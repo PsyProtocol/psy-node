@@ -12,11 +12,8 @@
 use std::{marker::PhantomData, sync::Arc};
 
 use async_trait::async_trait;
-use parth_core::{
-    crypto::hash::tag_tree::TagTreeMerkleProof,
-    protocol::core_types::Q256BitHash,
-};
-use psy_data::protocol::canonical_chain::{CanonicalChainRef, NetworkId};
+use parth_core::protocol::core_types::Q256BitHash;
+use psy_data::protocol::canonical_chain::NetworkId;
 
 use crate::queue::{
     realm_processor_durable_capture::{
@@ -30,12 +27,14 @@ use crate::queue::{
     realm_processor_deferred_actor_input::{
         RealmProcessorDeferredActorInput, RealmProcessorDeferredActorInputOutcome,
     },
+    realm_processor_application_proof_work::RealmProcessorApplicationProofWorkOutcome,
     realm_processor_external_dependency_input::RealmProcessorQualifiedExternalActorInput,
     realm_processor_generation_continuation::RealmProcessorGenerationContinuation,
-    realm_processor_generation_continuation::RealmProcessorApplicationContinuation,
     realm_processor_narrow_writer::{
         RealmProcessorNarrowWriterError, RealmProcessorNarrowWriterFactory,
-        RealmProcessorNarrowWriterObservation, SealedRealmProcessorNarrowWriterRequest,
+        RealmProcessorNarrowWriterObservation,
+        RealmProcessorVerifiedNarrowWriterEvidence,
+        SealedRealmProcessorNarrowWriterRequest,
     },
     realm_processor_continuation_restart::{
         RealmProcessorContinuationRestartFactory,
@@ -269,9 +268,7 @@ impl<Hash> RealmBranchExactCommitIteration<'_, Hash> {
     /// rotate a generation.
     pub async fn prepare_mapping_and_reward_proof(
         &mut self,
-        application: RealmProcessorApplicationContinuation,
-        candidate: CanonicalChainRef<Hash>,
-        reward_proof: TagTreeMerkleProof<Hash>,
+        evidence: &RealmProcessorVerifiedNarrowWriterEvidence<Hash>,
         clock_sample: AuthorityClockSampleUs,
     ) -> Result<RealmProcessorNarrowWriterObservation, RealmProcessorNarrowWriterError>
     where
@@ -286,9 +283,7 @@ impl<Hash> RealmBranchExactCommitIteration<'_, Hash> {
             runtime.realm_sub_id(),
             runtime.writer_activation_digest(),
             runtime.queue_readiness_digest(),
-            application,
-            candidate,
-            reward_proof,
+            evidence,
             clock_sample,
         )?;
         factory.prepare_and_verify(request).await
@@ -327,6 +322,28 @@ impl<Hash> RealmBranchExactCommitIteration<'_, Hash> {
         let factory = Arc::clone(self.owner.installed.capture_factory());
         factory
             .prepare_deferred_actor_input(
+                SealedRealmProcessorGenerationContinuationRequest::seal(
+                    self.owner.startup_permit_digest(),
+                    runtime.network(),
+                    runtime.realm_id(),
+                    runtime.realm_sub_id(),
+                    runtime.writer_activation_digest(),
+                    runtime.queue_readiness_digest(),
+                ),
+            )
+            .await
+    }
+
+    /// Rebuilds the exact immutable application selected by `WorkCaptured`.
+    /// Pending/proc identity and archive slot are selected by storage, never
+    /// supplied by the Processor or its legacy mutable state.
+    pub async fn prepare_application_proof_work(
+        &mut self,
+    ) -> Result<RealmProcessorApplicationProofWorkOutcome, RealmProcessorDurableCaptureError> {
+        let runtime = self.owner.runtime();
+        let factory = Arc::clone(self.owner.installed.capture_factory());
+        factory
+            .prepare_application_proof_work(
                 SealedRealmProcessorGenerationContinuationRequest::seal(
                     self.owner.startup_permit_digest(),
                     runtime.network(),
@@ -838,6 +855,16 @@ mod tests {
             )
             .map_err(|_| RealmProcessorDurableCaptureError::IdentityMismatch)?;
             Ok(RealmProcessorDeferredActorInputOutcome::Ready(input))
+        }
+
+        async fn prepare_application_proof_work(
+            &self,
+            request: SealedRealmProcessorGenerationContinuationRequest,
+        ) -> Result<RealmProcessorApplicationProofWorkOutcome, RealmProcessorDurableCaptureError> {
+            let _ = self.observe_generation_continuation(request).await?;
+            Err(RealmProcessorDurableCaptureError::Backend(
+                "proof-work fixture is intentionally unavailable".to_owned(),
+            ))
         }
 
         async fn open(

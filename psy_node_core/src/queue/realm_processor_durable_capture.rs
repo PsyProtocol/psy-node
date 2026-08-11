@@ -22,6 +22,7 @@ use super::recoverable_ephemeral::{
 use super::realm_processor_deferred_actor_input::{
     RealmProcessorDeferredActorInput, RealmProcessorDeferredActorInputOutcome,
 };
+use super::realm_processor_application_proof_work::RealmProcessorApplicationProofWorkOutcome;
 use super::realm_processor_external_dependency_input::{
     RealmProcessorExternalDependencyCommitment,
     RealmProcessorQualifiedExternalActorInput,
@@ -403,6 +404,15 @@ pub trait RealmProcessorDurableCaptureFactory: Send + Sync {
         &self,
         request: SealedRealmProcessorGenerationContinuationRequest,
     ) -> Result<RealmProcessorDeferredActorInputOutcome, RealmProcessorDurableCaptureError>;
+
+    /// Reconstruct the immutable application selected by `WorkCaptured` and
+    /// bracket it with exact durable-pipeline reads. The returned model is
+    /// read-only; later proof and writer mutation require separate sealed
+    /// capabilities.
+    async fn prepare_application_proof_work(
+        &self,
+        request: SealedRealmProcessorGenerationContinuationRequest,
+    ) -> Result<RealmProcessorApplicationProofWorkOutcome, RealmProcessorDurableCaptureError>;
 
     async fn open(
         self: std::sync::Arc<Self>,

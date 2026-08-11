@@ -367,8 +367,18 @@ impl RealmProcessorSemanticOutput {
         }
     }
     pub const fn processing_checkpoint_id(&self) -> u64 { self.processing_checkpoint_id }
+    pub const fn processing_checkpoint_root(&self) -> &[u8; 32] { &self.processing_checkpoint_root }
+    pub const fn processing_realm_start_root(&self) -> &[u8; 32] { &self.processing_realm_start_root }
     pub fn old_realm_root(&self) -> &[u8; 32] { &self.old_realm_root }
     pub fn new_realm_root(&self) -> &[u8; 32] { &self.new_realm_root }
+    pub const fn total_users_updated(&self) -> u64 { self.total_users_updated }
+    pub const fn total_proofs_generated(&self) -> u64 { self.total_proofs_generated }
+    pub fn global_user_tree_nodes(&self) -> &[u8] { &self.global_user_tree_nodes }
+    pub fn user_contract_tree_nodes(&self) -> &[u8] { &self.user_contract_tree_nodes }
+    pub fn contract_state_tree_nodes(&self) -> &[u8] { &self.contract_state_tree_nodes }
+    pub fn user_leaves(&self) -> &[u8] { &self.user_leaves }
+    pub fn contract_state_imt_leaves(&self) -> &[u8] { &self.contract_state_imt_leaves }
+    pub fn guta_header(&self) -> &[u8] { &self.guta_header }
     pub fn jobs(&self) -> &[RealmProcessorSemanticJob] { &self.jobs }
     pub fn deferred_jobs(&self) -> &[RealmProcessorDeferredJob] { &self.deferred_jobs }
 

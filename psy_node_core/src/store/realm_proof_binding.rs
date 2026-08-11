@@ -517,6 +517,36 @@ impl<Hash: Q256BitHash> SealedRealmProofBinding<Hash> {
     pub fn encode_canonical(&self) -> &[u8] {
         self.record.encode_canonical()
     }
+
+    /// Revalidate that a later consumer still holds the exact prepared
+    /// payload and Coordinator response used when this live proof capability
+    /// was sealed. In particular, this prevents replacing only the reward
+    /// proof while reusing an otherwise valid ZK/inclusion binding.
+    pub fn revalidate_exact_inputs<F: QFelt64>(
+        &self,
+        prepared: &PsyPreparedRealmBlockStateUpdates<Hash>,
+        coordinator: &PsyRealmCoordinatorUpdate<F, Hash>,
+    ) -> Result<(), RealmProofBindingError> {
+        let prepared_bytes = prepared
+            .psy_ser_to_bytes_vec()
+            .map_err(|_| RealmProofBindingError::PreparedSerializationFailed)?;
+        let coordinator_bytes = coordinator
+            .psy_ser_to_bytes_vec()
+            .map_err(|_| RealmProofBindingError::CoordinatorSerializationFailed)?;
+        if self.prepared_payload_commitment
+            != RealmPreparedPayloadCommitment::from_serialized(&prepared_bytes)
+            || self.record.prepared_payload_digest
+                != digest(PREPARED_DIGEST_DOMAIN, &prepared_bytes)
+            || self.record.coordinator_update_digest
+                != digest(COORDINATOR_UPDATE_DIGEST_DOMAIN, &coordinator_bytes)
+            || self.record.canonical_chain != coordinator.canonical_chain_ref
+            || self.record.old_realm_root != prepared.old_realm_root
+            || self.record.new_realm_root != prepared.new_realm_root
+        {
+            return Err(RealmProofBindingError::ExactInputMismatch);
+        }
+        Ok(())
+    }
 }
 
 fn validate_persisted_fields<Hash: Q256BitHash>(
@@ -674,6 +704,7 @@ pub enum RealmProofBindingError {
     UnknownCodecVersion(u16),
     InvalidCanonicalChain,
     BindingDigestMismatch,
+    ExactInputMismatch,
 }
 
 impl fmt::Display for RealmProofBindingError {
@@ -714,6 +745,7 @@ impl fmt::Display for RealmProofBindingError {
             Self::UnknownCodecVersion(version) => write!(formatter, "unknown Realm proof-binding codec version {version}"),
             Self::InvalidCanonicalChain => write!(formatter, "invalid canonical chain reference"),
             Self::BindingDigestMismatch => write!(formatter, "Realm proof-binding digest mismatch"),
+            Self::ExactInputMismatch => write!(formatter, "Realm proof-binding exact input mismatch"),
         }
     }
 }

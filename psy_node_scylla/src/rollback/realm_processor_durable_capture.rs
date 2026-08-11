@@ -50,6 +50,10 @@ use psy_node_core::{
             SealedRealmProcessorTerminalCarryoverRecoveryRequest,
         },
         realm_processor_application_archive::RealmProcessorApplicationArchivePlan,
+        realm_processor_application_proof_work::{
+            RealmProcessorApplicationProofWork,
+            RealmProcessorApplicationProofWorkOutcome,
+        },
         realm_processor_generation_continuation::{
             RealmProcessorApplicationContinuation, RealmProcessorGenerationContinuation,
             RealmProcessorGenerationContinuationPhase,
@@ -455,6 +459,49 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
             continuation,
             pipeline: second_pipeline,
         })
+    }
+
+    async fn prepare_application_proof_work_exact(
+        &self,
+    ) -> Result<RealmProcessorApplicationProofWorkOutcome, RealmProcessorDurableCaptureError> {
+        let first = self.observe_generation_continuation_exact().await?;
+        if first.continuation.phase()
+            != RealmProcessorGenerationContinuationPhase::AwaitWriter
+        {
+            return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+        }
+        let application = first
+            .continuation
+            .application()
+            .ok_or(RealmProcessorDurableCaptureError::IdentityMismatch)?;
+        let first_archive = self
+            .application_archive
+            .read_selected(application.archive_slot())
+            .await
+            .map_err(backend)?
+            .ok_or(RealmProcessorDurableCaptureError::IdentityMismatch)?;
+
+        let second = self.observe_generation_continuation_exact().await?;
+        let second_archive = self
+            .application_archive
+            .read_selected(application.archive_slot())
+            .await
+            .map_err(backend)?
+            .ok_or(RealmProcessorDurableCaptureError::IdentityMismatch)?;
+        if first.continuation != second.continuation
+            || !same_pipeline_snapshot(&first.pipeline, &second.pipeline)
+            || first_archive.header() != second_archive.header()
+            || first_archive.semantic() != second_archive.semantic()
+        {
+            return Err(RealmProcessorDurableCaptureError::ConcurrentMutation);
+        }
+        let work = RealmProcessorApplicationProofWork::try_from_storage(
+            second.continuation.processing(),
+            application,
+            second_archive.semantic().clone(),
+        )
+        .map_err(backend)?;
+        Ok(RealmProcessorApplicationProofWorkOutcome::from_exact_work(work))
     }
 
     pub(super) async fn prepare_narrow_writer(
@@ -1552,6 +1599,14 @@ where
             return Err(RealmProcessorDurableCaptureError::ConcurrentMutation);
         }
         Ok(second.outcome)
+    }
+
+    async fn prepare_application_proof_work(
+        &self,
+        request: SealedRealmProcessorGenerationContinuationRequest,
+    ) -> Result<RealmProcessorApplicationProofWorkOutcome, RealmProcessorDurableCaptureError> {
+        self.validate_generation_request(&request)?;
+        self.prepare_application_proof_work_exact().await
     }
 
     async fn open(

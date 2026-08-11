@@ -12,18 +12,103 @@ use std::{error::Error, fmt};
 use async_trait::async_trait;
 use parth_core::{
     crypto::hash::tag_tree::TagTreeMerkleProof,
+    felt::QFelt64,
     protocol::core_types::Q256BitHash,
 };
-use psy_data::protocol::canonical_chain::{CanonicalChainRef, NetworkId};
+use psy_data::{
+    prepared_block::realm::PsyRealmCoordinatorUpdate,
+    protocol::{
+        canonical_chain::{CanonicalChainRef, NetworkId},
+        chain_context::AuthorityScope,
+    },
+};
 
 use crate::store::{
     authority_commit::AuthorityClockSampleUs,
     pending_generation_identity::PendingGenerationContext,
     pending_generation_pipeline::PendingPipelineRevision,
+    realm_proof_binding::{RealmProofBindingDigest, SealedRealmProofBinding},
     realm_processor_startup::RealmProcessorStartupPermitDigest,
 };
 
-use super::realm_processor_generation_continuation::RealmProcessorApplicationContinuation;
+use super::{
+    realm_processor_application_proof_work::RealmProcessorApplicationProofWork,
+    realm_processor_generation_continuation::RealmProcessorApplicationContinuation,
+};
+
+/// Exact proof/Coordinator capability accepted by the narrow writer seal.
+///
+/// It is non-Clone and can only be constructed from a live, ZK-verified
+/// [`SealedRealmProofBinding`] plus the exact Coordinator response committed
+/// by that binding. The reward proof is derived from that same response, so a
+/// caller cannot swap it independently.
+pub struct RealmProcessorVerifiedNarrowWriterEvidence<Hash> {
+    realm_id: u32,
+    realm_sub_id: u16,
+    application: RealmProcessorApplicationContinuation,
+    candidate: CanonicalChainRef<Hash>,
+    reward_proof: TagTreeMerkleProof<Hash>,
+    proof_binding_digest: RealmProofBindingDigest,
+}
+
+impl<Hash: Q256BitHash> RealmProcessorVerifiedNarrowWriterEvidence<Hash> {
+    pub fn try_from_verified<F: QFelt64>(
+        realm_id: u32,
+        realm_sub_id: u16,
+        work: &RealmProcessorApplicationProofWork,
+        proof: &SealedRealmProofBinding<Hash>,
+        coordinator: &PsyRealmCoordinatorUpdate<F, Hash>,
+    ) -> Result<Self, RealmProcessorNarrowWriterError> {
+        let prepared = work.prepared_update::<Hash>(realm_id, realm_sub_id);
+        proof
+            .revalidate_exact_inputs(&prepared, coordinator)
+            .map_err(|error| RealmProcessorNarrowWriterError::Proof(error.to_string()))?;
+        if proof.record().authority()
+            != (AuthorityScope::Realm {
+                realm_id,
+                realm_sub_id,
+            })
+            || proof.record().canonical_chain() != &coordinator.canonical_chain_ref
+            || proof.record().old_realm_root() != &prepared.old_realm_root
+            || proof.record().new_realm_root() != &prepared.new_realm_root
+            || !work.application().has_application_work()
+        {
+            return Err(RealmProcessorNarrowWriterError::IdentityMismatch);
+        }
+        Ok(Self {
+            realm_id,
+            realm_sub_id,
+            application: work.application(),
+            candidate: coordinator.canonical_chain_ref,
+            reward_proof: coordinator.reward_tree_top_proof.clone(),
+            proof_binding_digest: proof.digest(),
+        })
+    }
+
+    pub const fn realm_id(&self) -> u32 {
+        self.realm_id
+    }
+
+    pub const fn realm_sub_id(&self) -> u16 {
+        self.realm_sub_id
+    }
+
+    pub const fn application(&self) -> RealmProcessorApplicationContinuation {
+        self.application
+    }
+
+    pub const fn candidate(&self) -> &CanonicalChainRef<Hash> {
+        &self.candidate
+    }
+
+    pub fn reward_proof(&self) -> &TagTreeMerkleProof<Hash> {
+        &self.reward_proof
+    }
+
+    pub const fn proof_binding_digest(&self) -> RealmProofBindingDigest {
+        self.proof_binding_digest
+    }
+}
 
 /// Sealed by the single commit iteration. Callers may provide coordinator
 /// evidence, but cannot select the durable pending/proc namespace.
@@ -37,6 +122,7 @@ pub struct SealedRealmProcessorNarrowWriterRequest<Hash> {
     application: RealmProcessorApplicationContinuation,
     candidate: CanonicalChainRef<Hash>,
     reward_proof: TagTreeMerkleProof<Hash>,
+    proof_binding_digest: RealmProofBindingDigest,
     clock_sample: AuthorityClockSampleUs,
 }
 
@@ -49,15 +135,15 @@ impl<Hash: Q256BitHash> SealedRealmProcessorNarrowWriterRequest<Hash> {
         realm_sub_id: u16,
         writer_activation_digest: [u8; 32],
         queue_readiness_digest: [u8; 32],
-        application: RealmProcessorApplicationContinuation,
-        candidate: CanonicalChainRef<Hash>,
-        reward_proof: TagTreeMerkleProof<Hash>,
+        evidence: &RealmProcessorVerifiedNarrowWriterEvidence<Hash>,
         clock_sample: AuthorityClockSampleUs,
     ) -> Result<Self, RealmProcessorNarrowWriterError> {
         if writer_activation_digest == [0; 32]
             || queue_readiness_digest == [0; 32]
-            || candidate.network_id() != network
-            || !application.has_application_work()
+            || evidence.candidate().network_id() != network
+            || evidence.realm_id() != realm_id
+            || evidence.realm_sub_id() != realm_sub_id
+            || !evidence.application().has_application_work()
         {
             return Err(RealmProcessorNarrowWriterError::IdentityMismatch);
         }
@@ -68,9 +154,10 @@ impl<Hash: Q256BitHash> SealedRealmProcessorNarrowWriterRequest<Hash> {
             realm_sub_id,
             writer_activation_digest,
             queue_readiness_digest,
-            application,
-            candidate,
-            reward_proof,
+            application: evidence.application(),
+            candidate: *evidence.candidate(),
+            reward_proof: evidence.reward_proof().clone(),
+            proof_binding_digest: evidence.proof_binding_digest(),
             clock_sample,
         })
     }
@@ -113,6 +200,10 @@ impl<Hash: Q256BitHash> SealedRealmProcessorNarrowWriterRequest<Hash> {
 
     pub fn reward_proof(&self) -> &TagTreeMerkleProof<Hash> {
         &self.reward_proof
+    }
+
+    pub const fn proof_binding_digest(&self) -> RealmProofBindingDigest {
+        self.proof_binding_digest
     }
 }
 
@@ -189,6 +280,7 @@ pub enum RealmProcessorNarrowWriterError {
     ConcurrentMutation,
     Writer(String),
     Pipeline(String),
+    Proof(String),
     Backend(String),
 }
 
@@ -245,9 +337,25 @@ mod tests {
         .unwrap()
     }
 
+    fn evidence(
+        network: NetworkId,
+        realm_id: u32,
+        realm_sub_id: u16,
+        application: RealmProcessorApplicationContinuation,
+    ) -> RealmProcessorVerifiedNarrowWriterEvidence<PHash> {
+        RealmProcessorVerifiedNarrowWriterEvidence {
+            realm_id,
+            realm_sub_id,
+            application,
+            candidate: candidate(network),
+            reward_proof: TagTreeMerkleProof::new_empty(),
+            proof_binding_digest: RealmProofBindingDigest::from_bytes([8; 32]),
+        }
+    }
+
     #[test]
     fn sealed_request_rejects_foreign_network_empty_identity_and_no_work() {
-        let seal = |writer, ready, app, chain| {
+        let seal = |writer, ready, evidence| {
             SealedRealmProcessorNarrowWriterRequest::seal(
                 RealmProcessorStartupPermitDigest::try_new([9; 32]).unwrap(),
                 network(),
@@ -255,27 +363,50 @@ mod tests {
                 3,
                 writer,
                 ready,
-                app,
-                chain,
-                TagTreeMerkleProof::<PHash>::new_empty(),
+                &evidence,
                 AuthorityClockSampleUs::try_from_i128(100).unwrap(),
             )
         };
-        assert!(seal([1; 32], [2; 32], application(true), candidate(network())).is_ok());
+        assert!(seal(
+            [1; 32],
+            [2; 32],
+            evidence(network(), 7, 3, application(true)),
+        )
+        .is_ok());
         assert!(matches!(
-            seal([0; 32], [2; 32], application(true), candidate(network())),
-            Err(RealmProcessorNarrowWriterError::IdentityMismatch)
-        ));
-        assert!(matches!(
-            seal([1; 32], [2; 32], application(false), candidate(network())),
+            seal(
+                [0; 32],
+                [2; 32],
+                evidence(network(), 7, 3, application(true)),
+            ),
             Err(RealmProcessorNarrowWriterError::IdentityMismatch)
         ));
         assert!(matches!(
             seal(
                 [1; 32],
                 [2; 32],
-                application(true),
-                candidate(NetworkId::try_from_chain_id(1).unwrap()),
+                evidence(network(), 7, 3, application(false)),
+            ),
+            Err(RealmProcessorNarrowWriterError::IdentityMismatch)
+        ));
+        assert!(matches!(
+            seal(
+                [1; 32],
+                [2; 32],
+                evidence(
+                    NetworkId::try_from_chain_id(1).unwrap(),
+                    7,
+                    3,
+                    application(true),
+                ),
+            ),
+            Err(RealmProcessorNarrowWriterError::IdentityMismatch)
+        ));
+        assert!(matches!(
+            seal(
+                [1; 32],
+                [2; 32],
+                evidence(network(), 8, 3, application(true)),
             ),
             Err(RealmProcessorNarrowWriterError::IdentityMismatch)
         ));
