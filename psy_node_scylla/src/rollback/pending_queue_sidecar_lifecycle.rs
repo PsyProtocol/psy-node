@@ -243,6 +243,21 @@ pub struct ScyllaPendingQueueSidecarLifecycleStore {
     cas: PreparedStatement,
 }
 
+#[cfg(all(test, feature = "rf3-test-support"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct HistoricalV12VerifiedLifecycleFixture {
+    slot: [u8; 32],
+    revision: i64,
+    payload: Vec<u8>,
+}
+
+#[cfg(all(test, feature = "rf3-test-support"))]
+impl HistoricalV12VerifiedLifecycleFixture {
+    pub(super) const fn slot(&self) -> &[u8; 32] { &self.slot }
+    pub(super) const fn revision(&self) -> i64 { self.revision }
+    pub(super) fn payload(&self) -> &[u8] { &self.payload }
+}
+
 impl ScyllaPendingQueueSidecarLifecycleStore {
     pub async fn create_schema(session: &Session, keyspace: &BranchExactDeploymentNoTabletKeyspace) -> Result<(), PendingQueueSidecarLifecycleError> {
         let queries = PendingQueueSidecarLifecycleQueries::new(keyspace);
@@ -254,6 +269,91 @@ impl ScyllaPendingQueueSidecarLifecycleStore {
     pub async fn prepare(session: Arc<Session>, keyspace: BranchExactDeploymentNoTabletKeyspace) -> Result<Self, PendingQueueSidecarLifecycleError> {
         let queries = PendingQueueSidecarLifecycleQueries::new(&keyspace);
         Ok(Self { read: prepare_read(&session, queries.read()).await?, bootstrap: prepare_lwt(&session, queries.bootstrap()).await?, cas: prepare_lwt(&session, queries.cas()).await?, session })
+    }
+
+    /// Qualification-only seed for the exact historical v12 lifecycle
+    /// identity. v12 and v13 intentionally share the same twenty-table
+    /// physical shape; only their codec/readiness identity differs. Keeping
+    /// this constructor inside the storage module prevents RF3 callers from
+    /// hand-rolling an arbitrary production readiness row.
+    #[cfg(all(test, feature = "rf3-test-support"))]
+    pub(super) async fn qualification_persist_historical_v12_verified(
+        &self,
+        keyspaces: &PendingQueueSidecarKeyspaces,
+    ) -> Result<HistoricalV12VerifiedLifecycleFixture, PendingQueueSidecarLifecycleError> {
+        use super::pending_queue_sidecar_schema::historical_v12_schema_fingerprint;
+
+        const HISTORICAL_SCHEMA_VERSION: u16 = 12;
+        const HISTORICAL_TARGET_TABLES: u16 = 20;
+
+        let fingerprint = historical_v12_schema_fingerprint();
+        let mut slot_hasher = Sha256::new();
+        slot_hasher.update(SLOT_DOMAIN);
+        slot_hasher.update(HISTORICAL_SCHEMA_VERSION.to_be_bytes());
+        slot_hasher.update(fingerprint.as_bytes());
+        update_len(&mut slot_hasher, keyspaces.data().as_str().as_bytes());
+        update_len(&mut slot_hasher, keyspaces.control().as_str().as_bytes());
+        let slot: [u8; 32] = slot_hasher.finalize().into();
+
+        let revision = PendingQueueSidecarDeploymentRevision::VERIFIED.as_i64();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(MAGIC);
+        payload.extend_from_slice(&CODEC_VERSION.to_be_bytes());
+        payload.extend_from_slice(
+            &PendingQueueSidecarDeploymentRevision::VERIFIED
+                .get()
+                .to_be_bytes(),
+        );
+        payload.push(PendingQueueSidecarDeploymentPhase::Verified as u8);
+        payload.extend_from_slice(&HISTORICAL_SCHEMA_VERSION.to_be_bytes());
+        payload.extend_from_slice(&HISTORICAL_TARGET_TABLES.to_be_bytes());
+        put_string(&mut payload, keyspaces.data().as_str());
+        put_string(&mut payload, keyspaces.control().as_str());
+        payload.extend_from_slice(fingerprint.as_bytes());
+        let mut state = Sha256::new();
+        state.update(STATE_DOMAIN);
+        state.update(&payload);
+        payload.extend_from_slice(&<[u8; 32]>::from(state.finalize()));
+
+        let execution = self
+            .session
+            .execute_unpaged(
+                &self.bootstrap,
+                (slot.to_vec(), revision, payload.clone()),
+            )
+            .await;
+        let execute_error = match execution {
+            Ok(result) => {
+                let _ = decode_applied(result)?;
+                None
+            }
+            Err(error) => Some(error),
+        };
+        let row = self
+            .session
+            .execute_unpaged(&self.read, (slot.to_vec(),))
+            .await
+            .map_err(cql)?
+            .into_rows_result()
+            .map_err(cql)?
+            .maybe_first_row::<(Vec<u8>, Option<i64>, Option<Vec<u8>>)>()
+            .map_err(cql)?;
+        let exact = row.is_some_and(|(selected, stored_revision, stored_payload)| {
+            selected == slot
+                && stored_revision == Some(revision)
+                && stored_payload.as_deref() == Some(payload.as_slice())
+        });
+        if !exact {
+            return match execute_error {
+                Some(error) => Err(cql(error)),
+                None => Err(PendingQueueSidecarLifecycleError::DeploymentConflict),
+            };
+        }
+        Ok(HistoricalV12VerifiedLifecycleFixture {
+            slot,
+            revision,
+            payload,
+        })
     }
 
     pub async fn read(&self, slot: PendingQueueSidecarDeploymentSlot) -> Result<PendingQueueSidecarDeploymentReadState, PendingQueueSidecarLifecycleError> {

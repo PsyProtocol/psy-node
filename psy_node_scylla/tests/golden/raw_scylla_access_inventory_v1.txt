@@ -60,7 +60,7 @@ psy_node_scylla/src/rollback/pending_queue_publish_store.rs|DurableControlAuthor
 psy_node_scylla/src/rollback/pending_queue_segment_ledger.rs|DurableControlAuthority|6|0|5|6|2|5|1|4
 psy_node_scylla/src/rollback/pending_queue_segment_lifecycle.rs|DurableControlAuthority|6|0|7|6|2|7|1|5
 psy_node_scylla/src/rollback/pending_queue_semantic_aggregate.rs|DurableControlAuthority|6|0|2|5|2|2|1|4
-psy_node_scylla/src/rollback/pending_queue_sidecar_lifecycle.rs|DurableControlAuthority|12|0|4|6|2|3|1|4
+psy_node_scylla/src/rollback/pending_queue_sidecar_lifecycle.rs|DurableControlAuthority|12|0|6|6|2|5|1|4
 psy_node_scylla/src/rollback/pending_queue_sidecar_schema.rs|DurableControlAuthority|5|0|0|0|0|0|2|3
 psy_node_scylla/src/rollback/pending_queue_stream_provision.rs|DurableControlAuthority|8|0|3|6|2|3|1|5
 psy_node_scylla/src/rollback/public_key_projection.rs|RollbackPrototypeAdapter|6|0|0|4|1|2|0|2
@@ -115,7 +115,7 @@ psy_node_scylla/src/utils.rs|LegacyTableAdapter|3|0|0|4|2|0|0|0
 psy_node_scylla/tests/rf3/d04b6h22e2b_segment_lifecycle.rs|TestHarness|2|0|0|0|0|0|3|3
 psy_node_scylla/tests/rf3/d04b6h22e3_cutover.rs|TestHarness|1|0|0|0|0|0|6|8
 psy_node_scylla/tests/rf3/d04b6h22e_consumer_gate.rs|TestHarness|0|0|0|0|0|0|1|1
-psy_node_scylla/tests/rf3/d04b6h23c4c1_queue_schema.rs|TestHarness|4|2|0|0|0|0|9|9
+psy_node_scylla/tests/rf3/d04b6h23c4c1_queue_schema.rs|TestHarness|7|2|0|0|0|0|21|21
 psy_node_scylla/tests/rf3/d04b6h23c4c2b3b2_claim_admission.rs|TestHarness|14|2|0|0|0|0|26|26
 psy_node_scylla/tests/rf3/d04b6h23c4c2b4d2_stream_provision.rs|TestHarness|0|0|0|0|0|0|6|6
 psy_node_scylla/tests/rf3/d04b6h23c4c2b4e3_edge_handler_ingress.rs|TestHarness|5|0|0|0|0|0|9|10

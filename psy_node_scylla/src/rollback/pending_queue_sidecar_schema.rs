@@ -486,10 +486,23 @@ fn sidecar_schema_fingerprint(
 
 #[cfg(test)]
 pub(super) fn historical_v12_schema_fingerprint() -> PendingQueueSidecarSchemaFingerprint {
+    // Frozen from the shipped v12 twenty-table/102-column manifest.  Never
+    // derive a historical lifecycle identity from the current manifest: a
+    // later physical schema revision must not move the v12 deployment slot.
+    PendingQueueSidecarSchemaFingerprint::from_persisted([
+        0x46, 0x6b, 0xf8, 0x0f, 0x7e, 0x9f, 0x33, 0x6a,
+        0x51, 0x91, 0xc2, 0xef, 0xde, 0xcf, 0x05, 0x12,
+        0x9c, 0x96, 0xf6, 0x08, 0x6f, 0x57, 0xc1, 0xaf,
+        0xb1, 0x4c, 0xe6, 0xcb, 0xe0, 0xac, 0xa7, 0xfb,
+    ])
+}
+
+#[cfg(test)]
+pub(super) fn current_physical_schema_matches_historical_v12() -> bool {
     sidecar_schema_fingerprint(
         12,
         b"psy/rollback/pending-queue-sidecar-schema/v12",
-    )
+    ) == historical_v12_schema_fingerprint()
 }
 
 pub fn inspect_pending_queue_sidecar_columns(
@@ -667,6 +680,11 @@ mod tests {
         assert!(!names.contains(RETIRED_V1_PIPELINE_TABLE));
         assert!(!names.contains(RETIRED_REALM_USER_UPDATE_CLAIM_V1_TABLE));
         assert_ne!(pending_queue_sidecar_schema_fingerprint().as_bytes(), &[0; 32]);
+        assert!(current_physical_schema_matches_historical_v12());
+        assert_eq!(
+            hex::encode(historical_v12_schema_fingerprint().as_bytes()),
+            "466bf80f7e9f336a5191c2efdecf05129c96f6086f57c1afb14ce6cbe0aca7fb",
+        );
     }
 
     #[test]
