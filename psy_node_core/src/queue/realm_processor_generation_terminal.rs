@@ -37,6 +37,7 @@ use super::{
         RealmProcessorGenerationContinuationError,
     },
     realm_processor_semantic_output::RealmProcessorSemanticOutputDigest,
+    realm_processor_terminal_authorization::RealmProcessorTerminalAuthorizationEnvelope,
 };
 
 const TERMINAL_MAGIC: &[u8; 8] = b"PSYRGTER";
@@ -249,6 +250,26 @@ impl<Hash: Q256BitHash> RealmProcessorGenerationTerminal<Hash> {
     pub const fn expected_pipeline(&self) -> &StoredPendingPipeline<Hash> { &self.expected_pipeline }
     pub const fn candidate_pipeline(&self) -> &StoredPendingPipeline<Hash> { &self.candidate_pipeline }
     pub fn terminal_authorization(&self) -> &[u8] { &self.terminal_authorization }
+    /// Decode the production terminal authorization and bind its successor
+    /// dependency commitment to this exact rotation intent. Historical
+    /// qualification-only opaque bytes remain readable as terminal records,
+    /// but cannot pass this production consumer boundary.
+    pub fn terminal_authorization_envelope(
+        &self,
+    ) -> Result<RealmProcessorTerminalAuthorizationEnvelope, RealmGenerationTerminalError> {
+        let envelope = RealmProcessorTerminalAuthorizationEnvelope::decode_canonical(
+            &self.terminal_authorization,
+        )
+        .map_err(|error| RealmGenerationTerminalError::AuthorizationEnvelope(error.to_string()))?;
+        let context = envelope.external_dependency().context();
+        if context.key() != self.key
+            || context.activation() != self.activation_digest
+            || context.processing() != self.successor
+        {
+            return Err(RealmGenerationTerminalError::AuthorizationBindingMismatch);
+        }
+        Ok(envelope)
+    }
     pub const fn terminal_authorization_digest(&self) -> RealmProcessorTerminalAuthorizationDigest { self.terminal_authorization_digest }
     pub const fn rotation_intent_digest(&self) -> RealmProcessorRotationIntentDigest { self.rotation_intent_digest }
     pub const fn digest(&self) -> RealmProcessorGenerationTerminalDigest { self.digest }
@@ -942,6 +963,8 @@ pub enum RealmGenerationTerminalError {
     ApplicationWorkMismatch,
     ApplicationSlotMismatch,
     AuthorizationSize,
+    AuthorizationEnvelope(String),
+    AuthorizationBindingMismatch,
     PayloadTooLarge,
     NotRotation,
     BindingMismatch,
@@ -988,6 +1011,14 @@ mod tests {
             PendingPublishReceiptDigest, PendingQueueCloseIntentDigest,
             PendingWorkCaptureDigest,
         },
+    };
+
+    use crate::queue::{
+        realm_processor_external_dependency_input::RealmProcessorExternalDependencyProjection,
+        realm_user_update_admission::{
+            RealmUserUpdateAdmissionCloseIntent, RealmUserUpdateQualificationDigest,
+        },
+        recoverable_ephemeral::PendingQueueCaptureContext,
     };
 
     use super::*;
@@ -1159,6 +1190,69 @@ mod tests {
 
     fn terminal_store_fingerprint() -> RealmProcessorGenerationTerminalStoreFingerprint {
         RealmProcessorGenerationTerminalStoreFingerprint::try_new([43; 32]).unwrap()
+    }
+
+    fn authorization_for(
+        successor: PendingGenerationContext,
+    ) -> RealmProcessorTerminalAuthorizationEnvelope {
+        let context = PendingQueueCaptureContext::try_new(
+            key(),
+            activation(),
+            successor,
+        )
+        .unwrap();
+        let dependency = RealmProcessorExternalDependencyProjection::try_new(
+            context,
+            RealmUserUpdateAdmissionCloseIntent::try_new([51; 32]).unwrap(),
+            RealmUserUpdateQualificationDigest::try_new([52; 32]).unwrap(),
+            [53; 32],
+            vec![],
+        )
+        .unwrap();
+        RealmProcessorTerminalAuthorizationEnvelope::try_new(
+            dependency.commitment(),
+            [54; 32],
+            7,
+            vec![55; 48],
+            8,
+            vec![56; 48],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn production_authorization_binds_the_exact_successor_dependency() {
+        let (pipeline, application) = published();
+        let authorization = authorization_for(pipeline.gathering());
+        let terminal = RealmProcessorGenerationTerminal::try_new(
+            &pipeline,
+            ReservedPendingGeneration::try_from_prefix(4, prefix()).unwrap(),
+            [40; 32],
+            [41; 32],
+            application,
+            authorization.to_canonical_bytes(),
+        )
+        .unwrap();
+        assert_eq!(terminal.terminal_authorization_envelope().unwrap(), authorization);
+
+        let foreign = authorization_for(context(99));
+        let foreign_terminal = RealmProcessorGenerationTerminal::try_new(
+            &pipeline,
+            ReservedPendingGeneration::try_from_prefix(4, prefix()).unwrap(),
+            [40; 32],
+            [41; 32],
+            application,
+            foreign.to_canonical_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            foreign_terminal.terminal_authorization_envelope(),
+            Err(RealmGenerationTerminalError::AuthorizationBindingMismatch),
+        );
+        assert!(matches!(
+            self::terminal(&pipeline, application).terminal_authorization_envelope(),
+            Err(RealmGenerationTerminalError::AuthorizationEnvelope(_)),
+        ));
     }
 
     #[test]
