@@ -8,6 +8,7 @@ version = "0.1.0"
 
 [features]
 default = ["std", "parth_core/serialize_rkyv", "parth_core/serialize_speedy", "parth_core/serialize_postcard", "serialize_bytemuck"]
+rf3-test-support = ["psy_node_core/rf3-test-support"]
 std = ["parth_core/std", "pser/std"]
 serialize_rkyv = ["dep:rkyv","pser/serialize_rkyv", "parth_core/serialize_rkyv"]
 serialize_speedy = ["dep:speedy", "pser/serialize_speedy", "parth_core/serialize_speedy"]

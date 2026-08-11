@@ -567,6 +567,18 @@ impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase + 'static, Output:
             .map_err(|_| GathererPauseError::ResponseChannelClosed)?
     }
 
+    /// RF=3 qualification-only entry into the exact command used by the real
+    /// Processor. It is absent from ordinary builds and deliberately exposes
+    /// neither a receipt constructor nor storage authority.
+    #[cfg(feature = "rf3-test-support")]
+    pub async fn qualification_apply_durable_generation(
+        &self,
+        generation: RealmProcessorDurableCapturedGeneration,
+        deferred_input: RealmProcessorDeferredActorInput,
+    ) -> Result<DurableTreeGathererApplyReceipt, GathererPauseError> {
+        self.apply_durable_generation(generation, deferred_input).await
+    }
+
     /// Finalize exactly the tentative builder selected by `receipt`.
     ///
     /// The actor caches the result, so a response-loss retry with a freshly
@@ -589,6 +601,17 @@ impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase + 'static, Output:
         response_rx
             .await
             .map_err(|_| GathererPauseError::ResponseChannelClosed)?
+    }
+
+    /// RF=3 qualification-only entry into the same cached finalize command
+    /// used by the real Processor. The returned value remains an inert
+    /// in-process receipt and cannot advance durable storage.
+    #[cfg(feature = "rf3-test-support")]
+    pub async fn qualification_finalize_durable_generation(
+        &self,
+        receipt: DurableTreeGathererApplyReceipt,
+    ) -> Result<DurableTreeGathererFinalizeReceipt<Output>, GathererPauseError> {
+        self.finalize_durable_generation(receipt).await
     }
 
     pub async fn stop_gracefully(&mut self) -> anyhow::Result<()> {

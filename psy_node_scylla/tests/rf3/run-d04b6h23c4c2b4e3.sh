@@ -10,8 +10,11 @@ EXERCISE_DURABLE_CAPTURE="${PSY_D04B6H23C4C3A_RF3:-0}"
 EXERCISE_DURABLE_REPLAY="${PSY_D04B6H23C4C3B_RF3:-0}"
 EXERCISE_APPLICATION_HANDOFF="${PSY_D04B6H23C4C4A2B_RF3:-0}"
 EXERCISE_TERMINAL_RECOVERY="${PSY_D04B6H23C4C4B3B2_RF3:-0}"
+EXERCISE_DEFERRED_ACTOR_ARCHIVE="${PSY_D04B6H23C4C4B4C2_RF3:-0}"
 EXPECTED_QUALIFICATION="H23C4C2B4E3_JTMB_HANDLER_INGRESS_RF3_PASSED"
-if [[ "${EXERCISE_TERMINAL_RECOVERY}" == "1" ]]; then
+if [[ "${EXERCISE_DEFERRED_ACTOR_ARCHIVE}" == "1" ]]; then
+  EXPECTED_QUALIFICATION="H23C4C4B4C2_DEFERRED_ACTOR_ARCHIVE_RF3_PASSED"
+elif [[ "${EXERCISE_TERMINAL_RECOVERY}" == "1" ]]; then
   EXPECTED_QUALIFICATION="H23C4C4B3B2_TERMINAL_CARRYOVER_RECOVERY_RF3_PASSED"
 elif [[ "${EXERCISE_APPLICATION_HANDOFF}" == "1" ]]; then
   EXPECTED_QUALIFICATION="H23C4C4A2B_REALM_APPLICATION_HANDOFF_RF3_PASSED"
@@ -21,7 +24,7 @@ elif [[ "${EXERCISE_DURABLE_CAPTURE}" == "1" ]]; then
   EXPECTED_QUALIFICATION="H23C4C3A_DURABLE_CAPTURE_OWNER_RF3_PASSED"
 fi
 CARGO_FEATURE_ARGS=()
-if [[ "${EXERCISE_DURABLE_CAPTURE}" == "1" ]]; then
+if [[ "${EXERCISE_DURABLE_CAPTURE}" == "1" || "${EXERCISE_DEFERRED_ACTOR_ARCHIVE}" == "1" ]]; then
   CARGO_FEATURE_ARGS=(--features rf3-test-support)
 fi
 NATS_DIR="$(mktemp -d /tmp/psy-h23e3-nats.XXXXXX)"
@@ -116,6 +119,7 @@ PSY_D04B6H23C4C3A_RF3="${EXERCISE_DURABLE_CAPTURE}" \
 PSY_D04B6H23C4C3B_RF3="${EXERCISE_DURABLE_REPLAY}" \
 PSY_D04B6H23C4C4A2B_RF3="${EXERCISE_APPLICATION_HANDOFF}" \
 PSY_D04B6H23C4C4B3B2_RF3="${EXERCISE_TERMINAL_RECOVERY}" \
+PSY_D04B6H23C4C4B4C2_RF3="${EXERCISE_DEFERRED_ACTOR_ARCHIVE}" \
 PSY_D04B6H23C4C2B4E3_COMPOSE_FILE="${COMPOSE_FILE}" \
 PSY_D04B6H23C4C2B4E3_REPORT_PATH="${REPORT_PATH}" \
 PSY_D04B6H23C4C2B4E3_NATS_URLS="nats://127.0.0.1:45322,nats://127.0.0.1:45323,nats://127.0.0.1:45324" \
@@ -133,11 +137,14 @@ jq -e \
   --argjson exercise_durable_capture "${EXERCISE_DURABLE_CAPTURE}" \
   --argjson exercise_durable_replay "${EXERCISE_DURABLE_REPLAY}" \
   --argjson exercise_application_handoff "${EXERCISE_APPLICATION_HANDOFF}" \
-  --argjson exercise_terminal_recovery "${EXERCISE_TERMINAL_RECOVERY}" '
+  --argjson exercise_terminal_recovery "${EXERCISE_TERMINAL_RECOVERY}" \
+  --argjson exercise_deferred_actor_archive "${EXERCISE_DEFERRED_ACTOR_ARCHIVE}" '
   .qualification == $expected_qualification
   and .scylla_replication_factor == 3
   and .configured_nats_servers == 3
   and .nats_stream_replicas == 3
+  and .nats_kv_replicas == 3
+  and .nats_kv_replica_mismatch_rejected == true
   and .real_realm_edge_handler == true
   and .jtmb_cli_profile_matched == true
   and .production_jtmb_zk_proof == false
@@ -180,11 +187,15 @@ jq -e \
   and .full_node_restart_tested == false
   and .production_serving == false
   and .h8_domains_closed == 0
+  and .repair_direct_one_table_names == (.repair_direct_one_table_names | sort | unique)
+  and (.repair_direct_one_dataset_digest | test("^[0-9a-f]{64}$"))
+  and .repair_direct_one_rows > 0
+  and .all_20_target_business_rows_qualified == false
   and (
     if $exercise_terminal_recovery == 1 then
       .affine_terminal_carryover_recovery == true
       and .qualification_seeded_terminal == true
-      and .inbound_missing_zero_write == true
+      and .inbound_missing_zero_write == false
       and .nonterminal_zero_write == true
       and .terminal_absent_zero_write == true
       and .terminal_only_repaired == true
@@ -219,8 +230,15 @@ jq -e \
     if $exercise_application_handoff == 1 then
       .semantic_handoff_integrated == true
       and .application_archive_data_rf3 == true
-      and .application_semantic_bytes > 4194304
-      and .application_fragments == 2
+      and (
+        if $exercise_deferred_actor_archive == 1 then
+          .application_semantic_bytes > 0
+          and .application_fragments == 1
+        else
+          .application_semantic_bytes > 4194304
+          and .application_fragments == 2
+        end
+      )
       and .application_pipeline_revision > 0
       and .application_restart_recovered == true
       and .fresh_source_assignment_close == true
@@ -236,6 +254,77 @@ jq -e \
       and .fresh_source_assignment_close == false
       and .first_pipeline_cas == false
       and .missing_extra_corrupt_rf3 == false
+    end
+  )
+  and (
+    if $exercise_deferred_actor_archive == 1 then
+      .sidecar_v13_rf3_inherited == true
+      and .v13_ready_receipt_consumed == true
+      and .qualification_constructed_predecessor_semantic == true
+      and .predecessor_nonempty_input_rf3 == true
+      and .predecessor_deferred_count == 3
+      and .explicit_empty_input_rf3 == true
+      and .explicit_empty_reason == "LegacyActivation"
+      and .predecessor_zero_input_rf3 == false
+      and .external_generation_nonempty_rf3 == true
+      and .external_generation_items == 3
+      and .deferred_before_external_rf3 == true
+      and (.ordered_actor_trace_digest | test("^[0-9a-f]{64}$"))
+      and .fresh_c_fault_rf3 == true
+      and .fresh_c_nats_delta == 0
+      and .fresh_d_fault_rf3 == true
+      and .fresh_d_actor_delta == 0
+      and .apply_retry_bit_exact == true
+      and .finalize_retry_bit_exact == true
+      and .different_input_rejected == true
+      and .actor_builder_create_count == 1
+      and .actor_finalize_count == 1
+      and .semantic_v2_input_bound == true
+      and .successor_application_semantic_bytes > 0
+      and .successor_application_fragments >= 1
+      and .application_archive_handoff_rf3 == true
+      and .handoff_recovery_without_actor_rerun == true
+      and .successor_handoff_revision > 0
+      and .actor_handoff_during_one_replica_offline == true
+      and .qualification_temp_dependency_hydration == true
+      and .production_external_dependency_projection == false
+      and .deferred_input_rf3 == true
+      and .actor_retry_socket_response_loss_injected == false
+      and .full_processor_rf3_runtime == false
+    else
+      .sidecar_v13_rf3_inherited == false
+      and .v13_ready_receipt_consumed == false
+      and .qualification_constructed_predecessor_semantic == false
+      and .predecessor_nonempty_input_rf3 == false
+      and .predecessor_deferred_count == 0
+      and .explicit_empty_input_rf3 == false
+      and .explicit_empty_reason == "none"
+      and .predecessor_zero_input_rf3 == false
+      and .external_generation_nonempty_rf3 == false
+      and .external_generation_items == 0
+      and .deferred_before_external_rf3 == false
+      and .ordered_actor_trace_digest == ""
+      and .fresh_c_fault_rf3 == false
+      and .fresh_c_nats_delta == 0
+      and .fresh_d_fault_rf3 == false
+      and .fresh_d_actor_delta == 0
+      and .apply_retry_bit_exact == false
+      and .finalize_retry_bit_exact == false
+      and .different_input_rejected == false
+      and .actor_builder_create_count == 0
+      and .actor_finalize_count == 0
+      and .semantic_v2_input_bound == false
+      and .successor_application_semantic_bytes == 0
+      and .successor_application_fragments == 0
+      and .application_archive_handoff_rf3 == false
+      and .handoff_recovery_without_actor_rerun == false
+      and .successor_handoff_revision == 0
+      and .actor_handoff_during_one_replica_offline == false
+      and .qualification_temp_dependency_hydration == false
+      and .production_external_dependency_projection == false
+      and .deferred_input_rf3 == false
+      and .actor_retry_socket_response_loss_injected == false
+      and .full_processor_rf3_runtime == false
     end
   )
   and (

@@ -47,6 +47,9 @@ use psy_node_core::{
 use psy_serialize::{PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
+#[cfg(feature = "rf3-test-support")]
+use std::sync::{Mutex, OnceLock};
+
 use crate::{
     guta_planner::realm_guta_planner::{PlannedFutureEndCapJob, RealmGUTAPlanner},
     queue::{
@@ -56,6 +59,103 @@ use crate::{
 };
 pub const REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_BYTES: [u8; 4] = [0x52, 0x47, 0x45, 0x31]; // 'RGE1' in ASCII
 pub const REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32: u32 = 0x31_45_47_52; // 'RGE1' in little-endian u32
+
+/// A behavior-level trace emitted only by the real Realm WithTree builder
+/// while an explicit RF=3 qualification is armed. Ordinary builds contain no
+/// trace state or API.
+#[cfg(feature = "rf3-test-support")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RealmDeferredActorTraceKind {
+    Deferred,
+    External,
+}
+
+#[cfg(feature = "rf3-test-support")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RealmDeferredActorTraceEntry {
+    pub kind: RealmDeferredActorTraceKind,
+    pub job_id: Vec<u8>,
+}
+
+#[cfg(feature = "rf3-test-support")]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RealmDeferredActorQualificationTrace {
+    pub entries: Vec<RealmDeferredActorTraceEntry>,
+    pub builder_create_count: u64,
+    pub finalize_count: u64,
+}
+
+#[cfg(feature = "rf3-test-support")]
+fn qualification_trace_state(
+) -> &'static Mutex<Option<RealmDeferredActorQualificationTrace>> {
+    static TRACE: OnceLock<Mutex<Option<RealmDeferredActorQualificationTrace>>> =
+        OnceLock::new();
+    TRACE.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(feature = "rf3-test-support")]
+pub fn qualification_start_realm_deferred_actor_trace() -> anyhow::Result<()> {
+    let mut state = qualification_trace_state()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Realm actor qualification trace lock is poisoned"))?;
+    anyhow::ensure!(state.is_none(), "Realm actor qualification trace is already armed");
+    *state = Some(RealmDeferredActorQualificationTrace::default());
+    Ok(())
+}
+
+#[cfg(feature = "rf3-test-support")]
+pub fn qualification_finish_realm_deferred_actor_trace(
+) -> anyhow::Result<RealmDeferredActorQualificationTrace> {
+    qualification_trace_state()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Realm actor qualification trace lock is poisoned"))?
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("Realm actor qualification trace is not armed"))
+}
+
+#[cfg(feature = "rf3-test-support")]
+fn qualification_record_realm_actor_entries(
+    kind: RealmDeferredActorTraceKind,
+    job_ids: impl IntoIterator<Item = Vec<u8>>,
+) -> anyhow::Result<()> {
+    let mut state = qualification_trace_state()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Realm actor qualification trace lock is poisoned"))?;
+    if let Some(trace) = state.as_mut() {
+        trace.entries.extend(job_ids.into_iter().map(|job_id| {
+            RealmDeferredActorTraceEntry { kind, job_id }
+        }));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "rf3-test-support")]
+fn qualification_record_realm_actor_builder_created() -> anyhow::Result<()> {
+    let mut state = qualification_trace_state()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Realm actor qualification trace lock is poisoned"))?;
+    if let Some(trace) = state.as_mut() {
+        trace.builder_create_count = trace
+            .builder_create_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("Realm actor builder trace overflow"))?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "rf3-test-support")]
+fn qualification_record_realm_actor_finalized() -> anyhow::Result<()> {
+    let mut state = qualification_trace_state()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Realm actor qualification trace lock is poisoned"))?;
+    if let Some(trace) = state.as_mut() {
+        trace.finalize_count = trace
+            .finalize_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("Realm actor finalize trace overflow"))?;
+    }
+    Ok(())
+}
 
 pub fn get_new_realm_end_cap_gatherer_backup_file_path(
     backup_file_directory: &str,
@@ -657,7 +757,7 @@ impl<
             N::GLOBAL_USER_TREE_HEIGHT,
             config.coordinator_guta_updates_circuit_whitelist,
         );
-        let future_end_cap_jobs = {
+        let future_end_cap_jobs: Vec<PlannedFutureEndCapJob<N::F, N::QHash>> = {
             std::mem::take(
                 config
                     .future_pending_end_cap_jobs
@@ -666,6 +766,11 @@ impl<
                     .as_mut(),
             )
         };
+        #[cfg(feature = "rf3-test-support")]
+        let qualification_deferred_job_ids = future_end_cap_jobs
+            .iter()
+            .map(|job| job.queue_item.job_id.to_fixed_bytes().to_vec())
+            .collect::<Vec<_>>();
         let end_cap_jobs_added = guta_planner
             .add_future_end_cap_jobs(
                 &config.checkpoint_tree,
@@ -675,6 +780,14 @@ impl<
                 future_end_cap_jobs,
             )
             .await?;
+        #[cfg(feature = "rf3-test-support")]
+        {
+            qualification_record_realm_actor_entries(
+                RealmDeferredActorTraceKind::Deferred,
+                qualification_deferred_job_ids,
+            )?;
+            qualification_record_realm_actor_builder_created()?;
+        }
         config
             .file_system
             .file_like_fs_flush_file_with_path(
@@ -709,6 +822,8 @@ impl<
             ));
         }
         let update_header = PsyRealmUserUpdateQueueItem::<N::F, N::QHash>::psy_ser_from_slice(&item)?;
+        #[cfg(feature = "rf3-test-support")]
+        let qualification_external_job_id = update_header.job_id.to_fixed_bytes().to_vec();
         tracing::info!("RealmGUTAEndCapGatherer processing queue item update_header {:?}", update_header);
         self.guta_planner
             .add_end_cap_job(
@@ -720,6 +835,11 @@ impl<
                 update_header,
             )
             .await?;
+        #[cfg(feature = "rf3-test-support")]
+        qualification_record_realm_actor_entries(
+            RealmDeferredActorTraceKind::External,
+            [qualification_external_job_id],
+        )?;
         tracing::info!("RealmGUTAEndCapGatherer finished processing queue item");
         self.config
             .file_system
@@ -790,6 +910,8 @@ impl<
                 anyhow::bail!("GUTA updates gatherer finalize failed");
             }
             let planner_result = result?;
+            #[cfg(feature = "rf3-test-support")]
+            qualification_record_realm_actor_finalized()?;
             let deferred_jobs = planner_result.deferred_jobs;
             {
                 let mut live_projection = self

@@ -3,6 +3,7 @@ use parth_core::protocol::core_types::{Q256BitHash, QNetworkTypesConfig};
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_data::{
     guta::header_extended::{GlobalUserTreeAggregatorHeaderWithTagValue, GlobalUserTreeAggregatorHeaderWithTagValueAndJobType},
+    node::realm_processor::RealmProcessorCoreState,
     node::node_proving_state::PsyNodeProvingState,
     prepared_block::realm::PsyPreparedRealmBlockStateUpdates,
     worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId,
@@ -54,6 +55,104 @@ enum RealmGatheringOutcome<F, Hash, JobId> {
     BranchExactGenerationContinuation(RealmProcessorGenerationContinuation),
     BranchExactAwaitingDeferredCarryover(RealmProcessorGenerationContinuation),
     BranchExactAwaitingClosedSource,
+}
+
+async fn project_branch_exact_semantic_output<
+    N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
+    TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + Send + Sync,
+>(
+    temp_db: &TempDatabase,
+    state: &RealmProcessorCoreState<N::QHash>,
+    processing: PendingGenerationContext,
+    receipt: &DurableTreeGathererFinalizeReceipt<
+        RealmGUTAEndCapGathererOutput<N::F, N::QHash, N::JobId>,
+    >,
+) -> anyhow::Result<RealmProcessorSemanticOutput> {
+    let output = receipt.output();
+    let pending_context = temp_db
+        .require_pending_context_for_generation(&state.realm_identifier, processing)
+        .await?;
+    let mut jobs = Vec::new();
+    for (level, level_jobs) in output.job_ids.iter().enumerate() {
+        let level = u16::try_from(level)?;
+        for (ordinal, job) in level_jobs.iter().enumerate() {
+            let witness = temp_db
+                .get_tdb_proof_witness_bytes(
+                    &state.realm_identifier,
+                    &pending_context,
+                    job.job_id,
+                )
+                .await?;
+            jobs.push(RealmProcessorSemanticJob::try_new(
+                level,
+                u32::try_from(ordinal)?,
+                job.psy_ser_to_bytes_vec()?,
+                witness,
+            )?);
+        }
+    }
+    let deferred_jobs = output
+        .deferred_jobs
+        .iter()
+        .enumerate()
+        .map(|(ordinal, job)| {
+            Ok(RealmProcessorDeferredJob::try_new(
+                u32::try_from(ordinal)?,
+                job.queue_item.psy_ser_to_bytes_vec()?,
+                job.contract_updates.clone(),
+            )?)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    RealmProcessorSemanticOutput::try_from_candidate_parts(
+        RealmProcessorSemanticOutputParts {
+            context_digest: receipt.context_digest(),
+            generation_digest: receipt.generation_digest(),
+            boundary_digest: receipt.boundary_digest(),
+            item_count: receipt.item_count(),
+            input_binding: psy_node_core::queue::realm_processor_semantic_output::RealmProcessorSemanticInputBinding::SuccessorDeferred(
+                receipt.actor_input_digest(),
+            ),
+            processing_checkpoint_id: state.processing_checkpoint_id,
+            processing_checkpoint_root: state.processing_checkpoint_root.into_owned_32bytes(),
+            processing_realm_start_root: state.processing_realm_start_root.into_owned_32bytes(),
+            old_realm_root: output.db_output.old_realm_root.into_owned_32bytes(),
+            new_realm_root: output.db_output.new_realm_root.into_owned_32bytes(),
+            total_users_updated: output.db_output.total_users_updated,
+            total_proofs_generated: output.db_output.total_proofs_generated,
+            global_user_tree_nodes: output.db_output.update_global_user_tree_nodes_ffs.clone(),
+            user_contract_tree_nodes: output.db_output.update_user_contract_tree_nodes_ffs.clone(),
+            contract_state_tree_nodes: output.db_output.update_contract_state_tree_nodes_ffs.clone(),
+            user_leaves: output.db_output.update_user_leaves_ffs.clone(),
+            contract_state_imt_leaves: output.db_output.update_contract_state_imt_leaves_ffs.clone(),
+            guta_header: output.db_output.guta_header.psy_ser_to_bytes_vec()?,
+            jobs,
+            deferred_jobs,
+        },
+    )
+    .map_err(anyhow::Error::from)
+}
+
+/// RF=3 qualification uses the exact same semantic projection as the real
+/// Processor without exposing the Processor owner or any storage receipt.
+#[cfg(feature = "rf3-test-support")]
+pub async fn qualification_project_branch_exact_semantic_output<
+    N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
+    TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + Send + Sync,
+>(
+    temp_db: &TempDatabase,
+    state: &RealmProcessorCoreState<N::QHash>,
+    processing: PendingGenerationContext,
+    receipt: &DurableTreeGathererFinalizeReceipt<
+        RealmGUTAEndCapGathererOutput<N::F, N::QHash, N::JobId>,
+    >,
+) -> anyhow::Result<RealmProcessorSemanticOutput> {
+    project_branch_exact_semantic_output::<N, TempDatabase>(
+        temp_db,
+        state,
+        processing,
+        receipt,
+    )
+    .await
 }
 
 pub(super) enum RealmOwnedIterationError {
@@ -151,92 +250,13 @@ where
             RealmGUTAEndCapGathererOutput<N::F, N::QHash, N::JobId>,
         >,
     ) -> anyhow::Result<RealmProcessorSemanticOutput> {
-        let output = receipt.output();
-        let pending_context = self
-            .db
-            .temp_db
-            .require_pending_context_for_generation(&self.db.state.realm_identifier, processing)
-            .await?;
-        let mut jobs = Vec::new();
-        for (level, level_jobs) in output.job_ids.iter().enumerate() {
-            let level = u16::try_from(level)?;
-            for (ordinal, job) in level_jobs.iter().enumerate() {
-                let witness = self
-                    .db
-                    .temp_db
-                    .get_tdb_proof_witness_bytes(
-                        &self.db.state.realm_identifier,
-                        &pending_context,
-                        job.job_id,
-                    )
-                    .await?;
-                jobs.push(RealmProcessorSemanticJob::try_new(
-                    level,
-                    u32::try_from(ordinal)?,
-                    job.psy_ser_to_bytes_vec()?,
-                    witness,
-                )?);
-            }
-        }
-        let deferred_jobs = output
-            .deferred_jobs
-            .iter()
-            .enumerate()
-            .map(|(ordinal, job)| {
-                Ok(RealmProcessorDeferredJob::try_new(
-                    u32::try_from(ordinal)?,
-                    job.queue_item.psy_ser_to_bytes_vec()?,
-                    job.contract_updates.clone(),
-                )?)
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        RealmProcessorSemanticOutput::try_from_candidate_parts(
-            RealmProcessorSemanticOutputParts {
-                context_digest: receipt.context_digest(),
-                generation_digest: receipt.generation_digest(),
-                boundary_digest: receipt.boundary_digest(),
-                item_count: receipt.item_count(),
-                input_binding: psy_node_core::queue::realm_processor_semantic_output::RealmProcessorSemanticInputBinding::SuccessorDeferred(
-                    receipt.actor_input_digest(),
-                ),
-                processing_checkpoint_id: self.db.state.processing_checkpoint_id,
-                processing_checkpoint_root: self
-                    .db
-                    .state
-                    .processing_checkpoint_root
-                    .into_owned_32bytes(),
-                processing_realm_start_root: self
-                    .db
-                    .state
-                    .processing_realm_start_root
-                    .into_owned_32bytes(),
-                old_realm_root: output.db_output.old_realm_root.into_owned_32bytes(),
-                new_realm_root: output.db_output.new_realm_root.into_owned_32bytes(),
-                total_users_updated: output.db_output.total_users_updated,
-                total_proofs_generated: output.db_output.total_proofs_generated,
-                global_user_tree_nodes: output
-                    .db_output
-                    .update_global_user_tree_nodes_ffs
-                    .clone(),
-                user_contract_tree_nodes: output
-                    .db_output
-                    .update_user_contract_tree_nodes_ffs
-                    .clone(),
-                contract_state_tree_nodes: output
-                    .db_output
-                    .update_contract_state_tree_nodes_ffs
-                    .clone(),
-                user_leaves: output.db_output.update_user_leaves_ffs.clone(),
-                contract_state_imt_leaves: output
-                    .db_output
-                    .update_contract_state_imt_leaves_ffs
-                    .clone(),
-                guta_header: output.db_output.guta_header.psy_ser_to_bytes_vec()?,
-                jobs,
-                deferred_jobs,
-            },
+        project_branch_exact_semantic_output::<N, TempDatabase>(
+            self.db.temp_db.as_ref(),
+            &self.db.state,
+            processing,
+            receipt,
         )
-        .map_err(anyhow::Error::from)
+        .await
     }
 
     async fn get_results_from_gatherers(

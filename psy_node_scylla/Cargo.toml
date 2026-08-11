@@ -13,7 +13,7 @@ serialize_rkyv = ["dep:rkyv","pser/serialize_rkyv", "parth_core/serialize_rkyv"]
 serialize_speedy = ["dep:speedy", "pser/serialize_speedy", "parth_core/serialize_speedy"]
 serialize_postcard = ["dep:postcard", "pser/serialize_postcard", "parth_core/serialize_postcard"]
 parallel_rayon = ["dep:rayon"]
-rf3-test-support = ["psy_node_core/rf3-test-support"]
+rf3-test-support = ["psy_node_core/rf3-test-support", "psy_node_common/rf3-test-support"]
 [dependencies]
 rayon = { workspace = true, optional = true }
 postcard = { workspace = true, optional = true }

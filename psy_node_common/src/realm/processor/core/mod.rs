@@ -33,6 +33,8 @@ use crate::{
 };
 
 mod process_block;
+#[cfg(feature = "rf3-test-support")]
+pub use process_block::qualification_project_branch_exact_semantic_output;
 mod control;
 pub mod runner;
 pub mod startup;

@@ -83,18 +83,33 @@ impl NatsJetStreamClient {
 
         let stream_name = format!("{}_stream", base_namespace.replace('.', "_"));
         let bucket = format!("{}_kv", base_namespace.replace('.', "_"));
+        // JetStream treats zero as the server default, which is one replica.
+        // Normalize it so an existing bucket can be checked against the
+        // effective durability requested by this client.
+        let kv_num_replicas = standard_jet_stream_config.num_replicas.max(1);
 
         let kv = match jetstream.get_key_value(&bucket).await {
             Ok(kv) => kv,
             Err(_) => {
                 jetstream
                     .create_key_value(jetstream::kv::Config {
-                        bucket,
+                        bucket: bucket.clone(),
+                        // The queue client is one durability boundary.  Its KV
+                        // metadata must use the same configured replica count as
+                        // the JetStream data stream; otherwise a nominal RF=3
+                        // deployment can become unrecoverable when the single KV
+                        // leader is the node that fails.
+                        num_replicas: kv_num_replicas,
                         ..Default::default()
                     })
                     .await?
             }
         };
+        let actual_kv_num_replicas = kv.status().await?.info.config.num_replicas;
+        anyhow::ensure!(
+            actual_kv_num_replicas == kv_num_replicas,
+            "NATS KV bucket {bucket} has {actual_kv_num_replicas} replicas, but the queue stream requires {kv_num_replicas}"
+        );
 
         let consumer_cache = Cache::builder()
             .max_capacity(100)
