@@ -15,7 +15,10 @@ fn workspace_root() -> PathBuf {
 }
 
 fn compiler_root() -> PathBuf {
-    workspace_root().join("client_prover/psy_compiler")
+    std::env::var_os("PSY_PROJECTS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_root().join(".."))
+        .join("psy-compiler")
 }
 
 fn provenance_stamp_path() -> PathBuf {
