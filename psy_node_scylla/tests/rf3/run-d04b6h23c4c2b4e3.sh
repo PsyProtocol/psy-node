@@ -255,7 +255,7 @@ jq -e \
   )
   and (
     if $exercise_deferred_actor_archive == 1 then
-      .sidecar_v13_rf3_inherited == true
+      .sidecar_v14_rf3_inherited == true
       and .v14_ready_receipt_consumed == true
       and .qualification_constructed_predecessor_semantic == true
       and .predecessor_nonempty_input_rf3 == true
@@ -295,7 +295,7 @@ jq -e \
       and (.nats_message_envelope_dataset_digest | test("^[0-9a-f]{64}$"))
       and .deferred_actor_nats_duplicate_delta == 0
     else
-      .sidecar_v13_rf3_inherited == false
+      .sidecar_v14_rf3_inherited == false
       and .v14_ready_receipt_consumed == false
       and .qualification_constructed_predecessor_semantic == false
       and .predecessor_nonempty_input_rf3 == false

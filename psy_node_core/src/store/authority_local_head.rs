@@ -11,6 +11,8 @@ use parth_core::protocol::core_types::Q256BitHash;
 use psy_data::protocol::chain_context::{
     AuthorityObservation, ChainContextCodecError, AUTHORITY_OBSERVATION_V1_LEN,
 };
+#[cfg(feature = "rf3-test-support")]
+use sha2::{Digest, Sha256};
 
 use super::{
     authority_commit::AuthorityTimestampKey,
@@ -383,6 +385,64 @@ impl<Hash: Q256BitHash> SealedAuthorityLocalHeadCas<Hash> {
             commit_write_timestamp: prepared.commit_write_timestamp(),
             manifest_digest: AuthorityHeadManifestDigest::from_manifest(
                 prepared.digest(),
+            ),
+            storage_binding: expected.storage_binding,
+        };
+        Ok(Self {
+            key,
+            expected,
+            candidate,
+        })
+    }
+
+    /// Qualification-only bridge for RF=3 compositions that exercise a
+    /// later production-shaped reader without pretending that the writer,
+    /// manifest, or proof chain has already been integrated.
+    ///
+    /// The feature gate keeps this constructor out of normal builds. The
+    /// resulting value still uses the exact full-payload authority-head CAS,
+    /// preserves the storage binding, advances revision/timestamp by one,
+    /// and cannot rewind or change authority.
+    #[cfg(feature = "rf3-test-support")]
+    pub fn seal_qualification_observation_advance(
+        expected: StoredAuthorityLocalHead<Hash>,
+        observation: AuthorityObservation<Hash>,
+    ) -> Result<Self, AuthorityLocalHeadModelError> {
+        let key = expected.head.key();
+        let observed_key = AuthorityTimestampKey::new(
+            observation.chain().network_id(),
+            observation.authority(),
+        );
+        if observed_key != key {
+            return Err(AuthorityLocalHeadModelError::AuthorityChanged);
+        }
+        let head = AuthorityHeadView::try_from_observed(
+            key,
+            *observation.chain(),
+            observation.state_checkpoint_id(),
+            *observation.state_root(),
+        )?;
+        let timestamp = expected
+            .commit_write_timestamp
+            .as_i64()
+            .checked_add(1)
+            .ok_or(AuthorityLocalHeadModelError::TimestampOutOfRange)?;
+        let commit_write_timestamp =
+            CommitWriteTimestampUs::try_from_i128(timestamp as i128)?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"psy.rollback.qualification-authority-head.v1\0");
+        hasher.update(expected.revision.get().to_le_bytes());
+        hasher.update(observation.to_canonical_bytes());
+        let manifest_digest = AuthorityManifestDigest::from_persisted(
+            hasher.finalize().into(),
+        );
+        let candidate = StoredAuthorityLocalHead {
+            revision: expected.revision.checked_next()?,
+            bootstrap_reason: expected.bootstrap_reason,
+            head,
+            commit_write_timestamp,
+            manifest_digest: AuthorityHeadManifestDigest::from_manifest(
+                manifest_digest,
             ),
             storage_binding: expected.storage_binding,
         };

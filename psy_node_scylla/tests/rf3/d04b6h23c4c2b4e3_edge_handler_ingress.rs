@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{bail, ensure};
+use anyhow::{bail, ensure, Context};
 use async_nats::jetstream::{self, consumer::pull::Config as PullConfig, stream::Config as StreamConfig};
 #[cfg(feature = "rf3-test-support")]
 use parth_common::memory_stores::{
@@ -73,11 +73,13 @@ use psy_node_core::{
             RealmProcessorActorInput, RealmProcessorActorInputDigest,
         },
         realm_user_update_artifact::VerifiedRealmUserUpdateRequest,
-        realm_user_update_admission::RealmUserUpdateAdmissionKey,
+        realm_user_update_admission::{
+            RealmUserUpdateAdmissionCloseIntent, RealmUserUpdateAdmissionKey,
+        },
         realm_user_update_claim::{
-            RealmUserUpdateAdmissionOrdinal, RealmUserUpdateClaimBucket,
-            RealmUserUpdateClaimPartition, RealmUserUpdateClaimPhase,
-            RealmUserUpdateCreatedAtSeconds, StoredRealmUserUpdateClaim,
+            RealmUserUpdateClaimBucket, RealmUserUpdateClaimPartition,
+            RealmUserUpdateClaimPhase, RealmUserUpdateCreatedAtSeconds,
+            StoredRealmUserUpdateClaim,
         },
         realm_user_update_dependency::{
             RealmUserUpdateDependencyBundle, RealmUserUpdateDependencyKind,
@@ -103,6 +105,7 @@ use psy_node_core::{
         realm_processor_generation_terminal::{
             RealmProcessorDeferredCarryover, RealmProcessorGenerationTerminal,
         },
+        realm_processor_terminal_authorization::RealmProcessorTerminalAuthorizationEnvelope,
         realm_processor_application_archive::{
             RealmProcessorApplicationArchiveBinding,
             RealmProcessorApplicationArchivePlan,
@@ -117,8 +120,9 @@ use psy_node_core::{
         authority_commit::AuthorityTimestampKey,
         authority_local_head::{
             AuthorityLocalHeadBootstrap, AuthorityLocalHeadBootstrapReason,
-            AuthorityLocalHeadReadState, AuthorityStorageBindingGeneration,
-            AuthorityStorageBindingRef, AuthorityStorageNamespaceId,
+            AuthorityLocalHeadReadState, AuthorityLocalHeadWriteOutcome,
+            AuthorityStorageBindingGeneration, AuthorityStorageBindingRef,
+            AuthorityStorageNamespaceId, SealedAuthorityLocalHeadCas,
         },
         manifest_lifecycle::AuthorityHeadView,
         manifest_record::AuthorityManifestDigest,
@@ -203,6 +207,7 @@ use super::{
         ScyllaRealmProcessorGenerationTerminalStore,
         REALM_PROCESSOR_GENERATION_TERMINAL_TABLE,
     },
+    realm_processor_external_dependency_projection::ScyllaRealmProcessorExternalDependencyProjector,
 };
 #[cfg(feature = "rf3-test-support")]
 use super::realm_processor_durable_capture::{
@@ -298,7 +303,7 @@ struct E3Report {
     terminal_recovery_pipeline_unchanged: bool,
     terminal_recovery_nats_delta: u64,
     terminal_recovery_socket_response_loss_injected: bool,
-    sidecar_v13_rf3_inherited: bool,
+    sidecar_v14_rf3_inherited: bool,
     v14_ready_receipt_consumed: bool,
     qualification_constructed_predecessor_semantic: bool,
     predecessor_nonempty_input_rf3: bool,
@@ -525,37 +530,43 @@ async fn terminal_recovery_snapshot(session: &Session) -> anyhow::Result<Physica
 async fn dependency_timestamps_match_durable_claims(
     session: &Session,
     claims: &ScyllaRealmUserUpdateClaimStore,
-    capture: PendingQueueCaptureContext,
+    captures: &[PendingQueueCaptureContext],
 ) -> anyhow::Result<bool> {
     let mut expected = BTreeMap::new();
-    for bucket in 0..RealmUserUpdateClaimBucket::COUNT {
-        let partition = RealmUserUpdateClaimPartition::try_new(
-            capture,
-            RealmUserUpdateClaimBucket::try_new(bucket)?,
-        )?;
-        for claim in claims.scan_bucket::<PHash>(partition).await? {
-            ensure!(
-                claim.phase() == RealmUserUpdateClaimPhase::Published,
-                "durable Handler claim did not reach Published"
-            );
-            let digest = claim.dependency_digest().ok_or_else(|| {
-                anyhow::anyhow!("published Handler claim is missing dependency digest")
-            })?;
-            let timestamp = RealmUserUpdateDependencyWriteTimestampUs::derive(
-                claim.slot(),
-                digest,
-                claim.created_at().get(),
-            );
-            let previous = expected.insert(
-                (claim.slot().as_bytes().to_vec(), digest.as_bytes().to_vec()),
-                timestamp.as_i64(),
-            );
-            ensure!(previous.is_none(), "duplicate durable claim dependency identity");
+    for capture in captures {
+        for bucket in 0..RealmUserUpdateClaimBucket::COUNT {
+            let partition = RealmUserUpdateClaimPartition::try_new(
+                *capture,
+                RealmUserUpdateClaimBucket::try_new(bucket)?,
+            )?;
+            for claim in claims.scan_bucket::<PHash>(partition).await? {
+                ensure!(
+                    claim.phase() == RealmUserUpdateClaimPhase::Published,
+                    "durable Handler claim did not reach Published"
+                );
+                let digest = claim.dependency_digest().ok_or_else(|| {
+                    anyhow::anyhow!("published Handler claim is missing dependency digest")
+                })?;
+                let timestamp = RealmUserUpdateDependencyWriteTimestampUs::derive(
+                    claim.slot(),
+                    digest,
+                    claim.created_at().get(),
+                );
+                let previous = expected.insert(
+                    (claim.slot().as_bytes().to_vec(), digest.as_bytes().to_vec()),
+                    timestamp.as_i64(),
+                );
+                ensure!(previous.is_none(), "duplicate durable claim dependency identity");
+            }
         }
     }
+    let expected_claims = captures
+        .len()
+        .checked_mul(3)
+        .ok_or_else(|| anyhow::anyhow!("dependency claim count overflow"))?;
     ensure!(
-        expected.len() == 3,
-        "expected three published Handler claims, found {}",
+        expected.len() == expected_claims,
+        "expected {expected_claims} published Handler claims, found {}",
         expected.len()
     );
     let rows = session
@@ -1303,11 +1314,11 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         fixture::control_keyspace(),
     )?;
     ScyllaAuthorityLocalHeadStore::create_schema(&session, &head_keyspace).await?;
-    let head_store = ScyllaAuthorityLocalHeadStore::prepare(
+    let head_store = Arc::new(ScyllaAuthorityLocalHeadStore::prepare(
         Arc::clone(&session),
         head_keyspace,
     )
-    .await?;
+    .await?);
     let head_view = AuthorityHeadView::try_from_observed(
         AuthorityTimestampKey::new(network, authority),
         predecessor_chain,
@@ -1844,7 +1855,7 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
     // bundles as the successor generation's external Data. They are not
     // published by the legacy Handler here: the exact queue/update bytes are
     // later committed through the successor assignment's durable outbox.
-    let mut successor_external_materials = Vec::new();
+    let mut successor_external_requests = Vec::new();
     if exercise_deferred_actor_archive {
         for (offset, leaf_seed) in [404_u64, 505, 606].into_iter().enumerate() {
             let user_id = user_c
@@ -1861,65 +1872,9 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                 N::GLOBAL_USER_TREE_HEIGHT,
                 &input,
             )?;
-            let verified = VerifiedRealmUserUpdateRequest::verify::<
-                PsyTestJTMBProof<PHash>,
-                Verifier,
-                PoseidonHasher,
-            >(
-                &input,
-                proof,
-                GlobalUserTreeHeight::try_new(N::GLOBAL_USER_TREE_HEIGHT)?,
-                &bound,
-            )?;
-            let claim = StoredRealmUserUpdateClaim::claimed(
-                admission.clone(),
-                profile.id(),
-                verified.user_id(),
-                verified.request_digest(),
-                RealmUserUpdateCreatedAtSeconds::try_new(
-                    1_700_000_400_u32
-                        .checked_add(u32::try_from(offset)?)
-                        .ok_or_else(|| anyhow::anyhow!("created-at overflow"))?,
-                )?,
-                RealmUserUpdateAdmissionOrdinal::try_new(
-                    100_u64
-                        .checked_add(u64::try_from(offset)?)
-                        .ok_or_else(|| anyhow::anyhow!("admission ordinal overflow"))?,
-                )?,
-            )?;
-            let material = factory.build(&claim, &input)?;
-            let artifacts = seal_realm_user_update_ingress_artifacts::<
-                PF,
-                PHash,
-                PoseidonHasher,
-            >(admission.clone(), &claim, &verified, material)?;
-            let bundle = RealmUserUpdateDependencyBundle::try_new_validated(
-                &claim,
-                &artifacts,
-            )?;
-            let queue_item = bundle
-                .component(RealmUserUpdateDependencyKind::QueuePayload)
-                .bytes()
-                .to_vec();
-            let contract_updates = bundle
-                .component(RealmUserUpdateDependencyKind::ContractUpdates)
-                .bytes()
-                .to_vec();
-            ensure!(!contract_updates.is_empty());
-            ensure!(
-                PsyRealmUserUpdateQueueItem::<PF, PHash>::psy_ser_from_slice(
-                    &queue_item,
-                )?
-                .psy_ser_to_bytes_vec()?
-                    == queue_item
-            );
-            successor_external_materials.push(QualificationJobMaterial {
-                user_id,
-                queue_item,
-                contract_updates,
-            });
+            successor_external_requests.push((user_id, input, proof));
         }
-        ensure!(successor_external_materials.len() == 3);
+        ensure!(successor_external_requests.len() == 3);
     }
 
     drop(handler);
@@ -1938,9 +1893,9 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
     );
     let restarted = compose_handler(
         lineage,
-        verifier,
-        profile,
-        restarted_nats,
+        Arc::clone(&verifier),
+        profile.clone(),
+        Arc::clone(&restarted_nats),
     )
     .await?;
     let retry_input = end_cap_input(
@@ -1975,6 +1930,66 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         !exercise_deferred_actor_archive
             || predecessor_deferred_materials.len() == 3
     );
+
+    let initial_qualification_fence = if exercise_durable_replay {
+        // Durable consumption is authorized by the closed admission manifest,
+        // not merely by observing Data/Seal in JetStream. Qualify the complete
+        // gathering generation while it is still the pipeline's selected
+        // gathering identity; the following rotation moves that exact identity
+        // into processing for capture.
+        let initial_observations = Arc::new(
+            ScyllaRealmAuthorityObservationReader::<PHash>::try_new(
+                Arc::clone(&head_store),
+                AuthorityTimestampKey::new(network, authority),
+            )?,
+        );
+        let initial_registry = Arc::new(
+            RealmUserUpdateVerifierRegistry::try_new([(
+                profile.clone(),
+                Arc::clone(&verifier),
+            )])?,
+        );
+        let initial_router = ScyllaRealmUserUpdateDurableRouter::<
+            PF,
+            PHash,
+            PoseidonHasher,
+            PsyTestJTMBProof<PHash>,
+            Verifier,
+        >::prepare(
+            Arc::clone(&session),
+            network,
+            authority,
+            GlobalUserTreeHeight::try_new(N::GLOBAL_USER_TREE_HEIGHT)?,
+            N::REALM_GLOBAL_USER_TREE_HEIGHT,
+            profile.id(),
+            initial_registry,
+            initial_observations,
+            Arc::clone(&sidecar_ready),
+            Arc::clone(&restarted_nats),
+        )
+        .await?;
+        initial_router
+            .attest_startup()
+            .await
+            .context("initial generation admission route was not open")?;
+        let initial_admission_key = RealmUserUpdateAdmissionKey::try_new(capture)?;
+        let initial_admission_close =
+            RealmUserUpdateAdmissionCloseIntent::derive(initial_admission_key, [0xCF; 32])?;
+        admission_guard
+            .close_generation::<PHash>(initial_admission_key, initial_admission_close)
+            .await?;
+        let qualification = initial_router
+            .qualify_generation(initial_admission_key, initial_admission_close)
+            .await
+            .context("initial generation admission qualification failed")?;
+        Some(*qualification
+            .current()
+            .generation_qualification()
+            .ok_or_else(|| anyhow::anyhow!("qualified admission omitted qualification"))?
+            .fence())
+    } else {
+        None
+    };
 
     let mut durable_generation_replayed = false;
     let mut durable_generation_items = 0_u64;
@@ -2024,6 +2039,7 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
     let mut actor_handoff_during_one_replica_offline = false;
     let mut deferred_actor_nats_message_count_before = 0_u64;
     let mut expected_nats_after_deferred_actor = 0_u64;
+    let mut successor_dependency_capture = None;
     let (durable_capture_items, durable_capture_empty_poll_not_close) =
         if let Some(owner) = branch_exact_commit_owner.as_mut() {
             // Edge always publishes to the gathering generation. Retire the
@@ -2069,6 +2085,20 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                     .await?,
             )?;
             ensure!(sealing.processing() == capture.processing());
+            if let Some(qualification_fence) = initial_qualification_fence {
+                ensure!(
+                    qualification_fence.matches_processing_pipeline(
+                        RealmUserUpdateAdmissionKey::try_new(capture)?,
+                        &sealing,
+                    ),
+                    "initial qualification fence mismatch after rotation: key_match={} activation_match={} processing_match={} frontier_match={} blocked={:?}",
+                    sealing.key() == capture.key(),
+                    sealing.activation_digest() == capture.activation(),
+                    sealing.processing() == capture.processing(),
+                    sealing.frontier() == qualification_fence.frontier(),
+                    sealing.blocked_reason(),
+                );
+            }
 
             if exercise_durable_replay {
                 // Publish the structural Seal through the same durable outbox
@@ -2192,7 +2222,8 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                     })?;
                 let initial_external_input = capture_owner
                     .qualify_external_actor_input(generation)
-                    .await?;
+                    .await
+                    .context("initial generation durable consumer qualification failed")?;
                 durable_generation_items =
                     u64::try_from(initial_external_input.items().len())?;
                 ensure!(durable_generation_items == 3);
@@ -2256,7 +2287,8 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                     .collect::<Vec<_>>();
                 let restarted_external_input = restarted_capture
                     .qualify_external_actor_input(replayed)
-                    .await?;
+                    .await
+                    .context("restarted initial generation durable consumer qualification failed")?;
                 let restarted_deferred_input = restarted_capture
                     .take_deferred_actor_input()
                     .await?;
@@ -2449,8 +2481,7 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                             )
                             .await?,
                         );
-                        let recovery_nats_before =
-                            stream_messages(&jetstream, segment.stream_name()).await?;
+                        let recovery_nats_before;
 
                         let (work_continuation, _, work_captured) = application_store
                             .observe_generation_continuation::<PHash>(
@@ -2512,6 +2543,28 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                                 )?)
                                 .await?,
                         )?;
+                        let current_head = match head_store
+                            .read::<PHash>(AuthorityTimestampKey::new(
+                                network,
+                                authority,
+                            ))
+                            .await?
+                        {
+                            AuthorityLocalHeadReadState::Current(current) => current,
+                            AuthorityLocalHeadReadState::Uninitialized => {
+                                bail!("authority-local head disappeared before qualification advance")
+                            }
+                        };
+                        let head_advance =
+                            SealedAuthorityLocalHeadCas::seal_qualification_observation_advance(
+                                current_head,
+                                published_observation,
+                            )?;
+                        ensure!(matches!(
+                            head_store.compare_and_set(&head_advance).await?,
+                            AuthorityLocalHeadWriteOutcome::Applied(_)
+                                | AuthorityLocalHeadWriteOutcome::Idempotent(_)
+                        ));
 
                         let before_terminal_absent =
                             terminal_recovery_snapshot(&session).await?;
@@ -2542,13 +2595,246 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                                     ))?,
                                 prefix,
                             )?;
+                        let (terminal_authorization, successor_fixture) =
+                            if exercise_deferred_actor_archive {
+                                // Qualification-only writer/head stand-in for
+                                // the terminal envelope. The successor
+                                // dependency itself is selected through the
+                                // production projector after a real durable
+                                // Handler generation has been closed and
+                                // qualified. No production terminal authorizer
+                                // or pipeline rotation authority is claimed.
+                                let successor_capture =
+                                    PendingQueueCaptureContext::try_new(
+                                        key,
+                                        activation,
+                                        published.gathering(),
+                                    )?;
+                                successor_dependency_capture = Some(successor_capture);
+                                let successor_assignment = ledger
+                                    .reserve_generation(
+                                        &ledger_key,
+                                        successor_capture,
+                                    )
+                                    .await?;
+                                let successor_admission_key =
+                                    RealmUserUpdateAdmissionKey::try_new(
+                                        successor_capture,
+                                    )?;
+                                admission_guard
+                                    .provision_generation::<PHash>(
+                                        successor_admission_key,
+                                    )
+                                    .await?;
+                                let successor_observations = Arc::new(
+                                    ScyllaRealmAuthorityObservationReader::<PHash>::try_new(
+                                        Arc::clone(&head_store),
+                                        AuthorityTimestampKey::new(
+                                            network,
+                                            authority,
+                                        ),
+                                    )?,
+                                );
+                                let successor_registry = Arc::new(
+                                    RealmUserUpdateVerifierRegistry::try_new([(
+                                        profile.clone(),
+                                        Arc::clone(&verifier),
+                                    )])?,
+                                );
+                                let successor_router =
+                                    ScyllaRealmUserUpdateDurableRouter::<
+                                        PF,
+                                        PHash,
+                                        PoseidonHasher,
+                                        PsyTestJTMBProof<PHash>,
+                                        Verifier,
+                                    >::prepare(
+                                        Arc::clone(&session),
+                                        network,
+                                        authority,
+                                        GlobalUserTreeHeight::try_new(
+                                            N::GLOBAL_USER_TREE_HEIGHT,
+                                        )?,
+                                        N::REALM_GLOBAL_USER_TREE_HEIGHT,
+                                        profile.id(),
+                                        successor_registry,
+                                        successor_observations,
+                                        Arc::clone(&sidecar_ready),
+                                        Arc::clone(&restarted_nats),
+                                    )
+                                    .await?;
+                                successor_router
+                                    .attest_startup()
+                                    .await
+                                    .context(
+                                        "successor router startup attestation",
+                                    )?;
+                                let successor_publisher = Arc::new(
+                                    restarted_nats
+                                        .recoverable_pending_publisher(
+                                            segment.clone(),
+                                        )
+                                        .await?,
+                                );
+                                let successor_publish_store =
+                                    ScyllaPendingQueuePublishStore::prepare(
+                                        Arc::clone(&session),
+                                        successor_publisher,
+                                        segment.clone(),
+                                        PendingQueuePublishKeyspaces::new(
+                                            control.clone(),
+                                            PendingQueuePublishDataKeyspace::try_new(
+                                                fixture::KEYSPACE,
+                                            )?,
+                                        ),
+                                    )
+                                    .await?;
+                                let publisher_kind =
+                                    PendingQueuePublisherKind::RealmUserUpdate;
+                                successor_publish_store
+                                    .bootstrap_source(
+                                        &successor_assignment,
+                                        publisher_kind,
+                                    )
+                                    .await?;
+                                let successor_nats_before = stream_messages(
+                                    &jetstream,
+                                    segment.stream_name(),
+                                )
+                                .await?;
+                                deferred_actor_nats_message_count_before =
+                                    successor_nats_before;
+                                for (_, input, proof) in
+                                    &successor_external_requests
+                                {
+                                    restarted
+                                        .handle_user_end_cap_proof_submission(
+                                            input.clone(),
+                                            proof.clone(),
+                                        )
+                                        .await
+                                        .context(
+                                            "successor durable Handler submission",
+                                        )?;
+                                }
+                                let successor_users = successor_external_requests
+                                    .iter()
+                                    .map(|(user_id, _, _)| *user_id)
+                                    .collect::<BTreeSet<_>>();
+                                let successor_external_materials =
+                                    read_published_job_materials(
+                                        Arc::clone(&session),
+                                        claims.as_ref(),
+                                        successor_capture,
+                                        &successor_users,
+                                    )
+                                    .await?;
+                                ensure!(successor_external_materials.len() == 3);
+                                let successor_admission_close =
+                                    RealmUserUpdateAdmissionCloseIntent::derive(
+                                        successor_admission_key,
+                                        [0xDE; 32],
+                                    )?;
+                                admission_guard
+                                    .close_generation::<PHash>(
+                                        successor_admission_key,
+                                        successor_admission_close,
+                                    )
+                                    .await?;
+                                successor_router
+                                    .qualify_generation(
+                                        successor_admission_key,
+                                        successor_admission_close,
+                                    )
+                                    .await
+                                    .context(
+                                        "successor generation qualification",
+                                    )?;
+                                let dependency_projector =
+                                    ScyllaRealmProcessorExternalDependencyProjector::<
+                                        PF,
+                                        PHash,
+                                    >::prepare(
+                                        Arc::clone(&session),
+                                        network,
+                                        authority,
+                                        GlobalUserTreeHeight::try_new(
+                                            N::GLOBAL_USER_TREE_HEIGHT,
+                                        )?,
+                                        Arc::clone(&sidecar_ready),
+                                        segment.clone(),
+                                    )
+                                    .await?;
+                                let dependency = dependency_projector
+                                    .read_exact(
+                                        successor_capture,
+                                        successor_admission_close,
+                                        *successor_assignment
+                                            .assignment()
+                                            .digest()
+                                            .as_bytes(),
+                                    )
+                                    .await?;
+                                let BranchExactWriterReadState::Current(
+                                    qualification_writer,
+                                ) = activated
+                                    .writer_store
+                                    .read::<PHash>(BranchExactWriterAuthorityKey::new(
+                                        network,
+                                        authority,
+                                    ))
+                                    .await?
+                                else {
+                                    bail!("qualification writer disappeared")
+                                };
+                                let AuthorityLocalHeadReadState::Current(
+                                    qualification_head,
+                                ) = head_store
+                                    .read::<PHash>(AuthorityTimestampKey::new(
+                                        network,
+                                        authority,
+                                    ))
+                                    .await?
+                                else {
+                                    bail!("qualification head disappeared")
+                                };
+                                let envelope =
+                                    RealmProcessorTerminalAuthorizationEnvelope::try_new(
+                                        dependency.commitment(),
+                                        *qualification_writer.slot().as_bytes(),
+                                        qualification_writer.revision().get(),
+                                        qualification_writer.to_canonical_bytes(),
+                                        qualification_head.revision().get(),
+                                        qualification_head
+                                            .encode_canonical()
+                                            .to_vec(),
+                                    )?;
+                                (
+                                    envelope.to_canonical_bytes(),
+                                    Some((
+                                        successor_capture,
+                                        successor_assignment,
+                                        successor_publish_store,
+                                        successor_nats_before,
+                                    )),
+                                )
+                            } else {
+                                (vec![0xB6; 96], None)
+                            };
+                        // The successor fixture deliberately publishes its
+                        // three Data envelopes before terminal/carryover
+                        // recovery begins. Start the zero-side-effect window
+                        // after those durable inputs exist so they are not
+                        // misclassified as recovery traffic.
+                        recovery_nats_before =
+                            stream_messages(&jetstream, segment.stream_name()).await?;
                         let terminal = RealmProcessorGenerationTerminal::try_new(
                             &published,
                             terminal_reserved,
                             *assignment.assignment().digest().as_bytes(),
                             *application_store.fingerprint().as_bytes(),
                             application,
-                            vec![0xB6; 96],
+                            terminal_authorization,
                         )?;
                         terminal_store
                             .qualification_persist(terminal.clone())
@@ -2864,74 +3150,17 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                             predecessor_nonempty_input_rf3 =
                                 application.deferred_count() == 3;
                             ensure!(predecessor_nonempty_input_rf3);
-                            // Reserve and publish a real closed successor
-                            // generation while the terminal's successor is
-                            // still the pipeline gathering identity. The
-                            // qualification-only rotation is applied only
-                            // after all predecessor recovery assertions above.
-                            let successor_capture = PendingQueueCaptureContext::try_new(
-                                key,
-                                activation,
-                                terminal.successor(),
-                            )?;
-                            ensure!(successor_capture.processing() == published.gathering());
-                            let successor_assignment = ledger
-                                .reserve_generation(&ledger_key, successor_capture)
-                                .await?;
-                            let successor_publisher = Arc::new(
-                                nats.recoverable_pending_publisher(segment.clone()).await?,
-                            );
-                            let successor_publish_store =
-                                ScyllaPendingQueuePublishStore::prepare(
-                                    Arc::clone(&session),
-                                    successor_publisher,
-                                    segment.clone(),
-                                    PendingQueuePublishKeyspaces::new(
-                                        control.clone(),
-                                        PendingQueuePublishDataKeyspace::try_new(
-                                            fixture::KEYSPACE,
-                                        )?,
-                                    ),
-                                )
-                                .await?;
-                            let publisher_kind = PendingQueuePublisherKind::RealmUserUpdate;
-                            successor_publish_store
-                                .bootstrap_source(&successor_assignment, publisher_kind)
-                                .await?;
-                            let successor_nats_before = stream_messages(
-                                &jetstream,
-                                segment.stream_name(),
-                            )
-                            .await?;
-                            deferred_actor_nats_message_count_before =
-                                successor_nats_before;
-                            for (index, material) in
-                                successor_external_materials.iter().enumerate()
-                            {
-                                let marker = 0xD8_u8
-                                    .checked_add(u8::try_from(index)?)
-                                    .ok_or_else(|| anyhow::anyhow!(
-                                        "successor publish marker overflow"
-                                    ))?;
-                                let slot = successor_publish_store
-                                    .materialize_data(
-                                        &successor_assignment,
-                                        publisher_kind,
-                                        PendingQueuePublishIntentId::try_new([marker; 32])?,
-                                        &material.queue_item,
-                                    )
-                                    .await?;
-                                let bound = successor_publish_store
-                                    .bind_materialized(
-                                        &successor_assignment,
-                                        publisher_kind,
-                                        slot,
-                                    )
-                                    .await?;
-                                successor_publish_store
-                                    .publish_and_commit(&successor_assignment, bound)
-                                    .await?;
-                            }
+                            let Some((
+                                successor_capture,
+                                successor_assignment,
+                                successor_publish_store,
+                                successor_nats_before,
+                            )) = successor_fixture
+                            else {
+                                bail!("deferred actor successor fixture missing")
+                            };
+                            let publisher_kind =
+                                PendingQueuePublisherKind::RealmUserUpdate;
 
                             let rotation = published.seal_rotation(terminal_reserved)?;
                             ensure!(rotation.candidate() == terminal.candidate_pipeline());
@@ -3627,11 +3856,15 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
     )?;
     fixture::wait_up(3).await?;
 
+    let mut dependency_captures = vec![capture];
+    if let Some(successor_capture) = successor_dependency_capture {
+        dependency_captures.push(successor_capture);
+    }
     let dependency_explicit_timestamp_verified =
         dependency_timestamps_match_durable_claims(
             &session,
             claims.as_ref(),
-            capture,
+            &dependency_captures,
         )
         .await?;
     ensure!(dependency_explicit_timestamp_verified);
@@ -3714,13 +3947,19 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         replica.row_count(
             &control,
             "branch_exact_realm_user_update_admission_v1",
-        )? == 4
+        )? == if exercise_deferred_actor_archive {
+            2 * (usize::from(RealmUserUpdateClaimBucket::COUNT) + 1)
+        } else if exercise_durable_replay {
+            usize::from(RealmUserUpdateClaimBucket::COUNT) + 1
+        } else {
+            4
+        }
     );
     ensure!(
         replica.row_count(
             &control,
             "branch_exact_realm_user_update_claim_v2",
-        )? == 3
+        )? == if exercise_deferred_actor_archive { 6 } else { 3 }
     );
     ensure!(
         replica.row_count(
@@ -3890,7 +4129,7 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         terminal_recovery_pipeline_unchanged,
         terminal_recovery_nats_delta,
         terminal_recovery_socket_response_loss_injected: false,
-        sidecar_v13_rf3_inherited: exercise_deferred_actor_archive,
+        sidecar_v14_rf3_inherited: exercise_deferred_actor_archive,
         v14_ready_receipt_consumed,
         qualification_constructed_predecessor_semantic,
         predecessor_nonempty_input_rf3,
