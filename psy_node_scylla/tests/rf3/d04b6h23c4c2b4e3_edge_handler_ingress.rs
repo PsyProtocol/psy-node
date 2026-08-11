@@ -67,8 +67,11 @@ use psy_node_core::{
         PsyNodeCheckpointTreeDatabaseReader,
         PsyNodeCoreDatabaseBasicContractInfoStoreWriter,
     },
-    psy_temp_db::{QTempDBPendingContextWriter, QTempDBUserContractUpdatesWriter},
+    psy_temp_db::QTempDBPendingContextWriter,
     queue::{
+        realm_processor_actor_input::{
+            RealmProcessorActorInput, RealmProcessorActorInputDigest,
+        },
         realm_user_update_artifact::VerifiedRealmUserUpdateRequest,
         realm_user_update_admission::RealmUserUpdateAdmissionKey,
         realm_user_update_claim::{
@@ -296,7 +299,7 @@ struct E3Report {
     terminal_recovery_nats_delta: u64,
     terminal_recovery_socket_response_loss_injected: bool,
     sidecar_v13_rf3_inherited: bool,
-    v13_ready_receipt_consumed: bool,
+    v14_ready_receipt_consumed: bool,
     qualification_constructed_predecessor_semantic: bool,
     predecessor_nonempty_input_rf3: bool,
     predecessor_deferred_count: u32,
@@ -316,7 +319,7 @@ struct E3Report {
     different_input_rejected: bool,
     actor_builder_create_count: u64,
     actor_finalize_count: u64,
-    semantic_v2_input_bound: bool,
+    semantic_v3_input_bound: bool,
     successor_application_semantic_bytes: usize,
     successor_application_fragments: u32,
     application_archive_handoff_rf3: bool,
@@ -699,7 +702,6 @@ async fn start_qualification_realm_actor(
     context: PendingQueueCaptureContext,
     chain: CanonicalChainRef<PHash>,
     checkpoint_id: u64,
-    materials: &[QualificationJobMaterial],
 ) -> anyhow::Result<(
     QualificationRealmActor,
     tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -731,18 +733,6 @@ async fn start_qualification_realm_actor(
     );
     temp.set_current_pending_context(&realm_identifier, &pending_context)
         .await?;
-    for material in materials {
-        let item = PsyRealmUserUpdateQueueItem::<PF, PHash>::psy_ser_from_slice(
-            &material.queue_item,
-        )?;
-        temp.set_contract_updates_for_user(
-            &realm_identifier,
-            processing.pending_id().get(),
-            item.new_user_leaf.user_id.to_u64_value(),
-            material.contract_updates.clone(),
-        )
-        .await?;
-    }
 
     let checkpoint_tree = Arc::new(
         PsyDashMemoryAppendOnlyMerkleStore::<PoseidonHasher, PHash>::new(
@@ -801,6 +791,7 @@ async fn start_qualification_realm_actor(
             PHash::from_owned_32bytes([0xD7; 32]),
         checkpoint_tree,
         future_pending_end_cap_jobs: Arc::new(RwLock::new(Vec::new())),
+        durable_external_dependencies: None,
         _phantom_n: std::marker::PhantomData,
     };
     let queue_key = QPStandardUniqueIdQueueKey {
@@ -1230,6 +1221,7 @@ async fn compose_handler(
     .install_durable_user_update_ingress(installation)?)
 }
 
+#[cfg(feature = "rf3-test-support")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "requires isolated e3 Scylla RF=3 and NATS RF=3 runner"]
 async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()> {
@@ -2005,7 +1997,7 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
     let mut application_toctou_rejected = false;
     let mut terminal_recovery_pipeline_unchanged = false;
     let mut terminal_recovery_nats_delta = 0_u64;
-    let mut v13_ready_receipt_consumed = false;
+    let mut v14_ready_receipt_consumed = false;
     let mut qualification_constructed_predecessor_semantic = false;
     let mut predecessor_nonempty_input_rf3 = false;
     let mut predecessor_deferred_count = 0_u32;
@@ -2023,7 +2015,7 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
     let mut different_input_rejected = false;
     let mut actor_builder_create_count = 0_u64;
     let mut actor_finalize_count = 0_u64;
-    let mut semantic_v2_input_bound = false;
+    let mut semantic_v3_input_bound = false;
     let mut successor_application_semantic_bytes = 0_usize;
     let mut successor_application_fragments = 0_u32;
     let mut application_archive_handoff_rf3 = false;
@@ -2198,12 +2190,24 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                             "closed durable source did not reconstruct a generation"
                         )
                     })?;
-                let _initial_actor_input =
-                    capture_owner.take_deferred_actor_input().await?;
-                durable_generation_items = generation.item_count();
+                let initial_external_input = capture_owner
+                    .qualify_external_actor_input(generation)
+                    .await?;
+                durable_generation_items =
+                    u64::try_from(initial_external_input.items().len())?;
                 ensure!(durable_generation_items == 3);
-                let first_digest = generation.digest();
-                let first_items = generation.into_business_items();
+                let first_digest = initial_external_input.generation_digest();
+                let first_items = initial_external_input
+                    .items()
+                    .iter()
+                    .map(|item| item.queue_item().to_vec())
+                    .collect::<Vec<_>>();
+                let initial_deferred_input =
+                    capture_owner.take_deferred_actor_input().await?;
+                let _initial_actor_input = RealmProcessorActorInput::try_new(
+                    initial_deferred_input,
+                    initial_external_input,
+                )?;
                 durable_generation_replayed = true;
 
                 // Drop the capture/gather-task side and reconstruct solely
@@ -2234,10 +2238,6 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                             "gather-task restart lost closed durable generation"
                         )
                     })?;
-                let restarted_actor_input = restarted_capture
-                    .take_deferred_actor_input()
-                    .await?;
-                let restarted_input_digest = restarted_actor_input.digest();
                 durable_generation_digest_stable =
                     replayed.digest() == first_digest;
                 let replayed_context_digest = replayed.context().digest();
@@ -2254,6 +2254,17 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                             .map(|item| item.payload().to_vec())
                     })
                     .collect::<Vec<_>>();
+                let restarted_external_input = restarted_capture
+                    .qualify_external_actor_input(replayed)
+                    .await?;
+                let restarted_deferred_input = restarted_capture
+                    .take_deferred_actor_input()
+                    .await?;
+                let restarted_actor_input = RealmProcessorActorInput::try_new(
+                    restarted_deferred_input,
+                    restarted_external_input,
+                )?;
+                let restarted_input_digest = restarted_actor_input.digest();
                 gather_task_restart_replayed = durable_generation_digest_stable
                     && replayed_items == first_items;
                 ensure!(durable_generation_digest_stable);
@@ -2265,7 +2276,7 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                         // LegacyActivation BootstrapEmpty row. Run the real
                         // Realm WithTree actor at the immediately preceding
                         // checkpoint so all three canonical external items
-                        // become ordered deferred jobs in its v2 semantic
+                        // become ordered deferred jobs in its v3 semantic
                         // output. That output is then persisted through the
                         // production capture/archive/handoff path below.
                         let actor_checkpoint = checkpoint_id
@@ -2279,14 +2290,10 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                                 capture,
                                 *sealing.frontier().chain(),
                                 actor_checkpoint,
-                                &predecessor_deferred_materials,
                             )
                             .await?;
                         let apply = actor
-                            .qualification_apply_durable_generation(
-                                replayed,
-                                restarted_actor_input,
-                            )
+                            .qualification_apply_durable_generation(restarted_actor_input)
                             .await?;
                         ensure!(apply.actor_revision().get() == 1);
                         let finalized = actor
@@ -2329,7 +2336,7 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                                 generation_digest: replayed_generation_digest,
                                 boundary_digest: replayed_boundary_digest,
                                 item_count: replayed_item_count,
-                                input_binding: psy_node_core::queue::realm_processor_semantic_output::RealmProcessorSemanticInputBinding::SuccessorDeferred(restarted_input_digest),
+                                input_binding: psy_node_core::queue::realm_processor_semantic_output::RealmProcessorSemanticInputBinding::SuccessorQualified(restarted_input_digest),
                                 processing_checkpoint_id: checkpoint_id,
                                 processing_checkpoint_root: [0xA1; 32],
                                 processing_realm_start_root: [0xA2; 32],
@@ -2853,7 +2860,7 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                         ensure!(terminal_recovery_nats_delta == 0);
 
                         if exercise_deferred_actor_archive {
-                            v13_ready_receipt_consumed = true;
+                            v14_ready_receipt_consumed = true;
                             predecessor_nonempty_input_rf3 =
                                 application.deferred_count() == 3;
                             ensure!(predecessor_nonempty_input_rf3);
@@ -3118,15 +3125,12 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                             // The real Realm actor/retry/archive chain follows
                             // after the C/D fault windows have restored exact
                             // storage bytes.
-                            let mut actor_materials = predecessor_deferred_materials.clone();
-                            actor_materials.extend(successor_external_materials.clone());
                             qualification_start_realm_deferred_actor_trace()?;
                             let (actor, actor_task, actor_temp, actor_state) =
                                 start_qualification_realm_actor(
                                     successor_capture,
                                     *successor_sealing.frontier().chain(),
                                     checkpoint_id,
-                                    &actor_materials,
                                 )
                                 .await?;
 
@@ -3146,7 +3150,6 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                                     bail!("successor input became unavailable before actor apply")
                                 }
                             };
-                            let actor_input_digest = apply1_input.digest();
                             let mut apply1_capture = apply1_iteration
                                 .open_durable_capture_for_deferred_input(apply1_input)
                                 .await?;
@@ -3156,14 +3159,19 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                                 .ok_or_else(|| anyhow::anyhow!(
                                     "successor generation disappeared before actor apply"
                                 ))?;
-                            let apply1_input = apply1_capture
+                            let apply1_external = apply1_capture
+                                .qualify_external_actor_input(apply1_generation)
+                                .await?;
+                            let apply1_deferred = apply1_capture
                                 .take_deferred_actor_input()
                                 .await?;
+                            let apply1_input = RealmProcessorActorInput::try_new(
+                                apply1_deferred,
+                                apply1_external,
+                            )?;
+                            let actor_input_digest = apply1_input.digest();
                             let discarded_apply = actor
-                                .qualification_apply_durable_generation(
-                                    apply1_generation,
-                                    apply1_input,
-                                )
+                                .qualification_apply_durable_generation(apply1_input)
                                 .await?;
                             ensure!(discarded_apply.actor_revision().get() == 1);
                             ensure!(discarded_apply.actor_input_digest() == actor_input_digest);
@@ -3193,14 +3201,18 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                                 .ok_or_else(|| anyhow::anyhow!(
                                     "successor generation disappeared before finalize"
                                 ))?;
-                            let finalize1_input = finalize1_capture
+                            let finalize1_external = finalize1_capture
+                                .qualify_external_actor_input(finalize1_generation)
+                                .await?;
+                            let finalize1_deferred = finalize1_capture
                                 .take_deferred_actor_input()
                                 .await?;
+                            let finalize1_input = RealmProcessorActorInput::try_new(
+                                finalize1_deferred,
+                                finalize1_external,
+                            )?;
                             let apply_retry = actor
-                                .qualification_apply_durable_generation(
-                                    finalize1_generation,
-                                    finalize1_input,
-                                )
+                                .qualification_apply_durable_generation(finalize1_input)
                                 .await?;
                             ensure!(apply_retry.actor_revision().get() == 1);
                             let discarded_finalize = actor
@@ -3224,7 +3236,7 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                             drop(finalize1_capture);
                             drop(finalize1_iteration);
 
-                            // Final retry keeps the capture alive so the v2
+                            // Final retry keeps the capture alive so the v3
                             // semantic can flow through the exact production
                             // archive/handoff method after retry invariants and
                             // a different-input rejection are checked.
@@ -3249,14 +3261,18 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                                 .ok_or_else(|| anyhow::anyhow!(
                                     "successor generation disappeared on final retry"
                                 ))?;
-                            let final_input = final_capture
+                            let final_external = final_capture
+                                .qualify_external_actor_input(final_generation)
+                                .await?;
+                            let final_deferred = final_capture
                                 .take_deferred_actor_input()
                                 .await?;
+                            let final_input = RealmProcessorActorInput::try_new(
+                                final_deferred,
+                                final_external,
+                            )?;
                             let final_apply = actor
-                                .qualification_apply_durable_generation(
-                                    final_generation,
-                                    final_input,
-                                )
+                                .qualification_apply_durable_generation(final_input)
                                 .await?;
                             ensure!(final_apply.actor_revision().get() == 1);
                             let final_receipt = actor
@@ -3284,7 +3300,13 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                                     == Some(actor_input_digest)
                             );
                             finalize_retry_bit_exact = true;
-                            semantic_v2_input_bound = true;
+                            semantic_v3_input_bound = true;
+
+                            // Release the final actor capture before opening
+                            // independent affine owners for the different-
+                            // input cache check and the archive handoff.
+                            drop(final_capture);
+                            drop(final_iteration);
 
                             let different_carryover =
                                 RealmProcessorDeferredCarryover::try_bootstrap_empty(
@@ -3300,21 +3322,49 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                                     different_carryover,
                                     None,
                                 )?;
-                            ensure!(different_input.digest() != actor_input_digest);
-                            let different_generation = final_capture
+                            let mut different_iteration = owner.begin_iteration(
+                                iteration_gate.try_begin_iteration()?,
+                            )?;
+                            let selected_different_input = match different_iteration
+                                .prepare_deferred_actor_input()
+                                .await?
+                            {
+                                RealmProcessorDeferredActorInputOutcome::Ready(input) => input,
+                                RealmProcessorDeferredActorInputOutcome::AwaitExplicitCarryover { .. } => {
+                                    bail!("successor input unavailable for different-input test")
+                                }
+                            };
+                            let mut different_capture = different_iteration
+                                .open_durable_capture_for_deferred_input(
+                                    selected_different_input,
+                                )
+                                .await?;
+                            let different_generation = different_capture
                                 .replay_complete_generation()
                                 .await?
                                 .ok_or_else(|| anyhow::anyhow!(
                                     "successor generation unavailable for different-input test"
                                 ))?;
+                            let different_external = different_capture
+                                .qualify_external_actor_input(different_generation)
+                                .await?;
+                            let _selected_deferred = different_capture
+                                .take_deferred_actor_input()
+                                .await?;
+                            let different_actor_input = RealmProcessorActorInput::try_new(
+                                different_input,
+                                different_external,
+                            )?;
+                            ensure!(different_actor_input.digest() != actor_input_digest);
                             different_input_rejected = actor
                                 .qualification_apply_durable_generation(
-                                    different_generation,
-                                    different_input,
+                                    different_actor_input,
                                 )
                                 .await
                                 .is_err();
                             ensure!(different_input_rejected);
+                            drop(different_capture);
+                            drop(different_iteration);
 
                             successor_application_semantic_bytes =
                                 final_semantic.canonical_len()?;
@@ -3322,7 +3372,39 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                                 successor_application_semantic_bytes
                                     .div_ceil(4 * 1024 * 1024),
                             )?;
-                            let successor_handoff = final_capture
+                            let mut handoff_iteration = owner.begin_iteration(
+                                iteration_gate.try_begin_iteration()?,
+                            )?;
+                            let handoff_input = match handoff_iteration
+                                .prepare_deferred_actor_input()
+                                .await?
+                            {
+                                RealmProcessorDeferredActorInputOutcome::Ready(input) => input,
+                                RealmProcessorDeferredActorInputOutcome::AwaitExplicitCarryover { .. } => {
+                                    bail!("successor input unavailable before archive handoff")
+                                }
+                            };
+                            let mut handoff_capture = handoff_iteration
+                                .open_durable_capture_for_deferred_input(handoff_input)
+                                .await?;
+                            let handoff_generation = handoff_capture
+                                .replay_complete_generation()
+                                .await?
+                                .ok_or_else(|| anyhow::anyhow!(
+                                    "successor generation unavailable before archive handoff"
+                                ))?;
+                            let handoff_external = handoff_capture
+                                .qualify_external_actor_input(handoff_generation)
+                                .await?;
+                            let handoff_deferred = handoff_capture
+                                .take_deferred_actor_input()
+                                .await?;
+                            let handoff_actor_input = RealmProcessorActorInput::try_new(
+                                handoff_deferred,
+                                handoff_external,
+                            )?;
+                            ensure!(handoff_actor_input.digest() == actor_input_digest);
+                            let successor_handoff = handoff_capture
                                 .persist_application_and_handoff(final_semantic)
                                 .await?;
                             ensure!(successor_handoff.has_application_work());
@@ -3330,15 +3412,15 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                                 successor_handoff.pipeline_revision();
                             application_archive_handoff_rf3 = true;
                             actor_handoff_during_one_replica_offline = true;
-                            let same_successor_handoff = final_capture
+                            let same_successor_handoff = handoff_capture
                                 .recover_application_handoff()
                                 .await?
                                 .ok_or_else(|| anyhow::anyhow!(
                                     "successor handoff was not recoverable in owner"
                                 ))?;
                             ensure!(same_successor_handoff == successor_handoff);
-                            drop(final_capture);
-                            drop(final_iteration);
+                            drop(handoff_capture);
+                            drop(handoff_iteration);
                             let mut successor_recovery_iteration = owner.begin_iteration(
                                 iteration_gate.try_begin_iteration()?,
                             )?;
@@ -3427,8 +3509,8 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                                 generation_digest: replayed_generation_digest,
                                 boundary_digest: replayed_boundary_digest,
                                 item_count: replayed_item_count,
-                                input_binding: psy_node_core::queue::realm_processor_semantic_output::RealmProcessorSemanticInputBinding::SuccessorDeferred(
-                                    psy_node_core::queue::realm_processor_deferred_actor_input::RealmProcessorDeferredActorInputDigest::try_new(
+                                input_binding: psy_node_core::queue::realm_processor_semantic_output::RealmProcessorSemanticInputBinding::SuccessorQualified(
+                                    RealmProcessorActorInputDigest::try_new(
                                         [0xA0 + poison_case; 32],
                                     )?,
                                 ),
@@ -3809,7 +3891,7 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         terminal_recovery_nats_delta,
         terminal_recovery_socket_response_loss_injected: false,
         sidecar_v13_rf3_inherited: exercise_deferred_actor_archive,
-        v13_ready_receipt_consumed,
+        v14_ready_receipt_consumed,
         qualification_constructed_predecessor_semantic,
         predecessor_nonempty_input_rf3,
         predecessor_deferred_count,
@@ -3833,15 +3915,15 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         different_input_rejected,
         actor_builder_create_count,
         actor_finalize_count,
-        semantic_v2_input_bound,
+        semantic_v3_input_bound,
         successor_application_semantic_bytes,
         successor_application_fragments,
         application_archive_handoff_rf3,
         handoff_recovery_without_actor_rerun,
         successor_handoff_revision,
         actor_handoff_during_one_replica_offline,
-        qualification_temp_dependency_hydration: exercise_deferred_actor_archive,
-        production_external_dependency_projection: false,
+        qualification_temp_dependency_hydration: false,
+        production_external_dependency_projection: exercise_deferred_actor_archive,
         deferred_input_rf3: exercise_deferred_actor_archive,
         actor_retry_socket_response_loss_injected: false,
         full_processor_rf3_runtime: false,

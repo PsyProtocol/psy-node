@@ -662,8 +662,8 @@ mod tests {
                 generation_digest: RealmProcessorDurableGenerationDigest::try_new([9; 32]).unwrap(),
                 boundary_digest: PendingQueueBoundaryDigest::try_new([10; 32]).unwrap(),
                 item_count: 0,
-                input_binding: crate::queue::realm_processor_semantic_output::RealmProcessorSemanticInputBinding::SuccessorDeferred(
-                    crate::queue::realm_processor_deferred_actor_input::RealmProcessorDeferredActorInputDigest::try_new([17; 32]).unwrap(),
+                input_binding: crate::queue::realm_processor_semantic_output::RealmProcessorSemanticInputBinding::SuccessorQualified(
+                    crate::queue::realm_processor_actor_input::RealmProcessorActorInputDigest::try_new([17; 32]).unwrap(),
                 ),
                 processing_checkpoint_id: 42,
                 processing_checkpoint_root: [11; 32],
@@ -689,14 +689,15 @@ mod tests {
     }
 
     #[test]
-    fn new_archive_plan_rejects_legacy_unbound_semantic() {
-        let legacy = RealmProcessorSemanticOutput::try_from_candidate_parts(
-            RealmProcessorSemanticOutputParts {
+    fn new_archive_plan_rejects_historical_unbound_semantics() {
+        let historical = |input_binding| {
+            RealmProcessorSemanticOutput::try_from_candidate_parts(
+                RealmProcessorSemanticOutputParts {
                 context_digest: PendingQueueCaptureContextDigest::try_new([8; 32]).unwrap(),
                 generation_digest: RealmProcessorDurableGenerationDigest::try_new([9; 32]).unwrap(),
                 boundary_digest: PendingQueueBoundaryDigest::try_new([10; 32]).unwrap(),
                 item_count: 0,
-                input_binding: crate::queue::realm_processor_semantic_output::RealmProcessorSemanticInputBinding::LegacyUnbound,
+                input_binding,
                 processing_checkpoint_id: 42,
                 processing_checkpoint_root: [11; 32],
                 processing_realm_start_root: [12; 32],
@@ -712,12 +713,25 @@ mod tests {
                 guta_header: vec![14],
                 jobs: vec![],
                 deferred_jobs: vec![],
-            },
-        ).unwrap();
-        assert_eq!(
-            RealmProcessorApplicationArchivePlan::try_new(binding(), &legacy),
-            Err(RealmProcessorApplicationArchiveError::UnboundSemantic),
-        );
+                },
+            )
+            .unwrap()
+        };
+        for semantic in [
+            historical(
+                crate::queue::realm_processor_semantic_output::RealmProcessorSemanticInputBinding::LegacyUnbound,
+            ),
+            historical(
+                crate::queue::realm_processor_semantic_output::RealmProcessorSemanticInputBinding::SuccessorDeferred(
+                    crate::queue::realm_processor_deferred_actor_input::RealmProcessorDeferredActorInputDigest::try_new([18; 32]).unwrap(),
+                ),
+            ),
+        ] {
+            assert_eq!(
+                RealmProcessorApplicationArchivePlan::try_new(binding(), &semantic),
+                Err(RealmProcessorApplicationArchiveError::UnboundSemantic),
+            );
+        }
     }
 
     #[test]

@@ -15,6 +15,7 @@ use psy_node_core::{
     psy_temp_db::StandardProcessorTempDBStoreBase,
     queue::{
         ephemeral::QStandardEphemeralQueueSubscriber,
+        realm_processor_actor_input::RealmProcessorActorInput,
         realm_processor_durable_capture::{
             RealmProcessorApplicationHandoffObservation,
             RealmProcessorDurableCaptureOutcome,
@@ -109,7 +110,7 @@ async fn project_branch_exact_semantic_output<
             generation_digest: receipt.generation_digest(),
             boundary_digest: receipt.boundary_digest(),
             item_count: receipt.item_count(),
-            input_binding: psy_node_core::queue::realm_processor_semantic_output::RealmProcessorSemanticInputBinding::SuccessorDeferred(
+            input_binding: psy_node_core::queue::realm_processor_semantic_output::RealmProcessorSemanticInputBinding::SuccessorQualified(
                 receipt.actor_input_digest(),
             ),
             processing_checkpoint_id: state.processing_checkpoint_id,
@@ -307,10 +308,15 @@ where
             let Some(generation) = generation else {
                 return Ok(RealmGatheringOutcome::BranchExactAwaitingClosedSource);
             };
+            let external_input = capture.qualify_external_actor_input(generation).await?;
             let deferred_input = capture.take_deferred_actor_input().await?;
+            let actor_input = RealmProcessorActorInput::try_new(
+                deferred_input,
+                external_input,
+            )?;
             let receipt = self
                 .guta_queue_gatherer
-                .apply_durable_generation(generation, deferred_input)
+                .apply_durable_generation(actor_input)
                 .await?;
             let finalized = self
                 .guta_queue_gatherer

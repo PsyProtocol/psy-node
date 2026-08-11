@@ -67,13 +67,14 @@ use super::{
 #[cfg(test)]
 use super::RETIRED_REALM_USER_UPDATE_CLAIM_V1_TABLE;
 
-// v13 keeps the v12 physical shape but requires the actor-input-bound Realm
-// application semantic codec. An old v12 binary cannot decode new v2
-// semantic payloads, so its VERIFIED receipt must not authorize this runtime.
-pub const PENDING_QUEUE_SIDECAR_SCHEMA_VERSION: u16 = 13;
+// v14 keeps the v13 physical shape but upgrades the application semantic
+// binding from deferred-only to the complete qualified actor input. An old
+// v13 binary would interpret the same 32 bytes differently, so its VERIFIED
+// receipt must not authorize this runtime.
+pub const PENDING_QUEUE_SIDECAR_SCHEMA_VERSION: u16 = 14;
 pub const PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT: usize = 20;
 const FINGERPRINT_DOMAIN: &[u8] =
-    b"psy/rollback/pending-queue-sidecar-schema/v13";
+    b"psy/rollback/pending-queue-sidecar-schema/v14";
 const INSPECT_COLUMNS_CQL: &str = "SELECT column_name, type, kind, position, clustering_order FROM system_schema.columns WHERE keyspace_name = ? AND table_name = ?";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -505,6 +506,24 @@ pub(super) fn current_physical_schema_matches_historical_v12() -> bool {
     ) == historical_v12_schema_fingerprint()
 }
 
+#[cfg(test)]
+pub(super) fn historical_v13_schema_fingerprint() -> PendingQueueSidecarSchemaFingerprint {
+    PendingQueueSidecarSchemaFingerprint::from_persisted([
+        0x52, 0x65, 0xf0, 0x08, 0x8c, 0xb8, 0x98, 0x68,
+        0x42, 0x95, 0x7a, 0xb6, 0xe6, 0xdc, 0xc9, 0x88,
+        0x09, 0xf4, 0x0a, 0x3e, 0x96, 0x9b, 0x74, 0x31,
+        0x5b, 0x83, 0x8e, 0x99, 0x8a, 0x94, 0x2d, 0xbc,
+    ])
+}
+
+#[cfg(test)]
+pub(super) fn current_physical_schema_matches_historical_v13() -> bool {
+    sidecar_schema_fingerprint(
+        13,
+        b"psy/rollback/pending-queue-sidecar-schema/v13",
+    ) == historical_v13_schema_fingerprint()
+}
+
 pub fn inspect_pending_queue_sidecar_columns(
     observed: Vec<ObservedPendingQueueSidecarColumn>,
     retired_v1_present: bool,
@@ -671,7 +690,7 @@ mod tests {
 
     #[test]
     fn exact_manifest_is_twenty_unique_tables_with_stable_placement() {
-        assert_eq!(PENDING_QUEUE_SIDECAR_SCHEMA_VERSION, 13);
+        assert_eq!(PENDING_QUEUE_SIDECAR_SCHEMA_VERSION, 14);
         assert_eq!(PendingQueueSidecarPhysicalTable::ALL.len(), 20);
         let names = PendingQueueSidecarPhysicalTable::ALL.iter().map(|table| table.table_name()).collect::<std::collections::BTreeSet<_>>();
         assert_eq!(names.len(), 20);
@@ -681,9 +700,14 @@ mod tests {
         assert!(!names.contains(RETIRED_REALM_USER_UPDATE_CLAIM_V1_TABLE));
         assert_ne!(pending_queue_sidecar_schema_fingerprint().as_bytes(), &[0; 32]);
         assert!(current_physical_schema_matches_historical_v12());
+        assert!(current_physical_schema_matches_historical_v13());
         assert_eq!(
             hex::encode(historical_v12_schema_fingerprint().as_bytes()),
             "466bf80f7e9f336a5191c2efdecf05129c96f6086f57c1afb14ce6cbe0aca7fb",
+        );
+        assert_eq!(
+            hex::encode(historical_v13_schema_fingerprint().as_bytes()),
+            "5265f0088cb8986842957ab6e6dcc98809f40a3e969b74315b838e998a942dbc",
         );
     }
 

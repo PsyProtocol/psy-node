@@ -262,8 +262,41 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
         queue_item_bytes: &[u8],
         queue_item: PsyRealmUserUpdateQueueItem<F, Hash>,
     ) -> anyhow::Result<usize> {
-        self.add_end_cap_job_internal::<Hasher, TempStore, File>(checkpoint_tree, global_user_tree, file, temp_store, queue_item_bytes, queue_item)
+        self.add_end_cap_job_internal::<Hasher, TempStore, File>(checkpoint_tree, global_user_tree, file, temp_store, queue_item_bytes, queue_item, None)
             .await
+    }
+
+    /// Branch-exact input path. Contract-update bytes were joined to this
+    /// exact queue envelope by durable storage and must not be looked up from
+    /// the mutable legacy temp namespace.
+    pub async fn add_end_cap_job_with_exact_contract_updates<
+        Hasher: FieldQHasher<F, Hash>,
+        TempStore: StandardProcessorTempDBStoreBase<QProvingJobDataID, Hash>,
+        File: TokioFileLike,
+    >(
+        &mut self,
+        checkpoint_tree: &PsyDashMemoryAppendOnlyMerkleStore<Hasher, Hash>,
+        global_user_tree: &mut SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
+        file: &mut File,
+        temp_store: Arc<TempStore>,
+        queue_item_bytes: &[u8],
+        queue_item: PsyRealmUserUpdateQueueItem<F, Hash>,
+        contract_updates: Vec<u8>,
+    ) -> anyhow::Result<usize> {
+        anyhow::ensure!(
+            !contract_updates.is_empty(),
+            "durable contract updates are empty"
+        );
+        self.add_end_cap_job_internal::<Hasher, TempStore, File>(
+            checkpoint_tree,
+            global_user_tree,
+            file,
+            temp_store,
+            queue_item_bytes,
+            queue_item,
+            Some(contract_updates),
+        )
+        .await
     }
     async fn add_end_cap_job_internal<
         Hasher: FieldQHasher<F, Hash>,
@@ -277,6 +310,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
         temp_store: Arc<TempStore>,
         queue_item_bytes: &[u8],
         queue_item: PsyRealmUserUpdateQueueItem<F, Hash>,
+        exact_contract_updates: Option<Vec<u8>>,
     ) -> anyhow::Result<usize> {
         let user_last_checkpoint_id = queue_item.new_user_leaf.last_checkpoint_id.to_u64_value();
         let user_id = queue_item.new_user_leaf.user_id.to_u64_value();
@@ -316,14 +350,21 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                 self.current_checkpoint_id,
                 user_id
             );
-            let result = RealmGUTAPlanner::populate_future_end_cap_job(
-                self.chain_id,
-                &self.realm_identifier,
-                self.unique_pending_id,
-                temp_store.clone(),
-                queue_item,
-            )
-            .await?;
+            let result = if let Some(contract_updates) = exact_contract_updates {
+                Some(PlannedFutureEndCapJob {
+                    queue_item,
+                    contract_updates,
+                })
+            } else {
+                RealmGUTAPlanner::populate_future_end_cap_job(
+                    self.chain_id,
+                    &self.realm_identifier,
+                    self.unique_pending_id,
+                    temp_store.clone(),
+                    queue_item,
+                )
+                .await?
+            };
             if result.is_none() {
                 tracing::info!("Skipping end-cap job population due to missing contract updates for user ID {}.", user_id);
             } else {
@@ -331,9 +372,17 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             }
             return Ok(0);
         }
-        let data: Option<Vec<u8>> = temp_store
-            .get_contract_updates_for_user(&self.realm_identifier, self.unique_pending_id, user_id)
-            .await?;
+        let data: Option<Vec<u8>> = if let Some(contract_updates) = exact_contract_updates {
+            Some(contract_updates)
+        } else {
+            temp_store
+                .get_contract_updates_for_user(
+                    &self.realm_identifier,
+                    self.unique_pending_id,
+                    user_id,
+                )
+                .await?
+        };
         if data.is_none() {
             tracing::info!("Skipping end-cap job population due to missing contract updates for user ID {}.", user_id);
             return Ok(0);

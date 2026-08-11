@@ -591,6 +591,46 @@ impl ScyllaRealmUserUpdateAdmissionGuard {
         Self { gates, claims }
     }
 
+    /// Select the exact qualified generation header without accepting a
+    /// caller-provided close identity. This is the bootstrap-side selector
+    /// used by the Processor dependency loader while the generation is still
+    /// fenced by the current pipeline.
+    pub(crate) async fn select_qualified_generation_header<Hash: Q256BitHash>(
+        &self,
+        key: RealmUserUpdateAdmissionKey,
+    ) -> Result<StoredRealmUserUpdateAdmission<Hash>, RealmUserUpdateAdmissionGuardError>
+    {
+        let read = || async {
+            match self
+                .gates
+                .read::<Hash>(key, RealmUserUpdateAdmissionShard::Generation)
+                .await
+                .map_err(guard_gate_store)?
+            {
+                RealmUserUpdateAdmissionReadState::Current(current)
+                    if current.key() == key
+                        && current.shard() == RealmUserUpdateAdmissionShard::Generation
+                        && current.phase()
+                            == RealmUserUpdateAdmissionPhase::GenerationQualified
+                        && current.close_intent().is_some()
+                        && current.generation_manifest().is_some()
+                        && current.generation_qualification().is_some() => Ok(current),
+                RealmUserUpdateAdmissionReadState::Current(_) => {
+                    Err(RealmUserUpdateAdmissionGuardError::GenerationConflict)
+                }
+                RealmUserUpdateAdmissionReadState::Uninitialized => {
+                    Err(RealmUserUpdateAdmissionGuardError::GenerationUninitialized)
+                }
+            }
+        };
+        let first = read().await?;
+        let second = read().await?;
+        if first != second {
+            return Err(RealmUserUpdateAdmissionGuardError::AdmissionRace);
+        }
+        Ok(second)
+    }
+
     /// Explicit generation provisioning. Missing is never interpreted as an
     /// empty/open generation by claim or close paths.
     pub(crate) async fn provision_generation<Hash: Q256BitHash>(

@@ -355,6 +355,24 @@ impl<Hash: Q256BitHash> RealmUserUpdateQualificationFence<Hash> {
         Self::try_from_pipeline(key, pipeline)
             .is_ok_and(|current| current == *self)
     }
+
+    /// Validate the same qualified generation after the pipeline has rotated
+    /// it from gathering into processing. The old gathering revision is not
+    /// expected to survive rotation; the immutable admission key, activation,
+    /// exact processing generation and authority frontier must all still
+    /// match the current unblocked pipeline.
+    pub fn matches_processing_pipeline(
+        &self,
+        key: RealmUserUpdateAdmissionKey,
+        pipeline: &StoredPendingPipeline<Hash>,
+    ) -> bool {
+        let capture = key.capture();
+        pipeline.key() == capture.key()
+            && pipeline.activation_digest() == capture.activation()
+            && pipeline.processing() == capture.processing()
+            && pipeline.frontier() == &self.frontier
+            && pipeline.blocked_reason().is_none()
+    }
 }
 
 /// Deterministic commitment to one accepted claim's exact durable terminal
@@ -2248,6 +2266,53 @@ mod tests {
         .unwrap();
         assert_ne!(fence, other_frontier);
         assert!(!fence.matches_pipeline(key, pipeline(2).candidate()));
+    }
+
+    #[test]
+    fn qualification_fence_follows_exact_generation_after_rotation() {
+        let admitted = admission(1);
+        let key = RealmUserUpdateAdmissionKey::try_new(admitted.capture()).unwrap();
+        let original = pipeline(1);
+        let fence = RealmUserUpdateQualificationFence::try_from_pipeline(
+            key,
+            original.candidate(),
+        )
+        .unwrap();
+        let processing = admitted.capture().processing();
+        let successor = PendingGenerationContext::try_from_legacy(12, 13).unwrap();
+        let rotated_shape = PendingPipelineBootstrap::try_new(
+            key.capture().key(),
+            key.capture().activation(),
+            ProcNamespacePrefix::for_authority(
+                key.capture().key().network(),
+                key.capture().key().authority(),
+            ),
+            PendingGenerationBootstrapReason::LegacyActivation,
+            processing,
+            successor,
+            *original.candidate().frontier(),
+            processing.pending_id().get(),
+        )
+        .unwrap();
+        let current = StoredPendingPipeline::decode_persisted(
+            key.capture().key(),
+            17,
+            &rotated_shape.candidate_payload()[..],
+        )
+        .unwrap();
+        assert_ne!(fence.pipeline_revision(), current.revision());
+        assert!(fence.matches_processing_pipeline(key, &current));
+
+        let wrong_key = RealmUserUpdateAdmissionKey::try_new(
+            PendingQueueCaptureContext::try_new(
+                key.capture().key(),
+                PendingGenerationActivationDigest::try_new([19; 32]).unwrap(),
+                processing,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!fence.matches_processing_pipeline(wrong_key, &current));
     }
 
     #[test]

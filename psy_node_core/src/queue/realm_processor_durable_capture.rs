@@ -362,6 +362,14 @@ pub trait RealmProcessorDurableCapturePort: Send {
 /// pipeline mutation authority.
 #[async_trait]
 pub trait RealmProcessorExternalDependencyLoader: Send + Sync {
+    /// Rebuild the exact dependency projection for a currently-processing
+    /// bootstrap generation. The implementation must storage-select the
+    /// qualified admission close/fence; callers cannot supply either value.
+    async fn load_current_exact(
+        &self,
+        generation: RealmProcessorDurableCapturedGeneration,
+    ) -> Result<RealmProcessorQualifiedExternalActorInput, RealmProcessorDurableCaptureError>;
+
     async fn load_committed_exact(
         &self,
         generation: RealmProcessorDurableCapturedGeneration,

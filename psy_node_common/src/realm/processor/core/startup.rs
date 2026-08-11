@@ -80,6 +80,7 @@ where
             file_system: file_system.clone(),
             _phantom_n: std::marker::PhantomData,
             future_pending_end_cap_jobs: Arc::new(std::sync::RwLock::new(Vec::new())),
+            durable_external_dependencies: None,
         };
         /*
         if db.last_committed.l2_state.next_contract_id as u64 != db_tree_next_contract_id {

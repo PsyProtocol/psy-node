@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     io::{Cursor, Read},
     path::PathBuf,
     sync::{Arc, RwLock},
@@ -33,6 +34,7 @@ use psy_node_core::{
     psy_temp_db::StandardProcessorTempDBStoreBase,
     queue::{
         realm_processor_deferred_actor_input::RealmProcessorDeferredActorInput,
+        realm_processor_external_dependency_input::RealmProcessorExternalDependencyItem,
         recoverable_ephemeral::PendingQueueCaptureContext,
     },
     qblob::{
@@ -487,6 +489,10 @@ pub struct RealmGUTAEndCapGathererConfig<
     pub coordinator_guta_updates_circuit_whitelist: N::QHash,
     pub checkpoint_tree: Arc<PsyDashMemoryAppendOnlyMerkleStore<N::HasherBase, N::QHash>>,
     pub future_pending_end_cap_jobs: Arc<RwLock<Vec<PlannedFutureEndCapJob<N::F, N::QHash>>>>,
+    /// Present only for a branch-exact builder. Items are consumed in the
+    /// durable generation's subject order and replace legacy temp lookups.
+    pub durable_external_dependencies:
+        Option<Arc<RwLock<VecDeque<RealmProcessorExternalDependencyItem>>>>,
 
     pub _phantom_n: std::marker::PhantomData<N>,
 }
@@ -504,6 +510,7 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
             coordinator_guta_updates_circuit_whitelist: self.coordinator_guta_updates_circuit_whitelist,
             checkpoint_tree: self.checkpoint_tree.clone(),
             future_pending_end_cap_jobs: self.future_pending_end_cap_jobs.clone(),
+            durable_external_dependencies: self.durable_external_dependencies.clone(),
             _phantom_n: std::marker::PhantomData,
         }
     }
@@ -596,6 +603,7 @@ impl<
         &self,
         context: PendingQueueCaptureContext,
         deferred_input: RealmProcessorDeferredActorInput,
+        external_dependencies: Vec<RealmProcessorExternalDependencyItem>,
     ) -> anyhow::Result<Self> {
         let current = self
             .status
@@ -618,6 +626,9 @@ impl<
         let mut bound = self.clone();
         bound.status = Arc::new(RwLock::new(exact));
         bound.future_pending_end_cap_jobs = Arc::new(RwLock::new(durable_future_jobs));
+        bound.durable_external_dependencies = Some(Arc::new(RwLock::new(
+            external_dependencies.into_iter().collect(),
+        )));
         Ok(bound)
     }
 }
@@ -825,16 +836,39 @@ impl<
         #[cfg(feature = "rf3-test-support")]
         let qualification_external_job_id = update_header.job_id.to_fixed_bytes().to_vec();
         tracing::info!("RealmGUTAEndCapGatherer processing queue item update_header {:?}", update_header);
-        self.guta_planner
-            .add_end_cap_job(
-                &self.config.checkpoint_tree,
-                tree,
-                &mut self.new_realm_end_cap_gatherer_file,
-                self.config.temp_db.clone(),
-                &item,
-                update_header,
-            )
-            .await?;
+        if let Some(dependencies) = self.config.durable_external_dependencies.as_ref() {
+            let dependency = dependencies
+                .write()
+                .map_err(|_| anyhow::anyhow!("durable dependency lock is poisoned"))?
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("durable dependency input is truncated"))?;
+            anyhow::ensure!(
+                dependency.queue_item() == item,
+                "durable dependency queue item does not match actor input"
+            );
+            self.guta_planner
+                .add_end_cap_job_with_exact_contract_updates(
+                    &self.config.checkpoint_tree,
+                    tree,
+                    &mut self.new_realm_end_cap_gatherer_file,
+                    self.config.temp_db.clone(),
+                    &item,
+                    update_header,
+                    dependency.contract_updates().to_vec(),
+                )
+                .await?;
+        } else {
+            self.guta_planner
+                .add_end_cap_job(
+                    &self.config.checkpoint_tree,
+                    tree,
+                    &mut self.new_realm_end_cap_gatherer_file,
+                    self.config.temp_db.clone(),
+                    &item,
+                    update_header,
+                )
+                .await?;
+        }
         #[cfg(feature = "rf3-test-support")]
         qualification_record_realm_actor_entries(
             RealmDeferredActorTraceKind::External,
@@ -855,6 +889,15 @@ impl<
     ) -> anyhow::Result<()> {
         for item in items {
             self.update_from_queue_item_with_tree(tree, item).await?;
+        }
+        if let Some(dependencies) = self.config.durable_external_dependencies.as_ref() {
+            anyhow::ensure!(
+                dependencies
+                    .read()
+                    .map_err(|_| anyhow::anyhow!("durable dependency lock is poisoned"))?
+                    .is_empty(),
+                "durable dependency input contains extra rows"
+            );
         }
         Ok(())
     }

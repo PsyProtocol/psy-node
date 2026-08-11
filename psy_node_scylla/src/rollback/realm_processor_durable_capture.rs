@@ -14,6 +14,7 @@ use psy_data::protocol::{
 };
 use psy_node_core::{
     queue::{
+        realm_processor_actor_input::RealmProcessorActorInputDigest,
         realm_processor_durable_capture::{
             RealmProcessorApplicationHandoffObservation,
             RealmProcessorDurableCaptureError,
@@ -1185,12 +1186,15 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
                 )
                 .await
                 .map_err(backend)?;
+            let semantic = archive.semantic();
+            let historical_input_matches = semantic
+                .legacy_deferred_input_digest()
+                .is_none_or(|digest| digest == request.deferred_input().digest());
             if handoff.archive_slot() != second.archive_slot()
                 || handoff.archive_digest() != second.archive_digest()
                 || handoff.semantic_digest() != second.semantic_digest()
                 || handoff.pipeline_revision() != second.pipeline_revision()
-                || archive.semantic().actor_input_digest()
-                    != Some(request.deferred_input().digest())
+                || !historical_input_matches
             {
                 return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
             }
@@ -1206,6 +1210,7 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
                 deferred_input: Some(deferred_input),
                 deferred_input_digest,
                 external_dependency_commitment: None,
+                actor_input_digest: semantic.actor_input_digest(),
                 mode: ScyllaRealmProcessorCaptureMode::Recovered(handoff),
                 _hash: PhantomData,
             });
@@ -1345,6 +1350,7 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
             deferred_input: Some(deferred_input),
             deferred_input_digest,
             external_dependency_commitment,
+            actor_input_digest: None,
             mode: ScyllaRealmProcessorCaptureMode::Active {
                 source,
                 close,
@@ -1680,6 +1686,7 @@ struct ScyllaRealmProcessorDurableCapture<Hash> {
     deferred_input_digest:
         psy_node_core::queue::realm_processor_deferred_actor_input::RealmProcessorDeferredActorInputDigest,
     external_dependency_commitment: Option<RealmProcessorExternalDependencyCommitment>,
+    actor_input_digest: Option<RealmProcessorActorInputDigest>,
     mode: ScyllaRealmProcessorCaptureMode,
     _hash: PhantomData<Hash>,
 }
@@ -1803,21 +1810,46 @@ where
             return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
         }
         self.revalidate_deferred_actor_input().await?;
-        let expected = self
-            .external_dependency_commitment
-            .take()
-            .ok_or(RealmProcessorDurableCaptureError::IdentityMismatch)?;
-        let input = self
-            .factory
-            .external_dependency_loader
-            .load_committed_exact(generation, expected)
-            .await?;
+        let input = match self.external_dependency_commitment.take() {
+            Some(expected) => {
+                let input = self
+                    .factory
+                    .external_dependency_loader
+                    .load_committed_exact(generation, expected)
+                    .await?;
+                if input.dependency_commitment() != expected {
+                    return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+                }
+                input
+            }
+            None => {
+                let Some(deferred_input) = self.deferred_input.as_ref() else {
+                    return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+                };
+                if !matches!(
+                    deferred_input.source(),
+                    RealmProcessorDeferredActorInputSource::BootstrapEmpty { .. }
+                ) {
+                    return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+                }
+                self.factory
+                    .external_dependency_loader
+                    .load_current_exact(generation)
+                    .await?
+            }
+        };
         self.revalidate_deferred_actor_input().await?;
-        if input.context() != self.context
-            || input.dependency_commitment() != expected
-        {
+        if input.context() != self.context {
             return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
         }
+        self.actor_input_digest = Some(
+            RealmProcessorActorInputDigest::try_from_exact_parts(
+                self.context,
+                self.deferred_input_digest,
+                input.digest(),
+            )
+            .map_err(backend)?,
+        );
         Ok(input)
     }
 
@@ -1839,7 +1871,8 @@ where
     ) -> Result<RealmProcessorApplicationHandoffObservation, RealmProcessorDurableCaptureError>
     {
         if self.deferred_input.is_some()
-            || semantic.actor_input_digest() != Some(self.deferred_input_digest)
+            || semantic.actor_input_digest() != self.actor_input_digest
+            || self.actor_input_digest.is_none()
         {
             return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
         }

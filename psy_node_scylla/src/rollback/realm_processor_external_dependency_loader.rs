@@ -152,6 +152,60 @@ where
         )
         .map_err(backend)
     }
+
+    async fn load_current(
+        &self,
+        generation: RealmProcessorDurableCapturedGeneration,
+    ) -> Result<RealmProcessorQualifiedExternalActorInput, RealmProcessorDurableCaptureError> {
+        let context = generation.context();
+        if context.key().network() != self.network
+            || context.key().authority() != self.authority
+        {
+            return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+        }
+        let ledger_key = PendingQueueSegmentLedgerKey::try_new(
+            context.key(),
+            &self.base_namespace,
+        )
+        .map_err(backend)?;
+        let route = self
+            .ledger
+            .read_assignment_route_exact(&ledger_key, context)
+            .await
+            .map_err(backend)?;
+        self.ledger
+            .revalidate_assignment_route(&route)
+            .await
+            .map_err(backend)?;
+        let assignment_digest = *route.assignment().assignment().digest().as_bytes();
+        let projector = ScyllaRealmProcessorExternalDependencyProjector::<F, Hash>::prepare(
+            self.session.clone(),
+            self.network,
+            self.authority,
+            self.global_user_tree_height,
+            self.ready.clone(),
+            route.segment().clone(),
+        )
+        .await
+        .map_err(backend)?;
+        let projection = projector
+            .read_current_selected_exact(context, assignment_digest)
+            .await
+            .map_err(backend)?;
+        projector
+            .revalidate_exact(&projection)
+            .await
+            .map_err(backend)?;
+        self.ledger
+            .revalidate_assignment_route(&route)
+            .await
+            .map_err(backend)?;
+        RealmProcessorQualifiedExternalActorInput::try_from_exact_sources(
+            generation,
+            projection.into_projection(),
+        )
+        .map_err(backend)
+    }
 }
 
 #[async_trait]
@@ -161,6 +215,13 @@ where
     F: QFelt64 + Send + Sync + 'static,
     Hash: Q256BitHash + QFHashBase<F> + Send + Sync + 'static,
 {
+    async fn load_current_exact(
+        &self,
+        generation: RealmProcessorDurableCapturedGeneration,
+    ) -> Result<RealmProcessorQualifiedExternalActorInput, RealmProcessorDurableCaptureError> {
+        self.load_current(generation).await
+    }
+
     async fn load_committed_exact(
         &self,
         generation: RealmProcessorDurableCapturedGeneration,
@@ -193,5 +254,20 @@ mod tests {
         assert!(!load.contains("persist"));
         assert!(!load.contains("apply("));
         assert!(!load.contains("seal_rotation"));
+
+        let load_current = source
+            .split("async fn load_current(")
+            .nth(1)
+            .unwrap()
+            .split("#[async_trait]")
+            .next()
+            .unwrap();
+        assert!(load_current.contains("read_assignment_route_exact"));
+        assert!(load_current.contains("read_current_selected_exact"));
+        assert!(load_current.contains("revalidate_exact(&projection)"));
+        assert!(load_current.contains("revalidate_assignment_route"));
+        assert!(load_current.contains("try_from_exact_sources"));
+        assert!(!load_current.contains("persist"));
+        assert!(!load_current.contains("apply("));
     }
 }

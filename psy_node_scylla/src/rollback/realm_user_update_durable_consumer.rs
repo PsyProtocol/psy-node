@@ -189,6 +189,41 @@ where
             .await
     }
 
+    /// Rebuild the exact currently-processing generation without accepting a
+    /// caller-provided close. The qualified header is selected before and
+    /// after the full dependency/publication scan so the close, manifest,
+    /// qualification and pipeline fence form one stable snapshot.
+    pub(super) async fn read_current_selected(
+        &self,
+        key: RealmUserUpdateAdmissionKey,
+    ) -> Result<RealmUserUpdateDurableGeneration<F, Hash>, RealmUserUpdateDurableConsumerError>
+    {
+        let before = self
+            .admission
+            .select_qualified_generation_header::<Hash>(key)
+            .await
+            .map_err(admission)?;
+        let close = before
+            .close_intent()
+            .ok_or(RealmUserUpdateDurableConsumerError::GenerationNotQualified)?;
+        let generation = self
+            .read_exact_with_fence(
+                key,
+                close,
+                DurableGenerationFence::CurrentProcessingPipeline,
+            )
+            .await?;
+        let after = self
+            .admission
+            .select_qualified_generation_header::<Hash>(key)
+            .await
+            .map_err(admission)?;
+        if before != after {
+            return Err(RealmUserUpdateDurableConsumerError::ConcurrentChange);
+        }
+        Ok(generation)
+    }
+
     /// Rebuild an immutable generation after its gathering pipeline has
     /// rotated. The expected qualification digest must come from a durable
     /// terminal authorization envelope; it replaces only the live-pipeline
@@ -358,6 +393,19 @@ where
                     return Err(RealmUserUpdateDurableConsumerError::PipelineFenceMismatch);
                 }
             }
+            DurableGenerationFence::CurrentProcessingPipeline => {
+                let PendingPipelineReadState::Current(pipeline) = self
+                    .pipeline
+                    .read::<Hash>(key.capture().key())
+                    .await
+                    .map_err(backend)?
+                else {
+                    return Err(RealmUserUpdateDurableConsumerError::PipelineFenceMismatch);
+                };
+                if !qualification_fence.matches_processing_pipeline(key, &pipeline) {
+                    return Err(RealmUserUpdateDurableConsumerError::PipelineFenceMismatch);
+                }
+            }
             DurableGenerationFence::CommittedQualification(expected)
                 => require_committed_qualification(qualification_digest, expected)?,
         }
@@ -368,6 +416,7 @@ where
 #[derive(Clone, Copy)]
 enum DurableGenerationFence {
     CurrentPipeline,
+    CurrentProcessingPipeline,
     CommittedQualification(RealmUserUpdateQualificationDigest),
 }
 

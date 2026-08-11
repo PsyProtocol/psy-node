@@ -23,10 +23,7 @@ elif [[ "${EXERCISE_DURABLE_REPLAY}" == "1" ]]; then
 elif [[ "${EXERCISE_DURABLE_CAPTURE}" == "1" ]]; then
   EXPECTED_QUALIFICATION="H23C4C3A_DURABLE_CAPTURE_OWNER_RF3_PASSED"
 fi
-CARGO_FEATURE_ARGS=()
-if [[ "${EXERCISE_DURABLE_CAPTURE}" == "1" || "${EXERCISE_DEFERRED_ACTOR_ARCHIVE}" == "1" ]]; then
-  CARGO_FEATURE_ARGS=(--features rf3-test-support)
-fi
+CARGO_FEATURE_ARGS=(--features rf3-test-support)
 NATS_DIR="$(mktemp -d /tmp/psy-h23e3-nats.XXXXXX)"
 
 NATS1_PID=""
@@ -259,7 +256,7 @@ jq -e \
   and (
     if $exercise_deferred_actor_archive == 1 then
       .sidecar_v13_rf3_inherited == true
-      and .v13_ready_receipt_consumed == true
+      and .v14_ready_receipt_consumed == true
       and .qualification_constructed_predecessor_semantic == true
       and .predecessor_nonempty_input_rf3 == true
       and .predecessor_deferred_count == 3
@@ -279,15 +276,15 @@ jq -e \
       and .different_input_rejected == true
       and .actor_builder_create_count == 1
       and .actor_finalize_count == 1
-      and .semantic_v2_input_bound == true
+      and .semantic_v3_input_bound == true
       and .successor_application_semantic_bytes > 0
       and .successor_application_fragments >= 1
       and .application_archive_handoff_rf3 == true
       and .handoff_recovery_without_actor_rerun == true
       and .successor_handoff_revision > 0
       and .actor_handoff_during_one_replica_offline == true
-      and .qualification_temp_dependency_hydration == true
-      and .production_external_dependency_projection == false
+      and .qualification_temp_dependency_hydration == false
+      and .production_external_dependency_projection == true
       and .deferred_input_rf3 == true
       and .actor_retry_socket_response_loss_injected == false
       and .full_processor_rf3_runtime == false
@@ -299,7 +296,7 @@ jq -e \
       and .deferred_actor_nats_duplicate_delta == 0
     else
       .sidecar_v13_rf3_inherited == false
-      and .v13_ready_receipt_consumed == false
+      and .v14_ready_receipt_consumed == false
       and .qualification_constructed_predecessor_semantic == false
       and .predecessor_nonempty_input_rf3 == false
       and .predecessor_deferred_count == 0
@@ -319,7 +316,7 @@ jq -e \
       and .different_input_rejected == false
       and .actor_builder_create_count == 0
       and .actor_finalize_count == 0
-      and .semantic_v2_input_bound == false
+      and .semantic_v3_input_bound == false
       and .successor_application_semantic_bytes == 0
       and .successor_application_fragments == 0
       and .application_archive_handoff_rf3 == false

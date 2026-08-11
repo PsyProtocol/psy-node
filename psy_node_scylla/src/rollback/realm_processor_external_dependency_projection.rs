@@ -173,6 +173,50 @@ where
         })
     }
 
+    /// Select and rebuild the currently-processing qualified generation. The
+    /// close identity is read from the durable admission header rather than
+    /// accepted from the caller; this is the bootstrap counterpart to the
+    /// predecessor-terminal commitment path below.
+    pub(super) async fn read_current_selected_exact(
+        &self,
+        context: PendingQueueCaptureContext,
+        expected_assignment_digest: [u8; 32],
+    ) -> Result<
+        PersistedRealmProcessorExternalDependencyProjection,
+        RealmProcessorExternalDependencyProjectionError,
+    > {
+        let key = RealmUserUpdateAdmissionKey::try_new(context).map_err(model)?;
+        let first = self
+            .consumer
+            .read_current_selected(key)
+            .await
+            .map_err(RealmProcessorExternalDependencyProjectionError::Consumer)?;
+        let first = RealmProcessorExternalDependencyProjection::try_from_qualified_generation(
+            context,
+            expected_assignment_digest,
+            &first,
+        )
+        .map_err(model)?;
+        let second = self
+            .consumer
+            .read_current_selected(key)
+            .await
+            .map_err(RealmProcessorExternalDependencyProjectionError::Consumer)?;
+        let second = RealmProcessorExternalDependencyProjection::try_from_qualified_generation(
+            context,
+            expected_assignment_digest,
+            &second,
+        )
+        .map_err(model)?;
+        if first != second {
+            return Err(RealmProcessorExternalDependencyProjectionError::ConcurrentMutation);
+        }
+        Ok(PersistedRealmProcessorExternalDependencyProjection {
+            projector_fingerprint: self.fingerprint,
+            projection: second,
+        })
+    }
+
     pub(super) async fn revalidate_exact(
         &self,
         receipt: &PersistedRealmProcessorExternalDependencyProjection,
