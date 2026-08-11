@@ -89,6 +89,31 @@ digest_type!(RealmProcessorTerminalAuthorizationDigest);
 digest_type!(RealmProcessorDeferredCarryoverSlot);
 digest_type!(RealmProcessorDeferredCarryoverRecordDigest);
 
+impl RealmProcessorGenerationTerminalSlot {
+    /// Deterministically selects one predecessor record. This is an identity
+    /// helper only; possessing a slot grants no persistence or rotation
+    /// authority.
+    pub fn for_generation(
+        key: PendingGenerationLedgerKey,
+        activation: PendingGenerationActivationDigest,
+        source: PendingGenerationContext,
+    ) -> Result<Self, RealmGenerationTerminalError> {
+        terminal_slot(key, activation, source)
+    }
+}
+
+impl RealmProcessorDeferredCarryoverSlot {
+    /// Deterministically selects the explicit locator for one successor. This
+    /// is an identity helper only; missing is never interpreted as empty.
+    pub fn for_successor(
+        key: PendingGenerationLedgerKey,
+        activation: PendingGenerationActivationDigest,
+        successor: PendingGenerationContext,
+    ) -> Result<Self, RealmGenerationTerminalError> {
+        carryover_slot(key, activation, successor)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum RealmProcessorGenerationTerminalKind {
@@ -1372,6 +1397,35 @@ mod tests {
                 &unknown,
             ),
             Err(RealmGenerationTerminalError::UnknownCodecVersion),
+        );
+    }
+
+    #[test]
+    fn restart_selectors_are_identical_to_model_slots_but_grant_no_authority() {
+        let (pipeline, _) = published();
+        let terminal = terminal(&pipeline, application(21, true, 0));
+        assert_eq!(
+            RealmProcessorGenerationTerminalSlot::for_generation(
+                terminal.key(),
+                terminal.activation_digest(),
+                terminal.source(),
+            )
+            .unwrap(),
+            terminal.slot(),
+        );
+        let carryover = RealmProcessorDeferredCarryover::try_from_terminal_commitment(
+            &terminal,
+            RealmProcessorGenerationTerminalStoreFingerprint::try_new([55; 32]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            RealmProcessorDeferredCarryoverSlot::for_successor(
+                carryover.key(),
+                carryover.activation_digest(),
+                carryover.successor(),
+            )
+            .unwrap(),
+            carryover.slot(),
         );
     }
 }

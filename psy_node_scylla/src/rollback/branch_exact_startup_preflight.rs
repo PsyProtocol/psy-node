@@ -42,7 +42,10 @@ use psy_node_core::store::{
         RealmBranchExactRuntimeScope,
     },
 };
-use psy_node_core::queue::realm_processor_durable_capture::RealmProcessorDurableCaptureFactory;
+use psy_node_core::queue::{
+    realm_processor_continuation_restart::RealmProcessorContinuationRestartFactory,
+    realm_processor_durable_capture::RealmProcessorDurableCaptureFactory,
+};
 use psy_node_nats::queue::NatsJetStreamClient;
 use scylla::client::session::Session;
 use sha2::{Digest, Sha256};
@@ -130,7 +133,7 @@ pub(crate) struct ScyllaRealmProcessorStartupPreflightProvider<Hash> {
     setup_ready: BranchExactSchemaReadyView,
     queue_schema: ScyllaPendingQueueSidecarFreshReader,
     queue_setup_ready: PendingQueueSidecarReadyView,
-    capture_factory: Option<Arc<dyn RealmProcessorDurableCaptureFactory>>,
+    capture_factory: Option<Arc<ScyllaRealmProcessorDurableCaptureFactory<Hash>>>,
     _hash: PhantomData<Hash>,
 }
 
@@ -719,16 +722,21 @@ where
         if fresh != startup_permit.evidence() {
             return Err(RealmProcessorStartupError::ConcurrentMutation);
         }
-        let capture_factory = self.capture_factory.clone().ok_or_else(|| {
+        let concrete_factory = self.capture_factory.clone().ok_or_else(|| {
             RealmProcessorStartupError::DurableEvidenceNotVerified(
                 "Realm Processor durable capture factory is missing".to_owned(),
             )
         })?;
+        let capture_factory: Arc<dyn RealmProcessorDurableCaptureFactory> =
+            concrete_factory.clone();
+        let restart_factory: Arc<dyn RealmProcessorContinuationRestartFactory<Hash>> =
+            concrete_factory;
         let runtime: Arc<dyn RealmBranchExactCommitRuntime<Hash>> = self;
         InstalledRealmBranchExactCommitRuntime::seal(
             startup_permit,
             runtime,
             capture_factory,
+            restart_factory,
         )
     }
 }

@@ -25,12 +25,24 @@ use psy_node_core::{
             SealedRealmProcessorDurableCaptureRequest,
             SealedRealmProcessorGenerationContinuationRequest,
         },
+        realm_processor_continuation_restart::{
+            RealmProcessorContinuationRestartFactory,
+            RealmProcessorContinuationRestartPort,
+            RealmProcessorInboundCarryoverObservation,
+            RealmProcessorReadOnlyRestartPreparation,
+            RealmProcessorTerminalCarryoverObservation,
+            SealedRealmProcessorContinuationRestartRequest,
+        },
         realm_processor_application_archive::RealmProcessorApplicationArchivePlan,
         realm_processor_generation_continuation::{
-            RealmProcessorGenerationContinuation,
+            RealmProcessorApplicationContinuation, RealmProcessorGenerationContinuation,
             RealmProcessorGenerationContinuationPhase,
         },
         realm_processor_semantic_output::RealmProcessorSemanticOutput,
+        realm_processor_generation_terminal::{
+            RealmProcessorDeferredCarryoverSource,
+            RealmProcessorGenerationTerminalKind,
+        },
         recoverable_artifact::{
             PendingQueueArtifactOwnerAttemptId,
             PendingQueueArtifactOwnerReasonDigest,
@@ -43,7 +55,7 @@ use psy_node_core::{
         },
     },
     store::pending_generation_pipeline::{
-        PendingPipelineReadState, PendingProcessingState,
+        PendingPipelineReadState, PendingProcessingState, StoredPendingPipeline,
     },
     store::pending_generation_identity::PendingGenerationLedgerKey,
 };
@@ -91,6 +103,8 @@ use super::realm_processor_application_archive::{
     PersistedRealmProcessorApplicationHandoffReceipt,
     ScyllaRealmProcessorApplicationArchiveStore,
 };
+use super::realm_processor_deferred_carryover::ScyllaRealmProcessorDeferredCarryoverStore;
+use super::realm_processor_generation_terminal::ScyllaRealmProcessorGenerationTerminalStore;
 
 const OWNER_ATTEMPT_DOMAIN: &[u8] =
     b"psy/rollback/realm-processor-capture-owner-attempt/v1";
@@ -116,6 +130,8 @@ pub(crate) struct ScyllaRealmProcessorDurableCaptureFactory<Hash> {
     publish_factory: Arc<ScyllaPendingQueuePublishStoreFactory>,
     transport_archive: Arc<ScyllaPendingQueueSemanticAggregateStore>,
     application_archive: Arc<ScyllaRealmProcessorApplicationArchiveStore>,
+    generation_terminal: Arc<ScyllaRealmProcessorGenerationTerminalStore>,
+    deferred_carryover: Arc<ScyllaRealmProcessorDeferredCarryoverStore>,
     _hash: PhantomData<Hash>,
 }
 
@@ -195,12 +211,25 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
         );
         let application_archive = Arc::new(
             ScyllaRealmProcessorApplicationArchiveStore::prepare(
-                session,
-                control,
+                session.clone(),
+                control.clone(),
                 keyspaces.application_data_keyspace().map_err(backend)?,
             )
             .await
             .map_err(backend)?,
+        );
+        let generation_terminal = Arc::new(
+            ScyllaRealmProcessorGenerationTerminalStore::prepare(
+                session.clone(),
+                control.clone(),
+            )
+            .await
+            .map_err(backend)?,
+        );
+        let deferred_carryover = Arc::new(
+            ScyllaRealmProcessorDeferredCarryoverStore::prepare(session, control)
+                .await
+                .map_err(backend)?,
         );
         Ok(Self {
             network,
@@ -216,8 +245,527 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
             publish_factory,
             transport_archive,
             application_archive,
+            generation_terminal,
+            deferred_carryover,
             _hash: PhantomData,
         })
+    }
+
+    async fn observe_generation_continuation_exact(
+        &self,
+    ) -> Result<
+        ScyllaRealmProcessorExactContinuation<Hash>,
+        RealmProcessorDurableCaptureError,
+    > {
+        let key = PendingGenerationLedgerKey::new(self.network, self.authority);
+        let PendingPipelineReadState::Current(pipeline) =
+            self.pipeline.read::<Hash>(key).await.map_err(backend)?
+        else {
+            return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+        };
+        if pipeline.activation_digest().as_bytes() != &self.writer_activation_digest
+            || pipeline.blocked_reason().is_some()
+        {
+            return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+        }
+        let phase = match pipeline.processing_state() {
+            PendingProcessingState::Baseline(_) => {
+                RealmProcessorGenerationContinuationPhase::AwaitPrimeOrRotate
+            }
+            PendingProcessingState::Ready => {
+                RealmProcessorGenerationContinuationPhase::AwaitQueueClose
+            }
+            PendingProcessingState::Sealing(_) => {
+                RealmProcessorGenerationContinuationPhase::CaptureClosedSource
+            }
+            PendingProcessingState::WorkCaptured(_)
+            | PendingProcessingState::InFlight { .. }
+            | PendingProcessingState::EmptyQueueSealed(_)
+            | PendingProcessingState::RetiredNoWork { .. }
+            | PendingProcessingState::Published { .. } => {
+                let context = PendingQueueCaptureContext::try_new(
+                    pipeline.key(),
+                    pipeline.activation_digest(),
+                    pipeline.processing(),
+                )
+                .map_err(backend)?;
+                let ledger_key = PendingQueueSegmentLedgerKey::try_new(
+                    pipeline.key(),
+                    self.nats.base_namespace(),
+                )
+                .map_err(backend)?;
+                let route = self
+                    .ledger
+                    .read_assignment_route_exact(&ledger_key, context)
+                    .await
+                    .map_err(backend)?;
+                self.ledger
+                    .revalidate_assignment_route(&route)
+                    .await
+                    .map_err(backend)?;
+                let (first, archive, first_pipeline) = self
+                    .application_archive
+                    .observe_generation_continuation::<Hash>(
+                        &self.pipeline,
+                        route.assignment(),
+                    )
+                    .await
+                    .map_err(backend)?;
+                self.transport_archive
+                    .revalidate_realm_application_header(
+                        route.assignment(),
+                        archive.header(),
+                    )
+                    .await
+                    .map_err(backend)?;
+                self.ledger
+                    .revalidate_assignment_route(&route)
+                    .await
+                    .map_err(backend)?;
+                let (second, second_archive, second_pipeline) = self
+                    .application_archive
+                    .observe_generation_continuation::<Hash>(
+                        &self.pipeline,
+                        route.assignment(),
+                    )
+                    .await
+                    .map_err(backend)?;
+                self.transport_archive
+                    .revalidate_realm_application_header(
+                        route.assignment(),
+                        second_archive.header(),
+                    )
+                    .await
+                    .map_err(backend)?;
+                self.ledger
+                    .revalidate_assignment_route(&route)
+                    .await
+                    .map_err(backend)?;
+                if first != second
+                    || pipeline.revision() != first_pipeline.revision()
+                    || first_pipeline.revision() != second_pipeline.revision()
+                    || pipeline.canonical_payload() != first_pipeline.canonical_payload()
+                    || first_pipeline.canonical_payload()
+                        != second_pipeline.canonical_payload()
+                {
+                    return Err(RealmProcessorDurableCaptureError::ConcurrentMutation);
+                }
+                return Ok(ScyllaRealmProcessorExactContinuation {
+                    continuation: first,
+                    pipeline: second_pipeline,
+                });
+            }
+        };
+        let continuation = RealmProcessorGenerationContinuation::try_from_storage(
+            pipeline.processing(),
+            pipeline.revision(),
+            phase,
+            None,
+        )
+        .map_err(backend)?;
+        let PendingPipelineReadState::Current(second_pipeline) =
+            self.pipeline.read::<Hash>(key).await.map_err(backend)?
+        else {
+            return Err(RealmProcessorDurableCaptureError::ConcurrentMutation);
+        };
+        if !same_pipeline_snapshot(&pipeline, &second_pipeline) {
+            return Err(RealmProcessorDurableCaptureError::ConcurrentMutation);
+        }
+        Ok(ScyllaRealmProcessorExactContinuation {
+            continuation,
+            pipeline: second_pipeline,
+        })
+    }
+
+    fn validate_restart_identity(
+        &self,
+        request: &SealedRealmProcessorContinuationRestartRequest,
+    ) -> Result<(), RealmProcessorDurableCaptureError> {
+        let AuthorityScope::Realm {
+            realm_id,
+            realm_sub_id,
+        } = self.authority
+        else {
+            return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+        };
+        if request.network() != self.network
+            || request.realm_id() != realm_id
+            || request.realm_sub_id() != realm_sub_id
+            || request.writer_activation_digest() != &self.writer_activation_digest
+            || request.queue_readiness_digest() != &self.queue_readiness_digest
+        {
+            return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+        }
+        Ok(())
+    }
+
+    async fn observe_restart_snapshot(
+        &self,
+    ) -> Result<ScyllaRealmProcessorRestartSnapshot, RealmProcessorDurableCaptureError> {
+        let exact = self.observe_generation_continuation_exact().await?;
+        let continuation = exact.continuation;
+        let key = PendingGenerationLedgerKey::new(self.network, self.authority);
+        let pipeline = exact.pipeline;
+        if pipeline.processing() != continuation.processing()
+            || pipeline.revision() != continuation.pipeline_revision()
+            || pipeline.activation_digest().as_bytes() != &self.writer_activation_digest
+            || pipeline.blocked_reason().is_some()
+        {
+            return Err(RealmProcessorDurableCaptureError::ConcurrentMutation);
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"psy/rollback/realm-processor-restart-snapshot/v1");
+        hash_pipeline(&mut hasher, &pipeline);
+
+        let inbound = match self
+            .deferred_carryover
+            .observe_for_restart(key, pipeline.activation_digest(), pipeline.processing())
+            .await
+            .map_err(backend)?
+        {
+            None => RealmProcessorInboundCarryoverObservation::Missing,
+            Some(carryover) => {
+                hasher.update(carryover.to_canonical_bytes());
+                match carryover.source() {
+                    RealmProcessorDeferredCarryoverSource::BootstrapEmpty { .. } => {
+                        if carryover.key() != key
+                            || carryover.activation_digest() != pipeline.activation_digest()
+                            || carryover.successor() != pipeline.processing()
+                            || carryover.deferred_count() != 0
+                        {
+                            return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+                        }
+                        RealmProcessorInboundCarryoverObservation::Bootstrap
+                    }
+                    RealmProcessorDeferredCarryoverSource::Predecessor {
+                        predecessor,
+                        terminal_slot,
+                        terminal_store_fingerprint,
+                        terminal_digest,
+                        rotation_intent_digest,
+                        assignment_digest,
+                        application_store_fingerprint,
+                        application,
+                    } => {
+                        let terminal = self
+                            .generation_terminal
+                            .observe_for_restart::<Hash>(
+                                key,
+                                pipeline.activation_digest(),
+                                predecessor,
+                            )
+                            .await
+                            .map_err(backend)?
+                            .ok_or(RealmProcessorDurableCaptureError::IdentityMismatch)?;
+                        if terminal_store_fingerprint
+                            != self.generation_terminal.restart_fingerprint()
+                            || terminal.slot() != terminal_slot
+                            || terminal.digest() != terminal_digest
+                            || terminal.rotation_intent_digest() != rotation_intent_digest
+                            || terminal.assignment_digest() != &assignment_digest
+                            || terminal.application_store_fingerprint()
+                                != &application_store_fingerprint
+                            || terminal.application() != application
+                            || terminal.source() != predecessor
+                            || terminal.successor() != pipeline.processing()
+                            || terminal.candidate_pipeline().key() != pipeline.key()
+                            || terminal.candidate_pipeline().activation_digest()
+                                != pipeline.activation_digest()
+                            || terminal.candidate_pipeline().processing()
+                                != pipeline.processing()
+                            || terminal.candidate_pipeline().gathering()
+                                != pipeline.gathering()
+                            || pipeline.revision().get()
+                                < terminal.candidate_pipeline().revision().get()
+                            || carryover.deferred_count() != application.deferred_count()
+                            || carryover.deferred_digest() != application.deferred_digest()
+                        {
+                            return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+                        }
+                        hasher.update(terminal.to_canonical_bytes());
+                        self.validate_application_source(
+                            key,
+                            pipeline.activation_digest(),
+                            predecessor,
+                            application,
+                            assignment_digest,
+                            application_store_fingerprint,
+                            &mut hasher,
+                        )
+                        .await?;
+                        RealmProcessorInboundCarryoverObservation::Predecessor
+                    }
+                }
+            }
+        };
+
+        let terminal = if inbound == RealmProcessorInboundCarryoverObservation::Missing {
+            if self
+                .generation_terminal
+                .observe_for_restart::<Hash>(
+                    pipeline.key(),
+                    pipeline.activation_digest(),
+                    pipeline.processing(),
+                )
+                .await
+                .map_err(backend)?
+                .is_some()
+                || self
+                    .deferred_carryover
+                    .observe_for_restart(
+                        pipeline.key(),
+                        pipeline.activation_digest(),
+                        pipeline.gathering(),
+                    )
+                    .await
+                    .map_err(backend)?
+                    .is_some()
+            {
+                return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+            }
+            RealmProcessorTerminalCarryoverObservation::NotEvaluated
+        } else {
+            self.observe_outbound_terminal(&pipeline, continuation, &mut hasher)
+                .await?
+        };
+        let preparation = RealmProcessorReadOnlyRestartPreparation::try_from_storage(
+            continuation,
+            inbound,
+            terminal,
+        )
+        .map_err(backend)?;
+
+        let PendingPipelineReadState::Current(second_pipeline) =
+            self.pipeline.read::<Hash>(key).await.map_err(backend)?
+        else {
+            return Err(RealmProcessorDurableCaptureError::ConcurrentMutation);
+        };
+        if !same_pipeline_snapshot(&pipeline, &second_pipeline) {
+            return Err(RealmProcessorDurableCaptureError::ConcurrentMutation);
+        }
+        Ok(ScyllaRealmProcessorRestartSnapshot {
+            preparation,
+            digest: hasher.finalize().into(),
+        })
+    }
+
+    async fn validate_application_source(
+        &self,
+        key: PendingGenerationLedgerKey,
+        activation: psy_node_core::store::pending_generation_identity::PendingGenerationActivationDigest,
+        processing: psy_node_core::store::pending_generation_identity::PendingGenerationContext,
+        application: RealmProcessorApplicationContinuation,
+        assignment_digest: [u8; 32],
+        application_store_fingerprint: [u8; 32],
+        hasher: &mut Sha256,
+    ) -> Result<(), RealmProcessorDurableCaptureError> {
+        if self.application_archive.restart_fingerprint().as_bytes()
+            != &application_store_fingerprint
+        {
+            return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+        }
+        let context = PendingQueueCaptureContext::try_new(key, activation, processing)
+            .map_err(backend)?;
+        let ledger_key = PendingQueueSegmentLedgerKey::try_new(
+            key,
+            self.nats.base_namespace(),
+        )
+        .map_err(backend)?;
+        let route = self
+            .ledger
+            .read_assignment_route_exact(&ledger_key, context)
+            .await
+            .map_err(backend)?;
+        self.ledger
+            .revalidate_assignment_route(&route)
+            .await
+            .map_err(backend)?;
+        if route.assignment().assignment().digest().as_bytes() != &assignment_digest {
+            return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+        }
+        let archive = self
+            .application_archive
+            .read_selected(application.archive_slot())
+            .await
+            .map_err(backend)?
+            .ok_or(RealmProcessorDurableCaptureError::IdentityMismatch)?;
+        let observed = RealmProcessorApplicationContinuation::try_from_storage(
+            archive.header().slot(),
+            archive.header().digest(),
+            archive.semantic(),
+        )
+        .map_err(backend)?;
+        if observed != application {
+            return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+        }
+        self.transport_archive
+            .revalidate_realm_application_header(route.assignment(), archive.header())
+            .await
+            .map_err(backend)?;
+        self.ledger
+            .revalidate_assignment_route(&route)
+            .await
+            .map_err(backend)?;
+        hasher.update(route.assignment().assignment().to_canonical_bytes());
+        hasher.update(archive.header().to_canonical_bytes());
+        hasher.update(archive.semantic().to_canonical_bytes());
+        Ok(())
+    }
+
+    async fn observe_outbound_terminal(
+        &self,
+        pipeline: &StoredPendingPipeline<Hash>,
+        continuation: RealmProcessorGenerationContinuation,
+        hasher: &mut Sha256,
+    ) -> Result<RealmProcessorTerminalCarryoverObservation, RealmProcessorDurableCaptureError> {
+        let terminal_phase = matches!(
+            continuation.phase(),
+            RealmProcessorGenerationContinuationPhase::AwaitPublishedTerminal
+                | RealmProcessorGenerationContinuationPhase::AwaitRetiredNoWorkTerminal
+        );
+        let current = self
+            .generation_terminal
+            .observe_for_restart::<Hash>(
+                pipeline.key(),
+                pipeline.activation_digest(),
+                pipeline.processing(),
+            )
+            .await
+            .map_err(backend)?;
+        if !terminal_phase {
+            if current.is_some() {
+                return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+            }
+            return Ok(RealmProcessorTerminalCarryoverObservation::NotTerminalPhase);
+        }
+        let Some(current) = current else {
+            if self
+                .deferred_carryover
+                .observe_for_restart(
+                    pipeline.key(),
+                    pipeline.activation_digest(),
+                    pipeline.gathering(),
+                )
+                .await
+                .map_err(backend)?
+                .is_some()
+            {
+                return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+            }
+            return Ok(
+                RealmProcessorTerminalCarryoverObservation::AwaitVerifiedTerminalAuthorization,
+            );
+        };
+        let application = continuation
+            .application()
+            .ok_or(RealmProcessorDurableCaptureError::IdentityMismatch)?;
+        let expected_kind = match continuation.phase() {
+            RealmProcessorGenerationContinuationPhase::AwaitPublishedTerminal => {
+                RealmProcessorGenerationTerminalKind::Published
+            }
+            RealmProcessorGenerationContinuationPhase::AwaitRetiredNoWorkTerminal => {
+                RealmProcessorGenerationTerminalKind::RetiredNoWork
+            }
+            _ => return Err(RealmProcessorDurableCaptureError::IdentityMismatch),
+        };
+        let assignment_digest = self
+            .validate_current_application_source(pipeline, application, hasher)
+            .await?;
+        if current.key() != pipeline.key()
+            || current.activation_digest() != pipeline.activation_digest()
+            || current.source() != pipeline.processing()
+            || current.successor() != pipeline.gathering()
+            || current.kind() != expected_kind
+            || current.expected_pipeline() != pipeline
+            || current.assignment_digest() != &assignment_digest
+            || current.application_store_fingerprint()
+                != self.application_archive.restart_fingerprint().as_bytes()
+            || current.application() != application
+        {
+            return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+        }
+        hasher.update(current.to_canonical_bytes());
+        let carryover = self
+            .deferred_carryover
+            .observe_for_restart(
+                pipeline.key(),
+                pipeline.activation_digest(),
+                pipeline.gathering(),
+            )
+            .await
+            .map_err(backend)?;
+        let Some(carryover) = carryover else {
+            return Ok(
+                RealmProcessorTerminalCarryoverObservation::UnqualifiedTerminalObservedAwaitCarryover,
+            );
+        };
+        let RealmProcessorDeferredCarryoverSource::Predecessor {
+            predecessor,
+            terminal_slot,
+            terminal_store_fingerprint,
+            terminal_digest,
+            rotation_intent_digest,
+            assignment_digest: carryover_assignment,
+            application_store_fingerprint,
+            application: carryover_application,
+        } = carryover.source()
+        else {
+            return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+        };
+        if predecessor != current.source()
+            || terminal_slot != current.slot()
+            || terminal_store_fingerprint != self.generation_terminal.restart_fingerprint()
+            || terminal_digest != current.digest()
+            || rotation_intent_digest != current.rotation_intent_digest()
+            || carryover_assignment != assignment_digest
+            || application_store_fingerprint
+                != *self.application_archive.restart_fingerprint().as_bytes()
+            || carryover_application != application
+            || carryover.successor() != current.successor()
+            || carryover.deferred_count() != application.deferred_count()
+            || carryover.deferred_digest() != application.deferred_digest()
+        {
+            return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+        }
+        hasher.update(carryover.to_canonical_bytes());
+        Ok(RealmProcessorTerminalCarryoverObservation::TerminalAndCarryoverObserved)
+    }
+
+    async fn validate_current_application_source(
+        &self,
+        pipeline: &StoredPendingPipeline<Hash>,
+        application: RealmProcessorApplicationContinuation,
+        hasher: &mut Sha256,
+    ) -> Result<[u8; 32], RealmProcessorDurableCaptureError> {
+        let context = PendingQueueCaptureContext::try_new(
+            pipeline.key(),
+            pipeline.activation_digest(),
+            pipeline.processing(),
+        )
+        .map_err(backend)?;
+        let ledger_key = PendingQueueSegmentLedgerKey::try_new(
+            pipeline.key(),
+            self.nats.base_namespace(),
+        )
+        .map_err(backend)?;
+        let route = self
+            .ledger
+            .read_assignment_route_exact(&ledger_key, context)
+            .await
+            .map_err(backend)?;
+        let assignment_digest = *route.assignment().assignment().digest().as_bytes();
+        self.validate_application_source(
+            pipeline.key(),
+            pipeline.activation_digest(),
+            pipeline.processing(),
+            application,
+            assignment_digest,
+            *self.application_archive.restart_fingerprint().as_bytes(),
+            hasher,
+        )
+        .await?;
+        Ok(assignment_digest)
     }
 
     async fn open_exact(
@@ -492,108 +1040,10 @@ where
         {
             return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
         }
-        let key = PendingGenerationLedgerKey::new(self.network, self.authority);
-        let PendingPipelineReadState::Current(pipeline) =
-            self.pipeline.read::<Hash>(key).await.map_err(backend)?
-        else {
-            return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
-        };
-        if pipeline.activation_digest().as_bytes() != &self.writer_activation_digest
-            || pipeline.blocked_reason().is_some()
-        {
-            return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
-        }
-        let phase = match pipeline.processing_state() {
-            PendingProcessingState::Baseline(_) => {
-                RealmProcessorGenerationContinuationPhase::AwaitPrimeOrRotate
-            }
-            PendingProcessingState::Ready => {
-                RealmProcessorGenerationContinuationPhase::AwaitQueueClose
-            }
-            PendingProcessingState::Sealing(_) => {
-                RealmProcessorGenerationContinuationPhase::CaptureClosedSource
-            }
-            PendingProcessingState::WorkCaptured(_)
-            | PendingProcessingState::InFlight { .. }
-            | PendingProcessingState::EmptyQueueSealed(_)
-            | PendingProcessingState::RetiredNoWork { .. }
-            | PendingProcessingState::Published { .. } => {
-                let context = PendingQueueCaptureContext::try_new(
-                    pipeline.key(),
-                    pipeline.activation_digest(),
-                    pipeline.processing(),
-                )
-                .map_err(backend)?;
-                let ledger_key = PendingQueueSegmentLedgerKey::try_new(
-                    pipeline.key(),
-                    self.nats.base_namespace(),
-                )
-                .map_err(backend)?;
-                let route = self
-                    .ledger
-                    .read_assignment_route_exact(&ledger_key, context)
-                    .await
-                    .map_err(backend)?;
-                self.ledger
-                    .revalidate_assignment_route(&route)
-                    .await
-                    .map_err(backend)?;
-                let (first, archive, first_pipeline) = self
-                    .application_archive
-                    .observe_generation_continuation::<Hash>(
-                        &self.pipeline,
-                        route.assignment(),
-                    )
-                    .await
-                    .map_err(backend)?;
-                self.transport_archive
-                    .revalidate_realm_application_header(
-                        route.assignment(),
-                        archive.header(),
-                    )
-                    .await
-                    .map_err(backend)?;
-                self.ledger
-                    .revalidate_assignment_route(&route)
-                    .await
-                    .map_err(backend)?;
-                let (second, second_archive, second_pipeline) = self
-                    .application_archive
-                    .observe_generation_continuation::<Hash>(
-                        &self.pipeline,
-                        route.assignment(),
-                    )
-                    .await
-                    .map_err(backend)?;
-                self.transport_archive
-                    .revalidate_realm_application_header(
-                        route.assignment(),
-                        second_archive.header(),
-                    )
-                    .await
-                    .map_err(backend)?;
-                self.ledger
-                    .revalidate_assignment_route(&route)
-                    .await
-                    .map_err(backend)?;
-                if first != second
-                    || pipeline.revision() != first_pipeline.revision()
-                    || first_pipeline.revision() != second_pipeline.revision()
-                    || pipeline.canonical_payload() != first_pipeline.canonical_payload()
-                    || first_pipeline.canonical_payload() != second_pipeline.canonical_payload()
-                {
-                    return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
-                }
-                return Ok(first);
-            }
-        };
-        RealmProcessorGenerationContinuation::try_from_storage(
-            pipeline.processing(),
-            pipeline.revision(),
-            phase,
-            None,
-        )
-        .map_err(backend)
+        Ok(self
+            .observe_generation_continuation_exact()
+            .await?
+            .continuation)
     }
 
     async fn open(
@@ -602,6 +1052,99 @@ where
     ) -> Result<Box<dyn RealmProcessorDurableCapturePort>, RealmProcessorDurableCaptureError> {
         Ok(Box::new(self.open_exact(request).await?))
     }
+}
+
+#[async_trait]
+impl<Hash> RealmProcessorContinuationRestartFactory<Hash>
+    for ScyllaRealmProcessorDurableCaptureFactory<Hash>
+where
+    Hash: Q256BitHash + Send + Sync + 'static,
+{
+    fn network(&self) -> NetworkId {
+        self.network
+    }
+
+    fn realm_id(&self) -> u32 {
+        match self.authority {
+            AuthorityScope::Realm { realm_id, .. } => realm_id,
+            AuthorityScope::Coordinator => unreachable!("Realm-only factory"),
+        }
+    }
+
+    fn realm_sub_id(&self) -> u16 {
+        match self.authority {
+            AuthorityScope::Realm { realm_sub_id, .. } => realm_sub_id,
+            AuthorityScope::Coordinator => unreachable!("Realm-only factory"),
+        }
+    }
+
+    fn writer_activation_digest(&self) -> [u8; 32] {
+        self.writer_activation_digest
+    }
+
+    fn queue_readiness_digest(&self) -> [u8; 32] {
+        self.queue_readiness_digest
+    }
+
+    async fn open(
+        self: Arc<Self>,
+        request: SealedRealmProcessorContinuationRestartRequest,
+    ) -> Result<Box<dyn RealmProcessorContinuationRestartPort>, RealmProcessorDurableCaptureError>
+    {
+        self.validate_restart_identity(&request)?;
+        Ok(Box::new(ScyllaRealmProcessorContinuationRestart {
+            factory: self,
+            request,
+        }))
+    }
+}
+
+struct ScyllaRealmProcessorExactContinuation<Hash> {
+    continuation: RealmProcessorGenerationContinuation,
+    pipeline: StoredPendingPipeline<Hash>,
+}
+
+struct ScyllaRealmProcessorRestartSnapshot {
+    preparation: RealmProcessorReadOnlyRestartPreparation,
+    digest: [u8; 32],
+}
+
+struct ScyllaRealmProcessorContinuationRestart<Hash> {
+    factory: Arc<ScyllaRealmProcessorDurableCaptureFactory<Hash>>,
+    request: SealedRealmProcessorContinuationRestartRequest,
+}
+
+#[async_trait]
+impl<Hash> RealmProcessorContinuationRestartPort
+    for ScyllaRealmProcessorContinuationRestart<Hash>
+where
+    Hash: Q256BitHash + Send + Sync + 'static,
+{
+    async fn observe_and_prepare(
+        self: Box<Self>,
+    ) -> Result<RealmProcessorReadOnlyRestartPreparation, RealmProcessorDurableCaptureError>
+    {
+        self.factory.validate_restart_identity(&self.request)?;
+        let first = self.factory.observe_restart_snapshot().await?;
+        let second = self.factory.observe_restart_snapshot().await?;
+        if first.preparation != second.preparation || first.digest != second.digest {
+            return Err(RealmProcessorDurableCaptureError::ConcurrentMutation);
+        }
+        Ok(first.preparation)
+    }
+}
+
+fn hash_pipeline<Hash: Q256BitHash>(hasher: &mut Sha256, pipeline: &StoredPendingPipeline<Hash>) {
+    hasher.update(pipeline.revision().get().to_be_bytes());
+    hasher.update(pipeline.canonical_payload());
+}
+
+fn same_pipeline_snapshot<Hash: Q256BitHash>(
+    first: &StoredPendingPipeline<Hash>,
+    second: &StoredPendingPipeline<Hash>,
+) -> bool {
+    first.revision() == second.revision()
+        && first.canonical_payload() == second.canonical_payload()
 }
 
 struct ScyllaRealmProcessorDurableCapture<Hash> {
@@ -1346,10 +1889,10 @@ mod tests {
     fn continuation_observer_brackets_full_pipeline_and_assignment_route() {
         let source = include_str!("realm_processor_durable_capture.rs");
         let method = source
-            .split("async fn observe_generation_continuation(")
+            .split("async fn observe_generation_continuation_exact(")
             .nth(1)
             .unwrap()
-            .split("async fn open(")
+            .split("fn validate_restart_identity(")
             .next()
             .unwrap();
         assert_eq!(method.matches("revalidate_assignment_route(&route)").count(), 3);
@@ -1358,13 +1901,70 @@ mod tests {
         assert!(method.contains(
             "pipeline.canonical_payload() != first_pipeline.canonical_payload()"
         ));
-        assert!(method.contains(
-            "first_pipeline.canonical_payload() != second_pipeline.canonical_payload()"
-        ));
+        assert!(method.contains("first_pipeline.canonical_payload()"));
+        assert!(method.contains("!= second_pipeline.canonical_payload()"));
         assert!(method.contains("PendingProcessingState::Baseline(_)"));
         assert!(method.contains("AwaitPrimeOrRotate"));
         assert!(method.contains("PendingProcessingState::Ready"));
         assert!(method.contains("AwaitQueueClose"));
+        assert!(method.contains("same_pipeline_snapshot(&pipeline, &second_pipeline)"));
+
+        let equality = source
+            .split("fn same_pipeline_snapshot")
+            .nth(1)
+            .unwrap()
+            .split("struct ScyllaRealmProcessorDurableCapture")
+            .next()
+            .unwrap();
+        assert!(equality.contains("first.revision() == second.revision()"));
+        assert!(equality.contains(
+            "first.canonical_payload() == second.canonical_payload()"
+        ));
+    }
+
+    #[test]
+    fn continuation_restart_is_storage_selected_one_shot_and_read_only() {
+        let source = include_str!("realm_processor_durable_capture.rs");
+        let restart = source
+            .split("async fn observe_restart_snapshot(")
+            .nth(1)
+            .unwrap()
+            .split("async fn open_exact(")
+            .next()
+            .unwrap();
+        assert!(restart.contains("observe_for_restart"));
+        assert!(restart.contains("observe_generation_continuation_exact"));
+        assert!(restart.contains("ConcurrentMutation"));
+        assert!(restart.contains("RealmProcessorInboundCarryoverObservation::Missing"));
+        assert!(restart.contains("let pipeline = exact.pipeline"));
+        assert!(restart.contains("generation_terminal"));
+        assert!(restart.contains("deferred_carryover"));
+        for forbidden in [
+            ".persist(",
+            ".apply(",
+            "seal_rotation(",
+            "terminal_authorization:",
+            "publish_marker",
+            "finish_published",
+        ] {
+            assert!(
+                !restart.contains(forbidden),
+                "restart preparation must be read-only: {forbidden}"
+            );
+        }
+
+        let terminal_store = include_str!("realm_processor_generation_terminal.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let carryover_store = include_str!("realm_processor_deferred_carryover.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(terminal_store.contains("pub(super) async fn observe_for_restart"));
+        assert!(carryover_store.contains("pub(super) async fn observe_for_restart"));
+        assert!(!terminal_store.contains("pub(super) async fn persist"));
+        assert!(!carryover_store.contains("pub(super) async fn persist"));
     }
 
     #[test]
@@ -1388,5 +1988,18 @@ mod tests {
         assert!(recovered.contains("revalidate_realm_application_header"));
         assert!(!recovered.contains("claim_owner"));
         assert!(!recovered.contains("read_queue_close_exact"));
+    }
+
+    #[test]
+    fn restart_owner_is_not_called_by_production_processor_or_serving_composition() {
+        let process = include_str!(
+            "../../../psy_node_common/src/realm/processor/core/process_block.rs"
+        );
+        let create = include_str!(
+            "../../../psy_node_common/src/realm/processor/create.rs"
+        );
+        assert!(!process.contains("open_continuation_restart"));
+        assert!(process.contains("REALM_BRANCH_EXACT_FULL_COMMIT_COVERAGE_NOT_INTEGRATED"));
+        assert!(create.contains("ServingCompositionNotIntegrated"));
     }
 }

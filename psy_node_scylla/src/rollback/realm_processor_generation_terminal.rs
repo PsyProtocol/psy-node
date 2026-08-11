@@ -14,6 +14,10 @@ use psy_node_core::queue::realm_processor_generation_terminal::{
     RealmProcessorGenerationTerminalSlot,
     RealmProcessorGenerationTerminalStoreFingerprint,
 };
+use psy_node_core::store::pending_generation_identity::{
+    PendingGenerationActivationDigest, PendingGenerationContext,
+    PendingGenerationLedgerKey,
+};
 use scylla::{
     client::session::Session,
     response::query_result::QueryResult,
@@ -109,6 +113,27 @@ impl ScyllaRealmProcessorGenerationTerminalStore {
             bootstrap: prepare_lwt(&session, queries.bootstrap).await?,
             session,
         })
+    }
+
+    /// Narrow, read-only selector used by the continuation restart owner.
+    /// It does not expose the private persistence receipt or mutation path.
+    pub(super) async fn observe_for_restart<Hash: Q256BitHash>(
+        &self,
+        key: PendingGenerationLedgerKey,
+        activation: PendingGenerationActivationDigest,
+        source: PendingGenerationContext,
+    ) -> Result<Option<RealmProcessorGenerationTerminal<Hash>>, RealmProcessorGenerationTerminalStoreError>
+    {
+        self.read(RealmProcessorGenerationTerminalSlot::for_generation(
+            key, activation, source,
+        )?)
+        .await
+    }
+
+    pub(super) const fn restart_fingerprint(
+        &self,
+    ) -> RealmProcessorGenerationTerminalStoreFingerprint {
+        self.fingerprint
     }
 
     async fn read<Hash: Q256BitHash>(

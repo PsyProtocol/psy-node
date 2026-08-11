@@ -422,6 +422,7 @@ impl SealedRealmProcessorDurableCaptureRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RealmProcessorDurableCaptureError {
     IdentityMismatch,
+    ConcurrentMutation,
     RuntimeCapabilityMismatch,
     MalformedCompleteGeneration,
     MalformedApplicationHandoff,

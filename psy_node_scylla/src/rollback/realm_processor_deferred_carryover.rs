@@ -12,6 +12,10 @@ use psy_node_core::queue::realm_processor_generation_terminal::{
     RealmGenerationTerminalError, RealmProcessorDeferredCarryover,
     RealmProcessorDeferredCarryoverSlot,
 };
+use psy_node_core::store::pending_generation_identity::{
+    PendingGenerationActivationDigest, PendingGenerationContext,
+    PendingGenerationLedgerKey,
+};
 use scylla::{
     client::session::Session,
     response::query_result::QueryResult,
@@ -106,6 +110,21 @@ impl ScyllaRealmProcessorDeferredCarryoverStore {
             bootstrap: prepare_lwt(&session, queries.bootstrap).await?,
             session,
         })
+    }
+
+    /// Narrow, read-only successor lookup for restart classification. Missing
+    /// remains `None`; callers may never treat it as an empty carryover.
+    pub(super) async fn observe_for_restart(
+        &self,
+        key: PendingGenerationLedgerKey,
+        activation: PendingGenerationActivationDigest,
+        successor: PendingGenerationContext,
+    ) -> Result<Option<RealmProcessorDeferredCarryover>, RealmProcessorDeferredCarryoverStoreError>
+    {
+        self.read(RealmProcessorDeferredCarryoverSlot::for_successor(
+            key, activation, successor,
+        )?)
+        .await
     }
 
     async fn read(

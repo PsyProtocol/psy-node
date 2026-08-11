@@ -17,4 +17,5 @@ pub mod realm_processor_durable_capture;
 pub mod realm_processor_semantic_output;
 pub mod realm_processor_application_archive;
 pub mod realm_processor_generation_continuation;
+pub mod realm_processor_continuation_restart;
 pub mod realm_processor_generation_terminal;

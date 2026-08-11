@@ -258,6 +258,12 @@ pub(super) struct ScyllaRealmProcessorApplicationArchiveStore {
 }
 
 impl ScyllaRealmProcessorApplicationArchiveStore {
+    pub(super) const fn restart_fingerprint(
+        &self,
+    ) -> RealmProcessorApplicationArchiveStoreFingerprint {
+        self.fingerprint
+    }
+
     pub(super) async fn create_schema(
         session: &Session,
         control: &BranchExactDeploymentNoTabletKeyspace,

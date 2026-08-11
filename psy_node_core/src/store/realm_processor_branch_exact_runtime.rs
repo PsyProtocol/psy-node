@@ -25,6 +25,12 @@ use crate::queue::{
         SealedRealmProcessorGenerationContinuationRequest,
     },
     realm_processor_generation_continuation::RealmProcessorGenerationContinuation,
+    realm_processor_continuation_restart::{
+        RealmProcessorContinuationRestartFactory,
+        RealmProcessorContinuationRestartPort,
+        RealmProcessorReadOnlyRestartPreparation,
+        SealedRealmProcessorContinuationRestartRequest,
+    },
     realm_processor_semantic_output::RealmProcessorSemanticOutput,
     recoverable_ephemeral::PendingQueueCaptureContext,
 };
@@ -66,6 +72,7 @@ pub struct InstalledRealmBranchExactCommitRuntime<Hash> {
     startup_permit: RealmProcessorFreshRunPermit,
     runtime: Arc<dyn RealmBranchExactCommitRuntime<Hash>>,
     capture_factory: Arc<dyn RealmProcessorDurableCaptureFactory>,
+    restart_factory: Arc<dyn RealmProcessorContinuationRestartFactory<Hash>>,
 }
 
 impl<Hash> InstalledRealmBranchExactCommitRuntime<Hash> {
@@ -75,6 +82,7 @@ impl<Hash> InstalledRealmBranchExactCommitRuntime<Hash> {
         startup_permit: RealmProcessorFreshRunPermit,
         runtime: Arc<dyn RealmBranchExactCommitRuntime<Hash>>,
         capture_factory: Arc<dyn RealmProcessorDurableCaptureFactory>,
+        restart_factory: Arc<dyn RealmProcessorContinuationRestartFactory<Hash>>,
     ) -> Result<Self, RealmProcessorStartupError> {
         let expectation = startup_permit.expectation();
         if runtime.network() != expectation.network()
@@ -91,6 +99,13 @@ impl<Hash> InstalledRealmBranchExactCommitRuntime<Hash> {
                 != runtime.writer_activation_digest()
             || capture_factory.queue_readiness_digest()
                 != runtime.queue_readiness_digest()
+            || restart_factory.network() != runtime.network()
+            || restart_factory.realm_id() != runtime.realm_id()
+            || restart_factory.realm_sub_id() != runtime.realm_sub_id()
+            || restart_factory.writer_activation_digest()
+                != runtime.writer_activation_digest()
+            || restart_factory.queue_readiness_digest()
+                != runtime.queue_readiness_digest()
         {
             return Err(RealmProcessorStartupError::CommitRuntimeIdentityMismatch);
         }
@@ -98,6 +113,7 @@ impl<Hash> InstalledRealmBranchExactCommitRuntime<Hash> {
             startup_permit,
             runtime,
             capture_factory,
+            restart_factory,
         })
     }
 
@@ -111,6 +127,12 @@ impl<Hash> InstalledRealmBranchExactCommitRuntime<Hash> {
 
     fn capture_factory(&self) -> &Arc<dyn RealmProcessorDurableCaptureFactory> {
         &self.capture_factory
+    }
+
+    fn restart_factory(
+        &self,
+    ) -> &Arc<dyn RealmProcessorContinuationRestartFactory<Hash>> {
+        &self.restart_factory
     }
 }
 
@@ -217,6 +239,32 @@ impl<Hash> RealmBranchExactCommitIteration<'_, Hash> {
             .await
     }
 
+    /// Opens one storage-owned, one-shot restart preparation while borrowing
+    /// the complete iteration. It cannot coexist with a durable-capture
+    /// handle borrowed from the same owner.
+    pub async fn open_continuation_restart<'restart>(
+        &'restart mut self,
+    ) -> Result<RealmBranchExactContinuationRestart<'restart>, RealmProcessorDurableCaptureError>
+    where
+        Hash: 'static,
+    {
+        let runtime = self.owner.runtime();
+        let factory = Arc::clone(self.owner.installed.restart_factory());
+        let request = SealedRealmProcessorContinuationRestartRequest::seal(
+            self.owner.startup_permit_digest(),
+            runtime.network(),
+            runtime.realm_id(),
+            runtime.realm_sub_id(),
+            runtime.writer_activation_digest(),
+            runtime.queue_readiness_digest(),
+        );
+        let port = factory.open(request).await?;
+        Ok(RealmBranchExactContinuationRestart {
+            port,
+            _iteration: PhantomData,
+        })
+    }
+
     /// Opens one backend-owned capture authority while borrowing this whole
     /// iteration mutably.  The returned port cannot outlive the iteration and
     /// no second queue mutation can be opened through the same owner until it
@@ -276,6 +324,21 @@ impl<Hash> RealmBranchExactCommitIteration<'_, Hash> {
 pub struct RealmBranchExactDurableCapture<'iteration> {
     port: Box<dyn RealmProcessorDurableCapturePort>,
     _iteration: PhantomData<&'iteration mut ()>,
+}
+
+/// Lifetime-bound, non-Clone restart preparation. The sole operation consumes
+/// the handle, preventing a stale private snapshot from being reused.
+pub struct RealmBranchExactContinuationRestart<'iteration> {
+    port: Box<dyn RealmProcessorContinuationRestartPort>,
+    _iteration: PhantomData<&'iteration mut ()>,
+}
+
+impl RealmBranchExactContinuationRestart<'_> {
+    pub async fn observe_and_prepare(
+        self,
+    ) -> Result<RealmProcessorReadOnlyRestartPreparation, RealmProcessorDurableCaptureError> {
+        self.port.observe_and_prepare().await
+    }
 }
 
 impl RealmBranchExactDurableCapture<'_> {
@@ -461,6 +524,20 @@ mod tests {
 
     struct CapturePort;
 
+    struct RestartPort {
+        preparation: RealmProcessorReadOnlyRestartPreparation,
+    }
+
+    #[async_trait]
+    impl RealmProcessorContinuationRestartPort for RestartPort {
+        async fn observe_and_prepare(
+            self: Box<Self>,
+        ) -> Result<RealmProcessorReadOnlyRestartPreparation, RealmProcessorDurableCaptureError>
+        {
+            Ok(self.preparation)
+        }
+    }
+
     #[async_trait]
     impl RealmProcessorDurableCapturePort for CapturePort {
         async fn capture_next(
@@ -536,7 +613,7 @@ mod tests {
                 || request.realm_id() != self.realm_id
                 || request.realm_sub_id() != self.realm_sub_id
                 || request.writer_activation_digest() != &self.activation
-                || request.queue_readiness_digest() != &self.queue_readiness_digest()
+                || request.queue_readiness_digest() != &[6; 32]
             {
                 return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
             }
@@ -559,7 +636,7 @@ mod tests {
                 || request.realm_id() != self.realm_id
                 || request.realm_sub_id() != self.realm_sub_id
                 || request.writer_activation_digest() != &self.activation
-                || request.queue_readiness_digest() != &self.queue_readiness_digest()
+                || request.queue_readiness_digest() != &[6; 32]
                 || request.context().key().network() != self.network
                 || request.context().key().authority()
                     != (AuthorityScope::Realm {
@@ -571,6 +648,59 @@ mod tests {
                 return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
             }
             Ok(Box::new(CapturePort))
+        }
+    }
+
+    #[async_trait]
+    impl RealmProcessorContinuationRestartFactory<PHash> for CaptureFactory {
+        fn network(&self) -> NetworkId {
+            self.network
+        }
+
+        fn realm_id(&self) -> u32 {
+            self.realm_id
+        }
+
+        fn realm_sub_id(&self) -> u16 {
+            self.realm_sub_id
+        }
+
+        fn writer_activation_digest(&self) -> [u8; 32] {
+            self.activation
+        }
+
+        fn queue_readiness_digest(&self) -> [u8; 32] {
+            [6; 32]
+        }
+
+        async fn open(
+            self: Arc<Self>,
+            request: SealedRealmProcessorContinuationRestartRequest,
+        ) -> Result<Box<dyn RealmProcessorContinuationRestartPort>, RealmProcessorDurableCaptureError>
+        {
+            if request.network() != self.network
+                || request.realm_id() != self.realm_id
+                || request.realm_sub_id() != self.realm_sub_id
+                || request.writer_activation_digest() != &self.activation
+                || request.queue_readiness_digest() != &[6; 32]
+            {
+                return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+            }
+            let continuation = RealmProcessorGenerationContinuation::try_from_storage(
+                PendingGenerationContext::try_from_legacy(17, 19).unwrap(),
+                crate::store::pending_generation_pipeline::PendingPipelineRevision::try_new(3)
+                    .unwrap(),
+                crate::queue::realm_processor_generation_continuation::RealmProcessorGenerationContinuationPhase::AwaitQueueClose,
+                None,
+            )
+            .map_err(|_| RealmProcessorDurableCaptureError::IdentityMismatch)?;
+            let preparation = RealmProcessorReadOnlyRestartPreparation::try_from_storage(
+                continuation,
+                crate::queue::realm_processor_continuation_restart::RealmProcessorInboundCarryoverObservation::Missing,
+                crate::queue::realm_processor_continuation_restart::RealmProcessorTerminalCarryoverObservation::NotEvaluated,
+            )
+            .map_err(|_| RealmProcessorDurableCaptureError::IdentityMismatch)?;
+            Ok(Box::new(RestartPort { preparation }))
         }
     }
 
@@ -588,6 +718,20 @@ mod tests {
         })
     }
 
+    fn restart_factory(
+        network: NetworkId,
+        realm_id: u32,
+        realm_sub_id: u16,
+        activation: [u8; 32],
+    ) -> Arc<dyn RealmProcessorContinuationRestartFactory<PHash>> {
+        Arc::new(CaptureFactory {
+            network,
+            realm_id,
+            realm_sub_id,
+            activation,
+        })
+    }
+
     #[tokio::test]
     async fn exact_runtime_consumes_permit_into_nonclone_capability() {
         let permit = permit().await;
@@ -597,6 +741,7 @@ mod tests {
             permit,
             runtime(network(), 7, 3, [2; 32], drops.clone()),
             capture_factory(network(), 7, 3, [2; 32]),
+            restart_factory(network(), 7, 3, [2; 32]),
         )
         .unwrap();
         assert_eq!(installed.startup_permit_digest(), expected_digest);
@@ -636,6 +781,7 @@ mod tests {
                     Arc::new(AtomicUsize::new(0)),
                 ),
                 capture_factory(network(), 7, 3, [2; 32]),
+                restart_factory(network(), 7, 3, [2; 32]),
             );
             let Err(error) = result else {
                 panic!("mismatched runtime must not install")
@@ -656,6 +802,24 @@ mod tests {
                 Arc::new(AtomicUsize::new(0)),
             ),
             capture_factory(network(), 7, 3, [9; 32]),
+            restart_factory(network(), 7, 3, [2; 32]),
+        );
+        assert!(matches!(
+            result,
+            Err(RealmProcessorStartupError::CommitRuntimeIdentityMismatch)
+        ));
+
+        let result = InstalledRealmBranchExactCommitRuntime::seal(
+            permit().await,
+            runtime(
+                network(),
+                7,
+                3,
+                [2; 32],
+                Arc::new(AtomicUsize::new(0)),
+            ),
+            capture_factory(network(), 7, 3, [2; 32]),
+            restart_factory(network(), 7, 4, [2; 32]),
         );
         assert!(matches!(
             result,
@@ -675,6 +839,7 @@ mod tests {
                 Arc::new(AtomicUsize::new(0)),
             ),
             capture_factory(network(), 7, 3, [2; 32]),
+            restart_factory(network(), 7, 3, [2; 32]),
         )
         .unwrap();
         let mut owner = RealmBranchExactSingleCommitOwner::from_installed(installed);
@@ -703,6 +868,21 @@ mod tests {
                 .unwrap();
             assert!(capture.capture_next().await.unwrap().is_none());
             assert!(controlled.snapshot().active_iteration());
+        }
+        {
+            let mut attempt = owner
+                .begin_iteration(controlled.try_begin_iteration().unwrap())
+                .unwrap();
+            let restart = attempt.open_continuation_restart().await.unwrap();
+            let preparation = restart.observe_and_prepare().await.unwrap();
+            assert_eq!(
+                preparation.continuation().phase(),
+                crate::queue::realm_processor_generation_continuation::RealmProcessorGenerationContinuationPhase::AwaitQueueClose
+            );
+            assert_eq!(
+                preparation.inbound(),
+                crate::queue::realm_processor_continuation_restart::RealmProcessorInboundCarryoverObservation::Missing
+            );
         }
         assert!(!controlled.snapshot().active_iteration());
         drop(owner
