@@ -2244,7 +2244,12 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                 let replayed_items = replayed
                     .batches()
                     .iter()
-                    .flat_map(|batch| batch.business_items().iter().cloned())
+                    .flat_map(|batch| {
+                        batch
+                            .business_items()
+                            .iter()
+                            .map(|item| item.payload().to_vec())
+                    })
                     .collect::<Vec<_>>();
                 gather_task_restart_replayed = durable_generation_digest_stable
                     && replayed_items == first_items;

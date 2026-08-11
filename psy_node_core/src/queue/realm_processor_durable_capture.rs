@@ -17,7 +17,7 @@ use crate::store::realm_processor_startup::{
 
 use super::recoverable_ephemeral::{
     PendingQueueCaptureCandidate, PendingQueueCaptureContext,
-    PendingQueueGenerationBoundary,
+    PendingQueueGenerationBoundary, PendingQueueSourceCursorView,
 };
 use super::realm_processor_deferred_actor_input::{
     RealmProcessorDeferredActorInput, RealmProcessorDeferredActorInputOutcome,
@@ -26,7 +26,7 @@ use super::realm_processor_generation_continuation::RealmProcessorGenerationCont
 use super::realm_processor_semantic_output::RealmProcessorSemanticOutput;
 
 const COMPLETE_GENERATION_DOMAIN: &[u8] =
-    b"psy/rollback/realm-processor-complete-generation/v1";
+    b"psy/rollback/realm-processor-complete-generation/v2";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RealmProcessorDurableGenerationDigest([u8; 32]);
@@ -53,17 +53,74 @@ impl RealmProcessorDurableGenerationDigest {
 #[derive(Debug)]
 pub struct RealmProcessorDurableCapturedBatch {
     candidate: PendingQueueCaptureCandidate,
-    business_items: Vec<Vec<u8>>,
+    business_items: Vec<RealmProcessorDurableCapturedItem>,
+}
+
+/// Exact source identity retained for one decoded business payload. This
+/// lets a later dependency projection join contract-update bytes to the same
+/// NATS Data envelope rather than matching only potentially duplicated
+/// business bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RealmProcessorDurableCapturedItem {
+    subject_sequence: u64,
+    envelope_digest: [u8; 32],
+    payload: Vec<u8>,
+}
+
+impl RealmProcessorDurableCapturedItem {
+    pub fn try_new(
+        subject_sequence: u64,
+        envelope_digest: [u8; 32],
+        payload: Vec<u8>,
+    ) -> Result<Self, RealmProcessorDurableCaptureError> {
+        if subject_sequence == 0 || envelope_digest == [0; 32] || payload.is_empty() {
+            return Err(RealmProcessorDurableCaptureError::MalformedCompleteGeneration);
+        }
+        Ok(Self {
+            subject_sequence,
+            envelope_digest,
+            payload,
+        })
+    }
+
+    pub const fn subject_sequence(&self) -> u64 {
+        self.subject_sequence
+    }
+
+    pub const fn envelope_digest(&self) -> &[u8; 32] {
+        &self.envelope_digest
+    }
+
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    pub fn into_payload(self) -> Vec<u8> {
+        self.payload
+    }
 }
 
 impl RealmProcessorDurableCapturedBatch {
     pub fn try_from_verified_envelopes(
         candidate: PendingQueueCaptureCandidate,
-        business_items: Vec<Vec<u8>>,
+        business_items: Vec<RealmProcessorDurableCapturedItem>,
     ) -> Result<Self, RealmProcessorDurableCaptureError> {
+        let PendingQueueSourceCursorView::NatsJetStream {
+            stream_sequences, ..
+        } = candidate.source().view()
+        else {
+            return Err(RealmProcessorDurableCaptureError::MalformedCompleteGeneration);
+        };
         if candidate.item_count() == 0
             || candidate.item_count() != business_items.len() as u64
-            || business_items.iter().any(Vec::is_empty)
+            || stream_sequences.len() != business_items.len()
+            || stream_sequences
+                .iter()
+                .zip(&business_items)
+                .any(|(sequence, item)| *sequence != item.subject_sequence())
+            || business_items.windows(2).any(|items| {
+                items[0].subject_sequence() >= items[1].subject_sequence()
+            })
         {
             return Err(RealmProcessorDurableCaptureError::MalformedCompleteGeneration);
         }
@@ -77,12 +134,15 @@ impl RealmProcessorDurableCapturedBatch {
         &self.candidate
     }
 
-    pub fn business_items(&self) -> &[Vec<u8>] {
+    pub fn business_items(&self) -> &[RealmProcessorDurableCapturedItem] {
         &self.business_items
     }
 
     pub fn into_business_items(self) -> Vec<Vec<u8>> {
         self.business_items
+            .into_iter()
+            .map(RealmProcessorDurableCapturedItem::into_payload)
+            .collect()
     }
 }
 
@@ -115,6 +175,7 @@ impl RealmProcessorDurableCapturedGeneration {
             return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
         }
         let mut item_count = 0_u64;
+        let mut previous_subject_sequence = 0_u64;
         let mut hasher = Sha256::new();
         hasher.update(COMPLETE_GENERATION_DOMAIN);
         hasher.update(context.digest().as_bytes());
@@ -131,8 +192,14 @@ impl RealmProcessorDurableCapturedGeneration {
             hasher.update(batch.candidate().payload_digest().as_bytes());
             hasher.update(batch.candidate().item_count().to_be_bytes());
             for item in batch.business_items() {
-                hasher.update((item.len() as u64).to_be_bytes());
-                hasher.update(item);
+                if item.subject_sequence() <= previous_subject_sequence {
+                    return Err(RealmProcessorDurableCaptureError::MalformedCompleteGeneration);
+                }
+                previous_subject_sequence = item.subject_sequence();
+                hasher.update(item.subject_sequence().to_be_bytes());
+                hasher.update(item.envelope_digest());
+                hasher.update((item.payload().len() as u64).to_be_bytes());
+                hasher.update(item.payload());
             }
         }
         hasher.update(item_count.to_be_bytes());

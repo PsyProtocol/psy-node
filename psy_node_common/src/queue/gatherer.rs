@@ -1674,6 +1674,7 @@ mod h23b1_tests {
             realm_processor_durable_capture::{
                 RealmProcessorDurableCapturedBatch,
                 RealmProcessorDurableCapturedGeneration,
+                RealmProcessorDurableCapturedItem,
             },
             realm_processor_generation_terminal::RealmProcessorDeferredCarryover,
             recoverable_ephemeral::{
@@ -2012,7 +2013,20 @@ mod h23b1_tests {
         .unwrap();
         let batch = RealmProcessorDurableCapturedBatch::try_from_verified_envelopes(
             candidate,
-            vec![vec![marker, 11], vec![marker, 12]],
+            vec![
+                RealmProcessorDurableCapturedItem::try_new(
+                    10,
+                    [marker.max(1); 32],
+                    vec![marker, 11],
+                )
+                .unwrap(),
+                RealmProcessorDurableCapturedItem::try_new(
+                    11,
+                    [marker.saturating_add(1).max(1); 32],
+                    vec![marker, 12],
+                )
+                .unwrap(),
+            ],
         )
         .unwrap();
         let boundary = PendingQueueGenerationBoundary::try_from_backend_observation(

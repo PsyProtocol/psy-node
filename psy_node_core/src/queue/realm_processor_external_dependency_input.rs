@@ -15,6 +15,10 @@ use parth_core::{
 use sha2::{Digest, Sha256};
 
 use super::{
+    realm_processor_durable_capture::{
+        RealmProcessorDurableCapturedGeneration,
+        RealmProcessorDurableGenerationDigest,
+    },
     realm_user_update_admission::{
         RealmUserUpdateAdmissionCloseIntent, RealmUserUpdateAdmissionKey,
         RealmUserUpdateQualificationDigest, RealmUserUpdateTerminalEvidenceDigest,
@@ -27,6 +31,8 @@ const ITEM_DIGEST_DOMAIN: &[u8] =
     b"psy/rollback/realm-processor-external-dependency-item/v1";
 const PROJECTION_DIGEST_DOMAIN: &[u8] =
     b"psy/rollback/realm-processor-external-dependency-projection/v1";
+const ACTOR_INPUT_DIGEST_DOMAIN: &[u8] =
+    b"psy/rollback/realm-processor-qualified-external-actor-input/v1";
 
 macro_rules! digest_type {
     ($name:ident) => {
@@ -53,6 +59,7 @@ macro_rules! digest_type {
 
 digest_type!(RealmProcessorExternalDependencyItemDigest);
 digest_type!(RealmProcessorExternalDependencyProjectionDigest);
+digest_type!(RealmProcessorQualifiedExternalActorInputDigest);
 
 /// One exact published queue item plus the contract-update bytes required by
 /// the Realm actor.  Subject sequence and envelope digest join the durable
@@ -280,6 +287,106 @@ impl RealmProcessorExternalDependencyProjection {
     }
 }
 
+/// One closed transport generation joined to the exact dependency rows for
+/// those same Data envelopes. The actor receives this value as a single
+/// non-Clone input, so callers cannot combine generation A with dependencies
+/// from generation B. Constructing it remains data validation, not mutation
+/// authority; the real actor entry point is kept behind the controlled
+/// Processor iteration.
+#[derive(Debug)]
+pub struct RealmProcessorQualifiedExternalActorInput {
+    generation: RealmProcessorDurableCapturedGeneration,
+    dependency_commitment: RealmProcessorExternalDependencyCommitment,
+    items: Vec<RealmProcessorExternalDependencyItem>,
+    digest: RealmProcessorQualifiedExternalActorInputDigest,
+}
+
+impl RealmProcessorQualifiedExternalActorInput {
+    pub fn try_from_exact_sources(
+        generation: RealmProcessorDurableCapturedGeneration,
+        projection: RealmProcessorExternalDependencyProjection,
+    ) -> Result<Self, RealmProcessorExternalDependencyInputError> {
+        let dependency_commitment = projection.commitment();
+        if generation.context() != dependency_commitment.context()
+            || generation.item_count() != u64::from(dependency_commitment.item_count())
+        {
+            return Err(RealmProcessorExternalDependencyInputError::GenerationMismatch);
+        }
+
+        let captured_items = generation
+            .batches()
+            .iter()
+            .flat_map(|batch| batch.business_items());
+        for (captured, dependency) in captured_items.zip(projection.items()) {
+            if captured.subject_sequence() != dependency.subject_sequence()
+                || captured.envelope_digest() != dependency.envelope_digest()
+            {
+                return Err(RealmProcessorExternalDependencyInputError::EnvelopeMismatch);
+            }
+            if captured.payload() != dependency.queue_item() {
+                return Err(RealmProcessorExternalDependencyInputError::PayloadMismatch);
+            }
+        }
+
+        let digest = qualified_actor_input_digest(
+            generation.digest(),
+            dependency_commitment.projection_digest(),
+            dependency_commitment.item_count(),
+        )?;
+        Ok(Self {
+            generation,
+            dependency_commitment,
+            items: projection.into_items(),
+            digest,
+        })
+    }
+
+    pub const fn context(&self) -> PendingQueueCaptureContext {
+        self.dependency_commitment.context()
+    }
+
+    pub const fn generation_digest(&self) -> RealmProcessorDurableGenerationDigest {
+        self.generation.digest()
+    }
+
+    pub const fn dependency_commitment(
+        &self,
+    ) -> RealmProcessorExternalDependencyCommitment {
+        self.dependency_commitment
+    }
+
+    pub fn items(&self) -> &[RealmProcessorExternalDependencyItem] {
+        &self.items
+    }
+
+    pub const fn digest(&self) -> RealmProcessorQualifiedExternalActorInputDigest {
+        self.digest
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        RealmProcessorDurableCapturedGeneration,
+        Vec<RealmProcessorExternalDependencyItem>,
+    ) {
+        (self.generation, self.items)
+    }
+}
+
+fn qualified_actor_input_digest(
+    generation_digest: RealmProcessorDurableGenerationDigest,
+    projection_digest: RealmProcessorExternalDependencyProjectionDigest,
+    item_count: u32,
+) -> Result<RealmProcessorQualifiedExternalActorInputDigest, RealmProcessorExternalDependencyInputError>
+{
+    let mut hasher = Sha256::new();
+    hasher.update(ACTOR_INPUT_DIGEST_DOMAIN);
+    hasher.update(generation_digest.as_bytes());
+    hasher.update(projection_digest.as_bytes());
+    hasher.update(item_count.to_be_bytes());
+    RealmProcessorQualifiedExternalActorInputDigest::try_new(hasher.finalize().into())
+}
+
 fn item_digest(
     subject_sequence: u64,
     envelope_digest: [u8; 32],
@@ -342,6 +449,9 @@ pub enum RealmProcessorExternalDependencyInputError {
     ContextMismatch,
     AssignmentMismatch,
     SequenceMismatch,
+    GenerationMismatch,
+    EnvelopeMismatch,
+    PayloadMismatch,
     ItemCountOverflow,
     ComponentTooLarge,
     Model(String),
@@ -367,6 +477,17 @@ mod tests {
         PendingGenerationLedgerKey,
     };
     use crate::store::pending_generation_pipeline::PendingQueueCloseIntentDigest;
+    use crate::queue::{
+        realm_processor_durable_capture::{
+            RealmProcessorDurableCapturedBatch,
+            RealmProcessorDurableCapturedItem,
+        },
+        recoverable_ephemeral::{
+            PendingQueueBoundaryObservation, PendingQueueCaptureCandidate,
+            PendingQueueGenerationBoundary, PendingQueueSourceCursor,
+            PendingQueueSourceIdentity,
+        },
+    };
 
     use super::*;
 
@@ -393,6 +514,87 @@ mod tests {
                 .unwrap(),
             vec![marker, 1],
             vec![marker, 2],
+        )
+        .unwrap()
+    }
+
+    fn admission_close() -> RealmUserUpdateAdmissionCloseIntent {
+        RealmUserUpdateAdmissionCloseIntent::derive(
+            RealmUserUpdateAdmissionKey::try_new(context()).unwrap(),
+            [7; 32],
+        )
+        .unwrap()
+    }
+
+    fn captured_generation(
+        items: &[(u64, u8)],
+    ) -> RealmProcessorDurableCapturedGeneration {
+        let context = context();
+        let source = PendingQueueSourceIdentity::nats_jetstream(
+            "psy",
+            "realm-updates-r2-s3",
+            "psy.realm-updates.r2.s3.processing",
+        )
+        .unwrap();
+        let batches = if items.is_empty() {
+            Vec::new()
+        } else {
+            let sequences = items.iter().map(|(sequence, _)| *sequence).collect::<Vec<_>>();
+            let candidate = PendingQueueCaptureCandidate::try_new(
+                context,
+                source.clone(),
+                PendingQueueSourceCursor::nats_jetstream([4; 32], &sequences).unwrap(),
+                items
+                    .iter()
+                    .map(|(_, marker)| vec![*marker, 99])
+                    .collect(),
+            )
+            .unwrap();
+            vec![RealmProcessorDurableCapturedBatch::try_from_verified_envelopes(
+                candidate,
+                items
+                    .iter()
+                    .map(|(sequence, marker)| {
+                        RealmProcessorDurableCapturedItem::try_new(
+                            *sequence,
+                            [*marker; 32],
+                            vec![*marker, 1],
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+            )
+            .unwrap()]
+        };
+        let last_data = items.last().map_or(0, |(sequence, _)| *sequence);
+        let boundary = PendingQueueGenerationBoundary::try_from_backend_observation(
+            context,
+            PendingQueueCloseIntentDigest::try_new([7; 32]).unwrap(),
+            source.clone(),
+            PendingQueueBoundaryObservation::NatsJetStream {
+                seal_marker_stream_sequence: last_data + 1,
+                last_data_stream_sequence: last_data,
+                seal_marker_digest: [8; 32],
+            },
+        )
+        .unwrap();
+        RealmProcessorDurableCapturedGeneration::try_from_exhaustive_readback(
+            context,
+            batches,
+            boundary,
+        )
+        .unwrap()
+    }
+
+    fn projection(
+        items: Vec<RealmProcessorExternalDependencyItem>,
+    ) -> RealmProcessorExternalDependencyProjection {
+        RealmProcessorExternalDependencyProjection::try_new(
+            context(),
+            admission_close(),
+            RealmUserUpdateQualificationDigest::try_new([8; 32]).unwrap(),
+            [9; 32],
+            items,
         )
         .unwrap()
     }
@@ -517,6 +719,166 @@ mod tests {
             )
             .unwrap_err(),
             RealmProcessorExternalDependencyInputError::MalformedItem,
+        );
+    }
+
+    #[test]
+    fn qualified_actor_input_joins_exact_envelopes_payloads_and_dependencies() {
+        let input = RealmProcessorQualifiedExternalActorInput::try_from_exact_sources(
+            captured_generation(&[(11, 11), (12, 12)]),
+            projection(vec![item(12, 12), item(11, 11)]),
+        )
+        .unwrap();
+        assert_eq!(input.context(), context());
+        assert_eq!(input.items().len(), 2);
+        assert_eq!(input.items()[0].subject_sequence(), 11);
+        assert_eq!(input.items()[1].contract_updates(), &[12, 2]);
+        assert_ne!(input.digest().as_bytes(), &[0; 32]);
+
+        let same = RealmProcessorQualifiedExternalActorInput::try_from_exact_sources(
+            captured_generation(&[(11, 11), (12, 12)]),
+            projection(vec![item(11, 11), item(12, 12)]),
+        )
+        .unwrap();
+        assert_eq!(input.digest(), same.digest());
+
+        let changed_updates = RealmProcessorQualifiedExternalActorInput::try_from_exact_sources(
+            captured_generation(&[(11, 11), (12, 12)]),
+            projection(vec![
+                item(11, 11),
+                RealmProcessorExternalDependencyItem::try_new(
+                    12,
+                    [12; 32],
+                    RealmUserUpdateTerminalEvidenceDigest::try_new([13; 32]).unwrap(),
+                    vec![12, 1],
+                    vec![12, 77],
+                )
+                .unwrap(),
+            ]),
+        )
+        .unwrap();
+        assert_ne!(input.digest(), changed_updates.digest());
+    }
+
+    #[test]
+    fn qualified_actor_input_rejects_cross_wired_sources_and_accepts_explicit_empty() {
+        let wrong_envelope = projection(vec![
+            item(11, 11),
+            RealmProcessorExternalDependencyItem::try_new(
+                12,
+                [99; 32],
+                RealmUserUpdateTerminalEvidenceDigest::try_new([13; 32]).unwrap(),
+                vec![12, 1],
+                vec![12, 2],
+            )
+            .unwrap(),
+        ]);
+        assert_eq!(
+            RealmProcessorQualifiedExternalActorInput::try_from_exact_sources(
+                captured_generation(&[(11, 11), (12, 12)]),
+                wrong_envelope,
+            )
+            .unwrap_err(),
+            RealmProcessorExternalDependencyInputError::EnvelopeMismatch,
+        );
+
+        let wrong_payload = projection(vec![
+            item(11, 11),
+            RealmProcessorExternalDependencyItem::try_new(
+                12,
+                [12; 32],
+                RealmUserUpdateTerminalEvidenceDigest::try_new([13; 32]).unwrap(),
+                vec![12, 88],
+                vec![12, 2],
+            )
+            .unwrap(),
+        ]);
+        assert_eq!(
+            RealmProcessorQualifiedExternalActorInput::try_from_exact_sources(
+                captured_generation(&[(11, 11), (12, 12)]),
+                wrong_payload,
+            )
+            .unwrap_err(),
+            RealmProcessorExternalDependencyInputError::PayloadMismatch,
+        );
+
+        let empty = RealmProcessorQualifiedExternalActorInput::try_from_exact_sources(
+            captured_generation(&[]),
+            projection(Vec::new()),
+        )
+        .unwrap();
+        assert!(empty.items().is_empty());
+        assert_eq!(empty.dependency_commitment().item_count(), 0);
+        assert_ne!(empty.digest().as_bytes(), &[0; 32]);
+    }
+
+    #[test]
+    fn captured_generation_rejects_cursor_or_cross_batch_sequence_drift() {
+        let context = context();
+        let source = PendingQueueSourceIdentity::nats_jetstream(
+            "psy",
+            "realm-updates-r2-s3",
+            "psy.realm-updates.r2.s3.processing",
+        )
+        .unwrap();
+        let candidate = PendingQueueCaptureCandidate::try_new(
+            context,
+            source.clone(),
+            PendingQueueSourceCursor::nats_jetstream([4; 32], &[11]).unwrap(),
+            vec![vec![1]],
+        )
+        .unwrap();
+        assert_eq!(
+            RealmProcessorDurableCapturedBatch::try_from_verified_envelopes(
+                candidate,
+                vec![RealmProcessorDurableCapturedItem::try_new(
+                    12,
+                    [12; 32],
+                    vec![12, 1],
+                )
+                .unwrap()],
+            )
+            .unwrap_err(),
+            crate::queue::realm_processor_durable_capture::RealmProcessorDurableCaptureError::MalformedCompleteGeneration,
+        );
+
+        let make_batch = |sequence: u64, marker: u8| {
+            RealmProcessorDurableCapturedBatch::try_from_verified_envelopes(
+                PendingQueueCaptureCandidate::try_new(
+                    context,
+                    source.clone(),
+                    PendingQueueSourceCursor::nats_jetstream([4; 32], &[sequence]).unwrap(),
+                    vec![vec![marker]],
+                )
+                .unwrap(),
+                vec![RealmProcessorDurableCapturedItem::try_new(
+                    sequence,
+                    [marker; 32],
+                    vec![marker, 1],
+                )
+                .unwrap()],
+            )
+            .unwrap()
+        };
+        let boundary = PendingQueueGenerationBoundary::try_from_backend_observation(
+            context,
+            PendingQueueCloseIntentDigest::try_new([7; 32]).unwrap(),
+            source.clone(),
+            PendingQueueBoundaryObservation::NatsJetStream {
+                seal_marker_stream_sequence: 13,
+                last_data_stream_sequence: 12,
+                seal_marker_digest: [8; 32],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            RealmProcessorDurableCapturedGeneration::try_from_exhaustive_readback(
+                context,
+                vec![make_batch(12, 12), make_batch(11, 11)],
+                boundary,
+            )
+            .unwrap_err(),
+            crate::queue::realm_processor_durable_capture::RealmProcessorDurableCaptureError::MalformedCompleteGeneration,
         );
     }
 }

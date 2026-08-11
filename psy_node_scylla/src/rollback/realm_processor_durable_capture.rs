@@ -22,6 +22,7 @@ use psy_node_core::{
             RealmProcessorDurableCapturePort,
             RealmProcessorDurableCapturedBatch,
             RealmProcessorDurableCapturedGeneration,
+            RealmProcessorDurableCapturedItem,
             SealedRealmProcessorDurableCaptureRequest,
             SealedRealmProcessorGenerationContinuationRequest,
         },
@@ -2000,7 +2001,11 @@ fn project_complete_generation(
             let PendingQueueEnvelopeBody::Data(payload) = envelope.body() else {
                 return Err(RealmProcessorDurableCaptureError::MalformedCompleteGeneration);
             };
-            business_items.push(payload.clone());
+            business_items.push(RealmProcessorDurableCapturedItem::try_new(
+                stream_sequence,
+                *envelope.digest().as_bytes(),
+                payload.clone(),
+            )?);
             expected_ordinal = expected_ordinal
                 .checked_add(1)
                 .ok_or(RealmProcessorDurableCaptureError::MalformedCompleteGeneration)?;
