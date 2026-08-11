@@ -392,3 +392,184 @@ export function shouldFatalRestartProcessor(line: string, alreadyRequested: bool
 export function s3CurlArgs(url: string, destPath: string): string[] {
     return ["curl", "-f", "-S", "-L", "--progress-bar", "-o", destPath, url];
 }
+
+/**
+ * psy-sdk declares psy-genesis as a submodule; prepare:wasm copies
+ * ../../../psy-genesis/config.json into packages/psy-sdk before build.
+ */
+export const PSY_SDK_GENESIS_SUBMODULE = "psy-genesis";
+export const PSY_SDK_GENESIS_CONFIG_REL = "psy-genesis/config.json";
+
+/**
+ * True when psy-sdk still needs `git submodule update --init` for psy-genesis
+ * before consumers can read config.json.
+ */
+export function psySdkGenesisSubmoduleNeedsInit(opts: {
+    gitMetadataPresent: boolean;
+    configPresent: boolean;
+}): boolean {
+    return !opts.gitMetadataPresent || !opts.configPresent;
+}
+
+/**
+ * psy-dapp ships nested gitlinks (psy-dapp/.gitmodules) for psy-genesis and
+ * psy-contracts. The UI apps alias directly into them — @chain-config ->
+ * psy-genesis/config.json, @protocol-config and @deployments ->
+ * psy-contracts/protocol-config|deployments — so both gitlinks must be
+ * initialized before UI dependency install or dev-server startup. A plain
+ * `git submodule update --init --recursive` at the psy-node root never
+ * reaches them when psy-dapp is pinned `update = none`; the nested gitlinks
+ * must be initialized from inside the psy-dapp checkout.
+ */
+export const PSY_DAPP_NESTED_SUBMODULES = ["psy-genesis", "psy-contracts"] as const;
+export type PsyDappNestedSubmodule = (typeof PSY_DAPP_NESTED_SUBMODULES)[number];
+
+/**
+ * Payload files (relative to each nested gitlink root) that the psy-dapp UI
+ * reads at dev/build time. A gitlink is ready only when its git metadata AND
+ * every payload file are present on disk.
+ */
+export const PSY_DAPP_NESTED_PAYLOADS: Readonly<Record<PsyDappNestedSubmodule, readonly string[]>> = {
+    "psy-genesis": ["config.json"],
+    "psy-contracts": ["protocol-config/index.ts", "deployments/index.ts"],
+};
+
+export type PsyDappNestedMissingPayloads = Readonly<Partial<Record<PsyDappNestedSubmodule, readonly string[]>>>;
+
+export type PsyDappNestedInitPlan = {
+    /** Nested gitlinks that still need `git submodule update --init`. */
+    pending: PsyDappNestedSubmodule[];
+    ready: boolean;
+    /** Payload files (submodule-relative) missing on disk, per gitlink. */
+    missingPayloads: PsyDappNestedMissingPayloads;
+    /** `submodule update --init -- <pending...>` args to run from the psy-dapp checkout root. */
+    updateArgs: string[];
+};
+
+/**
+ * Pure readiness decision + path planning for the nested psy-dapp gitlinks.
+ * Facts are gathered by the caller from the filesystem; this function never
+ * touches the network or the filesystem, so it is unit-testable in isolation.
+ */
+export function planPsyDappNestedSubmoduleInit(opts: {
+    /** Nested gitlinks whose .git gitlink metadata is absent on disk. */
+    uninitialized: readonly PsyDappNestedSubmodule[];
+    /** Payload files (submodule-relative) missing on disk. */
+    missingPayloads?: PsyDappNestedMissingPayloads;
+}): PsyDappNestedInitPlan {
+    const missingPayloads: PsyDappNestedMissingPayloads = {};
+    const pending: PsyDappNestedSubmodule[] = [];
+    for (const name of PSY_DAPP_NESTED_SUBMODULES) {
+        const payloads = opts.missingPayloads?.[name] ?? [];
+        if (payloads.length > 0) missingPayloads[name] = payloads;
+        if (opts.uninitialized.includes(name) || payloads.length > 0) {
+            pending.push(name);
+        }
+    }
+    const updateArgs = ["submodule", "update", "--init", "--", ...pending];
+    return { pending, ready: pending.length === 0, missingPayloads, updateArgs };
+}
+
+/**
+ * Repository-relative remedy for a plan that is not ready: the exact
+ * `git submodule update --init` command (relative to the psy-node repo root,
+ * `dappRelPath` is the psy-dapp checkout path, e.g. "psy-dapp") plus the
+ * payload files that remain missing on disk.
+ */
+export function formatPsyDappNestedSubmoduleRemedy(
+    dappRelPath: string,
+    plan: PsyDappNestedInitPlan,
+): string {
+    if (plan.ready) return "";
+    const command = `cd ${dappRelPath} && git submodule update --init -- ${plan.pending.join(" ")}`;
+    const missingFiles = plan.pending.flatMap((name) =>
+        (plan.missingPayloads[name] ?? []).map((rel) => `${dappRelPath}/${name}/${rel}`),
+    );
+    const payloadNote = missingFiles.length > 0
+        ? ` Required payloads still missing on disk: ${missingFiles.join(", ")}.`
+        : "";
+    return `Run \`${command}\` from the psy-node repository root.${payloadNote}`;
+}
+
+export type WalletPasswordSource = "env" | "cached" | "default-devnet" | "prompt-required";
+
+export type WalletPasswordPolicy = {
+    source: WalletPasswordSource;
+    password?: string;
+    error?: string;
+};
+
+/**
+ * Pure password resolution for the bridge-relayer keystore.
+ *
+ * Existing keystores must never silently invent the "devnet" default: a wrong
+ * assumption only fails much later during decrypt/deploy. Auto-generated
+ * keystores may still use the devnet default in non-interactive sessions.
+ * Interactive sessions still prompt; non-TTY with an existing keystore requires
+ * an explicit WALLET_PASSWORD.
+ */
+export function resolveWalletPasswordPolicy(opts: {
+    envPassword: string | undefined;
+    cachedPassword: string | null | undefined;
+    isTty: boolean;
+    keystoreExists: boolean;
+    keystoreGeneratedThisRun: boolean;
+}): WalletPasswordPolicy {
+    const envPassword = opts.envPassword ?? "";
+    if (envPassword.trim().length > 0) {
+        return { source: "env", password: envPassword };
+    }
+    if (opts.cachedPassword && opts.cachedPassword.length > 0) {
+        return { source: "cached", password: opts.cachedPassword };
+    }
+
+    const existingPreservedKeystore = opts.keystoreExists && !opts.keystoreGeneratedThisRun;
+    if (existingPreservedKeystore) {
+        if (!opts.isTty) {
+            return {
+                source: "prompt-required",
+                error:
+                    "WALLET_PASSWORD is required for an existing bridge-relayer keystore in a non-interactive session. " +
+                    "Set WALLET_PASSWORD to the keystore password, or remove ~/.psy/keystore/bridge-relayer to regenerate a dev key encrypted with 'devnet'.",
+            };
+        }
+        return { source: "prompt-required" };
+    }
+
+    if (!opts.isTty) {
+        return { source: "default-devnet", password: "devnet" };
+    }
+    return { source: "prompt-required" };
+}
+
+/** True when decrypt stderr/stdout looks like a wrong keystore password (not a missing tool). */
+export function isLikelyWrongKeystorePassword(errorText: string): boolean {
+    const normalized = errorText.toLowerCase();
+    return normalized.includes("invalid password")
+        || normalized.includes("incorrect password")
+        || normalized.includes("bad mac")
+        || normalized.includes("could not decrypt")
+        || normalized.includes("unable to decrypt")
+        || normalized.includes("unsupported state or unable to authenticate data")
+        || (normalized.includes("decrypt") && normalized.includes("password"));
+}
+
+/**
+ * Actionable error when an existing bridge-relayer keystore cannot be decrypted.
+ * Never echoes the password or keystore contents.
+ */
+export function formatBridgeRelayerKeystoreDecryptError(opts: {
+    keystorePath: string;
+    detail: string;
+}): string {
+    const detail = opts.detail.trim() || "unknown decrypt failure";
+    const wrongPasswordHint = isLikelyWrongKeystorePassword(detail)
+        ? "WALLET_PASSWORD does not match the existing keystore. "
+        : "Could not decrypt the existing keystore (wrong WALLET_PASSWORD or corrupt file). ";
+    return (
+        `[DevNet] failed to decrypt bridge relayer keystore at ${opts.keystorePath}. ` +
+        wrongPasswordHint +
+        `Set the correct WALLET_PASSWORD, or remove the keystore to regenerate a dev key: rm -f ${opts.keystorePath}. ` +
+        `Detail: ${detail}`
+    );
+}

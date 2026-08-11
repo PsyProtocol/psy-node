@@ -8,6 +8,7 @@ import {
 import {
     evaluateCompilerArtifactStamp,
     isUsableGenesisData,
+    planPsyDappNestedSubmodulesFromDisk,
     readGenesisContractsArtifactStamp,
     resolveProjectsDir,
     RunningProcess,
@@ -265,6 +266,56 @@ describe("compiler/genesis artifact stamps", () => {
             await writeCompilerArtifactStamp(stampPath, expected);
             expect(await readGenesisContractsArtifactStamp(stampPath)).toEqual(expected);
             expect(await Bun.file(`${stampPath}.tmp`).exists()).toBe(false);
+        } finally {
+            await Bun.$`rm -rf ${dir}`.quiet();
+        }
+    });
+});
+
+describe("planPsyDappNestedSubmodulesFromDisk", () => {
+    it("plans a fully present psy-dapp checkout as ready without git or network", async () => {
+        const dir = (await Bun.$`mktemp -d`.text()).trim();
+        try {
+            await Bun.write(`${dir}/psy-genesis/.git`, "gitdir: gitlink");
+            await Bun.write(`${dir}/psy-genesis/config.json`, "{}");
+            await Bun.write(`${dir}/psy-contracts/.git`, "gitdir: gitlink");
+            await Bun.write(`${dir}/psy-contracts/protocol-config/index.ts`, "export {}");
+            await Bun.write(`${dir}/psy-contracts/deployments/index.ts`, "export {}");
+            const plan = await planPsyDappNestedSubmodulesFromDisk(dir);
+            expect(plan.ready).toBe(true);
+            expect(plan.pending).toEqual([]);
+        } finally {
+            await Bun.$`rm -rf ${dir}`.quiet();
+        }
+    });
+
+    it("flags a fresh clone with missing git metadata and payloads as pending", async () => {
+        const dir = (await Bun.$`mktemp -d`.text()).trim();
+        try {
+            await Bun.write(`${dir}/psy-genesis/.git`, "gitdir: gitlink");
+            await Bun.write(`${dir}/psy-genesis/config.json`, "{}");
+            // psy-contracts is an empty gitlink directory: no .git, no payloads.
+            await Bun.$`mkdir -p ${dir}/psy-contracts`.quiet();
+            const plan = await planPsyDappNestedSubmodulesFromDisk(dir);
+            expect(plan.ready).toBe(false);
+            expect(plan.pending).toEqual(["psy-contracts"]);
+        } finally {
+            await Bun.$`rm -rf ${dir}`.quiet();
+        }
+    });
+
+    it("flags a checked-out gitlink missing payload files", async () => {
+        const dir = (await Bun.$`mktemp -d`.text()).trim();
+        try {
+            await Bun.write(`${dir}/psy-genesis/.git`, "gitdir: gitlink");
+            // config.json absent -> payload missing.
+            await Bun.write(`${dir}/psy-contracts/.git`, "gitdir: gitlink");
+            await Bun.write(`${dir}/psy-contracts/protocol-config/index.ts`, "export {}");
+            await Bun.write(`${dir}/psy-contracts/deployments/index.ts`, "export {}");
+            const plan = await planPsyDappNestedSubmodulesFromDisk(dir);
+            expect(plan.ready).toBe(false);
+            expect(plan.pending).toEqual(["psy-genesis"]);
+            expect(plan.missingPayloads["psy-genesis"]).toEqual(["config.json"]);
         } finally {
             await Bun.$`rm -rf ${dir}`.quiet();
         }

@@ -12,8 +12,14 @@ import {
     COORDINATOR_PROCESSOR_READY_MARKER,
     DEFAULT_WORKER_BATCH_SIZE,
     FAUCET_ENV_KEYS,
+    PSY_DAPP_NESTED_PAYLOADS,
+    PSY_DAPP_NESTED_SUBMODULES,
+    PSY_SDK_GENESIS_CONFIG_REL,
+    PSY_SDK_GENESIS_SUBMODULE,
     REALM_PROCESSOR_READY_MARKER,
     applyEnvioCpuSetToCompose,
+    formatBridgeRelayerKeystoreDecryptError,
+    formatPsyDappNestedSubmoduleRemedy,
     hasFaucetOperatorConfig,
     hasZstdMagic,
     parseCpuSet,
@@ -26,13 +32,17 @@ import {
     resolvePositiveIntegerSetting,
     resolveRayonThreadCount,
     resolveRealmWorkerCount,
+    resolveWalletPasswordPolicy,
     shouldFatalRestartProcessor,
     resolveScyllaMemory,
     selectNonEmptyEnv,
     shouldSkipBranchSync,
+    psySdkGenesisSubmoduleNeedsInit,
+    planPsyDappNestedSubmoduleInit,
     isCompilerFingerprintSource,
     s3CurlArgs,
 } from "./locSetupDefaults";
+import type { PsyDappNestedInitPlan, PsyDappNestedSubmodule } from "./locSetupDefaults";
 
 /**
  * Retry processor creation only for the known transient Scylla schema family.
@@ -247,6 +257,8 @@ function resolveL1Selection(): { l1Network: L1NetworkName; l1Fork: boolean; cfgE
 }
 
 let cachedWalletPassword: string | null = null;
+/** True when auto-setup generated the bridge-relayer keystore during this process. */
+let bridgeRelayerKeystoreGeneratedThisRun = false;
 
 function resolveBridgeRelayerKeystorePath(): string {
     const homeDir = process.env.HOME;
@@ -258,17 +270,32 @@ function resolveBridgeRelayerKeystorePath(): string {
 }
 
 async function resolveWalletPassword(): Promise<string> {
-    if (process.env.WALLET_PASSWORD && process.env.WALLET_PASSWORD.length > 0) {
-        return process.env.WALLET_PASSWORD;
+    const keystorePath = resolveBridgeRelayerKeystorePath();
+    const keystoreExists = await exists(keystorePath);
+    const policy = resolveWalletPasswordPolicy({
+        envPassword: process.env.WALLET_PASSWORD,
+        cachedPassword: cachedWalletPassword,
+        isTty: !!process.stdin.isTTY,
+        keystoreExists,
+        keystoreGeneratedThisRun: bridgeRelayerKeystoreGeneratedThisRun,
+    });
+
+    if (policy.password) {
+        if (policy.source === "env" || policy.source === "default-devnet") {
+            // Keep process env aligned so child deploy/relayer processes see the same secret.
+            process.env.WALLET_PASSWORD = policy.password;
+        }
+        if (policy.source === "cached" || policy.source === "default-devnet" || policy.source === "env") {
+            cachedWalletPassword = policy.password;
+        }
+        return policy.password;
     }
-    if (cachedWalletPassword) {
-        return cachedWalletPassword;
+
+    if (policy.error) {
+        throw new Error(`[DevNet] ${policy.error}`);
     }
-    if (!process.stdin.isTTY) {
-        cachedWalletPassword = process.env.WALLET_PASSWORD || "devnet";
-        process.env.WALLET_PASSWORD = cachedWalletPassword;
-        return cachedWalletPassword;
-    }
+
+    // Interactive path: existing keystore or first-run without env password.
     const { createInterface } = await import("node:readline/promises");
     const rl = createInterface({
         input: process.stdin,
@@ -277,7 +304,11 @@ async function resolveWalletPassword(): Promise<string> {
     try {
         const password = (await rl.question("Enter WALLET_PASSWORD for bridge-relayer keystore: ")).trim();
         if (!password) {
-            throw new Error("WALLET_PASSWORD is required when using bridge-relayer keystore");
+            throw new Error(
+                keystoreExists && !bridgeRelayerKeystoreGeneratedThisRun
+                    ? "WALLET_PASSWORD is required when using an existing bridge-relayer keystore"
+                    : "WALLET_PASSWORD is required when using bridge-relayer keystore",
+            );
         }
         cachedWalletPassword = password;
         process.env.WALLET_PASSWORD = password;
@@ -294,7 +325,7 @@ async function loadBridgeRelayerSigner(repoCwd: string): Promise<L1SignerInfo> {
     }
     const password = await resolveWalletPassword();
     const contractsDir = path.join(repoCwd, "psy-contracts");
-const decodeScript = `
+    const decodeScript = `
 const { Wallet } = require("ethers");
 const fs = require("fs");
 (async () => {
@@ -323,7 +354,10 @@ const fs = require("fs");
     const stdout = proc.stdout ? new TextDecoder().decode(proc.stdout) : "";
     const stderr = proc.stderr ? new TextDecoder().decode(proc.stderr) : "";
     if (code !== 0) {
-        throw new Error(`[DevNet] failed to decrypt bridge relayer keystore: ${stderr || stdout}`);
+        throw new Error(formatBridgeRelayerKeystoreDecryptError({
+            keystorePath,
+            detail: stderr || stdout,
+        }));
     }
     const parsed = JSON.parse(stdout) as { address: string };
     return {
@@ -1358,14 +1392,21 @@ async function ensureRepoCloned(repoName: string, repoUrl: string, branch: strin
     const projectsDir = resolveProjectsDir();
     const repoPath = path.join(projectsDir, repoName);
     if (await exists(path.join(repoPath, ".git"))) {
-        const remoteResult = await runAndCapture(["git", "remote", "get-url", "origin"], repoPath);
+        const remoteResult = await runAndCapture(["git", "remote", "-v"], repoPath);
         if (remoteResult.code !== 0) {
-            throw new Error(`[AutoSetup] Failed to inspect ${repoName} origin at ${repoPath}: ${remoteResult.stderr || remoteResult.stdout}`);
+            throw new Error(`[AutoSetup] Failed to inspect ${repoName} remotes at ${repoPath}: ${remoteResult.stderr || remoteResult.stdout}`);
         }
-        const currentOrigin = normalizeGitRemoteUrl(remoteResult.stdout);
         const expectedOrigin = normalizeGitRemoteUrl(repoUrl);
-        if (currentOrigin !== expectedOrigin) {
-            throw new Error(`[AutoSetup] ${repoName} already exists at ${repoPath} but origin is '${currentOrigin}' (expected '${expectedOrigin}'). Fix the remote or remove the repo to let auto-setup reclone it.`);
+        // Accept the canonical URL on ANY remote (not just origin): source
+        // checkouts keep their historical origin (e.g. psy-services origin is
+        // QEDProtocol) with the PsyProtocol canonical remote added separately.
+        const remotes = remoteResult.stdout
+            .split("\n")
+            .map((line) => line.split(/\s+/)[1])
+            .filter((url): url is string => Boolean(url))
+            .map(normalizeGitRemoteUrl);
+        if (!remotes.includes(expectedOrigin)) {
+            throw new Error(`[AutoSetup] ${repoName} already exists at ${repoPath} but no remote matches '${expectedOrigin}'. Fix the remote or remove the repo to let auto-setup reclone it.`);
         }
         if (shouldSkipBranchSync(process.env.PSY_SKIP_BRANCH_CHECK)) {
             console.log(`[AutoSetup] Branch sync disabled by default — leaving ${repoName} HEAD untouched; set PSY_SKIP_BRANCH_CHECK=0 to sync`);
@@ -1400,9 +1441,108 @@ async function ensureRequiredSubmodules(cwd: string): Promise<void> {
     );
 }
 
+async function ensurePsySdkGenesisSubmodule(sdkRoot: string): Promise<void> {
+    if (!(await exists(path.join(sdkRoot, ".git")))) {
+        throw new Error(`[AutoSetup] psy-sdk repository is missing under the projects directory: ${sdkRoot}`);
+    }
+    const gitMetadataPresent = await exists(path.join(sdkRoot, PSY_SDK_GENESIS_SUBMODULE, ".git"));
+    const configPresent = await exists(path.join(sdkRoot, PSY_SDK_GENESIS_CONFIG_REL));
+    if (!psySdkGenesisSubmoduleNeedsInit({ gitMetadataPresent, configPresent })) {
+        return;
+    }
+
+    console.log(`[AutoSetup] psy-sdk: initializing ${PSY_SDK_GENESIS_SUBMODULE} submodule...`);
+    const result = await runAndCapture(
+        gitWithoutLfs("submodule", "update", "--init", "--", PSY_SDK_GENESIS_SUBMODULE),
+        sdkRoot,
+    );
+    if (result.code !== 0) {
+        throw new Error(
+            `[AutoSetup] Failed to initialize psy-sdk ${PSY_SDK_GENESIS_SUBMODULE} submodule: ` +
+            `${result.stderr || result.stdout}. ` +
+            `Run \`git submodule update --init -- ${PSY_SDK_GENESIS_SUBMODULE}\` from ${sdkRoot}.`,
+        );
+    }
+
+    const readyGit = await exists(path.join(sdkRoot, PSY_SDK_GENESIS_SUBMODULE, ".git"));
+    const readyConfig = await exists(path.join(sdkRoot, PSY_SDK_GENESIS_CONFIG_REL));
+    if (psySdkGenesisSubmoduleNeedsInit({ gitMetadataPresent: readyGit, configPresent: readyConfig })) {
+        throw new Error(
+            `[AutoSetup] psy-sdk still missing ${PSY_SDK_GENESIS_CONFIG_REL} after submodule init. ` +
+            `Run \`git submodule update --init -- ${PSY_SDK_GENESIS_SUBMODULE}\` from ${sdkRoot}.`,
+        );
+    }
+    console.log(`[AutoSetup] psy-sdk: ${PSY_SDK_GENESIS_CONFIG_REL} ready`);
+}
+
+/**
+ * Gather disk facts for the nested psy-dapp gitlinks: which gitlinks lack
+ * their .git gitlink metadata and which payload files are missing. Pure
+ * planning happens in planPsyDappNestedSubmoduleInit; this only touches the
+ * filesystem, never git or the network.
+ */
+export async function planPsyDappNestedSubmodulesFromDisk(dappRoot: string): Promise<PsyDappNestedInitPlan> {
+    const uninitialized: PsyDappNestedSubmodule[] = [];
+    const missingPayloads: Partial<Record<PsyDappNestedSubmodule, string[]>> = {};
+    for (const name of PSY_DAPP_NESTED_SUBMODULES) {
+        if (!(await exists(path.join(dappRoot, name, ".git")))) {
+            uninitialized.push(name);
+            continue;
+        }
+        const missing: string[] = [];
+        for (const rel of PSY_DAPP_NESTED_PAYLOADS[name]) {
+            if (!(await exists(path.join(dappRoot, name, rel)))) missing.push(rel);
+        }
+        if (missing.length > 0) missingPayloads[name] = missing;
+    }
+    return planPsyDappNestedSubmoduleInit({ uninitialized, missingPayloads });
+}
+
+/**
+ * Ensure the nested psy-dapp gitlinks (psy-genesis, psy-contracts) are
+ * initialized before any UI dependency install or dev-server startup reads
+ * their payloads (config.json, protocol-config, deployments). Existing
+ * initialized checkouts are a no-op; failures throw with repository-relative
+ * commands and never silently continue.
+ */
+async function ensurePsyDappNestedSubmodules(dappRoot: string): Promise<void> {
+    if (!(await exists(path.join(dappRoot, ".git")))) {
+        throw new Error(
+            `[AutoSetup] psy-dapp checkout is missing at ${dappRoot}. ` +
+            "Run `git submodule update --init -- psy-dapp` from the psy-node repository.",
+        );
+    }
+    const dappRelPath = path.relative(REPO_ROOT, dappRoot) || "psy-dapp";
+
+    const plan = await planPsyDappNestedSubmodulesFromDisk(dappRoot);
+    if (plan.ready) return;
+
+    console.log(`[AutoSetup] psy-dapp: initializing nested gitlinks ${plan.pending.join(", ")}...`);
+    const result = await runAndCapture(gitWithoutLfs(...plan.updateArgs), dappRoot);
+    if (result.code !== 0) {
+        throw new Error(
+            `[AutoSetup] Failed to initialize psy-dapp nested gitlinks (${plan.pending.join(", ")}): ` +
+            `${result.stderr || result.stdout}. ` +
+            formatPsyDappNestedSubmoduleRemedy(dappRelPath, plan),
+        );
+    }
+
+    const afterPlan = await planPsyDappNestedSubmodulesFromDisk(dappRoot);
+    if (!afterPlan.ready) {
+        throw new Error(
+            `[AutoSetup] psy-dapp nested gitlinks still incomplete after init (${afterPlan.pending.join(", ")}). ` +
+            formatPsyDappNestedSubmoduleRemedy(dappRelPath, afterPlan),
+        );
+    }
+    console.log(`[AutoSetup] psy-dapp: nested gitlinks ${PSY_DAPP_NESTED_SUBMODULES.join(", ")} ready`);
+}
+
 async function ensureAllReposCloned(): Promise<void> {
     for (const repo of REPO_CONFIGS) {
-        await ensureRepoCloned(repo.name, repo.url, repo.branch);
+        const repoPath = await ensureRepoCloned(repo.name, repo.url, repo.branch);
+        if (repo.name === "psy-sdk") {
+            await ensurePsySdkGenesisSubmodule(repoPath);
+        }
     }
 }
 
@@ -1675,14 +1815,16 @@ async function assemblePsySdkCompilerSidecar(sdkDir: string, workspaceDir: strin
 async function ensurePsySdkArtifacts(workspaceDir: string): Promise<{ rebuilt: boolean }> {
     const projectsDir = resolveProjectsDir();
     const compilerDir = path.resolve(projectsDir, "psy-compiler");
-    const sdkDir = path.resolve(projectsDir, "psy-sdk", "psy-ts-sdk", "packages", "psy-sdk");
+    const sdkRoot = path.resolve(projectsDir, "psy-sdk");
+    const sdkDir = path.resolve(sdkRoot, "psy-ts-sdk", "packages", "psy-sdk");
     if (!(await exists(path.join(compilerDir, "Cargo.toml")))) {
         throw new Error(`[AutoSetup] standalone psy-compiler repository is missing under the projects directory`);
     }
     if (!(await exists(path.join(sdkDir, "package.json")))) {
         throw new Error(`[AutoSetup] psy-sdk package not found under the projects directory`);
     }
-
+    // prepare:wasm copies ../../../psy-genesis/config.json; init before any build/read.
+    await ensurePsySdkGenesisSubmodule(sdkRoot);
     const requiredArtifacts = [
         path.join(sdkDir, "dist", "index.mjs"),
         path.join(sdkDir, "dist", "index.d.ts"),
@@ -1791,6 +1933,51 @@ async function checkDockerComposeAvailable(): Promise<void> {
     if (result.code !== 0) {
         throw new Error("[AutoSetup] Required tool 'docker compose' not found. Install Docker Compose v2 or enable the compose plugin.");
     }
+}
+
+/**
+ * Fail early when an existing bridge-relayer keystore cannot be decrypted with
+ * the resolved password. Avoids long tool/binary startup before a password
+ * mismatch is discovered at deploy/relayer time. Never logs the password.
+ */
+async function assertExistingBridgeRelayerKeystorePassword(
+    keystorePath: string,
+    contractsDir: string,
+): Promise<void> {
+    // resolveWalletPassword already refuses silent "devnet" for preserved keystores.
+    const password = await resolveWalletPassword();
+    const decodeScript = `
+const { Wallet } = require("ethers");
+const fs = require("fs");
+(async () => {
+  const json = fs.readFileSync(process.argv[1], "utf8");
+  const password = (process.env.WALLET_PASSWORD || "").trim();
+  if (!password) {
+    throw new Error("WALLET_PASSWORD is required to decrypt bridge-relayer keystore");
+  }
+  await Wallet.fromEncryptedJson(json, password);
+  process.stdout.write("ok");
+})().catch((err) => {
+  console.error(err && err.message ? err.message : err);
+  process.exit(1);
+});
+`.trim();
+    const proc = Bun.spawnSync(["node", "-e", decodeScript, keystorePath], {
+        cwd: contractsDir,
+        env: {
+            ...process.env,
+            WALLET_PASSWORD: password,
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+    });
+    if ((proc.exitCode ?? 1) === 0) return;
+    const stdout = proc.stdout ? new TextDecoder().decode(proc.stdout) : "";
+    const stderr = proc.stderr ? new TextDecoder().decode(proc.stderr) : "";
+    throw new Error(formatBridgeRelayerKeystoreDecryptError({
+        keystorePath,
+        detail: stderr || stdout,
+    }));
 }
 
 async function autoGenerateBridgeRelayerKeystore(keystorePath: string, contractsDir: string): Promise<void> {
@@ -1904,6 +2091,8 @@ async function ensureKeystoreFiles(contractsDir: string): Promise<{ generated: b
     if (!homeDir) throw new Error("[AutoSetup] HOME is not set");
     const keystoreDir = path.join(homeDir, ".psy", "keystore");
     await mkdir(keystoreDir, { recursive: true });
+    const bridgeRelayerPath = resolveBridgeRelayerKeystorePath();
+    await mkdir(path.dirname(bridgeRelayerPath), { recursive: true });
     let generated = false;
 
     // Skip S3 download/hash verification when local keystores are intentionally managed
@@ -1933,27 +2122,31 @@ async function ensureKeystoreFiles(contractsDir: string): Promise<{ generated: b
                 `Generate them first or run without PSY_SKIP_KEYSTORE=1 to download the published setup.`,
             );
         }
-        const bridgeRelayerPath = path.join(keystoreDir, "bridge-relayer");
+        // KEYSTORE_PATH overrides only the relayer wallet; trust setup remains under ~/.psy/keystore.
         if (!(await exists(bridgeRelayerPath))) {
             await ensurePsyContractsDependencies(contractsDir);
             await autoGenerateBridgeRelayerKeystore(bridgeRelayerPath, contractsDir);
             generated = true;
+            bridgeRelayerKeystoreGeneratedThisRun = true;
         } else {
             console.log("[AutoSetup] bridge-relayer keystore present, keeping");
+            await assertExistingBridgeRelayerKeystorePassword(bridgeRelayerPath, contractsDir);
         }
         return { generated };
     }
 
     // 1. bridge-relayer keystore: auto-generate only when missing.
     //    It is a dev key and never needs refreshing on its own; no interactive prompt.
-    const bridgeRelayerPath = path.join(keystoreDir, "bridge-relayer");
+    // KEYSTORE_PATH overrides only the relayer wallet; trust setup remains under ~/.psy/keystore.
     if (!(await exists(bridgeRelayerPath))) {
         await ensurePsyContractsDependencies(contractsDir);
         await rm(bridgeRelayerPath).catch(() => undefined);
         await autoGenerateBridgeRelayerKeystore(bridgeRelayerPath, contractsDir);
         generated = true;
+        bridgeRelayerKeystoreGeneratedThisRun = true;
     } else {
         console.log("[AutoSetup] bridge-relayer keystore present, keeping");
+        await assertExistingBridgeRelayerKeystorePassword(bridgeRelayerPath, contractsDir);
     }
 
     // 2. Fetch the sha256sums.json manifest (tiny) that pins every trust-setup artifact.
@@ -2183,6 +2376,13 @@ async function ensureDevEnvironment(
     }
 
     await ensureRequiredSubmodules(cwd);
+    // psy-dapp ships nested psy-genesis/psy-contracts gitlinks that the UI
+    // apps alias into (config.json, protocol-config, deployments); initialize
+    // them before any UI dependency install or dev-server startup.
+    await ensurePsyDappNestedSubmodules(path.join(cwd, "psy-dapp"));
+    // Proven order from parth-generic-v1: clone/find siblings (and init
+    // psy-sdk's psy-genesis) before ensurePsySdkArtifacts reads config.json.
+    await ensureAllReposCloned();
     const contractsDir = path.join(cwd, "psy-contracts");
     const sdk = await ensurePsySdkArtifacts(cwd);
     await ensureAllUiDeps(cwd, { force: sdk.rebuilt });
@@ -2193,6 +2393,7 @@ async function ensureDevEnvironment(
     // For an existing keystore, leave it unset so the prompt/decryption flow still works.
     if (generated && !process.env.WALLET_PASSWORD) {
         process.env.WALLET_PASSWORD = "devnet";
+        bridgeRelayerKeystoreGeneratedThisRun = true;
         console.warn("[AutoSetup] WALLET_PASSWORD not set, using default 'devnet' for auto-generated keystore.");
     }
     console.log("[AutoSetup] Dev environment ready.");

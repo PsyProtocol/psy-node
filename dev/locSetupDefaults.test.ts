@@ -6,6 +6,7 @@ import {
     FATAL_PROCESSOR_ERROR_MARKERS,
     FAUCET_ENV_KEYS,
     findCpuSetOverlap,
+    formatBridgeRelayerKeystoreDecryptError,
     formatCpuSet,
     hasFaucetOperatorConfig,
     COORDINATOR_PROCESSOR_READY_MARKER,
@@ -14,15 +15,24 @@ import {
     isFatalProcessorErrorLine,
     isCompilerFingerprintSource,
     isExactProcessorReadyLine,
+    isLikelyWrongKeystorePassword,
     isTransientScyllaSchemaFailure,
     parseCpuSet,
     parseEnvAssignments,
     parseLscpuTopology,
+    PSY_DAPP_NESTED_PAYLOADS,
+    PSY_DAPP_NESTED_SUBMODULES,
+    PSY_SDK_GENESIS_CONFIG_REL,
+    PSY_SDK_GENESIS_SUBMODULE,
+    formatPsyDappNestedSubmoduleRemedy,
+    psySdkGenesisSubmoduleNeedsInit,
+    planPsyDappNestedSubmoduleInit,
     resolveCpuPartition,
     resolveCpuPartitionForAffinity,
     resolvePositiveIntegerSetting,
     resolveRayonThreadCount,
     resolveScyllaMemory,
+    resolveWalletPasswordPolicy,
     selectNonEmptyEnv,
     resolveRealmWorkerCount,
     shouldFatalRestartProcessor,
@@ -294,5 +304,190 @@ describe("processor readiness helpers", () => {
         expect(isTransientScyllaSchemaFailure("Scylla schema operation timed out while applying migration")).toBe(true);
         expect(isTransientScyllaSchemaFailure("raft group-0 add_entry: operation timeout")).toBe(true);
         expect(isTransientScyllaSchemaFailure("group [ec259ee0] raft operation [add_entry] timed out")).toBe(true);
+    });
+});
+
+describe("psySdkGenesisSubmoduleNeedsInit", () => {
+    it("requires init when git metadata or config.json is missing", () => {
+        expect(psySdkGenesisSubmoduleNeedsInit({ gitMetadataPresent: false, configPresent: false })).toBe(true);
+        expect(psySdkGenesisSubmoduleNeedsInit({ gitMetadataPresent: true, configPresent: false })).toBe(true);
+        expect(psySdkGenesisSubmoduleNeedsInit({ gitMetadataPresent: false, configPresent: true })).toBe(true);
+    });
+
+    it("skips init when psy-genesis is fully present for prepare:wasm", () => {
+        expect(psySdkGenesisSubmoduleNeedsInit({ gitMetadataPresent: true, configPresent: true })).toBe(false);
+        expect(PSY_SDK_GENESIS_SUBMODULE).toBe("psy-genesis");
+        expect(PSY_SDK_GENESIS_CONFIG_REL).toBe("psy-genesis/config.json");
+    });
+});
+
+describe("planPsyDappNestedSubmoduleInit", () => {
+    it("plans init for every nested gitlink missing git metadata", () => {
+        const plan = planPsyDappNestedSubmoduleInit({
+            uninitialized: ["psy-genesis", "psy-contracts"],
+        });
+        expect(plan.ready).toBe(false);
+        expect(plan.pending).toEqual(["psy-genesis", "psy-contracts"]);
+        expect(plan.updateArgs).toEqual([
+            "submodule", "update", "--init", "--", "psy-genesis", "psy-contracts",
+        ]);
+    });
+
+    it("treats a checked-out gitlink with missing payloads as pending", () => {
+        const plan = planPsyDappNestedSubmoduleInit({
+            uninitialized: [],
+            missingPayloads: { "psy-contracts": ["protocol-config/index.ts", "deployments/index.ts"] },
+        });
+        expect(plan.ready).toBe(false);
+        expect(plan.pending).toEqual(["psy-contracts"]);
+        expect(plan.updateArgs).toEqual([
+            "submodule", "update", "--init", "--", "psy-contracts",
+        ]);
+        expect(plan.missingPayloads["psy-contracts"]).toEqual([
+            "protocol-config/index.ts", "deployments/index.ts",
+        ]);
+    });
+
+    it("is a no-op when every nested gitlink is fully present", () => {
+        const plan = planPsyDappNestedSubmoduleInit({ uninitialized: [], missingPayloads: {} });
+        expect(plan.ready).toBe(true);
+        expect(plan.pending).toEqual([]);
+        expect(plan.missingPayloads).toEqual({});
+    });
+
+    it("declares exactly the gitlinks and payloads the psy-dapp UI aliases into", () => {
+        expect(PSY_DAPP_NESTED_SUBMODULES).toEqual(["psy-genesis", "psy-contracts"]);
+        expect(PSY_DAPP_NESTED_PAYLOADS["psy-genesis"]).toEqual(["config.json"]);
+        expect(PSY_DAPP_NESTED_PAYLOADS["psy-contracts"]).toEqual([
+            "protocol-config/index.ts", "deployments/index.ts",
+        ]);
+    });
+});
+
+describe("formatPsyDappNestedSubmoduleRemedy", () => {
+    it("renders a repository-relative command for pending gitlinks", () => {
+        const plan = planPsyDappNestedSubmoduleInit({ uninitialized: ["psy-contracts"] });
+        const remedy = formatPsyDappNestedSubmoduleRemedy("psy-dapp", plan);
+        expect(remedy).toContain("cd psy-dapp && git submodule update --init -- psy-contracts");
+        expect(remedy).toContain("from the psy-node repository root");
+    });
+
+    it("lists payload files that remain missing after an init attempt", () => {
+        const plan = planPsyDappNestedSubmoduleInit({
+            uninitialized: [],
+            missingPayloads: { "psy-genesis": ["config.json"] },
+        });
+        const remedy = formatPsyDappNestedSubmoduleRemedy("psy-dapp", plan);
+        expect(remedy).toContain("cd psy-dapp && git submodule update --init -- psy-genesis");
+        expect(remedy).toContain("psy-dapp/psy-genesis/config.json");
+    });
+
+    it("renders nothing for a ready plan", () => {
+        const plan = planPsyDappNestedSubmoduleInit({ uninitialized: [], missingPayloads: {} });
+        expect(formatPsyDappNestedSubmoduleRemedy("psy-dapp", plan)).toBe("");
+    });
+});
+
+describe("resolveWalletPasswordPolicy", () => {
+    it("prefers explicit env password over every other source", () => {
+        expect(resolveWalletPasswordPolicy({
+            envPassword: "from-env",
+            cachedPassword: "cached",
+            isTty: false,
+            keystoreExists: true,
+            keystoreGeneratedThisRun: false,
+        })).toEqual({ source: "env", password: "from-env" });
+    });
+
+    it("preserves leading and trailing password whitespace", () => {
+        expect(resolveWalletPasswordPolicy({
+            envPassword: "  exact secret  ",
+            cachedPassword: null,
+            isTty: false,
+            keystoreExists: true,
+            keystoreGeneratedThisRun: false,
+        })).toEqual({ source: "env", password: "  exact secret  " });
+    });
+
+    it("uses the cached password when env is empty", () => {
+        expect(resolveWalletPasswordPolicy({
+            envPassword: undefined,
+            cachedPassword: "cached",
+            isTty: true,
+            keystoreExists: true,
+            keystoreGeneratedThisRun: false,
+        })).toEqual({ source: "cached", password: "cached" });
+    });
+
+    it("defaults to devnet only for generated/missing keystores in non-TTY sessions", () => {
+        expect(resolveWalletPasswordPolicy({
+            envPassword: "",
+            cachedPassword: null,
+            isTty: false,
+            keystoreExists: false,
+            keystoreGeneratedThisRun: false,
+        })).toEqual({ source: "default-devnet", password: "devnet" });
+
+        expect(resolveWalletPasswordPolicy({
+            envPassword: undefined,
+            cachedPassword: null,
+            isTty: false,
+            keystoreExists: true,
+            keystoreGeneratedThisRun: true,
+        })).toEqual({ source: "default-devnet", password: "devnet" });
+    });
+
+    it("never silently defaults an existing preserved keystore to devnet", () => {
+        const nonTty = resolveWalletPasswordPolicy({
+            envPassword: undefined,
+            cachedPassword: null,
+            isTty: false,
+            keystoreExists: true,
+            keystoreGeneratedThisRun: false,
+        });
+        expect(nonTty.source).toBe("prompt-required");
+        expect(nonTty.password).toBeUndefined();
+        expect(nonTty.error).toContain("WALLET_PASSWORD is required");
+        expect(nonTty.error).toContain("existing bridge-relayer keystore");
+
+        const tty = resolveWalletPasswordPolicy({
+            envPassword: "   ",
+            cachedPassword: null,
+            isTty: true,
+            keystoreExists: true,
+            keystoreGeneratedThisRun: false,
+        });
+        expect(tty).toEqual({ source: "prompt-required" });
+    });
+
+    it("still prompts on TTY when generating a new keystore without env/cache", () => {
+        expect(resolveWalletPasswordPolicy({
+            envPassword: undefined,
+            cachedPassword: null,
+            isTty: true,
+            keystoreExists: false,
+            keystoreGeneratedThisRun: false,
+        })).toEqual({ source: "prompt-required" });
+    });
+});
+
+describe("bridge-relayer keystore decrypt errors", () => {
+    it("classifies common wrong-password diagnostics", () => {
+        expect(isLikelyWrongKeystorePassword("Error: invalid password")).toBe(true);
+        expect(isLikelyWrongKeystorePassword("bad MAC")).toBe(true);
+        expect(isLikelyWrongKeystorePassword("could not decrypt data")).toBe(true);
+        expect(isLikelyWrongKeystorePassword("ethers is not installed")).toBe(false);
+    });
+
+    it("formats an actionable recovery path without echoing credentials", () => {
+        const message = formatBridgeRelayerKeystoreDecryptError({
+            keystorePath: "<workspace>/.psy/keystore/bridge-relayer",
+            detail: "invalid password",
+        });
+        expect(message).toContain("<workspace>/.psy/keystore/bridge-relayer");
+        expect(message).toContain("WALLET_PASSWORD does not match the existing keystore");
+        expect(message).toContain("rm -f <workspace>/.psy/keystore/bridge-relayer");
+        expect(message).toContain("Detail: invalid password");
+        expect(message).not.toMatch(/password\s*=/i);
     });
 });
