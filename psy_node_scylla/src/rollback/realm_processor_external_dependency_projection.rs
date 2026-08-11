@@ -59,7 +59,15 @@ impl RealmProcessorExternalDependencyProjectorFingerprint {
 /// receipt at a mutation boundary.
 pub(super) struct PersistedRealmProcessorExternalDependencyProjection {
     projector_fingerprint: RealmProcessorExternalDependencyProjectorFingerprint,
+    selection: RealmProcessorExternalDependencySelection,
     projection: RealmProcessorExternalDependencyProjection,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RealmProcessorExternalDependencySelection {
+    CurrentGathering,
+    CurrentProcessing,
+    Committed,
 }
 
 impl PersistedRealmProcessorExternalDependencyProjection {
@@ -169,6 +177,7 @@ where
         }
         Ok(PersistedRealmProcessorExternalDependencyProjection {
             projector_fingerprint: self.fingerprint,
+            selection: RealmProcessorExternalDependencySelection::CurrentGathering,
             projection: second,
         })
     }
@@ -213,6 +222,7 @@ where
         }
         Ok(PersistedRealmProcessorExternalDependencyProjection {
             projector_fingerprint: self.fingerprint,
+            selection: RealmProcessorExternalDependencySelection::CurrentProcessing,
             projection: second,
         })
     }
@@ -225,13 +235,26 @@ where
             return Err(RealmProcessorExternalDependencyProjectionError::IdentityMismatch);
         }
         let commitment = receipt.commitment();
-        let fresh = self
-            .read_exact(
-                commitment.context(),
-                commitment.admission_close_intent(),
-                *commitment.assignment_digest(),
-            )
-            .await?;
+        let fresh = match receipt.selection {
+            RealmProcessorExternalDependencySelection::CurrentGathering => {
+                self.read_exact(
+                    commitment.context(),
+                    commitment.admission_close_intent(),
+                    *commitment.assignment_digest(),
+                )
+                .await?
+            }
+            RealmProcessorExternalDependencySelection::CurrentProcessing => {
+                self.read_current_selected_exact(
+                    commitment.context(),
+                    *commitment.assignment_digest(),
+                )
+                .await?
+            }
+            RealmProcessorExternalDependencySelection::Committed => {
+                self.read_committed_exact(commitment).await?
+            }
+        };
         if fresh.projection != receipt.projection {
             return Err(RealmProcessorExternalDependencyProjectionError::ConcurrentMutation);
         }
@@ -290,6 +313,7 @@ where
         }
         Ok(PersistedRealmProcessorExternalDependencyProjection {
             projector_fingerprint: self.fingerprint,
+            selection: RealmProcessorExternalDependencySelection::Committed,
             projection: second,
         })
     }
