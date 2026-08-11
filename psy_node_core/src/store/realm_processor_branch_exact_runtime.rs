@@ -24,6 +24,7 @@ use crate::queue::{
         SealedRealmProcessorDurableCaptureRequest,
         SealedRealmProcessorGenerationContinuationRequest,
     },
+    realm_processor_deferred_actor_input::RealmProcessorDeferredActorInputOutcome,
     realm_processor_generation_continuation::RealmProcessorGenerationContinuation,
     realm_processor_continuation_restart::{
         RealmProcessorContinuationRestartFactory,
@@ -250,6 +251,29 @@ impl<Hash> RealmBranchExactCommitIteration<'_, Hash> {
         let factory = Arc::clone(self.owner.installed.capture_factory());
         factory
             .observe_generation_continuation(
+                SealedRealmProcessorGenerationContinuationRequest::seal(
+                    self.owner.startup_permit_digest(),
+                    runtime.network(),
+                    runtime.realm_id(),
+                    runtime.realm_sub_id(),
+                    runtime.writer_activation_digest(),
+                    runtime.queue_readiness_digest(),
+                ),
+            )
+            .await
+    }
+
+    /// Freshly reconstruct the storage-selected successor carryover. This
+    /// returns a non-Clone typed actor input but does not yet open capture or
+    /// authorize actor mutation; c4b4b moves it into the sealed capture-open
+    /// boundary for the third freshness check.
+    pub async fn prepare_deferred_actor_input(
+        &mut self,
+    ) -> Result<RealmProcessorDeferredActorInputOutcome, RealmProcessorDurableCaptureError> {
+        let runtime = self.owner.runtime();
+        let factory = Arc::clone(self.owner.installed.capture_factory());
+        factory
+            .prepare_deferred_actor_input(
                 SealedRealmProcessorGenerationContinuationRequest::seal(
                     self.owner.startup_permit_digest(),
                     runtime.network(),
@@ -711,6 +735,15 @@ mod tests {
             .map_err(|_| RealmProcessorDurableCaptureError::IdentityMismatch)
         }
 
+        async fn prepare_deferred_actor_input(
+            &self,
+            request: SealedRealmProcessorGenerationContinuationRequest,
+        ) -> Result<RealmProcessorDeferredActorInputOutcome, RealmProcessorDurableCaptureError> {
+            Ok(RealmProcessorDeferredActorInputOutcome::AwaitExplicitCarryover {
+                continuation: self.observe_generation_continuation(request).await?,
+            })
+        }
+
         async fn open(
             &self,
             request: SealedRealmProcessorDurableCaptureRequest,
@@ -1038,6 +1071,11 @@ mod tests {
             assert_eq!(attempt.realm_sub_id(), 3);
             let continuation = attempt.observe_generation_continuation().await.unwrap();
             assert_eq!(continuation.processing().pending_id().get(), 17);
+            let input = attempt.prepare_deferred_actor_input().await.unwrap();
+            assert!(matches!(
+                input,
+                RealmProcessorDeferredActorInputOutcome::AwaitExplicitCarryover { .. }
+            ));
             let mut capture = attempt
                 .open_durable_capture_for_processing(
                     PendingGenerationContext::try_from_legacy(17, 19).unwrap(),

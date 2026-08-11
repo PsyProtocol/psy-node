@@ -220,6 +220,10 @@ impl<Hash> StoredPendingPipeline<Hash> {
         self.derived_start_pending_id
     }
 
+    pub const fn bootstrap_reason(&self) -> PendingGenerationBootstrapReason {
+        self.bootstrap_reason
+    }
+
     pub const fn processing(&self) -> PendingGenerationContext {
         self.processing
     }

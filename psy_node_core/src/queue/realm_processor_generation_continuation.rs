@@ -82,10 +82,16 @@ impl RealmProcessorDeferredCarryoverDigest {
     pub fn from_semantic(
         semantic: &RealmProcessorSemanticOutput,
     ) -> Result<Self, RealmProcessorGenerationContinuationError> {
+        Self::from_jobs(semantic.deferred_jobs())
+    }
+
+    pub fn from_jobs(
+        jobs: &[super::realm_processor_semantic_output::RealmProcessorDeferredJob],
+    ) -> Result<Self, RealmProcessorGenerationContinuationError> {
         let mut hasher = Sha256::new();
         hasher.update(DEFERRED_DIGEST_DOMAIN);
-        hasher.update((semantic.deferred_jobs().len() as u64).to_be_bytes());
-        for job in semantic.deferred_jobs() {
+        hasher.update((jobs.len() as u64).to_be_bytes());
+        for job in jobs {
             hasher.update(job.ordinal().to_be_bytes());
             encode_component(job.queue_item(), &mut hasher)?;
             encode_component(job.contract_updates(), &mut hasher)?;

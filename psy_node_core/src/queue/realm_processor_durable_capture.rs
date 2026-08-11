@@ -19,6 +19,7 @@ use super::recoverable_ephemeral::{
     PendingQueueCaptureCandidate, PendingQueueCaptureContext,
     PendingQueueGenerationBoundary,
 };
+use super::realm_processor_deferred_actor_input::RealmProcessorDeferredActorInputOutcome;
 use super::realm_processor_generation_continuation::RealmProcessorGenerationContinuation;
 use super::realm_processor_semantic_output::RealmProcessorSemanticOutput;
 
@@ -283,6 +284,14 @@ pub trait RealmProcessorDurableCaptureFactory: Send + Sync {
         &self,
         request: SealedRealmProcessorGenerationContinuationRequest,
     ) -> Result<RealmProcessorGenerationContinuation, RealmProcessorDurableCaptureError>;
+
+    /// Reconstruct the exact successor-keyed deferred input selected by the
+    /// current durable pipeline. Missing carryover returns an explicit await
+    /// outcome; implementations must never synthesize an empty input.
+    async fn prepare_deferred_actor_input(
+        &self,
+        request: SealedRealmProcessorGenerationContinuationRequest,
+    ) -> Result<RealmProcessorDeferredActorInputOutcome, RealmProcessorDurableCaptureError>;
 
     async fn open(
         &self,
