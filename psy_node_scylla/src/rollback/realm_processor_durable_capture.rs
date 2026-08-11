@@ -30,8 +30,12 @@ use psy_node_core::{
             RealmProcessorContinuationRestartPort,
             RealmProcessorInboundCarryoverObservation,
             RealmProcessorReadOnlyRestartPreparation,
+            RealmProcessorTerminalCarryoverRecoveryFactory,
+            RealmProcessorTerminalCarryoverRecoveryOutcome,
+            RealmProcessorTerminalCarryoverRecoveryPort,
             RealmProcessorTerminalCarryoverObservation,
             SealedRealmProcessorContinuationRestartRequest,
+            SealedRealmProcessorTerminalCarryoverRecoveryRequest,
         },
         realm_processor_application_archive::RealmProcessorApplicationArchivePlan,
         realm_processor_generation_continuation::{
@@ -57,7 +61,10 @@ use psy_node_core::{
     store::pending_generation_pipeline::{
         PendingPipelineReadState, PendingProcessingState, StoredPendingPipeline,
     },
-    store::pending_generation_identity::PendingGenerationLedgerKey,
+    store::pending_generation_identity::{
+        PendingGenerationActivationDigest, PendingGenerationContext,
+        PendingGenerationLedgerKey,
+    },
 };
 use psy_node_nats::{
     queue::NatsJetStreamClient,
@@ -399,6 +406,28 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
         Ok(())
     }
 
+    fn validate_terminal_carryover_recovery_identity(
+        &self,
+        request: &SealedRealmProcessorTerminalCarryoverRecoveryRequest,
+    ) -> Result<(), RealmProcessorDurableCaptureError> {
+        let AuthorityScope::Realm {
+            realm_id,
+            realm_sub_id,
+        } = self.authority
+        else {
+            return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+        };
+        if request.network() != self.network
+            || request.realm_id() != realm_id
+            || request.realm_sub_id() != realm_sub_id
+            || request.writer_activation_digest() != &self.writer_activation_digest
+            || request.queue_readiness_digest() != &self.queue_readiness_digest
+        {
+            return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+        }
+        Ok(())
+    }
+
     async fn observe_restart_snapshot(
         &self,
     ) -> Result<ScyllaRealmProcessorRestartSnapshot, RealmProcessorDurableCaptureError> {
@@ -500,7 +529,9 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
             }
         };
 
-        let terminal = if inbound == RealmProcessorInboundCarryoverObservation::Missing {
+        let (terminal, stable_source_digest) = if inbound
+            == RealmProcessorInboundCarryoverObservation::Missing
+        {
             if self
                 .generation_terminal
                 .observe_for_restart::<Hash>(
@@ -524,10 +555,15 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
             {
                 return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
             }
-            RealmProcessorTerminalCarryoverObservation::NotEvaluated
+            (
+                RealmProcessorTerminalCarryoverObservation::NotEvaluated,
+                cloned_digest(&hasher),
+            )
         } else {
-            self.observe_outbound_terminal(&pipeline, continuation, &mut hasher)
-                .await?
+            let outbound = self
+                .observe_outbound_terminal(&pipeline, continuation, &mut hasher)
+                .await?;
+            (outbound.status, outbound.stable_source_digest)
         };
         let preparation = RealmProcessorReadOnlyRestartPreparation::try_from_storage(
             continuation,
@@ -546,7 +582,11 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
         }
         Ok(ScyllaRealmProcessorRestartSnapshot {
             preparation,
+            stable_source_digest,
             digest: hasher.finalize().into(),
+            key,
+            activation: pipeline.activation_digest(),
+            processing: pipeline.processing(),
         })
     }
 
@@ -618,7 +658,7 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
         pipeline: &StoredPendingPipeline<Hash>,
         continuation: RealmProcessorGenerationContinuation,
         hasher: &mut Sha256,
-    ) -> Result<RealmProcessorTerminalCarryoverObservation, RealmProcessorDurableCaptureError> {
+    ) -> Result<ScyllaRealmProcessorOutboundObservation, RealmProcessorDurableCaptureError> {
         let terminal_phase = matches!(
             continuation.phase(),
             RealmProcessorGenerationContinuationPhase::AwaitPublishedTerminal
@@ -637,7 +677,10 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
             if current.is_some() {
                 return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
             }
-            return Ok(RealmProcessorTerminalCarryoverObservation::NotTerminalPhase);
+            return Ok(ScyllaRealmProcessorOutboundObservation {
+                status: RealmProcessorTerminalCarryoverObservation::NotTerminalPhase,
+                stable_source_digest: cloned_digest(hasher),
+            });
         }
         let Some(current) = current else {
             if self
@@ -653,9 +696,11 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
             {
                 return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
             }
-            return Ok(
-                RealmProcessorTerminalCarryoverObservation::AwaitVerifiedTerminalAuthorization,
-            );
+            return Ok(ScyllaRealmProcessorOutboundObservation {
+                status:
+                    RealmProcessorTerminalCarryoverObservation::AwaitVerifiedTerminalAuthorization,
+                stable_source_digest: cloned_digest(hasher),
+            });
         };
         let application = continuation
             .application()
@@ -686,6 +731,7 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
             return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
         }
         hasher.update(current.to_canonical_bytes());
+        let stable_source_digest = cloned_digest(hasher);
         let carryover = self
             .deferred_carryover
             .observe_for_restart(
@@ -696,9 +742,10 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
             .await
             .map_err(backend)?;
         let Some(carryover) = carryover else {
-            return Ok(
-                RealmProcessorTerminalCarryoverObservation::UnqualifiedTerminalObservedAwaitCarryover,
-            );
+            return Ok(ScyllaRealmProcessorOutboundObservation {
+                status: RealmProcessorTerminalCarryoverObservation::UnqualifiedTerminalObservedAwaitCarryover,
+                stable_source_digest,
+            });
         };
         let RealmProcessorDeferredCarryoverSource::Predecessor {
             predecessor,
@@ -729,7 +776,10 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
             return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
         }
         hasher.update(carryover.to_canonical_bytes());
-        Ok(RealmProcessorTerminalCarryoverObservation::TerminalAndCarryoverObserved)
+        Ok(ScyllaRealmProcessorOutboundObservation {
+            status: RealmProcessorTerminalCarryoverObservation::TerminalAndCarryoverObserved,
+            stable_source_digest,
+        })
     }
 
     async fn validate_current_application_source(
@@ -1099,19 +1149,80 @@ where
     }
 }
 
+#[async_trait]
+impl<Hash> RealmProcessorTerminalCarryoverRecoveryFactory<Hash>
+    for ScyllaRealmProcessorDurableCaptureFactory<Hash>
+where
+    Hash: Q256BitHash + Send + Sync + 'static,
+{
+    fn network(&self) -> NetworkId {
+        self.network
+    }
+
+    fn realm_id(&self) -> u32 {
+        match self.authority {
+            AuthorityScope::Realm { realm_id, .. } => realm_id,
+            AuthorityScope::Coordinator => unreachable!("Realm-only factory"),
+        }
+    }
+
+    fn realm_sub_id(&self) -> u16 {
+        match self.authority {
+            AuthorityScope::Realm { realm_sub_id, .. } => realm_sub_id,
+            AuthorityScope::Coordinator => unreachable!("Realm-only factory"),
+        }
+    }
+
+    fn writer_activation_digest(&self) -> [u8; 32] {
+        self.writer_activation_digest
+    }
+
+    fn queue_readiness_digest(&self) -> [u8; 32] {
+        self.queue_readiness_digest
+    }
+
+    async fn open(
+        self: Arc<Self>,
+        request: SealedRealmProcessorTerminalCarryoverRecoveryRequest,
+    ) -> Result<Box<dyn RealmProcessorTerminalCarryoverRecoveryPort>, RealmProcessorDurableCaptureError>
+    {
+        self.validate_terminal_carryover_recovery_identity(&request)?;
+        Ok(Box::new(
+            ScyllaRealmProcessorTerminalCarryoverRecovery {
+                factory: self,
+                request,
+            },
+        ))
+    }
+}
+
 struct ScyllaRealmProcessorExactContinuation<Hash> {
     continuation: RealmProcessorGenerationContinuation,
     pipeline: StoredPendingPipeline<Hash>,
 }
 
+struct ScyllaRealmProcessorOutboundObservation {
+    status: RealmProcessorTerminalCarryoverObservation,
+    stable_source_digest: [u8; 32],
+}
+
 struct ScyllaRealmProcessorRestartSnapshot {
     preparation: RealmProcessorReadOnlyRestartPreparation,
+    stable_source_digest: [u8; 32],
     digest: [u8; 32],
+    key: PendingGenerationLedgerKey,
+    activation: PendingGenerationActivationDigest,
+    processing: PendingGenerationContext,
 }
 
 struct ScyllaRealmProcessorContinuationRestart<Hash> {
     factory: Arc<ScyllaRealmProcessorDurableCaptureFactory<Hash>>,
     request: SealedRealmProcessorContinuationRestartRequest,
+}
+
+struct ScyllaRealmProcessorTerminalCarryoverRecovery<Hash> {
+    factory: Arc<ScyllaRealmProcessorDurableCaptureFactory<Hash>>,
+    request: SealedRealmProcessorTerminalCarryoverRecoveryRequest,
 }
 
 #[async_trait]
@@ -1134,9 +1245,89 @@ where
     }
 }
 
+#[async_trait]
+impl<Hash> RealmProcessorTerminalCarryoverRecoveryPort
+    for ScyllaRealmProcessorTerminalCarryoverRecovery<Hash>
+where
+    Hash: Q256BitHash + Send + Sync + 'static,
+{
+    async fn recover_and_prepare(
+        self: Box<Self>,
+    ) -> Result<RealmProcessorTerminalCarryoverRecoveryOutcome, RealmProcessorDurableCaptureError>
+    {
+        self.factory
+            .validate_terminal_carryover_recovery_identity(&self.request)?;
+        let first = self.factory.observe_restart_snapshot().await?;
+        let repairs_carryover = matches!(
+            first.preparation.terminal(),
+            RealmProcessorTerminalCarryoverObservation::UnqualifiedTerminalObservedAwaitCarryover
+        );
+        if repairs_carryover {
+            self.factory
+                .deferred_carryover
+                .persist_from_selected_terminal::<Hash>(
+                    self.factory.generation_terminal.as_ref(),
+                    first.key,
+                    first.activation,
+                    first.processing,
+                )
+                .await
+                .map_err(backend)?;
+        }
+
+        let second = self.factory.observe_restart_snapshot().await?;
+        let third = self.factory.observe_restart_snapshot().await?;
+        finish_terminal_carryover_recovery(&first, &second, &third, repairs_carryover)
+    }
+}
+
+fn finish_terminal_carryover_recovery(
+    first: &ScyllaRealmProcessorRestartSnapshot,
+    second: &ScyllaRealmProcessorRestartSnapshot,
+    third: &ScyllaRealmProcessorRestartSnapshot,
+    repairs_carryover: bool,
+) -> Result<RealmProcessorTerminalCarryoverRecoveryOutcome, RealmProcessorDurableCaptureError> {
+    if first.key != second.key
+        || second.key != third.key
+        || first.activation != second.activation
+        || second.activation != third.activation
+        || first.processing != second.processing
+        || second.processing != third.processing
+    {
+        return Err(RealmProcessorDurableCaptureError::ConcurrentMutation);
+    }
+    if repairs_carryover {
+        if first.stable_source_digest != second.stable_source_digest
+            || second.stable_source_digest != third.stable_source_digest
+            || second.preparation != third.preparation
+            || second.digest != third.digest
+            || !matches!(
+                second.preparation.terminal(),
+                RealmProcessorTerminalCarryoverObservation::TerminalAndCarryoverObserved
+            )
+        {
+            return Err(RealmProcessorDurableCaptureError::ConcurrentMutation);
+        }
+    } else if first.preparation != second.preparation
+        || second.preparation != third.preparation
+        || first.digest != second.digest
+        || second.digest != third.digest
+        || first.stable_source_digest != second.stable_source_digest
+        || second.stable_source_digest != third.stable_source_digest
+    {
+        return Err(RealmProcessorDurableCaptureError::ConcurrentMutation);
+    }
+    RealmProcessorTerminalCarryoverRecoveryOutcome::try_from_storage(second.preparation)
+        .map_err(backend)
+}
+
 fn hash_pipeline<Hash: Q256BitHash>(hasher: &mut Sha256, pipeline: &StoredPendingPipeline<Hash>) {
     hasher.update(pipeline.revision().get().to_be_bytes());
     hasher.update(pipeline.canonical_payload());
+}
+
+fn cloned_digest(hasher: &Sha256) -> [u8; 32] {
+    hasher.clone().finalize().into()
 }
 
 fn same_pipeline_snapshot<Hash: Q256BitHash>(
@@ -1561,7 +1752,9 @@ mod tests {
                 PendingGenerationActivationDigest, PendingGenerationContext,
                 PendingGenerationLedgerKey,
             },
-            pending_generation_pipeline::PendingQueueCloseIntentDigest,
+            pending_generation_pipeline::{
+                PendingPipelineRevision, PendingQueueCloseIntentDigest,
+            },
         },
     };
     use psy_node_nats::{
@@ -1653,6 +1846,54 @@ mod tests {
         )
         .unwrap();
         (context, assignment, route)
+    }
+
+    fn restart_preparation(
+        terminal: RealmProcessorTerminalCarryoverObservation,
+    ) -> RealmProcessorReadOnlyRestartPreparation {
+        let application = RealmProcessorApplicationContinuation::try_from_committed_parts(
+            psy_node_core::queue::realm_processor_application_archive::RealmProcessorApplicationArchiveSlot::try_new([11; 32]).unwrap(),
+            psy_node_core::queue::realm_processor_application_archive::RealmProcessorApplicationArchiveDigest::try_new([12; 32]).unwrap(),
+            psy_node_core::queue::realm_processor_semantic_output::RealmProcessorSemanticOutputDigest::try_new([13; 32]).unwrap(),
+            true,
+            1,
+            psy_node_core::queue::realm_processor_generation_continuation::RealmProcessorDeferredCarryoverDigest::try_new([14; 32]).unwrap(),
+        )
+        .unwrap();
+        let continuation = RealmProcessorGenerationContinuation::try_from_storage(
+            PendingGenerationContext::try_from_legacy(17, 19).unwrap(),
+            PendingPipelineRevision::try_new(7).unwrap(),
+            RealmProcessorGenerationContinuationPhase::AwaitPublishedTerminal,
+            Some(application),
+        )
+        .unwrap();
+        RealmProcessorReadOnlyRestartPreparation::try_from_storage(
+            continuation,
+            RealmProcessorInboundCarryoverObservation::Predecessor,
+            terminal,
+        )
+        .unwrap()
+    }
+
+    fn restart_snapshot(
+        preparation: RealmProcessorReadOnlyRestartPreparation,
+        stable_source: u8,
+        full: u8,
+    ) -> ScyllaRealmProcessorRestartSnapshot {
+        ScyllaRealmProcessorRestartSnapshot {
+            preparation,
+            stable_source_digest: [stable_source; 32],
+            digest: [full; 32],
+            key: PendingGenerationLedgerKey::new(
+                NetworkId::try_from_chain_id(1337).unwrap(),
+                AuthorityScope::Realm {
+                    realm_id: 3,
+                    realm_sub_id: 0,
+                },
+            ),
+            activation: PendingGenerationActivationDigest::try_new([3; 32]).unwrap(),
+            processing: preparation.continuation().processing(),
+        }
     }
 
     fn fixture() -> (
@@ -1963,8 +2204,80 @@ mod tests {
             .unwrap();
         assert!(terminal_store.contains("pub(super) async fn observe_for_restart"));
         assert!(carryover_store.contains("pub(super) async fn observe_for_restart"));
-        assert!(!terminal_store.contains("pub(super) async fn persist"));
-        assert!(!carryover_store.contains("pub(super) async fn persist"));
+        assert!(!terminal_store.contains("pub(super) async fn persist(\n"));
+        assert!(!carryover_store.contains("pub(super) async fn persist(\n"));
+        assert!(carryover_store.contains(
+            "pub(super) async fn persist_from_selected_terminal"
+        ));
+    }
+
+    #[test]
+    fn terminal_carryover_recovery_requires_stable_source_and_exact_post_write_snapshots() {
+        let terminal_only = restart_snapshot(
+            restart_preparation(
+                RealmProcessorTerminalCarryoverObservation::UnqualifiedTerminalObservedAwaitCarryover,
+            ),
+            1,
+            2,
+        );
+        let complete = restart_snapshot(
+            restart_preparation(
+                RealmProcessorTerminalCarryoverObservation::TerminalAndCarryoverObserved,
+            ),
+            1,
+            3,
+        );
+        assert!(matches!(
+            finish_terminal_carryover_recovery(&terminal_only, &complete, &complete, true),
+            Ok(RealmProcessorTerminalCarryoverRecoveryOutcome::Prepared(_))
+        ));
+
+        let source_drift = restart_snapshot(complete.preparation, 9, 3);
+        assert_eq!(
+            finish_terminal_carryover_recovery(
+                &terminal_only,
+                &source_drift,
+                &source_drift,
+                true,
+            ),
+            Err(RealmProcessorDurableCaptureError::ConcurrentMutation)
+        );
+        let full_drift = restart_snapshot(complete.preparation, 1, 4);
+        assert_eq!(
+            finish_terminal_carryover_recovery(
+                &terminal_only,
+                &complete,
+                &full_drift,
+                true,
+            ),
+            Err(RealmProcessorDurableCaptureError::ConcurrentMutation)
+        );
+
+        let await_authorization = restart_snapshot(
+            restart_preparation(
+                RealmProcessorTerminalCarryoverObservation::AwaitVerifiedTerminalAuthorization,
+            ),
+            5,
+            6,
+        );
+        assert!(matches!(
+            finish_terminal_carryover_recovery(
+                &await_authorization,
+                &await_authorization,
+                &await_authorization,
+                false,
+            ),
+            Ok(RealmProcessorTerminalCarryoverRecoveryOutcome::AwaitVerifiedTerminalAuthorization(_))
+        ));
+        assert_eq!(
+            finish_terminal_carryover_recovery(
+                &await_authorization,
+                &complete,
+                &complete,
+                false,
+            ),
+            Err(RealmProcessorDurableCaptureError::ConcurrentMutation)
+        );
     }
 
     #[test]
@@ -1991,6 +2304,35 @@ mod tests {
     }
 
     #[test]
+    fn terminal_carryover_recovery_cannot_create_terminal_reserve_or_rotate() {
+        let source = include_str!("realm_processor_durable_capture.rs");
+        let recovery = source
+            .split("impl<Hash> RealmProcessorTerminalCarryoverRecoveryPort")
+            .nth(1)
+            .unwrap()
+            .split("fn hash_pipeline")
+            .next()
+            .unwrap();
+        assert!(recovery.contains("persist_from_selected_terminal"));
+        assert!(recovery.contains("stable_source_digest"));
+        assert!(recovery.contains("TerminalAndCarryoverObserved"));
+        for forbidden in [
+            "generation_terminal.persist",
+            "RealmProcessorGenerationTerminal::try_new",
+            "PendingCounterAdapter",
+            "ReservedPendingGeneration",
+            "seal_rotation(",
+            "pipeline.apply",
+            "authority_head",
+        ] {
+            assert!(
+                !recovery.contains(forbidden),
+                "derived recovery must not gain terminal/rotation authority: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
     fn restart_owner_is_not_called_by_production_processor_or_serving_composition() {
         let process = include_str!(
             "../../../psy_node_common/src/realm/processor/core/process_block.rs"
@@ -1999,6 +2341,7 @@ mod tests {
             "../../../psy_node_common/src/realm/processor/create.rs"
         );
         assert!(!process.contains("open_continuation_restart"));
+        assert!(!process.contains("open_terminal_carryover_recovery"));
         assert!(process.contains("REALM_BRANCH_EXACT_FULL_COMMIT_COVERAGE_NOT_INTEGRATED"));
         assert!(create.contains("ServingCompositionNotIntegrated"));
     }

@@ -8,6 +8,7 @@
 
 use std::{error::Error, fmt, sync::Arc};
 
+use parth_core::protocol::core_types::Q256BitHash;
 use psy_node_core::queue::realm_processor_generation_terminal::{
     RealmGenerationTerminalError, RealmProcessorDeferredCarryover,
     RealmProcessorDeferredCarryoverSlot,
@@ -24,7 +25,10 @@ use scylla::{
 };
 use sha2::{Digest, Sha256};
 
-use super::BranchExactDeploymentNoTabletKeyspace;
+use super::{
+    realm_processor_generation_terminal::ScyllaRealmProcessorGenerationTerminalStore,
+    BranchExactDeploymentNoTabletKeyspace,
+};
 
 pub(super) const REALM_PROCESSOR_DEFERRED_CARRYOVER_TABLE: &str =
     "branch_exact_realm_processor_deferred_carryover_v1";
@@ -125,6 +129,55 @@ impl ScyllaRealmProcessorDeferredCarryoverStore {
             key, activation, successor,
         )?)
         .await
+    }
+
+    /// The only non-test sibling-visible carryover write path. It derives the
+    /// successor row from an exact durable terminal selected by storage; the
+    /// caller cannot provide a terminal model, slot, digest or carryover.
+    /// Terminal persistence, successor reservation and pipeline rotation are
+    /// intentionally outside this capability.
+    pub(super) async fn persist_from_selected_terminal<Hash: Q256BitHash>(
+        &self,
+        terminal_store: &ScyllaRealmProcessorGenerationTerminalStore,
+        key: PendingGenerationLedgerKey,
+        activation: PendingGenerationActivationDigest,
+        predecessor: PendingGenerationContext,
+    ) -> Result<(), RealmProcessorDeferredCarryoverStoreError> {
+        let selected = terminal_store
+            .observe_for_restart::<Hash>(key, activation, predecessor)
+            .await
+            .map_err(|error| {
+                RealmProcessorDeferredCarryoverStoreError::TerminalStore(error.to_string())
+            })?
+            .ok_or(RealmProcessorDeferredCarryoverStoreError::MissingSelectedTerminal)?;
+        let carryover = RealmProcessorDeferredCarryover::try_from_terminal_commitment(
+            &selected,
+            terminal_store.restart_fingerprint(),
+        )?;
+        let receipt = self.persist(carryover).await?;
+
+        let after_persist = terminal_store
+            .observe_for_restart::<Hash>(key, activation, predecessor)
+            .await
+            .map_err(|error| {
+                RealmProcessorDeferredCarryoverStoreError::TerminalStore(error.to_string())
+            })?
+            .ok_or(RealmProcessorDeferredCarryoverStoreError::SelectedTerminalChanged)?;
+        if after_persist != selected {
+            return Err(RealmProcessorDeferredCarryoverStoreError::SelectedTerminalChanged);
+        }
+        self.revalidate(&receipt).await?;
+        let after_revalidate = terminal_store
+            .observe_for_restart::<Hash>(key, activation, predecessor)
+            .await
+            .map_err(|error| {
+                RealmProcessorDeferredCarryoverStoreError::TerminalStore(error.to_string())
+            })?
+            .ok_or(RealmProcessorDeferredCarryoverStoreError::SelectedTerminalChanged)?;
+        if after_revalidate != selected {
+            return Err(RealmProcessorDeferredCarryoverStoreError::SelectedTerminalChanged);
+        }
+        Ok(())
     }
 
     async fn read(
@@ -285,6 +338,9 @@ pub(super) enum RealmProcessorDeferredCarryoverStoreError {
     ReceiptBindingMismatch,
     ReceiptStale,
     Indeterminate(String),
+    TerminalStore(String),
+    MissingSelectedTerminal,
+    SelectedTerminalChanged,
 }
 
 impl From<RealmGenerationTerminalError> for RealmProcessorDeferredCarryoverStoreError {
@@ -362,7 +418,18 @@ mod tests {
         let source = include_str!("realm_processor_deferred_carryover.rs");
         let production = source.split("#[cfg(test)]").next().unwrap();
         assert!(production.contains("struct PersistedRealmProcessorDeferredCarryoverReceipt"));
-        assert!(!production.contains("pub(super) async fn persist"));
+        assert!(!production.contains("pub(super) async fn persist(\n"));
+        assert!(production.contains("pub(super) async fn persist_from_selected_terminal"));
+        let derived = production
+            .split("pub(super) async fn persist_from_selected_terminal")
+            .nth(1)
+            .unwrap()
+            .split("async fn read")
+            .next()
+            .unwrap();
+        assert!(!derived.contains("terminal: RealmProcessorGenerationTerminal"));
+        assert!(!derived.contains("carryover: RealmProcessorDeferredCarryover"));
+        assert!(!derived.contains("terminal_slot:"));
         assert!(!production.contains("seal_pipeline_rotation"));
         assert!(!production.contains("ScyllaPendingPipelineStore"));
         assert!(!production.contains("pipeline.apply"));

@@ -29,7 +29,11 @@ use crate::queue::{
         RealmProcessorContinuationRestartFactory,
         RealmProcessorContinuationRestartPort,
         RealmProcessorReadOnlyRestartPreparation,
+        RealmProcessorTerminalCarryoverRecoveryFactory,
+        RealmProcessorTerminalCarryoverRecoveryOutcome,
+        RealmProcessorTerminalCarryoverRecoveryPort,
         SealedRealmProcessorContinuationRestartRequest,
+        SealedRealmProcessorTerminalCarryoverRecoveryRequest,
     },
     realm_processor_semantic_output::RealmProcessorSemanticOutput,
     recoverable_ephemeral::PendingQueueCaptureContext,
@@ -73,6 +77,8 @@ pub struct InstalledRealmBranchExactCommitRuntime<Hash> {
     runtime: Arc<dyn RealmBranchExactCommitRuntime<Hash>>,
     capture_factory: Arc<dyn RealmProcessorDurableCaptureFactory>,
     restart_factory: Arc<dyn RealmProcessorContinuationRestartFactory<Hash>>,
+    terminal_carryover_recovery_factory:
+        Arc<dyn RealmProcessorTerminalCarryoverRecoveryFactory<Hash>>,
 }
 
 impl<Hash> InstalledRealmBranchExactCommitRuntime<Hash> {
@@ -83,6 +89,9 @@ impl<Hash> InstalledRealmBranchExactCommitRuntime<Hash> {
         runtime: Arc<dyn RealmBranchExactCommitRuntime<Hash>>,
         capture_factory: Arc<dyn RealmProcessorDurableCaptureFactory>,
         restart_factory: Arc<dyn RealmProcessorContinuationRestartFactory<Hash>>,
+        terminal_carryover_recovery_factory: Arc<
+            dyn RealmProcessorTerminalCarryoverRecoveryFactory<Hash>,
+        >,
     ) -> Result<Self, RealmProcessorStartupError> {
         let expectation = startup_permit.expectation();
         if runtime.network() != expectation.network()
@@ -106,6 +115,13 @@ impl<Hash> InstalledRealmBranchExactCommitRuntime<Hash> {
                 != runtime.writer_activation_digest()
             || restart_factory.queue_readiness_digest()
                 != runtime.queue_readiness_digest()
+            || terminal_carryover_recovery_factory.network() != runtime.network()
+            || terminal_carryover_recovery_factory.realm_id() != runtime.realm_id()
+            || terminal_carryover_recovery_factory.realm_sub_id() != runtime.realm_sub_id()
+            || terminal_carryover_recovery_factory.writer_activation_digest()
+                != runtime.writer_activation_digest()
+            || terminal_carryover_recovery_factory.queue_readiness_digest()
+                != runtime.queue_readiness_digest()
         {
             return Err(RealmProcessorStartupError::CommitRuntimeIdentityMismatch);
         }
@@ -114,6 +130,7 @@ impl<Hash> InstalledRealmBranchExactCommitRuntime<Hash> {
             runtime,
             capture_factory,
             restart_factory,
+            terminal_carryover_recovery_factory,
         })
     }
 
@@ -133,6 +150,12 @@ impl<Hash> InstalledRealmBranchExactCommitRuntime<Hash> {
         &self,
     ) -> &Arc<dyn RealmProcessorContinuationRestartFactory<Hash>> {
         &self.restart_factory
+    }
+
+    fn terminal_carryover_recovery_factory(
+        &self,
+    ) -> &Arc<dyn RealmProcessorTerminalCarryoverRecoveryFactory<Hash>> {
+        &self.terminal_carryover_recovery_factory
     }
 }
 
@@ -265,6 +288,37 @@ impl<Hash> RealmBranchExactCommitIteration<'_, Hash> {
         })
     }
 
+    /// Opens the separate terminal-to-carryover repair capability. Storage
+    /// selects the processing generation and may only derive a successor
+    /// carryover from an already durable terminal record. The capability
+    /// cannot create a terminal, reserve a generation or rotate the pipeline.
+    pub async fn open_terminal_carryover_recovery<'recovery>(
+        &'recovery mut self,
+    ) -> Result<RealmBranchExactTerminalCarryoverRecovery<'recovery>, RealmProcessorDurableCaptureError>
+    where
+        Hash: 'static,
+    {
+        let runtime = self.owner.runtime();
+        let factory = Arc::clone(
+            self.owner
+                .installed
+                .terminal_carryover_recovery_factory(),
+        );
+        let request = SealedRealmProcessorTerminalCarryoverRecoveryRequest::seal(
+            self.owner.startup_permit_digest(),
+            runtime.network(),
+            runtime.realm_id(),
+            runtime.realm_sub_id(),
+            runtime.writer_activation_digest(),
+            runtime.queue_readiness_digest(),
+        );
+        let port = factory.open(request).await?;
+        Ok(RealmBranchExactTerminalCarryoverRecovery {
+            port,
+            _iteration: PhantomData,
+        })
+    }
+
     /// Opens one backend-owned capture authority while borrowing this whole
     /// iteration mutably.  The returned port cannot outlive the iteration and
     /// no second queue mutation can be opened through the same owner until it
@@ -333,11 +387,27 @@ pub struct RealmBranchExactContinuationRestart<'iteration> {
     _iteration: PhantomData<&'iteration mut ()>,
 }
 
+/// Lifetime-bound, non-Clone derived-repair capability. The sole operation
+/// consumes the handle and returns only a non-authoritative observation.
+pub struct RealmBranchExactTerminalCarryoverRecovery<'iteration> {
+    port: Box<dyn RealmProcessorTerminalCarryoverRecoveryPort>,
+    _iteration: PhantomData<&'iteration mut ()>,
+}
+
 impl RealmBranchExactContinuationRestart<'_> {
     pub async fn observe_and_prepare(
         self,
     ) -> Result<RealmProcessorReadOnlyRestartPreparation, RealmProcessorDurableCaptureError> {
         self.port.observe_and_prepare().await
+    }
+}
+
+impl RealmBranchExactTerminalCarryoverRecovery<'_> {
+    pub async fn recover_and_prepare(
+        self,
+    ) -> Result<RealmProcessorTerminalCarryoverRecoveryOutcome, RealmProcessorDurableCaptureError>
+    {
+        self.port.recover_and_prepare().await
     }
 }
 
@@ -528,6 +598,10 @@ mod tests {
         preparation: RealmProcessorReadOnlyRestartPreparation,
     }
 
+    struct TerminalCarryoverRecoveryPort {
+        outcome: RealmProcessorTerminalCarryoverRecoveryOutcome,
+    }
+
     #[async_trait]
     impl RealmProcessorContinuationRestartPort for RestartPort {
         async fn observe_and_prepare(
@@ -535,6 +609,16 @@ mod tests {
         ) -> Result<RealmProcessorReadOnlyRestartPreparation, RealmProcessorDurableCaptureError>
         {
             Ok(self.preparation)
+        }
+    }
+
+    #[async_trait]
+    impl RealmProcessorTerminalCarryoverRecoveryPort for TerminalCarryoverRecoveryPort {
+        async fn recover_and_prepare(
+            self: Box<Self>,
+        ) -> Result<RealmProcessorTerminalCarryoverRecoveryOutcome, RealmProcessorDurableCaptureError>
+        {
+            Ok(self.outcome)
         }
     }
 
@@ -704,6 +788,63 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl RealmProcessorTerminalCarryoverRecoveryFactory<PHash> for CaptureFactory {
+        fn network(&self) -> NetworkId {
+            self.network
+        }
+
+        fn realm_id(&self) -> u32 {
+            self.realm_id
+        }
+
+        fn realm_sub_id(&self) -> u16 {
+            self.realm_sub_id
+        }
+
+        fn writer_activation_digest(&self) -> [u8; 32] {
+            self.activation
+        }
+
+        fn queue_readiness_digest(&self) -> [u8; 32] {
+            [6; 32]
+        }
+
+        async fn open(
+            self: Arc<Self>,
+            request: SealedRealmProcessorTerminalCarryoverRecoveryRequest,
+        ) -> Result<Box<dyn RealmProcessorTerminalCarryoverRecoveryPort>, RealmProcessorDurableCaptureError>
+        {
+            if request.network() != self.network
+                || request.realm_id() != self.realm_id
+                || request.realm_sub_id() != self.realm_sub_id
+                || request.writer_activation_digest() != &self.activation
+                || request.queue_readiness_digest() != &[6; 32]
+            {
+                return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+            }
+            let continuation = RealmProcessorGenerationContinuation::try_from_storage(
+                PendingGenerationContext::try_from_legacy(17, 19).unwrap(),
+                crate::store::pending_generation_pipeline::PendingPipelineRevision::try_new(3)
+                    .unwrap(),
+                crate::queue::realm_processor_generation_continuation::RealmProcessorGenerationContinuationPhase::AwaitQueueClose,
+                None,
+            )
+            .map_err(|_| RealmProcessorDurableCaptureError::IdentityMismatch)?;
+            let preparation = RealmProcessorReadOnlyRestartPreparation::try_from_storage(
+                continuation,
+                crate::queue::realm_processor_continuation_restart::RealmProcessorInboundCarryoverObservation::Missing,
+                crate::queue::realm_processor_continuation_restart::RealmProcessorTerminalCarryoverObservation::NotEvaluated,
+            )
+            .map_err(|_| RealmProcessorDurableCaptureError::IdentityMismatch)?;
+            let outcome = RealmProcessorTerminalCarryoverRecoveryOutcome::try_from_storage(
+                preparation,
+            )
+            .map_err(|_| RealmProcessorDurableCaptureError::IdentityMismatch)?;
+            Ok(Box::new(TerminalCarryoverRecoveryPort { outcome }))
+        }
+    }
+
     fn capture_factory(
         network: NetworkId,
         realm_id: u32,
@@ -732,6 +873,20 @@ mod tests {
         })
     }
 
+    fn terminal_carryover_recovery_factory(
+        network: NetworkId,
+        realm_id: u32,
+        realm_sub_id: u16,
+        activation: [u8; 32],
+    ) -> Arc<dyn RealmProcessorTerminalCarryoverRecoveryFactory<PHash>> {
+        Arc::new(CaptureFactory {
+            network,
+            realm_id,
+            realm_sub_id,
+            activation,
+        })
+    }
+
     #[tokio::test]
     async fn exact_runtime_consumes_permit_into_nonclone_capability() {
         let permit = permit().await;
@@ -742,6 +897,7 @@ mod tests {
             runtime(network(), 7, 3, [2; 32], drops.clone()),
             capture_factory(network(), 7, 3, [2; 32]),
             restart_factory(network(), 7, 3, [2; 32]),
+            terminal_carryover_recovery_factory(network(), 7, 3, [2; 32]),
         )
         .unwrap();
         assert_eq!(installed.startup_permit_digest(), expected_digest);
@@ -782,6 +938,7 @@ mod tests {
                 ),
                 capture_factory(network(), 7, 3, [2; 32]),
                 restart_factory(network(), 7, 3, [2; 32]),
+                terminal_carryover_recovery_factory(network(), 7, 3, [2; 32]),
             );
             let Err(error) = result else {
                 panic!("mismatched runtime must not install")
@@ -803,6 +960,7 @@ mod tests {
             ),
             capture_factory(network(), 7, 3, [9; 32]),
             restart_factory(network(), 7, 3, [2; 32]),
+            terminal_carryover_recovery_factory(network(), 7, 3, [2; 32]),
         );
         assert!(matches!(
             result,
@@ -820,6 +978,25 @@ mod tests {
             ),
             capture_factory(network(), 7, 3, [2; 32]),
             restart_factory(network(), 7, 4, [2; 32]),
+            terminal_carryover_recovery_factory(network(), 7, 3, [2; 32]),
+        );
+        assert!(matches!(
+            result,
+            Err(RealmProcessorStartupError::CommitRuntimeIdentityMismatch)
+        ));
+
+        let result = InstalledRealmBranchExactCommitRuntime::seal(
+            permit().await,
+            runtime(
+                network(),
+                7,
+                3,
+                [2; 32],
+                Arc::new(AtomicUsize::new(0)),
+            ),
+            capture_factory(network(), 7, 3, [2; 32]),
+            restart_factory(network(), 7, 3, [2; 32]),
+            terminal_carryover_recovery_factory(network(), 7, 4, [2; 32]),
         );
         assert!(matches!(
             result,
@@ -840,6 +1017,7 @@ mod tests {
             ),
             capture_factory(network(), 7, 3, [2; 32]),
             restart_factory(network(), 7, 3, [2; 32]),
+            terminal_carryover_recovery_factory(network(), 7, 3, [2; 32]),
         )
         .unwrap();
         let mut owner = RealmBranchExactSingleCommitOwner::from_installed(installed);
@@ -883,6 +1061,20 @@ mod tests {
                 preparation.inbound(),
                 crate::queue::realm_processor_continuation_restart::RealmProcessorInboundCarryoverObservation::Missing
             );
+        }
+        {
+            let mut attempt = owner
+                .begin_iteration(controlled.try_begin_iteration().unwrap())
+                .unwrap();
+            let recovery = attempt
+                .open_terminal_carryover_recovery()
+                .await
+                .unwrap();
+            let outcome = recovery.recover_and_prepare().await.unwrap();
+            assert!(matches!(
+                outcome,
+                RealmProcessorTerminalCarryoverRecoveryOutcome::AwaitExplicitInboundCarryover(_)
+            ));
         }
         assert!(!controlled.snapshot().active_iteration());
         drop(owner

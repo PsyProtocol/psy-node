@@ -449,7 +449,8 @@ impl RealmProcessorDeferredCarryover {
     /// Build a locator commitment from a terminal record and the exact store
     /// identity in which that record will be selected. This value is still a
     /// model object, not persistence authority: the storage layer must only
-    /// call it after obtaining and revalidating its private terminal receipt.
+    /// call it after exact-selecting the terminal through a private store
+    /// identity and must bracket the derived write with fresh revalidation.
     pub fn try_from_terminal_commitment<Hash: Q256BitHash>(
         terminal: &RealmProcessorGenerationTerminal<Hash>,
         terminal_store_fingerprint: RealmProcessorGenerationTerminalStoreFingerprint,

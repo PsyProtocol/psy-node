@@ -186,6 +186,121 @@ pub trait RealmProcessorContinuationRestartFactory<Hash>: Send + Sync {
     ) -> Result<Box<dyn RealmProcessorContinuationRestartPort>, RealmProcessorDurableCaptureError>;
 }
 
+/// Typed result of the separate terminal-to-carryover recovery capability.
+/// `Prepared` only means the immutable successor locator is now exact; it
+/// grants no pipeline terminal, rotation, writer, or head authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RealmProcessorTerminalCarryoverRecoveryOutcome {
+    AwaitExplicitInboundCarryover(RealmProcessorReadOnlyRestartPreparation),
+    AwaitTerminalPhase(RealmProcessorReadOnlyRestartPreparation),
+    AwaitVerifiedTerminalAuthorization(RealmProcessorReadOnlyRestartPreparation),
+    Prepared(RealmProcessorReadOnlyRestartPreparation),
+}
+
+impl RealmProcessorTerminalCarryoverRecoveryOutcome {
+    pub fn try_from_storage(
+        preparation: RealmProcessorReadOnlyRestartPreparation,
+    ) -> Result<Self, RealmProcessorContinuationRestartError> {
+        match (preparation.inbound(), preparation.terminal()) {
+            (
+                RealmProcessorInboundCarryoverObservation::Missing,
+                RealmProcessorTerminalCarryoverObservation::NotEvaluated,
+            ) => Ok(Self::AwaitExplicitInboundCarryover(preparation)),
+            (
+                RealmProcessorInboundCarryoverObservation::Bootstrap
+                | RealmProcessorInboundCarryoverObservation::Predecessor,
+                RealmProcessorTerminalCarryoverObservation::NotTerminalPhase,
+            ) => Ok(Self::AwaitTerminalPhase(preparation)),
+            (
+                RealmProcessorInboundCarryoverObservation::Bootstrap
+                | RealmProcessorInboundCarryoverObservation::Predecessor,
+                RealmProcessorTerminalCarryoverObservation::AwaitVerifiedTerminalAuthorization,
+            ) => Ok(Self::AwaitVerifiedTerminalAuthorization(preparation)),
+            (
+                RealmProcessorInboundCarryoverObservation::Bootstrap
+                | RealmProcessorInboundCarryoverObservation::Predecessor,
+                RealmProcessorTerminalCarryoverObservation::TerminalAndCarryoverObserved,
+            ) => Ok(Self::Prepared(preparation)),
+            _ => Err(RealmProcessorContinuationRestartError::StateMismatch),
+        }
+    }
+
+    pub const fn preparation(self) -> RealmProcessorReadOnlyRestartPreparation {
+        match self {
+            Self::AwaitExplicitInboundCarryover(value)
+            | Self::AwaitTerminalPhase(value)
+            | Self::AwaitVerifiedTerminalAuthorization(value)
+            | Self::Prepared(value) => value,
+        }
+    }
+}
+
+/// Identity-only request for the mutating-but-non-terminal recovery port.
+/// Storage still selects pending/proc, terminal slot and carryover content.
+#[derive(Debug)]
+pub struct SealedRealmProcessorTerminalCarryoverRecoveryRequest {
+    startup_permit_digest: RealmProcessorStartupPermitDigest,
+    network: NetworkId,
+    realm_id: u32,
+    realm_sub_id: u16,
+    writer_activation_digest: [u8; 32],
+    queue_readiness_digest: [u8; 32],
+}
+
+impl SealedRealmProcessorTerminalCarryoverRecoveryRequest {
+    pub(crate) fn seal(
+        startup_permit_digest: RealmProcessorStartupPermitDigest,
+        network: NetworkId,
+        realm_id: u32,
+        realm_sub_id: u16,
+        writer_activation_digest: [u8; 32],
+        queue_readiness_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            startup_permit_digest,
+            network,
+            realm_id,
+            realm_sub_id,
+            writer_activation_digest,
+            queue_readiness_digest,
+        }
+    }
+
+    pub const fn startup_permit_digest(&self) -> RealmProcessorStartupPermitDigest {
+        self.startup_permit_digest
+    }
+    pub const fn network(&self) -> NetworkId { self.network }
+    pub const fn realm_id(&self) -> u32 { self.realm_id }
+    pub const fn realm_sub_id(&self) -> u16 { self.realm_sub_id }
+    pub const fn writer_activation_digest(&self) -> &[u8; 32] {
+        &self.writer_activation_digest
+    }
+    pub const fn queue_readiness_digest(&self) -> &[u8; 32] {
+        &self.queue_readiness_digest
+    }
+}
+
+#[async_trait]
+pub trait RealmProcessorTerminalCarryoverRecoveryPort: Send {
+    async fn recover_and_prepare(
+        self: Box<Self>,
+    ) -> Result<RealmProcessorTerminalCarryoverRecoveryOutcome, RealmProcessorDurableCaptureError>;
+}
+
+#[async_trait]
+pub trait RealmProcessorTerminalCarryoverRecoveryFactory<Hash>: Send + Sync {
+    fn network(&self) -> NetworkId;
+    fn realm_id(&self) -> u32;
+    fn realm_sub_id(&self) -> u16;
+    fn writer_activation_digest(&self) -> [u8; 32];
+    fn queue_readiness_digest(&self) -> [u8; 32];
+
+    async fn open(
+        self: Arc<Self>,
+        request: SealedRealmProcessorTerminalCarryoverRecoveryRequest,
+    ) -> Result<Box<dyn RealmProcessorTerminalCarryoverRecoveryPort>, RealmProcessorDurableCaptureError>;
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RealmProcessorContinuationRestartError {
     StateMismatch,
@@ -272,6 +387,20 @@ mod tests {
         let source = include_str!("realm_processor_continuation_restart.rs");
         let production = source.split("#[cfg(test)]").next().unwrap();
         assert!(!production.contains("impl Clone for SealedRealmProcessorContinuationRestartRequest"));
+        assert!(!production.contains(
+            "impl Clone for SealedRealmProcessorTerminalCarryoverRecoveryRequest"
+        ));
+        let recovery_request = production
+            .split("pub struct SealedRealmProcessorTerminalCarryoverRecoveryRequest")
+            .nth(1)
+            .unwrap()
+            .split("impl SealedRealmProcessorTerminalCarryoverRecoveryRequest")
+            .next()
+            .unwrap();
+        assert!(!recovery_request.contains("pending_id"));
+        assert!(!recovery_request.contains("proc"));
+        assert!(!recovery_request.contains("terminal_slot"));
+        assert!(!recovery_request.contains("carryover"));
         assert!(!production.contains("terminal_authorization: Vec"));
         assert!(!production.contains("seal_rotation("));
         assert!(!production.contains("apply_pipeline"));
@@ -315,5 +444,64 @@ mod tests {
             )
             .is_err());
         }
+    }
+
+    #[test]
+    fn terminal_carryover_recovery_has_four_exhaustive_non_authority_outcomes() {
+        use RealmProcessorGenerationContinuationPhase as Phase;
+        let missing = RealmProcessorReadOnlyRestartPreparation::try_from_storage(
+            continuation(Phase::AwaitPublishedTerminal),
+            RealmProcessorInboundCarryoverObservation::Missing,
+            RealmProcessorTerminalCarryoverObservation::NotEvaluated,
+        )
+        .unwrap();
+        assert!(matches!(
+            RealmProcessorTerminalCarryoverRecoveryOutcome::try_from_storage(missing),
+            Ok(RealmProcessorTerminalCarryoverRecoveryOutcome::AwaitExplicitInboundCarryover(_))
+        ));
+
+        let nonterminal = RealmProcessorReadOnlyRestartPreparation::try_from_storage(
+            continuation(Phase::AwaitWriter),
+            RealmProcessorInboundCarryoverObservation::Predecessor,
+            RealmProcessorTerminalCarryoverObservation::NotTerminalPhase,
+        )
+        .unwrap();
+        assert!(matches!(
+            RealmProcessorTerminalCarryoverRecoveryOutcome::try_from_storage(nonterminal),
+            Ok(RealmProcessorTerminalCarryoverRecoveryOutcome::AwaitTerminalPhase(_))
+        ));
+
+        let await_authorization = RealmProcessorReadOnlyRestartPreparation::try_from_storage(
+            continuation(Phase::AwaitPublishedTerminal),
+            RealmProcessorInboundCarryoverObservation::Predecessor,
+            RealmProcessorTerminalCarryoverObservation::AwaitVerifiedTerminalAuthorization,
+        )
+        .unwrap();
+        assert!(matches!(
+            RealmProcessorTerminalCarryoverRecoveryOutcome::try_from_storage(await_authorization),
+            Ok(RealmProcessorTerminalCarryoverRecoveryOutcome::AwaitVerifiedTerminalAuthorization(_))
+        ));
+
+        let prepared = RealmProcessorReadOnlyRestartPreparation::try_from_storage(
+            continuation(Phase::AwaitRetiredNoWorkTerminal),
+            RealmProcessorInboundCarryoverObservation::Bootstrap,
+            RealmProcessorTerminalCarryoverObservation::TerminalAndCarryoverObserved,
+        )
+        .unwrap();
+        assert!(matches!(
+            RealmProcessorTerminalCarryoverRecoveryOutcome::try_from_storage(prepared),
+            Ok(RealmProcessorTerminalCarryoverRecoveryOutcome::Prepared(_))
+        ));
+
+        let terminal_only = RealmProcessorReadOnlyRestartPreparation::try_from_storage(
+            continuation(Phase::AwaitPublishedTerminal),
+            RealmProcessorInboundCarryoverObservation::Predecessor,
+            RealmProcessorTerminalCarryoverObservation::UnqualifiedTerminalObservedAwaitCarryover,
+        )
+        .unwrap();
+        assert_eq!(
+            RealmProcessorTerminalCarryoverRecoveryOutcome::try_from_storage(terminal_only),
+            Err(RealmProcessorContinuationRestartError::StateMismatch)
+        );
     }
 }
