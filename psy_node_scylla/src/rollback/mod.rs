@@ -76,6 +76,9 @@ mod realm_processor_durable_capture;
 mod realm_processor_application_archive;
 mod realm_processor_deferred_carryover;
 mod realm_processor_generation_terminal;
+#[cfg(all(test, feature = "rf3-test-support"))]
+#[path = "../../tests/rf3/d04b6h23c4c4b2b_terminal_carryover.rs"]
+mod realm_processor_terminal_carryover_rf3;
 mod pending_queue_consumer_gate;
 #[cfg(test)]
 #[path = "../../tests/rf3/d04b6h22e_consumer_gate.rs"]

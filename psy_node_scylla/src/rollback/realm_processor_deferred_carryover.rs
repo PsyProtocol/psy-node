@@ -277,6 +277,47 @@ impl fmt::Display for RealmProcessorDeferredCarryoverStoreError {
 impl Error for RealmProcessorDeferredCarryoverStoreError {}
 
 #[cfg(test)]
+impl ScyllaRealmProcessorDeferredCarryoverStore {
+    pub(super) async fn qualification_persist(
+        &self,
+        carryover: RealmProcessorDeferredCarryover,
+    ) -> Result<(), RealmProcessorDeferredCarryoverStoreError> {
+        let receipt = self.persist(carryover).await?;
+        self.revalidate(&receipt).await
+    }
+
+    pub(super) async fn qualification_commit_then_discard_response(
+        &self,
+        carryover: RealmProcessorDeferredCarryover,
+    ) -> Result<(), RealmProcessorDeferredCarryoverStoreError> {
+        let payload = carryover.to_canonical_bytes();
+        let result = self
+            .session
+            .execute_unpaged(
+                &self.bootstrap,
+                (
+                    carryover.slot().as_bytes().as_slice(),
+                    REVISION,
+                    payload.as_slice(),
+                ),
+            )
+            .await
+            .map_err(cql)?;
+        if !decode_applied(result)? {
+            return Err(RealmProcessorDeferredCarryoverStoreError::Conflict);
+        }
+        self.qualification_persist(carryover).await
+    }
+
+    pub(super) async fn qualification_read(
+        &self,
+        slot: RealmProcessorDeferredCarryoverSlot,
+    ) -> Result<Option<RealmProcessorDeferredCarryover>, RealmProcessorDeferredCarryoverStoreError> {
+        self.read(slot).await
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

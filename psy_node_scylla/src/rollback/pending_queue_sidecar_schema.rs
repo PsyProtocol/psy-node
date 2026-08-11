@@ -546,31 +546,7 @@ impl PendingQueueSidecarSchemaMaterializer {
             }
             PendingQueueSidecarSchemaInspection::Absent | PendingQueueSidecarSchemaInspection::Partial { .. } => {}
         }
-        ScyllaPendingPipelineStore::create_schema(session, &keyspaces.control).await.map_err(sidecar)?;
-        ScyllaPendingQueueSegmentLedgerStore::create_schema(session, &keyspaces.control).await.map_err(sidecar)?;
-        ScyllaPendingQueueConsumerGateStore::create_schema(session, &keyspaces.control).await.map_err(sidecar)?;
-        ScyllaPendingQueueSemanticAggregateStore::create_schema(session, &keyspaces.control).await.map_err(sidecar)?;
-        ScyllaPendingQueueGenerationTerminalStore::create_schema(session, &keyspaces.control).await.map_err(sidecar)?;
-        ScyllaPendingQueueSegmentLifecycleStore::create_schema(session, &keyspaces.control).await.map_err(sidecar)?;
-        ScyllaPendingQueueStreamProvisionStore::create_schema(session, &keyspaces.control).await.map_err(sidecar)?;
-        ScyllaPendingQueueArtifactStore::create_schema(session, &keyspaces.artifact_keyspaces()?).await.map_err(sidecar)?;
-        ScyllaPendingQueuePublishStore::create_schema(session, &keyspaces.publish_keyspaces()?).await.map_err(sidecar)?;
-        ScyllaRealmUserUpdateClaimStore::create_schema(session, &keyspaces.control).await.map_err(sidecar)?;
-        ScyllaRealmUserUpdateAdmissionStore::create_schema(session, &keyspaces.control).await.map_err(sidecar)?;
-        ScyllaRealmUserUpdateDependencyStore::create_schema(
-            session,
-            &PendingQueueArtifactDataKeyspace::try_new(keyspaces.data.as_str().to_owned())
-                .map_err(sidecar)?,
-        )
-        .await
-        .map_err(sidecar)?;
-        ScyllaRealmProcessorApplicationArchiveStore::create_schema(
-            session,
-            &keyspaces.control,
-            &keyspaces.application_data_keyspace()?,
-        )
-        .await
-        .map_err(sidecar)?;
+        materialize_pre_v12_tables(session, keyspaces).await?;
         ScyllaRealmProcessorGenerationTerminalStore::create_schema(
             session,
             &keyspaces.control,
@@ -587,6 +563,48 @@ impl PendingQueueSidecarSchemaMaterializer {
             return Err(PendingQueueSidecarSchemaError::DidNotConverge);
         };
         Ok(PendingQueueSidecarSchemaOnlyReceipt { keyspaces: keyspaces.clone(), fingerprint })
+    }
+}
+
+async fn materialize_pre_v12_tables(
+    session: &Session,
+    keyspaces: &PendingQueueSidecarKeyspaces,
+) -> Result<(), PendingQueueSidecarSchemaError> {
+    ScyllaPendingPipelineStore::create_schema(session, &keyspaces.control).await.map_err(sidecar)?;
+    ScyllaPendingQueueSegmentLedgerStore::create_schema(session, &keyspaces.control).await.map_err(sidecar)?;
+    ScyllaPendingQueueConsumerGateStore::create_schema(session, &keyspaces.control).await.map_err(sidecar)?;
+    ScyllaPendingQueueSemanticAggregateStore::create_schema(session, &keyspaces.control).await.map_err(sidecar)?;
+    ScyllaPendingQueueGenerationTerminalStore::create_schema(session, &keyspaces.control).await.map_err(sidecar)?;
+    ScyllaPendingQueueSegmentLifecycleStore::create_schema(session, &keyspaces.control).await.map_err(sidecar)?;
+    ScyllaPendingQueueStreamProvisionStore::create_schema(session, &keyspaces.control).await.map_err(sidecar)?;
+    ScyllaPendingQueueArtifactStore::create_schema(session, &keyspaces.artifact_keyspaces()?).await.map_err(sidecar)?;
+    ScyllaPendingQueuePublishStore::create_schema(session, &keyspaces.publish_keyspaces()?).await.map_err(sidecar)?;
+    ScyllaRealmUserUpdateClaimStore::create_schema(session, &keyspaces.control).await.map_err(sidecar)?;
+    ScyllaRealmUserUpdateAdmissionStore::create_schema(session, &keyspaces.control).await.map_err(sidecar)?;
+    ScyllaRealmUserUpdateDependencyStore::create_schema(
+        session,
+        &PendingQueueArtifactDataKeyspace::try_new(keyspaces.data.as_str().to_owned())
+            .map_err(sidecar)?,
+    )
+    .await
+    .map_err(sidecar)?;
+    ScyllaRealmProcessorApplicationArchiveStore::create_schema(
+        session,
+        &keyspaces.control,
+        &keyspaces.application_data_keyspace()?,
+    )
+    .await
+    .map_err(sidecar)?;
+    Ok(())
+}
+
+#[cfg(test)]
+impl PendingQueueSidecarSchemaMaterializer {
+    pub(super) async fn qualification_materialize_historical_v11(
+        session: &Session,
+        keyspaces: &PendingQueueSidecarKeyspaces,
+    ) -> Result<(), PendingQueueSidecarSchemaError> {
+        materialize_pre_v12_tables(session, keyspaces).await
     }
 }
 

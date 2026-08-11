@@ -116,6 +116,17 @@ impl ReservedPendingGeneration {
         })
     }
 
+    /// Isolated RF=3 qualification support. The default production feature
+    /// set cannot mint a reservation without the durable allocator.
+    #[cfg(feature = "rf3-test-support")]
+    #[doc(hidden)]
+    pub fn qualification_from_prefix(
+        pending_id: u64,
+        prefix: ProcNamespacePrefix,
+    ) -> Result<Self, UniquePendingIdOutOfRange> {
+        Self::try_from_prefix(pending_id, prefix)
+    }
+
     pub const fn pending_id(self) -> UniquePendingId {
         self.pending_id
     }

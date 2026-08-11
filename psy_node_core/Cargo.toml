@@ -13,6 +13,7 @@ serialize_speedy = ["dep:speedy", "pser/serialize_speedy", "parth_core/serialize
 serialize_postcard = ["dep:postcard", "pser/serialize_postcard", "parth_core/serialize_postcard"]
 serialize_bytemuck = ["dep:bytemuck", "parth_core/serialize_bytemuck", "psy_data/serialize_bytemuck", "psy_serialize/serialize_bytemuck"]
 clap_cli = ["dep:clap"]
+rf3-test-support = []
 
 [dependencies]
 postcard = { workspace = true, optional = true }

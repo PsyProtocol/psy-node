@@ -284,6 +284,53 @@ impl fmt::Display for RealmProcessorGenerationTerminalStoreError {
 impl Error for RealmProcessorGenerationTerminalStoreError {}
 
 #[cfg(test)]
+impl ScyllaRealmProcessorGenerationTerminalStore {
+    pub(super) const fn qualification_fingerprint(
+        &self,
+    ) -> RealmProcessorGenerationTerminalStoreFingerprint {
+        self.fingerprint
+    }
+
+    pub(super) async fn qualification_persist<Hash: Q256BitHash>(
+        &self,
+        terminal: RealmProcessorGenerationTerminal<Hash>,
+    ) -> Result<(), RealmProcessorGenerationTerminalStoreError> {
+        let receipt = self.persist(terminal).await?;
+        self.revalidate(&receipt).await
+    }
+
+    pub(super) async fn qualification_commit_then_discard_response<Hash: Q256BitHash>(
+        &self,
+        terminal: RealmProcessorGenerationTerminal<Hash>,
+    ) -> Result<(), RealmProcessorGenerationTerminalStoreError> {
+        let payload = terminal.to_canonical_bytes();
+        let result = self
+            .session
+            .execute_unpaged(
+                &self.bootstrap,
+                (
+                    terminal.slot().as_bytes().as_slice(),
+                    REVISION,
+                    payload.as_slice(),
+                ),
+            )
+            .await
+            .map_err(cql)?;
+        if !decode_applied(result)? {
+            return Err(RealmProcessorGenerationTerminalStoreError::Conflict);
+        }
+        self.qualification_persist(terminal).await
+    }
+
+    pub(super) async fn qualification_read<Hash: Q256BitHash>(
+        &self,
+        slot: RealmProcessorGenerationTerminalSlot,
+    ) -> Result<Option<RealmProcessorGenerationTerminal<Hash>>, RealmProcessorGenerationTerminalStoreError> {
+        self.read(slot).await
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
