@@ -79,7 +79,9 @@ use psy_node_core::{
             RealmUserUpdateVerifierProfile, RealmUserUpdateVerifierRegistry,
         },
         realm_processor_durable_capture::RealmProcessorDurableCaptureOutcome,
+        realm_processor_deferred_actor_input::RealmProcessorDeferredActorInputOutcome,
         realm_processor_continuation_restart::RealmProcessorTerminalCarryoverRecoveryOutcome,
+        realm_processor_generation_continuation::RealmProcessorGenerationContinuationPhase,
         realm_processor_generation_terminal::{
             RealmProcessorDeferredCarryover, RealmProcessorGenerationTerminal,
         },
@@ -1483,13 +1485,36 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                 );
             }
 
+            #[cfg(feature = "rf3-test-support")]
+            {
+                let carryover_store = ScyllaRealmProcessorDeferredCarryoverStore::prepare(
+                    Arc::clone(&session),
+                    control.clone(),
+                )
+                .await?;
+                let bootstrap = RealmProcessorDeferredCarryover::try_bootstrap_empty(
+                    key,
+                    activation,
+                    capture.processing(),
+                    PendingGenerationBootstrapReason::LegacyActivation,
+                )?;
+                carryover_store.qualification_persist(bootstrap).await?;
+            }
+
             let iteration_gate = RealmProcessorIterationGate::controlled();
             let mut iteration = owner.begin_iteration(
                 iteration_gate.try_begin_iteration()?,
             )?;
+            let deferred_input = match iteration.prepare_deferred_actor_input().await? {
+                RealmProcessorDeferredActorInputOutcome::Ready(input) => input,
+                RealmProcessorDeferredActorInputOutcome::AwaitExplicitCarryover { .. } => {
+                    bail!("qualification fixture did not persist explicit bootstrap carryover")
+                }
+            };
             let mut capture_owner = iteration
-                .open_durable_capture_for_processing(capture.processing())
+                .open_durable_capture_for_deferred_input(deferred_input)
                 .await?;
+            let _initial_actor_input = capture_owner.take_deferred_actor_input().await?;
             let mut item_count = 0_u64;
             let mut observed_close = false;
             for _ in 0..8 {
@@ -1541,9 +1566,22 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                 let mut restarted_iteration = owner.begin_iteration(
                     iteration_gate.try_begin_iteration()?,
                 )?;
+                let restarted_input = match restarted_iteration
+                    .prepare_deferred_actor_input()
+                    .await?
+                {
+                    RealmProcessorDeferredActorInputOutcome::Ready(input) => input,
+                    RealmProcessorDeferredActorInputOutcome::AwaitExplicitCarryover { .. } => {
+                        bail!("restart lost explicit bootstrap carryover")
+                    }
+                };
                 let mut restarted_capture = restarted_iteration
-                    .open_durable_capture_for_processing(capture.processing())
+                    .open_durable_capture_for_deferred_input(restarted_input)
                     .await?;
+                let restarted_input_digest = restarted_capture
+                    .take_deferred_actor_input()
+                    .await?
+                    .digest();
                 let replayed = restarted_capture
                     .replay_complete_generation()
                     .await?
@@ -1574,6 +1612,7 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                             generation_digest: replayed_generation_digest,
                             boundary_digest: replayed_boundary_digest,
                             item_count: replayed_item_count,
+                            input_binding: psy_node_core::queue::realm_processor_semantic_output::RealmProcessorSemanticInputBinding::SuccessorDeferred(restarted_input_digest),
                             processing_checkpoint_id: checkpoint_id,
                             processing_checkpoint_root: [0xA1; 32],
                             processing_realm_start_root: [0xA2; 32],
@@ -1624,23 +1663,36 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                     let mut recovered_iteration = owner.begin_iteration(
                         iteration_gate.try_begin_iteration()?,
                     )?;
-                    let mut recovered_capture = recovered_iteration
-                        .open_durable_capture_for_processing(capture.processing())
+                    let recovered = recovered_iteration
+                        .observe_generation_continuation()
                         .await?;
-                    let recovered = recovered_capture
-                        .recover_application_handoff()
-                        .await?
+                    let recovered_application = recovered
+                        .application()
                         .ok_or_else(|| {
                             anyhow::anyhow!(
-                                "post-CAS capture reopen did not recover application handoff"
+                                "post-CAS continuation did not recover application handoff"
                             )
                         })?;
-                    ensure!(recovered == expected_handoff);
+                    ensure!(
+                        recovered.phase()
+                            == RealmProcessorGenerationContinuationPhase::AwaitWriter
+                    );
+                    ensure!(
+                        recovered_application.archive_slot().as_bytes()
+                            == expected_handoff.archive_slot()
+                            && recovered_application.archive_digest().as_bytes()
+                                == expected_handoff.archive_digest()
+                            && recovered_application.semantic_digest().as_bytes()
+                                == expected_handoff.semantic_digest()
+                            && recovered.pipeline_revision().get()
+                                == expected_handoff.pipeline_revision()
+                            && recovered_application.has_application_work()
+                                == expected_handoff.has_application_work()
+                    );
                     application_restart_recovered = true;
 
                     #[cfg(feature = "rf3-test-support")]
                     if exercise_terminal_recovery {
-                        drop(recovered_capture);
                         drop(recovered_iteration);
 
                         let application_store = Arc::new(
@@ -2138,6 +2190,11 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                                 generation_digest: replayed_generation_digest,
                                 boundary_digest: replayed_boundary_digest,
                                 item_count: replayed_item_count,
+                                input_binding: psy_node_core::queue::realm_processor_semantic_output::RealmProcessorSemanticInputBinding::SuccessorDeferred(
+                                    psy_node_core::queue::realm_processor_deferred_actor_input::RealmProcessorDeferredActorInputDigest::try_new(
+                                        [0xA0 + poison_case; 32],
+                                    )?,
+                                ),
                                 processing_checkpoint_id: checkpoint_id,
                                 processing_checkpoint_root: [0x40 + poison_case; 32],
                                 processing_realm_start_root: [0x50 + poison_case; 32],

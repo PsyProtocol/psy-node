@@ -10,6 +10,7 @@ use std::{error::Error, fmt};
 use sha2::{Digest, Sha256};
 
 use super::{
+    realm_processor_deferred_actor_input::RealmProcessorDeferredActorInputDigest,
     realm_processor_durable_capture::RealmProcessorDurableGenerationDigest,
     recoverable_ephemeral::{
         PendingQueueBoundaryDigest, PendingQueueCaptureContextDigest,
@@ -17,8 +18,10 @@ use super::{
 };
 
 const MAGIC: &[u8; 8] = b"PSYRSMO1";
-const CODEC_VERSION: u16 = 1;
-const DIGEST_DOMAIN: &[u8] = b"psy/rollback/realm-semantic-output/v1";
+const LEGACY_CODEC_VERSION: u16 = 1;
+const BOUND_CODEC_VERSION: u16 = 2;
+const LEGACY_DIGEST_DOMAIN: &[u8] = b"psy/rollback/realm-semantic-output/v1";
+const BOUND_DIGEST_DOMAIN: &[u8] = b"psy/rollback/realm-semantic-output/v2";
 const MAX_COMPONENTS: usize = 1_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -70,6 +73,16 @@ pub struct RealmProcessorDeferredJob {
     contract_updates: Vec<u8>,
 }
 
+/// Canonical provenance of the actor input used to produce this semantic
+/// output. Version-1 archives decode as `LegacyUnbound` for predecessor
+/// recovery only; new branch-exact publication must require the v2 bound
+/// variant and must never synthesize a zero digest for legacy bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RealmProcessorSemanticInputBinding {
+    LegacyUnbound,
+    SuccessorDeferred(RealmProcessorDeferredActorInputDigest),
+}
+
 impl RealmProcessorDeferredJob {
     pub fn try_new(
         ordinal: u32,
@@ -97,6 +110,7 @@ pub struct RealmProcessorSemanticOutputParts {
     pub generation_digest: RealmProcessorDurableGenerationDigest,
     pub boundary_digest: PendingQueueBoundaryDigest,
     pub item_count: u64,
+    pub input_binding: RealmProcessorSemanticInputBinding,
     pub processing_checkpoint_id: u64,
     pub processing_checkpoint_root: [u8; 32],
     pub processing_realm_start_root: [u8; 32],
@@ -120,6 +134,7 @@ pub struct RealmProcessorSemanticOutput {
     generation_digest: RealmProcessorDurableGenerationDigest,
     boundary_digest: PendingQueueBoundaryDigest,
     item_count: u64,
+    input_binding: RealmProcessorSemanticInputBinding,
     processing_checkpoint_id: u64,
     processing_checkpoint_root: [u8; 32],
     processing_realm_start_root: [u8; 32],
@@ -166,6 +181,7 @@ impl RealmProcessorSemanticOutput {
             generation_digest: parts.generation_digest,
             boundary_digest: parts.boundary_digest,
             item_count: parts.item_count,
+            input_binding: parts.input_binding,
             processing_checkpoint_id: parts.processing_checkpoint_id,
             processing_checkpoint_root: parts.processing_checkpoint_root,
             processing_realm_start_root: parts.processing_realm_start_root,
@@ -183,7 +199,7 @@ impl RealmProcessorSemanticOutput {
             deferred_jobs: parts.deferred_jobs,
             digest: RealmProcessorSemanticOutputDigest([1; 32]),
         };
-        output.digest = digest(&output.encode_unsigned())?;
+        output.digest = digest(output.input_binding, &output.encode_unsigned())?;
         Ok(output)
     }
 
@@ -192,7 +208,8 @@ impl RealmProcessorSemanticOutput {
         if decoder.take(8)? != MAGIC {
             return Err(RealmProcessorSemanticOutputError::InvalidMagic);
         }
-        if decoder.u16()? != CODEC_VERSION {
+        let codec_version = decoder.u16()?;
+        if codec_version != LEGACY_CODEC_VERSION && codec_version != BOUND_CODEC_VERSION {
             return Err(RealmProcessorSemanticOutputError::UnknownCodecVersion);
         }
         let context_digest = PendingQueueCaptureContextDigest::try_new(decoder.array32()?)
@@ -202,6 +219,14 @@ impl RealmProcessorSemanticOutput {
         let boundary_digest = PendingQueueBoundaryDigest::try_new(decoder.array32()?)
             .map_err(|_| RealmProcessorSemanticOutputError::EmptyDigest)?;
         let item_count = decoder.u64()?;
+        let input_binding = if codec_version == BOUND_CODEC_VERSION {
+            RealmProcessorSemanticInputBinding::SuccessorDeferred(
+                RealmProcessorDeferredActorInputDigest::try_new(decoder.array32()?)
+                    .map_err(|_| RealmProcessorSemanticOutputError::EmptyDigest)?,
+            )
+        } else {
+            RealmProcessorSemanticInputBinding::LegacyUnbound
+        };
         let processing_checkpoint_id = decoder.u64()?;
         let processing_checkpoint_root = decoder.array32()?;
         let processing_realm_start_root = decoder.array32()?;
@@ -238,6 +263,7 @@ impl RealmProcessorSemanticOutput {
             generation_digest,
             boundary_digest,
             item_count,
+            input_binding,
             processing_checkpoint_id,
             processing_checkpoint_root,
             processing_realm_start_root,
@@ -271,8 +297,11 @@ impl RealmProcessorSemanticOutput {
     /// method before calling `to_canonical_bytes`.
     pub fn canonical_len(&self) -> Result<usize, RealmProcessorSemanticOutputError> {
         // Fixed fields, six u32 byte-length prefixes, two vector counts and
-        // the trailing digest.
-        let mut len = 330_usize;
+        // the trailing digest. Bound v2 adds one exact 32-byte input digest.
+        let mut len = match self.input_binding {
+            RealmProcessorSemanticInputBinding::LegacyUnbound => 330_usize,
+            RealmProcessorSemanticInputBinding::SuccessorDeferred(_) => 362_usize,
+        };
         for bytes in [
             &self.global_user_tree_nodes,
             &self.user_contract_tree_nodes,
@@ -304,6 +333,13 @@ impl RealmProcessorSemanticOutput {
     pub const fn generation_digest(&self) -> RealmProcessorDurableGenerationDigest { self.generation_digest }
     pub const fn boundary_digest(&self) -> PendingQueueBoundaryDigest { self.boundary_digest }
     pub const fn item_count(&self) -> u64 { self.item_count }
+    pub const fn input_binding(&self) -> RealmProcessorSemanticInputBinding { self.input_binding }
+    pub const fn actor_input_digest(&self) -> Option<RealmProcessorDeferredActorInputDigest> {
+        match self.input_binding {
+            RealmProcessorSemanticInputBinding::LegacyUnbound => None,
+            RealmProcessorSemanticInputBinding::SuccessorDeferred(digest) => Some(digest),
+        }
+    }
     pub const fn processing_checkpoint_id(&self) -> u64 { self.processing_checkpoint_id }
     pub fn old_realm_root(&self) -> &[u8; 32] { &self.old_realm_root }
     pub fn new_realm_root(&self) -> &[u8; 32] { &self.new_realm_root }
@@ -328,11 +364,18 @@ impl RealmProcessorSemanticOutput {
     fn encode_unsigned(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&CODEC_VERSION.to_be_bytes());
+        let codec_version = match self.input_binding {
+            RealmProcessorSemanticInputBinding::LegacyUnbound => LEGACY_CODEC_VERSION,
+            RealmProcessorSemanticInputBinding::SuccessorDeferred(_) => BOUND_CODEC_VERSION,
+        };
+        out.extend_from_slice(&codec_version.to_be_bytes());
         out.extend_from_slice(self.context_digest.as_bytes());
         out.extend_from_slice(self.generation_digest.as_bytes());
         out.extend_from_slice(self.boundary_digest.as_bytes());
         out.extend_from_slice(&self.item_count.to_be_bytes());
+        if let RealmProcessorSemanticInputBinding::SuccessorDeferred(digest) = self.input_binding {
+            out.extend_from_slice(digest.as_bytes());
+        }
         out.extend_from_slice(&self.processing_checkpoint_id.to_be_bytes());
         out.extend_from_slice(&self.processing_checkpoint_root);
         out.extend_from_slice(&self.processing_realm_start_root);
@@ -423,9 +466,15 @@ fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
-fn digest(bytes: &[u8]) -> Result<RealmProcessorSemanticOutputDigest, RealmProcessorSemanticOutputError> {
+fn digest(
+    binding: RealmProcessorSemanticInputBinding,
+    bytes: &[u8],
+) -> Result<RealmProcessorSemanticOutputDigest, RealmProcessorSemanticOutputError> {
     let mut hasher = Sha256::new();
-    hasher.update(DIGEST_DOMAIN);
+    hasher.update(match binding {
+        RealmProcessorSemanticInputBinding::LegacyUnbound => LEGACY_DIGEST_DOMAIN,
+        RealmProcessorSemanticInputBinding::SuccessorDeferred(_) => BOUND_DIGEST_DOMAIN,
+    });
     hasher.update(bytes);
     RealmProcessorSemanticOutputDigest::try_new(hasher.finalize().into())
 }
@@ -493,6 +542,7 @@ mod tests {
             generation_digest: RealmProcessorDurableGenerationDigest::try_new([2; 32]).unwrap(),
             boundary_digest: PendingQueueBoundaryDigest::try_new([3; 32]).unwrap(),
             item_count: 2,
+            input_binding: RealmProcessorSemanticInputBinding::LegacyUnbound,
             processing_checkpoint_id: 17,
             processing_checkpoint_root: [4; 32],
             processing_realm_start_root: [5; 32],
@@ -531,12 +581,47 @@ mod tests {
         bad_magic[0] ^= 1;
         assert_eq!(RealmProcessorSemanticOutput::decode_canonical(&bad_magic), Err(RealmProcessorSemanticOutputError::InvalidMagic));
         let mut unknown = bytes.clone();
-        unknown[8..10].copy_from_slice(&2_u16.to_be_bytes());
+        unknown[8..10].copy_from_slice(&3_u16.to_be_bytes());
         assert_eq!(RealmProcessorSemanticOutput::decode_canonical(&unknown), Err(RealmProcessorSemanticOutputError::UnknownCodecVersion));
         assert_eq!(RealmProcessorSemanticOutput::decode_canonical(&bytes[..bytes.len() - 1]), Err(RealmProcessorSemanticOutputError::Truncated));
         let mut trailing = bytes;
         trailing.push(0);
         assert_eq!(RealmProcessorSemanticOutput::decode_canonical(&trailing), Err(RealmProcessorSemanticOutputError::TrailingBytes));
+    }
+
+    #[test]
+    fn bound_v2_commits_actor_input_while_v1_remains_read_only_compatible() {
+        let legacy = RealmProcessorSemanticOutput::try_from_candidate_parts(parts(false)).unwrap();
+        let legacy_bytes = legacy.to_canonical_bytes();
+        assert_eq!(u16::from_be_bytes(legacy_bytes[8..10].try_into().unwrap()), 1);
+        assert_eq!(legacy.actor_input_digest(), None);
+        assert_eq!(
+            RealmProcessorSemanticOutput::decode_canonical(&legacy_bytes).unwrap(),
+            legacy
+        );
+
+        let input_digest = RealmProcessorDeferredActorInputDigest::try_new([42; 32]).unwrap();
+        let mut bound_parts = parts(false);
+        bound_parts.input_binding =
+            RealmProcessorSemanticInputBinding::SuccessorDeferred(input_digest);
+        let bound = RealmProcessorSemanticOutput::try_from_candidate_parts(bound_parts).unwrap();
+        let bound_bytes = bound.to_canonical_bytes();
+        assert_eq!(u16::from_be_bytes(bound_bytes[8..10].try_into().unwrap()), 2);
+        assert_eq!(bound.actor_input_digest(), Some(input_digest));
+        assert_eq!(bound.canonical_len().unwrap(), bound_bytes.len());
+        assert_eq!(bound_bytes.len(), legacy_bytes.len() + 32);
+        assert_ne!(bound.digest(), legacy.digest());
+        assert_eq!(
+            RealmProcessorSemanticOutput::decode_canonical(&bound_bytes).unwrap(),
+            bound
+        );
+
+        let mut changed_parts = parts(false);
+        changed_parts.input_binding = RealmProcessorSemanticInputBinding::SuccessorDeferred(
+            RealmProcessorDeferredActorInputDigest::try_new([43; 32]).unwrap(),
+        );
+        let changed = RealmProcessorSemanticOutput::try_from_candidate_parts(changed_parts).unwrap();
+        assert_ne!(bound.digest(), changed.digest());
     }
 
     #[test]

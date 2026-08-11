@@ -21,7 +21,7 @@ elif [[ "${EXERCISE_DURABLE_CAPTURE}" == "1" ]]; then
   EXPECTED_QUALIFICATION="H23C4C3A_DURABLE_CAPTURE_OWNER_RF3_PASSED"
 fi
 CARGO_FEATURE_ARGS=()
-if [[ "${EXERCISE_TERMINAL_RECOVERY}" == "1" ]]; then
+if [[ "${EXERCISE_DURABLE_CAPTURE}" == "1" ]]; then
   CARGO_FEATURE_ARGS=(--features rf3-test-support)
 fi
 NATS_DIR="$(mktemp -d /tmp/psy-h23e3-nats.XXXXXX)"

@@ -324,6 +324,9 @@ impl RealmProcessorApplicationArchivePlan {
         binding: RealmProcessorApplicationArchiveBinding,
         semantic: &RealmProcessorSemanticOutput,
     ) -> Result<Self, RealmProcessorApplicationArchiveError> {
+        if semantic.actor_input_digest().is_none() {
+            return Err(RealmProcessorApplicationArchiveError::UnboundSemantic);
+        }
         if semantic.canonical_len()? > REALM_APPLICATION_ARCHIVE_MAX_BYTES {
             return Err(RealmProcessorApplicationArchiveError::PayloadTooLarge);
         }
@@ -606,6 +609,7 @@ impl<'a> Decoder<'a> {
 pub enum RealmProcessorApplicationArchiveError {
     EmptyDigest,
     InvalidBinding,
+    UnboundSemantic,
     PayloadTooLarge,
     CoordinateOutOfRange,
     MalformedHeader,
@@ -658,6 +662,9 @@ mod tests {
                 generation_digest: RealmProcessorDurableGenerationDigest::try_new([9; 32]).unwrap(),
                 boundary_digest: PendingQueueBoundaryDigest::try_new([10; 32]).unwrap(),
                 item_count: 0,
+                input_binding: crate::queue::realm_processor_semantic_output::RealmProcessorSemanticInputBinding::SuccessorDeferred(
+                    crate::queue::realm_processor_deferred_actor_input::RealmProcessorDeferredActorInputDigest::try_new([17; 32]).unwrap(),
+                ),
                 processing_checkpoint_id: 42,
                 processing_checkpoint_root: [11; 32],
                 processing_realm_start_root: [12; 32],
@@ -679,6 +686,38 @@ mod tests {
                 },
             },
         ).unwrap()
+    }
+
+    #[test]
+    fn new_archive_plan_rejects_legacy_unbound_semantic() {
+        let legacy = RealmProcessorSemanticOutput::try_from_candidate_parts(
+            RealmProcessorSemanticOutputParts {
+                context_digest: PendingQueueCaptureContextDigest::try_new([8; 32]).unwrap(),
+                generation_digest: RealmProcessorDurableGenerationDigest::try_new([9; 32]).unwrap(),
+                boundary_digest: PendingQueueBoundaryDigest::try_new([10; 32]).unwrap(),
+                item_count: 0,
+                input_binding: crate::queue::realm_processor_semantic_output::RealmProcessorSemanticInputBinding::LegacyUnbound,
+                processing_checkpoint_id: 42,
+                processing_checkpoint_root: [11; 32],
+                processing_realm_start_root: [12; 32],
+                old_realm_root: [12; 32],
+                new_realm_root: [12; 32],
+                total_users_updated: 0,
+                total_proofs_generated: 0,
+                global_user_tree_nodes: vec![],
+                user_contract_tree_nodes: vec![],
+                contract_state_tree_nodes: vec![],
+                user_leaves: vec![],
+                contract_state_imt_leaves: vec![],
+                guta_header: vec![14],
+                jobs: vec![],
+                deferred_jobs: vec![],
+            },
+        ).unwrap();
+        assert_eq!(
+            RealmProcessorApplicationArchivePlan::try_new(binding(), &legacy),
+            Err(RealmProcessorApplicationArchiveError::UnboundSemantic),
+        );
     }
 
     #[test]

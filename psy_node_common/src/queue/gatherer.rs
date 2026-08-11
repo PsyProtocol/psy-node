@@ -8,6 +8,10 @@ use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::queue::queue_key:
 use psy_node_core::{
     queue::{
         ephemeral::QStandardEphemeralQueueSubscriber,
+        realm_processor_deferred_actor_input::{
+            RealmProcessorDeferredActorInput,
+            RealmProcessorDeferredActorInputDigest,
+        },
         realm_processor_durable_capture::{
             RealmProcessorDurableCapturedGeneration,
             RealmProcessorDurableGenerationDigest,
@@ -327,6 +331,7 @@ enum TreeGathererCommand<Output> {
     Status(oneshot::Sender<GathererBoundaryStatus>),
     ApplyDurableGeneration {
         generation: RealmProcessorDurableCapturedGeneration,
+        deferred_input: RealmProcessorDeferredActorInput,
         responder: oneshot::Sender<
             Result<DurableTreeGathererApplyReceipt, GathererPauseError>,
         >,
@@ -346,6 +351,7 @@ pub trait DurableTreeGathererConfig: Clone + Send + Sync + 'static {
     fn bind_complete_generation(
         &self,
         context: PendingQueueCaptureContext,
+        deferred_input: RealmProcessorDeferredActorInput,
     ) -> anyhow::Result<Self>;
 }
 
@@ -357,6 +363,7 @@ pub struct DurableTreeGathererApplyReceipt {
     generation_digest: RealmProcessorDurableGenerationDigest,
     boundary_digest: PendingQueueBoundaryDigest,
     item_count: u64,
+    actor_input_digest: RealmProcessorDeferredActorInputDigest,
 }
 
 /// In-process proof that the command-only actor finalized exactly the builder
@@ -372,6 +379,7 @@ pub struct DurableTreeGathererFinalizeReceipt<Output> {
     generation_digest: RealmProcessorDurableGenerationDigest,
     boundary_digest: PendingQueueBoundaryDigest,
     item_count: u64,
+    actor_input_digest: RealmProcessorDeferredActorInputDigest,
     output: Arc<Output>,
 }
 
@@ -394,6 +402,10 @@ impl<Output> DurableTreeGathererFinalizeReceipt<Output> {
 
     pub const fn item_count(&self) -> u64 {
         self.item_count
+    }
+
+    pub const fn actor_input_digest(&self) -> RealmProcessorDeferredActorInputDigest {
+        self.actor_input_digest
     }
 
     pub fn output(&self) -> &Output {
@@ -420,6 +432,10 @@ impl DurableTreeGathererApplyReceipt {
 
     pub const fn item_count(&self) -> u64 {
         self.item_count
+    }
+
+    pub const fn actor_input_digest(&self) -> RealmProcessorDeferredActorInputDigest {
+        self.actor_input_digest
     }
 }
 
@@ -535,11 +551,13 @@ impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase + 'static, Output:
     pub(crate) async fn apply_durable_generation(
         &self,
         generation: RealmProcessorDurableCapturedGeneration,
+        deferred_input: RealmProcessorDeferredActorInput,
     ) -> Result<DurableTreeGathererApplyReceipt, GathererPauseError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.trigger_tx
             .send(TreeGathererCommand::ApplyDurableGeneration {
                 generation,
+                deferred_input,
                 responder: response_tx,
             })
             .await
@@ -862,12 +880,14 @@ async fn durable_gatherer_runner_for_tree<
         match command {
             TreeGathererCommand::ApplyDurableGeneration {
                 generation,
+                deferred_input,
                 responder,
             } => {
                 let context = generation.context();
                 let boundary_digest = generation.boundary().digest();
                 let generation_digest = generation.digest();
                 let item_count = generation.item_count();
+                let actor_input_digest = deferred_input.digest();
 
                 if context.key().authority()
                     != (psy_data::protocol::chain_context::AuthorityScope::Realm {
@@ -876,6 +896,7 @@ async fn durable_gatherer_runner_for_tree<
                     })
                     || context.processing().proc_checkpoint_id().as_u128()
                         != queue_key.unique_id
+                    || deferred_input.successor() != context.processing()
                 {
                     let _ = responder.send(Err(
                         GathererPauseError::DurableGenerationIdentityMismatch,
@@ -888,6 +909,7 @@ async fn durable_gatherer_runner_for_tree<
                         && current.generation_digest() == generation_digest
                         && current.boundary_digest() == boundary_digest
                         && current.item_count() == item_count
+                        && current.actor_input_digest() == actor_input_digest
                     {
                         Ok(DurableTreeGathererApplyReceipt {
                             actor_identity: current.actor_identity.clone(),
@@ -896,6 +918,7 @@ async fn durable_gatherer_runner_for_tree<
                             generation_digest: current.generation_digest,
                             boundary_digest: current.boundary_digest,
                             item_count: current.item_count,
+                            actor_input_digest: current.actor_input_digest,
                         })
                     } else {
                         Err(GathererPauseError::DurableGenerationIdentityMismatch)
@@ -904,7 +927,9 @@ async fn durable_gatherer_runner_for_tree<
                     continue;
                 }
 
-                let bound_config = match base_config.bind_complete_generation(context) {
+                let bound_config = match base_config
+                    .bind_complete_generation(context, deferred_input)
+                {
                     Ok(config) => config,
                     Err(err) => {
                         tracing::error!(
@@ -947,6 +972,7 @@ async fn durable_gatherer_runner_for_tree<
                     generation_digest,
                     boundary_digest,
                     item_count,
+                    actor_input_digest,
                 };
                 let response = DurableTreeGathererApplyReceipt {
                     actor_identity: receipt.actor_identity.clone(),
@@ -955,6 +981,7 @@ async fn durable_gatherer_runner_for_tree<
                     generation_digest: receipt.generation_digest,
                     boundary_digest: receipt.boundary_digest,
                     item_count: receipt.item_count,
+                    actor_input_digest: receipt.actor_input_digest,
                 };
                 tentative_builder = Some(builder);
                 applied = Some(receipt);
@@ -971,6 +998,7 @@ async fn durable_gatherer_runner_for_tree<
                     || receipt.generation_digest != current.generation_digest
                     || receipt.boundary_digest != current.boundary_digest
                     || receipt.item_count != current.item_count
+                    || receipt.actor_input_digest != current.actor_input_digest
                 {
                     let _ = responder.send(Err(GathererPauseError::DurableGenerationIdentityMismatch));
                     continue;
@@ -986,6 +1014,7 @@ async fn durable_gatherer_runner_for_tree<
                         generation_digest: current.generation_digest,
                         boundary_digest: current.boundary_digest,
                         item_count: current.item_count,
+                        actor_input_digest: current.actor_input_digest,
                         output: output.clone(),
                     }));
                     continue;
@@ -1011,6 +1040,7 @@ async fn durable_gatherer_runner_for_tree<
                     generation_digest: current.generation_digest,
                     boundary_digest: current.boundary_digest,
                     item_count: current.item_count,
+                    actor_input_digest: current.actor_input_digest,
                     output,
                 }));
             }
@@ -1622,6 +1652,7 @@ mod h23b1_tests {
                 RealmProcessorDurableCapturedBatch,
                 RealmProcessorDurableCapturedGeneration,
             },
+            realm_processor_generation_terminal::RealmProcessorDeferredCarryover,
             recoverable_ephemeral::{
                 PendingQueueBoundaryObservation, PendingQueueCaptureCandidate,
                 PendingQueueCaptureContext, PendingQueueGenerationBoundary,
@@ -1630,7 +1661,8 @@ mod h23b1_tests {
         },
         store::{
             pending_generation_identity::{
-                PendingGenerationActivationDigest, PendingGenerationContext,
+                PendingGenerationActivationDigest, PendingGenerationBootstrapReason,
+                PendingGenerationContext,
                 PendingGenerationLedgerKey,
             },
             pending_generation_pipeline::PendingQueueCloseIntentDigest,
@@ -1823,6 +1855,7 @@ mod h23b1_tests {
         fn bind_complete_generation(
             &self,
             _context: PendingQueueCaptureContext,
+            _deferred_input: RealmProcessorDeferredActorInput,
         ) -> anyhow::Result<Self> {
             Ok(self.clone())
         }
@@ -1974,6 +2007,26 @@ mod h23b1_tests {
             context,
             vec![batch],
             boundary,
+        )
+        .unwrap()
+    }
+
+    fn durable_input(
+        reason: PendingGenerationBootstrapReason,
+    ) -> RealmProcessorDeferredActorInput {
+        let context = durable_context();
+        let carryover = RealmProcessorDeferredCarryover::try_bootstrap_empty(
+            context.key(),
+            context.activation(),
+            context.processing(),
+            reason,
+        )
+        .unwrap();
+        RealmProcessorDeferredActorInput::try_from_storage(
+            context.processing(),
+            reason,
+            carryover,
+            None,
         )
         .unwrap()
     }
@@ -2163,23 +2216,45 @@ mod h23b1_tests {
         let (mut gatherer, join) = start_durable_test_gatherer(state.clone());
         state.release_update.notify_one();
         let receipt = gatherer
-            .apply_durable_generation(durable_generation(1))
+            .apply_durable_generation(
+                durable_generation(1),
+                durable_input(PendingGenerationBootstrapReason::LegacyActivation),
+            )
             .await
             .unwrap();
         assert_eq!(receipt.item_count(), 2);
         assert_eq!(receipt.actor_revision().get(), 1);
+        let expected_input_digest = receipt.actor_input_digest();
         assert_eq!(state.update_calls.load(Ordering::SeqCst), 1);
 
         let retry = gatherer
-            .apply_durable_generation(durable_generation(1))
+            .apply_durable_generation(
+                durable_generation(1),
+                durable_input(PendingGenerationBootstrapReason::LegacyActivation),
+            )
             .await
             .unwrap();
         assert_eq!(retry.generation_digest(), receipt.generation_digest());
+        assert_eq!(retry.actor_input_digest(), receipt.actor_input_digest());
         assert_eq!(retry.actor_revision(), receipt.actor_revision());
         assert_eq!(state.update_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             gatherer
-                .apply_durable_generation(durable_generation(2))
+                .apply_durable_generation(
+                    durable_generation(1),
+                    durable_input(PendingGenerationBootstrapReason::Genesis),
+                )
+                .await
+                .unwrap_err(),
+            GathererPauseError::DurableGenerationIdentityMismatch
+        );
+        assert_eq!(state.update_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            gatherer
+                .apply_durable_generation(
+                    durable_generation(2),
+                    durable_input(PendingGenerationBootstrapReason::LegacyActivation),
+                )
                 .await
                 .unwrap_err(),
             GathererPauseError::DurableGenerationIdentityMismatch
@@ -2190,7 +2265,10 @@ mod h23b1_tests {
             start_durable_test_gatherer(foreign_state.clone());
         foreign_state.release_update.notify_one();
         let foreign_receipt = foreign_gatherer
-            .apply_durable_generation(durable_generation(1))
+            .apply_durable_generation(
+                durable_generation(1),
+                durable_input(PendingGenerationBootstrapReason::LegacyActivation),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -2210,11 +2288,15 @@ mod h23b1_tests {
             .unwrap();
         assert_eq!(finalized.actor_revision().get(), 2);
         assert_eq!(finalized.item_count(), 2);
+        assert_eq!(finalized.actor_input_digest(), expected_input_digest);
         assert_eq!(*finalized.output(), 1);
         assert_eq!(state.finalize_calls.load(Ordering::SeqCst), 1);
 
         let retry_apply = gatherer
-            .apply_durable_generation(durable_generation(1))
+            .apply_durable_generation(
+                durable_generation(1),
+                durable_input(PendingGenerationBootstrapReason::LegacyActivation),
+            )
             .await
             .unwrap();
         let retry_finalize = gatherer
@@ -2237,7 +2319,10 @@ mod h23b1_tests {
         assert_eq!(pause_receipt.revision().get(), 3);
         assert_eq!(gatherer.resume(pause_receipt).await.unwrap().revision().get(), 4);
         let post_resume_apply = gatherer
-            .apply_durable_generation(durable_generation(1))
+            .apply_durable_generation(
+                durable_generation(1),
+                durable_input(PendingGenerationBootstrapReason::LegacyActivation),
+            )
             .await
             .unwrap();
         let post_resume_finalize = gatherer
@@ -2262,12 +2347,47 @@ mod h23b1_tests {
         join.await.unwrap().unwrap();
     }
 
+    #[test]
+    fn realm_durable_actor_binds_deferred_lineage_before_external_data() {
+        let actor = include_str!("gatherer.rs")
+            .split("async fn durable_gatherer_runner_for_tree")
+            .nth(1)
+            .unwrap()
+            .split("\nasync fn gatherer_runner_for_tree")
+            .next()
+            .unwrap();
+        let bind = actor.find("bind_complete_generation").unwrap();
+        let create = actor.find("Builder::create_new_with_tree").unwrap();
+        let external = actor
+            .find("update_from_many_queue_items_with_tree")
+            .unwrap();
+        assert!(bind < create);
+        assert!(create < external);
+
+        let realm = include_str!(
+            "../realm/processor/gatherers/realm_end_cap_gatherer.rs"
+        );
+        let create = realm
+            .split("async fn create_new_with_tree")
+            .nth(1)
+            .unwrap()
+            .split("async fn update_from_queue_item_with_tree")
+            .next()
+            .unwrap();
+        let isolate = create.find("future_pending_end_cap_jobs").unwrap();
+        let inject = create.find("add_future_end_cap_jobs").unwrap();
+        assert!(isolate < inject);
+    }
+
     #[tokio::test]
     async fn durable_pause_waits_for_apply_and_failed_actor_replays_from_clean_builder() {
         let state = Arc::new(TestGathererState::default());
         let (gatherer, join) = start_durable_test_gatherer(state.clone());
         let pause_receipt = {
-            let apply = gatherer.apply_durable_generation(durable_generation(3));
+            let apply = gatherer.apply_durable_generation(
+                durable_generation(3),
+                durable_input(PendingGenerationBootstrapReason::LegacyActivation),
+            );
             tokio::pin!(apply);
             assert!(tokio::time::timeout(Duration::from_millis(20), &mut apply)
                 .await
@@ -2296,7 +2416,10 @@ mod h23b1_tests {
         failed.release_update.notify_one();
         assert_eq!(
             failed_gatherer
-                .apply_durable_generation(durable_generation(4))
+                .apply_durable_generation(
+                    durable_generation(4),
+                    durable_input(PendingGenerationBootstrapReason::LegacyActivation),
+                )
                 .await
                 .unwrap_err(),
             GathererPauseError::DurableGenerationApplyFailed
@@ -2308,7 +2431,10 @@ mod h23b1_tests {
             start_durable_test_gatherer(recovered.clone());
         recovered.release_update.notify_one();
         recovered_gatherer
-            .apply_durable_generation(durable_generation(4))
+            .apply_durable_generation(
+                durable_generation(4),
+                durable_input(PendingGenerationBootstrapReason::LegacyActivation),
+            )
             .await
             .unwrap();
         assert_eq!(recovered.update_calls.load(Ordering::SeqCst), 1);
@@ -2321,7 +2447,10 @@ mod h23b1_tests {
             start_durable_test_gatherer(finalize_failed.clone());
         finalize_failed.release_update.notify_one();
         let failed_receipt = finalize_failed_gatherer
-            .apply_durable_generation(durable_generation(5))
+            .apply_durable_generation(
+                durable_generation(5),
+                durable_input(PendingGenerationBootstrapReason::LegacyActivation),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -2339,7 +2468,10 @@ mod h23b1_tests {
             start_durable_test_gatherer(finalize_recovered.clone());
         finalize_recovered.release_update.notify_one();
         let recovered_receipt = finalize_recovered_gatherer
-            .apply_durable_generation(durable_generation(5))
+            .apply_durable_generation(
+                durable_generation(5),
+                durable_input(PendingGenerationBootstrapReason::LegacyActivation),
+            )
             .await
             .unwrap();
         let recovered_output = finalize_recovered_gatherer

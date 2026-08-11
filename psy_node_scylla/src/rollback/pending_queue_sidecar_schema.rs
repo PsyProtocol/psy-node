@@ -67,13 +67,13 @@ use super::{
 #[cfg(test)]
 use super::RETIRED_REALM_USER_UPDATE_CLAIM_V1_TABLE;
 
-// v12 adds the Realm predecessor terminal/rotation intent and successor
-// deferred-carryover locator. A v11 VERIFIED receipt intentionally has a
-// different deployment slot and cannot authorize this stronger contract.
-pub const PENDING_QUEUE_SIDECAR_SCHEMA_VERSION: u16 = 12;
+// v13 keeps the v12 physical shape but requires the actor-input-bound Realm
+// application semantic codec. An old v12 binary cannot decode new v2
+// semantic payloads, so its VERIFIED receipt must not authorize this runtime.
+pub const PENDING_QUEUE_SIDECAR_SCHEMA_VERSION: u16 = 13;
 pub const PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT: usize = 20;
 const FINGERPRINT_DOMAIN: &[u8] =
-    b"psy/rollback/pending-queue-sidecar-schema/v12";
+    b"psy/rollback/pending-queue-sidecar-schema/v13";
 const INSPECT_COLUMNS_CQL: &str = "SELECT column_name, type, kind, position, clustering_order FROM system_schema.columns WHERE keyspace_name = ? AND table_name = ?";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -456,9 +456,19 @@ pub enum PendingQueueSidecarSchemaInspection {
 }
 
 pub fn pending_queue_sidecar_schema_fingerprint() -> PendingQueueSidecarSchemaFingerprint {
+    sidecar_schema_fingerprint(
+        PENDING_QUEUE_SIDECAR_SCHEMA_VERSION,
+        FINGERPRINT_DOMAIN,
+    )
+}
+
+fn sidecar_schema_fingerprint(
+    schema_version: u16,
+    domain: &[u8],
+) -> PendingQueueSidecarSchemaFingerprint {
     let mut hasher = Sha256::new();
-    hasher.update(FINGERPRINT_DOMAIN);
-    hasher.update(PENDING_QUEUE_SIDECAR_SCHEMA_VERSION.to_be_bytes());
+    hasher.update(domain);
+    hasher.update(schema_version.to_be_bytes());
     for table in PendingQueueSidecarPhysicalTable::ALL {
         hasher.update([table as u8]);
         update_len(&mut hasher, table.table_name().as_bytes());
@@ -472,6 +482,14 @@ pub fn pending_queue_sidecar_schema_fingerprint() -> PendingQueueSidecarSchemaFi
         }
     }
     PendingQueueSidecarSchemaFingerprint(hasher.finalize().into())
+}
+
+#[cfg(test)]
+pub(super) fn historical_v12_schema_fingerprint() -> PendingQueueSidecarSchemaFingerprint {
+    sidecar_schema_fingerprint(
+        12,
+        b"psy/rollback/pending-queue-sidecar-schema/v12",
+    )
 }
 
 pub fn inspect_pending_queue_sidecar_columns(
@@ -640,7 +658,7 @@ mod tests {
 
     #[test]
     fn exact_manifest_is_twenty_unique_tables_with_stable_placement() {
-        assert_eq!(PENDING_QUEUE_SIDECAR_SCHEMA_VERSION, 12);
+        assert_eq!(PENDING_QUEUE_SIDECAR_SCHEMA_VERSION, 13);
         assert_eq!(PendingQueueSidecarPhysicalTable::ALL.len(), 20);
         let names = PendingQueueSidecarPhysicalTable::ALL.iter().map(|table| table.table_name()).collect::<std::collections::BTreeSet<_>>();
         assert_eq!(names.len(), 20);

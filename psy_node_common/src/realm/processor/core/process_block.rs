@@ -18,6 +18,7 @@ use psy_node_core::{
             RealmProcessorApplicationHandoffObservation,
             RealmProcessorDurableCaptureOutcome,
         },
+        realm_processor_deferred_actor_input::RealmProcessorDeferredActorInputOutcome,
         realm_processor_generation_continuation::{
             RealmProcessorGenerationContinuation,
             RealmProcessorGenerationContinuationPhase,
@@ -51,6 +52,7 @@ enum RealmGatheringOutcome<F, Hash, JobId> {
     Legacy(RealmGUTAEndCapGathererOutput<F, Hash, JobId>),
     BranchExactApplicationHandoff(RealmProcessorApplicationHandoffObservation),
     BranchExactGenerationContinuation(RealmProcessorGenerationContinuation),
+    BranchExactAwaitingDeferredCarryover(RealmProcessorGenerationContinuation),
     BranchExactAwaitingClosedSource,
 }
 
@@ -194,6 +196,9 @@ where
                 generation_digest: receipt.generation_digest(),
                 boundary_digest: receipt.boundary_digest(),
                 item_count: receipt.item_count(),
+                input_binding: psy_node_core::queue::realm_processor_semantic_output::RealmProcessorSemanticInputBinding::SuccessorDeferred(
+                    receipt.actor_input_digest(),
+                ),
                 processing_checkpoint_id: self.db.state.processing_checkpoint_id,
                 processing_checkpoint_root: self
                     .db
@@ -247,9 +252,19 @@ where
                     continuation,
                 ));
             }
-            let processing = continuation.processing();
+            let deferred_input = match iteration.prepare_deferred_actor_input().await? {
+                RealmProcessorDeferredActorInputOutcome::AwaitExplicitCarryover {
+                    continuation,
+                } => {
+                    return Ok(RealmGatheringOutcome::BranchExactAwaitingDeferredCarryover(
+                        continuation,
+                    ));
+                }
+                RealmProcessorDeferredActorInputOutcome::Ready(input) => input,
+            };
+            let processing = deferred_input.successor();
             let mut capture = iteration
-                .open_durable_capture_for_processing(processing)
+                .open_durable_capture_for_deferred_input(deferred_input)
                 .await?;
             if let Some(recovered) = capture.recover_application_handoff().await? {
                 return Ok(RealmGatheringOutcome::BranchExactApplicationHandoff(
@@ -272,9 +287,10 @@ where
             let Some(generation) = generation else {
                 return Ok(RealmGatheringOutcome::BranchExactAwaitingClosedSource);
             };
+            let deferred_input = capture.take_deferred_actor_input().await?;
             let receipt = self
                 .guta_queue_gatherer
-                .apply_durable_generation(generation)
+                .apply_durable_generation(generation, deferred_input)
                 .await?;
             let finalized = self
                 .guta_queue_gatherer
@@ -397,6 +413,14 @@ where
                 tracing::info!(
                     "Branch-exact generation is durably classified as {:?}: processing_pending={}, pipeline_revision={}; terminal/rotation/writer/head remain blocked",
                     continuation.phase(),
+                    continuation.processing().pending_id().get(),
+                    continuation.pipeline_revision().get(),
+                );
+                return Ok(());
+            }
+            RealmGatheringOutcome::BranchExactAwaitingDeferredCarryover(continuation) => {
+                tracing::debug!(
+                    "Branch-exact processing generation has no explicit durable carryover: processing_pending={}, pipeline_revision={}; missing is not empty and capture/actor remain unopened",
                     continuation.processing().pending_id().get(),
                     continuation.pipeline_revision().get(),
                 );
@@ -705,11 +729,13 @@ mod h23c4c3b_tests {
             .next()
             .unwrap();
         assert!(function.contains("observe_generation_continuation().await?"));
-        assert!(function.contains("open_durable_capture_for_processing(processing)"));
+        assert!(function.contains("prepare_deferred_actor_input().await?"));
+        assert!(function.contains("open_durable_capture_for_deferred_input(deferred_input)"));
+        assert!(function.contains("take_deferred_actor_input()"));
         assert!(function.contains("recover_application_handoff()"));
         assert!(function.contains("replay_complete_generation()"));
         assert!(function.contains("capture.capture_next()"));
-        assert!(function.contains("apply_durable_generation(generation)"));
+        assert!(function.contains("apply_durable_generation(generation, deferred_input)"));
         assert!(function.contains("finalize_durable_generation(receipt)"));
         assert!(function.contains("build_branch_exact_semantic_output(processing, &finalized)"));
         assert!(function.contains("persist_application_and_handoff(semantic)"));
@@ -847,8 +873,9 @@ mod h23c4c4b1_tests {
             .next()
             .unwrap();
         assert!(gather.contains("observe_generation_continuation().await?"));
-        assert!(gather.contains("let processing = continuation.processing()"));
-        assert!(gather.contains("open_durable_capture_for_processing(processing)"));
+        assert!(gather.contains("prepare_deferred_actor_input().await?"));
+        assert!(gather.contains("let processing = deferred_input.successor()"));
+        assert!(gather.contains("open_durable_capture_for_deferred_input(deferred_input)"));
         assert!(!gather.contains("self.db.state.processing_unique_pending_id"));
         assert!(!gather.contains("self.db.state.processing_proc_checkpoint_unique_id"));
     }

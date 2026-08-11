@@ -31,7 +31,10 @@ use psy_data::{
 use psy_io::tokio::{TokioFileLike, TokioLikeFileSystem};
 use psy_node_core::{
     psy_temp_db::StandardProcessorTempDBStoreBase,
-    queue::recoverable_ephemeral::PendingQueueCaptureContext,
+    queue::{
+        realm_processor_deferred_actor_input::RealmProcessorDeferredActorInput,
+        recoverable_ephemeral::PendingQueueCaptureContext,
+    },
     qblob::{
         data_views::{
             double_merkle_node_batch::QBlobDoubleMerkleNodeBatchDataView, single_merkle_node_batch::QBlobSingleMerkleNodeBatchDataView,
@@ -450,6 +453,39 @@ fn require_empty_branch_exact_future_lineage<T>(jobs: &[T]) -> anyhow::Result<()
     Ok(())
 }
 
+fn decode_deferred_actor_jobs<N: QNetworkTypesConfig>(
+    context: PendingQueueCaptureContext,
+    input: RealmProcessorDeferredActorInput,
+) -> anyhow::Result<Vec<PlannedFutureEndCapJob<N::F, N::QHash>>> {
+    anyhow::ensure!(
+        input.successor() == context.processing(),
+        "deferred actor input successor does not match durable generation"
+    );
+    input
+        .into_deferred_jobs()
+        .into_iter()
+        .enumerate()
+        .map(|(expected, job)| {
+            anyhow::ensure!(
+                job.ordinal() == u32::try_from(expected)?,
+                "deferred actor input ordinal is not canonical"
+            );
+            let queue_item =
+                PsyRealmUserUpdateQueueItem::<N::F, N::QHash>::psy_ser_from_slice(
+                    job.queue_item(),
+                )?;
+            anyhow::ensure!(
+                queue_item.psy_ser_to_bytes_vec()?.as_slice() == job.queue_item(),
+                "deferred actor queue item has trailing or non-canonical bytes"
+            );
+            Ok(PlannedFutureEndCapJob {
+                queue_item,
+                contract_updates: job.contract_updates().to_vec(),
+            })
+        })
+        .collect()
+}
+
 impl<
         N: QNetworkTypesConfig + 'static,
         TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + 'static,
@@ -459,6 +495,7 @@ impl<
     fn bind_complete_generation(
         &self,
         context: PendingQueueCaptureContext,
+        deferred_input: RealmProcessorDeferredActorInput,
     ) -> anyhow::Result<Self> {
         let current = self
             .status
@@ -477,9 +514,10 @@ impl<
             .read()
             .map_err(|_| anyhow::anyhow!("future end-cap job lock is poisoned"))?;
         require_empty_branch_exact_future_lineage(future_pending_end_cap_jobs.as_slice())?;
+        let durable_future_jobs = decode_deferred_actor_jobs::<N>(context, deferred_input)?;
         let mut bound = self.clone();
         bound.status = Arc::new(RwLock::new(exact));
-        bound.future_pending_end_cap_jobs = Arc::new(RwLock::new(Vec::new()));
+        bound.future_pending_end_cap_jobs = Arc::new(RwLock::new(durable_future_jobs));
         Ok(bound)
     }
 }

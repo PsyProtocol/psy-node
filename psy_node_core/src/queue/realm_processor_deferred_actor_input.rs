@@ -415,6 +415,7 @@ mod tests {
                     .unwrap(),
                 boundary_digest: PendingQueueBoundaryDigest::try_new([3; 32]).unwrap(),
                 item_count: 2,
+                input_binding: crate::queue::realm_processor_semantic_output::RealmProcessorSemanticInputBinding::LegacyUnbound,
                 processing_checkpoint_id: 17,
                 processing_checkpoint_root: [4; 32],
                 processing_realm_start_root: [5; 32],

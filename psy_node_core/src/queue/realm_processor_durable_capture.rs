@@ -19,7 +19,9 @@ use super::recoverable_ephemeral::{
     PendingQueueCaptureCandidate, PendingQueueCaptureContext,
     PendingQueueGenerationBoundary,
 };
-use super::realm_processor_deferred_actor_input::RealmProcessorDeferredActorInputOutcome;
+use super::realm_processor_deferred_actor_input::{
+    RealmProcessorDeferredActorInput, RealmProcessorDeferredActorInputOutcome,
+};
 use super::realm_processor_generation_continuation::RealmProcessorGenerationContinuation;
 use super::realm_processor_semantic_output::RealmProcessorSemanticOutput;
 
@@ -235,6 +237,12 @@ impl RealmProcessorApplicationHandoffObservation {
 /// read back a selected batch before consuming their private ACK token.
 #[async_trait]
 pub trait RealmProcessorDurableCapturePort: Send {
+    /// Release the exact input validated at capture-open fresh C. The value
+    /// may be taken once and must be passed intact to the command-only actor.
+    async fn take_deferred_actor_input(
+        &mut self,
+    ) -> Result<RealmProcessorDeferredActorInput, RealmProcessorDurableCaptureError>;
+
     async fn capture_next(
         &mut self,
     ) -> Result<Option<RealmProcessorDurableCaptureOutcome>, RealmProcessorDurableCaptureError>;
@@ -294,7 +302,7 @@ pub trait RealmProcessorDurableCaptureFactory: Send + Sync {
     ) -> Result<RealmProcessorDeferredActorInputOutcome, RealmProcessorDurableCaptureError>;
 
     async fn open(
-        &self,
+        self: std::sync::Arc<Self>,
         request: SealedRealmProcessorDurableCaptureRequest,
     ) -> Result<Box<dyn RealmProcessorDurableCapturePort>, RealmProcessorDurableCaptureError>;
 }
@@ -367,6 +375,7 @@ pub struct SealedRealmProcessorDurableCaptureRequest {
     writer_activation_digest: [u8; 32],
     queue_readiness_digest: [u8; 32],
     context: PendingQueueCaptureContext,
+    deferred_input: RealmProcessorDeferredActorInput,
 }
 
 impl SealedRealmProcessorDurableCaptureRequest {
@@ -377,8 +386,23 @@ impl SealedRealmProcessorDurableCaptureRequest {
         realm_sub_id: u16,
         writer_activation_digest: [u8; 32],
         queue_readiness_digest: [u8; 32],
-        context: PendingQueueCaptureContext,
+        deferred_input: RealmProcessorDeferredActorInput,
     ) -> Result<Self, RealmProcessorDurableCaptureError> {
+        let context = PendingQueueCaptureContext::try_new(
+            crate::store::pending_generation_identity::PendingGenerationLedgerKey::new(
+                network,
+                psy_data::protocol::chain_context::AuthorityScope::Realm {
+                    realm_id,
+                    realm_sub_id,
+                },
+            ),
+            crate::store::pending_generation_identity::PendingGenerationActivationDigest::try_new(
+                writer_activation_digest,
+            )
+            .map_err(|_| RealmProcessorDurableCaptureError::RuntimeCapabilityMismatch)?,
+            deferred_input.successor(),
+        )
+        .map_err(|_| RealmProcessorDurableCaptureError::IdentityMismatch)?;
         if context.key().network() != network
             || context.key().authority()
                 != (psy_data::protocol::chain_context::AuthorityScope::Realm {
@@ -396,6 +420,7 @@ impl SealedRealmProcessorDurableCaptureRequest {
             writer_activation_digest,
             queue_readiness_digest,
             context,
+            deferred_input,
         })
     }
 
@@ -425,6 +450,14 @@ impl SealedRealmProcessorDurableCaptureRequest {
 
     pub const fn context(&self) -> PendingQueueCaptureContext {
         self.context
+    }
+
+    pub const fn deferred_input(&self) -> &RealmProcessorDeferredActorInput {
+        &self.deferred_input
+    }
+
+    pub fn into_deferred_input(self) -> RealmProcessorDeferredActorInput {
+        self.deferred_input
     }
 }
 

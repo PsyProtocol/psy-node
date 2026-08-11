@@ -13,7 +13,6 @@ use std::{marker::PhantomData, sync::Arc};
 
 use async_trait::async_trait;
 use psy_data::protocol::canonical_chain::NetworkId;
-use psy_data::protocol::chain_context::AuthorityScope;
 
 use crate::queue::{
     realm_processor_durable_capture::{
@@ -24,7 +23,9 @@ use crate::queue::{
         SealedRealmProcessorDurableCaptureRequest,
         SealedRealmProcessorGenerationContinuationRequest,
     },
-    realm_processor_deferred_actor_input::RealmProcessorDeferredActorInputOutcome,
+    realm_processor_deferred_actor_input::{
+        RealmProcessorDeferredActorInput, RealmProcessorDeferredActorInputOutcome,
+    },
     realm_processor_generation_continuation::RealmProcessorGenerationContinuation,
     realm_processor_continuation_restart::{
         RealmProcessorContinuationRestartFactory,
@@ -37,16 +38,11 @@ use crate::queue::{
         SealedRealmProcessorTerminalCarryoverRecoveryRequest,
     },
     realm_processor_semantic_output::RealmProcessorSemanticOutput,
-    recoverable_ephemeral::PendingQueueCaptureContext,
 };
 
 use super::realm_processor_startup::{
     RealmProcessorFreshRunPermit, RealmProcessorStartupError,
     RealmProcessorStartupPermitDigest,
-};
-use super::pending_generation_identity::{
-    PendingGenerationActivationDigest, PendingGenerationContext,
-    PendingGenerationLedgerKey,
 };
 use super::realm_processor_quiescence::RealmProcessorIterationPermit;
 
@@ -349,7 +345,7 @@ impl<Hash> RealmBranchExactCommitIteration<'_, Hash> {
     /// is dropped.
     async fn open_durable_capture<'capture>(
         &'capture mut self,
-        context: PendingQueueCaptureContext,
+        deferred_input: RealmProcessorDeferredActorInput,
     ) -> Result<RealmBranchExactDurableCapture<'capture>, RealmProcessorDurableCaptureError> {
         let runtime = self.owner.runtime();
         let factory = Arc::clone(self.owner.installed.capture_factory());
@@ -360,7 +356,7 @@ impl<Hash> RealmBranchExactCommitIteration<'_, Hash> {
             runtime.realm_sub_id(),
             runtime.writer_activation_digest(),
             runtime.queue_readiness_digest(),
-            context,
+            deferred_input,
         )?;
         let port = factory.open(request).await?;
         Ok(RealmBranchExactDurableCapture {
@@ -369,31 +365,14 @@ impl<Hash> RealmBranchExactCommitIteration<'_, Hash> {
         })
     }
 
-    /// Production-shaped capture entry.  The Processor supplies only its
-    /// exact durable processing pending/proc context; network, Realm scope and
-    /// activation are derived from the installed runtime and cannot be mixed
-    /// from caller-provided values.
-    pub async fn open_durable_capture_for_processing<'capture>(
+    /// Production-shaped capture entry. The Processor moves the exact
+    /// storage-loaded input into this sealed boundary; processing identity is
+    /// derived from the input and cannot be supplied independently.
+    pub async fn open_durable_capture_for_deferred_input<'capture>(
         &'capture mut self,
-        processing: PendingGenerationContext,
+        deferred_input: RealmProcessorDeferredActorInput,
     ) -> Result<RealmBranchExactDurableCapture<'capture>, RealmProcessorDurableCaptureError> {
-        let runtime = self.owner.runtime();
-        let context = PendingQueueCaptureContext::try_new(
-            PendingGenerationLedgerKey::new(
-                runtime.network(),
-                AuthorityScope::Realm {
-                    realm_id: runtime.realm_id(),
-                    realm_sub_id: runtime.realm_sub_id(),
-                },
-            ),
-            PendingGenerationActivationDigest::try_new(
-                runtime.writer_activation_digest(),
-            )
-            .map_err(|_| RealmProcessorDurableCaptureError::RuntimeCapabilityMismatch)?,
-            processing,
-        )
-        .map_err(|_| RealmProcessorDurableCaptureError::IdentityMismatch)?;
-        self.open_durable_capture(context).await
+        self.open_durable_capture(deferred_input).await
     }
 }
 
@@ -436,6 +415,12 @@ impl RealmBranchExactTerminalCarryoverRecovery<'_> {
 }
 
 impl RealmBranchExactDurableCapture<'_> {
+    pub async fn take_deferred_actor_input(
+        &mut self,
+    ) -> Result<RealmProcessorDeferredActorInput, RealmProcessorDurableCaptureError> {
+        self.port.take_deferred_actor_input().await
+    }
+
     pub async fn capture_next(
         &mut self,
     ) -> Result<Option<RealmProcessorDurableCaptureOutcome>, RealmProcessorDurableCaptureError> {
@@ -616,7 +601,9 @@ mod tests {
         })
     }
 
-    struct CapturePort;
+    struct CapturePort {
+        deferred_input: Option<RealmProcessorDeferredActorInput>,
+    }
 
     struct RestartPort {
         preparation: RealmProcessorReadOnlyRestartPreparation,
@@ -648,6 +635,14 @@ mod tests {
 
     #[async_trait]
     impl RealmProcessorDurableCapturePort for CapturePort {
+        async fn take_deferred_actor_input(
+            &mut self,
+        ) -> Result<RealmProcessorDeferredActorInput, RealmProcessorDurableCaptureError> {
+            self.deferred_input
+                .take()
+                .ok_or(RealmProcessorDurableCaptureError::IdentityMismatch)
+        }
+
         async fn capture_next(
             &mut self,
         ) -> Result<Option<RealmProcessorDurableCaptureOutcome>, RealmProcessorDurableCaptureError>
@@ -739,13 +734,39 @@ mod tests {
             &self,
             request: SealedRealmProcessorGenerationContinuationRequest,
         ) -> Result<RealmProcessorDeferredActorInputOutcome, RealmProcessorDurableCaptureError> {
-            Ok(RealmProcessorDeferredActorInputOutcome::AwaitExplicitCarryover {
-                continuation: self.observe_generation_continuation(request).await?,
-            })
+            let continuation = self.observe_generation_continuation(request).await?;
+            let successor = continuation.processing();
+            let reason = crate::store::pending_generation_identity::PendingGenerationBootstrapReason::LegacyActivation;
+            let key = crate::store::pending_generation_identity::PendingGenerationLedgerKey::new(
+                self.network,
+                AuthorityScope::Realm {
+                    realm_id: self.realm_id,
+                    realm_sub_id: self.realm_sub_id,
+                },
+            );
+            let activation = crate::store::pending_generation_identity::PendingGenerationActivationDigest::try_new(
+                self.activation,
+            )
+            .map_err(|_| RealmProcessorDurableCaptureError::IdentityMismatch)?;
+            let carryover = crate::queue::realm_processor_generation_terminal::RealmProcessorDeferredCarryover::try_bootstrap_empty(
+                key,
+                activation,
+                successor,
+                reason,
+            )
+            .map_err(|_| RealmProcessorDurableCaptureError::IdentityMismatch)?;
+            let input = RealmProcessorDeferredActorInput::try_from_storage(
+                successor,
+                reason,
+                carryover,
+                None,
+            )
+            .map_err(|_| RealmProcessorDurableCaptureError::IdentityMismatch)?;
+            Ok(RealmProcessorDeferredActorInputOutcome::Ready(input))
         }
 
         async fn open(
-            &self,
+            self: Arc<Self>,
             request: SealedRealmProcessorDurableCaptureRequest,
         ) -> Result<Box<dyn RealmProcessorDurableCapturePort>, RealmProcessorDurableCaptureError>
         {
@@ -764,7 +785,9 @@ mod tests {
             {
                 return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
             }
-            Ok(Box::new(CapturePort))
+            Ok(Box::new(CapturePort {
+                deferred_input: Some(request.into_deferred_input()),
+            }))
         }
     }
 
@@ -1071,17 +1094,22 @@ mod tests {
             assert_eq!(attempt.realm_sub_id(), 3);
             let continuation = attempt.observe_generation_continuation().await.unwrap();
             assert_eq!(continuation.processing().pending_id().get(), 17);
-            let input = attempt.prepare_deferred_actor_input().await.unwrap();
-            assert!(matches!(
-                input,
-                RealmProcessorDeferredActorInputOutcome::AwaitExplicitCarryover { .. }
-            ));
+            let input = match attempt.prepare_deferred_actor_input().await.unwrap() {
+                RealmProcessorDeferredActorInputOutcome::Ready(input) => input,
+                RealmProcessorDeferredActorInputOutcome::AwaitExplicitCarryover { .. } => {
+                    panic!("fixture must provide explicit bootstrap carryover")
+                }
+            };
+            let expected_input_digest = input.digest();
             let mut capture = attempt
-                .open_durable_capture_for_processing(
-                    PendingGenerationContext::try_from_legacy(17, 19).unwrap(),
-                )
+                .open_durable_capture_for_deferred_input(input)
                 .await
                 .unwrap();
+            assert_eq!(
+                capture.take_deferred_actor_input().await.unwrap().digest(),
+                expected_input_digest
+            );
+            assert!(capture.take_deferred_actor_input().await.is_err());
             assert!(capture.capture_next().await.unwrap().is_none());
             assert!(controlled.snapshot().active_iteration());
         }
@@ -1156,7 +1184,7 @@ mod tests {
             .nth(1)
             .unwrap();
         assert_eq!(attempt.matches("pub async fn open_durable_capture").count(), 1);
-        assert!(attempt.contains("open_durable_capture_for_processing"));
+        assert!(attempt.contains("open_durable_capture_for_deferred_input"));
         for forbidden in [
             "prepare_and_verify",
             "finish_published",

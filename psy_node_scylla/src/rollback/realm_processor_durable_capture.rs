@@ -1055,7 +1055,7 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
     }
 
     async fn open_exact(
-        &self,
+        self: &Arc<Self>,
         request: SealedRealmProcessorDurableCaptureRequest,
     ) -> Result<ScyllaRealmProcessorDurableCapture<Hash>, RealmProcessorDurableCaptureError> {
         let AuthorityScope::Realm {
@@ -1140,20 +1140,41 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
                 || handoff.archive_digest() != second.archive_digest()
                 || handoff.semantic_digest() != second.semantic_digest()
                 || handoff.pipeline_revision() != second.pipeline_revision()
+                || archive.semantic().actor_input_digest()
+                    != Some(request.deferred_input().digest())
             {
                 return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
             }
+            let deferred_input_digest = request.deferred_input().digest();
+            let deferred_input = request.into_deferred_input();
             return Ok(ScyllaRealmProcessorDurableCapture {
+                factory: Arc::clone(self),
                 pipeline: self.pipeline.clone(),
                 transport_archive: self.transport_archive.clone(),
                 application_archive: self.application_archive.clone(),
                 context,
+                deferred_pipeline: pipeline,
+                deferred_input: Some(deferred_input),
+                deferred_input_digest,
                 mode: ScyllaRealmProcessorCaptureMode::Recovered(handoff),
                 _hash: PhantomData,
             });
         }
         if !matches!(pipeline.processing_state(), PendingProcessingState::Sealing(_)) {
             return Err(RealmProcessorDurableCaptureError::ApplicationHandoffNotSealing);
+        }
+        // Fresh C: repeat the complete successor carryover/terminal/archive
+        // snapshot before any consumer provisioning, owner claim, NATS or
+        // actor side effect. Compare both the full typed input and the exact
+        // pipeline row selected by A/B.
+        let fresh = self.observe_deferred_actor_input_snapshot().await?;
+        let RealmProcessorDeferredActorInputOutcome::Ready(fresh_input) = fresh.outcome else {
+            return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+        };
+        if fresh_input != *request.deferred_input()
+            || !same_pipeline_snapshot(&pipeline, &fresh.pipeline)
+        {
+            return Err(RealmProcessorDurableCaptureError::ConcurrentMutation);
         }
         let close = self
             .pipeline
@@ -1259,11 +1280,17 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
             )
             .map_err(backend)?,
         );
+        let deferred_input_digest = request.deferred_input().digest();
+        let deferred_input = request.into_deferred_input();
         Ok(ScyllaRealmProcessorDurableCapture {
+            factory: Arc::clone(self),
             pipeline: self.pipeline.clone(),
             transport_archive: self.transport_archive.clone(),
             application_archive: self.application_archive.clone(),
             context,
+            deferred_pipeline: fresh.pipeline,
+            deferred_input: Some(deferred_input),
+            deferred_input_digest,
             mode: ScyllaRealmProcessorCaptureMode::Active {
                 source,
                 close,
@@ -1334,7 +1361,7 @@ where
     }
 
     async fn open(
-        &self,
+        self: Arc<Self>,
         request: SealedRealmProcessorDurableCaptureRequest,
     ) -> Result<Box<dyn RealmProcessorDurableCapturePort>, RealmProcessorDurableCaptureError> {
         Ok(Box::new(self.open_exact(request).await?))
@@ -1589,10 +1616,15 @@ fn same_pipeline_snapshot<Hash: Q256BitHash>(
 }
 
 struct ScyllaRealmProcessorDurableCapture<Hash> {
+    factory: Arc<ScyllaRealmProcessorDurableCaptureFactory<Hash>>,
     pipeline: Arc<ScyllaPendingPipelineStore>,
     transport_archive: Arc<ScyllaPendingQueueSemanticAggregateStore>,
     application_archive: Arc<ScyllaRealmProcessorApplicationArchiveStore>,
     context: psy_node_core::queue::recoverable_ephemeral::PendingQueueCaptureContext,
+    deferred_pipeline: StoredPendingPipeline<Hash>,
+    deferred_input: Option<RealmProcessorDeferredActorInput>,
+    deferred_input_digest:
+        psy_node_core::queue::realm_processor_deferred_actor_input::RealmProcessorDeferredActorInputDigest,
     mode: ScyllaRealmProcessorCaptureMode,
     _hash: PhantomData<Hash>,
 }
@@ -1607,12 +1639,59 @@ enum ScyllaRealmProcessorCaptureMode {
     Recovered(PersistedRealmProcessorApplicationHandoffReceipt),
 }
 
+impl<Hash> ScyllaRealmProcessorDurableCapture<Hash>
+where
+    Hash: Q256BitHash + Send + Sync + 'static,
+{
+    async fn revalidate_deferred_actor_input(
+        &self,
+    ) -> Result<(), RealmProcessorDurableCaptureError> {
+        let fresh = self
+            .factory
+            .observe_deferred_actor_input_snapshot()
+            .await?;
+        let RealmProcessorDeferredActorInputOutcome::Ready(input) = fresh.outcome else {
+            return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+        };
+        if self
+            .deferred_input
+            .as_ref()
+            .is_some_and(|expected| expected != &input)
+            || input.successor() != self.context.processing()
+            || input.digest() != self.deferred_input_digest
+            || !same_pipeline_snapshot(&fresh.pipeline, &self.deferred_pipeline)
+            || fresh.pipeline.key() != self.context.key()
+            || fresh.pipeline.activation_digest() != self.context.activation()
+            || fresh.pipeline.processing() != self.context.processing()
+        {
+            return Err(RealmProcessorDurableCaptureError::ConcurrentMutation);
+        }
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl<Hash> RealmProcessorDurableCapturePort
     for ScyllaRealmProcessorDurableCapture<Hash>
 where
     Hash: Q256BitHash + Send + Sync + 'static,
 {
+    async fn take_deferred_actor_input(
+        &mut self,
+    ) -> Result<RealmProcessorDeferredActorInput, RealmProcessorDurableCaptureError> {
+        let ScyllaRealmProcessorCaptureMode::Active { .. } = &self.mode else {
+            return Err(RealmProcessorDurableCaptureError::ApplicationHandoffNotSealing);
+        };
+        // Capture/replay may wait on the durable source after open-time fresh C.
+        // Re-select the complete typed lineage immediately before handing it to
+        // the command-only actor.  While the input is still owned here we can
+        // compare the full value, not only its digest.
+        self.revalidate_deferred_actor_input().await?;
+        self.deferred_input
+            .take()
+            .ok_or(RealmProcessorDurableCaptureError::IdentityMismatch)
+    }
+
     async fn capture_next(
         &mut self,
     ) -> Result<Option<RealmProcessorDurableCaptureOutcome>, RealmProcessorDurableCaptureError> {
@@ -1675,6 +1754,12 @@ where
         semantic: RealmProcessorSemanticOutput,
     ) -> Result<RealmProcessorApplicationHandoffObservation, RealmProcessorDurableCaptureError>
     {
+        if self.deferred_input.is_some()
+            || semantic.actor_input_digest() != Some(self.deferred_input_digest)
+        {
+            return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+        }
+        self.revalidate_deferred_actor_input().await?;
         let handoff = {
             let ScyllaRealmProcessorCaptureMode::Active {
                 source,
@@ -1710,6 +1795,11 @@ where
                 .persist_and_readback(&plan)
                 .await
                 .map_err(backend)?;
+
+            // The immutable archive now commits the actor-input digest through
+            // semantic v2. Re-select the successor lineage once more while the
+            // pipeline is still the exact Sealing predecessor.
+            self.revalidate_deferred_actor_input().await?;
 
             // Fresh B: re-read the closed source, NATS retained set,
             // assignment route, transport aggregate and close fence after the
@@ -2597,7 +2687,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_actor_input_loader_is_storage_selected_and_double_read() {
+    fn deferred_actor_input_is_storage_selected_revalidated_and_processor_ordered() {
         let source = include_str!("realm_processor_durable_capture.rs");
         let snapshot = source
             .split("async fn observe_deferred_actor_input_snapshot")
@@ -2655,9 +2745,76 @@ mod tests {
         );
         assert!(prepare.contains("same_pipeline_snapshot"));
 
+        let open = source
+            .split("async fn open_exact")
+            .nth(1)
+            .unwrap()
+            .split("impl<Hash> RealmProcessorDurableCaptureFactory")
+            .next()
+            .unwrap();
+        let fresh_c = open.find("observe_deferred_actor_input_snapshot").unwrap();
+        for side_effect in [
+            "resolve_assignment_route",
+            "bootstrap_open",
+            "provision_capture_consumer",
+            "claim_owner",
+        ] {
+            assert!(
+                fresh_c < open.find(side_effect).unwrap(),
+                "fresh C must precede {side_effect}"
+            );
+        }
+
+        let capture = source
+            .split("impl<Hash> RealmProcessorDurableCapturePort")
+            .nth(1)
+            .unwrap();
+        let revalidate = source
+            .split("async fn revalidate_deferred_actor_input")
+            .nth(1)
+            .unwrap()
+            .split("impl<Hash> RealmProcessorDurableCapturePort")
+            .next()
+            .unwrap();
+        assert!(revalidate.contains("deferred_pipeline"));
+        assert!(revalidate.contains("same_pipeline_snapshot"));
+        let take = capture
+            .split("async fn take_deferred_actor_input")
+            .nth(1)
+            .unwrap()
+            .split("async fn capture_next")
+            .next()
+            .unwrap();
+        assert!(take.contains("revalidate_deferred_actor_input().await"));
+        assert!(take.find("revalidate_deferred_actor_input").unwrap()
+            < take.find(".take()").unwrap());
+
         let process = include_str!(
             "../../../psy_node_common/src/realm/processor/core/process_block.rs"
         );
-        assert!(!process.contains("prepare_deferred_actor_input"));
+        let process = process
+            .split("async fn get_results_from_gatherers")
+            .nth(1)
+            .unwrap()
+            .split("pub async fn sync_and_verify")
+            .next()
+            .unwrap();
+        let prepare = process.find("prepare_deferred_actor_input").unwrap();
+        let open = process
+            .find("open_durable_capture_for_deferred_input")
+            .unwrap();
+        let replay = process.find("replay_complete_generation").unwrap();
+        let take = process.find("take_deferred_actor_input").unwrap();
+        let apply = process.find("apply_durable_generation").unwrap();
+        let finalize = process.find("finalize_durable_generation").unwrap();
+        let semantic = process.find("build_branch_exact_semantic_output").unwrap();
+        let archive = process.find("persist_application_and_handoff").unwrap();
+        assert!(prepare < open);
+        assert!(open < replay);
+        assert!(replay < take);
+        assert!(take < apply);
+        assert!(apply < finalize);
+        assert!(finalize < semantic);
+        assert!(semantic < archive);
     }
 }
