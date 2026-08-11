@@ -21,3 +21,4 @@ pub mod realm_processor_continuation_restart;
 pub mod realm_processor_generation_terminal;
 pub mod realm_processor_deferred_actor_input;
 pub mod realm_processor_external_dependency_input;
+pub mod realm_processor_terminal_authorization;
