@@ -54,6 +54,10 @@ use psy_node_core::queue::{
         RealmProcessorDurableCaptureFactory,
         RealmProcessorExternalDependencyLoader,
     },
+    realm_processor_narrow_writer::{
+        RealmProcessorNarrowWriterError, RealmProcessorNarrowWriterFactory,
+        RealmProcessorNarrowWriterObservation, SealedRealmProcessorNarrowWriterRequest,
+    },
     realm_user_update_publish::GlobalUserTreeHeight,
 };
 use psy_node_nats::queue::NatsJetStreamClient;
@@ -736,6 +740,53 @@ where
 }
 
 #[async_trait]
+impl<Hash> RealmProcessorNarrowWriterFactory<Hash>
+    for ScyllaRealmProcessorStartupPreflightProvider<Hash>
+where
+    Hash: Q256BitHash + Send + Sync + 'static,
+{
+    fn network(&self) -> NetworkId {
+        self.network
+    }
+
+    fn realm_id(&self) -> u32 {
+        match self.authority {
+            AuthorityScope::Realm { realm_id, .. } => realm_id,
+            AuthorityScope::Coordinator => unreachable!("Realm-only provider"),
+        }
+    }
+
+    fn realm_sub_id(&self) -> u16 {
+        match self.authority {
+            AuthorityScope::Realm { realm_sub_id, .. } => realm_sub_id,
+            AuthorityScope::Coordinator => unreachable!("Realm-only provider"),
+        }
+    }
+
+    fn writer_activation_digest(&self) -> [u8; 32] {
+        *self.writer_runtime.activation_digest().as_bytes()
+    }
+
+    fn queue_readiness_digest(&self) -> [u8; 32] {
+        *self.queue_setup_ready.ready_digest()
+    }
+
+    async fn prepare_and_verify(
+        &self,
+        request: SealedRealmProcessorNarrowWriterRequest<Hash>,
+    ) -> Result<RealmProcessorNarrowWriterObservation, RealmProcessorNarrowWriterError> {
+        let factory = self.capture_factory.as_ref().ok_or_else(|| {
+            RealmProcessorNarrowWriterError::Backend(
+                "Realm Processor durable capture factory is missing".to_owned(),
+            )
+        })?;
+        factory
+            .prepare_narrow_writer(&self.writer_runtime, request)
+            .await
+    }
+}
+
+#[async_trait]
 impl<Hash> RealmBranchExactCommitRuntimeInstaller<Hash>
     for ScyllaRealmProcessorStartupPreflightProvider<Hash>
 where
@@ -764,6 +815,8 @@ where
         let terminal_carryover_recovery_factory: Arc<
             dyn RealmProcessorTerminalCarryoverRecoveryFactory<Hash>,
         > = concrete_factory;
+        let narrow_writer_factory: Arc<dyn RealmProcessorNarrowWriterFactory<Hash>> =
+            self.clone();
         let runtime: Arc<dyn RealmBranchExactCommitRuntime<Hash>> = self;
         InstalledRealmBranchExactCommitRuntime::seal(
             startup_permit,
@@ -771,6 +824,7 @@ where
             capture_factory,
             restart_factory,
             terminal_carryover_recovery_factory,
+            narrow_writer_factory,
         )
     }
 }
@@ -1472,6 +1526,10 @@ mod tests {
             .find("InstalledRealmBranchExactCommitRuntime::seal")
             .expect("only an exactly matched permit may be consumed");
         assert!(fresh_read < exact_match && exact_match < seal);
+        assert!(installer.contains(
+            "let narrow_writer_factory: Arc<dyn RealmProcessorNarrowWriterFactory<Hash>>"
+        ));
+        assert!(installer.contains("narrow_writer_factory,"));
 
         for forbidden in [
             "compare_and_set",

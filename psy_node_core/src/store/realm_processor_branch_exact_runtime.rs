@@ -12,7 +12,11 @@
 use std::{marker::PhantomData, sync::Arc};
 
 use async_trait::async_trait;
-use psy_data::protocol::canonical_chain::NetworkId;
+use parth_core::{
+    crypto::hash::tag_tree::TagTreeMerkleProof,
+    protocol::core_types::Q256BitHash,
+};
+use psy_data::protocol::canonical_chain::{CanonicalChainRef, NetworkId};
 
 use crate::queue::{
     realm_processor_durable_capture::{
@@ -28,6 +32,11 @@ use crate::queue::{
     },
     realm_processor_external_dependency_input::RealmProcessorQualifiedExternalActorInput,
     realm_processor_generation_continuation::RealmProcessorGenerationContinuation,
+    realm_processor_generation_continuation::RealmProcessorApplicationContinuation,
+    realm_processor_narrow_writer::{
+        RealmProcessorNarrowWriterError, RealmProcessorNarrowWriterFactory,
+        RealmProcessorNarrowWriterObservation, SealedRealmProcessorNarrowWriterRequest,
+    },
     realm_processor_continuation_restart::{
         RealmProcessorContinuationRestartFactory,
         RealmProcessorContinuationRestartPort,
@@ -46,6 +55,7 @@ use super::realm_processor_startup::{
     RealmProcessorStartupPermitDigest,
 };
 use super::realm_processor_quiescence::RealmProcessorIterationPermit;
+use super::authority_commit::AuthorityClockSampleUs;
 
 /// Exact, deliberately narrow scope of the runtime being installed.  It does
 /// not claim full 22-domain normal-commit coverage.
@@ -77,6 +87,7 @@ pub struct InstalledRealmBranchExactCommitRuntime<Hash> {
     restart_factory: Arc<dyn RealmProcessorContinuationRestartFactory<Hash>>,
     terminal_carryover_recovery_factory:
         Arc<dyn RealmProcessorTerminalCarryoverRecoveryFactory<Hash>>,
+    narrow_writer_factory: Arc<dyn RealmProcessorNarrowWriterFactory<Hash>>,
 }
 
 impl<Hash> InstalledRealmBranchExactCommitRuntime<Hash> {
@@ -90,6 +101,7 @@ impl<Hash> InstalledRealmBranchExactCommitRuntime<Hash> {
         terminal_carryover_recovery_factory: Arc<
             dyn RealmProcessorTerminalCarryoverRecoveryFactory<Hash>,
         >,
+        narrow_writer_factory: Arc<dyn RealmProcessorNarrowWriterFactory<Hash>>,
     ) -> Result<Self, RealmProcessorStartupError> {
         let expectation = startup_permit.expectation();
         if runtime.network() != expectation.network()
@@ -120,6 +132,13 @@ impl<Hash> InstalledRealmBranchExactCommitRuntime<Hash> {
                 != runtime.writer_activation_digest()
             || terminal_carryover_recovery_factory.queue_readiness_digest()
                 != runtime.queue_readiness_digest()
+            || narrow_writer_factory.network() != runtime.network()
+            || narrow_writer_factory.realm_id() != runtime.realm_id()
+            || narrow_writer_factory.realm_sub_id() != runtime.realm_sub_id()
+            || narrow_writer_factory.writer_activation_digest()
+                != runtime.writer_activation_digest()
+            || narrow_writer_factory.queue_readiness_digest()
+                != runtime.queue_readiness_digest()
         {
             return Err(RealmProcessorStartupError::CommitRuntimeIdentityMismatch);
         }
@@ -129,6 +148,7 @@ impl<Hash> InstalledRealmBranchExactCommitRuntime<Hash> {
             capture_factory,
             restart_factory,
             terminal_carryover_recovery_factory,
+            narrow_writer_factory,
         })
     }
 
@@ -154,6 +174,10 @@ impl<Hash> InstalledRealmBranchExactCommitRuntime<Hash> {
         &self,
     ) -> &Arc<dyn RealmProcessorTerminalCarryoverRecoveryFactory<Hash>> {
         &self.terminal_carryover_recovery_factory
+    }
+
+    fn narrow_writer_factory(&self) -> &Arc<dyn RealmProcessorNarrowWriterFactory<Hash>> {
+        &self.narrow_writer_factory
     }
 }
 
@@ -236,6 +260,38 @@ impl<Hash> RealmBranchExactCommitIteration<'_, Hash> {
 
     pub const fn startup_permit_digest(&self) -> RealmProcessorStartupPermitDigest {
         self.owner.startup_permit_digest()
+    }
+
+    /// Verifies the existing eight-leg Realm mapping/reward-proof writer and
+    /// advances only the first application candidate from `WorkCaptured` to
+    /// `InFlight`. Pending/proc identity is selected from durable storage;
+    /// this operation cannot publish the authority head, terminalize, or
+    /// rotate a generation.
+    pub async fn prepare_mapping_and_reward_proof(
+        &mut self,
+        application: RealmProcessorApplicationContinuation,
+        candidate: CanonicalChainRef<Hash>,
+        reward_proof: TagTreeMerkleProof<Hash>,
+        clock_sample: AuthorityClockSampleUs,
+    ) -> Result<RealmProcessorNarrowWriterObservation, RealmProcessorNarrowWriterError>
+    where
+        Hash: Q256BitHash + 'static,
+    {
+        let runtime = self.owner.runtime();
+        let factory = Arc::clone(self.owner.installed.narrow_writer_factory());
+        let request = SealedRealmProcessorNarrowWriterRequest::seal(
+            self.owner.startup_permit_digest(),
+            runtime.network(),
+            runtime.realm_id(),
+            runtime.realm_sub_id(),
+            runtime.writer_activation_digest(),
+            runtime.queue_readiness_digest(),
+            application,
+            candidate,
+            reward_proof,
+            clock_sample,
+        )?;
+        factory.prepare_and_verify(request).await
     }
 
     /// Freshly observes the storage-selected processing generation. This is
@@ -920,6 +976,46 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl RealmProcessorNarrowWriterFactory<PHash> for CaptureFactory {
+        fn network(&self) -> NetworkId {
+            self.network
+        }
+
+        fn realm_id(&self) -> u32 {
+            self.realm_id
+        }
+
+        fn realm_sub_id(&self) -> u16 {
+            self.realm_sub_id
+        }
+
+        fn writer_activation_digest(&self) -> [u8; 32] {
+            self.activation
+        }
+
+        fn queue_readiness_digest(&self) -> [u8; 32] {
+            [6; 32]
+        }
+
+        async fn prepare_and_verify(
+            &self,
+            request: SealedRealmProcessorNarrowWriterRequest<PHash>,
+        ) -> Result<RealmProcessorNarrowWriterObservation, RealmProcessorNarrowWriterError> {
+            if request.network() != self.network
+                || request.realm_id() != self.realm_id
+                || request.realm_sub_id() != self.realm_sub_id
+                || request.writer_activation_digest() != &self.activation
+                || request.queue_readiness_digest() != &[6; 32]
+            {
+                return Err(RealmProcessorNarrowWriterError::IdentityMismatch);
+            }
+            Err(RealmProcessorNarrowWriterError::Backend(
+                "writer fixture is installation-only".to_owned(),
+            ))
+        }
+    }
+
     fn capture_factory(
         network: NetworkId,
         realm_id: u32,
@@ -962,6 +1058,20 @@ mod tests {
         })
     }
 
+    fn narrow_writer_factory(
+        network: NetworkId,
+        realm_id: u32,
+        realm_sub_id: u16,
+        activation: [u8; 32],
+    ) -> Arc<dyn RealmProcessorNarrowWriterFactory<PHash>> {
+        Arc::new(CaptureFactory {
+            network,
+            realm_id,
+            realm_sub_id,
+            activation,
+        })
+    }
+
     #[tokio::test]
     async fn exact_runtime_consumes_permit_into_nonclone_capability() {
         let permit = permit().await;
@@ -973,6 +1083,7 @@ mod tests {
             capture_factory(network(), 7, 3, [2; 32]),
             restart_factory(network(), 7, 3, [2; 32]),
             terminal_carryover_recovery_factory(network(), 7, 3, [2; 32]),
+            narrow_writer_factory(network(), 7, 3, [2; 32]),
         )
         .unwrap();
         assert_eq!(installed.startup_permit_digest(), expected_digest);
@@ -1014,6 +1125,7 @@ mod tests {
                 capture_factory(network(), 7, 3, [2; 32]),
                 restart_factory(network(), 7, 3, [2; 32]),
                 terminal_carryover_recovery_factory(network(), 7, 3, [2; 32]),
+                narrow_writer_factory(network(), 7, 3, [2; 32]),
             );
             let Err(error) = result else {
                 panic!("mismatched runtime must not install")
@@ -1036,6 +1148,7 @@ mod tests {
             capture_factory(network(), 7, 3, [9; 32]),
             restart_factory(network(), 7, 3, [2; 32]),
             terminal_carryover_recovery_factory(network(), 7, 3, [2; 32]),
+            narrow_writer_factory(network(), 7, 3, [2; 32]),
         );
         assert!(matches!(
             result,
@@ -1054,6 +1167,7 @@ mod tests {
             capture_factory(network(), 7, 3, [2; 32]),
             restart_factory(network(), 7, 4, [2; 32]),
             terminal_carryover_recovery_factory(network(), 7, 3, [2; 32]),
+            narrow_writer_factory(network(), 7, 3, [2; 32]),
         );
         assert!(matches!(
             result,
@@ -1072,6 +1186,26 @@ mod tests {
             capture_factory(network(), 7, 3, [2; 32]),
             restart_factory(network(), 7, 3, [2; 32]),
             terminal_carryover_recovery_factory(network(), 7, 4, [2; 32]),
+            narrow_writer_factory(network(), 7, 3, [2; 32]),
+        );
+        assert!(matches!(
+            result,
+            Err(RealmProcessorStartupError::CommitRuntimeIdentityMismatch)
+        ));
+
+        let result = InstalledRealmBranchExactCommitRuntime::seal(
+            permit().await,
+            runtime(
+                network(),
+                7,
+                3,
+                [2; 32],
+                Arc::new(AtomicUsize::new(0)),
+            ),
+            capture_factory(network(), 7, 3, [2; 32]),
+            restart_factory(network(), 7, 3, [2; 32]),
+            terminal_carryover_recovery_factory(network(), 7, 3, [2; 32]),
+            narrow_writer_factory(network(), 8, 3, [2; 32]),
         );
         assert!(matches!(
             result,
@@ -1093,6 +1227,7 @@ mod tests {
             capture_factory(network(), 7, 3, [2; 32]),
             restart_factory(network(), 7, 3, [2; 32]),
             terminal_carryover_recovery_factory(network(), 7, 3, [2; 32]),
+            narrow_writer_factory(network(), 7, 3, [2; 32]),
         )
         .unwrap();
         let mut owner = RealmBranchExactSingleCommitOwner::from_installed(installed);
@@ -1183,7 +1318,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_and_attempt_are_nonclone_and_expose_only_affine_capture() {
+    fn owner_and_attempt_are_nonclone_and_expose_only_affine_ports() {
         let source = include_str!("realm_processor_branch_exact_runtime.rs");
         let production = source.split("#[cfg(test)]").next().unwrap();
         for declaration in [
@@ -1204,14 +1339,17 @@ mod tests {
             .unwrap();
         assert_eq!(attempt.matches("pub async fn open_durable_capture").count(), 1);
         assert!(attempt.contains("open_durable_capture_for_deferred_input"));
+        assert!(attempt.contains("prepare_mapping_and_reward_proof"));
+        assert!(attempt.contains("narrow_writer_factory"));
         for forbidden in [
-            "prepare_and_verify",
             "finish_published",
             "publish_marker",
-            "queue_close",
             "ack_token",
-            "CanonicalChainRef",
             "Session",
+            "seal_branch_exact_publish",
+            "seal_branch_exact_no_work",
+            "seal_rotation",
+            "authority_head",
         ] {
             assert!(!attempt.contains(forbidden));
         }

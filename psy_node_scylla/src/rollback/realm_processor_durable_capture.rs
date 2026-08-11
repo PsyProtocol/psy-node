@@ -59,6 +59,10 @@ use psy_node_core::{
             RealmProcessorDeferredCarryoverSource,
             RealmProcessorGenerationTerminalKind,
         },
+        realm_processor_narrow_writer::{
+            RealmProcessorNarrowWriterError, RealmProcessorNarrowWriterObservation,
+            SealedRealmProcessorNarrowWriterRequest,
+        },
         recoverable_artifact::{
             PendingQueueArtifactOwnerAttemptId,
             PendingQueueArtifactOwnerReasonDigest,
@@ -71,12 +75,15 @@ use psy_node_core::{
         },
     },
     store::pending_generation_pipeline::{
-        PendingPipelineReadState, PendingProcessingState, StoredPendingPipeline,
+        PendingPipelineReadState, PendingPipelineWriteOutcome,
+        PendingProcessingState, StoredPendingPipeline,
     },
     store::pending_generation_identity::{
         PendingGenerationActivationDigest, PendingGenerationContext,
         PendingGenerationLedgerKey,
     },
+    store::branch_exact_dual_write::BranchExactDualWriteIntent,
+    store::branch_pending_mapping::BranchPendingMapping,
 };
 use psy_node_nats::{
     queue::NatsJetStreamClient,
@@ -144,10 +151,12 @@ async fn qualification_pause_after_snapshot_a_if_armed() {
 }
 
 use super::{
+    BranchExactWriterState, ScyllaBranchExactWriterRuntime,
     PendingQueueArtifactStoreError, PendingQueueSidecarReady,
     ScyllaPendingPipelineStore, ScyllaPendingQueueArtifactStore,
     ScyllaPendingQueueSegmentLedgerStore,
 };
+use super::branch_exact_pending_orchestration::seal_branch_exact_begin;
 use super::pending_queue_consumer_gate::{
     PendingQueueConsumerGateError, PendingQueueConsumerGateIdentity,
     ScyllaPendingQueueConsumerGateStore,
@@ -446,6 +455,131 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
             continuation,
             pipeline: second_pipeline,
         })
+    }
+
+    pub(super) async fn prepare_narrow_writer(
+        &self,
+        writer: &ScyllaBranchExactWriterRuntime<Hash>,
+        request: SealedRealmProcessorNarrowWriterRequest<Hash>,
+    ) -> Result<RealmProcessorNarrowWriterObservation, RealmProcessorNarrowWriterError> {
+        let AuthorityScope::Realm {
+            realm_id,
+            realm_sub_id,
+        } = self.authority
+        else {
+            return Err(RealmProcessorNarrowWriterError::IdentityMismatch);
+        };
+        if request.network() != self.network
+            || request.realm_id() != realm_id
+            || request.realm_sub_id() != realm_sub_id
+            || request.writer_activation_digest() != &self.writer_activation_digest
+            || request.queue_readiness_digest() != &self.queue_readiness_digest
+            || writer.network() != self.network
+            || writer.authority() != self.authority
+            || writer.activation_digest().as_bytes() != &self.writer_activation_digest
+        {
+            return Err(RealmProcessorNarrowWriterError::IdentityMismatch);
+        }
+
+        let first = self
+            .observe_generation_continuation_exact()
+            .await
+            .map_err(narrow_capture)?;
+        if first.continuation.phase()
+            != RealmProcessorGenerationContinuationPhase::AwaitWriter
+            || first.continuation.application() != Some(request.application())
+        {
+            return Err(RealmProcessorNarrowWriterError::IdentityMismatch);
+        }
+
+        let writer_before = writer.read_writer().await.map_err(narrow_writer)?;
+        let predecessor = match writer_before.state() {
+            BranchExactWriterState::Active(active) => *active.watermark(),
+            BranchExactWriterState::WritePrepared(prepared) => {
+                *prepared.intent().predecessor()
+            }
+            BranchExactWriterState::WritesVerified(verified) => {
+                *verified.prepared().intent().predecessor()
+            }
+            BranchExactWriterState::ActivationPrepared
+            | BranchExactWriterState::Blocked(_) => {
+                return Err(RealmProcessorNarrowWriterError::Writer(
+                    "writer is not active/prepared/verified".to_owned(),
+                ))
+            }
+        };
+        let processing = first.pipeline.processing();
+        let candidate = BranchPendingMapping::new(
+            *request.candidate(),
+            processing.pending_id(),
+        );
+        let intent = BranchExactDualWriteIntent::try_realm(
+            self.authority,
+            predecessor,
+            candidate,
+            processing.proc_checkpoint_id(),
+            request.reward_proof(),
+        )
+        .map_err(narrow_writer)?;
+        let intent_digest = *intent.intent_digest().as_bytes();
+        let barrier = writer
+            .prepare_and_verify(intent, request.clock_sample())
+            .await
+            .map_err(narrow_writer)?;
+        writer
+            .require_fresh_barrier(&barrier)
+            .await
+            .map_err(narrow_writer)?;
+
+        let fresh = self
+            .observe_generation_continuation_exact()
+            .await
+            .map_err(narrow_capture)?;
+        if fresh.continuation != first.continuation
+            || !same_pipeline_snapshot(&fresh.pipeline, &first.pipeline)
+        {
+            return Err(RealmProcessorNarrowWriterError::ConcurrentMutation);
+        }
+        let verified = writer.read_writer().await.map_err(narrow_writer)?;
+        let transition = seal_branch_exact_begin(&fresh.pipeline, &verified)
+            .map_err(narrow_pipeline)?;
+        match self
+            .pipeline
+            .apply(&transition)
+            .await
+            .map_err(narrow_pipeline)?
+        {
+            PendingPipelineWriteOutcome::Applied(_)
+            | PendingPipelineWriteOutcome::Idempotent(_) => {}
+            PendingPipelineWriteOutcome::Conflict(_) => {
+                return Err(RealmProcessorNarrowWriterError::Pipeline(
+                    "pipeline begin transition conflicted".to_owned(),
+                ))
+            }
+        }
+
+        writer
+            .require_fresh_barrier(&barrier)
+            .await
+            .map_err(narrow_writer)?;
+        let final_observation = self
+            .observe_generation_continuation_exact()
+            .await
+            .map_err(narrow_capture)?;
+        if final_observation.continuation.phase()
+            != RealmProcessorGenerationContinuationPhase::AwaitWriterCompletion
+            || final_observation.continuation.application() != Some(request.application())
+            || final_observation.pipeline.processing() != processing
+        {
+            return Err(RealmProcessorNarrowWriterError::ConcurrentMutation);
+        }
+        RealmProcessorNarrowWriterObservation::try_from_storage(
+            processing,
+            request.application(),
+            final_observation.pipeline.revision(),
+            barrier.writer_revision().get(),
+            intent_digest,
+        )
     }
 
     fn validate_generation_request(
@@ -2197,6 +2331,30 @@ fn backend(error: impl std::fmt::Display) -> RealmProcessorDurableCaptureError {
     RealmProcessorDurableCaptureError::Backend(error.to_string())
 }
 
+fn narrow_capture(
+    error: RealmProcessorDurableCaptureError,
+) -> RealmProcessorNarrowWriterError {
+    match error {
+        RealmProcessorDurableCaptureError::ConcurrentMutation => {
+            RealmProcessorNarrowWriterError::ConcurrentMutation
+        }
+        RealmProcessorDurableCaptureError::IdentityMismatch
+        | RealmProcessorDurableCaptureError::RuntimeCapabilityMismatch
+        | RealmProcessorDurableCaptureError::ApplicationHandoffNotSealing => {
+            RealmProcessorNarrowWriterError::IdentityMismatch
+        }
+        other => RealmProcessorNarrowWriterError::Backend(other.to_string()),
+    }
+}
+
+fn narrow_writer(error: impl std::fmt::Display) -> RealmProcessorNarrowWriterError {
+    RealmProcessorNarrowWriterError::Writer(error.to_string())
+}
+
+fn narrow_pipeline(error: impl std::fmt::Display) -> RealmProcessorNarrowWriterError {
+    RealmProcessorNarrowWriterError::Pipeline(error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2622,6 +2780,53 @@ mod tests {
         assert!(equality.contains(
             "first.canonical_payload() == second.canonical_payload()"
         ));
+    }
+
+    #[test]
+    fn narrow_writer_is_storage_selected_verified_before_inflight_and_stops_before_publish() {
+        let source = include_str!("realm_processor_durable_capture.rs");
+        let method = source
+            .split("pub(super) async fn prepare_narrow_writer")
+            .nth(1)
+            .unwrap()
+            .split("fn validate_generation_request")
+            .next()
+            .unwrap();
+        let first = method.find("observe_generation_continuation_exact").unwrap();
+        let writer = method.find(".prepare_and_verify(intent").unwrap();
+        let barrier = method.find(".require_fresh_barrier(&barrier)").unwrap();
+        let fresh = method[first + 1..]
+            .find("observe_generation_continuation_exact")
+            .map(|offset| first + 1 + offset)
+            .unwrap();
+        let begin = method.find("seal_branch_exact_begin").unwrap();
+        let pipeline = method.find(".apply(&transition)").unwrap();
+        let final_observation = method.rfind("observe_generation_continuation_exact").unwrap();
+        assert!(first < writer);
+        assert!(writer < barrier);
+        assert!(barrier < fresh);
+        assert!(fresh < begin && begin < pipeline);
+        assert!(pipeline < final_observation);
+        assert!(method.contains("RealmProcessorGenerationContinuationPhase::AwaitWriter"));
+        assert!(method.contains(
+            "RealmProcessorGenerationContinuationPhase::AwaitWriterCompletion"
+        ));
+        assert!(method.contains("first.continuation.application() != Some(request.application())"));
+        assert!(method.contains("same_pipeline_snapshot(&fresh.pipeline, &first.pipeline)"));
+        for forbidden in [
+            "finish_published",
+            "seal_branch_exact_publish",
+            "seal_branch_exact_no_work",
+            "seal_rotation",
+            "authority_head",
+            "publish_marker",
+            "NatsJetStreamClient",
+        ] {
+            assert!(
+                !method.contains(forbidden),
+                "narrow writer crossed the c4d boundary: {forbidden}"
+            );
+        }
     }
 
     #[test]
