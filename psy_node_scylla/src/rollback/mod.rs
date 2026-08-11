@@ -58,6 +58,8 @@ mod realm_user_update_admission_store;
 mod realm_user_update_dependency_store;
 #[allow(dead_code)]
 mod realm_user_update_durable_consumer;
+#[allow(dead_code)]
+mod realm_processor_external_dependency_projection;
 mod realm_user_update_router;
 mod realm_user_update_ingress;
 mod pending_queue_sidecar_lifecycle;
