@@ -767,16 +767,21 @@ where
                 observation.intent_digest(),
             );
         }
+        let write_set = self
+            .db
+            .build_branch_exact_full_commit_write_set(&prepared, &coordinator)
+            .await?;
         let source = RealmProcessorVerifiedFullCommitSource::try_from_verified(
             u32::try_from(self.db.state.realm_id_u64)?,
             u16::try_from(self.db.state.realm_sub_id_u64)?,
             &work,
             proof_binding,
             &coordinator,
+            write_set,
         )?;
         let source_observation = iteration.validate_full_commit_source(source).await?;
         tracing::info!(
-            "Branch-exact full-commit source revalidated: archive={:?}, pending={}, pipeline_revision={}, writer_revision={}, narrow_prepared={:?}, proof={:?}, coordinator={:?}; remaining 22-domain executor/head/terminal/rotation remain blocked",
+            "Branch-exact full-commit source revalidated: archive={:?}, pending={}, pipeline_revision={}, writer_revision={}, narrow_prepared={:?}, proof={:?}, coordinator={:?}, domains={}, coverage={:?}; executor/manifest/head/terminal/rotation remain blocked",
             source_observation.application().archive_slot(),
             source_observation.processing().pending_id().get(),
             source_observation.pipeline_revision().get(),
@@ -784,6 +789,8 @@ where
             source_observation.narrow_prepared_digest(),
             source_observation.proof_binding_digest(),
             source_observation.coordinator_payload_digest(),
+            source_observation.semantic_domain_count(),
+            source_observation.full_coverage_digest(),
         );
         if let Err(error) = self
             .db
@@ -1672,12 +1679,16 @@ mod h23c4e3a_tests {
             .find("SealedRealmProofBinding::verify_and_seal")
             .unwrap();
         let optional_narrow = route.find("if prepare_narrow_writer").unwrap();
+        let write_set = route
+            .find("build_branch_exact_full_commit_write_set")
+            .unwrap();
         let full_source = route
             .find("RealmProcessorVerifiedFullCommitSource::try_from_verified")
             .unwrap();
         let durable_fence = route.find("validate_full_commit_source(source)").unwrap();
         assert!(proof < optional_narrow);
-        assert!(optional_narrow < full_source);
+        assert!(optional_narrow < write_set);
+        assert!(write_set < full_source);
         assert!(full_source < durable_fence);
         for forbidden in [
             "self.db.commit_state",

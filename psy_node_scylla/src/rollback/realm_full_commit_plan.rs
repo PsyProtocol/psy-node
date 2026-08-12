@@ -659,7 +659,7 @@ pub(crate) mod tests {
                 prepared.intent().proc_checkpoint_id().as_u128(),
             ),
             old_realm_root: PHash::from_owned_32bytes([1; 32]),
-            new_realm_root: PHash::from_owned_32bytes([2; 32]),
+            new_realm_root: PHash::from_owned_32bytes([1; 32]),
             update_global_user_tree_nodes_ffs: Vec::new(),
             update_user_contract_tree_nodes_ffs: Vec::new(),
             update_contract_state_tree_nodes_ffs: Vec::new(),

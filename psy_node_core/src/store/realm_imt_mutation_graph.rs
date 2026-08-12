@@ -527,6 +527,56 @@ pub struct RealmImtMutationGraphPlan<Hash, Hasher> {
 }
 
 impl<Hash: Q256BitHash, Hasher: MerkleHasher<Hash>> RealmImtMutationGraphPlan<Hash, Hasher> {
+    /// Build a graph only from the checkpoint-bound, exact contract-height
+    /// response produced by [`RealmImtContractHeightReadPlan`].  This is the
+    /// public driver-independent entry used by the real Processor after its
+    /// database adapter has executed that read plan.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_from_bound_prepared<F>(
+        authority: AuthorityScope,
+        predecessor_checkpoint: AuthorityStateCheckpointId,
+        state_checkpoint: AuthorityStateCheckpointId,
+        config: RealmImtMutationGraphConfig,
+        contract_state_tree_heights: &RealmImtContractHeights,
+        prepared: &PsyPreparedRealmBlockStateUpdates<Hash>,
+    ) -> Result<Self, RealmImtMutationGraphError>
+    where
+        F: QFelt64,
+        Hash: QFHashBase<F>,
+        Hasher: FieldQHasher<F, Hash>,
+    {
+        if contract_state_tree_heights.predecessor_checkpoint()
+            != predecessor_checkpoint
+        {
+            return Err(
+                RealmImtMutationGraphError::ContractHeightCheckpointMismatch {
+                    expected: predecessor_checkpoint,
+                    actual: contract_state_tree_heights
+                        .predecessor_checkpoint(),
+                },
+            );
+        }
+        let expected = RealmImtContractHeightReadPlan::try_from_prepared(
+            predecessor_checkpoint,
+            prepared,
+        )?;
+        let actual = contract_state_tree_heights.contract_ids().collect::<Vec<_>>();
+        if expected.contract_ids() != actual {
+            return Err(RealmImtMutationGraphError::ContractHeightDomainMismatch {
+                expected: expected.contract_ids().to_vec(),
+                actual,
+            });
+        }
+        Self::try_from_prepared::<F>(
+            authority,
+            predecessor_checkpoint,
+            state_checkpoint,
+            config,
+            contract_state_tree_heights.as_map(),
+            prepared,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn try_from_prepared<F>(
         authority: AuthorityScope,
@@ -1267,6 +1317,11 @@ pub enum RealmImtMutationGraphError {
     UserOutsideRealm { user_id: u64, realm_id: u64 },
     MerklePositionOutOfRange { level: u8, index: u64, height: u8 },
     ContractHeightMissing(u64),
+    ContractHeightCheckpointMismatch {
+        expected: AuthorityStateCheckpointId,
+        actual: AuthorityStateCheckpointId,
+    },
+    ContractHeightDomainMismatch { expected: Vec<u64>, actual: Vec<u64> },
     ContractHeightResponseCountMismatch { expected: usize, actual: usize },
     InvalidContractHeight { contract_id: u64, height: u8 },
     InvalidPredecessorReadHeight { key: RealmImtBaselineNodeKey, tree_height: u8 },

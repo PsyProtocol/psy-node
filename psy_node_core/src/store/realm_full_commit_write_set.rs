@@ -176,7 +176,7 @@ pub struct RealmFullCommitWriteSet {
 }
 
 impl RealmFullCommitWriteSet {
-    pub fn try_new<Hash>(
+    pub fn try_new<Hash: PartialEq>(
         prepared: &PsyPreparedRealmBlockStateUpdates<Hash>,
         mut remaining: Vec<RealmCommitLogicalDomainBatch>,
         prepared_state: Option<RealmPreparedStateWriteSet>,
@@ -184,6 +184,11 @@ impl RealmFullCommitWriteSet {
         let coverage_plan = RealmNormalCommitCoveragePlan::from_prepared(prepared);
         if coverage_plan.has_ignored_prepared_payload() {
             return Err(RealmFullCommitWriteSetError::IgnoredPreparedPayload);
+        }
+        if !coverage_plan.invokes_state_update_branch()
+            && prepared.old_realm_root != prepared.new_realm_root
+        {
+            return Err(RealmFullCommitWriteSetError::UnexplainedRealmRootChange);
         }
         match (coverage_plan.invokes_state_update_branch(), &prepared_state) {
             (true, Some(state)) if state.coverage_plan == coverage_plan => {}
@@ -265,6 +270,7 @@ impl RealmFullCommitWriteSet {
 #[derive(Debug)]
 pub enum RealmFullCommitWriteSetError {
     IgnoredPreparedPayload,
+    UnexplainedRealmRootChange,
     PreparedStateRequired,
     PreparedStatePlanMismatch,
     UnexpectedPreparedState,
@@ -400,6 +406,30 @@ mod tests {
         assert!(matches!(
             RealmFullCommitWriteSet::try_new(&prepared(), duplicate, None),
             Err(RealmFullCommitWriteSetError::DuplicateDomain { .. })
+        ));
+    }
+
+    #[test]
+    fn unexplained_root_change_is_not_a_no_state_commit() {
+        let mut prepared = prepared();
+        prepared.new_realm_root = PHash::from_owned_32bytes([2; 32]);
+        assert!(matches!(
+            RealmFullCommitWriteSet::try_new(
+                &prepared,
+                RealmNormalCommitCoveragePlan::from_prepared(&prepared)
+                    .domains()
+                    .filter(|domain| {
+                        !H22_BRANCH_EXACT_REALM_DOMAIN_SCOPE.contains(domain)
+                            && !STATE_DOMAINS.contains(domain)
+                    })
+                    .map(|domain| RealmCommitLogicalDomainBatch::new(
+                        domain,
+                        vec![mutation_for(domain)],
+                    ))
+                    .collect(),
+                None,
+            ),
+            Err(RealmFullCommitWriteSetError::UnexplainedRealmRootChange),
         ));
     }
 }

@@ -23,6 +23,8 @@ use sha2::{Digest, Sha256};
 use crate::store::{
     pending_generation_identity::PendingGenerationContext,
     pending_generation_pipeline::PendingPipelineRevision,
+    realm_full_commit_write_set::RealmFullCommitWriteSet,
+    realm_normal_commit_coverage::RealmNormalCommitCoveragePlan,
     realm_proof_binding::{RealmProofBindingDigest, SealedRealmProofBinding},
     realm_processor_startup::{
         RealmProcessorStartupPermitDigest,
@@ -52,6 +54,7 @@ pub struct RealmProcessorVerifiedFullCommitSource<Hash> {
     proof: SealedRealmProofBinding<Hash>,
     coordinator_payload: Vec<u8>,
     coordinator_payload_digest: [u8; 32],
+    write_set: RealmFullCommitWriteSet,
 }
 
 impl<Hash: Q256BitHash> RealmProcessorVerifiedFullCommitSource<Hash> {
@@ -61,6 +64,7 @@ impl<Hash: Q256BitHash> RealmProcessorVerifiedFullCommitSource<Hash> {
         work: &RealmProcessorApplicationProofWork,
         proof: SealedRealmProofBinding<Hash>,
         coordinator: &PsyRealmCoordinatorUpdate<F, Hash>,
+        write_set: RealmFullCommitWriteSet,
     ) -> Result<Self, RealmProcessorFullCommitSourceError> {
         let prepared = work.prepared_update::<Hash>(realm_id, realm_sub_id);
         proof
@@ -74,6 +78,8 @@ impl<Hash: Q256BitHash> RealmProcessorVerifiedFullCommitSource<Hash> {
             || proof.record().canonical_chain() != &coordinator.canonical_chain_ref
             || proof.record().old_realm_root() != &prepared.old_realm_root
             || proof.record().new_realm_root() != &prepared.new_realm_root
+            || write_set.coverage_plan()
+                != RealmNormalCommitCoveragePlan::from_prepared(&prepared)
             || !work.application().has_application_work()
         {
             return Err(RealmProcessorFullCommitSourceError::IdentityMismatch);
@@ -88,6 +94,7 @@ impl<Hash: Q256BitHash> RealmProcessorVerifiedFullCommitSource<Hash> {
             proof,
             coordinator_payload,
             coordinator_payload_digest,
+            write_set,
         })
     }
 
@@ -123,6 +130,7 @@ pub struct SealedRealmProcessorFullCommitSourceRequest<Hash> {
     proof: SealedRealmProofBinding<Hash>,
     coordinator_payload: Vec<u8>,
     coordinator_payload_digest: [u8; 32],
+    write_set: RealmFullCommitWriteSet,
 }
 
 impl<Hash: Q256BitHash> SealedRealmProcessorFullCommitSourceRequest<Hash> {
@@ -162,6 +170,7 @@ impl<Hash: Q256BitHash> SealedRealmProcessorFullCommitSourceRequest<Hash> {
             proof: source.proof,
             coordinator_payload: source.coordinator_payload,
             coordinator_payload_digest: source.coordinator_payload_digest,
+            write_set: source.write_set,
         })
     }
 
@@ -187,6 +196,9 @@ impl<Hash: Q256BitHash> SealedRealmProcessorFullCommitSourceRequest<Hash> {
     pub const fn coordinator_payload_digest(&self) -> &[u8; 32] {
         &self.coordinator_payload_digest
     }
+    pub const fn write_set(&self) -> &RealmFullCommitWriteSet {
+        &self.write_set
+    }
 }
 
 /// Read-only durable confirmation that the full-commit source still matches
@@ -200,6 +212,8 @@ pub struct RealmProcessorFullCommitSourceObservation {
     narrow_prepared_digest: [u8; 32],
     proof_binding_digest: RealmProofBindingDigest,
     coordinator_payload_digest: [u8; 32],
+    full_coverage_digest: [u8; 32],
+    semantic_domain_count: u8,
 }
 
 impl RealmProcessorFullCommitSourceObservation {
@@ -212,10 +226,15 @@ impl RealmProcessorFullCommitSourceObservation {
         narrow_prepared_digest: [u8; 32],
         proof_binding_digest: RealmProofBindingDigest,
         coordinator_payload_digest: [u8; 32],
+        full_coverage_digest: [u8; 32],
+        semantic_domain_count: u8,
     ) -> Result<Self, RealmProcessorFullCommitSourceError> {
         if writer_revision == 0
             || narrow_prepared_digest == [0; 32]
             || coordinator_payload_digest == [0; 32]
+            || full_coverage_digest == [0; 32]
+            || semantic_domain_count == 0
+            || semantic_domain_count > 22
             || !application.has_application_work()
         {
             return Err(RealmProcessorFullCommitSourceError::IdentityMismatch);
@@ -228,6 +247,8 @@ impl RealmProcessorFullCommitSourceObservation {
             narrow_prepared_digest,
             proof_binding_digest,
             coordinator_payload_digest,
+            full_coverage_digest,
+            semantic_domain_count,
         })
     }
 
@@ -247,6 +268,12 @@ impl RealmProcessorFullCommitSourceObservation {
     }
     pub const fn coordinator_payload_digest(&self) -> &[u8; 32] {
         &self.coordinator_payload_digest
+    }
+    pub const fn full_coverage_digest(&self) -> &[u8; 32] {
+        &self.full_coverage_digest
+    }
+    pub const fn semantic_domain_count(&self) -> u8 {
+        self.semantic_domain_count
     }
 }
 

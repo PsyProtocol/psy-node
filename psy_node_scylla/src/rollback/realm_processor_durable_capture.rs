@@ -735,6 +735,13 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
         let BranchExactWriterState::WritesVerified(verified) = second_writer.state() else {
             return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
         };
+        let full_plan = super::realm_full_commit_plan::RealmFullCommitPhysicalPlan::try_assemble_from_write_set(
+            verified.prepared(),
+            request.write_set(),
+        )
+        .map_err(|error| RealmProcessorFullCommitSourceError::Writer(error.to_string()))?;
+        let semantic_domain_count = u8::try_from(full_plan.coverage().domains().len())
+            .map_err(|_| RealmProcessorFullCommitSourceError::IdentityMismatch)?;
         RealmProcessorFullCommitSourceObservation::try_from_storage(
             processing,
             application,
@@ -743,6 +750,8 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
             *verified.prepared().digest(),
             request.proof().digest(),
             *request.coordinator_payload_digest(),
+            *full_plan.coverage().digest(),
+            semantic_domain_count,
         )
     }
 
@@ -2591,6 +2600,11 @@ mod tests {
         assert!(method.contains("first_archive.header() != second_archive.header()"));
         assert!(method.contains("first_writer != second_writer"));
         assert!(method.contains("BranchExactWriterState::WritesVerified"));
+        assert!(method.contains(
+            "RealmFullCommitPhysicalPlan::try_assemble_from_write_set"
+        ));
+        assert!(method.contains("full_plan.coverage().digest()"));
+        assert!(method.contains("full_plan.coverage().domains().len()"));
         assert!(!method.contains("write_and_verify"));
         assert!(!method.contains("persist_from_fresh_sources"));
         assert!(!method.contains("finish_published"));
