@@ -24,6 +24,8 @@ use psy_node_core::store::{
         RealmNormalCommitWriteDomain,
         realm_normal_commit_domain_for_branch_exact_mutation,
     },
+    realm_imt_mutation_graph::RealmImtMutationGraphDigest,
+    realm_prepared_payload::RealmPreparedPayloadCommitment,
     timestamp::CommitWriteTimestampUs,
 };
 use sha2::{Digest, Sha256};
@@ -32,6 +34,7 @@ use super::{
     BranchExactWriterPrepared, ScyllaKeyDomain, ScyllaPhysicalTableId,
     SealedTimestampedPut, TimestampedWriteKind,
     expected_physical_table, key_domain_for,
+    realm_prepared_state_physical_plan::RealmPreparedStatePhysicalBatches,
 };
 
 const NARROW_BATCH_DIGEST_DOMAIN: &[u8] =
@@ -99,6 +102,8 @@ pub(crate) struct RealmFullCommitPhysicalPlan {
     coverage: RealmFullCommitCoverage,
     narrow_prepared_digest: [u8; 32],
     narrow_intent_digest: [u8; 32],
+    prepared_payload_commitment: Option<RealmPreparedPayloadCommitment>,
+    mutation_graph_digest: Option<RealmImtMutationGraphDigest>,
     remaining: Vec<RealmCommitPhysicalDomainBatch>,
 }
 
@@ -108,12 +113,54 @@ impl RealmFullCommitPhysicalPlan {
         narrow: &BranchExactWriterPrepared<Hash>,
         remaining: Vec<RealmCommitPhysicalDomainBatch>,
     ) -> Result<Self, RealmFullCommitPhysicalPlanError> {
+        if coverage_plan.invokes_state_update_branch() {
+            return Err(
+                RealmFullCommitPhysicalPlanError::PreparedStateBatchesRequired,
+            );
+        }
         assemble(
             coverage_plan,
             narrow.intent(),
             narrow.timestamp(),
             *narrow.digest(),
             remaining,
+            None,
+            None,
+        )
+    }
+
+    /// Assemble the complete state-changing path only from batches that were
+    /// derived from an exact sealed mutation graph and its prepared payload.
+    pub(crate) fn try_assemble_with_prepared_state<Hash: Q256BitHash>(
+        narrow: &BranchExactWriterPrepared<Hash>,
+        mut remaining: Vec<RealmCommitPhysicalDomainBatch>,
+        state: RealmPreparedStatePhysicalBatches,
+    ) -> Result<Self, RealmFullCommitPhysicalPlanError> {
+        if state.authority() != narrow.intent().authority() {
+            return Err(
+                RealmFullCommitPhysicalPlanError::PreparedStateAuthorityMismatch,
+            );
+        }
+        if state.timestamp() != narrow.timestamp() {
+            return Err(
+                RealmFullCommitPhysicalPlanError::PreparedStateTimestampMismatch {
+                    expected: narrow.timestamp(),
+                    actual: state.timestamp(),
+                },
+            );
+        }
+        let coverage_plan = state.coverage_plan();
+        let prepared_payload_commitment = state.prepared_payload_commitment();
+        let mutation_graph_digest = state.mutation_graph_digest();
+        remaining.extend(state.into_batches());
+        assemble(
+            coverage_plan,
+            narrow.intent(),
+            narrow.timestamp(),
+            *narrow.digest(),
+            remaining,
+            Some(prepared_payload_commitment),
+            Some(mutation_graph_digest),
         )
     }
 
@@ -129,6 +176,18 @@ impl RealmFullCommitPhysicalPlan {
         &self.narrow_intent_digest
     }
 
+    pub(crate) const fn prepared_payload_commitment(
+        &self,
+    ) -> Option<RealmPreparedPayloadCommitment> {
+        self.prepared_payload_commitment
+    }
+
+    pub(crate) const fn mutation_graph_digest(
+        &self,
+    ) -> Option<RealmImtMutationGraphDigest> {
+        self.mutation_graph_digest
+    }
+
     pub(crate) fn remaining(&self) -> &[RealmCommitPhysicalDomainBatch] {
         &self.remaining
     }
@@ -140,6 +199,8 @@ fn assemble<Hash: Q256BitHash>(
     timestamp: CommitWriteTimestampUs,
     narrow_prepared_digest: [u8; 32],
     mut remaining: Vec<RealmCommitPhysicalDomainBatch>,
+    prepared_payload_commitment: Option<RealmPreparedPayloadCommitment>,
+    mutation_graph_digest: Option<RealmImtMutationGraphDigest>,
 ) -> Result<RealmFullCommitPhysicalPlan, RealmFullCommitPhysicalPlanError> {
     if !matches!(narrow.authority(), AuthorityScope::Realm { .. }) {
         return Err(RealmFullCommitPhysicalPlanError::RealmNarrowIntentRequired);
@@ -237,6 +298,8 @@ fn assemble<Hash: Q256BitHash>(
         coverage,
         narrow_prepared_digest,
         narrow_intent_digest: *narrow.intent_digest().as_bytes(),
+        prepared_payload_commitment,
+        mutation_graph_digest,
         remaining,
     })
 }
@@ -345,6 +408,12 @@ pub(crate) enum RealmFullCommitPhysicalPlanError {
     UnexpectedCutoverPreparedIdentity {
         domain: RealmNormalCommitWriteDomain,
     },
+    PreparedStateBatchesRequired,
+    PreparedStateAuthorityMismatch,
+    PreparedStateTimestampMismatch {
+        expected: CommitWriteTimestampUs,
+        actual: CommitWriteTimestampUs,
+    },
     Coverage(RealmFullCommitCoverageError),
 }
 
@@ -365,8 +434,9 @@ impl Error for RealmFullCommitPhysicalPlanError {}
 #[cfg(test)]
 mod tests {
     use parth_core::{
-        PHash,
         crypto::hash::tag_tree::TagTreeMerkleProof,
+        pgoldilocks::PoseidonHasher,
+        PHash, PF,
     };
     use psy_data::{
         prepared_block::realm::PsyPreparedRealmBlockStateUpdates,
@@ -412,12 +482,9 @@ mod tests {
         )
     }
 
-    fn narrow() -> BranchExactDualWriteIntent<Hash> {
+    fn narrow_for(authority: AuthorityScope) -> BranchExactDualWriteIntent<Hash> {
         BranchExactDualWriteIntent::try_realm(
-            AuthorityScope::Realm {
-                realm_id: 7,
-                realm_sub_id: 2,
-            },
+            authority,
             BranchPendingMapping::new(
                 chain(10, 10),
                 UniquePendingId::try_new(100).unwrap(),
@@ -432,7 +499,17 @@ mod tests {
         .unwrap()
     }
 
-    fn prepared(timestamp: CommitWriteTimestampUs) -> BranchExactWriterPrepared<Hash> {
+    fn narrow() -> BranchExactDualWriteIntent<Hash> {
+        narrow_for(AuthorityScope::Realm {
+            realm_id: 7,
+            realm_sub_id: 2,
+        })
+    }
+
+    fn prepared_from_intent(
+        timestamp: CommitWriteTimestampUs,
+        intent: BranchExactDualWriteIntent<Hash>,
+    ) -> BranchExactWriterPrepared<Hash> {
         let mut fence = [0u8; 81];
         fence[..8].copy_from_slice(&9_u64.to_be_bytes());
         fence[8..16].copy_from_slice(&3_u64.to_be_bytes());
@@ -440,10 +517,14 @@ mod tests {
         fence[48..80].fill(0x55);
         fence[80] = BranchExactCutoverPhase::TargetPrimaryDualWrite as u8;
         BranchExactWriterPrepared::test_fixture(
-            narrow(),
+            intent,
             timestamp,
             BranchExactWriterCutoverFence::decode_canonical(&fence).unwrap(),
         )
+    }
+
+    fn prepared(timestamp: CommitWriteTimestampUs) -> BranchExactWriterPrepared<Hash> {
+        prepared_from_intent(timestamp, narrow())
     }
 
     fn no_state_plan() -> RealmNormalCommitCoveragePlan {
@@ -630,6 +711,104 @@ mod tests {
         let second = assemble_test(&narrow_prepared, reversed).unwrap();
         assert_eq!(first.coverage(), second.coverage());
         assert_eq!(first.remaining(), second.remaining());
+    }
+
+    #[test]
+    fn sealed_prepared_state_completes_all_twenty_two_domains() {
+        let timestamp = CommitWriteTimestampUs::try_from_i128(10_005).unwrap();
+        let (prepared_state, graph, cursor_before) =
+            crate::rollback::realm_imt_predecessor_rf3_gate::qualification_state_fixture()
+                .unwrap();
+        let state = RealmPreparedStatePhysicalBatches::try_new::<
+            PF,
+            PHash,
+            PoseidonHasher,
+        >(&prepared_state, &graph, timestamp, &[cursor_before])
+        .unwrap();
+        assert_eq!(state.batches().len(), 7);
+
+        let authority = AuthorityScope::Realm {
+            realm_id: 1,
+            realm_sub_id: 2,
+        };
+        let narrow_prepared =
+            prepared_from_intent(timestamp, narrow_for(authority));
+        let plan = RealmFullCommitPhysicalPlan::try_assemble_with_prepared_state(
+            &narrow_prepared,
+            remaining(&narrow_prepared),
+            state,
+        )
+        .unwrap();
+
+        assert_eq!(plan.coverage().domains().len(), 22);
+        assert_eq!(plan.coverage().total_mutation_count(), 33);
+        assert_eq!(plan.remaining().len(), 17);
+        assert_eq!(
+            plan.prepared_payload_commitment(),
+            Some(graph.prepared_payload_commitment()),
+        );
+        assert_eq!(plan.mutation_graph_digest(), Some(graph.digest()));
+    }
+
+    #[test]
+    fn prepared_state_cannot_cross_authority_or_use_generic_assembly() {
+        let timestamp = CommitWriteTimestampUs::try_from_i128(10_006).unwrap();
+        let (prepared_state, graph, cursor_before) =
+            crate::rollback::realm_imt_predecessor_rf3_gate::qualification_state_fixture()
+                .unwrap();
+        let state = RealmPreparedStatePhysicalBatches::try_new::<
+            PF,
+            PHash,
+            PoseidonHasher,
+        >(&prepared_state, &graph, timestamp, &[cursor_before])
+        .unwrap();
+        let foreign = prepared(timestamp);
+        assert_eq!(
+            RealmFullCommitPhysicalPlan::try_assemble_with_prepared_state(
+                &foreign,
+                remaining(&foreign),
+                state,
+            ),
+            Err(RealmFullCommitPhysicalPlanError::PreparedStateAuthorityMismatch),
+        );
+        assert_eq!(
+            RealmFullCommitPhysicalPlan::try_assemble(
+                RealmNormalCommitCoveragePlan::from_prepared(&prepared_state),
+                &foreign,
+                remaining(&foreign),
+            ),
+            Err(RealmFullCommitPhysicalPlanError::PreparedStateBatchesRequired),
+        );
+    }
+
+    #[test]
+    fn sealed_state_without_imt_completes_nineteen_domains() {
+        let timestamp = CommitWriteTimestampUs::try_from_i128(10_007).unwrap();
+        let (prepared_state, graph) = crate::rollback::realm_imt_predecessor_rf3_gate::qualification_state_fixture_without_imt().unwrap();
+        let state = RealmPreparedStatePhysicalBatches::try_new::<
+            PF,
+            PHash,
+            PoseidonHasher,
+        >(&prepared_state, &graph, timestamp, &[])
+        .unwrap();
+        assert_eq!(state.batches().len(), 4);
+
+        let narrow_prepared = prepared_from_intent(
+            timestamp,
+            narrow_for(AuthorityScope::Realm {
+                realm_id: 1,
+                realm_sub_id: 2,
+            }),
+        );
+        let plan = RealmFullCommitPhysicalPlan::try_assemble_with_prepared_state(
+            &narrow_prepared,
+            remaining(&narrow_prepared),
+            state,
+        )
+        .unwrap();
+        assert_eq!(plan.coverage().domains().len(), 19);
+        assert_eq!(plan.coverage().total_mutation_count(), 30);
+        assert_eq!(plan.remaining().len(), 14);
     }
 
     #[test]

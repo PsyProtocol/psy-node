@@ -33,7 +33,7 @@ use psy_data::{
 use psy_node_core::store::realm_imt_mutation_graph::{
     RealmImtBaselineNodeKey, RealmImtMutationGraphConfig,
     RealmImtMutationGraphPlan, RealmImtPredecessorReadPlan,
-    RealmImtPredecessorReadRow,
+    RealmImtPredecessorReadRow, SealedRealmImtMutationGraph,
 };
 use psy_serialize::FastFixedSerializable;
 use scylla::{
@@ -337,6 +337,51 @@ fn fixture() -> Fixture {
         heights: BTreeMap::from([(CONTRACT_ID, CST_HEIGHT)]),
         baseline,
     }
+}
+
+pub(super) fn qualification_state_fixture(
+) -> anyhow::Result<(
+    PsyPreparedRealmBlockStateUpdates<PHash>,
+    SealedRealmImtMutationGraph<PHash, PoseidonHasher>,
+    super::ImtCursorSnapshot,
+)> {
+    let mut fixture = fixture();
+    // The c4e positive path needs the production IMT helper to emit all three
+    // physical families, including the content-birth key index.
+    fixture.prepared.update_contract_state_imt_leaves_ffs[160] = 1;
+    let plan = fixture.plan()?;
+    let observations = plan
+        .baseline_requests()
+        .iter()
+        .map(|key| (*key, fixture.baseline[key]))
+        .collect::<Vec<_>>();
+    let graph = plan.verify_and_seal(&observations)?;
+    Ok((
+        fixture.prepared,
+        graph,
+        super::ImtCursorSnapshot::new(
+            psy_node_core::store::typed::TreeId::new(USER_ID),
+            psy_node_core::store::typed::TreeSubId::new(CONTRACT_ID),
+            IMT_INDEX,
+        ),
+    ))
+}
+
+pub(super) fn qualification_state_fixture_without_imt(
+) -> anyhow::Result<(
+    PsyPreparedRealmBlockStateUpdates<PHash>,
+    SealedRealmImtMutationGraph<PHash, PoseidonHasher>,
+)> {
+    let mut fixture = fixture();
+    fixture.prepared.update_contract_state_imt_leaves_ffs.clear();
+    let plan = fixture.plan()?;
+    let observations = plan
+        .baseline_requests()
+        .iter()
+        .map(|key| (*key, fixture.baseline[key]))
+        .collect::<Vec<_>>();
+    let graph = plan.verify_and_seal(&observations)?;
+    Ok((fixture.prepared, graph))
 }
 
 async fn connect(

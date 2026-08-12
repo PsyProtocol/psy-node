@@ -27,6 +27,9 @@ use psy_node_core::store::realm_imt_mutation_graph::{
     RealmImtMutationGraphError, RealmImtMutationGraphPlan,
     RealmImtPredecessorReadRow,
 };
+use psy_node_core::store::typed::{
+    MutationValue, StructuredValueSchema, TypedTableKey,
+};
 use psy_serialize::FastFixedSerializable;
 
 const GLOBAL_HEIGHT: u8 = 4;
@@ -231,6 +234,58 @@ fn complete_real_ffs_graph_requires_baseline_and_seals_deterministically() {
     assert_eq!(first.counts().user_leaves, 1);
     assert_eq!(first.counts().final_imt_leaves, 1);
     assert!(!plan.baseline_requests().is_empty());
+}
+
+#[test]
+fn sealed_graph_expands_only_its_exact_prepared_payload_into_typed_rows() {
+    let fixture = valid_fixture();
+    let plan = fixture.plan().unwrap();
+    let sealed = plan
+        .verify_and_seal(&fixture.observations(&plan))
+        .unwrap();
+    let rows = sealed
+        .expand_exact_prepared_rows::<PF>(&fixture.prepared)
+        .unwrap();
+
+    assert_eq!(rows.global_user_merkle().len(), 3);
+    assert_eq!(rows.user_contract_merkle().len(), 4);
+    assert_eq!(rows.contract_state_merkle().len(), 4);
+    assert_eq!(rows.user_leaves().len(), 1);
+    assert_eq!(rows.imt_leaves().len(), 1);
+    assert_eq!(
+        rows.prepared_payload_commitment(),
+        sealed.prepared_payload_commitment(),
+    );
+    assert!(matches!(
+        &rows.user_leaves()[0],
+        psy_node_core::store::typed::LogicalMutation::Put {
+            key: TypedTableKey::UserLeaf { user, checkpoint },
+            value: MutationValue::PsyCanonicalBytes(value),
+        } if user.get() == USER_ID
+            && checkpoint.get() == 41
+            && value == &fixture.prepared.update_user_leaves_ffs
+    ));
+    assert!(matches!(
+        &rows.imt_leaves()[0],
+        psy_node_core::store::typed::LogicalMutation::Put {
+            key: TypedTableKey::ImtLeaf { tree, tree_sub, leaf, checkpoint },
+            value: MutationValue::Structured {
+                schema: StructuredValueSchema::ImtLeafRowV1,
+                canonical_bytes,
+            },
+        } if tree.get() == USER_ID
+            && tree_sub.get() == CONTRACT_ID
+            && leaf.get() == IMT_INDEX
+            && checkpoint.get() == 41
+            && canonical_bytes == &fixture.prepared.update_contract_state_imt_leaves_ffs
+    ));
+
+    let mut foreign = fixture.prepared.clone();
+    foreign.unique_pending_id += 1;
+    assert_eq!(
+        sealed.expand_exact_prepared_rows::<PF>(&foreign),
+        Err(RealmImtMutationGraphError::PreparedPayloadIdentityMismatch),
+    );
 }
 
 #[test]

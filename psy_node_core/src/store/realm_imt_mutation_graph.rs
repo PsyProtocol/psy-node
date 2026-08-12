@@ -34,7 +34,14 @@ use psy_data::{
 use psy_serialize::{FastFixedSerializable, PsyCanonicalDatabaseSerializeBaseSingle};
 use sha2::{Digest, Sha256};
 
-use super::realm_prepared_payload::RealmPreparedPayloadCommitment;
+use super::{
+    realm_prepared_payload::RealmPreparedPayloadCommitment,
+    typed::{
+        CheckpointId, ContractId, LeafIndex, LogicalMutation, MerkleNode,
+        MutationValue, NodeIndex, StructuredValueSchema, TreeId, TreeSubId,
+        TypedTableKey, UserId,
+    },
+};
 
 const PREPARED_GRAPH_DOMAIN: &[u8] = b"psy.rollback.realm-imt-mutation-graph.v1\0";
 const PREPARED_PAYLOAD_DOMAIN: &[u8] = b"psy.rollback.realm-imt-prepared-payload.v1\0";
@@ -342,6 +349,152 @@ impl<Hash, Hasher> SealedRealmImtMutationGraph<Hash, Hasher> {
     pub const fn digest(&self) -> RealmImtMutationGraphDigest { self.digest }
     pub const fn counts(&self) -> RealmImtMutationGraphCounts { self.counts }
     pub const fn config(&self) -> RealmImtMutationGraphConfig { self.config }
+}
+
+/// Exact typed rows recovered from the same prepared payload that was sealed
+/// into a Realm mutation graph.
+///
+/// This value is deliberately only obtainable through
+/// [`SealedRealmImtMutationGraph::expand_exact_prepared_rows`]. It is not a
+/// commit or storage authority; the Scylla layer still has to resolve and seal
+/// every mutation under the commit timestamp.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RealmPreparedStateRows {
+    prepared_payload_commitment: RealmPreparedPayloadCommitment,
+    global_user_merkle: Vec<LogicalMutation>,
+    user_contract_merkle: Vec<LogicalMutation>,
+    contract_state_merkle: Vec<LogicalMutation>,
+    user_leaves: Vec<LogicalMutation>,
+    imt_leaves: Vec<LogicalMutation>,
+}
+
+impl RealmPreparedStateRows {
+    pub const fn prepared_payload_commitment(&self) -> RealmPreparedPayloadCommitment {
+        self.prepared_payload_commitment
+    }
+
+    pub fn global_user_merkle(&self) -> &[LogicalMutation] { &self.global_user_merkle }
+    pub fn user_contract_merkle(&self) -> &[LogicalMutation] { &self.user_contract_merkle }
+    pub fn contract_state_merkle(&self) -> &[LogicalMutation] { &self.contract_state_merkle }
+    pub fn user_leaves(&self) -> &[LogicalMutation] { &self.user_leaves }
+    pub fn imt_leaves(&self) -> &[LogicalMutation] { &self.imt_leaves }
+}
+
+impl<Hash: Q256BitHash, Hasher> SealedRealmImtMutationGraph<Hash, Hasher> {
+    /// Rebind the graph seal to the exact prepared payload and expand its five
+    /// state families into driver-independent typed rows.
+    ///
+    /// The graph already verified the cross-table Merkle relationships. This
+    /// method first proves that the caller supplied those exact same bytes,
+    /// then parses their physical row identities without accepting a second,
+    /// unchecked payload.
+    pub fn expand_exact_prepared_rows<F: QFelt64>(
+        &self,
+        prepared: &PsyPreparedRealmBlockStateUpdates<Hash>,
+    ) -> Result<RealmPreparedStateRows, RealmImtMutationGraphError> {
+        let (realm_id, realm_sub_id) = match self.authority {
+            AuthorityScope::Realm { realm_id, realm_sub_id } => {
+                (u64::from(realm_id), u64::from(realm_sub_id))
+            }
+            AuthorityScope::Coordinator => {
+                return Err(RealmImtMutationGraphError::RealmAuthorityRequired);
+            }
+        };
+        if prepared.realm_id != realm_id || prepared.realm_sub_id != realm_sub_id {
+            return Err(RealmImtMutationGraphError::PreparedAuthorityMismatch);
+        }
+
+        let prepared_bytes = prepared
+            .psy_ser_to_bytes_vec()
+            .map_err(|_| RealmImtMutationGraphError::PreparedSerializationFailed)?;
+        if RealmPreparedPayloadCommitment::from_serialized(&prepared_bytes)
+            != self.prepared_payload_commitment
+            || digest(PREPARED_PAYLOAD_DOMAIN, &prepared_bytes) != self.prepared_payload_digest
+        {
+            return Err(RealmImtMutationGraphError::PreparedPayloadIdentityMismatch);
+        }
+
+        let checkpoint = CheckpointId::try_new(self.state_checkpoint.get()).map_err(|error| {
+            RealmImtMutationGraphError::StateCheckpointOutOfRange(error.0)
+        })?;
+
+        let global_nodes = parse_global_nodes(prepared, self.config, realm_id)?;
+        let global_user_merkle = global_nodes
+            .into_iter()
+            .map(|(key, value)| match key {
+                RealmImtBaselineNodeKey::GlobalUser { level, index } => {
+                    Ok(LogicalMutation::Put {
+                        key: TypedTableKey::GlobalUserMerkle {
+                            node: MerkleNode::new(level, NodeIndex::new(index)),
+                            checkpoint,
+                        },
+                        value: MutationValue::PsyCanonicalBytes(
+                            value.into_owned_32bytes().to_vec(),
+                        ),
+                    })
+                }
+                _ => Err(RealmImtMutationGraphError::PreparedRowDomainMismatch),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let user_contract_nodes = parse_user_contract_nodes(prepared, self.config, realm_id)?;
+        let user_contract_merkle = user_contract_nodes
+            .into_iter()
+            .map(|(key, value)| match key {
+                RealmImtBaselineNodeKey::UserContract { user_id, level, index } => {
+                    Ok(LogicalMutation::Put {
+                        key: TypedTableKey::UserContractMerkle {
+                            user: UserId::new(user_id),
+                            node: MerkleNode::new(level, NodeIndex::new(index)),
+                            checkpoint,
+                        },
+                        value: MutationValue::PsyCanonicalBytes(
+                            value.into_owned_32bytes().to_vec(),
+                        ),
+                    })
+                }
+                _ => Err(RealmImtMutationGraphError::PreparedRowDomainMismatch),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let contract_state_merkle = parse_contract_state_rows(
+            prepared,
+            self.config,
+            realm_id,
+            checkpoint,
+        )?;
+
+        let user_leaves = parse_user_leaves::<F, Hash>(prepared, self.config, realm_id)?
+            .into_iter()
+            .map(|(user_id, leaf)| LogicalMutation::Put {
+                key: TypedTableKey::UserLeaf {
+                    user: UserId::new(user_id),
+                    checkpoint,
+                },
+                value: MutationValue::PsyCanonicalBytes(leaf.ffs_to_bytes().to_vec()),
+            })
+            .collect::<Vec<_>>();
+
+        let (imt_leaves, final_imt_leaf_count) = parse_imt_state_rows(prepared, checkpoint)?;
+        let counts = self.counts;
+        if global_user_merkle.len() != counts.global_nodes
+            || user_contract_merkle.len() != counts.user_contract_nodes
+            || contract_state_merkle.len() != counts.contract_state_nodes
+            || user_leaves.len() != counts.user_leaves
+            || final_imt_leaf_count != counts.final_imt_leaves
+        {
+            return Err(RealmImtMutationGraphError::PreparedRowCountMismatch);
+        }
+
+        Ok(RealmPreparedStateRows {
+            prepared_payload_commitment: self.prepared_payload_commitment,
+            global_user_merkle,
+            user_contract_merkle,
+            contract_state_merkle,
+            user_leaves,
+            imt_leaves,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -753,6 +906,95 @@ where
     Ok(leaves)
 }
 
+fn parse_contract_state_rows<Hash: Q256BitHash>(
+    prepared: &PsyPreparedRealmBlockStateUpdates<Hash>,
+    config: RealmImtMutationGraphConfig,
+    realm_id: u64,
+    checkpoint: CheckpointId,
+) -> Result<Vec<LogicalMutation>, RealmImtMutationGraphError> {
+    let bytes = &prepared.update_contract_state_tree_nodes_ffs;
+    if bytes.is_empty()
+        || !bytes
+            .len()
+            .is_multiple_of(QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE)
+    {
+        return Err(RealmImtMutationGraphError::MalformedContractStateNodes);
+    }
+    let mut seen = BTreeSet::new();
+    let mut rows = Vec::with_capacity(
+        bytes.len() / QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE,
+    );
+    for chunk in bytes.chunks_exact(QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE) {
+        let node = QMerkleStoreDoubleIdNode::<Hash>::ffs_try_from_slice(chunk)
+            .map_err(|_| RealmImtMutationGraphError::MalformedContractStateNodes)?;
+        validate_user(node.key.tree_id, realm_id, config)?;
+        let identity = (
+            node.key.tree_id,
+            node.key.tree_sub_id,
+            node.key.level,
+            node.key.index,
+        );
+        if !seen.insert(identity) {
+            return Err(RealmImtMutationGraphError::DuplicateMerkleMutation(
+                RealmImtBaselineNodeKey::ContractState {
+                    user_id: node.key.tree_id,
+                    contract_id: node.key.tree_sub_id,
+                    level: node.key.level,
+                    index: node.key.index,
+                },
+            ));
+        }
+        rows.push(LogicalMutation::Put {
+            key: TypedTableKey::ContractStateMerkle {
+                user: UserId::new(node.key.tree_id),
+                contract: ContractId::new(node.key.tree_sub_id),
+                node: MerkleNode::new(node.key.level, NodeIndex::new(node.key.index)),
+                checkpoint,
+            },
+            value: MutationValue::PsyCanonicalBytes(
+                node.value.into_owned_32bytes().to_vec(),
+            ),
+        });
+    }
+    Ok(rows)
+}
+
+fn parse_imt_state_rows<Hash: Q256BitHash>(
+    prepared: &PsyPreparedRealmBlockStateUpdates<Hash>,
+    checkpoint: CheckpointId,
+) -> Result<(Vec<LogicalMutation>, usize), RealmImtMutationGraphError> {
+    let bytes = &prepared.update_contract_state_imt_leaves_ffs;
+    if !bytes.len().is_multiple_of(IMT_LEAF_FFS_ENTRY_SIZE_V2) {
+        return Err(RealmImtMutationGraphError::MalformedImtLeaves);
+    }
+    let mut final_leaf_keys = BTreeSet::new();
+    let mut rows = Vec::with_capacity(bytes.len() / IMT_LEAF_FFS_ENTRY_SIZE_V2);
+    for chunk in bytes.chunks_exact(IMT_LEAF_FFS_ENTRY_SIZE_V2) {
+        if chunk[160] > 1 {
+            return Err(RealmImtMutationGraphError::NonCanonicalImtNewKeyFlag(
+                chunk[160],
+            ));
+        }
+        let (tree_id, contract_id, leaf_index, ..) =
+            deserialize_imt_leaf_ffs_entry_v2(chunk)
+                .map_err(|_| RealmImtMutationGraphError::MalformedImtLeaves)?;
+        final_leaf_keys.insert((tree_id, contract_id, leaf_index));
+        rows.push(LogicalMutation::Put {
+            key: TypedTableKey::ImtLeaf {
+                tree: TreeId::new(tree_id),
+                tree_sub: TreeSubId::new(contract_id),
+                leaf: LeafIndex::new(leaf_index),
+                checkpoint,
+            },
+            value: MutationValue::Structured {
+                schema: StructuredValueSchema::ImtLeafRowV1,
+                canonical_bytes: chunk.to_vec(),
+            },
+        });
+    }
+    Ok((rows, final_leaf_keys.len()))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_graph_edges<F, Hash, Hasher>(
     prepared: &PsyPreparedRealmBlockStateUpdates<Hash>,
@@ -1052,6 +1294,10 @@ pub enum RealmImtMutationGraphError {
     PredecessorRealmRootMismatch,
     MerkleParentMismatch(RealmImtBaselineNodeKey),
     PreparedSerializationFailed,
+    PreparedPayloadIdentityMismatch,
+    StateCheckpointOutOfRange(u64),
+    PreparedRowDomainMismatch,
+    PreparedRowCountMismatch,
 }
 
 impl fmt::Display for RealmImtMutationGraphError {
