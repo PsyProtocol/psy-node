@@ -377,6 +377,7 @@ mod tests {
     };
     use psy_node_core::store::{
         branch_pending_mapping::BranchPendingMapping,
+        timestamp::{DeleteFenceTimestampUs, NewBranchWriteTimestampUs},
         typed::{
             CheckpointId, CheckpointRootKey, CheckpointedObjectKey,
             LatestInfoSlot, LogicalMutation, MerkleNode, MutationValue,
@@ -390,6 +391,7 @@ mod tests {
         BranchExactCutoverPhase, BranchExactWriterCutoverFence,
         MutationBuildError, RegistryBlocker, RegistryReadinessError,
         TimestampedMutationError, seal_commit_put, seal_commit_put_batch,
+        seal_new_branch_put,
     };
 
     type Hash = PHash;
@@ -649,6 +651,28 @@ mod tests {
             assemble_test(&narrow_prepared, mixed),
             Err(RealmFullCommitPhysicalPlanError::MixedWriteTimestamp { .. })
         ));
+
+        let old = CommitWriteTimestampUs::try_from_i128(10_000).unwrap();
+        let fence = DeleteFenceTimestampUs::try_after(old, 10_001).unwrap();
+        let new_branch = NewBranchWriteTimestampUs::try_after(fence, 10_002).unwrap();
+        let mut wrong_write_kind = remaining(&narrow_prepared);
+        wrong_write_kind[1].puts = vec![seal_new_branch_put(
+            LogicalMutation::Put {
+                key: TypedTableKey::CheckpointStateRoots(
+                    CheckpointId::try_new(12).unwrap(),
+                ),
+                value: MutationValue::PsyCanonicalBytes(vec![2]),
+            },
+            new_branch,
+        )
+        .unwrap()];
+        assert_eq!(
+            assemble_test(&narrow_prepared, wrong_write_kind),
+            Err(RealmFullCommitPhysicalPlanError::WrongWriteKind {
+                domain: RealmNormalCommitWriteDomain::CheckpointStateRoots,
+                actual: TimestampedWriteKind::NewBranchAfterFence,
+            })
+        );
 
         let mut duplicate = remaining(&narrow_prepared);
         let repeated = duplicate[0].puts[0].clone();
