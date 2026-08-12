@@ -56,6 +56,7 @@ use psy_core::{
 use psy_data::{
     guta::header_extended::{
         GlobalUserTreeAggregatorHeaderWithTagValue,
+        GlobalUserTreeAggregatorHeaderWithTagValueAndJobID,
         GlobalUserTreeAggregatorHeaderWithTagValueAndJobType,
         GlobalUserTreeAggregatorHeaderWithJobId,
     },
@@ -63,7 +64,7 @@ use psy_data::{
     prepared_block::realm::PsyRealmCoordinatorUpdate,
     protocol::{
         canonical_chain::{
-            CanonicalChainRef, CheckpointHash, CheckpointId,
+            CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId,
             CheckpointRef,
         },
         chain_context::{
@@ -116,12 +117,18 @@ use psy_node_core::{
         PsyNodeCheckpointObjectDatabaseWriter,
         PsyNodeCheckpointTreeDatabaseReader,
         PsyNodeCoreDatabaseBasicContractInfoStoreWriter,
+        PsyNodeGlobalUserTreeDatabaseWriter,
     },
     psy_temp_db::{
-        QTempDBPendingContextWriter, QTempDBProofWitnessWriter,
+        QTempDBPendingContextWriter, QTempDBPendingIdWriter,
+        QTempDBProofWitnessWriter,
         QTempDBRewardsTreeReader, QTempDBWorkerReputationWriter,
     },
     queue::{
+        coordinator_guta_durable_submission::{
+            CoordinatorGutaDurableSubmissionSlot,
+        },
+        ephemeral::QStandardEphemeralQueueSubscriber,
         realm_processor_actor_input::{
             RealmProcessorActorInput, RealmProcessorActorInputDigest,
         },
@@ -185,6 +192,10 @@ use psy_node_core::{
             AuthorityStorageNamespaceId, SealedAuthorityLocalHeadCas,
         },
         branch_exact_dual_write::BranchExactDualWriteIntent,
+        canonical_head::{
+            CanonicalHeadBootstrap, CanonicalHeadBootstrapProfile,
+            CoordinatorCanonicalHeadStore,
+        },
         branch_pending_mapping::BranchPendingMapping,
         manifest_lifecycle::AuthorityHeadView,
         manifest_record::AuthorityManifestDigest,
@@ -210,6 +221,12 @@ use psy_node_core::{
             authorize_realm_processor_startup,
             RealmProcessorStartupAuthorization, RealmProcessorStartupLineage,
             RealmProcessorStartupMode,
+        },
+        rollback_admin::{
+            CoordinatorRollbackAdminInbox, RollbackAdminInboxAccess,
+        },
+        rollback_admission::{
+            CoordinatorRollbackAdmissionStore, RollbackAdmissionSlotBootstrap,
         },
         realm_proof_binding::SealedRealmProofBinding,
         traits::proof_store::QCanonicalProofStoreV2,
@@ -246,6 +263,12 @@ use crate::psy_setup::{
 
 #[cfg(feature = "rf3-test-support")]
 use psy_node_common::{
+    coordinator::{
+        edge::handler::CoordinatorEdgeHandler,
+        processor::gatherers::coordinator_guta_update_gatherer::
+            qualification_recover_coordinator_guta_queue_item,
+        queue_key::CoordinatorSubmitRealmGUTAUpdateQueueKey,
+    },
     constants::queue::PQ_REALM_SUBMIT_USER_UPDATE_QUEUE_TOPIC_ID,
     queue::gatherer::EphemeralQueueGathererWithTree,
     realm::processor::{
@@ -437,6 +460,19 @@ struct E3Report {
     coordinator_rpc_post_commit_error_recovered: bool,
     coordinator_rpc_preexisting_inclusion_recovered_without_submit: bool,
     coordinator_rpc_socket_response_loss_injected: bool,
+    coordinator_handler_durable_rf3: bool,
+    coordinator_handler_real_jtmb: bool,
+    coordinator_handler_submission_exact: bool,
+    coordinator_handler_same_retry: bool,
+    coordinator_handler_queue_messages: u64,
+    coordinator_handler_queue_dataset_digest: String,
+    coordinator_processor_projection_recovered: bool,
+    coordinator_processor_conflicting_projection_rejected: bool,
+    coordinator_handler_during_one_replica_offline: bool,
+    coordinator_handler_publish_after_leader_failover: bool,
+    coordinator_real_redis_process_restart: bool,
+    mixed_version_clean_boundary_required: bool,
+    mixed_version_overlap_supported: bool,
     production_coordinator_handler_rf3: bool,
     production_coordinator_processor_rf3: bool,
     proof_worker_queue_rf3: bool,
@@ -523,6 +559,12 @@ const APPLICATION_HANDOFF_DATA_TABLES: &[&str] = &[
 const TERMINAL_RECOVERY_CONTROL_TABLES: &[&str] = &[
     REALM_PROCESSOR_GENERATION_TERMINAL_TABLE,
     REALM_PROCESSOR_DEFERRED_CARRYOVER_TABLE,
+];
+
+const COORDINATOR_HANDLER_CONTROL_TABLES: &[&str] = &[
+    "coordinator_canonical_head",
+    "coordinator_rollback_admission_inbox",
+    "branch_exact_coordinator_guta_submission_v1",
 ];
 
 const HANDLER_MUTATION_CONTROL_TABLES: &[&str] = &[
@@ -617,6 +659,7 @@ async fn direct_one_snapshot(
     include_durable_replay: bool,
     include_application_handoff: bool,
     include_terminal_recovery: bool,
+    include_coordinator_handler: bool,
 ) -> anyhow::Result<PhysicalSnapshot> {
     let session = fixture::connect(Some(ip), Consistency::One).await?;
     let mut control = CONTROL_DIRECT_ONE_TABLES.to_vec();
@@ -631,6 +674,9 @@ async fn direct_one_snapshot(
     }
     if include_terminal_recovery {
         control.extend_from_slice(TERMINAL_RECOVERY_CONTROL_TABLES);
+    }
+    if include_coordinator_handler {
+        control.extend_from_slice(COORDINATOR_HANDLER_CONTROL_TABLES);
     }
     snapshot_tables(&session, &control, &data).await
 }
@@ -2119,6 +2165,8 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         std::env::var("PSY_D04B6H23C4D3A_RF3").as_deref() == Ok("1");
     let exercise_coordinator_rpc =
         std::env::var("PSY_D04B6H23C4D3B1_RF3").as_deref() == Ok("1");
+    let exercise_coordinator_handler =
+        std::env::var("PSY_D04B6H23C4D3B2B2B1_RF3").as_deref() == Ok("1");
     ensure!(
         !exercise_proof_worker_queue || exercise_proof_narrow_writer,
         "c4d3a worker queue Gate requires c4d2 proof/narrow writer",
@@ -2127,12 +2175,18 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         !exercise_coordinator_rpc || exercise_proof_worker_queue,
         "c4d3b1 Coordinator RPC Gate requires c4d3a proof worker queue",
     );
+    ensure!(
+        !exercise_coordinator_handler || exercise_coordinator_rpc,
+        "c4d3b2b2b1 Coordinator Handler Gate requires c4d3b1 Coordinator RPC",
+    );
 
     fixture::wait_up(3).await?;
     let session = Arc::new(fixture::connect(None, Consistency::Quorum).await?);
     fixture::create_keyspaces(&session).await?;
-    let seed_db = setup_psy_scylla_database_store::<N>(Arc::new(fixture::core().await?))
-        .await?;
+    let seed_db = Arc::new(
+        setup_psy_scylla_database_store::<N>(Arc::new(fixture::core().await?))
+            .await?,
+    );
 
     let network_type = PsyChainNetworkType::PsyPublicTestnet;
     let (library, circuit_manager) = get_jtmb_circuit_library_and_prover_for_network::<
@@ -2184,6 +2238,34 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
             PendingQueueSidecarSetupMode::RequireVerified,
         )
         .await?;
+
+    let coordinator_core = if exercise_coordinator_handler {
+        let core = Arc::new(fixture::core().await?);
+        core.initialize_coordinator_canonical_head(true).await?;
+        core.initialize_coordinator_rollback_admission(true).await?;
+        core.initialize_pending_queue_sidecar_setup(
+            AuthorityScope::Coordinator,
+            PendingQueueSidecarSetupMode::RequireVerified,
+        )
+        .await?;
+        let coordinator_chain = CanonicalChainRef::new(
+            network,
+            ChainEpoch::new(0),
+            *predecessor_chain.checkpoint(),
+        );
+        let head = CanonicalHeadBootstrap::try_new(
+            CanonicalHeadBootstrapProfile::PostGenesisFloor,
+            coordinator_chain,
+        )?;
+        core.bootstrap_canonical_head(&head).await?;
+        core.bootstrap_rollback_admission_slot(
+            &RollbackAdmissionSlotBootstrap::new(network),
+        )
+        .await?;
+        Some(core)
+    } else {
+        None
+    };
 
     let state_checkpoint = AuthorityStateCheckpointId::new(
         predecessor_chain.checkpoint().checkpoint_id().get(),
@@ -2353,6 +2435,13 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         )
         .await?,
     );
+    if exercise_coordinator_handler {
+        // Production startup creates the Coordinator standard queue before
+        // accepting traffic. Create it while all three replicas are present,
+        // then exercise publish/consume through a freshly reconnected client
+        // after the deliberate leader failover below.
+        nats.ensure_stream().await?;
+    }
     let proof_worker_nats = if exercise_proof_worker_queue {
         let client = Arc::new(
             NatsJetStreamClient::new_connection(
@@ -2982,6 +3071,16 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
     let mut coordinator_rpc_sync_reads = 0_u64;
     let mut coordinator_rpc_post_commit_error_recovered = false;
     let mut coordinator_rpc_preexisting_inclusion_recovered_without_submit = false;
+    let mut coordinator_handler_durable_rf3 = false;
+    let mut coordinator_handler_real_jtmb = false;
+    let mut coordinator_handler_submission_exact = false;
+    let mut coordinator_handler_same_retry = false;
+    let mut coordinator_handler_queue_messages = 0_u64;
+    let mut coordinator_handler_queue_dataset_digest = String::new();
+    let mut coordinator_processor_projection_recovered = false;
+    let mut coordinator_processor_conflicting_projection_rejected = false;
+    let mut coordinator_handler_during_one_replica_offline = false;
+    let mut coordinator_handler_publish_after_leader_failover = false;
     let mut proof_worker_api_handler_rf3 = false;
     let mut proof_worker_jobs_dispatched = 0_usize;
     let mut proof_worker_jobs_completed = 0_usize;
@@ -4884,6 +4983,353 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                                 };
                                 qualification_coordinator_inclusion = true;
 
+                                if exercise_coordinator_handler {
+                                    let coordinator_core = coordinator_core
+                                        .as_ref()
+                                        .ok_or_else(|| anyhow::anyhow!(
+                                            "Coordinator control store is absent",
+                                        ))?;
+                                    let durable_submissions = coordinator_core
+                                        .prepare_coordinator_guta_durable_submission_store(
+                                            network,
+                                        )
+                                        .await?;
+                                    let checkpoint_id = proof_predecessor_chain
+                                        .checkpoint()
+                                        .checkpoint_id()
+                                        .get();
+                                    seed_db.set_latest_checkpoint_id(checkpoint_id).await?;
+                                    seed_db
+                                        .global_user_tree_set_leaf_hash(
+                                            checkpoint_id,
+                                            u64::from(REALM_ID),
+                                            proof.submission
+                                                .header
+                                                .header
+                                                .state_transition
+                                                .old_node_value,
+                                        )
+                                        .await?;
+
+                                    let coordinator_rid = QRealmIdentifier {
+                                        realm_id: 0,
+                                        realm_sub_id: 0,
+                                    };
+                                    let coordinator_pending = 910_000_u64;
+                                    let coordinator_proc = 910_001_u128;
+                                    let coordinator_context = PendingContext::new(
+                                        proof_predecessor_chain,
+                                        AuthorityScope::Coordinator,
+                                        WorkUniquePendingId::new(coordinator_pending),
+                                        WorkProcCheckpointUniqueId::from_u128(
+                                            coordinator_proc,
+                                        ),
+                                    );
+                                    let coordinator_temp = Arc::new(
+                                        InMemoryTempStore::new(
+                                            format!(
+                                                "{}-c4d3b2b2b1-handler",
+                                                fixture::KEYSPACE,
+                                            ),
+                                            0,
+                                            0,
+                                        ),
+                                    );
+                                    coordinator_temp
+                                        .set_current_pending_context(
+                                            &coordinator_rid,
+                                            &coordinator_context,
+                                        )
+                                        .await?;
+                                    coordinator_temp
+                                        .set_gathering_unique_pending_ids(
+                                            &coordinator_rid,
+                                            coordinator_pending,
+                                            coordinator_proc,
+                                        )
+                                        .await?;
+
+                                    let queue_key =
+                                        CoordinatorSubmitRealmGUTAUpdateQueueKey::<PF, PHash> {
+                                            realm_id: 0,
+                                            realm_sub_id: 0,
+                                            unique_id: coordinator_proc,
+                                            task_group: 0,
+                                            queue_type:
+                                                QPBaseQueueType::StandardEphemeral,
+                                            _phantom_queue_item:
+                                                std::marker::PhantomData,
+                                        };
+                                    let subject = queue_key.get_queue_subject(
+                                        restarted_nats.base_namespace(),
+                                        0,
+                                        0,
+                                        coordinator_proc,
+                                        0,
+                                    );
+                                    let durable_name = queue_key.get_durable_name(
+                                        restarted_nats.base_namespace(),
+                                        0,
+                                        0,
+                                        coordinator_proc,
+                                        0,
+                                    );
+                                    restarted_nats.ensure_consumer(
+                                        &subject,
+                                        &durable_name,
+                                        QPBaseQueueType::StandardEphemeral,
+                                    )
+                                    .await?;
+                                    let before_handler_messages =
+                                        stream_messages(
+                                            &jetstream,
+                                            restarted_nats.stream_name(),
+                                        )
+                                        .await?;
+                                    let rollback_inbox = Arc::new(
+                                        CoordinatorRollbackAdminInbox::new(
+                                            network,
+                                            RollbackAdminInboxAccess::Disabled,
+                                            coordinator_core.clone(),
+                                            coordinator_core.clone(),
+                                        ),
+                                    );
+                                    let coordinator_handler =
+                                        CoordinatorEdgeHandler::<
+                                            N,
+                                            _,
+                                            _,
+                                            _,
+                                            _,
+                                            _,
+                                            _,
+                                            _,
+                                            _,
+                                        >::new(
+                                            Arc::clone(&seed_db),
+                                            coordinator_core.clone(),
+                                            rollback_inbox,
+                                            Arc::clone(&seed_db),
+                                            Arc::clone(&coordinator_temp),
+                                            Arc::clone(&coordinator_temp),
+                                            Arc::clone(&restarted_nats),
+                                            Arc::clone(&restarted_nats),
+                                            Arc::clone(&restarted_nats),
+                                            Arc::clone(&restarted_nats),
+                                            coordinator_rid,
+                                            Arc::clone(&verifier),
+                                            guta_circuit_whitelist,
+                                            network,
+                                        )
+                                        .install_durable_guta_submissions(
+                                            Arc::clone(&durable_submissions),
+                                        )?;
+
+                                    coordinator_handler
+                                        .submit_guta_internal(
+                                            proof.submission.clone(),
+                                            proof.proof_bytes.clone(),
+                                        )
+                                        .await
+                                        .context(
+                                            "c4d3b2b2b1 production Coordinator Handler submit",
+                                        )?;
+                                    let first_queue_item = restarted_nats
+                                        .wait_for_ephemeral_queue_item_bytes(
+                                            &queue_key,
+                                            0,
+                                            0,
+                                            coordinator_proc,
+                                            0,
+                                            30_000,
+                                        )
+                                        .await?
+                                        .ok_or_else(|| anyhow::anyhow!(
+                                            "Coordinator GUTA queue item was not published",
+                                        ))?;
+                                    let decoded_queue_item =
+                                        GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<
+                                            PF,
+                                            PHash,
+                                        >::psy_ser_from_slice(&first_queue_item)?;
+                                    let durable_slot =
+                                        CoordinatorGutaDurableSubmissionSlot::for_submission(
+                                            &coordinator_context,
+                                            u64::from(REALM_ID),
+                                        )?;
+                                    let durable = durable_submissions
+                                        .read_selected(durable_slot)
+                                        .await?
+                                        .ok_or_else(|| anyhow::anyhow!(
+                                            "Coordinator durable submission disappeared",
+                                        ))?;
+                                    ensure!(
+                                        durable.pending() == &coordinator_context
+                                            && durable.queue_item()
+                                                == first_queue_item.as_slice()
+                                            && durable.proof_bytes()
+                                                == proof.proof_bytes.as_slice(),
+                                        "Coordinator durable submission readback mismatch",
+                                    );
+                                    coordinator_handler
+                                        .submit_guta_internal(
+                                            proof.submission.clone(),
+                                            proof.proof_bytes.clone(),
+                                        )
+                                        .await
+                                        .context(
+                                            "c4d3b2b2b1 idempotent Handler retry",
+                                        )?;
+                                    let second_queue_item = restarted_nats
+                                        .wait_for_ephemeral_queue_item_bytes(
+                                            &queue_key,
+                                            0,
+                                            0,
+                                            coordinator_proc,
+                                            0,
+                                            30_000,
+                                        )
+                                        .await?
+                                        .ok_or_else(|| anyhow::anyhow!(
+                                            "Coordinator retry queue item was not published",
+                                        ))?;
+                                    ensure!(first_queue_item == second_queue_item);
+                                    ensure!(
+                                        durable_submissions
+                                            .read_selected(durable_slot)
+                                            .await?
+                                            == Some(durable.clone()),
+                                    );
+
+                                    let recovery_temp = Arc::new(
+                                        InMemoryTempStore::new(
+                                            format!(
+                                                "{}-c4d3b2b2b1-recovery",
+                                                fixture::KEYSPACE,
+                                            ),
+                                            0,
+                                            0,
+                                        ),
+                                    );
+                                    recovery_temp
+                                        .set_current_pending_context(
+                                            &coordinator_rid,
+                                            &coordinator_context,
+                                        )
+                                        .await?;
+                                    let recovery =
+                                        qualification_recover_coordinator_guta_queue_item::<
+                                            N,
+                                            _,
+                                            _,
+                                        >(
+                                            Arc::clone(&durable_submissions),
+                                            Arc::clone(&recovery_temp),
+                                            Arc::clone(&recovery_temp),
+                                            coordinator_rid,
+                                            coordinator_pending,
+                                            coordinator_proc,
+                                            first_queue_item.clone(),
+                                        )
+                                        .await
+                                        .context(
+                                            "c4d3b2b2b1 Processor durable projection recovery",
+                                        )?;
+                                    ensure!(
+                                        recovery.submitted_realm_id
+                                            == u64::from(REALM_ID)
+                                            && recovery.proof_was_missing
+                                            && recovery.proof_rehydrated,
+                                    );
+
+                                    let conflict_temp = Arc::new(
+                                        InMemoryTempStore::new(
+                                            format!(
+                                                "{}-c4d3b2b2b1-conflict",
+                                                fixture::KEYSPACE,
+                                            ),
+                                            0,
+                                            0,
+                                        ),
+                                    );
+                                    conflict_temp
+                                        .set_current_pending_context(
+                                            &coordinator_rid,
+                                            &coordinator_context,
+                                        )
+                                        .await?;
+                                    let conflict_address = conflict_temp
+                                        .resolve_proof_address(
+                                            &coordinator_context,
+                                            &decoded_queue_item.job_id,
+                                        )?;
+                                    let conflicting_proof = vec![0xA5; 32];
+                                    conflict_temp
+                                        .put_proof_bytes_exact(
+                                            &conflict_address,
+                                            &conflicting_proof,
+                                        )
+                                        .await?;
+                                    coordinator_processor_conflicting_projection_rejected =
+                                        qualification_recover_coordinator_guta_queue_item::<
+                                            N,
+                                            _,
+                                            _,
+                                        >(
+                                            Arc::clone(&durable_submissions),
+                                            Arc::clone(&conflict_temp),
+                                            Arc::clone(&conflict_temp),
+                                            coordinator_rid,
+                                            coordinator_pending,
+                                            coordinator_proc,
+                                            first_queue_item,
+                                        )
+                                        .await
+                                        .is_err();
+                                    ensure!(
+                                        coordinator_processor_conflicting_projection_rejected
+                                            && conflict_temp
+                                                .get_proof_bytes_exact(
+                                                    &conflict_address,
+                                                )
+                                                .await?
+                                                .as_deref()
+                                                == Some(
+                                                    conflicting_proof.as_slice(),
+                                                ),
+                                    );
+                                    let after_handler_messages = stream_messages(
+                                        &jetstream,
+                                        restarted_nats.stream_name(),
+                                    )
+                                    .await?;
+                                    coordinator_handler_queue_messages =
+                                        after_handler_messages
+                                            .checked_sub(before_handler_messages)
+                                            .ok_or_else(|| anyhow::anyhow!(
+                                                "Coordinator Handler NATS count regressed",
+                                            ))?;
+                                    ensure!(coordinator_handler_queue_messages == 2);
+                                    let mut queue_hasher = Sha256::new();
+                                    queue_hasher.update(
+                                        b"psy/rf3/d04b6h23c4d3b2b2b1/coordinator-queue/v1",
+                                    );
+                                    queue_hasher.update(
+                                        (second_queue_item.len() as u64).to_be_bytes(),
+                                    );
+                                    queue_hasher.update(&second_queue_item);
+                                    coordinator_handler_queue_dataset_digest =
+                                        hex::encode(queue_hasher.finalize());
+                                    coordinator_handler_durable_rf3 = true;
+                                    coordinator_handler_real_jtmb = true;
+                                    coordinator_handler_submission_exact = true;
+                                    coordinator_handler_same_retry = true;
+                                    coordinator_processor_projection_recovered = true;
+                                    coordinator_handler_during_one_replica_offline = true;
+                                    coordinator_handler_publish_after_leader_failover =
+                                        leader_before != leader_after;
+                                }
+
                                 let mut tampered = coordinator.clone();
                                 tampered.merkle_proof_to_realm_root.value =
                                     PHash::from_owned_32bytes([0xE1; 32]);
@@ -5206,6 +5652,7 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                 exercise_durable_replay,
                 exercise_application_handoff,
                 exercise_terminal_recovery,
+                exercise_coordinator_handler,
             )
         }),
     )
@@ -5234,6 +5681,11 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                 }
                 + if exercise_terminal_recovery {
                     TERMINAL_RECOVERY_CONTROL_TABLES.len()
+                } else {
+                    0
+                }
+                + if exercise_coordinator_handler {
+                    COORDINATOR_HANDLER_CONTROL_TABLES.len()
                 } else {
                     0
                 }
@@ -5334,6 +5786,23 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                 &control,
                 REALM_PROCESSOR_DEFERRED_CARRYOVER_TABLE,
             )? == 3
+        );
+    }
+    if exercise_coordinator_handler {
+        ensure!(
+            replica.row_count(
+                &control,
+                "branch_exact_coordinator_guta_submission_v1",
+            )? == 1
+        );
+        ensure!(
+            replica.row_count(&control, "coordinator_canonical_head")? == 1
+        );
+        ensure!(
+            replica.row_count(
+                &control,
+                "coordinator_rollback_admission_inbox",
+            )? == 1
         );
     }
 
@@ -5483,7 +5952,20 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         coordinator_rpc_post_commit_error_recovered,
         coordinator_rpc_preexisting_inclusion_recovered_without_submit,
         coordinator_rpc_socket_response_loss_injected: false,
-        production_coordinator_handler_rf3: false,
+        coordinator_handler_durable_rf3,
+        coordinator_handler_real_jtmb,
+        coordinator_handler_submission_exact,
+        coordinator_handler_same_retry,
+        coordinator_handler_queue_messages,
+        coordinator_handler_queue_dataset_digest,
+        coordinator_processor_projection_recovered,
+        coordinator_processor_conflicting_projection_rejected,
+        coordinator_handler_during_one_replica_offline,
+        coordinator_handler_publish_after_leader_failover,
+        coordinator_real_redis_process_restart: false,
+        mixed_version_clean_boundary_required: exercise_coordinator_handler,
+        mixed_version_overlap_supported: false,
+        production_coordinator_handler_rf3: exercise_coordinator_handler,
         production_coordinator_processor_rf3: false,
         proof_worker_queue_rf3: exercise_proof_worker_queue,
         proof_worker_api_handler_rf3,
@@ -5522,7 +6004,9 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         full_node_restart_tested: false,
         production_serving: false,
         h8_domains_closed: 0,
-        qualification: if exercise_coordinator_rpc {
+        qualification: if exercise_coordinator_handler {
+            "H23C4D3B2B2B1_COORDINATOR_HANDLER_RECOVERY_PREFIX_RF3_PASSED"
+        } else if exercise_coordinator_rpc {
             "H23C4D3B1_REALM_COORDINATOR_RPC_RECOVERY_RF3_PASSED"
         } else if exercise_proof_worker_queue {
             "H23C4D3A_REALM_PROOF_WORKER_QUEUE_RF3_PASSED"

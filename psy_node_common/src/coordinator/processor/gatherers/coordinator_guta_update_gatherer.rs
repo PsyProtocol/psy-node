@@ -47,6 +47,171 @@ fn get_temp_guta_rand_seed<Hash: Q256BitHash>() -> Hash {
     rand::thread_rng().fill_bytes(&mut bytes);
     Hash::from_owned_32bytes(bytes)
 }
+
+async fn decode_and_rehydrate_durable_submission<
+    N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
+    TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + Send + Sync,
+    ProofStore: QParthProofStore + QCanonicalProofStoreV2 + Send + Sync,
+>(
+    durable_guta_submissions: Option<
+        &Arc<dyn CoordinatorGutaDurableSubmissionStore<N::QHash>>,
+    >,
+    temp_db: &TempDatabase,
+    proof_store: &ProofStore,
+    realm_identifier: &QRealmIdentifier,
+    expected_unique_pending_id: u64,
+    expected_proc_checkpoint_id: QCoreProcCheckpointUniqueId,
+    item: &[u8],
+) -> anyhow::Result<(
+    GlobalUserTreeAggregatorHeaderWithTagValueAndJobID<N::F, N::QHash>,
+    psy_data::protocol::chain_context::PendingContext<N::QHash>,
+)> {
+    if item.len()
+        != GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<N::F, N::QHash>::FIXED_SIZE
+    {
+        anyhow::bail!(
+            "Invalid queue item size for CoordinatorGUTAUpdateGatherer: expected {}, got {}",
+            GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<N::F, N::QHash>::FIXED_SIZE,
+            item.len(),
+        );
+    }
+    let update_header =
+        GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<N::F, N::QHash>::
+            psy_ser_from_slice(item)?;
+    let pending_context = temp_db
+        .require_pending_context_for_pending_id(
+            realm_identifier,
+            expected_unique_pending_id,
+        )
+        .await?;
+    if pending_context.proc_checkpoint_unique_id().as_u128()
+        != expected_proc_checkpoint_id
+    {
+        anyhow::bail!(
+            "Coordinator GUTA queue proc ID does not match exact pending context"
+        );
+    }
+
+    if let Some(store) = durable_guta_submissions {
+        let submitted_realm_id = update_header
+            .header
+            .header
+            .state_transition
+            .node_index
+            .to_u64_value();
+        let slot = CoordinatorGutaDurableSubmissionSlot::for_submission(
+            &pending_context,
+            submitted_realm_id,
+        )?;
+        let durable = store
+            .read_selected(slot)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!(
+                "durable Coordinator GUTA submission is missing for realm {}",
+                submitted_realm_id,
+            ))?;
+        if durable.pending() != &pending_context || durable.queue_item() != item {
+            anyhow::bail!(
+                "durable Coordinator GUTA submission does not match queue item"
+            );
+        }
+        let proof_address = proof_store
+            .resolve_proof_address(&pending_context, &update_header.job_id)?;
+        match proof_store.get_proof_bytes_exact(&proof_address).await? {
+            Some(current) if current.as_slice() != durable.proof_bytes() => {
+                anyhow::bail!(
+                    "Coordinator GUTA proof projection contains conflicting bytes"
+                );
+            }
+            Some(_) => {}
+            None => {
+                proof_store
+                    .put_proof_bytes_exact(&proof_address, durable.proof_bytes())
+                    .await?;
+            }
+        }
+        if proof_store
+            .get_proof_bytes_exact(&proof_address)
+            .await?
+            .as_deref()
+            != Some(durable.proof_bytes())
+        {
+            anyhow::bail!("Coordinator GUTA proof projection readback mismatch");
+        }
+        if store.read_selected(slot).await? != Some(durable) {
+            anyhow::bail!(
+                "durable Coordinator GUTA submission changed during recovery"
+            );
+        }
+    }
+
+    Ok((update_header, pending_context))
+}
+
+#[cfg(feature = "rf3-test-support")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QualificationCoordinatorGutaRecoveryTrace {
+    pub submitted_realm_id: u64,
+    pub proof_was_missing: bool,
+    pub proof_rehydrated: bool,
+}
+
+/// Exercise the exact durable-selection prefix used by the production
+/// Coordinator gatherer without exposing its tree/file/planner mutation
+/// capabilities to an RF=3 harness.
+#[cfg(feature = "rf3-test-support")]
+pub async fn qualification_recover_coordinator_guta_queue_item<
+    N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
+    TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + Send + Sync,
+    ProofStore: QParthProofStore + QCanonicalProofStoreV2 + Send + Sync,
+>(
+    store: Arc<dyn CoordinatorGutaDurableSubmissionStore<N::QHash>>,
+    temp_db: Arc<TempDatabase>,
+    proof_store: Arc<ProofStore>,
+    realm_identifier: QRealmIdentifier,
+    expected_unique_pending_id: u64,
+    expected_proc_checkpoint_id: QCoreProcCheckpointUniqueId,
+    item: Vec<u8>,
+) -> anyhow::Result<QualificationCoordinatorGutaRecoveryTrace> {
+    let decoded =
+        GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<N::F, N::QHash>::
+            psy_ser_from_slice(&item)?;
+    let pending_context = temp_db
+        .require_pending_context_for_pending_id(
+            &realm_identifier,
+            expected_unique_pending_id,
+        )
+        .await?;
+    let proof_address = proof_store
+        .resolve_proof_address(&pending_context, &decoded.job_id)?;
+    let proof_was_missing = proof_store
+        .get_proof_bytes_exact(&proof_address)
+        .await?
+        .is_none();
+    let (decoded, _) = decode_and_rehydrate_durable_submission::<N, _, _>(
+        Some(&store),
+        temp_db.as_ref(),
+        proof_store.as_ref(),
+        &realm_identifier,
+        expected_unique_pending_id,
+        expected_proc_checkpoint_id,
+        &item,
+    )
+    .await?;
+    Ok(QualificationCoordinatorGutaRecoveryTrace {
+        submitted_realm_id: decoded
+            .header
+            .header
+            .state_transition
+            .node_index
+            .to_u64_value(),
+        proof_was_missing,
+        proof_rehydrated: proof_store
+            .get_proof_bytes_exact(&proof_address)
+            .await?
+            .is_some(),
+    })
+}
 pub fn get_new_coordinator_guta_update_gatherer_backup_file_path(
     backup_file_directory: &str,
     realm_id_u64: u64,
@@ -340,15 +505,22 @@ impl<
         tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
         item: Vec<u8>,
     ) -> anyhow::Result<()> {
-        if item.len() != GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<N::F, N::QHash>::FIXED_SIZE {
-            // added sanity check
-            return Err(anyhow::anyhow!(
-                "Invalid queue item size for CoordinatorGUTAUpdateGatherer: expected {}, got {}",
-                GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<N::F, N::QHash>::FIXED_SIZE,
-                item.len()
-            ));
-        }
-        let update_header = GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<N::F, N::QHash>::psy_ser_from_slice(&item)?;
+        let unique_pending_id = self.status.unique_pending_id;
+        let realm_identifier = QRealmIdentifier {
+            realm_id: self.config.realm_id_u64 as u32,
+            realm_sub_id: self.config.realm_sub_id_u64 as u16,
+        };
+        let (update_header, pending_context) =
+            decode_and_rehydrate_durable_submission::<N, _, _>(
+                self.config.durable_guta_submissions.as_ref(),
+                self.config.temp_db.as_ref(),
+                self.config.proof_store.as_ref(),
+                &realm_identifier,
+                unique_pending_id,
+                self.pending_core_proc_id,
+                &item,
+            )
+            .await?;
         let submitted_realm_id = update_header
             .header
             .header
@@ -369,79 +541,6 @@ impl<
         if self.last_committed_checkpoint_root != current_checkpoint_root {
             //self.update_status()?;
             self.last_committed_checkpoint_root = current_checkpoint_root;
-        }
-        let unique_pending_id = self.status.unique_pending_id;
-        let realm_identifier = QRealmIdentifier {
-            realm_id: self.config.realm_id_u64 as u32,
-            realm_sub_id: self.config.realm_sub_id_u64 as u16,
-        };
-        let pending_context = self
-            .config
-            .temp_db
-            .require_pending_context_for_pending_id(
-                &realm_identifier,
-                unique_pending_id,
-            )
-            .await?;
-        if pending_context.proc_checkpoint_unique_id().as_u128()
-            != self.pending_core_proc_id
-        {
-            anyhow::bail!(
-                "Coordinator GUTA queue proc ID does not match exact pending context"
-            );
-        }
-
-        if let Some(store) = &self.config.durable_guta_submissions {
-            let slot = CoordinatorGutaDurableSubmissionSlot::for_submission(
-                &pending_context,
-                submitted_realm_id,
-            )?;
-            let durable = store
-                .read_selected(slot)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!(
-                    "durable Coordinator GUTA submission is missing for realm {}",
-                    submitted_realm_id,
-                ))?;
-            if durable.pending() != &pending_context || durable.queue_item() != item.as_slice() {
-                anyhow::bail!(
-                    "durable Coordinator GUTA submission does not match queue item"
-                );
-            }
-            let proof_address = self
-                .config
-                .proof_store
-                .resolve_proof_address(&pending_context, &update_header.job_id)?;
-            match self
-                .config
-                .proof_store
-                .get_proof_bytes_exact(&proof_address)
-                .await?
-            {
-                Some(current) if current.as_slice() != durable.proof_bytes() => {
-                    anyhow::bail!("Coordinator GUTA proof projection contains conflicting bytes");
-                }
-                Some(_) => {}
-                None => {
-                    self.config
-                        .proof_store
-                        .put_proof_bytes_exact(&proof_address, durable.proof_bytes())
-                        .await?;
-                }
-            }
-            if self
-                .config
-                .proof_store
-                .get_proof_bytes_exact(&proof_address)
-                .await?
-                .as_deref()
-                != Some(durable.proof_bytes())
-            {
-                anyhow::bail!("Coordinator GUTA proof projection readback mismatch");
-            }
-            if store.read_selected(slot).await? != Some(durable) {
-                anyhow::bail!("durable Coordinator GUTA submission changed during recovery");
-            }
         }
 
         self.config
@@ -665,6 +764,14 @@ mod tests {
     #[test]
     fn durable_submission_rehydrates_exact_proof_before_gatherer_side_effects() {
         let source = include_str!("coordinator_guta_update_gatherer.rs");
+        let helper_start = source
+            .find("async fn decode_and_rehydrate_durable_submission")
+            .expect("durable recovery helper must exist");
+        let helper_end = source[helper_start..]
+            .find("#[cfg(feature = \"rf3-test-support\")]")
+            .map(|offset| helper_start + offset)
+            .expect("qualification projection must follow helper");
+        let helper = &source[helper_start..helper_end];
         let start = source
             .find("async fn update_from_queue_item_with_tree")
             .expect("queue item handler must exist");
@@ -674,24 +781,27 @@ mod tests {
             .expect("next gatherer method must exist");
         let body = &source[start..end];
 
-        let pending = body
+        let pending = helper
             .find("require_pending_context_for_pending_id")
             .expect("durable selection needs exact pending context");
-        let proc = body
-            .find("pending_core_proc_id")
+        let proc = helper
+            .rfind("expected_proc_checkpoint_id")
             .expect("durable selection needs exact proc identity");
-        let first_durable_read = body
+        let first_durable_read = helper
             .find("read_selected")
             .expect("durable record must be selected before projection");
-        let proof_write = body
+        let proof_write = helper
             .find("put_proof_bytes_exact")
             .expect("missing Redis proof projection must be reconstructed exactly");
-        let proof_readback = body
+        let proof_readback = helper
             .rfind("get_proof_bytes_exact")
             .expect("reconstructed proof must be read back exactly");
-        let second_durable_read = body
+        let second_durable_read = helper
             .rfind("read_selected")
             .expect("durable record must be revalidated after projection");
+        let recovery = body
+            .find("decode_and_rehydrate_durable_submission")
+            .expect("production gatherer must invoke durable recovery helper");
         let rewards = body
             .find("set_proof_miner_rewards_tree_value")
             .expect("gatherer reward mutation must remain explicit");
@@ -708,10 +818,10 @@ mod tests {
         assert!(proof_write < proof_readback);
         assert!(proof_readback < second_durable_read);
         for mutation in [rewards, backup, planner] {
-            assert!(second_durable_read < mutation);
+            assert!(recovery < mutation);
         }
-        assert!(!body.contains("get_proof_bytes("));
-        assert!(!body.contains("put_proof_bytes("));
+        assert!(!helper.contains("get_proof_bytes("));
+        assert!(!helper.contains("put_proof_bytes("));
     }
 
     #[tokio::test]
@@ -813,9 +923,6 @@ mod tests {
 
     #[tokio::test]
     async fn reads_all_local_coordinator_backups() -> anyhow::Result<()> {
-        type Hasher = PoseidonHasher;
-        type Hash = PHash;
-
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let workspace_root = manifest_dir.parent().unwrap();
         let backup_dir = workspace_root.join("local_checkpoints/coordinator_0_0/guta_updates_backup");

@@ -14,8 +14,11 @@ EXERCISE_DEFERRED_ACTOR_ARCHIVE="${PSY_D04B6H23C4C4B4C2_RF3:-0}"
 EXERCISE_PROOF_NARROW_WRITER="${PSY_D04B6H23C4D2_RF3:-0}"
 EXERCISE_PROOF_WORKER_QUEUE="${PSY_D04B6H23C4D3A_RF3:-0}"
 EXERCISE_COORDINATOR_RPC="${PSY_D04B6H23C4D3B1_RF3:-0}"
+EXERCISE_COORDINATOR_HANDLER="${PSY_D04B6H23C4D3B2B2B1_RF3:-0}"
 EXPECTED_QUALIFICATION="H23C4C2B4E3_JTMB_HANDLER_INGRESS_RF3_PASSED"
-if [[ "${EXERCISE_COORDINATOR_RPC}" == "1" ]]; then
+if [[ "${EXERCISE_COORDINATOR_HANDLER}" == "1" ]]; then
+  EXPECTED_QUALIFICATION="H23C4D3B2B2B1_COORDINATOR_HANDLER_RECOVERY_PREFIX_RF3_PASSED"
+elif [[ "${EXERCISE_COORDINATOR_RPC}" == "1" ]]; then
   EXPECTED_QUALIFICATION="H23C4D3B1_REALM_COORDINATOR_RPC_RECOVERY_RF3_PASSED"
 elif [[ "${EXERCISE_PROOF_WORKER_QUEUE}" == "1" ]]; then
   EXPECTED_QUALIFICATION="H23C4D3A_REALM_PROOF_WORKER_QUEUE_RF3_PASSED"
@@ -129,6 +132,7 @@ PSY_D04B6H23C4C4B4C2_RF3="${EXERCISE_DEFERRED_ACTOR_ARCHIVE}" \
 PSY_D04B6H23C4D2_RF3="${EXERCISE_PROOF_NARROW_WRITER}" \
 PSY_D04B6H23C4D3A_RF3="${EXERCISE_PROOF_WORKER_QUEUE}" \
 PSY_D04B6H23C4D3B1_RF3="${EXERCISE_COORDINATOR_RPC}" \
+PSY_D04B6H23C4D3B2B2B1_RF3="${EXERCISE_COORDINATOR_HANDLER}" \
 PSY_D04B6H23C4C2B4E3_COMPOSE_FILE="${COMPOSE_FILE}" \
 PSY_D04B6H23C4C2B4E3_REPORT_PATH="${REPORT_PATH}" \
 PSY_D04B6H23C4C2B4E3_NATS_URLS="nats://127.0.0.1:45322,nats://127.0.0.1:45323,nats://127.0.0.1:45324" \
@@ -150,7 +154,8 @@ jq -e \
   --argjson exercise_deferred_actor_archive "${EXERCISE_DEFERRED_ACTOR_ARCHIVE}" \
   --argjson exercise_proof_narrow_writer "${EXERCISE_PROOF_NARROW_WRITER}" \
   --argjson exercise_proof_worker_queue "${EXERCISE_PROOF_WORKER_QUEUE}" \
-  --argjson exercise_coordinator_rpc "${EXERCISE_COORDINATOR_RPC}" '
+  --argjson exercise_coordinator_rpc "${EXERCISE_COORDINATOR_RPC}" \
+  --argjson exercise_coordinator_handler "${EXERCISE_COORDINATOR_HANDLER}" '
   .qualification == $expected_qualification
   and .scylla_replication_factor == 3
   and .configured_nats_servers == 3
@@ -176,7 +181,8 @@ jq -e \
   and .restart_retry_messages == 3
   and .dependency_explicit_timestamp_verified == true
   and .repair_direct_one_tables == (
-    if $exercise_terminal_recovery == 1 then 25
+    if $exercise_coordinator_handler == 1 then 28
+    elif $exercise_terminal_recovery == 1 then 25
     elif $exercise_application_handoff == 1 then 23
     elif $exercise_durable_replay == 1 then 20
     else 17 end
@@ -215,7 +221,7 @@ jq -e \
       and (.proof_binding_digest | test("^[0-9a-f]{64}$"))
       and .proof_binding_tamper_rejected == true
       and .qualification_coordinator_inclusion == true
-      and .production_coordinator_handler_rf3 == false
+      and .production_coordinator_handler_rf3 == ($exercise_coordinator_handler == 1)
       and .production_coordinator_processor_rf3 == false
       and .coordinator_rpc_socket_response_loss_injected == false
       and (
@@ -239,6 +245,37 @@ jq -e \
           and .coordinator_rpc_sync_reads == 0
           and .coordinator_rpc_post_commit_error_recovered == false
           and .coordinator_rpc_preexisting_inclusion_recovered_without_submit == false
+        end
+      )
+      and (
+        if $exercise_coordinator_handler == 1 then
+          .coordinator_handler_durable_rf3 == true
+          and .coordinator_handler_real_jtmb == true
+          and .coordinator_handler_submission_exact == true
+          and .coordinator_handler_same_retry == true
+          and .coordinator_handler_queue_messages == 2
+          and (.coordinator_handler_queue_dataset_digest | test("^[0-9a-f]{64}$"))
+          and .coordinator_processor_projection_recovered == true
+          and .coordinator_processor_conflicting_projection_rejected == true
+          and .coordinator_handler_during_one_replica_offline == true
+          and .coordinator_handler_publish_after_leader_failover == true
+          and .coordinator_real_redis_process_restart == false
+          and .mixed_version_clean_boundary_required == true
+          and .mixed_version_overlap_supported == false
+        else
+          .coordinator_handler_durable_rf3 == false
+          and .coordinator_handler_real_jtmb == false
+          and .coordinator_handler_submission_exact == false
+          and .coordinator_handler_same_retry == false
+          and .coordinator_handler_queue_messages == 0
+          and .coordinator_handler_queue_dataset_digest == ""
+          and .coordinator_processor_projection_recovered == false
+          and .coordinator_processor_conflicting_projection_rejected == false
+          and .coordinator_handler_during_one_replica_offline == false
+          and .coordinator_handler_publish_after_leader_failover == false
+          and .coordinator_real_redis_process_restart == false
+          and .mixed_version_clean_boundary_required == false
+          and .mixed_version_overlap_supported == false
         end
       )
       and .proof_worker_queue_rf3 == ($exercise_proof_worker_queue == 1)
@@ -291,6 +328,19 @@ jq -e \
       and .coordinator_rpc_post_commit_error_recovered == false
       and .coordinator_rpc_preexisting_inclusion_recovered_without_submit == false
       and .coordinator_rpc_socket_response_loss_injected == false
+      and .coordinator_handler_durable_rf3 == false
+      and .coordinator_handler_real_jtmb == false
+      and .coordinator_handler_submission_exact == false
+      and .coordinator_handler_same_retry == false
+      and .coordinator_handler_queue_messages == 0
+      and .coordinator_handler_queue_dataset_digest == ""
+      and .coordinator_processor_projection_recovered == false
+      and .coordinator_processor_conflicting_projection_rejected == false
+      and .coordinator_handler_during_one_replica_offline == false
+      and .coordinator_handler_publish_after_leader_failover == false
+      and .coordinator_real_redis_process_restart == false
+      and .mixed_version_clean_boundary_required == false
+      and .mixed_version_overlap_supported == false
       and .production_coordinator_handler_rf3 == false
       and .production_coordinator_processor_rf3 == false
       and .proof_worker_queue_rf3 == false
