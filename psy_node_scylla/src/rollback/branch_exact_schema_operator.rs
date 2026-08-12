@@ -10,8 +10,15 @@
 use std::sync::Arc;
 
 use parth_core::protocol::core_types::Q256BitHash;
+use psy_data::protocol::canonical_chain::CanonicalChainRef;
+use psy_node_core::store::authority_commit::{
+    AuthorityClockSampleUs, AuthorityCommitIntentDigest,
+    AuthorityIntentObservation, AuthorityTimestampKey,
+    AuthorityTimestampReadState, AuthorityTimestampWriteOutcome,
+};
 use psy_node_core::store::timestamp::CommitWriteTimestampUs;
 use scylla::client::session::Session;
+use sha2::{Digest, Sha256};
 
 use super::{
     inspect_branch_exact_local_node_postflight, BranchExactBackfillArtifact,
@@ -22,11 +29,14 @@ use super::{
     BranchExactDeploymentNoTabletKeyspace, BranchExactExpectedTopology,
     BranchExactSchemaMaterializationRequest, BranchExactSchemaMaterializer,
     BranchExactTopologyAttestation, BranchExactVerifiedDeploymentReceipt,
-    ScyllaBranchExactBackfillExecutor,
+    ScyllaAuthorityTimestampStore, ScyllaBranchExactBackfillExecutor,
     ScyllaBranchExactDeploymentLifecycleStore, SealedBranchExactBackfillChunkCas,
     SealedBranchExactBackfillPlanCas, SealedBranchExactBackfillVerifiedCas,
     SealedBranchExactSchemaVerifiedCas, StoredBranchExactDeploymentLifecycle,
 };
+
+const MIGRATION_TIMESTAMP_INTENT_DOMAIN: &[u8] =
+    b"psy/rollback/branch-exact-schema-migration-timestamp/v1";
 
 /// All inputs whose identity must remain stable across an operator retry.
 ///
@@ -37,7 +47,6 @@ pub(crate) struct BranchExactPostGenesisMigration<'a, Hash> {
     pub(crate) request: &'a BranchExactSchemaMaterializationRequest,
     pub(crate) artifact: &'a BranchExactBackfillArtifact<Hash>,
     pub(crate) expected_topology: BranchExactExpectedTopology,
-    pub(crate) write_timestamp: CommitWriteTimestampUs,
     pub(crate) total_chunks: u32,
 }
 
@@ -51,6 +60,8 @@ pub(crate) async fn resume_post_genesis_branch_exact_migration<Hash>(
     session: Arc<Session>,
     targeted_sessions: &[Arc<Session>],
     control_keyspace: BranchExactDeploymentNoTabletKeyspace,
+    timestamps: &ScyllaAuthorityTimestampStore,
+    clock_sample: AuthorityClockSampleUs,
     migration: BranchExactPostGenesisMigration<'_, Hash>,
 ) -> anyhow::Result<BranchExactBackfillVerifiedReceipt>
 where
@@ -106,18 +117,44 @@ where
     }
     let attestation = BranchExactTopologyAttestation::try_new(
         &schema,
-        migration.expected_topology,
+        migration.expected_topology.clone(),
         observations,
     )?;
     let deployment = BranchExactVerifiedDeploymentReceipt::try_new(
         intent,
         attestation,
     )?;
+    validate_migration_inputs_before_timestamp_reservation(
+        &migration,
+        &deployment,
+        clock_sample,
+    )?;
+    let timestamp_key = migration_timestamp_key::<Hash>(
+        migration.request,
+    )?;
+    let timestamp_intent = migration_timestamp_intent(&deployment);
+    let persisted_plan = lifecycle_plan(current.state());
+    let write_timestamp = match persisted_plan {
+        Some(plan) => plan.write_timestamp().ok_or_else(|| {
+            anyhow::anyhow!(
+                "post-genesis branch-exact lifecycle plan has no write timestamp"
+            )
+        })?,
+        None => {
+            reserve_migration_timestamp(
+                timestamps,
+                timestamp_key,
+                timestamp_intent,
+                clock_sample,
+            )
+            .await?
+        }
+    };
     let plan = BranchExactBackfillPlan::post_genesis_artifact(
         migration.request,
         deployment.clone(),
         migration.artifact.dataset_digest(),
-        migration.write_timestamp,
+        write_timestamp,
         migration.total_chunks,
         migration.artifact.pair_rows_per_direction(),
         migration.artifact.proof_rows(),
@@ -126,6 +163,21 @@ where
     // plan. Otherwise a future plan-field addition could durably select work
     // that every executor retry must reject.
     migration.artifact.validate_plan(&plan)?;
+    if let Some(persisted_plan) = persisted_plan {
+        require_plan(persisted_plan, &plan)?;
+        if !matches!(
+            current.state(),
+            BranchExactDeploymentLifecycleState::BackfillVerified(_)
+        ) {
+            require_replay_timestamp_safe(
+                timestamps,
+                timestamp_key,
+                timestamp_intent,
+                write_timestamp,
+            )
+            .await?;
+        }
+    }
     let executor = ScyllaBranchExactBackfillExecutor::prepare(
         Arc::clone(&session),
         &plan,
@@ -212,9 +264,217 @@ where
                 else {
                     anyhow::bail!("branch-exact lifecycle regressed after verification");
                 };
-                return Ok(readback_receipt.clone());
+                let receipt = readback_receipt.clone();
+                complete_migration_timestamp_if_active(
+                    timestamps,
+                    timestamp_key,
+                    timestamp_intent,
+                    write_timestamp,
+                )
+                .await?;
+                return Ok(receipt);
             }
         };
+    }
+}
+
+fn migration_timestamp_key<Hash: Q256BitHash>(
+    request: &BranchExactSchemaMaterializationRequest,
+) -> anyhow::Result<AuthorityTimestampKey> {
+    let anchor = CanonicalChainRef::<Hash>::from_canonical_bytes(
+        request.plan().anchor_payload(),
+    )?;
+    Ok(AuthorityTimestampKey::new(
+        anchor.network_id(),
+        request.plan().authority(),
+    ))
+}
+
+fn validate_migration_inputs_before_timestamp_reservation<Hash: Q256BitHash>(
+    migration: &BranchExactPostGenesisMigration<'_, Hash>,
+    deployment: &BranchExactVerifiedDeploymentReceipt,
+    clock_sample: AuthorityClockSampleUs,
+) -> anyhow::Result<()> {
+    // A clock sample is already range-checked but is not an allocated write
+    // timestamp. Use it only to exercise every plan/artifact invariant before
+    // reserving durable allocator state. The executable plan below is rebuilt
+    // with the allocator-owned timestamp.
+    let validation_timestamp =
+        CommitWriteTimestampUs::try_from_i128(clock_sample.as_i64() as i128)?;
+    let validation_plan = BranchExactBackfillPlan::post_genesis_artifact(
+        migration.request,
+        deployment.clone(),
+        migration.artifact.dataset_digest(),
+        validation_timestamp,
+        migration.total_chunks,
+        migration.artifact.pair_rows_per_direction(),
+        migration.artifact.proof_rows(),
+    )?;
+    migration.artifact.validate_plan(&validation_plan)?;
+    Ok(())
+}
+
+fn migration_timestamp_intent(
+    deployment: &BranchExactVerifiedDeploymentReceipt,
+) -> AuthorityCommitIntentDigest {
+    let mut hasher = Sha256::new();
+    hasher.update(MIGRATION_TIMESTAMP_INTENT_DOMAIN);
+    hasher.update(deployment.intent().digest().as_bytes());
+    AuthorityCommitIntentDigest::from_sealed_commit_digest(
+        hasher.finalize().into(),
+    )
+}
+
+fn lifecycle_plan(
+    state: &BranchExactDeploymentLifecycleState,
+) -> Option<&BranchExactBackfillPlan> {
+    match state {
+        BranchExactDeploymentLifecycleState::Intent(_)
+        | BranchExactDeploymentLifecycleState::SchemaVerified(_) => None,
+        BranchExactDeploymentLifecycleState::BackfillPlanned(plan) => {
+            Some(plan)
+        }
+        BranchExactDeploymentLifecycleState::BackfillProgress(progress) => {
+            Some(progress.plan())
+        }
+        BranchExactDeploymentLifecycleState::BackfillVerified(receipt) => {
+            Some(receipt.plan())
+        }
+    }
+}
+
+async fn reserve_migration_timestamp(
+    timestamps: &ScyllaAuthorityTimestampStore,
+    key: AuthorityTimestampKey,
+    intent: AuthorityCommitIntentDigest,
+    clock_sample: AuthorityClockSampleUs,
+) -> anyhow::Result<psy_node_core::store::timestamp::CommitWriteTimestampUs> {
+    loop {
+        let AuthorityTimestampReadState::Current(current) =
+            timestamps.read(key).await?
+        else {
+            anyhow::bail!(
+                "branch-exact authority timestamp allocator is uninitialized"
+            );
+        };
+        match current.observe_intent(key, intent) {
+            AuthorityIntentObservation::Active(lease) => {
+                return Ok(lease.timestamp())
+            }
+            AuthorityIntentObservation::Completed { timestamp, .. } => {
+                anyhow::bail!(
+                    "branch-exact migration timestamp is completed before a durable backfill plan exists: {}",
+                    timestamp.as_i64(),
+                )
+            }
+            AuthorityIntentObservation::BlockedByActive {
+                active_intent,
+                ..
+            } => {
+                anyhow::bail!(
+                    "branch-exact migration timestamp allocator is owned by another intent: {}",
+                    hex::encode(active_intent.as_bytes()),
+                )
+            }
+            AuthorityIntentObservation::Idle { .. } => {
+                let sealed = current.seal_reservation(
+                    key,
+                    intent,
+                    clock_sample,
+                )?;
+                match timestamps.reserve(sealed).await? {
+                    AuthorityTimestampWriteOutcome::Applied(_)
+                    | AuthorityTimestampWriteOutcome::Idempotent(_)
+                    | AuthorityTimestampWriteOutcome::Conflict(_) => {}
+                }
+            }
+        }
+    }
+}
+
+async fn require_replay_timestamp_safe(
+    timestamps: &ScyllaAuthorityTimestampStore,
+    key: AuthorityTimestampKey,
+    intent: AuthorityCommitIntentDigest,
+    persisted_timestamp: psy_node_core::store::timestamp::CommitWriteTimestampUs,
+) -> anyhow::Result<()> {
+    let AuthorityTimestampReadState::Current(current) =
+        timestamps.read(key).await?
+    else {
+        anyhow::bail!(
+            "branch-exact authority timestamp allocator disappeared during migration replay"
+        );
+    };
+    if current.high_water().as_i64() < persisted_timestamp.as_i64() {
+        anyhow::bail!(
+            "branch-exact persisted backfill timestamp exceeds authority high-water"
+        );
+    }
+    match current.observe_intent(key, intent) {
+        AuthorityIntentObservation::Active(lease)
+            if lease.timestamp() == persisted_timestamp => {}
+        AuthorityIntentObservation::Active(_) => anyhow::bail!(
+            "branch-exact active migration timestamp differs from persisted backfill plan"
+        ),
+        AuthorityIntentObservation::Completed { .. }
+        | AuthorityIntentObservation::Idle { .. } => anyhow::bail!(
+            "branch-exact incomplete migration no longer owns its timestamp lease"
+        ),
+        AuthorityIntentObservation::BlockedByActive { .. } => anyhow::bail!(
+            "branch-exact migration replay is blocked by another active authority write"
+        ),
+    }
+    Ok(())
+}
+
+async fn complete_migration_timestamp_if_active(
+    timestamps: &ScyllaAuthorityTimestampStore,
+    key: AuthorityTimestampKey,
+    intent: AuthorityCommitIntentDigest,
+    persisted_timestamp: psy_node_core::store::timestamp::CommitWriteTimestampUs,
+) -> anyhow::Result<()> {
+    loop {
+        let AuthorityTimestampReadState::Current(current) =
+            timestamps.read(key).await?
+        else {
+            anyhow::bail!(
+                "branch-exact authority timestamp allocator disappeared after backfill verification"
+            );
+        };
+        if current.high_water().as_i64() < persisted_timestamp.as_i64() {
+            anyhow::bail!(
+                "branch-exact verified backfill timestamp exceeds authority high-water"
+            );
+        }
+        match current.observe_intent(key, intent) {
+            AuthorityIntentObservation::Active(lease) => {
+                if lease.timestamp() != persisted_timestamp {
+                    anyhow::bail!(
+                        "branch-exact active migration timestamp differs after verification"
+                    );
+                }
+                let sealed = current.seal_completion(key, lease)?;
+                match timestamps.complete(sealed).await? {
+                    AuthorityTimestampWriteOutcome::Applied(_)
+                    | AuthorityTimestampWriteOutcome::Idempotent(_)
+                    | AuthorityTimestampWriteOutcome::Conflict(_) => {}
+                }
+            }
+            AuthorityIntentObservation::Completed { timestamp, .. } => {
+                if timestamp != persisted_timestamp {
+                    anyhow::bail!(
+                        "branch-exact completed migration timestamp differs after verification"
+                    );
+                }
+                return Ok(())
+            }
+            AuthorityIntentObservation::Idle { .. }
+            | AuthorityIntentObservation::BlockedByActive { .. } => {
+                // A later authority operation proves this migration lease was
+                // already released. Never interfere with that operation.
+                return Ok(())
+            }
+        }
     }
 }
 
@@ -330,5 +590,29 @@ mod tests {
         let validate = source.find("migration.artifact.validate_plan(&plan)").unwrap();
         let persist = source.find("lifecycle.plan_backfill").unwrap();
         assert!(validate < persist);
+    }
+
+    #[test]
+    fn backfill_timestamp_is_allocator_owned_until_full_verification() {
+        let source = include_str!("branch_exact_schema_operator.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let validate_inputs = production
+            .find("validate_migration_inputs_before_timestamp_reservation(")
+            .unwrap();
+        let reserve = production.find("reserve_migration_timestamp(").unwrap();
+        let plan = production
+            .find("BranchExactBackfillPlan::post_genesis_artifact")
+            .unwrap();
+        let verify = production.find("verify_artifact_readback").unwrap();
+        let complete = production
+            .find("complete_migration_timestamp_if_active(")
+            .unwrap();
+        assert!(validate_inputs < reserve);
+        assert!(reserve < plan);
+        assert!(plan < verify);
+        assert!(verify < complete);
+        assert!(!production.contains("pub(crate) write_timestamp"));
+        assert!(production.contains("incomplete migration no longer owns its timestamp lease"));
+        assert!(production.contains("migration_timestamp_key::<Hash>"));
     }
 }
