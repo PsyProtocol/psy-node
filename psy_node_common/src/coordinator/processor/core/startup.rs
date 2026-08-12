@@ -56,7 +56,7 @@ impl<
 where
     FileSystem::File: Send + Sync,
 {
-    pub async fn new(
+    pub(crate) async fn new(
         mut db: PsyCoordinatorDatabaseProcessor<
             N,
             S,
@@ -76,6 +76,7 @@ where
         guta_gatherer_backup_directory: String,
         durable_guta_submissions:
             Option<Arc<dyn CoordinatorGutaDurableSubmissionStore<N::QHash>>>,
+        normal_processing_owner: super::CoordinatorNormalProcessingOwner,
     ) -> anyhow::Result<(
         Self,
         tokio::task::JoinHandle<Result<(), anyhow::Error>>,
@@ -140,67 +141,117 @@ where
             ));
         }
         */
-        let (guta_queue_gatherer, guta_join_handle) = EphemeralQueueGathererWithTree::new_with_status::<
+        let branch_exact = normal_processing_owner.is_branch_exact();
+        let guta_base_queue_key = db.guta_queue_key_status_manager.get_queue_key()?;
+        let (guta_queue_gatherer, guta_join_handle) = if branch_exact {
+            EphemeralQueueGathererWithTree::new_coordinator_durable_with_status::<
+                CoordinatorGUTAUpdateGathererConfig<N, TempDatabase, ProofStore, FileSystem>,
+                N::QHash,
+                N::HasherBase,
+                CoordinatorGUTAUpdateGatherer<N, TempDatabase, ProofStore, FileSystem>,
+            >(
+                guta_create_builder_config,
+                guta_base_queue_key,
+                global_user_tree,
+                db.status.clone(),
+                psy_node_core::queue::coordinator_processor_durable_capture::CoordinatorProcessorSourceKind::Guta,
+            )
+        } else {
+            EphemeralQueueGathererWithTree::new_with_status::<
             GUTAUpdateQueue,
             CoordinatorGUTAUpdateGathererConfig<N, TempDatabase, ProofStore, FileSystem>,
             N::QHash,
             N::HasherBase,
             CoordinatorGUTAUpdateGatherer<N, TempDatabase, ProofStore, FileSystem>,
-        >(
-            db.guta_update_queue.clone(),
-            guta_create_builder_config,
-            db.guta_queue_key_status_manager.get_queue_key()?,
-            global_user_tree,
-            db.status.clone(),
-        );
+            >(
+                db.guta_update_queue.clone(),
+                guta_create_builder_config,
+                guta_base_queue_key,
+                global_user_tree,
+                db.status.clone(),
+            )
+        };
 
-        let (register_user_queue_gatherer, register_user_join_handle) = EphemeralQueueGathererWithTree::new_with_status::<
+        let register_config = RegisterUserGathererConfig {
+            realm_id_u64: db.ids.realm_id_u64,
+            realm_sub_id_u64: db.ids.realm_sub_id_u64,
+            temp_db: db.temp_db.clone(),
+            backup_file_directory: register_user_gatherer_backup_directory,
+            _phantom_n: std::marker::PhantomData,
+            status: db.shared_status.inner.clone(),
+            register_users_circuit_whitelist: db.circuit_fingerprint_config.register_users_circuit_whitelist_root,
+            last_job_next_user_id: Arc::new(std::sync::RwLock::new(db.last_committed.l2_state.next_user_id)),
+            file_system: file_system.clone(),
+        };
+        let register_base_queue_key = db.register_user_queue_key_status_manager.get_queue_key()?;
+        let (register_user_queue_gatherer, register_user_join_handle) = if branch_exact {
+            EphemeralQueueGathererWithTree::new_coordinator_durable_with_status::<
+                RegisterUserGathererConfig<N, TempDatabase, FileSystem>,
+                N::QHash,
+                N::HasherBase,
+                RegisterUserGatherer<N, TempDatabase, FileSystem>,
+            >(
+                register_config,
+                register_base_queue_key,
+                user_registration_tree,
+                db.status.clone(),
+                psy_node_core::queue::coordinator_processor_durable_capture::CoordinatorProcessorSourceKind::Registration,
+            )
+        } else {
+            EphemeralQueueGathererWithTree::new_with_status::<
             RegisterUserQueue,
             RegisterUserGathererConfig<N, TempDatabase, FileSystem>,
             N::QHash,
             N::HasherBase,
             RegisterUserGatherer<N, TempDatabase, FileSystem>,
-        >(
-            db.register_user_queue.clone(),
-            RegisterUserGathererConfig {
-                realm_id_u64: db.ids.realm_id_u64,
-                realm_sub_id_u64: db.ids.realm_sub_id_u64,
-                temp_db: db.temp_db.clone(),
-
-                backup_file_directory: register_user_gatherer_backup_directory,
-                _phantom_n: std::marker::PhantomData,
-                status: db.shared_status.inner.clone(),
-                register_users_circuit_whitelist: db.circuit_fingerprint_config.register_users_circuit_whitelist_root,
-                last_job_next_user_id: Arc::new(std::sync::RwLock::new(db.last_committed.l2_state.next_user_id)),
-                file_system: file_system.clone(),
-            },
-            db.register_user_queue_key_status_manager.get_queue_key()?,
-            user_registration_tree,
-            db.status.clone(),
-        );
-        let (deploy_contract_queue_gatherer, deploy_contract_join_handle) = EphemeralQueueGathererWithTree::new_with_status::<
+            >(
+                db.register_user_queue.clone(),
+                register_config,
+                register_base_queue_key,
+                user_registration_tree,
+                db.status.clone(),
+            )
+        };
+        let deploy_config = DeployContractGathererConfig {
+            realm_id_u64: db.ids.realm_id_u64,
+            realm_sub_id_u64: db.ids.realm_sub_id_u64,
+            temp_db: db.temp_db.clone(),
+            backup_file_directory: deploy_contract_gatherer_backup_directory,
+            _phantom_n: std::marker::PhantomData,
+            shared_status: db.shared_status.inner.clone(),
+            deploy_contract_circuit_whitelist: db.circuit_fingerprint_config.deploy_contracts_circuit_whitelist_root,
+            last_job_next_contract_id: Arc::new(std::sync::RwLock::new(db.last_committed.l2_state.next_contract_id as u64)),
+            file_system: file_system.clone(),
+        };
+        let deploy_base_queue_key = db.deploy_contract_queue_key_status_manager.get_queue_key()?;
+        let (deploy_contract_queue_gatherer, deploy_contract_join_handle) = if branch_exact {
+            EphemeralQueueGathererWithTree::new_coordinator_durable_with_status::<
+                DeployContractGathererConfig<N, TempDatabase, FileSystem>,
+                N::QHash,
+                N::HasherBase,
+                DeployContractGatherer<N, TempDatabase, FileSystem>,
+            >(
+                deploy_config,
+                deploy_base_queue_key,
+                global_contract_tree,
+                db.status.clone(),
+                psy_node_core::queue::coordinator_processor_durable_capture::CoordinatorProcessorSourceKind::Deploy,
+            )
+        } else {
+            EphemeralQueueGathererWithTree::new_with_status::<
             DeployContractQueue,
             DeployContractGathererConfig<N, TempDatabase, FileSystem>,
             N::QHash,
             N::HasherBase,
             DeployContractGatherer<N, TempDatabase, FileSystem>,
-        >(
-            db.deploy_contract_queue.clone(),
-            DeployContractGathererConfig {
-                realm_id_u64: db.ids.realm_id_u64,
-                realm_sub_id_u64: db.ids.realm_sub_id_u64,
-                temp_db: db.temp_db.clone(),
-                backup_file_directory: deploy_contract_gatherer_backup_directory,
-                _phantom_n: std::marker::PhantomData,
-                shared_status: db.shared_status.inner.clone(),
-                deploy_contract_circuit_whitelist: db.circuit_fingerprint_config.deploy_contracts_circuit_whitelist_root,
-                last_job_next_contract_id: Arc::new(std::sync::RwLock::new(db.last_committed.l2_state.next_contract_id as u64)),
-                file_system: file_system.clone(),
-            },
-            db.deploy_contract_queue_key_status_manager.get_queue_key()?,
-            global_contract_tree,
-            db.status.clone(),
-        );
+            >(
+                db.deploy_contract_queue.clone(),
+                deploy_config,
+                deploy_base_queue_key,
+                global_contract_tree,
+                db.status.clone(),
+            )
+        };
 
         Ok((
             Self {
@@ -209,6 +260,7 @@ where
                 register_user_queue_gatherer: register_user_queue_gatherer,
                 deploy_contract_queue_gatherer: deploy_contract_queue_gatherer,
                 proof_worker_queue_max_time_ms: u64::MAX,
+                normal_processing_owner: Some(normal_processing_owner),
             },
             guta_join_handle,
             register_user_join_handle,

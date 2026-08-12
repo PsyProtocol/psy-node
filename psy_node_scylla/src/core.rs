@@ -7,6 +7,7 @@ use scylla::client::PoolSize;
 use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::db::table::QDatabaseTableRoutingKey, felt::QFelt64, protocol::core_types::{Q256BitHash, QFHashBase, QHashBase}};
 use psy_node_core::queue::realm_user_update_publish::GlobalUserTreeHeight;
 use psy_node_core::queue::coordinator_guta_durable_submission::CoordinatorGutaDurableSubmissionStore;
+use psy_node_core::queue::coordinator_processor_durable_capture::CoordinatorProcessorDurableCaptureFactory;
 use psy_node_core::store::canonical_head::{
     CanonicalHeadBootstrap, CanonicalHeadReadState, CanonicalHeadWriteOutcome,
     CoordinatorCanonicalHeadReader, CoordinatorCanonicalHeadStore, NetworkId,
@@ -35,6 +36,7 @@ use crate::rollback::{
     PendingQueueSidecarReadyView, PendingQueueSidecarSetupMode,
     PendingQueueSidecarSetupOutcome, ScyllaPendingQueueSidecarSetupGate,
     ScyllaCoordinatorGutaDurableSubmissionStore,
+    ScyllaCoordinatorProcessorDurableCaptureFactory,
 };
 use crate::rollback::branch_exact_startup_preflight::ScyllaRealmProcessorStartupPreflightProvider;
 use crate::tables::{merkle::ScyllaMerkleNodesZeroPreparedStatements, traits::ScyllaStandardPreparedTableStatements};
@@ -375,6 +377,37 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
                 keyspaces.control().clone(),
                 network,
                 *ready.view().ready_digest(),
+            )
+            .await?,
+        ))
+    }
+
+    /// Prepare the storage-owned three-source Coordinator capture factory.
+    /// The current activation is selected from the verified durable pipeline;
+    /// callers cannot supply activation, pending or proc identity.
+    pub async fn prepare_coordinator_processor_durable_capture_factory(
+        &self,
+        network: psy_data::protocol::canonical_chain::NetworkId,
+        nats: Arc<NatsJetStreamClient>,
+    ) -> Result<Arc<dyn CoordinatorProcessorDurableCaptureFactory>, anyhow::Error>
+    where
+        Hash: Q256BitHash + Send + Sync + 'static,
+        Hasher: Send + Sync + 'static,
+    {
+        let ready = self.require_pending_queue_sidecar_ready()?;
+        if ready.view().authority()
+            != psy_data::protocol::chain_context::AuthorityScope::Coordinator
+        {
+            anyhow::bail!(
+                "Coordinator durable capture requires Coordinator sidecar readiness"
+            );
+        }
+        Ok(Arc::new(
+            ScyllaCoordinatorProcessorDurableCaptureFactory::<Hash>::prepare(
+                self.session.clone(),
+                network,
+                ready.as_ref(),
+                nats,
             )
             .await?,
         ))

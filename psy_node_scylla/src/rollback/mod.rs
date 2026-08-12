@@ -175,6 +175,7 @@ pub(crate) use realm_user_update_router::*;
 pub(crate) use realm_user_update_ingress::*;
 pub use pending_queue_sidecar_lifecycle::*;
 pub(crate) use coordinator_guta_durable_submission_store::*;
+pub(crate) use coordinator_processor_durable_capture::ScyllaCoordinatorProcessorDurableCaptureFactory;
 pub use authority_local_head_prototype::*;
 pub use authority_timestamp_prototype::*;
 pub use checkpoint_kiv::*;

@@ -7,6 +7,12 @@ use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderSt
 use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::queue::queue_key::{PCoreQueueItemBase, QPStandardUniqueIdQueueKey}, protocol::core_types::QHashBase};
 use psy_node_core::{
     queue::{
+        coordinator_processor_durable_capture::{
+            CoordinatorProcessorDurableCapturedSource,
+            CoordinatorProcessorDurableGenerationDigest,
+            CoordinatorProcessorDurableSourceDigest,
+            CoordinatorProcessorSourceKind,
+        },
         ephemeral::QStandardEphemeralQueueSubscriber,
         realm_processor_actor_input::{
             RealmProcessorActorInput, RealmProcessorActorInputDigest,
@@ -25,8 +31,6 @@ use psy_node_core::{
     },
     store::realm_processor_quiescence::RealmProcessorDrainRequest,
 };
-#[cfg(test)]
-use psy_node_core::queue::realm_processor_durable_capture::RealmProcessorDurableCapturedGeneration;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
@@ -302,6 +306,8 @@ pub enum GathererPauseError {
     StaleReceipt,
     FinalizeWhilePaused,
     DurableGenerationOnLegacyActor,
+    CoordinatorSourceOnLegacyActor,
+    RealmGenerationOnCoordinatorActor,
     LegacyFinalizeOnDurableActor,
     DurableGenerationIdentityMismatch,
     DurableGenerationApplyFailed,
@@ -345,6 +351,19 @@ enum TreeGathererCommand<Output> {
             Result<DurableTreeGathererFinalizeReceipt<Output>, GathererPauseError>,
         >,
     },
+    ApplyCoordinatorDurableSource {
+        generation_digest: CoordinatorProcessorDurableGenerationDigest,
+        source: CoordinatorProcessorDurableCapturedSource,
+        responder: oneshot::Sender<
+            Result<CoordinatorDurableTreeGathererApplyReceipt, GathererPauseError>,
+        >,
+    },
+    FinalizeCoordinatorDurableSource {
+        receipt: CoordinatorDurableTreeGathererApplyReceipt,
+        responder: oneshot::Sender<
+            Result<CoordinatorDurableTreeGathererFinalizeReceipt<Output>, GathererPauseError>,
+        >,
+    },
 }
 
 /// A builder config used by the command-only branch-exact actor must bind its
@@ -356,6 +375,16 @@ pub trait DurableTreeGathererConfig: Clone + Send + Sync + 'static {
         context: PendingQueueCaptureContext,
         deferred_input: RealmProcessorDeferredActorInput,
         external_dependencies: Vec<RealmProcessorExternalDependencyItem>,
+    ) -> anyhow::Result<Self>;
+}
+
+/// Coordinator command-only builders do not read a queue.  They may only
+/// bind their legacy mutable config to the exact storage-selected processing
+/// generation before receiving the source payloads.
+pub trait CoordinatorDurableTreeGathererConfig: Clone + Send + Sync + 'static {
+    fn bind_coordinator_generation(
+        &self,
+        context: PendingQueueCaptureContext,
     ) -> anyhow::Result<Self>;
 }
 
@@ -385,6 +414,90 @@ pub struct DurableTreeGathererFinalizeReceipt<Output> {
     item_count: u64,
     actor_input_digest: RealmProcessorActorInputDigest,
     output: Arc<Output>,
+}
+
+#[derive(Debug)]
+pub struct CoordinatorDurableTreeGathererApplyReceipt {
+    actor_identity: Arc<GathererActorIdentity>,
+    actor_revision: GathererActorRevision,
+    context_digest: PendingQueueCaptureContextDigest,
+    generation_digest: CoordinatorProcessorDurableGenerationDigest,
+    source_kind: CoordinatorProcessorSourceKind,
+    source_digest: CoordinatorProcessorDurableSourceDigest,
+    boundary_digest: PendingQueueBoundaryDigest,
+    item_count: u64,
+}
+
+pub struct CoordinatorDurableTreeGathererFinalizeReceipt<Output> {
+    _actor_identity: Arc<GathererActorIdentity>,
+    actor_revision: GathererActorRevision,
+    context_digest: PendingQueueCaptureContextDigest,
+    generation_digest: CoordinatorProcessorDurableGenerationDigest,
+    source_kind: CoordinatorProcessorSourceKind,
+    source_digest: CoordinatorProcessorDurableSourceDigest,
+    boundary_digest: PendingQueueBoundaryDigest,
+    item_count: u64,
+    output: Arc<Output>,
+}
+
+impl CoordinatorDurableTreeGathererApplyReceipt {
+    pub const fn actor_revision(&self) -> GathererActorRevision {
+        self.actor_revision
+    }
+
+    pub const fn context_digest(&self) -> PendingQueueCaptureContextDigest {
+        self.context_digest
+    }
+
+    pub const fn generation_digest(&self) -> CoordinatorProcessorDurableGenerationDigest {
+        self.generation_digest
+    }
+
+    pub const fn source_kind(&self) -> CoordinatorProcessorSourceKind {
+        self.source_kind
+    }
+
+    pub const fn source_digest(&self) -> CoordinatorProcessorDurableSourceDigest {
+        self.source_digest
+    }
+
+    pub const fn item_count(&self) -> u64 {
+        self.item_count
+    }
+}
+
+impl<Output> CoordinatorDurableTreeGathererFinalizeReceipt<Output> {
+    pub const fn actor_revision(&self) -> GathererActorRevision {
+        self.actor_revision
+    }
+
+    pub const fn context_digest(&self) -> PendingQueueCaptureContextDigest {
+        self.context_digest
+    }
+
+    pub const fn generation_digest(&self) -> CoordinatorProcessorDurableGenerationDigest {
+        self.generation_digest
+    }
+
+    pub const fn source_kind(&self) -> CoordinatorProcessorSourceKind {
+        self.source_kind
+    }
+
+    pub const fn source_digest(&self) -> CoordinatorProcessorDurableSourceDigest {
+        self.source_digest
+    }
+
+    pub const fn boundary_digest(&self) -> PendingQueueBoundaryDigest {
+        self.boundary_digest
+    }
+
+    pub const fn item_count(&self) -> u64 {
+        self.item_count
+    }
+
+    pub fn output(&self) -> &Output {
+        self.output.as_ref()
+    }
 }
 
 impl<Output> DurableTreeGathererFinalizeReceipt<Output> {
@@ -546,6 +659,82 @@ impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase + 'static, Output:
             trigger_rx,
         ));
         (Self { qk, trigger_tx }, jh)
+    }
+
+    /// Spawn a Coordinator branch-exact actor with no queue subscriber.  Its
+    /// only mutation input is one exact source split from a storage-owned
+    /// three-source generation.
+    pub fn new_coordinator_durable_with_status<
+        C: CoordinatorDurableTreeGathererConfig,
+        Hash: QHashBase + Send + Sync + 'static,
+        Hasher: MerkleZeroHasher<Hash> + Send + Sync + 'static,
+        Builder: QueueGathererItemBuilderWithTree<
+                C,
+                SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
+                Output = Output,
+            > + Send
+            + Sync
+            + 'static,
+    >(
+        create_builder_config: C,
+        base_queue_key: QPStandardUniqueIdQueueKey<QUEUE_TOPIC_ID, QueueItem>,
+        tree: SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
+        status: ProcessorStatus,
+        expected_source_kind: CoordinatorProcessorSourceKind,
+    ) -> (Self, tokio::task::JoinHandle<Result<(), anyhow::Error>>) {
+        let qk = QueueKeyStatusManager::new_with_status(base_queue_key.clone(), status);
+        let (trigger_tx, trigger_rx) = mpsc::channel::<TreeGathererCommand<Output>>(1);
+        let jh = tokio::spawn(coordinator_durable_gatherer_runner_for_tree::<
+            QUEUE_TOPIC_ID,
+            QueueItem,
+            Builder,
+            C,
+            Hash,
+            Hasher,
+        >(
+            create_builder_config,
+            base_queue_key,
+            tree,
+            expected_source_kind,
+            trigger_rx,
+        ));
+        (Self { qk, trigger_tx }, jh)
+    }
+
+    pub(crate) async fn apply_coordinator_durable_source(
+        &self,
+        generation_digest: CoordinatorProcessorDurableGenerationDigest,
+        source: CoordinatorProcessorDurableCapturedSource,
+    ) -> Result<CoordinatorDurableTreeGathererApplyReceipt, GathererPauseError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.trigger_tx
+            .send(TreeGathererCommand::ApplyCoordinatorDurableSource {
+                generation_digest,
+                source,
+                responder: response_tx,
+            })
+            .await
+            .map_err(|_| GathererPauseError::ControlChannelClosed)?;
+        response_rx
+            .await
+            .map_err(|_| GathererPauseError::ResponseChannelClosed)?
+    }
+
+    pub(crate) async fn finalize_coordinator_durable_source(
+        &self,
+        receipt: CoordinatorDurableTreeGathererApplyReceipt,
+    ) -> Result<CoordinatorDurableTreeGathererFinalizeReceipt<Output>, GathererPauseError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.trigger_tx
+            .send(TreeGathererCommand::FinalizeCoordinatorDurableSource {
+                receipt,
+                responder: response_tx,
+            })
+            .await
+            .map_err(|_| GathererPauseError::ControlChannelClosed)?;
+        response_rx
+            .await
+            .map_err(|_| GathererPauseError::ResponseChannelClosed)?
     }
 
     /// Apply one complete, exhaustive durable generation to the tentative
@@ -874,7 +1063,256 @@ fn reject_tree_command_at_callback_boundary<Output>(
         TreeGathererCommand::FinalizeDurableGeneration { responder, .. } => {
             let _ = responder.send(Err(GathererPauseError::DurableGenerationOnLegacyActor));
         }
+        TreeGathererCommand::ApplyCoordinatorDurableSource { responder, .. } => {
+            let _ = responder.send(Err(GathererPauseError::CoordinatorSourceOnLegacyActor));
+        }
+        TreeGathererCommand::FinalizeCoordinatorDurableSource { responder, .. } => {
+            let _ = responder.send(Err(GathererPauseError::CoordinatorSourceOnLegacyActor));
+        }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn coordinator_durable_gatherer_runner_for_tree<
+    const QUEUE_TOPIC_ID: u32,
+    QueueItem: PCoreQueueItemBase,
+    Builder: QueueGathererItemBuilderWithTree<C, SimpleMemoryMerkleRecorderStore<Hasher, Hash>>
+        + Send
+        + Sync,
+    C: CoordinatorDurableTreeGathererConfig,
+    Hash: QHashBase + Send + Sync + 'static,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync + 'static,
+>(
+    base_config: C,
+    queue_key: QPStandardUniqueIdQueueKey<QUEUE_TOPIC_ID, QueueItem>,
+    mut tree: SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
+    expected_source_kind: CoordinatorProcessorSourceKind,
+    mut trigger_rx: mpsc::Receiver<TreeGathererCommand<Builder::Output>>,
+) -> anyhow::Result<()> {
+    let actor_identity = Arc::new(GathererActorIdentity);
+    let mut actor_revision = GathererActorRevision(0);
+    let mut applied: Option<CoordinatorDurableTreeGathererApplyReceipt> = None;
+    let mut tentative_builder: Option<Builder> = None;
+    let mut finalized_output: Option<Arc<Builder::Output>> = None;
+    let mut finalized_revision: Option<GathererActorRevision> = None;
+
+    while let Some(command) = trigger_rx.recv().await {
+        match command {
+            TreeGathererCommand::ApplyCoordinatorDurableSource {
+                generation_digest,
+                source,
+                responder,
+            } => {
+                let context = source.context();
+                let source_kind = source.kind();
+                let source_digest = source.digest();
+                let boundary_digest = source.boundary();
+                let item_count = source.items().len() as u64;
+                if context.key().authority()
+                    != psy_data::protocol::chain_context::AuthorityScope::Coordinator
+                    || context.processing().proc_checkpoint_id().as_u128()
+                        != queue_key.unique_id
+                    || source_kind != expected_source_kind
+                {
+                    let _ = responder.send(Err(
+                        GathererPauseError::DurableGenerationIdentityMismatch,
+                    ));
+                    continue;
+                }
+
+                if let Some(current) = applied.as_ref() {
+                    let outcome = if current.context_digest == context.digest()
+                        && current.generation_digest == generation_digest
+                        && current.source_kind == source_kind
+                        && current.source_digest == source_digest
+                        && current.boundary_digest == boundary_digest
+                        && current.item_count == item_count
+                    {
+                        Ok(CoordinatorDurableTreeGathererApplyReceipt {
+                            actor_identity: current.actor_identity.clone(),
+                            actor_revision: current.actor_revision,
+                            context_digest: current.context_digest,
+                            generation_digest: current.generation_digest,
+                            source_kind: current.source_kind,
+                            source_digest: current.source_digest,
+                            boundary_digest: current.boundary_digest,
+                            item_count: current.item_count,
+                        })
+                    } else {
+                        Err(GathererPauseError::DurableGenerationIdentityMismatch)
+                    };
+                    let _ = responder.send(outcome);
+                    continue;
+                }
+
+                let bound_config = match base_config.bind_coordinator_generation(context) {
+                    Ok(config) => config,
+                    Err(error) => {
+                        let _ = responder.send(Err(
+                            GathererPauseError::DurableGenerationIdentityMismatch,
+                        ));
+                        return Err(error);
+                    }
+                };
+                let mut builder = match Builder::create_new_with_tree(
+                    &mut tree,
+                    queue_key.unique_id,
+                    bound_config,
+                )
+                .await
+                {
+                    Ok(builder) => builder,
+                    Err(error) => {
+                        let _ = responder.send(Err(
+                            GathererPauseError::DurableGenerationApplyFailed,
+                        ));
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = builder
+                    .update_from_many_queue_items_with_tree(
+                        &mut tree,
+                        source.into_payloads(),
+                    )
+                    .await
+                {
+                    let _ = responder.send(Err(
+                        GathererPauseError::DurableGenerationApplyFailed,
+                    ));
+                    return Err(error);
+                }
+                actor_revision = actor_revision.checked_next()?;
+                let receipt = CoordinatorDurableTreeGathererApplyReceipt {
+                    actor_identity: actor_identity.clone(),
+                    actor_revision,
+                    context_digest: context.digest(),
+                    generation_digest,
+                    source_kind,
+                    source_digest,
+                    boundary_digest,
+                    item_count,
+                };
+                let response = CoordinatorDurableTreeGathererApplyReceipt {
+                    actor_identity: receipt.actor_identity.clone(),
+                    actor_revision: receipt.actor_revision,
+                    context_digest: receipt.context_digest,
+                    generation_digest: receipt.generation_digest,
+                    source_kind: receipt.source_kind,
+                    source_digest: receipt.source_digest,
+                    boundary_digest: receipt.boundary_digest,
+                    item_count: receipt.item_count,
+                };
+                tentative_builder = Some(builder);
+                applied = Some(receipt);
+                let _ = responder.send(Ok(response));
+            }
+            TreeGathererCommand::FinalizeCoordinatorDurableSource {
+                receipt,
+                responder,
+            } => {
+                let Some(current) = applied.as_ref() else {
+                    let _ = responder.send(Err(
+                        GathererPauseError::DurableGenerationIdentityMismatch,
+                    ));
+                    continue;
+                };
+                if !Arc::ptr_eq(&receipt.actor_identity, &current.actor_identity)
+                    || receipt.actor_revision != current.actor_revision
+                    || receipt.context_digest != current.context_digest
+                    || receipt.generation_digest != current.generation_digest
+                    || receipt.source_kind != current.source_kind
+                    || receipt.source_digest != current.source_digest
+                    || receipt.boundary_digest != current.boundary_digest
+                    || receipt.item_count != current.item_count
+                {
+                    let _ = responder.send(Err(
+                        GathererPauseError::DurableGenerationIdentityMismatch,
+                    ));
+                    continue;
+                }
+                if let Some(output) = finalized_output.as_ref() {
+                    let revision = finalized_revision.ok_or_else(|| {
+                        anyhow::anyhow!("finalized Coordinator output missing revision")
+                    })?;
+                    let _ = responder.send(Ok(
+                        CoordinatorDurableTreeGathererFinalizeReceipt {
+                            _actor_identity: current.actor_identity.clone(),
+                            actor_revision: revision,
+                            context_digest: current.context_digest,
+                            generation_digest: current.generation_digest,
+                            source_kind: current.source_kind,
+                            source_digest: current.source_digest,
+                            boundary_digest: current.boundary_digest,
+                            item_count: current.item_count,
+                            output: output.clone(),
+                        },
+                    ));
+                    continue;
+                }
+                let Some(builder) = tentative_builder.take() else {
+                    let _ = responder.send(Err(
+                        GathererPauseError::DurableGenerationApplyFailed,
+                    ));
+                    continue;
+                };
+                let output = match builder.finalize_with_tree(&mut tree).await {
+                    Ok(output) => Arc::new(output),
+                    Err(error) => {
+                        let _ = responder.send(Err(
+                            GathererPauseError::DurableGenerationApplyFailed,
+                        ));
+                        return Err(error);
+                    }
+                };
+                actor_revision = actor_revision.checked_next()?;
+                finalized_revision = Some(actor_revision);
+                finalized_output = Some(output.clone());
+                let _ = responder.send(Ok(
+                    CoordinatorDurableTreeGathererFinalizeReceipt {
+                        _actor_identity: current.actor_identity.clone(),
+                        actor_revision,
+                        context_digest: current.context_digest,
+                        generation_digest: current.generation_digest,
+                        source_kind: current.source_kind,
+                        source_digest: current.source_digest,
+                        boundary_digest: current.boundary_digest,
+                        item_count: current.item_count,
+                        output,
+                    },
+                ));
+            }
+            TreeGathererCommand::ApplyDurableGeneration { responder, .. } => {
+                let _ = responder.send(Err(
+                    GathererPauseError::RealmGenerationOnCoordinatorActor,
+                ));
+            }
+            TreeGathererCommand::FinalizeDurableGeneration { responder, .. } => {
+                let _ = responder.send(Err(
+                    GathererPauseError::RealmGenerationOnCoordinatorActor,
+                ));
+            }
+            TreeGathererCommand::Finalize { responder, .. } => {
+                let _ = responder.send(Err(
+                    GathererPauseError::LegacyFinalizeOnDurableActor.into(),
+                ));
+            }
+            TreeGathererCommand::Pause { responder, .. } => {
+                let _ = responder.send(Err(GathererPauseError::NotPaused));
+            }
+            TreeGathererCommand::Resume { responder, .. } => {
+                let _ = responder.send(Err(GathererPauseError::NotPaused));
+            }
+            TreeGathererCommand::Status(responder) => {
+                let _ = responder.send(GathererBoundaryStatus {
+                    revision: actor_revision,
+                    phase: GathererBoundaryPhase::Running,
+                    request: None,
+                    unique_id: queue_key.unique_id,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1163,6 +1601,16 @@ async fn durable_gatherer_runner_for_tree<
                                 GathererPauseError::AlreadyPausedAtDifferentRequest,
                             ));
                         }
+                        TreeGathererCommand::ApplyCoordinatorDurableSource { responder, .. } => {
+                            let _ = responder.send(Err(
+                                GathererPauseError::RealmGenerationOnCoordinatorActor,
+                            ));
+                        }
+                        TreeGathererCommand::FinalizeCoordinatorDurableSource { responder, .. } => {
+                            let _ = responder.send(Err(
+                                GathererPauseError::RealmGenerationOnCoordinatorActor,
+                            ));
+                        }
                     }
                 }
             }
@@ -1180,6 +1628,16 @@ async fn durable_gatherer_runner_for_tree<
             TreeGathererCommand::Finalize { responder, .. } => {
                 let _ = responder.send(Err(
                     GathererPauseError::SemanticHandoffNotIntegrated.into(),
+                ));
+            }
+            TreeGathererCommand::ApplyCoordinatorDurableSource { responder, .. } => {
+                let _ = responder.send(Err(
+                    GathererPauseError::RealmGenerationOnCoordinatorActor,
+                ));
+            }
+            TreeGathererCommand::FinalizeCoordinatorDurableSource { responder, .. } => {
+                let _ = responder.send(Err(
+                    GathererPauseError::RealmGenerationOnCoordinatorActor,
                 ));
             }
         }
@@ -1401,6 +1859,16 @@ async fn gatherer_runner_for_tree<
                                                 GathererPauseError::DurableGenerationOnLegacyActor,
                                             ));
                                         }
+                                        TreeGathererCommand::ApplyCoordinatorDurableSource { responder, .. } => {
+                                            let _ = responder.send(Err(
+                                                GathererPauseError::CoordinatorSourceOnLegacyActor,
+                                            ));
+                                        }
+                                        TreeGathererCommand::FinalizeCoordinatorDurableSource { responder, .. } => {
+                                            let _ = responder.send(Err(
+                                                GathererPauseError::CoordinatorSourceOnLegacyActor,
+                                            ));
+                                        }
                                     }
                                 }
                                 continue 'gathering;
@@ -1430,6 +1898,18 @@ async fn gatherer_runner_for_tree<
                         TreeGathererCommand::FinalizeDurableGeneration { responder, .. } => {
                             let _ = responder.send(Err(
                                 GathererPauseError::DurableGenerationOnLegacyActor,
+                            ));
+                            continue 'gathering;
+                        }
+                        TreeGathererCommand::ApplyCoordinatorDurableSource { responder, .. } => {
+                            let _ = responder.send(Err(
+                                GathererPauseError::CoordinatorSourceOnLegacyActor,
+                            ));
+                            continue 'gathering;
+                        }
+                        TreeGathererCommand::FinalizeCoordinatorDurableSource { responder, .. } => {
+                            let _ = responder.send(Err(
+                                GathererPauseError::CoordinatorSourceOnLegacyActor,
                             ));
                             continue 'gathering;
                         }
@@ -1675,6 +2155,12 @@ mod h23b1_tests {
     };
     use psy_node_core::{
         queue::{
+            coordinator_processor_durable_capture::{
+                CoordinatorProcessorDurableCapturedGeneration,
+                CoordinatorProcessorDurableCapturedItem,
+                CoordinatorProcessorDurableCapturedSource,
+                CoordinatorProcessorSourceKind,
+            },
             ephemeral::QStandardEphemeralQueueSubscriber,
             infrastructure::QStandardQueueBase,
             realm_processor_durable_capture::{
@@ -1695,8 +2181,9 @@ mod h23b1_tests {
             },
             recoverable_ephemeral::{
                 PendingQueueBoundaryObservation, PendingQueueCaptureCandidate,
-                PendingQueueCaptureContext, PendingQueueGenerationBoundary,
-                PendingQueueSourceCursor, PendingQueueSourceIdentity,
+                PendingQueueBoundaryDigest, PendingQueueCaptureContext,
+                PendingQueueGenerationBoundary, PendingQueueSourceCursor,
+                PendingQueueSourceIdentity, PendingQueueSourceIdentityDigest,
             },
         },
         store::{
@@ -1898,6 +2385,20 @@ mod h23b1_tests {
             _deferred_input: RealmProcessorDeferredActorInput,
             _external_dependencies: Vec<RealmProcessorExternalDependencyItem>,
         ) -> anyhow::Result<Self> {
+            Ok(self.clone())
+        }
+    }
+
+    impl CoordinatorDurableTreeGathererConfig for Arc<TestGathererState> {
+        fn bind_coordinator_generation(
+            &self,
+            context: PendingQueueCaptureContext,
+        ) -> anyhow::Result<Self> {
+            if context.key().authority() != AuthorityScope::Coordinator
+                || context.processing().proc_checkpoint_id().as_u128() != 41
+            {
+                anyhow::bail!("test Coordinator generation identity mismatch")
+            }
             Ok(self.clone())
         }
     }
@@ -2148,6 +2649,85 @@ mod h23b1_tests {
             queue_key(),
             SimpleMemoryMerkleRecorderStore::new(4),
             status,
+        )
+    }
+
+    fn coordinator_context() -> PendingQueueCaptureContext {
+        PendingQueueCaptureContext::try_new(
+            PendingGenerationLedgerKey::new(
+                NetworkId::from_network_type(PsyChainNetworkType::LocalDevnet),
+                AuthorityScope::Coordinator,
+            ),
+            PendingGenerationActivationDigest::try_new([13; 32]).unwrap(),
+            PendingGenerationContext::try_from_legacy(101, 41).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn coordinator_source(
+        kind: CoordinatorProcessorSourceKind,
+        marker: u8,
+    ) -> CoordinatorProcessorDurableCapturedSource {
+        CoordinatorProcessorDurableCapturedSource::try_from_exhaustive_readback(
+            kind,
+            coordinator_context(),
+            PendingQueueSourceIdentityDigest::try_new([marker + 10; 32]).unwrap(),
+            PendingQueueBoundaryDigest::try_new([marker + 20; 32]).unwrap(),
+            vec![
+                CoordinatorProcessorDurableCapturedItem::try_new(
+                    1,
+                    [marker + 30; 32],
+                    vec![marker, 1],
+                )
+                .unwrap(),
+                CoordinatorProcessorDurableCapturedItem::try_new(
+                    2,
+                    [marker + 31; 32],
+                    vec![marker, 2],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn coordinator_generation(
+        registration_marker: u8,
+    ) -> CoordinatorProcessorDurableCapturedGeneration {
+        CoordinatorProcessorDurableCapturedGeneration::try_from_exhaustive_readback(
+            coordinator_context(),
+            vec![
+                coordinator_source(
+                    CoordinatorProcessorSourceKind::Registration,
+                    registration_marker,
+                ),
+                coordinator_source(CoordinatorProcessorSourceKind::Deploy, 2),
+                coordinator_source(CoordinatorProcessorSourceKind::Guta, 3),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn start_coordinator_durable_test_gatherer(
+        state: Arc<TestGathererState>,
+        expected_source_kind: CoordinatorProcessorSourceKind,
+    ) -> (
+        EphemeralQueueGathererWithTree<TEST_TOPIC, TestQueueItem, usize>,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        let status = ProcessorStatus::new();
+        status.mark_running();
+        EphemeralQueueGathererWithTree::new_coordinator_durable_with_status::<
+            Arc<TestGathererState>,
+            PHash,
+            PoseidonHasher,
+            TestBuilder,
+        >(
+            state,
+            queue_key(),
+            SimpleMemoryMerkleRecorderStore::new(4),
+            status,
+            expected_source_kind,
         )
     }
 
@@ -2435,6 +3015,74 @@ mod h23b1_tests {
         assert_eq!(state.ensure_calls.load(Ordering::SeqCst), 0);
         assert_eq!(state.delete_calls.load(Ordering::SeqCst), 0);
         assert_eq!(state.finalize_calls.load(Ordering::SeqCst), 1);
+        drop(gatherer);
+        join.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn coordinator_durable_actor_applies_one_exact_source_without_queue_io() {
+        let state = Arc::new(TestGathererState::default());
+        let (gatherer, join) = start_coordinator_durable_test_gatherer(
+            state.clone(),
+            CoordinatorProcessorSourceKind::Registration,
+        );
+        state.release_update.notify_one();
+        let generation = coordinator_generation(1);
+        let generation_digest = generation.digest();
+        let (_, _, registration, _, _) = generation.into_sources();
+        let receipt = gatherer
+            .apply_coordinator_durable_source(generation_digest, registration)
+            .await
+            .unwrap();
+        assert_eq!(receipt.actor_revision().get(), 1);
+        assert_eq!(receipt.source_kind(), CoordinatorProcessorSourceKind::Registration);
+        assert_eq!(receipt.item_count(), 2);
+        assert_eq!(state.update_calls.load(Ordering::SeqCst), 1);
+
+        let retry_generation = coordinator_generation(1);
+        let retry_digest = retry_generation.digest();
+        let (_, _, retry_registration, _, _) = retry_generation.into_sources();
+        let retry = gatherer
+            .apply_coordinator_durable_source(retry_digest, retry_registration)
+            .await
+            .unwrap();
+        assert_eq!(retry.actor_revision(), receipt.actor_revision());
+        assert_eq!(retry.source_digest(), receipt.source_digest());
+        assert_eq!(state.update_calls.load(Ordering::SeqCst), 1);
+
+        let foreign_generation = coordinator_generation(4);
+        let foreign_digest = foreign_generation.digest();
+        let (_, _, foreign_registration, _, _) = foreign_generation.into_sources();
+        assert_eq!(
+            gatherer
+                .apply_coordinator_durable_source(foreign_digest, foreign_registration)
+                .await
+                .unwrap_err(),
+            GathererPauseError::DurableGenerationIdentityMismatch
+        );
+        assert_eq!(state.update_calls.load(Ordering::SeqCst), 1);
+
+        let finalized = gatherer
+            .finalize_coordinator_durable_source(receipt)
+            .await
+            .unwrap();
+        assert_eq!(finalized.actor_revision().get(), 2);
+        assert_eq!(finalized.generation_digest(), generation_digest);
+        assert_eq!(finalized.source_kind(), CoordinatorProcessorSourceKind::Registration);
+        assert_eq!(*finalized.output(), 1);
+        assert_eq!(state.finalize_calls.load(Ordering::SeqCst), 1);
+
+        let finalized_retry = gatherer
+            .finalize_coordinator_durable_source(retry)
+            .await
+            .unwrap();
+        assert_eq!(finalized_retry.actor_revision(), finalized.actor_revision());
+        assert_eq!(*finalized_retry.output(), 1);
+        assert_eq!(state.finalize_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.dump_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.ensure_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.delete_calls.load(Ordering::SeqCst), 0);
+
         drop(gatherer);
         join.await.unwrap().unwrap();
     }

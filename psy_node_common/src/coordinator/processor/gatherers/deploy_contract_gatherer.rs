@@ -34,12 +34,17 @@ use psy_node_core::{
     qblob::data_views::{
         single_merkle_node_batch::{generate_single_merkle_node_blob_from_leaves, generate_single_merkle_node_blob_from_leaves_with_tree_height}, zero_merkle_node_batch::create_ffs_merkle_nodes_zero_id_from_hash_map,
     },
+    queue::recoverable_ephemeral::PendingQueueCaptureContext,
 };
 use psy_serialize::{FastFixedSerializable, PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::{
-    coordinator::processor::processor_shared_status::PsyCoordinatorProcessorSharedStatus, queue::gatherer_builder::QueueGathererItemBuilderWithTree,
+    coordinator::processor::processor_shared_status::PsyCoordinatorProcessorSharedStatus,
+    queue::{
+        gatherer::CoordinatorDurableTreeGathererConfig,
+        gatherer_builder::QueueGathererItemBuilderWithTree,
+    },
 };
 pub const DEPLOY_CONTRACT_GATHERER_BACKUP_V1_MAGIC_BYTES: [u8; 4] = [0x44, 0x43, 0x42, 0x31]; // 'DCB1' in ASCII
 pub const DEPLOY_CONTRACT_GATHERER_BACKUP_V1_MAGIC_U32: u32 = 0x31424344; // 'DCB1' in little-endian u32
@@ -292,6 +297,34 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
             realm_id: self.realm_id_u64 as u32,
             realm_sub_id: self.realm_sub_id_u64 as u16,
         }
+    }
+}
+
+impl<
+        N: QNetworkTypesConfig + 'static,
+        TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + 'static,
+        FileSystem: TokioLikeFileSystem + 'static,
+    > CoordinatorDurableTreeGathererConfig
+    for DeployContractGathererConfig<N, TempDatabase, FileSystem>
+{
+    fn bind_coordinator_generation(
+        &self,
+        context: PendingQueueCaptureContext,
+    ) -> anyhow::Result<Self> {
+        if context.key().authority()
+            != psy_data::protocol::chain_context::AuthorityScope::Coordinator
+        {
+            anyhow::bail!("deploy durable input is not Coordinator-scoped");
+        }
+        let mut status = self
+            .shared_status
+            .read()
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?
+            .clone();
+        status.unique_pending_id = context.processing().pending_id().get();
+        let mut bound = self.clone();
+        bound.shared_status = Arc::new(RwLock::new(status));
+        Ok(bound)
     }
 }
 pub struct DeployContractGatherer<

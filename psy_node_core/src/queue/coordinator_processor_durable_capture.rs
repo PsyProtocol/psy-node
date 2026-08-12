@@ -363,6 +363,28 @@ impl CoordinatorProcessorDurableCapturedGeneration {
             self.guta.into_payloads(),
         )
     }
+
+    /// Split the non-Clone generation into the three exact source values
+    /// consumed by the command-only Coordinator actors.  The generation
+    /// digest is carried alongside every source apply so three independently
+    /// cached actors cannot be composed from different generations.
+    pub fn into_sources(
+        self,
+    ) -> (
+        PendingQueueCaptureContext,
+        CoordinatorProcessorDurableGenerationDigest,
+        CoordinatorProcessorDurableCapturedSource,
+        CoordinatorProcessorDurableCapturedSource,
+        CoordinatorProcessorDurableCapturedSource,
+    ) {
+        (
+            self.context,
+            self.digest,
+            self.registration,
+            self.deploy,
+            self.guta,
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

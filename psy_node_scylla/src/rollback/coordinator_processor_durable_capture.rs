@@ -340,17 +340,29 @@ impl<Hash: Q256BitHash> ScyllaCoordinatorProcessorDurableCaptureFactory<Hash> {
     pub(crate) async fn prepare(
         session: Arc<Session>,
         network: NetworkId,
-        writer_activation_digest: [u8; 32],
         ready: &PendingQueueSidecarReady,
         nats: Arc<NatsJetStreamClient>,
     ) -> Result<Self, CoordinatorProcessorDurableCaptureError> {
-        if ready.view().authority() != AuthorityScope::Coordinator
-            || writer_activation_digest == [0; 32]
-        {
+        if ready.view().authority() != AuthorityScope::Coordinator {
             return Err(CoordinatorProcessorDurableCaptureError::IdentityMismatch);
         }
         let keyspaces = ready.view().verified().stored().keyspaces();
         let control = keyspaces.control().clone();
+        let pipeline = Arc::new(
+            ScyllaPendingPipelineStore::prepare(session.clone(), control.clone())
+                .await
+                .map_err(backend)?,
+        );
+        let key = PendingGenerationLedgerKey::new(network, AuthorityScope::Coordinator);
+        let PendingPipelineReadState::Current(current_pipeline) =
+            pipeline.read::<Hash>(key).await.map_err(backend)?
+        else {
+            return Err(CoordinatorProcessorDurableCaptureError::IdentityMismatch);
+        };
+        if current_pipeline.key() != key || current_pipeline.blocked_reason().is_some() {
+            return Err(CoordinatorProcessorDurableCaptureError::IdentityMismatch);
+        }
+        let writer_activation_digest = *current_pipeline.activation_digest().as_bytes();
         let ledger = Arc::new(
             ScyllaPendingQueueSegmentLedgerStore::prepare(
                 session.clone(),
@@ -367,11 +379,6 @@ impl<Hash: Q256BitHash> ScyllaCoordinatorProcessorDurableCaptureFactory<Hash> {
             )
             .await
             .map_err(backend)?,
-        );
-        let pipeline = Arc::new(
-            ScyllaPendingPipelineStore::prepare(session.clone(), control.clone())
-                .await
-                .map_err(backend)?,
         );
         let consumer_gate = Arc::new(
             ScyllaPendingQueueConsumerGateStore::prepare(
@@ -1255,5 +1262,15 @@ mod tests {
         assert!(!production.contains("pipeline.apply"));
         assert!(!production.contains("seal_rotation"));
         assert!(!production.contains("PendingPipelineWriteOutcome"));
+        let prepare = production
+            .split("pub(crate) async fn prepare")
+            .nth(1)
+            .unwrap()
+            .split("async fn open_exact")
+            .next()
+            .unwrap();
+        assert!(prepare.contains("PendingPipelineReadState::Current"));
+        assert!(prepare.contains("current_pipeline.activation_digest()"));
+        assert!(!prepare.contains("writer_activation_digest: [u8; 32]"));
     }
 }

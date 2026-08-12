@@ -23,11 +23,12 @@ use psy_node_core::{
         CanonicalHeadBootstrapProfile, CoordinatorCanonicalHeadStore,
     },
     store::rollback_admission::CoordinatorRollbackAdmissionStore,
+    store::coordinator_processor_branch_exact_runtime::CoordinatorBranchExactProcessorOwner,
 };
 
 use crate::coordinator::processor::{PsyCoordinatorProcessor, db::PsyCoordinatorDatabaseProcessor, runner::run_coordinator_processor};
 
-pub async fn create_coordinator_processor_with_durable_guta_submissions<
+async fn create_coordinator_processor_with_processing_owner<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
     S: PsyCoordinatorProcessorStore<N::F, N::QHash> + Send + Sync + 'static,
     STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync + 'static,
@@ -55,6 +56,8 @@ pub async fn create_coordinator_processor_with_durable_guta_submissions<
     proof_store: Arc<ProofStore>,
     durable_guta_submissions:
         Option<Arc<dyn CoordinatorGutaDurableSubmissionStore<N::QHash>>>,
+    normal_processing_owner:
+        crate::coordinator::processor::CoordinatorNormalProcessingOwner,
     guta_update_queue: Arc<GUTAUpdateQueue>,
     register_user_queue: Arc<RegisterUserQueue>,
     deploy_contract_queue: Arc<DeployContractQueue>,
@@ -183,11 +186,205 @@ where
         register_user_gatherer_backup_directory,
         guta_gatherer_backup_directory,
         durable_guta_submissions,
+        normal_processing_owner,
     )
     .await?;
     tracing::info!("[COORD_CREATE] processor new done");
 
     Ok(processor_result)
+}
+
+pub async fn create_coordinator_processor_with_durable_guta_submissions<
+    N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
+    S: PsyCoordinatorProcessorStore<N::F, N::QHash> + Send + Sync + 'static,
+    STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash>
+        + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash>
+        + Send
+        + Sync
+        + 'static,
+    GUTAUpdateQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
+    RegisterUserQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
+    DeployContractQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
+    ProofWorkQueue: QStandardWorkerQueuePublisher
+        + QStandardWorkerQueueSubscriber
+        + Send
+        + Sync
+        + 'static,
+    TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>
+        + Send
+        + Sync
+        + 'static,
+    ProofStore: QParthProofStore + QCanonicalProofStoreV2 + Send + Sync + 'static,
+    FileSystem: TokioLikeFileSystem + Send + Sync + 'static,
+>(
+    genesis_data: &PsyGenesisBlockSetupData<N::F, N::QHash>,
+    network: PsyChainNetworkType,
+    canonical_head_bootstrap_profile: Option<CanonicalHeadBootstrapProfile>,
+    canonical_head_store: Arc<dyn CoordinatorCanonicalHeadStore<N::QHash>>,
+    rollback_admission_store: Arc<dyn CoordinatorRollbackAdmissionStore<N::QHash>>,
+    file_system: Arc<FileSystem>,
+    deploy_contract_gatherer_backup_directory: String,
+    register_user_gatherer_backup_directory: String,
+    guta_gatherer_backup_directory: String,
+    checkpoint_tree_root_backup_file_path: String,
+    db: Arc<S>,
+    tag_tree_rewards_store: Arc<STagTreeRewards>,
+    temp_db: Arc<TempDatabase>,
+    proof_store: Arc<ProofStore>,
+    durable_guta_submissions:
+        Option<Arc<dyn CoordinatorGutaDurableSubmissionStore<N::QHash>>>,
+    guta_update_queue: Arc<GUTAUpdateQueue>,
+    register_user_queue: Arc<RegisterUserQueue>,
+    deploy_contract_queue: Arc<DeployContractQueue>,
+    proof_work_queue: Arc<ProofWorkQueue>,
+    realm_identifier: QRealmIdentifier,
+    circuit_fingerprint_config: PsyNodeCircuitFingerprintConfig<N::QHash>,
+) -> anyhow::Result<(
+    PsyCoordinatorProcessor<
+        N,
+        S,
+        STagTreeRewards,
+        GUTAUpdateQueue,
+        RegisterUserQueue,
+        DeployContractQueue,
+        ProofWorkQueue,
+        TempDatabase,
+        ProofStore,
+        FileSystem,
+    >,
+    tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+    tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+    tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+)>
+where
+    FileSystem::File: Send + Sync,
+{
+    create_coordinator_processor_with_processing_owner(
+        genesis_data,
+        network,
+        canonical_head_bootstrap_profile,
+        canonical_head_store,
+        rollback_admission_store,
+        file_system,
+        deploy_contract_gatherer_backup_directory,
+        register_user_gatherer_backup_directory,
+        guta_gatherer_backup_directory,
+        checkpoint_tree_root_backup_file_path,
+        db,
+        tag_tree_rewards_store,
+        temp_db,
+        proof_store,
+        durable_guta_submissions,
+        crate::coordinator::processor::CoordinatorNormalProcessingOwner::legacy(),
+        guta_update_queue,
+        register_user_queue,
+        deploy_contract_queue,
+        proof_work_queue,
+        realm_identifier,
+        circuit_fingerprint_config,
+    )
+    .await
+}
+
+/// Explicit default-off constructor for the branch-exact Coordinator capture
+/// owner. It installs command-only gatherers and never falls back to legacy
+/// whole-queue draining for this Processor instance.
+pub async fn create_coordinator_processor_with_branch_exact_capture<
+    N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
+    S: PsyCoordinatorProcessorStore<N::F, N::QHash> + Send + Sync + 'static,
+    STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash>
+        + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash>
+        + Send
+        + Sync
+        + 'static,
+    GUTAUpdateQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
+    RegisterUserQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
+    DeployContractQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
+    ProofWorkQueue: QStandardWorkerQueuePublisher
+        + QStandardWorkerQueueSubscriber
+        + Send
+        + Sync
+        + 'static,
+    TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>
+        + Send
+        + Sync
+        + 'static,
+    ProofStore: QParthProofStore + QCanonicalProofStoreV2 + Send + Sync + 'static,
+    FileSystem: TokioLikeFileSystem + Send + Sync + 'static,
+>(
+    genesis_data: &PsyGenesisBlockSetupData<N::F, N::QHash>,
+    network: PsyChainNetworkType,
+    canonical_head_bootstrap_profile: Option<CanonicalHeadBootstrapProfile>,
+    canonical_head_store: Arc<dyn CoordinatorCanonicalHeadStore<N::QHash>>,
+    rollback_admission_store: Arc<dyn CoordinatorRollbackAdmissionStore<N::QHash>>,
+    file_system: Arc<FileSystem>,
+    deploy_contract_gatherer_backup_directory: String,
+    register_user_gatherer_backup_directory: String,
+    guta_gatherer_backup_directory: String,
+    checkpoint_tree_root_backup_file_path: String,
+    db: Arc<S>,
+    tag_tree_rewards_store: Arc<STagTreeRewards>,
+    temp_db: Arc<TempDatabase>,
+    proof_store: Arc<ProofStore>,
+    durable_guta_submissions:
+        Option<Arc<dyn CoordinatorGutaDurableSubmissionStore<N::QHash>>>,
+    branch_exact_owner: CoordinatorBranchExactProcessorOwner,
+    guta_update_queue: Arc<GUTAUpdateQueue>,
+    register_user_queue: Arc<RegisterUserQueue>,
+    deploy_contract_queue: Arc<DeployContractQueue>,
+    proof_work_queue: Arc<ProofWorkQueue>,
+    realm_identifier: QRealmIdentifier,
+    circuit_fingerprint_config: PsyNodeCircuitFingerprintConfig<N::QHash>,
+) -> anyhow::Result<(
+    PsyCoordinatorProcessor<
+        N,
+        S,
+        STagTreeRewards,
+        GUTAUpdateQueue,
+        RegisterUserQueue,
+        DeployContractQueue,
+        ProofWorkQueue,
+        TempDatabase,
+        ProofStore,
+        FileSystem,
+    >,
+    tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+    tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+    tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+)>
+where
+    FileSystem::File: Send + Sync,
+{
+    if branch_exact_owner.network() != network.into() {
+        anyhow::bail!("branch-exact Coordinator owner network does not match Processor network");
+    }
+    create_coordinator_processor_with_processing_owner(
+        genesis_data,
+        network,
+        canonical_head_bootstrap_profile,
+        canonical_head_store,
+        rollback_admission_store,
+        file_system,
+        deploy_contract_gatherer_backup_directory,
+        register_user_gatherer_backup_directory,
+        guta_gatherer_backup_directory,
+        checkpoint_tree_root_backup_file_path,
+        db,
+        tag_tree_rewards_store,
+        temp_db,
+        proof_store,
+        durable_guta_submissions,
+        crate::coordinator::processor::CoordinatorNormalProcessingOwner::branch_exact(
+            branch_exact_owner,
+        ),
+        guta_update_queue,
+        register_user_queue,
+        deploy_contract_queue,
+        proof_work_queue,
+        realm_identifier,
+        circuit_fingerprint_config,
+    )
+    .await
 }
 
 pub async fn create_coordinator_processor<
@@ -444,4 +641,33 @@ where
         realm_identifier,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn legacy_and_branch_exact_constructors_install_disjoint_processing_owners() {
+        let source = include_str!("create.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let legacy = production
+            .split("pub async fn create_coordinator_processor_with_durable_guta_submissions")
+            .nth(1)
+            .unwrap()
+            .split("pub async fn create_coordinator_processor_with_branch_exact_capture")
+            .next()
+            .unwrap();
+        assert!(legacy.contains("CoordinatorNormalProcessingOwner::legacy()"));
+        assert!(!legacy.contains("CoordinatorNormalProcessingOwner::branch_exact"));
+
+        let branch_exact = production
+            .split("pub async fn create_coordinator_processor_with_branch_exact_capture")
+            .nth(1)
+            .unwrap()
+            .split("pub async fn create_coordinator_processor<")
+            .next()
+            .unwrap();
+        assert!(branch_exact.contains("branch_exact_owner.network() != network.into()"));
+        assert!(branch_exact.contains("CoordinatorNormalProcessingOwner::branch_exact"));
+        assert!(!branch_exact.contains("CoordinatorNormalProcessingOwner::legacy()"));
+    }
 }

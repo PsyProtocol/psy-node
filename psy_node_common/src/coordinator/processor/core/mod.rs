@@ -10,6 +10,7 @@ use psy_node_core::{
         worker_queue::QStandardWorkerQueuePublisher,
     },
     store::traits::proof_store::QParthProofStore,
+    store::coordinator_processor_branch_exact_runtime::CoordinatorBranchExactProcessorOwner,
 };
 
 use crate::{
@@ -31,6 +32,25 @@ mod process_block;
 mod recover_from_backup;
 pub mod runner;
 pub mod startup;
+
+pub(crate) enum CoordinatorNormalProcessingOwner {
+    Legacy,
+    BranchExact(CoordinatorBranchExactProcessorOwner),
+}
+
+impl CoordinatorNormalProcessingOwner {
+    pub const fn legacy() -> Self {
+        Self::Legacy
+    }
+
+    pub fn branch_exact(owner: CoordinatorBranchExactProcessorOwner) -> Self {
+        Self::BranchExact(owner)
+    }
+
+    pub const fn is_branch_exact(&self) -> bool {
+        matches!(self, Self::BranchExact(_))
+    }
+}
 
 pub struct PsyCoordinatorProcessor<
     N: QNetworkTypesConfig,
@@ -75,4 +95,5 @@ pub struct PsyCoordinatorProcessor<
         DeployContractGathererOutput<N::QHash, N::JobId>,
     >,
     pub proof_worker_queue_max_time_ms: u64,
+    normal_processing_owner: Option<CoordinatorNormalProcessingOwner>,
 }

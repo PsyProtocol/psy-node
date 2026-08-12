@@ -32,6 +32,7 @@ use psy_node_core::{
     queue::coordinator_guta_durable_submission::{
         CoordinatorGutaDurableSubmissionStore, CoordinatorGutaQueueItem,
     },
+    queue::recoverable_ephemeral::PendingQueueCaptureContext,
     store::traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore},
 };
 use psy_serialize::{PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
@@ -40,7 +41,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{
     coordinator::processor::processor_shared_status::PsyCoordinatorProcessorSharedStatus,
-    guta_planner::coordinator_guta_planner::CoordinatorGUTAPlanner, queue::gatherer_builder::QueueGathererItemBuilderWithTree,
+    guta_planner::coordinator_guta_planner::CoordinatorGUTAPlanner,
+    queue::{
+        gatherer::CoordinatorDurableTreeGathererConfig,
+        gatherer_builder::QueueGathererItemBuilderWithTree,
+    },
 };
 pub const COORDINATOR_GUTA_UPDATE_GATHERER_BACKUP_V1_MAGIC_BYTES: [u8; 4] = [0x43, 0x47, 0x42, 0x31]; // 'CGB1' in ASCII
 pub const COORDINATOR_GUTA_UPDATE_GATHERER_BACKUP_V1_MAGIC_U32: u32 = 0x31424743; // 'CGB1' in little-endian u32
@@ -424,6 +429,35 @@ impl<
             last_old_realm_roots: self.last_old_realm_roots.clone(),
             _phantom_n: std::marker::PhantomData,
         }
+    }
+}
+
+impl<
+        N: QNetworkTypesConfig + 'static,
+        TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + 'static,
+        ProofStore: QParthProofStore + QCanonicalProofStoreV2 + Send + Sync + 'static,
+        FileSystem: TokioLikeFileSystem + 'static,
+    > CoordinatorDurableTreeGathererConfig
+    for CoordinatorGUTAUpdateGathererConfig<N, TempDatabase, ProofStore, FileSystem>
+{
+    fn bind_coordinator_generation(
+        &self,
+        context: PendingQueueCaptureContext,
+    ) -> anyhow::Result<Self> {
+        if context.key().authority()
+            != psy_data::protocol::chain_context::AuthorityScope::Coordinator
+        {
+            anyhow::bail!("GUTA durable input is not Coordinator-scoped");
+        }
+        let mut status = self
+            .status
+            .read()
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?
+            .clone();
+        status.unique_pending_id = context.processing().pending_id().get();
+        let mut bound = self.clone();
+        bound.status = Arc::new(RwLock::new(status));
+        Ok(bound)
     }
 }
 pub struct CoordinatorGUTAUpdateGatherer<

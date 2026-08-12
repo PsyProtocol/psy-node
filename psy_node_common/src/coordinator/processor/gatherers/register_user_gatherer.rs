@@ -28,13 +28,19 @@ use psy_data::{
 };
 use psy_io::tokio::{TokioFileLike, TokioLikeFileSystem};
 use psy_node_core::{
-    psy_temp_db::StandardProcessorTempDBStoreBase, qblob::data_views::zero_merkle_node_batch::create_ffs_merkle_nodes_zero_id_from_hash_map,
+    psy_temp_db::StandardProcessorTempDBStoreBase,
+    qblob::data_views::zero_merkle_node_batch::create_ffs_merkle_nodes_zero_id_from_hash_map,
+    queue::recoverable_ephemeral::PendingQueueCaptureContext,
 };
 use psy_serialize::{FastFixedSerializable, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 use tokio::io::AsyncWriteExt;
 
 use crate::{
-    coordinator::processor::processor_shared_status::PsyCoordinatorProcessorSharedStatus, queue::gatherer_builder::QueueGathererItemBuilderWithTree,
+    coordinator::processor::processor_shared_status::PsyCoordinatorProcessorSharedStatus,
+    queue::{
+        gatherer::CoordinatorDurableTreeGathererConfig,
+        gatherer_builder::QueueGathererItemBuilderWithTree,
+    },
 };
 
 pub const REGISTER_USER_GATHERER_BACKUP_V1_MAGIC_BYTES: [u8; 4] = [0x52, 0x55, 0x42, 0x31]; // 'RUB1' in ASCII
@@ -201,6 +207,34 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
             file_system: Arc::clone(&self.file_system),
             _phantom_n: std::marker::PhantomData,
         }
+    }
+}
+
+impl<
+        N: QNetworkTypesConfig + 'static,
+        TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + 'static,
+        FileSystem: TokioLikeFileSystem + 'static,
+    > CoordinatorDurableTreeGathererConfig
+    for RegisterUserGathererConfig<N, TempDatabase, FileSystem>
+{
+    fn bind_coordinator_generation(
+        &self,
+        context: PendingQueueCaptureContext,
+    ) -> anyhow::Result<Self> {
+        if context.key().authority()
+            != psy_data::protocol::chain_context::AuthorityScope::Coordinator
+        {
+            anyhow::bail!("register-user durable input is not Coordinator-scoped");
+        }
+        let mut status = self
+            .status
+            .read()
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?
+            .clone();
+        status.unique_pending_id = context.processing().pending_id().get();
+        let mut bound = self.clone();
+        bound.status = Arc::new(RwLock::new(status));
+        Ok(bound)
     }
 }
 

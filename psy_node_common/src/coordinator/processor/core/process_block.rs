@@ -93,6 +93,10 @@ use psy_node_core::{
     psy_core_db::traits::full::{PsyCoordinatorProcessorStore, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter},
     psy_temp_db::StandardProcessorTempDBStoreBase,
     queue::{
+        coordinator_processor_durable_capture::{
+            CoordinatorProcessorDurableGenerationDigest,
+            CoordinatorProcessorSourceKind,
+        },
         coordinator_guta_durable_submission::CoordinatorGutaQueueItem,
         ephemeral::QStandardEphemeralQueueSubscriber,
         worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
@@ -104,7 +108,10 @@ use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 use crate::{
     backup::output::coordinator_output_builder::CoordinatorOutputBuilder,
     coordinator::{
-        processor::PsyCoordinatorProcessor,
+        processor::{
+            PsyCoordinatorProcessor,
+            CoordinatorNormalProcessingOwner,
+        },
         queue_key::{
             CoordinatorProvingWorkQueueKey,
             CoordinatorSubmitRealmGUTAUpdateQueueKey,
@@ -113,6 +120,25 @@ use crate::{
         },
     },
 };
+
+enum CoordinatorGatheringOutcome<
+    N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
+> {
+    Legacy(
+        PsyNodeProvingState,
+        Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>,
+        Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>,
+        Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>,
+        CoordinatorOutputBuilder<N>,
+    ),
+    AwaitingDurableClose,
+    BranchExactFinalized {
+        generation_digest: CoordinatorProcessorDurableGenerationDigest,
+        registration_items: u64,
+        deploy_items: u64,
+        guta_items: u64,
+    },
+}
 impl<
         N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
         S: PsyCoordinatorProcessorStore<N::F, N::QHash> + Send + Sync,
@@ -324,7 +350,123 @@ impl<
     }
 
 
-    pub async fn get_results_from_gatherers(&mut self) -> anyhow::Result<(
+    async fn get_results_from_gatherers(
+        &mut self,
+    ) -> anyhow::Result<CoordinatorGatheringOutcome<N>> {
+        let mut owner = self
+            .normal_processing_owner
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Coordinator processing owner is already borrowed"))?;
+        let result = match &mut owner {
+            CoordinatorNormalProcessingOwner::Legacy => self
+                .get_legacy_results_from_gatherers()
+                .await
+                .map(|(proving, guta, registration, deploy, output)| {
+                    CoordinatorGatheringOutcome::Legacy(
+                        proving,
+                        guta,
+                        registration,
+                        deploy,
+                        output,
+                    )
+                }),
+            CoordinatorNormalProcessingOwner::BranchExact(branch_exact) => {
+                self.get_branch_exact_results_from_gatherers(branch_exact)
+                    .await
+            }
+        };
+        self.normal_processing_owner = Some(owner);
+        result
+    }
+
+    async fn get_branch_exact_results_from_gatherers(
+        &mut self,
+        owner: &mut psy_node_core::store::coordinator_processor_branch_exact_runtime::CoordinatorBranchExactProcessorOwner,
+    ) -> anyhow::Result<CoordinatorGatheringOutcome<N>> {
+        let mut iteration = owner.begin_iteration();
+        let mut capture = iteration.open_capture().await?;
+        let Some(generation) = capture.capture_or_replay().await? else {
+            return Ok(CoordinatorGatheringOutcome::AwaitingDurableClose);
+        };
+        drop(capture);
+        let total_items = generation.total_items();
+        let (context, generation_digest, registration, deploy, guta) =
+            generation.into_sources();
+        if self.db.ids.unique_pending_id != context.processing().pending_id().get()
+            || self.db.ids.proc_checkpoint_unique_id
+                != context.processing().proc_checkpoint_id().as_u128()
+        {
+            anyhow::bail!(
+                "durable Coordinator pipeline processing identity does not match the clean-boundary Processor state"
+            );
+        }
+        let registration_items = registration.items().len() as u64;
+        let deploy_items = deploy.items().len() as u64;
+        let guta_items = guta.items().len() as u64;
+        if registration_items
+            .checked_add(deploy_items)
+            .and_then(|count| count.checked_add(guta_items))
+            != Some(total_items)
+        {
+            anyhow::bail!("Coordinator durable source counts do not match generation total");
+        }
+
+        let (registration_apply, deploy_apply, guta_apply) = tokio::try_join!(
+            self.register_user_queue_gatherer
+                .apply_coordinator_durable_source(generation_digest, registration),
+            self.deploy_contract_queue_gatherer
+                .apply_coordinator_durable_source(generation_digest, deploy),
+            self.guta_queue_gatherer
+                .apply_coordinator_durable_source(generation_digest, guta),
+        )?;
+        if registration_apply.source_kind()
+                != CoordinatorProcessorSourceKind::Registration
+            || deploy_apply.source_kind() != CoordinatorProcessorSourceKind::Deploy
+            || guta_apply.source_kind() != CoordinatorProcessorSourceKind::Guta
+            || registration_apply.generation_digest() != generation_digest
+            || deploy_apply.generation_digest() != generation_digest
+            || guta_apply.generation_digest() != generation_digest
+        {
+            anyhow::bail!("Coordinator command actors returned a mixed-generation receipt");
+        }
+        let (registration, deploy, guta) = tokio::try_join!(
+            self.register_user_queue_gatherer
+                .finalize_coordinator_durable_source(registration_apply),
+            self.deploy_contract_queue_gatherer
+                .finalize_coordinator_durable_source(deploy_apply),
+            self.guta_queue_gatherer
+                .finalize_coordinator_durable_source(guta_apply),
+        )?;
+        if registration.generation_digest() != generation_digest
+            || deploy.generation_digest() != generation_digest
+            || guta.generation_digest() != generation_digest
+            || registration.source_kind()
+                != CoordinatorProcessorSourceKind::Registration
+            || deploy.source_kind() != CoordinatorProcessorSourceKind::Deploy
+            || guta.source_kind() != CoordinatorProcessorSourceKind::Guta
+        {
+            anyhow::bail!("Coordinator command actor finalization mixed durable generations");
+        }
+
+        // Build the exact same Coordinator output/job plan as the legacy
+        // path.  c4e/c4f will persist and publish it; until that writer/head
+        // barrier exists, branch-exact stops here and cannot fall through the
+        // legacy proof/commit/head path.
+        let _validated_output = CoordinatorOutputBuilder::<N>::new(
+            &self.db.ids,
+            guta.output().clone(),
+            registration.output().clone(),
+            deploy.output().clone(),
+        )?;
+        Ok(CoordinatorGatheringOutcome::BranchExactFinalized {
+            generation_digest,
+            registration_items,
+            deploy_items,
+            guta_items,
+        })
+    }
+
+    async fn get_legacy_results_from_gatherers(&mut self) -> anyhow::Result<(
         PsyNodeProvingState,
         Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>,
         Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>,
@@ -536,7 +678,43 @@ impl<
     pub async fn process_block(&mut self) -> anyhow::Result<()> {
         let mut timer = TraceTimer::new("process_block");
         tracing::info!("Starting to process new coordinator block with checkpoint_id = {}...", self.db.ids.next_checkpoint_id);
-        let (mut proving_state, guta_jobs, register_user_jobs, deploy_contract_jobs, mut output_builder) = self.get_results_from_gatherers().await?;
+        let gathering = self.get_results_from_gatherers().await?;
+        let (mut proving_state, guta_jobs, register_user_jobs, deploy_contract_jobs, mut output_builder) = match gathering {
+            CoordinatorGatheringOutcome::Legacy(
+                proving_state,
+                guta_jobs,
+                register_user_jobs,
+                deploy_contract_jobs,
+                output_builder,
+            ) => (
+                proving_state,
+                guta_jobs,
+                register_user_jobs,
+                deploy_contract_jobs,
+                output_builder,
+            ),
+            CoordinatorGatheringOutcome::AwaitingDurableClose => {
+                tracing::info!(
+                    "Coordinator branch-exact capture is waiting for all three explicit source closes"
+                );
+                return Ok(());
+            }
+            CoordinatorGatheringOutcome::BranchExactFinalized {
+                generation_digest,
+                registration_items,
+                deploy_items,
+                guta_items,
+            } => {
+                tracing::info!(
+                    generation_digest = %hex::encode(generation_digest.as_bytes()),
+                    registration_items,
+                    deploy_items,
+                    guta_items,
+                    "Coordinator branch-exact generation finalized; waiting for c4e/c4f writer/head barrier"
+                );
+                return Ok(());
+            }
+        };
         let worker_queue_key_for_cleanup = self.db.get_proof_worker_queue_key();
         let worker_unique_id_for_cleanup = self.db.ids.proc_checkpoint_unique_id;
 
@@ -644,6 +822,56 @@ mod tests {
     };
 
     use super::{publish_wait_for_queue_and_job_ready, wait_for_job_ready};
+
+    #[test]
+    fn branch_exact_coordinator_route_is_command_only_and_stops_before_legacy_authority() {
+        let source = include_str!("process_block.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let branch_exact = production
+            .split("async fn get_branch_exact_results_from_gatherers")
+            .nth(1)
+            .unwrap()
+            .split("async fn get_legacy_results_from_gatherers")
+            .next()
+            .unwrap();
+        assert!(branch_exact.contains("capture_or_replay"));
+        assert_eq!(
+            branch_exact
+                .matches("apply_coordinator_durable_source")
+                .count(),
+            3
+        );
+        assert_eq!(
+            branch_exact
+                .matches("finalize_coordinator_durable_source")
+                .count(),
+            3
+        );
+        assert!(branch_exact.contains("CoordinatorOutputBuilder::<N>::new"));
+        for forbidden in [
+            "finalize_gathering_and_update_queue_key",
+            "set_new_unique_ids",
+            "commit_state",
+            "publish_worker_queue_item_ref",
+        ] {
+            assert!(
+                !branch_exact.contains(forbidden),
+                "branch-exact Coordinator route must not call legacy authority path: {forbidden}"
+            );
+        }
+
+        let handoff_arm = production
+            .rsplit("CoordinatorGatheringOutcome::BranchExactFinalized")
+            .next()
+            .unwrap()
+            .split("let worker_queue_key_for_cleanup")
+            .next()
+            .unwrap();
+        assert!(handoff_arm.contains("return Ok(())"));
+        assert!(!handoff_arm.contains("get_root_job_ids"));
+        assert!(!handoff_arm.contains("publish_jobs"));
+        assert!(!handoff_arm.contains("commit_state"));
+    }
 
     #[tokio::test]
     async fn polls_until_both_job_values_exist() -> anyhow::Result<()> {
