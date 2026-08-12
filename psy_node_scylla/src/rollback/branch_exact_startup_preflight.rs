@@ -18,10 +18,7 @@ use psy_data::protocol::{
     chain_context::AuthorityScope,
 };
 use psy_node_core::store::{
-    authority_commit::{
-        AuthorityTimestampKey, AuthorityTimestampPhase,
-        ObservedAuthorityTimestampState,
-    },
+    authority_commit::{AuthorityTimestampKey, ObservedAuthorityTimestampState},
     authority_local_head::{
         AuthorityLocalHeadReadState, StoredAuthorityLocalHead,
     },
@@ -544,29 +541,15 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorStartupPreflightProvider<Hash> {
         let plan = sample.writer.plan();
         let phase = validated.phase;
         let recovery = validated.recovery;
-        let recovery_tag = require_clean_run_boundary(&recovery)?;
-        let BranchExactWriterState::Active(active) = sample.writer.state() else {
-            return Err(RealmProcessorStartupError::DurableRecoveryRequired(
-                "writer/pending crash recovery must complete before Realm startup"
-                    .to_owned(),
-            ));
-        };
-        if !matches!(sample.timestamp.state().phase(), AuthorityTimestampPhase::Idle { .. })
-            || sample.timestamp.state() != active.timestamp_state()
-        {
-            return Err(not_verified_message(
-                "active writer and timestamp allocator disagree",
-            ));
-        }
-        if sample.head.head().key().network() != self.network
-            || sample.head.head().key().authority() != self.authority
-            || sample.head.head().chain() != active.watermark().canonical_chain()
-        {
-            return Err(not_verified_message(
-                "authority head and active writer watermark disagree",
-            ));
-        }
-        require_not_behind_cutover(binding.watermark(), active.watermark())?;
+        let recovery_tag = require_runtime_run_boundary(&recovery)?;
+        let writer_watermark = runtime_writer_watermark(&recovery, &sample.writer)?;
+        validate_recovery_head(
+            self.network,
+            self.authority,
+            sample,
+            &recovery,
+        )?;
+        require_not_behind_cutover(binding.watermark(), writer_watermark)?;
 
         let route = RealmProcessorStartupRouteObservation::try_new(
             binding.generation().get(),
@@ -575,7 +558,7 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorStartupPreflightProvider<Hash> {
             *sample.route.state_digest().as_bytes(),
             phase,
         )?;
-        let watermark_digest = cutover_watermark_digest(binding.watermark());
+        let watermark_digest = cutover_watermark_digest(writer_watermark);
         let fingerprint = sample.fingerprint();
         let readiness_digest = readiness_digest(&fingerprint, recovery_tag);
         Ok(ValidatedScyllaStartup {
@@ -588,7 +571,9 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorStartupPreflightProvider<Hash> {
 
     /// Run only deterministic Scylla crash recovery. Every iteration brackets
     /// the complete eight-component authority state, consumes at most one sealed
-    /// action, and then starts classification again from storage.
+    /// action, and then starts classification again from storage. A phase that
+    /// needs the installed affine Processor owner is admitted read-only here
+    /// and resumed only after the separately sampled run permit is consumed.
     pub(crate) async fn recover_isolated(
         &self,
         expectation: RealmProcessorStartupExpectation,
@@ -620,10 +605,13 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorStartupPreflightProvider<Hash> {
                     self.validate_composite(expectation, &after)?;
                     return Ok(())
                 }
-                ScyllaStartupRecoveryDecision::AwaitExternal(reason) => {
-                    return Err(RealmProcessorStartupError::DurableRecoveryRequired(
-                        format!("startup recovery awaits external capability: {reason:?}"),
-                    ))
+                ScyllaStartupRecoveryDecision::AwaitExternal(_reason) => {
+                    // These phases require the installed affine runtime rather
+                    // than a startup-only storage mutation. Final admission
+                    // below accepts only the exhaustive resumable subset and
+                    // still rejects Baseline or any inconsistent pairing.
+                    self.validate_composite(expectation, &after)?;
+                    return Ok(())
                 }
                 ScyllaStartupRecoveryDecision::Recover(admission) => {
                     self.execute_recovery_admission(
@@ -1202,29 +1190,57 @@ fn route_phase(
 }
 
 /// A durable state may be internally consistent without being safe for a new
-/// Processor/gatherer. Only the clean Ready boundary authorizes a run; every
-/// crash-intermediate or terminal-but-unrotated state belongs to the isolated
-/// recovery runner.
-fn require_clean_run_boundary<Hash>(
+/// Processor/gatherer. Admit only phases with an installed storage-owned
+/// runtime owner. Startup-only CAS states must first be normalized by the
+/// isolated runner; Baseline still requires an explicit prime/rotation owner.
+fn require_runtime_run_boundary<Hash>(
     recovery: &BranchExactPendingStartupRecovery<Hash>,
 ) -> Result<u8, RealmProcessorStartupError> {
     match recovery {
         BranchExactPendingStartupRecovery::ReadyForQueueClose => Ok(2),
+        BranchExactPendingStartupRecovery::ResumeQueueSeal(_) => Ok(3),
+        BranchExactPendingStartupRecovery::AwaitRecoverableWork(_) => Ok(4),
+        BranchExactPendingStartupRecovery::AwaitTrustedMarker => Ok(5),
+        BranchExactPendingStartupRecovery::ResumeNoWorkPublication(_) => Ok(6),
+        BranchExactPendingStartupRecovery::CompleteNoWorkAfterTrustedMarker => Ok(7),
+        BranchExactPendingStartupRecovery::CompleteAfterTrustedMarker => Ok(8),
         BranchExactPendingStartupRecovery::AwaitPrimeOrRotate
-        | BranchExactPendingStartupRecovery::ResumeQueueSeal(_)
-        | BranchExactPendingStartupRecovery::AwaitRecoverableWork(_)
         | BranchExactPendingStartupRecovery::ApplyPipeline { .. }
         | BranchExactPendingStartupRecovery::ResumeWriterVerification(_)
-        | BranchExactPendingStartupRecovery::AwaitTrustedMarker
-        | BranchExactPendingStartupRecovery::ResumeNoWorkPublication(_)
-        | BranchExactPendingStartupRecovery::CompleteNoWorkAfterTrustedMarker
-        | BranchExactPendingStartupRecovery::FinishWriterAfterTrustedMarker
-        | BranchExactPendingStartupRecovery::CompleteAfterTrustedMarker => {
+        | BranchExactPendingStartupRecovery::FinishWriterAfterTrustedMarker => {
             Err(RealmProcessorStartupError::DurableRecoveryRequired(
-                "pending pipeline is not at the clean Ready run boundary"
+                "pending/writer state has no installed runtime resume owner"
                     .to_owned(),
             ))
         }
+    }
+}
+
+fn runtime_writer_watermark<'writer, Hash: Q256BitHash>(
+    recovery: &BranchExactPendingStartupRecovery<Hash>,
+    writer: &'writer StoredBranchExactWriterLifecycle<Hash>,
+) -> Result<
+    &'writer psy_node_core::store::branch_pending_mapping::BranchPendingMapping<Hash>,
+    RealmProcessorStartupError,
+> {
+    match (recovery, writer.state()) {
+        (
+            BranchExactPendingStartupRecovery::AwaitTrustedMarker,
+            BranchExactWriterState::WritesVerified(verified),
+        ) => Ok(verified.prepared().previous().watermark()),
+        (
+            BranchExactPendingStartupRecovery::ReadyForQueueClose
+            | BranchExactPendingStartupRecovery::ResumeQueueSeal(_)
+            | BranchExactPendingStartupRecovery::AwaitRecoverableWork(_)
+            | BranchExactPendingStartupRecovery::ResumeNoWorkPublication(_)
+            | BranchExactPendingStartupRecovery::CompleteNoWorkAfterTrustedMarker
+            | BranchExactPendingStartupRecovery::CompleteAfterTrustedMarker,
+            BranchExactWriterState::Active(active),
+        ) => Ok(active.watermark()),
+        _ => Err(RealmProcessorStartupError::DurableRecoveryRequired(
+            "pending/writer state has no installed runtime resume owner"
+                .to_owned(),
+        )),
     }
 }
 
@@ -1362,6 +1378,10 @@ fn storage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use psy_node_core::store::pending_generation_pipeline::{
+        PendingEmptyQueueSealDigest, PendingQueueCloseIntentDigest,
+        PendingWorkCaptureDigest,
+    };
 
     fn expectation(nonce: u8) -> RealmProcessorStartupExpectation {
         RealmProcessorStartupExpectation::try_new(
@@ -1512,36 +1532,63 @@ mod tests {
     }
 
     #[test]
-    fn only_clean_ready_pending_boundary_can_authorize_a_run() {
-        assert_eq!(
-            require_clean_run_boundary::<parth_core::PHash>(
-                &BranchExactPendingStartupRecovery::ReadyForQueueClose,
+    fn only_installed_runtime_resume_boundaries_can_authorize_a_run() {
+        for (recovery, tag) in [
+            (
+                BranchExactPendingStartupRecovery::<parth_core::PHash>::ReadyForQueueClose,
+                2,
             ),
-            Ok(2),
-        );
+            (
+                BranchExactPendingStartupRecovery::ResumeQueueSeal(
+                    PendingQueueCloseIntentDigest::try_new([1; 32]).unwrap(),
+                ),
+                3,
+            ),
+            (
+                BranchExactPendingStartupRecovery::AwaitRecoverableWork(
+                    PendingWorkCaptureDigest::try_new([2; 32]).unwrap(),
+                ),
+                4,
+            ),
+            (BranchExactPendingStartupRecovery::AwaitTrustedMarker, 5),
+            (
+                BranchExactPendingStartupRecovery::ResumeNoWorkPublication(
+                    PendingEmptyQueueSealDigest::try_new([3; 32]).unwrap(),
+                ),
+                6,
+            ),
+            (
+                BranchExactPendingStartupRecovery::CompleteNoWorkAfterTrustedMarker,
+                7,
+            ),
+            (
+                BranchExactPendingStartupRecovery::CompleteAfterTrustedMarker,
+                8,
+            ),
+        ] {
+            assert_eq!(require_runtime_run_boundary(&recovery), Ok(tag));
+        }
         for recovery in [
             BranchExactPendingStartupRecovery::<parth_core::PHash>::AwaitPrimeOrRotate,
-            BranchExactPendingStartupRecovery::AwaitTrustedMarker,
-            BranchExactPendingStartupRecovery::CompleteNoWorkAfterTrustedMarker,
             BranchExactPendingStartupRecovery::FinishWriterAfterTrustedMarker,
-            BranchExactPendingStartupRecovery::CompleteAfterTrustedMarker,
         ] {
             assert!(matches!(
-                require_clean_run_boundary(&recovery),
+                require_runtime_run_boundary(&recovery),
                 Err(RealmProcessorStartupError::DurableRecoveryRequired(_))
             ));
         }
 
         let source = include_str!("branch_exact_startup_preflight.rs");
         let boundary = source
-            .split("fn require_clean_run_boundary")
+            .split("fn require_runtime_run_boundary")
             .nth(1)
             .unwrap()
-            .split("fn require_not_behind_cutover")
+            .split("fn runtime_writer_watermark")
             .next()
             .unwrap();
-        assert_eq!(boundary.matches("=> Ok(").count(), 1);
+        assert_eq!(boundary.matches("=> Ok(").count(), 7);
         assert!(boundary.contains("ReadyForQueueClose => Ok(2)"));
+        assert!(!boundary.contains("_ =>"));
     }
 
     #[test]
@@ -1584,6 +1631,7 @@ mod tests {
         assert!(runner.contains("self.execute_recovery_admission"));
         assert!(runner.contains("AwaitExternal"));
         assert!(runner.contains("self.validate_composite(expectation, &after)?"));
+        assert!(runner.contains("return Ok(())"));
 
         let executor = source
             .split("async fn execute_recovery_admission")

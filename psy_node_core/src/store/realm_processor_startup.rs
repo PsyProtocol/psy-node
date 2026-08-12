@@ -1,9 +1,10 @@
 //! Driver-independent preflight boundary for an enabled Realm Processor.
 //!
 //! A provider may inspect durable storage and return a stable evidence view,
-//! but only this module can seal the non-Clone permit. The current production
-//! composition still rejects the permit before startup side effects because
-//! its reader/writer paths have not migrated yet.
+//! but only this module can seal the non-Clone permit. Providers decide which
+//! exact durable phases have an installed runtime recovery owner; the permit
+//! commits that complete evidence without turning the observation itself into
+//! mutation authority.
 
 use std::{error::Error, fmt};
 
@@ -383,8 +384,9 @@ impl RealmProcessorStartupPermit {
 }
 
 /// The only branch-exact authorization that may cross from startup admission
-/// into a Processor composition. It is minted from one fresh, fully ready
-/// preflight and is deliberately non-Clone and non-serializable.
+/// into a Processor composition. It is minted from one fresh, fully
+/// runtime-resumable preflight and is deliberately non-Clone and
+/// non-serializable.
 #[derive(Debug)]
 pub struct RealmProcessorFreshRunPermit {
     startup: RealmProcessorStartupPermit,
