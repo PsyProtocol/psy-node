@@ -109,7 +109,7 @@ use psy_node_nats::{
         RecoverableNatsConsumerProvisioningOperationId,
     },
 };
-use scylla::client::session::Session;
+use scylla::{client::session::Session, statement::Consistency};
 use sha2::{Digest, Sha256};
 
 #[cfg(all(test, feature = "rf3-test-support"))]
@@ -192,6 +192,9 @@ use super::realm_processor_application_archive::{
 };
 use super::realm_processor_deferred_carryover::ScyllaRealmProcessorDeferredCarryoverStore;
 use super::realm_processor_generation_terminal::ScyllaRealmProcessorGenerationTerminalStore;
+use super::realm_full_commit_execution::RealmFullCommitExecutionSchedule;
+use super::realm_full_commit_manifest_store::ScyllaRealmFullCommitManifestStore;
+use super::realm_full_commit_scylla::RealmFullCommitScyllaExecutor;
 
 const OWNER_ATTEMPT_DOMAIN: &[u8] =
     b"psy/rollback/realm-processor-capture-owner-attempt/v1";
@@ -219,6 +222,9 @@ pub(crate) struct ScyllaRealmProcessorDurableCaptureFactory<Hash> {
     application_archive: Arc<ScyllaRealmProcessorApplicationArchiveStore>,
     generation_terminal: Arc<ScyllaRealmProcessorGenerationTerminalStore>,
     deferred_carryover: Arc<ScyllaRealmProcessorDeferredCarryoverStore>,
+    full_commit_session: Arc<Session>,
+    full_commit_executor: Arc<RealmFullCommitScyllaExecutor>,
+    full_commit_manifest: Arc<ScyllaRealmFullCommitManifestStore>,
     external_dependency_loader: Arc<dyn RealmProcessorExternalDependencyLoader>,
     _hash: PhantomData<Hash>,
 }
@@ -316,9 +322,29 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
             .map_err(backend)?,
         );
         let deferred_carryover = Arc::new(
-            ScyllaRealmProcessorDeferredCarryoverStore::prepare(session, control)
+            ScyllaRealmProcessorDeferredCarryoverStore::prepare(
+                session.clone(),
+                control.clone(),
+            )
                 .await
                 .map_err(backend)?,
+        );
+        let full_commit_executor = Arc::new(
+            RealmFullCommitScyllaExecutor::prepare_with_consistency(
+                &session,
+                keyspaces.data().clone(),
+                Consistency::Quorum,
+            )
+            .await
+            .map_err(backend)?,
+        );
+        let full_commit_manifest = Arc::new(
+            ScyllaRealmFullCommitManifestStore::prepare(
+                session.clone(),
+                control,
+            )
+            .await
+            .map_err(backend)?,
         );
         Ok(Self {
             network,
@@ -336,6 +362,9 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
             application_archive,
             generation_terminal,
             deferred_carryover,
+            full_commit_session: session,
+            full_commit_executor,
+            full_commit_manifest,
             external_dependency_loader,
             _hash: PhantomData,
         })
@@ -637,7 +666,7 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
         )
     }
 
-    pub(super) async fn validate_full_commit_source(
+    pub(super) async fn execute_full_commit(
         &self,
         writer: &ScyllaBranchExactWriterRuntime<Hash>,
         request: SealedRealmProcessorFullCommitSourceRequest<Hash>,
@@ -742,6 +771,53 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
         .map_err(|error| RealmProcessorFullCommitSourceError::Writer(error.to_string()))?;
         let semantic_domain_count = u8::try_from(full_plan.coverage().domains().len())
             .map_err(|_| RealmProcessorFullCommitSourceError::IdentityMismatch)?;
+        let schedule = RealmFullCommitExecutionSchedule::try_from_plan(
+            &full_plan,
+            verified.prepared(),
+        )
+        .map_err(|error| RealmProcessorFullCommitSourceError::Writer(error.to_string()))?;
+        self.full_commit_executor
+            .write_and_verify(&self.full_commit_session, &schedule)
+            .await
+            .map_err(full_source_backend)?;
+        let manifest = self
+            .full_commit_manifest
+            .persist_from_runtime_fresh_sources::<Hash>(
+                writer,
+                &self.full_commit_executor,
+                &full_plan,
+            )
+            .await
+            .map_err(full_source_backend)?;
+        self.full_commit_manifest
+            .revalidate_from_runtime_fresh_sources(
+                &manifest,
+                writer,
+                &self.full_commit_executor,
+                &full_plan,
+            )
+            .await
+            .map_err(full_source_backend)?;
+        let final_pipeline = self
+            .observe_generation_continuation_exact()
+            .await
+            .map_err(full_source_capture)?;
+        let final_archive = self
+            .application_archive
+            .read_selected(application.archive_slot())
+            .await
+            .map_err(full_source_backend)?
+            .ok_or(RealmProcessorFullCommitSourceError::ConcurrentMutation)?;
+        let final_writer = writer.read_writer().await.map_err(full_source_writer)?;
+        if second.continuation != final_pipeline.continuation
+            || !same_pipeline_snapshot(&second.pipeline, &final_pipeline.pipeline)
+            || second_archive.header() != final_archive.header()
+            || second_archive.semantic() != final_archive.semantic()
+            || second_writer != final_writer
+        {
+            return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
+        }
+        let persisted = manifest.manifest();
         RealmProcessorFullCommitSourceObservation::try_from_storage(
             processing,
             application,
@@ -752,6 +828,10 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
             *request.coordinator_payload_digest(),
             *full_plan.coverage().digest(),
             semantic_domain_count,
+            *persisted.slot().as_bytes(),
+            *persisted.digest(),
+            persisted.typed_row_count(),
+            persisted.total_mutation_count(),
         )
     }
 
@@ -2583,19 +2663,19 @@ mod tests {
     };
 
     #[test]
-    fn full_commit_source_is_bracketed_by_exact_pipeline_archive_and_writer_reads() {
+    fn full_commit_execution_is_bracketed_and_manifested_before_return() {
         let source = include_str!("realm_processor_durable_capture.rs");
         let method = source
-            .split("pub(super) async fn validate_full_commit_source(")
+            .split("pub(super) async fn execute_full_commit(")
             .nth(1)
             .unwrap()
             .split("fn validate_generation_request")
             .next()
             .unwrap();
         assert!(method.contains("AwaitWriterCompletion"));
-        assert_eq!(method.matches("read_selected(application.archive_slot())").count(), 2);
-        assert_eq!(method.matches("writer.read_writer()").count(), 2);
-        assert_eq!(method.matches("observe_generation_continuation_exact()").count(), 2);
+        assert_eq!(method.matches("read_selected(application.archive_slot())").count(), 3);
+        assert_eq!(method.matches("writer.read_writer()").count(), 3);
+        assert_eq!(method.matches("observe_generation_continuation_exact()").count(), 3);
         assert!(method.contains("same_pipeline_snapshot"));
         assert!(method.contains("first_archive.header() != second_archive.header()"));
         assert!(method.contains("first_writer != second_writer"));
@@ -2605,9 +2685,31 @@ mod tests {
         ));
         assert!(method.contains("full_plan.coverage().digest()"));
         assert!(method.contains("full_plan.coverage().domains().len()"));
-        assert!(!method.contains("write_and_verify"));
-        assert!(!method.contains("persist_from_fresh_sources"));
-        assert!(!method.contains("finish_published"));
+        let plan = method
+            .find("RealmFullCommitPhysicalPlan::try_assemble_from_write_set")
+            .unwrap();
+        let writes = method.find(".write_and_verify(").unwrap();
+        let manifest = method
+            .find(".persist_from_runtime_fresh_sources")
+            .unwrap();
+        let final_pipeline = method
+            .rfind("observe_generation_continuation_exact()")
+            .unwrap();
+        assert!(plan < writes);
+        assert!(writes < manifest);
+        assert!(manifest < final_pipeline);
+        assert!(method.contains("revalidate_from_runtime_fresh_sources"));
+        assert!(method.contains("persisted.slot().as_bytes()"));
+        assert!(method.contains("persisted.digest()"));
+        for forbidden in [
+            "finish_published",
+            "seal_publish",
+            "seal_rotation",
+            "authority_head",
+            "generation_terminal.persist",
+        ] {
+            assert!(!method.contains(forbidden), "found {forbidden}");
+        }
     }
     use psy_node_nats::{
         recoverable_assignment::{

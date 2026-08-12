@@ -824,7 +824,7 @@ where
         *self.queue_setup_ready.ready_digest()
     }
 
-    async fn validate_source(
+    async fn execute_source(
         &self,
         request: SealedRealmProcessorFullCommitSourceRequest<Hash>,
     ) -> Result<RealmProcessorFullCommitSourceObservation, RealmProcessorFullCommitSourceError> {
@@ -834,7 +834,7 @@ where
             )
         })?;
         factory
-            .validate_full_commit_source(&self.writer_runtime, request)
+            .execute_full_commit(&self.writer_runtime, request)
             .await
     }
 }

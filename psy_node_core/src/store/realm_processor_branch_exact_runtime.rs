@@ -315,10 +315,11 @@ impl<Hash> RealmBranchExactCommitIteration<'_, Hash> {
         factory.prepare_and_verify(request).await
     }
 
-    /// Revalidates the application/proof/Coordinator source against the exact
-    /// InFlight pipeline and WritesVerified narrow writer. This source fence
-    /// does not execute the remaining writes or publish any marker.
-    pub async fn validate_full_commit_source(
+    /// Revalidates the application/proof/Coordinator source, executes every
+    /// remaining typed write with exact readback, and persists the immutable
+    /// full-commit manifest. It does not publish the authority head,
+    /// terminalize, or rotate the generation.
+    pub async fn execute_full_commit(
         &mut self,
         source: RealmProcessorVerifiedFullCommitSource<Hash>,
     ) -> Result<RealmProcessorFullCommitSourceObservation, RealmProcessorFullCommitSourceError>
@@ -338,7 +339,7 @@ impl<Hash> RealmBranchExactCommitIteration<'_, Hash> {
             runtime.queue_readiness_digest(),
             source,
         )?;
-        factory.validate_source(request).await
+        factory.execute_source(request).await
     }
 
     /// Freshly observes the storage-selected processing generation. This is
@@ -1117,7 +1118,7 @@ mod tests {
             [6; 32]
         }
 
-        async fn validate_source(
+        async fn execute_source(
             &self,
             _request: SealedRealmProcessorFullCommitSourceRequest<PHash>,
         ) -> Result<RealmProcessorFullCommitSourceObservation, RealmProcessorFullCommitSourceError>

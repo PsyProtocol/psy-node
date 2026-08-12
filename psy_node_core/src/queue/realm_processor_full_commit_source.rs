@@ -1,9 +1,10 @@
 //! Exact live source retained across the narrow-writer/full-commit boundary.
 //!
-//! The value carries a live proof seal and the exact canonical Coordinator
-//! response. It is not a write, manifest, head, terminal, or rotation permit.
-//! A storage backend must still reselect the application, pipeline and durable
-//! writer before accepting it as the source of a later full commit.
+//! The value carries a live proof seal, the exact canonical Coordinator
+//! response and the checked logical write set. A storage backend must reselect
+//! the application, pipeline and durable writer before executing the complete
+//! physical plan and persisting its immutable verification manifest. The
+//! resulting observation is still not a head, terminal, or rotation permit.
 
 use std::{error::Error, fmt};
 
@@ -201,8 +202,10 @@ impl<Hash: Q256BitHash> SealedRealmProcessorFullCommitSourceRequest<Hash> {
     }
 }
 
-/// Read-only durable confirmation that the full-commit source still matches
-/// the selected InFlight pipeline and WritesVerified narrow writer.
+/// Durable confirmation that the complete full-commit plan was written,
+/// exactly read back and committed by an immutable verification manifest.
+/// It remains an observation only; later head/terminal owners must fresh-read
+/// the manifest rather than treating this copyable value as authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RealmProcessorFullCommitSourceObservation {
     processing: PendingGenerationContext,
@@ -214,6 +217,10 @@ pub struct RealmProcessorFullCommitSourceObservation {
     coordinator_payload_digest: [u8; 32],
     full_coverage_digest: [u8; 32],
     semantic_domain_count: u8,
+    manifest_slot: [u8; 32],
+    manifest_digest: [u8; 32],
+    typed_row_count: u32,
+    total_mutation_count: u64,
 }
 
 impl RealmProcessorFullCommitSourceObservation {
@@ -228,6 +235,10 @@ impl RealmProcessorFullCommitSourceObservation {
         coordinator_payload_digest: [u8; 32],
         full_coverage_digest: [u8; 32],
         semantic_domain_count: u8,
+        manifest_slot: [u8; 32],
+        manifest_digest: [u8; 32],
+        typed_row_count: u32,
+        total_mutation_count: u64,
     ) -> Result<Self, RealmProcessorFullCommitSourceError> {
         if writer_revision == 0
             || narrow_prepared_digest == [0; 32]
@@ -235,6 +246,10 @@ impl RealmProcessorFullCommitSourceObservation {
             || full_coverage_digest == [0; 32]
             || semantic_domain_count == 0
             || semantic_domain_count > 22
+            || manifest_slot == [0; 32]
+            || manifest_digest == [0; 32]
+            || typed_row_count == 0
+            || total_mutation_count <= u64::from(typed_row_count)
             || !application.has_application_work()
         {
             return Err(RealmProcessorFullCommitSourceError::IdentityMismatch);
@@ -249,6 +264,10 @@ impl RealmProcessorFullCommitSourceObservation {
             coordinator_payload_digest,
             full_coverage_digest,
             semantic_domain_count,
+            manifest_slot,
+            manifest_digest,
+            typed_row_count,
+            total_mutation_count,
         })
     }
 
@@ -275,6 +294,12 @@ impl RealmProcessorFullCommitSourceObservation {
     pub const fn semantic_domain_count(&self) -> u8 {
         self.semantic_domain_count
     }
+    pub const fn manifest_slot(&self) -> &[u8; 32] { &self.manifest_slot }
+    pub const fn manifest_digest(&self) -> &[u8; 32] { &self.manifest_digest }
+    pub const fn typed_row_count(&self) -> u32 { self.typed_row_count }
+    pub const fn total_mutation_count(&self) -> u64 {
+        self.total_mutation_count
+    }
 }
 
 #[async_trait]
@@ -285,7 +310,7 @@ pub trait RealmProcessorFullCommitSourceFactory<Hash>: Send + Sync {
     fn writer_activation_digest(&self) -> [u8; 32];
     fn queue_readiness_digest(&self) -> [u8; 32];
 
-    async fn validate_source(
+    async fn execute_source(
         &self,
         request: SealedRealmProcessorFullCommitSourceRequest<Hash>,
     ) -> Result<RealmProcessorFullCommitSourceObservation, RealmProcessorFullCommitSourceError>;

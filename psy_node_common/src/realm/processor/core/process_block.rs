@@ -779,9 +779,9 @@ where
             &coordinator,
             write_set,
         )?;
-        let source_observation = iteration.validate_full_commit_source(source).await?;
+        let source_observation = iteration.execute_full_commit(source).await?;
         tracing::info!(
-            "Branch-exact full-commit source revalidated: archive={:?}, pending={}, pipeline_revision={}, writer_revision={}, narrow_prepared={:?}, proof={:?}, coordinator={:?}, domains={}, coverage={:?}; executor/manifest/head/terminal/rotation remain blocked",
+            "Branch-exact full commit written and manifested: archive={:?}, pending={}, pipeline_revision={}, writer_revision={}, narrow_prepared={:?}, proof={:?}, coordinator={:?}, domains={}, coverage={:?}, typed_rows={}, total_mutations={}, manifest_slot={:?}, manifest={:?}; head/terminal/rotation remain blocked",
             source_observation.application().archive_slot(),
             source_observation.processing().pending_id().get(),
             source_observation.pipeline_revision().get(),
@@ -791,6 +791,10 @@ where
             source_observation.coordinator_payload_digest(),
             source_observation.semantic_domain_count(),
             source_observation.full_coverage_digest(),
+            source_observation.typed_row_count(),
+            source_observation.total_mutation_count(),
+            source_observation.manifest_slot(),
+            source_observation.manifest_digest(),
         );
         if let Err(error) = self
             .db
@@ -1685,7 +1689,7 @@ mod h23c4e3a_tests {
         let full_source = route
             .find("RealmProcessorVerifiedFullCommitSource::try_from_verified")
             .unwrap();
-        let durable_fence = route.find("validate_full_commit_source(source)").unwrap();
+        let durable_fence = route.find("execute_full_commit(source)").unwrap();
         assert!(proof < optional_narrow);
         assert!(optional_narrow < write_set);
         assert!(write_set < full_source);

@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use super::{
     BranchExactDeploymentNoTabletKeyspace, BranchExactWriterAuthorityKey,
     BranchExactWriterReadState, BranchExactWriterState,
-    ScyllaBranchExactWriterLifecycleStore,
+    ScyllaBranchExactWriterLifecycleStore, ScyllaBranchExactWriterRuntime,
     realm_full_commit_execution::RealmFullCommitExecutionSchedule,
     realm_full_commit_manifest::{
         RealmFullCommitCompositeManifest, RealmFullCommitManifestError,
@@ -151,6 +151,55 @@ impl ScyllaRealmFullCommitManifestStore {
         Ok(receipt)
     }
 
+    /// Production Processor route. The identity-bound runtime is re-read
+    /// around the immutable manifest LWT so callers cannot substitute a raw
+    /// lifecycle store/key or manufacture narrow-writer evidence.
+    pub(super) async fn persist_from_runtime_fresh_sources<Hash: Q256BitHash>(
+        &self,
+        writer: &ScyllaBranchExactWriterRuntime<Hash>,
+        executor: &RealmFullCommitScyllaExecutor,
+        plan: &RealmFullCommitPhysicalPlan,
+    ) -> Result<PersistedRealmFullCommitManifestReceipt<Hash>, RealmFullCommitManifestStoreError>
+    {
+        let before = self
+            .observe_runtime_sources(writer, executor, plan)
+            .await?;
+        let receipt = self.persist(before.clone()).await?;
+        let after = self
+            .observe_runtime_sources(writer, executor, plan)
+            .await?;
+        if after != before {
+            return Err(RealmFullCommitManifestStoreError::SourceChanged);
+        }
+        self.revalidate_from_runtime_fresh_sources(
+            &receipt,
+            writer,
+            executor,
+            plan,
+        )
+        .await?;
+        Ok(receipt)
+    }
+
+    pub(super) async fn revalidate_from_runtime_fresh_sources<
+        Hash: Q256BitHash,
+    >(
+        &self,
+        receipt: &PersistedRealmFullCommitManifestReceipt<Hash>,
+        writer: &ScyllaBranchExactWriterRuntime<Hash>,
+        executor: &RealmFullCommitScyllaExecutor,
+        plan: &RealmFullCommitPhysicalPlan,
+    ) -> Result<(), RealmFullCommitManifestStoreError> {
+        self.revalidate(receipt).await?;
+        let observed = self
+            .observe_runtime_sources(writer, executor, plan)
+            .await?;
+        if observed != receipt.manifest {
+            return Err(RealmFullCommitManifestStoreError::SourceChanged);
+        }
+        self.revalidate(receipt).await
+    }
+
     /// Fresh consumption fence for a previously returned receipt.  The
     /// manifest row is checked both before and after reconstructing the source
     /// evidence, so a later writer/head owner never relies on a stale receipt
@@ -187,6 +236,35 @@ impl ScyllaRealmFullCommitManifestStore {
             return Err(RealmFullCommitManifestStoreError::WriterUninitialized);
         };
         let BranchExactWriterState::WritesVerified(verified) = current.state() else {
+            return Err(RealmFullCommitManifestStoreError::WriterNotWritesVerified);
+        };
+        let narrow = RealmNarrowWritesVerifiedEvidence::try_from_stored(&current)?;
+        let schedule = RealmFullCommitExecutionSchedule::try_from_plan(
+            plan,
+            verified.prepared(),
+        )
+        .map_err(execution_error)?;
+        let observed = executor
+            .read_all(&self.session, &schedule)
+            .await
+            .map_err(source_read_error)?;
+        let typed = schedule
+            .verify_after_write(&observed)
+            .map_err(execution_error)?;
+        RealmFullCommitCompositeManifest::try_new(plan, &narrow, &typed)
+            .map_err(Into::into)
+    }
+
+    async fn observe_runtime_sources<Hash: Q256BitHash>(
+        &self,
+        writer: &ScyllaBranchExactWriterRuntime<Hash>,
+        executor: &RealmFullCommitScyllaExecutor,
+        plan: &RealmFullCommitPhysicalPlan,
+    ) -> Result<RealmFullCommitCompositeManifest<Hash>, RealmFullCommitManifestStoreError>
+    {
+        let current = writer.read_writer().await.map_err(writer_error)?;
+        let BranchExactWriterState::WritesVerified(verified) = current.state()
+        else {
             return Err(RealmFullCommitManifestStoreError::WriterNotWritesVerified);
         };
         let narrow = RealmNarrowWritesVerifiedEvidence::try_from_stored(&current)?;
@@ -425,6 +503,8 @@ mod tests {
         assert!(production.contains("SerialConsistency::LocalSerial"));
         assert!(production.contains("observe_sources(writer, writer_key, executor, plan)"));
         assert!(production.contains("revalidate_from_fresh_sources"));
-        assert_eq!(production.matches("self.revalidate(receipt)").count(), 2);
+        assert!(production.contains("observe_runtime_sources(writer, executor, plan)"));
+        assert!(production.contains("revalidate_from_runtime_fresh_sources"));
+        assert_eq!(production.matches("self.revalidate(receipt)").count(), 4);
     }
 }
