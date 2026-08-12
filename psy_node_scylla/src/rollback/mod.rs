@@ -18,6 +18,7 @@ mod branch_exact_schema_deployment;
 mod branch_exact_schema_deployment_lifecycle;
 mod branch_exact_schema_backfill;
 mod branch_exact_schema_backfill_executor;
+mod branch_exact_schema_operator;
 mod branch_exact_schema_exporter;
 mod branch_exact_dual_write_executor;
 #[allow(dead_code)]
@@ -163,6 +164,7 @@ pub use branch_exact_schema_deployment::*;
 pub use branch_exact_schema_deployment_lifecycle::*;
 pub use branch_exact_schema_backfill::*;
 pub use branch_exact_schema_backfill_executor::*;
+pub(crate) use branch_exact_schema_operator::*;
 pub use branch_exact_schema_exporter::*;
 pub use branch_exact_cutover_lifecycle::*;
 pub use branch_exact_cutover_store::*;
