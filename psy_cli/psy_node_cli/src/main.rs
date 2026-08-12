@@ -8,6 +8,7 @@ use psy_node_scylla::psy_setup::{
     deploy_pending_queue_sidecar_from_connection_string,
     inspect_realm_branch_exact_activation,
 };
+use psy_node_cli::node::inspect_realm_rollback_readiness;
 
 use crate::subcommand::{Cli, Commands, start_coordinator_edge, start_coordinator_processor, start_realm_edge, start_realm_processor};
 
@@ -25,6 +26,45 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     //psy_common::setup_logging()?;
     match cli.command {
+        Commands::CheckRealmRollbackReadiness {
+            scylla_db_url,
+            db_namespace,
+            network,
+            realm_id,
+            realm_sub_id,
+            proving_backend,
+        } => {
+            let network = network.into();
+            let summary = inspect_realm_rollback_readiness::inspect(
+                &db_namespace,
+                &scylla_db_url,
+                network,
+                realm_id,
+                realm_sub_id,
+                proving_backend.into(),
+            )
+            .await?;
+            let activation = summary.activation();
+            let startup = activation.startup_config();
+            println!("Realm rollback startup preflight passed");
+            println!("cutover_phase={:?}", activation.cutover_phase());
+            println!("cutover_revision={}", activation.cutover_revision());
+            println!("writer_revision={}", activation.writer_revision());
+            println!("route_phase={:?}", summary.route_phase());
+            println!("route_revision={}", summary.route_revision());
+            println!(
+                "readiness_digest={}",
+                hex::encode(summary.readiness_digest())
+            );
+            println!("permit_digest={}", hex::encode(summary.permit_digest()));
+            println!("branch_exact_startup:");
+            println!("  generation: {}", startup.generation);
+            println!("  binding_digest_hex: {}", startup.binding_digest_hex);
+            println!(
+                "  writer_activation_digest_hex: {}",
+                startup.writer_activation_digest_hex
+            );
+        }
         Commands::InspectRealmRollbackActivation {
             scylla_db_url,
             db_namespace,

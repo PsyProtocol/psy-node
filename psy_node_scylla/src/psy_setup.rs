@@ -24,6 +24,7 @@ use psy_node_core::{
             RealmProcessorStartupAuthorization, RealmProcessorStartupError,
             RealmProcessorStartupLineage, RealmProcessorStartupMode,
             RealmProcessorStartupPreflightProvider,
+            RealmProcessorStartupRoutePhase,
         },
         realm_processor_branch_exact_runtime::RealmBranchExactCommitRuntimeInstaller,
     },
@@ -58,6 +59,7 @@ use crate::{
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RealmBranchExactActivationSummary {
     startup_config: psy_node_core::config::node_start_config::RealmBranchExactStartupConfig,
+    lineage: RealmProcessorStartupLineage,
     cutover_phase: BranchExactCutoverPhase,
     cutover_revision: u64,
     writer_revision: u64,
@@ -70,6 +72,10 @@ impl RealmBranchExactActivationSummary {
         &self.startup_config
     }
 
+    pub const fn lineage(&self) -> RealmProcessorStartupLineage {
+        self.lineage
+    }
+
     pub const fn cutover_phase(&self) -> BranchExactCutoverPhase {
         self.cutover_phase
     }
@@ -80,6 +86,37 @@ impl RealmBranchExactActivationSummary {
 
     pub const fn writer_revision(&self) -> u64 {
         self.writer_revision
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RealmBranchExactReadinessSummary {
+    activation: RealmBranchExactActivationSummary,
+    route_phase: RealmProcessorStartupRoutePhase,
+    route_revision: u64,
+    readiness_digest: [u8; 32],
+    permit_digest: [u8; 32],
+}
+
+impl RealmBranchExactReadinessSummary {
+    pub const fn activation(&self) -> &RealmBranchExactActivationSummary {
+        &self.activation
+    }
+
+    pub const fn route_phase(&self) -> RealmProcessorStartupRoutePhase {
+        self.route_phase
+    }
+
+    pub const fn route_revision(&self) -> u64 {
+        self.route_revision
+    }
+
+    pub const fn readiness_digest(&self) -> &[u8; 32] {
+        &self.readiness_digest
+    }
+
+    pub const fn permit_digest(&self) -> &[u8; 32] {
+        &self.permit_digest
     }
 }
 
@@ -367,7 +404,11 @@ pub async fn setup_psy_scylla_database_store_from_connection_string<N: QNetworkD
     }
     let addresses = connection_string.split(",").map(|s| s.to_string()).collect::<Vec<String>>();
 
-    let scylla_db = ScyllaCoreStore::new(0, 0, keyspace.to_string(), &addresses).await?;
+    let scylla_db = if create_tables {
+        ScyllaCoreStore::new(0, 0, keyspace.to_string(), &addresses).await?
+    } else {
+        ScyllaCoreStore::new_existing(0, 0, keyspace.to_string(), &addresses).await?
+    };
 
     if create_tables {
         // Processor nodes: create tables then prepare statements
@@ -570,6 +611,14 @@ pub async fn inspect_realm_branch_exact_activation<Hash: Q256BitHash>(
         }
     }
 
+    let lineage = RealmProcessorStartupLineage::try_new(
+        network,
+        realm_id,
+        realm_sub_id,
+        binding.generation().get(),
+        *binding.digest().as_bytes(),
+        *writer_plan.digest().as_bytes(),
+    )?;
     Ok(RealmBranchExactActivationSummary {
         startup_config:
             psy_node_core::config::node_start_config::RealmBranchExactStartupConfig {
@@ -577,6 +626,7 @@ pub async fn inspect_realm_branch_exact_activation<Hash: Q256BitHash>(
                 binding_digest_hex: hex::encode(binding.digest().as_bytes()),
                 writer_activation_digest_hex: hex::encode(writer_plan.digest().as_bytes()),
             },
+        lineage,
         cutover_phase: first_cutover.phase(),
         cutover_revision: first_cutover.revision().get(),
         writer_revision: first_writer.revision().get(),
@@ -656,15 +706,23 @@ pub async fn setup_realm_psy_scylla_database_store_with_branch_exact_schema<
         .split(',')
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    let store = Arc::new(
+    let store = Arc::new(if create_tables {
         ScyllaCoreStore::new(
             u64::from(realm_id),
             u64::from(realm_sub_id),
             keyspace.to_owned(),
             &addresses,
         )
-        .await?,
-    );
+        .await?
+    } else {
+        ScyllaCoreStore::new_existing(
+            u64::from(realm_id),
+            u64::from(realm_sub_id),
+            keyspace.to_owned(),
+            &addresses,
+        )
+        .await?
+    });
     let db = if create_tables {
         setup_psy_scylla_database_store::<N>(store).await?
     } else {
@@ -947,6 +1005,56 @@ where
     })
 }
 
+/// Run the same read-only durable preflight used by an enabled Realm Edge and
+/// return an inert operator summary.
+///
+/// Unlike Processor startup this does not run recovery and does not require a
+/// NATS client. Prepare-only storage setup refuses to create keyspaces or
+/// tables, so this can be used before changing the node configuration.
+pub async fn inspect_realm_branch_exact_readiness<N: QNetworkDatabaseTypes>(
+    keyspace: &str,
+    connection_string: &str,
+    network: psy_data::protocol::canonical_chain::NetworkId,
+    realm_id: u32,
+    realm_sub_id: u16,
+) -> anyhow::Result<RealmBranchExactReadinessSummary>
+where
+    N::QHash: Q256BitHash + Send + Sync + 'static,
+    N::HasherBase: Send + Sync + 'static,
+{
+    let activation = inspect_realm_branch_exact_activation::<N::QHash>(
+        keyspace,
+        connection_string,
+        network,
+        realm_id,
+        realm_sub_id,
+    )
+    .await?;
+    let composition = setup_realm_edge_scylla_startup_composition::<N>(
+        keyspace,
+        connection_string,
+        false,
+        realm_id,
+        realm_sub_id,
+        Some(activation.lineage()),
+    )
+    .await?;
+    let ScyllaRealmEdgeStartupAuthorization::BranchExact { permit, .. } =
+        composition.authorization
+    else {
+        return Err(RealmProcessorStartupError::StartupProviderMissing.into());
+    };
+    let evidence = permit.evidence();
+    let route = evidence.route();
+    Ok(RealmBranchExactReadinessSummary {
+        activation,
+        route_phase: route.phase(),
+        route_revision: route.revision(),
+        readiness_digest: *evidence.readiness_digest().as_bytes(),
+        permit_digest: *permit.digest().as_bytes(),
+    })
+}
+
 /// One indivisible Realm startup composition. Keeping DB, mode and provider
 /// together prevents a caller from pairing a provider prepared for one
 /// session/Realm with a different authority store.
@@ -1120,6 +1228,30 @@ mod realm_startup_composition_tests {
     use super::*;
 
     #[test]
+    fn prepare_only_setup_never_calls_the_legacy_keyspace_creator() {
+        let source = include_str!("psy_setup.rs");
+        let generic = source
+            .split("pub async fn setup_psy_scylla_database_store_from_connection_string")
+            .nth(1)
+            .unwrap()
+            .split("#[derive(Clone, Debug, Eq, PartialEq)]")
+            .next()
+            .unwrap();
+        assert!(generic.contains("if create_tables"));
+        assert!(generic.contains("ScyllaCoreStore::new_existing"));
+
+        let realm = source
+            .split("pub async fn setup_realm_psy_scylla_database_store_with_branch_exact_schema")
+            .nth(1)
+            .unwrap()
+            .split("enum ScyllaRealmEdgeStartupAuthorization")
+            .next()
+            .unwrap();
+        assert!(realm.contains("if create_tables"));
+        assert!(realm.contains("ScyllaCoreStore::new_existing"));
+    }
+
+    #[test]
     fn edge_composition_is_default_off_and_seals_only_high_level_ingress() {
         let source = include_str!("psy_setup.rs");
         let composition = source
@@ -1204,6 +1336,35 @@ mod realm_startup_composition_tests {
         ]
         .concat();
         assert!(!source.contains(&public_authorization));
+    }
+
+    #[test]
+    fn readiness_inspector_reuses_full_edge_preflight_without_mutation() {
+        let source = include_str!("psy_setup.rs");
+        let inspector = source
+            .split("pub async fn inspect_realm_branch_exact_readiness")
+            .nth(1)
+            .unwrap()
+            .split("/// One indivisible Realm startup composition")
+            .next()
+            .unwrap();
+        assert!(inspector.contains("inspect_realm_branch_exact_activation"));
+        assert!(inspector.contains("setup_realm_edge_scylla_startup_composition::<N>"));
+        assert!(inspector.contains("false,"));
+        assert!(inspector.contains("permit.evidence()"));
+        assert!(inspector.contains("permit.digest()"));
+        for forbidden in [
+            "recover_realm_processor_startup",
+            "PendingQueueSidecarDeploymentExecutor::deploy",
+            "into_branch_exact_ingress",
+            ".apply(",
+            ".compare_and_set(",
+        ] {
+            assert!(
+                !inspector.contains(forbidden),
+                "readiness inspector contains forbidden mutation {forbidden}"
+            );
+        }
     }
 
     #[test]

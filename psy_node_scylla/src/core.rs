@@ -85,6 +85,26 @@ pub(crate) async fn connect_existing_scylla_session(
     Ok(Arc::new(session))
 }
 
+async fn require_existing_keyspace(
+    session: &Session,
+    keyspace: &str,
+) -> anyhow::Result<()> {
+    let row = session
+        .query_unpaged(
+            "SELECT keyspace_name FROM system_schema.keyspaces WHERE keyspace_name = ?",
+            (keyspace,),
+        )
+        .await?
+        .into_rows_result()?
+        .maybe_first_row::<(String,)>()?;
+    if row.is_none() {
+        anyhow::bail!(
+            "required Scylla keyspace {keyspace:?} does not exist; prepare-only setup refuses to create it"
+        );
+    }
+    Ok(())
+}
+
 impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hasher> {
     pub async fn new(realm_id: u64, realm_sub_id: u64, keyspace: String, known_nodes: &[String]) -> anyhow::Result<Self> {
         let session = connect_existing_scylla_session(known_nodes).await?;
@@ -117,7 +137,46 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
         let _ = res_std?;
         let _ = res_no_tablet?;
         session.await_schema_agreement().await?;
-        Ok(Self {
+        Ok(Self::from_session(
+            session,
+            keyspace,
+            no_tablet_keyspace,
+            realm_id,
+            realm_sub_id,
+        ))
+    }
+
+    /// Open an already-deployed Realm store without creating keyspaces.
+    ///
+    /// Prepare-only Edge, inspection and startup-preflight paths must use this
+    /// constructor so a typo cannot silently create an empty RF=1 keyspace.
+    pub(crate) async fn new_existing(
+        realm_id: u64,
+        realm_sub_id: u64,
+        keyspace: String,
+        known_nodes: &[String],
+    ) -> anyhow::Result<Self> {
+        let session = connect_existing_scylla_session(known_nodes).await?;
+        let no_tablet_keyspace = format!("{}_no_tablet", keyspace);
+        require_existing_keyspace(&session, &keyspace).await?;
+        require_existing_keyspace(&session, &no_tablet_keyspace).await?;
+        Ok(Self::from_session(
+            session,
+            keyspace,
+            no_tablet_keyspace,
+            realm_id,
+            realm_sub_id,
+        ))
+    }
+
+    fn from_session(
+        session: Arc<Session>,
+        keyspace: String,
+        no_tablet_keyspace: String,
+        realm_id: u64,
+        realm_sub_id: u64,
+    ) -> Self {
+        Self {
             session,
             keyspace,
             no_tablet_keyspace,
@@ -129,7 +188,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
             pending_queue_sidecar_ready: Arc::new(OnceLock::new()),
             _phantom_hash: std::marker::PhantomData,
             _phantom_hasher: std::marker::PhantomData,
-        })
+        }
     }
 
     pub async fn init_std_table<T: ScyllaStandardPreparedTableStatements>(
@@ -297,7 +356,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
 
     /// Default-off queue-sidecar setup. Disabled mode executes no queue CQL;
     /// enabled mode is inspect-only and requires an operator-created VERIFIED
-    /// lifecycle plus the exact twenty-one-table v16 schema.
+    /// lifecycle plus the exact twenty-two-table v18 schema.
     pub async fn initialize_pending_queue_sidecar_setup(
         &self,
         authority: psy_data::protocol::chain_context::AuthorityScope,
@@ -364,7 +423,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
     }
 
     /// Prepare the Coordinator GUTA durable submission authority only after
-    /// this exact process has consumed a VERIFIED v16 sidecar capability for
+    /// this exact process has consumed a VERIFIED v18 sidecar capability for
     /// Coordinator scope. The returned trait exposes no Session or DDL.
     pub async fn prepare_coordinator_guta_durable_submission_store(
         &self,
@@ -691,6 +750,22 @@ mod branch_exact_startup_factory_tests {
     use psy_node_core::store::branch_exact_schema::AuthorityScope;
 
     use super::*;
+
+    #[test]
+    fn prepare_only_constructor_requires_existing_keyspaces_without_ddl() {
+        let source = include_str!("core.rs");
+        let constructor = source
+            .split("pub(crate) async fn new_existing")
+            .nth(1)
+            .unwrap()
+            .split("fn from_session")
+            .next()
+            .unwrap();
+        assert!(constructor.contains("connect_existing_scylla_session"));
+        assert_eq!(constructor.matches("require_existing_keyspace").count(), 2);
+        assert!(!constructor.contains("CREATE KEYSPACE"));
+        assert!(!constructor.contains("await_schema_agreement"));
+    }
 
     fn expectation(
         realm_id: u32,
