@@ -309,8 +309,8 @@ fn lexical_inventory_is_stable_and_nontrivial() {
             prepared_statement: 436,
             prepare_call: 192,
             execute_call: 395,
-            query_call: 328,
-            direct_cql: 723,
+            query_call: 329,
+            direct_cql: 724,
         }
     );
 }
