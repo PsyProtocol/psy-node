@@ -189,7 +189,8 @@ use super::{
 use super::authority_local_head_prototype::AuthorityLocalHeadNoTabletKeyspace;
 use super::branch_exact_writer_lifecycle_store::ScyllaBranchExactWriterLifecycleStore;
 use super::branch_exact_pending_orchestration::{
-    seal_branch_exact_begin, seal_branch_exact_publish,
+    seal_branch_exact_application_no_work, seal_branch_exact_begin,
+    seal_branch_exact_publish,
     seal_branch_exact_queue_close, PendingQueueClosePlan,
 };
 use super::pending_queue_consumer_gate::{
@@ -1199,10 +1200,103 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
             return Err(RealmProcessorFullCommitSourceError::IdentityMismatch);
         }
 
-        let first = self
+        let mut first = self
             .observe_generation_continuation_exact()
             .await
             .map_err(full_source_capture)?;
+        if first.continuation.phase()
+            == RealmProcessorGenerationContinuationPhase::AwaitNoWorkTerminal
+        {
+            let authorization = match self
+                .terminal_authorizer
+                .authorize_no_work_current()
+                .await
+            {
+                Ok(authorization) => authorization,
+                Err(error) if error.successor_dependency_pending() => {
+                    let second = self
+                        .observe_generation_continuation_exact()
+                        .await
+                        .map_err(full_source_capture)?;
+                    if first.continuation != second.continuation
+                        || !same_pipeline_snapshot(&first.pipeline, &second.pipeline)
+                    {
+                        return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
+                    }
+                    return Ok(
+                        RealmProcessorGenerationRotationOutcome::AwaitSuccessorDependency {
+                            source: second.pipeline.processing(),
+                            successor: second.pipeline.gathering(),
+                            pipeline_revision: second.pipeline.revision(),
+                        },
+                    );
+                }
+                Err(error) => return Err(full_source_backend(error)),
+            };
+            if authorization.pipeline() != &first.pipeline {
+                return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
+            }
+            let application = first
+                .continuation
+                .application()
+                .ok_or(RealmProcessorFullCommitSourceError::IdentityMismatch)?;
+            if application.has_application_work() {
+                return Err(RealmProcessorFullCommitSourceError::IdentityMismatch);
+            }
+            let retirement = seal_branch_exact_application_no_work(
+                &first.pipeline,
+                authorization.writer(),
+                application.archive_slot(),
+                authorization.head_observation().map_err(full_source_backend)?,
+            )
+            .map_err(full_source_backend)?;
+
+            let second = self
+                .observe_generation_continuation_exact()
+                .await
+                .map_err(full_source_capture)?;
+            if first.continuation != second.continuation
+                || !same_pipeline_snapshot(&first.pipeline, &second.pipeline)
+            {
+                return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
+            }
+            self.terminal_authorizer
+                .revalidate_exact(&authorization)
+                .await
+                .map_err(full_source_backend)?;
+            let retired = match self
+                .pipeline
+                .apply(&retirement)
+                .await
+                .map_err(full_source_backend)?
+            {
+                PendingPipelineWriteOutcome::Applied(current)
+                | PendingPipelineWriteOutcome::Idempotent(current) => current,
+                PendingPipelineWriteOutcome::Conflict(_) => {
+                    return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation)
+                }
+            };
+            if retired != *retirement.candidate()
+                || retired.processing() != first.pipeline.processing()
+                || !matches!(
+                    retired.processing_state(),
+                    PendingProcessingState::RetiredNoWork { .. }
+                )
+            {
+                return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
+            }
+            let after = self
+                .observe_generation_continuation_exact()
+                .await
+                .map_err(full_source_capture)?;
+            if after.continuation.phase()
+                != RealmProcessorGenerationContinuationPhase::AwaitRetiredNoWorkTerminal
+                || !same_pipeline_snapshot(&retired, &after.pipeline)
+            {
+                return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
+            }
+            first = after;
+        }
         if !matches!(
             first.continuation.phase(),
             RealmProcessorGenerationContinuationPhase::AwaitPublishedTerminal
@@ -4028,6 +4122,17 @@ mod tests {
             .unwrap();
 
         let observe = method.find("observe_generation_continuation_exact").unwrap();
+        let no_work_authorize = method.find("authorize_no_work_current").unwrap();
+        let no_work_application = method
+            .find("seal_branch_exact_application_no_work")
+            .unwrap();
+        let no_work_revalidate = method[..method.find("let retired = match").unwrap()]
+            .rfind("revalidate_exact")
+            .unwrap();
+        let retire_apply = method.find("pipeline\n                .apply(&retirement)").unwrap();
+        let retired_readback = method
+            .find("RealmProcessorGenerationContinuationPhase::AwaitRetiredNoWorkTerminal")
+            .unwrap();
         let authorize = method.find("terminal_authorizer.authorize_current").unwrap();
         let reserve = method.find("pending_counter").unwrap();
         let terminal = method.find("persist_from_authorized_sources").unwrap();
@@ -4037,13 +4142,18 @@ mod tests {
         let pipeline = method.find("pipeline\n            .apply(&rotation)").unwrap();
         let terminal_after = method.rfind("let terminal_after").unwrap();
 
-        assert!(observe < authorize);
+        assert!(observe < no_work_authorize);
+        assert!(no_work_authorize < no_work_application);
+        assert!(no_work_application < no_work_revalidate);
+        assert!(no_work_revalidate < retire_apply && retire_apply < retired_readback);
+        assert!(retired_readback < authorize);
         assert!(authorize < reserve && reserve < terminal);
         assert!(terminal < carryover && carryover < revalidate);
         assert!(revalidate < rotation && rotation < pipeline);
         assert!(pipeline < terminal_after);
         assert!(method.contains("successor_dependency_pending"));
         assert!(method.contains("AwaitSuccessorDependency"));
+        assert!(method.contains("application.has_application_work()"));
         assert!(method.contains("PendingCounterExpected::Present(current_gathering)"));
         assert!(method.contains("PendingCounterAllocationOutcome::Owned"));
         assert!(method.contains("PendingPipelineWriteOutcome::Applied"));

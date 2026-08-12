@@ -1,10 +1,11 @@
-//! Storage-private signer for one Realm terminal evidence envelope.
+//! Storage-private signer for one Realm terminal or no-work retirement
+//! evidence envelope.
 //!
 //! It reads the terminal pipeline, Active writer, authority-local head, and
 //! successor dependency projection from their durable stores, validates the
 //! complete relationship, then repeats every read. The result is still only
-//! an input to the future terminal owner; it cannot persist a terminal or
-//! apply a pipeline transition.
+//! an input to the storage-owned terminal/retirement owner; it cannot persist
+//! a terminal or apply a pipeline transition by itself.
 
 #![allow(dead_code)]
 
@@ -41,7 +42,9 @@ use scylla::client::session::Session;
 
 use super::{
     branch_exact_pending_orchestration::{
-        validate_branch_exact_queue_terminal_pair, BranchExactPendingOrchestrationError,
+        validate_branch_exact_application_no_work_pair,
+        validate_branch_exact_queue_terminal_pair,
+        BranchExactPendingOrchestrationError,
     },
     realm_processor_external_dependency_projection::{
         PersistedRealmProcessorExternalDependencyProjection,
@@ -58,6 +61,7 @@ use super::{
 };
 
 pub(super) struct PersistedRealmProcessorTerminalAuthorization<Hash> {
+    mode: RealmProcessorTerminalAuthorizationMode,
     envelope: RealmProcessorTerminalAuthorizationEnvelope,
     route: PendingQueueSegmentAssignmentRouteReceipt,
     dependency: PersistedRealmProcessorExternalDependencyProjection,
@@ -75,11 +79,27 @@ impl<Hash: Q256BitHash> PersistedRealmProcessorTerminalAuthorization<Hash> {
         &self.pipeline
     }
 
+    pub(super) const fn writer(&self) -> &StoredBranchExactWriterLifecycle<Hash> {
+        &self.writer
+    }
+
+    pub(super) fn head_observation(
+        &self,
+    ) -> Result<AuthorityObservation<Hash>, RealmProcessorTerminalAuthorizationStoreError> {
+        authority_observation(&self.head)
+    }
+
     pub(super) const fn allocation_timestamp(
         &self,
     ) -> psy_node_core::store::timestamp::CommitWriteTimestampUs {
         self.head.commit_write_timestamp()
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RealmProcessorTerminalAuthorizationMode {
+    Terminal,
+    RetireNoWork,
 }
 
 #[async_trait]
@@ -95,6 +115,13 @@ pub(super) trait RealmProcessorTerminalAuthorizationProvider<Hash>: Send + Sync 
         &self,
         receipt: &PersistedRealmProcessorTerminalAuthorization<Hash>,
     ) -> Result<(), RealmProcessorTerminalAuthorizationStoreError>;
+
+    async fn authorize_no_work_current(
+        &self,
+    ) -> Result<
+        PersistedRealmProcessorTerminalAuthorization<Hash>,
+        RealmProcessorTerminalAuthorizationStoreError,
+    >;
 }
 
 pub(super) struct ScyllaRealmProcessorTerminalAuthorizer<F, Hash> {
@@ -160,6 +187,7 @@ where
 
     async fn authorize_selected(
         &self,
+        mode: RealmProcessorTerminalAuthorizationMode,
     ) -> Result<
         PersistedRealmProcessorTerminalAuthorization<Hash>,
         RealmProcessorTerminalAuthorizationStoreError,
@@ -196,7 +224,7 @@ where
             )
             .await?;
         projector.revalidate_exact(&dependency).await?;
-        self.validate_relationship(&pipeline, &writer, &head, &dependency)?;
+        self.validate_relationship(mode, &pipeline, &writer, &head, &dependency)?;
         let envelope = RealmProcessorTerminalAuthorizationEnvelope::try_new(
             dependency.commitment(),
             *writer.slot().as_bytes(),
@@ -214,6 +242,7 @@ where
         let (second_pipeline, second_writer, second_head) =
             self.read_terminal_sources().await?;
         self.validate_relationship(
+            mode,
             &second_pipeline,
             &second_writer,
             &second_head,
@@ -223,6 +252,7 @@ where
             return Err(RealmProcessorTerminalAuthorizationStoreError::ConcurrentMutation);
         }
         Ok(PersistedRealmProcessorTerminalAuthorization {
+            mode,
             envelope,
             route,
             dependency,
@@ -257,6 +287,13 @@ where
         if pipeline != receipt.pipeline || writer != receipt.writer || head != receipt.head {
             return Err(RealmProcessorTerminalAuthorizationStoreError::ConcurrentMutation);
         }
+        self.validate_relationship(
+            receipt.mode,
+            &pipeline,
+            &writer,
+            &head,
+            &receipt.dependency,
+        )?;
         let envelope = RealmProcessorTerminalAuthorizationEnvelope::try_new(
             receipt.envelope.external_dependency(),
             *writer.slot().as_bytes(),
@@ -320,6 +357,7 @@ where
 
     fn validate_relationship(
         &self,
+        mode: RealmProcessorTerminalAuthorizationMode,
         pipeline: &StoredPendingPipeline<Hash>,
         writer: &StoredBranchExactWriterLifecycle<Hash>,
         head: &StoredAuthorityLocalHead<Hash>,
@@ -331,15 +369,16 @@ where
         {
             return Err(RealmProcessorTerminalAuthorizationStoreError::IdentityMismatch);
         }
-        validate_branch_exact_queue_terminal_pair(pipeline, writer)?;
+        match mode {
+            RealmProcessorTerminalAuthorizationMode::Terminal => {
+                validate_branch_exact_queue_terminal_pair(pipeline, writer)?
+            }
+            RealmProcessorTerminalAuthorizationMode::RetireNoWork => {
+                validate_branch_exact_application_no_work_pair(pipeline, writer)?
+            }
+        }
         let view = head.head();
-        let observed = AuthorityObservation::try_new(
-            *view.chain(),
-            self.authority,
-            view.state_checkpoint(),
-            *view.state_root(),
-        )
-        .map_err(backend)?;
+        let observed = authority_observation(head)?;
         if observed != *pipeline.frontier()
             || view.key().network() != self.network
             || view.key().authority() != self.authority
@@ -370,7 +409,8 @@ where
         PersistedRealmProcessorTerminalAuthorization<Hash>,
         RealmProcessorTerminalAuthorizationStoreError,
     > {
-        self.authorize_selected().await
+        self.authorize_selected(RealmProcessorTerminalAuthorizationMode::Terminal)
+            .await
     }
 
     async fn revalidate_exact(
@@ -379,6 +419,29 @@ where
     ) -> Result<(), RealmProcessorTerminalAuthorizationStoreError> {
         self.revalidate_selected(receipt).await
     }
+
+    async fn authorize_no_work_current(
+        &self,
+    ) -> Result<
+        PersistedRealmProcessorTerminalAuthorization<Hash>,
+        RealmProcessorTerminalAuthorizationStoreError,
+    > {
+        self.authorize_selected(RealmProcessorTerminalAuthorizationMode::RetireNoWork)
+            .await
+    }
+}
+
+fn authority_observation<Hash: Q256BitHash>(
+    head: &StoredAuthorityLocalHead<Hash>,
+) -> Result<AuthorityObservation<Hash>, RealmProcessorTerminalAuthorizationStoreError> {
+    let view = head.head();
+    AuthorityObservation::try_new(
+        *view.chain(),
+        view.key().authority(),
+        view.state_checkpoint(),
+        *view.state_root(),
+    )
+    .map_err(backend)
 }
 
 fn backend(error: impl fmt::Display) -> RealmProcessorTerminalAuthorizationStoreError {
@@ -469,6 +532,8 @@ mod tests {
         assert!(production.contains("read_terminal_sources"));
         assert!(production.contains("revalidate_exact"));
         assert!(production.contains("validate_branch_exact_queue_terminal_pair"));
+        assert!(production.contains("validate_branch_exact_application_no_work_pair"));
+        assert!(production.contains("authorize_no_work_current"));
         assert!(!production.contains("qualification_persist"));
         assert!(!production.contains("seal_rotation"));
         assert!(!production.contains("pipeline.apply"));

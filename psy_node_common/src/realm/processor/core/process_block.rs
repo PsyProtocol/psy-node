@@ -1074,7 +1074,8 @@ where
                 }
                 if matches!(
                     continuation.phase(),
-                    RealmProcessorGenerationContinuationPhase::AwaitPublishedTerminal
+                    RealmProcessorGenerationContinuationPhase::AwaitNoWorkTerminal
+                        | RealmProcessorGenerationContinuationPhase::AwaitPublishedTerminal
                         | RealmProcessorGenerationContinuationPhase::AwaitRetiredNoWorkTerminal
                 ) {
                     let RealmNormalCommitIteration::BranchExact(iteration) = iteration
@@ -1795,7 +1796,7 @@ mod h23_generation_rotation_tests {
             .unwrap();
         let terminal_start = process
             .find(
-                "if matches!(\n                    continuation.phase(),\n                    RealmProcessorGenerationContinuationPhase::AwaitPublishedTerminal",
+                "if matches!(\n                    continuation.phase(),\n                    RealmProcessorGenerationContinuationPhase::AwaitNoWorkTerminal",
             )
             .unwrap();
         let terminal = process[terminal_start..]
@@ -1803,6 +1804,9 @@ mod h23_generation_rotation_tests {
             .next()
             .unwrap();
 
+        assert!(terminal.contains(
+            "RealmProcessorGenerationContinuationPhase::AwaitNoWorkTerminal"
+        ));
         assert!(terminal.contains(
             "RealmProcessorGenerationContinuationPhase::AwaitRetiredNoWorkTerminal"
         ));

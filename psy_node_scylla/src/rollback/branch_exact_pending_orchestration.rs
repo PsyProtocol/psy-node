@@ -14,7 +14,9 @@ use std::{error::Error, fmt};
 
 use parth_core::protocol::core_types::Q256BitHash;
 use psy_data::protocol::chain_context::{AuthorityObservation, AuthorityScope};
-use psy_node_core::store::{
+use psy_node_core::{
+    queue::realm_processor_application_archive::RealmProcessorApplicationArchiveSlot,
+    store::{
     authority_commit::{AuthorityIntentObservation, ObservedAuthorityTimestampState},
     pending_generation_identity::{
         PendingGenerationActivationDigest, PendingGenerationContext,
@@ -27,6 +29,7 @@ use psy_node_core::store::{
         PendingPipelineRevision, PendingQueueCloseIntentDigest,
         PendingWorkCaptureDigest,
         SealedPendingPipelineTransition, StoredPendingPipeline,
+    },
     },
 };
 use sha2::{Digest, Sha256};
@@ -335,6 +338,59 @@ pub(crate) fn seal_branch_exact_no_work_qualified<Hash: Q256BitHash>(
             )
         })?;
     seal_branch_exact_no_work(pipeline, writer, empty, observed)
+}
+
+/// Retire one exact application-backed empty generation. The application
+/// archive slot is the evidence persisted by the first handoff CAS, so a
+/// caller cannot substitute the older model-only empty-seal digest.
+pub(crate) fn seal_branch_exact_application_no_work<Hash: Q256BitHash>(
+    pipeline: &StoredPendingPipeline<Hash>,
+    writer: &StoredBranchExactWriterLifecycle<Hash>,
+    application_slot: RealmProcessorApplicationArchiveSlot,
+    observed: AuthorityObservation<Hash>,
+) -> Result<SealedPendingPipelineTransition<Hash>, BranchExactPendingOrchestrationError> {
+    let active = require_active_writer(pipeline, writer)?;
+    if pipeline.key().authority() == AuthorityScope::Coordinator {
+        return Err(BranchExactPendingOrchestrationError::CoordinatorNoWork);
+    }
+    let PendingProcessingState::EmptyQueueSealed(seal) = pipeline.processing_state() else {
+        return Err(BranchExactPendingOrchestrationError::ExpectedEmptySeal);
+    };
+    if seal.as_bytes() != application_slot.as_bytes() {
+        return Err(BranchExactPendingOrchestrationError::QueueSealMismatch);
+    }
+    require_writer_frontier(pipeline, active)?;
+    let receipt = generation_receipt_digest(
+        NO_WORK_DOMAIN,
+        pipeline,
+        &[seal.as_bytes(), observed.to_canonical_bytes().as_slice()],
+    )?;
+    pipeline
+        .seal_retire_no_work(
+            seal,
+            PendingNoWorkReceiptDigest::try_new(receipt)
+                .map_err(BranchExactPendingOrchestrationError::Pipeline)?,
+            observed,
+        )
+        .map_err(BranchExactPendingOrchestrationError::Pipeline)
+}
+
+/// Exact precondition used by the storage-owned no-work authorization reader.
+/// It proves that the empty pipeline still points at the active writer
+/// frontier; the application archive and successor dependency are checked by
+/// their respective storage adapters.
+pub(crate) fn validate_branch_exact_application_no_work_pair<Hash: Q256BitHash>(
+    pipeline: &StoredPendingPipeline<Hash>,
+    writer: &StoredBranchExactWriterLifecycle<Hash>,
+) -> Result<(), BranchExactPendingOrchestrationError> {
+    let active = require_active_writer(pipeline, writer)?;
+    if !matches!(
+        pipeline.processing_state(),
+        PendingProcessingState::EmptyQueueSealed(_)
+    ) {
+        return Err(BranchExactPendingOrchestrationError::ExpectedEmptySeal);
+    }
+    require_writer_frontier(pipeline, active)
 }
 
 /// Seal publish only from the exact durable `WritesVerified` writer state and
@@ -1026,5 +1082,27 @@ mod terminal_qualification_tests {
             let transition = body.find(legacy).unwrap();
             assert!(revalidate < transition);
         }
+    }
+
+    #[test]
+    fn application_no_work_retirement_binds_archive_writer_and_frontier() {
+        let source = include_str!("branch_exact_pending_orchestration.rs");
+        let method = source
+            .split("pub(crate) fn seal_branch_exact_application_no_work")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn validate_branch_exact_application_no_work_pair")
+            .next()
+            .unwrap();
+
+        let writer = method.find("require_active_writer").unwrap();
+        let phase = method.find("PendingProcessingState::EmptyQueueSealed").unwrap();
+        let archive = method.find("seal.as_bytes() != application_slot.as_bytes()").unwrap();
+        let frontier = method.find("require_writer_frontier").unwrap();
+        let retire = method.find("seal_retire_no_work").unwrap();
+
+        assert!(writer < phase && phase < archive);
+        assert!(archive < frontier && frontier < retire);
+        assert!(method.contains("PendingNoWorkReceiptDigest::try_new"));
     }
 }
