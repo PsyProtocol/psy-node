@@ -12,8 +12,11 @@ EXERCISE_APPLICATION_HANDOFF="${PSY_D04B6H23C4C4A2B_RF3:-0}"
 EXERCISE_TERMINAL_RECOVERY="${PSY_D04B6H23C4C4B3B2_RF3:-0}"
 EXERCISE_DEFERRED_ACTOR_ARCHIVE="${PSY_D04B6H23C4C4B4C2_RF3:-0}"
 EXERCISE_PROOF_NARROW_WRITER="${PSY_D04B6H23C4D2_RF3:-0}"
+EXERCISE_PROOF_WORKER_QUEUE="${PSY_D04B6H23C4D3A_RF3:-0}"
 EXPECTED_QUALIFICATION="H23C4C2B4E3_JTMB_HANDLER_INGRESS_RF3_PASSED"
-if [[ "${EXERCISE_PROOF_NARROW_WRITER}" == "1" ]]; then
+if [[ "${EXERCISE_PROOF_WORKER_QUEUE}" == "1" ]]; then
+  EXPECTED_QUALIFICATION="H23C4D3A_REALM_PROOF_WORKER_QUEUE_RF3_PASSED"
+elif [[ "${EXERCISE_PROOF_NARROW_WRITER}" == "1" ]]; then
   EXPECTED_QUALIFICATION="H23C4D2_REALM_PROOF_NARROW_WRITER_RF3_PASSED"
 elif [[ "${EXERCISE_DEFERRED_ACTOR_ARCHIVE}" == "1" ]]; then
   EXPECTED_QUALIFICATION="H23C4C4B4C2_DEFERRED_ACTOR_ARCHIVE_RF3_PASSED"
@@ -121,6 +124,7 @@ PSY_D04B6H23C4C4A2B_RF3="${EXERCISE_APPLICATION_HANDOFF}" \
 PSY_D04B6H23C4C4B3B2_RF3="${EXERCISE_TERMINAL_RECOVERY}" \
 PSY_D04B6H23C4C4B4C2_RF3="${EXERCISE_DEFERRED_ACTOR_ARCHIVE}" \
 PSY_D04B6H23C4D2_RF3="${EXERCISE_PROOF_NARROW_WRITER}" \
+PSY_D04B6H23C4D3A_RF3="${EXERCISE_PROOF_WORKER_QUEUE}" \
 PSY_D04B6H23C4C2B4E3_COMPOSE_FILE="${COMPOSE_FILE}" \
 PSY_D04B6H23C4C2B4E3_REPORT_PATH="${REPORT_PATH}" \
 PSY_D04B6H23C4C2B4E3_NATS_URLS="nats://127.0.0.1:45322,nats://127.0.0.1:45323,nats://127.0.0.1:45324" \
@@ -140,7 +144,8 @@ jq -e \
   --argjson exercise_application_handoff "${EXERCISE_APPLICATION_HANDOFF}" \
   --argjson exercise_terminal_recovery "${EXERCISE_TERMINAL_RECOVERY}" \
   --argjson exercise_deferred_actor_archive "${EXERCISE_DEFERRED_ACTOR_ARCHIVE}" \
-  --argjson exercise_proof_narrow_writer "${EXERCISE_PROOF_NARROW_WRITER}" '
+  --argjson exercise_proof_narrow_writer "${EXERCISE_PROOF_NARROW_WRITER}" \
+  --argjson exercise_proof_worker_queue "${EXERCISE_PROOF_WORKER_QUEUE}" '
   .qualification == $expected_qualification
   and .scylla_replication_factor == 3
   and .configured_nats_servers == 3
@@ -206,7 +211,27 @@ jq -e \
       and .proof_binding_tamper_rejected == true
       and .qualification_coordinator_inclusion == true
       and .coordinator_rpc_rf3 == false
-      and .proof_worker_queue_rf3 == false
+      and .proof_worker_queue_rf3 == ($exercise_proof_worker_queue == 1)
+      and (
+        if $exercise_proof_worker_queue == 1 then
+          .proof_worker_api_handler_rf3 == true
+          and .proof_worker_jobs_dispatched == .qualification_guta_jobs_proved
+          and .proof_worker_jobs_completed == .proof_worker_jobs_dispatched
+          and .proof_worker_jobs_dispatched > 0
+          and .proof_worker_recovered_without_republish == true
+          and .proof_worker_queue_message_count == .proof_worker_jobs_dispatched
+          and (.proof_worker_queue_dataset_digest | test("^[0-9a-f]{64}$"))
+          and .proof_worker_socket_response_loss_injected == false
+        else
+          .proof_worker_api_handler_rf3 == false
+          and .proof_worker_jobs_dispatched == 0
+          and .proof_worker_jobs_completed == 0
+          and .proof_worker_recovered_without_republish == false
+          and .proof_worker_queue_message_count == 0
+          and .proof_worker_queue_dataset_digest == ""
+          and .proof_worker_socket_response_loss_injected == false
+        end
+      )
       and .narrow_writer_pipeline_revision > 0
       and .narrow_writer_revision > 0
       and (.narrow_writer_intent_digest | test("^[0-9a-f]{64}$"))
@@ -228,6 +253,13 @@ jq -e \
       and .qualification_coordinator_inclusion == false
       and .coordinator_rpc_rf3 == false
       and .proof_worker_queue_rf3 == false
+      and .proof_worker_api_handler_rf3 == false
+      and .proof_worker_jobs_dispatched == 0
+      and .proof_worker_jobs_completed == 0
+      and .proof_worker_recovered_without_republish == false
+      and .proof_worker_queue_message_count == 0
+      and .proof_worker_queue_dataset_digest == ""
+      and .proof_worker_socket_response_loss_injected == false
       and .narrow_writer_pipeline_revision == 0
       and .narrow_writer_revision == 0
       and .narrow_writer_intent_digest == ""
