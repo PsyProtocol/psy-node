@@ -83,6 +83,8 @@ mod realm_processor_application_archive;
 mod realm_processor_deferred_carryover;
 mod realm_processor_generation_terminal;
 mod coordinator_guta_durable_submission_store;
+#[allow(dead_code)]
+mod coordinator_processor_durable_capture;
 #[cfg(all(test, feature = "rf3-test-support"))]
 #[path = "../../tests/rf3/d04b6h23c4c4b2b_terminal_carryover.rs"]
 mod realm_processor_terminal_carryover_rf3;
