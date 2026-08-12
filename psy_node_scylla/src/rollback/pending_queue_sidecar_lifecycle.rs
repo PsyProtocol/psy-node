@@ -260,7 +260,22 @@ pub(super) struct HistoricalV13VerifiedLifecycleFixture {
 }
 
 #[cfg(all(test, feature = "rf3-test-support"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct HistoricalV14VerifiedLifecycleFixture {
+    slot: [u8; 32],
+    revision: i64,
+    payload: Vec<u8>,
+}
+
+#[cfg(all(test, feature = "rf3-test-support"))]
 impl HistoricalV13VerifiedLifecycleFixture {
+    pub(super) const fn slot(&self) -> &[u8; 32] { &self.slot }
+    pub(super) const fn revision(&self) -> i64 { self.revision }
+    pub(super) fn payload(&self) -> &[u8] { &self.payload }
+}
+
+#[cfg(all(test, feature = "rf3-test-support"))]
+impl HistoricalV14VerifiedLifecycleFixture {
     pub(super) const fn slot(&self) -> &[u8; 32] { &self.slot }
     pub(super) const fn revision(&self) -> i64 { self.revision }
     pub(super) fn payload(&self) -> &[u8] { &self.payload }
@@ -334,6 +349,32 @@ impl ScyllaPendingQueueSidecarLifecycleStore {
             )
             .await?;
         Ok(HistoricalV13VerifiedLifecycleFixture {
+            slot,
+            revision,
+            payload,
+        })
+    }
+
+    /// Qualification-only seed for the exact historical v14 lifecycle
+    /// identity. v15 adds the Coordinator GUTA durable submission table, so
+    /// this old VERIFIED row must remain on its own deployment partition.
+    #[cfg(all(test, feature = "rf3-test-support"))]
+    pub(super) async fn qualification_persist_historical_v14_verified(
+        &self,
+        keyspaces: &PendingQueueSidecarKeyspaces,
+    ) -> Result<HistoricalV14VerifiedLifecycleFixture, PendingQueueSidecarLifecycleError> {
+        use super::pending_queue_sidecar_schema::historical_v14_schema_fingerprint;
+
+        let fingerprint = historical_v14_schema_fingerprint();
+        let (slot, revision, payload) = self
+            .qualification_persist_historical_verified(
+                keyspaces,
+                14,
+                20,
+                fingerprint.as_bytes(),
+            )
+            .await?;
+        Ok(HistoricalV14VerifiedLifecycleFixture {
             slot,
             revision,
             payload,

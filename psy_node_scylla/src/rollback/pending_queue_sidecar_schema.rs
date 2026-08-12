@@ -681,6 +681,27 @@ impl PendingQueueSidecarSchemaMaterializer {
     ) -> Result<(), PendingQueueSidecarSchemaError> {
         materialize_pre_v12_tables(session, keyspaces).await
     }
+
+    #[cfg(feature = "rf3-test-support")]
+    pub(super) async fn qualification_materialize_historical_v14(
+        session: &Session,
+        keyspaces: &PendingQueueSidecarKeyspaces,
+    ) -> Result<(), PendingQueueSidecarSchemaError> {
+        materialize_pre_v12_tables(session, keyspaces).await?;
+        ScyllaRealmProcessorGenerationTerminalStore::create_schema(
+            session,
+            &keyspaces.control,
+        )
+        .await
+        .map_err(sidecar)?;
+        ScyllaRealmProcessorDeferredCarryoverStore::create_schema(
+            session,
+            &keyspaces.control,
+        )
+        .await
+        .map_err(sidecar)?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
