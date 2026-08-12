@@ -720,7 +720,18 @@ impl RealmFullCommitScyllaExecutor {
         plan: &RealmFullCommitScyllaWritePlan,
     ) -> anyhow::Result<()> {
         for action in &plan.actions {
-            match action {
+            self.execute_action(session, schedule, action).await?;
+        }
+        Ok(())
+    }
+
+    async fn execute_action(
+        &self,
+        session: &Session,
+        schedule: &RealmFullCommitExecutionSchedule,
+        action: &RealmFullCommitScyllaWriteAction,
+    ) -> anyhow::Result<()> {
+        match action {
                 RealmFullCommitScyllaWriteAction::CheckpointKiv { index } => {
                     self.checkpoint_kiv
                         .put(session, schedule.rows()[*index].sealed())
@@ -794,9 +805,32 @@ impl RealmFullCommitScyllaExecutor {
                         .put(session, &schedule.rows()[*index])
                         .await?;
                 }
-            }
         }
         Ok(())
+    }
+
+    /// Qualification-only crash-window hook. It executes a bounded prefix of
+    /// the same private write plan and returns without reconciliation so the
+    /// RF=3 harness can rebuild the executor and prove fresh retry convergence.
+    #[cfg(test)]
+    pub(super) async fn qualification_write_prefix(
+        &self,
+        session: &Session,
+        schedule: &RealmFullCommitExecutionSchedule,
+        limit: usize,
+    ) -> anyhow::Result<usize> {
+        let before = self.read_all(session, schedule).await?;
+        let preflight = schedule.preflight(&before)?;
+        let plan = RealmFullCommitScyllaWritePlan::try_new(
+            schedule,
+            &before,
+            &preflight,
+        )?;
+        let count = limit.min(plan.actions.len());
+        for action in plan.actions.iter().take(count) {
+            self.execute_action(session, schedule, action).await?;
+        }
+        Ok(count)
     }
 
     async fn read_one(

@@ -1,11 +1,11 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
     process::Command,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{bail, ensure, Context};
@@ -120,6 +120,9 @@ use serde::Serialize;
 use tokio::time::sleep;
 
 use super::*;
+use super::realm_full_commit_scylla::{
+    RealmFullCommitScyllaExecutor, validate_schedule_write_plan,
+};
 use crate::utils::{
     convert_checkpoint_id_to_i64, i64_to_u64_exact, u64_to_i64_exact,
     u8_to_i8_exact,
@@ -1778,6 +1781,259 @@ async fn d04b2c_representative_state_replay_rf3_gate() -> anyhow::Result<()> {
     };
     let report_path = std::env::var("PSY_D04B2C_REPORT_PATH")
         .unwrap_or_else(|_| "target/d04b2c-state-replay-rf3-report.json".into());
+    let report_path = Path::new(&report_path);
+    if let Some(parent) = report_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(report_path, serde_json::to_vec_pretty(&report)?)?;
+    Ok(())
+}
+
+async fn create_full_commit_schema(session: &Session) -> anyhow::Result<()> {
+    create_schema(session).await?;
+
+    for table in CHECKPOINT_KIV_TABLES {
+        let name = physical_descriptor(table.physical_table()).physical_name;
+        session
+            .query_unpaged(
+                format!(
+                    "CREATE TABLE IF NOT EXISTS {STATE_KEYSPACE}.{name} (obj_id BIGINT PRIMARY KEY, value BLOB)"
+                ),
+                &[],
+            )
+            .await?;
+    }
+    for table in CHECKPOINT_OBJECT_SINGLE_TABLES {
+        let name = physical_descriptor(table.physical_table()).physical_name;
+        session
+            .query_unpaged(
+                format!(
+                    "CREATE TABLE IF NOT EXISTS {STATE_KEYSPACE}.{name} (obj_id BIGINT, checkpoint_id BIGINT, value BLOB, PRIMARY KEY ((obj_id), checkpoint_id)) WITH CLUSTERING ORDER BY (checkpoint_id DESC)"
+                ),
+                &[],
+            )
+            .await?;
+    }
+    for table in CHECKPOINT_MERKLE_TABLES {
+        let name = physical_descriptor(table.physical_table()).physical_name;
+        let cql = match table.schema_family() {
+            ScyllaSchemaFamily::MerkleZero => format!(
+                "CREATE TABLE IF NOT EXISTS {STATE_KEYSPACE}.{name} (level TINYINT, node_index BIGINT, checkpoint_id BIGINT, value BLOB, PRIMARY KEY ((level), node_index, checkpoint_id)) WITH CLUSTERING ORDER BY (node_index ASC, checkpoint_id DESC)"
+            ),
+            ScyllaSchemaFamily::MerkleSingle => format!(
+                "CREATE TABLE IF NOT EXISTS {STATE_KEYSPACE}.{name} (tree_id BIGINT, level TINYINT, node_index BIGINT, checkpoint_id BIGINT, value BLOB, PRIMARY KEY ((tree_id), level, node_index, checkpoint_id)) WITH CLUSTERING ORDER BY (level ASC, node_index ASC, checkpoint_id DESC)"
+            ),
+            ScyllaSchemaFamily::MerkleDouble => format!(
+                "CREATE TABLE IF NOT EXISTS {STATE_KEYSPACE}.{name} (tree_id BIGINT, tree_sub_id BIGINT, level TINYINT, node_index BIGINT, checkpoint_id BIGINT, value BLOB, PRIMARY KEY ((tree_id, tree_sub_id), level, node_index, checkpoint_id)) WITH CLUSTERING ORDER BY (level ASC, node_index ASC, checkpoint_id DESC)"
+            ),
+            family => bail!("full-commit Merkle table exposed unexpected schema family {family:?}"),
+        };
+        session.query_unpaged(cql, &[]).await?;
+    }
+    let checkpointed_object =
+        physical_descriptor(ScyllaPhysicalTableId::CheckpointedObject).physical_name;
+    session
+        .query_unpaged(
+            format!(
+                "CREATE TABLE IF NOT EXISTS {STATE_KEYSPACE}.{checkpointed_object} (obj_id BIGINT, checkpoint_id BIGINT, value BLOB, PRIMARY KEY ((obj_id), checkpoint_id)) WITH CLUSTERING ORDER BY (checkpoint_id DESC)"
+            ),
+            &[],
+        )
+        .await?;
+    Ok(())
+}
+
+async fn open_full_commit_executor(
+    target: Option<Ipv4Addr>,
+    consistency: Consistency,
+) -> anyhow::Result<(Session, RealmFullCommitScyllaExecutor)> {
+    let session = connect(target, consistency).await?;
+    let executor = RealmFullCommitScyllaExecutor::prepare_with_consistency(
+        &session,
+        CqlKeyspaceName::try_new(STATE_KEYSPACE)?,
+        consistency,
+    )
+    .await?;
+    Ok((session, executor))
+}
+
+#[derive(Serialize)]
+struct H23c4e2c2b2bReport {
+    baseline: &'static str,
+    image: &'static str,
+    scylla_release: String,
+    replication_factor: u8,
+    regular_consistency: &'static str,
+    full_schedule_rows: usize,
+    full_schedule_actions: usize,
+    partial_prefix_actions: usize,
+    partial_restart_recovered: bool,
+    caller_discard_retry: bool,
+    socket_response_loss_injected: bool,
+    one_replica_offline: bool,
+    exact_retry_digest_equal: bool,
+    repair_ms: u64,
+    direct_one_nodes: usize,
+    direct_one_table_names: Vec<&'static str>,
+    direct_one_table_count: usize,
+    direct_one_row_count: usize,
+    direct_one_dataset_digest: String,
+    direct_one_equal: bool,
+    h22_typed_composite_manifest: bool,
+    manifest_persisted: bool,
+    processor_writer_invocation: bool,
+    production_writer_covered_domains: u8,
+    authority_head_published: bool,
+    production_serving: bool,
+    h8_domains_closed: u8,
+    finished_unix_ms: u64,
+    qualification: &'static str,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the destructive local three-node Scylla RF=3 harness"]
+async fn h23c4e2c2b2b_full_commit_executor_rf3_gate() -> anyhow::Result<()> {
+    if std::env::var_os("PSY_D04B6H23C4E2C2B2B_RF3").is_none() {
+        bail!("set PSY_D04B6H23C4E2C2B2B_RF3=1 through run-d04b6h23c4e2c2b2b.sh");
+    }
+
+    let initial_session = connect(None, Consistency::Quorum).await?;
+    create_full_commit_schema(&initial_session).await?;
+    let release = docker_exec(
+        NODE_CONTAINERS[0],
+        &["scylla", "--version"],
+        "read h23c4e2c2b2b Scylla version",
+    )?
+    .trim()
+    .to_owned();
+    drop(initial_session);
+
+    let first_timestamp = CommitWriteTimestampUs::try_from_i128(70_000)?;
+    let first_schedule =
+        realm_full_commit_plan::tests::qualification_full_schedule(first_timestamp);
+    ensure!(first_schedule.rows().len() == 25);
+    let all_missing = vec![None; first_schedule.rows().len()];
+    let full_schedule_actions =
+        validate_schedule_write_plan(&first_schedule, &all_missing)?;
+    ensure!(full_schedule_actions == 24);
+
+    let (first_session, first_executor) =
+        open_full_commit_executor(None, Consistency::Quorum).await?;
+    ensure!(first_executor
+        .read_all(&first_session, &first_schedule)
+        .await?
+        .iter()
+        .all(Option::is_none));
+    let partial_prefix_actions = first_executor
+        .qualification_write_prefix(&first_session, &first_schedule, 7)
+        .await?;
+    ensure!(partial_prefix_actions == 7);
+    let partial = first_executor.read_all(&first_session, &first_schedule).await?;
+    ensure!(partial.iter().any(Option::is_some));
+    ensure!(partial.iter().any(Option::is_none));
+    drop(first_executor);
+    drop(first_session);
+
+    let (restart_session, restart_executor) =
+        open_full_commit_executor(None, Consistency::Quorum).await?;
+    let restarted = restart_executor
+        .write_and_verify(&restart_session, &first_schedule)
+        .await?;
+    ensure!(restarted.row_count() == 25);
+    drop(restart_executor);
+    drop(restart_session);
+
+    docker_container("stop", NODE_CONTAINERS[2])?;
+    let retry_timestamp = CommitWriteTimestampUs::try_from_i128(70_001)?;
+    let retry_schedule =
+        realm_full_commit_plan::tests::qualification_full_schedule(retry_timestamp);
+    let (offline_session, offline_executor) =
+        open_full_commit_executor(None, Consistency::Quorum).await?;
+    let first_retry = offline_executor
+        .write_and_verify(&offline_session, &retry_schedule)
+        .await?;
+    let first_retry_digest = *first_retry.digest();
+    drop(offline_executor);
+    drop(offline_session);
+
+    // Model a caller/process losing the successful result: rebuild every
+    // prepared statement while one replica remains offline, then retry the
+    // same sealed schedule and require an identical typed observation.
+    let (discard_session, discard_executor) =
+        open_full_commit_executor(None, Consistency::Quorum).await?;
+    let discarded_retry = discard_executor
+        .write_and_verify(&discard_session, &retry_schedule)
+        .await?;
+    ensure!(discarded_retry.digest() == &first_retry_digest);
+    drop(discard_executor);
+    drop(discard_session);
+
+    docker_container("start", NODE_CONTAINERS[2])?;
+    wait_for_three_up_normal().await?;
+    let repair_started = Instant::now();
+    repair_flush_compact()?;
+    let repair_ms = u64::try_from(repair_started.elapsed().as_millis())?;
+
+    let mut replica_digests = Vec::new();
+    for ip in NODE_IPS {
+        let (session, executor) =
+            open_full_commit_executor(Some(ip), Consistency::One).await?;
+        let rows = executor.read_all(&session, &retry_schedule).await?;
+        replica_digests.push(*retry_schedule.verify_after_write(&rows)?.digest());
+    }
+    let direct_one_equal = replica_digests
+        .iter()
+        .all(|digest| digest == &first_retry_digest);
+    ensure!(direct_one_equal);
+
+    let direct_one_table_names = retry_schedule
+        .rows()
+        .iter()
+        .map(|row| physical_descriptor(row.physical_table()).physical_name)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let report = H23c4e2c2b2bReport {
+        baseline: "236fd77f9d682af35a19bedcbfeda319e373d0dd",
+        image: IMAGE,
+        scylla_release: release,
+        replication_factor: 3,
+        regular_consistency: "QUORUM",
+        full_schedule_rows: retry_schedule.rows().len(),
+        full_schedule_actions,
+        partial_prefix_actions,
+        partial_restart_recovered: true,
+        caller_discard_retry: true,
+        socket_response_loss_injected: false,
+        one_replica_offline: true,
+        exact_retry_digest_equal: true,
+        repair_ms,
+        direct_one_nodes: NODE_IPS.len(),
+        direct_one_table_count: direct_one_table_names.len(),
+        direct_one_table_names,
+        direct_one_row_count: retry_schedule.rows().len(),
+        direct_one_dataset_digest: hex::encode(first_retry_digest),
+        direct_one_equal,
+        h22_typed_composite_manifest: false,
+        manifest_persisted: false,
+        processor_writer_invocation: false,
+        production_writer_covered_domains: 0,
+        authority_head_published: false,
+        production_serving: false,
+        h8_domains_closed: 0,
+        finished_unix_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_millis() as u64,
+        qualification:
+            "H23C4E2C2B2B_FULL_COMMIT_EXECUTOR_RF3_PASSED",
+    };
+    let report_path = std::env::var(
+        "PSY_D04B6H23C4E2C2B2B_REPORT_PATH",
+    )
+    .unwrap_or_else(|_| {
+        "target/d04b6h23c4e2c2b2b-full-commit-executor-rf3-report.json"
+            .into()
+    });
     let report_path = Path::new(&report_path);
     if let Some(parent) = report_path.parent() {
         fs::create_dir_all(parent)?;

@@ -432,7 +432,7 @@ impl fmt::Display for RealmFullCommitPhysicalPlanError {
 impl Error for RealmFullCommitPhysicalPlanError {}
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use parth_core::{
         crypto::hash::tag_tree::TagTreeMerkleProof,
         pgoldilocks::PoseidonHasher,
@@ -705,6 +705,18 @@ mod tests {
         )
         .unwrap();
         (narrow_prepared, plan)
+    }
+
+    pub(crate) fn qualification_full_schedule(
+        timestamp: CommitWriteTimestampUs,
+    ) -> crate::rollback::realm_full_commit_execution::RealmFullCommitExecutionSchedule
+    {
+        let (narrow, full) = full_state_plan(timestamp);
+        crate::rollback::realm_full_commit_execution::RealmFullCommitExecutionSchedule::try_from_plan(
+            &full,
+            &narrow,
+        )
+        .expect("qualification full schedule must remain valid")
     }
 
     fn state_without_imt_plan(
