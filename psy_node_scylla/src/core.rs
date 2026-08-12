@@ -57,24 +57,37 @@ pub struct ScyllaCoreStore<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> {
     _phantom_hasher: std::marker::PhantomData<Hasher>,
 }
 
+/// Connect to an existing Scylla cluster without creating any keyspace or
+/// table. Operator-only schema deployment paths use this instead of
+/// `ScyllaCoreStore::new`, whose legacy bootstrap contract creates keyspaces.
+pub(crate) async fn connect_existing_scylla_session(
+    known_nodes: &[String],
+) -> anyhow::Result<Arc<Session>> {
+    if known_nodes.is_empty() || known_nodes.iter().any(|node| node.trim().is_empty()) {
+        anyhow::bail!("at least one non-empty Scylla node address is required");
+    }
+
+    let mut execution_profile =
+        ExecutionProfile::builder().request_timeout(Some(Duration::from_secs(300)));
+    if known_nodes.len() == 1 {
+        execution_profile = execution_profile.consistency(scylla::statement::Consistency::One)
+    };
+    let execution_profile = execution_profile.build();
+    let session = SessionBuilder::new()
+        .known_nodes(known_nodes.iter())
+        .default_execution_profile_handle(execution_profile.into_handle())
+        .connection_timeout(Duration::from_secs(120))
+        .keepalive_timeout(Duration::from_secs(60))
+        .keepalive_interval(Duration::from_secs(30))
+        .pool_size(PoolSize::PerHost(NonZeroUsize::new(1).unwrap()))
+        .build()
+        .await?;
+    Ok(Arc::new(session))
+}
+
 impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hasher> {
     pub async fn new(realm_id: u64, realm_sub_id: u64, keyspace: String, known_nodes: &[String]) -> anyhow::Result<Self> {
-        let mut execution_profile = ExecutionProfile::builder()
-            .request_timeout(Some(Duration::from_secs(300)));
-        if known_nodes.len() == 1 {
-                execution_profile = execution_profile.consistency(scylla::statement::Consistency::One)
-        };
-        let execution_profile = execution_profile.build();
-        let session = SessionBuilder::new()
-            .known_nodes(known_nodes.iter())
-            .default_execution_profile_handle(execution_profile.into_handle())
-            .connection_timeout(Duration::from_secs(120))
-            .keepalive_timeout(Duration::from_secs(60))
-            .keepalive_interval(Duration::from_secs(30))
-            .pool_size(PoolSize::PerHost(NonZeroUsize::new(1).unwrap()))
-            .build()
-            .await?;
-        let session = Arc::new(session);
+        let session = connect_existing_scylla_session(known_nodes).await?;
 
         let no_tablet_keyspace = format!("{}_no_tablet", keyspace);
 

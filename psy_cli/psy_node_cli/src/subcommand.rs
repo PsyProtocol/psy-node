@@ -15,6 +15,29 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    #[command(about = "Explicitly deploy and verify the Realm rollback sidecar schema")]
+    DeployRealmRollbackSidecar {
+        #[arg(
+            long = "scylla-db-url",
+            env = "SCYLLA_DB_URL",
+            help = "Comma-separated Scylla node addresses"
+        )]
+        scylla_db_url: String,
+
+        #[arg(
+            long = "db-namespace",
+            env = "DB_NAMESPACE",
+            help = "Existing Realm data keyspace; the control keyspace is <name>_no_tablet"
+        )]
+        db_namespace: String,
+
+        #[arg(
+            long = "apply",
+            required = true,
+            help = "Required acknowledgement that this command may create or verify sidecar tables"
+        )]
+        apply: bool,
+    },
     #[command(about = "Start a realm processor node")]
     StartRealmProcessor {
         #[arg(long = "config", short = 'c', help = "Path to config.yaml/config.json file")]
@@ -178,4 +201,47 @@ pub enum Commands {
         #[arg(long = "proving-backend", help = "The proving backend to use (plonky2-poseidon-goldilocks, jtmb-poseidon-goldilocks, jtmb-sha256-u64, etc.)")]
         proving_backend: Option<PsyChainProvingBackendTypeInput>,
     },
+}
+
+#[cfg(test)]
+mod rollback_sidecar_command_tests {
+    use super::*;
+
+    #[test]
+    fn deployment_command_requires_explicit_apply_acknowledgement() {
+        let missing_apply = Cli::try_parse_from([
+            "psy_node_cli",
+            "deploy-realm-rollback-sidecar",
+            "--scylla-db-url",
+            "10.0.0.1:9042,10.0.0.2:9042,10.0.0.3:9042",
+            "--db-namespace",
+            "psy_realm_7",
+        ]);
+        assert!(missing_apply.is_err());
+
+        let parsed = Cli::try_parse_from([
+            "psy_node_cli",
+            "deploy-realm-rollback-sidecar",
+            "--scylla-db-url",
+            "10.0.0.1:9042,10.0.0.2:9042,10.0.0.3:9042",
+            "--db-namespace",
+            "psy_realm_7",
+            "--apply",
+        ])
+        .unwrap();
+        let Commands::DeployRealmRollbackSidecar {
+            scylla_db_url,
+            db_namespace,
+            apply,
+        } = parsed.command
+        else {
+            panic!("unexpected command");
+        };
+        assert_eq!(
+            scylla_db_url,
+            "10.0.0.1:9042,10.0.0.2:9042,10.0.0.3:9042"
+        );
+        assert_eq!(db_namespace, "psy_realm_7");
+        assert!(apply);
+    }
 }

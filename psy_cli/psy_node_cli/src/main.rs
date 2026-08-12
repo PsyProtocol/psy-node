@@ -3,6 +3,7 @@ mod subcommand;
 use clap::Parser;
 use psy_core::constants::proving_backends::{PsyChainProvingBackendType, PsyChainProvingBackendTypeInput};
 use psy_node_core::config::node_cli_config::{CoordinatorEdgeCliConfig, CoordinatorProcessorCliConfig, RealmEdgeCliConfig, RealmProcessorCliConfig};
+use psy_node_scylla::psy_setup::deploy_pending_queue_sidecar_from_connection_string;
 
 use crate::subcommand::{Cli, Commands, start_coordinator_edge, start_coordinator_processor, start_realm_edge, start_realm_processor};
 
@@ -20,6 +21,31 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     //psy_common::setup_logging()?;
     match cli.command {
+        Commands::DeployRealmRollbackSidecar {
+            scylla_db_url,
+            db_namespace,
+            apply,
+        } => {
+            if !apply {
+                anyhow::bail!(
+                    "refusing to deploy without --apply; no Scylla connection was attempted"
+                );
+            }
+            let summary = deploy_pending_queue_sidecar_from_connection_string(
+                &db_namespace,
+                &scylla_db_url,
+            )
+            .await?;
+            println!("pending queue sidecar verified");
+            println!("schema_version={}", summary.schema_version());
+            println!("data_keyspace={}", summary.data_keyspace());
+            println!("control_keyspace={}", summary.control_keyspace());
+            println!(
+                "schema_fingerprint={}",
+                hex::encode(summary.schema_fingerprint())
+            );
+            println!("ready_digest={}", hex::encode(summary.ready_digest()));
+        }
         Commands::StartRealmProcessor {
             config,
             scylla_db_url,

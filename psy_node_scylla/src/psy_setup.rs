@@ -32,16 +32,17 @@ use psy_node_nats::queue::NatsJetStreamClient;
 use rand::{rngs::OsRng, RngCore};
 
 use crate::{
-    core::ScyllaCoreStore,
+    core::{connect_existing_scylla_session, ScyllaCoreStore},
     rollback::{
         BranchExactDeploymentNoTabletKeyspace, BranchExactSchemaSetupMode,
         BranchExactSchemaSetupRequest, BranchExactWriterAuthorityKey,
         BranchExactWriterActivationPlan, BranchExactWriterReadState,
+        PendingQueueSidecarDeploymentExecutor, PendingQueueSidecarKeyspaces,
         PendingQueueSidecarSetupMode, ScyllaAuthorityLocalHeadStore,
         ScyllaBranchExactWriterLifecycleStore,
         ScyllaRealmAuthorityObservationReader,
         ScyllaRealmUserUpdateDurableRouter, ScyllaRealmUserUpdateIngress,
-        AuthorityLocalHeadNoTabletKeyspace,
+        AuthorityLocalHeadNoTabletKeyspace, PENDING_QUEUE_SIDECAR_SCHEMA_VERSION,
     },
     tables::{
         blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements, bridge::{deposit_leaf::ScyllaBridgeDepositLeafPreparedStatements, next_index::ScyllaBridgeDepositNextIndexPreparedStatements}, counter::u64_counter::ScyllaU64ToU64CounterTablePreparedStatements, hash_to_many_ids::ScyllaHashToManyIdsTablePreparedStatements, imt::{imt_key_index::ScyllaIMTKeyIndexPreparedStatements, imt_leaf::ScyllaIMTLeafPreparedStatements, imt_next_append_index::ScyllaIMTNextAppendIndexPreparedStatements}, merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements, ScyllaMerkleNodesZeroPreparedStatements}, object::{
@@ -344,6 +345,102 @@ pub async fn setup_psy_scylla_database_store_from_connection_string<N: QNetworkD
         // Edge nodes: only prepare statements, assume tables exist
         prepare_psy_scylla_database_store::<N>(Arc::new(scylla_db)).await
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingQueueSidecarDeploymentSummary {
+    schema_version: u16,
+    data_keyspace: String,
+    control_keyspace: String,
+    schema_fingerprint: [u8; 32],
+    ready_digest: [u8; 32],
+}
+
+impl PendingQueueSidecarDeploymentSummary {
+    pub const fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+
+    pub fn data_keyspace(&self) -> &str {
+        &self.data_keyspace
+    }
+
+    pub fn control_keyspace(&self) -> &str {
+        &self.control_keyspace
+    }
+
+    pub const fn schema_fingerprint(&self) -> &[u8; 32] {
+        &self.schema_fingerprint
+    }
+
+    pub const fn ready_digest(&self) -> &[u8; 32] {
+        &self.ready_digest
+    }
+}
+
+fn parse_scylla_known_nodes(connection_string: &str) -> anyhow::Result<Vec<String>> {
+    let nodes = connection_string
+        .split(',')
+        .map(str::trim)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if nodes.is_empty() || nodes.iter().any(String::is_empty) {
+        anyhow::bail!(
+            "Scylla connection string must be a comma-separated list of non-empty node addresses"
+        );
+    }
+    Ok(nodes)
+}
+
+async fn require_existing_scylla_keyspace(
+    session: &scylla::client::session::Session,
+    keyspace: &str,
+) -> anyhow::Result<()> {
+    let row = session
+        .query_unpaged(
+            "SELECT keyspace_name FROM system_schema.keyspaces WHERE keyspace_name = ?",
+            (keyspace,),
+        )
+        .await?
+        .into_rows_result()?
+        .maybe_first_row::<(String,)>()?;
+    if row.is_none() {
+        anyhow::bail!(
+            "required Scylla keyspace {keyspace:?} does not exist; refusing to create it with an implicit replication policy"
+        );
+    }
+    Ok(())
+}
+
+/// Explicit operator path for the immutable pending-queue sidecar schema.
+///
+/// This connects to an existing cluster and refuses to create either
+/// keyspace. Only the versioned sidecar tables and lifecycle row are
+/// materialized by the typed deployment executor.
+pub async fn deploy_pending_queue_sidecar_from_connection_string(
+    data_keyspace: &str,
+    connection_string: &str,
+) -> anyhow::Result<PendingQueueSidecarDeploymentSummary> {
+    let nodes = parse_scylla_known_nodes(connection_string)?;
+    let control_keyspace = format!("{data_keyspace}_no_tablet");
+    let keyspaces = PendingQueueSidecarKeyspaces::try_new(
+        data_keyspace.to_owned(),
+        control_keyspace.clone(),
+    )?;
+    let session = connect_existing_scylla_session(&nodes).await?;
+
+    require_existing_scylla_keyspace(&session, data_keyspace).await?;
+    require_existing_scylla_keyspace(&session, &control_keyspace).await?;
+
+    let receipt = PendingQueueSidecarDeploymentExecutor::deploy(session, keyspaces).await?;
+    let stored = receipt.stored();
+    Ok(PendingQueueSidecarDeploymentSummary {
+        schema_version: PENDING_QUEUE_SIDECAR_SCHEMA_VERSION,
+        data_keyspace: data_keyspace.to_owned(),
+        control_keyspace,
+        schema_fingerprint: *stored.schema_fingerprint().as_bytes(),
+        ready_digest: *receipt.ready_digest(),
+    })
 }
 
 /// Coordinator processor/edge composition root. The canonical-head control
@@ -1035,5 +1132,42 @@ mod realm_startup_composition_tests {
         let third = fresh_startup_nonce_excluding(first);
         assert_ne!(third, [0; 32]);
         assert_ne!(third, first);
+    }
+
+    #[test]
+    fn sidecar_operator_connection_input_is_exact_and_nonempty() {
+        assert_eq!(
+            parse_scylla_known_nodes(" 10.0.0.1:9042,10.0.0.2:9042 ").unwrap(),
+            vec!["10.0.0.1:9042", "10.0.0.2:9042"]
+        );
+        for invalid in ["", " ", ",", "10.0.0.1:9042,", ",10.0.0.1:9042"] {
+            assert!(parse_scylla_known_nodes(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn sidecar_operator_never_implicitly_creates_keyspaces() {
+        let source = include_str!("psy_setup.rs");
+        let operator = source
+            .split("pub async fn deploy_pending_queue_sidecar_from_connection_string")
+            .nth(1)
+            .unwrap()
+            .split("/// Coordinator processor/edge composition root")
+            .next()
+            .unwrap();
+        assert!(operator.contains("connect_existing_scylla_session"));
+        assert_eq!(
+            operator.matches("require_existing_scylla_keyspace").count(),
+            2
+        );
+        assert!(
+            operator.find("require_existing_scylla_keyspace").unwrap()
+                < operator
+                    .find("PendingQueueSidecarDeploymentExecutor::deploy")
+                    .unwrap()
+        );
+        let create_keyspace = ["CREATE", " KEYSPACE"].concat();
+        assert!(!operator.contains(&create_keyspace));
+        assert!(!operator.contains("ScyllaCoreStore::new"));
     }
 }
