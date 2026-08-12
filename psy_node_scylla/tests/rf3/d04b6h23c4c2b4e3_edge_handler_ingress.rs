@@ -82,7 +82,11 @@ use psy_data::{
             PQEDCheckpointLeafStats, QEDL2BlockState,
         },
         checkpoint_sync::PQEDCheckpointSyncInfoCompact,
-        contract::{DashMapContractHeightCache, PSimpleContractHeightCache},
+        contract::{
+            DashMapContractHeightCache, PSimpleContractHeightCache,
+            PsyDeployContractQueueItem,
+        },
+        public_key::PZKPublicKeyInfo,
     },
     worker::{
         api_response::{
@@ -132,6 +136,10 @@ use psy_node_core::{
     queue::{
         coordinator_guta_durable_submission::{
             CoordinatorGutaDurableSubmissionStore, CoordinatorGutaQueueItem,
+        },
+        coordinator_processor_durable_capture::{
+            CoordinatorProcessorDurableCapturedGeneration,
+            CoordinatorProcessorSourceKind,
         },
         realm_processor_actor_input::{
             RealmProcessorActorInput, RealmProcessorActorInputDigest,
@@ -216,6 +224,7 @@ use psy_node_core::{
             PendingQueueCloseIntentDigest, PendingWorkCaptureDigest,
             StoredPendingPipeline,
         },
+        coordinator_processor_branch_exact_runtime::CoordinatorBranchExactProcessorOwner,
         realm_processor_branch_exact_runtime::{
             RealmBranchExactCommitRuntimeInstaller,
             RealmBranchExactSingleCommitOwner,
@@ -270,17 +279,33 @@ use psy_node_common::{
     coordinator::{
         edge::handler::CoordinatorEdgeHandler,
         processor::{
-            gatherers::coordinator_guta_update_gatherer::{
-                qualification_recover_coordinator_guta_queue_item,
-                CoordinatorGUTAUpdateGatherer,
-                CoordinatorGUTAUpdateGathererConfig,
-                CoordinatorGUTAUpdateGathererOutput,
+            gatherers::{
+                coordinator_guta_update_gatherer::{
+                    qualification_recover_coordinator_guta_queue_item,
+                    CoordinatorGUTAUpdateGatherer,
+                    CoordinatorGUTAUpdateGathererConfig,
+                    CoordinatorGUTAUpdateGathererOutput,
+                },
+                deploy_contract_gatherer::{
+                    DeployContractGatherer, DeployContractGathererConfig,
+                    DeployContractGathererOutput,
+                },
+                register_user_gatherer::{
+                    RegisterUserGatherer, RegisterUserGathererConfig,
+                    RegisterUserGathererOutput,
+                },
             },
             processor_shared_status::PsyCoordinatorProcessorSharedStatus,
         },
-        queue_key::CoordinatorSubmitRealmGUTAUpdateQueueKey,
+        queue_key::{
+            CoordinatorDeployContractQueueKey,
+            CoordinatorRegisterUserPublicKeyQueueKey,
+            CoordinatorSubmitRealmGUTAUpdateQueueKey,
+        },
     },
     constants::queue::{
+        PQ_COORDINATOR_DEPLOY_CONTRACT_QUEUE_TOPIC_ID,
+        PQ_COORDINATOR_REGISTER_USER_PUBLIC_KEY_QUEUE_TOPIC_ID,
         PQ_COORDINATOR_SUBMIT_REALM_GUTA_UPDATE_QUEUE_TOPIC_ID,
         PQ_REALM_SUBMIT_USER_UPDATE_QUEUE_TOPIC_ID,
     },
@@ -571,6 +596,18 @@ struct E3Report {
     coordinator_gatherer_total_inputs: u64,
     coordinator_gatherer_duplicate_collapsed: bool,
     coordinator_gatherer_root_transition_exact: bool,
+    coordinator_durable_capture_rf3: bool,
+    coordinator_durable_replay_after_ack: bool,
+    coordinator_durable_generation_digest: String,
+    coordinator_durable_registration_items: u64,
+    coordinator_durable_deploy_items: u64,
+    coordinator_durable_guta_items: u64,
+    coordinator_durable_actor_retry_bit_exact: bool,
+    coordinator_durable_actor_revisions: [u64; 3],
+    coordinator_durable_guta_root_transition_exact: bool,
+    coordinator_durable_during_one_replica_offline: bool,
+    coordinator_durable_after_nats_leader_failover: bool,
+    coordinator_legacy_consumer_clean_boundary: bool,
     mixed_version_clean_boundary_required: bool,
     mixed_version_overlap_supported: bool,
     production_coordinator_handler_rf3: bool,
@@ -1711,6 +1748,34 @@ type QualificationCoordinatorGutaActor = EphemeralQueueGathererWithTree<
 >;
 
 #[cfg(feature = "rf3-test-support")]
+type QualificationCoordinatorRegistrationActor = EphemeralQueueGathererWithTree<
+    PQ_COORDINATOR_REGISTER_USER_PUBLIC_KEY_QUEUE_TOPIC_ID,
+    PZKPublicKeyInfo<PHash>,
+    RegisterUserGathererOutput<PHash, QProvingJobDataID>,
+>;
+
+#[cfg(feature = "rf3-test-support")]
+type QualificationCoordinatorDeployActor = EphemeralQueueGathererWithTree<
+    PQ_COORDINATOR_DEPLOY_CONTRACT_QUEUE_TOPIC_ID,
+    PsyDeployContractQueueItem<PF, PHash>,
+    DeployContractGathererOutput<PHash, QProvingJobDataID>,
+>;
+
+#[cfg(feature = "rf3-test-support")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct QualificationCoordinatorDurableActorTrace {
+    generation_digest: String,
+    registration_items: u64,
+    deploy_items: u64,
+    guta_items: u64,
+    registration_actor_revision: u64,
+    deploy_actor_revision: u64,
+    guta_actor_revision: u64,
+    guta_root_transition_exact: bool,
+    same_generation_retry_bit_exact: bool,
+}
+
+#[cfg(feature = "rf3-test-support")]
 async fn run_qualification_coordinator_guta_gatherer(
     nats: Arc<NatsJetStreamClient>,
     queue_key: CoordinatorSubmitRealmGUTAUpdateQueueKey<PF, PHash>,
@@ -1831,6 +1896,337 @@ async fn run_qualification_coordinator_guta_gatherer(
         "Coordinator gatherer returned a mismatched root transition",
     );
     Ok(output)
+}
+
+#[cfg(feature = "rf3-test-support")]
+async fn run_qualification_coordinator_durable_actors(
+    durable_submissions: Arc<dyn CoordinatorGutaDurableSubmissionStore<PHash>>,
+    redis: Arc<StandardRedisStore>,
+    pending: PendingContext<PHash>,
+    checkpoint_leaves: &[PHash],
+    guta_circuit_whitelist: PHash,
+    submitted_realm: u32,
+    old_realm_root: PHash,
+    new_realm_root: PHash,
+    first: CoordinatorProcessorDurableCapturedGeneration,
+    retry: CoordinatorProcessorDurableCapturedGeneration,
+) -> anyhow::Result<QualificationCoordinatorDurableActorTrace> {
+    ensure!(pending.authority() == AuthorityScope::Coordinator);
+    let checkpoint_id = pending.chain().checkpoint().checkpoint_id().get();
+    ensure!(checkpoint_leaves.len() > usize::try_from(checkpoint_id)?);
+
+    let checkpoint_tree = PsyDashMemoryAppendOnlyMerkleStore::<
+        PoseidonHasher,
+        PHash,
+    >::new(N::CHECKPOINT_TREE_HEIGHT);
+    for index in 0..=checkpoint_id {
+        checkpoint_tree.append_leaf(
+            index,
+            checkpoint_leaves[usize::try_from(index)?],
+        )?;
+    }
+    let checkpoint_tree = Arc::new(checkpoint_tree);
+
+    let mut global_user_tree =
+        SimpleMemoryMerkleRecorderStore::<PoseidonHasher, PHash>::new(
+            N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+        );
+    global_user_tree.set_e_leaf_no_proof(
+        u64::from(submitted_realm),
+        old_realm_root,
+    );
+    global_user_tree.commit_changes();
+    let start_global_user_root = global_user_tree.get_root();
+    let mut expected_global_user_tree = global_user_tree.clone();
+    expected_global_user_tree.set_e_leaf_no_proof(
+        u64::from(submitted_realm),
+        new_realm_root,
+    );
+    let expected_global_user_root = expected_global_user_tree.get_root();
+
+    let user_registration_tree =
+        SimpleMemoryMerkleRecorderStore::<PoseidonHasher, PHash>::new(
+            N::GLOBAL_USER_TREE_HEIGHT,
+        );
+    let global_contract_tree =
+        SimpleMemoryMerkleRecorderStore::<PoseidonHasher, PHash>::new(
+            N::GLOBAL_CONTRACT_TREE_HEIGHT,
+        );
+    let state_roots = PQEDCheckpointGlobalStateRoots {
+        contract_tree_root: global_contract_tree.get_root(),
+        deposit_tree_root: PHash::get_zero_value(),
+        user_tree_root: start_global_user_root,
+        withdrawal_tree_root: PHash::get_zero_value(),
+        user_registration_tree_root: user_registration_tree.get_root(),
+    };
+    let checkpoint_leaf = PQEDCheckpointLeaf {
+        global_chain_root: state_roots.qfhash::<PoseidonHasher>(),
+        stats: PQEDCheckpointLeafStats::<PF, PHash>::get_empty_stats(),
+    };
+    let mut block_state = QEDL2BlockState::get_genesis_value();
+    block_state.checkpoint_id = checkpoint_id;
+    let shared_status = Arc::new(RwLock::new(PsyCoordinatorProcessorSharedStatus {
+        last_committed_checkpoint_id: checkpoint_id,
+        unique_pending_id: pending.unique_pending_id().get(),
+        last_committed_checkpoint_leaf: checkpoint_leaf,
+        last_committed_checkpoint_state_roots: state_roots,
+        should_revert_last_changes: false,
+        block_state,
+    }));
+    let file_system = Arc::new(SimpleMockMemoryFileSystem::new());
+
+    let guta_config = CoordinatorGUTAUpdateGathererConfig::<
+        N,
+        StandardRedisStore,
+        StandardRedisStore,
+        SimpleMockMemoryFileSystem,
+    > {
+        realm_id_u64: 0,
+        realm_sub_id_u64: 0,
+        status: Arc::clone(&shared_status),
+        temp_db: Arc::clone(&redis),
+        proof_store: Arc::clone(&redis),
+        durable_guta_submissions: Some(durable_submissions),
+        file_system: Arc::clone(&file_system),
+        last_old_realm_roots: Arc::new(RwLock::new(Vec::new())),
+        backup_file_directory: "/h23c4d3b2b2b4c2b-guta".to_owned(),
+        coordinator_guta_updates_circuit_whitelist: guta_circuit_whitelist,
+        checkpoint_tree,
+        _phantom_n: std::marker::PhantomData,
+    };
+    let register_config = RegisterUserGathererConfig::<
+        N,
+        StandardRedisStore,
+        SimpleMockMemoryFileSystem,
+    > {
+        status: Arc::clone(&shared_status),
+        realm_id_u64: 0,
+        realm_sub_id_u64: 0,
+        temp_db: Arc::clone(&redis),
+        backup_file_directory: "/h23c4d3b2b2b4c2b-registration".to_owned(),
+        register_users_circuit_whitelist: guta_circuit_whitelist,
+        last_job_next_user_id: Arc::new(RwLock::new(0)),
+        file_system: Arc::clone(&file_system),
+        _phantom_n: std::marker::PhantomData,
+    };
+    let deploy_config = DeployContractGathererConfig::<
+        N,
+        StandardRedisStore,
+        SimpleMockMemoryFileSystem,
+    > {
+        realm_id_u64: 0,
+        realm_sub_id_u64: 0,
+        shared_status,
+        temp_db: redis,
+        backup_file_directory: "/h23c4d3b2b2b4c2b-deploy".to_owned(),
+        deploy_contract_circuit_whitelist: guta_circuit_whitelist,
+        last_job_next_contract_id: Arc::new(RwLock::new(0)),
+        file_system,
+        _phantom_n: std::marker::PhantomData,
+    };
+    let proc_id = pending.proc_checkpoint_unique_id().as_u128();
+    let status = || {
+        let status = ProcessorStatus::new();
+        status.mark_running();
+        status
+    };
+    let guta_key: CoordinatorSubmitRealmGUTAUpdateQueueKey<PF, PHash> =
+        QPStandardUniqueIdQueueKey {
+            realm_id: 0,
+            realm_sub_id: 0,
+            unique_id: proc_id,
+            task_group: 0,
+            queue_type: QPBaseQueueType::StandardEphemeral,
+            _phantom_queue_item: std::marker::PhantomData,
+        };
+    let register_key: CoordinatorRegisterUserPublicKeyQueueKey<PHash> =
+        QPStandardUniqueIdQueueKey {
+            realm_id: 0,
+            realm_sub_id: 0,
+            unique_id: proc_id,
+            task_group: 0,
+            queue_type: QPBaseQueueType::StandardEphemeral,
+            _phantom_queue_item: std::marker::PhantomData,
+        };
+    let deploy_key: CoordinatorDeployContractQueueKey<PF, PHash> =
+        QPStandardUniqueIdQueueKey {
+            realm_id: 0,
+            realm_sub_id: 0,
+            unique_id: proc_id,
+            task_group: 0,
+            queue_type: QPBaseQueueType::StandardEphemeral,
+            _phantom_queue_item: std::marker::PhantomData,
+        };
+
+    let (guta_actor, guta_task) =
+        QualificationCoordinatorGutaActor::new_coordinator_durable_with_status::<
+            CoordinatorGUTAUpdateGathererConfig<
+                N,
+                StandardRedisStore,
+                StandardRedisStore,
+                SimpleMockMemoryFileSystem,
+            >,
+            PHash,
+            PoseidonHasher,
+            CoordinatorGUTAUpdateGatherer<
+                N,
+                StandardRedisStore,
+                StandardRedisStore,
+                SimpleMockMemoryFileSystem,
+            >,
+        >(
+            guta_config,
+            guta_key,
+            global_user_tree,
+            status(),
+            CoordinatorProcessorSourceKind::Guta,
+        );
+    let (registration_actor, registration_task) =
+        QualificationCoordinatorRegistrationActor::new_coordinator_durable_with_status::<
+            RegisterUserGathererConfig<
+                N,
+                StandardRedisStore,
+                SimpleMockMemoryFileSystem,
+            >,
+            PHash,
+            PoseidonHasher,
+            RegisterUserGatherer<
+                N,
+                StandardRedisStore,
+                SimpleMockMemoryFileSystem,
+            >,
+        >(
+            register_config,
+            register_key,
+            user_registration_tree,
+            status(),
+            CoordinatorProcessorSourceKind::Registration,
+        );
+    let (deploy_actor, deploy_task) =
+        QualificationCoordinatorDeployActor::new_coordinator_durable_with_status::<
+            DeployContractGathererConfig<
+                N,
+                StandardRedisStore,
+                SimpleMockMemoryFileSystem,
+            >,
+            PHash,
+            PoseidonHasher,
+            DeployContractGatherer<
+                N,
+                StandardRedisStore,
+                SimpleMockMemoryFileSystem,
+            >,
+        >(
+            deploy_config,
+            deploy_key,
+            global_contract_tree,
+            status(),
+            CoordinatorProcessorSourceKind::Deploy,
+        );
+
+    let (context, generation_digest, registration, deploy, guta) =
+        first.into_sources();
+    let (retry_context, retry_digest, retry_registration, retry_deploy, retry_guta) =
+        retry.into_sources();
+    ensure!(context == retry_context && generation_digest == retry_digest);
+    ensure!(context.processing().pending_id().get() == pending.unique_pending_id().get());
+    ensure!(
+        context.processing().proc_checkpoint_id().as_u128()
+            == pending.proc_checkpoint_unique_id().as_u128(),
+    );
+    ensure!(registration.items().is_empty() && deploy.items().is_empty());
+    ensure!(guta.items().len() == 1);
+
+    let (registration_apply, deploy_apply, guta_apply) = tokio::try_join!(
+        registration_actor.qualification_apply_coordinator_durable_source(
+            generation_digest,
+            registration,
+        ),
+        deploy_actor.qualification_apply_coordinator_durable_source(
+            generation_digest,
+            deploy,
+        ),
+        guta_actor.qualification_apply_coordinator_durable_source(
+            generation_digest,
+            guta,
+        ),
+    )?;
+    let (registration_retry, deploy_retry, guta_retry) = tokio::try_join!(
+        registration_actor.qualification_apply_coordinator_durable_source(
+            retry_digest,
+            retry_registration,
+        ),
+        deploy_actor.qualification_apply_coordinator_durable_source(
+            retry_digest,
+            retry_deploy,
+        ),
+        guta_actor.qualification_apply_coordinator_durable_source(
+            retry_digest,
+            retry_guta,
+        ),
+    )?;
+    let same_generation_retry_bit_exact = registration_apply.actor_revision()
+        == registration_retry.actor_revision()
+        && registration_apply.source_digest() == registration_retry.source_digest()
+        && deploy_apply.actor_revision() == deploy_retry.actor_revision()
+        && deploy_apply.source_digest() == deploy_retry.source_digest()
+        && guta_apply.actor_revision() == guta_retry.actor_revision()
+        && guta_apply.source_digest() == guta_retry.source_digest();
+    ensure!(same_generation_retry_bit_exact);
+
+    let (registration_final, deploy_final, guta_final) = tokio::try_join!(
+        registration_actor
+            .qualification_finalize_coordinator_durable_source(registration_apply),
+        deploy_actor.qualification_finalize_coordinator_durable_source(deploy_apply),
+        guta_actor.qualification_finalize_coordinator_durable_source(guta_apply),
+    )?;
+    let (registration_final_retry, deploy_final_retry, guta_final_retry) =
+        tokio::try_join!(
+            registration_actor.qualification_finalize_coordinator_durable_source(
+                registration_retry,
+            ),
+            deploy_actor.qualification_finalize_coordinator_durable_source(
+                deploy_retry,
+            ),
+            guta_actor.qualification_finalize_coordinator_durable_source(guta_retry),
+        )?;
+    ensure!(
+        registration_final.actor_revision()
+            == registration_final_retry.actor_revision()
+            && deploy_final.actor_revision() == deploy_final_retry.actor_revision()
+            && guta_final.actor_revision() == guta_final_retry.actor_revision()
+    );
+    let guta_output = guta_final.output();
+    let guta_root_transition_exact = guta_output.db_output.total_guta_inputs == 1
+        && guta_output.db_output.start_global_user_tree_root == start_global_user_root
+        && guta_output.db_output.end_global_user_tree_root == expected_global_user_root
+        && guta_output.db_output.root_guta_header.is_some_and(|header| {
+            header.state_transition.old_node_value == start_global_user_root
+                && header.state_transition.new_node_value == expected_global_user_root
+        });
+    ensure!(guta_root_transition_exact);
+
+    let trace = QualificationCoordinatorDurableActorTrace {
+        generation_digest: hex::encode(generation_digest.as_bytes()),
+        registration_items: registration_final.item_count(),
+        deploy_items: deploy_final.item_count(),
+        guta_items: guta_final.item_count(),
+        registration_actor_revision: registration_final.actor_revision().get(),
+        deploy_actor_revision: deploy_final.actor_revision().get(),
+        guta_actor_revision: guta_final.actor_revision().get(),
+        guta_root_transition_exact,
+        same_generation_retry_bit_exact,
+    };
+    drop((registration_actor, deploy_actor, guta_actor));
+    let (registration_exit, deploy_exit, guta_exit) = tokio::join!(
+        registration_task,
+        deploy_task,
+        guta_task,
+    );
+    registration_exit??;
+    deploy_exit??;
+    guta_exit??;
+    Ok(trace)
 }
 
 #[cfg(feature = "rf3-test-support")]
@@ -2095,6 +2491,26 @@ fn generation_budget() -> anyhow::Result<PendingQueueGenerationBudgetContract> {
             127 * mib,
             mib,
         )?],
+        128 * mib,
+    )?)
+}
+
+fn coordinator_generation_budget(
+) -> anyhow::Result<PendingQueueGenerationBudgetContract> {
+    let mib = 1024 * 1024_u64;
+    let quotas = [
+        (PendingQueuePublisherKind::CoordinatorRegistration, 15),
+        (PendingQueuePublisherKind::CoordinatorDeploy, 47),
+        (PendingQueuePublisherKind::CoordinatorGuta, 63),
+    ]
+    .into_iter()
+    .map(|(kind, data_mib)| {
+        PendingQueueSourceQuota::try_new(kind, 1_000, data_mib * mib, mib)
+    })
+    .collect::<Result<Vec<_>, _>>()?;
+    Ok(PendingQueueGenerationBudgetContract::try_new(
+        AuthorityScope::Coordinator,
+        quotas,
         128 * mib,
     )?)
 }
@@ -2430,10 +2846,14 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         std::env::var("PSY_D04B6H23C4D3B2B2B2_RF3").as_deref() == Ok("1");
     let exercise_coordinator_gatherer =
         std::env::var("PSY_D04B6H23C4D3B2B2B3_RF3").as_deref() == Ok("1");
+    let exercise_coordinator_durable_processor =
+        std::env::var("PSY_D04B6H23C4D3B2B2B4C2B_RF3").as_deref()
+            == Ok("1");
     let exercise_coordinator_handler =
         exercise_coordinator_handler_prefix
             || exercise_coordinator_redis_restart
-            || exercise_coordinator_gatherer;
+            || exercise_coordinator_gatherer
+            || exercise_coordinator_durable_processor;
     ensure!(
         !exercise_proof_worker_queue || exercise_proof_narrow_writer,
         "c4d3a worker queue Gate requires c4d2 proof/narrow writer",
@@ -2449,6 +2869,10 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
     ensure!(
         !exercise_coordinator_gatherer || exercise_coordinator_redis_restart,
         "c4d3b2b2b3 Coordinator gatherer Gate requires real Redis restart",
+    );
+    ensure!(
+        !exercise_coordinator_durable_processor || exercise_coordinator_gatherer,
+        "c4d3b2b2b4c2b Coordinator durable Processor Gate requires the real gatherer Gate",
     );
 
     fixture::wait_up(3).await?;
@@ -3357,6 +3781,18 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
     let mut coordinator_gatherer_total_inputs = 0_u64;
     let mut coordinator_gatherer_duplicate_collapsed = false;
     let mut coordinator_gatherer_root_transition_exact = false;
+    let mut coordinator_durable_capture_rf3 = false;
+    let mut coordinator_durable_replay_after_ack = false;
+    let mut coordinator_durable_generation_digest = String::new();
+    let mut coordinator_durable_registration_items = 0_u64;
+    let mut coordinator_durable_deploy_items = 0_u64;
+    let mut coordinator_durable_guta_items = 0_u64;
+    let mut coordinator_durable_actor_retry_bit_exact = false;
+    let mut coordinator_durable_actor_revisions = [0_u64; 3];
+    let mut coordinator_durable_guta_root_transition_exact = false;
+    let mut coordinator_durable_during_one_replica_offline = false;
+    let mut coordinator_durable_after_nats_leader_failover = false;
+    let mut coordinator_legacy_consumer_clean_boundary = false;
     let mut proof_worker_api_handler_rf3 = false;
     let mut proof_worker_jobs_dispatched = 0_usize;
     let mut proof_worker_jobs_completed = 0_usize;
@@ -5316,7 +5752,20 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                                         realm_sub_id: 0,
                                     };
                                     let coordinator_pending = 910_000_u64;
-                                    let coordinator_proc = 910_001_u128;
+                                    let coordinator_prefix =
+                                        ProcNamespacePrefix::for_authority(
+                                            network,
+                                            AuthorityScope::Coordinator,
+                                        );
+                                    let coordinator_proc = if exercise_coordinator_durable_processor {
+                                        coordinator_prefix
+                                            .derive_proc_id(UniquePendingId::try_new(
+                                                coordinator_pending,
+                                            )?)
+                                            .as_u128()
+                                    } else {
+                                        910_001_u128
+                                    };
                                     let coordinator_context = PendingContext::new(
                                         proof_predecessor_chain,
                                         AuthorityScope::Coordinator,
@@ -5647,6 +6096,451 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                                                 .root_guta_header
                                                 .is_some();
                                             coordinator_gatherer_rf3 = true;
+
+                                            if exercise_coordinator_durable_processor {
+                                                coordinator_legacy_consumer_clean_boundary =
+                                                    match jetstream
+                                                        .get_consumer_from_stream::<
+                                                            PullConfig,
+                                                            _,
+                                                            _,
+                                                        >(
+                                                            &durable_name,
+                                                            restarted_nats.stream_name(),
+                                                        )
+                                                        .await
+                                                    {
+                                                        Ok(mut consumer) => {
+                                                            let info = consumer.info().await?;
+                                                            info.num_pending == 0
+                                                                && info.num_ack_pending == 0
+                                                        }
+                                                        Err(error) => {
+                                                            let message = error
+                                                                .to_string()
+                                                                .to_ascii_lowercase();
+                                                            message.contains("not found")
+                                                                || message.contains("10014")
+                                                        }
+                                                    };
+                                                ensure!(
+                                                    coordinator_legacy_consumer_clean_boundary,
+                                                    "legacy Coordinator queue was not drained before v16 durable capture activation",
+                                                );
+
+                                                let coordinator_key =
+                                                    PendingGenerationLedgerKey::new(
+                                                        network,
+                                                        AuthorityScope::Coordinator,
+                                                    );
+                                                let processing =
+                                                    PendingGenerationContext::try_from_legacy(
+                                                        coordinator_pending,
+                                                        coordinator_proc,
+                                                    )?;
+                                                let predecessor_pending =
+                                                    UniquePendingId::try_new(
+                                                        coordinator_pending - 1,
+                                                    )?;
+                                                let predecessor =
+                                                    PendingGenerationContext::try_from_legacy(
+                                                        predecessor_pending.get(),
+                                                        coordinator_prefix
+                                                            .derive_proc_id(
+                                                                predecessor_pending,
+                                                            )
+                                                            .as_u128(),
+                                                    )?;
+                                                let coordinator_activation =
+                                                    PendingGenerationActivationDigest::try_new(
+                                                        [0xD6; 32],
+                                                    )?;
+                                                let coordinator_frontier =
+                                                    AuthorityObservation::try_new(
+                                                        proof_predecessor_chain,
+                                                        AuthorityScope::Coordinator,
+                                                        AuthorityStateCheckpointId::new(
+                                                            proof_predecessor_chain
+                                                                .checkpoint()
+                                                                .checkpoint_id()
+                                                                .get(),
+                                                        ),
+                                                        AuthorityStateRoot::from_local_state_root(
+                                                            transition.old_node_value,
+                                                        ),
+                                                    )?;
+                                                let coordinator_pipeline_store = Arc::new(
+                                                    ScyllaPendingPipelineStore::prepare(
+                                                        Arc::clone(&session),
+                                                        control.clone(),
+                                                    )
+                                                    .await?,
+                                                );
+                                                let coordinator_baseline = current_pipeline(
+                                                    coordinator_pipeline_store
+                                                        .bootstrap(
+                                                            &PendingPipelineBootstrap::try_new(
+                                                                coordinator_key,
+                                                                coordinator_activation,
+                                                                coordinator_prefix,
+                                                                PendingGenerationBootstrapReason::LegacyActivation,
+                                                                predecessor,
+                                                                processing,
+                                                                coordinator_frontier,
+                                                                predecessor_pending.get(),
+                                                            )?,
+                                                        )
+                                                        .await?,
+                                                )?;
+                                                let coordinator_future =
+                                                    ReservedPendingGeneration::qualification_from_prefix(
+                                                        coordinator_pending + 1,
+                                                        coordinator_prefix,
+                                                    )?;
+                                                let coordinator_ready_pipeline = current_pipeline(
+                                                    coordinator_pipeline_store
+                                                        .apply(
+                                                            &coordinator_baseline
+                                                                .seal_rotation(
+                                                                    coordinator_future,
+                                                                )?,
+                                                        )
+                                                        .await?,
+                                                )?;
+                                                ensure!(
+                                                    coordinator_ready_pipeline.processing()
+                                                        == processing,
+                                                );
+                                                let coordinator_close =
+                                                    PendingQueueCloseIntentDigest::try_new(
+                                                        [0xD7; 32],
+                                                    )?;
+                                                let coordinator_sealing = current_pipeline(
+                                                    coordinator_pipeline_store
+                                                        .apply(
+                                                            &coordinator_ready_pipeline
+                                                                .seal_begin_queue_close(
+                                                                    coordinator_close,
+                                                                )?,
+                                                        )
+                                                        .await?,
+                                                )?;
+                                                let coordinator_capture =
+                                                    PendingQueueCaptureContext::try_new(
+                                                        coordinator_key,
+                                                        coordinator_activation,
+                                                        processing,
+                                                    )?;
+                                                ensure!(
+                                                    coordinator_sealing.processing()
+                                                        == coordinator_capture.processing(),
+                                                );
+
+                                                let coordinator_nats_base = format!(
+                                                    "{}_coordinator_durable",
+                                                    fixture::KEYSPACE,
+                                                );
+                                                let coordinator_nats = Arc::new(
+                                                    NatsJetStreamClient::new_connection(
+                                                        coordinator_nats_base.clone(),
+                                                        nats_urls.clone(),
+                                                        PullConfig::default(),
+                                                        PullConfig::default(),
+                                                        StreamConfig {
+                                                            num_replicas: 3,
+                                                            ..Default::default()
+                                                        },
+                                                    )
+                                                    .await?,
+                                                );
+                                                let coordinator_segment =
+                                                    RecoverableNatsStreamSegment::try_new(
+                                                        coordinator_nats_base,
+                                                        coordinator_key,
+                                                        RecoverableNatsSegmentId::try_new(1)?,
+                                                        retention()?,
+                                                    )?;
+                                                let validated = coordinator_segment
+                                                    .validate_stream_config_structure(
+                                                        &coordinator_segment.stream_config(),
+                                                    )?;
+                                                let coordinator_ledger_bootstrap =
+                                                    PendingQueueSegmentLedgerBootstrap::try_new(
+                                                        coordinator_key,
+                                                        &validated,
+                                                        coordinator_generation_budget()?,
+                                                        1,
+                                                    )?;
+                                                let coordinator_ledger_key =
+                                                    coordinator_ledger_bootstrap
+                                                        .candidate()
+                                                        .key()
+                                                        .clone();
+                                                let coordinator_ledger = Arc::new(
+                                                    ScyllaPendingQueueSegmentLedgerStore::prepare(
+                                                        Arc::clone(&session),
+                                                        control.clone(),
+                                                    )
+                                                    .await?,
+                                                );
+                                                coordinator_ledger
+                                                    .bootstrap(
+                                                        &coordinator_ledger_bootstrap,
+                                                    )
+                                                    .await?;
+                                                let coordinator_sidecar_ready =
+                                                    ScyllaPendingQueueSidecarSetupGate::authorize(
+                                                        Arc::clone(&session),
+                                                        PendingQueueSidecarKeyspaces::try_new(
+                                                            fixture::KEYSPACE,
+                                                            fixture::control_keyspace(),
+                                                        )?,
+                                                        AuthorityScope::Coordinator,
+                                                    )
+                                                    .await?;
+                                                let coordinator_provision =
+                                                    ScyllaPendingQueueStreamProvisionStore::prepare_authorized(
+                                                        Arc::clone(&session),
+                                                        &coordinator_sidecar_ready,
+                                                        Arc::clone(&coordinator_ledger),
+                                                    )
+                                                    .await?;
+                                                coordinator_provision
+                                                    .provision(
+                                                        &coordinator_nats,
+                                                        &coordinator_ledger_key,
+                                                        coordinator_segment.clone(),
+                                                    )
+                                                    .await?;
+                                                let coordinator_assignment =
+                                                    coordinator_ledger
+                                                        .reserve_generation(
+                                                            &coordinator_ledger_key,
+                                                            coordinator_capture,
+                                                        )
+                                                        .await?;
+                                                let coordinator_publisher = Arc::new(
+                                                    coordinator_nats
+                                                        .recoverable_pending_publisher(
+                                                            coordinator_segment.clone(),
+                                                        )
+                                                        .await?,
+                                                );
+                                                let coordinator_publish_store =
+                                                    ScyllaPendingQueuePublishStore::prepare(
+                                                        Arc::clone(&session),
+                                                        coordinator_publisher,
+                                                        coordinator_segment.clone(),
+                                                        PendingQueuePublishKeyspaces::new(
+                                                            control.clone(),
+                                                            PendingQueuePublishDataKeyspace::try_new(
+                                                                fixture::KEYSPACE,
+                                                            )?,
+                                                        ),
+                                                    )
+                                                    .await?;
+                                                for kind in [
+                                                    PendingQueuePublisherKind::CoordinatorRegistration,
+                                                    PendingQueuePublisherKind::CoordinatorDeploy,
+                                                    PendingQueuePublisherKind::CoordinatorGuta,
+                                                ] {
+                                                    coordinator_publish_store
+                                                        .bootstrap_source(
+                                                            &coordinator_assignment,
+                                                            kind,
+                                                        )
+                                                        .await?;
+                                                }
+                                                let guta_slot = coordinator_publish_store
+                                                    .materialize_data(
+                                                        &coordinator_assignment,
+                                                        PendingQueuePublisherKind::CoordinatorGuta,
+                                                        PendingQueuePublishIntentId::try_new(
+                                                            [0xD8; 32],
+                                                        )?,
+                                                        &first_queue_item,
+                                                    )
+                                                    .await?;
+                                                let guta_publish = coordinator_publish_store
+                                                    .bind_materialized(
+                                                        &coordinator_assignment,
+                                                        PendingQueuePublisherKind::CoordinatorGuta,
+                                                        guta_slot,
+                                                    )
+                                                    .await?;
+                                                coordinator_publish_store
+                                                    .publish_and_commit(
+                                                        &coordinator_assignment,
+                                                        guta_publish,
+                                                    )
+                                                    .await?;
+                                                let coordinator_close_receipt =
+                                                    coordinator_pipeline_store
+                                                        .read_queue_close_exact::<PHash>(
+                                                            coordinator_capture,
+                                                        )
+                                                        .await?;
+                                                for (marker, kind) in [
+                                                    (
+                                                        0xD9,
+                                                        PendingQueuePublisherKind::CoordinatorRegistration,
+                                                    ),
+                                                    (
+                                                        0xDA,
+                                                        PendingQueuePublisherKind::CoordinatorDeploy,
+                                                    ),
+                                                    (
+                                                        0xDB,
+                                                        PendingQueuePublisherKind::CoordinatorGuta,
+                                                    ),
+                                                ] {
+                                                    let seal_slot = coordinator_publish_store
+                                                        .materialize_seal::<PHash>(
+                                                            &coordinator_pipeline_store,
+                                                            &coordinator_assignment,
+                                                            kind,
+                                                            PendingQueuePublishIntentId::try_new(
+                                                                [marker; 32],
+                                                            )?,
+                                                            &coordinator_close_receipt,
+                                                        )
+                                                        .await?;
+                                                    let seal = coordinator_publish_store
+                                                        .bind_materialized(
+                                                            &coordinator_assignment,
+                                                            kind,
+                                                            seal_slot,
+                                                        )
+                                                        .await?;
+                                                    coordinator_publish_store
+                                                        .publish_and_commit(
+                                                            &coordinator_assignment,
+                                                            seal,
+                                                        )
+                                                        .await?;
+                                                }
+                                                ensure!(
+                                                    stream_messages(
+                                                        &jetstream,
+                                                        coordinator_segment.stream_name(),
+                                                    )
+                                                    .await?
+                                                        == 4,
+                                                );
+
+                                                let capture_factory = coordinator_core
+                                                    .prepare_coordinator_processor_durable_capture_factory(
+                                                        network,
+                                                        Arc::clone(&coordinator_nats),
+                                                    )
+                                                    .await?;
+                                                let mut capture_owner =
+                                                    CoordinatorBranchExactProcessorOwner::install(
+                                                        Arc::clone(&capture_factory),
+                                                        network,
+                                                        capture_factory
+                                                            .writer_activation_digest(),
+                                                        capture_factory
+                                                            .queue_readiness_digest(),
+                                                        [0xDC; 32],
+                                                    )?;
+                                                let captured = {
+                                                    let mut iteration =
+                                                        capture_owner.begin_iteration();
+                                                    let mut capture =
+                                                        iteration.open_capture().await?;
+                                                    capture
+                                                        .capture_or_replay()
+                                                        .await?
+                                                        .ok_or_else(|| anyhow::anyhow!(
+                                                            "Coordinator three-source capture did not close",
+                                                        ))?
+                                                };
+                                                ensure!(captured.total_items() == 1);
+                                                drop(capture_owner);
+
+                                                let replay_factory = coordinator_core
+                                                    .prepare_coordinator_processor_durable_capture_factory(
+                                                        network,
+                                                        Arc::clone(&coordinator_nats),
+                                                    )
+                                                    .await?;
+                                                let mut replay_owner =
+                                                    CoordinatorBranchExactProcessorOwner::install(
+                                                        Arc::clone(&replay_factory),
+                                                        network,
+                                                        replay_factory
+                                                            .writer_activation_digest(),
+                                                        replay_factory
+                                                            .queue_readiness_digest(),
+                                                        [0xDD; 32],
+                                                    )?;
+                                                let replayed = {
+                                                    let mut iteration =
+                                                        replay_owner.begin_iteration();
+                                                    let mut capture =
+                                                        iteration.open_capture().await?;
+                                                    capture
+                                                        .capture_or_replay()
+                                                        .await?
+                                                        .ok_or_else(|| anyhow::anyhow!(
+                                                            "Coordinator durable replay disappeared after ACK",
+                                                        ))?
+                                                };
+                                                ensure!(
+                                                    captured.digest() == replayed.digest()
+                                                        && captured.context()
+                                                            == replayed.context()
+                                                        && captured.total_items()
+                                                            == replayed.total_items(),
+                                                );
+                                                coordinator_durable_replay_after_ack = true;
+                                                let actor_trace =
+                                                    run_qualification_coordinator_durable_actors(
+                                                        durable_submissions.clone(),
+                                                        Arc::clone(&restarted_cache),
+                                                        coordinator_context,
+                                                        &qualification_checkpoint_leaves,
+                                                        guta_circuit_whitelist,
+                                                        u32::try_from(
+                                                            transition
+                                                                .node_index
+                                                                .to_u64_value(),
+                                                        )?,
+                                                        transition.old_node_value,
+                                                        transition.new_node_value,
+                                                        captured,
+                                                        replayed,
+                                                    )
+                                                    .await
+                                                    .context(
+                                                        "c4d3b2b2b4c2b durable three-source actors",
+                                                    )?;
+                                                coordinator_durable_generation_digest =
+                                                    actor_trace.generation_digest;
+                                                coordinator_durable_registration_items =
+                                                    actor_trace.registration_items;
+                                                coordinator_durable_deploy_items =
+                                                    actor_trace.deploy_items;
+                                                coordinator_durable_guta_items =
+                                                    actor_trace.guta_items;
+                                                coordinator_durable_actor_retry_bit_exact =
+                                                    actor_trace
+                                                        .same_generation_retry_bit_exact;
+                                                coordinator_durable_actor_revisions = [
+                                                    actor_trace.registration_actor_revision,
+                                                    actor_trace.deploy_actor_revision,
+                                                    actor_trace.guta_actor_revision,
+                                                ];
+                                                coordinator_durable_guta_root_transition_exact =
+                                                    actor_trace
+                                                        .guta_root_transition_exact;
+                                                coordinator_durable_capture_rf3 = true;
+                                                coordinator_durable_during_one_replica_offline =
+                                                    true;
+                                                coordinator_durable_after_nats_leader_failover =
+                                                    leader_before != leader_after;
+                                            }
                                         }
                                         coordinator_real_redis_process_restart = true;
                                         recovered
@@ -6162,30 +7056,43 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         replica.row_count(
             &control,
             "branch_exact_pending_queue_publish_source_v1",
-        )? == if exercise_deferred_actor_archive { 2 } else { 1 }
+        )? == (if exercise_deferred_actor_archive { 2 } else { 1 })
+            + if exercise_coordinator_durable_processor {
+                3
+            } else {
+                0
+            }
     );
     ensure!(
         replica.row_count(
             &control,
             "branch_exact_pending_queue_publish_intent_v1",
-        )? == if exercise_deferred_actor_archive {
+        )? == (if exercise_deferred_actor_archive {
             8
         } else if exercise_durable_replay {
             4
         } else {
             3
+        }) + if exercise_coordinator_durable_processor {
+            4
+        } else {
+            0
         }
     );
     ensure!(
         replica.row_count(
             &control,
             "branch_exact_pending_queue_publish_prepared_v1",
-        )? == if exercise_deferred_actor_archive {
+        )? == (if exercise_deferred_actor_archive {
             8
         } else if exercise_durable_replay {
             4
         } else {
             3
+        }) + if exercise_coordinator_durable_processor {
+            4
+        } else {
+            0
         }
     );
     ensure!(
@@ -6198,7 +7105,12 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         replica.row_count(
             fixture::KEYSPACE,
             "branch_exact_pending_queue_publish_payload_fragment_v1",
-        )? == if exercise_deferred_actor_archive { 6 } else { 3 }
+        )? == (if exercise_deferred_actor_archive { 6 } else { 3 })
+            + if exercise_coordinator_durable_processor {
+                1
+            } else {
+                0
+            }
     );
     if exercise_application_handoff {
         ensure!(
@@ -6415,7 +7327,19 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         coordinator_gatherer_total_inputs,
         coordinator_gatherer_duplicate_collapsed,
         coordinator_gatherer_root_transition_exact,
-        mixed_version_clean_boundary_required: exercise_coordinator_handler,
+        coordinator_durable_capture_rf3,
+        coordinator_durable_replay_after_ack,
+        coordinator_durable_generation_digest,
+        coordinator_durable_registration_items,
+        coordinator_durable_deploy_items,
+        coordinator_durable_guta_items,
+        coordinator_durable_actor_retry_bit_exact,
+        coordinator_durable_actor_revisions,
+        coordinator_durable_guta_root_transition_exact,
+        coordinator_durable_during_one_replica_offline,
+        coordinator_durable_after_nats_leader_failover,
+        coordinator_legacy_consumer_clean_boundary,
+        mixed_version_clean_boundary_required: exercise_coordinator_durable_processor,
         mixed_version_overlap_supported: false,
         production_coordinator_handler_rf3: exercise_coordinator_handler,
         production_coordinator_processor_rf3: false,
@@ -6456,7 +7380,9 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         full_node_restart_tested: false,
         production_serving: false,
         h8_domains_closed: 0,
-        qualification: if exercise_coordinator_gatherer {
+        qualification: if exercise_coordinator_durable_processor {
+            "H23C4D3B2B2B4C2B_COORDINATOR_DURABLE_PROCESSOR_RF3_PASSED"
+        } else if exercise_coordinator_gatherer {
             "H23C4D3B2B2B3_COORDINATOR_GATHERER_RF3_PASSED"
         } else if exercise_coordinator_redis_restart {
             "H23C4D3B2B2B2_COORDINATOR_REDIS_RESTART_RF3_PASSED"

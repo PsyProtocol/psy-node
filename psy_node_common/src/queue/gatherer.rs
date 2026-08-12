@@ -720,6 +720,19 @@ impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase + 'static, Output:
             .map_err(|_| GathererPauseError::ResponseChannelClosed)?
     }
 
+    /// RF=3 qualification-only entry into the exact Coordinator command used
+    /// by the real Processor. Ordinary builds expose neither this method nor
+    /// a way to forge its storage-owned captured source.
+    #[cfg(feature = "rf3-test-support")]
+    pub async fn qualification_apply_coordinator_durable_source(
+        &self,
+        generation_digest: CoordinatorProcessorDurableGenerationDigest,
+        source: CoordinatorProcessorDurableCapturedSource,
+    ) -> Result<CoordinatorDurableTreeGathererApplyReceipt, GathererPauseError> {
+        self.apply_coordinator_durable_source(generation_digest, source)
+            .await
+    }
+
     pub(crate) async fn finalize_coordinator_durable_source(
         &self,
         receipt: CoordinatorDurableTreeGathererApplyReceipt,
@@ -735,6 +748,17 @@ impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase + 'static, Output:
         response_rx
             .await
             .map_err(|_| GathererPauseError::ResponseChannelClosed)?
+    }
+
+    /// RF=3 qualification-only entry into the same cached Coordinator
+    /// finalize command used by the real Processor. The returned value is an
+    /// inert in-process receipt and cannot advance durable storage.
+    #[cfg(feature = "rf3-test-support")]
+    pub async fn qualification_finalize_coordinator_durable_source(
+        &self,
+        receipt: CoordinatorDurableTreeGathererApplyReceipt,
+    ) -> Result<CoordinatorDurableTreeGathererFinalizeReceipt<Output>, GathererPauseError> {
+        self.finalize_coordinator_durable_source(receipt).await
     }
 
     /// Apply one complete, exhaustive durable generation to the tentative

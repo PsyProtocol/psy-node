@@ -17,12 +17,15 @@ EXERCISE_COORDINATOR_RPC="${PSY_D04B6H23C4D3B1_RF3:-0}"
 EXERCISE_COORDINATOR_HANDLER_PREFIX="${PSY_D04B6H23C4D3B2B2B1_RF3:-0}"
 EXERCISE_COORDINATOR_REDIS_RESTART="${PSY_D04B6H23C4D3B2B2B2_RF3:-0}"
 EXERCISE_COORDINATOR_GATHERER="${PSY_D04B6H23C4D3B2B2B3_RF3:-0}"
+EXERCISE_COORDINATOR_DURABLE_PROCESSOR="${PSY_D04B6H23C4D3B2B2B4C2B_RF3:-0}"
 EXERCISE_COORDINATOR_HANDLER="${EXERCISE_COORDINATOR_HANDLER_PREFIX}"
-if [[ "${EXERCISE_COORDINATOR_REDIS_RESTART}" == "1" || "${EXERCISE_COORDINATOR_GATHERER}" == "1" ]]; then
+if [[ "${EXERCISE_COORDINATOR_REDIS_RESTART}" == "1" || "${EXERCISE_COORDINATOR_GATHERER}" == "1" || "${EXERCISE_COORDINATOR_DURABLE_PROCESSOR}" == "1" ]]; then
   EXERCISE_COORDINATOR_HANDLER=1
 fi
 EXPECTED_QUALIFICATION="H23C4C2B4E3_JTMB_HANDLER_INGRESS_RF3_PASSED"
-if [[ "${EXERCISE_COORDINATOR_GATHERER}" == "1" ]]; then
+if [[ "${EXERCISE_COORDINATOR_DURABLE_PROCESSOR}" == "1" ]]; then
+  EXPECTED_QUALIFICATION="H23C4D3B2B2B4C2B_COORDINATOR_DURABLE_PROCESSOR_RF3_PASSED"
+elif [[ "${EXERCISE_COORDINATOR_GATHERER}" == "1" ]]; then
   EXPECTED_QUALIFICATION="H23C4D3B2B2B3_COORDINATOR_GATHERER_RF3_PASSED"
 elif [[ "${EXERCISE_COORDINATOR_REDIS_RESTART}" == "1" ]]; then
   EXPECTED_QUALIFICATION="H23C4D3B2B2B2_COORDINATOR_REDIS_RESTART_RF3_PASSED"
@@ -145,6 +148,7 @@ PSY_D04B6H23C4D3B1_RF3="${EXERCISE_COORDINATOR_RPC}" \
 PSY_D04B6H23C4D3B2B2B1_RF3="${EXERCISE_COORDINATOR_HANDLER_PREFIX}" \
 PSY_D04B6H23C4D3B2B2B2_RF3="${EXERCISE_COORDINATOR_REDIS_RESTART}" \
 PSY_D04B6H23C4D3B2B2B3_RF3="${EXERCISE_COORDINATOR_GATHERER}" \
+PSY_D04B6H23C4D3B2B2B4C2B_RF3="${EXERCISE_COORDINATOR_DURABLE_PROCESSOR}" \
 PSY_D04B6H23C4C2B4E3_COMPOSE_FILE="${COMPOSE_FILE}" \
 PSY_D04B6H23C4C2B4E3_REPORT_PATH="${REPORT_PATH}" \
 PSY_D04B6H23C4C2B4E3_NATS_URLS="nats://127.0.0.1:45322,nats://127.0.0.1:45323,nats://127.0.0.1:45324" \
@@ -169,7 +173,8 @@ jq -e \
   --argjson exercise_coordinator_rpc "${EXERCISE_COORDINATOR_RPC}" \
   --argjson exercise_coordinator_handler "${EXERCISE_COORDINATOR_HANDLER}" \
   --argjson exercise_coordinator_redis_restart "${EXERCISE_COORDINATOR_REDIS_RESTART}" \
-  --argjson exercise_coordinator_gatherer "${EXERCISE_COORDINATOR_GATHERER}" '
+  --argjson exercise_coordinator_gatherer "${EXERCISE_COORDINATOR_GATHERER}" \
+  --argjson exercise_coordinator_durable_processor "${EXERCISE_COORDINATOR_DURABLE_PROCESSOR}" '
   .qualification == $expected_qualification
   and .scylla_replication_factor == 3
   and .configured_nats_servers == 3
@@ -278,6 +283,19 @@ jq -e \
           and .coordinator_gatherer_total_inputs == (if $exercise_coordinator_gatherer == 1 then 1 else 0 end)
           and .coordinator_gatherer_duplicate_collapsed == ($exercise_coordinator_gatherer == 1)
           and .coordinator_gatherer_root_transition_exact == ($exercise_coordinator_gatherer == 1)
+          and .coordinator_durable_capture_rf3 == ($exercise_coordinator_durable_processor == 1)
+          and .coordinator_durable_replay_after_ack == ($exercise_coordinator_durable_processor == 1)
+          and .coordinator_durable_generation_digest == (if $exercise_coordinator_durable_processor == 1 then .coordinator_durable_generation_digest else "" end)
+          and (if $exercise_coordinator_durable_processor == 1 then (.coordinator_durable_generation_digest | test("^[0-9a-f]{64}$")) else true end)
+          and .coordinator_durable_registration_items == 0
+          and .coordinator_durable_deploy_items == 0
+          and .coordinator_durable_guta_items == (if $exercise_coordinator_durable_processor == 1 then 1 else 0 end)
+          and .coordinator_durable_actor_retry_bit_exact == ($exercise_coordinator_durable_processor == 1)
+          and .coordinator_durable_actor_revisions == (if $exercise_coordinator_durable_processor == 1 then [2, 2, 2] else [0, 0, 0] end)
+          and .coordinator_durable_guta_root_transition_exact == ($exercise_coordinator_durable_processor == 1)
+          and .coordinator_durable_during_one_replica_offline == ($exercise_coordinator_durable_processor == 1)
+          and .coordinator_durable_after_nats_leader_failover == ($exercise_coordinator_durable_processor == 1)
+          and .coordinator_legacy_consumer_clean_boundary == ($exercise_coordinator_durable_processor == 1)
           and .mixed_version_clean_boundary_required == true
           and .mixed_version_overlap_supported == false
         else
@@ -296,6 +314,18 @@ jq -e \
           and .coordinator_gatherer_total_inputs == 0
           and .coordinator_gatherer_duplicate_collapsed == false
           and .coordinator_gatherer_root_transition_exact == false
+          and .coordinator_durable_capture_rf3 == false
+          and .coordinator_durable_replay_after_ack == false
+          and .coordinator_durable_generation_digest == ""
+          and .coordinator_durable_registration_items == 0
+          and .coordinator_durable_deploy_items == 0
+          and .coordinator_durable_guta_items == 0
+          and .coordinator_durable_actor_retry_bit_exact == false
+          and .coordinator_durable_actor_revisions == [0, 0, 0]
+          and .coordinator_durable_guta_root_transition_exact == false
+          and .coordinator_durable_during_one_replica_offline == false
+          and .coordinator_durable_after_nats_leader_failover == false
+          and .coordinator_legacy_consumer_clean_boundary == false
           and .mixed_version_clean_boundary_required == false
           and .mixed_version_overlap_supported == false
         end
