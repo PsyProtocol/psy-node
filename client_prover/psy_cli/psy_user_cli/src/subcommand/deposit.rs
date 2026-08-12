@@ -59,7 +59,6 @@ use crate::result::{CommandResult, L1TransactionResult, L1TransactionStatus};
 
 const BRIDGE_USER_ID_U64: u64 = 524288;
 const DEPOSIT_TREE_CONTRACT_ID: u32 = 2;
-const CONTRACT_STATE_TREE_HEIGHT: u8 = 32;
 const DEPOSIT_TREE_CHAIN_COUNTS_SUBSLOT_BASE: u64 = 8 + (8192 * 8);
 
 fn resolve_shield_address(args: &DepositArgs) -> anyhow::Result<String> {
@@ -291,7 +290,7 @@ async fn fetch_deposit_tree_next_index(provider: &RpcProvider, checkpoint_id: u6
             checkpoint_id,
             BRIDGE_USER_ID_U64,
             DEPOSIT_TREE_CONTRACT_ID,
-            CONTRACT_STATE_TREE_HEIGHT,
+            psy_config::network_constants::DEPOSIT_TREE_CONTRACT_STATE_TREE_HEIGHT,
             leaf_index,
         )
         .await?;

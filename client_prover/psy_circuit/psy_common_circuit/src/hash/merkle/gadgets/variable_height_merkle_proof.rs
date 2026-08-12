@@ -45,6 +45,9 @@ impl VariableHeightMerkleProofGadget {
             Some(v) => v,
             None => builder.add_virtual_target(),
         };
+        let max_height_target = builder.constant(F::from_canonical_usize(max_height));
+        builder.ensure_is_less_than_or_equal(8, height, max_height_target);
+        builder.assert_non_zero(height);
 
         let root = Self::compute_root::<H, F, D>(builder, index, value, &siblings, height);
 
@@ -75,6 +78,8 @@ impl VariableHeightMerkleProofGadget {
             Some(v) => v,
             None => builder.add_virtual_target(),
         };
+        let max_height_target = builder.constant(F::from_canonical_usize(max_height));
+        builder.ensure_is_less_than_or_equal(8, height, max_height_target);
         let zero_target = builder.zero();
         builder.ensure_not_equal(height, zero_target);
 

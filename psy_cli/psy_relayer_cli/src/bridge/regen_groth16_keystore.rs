@@ -70,7 +70,10 @@ const WITHDRAWAL_TREE_HEIGHT: usize = 32;
 const CHECKPOINT_TREE_HEIGHT: usize = PsyNetworkLocalDevnetConstants::CHECKPOINT_TREE_HEIGHT_USIZE;
 const GLOBAL_USER_TREE_HEIGHT: usize = PsyNetworkLocalDevnetConstants::GLOBAL_USER_TREE_HEIGHT_USIZE;
 const GLOBAL_CONTRACT_TREE_HEIGHT: usize = PsyNetworkLocalDevnetConstants::GLOBAL_CONTRACT_TREE_HEIGHT_USIZE;
-const CONTRACT_STATE_TREE_HEIGHT: usize = PsyNetworkLocalDevnetConstants::MAX_CONTRACT_STATE_TREE_HEIGHT_USIZE;
+const DEPOSIT_CONTRACT_STATE_TREE_HEIGHT: usize =
+    psy_config::network_constants::DEPOSIT_TREE_CONTRACT_STATE_TREE_HEIGHT as usize;
+const WITHDRAWAL_CONTRACT_STATE_TREE_HEIGHT: usize =
+    psy_config::network_constants::WITHDRAWAL_TREE_CONTRACT_STATE_TREE_HEIGHT as usize;
 const GROTH16_FILES: [&str; 3] = ["circuit_groth16.bin", "pk_groth16.bin", "vk_groth16.bin"];
 
 #[derive(Debug, Clone, Args)]
@@ -398,7 +401,8 @@ fn regenerate_bridge_agg(keystore_dir: &Path) -> anyhow::Result<()> {
         CHECKPOINT_TREE_HEIGHT,
         GLOBAL_USER_TREE_HEIGHT,
         GLOBAL_CONTRACT_TREE_HEIGHT,
-        CONTRACT_STATE_TREE_HEIGHT,
+        DEPOSIT_CONTRACT_STATE_TREE_HEIGHT,
+        WITHDRAWAL_CONTRACT_STATE_TREE_HEIGHT,
     ).context("failed to generate bridge aggregation final proof")?;
 
     println!(
@@ -698,16 +702,16 @@ fn bridge_state_witnesses() -> anyhow::Result<(
     let mut deposit_leaves = HashMap::new();
     deposit_leaves.insert(0, deposit_slot0);
     deposit_leaves.insert(1, deposit_slot1);
-    let deposit_slot0_proof = sparse_merkle_proof(&deposit_leaves, 0, CONTRACT_STATE_TREE_HEIGHT);
-    let deposit_slot1_proof = sparse_merkle_proof(&deposit_leaves, 1, CONTRACT_STATE_TREE_HEIGHT);
+    let deposit_slot0_proof = sparse_merkle_proof(&deposit_leaves, 0, DEPOSIT_CONTRACT_STATE_TREE_HEIGHT);
+    let deposit_slot1_proof = sparse_merkle_proof(&deposit_leaves, 1, DEPOSIT_CONTRACT_STATE_TREE_HEIGHT);
     let deposit_state_root = deposit_slot0_proof.root;
     anyhow::ensure!(deposit_slot1_proof.root == deposit_state_root, "deposit state roots mismatch");
 
     let mut withdrawal_leaves = HashMap::new();
     withdrawal_leaves.insert(0, withdrawal_slot0);
     withdrawal_leaves.insert(1, withdrawal_slot1);
-    let withdrawal_slot0_proof = sparse_merkle_proof(&withdrawal_leaves, 0, CONTRACT_STATE_TREE_HEIGHT);
-    let withdrawal_slot1_proof = sparse_merkle_proof(&withdrawal_leaves, 1, CONTRACT_STATE_TREE_HEIGHT);
+    let withdrawal_slot0_proof = sparse_merkle_proof(&withdrawal_leaves, 0, WITHDRAWAL_CONTRACT_STATE_TREE_HEIGHT);
+    let withdrawal_slot1_proof = sparse_merkle_proof(&withdrawal_leaves, 1, WITHDRAWAL_CONTRACT_STATE_TREE_HEIGHT);
     let withdrawal_state_root = withdrawal_slot0_proof.root;
     anyhow::ensure!(withdrawal_slot1_proof.root == withdrawal_state_root, "withdrawal state roots mismatch");
 

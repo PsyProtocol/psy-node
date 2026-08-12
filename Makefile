@@ -134,6 +134,8 @@ export-solidity-verifier-deposit:
 export-solidity-verifier-withdrawal:
 	${BIN_PREFIX}/psy_relayer_cli export-solidity-verifier ${keystore}/withdrawal_claim ./psy-contracts/src/WithdrawalClaimVerifier.sol
 
+export-all-solidity-verifier: export-solidity-verifier export-solidity-verifier-deposit export-solidity-verifier-withdrawal
+
 BRIDGE_TO_CHECKPOINT ?= 10
 BRIDGE_FROM_CHECKPOINT ?= 1
 BRIDGE_PROOF_JSON ?= /tmp/bridge_batch_$(BRIDGE_TO_CHECKPOINT).json

@@ -256,7 +256,12 @@ impl<
         // TODO: make this actually work in the db
         let mut contract_heights_to_fetch = Vec::new();
         for &contract_id in contract_ids {
-            if !self.contract_state_tree_height_cache.mapping.contains_key(&contract_id) {
+            let cached_height = self
+                .contract_state_tree_height_cache
+                .mapping
+                .get(&contract_id)
+                .map(|entry| entry.value().0);
+            if cached_height.is_none() || cached_height == Some(0) {
                 contract_heights_to_fetch.push(contract_id as u64);
             }
         }
@@ -268,10 +273,15 @@ impl<
                 .get_contract_tree_heights(MAX_CHECKPOINT_ID, &contract_heights_to_fetch)
                 .await?;
 
-            height.iter().zip(contract_heights_to_fetch.iter()).for_each(|(&height, &contract_id)| {
+            for (&height, &contract_id) in height.iter().zip(contract_heights_to_fetch.iter()) {
+                anyhow::ensure!(
+                    height > 0,
+                    "contract {} state tree height metadata is not available in Realm DB yet",
+                    contract_id
+                );
                 self.contract_state_tree_height_cache
                     .add_contract(contract_id as u32, height, N::HasherBase::get_zero_hash(height as usize));
-            });
+            }
         }
         Ok(())
     }
@@ -843,9 +853,9 @@ impl<
         checkpoint_id: u64,
         user_id: u64,
         contract_id: u32,
-        height: u8,
         leaf_id: u64,
     ) -> QRpcResult<N::QHash> {
+        let height = res(self.contract_state_tree_height(contract_id).await)?;
         res(self
             .db_reader
             .contract_state_tree_get_leaf_hash(checkpoint_id, user_id, contract_id as u64, height, leaf_id)
@@ -857,9 +867,17 @@ impl<
         checkpoint_id: u64,
         user_id: u64,
         contract_id: u32,
-        height: u8, // height is not used in the db call
         leaf_id: u64,
     ) -> QRpcResult<MerkleProofCore<N::QHash>> {
+        let height = res(self.contract_state_tree_height(contract_id).await)?;
+        tracing::warn!(
+            checkpoint_id,
+            user_id,
+            contract_id,
+            height,
+            leaf_id,
+            "[CONTRACT_HEIGHT_DEBUG] serving user contract state proof"
+        );
         res(self
             .db_reader
             .contract_state_tree_get_merkle_proof(checkpoint_id, user_id, contract_id as u64, height, leaf_id)

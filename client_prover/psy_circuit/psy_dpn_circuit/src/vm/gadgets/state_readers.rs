@@ -19,9 +19,11 @@ use psy_common_circuit::{
         delta_merkle_proof::DeltaMerkleProofGadget,
         historical_root_merkle_proof::HistoricalRootMerkleProofGadget,
         imt_contract_state_update::{is_qhashout_lt, IMTLeafTargets},
+        merkle_array_gen::enforce_merkle_array_values_2_bit,
         merkle_proof::MerkleProofGadget,
         sub_slot_delta_merkle_proof_batch::SubSlotDeltaMerkleProofBatchGadget,
         sub_slot_merkle_proof_batch::SubSlotMerkleProofBatchGadget,
+        variable_height_merkle_proof::VariableHeightMerkleProofGadget,
     },
     traits::{CreatableTarget, ToTargets},
 };
@@ -81,19 +83,19 @@ pub struct IMTReadGadget {
 #[derive(Clone, Debug)]
 pub struct IMTExternalReadGadget {
     pub contract_tree_proof: MerkleProofGadget,
-    pub state_slot_proof: MerkleProofGadget,
+    pub state_slot_proof: VariableHeightMerkleProofGadget,
     pub leaf: IMTLeafTargets,
 }
 
 #[derive(Clone, Debug)]
 pub struct IMTOtherUserReadGadget {
-    pub state_slot_proof: MerkleProofGadget,
+    pub state_slot_proof: VariableHeightMerkleProofGadget,
     pub leaf: IMTLeafTargets,
 }
 
 #[derive(Clone, Debug)]
 pub struct IMTContainsOtherUserGadget {
-    pub state_slot_proof: MerkleProofGadget,
+    pub state_slot_proof: VariableHeightMerkleProofGadget,
     pub leaf: IMTLeafTargets,
     pub exists: Target,
 }
@@ -115,6 +117,7 @@ pub enum StateReaderReferenceKeyType {
     IMTExternalRead = 11,
     IMTOtherUserRead = 12,
     IMTContainsOtherUser = 13,
+    VariableHeightMerkleProof = 14,
 }
 impl StateReaderReferenceKeyType {
     pub fn to_u8(&self) -> u8 {
@@ -145,6 +148,7 @@ impl TryFrom<u8> for StateReaderReferenceKeyType {
             11 => Ok(StateReaderReferenceKeyType::IMTExternalRead),
             12 => Ok(StateReaderReferenceKeyType::IMTOtherUserRead),
             13 => Ok(StateReaderReferenceKeyType::IMTContainsOtherUser),
+            14 => Ok(StateReaderReferenceKeyType::VariableHeightMerkleProof),
             _ => Err(anyhow::format_err!("Invalid StateReaderReferenceKeyType value: {}", value)),
         }
     }
@@ -165,6 +169,12 @@ impl StateReaderReferenceKey {
     pub fn new_delta_merkle_proof_key(index: usize) -> Self {
         Self {
             gadget_type: StateReaderReferenceKeyType::DeltaMerkleProof,
+            gadget_index: index,
+        }
+    }
+    pub fn new_variable_height_merkle_proof_key(index: usize) -> Self {
+        Self {
+            gadget_type: StateReaderReferenceKeyType::VariableHeightMerkleProof,
             gadget_index: index,
         }
     }
@@ -643,6 +653,7 @@ impl StateCommandCacheKey {
 #[derive(Clone, Debug)]
 pub struct StateReaderGadget {
     pub merkle_proofs: Vec<MerkleProofGadget>,
+    pub variable_height_merkle_proofs: Vec<VariableHeightMerkleProofGadget>,
     pub delta_merkle_proofs: Vec<DeltaMerkleProofGadget>,
     pub user_leaves: Vec<PsyUserLeafGadget>,
     pub checkpoint_stats_requests: Vec<PsyCheckpointLeafStatsGadget>,
@@ -700,6 +711,7 @@ impl StateReaderGadget {
     ) -> Self {
         Self {
             merkle_proofs: vec![],
+            variable_height_merkle_proofs: vec![],
             delta_merkle_proofs: vec![],
             user_leaves: vec![],
             checkpoint_stats_requests: vec![],
@@ -771,6 +783,64 @@ impl StateReaderGadget {
         let g = MerkleProofGadget::add_virtual_to::<H, F, D>(builder, height);
         self.insert_merkle_proof_gadget(key, g);
         (true, self.merkle_proofs.last().unwrap())
+    }
+
+    pub fn resolve_or_insert_variable_height_merkle_proof_gadget<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
+        &mut self,
+        builder: &mut CircuitBuilder<F, D>,
+        key: StateCommandCacheKey,
+        height: Target,
+    ) -> (bool, &VariableHeightMerkleProofGadget) {
+        if self.gadget_map.contains_key(&key) {
+            let value = self.gadget_map[&key];
+            if value.gadget_type == StateReaderReferenceKeyType::VariableHeightMerkleProof {
+                return (false, &self.variable_height_merkle_proofs[value.gadget_index]);
+            }
+        }
+        let gadget = VariableHeightMerkleProofGadget::add_virtual_to_full::<H, F, D>(builder, 32, Some(height));
+        let ref_key = StateReaderReferenceKey::new_variable_height_merkle_proof_key(self.variable_height_merkle_proofs.len());
+        self.variable_height_merkle_proofs.push(gadget);
+        self.gadget_map.insert(key, ref_key);
+        (true, self.variable_height_merkle_proofs.last().unwrap())
+    }
+
+    fn add_variable_height_merkle_proof_batch<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
+        builder: &mut CircuitBuilder<F, D>,
+        height: Target,
+        sub_slot_index: Target,
+        length: usize,
+        force_four_align: bool,
+    ) -> (Vec<Target>, Vec<VariableHeightMerkleProofGadget>) {
+        let (start_slot_index, sub_slot_index_mod_4) = builder.div_rem4(sub_slot_index);
+        let proof_count = (length + 6) / 4;
+        let mut proofs: Vec<VariableHeightMerkleProofGadget> = Vec::with_capacity(proof_count);
+        let one = builder.one();
+        for proof_index in 0..proof_count {
+            let proof = VariableHeightMerkleProofGadget::add_virtual_to_full::<H, F, D>(builder, 32, Some(height));
+            let expected_index = if proof_index == 0 {
+                start_slot_index
+            } else {
+                builder.add(proofs[proof_index - 1].index, one)
+            };
+            builder.connect(proof.index, expected_index);
+            if proof_index > 0 {
+                builder.connect_hashes(proof.root, proofs[0].root);
+            }
+            proofs.push(proof);
+        }
+
+        let proof_values = proofs.iter().map(|proof| proof.value).collect::<Vec<_>>();
+        let values = if force_four_align {
+            builder.assert_zero(sub_slot_index_mod_4);
+            proof_values
+                .iter()
+                .flat_map(|value| value.elements)
+                .take(length)
+                .collect()
+        } else {
+            enforce_merkle_array_values_2_bit(builder, sub_slot_index_mod_4, length, &proof_values)
+        };
+        (values, proofs)
     }
 
     pub fn resolve_delta_merkle_proof_gadget(&self, key: &StateCommandCacheKey) -> Option<&DeltaMerkleProofGadget> {
@@ -965,13 +1035,13 @@ impl StateReaderGadget {
         dpn: &SimpleDPNBuilder<F, D>,
         contract_target_id: u64,
         slot_target_id: u64,
-        contract_state_tree_height: usize,
+        contract_state_tree_height: Target,
     ) -> HashOutTarget {
         let contract_state_tree_ck =
             StateCommandCacheKey::new_read_self_user_external_contract_slot(contract_target_id, slot_target_id, self.contract_call_epoch);
         let (is_new_contract_state_tree, mp_cst_value, mp_cst_root, mp_cst_index) = {
             let (is_new_contract_state_tree, mp_cst) =
-                self.resolve_or_insert_merkle_proof_gadget::<H, F, D>(builder, contract_state_tree_ck, contract_state_tree_height as usize);
+                self.resolve_or_insert_variable_height_merkle_proof_gadget::<H, F, D>(builder, contract_state_tree_ck, contract_state_tree_height);
             (is_new_contract_state_tree, mp_cst.value, mp_cst.root, mp_cst.index)
         };
 
@@ -1055,14 +1125,15 @@ impl StateReaderGadget {
         user_target_id: u64,
         contract_target_id: u64,
         slot_target_id: u64,
-        contract_state_tree_height: usize,
+        contract_state_tree_height: Target,
     ) -> HashOutTarget {
         let expected_contract_state_tree_root =
             { self.get_other_user_contract_state_root::<H, F, D>(builder, dpn, user_target_id, contract_target_id) };
 
         let cst_ck = StateCommandCacheKey::new_read_other_user_contract_slot(user_target_id, contract_target_id, slot_target_id);
 
-        let (is_new, mp_cst) = self.resolve_or_insert_merkle_proof_gadget::<H, F, D>(builder, cst_ck, contract_state_tree_height);
+        let (is_new, mp_cst) =
+            self.resolve_or_insert_variable_height_merkle_proof_gadget::<H, F, D>(builder, cst_ck, contract_state_tree_height);
 
         if is_new {
             let expected_contract_id = dpn.resolve_target(slot_target_id);
@@ -1081,7 +1152,7 @@ impl StateReaderGadget {
         user_target_id: u64,
         contract_target_id: u64,
         sub_slot_target_id: u64,
-        contract_state_tree_height: usize,
+        contract_state_tree_height: Target,
         length: usize,
     ) -> Vec<Target> {
         let expected_contract_state_tree_root =
@@ -1093,16 +1164,13 @@ impl StateReaderGadget {
             self.result_map.get(&r_ck).unwrap().to_owned()
         } else {
             let sub_slot_index = dpn.resolve_target(sub_slot_target_id);
-            let (values, mps) = {
-                let gadget = SubSlotMerkleProofBatchGadget::add_virtual_to::<H, F, D>(
-                    builder,
-                    contract_state_tree_height,
-                    length as usize,
-                    sub_slot_index,
-                    self.force_four_align,
-                );
-                (gadget.values, gadget.merkle_proof_gadgets)
-            };
+            let (values, mps) = Self::add_variable_height_merkle_proof_batch::<H, F, D>(
+                builder,
+                contract_state_tree_height,
+                sub_slot_index,
+                length,
+                self.force_four_align,
+            );
             builder.connect_hashes(mps[0].root, expected_contract_state_tree_root);
             for (i, mp) in mps.into_iter().enumerate() {
                 let ck = StateCommandCacheKey::new_read_other_user_contract_range(
@@ -1112,7 +1180,9 @@ impl StateReaderGadget {
                     length as u32,
                     i as u64,
                 );
-                let _ref_key = self.insert_merkle_proof_gadget(ck, mp);
+                let ref_key = StateReaderReferenceKey::new_variable_height_merkle_proof_key(self.variable_height_merkle_proofs.len());
+                self.variable_height_merkle_proofs.push(mp);
+                self.gadget_map.insert(ck, ref_key);
             }
             self.result_map.insert(r_ck, values.clone());
             values
@@ -1125,13 +1195,14 @@ impl StateReaderGadget {
         dpn: &SimpleDPNBuilder<F, D>,
         contract_target_id: u64,
         sub_slot_target_id: u64,
-        contract_state_tree_height: usize,
+        contract_state_tree_height: Target,
     ) -> Target {
         let ck = StateCommandCacheKey::new_read_self_user_external_contract_single(contract_target_id, sub_slot_target_id, self.contract_call_epoch);
 
         let expected_contract_state_tree_root = self.get_self_user_external_contract_root::<H, F, D>(builder, dpn, contract_target_id);
 
-        let (is_new, mp_cst) = self.resolve_or_insert_merkle_proof_gadget::<H, F, D>(builder, ck, contract_state_tree_height);
+        let (is_new, mp_cst) =
+            self.resolve_or_insert_variable_height_merkle_proof_gadget::<H, F, D>(builder, ck, contract_state_tree_height);
 
         if is_new {
             let sub_slot_index = dpn.resolve_target(sub_slot_target_id);
@@ -1152,7 +1223,7 @@ impl StateReaderGadget {
         dpn: &SimpleDPNBuilder<F, D>,
         contract_target_id: u64,
         sub_slot_target_id: u64,
-        contract_state_tree_height: usize,
+        contract_state_tree_height: Target,
         length: usize,
     ) -> Vec<Target> {
         let r_ck = StateCommandCacheKey::new_read_self_user_external_contract_range(
@@ -1169,16 +1240,13 @@ impl StateReaderGadget {
             let expected_contract_state_tree_root = self.get_self_user_external_contract_root::<H, F, D>(builder, dpn, contract_target_id);
 
             let sub_slot_index = dpn.resolve_target(sub_slot_target_id);
-            let (values, mps) = {
-                let gadget = SubSlotMerkleProofBatchGadget::add_virtual_to::<H, F, D>(
-                    builder,
-                    contract_state_tree_height,
-                    length,
-                    sub_slot_index,
-                    self.force_four_align,
-                );
-                (gadget.values, gadget.merkle_proof_gadgets)
-            };
+            let (values, mps) = Self::add_variable_height_merkle_proof_batch::<H, F, D>(
+                builder,
+                contract_state_tree_height,
+                sub_slot_index,
+                length,
+                self.force_four_align,
+            );
 
             builder.connect_hashes(mps[0].root, expected_contract_state_tree_root);
             for (i, mp) in mps.into_iter().enumerate() {
@@ -1189,7 +1257,9 @@ impl StateReaderGadget {
                     self.contract_call_epoch,
                     i as u64,
                 );
-                let _ref_key = self.insert_merkle_proof_gadget(ck, mp);
+                let ref_key = StateReaderReferenceKey::new_variable_height_merkle_proof_key(self.variable_height_merkle_proofs.len());
+                self.variable_height_merkle_proofs.push(mp);
+                self.gadget_map.insert(ck, ref_key);
             }
 
             self.result_map.insert(r_ck, values.clone());
@@ -1371,8 +1441,13 @@ impl StateReaderGadget {
 
                 let contract_state_tree_ck = StateCommandCacheKey::new_read_self_user_external_contract_slot(c.contract_id, c.slot_index, call_epoch);
 
+                let contract_state_tree_height = dpn.resolve_target(c.contract_state_tree_height);
                 let (is_new_contract_state_tree, mp_cst) =
-                    self.resolve_or_insert_merkle_proof_gadget::<H, F, D>(builder, contract_state_tree_ck, c.contract_state_tree_height as usize);
+                    self.resolve_or_insert_variable_height_merkle_proof_gadget::<H, F, D>(
+                        builder,
+                        contract_state_tree_ck,
+                        contract_state_tree_height,
+                    );
 
                 let slot_value = mp_cst.value.elements.to_vec();
                 if is_new_contract_state_tree {
@@ -1390,7 +1465,7 @@ impl StateReaderGadget {
                     dpn,
                     c.contract_id,
                     c.sub_slot_index,
-                    c.contract_state_tree_height as usize,
+                    dpn.resolve_target(c.contract_state_tree_height),
                 );
                 vec![single_value]
             }
@@ -1399,7 +1474,7 @@ impl StateReaderGadget {
                 dpn,
                 c.contract_id,
                 c.sub_slot_index,
-                c.contract_state_tree_height as usize,
+                dpn.resolve_target(c.contract_state_tree_height),
                 c.length as usize,
             ),
             DPNStateCmd::GetOtherUserContractStateSlotSingle(c) => {
@@ -1407,7 +1482,9 @@ impl StateReaderGadget {
 
                 let expected_contract_state_tree_root = self.get_other_user_contract_state_root::<H, F, D>(builder, dpn, c.user_id, c.contract_id);
 
-                let (is_new, mp_cst) = self.resolve_or_insert_merkle_proof_gadget::<H, F, D>(builder, ck, c.contract_state_tree_height as usize);
+                let contract_state_tree_height = dpn.resolve_target(c.contract_state_tree_height);
+                let (is_new, mp_cst) =
+                    self.resolve_or_insert_variable_height_merkle_proof_gadget::<H, F, D>(builder, ck, contract_state_tree_height);
 
                 if is_new {
                     let sub_slot_index = dpn.resolve_target(c.sub_slot_index);
@@ -1427,7 +1504,7 @@ impl StateReaderGadget {
                 c.user_id,
                 c.contract_id,
                 c.sub_slot_index,
-                c.contract_state_tree_height as usize,
+                dpn.resolve_target(c.contract_state_tree_height),
                 c.length as usize,
             ),
             DPNStateCmd::GetOtherUserContractStateSlotHash(c) => self
@@ -1437,7 +1514,7 @@ impl StateReaderGadget {
                     c.user_id,
                     c.contract_id,
                     c.slot_index,
-                    c.contract_state_tree_height as usize,
+                    dpn.resolve_target(c.contract_state_tree_height),
                 )
                 .elements
                 .to_vec(),
@@ -2112,7 +2189,8 @@ impl StateReaderGadget {
                 if let Some(existing_result) = self.result_map.get(&imt_ck) {
                     existing_result.clone()
                 } else {
-                    let state_slot_proof = MerkleProofGadget::add_virtual_to::<H, F, D>(builder, c.contract_state_tree_height as usize);
+                    let height = dpn.resolve_target(c.contract_state_tree_height);
+                    let state_slot_proof = VariableHeightMerkleProofGadget::add_virtual_to_full::<H, F, D>(builder, 32, Some(height));
                     let leaf = IMTLeafTargets::add_virtual_to(builder);
                     let query_key = HashOutTarget {
                         elements: [
@@ -2148,7 +2226,8 @@ impl StateReaderGadget {
                 if let Some(existing_result) = self.result_map.get(&imt_ck) {
                     existing_result.clone()
                 } else {
-                    let state_slot_proof = MerkleProofGadget::add_virtual_to::<H, F, D>(builder, c.contract_state_tree_height as usize);
+                    let height = dpn.resolve_target(c.contract_state_tree_height);
+                    let state_slot_proof = VariableHeightMerkleProofGadget::add_virtual_to_full::<H, F, D>(builder, 32, Some(height));
                     let leaf = IMTLeafTargets::add_virtual_to(builder);
                     let query_key = HashOutTarget {
                         elements: [
@@ -2184,7 +2263,8 @@ impl StateReaderGadget {
                 if let Some(existing_result) = self.result_map.get(&imt_ck) {
                     existing_result.clone()
                 } else {
-                    let state_slot_proof = MerkleProofGadget::add_virtual_to::<H, F, D>(builder, c.contract_state_tree_height as usize);
+                    let height = dpn.resolve_target(c.contract_state_tree_height);
+                    let state_slot_proof = VariableHeightMerkleProofGadget::add_virtual_to_full::<H, F, D>(builder, 32, Some(height));
                     let leaf = IMTLeafTargets::add_virtual_to(builder);
                     let exists = builder.add_virtual_bool_target_safe();
 

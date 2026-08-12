@@ -207,10 +207,13 @@ impl MerkleProofGadget {
             witness.set_hash_target(self.value, value.0)?;
         }
         if !self.option_flags.contains(MerkleProofGadgetOptionFlags::siblings) {
+            anyhow::ensure!(
+                siblings.len() == self.siblings.len(),
+                "merkle proof siblings length mismatch: expected_height={} actual_siblings_len={}",
+                self.siblings.len(),
+                siblings.len()
+            );
             for (i, sibling) in self.siblings.iter().enumerate() {
-                if i >= siblings.len() {
-                    panic!("siblings len is not equal to height");
-                }
                 witness.set_hash_target(*sibling, siblings[i].0)?;
             }
         }

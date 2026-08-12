@@ -167,7 +167,7 @@ pub async fn run(args: PrivateClaimArgs) -> anyhow::Result<CommandResult> {
         let local = PrivateNoteInclusionCircuit::<C, D>::new(
             psy_config::network_constants::GLOBAL_USER_TREE_HEIGHT as usize,
             psy_config::network_constants::GLOBAL_CONTRACT_TREE_HEIGHT as usize,
-            psy_config::network_constants::MAX_CONTRACT_STATE_TREE_HEIGHT as usize,
+            psy_config::network_constants::TOKEN_CONTRACT_STATE_TREE_HEIGHT as usize,
             NOTE_TREE_HEIGHT,
         );
         let local_fingerprint = local.get_fingerprint();

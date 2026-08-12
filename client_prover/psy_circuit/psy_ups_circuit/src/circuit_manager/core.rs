@@ -30,7 +30,7 @@ use psy_common_circuit::{
     },
 };
 use psy_config::network_constants::{
-    GLOBAL_CONTRACT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT, MAX_CONTRACT_STATE_TREE_HEIGHT, PRIVATE_NOTE_TREE_HEIGHT,
+    GLOBAL_CONTRACT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT, PRIVATE_NOTE_TREE_HEIGHT, TOKEN_CONTRACT_STATE_TREE_HEIGHT,
     UPS_CIRCUIT_WHITELIST_TREE_HEIGHT, UPS_SESSION_PROOF_TREE_HEIGHT,
 };
 use psy_crypto::{
@@ -187,7 +187,7 @@ where
             PrivateNoteInclusionCircuit::<C, D>::new(
                 GLOBAL_USER_TREE_HEIGHT as usize,
                 GLOBAL_CONTRACT_TREE_HEIGHT as usize,
-                MAX_CONTRACT_STATE_TREE_HEIGHT as usize,
+                TOKEN_CONTRACT_STATE_TREE_HEIGHT as usize,
                 PRIVATE_NOTE_TREE_HEIGHT,
             )
         })

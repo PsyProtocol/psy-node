@@ -30,7 +30,7 @@ use psy_common_circuit::{
 };
 use psy_config::network_constants::{
     DEFAULT_CALLER_CONTRACT_ID_U64, GLOBAL_CONTRACT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT, MAX_CONTRACT_STATE_TREE_HEIGHT, PRIVATE_NOTE_TREE_HEIGHT,
-    UPS_SESSION_PROOF_TREE_HEIGHT,
+    TOKEN_CONTRACT_STATE_TREE_HEIGHT, UPS_SESSION_PROOF_TREE_HEIGHT,
 };
 use psy_crypto::{
     hash::traits::qhashable::QFieldHashable,
@@ -257,7 +257,7 @@ impl FallbackMinifierCircuits {
             PrivateNoteInclusionCircuit::<C, D>::new(
                 GLOBAL_USER_TREE_HEIGHT as usize,
                 GLOBAL_CONTRACT_TREE_HEIGHT as usize,
-                MAX_CONTRACT_STATE_TREE_HEIGHT as usize,
+                TOKEN_CONTRACT_STATE_TREE_HEIGHT as usize,
                 PRIVATE_NOTE_TREE_HEIGHT,
             )
         })
@@ -327,7 +327,7 @@ fn load_or_build_local_circuit<T>(
 const PRIVATE_NOTE_INCLUSION_HEIGHTS: (usize, usize, usize, usize) = (
     GLOBAL_USER_TREE_HEIGHT as usize,
     GLOBAL_CONTRACT_TREE_HEIGHT as usize,
-    MAX_CONTRACT_STATE_TREE_HEIGHT as usize,
+    TOKEN_CONTRACT_STATE_TREE_HEIGHT as usize,
     PRIVATE_NOTE_TREE_HEIGHT,
 );
 

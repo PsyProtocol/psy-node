@@ -78,7 +78,6 @@ LEAF_CHECKPOINT_ID       := ${CHECKPOINT_ID}
 USER_ID                  := 0
 CONTRACT_ID              := 0
 SLOT_ID                  := 0
-CONTRACT_STATE_HEIGHT    := 32
 REALM_ID                 := 0
 REGISTRATION_ID          := 1
 STRATEGY                 := 5
@@ -143,16 +142,16 @@ register-random-user:
 deploy-contract:
 	@echo "Deploying contracts..."
 	@echo "USER0 deploying token contract..."
-	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) deploy-contract --private-key=${USER0_PRIVATE_KEY} --contract-path ${PWD}/token.json --is-deploy
+	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) deploy-contract --private-key=${USER0_PRIVATE_KEY} --contract-path ${PWD}/token.json --abi-path ${PWD}/token.abi.json --is-deploy
 	@echo "USER1 deploying token contract..."
-	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) deploy-contract --private-key=${USER1_PRIVATE_KEY} --contract-path ${PWD}/token.json --is-deploy
+	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) deploy-contract --private-key=${USER1_PRIVATE_KEY} --contract-path ${PWD}/token.json --abi-path ${PWD}/token.abi.json --is-deploy
 
 get-deploy-contract-cmd:
 	@echo "Deploying contracts..."
 	@echo "USER0 deploying token contract..."
-	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) deploy-contract --private-key=${USER0_PRIVATE_KEY} --contract-path ${PWD}/token.json --output-path ./genesis_contracts.json
+	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) deploy-contract --private-key=${USER0_PRIVATE_KEY} --contract-path ${PWD}/token.json --abi-path ${PWD}/token.abi.json --output-path ./genesis_contracts.json
 	@echo "USER1 deploying token contract..."
-	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) deploy-contract --private-key=${USER1_PRIVATE_KEY} --contract-path ${PWD}/token.json --output-path ./genesis_contracts.json
+	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) deploy-contract --private-key=${USER1_PRIVATE_KEY} --contract-path ${PWD}/token.json --abi-path ${PWD}/token.abi.json --output-path ./genesis_contracts.json
 
 multi-contract-call:
 	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) call -p ${USER0_PRIVATE_KEY} --contract-id ${CONTRACT_ID}
@@ -194,7 +193,7 @@ withdraw:
 
 # Unified RPC commands using psy_user_cli automatic routing
 get-slot-value:
-	@RUST_LOG=error $(USER_CLI) get-user-contract-state-tree-merkle-proof --checkpoint-id ${CHECKPOINT_ID} --user-id ${USER_ID} --contract-id ${CONTRACT_ID} --height ${CONTRACT_STATE_HEIGHT} --leaf-id ${SLOT_ID} | jq '.value' | tr -d '"'
+	@RUST_LOG=error $(USER_CLI) get-user-contract-state-tree-merkle-proof --checkpoint-id ${CHECKPOINT_ID} --user-id ${USER_ID} --contract-id ${CONTRACT_ID} --leaf-id ${SLOT_ID} | jq '.value' | tr -d '"'
 
 # Metadata RPC commands
 get-contract-leaf-data:
@@ -266,7 +265,7 @@ get-user-contract-tree-merkle-proof:
 	@$(USER_CLI) get-user-contract-tree-merkle-proof --checkpoint-id ${CHECKPOINT_ID} --user-id ${USER_ID} --contract-id ${CONTRACT_ID}
 
 get-user-contract-state-tree-merkle-proof:
-	@$(USER_CLI) get-user-contract-state-tree-merkle-proof --checkpoint-id ${CHECKPOINT_ID} --user-id ${USER_ID} --contract-id ${CONTRACT_ID} --height ${CONTRACT_STATE_HEIGHT} --leaf-id ${SLOT_ID}
+	@$(USER_CLI) get-user-contract-state-tree-merkle-proof --checkpoint-id ${CHECKPOINT_ID} --user-id ${USER_ID} --contract-id ${CONTRACT_ID} --leaf-id ${SLOT_ID}
 
 get-psy-sdc-fingerprint:
 	@$(USER_CLI) get-psy-sdc-fingerprint --sdc-path ${SDC_PATH}

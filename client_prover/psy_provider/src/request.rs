@@ -653,7 +653,6 @@ pub struct QUserContractStateTreeLeafHashRPCRequest {
     pub checkpoint_id: u64,
     pub user_id: u64,
     pub contract_id: u32,
-    pub height: u8,
     pub leaf_id: u64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -663,7 +662,6 @@ pub struct QUserContractStateTreeLeafHashFRPCRequest<F: RichField> {
     pub checkpoint_id: F,
     pub user_id: F,
     pub contract_id: F,
-    pub height: u8,
     pub leaf_id: F,
 }
 
@@ -674,7 +672,6 @@ pub struct QUserContractStateTreeMerkleProofRPCRequest {
     pub checkpoint_id: u64,
     pub user_id: u64,
     pub contract_id: u32,
-    pub height: u8,
     pub leaf_id: u64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -684,7 +681,6 @@ pub struct QUserContractStateTreeMerkleProofFRPCRequest<F: RichField> {
     pub checkpoint_id: F,
     pub user_id: F,
     pub contract_id: F,
-    pub height: u8,
     pub leaf_id: F,
 }
 

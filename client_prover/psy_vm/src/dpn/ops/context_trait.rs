@@ -355,6 +355,7 @@ pub trait DPNContext<F: ContextFelt>: Debug + Clone {
     fn get_user_id(&mut self) -> F;
     fn get_contract_id(&mut self) -> F;
     fn get_contract_deployer(&mut self, contract_id: F) -> [F; 4];
+    fn get_contract_state_tree_height(&mut self, contract_id: F) -> F;
     fn get_caller_contract_id(&mut self) -> F;
     fn get_checkpoint_id(&mut self) -> F;
     fn get_last_nonce(&mut self) -> F;
@@ -386,7 +387,7 @@ pub trait DPNContext<F: ContextFelt>: Debug + Clone {
     fn get_checkpoint_user_registration_tree_root(&mut self, checkpoint_id: F) -> [F; 4];
 
     // state operations
-    fn op_get_state_felt(&mut self, contract_state_tree_height: u16, contract_id: F, user_id: F, index: F) -> F;
+    fn op_get_state_felt(&mut self, contract_state_tree_height: F, contract_id: F, user_id: F, index: F) -> F;
     fn op_set_state_felt(&mut self, index: F, value: F) -> F;
     fn op_set_state_obj<T: ToFelts<F>>(&mut self, index: F, value: T) -> T;
     fn clear_entire_tree(&mut self) -> Vec<F>;

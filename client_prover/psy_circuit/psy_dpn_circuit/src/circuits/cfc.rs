@@ -116,7 +116,7 @@ where
         pw.set_hash_target(self.fn_builder_gadget.session_proof_tree_root, cfc_input.session_proof_tree_root.0)?;
 
         self.fn_builder_gadget.tx_ctx_header.set_witness(&mut pw, &cfc_input.tx_input_ctx)?;
-        self.fn_builder_gadget.state_reader.set_witness(&mut pw, cfc_input, &self.fn_def);
+        self.fn_builder_gadget.state_reader.set_witness(&mut pw, cfc_input, &self.fn_def)?;
 
         let base_proof = self.circuit_data.prove(pw)?;
         let minified_proof = self.minifier_chain.prove(&base_proof)?;

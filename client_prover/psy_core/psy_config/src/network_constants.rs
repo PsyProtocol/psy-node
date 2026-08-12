@@ -16,6 +16,13 @@ pub const CONTRACT_FUNCTION_TREE_HEIGHT: u8 = 16;
 pub const MAX_CONTRACT_STATE_TREE_HEIGHT: u8 = 32;
 pub const MINING_REWARDS_CONTRACT_ID: u64 = 1;
 pub const TOKEN_CONTRACT_ID: u32 = 0;
+/// Actual state-tree height of the native token contract. This must match
+/// contract 0 in genesis_contracts.json and all token-specific circuits.
+pub const TOKEN_CONTRACT_STATE_TREE_HEIGHT: u8 = 24;
+/// Actual state-tree height of the bridge deposit-tree contract (contract 2).
+pub const DEPOSIT_TREE_CONTRACT_STATE_TREE_HEIGHT: u8 = 21;
+/// Actual state-tree height of the bridge withdrawal-tree contract (contract 3).
+pub const WITHDRAWAL_TREE_CONTRACT_STATE_TREE_HEIGHT: u8 = 15;
 pub const TOKEN_SIMPLE_BURN_METHOD_ID: u32 = 2923993647;
 pub const USERS_PER_REALM: u64 = 1048576;
 

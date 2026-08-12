@@ -16,7 +16,7 @@ use psy_client_data::{
     traits::qdatastore::{qmetadata::QMetaDataStoreReaderSync, qtreedata::QTreeDataStoreReaderSync},
 };
 use psy_common_circuit::circuits::traits::qstandard::QStandardCircuit;
-use psy_config::network_constants::MAX_CONTRACT_STATE_TREE_HEIGHT;
+use psy_config::network_constants::DEPOSIT_TREE_CONTRACT_STATE_TREE_HEIGHT;
 use psy_crypto::{
     hash::{
         merkle::core::MerkleProofCore,
@@ -55,7 +55,6 @@ fn resolve_bridge_address(deployments_network: &str) -> anyhow::Result<String> {
 }
 const BRIDGE_USER_ID_U64: u64 = 524288;
 const DEPOSIT_TREE_CONTRACT_ID: u32 = 2;
-const CONTRACT_STATE_TREE_HEIGHT: u8 = 32;
 const DEPOSIT_TREE_CHAIN_COUNTS_SUBSLOT_BASE: u64 = 8 + (8192 * 8);
 
 fn read_single_felt_from_packed_leaf(leaf: QHashOut<GoldilocksField>, sub_slot_index: u64) -> anyhow::Result<u64> {
@@ -78,7 +77,7 @@ async fn fetch_deposit_tree_next_index(provider: &RpcProvider, checkpoint_id: u6
             checkpoint_id,
             BRIDGE_USER_ID_U64,
             DEPOSIT_TREE_CONTRACT_ID,
-            CONTRACT_STATE_TREE_HEIGHT,
+            DEPOSIT_TREE_CONTRACT_STATE_TREE_HEIGHT,
             leaf_index,
         )
         .await?;
@@ -638,7 +637,7 @@ mod tests {
         let mut pw = PartialWitness::new();
         let witness_values: Vec<F> = (0..42).map(|i| F::from_canonical_u64((i as u64) * 12345 + 999)).collect();
         for (target, val) in inputs.iter().zip(&witness_values) {
-            pw.set_target(*target, *val);
+            pw.set_target(*target, *val).unwrap();
         }
         let proof = data.prove(pw).unwrap();
 
