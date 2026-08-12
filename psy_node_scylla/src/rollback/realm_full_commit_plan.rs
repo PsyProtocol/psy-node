@@ -659,6 +659,60 @@ mod tests {
         )
     }
 
+    fn full_state_plan(
+        timestamp: CommitWriteTimestampUs,
+    ) -> (BranchExactWriterPrepared<Hash>, RealmFullCommitPhysicalPlan) {
+        let (prepared_state, graph, cursor_before) =
+            crate::rollback::realm_imt_predecessor_rf3_gate::qualification_state_fixture()
+                .unwrap();
+        let state = RealmPreparedStatePhysicalBatches::try_new::<
+            PF,
+            PHash,
+            PoseidonHasher,
+        >(&prepared_state, &graph, timestamp, &[cursor_before])
+        .unwrap();
+        let narrow_prepared = prepared_from_intent(
+            timestamp,
+            narrow_for(AuthorityScope::Realm {
+                realm_id: 1,
+                realm_sub_id: 2,
+            }),
+        );
+        let plan = RealmFullCommitPhysicalPlan::try_assemble_with_prepared_state(
+            &narrow_prepared,
+            remaining(&narrow_prepared),
+            state,
+        )
+        .unwrap();
+        (narrow_prepared, plan)
+    }
+
+    fn state_without_imt_plan(
+        timestamp: CommitWriteTimestampUs,
+    ) -> (BranchExactWriterPrepared<Hash>, RealmFullCommitPhysicalPlan) {
+        let (prepared_state, graph) = crate::rollback::realm_imt_predecessor_rf3_gate::qualification_state_fixture_without_imt().unwrap();
+        let state = RealmPreparedStatePhysicalBatches::try_new::<
+            PF,
+            PHash,
+            PoseidonHasher,
+        >(&prepared_state, &graph, timestamp, &[])
+        .unwrap();
+        let narrow_prepared = prepared_from_intent(
+            timestamp,
+            narrow_for(AuthorityScope::Realm {
+                realm_id: 1,
+                realm_sub_id: 2,
+            }),
+        );
+        let plan = RealmFullCommitPhysicalPlan::try_assemble_with_prepared_state(
+            &narrow_prepared,
+            remaining(&narrow_prepared),
+            state,
+        )
+        .unwrap();
+        (narrow_prepared, plan)
+    }
+
     #[test]
     fn real_registry_puts_and_narrow_intent_form_exact_no_state_plan() {
         let timestamp = CommitWriteTimestampUs::try_from_i128(10_000).unwrap();
@@ -809,6 +863,170 @@ mod tests {
         assert_eq!(plan.coverage().domains().len(), 19);
         assert_eq!(plan.coverage().total_mutation_count(), 30);
         assert_eq!(plan.remaining().len(), 14);
+    }
+
+    fn exact_observations(
+        schedule: &crate::rollback::realm_full_commit_execution::RealmFullCommitExecutionSchedule,
+    ) -> Vec<Option<crate::rollback::realm_full_commit_execution::RealmFullCommitObservedRow>> {
+        schedule
+            .rows()
+            .iter()
+            .map(|row| {
+                Some(
+                    crate::rollback::realm_full_commit_execution::RealmFullCommitObservedRow::new(
+                        row.physical_table(),
+                        row.locator().to_vec(),
+                        row.expected_value().to_vec(),
+                        row.timestamp().as_i64(),
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn full_plan_has_deterministic_exact_readback_schedule() {
+        use crate::rollback::realm_full_commit_execution::RealmFullCommitExecutionSchedule;
+
+        let timestamp = CommitWriteTimestampUs::try_from_i128(10_008).unwrap();
+        let (narrow, full) = full_state_plan(timestamp);
+        let schedule = RealmFullCommitExecutionSchedule::try_from_plan(&full, &narrow)
+            .unwrap();
+        assert_eq!(schedule.rows().len(), 25);
+        assert!(schedule.rows().windows(2).all(|pair| {
+            (pair[0].domain(), pair[0].physical_table(), pair[0].locator())
+                <= (pair[1].domain(), pair[1].physical_table(), pair[1].locator())
+        }));
+
+        let missing = vec![None; schedule.rows().len()];
+        assert_eq!(
+            schedule.preflight(&missing).unwrap().write_indices(),
+            (0..25).collect::<Vec<_>>(),
+        );
+        let exact = exact_observations(&schedule);
+        assert!(schedule.preflight(&exact).unwrap().write_indices().is_empty());
+        let verified = schedule.verify_after_write(&exact).unwrap();
+        assert_eq!(verified.row_count(), 25);
+        assert_eq!(verified.coverage_digest(), full.coverage().digest());
+        assert_eq!(verified.narrow_prepared_digest(), narrow.digest());
+        assert_ne!(verified.digest(), &[0; 32]);
+
+        let (narrow, no_imt) = state_without_imt_plan(timestamp);
+        assert_eq!(
+            RealmFullCommitExecutionSchedule::try_from_plan(&no_imt, &narrow)
+                .unwrap()
+                .rows()
+                .len(),
+            22,
+        );
+        let narrow = prepared(timestamp);
+        let no_state = assemble_test(&narrow, remaining(&narrow)).unwrap();
+        assert_eq!(
+            RealmFullCommitExecutionSchedule::try_from_plan(&no_state, &narrow)
+                .unwrap()
+                .rows()
+                .len(),
+            10,
+        );
+    }
+
+    #[test]
+    fn exact_reconciliation_separates_retry_from_conflict() {
+        use crate::rollback::realm_full_commit_execution::{
+            RealmFullCommitExecutionError, RealmFullCommitExecutionSchedule,
+            RealmFullCommitObservedRow,
+        };
+
+        let timestamp = CommitWriteTimestampUs::try_from_i128(10_009).unwrap();
+        let (narrow, full) = full_state_plan(timestamp);
+        let schedule = RealmFullCommitExecutionSchedule::try_from_plan(&full, &narrow)
+            .unwrap();
+        let first = &schedule.rows()[0];
+        let mut observed = exact_observations(&schedule);
+
+        observed[0] = Some(RealmFullCommitObservedRow::new(
+            first.physical_table(),
+            first.locator().to_vec(),
+            vec![0xAA],
+            timestamp.as_i64() - 1,
+        ));
+        assert_eq!(schedule.preflight(&observed).unwrap().write_indices(), &[0]);
+        assert_eq!(
+            schedule.verify_after_write(&observed),
+            Err(RealmFullCommitExecutionError::RetryRequired {
+                indices: vec![0],
+            }),
+        );
+
+        observed[0] = Some(RealmFullCommitObservedRow::new(
+            first.physical_table(),
+            first.locator().to_vec(),
+            vec![0xAA],
+            timestamp.as_i64(),
+        ));
+        assert_eq!(
+            schedule.verify_after_write(&observed),
+            Err(RealmFullCommitExecutionError::PhysicalValueConflict { index: 0 }),
+        );
+
+        observed[0] = Some(RealmFullCommitObservedRow::new(
+            first.physical_table(),
+            first.locator().to_vec(),
+            first.expected_value().to_vec(),
+            timestamp.as_i64() + 1,
+        ));
+        assert_eq!(
+            schedule.preflight(&observed),
+            Err(RealmFullCommitExecutionError::SealedTimestampSuperseded {
+                index: 0,
+                sealed: timestamp.as_i64(),
+                actual: timestamp.as_i64() + 1,
+            }),
+        );
+    }
+
+    #[test]
+    fn execution_schedule_rejects_foreign_narrow_and_malformed_observations() {
+        use crate::rollback::realm_full_commit_execution::{
+            RealmFullCommitExecutionError, RealmFullCommitExecutionSchedule,
+            RealmFullCommitObservedRow,
+        };
+
+        let timestamp = CommitWriteTimestampUs::try_from_i128(10_010).unwrap();
+        let (narrow, full) = full_state_plan(timestamp);
+        assert_eq!(
+            RealmFullCommitExecutionSchedule::try_from_plan(
+                &full,
+                &prepared(timestamp),
+            ),
+            Err(RealmFullCommitExecutionError::NarrowIdentityMismatch),
+        );
+
+        let schedule =
+            RealmFullCommitExecutionSchedule::try_from_plan(&full, &narrow)
+                .unwrap();
+        assert_eq!(
+            schedule.preflight(&[]),
+            Err(RealmFullCommitExecutionError::ObservationCountMismatch {
+                expected: schedule.rows().len(),
+                actual: 0,
+            }),
+        );
+
+        let first = &schedule.rows()[0];
+        let mut observed = exact_observations(&schedule);
+        observed[0] = Some(RealmFullCommitObservedRow::new(
+            first.physical_table(),
+            vec![0xFF],
+            first.expected_value().to_vec(),
+            first.timestamp().as_i64(),
+        ));
+        assert_eq!(
+            schedule.verify_after_write(&observed),
+            Err(RealmFullCommitExecutionError::ObservationIdentityMismatch {
+                index: 0,
+            }),
+        );
     }
 
     #[test]
