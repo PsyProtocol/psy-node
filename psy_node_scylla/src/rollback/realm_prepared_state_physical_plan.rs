@@ -16,6 +16,7 @@ use psy_node_core::store::{
         RealmImtMutationGraphDigest, RealmImtMutationGraphError,
         SealedRealmImtMutationGraph,
     },
+    realm_full_commit_write_set::RealmPreparedStateWriteSet,
     realm_normal_commit_coverage::{
         RealmNormalCommitCoveragePlan, RealmNormalCommitWriteDomain,
     },
@@ -42,6 +43,34 @@ pub(crate) struct RealmPreparedStatePhysicalBatches {
 }
 
 impl RealmPreparedStatePhysicalBatches {
+    /// Resolve a driver-independent state write set that was already bound to
+    /// one exact sealed mutation graph by the Processor layer.
+    pub(crate) fn try_from_write_set(
+        state: &RealmPreparedStateWriteSet,
+        timestamp: CommitWriteTimestampUs,
+    ) -> Result<Self, RealmPreparedStatePhysicalPlanError> {
+        let cursor_before = state
+            .cursor_before()
+            .iter()
+            .map(|cursor| {
+                ImtCursorSnapshot::new(
+                    cursor.tree(),
+                    cursor.tree_sub(),
+                    cursor.next_append_index(),
+                )
+            })
+            .collect::<Vec<_>>();
+        Self::from_verified_rows(
+            state.authority(),
+            state.coverage_plan(),
+            state.prepared_payload_commitment(),
+            state.mutation_graph_digest(),
+            state.rows(),
+            timestamp,
+            &cursor_before,
+        )
+    }
+
     pub(crate) fn try_new<F, Hash, Hasher>(
         prepared: &PsyPreparedRealmBlockStateUpdates<Hash>,
         graph: &SealedRealmImtMutationGraph<Hash, Hasher>,
@@ -58,6 +87,27 @@ impl RealmPreparedStatePhysicalBatches {
         }
 
         let rows = graph.expand_exact_prepared_rows::<F>(prepared)?;
+        Self::from_verified_rows(
+            graph.authority(),
+            coverage_plan,
+            rows.prepared_payload_commitment(),
+            graph.digest(),
+            &rows,
+            timestamp,
+            cursor_before,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_verified_rows(
+        authority: AuthorityScope,
+        coverage_plan: RealmNormalCommitCoveragePlan,
+        prepared_payload_commitment: RealmPreparedPayloadCommitment,
+        mutation_graph_digest: RealmImtMutationGraphDigest,
+        rows: &psy_node_core::store::realm_imt_mutation_graph::RealmPreparedStateRows,
+        timestamp: CommitWriteTimestampUs,
+        cursor_before: &[ImtCursorSnapshot],
+    ) -> Result<Self, RealmPreparedStatePhysicalPlanError> {
         let mut batches = vec![
             seal_batch(
                 RealmNormalCommitWriteDomain::UserLeaf,
@@ -120,10 +170,10 @@ impl RealmPreparedStatePhysicalBatches {
         }
 
         Ok(Self {
-            authority: graph.authority(),
+            authority,
             coverage_plan,
-            prepared_payload_commitment: rows.prepared_payload_commitment(),
-            mutation_graph_digest: graph.digest(),
+            prepared_payload_commitment,
+            mutation_graph_digest,
             timestamp,
             batches,
         })

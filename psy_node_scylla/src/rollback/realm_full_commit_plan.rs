@@ -19,6 +19,9 @@ use psy_node_core::store::{
         RealmCommitDomainMutationCommitment, RealmFullCommitCoverage,
         RealmFullCommitCoverageError, domain_id,
     },
+    realm_full_commit_write_set::{
+        RealmCommitLogicalDomainBatch, RealmFullCommitWriteSet,
+    },
     realm_normal_commit_coverage::{
         H22_BRANCH_EXACT_REALM_DOMAIN_SCOPE, RealmNormalCommitCoveragePlan,
         RealmNormalCommitWriteDomain,
@@ -27,14 +30,16 @@ use psy_node_core::store::{
     realm_imt_mutation_graph::RealmImtMutationGraphDigest,
     realm_prepared_payload::RealmPreparedPayloadCommitment,
     timestamp::CommitWriteTimestampUs,
+    typed::LogicalMutation,
 };
 use sha2::{Digest, Sha256};
 
 use super::{
     BranchExactWriterPrepared, ScyllaKeyDomain, ScyllaPhysicalTableId,
-    SealedTimestampedPut, TimestampedWriteKind,
+    SealedTimestampedPut, TimestampedMutationError, TimestampedWriteKind,
     expected_physical_table, key_domain_for,
     realm_prepared_state_physical_plan::RealmPreparedStatePhysicalBatches,
+    seal_commit_put_batch,
 };
 
 const NARROW_BATCH_DIGEST_DOMAIN: &[u8] =
@@ -108,6 +113,29 @@ pub(crate) struct RealmFullCommitPhysicalPlan {
 }
 
 impl RealmFullCommitPhysicalPlan {
+    /// Resolve the complete driver-independent Processor write set under the
+    /// exact timestamp and cutover identity owned by the durable narrow writer.
+    pub(crate) fn try_assemble_from_write_set<Hash: Q256BitHash>(
+        narrow: &BranchExactWriterPrepared<Hash>,
+        logical: &RealmFullCommitWriteSet,
+    ) -> Result<Self, RealmFullCommitPhysicalPlanError> {
+        let remaining = logical
+            .remaining()
+            .iter()
+            .map(|batch| seal_logical_batch(narrow, batch))
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(state) = logical.prepared_state() {
+            let state = RealmPreparedStatePhysicalBatches::try_from_write_set(
+                state,
+                narrow.timestamp(),
+            )
+            .map_err(|_| RealmFullCommitPhysicalPlanError::PreparedStateExpansion)?;
+            Self::try_assemble_with_prepared_state(narrow, remaining, state)
+        } else {
+            Self::try_assemble(logical.coverage_plan(), narrow, remaining)
+        }
+    }
+
     pub(crate) fn try_assemble<Hash: Q256BitHash>(
         coverage_plan: RealmNormalCommitCoveragePlan,
         narrow: &BranchExactWriterPrepared<Hash>,
@@ -191,6 +219,56 @@ impl RealmFullCommitPhysicalPlan {
     pub(crate) fn remaining(&self) -> &[RealmCommitPhysicalDomainBatch] {
         &self.remaining
     }
+}
+
+fn seal_logical_batch<Hash: Q256BitHash>(
+    narrow: &BranchExactWriterPrepared<Hash>,
+    batch: &RealmCommitLogicalDomainBatch,
+) -> Result<RealmCommitPhysicalDomainBatch, RealmFullCommitPhysicalPlanError> {
+    if batch.domain()
+        == RealmNormalCommitWriteDomain::GlobalUserTopProofAtCheckpoint
+    {
+        let [LogicalMutation::Put { key, value }] = batch.mutations() else {
+            return Err(
+                RealmFullCommitPhysicalPlanError::LogicalMutationPhysicalCardinality {
+                    domain: batch.domain(),
+                    actual: batch.mutations().len(),
+                },
+            );
+        };
+        return RealmCommitPhysicalDomainBatch::global_user_proof_after_cutover(
+            narrow,
+            key.clone(),
+            value.clone(),
+        )
+        .map_err(Into::into);
+    }
+
+    let expected_key_domain = key_domain_for(batch.domain());
+    let expected_table = expected_physical_table(batch.domain());
+    let mut puts = Vec::with_capacity(batch.mutations().len());
+    for mutation in batch.mutations() {
+        let sealed = seal_commit_put_batch(mutation.clone(), narrow.timestamp())?;
+        let selected = sealed
+            .members()
+            .iter()
+            .filter(|put| {
+                let mutation = put.resolved().mutation();
+                mutation.key_domain() == expected_key_domain
+                    && mutation.physical_table() == expected_table
+            })
+            .collect::<Vec<_>>();
+        if selected.len() != 1 {
+            return Err(
+                RealmFullCommitPhysicalPlanError::LogicalMutationPhysicalCardinality {
+                    domain: batch.domain(),
+                    actual: selected.len(),
+                },
+            );
+        }
+        puts.push(selected[0].clone());
+    }
+    Ok(RealmCommitPhysicalDomainBatch::new(batch.domain(), puts))
 }
 
 fn assemble<Hash: Q256BitHash>(
@@ -409,12 +487,24 @@ pub(crate) enum RealmFullCommitPhysicalPlanError {
         domain: RealmNormalCommitWriteDomain,
     },
     PreparedStateBatchesRequired,
+    PreparedStateExpansion,
     PreparedStateAuthorityMismatch,
     PreparedStateTimestampMismatch {
         expected: CommitWriteTimestampUs,
         actual: CommitWriteTimestampUs,
     },
+    LogicalMutationPhysicalCardinality {
+        domain: RealmNormalCommitWriteDomain,
+        actual: usize,
+    },
+    Timestamped(TimestampedMutationError),
     Coverage(RealmFullCommitCoverageError),
+}
+
+impl From<TimestampedMutationError> for RealmFullCommitPhysicalPlanError {
+    fn from(value: TimestampedMutationError) -> Self {
+        Self::Timestamped(value)
+    }
 }
 
 impl From<RealmFullCommitCoverageError> for RealmFullCommitPhysicalPlanError {
@@ -447,6 +537,10 @@ pub(crate) mod tests {
     };
     use psy_node_core::store::{
         branch_pending_mapping::BranchPendingMapping,
+        realm_full_commit_write_set::{
+            RealmCommitLogicalDomainBatch, RealmFullCommitWriteSet,
+            RealmImtCursorBeforeImage, RealmPreparedStateWriteSet,
+        },
         timestamp::{DeleteFenceTimestampUs, NewBranchWriteTimestampUs},
         typed::{
             CheckpointId, CheckpointRootKey, CheckpointedObjectKey,
@@ -547,9 +641,9 @@ pub(crate) mod tests {
         prepared_from_intent(timestamp, narrow())
     }
 
-    fn no_state_plan_for(
+    fn no_state_prepared_for(
         prepared: &BranchExactWriterPrepared<Hash>,
-    ) -> RealmNormalCommitCoveragePlan {
+    ) -> PsyPreparedRealmBlockStateUpdates<Hash> {
         let AuthorityScope::Realm {
             realm_id,
             realm_sub_id,
@@ -557,23 +651,27 @@ pub(crate) mod tests {
         else {
             panic!("qualification full plan requires Realm authority")
         };
-        RealmNormalCommitCoveragePlan::from_prepared(
-            &PsyPreparedRealmBlockStateUpdates::<Hash> {
-                realm_id: u64::from(realm_id),
-                realm_sub_id: u64::from(realm_sub_id),
-                unique_pending_id: prepared.intent().candidate().pending_id().get(),
-                proc_checkpoint_unique_id: parth_core::QCoreProcCheckpointUniqueId::from(
-                    prepared.intent().proc_checkpoint_id().as_u128(),
-                ),
-                old_realm_root: PHash::from_owned_32bytes([1; 32]),
-                new_realm_root: PHash::from_owned_32bytes([2; 32]),
-                update_global_user_tree_nodes_ffs: Vec::new(),
-                update_user_contract_tree_nodes_ffs: Vec::new(),
-                update_contract_state_tree_nodes_ffs: Vec::new(),
-                update_user_leaves_ffs: Vec::new(),
-                update_contract_state_imt_leaves_ffs: Vec::new(),
-            },
-        )
+        PsyPreparedRealmBlockStateUpdates::<Hash> {
+            realm_id: u64::from(realm_id),
+            realm_sub_id: u64::from(realm_sub_id),
+            unique_pending_id: prepared.intent().candidate().pending_id().get(),
+            proc_checkpoint_unique_id: parth_core::QCoreProcCheckpointUniqueId::from(
+                prepared.intent().proc_checkpoint_id().as_u128(),
+            ),
+            old_realm_root: PHash::from_owned_32bytes([1; 32]),
+            new_realm_root: PHash::from_owned_32bytes([2; 32]),
+            update_global_user_tree_nodes_ffs: Vec::new(),
+            update_user_contract_tree_nodes_ffs: Vec::new(),
+            update_contract_state_tree_nodes_ffs: Vec::new(),
+            update_user_leaves_ffs: Vec::new(),
+            update_contract_state_imt_leaves_ffs: Vec::new(),
+        }
+    }
+
+    fn no_state_plan_for(
+        prepared: &BranchExactWriterPrepared<Hash>,
+    ) -> RealmNormalCommitCoveragePlan {
+        RealmNormalCommitCoveragePlan::from_prepared(&no_state_prepared_for(prepared))
     }
 
     fn no_state_plan() -> RealmNormalCommitCoveragePlan {
@@ -680,6 +778,95 @@ pub(crate) mod tests {
                 TypedTableKey::LatestInfo(LatestInfoSlot::RealmAuthorityObservation),
                 MutationValue::PsyCanonicalBytes(realm_observation_bytes(checkpoint)),
                 timestamp,
+            ),
+        ]
+    }
+
+    fn logical_remaining() -> Vec<RealmCommitLogicalDomainBatch> {
+        use RealmNormalCommitWriteDomain as D;
+        let checkpoint = CheckpointId::try_new(12).unwrap();
+        let root = CheckpointRootKey::new(vec![0x44; 32]);
+        vec![
+            RealmCommitLogicalDomainBatch::new(
+                D::GlobalUserTopProofAtCheckpoint,
+                vec![LogicalMutation::Put {
+                    key: TypedTableKey::CheckpointedObject(
+                        CheckpointedObjectKey::GlobalUserProofAtCheckpoint(checkpoint),
+                    ),
+                    value: MutationValue::PsyCanonicalBytes(vec![1]),
+                }],
+            ),
+            RealmCommitLogicalDomainBatch::new(
+                D::CheckpointStateRoots,
+                vec![LogicalMutation::Put {
+                    key: TypedTableKey::CheckpointStateRoots(checkpoint),
+                    value: MutationValue::PsyCanonicalBytes(vec![2]),
+                }],
+            ),
+            RealmCommitLogicalDomainBatch::new(
+                D::CheckpointLeaf,
+                vec![LogicalMutation::Put {
+                    key: TypedTableKey::CheckpointLeaf(checkpoint),
+                    value: MutationValue::PsyCanonicalBytes(vec![3]),
+                }],
+            ),
+            RealmCommitLogicalDomainBatch::new(
+                D::GlobalCheckpointMerkle,
+                vec![LogicalMutation::Put {
+                    key: TypedTableKey::GlobalCheckpointMerkle {
+                        node: MerkleNode::new(1, NodeIndex::new(4)),
+                        checkpoint,
+                    },
+                    value: MutationValue::PsyCanonicalBytes(vec![4; 32]),
+                }],
+            ),
+            RealmCommitLogicalDomainBatch::new(
+                D::CheckpointRootByHash,
+                vec![LogicalMutation::CheckpointRootMapping {
+                    root: root.clone(),
+                    checkpoint,
+                }],
+            ),
+            RealmCommitLogicalDomainBatch::new(
+                D::CheckpointRootByCheckpoint,
+                vec![LogicalMutation::CheckpointRootMapping {
+                    root,
+                    checkpoint,
+                }],
+            ),
+            RealmCommitLogicalDomainBatch::new(
+                D::L2BlockState,
+                vec![LogicalMutation::Put {
+                    key: TypedTableKey::L2BlockState(checkpoint),
+                    value: MutationValue::PsyCanonicalBytes(vec![5]),
+                }],
+            ),
+            RealmCommitLogicalDomainBatch::new(
+                D::LatestCheckpoint,
+                vec![LogicalMutation::Put {
+                    key: TypedTableKey::U64Singleton(U64SingletonSlot::LatestCheckpoint),
+                    value: MutationValue::CqlU64(checkpoint.get()),
+                }],
+            ),
+            RealmCommitLogicalDomainBatch::new(
+                D::LatestL2BlockState,
+                vec![LogicalMutation::Put {
+                    key: TypedTableKey::LatestInfo(LatestInfoSlot::LatestL2BlockState),
+                    value: MutationValue::PsyCanonicalBytes(
+                        latest_l2_state_bytes(checkpoint),
+                    ),
+                }],
+            ),
+            RealmCommitLogicalDomainBatch::new(
+                D::RealmAuthorityObservation,
+                vec![LogicalMutation::Put {
+                    key: TypedTableKey::LatestInfo(
+                        LatestInfoSlot::RealmAuthorityObservation,
+                    ),
+                    value: MutationValue::PsyCanonicalBytes(
+                        realm_observation_bytes(checkpoint),
+                    ),
+                }],
             ),
         ]
     }
@@ -817,6 +1004,105 @@ pub(crate) mod tests {
         assert!(counts.contains(&(RealmNormalCommitWriteDomain::PendingToCheckpoint, 2)));
         assert!(counts.contains(&(RealmNormalCommitWriteDomain::CheckpointToPending, 2)));
         assert!(counts.contains(&(RealmNormalCommitWriteDomain::RewardsTopProofAtPending, 2)));
+    }
+
+    #[test]
+    fn processor_logical_write_set_resolves_to_the_same_complete_plan() {
+        let timestamp = CommitWriteTimestampUs::try_from_i128(10_008).unwrap();
+        let narrow_prepared = prepared(timestamp);
+        let prepared_state = no_state_prepared_for(&narrow_prepared);
+        let logical = RealmFullCommitWriteSet::try_new(
+            &prepared_state,
+            logical_remaining(),
+            None,
+        )
+        .unwrap();
+        let resolved = RealmFullCommitPhysicalPlan::try_assemble_from_write_set(
+            &narrow_prepared,
+            &logical,
+        )
+        .unwrap();
+        let direct = assemble_test(&narrow_prepared, remaining(&narrow_prepared)).unwrap();
+        assert_eq!(resolved, direct);
+
+        let wrong_domain = logical_remaining()
+            .into_iter()
+            .map(|batch| {
+                if batch.domain() == RealmNormalCommitWriteDomain::CheckpointLeaf {
+                    RealmCommitLogicalDomainBatch::new(
+                        batch.domain(),
+                        vec![LogicalMutation::Put {
+                            key: TypedTableKey::L2BlockState(
+                                CheckpointId::try_new(12).unwrap(),
+                            ),
+                            value: MutationValue::PsyCanonicalBytes(vec![3]),
+                        }],
+                    )
+                } else {
+                    batch
+                }
+            })
+            .collect();
+        let wrong_domain = RealmFullCommitWriteSet::try_new(
+            &prepared_state,
+            wrong_domain,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            RealmFullCommitPhysicalPlan::try_assemble_from_write_set(
+                &narrow_prepared,
+                &wrong_domain,
+            ),
+            Err(
+                RealmFullCommitPhysicalPlanError::LogicalMutationPhysicalCardinality {
+                    domain: RealmNormalCommitWriteDomain::CheckpointLeaf,
+                    actual: 0,
+                },
+            ),
+        );
+
+        let (prepared_state, graph, cursor_before) =
+            crate::rollback::realm_imt_predecessor_rf3_gate::qualification_state_fixture()
+                .unwrap();
+        let state = RealmPreparedStateWriteSet::try_from_verified::<
+            PF,
+            PHash,
+            PoseidonHasher,
+        >(
+            &prepared_state,
+            &graph,
+            vec![RealmImtCursorBeforeImage::new(
+                cursor_before.tree(),
+                cursor_before.tree_sub(),
+                cursor_before.next_append_index(),
+            )],
+        )
+        .unwrap();
+        let narrow_prepared = prepared_from_intent(
+            timestamp,
+            narrow_for(AuthorityScope::Realm {
+                realm_id: 1,
+                realm_sub_id: 2,
+            }),
+        );
+        let logical = RealmFullCommitWriteSet::try_new(
+            &prepared_state,
+            logical_remaining(),
+            Some(state),
+        )
+        .unwrap();
+        let resolved = RealmFullCommitPhysicalPlan::try_assemble_from_write_set(
+            &narrow_prepared,
+            &logical,
+        )
+        .unwrap();
+        assert_eq!(resolved.coverage().domains().len(), 22);
+        assert_eq!(
+            resolved.prepared_payload_commitment(),
+            Some(graph.prepared_payload_commitment()),
+        );
+        assert_eq!(resolved.mutation_graph_digest(), Some(graph.digest()));
     }
 
     #[test]

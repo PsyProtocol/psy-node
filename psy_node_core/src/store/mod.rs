@@ -17,6 +17,7 @@ pub mod realm_commit_evidence_assembly;
 pub mod realm_commit_seal;
 pub mod realm_manifest_evidence;
 pub mod realm_full_commit_coverage;
+pub mod realm_full_commit_write_set;
 pub mod realm_normal_commit_coverage;
 pub mod realm_prepared_payload;
 pub mod realm_proof_binding;
