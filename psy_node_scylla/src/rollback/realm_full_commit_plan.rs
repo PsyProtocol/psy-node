@@ -506,6 +506,26 @@ mod tests {
         })
     }
 
+    fn latest_l2_state_bytes(checkpoint: CheckpointId) -> Vec<u8> {
+        let mut bytes = vec![0_u8; 60];
+        bytes[..8].copy_from_slice(&checkpoint.get().to_le_bytes());
+        bytes
+    }
+
+    fn realm_observation_bytes(checkpoint: CheckpointId) -> Vec<u8> {
+        let mut bytes = vec![0_u8; 122];
+        bytes[0..8].copy_from_slice(b"PSYAUTHO");
+        bytes[8..10].copy_from_slice(&1_u16.to_le_bytes());
+        bytes[10..18].copy_from_slice(b"PSYCCREF");
+        bytes[18..20].copy_from_slice(&1_u16.to_le_bytes());
+        bytes[32..40].copy_from_slice(&checkpoint.get().to_le_bytes());
+        bytes[40] = 1;
+        bytes[41..43].copy_from_slice(&32_u16.to_le_bytes());
+        bytes[75] = 2;
+        bytes[82..90].copy_from_slice(&checkpoint.get().to_le_bytes());
+        bytes
+    }
+
     fn prepared_from_intent(
         timestamp: CommitWriteTimestampUs,
         intent: BranchExactDualWriteIntent<Hash>,
@@ -636,13 +656,13 @@ mod tests {
             put(
                 D::LatestL2BlockState,
                 TypedTableKey::LatestInfo(LatestInfoSlot::LatestL2BlockState),
-                MutationValue::PsyCanonicalBytes(vec![6]),
+                MutationValue::PsyCanonicalBytes(latest_l2_state_bytes(checkpoint)),
                 timestamp,
             ),
             put(
                 D::RealmAuthorityObservation,
                 TypedTableKey::LatestInfo(LatestInfoSlot::RealmAuthorityObservation),
-                MutationValue::PsyCanonicalBytes(vec![7]),
+                MutationValue::PsyCanonicalBytes(realm_observation_bytes(checkpoint)),
                 timestamp,
             ),
         ]
@@ -910,8 +930,59 @@ mod tests {
             schedule.preflight(&missing).unwrap().write_indices(),
             (0..25).collect::<Vec<_>>(),
         );
+        assert_eq!(
+            crate::rollback::realm_full_commit_scylla::validate_schedule_write_plan(
+                &schedule,
+                &missing,
+            )
+            .unwrap(),
+            24,
+        );
         let exact = exact_observations(&schedule);
+        let root_by_hash = schedule
+            .rows()
+            .iter()
+            .position(|row| {
+                row.domain() == RealmNormalCommitWriteDomain::CheckpointRootByHash
+            })
+            .unwrap();
+        let root_by_checkpoint = schedule
+            .rows()
+            .iter()
+            .position(|row| {
+                row.domain()
+                    == RealmNormalCommitWriteDomain::CheckpointRootByCheckpoint
+            })
+            .unwrap();
+        let mut partial_root_pair = missing.clone();
+        partial_root_pair[root_by_hash] = exact[root_by_hash].clone();
+        assert_eq!(
+            crate::rollback::realm_full_commit_scylla::validate_schedule_write_plan(
+                &schedule,
+                &partial_root_pair,
+            )
+            .unwrap(),
+            24,
+        );
+        partial_root_pair[root_by_checkpoint] =
+            exact[root_by_checkpoint].clone();
+        assert_eq!(
+            crate::rollback::realm_full_commit_scylla::validate_schedule_write_plan(
+                &schedule,
+                &partial_root_pair,
+            )
+            .unwrap(),
+            23,
+        );
         assert!(schedule.preflight(&exact).unwrap().write_indices().is_empty());
+        assert_eq!(
+            crate::rollback::realm_full_commit_scylla::validate_schedule_write_plan(
+                &schedule,
+                &exact,
+            )
+            .unwrap(),
+            0,
+        );
         let verified = schedule.verify_after_write(&exact).unwrap();
         assert_eq!(verified.row_count(), 25);
         assert_eq!(verified.coverage_digest(), full.coverage().digest());

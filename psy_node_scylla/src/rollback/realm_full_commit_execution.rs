@@ -275,6 +275,8 @@ impl RealmFullCommitObservedRow {
     ) -> Self {
         Self { physical_table, locator, value, writetime_us }
     }
+
+    pub(crate) fn value(&self) -> &[u8] { &self.value }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
