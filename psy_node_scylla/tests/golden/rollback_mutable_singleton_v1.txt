@@ -5,5 +5,8 @@ LatestCheckpointPut
 INSERT INTO psy_d02t7.u64_singleton_table (obj_id, value) VALUES (?, ?) USING TIMESTAMP ?
 obj_id:BIGINT,value:BIGINT,write_timestamp_us:BIGINT
 LatestCheckpointRead
-SELECT value FROM psy_d02t7.u64_singleton_table WHERE obj_id = ?
+SELECT value, writetime(value) FROM psy_d02t7.u64_singleton_table WHERE obj_id = ?
+obj_id:BIGINT
+LatestInfoRead
+SELECT value, writetime(value) FROM psy_d02t7.latest_info_table WHERE obj_id = ?
 obj_id:BIGINT

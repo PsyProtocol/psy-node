@@ -87,7 +87,7 @@ fn query_catalog_uses_both_real_physical_names_and_matches_golden() {
     }
     for query in [queries.k1_exact_read(), queries.k2_exact_read()] {
         assert_eq!(query.kind(), CheckpointRootPairQueryKind::ExactRead);
-        assert!(query.cql().starts_with("SELECT value FROM "));
+        assert!(query.cql().starts_with("SELECT value, writetime(value) FROM "));
         assert_eq!(query.cql().matches('?').count(), query.bind_shape().len());
     }
     assert!(queries

@@ -149,6 +149,15 @@ fn query_catalog_is_closed_timestamped_and_matches_golden() {
             .bounded_range_delete()
             .cql()
             .contains("obj_id = ? AND checkpoint_id > ? AND checkpoint_id <= ?"));
+        assert_eq!(
+            table_queries.exact_read().kind(),
+            CheckpointObjectSingleQueryKind::ExactRead,
+        );
+        assert!(table_queries.exact_read().cql().contains("writetime(value)"));
+        assert_eq!(
+            table_queries.exact_read().bind_shape(),
+            ["obj_id:BIGINT", "checkpoint_id:BIGINT"],
+        );
     }
 }
 

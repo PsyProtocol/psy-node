@@ -4,21 +4,33 @@ obj_id:BIGINT,value:BLOB,write_timestamp_us:BIGINT
 CheckpointLeaf/VersionPartitionDelete
 DELETE FROM psy_d02t1.checkpoint_leaf_table USING TIMESTAMP ? WHERE obj_id = ?
 delete_fence_us:BIGINT,obj_id:BIGINT
+CheckpointLeaf/ExactRead
+SELECT value, writetime(value) FROM psy_d02t1.checkpoint_leaf_table WHERE obj_id = ?
+obj_id:BIGINT
 L2BlockState/Put
 INSERT INTO psy_d02t1.l2_block_state_table (obj_id, value) VALUES (?, ?) USING TIMESTAMP ?
 obj_id:BIGINT,value:BLOB,write_timestamp_us:BIGINT
 L2BlockState/VersionPartitionDelete
 DELETE FROM psy_d02t1.l2_block_state_table USING TIMESTAMP ? WHERE obj_id = ?
 delete_fence_us:BIGINT,obj_id:BIGINT
+L2BlockState/ExactRead
+SELECT value, writetime(value) FROM psy_d02t1.l2_block_state_table WHERE obj_id = ?
+obj_id:BIGINT
 CheckpointStateRoots/Put
 INSERT INTO psy_d02t1.checkpoint_state_roots_table (obj_id, value) VALUES (?, ?) USING TIMESTAMP ?
 obj_id:BIGINT,value:BLOB,write_timestamp_us:BIGINT
 CheckpointStateRoots/VersionPartitionDelete
 DELETE FROM psy_d02t1.checkpoint_state_roots_table USING TIMESTAMP ? WHERE obj_id = ?
 delete_fence_us:BIGINT,obj_id:BIGINT
+CheckpointStateRoots/ExactRead
+SELECT value, writetime(value) FROM psy_d02t1.checkpoint_state_roots_table WHERE obj_id = ?
+obj_id:BIGINT
 CheckpointZkProofAndTransition/Put
 INSERT INTO psy_d02t1.checkpoint_zk_proof_and_transition_table (obj_id, value) VALUES (?, ?) USING TIMESTAMP ?
 obj_id:BIGINT,value:BLOB,write_timestamp_us:BIGINT
 CheckpointZkProofAndTransition/VersionPartitionDelete
 DELETE FROM psy_d02t1.checkpoint_zk_proof_and_transition_table USING TIMESTAMP ? WHERE obj_id = ?
 delete_fence_us:BIGINT,obj_id:BIGINT
+CheckpointZkProofAndTransition/ExactRead
+SELECT value, writetime(value) FROM psy_d02t1.checkpoint_zk_proof_and_transition_table WHERE obj_id = ?
+obj_id:BIGINT

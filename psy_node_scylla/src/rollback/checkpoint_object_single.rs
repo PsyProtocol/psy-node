@@ -126,6 +126,7 @@ pub enum CheckpointObjectSingleQueryKind {
     Put = 1,
     PointDelete = 2,
     BoundedRangeDelete = 3,
+    ExactRead = 4,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -160,6 +161,7 @@ pub struct CheckpointObjectSingleTableQueries {
     put: CheckpointObjectSingleQuery,
     point_delete: CheckpointObjectSingleQuery,
     bounded_range_delete: CheckpointObjectSingleQuery,
+    exact_read: CheckpointObjectSingleQuery,
 }
 
 impl CheckpointObjectSingleTableQueries {
@@ -209,6 +211,14 @@ impl CheckpointObjectSingleTableQueries {
                     "old_head_inclusive:BIGINT",
                 ],
             },
+            exact_read: CheckpointObjectSingleQuery {
+                table,
+                kind: CheckpointObjectSingleQueryKind::ExactRead,
+                cql: format!(
+                    "SELECT value, writetime(value) FROM {qualified} WHERE obj_id = ? AND checkpoint_id = ?"
+                ),
+                bind_shape: &["obj_id:BIGINT", "checkpoint_id:BIGINT"],
+            },
         }
     }
 
@@ -226,6 +236,10 @@ impl CheckpointObjectSingleTableQueries {
 
     pub const fn bounded_range_delete(&self) -> &CheckpointObjectSingleQuery {
         &self.bounded_range_delete
+    }
+
+    pub const fn exact_read(&self) -> &CheckpointObjectSingleQuery {
+        &self.exact_read
     }
 }
 
@@ -261,6 +275,7 @@ impl CheckpointObjectSingleQueries {
                 table.put(),
                 table.point_delete(),
                 table.bounded_range_delete(),
+                table.exact_read(),
             ] {
                 output.push_str(&format!(
                     "{:?}/{:?}\n{}\n{}\n",
@@ -513,6 +528,7 @@ struct PreparedCheckpointObjectSingleTable {
     put: PreparedStatement,
     point_delete: PreparedStatement,
     bounded_range_delete: PreparedStatement,
+    exact_read: PreparedStatement,
 }
 
 #[allow(dead_code)]
@@ -545,6 +561,12 @@ impl CheckpointObjectSingleAdapter {
                 bounded_range_delete: prepare_idempotent(
                     session,
                     table_queries.bounded_range_delete().cql(),
+                    consistency,
+                )
+                .await?,
+                exact_read: prepare_idempotent(
+                    session,
+                    table_queries.exact_read().cql(),
                     consistency,
                 )
                 .await?,
@@ -648,6 +670,34 @@ impl CheckpointObjectSingleAdapter {
             )
             .await?;
         Ok(())
+    }
+
+    pub(crate) async fn read_exact(
+        &self,
+        session: &Session,
+        sealed: &SealedTimestampedPut,
+    ) -> anyhow::Result<Option<(Vec<u8>, i64)>> {
+        let binding = CheckpointObjectSinglePutBinding::try_from_sealed(sealed)?;
+        let result = session
+            .execute_unpaged(
+                &self.prepared(binding.table).exact_read,
+                (
+                    u64_to_i64_exact(binding.object_id),
+                    convert_checkpoint_id_to_i64(binding.checkpoint.get()),
+                ),
+            )
+            .await?;
+        let Some((stored, writetime)) = result
+            .into_rows_result()?
+            .maybe_first_row::<(Option<Vec<u8>>, Option<i64>)>()?
+        else {
+            return Ok(None);
+        };
+        let stored = stored
+            .ok_or_else(|| anyhow::anyhow!("checkpoint object value is null"))?;
+        let writetime = writetime
+            .ok_or_else(|| anyhow::anyhow!("checkpoint object writetime is null"))?;
+        Ok(Some((compression::decompress(&stored)?, writetime)))
     }
 
     fn prepared(

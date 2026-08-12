@@ -80,6 +80,7 @@ fn query_catalog_matches_all_three_real_schemas() {
         queries.cursor_exact_read(),
     ] {
         assert!(!query.cql().is_empty());
+        assert!(query.cql().contains("writetime("));
         assert_eq!(query.cql().matches('?').count(), query.bind_shape().len());
     }
 }

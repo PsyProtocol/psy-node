@@ -105,6 +105,7 @@ impl CheckpointKivTable {
 pub enum CheckpointKivQueryKind {
     Put = 1,
     VersionPartitionDelete = 2,
+    ExactRead = 3,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -138,6 +139,7 @@ pub struct CheckpointKivTableQueries {
     table: CheckpointKivTable,
     put: CheckpointKivQuery,
     version_partition_delete: CheckpointKivQuery,
+    exact_read: CheckpointKivQuery,
 }
 
 impl CheckpointKivTableQueries {
@@ -164,6 +166,14 @@ impl CheckpointKivTableQueries {
                 cql: format!("DELETE FROM {qualified} USING TIMESTAMP ? WHERE obj_id = ?"),
                 bind_shape: &["delete_fence_us:BIGINT", "obj_id:BIGINT"],
             },
+            exact_read: CheckpointKivQuery {
+                table,
+                kind: CheckpointKivQueryKind::ExactRead,
+                cql: format!(
+                    "SELECT value, writetime(value) FROM {qualified} WHERE obj_id = ?"
+                ),
+                bind_shape: &["obj_id:BIGINT"],
+            },
         }
     }
 
@@ -177,6 +187,10 @@ impl CheckpointKivTableQueries {
 
     pub const fn version_partition_delete(&self) -> &CheckpointKivQuery {
         &self.version_partition_delete
+    }
+
+    pub const fn exact_read(&self) -> &CheckpointKivQuery {
+        &self.exact_read
     }
 }
 
@@ -206,7 +220,11 @@ impl CheckpointKivQueries {
     pub fn render_golden(&self) -> String {
         let mut output = String::new();
         for table in &self.tables {
-            for query in [table.put(), table.version_partition_delete()] {
+            for query in [
+                table.put(),
+                table.version_partition_delete(),
+                table.exact_read(),
+            ] {
                 output.push_str(&format!(
                     "{:?}/{:?}\n{}\n{}\n",
                     query.table(),
@@ -456,6 +474,7 @@ struct PreparedCheckpointKivTable {
     table: CheckpointKivTable,
     put: PreparedStatement,
     version_partition_delete: PreparedStatement,
+    exact_read: PreparedStatement,
 }
 
 /// Production-shaped executable adapter, still isolated from production setup.
@@ -483,6 +502,12 @@ impl CheckpointKivAdapter {
                 version_partition_delete: prepare_idempotent(
                     session,
                     table_queries.version_partition_delete().cql(),
+                    consistency,
+                )
+                .await?,
+                exact_read: prepare_idempotent(
+                    session,
+                    table_queries.exact_read().cql(),
                     consistency,
                 )
                 .await?,
@@ -550,6 +575,30 @@ impl CheckpointKivAdapter {
             )
             .await?;
         Ok(())
+    }
+
+    pub(crate) async fn read_exact(
+        &self,
+        session: &Session,
+        sealed: &SealedTimestampedPut,
+    ) -> anyhow::Result<Option<(Vec<u8>, i64)>> {
+        let binding = CheckpointKivPutBinding::try_from_sealed(sealed)?;
+        let result = session
+            .execute_unpaged(
+                &self.prepared(binding.table).exact_read,
+                (u64_to_i64_exact(binding.checkpoint.get()),),
+            )
+            .await?;
+        let Some((stored, writetime)) = result
+            .into_rows_result()?
+            .maybe_first_row::<(Option<Vec<u8>>, Option<i64>)>()?
+        else {
+            return Ok(None);
+        };
+        let stored = stored.ok_or_else(|| anyhow::anyhow!("checkpoint KIV value is null"))?;
+        let writetime = writetime
+            .ok_or_else(|| anyhow::anyhow!("checkpoint KIV writetime is null"))?;
+        Ok(Some((crate::compression::decompress(&stored)?, writetime)))
     }
 
     fn prepared(&self, table: CheckpointKivTable) -> &PreparedCheckpointKivTable {

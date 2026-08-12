@@ -191,6 +191,10 @@ fn query_catalog_uses_real_schemas_explicit_timestamp_and_no_delete() {
         assert!(!query.cql().contains("DELETE"));
         assert_eq!(query.cql().matches('?').count(), query.bind_shape().len());
     }
+    for query in [queries.latest_info_read(), queries.latest_checkpoint_read()] {
+        assert!(query.cql().contains("writetime(value)"));
+        assert_eq!(query.cql().matches('?').count(), query.bind_shape().len());
+    }
 }
 
 #[test]

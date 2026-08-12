@@ -17,11 +17,11 @@ CursorPut
 INSERT INTO psy_d02t6.imt_next_append_index_table (tree_id, tree_sub_id, next_append_index) VALUES (?, ?, ?) USING TIMESTAMP ?
 tree_id:BIGINT,tree_sub_id:BIGINT,next_append_index:BIGINT,write_timestamp_us:BIGINT
 LeafExactRead
-SELECT leaf_hash, leaf_key, leaf_value, next_key, next_index FROM psy_d02t6.imt_leaf_table WHERE tree_id = ? AND tree_sub_id = ? AND leaf_index = ? AND checkpoint_id = ?
+SELECT leaf_hash, leaf_key, leaf_value, next_key, next_index, writetime(leaf_hash), writetime(leaf_key), writetime(leaf_value), writetime(next_key), writetime(next_index) FROM psy_d02t6.imt_leaf_table WHERE tree_id = ? AND tree_sub_id = ? AND leaf_index = ? AND checkpoint_id = ?
 tree_id:BIGINT,tree_sub_id:BIGINT,leaf_index:BIGINT,checkpoint_id:BIGINT
 IndexExactRead
-SELECT leaf_key, birth_checkpoint, leaf_index FROM psy_d02t6.imt_key_index_table WHERE tree_id = ? AND tree_sub_id = ? AND key_bucket = ? AND encoded_key = ?
+SELECT leaf_key, birth_checkpoint, leaf_index, writetime(leaf_key), writetime(birth_checkpoint), writetime(leaf_index) FROM psy_d02t6.imt_key_index_table WHERE tree_id = ? AND tree_sub_id = ? AND key_bucket = ? AND encoded_key = ?
 tree_id:BIGINT,tree_sub_id:BIGINT,key_bucket:SMALLINT,encoded_key:BLOB
 CursorExactRead
-SELECT next_append_index FROM psy_d02t6.imt_next_append_index_table WHERE tree_id = ? AND tree_sub_id = ?
+SELECT next_append_index, writetime(next_append_index) FROM psy_d02t6.imt_next_append_index_table WHERE tree_id = ? AND tree_sub_id = ?
 tree_id:BIGINT,tree_sub_id:BIGINT

@@ -156,7 +156,7 @@ impl CheckpointRootPairQueries {
                 direction: CheckpointRootPairDirection::RootToCheckpoint,
                 kind: CheckpointRootPairQueryKind::ExactRead,
                 cql: format!(
-                    "SELECT value FROM {k1_qualified} WHERE obj_id = ?"
+                    "SELECT value, writetime(value) FROM {k1_qualified} WHERE obj_id = ?"
                 ),
                 bind_shape: &["root: BLOB"],
             },
@@ -164,7 +164,7 @@ impl CheckpointRootPairQueries {
                 direction: CheckpointRootPairDirection::CheckpointToRoot,
                 kind: CheckpointRootPairQueryKind::ExactRead,
                 cql: format!(
-                    "SELECT value FROM {k2_qualified} WHERE obj_id = ?"
+                    "SELECT value, writetime(value) FROM {k2_qualified} WHERE obj_id = ?"
                 ),
                 bind_shape: &["checkpoint_le: BLOB"],
             },
@@ -520,20 +520,37 @@ impl CheckpointRootPairAdapter {
         session: &Session,
         plan: &CheckpointRootPairPutPlan,
     ) -> anyhow::Result<[Option<Vec<u8>>; 2]> {
+        let [k1, k2] = self.read_pair_exact_with_writetime(session, plan).await?;
+        Ok([k1.map(|(value, _)| value), k2.map(|(value, _)| value)])
+    }
+
+    pub(crate) async fn read_pair_exact_with_writetime(
+        &self,
+        session: &Session,
+        plan: &CheckpointRootPairPutPlan,
+    ) -> anyhow::Result<[Option<(Vec<u8>, i64)>; 2]> {
         let k1 = session
             .execute_unpaged(&self.prepared.k1_exact_read, (plan.root.as_slice(),))
             .await?
             .into_rows_result()?
-            .maybe_first_row::<(Vec<u8>,)>()?
-            .map(|row| compression::decompress(&row.0))
+            .maybe_first_row::<(Option<Vec<u8>>, Option<i64>)>()?
+            .map(|(stored, writetime)| {
+                let stored = stored.ok_or_else(|| anyhow::anyhow!("checkpoint root k1 value is null"))?;
+                let writetime = writetime.ok_or_else(|| anyhow::anyhow!("checkpoint root k1 writetime is null"))?;
+                Ok::<_, anyhow::Error>((compression::decompress(&stored)?, writetime))
+            })
             .transpose()?;
         let checkpoint_key = plan.checkpoint.get().to_le_bytes();
         let k2 = session
             .execute_unpaged(&self.prepared.k2_exact_read, (checkpoint_key.as_slice(),))
             .await?
             .into_rows_result()?
-            .maybe_first_row::<(Vec<u8>,)>()?
-            .map(|row| compression::decompress(&row.0))
+            .maybe_first_row::<(Option<Vec<u8>>, Option<i64>)>()?
+            .map(|(stored, writetime)| {
+                let stored = stored.ok_or_else(|| anyhow::anyhow!("checkpoint root k2 value is null"))?;
+                let writetime = writetime.ok_or_else(|| anyhow::anyhow!("checkpoint root k2 writetime is null"))?;
+                Ok::<_, anyhow::Error>((compression::decompress(&stored)?, writetime))
+            })
             .transpose()?;
         Ok([k1, k2])
     }

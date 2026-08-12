@@ -49,6 +49,7 @@ pub enum MutableSingletonQueryKind {
     LatestInfoPut = 1,
     LatestCheckpointPut = 2,
     LatestCheckpointRead = 3,
+    LatestInfoRead = 4,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -69,6 +70,7 @@ pub struct MutableSingletonQueries {
     latest_info_put: MutableSingletonQuery,
     latest_checkpoint_put: MutableSingletonQuery,
     latest_checkpoint_read: MutableSingletonQuery,
+    latest_info_read: MutableSingletonQuery,
 }
 
 impl MutableSingletonQueries {
@@ -88,7 +90,12 @@ impl MutableSingletonQueries {
             },
             latest_checkpoint_read: MutableSingletonQuery {
                 kind: MutableSingletonQueryKind::LatestCheckpointRead,
-                cql: format!("SELECT value FROM {}.{latest_checkpoint} WHERE obj_id = ?", keyspace.as_str()),
+                cql: format!("SELECT value, writetime(value) FROM {}.{latest_checkpoint} WHERE obj_id = ?", keyspace.as_str()),
+                bind_shape: &["obj_id:BIGINT"],
+            },
+            latest_info_read: MutableSingletonQuery {
+                kind: MutableSingletonQueryKind::LatestInfoRead,
+                cql: format!("SELECT value, writetime(value) FROM {}.{latest_info} WHERE obj_id = ?", keyspace.as_str()),
                 bind_shape: &["obj_id:BIGINT"],
             },
         }
@@ -97,10 +104,11 @@ impl MutableSingletonQueries {
     pub const fn latest_info_put(&self) -> &MutableSingletonQuery { &self.latest_info_put }
     pub const fn latest_checkpoint_put(&self) -> &MutableSingletonQuery { &self.latest_checkpoint_put }
     pub const fn latest_checkpoint_read(&self) -> &MutableSingletonQuery { &self.latest_checkpoint_read }
+    pub const fn latest_info_read(&self) -> &MutableSingletonQuery { &self.latest_info_read }
 
     pub fn render_golden(&self) -> String {
         let mut output = String::new();
-        for query in [self.latest_info_put(), self.latest_checkpoint_put(), self.latest_checkpoint_read()] {
+        for query in [self.latest_info_put(), self.latest_checkpoint_put(), self.latest_checkpoint_read(), self.latest_info_read()] {
             output.push_str(&format!("{:?}\n{}\n{}\n", query.kind(), query.cql(), query.bind_shape().join(",")));
         }
         output
@@ -506,6 +514,7 @@ struct PreparedMutableSingleton {
     latest_info_put: PreparedStatement,
     latest_checkpoint_put: PreparedStatement,
     latest_checkpoint_read: PreparedStatement,
+    latest_info_read: PreparedStatement,
 }
 
 #[allow(dead_code)]
@@ -526,6 +535,7 @@ impl MutableSingletonAdapter {
             latest_info_put: prepare(session, queries.latest_info_put().cql(), consistency).await?,
             latest_checkpoint_put: prepare(session, queries.latest_checkpoint_put().cql(), consistency).await?,
             latest_checkpoint_read: prepare(session, queries.latest_checkpoint_read().cql(), consistency).await?,
+            latest_info_read: prepare(session, queries.latest_info_read().cql(), consistency).await?,
         };
         Ok(Self { queries, prepared })
     }
@@ -561,12 +571,57 @@ impl MutableSingletonAdapter {
             )
             .await?;
         let rows = result.into_rows_result()?;
-        rows.maybe_first_row::<(i64,)>()?
-            .map(|row| {
-                CheckpointId::try_new(i64_to_u64_exact(row.0))
+        rows.maybe_first_row::<(i64, Option<i64>)>()?
+            .map(|(value, _)| {
+                CheckpointId::try_new(i64_to_u64_exact(value))
                     .map_err(anyhow::Error::from)
             })
             .transpose()
+    }
+
+    pub(crate) async fn read_latest_checkpoint_exact(
+        &self,
+        session: &Session,
+    ) -> anyhow::Result<Option<(Vec<u8>, i64)>> {
+        let result = session
+            .execute_unpaged(
+                &self.prepared.latest_checkpoint_read,
+                (u64_to_i64_exact(U64SingletonSlot::LatestCheckpoint as u8 as u64),),
+            )
+            .await?;
+        let Some((value, writetime)) = result
+            .into_rows_result()?
+            .maybe_first_row::<(Option<i64>, Option<i64>)>()?
+        else {
+            return Ok(None);
+        };
+        let value = value.ok_or_else(|| anyhow::anyhow!("latest checkpoint value is null"))?;
+        let writetime = writetime
+            .ok_or_else(|| anyhow::anyhow!("latest checkpoint writetime is null"))?;
+        Ok(Some((i64_to_u64_exact(value).to_be_bytes().to_vec(), writetime)))
+    }
+
+    pub(crate) async fn read_latest_info_exact(
+        &self,
+        session: &Session,
+        slot: LatestInfoSlot,
+    ) -> anyhow::Result<Option<(Vec<u8>, i64)>> {
+        let result = session
+            .execute_unpaged(
+                &self.prepared.latest_info_read,
+                (u64_to_i64_exact(slot as u8 as u64),),
+            )
+            .await?;
+        let Some((stored, writetime)) = result
+            .into_rows_result()?
+            .maybe_first_row::<(Option<Vec<u8>>, Option<i64>)>()?
+        else {
+            return Ok(None);
+        };
+        let stored = stored.ok_or_else(|| anyhow::anyhow!("latest info value is null"))?;
+        let writetime = writetime
+            .ok_or_else(|| anyhow::anyhow!("latest info writetime is null"))?;
+        Ok(Some((crate::compression::decompress(&stored)?, writetime)))
     }
 }
 

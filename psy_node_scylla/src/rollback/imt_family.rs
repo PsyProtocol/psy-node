@@ -128,17 +128,17 @@ impl ImtQueries {
             ),
             leaf_exact_read: query(
                 ImtQueryKind::LeafExactRead,
-                format!("SELECT leaf_hash, leaf_key, leaf_value, next_key, next_index FROM {leaf} WHERE tree_id = ? AND tree_sub_id = ? AND leaf_index = ? AND checkpoint_id = ?"),
+                format!("SELECT leaf_hash, leaf_key, leaf_value, next_key, next_index, writetime(leaf_hash), writetime(leaf_key), writetime(leaf_value), writetime(next_key), writetime(next_index) FROM {leaf} WHERE tree_id = ? AND tree_sub_id = ? AND leaf_index = ? AND checkpoint_id = ?"),
                 &["tree_id:BIGINT", "tree_sub_id:BIGINT", "leaf_index:BIGINT", "checkpoint_id:BIGINT"],
             ),
             index_exact_read: query(
                 ImtQueryKind::IndexExactRead,
-                format!("SELECT leaf_key, birth_checkpoint, leaf_index FROM {index} WHERE tree_id = ? AND tree_sub_id = ? AND key_bucket = ? AND encoded_key = ?"),
+                format!("SELECT leaf_key, birth_checkpoint, leaf_index, writetime(leaf_key), writetime(birth_checkpoint), writetime(leaf_index) FROM {index} WHERE tree_id = ? AND tree_sub_id = ? AND key_bucket = ? AND encoded_key = ?"),
                 &["tree_id:BIGINT", "tree_sub_id:BIGINT", "key_bucket:SMALLINT", "encoded_key:BLOB"],
             ),
             cursor_exact_read: query(
                 ImtQueryKind::CursorExactRead,
-                format!("SELECT next_append_index FROM {cursor} WHERE tree_id = ? AND tree_sub_id = ?"),
+                format!("SELECT next_append_index, writetime(next_append_index) FROM {cursor} WHERE tree_id = ? AND tree_sub_id = ?"),
                 &["tree_id:BIGINT", "tree_sub_id:BIGINT"],
             ),
         }
@@ -811,34 +811,63 @@ impl ImtFamilyAdapter {
     pub(crate) async fn delete_index(&self, session: &Session, plan: &ImtIndexPointDeletePlan) -> anyhow::Result<()> { session.execute_unpaged(&self.prepared.index_point_delete, plan.driver_values()).await?; Ok(()) }
     pub(crate) async fn restore_cursor(&self, session: &Session, plan: &ImtCursorRestorePlan) -> anyhow::Result<()> { session.execute_unpaged(&self.prepared.cursor_put, plan.driver_values()).await?; Ok(()) }
     pub(crate) async fn read_leaf_exact(&self, session: &Session, binding: &ImtLeafPutBinding) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(self.read_leaf_exact_with_writetime(session, binding).await?.map(|(value, _)| value))
+    }
+    pub(crate) async fn read_leaf_exact_with_writetime(&self, session: &Session, binding: &ImtLeafPutBinding) -> anyhow::Result<Option<(Vec<u8>, i64)>> {
         let result = session.execute_unpaged(&self.prepared.leaf_exact_read, binding.exact_read_driver_values()).await?;
-        let Some((leaf_hash, leaf_key, leaf_value, next_key, next_index)) = result.into_rows_result()?.maybe_first_row::<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64)>()? else { return Ok(None); };
+        let Some((leaf_hash, leaf_key, leaf_value, next_key, next_index, wt_hash, wt_key, wt_value, wt_next_key, wt_next_index)) = result.into_rows_result()?.maybe_first_row::<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64, Option<i64>, Option<i64>, Option<i64>, Option<i64>, Option<i64>)>()? else { return Ok(None); };
         anyhow::ensure!(leaf_hash.len() == 32 && leaf_key.len() == 32 && leaf_value.len() == 32 && next_key.len() == 32, "stored IMT leaf hash field has invalid length");
-        Ok(Some(encode_leaf_physical_value(
+        let writetime = require_same_writetime(&[wt_hash, wt_key, wt_value, wt_next_key, wt_next_index], "IMT leaf")?;
+        Ok(Some((encode_leaf_physical_value(
             leaf_hash.as_slice().try_into().expect("validated length"),
             leaf_key.as_slice().try_into().expect("validated length"),
             leaf_value.as_slice().try_into().expect("validated length"),
             next_key.as_slice().try_into().expect("validated length"),
             i64_to_u64_exact(next_index),
-        )))
+        ), writetime)))
     }
     pub(crate) async fn read_index_exact(&self, session: &Session, binding: &ImtIndexPutBinding) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(self.read_index_exact_with_writetime(session, binding).await?.map(|(value, _)| value))
+    }
+    pub(crate) async fn read_index_exact_with_writetime(&self, session: &Session, binding: &ImtIndexPutBinding) -> anyhow::Result<Option<(Vec<u8>, i64)>> {
         let result = session.execute_unpaged(&self.prepared.index_exact_read, binding.exact_read_driver_values()).await?;
-        let Some((leaf_key, birth_checkpoint, leaf_index)) = result.into_rows_result()?.maybe_first_row::<(Vec<u8>, i64, i64)>()? else { return Ok(None); };
+        let Some((leaf_key, birth_checkpoint, leaf_index, wt_key, wt_birth, wt_index)) = result.into_rows_result()?.maybe_first_row::<(Vec<u8>, i64, i64, Option<i64>, Option<i64>, Option<i64>)>()? else { return Ok(None); };
         anyhow::ensure!(leaf_key.len() == 32, "stored IMT index leaf_key has invalid length");
         anyhow::ensure!(birth_checkpoint >= 0, "stored IMT index birth checkpoint is negative");
         let birth_checkpoint = CheckpointId::try_new(birth_checkpoint as u64)
             .map_err(|_| anyhow::anyhow!("stored IMT index birth checkpoint is outside typed range"))?;
-        Ok(Some(ImtKeyIndexRow::new(
+        let writetime = require_same_writetime(&[wt_key, wt_birth, wt_index], "IMT index")?;
+        Ok(Some((ImtKeyIndexRow::new(
             leaf_key.as_slice().try_into().expect("validated length"),
             birth_checkpoint,
             LeafIndex::new(i64_to_u64_exact(leaf_index)),
-        ).encode_canonical().to_vec()))
+        ).encode_canonical().to_vec(), writetime)))
     }
     pub(crate) async fn read_cursor_exact(&self, session: &Session, binding: &ImtCursorPutBinding) -> anyhow::Result<Option<Vec<u8>>> {
-        let result = session.execute_unpaged(&self.prepared.cursor_exact_read, binding.exact_read_driver_values()).await?;
-        Ok(result.into_rows_result()?.maybe_first_row::<(i64,)>()?.map(|(value,)| i64_to_u64_exact(value).to_be_bytes().to_vec()))
+        Ok(self.read_cursor_exact_with_writetime(session, binding).await?.map(|(value, _)| value))
     }
+    pub(crate) async fn read_cursor_exact_with_writetime(&self, session: &Session, binding: &ImtCursorPutBinding) -> anyhow::Result<Option<(Vec<u8>, i64)>> {
+        let result = session.execute_unpaged(&self.prepared.cursor_exact_read, binding.exact_read_driver_values()).await?;
+        let Some((value, writetime)) = result.into_rows_result()?.maybe_first_row::<(i64, Option<i64>)>()? else { return Ok(None); };
+        let writetime = writetime.ok_or_else(|| anyhow::anyhow!("IMT cursor writetime is null"))?;
+        Ok(Some((i64_to_u64_exact(value).to_be_bytes().to_vec(), writetime)))
+    }
+}
+
+fn require_same_writetime(
+    writetimes: &[Option<i64>],
+    family: &str,
+) -> anyhow::Result<i64> {
+    let first = writetimes
+        .first()
+        .copied()
+        .flatten()
+        .ok_or_else(|| anyhow::anyhow!("{family} writetime is null"))?;
+    anyhow::ensure!(
+        writetimes.iter().all(|writetime| *writetime == Some(first)),
+        "{family} columns have mixed writetimes",
+    );
+    Ok(first)
 }
 
 async fn prepare(session: &Session, cql: &str, consistency: Consistency) -> anyhow::Result<PreparedStatement> {
@@ -870,3 +899,29 @@ impl fmt::Display for ImtPlanError {
 impl Error for ImtPlanError {}
 impl From<RegistryReadinessError> for ImtPlanError { fn from(value: RegistryReadinessError) -> Self { Self::Registry(value) } }
 impl From<MutationBuildError> for ImtPlanError { fn from(value: MutationBuildError) -> Self { Self::MutationBuild(value) } }
+
+#[cfg(test)]
+mod exact_readback_tests {
+    use super::require_same_writetime;
+
+    #[test]
+    fn multi_column_writetime_must_be_complete_and_identical() {
+        assert_eq!(
+            require_same_writetime(&[Some(17), Some(17), Some(17)], "fixture")
+                .unwrap(),
+            17,
+        );
+        assert!(
+            require_same_writetime(&[Some(17), Some(18)], "fixture")
+                .unwrap_err()
+                .to_string()
+                .contains("mixed writetimes")
+        );
+        assert!(
+            require_same_writetime(&[Some(17), None], "fixture")
+                .unwrap_err()
+                .to_string()
+                .contains("mixed writetimes")
+        );
+    }
+}

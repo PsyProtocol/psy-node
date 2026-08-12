@@ -145,6 +145,15 @@ fn query_catalog_is_closed_timestamped_and_matches_golden() {
             .bounded_range_delete()
             .cql()
             .contains("checkpoint_id > ? AND checkpoint_id <= ?"));
+        assert_eq!(
+            table_queries.exact_read().kind(),
+            CheckpointMerkleQueryKind::ExactRead,
+        );
+        assert!(table_queries.exact_read().cql().contains("writetime(value)"));
+        assert_eq!(
+            table_queries.exact_read().cql().matches('?').count(),
+            table_queries.exact_read().bind_shape().len(),
+        );
     }
 }
 
@@ -394,4 +403,3 @@ fn production_writers_and_capability_remain_unchanged() {
         assert!(!legacy.contains("DELETE FROM"));
     }
 }
-

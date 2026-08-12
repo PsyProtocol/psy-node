@@ -101,6 +101,9 @@ fn closed_query_catalog_matches_golden_and_always_binds_timestamp() {
             queries.version_partition_delete().bind_shape(),
             ["delete_fence_us:BIGINT", "obj_id:BIGINT"]
         );
+        assert_eq!(queries.exact_read().kind(), CheckpointKivQueryKind::ExactRead);
+        assert!(queries.exact_read().cql().contains("writetime(value)"));
+        assert_eq!(queries.exact_read().bind_shape(), ["obj_id:BIGINT"]);
     }
 }
 

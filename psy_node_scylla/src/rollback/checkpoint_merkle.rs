@@ -203,6 +203,7 @@ pub enum CheckpointMerkleQueryKind {
     Put = 1,
     PointDelete = 2,
     BoundedRangeDelete = 3,
+    ExactRead = 4,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -237,6 +238,7 @@ pub struct CheckpointMerkleTableQueries {
     put: CheckpointMerkleQuery,
     point_delete: CheckpointMerkleQuery,
     bounded_range_delete: CheckpointMerkleQuery,
+    exact_read: CheckpointMerkleQuery,
 }
 
 impl CheckpointMerkleTableQueries {
@@ -246,25 +248,29 @@ impl CheckpointMerkleTableQueries {
             keyspace.as_str(),
             physical_descriptor(table.physical_table()).physical_name
         );
-        let (put, point, range) = match table.schema_family() {
+        let (put, point, range, read) = match table.schema_family() {
             ScyllaSchemaFamily::MerkleZero => (
                 format!("INSERT INTO {qualified} (level, node_index, checkpoint_id, value) VALUES (?, ?, ?, ?) USING TIMESTAMP ?"),
                 format!("DELETE FROM {qualified} USING TIMESTAMP ? WHERE level = ? AND node_index = ? AND checkpoint_id = ?"),
                 format!("DELETE FROM {qualified} USING TIMESTAMP ? WHERE level = ? AND node_index = ? AND checkpoint_id > ? AND checkpoint_id <= ?"),
+                format!("SELECT value, writetime(value) FROM {qualified} WHERE level = ? AND node_index = ? AND checkpoint_id = ?"),
             ),
             ScyllaSchemaFamily::MerkleSingle => (
                 format!("INSERT INTO {qualified} (tree_id, level, node_index, checkpoint_id, value) VALUES (?, ?, ?, ?, ?) USING TIMESTAMP ?"),
                 format!("DELETE FROM {qualified} USING TIMESTAMP ? WHERE tree_id = ? AND level = ? AND node_index = ? AND checkpoint_id = ?"),
                 format!("DELETE FROM {qualified} USING TIMESTAMP ? WHERE tree_id = ? AND level = ? AND node_index = ? AND checkpoint_id > ? AND checkpoint_id <= ?"),
+                format!("SELECT value, writetime(value) FROM {qualified} WHERE tree_id = ? AND level = ? AND node_index = ? AND checkpoint_id = ?"),
             ),
             ScyllaSchemaFamily::MerkleDouble => (
                 format!("INSERT INTO {qualified} (tree_id, tree_sub_id, level, node_index, checkpoint_id, value) VALUES (?, ?, ?, ?, ?, ?) USING TIMESTAMP ?"),
                 format!("DELETE FROM {qualified} USING TIMESTAMP ? WHERE tree_id = ? AND tree_sub_id = ? AND level = ? AND node_index = ? AND checkpoint_id = ?"),
                 format!("DELETE FROM {qualified} USING TIMESTAMP ? WHERE tree_id = ? AND tree_sub_id = ? AND level = ? AND node_index = ? AND checkpoint_id > ? AND checkpoint_id <= ?"),
+                format!("SELECT value, writetime(value) FROM {qualified} WHERE tree_id = ? AND tree_sub_id = ? AND level = ? AND node_index = ? AND checkpoint_id = ?"),
             ),
             _ => unreachable!("closed checkpoint Merkle table has non-Merkle schema"),
         };
-        let (put_shape, point_shape, range_shape): (
+        let (put_shape, point_shape, range_shape, read_shape): (
+            &'static [&'static str],
             &'static [&'static str],
             &'static [&'static str],
             &'static [&'static str],
@@ -290,6 +296,7 @@ impl CheckpointMerkleTableQueries {
                     "target_checkpoint_id:BIGINT",
                     "old_head_checkpoint_id:BIGINT",
                 ],
+                &["level:TINYINT", "node_index:BIGINT", "checkpoint_id:BIGINT"],
             ),
             ScyllaSchemaFamily::MerkleSingle => (
                 &[
@@ -314,6 +321,12 @@ impl CheckpointMerkleTableQueries {
                     "node_index:BIGINT",
                     "target_checkpoint_id:BIGINT",
                     "old_head_checkpoint_id:BIGINT",
+                ],
+                &[
+                    "tree_id:BIGINT",
+                    "level:TINYINT",
+                    "node_index:BIGINT",
+                    "checkpoint_id:BIGINT",
                 ],
             ),
             ScyllaSchemaFamily::MerkleDouble => (
@@ -343,6 +356,13 @@ impl CheckpointMerkleTableQueries {
                     "target_checkpoint_id:BIGINT",
                     "old_head_checkpoint_id:BIGINT",
                 ],
+                &[
+                    "tree_id:BIGINT",
+                    "tree_sub_id:BIGINT",
+                    "level:TINYINT",
+                    "node_index:BIGINT",
+                    "checkpoint_id:BIGINT",
+                ],
             ),
             _ => unreachable!("closed checkpoint Merkle table has non-Merkle schema"),
         };
@@ -366,6 +386,12 @@ impl CheckpointMerkleTableQueries {
                 cql: range,
                 bind_shape: range_shape,
             },
+            exact_read: CheckpointMerkleQuery {
+                table,
+                kind: CheckpointMerkleQueryKind::ExactRead,
+                cql: read,
+                bind_shape: read_shape,
+            },
         }
     }
 
@@ -383,6 +409,10 @@ impl CheckpointMerkleTableQueries {
 
     pub const fn bounded_range_delete(&self) -> &CheckpointMerkleQuery {
         &self.bounded_range_delete
+    }
+
+    pub const fn exact_read(&self) -> &CheckpointMerkleQuery {
+        &self.exact_read
     }
 }
 
@@ -414,6 +444,7 @@ impl CheckpointMerkleQueries {
                 table.put(),
                 table.point_delete(),
                 table.bounded_range_delete(),
+                table.exact_read(),
             ] {
                 output.push_str(&format!(
                     "{:?}/{:?}\n{}\n{}\n",
@@ -788,6 +819,7 @@ struct PreparedCheckpointMerkleTable {
     put: PreparedStatement,
     point_delete: PreparedStatement,
     bounded_range_delete: PreparedStatement,
+    exact_read: PreparedStatement,
 }
 
 #[allow(dead_code)]
@@ -820,6 +852,12 @@ impl CheckpointMerkleAdapter {
                 bounded_range_delete: prepare_idempotent(
                     session,
                     table_queries.bounded_range_delete().cql(),
+                    consistency,
+                )
+                .await?,
+                exact_read: prepare_idempotent(
+                    session,
+                    table_queries.exact_read().cql(),
                     consistency,
                 )
                 .await?,
@@ -1055,6 +1093,70 @@ impl CheckpointMerkleAdapter {
         Ok(())
     }
 
+    pub(crate) async fn read_exact(
+        &self,
+        session: &Session,
+        sealed: &SealedTimestampedPut,
+    ) -> anyhow::Result<Option<(Vec<u8>, i64)>> {
+        let binding = CheckpointMerklePutBinding::try_from_sealed(sealed)?;
+        let prepared = self.prepared(binding.table);
+        let result = match binding.position {
+            CheckpointMerklePosition::Zero { node } => {
+                session
+                    .execute_unpaged(
+                        &prepared.exact_read,
+                        (
+                            u8_to_i8_exact(node.level()),
+                            u64_to_i64_exact(node.index().get()),
+                            convert_checkpoint_id_to_i64(binding.checkpoint.get()),
+                        ),
+                    )
+                    .await?
+            }
+            CheckpointMerklePosition::Single { tree_id, node } => {
+                session
+                    .execute_unpaged(
+                        &prepared.exact_read,
+                        (
+                            u64_to_i64_exact(tree_id),
+                            u8_to_i8_exact(node.level()),
+                            u64_to_i64_exact(node.index().get()),
+                            convert_checkpoint_id_to_i64(binding.checkpoint.get()),
+                        ),
+                    )
+                    .await?
+            }
+            CheckpointMerklePosition::Double {
+                tree_id,
+                tree_sub_id,
+                node,
+            } => {
+                session
+                    .execute_unpaged(
+                        &prepared.exact_read,
+                        (
+                            u64_to_i64_exact(tree_id),
+                            u64_to_i64_exact(tree_sub_id),
+                            u8_to_i8_exact(node.level()),
+                            u64_to_i64_exact(node.index().get()),
+                            convert_checkpoint_id_to_i64(binding.checkpoint.get()),
+                        ),
+                    )
+                    .await?
+            }
+        };
+        let Some((value, writetime)) = result
+            .into_rows_result()?
+            .maybe_first_row::<(Option<Vec<u8>>, Option<i64>)>()?
+        else {
+            return Ok(None);
+        };
+        let value = value.ok_or_else(|| anyhow::anyhow!("checkpoint Merkle value is null"))?;
+        let writetime = writetime
+            .ok_or_else(|| anyhow::anyhow!("checkpoint Merkle writetime is null"))?;
+        Ok(Some((value, writetime)))
+    }
+
     fn prepared(&self, table: CheckpointMerkleTable) -> &PreparedCheckpointMerkleTable {
         let prepared = &self.prepared[table as usize - 1];
         debug_assert_eq!(prepared.table, table);
@@ -1125,4 +1227,3 @@ async fn prepare_idempotent(
     statement.set_is_idempotent(true);
     Ok(statement)
 }
-
