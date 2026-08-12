@@ -574,6 +574,48 @@ impl<Hash: Q256BitHash> StoredPendingPipeline<Hash> {
         seal(self, candidate, PendingPipelineTransitionKind::RetireNoWork)
     }
 
+    /// Retire a generation whose immutable application contains only
+    /// successor-deferred jobs. The application archive slot is carried in
+    /// the original WorkCaptured evidence; the durable storage owner must
+    /// prove the exact semantic is deferred-only before calling this model.
+    pub fn seal_retire_deferred_work(
+        &self,
+        expected_capture: PendingWorkCaptureDigest,
+        no_work_receipt: PendingNoWorkReceiptDigest,
+        observed: AuthorityObservation<Hash>,
+    ) -> Result<SealedPendingPipelineTransition<Hash>, PendingPipelineError> {
+        self.require_unblocked()?;
+        if self.processing_state != PendingProcessingState::WorkCaptured(expected_capture) {
+            if self.phase() != PendingProcessingPhase::WorkCaptured {
+                return Err(PendingPipelineError::WorkNotCaptured(self.phase()));
+            }
+            return Err(PendingPipelineError::WorkCaptureMismatch);
+        }
+        if self.key.authority() == AuthorityScope::Coordinator {
+            return Err(PendingPipelineError::CoordinatorCannotRetireNoWork);
+        }
+        validate_observed_advance(self, &observed, false)?;
+        if observed.state_checkpoint_id() != self.frontier.state_checkpoint_id()
+            || observed.state_root() != self.frontier.state_root()
+        {
+            return Err(PendingPipelineError::NoWorkChangedState);
+        }
+        let seal_digest = PendingEmptyQueueSealDigest::try_new(*expected_capture.as_bytes())?;
+        let mut candidate = self.clone();
+        candidate.revision = self.revision.next()?;
+        candidate.processing_state = PendingProcessingState::RetiredNoWork {
+            seal: seal_digest,
+            receipt: no_work_receipt,
+        };
+        candidate.frontier = observed;
+        candidate.processed_pending_id = self.processing.pending_id().get();
+        seal(
+            self,
+            candidate,
+            PendingPipelineTransitionKind::RetireDeferredWork,
+        )
+    }
+
     pub fn seal_publish(
         &self,
         expected_intent: PendingPipelineIntentDigest,
@@ -744,6 +786,7 @@ pub enum PendingPipelineTransitionKind {
     RetireNoWork = 7,
     Publish = 8,
     Block = 9,
+    RetireDeferredWork = 10,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1378,6 +1421,41 @@ mod tests {
             .clone();
         assert_eq!(published.phase(), PendingProcessingPhase::Published);
         assert_eq!(published.processed_pending_id(), 15);
+    }
+
+    #[test]
+    fn deferred_only_work_retires_from_capture_without_changing_state() {
+        let ready = bootstrap()
+            .candidate()
+            .seal_rotation(
+                ReservedPendingGeneration::try_from_prefix(10, prefix()).unwrap(),
+            )
+            .unwrap()
+            .candidate()
+            .clone();
+        let captured = capture_work(&ready, 1, 2);
+        let retired = captured
+            .seal_retire_deferred_work(
+                capture(2),
+                no_work(3),
+                *captured.frontier(),
+            )
+            .unwrap();
+        assert_eq!(retired.kind(), PendingPipelineTransitionKind::RetireDeferredWork);
+        assert_eq!(retired.candidate().phase(), PendingProcessingPhase::RetiredNoWork);
+        assert_eq!(retired.candidate().frontier(), captured.frontier());
+        assert_eq!(
+            retired.candidate().processed_pending_id(),
+            captured.processing().pending_id().get(),
+        );
+        assert!(matches!(
+            captured.seal_retire_deferred_work(
+                capture(4),
+                no_work(3),
+                *captured.frontier(),
+            ),
+            Err(PendingPipelineError::WorkCaptureMismatch),
+        ));
     }
 
     #[test]

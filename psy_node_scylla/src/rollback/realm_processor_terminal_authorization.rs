@@ -43,6 +43,7 @@ use scylla::client::session::Session;
 use super::{
     branch_exact_pending_orchestration::{
         validate_branch_exact_application_no_work_pair,
+        validate_branch_exact_deferred_only_pair,
         validate_branch_exact_queue_terminal_pair,
         BranchExactPendingOrchestrationError,
     },
@@ -100,6 +101,7 @@ impl<Hash: Q256BitHash> PersistedRealmProcessorTerminalAuthorization<Hash> {
 enum RealmProcessorTerminalAuthorizationMode {
     Terminal,
     RetireNoWork,
+    RetireDeferredOnly,
 }
 
 #[async_trait]
@@ -117,6 +119,13 @@ pub(super) trait RealmProcessorTerminalAuthorizationProvider<Hash>: Send + Sync 
     ) -> Result<(), RealmProcessorTerminalAuthorizationStoreError>;
 
     async fn authorize_no_work_current(
+        &self,
+    ) -> Result<
+        PersistedRealmProcessorTerminalAuthorization<Hash>,
+        RealmProcessorTerminalAuthorizationStoreError,
+    >;
+
+    async fn authorize_deferred_only_current(
         &self,
     ) -> Result<
         PersistedRealmProcessorTerminalAuthorization<Hash>,
@@ -376,6 +385,9 @@ where
             RealmProcessorTerminalAuthorizationMode::RetireNoWork => {
                 validate_branch_exact_application_no_work_pair(pipeline, writer)?
             }
+            RealmProcessorTerminalAuthorizationMode::RetireDeferredOnly => {
+                validate_branch_exact_deferred_only_pair(pipeline, writer)?
+            }
         }
         let view = head.head();
         let observed = authority_observation(head)?;
@@ -428,6 +440,18 @@ where
     > {
         self.authorize_selected(RealmProcessorTerminalAuthorizationMode::RetireNoWork)
             .await
+    }
+
+    async fn authorize_deferred_only_current(
+        &self,
+    ) -> Result<
+        PersistedRealmProcessorTerminalAuthorization<Hash>,
+        RealmProcessorTerminalAuthorizationStoreError,
+    > {
+        self.authorize_selected(
+            RealmProcessorTerminalAuthorizationMode::RetireDeferredOnly,
+        )
+        .await
     }
 }
 

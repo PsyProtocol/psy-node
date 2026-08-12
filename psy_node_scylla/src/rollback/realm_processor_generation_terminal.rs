@@ -201,6 +201,16 @@ impl ScyllaRealmProcessorGenerationTerminalStore {
             application.semantic(),
         )
         .map_err(|error| RealmProcessorGenerationTerminalStoreError::Application(error.to_string()))?;
+        if matches!(
+            pipeline.processing_state(),
+            psy_node_core::store::pending_generation_pipeline::PendingProcessingState::RetiredNoWork { .. }
+        ) && application.semantic().has_application_work()
+            && !application.semantic().is_deferred_only_work()
+        {
+            return Err(
+                RealmProcessorGenerationTerminalStoreError::AuthorizationBindingMismatch,
+            );
+        }
         let terminal = RealmProcessorGenerationTerminal::try_new_from_reserved_context(
             pipeline,
             reserved_context,
@@ -478,5 +488,25 @@ mod tests {
         assert!(!production.contains("seal_pipeline_rotation"));
         assert!(!production.contains("ScyllaPendingPipelineStore"));
         assert!(!production.contains("pipeline.apply"));
+    }
+
+    #[test]
+    fn retired_application_work_must_be_exactly_deferred_only() {
+        let source = include_str!("realm_processor_generation_terminal.rs");
+        let method = source
+            .split("pub(super) async fn persist_from_authorized_sources")
+            .nth(1)
+            .unwrap()
+            .split("async fn persist<")
+            .next()
+            .unwrap();
+        let retired = method.find("PendingProcessingState::RetiredNoWork").unwrap();
+        let application_work = method.find("has_application_work()").unwrap();
+        let deferred_only = method.find("is_deferred_only_work()").unwrap();
+        let terminal = method
+            .find("RealmProcessorGenerationTerminal::try_new_from_reserved_context")
+            .unwrap();
+        assert!(retired < application_work);
+        assert!(application_work < deferred_only && deferred_only < terminal);
     }
 }

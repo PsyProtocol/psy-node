@@ -75,13 +75,14 @@ use super::{
 #[cfg(test)]
 use super::RETIRED_REALM_USER_UPDATE_CLAIM_V1_TABLE;
 
-// v17 adds the immutable Realm full-commit composite manifest. A v16 VERIFIED
-// lifecycle must not authorize a binary which expects that new durability
-// fence before writer/head publication.
-pub const PENDING_QUEUE_SIDECAR_SCHEMA_VERSION: u16 = 17;
+// v18 keeps the v17 physical manifest but changes the terminal/rotation
+// protocol: RetiredNoWork may now carry a storage-proven deferred-only
+// application. A v17 VERIFIED lifecycle must not authorize a binary whose
+// restart/terminal decoder does not understand that state.
+pub const PENDING_QUEUE_SIDECAR_SCHEMA_VERSION: u16 = 18;
 pub const PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT: usize = 22;
 const FINGERPRINT_DOMAIN: &[u8] =
-    b"psy/rollback/pending-queue-sidecar-schema/v17";
+    b"psy/rollback/pending-queue-sidecar-schema/v18";
 const INSPECT_COLUMNS_CQL: &str = "SELECT column_name, type, kind, position, clustering_order FROM system_schema.columns WHERE keyspace_name = ? AND table_name = ?";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -590,6 +591,26 @@ pub(super) fn current_physical_schema_matches_historical_v16() -> bool {
     ) == historical_v16_schema_fingerprint()
 }
 
+#[cfg(test)]
+pub(super) fn historical_v17_schema_fingerprint() -> PendingQueueSidecarSchemaFingerprint {
+    // Frozen from the shipped v17 twenty-two-table manifest. v18 deliberately
+    // retains this physical shape while changing the protocol capability.
+    PendingQueueSidecarSchemaFingerprint::from_persisted([
+        0x92, 0x1a, 0x19, 0x40, 0xbd, 0x46, 0x3f, 0x7a,
+        0x99, 0xb0, 0xac, 0x6f, 0x20, 0x02, 0xc6, 0x82,
+        0xf0, 0x64, 0x57, 0xd4, 0x38, 0x3f, 0x3c, 0xf0,
+        0xbf, 0xd6, 0xa4, 0x41, 0xda, 0x67, 0x6b, 0x6c,
+    ])
+}
+
+#[cfg(test)]
+pub(super) fn current_physical_schema_matches_historical_v17() -> bool {
+    sidecar_schema_fingerprint(
+        17,
+        b"psy/rollback/pending-queue-sidecar-schema/v17",
+    ) == historical_v17_schema_fingerprint()
+}
+
 pub fn inspect_pending_queue_sidecar_columns(
     observed: Vec<ObservedPendingQueueSidecarColumn>,
     retired_v1_present: bool,
@@ -805,7 +826,7 @@ mod tests {
 
     #[test]
     fn exact_manifest_is_twenty_two_unique_tables_with_stable_placement() {
-        assert_eq!(PENDING_QUEUE_SIDECAR_SCHEMA_VERSION, 17);
+        assert_eq!(PENDING_QUEUE_SIDECAR_SCHEMA_VERSION, 18);
         assert_eq!(PendingQueueSidecarPhysicalTable::ALL.len(), 22);
         let names = PendingQueueSidecarPhysicalTable::ALL.iter().map(|table| table.table_name()).collect::<std::collections::BTreeSet<_>>();
         assert_eq!(names.len(), 22);
@@ -818,6 +839,7 @@ mod tests {
         assert!(!current_physical_schema_matches_historical_v13());
         assert!(!current_physical_schema_matches_historical_v15());
         assert!(!current_physical_schema_matches_historical_v16());
+        assert!(current_physical_schema_matches_historical_v17());
         assert_eq!(
             hex::encode(historical_v12_schema_fingerprint().as_bytes()),
             "466bf80f7e9f336a5191c2efdecf05129c96f6086f57c1afb14ce6cbe0aca7fb",
@@ -837,6 +859,10 @@ mod tests {
         assert_eq!(
             hex::encode(historical_v16_schema_fingerprint().as_bytes()),
             "296fdbc4419b991b9e8f2ffd88dadb5689127cf919afe6756c498a0fc24096d4",
+        );
+        assert_eq!(
+            hex::encode(historical_v17_schema_fingerprint().as_bytes()),
+            "921a1940bd463f7a99b0ac6f2002c682f06457d4383f3cf0bfd6a441da676b6c",
         );
     }
 

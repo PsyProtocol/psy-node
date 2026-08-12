@@ -382,9 +382,12 @@ impl RealmProcessorSemanticOutput {
     pub fn jobs(&self) -> &[RealmProcessorSemanticJob] { &self.jobs }
     pub fn deferred_jobs(&self) -> &[RealmProcessorDeferredJob] { &self.deferred_jobs }
 
-    /// Work classification is based on application semantics, never transport
-    /// Data count.  A deferred job is work even when the current tree is a no-op.
-    pub fn has_application_work(&self) -> bool {
+    /// Work that changes the current generation's materialized Realm state
+    /// and therefore requires the proof/writer path. Deferred jobs are
+    /// deliberately excluded: they are immutable work for the successor and
+    /// must survive rotation, but they do not justify manufacturing a proof
+    /// for an otherwise unchanged current state.
+    pub fn has_materialized_state_work(&self) -> bool {
         self.old_realm_root != self.new_realm_root
             || self.total_users_updated != 0
             || self.total_proofs_generated != 0
@@ -394,7 +397,19 @@ impl RealmProcessorSemanticOutput {
             || !self.user_leaves.is_empty()
             || !self.contract_state_imt_leaves.is_empty()
             || !self.jobs.is_empty()
-            || !self.deferred_jobs.is_empty()
+    }
+
+    /// Work classification is based on application semantics, never transport
+    /// Data count. A deferred job is durable application work even when the
+    /// current tree is a no-op.
+    pub fn has_application_work(&self) -> bool {
+        self.has_materialized_state_work() || !self.deferred_jobs.is_empty()
+    }
+
+    /// The exact edge case that may retire the current generation without a
+    /// proof while carrying immutable jobs into the successor.
+    pub fn is_deferred_only_work(&self) -> bool {
+        !self.has_materialized_state_work() && !self.deferred_jobs.is_empty()
     }
 
     fn encode_unsigned(&self) -> Vec<u8> {
@@ -698,6 +713,8 @@ mod tests {
     fn deferred_job_is_application_work_even_with_no_tree_change() {
         let output = RealmProcessorSemanticOutput::try_from_candidate_parts(parts(true)).unwrap();
         assert!(output.has_application_work());
+        assert!(!output.has_materialized_state_work());
+        assert!(output.is_deferred_only_work());
         assert_eq!(output.jobs().len(), 0);
         assert_eq!(output.deferred_jobs().len(), 1);
     }
@@ -709,6 +726,8 @@ mod tests {
         let output = RealmProcessorSemanticOutput::try_from_candidate_parts(empty).unwrap();
         assert_eq!(output.item_count(), 2);
         assert!(!output.has_application_work());
+        assert!(!output.has_materialized_state_work());
+        assert!(!output.is_deferred_only_work());
     }
 
     #[test]

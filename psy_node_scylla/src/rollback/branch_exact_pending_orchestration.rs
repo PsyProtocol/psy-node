@@ -15,7 +15,11 @@ use std::{error::Error, fmt};
 use parth_core::protocol::core_types::Q256BitHash;
 use psy_data::protocol::chain_context::{AuthorityObservation, AuthorityScope};
 use psy_node_core::{
-    queue::realm_processor_application_archive::RealmProcessorApplicationArchiveSlot,
+    queue::{
+        realm_processor_application_archive::RealmProcessorApplicationArchiveSlot,
+        realm_processor_generation_continuation::RealmProcessorApplicationContinuation,
+        realm_processor_semantic_output::RealmProcessorSemanticOutput,
+    },
     store::{
     authority_commit::{AuthorityIntentObservation, ObservedAuthorityTimestampState},
     pending_generation_identity::{
@@ -373,6 +377,70 @@ pub(crate) fn seal_branch_exact_application_no_work<Hash: Q256BitHash>(
             observed,
         )
         .map_err(BranchExactPendingOrchestrationError::Pipeline)
+}
+
+/// Retire one exact deferred-only application without manufacturing a proof
+/// or touching the materialized writer/head. The immutable application still
+/// counts as work because its jobs must be carried to the successor; this
+/// transition only certifies that the current Realm state did not change.
+pub(crate) fn seal_branch_exact_application_deferred_only<Hash: Q256BitHash>(
+    pipeline: &StoredPendingPipeline<Hash>,
+    writer: &StoredBranchExactWriterLifecycle<Hash>,
+    application: RealmProcessorApplicationContinuation,
+    semantic: &RealmProcessorSemanticOutput,
+    observed: AuthorityObservation<Hash>,
+) -> Result<SealedPendingPipelineTransition<Hash>, BranchExactPendingOrchestrationError> {
+    let active = require_active_writer(pipeline, writer)?;
+    if pipeline.key().authority() == AuthorityScope::Coordinator {
+        return Err(BranchExactPendingOrchestrationError::CoordinatorNoWork);
+    }
+    let PendingProcessingState::WorkCaptured(capture) = pipeline.processing_state() else {
+        return Err(BranchExactPendingOrchestrationError::WorkNotCaptured);
+    };
+    let observed_application = RealmProcessorApplicationContinuation::try_from_storage(
+        application.archive_slot(),
+        application.archive_digest(),
+        semantic,
+    )
+    .map_err(|_| BranchExactPendingOrchestrationError::GenerationMismatch)?;
+    if observed_application != application
+        || capture.as_bytes() != application.archive_slot().as_bytes()
+        || !semantic.is_deferred_only_work()
+    {
+        return Err(BranchExactPendingOrchestrationError::GenerationMismatch);
+    }
+    require_writer_frontier(pipeline, active)?;
+    let seal = PendingEmptyQueueSealDigest::try_new(*capture.as_bytes())
+        .map_err(BranchExactPendingOrchestrationError::Pipeline)?;
+    let receipt = generation_receipt_digest(
+        NO_WORK_DOMAIN,
+        pipeline,
+        &[seal.as_bytes(), observed.to_canonical_bytes().as_slice()],
+    )?;
+    pipeline
+        .seal_retire_deferred_work(
+            capture,
+            PendingNoWorkReceiptDigest::try_new(receipt)
+                .map_err(BranchExactPendingOrchestrationError::Pipeline)?,
+            observed,
+        )
+        .map_err(BranchExactPendingOrchestrationError::Pipeline)
+}
+
+/// Exact precondition used before a deferred-only WorkCaptured generation may
+/// retire without entering the proof/writer path.
+pub(crate) fn validate_branch_exact_deferred_only_pair<Hash: Q256BitHash>(
+    pipeline: &StoredPendingPipeline<Hash>,
+    writer: &StoredBranchExactWriterLifecycle<Hash>,
+) -> Result<(), BranchExactPendingOrchestrationError> {
+    let active = require_active_writer(pipeline, writer)?;
+    if !matches!(
+        pipeline.processing_state(),
+        PendingProcessingState::WorkCaptured(_)
+    ) {
+        return Err(BranchExactPendingOrchestrationError::WorkNotCaptured);
+    }
+    require_writer_frontier(pipeline, active)
 }
 
 /// Exact precondition used by the storage-owned no-work authorization reader.
@@ -1104,5 +1172,28 @@ mod terminal_qualification_tests {
         assert!(writer < phase && phase < archive);
         assert!(archive < frontier && frontier < retire);
         assert!(method.contains("PendingNoWorkReceiptDigest::try_new"));
+    }
+
+    #[test]
+    fn deferred_only_retirement_binds_archive_semantic_writer_and_frontier() {
+        let source = include_str!("branch_exact_pending_orchestration.rs");
+        let method = source
+            .split("pub(crate) fn seal_branch_exact_application_deferred_only")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn validate_branch_exact_deferred_only_pair")
+            .next()
+            .unwrap();
+
+        let writer = method.find("require_active_writer").unwrap();
+        let capture = method.find("PendingProcessingState::WorkCaptured").unwrap();
+        let semantic = method.find("semantic.is_deferred_only_work()").unwrap();
+        let frontier = method.find("require_writer_frontier").unwrap();
+        let retire = method.find("seal_retire_deferred_work").unwrap();
+
+        assert!(writer < capture && capture < semantic);
+        assert!(semantic < frontier && frontier < retire);
+        assert!(method.contains("application.archive_slot()"));
+        assert!(method.contains("PendingEmptyQueueSealDigest::try_new(*capture.as_bytes())"));
     }
 }

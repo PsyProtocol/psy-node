@@ -532,10 +532,35 @@ where
                 application,
             } => {
                 tracing::info!(
-                    "Branch-exact application {:?} in pending={} contains durable deferred work but no checkpoint proof; awaiting the proofless terminal path",
+                    "Branch-exact application {:?} in pending={} contains only durable successor work; retiring its unchanged current state without manufacturing a proof",
                     application.archive_slot(),
                     processing.pending_id().get(),
                 );
+                match iteration.terminalize_and_rotate_generation().await? {
+                    RealmProcessorGenerationRotationOutcome::AwaitSuccessorDependency {
+                        source,
+                        successor,
+                        pipeline_revision,
+                    } => {
+                        tracing::debug!(
+                            "Branch-exact deferred-only generation is waiting for its successor dependency: source_pending={}, successor_pending={}, pipeline_revision={}",
+                            source.pending_id().get(),
+                            successor.pending_id().get(),
+                            pipeline_revision.get(),
+                        );
+                    }
+                    RealmProcessorGenerationRotationOutcome::Rotated(rotated) => {
+                        tracing::info!(
+                            "Branch-exact deferred-only generation retired and rotated exactly: source_pending={}, successor_pending={}, next_gathering_pending={}, pipeline_revision={}, terminal={:?}, carryover={:?}",
+                            rotated.source().pending_id().get(),
+                            rotated.successor().pending_id().get(),
+                            rotated.reserved_next_gathering().pending_id().get(),
+                            rotated.pipeline_revision().get(),
+                            rotated.terminal_digest(),
+                            rotated.carryover_digest(),
+                        );
+                    }
+                }
                 return Ok(());
             }
             RealmProcessorApplicationProofWorkOutcome::Ready(work) => work,
@@ -1076,7 +1101,7 @@ where
                     continuation.phase(),
                     RealmProcessorGenerationContinuationPhase::AwaitNoWorkTerminal
                         | RealmProcessorGenerationContinuationPhase::AwaitPublishedTerminal
-                        | RealmProcessorGenerationContinuationPhase::AwaitRetiredNoWorkTerminal
+                        | RealmProcessorGenerationContinuationPhase::AwaitRetiredTerminal
                 ) {
                     let RealmNormalCommitIteration::BranchExact(iteration) = iteration
                     else {
@@ -1723,6 +1748,7 @@ mod h23c4d2_tests {
         assert!(route.contains(
             "RealmProcessorApplicationProofWorkOutcome::AwaitProoflessApplication"
         ));
+        assert!(route.contains("terminalize_and_rotate_generation()"));
         assert!(route.contains("return Ok(())"));
         assert!(!route.contains("publish_branch_exact_worker_jobs"));
         assert!(!route.contains("prepare_mapping_and_reward_proof"));
@@ -1808,7 +1834,7 @@ mod h23_generation_rotation_tests {
             "RealmProcessorGenerationContinuationPhase::AwaitNoWorkTerminal"
         ));
         assert!(terminal.contains(
-            "RealmProcessorGenerationContinuationPhase::AwaitRetiredNoWorkTerminal"
+            "RealmProcessorGenerationContinuationPhase::AwaitRetiredTerminal"
         ));
         let recover = terminal.find("recover_full_commit_publication").unwrap();
         let rotate = terminal.find("terminalize_and_rotate_generation").unwrap();

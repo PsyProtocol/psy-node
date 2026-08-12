@@ -62,7 +62,7 @@ impl RealmProcessorReadOnlyRestartPreparation {
         let terminal_phase = matches!(
             continuation.phase(),
             RealmProcessorGenerationContinuationPhase::AwaitPublishedTerminal
-                | RealmProcessorGenerationContinuationPhase::AwaitRetiredNoWorkTerminal
+                | RealmProcessorGenerationContinuationPhase::AwaitRetiredTerminal
         );
         let valid = match (inbound, terminal, terminal_phase) {
             (
@@ -344,7 +344,7 @@ mod tests {
                 RealmProcessorApplicationArchiveSlot::try_new([1; 32]).unwrap(),
                 RealmProcessorApplicationArchiveDigest::try_new([2; 32]).unwrap(),
                 RealmProcessorSemanticOutputDigest::try_new([3; 32]).unwrap(),
-                phase.expects_application_work().unwrap(),
+                phase.expects_application_work().unwrap_or(false),
                 0,
                 RealmProcessorDeferredCarryoverDigest::try_new([4; 32]).unwrap(),
             )
@@ -424,7 +424,7 @@ mod tests {
             )
             .is_ok());
         }
-        for phase in [Phase::AwaitPublishedTerminal, Phase::AwaitRetiredNoWorkTerminal] {
+        for phase in [Phase::AwaitPublishedTerminal, Phase::AwaitRetiredTerminal] {
             for terminal in [
                 RealmProcessorTerminalCarryoverObservation::AwaitVerifiedTerminalAuthorization,
                 RealmProcessorTerminalCarryoverObservation::UnqualifiedTerminalObservedAwaitCarryover,
@@ -483,7 +483,7 @@ mod tests {
         ));
 
         let prepared = RealmProcessorReadOnlyRestartPreparation::try_from_storage(
-            continuation(Phase::AwaitRetiredNoWorkTerminal),
+            continuation(Phase::AwaitRetiredTerminal),
             RealmProcessorInboundCarryoverObservation::Bootstrap,
             RealmProcessorTerminalCarryoverObservation::TerminalAndCarryoverObserved,
         )

@@ -141,9 +141,6 @@ impl RealmProcessorGenerationTerminalKind {
         }
     }
 
-    const fn expects_work(self) -> bool {
-        matches!(self, Self::Published)
-    }
 }
 
 /// Immutable predecessor-keyed terminal and future rotation intent.
@@ -772,8 +769,19 @@ fn validate_application<Hash>(
     pipeline: &StoredPendingPipeline<Hash>,
     application: RealmProcessorApplicationContinuation,
 ) -> Result<(), RealmGenerationTerminalError> {
-    if application.has_application_work() != kind.expects_work() {
-        return Err(RealmGenerationTerminalError::ApplicationWorkMismatch);
+    match kind {
+        RealmProcessorGenerationTerminalKind::Published
+            if !application.has_application_work() =>
+        {
+            return Err(RealmGenerationTerminalError::ApplicationWorkMismatch)
+        }
+        RealmProcessorGenerationTerminalKind::RetiredNoWork
+            if application.has_application_work()
+                && application.deferred_count() == 0 =>
+        {
+            return Err(RealmGenerationTerminalError::ApplicationWorkMismatch)
+        }
+        _ => {}
     }
     let selected = match pipeline.processing_state() {
         PendingProcessingState::Published { capture, .. } => *capture.as_bytes(),
@@ -1244,6 +1252,33 @@ mod tests {
         (terminal, application)
     }
 
+    fn retired_deferred() -> (StoredPendingPipeline<PHash>, RealmProcessorApplicationContinuation) {
+        let application = application(33, true, 2);
+        let sealing = ready()
+            .seal_begin_queue_close(PendingQueueCloseIntentDigest::try_new([34; 32]).unwrap())
+            .unwrap()
+            .candidate()
+            .clone();
+        let captured = sealing
+            .seal_capture_work(
+                PendingQueueCloseIntentDigest::try_new([34; 32]).unwrap(),
+                PendingWorkCaptureDigest::try_new(*application.archive_slot().as_bytes()).unwrap(),
+            )
+            .unwrap()
+            .candidate()
+            .clone();
+        let terminal = captured
+            .seal_retire_deferred_work(
+                PendingWorkCaptureDigest::try_new(*application.archive_slot().as_bytes()).unwrap(),
+                PendingNoWorkReceiptDigest::try_new([35; 32]).unwrap(),
+                *captured.frontier(),
+            )
+            .unwrap()
+            .candidate()
+            .clone();
+        (terminal, application)
+    }
+
     fn terminal(
         pipeline: &StoredPendingPipeline<PHash>,
         application: RealmProcessorApplicationContinuation,
@@ -1337,6 +1372,10 @@ mod tests {
                 let (pipeline, application) = retired();
                 (pipeline, application, RealmProcessorGenerationTerminalKind::RetiredNoWork)
             },
+            {
+                let (pipeline, application) = retired_deferred();
+                (pipeline, application, RealmProcessorGenerationTerminalKind::RetiredNoWork)
+            },
         ] {
             let terminal = terminal(&pipeline, application);
             assert_eq!(terminal.kind(), kind);
@@ -1363,7 +1402,7 @@ mod tests {
             )
             .unwrap();
             if kind == RealmProcessorGenerationTerminalKind::RetiredNoWork {
-                assert_eq!(carryover.deferred_count(), 0);
+                assert_eq!(carryover.deferred_count(), application.deferred_count());
                 assert_ne!(carryover.deferred_digest().as_bytes(), &[0; 32]);
             }
         }

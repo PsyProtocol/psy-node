@@ -605,7 +605,9 @@ impl ScyllaRealmProcessorApplicationArchiveStore {
             .checked_add(revision_delta)
             .ok_or(RealmProcessorApplicationArchiveStoreError::CounterOverflow)?;
         if current.revision().get() != expected_revision
-            || archive.semantic().has_application_work() != expected_work
+            || expected_work.is_some_and(|expected| {
+                archive.semantic().has_application_work() != expected
+            })
         {
             return Err(RealmProcessorApplicationArchiveStoreError::HandoffMismatch);
         }
@@ -763,7 +765,7 @@ fn application_continuation_slot(
     (
         RealmProcessorApplicationArchiveSlot,
         RealmProcessorGenerationContinuationPhase,
-        bool,
+        Option<bool>,
         u64,
     ),
     RealmProcessorApplicationArchiveStoreError,
@@ -772,31 +774,34 @@ fn application_continuation_slot(
         PendingProcessingState::WorkCaptured(capture) => Ok((
             RealmProcessorApplicationArchiveSlot::try_new(*capture.as_bytes())?,
             RealmProcessorGenerationContinuationPhase::AwaitWriter,
-            true,
+            Some(true),
             1,
         )),
         PendingProcessingState::InFlight { capture, .. } => Ok((
             RealmProcessorApplicationArchiveSlot::try_new(*capture.as_bytes())?,
             RealmProcessorGenerationContinuationPhase::AwaitWriterCompletion,
-            true,
+            Some(true),
             2,
         )),
         PendingProcessingState::EmptyQueueSealed(seal) => Ok((
             RealmProcessorApplicationArchiveSlot::try_new(*seal.as_bytes())?,
             RealmProcessorGenerationContinuationPhase::AwaitNoWorkTerminal,
-            false,
+            Some(false),
             1,
         )),
         PendingProcessingState::Published { capture, .. } => Ok((
             RealmProcessorApplicationArchiveSlot::try_new(*capture.as_bytes())?,
             RealmProcessorGenerationContinuationPhase::AwaitPublishedTerminal,
-            true,
+            Some(true),
             3,
         )),
         PendingProcessingState::RetiredNoWork { seal, .. } => Ok((
             RealmProcessorApplicationArchiveSlot::try_new(*seal.as_bytes())?,
-            RealmProcessorGenerationContinuationPhase::AwaitRetiredNoWorkTerminal,
-            false,
+            RealmProcessorGenerationContinuationPhase::AwaitRetiredTerminal,
+            // Retired may mean a truly empty application or a deferred-only
+            // application whose current state was unchanged. The selected
+            // archive is checked exactly by the terminal owner.
+            None,
             2,
         )),
         PendingProcessingState::Baseline(_)
@@ -1018,19 +1023,19 @@ mod tests {
             (
                 PendingProcessingState::WorkCaptured(capture),
                 RealmProcessorGenerationContinuationPhase::AwaitWriter,
-                true,
+                Some(true),
                 1,
             ),
             (
                 PendingProcessingState::InFlight { capture, intent },
                 RealmProcessorGenerationContinuationPhase::AwaitWriterCompletion,
-                true,
+                Some(true),
                 2,
             ),
             (
                 PendingProcessingState::EmptyQueueSealed(seal),
                 RealmProcessorGenerationContinuationPhase::AwaitNoWorkTerminal,
-                false,
+                Some(false),
                 1,
             ),
             (
@@ -1039,7 +1044,7 @@ mod tests {
                     receipt: publish,
                 },
                 RealmProcessorGenerationContinuationPhase::AwaitPublishedTerminal,
-                true,
+                Some(true),
                 3,
             ),
             (
@@ -1047,8 +1052,8 @@ mod tests {
                     seal,
                     receipt: no_work,
                 },
-                RealmProcessorGenerationContinuationPhase::AwaitRetiredNoWorkTerminal,
-                false,
+                RealmProcessorGenerationContinuationPhase::AwaitRetiredTerminal,
+                None,
                 2,
             ),
         ] {

@@ -42,8 +42,11 @@ pub enum RealmProcessorGenerationContinuationPhase {
     AwaitNoWorkTerminal,
     /// Published.  A later terminal authorization must persist the terminal.
     AwaitPublishedTerminal,
-    /// RetiredNoWork.  A later terminal authorization must persist the terminal.
-    AwaitRetiredNoWorkTerminal,
+    /// Retired without a current-state write. This covers both an entirely
+    /// empty application and a deferred-only application whose jobs are
+    /// committed for the successor. A later terminal authorization must
+    /// persist the terminal.
+    AwaitRetiredTerminal,
 }
 
 impl RealmProcessorGenerationContinuationPhase {
@@ -59,7 +62,11 @@ impl RealmProcessorGenerationContinuationPhase {
             Self::AwaitWriter
             | Self::AwaitWriterCompletion
             | Self::AwaitPublishedTerminal => Some(true),
-            Self::AwaitNoWorkTerminal | Self::AwaitRetiredNoWorkTerminal => Some(false),
+            Self::AwaitNoWorkTerminal => Some(false),
+            // The retired pipeline state may bind either an empty archive or
+            // a deferred-only archive. Exact semantic validation happens at
+            // the storage-owned retirement and terminal boundaries.
+            Self::AwaitRetiredTerminal => None,
             Self::AwaitPrimeOrRotate | Self::AwaitQueueClose | Self::CaptureClosedSource => None,
         }
     }
@@ -375,10 +382,7 @@ mod tests {
             )
             .is_err());
         }
-        for phase in [
-            RealmProcessorGenerationContinuationPhase::AwaitNoWorkTerminal,
-            RealmProcessorGenerationContinuationPhase::AwaitRetiredNoWorkTerminal,
-        ] {
+        for phase in [RealmProcessorGenerationContinuationPhase::AwaitNoWorkTerminal] {
             assert!(RealmProcessorGenerationContinuation::try_from_storage(
                 processing,
                 revision,
@@ -393,6 +397,15 @@ mod tests {
                 Some(application(true)),
             )
             .is_err());
+        }
+        for work in [false, true] {
+            assert!(RealmProcessorGenerationContinuation::try_from_storage(
+                processing,
+                revision,
+                RealmProcessorGenerationContinuationPhase::AwaitRetiredTerminal,
+                Some(application(work)),
+            )
+            .is_ok());
         }
     }
 

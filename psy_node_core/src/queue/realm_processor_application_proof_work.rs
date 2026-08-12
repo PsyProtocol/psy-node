@@ -40,6 +40,7 @@ impl RealmProcessorApplicationProofWork {
         if observed != application
             || !application.has_application_work()
             || semantic.actor_input_digest().is_none()
+            || (semantic.has_materialized_state_work() && semantic.jobs().is_empty())
         {
             return Err(RealmProcessorApplicationProofWorkError::ApplicationMismatch);
         }
@@ -107,7 +108,8 @@ impl RealmProcessorApplicationProofWork {
 
 /// Proof work is explicit about the deferred-only edge case. Such an
 /// application remains durable work, but it cannot manufacture a checkpoint
-/// proof or advance the narrow writer without a real proof-bearing output.
+/// proof or advance the narrow writer. Storage must retire the unchanged
+/// current state while retaining the committed jobs for the successor.
 #[derive(Debug)]
 pub enum RealmProcessorApplicationProofWorkOutcome {
     AwaitProoflessApplication {
@@ -119,7 +121,7 @@ pub enum RealmProcessorApplicationProofWorkOutcome {
 
 impl RealmProcessorApplicationProofWorkOutcome {
     pub fn from_exact_work(work: RealmProcessorApplicationProofWork) -> Self {
-        if work.semantic().jobs().is_empty() {
+        if work.semantic().is_deferred_only_work() {
             Self::AwaitProoflessApplication {
                 processing: work.processing(),
                 application: work.application(),
@@ -162,54 +164,56 @@ mod tests {
         },
     };
 
-    fn semantic(with_proof: bool) -> RealmProcessorSemanticOutput {
-        RealmProcessorSemanticOutput::try_from_candidate_parts(
-            RealmProcessorSemanticOutputParts {
-                context_digest: PendingQueueCaptureContextDigest::try_new([1; 32]).unwrap(),
-                generation_digest: RealmProcessorDurableGenerationDigest::try_new([2; 32])
-                    .unwrap(),
-                boundary_digest: PendingQueueBoundaryDigest::try_new([3; 32]).unwrap(),
-                item_count: 1,
-                input_binding: RealmProcessorSemanticInputBinding::SuccessorQualified(
-                    RealmProcessorActorInputDigest::try_new([4; 32]).unwrap(),
-                ),
-                processing_checkpoint_id: 7,
-                processing_checkpoint_root: [5; 32],
-                processing_realm_start_root: [6; 32],
-                old_realm_root: [6; 32],
-                new_realm_root: if with_proof { [7; 32] } else { [6; 32] },
-                total_users_updated: if with_proof { 1 } else { 0 },
-                total_proofs_generated: if with_proof { 1 } else { 0 },
-                global_user_tree_nodes: Vec::new(),
-                user_contract_tree_nodes: Vec::new(),
-                contract_state_tree_nodes: Vec::new(),
-                user_leaves: Vec::new(),
-                contract_state_imt_leaves: Vec::new(),
-                guta_header: vec![8],
-                jobs: if with_proof {
-                    vec![RealmProcessorSemanticJob::try_new(
-                        0,
-                        0,
-                        vec![9],
-                        vec![10],
-                    )
-                    .unwrap()]
-                } else {
-                    Vec::new()
-                },
-                deferred_jobs: if with_proof {
-                    Vec::new()
-                } else {
-                    vec![RealmProcessorDeferredJob::try_new(
-                        0,
-                        vec![11],
-                        vec![12],
-                    )
-                    .unwrap()]
-                },
+    fn semantic_parts(with_proof: bool) -> RealmProcessorSemanticOutputParts {
+        RealmProcessorSemanticOutputParts {
+            context_digest: PendingQueueCaptureContextDigest::try_new([1; 32]).unwrap(),
+            generation_digest: RealmProcessorDurableGenerationDigest::try_new([2; 32])
+                .unwrap(),
+            boundary_digest: PendingQueueBoundaryDigest::try_new([3; 32]).unwrap(),
+            item_count: 1,
+            input_binding: RealmProcessorSemanticInputBinding::SuccessorQualified(
+                RealmProcessorActorInputDigest::try_new([4; 32]).unwrap(),
+            ),
+            processing_checkpoint_id: 7,
+            processing_checkpoint_root: [5; 32],
+            processing_realm_start_root: [6; 32],
+            old_realm_root: [6; 32],
+            new_realm_root: if with_proof { [7; 32] } else { [6; 32] },
+            total_users_updated: if with_proof { 1 } else { 0 },
+            total_proofs_generated: if with_proof { 1 } else { 0 },
+            global_user_tree_nodes: Vec::new(),
+            user_contract_tree_nodes: Vec::new(),
+            contract_state_tree_nodes: Vec::new(),
+            user_leaves: Vec::new(),
+            contract_state_imt_leaves: Vec::new(),
+            guta_header: vec![8],
+            jobs: if with_proof {
+                vec![RealmProcessorSemanticJob::try_new(
+                    0,
+                    0,
+                    vec![9],
+                    vec![10],
+                )
+                .unwrap()]
+            } else {
+                Vec::new()
             },
-        )
-        .unwrap()
+            deferred_jobs: if with_proof {
+                Vec::new()
+            } else {
+                vec![RealmProcessorDeferredJob::try_new(
+                    0,
+                    vec![11],
+                    vec![12],
+                )
+                .unwrap()]
+            },
+        }
+    }
+
+    fn semantic(with_proof: bool) -> RealmProcessorSemanticOutput {
+        RealmProcessorSemanticOutput::try_from_candidate_parts(semantic_parts(with_proof))
+            .unwrap()
     }
 
     fn work(with_proof: bool) -> RealmProcessorApplicationProofWork {
@@ -238,6 +242,13 @@ mod tests {
             RealmProcessorApplicationProofWorkOutcome::from_exact_work(work(false)),
             RealmProcessorApplicationProofWorkOutcome::AwaitProoflessApplication { .. }
         ));
+    }
+
+    #[test]
+    fn semantic_model_rejects_materialized_state_change_without_a_proof_job() {
+        let mut parts = semantic_parts(true);
+        parts.jobs.clear();
+        assert!(RealmProcessorSemanticOutput::try_from_candidate_parts(parts).is_err());
     }
 
     #[test]
