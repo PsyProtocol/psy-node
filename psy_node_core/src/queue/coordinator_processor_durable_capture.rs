@@ -7,8 +7,10 @@
 //! contains no backend token, ACK method, pipeline transition or public
 //! unchecked constructor.
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, sync::Arc};
 
+use async_trait::async_trait;
+use psy_data::protocol::canonical_chain::NetworkId;
 use sha2::{Digest, Sha256};
 
 use crate::queue::recoverable_ephemeral::{
@@ -203,6 +205,87 @@ pub struct CoordinatorProcessorDurableCapturedGeneration {
     digest: CoordinatorProcessorDurableGenerationDigest,
 }
 
+/// Storage-owned owner of one Coordinator generation. Implementations keep
+/// all backend delivery/ACK tokens private and may only acknowledge a queue
+/// delivery after its exact artifact has been persisted and read back.
+#[async_trait]
+pub trait CoordinatorProcessorDurableCapturePort: Send {
+    /// Advances each of the three fixed sources by at most one durable batch,
+    /// then attempts an exhaustive Scylla-only replay. `None` means at least
+    /// one explicit source close has not been observed yet; it never means an
+    /// absent source is empty.
+    async fn capture_or_replay(
+        &mut self,
+    ) -> Result<
+        Option<CoordinatorProcessorDurableCapturedGeneration>,
+        CoordinatorProcessorDurableCaptureError,
+    >;
+}
+
+/// Identity-only factory installed by the verified Coordinator sidecar
+/// composition. Pending/proc identity is deliberately absent from this API:
+/// the concrete backend selects it from the current durable pipeline.
+#[async_trait]
+pub trait CoordinatorProcessorDurableCaptureFactory: Send + Sync {
+    fn network(&self) -> NetworkId;
+    fn writer_activation_digest(&self) -> [u8; 32];
+    fn queue_readiness_digest(&self) -> [u8; 32];
+
+    async fn open(
+        self: Arc<Self>,
+        request: SealedCoordinatorProcessorDurableCaptureRequest,
+    ) -> Result<Box<dyn CoordinatorProcessorDurableCapturePort>, CoordinatorProcessorDurableCaptureError>;
+}
+
+/// Sealed process-attempt identity. It contains no caller-selected pending,
+/// proc, queue subject, source slot or payload. The attempt digest must change
+/// for a new process owner so startup takeover advances the artifact fence.
+#[derive(Debug)]
+pub struct SealedCoordinatorProcessorDurableCaptureRequest {
+    network: NetworkId,
+    writer_activation_digest: [u8; 32],
+    queue_readiness_digest: [u8; 32],
+    owner_attempt_digest: [u8; 32],
+}
+
+impl SealedCoordinatorProcessorDurableCaptureRequest {
+    pub fn seal(
+        factory: &dyn CoordinatorProcessorDurableCaptureFactory,
+        owner_attempt_digest: [u8; 32],
+    ) -> Result<Self, CoordinatorProcessorDurableCaptureError> {
+        let writer_activation_digest = factory.writer_activation_digest();
+        let queue_readiness_digest = factory.queue_readiness_digest();
+        if writer_activation_digest == [0; 32]
+            || queue_readiness_digest == [0; 32]
+            || owner_attempt_digest == [0; 32]
+        {
+            return Err(CoordinatorProcessorDurableCaptureError::RuntimeCapabilityMismatch);
+        }
+        Ok(Self {
+            network: factory.network(),
+            writer_activation_digest,
+            queue_readiness_digest,
+            owner_attempt_digest,
+        })
+    }
+
+    pub const fn network(&self) -> NetworkId {
+        self.network
+    }
+
+    pub const fn writer_activation_digest(&self) -> &[u8; 32] {
+        &self.writer_activation_digest
+    }
+
+    pub const fn queue_readiness_digest(&self) -> &[u8; 32] {
+        &self.queue_readiness_digest
+    }
+
+    pub const fn owner_attempt_digest(&self) -> &[u8; 32] {
+        &self.owner_attempt_digest
+    }
+}
+
 impl CoordinatorProcessorDurableCapturedGeneration {
     pub fn try_from_exhaustive_readback(
         context: PendingQueueCaptureContext,
@@ -289,6 +372,10 @@ pub enum CoordinatorProcessorDurableCaptureError {
     NonCanonicalItemOrder,
     SourceManifestMismatch,
     ItemCountOverflow,
+    IdentityMismatch,
+    RuntimeCapabilityMismatch,
+    ConcurrentMutation,
+    Backend(String),
 }
 
 impl fmt::Display for CoordinatorProcessorDurableCaptureError {
@@ -363,6 +450,35 @@ mod tests {
         .unwrap()
     }
 
+    struct FakeFactory;
+
+    #[async_trait]
+    impl CoordinatorProcessorDurableCaptureFactory for FakeFactory {
+        fn network(&self) -> NetworkId {
+            NetworkId::try_from_chain_id(1337).unwrap()
+        }
+
+        fn writer_activation_digest(&self) -> [u8; 32] {
+            [7; 32]
+        }
+
+        fn queue_readiness_digest(&self) -> [u8; 32] {
+            [8; 32]
+        }
+
+        async fn open(
+            self: Arc<Self>,
+            _request: SealedCoordinatorProcessorDurableCaptureRequest,
+        ) -> Result<
+            Box<dyn CoordinatorProcessorDurableCapturePort>,
+            CoordinatorProcessorDurableCaptureError,
+        > {
+            Err(CoordinatorProcessorDurableCaptureError::Backend(
+                "fake".to_owned(),
+            ))
+        }
+    }
+
     #[test]
     fn exact_three_source_generation_is_deterministic_and_allows_explicit_empty() {
         let first = generation();
@@ -372,6 +488,28 @@ mod tests {
         assert_eq!(first.deploy().items().len(), 0);
         assert_eq!(first.digest(), second.digest());
         assert_ne!(first.digest().as_bytes(), &[0; 32]);
+    }
+
+    #[test]
+    fn sealed_request_contains_only_runtime_identity_and_nonzero_process_attempt() {
+        let factory = FakeFactory;
+        let request = SealedCoordinatorProcessorDurableCaptureRequest::seal(
+            &factory,
+            [9; 32],
+        )
+        .unwrap();
+        assert_eq!(request.network(), factory.network());
+        assert_eq!(request.writer_activation_digest(), &[7; 32]);
+        assert_eq!(request.queue_readiness_digest(), &[8; 32]);
+        assert_eq!(request.owner_attempt_digest(), &[9; 32]);
+        assert_eq!(
+            SealedCoordinatorProcessorDurableCaptureRequest::seal(
+                &factory,
+                [0; 32],
+            )
+            .unwrap_err(),
+            CoordinatorProcessorDurableCaptureError::RuntimeCapabilityMismatch,
+        );
     }
 
     #[test]
