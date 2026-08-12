@@ -162,6 +162,16 @@ impl AuthorityHeadManifestDigest {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    fn try_from_verified_full_commit(
+        digest: [u8; 32],
+    ) -> Result<Self, AuthorityLocalHeadModelError> {
+        if digest == [0; 32] {
+            Err(AuthorityLocalHeadModelError::ZeroManifestDigest)
+        } else {
+            Ok(Self(digest))
+        }
+    }
 }
 
 /// Complete, indivisible durable row payload plus its LWT revision.
@@ -395,6 +405,55 @@ impl<Hash: Q256BitHash> SealedAuthorityLocalHeadCas<Hash> {
         })
     }
 
+    /// Internal bridge used by the sealed Realm full-commit request after its
+    /// immutable composite manifest has been freshly revalidated.  The
+    /// request performs the proof/root/source checks; this constructor keeps
+    /// the authority-local row transition monotonic and indivisible.
+    pub(crate) fn seal_realm_full_commit_advance(
+        expected: StoredAuthorityLocalHead<Hash>,
+        observation: AuthorityObservation<Hash>,
+        commit_write_timestamp: CommitWriteTimestampUs,
+        manifest_digest: [u8; 32],
+    ) -> Result<Self, AuthorityLocalHeadModelError> {
+        let key = expected.head.key();
+        let observed_key = AuthorityTimestampKey::new(
+            observation.chain().network_id(),
+            observation.authority(),
+        );
+        if observed_key != key {
+            return Err(AuthorityLocalHeadModelError::AuthorityChanged);
+        }
+        if commit_write_timestamp.as_i64()
+            <= expected.commit_write_timestamp.as_i64()
+        {
+            return Err(AuthorityLocalHeadModelError::TimestampDidNotAdvance {
+                previous: expected.commit_write_timestamp.as_i64(),
+                candidate: commit_write_timestamp.as_i64(),
+            });
+        }
+        let candidate_head = AuthorityHeadView::try_from_observed(
+            key,
+            *observation.chain(),
+            observation.state_checkpoint_id(),
+            *observation.state_root(),
+        )?;
+        let candidate = StoredAuthorityLocalHead {
+            revision: expected.revision.checked_next()?,
+            bootstrap_reason: expected.bootstrap_reason,
+            head: candidate_head,
+            commit_write_timestamp,
+            manifest_digest: AuthorityHeadManifestDigest::try_from_verified_full_commit(
+                manifest_digest,
+            )?,
+            storage_binding: expected.storage_binding,
+        };
+        Ok(Self {
+            key,
+            expected,
+            candidate,
+        })
+    }
+
     /// Qualification-only bridge for RF=3 compositions that exercise a
     /// later production-shaped reader without pretending that the writer,
     /// manifest, or proof chain has already been integrated.
@@ -518,6 +577,7 @@ pub enum AuthorityLocalHeadModelError {
     NegativeRevision(i64),
     RevisionOutOfCqlRange(u64),
     RevisionOverflow(u64),
+    ZeroManifestDigest,
     BindingGenerationOutOfCqlRange(u64),
     InvalidPayloadLength { expected: usize, actual: usize },
     InvalidPayloadMagic,
@@ -560,3 +620,125 @@ impl fmt::Display for AuthorityLocalHeadModelError {
 }
 
 impl Error for AuthorityLocalHeadModelError {}
+
+#[cfg(test)]
+mod tests {
+    use parth_core::PHash;
+    use psy_core::constants::chain_id::PsyChainNetworkType;
+    use psy_data::protocol::{
+        canonical_chain::{
+            CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId,
+            CheckpointRef, NetworkId,
+        },
+        chain_context::{
+            AuthorityObservation, AuthorityStateCheckpointId,
+            AuthorityStateRoot,
+        },
+    };
+
+    use super::*;
+    use crate::store::branch_exact_schema::AuthorityScope;
+
+    fn observation(
+        chain_checkpoint: u64,
+        state_checkpoint: u64,
+        root_seed: u64,
+    ) -> AuthorityObservation<PHash> {
+        AuthorityObservation::try_new(
+            CanonicalChainRef::new(
+                NetworkId::from_network_type(
+                    PsyChainNetworkType::LocalDevnet,
+                ),
+                ChainEpoch::new(2),
+                CheckpointRef::new(
+                    CheckpointId::new(chain_checkpoint),
+                    CheckpointHash::from_last_chain_hash(PHash::from_values(
+                        chain_checkpoint,
+                        chain_checkpoint + 1,
+                        chain_checkpoint + 2,
+                        chain_checkpoint + 3,
+                    )),
+                ),
+            ),
+            AuthorityScope::Realm {
+                realm_id: 7,
+                realm_sub_id: 2,
+            },
+            AuthorityStateCheckpointId::new(state_checkpoint),
+            AuthorityStateRoot::from_local_state_root(PHash::from_values(
+                root_seed,
+                root_seed + 1,
+                root_seed + 2,
+                root_seed + 3,
+            )),
+        )
+        .unwrap()
+    }
+
+    fn expected_head() -> StoredAuthorityLocalHead<PHash> {
+        let observation = observation(10, 9, 20);
+        let key = AuthorityTimestampKey::new(
+            observation.chain().network_id(),
+            observation.authority(),
+        );
+        AuthorityLocalHeadBootstrap::seal(
+            AuthorityLocalHeadBootstrapReason::GenesisNative,
+            AuthorityHeadView::try_from_observed(
+                key,
+                *observation.chain(),
+                observation.state_checkpoint_id(),
+                *observation.state_root(),
+            )
+            .unwrap(),
+            CommitWriteTimestampUs::try_from_i128(100).unwrap(),
+            AuthorityManifestDigest::from_persisted([3; 32]),
+            AuthorityStorageBindingRef::new(
+                AuthorityStorageBindingGeneration::try_new(4).unwrap(),
+                AuthorityStorageNamespaceId::from_verified_namespace_id([
+                    5; 32
+                ]),
+            ),
+        )
+        .candidate()
+        .clone()
+    }
+
+    #[test]
+    fn realm_full_commit_head_advance_is_manifest_bound_and_monotonic() {
+        let expected = expected_head();
+        let candidate_observation = observation(11, 10, 30);
+        let sealed = SealedAuthorityLocalHeadCas::seal_realm_full_commit_advance(
+            expected.clone(),
+            candidate_observation,
+            CommitWriteTimestampUs::try_from_i128(101).unwrap(),
+            [9; 32],
+        )
+        .unwrap();
+        assert_eq!(sealed.candidate().revision().get(), 1);
+        assert_eq!(sealed.candidate().storage_binding(), expected.storage_binding());
+        assert_eq!(sealed.candidate().manifest_digest().as_bytes(), &[9; 32]);
+        assert_eq!(
+            sealed.candidate().head().state_checkpoint(),
+            candidate_observation.state_checkpoint_id()
+        );
+
+        assert!(matches!(
+            SealedAuthorityLocalHeadCas::seal_realm_full_commit_advance(
+                expected.clone(),
+                candidate_observation,
+                CommitWriteTimestampUs::try_from_i128(100).unwrap(),
+                [9; 32],
+            ),
+            Err(AuthorityLocalHeadModelError::TimestampDidNotAdvance { .. })
+        ));
+        assert!(matches!(
+            SealedAuthorityLocalHeadCas::seal_realm_full_commit_advance(
+                expected,
+                candidate_observation,
+                CommitWriteTimestampUs::try_from_i128(101).unwrap(),
+                [0; 32],
+            ),
+            Err(AuthorityLocalHeadModelError::ZeroManifestDigest)
+        ));
+    }
+}

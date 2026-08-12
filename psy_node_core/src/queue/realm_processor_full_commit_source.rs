@@ -16,12 +16,16 @@ use parth_core::{
 };
 use psy_data::{
     prepared_block::realm::PsyRealmCoordinatorUpdate,
-    protocol::canonical_chain::{CanonicalChainRef, NetworkId},
+    protocol::{
+        canonical_chain::{CanonicalChainRef, NetworkId},
+        chain_context::{AuthorityObservation, AuthorityScope},
+    },
 };
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 use sha2::{Digest, Sha256};
 
 use crate::store::{
+    authority_local_head::{SealedAuthorityLocalHeadCas, StoredAuthorityLocalHead},
     pending_generation_identity::PendingGenerationContext,
     pending_generation_pipeline::PendingPipelineRevision,
     realm_full_commit_write_set::RealmFullCommitWriteSet,
@@ -30,6 +34,7 @@ use crate::store::{
     realm_processor_startup::{
         RealmProcessorStartupPermitDigest,
     },
+    timestamp::CommitWriteTimestampUs,
 };
 
 use super::{
@@ -55,6 +60,7 @@ pub struct RealmProcessorVerifiedFullCommitSource<Hash> {
     proof: SealedRealmProofBinding<Hash>,
     coordinator_payload: Vec<u8>,
     coordinator_payload_digest: [u8; 32],
+    authority_observation: AuthorityObservation<Hash>,
     write_set: RealmFullCommitWriteSet,
 }
 
@@ -86,6 +92,22 @@ impl<Hash: Q256BitHash> RealmProcessorVerifiedFullCommitSource<Hash> {
             return Err(RealmProcessorFullCommitSourceError::IdentityMismatch);
         }
         let coordinator_payload_digest = digest_coordinator(&coordinator_payload);
+        let authority_observation = write_set
+            .authority_observation::<Hash>()
+            .map_err(|error| RealmProcessorFullCommitSourceError::Writer(error.to_string()))?;
+        let expected_authority = AuthorityScope::Realm {
+            realm_id,
+            realm_sub_id,
+        };
+        if authority_observation.authority() != expected_authority
+            || authority_observation.chain() != &coordinator.canonical_chain_ref
+            || authority_observation.state_checkpoint_id()
+                != proof.record().state_checkpoint()
+            || authority_observation.state_root().as_inner()
+                != proof.record().new_realm_root()
+        {
+            return Err(RealmProcessorFullCommitSourceError::IdentityMismatch);
+        }
         Ok(Self {
             realm_id,
             realm_sub_id,
@@ -95,6 +117,7 @@ impl<Hash: Q256BitHash> RealmProcessorVerifiedFullCommitSource<Hash> {
             proof,
             coordinator_payload,
             coordinator_payload_digest,
+            authority_observation,
             write_set,
         })
     }
@@ -131,6 +154,7 @@ pub struct SealedRealmProcessorFullCommitSourceRequest<Hash> {
     proof: SealedRealmProofBinding<Hash>,
     coordinator_payload: Vec<u8>,
     coordinator_payload_digest: [u8; 32],
+    authority_observation: AuthorityObservation<Hash>,
     write_set: RealmFullCommitWriteSet,
 }
 
@@ -171,6 +195,7 @@ impl<Hash: Q256BitHash> SealedRealmProcessorFullCommitSourceRequest<Hash> {
             proof: source.proof,
             coordinator_payload: source.coordinator_payload,
             coordinator_payload_digest: source.coordinator_payload_digest,
+            authority_observation: source.authority_observation,
             write_set: source.write_set,
         })
     }
@@ -197,8 +222,45 @@ impl<Hash: Q256BitHash> SealedRealmProcessorFullCommitSourceRequest<Hash> {
     pub const fn coordinator_payload_digest(&self) -> &[u8; 32] {
         &self.coordinator_payload_digest
     }
+    pub const fn authority_observation(&self) -> AuthorityObservation<Hash> {
+        self.authority_observation
+    }
     pub const fn write_set(&self) -> &RealmFullCommitWriteSet {
         &self.write_set
+    }
+
+    /// Seal the authority-head CAS only while the affine full-commit request
+    /// and its live proof binding are still present.  The storage adapter must
+    /// first fresh-revalidate the manifest and pass its exact digest/timestamp.
+    pub fn seal_authority_head_advance(
+        &self,
+        expected: StoredAuthorityLocalHead<Hash>,
+        write_timestamp: CommitWriteTimestampUs,
+        manifest_digest: [u8; 32],
+    ) -> Result<SealedAuthorityLocalHeadCas<Hash>, RealmProcessorFullCommitSourceError> {
+        let key = expected.head().key();
+        let expected_authority = AuthorityScope::Realm {
+            realm_id: self.realm_id,
+            realm_sub_id: self.realm_sub_id,
+        };
+        if key.network() != self.network
+            || key.authority() != expected_authority
+            || expected.head().state_root().as_inner()
+                != self.proof.record().old_realm_root()
+            || self.authority_observation.state_root().as_inner()
+                != self.proof.record().new_realm_root()
+            || self.authority_observation.state_checkpoint_id()
+                != self.proof.record().state_checkpoint()
+        {
+            return Err(RealmProcessorFullCommitSourceError::IdentityMismatch);
+        }
+        SealedAuthorityLocalHeadCas::seal_realm_full_commit_advance(
+            expected,
+            self.authority_observation,
+            write_timestamp,
+            manifest_digest,
+        )
+        .map_err(|error| RealmProcessorFullCommitSourceError::Backend(error.to_string()))
     }
 }
 
@@ -221,6 +283,110 @@ pub struct RealmProcessorFullCommitSourceObservation {
     manifest_digest: [u8; 32],
     typed_row_count: u32,
     total_mutation_count: u64,
+}
+
+/// Identity-only request for the crash window in which the pipeline is
+/// already Published but the branch-exact writer has not yet reached Active.
+/// It carries no manifest slot, digest, head or candidate supplied by the
+/// caller; the backend must select every one from durable storage.
+pub struct SealedRealmProcessorFullCommitPublicationRequest {
+    startup_permit_digest: RealmProcessorStartupPermitDigest,
+    network: NetworkId,
+    realm_id: u32,
+    realm_sub_id: u16,
+    writer_activation_digest: [u8; 32],
+    queue_readiness_digest: [u8; 32],
+}
+
+impl SealedRealmProcessorFullCommitPublicationRequest {
+    pub(crate) fn seal(
+        startup_permit_digest: RealmProcessorStartupPermitDigest,
+        network: NetworkId,
+        realm_id: u32,
+        realm_sub_id: u16,
+        writer_activation_digest: [u8; 32],
+        queue_readiness_digest: [u8; 32],
+    ) -> Result<Self, RealmProcessorFullCommitSourceError> {
+        if writer_activation_digest == [0; 32]
+            || queue_readiness_digest == [0; 32]
+        {
+            return Err(RealmProcessorFullCommitSourceError::IdentityMismatch);
+        }
+        Ok(Self {
+            startup_permit_digest,
+            network,
+            realm_id,
+            realm_sub_id,
+            writer_activation_digest,
+            queue_readiness_digest,
+        })
+    }
+
+    pub const fn startup_permit_digest(&self) -> RealmProcessorStartupPermitDigest {
+        self.startup_permit_digest
+    }
+    pub const fn network(&self) -> NetworkId { self.network }
+    pub const fn realm_id(&self) -> u32 { self.realm_id }
+    pub const fn realm_sub_id(&self) -> u16 { self.realm_sub_id }
+    pub const fn writer_activation_digest(&self) -> &[u8; 32] {
+        &self.writer_activation_digest
+    }
+    pub const fn queue_readiness_digest(&self) -> &[u8; 32] {
+        &self.queue_readiness_digest
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RealmProcessorFullCommitPublicationObservation {
+    processing: PendingGenerationContext,
+    application: RealmProcessorApplicationContinuation,
+    pipeline_revision: PendingPipelineRevision,
+    writer_revision: u64,
+    manifest_slot: [u8; 32],
+    manifest_digest: [u8; 32],
+    head_revision: u64,
+}
+
+impl RealmProcessorFullCommitPublicationObservation {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_from_storage(
+        processing: PendingGenerationContext,
+        application: RealmProcessorApplicationContinuation,
+        pipeline_revision: PendingPipelineRevision,
+        writer_revision: u64,
+        manifest_slot: [u8; 32],
+        manifest_digest: [u8; 32],
+        head_revision: u64,
+    ) -> Result<Self, RealmProcessorFullCommitSourceError> {
+        if writer_revision == 0
+            || manifest_slot == [0; 32]
+            || manifest_digest == [0; 32]
+            || !application.has_application_work()
+        {
+            return Err(RealmProcessorFullCommitSourceError::IdentityMismatch);
+        }
+        Ok(Self {
+            processing,
+            application,
+            pipeline_revision,
+            writer_revision,
+            manifest_slot,
+            manifest_digest,
+            head_revision,
+        })
+    }
+
+    pub const fn processing(&self) -> PendingGenerationContext { self.processing }
+    pub const fn application(&self) -> RealmProcessorApplicationContinuation {
+        self.application
+    }
+    pub const fn pipeline_revision(&self) -> PendingPipelineRevision {
+        self.pipeline_revision
+    }
+    pub const fn writer_revision(&self) -> u64 { self.writer_revision }
+    pub const fn manifest_slot(&self) -> &[u8; 32] { &self.manifest_slot }
+    pub const fn manifest_digest(&self) -> &[u8; 32] { &self.manifest_digest }
+    pub const fn head_revision(&self) -> u64 { self.head_revision }
 }
 
 impl RealmProcessorFullCommitSourceObservation {
@@ -314,6 +480,14 @@ pub trait RealmProcessorFullCommitSourceFactory<Hash>: Send + Sync {
         &self,
         request: SealedRealmProcessorFullCommitSourceRequest<Hash>,
     ) -> Result<RealmProcessorFullCommitSourceObservation, RealmProcessorFullCommitSourceError>;
+
+    async fn recover_publication(
+        &self,
+        request: SealedRealmProcessorFullCommitPublicationRequest,
+    ) -> Result<
+        RealmProcessorFullCommitPublicationObservation,
+        RealmProcessorFullCommitSourceError,
+    >;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -346,12 +520,13 @@ fn digest_coordinator(bytes: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn source_request_and_observation_do_not_expose_publish_authority() {
+    fn source_request_exposes_only_the_checked_head_model_not_storage_mutation() {
         let source = include_str!("realm_processor_full_commit_source.rs");
         let production = source.split("#[cfg(test)]").next().unwrap();
+        assert!(production.contains("seal_authority_head_advance"));
+        assert!(!production.contains("compare_and_set"));
         assert!(!production.contains("finish_published"));
         assert!(!production.contains("seal_rotation"));
-        assert!(!production.contains("authority_head"));
         assert!(!production.contains("pipeline.apply"));
         assert!(!production.contains("impl Clone for RealmProcessorVerifiedFullCommitSource"));
         assert!(!production.contains("impl Clone for SealedRealmProcessorFullCommitSourceRequest"));

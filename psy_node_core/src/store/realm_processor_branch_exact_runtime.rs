@@ -39,8 +39,10 @@ use crate::queue::{
     realm_processor_full_commit_source::{
         RealmProcessorFullCommitSourceError,
         RealmProcessorFullCommitSourceFactory,
+        RealmProcessorFullCommitPublicationObservation,
         RealmProcessorFullCommitSourceObservation,
         RealmProcessorVerifiedFullCommitSource,
+        SealedRealmProcessorFullCommitPublicationRequest,
         SealedRealmProcessorFullCommitSourceRequest,
     },
     realm_processor_continuation_restart::{
@@ -316,9 +318,10 @@ impl<Hash> RealmBranchExactCommitIteration<'_, Hash> {
     }
 
     /// Revalidates the application/proof/Coordinator source, executes every
-    /// remaining typed write with exact readback, and persists the immutable
-    /// full-commit manifest. It does not publish the authority head,
-    /// terminalize, or rotate the generation.
+    /// remaining typed write with exact readback, persists the immutable
+    /// full-commit manifest, publishes the authority head and pipeline, and
+    /// returns the writer to `Active`. It does not terminalize or rotate the
+    /// generation.
     pub async fn execute_full_commit(
         &mut self,
         source: RealmProcessorVerifiedFullCommitSource<Hash>,
@@ -340,6 +343,31 @@ impl<Hash> RealmBranchExactCommitIteration<'_, Hash> {
             source,
         )?;
         factory.execute_source(request).await
+    }
+
+    /// Recover the publication crash window using only storage-selected
+    /// pipeline, writer, manifest and authority-head rows. No caller-provided
+    /// slot, digest or authority observation participates in this operation.
+    pub async fn recover_full_commit_publication(
+        &mut self,
+    ) -> Result<
+        RealmProcessorFullCommitPublicationObservation,
+        RealmProcessorFullCommitSourceError,
+    >
+    where
+        Hash: Q256BitHash + 'static,
+    {
+        let runtime = self.owner.runtime();
+        let factory = Arc::clone(self.owner.installed.full_commit_source_factory());
+        let request = SealedRealmProcessorFullCommitPublicationRequest::seal(
+            self.owner.startup_permit_digest(),
+            runtime.network(),
+            runtime.realm_id(),
+            runtime.realm_sub_id(),
+            runtime.writer_activation_digest(),
+            runtime.queue_readiness_digest(),
+        )?;
+        factory.recover_publication(request).await
     }
 
     /// Freshly observes the storage-selected processing generation. This is
@@ -1125,6 +1153,18 @@ mod tests {
         {
             Err(RealmProcessorFullCommitSourceError::Backend(
                 "full-commit source fixture is installation-only".to_owned(),
+            ))
+        }
+
+        async fn recover_publication(
+            &self,
+            _request: SealedRealmProcessorFullCommitPublicationRequest,
+        ) -> Result<
+            RealmProcessorFullCommitPublicationObservation,
+            RealmProcessorFullCommitSourceError,
+        > {
+            Err(RealmProcessorFullCommitSourceError::Backend(
+                "full-commit publication fixture is installation-only".to_owned(),
             ))
         }
     }

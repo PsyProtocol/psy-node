@@ -8,6 +8,10 @@
 use std::{error::Error, fmt, sync::Arc};
 
 use parth_core::protocol::core_types::Q256BitHash;
+use psy_node_core::store::{
+    branch_pending_mapping::BranchPendingMapping,
+    pending_generation_pipeline::{PendingProcessingState, StoredPendingPipeline},
+};
 use scylla::{
     client::session::Session,
     response::query_result::QueryResult,
@@ -24,6 +28,7 @@ use super::{
     realm_full_commit_manifest::{
         RealmFullCommitCompositeManifest, RealmFullCommitManifestError,
         RealmFullCommitManifestSlot, RealmNarrowWritesVerifiedEvidence,
+        realm_full_commit_manifest_slot,
     },
     realm_full_commit_plan::RealmFullCommitPhysicalPlan,
     realm_full_commit_scylla::RealmFullCommitScyllaExecutor,
@@ -195,6 +200,74 @@ impl ScyllaRealmFullCommitManifestStore {
             .observe_runtime_sources(writer, executor, plan)
             .await?;
         if observed != receipt.manifest {
+            return Err(RealmFullCommitManifestStoreError::SourceChanged);
+        }
+        self.revalidate(receipt).await
+    }
+
+    /// Select the immutable manifest after the pending pipeline has reached
+    /// Published. This restart route derives the manifest slot from the
+    /// durable writer and pipeline; callers cannot supply a slot or digest.
+    pub(super) async fn read_for_published_runtime<Hash: Q256BitHash>(
+        &self,
+        writer: &ScyllaBranchExactWriterRuntime<Hash>,
+        pipeline: &StoredPendingPipeline<Hash>,
+    ) -> Result<PersistedRealmFullCommitManifestReceipt<Hash>, RealmFullCommitManifestStoreError>
+    {
+        let PendingProcessingState::Published { .. } = pipeline.processing_state()
+        else {
+            return Err(RealmFullCommitManifestStoreError::PipelineNotPublished);
+        };
+        let current_writer = writer.read_writer().await.map_err(writer_error)?;
+        let candidate = BranchPendingMapping::new(
+            *pipeline.frontier().chain(),
+            pipeline.processing().pending_id(),
+        );
+        let slot = realm_full_commit_manifest_slot(
+            *current_writer.slot().as_bytes(),
+            &candidate,
+        );
+        let manifest = self
+            .read(slot)
+            .await?
+            .ok_or(RealmFullCommitManifestStoreError::ReceiptStale)?;
+        if manifest.candidate() != &candidate
+            || manifest.authority() != pipeline.key().authority()
+        {
+            return Err(RealmFullCommitManifestStoreError::SourceChanged);
+        }
+        manifest.revalidate_published_writer(&current_writer)?;
+        let receipt = PersistedRealmFullCommitManifestReceipt {
+            store_fingerprint: self.fingerprint,
+            manifest,
+        };
+        self.revalidate_published_runtime(&receipt, writer, pipeline)
+            .await?;
+        Ok(receipt)
+    }
+
+    pub(super) async fn revalidate_published_runtime<Hash: Q256BitHash>(
+        &self,
+        receipt: &PersistedRealmFullCommitManifestReceipt<Hash>,
+        writer: &ScyllaBranchExactWriterRuntime<Hash>,
+        pipeline: &StoredPendingPipeline<Hash>,
+    ) -> Result<(), RealmFullCommitManifestStoreError> {
+        self.revalidate(receipt).await?;
+        let current_writer = writer.read_writer().await.map_err(writer_error)?;
+        receipt
+            .manifest
+            .revalidate_published_writer(&current_writer)?;
+        let expected = BranchPendingMapping::new(
+            *pipeline.frontier().chain(),
+            pipeline.processing().pending_id(),
+        );
+        if receipt.manifest.candidate() != &expected
+            || receipt.manifest.authority() != pipeline.key().authority()
+            || !matches!(
+                pipeline.processing_state(),
+                PendingProcessingState::Published { .. }
+            )
+        {
             return Err(RealmFullCommitManifestStoreError::SourceChanged);
         }
         self.revalidate(receipt).await
@@ -452,6 +525,7 @@ pub(super) enum RealmFullCommitManifestStoreError {
     Manifest(RealmFullCommitManifestError),
     WriterUninitialized,
     WriterNotWritesVerified,
+    PipelineNotPublished,
     SourceChanged,
     MissingColumn,
     MissingAppliedColumn,
@@ -505,6 +579,8 @@ mod tests {
         assert!(production.contains("revalidate_from_fresh_sources"));
         assert!(production.contains("observe_runtime_sources(writer, executor, plan)"));
         assert!(production.contains("revalidate_from_runtime_fresh_sources"));
-        assert_eq!(production.matches("self.revalidate(receipt)").count(), 4);
+        assert!(production.contains("read_for_published_runtime"));
+        assert!(production.contains("revalidate_published_runtime"));
+        assert_eq!(production.matches("self.revalidate(receipt)").count(), 6);
     }
 }

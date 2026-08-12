@@ -61,7 +61,9 @@ use psy_node_core::queue::{
     realm_processor_full_commit_source::{
         RealmProcessorFullCommitSourceError,
         RealmProcessorFullCommitSourceFactory,
+        RealmProcessorFullCommitPublicationObservation,
         RealmProcessorFullCommitSourceObservation,
+        SealedRealmProcessorFullCommitPublicationRequest,
         SealedRealmProcessorFullCommitSourceRequest,
     },
     realm_user_update_publish::GlobalUserTreeHeight,
@@ -834,7 +836,28 @@ where
             )
         })?;
         factory
-            .execute_full_commit(&self.writer_runtime, request)
+            .execute_full_commit(&self.writer_runtime, &self.head, request)
+            .await
+    }
+
+    async fn recover_publication(
+        &self,
+        request: SealedRealmProcessorFullCommitPublicationRequest,
+    ) -> Result<
+        RealmProcessorFullCommitPublicationObservation,
+        RealmProcessorFullCommitSourceError,
+    > {
+        let factory = self.capture_factory.as_ref().ok_or_else(|| {
+            RealmProcessorFullCommitSourceError::Backend(
+                "Realm Processor durable capture factory is missing".to_owned(),
+            )
+        })?;
+        factory
+            .recover_full_commit_publication(
+                &self.writer_runtime,
+                &self.head,
+                request,
+            )
             .await
     }
 }

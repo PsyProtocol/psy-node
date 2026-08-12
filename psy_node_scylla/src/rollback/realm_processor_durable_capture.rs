@@ -70,7 +70,9 @@ use psy_node_core::{
         },
         realm_processor_full_commit_source::{
             RealmProcessorFullCommitSourceError,
+            RealmProcessorFullCommitPublicationObservation,
             RealmProcessorFullCommitSourceObservation,
+            SealedRealmProcessorFullCommitPublicationRequest,
             SealedRealmProcessorFullCommitSourceRequest,
         },
         recoverable_artifact::{
@@ -87,6 +89,13 @@ use psy_node_core::{
     store::pending_generation_pipeline::{
         PendingPipelineReadState, PendingPipelineWriteOutcome,
         PendingProcessingState, StoredPendingPipeline,
+    },
+    store::{
+        authority_commit::AuthorityTimestampKey,
+        authority_local_head::{
+            AuthorityLocalHeadReadState, AuthorityLocalHeadWriteOutcome,
+            StoredAuthorityLocalHead,
+        },
     },
     store::pending_generation_identity::{
         PendingGenerationActivationDigest, PendingGenerationContext,
@@ -161,12 +170,15 @@ async fn qualification_pause_after_snapshot_a_if_armed() {
 }
 
 use super::{
-    BranchExactWriterState, ScyllaBranchExactWriterRuntime,
+    BranchExactWriterState, ScyllaAuthorityLocalHeadStore,
+    ScyllaBranchExactWriterRuntime,
     PendingQueueArtifactStoreError, PendingQueueSidecarReady,
     ScyllaPendingPipelineStore, ScyllaPendingQueueArtifactStore,
     ScyllaPendingQueueSegmentLedgerStore,
 };
-use super::branch_exact_pending_orchestration::seal_branch_exact_begin;
+use super::branch_exact_pending_orchestration::{
+    seal_branch_exact_begin, seal_branch_exact_publish,
+};
 use super::pending_queue_consumer_gate::{
     PendingQueueConsumerGateError, PendingQueueConsumerGateIdentity,
     ScyllaPendingQueueConsumerGateStore,
@@ -669,6 +681,7 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
     pub(super) async fn execute_full_commit(
         &self,
         writer: &ScyllaBranchExactWriterRuntime<Hash>,
+        head: &ScyllaAuthorityLocalHeadStore,
         request: SealedRealmProcessorFullCommitSourceRequest<Hash>,
     ) -> Result<RealmProcessorFullCommitSourceObservation, RealmProcessorFullCommitSourceError> {
         let AuthorityScope::Realm {
@@ -818,11 +831,137 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
             return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
         }
         let persisted = manifest.manifest();
+        let observed = request.authority_observation();
+        let head_key = AuthorityTimestampKey::new(self.network, self.authority);
+        let current_head = match head
+            .read::<Hash>(head_key)
+            .await
+            .map_err(full_source_backend)?
+        {
+            AuthorityLocalHeadReadState::Current(current) => current,
+            AuthorityLocalHeadReadState::Uninitialized => {
+                return Err(RealmProcessorFullCommitSourceError::Backend(
+                    "authority-local head is uninitialized".to_owned(),
+                ));
+            }
+        };
+        let published_head = if authority_head_matches(
+            &current_head,
+            observed,
+            persisted.digest(),
+            persisted.write_timestamp(),
+        ) {
+            current_head
+        } else {
+            if current_head.head().chain()
+                != verified.prepared().previous().watermark().canonical_chain()
+            {
+                return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
+            }
+            self.full_commit_manifest
+                .revalidate_from_runtime_fresh_sources(
+                    &manifest,
+                    writer,
+                    &self.full_commit_executor,
+                    &full_plan,
+                )
+                .await
+                .map_err(full_source_backend)?;
+            let sealed = request.seal_authority_head_advance(
+                current_head,
+                persisted.write_timestamp(),
+                *persisted.digest(),
+            )?;
+            match head
+                .compare_and_set(&sealed)
+                .await
+                .map_err(full_source_backend)?
+            {
+                AuthorityLocalHeadWriteOutcome::Applied(current)
+                | AuthorityLocalHeadWriteOutcome::Idempotent(current) => current,
+                AuthorityLocalHeadWriteOutcome::Conflict(_) => {
+                    return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
+                }
+            }
+        };
+        if !authority_head_matches(
+            &published_head,
+            observed,
+            persisted.digest(),
+            persisted.write_timestamp(),
+        ) {
+            return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
+        }
+
+        let publish = seal_branch_exact_publish(
+            &final_pipeline.pipeline,
+            &final_writer,
+            observed,
+        )
+        .map_err(|error| RealmProcessorFullCommitSourceError::Pipeline(error.to_string()))?;
+        match self
+            .pipeline
+            .apply(&publish)
+            .await
+            .map_err(full_source_backend)?
+        {
+            PendingPipelineWriteOutcome::Applied(_)
+            | PendingPipelineWriteOutcome::Idempotent(_) => {}
+            PendingPipelineWriteOutcome::Conflict(_) => {
+                return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
+            }
+        }
+        let PendingPipelineReadState::Current(published_pipeline) = self
+            .pipeline
+            .read::<Hash>(final_pipeline.pipeline.key())
+            .await
+            .map_err(full_source_backend)?
+        else {
+            return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
+        };
+        if published_pipeline != *publish.candidate()
+            || !matches!(
+                published_pipeline.processing_state(),
+                PendingProcessingState::Published { .. }
+            )
+        {
+            return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
+        }
+        writer
+            .finish_verified_after_published(request.candidate())
+            .await
+            .map_err(full_source_writer)?;
+        let final_writer = writer.read_writer().await.map_err(full_source_writer)?;
+        let BranchExactWriterState::Active(active) = final_writer.state() else {
+            return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
+        };
+        if active.watermark().canonical_chain() != request.candidate()
+            || active.watermark().pending_id() != processing.pending_id()
+        {
+            return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
+        }
+        self.full_commit_manifest
+            .revalidate_published_runtime(&manifest, writer, &published_pipeline)
+            .await
+            .map_err(full_source_backend)?;
+        let fresh_head = match head
+            .read::<Hash>(head_key)
+            .await
+            .map_err(full_source_backend)?
+        {
+            AuthorityLocalHeadReadState::Current(current) => current,
+            AuthorityLocalHeadReadState::Uninitialized => {
+                return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
+            }
+        };
+        if fresh_head != published_head {
+            return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
+        }
         RealmProcessorFullCommitSourceObservation::try_from_storage(
             processing,
             application,
-            second.pipeline.revision(),
-            second_writer.revision().get(),
+            published_pipeline.revision(),
+            final_writer.revision().get(),
             *verified.prepared().digest(),
             request.proof().digest(),
             *request.coordinator_payload_digest(),
@@ -832,6 +971,128 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
             *persisted.digest(),
             persisted.typed_row_count(),
             persisted.total_mutation_count(),
+        )
+    }
+
+    pub(super) async fn recover_full_commit_publication(
+        &self,
+        writer: &ScyllaBranchExactWriterRuntime<Hash>,
+        head: &ScyllaAuthorityLocalHeadStore,
+        request: SealedRealmProcessorFullCommitPublicationRequest,
+    ) -> Result<
+        RealmProcessorFullCommitPublicationObservation,
+        RealmProcessorFullCommitSourceError,
+    > {
+        let AuthorityScope::Realm {
+            realm_id,
+            realm_sub_id,
+        } = self.authority
+        else {
+            return Err(RealmProcessorFullCommitSourceError::IdentityMismatch);
+        };
+        if request.network() != self.network
+            || request.realm_id() != realm_id
+            || request.realm_sub_id() != realm_sub_id
+            || request.writer_activation_digest() != &self.writer_activation_digest
+            || request.queue_readiness_digest() != &self.queue_readiness_digest
+            || writer.network() != self.network
+            || writer.authority() != self.authority
+            || writer.activation_digest().as_bytes() != &self.writer_activation_digest
+        {
+            return Err(RealmProcessorFullCommitSourceError::IdentityMismatch);
+        }
+        let first = self
+            .observe_generation_continuation_exact()
+            .await
+            .map_err(full_source_capture)?;
+        if first.continuation.phase()
+            != RealmProcessorGenerationContinuationPhase::AwaitPublishedTerminal
+        {
+            return Err(RealmProcessorFullCommitSourceError::IdentityMismatch);
+        }
+        let application = first
+            .continuation
+            .application()
+            .ok_or(RealmProcessorFullCommitSourceError::IdentityMismatch)?;
+        let manifest = self
+            .full_commit_manifest
+            .read_for_published_runtime(writer, &first.pipeline)
+            .await
+            .map_err(full_source_backend)?;
+        let persisted = manifest.manifest();
+        let head_key = AuthorityTimestampKey::new(self.network, self.authority);
+        let first_head = match head
+            .read::<Hash>(head_key)
+            .await
+            .map_err(full_source_backend)?
+        {
+            AuthorityLocalHeadReadState::Current(current) => current,
+            AuthorityLocalHeadReadState::Uninitialized => {
+                return Err(RealmProcessorFullCommitSourceError::IdentityMismatch);
+            }
+        };
+        if !authority_head_matches(
+            &first_head,
+            *first.pipeline.frontier(),
+            persisted.digest(),
+            persisted.write_timestamp(),
+        ) {
+            return Err(RealmProcessorFullCommitSourceError::IdentityMismatch);
+        }
+        let first_writer = writer.read_writer().await.map_err(full_source_writer)?;
+        match first_writer.state() {
+            BranchExactWriterState::WritesVerified(_) => {
+                writer
+                    .finish_verified_after_published(first.pipeline.frontier().chain())
+                    .await
+                    .map_err(full_source_writer)?;
+            }
+            BranchExactWriterState::Active(_) => {}
+            _ => return Err(RealmProcessorFullCommitSourceError::IdentityMismatch),
+        }
+        let second = self
+            .observe_generation_continuation_exact()
+            .await
+            .map_err(full_source_capture)?;
+        if first.continuation != second.continuation
+            || !same_pipeline_snapshot(&first.pipeline, &second.pipeline)
+        {
+            return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
+        }
+        self.full_commit_manifest
+            .revalidate_published_runtime(&manifest, writer, &second.pipeline)
+            .await
+            .map_err(full_source_backend)?;
+        let final_writer = writer.read_writer().await.map_err(full_source_writer)?;
+        let BranchExactWriterState::Active(active) = final_writer.state() else {
+            return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
+        };
+        if active.watermark().canonical_chain() != second.pipeline.frontier().chain()
+            || active.watermark().pending_id() != second.pipeline.processing().pending_id()
+        {
+            return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
+        }
+        let final_head = match head
+            .read::<Hash>(head_key)
+            .await
+            .map_err(full_source_backend)?
+        {
+            AuthorityLocalHeadReadState::Current(current) => current,
+            AuthorityLocalHeadReadState::Uninitialized => {
+                return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
+            }
+        };
+        if final_head != first_head {
+            return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
+        }
+        RealmProcessorFullCommitPublicationObservation::try_from_storage(
+            second.pipeline.processing(),
+            application,
+            second.pipeline.revision(),
+            final_writer.revision().get(),
+            *persisted.slot().as_bytes(),
+            *persisted.digest(),
+            final_head.revision().get(),
         )
     }
 
@@ -2070,6 +2331,20 @@ fn same_pipeline_snapshot<Hash: Q256BitHash>(
         && first.canonical_payload() == second.canonical_payload()
 }
 
+fn authority_head_matches<Hash: Q256BitHash>(
+    head: &StoredAuthorityLocalHead<Hash>,
+    observed: psy_data::protocol::chain_context::AuthorityObservation<Hash>,
+    manifest_digest: &[u8; 32],
+    write_timestamp: psy_node_core::store::timestamp::CommitWriteTimestampUs,
+) -> bool {
+    head.head().chain() == observed.chain()
+        && head.head().key().authority() == observed.authority()
+        && head.head().state_checkpoint() == observed.state_checkpoint_id()
+        && head.head().state_root() == observed.state_root()
+        && head.commit_write_timestamp() == write_timestamp
+        && head.manifest_digest().as_bytes() == manifest_digest
+}
+
 struct ScyllaRealmProcessorDurableCapture<Hash> {
     factory: Arc<ScyllaRealmProcessorDurableCaptureFactory<Hash>>,
     pipeline: Arc<ScyllaPendingPipelineStore>,
@@ -2663,18 +2938,18 @@ mod tests {
     };
 
     #[test]
-    fn full_commit_execution_is_bracketed_and_manifested_before_return() {
+    fn full_commit_execution_publishes_head_then_pipeline_then_writer() {
         let source = include_str!("realm_processor_durable_capture.rs");
         let method = source
             .split("pub(super) async fn execute_full_commit(")
             .nth(1)
             .unwrap()
-            .split("fn validate_generation_request")
+            .split("pub(super) async fn recover_full_commit_publication")
             .next()
             .unwrap();
         assert!(method.contains("AwaitWriterCompletion"));
         assert_eq!(method.matches("read_selected(application.archive_slot())").count(), 3);
-        assert_eq!(method.matches("writer.read_writer()").count(), 3);
+        assert!(method.matches("writer.read_writer()").count() >= 3);
         assert_eq!(method.matches("observe_generation_continuation_exact()").count(), 3);
         assert!(method.contains("same_pipeline_snapshot"));
         assert!(method.contains("first_archive.header() != second_archive.header()"));
@@ -2695,17 +2970,21 @@ mod tests {
         let final_pipeline = method
             .rfind("observe_generation_continuation_exact()")
             .unwrap();
+        let head = method.find("head\n                .compare_and_set").unwrap();
+        let pipeline = method.find("seal_branch_exact_publish(").unwrap();
+        let writer = method.find(".finish_verified_after_published(").unwrap();
         assert!(plan < writes);
         assert!(writes < manifest);
         assert!(manifest < final_pipeline);
+        assert!(final_pipeline < head);
+        assert!(head < pipeline);
+        assert!(pipeline < writer);
         assert!(method.contains("revalidate_from_runtime_fresh_sources"));
+        assert!(method.contains("revalidate_published_runtime"));
         assert!(method.contains("persisted.slot().as_bytes()"));
         assert!(method.contains("persisted.digest()"));
         for forbidden in [
-            "finish_published",
-            "seal_publish",
             "seal_rotation",
-            "authority_head",
             "generation_terminal.persist",
         ] {
             assert!(!method.contains(forbidden), "found {forbidden}");
@@ -3124,7 +3403,7 @@ mod tests {
             .split("pub(super) async fn prepare_narrow_writer")
             .nth(1)
             .unwrap()
-            .split("fn validate_generation_request")
+            .split("pub(super) async fn execute_full_commit")
             .next()
             .unwrap();
         let first = method.find("observe_generation_continuation_exact").unwrap();

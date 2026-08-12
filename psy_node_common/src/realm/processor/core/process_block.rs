@@ -514,8 +514,9 @@ where
     }
 
     /// Resume `WorkCaptured` from immutable storage, execute the real proof
-    /// protocol, bind the exact Coordinator response, and enter only the
-    /// narrow mapping/reward-proof writer. Full writer/head/terminal/rotation
+    /// protocol, bind the exact Coordinator response, enter the narrow
+    /// mapping/reward-proof writer, and finish the manifested full write plus
+    /// authority-head/pipeline publication. Terminalization and rotation
     /// remain later gates.
     async fn resume_branch_exact_await_writer(
         &mut self,
@@ -781,7 +782,7 @@ where
         )?;
         let source_observation = iteration.execute_full_commit(source).await?;
         tracing::info!(
-            "Branch-exact full commit written and manifested: archive={:?}, pending={}, pipeline_revision={}, writer_revision={}, narrow_prepared={:?}, proof={:?}, coordinator={:?}, domains={}, coverage={:?}, typed_rows={}, total_mutations={}, manifest_slot={:?}, manifest={:?}; head/terminal/rotation remain blocked",
+            "Branch-exact full commit written, manifested and published: archive={:?}, pending={}, pipeline_revision={}, writer_revision={}, narrow_prepared={:?}, proof={:?}, coordinator={:?}, domains={}, coverage={:?}, typed_rows={}, total_mutations={}, manifest_slot={:?}, manifest={:?}; terminal/rotation remain blocked",
             source_observation.application().archive_slot(),
             source_observation.processing().pending_id().get(),
             source_observation.pipeline_revision().get(),
@@ -1046,6 +1047,29 @@ where
                     return self
                         .resume_branch_exact_await_writer_completion(iteration)
                         .await;
+                }
+                if continuation.phase()
+                    == RealmProcessorGenerationContinuationPhase::AwaitPublishedTerminal
+                {
+                    let RealmNormalCommitIteration::BranchExact(iteration) = iteration
+                    else {
+                        anyhow::bail!(
+                            "branch-exact continuation observed under legacy iteration"
+                        );
+                    };
+                    let published = iteration
+                        .recover_full_commit_publication()
+                        .await?;
+                    tracing::info!(
+                        "Branch-exact full commit publication is exact: archive={:?}, pending={}, pipeline_revision={}, writer_revision={}, head_revision={}, manifest={:?}; terminal/rotation remain blocked",
+                        published.application().archive_slot(),
+                        published.processing().pending_id().get(),
+                        published.pipeline_revision().get(),
+                        published.writer_revision(),
+                        published.head_revision(),
+                        published.manifest_digest(),
+                    );
+                    return Ok(());
                 }
                 tracing::info!(
                     "Branch-exact generation is durably classified as {:?}: processing_pending={}, pipeline_revision={}; its next qualified owner is not integrated yet",

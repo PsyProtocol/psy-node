@@ -355,8 +355,69 @@ impl<Hash: Q256BitHash> RealmFullCommitCompositeManifest<Hash> {
         Ok(())
     }
 
+    /// Validate this immutable manifest against the current durable writer
+    /// during publication recovery.  The Active state is accepted only as the
+    /// exact one-revision successor retaining this manifest's candidate and
+    /// intent digest.
+    pub(crate) fn revalidate_published_writer(
+        &self,
+        writer: &StoredBranchExactWriterLifecycle<Hash>,
+    ) -> Result<(), RealmFullCommitManifestError> {
+        if writer.plan().authority() != self.authority
+            || writer.slot().as_bytes() != &self.writer_slot
+        {
+            return Err(RealmFullCommitManifestError::SourceRevalidationMismatch);
+        }
+        match writer.state() {
+            BranchExactWriterState::WritesVerified(_) => {
+                let narrow = RealmNarrowWritesVerifiedEvidence::try_from_stored(writer)?;
+                if narrow.authority != self.authority
+                    || narrow.candidate != self.candidate
+                    || narrow.writer_slot != self.writer_slot
+                    || narrow.writer_revision != self.writer_revision
+                    || narrow.writer_payload_digest != self.writer_payload_digest
+                    || narrow.writer_verified_digest != self.writer_verified_digest
+                    || narrow.h22_observation_digest != self.h22_observation_digest
+                    || narrow.narrow_prepared_digest != self.narrow_prepared_digest
+                    || narrow.narrow_intent_digest != self.narrow_intent_digest
+                    || narrow.write_timestamp != self.write_timestamp
+                {
+                    return Err(RealmFullCommitManifestError::SourceRevalidationMismatch);
+                }
+            }
+            BranchExactWriterState::Active(active) => {
+                if active.watermark() != &self.candidate
+                    || active.last_intent().map(|digest| *digest.as_bytes())
+                        != Some(self.narrow_intent_digest)
+                    || self.writer_revision.checked_add(1)
+                        != Some(writer.revision().get())
+                {
+                    return Err(RealmFullCommitManifestError::SourceRevalidationMismatch);
+                }
+            }
+            _ => return Err(RealmFullCommitManifestError::WriterNotWritesVerified),
+        }
+        Ok(())
+    }
+
     pub(crate) const fn slot(&self) -> RealmFullCommitManifestSlot { self.slot }
     pub(crate) const fn revision(&self) -> u64 { self.revision }
+    pub(crate) const fn authority(&self) -> AuthorityScope { self.authority }
+    pub(crate) const fn candidate(&self) -> &BranchPendingMapping<Hash> {
+        &self.candidate
+    }
+    pub(crate) const fn writer_slot(&self) -> &[u8; 32] {
+        &self.writer_slot
+    }
+    pub(crate) const fn writer_revision(&self) -> u64 {
+        self.writer_revision
+    }
+    pub(crate) const fn narrow_intent_digest(&self) -> &[u8; 32] {
+        &self.narrow_intent_digest
+    }
+    pub(crate) const fn write_timestamp(&self) -> CommitWriteTimestampUs {
+        self.write_timestamp
+    }
     pub(crate) const fn digest(&self) -> &[u8; 32] { &self.digest }
     pub(crate) const fn typed_row_count(&self) -> u32 { self.typed_row_count }
     pub(crate) const fn total_mutation_count(&self) -> u64 {
@@ -365,6 +426,13 @@ impl<Hash: Q256BitHash> RealmFullCommitCompositeManifest<Hash> {
     pub(crate) fn canonical_payload(&self) -> &[u8] {
         &self.canonical_payload
     }
+}
+
+pub(crate) fn realm_full_commit_manifest_slot<Hash: Q256BitHash>(
+    writer_slot: [u8; 32],
+    candidate: &BranchPendingMapping<Hash>,
+) -> RealmFullCommitManifestSlot {
+    manifest_slot(writer_slot, candidate)
 }
 
 fn manifest_slot<Hash: Q256BitHash>(

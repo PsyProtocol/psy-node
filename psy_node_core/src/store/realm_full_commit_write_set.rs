@@ -10,6 +10,7 @@ use std::{collections::BTreeSet, error::Error, fmt};
 
 use parth_core::{felt::QFelt64, protocol::core_types::Q256BitHash};
 use psy_data::prepared_block::realm::PsyPreparedRealmBlockStateUpdates;
+use psy_data::protocol::chain_context::AuthorityObservation;
 
 use super::{
     branch_exact_schema::AuthorityScope,
@@ -265,6 +266,35 @@ impl RealmFullCommitWriteSet {
     pub const fn prepared_state(&self) -> Option<&RealmPreparedStateWriteSet> {
         self.prepared_state.as_ref()
     }
+
+    /// Decode the exact authority observation carried by the exhaustive
+    /// RealmAuthorityObservation domain.  Publication code must use this
+    /// value rather than reconstructing a head from a Coordinator response
+    /// that was not itself part of the verified physical write plan.
+    pub fn authority_observation<Hash: Q256BitHash>(
+        &self,
+    ) -> Result<AuthorityObservation<Hash>, RealmFullCommitWriteSetError> {
+        use super::typed::{LatestInfoSlot, MutationValue};
+
+        let batch = self
+            .remaining
+            .iter()
+            .find(|batch| {
+                batch.domain == RealmNormalCommitWriteDomain::RealmAuthorityObservation
+            })
+            .ok_or(RealmFullCommitWriteSetError::MissingDomain {
+                domain: RealmNormalCommitWriteDomain::RealmAuthorityObservation,
+            })?;
+        let [LogicalMutation::Put {
+            key: TypedTableKey::LatestInfo(LatestInfoSlot::RealmAuthorityObservation),
+            value: MutationValue::PsyCanonicalBytes(bytes),
+        }] = batch.mutations.as_slice()
+        else {
+            return Err(RealmFullCommitWriteSetError::InvalidAuthorityObservation);
+        };
+        AuthorityObservation::from_canonical_bytes(bytes)
+            .map_err(|_| RealmFullCommitWriteSetError::InvalidAuthorityObservation)
+    }
 }
 
 #[derive(Debug)]
@@ -284,6 +314,7 @@ pub enum RealmFullCommitWriteSetError {
     EmptyDomainBatch { domain: RealmNormalCommitWriteDomain },
     MissingDomain { domain: RealmNormalCommitWriteDomain },
     UnexpectedDomain { domain: RealmNormalCommitWriteDomain },
+    InvalidAuthorityObservation,
     Graph(RealmImtMutationGraphError),
 }
 
@@ -302,7 +333,15 @@ impl Error for RealmFullCommitWriteSetError {}
 #[cfg(test)]
 mod tests {
     use parth_core::{PHash, QCoreProcCheckpointUniqueId};
+    use psy_core::constants::chain_id::PsyChainNetworkType;
     use psy_data::prepared_block::realm::PsyPreparedRealmBlockStateUpdates;
+    use psy_data::protocol::{
+        canonical_chain::{
+            CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId as ChainCheckpointId,
+            CheckpointRef, NetworkId,
+        },
+        chain_context::{AuthorityStateCheckpointId, AuthorityStateRoot},
+    };
 
     use super::*;
     use crate::store::typed::{
@@ -430,6 +469,67 @@ mod tests {
                 None,
             ),
             Err(RealmFullCommitWriteSetError::UnexplainedRealmRootChange),
+        ));
+    }
+
+    #[test]
+    fn authority_observation_is_selected_and_decoded_exactly() {
+        let observation = AuthorityObservation::try_new(
+            CanonicalChainRef::new(
+                NetworkId::from_network_type(PsyChainNetworkType::LocalDevnet),
+                ChainEpoch::new(3),
+                CheckpointRef::new(
+                    ChainCheckpointId::new(11),
+                    CheckpointHash::from_last_chain_hash(PHash::from_values(1, 2, 3, 4)),
+                ),
+            ),
+            AuthorityScope::Realm {
+                realm_id: 1,
+                realm_sub_id: 2,
+            },
+            AuthorityStateCheckpointId::new(10),
+            AuthorityStateRoot::from_local_state_root(PHash::from_values(5, 6, 7, 8)),
+        )
+        .unwrap();
+        let mut batches = complete_batches();
+        let authority = batches
+            .iter_mut()
+            .find(|batch| {
+                batch.domain()
+                    == RealmNormalCommitWriteDomain::RealmAuthorityObservation
+            })
+            .unwrap();
+        authority.mutations = vec![LogicalMutation::Put {
+            key: TypedTableKey::LatestInfo(
+                LatestInfoSlot::RealmAuthorityObservation,
+            ),
+            value: MutationValue::PsyCanonicalBytes(
+                observation.to_canonical_bytes().to_vec(),
+            ),
+        }];
+        let write_set =
+            RealmFullCommitWriteSet::try_new(&prepared(), batches, None)
+                .unwrap();
+        assert_eq!(write_set.authority_observation::<PHash>().unwrap(), observation);
+
+        let mut malformed = write_set.clone();
+        let authority = malformed
+            .remaining
+            .iter_mut()
+            .find(|batch| {
+                batch.domain()
+                    == RealmNormalCommitWriteDomain::RealmAuthorityObservation
+            })
+            .unwrap();
+        authority.mutations[0] = LogicalMutation::Put {
+            key: TypedTableKey::LatestInfo(
+                LatestInfoSlot::RealmAuthorityObservation,
+            ),
+            value: MutationValue::PsyCanonicalBytes(vec![0; 3]),
+        };
+        assert!(matches!(
+            malformed.authority_observation::<PHash>(),
+            Err(RealmFullCommitWriteSetError::InvalidAuthorityObservation)
         ));
     }
 }
