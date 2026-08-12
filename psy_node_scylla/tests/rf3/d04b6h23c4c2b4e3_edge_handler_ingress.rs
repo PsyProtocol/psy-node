@@ -130,8 +130,9 @@ use psy_node_core::{
         QTempDBRewardsTreeReader, QTempDBWorkerReputationWriter,
     },
     queue::{
-        coordinator_guta_durable_submission::CoordinatorGutaQueueItem,
-        ephemeral::QStandardEphemeralQueueSubscriber,
+        coordinator_guta_durable_submission::{
+            CoordinatorGutaDurableSubmissionStore, CoordinatorGutaQueueItem,
+        },
         realm_processor_actor_input::{
             RealmProcessorActorInput, RealmProcessorActorInputDigest,
         },
@@ -268,11 +269,21 @@ use crate::psy_setup::{
 use psy_node_common::{
     coordinator::{
         edge::handler::CoordinatorEdgeHandler,
-        processor::gatherers::coordinator_guta_update_gatherer::
-            qualification_recover_coordinator_guta_queue_item,
+        processor::{
+            gatherers::coordinator_guta_update_gatherer::{
+                qualification_recover_coordinator_guta_queue_item,
+                CoordinatorGUTAUpdateGatherer,
+                CoordinatorGUTAUpdateGathererConfig,
+                CoordinatorGUTAUpdateGathererOutput,
+            },
+            processor_shared_status::PsyCoordinatorProcessorSharedStatus,
+        },
         queue_key::CoordinatorSubmitRealmGUTAUpdateQueueKey,
     },
-    constants::queue::PQ_REALM_SUBMIT_USER_UPDATE_QUEUE_TOPIC_ID,
+    constants::queue::{
+        PQ_COORDINATOR_SUBMIT_REALM_GUTA_UPDATE_QUEUE_TOPIC_ID,
+        PQ_REALM_SUBMIT_USER_UPDATE_QUEUE_TOPIC_ID,
+    },
     queue::gatherer::EphemeralQueueGathererWithTree,
     realm::processor::{
         core::{
@@ -556,6 +567,10 @@ struct E3Report {
     coordinator_handler_during_one_replica_offline: bool,
     coordinator_handler_publish_after_leader_failover: bool,
     coordinator_real_redis_process_restart: bool,
+    coordinator_gatherer_rf3: bool,
+    coordinator_gatherer_total_inputs: u64,
+    coordinator_gatherer_duplicate_collapsed: bool,
+    coordinator_gatherer_root_transition_exact: bool,
     mixed_version_clean_boundary_required: bool,
     mixed_version_overlap_supported: bool,
     production_coordinator_handler_rf3: bool,
@@ -1689,6 +1704,136 @@ type QualificationRealmActor = EphemeralQueueGathererWithTree<
 >;
 
 #[cfg(feature = "rf3-test-support")]
+type QualificationCoordinatorGutaActor = EphemeralQueueGathererWithTree<
+    PQ_COORDINATOR_SUBMIT_REALM_GUTA_UPDATE_QUEUE_TOPIC_ID,
+    CoordinatorGutaQueueItem<PF, PHash>,
+    CoordinatorGUTAUpdateGathererOutput<PF, PHash, QProvingJobDataID>,
+>;
+
+#[cfg(feature = "rf3-test-support")]
+async fn run_qualification_coordinator_guta_gatherer(
+    nats: Arc<NatsJetStreamClient>,
+    queue_key: CoordinatorSubmitRealmGUTAUpdateQueueKey<PF, PHash>,
+    durable_submissions: Arc<dyn CoordinatorGutaDurableSubmissionStore<PHash>>,
+    redis: Arc<StandardRedisStore>,
+    pending: PendingContext<PHash>,
+    checkpoint_leaves: &[PHash],
+    guta_circuit_whitelist: PHash,
+    submitted_realm: u32,
+    old_realm_root: PHash,
+    new_realm_root: PHash,
+) -> anyhow::Result<CoordinatorGUTAUpdateGathererOutput<PF, PHash, QProvingJobDataID>> {
+    ensure!(pending.authority() == AuthorityScope::Coordinator);
+    ensure!(queue_key.unique_id == pending.proc_checkpoint_unique_id().as_u128());
+    let checkpoint_id = pending.chain().checkpoint().checkpoint_id().get();
+    ensure!(
+        checkpoint_leaves.len() > usize::try_from(checkpoint_id)?,
+        "Coordinator gatherer is missing exact checkpoint leaves",
+    );
+    let checkpoint_tree = Arc::new(
+        PsyDashMemoryAppendOnlyMerkleStore::<PoseidonHasher, PHash>::new(
+            N::CHECKPOINT_TREE_HEIGHT,
+        ),
+    );
+    for index in 0..=checkpoint_id {
+        checkpoint_tree.append_leaf(
+            index,
+            checkpoint_leaves[usize::try_from(index)?],
+        )?;
+    }
+
+    let mut global_tree =
+        SimpleMemoryMerkleRecorderStore::<PoseidonHasher, PHash>::new(
+            N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+        );
+    global_tree.set_e_leaf_no_proof(u64::from(submitted_realm), old_realm_root);
+    global_tree.commit_changes();
+    let start_root = global_tree.get_root();
+    let mut expected_tree = global_tree.clone();
+    expected_tree.set_e_leaf_no_proof(u64::from(submitted_realm), new_realm_root);
+    let expected_end_root = expected_tree.get_root();
+
+    let state_roots = PQEDCheckpointGlobalStateRoots {
+        contract_tree_root: PHash::get_zero_value(),
+        deposit_tree_root: PHash::get_zero_value(),
+        user_tree_root: start_root,
+        withdrawal_tree_root: PHash::get_zero_value(),
+        user_registration_tree_root: PHash::get_zero_value(),
+    };
+    let checkpoint_leaf = PQEDCheckpointLeaf {
+        global_chain_root: state_roots.qfhash::<PoseidonHasher>(),
+        stats: PQEDCheckpointLeafStats::<PF, PHash>::get_empty_stats(),
+    };
+    let mut block_state = QEDL2BlockState::get_genesis_value();
+    block_state.checkpoint_id = checkpoint_id;
+    let shared_status = PsyCoordinatorProcessorSharedStatus {
+        last_committed_checkpoint_id: checkpoint_id,
+        unique_pending_id: pending.unique_pending_id().get(),
+        last_committed_checkpoint_leaf: checkpoint_leaf,
+        last_committed_checkpoint_state_roots: state_roots,
+        should_revert_last_changes: false,
+        block_state,
+    };
+    let config = CoordinatorGUTAUpdateGathererConfig::<
+        N,
+        StandardRedisStore,
+        StandardRedisStore,
+        SimpleMockMemoryFileSystem,
+    > {
+        realm_id_u64: 0,
+        realm_sub_id_u64: 0,
+        status: Arc::new(RwLock::new(shared_status)),
+        temp_db: Arc::clone(&redis),
+        proof_store: Arc::clone(&redis),
+        durable_guta_submissions: Some(durable_submissions),
+        file_system: Arc::new(SimpleMockMemoryFileSystem::new()),
+        last_old_realm_roots: Arc::new(RwLock::new(Vec::new())),
+        backup_file_directory: "/h23c4d3b2b2b3".to_owned(),
+        coordinator_guta_updates_circuit_whitelist: guta_circuit_whitelist,
+        checkpoint_tree,
+        _phantom_n: std::marker::PhantomData,
+    };
+    let status = ProcessorStatus::new();
+    status.mark_running();
+    let (mut gatherer, task) = QualificationCoordinatorGutaActor::new_with_status::<
+        NatsJetStreamClient,
+        CoordinatorGUTAUpdateGathererConfig<
+            N,
+            StandardRedisStore,
+            StandardRedisStore,
+            SimpleMockMemoryFileSystem,
+        >,
+        PHash,
+        PoseidonHasher,
+        CoordinatorGUTAUpdateGatherer<
+            N,
+            StandardRedisStore,
+            StandardRedisStore,
+            SimpleMockMemoryFileSystem,
+        >,
+    >(nats, config, queue_key, global_tree, status);
+
+    let output = gatherer
+        .finalize_gathering_and_update_queue_key(
+            pending.proc_checkpoint_unique_id().as_u128() + 1,
+        )
+        .await?;
+    task.abort();
+    let _ = task.await;
+    ensure!(output.db_output.total_guta_inputs == 1);
+    ensure!(output.db_output.start_global_user_tree_root == start_root);
+    ensure!(output.db_output.end_global_user_tree_root == expected_end_root);
+    ensure!(
+        output.db_output.root_guta_header.is_some_and(|header| {
+            header.state_transition.old_node_value == start_root
+                && header.state_transition.new_node_value == expected_end_root
+        }),
+        "Coordinator gatherer returned a mismatched root transition",
+    );
+    Ok(output)
+}
+
+#[cfg(feature = "rf3-test-support")]
 async fn start_qualification_realm_actor(
     context: PendingQueueCaptureContext,
     chain: CanonicalChainRef<PHash>,
@@ -2041,6 +2186,35 @@ async fn stream_messages(
     )
 }
 
+#[cfg(feature = "rf3-test-support")]
+async fn latest_stream_payload_after(
+    context: &jetstream::Context,
+    stream_name: &str,
+    previous_messages: u64,
+) -> anyhow::Result<Vec<u8>> {
+    let mut last_error = None;
+    for _ in 0..60 {
+        match context.get_stream(stream_name).await {
+            Ok(stream) => match stream.get_info().await {
+                Ok(info) if info.state.messages > previous_messages => {
+                    let message = stream
+                        .get_raw_message(info.state.last_sequence)
+                        .await?;
+                    return Ok(message.payload.to_vec());
+                }
+                Ok(_) => {}
+                Err(error) => last_error = Some(error.to_string()),
+            },
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+    bail!(
+        "timed out reading new JetStream payload for {stream_name}: {}",
+        last_error.as_deref().unwrap_or("no new message"),
+    )
+}
+
 #[derive(Debug)]
 struct NatsMessageEnvelopeDataset {
     message_count: u64,
@@ -2254,8 +2428,12 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         std::env::var("PSY_D04B6H23C4D3B2B2B1_RF3").as_deref() == Ok("1");
     let exercise_coordinator_redis_restart =
         std::env::var("PSY_D04B6H23C4D3B2B2B2_RF3").as_deref() == Ok("1");
+    let exercise_coordinator_gatherer =
+        std::env::var("PSY_D04B6H23C4D3B2B2B3_RF3").as_deref() == Ok("1");
     let exercise_coordinator_handler =
-        exercise_coordinator_handler_prefix || exercise_coordinator_redis_restart;
+        exercise_coordinator_handler_prefix
+            || exercise_coordinator_redis_restart
+            || exercise_coordinator_gatherer;
     ensure!(
         !exercise_proof_worker_queue || exercise_proof_narrow_writer,
         "c4d3a worker queue Gate requires c4d2 proof/narrow writer",
@@ -2267,6 +2445,10 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
     ensure!(
         !exercise_coordinator_handler || exercise_coordinator_rpc,
         "c4d3b2b2b1 Coordinator Handler Gate requires c4d3b1 Coordinator RPC",
+    );
+    ensure!(
+        !exercise_coordinator_gatherer || exercise_coordinator_redis_restart,
+        "c4d3b2b2b3 Coordinator gatherer Gate requires real Redis restart",
     );
 
     fixture::wait_up(3).await?;
@@ -2710,7 +2892,7 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
     let input_b = end_cap_input(&handler.db_reader, user_b, 202, checkpoint_id).await?;
     let input_c = end_cap_input(&handler.db_reader, user_c, 303, checkpoint_id).await?;
     let mut qualification_checkpoint_leaves = Vec::new();
-    if exercise_deferred_actor_archive {
+    if exercise_deferred_actor_archive || exercise_coordinator_gatherer {
         for leaf_index in 0..=checkpoint_id {
             qualification_checkpoint_leaves.push(
                 handler
@@ -3171,6 +3353,10 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
     let mut coordinator_handler_during_one_replica_offline = false;
     let mut coordinator_handler_publish_after_leader_failover = false;
     let mut coordinator_real_redis_process_restart = false;
+    let mut coordinator_gatherer_rf3 = false;
+    let mut coordinator_gatherer_total_inputs = 0_u64;
+    let mut coordinator_gatherer_duplicate_collapsed = false;
+    let mut coordinator_gatherer_root_transition_exact = false;
     let mut proof_worker_api_handler_rf3 = false;
     let mut proof_worker_jobs_dispatched = 0_usize;
     let mut proof_worker_jobs_completed = 0_usize;
@@ -4931,6 +5117,30 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                                 );
                                 let proof_predecessor_chain =
                                     *proof_pipeline.frontier().chain();
+                                if exercise_coordinator_gatherer {
+                                    let proof_checkpoint_id = proof_predecessor_chain
+                                        .checkpoint()
+                                        .checkpoint_id()
+                                        .get();
+                                    let first_missing_leaf = u64::try_from(
+                                        qualification_checkpoint_leaves.len(),
+                                    )?;
+                                    if first_missing_leaf <= proof_checkpoint_id {
+                                        for leaf_index in
+                                            first_missing_leaf..=proof_checkpoint_id
+                                        {
+                                            qualification_checkpoint_leaves.push(
+                                                restarted
+                                                    .db_reader
+                                                    .checkpoint_tree_get_leaf_hash(
+                                                        u64::MAX - 0xFFFF,
+                                                        leaf_index,
+                                                    )
+                                                    .await?,
+                                            );
+                                        }
+                                    }
+                                }
                                 proof_work_storage_reconstructed = true;
                                 let proof = if exercise_proof_worker_queue {
                                     let proof_nats = proof_worker_nats
@@ -5224,19 +5434,21 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                                         .context(
                                             "c4d3b2b2b1 production Coordinator Handler submit",
                                         )?;
-                                    let first_queue_item = restarted_nats
-                                        .wait_for_ephemeral_queue_item_bytes(
-                                            &queue_key,
-                                            0,
-                                            0,
-                                            coordinator_proc,
-                                            0,
-                                            30_000,
-                                        )
-                                        .await?
-                                        .ok_or_else(|| anyhow::anyhow!(
-                                            "Coordinator GUTA queue item was not published",
-                                        ))?;
+                                    let after_first_handler_message = stream_messages(
+                                        &jetstream,
+                                        restarted_nats.stream_name(),
+                                    )
+                                    .await?;
+                                    ensure!(
+                                        after_first_handler_message
+                                            == before_handler_messages + 1,
+                                    );
+                                    let first_queue_item = latest_stream_payload_after(
+                                        &jetstream,
+                                        restarted_nats.stream_name(),
+                                        before_handler_messages,
+                                    )
+                                    .await?;
                                     let decoded_queue_item =
                                         CoordinatorGutaQueueItem::<PF, PHash>::
                                             decode_queue_item_ref(&first_queue_item)?;
@@ -5275,19 +5487,12 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                                         .context(
                                             "c4d3b2b2b1 idempotent Handler retry",
                                         )?;
-                                    let second_queue_item = restarted_nats
-                                        .wait_for_ephemeral_queue_item_bytes(
-                                            &queue_key,
-                                            0,
-                                            0,
-                                            coordinator_proc,
-                                            0,
-                                            30_000,
-                                        )
-                                        .await?
-                                        .ok_or_else(|| anyhow::anyhow!(
-                                            "Coordinator retry queue item was not published",
-                                        ))?;
+                                    let second_queue_item = latest_stream_payload_after(
+                                        &jetstream,
+                                        restarted_nats.stream_name(),
+                                        after_first_handler_message,
+                                    )
+                                    .await?;
                                     ensure!(first_queue_item == second_queue_item);
                                     ensure!(
                                         durable_submissions
@@ -5404,6 +5609,45 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                                                     .as_deref()
                                                     == Some(durable.proof_bytes()),
                                         );
+                                        if exercise_coordinator_gatherer {
+                                            let durable_store: Arc<
+                                                dyn CoordinatorGutaDurableSubmissionStore<PHash>,
+                                            > = durable_submissions.clone();
+                                            let transition = decoded_business_item
+                                                .header
+                                                .header
+                                                .state_transition;
+                                            let output =
+                                                run_qualification_coordinator_guta_gatherer(
+                                                    Arc::clone(&restarted_nats),
+                                                    queue_key.clone(),
+                                                    durable_store,
+                                                    Arc::clone(&restarted_cache),
+                                                    coordinator_context,
+                                                    &qualification_checkpoint_leaves,
+                                                    guta_circuit_whitelist,
+                                                    u32::try_from(
+                                                        transition
+                                                            .node_index
+                                                            .to_u64_value(),
+                                                    )?,
+                                                    transition.old_node_value,
+                                                    transition.new_node_value,
+                                                )
+                                                .await
+                                                .context(
+                                                    "c4d3b2b2b3 production Coordinator GUTA gatherer",
+                                                )?;
+                                            coordinator_gatherer_total_inputs =
+                                                output.db_output.total_guta_inputs;
+                                            coordinator_gatherer_duplicate_collapsed =
+                                                coordinator_gatherer_total_inputs == 1;
+                                            coordinator_gatherer_root_transition_exact = output
+                                                .db_output
+                                                .root_guta_header
+                                                .is_some();
+                                            coordinator_gatherer_rf3 = true;
+                                        }
                                         coordinator_real_redis_process_restart = true;
                                         recovered
                                     } else {
@@ -6167,6 +6411,10 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         coordinator_handler_during_one_replica_offline,
         coordinator_handler_publish_after_leader_failover,
         coordinator_real_redis_process_restart,
+        coordinator_gatherer_rf3,
+        coordinator_gatherer_total_inputs,
+        coordinator_gatherer_duplicate_collapsed,
+        coordinator_gatherer_root_transition_exact,
         mixed_version_clean_boundary_required: exercise_coordinator_handler,
         mixed_version_overlap_supported: false,
         production_coordinator_handler_rf3: exercise_coordinator_handler,
@@ -6208,7 +6456,9 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         full_node_restart_tested: false,
         production_serving: false,
         h8_domains_closed: 0,
-        qualification: if exercise_coordinator_redis_restart {
+        qualification: if exercise_coordinator_gatherer {
+            "H23C4D3B2B2B3_COORDINATOR_GATHERER_RF3_PASSED"
+        } else if exercise_coordinator_redis_restart {
             "H23C4D3B2B2B2_COORDINATOR_REDIS_RESTART_RF3_PASSED"
         } else if exercise_coordinator_handler {
             "H23C4D3B2B2B1_COORDINATOR_HANDLER_RECOVERY_PREFIX_RF3_PASSED"
