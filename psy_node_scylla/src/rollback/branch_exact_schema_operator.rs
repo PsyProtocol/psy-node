@@ -15,6 +15,8 @@ use psy_node_core::store::authority_commit::{
     AuthorityClockSampleUs, AuthorityCommitIntentDigest,
     AuthorityIntentObservation, AuthorityTimestampKey,
     AuthorityTimestampReadState, AuthorityTimestampWriteOutcome,
+    SealedAuthorityTimestampCompletion, SealedAuthorityTimestampReservation,
+    StoredAuthorityTimestampState,
 };
 use psy_node_core::store::timestamp::CommitWriteTimestampUs;
 use scylla::client::session::Session;
@@ -357,31 +359,16 @@ async fn reserve_migration_timestamp(
                 "branch-exact authority timestamp allocator is uninitialized"
             );
         };
-        match current.observe_intent(key, intent) {
-            AuthorityIntentObservation::Active(lease) => {
-                return Ok(lease.timestamp())
+        match plan_migration_timestamp_reservation(
+            current,
+            key,
+            intent,
+            clock_sample,
+        )? {
+            MigrationTimestampReservation::Ready(timestamp) => {
+                return Ok(timestamp)
             }
-            AuthorityIntentObservation::Completed { timestamp, .. } => {
-                anyhow::bail!(
-                    "branch-exact migration timestamp is completed before a durable backfill plan exists: {}",
-                    timestamp.as_i64(),
-                )
-            }
-            AuthorityIntentObservation::BlockedByActive {
-                active_intent,
-                ..
-            } => {
-                anyhow::bail!(
-                    "branch-exact migration timestamp allocator is owned by another intent: {}",
-                    hex::encode(active_intent.as_bytes()),
-                )
-            }
-            AuthorityIntentObservation::Idle { .. } => {
-                let sealed = current.seal_reservation(
-                    key,
-                    intent,
-                    clock_sample,
-                )?;
+            MigrationTimestampReservation::Reserve(sealed) => {
                 match timestamps.reserve(sealed).await? {
                     AuthorityTimestampWriteOutcome::Applied(_)
                     | AuthorityTimestampWriteOutcome::Idempotent(_)
@@ -389,6 +376,45 @@ async fn reserve_migration_timestamp(
                 }
             }
         }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum MigrationTimestampReservation {
+    Ready(CommitWriteTimestampUs),
+    Reserve(SealedAuthorityTimestampReservation),
+}
+
+fn plan_migration_timestamp_reservation(
+    current: StoredAuthorityTimestampState,
+    key: AuthorityTimestampKey,
+    intent: AuthorityCommitIntentDigest,
+    clock_sample: AuthorityClockSampleUs,
+) -> anyhow::Result<MigrationTimestampReservation> {
+    match current.observe_intent(key, intent) {
+        AuthorityIntentObservation::Active(lease) => Ok(
+            MigrationTimestampReservation::Ready(lease.timestamp()),
+        ),
+        AuthorityIntentObservation::Completed { timestamp, .. } => {
+            anyhow::bail!(
+                "branch-exact migration timestamp is completed before a durable backfill plan exists: {}",
+                timestamp.as_i64(),
+            )
+        }
+        AuthorityIntentObservation::BlockedByActive {
+            active_intent,
+            ..
+        } => {
+            anyhow::bail!(
+                "branch-exact migration timestamp allocator is owned by another intent: {}",
+                hex::encode(active_intent.as_bytes()),
+            )
+        }
+        AuthorityIntentObservation::Idle { .. } => Ok(
+            MigrationTimestampReservation::Reserve(
+                current.seal_reservation(key, intent, clock_sample)?,
+            ),
+        ),
     }
 }
 
@@ -405,6 +431,20 @@ async fn require_replay_timestamp_safe(
             "branch-exact authority timestamp allocator disappeared during migration replay"
         );
     };
+    validate_migration_timestamp_replay(
+        current,
+        key,
+        intent,
+        persisted_timestamp,
+    )
+}
+
+fn validate_migration_timestamp_replay(
+    current: StoredAuthorityTimestampState,
+    key: AuthorityTimestampKey,
+    intent: AuthorityCommitIntentDigest,
+    persisted_timestamp: CommitWriteTimestampUs,
+) -> anyhow::Result<()> {
     if current.high_water().as_i64() < persisted_timestamp.as_i64() {
         anyhow::bail!(
             "branch-exact persisted backfill timestamp exceeds authority high-water"
@@ -441,39 +481,65 @@ async fn complete_migration_timestamp_if_active(
                 "branch-exact authority timestamp allocator disappeared after backfill verification"
             );
         };
-        if current.high_water().as_i64() < persisted_timestamp.as_i64() {
-            anyhow::bail!(
-                "branch-exact verified backfill timestamp exceeds authority high-water"
-            );
-        }
-        match current.observe_intent(key, intent) {
-            AuthorityIntentObservation::Active(lease) => {
-                if lease.timestamp() != persisted_timestamp {
-                    anyhow::bail!(
-                        "branch-exact active migration timestamp differs after verification"
-                    );
-                }
-                let sealed = current.seal_completion(key, lease)?;
+        match plan_migration_timestamp_completion(
+            current,
+            key,
+            intent,
+            persisted_timestamp,
+        )? {
+            MigrationTimestampCompletion::Complete(sealed) => {
                 match timestamps.complete(sealed).await? {
                     AuthorityTimestampWriteOutcome::Applied(_)
                     | AuthorityTimestampWriteOutcome::Idempotent(_)
                     | AuthorityTimestampWriteOutcome::Conflict(_) => {}
                 }
             }
-            AuthorityIntentObservation::Completed { timestamp, .. } => {
-                if timestamp != persisted_timestamp {
-                    anyhow::bail!(
-                        "branch-exact completed migration timestamp differs after verification"
-                    );
-                }
-                return Ok(())
+            MigrationTimestampCompletion::Done => return Ok(()),
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum MigrationTimestampCompletion {
+    Done,
+    Complete(SealedAuthorityTimestampCompletion),
+}
+
+fn plan_migration_timestamp_completion(
+    current: StoredAuthorityTimestampState,
+    key: AuthorityTimestampKey,
+    intent: AuthorityCommitIntentDigest,
+    persisted_timestamp: CommitWriteTimestampUs,
+) -> anyhow::Result<MigrationTimestampCompletion> {
+    if current.high_water().as_i64() < persisted_timestamp.as_i64() {
+        anyhow::bail!(
+            "branch-exact verified backfill timestamp exceeds authority high-water"
+        );
+    }
+    match current.observe_intent(key, intent) {
+        AuthorityIntentObservation::Active(lease) => {
+            if lease.timestamp() != persisted_timestamp {
+                anyhow::bail!(
+                    "branch-exact active migration timestamp differs after verification"
+                );
             }
-            AuthorityIntentObservation::Idle { .. }
-            | AuthorityIntentObservation::BlockedByActive { .. } => {
-                // A later authority operation proves this migration lease was
-                // already released. Never interfere with that operation.
-                return Ok(())
+            Ok(MigrationTimestampCompletion::Complete(
+                current.seal_completion(key, lease)?,
+            ))
+        }
+        AuthorityIntentObservation::Completed { timestamp, .. } => {
+            if timestamp != persisted_timestamp {
+                anyhow::bail!(
+                    "branch-exact completed migration timestamp differs after verification"
+                );
             }
+            Ok(MigrationTimestampCompletion::Done)
+        }
+        AuthorityIntentObservation::Idle { .. }
+        | AuthorityIntentObservation::BlockedByActive { .. } => {
+            // A later authority operation proves this migration lease was
+            // already released. Never interfere with that operation.
+            Ok(MigrationTimestampCompletion::Done)
         }
     }
 }
@@ -510,7 +576,44 @@ fn require_plan(
 
 #[cfg(test)]
 mod tests {
+    use psy_core::constants::chain_id::PsyChainNetworkType;
+    use psy_node_core::store::authority_commit::{
+        AuthorityTimestampBootstrap, AuthorityTimestampBootstrapReason,
+        NetworkId,
+    };
+
     use super::*;
+
+    fn timestamp_key() -> AuthorityTimestampKey {
+        AuthorityTimestampKey::new(
+            NetworkId::from_network_type(PsyChainNetworkType::LocalDevnet),
+            psy_node_core::store::branch_exact_schema::AuthorityScope::Realm {
+                realm_id: 7,
+                realm_sub_id: 2,
+            },
+        )
+    }
+
+    fn timestamp(value: i64) -> CommitWriteTimestampUs {
+        CommitWriteTimestampUs::try_from_i128(value as i128).unwrap()
+    }
+
+    fn clock_sample(value: i64) -> AuthorityClockSampleUs {
+        AuthorityClockSampleUs::try_from_i128(value as i128).unwrap()
+    }
+
+    fn timestamp_intent(value: u8) -> AuthorityCommitIntentDigest {
+        AuthorityCommitIntentDigest::from_sealed_commit_digest([value; 32])
+    }
+
+    fn initial_timestamp_state() -> StoredAuthorityTimestampState {
+        AuthorityTimestampBootstrap::new(
+            timestamp_key(),
+            timestamp(100),
+            AuthorityTimestampBootstrapReason::ControlledWriterCutover,
+        )
+        .candidate()
+    }
 
     #[test]
     fn operator_sequence_is_intent_first_resumable_and_stops_before_cutover() {
@@ -614,5 +717,126 @@ mod tests {
         assert!(!production.contains("pub(crate) write_timestamp"));
         assert!(production.contains("incomplete migration no longer owns its timestamp lease"));
         assert!(production.contains("migration_timestamp_key::<Hash>"));
+    }
+
+    #[test]
+    fn timestamp_reservation_recovers_same_intent_and_rejects_unsafe_replay() {
+        let key = timestamp_key();
+        let intent = timestamp_intent(1);
+        let MigrationTimestampReservation::Reserve(reservation) =
+            plan_migration_timestamp_reservation(
+                initial_timestamp_state(),
+                key,
+                intent,
+                clock_sample(200),
+            )
+            .unwrap()
+        else {
+            panic!("idle allocator must request one durable reservation")
+        };
+        assert_eq!(reservation.lease().timestamp(), timestamp(200));
+
+        let active = reservation.candidate();
+        assert_eq!(
+            plan_migration_timestamp_reservation(
+                active,
+                key,
+                intent,
+                clock_sample(999),
+            )
+            .unwrap(),
+            MigrationTimestampReservation::Ready(timestamp(200)),
+        );
+        assert!(validate_migration_timestamp_replay(
+            active,
+            key,
+            intent,
+            timestamp(200),
+        )
+        .is_ok());
+        assert!(validate_migration_timestamp_replay(
+            active,
+            key,
+            timestamp_intent(2),
+            timestamp(200),
+        )
+        .is_err());
+
+        let completed = active
+            .seal_completion(key, reservation.lease())
+            .unwrap()
+            .candidate();
+        assert!(plan_migration_timestamp_reservation(
+            completed,
+            key,
+            intent,
+            clock_sample(300),
+        )
+        .is_err());
+        assert!(validate_migration_timestamp_replay(
+            completed,
+            key,
+            intent,
+            timestamp(200),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn timestamp_completion_is_exact_and_never_interferes_with_later_work() {
+        let key = timestamp_key();
+        let intent = timestamp_intent(1);
+        let reservation = initial_timestamp_state()
+            .seal_reservation(key, intent, clock_sample(200))
+            .unwrap();
+        let active = reservation.candidate();
+        let MigrationTimestampCompletion::Complete(completion) =
+            plan_migration_timestamp_completion(
+                active,
+                key,
+                intent,
+                timestamp(200),
+            )
+            .unwrap()
+        else {
+            panic!("active exact lease must be completed")
+        };
+        let completed = completion.candidate();
+        assert_eq!(
+            plan_migration_timestamp_completion(
+                completed,
+                key,
+                intent,
+                timestamp(200),
+            )
+            .unwrap(),
+            MigrationTimestampCompletion::Done,
+        );
+
+        let later = completed
+            .seal_reservation(
+                key,
+                timestamp_intent(2),
+                clock_sample(300),
+            )
+            .unwrap()
+            .candidate();
+        assert_eq!(
+            plan_migration_timestamp_completion(
+                later,
+                key,
+                intent,
+                timestamp(200),
+            )
+            .unwrap(),
+            MigrationTimestampCompletion::Done,
+        );
+        assert!(plan_migration_timestamp_completion(
+            initial_timestamp_state(),
+            key,
+            intent,
+            timestamp(200),
+        )
+        .is_err());
     }
 }
