@@ -36,6 +36,13 @@ use crate::queue::{
         RealmProcessorVerifiedNarrowWriterEvidence,
         SealedRealmProcessorNarrowWriterRequest,
     },
+    realm_processor_full_commit_source::{
+        RealmProcessorFullCommitSourceError,
+        RealmProcessorFullCommitSourceFactory,
+        RealmProcessorFullCommitSourceObservation,
+        RealmProcessorVerifiedFullCommitSource,
+        SealedRealmProcessorFullCommitSourceRequest,
+    },
     realm_processor_continuation_restart::{
         RealmProcessorContinuationRestartFactory,
         RealmProcessorContinuationRestartPort,
@@ -87,6 +94,8 @@ pub struct InstalledRealmBranchExactCommitRuntime<Hash> {
     terminal_carryover_recovery_factory:
         Arc<dyn RealmProcessorTerminalCarryoverRecoveryFactory<Hash>>,
     narrow_writer_factory: Arc<dyn RealmProcessorNarrowWriterFactory<Hash>>,
+    full_commit_source_factory:
+        Arc<dyn RealmProcessorFullCommitSourceFactory<Hash>>,
 }
 
 impl<Hash> InstalledRealmBranchExactCommitRuntime<Hash> {
@@ -101,6 +110,9 @@ impl<Hash> InstalledRealmBranchExactCommitRuntime<Hash> {
             dyn RealmProcessorTerminalCarryoverRecoveryFactory<Hash>,
         >,
         narrow_writer_factory: Arc<dyn RealmProcessorNarrowWriterFactory<Hash>>,
+        full_commit_source_factory: Arc<
+            dyn RealmProcessorFullCommitSourceFactory<Hash>,
+        >,
     ) -> Result<Self, RealmProcessorStartupError> {
         let expectation = startup_permit.expectation();
         if runtime.network() != expectation.network()
@@ -138,6 +150,13 @@ impl<Hash> InstalledRealmBranchExactCommitRuntime<Hash> {
                 != runtime.writer_activation_digest()
             || narrow_writer_factory.queue_readiness_digest()
                 != runtime.queue_readiness_digest()
+            || full_commit_source_factory.network() != runtime.network()
+            || full_commit_source_factory.realm_id() != runtime.realm_id()
+            || full_commit_source_factory.realm_sub_id() != runtime.realm_sub_id()
+            || full_commit_source_factory.writer_activation_digest()
+                != runtime.writer_activation_digest()
+            || full_commit_source_factory.queue_readiness_digest()
+                != runtime.queue_readiness_digest()
         {
             return Err(RealmProcessorStartupError::CommitRuntimeIdentityMismatch);
         }
@@ -148,6 +167,7 @@ impl<Hash> InstalledRealmBranchExactCommitRuntime<Hash> {
             restart_factory,
             terminal_carryover_recovery_factory,
             narrow_writer_factory,
+            full_commit_source_factory,
         })
     }
 
@@ -177,6 +197,12 @@ impl<Hash> InstalledRealmBranchExactCommitRuntime<Hash> {
 
     fn narrow_writer_factory(&self) -> &Arc<dyn RealmProcessorNarrowWriterFactory<Hash>> {
         &self.narrow_writer_factory
+    }
+
+    fn full_commit_source_factory(
+        &self,
+    ) -> &Arc<dyn RealmProcessorFullCommitSourceFactory<Hash>> {
+        &self.full_commit_source_factory
     }
 }
 
@@ -287,6 +313,32 @@ impl<Hash> RealmBranchExactCommitIteration<'_, Hash> {
             clock_sample,
         )?;
         factory.prepare_and_verify(request).await
+    }
+
+    /// Revalidates the application/proof/Coordinator source against the exact
+    /// InFlight pipeline and WritesVerified narrow writer. This source fence
+    /// does not execute the remaining writes or publish any marker.
+    pub async fn validate_full_commit_source(
+        &mut self,
+        source: RealmProcessorVerifiedFullCommitSource<Hash>,
+    ) -> Result<RealmProcessorFullCommitSourceObservation, RealmProcessorFullCommitSourceError>
+    where
+        Hash: Q256BitHash + 'static,
+    {
+        let runtime = self.owner.runtime();
+        let factory = Arc::clone(
+            self.owner.installed.full_commit_source_factory(),
+        );
+        let request = SealedRealmProcessorFullCommitSourceRequest::seal(
+            self.owner.startup_permit_digest(),
+            runtime.network(),
+            runtime.realm_id(),
+            runtime.realm_sub_id(),
+            runtime.writer_activation_digest(),
+            runtime.queue_readiness_digest(),
+            source,
+        )?;
+        factory.validate_source(request).await
     }
 
     /// Freshly observes the storage-selected processing generation. This is
@@ -1043,6 +1095,39 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl RealmProcessorFullCommitSourceFactory<PHash> for CaptureFactory {
+        fn network(&self) -> NetworkId {
+            self.network
+        }
+
+        fn realm_id(&self) -> u32 {
+            self.realm_id
+        }
+
+        fn realm_sub_id(&self) -> u16 {
+            self.realm_sub_id
+        }
+
+        fn writer_activation_digest(&self) -> [u8; 32] {
+            self.activation
+        }
+
+        fn queue_readiness_digest(&self) -> [u8; 32] {
+            [6; 32]
+        }
+
+        async fn validate_source(
+            &self,
+            _request: SealedRealmProcessorFullCommitSourceRequest<PHash>,
+        ) -> Result<RealmProcessorFullCommitSourceObservation, RealmProcessorFullCommitSourceError>
+        {
+            Err(RealmProcessorFullCommitSourceError::Backend(
+                "full-commit source fixture is installation-only".to_owned(),
+            ))
+        }
+    }
+
     fn capture_factory(
         network: NetworkId,
         realm_id: u32,
@@ -1099,6 +1184,20 @@ mod tests {
         })
     }
 
+    fn full_commit_source_factory(
+        network: NetworkId,
+        realm_id: u32,
+        realm_sub_id: u16,
+        activation: [u8; 32],
+    ) -> Arc<dyn RealmProcessorFullCommitSourceFactory<PHash>> {
+        Arc::new(CaptureFactory {
+            network,
+            realm_id,
+            realm_sub_id,
+            activation,
+        })
+    }
+
     #[tokio::test]
     async fn exact_runtime_consumes_permit_into_nonclone_capability() {
         let permit = permit().await;
@@ -1111,6 +1210,7 @@ mod tests {
             restart_factory(network(), 7, 3, [2; 32]),
             terminal_carryover_recovery_factory(network(), 7, 3, [2; 32]),
             narrow_writer_factory(network(), 7, 3, [2; 32]),
+            full_commit_source_factory(network(), 7, 3, [2; 32]),
         )
         .unwrap();
         assert_eq!(installed.startup_permit_digest(), expected_digest);
@@ -1153,6 +1253,7 @@ mod tests {
                 restart_factory(network(), 7, 3, [2; 32]),
                 terminal_carryover_recovery_factory(network(), 7, 3, [2; 32]),
                 narrow_writer_factory(network(), 7, 3, [2; 32]),
+                full_commit_source_factory(network(), 7, 3, [2; 32]),
             );
             let Err(error) = result else {
                 panic!("mismatched runtime must not install")
@@ -1176,6 +1277,27 @@ mod tests {
             restart_factory(network(), 7, 3, [2; 32]),
             terminal_carryover_recovery_factory(network(), 7, 3, [2; 32]),
             narrow_writer_factory(network(), 7, 3, [2; 32]),
+            full_commit_source_factory(network(), 7, 3, [2; 32]),
+        );
+        assert!(matches!(
+            result,
+            Err(RealmProcessorStartupError::CommitRuntimeIdentityMismatch)
+        ));
+
+        let result = InstalledRealmBranchExactCommitRuntime::seal(
+            permit().await,
+            runtime(
+                network(),
+                7,
+                3,
+                [2; 32],
+                Arc::new(AtomicUsize::new(0)),
+            ),
+            capture_factory(network(), 7, 3, [2; 32]),
+            restart_factory(network(), 7, 3, [2; 32]),
+            terminal_carryover_recovery_factory(network(), 7, 3, [2; 32]),
+            narrow_writer_factory(network(), 7, 3, [2; 32]),
+            full_commit_source_factory(network(), 7, 4, [2; 32]),
         );
         assert!(matches!(
             result,
@@ -1195,6 +1317,7 @@ mod tests {
             restart_factory(network(), 7, 4, [2; 32]),
             terminal_carryover_recovery_factory(network(), 7, 3, [2; 32]),
             narrow_writer_factory(network(), 7, 3, [2; 32]),
+            full_commit_source_factory(network(), 7, 3, [2; 32]),
         );
         assert!(matches!(
             result,
@@ -1214,6 +1337,7 @@ mod tests {
             restart_factory(network(), 7, 3, [2; 32]),
             terminal_carryover_recovery_factory(network(), 7, 4, [2; 32]),
             narrow_writer_factory(network(), 7, 3, [2; 32]),
+            full_commit_source_factory(network(), 7, 3, [2; 32]),
         );
         assert!(matches!(
             result,
@@ -1233,6 +1357,7 @@ mod tests {
             restart_factory(network(), 7, 3, [2; 32]),
             terminal_carryover_recovery_factory(network(), 7, 3, [2; 32]),
             narrow_writer_factory(network(), 8, 3, [2; 32]),
+            full_commit_source_factory(network(), 7, 3, [2; 32]),
         );
         assert!(matches!(
             result,
@@ -1255,6 +1380,7 @@ mod tests {
             restart_factory(network(), 7, 3, [2; 32]),
             terminal_carryover_recovery_factory(network(), 7, 3, [2; 32]),
             narrow_writer_factory(network(), 7, 3, [2; 32]),
+            full_commit_source_factory(network(), 7, 3, [2; 32]),
         )
         .unwrap();
         let mut owner = RealmBranchExactSingleCommitOwner::from_installed(installed);

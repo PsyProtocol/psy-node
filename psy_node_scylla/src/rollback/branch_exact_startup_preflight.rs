@@ -58,6 +58,12 @@ use psy_node_core::queue::{
         RealmProcessorNarrowWriterError, RealmProcessorNarrowWriterFactory,
         RealmProcessorNarrowWriterObservation, SealedRealmProcessorNarrowWriterRequest,
     },
+    realm_processor_full_commit_source::{
+        RealmProcessorFullCommitSourceError,
+        RealmProcessorFullCommitSourceFactory,
+        RealmProcessorFullCommitSourceObservation,
+        SealedRealmProcessorFullCommitSourceRequest,
+    },
     realm_user_update_publish::GlobalUserTreeHeight,
 };
 use psy_node_nats::queue::NatsJetStreamClient;
@@ -787,6 +793,53 @@ where
 }
 
 #[async_trait]
+impl<Hash> RealmProcessorFullCommitSourceFactory<Hash>
+    for ScyllaRealmProcessorStartupPreflightProvider<Hash>
+where
+    Hash: Q256BitHash + Send + Sync + 'static,
+{
+    fn network(&self) -> NetworkId {
+        self.network
+    }
+
+    fn realm_id(&self) -> u32 {
+        match self.authority {
+            AuthorityScope::Realm { realm_id, .. } => realm_id,
+            AuthorityScope::Coordinator => unreachable!("Realm-only provider"),
+        }
+    }
+
+    fn realm_sub_id(&self) -> u16 {
+        match self.authority {
+            AuthorityScope::Realm { realm_sub_id, .. } => realm_sub_id,
+            AuthorityScope::Coordinator => unreachable!("Realm-only provider"),
+        }
+    }
+
+    fn writer_activation_digest(&self) -> [u8; 32] {
+        *self.writer_runtime.activation_digest().as_bytes()
+    }
+
+    fn queue_readiness_digest(&self) -> [u8; 32] {
+        *self.queue_setup_ready.ready_digest()
+    }
+
+    async fn validate_source(
+        &self,
+        request: SealedRealmProcessorFullCommitSourceRequest<Hash>,
+    ) -> Result<RealmProcessorFullCommitSourceObservation, RealmProcessorFullCommitSourceError> {
+        let factory = self.capture_factory.as_ref().ok_or_else(|| {
+            RealmProcessorFullCommitSourceError::Backend(
+                "Realm Processor durable capture factory is missing".to_owned(),
+            )
+        })?;
+        factory
+            .validate_full_commit_source(&self.writer_runtime, request)
+            .await
+    }
+}
+
+#[async_trait]
 impl<Hash> RealmBranchExactCommitRuntimeInstaller<Hash>
     for ScyllaRealmProcessorStartupPreflightProvider<Hash>
 where
@@ -817,6 +870,8 @@ where
         > = concrete_factory;
         let narrow_writer_factory: Arc<dyn RealmProcessorNarrowWriterFactory<Hash>> =
             self.clone();
+        let full_commit_source_factory: Arc<dyn RealmProcessorFullCommitSourceFactory<Hash>> =
+            self.clone();
         let runtime: Arc<dyn RealmBranchExactCommitRuntime<Hash>> = self;
         InstalledRealmBranchExactCommitRuntime::seal(
             startup_permit,
@@ -825,6 +880,7 @@ where
             restart_factory,
             terminal_carryover_recovery_factory,
             narrow_writer_factory,
+            full_commit_source_factory,
         )
     }
 }

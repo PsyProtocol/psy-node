@@ -12,6 +12,7 @@ use psy_data::protocol::{
     canonical_chain::NetworkId,
     chain_context::AuthorityScope,
 };
+use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 use psy_node_core::{
     queue::{
         realm_processor_actor_input::RealmProcessorActorInputDigest,
@@ -66,6 +67,11 @@ use psy_node_core::{
         realm_processor_narrow_writer::{
             RealmProcessorNarrowWriterError, RealmProcessorNarrowWriterObservation,
             SealedRealmProcessorNarrowWriterRequest,
+        },
+        realm_processor_full_commit_source::{
+            RealmProcessorFullCommitSourceError,
+            RealmProcessorFullCommitSourceObservation,
+            SealedRealmProcessorFullCommitSourceRequest,
         },
         recoverable_artifact::{
             PendingQueueArtifactOwnerAttemptId,
@@ -465,9 +471,11 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
         &self,
     ) -> Result<RealmProcessorApplicationProofWorkOutcome, RealmProcessorDurableCaptureError> {
         let first = self.observe_generation_continuation_exact().await?;
-        if first.continuation.phase()
-            != RealmProcessorGenerationContinuationPhase::AwaitWriter
-        {
+        if !matches!(
+            first.continuation.phase(),
+            RealmProcessorGenerationContinuationPhase::AwaitWriter
+                | RealmProcessorGenerationContinuationPhase::AwaitWriterCompletion
+        ) {
             return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
         }
         let application = first
@@ -626,6 +634,115 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
             final_observation.pipeline.revision(),
             barrier.writer_revision().get(),
             intent_digest,
+        )
+    }
+
+    pub(super) async fn validate_full_commit_source(
+        &self,
+        writer: &ScyllaBranchExactWriterRuntime<Hash>,
+        request: SealedRealmProcessorFullCommitSourceRequest<Hash>,
+    ) -> Result<RealmProcessorFullCommitSourceObservation, RealmProcessorFullCommitSourceError> {
+        let AuthorityScope::Realm {
+            realm_id,
+            realm_sub_id,
+        } = self.authority
+        else {
+            return Err(RealmProcessorFullCommitSourceError::IdentityMismatch);
+        };
+        if request.network() != self.network
+            || request.realm_id() != realm_id
+            || request.realm_sub_id() != realm_sub_id
+            || request.writer_activation_digest() != &self.writer_activation_digest
+            || request.queue_readiness_digest() != &self.queue_readiness_digest
+            || writer.network() != self.network
+            || writer.authority() != self.authority
+            || writer.activation_digest().as_bytes() != &self.writer_activation_digest
+        {
+            return Err(RealmProcessorFullCommitSourceError::IdentityMismatch);
+        }
+
+        let first = self
+            .observe_generation_continuation_exact()
+            .await
+            .map_err(full_source_capture)?;
+        if first.continuation.phase()
+            != RealmProcessorGenerationContinuationPhase::AwaitWriterCompletion
+            || first.continuation.application() != Some(request.application())
+        {
+            return Err(RealmProcessorFullCommitSourceError::IdentityMismatch);
+        }
+        let application = request.application();
+        let first_archive = self
+            .application_archive
+            .read_selected(application.archive_slot())
+            .await
+            .map_err(full_source_backend)?
+            .ok_or(RealmProcessorFullCommitSourceError::IdentityMismatch)?;
+        let first_writer = writer.read_writer().await.map_err(full_source_writer)?;
+
+        let processing = first.pipeline.processing();
+        let prepared = RealmProcessorApplicationProofWork::try_from_storage(
+            processing,
+            application,
+            first_archive.semantic().clone(),
+        )
+        .map_err(|_| RealmProcessorFullCommitSourceError::IdentityMismatch)?
+        .prepared_update::<Hash>(realm_id, realm_sub_id);
+        let proof_record = request.proof().record();
+        let BranchExactWriterState::WritesVerified(first_verified) = first_writer.state() else {
+            return Err(RealmProcessorFullCommitSourceError::Writer(
+                "narrow writer is not WritesVerified".to_owned(),
+            ));
+        };
+        let first_prepared = first_verified.prepared();
+        let first_intent = first_prepared.intent();
+        let reward_proof = request
+            .reward_proof()
+            .psy_ser_to_bytes_vec()
+            .map_err(|error| RealmProcessorFullCommitSourceError::Codec(error.to_string()))?;
+        if first_intent.authority() != self.authority
+            || first_intent.candidate().canonical_chain() != request.candidate()
+            || first_intent.candidate().pending_id() != processing.pending_id()
+            || first_intent.proc_checkpoint_id() != processing.proc_checkpoint_id()
+            || first_intent.reward_proof_canonical() != Some(reward_proof.as_slice())
+            || proof_record.authority() != self.authority
+            || proof_record.canonical_chain() != request.candidate()
+            || proof_record.old_realm_root() != &prepared.old_realm_root
+            || proof_record.new_realm_root() != &prepared.new_realm_root
+        {
+            return Err(RealmProcessorFullCommitSourceError::IdentityMismatch);
+        }
+
+        let second = self
+            .observe_generation_continuation_exact()
+            .await
+            .map_err(full_source_capture)?;
+        let second_archive = self
+            .application_archive
+            .read_selected(application.archive_slot())
+            .await
+            .map_err(full_source_backend)?
+            .ok_or(RealmProcessorFullCommitSourceError::IdentityMismatch)?;
+        let second_writer = writer.read_writer().await.map_err(full_source_writer)?;
+        if first.continuation != second.continuation
+            || !same_pipeline_snapshot(&first.pipeline, &second.pipeline)
+            || first_archive.header() != second_archive.header()
+            || first_archive.semantic() != second_archive.semantic()
+            || first_writer != second_writer
+        {
+            return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
+        }
+        let BranchExactWriterState::WritesVerified(verified) = second_writer.state() else {
+            return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
+        };
+        RealmProcessorFullCommitSourceObservation::try_from_storage(
+            processing,
+            application,
+            second.pipeline.revision(),
+            second_writer.revision().get(),
+            *verified.prepared().digest(),
+            request.proof().digest(),
+            *request.coordinator_payload_digest(),
         )
     }
 
@@ -2410,6 +2527,30 @@ fn narrow_pipeline(error: impl std::fmt::Display) -> RealmProcessorNarrowWriterE
     RealmProcessorNarrowWriterError::Pipeline(error.to_string())
 }
 
+fn full_source_capture(
+    error: RealmProcessorDurableCaptureError,
+) -> RealmProcessorFullCommitSourceError {
+    match error {
+        RealmProcessorDurableCaptureError::ConcurrentMutation => {
+            RealmProcessorFullCommitSourceError::ConcurrentMutation
+        }
+        RealmProcessorDurableCaptureError::IdentityMismatch
+        | RealmProcessorDurableCaptureError::RuntimeCapabilityMismatch
+        | RealmProcessorDurableCaptureError::ApplicationHandoffNotSealing => {
+            RealmProcessorFullCommitSourceError::IdentityMismatch
+        }
+        other => RealmProcessorFullCommitSourceError::Backend(other.to_string()),
+    }
+}
+
+fn full_source_backend(error: impl std::fmt::Display) -> RealmProcessorFullCommitSourceError {
+    RealmProcessorFullCommitSourceError::Backend(error.to_string())
+}
+
+fn full_source_writer(error: impl std::fmt::Display) -> RealmProcessorFullCommitSourceError {
+    RealmProcessorFullCommitSourceError::Writer(error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2431,6 +2572,29 @@ mod tests {
             },
         },
     };
+
+    #[test]
+    fn full_commit_source_is_bracketed_by_exact_pipeline_archive_and_writer_reads() {
+        let source = include_str!("realm_processor_durable_capture.rs");
+        let method = source
+            .split("pub(super) async fn validate_full_commit_source(")
+            .nth(1)
+            .unwrap()
+            .split("fn validate_generation_request")
+            .next()
+            .unwrap();
+        assert!(method.contains("AwaitWriterCompletion"));
+        assert_eq!(method.matches("read_selected(application.archive_slot())").count(), 2);
+        assert_eq!(method.matches("writer.read_writer()").count(), 2);
+        assert_eq!(method.matches("observe_generation_continuation_exact()").count(), 2);
+        assert!(method.contains("same_pipeline_snapshot"));
+        assert!(method.contains("first_archive.header() != second_archive.header()"));
+        assert!(method.contains("first_writer != second_writer"));
+        assert!(method.contains("BranchExactWriterState::WritesVerified"));
+        assert!(!method.contains("write_and_verify"));
+        assert!(!method.contains("persist_from_fresh_sources"));
+        assert!(!method.contains("finish_published"));
+    }
     use psy_node_nats::{
         recoverable_assignment::{
             PendingQueueSegmentLedgerBootstrap,

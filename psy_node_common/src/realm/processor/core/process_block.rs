@@ -40,6 +40,7 @@ use psy_node_core::{
             RealmProcessorGenerationContinuation,
             RealmProcessorGenerationContinuationPhase,
         },
+        realm_processor_full_commit_source::RealmProcessorVerifiedFullCommitSource,
         realm_processor_narrow_writer::RealmProcessorVerifiedNarrowWriterEvidence,
         realm_processor_semantic_output::{
             RealmProcessorDeferredJob, RealmProcessorSemanticJob,
@@ -534,7 +535,26 @@ where
             }
             RealmProcessorApplicationProofWorkOutcome::Ready(work) => work,
         };
-        self.execute_branch_exact_proof_and_narrow_write(iteration, work)
+        self.execute_branch_exact_proof_and_narrow_write(iteration, work, true)
+            .await
+    }
+
+    /// Resume after the narrow writer has already reached WritesVerified and
+    /// the pipeline is InFlight. Proof and Coordinator evidence are rebuilt
+    /// exactly, but the narrow mutation is not executed a second time.
+    async fn resume_branch_exact_await_writer_completion(
+        &mut self,
+        iteration: &mut psy_node_core::store::realm_processor_branch_exact_runtime::RealmBranchExactCommitIteration<'_, N::QHash>,
+    ) -> anyhow::Result<()> {
+        let work = match iteration.prepare_application_proof_work().await? {
+            RealmProcessorApplicationProofWorkOutcome::AwaitProoflessApplication { .. } => {
+                anyhow::bail!(
+                    "WritesVerified branch-exact generation lost its proof-bearing application"
+                );
+            }
+            RealmProcessorApplicationProofWorkOutcome::Ready(work) => work,
+        };
+        self.execute_branch_exact_proof_and_narrow_write(iteration, work, false)
             .await
     }
 
@@ -542,6 +562,7 @@ where
         &mut self,
         iteration: &mut psy_node_core::store::realm_processor_branch_exact_runtime::RealmBranchExactCommitIteration<'_, N::QHash>,
         work: RealmProcessorApplicationProofWork,
+        prepare_narrow_writer: bool,
     ) -> anyhow::Result<()> {
         let processing = work.processing();
         let semantic = work.semantic();
@@ -723,26 +744,46 @@ where
             &coordinator,
             N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
         )?;
-        let evidence = RealmProcessorVerifiedNarrowWriterEvidence::try_from_verified(
+        if prepare_narrow_writer {
+            let evidence = RealmProcessorVerifiedNarrowWriterEvidence::try_from_verified(
+                u32::try_from(self.db.state.realm_id_u64)?,
+                u16::try_from(self.db.state.realm_sub_id_u64)?,
+                &work,
+                &proof_binding,
+                &coordinator,
+            )?;
+            let observation = iteration
+                .prepare_mapping_and_reward_proof(
+                    &evidence,
+                    Self::branch_exact_clock_sample()?,
+                )
+                .await?;
+            tracing::info!(
+                "Branch-exact narrow writer prepared application {:?}: pending={}, pipeline_revision={}, writer_revision={}, intent={:?}",
+                observation.application().archive_slot(),
+                observation.processing().pending_id().get(),
+                observation.pipeline_revision().get(),
+                observation.writer_revision(),
+                observation.intent_digest(),
+            );
+        }
+        let source = RealmProcessorVerifiedFullCommitSource::try_from_verified(
             u32::try_from(self.db.state.realm_id_u64)?,
             u16::try_from(self.db.state.realm_sub_id_u64)?,
             &work,
-            &proof_binding,
+            proof_binding,
             &coordinator,
         )?;
-        let observation = iteration
-            .prepare_mapping_and_reward_proof(
-                &evidence,
-                Self::branch_exact_clock_sample()?,
-            )
-            .await?;
+        let source_observation = iteration.validate_full_commit_source(source).await?;
         tracing::info!(
-            "Branch-exact narrow writer prepared application {:?}: pending={}, pipeline_revision={}, writer_revision={}, intent={:?}; full writer/head/terminal/rotation remain blocked",
-            observation.application().archive_slot(),
-            observation.processing().pending_id().get(),
-            observation.pipeline_revision().get(),
-            observation.writer_revision(),
-            observation.intent_digest(),
+            "Branch-exact full-commit source revalidated: archive={:?}, pending={}, pipeline_revision={}, writer_revision={}, narrow_prepared={:?}, proof={:?}, coordinator={:?}; remaining 22-domain executor/head/terminal/rotation remain blocked",
+            source_observation.application().archive_slot(),
+            source_observation.processing().pending_id().get(),
+            source_observation.pipeline_revision().get(),
+            source_observation.writer_revision(),
+            source_observation.narrow_prepared_digest(),
+            source_observation.proof_binding_digest(),
+            source_observation.coordinator_payload_digest(),
         );
         if let Err(error) = self
             .db
@@ -980,6 +1021,19 @@ where
                     };
                     return self
                         .resume_branch_exact_await_writer(iteration)
+                        .await;
+                }
+                if continuation.phase()
+                    == RealmProcessorGenerationContinuationPhase::AwaitWriterCompletion
+                {
+                    let RealmNormalCommitIteration::BranchExact(iteration) = iteration
+                    else {
+                        anyhow::bail!(
+                            "branch-exact continuation observed under legacy iteration"
+                        );
+                    };
+                    return self
+                        .resume_branch_exact_await_writer_completion(iteration)
                         .await;
                 }
                 tracing::info!(
@@ -1581,5 +1635,57 @@ mod h23c4d2_tests {
         assert!(route.contains("return Ok(())"));
         assert!(!route.contains("publish_branch_exact_worker_jobs"));
         assert!(!route.contains("prepare_mapping_and_reward_proof"));
+    }
+}
+
+#[cfg(test)]
+mod h23c4e3a_tests {
+    #[test]
+    fn writes_verified_restart_rebuilds_and_revalidates_full_commit_source() {
+        let source = include_str!("process_block.rs");
+        let process = source
+            .split("pub(super) async fn process_block")
+            .nth(1)
+            .unwrap();
+        let continuation = process
+            .split("RealmGatheringOutcome::BranchExactGenerationContinuation")
+            .nth(1)
+            .unwrap()
+            .split("RealmGatheringOutcome::BranchExactAwaitingDeferredCarryover")
+            .next()
+            .unwrap();
+        assert!(continuation.contains(
+            "RealmProcessorGenerationContinuationPhase::AwaitWriterCompletion"
+        ));
+        assert!(continuation.contains(
+            "resume_branch_exact_await_writer_completion(iteration)"
+        ));
+
+        let route = source
+            .split("async fn execute_branch_exact_proof_and_narrow_write(")
+            .nth(1)
+            .unwrap()
+            .split("pub fn get_root_job_id")
+            .next()
+            .unwrap();
+        let proof = route
+            .find("SealedRealmProofBinding::verify_and_seal")
+            .unwrap();
+        let optional_narrow = route.find("if prepare_narrow_writer").unwrap();
+        let full_source = route
+            .find("RealmProcessorVerifiedFullCommitSource::try_from_verified")
+            .unwrap();
+        let durable_fence = route.find("validate_full_commit_source(source)").unwrap();
+        assert!(proof < optional_narrow);
+        assert!(optional_narrow < full_source);
+        assert!(full_source < durable_fence);
+        for forbidden in [
+            "self.db.commit_state",
+            "seal_publish",
+            "seal_rotation",
+            "authority_head",
+        ] {
+            assert!(!route.contains(forbidden), "found {forbidden}");
+        }
     }
 }
