@@ -228,7 +228,7 @@ pub fn resolve_realm_normal_commit_coverage(
     })
 }
 
-const fn key_domain_for(
+pub(super) const fn key_domain_for(
     domain: RealmNormalCommitWriteDomain,
 ) -> ScyllaKeyDomain {
     use RealmNormalCommitWriteDomain as W;
@@ -259,7 +259,7 @@ const fn key_domain_for(
     }
 }
 
-const fn expected_physical_table(
+pub(super) const fn expected_physical_table(
     domain: RealmNormalCommitWriteDomain,
 ) -> ScyllaPhysicalTableId {
     use RealmNormalCommitWriteDomain as W;

@@ -1,12 +1,16 @@
 use std::{error::Error, fmt};
 
+use parth_core::protocol::core_types::Q256BitHash;
 use psy_node_core::store::{
     timestamp::{CommitWriteTimestampUs, NewBranchWriteTimestampUs},
     typed::{LogicalMutation, MutationOperation, MutationValue},
 };
 use sha2::{Digest, Sha256};
 
-use super::{expand_logical_mutation, MutationBuildError, ResolvedScyllaMutation};
+use super::{
+    BranchExactWriterPrepared, MutationBuildError, ResolvedScyllaMutation,
+    build_realm_global_user_proof_after_cutover, expand_logical_mutation,
+};
 
 const TIMESTAMPED_PUT_CODEC_VERSION: u16 = 1;
 
@@ -297,6 +301,22 @@ pub fn seal_commit_put(
     timestamp: CommitWriteTimestampUs,
 ) -> Result<SealedTimestampedPut, TimestampedMutationError> {
     seal_inner(intent, timestamp, TimestampedWriteKind::AuthorityCommit)
+}
+
+/// Seal the checkpoint global-user proof only after the exact h22 writer
+/// preparation captured a non-quiescing cutover fence. Generic typed sealing
+/// intentionally continues to reject the historical mixed-axis table.
+pub(super) fn seal_realm_global_user_proof_after_cutover<Hash: Q256BitHash>(
+    prepared: &BranchExactWriterPrepared<Hash>,
+    key: psy_node_core::store::typed::TypedTableKey,
+    value: MutationValue,
+) -> Result<SealedTimestampedPut, TimestampedMutationError> {
+    let resolved = build_realm_global_user_proof_after_cutover(prepared, key, value)?;
+    seal_resolved(
+        resolved,
+        prepared.timestamp(),
+        TimestampedWriteKind::AuthorityCommit,
+    )
 }
 
 /// Seals a post-rollback write whose timestamp has already been proven to be

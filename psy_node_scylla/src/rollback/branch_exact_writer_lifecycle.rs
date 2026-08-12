@@ -543,6 +543,59 @@ impl<Hash: Q256BitHash> BranchExactWriterPrepared<Hash> {
         &self.digest
     }
 
+    #[cfg(test)]
+    pub(super) fn test_fixture(
+        intent: BranchExactDualWriteIntent<Hash>,
+        timestamp: CommitWriteTimestampUs,
+        cutover_fence: BranchExactWriterCutoverFence,
+    ) -> Self {
+        let predecessor_timestamp = CommitWriteTimestampUs::try_from_i128(
+            i128::from(timestamp.as_i64()) - 1,
+        )
+        .expect("fixture timestamp predecessor");
+        let timestamp_key = AuthorityTimestampKey::new(
+            intent.candidate().canonical_chain().network_id(),
+            intent.authority(),
+        );
+        let timestamp_predecessor = AuthorityTimestampBootstrap::new(
+            timestamp_key,
+            predecessor_timestamp,
+            AuthorityTimestampBootstrapReason::ControlledWriterCutover,
+        )
+        .candidate();
+        let reservation = timestamp_predecessor
+            .seal_reservation(
+                timestamp_key,
+                intent.intent_digest().authority_intent(),
+                AuthorityClockSampleUs::try_from_i128(timestamp.as_i64() as i128)
+                    .expect("fixture timestamp sample"),
+            )
+            .expect("fixture timestamp reservation");
+        let previous = BranchExactWriterActive {
+            watermark: *intent.predecessor(),
+            timestamp_state: timestamp_predecessor,
+            committed_writes: 0,
+            last_intent: None,
+        };
+        let digest = prepared_digest(
+            &previous,
+            &intent,
+            reservation.lease().active_revision(),
+            timestamp,
+            timestamp_predecessor,
+            Some(&cutover_fence),
+        );
+        Self {
+            previous,
+            intent,
+            timestamp_revision: reservation.lease().active_revision(),
+            timestamp,
+            timestamp_predecessor,
+            cutover_fence: Some(cutover_fence),
+            digest,
+        }
+    }
+
     /// Reconstitutes the executable capability only from the exact durable
     /// allocator row. A persisted timestamp alone is never sufficient.
     pub fn reseal(

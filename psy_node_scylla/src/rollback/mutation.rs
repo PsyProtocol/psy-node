@@ -1,14 +1,21 @@
 use std::{error::Error, fmt};
 
-use psy_node_core::store::typed::{
-    ImtCursorTransition, ImtCursorTransitionError, LogicalMutation,
-    ImtKeyIndexRow, ImtKeyIndexRowError, MutationOperation, MutationValue,
-    MutationValueKind, PsyLogicalTableId, StructuredValueSchema, TypedTableKey,
-    ValueDigestAlgorithm,
+use parth_core::protocol::core_types::Q256BitHash;
+use psy_node_core::store::{
+    branch_exact_schema::AuthorityScope,
+    typed::{
+        CheckpointedObjectKey, ImtCursorTransition, ImtCursorTransitionError,
+        ImtKeyIndexRow, ImtKeyIndexRowError, LogicalMutation,
+        MutationOperation, MutationValue, MutationValueKind,
+        PsyLogicalTableId, StructuredValueSchema, TypedTableKey,
+        ValueDigestAlgorithm,
+    },
 };
 
 use super::{
-    decode_locator_canonical, key_domain_descriptor, resolve_key_for_rollback,
+    BranchExactWriterPrepared,
+    decode_locator_canonical, describe_existing_key, key_domain_descriptor,
+    resolve_key_for_rollback,
     RegistryReadinessError, ResolvedScyllaKey, ScyllaKeyDomain,
     ScyllaPhysicalTableId,
 };
@@ -291,6 +298,9 @@ pub enum MutationBuildError {
     ValueEncodingMismatch { domain: ScyllaKeyDomain, actual: MutationValueKind },
     InvalidImtCursorTransition(ImtCursorTransitionError),
     InvalidImtKeyIndexRow(ImtKeyIndexRowError),
+    RealmAuthorityRequiredAfterCutover,
+    BranchExactCutoverFenceRequired,
+    GlobalUserProofMutationRequired,
 }
 
 impl fmt::Display for MutationBuildError {
@@ -304,6 +314,15 @@ impl fmt::Display for MutationBuildError {
             }
             Self::InvalidImtCursorTransition(error) => error.fmt(f),
             Self::InvalidImtKeyIndexRow(error) => error.fmt(f),
+            Self::RealmAuthorityRequiredAfterCutover => {
+                write!(f, "cutover-bound mixed-axis write requires Realm authority")
+            }
+            Self::BranchExactCutoverFenceRequired => {
+                write!(f, "cutover-bound mixed-axis write requires an exact writer fence")
+            }
+            Self::GlobalUserProofMutationRequired => {
+                write!(f, "cutover-bound mixed-axis override only accepts the checkpoint global-user proof")
+            }
         }
     }
 }
@@ -338,6 +357,38 @@ fn build_resolved(resolved: ResolvedScyllaKey, operation: MutationOperation) -> 
         operation,
     };
     ResolvedScyllaMutation { mutation, locator_bytes: resolved.locator_bytes().to_vec() }
+}
+
+/// Resolve the checkpoint-axis row which remains in the historical mixed-axis
+/// object table after h22 moves pending rewards into its target table. The
+/// generic registry remains blocked; an exact Realm writer cutover fence is
+/// mandatory and cannot be replaced with a bare key or timestamp.
+pub(super) fn build_realm_global_user_proof_after_cutover<Hash: Q256BitHash>(
+    prepared: &BranchExactWriterPrepared<Hash>,
+    key: TypedTableKey,
+    value: MutationValue,
+) -> Result<ResolvedScyllaMutation, MutationBuildError> {
+    if !matches!(prepared.intent().authority(), AuthorityScope::Realm { .. }) {
+        return Err(MutationBuildError::RealmAuthorityRequiredAfterCutover);
+    }
+    if prepared.cutover_fence().is_none() {
+        return Err(MutationBuildError::BranchExactCutoverFenceRequired);
+    }
+    if !matches!(
+        key,
+        TypedTableKey::CheckpointedObject(
+            CheckpointedObjectKey::GlobalUserProofAtCheckpoint(_)
+        )
+    ) {
+        return Err(MutationBuildError::GlobalUserProofMutationRequired);
+    }
+    let resolved = describe_existing_key(&key);
+    debug_assert_eq!(
+        resolved.key_domain(),
+        ScyllaKeyDomain::CheckpointedGlobalUserProof
+    );
+    validate_put_value(&resolved, &value)?;
+    Ok(build_resolved(resolved, MutationOperation::Put(value)))
 }
 
 fn validate_put_value(resolved: &ResolvedScyllaKey, value: &MutationValue) -> Result<(), MutationBuildError> {
