@@ -18,6 +18,8 @@ use psy_node_scylla::psy_setup::{
     setup_realm_edge_scylla_startup_composition,
     setup_coordinator_psy_scylla_database_store_from_connection_string,
 };
+use psy_node_scylla::rollback::PendingQueueSidecarSetupMode;
+use psy_data::protocol::chain_context::AuthorityScope;
 use psy_plonky2_circuits::{
     node::config::networks::resolver::PsyPlonky2NodeConfigResolver,
     protocol_types::ZKTypesPlonky2GoldilocksPoseidon, zk_verifier::PsyPlonky2ZKVerifier,
@@ -74,6 +76,15 @@ pub async fn run_startup_plonky2_scylla_edge_node(config: &CoordinatorEdgeStartC
         psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
             let db = setup_coordinator_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, false).await?;
+            let durable_guta_submissions = if config.durable_guta_submission_enabled {
+                db.store.initialize_pending_queue_sidecar_setup(
+                    AuthorityScope::Coordinator,
+                    PendingQueueSidecarSetupMode::RequireVerified,
+                ).await?;
+                Some(db.store.prepare_coordinator_guta_durable_submission_store(config.network.into()).await?)
+            } else {
+                None
+            };
             let canonical_head_reader = db.store.clone();
             let rollback_admin_inbox = Arc::new(CoordinatorRollbackAdminInbox::new(
                 config.network.into(),
@@ -103,6 +114,11 @@ pub async fn run_startup_plonky2_scylla_edge_node(config: &CoordinatorEdgeStartC
                 checkpoint_state_transition_circuit_fingerprint,
                 config.network.into(),
             );
+            let handler = if let Some(store) = durable_guta_submissions {
+                handler.install_durable_guta_submissions(store)?
+            } else {
+                handler
+            };
             start_coordinator_edge_rpc_server::<N, _, _, _, _, _, _, _, _>(
                 handler,
                 &config.listen,

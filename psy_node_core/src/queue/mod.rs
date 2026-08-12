@@ -25,3 +25,4 @@ pub mod realm_processor_actor_input;
 pub mod realm_processor_terminal_authorization;
 pub mod realm_processor_narrow_writer;
 pub mod realm_processor_application_proof_work;
+pub mod coordinator_guta_durable_submission;

@@ -32,7 +32,14 @@ use psy_node_core::{
         CoordinatorGutaSubmissionClaimOutcome, CoordinatorGutaSubmissionDigest,
         StandardEdgeAPITempDBStoreBase,
     },
-    queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber},
+    queue::{
+        coordinator_guta_durable_submission::{
+            CoordinatorGutaDurableSubmission,
+            CoordinatorGutaDurableSubmissionStore,
+        },
+        ephemeral::QStandardEphemeralQueuePublisher,
+        worker_queue::QStandardWorkerQueueSubscriber,
+    },
     store::{
         canonical_head::{CanonicalHeadReadState, CanonicalHeadRevision, CoordinatorCanonicalHeadReader},
         rollback_admin::{
@@ -197,6 +204,12 @@ mod rollback_admin_tests {
 
         assert!(!body.contains("rand::random"));
         assert!(!body.contains("set_submitted_status_for_pending"));
+        let legacy_claim_precheck = body
+            .find("get_coordinator_guta_submission_claim")
+            .expect("legacy selection must be checked before durable migration");
+        let durable_persist = body
+            .find("persist_and_readback")
+            .expect("durable submission must be persisted before cache projection");
         let claim = body
             .find("claim_coordinator_guta_submission")
             .expect("content-bound atomic claim must exist");
@@ -207,14 +220,21 @@ mod rollback_admin_tests {
             .rfind("get_proof_bytes_exact")
             .expect("exact proof readback must exist");
         let claim_revalidation = body
-            .find("get_coordinator_guta_submission_claim")
+            .rfind("get_coordinator_guta_submission_claim")
             .expect("claim must be revalidated before publish");
+        let durable_revalidation = body
+            .find("read_selected")
+            .expect("durable submission must be revalidated before publish");
         let publish = body
             .find("publish_ephemeral_queue_item_owned")
             .expect("Coordinator queue publish must exist");
+        assert!(legacy_claim_precheck < durable_persist);
+        assert!(durable_persist < claim);
         assert!(claim < proof);
         assert!(proof < readback);
+        assert!(readback < durable_revalidation);
         assert!(readback < claim_revalidation);
+        assert!(durable_revalidation < publish);
         assert!(claim_revalidation < publish);
     }
 
@@ -448,6 +468,8 @@ pub struct CoordinatorEdgeHandler<
     pub tag_tree_rewards_store: Arc<STagTreeRewards>,
     pub temp_db: Arc<TempDatabase>,
     pub proof_store: Arc<ProofStore>,
+    durable_guta_submissions:
+        Option<Arc<dyn CoordinatorGutaDurableSubmissionStore<N::QHash>>>,
 
     pub guta_update_queue: Arc<GUTAUpdateQueue>,
     pub register_user_queue: Arc<RegisterUserQueue>,
@@ -495,6 +517,7 @@ impl<
             tag_tree_rewards_store: self.tag_tree_rewards_store.clone(),
             temp_db: self.temp_db.clone(),
             proof_store: self.proof_store.clone(),
+            durable_guta_submissions: self.durable_guta_submissions.clone(),
             guta_update_queue: self.guta_update_queue.clone(),
             register_user_queue: self.register_user_queue.clone(),
             deploy_contract_queue: self.deploy_contract_queue.clone(),
@@ -557,6 +580,7 @@ impl<
             tag_tree_rewards_store,
             temp_db,
             proof_store,
+            durable_guta_submissions: None,
             guta_update_queue,
             register_user_queue,
             deploy_contract_queue,
@@ -569,6 +593,23 @@ impl<
             checkpoint_state_transition_circuit_fingerprint,
             network_id,
         }
+    }
+
+    /// Install the Coordinator-scoped v15 durable selection store. Legacy
+    /// construction remains default-off; an installed store is the authority
+    /// and Redis becomes only an exactly reconstructed proof projection.
+    pub fn install_durable_guta_submissions(
+        mut self,
+        store: Arc<dyn CoordinatorGutaDurableSubmissionStore<N::QHash>>,
+    ) -> anyhow::Result<Self> {
+        if store.network() != self.network_id
+            || store.authority() != psy_data::protocol::chain_context::AuthorityScope::Coordinator
+            || store.readiness_digest() == [0; 32]
+        {
+            anyhow::bail!("Coordinator GUTA durable store identity does not match Handler");
+        }
+        self.durable_guta_submissions = Some(store);
+        Ok(self)
     }
 
     pub async fn admin_start_rollback_internal(
@@ -1074,6 +1115,57 @@ impl<
             &canonical_input,
             proof_bytes.as_slice(),
         )?;
+        let proof_address = self
+            .proof_store
+            .resolve_proof_address(&pending_context, &output_proof_job_id)?;
+        if self.durable_guta_submissions.is_some() {
+            if let Some(existing) = self
+                .temp_db
+                .get_coordinator_guta_submission_claim(
+                    &self.realm_identifier,
+                    &pending_context,
+                    realm_id_u64,
+                )
+                .await?
+            {
+                if existing != submission_digest {
+                    anyhow::bail!(
+                        "legacy Coordinator GUTA selection conflicts with durable candidate for realm {}",
+                        realm_id,
+                    );
+                }
+            }
+            if let Some(existing) = self.proof_store.get_proof_bytes_exact(&proof_address).await? {
+                if existing.as_slice() != proof_bytes.as_slice() {
+                    anyhow::bail!(
+                        "legacy Coordinator GUTA proof projection conflicts with durable candidate"
+                    );
+                }
+            }
+        }
+        let queue_item = GlobalUserTreeAggregatorHeaderWithTagValueAndJobID {
+            header: input.header,
+            job_id: output_proof_job_id,
+        };
+        let queue_item_bytes = queue_item.psy_ser_to_bytes_vec()?;
+        let durable_submission = if let Some(store) = &self.durable_guta_submissions {
+            let durable_submission = CoordinatorGutaDurableSubmission::try_new(
+                pending_context,
+                realm_id_u64,
+                canonical_input,
+                proof_bytes.as_slice().to_vec(),
+                queue_item_bytes,
+            )?;
+            let persisted = store
+                .persist_and_readback(durable_submission.clone())
+                .await?;
+            if persisted != durable_submission {
+                anyhow::bail!("Coordinator GUTA durable readback changed the selected submission");
+            }
+            Some(durable_submission)
+        } else {
+            None
+        };
         match self
             .temp_db
             .claim_coordinator_guta_submission(
@@ -1094,9 +1186,6 @@ impl<
                 );
             }
         }
-        let proof_address = self
-            .proof_store
-            .resolve_proof_address(&pending_context, &output_proof_job_id)?;
         match self.proof_store.get_proof_bytes_exact(&proof_address).await? {
             Some(current) if current.as_slice() != proof_bytes.as_slice() => {
                 anyhow::bail!("exact Coordinator GUTA proof address contains conflicting bytes");
@@ -1125,7 +1214,16 @@ impl<
         if publish_context != pending_context {
             anyhow::bail!("pending context changed before GUTA publish");
         }
-        if self
+        if let Some(store) = &self.durable_guta_submissions {
+            let durable_submission = durable_submission.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("Coordinator GUTA durable submission was not retained")
+            })?;
+            if store.read_selected(durable_submission.slot()).await?
+                != Some(durable_submission.clone())
+            {
+                anyhow::bail!("Coordinator GUTA durable submission changed before publish");
+            }
+        } else if self
             .temp_db
             .get_coordinator_guta_submission_claim(
                 &self.realm_identifier,
@@ -1137,11 +1235,6 @@ impl<
         {
             anyhow::bail!("Coordinator GUTA submission claim changed before publish");
         }
-
-        let queue_item = GlobalUserTreeAggregatorHeaderWithTagValueAndJobID {
-            header: input.header,
-            job_id: output_proof_job_id,
-        };
 
         let queue_key = CoordinatorSubmitRealmGUTAUpdateQueueKey::<N::F, N::QHash> {
             realm_id: self.realm_id_u64,

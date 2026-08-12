@@ -6,6 +6,7 @@ use scylla::client::execution_profile::ExecutionProfile;
 use scylla::client::PoolSize;
 use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::db::table::QDatabaseTableRoutingKey, felt::QFelt64, protocol::core_types::{Q256BitHash, QFHashBase, QHashBase}};
 use psy_node_core::queue::realm_user_update_publish::GlobalUserTreeHeight;
+use psy_node_core::queue::coordinator_guta_durable_submission::CoordinatorGutaDurableSubmissionStore;
 use psy_node_core::store::canonical_head::{
     CanonicalHeadBootstrap, CanonicalHeadReadState, CanonicalHeadWriteOutcome,
     CoordinatorCanonicalHeadReader, CoordinatorCanonicalHeadStore, NetworkId,
@@ -33,6 +34,7 @@ use crate::rollback::{
     PendingQueueSidecarLifecycleError, PendingQueueSidecarReady,
     PendingQueueSidecarReadyView, PendingQueueSidecarSetupMode,
     PendingQueueSidecarSetupOutcome, ScyllaPendingQueueSidecarSetupGate,
+    ScyllaCoordinatorGutaDurableSubmissionStore,
 };
 use crate::rollback::branch_exact_startup_preflight::ScyllaRealmProcessorStartupPreflightProvider;
 use crate::tables::{merkle::ScyllaMerkleNodesZeroPreparedStatements, traits::ScyllaStandardPreparedTableStatements};
@@ -280,7 +282,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
 
     /// Default-off queue-sidecar setup. Disabled mode executes no queue CQL;
     /// enabled mode is inspect-only and requires an operator-created VERIFIED
-    /// lifecycle plus the exact twelve-table schema.
+    /// lifecycle plus the exact twenty-one-table v15 schema.
     pub async fn initialize_pending_queue_sidecar_setup(
         &self,
         authority: psy_data::protocol::chain_context::AuthorityScope,
@@ -344,6 +346,38 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
                 "pending queue sidecar setup capability is disabled".to_owned(),
             )
         })
+    }
+
+    /// Prepare the Coordinator GUTA durable submission authority only after
+    /// this exact process has consumed a VERIFIED v15 sidecar capability for
+    /// Coordinator scope. The returned trait exposes no Session or DDL.
+    pub async fn prepare_coordinator_guta_durable_submission_store(
+        &self,
+        network: psy_data::protocol::canonical_chain::NetworkId,
+    ) -> Result<Arc<dyn CoordinatorGutaDurableSubmissionStore<Hash>>, anyhow::Error>
+    where
+        Hash: Q256BitHash + Send + Sync + 'static,
+        Hasher: Send + Sync + 'static,
+    {
+        let ready = self.require_pending_queue_sidecar_ready()?;
+        if ready.view().authority()
+            != psy_data::protocol::chain_context::AuthorityScope::Coordinator
+        {
+            anyhow::bail!("Coordinator GUTA durable store requires Coordinator sidecar readiness");
+        }
+        let keyspaces = PendingQueueSidecarKeyspaces::try_new(
+            self.keyspace.clone(),
+            self.no_tablet_keyspace.clone(),
+        )?;
+        Ok(Arc::new(
+            ScyllaCoordinatorGutaDurableSubmissionStore::prepare(
+                self.session.clone(),
+                keyspaces.control().clone(),
+                network,
+                *ready.view().ready_digest(),
+            )
+            .await?,
+        ))
     }
 
     /// Explicit h21 tooling hook.  Opening a shadow reader requires the exact

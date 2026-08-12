@@ -238,6 +238,7 @@ pub struct CoordinatorProcessorCliConfig {
     pub coordinator_sub_id: Option<u16>,
     pub network: Option<PsyNetworkTypeInput>,
     pub canonical_head_bootstrap_profile: Option<CanonicalHeadBootstrapProfile>,
+    pub durable_guta_submission_enabled: Option<bool>,
     pub verbose: Option<bool>,
     pub checkpoint_backup_path: Option<String>,
     pub genesis_data_path: Option<String>,
@@ -253,6 +254,7 @@ impl CoordinatorProcessorCliConfig {
             coordinator_sub_id: None,
             network: None,
             canonical_head_bootstrap_profile: None,
+            durable_guta_submission_enabled: None,
             verbose: None,
             checkpoint_backup_path: None,
             genesis_data_path: None,
@@ -280,6 +282,7 @@ impl CoordinatorProcessorCliConfig {
             coordinator_sub_id: coordinator_sub_id.or(self.coordinator_sub_id).ok_or_else(|| anyhow::anyhow!("coordinator_sub_id is required"))?,
             network: network.or(self.network).ok_or_else(|| anyhow::anyhow!("network is required"))?.into(),
             canonical_head_bootstrap_profile: self.canonical_head_bootstrap_profile,
+            durable_guta_submission_enabled: self.durable_guta_submission_enabled.unwrap_or(false),
             verbose: verbose || self.verbose.unwrap_or(false),
             checkpoint_backup_path: checkpoint_backup_path.or(self.checkpoint_backup_path).ok_or_else(|| anyhow::anyhow!("checkpoint_backup_path is required"))?,
             genesis_data_path: genesis_data_path.or(self.genesis_data_path),
@@ -330,6 +333,7 @@ pub struct CoordinatorEdgeCliConfig {
     pub port: Option<u16>,
     pub listen: Option<String>,
     pub rollback_admin_rpc_enabled: Option<bool>,
+    pub durable_guta_submission_enabled: Option<bool>,
 }
 
 impl CoordinatorEdgeCliConfig {
@@ -346,6 +350,7 @@ impl CoordinatorEdgeCliConfig {
             port: None,
             listen: None,
             rollback_admin_rpc_enabled: None,
+            durable_guta_submission_enabled: None,
         }
     }
     pub fn into_start_config_with_cli_args(
@@ -375,6 +380,7 @@ impl CoordinatorEdgeCliConfig {
             listen: listen.or(self.listen).unwrap_or_else(|| "0.0.0.0".to_string()),
             rollback_admin_rpc_enabled: rollback_admin_rpc_enabled
                 || self.rollback_admin_rpc_enabled.unwrap_or(false),
+            durable_guta_submission_enabled: self.durable_guta_submission_enabled.unwrap_or(false),
         })
     }
     pub async fn get_start_config(

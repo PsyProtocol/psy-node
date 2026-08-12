@@ -82,6 +82,7 @@ mod realm_processor_durable_capture;
 mod realm_processor_application_archive;
 mod realm_processor_deferred_carryover;
 mod realm_processor_generation_terminal;
+mod coordinator_guta_durable_submission_store;
 #[cfg(all(test, feature = "rf3-test-support"))]
 #[path = "../../tests/rf3/d04b6h23c4c4b2b_terminal_carryover.rs"]
 mod realm_processor_terminal_carryover_rf3;
@@ -171,6 +172,7 @@ pub(crate) use realm_user_update_durable_consumer::*;
 pub(crate) use realm_user_update_router::*;
 pub(crate) use realm_user_update_ingress::*;
 pub use pending_queue_sidecar_lifecycle::*;
+pub(crate) use coordinator_guta_durable_submission_store::*;
 pub use authority_local_head_prototype::*;
 pub use authority_timestamp_prototype::*;
 pub use checkpoint_kiv::*;

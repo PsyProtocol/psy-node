@@ -113,6 +113,9 @@ pub struct CoordinatorProcessorStartConfig {
     /// row exists this value cannot overwrite or reinterpret it.
     #[serde(default)]
     pub canonical_head_bootstrap_profile: Option<CanonicalHeadBootstrapProfile>,
+    /// Default-off until an operator has deployed and VERIFIED sidecar v15.
+    #[serde(default)]
+    pub durable_guta_submission_enabled: bool,
     pub verbose: bool,
     pub checkpoint_backup_path: String,
     pub genesis_data_path: Option<String>,
@@ -255,4 +258,7 @@ pub struct CoordinatorEdgeStartConfig {
     /// request; it still cannot publish canonical rollback control.
     #[serde(default)]
     pub rollback_admin_rpc_enabled: bool,
+    /// Default-off until an operator has deployed and VERIFIED sidecar v15.
+    #[serde(default)]
+    pub durable_guta_submission_enabled: bool,
 }

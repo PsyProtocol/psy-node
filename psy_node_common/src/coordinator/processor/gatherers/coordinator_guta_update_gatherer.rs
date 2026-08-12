@@ -24,7 +24,12 @@ use psy_data::{
 };
 use psy_io::tokio::{TokioFileLike, TokioLikeFileSystem};
 use psy_node_core::{
-    psy_temp_db::StandardProcessorTempDBStoreBase, qblob::data_views::zero_merkle_node_batch::create_ffs_merkle_nodes_zero_id_from_hash_map,
+    psy_temp_db::StandardProcessorTempDBStoreBase,
+    qblob::data_views::zero_merkle_node_batch::create_ffs_merkle_nodes_zero_id_from_hash_map,
+    queue::coordinator_guta_durable_submission::{
+        CoordinatorGutaDurableSubmissionSlot, CoordinatorGutaDurableSubmissionStore,
+    },
+    store::traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore},
 };
 use psy_serialize::{PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 use rand::RngCore;
@@ -185,12 +190,16 @@ pub async fn read_coordinator_guta_update_gatherer_backup_file<
 pub struct CoordinatorGUTAUpdateGathererConfig<
     N: QNetworkTypesConfig,
     TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>,
+    ProofStore: QParthProofStore + QCanonicalProofStoreV2,
     FileSystem: TokioLikeFileSystem,
 > {
     pub realm_id_u64: u64,
     pub realm_sub_id_u64: u64,
     pub status: Arc<RwLock<PsyCoordinatorProcessorSharedStatus<N::F, N::QHash>>>,
     pub temp_db: Arc<TempDatabase>,
+    pub proof_store: Arc<ProofStore>,
+    pub durable_guta_submissions:
+        Option<Arc<dyn CoordinatorGutaDurableSubmissionStore<N::QHash>>>,
     pub file_system: Arc<FileSystem>,
     pub last_old_realm_roots: Arc<RwLock<Vec<(u64, N::QHash)>>>,
     pub backup_file_directory: String,
@@ -199,8 +208,12 @@ pub struct CoordinatorGUTAUpdateGathererConfig<
 
     pub _phantom_n: std::marker::PhantomData<N>,
 }
-impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>, FileSystem: TokioLikeFileSystem> Clone
-    for CoordinatorGUTAUpdateGathererConfig<N, TempDatabase, FileSystem>
+impl<
+        N: QNetworkTypesConfig,
+        TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>,
+        ProofStore: QParthProofStore + QCanonicalProofStoreV2,
+        FileSystem: TokioLikeFileSystem,
+    > Clone for CoordinatorGUTAUpdateGathererConfig<N, TempDatabase, ProofStore, FileSystem>
 {
     fn clone(&self) -> Self {
         Self {
@@ -208,6 +221,8 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
             realm_sub_id_u64: self.realm_sub_id_u64,
             status: self.status.clone(),
             temp_db: self.temp_db.clone(),
+            proof_store: self.proof_store.clone(),
+            durable_guta_submissions: self.durable_guta_submissions.clone(),
             backup_file_directory: self.backup_file_directory.clone(),
             file_system: self.file_system.clone(),
             coordinator_guta_updates_circuit_whitelist: self.coordinator_guta_updates_circuit_whitelist,
@@ -220,9 +235,10 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
 pub struct CoordinatorGUTAUpdateGatherer<
     N: QNetworkTypesConfig,
     TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>,
+    ProofStore: QParthProofStore + QCanonicalProofStoreV2,
     FileSystem: TokioLikeFileSystem,
 > {
-    pub config: CoordinatorGUTAUpdateGathererConfig<N, TempDatabase, FileSystem>,
+    pub config: CoordinatorGUTAUpdateGathererConfig<N, TempDatabase, ProofStore, FileSystem>,
     pub last_committed_checkpoint_root: N::QHash,
     pub guta_planner: CoordinatorGUTAPlanner<N::F, N::QHash>,
     pub status: PsyCoordinatorProcessorSharedStatus<N::F, N::QHash>,
@@ -271,18 +287,19 @@ impl<
         FileSystem: TokioLikeFileSystem,
         N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
         TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + Send + Sync + 'static,
+        ProofStore: QParthProofStore + QCanonicalProofStoreV2 + Send + Sync + 'static,
     >
     QueueGathererItemBuilderWithTree<
-        CoordinatorGUTAUpdateGathererConfig<N, TempDatabase, FileSystem>,
+        CoordinatorGUTAUpdateGathererConfig<N, TempDatabase, ProofStore, FileSystem>,
         SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
-    > for CoordinatorGUTAUpdateGatherer<N, TempDatabase, FileSystem>
+    > for CoordinatorGUTAUpdateGatherer<N, TempDatabase, ProofStore, FileSystem>
 {
     type Output = CoordinatorGUTAUpdateGathererOutput<N::F, N::QHash, N::JobId>;
 
     async fn create_new_with_tree(
         tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
         unique_id: QCoreProcCheckpointUniqueId,
-        config: CoordinatorGUTAUpdateGathererConfig<N, TempDatabase, FileSystem>,
+        config: CoordinatorGUTAUpdateGathererConfig<N, TempDatabase, ProofStore, FileSystem>,
     ) -> anyhow::Result<Self> {
         let status = config.status.read().unwrap().clone();
         let new_coordinator_guta_file_path = get_new_coordinator_guta_update_gatherer_backup_file_path(
@@ -366,6 +383,66 @@ impl<
                 unique_pending_id,
             )
             .await?;
+        if pending_context.proc_checkpoint_unique_id().as_u128()
+            != self.pending_core_proc_id
+        {
+            anyhow::bail!(
+                "Coordinator GUTA queue proc ID does not match exact pending context"
+            );
+        }
+
+        if let Some(store) = &self.config.durable_guta_submissions {
+            let slot = CoordinatorGutaDurableSubmissionSlot::for_submission(
+                &pending_context,
+                submitted_realm_id,
+            )?;
+            let durable = store
+                .read_selected(slot)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!(
+                    "durable Coordinator GUTA submission is missing for realm {}",
+                    submitted_realm_id,
+                ))?;
+            if durable.pending() != &pending_context || durable.queue_item() != item.as_slice() {
+                anyhow::bail!(
+                    "durable Coordinator GUTA submission does not match queue item"
+                );
+            }
+            let proof_address = self
+                .config
+                .proof_store
+                .resolve_proof_address(&pending_context, &update_header.job_id)?;
+            match self
+                .config
+                .proof_store
+                .get_proof_bytes_exact(&proof_address)
+                .await?
+            {
+                Some(current) if current.as_slice() != durable.proof_bytes() => {
+                    anyhow::bail!("Coordinator GUTA proof projection contains conflicting bytes");
+                }
+                Some(_) => {}
+                None => {
+                    self.config
+                        .proof_store
+                        .put_proof_bytes_exact(&proof_address, durable.proof_bytes())
+                        .await?;
+                }
+            }
+            if self
+                .config
+                .proof_store
+                .get_proof_bytes_exact(&proof_address)
+                .await?
+                .as_deref()
+                != Some(durable.proof_bytes())
+            {
+                anyhow::bail!("Coordinator GUTA proof projection readback mismatch");
+            }
+            if store.read_selected(slot).await? != Some(durable) {
+                anyhow::bail!("durable Coordinator GUTA submission changed during recovery");
+            }
+        }
 
         self.config
             .temp_db
@@ -584,6 +661,58 @@ mod tests {
     use super::{
         read_coordinator_guta_update_gatherer_backup_file, COORDINATOR_GUTA_UPDATE_GATHERER_BACKUP_V1_MAGIC_U32,
     };
+
+    #[test]
+    fn durable_submission_rehydrates_exact_proof_before_gatherer_side_effects() {
+        let source = include_str!("coordinator_guta_update_gatherer.rs");
+        let start = source
+            .find("async fn update_from_queue_item_with_tree")
+            .expect("queue item handler must exist");
+        let end = source[start..]
+            .find("async fn update_from_many_queue_items_with_tree")
+            .map(|offset| start + offset)
+            .expect("next gatherer method must exist");
+        let body = &source[start..end];
+
+        let pending = body
+            .find("require_pending_context_for_pending_id")
+            .expect("durable selection needs exact pending context");
+        let proc = body
+            .find("pending_core_proc_id")
+            .expect("durable selection needs exact proc identity");
+        let first_durable_read = body
+            .find("read_selected")
+            .expect("durable record must be selected before projection");
+        let proof_write = body
+            .find("put_proof_bytes_exact")
+            .expect("missing Redis proof projection must be reconstructed exactly");
+        let proof_readback = body
+            .rfind("get_proof_bytes_exact")
+            .expect("reconstructed proof must be read back exactly");
+        let second_durable_read = body
+            .rfind("read_selected")
+            .expect("durable record must be revalidated after projection");
+        let rewards = body
+            .find("set_proof_miner_rewards_tree_value")
+            .expect("gatherer reward mutation must remain explicit");
+        let backup = body
+            .find("new_coordinator_guta_file.write_all")
+            .expect("gatherer backup mutation must remain explicit");
+        let planner = body
+            .find("add_realm_job")
+            .expect("planner mutation must remain explicit");
+
+        assert!(pending < proc);
+        assert!(proc < first_durable_read);
+        assert!(first_durable_read < proof_write);
+        assert!(proof_write < proof_readback);
+        assert!(proof_readback < second_durable_read);
+        for mutation in [rewards, backup, planner] {
+            assert!(second_durable_read < mutation);
+        }
+        assert!(!body.contains("get_proof_bytes("));
+        assert!(!body.contains("put_proof_bytes("));
+    }
 
     #[tokio::test]
     async fn reads_coordinator_guta_backup_with_trailing_random_seed() -> anyhow::Result<()> {

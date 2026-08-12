@@ -1,6 +1,6 @@
 //! Exact, default-off schema boundary for the recoverable Realm queue.
 //!
-//! The twenty target tables have production-shaped, default-off adapters. This module
+//! The twenty-one target tables have production-shaped, default-off adapters. This module
 //! gives deployment tooling one deterministic manifest/materializer and gives
 //! node startup an inspect-only capability.  Ordinary setup performs no queue
 //! CQL.  Partial materialization is retained and completed idempotently; this
@@ -12,6 +12,10 @@ use scylla::client::session::Session;
 use sha2::{Digest, Sha256};
 
 use super::{
+    coordinator_guta_durable_submission_store::{
+        ScyllaCoordinatorGutaDurableSubmissionStore,
+        COORDINATOR_GUTA_DURABLE_SUBMISSION_TABLE,
+    },
     pending_generation_pipeline_store::{
         PIPELINE_TABLE, RETIRED_V1_PIPELINE_TABLE,
     },
@@ -67,14 +71,13 @@ use super::{
 #[cfg(test)]
 use super::RETIRED_REALM_USER_UPDATE_CLAIM_V1_TABLE;
 
-// v14 keeps the v13 physical shape but upgrades the application semantic
-// binding from deferred-only to the complete qualified actor input. An old
-// v13 binary would interpret the same 32 bytes differently, so its VERIFIED
-// receipt must not authorize this runtime.
-pub const PENDING_QUEUE_SIDECAR_SCHEMA_VERSION: u16 = 14;
-pub const PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT: usize = 20;
+// v15 adds the immutable Coordinator GUTA submission record. A v14 VERIFIED
+// lifecycle must not authorize a binary whose Coordinator recovery contract
+// requires this additional durable fact.
+pub const PENDING_QUEUE_SIDECAR_SCHEMA_VERSION: u16 = 15;
+pub const PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT: usize = 21;
 const FINGERPRINT_DOMAIN: &[u8] =
-    b"psy/rollback/pending-queue-sidecar-schema/v14";
+    b"psy/rollback/pending-queue-sidecar-schema/v15";
 const INSPECT_COLUMNS_CQL: &str = "SELECT column_name, type, kind, position, clustering_order FROM system_schema.columns WHERE keyspace_name = ? AND table_name = ?";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -100,6 +103,7 @@ pub enum PendingQueueSidecarPhysicalTable {
     RealmApplicationArchiveFragment = 18,
     RealmGenerationTerminalIntent = 19,
     RealmDeferredCarryover = 20,
+    CoordinatorGutaSubmission = 21,
 }
 
 impl PendingQueueSidecarPhysicalTable {
@@ -124,6 +128,7 @@ impl PendingQueueSidecarPhysicalTable {
         Self::RealmApplicationArchiveFragment,
         Self::RealmGenerationTerminalIntent,
         Self::RealmDeferredCarryover,
+        Self::CoordinatorGutaSubmission,
     ];
 
     pub const fn table_name(self) -> &'static str {
@@ -148,6 +153,7 @@ impl PendingQueueSidecarPhysicalTable {
             Self::RealmApplicationArchiveFragment => REALM_PROCESSOR_APPLICATION_ARCHIVE_FRAGMENT_TABLE,
             Self::RealmGenerationTerminalIntent => REALM_PROCESSOR_GENERATION_TERMINAL_TABLE,
             Self::RealmDeferredCarryover => REALM_PROCESSOR_DEFERRED_CARRYOVER_TABLE,
+            Self::CoordinatorGutaSubmission => COORDINATOR_GUTA_DURABLE_SUBMISSION_TABLE,
         }
     }
 
@@ -310,7 +316,7 @@ const fn regular(
     PendingQueueSidecarColumnSpec { table, name, cql_type, kind: PendingQueueSidecarColumnKind::Regular, position: -1, clustering_order: PendingQueueSidecarClusteringOrder::None }
 }
 
-pub const PENDING_QUEUE_SIDECAR_EXPECTED_COLUMNS: [PendingQueueSidecarColumnSpec; 102] = [
+pub const PENDING_QUEUE_SIDECAR_EXPECTED_COLUMNS: [PendingQueueSidecarColumnSpec; 105] = [
     pk(PendingQueueSidecarPhysicalTable::Pipeline, "network_chain_id", "bigint", 0),
     pk(PendingQueueSidecarPhysicalTable::Pipeline, "authority_kind", "tinyint", 1),
     pk(PendingQueueSidecarPhysicalTable::Pipeline, "realm_id", "bigint", 2),
@@ -413,6 +419,9 @@ pub const PENDING_QUEUE_SIDECAR_EXPECTED_COLUMNS: [PendingQueueSidecarColumnSpec
     pk(PendingQueueSidecarPhysicalTable::RealmDeferredCarryover, "successor_slot", "blob", 0),
     regular(PendingQueueSidecarPhysicalTable::RealmDeferredCarryover, "revision", "bigint"),
     regular(PendingQueueSidecarPhysicalTable::RealmDeferredCarryover, "carryover_payload", "blob"),
+    pk(PendingQueueSidecarPhysicalTable::CoordinatorGutaSubmission, "submission_slot", "blob", 0),
+    regular(PendingQueueSidecarPhysicalTable::CoordinatorGutaSubmission, "revision", "bigint"),
+    regular(PendingQueueSidecarPhysicalTable::CoordinatorGutaSubmission, "submission_payload", "blob"),
 ];
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -524,6 +533,16 @@ pub(super) fn current_physical_schema_matches_historical_v13() -> bool {
     ) == historical_v13_schema_fingerprint()
 }
 
+#[cfg(test)]
+pub(super) fn historical_v14_schema_fingerprint() -> PendingQueueSidecarSchemaFingerprint {
+    PendingQueueSidecarSchemaFingerprint::from_persisted([
+        0x24, 0xad, 0x49, 0x30, 0xef, 0x56, 0x08, 0x60,
+        0xd8, 0x2b, 0x45, 0x44, 0x5b, 0x30, 0x9d, 0x42,
+        0x0b, 0x0e, 0xab, 0x23, 0x83, 0x31, 0x8c, 0x26,
+        0x93, 0x2e, 0xc4, 0x9d, 0xab, 0x31, 0xb8, 0x5d,
+    ])
+}
+
 pub fn inspect_pending_queue_sidecar_columns(
     observed: Vec<ObservedPendingQueueSidecarColumn>,
     retired_v1_present: bool,
@@ -609,6 +628,12 @@ impl PendingQueueSidecarSchemaMaterializer {
         )
         .await
         .map_err(sidecar)?;
+        ScyllaCoordinatorGutaDurableSubmissionStore::create_schema(
+            session,
+            &keyspaces.control,
+        )
+        .await
+        .map_err(sidecar)?;
         let PendingQueueSidecarSchemaInspection::Exact { fingerprint } = Self::inspect_schema(session, keyspaces).await? else {
             return Err(PendingQueueSidecarSchemaError::DidNotConverge);
         };
@@ -689,18 +714,18 @@ mod tests {
     }
 
     #[test]
-    fn exact_manifest_is_twenty_unique_tables_with_stable_placement() {
-        assert_eq!(PENDING_QUEUE_SIDECAR_SCHEMA_VERSION, 14);
-        assert_eq!(PendingQueueSidecarPhysicalTable::ALL.len(), 20);
+    fn exact_manifest_is_twenty_one_unique_tables_with_stable_placement() {
+        assert_eq!(PENDING_QUEUE_SIDECAR_SCHEMA_VERSION, 15);
+        assert_eq!(PendingQueueSidecarPhysicalTable::ALL.len(), 21);
         let names = PendingQueueSidecarPhysicalTable::ALL.iter().map(|table| table.table_name()).collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(names.len(), 20);
+        assert_eq!(names.len(), 21);
         assert_eq!(PendingQueueSidecarPhysicalTable::ALL.iter().filter(|table| table.keyspace_kind() == PendingQueueSidecarKeyspaceKind::StandardData).count(), 4);
-        assert_eq!(PendingQueueSidecarPhysicalTable::ALL.iter().filter(|table| table.keyspace_kind() == PendingQueueSidecarKeyspaceKind::NoTabletControl).count(), 16);
+        assert_eq!(PendingQueueSidecarPhysicalTable::ALL.iter().filter(|table| table.keyspace_kind() == PendingQueueSidecarKeyspaceKind::NoTabletControl).count(), 17);
         assert!(!names.contains(RETIRED_V1_PIPELINE_TABLE));
         assert!(!names.contains(RETIRED_REALM_USER_UPDATE_CLAIM_V1_TABLE));
         assert_ne!(pending_queue_sidecar_schema_fingerprint().as_bytes(), &[0; 32]);
-        assert!(current_physical_schema_matches_historical_v12());
-        assert!(current_physical_schema_matches_historical_v13());
+        assert!(!current_physical_schema_matches_historical_v12());
+        assert!(!current_physical_schema_matches_historical_v13());
         assert_eq!(
             hex::encode(historical_v12_schema_fingerprint().as_bytes()),
             "466bf80f7e9f336a5191c2efdecf05129c96f6086f57c1afb14ce6cbe0aca7fb",
@@ -708,6 +733,10 @@ mod tests {
         assert_eq!(
             hex::encode(historical_v13_schema_fingerprint().as_bytes()),
             "5265f0088cb8986842957ab6e6dcc98809f40a3e969b74315b838e998a942dbc",
+        );
+        assert_eq!(
+            hex::encode(historical_v14_schema_fingerprint().as_bytes()),
+            "24ad4930ef560860d82b45445b309d420b0eab2383318c26932ec49dab31b85d",
         );
     }
 
@@ -722,6 +751,13 @@ mod tests {
             column.table,
             PendingQueueSidecarPhysicalTable::RealmGenerationTerminalIntent
                 | PendingQueueSidecarPhysicalTable::RealmDeferredCarryover
+        ));
+        let mut old_v14 = exact_columns();
+        old_v14.retain(|column| column.table != PendingQueueSidecarPhysicalTable::CoordinatorGutaSubmission);
+        assert!(matches!(
+            inspect_pending_queue_sidecar_columns(old_v14, false).unwrap(),
+            PendingQueueSidecarSchemaInspection::Partial { missing, .. }
+                if missing == vec![PendingQueueSidecarPhysicalTable::CoordinatorGutaSubmission]
         ));
         assert!(matches!(
             inspect_pending_queue_sidecar_columns(old_v11, false).unwrap(),

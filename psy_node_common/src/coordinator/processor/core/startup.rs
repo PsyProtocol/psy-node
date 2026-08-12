@@ -7,8 +7,12 @@ use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
     psy_core_db::traits::full::{PsyCoordinatorProcessorStore, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter},
     psy_temp_db::StandardProcessorTempDBStoreBase,
-    queue::{ephemeral::QStandardEphemeralQueueSubscriber, worker_queue::QStandardWorkerQueuePublisher},
-    store::traits::proof_store::QParthProofStore,
+    queue::{
+        coordinator_guta_durable_submission::CoordinatorGutaDurableSubmissionStore,
+        ephemeral::QStandardEphemeralQueueSubscriber,
+        worker_queue::QStandardWorkerQueuePublisher,
+    },
+    store::traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore},
 };
 
 use crate::{
@@ -34,7 +38,7 @@ impl<
         DeployContractQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
         ProofWorkQueue: QStandardWorkerQueuePublisher + Send + Sync,
         TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + Send + Sync + 'static,
-        ProofStore: QParthProofStore,
+        ProofStore: QParthProofStore + QCanonicalProofStoreV2 + Send + Sync + 'static,
         FileSystem: TokioLikeFileSystem + Send + Sync + 'static,
     >
     PsyCoordinatorProcessor<
@@ -70,6 +74,8 @@ where
         deploy_contract_gatherer_backup_directory: String,
         register_user_gatherer_backup_directory: String,
         guta_gatherer_backup_directory: String,
+        durable_guta_submissions:
+            Option<Arc<dyn CoordinatorGutaDurableSubmissionStore<N::QHash>>>,
     ) -> anyhow::Result<(
         Self,
         tokio::task::JoinHandle<Result<(), anyhow::Error>>,
@@ -104,11 +110,13 @@ where
         //db.set_new_unique_ids().await?;
         tracing::info!("intialized coordinator processor database, building gatherers...");
 
-        let guta_create_builder_config = CoordinatorGUTAUpdateGathererConfig::<N, TempDatabase, FileSystem> {
+        let guta_create_builder_config = CoordinatorGUTAUpdateGathererConfig::<N, TempDatabase, ProofStore, FileSystem> {
             realm_id_u64: db.ids.realm_id_u64,
             realm_sub_id_u64: db.ids.realm_sub_id_u64,
             status: db.shared_status.inner.clone(),
             temp_db: db.temp_db.clone(),
+            proof_store: db.proof_store.clone(),
+            durable_guta_submissions,
             backup_file_directory: guta_gatherer_backup_directory,
             coordinator_guta_updates_circuit_whitelist: db.circuit_fingerprint_config.guta_circuit_whitelist_root,
             checkpoint_tree: db.checkpoint_tree_backup_manager.checkpoint_tree.clone(),
@@ -134,10 +142,10 @@ where
         */
         let (guta_queue_gatherer, guta_join_handle) = EphemeralQueueGathererWithTree::new_with_status::<
             GUTAUpdateQueue,
-            CoordinatorGUTAUpdateGathererConfig<N, TempDatabase, FileSystem>,
+            CoordinatorGUTAUpdateGathererConfig<N, TempDatabase, ProofStore, FileSystem>,
             N::QHash,
             N::HasherBase,
-            CoordinatorGUTAUpdateGatherer<N, TempDatabase, FileSystem>,
+            CoordinatorGUTAUpdateGatherer<N, TempDatabase, ProofStore, FileSystem>,
         >(
             db.guta_update_queue.clone(),
             guta_create_builder_config,
