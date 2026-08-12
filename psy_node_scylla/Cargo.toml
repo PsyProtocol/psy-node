@@ -69,6 +69,7 @@ psy_dummy_prover = { workspace = true }
 psy_jtmb_testing_core = { workspace = true }
 psy_node_common = { workspace = true }
 psy_node_store_memory = { workspace = true }
+psy_worker_core = { workspace = true }
 
 
 [[bench]]

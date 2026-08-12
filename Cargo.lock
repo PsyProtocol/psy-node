@@ -7066,6 +7066,7 @@ dependencies = [
  "psy_node_nats",
  "psy_node_store_memory",
  "psy_serialize",
+ "psy_worker_core",
  "rand 0.8.5",
  "rand_chacha 0.3.1",
  "rayon",

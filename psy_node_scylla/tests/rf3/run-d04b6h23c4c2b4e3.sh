@@ -11,8 +11,11 @@ EXERCISE_DURABLE_REPLAY="${PSY_D04B6H23C4C3B_RF3:-0}"
 EXERCISE_APPLICATION_HANDOFF="${PSY_D04B6H23C4C4A2B_RF3:-0}"
 EXERCISE_TERMINAL_RECOVERY="${PSY_D04B6H23C4C4B3B2_RF3:-0}"
 EXERCISE_DEFERRED_ACTOR_ARCHIVE="${PSY_D04B6H23C4C4B4C2_RF3:-0}"
+EXERCISE_PROOF_NARROW_WRITER="${PSY_D04B6H23C4D2_RF3:-0}"
 EXPECTED_QUALIFICATION="H23C4C2B4E3_JTMB_HANDLER_INGRESS_RF3_PASSED"
-if [[ "${EXERCISE_DEFERRED_ACTOR_ARCHIVE}" == "1" ]]; then
+if [[ "${EXERCISE_PROOF_NARROW_WRITER}" == "1" ]]; then
+  EXPECTED_QUALIFICATION="H23C4D2_REALM_PROOF_NARROW_WRITER_RF3_PASSED"
+elif [[ "${EXERCISE_DEFERRED_ACTOR_ARCHIVE}" == "1" ]]; then
   EXPECTED_QUALIFICATION="H23C4C4B4C2_DEFERRED_ACTOR_ARCHIVE_RF3_PASSED"
 elif [[ "${EXERCISE_TERMINAL_RECOVERY}" == "1" ]]; then
   EXPECTED_QUALIFICATION="H23C4C4B3B2_TERMINAL_CARRYOVER_RECOVERY_RF3_PASSED"
@@ -117,6 +120,7 @@ PSY_D04B6H23C4C3B_RF3="${EXERCISE_DURABLE_REPLAY}" \
 PSY_D04B6H23C4C4A2B_RF3="${EXERCISE_APPLICATION_HANDOFF}" \
 PSY_D04B6H23C4C4B3B2_RF3="${EXERCISE_TERMINAL_RECOVERY}" \
 PSY_D04B6H23C4C4B4C2_RF3="${EXERCISE_DEFERRED_ACTOR_ARCHIVE}" \
+PSY_D04B6H23C4D2_RF3="${EXERCISE_PROOF_NARROW_WRITER}" \
 PSY_D04B6H23C4C2B4E3_COMPOSE_FILE="${COMPOSE_FILE}" \
 PSY_D04B6H23C4C2B4E3_REPORT_PATH="${REPORT_PATH}" \
 PSY_D04B6H23C4C2B4E3_NATS_URLS="nats://127.0.0.1:45322,nats://127.0.0.1:45323,nats://127.0.0.1:45324" \
@@ -135,7 +139,8 @@ jq -e \
   --argjson exercise_durable_replay "${EXERCISE_DURABLE_REPLAY}" \
   --argjson exercise_application_handoff "${EXERCISE_APPLICATION_HANDOFF}" \
   --argjson exercise_terminal_recovery "${EXERCISE_TERMINAL_RECOVERY}" \
-  --argjson exercise_deferred_actor_archive "${EXERCISE_DEFERRED_ACTOR_ARCHIVE}" '
+  --argjson exercise_deferred_actor_archive "${EXERCISE_DEFERRED_ACTOR_ARCHIVE}" \
+  --argjson exercise_proof_narrow_writer "${EXERCISE_PROOF_NARROW_WRITER}" '
   .qualification == $expected_qualification
   and .scylla_replication_factor == 3
   and .configured_nats_servers == 3
@@ -177,7 +182,7 @@ jq -e \
   and .carryover_replay == false
   and .successor_actor_injection == false
   and .proof_publish == false
-  and .mapping_reward_writer_integrated == false
+  and .mapping_reward_writer_integrated == ($exercise_proof_narrow_writer == 1)
   and .full_22_domain_writer == false
   and .production_writer_integrated == false
   and .authority_head_publish_integrated == false
@@ -188,6 +193,51 @@ jq -e \
   and (.repair_direct_one_dataset_digest | test("^[0-9a-f]{64}$"))
   and .repair_direct_one_rows > 0
   and .all_20_target_business_rows_qualified == false
+  and (
+    if $exercise_proof_narrow_writer == 1 then
+      .proof_narrow_writer_rf3 == true
+      and .proof_work_storage_reconstructed == true
+      and .qualification_jtmb_guta_proof_verified == true
+      and .qualification_guta_jobs_proved > 0
+      and .qualification_root_proof_bytes > 0
+      and .qualification_root_job_circuit > 0
+      and .proof_binding_verified == true
+      and (.proof_binding_digest | test("^[0-9a-f]{64}$"))
+      and .proof_binding_tamper_rejected == true
+      and .qualification_coordinator_inclusion == true
+      and .coordinator_rpc_rf3 == false
+      and .proof_worker_queue_rf3 == false
+      and .narrow_writer_pipeline_revision > 0
+      and .narrow_writer_revision > 0
+      and (.narrow_writer_intent_digest | test("^[0-9a-f]{64}$"))
+      and .narrow_writer_inflight_recovered == true
+      and .narrow_writer_caller_discard_recovered == true
+      and .narrow_writer_during_one_replica_offline == true
+      and .narrow_writer_nats_delta == 0
+      and .narrow_writer_socket_response_loss_injected == false
+    else
+      .proof_narrow_writer_rf3 == false
+      and .proof_work_storage_reconstructed == false
+      and .qualification_jtmb_guta_proof_verified == false
+      and .qualification_guta_jobs_proved == 0
+      and .qualification_root_proof_bytes == 0
+      and .qualification_root_job_circuit == 0
+      and .proof_binding_verified == false
+      and .proof_binding_digest == ""
+      and .proof_binding_tamper_rejected == false
+      and .qualification_coordinator_inclusion == false
+      and .coordinator_rpc_rf3 == false
+      and .proof_worker_queue_rf3 == false
+      and .narrow_writer_pipeline_revision == 0
+      and .narrow_writer_revision == 0
+      and .narrow_writer_intent_digest == ""
+      and .narrow_writer_inflight_recovered == false
+      and .narrow_writer_caller_discard_recovered == false
+      and .narrow_writer_during_one_replica_offline == false
+      and .narrow_writer_nats_delta == 0
+      and .narrow_writer_socket_response_loss_injected == false
+    end
+  )
   and (
     if $exercise_terminal_recovery == 1 then
       .affine_terminal_carryover_recovery == true

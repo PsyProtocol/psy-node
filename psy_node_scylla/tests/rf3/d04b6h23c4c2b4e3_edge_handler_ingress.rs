@@ -5,7 +5,7 @@ use std::{
     path::Path,
     process::Command,
     sync::{Arc, RwLock},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{bail, ensure, Context};
@@ -17,30 +17,62 @@ use parth_common::memory_stores::{
     traits::PsyMemoryMerkleStoreImm,
 };
 use parth_core::{
-    crypto::hash::traits::MerkleZeroHasher,
+    crypto::hash::{
+        merkle_proof::MerkleProofCore,
+        tag_tree::TagTreeMerkleProof,
+        traits::{MerkleZeroHasher, QFieldHashable, ZeroableHash},
+    },
     data::queue::queue_key::{QPBaseQueueType, QPStandardUniqueIdQueueKey},
     felt::ToU64Value,
     node::realm_identifier::QRealmIdentifier,
     pgoldilocks::PoseidonHasher,
-    protocol::core_types::{Q256BitHash, QNetworkTreeConstants, QNetworkTypesConfigHelper},
+    protocol::core_types::{
+        Q256BitHash, QNetworkTreeConstants, QNetworkTypesConfigHelper,
+        QZKProofPublicInputsHasherReader, QZKProofVerifier,
+    },
     PHash, PF,
 };
 use psy_core::{
     constants::chain_id::PsyChainNetworkType,
-    job::job_id::QProvingJobDataID,
+    job::job_id::{ProvingJobCircuitType, QProvingJobDataID},
     network_config::PsyNetworkLocalDevnetConstants,
 };
 use psy_data::{
+    guta::header_extended::{
+        GlobalUserTreeAggregatorHeaderWithTagValue,
+        GlobalUserTreeAggregatorHeaderWithTagValueAndJobType,
+        GlobalUserTreeAggregatorHeaderWithJobId,
+    },
     node::realm_processor::RealmProcessorCoreState,
+    prepared_block::realm::PsyRealmCoordinatorUpdate,
     protocol::{
-        canonical_chain::{CanonicalChainRef, CheckpointHash, CheckpointId, CheckpointRef},
+        canonical_chain::{
+            CanonicalChainRef, CheckpointHash, CheckpointId,
+            CheckpointRef,
+        },
         chain_context::{
-            AuthorityObservation, AuthorityStateCheckpointId, AuthorityStateRoot,
-            PendingContext, WorkProcCheckpointUniqueId, WorkUniquePendingId,
+            AuthorityObservation, AuthorityScope, AuthorityStateCheckpointId,
+            AuthorityStateRoot, PendingContext, WorkContext, WorkContextToken,
+            WorkProcCheckpointUniqueId, WorkUniquePendingId,
         },
     },
     queue_items::realm_user_update::PsyRealmUserUpdateQueueItem,
-    v1::qdata::contract::{DashMapContractHeightCache, PSimpleContractHeightCache},
+    v1::qdata::{
+        checkpoint::{
+            PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf,
+            PQEDCheckpointLeafStats, QEDL2BlockState,
+        },
+        checkpoint_sync::PQEDCheckpointSyncInfoCompact,
+        contract::{DashMapContractHeightCache, PSimpleContractHeightCache},
+    },
+    worker::{
+        api_response::{
+            PsyWorkerGetProvingWorkAPIResponse,
+            PsyWorkerGetProvingWorkWithChildProofsAPIResponse,
+            PROVING_JOB_NODE_TYPE_REALM,
+        },
+        metadata_with_job_id::PsyProvingJobMetadataWithJobId,
+    },
 };
 use psy_dummy_prover::{
     lite::user_state::{DPContractUpdate, DPLocalUser},
@@ -54,6 +86,8 @@ use psy_jtmb_testing_core::{
     protocol_types::{JTMBPoseidonGoldilocksConfig, ZKTypesJTMBGoldilocksPoseidon},
     proof::PsyTestJTMBProof,
     proving::circuits::dummy_end_cap::DummyUPSStandardEndCapCircuit,
+    proving::coordinator_helper::QEDCoordinatorCircuitManager,
+    utils::circuit_info_library::PsyJTMBCircuitInfoLibraryCore,
     zk_verifier::PsyJTMBZKVerifier,
 };
 use psy_node_common::realm::edge::{
@@ -110,6 +144,10 @@ use psy_node_core::{
             RealmProcessorApplicationArchiveBinding,
             RealmProcessorApplicationArchivePlan,
         },
+        realm_processor_application_proof_work::{
+            RealmProcessorApplicationProofWorkOutcome,
+        },
+        realm_processor_narrow_writer::RealmProcessorVerifiedNarrowWriterEvidence,
         realm_processor_semantic_output::{
             RealmProcessorDeferredJob, RealmProcessorSemanticOutput,
             RealmProcessorSemanticOutputParts,
@@ -117,13 +155,15 @@ use psy_node_core::{
         recoverable_ephemeral::PendingQueueCaptureContext,
     },
     store::{
-        authority_commit::AuthorityTimestampKey,
+        authority_commit::{AuthorityClockSampleUs, AuthorityTimestampKey},
         authority_local_head::{
             AuthorityLocalHeadBootstrap, AuthorityLocalHeadBootstrapReason,
             AuthorityLocalHeadReadState, AuthorityLocalHeadWriteOutcome,
             AuthorityStorageBindingGeneration, AuthorityStorageBindingRef,
             AuthorityStorageNamespaceId, SealedAuthorityLocalHeadCas,
         },
+        branch_exact_dual_write::BranchExactDualWriteIntent,
+        branch_pending_mapping::BranchPendingMapping,
         manifest_lifecycle::AuthorityHeadView,
         manifest_record::AuthorityManifestDigest,
         pending_generation::{ProcNamespacePrefix, ReservedPendingGeneration},
@@ -134,6 +174,7 @@ use psy_node_core::{
         pending_generation_pipeline::{
             PendingEmptyQueueSealDigest, PendingNoWorkReceiptDigest,
             PendingPipelineBootstrap, PendingPipelineIntentDigest,
+            PendingPipelineReadState,
             PendingPipelineWriteOutcome, PendingPublishReceiptDigest,
             PendingQueueCloseIntentDigest, PendingWorkCaptureDigest,
             StoredPendingPipeline,
@@ -148,6 +189,7 @@ use psy_node_core::{
             RealmProcessorStartupAuthorization, RealmProcessorStartupLineage,
             RealmProcessorStartupMode,
         },
+        realm_proof_binding::SealedRealmProofBinding,
         typed::UniquePendingId,
     },
 };
@@ -168,6 +210,8 @@ use psy_node_nats::{
 use scylla::{client::session::Session, statement::Consistency};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+#[cfg(feature = "rf3-test-support")]
+use psy_worker_core::worker::prover_trait::PsyWorkerGenericLibraryProver;
 use tokio::time::{sleep, timeout};
 #[cfg(feature = "rf3-test-support")]
 use tokio::sync::oneshot;
@@ -336,6 +380,26 @@ struct E3Report {
     deferred_input_rf3: bool,
     actor_retry_socket_response_loss_injected: bool,
     full_processor_rf3_runtime: bool,
+    proof_narrow_writer_rf3: bool,
+    proof_work_storage_reconstructed: bool,
+    qualification_jtmb_guta_proof_verified: bool,
+    qualification_guta_jobs_proved: usize,
+    qualification_root_proof_bytes: usize,
+    qualification_root_job_circuit: u32,
+    proof_binding_verified: bool,
+    proof_binding_digest: String,
+    proof_binding_tamper_rejected: bool,
+    qualification_coordinator_inclusion: bool,
+    coordinator_rpc_rf3: bool,
+    proof_worker_queue_rf3: bool,
+    narrow_writer_pipeline_revision: u64,
+    narrow_writer_revision: u64,
+    narrow_writer_intent_digest: String,
+    narrow_writer_inflight_recovered: bool,
+    narrow_writer_caller_discard_recovered: bool,
+    narrow_writer_during_one_replica_offline: bool,
+    narrow_writer_nats_delta: u64,
+    narrow_writer_socket_response_loss_injected: bool,
     all_20_target_business_rows_qualified: bool,
     repair_direct_one_table_names: Vec<String>,
     repair_direct_one_rows: usize,
@@ -602,6 +666,8 @@ async fn dependency_timestamps_match_durable_claims(
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct QualificationJobMaterial {
     user_id: u64,
+    job_id: QProvingJobDataID,
+    proof: Vec<u8>,
     queue_item: Vec<u8>,
     contract_updates: Vec<u8>,
 }
@@ -651,7 +717,12 @@ async fn read_published_job_materials(
                 .component(RealmUserUpdateDependencyKind::ContractUpdates)
                 .bytes()
                 .to_vec();
+            let proof = bundle
+                .component(RealmUserUpdateDependencyKind::Proof)
+                .bytes()
+                .to_vec();
             ensure!(!contract_updates.is_empty());
+            ensure!(!proof.is_empty());
             let decoded = PsyRealmUserUpdateQueueItem::<PF, PHash>::psy_ser_from_slice(
                 &queue_item,
             )?;
@@ -666,6 +737,8 @@ async fn read_published_job_materials(
                         claim.user_id().get(),
                         QualificationJobMaterial {
                             user_id: claim.user_id().get(),
+                            job_id: decoded.job_id,
+                            proof,
                             queue_item,
                             contract_updates,
                         },
@@ -702,6 +775,280 @@ fn deferred_jobs_from_materials(
 }
 
 #[cfg(feature = "rf3-test-support")]
+struct QualificationRealmProofArtifacts {
+    submission: GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<PF, PHash>,
+    proof_bytes: Vec<u8>,
+    proof_public_inputs: PHash,
+    reward_root: PHash,
+    root_job_id: QProvingJobDataID,
+    proved_jobs: usize,
+}
+
+#[cfg(feature = "rf3-test-support")]
+fn qualification_worker_tag(job_id: QProvingJobDataID) -> PHash {
+    let mut hasher = Sha256::new();
+    hasher.update(b"psy/rf3/d04b6h23c4d2/worker-reward-tag/v1");
+    hasher.update(job_id.to_fixed_bytes());
+    PHash::from_owned_32bytes(hasher.finalize().into())
+}
+
+#[cfg(feature = "rf3-test-support")]
+fn qualification_prove_realm_semantic(
+    semantic: &RealmProcessorSemanticOutput,
+    processing: PendingGenerationContext,
+    chain: CanonicalChainRef<PHash>,
+    materials: &[QualificationJobMaterial],
+    manager: &QEDCoordinatorCircuitManager<JTMBPoseidonGoldilocksConfig>,
+    verifier: &Verifier,
+) -> anyhow::Result<QualificationRealmProofArtifacts> {
+    let authority = AuthorityScope::Realm {
+        realm_id: REALM_ID,
+        realm_sub_id: REALM_SUB_ID,
+    };
+    let mut proofs = BTreeMap::<QProvingJobDataID, Vec<u8>>::new();
+    let mut reward_values = BTreeMap::<QProvingJobDataID, PHash>::new();
+    for material in materials {
+        ensure!(
+            proofs
+                .insert(material.job_id, material.proof.clone())
+                .is_none(),
+            "duplicate qualification end-cap proof",
+        );
+    }
+
+    let mut levels = BTreeMap::<
+        u16,
+        Vec<(
+            u32,
+            PsyProvingJobMetadataWithJobId<PHash, QProvingJobDataID>,
+            Vec<u8>,
+        )>,
+    >::new();
+    for stored in semantic.jobs() {
+        let metadata = PsyProvingJobMetadataWithJobId::<
+            PHash,
+            QProvingJobDataID,
+        >::psy_ser_from_slice(stored.metadata())?;
+        ensure!(
+            metadata.psy_ser_to_bytes_vec()? == stored.metadata(),
+            "non-canonical qualification proof metadata",
+        );
+        levels.entry(stored.level()).or_default().push((
+            stored.ordinal(),
+            metadata,
+            stored.witness().to_vec(),
+        ));
+    }
+    let root_level = *levels
+        .keys()
+        .next_back()
+        .ok_or_else(|| anyhow::anyhow!("proof-bearing semantic has no jobs"))?;
+
+    let mut proved_jobs = 0_usize;
+    let mut root_job = None;
+    for (level, level_jobs) in &mut levels {
+        level_jobs.sort_by_key(|(ordinal, _, _)| *ordinal);
+        for (expected, (ordinal, job, witness)) in level_jobs.iter().enumerate() {
+            ensure!(
+                usize::try_from(*ordinal)? == expected,
+                "non-contiguous proof ordinal at level {level}",
+            );
+            let mut input_proofs = Vec::with_capacity(job.metadata.dependencies.len());
+            let mut child_reward_values =
+                Vec::with_capacity(job.metadata.dependencies.len());
+            for dependency in &job.metadata.dependencies {
+                input_proofs.push(
+                    proofs
+                        .get(dependency)
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "missing qualification child proof for {dependency:?}"
+                        ))?
+                        .clone(),
+                );
+                child_reward_values.push(
+                    if matches!(
+                        dependency.circuit_type,
+                        ProvingJobCircuitType::UserEndCap
+                            | ProvingJobCircuitType::GenerateRollupStateTransitionProof
+                    ) {
+                        PHash::get_zero_value()
+                    } else {
+                        *reward_values.get(dependency).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "missing qualification child reward for {dependency:?}"
+                            )
+                        })?
+                    },
+                );
+            }
+            let tag = qualification_worker_tag(job.job_id);
+            let reward_value = job
+                .metadata
+                .get_new_rewards_tag_tree_value::<PoseidonHasher>(
+                    tag,
+                    &child_reward_values,
+                )?;
+            let work_context = WorkContext::try_new(
+                chain,
+                authority,
+                WorkUniquePendingId::new(processing.pending_id().get()),
+                WorkProcCheckpointUniqueId::from_u128(
+                    processing.proc_checkpoint_id().as_u128(),
+                ),
+                job.job_id,
+            )?;
+            let response = PsyWorkerGetProvingWorkWithChildProofsAPIResponse {
+                base: PsyWorkerGetProvingWorkAPIResponse {
+                    job: job.clone(),
+                    child_proof_tag_values: child_reward_values,
+                    realm_id: u64::from(REALM_ID),
+                    realm_sub_id: u64::from(REALM_SUB_ID),
+                    work_context: WorkContextToken::from_work_context(&work_context),
+                    node_type: PROVING_JOB_NODE_TYPE_REALM,
+                    witness: witness.clone(),
+                },
+                input_proofs,
+            };
+            let proof = manager.prove_job_from_api(
+                &verifier.gcv.library,
+                response,
+                tag,
+            )
+            .with_context(|| {
+                format!(
+                    "c4d2 proving job {:?} at semantic level {level}",
+                    job.job_id,
+                )
+            })?;
+            let parsed = <Verifier as QZKProofPublicInputsHasherReader<
+                PHash,
+                PsyTestJTMBProof<PHash>,
+            >>::try_proof_from_slice(&proof)?;
+            <Verifier as QZKProofVerifier<PHash, PsyTestJTMBProof<PHash>>>::verify_zk_proof(
+                verifier,
+                job.job_id.circuit_type as u32,
+                &parsed,
+            )?;
+            ensure!(proofs.insert(job.job_id, proof).is_none());
+            ensure!(reward_values.insert(job.job_id, reward_value).is_none());
+            proved_jobs += 1;
+        }
+        if *level == root_level {
+            ensure!(level_jobs.len() == 1, "qualification proof has multiple roots");
+            root_job = Some(level_jobs[0].1.clone());
+        }
+    }
+
+    let root_job = root_job.ok_or_else(|| anyhow::anyhow!("missing root proof job"))?;
+    let root_job_id = root_job.job_id;
+    let proof_bytes = proofs
+        .remove(&root_job_id)
+        .ok_or_else(|| anyhow::anyhow!("missing generated root proof"))?;
+    let reward_root = reward_values
+        .remove(&root_job_id)
+        .ok_or_else(|| anyhow::anyhow!("missing generated reward root"))?;
+    let guta_header = GlobalUserTreeAggregatorHeaderWithJobId::<PF, PHash>::
+        psy_ser_from_slice(semantic.guta_header())?;
+    ensure!(
+        guta_header.psy_ser_to_bytes_vec()? == semantic.guta_header()
+            && guta_header.job_id == root_job_id,
+        "semantic GUTA header does not select generated root proof",
+    );
+    let submission = GlobalUserTreeAggregatorHeaderWithTagValueAndJobType {
+        header: GlobalUserTreeAggregatorHeaderWithTagValue {
+            header: guta_header.header,
+            new_tag_tree_node_value: reward_root,
+        },
+        job_type_u32: root_job_id.circuit_type as u32,
+    };
+    let parsed = <Verifier as QZKProofPublicInputsHasherReader<
+        PHash,
+        PsyTestJTMBProof<PHash>,
+    >>::try_proof_from_slice(&proof_bytes)?;
+    let proof_public_inputs = <Verifier as QZKProofPublicInputsHasherReader<
+        PHash,
+        PsyTestJTMBProof<PHash>,
+    >>::get_proof_public_inputs_hash(&parsed)?;
+    ensure!(
+        proof_public_inputs == submission.qfhash::<PoseidonHasher>(),
+        "generated root proof does not bind the exact submission",
+    );
+    Ok(QualificationRealmProofArtifacts {
+        submission,
+        proof_bytes,
+        proof_public_inputs,
+        reward_root,
+        root_job_id,
+        proved_jobs,
+    })
+}
+
+#[cfg(feature = "rf3-test-support")]
+fn qualification_coordinator_update(
+    predecessor: CanonicalChainRef<PHash>,
+    new_realm_root: PHash,
+    proof_public_inputs: PHash,
+) -> anyhow::Result<PsyRealmCoordinatorUpdate<PF, PHash>> {
+    let siblings = (0..N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT)
+        .map(|level| {
+            let mut hasher = Sha256::new();
+            hasher.update(b"psy/rf3/d04b6h23c4d2/coordinator-sibling/v1");
+            hasher.update([level]);
+            PHash::from_owned_32bytes(hasher.finalize().into())
+        })
+        .collect::<Vec<_>>();
+    let inclusion = MerkleProofCore::new_from_params::<PoseidonHasher>(
+        u64::from(REALM_ID),
+        new_realm_root,
+        siblings,
+    );
+    let state_roots = PQEDCheckpointGlobalStateRoots {
+        contract_tree_root: PHash::from_owned_32bytes([0x91; 32]),
+        deposit_tree_root: PHash::from_owned_32bytes([0x92; 32]),
+        user_tree_root: inclusion.root,
+        withdrawal_tree_root: PHash::from_owned_32bytes([0x93; 32]),
+        user_registration_tree_root: PHash::from_owned_32bytes([0x94; 32]),
+    };
+    let checkpoint_leaf = PQEDCheckpointLeaf {
+        global_chain_root: state_roots.qfhash::<PoseidonHasher>(),
+        stats: PQEDCheckpointLeafStats::<PF, PHash>::get_empty_stats(),
+    };
+    let checkpoint_leaf_hash = checkpoint_leaf.qfhash::<PoseidonHasher>();
+    let checkpoint_id = predecessor
+        .checkpoint()
+        .checkpoint_id()
+        .get()
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("qualification checkpoint overflow"))?;
+    let mut block_state = QEDL2BlockState::get_genesis_value();
+    block_state.checkpoint_id = checkpoint_id;
+    Ok(PsyRealmCoordinatorUpdate {
+        canonical_chain_ref: CanonicalChainRef::new(
+            predecessor.network_id(),
+            predecessor.chain_epoch(),
+            CheckpointRef::new(
+                CheckpointId::new(checkpoint_id),
+                CheckpointHash::from_proof_public_inputs_hash(proof_public_inputs),
+            ),
+        ),
+        checkpoint_sync_info: PQEDCheckpointSyncInfoCompact {
+            checkpoint_id,
+            coordinator_id: 0,
+            coordinator_sub_id: 0,
+            coordinator_unique_pending_id: 1,
+            block_state,
+            state_roots,
+            checkpoint_leaf,
+            checkpoint_leaf_hash,
+            checkpoint_tree_root: PHash::from_owned_32bytes([0x95; 32]),
+        },
+        merkle_proof_to_realm_root: inclusion,
+        reward_tree_top_proof:
+            parth_core::crypto::hash::tag_tree::TagTreeMerkleProof::new_empty(),
+    })
+}
+
+#[cfg(feature = "rf3-test-support")]
 type QualificationRealmActor = EphemeralQueueGathererWithTree<
     PQ_REALM_SUBMIT_USER_UPDATE_QUEUE_TOPIC_ID,
     PsyRealmUserUpdateQueueItem<PF, PHash>,
@@ -713,6 +1060,8 @@ async fn start_qualification_realm_actor(
     context: PendingQueueCaptureContext,
     chain: CanonicalChainRef<PHash>,
     checkpoint_id: u64,
+    checkpoint_leaves: &[PHash],
+    guta_circuit_whitelist: PHash,
 ) -> anyhow::Result<(
     QualificationRealmActor,
     tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -750,13 +1099,14 @@ async fn start_qualification_realm_actor(
             N::CHECKPOINT_TREE_HEIGHT,
         ),
     );
+    ensure!(
+        checkpoint_leaves.len() > usize::try_from(checkpoint_id)?,
+        "qualification actor is missing exact checkpoint leaves",
+    );
     for index in 0..=checkpoint_id {
         checkpoint_tree.append_leaf(
             index,
-            PHash::from_owned_32bytes([
-                u8::try_from(index & 0xFF)?;
-                32
-            ]),
+            checkpoint_leaves[usize::try_from(index)?],
         )?;
     }
     let global_tree =
@@ -798,8 +1148,7 @@ async fn start_qualification_realm_actor(
         temp_db: Arc::clone(&temp),
         file_system: Arc::new(SimpleMockMemoryFileSystem::new()),
         backup_file_directory: "/h23c4c4b4c2".to_owned(),
-        coordinator_guta_updates_circuit_whitelist:
-            PHash::from_owned_32bytes([0xD7; 32]),
+        coordinator_guta_updates_circuit_whitelist: guta_circuit_whitelist,
         checkpoint_tree,
         future_pending_end_cap_jobs: Arc::new(RwLock::new(Vec::new())),
         durable_external_dependencies: None,
@@ -1248,6 +1597,8 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
     ensure!(nats_urls.len() == 3);
     let exercise_deferred_actor_archive =
         std::env::var("PSY_D04B6H23C4C4B4C2_RF3").as_deref() == Ok("1");
+    let exercise_proof_narrow_writer =
+        std::env::var("PSY_D04B6H23C4D2_RF3").as_deref() == Ok("1");
 
     fixture::wait_up(3).await?;
     let session = Arc::new(fixture::connect(None, Consistency::Quorum).await?);
@@ -1256,10 +1607,18 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         .await?;
 
     let network_type = PsyChainNetworkType::PsyPublicTestnet;
-    let (library, _) = get_jtmb_circuit_library_and_prover_for_network::<
+    let (library, circuit_manager) = get_jtmb_circuit_library_and_prover_for_network::<
         JTMBPoseidonGoldilocksConfig,
     >(network_type)?;
     let verifier = Arc::new(PsyJTMBZKVerifier::new(library));
+    let guta_circuit_whitelist = verifier
+        .gcv
+        .library
+        .get_group_inclusion_proof(
+            ProvingJobCircuitType::GUTATwoGUTALinearUpgradeCheckpoint,
+            ProvingJobCircuitType::GUTATwoGUTALinear,
+        )?
+        .root;
     let profile = verifier.realm_user_update_verifier_profile(network_type)?;
     let activated = realm_fixture::activate_realm_writer_with_profile(
         Arc::clone(&session),
@@ -1574,6 +1933,10 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         !exercise_deferred_actor_archive || exercise_terminal_recovery,
         "c4b4c2 deferred actor Gate requires c4b3b2 terminal carryover recovery"
     );
+    ensure!(
+        !exercise_proof_narrow_writer || exercise_deferred_actor_archive,
+        "c4d2 proof/writer Gate requires c4b4c2 deferred actor archive"
+    );
     let mut branch_exact_commit_owner = if exercise_durable_capture {
         let expectation = lineage.seal_attempt([0xC3; 32])?;
         let provider = Arc::new(
@@ -1616,6 +1979,20 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
     let input_a = end_cap_input(&handler.db_reader, user_a, 101, checkpoint_id).await?;
     let input_b = end_cap_input(&handler.db_reader, user_b, 202, checkpoint_id).await?;
     let input_c = end_cap_input(&handler.db_reader, user_c, 303, checkpoint_id).await?;
+    let mut qualification_checkpoint_leaves = Vec::new();
+    if exercise_deferred_actor_archive {
+        for leaf_index in 0..=checkpoint_id {
+            qualification_checkpoint_leaves.push(
+                handler
+                    .db_reader
+                    .checkpoint_tree_get_leaf_hash(
+                        u64::MAX - 0xFFFF,
+                        leaf_index,
+                    )
+                    .await?,
+            );
+        }
+    }
     let prover = DummyUPSStandardEndCapCircuit::<JTMBPoseidonGoldilocksConfig>::new(
         &get_test_circuit_authority_key(network_type),
     );
@@ -1930,6 +2307,7 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         !exercise_deferred_actor_archive
             || predecessor_deferred_materials.len() == 3
     );
+    let mut qualification_proof_materials = predecessor_deferred_materials.clone();
 
     let initial_qualification_fence = if exercise_durable_replay {
         // Durable consumption is authorized by the closed admission manifest,
@@ -2037,6 +2415,22 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
     let mut handoff_recovery_without_actor_rerun = false;
     let mut successor_handoff_revision = 0_u64;
     let mut actor_handoff_during_one_replica_offline = false;
+    let mut proof_work_storage_reconstructed = false;
+    let mut qualification_jtmb_guta_proof_verified = false;
+    let mut qualification_guta_jobs_proved = 0_usize;
+    let mut qualification_root_proof_bytes = 0_usize;
+    let mut qualification_root_job_circuit = 0_u32;
+    let mut proof_binding_verified = false;
+    let mut proof_binding_digest = String::new();
+    let mut proof_binding_tamper_rejected = false;
+    let mut qualification_coordinator_inclusion = false;
+    let mut narrow_writer_pipeline_revision = 0_u64;
+    let mut narrow_writer_revision = 0_u64;
+    let mut narrow_writer_intent_digest = String::new();
+    let mut narrow_writer_inflight_recovered = false;
+    let mut narrow_writer_caller_discard_recovered = false;
+    let mut narrow_writer_during_one_replica_offline = false;
+    let mut narrow_writer_nats_delta = 0_u64;
     let mut deferred_actor_nats_message_count_before = 0_u64;
     let mut expected_nats_after_deferred_actor = 0_u64;
     let mut successor_dependency_capture = None;
@@ -2322,6 +2716,8 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                                 capture,
                                 *sealing.frontier().chain(),
                                 actor_checkpoint,
+                                &qualification_checkpoint_leaves,
+                                guta_circuit_whitelist,
                             )
                             .await?;
                         let apply = actor
@@ -2566,6 +2962,57 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                                 | AuthorityLocalHeadWriteOutcome::Idempotent(_)
                         ));
 
+                        if exercise_proof_narrow_writer {
+                            // Earlier qualification stages advanced the
+                            // predecessor pipeline/head without invoking the
+                            // production writer. Reconcile that already-
+                            // published predecessor before qualifying the
+                            // successor writer, so all three frontiers agree.
+                            let qualification_candidate = BranchPendingMapping::new(
+                                *published_observation.chain(),
+                                published.processing().pending_id(),
+                            );
+                            let qualification_intent =
+                                BranchExactDualWriteIntent::try_realm(
+                                    authority,
+                                    activated.predecessor,
+                                    qualification_candidate,
+                                    published.processing().proc_checkpoint_id(),
+                                    &TagTreeMerkleProof::<PHash>::new_empty(),
+                                )?;
+                            let qualification_writer =
+                                ScyllaBranchExactWriterRuntime::<PHash>::prepare(
+                                    Arc::clone(&session),
+                                    fixture::KEYSPACE,
+                                    &fixture::control_keyspace(),
+                                    BranchExactWriterRuntimeRequest::new(
+                                        network,
+                                        authority,
+                                        activated.plan.digest(),
+                                    ),
+                                )
+                                .await?;
+                            let qualification_barrier = qualification_writer
+                                .prepare_and_verify(
+                                    qualification_intent,
+                                    AuthorityClockSampleUs::try_from_i128(
+                                        i128::from(
+                                            activated.baseline_timestamp.as_i64(),
+                                        ) + 1_000,
+                                    )?,
+                                )
+                                .await?;
+                            qualification_writer
+                                .require_fresh_barrier(&qualification_barrier)
+                                .await?;
+                            qualification_writer
+                                .finish_published(
+                                    &qualification_barrier,
+                                    published_observation.chain(),
+                                )
+                                .await?;
+                        }
+
                         let before_terminal_absent =
                             terminal_recovery_snapshot(&session).await?;
                         let mut absent_iteration = owner.begin_iteration(
@@ -2730,6 +3177,8 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                                     )
                                     .await?;
                                 ensure!(successor_external_materials.len() == 3);
+                                qualification_proof_materials
+                                    .extend(successor_external_materials.iter().cloned());
                                 let successor_admission_close =
                                     RealmUserUpdateAdmissionCloseIntent::derive(
                                         successor_admission_key,
@@ -3360,6 +3809,8 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                                     successor_capture,
                                     *successor_sealing.frontier().chain(),
                                     checkpoint_id,
+                                    &qualification_checkpoint_leaves,
+                                    guta_circuit_whitelist,
                                 )
                                 .await?;
 
@@ -3695,6 +4146,174 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                             handoff_recovery_without_actor_rerun =
                                 actor_builder_create_count == 1 && actor_finalize_count == 1;
                             ensure!(handoff_recovery_without_actor_rerun);
+
+                            if exercise_proof_narrow_writer {
+                                ensure!(
+                                    qualification_proof_materials.len() == 6,
+                                    "c4d2 qualification requires six exact end-cap proofs",
+                                );
+                                let proof_nats_before = stream_messages(
+                                    &jetstream,
+                                    segment.stream_name(),
+                                )
+                                .await?;
+                                let work = match successor_recovery_iteration
+                                    .prepare_application_proof_work()
+                                    .await?
+                                {
+                                    RealmProcessorApplicationProofWorkOutcome::Ready(work) => work,
+                                    RealmProcessorApplicationProofWorkOutcome::AwaitProoflessApplication { .. } => {
+                                        bail!("successor application unexpectedly has no proof work")
+                                    }
+                                };
+                                let PendingPipelineReadState::Current(
+                                    proof_pipeline,
+                                ) = pipeline_store.read::<PHash>(key).await?
+                                else {
+                                    bail!("c4d2 proof pipeline disappeared")
+                                };
+                                ensure!(
+                                    proof_pipeline.processing() == work.processing()
+                                        && proof_pipeline
+                                            .frontier()
+                                            .chain()
+                                            .network_id()
+                                            == network,
+                                    "c4d2 proof work does not match current pipeline",
+                                );
+                                let proof_predecessor_chain =
+                                    *proof_pipeline.frontier().chain();
+                                proof_work_storage_reconstructed = true;
+                                let proof = qualification_prove_realm_semantic(
+                                    work.semantic(),
+                                    work.processing(),
+                                    proof_predecessor_chain,
+                                    &qualification_proof_materials,
+                                    &circuit_manager,
+                                    verifier.as_ref(),
+                                )
+                                .context("c4d2 proving exact application semantic")?;
+                                ensure!(proof.proved_jobs == work.semantic().jobs().len());
+                                ensure!(proof.reward_root != PHash::get_zero_value());
+                                qualification_jtmb_guta_proof_verified = true;
+                                qualification_guta_jobs_proved = proof.proved_jobs;
+                                qualification_root_proof_bytes = proof.proof_bytes.len();
+                                qualification_root_job_circuit =
+                                    proof.root_job_id.circuit_type as u32;
+
+                                let prepared = work.prepared_update::<PHash>(
+                                    REALM_ID,
+                                    REALM_SUB_ID,
+                                );
+                                let coordinator = qualification_coordinator_update(
+                                    proof_predecessor_chain,
+                                    prepared.new_realm_root,
+                                    proof.proof_public_inputs,
+                                )?;
+                                qualification_coordinator_inclusion = true;
+
+                                let mut tampered = coordinator.clone();
+                                tampered.merkle_proof_to_realm_root.value =
+                                    PHash::from_owned_32bytes([0xE1; 32]);
+                                proof_binding_tamper_rejected =
+                                    SealedRealmProofBinding::verify_and_seal::<
+                                        PF,
+                                        PoseidonHasher,
+                                        PsyTestJTMBProof<PHash>,
+                                        Verifier,
+                                    >(
+                                        authority,
+                                        &prepared,
+                                        &proof.submission,
+                                        &proof.proof_bytes,
+                                        verifier.as_ref(),
+                                        &tampered,
+                                        N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+                                    )
+                                    .is_err();
+                                ensure!(proof_binding_tamper_rejected);
+
+                                let binding =
+                                    SealedRealmProofBinding::verify_and_seal::<
+                                        PF,
+                                        PoseidonHasher,
+                                        PsyTestJTMBProof<PHash>,
+                                        Verifier,
+                                    >(
+                                        authority,
+                                        &prepared,
+                                        &proof.submission,
+                                        &proof.proof_bytes,
+                                        verifier.as_ref(),
+                                        &coordinator,
+                                        N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+                                    )
+                                    .context("c4d2 sealing exact proof binding")?;
+
+                                proof_binding_verified = true;
+                                proof_binding_digest =
+                                    hex::encode(binding.digest().as_bytes());
+                                let evidence =
+                                    RealmProcessorVerifiedNarrowWriterEvidence::try_from_verified(
+                                        REALM_ID,
+                                        REALM_SUB_ID,
+                                        &work,
+                                        &binding,
+                                        &coordinator,
+                                    )
+                                    .context("c4d2 deriving narrow-writer evidence")?;
+                                let clock = AuthorityClockSampleUs::try_from_i128(
+                                    i128::try_from(
+                                        SystemTime::now()
+                                            .duration_since(UNIX_EPOCH)?
+                                            .as_micros(),
+                                    )?,
+                                )?;
+                                let narrow = successor_recovery_iteration
+                                    .prepare_mapping_and_reward_proof(
+                                        &evidence,
+                                        clock,
+                                    )
+                                    .await
+                                    .map_err(|error| {
+                                        anyhow::anyhow!(
+                                            "c4d2 applying narrow mapping/reward writer: {error:?}",
+                                        )
+                                    })?;
+                                narrow_writer_pipeline_revision =
+                                    narrow.pipeline_revision().get();
+                                narrow_writer_revision = narrow.writer_revision();
+                                narrow_writer_intent_digest =
+                                    hex::encode(narrow.intent_digest());
+                                narrow_writer_during_one_replica_offline = true;
+
+                                // Model caller loss after the durable writer
+                                // and pipeline mutations. A fresh storage read
+                                // must recover InFlight without re-running the
+                                // proof or accepting a second candidate.
+                                let _ = narrow;
+                                let recovered = successor_recovery_iteration
+                                    .observe_generation_continuation()
+                                    .await?;
+                                narrow_writer_inflight_recovered = recovered.phase()
+                                    == RealmProcessorGenerationContinuationPhase::AwaitWriterCompletion
+                                    && recovered.application()
+                                        == successor_continuation.application();
+                                narrow_writer_caller_discard_recovered =
+                                    narrow_writer_inflight_recovered;
+                                ensure!(narrow_writer_inflight_recovered);
+                                let proof_nats_after = stream_messages(
+                                    &jetstream,
+                                    segment.stream_name(),
+                                )
+                                .await?;
+                                narrow_writer_nats_delta = proof_nats_after
+                                    .checked_sub(proof_nats_before)
+                                    .ok_or_else(|| anyhow::anyhow!(
+                                        "proof/narrow-writer NATS count regressed"
+                                    ))?;
+                                ensure!(narrow_writer_nats_delta == 0);
+                            }
                             drop(successor_recovery_iteration);
                             drop(actor);
                             timeout(Duration::from_secs(30), actor_task).await???;
@@ -4166,6 +4785,26 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         deferred_input_rf3: exercise_deferred_actor_archive,
         actor_retry_socket_response_loss_injected: false,
         full_processor_rf3_runtime: false,
+        proof_narrow_writer_rf3: exercise_proof_narrow_writer,
+        proof_work_storage_reconstructed,
+        qualification_jtmb_guta_proof_verified,
+        qualification_guta_jobs_proved,
+        qualification_root_proof_bytes,
+        qualification_root_job_circuit,
+        proof_binding_verified,
+        proof_binding_digest,
+        proof_binding_tamper_rejected,
+        qualification_coordinator_inclusion,
+        coordinator_rpc_rf3: false,
+        proof_worker_queue_rf3: false,
+        narrow_writer_pipeline_revision,
+        narrow_writer_revision,
+        narrow_writer_intent_digest,
+        narrow_writer_inflight_recovered,
+        narrow_writer_caller_discard_recovered,
+        narrow_writer_during_one_replica_offline,
+        narrow_writer_nats_delta,
+        narrow_writer_socket_response_loss_injected: false,
         all_20_target_business_rows_qualified: false,
         repair_direct_one_table_names: replica.table_names(),
         repair_direct_one_rows: replica.total_rows(),
@@ -4180,14 +4819,16 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         carryover_replay: false,
         successor_actor_injection: false,
         proof_publish: false,
-        mapping_reward_writer_integrated: false,
+        mapping_reward_writer_integrated: exercise_proof_narrow_writer,
         full_22_domain_writer: false,
         production_writer_integrated: false,
         authority_head_publish_integrated: false,
         full_node_restart_tested: false,
         production_serving: false,
         h8_domains_closed: 0,
-        qualification: if exercise_deferred_actor_archive {
+        qualification: if exercise_proof_narrow_writer {
+            "H23C4D2_REALM_PROOF_NARROW_WRITER_RF3_PASSED"
+        } else if exercise_deferred_actor_archive {
             "H23C4C4B4C2_DEFERRED_ACTOR_ARCHIVE_RF3_PASSED"
         } else if exercise_terminal_recovery {
             "H23C4C4B3B2_TERMINAL_CARRYOVER_RECOVERY_RF3_PASSED"
