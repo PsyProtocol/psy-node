@@ -1,6 +1,7 @@
 mod pending_id;
 mod pending_context;
 mod submit_status;
+mod coordinator_guta_submission;
 mod witness;
 mod expected_public_inputs;
 mod user_contract_tree_updates;
@@ -19,6 +20,7 @@ pub use expected_public_inputs::*;
 pub use pending_id::*;
 pub use pending_context::*;
 pub use submit_status::*;
+pub use coordinator_guta_submission::*;
 pub use witness::*;
 pub use user_contract_tree_updates::*;
 pub use user_end_cap_slot_updates::*;
@@ -33,6 +35,7 @@ pub use worker_reputation::*;
 pub trait StandardEdgeAPITempDBStoreBase<JobId: QJobIdBase, Hash: QDBHashBase>: 
     QTempDBPendingIdStore + 
     QTempDBPendingContextStore<Hash> +
+    QTempDBCoordinatorGutaSubmissionClaimStore +
     QTempDBSubmitStatusStore + 
     QTempDBProofWitnessStore<Hash, JobId> +
     QTempDBUserContractUpdatesStore + 
@@ -54,6 +57,7 @@ impl<
     T: 
     QTempDBPendingIdStore + 
     QTempDBPendingContextStore<Hash> +
+    QTempDBCoordinatorGutaSubmissionClaimStore +
     QTempDBSubmitStatusStore + 
     QTempDBProofWitnessStore<Hash, JobId> +
     QTempDBUserContractUpdatesStore + 

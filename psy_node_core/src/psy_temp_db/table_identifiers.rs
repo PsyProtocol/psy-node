@@ -150,6 +150,20 @@ pub const TEMP_TABLE_ID_SUBMIT_STATUS_BYTES: [u8; 2] = [0x53, 0x53]; // 'SS'
 pub const TEMP_TABLE_SUBMIT_STATUS_KEY_SIZE: usize = 24; // 4 + 2 + 2 + 8 + 8
 pub const TEMP_TABLE_SUBMIT_STAUTS_VALUE_SIZE: usize = 8; // u64
 
+/// Content-bound, generation-exact Coordinator GUTA submission claim.
+///
+/// This is deliberately a distinct keyspace from the legacy random submit
+/// status. The complete canonical `PendingContext` prevents pending/proc or
+/// branch reuse, while the submitted Realm ID gives one immutable winner per
+/// Realm in that generation.
+pub const TEMP_TABLE_ID_COORDINATOR_GUTA_SUBMISSION: u16 = 0x5347; // 'GS'
+pub const TEMP_TABLE_ID_COORDINATOR_GUTA_SUBMISSION_BYTES: [u8; 2] = [0x47, 0x53]; // 'GS'
+pub const TEMP_COORDINATOR_GUTA_SUBMISSION_KEY_MAGIC: [u8; 4] = *b"CGS1";
+pub const TEMP_COORDINATOR_GUTA_SUBMISSION_KEY_SIZE: usize =
+    4 + 2 + 2 + TEMP_COORDINATOR_GUTA_SUBMISSION_KEY_MAGIC.len()
+        + PENDING_CONTEXT_V1_LEN
+        + 8;
+
 pub const TEMP_TABLE_ID_USER_CONTRACT_TREE_UPDATES: u16 = 0x5543; // 'CU'
 pub const TEMP_TABLE_ID_USER_CONTRACT_TREE_UPDATES_BYTES: [u8; 2] = [0x43, 0x55]; // 'CU'
 pub const TEMP_TABLE_USER_CONTRACT_TREE_UPDATES_KEY_SIZE: usize = 24; // 4 + 2 + 2 + 8 + 8
@@ -420,6 +434,26 @@ pub fn tt_get_proof_witness_data_key_from_job<JobId: QJobIdBase>(
 }
 
 // --- Submit Status ---
+
+#[inline(always)]
+pub fn tt_get_coordinator_guta_submission_key<Hash: Q256BitHash>(
+    rid: &QRealmIdentifier,
+    context: &PendingContext<Hash>,
+    submitted_realm_id: u64,
+) -> anyhow::Result<[u8; TEMP_COORDINATOR_GUTA_SUBMISSION_KEY_SIZE]> {
+    if context.authority() != AuthorityScope::Coordinator {
+        anyhow::bail!("Coordinator GUTA submission context must use Coordinator authority");
+    }
+
+    let mut key = [0u8; TEMP_COORDINATOR_GUTA_SUBMISSION_KEY_SIZE];
+    key[0..4].copy_from_slice(&rid.realm_id.to_le_bytes());
+    key[4..6].copy_from_slice(&rid.realm_sub_id.to_le_bytes());
+    key[6..8].copy_from_slice(&TEMP_TABLE_ID_COORDINATOR_GUTA_SUBMISSION_BYTES);
+    key[8..12].copy_from_slice(&TEMP_COORDINATOR_GUTA_SUBMISSION_KEY_MAGIC);
+    key[12..(12 + PENDING_CONTEXT_V1_LEN)].copy_from_slice(&context.to_canonical_bytes());
+    key[(12 + PENDING_CONTEXT_V1_LEN)..].copy_from_slice(&submitted_realm_id.to_le_bytes());
+    Ok(key)
+}
 
 // (realm_id = 4) + (realm_sub_id = 2) + (table id length = 2) + (unique_pending_id = 8) + (user_or_realm_id = 8) = 24
 #[inline(always)]

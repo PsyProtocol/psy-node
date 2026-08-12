@@ -82,14 +82,25 @@ impl QCanonicalProofStoreV2 for SimpleMemoryTempStore {
         address: &CanonicalProofStoreAddress,
         proof_bytes: &[u8],
     ) -> anyhow::Result<()> {
+        if proof_bytes.is_empty() {
+            anyhow::bail!("canonical proof bytes must not be empty");
+        }
         let mut guard = self
             .proof_map_v2
             .write()
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        guard
+        let bucket = guard
             .entry(address.redis_hash_key().to_owned())
-            .or_default()
-            .insert(address.job_field().to_vec(), proof_bytes.to_vec());
+            .or_default();
+        match bucket.get(address.job_field()) {
+            Some(current) if current.as_slice() == proof_bytes => {}
+            Some(_) => anyhow::bail!(
+                "canonical proof address already contains different bytes"
+            ),
+            None => {
+                bucket.insert(address.job_field().to_vec(), proof_bytes.to_vec());
+            }
+        }
         Ok(())
     }
 
@@ -258,6 +269,15 @@ impl QTempDatabaseRawKVWriterBase for SimpleMemoryTempStore {
     async fn qtdb_raw_kv_put_value(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
         self.kv_map.write().map_err(|e| anyhow::anyhow!(e.to_string()))?.insert(key.to_vec(), value.to_vec());
         Ok(())
+    }
+    async fn qtdb_raw_kv_put_value_if_absent(&self, key: &[u8], value: &[u8]) -> anyhow::Result<bool> {
+        let mut map = self.kv_map.write().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        if map.contains_key(key) {
+            Ok(false)
+        } else {
+            map.insert(key.to_vec(), value.to_vec());
+            Ok(true)
+        }
     }
     async fn qtdb_raw_kv_delete_key(&self, key: &[u8]) -> anyhow::Result<()> {
         self.kv_map.write().map_err(|e| anyhow::anyhow!(e.to_string()))?.remove(key);

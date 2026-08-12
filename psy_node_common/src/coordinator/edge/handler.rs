@@ -28,7 +28,10 @@ use psy_data::{
 };
 use psy_node_core::{
     psy_core_db::traits::full::{PsyCoordinatorEdgeAPIStoreReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter},
-    psy_temp_db::StandardEdgeAPITempDBStoreBase,
+    psy_temp_db::{
+        CoordinatorGutaSubmissionClaimOutcome, CoordinatorGutaSubmissionDigest,
+        StandardEdgeAPITempDBStoreBase,
+    },
     queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber},
     store::{
         canonical_head::{CanonicalHeadReadState, CanonicalHeadRevision, CoordinatorCanonicalHeadReader},
@@ -173,6 +176,46 @@ mod rollback_admin_tests {
                 "{name} must remain available for control-plane observation"
             );
         }
+    }
+
+    #[test]
+    fn coordinator_guta_submission_uses_content_claim_exact_proof_and_acked_publish_order() {
+        let source = include_str!("handler.rs");
+        let submit_marker = ["pub async fn ", "submit_guta_internal"].concat();
+        let next_marker = [
+            "\n    async fn ",
+            "ensure_guta_matches_current_coordinator_state",
+        ]
+        .concat();
+        let start = source
+            .find(&submit_marker)
+            .expect("submit_guta_internal must exist");
+        let body = &source[start..source[start..]
+            .find(&next_marker)
+            .map(|end| start + end)
+            .unwrap_or(source.len())];
+
+        assert!(!body.contains("rand::random"));
+        assert!(!body.contains("set_submitted_status_for_pending"));
+        let claim = body
+            .find("claim_coordinator_guta_submission")
+            .expect("content-bound atomic claim must exist");
+        let proof = body
+            .find("put_proof_bytes_exact")
+            .expect("exact proof persistence must exist");
+        let readback = body
+            .rfind("get_proof_bytes_exact")
+            .expect("exact proof readback must exist");
+        let claim_revalidation = body
+            .find("get_coordinator_guta_submission_claim")
+            .expect("claim must be revalidated before publish");
+        let publish = body
+            .find("publish_ephemeral_queue_item_owned")
+            .expect("Coordinator queue publish must exist");
+        assert!(claim < proof);
+        assert!(proof < readback);
+        assert!(readback < claim_revalidation);
+        assert!(claim_revalidation < publish);
     }
 
     fn request() -> RollbackAdminStartRequest<PHash> {
@@ -975,7 +1018,7 @@ impl<
         }
 
         let realm_level = realm_level_u64 as u8;
-        if realm_id_u64 > (1u64 << realm_level) || realm_id_u64 > u32::MAX as u64 {
+        if realm_id_u64 >= (1u64 << realm_level) || realm_id_u64 > u32::MAX as u64 {
             anyhow::bail!("invalid realm id {}", realm_id_u64);
         }
 
@@ -1000,19 +1043,6 @@ impl<
         }
         self.ensure_guta_matches_current_coordinator_state(realm_id_u64, &input).await?;
 
-        let status = rand::random::<u64>() & 0x0fff_ffff_ffff_ffff;
-        if self
-            .temp_db
-            .get_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, realm_id_u64)
-            .await?
-            != 0
-        {
-            anyhow::bail!(
-                "GUTA for realm_id {} at unique_pending_id {} has already been submitted",
-                realm_id,
-                unique_pending_id
-            );
-        }
         let output_proof_job_id = QProvingJobDataID::try_get_coordinator_edge_proof_store_output_proof_id_for_realm_submit(
             realm_id,
             realm_level,
@@ -1037,39 +1067,76 @@ impl<
         if current_context != pending_context {
             anyhow::bail!("pending context changed during GUTA verification");
         }
-        if self
+
+        let canonical_input = input.psy_ser_to_bytes_vec()?;
+        let submission_digest = CoordinatorGutaSubmissionDigest::from_submission(
+            realm_id_u64,
+            &canonical_input,
+            proof_bytes.as_slice(),
+        )?;
+        match self
             .temp_db
-            .get_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, realm_id_u64)
+            .claim_coordinator_guta_submission(
+                &self.realm_identifier,
+                &pending_context,
+                realm_id_u64,
+                submission_digest,
+            )
             .await?
-            != 0
         {
-            anyhow::bail!(
-                "GUTA for realm_id {} at unique_pending_id {} was submitted while proof verification was running",
-                realm_id,
-                unique_pending_id
-            );
-        }
-        self.temp_db
-            .set_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, realm_id_u64, status)
-            .await?;
-        if self
-            .temp_db
-            .get_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, realm_id_u64)
-            .await?
-            != status
-        {
-            anyhow::bail!(
-                "RACE: GUTA for realm_id {} at unique_pending_id {} has already been submitted",
-                realm_id,
-                unique_pending_id
-            );
+            CoordinatorGutaSubmissionClaimOutcome::Applied
+            | CoordinatorGutaSubmissionClaimOutcome::Idempotent => {}
+            CoordinatorGutaSubmissionClaimOutcome::Conflict { .. } => {
+                anyhow::bail!(
+                    "conflicting GUTA for realm_id {} at exact pending generation {}",
+                    realm_id,
+                    unique_pending_id,
+                );
+            }
         }
         let proof_address = self
             .proof_store
             .resolve_proof_address(&pending_context, &output_proof_job_id)?;
-        self.proof_store
-            .put_proof_bytes_exact(&proof_address, &proof_bytes)
-            .await?;
+        match self.proof_store.get_proof_bytes_exact(&proof_address).await? {
+            Some(current) if current.as_slice() != proof_bytes.as_slice() => {
+                anyhow::bail!("exact Coordinator GUTA proof address contains conflicting bytes");
+            }
+            Some(_) => {}
+            None => {
+                self.proof_store
+                    .put_proof_bytes_exact(&proof_address, &proof_bytes)
+                    .await?;
+            }
+        }
+        let persisted_proof = self
+            .proof_store
+            .get_proof_bytes_exact(&proof_address)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Coordinator GUTA proof disappeared after write"))?;
+        if persisted_proof.as_slice() != proof_bytes.as_slice() {
+            anyhow::bail!("Coordinator GUTA proof readback does not match claimed submission");
+        }
+
+        let publish_context = self
+            .temp_db
+            .get_current_pending_context(&self.realm_identifier)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("current pending context disappeared before GUTA publish"))?;
+        if publish_context != pending_context {
+            anyhow::bail!("pending context changed before GUTA publish");
+        }
+        if self
+            .temp_db
+            .get_coordinator_guta_submission_claim(
+                &self.realm_identifier,
+                &pending_context,
+                realm_id_u64,
+            )
+            .await?
+            != Some(submission_digest)
+        {
+            anyhow::bail!("Coordinator GUTA submission claim changed before publish");
+        }
 
         let queue_item = GlobalUserTreeAggregatorHeaderWithTagValueAndJobID {
             header: input.header,

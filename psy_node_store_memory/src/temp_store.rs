@@ -122,12 +122,26 @@ impl QCanonicalProofStoreV2 for InMemoryTempStore {
         address: &CanonicalProofStoreAddress,
         proof_bytes: &[u8],
     ) -> anyhow::Result<()> {
+        if proof_bytes.is_empty() {
+            anyhow::bail!("canonical proof bytes must not be empty");
+        }
         let bucket = self
             .proof_store_v2
             .entry(address.redis_hash_key().to_owned())
             .or_insert_with(|| Arc::new(DashMap::new()))
             .clone();
-        bucket.insert(address.job_field().to_vec(), proof_bytes.to_vec());
+        match bucket.entry(address.job_field().to_vec()) {
+            dashmap::mapref::entry::Entry::Occupied(current) => {
+                if current.get().as_slice() != proof_bytes {
+                    anyhow::bail!(
+                        "canonical proof address already contains different bytes"
+                    );
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(proof_bytes.to_vec());
+            }
+        }
         Ok(())
     }
 
@@ -495,6 +509,18 @@ impl QTempDatabaseRawKVWriterBase for InMemoryTempStore {
     async fn qtdb_raw_kv_put_value(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
         self.kv_store.insert(key.to_vec(), value.to_vec());
         Ok(())
+    }
+
+    async fn qtdb_raw_kv_put_value_if_absent(&self, key: &[u8], value: &[u8]) -> anyhow::Result<bool> {
+        use dashmap::mapref::entry::Entry;
+
+        match self.kv_store.entry(key.to_vec()) {
+            Entry::Occupied(_) => Ok(false),
+            Entry::Vacant(entry) => {
+                entry.insert(value.to_vec());
+                Ok(true)
+            }
+        }
     }
 
     async fn qtdb_raw_kv_delete_key(&self, key: &[u8]) -> anyhow::Result<()> {

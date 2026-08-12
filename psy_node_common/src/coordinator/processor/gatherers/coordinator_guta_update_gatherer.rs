@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     path::PathBuf,
     sync::{Arc, RwLock},
 };
@@ -126,6 +127,7 @@ pub async fn read_coordinator_guta_update_gatherer_backup_file<
     let mut cur_guta_stats = GUTAStats::<F>::get_zero_value();
 
     let mut total_guta_proofs_generated = F::ZERO_VALUE;
+    let mut selected_realm_updates: HashMap<u64, Vec<u8>> = HashMap::new();
 
     // ensure any existing changes are already commited
 
@@ -135,7 +137,18 @@ pub async fn read_coordinator_guta_update_gatherer_backup_file<
     for _ in 0..expected_count {
         let mut header_bytes = vec![0u8; GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<F, Hash>::FIXED_SIZE];
         file.read_exact(&mut header_bytes).await?;
-        let header = GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<F, Hash>::psy_ser_from_owned_bytes_vec(header_bytes)?;
+        let header = GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<F, Hash>::psy_ser_from_slice(&header_bytes)?;
+        let realm_id = header.header.header.state_transition.node_index.to_u64_value();
+        if let Some(selected) = selected_realm_updates.get(&realm_id) {
+            if selected.as_slice() == header_bytes.as_slice() {
+                continue;
+            }
+            anyhow::bail!(
+                "Coordinator GUTA backup contains conflicting updates for realm {}",
+                realm_id,
+            );
+        }
+        selected_realm_updates.insert(realm_id, header_bytes);
         cur_guta_stats.add_from_mut(&header.header.header.stats);
         total_guta_proofs_generated += header.header.header.total_aggregation_proofs_generated;
         let state_transition = header.header.header.state_transition;
@@ -221,6 +234,7 @@ pub struct CoordinatorGUTAUpdateGatherer<
     pub new_coordinator_guta_file: FileSystem::File,
     pub pending_file_path: String,
     pub total_guta_inputs: u64,
+    selected_realm_updates: HashMap<u64, Vec<u8>>,
 }
 /*
 impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>, FileSystem: TokioLikeFileSystem> CoordinatorGUTAUpdateGatherer<N, TempDatabase, FileSystem>
@@ -301,6 +315,7 @@ impl<
             new_coordinator_guta_file,
             start_global_user_tree_root: tree.get_root(),
             pending_file_path: new_coordinator_guta_file_path.to_string_lossy().to_string(),
+            selected_realm_updates: HashMap::new(),
         })
     }
     async fn update_from_queue_item_with_tree(
@@ -317,6 +332,21 @@ impl<
             ));
         }
         let update_header = GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<N::F, N::QHash>::psy_ser_from_slice(&item)?;
+        let submitted_realm_id = update_header
+            .header
+            .header
+            .state_transition
+            .node_index
+            .to_u64_value();
+        if let Some(selected) = self.selected_realm_updates.get(&submitted_realm_id) {
+            if selected.as_slice() == item.as_slice() {
+                return Ok(());
+            }
+            anyhow::bail!(
+                "Coordinator GUTA gatherer received conflicting updates for realm {}",
+                submitted_realm_id,
+            );
+        }
         tracing::info!("[CoordinatorGUTAUpdateGatherer] got update_header: {:#?}", update_header);
         let current_checkpoint_root = self.config.checkpoint_tree.get_root();
         if self.last_committed_checkpoint_root != current_checkpoint_root {
@@ -363,6 +393,8 @@ impl<
                 update_header,
             )
             .await?;
+        self.selected_realm_updates
+            .insert(submitted_realm_id, item);
         self.total_guta_inputs += 1;
         Ok(())
     }
@@ -594,7 +626,9 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(&COORDINATOR_GUTA_UPDATE_GATHERER_BACKUP_V1_MAGIC_U32.to_le_bytes());
         data.extend_from_slice(&start_root.into_owned_32bytes());
-        data.extend_from_slice(&item.psy_ser_to_bytes_vec()?);
+        let item_bytes = item.psy_ser_to_bytes_vec()?;
+        data.extend_from_slice(&item_bytes);
+        data.extend_from_slice(&item_bytes);
         data.extend_from_slice(&random_seed.into_owned_32bytes());
         file_system.files.insert(path.to_string(), data);
 
@@ -607,6 +641,43 @@ mod tests {
         assert_eq!(output.guta_stats.user_ops_processed.to_u64_value(), 13);
         assert_eq!(output.random_seed_guta, random_seed);
         assert_eq!(output.end_global_user_tree_root, tree.get_root());
+
+        let conflicting_path =
+            "coordinator_guta_update_gatherer_realm_0_sub_1_pending_2.backup";
+        let mut conflicting_item = item;
+        conflicting_item
+            .header
+            .header
+            .state_transition
+            .new_node_value = Hash::from_owned_32bytes([6u8; 32]);
+        let mut conflicting_data = Vec::new();
+        conflicting_data.extend_from_slice(
+            &COORDINATOR_GUTA_UPDATE_GATHERER_BACKUP_V1_MAGIC_U32.to_le_bytes(),
+        );
+        conflicting_data.extend_from_slice(&start_root.into_owned_32bytes());
+        conflicting_data.extend_from_slice(&item_bytes);
+        conflicting_data.extend_from_slice(&conflicting_item.psy_ser_to_bytes_vec()?);
+        conflicting_data.extend_from_slice(&random_seed.into_owned_32bytes());
+        file_system
+            .files
+            .insert(conflicting_path.to_string(), conflicting_data);
+        let mut conflicting_tree =
+            SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(4);
+        assert!(
+            read_coordinator_guta_update_gatherer_backup_file::<
+                Hasher,
+                Hash,
+                F,
+                SimpleMockMemoryFileSystem,
+            >(
+                &file_system,
+                conflicting_path,
+                &mut conflicting_tree,
+            )
+            .await
+            .is_err(),
+            "different updates for one Realm must fail closed",
+        );
 
         Ok(())
     }

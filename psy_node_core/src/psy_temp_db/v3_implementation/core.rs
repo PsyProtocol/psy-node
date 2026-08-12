@@ -14,7 +14,7 @@ const DEPLOY_CONTRACT_ZSTD_PREFIX: &[u8; 4] = b"PSZ1";
 use crate::{
     psy_temp_db::{
         tt_get_worker_reputation_key,
-        CheckpointJobStats, QTempDBDeployContractDataReader, QTempDBDeployContractDataWriter, QTempDBJobClaimInfoReader, QTempDBJobClaimInfoWriter, QTempDBJobStatsStore, QTempDBNodeProvingStateReader, QTempDBNodeProvingStateWriter, QTempDBPendingContextCleaner, QTempDBPendingContextReader, QTempDBPendingContextWriter, QTempDBPendingIdReader, QTempDBPendingIdWriter, QTempDBProofWitnessReader, QTempDBProofWitnessWriter, QTempDBProvingJobMetadataReader, QTempDBProvingJobMetadataWriter, QTempDBRewardsTreeReader, QTempDBRewardsTreeWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter, QTempDBUserContractUpdatesReader, QTempDBUserContractUpdatesWriter, QTempDBUserEndCapSlotUpdatesReader, QTempDBUserEndCapSlotUpdatesWriter, QTempDBWorkerReputationReader, QTempDBWorkerReputationWriter, tt_get_contract_updates_key, tt_get_current_pending_context_key, tt_get_deploy_contract_code_definition_key, tt_get_gathering_unique_pending_id_key, tt_get_job_claim_key_v2, tt_get_job_stats_count_key, tt_get_job_stats_max_duration_key, tt_get_job_stats_min_duration_key, tt_get_job_stats_total_duration_key, tt_get_node_proving_state_key, tt_get_proof_claim_tag_key_v2, tt_get_proof_witness_data_key_v2, tt_get_proving_job_metadata_key_v2, tt_get_rewards_tag_tree_value_key_v2, tt_get_submit_status_key, tt_get_unique_pending_id_key, tt_get_user_end_cap_slot_updates_key
+        CheckpointJobStats, CoordinatorGutaSubmissionClaimOutcome, CoordinatorGutaSubmissionDigest, QTempDBCoordinatorGutaSubmissionClaimStore, QTempDBDeployContractDataReader, QTempDBDeployContractDataWriter, QTempDBJobClaimInfoReader, QTempDBJobClaimInfoWriter, QTempDBJobStatsStore, QTempDBNodeProvingStateReader, QTempDBNodeProvingStateWriter, QTempDBPendingContextCleaner, QTempDBPendingContextReader, QTempDBPendingContextWriter, QTempDBPendingIdReader, QTempDBPendingIdWriter, QTempDBProofWitnessReader, QTempDBProofWitnessWriter, QTempDBProvingJobMetadataReader, QTempDBProvingJobMetadataWriter, QTempDBRewardsTreeReader, QTempDBRewardsTreeWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter, QTempDBUserContractUpdatesReader, QTempDBUserContractUpdatesWriter, QTempDBUserEndCapSlotUpdatesReader, QTempDBUserEndCapSlotUpdatesWriter, QTempDBWorkerReputationReader, QTempDBWorkerReputationWriter, tt_get_contract_updates_key, tt_get_coordinator_guta_submission_key, tt_get_current_pending_context_key, tt_get_deploy_contract_code_definition_key, tt_get_gathering_unique_pending_id_key, tt_get_job_claim_key_v2, tt_get_job_stats_count_key, tt_get_job_stats_max_duration_key, tt_get_job_stats_min_duration_key, tt_get_job_stats_total_duration_key, tt_get_node_proving_state_key, tt_get_proof_claim_tag_key_v2, tt_get_proof_witness_data_key_v2, tt_get_proving_job_metadata_key_v2, tt_get_rewards_tag_tree_value_key_v2, tt_get_submit_status_key, tt_get_unique_pending_id_key, tt_get_user_end_cap_slot_updates_key
     },
     store::traits::temp_db::{
         QTempDatabaseRawCounterReaderBase, QTempDatabaseRawCounterWriterBase, QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase,
@@ -152,6 +152,67 @@ impl<T: QTempDatabaseRawKVWriterBase + Sync + Send, JobId: QJobIdBase + Sync + S
     }
 }
 */
+
+#[async_trait]
+impl<T> QTempDBCoordinatorGutaSubmissionClaimStore for T
+where
+    T: QTempDatabaseRawKVReaderBase + QTempDatabaseRawKVWriterBase + Send + Sync,
+{
+    async fn claim_coordinator_guta_submission<Hash: Q256BitHash + Send + Sync>(
+        &self,
+        rid: &QRealmIdentifier,
+        context: &PendingContext<Hash>,
+        submitted_realm_id: u64,
+        digest: CoordinatorGutaSubmissionDigest,
+    ) -> anyhow::Result<CoordinatorGutaSubmissionClaimOutcome> {
+        let key = tt_get_coordinator_guta_submission_key(
+            rid,
+            context,
+            submitted_realm_id,
+        )?;
+        if self
+            .qtdb_raw_kv_put_value_if_absent(&key, digest.as_bytes())
+            .await?
+        {
+            let persisted = self
+                .qtdb_raw_kv_get_value(&key)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Coordinator GUTA claim disappeared after insert"))?;
+            if persisted.as_slice() != digest.as_bytes() {
+                anyhow::bail!("Coordinator GUTA claim changed after insert");
+            }
+            return Ok(CoordinatorGutaSubmissionClaimOutcome::Applied);
+        }
+
+        let current = self
+            .qtdb_raw_kv_get_value(&key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Coordinator GUTA claim disappeared after conflict"))?;
+        let current = CoordinatorGutaSubmissionDigest::try_from_bytes(&current)?;
+        if current == digest {
+            Ok(CoordinatorGutaSubmissionClaimOutcome::Idempotent)
+        } else {
+            Ok(CoordinatorGutaSubmissionClaimOutcome::Conflict { current })
+        }
+    }
+
+    async fn get_coordinator_guta_submission_claim<Hash: Q256BitHash + Send + Sync>(
+        &self,
+        rid: &QRealmIdentifier,
+        context: &PendingContext<Hash>,
+        submitted_realm_id: u64,
+    ) -> anyhow::Result<Option<CoordinatorGutaSubmissionDigest>> {
+        let key = tt_get_coordinator_guta_submission_key(
+            rid,
+            context,
+            submitted_realm_id,
+        )?;
+        self.qtdb_raw_kv_get_value(&key)
+            .await?
+            .map(|bytes| CoordinatorGutaSubmissionDigest::try_from_bytes(&bytes))
+            .transpose()
+    }
+}
 
 #[async_trait]
 impl<T> QTempDBJobStatsStore for T
@@ -837,6 +898,9 @@ mod tests {
     use crate::psy_temp_db::{
         tt_get_current_pending_context_key,
         tt_get_proof_witness_data_key_from_job,
+        CoordinatorGutaSubmissionClaimOutcome,
+        CoordinatorGutaSubmissionDigest,
+        QTempDBCoordinatorGutaSubmissionClaimStore,
         QTempDBJobClaimInfoReader, QTempDBJobClaimInfoWriter,
         QTempDBPendingContextCleaner, QTempDBPendingContextReader,
         QTempDBPendingContextWriter, QTempDBProofWitnessReader,
@@ -889,6 +953,27 @@ mod tests {
             WorkProcCheckpointUniqueId::from_u128(
                 0xffee_ddcc_bbaa_9988_7766_5544_3322_1100,
             ),
+        )
+    }
+
+    fn coordinator_pending_context(epoch: u64) -> PendingContext<PHash> {
+        PendingContext::new(
+            CanonicalChainRef::new(
+                NetworkId::try_from_chain_id(0x6979_7350).unwrap(),
+                ChainEpoch::new(epoch),
+                CheckpointRef::new(
+                    CheckpointId::new(500 + epoch),
+                    CheckpointHash::from_last_chain_hash(PHash::from_values(
+                        epoch,
+                        epoch + 1,
+                        epoch + 2,
+                        epoch + 3,
+                    )),
+                ),
+            ),
+            AuthorityScope::Coordinator,
+            WorkUniquePendingId::new(700 + epoch),
+            WorkProcCheckpointUniqueId::from_u128(900 + epoch as u128),
         )
     }
 
@@ -1076,6 +1161,130 @@ mod tests {
         reader.await.unwrap();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn coordinator_guta_submission_claim_is_atomic_content_bound_and_generation_exact() {
+        let store = SimpleMemoryTempStore::new();
+        let rid = QRealmIdentifier::new(0, 0);
+        let first_context = coordinator_pending_context(1);
+        let second_context = coordinator_pending_context(2);
+        let submitted_realm_id = 17;
+        let winner = CoordinatorGutaSubmissionDigest::from_submission(
+            submitted_realm_id,
+            b"canonical-guta-a",
+            b"proof-a",
+        )
+        .unwrap();
+        let contender = CoordinatorGutaSubmissionDigest::from_submission(
+            submitted_realm_id,
+            b"canonical-guta-b",
+            b"proof-b",
+        )
+        .unwrap();
+
+        assert_eq!(
+            store
+                .claim_coordinator_guta_submission(
+                    &rid,
+                    &first_context,
+                    submitted_realm_id,
+                    winner,
+                )
+                .await
+                .unwrap(),
+            CoordinatorGutaSubmissionClaimOutcome::Applied,
+        );
+        assert_eq!(
+            store
+                .claim_coordinator_guta_submission(
+                    &rid,
+                    &first_context,
+                    submitted_realm_id,
+                    winner,
+                )
+                .await
+                .unwrap(),
+            CoordinatorGutaSubmissionClaimOutcome::Idempotent,
+        );
+        assert_eq!(
+            store
+                .claim_coordinator_guta_submission(
+                    &rid,
+                    &first_context,
+                    submitted_realm_id,
+                    contender,
+                )
+                .await
+                .unwrap(),
+            CoordinatorGutaSubmissionClaimOutcome::Conflict { current: winner },
+        );
+
+        assert_eq!(
+            store
+                .claim_coordinator_guta_submission(
+                    &rid,
+                    &second_context,
+                    submitted_realm_id,
+                    contender,
+                )
+                .await
+                .unwrap(),
+            CoordinatorGutaSubmissionClaimOutcome::Applied,
+            "a new exact generation must have an independent claim",
+        );
+
+        let concurrent_store = SimpleMemoryTempStore::new();
+        let mut tasks = Vec::new();
+        for index in 0..32_u8 {
+            let concurrent_store = concurrent_store.clone();
+            let context = first_context;
+            tasks.push(tokio::spawn(async move {
+                let digest = CoordinatorGutaSubmissionDigest::from_submission(
+                    submitted_realm_id,
+                    &[index],
+                    &[index.wrapping_add(1)],
+                )
+                .unwrap();
+                let outcome = concurrent_store
+                    .claim_coordinator_guta_submission(
+                        &rid,
+                        &context,
+                        submitted_realm_id,
+                        digest,
+                    )
+                    .await
+                    .unwrap();
+                (digest, outcome)
+            }));
+        }
+        let mut applied = 0;
+        let mut selected = None;
+        for task in tasks {
+            let (digest, outcome) = task.await.unwrap();
+            match outcome {
+                CoordinatorGutaSubmissionClaimOutcome::Applied => {
+                    applied += 1;
+                    selected = Some(digest);
+                }
+                CoordinatorGutaSubmissionClaimOutcome::Conflict { .. } => {}
+                CoordinatorGutaSubmissionClaimOutcome::Idempotent => {
+                    panic!("all concurrent contenders use different content")
+                }
+            }
+        }
+        assert_eq!(applied, 1);
+        assert_eq!(
+            concurrent_store
+                .get_coordinator_guta_submission_claim(
+                    &rid,
+                    &first_context,
+                    submitted_realm_id,
+                )
+                .await
+                .unwrap(),
+            selected,
+        );
+    }
+
     // Defends the checkpoint-367 contract against the proof/reward namespace corruption:
     // for one realm/pending/job-id, a worker's proof claim-tag and the finalized
     // reward-tree value MUST live in distinct KV namespaces, and the blanket reward-trait
@@ -1195,6 +1404,40 @@ mod tests {
             data_type: ProvingJobDataType::StandardProof,
             data_index: 0x01,
         }
+    }
+
+    #[tokio::test]
+    async fn canonical_proof_address_is_immutable_and_same_bytes_are_idempotent() {
+        let store = SimpleMemoryTempStore::new();
+        let context = coordinator_pending_context(3);
+        let address = store
+            .resolve_proof_address(&context, &sample_job_id())
+            .unwrap();
+
+        store
+            .put_proof_bytes_exact(&address, b"proof-a")
+            .await
+            .unwrap();
+        store
+            .put_proof_bytes_exact(&address, b"proof-a")
+            .await
+            .unwrap();
+        assert!(store
+            .put_proof_bytes_exact(&address, b"proof-b")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("different bytes"));
+        assert!(store
+            .put_proof_bytes_exact(&address, b"")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("must not be empty"));
+        assert_eq!(
+            store.get_proof_bytes_exact(&address).await.unwrap(),
+            Some(b"proof-a".to_vec()),
+        );
     }
 
     #[tokio::test]

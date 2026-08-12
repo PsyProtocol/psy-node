@@ -677,12 +677,29 @@ impl QCanonicalProofStoreV2 for StandardFredRedisStore {
         address: &CanonicalProofStoreAddress,
         proof_bytes: &[u8],
     ) -> anyhow::Result<()> {
-        self.set_proof_bytes_internal(
-            address.redis_hash_key(),
-            address.job_field(),
-            proof_bytes,
-        )
-        .await
+        if proof_bytes.is_empty() {
+            anyhow::bail!("canonical proof bytes must not be empty");
+        }
+        if self
+            .client
+            .hsetnx(
+                address.redis_hash_key(),
+                address.job_field(),
+                proof_bytes,
+            )
+            .await?
+        {
+            return Ok(());
+        }
+        match self.get_proof_bytes_exact(address).await? {
+            Some(current) if current.as_slice() == proof_bytes => Ok(()),
+            Some(_) => anyhow::bail!(
+                "canonical proof address already contains different bytes"
+            ),
+            None => anyhow::bail!(
+                "canonical proof disappeared after conflicting insert"
+            ),
+        }
     }
 
     async fn delete_proof_namespace_exact(
@@ -729,6 +746,10 @@ impl QTempDatabaseRawKVReaderBase for StandardFredRedisStore {
 impl QTempDatabaseRawKVWriterBase for StandardFredRedisStore {
     async fn qtdb_raw_kv_put_value(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
         self.set_bytes_generic_internal(&self.kv_store_namespace, key, value).await
+    }
+
+    async fn qtdb_raw_kv_put_value_if_absent(&self, key: &[u8], value: &[u8]) -> anyhow::Result<bool> {
+        Ok(self.client.hsetnx(&self.kv_store_namespace, key, value).await?)
     }
 
     async fn qtdb_raw_kv_delete_key(&self, key: &[u8]) -> anyhow::Result<()> {
