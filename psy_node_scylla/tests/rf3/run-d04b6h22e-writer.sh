@@ -23,4 +23,22 @@ cargo test -p psy_node_scylla \
   rollback::branch_exact_writer_rf3_gate::d04b6h22e_branch_exact_writer_rf3_gate \
   --lib -- --ignored --exact --nocapture
 
+jq -e '
+  .qualification == "PASS" and
+  .full_commit_manifest_qualification == "H23C4E2C3C2_REALM_FULL_COMMIT_MANIFEST_RF3_PASSED" and
+  .replication_factor == 3 and
+  .one_replica_offline == true and
+  .full_commit_manifest_missing_source_rejected == true and
+  .full_commit_manifest_persisted == true and
+  .full_commit_manifest_retry_bit_exact == true and
+  .full_commit_typed_rows > 0 and
+  .full_commit_total_mutations == (.full_commit_typed_rows + .dual_write_mutations) and
+  (.full_commit_manifest_digest | test("^[0-9a-f]{64}$")) and
+  .qualification_cutover_fence == true and
+  .production_processor_invocation == false and
+  .production_writer_covered_domains == 0 and
+  .repair_direct_one_equal == true and
+  .repair_ms > 0
+' "${REPORT_PATH}" >/dev/null
+
 echo "D-04b6h22e writer RF=3 report: ${REPORT_PATH}"

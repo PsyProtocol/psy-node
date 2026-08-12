@@ -130,7 +130,7 @@ use crate::utils::{
 
 const CONTROL_KEYSPACE: &str = "psy_d04b2c_rf3_nt";
 const ARTIFACT_KEYSPACE: &str = "psy_d04b2c_rf3_artifacts";
-const STATE_KEYSPACE: &str = "psy_d04b2c_rf3_state";
+pub(super) const STATE_KEYSPACE: &str = "psy_d04b2c_rf3_state";
 const BASELINE: &str = "133b412755e0241c83b496ff023eff07180f120d";
 const IMAGE: &str = "scylladb/scylla@sha256:17496f2dd6e72056d0b0d7e2bd18bd62638872d1d80a5dd9db96ba017fd426fc";
 const NODE_IPS: [Ipv4Addr; 3] = [
@@ -1789,7 +1789,9 @@ async fn d04b2c_representative_state_replay_rf3_gate() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn create_full_commit_schema(session: &Session) -> anyhow::Result<()> {
+pub(super) async fn create_full_commit_schema(
+    session: &Session,
+) -> anyhow::Result<()> {
     create_schema(session).await?;
 
     for table in CHECKPOINT_KIV_TABLES {

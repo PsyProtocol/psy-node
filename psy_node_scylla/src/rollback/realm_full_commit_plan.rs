@@ -547,14 +547,24 @@ pub(crate) mod tests {
         prepared_from_intent(timestamp, narrow())
     }
 
-    fn no_state_plan() -> RealmNormalCommitCoveragePlan {
+    fn no_state_plan_for(
+        prepared: &BranchExactWriterPrepared<Hash>,
+    ) -> RealmNormalCommitCoveragePlan {
+        let AuthorityScope::Realm {
+            realm_id,
+            realm_sub_id,
+        } = prepared.intent().authority()
+        else {
+            panic!("qualification full plan requires Realm authority")
+        };
         RealmNormalCommitCoveragePlan::from_prepared(
             &PsyPreparedRealmBlockStateUpdates::<Hash> {
-                realm_id: 7,
-                realm_sub_id: 2,
-                unique_pending_id: 101,
-                proc_checkpoint_unique_id:
-                    parth_core::QCoreProcCheckpointUniqueId::from(9001_u128),
+                realm_id: u64::from(realm_id),
+                realm_sub_id: u64::from(realm_sub_id),
+                unique_pending_id: prepared.intent().candidate().pending_id().get(),
+                proc_checkpoint_unique_id: parth_core::QCoreProcCheckpointUniqueId::from(
+                    prepared.intent().proc_checkpoint_id().as_u128(),
+                ),
                 old_realm_root: PHash::from_owned_32bytes([1; 32]),
                 new_realm_root: PHash::from_owned_32bytes([2; 32]),
                 update_global_user_tree_nodes_ffs: Vec::new(),
@@ -564,6 +574,12 @@ pub(crate) mod tests {
                 update_contract_state_imt_leaves_ffs: Vec::new(),
             },
         )
+    }
+
+    fn no_state_plan() -> RealmNormalCommitCoveragePlan {
+        no_state_plan_for(&prepared(
+            CommitWriteTimestampUs::try_from_i128(1_000).unwrap(),
+        ))
     }
 
     fn put(
@@ -717,6 +733,22 @@ pub(crate) mod tests {
             &narrow,
         )
         .expect("qualification full schedule must remain valid")
+    }
+
+    /// RF=3 qualification input derived from the exact durable h22 prepared
+    /// writer selected by the production lifecycle. This keeps the test from
+    /// manufacturing a second writer identity while still exercising the
+    /// complete manifest path with the domains that are non-empty for this
+    /// checkpoint.
+    pub(crate) fn qualification_no_state_full_plan(
+        prepared: &BranchExactWriterPrepared<Hash>,
+    ) -> RealmFullCommitPhysicalPlan {
+        RealmFullCommitPhysicalPlan::try_assemble(
+            no_state_plan_for(prepared),
+            prepared,
+            remaining(prepared),
+        )
+        .expect("qualification no-state full plan must remain valid")
     }
 
     fn state_without_imt_plan(

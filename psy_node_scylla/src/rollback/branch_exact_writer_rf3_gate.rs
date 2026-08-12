@@ -1,6 +1,6 @@
 //! h22e: real RF=3 requalification of the branch-exact Realm writer.
 
-use std::{path::Path, sync::Arc, time::Instant};
+use std::{path::Path, sync::Arc, time::{Duration, Instant}};
 
 use anyhow::{bail, ensure};
 use parth_core::{crypto::hash::tag_tree::TagTreeMerkleProof, PHash};
@@ -22,6 +22,16 @@ use uuid::Uuid;
 use super::{
     branch_exact_shadow_reader_rf3_gate as fixture, *,
 };
+use super::{
+    normal_state_replay_rf3_gate,
+    realm_full_commit_execution::RealmFullCommitExecutionSchedule,
+    realm_full_commit_manifest::RealmFullCommitManifestSlot,
+    realm_full_commit_manifest_store::{
+        REALM_FULL_COMMIT_MANIFEST_TABLE,
+        ScyllaRealmFullCommitManifestStore,
+    },
+    realm_full_commit_scylla::RealmFullCommitScyllaExecutor,
+};
 
 const IMAGE: &str =
     "scylladb/scylla@sha256:17496f2dd6e72056d0b0d7e2bd18bd62638872d1d80a5dd9db96ba017fd426fc";
@@ -38,6 +48,7 @@ struct ReplicaSnapshot {
     target_proof: (Vec<u8>, i64),
     writer_row: (i64, Vec<u8>),
     timestamp_row: (i64, Vec<u8>),
+    manifest_row: (i64, Vec<u8>),
 }
 
 #[derive(Debug, Serialize)]
@@ -51,6 +62,16 @@ struct H22eWriterReport {
     retry_barrier_bit_exact: bool,
     finish_response_loss_idempotent: bool,
     explicit_timestamp_all_rows: bool,
+    full_commit_manifest_missing_source_rejected: bool,
+    full_commit_manifest_persisted: bool,
+    full_commit_manifest_retry_bit_exact: bool,
+    full_commit_typed_rows: u32,
+    full_commit_total_mutations: u64,
+    full_commit_manifest_digest: String,
+    full_commit_manifest_qualification: &'static str,
+    qualification_cutover_fence: bool,
+    production_processor_invocation: bool,
+    production_writer_covered_domains: u8,
     repair_direct_one_equal: bool,
     prepare_verify_ms: u64,
     repair_ms: u64,
@@ -80,10 +101,61 @@ async fn create_writer_legacy_tables(session: &scylla::client::session::Session)
     Ok(())
 }
 
+async fn create_manifest_schema_with_retry(
+    session: &scylla::client::session::Session,
+    control: &BranchExactDeploymentNoTabletKeyspace,
+) -> anyhow::Result<()> {
+    let mut last = None;
+    for _ in 0..10 {
+        match ScyllaRealmFullCommitManifestStore::create_schema(session, control).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last = Some(error);
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "manifest schema did not converge: {}",
+        last.expect("retry loop always records the last schema error"),
+    ))
+}
+
+async fn create_full_commit_schema_with_retry(
+    session: &scylla::client::session::Session,
+) -> anyhow::Result<()> {
+    let mut last = None;
+    for _ in 0..20 {
+        match normal_state_replay_rf3_gate::create_full_commit_schema(session).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last = Some(error);
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "full-commit schema did not converge: {}",
+        last.expect("retry loop always records the last schema error"),
+    ))
+}
+
+fn qualification_cutover_fence() -> BranchExactWriterCutoverFence {
+    let mut bytes = [0_u8; 81];
+    bytes[..8].copy_from_slice(&9_u64.to_be_bytes());
+    bytes[8..16].copy_from_slice(&3_u64.to_be_bytes());
+    bytes[16..48].fill(0x44);
+    bytes[48..80].fill(0x55);
+    bytes[80] = BranchExactCutoverPhase::TargetPrimaryDualWrite as u8;
+    BranchExactWriterCutoverFence::decode_canonical(&bytes)
+        .expect("qualification cutover fence must be canonical")
+}
+
 async fn direct_replica_snapshot(
     ip: std::net::Ipv4Addr,
     candidate: &BranchPendingMapping<PHash>,
     proc_id: ProcCheckpointUniqueId,
+    manifest_slot: RealmFullCommitManifestSlot,
 ) -> anyhow::Result<ReplicaSnapshot> {
     let session = fixture::connect(Some(ip), Consistency::One).await?;
     let height = candidate
@@ -208,6 +280,18 @@ async fn direct_replica_snapshot(
         .await?
         .into_rows_result()?
         .single_row::<(i64, Vec<u8>)>()?;
+    let manifest_row = session
+        .query_unpaged(
+            format!(
+                "SELECT revision, manifest_payload FROM {}.{} WHERE manifest_slot = ?",
+                fixture::control_keyspace(),
+                REALM_FULL_COMMIT_MANIFEST_TABLE,
+            ),
+            (manifest_slot.as_bytes().as_slice(),),
+        )
+        .await?
+        .into_rows_result()?
+        .single_row::<(i64, Vec<u8>)>()?;
     Ok(ReplicaSnapshot {
         legacy_checkpoint_to_pending,
         legacy_pending_to_checkpoint,
@@ -219,6 +303,7 @@ async fn direct_replica_snapshot(
         target_proof,
         writer_row,
         timestamp_row,
+        manifest_row,
     })
 }
 
@@ -363,6 +448,22 @@ async fn d04b6h22e_branch_exact_writer_rf3_gate() -> anyhow::Result<()> {
         request.clone(),
     )
     .await?;
+    create_full_commit_schema_with_retry(&session).await?;
+    create_manifest_schema_with_retry(&session, &control).await?;
+    let manifest_store = ScyllaRealmFullCommitManifestStore::prepare(
+        session.clone(),
+        control.clone(),
+    )
+    .await?;
+    let full_commit_executor =
+        RealmFullCommitScyllaExecutor::prepare_with_consistency(
+            &session,
+            CqlKeyspaceName::try_new(
+                normal_state_replay_rf3_gate::STATE_KEYSPACE,
+            )?,
+            Consistency::Quorum,
+        )
+        .await?;
 
     fixture::compose(
         Path::new(&compose_file),
@@ -371,16 +472,84 @@ async fn d04b6h22e_branch_exact_writer_rf3_gate() -> anyhow::Result<()> {
     )?;
     fixture::wait_up(2).await?;
     let started = Instant::now();
+    let cutover_fence = qualification_cutover_fence();
     let barrier = runtime
-        .prepare_and_verify(
+        .prepare_and_verify_with_cutover(
             intent.clone(),
             AuthorityClockSampleUs::try_from_i128(
                 baseline_timestamp.as_i64() as i128 + 100,
             )?,
+            cutover_fence.clone(),
         )
         .await?;
     let prepare_verify_ms = started.elapsed().as_millis() as u64;
     runtime.require_fresh_barrier(&barrier).await?;
+
+    let durable_writer = runtime.read_writer().await?;
+    let BranchExactWriterState::WritesVerified(verified_writer) =
+        durable_writer.state()
+    else {
+        bail!("full-commit manifest requires durable WritesVerified")
+    };
+    let full_commit_plan =
+        super::realm_full_commit_plan::tests::qualification_no_state_full_plan(
+            verified_writer.prepared(),
+        );
+    let full_commit_schedule = RealmFullCommitExecutionSchedule::try_from_plan(
+        &full_commit_plan,
+        verified_writer.prepared(),
+    )?;
+    let writer_key = BranchExactWriterAuthorityKey::new(
+        runtime.network(),
+        runtime.authority(),
+    );
+    let full_commit_manifest_missing_source_rejected = manifest_store
+        .persist_from_fresh_sources::<PHash>(
+            &writer_store,
+            writer_key,
+            &full_commit_executor,
+            &full_commit_plan,
+        )
+        .await
+        .is_err();
+    ensure!(full_commit_manifest_missing_source_rejected);
+    let typed_observation = full_commit_executor
+        .write_and_verify(&session, &full_commit_schedule)
+        .await?;
+    let typed_observation_digest = *typed_observation.digest();
+    let manifest_receipt = manifest_store
+        .persist_from_fresh_sources::<PHash>(
+            &writer_store,
+            writer_key,
+            &full_commit_executor,
+            &full_commit_plan,
+        )
+        .await?;
+    manifest_store
+        .revalidate_from_fresh_sources(
+            &manifest_receipt,
+            &writer_store,
+            writer_key,
+            &full_commit_executor,
+            &full_commit_plan,
+        )
+        .await?;
+    let manifest_slot = manifest_receipt.manifest().slot();
+    let full_commit_manifest_digest = *manifest_receipt.manifest().digest();
+    let full_commit_typed_rows = manifest_receipt.manifest().typed_row_count();
+    let full_commit_total_mutations =
+        manifest_receipt.manifest().total_mutation_count();
+    let retry_manifest = manifest_store
+        .persist_from_fresh_sources::<PHash>(
+            &writer_store,
+            writer_key,
+            &full_commit_executor,
+            &full_commit_plan,
+        )
+        .await?;
+    let full_commit_manifest_retry_bit_exact =
+        retry_manifest.manifest() == manifest_receipt.manifest();
+    ensure!(full_commit_manifest_retry_bit_exact);
 
     let restarted = ScyllaBranchExactWriterRuntime::<PHash>::prepare(
         session.clone(),
@@ -390,11 +559,12 @@ async fn d04b6h22e_branch_exact_writer_rf3_gate() -> anyhow::Result<()> {
     )
     .await?;
     let retried = restarted
-        .prepare_and_verify(
+        .prepare_and_verify_with_cutover(
             intent,
             AuthorityClockSampleUs::try_from_i128(
                 baseline_timestamp.as_i64() as i128 + 10_000,
             )?,
+            cutover_fence,
         )
         .await?;
     ensure!(retried == barrier);
@@ -424,6 +594,15 @@ async fn d04b6h22e_branch_exact_writer_rf3_gate() -> anyhow::Result<()> {
         &["cluster", "repair", fixture::KEYSPACE],
         "repair h22e standard keyspace",
     )?;
+    fixture::nodetool(
+        fixture::NODE_CONTAINERS[0],
+        &[
+            "cluster",
+            "repair",
+            normal_state_replay_rf3_gate::STATE_KEYSPACE,
+        ],
+        "repair full-commit tablet state keyspace",
+    )?;
     for node in fixture::NODE_CONTAINERS {
         fixture::nodetool(
             node,
@@ -436,22 +615,60 @@ async fn d04b6h22e_branch_exact_writer_rf3_gate() -> anyhow::Result<()> {
             &["flush", &fixture::control_keyspace()],
             "flush h22e control",
         )?;
+        fixture::nodetool(
+            node,
+            &["flush", normal_state_replay_rf3_gate::STATE_KEYSPACE],
+            "flush full-commit state",
+        )?;
         fixture::nodetool(node, &["compact", fixture::KEYSPACE], "compact h22e standard")?;
         fixture::nodetool(
             node,
             &["compact", &fixture::control_keyspace()],
             "compact h22e control",
         )?;
+        fixture::nodetool(
+            node,
+            &["compact", normal_state_replay_rf3_gate::STATE_KEYSPACE],
+            "compact full-commit state",
+        )?;
     }
     let repair_ms = repair_started.elapsed().as_millis() as u64;
     let snapshots = futures::future::join_all(
-        fixture::NODE_IPS.map(|ip| direct_replica_snapshot(ip, &candidate, proc_id)),
+        fixture::NODE_IPS.map(|ip| {
+            direct_replica_snapshot(ip, &candidate, proc_id, manifest_slot)
+        }),
     )
     .await
     .into_iter()
     .collect::<Result<Vec<_>, _>>()?;
     ensure!(snapshots.windows(2).all(|pair| pair[0] == pair[1]));
+    let mut direct_typed_digests = Vec::new();
+    for ip in fixture::NODE_IPS {
+        let direct_session = fixture::connect(Some(ip), Consistency::One).await?;
+        let direct_executor =
+            RealmFullCommitScyllaExecutor::prepare_with_consistency(
+                &direct_session,
+                CqlKeyspaceName::try_new(
+                    normal_state_replay_rf3_gate::STATE_KEYSPACE,
+                )?,
+                Consistency::One,
+            )
+            .await?;
+        let rows = direct_executor
+            .read_all(&direct_session, &full_commit_schedule)
+            .await?;
+        direct_typed_digests.push(
+            *full_commit_schedule.verify_after_write(&rows)?.digest(),
+        );
+    }
+    ensure!(
+        direct_typed_digests
+            .iter()
+            .all(|digest| digest == &typed_observation_digest)
+    );
     let snapshot = &snapshots[0];
+    ensure!(snapshot.manifest_row.0 == 1);
+    ensure!(snapshot.manifest_row.1 == manifest_receipt.manifest().canonical_payload());
     let writetimes = [
         snapshot.legacy_checkpoint_to_pending.1,
         snapshot.legacy_pending_to_checkpoint.1,
@@ -480,6 +697,17 @@ async fn d04b6h22e_branch_exact_writer_rf3_gate() -> anyhow::Result<()> {
         retry_barrier_bit_exact: true,
         finish_response_loss_idempotent: true,
         explicit_timestamp_all_rows: true,
+        full_commit_manifest_missing_source_rejected,
+        full_commit_manifest_persisted: true,
+        full_commit_manifest_retry_bit_exact,
+        full_commit_typed_rows,
+        full_commit_total_mutations,
+        full_commit_manifest_digest: hex::encode(full_commit_manifest_digest),
+        full_commit_manifest_qualification:
+            "H23C4E2C3C2_REALM_FULL_COMMIT_MANIFEST_RF3_PASSED",
+        qualification_cutover_fence: true,
+        production_processor_invocation: false,
+        production_writer_covered_domains: 0,
         repair_direct_one_equal: true,
         prepare_verify_ms,
         repair_ms,
