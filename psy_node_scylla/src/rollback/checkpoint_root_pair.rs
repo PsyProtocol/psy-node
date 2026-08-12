@@ -554,6 +554,45 @@ impl CheckpointRootPairAdapter {
             .transpose()?;
         Ok([k1, k2])
     }
+
+    /// Read one already-validated physical direction. The full-commit reader
+    /// uses this per-row form while the writer still retains the logged pair
+    /// operation for atomic bidirectional publication.
+    pub(crate) async fn read_exact(
+        &self,
+        session: &Session,
+        sealed: &super::SealedTimestampedPut,
+    ) -> anyhow::Result<Option<(Vec<u8>, i64)>> {
+        let mutation = sealed.resolved().mutation();
+        let (statement, key): (&PreparedStatement, Vec<u8>) =
+            match (mutation.physical_table(), mutation.key()) {
+                (
+                    ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK1,
+                    TypedTableKey::CheckpointRootByHash(root),
+                ) => (&self.prepared.k1_exact_read, root.as_bytes().to_vec()),
+                (
+                    ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK2,
+                    TypedTableKey::CheckpointRootByCheckpoint(checkpoint),
+                ) => (
+                    &self.prepared.k2_exact_read,
+                    checkpoint.get().to_le_bytes().to_vec(),
+                ),
+                _ => anyhow::bail!("sealed mutation is not a checkpoint root-pair direction"),
+            };
+        let Some((stored, writetime)) = session
+            .execute_unpaged(statement, (key.as_slice(),))
+            .await?
+            .into_rows_result()?
+            .maybe_first_row::<(Option<Vec<u8>>, Option<i64>)>()?
+        else {
+            return Ok(None);
+        };
+        let stored = stored
+            .ok_or_else(|| anyhow::anyhow!("checkpoint root direction value is null"))?;
+        let writetime = writetime
+            .ok_or_else(|| anyhow::anyhow!("checkpoint root direction writetime is null"))?;
+        Ok(Some((compression::decompress(&stored)?, writetime)))
+    }
 }
 
 async fn prepare_idempotent(

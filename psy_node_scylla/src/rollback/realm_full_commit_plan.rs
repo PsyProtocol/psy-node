@@ -613,7 +613,7 @@ mod tests {
                     node: MerkleNode::new(1, NodeIndex::new(4)),
                     checkpoint,
                 },
-                MutationValue::PsyCanonicalBytes(vec![4]),
+                MutationValue::PsyCanonicalBytes(vec![4; 32]),
                 timestamp,
             ),
             RealmCommitPhysicalDomainBatch::new(D::CheckpointRootByHash, vec![by_hash]),
@@ -893,6 +893,13 @@ mod tests {
         let schedule = RealmFullCommitExecutionSchedule::try_from_plan(&full, &narrow)
             .unwrap();
         assert_eq!(schedule.rows().len(), 25);
+        assert_eq!(
+            crate::rollback::realm_full_commit_scylla::validate_schedule_bindings(
+                &schedule,
+            )
+            .unwrap(),
+            25,
+        );
         assert!(schedule.rows().windows(2).all(|pair| {
             (pair[0].domain(), pair[0].physical_table(), pair[0].locator())
                 <= (pair[1].domain(), pair[1].physical_table(), pair[1].locator())

@@ -623,6 +623,27 @@ impl MutableSingletonAdapter {
             .ok_or_else(|| anyhow::anyhow!("latest info writetime is null"))?;
         Ok(Some((crate::compression::decompress(&stored)?, writetime)))
     }
+
+    pub(crate) async fn read_exact(
+        &self,
+        session: &Session,
+        sealed: &SealedTimestampedPut,
+    ) -> anyhow::Result<Option<(Vec<u8>, i64)>> {
+        match (
+            sealed.resolved().mutation().physical_table(),
+            sealed.resolved().mutation().key(),
+        ) {
+            (
+                ScyllaPhysicalTableId::U64Singleton,
+                TypedTableKey::U64Singleton(U64SingletonSlot::LatestCheckpoint),
+            ) => self.read_latest_checkpoint_exact(session).await,
+            (
+                ScyllaPhysicalTableId::LatestInfo,
+                TypedTableKey::LatestInfo(slot),
+            ) => self.read_latest_info_exact(session, *slot).await,
+            _ => anyhow::bail!("sealed mutation is not a supported mutable singleton"),
+        }
+    }
 }
 
 async fn prepare(

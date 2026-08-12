@@ -121,6 +121,8 @@ mod realm_full_commit_plan;
 #[allow(dead_code)]
 mod realm_full_commit_execution;
 #[allow(dead_code)]
+mod realm_full_commit_scylla;
+#[allow(dead_code)]
 mod realm_prepared_state_physical_plan;
 #[cfg(test)]
 mod realm_imt_predecessor_rf3_gate;

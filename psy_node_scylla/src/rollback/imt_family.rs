@@ -15,7 +15,7 @@ use psy_node_core::store::{
     timestamp::{DeleteFenceTimestampUs, NewBranchWriteTimestampUs},
     typed::{
         CheckpointId, ImtCursorTransition, ImtCursorTransitionError,
-        ImtEncodedKey, ImtKeyIndexRow, LeafIndex, LogicalMutation,
+        ImtEncodedKey, ImtKeyIndexRow, ImtKeyIndexRowError, LeafIndex, LogicalMutation,
         MutationOperation, MutationValue, StructuredValueSchema, TreeId,
         TreeSubId, TypedTableKey,
     },
@@ -331,6 +331,38 @@ pub struct ImtIndexPutBinding {
 }
 
 impl ImtIndexPutBinding {
+    pub fn try_from_sealed(sealed: &SealedTimestampedPut) -> Result<Self, ImtPlanError> {
+        let mutation = sealed.resolved().mutation();
+        if mutation.physical_table() != ScyllaPhysicalTableId::ImtKeyIndex {
+            return Err(ImtPlanError::WrongPhysicalTable(mutation.physical_table()));
+        }
+        let (tree, tree_sub, encoded_key) = match mutation.key() {
+            TypedTableKey::ImtKeyIndex {
+                tree,
+                tree_sub,
+                encoded_key,
+            } => (*tree, *tree_sub, encoded_key.clone()),
+            _ => return Err(ImtPlanError::WrongTypedKey),
+        };
+        let row = match mutation.operation() {
+            MutationOperation::Put(MutationValue::Structured {
+                schema: StructuredValueSchema::ImtKeyIndexRowV2,
+                canonical_bytes,
+            }) => ImtKeyIndexRow::decode_canonical(canonical_bytes)
+                .map_err(ImtPlanError::IndexRow)?,
+            _ => return Err(ImtPlanError::ExpectedIndexRowV2),
+        };
+        Ok(Self {
+            tree,
+            tree_sub,
+            encoded_key,
+            leaf_key: row.leaf_key(),
+            birth_checkpoint: row.birth_checkpoint(),
+            leaf: row.leaf_index(),
+            write_timestamp_us: sealed.timestamp().as_i64(),
+        })
+    }
+
     pub const fn tree(&self) -> TreeId { self.tree }
     pub const fn tree_sub(&self) -> TreeSubId { self.tree_sub }
     pub const fn encoded_key(&self) -> &ImtEncodedKey { &self.encoded_key }
@@ -400,6 +432,31 @@ pub struct ImtCursorPutBinding {
 }
 
 impl ImtCursorPutBinding {
+    pub fn try_from_sealed(sealed: &SealedTimestampedPut) -> Result<Self, ImtPlanError> {
+        let mutation = sealed.resolved().mutation();
+        if mutation.physical_table() != ScyllaPhysicalTableId::ImtNextAppendIndex {
+            return Err(ImtPlanError::WrongPhysicalTable(mutation.physical_table()));
+        }
+        let (tree, tree_sub) = match mutation.key() {
+            TypedTableKey::ImtCursor { tree, tree_sub } => (*tree, *tree_sub),
+            _ => return Err(ImtPlanError::WrongTypedKey),
+        };
+        let transition = match mutation.operation() {
+            MutationOperation::Put(MutationValue::Structured {
+                schema: StructuredValueSchema::ImtCursorTransitionV1,
+                canonical_bytes,
+            }) => ImtCursorTransition::decode_canonical(canonical_bytes)
+                .map_err(ImtPlanError::CursorTransition)?,
+            _ => return Err(ImtPlanError::ExpectedCursorTransitionV1),
+        };
+        Ok(Self {
+            before: ImtCursorSnapshot::new(tree, tree_sub, transition.before()),
+            after: ImtCursorSnapshot::new(tree, tree_sub, transition.after()),
+            transition,
+            write_timestamp_us: sealed.timestamp().as_i64(),
+        })
+    }
+
     pub const fn before(&self) -> ImtCursorSnapshot { self.before }
     pub const fn after(&self) -> ImtCursorSnapshot { self.after }
     pub const fn checkpoint(&self) -> CheckpointId { self.transition.checkpoint() }
@@ -882,6 +939,7 @@ pub enum ImtPlanError {
     Registry(RegistryReadinessError), MutationBuild(MutationBuildError),
     WrongPhysicalTable(ScyllaPhysicalTableId), WrongTypedKey,
     ExpectedLeafRowV1, InvalidLeafRowLength { actual: usize }, LeafKeyRowMismatch,
+    ExpectedIndexRowV2, IndexRow(ImtKeyIndexRowError),
     ExpectedCursorTransitionV1, UnexpectedDerivedTable(ScyllaPhysicalTableId),
     EmptyLeafBatch, MixedCheckpoints { expected: CheckpointId, actual: CheckpointId },
     MixedWriteTimestamps { expected: i64, actual: i64 }, DuplicateCursorBeforeImage,

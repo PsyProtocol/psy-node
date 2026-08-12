@@ -40,6 +40,7 @@ pub(crate) struct RealmFullCommitExpectedRow {
     expected_value: Vec<u8>,
     timestamp: CommitWriteTimestampUs,
     row_digest: [u8; 32],
+    sealed: super::SealedTimestampedPut,
 }
 
 impl RealmFullCommitExpectedRow {
@@ -60,6 +61,13 @@ impl RealmFullCommitExpectedRow {
     }
 
     pub(crate) const fn row_digest(&self) -> &[u8; 32] { &self.row_digest }
+
+    /// The immutable mutation retained from the validated full plan. Family
+    /// adapters must consume this value rather than reconstructing a typed key
+    /// or physical payload from the public observation fields.
+    pub(crate) const fn sealed(&self) -> &super::SealedTimestampedPut {
+        &self.sealed
+    }
 }
 
 /// Canonical schedule for every typed row not owned by the h22 dual writer.
@@ -108,6 +116,7 @@ impl RealmFullCommitExecutionSchedule {
                     expected_value,
                     timestamp,
                     row_digest,
+                    sealed: put.clone(),
                 });
             }
         }
