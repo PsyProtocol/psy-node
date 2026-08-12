@@ -2982,6 +2982,12 @@ mod tests {
             verified.candidate().state(),
             BranchExactWriterState::WritesVerified(_)
         ));
+        assert!(
+            crate::rollback::realm_full_commit_manifest::RealmNarrowWritesVerifiedEvidence::try_from_stored(
+                verified.candidate(),
+            )
+            .is_ok()
+        );
         assert_eq!(
             classify_branch_exact_publish_recovery(
                 publish.candidate(),

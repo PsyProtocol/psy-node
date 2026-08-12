@@ -1021,6 +1021,98 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn h22_and_typed_observations_form_one_canonical_composite_manifest() {
+        use crate::rollback::{
+            realm_full_commit_execution::RealmFullCommitExecutionSchedule,
+            realm_full_commit_manifest::{
+                RealmFullCommitCompositeManifest,
+                RealmFullCommitManifestError,
+                RealmNarrowWritesVerifiedEvidence,
+            },
+        };
+
+        let timestamp = CommitWriteTimestampUs::try_from_i128(10_011).unwrap();
+        let (narrow, full) = full_state_plan(timestamp);
+        let schedule =
+            RealmFullCommitExecutionSchedule::try_from_plan(&full, &narrow).unwrap();
+        let typed = schedule
+            .verify_after_write(&exact_observations(&schedule))
+            .unwrap();
+        let h22 = RealmNarrowWritesVerifiedEvidence::test_fixture(&narrow);
+        let manifest =
+            RealmFullCommitCompositeManifest::try_new(&full, &h22, &typed).unwrap();
+
+        assert_eq!(manifest.typed_row_count(), 25);
+        assert_eq!(manifest.total_mutation_count(), 33);
+        assert_eq!(manifest.canonical_payload().len(), 512);
+        assert_ne!(manifest.slot().as_bytes(), &[0; 32]);
+        assert_ne!(manifest.digest(), &[0; 32]);
+        let retry =
+            RealmFullCommitCompositeManifest::try_new(&full, &h22, &typed)
+                .unwrap();
+        assert_eq!(retry, manifest);
+        let decoded = RealmFullCommitCompositeManifest::<Hash>::decode_persisted(
+            manifest.slot().as_bytes(),
+            manifest.revision() as i64,
+            manifest.canonical_payload(),
+        )
+        .unwrap();
+        assert_eq!(decoded, manifest);
+        manifest.revalidate_sources(&full, &h22, &typed).unwrap();
+
+        let mut tampered = manifest.canonical_payload().to_vec();
+        tampered[40] ^= 1;
+        assert_eq!(
+            RealmFullCommitCompositeManifest::<Hash>::decode_persisted(
+                manifest.slot().as_bytes(),
+                manifest.revision() as i64,
+                &tampered,
+            ),
+            Err(RealmFullCommitManifestError::ManifestDigestMismatch),
+        );
+
+        let (foreign_narrow, foreign_full) = full_state_plan(
+            CommitWriteTimestampUs::try_from_i128(10_012).unwrap(),
+        );
+        let foreign_schedule = RealmFullCommitExecutionSchedule::try_from_plan(
+            &foreign_full,
+            &foreign_narrow,
+        )
+        .unwrap();
+        let foreign_typed = foreign_schedule
+            .verify_after_write(&exact_observations(&foreign_schedule))
+            .unwrap();
+        assert_eq!(
+            RealmFullCommitCompositeManifest::try_new(
+                &full,
+                &h22,
+                &foreign_typed,
+            ),
+            Err(RealmFullCommitManifestError::NarrowIdentityMismatch),
+        );
+        assert_eq!(
+            RealmFullCommitCompositeManifest::<Hash>::decode_persisted(
+                &[0x99; 32],
+                manifest.revision() as i64,
+                manifest.canonical_payload(),
+            ),
+            Err(RealmFullCommitManifestError::PersistedIdentityMismatch),
+        );
+        let mut oversized = manifest.canonical_payload().to_vec();
+        oversized.push(0);
+        assert_eq!(
+            RealmFullCommitCompositeManifest::<Hash>::decode_persisted(
+                manifest.slot().as_bytes(),
+                manifest.revision() as i64,
+                &oversized,
+            ),
+            Err(RealmFullCommitManifestError::PayloadTooLarge {
+                actual: oversized.len(),
+            }),
+        );
+    }
+
+    #[test]
     fn exact_reconciliation_separates_retry_from_conflict() {
         use crate::rollback::realm_full_commit_execution::{
             RealmFullCommitExecutionError, RealmFullCommitExecutionSchedule,
