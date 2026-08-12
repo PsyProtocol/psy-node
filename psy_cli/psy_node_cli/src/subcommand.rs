@@ -15,6 +15,31 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    #[command(about = "Read the durable Realm rollback activation and print its startup YAML")]
+    InspectRealmRollbackActivation {
+        #[arg(
+            long = "scylla-db-url",
+            env = "SCYLLA_DB_URL",
+            help = "Comma-separated Scylla node addresses"
+        )]
+        scylla_db_url: String,
+
+        #[arg(
+            long = "db-namespace",
+            env = "DB_NAMESPACE",
+            help = "Existing Realm data keyspace; the control keyspace is <name>_no_tablet"
+        )]
+        db_namespace: String,
+
+        #[arg(long = "network", help = "The network id for the Realm")]
+        network: PsyNetworkTypeInput,
+
+        #[arg(long = "realm-id", help = "The Realm id")]
+        realm_id: u32,
+
+        #[arg(long = "realm-sub-id", help = "The Realm sub id")]
+        realm_sub_id: u16,
+    },
     #[command(about = "Explicitly deploy and verify the Realm rollback sidecar schema")]
     DeployRealmRollbackSidecar {
         #[arg(
@@ -243,5 +268,51 @@ mod rollback_sidecar_command_tests {
         );
         assert_eq!(db_namespace, "psy_realm_7");
         assert!(apply);
+    }
+
+    #[test]
+    fn activation_inspection_requires_exact_realm_identity() {
+        let missing_realm = Cli::try_parse_from([
+            "psy_node_cli",
+            "inspect-realm-rollback-activation",
+            "--scylla-db-url",
+            "10.0.0.1:9042",
+            "--db-namespace",
+            "psy_realm_7",
+            "--network",
+            "local-devnet",
+        ]);
+        assert!(missing_realm.is_err());
+
+        let parsed = Cli::try_parse_from([
+            "psy_node_cli",
+            "inspect-realm-rollback-activation",
+            "--scylla-db-url",
+            "10.0.0.1:9042,10.0.0.2:9042,10.0.0.3:9042",
+            "--db-namespace",
+            "psy_realm_7",
+            "--network",
+            "local-devnet",
+            "--realm-id",
+            "7",
+            "--realm-sub-id",
+            "3",
+        ])
+        .unwrap();
+        let Commands::InspectRealmRollbackActivation {
+            scylla_db_url,
+            db_namespace,
+            network,
+            realm_id,
+            realm_sub_id,
+        } = parsed.command
+        else {
+            panic!("unexpected command");
+        };
+        assert_eq!(scylla_db_url, "10.0.0.1:9042,10.0.0.2:9042,10.0.0.3:9042");
+        assert_eq!(db_namespace, "psy_realm_7");
+        assert_eq!(network, PsyNetworkTypeInput::LocalDevnet);
+        assert_eq!(realm_id, 7);
+        assert_eq!(realm_sub_id, 3);
     }
 }

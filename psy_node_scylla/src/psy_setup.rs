@@ -34,9 +34,12 @@ use rand::{rngs::OsRng, RngCore};
 use crate::{
     core::{connect_existing_scylla_session, ScyllaCoreStore},
     rollback::{
+        BranchExactCutoverAuthorityKey, BranchExactCutoverPhase,
+        BranchExactCutoverReadState,
         BranchExactDeploymentNoTabletKeyspace, BranchExactSchemaSetupMode,
         BranchExactSchemaSetupRequest, BranchExactWriterAuthorityKey,
         BranchExactWriterActivationPlan, BranchExactWriterReadState,
+        BranchExactWriterState, ScyllaBranchExactCutoverStore,
         PendingQueueSidecarDeploymentExecutor, PendingQueueSidecarKeyspaces,
         PendingQueueSidecarSetupMode, ScyllaAuthorityLocalHeadStore,
         ScyllaBranchExactWriterLifecycleStore,
@@ -51,6 +54,34 @@ use crate::{
         }, tag_tree::ScyllaTagTreeNodesPreparedStatements, u64_table::{ScyllaBidirectionalU64U128MappingPreparedStatements, ScyllaU64ToU64TablePreparedStatements}
     },
 };
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RealmBranchExactActivationSummary {
+    startup_config: psy_node_core::config::node_start_config::RealmBranchExactStartupConfig,
+    cutover_phase: BranchExactCutoverPhase,
+    cutover_revision: u64,
+    writer_revision: u64,
+}
+
+impl RealmBranchExactActivationSummary {
+    pub const fn startup_config(
+        &self,
+    ) -> &psy_node_core::config::node_start_config::RealmBranchExactStartupConfig {
+        &self.startup_config
+    }
+
+    pub const fn cutover_phase(&self) -> BranchExactCutoverPhase {
+        self.cutover_phase
+    }
+
+    pub const fn cutover_revision(&self) -> u64 {
+        self.cutover_revision
+    }
+
+    pub const fn writer_revision(&self) -> u64 {
+        self.writer_revision
+    }
+}
 
 type ExBiDirectionalMappingTableIdentifier = ScyllaBiDirectionalBlobToBlobTablePreparedStatements;
 type ExBiDirectionalU64U128MappingTableIdentifier = ScyllaBidirectionalU64U128MappingPreparedStatements;
@@ -440,6 +471,115 @@ pub async fn deploy_pending_queue_sidecar_from_connection_string(
         control_keyspace,
         schema_fingerprint: *stored.schema_fingerprint().as_bytes(),
         ready_digest: *receipt.ready_digest(),
+    })
+}
+
+/// Read the exact durable Realm cutover identity needed by
+/// `branch_exact_startup` without mutating Scylla.
+///
+/// This is intentionally not a substitute for startup preflight. The node
+/// still revalidates schema, sidecar, shadow, writer, authority-head, pending
+/// pipeline, and NATS evidence before serving. The operator command merely
+/// removes manual digest transcription from the configuration step.
+pub async fn inspect_realm_branch_exact_activation<Hash: Q256BitHash>(
+    data_keyspace: &str,
+    connection_string: &str,
+    network: psy_data::protocol::canonical_chain::NetworkId,
+    realm_id: u32,
+    realm_sub_id: u16,
+) -> anyhow::Result<RealmBranchExactActivationSummary> {
+    let nodes = parse_scylla_known_nodes(connection_string)?;
+    let control_keyspace_name = format!("{data_keyspace}_no_tablet");
+    let control_keyspace =
+        BranchExactDeploymentNoTabletKeyspace::try_new(control_keyspace_name.clone())?;
+    let session = connect_existing_scylla_session(&nodes).await?;
+
+    require_existing_scylla_keyspace(&session, data_keyspace).await?;
+    require_existing_scylla_keyspace(&session, &control_keyspace_name).await?;
+
+    let cutover_store = ScyllaBranchExactCutoverStore::prepare(
+        Arc::clone(&session),
+        control_keyspace.clone(),
+    )
+    .await?;
+    let writer_store =
+        ScyllaBranchExactWriterLifecycleStore::prepare(session, control_keyspace).await?;
+    let authority = AuthorityScope::Realm {
+        realm_id,
+        realm_sub_id,
+    };
+    let cutover_key = BranchExactCutoverAuthorityKey::try_new(network, authority)?;
+    let writer_key = BranchExactWriterAuthorityKey::new(network, authority);
+
+    let first_cutover = match cutover_store.read::<Hash>(cutover_key).await? {
+        BranchExactCutoverReadState::Current(current) => current,
+        BranchExactCutoverReadState::Uninitialized => {
+            anyhow::bail!("Realm branch-exact cutover is uninitialized")
+        }
+    };
+    let first_writer = match writer_store.read::<Hash>(writer_key).await? {
+        BranchExactWriterReadState::Current(current) => current,
+        BranchExactWriterReadState::Uninitialized => {
+            anyhow::bail!("Realm branch-exact writer lifecycle is uninitialized")
+        }
+    };
+    let second_cutover = match cutover_store.read::<Hash>(cutover_key).await? {
+        BranchExactCutoverReadState::Current(current) => current,
+        BranchExactCutoverReadState::Uninitialized => {
+            anyhow::bail!("Realm branch-exact cutover disappeared during inspection")
+        }
+    };
+    let second_writer = match writer_store.read::<Hash>(writer_key).await? {
+        BranchExactWriterReadState::Current(current) => current,
+        BranchExactWriterReadState::Uninitialized => {
+            anyhow::bail!("Realm branch-exact writer lifecycle disappeared during inspection")
+        }
+    };
+
+    if first_cutover != second_cutover || first_writer != second_writer {
+        anyhow::bail!("Realm branch-exact activation changed during inspection; retry")
+    }
+    if !matches!(
+        first_cutover.phase(),
+        BranchExactCutoverPhase::LegacyPrimaryDualWrite
+            | BranchExactCutoverPhase::TargetPrimaryDualWrite
+    ) {
+        anyhow::bail!("Realm branch-exact cutover is quiescing; retry after it becomes stable")
+    }
+    let binding = first_cutover.binding();
+    let writer_plan = first_writer.plan();
+    if binding.network() != network
+        || binding.authority() != authority
+        || writer_plan.baseline().canonical_chain().network_id() != network
+        || writer_plan.authority() != authority
+    {
+        anyhow::bail!("Realm branch-exact activation authority does not match the request")
+    }
+    if binding.writer_activation_digest_bytes() != writer_plan.digest().as_bytes() {
+        anyhow::bail!("Realm cutover and writer activation digests do not close")
+    }
+    match first_writer.state() {
+        BranchExactWriterState::Active(_)
+        | BranchExactWriterState::WritePrepared(_)
+        | BranchExactWriterState::WritesVerified(_) => {}
+        BranchExactWriterState::ActivationPrepared => {
+            anyhow::bail!("Realm branch-exact writer activation is not active")
+        }
+        BranchExactWriterState::Blocked(_) => {
+            anyhow::bail!("Realm branch-exact writer lifecycle is blocked")
+        }
+    }
+
+    Ok(RealmBranchExactActivationSummary {
+        startup_config:
+            psy_node_core::config::node_start_config::RealmBranchExactStartupConfig {
+                generation: binding.generation().get(),
+                binding_digest_hex: hex::encode(binding.digest().as_bytes()),
+                writer_activation_digest_hex: hex::encode(writer_plan.digest().as_bytes()),
+            },
+        cutover_phase: first_cutover.phase(),
+        cutover_revision: first_cutover.revision().get(),
+        writer_revision: first_writer.revision().get(),
     })
 }
 
@@ -1169,5 +1309,44 @@ mod realm_startup_composition_tests {
         let create_keyspace = ["CREATE", " KEYSPACE"].concat();
         assert!(!operator.contains(&create_keyspace));
         assert!(!operator.contains("ScyllaCoreStore::new"));
+    }
+
+    #[test]
+    fn activation_inspector_is_read_only_and_brackets_exact_control_rows() {
+        let source = include_str!("psy_setup.rs");
+        let operator = source
+            .split("pub async fn inspect_realm_branch_exact_activation")
+            .nth(1)
+            .unwrap()
+            .split("/// Coordinator processor/edge composition root")
+            .next()
+            .unwrap();
+        assert!(operator.contains("connect_existing_scylla_session"));
+        assert_eq!(
+            operator.matches("require_existing_scylla_keyspace").count(),
+            2
+        );
+        assert_eq!(operator.matches("cutover_store.read::<Hash>").count(), 2);
+        assert_eq!(operator.matches("writer_store.read::<Hash>").count(), 2);
+        assert!(operator.contains("first_cutover != second_cutover"));
+        assert!(operator.contains("first_writer != second_writer"));
+        assert!(operator.contains("BranchExactCutoverPhase::LegacyPrimaryDualWrite"));
+        assert!(operator.contains("BranchExactCutoverPhase::TargetPrimaryDualWrite"));
+        assert!(operator.contains("BranchExactWriterState::Blocked"));
+        assert!(operator.contains("binding.writer_activation_digest_bytes()"));
+        assert!(operator.contains("writer_plan.digest().as_bytes()"));
+        for forbidden in [
+            "ScyllaCoreStore::new",
+            "::create_schema",
+            "PendingQueueSidecarDeploymentExecutor::deploy",
+            ".bootstrap(",
+            ".compare_and_set(",
+            ".apply(",
+        ] {
+            assert!(
+                !operator.contains(forbidden),
+                "activation inspector contains forbidden mutation {forbidden}"
+            );
+        }
     }
 }

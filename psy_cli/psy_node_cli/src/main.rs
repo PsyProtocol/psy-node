@@ -1,9 +1,13 @@
 mod subcommand;
 
 use clap::Parser;
+use psy_data::protocol::canonical_chain::NetworkId;
 use psy_core::constants::proving_backends::{PsyChainProvingBackendType, PsyChainProvingBackendTypeInput};
 use psy_node_core::config::node_cli_config::{CoordinatorEdgeCliConfig, CoordinatorProcessorCliConfig, RealmEdgeCliConfig, RealmProcessorCliConfig};
-use psy_node_scylla::psy_setup::deploy_pending_queue_sidecar_from_connection_string;
+use psy_node_scylla::psy_setup::{
+    deploy_pending_queue_sidecar_from_connection_string,
+    inspect_realm_branch_exact_activation,
+};
 
 use crate::subcommand::{Cli, Commands, start_coordinator_edge, start_coordinator_processor, start_realm_edge, start_realm_processor};
 
@@ -21,6 +25,33 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     //psy_common::setup_logging()?;
     match cli.command {
+        Commands::InspectRealmRollbackActivation {
+            scylla_db_url,
+            db_namespace,
+            network,
+            realm_id,
+            realm_sub_id,
+        } => {
+            let summary = inspect_realm_branch_exact_activation::<parth_core::PHash>(
+                &db_namespace,
+                &scylla_db_url,
+                NetworkId::from_network_type(network.into()),
+                realm_id,
+                realm_sub_id,
+            )
+            .await?;
+            let startup = summary.startup_config();
+            println!("# cutover_phase={:?}", summary.cutover_phase());
+            println!("# cutover_revision={}", summary.cutover_revision());
+            println!("# writer_revision={}", summary.writer_revision());
+            println!("branch_exact_startup:");
+            println!("  generation: {}", startup.generation);
+            println!("  binding_digest_hex: {}", startup.binding_digest_hex);
+            println!(
+                "  writer_activation_digest_hex: {}",
+                startup.writer_activation_digest_hex
+            );
+        }
         Commands::DeployRealmRollbackSidecar {
             scylla_db_url,
             db_namespace,
