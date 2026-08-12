@@ -76,6 +76,150 @@ enum RealmGatheringOutcome<F, Hash, JobId> {
     BranchExactAwaitingClosedSource,
 }
 
+async fn observe_exact_coordinator_inclusion<F, Hash, CoordinatorClient>(
+    coordinator_client: &CoordinatorClient,
+    realm_id: u64,
+    old_realm_root: Hash,
+    new_realm_root: Hash,
+) -> anyhow::Result<Option<PsyRealmCoordinatorUpdate<F, Hash>>>
+where
+    Hash: Copy + PartialEq + std::fmt::Debug,
+    CoordinatorClient: RealmCoordinatorClient<F, Hash> + Send + Sync,
+{
+    let checkpoint_id = coordinator_client.rc_get_latest_checkpoint_id().await?;
+    let realm_state = coordinator_client
+        .rc_get_realm_root_and_last_modified_checkpoint(checkpoint_id, realm_id)
+        .await?;
+    if realm_state.value == new_realm_root {
+        return coordinator_client
+            .rc_get_realm_sync_info(realm_state.checkpoint_id, realm_id)
+            .await
+            .map(Some);
+    }
+    if realm_state.value != old_realm_root {
+        anyhow::bail!(
+            "branch-exact Realm root diverged: expected {:?} -> {:?}, found {:?} at checkpoint {}",
+            old_realm_root,
+            new_realm_root,
+            realm_state.value,
+            realm_state.checkpoint_id,
+        );
+    }
+    Ok(None)
+}
+
+async fn wait_for_exact_coordinator_inclusion<F, Hash, CoordinatorClient>(
+    coordinator_client: &CoordinatorClient,
+    realm_id: u64,
+    old_realm_root: Hash,
+    new_realm_root: Hash,
+) -> anyhow::Result<PsyRealmCoordinatorUpdate<F, Hash>>
+where
+    Hash: Copy + PartialEq + std::fmt::Debug,
+    CoordinatorClient: RealmCoordinatorClient<F, Hash> + Send + Sync,
+{
+    loop {
+        if let Some(update) = observe_exact_coordinator_inclusion(
+            coordinator_client,
+            realm_id,
+            old_realm_root,
+            new_realm_root,
+        )
+        .await?
+        {
+            return Ok(update);
+        }
+        coordinator_client.rc_wait_for_next_checkpoint().await?;
+    }
+}
+
+/// Submit one exact Realm proof, recovering an accepted submission by reading
+/// the Coordinator before and after the RPC. This function is the sole
+/// response-loss policy shared by the live Processor and the RF=3 transport
+/// qualification; neither path retries a submission whose inclusion is
+/// already durable.
+async fn submit_or_recover_exact_coordinator_inclusion<
+    F,
+    Hash,
+    CoordinatorClient,
+>(
+    coordinator_client: &CoordinatorClient,
+    realm_id: u64,
+    old_realm_root: Hash,
+    new_realm_root: Hash,
+    submission: GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<F, Hash>,
+    proof: Vec<u8>,
+) -> anyhow::Result<PsyRealmCoordinatorUpdate<F, Hash>>
+where
+    Hash: Copy + PartialEq + std::fmt::Debug,
+    CoordinatorClient: RealmCoordinatorClient<F, Hash> + Send + Sync,
+{
+    if let Some(coordinator) = observe_exact_coordinator_inclusion(
+        coordinator_client,
+        realm_id,
+        old_realm_root,
+        new_realm_root,
+    )
+    .await?
+    {
+        return Ok(coordinator);
+    }
+
+    match coordinator_client
+        .rc_submit_guta_proof(submission, proof, realm_id)
+        .await
+    {
+        Ok(()) => {
+            wait_for_exact_coordinator_inclusion(
+                coordinator_client,
+                realm_id,
+                old_realm_root,
+                new_realm_root,
+            )
+            .await
+        }
+        Err(error) => match observe_exact_coordinator_inclusion(
+            coordinator_client,
+            realm_id,
+            old_realm_root,
+            new_realm_root,
+        )
+        .await?
+        {
+            Some(coordinator) => Ok(coordinator),
+            None => Err(error),
+        },
+    }
+}
+
+#[cfg(feature = "rf3-test-support")]
+pub async fn qualification_submit_or_recover_exact_coordinator_inclusion<
+    F,
+    Hash,
+    CoordinatorClient,
+>(
+    coordinator_client: &CoordinatorClient,
+    realm_id: u64,
+    old_realm_root: Hash,
+    new_realm_root: Hash,
+    submission: GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<F, Hash>,
+    proof: Vec<u8>,
+) -> anyhow::Result<PsyRealmCoordinatorUpdate<F, Hash>>
+where
+    Hash: Copy + PartialEq + std::fmt::Debug,
+    CoordinatorClient: RealmCoordinatorClient<F, Hash> + Send + Sync,
+{
+    submit_or_recover_exact_coordinator_inclusion(
+        coordinator_client,
+        realm_id,
+        old_realm_root,
+        new_realm_root,
+        submission,
+        proof,
+    )
+    .await
+}
+
 async fn project_branch_exact_semantic_output<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
     TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + Send + Sync,
@@ -360,75 +504,6 @@ where
         Ok(root)
     }
 
-    /// Observe the exact Coordinator inclusion without updating any legacy
-    /// Realm singleton or writing its pending-keyed reward proof. `None`
-    /// means the Coordinator is still at the expected predecessor root.
-    async fn observe_branch_exact_coordinator_update(
-        &self,
-        old_realm_root: N::QHash,
-        new_realm_root: N::QHash,
-    ) -> anyhow::Result<Option<PsyRealmCoordinatorUpdate<N::F, N::QHash>>> {
-        let checkpoint_id = self
-            .db
-            .coordinator_client
-            .rc_get_latest_checkpoint_id()
-            .await?;
-        let realm_state = self
-            .db
-            .coordinator_client
-            .rc_get_realm_root_and_last_modified_checkpoint(
-                checkpoint_id,
-                self.db.state.realm_id_u64,
-            )
-            .await?;
-        if realm_state.value == new_realm_root {
-            return self
-                .db
-                .coordinator_client
-                .rc_get_realm_sync_info(
-                    realm_state.checkpoint_id,
-                    self.db.state.realm_id_u64,
-                )
-                .await
-                .map(Some);
-        }
-        if realm_state.value != old_realm_root {
-            anyhow::bail!(
-                "branch-exact Realm root diverged: expected {:?} -> {:?}, found {:?} at checkpoint {}",
-                old_realm_root,
-                new_realm_root,
-                realm_state.value,
-                realm_state.checkpoint_id,
-            );
-        }
-        Ok(None)
-    }
-
-    /// Wait for the exact Coordinator inclusion without mutating legacy
-    /// state. A retry first observes the durable Coordinator result, so a
-    /// response loss never requires submitting the same proof a second time.
-    async fn wait_for_branch_exact_coordinator_update(
-        &self,
-        old_realm_root: N::QHash,
-        new_realm_root: N::QHash,
-    ) -> anyhow::Result<PsyRealmCoordinatorUpdate<N::F, N::QHash>> {
-        loop {
-            if let Some(update) = self
-                .observe_branch_exact_coordinator_update(
-                    old_realm_root,
-                    new_realm_root,
-                )
-                .await?
-            {
-                return Ok(update);
-            }
-            self.db
-                .coordinator_client
-                .rc_wait_for_next_checkpoint()
-                .await?;
-        }
-    }
-
     fn branch_exact_clock_sample() -> anyhow::Result<AuthorityClockSampleUs> {
         let micros = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -616,53 +691,15 @@ where
             u32::try_from(self.db.state.realm_id_u64)?,
             u16::try_from(self.db.state.realm_sub_id_u64)?,
         );
-        let coordinator = match self
-            .observe_branch_exact_coordinator_update(
-                prepared.old_realm_root,
-                prepared.new_realm_root,
-            )
-            .await?
-        {
-            Some(coordinator) => {
-                tracing::info!(
-                    "Recovered exact Coordinator inclusion for branch-exact application {:?}; proof is not resubmitted",
-                    work.application().archive_slot(),
-                );
-                coordinator
-            }
-            None => {
-                let submit_result = self
-                    .db
-                    .coordinator_client
-                    .rc_submit_guta_proof(
-                        submission,
-                        root_proof.clone(),
-                        self.db.state.realm_id_u64,
-                    )
-                    .await;
-                match submit_result {
-                    Ok(()) => {
-                        self.wait_for_branch_exact_coordinator_update(
-                            prepared.old_realm_root,
-                            prepared.new_realm_root,
-                        )
-                        .await?
-                    }
-                    Err(error) => {
-                        match self
-                            .observe_branch_exact_coordinator_update(
-                                prepared.old_realm_root,
-                                prepared.new_realm_root,
-                            )
-                            .await?
-                        {
-                            Some(coordinator) => coordinator,
-                            None => return Err(error.into()),
-                        }
-                    }
-                }
-            }
-        };
+        let coordinator = submit_or_recover_exact_coordinator_inclusion(
+            self.db.coordinator_client.as_ref(),
+            self.db.state.realm_id_u64,
+            prepared.old_realm_root,
+            prepared.new_realm_root,
+            submission,
+            root_proof.clone(),
+        )
+        .await?;
         let authority = AuthorityScope::Realm {
             realm_id: u32::try_from(self.db.state.realm_id_u64)?,
             realm_sub_id: u16::try_from(self.db.state.realm_sub_id_u64)?,
@@ -1466,8 +1503,7 @@ mod h23c4d2_tests {
             "get_tdb_proof_witness_bytes",
             "publish_branch_exact_worker_jobs",
             "get_proof_bytes_exact",
-            "observe_branch_exact_coordinator_update",
-            "wait_for_branch_exact_coordinator_update",
+            "submit_or_recover_exact_coordinator_inclusion",
             "SealedRealmProofBinding::verify_and_seal",
             "RealmProcessorVerifiedNarrowWriterEvidence::try_from_verified",
             "prepare_mapping_and_reward_proof",
@@ -1488,11 +1524,45 @@ mod h23c4d2_tests {
             .find("self.publish_branch_exact_worker_jobs")
             .unwrap();
         assert!(proof_read < proof_publish);
-        let coordinator_read = route
-            .find(".observe_branch_exact_coordinator_update(")
+    }
+
+    #[test]
+    fn live_and_rf3_routes_share_exact_coordinator_response_loss_policy() {
+        let source = include_str!("process_block.rs");
+        let helper = source
+            .split("async fn submit_or_recover_exact_coordinator_inclusion")
+            .nth(1)
+            .unwrap()
+            .split("#[cfg(feature = \"rf3-test-support\")]")
+            .next()
             .unwrap();
-        let coordinator_submit = route.find(".rc_submit_guta_proof(").unwrap();
-        assert!(coordinator_read < coordinator_submit);
+        let pre_observe = helper
+            .find("observe_exact_coordinator_inclusion(")
+            .unwrap();
+        let submit = helper.find(".rc_submit_guta_proof(").unwrap();
+        let post_observe = helper.rfind("observe_exact_coordinator_inclusion(").unwrap();
+        assert!(pre_observe < submit);
+        assert!(submit < post_observe);
+        assert!(helper.contains("wait_for_exact_coordinator_inclusion("));
+
+        let live_route = source
+            .split("async fn execute_branch_exact_proof_and_narrow_write(")
+            .nth(1)
+            .unwrap()
+            .split("pub fn get_root_job_id")
+            .next()
+            .unwrap();
+        assert!(live_route.contains("submit_or_recover_exact_coordinator_inclusion("));
+
+        let qualification_route = source
+            .split("pub async fn qualification_submit_or_recover_exact_coordinator_inclusion")
+            .nth(1)
+            .unwrap()
+            .split("async fn project_branch_exact_semantic_output")
+            .next()
+            .unwrap();
+        assert!(qualification_route
+            .contains("submit_or_recover_exact_coordinator_inclusion("));
     }
 
     #[test]

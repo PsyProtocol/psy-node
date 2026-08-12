@@ -27,6 +27,7 @@ use parth_core::{
         },
         secp256k1::SimpleTimedRequest,
     },
+    data::hash::checkpointed_merkle_node::CheckpointedMerkleHash,
     data::queue::queue_key::{
         PCoreSubjectQueueBase, QPBaseQueueType, QPStandardUniqueIdQueueKey,
     },
@@ -38,6 +39,14 @@ use parth_core::{
         QZKProofPublicInputsHasherReader, QZKProofVerifier,
     },
     PHash, PF,
+};
+#[cfg(feature = "rf3-test-support")]
+use jsonrpsee::{
+    core::RpcResult,
+    http_client::HttpClientBuilder,
+    server::ServerBuilder,
+    types::ErrorObjectOwned,
+    RpcModule,
 };
 use psy_core::{
     constants::chain_id::PsyChainNetworkType,
@@ -228,7 +237,7 @@ use sha2::{Digest, Sha256};
 use psy_worker_core::worker::prover_trait::PsyWorkerGenericLibraryProver;
 use tokio::time::{sleep, timeout};
 #[cfg(feature = "rf3-test-support")]
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Mutex};
 
 use crate::psy_setup::{
     setup_psy_scylla_database_store, setup_realm_edge_scylla_startup_composition,
@@ -240,7 +249,10 @@ use psy_node_common::{
     constants::queue::PQ_REALM_SUBMIT_USER_UPDATE_QUEUE_TOPIC_ID,
     queue::gatherer::EphemeralQueueGathererWithTree,
     realm::processor::{
-        core::qualification_project_branch_exact_semantic_output,
+        core::{
+            qualification_project_branch_exact_semantic_output,
+            qualification_submit_or_recover_exact_coordinator_inclusion,
+        },
         gatherers::realm_end_cap_gatherer::{
             qualification_finish_realm_deferred_actor_trace,
             qualification_start_realm_deferred_actor_trace,
@@ -249,6 +261,7 @@ use psy_node_common::{
         },
     },
     realm::queue_key::RealmProvingWorkQueueKey,
+    p2p::realm_coordinator::PsyRealmCoordinatorClientAPI,
     utils::processor_status::ProcessorStatus,
 };
 
@@ -415,6 +428,17 @@ struct E3Report {
     proof_binding_tamper_rejected: bool,
     qualification_coordinator_inclusion: bool,
     coordinator_rpc_rf3: bool,
+    coordinator_rpc_production_client: bool,
+    coordinator_rpc_qualification_server: bool,
+    coordinator_rpc_submit_calls: u64,
+    coordinator_rpc_canonical_reads: u64,
+    coordinator_rpc_realm_root_reads: u64,
+    coordinator_rpc_sync_reads: u64,
+    coordinator_rpc_post_commit_error_recovered: bool,
+    coordinator_rpc_preexisting_inclusion_recovered_without_submit: bool,
+    coordinator_rpc_socket_response_loss_injected: bool,
+    production_coordinator_handler_rf3: bool,
+    production_coordinator_processor_rf3: bool,
     proof_worker_queue_rf3: bool,
     proof_worker_api_handler_rf3: bool,
     proof_worker_jobs_dispatched: usize,
@@ -1306,6 +1330,227 @@ fn qualification_coordinator_update(
 }
 
 #[cfg(feature = "rf3-test-support")]
+struct QualificationCoordinatorRpcInner {
+    predecessor: CanonicalChainRef<PHash>,
+    old_realm_root: PHash,
+    update: PsyRealmCoordinatorUpdate<PF, PHash>,
+    expected_submission: Vec<u8>,
+    expected_proof: Vec<u8>,
+    committed: bool,
+    post_commit_error_sent: bool,
+    submit_calls: u64,
+    canonical_reads: u64,
+    realm_root_reads: u64,
+    sync_reads: u64,
+}
+
+#[cfg(feature = "rf3-test-support")]
+#[derive(Clone)]
+struct QualificationCoordinatorRpcState {
+    inner: Arc<Mutex<QualificationCoordinatorRpcInner>>,
+}
+
+#[cfg(feature = "rf3-test-support")]
+#[derive(Debug)]
+struct QualificationCoordinatorRpcObservation {
+    submit_calls: u64,
+    canonical_reads: u64,
+    realm_root_reads: u64,
+    sync_reads: u64,
+    post_commit_error_recovered: bool,
+    preexisting_inclusion_recovered_without_submit: bool,
+}
+
+#[cfg(feature = "rf3-test-support")]
+fn qualification_rpc_error(message: impl Into<String>) -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(-32091, message.into(), None::<()>)
+}
+
+#[cfg(feature = "rf3-test-support")]
+async fn qualification_coordinator_rpc_roundtrip(
+    predecessor: CanonicalChainRef<PHash>,
+    old_realm_root: PHash,
+    update: PsyRealmCoordinatorUpdate<PF, PHash>,
+    submission: GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<PF, PHash>,
+    proof: Vec<u8>,
+) -> anyhow::Result<(
+    PsyRealmCoordinatorUpdate<PF, PHash>,
+    QualificationCoordinatorRpcObservation,
+)> {
+    let state = QualificationCoordinatorRpcState {
+        inner: Arc::new(Mutex::new(QualificationCoordinatorRpcInner {
+            predecessor,
+            old_realm_root,
+            update: update.clone(),
+            expected_submission: submission.psy_ser_to_bytes_vec()?,
+            expected_proof: proof.clone(),
+            committed: false,
+            post_commit_error_sent: false,
+            submit_calls: 0,
+            canonical_reads: 0,
+            realm_root_reads: 0,
+            sync_reads: 0,
+        })),
+    };
+    let server = ServerBuilder::default().build("127.0.0.1:0").await?;
+    let address = server.local_addr()?;
+    let mut rpc = RpcModule::new(state.clone());
+    rpc.register_async_method(
+        "psy_get_canonical_chain_ref",
+        |_params, state, _extensions| async move {
+            let mut inner = state.inner.lock().await;
+            inner.canonical_reads = inner.canonical_reads.saturating_add(1);
+            RpcResult::Ok(if inner.committed {
+                inner.update.canonical_chain_ref
+            } else {
+                inner.predecessor
+            })
+        },
+    )?;
+    rpc.register_async_method(
+        "psy_get_realm_root_and_last_modified_checkpoint",
+        |params, state, _extensions| async move {
+            let (checkpoint_id, realm_id): (u64, u64) = params.parse()?;
+            if realm_id != u64::from(REALM_ID) {
+                return RpcResult::Err(qualification_rpc_error(
+                    "qualification Coordinator received a foreign Realm",
+                ));
+            }
+            let mut inner = state.inner.lock().await;
+            inner.realm_root_reads = inner.realm_root_reads.saturating_add(1);
+            let selected_checkpoint = if inner.committed {
+                inner.update.canonical_chain_ref.checkpoint().checkpoint_id().get()
+            } else {
+                inner.predecessor.checkpoint().checkpoint_id().get()
+            };
+            if checkpoint_id != selected_checkpoint {
+                return RpcResult::Err(qualification_rpc_error(
+                    "qualification Coordinator checkpoint selection drifted",
+                ));
+            }
+            RpcResult::Ok(CheckpointedMerkleHash {
+                checkpoint_id: selected_checkpoint,
+                value: if inner.committed {
+                    inner.update.merkle_proof_to_realm_root.value
+                } else {
+                    inner.old_realm_root
+                },
+            })
+        },
+    )?;
+    rpc.register_async_method(
+        "psy_get_realm_sync_info",
+        |params, state, _extensions| async move {
+            let (checkpoint_id, realm_id): (u64, u64) = params.parse()?;
+            let mut inner = state.inner.lock().await;
+            inner.sync_reads = inner.sync_reads.saturating_add(1);
+            if !inner.committed
+                || realm_id != u64::from(REALM_ID)
+                || checkpoint_id
+                    != inner
+                        .update
+                        .canonical_chain_ref
+                        .checkpoint()
+                        .checkpoint_id()
+                        .get()
+            {
+                return RpcResult::Err(qualification_rpc_error(
+                    "qualification Coordinator inclusion is not selected",
+                ));
+            }
+            RpcResult::Ok(inner.update.clone())
+        },
+    )?;
+    rpc.register_async_method(
+        "psy_submit_guta",
+        |params, state, _extensions| async move {
+            let (submission, proof, realm_id): (
+                GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<PF, PHash>,
+                Vec<u8>,
+                u64,
+            ) = params.parse()?;
+            let submission = submission
+                .psy_ser_to_bytes_vec()
+                .map_err(|error| qualification_rpc_error(error.to_string()))?;
+            let mut inner = state.inner.lock().await;
+            inner.submit_calls = inner.submit_calls.saturating_add(1);
+            if realm_id != u64::from(REALM_ID)
+                || submission != inner.expected_submission
+                || proof != inner.expected_proof
+            {
+                return RpcResult::Err(qualification_rpc_error(
+                    "qualification Coordinator rejected non-exact proof submission",
+                ));
+            }
+            if inner.committed {
+                return RpcResult::Err(qualification_rpc_error(
+                    "qualification Coordinator received a duplicate proof submission",
+                ));
+            }
+            inner.committed = true;
+            if !inner.post_commit_error_sent {
+                inner.post_commit_error_sent = true;
+                return RpcResult::Err(qualification_rpc_error(
+                    "QUALIFICATION_POST_COMMIT_RESPONSE_LOST",
+                ));
+            }
+            RpcResult::Ok("ok".to_owned())
+        },
+    )?;
+    let handle = server.start(rpc);
+    let url = format!("http://{address}");
+    let first_client = PsyRealmCoordinatorClientAPI::<N, _>::new(
+        HttpClientBuilder::default().build(&url)?,
+    );
+    let recovered = qualification_submit_or_recover_exact_coordinator_inclusion(
+        &first_client,
+        u64::from(REALM_ID),
+        old_realm_root,
+        update.merkle_proof_to_realm_root.value,
+        submission.clone(),
+        proof.clone(),
+    )
+    .await?;
+    ensure!(recovered == update);
+
+    // Rebuild the production client and enter the same helper again. The
+    // initial observation must select the already committed inclusion and
+    // must not issue a second submit RPC.
+    drop(first_client);
+    let restarted_client = PsyRealmCoordinatorClientAPI::<N, _>::new(
+        HttpClientBuilder::default().build(&url)?,
+    );
+    let recovered_after_client_restart =
+        qualification_submit_or_recover_exact_coordinator_inclusion(
+            &restarted_client,
+            u64::from(REALM_ID),
+            old_realm_root,
+            update.merkle_proof_to_realm_root.value,
+            submission,
+            proof,
+        )
+        .await?;
+    ensure!(recovered_after_client_restart == update);
+
+    let observation = {
+        let inner = state.inner.lock().await;
+        QualificationCoordinatorRpcObservation {
+            submit_calls: inner.submit_calls,
+            canonical_reads: inner.canonical_reads,
+            realm_root_reads: inner.realm_root_reads,
+            sync_reads: inner.sync_reads,
+            post_commit_error_recovered: inner.post_commit_error_sent
+                && inner.committed,
+            preexisting_inclusion_recovered_without_submit:
+                inner.submit_calls == 1 && inner.sync_reads == 2,
+        }
+    };
+    handle.stop()?;
+    handle.stopped().await;
+    Ok((recovered, observation))
+}
+
+#[cfg(feature = "rf3-test-support")]
 type QualificationRealmActor = EphemeralQueueGathererWithTree<
     PQ_REALM_SUBMIT_USER_UPDATE_QUEUE_TOPIC_ID,
     PsyRealmUserUpdateQueueItem<PF, PHash>,
@@ -1872,9 +2117,15 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         std::env::var("PSY_D04B6H23C4D2_RF3").as_deref() == Ok("1");
     let exercise_proof_worker_queue =
         std::env::var("PSY_D04B6H23C4D3A_RF3").as_deref() == Ok("1");
+    let exercise_coordinator_rpc =
+        std::env::var("PSY_D04B6H23C4D3B1_RF3").as_deref() == Ok("1");
     ensure!(
         !exercise_proof_worker_queue || exercise_proof_narrow_writer,
         "c4d3a worker queue Gate requires c4d2 proof/narrow writer",
+    );
+    ensure!(
+        !exercise_coordinator_rpc || exercise_proof_worker_queue,
+        "c4d3b1 Coordinator RPC Gate requires c4d3a proof worker queue",
     );
 
     fixture::wait_up(3).await?;
@@ -2725,6 +2976,12 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
     let mut proof_binding_digest = String::new();
     let mut proof_binding_tamper_rejected = false;
     let mut qualification_coordinator_inclusion = false;
+    let mut coordinator_rpc_submit_calls = 0_u64;
+    let mut coordinator_rpc_canonical_reads = 0_u64;
+    let mut coordinator_rpc_realm_root_reads = 0_u64;
+    let mut coordinator_rpc_sync_reads = 0_u64;
+    let mut coordinator_rpc_post_commit_error_recovered = false;
+    let mut coordinator_rpc_preexisting_inclusion_recovered_without_submit = false;
     let mut proof_worker_api_handler_rf3 = false;
     let mut proof_worker_jobs_dispatched = 0_usize;
     let mut proof_worker_jobs_completed = 0_usize;
@@ -4587,11 +4844,44 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                                     REALM_ID,
                                     REALM_SUB_ID,
                                 );
-                                let coordinator = qualification_coordinator_update(
+                                let expected_coordinator = qualification_coordinator_update(
                                     proof_predecessor_chain,
                                     prepared.new_realm_root,
                                     proof.proof_public_inputs,
                                 )?;
+                                let coordinator = if exercise_coordinator_rpc {
+                                    let (coordinator, rpc) =
+                                        qualification_coordinator_rpc_roundtrip(
+                                            proof_predecessor_chain,
+                                            prepared.old_realm_root,
+                                            expected_coordinator.clone(),
+                                            proof.submission.clone(),
+                                            proof.proof_bytes.clone(),
+                                        )
+                                        .await
+                                        .context(
+                                            "c4d3b1 production Coordinator client RPC roundtrip",
+                                        )?;
+                                    ensure!(rpc.submit_calls == 1);
+                                    ensure!(rpc.canonical_reads >= 2);
+                                    ensure!(rpc.realm_root_reads >= 2);
+                                    ensure!(rpc.sync_reads == 2);
+                                    ensure!(rpc.post_commit_error_recovered);
+                                    ensure!(
+                                        rpc.preexisting_inclusion_recovered_without_submit
+                                    );
+                                    coordinator_rpc_submit_calls = rpc.submit_calls;
+                                    coordinator_rpc_canonical_reads = rpc.canonical_reads;
+                                    coordinator_rpc_realm_root_reads = rpc.realm_root_reads;
+                                    coordinator_rpc_sync_reads = rpc.sync_reads;
+                                    coordinator_rpc_post_commit_error_recovered =
+                                        rpc.post_commit_error_recovered;
+                                    coordinator_rpc_preexisting_inclusion_recovered_without_submit =
+                                        rpc.preexisting_inclusion_recovered_without_submit;
+                                    coordinator
+                                } else {
+                                    expected_coordinator
+                                };
                                 qualification_coordinator_inclusion = true;
 
                                 let mut tampered = coordinator.clone();
@@ -5183,7 +5473,18 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         proof_binding_digest,
         proof_binding_tamper_rejected,
         qualification_coordinator_inclusion,
-        coordinator_rpc_rf3: false,
+        coordinator_rpc_rf3: exercise_coordinator_rpc,
+        coordinator_rpc_production_client: exercise_coordinator_rpc,
+        coordinator_rpc_qualification_server: exercise_coordinator_rpc,
+        coordinator_rpc_submit_calls,
+        coordinator_rpc_canonical_reads,
+        coordinator_rpc_realm_root_reads,
+        coordinator_rpc_sync_reads,
+        coordinator_rpc_post_commit_error_recovered,
+        coordinator_rpc_preexisting_inclusion_recovered_without_submit,
+        coordinator_rpc_socket_response_loss_injected: false,
+        production_coordinator_handler_rf3: false,
+        production_coordinator_processor_rf3: false,
         proof_worker_queue_rf3: exercise_proof_worker_queue,
         proof_worker_api_handler_rf3,
         proof_worker_jobs_dispatched,
@@ -5221,7 +5522,9 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         full_node_restart_tested: false,
         production_serving: false,
         h8_domains_closed: 0,
-        qualification: if exercise_proof_worker_queue {
+        qualification: if exercise_coordinator_rpc {
+            "H23C4D3B1_REALM_COORDINATOR_RPC_RECOVERY_RF3_PASSED"
+        } else if exercise_proof_worker_queue {
             "H23C4D3A_REALM_PROOF_WORKER_QUEUE_RF3_PASSED"
         } else if exercise_proof_narrow_writer {
             "H23C4D2_REALM_PROOF_NARROW_WRITER_RF3_PASSED"

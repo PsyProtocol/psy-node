@@ -60,8 +60,10 @@ sha2 = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+jsonrpsee = { workspace = true }
 parth_crypto = { workspace = true }
 parth_common = { workspace = true }
+psy_api_core = { workspace = true }
 psy_core = { workspace = true }
 psy_data = { workspace = true }
 cf_utils = { workspace = true }

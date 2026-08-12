@@ -13,8 +13,11 @@ EXERCISE_TERMINAL_RECOVERY="${PSY_D04B6H23C4C4B3B2_RF3:-0}"
 EXERCISE_DEFERRED_ACTOR_ARCHIVE="${PSY_D04B6H23C4C4B4C2_RF3:-0}"
 EXERCISE_PROOF_NARROW_WRITER="${PSY_D04B6H23C4D2_RF3:-0}"
 EXERCISE_PROOF_WORKER_QUEUE="${PSY_D04B6H23C4D3A_RF3:-0}"
+EXERCISE_COORDINATOR_RPC="${PSY_D04B6H23C4D3B1_RF3:-0}"
 EXPECTED_QUALIFICATION="H23C4C2B4E3_JTMB_HANDLER_INGRESS_RF3_PASSED"
-if [[ "${EXERCISE_PROOF_WORKER_QUEUE}" == "1" ]]; then
+if [[ "${EXERCISE_COORDINATOR_RPC}" == "1" ]]; then
+  EXPECTED_QUALIFICATION="H23C4D3B1_REALM_COORDINATOR_RPC_RECOVERY_RF3_PASSED"
+elif [[ "${EXERCISE_PROOF_WORKER_QUEUE}" == "1" ]]; then
   EXPECTED_QUALIFICATION="H23C4D3A_REALM_PROOF_WORKER_QUEUE_RF3_PASSED"
 elif [[ "${EXERCISE_PROOF_NARROW_WRITER}" == "1" ]]; then
   EXPECTED_QUALIFICATION="H23C4D2_REALM_PROOF_NARROW_WRITER_RF3_PASSED"
@@ -125,6 +128,7 @@ PSY_D04B6H23C4C4B3B2_RF3="${EXERCISE_TERMINAL_RECOVERY}" \
 PSY_D04B6H23C4C4B4C2_RF3="${EXERCISE_DEFERRED_ACTOR_ARCHIVE}" \
 PSY_D04B6H23C4D2_RF3="${EXERCISE_PROOF_NARROW_WRITER}" \
 PSY_D04B6H23C4D3A_RF3="${EXERCISE_PROOF_WORKER_QUEUE}" \
+PSY_D04B6H23C4D3B1_RF3="${EXERCISE_COORDINATOR_RPC}" \
 PSY_D04B6H23C4C2B4E3_COMPOSE_FILE="${COMPOSE_FILE}" \
 PSY_D04B6H23C4C2B4E3_REPORT_PATH="${REPORT_PATH}" \
 PSY_D04B6H23C4C2B4E3_NATS_URLS="nats://127.0.0.1:45322,nats://127.0.0.1:45323,nats://127.0.0.1:45324" \
@@ -145,7 +149,8 @@ jq -e \
   --argjson exercise_terminal_recovery "${EXERCISE_TERMINAL_RECOVERY}" \
   --argjson exercise_deferred_actor_archive "${EXERCISE_DEFERRED_ACTOR_ARCHIVE}" \
   --argjson exercise_proof_narrow_writer "${EXERCISE_PROOF_NARROW_WRITER}" \
-  --argjson exercise_proof_worker_queue "${EXERCISE_PROOF_WORKER_QUEUE}" '
+  --argjson exercise_proof_worker_queue "${EXERCISE_PROOF_WORKER_QUEUE}" \
+  --argjson exercise_coordinator_rpc "${EXERCISE_COORDINATOR_RPC}" '
   .qualification == $expected_qualification
   and .scylla_replication_factor == 3
   and .configured_nats_servers == 3
@@ -210,7 +215,32 @@ jq -e \
       and (.proof_binding_digest | test("^[0-9a-f]{64}$"))
       and .proof_binding_tamper_rejected == true
       and .qualification_coordinator_inclusion == true
-      and .coordinator_rpc_rf3 == false
+      and .production_coordinator_handler_rf3 == false
+      and .production_coordinator_processor_rf3 == false
+      and .coordinator_rpc_socket_response_loss_injected == false
+      and (
+        if $exercise_coordinator_rpc == 1 then
+          .coordinator_rpc_rf3 == true
+          and .coordinator_rpc_production_client == true
+          and .coordinator_rpc_qualification_server == true
+          and .coordinator_rpc_submit_calls == 1
+          and .coordinator_rpc_canonical_reads >= 2
+          and .coordinator_rpc_realm_root_reads >= 2
+          and .coordinator_rpc_sync_reads == 2
+          and .coordinator_rpc_post_commit_error_recovered == true
+          and .coordinator_rpc_preexisting_inclusion_recovered_without_submit == true
+        else
+          .coordinator_rpc_rf3 == false
+          and .coordinator_rpc_production_client == false
+          and .coordinator_rpc_qualification_server == false
+          and .coordinator_rpc_submit_calls == 0
+          and .coordinator_rpc_canonical_reads == 0
+          and .coordinator_rpc_realm_root_reads == 0
+          and .coordinator_rpc_sync_reads == 0
+          and .coordinator_rpc_post_commit_error_recovered == false
+          and .coordinator_rpc_preexisting_inclusion_recovered_without_submit == false
+        end
+      )
       and .proof_worker_queue_rf3 == ($exercise_proof_worker_queue == 1)
       and (
         if $exercise_proof_worker_queue == 1 then
@@ -252,6 +282,17 @@ jq -e \
       and .proof_binding_tamper_rejected == false
       and .qualification_coordinator_inclusion == false
       and .coordinator_rpc_rf3 == false
+      and .coordinator_rpc_production_client == false
+      and .coordinator_rpc_qualification_server == false
+      and .coordinator_rpc_submit_calls == 0
+      and .coordinator_rpc_canonical_reads == 0
+      and .coordinator_rpc_realm_root_reads == 0
+      and .coordinator_rpc_sync_reads == 0
+      and .coordinator_rpc_post_commit_error_recovered == false
+      and .coordinator_rpc_preexisting_inclusion_recovered_without_submit == false
+      and .coordinator_rpc_socket_response_loss_injected == false
+      and .production_coordinator_handler_rf3 == false
+      and .production_coordinator_processor_rf3 == false
       and .proof_worker_queue_rf3 == false
       and .proof_worker_api_handler_rf3 == false
       and .proof_worker_jobs_dispatched == 0
