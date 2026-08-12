@@ -42,6 +42,7 @@ use psy_node_core::{
         },
         realm_processor_full_commit_source::{
             RealmProcessorGenerationRotationOutcome,
+            RealmProcessorQueueCloseObservation,
             RealmProcessorVerifiedFullCommitSource,
         },
         realm_processor_narrow_writer::RealmProcessorVerifiedNarrowWriterEvidence,
@@ -1051,6 +1052,26 @@ where
                         .resume_branch_exact_await_writer_completion(iteration)
                         .await;
                 }
+                if continuation.phase()
+                    == RealmProcessorGenerationContinuationPhase::AwaitQueueClose
+                {
+                    let RealmNormalCommitIteration::BranchExact(iteration) = iteration
+                    else {
+                        anyhow::bail!(
+                            "branch-exact continuation observed under legacy iteration"
+                        );
+                    };
+                    let closed: RealmProcessorQueueCloseObservation = iteration
+                        .begin_next_generation_queue_close()
+                        .await?;
+                    tracing::info!(
+                        "Branch-exact generation close intent is exact: processing_pending={}, pipeline_revision={}, close={:?}",
+                        closed.processing().pending_id().get(),
+                        closed.pipeline_revision().get(),
+                        closed.close_intent(),
+                    );
+                    return Ok(());
+                }
                 if matches!(
                     continuation.phase(),
                     RealmProcessorGenerationContinuationPhase::AwaitPublishedTerminal
@@ -1793,6 +1814,34 @@ mod h23_generation_rotation_tests {
         assert!(terminal.contains("return Ok(())"));
         for forbidden in ["seal_rotation(", "pipeline.apply", "qualification_persist"] {
             assert!(!terminal.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn ready_generation_uses_storage_owned_queue_close_and_returns_before_legacy_work() {
+        let source = include_str!("process_block.rs");
+        let process = source
+            .split("pub(super) async fn process_block")
+            .nth(1)
+            .unwrap();
+        let start = process
+            .find(
+                "continuation.phase()\n                    == RealmProcessorGenerationContinuationPhase::AwaitQueueClose",
+            )
+            .unwrap();
+        let close = process[start..]
+            .split("if matches!(")
+            .next()
+            .unwrap();
+        assert!(close.contains("begin_next_generation_queue_close"));
+        assert!(close.contains("return Ok(())"));
+        for forbidden in [
+            "PendingQueueClosePlan",
+            "seal_begin_queue_close",
+            "pipeline.apply",
+            "commit_state",
+        ] {
+            assert!(!close.contains(forbidden));
         }
     }
 }

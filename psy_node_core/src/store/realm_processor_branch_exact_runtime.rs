@@ -42,10 +42,12 @@ use crate::queue::{
         RealmProcessorFullCommitPublicationObservation,
         RealmProcessorFullCommitSourceObservation,
         RealmProcessorGenerationRotationOutcome,
+        RealmProcessorQueueCloseObservation,
         RealmProcessorVerifiedFullCommitSource,
         SealedRealmProcessorFullCommitPublicationRequest,
         SealedRealmProcessorFullCommitSourceRequest,
         SealedRealmProcessorGenerationRotationRequest,
+        SealedRealmProcessorQueueCloseRequest,
     },
     realm_processor_continuation_restart::{
         RealmProcessorContinuationRestartFactory,
@@ -392,6 +394,28 @@ impl<Hash> RealmBranchExactCommitIteration<'_, Hash> {
             runtime.queue_readiness_digest(),
         )?;
         factory.terminalize_and_rotate(request).await
+    }
+
+    /// Move the exact storage-selected Ready generation into Sealing. The
+    /// close identity is derived from the durable pipeline and active writer;
+    /// no caller-provided generation or digest participates.
+    pub async fn begin_next_generation_queue_close(
+        &mut self,
+    ) -> Result<RealmProcessorQueueCloseObservation, RealmProcessorFullCommitSourceError>
+    where
+        Hash: Q256BitHash + 'static,
+    {
+        let runtime = self.owner.runtime();
+        let factory = Arc::clone(self.owner.installed.full_commit_source_factory());
+        let request = SealedRealmProcessorQueueCloseRequest::seal(
+            self.owner.startup_permit_digest(),
+            runtime.network(),
+            runtime.realm_id(),
+            runtime.realm_sub_id(),
+            runtime.writer_activation_digest(),
+            runtime.queue_readiness_digest(),
+        )?;
+        factory.begin_queue_close(request).await
     }
 
     /// Freshly observes the storage-selected processing generation. This is
@@ -1199,6 +1223,16 @@ mod tests {
         {
             Err(RealmProcessorFullCommitSourceError::Backend(
                 "generation rotation fixture is installation-only".to_owned(),
+            ))
+        }
+
+        async fn begin_queue_close(
+            &self,
+            _request: SealedRealmProcessorQueueCloseRequest,
+        ) -> Result<RealmProcessorQueueCloseObservation, RealmProcessorFullCommitSourceError>
+        {
+            Err(RealmProcessorFullCommitSourceError::Backend(
+                "queue-close fixture is installation-only".to_owned(),
             ))
         }
     }

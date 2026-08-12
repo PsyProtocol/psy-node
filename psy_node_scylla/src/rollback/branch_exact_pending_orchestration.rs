@@ -46,8 +46,8 @@ const PUBLISH_DOMAIN: &[u8] = b"psy/rollback/pending-pipeline-publish/v2";
 
 /// Exact, replay-stable request to close one processing queue generation.
 ///
-/// The model constructor is crate-private. h22d3b3 must replace it with a plan
-/// issued by the narrow runtime immediately before the backend producer fence.
+/// Production constructs this only from a freshly selected durable pipeline;
+/// callers cannot provide the generation identity, source revision or digest.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct PendingQueueClosePlan {
     key: PendingGenerationLedgerKey,
@@ -58,8 +58,7 @@ pub struct PendingQueueClosePlan {
 }
 
 impl PendingQueueClosePlan {
-    #[cfg(test)]
-    pub(crate) fn model<Hash: Q256BitHash>(
+    pub(crate) fn from_storage_selected<Hash: Q256BitHash>(
         pipeline: &StoredPendingPipeline<Hash>,
     ) -> Result<Self, BranchExactPendingOrchestrationError> {
         let key = pipeline.key();
@@ -82,6 +81,13 @@ impl PendingQueueClosePlan {
             source_revision,
             digest,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn model<Hash: Q256BitHash>(
+        pipeline: &StoredPendingPipeline<Hash>,
+    ) -> Result<Self, BranchExactPendingOrchestrationError> {
+        Self::from_storage_selected(pipeline)
     }
 
     pub const fn processing(&self) -> PendingGenerationContext {

@@ -27,7 +27,9 @@ use sha2::{Digest, Sha256};
 use crate::store::{
     authority_local_head::{SealedAuthorityLocalHeadCas, StoredAuthorityLocalHead},
     pending_generation_identity::PendingGenerationContext,
-    pending_generation_pipeline::PendingPipelineRevision,
+    pending_generation_pipeline::{
+        PendingPipelineRevision, PendingQueueCloseIntentDigest,
+    },
     realm_full_commit_write_set::RealmFullCommitWriteSet,
     realm_normal_commit_coverage::RealmNormalCommitCoveragePlan,
     realm_proof_binding::{RealmProofBindingDigest, SealedRealmProofBinding},
@@ -429,6 +431,88 @@ pub enum RealmProcessorGenerationRotationOutcome {
     Rotated(RealmProcessorGenerationRotationObservation),
 }
 
+/// Identity-only request for moving the freshly rotated Ready generation into
+/// Sealing. The storage backend selects the processing generation, writer and
+/// close intent; the caller cannot provide any of them.
+pub struct SealedRealmProcessorQueueCloseRequest {
+    startup_permit_digest: RealmProcessorStartupPermitDigest,
+    network: NetworkId,
+    realm_id: u32,
+    realm_sub_id: u16,
+    writer_activation_digest: [u8; 32],
+    queue_readiness_digest: [u8; 32],
+}
+
+impl SealedRealmProcessorQueueCloseRequest {
+    pub(crate) fn seal(
+        startup_permit_digest: RealmProcessorStartupPermitDigest,
+        network: NetworkId,
+        realm_id: u32,
+        realm_sub_id: u16,
+        writer_activation_digest: [u8; 32],
+        queue_readiness_digest: [u8; 32],
+    ) -> Result<Self, RealmProcessorFullCommitSourceError> {
+        if writer_activation_digest == [0; 32]
+            || queue_readiness_digest == [0; 32]
+        {
+            return Err(RealmProcessorFullCommitSourceError::IdentityMismatch);
+        }
+        Ok(Self {
+            startup_permit_digest,
+            network,
+            realm_id,
+            realm_sub_id,
+            writer_activation_digest,
+            queue_readiness_digest,
+        })
+    }
+
+    pub const fn startup_permit_digest(&self) -> RealmProcessorStartupPermitDigest {
+        self.startup_permit_digest
+    }
+    pub const fn network(&self) -> NetworkId { self.network }
+    pub const fn realm_id(&self) -> u32 { self.realm_id }
+    pub const fn realm_sub_id(&self) -> u16 { self.realm_sub_id }
+    pub const fn writer_activation_digest(&self) -> &[u8; 32] {
+        &self.writer_activation_digest
+    }
+    pub const fn queue_readiness_digest(&self) -> &[u8; 32] {
+        &self.queue_readiness_digest
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RealmProcessorQueueCloseObservation {
+    processing: PendingGenerationContext,
+    pipeline_revision: PendingPipelineRevision,
+    close_intent: PendingQueueCloseIntentDigest,
+}
+
+impl RealmProcessorQueueCloseObservation {
+    pub fn try_from_storage(
+        processing: PendingGenerationContext,
+        pipeline_revision: PendingPipelineRevision,
+        close_intent: PendingQueueCloseIntentDigest,
+    ) -> Result<Self, RealmProcessorFullCommitSourceError> {
+        if processing.pending_id().get() == 0 {
+            return Err(RealmProcessorFullCommitSourceError::IdentityMismatch);
+        }
+        Ok(Self {
+            processing,
+            pipeline_revision,
+            close_intent,
+        })
+    }
+
+    pub const fn processing(&self) -> PendingGenerationContext { self.processing }
+    pub const fn pipeline_revision(&self) -> PendingPipelineRevision {
+        self.pipeline_revision
+    }
+    pub const fn close_intent(&self) -> PendingQueueCloseIntentDigest {
+        self.close_intent
+    }
+}
+
 impl SealedRealmProcessorFullCommitPublicationRequest {
     pub(crate) fn seal(
         startup_permit_digest: RealmProcessorStartupPermitDigest,
@@ -624,6 +708,11 @@ pub trait RealmProcessorFullCommitSourceFactory<Hash>: Send + Sync {
         &self,
         request: SealedRealmProcessorGenerationRotationRequest,
     ) -> Result<RealmProcessorGenerationRotationOutcome, RealmProcessorFullCommitSourceError>;
+
+    async fn begin_queue_close(
+        &self,
+        request: SealedRealmProcessorQueueCloseRequest,
+    ) -> Result<RealmProcessorQueueCloseObservation, RealmProcessorFullCommitSourceError>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

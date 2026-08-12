@@ -64,9 +64,11 @@ use psy_node_core::queue::{
         RealmProcessorFullCommitPublicationObservation,
         RealmProcessorFullCommitSourceObservation,
         RealmProcessorGenerationRotationOutcome,
+        RealmProcessorQueueCloseObservation,
         SealedRealmProcessorFullCommitPublicationRequest,
         SealedRealmProcessorFullCommitSourceRequest,
         SealedRealmProcessorGenerationRotationRequest,
+        SealedRealmProcessorQueueCloseRequest,
     },
     realm_user_update_publish::GlobalUserTreeHeight,
 };
@@ -879,6 +881,19 @@ where
             )
         })?;
         factory.terminalize_and_rotate_generation(request).await
+    }
+
+    async fn begin_queue_close(
+        &self,
+        request: SealedRealmProcessorQueueCloseRequest,
+    ) -> Result<RealmProcessorQueueCloseObservation, RealmProcessorFullCommitSourceError>
+    {
+        let factory = self.capture_factory.as_ref().ok_or_else(|| {
+            RealmProcessorFullCommitSourceError::Backend(
+                "Realm Processor durable capture factory is missing".to_owned(),
+            )
+        })?;
+        factory.begin_ready_generation_queue_close(request).await
     }
 }
 

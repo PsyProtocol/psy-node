@@ -75,9 +75,11 @@ use psy_node_core::{
             RealmProcessorFullCommitSourceObservation,
             RealmProcessorGenerationRotationObservation,
             RealmProcessorGenerationRotationOutcome,
+            RealmProcessorQueueCloseObservation,
             SealedRealmProcessorFullCommitPublicationRequest,
             SealedRealmProcessorFullCommitSourceRequest,
             SealedRealmProcessorGenerationRotationRequest,
+            SealedRealmProcessorQueueCloseRequest,
         },
         recoverable_artifact::{
             PendingQueueArtifactOwnerAttemptId,
@@ -176,6 +178,7 @@ async fn qualification_pause_after_snapshot_a_if_armed() {
 }
 
 use super::{
+    BranchExactWriterAuthorityKey, BranchExactWriterReadState,
     BranchExactWriterState, ScyllaAuthorityLocalHeadStore,
     ScyllaBranchExactWriterRuntime,
     PendingQueueArtifactStoreError, PendingQueueSidecarReady,
@@ -187,6 +190,7 @@ use super::authority_local_head_prototype::AuthorityLocalHeadNoTabletKeyspace;
 use super::branch_exact_writer_lifecycle_store::ScyllaBranchExactWriterLifecycleStore;
 use super::branch_exact_pending_orchestration::{
     seal_branch_exact_begin, seal_branch_exact_publish,
+    seal_branch_exact_queue_close, PendingQueueClosePlan,
 };
 use super::pending_queue_consumer_gate::{
     PendingQueueConsumerGateError, PendingQueueConsumerGateIdentity,
@@ -252,6 +256,7 @@ pub(crate) struct ScyllaRealmProcessorDurableCaptureFactory<Hash> {
     generation_terminal: Arc<ScyllaRealmProcessorGenerationTerminalStore>,
     deferred_carryover: Arc<ScyllaRealmProcessorDeferredCarryoverStore>,
     terminal_authorizer: Arc<dyn RealmProcessorTerminalAuthorizationProvider<Hash>>,
+    writer_lifecycle: Arc<ScyllaBranchExactWriterLifecycleStore>,
     pending_counter: Arc<PendingCounterAdapter>,
     full_commit_session: Arc<Session>,
     full_commit_executor: Arc<RealmFullCommitScyllaExecutor>,
@@ -367,7 +372,7 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
                 .await
                 .map_err(backend)?,
         );
-        let terminal_writer = Arc::new(
+        let writer_lifecycle = Arc::new(
             ScyllaBranchExactWriterLifecycleStore::prepare(
                 session.clone(),
                 control.clone(),
@@ -397,7 +402,7 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
                     nats.base_namespace(),
                     ledger.clone(),
                     pipeline.clone(),
-                    terminal_writer,
+                    writer_lifecycle.clone(),
                     terminal_head,
                 )
                 .map_err(backend)?,
@@ -445,6 +450,7 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
             generation_terminal,
             deferred_carryover,
             terminal_authorizer,
+            writer_lifecycle,
             pending_counter,
             full_commit_session: session,
             full_commit_executor,
@@ -1381,6 +1387,117 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
                 carryover.digest(),
             )?,
         ))
+    }
+
+    /// Persist the close intent for the exact Ready generation selected from
+    /// durable storage. Writer and pipeline are bracketed before the CAS, and
+    /// the applied candidate is read back as CaptureClosedSource.
+    pub(super) async fn begin_ready_generation_queue_close(
+        &self,
+        request: SealedRealmProcessorQueueCloseRequest,
+    ) -> Result<RealmProcessorQueueCloseObservation, RealmProcessorFullCommitSourceError>
+    {
+        let AuthorityScope::Realm {
+            realm_id,
+            realm_sub_id,
+        } = self.authority
+        else {
+            return Err(RealmProcessorFullCommitSourceError::IdentityMismatch);
+        };
+        if request.network() != self.network
+            || request.realm_id() != realm_id
+            || request.realm_sub_id() != realm_sub_id
+            || request.writer_activation_digest() != &self.writer_activation_digest
+            || request.queue_readiness_digest() != &self.queue_readiness_digest
+        {
+            return Err(RealmProcessorFullCommitSourceError::IdentityMismatch);
+        }
+
+        let first = self
+            .observe_generation_continuation_exact()
+            .await
+            .map_err(full_source_capture)?;
+        if first.continuation.phase()
+            != RealmProcessorGenerationContinuationPhase::AwaitQueueClose
+            || first.pipeline.processing_state() != PendingProcessingState::Ready
+        {
+            return Err(RealmProcessorFullCommitSourceError::IdentityMismatch);
+        }
+        let BranchExactWriterReadState::Current(first_writer) = self
+            .writer_lifecycle
+            .read::<Hash>(BranchExactWriterAuthorityKey::new(
+                self.network,
+                self.authority,
+            ))
+            .await
+            .map_err(full_source_backend)?
+        else {
+            return Err(RealmProcessorFullCommitSourceError::IdentityMismatch);
+        };
+        let plan = PendingQueueClosePlan::from_storage_selected(&first.pipeline)
+            .map_err(full_source_backend)?;
+        let transition = seal_branch_exact_queue_close(
+            &first.pipeline,
+            &first_writer,
+            plan,
+        )
+        .map_err(full_source_backend)?;
+
+        let second = self
+            .observe_generation_continuation_exact()
+            .await
+            .map_err(full_source_capture)?;
+        let BranchExactWriterReadState::Current(second_writer) = self
+            .writer_lifecycle
+            .read::<Hash>(BranchExactWriterAuthorityKey::new(
+                self.network,
+                self.authority,
+            ))
+            .await
+            .map_err(full_source_backend)?
+        else {
+            return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
+        };
+        if !same_pipeline_snapshot(&first.pipeline, &second.pipeline)
+            || first_writer != second_writer
+        {
+            return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
+        }
+
+        let current = match self
+            .pipeline
+            .apply(&transition)
+            .await
+            .map_err(full_source_backend)?
+        {
+            PendingPipelineWriteOutcome::Applied(current)
+            | PendingPipelineWriteOutcome::Idempotent(current) => current,
+            PendingPipelineWriteOutcome::Conflict(_) => {
+                return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation)
+            }
+        };
+        if current != *transition.candidate()
+            || current.processing() != first.pipeline.processing()
+            || current.processing_state() != PendingProcessingState::Sealing(plan.digest())
+        {
+            return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
+        }
+        let after = self
+            .observe_generation_continuation_exact()
+            .await
+            .map_err(full_source_capture)?;
+        if after.continuation.phase()
+            != RealmProcessorGenerationContinuationPhase::CaptureClosedSource
+            || !same_pipeline_snapshot(&current, &after.pipeline)
+        {
+            return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
+        }
+
+        RealmProcessorQueueCloseObservation::try_from_storage(
+            current.processing(),
+            current.revision(),
+            plan.digest(),
+        )
     }
 
     fn validate_generation_request(
@@ -3933,6 +4050,42 @@ mod tests {
         assert!(method.contains("PendingPipelineWriteOutcome::Idempotent"));
         assert!(!method.contains("qualification_persist"));
         assert!(!method.contains("ReservedPendingGeneration::qualification"));
+    }
+
+    #[test]
+    fn production_queue_close_brackets_pipeline_and_writer_before_cas() {
+        let source = include_str!("realm_processor_durable_capture.rs");
+        let method = source
+            .split("pub(super) async fn begin_ready_generation_queue_close")
+            .nth(1)
+            .unwrap()
+            .split("fn validate_generation_request")
+            .next()
+            .unwrap();
+
+        let first = method.find("observe_generation_continuation_exact").unwrap();
+        let first_writer = method.find("BranchExactWriterReadState::Current(first_writer)").unwrap();
+        let plan = method.find("PendingQueueClosePlan::from_storage_selected").unwrap();
+        let seal = method.find("seal_branch_exact_queue_close").unwrap();
+        let second = method[first + 1..]
+            .find("observe_generation_continuation_exact")
+            .map(|offset| first + 1 + offset)
+            .unwrap();
+        let second_writer = method.find("BranchExactWriterReadState::Current(second_writer)").unwrap();
+        let apply = method.find(".apply(&transition)").unwrap();
+        let after = method.rfind("observe_generation_continuation_exact").unwrap();
+
+        assert!(first < first_writer && first_writer < plan && plan < seal);
+        assert!(seal < second && second < second_writer && second_writer < apply);
+        assert!(apply < after);
+        assert!(method.contains("first_writer != second_writer"));
+        assert!(method.contains("same_pipeline_snapshot(&first.pipeline, &second.pipeline)"));
+        assert!(method.contains("PendingProcessingState::Ready"));
+        assert!(method.contains("PendingProcessingState::Sealing(plan.digest())"));
+        assert!(method.contains("RealmProcessorGenerationContinuationPhase::CaptureClosedSource"));
+        for forbidden in ["model(", "qualification_", "NatsJetStreamClient"] {
+            assert!(!method.contains(forbidden));
+        }
     }
 
     #[test]
