@@ -7066,6 +7066,7 @@ dependencies = [
  "psy_node_common",
  "psy_node_core",
  "psy_node_nats",
+ "psy_node_redis",
  "psy_node_store_memory",
  "psy_serialize",
  "psy_worker_core",

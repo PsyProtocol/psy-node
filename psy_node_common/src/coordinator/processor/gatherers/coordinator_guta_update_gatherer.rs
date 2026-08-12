@@ -10,7 +10,10 @@ use parth_common::memory_stores::{
 };
 use parth_core::{
     crypto::hash::traits::{MerkleZeroHasher, QFieldHashable},
-    data::hash::merkle_node_key::{SimpleMerkleNode, PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE, PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE_KEY},
+    data::{
+        hash::merkle_node_key::{SimpleMerkleNode, PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE, PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE_KEY},
+        queue::queue_key::PCoreQueueItemBase,
+    },
     felt::{FromPrimitiveValuesFelt, QFelt64, ToU64Value, ZeroableFelt},
     node::realm_identifier::QRealmIdentifier,
     protocol::core_types::{Q256BitHash, QDBHashBase, QFHashBase, QNetworkTypesConfig},
@@ -27,7 +30,7 @@ use psy_node_core::{
     psy_temp_db::StandardProcessorTempDBStoreBase,
     qblob::data_views::zero_merkle_node_batch::create_ffs_merkle_nodes_zero_id_from_hash_map,
     queue::coordinator_guta_durable_submission::{
-        CoordinatorGutaDurableSubmissionSlot, CoordinatorGutaDurableSubmissionStore,
+        CoordinatorGutaDurableSubmissionStore, CoordinatorGutaQueueItem,
     },
     store::traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore},
 };
@@ -65,44 +68,25 @@ async fn decode_and_rehydrate_durable_submission<
 ) -> anyhow::Result<(
     GlobalUserTreeAggregatorHeaderWithTagValueAndJobID<N::F, N::QHash>,
     psy_data::protocol::chain_context::PendingContext<N::QHash>,
+    Vec<u8>,
+    bool,
 )> {
-    if item.len()
-        != GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<N::F, N::QHash>::FIXED_SIZE
-    {
-        anyhow::bail!(
-            "Invalid queue item size for CoordinatorGUTAUpdateGatherer: expected {}, got {}",
-            GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<N::F, N::QHash>::FIXED_SIZE,
-            item.len(),
-        );
-    }
-    let update_header =
-        GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<N::F, N::QHash>::
-            psy_ser_from_slice(item)?;
-    let pending_context = temp_db
-        .require_pending_context_for_pending_id(
-            realm_identifier,
-            expected_unique_pending_id,
-        )
-        .await?;
-    if pending_context.proc_checkpoint_unique_id().as_u128()
-        != expected_proc_checkpoint_id
-    {
-        anyhow::bail!(
-            "Coordinator GUTA queue proc ID does not match exact pending context"
-        );
-    }
+    let queue_item = CoordinatorGutaQueueItem::<N::F, N::QHash>::decode_queue_item_ref(item)?;
+    let update_header = queue_item.item().clone();
+    let canonical_queue_item = update_header.psy_ser_to_bytes_vec()?;
 
-    if let Some(store) = durable_guta_submissions {
+    let pending_context = if let Some(store) = durable_guta_submissions {
+        let (slot, record_digest) = queue_item.durable_pointer().ok_or_else(|| {
+            anyhow::anyhow!(
+                "legacy Coordinator GUTA queue item cannot authorize durable recovery"
+            )
+        })?;
         let submitted_realm_id = update_header
             .header
             .header
             .state_transition
             .node_index
             .to_u64_value();
-        let slot = CoordinatorGutaDurableSubmissionSlot::for_submission(
-            &pending_context,
-            submitted_realm_id,
-        )?;
         let durable = store
             .read_selected(slot)
             .await?
@@ -110,13 +94,44 @@ async fn decode_and_rehydrate_durable_submission<
                 "durable Coordinator GUTA submission is missing for realm {}",
                 submitted_realm_id,
             ))?;
-        if durable.pending() != &pending_context || durable.queue_item() != item {
+        if durable.record_digest() != record_digest
+            || durable.submitted_realm_id() != submitted_realm_id
+            || durable.queue_item() != canonical_queue_item.as_slice()
+            || durable.pending().chain().network_id() != store.network()
+            || durable.pending().authority()
+                != psy_data::protocol::chain_context::AuthorityScope::Coordinator
+            || durable.pending().unique_pending_id().get() != expected_unique_pending_id
+            || durable.pending().proc_checkpoint_unique_id().as_u128()
+                != expected_proc_checkpoint_id
+        {
             anyhow::bail!(
-                "durable Coordinator GUTA submission does not match queue item"
+                "durable Coordinator GUTA submission does not match queue pointer or processing generation"
             );
         }
+        match temp_db.get_current_pending_context(realm_identifier).await? {
+            Some(current) if current != *durable.pending() => {
+                anyhow::bail!(
+                    "Coordinator pending-context projection conflicts with durable submission"
+                );
+            }
+            Some(_) => {}
+            None => {
+                temp_db
+                    .set_current_pending_context(realm_identifier, durable.pending())
+                    .await?;
+            }
+        }
+        if temp_db.get_current_pending_context(realm_identifier).await?
+            != Some(*durable.pending())
+        {
+            anyhow::bail!("Coordinator pending-context projection readback mismatch");
+        }
         let proof_address = proof_store
-            .resolve_proof_address(&pending_context, &update_header.job_id)?;
+            .resolve_proof_address(durable.pending(), &update_header.job_id)?;
+        let proof_was_missing = proof_store
+            .get_proof_bytes_exact(&proof_address)
+            .await?
+            .is_none();
         match proof_store.get_proof_bytes_exact(&proof_address).await? {
             Some(current) if current.as_slice() != durable.proof_bytes() => {
                 anyhow::bail!(
@@ -138,14 +153,40 @@ async fn decode_and_rehydrate_durable_submission<
         {
             anyhow::bail!("Coordinator GUTA proof projection readback mismatch");
         }
-        if store.read_selected(slot).await? != Some(durable) {
+        if store.read_selected(slot).await? != Some(durable.clone()) {
             anyhow::bail!(
                 "durable Coordinator GUTA submission changed during recovery"
             );
         }
-    }
+        return Ok((
+            update_header,
+            *durable.pending(),
+            canonical_queue_item,
+            proof_was_missing,
+        ));
+    } else {
+        if queue_item.durable_pointer().is_some() {
+            anyhow::bail!(
+                "durable Coordinator GUTA queue item requires an installed durable store"
+            );
+        }
+        let pending_context = temp_db
+            .require_pending_context_for_pending_id(
+                realm_identifier,
+                expected_unique_pending_id,
+            )
+            .await?;
+        if pending_context.proc_checkpoint_unique_id().as_u128()
+            != expected_proc_checkpoint_id
+        {
+            anyhow::bail!(
+                "Coordinator GUTA queue proc ID does not match exact pending context"
+            );
+        }
+        pending_context
+    };
 
-    Ok((update_header, pending_context))
+    Ok((update_header, pending_context, canonical_queue_item, false))
 }
 
 #[cfg(feature = "rf3-test-support")]
@@ -173,22 +214,8 @@ pub async fn qualification_recover_coordinator_guta_queue_item<
     expected_proc_checkpoint_id: QCoreProcCheckpointUniqueId,
     item: Vec<u8>,
 ) -> anyhow::Result<QualificationCoordinatorGutaRecoveryTrace> {
-    let decoded =
-        GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<N::F, N::QHash>::
-            psy_ser_from_slice(&item)?;
-    let pending_context = temp_db
-        .require_pending_context_for_pending_id(
-            &realm_identifier,
-            expected_unique_pending_id,
-        )
-        .await?;
-    let proof_address = proof_store
-        .resolve_proof_address(&pending_context, &decoded.job_id)?;
-    let proof_was_missing = proof_store
-        .get_proof_bytes_exact(&proof_address)
-        .await?
-        .is_none();
-    let (decoded, _) = decode_and_rehydrate_durable_submission::<N, _, _>(
+    let (decoded, pending_context, _, proof_was_missing) =
+        decode_and_rehydrate_durable_submission::<N, _, _>(
         Some(&store),
         temp_db.as_ref(),
         proof_store.as_ref(),
@@ -198,6 +225,8 @@ pub async fn qualification_recover_coordinator_guta_queue_item<
         &item,
     )
     .await?;
+    let proof_address = proof_store
+        .resolve_proof_address(&pending_context, &decoded.job_id)?;
     Ok(QualificationCoordinatorGutaRecoveryTrace {
         submitted_realm_id: decoded
             .header
@@ -510,7 +539,7 @@ impl<
             realm_id: self.config.realm_id_u64 as u32,
             realm_sub_id: self.config.realm_sub_id_u64 as u16,
         };
-        let (update_header, pending_context) =
+        let (update_header, pending_context, canonical_queue_item, _) =
             decode_and_rehydrate_durable_submission::<N, _, _>(
                 self.config.durable_guta_submissions.as_ref(),
                 self.config.temp_db.as_ref(),
@@ -528,7 +557,7 @@ impl<
             .node_index
             .to_u64_value();
         if let Some(selected) = self.selected_realm_updates.get(&submitted_realm_id) {
-            if selected.as_slice() == item.as_slice() {
+            if selected.as_slice() == canonical_queue_item.as_slice() {
                 return Ok(());
             }
             anyhow::bail!(
@@ -552,7 +581,9 @@ impl<
                 update_header.header.new_tag_tree_node_value,
             )
             .await?;
-        self.new_coordinator_guta_file.write_all(&item).await?;
+        self.new_coordinator_guta_file
+            .write_all(&canonical_queue_item)
+            .await?;
         self.guta_stats.add_from_mut(&update_header.header.header.stats);
         self.total_guta_proofs_generated += update_header.header.header.total_aggregation_proofs_generated;
         self.old_realm_roots.push((
@@ -570,7 +601,7 @@ impl<
             )
             .await?;
         self.selected_realm_updates
-            .insert(submitted_realm_id, item);
+            .insert(submitted_realm_id, canonical_queue_item);
         self.total_guta_inputs += 1;
         Ok(())
     }
@@ -781,11 +812,11 @@ mod tests {
             .expect("next gatherer method must exist");
         let body = &source[start..end];
 
-        let pending = helper
-            .find("require_pending_context_for_pending_id")
-            .expect("durable selection needs exact pending context");
+        let pointer = helper
+            .find("durable_pointer")
+            .expect("durable selection needs a queue-carried pointer");
         let proc = helper
-            .rfind("expected_proc_checkpoint_id")
+            .find("durable.pending().proc_checkpoint_unique_id")
             .expect("durable selection needs exact proc identity");
         let first_durable_read = helper
             .find("read_selected")
@@ -799,6 +830,9 @@ mod tests {
         let second_durable_read = helper
             .rfind("read_selected")
             .expect("durable record must be revalidated after projection");
+        let pending_projection = helper
+            .find("set_current_pending_context")
+            .expect("missing Redis pending context must be reconstructed exactly");
         let recovery = body
             .find("decode_and_rehydrate_durable_submission")
             .expect("production gatherer must invoke durable recovery helper");
@@ -806,15 +840,16 @@ mod tests {
             .find("set_proof_miner_rewards_tree_value")
             .expect("gatherer reward mutation must remain explicit");
         let backup = body
-            .find("new_coordinator_guta_file.write_all")
+            .find("write_all(&canonical_queue_item)")
             .expect("gatherer backup mutation must remain explicit");
         let planner = body
             .find("add_realm_job")
             .expect("planner mutation must remain explicit");
 
-        assert!(pending < proc);
-        assert!(proc < first_durable_read);
-        assert!(first_durable_read < proof_write);
+        assert!(pointer < first_durable_read);
+        assert!(first_durable_read < proc);
+        assert!(proc < pending_projection);
+        assert!(pending_projection < proof_write);
         assert!(proof_write < proof_readback);
         assert!(proof_readback < second_durable_read);
         for mutation in [rewards, backup, planner] {

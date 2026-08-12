@@ -34,7 +34,7 @@ use psy_node_core::{
     },
     queue::{
         coordinator_guta_durable_submission::{
-            CoordinatorGutaDurableSubmission,
+            CoordinatorGutaDurableSubmission, CoordinatorGutaQueueItem,
             CoordinatorGutaDurableSubmissionStore,
         },
         ephemeral::QStandardEphemeralQueuePublisher,
@@ -595,7 +595,7 @@ impl<
         }
     }
 
-    /// Install the Coordinator-scoped v15 durable selection store. Legacy
+    /// Install the Coordinator-scoped v16 durable selection store. Legacy
     /// construction remains default-off; an installed store is the authority
     /// and Redis becomes only an exactly reconstructed proof projection.
     pub fn install_durable_guta_submissions(
@@ -1243,6 +1243,10 @@ impl<
             task_group: 0,
             queue_type: QPBaseQueueType::StandardEphemeral,
             _phantom_queue_item: std::marker::PhantomData,
+        };
+        let queue_item = match durable_submission.as_ref() {
+            Some(submission) => CoordinatorGutaQueueItem::durable(submission, queue_item)?,
+            None => CoordinatorGutaQueueItem::legacy(queue_item),
         };
 
         self.guta_update_queue

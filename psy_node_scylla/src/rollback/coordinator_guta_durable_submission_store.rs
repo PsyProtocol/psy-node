@@ -107,16 +107,19 @@ impl ScyllaCoordinatorGutaDurableSubmissionStore {
             return Err(CoordinatorGutaDurableSubmissionStoreError::UnknownRevision);
         }
         let payload = payload.ok_or(CoordinatorGutaDurableSubmissionStoreError::MissingColumn)?;
-        Ok(Some(CoordinatorGutaDurableSubmission::decode_selected(
+        let submission = CoordinatorGutaDurableSubmission::decode_selected(
             slot,
             &payload,
-        )?))
+        )?;
+        self.validate_identity(&submission)?;
+        Ok(Some(submission))
     }
 
     async fn persist<Hash: Q256BitHash>(
         &self,
         submission: CoordinatorGutaDurableSubmission<Hash>,
     ) -> Result<CoordinatorGutaDurableSubmission<Hash>, CoordinatorGutaDurableSubmissionStoreError> {
+        self.validate_identity(&submission)?;
         let payload = submission.to_canonical_bytes();
         let execution = self
             .session
@@ -157,6 +160,18 @@ impl ScyllaCoordinatorGutaDurableSubmissionStore {
             });
         }
         Ok(current)
+    }
+
+    fn validate_identity<Hash: Q256BitHash>(
+        &self,
+        submission: &CoordinatorGutaDurableSubmission<Hash>,
+    ) -> Result<(), CoordinatorGutaDurableSubmissionStoreError> {
+        if submission.pending().chain().network_id() != self.network
+            || submission.pending().authority() != AuthorityScope::Coordinator
+        {
+            return Err(CoordinatorGutaDurableSubmissionStoreError::IdentityMismatch);
+        }
+        Ok(())
     }
 }
 
@@ -243,6 +258,7 @@ pub(crate) enum CoordinatorGutaDurableSubmissionStoreError {
     InvalidAppliedColumn,
     MissingAfterLwt,
     AppliedStateMismatch,
+    IdentityMismatch,
     Conflict,
     Indeterminate(String),
 }

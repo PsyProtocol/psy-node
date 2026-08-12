@@ -680,7 +680,7 @@ impl Error for PendingQueueSidecarLifecycleError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::pending_queue_sidecar_schema::historical_v14_schema_fingerprint;
+    use super::super::pending_queue_sidecar_schema::historical_v15_schema_fingerprint;
 
     fn keyspaces() -> PendingQueueSidecarKeyspaces { PendingQueueSidecarKeyspaces::try_new("psy_data", "psy_data_no_tablet").unwrap() }
 
@@ -691,9 +691,9 @@ mod tests {
         assert_eq!(first, second);
         let bytes = first.to_canonical_bytes();
         assert_eq!(StoredPendingQueueSidecarDeployment::decode_selected(first.slot, 1, &bytes).unwrap(), first);
-        let mut old_v14 = bytes.clone();
-        old_v14[19..21].copy_from_slice(&14_u16.to_be_bytes());
-        assert_eq!(StoredPendingQueueSidecarDeployment::decode_selected(first.slot, 1, &old_v14), Err(PendingQueueSidecarLifecycleError::UnknownSchemaVersion));
+        let mut old_v15 = bytes.clone();
+        old_v15[19..21].copy_from_slice(&15_u16.to_be_bytes());
+        assert_eq!(StoredPendingQueueSidecarDeployment::decode_selected(first.slot, 1, &old_v15), Err(PendingQueueSidecarLifecycleError::UnknownSchemaVersion));
         let mut tampered = bytes.clone(); tampered[20] ^= 1;
         assert!(StoredPendingQueueSidecarDeployment::decode_selected(first.slot, 1, &tampered).is_err());
         let mut trailing = bytes; trailing.push(0);
@@ -701,17 +701,17 @@ mod tests {
     }
 
     #[test]
-    fn schema_upgrade_slot_differs_from_the_exact_v14_identity() {
+    fn schema_upgrade_slot_differs_from_the_exact_v15_identity() {
         let keyspaces = keyspaces();
         let mut old = Sha256::new();
         old.update(b"psy/rollback/pending-queue-sidecar-slot/v2");
-        old.update(14_u16.to_be_bytes());
-        old.update(historical_v14_schema_fingerprint().as_bytes());
+        old.update(15_u16.to_be_bytes());
+        old.update(historical_v15_schema_fingerprint().as_bytes());
         update_len(&mut old, keyspaces.data().as_str().as_bytes());
         update_len(&mut old, keyspaces.control().as_str().as_bytes());
-        let old_v14_slot: [u8; 32] = old.finalize().into();
+        let old_v15_slot: [u8; 32] = old.finalize().into();
         let current = PendingQueueSidecarDeploymentSlot::for_keyspaces(&keyspaces);
-        assert_ne!(current.as_bytes(), &old_v14_slot);
+        assert_ne!(current.as_bytes(), &old_v15_slot);
 
         let materializing = StoredPendingQueueSidecarDeployment::materializing(keyspaces);
         assert_eq!(materializing.slot(), current);

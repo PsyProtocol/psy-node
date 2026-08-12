@@ -1,13 +1,14 @@
 use parth_core::protocol::core_types::QNetworkTypesConfig;
-use psy_data::{
-    guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobID,
-    v1::qdata::{contract::PsyDeployContractQueueItem, public_key::PZKPublicKeyInfo},
-};
+use psy_data::v1::qdata::{contract::PsyDeployContractQueueItem, public_key::PZKPublicKeyInfo};
 use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
     psy_core_db::traits::full::{PsyCoordinatorProcessorStore, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter},
     psy_temp_db::StandardProcessorTempDBStoreBase,
-    queue::{ephemeral::QStandardEphemeralQueueSubscriber, worker_queue::QStandardWorkerQueuePublisher},
+    queue::{
+        coordinator_guta_durable_submission::CoordinatorGutaQueueItem,
+        ephemeral::QStandardEphemeralQueueSubscriber,
+        worker_queue::QStandardWorkerQueuePublisher,
+    },
     store::traits::proof_store::QParthProofStore,
 };
 
@@ -60,7 +61,7 @@ pub struct PsyCoordinatorProcessor<
 
     pub guta_queue_gatherer: EphemeralQueueGathererWithTree<
         PQ_COORDINATOR_SUBMIT_REALM_GUTA_UPDATE_QUEUE_TOPIC_ID,
-        GlobalUserTreeAggregatorHeaderWithTagValueAndJobID<N::F, N::QHash>,
+        CoordinatorGutaQueueItem<N::F, N::QHash>,
         CoordinatorGUTAUpdateGathererOutput<N::F, N::QHash, N::JobId>,
     >,
     pub register_user_queue_gatherer: EphemeralQueueGathererWithTree<

@@ -14,9 +14,16 @@ EXERCISE_DEFERRED_ACTOR_ARCHIVE="${PSY_D04B6H23C4C4B4C2_RF3:-0}"
 EXERCISE_PROOF_NARROW_WRITER="${PSY_D04B6H23C4D2_RF3:-0}"
 EXERCISE_PROOF_WORKER_QUEUE="${PSY_D04B6H23C4D3A_RF3:-0}"
 EXERCISE_COORDINATOR_RPC="${PSY_D04B6H23C4D3B1_RF3:-0}"
-EXERCISE_COORDINATOR_HANDLER="${PSY_D04B6H23C4D3B2B2B1_RF3:-0}"
+EXERCISE_COORDINATOR_HANDLER_PREFIX="${PSY_D04B6H23C4D3B2B2B1_RF3:-0}"
+EXERCISE_COORDINATOR_REDIS_RESTART="${PSY_D04B6H23C4D3B2B2B2_RF3:-0}"
+EXERCISE_COORDINATOR_HANDLER="${EXERCISE_COORDINATOR_HANDLER_PREFIX}"
+if [[ "${EXERCISE_COORDINATOR_REDIS_RESTART}" == "1" ]]; then
+  EXERCISE_COORDINATOR_HANDLER=1
+fi
 EXPECTED_QUALIFICATION="H23C4C2B4E3_JTMB_HANDLER_INGRESS_RF3_PASSED"
-if [[ "${EXERCISE_COORDINATOR_HANDLER}" == "1" ]]; then
+if [[ "${EXERCISE_COORDINATOR_REDIS_RESTART}" == "1" ]]; then
+  EXPECTED_QUALIFICATION="H23C4D3B2B2B2_COORDINATOR_REDIS_RESTART_RF3_PASSED"
+elif [[ "${EXERCISE_COORDINATOR_HANDLER}" == "1" ]]; then
   EXPECTED_QUALIFICATION="H23C4D3B2B2B1_COORDINATOR_HANDLER_RECOVERY_PREFIX_RF3_PASSED"
 elif [[ "${EXERCISE_COORDINATOR_RPC}" == "1" ]]; then
   EXPECTED_QUALIFICATION="H23C4D3B1_REALM_COORDINATOR_RPC_RECOVERY_RF3_PASSED"
@@ -132,7 +139,8 @@ PSY_D04B6H23C4C4B4C2_RF3="${EXERCISE_DEFERRED_ACTOR_ARCHIVE}" \
 PSY_D04B6H23C4D2_RF3="${EXERCISE_PROOF_NARROW_WRITER}" \
 PSY_D04B6H23C4D3A_RF3="${EXERCISE_PROOF_WORKER_QUEUE}" \
 PSY_D04B6H23C4D3B1_RF3="${EXERCISE_COORDINATOR_RPC}" \
-PSY_D04B6H23C4D3B2B2B1_RF3="${EXERCISE_COORDINATOR_HANDLER}" \
+PSY_D04B6H23C4D3B2B2B1_RF3="${EXERCISE_COORDINATOR_HANDLER_PREFIX}" \
+PSY_D04B6H23C4D3B2B2B2_RF3="${EXERCISE_COORDINATOR_REDIS_RESTART}" \
 PSY_D04B6H23C4C2B4E3_COMPOSE_FILE="${COMPOSE_FILE}" \
 PSY_D04B6H23C4C2B4E3_REPORT_PATH="${REPORT_PATH}" \
 PSY_D04B6H23C4C2B4E3_NATS_URLS="nats://127.0.0.1:45322,nats://127.0.0.1:45323,nats://127.0.0.1:45324" \
@@ -155,7 +163,8 @@ jq -e \
   --argjson exercise_proof_narrow_writer "${EXERCISE_PROOF_NARROW_WRITER}" \
   --argjson exercise_proof_worker_queue "${EXERCISE_PROOF_WORKER_QUEUE}" \
   --argjson exercise_coordinator_rpc "${EXERCISE_COORDINATOR_RPC}" \
-  --argjson exercise_coordinator_handler "${EXERCISE_COORDINATOR_HANDLER}" '
+  --argjson exercise_coordinator_handler "${EXERCISE_COORDINATOR_HANDLER}" \
+  --argjson exercise_coordinator_redis_restart "${EXERCISE_COORDINATOR_REDIS_RESTART}" '
   .qualification == $expected_qualification
   and .scylla_replication_factor == 3
   and .configured_nats_servers == 3
@@ -259,7 +268,7 @@ jq -e \
           and .coordinator_processor_conflicting_projection_rejected == true
           and .coordinator_handler_during_one_replica_offline == true
           and .coordinator_handler_publish_after_leader_failover == true
-          and .coordinator_real_redis_process_restart == false
+          and .coordinator_real_redis_process_restart == ($exercise_coordinator_redis_restart == 1)
           and .mixed_version_clean_boundary_required == true
           and .mixed_version_overlap_supported == false
         else

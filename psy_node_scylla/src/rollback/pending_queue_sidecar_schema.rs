@@ -71,13 +71,13 @@ use super::{
 #[cfg(test)]
 use super::RETIRED_REALM_USER_UPDATE_CLAIM_V1_TABLE;
 
-// v15 adds the immutable Coordinator GUTA submission record. A v14 VERIFIED
-// lifecycle must not authorize a binary whose Coordinator recovery contract
-// requires this additional durable fact.
-pub const PENDING_QUEUE_SIDECAR_SCHEMA_VERSION: u16 = 15;
+// v16 keeps the v15 physical shape but requires Coordinator durable queue
+// pointers. A v15 VERIFIED lifecycle must not authorize a binary which emits
+// a transport format that an older Processor cannot decode.
+pub const PENDING_QUEUE_SIDECAR_SCHEMA_VERSION: u16 = 16;
 pub const PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT: usize = 21;
 const FINGERPRINT_DOMAIN: &[u8] =
-    b"psy/rollback/pending-queue-sidecar-schema/v15";
+    b"psy/rollback/pending-queue-sidecar-schema/v16";
 const INSPECT_COLUMNS_CQL: &str = "SELECT column_name, type, kind, position, clustering_order FROM system_schema.columns WHERE keyspace_name = ? AND table_name = ?";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -543,6 +543,24 @@ pub(super) fn historical_v14_schema_fingerprint() -> PendingQueueSidecarSchemaFi
     ])
 }
 
+#[cfg(test)]
+pub(super) fn historical_v15_schema_fingerprint() -> PendingQueueSidecarSchemaFingerprint {
+    PendingQueueSidecarSchemaFingerprint::from_persisted([
+        0x53, 0x5f, 0x0b, 0x35, 0x07, 0x83, 0x7c, 0xb1,
+        0x9b, 0x29, 0xa7, 0x2c, 0x57, 0x1f, 0xbf, 0x83,
+        0x01, 0xaa, 0x1f, 0xb7, 0xe8, 0xee, 0xb0, 0x1d,
+        0x3e, 0x1b, 0xb2, 0xc0, 0x2e, 0x9e, 0xef, 0x0a,
+    ])
+}
+
+#[cfg(test)]
+pub(super) fn current_physical_schema_matches_historical_v15() -> bool {
+    sidecar_schema_fingerprint(
+        15,
+        b"psy/rollback/pending-queue-sidecar-schema/v15",
+    ) == historical_v15_schema_fingerprint()
+}
+
 pub fn inspect_pending_queue_sidecar_columns(
     observed: Vec<ObservedPendingQueueSidecarColumn>,
     retired_v1_present: bool,
@@ -736,7 +754,7 @@ mod tests {
 
     #[test]
     fn exact_manifest_is_twenty_one_unique_tables_with_stable_placement() {
-        assert_eq!(PENDING_QUEUE_SIDECAR_SCHEMA_VERSION, 15);
+        assert_eq!(PENDING_QUEUE_SIDECAR_SCHEMA_VERSION, 16);
         assert_eq!(PendingQueueSidecarPhysicalTable::ALL.len(), 21);
         let names = PendingQueueSidecarPhysicalTable::ALL.iter().map(|table| table.table_name()).collect::<std::collections::BTreeSet<_>>();
         assert_eq!(names.len(), 21);
@@ -747,6 +765,7 @@ mod tests {
         assert_ne!(pending_queue_sidecar_schema_fingerprint().as_bytes(), &[0; 32]);
         assert!(!current_physical_schema_matches_historical_v12());
         assert!(!current_physical_schema_matches_historical_v13());
+        assert!(current_physical_schema_matches_historical_v15());
         assert_eq!(
             hex::encode(historical_v12_schema_fingerprint().as_bytes()),
             "466bf80f7e9f336a5191c2efdecf05129c96f6086f57c1afb14ce6cbe0aca7fb",
@@ -758,6 +777,10 @@ mod tests {
         assert_eq!(
             hex::encode(historical_v14_schema_fingerprint().as_bytes()),
             "24ad4930ef560860d82b45445b309d420b0eab2383318c26932ec49dab31b85d",
+        );
+        assert_eq!(
+            hex::encode(historical_v15_schema_fingerprint().as_bytes()),
+            "535f0b3507837cb19b29a72c571fbf8301aa1fb7e8eeb01d3e1bb2c02e9eef0a",
         );
     }
 

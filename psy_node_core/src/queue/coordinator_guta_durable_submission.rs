@@ -8,9 +8,17 @@
 use std::{error::Error, fmt};
 
 use async_trait::async_trait;
-use parth_core::protocol::core_types::Q256BitHash;
-use psy_data::protocol::chain_context::{AuthorityScope, PendingContext, PENDING_CONTEXT_V1_LEN};
+use parth_core::{
+    data::queue::queue_key::PCoreQueueItemBase,
+    felt::QFelt64,
+    protocol::core_types::Q256BitHash,
+};
+use psy_data::{
+    guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobID,
+    protocol::chain_context::{AuthorityScope, PendingContext, PENDING_CONTEXT_V1_LEN},
+};
 use psy_data::protocol::canonical_chain::NetworkId;
+use psy_serialize::{PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSerializeMetadata};
 use sha2::{Digest, Sha256};
 
 use crate::psy_temp_db::CoordinatorGutaSubmissionDigest;
@@ -19,6 +27,8 @@ const MAGIC: &[u8; 8] = b"PSYCGUTA";
 const CODEC_VERSION: u16 = 1;
 const SLOT_DOMAIN: &[u8] = b"psy/coordinator-guta-durable-submission-slot/v1";
 const RECORD_DOMAIN: &[u8] = b"psy/coordinator-guta-durable-submission-record/v1";
+const QUEUE_POINTER_MAGIC: &[u8; 8] = b"PSYCGQPT";
+const QUEUE_POINTER_CODEC_VERSION: u16 = 1;
 
 pub const MAX_COORDINATOR_GUTA_CANONICAL_INPUT_BYTES: usize = 64 * 1024;
 pub const MAX_COORDINATOR_GUTA_PROOF_BYTES: usize = 4 * 1024 * 1024;
@@ -75,6 +85,160 @@ impl CoordinatorGutaDurableRecordDigest {
 
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+}
+
+/// Queue transport for one Coordinator GUTA contribution.
+///
+/// Legacy payloads remain decodable so a disabled deployment can drain an old
+/// queue. A durable deployment must require the `Durable` variant: its slot
+/// and record digest let a restarted Processor select the immutable Scylla row
+/// without consulting Redis for the pending context first.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CoordinatorGutaQueueItem<F, Hash> {
+    Legacy(GlobalUserTreeAggregatorHeaderWithTagValueAndJobID<F, Hash>),
+    Durable {
+        slot: CoordinatorGutaDurableSubmissionSlot,
+        record_digest: CoordinatorGutaDurableRecordDigest,
+        item: GlobalUserTreeAggregatorHeaderWithTagValueAndJobID<F, Hash>,
+    },
+}
+
+impl<F: QFelt64, Hash: Q256BitHash> CoordinatorGutaQueueItem<F, Hash> {
+    pub const DURABLE_FIXED_SIZE: usize = 10
+        + 32
+        + 32
+        + GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<F, Hash>::FIXED_SIZE;
+
+    pub const fn legacy(
+        item: GlobalUserTreeAggregatorHeaderWithTagValueAndJobID<F, Hash>,
+    ) -> Self {
+        Self::Legacy(item)
+    }
+
+    pub fn durable(
+        submission: &CoordinatorGutaDurableSubmission<Hash>,
+        item: GlobalUserTreeAggregatorHeaderWithTagValueAndJobID<F, Hash>,
+    ) -> Result<Self, CoordinatorGutaDurableSubmissionError> {
+        let item_bytes = item
+            .psy_ser_to_bytes_vec()
+            .map_err(|error| CoordinatorGutaDurableSubmissionError::Codec(error.to_string()))?;
+        if submission.queue_item() != item_bytes.as_slice() {
+            return Err(CoordinatorGutaDurableSubmissionError::QueueItemMismatch);
+        }
+        if submission.submitted_realm_id()
+            != item
+                .header
+                .header
+                .state_transition
+                .node_index
+                .to_u64_value()
+        {
+            return Err(CoordinatorGutaDurableSubmissionError::RealmMismatch);
+        }
+        Ok(Self::Durable {
+            slot: submission.slot(),
+            record_digest: submission.record_digest(),
+            item,
+        })
+    }
+
+    pub const fn item(
+        &self,
+    ) -> &GlobalUserTreeAggregatorHeaderWithTagValueAndJobID<F, Hash> {
+        match self {
+            Self::Legacy(item) | Self::Durable { item, .. } => item,
+        }
+    }
+
+    pub const fn durable_pointer(
+        &self,
+    ) -> Option<(
+        CoordinatorGutaDurableSubmissionSlot,
+        CoordinatorGutaDurableRecordDigest,
+    )> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::Durable {
+                slot,
+                record_digest,
+                ..
+            } => Some((*slot, *record_digest)),
+        }
+    }
+}
+
+impl<F: QFelt64, Hash: Q256BitHash> PCoreQueueItemBase
+    for CoordinatorGutaQueueItem<F, Hash>
+{
+    fn is_queue_item(data: &[u8]) -> bool {
+        Self::decode_queue_item_ref(data).is_ok()
+    }
+
+    fn decode_queue_item_ref(data: &[u8]) -> anyhow::Result<Self> {
+        if data.len()
+            == GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<F, Hash>::FIXED_SIZE
+        {
+            return Ok(Self::Legacy(
+                GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<F, Hash>::
+                    psy_ser_from_slice(data)?,
+            ));
+        }
+        if data.len() != Self::DURABLE_FIXED_SIZE {
+            anyhow::bail!("invalid Coordinator GUTA queue item length {}", data.len());
+        }
+        if &data[..8] != QUEUE_POINTER_MAGIC {
+            anyhow::bail!("unknown Coordinator GUTA queue pointer magic");
+        }
+        if u16::from_be_bytes(data[8..10].try_into().expect("fixed slice"))
+            != QUEUE_POINTER_CODEC_VERSION
+        {
+            anyhow::bail!("unknown Coordinator GUTA queue pointer codec");
+        }
+        let slot = CoordinatorGutaDurableSubmissionSlot::try_from_bytes(
+            data[10..42].try_into().expect("fixed slice"),
+        )?;
+        let record_digest = CoordinatorGutaDurableRecordDigest::try_from_bytes(
+            data[42..74].try_into().expect("fixed slice"),
+        )?;
+        let item = GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<F, Hash>::
+            psy_ser_from_slice(&data[74..])?;
+        Ok(Self::Durable {
+            slot,
+            record_digest,
+            item,
+        })
+    }
+
+    fn encode_queue_item_vec(&self) -> anyhow::Result<Vec<u8>> {
+        match self {
+            Self::Legacy(item) => item.psy_ser_to_bytes_vec(),
+            Self::Durable {
+                slot,
+                record_digest,
+                item,
+            } => {
+                let mut out = Vec::with_capacity(Self::DURABLE_FIXED_SIZE);
+                out.extend_from_slice(QUEUE_POINTER_MAGIC);
+                out.extend_from_slice(&QUEUE_POINTER_CODEC_VERSION.to_be_bytes());
+                out.extend_from_slice(slot.as_bytes());
+                out.extend_from_slice(record_digest.as_bytes());
+                out.extend_from_slice(&item.psy_ser_to_bytes_vec()?);
+                Ok(out)
+            }
+        }
+    }
+
+    fn get_restorable_job_id(&self) -> Vec<u8> {
+        self.item().get_restorable_job_id()
+    }
+
+    fn get_size_hint() -> usize {
+        Self::DURABLE_FIXED_SIZE
+    }
+
+    fn has_fixed_size() -> bool {
+        false
     }
 }
 
@@ -346,6 +510,8 @@ pub enum CoordinatorGutaDurableSubmissionError {
     UnknownCodecVersion,
     SlotMismatch,
     DigestMismatch,
+    QueueItemMismatch,
+    RealmMismatch,
     Truncated,
     TrailingBytes,
     Codec(String),
@@ -361,10 +527,22 @@ impl Error for CoordinatorGutaDurableSubmissionError {}
 
 #[cfg(test)]
 mod tests {
-    use parth_core::PHash;
-    use psy_data::protocol::{
-        canonical_chain::{CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId, CheckpointRef, NetworkId},
-        chain_context::{AuthorityScope, PendingContext, WorkProcCheckpointUniqueId, WorkUniquePendingId},
+    use parth_core::{felt::FromPrimitiveValuesFelt, PHash, PF, QJobIdBase};
+    use psy_core::job::job_id::QProvingJobDataID;
+    use psy_data::{
+        guta::{
+            header::GlobalUserTreeAggregatorHeader,
+            header_extended::{
+                GlobalUserTreeAggregatorHeaderWithTagValue,
+                GlobalUserTreeAggregatorHeaderWithTagValueAndJobID,
+            },
+            stats::GUTAStats,
+            sub_tree_transition::SubTreeNodeStateTransition,
+        },
+        protocol::{
+            canonical_chain::{CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId, CheckpointRef, NetworkId},
+            chain_context::{AuthorityScope, PendingContext, WorkProcCheckpointUniqueId, WorkUniquePendingId},
+        },
     };
 
     use super::*;
@@ -380,6 +558,79 @@ mod tests {
             WorkUniquePendingId::new(pending),
             WorkProcCheckpointUniqueId::from_u128(99),
         )
+    }
+
+    fn queue_item(realm_id: u64) -> GlobalUserTreeAggregatorHeaderWithTagValueAndJobID<PF, PHash> {
+        GlobalUserTreeAggregatorHeaderWithTagValueAndJobID {
+            header: GlobalUserTreeAggregatorHeaderWithTagValue {
+                header: GlobalUserTreeAggregatorHeader {
+                    guta_circuit_whitelist: PHash::from_values(1, 2, 3, 4),
+                    checkpoint_tree_root: PHash::from_values(5, 6, 7, 8),
+                    state_transition: SubTreeNodeStateTransition {
+                        old_node_value: PHash::from_values(9, 10, 11, 12),
+                        new_node_value: PHash::from_values(13, 14, 15, 16),
+                        node_index: PF::from_u64_value(realm_id),
+                        node_level: PF::from_u64_value(8),
+                    },
+                    stats: GUTAStats {
+                        guta_fees_collected: PF::from_u64_value(1),
+                        da_fees_collected: PF::from_u64_value(2),
+                        user_ops_processed: PF::from_u64_value(3),
+                        total_transactions: PF::from_u64_value(4),
+                        slots_modified: PF::from_u64_value(5),
+                    },
+                    total_aggregation_proofs_generated: PF::from_u64_value(6),
+                },
+                new_tag_tree_node_value: PHash::from_values(17, 18, 19, 20),
+            },
+            job_id: QProvingJobDataID::new_invalid_job_id(),
+        }
+    }
+
+    #[test]
+    fn durable_queue_pointer_roundtrip_binds_record_and_preserves_legacy_decode() {
+        let item = queue_item(3);
+        let item_bytes = item.psy_ser_to_bytes_vec().unwrap();
+        let record = CoordinatorGutaDurableSubmission::try_new(
+            pending(AuthorityScope::Coordinator, 7),
+            3,
+            vec![1, 2],
+            vec![3, 4, 5],
+            item_bytes.clone(),
+        )
+        .unwrap();
+
+        let legacy = CoordinatorGutaQueueItem::<PF, PHash>::legacy(item);
+        assert_eq!(legacy.encode_queue_item_vec().unwrap(), item_bytes);
+        assert!(matches!(
+            CoordinatorGutaQueueItem::<PF, PHash>::decode_queue_item_ref(&item_bytes).unwrap(),
+            CoordinatorGutaQueueItem::Legacy(_),
+        ));
+
+        let durable = CoordinatorGutaQueueItem::durable(&record, item).unwrap();
+        let bytes = durable.encode_queue_item_vec().unwrap();
+        assert_eq!(bytes.len(), CoordinatorGutaQueueItem::<PF, PHash>::DURABLE_FIXED_SIZE);
+        assert_eq!(
+            CoordinatorGutaQueueItem::<PF, PHash>::decode_queue_item_ref(&bytes).unwrap(),
+            durable,
+        );
+        assert_eq!(
+            durable.durable_pointer(),
+            Some((record.slot(), record.record_digest())),
+        );
+
+        let wrong_record = CoordinatorGutaDurableSubmission::try_new(
+            record.pending,
+            3,
+            vec![1, 2],
+            vec![3, 4, 5],
+            vec![9],
+        )
+        .unwrap();
+        assert_eq!(
+            CoordinatorGutaQueueItem::durable(&wrong_record, item),
+            Err(CoordinatorGutaDurableSubmissionError::QueueItemMismatch),
+        );
     }
 
     #[test]

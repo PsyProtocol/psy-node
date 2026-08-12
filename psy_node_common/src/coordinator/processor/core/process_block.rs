@@ -78,7 +78,6 @@ use parth_core::{
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
-    guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobID,
     node::node_proving_state::PsyNodeProvingState,
     prepared_block::coordinator::PsyPreparedCoordinatorBlockStateUpdates,
     proof_input::genesis::PsyCheckpointStateTransitionGenesisCircuitInput,
@@ -94,6 +93,7 @@ use psy_node_core::{
     psy_core_db::traits::full::{PsyCoordinatorProcessorStore, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter},
     psy_temp_db::StandardProcessorTempDBStoreBase,
     queue::{
+        coordinator_guta_durable_submission::CoordinatorGutaQueueItem,
         ephemeral::QStandardEphemeralQueueSubscriber,
         worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
     },
@@ -350,7 +350,7 @@ impl<
                 // Create keys for all queue types
                 let guta_processing_key = CoordinatorSubmitRealmGUTAUpdateQueueKey {
                     realm_id, realm_sub_id, unique_id, task_group: 0,
-                    queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<GlobalUserTreeAggregatorHeaderWithTagValueAndJobID<N::F, N::QHash>>,
+                    queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<CoordinatorGutaQueueItem<N::F, N::QHash>>,
                 };
                 let user_reg_processing_key = CoordinatorRegisterUserPublicKeyQueueKey {
                     realm_id, realm_sub_id, unique_id, task_group: 0,

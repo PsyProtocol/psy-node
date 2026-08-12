@@ -282,7 +282,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
 
     /// Default-off queue-sidecar setup. Disabled mode executes no queue CQL;
     /// enabled mode is inspect-only and requires an operator-created VERIFIED
-    /// lifecycle plus the exact twenty-one-table v15 schema.
+    /// lifecycle plus the exact twenty-one-table v16 schema.
     pub async fn initialize_pending_queue_sidecar_setup(
         &self,
         authority: psy_data::protocol::chain_context::AuthorityScope,
@@ -349,7 +349,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
     }
 
     /// Prepare the Coordinator GUTA durable submission authority only after
-    /// this exact process has consumed a VERIFIED v15 sidecar capability for
+    /// this exact process has consumed a VERIFIED v16 sidecar capability for
     /// Coordinator scope. The returned trait exposes no Session or DDL.
     pub async fn prepare_coordinator_guta_durable_submission_store(
         &self,

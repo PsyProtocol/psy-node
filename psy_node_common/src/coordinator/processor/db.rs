@@ -10,6 +10,7 @@ use parth_core::{
         traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable, ZeroableHash},
     }, data::queue::queue_key::{QPBaseQueueType, QPStandardUniqueIdQueueKey}, generic_traits::psy_debug_printable::PsyDebugPrintable, node::realm_identifier::QRealmIdentifier, protocol::core_types::{Q256BitHash, QNetworkTypesConfig}
 };
+use psy_node_core::queue::coordinator_guta_durable_submission::CoordinatorGutaQueueItem;
 use crate::coordinator::queue_key::{CoordinatorSubmitRealmGUTAUpdateQueueKey, CoordinatorRegisterUserPublicKeyQueueKey, CoordinatorDeployContractQueueKey, CoordinatorProvingWorkQueueKey};
 
 use psy_core::{
@@ -22,7 +23,6 @@ use psy_core::{
 use psy_data::{
     config::network_config::PsyNodeCircuitFingerprintConfig,
     genesis::genesis_block_setup::PsyGenesisBlockSetupData,
-    guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobID,
     node::coordinator_processor::{CoordinatorProcessorIdState, CoordinatorProcessorLastCommittedState},
     prepared_block::coordinator::PsyPreparedCoordinatorBlockStateUpdates,
     protocol::{
@@ -177,7 +177,7 @@ pub struct PsyCoordinatorDatabaseProcessor<
     pub status: ProcessorStatus,
     pub guta_queue_key_status_manager: QueueKeyStatusManager<
         PQ_COORDINATOR_SUBMIT_REALM_GUTA_UPDATE_QUEUE_TOPIC_ID,
-        GlobalUserTreeAggregatorHeaderWithTagValueAndJobID<N::F, N::QHash>,
+        CoordinatorGutaQueueItem<N::F, N::QHash>,
     >,
     pub register_user_queue_key_status_manager:
         QueueKeyStatusManager<PQ_COORDINATOR_REGISTER_USER_PUBLIC_KEY_QUEUE_TOPIC_ID, PZKPublicKeyInfo<N::QHash>>,
@@ -483,7 +483,7 @@ impl<
             genesis_verifiable_state_transition,
             guta_queue_key_status_manager: QueueKeyStatusManager::<
                 PQ_COORDINATOR_SUBMIT_REALM_GUTA_UPDATE_QUEUE_TOPIC_ID,
-                GlobalUserTreeAggregatorHeaderWithTagValueAndJobID<N::F, N::QHash>,
+                CoordinatorGutaQueueItem<N::F, N::QHash>,
             >::new_with_status(QPStandardUniqueIdQueueKey {
                 realm_id: realm_id_u64,
                 realm_sub_id: realm_sub_id_u64,
@@ -1074,7 +1074,7 @@ checkpoint_backup_copy_status={}
 
         let guta_key = CoordinatorSubmitRealmGUTAUpdateQueueKey {
             realm_id, realm_sub_id, unique_id, task_group: 0,
-            queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<GlobalUserTreeAggregatorHeaderWithTagValueAndJobID<N::F, N::QHash>>,
+            queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<CoordinatorGutaQueueItem<N::F, N::QHash>>,
         };
         let user_reg_key = CoordinatorRegisterUserPublicKeyQueueKey {
             realm_id, realm_sub_id, unique_id, task_group: 0,
@@ -1099,7 +1099,7 @@ checkpoint_backup_copy_status={}
         if should_create_genesis_consumers {
             let processing_guta_key = CoordinatorSubmitRealmGUTAUpdateQueueKey {
                 realm_id, realm_sub_id, unique_id: gathering_proc_id, task_group: 0,
-                queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<GlobalUserTreeAggregatorHeaderWithTagValueAndJobID<N::F, N::QHash>>,
+                queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<CoordinatorGutaQueueItem<N::F, N::QHash>>,
             };
             let processing_user_reg_key = CoordinatorRegisterUserPublicKeyQueueKey {
                 realm_id, realm_sub_id, unique_id: gathering_proc_id, task_group: 0,

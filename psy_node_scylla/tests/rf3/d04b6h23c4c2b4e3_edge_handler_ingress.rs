@@ -7,6 +7,8 @@ use std::{
     sync::{Arc, RwLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+#[cfg(feature = "rf3-test-support")]
+use std::process::{Child, Stdio};
 
 use anyhow::{bail, ensure, Context};
 use async_nats::jetstream::{self, consumer::pull::Config as PullConfig, stream::Config as StreamConfig};
@@ -29,7 +31,8 @@ use parth_core::{
     },
     data::hash::checkpointed_merkle_node::CheckpointedMerkleHash,
     data::queue::queue_key::{
-        PCoreSubjectQueueBase, QPBaseQueueType, QPStandardUniqueIdQueueKey,
+        PCoreQueueItemBase, PCoreSubjectQueueBase, QPBaseQueueType,
+        QPStandardUniqueIdQueueKey,
     },
     felt::ToU64Value,
     node::realm_identifier::QRealmIdentifier,
@@ -56,7 +59,6 @@ use psy_core::{
 use psy_data::{
     guta::header_extended::{
         GlobalUserTreeAggregatorHeaderWithTagValue,
-        GlobalUserTreeAggregatorHeaderWithTagValueAndJobID,
         GlobalUserTreeAggregatorHeaderWithTagValueAndJobType,
         GlobalUserTreeAggregatorHeaderWithJobId,
     },
@@ -111,6 +113,8 @@ use psy_node_common::realm::edge::{
     durable_user_update_artifact::DeterministicRealmUserUpdateArtifactFactory,
     handler::RealmEdgeHandler,
 };
+#[cfg(feature = "rf3-test-support")]
+use psy_node_redis::store::{new_redis_async_pool, StandardRedisStore};
 use psy_node_core::{
     file::memory_fs::SimpleMockMemoryFileSystem,
     psy_core_db::traits::full::{
@@ -120,14 +124,13 @@ use psy_node_core::{
         PsyNodeGlobalUserTreeDatabaseWriter,
     },
     psy_temp_db::{
-        QTempDBPendingContextWriter, QTempDBPendingIdWriter,
+        QTempDBPendingContextReader, QTempDBPendingContextWriter,
+        QTempDBPendingIdWriter,
         QTempDBProofWitnessWriter,
         QTempDBRewardsTreeReader, QTempDBWorkerReputationWriter,
     },
     queue::{
-        coordinator_guta_durable_submission::{
-            CoordinatorGutaDurableSubmissionSlot,
-        },
+        coordinator_guta_durable_submission::CoordinatorGutaQueueItem,
         ephemeral::QStandardEphemeralQueueSubscriber,
         realm_processor_actor_input::{
             RealmProcessorActorInput, RealmProcessorActorInputDigest,
@@ -334,6 +337,88 @@ const REALM_ID: u32 = 7;
 const REALM_SUB_ID: u16 = 2;
 const CONTRACT_ID: u32 = 41;
 const CONTRACT_HEIGHT: u8 = 8;
+
+#[cfg(feature = "rf3-test-support")]
+struct QualificationRedisServer {
+    port: u16,
+    child: Child,
+}
+
+#[cfg(feature = "rf3-test-support")]
+impl QualificationRedisServer {
+    fn start(port: u16) -> anyhow::Result<Self> {
+        Ok(Self {
+            port,
+            child: Self::spawn(port)?,
+        })
+    }
+
+    fn spawn(port: u16) -> anyhow::Result<Child> {
+        Command::new("redis-server")
+            .args([
+                "--bind",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+                "--save",
+                "",
+                "--appendonly",
+                "no",
+                "--protected-mode",
+                "no",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("start qualification Redis process")
+    }
+
+    async fn wait_ready(&self) -> anyhow::Result<()> {
+        let address = format!("127.0.0.1:{}", self.port);
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(&address).await.is_ok() {
+                return Ok(());
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        bail!("qualification Redis did not become ready at {address}")
+    }
+
+    fn url(&self) -> String {
+        format!("redis://127.0.0.1:{}/", self.port)
+    }
+
+    fn restart_empty(&mut self) -> anyhow::Result<()> {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.child = Self::spawn(self.port)?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "rf3-test-support")]
+impl Drop for QualificationRedisServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(feature = "rf3-test-support")]
+async fn qualification_redis_store(
+    server: &QualificationRedisServer,
+    root_prefix: &str,
+) -> anyhow::Result<Arc<StandardRedisStore>> {
+    server.wait_ready().await?;
+    let pool = new_redis_async_pool(&server.url(), 2).await?;
+    Ok(Arc::new(StandardRedisStore::new(
+        pool,
+        root_prefix.to_owned(),
+        0,
+        0,
+    )))
+}
 
 #[derive(Debug, Serialize)]
 struct E3Report {
@@ -2165,8 +2250,12 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         std::env::var("PSY_D04B6H23C4D3A_RF3").as_deref() == Ok("1");
     let exercise_coordinator_rpc =
         std::env::var("PSY_D04B6H23C4D3B1_RF3").as_deref() == Ok("1");
-    let exercise_coordinator_handler =
+    let exercise_coordinator_handler_prefix =
         std::env::var("PSY_D04B6H23C4D3B2B2B1_RF3").as_deref() == Ok("1");
+    let exercise_coordinator_redis_restart =
+        std::env::var("PSY_D04B6H23C4D3B2B2B2_RF3").as_deref() == Ok("1");
+    let exercise_coordinator_handler =
+        exercise_coordinator_handler_prefix || exercise_coordinator_redis_restart;
     ensure!(
         !exercise_proof_worker_queue || exercise_proof_narrow_writer,
         "c4d3a worker queue Gate requires c4d2 proof/narrow writer",
@@ -3081,6 +3170,7 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
     let mut coordinator_processor_conflicting_projection_rejected = false;
     let mut coordinator_handler_during_one_replica_offline = false;
     let mut coordinator_handler_publish_after_leader_failover = false;
+    let mut coordinator_real_redis_process_restart = false;
     let mut proof_worker_api_handler_rf3 = false;
     let mut proof_worker_jobs_dispatched = 0_usize;
     let mut proof_worker_jobs_completed = 0_usize;
@@ -5148,15 +5238,16 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                                             "Coordinator GUTA queue item was not published",
                                         ))?;
                                     let decoded_queue_item =
-                                        GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<
-                                            PF,
-                                            PHash,
-                                        >::psy_ser_from_slice(&first_queue_item)?;
-                                    let durable_slot =
-                                        CoordinatorGutaDurableSubmissionSlot::for_submission(
-                                            &coordinator_context,
-                                            u64::from(REALM_ID),
-                                        )?;
+                                        CoordinatorGutaQueueItem::<PF, PHash>::
+                                            decode_queue_item_ref(&first_queue_item)?;
+                                    let (durable_slot, queue_record_digest) =
+                                        decoded_queue_item
+                                            .durable_pointer()
+                                            .ok_or_else(|| anyhow::anyhow!(
+                                                "durable Handler published a legacy queue item",
+                                            ))?;
+                                    let decoded_business_item =
+                                        decoded_queue_item.item();
                                     let durable = durable_submissions
                                         .read_selected(durable_slot)
                                         .await?
@@ -5165,8 +5256,12 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                                         ))?;
                                     ensure!(
                                         durable.pending() == &coordinator_context
+                                            && durable.record_digest()
+                                                == queue_record_digest
                                             && durable.queue_item()
-                                                == first_queue_item.as_slice()
+                                                == decoded_business_item
+                                                    .psy_ser_to_bytes_vec()?
+                                                    .as_slice()
                                             && durable.proof_bytes()
                                                 == proof.proof_bytes.as_slice(),
                                         "Coordinator durable submission readback mismatch",
@@ -5201,40 +5296,155 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                                             == Some(durable.clone()),
                                     );
 
-                                    let recovery_temp = Arc::new(
-                                        InMemoryTempStore::new(
-                                            format!(
-                                                "{}-c4d3b2b2b1-recovery",
-                                                fixture::KEYSPACE,
-                                            ),
-                                            0,
-                                            0,
-                                        ),
-                                    );
-                                    recovery_temp
-                                        .set_current_pending_context(
-                                            &coordinator_rid,
-                                            &coordinator_context,
+                                    let recovery = if exercise_coordinator_redis_restart {
+                                        let redis_port = std::env::var(
+                                            "PSY_D04B6H23C4D3B2B2B2_REDIS_PORT",
+                                        )
+                                        .ok()
+                                        .map(|value| value.parse::<u16>())
+                                        .transpose()?
+                                        .unwrap_or(16_397);
+                                        let mut redis =
+                                            QualificationRedisServer::start(redis_port)?;
+                                        let root_prefix = format!(
+                                            "{}-c4d3b2b2b2-real-redis",
+                                            fixture::KEYSPACE,
+                                        );
+                                        let old_cache = qualification_redis_store(
+                                            &redis,
+                                            &root_prefix,
                                         )
                                         .await?;
-                                    let recovery =
-                                        qualification_recover_coordinator_guta_queue_item::<
-                                            N,
-                                            _,
-                                            _,
-                                        >(
-                                            Arc::clone(&durable_submissions),
-                                            Arc::clone(&recovery_temp),
-                                            Arc::clone(&recovery_temp),
-                                            coordinator_rid,
-                                            coordinator_pending,
-                                            coordinator_proc,
-                                            first_queue_item.clone(),
+                                        old_cache
+                                            .set_current_pending_context(
+                                                &coordinator_rid,
+                                                &coordinator_context,
+                                            )
+                                            .await?;
+                                        let proof_address = old_cache
+                                            .resolve_proof_address(
+                                                &coordinator_context,
+                                                &decoded_business_item.job_id,
+                                            )?;
+                                        old_cache
+                                            .put_proof_bytes_exact(
+                                                &proof_address,
+                                                durable.proof_bytes(),
+                                            )
+                                            .await?;
+                                        ensure!(
+                                            old_cache
+                                                .get_current_pending_context(
+                                                    &coordinator_rid,
+                                                )
+                                                .await?
+                                                == Some(coordinator_context)
+                                                && old_cache
+                                                    .get_proof_bytes_exact(
+                                                        &proof_address,
+                                                    )
+                                                    .await?
+                                                    .as_deref()
+                                                    == Some(durable.proof_bytes()),
+                                        );
+                                        drop(old_cache);
+                                        redis.restart_empty()?;
+                                        let restarted_cache = qualification_redis_store(
+                                            &redis,
+                                            &root_prefix,
                                         )
-                                        .await
-                                        .context(
-                                            "c4d3b2b2b1 Processor durable projection recovery",
-                                        )?;
+                                        .await?;
+                                        ensure!(
+                                            <StandardRedisStore as QTempDBPendingContextReader<
+                                                PHash,
+                                            >>::get_current_pending_context(
+                                                restarted_cache.as_ref(),
+                                                &coordinator_rid,
+                                            )
+                                            .await?
+                                            .is_none()
+                                                && restarted_cache
+                                                    .get_proof_bytes_exact(
+                                                        &proof_address,
+                                                    )
+                                                    .await?
+                                                    .is_none(),
+                                            "restarted Redis retained volatile Coordinator cache",
+                                        );
+                                        let recovered =
+                                            qualification_recover_coordinator_guta_queue_item::<
+                                                N,
+                                                _,
+                                                _,
+                                            >(
+                                                Arc::clone(&durable_submissions),
+                                                Arc::clone(&restarted_cache),
+                                                Arc::clone(&restarted_cache),
+                                                coordinator_rid,
+                                                coordinator_pending,
+                                                coordinator_proc,
+                                                first_queue_item.clone(),
+                                            )
+                                            .await
+                                            .context(
+                                                "c4d3b2b2b2 real Redis process-loss recovery",
+                                            )?;
+                                        ensure!(
+                                            restarted_cache
+                                                .get_current_pending_context(
+                                                    &coordinator_rid,
+                                                )
+                                                .await?
+                                                == Some(coordinator_context)
+                                                && restarted_cache
+                                                    .get_proof_bytes_exact(
+                                                        &proof_address,
+                                                    )
+                                                    .await?
+                                                    .as_deref()
+                                                    == Some(durable.proof_bytes()),
+                                        );
+                                        coordinator_real_redis_process_restart = true;
+                                        recovered
+                                    } else {
+                                        let recovery_temp = Arc::new(
+                                            InMemoryTempStore::new(
+                                                format!(
+                                                    "{}-c4d3b2b2b1-recovery",
+                                                    fixture::KEYSPACE,
+                                                ),
+                                                0,
+                                                0,
+                                            ),
+                                        );
+                                        let recovered =
+                                            qualification_recover_coordinator_guta_queue_item::<
+                                                N,
+                                                _,
+                                                _,
+                                            >(
+                                                Arc::clone(&durable_submissions),
+                                                Arc::clone(&recovery_temp),
+                                                Arc::clone(&recovery_temp),
+                                                coordinator_rid,
+                                                coordinator_pending,
+                                                coordinator_proc,
+                                                first_queue_item.clone(),
+                                            )
+                                            .await
+                                            .context(
+                                                "c4d3b2b2b1 Processor durable projection recovery",
+                                            )?;
+                                        ensure!(
+                                            recovery_temp
+                                                .get_current_pending_context(
+                                                    &coordinator_rid,
+                                                )
+                                                .await?
+                                                == Some(coordinator_context),
+                                        );
+                                        recovered
+                                    };
                                     ensure!(
                                         recovery.submitted_realm_id
                                             == u64::from(REALM_ID)
@@ -5252,16 +5462,10 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                                             0,
                                         ),
                                     );
-                                    conflict_temp
-                                        .set_current_pending_context(
-                                            &coordinator_rid,
-                                            &coordinator_context,
-                                        )
-                                        .await?;
                                     let conflict_address = conflict_temp
                                         .resolve_proof_address(
                                             &coordinator_context,
-                                            &decoded_queue_item.job_id,
+                                            &decoded_business_item.job_id,
                                         )?;
                                     let conflicting_proof = vec![0xA5; 32];
                                     conflict_temp
@@ -5962,7 +6166,7 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         coordinator_processor_conflicting_projection_rejected,
         coordinator_handler_during_one_replica_offline,
         coordinator_handler_publish_after_leader_failover,
-        coordinator_real_redis_process_restart: false,
+        coordinator_real_redis_process_restart,
         mixed_version_clean_boundary_required: exercise_coordinator_handler,
         mixed_version_overlap_supported: false,
         production_coordinator_handler_rf3: exercise_coordinator_handler,
@@ -6004,7 +6208,9 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         full_node_restart_tested: false,
         production_serving: false,
         h8_domains_closed: 0,
-        qualification: if exercise_coordinator_handler {
+        qualification: if exercise_coordinator_redis_restart {
+            "H23C4D3B2B2B2_COORDINATOR_REDIS_RESTART_RF3_PASSED"
+        } else if exercise_coordinator_handler {
             "H23C4D3B2B2B1_COORDINATOR_HANDLER_RECOVERY_PREFIX_RF3_PASSED"
         } else if exercise_coordinator_rpc {
             "H23C4D3B1_REALM_COORDINATOR_RPC_RECOVERY_RF3_PASSED"
