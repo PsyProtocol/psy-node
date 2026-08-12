@@ -1,6 +1,6 @@
 //! Exact, default-off schema boundary for the recoverable Realm queue.
 //!
-//! The twenty-one target tables have production-shaped, default-off adapters. This module
+//! The twenty-two target tables have production-shaped, default-off adapters. This module
 //! gives deployment tooling one deterministic manifest/materializer and gives
 //! node startup an inspect-only capability.  Ordinary setup performs no queue
 //! CQL.  Partial materialization is retained and completed idempotently; this
@@ -53,6 +53,10 @@ use super::{
         ScyllaRealmProcessorGenerationTerminalStore,
         REALM_PROCESSOR_GENERATION_TERMINAL_TABLE,
     },
+    realm_full_commit_manifest_store::{
+        ScyllaRealmFullCommitManifestStore,
+        REALM_FULL_COMMIT_MANIFEST_TABLE,
+    },
     BranchExactDeploymentNoTabletKeyspace, CqlKeyspaceName,
     PendingQueueArtifactControlKeyspace, PendingQueueArtifactDataKeyspace,
     PendingQueueArtifactKeyspaces, PendingQueuePublishDataKeyspace,
@@ -71,13 +75,13 @@ use super::{
 #[cfg(test)]
 use super::RETIRED_REALM_USER_UPDATE_CLAIM_V1_TABLE;
 
-// v16 keeps the v15 physical shape but requires Coordinator durable queue
-// pointers. A v15 VERIFIED lifecycle must not authorize a binary which emits
-// a transport format that an older Processor cannot decode.
-pub const PENDING_QUEUE_SIDECAR_SCHEMA_VERSION: u16 = 16;
-pub const PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT: usize = 21;
+// v17 adds the immutable Realm full-commit composite manifest. A v16 VERIFIED
+// lifecycle must not authorize a binary which expects that new durability
+// fence before writer/head publication.
+pub const PENDING_QUEUE_SIDECAR_SCHEMA_VERSION: u16 = 17;
+pub const PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT: usize = 22;
 const FINGERPRINT_DOMAIN: &[u8] =
-    b"psy/rollback/pending-queue-sidecar-schema/v16";
+    b"psy/rollback/pending-queue-sidecar-schema/v17";
 const INSPECT_COLUMNS_CQL: &str = "SELECT column_name, type, kind, position, clustering_order FROM system_schema.columns WHERE keyspace_name = ? AND table_name = ?";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -104,6 +108,7 @@ pub enum PendingQueueSidecarPhysicalTable {
     RealmGenerationTerminalIntent = 19,
     RealmDeferredCarryover = 20,
     CoordinatorGutaSubmission = 21,
+    RealmFullCommitManifest = 22,
 }
 
 impl PendingQueueSidecarPhysicalTable {
@@ -129,6 +134,7 @@ impl PendingQueueSidecarPhysicalTable {
         Self::RealmGenerationTerminalIntent,
         Self::RealmDeferredCarryover,
         Self::CoordinatorGutaSubmission,
+        Self::RealmFullCommitManifest,
     ];
 
     pub const fn table_name(self) -> &'static str {
@@ -154,6 +160,7 @@ impl PendingQueueSidecarPhysicalTable {
             Self::RealmGenerationTerminalIntent => REALM_PROCESSOR_GENERATION_TERMINAL_TABLE,
             Self::RealmDeferredCarryover => REALM_PROCESSOR_DEFERRED_CARRYOVER_TABLE,
             Self::CoordinatorGutaSubmission => COORDINATOR_GUTA_DURABLE_SUBMISSION_TABLE,
+            Self::RealmFullCommitManifest => REALM_FULL_COMMIT_MANIFEST_TABLE,
         }
     }
 
@@ -316,7 +323,7 @@ const fn regular(
     PendingQueueSidecarColumnSpec { table, name, cql_type, kind: PendingQueueSidecarColumnKind::Regular, position: -1, clustering_order: PendingQueueSidecarClusteringOrder::None }
 }
 
-pub const PENDING_QUEUE_SIDECAR_EXPECTED_COLUMNS: [PendingQueueSidecarColumnSpec; 105] = [
+pub const PENDING_QUEUE_SIDECAR_EXPECTED_COLUMNS: [PendingQueueSidecarColumnSpec; 108] = [
     pk(PendingQueueSidecarPhysicalTable::Pipeline, "network_chain_id", "bigint", 0),
     pk(PendingQueueSidecarPhysicalTable::Pipeline, "authority_kind", "tinyint", 1),
     pk(PendingQueueSidecarPhysicalTable::Pipeline, "realm_id", "bigint", 2),
@@ -422,6 +429,9 @@ pub const PENDING_QUEUE_SIDECAR_EXPECTED_COLUMNS: [PendingQueueSidecarColumnSpec
     pk(PendingQueueSidecarPhysicalTable::CoordinatorGutaSubmission, "submission_slot", "blob", 0),
     regular(PendingQueueSidecarPhysicalTable::CoordinatorGutaSubmission, "revision", "bigint"),
     regular(PendingQueueSidecarPhysicalTable::CoordinatorGutaSubmission, "submission_payload", "blob"),
+    pk(PendingQueueSidecarPhysicalTable::RealmFullCommitManifest, "manifest_slot", "blob", 0),
+    regular(PendingQueueSidecarPhysicalTable::RealmFullCommitManifest, "revision", "bigint"),
+    regular(PendingQueueSidecarPhysicalTable::RealmFullCommitManifest, "manifest_payload", "blob"),
 ];
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -561,6 +571,25 @@ pub(super) fn current_physical_schema_matches_historical_v15() -> bool {
     ) == historical_v15_schema_fingerprint()
 }
 
+#[cfg(test)]
+pub(super) fn historical_v16_schema_fingerprint() -> PendingQueueSidecarSchemaFingerprint {
+    // Frozen from the shipped v16 twenty-one-table/105-column manifest.
+    PendingQueueSidecarSchemaFingerprint::from_persisted([
+        0x29, 0x6f, 0xdb, 0xc4, 0x41, 0x9b, 0x99, 0x1b,
+        0x9e, 0x8f, 0x2f, 0xfd, 0x88, 0xda, 0xdb, 0x56,
+        0x89, 0x12, 0x7c, 0xf9, 0x19, 0xaf, 0xe6, 0x75,
+        0x6c, 0x49, 0x8a, 0x0f, 0xc2, 0x40, 0x96, 0xd4,
+    ])
+}
+
+#[cfg(test)]
+pub(super) fn current_physical_schema_matches_historical_v16() -> bool {
+    sidecar_schema_fingerprint(
+        16,
+        b"psy/rollback/pending-queue-sidecar-schema/v16",
+    ) == historical_v16_schema_fingerprint()
+}
+
 pub fn inspect_pending_queue_sidecar_columns(
     observed: Vec<ObservedPendingQueueSidecarColumn>,
     retired_v1_present: bool,
@@ -633,20 +662,8 @@ impl PendingQueueSidecarSchemaMaterializer {
             }
             PendingQueueSidecarSchemaInspection::Absent | PendingQueueSidecarSchemaInspection::Partial { .. } => {}
         }
-        materialize_pre_v12_tables(session, keyspaces).await?;
-        ScyllaRealmProcessorGenerationTerminalStore::create_schema(
-            session,
-            &keyspaces.control,
-        )
-        .await
-        .map_err(sidecar)?;
-        ScyllaRealmProcessorDeferredCarryoverStore::create_schema(
-            session,
-            &keyspaces.control,
-        )
-        .await
-        .map_err(sidecar)?;
-        ScyllaCoordinatorGutaDurableSubmissionStore::create_schema(
+        materialize_pre_v17_tables(session, keyspaces).await?;
+        ScyllaRealmFullCommitManifestStore::create_schema(
             session,
             &keyspaces.control,
         )
@@ -657,6 +674,32 @@ impl PendingQueueSidecarSchemaMaterializer {
         };
         Ok(PendingQueueSidecarSchemaOnlyReceipt { keyspaces: keyspaces.clone(), fingerprint })
     }
+}
+
+async fn materialize_pre_v17_tables(
+    session: &Session,
+    keyspaces: &PendingQueueSidecarKeyspaces,
+) -> Result<(), PendingQueueSidecarSchemaError> {
+    materialize_pre_v12_tables(session, keyspaces).await?;
+    ScyllaRealmProcessorGenerationTerminalStore::create_schema(
+        session,
+        &keyspaces.control,
+    )
+    .await
+    .map_err(sidecar)?;
+    ScyllaRealmProcessorDeferredCarryoverStore::create_schema(
+        session,
+        &keyspaces.control,
+    )
+    .await
+    .map_err(sidecar)?;
+    ScyllaCoordinatorGutaDurableSubmissionStore::create_schema(
+        session,
+        &keyspaces.control,
+    )
+    .await
+    .map_err(sidecar)?;
+    Ok(())
 }
 
 async fn materialize_pre_v12_tables(
@@ -720,6 +763,14 @@ impl PendingQueueSidecarSchemaMaterializer {
         .map_err(sidecar)?;
         Ok(())
     }
+
+    #[cfg(feature = "rf3-test-support")]
+    pub(super) async fn qualification_materialize_historical_v16(
+        session: &Session,
+        keyspaces: &PendingQueueSidecarKeyspaces,
+    ) -> Result<(), PendingQueueSidecarSchemaError> {
+        materialize_pre_v17_tables(session, keyspaces).await
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -753,19 +804,20 @@ mod tests {
     }
 
     #[test]
-    fn exact_manifest_is_twenty_one_unique_tables_with_stable_placement() {
-        assert_eq!(PENDING_QUEUE_SIDECAR_SCHEMA_VERSION, 16);
-        assert_eq!(PendingQueueSidecarPhysicalTable::ALL.len(), 21);
+    fn exact_manifest_is_twenty_two_unique_tables_with_stable_placement() {
+        assert_eq!(PENDING_QUEUE_SIDECAR_SCHEMA_VERSION, 17);
+        assert_eq!(PendingQueueSidecarPhysicalTable::ALL.len(), 22);
         let names = PendingQueueSidecarPhysicalTable::ALL.iter().map(|table| table.table_name()).collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(names.len(), 21);
+        assert_eq!(names.len(), 22);
         assert_eq!(PendingQueueSidecarPhysicalTable::ALL.iter().filter(|table| table.keyspace_kind() == PendingQueueSidecarKeyspaceKind::StandardData).count(), 4);
-        assert_eq!(PendingQueueSidecarPhysicalTable::ALL.iter().filter(|table| table.keyspace_kind() == PendingQueueSidecarKeyspaceKind::NoTabletControl).count(), 17);
+        assert_eq!(PendingQueueSidecarPhysicalTable::ALL.iter().filter(|table| table.keyspace_kind() == PendingQueueSidecarKeyspaceKind::NoTabletControl).count(), 18);
         assert!(!names.contains(RETIRED_V1_PIPELINE_TABLE));
         assert!(!names.contains(RETIRED_REALM_USER_UPDATE_CLAIM_V1_TABLE));
         assert_ne!(pending_queue_sidecar_schema_fingerprint().as_bytes(), &[0; 32]);
         assert!(!current_physical_schema_matches_historical_v12());
         assert!(!current_physical_schema_matches_historical_v13());
-        assert!(current_physical_schema_matches_historical_v15());
+        assert!(!current_physical_schema_matches_historical_v15());
+        assert!(!current_physical_schema_matches_historical_v16());
         assert_eq!(
             hex::encode(historical_v12_schema_fingerprint().as_bytes()),
             "466bf80f7e9f336a5191c2efdecf05129c96f6086f57c1afb14ce6cbe0aca7fb",
@@ -781,6 +833,10 @@ mod tests {
         assert_eq!(
             hex::encode(historical_v15_schema_fingerprint().as_bytes()),
             "535f0b3507837cb19b29a72c571fbf8301aa1fb7e8eeb01d3e1bb2c02e9eef0a",
+        );
+        assert_eq!(
+            hex::encode(historical_v16_schema_fingerprint().as_bytes()),
+            "296fdbc4419b991b9e8f2ffd88dadb5689127cf919afe6756c498a0fc24096d4",
         );
     }
 
@@ -798,6 +854,13 @@ mod tests {
         ));
         let mut old_v14 = exact_columns();
         old_v14.retain(|column| column.table != PendingQueueSidecarPhysicalTable::CoordinatorGutaSubmission);
+        let mut old_v16 = exact_columns();
+        old_v16.retain(|column| column.table != PendingQueueSidecarPhysicalTable::RealmFullCommitManifest);
+        assert!(matches!(
+            inspect_pending_queue_sidecar_columns(old_v16, false).unwrap(),
+            PendingQueueSidecarSchemaInspection::Partial { missing, .. }
+                if missing == vec![PendingQueueSidecarPhysicalTable::RealmFullCommitManifest]
+        ));
         assert!(matches!(
             inspect_pending_queue_sidecar_columns(old_v14, false).unwrap(),
             PendingQueueSidecarSchemaInspection::Partial { missing, .. }

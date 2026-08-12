@@ -276,6 +276,14 @@ pub(super) struct HistoricalV15VerifiedLifecycleFixture {
 }
 
 #[cfg(all(test, feature = "rf3-test-support"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct HistoricalV16VerifiedLifecycleFixture {
+    slot: [u8; 32],
+    revision: i64,
+    payload: Vec<u8>,
+}
+
+#[cfg(all(test, feature = "rf3-test-support"))]
 impl HistoricalV13VerifiedLifecycleFixture {
     pub(super) const fn slot(&self) -> &[u8; 32] { &self.slot }
     pub(super) const fn revision(&self) -> i64 { self.revision }
@@ -291,6 +299,13 @@ impl HistoricalV14VerifiedLifecycleFixture {
 
 #[cfg(all(test, feature = "rf3-test-support"))]
 impl HistoricalV15VerifiedLifecycleFixture {
+    pub(super) const fn slot(&self) -> &[u8; 32] { &self.slot }
+    pub(super) const fn revision(&self) -> i64 { self.revision }
+    pub(super) fn payload(&self) -> &[u8] { &self.payload }
+}
+
+#[cfg(all(test, feature = "rf3-test-support"))]
+impl HistoricalV16VerifiedLifecycleFixture {
     pub(super) const fn slot(&self) -> &[u8; 32] { &self.slot }
     pub(super) const fn revision(&self) -> i64 { self.revision }
     pub(super) fn payload(&self) -> &[u8] { &self.payload }
@@ -417,6 +432,32 @@ impl ScyllaPendingQueueSidecarLifecycleStore {
             )
             .await?;
         Ok(HistoricalV15VerifiedLifecycleFixture {
+            slot,
+            revision,
+            payload,
+        })
+    }
+
+    /// Qualification-only seed for the exact historical v16 lifecycle.
+    /// v17 adds the full-commit manifest table, so this VERIFIED row must not
+    /// authorize the current deployment partition.
+    #[cfg(all(test, feature = "rf3-test-support"))]
+    pub(super) async fn qualification_persist_historical_v16_verified(
+        &self,
+        keyspaces: &PendingQueueSidecarKeyspaces,
+    ) -> Result<HistoricalV16VerifiedLifecycleFixture, PendingQueueSidecarLifecycleError> {
+        use super::pending_queue_sidecar_schema::historical_v16_schema_fingerprint;
+
+        let fingerprint = historical_v16_schema_fingerprint();
+        let (slot, revision, payload) = self
+            .qualification_persist_historical_verified(
+                keyspaces,
+                16,
+                21,
+                fingerprint.as_bytes(),
+            )
+            .await?;
+        Ok(HistoricalV16VerifiedLifecycleFixture {
             slot,
             revision,
             payload,
@@ -722,7 +763,7 @@ impl Error for PendingQueueSidecarLifecycleError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::pending_queue_sidecar_schema::historical_v15_schema_fingerprint;
+    use super::super::pending_queue_sidecar_schema::historical_v16_schema_fingerprint;
 
     fn keyspaces() -> PendingQueueSidecarKeyspaces { PendingQueueSidecarKeyspaces::try_new("psy_data", "psy_data_no_tablet").unwrap() }
 
@@ -733,9 +774,9 @@ mod tests {
         assert_eq!(first, second);
         let bytes = first.to_canonical_bytes();
         assert_eq!(StoredPendingQueueSidecarDeployment::decode_selected(first.slot, 1, &bytes).unwrap(), first);
-        let mut old_v15 = bytes.clone();
-        old_v15[19..21].copy_from_slice(&15_u16.to_be_bytes());
-        assert_eq!(StoredPendingQueueSidecarDeployment::decode_selected(first.slot, 1, &old_v15), Err(PendingQueueSidecarLifecycleError::UnknownSchemaVersion));
+        let mut old_v16 = bytes.clone();
+        old_v16[19..21].copy_from_slice(&16_u16.to_be_bytes());
+        assert_eq!(StoredPendingQueueSidecarDeployment::decode_selected(first.slot, 1, &old_v16), Err(PendingQueueSidecarLifecycleError::UnknownSchemaVersion));
         let mut tampered = bytes.clone(); tampered[20] ^= 1;
         assert!(StoredPendingQueueSidecarDeployment::decode_selected(first.slot, 1, &tampered).is_err());
         let mut trailing = bytes; trailing.push(0);
@@ -743,17 +784,17 @@ mod tests {
     }
 
     #[test]
-    fn schema_upgrade_slot_differs_from_the_exact_v15_identity() {
+    fn schema_upgrade_slot_differs_from_the_exact_v16_identity() {
         let keyspaces = keyspaces();
         let mut old = Sha256::new();
         old.update(b"psy/rollback/pending-queue-sidecar-slot/v2");
-        old.update(15_u16.to_be_bytes());
-        old.update(historical_v15_schema_fingerprint().as_bytes());
+        old.update(16_u16.to_be_bytes());
+        old.update(historical_v16_schema_fingerprint().as_bytes());
         update_len(&mut old, keyspaces.data().as_str().as_bytes());
         update_len(&mut old, keyspaces.control().as_str().as_bytes());
-        let old_v15_slot: [u8; 32] = old.finalize().into();
+        let old_v16_slot: [u8; 32] = old.finalize().into();
         let current = PendingQueueSidecarDeploymentSlot::for_keyspaces(&keyspaces);
-        assert_ne!(current.as_bytes(), &old_v15_slot);
+        assert_ne!(current.as_bytes(), &old_v16_slot);
 
         let materializing = StoredPendingQueueSidecarDeployment::materializing(keyspaces);
         assert_eq!(materializing.slot(), current);
