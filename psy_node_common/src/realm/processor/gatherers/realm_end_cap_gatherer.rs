@@ -532,12 +532,13 @@ fn bind_processing_generation_state<Hash: Copy>(
                 }),
         "durable generation network/Realm does not match gatherer config"
     );
-    anyhow::ensure!(
-        processing.pending_id().get() == exact.processing_unique_pending_id
-            && processing.proc_checkpoint_id().as_u128()
-                == exact.processing_proc_checkpoint_unique_id,
-        "durable generation does not match current processing pending context"
-    );
+    // The branch-exact pipeline, not the legacy mutable singleton, selects
+    // the processing namespace. Keep the checkpoint/root snapshot from the
+    // freshly synchronized Processor state, but replace both generation IDs
+    // in this actor-private copy before the builder sees it.
+    exact.processing_unique_pending_id = processing.pending_id().get();
+    exact.processing_proc_checkpoint_unique_id =
+        processing.proc_checkpoint_id().as_u128();
 
     // The existing GUTA builder names its input fields `gathering_*`.
     // Branch-exact replay is for the already-closed processing generation, so
@@ -1122,14 +1123,18 @@ mod h23c4c3b_processing_binding_tests {
     }
 
     #[test]
-    fn stale_processing_or_wrong_realm_fails_before_builder_creation() {
-        assert!(bind_processing_generation_state(
+    fn durable_processing_replaces_stale_legacy_identity_but_wrong_realm_fails() {
+        let rebound = bind_processing_generation_state(
             state(),
-            context(100, 41),
+            context(100, 40),
             7,
             3,
         )
-        .is_err());
+        .unwrap();
+        assert_eq!(rebound.processing_unique_pending_id, 100);
+        assert_eq!(rebound.processing_proc_checkpoint_unique_id, 40);
+        assert_eq!(rebound.gathering_unique_pending_id, 100);
+        assert_eq!(rebound.gathering_proc_checkpoint_unique_id, 40);
         assert!(bind_processing_generation_state(
             state(),
             context(101, 41),

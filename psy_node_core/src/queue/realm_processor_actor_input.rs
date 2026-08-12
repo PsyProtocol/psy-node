@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use super::{
     realm_processor_deferred_actor_input::{
         RealmProcessorDeferredActorInput, RealmProcessorDeferredActorInputDigest,
+        RealmProcessorDeferredActorInputSource,
     },
     realm_processor_external_dependency_input::{
         RealmProcessorQualifiedExternalActorInput,
@@ -91,6 +92,10 @@ impl RealmProcessorActorInput {
 
     pub const fn deferred_digest(&self) -> RealmProcessorDeferredActorInputDigest {
         self.deferred.digest()
+    }
+
+    pub const fn deferred_source(&self) -> RealmProcessorDeferredActorInputSource {
+        self.deferred.source()
     }
 
     pub const fn external_digest(&self) -> RealmProcessorQualifiedExternalActorInputDigest {

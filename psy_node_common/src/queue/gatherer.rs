@@ -19,6 +19,7 @@ use psy_node_core::{
         },
         realm_processor_deferred_actor_input::{
             RealmProcessorDeferredActorInput,
+            RealmProcessorDeferredActorInputSource,
         },
         realm_processor_durable_capture::{
             RealmProcessorDurableGenerationDigest,
@@ -29,7 +30,10 @@ use psy_node_core::{
             PendingQueueCaptureContextDigest,
         },
     },
-    store::realm_processor_quiescence::RealmProcessorDrainRequest,
+    store::{
+        pending_generation_identity::PendingGenerationContext,
+        realm_processor_quiescence::RealmProcessorDrainRequest,
+    },
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -1361,6 +1365,8 @@ async fn durable_gatherer_runner_for_tree<
     let mut tentative_builder: Option<Builder> = None;
     let mut finalized_output: Option<Arc<Builder::Output>> = None;
     let mut finalized_revision: Option<GathererActorRevision> = None;
+    let mut current_processing: Option<PendingGenerationContext> = None;
+    let mut active_unique_id = queue_key.unique_id;
 
     while let Some(command) = trigger_rx.recv().await {
         match command {
@@ -1370,6 +1376,7 @@ async fn durable_gatherer_runner_for_tree<
             } => {
                 let context = input.context();
                 let actor_input_digest = input.digest();
+                let deferred_source = input.deferred_source();
                 let (deferred_input, external_input) = input.into_parts();
                 let (generation, external_dependencies) = external_input.into_parts();
                 let boundary_digest = generation.boundary().digest();
@@ -1381,8 +1388,6 @@ async fn durable_gatherer_runner_for_tree<
                         realm_id: queue_key.realm_id as u32,
                         realm_sub_id: queue_key.realm_sub_id as u16,
                     })
-                    || context.processing().proc_checkpoint_id().as_u128()
-                        != queue_key.unique_id
                     || deferred_input.successor() != context.processing()
                 {
                     let _ = responder.send(Err(
@@ -1392,13 +1397,13 @@ async fn durable_gatherer_runner_for_tree<
                 }
 
                 if let Some(current) = applied.as_ref() {
-                    let outcome = if current.context_digest() == context.digest()
+                    let same_generation = current.context_digest() == context.digest()
                         && current.generation_digest() == generation_digest
                         && current.boundary_digest() == boundary_digest
                         && current.item_count() == item_count
-                        && current.actor_input_digest() == actor_input_digest
-                    {
-                        Ok(DurableTreeGathererApplyReceipt {
+                        && current.actor_input_digest() == actor_input_digest;
+                    if same_generation {
+                        let _ = responder.send(Ok(DurableTreeGathererApplyReceipt {
                             actor_identity: current.actor_identity.clone(),
                             actor_revision: current.actor_revision,
                             context_digest: current.context_digest,
@@ -1406,13 +1411,32 @@ async fn durable_gatherer_runner_for_tree<
                             boundary_digest: current.boundary_digest,
                             item_count: current.item_count,
                             actor_input_digest: current.actor_input_digest,
-                        })
-                    } else {
-                        Err(GathererPauseError::DurableGenerationIdentityMismatch)
-                    };
-                    let _ = responder.send(outcome);
-                    continue;
+                        }));
+                        continue;
+                    }
+
+                    let advances_finalized_predecessor = can_advance_durable_actor(
+                        current_processing,
+                        context.processing(),
+                        deferred_source,
+                        finalized_output.is_some(),
+                    );
+                    if !advances_finalized_predecessor {
+                        let _ = responder.send(Err(
+                            GathererPauseError::DurableGenerationIdentityMismatch,
+                        ));
+                        continue;
+                    }
+
+                    // The prior generation is immutable in its application
+                    // archive before its terminal can select this successor.
+                    // Drop only process-local retry caches; keep the evolved
+                    // tree and monotonic actor revision.
+                    finalized_output = None;
+                    finalized_revision = None;
                 }
+
+                active_unique_id = context.processing().proc_checkpoint_id().as_u128();
 
                 let bound_config = match base_config
                     .bind_complete_generation(
@@ -1434,7 +1458,7 @@ async fn durable_gatherer_runner_for_tree<
                 };
                 let mut builder = match Builder::create_new_with_tree(
                     &mut tree,
-                    queue_key.unique_id,
+                    active_unique_id,
                     bound_config,
                 )
                 .await
@@ -1476,6 +1500,7 @@ async fn durable_gatherer_runner_for_tree<
                 };
                 tentative_builder = Some(builder);
                 applied = Some(receipt);
+                current_processing = Some(context.processing());
                 let _ = responder.send(Ok(response));
             }
             TreeGathererCommand::FinalizeDurableGeneration { receipt, responder } => {
@@ -1542,9 +1567,9 @@ async fn durable_gatherer_runner_for_tree<
                     let _ = responder.send(Err(GathererPauseError::RealmIdentityMismatch));
                     continue;
                 }
-                if request.expected_unique_id() != queue_key.unique_id {
+                if request.expected_unique_id() != active_unique_id {
                     let _ = responder.send(Err(GathererPauseError::UniqueIdMismatch {
-                        current: queue_key.unique_id,
+                        current: active_unique_id,
                         expected: request.expected_unique_id(),
                     }));
                     continue;
@@ -1564,7 +1589,7 @@ async fn durable_gatherer_runner_for_tree<
                     queue_topic_id: QUEUE_TOPIC_ID,
                     realm_id: queue_key.realm_id,
                     realm_sub_id: queue_key.realm_sub_id,
-                    unique_id: queue_key.unique_id,
+                    unique_id: active_unique_id,
                 };
                 let _ = responder.send(Ok(make_receipt()));
 
@@ -1588,7 +1613,7 @@ async fn durable_gatherer_runner_for_tree<
                             if !Arc::ptr_eq(&actor_identity, &receipt.actor_identity)
                                 || receipt.request != request
                                 || receipt.revision != actor_revision
-                                || receipt.unique_id != queue_key.unique_id
+                                || receipt.unique_id != active_unique_id
                             {
                                 let _ = responder.send(Err(GathererPauseError::StaleReceipt));
                                 continue;
@@ -1598,7 +1623,7 @@ async fn durable_gatherer_runner_for_tree<
                                 revision: actor_revision,
                                 phase: GathererBoundaryPhase::Running,
                                 request: None,
-                                unique_id: queue_key.unique_id,
+                                unique_id: active_unique_id,
                             }));
                             break;
                         }
@@ -1607,7 +1632,7 @@ async fn durable_gatherer_runner_for_tree<
                                 revision: actor_revision,
                                 phase: GathererBoundaryPhase::Paused,
                                 request: Some(request),
-                                unique_id: queue_key.unique_id,
+                                unique_id: active_unique_id,
                             });
                         }
                         TreeGathererCommand::Finalize { responder, .. } => {
@@ -1646,7 +1671,7 @@ async fn durable_gatherer_runner_for_tree<
                     revision: actor_revision,
                     phase: GathererBoundaryPhase::Running,
                     request: None,
-                    unique_id: queue_key.unique_id,
+                    unique_id: active_unique_id,
                 });
             }
             TreeGathererCommand::Finalize { responder, .. } => {
@@ -1667,6 +1692,24 @@ async fn durable_gatherer_runner_for_tree<
         }
     }
     Ok(())
+}
+
+fn can_advance_durable_actor(
+    current: Option<PendingGenerationContext>,
+    next: PendingGenerationContext,
+    source: RealmProcessorDeferredActorInputSource,
+    current_finalized: bool,
+) -> bool {
+    current_finalized
+        && current.is_some_and(|previous| {
+            matches!(
+                source,
+                RealmProcessorDeferredActorInputSource::Predecessor {
+                    predecessor,
+                    ..
+                } if predecessor == previous
+            ) && next != previous
+        })
 }
 
 async fn gatherer_runner_for_tree<
@@ -2192,6 +2235,19 @@ mod h23b1_tests {
                 RealmProcessorDurableCapturedGeneration,
                 RealmProcessorDurableCapturedItem,
             },
+            realm_processor_application_archive::{
+                RealmProcessorApplicationArchiveDigest,
+                RealmProcessorApplicationArchiveSlot,
+            },
+            realm_processor_generation_continuation::{
+                RealmProcessorApplicationContinuation,
+                RealmProcessorDeferredCarryoverDigest,
+            },
+            realm_processor_generation_terminal::{
+                RealmProcessorDeferredCarryoverRecordDigest,
+                RealmProcessorGenerationTerminalDigest,
+            },
+            realm_processor_semantic_output::RealmProcessorSemanticOutputDigest,
             realm_processor_external_dependency_input::{
                 RealmProcessorExternalDependencyItem,
                 RealmProcessorExternalDependencyProjection,
@@ -2653,6 +2709,89 @@ mod h23b1_tests {
         )
         .unwrap();
         RealmProcessorActorInput::try_new(durable_input(reason), external).unwrap()
+    }
+
+    fn predecessor_source(
+        predecessor: PendingGenerationContext,
+    ) -> RealmProcessorDeferredActorInputSource {
+        let application = RealmProcessorApplicationContinuation::try_from_committed_parts(
+            RealmProcessorApplicationArchiveSlot::try_new([41; 32]).unwrap(),
+            RealmProcessorApplicationArchiveDigest::try_new([42; 32]).unwrap(),
+            RealmProcessorSemanticOutputDigest::try_new([43; 32]).unwrap(),
+            false,
+            0,
+            RealmProcessorDeferredCarryoverDigest::try_new([44; 32]).unwrap(),
+        )
+        .unwrap();
+        RealmProcessorDeferredActorInputSource::Predecessor {
+            predecessor,
+            carryover_record_digest:
+                RealmProcessorDeferredCarryoverRecordDigest::try_new([45; 32]).unwrap(),
+            terminal_digest:
+                RealmProcessorGenerationTerminalDigest::try_new([46; 32]).unwrap(),
+            application,
+        }
+    }
+
+    #[test]
+    fn durable_actor_advances_only_from_finalized_exact_predecessor() {
+        let previous = PendingGenerationContext::try_from_legacy(101, 41).unwrap();
+        let next = PendingGenerationContext::try_from_legacy(102, 42).unwrap();
+        assert!(can_advance_durable_actor(
+            Some(previous),
+            next,
+            predecessor_source(previous),
+            true,
+        ));
+        assert!(!can_advance_durable_actor(
+            Some(previous),
+            next,
+            predecessor_source(previous),
+            false,
+        ));
+        assert!(!can_advance_durable_actor(
+            Some(previous),
+            next,
+            predecessor_source(next),
+            true,
+        ));
+        assert!(!can_advance_durable_actor(
+            Some(previous),
+            previous,
+            predecessor_source(previous),
+            true,
+        ));
+        assert!(!can_advance_durable_actor(
+            None,
+            next,
+            predecessor_source(previous),
+            true,
+        ));
+    }
+
+    #[test]
+    fn durable_actor_rebinds_namespace_only_after_predecessor_gate() {
+        let source = include_str!("gatherer.rs");
+        let runner = source
+            .split("async fn durable_gatherer_runner_for_tree")
+            .nth(1)
+            .unwrap()
+            .split("fn can_advance_durable_actor")
+            .next()
+            .unwrap();
+        let gate = runner.find("can_advance_durable_actor(").unwrap();
+        let reject = runner.find("if !advances_finalized_predecessor").unwrap();
+        let clear = runner.find("finalized_output = None").unwrap();
+        let bind = runner
+            .find("active_unique_id = context.processing().proc_checkpoint_id()")
+            .unwrap();
+        let builder = runner.find("Builder::create_new_with_tree").unwrap();
+
+        assert!(gate < reject && reject < clear && clear < bind && bind < builder);
+        assert!(!runner.contains(
+            "context.processing().proc_checkpoint_id().as_u128()\n                        != queue_key.unique_id"
+        ));
+        assert!(runner.contains("current_processing = Some(context.processing())"));
     }
 
     fn start_durable_test_gatherer(
