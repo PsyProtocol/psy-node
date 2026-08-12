@@ -516,7 +516,6 @@ pub enum RealmProcessorStartupError {
     CommitRuntimeInstallerMissing,
     ProofVerifierMissing,
     CommitRuntimeIdentityMismatch,
-    ServingCompositionNotIntegrated,
     UnexpectedProviderWhileDisabled,
     UnexpectedCommitRuntimeInstallerWhileDisabled,
     UnexpectedProofVerifierWhileDisabled,

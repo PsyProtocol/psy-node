@@ -96,10 +96,7 @@ where
                 .ok_or(RealmProcessorStartupError::CommitRuntimeInstallerMissing)?;
             let installed = installer.install(run_permit).await?;
             let commit_owner = RealmBranchExactSingleCommitOwner::from_installed(installed);
-            return Err(reject_unintegrated_branch_exact_serving(
-                RealmNormalCommitOwner::branch_exact(commit_owner),
-            )
-            .into());
+            RealmNormalCommitOwner::branch_exact(commit_owner)
         }
     };
 
@@ -219,20 +216,6 @@ where
     Ok(processor_result)
 }
 
-/// The non-Clone fresh permit is consumed at the real serving boundary. Until
-/// h23c4 replaces legacy startup/commit with the branch-aware composition,
-/// consuming it can only produce a fail-closed error.
-fn reject_unintegrated_branch_exact_serving<Hash>(
-    commit_owner: RealmNormalCommitOwner<Hash>,
-) -> RealmProcessorStartupError {
-    let RealmNormalCommitOwner::BranchExact(_commit_owner) = commit_owner else {
-        unreachable!("legacy owner cannot reach branch-exact serving guard")
-    };
-    RealmProcessorStartupError::ServingCompositionNotIntegrated
-}
-
-
-
 pub async fn create_realm_processor_and_run<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
     S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync + 'static,
@@ -301,7 +284,8 @@ mod tests {
     #[test]
     fn startup_preflight_precedes_every_realm_startup_side_effect() {
         let source = include_str!("create.rs");
-        let function = source
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let function = production
             .split("pub async fn create_realm_processor<")
             .nth(1)
             .expect("create_realm_processor must remain present");
@@ -321,9 +305,10 @@ mod tests {
     }
 
     #[test]
-    fn enabled_permit_is_rejected_until_production_composition_is_integrated() {
+    fn enabled_permit_installs_the_single_branch_exact_serving_owner() {
         let source = include_str!("create.rs");
-        let function = source
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let function = production
             .split("pub async fn create_realm_processor<")
             .nth(1)
             .expect("create_realm_processor must remain present");
@@ -347,31 +332,13 @@ mod tests {
             .expect("installed runtime must have one process-local owner");
         let routed_owner = function
             .find("RealmNormalCommitOwner::branch_exact(commit_owner)")
-            .expect("enabled startup must remain fail closed after installation");
-        let rejection = function
-            .find("reject_unintegrated_branch_exact_serving(")
-            .expect("enabled startup must remain fail closed after owner routing");
+            .expect("enabled startup must route the installed owner");
         let first_side_effect = function
             .find("GenesisDatabaseDataBuilder::<")
             .expect("genesis builder must remain present");
-        assert!(
-            install < owner
-                && owner < rejection
-                && rejection < routed_owner
-                && routed_owner < first_side_effect
-        );
-        let rejector = source
-            .split("fn reject_unintegrated_branch_exact_serving<Hash>(")
-            .nth(1)
-            .unwrap()
-            .split("pub async fn create_realm_processor_and_run")
-            .next()
-            .unwrap();
-        assert!(rejector.contains("commit_owner: RealmNormalCommitOwner<Hash>"));
-        assert!(rejector.contains("RealmNormalCommitOwner::BranchExact(_commit_owner)"));
-        assert!(rejector.contains(
-            "RealmProcessorStartupError::ServingCompositionNotIntegrated"
-        ));
+        assert!(install < owner && owner < routed_owner && routed_owner < first_side_effect);
+        assert!(!function.contains("reject_unintegrated_branch_exact_serving"));
+        assert!(!function.contains("ServingCompositionNotIntegrated"));
     }
 
     #[test]

@@ -1557,7 +1557,7 @@ mod h23c4c3b_tests {
     }
 
     #[test]
-    fn startup_selects_command_only_actor_and_keeps_default_off_guard() {
+    fn startup_selects_command_only_actor_and_routes_verified_serving_owner() {
         let startup = include_str!("startup.rs");
         let branch = startup
             .split("if branch_exact {")
@@ -1579,8 +1579,10 @@ mod h23c4c3b_tests {
         assert!(legacy.contains("db.guta_update_queue.clone()"));
 
         let create = include_str!("../create.rs");
-        assert!(create.contains("ServingCompositionNotIntegrated"));
-        assert!(create.contains("reject_unintegrated_branch_exact_serving"));
+        let production_create = create.split("#[cfg(test)]").next().unwrap();
+        assert!(production_create.contains("RealmNormalCommitOwner::branch_exact(commit_owner)"));
+        assert!(!production_create.contains("ServingCompositionNotIntegrated"));
+        assert!(!production_create.contains("reject_unintegrated_branch_exact_serving"));
     }
 
     #[test]

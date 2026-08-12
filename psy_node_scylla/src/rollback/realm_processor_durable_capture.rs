@@ -4325,17 +4325,19 @@ mod tests {
     }
 
     #[test]
-    fn restart_owner_is_not_called_by_production_processor_or_serving_composition() {
+    fn restart_repair_handles_are_not_exposed_to_the_processor_serving_route() {
         let process = include_str!(
             "../../../psy_node_common/src/realm/processor/core/process_block.rs"
         );
         let create = include_str!(
             "../../../psy_node_common/src/realm/processor/create.rs"
         );
+        let production_create = create.split("#[cfg(test)]").next().unwrap();
         assert!(!process.contains("open_continuation_restart"));
         assert!(!process.contains("open_terminal_carryover_recovery"));
         assert!(process.contains("REALM_BRANCH_EXACT_FULL_COMMIT_COVERAGE_NOT_INTEGRATED"));
-        assert!(create.contains("ServingCompositionNotIntegrated"));
+        assert!(production_create.contains("RealmNormalCommitOwner::branch_exact(commit_owner)"));
+        assert!(!production_create.contains("ServingCompositionNotIntegrated"));
     }
 
     #[test]
