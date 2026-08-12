@@ -327,7 +327,82 @@ fn ensure_private_transfer_contract_matches(contract_id: u64, token_contract_id:
 }
 
 impl PrivateTransferClaim {
+    fn expected_note_proof_public_inputs_hash(&self) -> QHashOut<F> {
+        let mut values = Vec::with_capacity(16);
+        values.extend(self.owner.iter().copied().map(F::from_noncanonical_u64));
+        values.push(F::from_noncanonical_u64(self.amount));
+        values.extend(self.user_tree_root.iter().copied().map(F::from_noncanonical_u64));
+        values.push(F::from_noncanonical_u64(self.checkpoint_id));
+        values.push(F::from_noncanonical_u64(self.note_root_slot));
+        values.push(F::from_noncanonical_u64(self.token_contract_id));
+        values.extend(self.nullifier.iter().copied().map(F::from_noncanonical_u64));
+        PsyHasher::q_hash_many(&values)
+    }
+
+    fn validate_note_proof_public_inputs(&self) -> anyhow::Result<QHashOut<F>> {
+        if self.note_proof.public_inputs.len() != 4 {
+            anyhow::bail!(
+                "private claim note proof must have 4 public inputs, got {}",
+                self.note_proof.public_inputs.len()
+            );
+        }
+        let actual = QHashOut(HashOut {
+            elements: [
+                self.note_proof.public_inputs[0],
+                self.note_proof.public_inputs[1],
+                self.note_proof.public_inputs[2],
+                self.note_proof.public_inputs[3],
+            ],
+        });
+        let expected = self.expected_note_proof_public_inputs_hash();
+        tracing::info!(
+            checkpoint_id = self.checkpoint_id,
+            note_root_slot = self.note_root_slot,
+            amount = self.amount,
+            fingerprint = %self.note_proof_fingerprint,
+            expected_public_inputs = %expected,
+            actual_public_inputs = %actual,
+            owner = ?self.owner,
+            user_tree_root = ?self.user_tree_root,
+            nullifier = ?self.nullifier,
+            "private claim note-proof public-input preflight"
+        );
+        if actual != expected {
+            anyhow::bail!(
+                "private claim payload does not match note proof public inputs: expected_from_payload={} actual_from_proof={} checkpoint_id={} contract_note_root_slot={} amount={}",
+                expected,
+                actual,
+                self.checkpoint_id,
+                self.note_root_slot,
+                self.amount
+            );
+        }
+        Ok(actual)
+    }
+
     pub fn to_contract_call_args(&self, contract_id: u64, proof_ref: &TraceExternalProofRef) -> anyhow::Result<ContractCallArgs> {
+        let public_inputs_hash = self.validate_note_proof_public_inputs()?;
+        let expected_leaf = PsyHasher::q_two_to_one(self.note_proof_fingerprint, public_inputs_hash);
+        tracing::info!(
+            proof_index = proof_ref.proof_index,
+            fingerprint = %self.note_proof_fingerprint,
+            public_inputs_hash = %public_inputs_hash,
+            expected_leaf = %expected_leaf,
+            actual_leaf = %proof_ref.leaf_proof.value,
+            leaf_path_root = %proof_ref.leaf_proof.root,
+            siblings_len = proof_ref.leaf_proof.siblings.len(),
+            first_sibling = ?proof_ref.leaf_proof.siblings.first(),
+            last_sibling = ?proof_ref.leaf_proof.siblings.last(),
+            "private claim proof-tree leaf preflight"
+        );
+        if proof_ref.leaf_proof.value != expected_leaf {
+            anyhow::bail!(
+                "private claim proof-tree leaf mismatch: expected_leaf={} actual_leaf={} proof_index={}",
+                expected_leaf,
+                proof_ref.leaf_proof.value,
+                proof_ref.proof_index
+            );
+        }
         ensure_private_transfer_contract_matches(contract_id, self.token_contract_id)?;
         Ok(ContractCallArgs {
             contract_id,
@@ -1612,11 +1687,25 @@ impl WalletSession {
             .get_mut(&public_key)
             .ok_or_else(|| anyhow::format_err!("user {} not found", public_key.to_string()))?;
 
+        let proof_tree_start_root = user_session_mgr.proof_tree_state.get_proof_tree_root().await;
+        let proof_public_inputs = proof.public_inputs.clone();
         let leaf_index = user_session_mgr.add_external_proof(fingerprint, proof, verifier_data).await;
         let proof_tree_root = user_session_mgr.proof_tree_state.get_proof_tree_root().await;
         user_session_mgr.require_lps_mut()?.set_proof_tree_root(proof_tree_root);
 
         let leaf_proof = user_session_mgr.proof_tree_state.get_leaf_merkle_proof(leaf_index).await;
+        tracing::info!(
+            proof_index = leaf_index,
+            fingerprint = %fingerprint,
+            proof_public_inputs = ?proof_public_inputs,
+            proof_tree_start_root = %proof_tree_start_root,
+            proof_tree_end_root = %proof_tree_root,
+            leaf_value = %leaf_proof.value,
+            leaf_path_root = %leaf_proof.root,
+            siblings_len = leaf_proof.siblings.len(),
+            siblings = ?leaf_proof.siblings,
+            "external proof inserted into trace proof tree"
+        );
         if leaf_proof.root != proof_tree_root {
             anyhow::bail!(
                 "external proof leaf_proof.root mismatch proof_tree_root: leaf={:?} tree={:?}",
@@ -1908,9 +1997,12 @@ impl WalletSession {
                         user_session_mgr.require_lps_mut()?.set_proof_tree_root(proof_tree_root);
                     }
                     ClaimBatchItem::PrivateTransfer { contract_id, claim } => {
+                        let public_inputs_hash = claim.validate_note_proof_public_inputs()?;
+                        let note_proof_fingerprint = claim.note_proof_fingerprint;
+                        let expected_leaf = PsyHasher::q_two_to_one(note_proof_fingerprint, public_inputs_hash);
                         let proof_index = user_session_mgr
                             .add_external_proof(
-                                claim.note_proof_fingerprint,
+                                note_proof_fingerprint,
                                 claim.note_proof,
                                 claim.note_verifier_data.to_verifier_data::<C, D>(),
                             )
@@ -1923,6 +2015,28 @@ impl WalletSession {
                                 "private_transfer leaf_proof.root mismatch proof_tree_root: leaf={:?} tree={:?}",
                                 leaf_proof.root,
                                 proof_tree_root
+                            );
+                        }
+                        tracing::info!(
+                            item_index,
+                            proof_index,
+                            fingerprint = %note_proof_fingerprint,
+                            public_inputs_hash = %public_inputs_hash,
+                            expected_leaf = %expected_leaf,
+                            actual_leaf = %leaf_proof.value,
+                            leaf_path_root = %leaf_proof.root,
+                            proof_tree_root = %proof_tree_root,
+                            siblings_len = leaf_proof.siblings.len(),
+                            first_sibling = ?leaf_proof.siblings.first(),
+                            last_sibling = ?leaf_proof.siblings.last(),
+                            "private claim proof-tree preflight inside claim batch"
+                        );
+                        if leaf_proof.value != expected_leaf {
+                            anyhow::bail!(
+                                "private claim proof-tree leaf mismatch inside claim batch: expected_leaf={} actual_leaf={} proof_index={}",
+                                expected_leaf,
+                                leaf_proof.value,
+                                proof_index
                             );
                         }
                         let inputs = Self::build_private_claim_inputs(
@@ -2674,11 +2788,32 @@ impl WalletSession {
 
         let proof_tree_start_root = user_session_mgr.proof_tree_state.get_proof_tree_root().await;
         let proof_bytes = bincode::serialize(&proof)?;
+        let proof_public_inputs = proof.public_inputs.clone();
         let verifier_data_alt = AltVerifierOnlyCircuitData::from(&verifier_data);
         let leaf_index = user_session_mgr.add_external_proof(fingerprint, proof, verifier_data).await;
         let proof_tree_end_root = user_session_mgr.proof_tree_state.get_proof_tree_root().await;
         user_session_mgr.require_lps_mut()?.set_proof_tree_root(proof_tree_end_root);
         let leaf_proof = user_session_mgr.proof_tree_state.get_leaf_merkle_proof(leaf_index).await;
+        tracing::info!(
+            proof_index = leaf_index,
+            fingerprint = %fingerprint,
+            proof_public_inputs = ?proof_public_inputs,
+            proof_tree_start_root = %proof_tree_start_root,
+            proof_tree_end_root = %proof_tree_end_root,
+            leaf_value = %leaf_proof.value,
+            leaf_path_root = %leaf_proof.root,
+            siblings_len = leaf_proof.siblings.len(),
+            siblings = ?leaf_proof.siblings,
+            "external proof inserted into trace proof tree"
+        );
+        if leaf_proof.root != proof_tree_end_root {
+            anyhow::bail!(
+                "external proof leaf path root mismatch after insertion: proof_index={} leaf_root={} tree_root={}",
+                leaf_index,
+                leaf_proof.root,
+                proof_tree_end_root
+            );
+        }
         let siblings = leaf_proof
             .siblings
             .iter()
@@ -5350,7 +5485,7 @@ mod async_split_tests {
             let local = PrivateNoteInclusionCircuit::<C, D>::new(
                 psy_config::network_constants::GLOBAL_USER_TREE_HEIGHT as usize,
                 psy_config::network_constants::GLOBAL_CONTRACT_TREE_HEIGHT as usize,
-                psy_config::network_constants::MAX_CONTRACT_STATE_TREE_HEIGHT as usize,
+                psy_config::network_constants::TOKEN_CONTRACT_STATE_TREE_HEIGHT as usize,
                 20,
             );
             let local_fingerprint = local.get_fingerprint();
@@ -5864,8 +5999,8 @@ mod async_split_tests {
         };
 
         let simulated = wallet_session.simulate_contract_call(user0, call_data.clone()).await?;
-        let generated = &simulated.generated;
-        assert_eq!(simulated.metadata.tx_hash.to_string(), generated.tx_hash);
+        let generated = simulated.generated.as_ref().expect("simulation should include a generated tx trace");
+        assert_eq!(simulated.metadata.tx_hash.expect("simulation should include a tx hash").to_string(), generated.tx_hash);
         assert!(!generated.trace.payload.is_empty());
         assert_eq!(simulated.metadata.contract_call_data.contract_calls.len(), 1);
         assert_eq!(simulated.metadata.contract_call_data.contract_calls[0].contract_id, contract_id);

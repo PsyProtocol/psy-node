@@ -242,13 +242,10 @@ pub fn compute_contract_layout(
         }
     }
 
-    // Compute state tree height
+    // Contract-state Merkle leaves pack four felts. Size the tree from the
+    // number of packed leaves, and retain the protocol's minimum height.
     let total_virtual_size = offset;
-    let state_tree_height = if total_virtual_size <= 1 {
-        1
-    } else {
-        (total_virtual_size as f64).log2().ceil() as u16
-    };
+    let state_tree_height = state_tree_height_for_total_felts(total_virtual_size);
 
     Ok(ContractStateLayout {
         contract_name: contract_name.to_string(),
@@ -260,6 +257,19 @@ pub fn compute_contract_layout(
         has_imt_map,
         imt_map_field_name,
     })
+}
+
+/// Compute the contract-state Merkle height for a felt footprint.
+///
+/// This must stay identical to psy-compiler/psy-abi's calculation.
+pub fn state_tree_height_for_total_felts(total_felts: usize) -> u16 {
+    let total_leaves = total_felts.max(1).saturating_add(3) / 4;
+    if total_leaves <= 1 {
+        0
+    } else {
+        (usize::BITS - (total_leaves - 1).leading_zeros()) as u16
+    }
+    .max(4)
 }
 
 /// Resolve an AST Type to a ResolvedType, given known constants.
@@ -343,5 +353,19 @@ impl ContractStateLayout {
             .get(struct_name)
             .and_then(|layout| layout.fields.iter().find(|f| f.name == field_name))
             .map(|f| f.offset)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::state_tree_height_for_total_felts;
+
+    #[test]
+    fn state_tree_height_matches_packed_leaf_boundaries() {
+        assert_eq!(state_tree_height_for_total_felts(0), 4);
+        assert_eq!(state_tree_height_for_total_felts(64), 4);
+        assert_eq!(state_tree_height_for_total_felts(65), 5);
+        assert_eq!(state_tree_height_for_total_felts(128), 5);
+        assert_eq!(state_tree_height_for_total_felts(129), 6);
     }
 }

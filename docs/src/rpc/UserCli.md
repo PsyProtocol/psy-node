@@ -77,7 +77,7 @@ This interface focuses on querying roots, leaf hashes, and Merkle proofs of vari
 | Method Name | Parameter Description | Return Value | Function Description | Called Node |
 |-------------|------------------------|--------------|----------------------|-------------|
 | `get_user_contract_state_tree_root` | - `checkpoint_id: u64`: Unique identifier for the checkpoint<br>- `user_id: u64`: Unique identifier for the user<br>- `contract_id: u32`: Unique identifier for the contract | `QHashOut<F>` | Queries the root hash of a user's contract state tree under a specified checkpoint | Realm Node |
-| `get_user_contract_state_tree_leaf_hash` | - Same as above<br>- `height: u8`: Height of the state tree<br>- `leaf_id: u64`: Unique identifier for the leaf node | `QHashOut<F>` | Queries the hash of a specified leaf node in the state tree | Realm Node |
+| `get_user_contract_state_tree_leaf_hash` | - Same as above<br>- `leaf_id: u64`: Unique identifier for the leaf node | `QHashOut<F>` | Queries the hash of a specified leaf node in the state tree | Realm Node |
 | `get_user_contract_state_tree_merkle_proof` | Same parameters as above | `MerkleProofCore<QHashOut<F>>` | Queries the Merkle proof of a specified leaf node in the state tree (including verification logic) | Realm Node |
 
 #### (2) User Contract Tree Queries (User-Contract Association)
@@ -162,4 +162,3 @@ This interface focuses on querying core blockchain metadata, including complete 
 | `get_checkpoint_leaf_data` | - `checkpoint_id: u64`: Unique identifier for the checkpoint | `PsyCheckpointLeaf<F>` | Queries complete leaf data for a specified checkpoint (including global state root, block information, etc.) | Coordinator Node |
 | `get_latest_block_state` | No parameters | `PsyBlockState` | Queries the complete state of the latest L2 block (including block height, transaction count, etc.) | Coordinator Node |
 | `get_block_state` | - `checkpoint_id: u64`: Unique identifier for the checkpoint | `PsyBlockState` | Queries the L2 block state corresponding to a specified checkpoint | Coordinator Node |
-

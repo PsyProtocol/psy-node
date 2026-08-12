@@ -108,7 +108,8 @@ where
         checkpoint_tree_height: usize,
         global_user_tree_height: usize,
         global_contract_tree_height: usize,
-        contract_state_tree_height: usize,
+        deposit_contract_state_tree_height: usize,
+        withdrawal_contract_state_tree_height: usize,
     ) -> Self {
         let config = CircuitConfig::standard_recursion_config();
         let mut builder = CircuitBuilder::<C::F, D>::new(config);
@@ -256,14 +257,14 @@ where
                 &mut builder,
                 global_user_tree_height,
                 global_contract_tree_height,
-                contract_state_tree_height,
+                deposit_contract_state_tree_height,
             );
         let withdrawal_root_gadget =
             TreeRootInContractStateGadget::add_virtual_to::<C::Hasher, C::F, D>(
                 &mut builder,
                 global_user_tree_height,
                 global_contract_tree_height,
-                contract_state_tree_height,
+                withdrawal_contract_state_tree_height,
             );
         builder.connect_hashes(
             withdrawal_root_gadget.user_tree_root,
@@ -389,7 +390,8 @@ where
         checkpoint_tree_height: usize,
         user_tree_height: usize,
         contract_tree_height: usize,
-        contract_state_tree_height: usize,
+        deposit_contract_state_tree_height: usize,
+        withdrawal_contract_state_tree_height: usize,
     ) -> Self {
         let chain_circuit = BridgeAggChainCircuit::<C, D>::new(
             checkpoint_base_fingerprint,
@@ -409,7 +411,8 @@ where
             checkpoint_tree_height,
             user_tree_height,
             contract_tree_height,
-            contract_state_tree_height,
+            deposit_contract_state_tree_height,
+            withdrawal_contract_state_tree_height,
         )
     }
 
@@ -433,7 +436,8 @@ where
         checkpoint_tree_height: usize,
         user_tree_height: usize,
         contract_tree_height: usize,
-        contract_state_tree_height: usize,
+        deposit_contract_state_tree_height: usize,
+        withdrawal_contract_state_tree_height: usize,
     ) -> anyhow::Result<BridgeAggProveResult<C, D>> {
         anyhow::ensure!(
             from_checkpoint <= to_checkpoint,
@@ -504,7 +508,8 @@ where
             checkpoint_tree_height,
             user_tree_height,
             contract_tree_height,
-            contract_state_tree_height,
+            deposit_contract_state_tree_height,
+            withdrawal_contract_state_tree_height,
         );
         let terminal_slots = delta_merkle_proofs[prefix_len..total]
             .iter()
@@ -963,6 +968,7 @@ mod tests {
             20,
             2,
             TEST_CONTRACT_STATE_TREE_HEIGHT,
+            TEST_CONTRACT_STATE_TREE_HEIGHT,
         )
     }
 
@@ -1066,6 +1072,7 @@ mod tests {
                 self.checkpoint_tree_height,
                 20,
                 2,
+                TEST_CONTRACT_STATE_TREE_HEIGHT,
                 TEST_CONTRACT_STATE_TREE_HEIGHT,
             )
         }
@@ -1196,6 +1203,7 @@ mod tests {
             20,
             2,
             TEST_CONTRACT_STATE_TREE_HEIGHT,
+            TEST_CONTRACT_STATE_TREE_HEIGHT,
         )
         .unwrap();
 
@@ -1232,6 +1240,7 @@ mod tests {
             fixture.checkpoint_tree_height,
             20,
             2,
+            TEST_CONTRACT_STATE_TREE_HEIGHT,
             TEST_CONTRACT_STATE_TREE_HEIGHT,
         ) {
             Ok(_) => panic!("empty range unexpectedly proved"),
@@ -1271,6 +1280,7 @@ mod tests {
                 fixture.checkpoint_tree_height,
                 20,
                 2,
+                TEST_CONTRACT_STATE_TREE_HEIGHT,
                 TEST_CONTRACT_STATE_TREE_HEIGHT,
             )
         };
@@ -1366,6 +1376,7 @@ mod tests {
             1,
             1,
             TEST_CONTRACT_STATE_TREE_HEIGHT,
+            TEST_CONTRACT_STATE_TREE_HEIGHT,
         );
 
         assert_eq!(final_circuit.circuit_data.common.num_public_inputs, BRIDGE_AGG_FINAL_PI_LEN);
@@ -1413,6 +1424,7 @@ mod tests {
             checkpoint_tree_height,
             20,
             2,
+            TEST_CONTRACT_STATE_TREE_HEIGHT,
             TEST_CONTRACT_STATE_TREE_HEIGHT,
         );
         let proof = final_circuit

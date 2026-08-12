@@ -407,8 +407,6 @@ async fn get_l2_deposit_tree_next_index(cfg: &Cfg) -> anyhow::Result<i64> {
         .arg("524288")
         .arg("--contract-id")
         .arg(cfg.deposit_tree_contract_id.to_string())
-        .arg("--height")
-        .arg("32")
         .arg("--leaf-id")
         .arg("2")
         .env("RUST_LOG", "error")

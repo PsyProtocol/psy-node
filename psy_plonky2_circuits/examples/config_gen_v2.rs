@@ -322,6 +322,7 @@ fn generate_groth16_setup<N: QNetworkCircuitConstants>(
         N::GLOBAL_USER_TREE_HEIGHT_USIZE,
         N::GLOBAL_CONTRACT_TREE_HEIGHT_USIZE,
         N::MAX_CONTRACT_STATE_TREE_HEIGHT_USIZE,
+        N::MAX_CONTRACT_STATE_TREE_HEIGHT_USIZE,
     );
 
     let bridge_agg_common = &final_circuit.circuit_data.common;

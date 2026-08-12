@@ -586,7 +586,6 @@ Get user contract state tree leaf hash (u64 parameters).
   "checkpoint_id": 100,
   "user_id": 12345,
   "contract_id": 5,
-  "height": 10,
   "leaf_id": 42
 }
 ```
@@ -596,7 +595,6 @@ Get user contract state tree leaf hash (u64 parameters).
 | `checkpoint_id` | `u64` | The checkpoint ID |
 | `user_id` | `u64` | The user ID |
 | `contract_id` | `u32` | The contract ID |
-| `height` | `u8` | The tree height |
 | `leaf_id` | `u64` | The leaf ID |
 
 **Response**: See [QHashOut](#qhashout)
@@ -615,7 +613,6 @@ Get user contract state tree leaf hash (Field parameters).
   "checkpoint_id": "100",
   "user_id": "12345",
   "contract_id": "5",
-  "height": 10,
   "leaf_id": "42"
 }
 ```
@@ -625,7 +622,6 @@ Get user contract state tree leaf hash (Field parameters).
 | `checkpoint_id` | `F` (Field) | The checkpoint ID as a field element |
 | `user_id` | `F` (Field) | The user ID as a field element |
 | `contract_id` | `F` (Field) | The contract ID as a field element |
-| `height` | `u8` | The tree height |
 | `leaf_id` | `F` (Field) | The leaf ID as a field element |
 
 **Response**: See [QHashOut](#qhashout)
@@ -644,7 +640,6 @@ Get Merkle proof for user contract state tree (u64 parameters).
   "checkpoint_id": 100,
   "user_id": 12345,
   "contract_id": 5,
-  "height": 10,
   "leaf_id": 42
 }
 ```
@@ -654,7 +649,6 @@ Get Merkle proof for user contract state tree (u64 parameters).
 | `checkpoint_id` | `u64` | The checkpoint ID |
 | `user_id` | `u64` | The user ID |
 | `contract_id` | `u32` | The contract ID |
-| `height` | `u8` | The tree height |
 | `leaf_id` | `u64` | The leaf ID |
 
 **Response**: See [MerkleProofCore](#merkleproofcore)
@@ -673,7 +667,6 @@ Get Merkle proof for user contract state tree (Field parameters).
   "checkpoint_id": "100",
   "user_id": "12345",
   "contract_id": "5",
-  "height": 10,
   "leaf_id": "42"
 }
 ```
@@ -683,7 +676,6 @@ Get Merkle proof for user contract state tree (Field parameters).
 | `checkpoint_id` | `F` (Field) | The checkpoint ID as a field element |
 | `user_id` | `F` (Field) | The user ID as a field element |
 | `contract_id` | `F` (Field) | The contract ID as a field element |
-| `height` | `u8` | The tree height |
 | `leaf_id` | `F` (Field) | The leaf ID as a field element |
 
 **Response**: See [MerkleProofCore](#merkleproofcore)

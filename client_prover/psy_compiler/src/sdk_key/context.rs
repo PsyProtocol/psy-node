@@ -96,8 +96,8 @@ impl<'a> SDKKeyCompilerContext<'a> {
         method: &CheckedMethod,
         helpers: &HashMap<String, &CheckedMethod>,
     ) -> Result<DPNFunctionCircuitDefinition> {
-        let mut exec = QExecContext::new();
         let layout = &self.checked.contract_layout;
+        let mut exec = QExecContext::new_with_contract_state_tree_height(layout.state_tree_height);
 
         // Register inputs for non-self, non-ctx parameters
         let mut locals: HashMap<String, SymValue> = HashMap::new();

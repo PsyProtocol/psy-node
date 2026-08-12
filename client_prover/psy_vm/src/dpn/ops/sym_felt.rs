@@ -720,7 +720,12 @@ impl QStateInitializable for SymFeltRef {
         contract_id: SymFeltRef,
         user_id: SymFeltRef,
     ) -> Self {
-        context.op_get_state_felt(contract_state_tree_height, contract_id, user_id, state_pointer)
+        context.op_get_state_felt(
+            SymFeltRef::new_constant(contract_state_tree_height as u64),
+            contract_id,
+            user_id,
+            state_pointer,
+        )
     }
 }
 

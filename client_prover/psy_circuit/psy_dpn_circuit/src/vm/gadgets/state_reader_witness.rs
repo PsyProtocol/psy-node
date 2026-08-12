@@ -47,6 +47,40 @@ impl StateReaderGadgetWitnessBuilderState {
 }
 // witness handlers
 impl StateReaderGadget {
+    fn dynamic_contract_state_tree_height<F: RichField>(cmd_witness: &PsyCmdWithInputAndWitness<F>) -> anyhow::Result<usize> {
+        let height = match &cmd_witness.state_cmd {
+            DPNStateCmd::GetSelfUserExternalContractStateSlotHash(c) => c.contract_state_tree_height,
+            DPNStateCmd::GetSelfUserExternalContractStateSlotSingle(c) => c.contract_state_tree_height,
+            DPNStateCmd::GetSelfUserExternalContractStateSlotRange(c) => c.contract_state_tree_height,
+            DPNStateCmd::GetOtherUserContractStateSlotHash(c) => c.contract_state_tree_height,
+            DPNStateCmd::GetOtherUserContractStateSlotSingle(c) => c.contract_state_tree_height,
+            DPNStateCmd::GetOtherUserContractStateSlotRange(c) => c.contract_state_tree_height,
+            DPNStateCmd::GetSelfUserExternalIMTContractStateValue(c) => c.contract_state_tree_height,
+            DPNStateCmd::GetOtherUserIMTContractStateValue(c) => c.contract_state_tree_height,
+            DPNStateCmd::ContainsOtherUserIMTContractStateValue(c) => c.contract_state_tree_height,
+            command => anyhow::bail!("state command does not carry a dynamic contract state tree height: {:?}", command),
+        } as usize;
+        if !(1..=32).contains(&height) {
+            anyhow::bail!("contract state tree height {} is outside supported range 1..=32", height);
+        }
+        Ok(height)
+    }
+
+    fn validate_dynamic_merkle_proof_height<F: RichField>(
+        cmd_witness: &PsyCmdWithInputAndWitness<F>,
+        proof: &MerkleProofCore<QHashOut<F>>,
+    ) -> anyhow::Result<()> {
+        let expected_height = Self::dynamic_contract_state_tree_height(cmd_witness)?;
+        if proof.siblings.len() != expected_height {
+            anyhow::bail!(
+                "contract state proof height mismatch: expected_height={} rpc_siblings_len={}",
+                expected_height,
+                proof.siblings.len()
+            );
+        }
+        Ok(())
+    }
+
     fn set_witness_for_key_dmp<W: Witness<F>, F: RichField>(
         &self,
         witness: &mut W,
@@ -85,6 +119,14 @@ impl StateReaderGadget {
         match reader_ref_key.gadget_type {
             StateReaderReferenceKeyType::MerkleProof => {
                 self.merkle_proofs[reader_ref_key.gadget_index].set_witness_generic::<W, F>(
+                    witness,
+                    F::from_noncanonical_u64(witness_value.index),
+                    witness_value.value,
+                    &witness_value.siblings,
+                )?;
+            }
+            StateReaderReferenceKeyType::VariableHeightMerkleProof => {
+                self.variable_height_merkle_proofs[reader_ref_key.gadget_index].set_witness_generic::<W, F>(
                     witness,
                     F::from_noncanonical_u64(witness_value.index),
                     witness_value.value,
@@ -235,6 +277,7 @@ impl StateReaderGadget {
                 let contract_state_tree_ck =
                     StateCommandCacheKey::new_read_self_user_external_contract_slot(c.contract_id, c.slot_index, wb_state.contract_call_epoch);
 
+                Self::validate_dynamic_merkle_proof_height(cmd_witness, &proofs[1])?;
                 self.set_witness_for_key_mp(witness, &contract_state_tree_ck, &proofs[1])?;
             }
             DPNStateCmd::GetSelfUserExternalContractStateSlotSingle(c) => {
@@ -247,6 +290,7 @@ impl StateReaderGadget {
 
                 self.set_witness_for_key_mp(witness, &read_root_ck, &proofs[0])?;
 
+                Self::validate_dynamic_merkle_proof_height(cmd_witness, &proofs[1])?;
                 self.set_witness_for_key_mp(witness, &contract_state_tree_ck, &proofs[1])?;
             }
             DPNStateCmd::GetSelfUserExternalContractStateSlotRange(c) => {
@@ -264,6 +308,7 @@ impl StateReaderGadget {
                         i as u64,
                     );
 
+                    Self::validate_dynamic_merkle_proof_height(cmd_witness, p)?;
                     self.set_witness_for_key_mp(witness, &contract_state_tree_ck, p)?;
                 }
             }
@@ -293,6 +338,7 @@ impl StateReaderGadget {
                 self.set_witness_for_key_mp(witness, &user_tree_ck, &read_witness.user_leaf_witness.user_tree_proof)?;
                 self.set_witness_for_key_user_leaf(witness, &user_leaf_ck, &read_witness.user_leaf_witness.user_leaf)?;
                 self.set_witness_for_key_mp(witness, &uct_ck, &read_witness.contract_state_proof)?;
+                Self::validate_dynamic_merkle_proof_height(cmd_witness, &read_witness.state_slot_proofs[0])?;
                 self.set_witness_for_key_mp(witness, &cst_ck, &read_witness.state_slot_proofs[0])?;
             }
             DPNStateCmd::GetOtherUserContractStateSlotSingle(c) => {
@@ -315,6 +361,7 @@ impl StateReaderGadget {
                 self.set_witness_for_key_mp(witness, &user_tree_ck, &read_witness.user_leaf_witness.user_tree_proof)?;
                 self.set_witness_for_key_user_leaf(witness, &user_leaf_ck, &read_witness.user_leaf_witness.user_leaf)?;
                 self.set_witness_for_key_mp(witness, &uct_ck, &read_witness.contract_state_proof)?;
+                Self::validate_dynamic_merkle_proof_height(cmd_witness, &read_witness.state_slot_proofs[0])?;
                 self.set_witness_for_key_mp(witness, &cst_ck, &read_witness.state_slot_proofs[0])?;
             }
             DPNStateCmd::GetOtherUserContractStateSlotRange(c) => {
@@ -341,6 +388,7 @@ impl StateReaderGadget {
                         i as u64,
                     );
 
+                    Self::validate_dynamic_merkle_proof_height(cmd_witness, mp)?;
                     self.set_witness_for_key_mp(witness, &cst_ck, mp)?;
                 }
             }
@@ -521,6 +569,7 @@ impl StateReaderGadget {
                             read_witness.contract_tree_proof.value,
                             &read_witness.contract_tree_proof.siblings,
                         )?;
+                        Self::validate_dynamic_merkle_proof_height(cmd_witness, &read_witness.state_slot_proof)?;
                         gadget.state_slot_proof.set_witness_generic::<W, F>(
                             witness,
                             F::from_noncanonical_u64(read_witness.state_slot_proof.index),
@@ -549,6 +598,7 @@ impl StateReaderGadget {
                 match reader_ref_key.gadget_type {
                     StateReaderReferenceKeyType::IMTOtherUserRead => {
                         let gadget = &self.imt_other_user_read_requests[reader_ref_key.gadget_index];
+                        Self::validate_dynamic_merkle_proof_height(cmd_witness, &read_witness.state_slot_proof)?;
                         gadget.state_slot_proof.set_witness_generic::<W, F>(
                             witness,
                             F::from_noncanonical_u64(read_witness.state_slot_proof.index),
@@ -577,6 +627,7 @@ impl StateReaderGadget {
                 match reader_ref_key.gadget_type {
                     StateReaderReferenceKeyType::IMTContainsOtherUser => {
                         let gadget = &self.imt_contains_other_user_requests[reader_ref_key.gadget_index];
+                        Self::validate_dynamic_merkle_proof_height(cmd_witness, &read_witness.state_slot_proof)?;
                         gadget.state_slot_proof.set_witness_generic::<W, F>(
                             witness,
                             F::from_noncanonical_u64(read_witness.state_slot_proof.index),
@@ -597,17 +648,31 @@ impl StateReaderGadget {
         witness: &mut W,
         input: &DapenContractFunctionCircuitInput<F>,
         fn_def: &DPNFunctionCircuitDefinition,
-    ) {
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            fn_def.state_commands.len() == input.cmd_witnesses.len(),
+            "state command/witness count mismatch: commands={} witnesses={}",
+            fn_def.state_commands.len(),
+            input.cmd_witnesses.len()
+        );
         let mut wb = StateReaderGadgetWitnessBuilderState::new();
 
-        for (dsc, ciw) in fn_def.state_commands.iter().zip(input.cmd_witnesses.iter()) {
+        for (command_index, (dsc, ciw)) in fn_def.state_commands.iter().zip(input.cmd_witnesses.iter()).enumerate() {
             tracing::debug!(
                 target: "state_reader_witness_dump",
                 "set_witness dsc: {}, ciw: {}",
                 serde_json::to_string_pretty(dsc).unwrap(),
                 serde_json::to_string_pretty(ciw).unwrap()
             );
-            self.set_witness_single(witness, dsc, ciw, &mut wb).unwrap();
+            self.set_witness_single(witness, dsc, ciw, &mut wb).map_err(|err| {
+                anyhow::anyhow!(
+                    "failed to set state command witness at index {}: command={} error={:#}",
+                    command_index,
+                    serde_json::to_string(dsc).unwrap_or_else(|_| format!("{:?}", dsc)),
+                    err
+                )
+            })?;
         }
+        Ok(())
     }
 }

@@ -211,7 +211,7 @@ impl<
             DPNStateCmdGetSelfUserExternalContractStateSlotHash {
                 contract_id,
                 slot_index,
-                contract_state_tree_height: state_tree_height,
+                contract_state_tree_height: F::from_canonical_u8(state_tree_height),
             },
         ));
 
@@ -313,7 +313,7 @@ impl<
                 user_id,
                 contract_id,
                 slot_index,
-                contract_state_tree_height: state_tree_height,
+                contract_state_tree_height: F::from_canonical_u8(state_tree_height),
             },
         ));
 

@@ -394,7 +394,7 @@ async fn main() -> anyhow::Result<()> {
             use psy_provider::provider::RpcProvider;
             let provider = RpcProvider::new_with_config_path(&args.rpc_config)?;
             let hash = provider
-                .get_user_contract_state_tree_leaf_hash(args.checkpoint_id, args.user_id, args.contract_id, args.height, args.leaf_id)
+                .get_user_contract_state_tree_leaf_hash(args.checkpoint_id, args.user_id, args.contract_id, 0, args.leaf_id)
                 .await?;
             println!("{}", serde_json::to_string_pretty(&hash)?);
             CommandResult::LeafHash(LeafHashResult { leaf_hash: hash })
@@ -414,7 +414,10 @@ async fn main() -> anyhow::Result<()> {
             use psy_provider::provider::RpcProvider;
             let provider = RpcProvider::new_with_config_path(&args.rpc_config)?;
             let proof = provider
-                .get_user_contract_state_tree_merkle_proof(args.checkpoint_id, args.user_id, args.contract_id, args.height, args.leaf_id)
+                // The Realm resolves the deployed contract's state-tree height.
+                // The legacy local trait parameter is intentionally ignored by
+                // RpcProvider and can be removed in a follow-up API cleanup.
+                .get_user_contract_state_tree_merkle_proof(args.checkpoint_id, args.user_id, args.contract_id, 0, args.leaf_id)
                 .await?;
             println!("{}", serde_json::to_string_pretty(&proof)?);
             CommandResult::MerkleProof(MerkleProofResult { merkle_proof: proof })

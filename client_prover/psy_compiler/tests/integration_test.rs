@@ -206,8 +206,9 @@ fn test_resolve_example() {
     assert_eq!(layout.fields[1].array_count, Some(1073741824));
     assert_eq!(layout.fields[1].element_felt_size, Some(2));
 
-    // state_tree_height = ceil(log2(4 + 1073741824*2)) = 32
-    assert_eq!(layout.state_tree_height, 32);
+    // Four felts are packed per leaf:
+    // ceil(log2(ceil((4 + 1073741824*2) / 4))) = 30.
+    assert_eq!(layout.state_tree_height, 30);
 }
 
 #[test]
@@ -445,7 +446,7 @@ impl SimpleContract {
     let output = result.unwrap();
 
     assert_eq!(output.method_count(), 2);
-    assert_eq!(output.state_tree_height(), 1); // ceil(log2(1)) = 1 (single felt)
+    assert_eq!(output.state_tree_height(), 4); // one packed leaf, protocol minimum 4
     assert_eq!(output.abi.contract_name, "SimpleContract");
     assert_eq!(output.abi.methods.len(), 2);
     assert_eq!(output.abi.methods[0].name, "set_value");
@@ -589,8 +590,8 @@ impl ArrayContract {
     assert!(result.is_ok(), "Compilation failed: {:?}", result.err());
     let output = result.unwrap();
 
-    // State tree height: ceil(log2(1 + 1024*2)) = ceil(log2(2049)) = 12
-    assert_eq!(output.state_tree_height(), 12);
+    // State tree height: ceil(log2(ceil((1 + 1024*2) / 4))) = 10
+    assert_eq!(output.state_tree_height(), 10);
 
     // ABI should describe the array
     assert!(output.abi.state_layout.len() == 2);

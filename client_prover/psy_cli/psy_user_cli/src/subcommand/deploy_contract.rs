@@ -7,11 +7,19 @@ use psy_provider::{
     provider::{QUserRpcProvider, RpcProvider},
     request::QDeployContractRPCRequest,
 };
-use psy_vm::dpn::vm::def::{derive_state_tree_height, DPNFunctionCircuitDefinition};
+use psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition;
+use serde::Deserialize;
 
 use super::{args::DeployContractArgs, contract_abi_upload};
 use crate::result::{CommandResult, DeployResult, DeployStatus};
 
+#[derive(Deserialize)]
+struct CompilationArtifact {
+    state_tree_height: u16,
+    circuit_definitions: Vec<DPNFunctionCircuitDefinition>,
+}
+
+// #[cfg(feature = "is_sync")]
 pub async fn run(args: DeployContractArgs) -> anyhow::Result<CommandResult> {
     tracing::info!("deploying contract");
 
@@ -25,10 +33,9 @@ pub async fn run(args: DeployContractArgs) -> anyhow::Result<CommandResult> {
     let info = load_wallet_key_info(&args.wallet, false)?;
     let deployer = info.public_key_hash;
 
-    let defs_array: Vec<DPNFunctionCircuitDefinition> = serde_json::from_str(&fs::read_to_string(args.contract_path)?)?;
-
-    tracing::info!("getting contract state tree height");
-    let contract_state_tree_height = derive_state_tree_height(&defs_array) as usize;
+    let artifact: CompilationArtifact = serde_json::from_str(&fs::read_to_string(args.contract_path)?)?;
+    let defs_array = artifact.circuit_definitions;
+    let contract_state_tree_height = usize::from(artifact.state_tree_height);
 
     tracing::info!("generating circuits");
     let (_result_circuits, deploy_cmd) =

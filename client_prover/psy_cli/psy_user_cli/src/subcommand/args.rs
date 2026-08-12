@@ -152,8 +152,6 @@ pub struct UserContractStateTreeLeafHashArgs {
     #[arg(long, env)]
     pub contract_id: u32,
     #[arg(long, env)]
-    pub height: u8,
-    #[arg(long, env)]
     pub leaf_id: u64,
 }
 
@@ -181,8 +179,6 @@ pub struct UserContractStateTreeMerkleProofArgs {
     pub user_id: u64,
     #[arg(long, env)]
     pub contract_id: u32,
-    #[arg(long, env)]
-    pub height: u8,
     #[arg(long, env)]
     pub leaf_id: u64,
 }

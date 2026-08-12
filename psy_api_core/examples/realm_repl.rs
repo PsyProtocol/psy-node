@@ -76,10 +76,10 @@ impl ReplHelper {
         commands.insert("get_checkpoint_global_state_roots", "<checkpoint_id>");
         commands.insert("get_user_leaf_data", "<checkpoint_id> <user_id>");
         commands.insert("get_user_contract_state_tree_root", "<checkpoint_id> <user_id> <contract_id>");
-        commands.insert("get_user_contract_state_tree_leaf_hash", "<checkpoint_id> <user_id> <contract_id> <height> <leaf_id>");
+        commands.insert("get_user_contract_state_tree_leaf_hash", "<checkpoint_id> <user_id> <contract_id> <leaf_id>");
         commands.insert("get_user_contract_state_tree_nodes", r#"<checkpoint_id> '[{"user_id":1,"contract_id":2,"node_key":{"level":3,"index":4}},...]"'"#);
         commands.insert("get_user_contract_tree_nodes", r#"<checkpoint_id> '[{"user_id":1,"node_key":{"level":2,"index":3}},...]"'"#);
-        commands.insert("get_user_contract_state_tree_merkle_proof", "<checkpoint_id> <user_id> <contract_id> <height> <leaf_id>");
+        commands.insert("get_user_contract_state_tree_merkle_proof", "<checkpoint_id> <user_id> <contract_id> <leaf_id>");
         commands.insert("get_user_contract_tree_root", "<checkpoint_id> <user_id>");
         commands.insert("get_user_contract_tree_leaf_hash", "<checkpoint_id> <user_id> <contract_id>");
         commands.insert("get_user_contract_tree_merkle_proof", "<checkpoint_id> <user_id> <contract_id>");
@@ -281,9 +281,8 @@ async fn execute_command<
             let id1 = parse_arg(&mut args, "checkpoint_id")?;
             let id2 = parse_arg(&mut args, "user_id")?;
             let id3 = parse_arg(&mut args, "contract_id")?;
-            let id4 = parse_arg(&mut args, "height")?;
-            let id5 = parse_arg(&mut args, "leaf_id")?;
-            let res = client.get_user_contract_state_tree_leaf_hash(id1, id2, id3, id4, id5).await?;
+            let id4 = parse_arg(&mut args, "leaf_id")?;
+            let res = client.get_user_contract_state_tree_leaf_hash(id1, id2, id3, id4).await?;
             format!("{:#?}", res)
         }
         "get_user_contract_state_tree_nodes" => {
@@ -302,9 +301,8 @@ async fn execute_command<
             let id1 = parse_arg(&mut args, "checkpoint_id")?;
             let id2 = parse_arg(&mut args, "user_id")?;
             let id3 = parse_arg(&mut args, "contract_id")?;
-            let id4 = parse_arg(&mut args, "height")?;
-            let id5 = parse_arg(&mut args, "leaf_id")?;
-            let res = client.get_user_contract_state_tree_merkle_proof(id1, id2, id3, id4, id5).await?;
+            let id4 = parse_arg(&mut args, "leaf_id")?;
+            let res = client.get_user_contract_state_tree_merkle_proof(id1, id2, id3, id4).await?;
             format!("{:#?}", res)
         }
         "get_user_contract_tree_root" => {
