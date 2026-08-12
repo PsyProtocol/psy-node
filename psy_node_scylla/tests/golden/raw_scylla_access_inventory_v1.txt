@@ -119,7 +119,7 @@ psy_node_scylla/src/utils.rs|LegacyTableAdapter|3|0|0|4|2|0|0|0
 psy_node_scylla/tests/rf3/d04b6h22e2b_segment_lifecycle.rs|TestHarness|2|0|0|0|0|0|3|3
 psy_node_scylla/tests/rf3/d04b6h22e3_cutover.rs|TestHarness|1|0|0|0|0|0|6|8
 psy_node_scylla/tests/rf3/d04b6h22e_consumer_gate.rs|TestHarness|0|0|0|0|0|0|1|1
-psy_node_scylla/tests/rf3/d04b6h23c4c1_queue_schema.rs|TestHarness|8|2|0|0|0|0|24|24
+psy_node_scylla/tests/rf3/d04b6h23c4c1_queue_schema.rs|TestHarness|8|2|0|0|0|0|25|25
 psy_node_scylla/tests/rf3/d04b6h23c4c2b3b2_claim_admission.rs|TestHarness|14|2|0|0|0|0|26|26
 psy_node_scylla/tests/rf3/d04b6h23c4c2b4d2_stream_provision.rs|TestHarness|0|0|0|0|0|0|6|6
 psy_node_scylla/tests/rf3/d04b6h23c4c2b4e3_edge_handler_ingress.rs|TestHarness|8|0|0|0|0|0|11|12

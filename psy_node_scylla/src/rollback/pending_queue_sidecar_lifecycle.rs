@@ -268,6 +268,14 @@ pub(super) struct HistoricalV14VerifiedLifecycleFixture {
 }
 
 #[cfg(all(test, feature = "rf3-test-support"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct HistoricalV15VerifiedLifecycleFixture {
+    slot: [u8; 32],
+    revision: i64,
+    payload: Vec<u8>,
+}
+
+#[cfg(all(test, feature = "rf3-test-support"))]
 impl HistoricalV13VerifiedLifecycleFixture {
     pub(super) const fn slot(&self) -> &[u8; 32] { &self.slot }
     pub(super) const fn revision(&self) -> i64 { self.revision }
@@ -276,6 +284,13 @@ impl HistoricalV13VerifiedLifecycleFixture {
 
 #[cfg(all(test, feature = "rf3-test-support"))]
 impl HistoricalV14VerifiedLifecycleFixture {
+    pub(super) const fn slot(&self) -> &[u8; 32] { &self.slot }
+    pub(super) const fn revision(&self) -> i64 { self.revision }
+    pub(super) fn payload(&self) -> &[u8] { &self.payload }
+}
+
+#[cfg(all(test, feature = "rf3-test-support"))]
+impl HistoricalV15VerifiedLifecycleFixture {
     pub(super) const fn slot(&self) -> &[u8; 32] { &self.slot }
     pub(super) const fn revision(&self) -> i64 { self.revision }
     pub(super) fn payload(&self) -> &[u8] { &self.payload }
@@ -375,6 +390,33 @@ impl ScyllaPendingQueueSidecarLifecycleStore {
             )
             .await?;
         Ok(HistoricalV14VerifiedLifecycleFixture {
+            slot,
+            revision,
+            payload,
+        })
+    }
+
+    /// Qualification-only seed for the exact historical v15 lifecycle
+    /// identity. v15 and v16 intentionally share the same twenty-one-table
+    /// physical shape; v16 requires the durable Coordinator queue pointer
+    /// wire and therefore must use a different readiness partition.
+    #[cfg(all(test, feature = "rf3-test-support"))]
+    pub(super) async fn qualification_persist_historical_v15_verified(
+        &self,
+        keyspaces: &PendingQueueSidecarKeyspaces,
+    ) -> Result<HistoricalV15VerifiedLifecycleFixture, PendingQueueSidecarLifecycleError> {
+        use super::pending_queue_sidecar_schema::historical_v15_schema_fingerprint;
+
+        let fingerprint = historical_v15_schema_fingerprint();
+        let (slot, revision, payload) = self
+            .qualification_persist_historical_verified(
+                keyspaces,
+                15,
+                21,
+                fingerprint.as_bytes(),
+            )
+            .await?;
+        Ok(HistoricalV15VerifiedLifecycleFixture {
             slot,
             revision,
             payload,

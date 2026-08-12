@@ -74,6 +74,8 @@ const V14_UPGRADE: &str = "psy_h23c4c4b4c2a_upgrade";
 const V14_CONFLICT: &str = "psy_h23c4c4b4c2a_conflict";
 const V15_UPGRADE: &str = "psy_h23c4d3b2b2_upgrade";
 const V15_CONFLICT: &str = "psy_h23c4d3b2b2_conflict";
+const V16_UPGRADE: &str = "psy_h23c4d3b2b2b4c2a_upgrade";
+const V16_CONFLICT: &str = "psy_h23c4d3b2b2b4c2a_conflict";
 const IMAGE: &str =
     "scylladb/scylla@sha256:17496f2dd6e72056d0b0d7e2bd18bd62638872d1d80a5dd9db96ba017fd426fc";
 const NODE_IPS: [Ipv4Addr; 3] = [
@@ -206,6 +208,8 @@ async fn create_keyspaces(session: &Session) -> anyhow::Result<()> {
         V14_CONFLICT,
         V15_UPGRADE,
         V15_CONFLICT,
+        V16_UPGRADE,
+        V16_CONFLICT,
     ] {
         session.query_unpaged(
             format!("CREATE KEYSPACE IF NOT EXISTS {keyspace} WITH replication = {{'class': 'NetworkTopologyStrategy', 'datacenter1': 3}}"),
@@ -327,6 +331,20 @@ struct V14V15DirectDataset {
     current_v15_lifecycle: (i64, Vec<u8>),
     representative: HistoricalRepresentativeRows,
     coordinator_submission: (i64, Vec<u8>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct V15V16DirectDataset {
+    historical_v15_lifecycle: (i64, Vec<u8>),
+    current_v16_lifecycle: (i64, Vec<u8>),
+    representative: HistoricalRepresentativeRows,
+    coordinator_submission: (i64, Vec<u8>),
+}
+
+impl V15V16DirectDataset {
+    const fn row_count(&self) -> usize {
+        3 + self.representative.row_count()
+    }
 }
 
 impl V14V15DirectDataset {
@@ -481,6 +499,55 @@ struct H23c4d3b2b2SidecarReport {
     handler_processor_rf3: bool,
     redis_loss_recovery_rf3: bool,
     mixed_version_activation_safe: bool,
+    production_terminal_transition: bool,
+    production_pipeline_rotation: bool,
+    production_writer_integrated: bool,
+    authority_head_publish_integrated: bool,
+    full_node_restart_tested: bool,
+    production_serving: bool,
+    h8_domains_closed: u8,
+    h8_domains_total: u8,
+    qualification: &'static str,
+}
+
+#[derive(Serialize)]
+struct H23c4d3b2b2b4c2aReport {
+    image: &'static str,
+    replication_factor: u8,
+    historical_schema_version: u16,
+    current_schema_version: u16,
+    target_tables: usize,
+    lifecycle_tables: usize,
+    control_targets: usize,
+    data_targets: usize,
+    expected_columns: usize,
+    historical_schema_fingerprint: String,
+    current_schema_fingerprint: String,
+    same_physical_shape: bool,
+    v15_verified_rejected_for_v16: bool,
+    v15_payload_rejected_by_v16_decoder: bool,
+    v16_slot_differs_from_v15: bool,
+    v16_deploy_idempotent: bool,
+    different_current_rejected: bool,
+    v15_lifecycle_preserved: bool,
+    v15_representative_rows_preserved: bool,
+    coordinator_submission_preserved: bool,
+    one_replica_offline_deploy: bool,
+    caller_discard_retry: bool,
+    socket_response_loss_injected: bool,
+    representative_rows_preserved_and_current_manifest_unchanged: bool,
+    repair_flush_compact: bool,
+    repair_ms: u64,
+    direct_one_nodes: usize,
+    direct_one_table_names: Vec<String>,
+    direct_one_table_count: usize,
+    direct_one_row_count: usize,
+    direct_one_dataset_digest: String,
+    direct_one_equal: bool,
+    sidecar_v16_rf3: bool,
+    coordinator_capture_replay_rf3: bool,
+    production_coordinator_processor_rf3: bool,
+    mixed_version_clean_boundary_qualified: bool,
     production_terminal_transition: bool,
     production_pipeline_rotation: bool,
     production_writer_integrated: bool,
@@ -2019,6 +2086,362 @@ async fn d04b6h23c4d3b2b2a_sidecar_v15_submission_rf3_gate() -> anyhow::Result<(
         qualification: "H23C4D3B2B2A_SIDECAR_V15_SUBMISSION_RF3_PASSED",
     };
     let report_path = std::env::var("PSY_D04B6H23C4D3B2B2A_REPORT_PATH")?;
+    std::fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+#[cfg(feature = "rf3-test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires isolated Scylla RF=3 docker-compose cluster"]
+async fn d04b6h23c4d3b2b2b4c2a_sidecar_v16_lifecycle_rf3_gate() -> anyhow::Result<()> {
+    ensure!(
+        std::env::var("PSY_D04B6H23C4D3B2B2B4C2A_RF3").as_deref() == Ok("1"),
+        "run through tests/rf3/run-d04b6h23c4d3b2b2b4c2a.sh"
+    );
+    let compose_file = std::env::var("PSY_D04B6H23C4D3B2B2B4C2A_COMPOSE_FILE")?;
+    wait_up(3).await?;
+    let session = Arc::new(connect(None, Consistency::Quorum).await?);
+    create_keyspaces(&session).await?;
+    let upgrade_keys = keyspaces(V16_UPGRADE)?;
+
+    let physical = PendingQueueSidecarSchemaMaterializer::materialize_schema(
+        &session,
+        &upgrade_keys,
+    )
+    .await?;
+    ensure!(current_physical_schema_matches_historical_v15());
+    ensure!(matches!(
+        PendingQueueSidecarSchemaMaterializer::inspect_schema(&session, &upgrade_keys).await?,
+        PendingQueueSidecarSchemaInspection::Exact { fingerprint }
+            if fingerprint == physical.fingerprint()
+    ));
+    ScyllaPendingQueueSidecarLifecycleStore::create_schema(
+        &session,
+        upgrade_keys.control(),
+    )
+    .await?;
+    let lifecycle = ScyllaPendingQueueSidecarLifecycleStore::prepare(
+        Arc::clone(&session),
+        upgrade_keys.control().clone(),
+    )
+    .await?;
+    let historical = lifecycle
+        .qualification_persist_historical_v15_verified(&upgrade_keys)
+        .await?;
+    let historical_row = (historical.revision(), historical.payload().to_vec());
+    let representative =
+        seed_historical_representative_rows(&session, &upgrade_keys, 15).await?;
+    let historical_submission_store = ScyllaCoordinatorGutaDurableSubmissionStore::prepare(
+        Arc::clone(&session),
+        upgrade_keys.control().clone(),
+        NetworkId::try_from_chain_id(1337)?,
+        [0x15; 32],
+    )
+    .await?;
+    let submission = coordinator_submission(0xC1)?;
+    let submission_slot = submission.slot();
+    ensure!(
+        historical_submission_store
+            .persist_and_readback(submission.clone())
+            .await?
+            == submission
+    );
+    let historical_submission_row = read_coordinator_submission_row(
+        &session,
+        &upgrade_keys,
+        submission_slot.as_bytes(),
+    )
+    .await?;
+
+    let current_slot = PendingQueueSidecarDeploymentSlot::for_keyspaces(&upgrade_keys);
+    let v16_slot_differs_from_v15 = current_slot.as_bytes() != historical.slot();
+    ensure!(v16_slot_differs_from_v15);
+    let v15_verified_rejected_for_v16 = matches!(
+        ScyllaPendingQueueSidecarSetupGate::authorize(
+            Arc::clone(&session),
+            upgrade_keys.clone(),
+            AuthorityScope::Coordinator,
+        )
+        .await,
+        Err(PendingQueueSidecarLifecycleError::Uninitialized),
+    );
+    ensure!(v15_verified_rejected_for_v16);
+    let v15_payload_rejected_by_v16_decoder = matches!(
+        StoredPendingQueueSidecarDeployment::decode_selected(
+            current_slot,
+            historical.revision(),
+            historical.payload(),
+        ),
+        Err(PendingQueueSidecarLifecycleError::UnknownSchemaVersion),
+    );
+    ensure!(v15_payload_rejected_by_v16_decoder);
+
+    let conflict_keys = keyspaces(V16_CONFLICT)?;
+    PendingQueueSidecarSchemaMaterializer::materialize_schema(&session, &conflict_keys)
+        .await?;
+    ScyllaPendingQueueSidecarLifecycleStore::create_schema(
+        &session,
+        conflict_keys.control(),
+    )
+    .await?;
+    let conflict = StoredPendingQueueSidecarDeployment::materializing(conflict_keys.clone());
+    let mut poisoned = conflict.to_canonical_bytes();
+    *poisoned
+        .last_mut()
+        .ok_or_else(|| anyhow::anyhow!("empty lifecycle payload"))? ^= 0xFF;
+    session
+        .query_unpaged(
+            format!(
+                "INSERT INTO {}.{} (deployment_slot, revision, deployment_payload) VALUES (?, ?, ?)",
+                conflict_keys.control().as_str(),
+                PENDING_QUEUE_SIDECAR_LIFECYCLE_TABLE,
+            ),
+            (
+                conflict.slot().as_bytes().to_vec(),
+                i64::try_from(conflict.revision().get())?,
+                poisoned,
+            ),
+        )
+        .await?;
+    let different_current_rejected = PendingQueueSidecarDeploymentExecutor::deploy(
+        Arc::clone(&session),
+        conflict_keys,
+    )
+    .await
+    .is_err();
+    ensure!(different_current_rejected);
+
+    compose(
+        Path::new(&compose_file),
+        &["stop", "scylla3"],
+        "stop third replica for v16 lifecycle",
+    )?;
+    wait_up(2).await?;
+    let first = PendingQueueSidecarDeploymentExecutor::deploy(
+        Arc::clone(&session),
+        upgrade_keys.clone(),
+    )
+    .await?;
+    let first_ready_digest = *first.ready_digest();
+    drop(first);
+    let second = PendingQueueSidecarDeploymentExecutor::deploy(
+        Arc::clone(&session),
+        upgrade_keys.clone(),
+    )
+    .await?;
+    let v16_deploy_idempotent = second.ready_digest() == &first_ready_digest;
+    ensure!(v16_deploy_idempotent);
+    let ready = ScyllaPendingQueueSidecarSetupGate::authorize(
+        Arc::clone(&session),
+        upgrade_keys.clone(),
+        AuthorityScope::Coordinator,
+    )
+    .await?;
+    ensure!(ready.view().verified().ready_digest() == &first_ready_digest);
+
+    let v15_lifecycle_preserved = read_lifecycle_row(
+        &session,
+        &upgrade_keys,
+        historical.slot(),
+    )
+    .await?
+        == historical_row;
+    ensure!(v15_lifecycle_preserved);
+    let v15_representative_rows_preserved =
+        read_historical_representative_rows(&session, &upgrade_keys).await?
+            == representative;
+    ensure!(v15_representative_rows_preserved);
+    let coordinator_submission_preserved = read_coordinator_submission_row(
+        &session,
+        &upgrade_keys,
+        submission_slot.as_bytes(),
+    )
+    .await?
+        == historical_submission_row;
+    ensure!(coordinator_submission_preserved);
+    let current_submission_store = ScyllaCoordinatorGutaDurableSubmissionStore::prepare(
+        Arc::clone(&session),
+        upgrade_keys.control().clone(),
+        NetworkId::try_from_chain_id(1337)?,
+        *ready.view().ready_digest(),
+    )
+    .await?;
+    ensure!(
+        current_submission_store
+            .read_selected(submission_slot)
+            .await?
+            .as_ref()
+            == Some(&submission)
+    );
+
+    compose(
+        Path::new(&compose_file),
+        &["start", "scylla3"],
+        "restart third replica after v16 lifecycle",
+    )?;
+    wait_up(3).await?;
+    let repair_started = Instant::now();
+    docker_exec(
+        NODE_CONTAINERS[0],
+        &["nodetool", "cluster", "repair", V16_UPGRADE],
+        "repair v16 representative data",
+    )?;
+    for node in NODE_CONTAINERS {
+        docker_exec(
+            node,
+            &["nodetool", "repair", "-pr", &no_tablet(V16_UPGRADE)],
+            "repair v16 lifecycle/control",
+        )?;
+        docker_exec(node, &["nodetool", "flush", V16_UPGRADE], "flush v16 data")?;
+        docker_exec(
+            node,
+            &["nodetool", "flush", &no_tablet(V16_UPGRADE)],
+            "flush v16 lifecycle/control",
+        )?;
+        docker_exec(node, &["nodetool", "compact", V16_UPGRADE], "compact v16 data")?;
+        docker_exec(
+            node,
+            &["nodetool", "compact", &no_tablet(V16_UPGRADE)],
+            "compact v16 lifecycle/control",
+        )?;
+    }
+    let repair_ms = repair_started.elapsed().as_millis() as u64;
+
+    let mut datasets = Vec::new();
+    let mut direct_one_nodes = 0;
+    for ip in NODE_IPS {
+        let local = connect(Some(ip), Consistency::One).await?;
+        ensure!(matches!(
+            PendingQueueSidecarSchemaMaterializer::inspect_schema(&local, &upgrade_keys).await?,
+            PendingQueueSidecarSchemaInspection::Exact { fingerprint }
+                if fingerprint == physical.fingerprint()
+        ));
+        datasets.push(V15V16DirectDataset {
+            historical_v15_lifecycle: read_lifecycle_row(
+                &local,
+                &upgrade_keys,
+                historical.slot(),
+            )
+            .await?,
+            current_v16_lifecycle: read_lifecycle_row(
+                &local,
+                &upgrade_keys,
+                current_slot.as_bytes(),
+            )
+            .await?,
+            representative: read_historical_representative_rows(&local, &upgrade_keys).await?,
+            coordinator_submission: read_coordinator_submission_row(
+                &local,
+                &upgrade_keys,
+                submission_slot.as_bytes(),
+            )
+            .await?,
+        });
+        direct_one_nodes += 1;
+    }
+    let direct_one_equal = datasets.windows(2).all(|pair| pair[0] == pair[1]);
+    ensure!(direct_one_equal);
+    let direct_one_dataset_digest = hex::encode(Sha256::digest(serde_json::to_vec(
+        datasets
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("missing direct-ONE dataset"))?,
+    )?));
+    let direct_one_table_names = vec![
+        PENDING_QUEUE_SIDECAR_LIFECYCLE_TABLE.to_owned(),
+        PendingQueueSidecarPhysicalTable::Pipeline.table_name().to_owned(),
+        PendingQueueSidecarPhysicalTable::RealmApplicationArchiveHeader
+            .table_name()
+            .to_owned(),
+        PendingQueueSidecarPhysicalTable::RealmApplicationArchiveFragment
+            .table_name()
+            .to_owned(),
+        PendingQueueSidecarPhysicalTable::RealmGenerationTerminalIntent
+            .table_name()
+            .to_owned(),
+        PendingQueueSidecarPhysicalTable::RealmDeferredCarryover
+            .table_name()
+            .to_owned(),
+        PendingQueueSidecarPhysicalTable::CoordinatorGutaSubmission
+            .table_name()
+            .to_owned(),
+    ];
+    let control_targets = PendingQueueSidecarPhysicalTable::ALL
+        .iter()
+        .filter(|table| {
+            table.keyspace_kind()
+                == PendingQueueSidecarKeyspaceKind::NoTabletControl
+        })
+        .count();
+    let data_targets = PendingQueueSidecarPhysicalTable::ALL.len() - control_targets;
+    let same_physical_shape = current_physical_schema_matches_historical_v15()
+        && PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT == 21
+        && PENDING_QUEUE_SIDECAR_EXPECTED_COLUMNS.len() == 105
+        && control_targets == 17
+        && data_targets == 4;
+    ensure!(same_physical_shape);
+    let representative_rows_preserved_and_current_manifest_unchanged = same_physical_shape
+        && v15_lifecycle_preserved
+        && v15_representative_rows_preserved
+        && coordinator_submission_preserved;
+    ensure!(representative_rows_preserved_and_current_manifest_unchanged);
+    let direct_one_row_count = datasets
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("missing direct-ONE dataset"))?
+        .row_count();
+
+    let report = H23c4d3b2b2b4c2aReport {
+        image: IMAGE,
+        replication_factor: 3,
+        historical_schema_version: 15,
+        current_schema_version: PENDING_QUEUE_SIDECAR_SCHEMA_VERSION,
+        target_tables: PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT,
+        lifecycle_tables: 1,
+        control_targets,
+        data_targets,
+        expected_columns: PENDING_QUEUE_SIDECAR_EXPECTED_COLUMNS.len(),
+        historical_schema_fingerprint: hex::encode(
+            historical_v15_schema_fingerprint().as_bytes(),
+        ),
+        current_schema_fingerprint: hex::encode(
+            pending_queue_sidecar_schema_fingerprint().as_bytes(),
+        ),
+        same_physical_shape,
+        v15_verified_rejected_for_v16,
+        v15_payload_rejected_by_v16_decoder,
+        v16_slot_differs_from_v15,
+        v16_deploy_idempotent,
+        different_current_rejected,
+        v15_lifecycle_preserved,
+        v15_representative_rows_preserved,
+        coordinator_submission_preserved,
+        one_replica_offline_deploy: true,
+        caller_discard_retry: v16_deploy_idempotent,
+        socket_response_loss_injected: false,
+        representative_rows_preserved_and_current_manifest_unchanged,
+        repair_flush_compact: true,
+        repair_ms,
+        direct_one_nodes,
+        direct_one_table_count: direct_one_table_names.len(),
+        direct_one_table_names,
+        direct_one_row_count,
+        direct_one_dataset_digest,
+        direct_one_equal,
+        sidecar_v16_rf3: true,
+        coordinator_capture_replay_rf3: false,
+        production_coordinator_processor_rf3: false,
+        mixed_version_clean_boundary_qualified: false,
+        production_terminal_transition: false,
+        production_pipeline_rotation: false,
+        production_writer_integrated: false,
+        authority_head_publish_integrated: false,
+        full_node_restart_tested: false,
+        production_serving: false,
+        h8_domains_closed: 0,
+        h8_domains_total: 22,
+        qualification: "H23C4D3B2B2B4C2A_SIDECAR_V16_RF3_PASSED",
+    };
+    let report_path = std::env::var("PSY_D04B6H23C4D3B2B2B4C2A_REPORT_PATH")?;
     std::fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
