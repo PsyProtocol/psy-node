@@ -142,7 +142,7 @@ impl ScyllaRealmProcessorDeferredCarryoverStore {
         key: PendingGenerationLedgerKey,
         activation: PendingGenerationActivationDigest,
         predecessor: PendingGenerationContext,
-    ) -> Result<(), RealmProcessorDeferredCarryoverStoreError> {
+    ) -> Result<RealmProcessorDeferredCarryover, RealmProcessorDeferredCarryoverStoreError> {
         let selected = terminal_store
             .observe_for_restart::<Hash>(key, activation, predecessor)
             .await
@@ -177,7 +177,7 @@ impl ScyllaRealmProcessorDeferredCarryoverStore {
         if after_revalidate != selected {
             return Err(RealmProcessorDeferredCarryoverStoreError::SelectedTerminalChanged);
         }
-        Ok(())
+        Ok(*receipt.carryover())
     }
 
     async fn read(

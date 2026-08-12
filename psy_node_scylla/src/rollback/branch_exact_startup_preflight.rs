@@ -63,8 +63,10 @@ use psy_node_core::queue::{
         RealmProcessorFullCommitSourceFactory,
         RealmProcessorFullCommitPublicationObservation,
         RealmProcessorFullCommitSourceObservation,
+        RealmProcessorGenerationRotationOutcome,
         SealedRealmProcessorFullCommitPublicationRequest,
         SealedRealmProcessorFullCommitSourceRequest,
+        SealedRealmProcessorGenerationRotationRequest,
     },
     realm_user_update_publish::GlobalUserTreeHeight,
 };
@@ -339,12 +341,15 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorStartupPreflightProvider<Hash> {
                 .await
                 .map_err(|error| storage("external dependency loader", error))?,
             );
-        let factory = ScyllaRealmProcessorDurableCaptureFactory::<Hash>::prepare(
+        let factory = ScyllaRealmProcessorDurableCaptureFactory::<Hash>::prepare::<F>(
             session,
+            standard_keyspace,
+            no_tablet_keyspace,
             network,
             authority,
             *provider.writer_runtime.activation_digest().as_bytes(),
-            &queue_ready,
+            global_user_tree_height,
+            queue_ready,
             nats,
             external_dependency_loader,
         )
@@ -859,6 +864,21 @@ where
                 request,
             )
             .await
+    }
+
+    async fn terminalize_and_rotate(
+        &self,
+        request: SealedRealmProcessorGenerationRotationRequest,
+    ) -> Result<
+        RealmProcessorGenerationRotationOutcome,
+        RealmProcessorFullCommitSourceError,
+    > {
+        let factory = self.capture_factory.as_ref().ok_or_else(|| {
+            RealmProcessorFullCommitSourceError::Backend(
+                "Realm Processor durable capture factory is missing".to_owned(),
+            )
+        })?;
+        factory.terminalize_and_rotate_generation(request).await
     }
 }
 

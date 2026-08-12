@@ -60,6 +60,7 @@ use psy_node_core::{
             RealmProcessorGenerationContinuationPhase,
         },
         realm_processor_semantic_output::RealmProcessorSemanticOutput,
+        realm_user_update_publish::GlobalUserTreeHeight,
         realm_processor_generation_terminal::{
             RealmProcessorDeferredCarryoverSource,
             RealmProcessorGenerationTerminalKind,
@@ -72,8 +73,11 @@ use psy_node_core::{
             RealmProcessorFullCommitSourceError,
             RealmProcessorFullCommitPublicationObservation,
             RealmProcessorFullCommitSourceObservation,
+            RealmProcessorGenerationRotationObservation,
+            RealmProcessorGenerationRotationOutcome,
             SealedRealmProcessorFullCommitPublicationRequest,
             SealedRealmProcessorFullCommitSourceRequest,
+            SealedRealmProcessorGenerationRotationRequest,
         },
         recoverable_artifact::{
             PendingQueueArtifactOwnerAttemptId,
@@ -101,6 +105,8 @@ use psy_node_core::{
         PendingGenerationActivationDigest, PendingGenerationContext,
         PendingGenerationLedgerKey,
     },
+    store::pending_generation::ProcNamespacePrefix,
+    store::typed::UniquePendingId,
     store::branch_exact_dual_write::BranchExactDualWriteIntent,
     store::branch_pending_mapping::BranchPendingMapping,
 };
@@ -175,7 +181,10 @@ use super::{
     PendingQueueArtifactStoreError, PendingQueueSidecarReady,
     ScyllaPendingPipelineStore, ScyllaPendingQueueArtifactStore,
     ScyllaPendingQueueSegmentLedgerStore,
+    CqlKeyspaceName,
 };
+use super::authority_local_head_prototype::AuthorityLocalHeadNoTabletKeyspace;
+use super::branch_exact_writer_lifecycle_store::ScyllaBranchExactWriterLifecycleStore;
 use super::branch_exact_pending_orchestration::{
     seal_branch_exact_begin, seal_branch_exact_publish,
 };
@@ -204,6 +213,14 @@ use super::realm_processor_application_archive::{
 };
 use super::realm_processor_deferred_carryover::ScyllaRealmProcessorDeferredCarryoverStore;
 use super::realm_processor_generation_terminal::ScyllaRealmProcessorGenerationTerminalStore;
+use super::realm_processor_terminal_authorization::{
+    RealmProcessorTerminalAuthorizationProvider,
+    ScyllaRealmProcessorTerminalAuthorizer,
+};
+use super::pending_counter::{
+    PendingCounterAdapter, PendingCounterAllocationOutcome,
+    PendingCounterExpected, SealedPendingCounterAllocation,
+};
 use super::realm_full_commit_execution::RealmFullCommitExecutionSchedule;
 use super::realm_full_commit_manifest_store::ScyllaRealmFullCommitManifestStore;
 use super::realm_full_commit_scylla::RealmFullCommitScyllaExecutor;
@@ -234,6 +251,8 @@ pub(crate) struct ScyllaRealmProcessorDurableCaptureFactory<Hash> {
     application_archive: Arc<ScyllaRealmProcessorApplicationArchiveStore>,
     generation_terminal: Arc<ScyllaRealmProcessorGenerationTerminalStore>,
     deferred_carryover: Arc<ScyllaRealmProcessorDeferredCarryoverStore>,
+    terminal_authorizer: Arc<dyn RealmProcessorTerminalAuthorizationProvider<Hash>>,
+    pending_counter: Arc<PendingCounterAdapter>,
     full_commit_session: Arc<Session>,
     full_commit_executor: Arc<RealmFullCommitScyllaExecutor>,
     full_commit_manifest: Arc<ScyllaRealmFullCommitManifestStore>,
@@ -242,15 +261,22 @@ pub(crate) struct ScyllaRealmProcessorDurableCaptureFactory<Hash> {
 }
 
 impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
-    pub(crate) async fn prepare(
+    pub(crate) async fn prepare<F>(
         session: Arc<Session>,
+        standard_keyspace: &str,
+        no_tablet_keyspace: &str,
         network: NetworkId,
         authority: AuthorityScope,
         writer_activation_digest: [u8; 32],
-        ready: &PendingQueueSidecarReady,
+        global_user_tree_height: GlobalUserTreeHeight,
+        ready: Arc<PendingQueueSidecarReady>,
         nats: Arc<NatsJetStreamClient>,
         external_dependency_loader: Arc<dyn RealmProcessorExternalDependencyLoader>,
-    ) -> Result<Self, RealmProcessorDurableCaptureError> {
+    ) -> Result<Self, RealmProcessorDurableCaptureError>
+    where
+        F: parth_core::felt::QFelt64 + Send + Sync + 'static,
+        Hash: parth_core::protocol::core_types::QFHashBase<F> + Send + Sync + 'static,
+    {
         let AuthorityScope::Realm { .. } = authority else {
             return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
         };
@@ -272,7 +298,7 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
         let provision = Arc::new(
             ScyllaPendingQueueStreamProvisionStore::prepare_authorized(
                 session.clone(),
-                ready,
+                ready.as_ref(),
                 ledger.clone(),
             )
             .await
@@ -341,6 +367,50 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
                 .await
                 .map_err(backend)?,
         );
+        let terminal_writer = Arc::new(
+            ScyllaBranchExactWriterLifecycleStore::prepare(
+                session.clone(),
+                control.clone(),
+            )
+            .await
+            .map_err(backend)?,
+        );
+        let terminal_head = Arc::new(
+            ScyllaAuthorityLocalHeadStore::prepare(
+                session.clone(),
+                AuthorityLocalHeadNoTabletKeyspace::try_new(
+                    no_tablet_keyspace.to_owned(),
+                )
+                .map_err(backend)?,
+            )
+            .await
+            .map_err(backend)?,
+        );
+        let terminal_authorizer: Arc<dyn RealmProcessorTerminalAuthorizationProvider<Hash>> =
+            Arc::new(
+                ScyllaRealmProcessorTerminalAuthorizer::<F, Hash>::new(
+                    session.clone(),
+                    network,
+                    authority,
+                    global_user_tree_height,
+                    ready.clone(),
+                    nats.base_namespace(),
+                    ledger.clone(),
+                    pipeline.clone(),
+                    terminal_writer,
+                    terminal_head,
+                )
+                .map_err(backend)?,
+            );
+        let pending_counter = Arc::new(
+            PendingCounterAdapter::prepare(
+                session.clone(),
+                CqlKeyspaceName::try_new(no_tablet_keyspace.to_owned()).map_err(backend)?,
+                CqlKeyspaceName::try_new(standard_keyspace.to_owned()).map_err(backend)?,
+            )
+            .await
+            .map_err(backend)?,
+        );
         let full_commit_executor = Arc::new(
             RealmFullCommitScyllaExecutor::prepare_with_consistency(
                 &session,
@@ -374,6 +444,8 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
             application_archive,
             generation_terminal,
             deferred_carryover,
+            terminal_authorizer,
+            pending_counter,
             full_commit_session: session,
             full_commit_executor,
             full_commit_manifest,
@@ -1094,6 +1166,221 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
             *persisted.digest(),
             final_head.revision().get(),
         )
+    }
+
+    /// Storage-owned terminal and rotation path. The request carries only the
+    /// installed runtime identity; pipeline generations, the successor
+    /// dependency, reservation, terminal, carryover and CAS payload are all
+    /// selected or derived from freshly revalidated durable state.
+    pub(super) async fn terminalize_and_rotate_generation(
+        &self,
+        request: SealedRealmProcessorGenerationRotationRequest,
+    ) -> Result<RealmProcessorGenerationRotationOutcome, RealmProcessorFullCommitSourceError>
+    {
+        let AuthorityScope::Realm {
+            realm_id,
+            realm_sub_id,
+        } = self.authority
+        else {
+            return Err(RealmProcessorFullCommitSourceError::IdentityMismatch);
+        };
+        if request.network() != self.network
+            || request.realm_id() != realm_id
+            || request.realm_sub_id() != realm_sub_id
+            || request.writer_activation_digest() != &self.writer_activation_digest
+            || request.queue_readiness_digest() != &self.queue_readiness_digest
+        {
+            return Err(RealmProcessorFullCommitSourceError::IdentityMismatch);
+        }
+
+        let first = self
+            .observe_generation_continuation_exact()
+            .await
+            .map_err(full_source_capture)?;
+        if !matches!(
+            first.continuation.phase(),
+            RealmProcessorGenerationContinuationPhase::AwaitPublishedTerminal
+                | RealmProcessorGenerationContinuationPhase::AwaitRetiredNoWorkTerminal
+        ) || first.pipeline.proc_namespace_prefix()
+            != ProcNamespacePrefix::for_authority(self.network, self.authority)
+        {
+            return Err(RealmProcessorFullCommitSourceError::IdentityMismatch);
+        }
+
+        let authorization = match self.terminal_authorizer.authorize_current().await {
+            Ok(authorization) => authorization,
+            Err(error) if error.successor_dependency_pending() => {
+                let second = self
+                    .observe_generation_continuation_exact()
+                    .await
+                    .map_err(full_source_capture)?;
+                if first.continuation != second.continuation
+                    || !same_pipeline_snapshot(&first.pipeline, &second.pipeline)
+                {
+                    return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
+                }
+                return Ok(
+                    RealmProcessorGenerationRotationOutcome::AwaitSuccessorDependency {
+                        source: second.pipeline.processing(),
+                        successor: second.pipeline.gathering(),
+                        pipeline_revision: second.pipeline.revision(),
+                    },
+                );
+            }
+            Err(error) => return Err(full_source_backend(error)),
+        };
+        if authorization.pipeline() != &first.pipeline {
+            return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
+        }
+
+        let current_gathering = first.pipeline.gathering().pending_id();
+        let reserved_pending = UniquePendingId::try_new(
+            current_gathering
+                .get()
+                .checked_add(1)
+                .ok_or(RealmProcessorFullCommitSourceError::IdentityMismatch)?,
+        )
+        .map_err(full_source_backend)?;
+        let reserved_proc = first
+            .pipeline
+            .proc_namespace_prefix()
+            .derive_proc_id(reserved_pending);
+        let allocation = SealedPendingCounterAllocation::try_for_commit(
+            PendingCounterExpected::Present(current_gathering),
+            reserved_proc,
+            authorization.allocation_timestamp(),
+        )
+        .map_err(full_source_backend)?;
+        let ownership = match self
+            .pending_counter
+            .allocate(&allocation)
+            .await
+            .map_err(full_source_backend)?
+        {
+            PendingCounterAllocationOutcome::Owned(ownership) => ownership
+                .try_into_current()
+                .map_err(|_| RealmProcessorFullCommitSourceError::ConcurrentMutation)?,
+            PendingCounterAllocationOutcome::Conflict(conflict) => {
+                return Err(RealmProcessorFullCommitSourceError::Backend(format!(
+                    "successor pending reservation conflicted: {conflict:?}"
+                )))
+            }
+        };
+
+        self.terminal_authorizer
+            .revalidate_exact(&authorization)
+            .await
+            .map_err(full_source_backend)?;
+        let terminal = self
+            .generation_terminal
+            .persist_from_authorized_sources(
+                self.terminal_authorizer.as_ref(),
+                &authorization,
+                self.application_archive.as_ref(),
+                ownership,
+            )
+            .await
+            .map_err(full_source_backend)?;
+        let carryover = self
+            .deferred_carryover
+            .persist_from_selected_terminal::<Hash>(
+                self.generation_terminal.as_ref(),
+                terminal.key(),
+                terminal.activation_digest(),
+                terminal.source(),
+            )
+            .await
+            .map_err(full_source_backend)?;
+
+        let selected_terminal = self
+            .generation_terminal
+            .observe_for_restart::<Hash>(
+                terminal.key(),
+                terminal.activation_digest(),
+                terminal.source(),
+            )
+            .await
+            .map_err(full_source_backend)?
+            .ok_or(RealmProcessorFullCommitSourceError::ConcurrentMutation)?;
+        let selected_carryover = self
+            .deferred_carryover
+            .observe_for_restart(
+                terminal.key(),
+                terminal.activation_digest(),
+                terminal.successor(),
+            )
+            .await
+            .map_err(full_source_backend)?
+            .ok_or(RealmProcessorFullCommitSourceError::ConcurrentMutation)?;
+        if selected_terminal != terminal || selected_carryover != carryover {
+            return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
+        }
+        self.terminal_authorizer
+            .revalidate_exact(&authorization)
+            .await
+            .map_err(full_source_backend)?;
+
+        let rotation = terminal
+            .seal_recorded_rotation(authorization.pipeline())
+            .map_err(full_source_backend)?;
+        let rotated = match self
+            .pipeline
+            .apply(&rotation)
+            .await
+            .map_err(full_source_backend)?
+        {
+            PendingPipelineWriteOutcome::Applied(current)
+            | PendingPipelineWriteOutcome::Idempotent(current) => current,
+            PendingPipelineWriteOutcome::Conflict(_) => {
+                return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation)
+            }
+        };
+        if rotated != *rotation.candidate()
+            || rotated.processing() != terminal.successor()
+            || rotated.gathering() != terminal.reserved_next_gathering()
+        {
+            return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
+        }
+
+        let terminal_after = self
+            .generation_terminal
+            .observe_for_restart::<Hash>(
+                terminal.key(),
+                terminal.activation_digest(),
+                terminal.source(),
+            )
+            .await
+            .map_err(full_source_backend)?
+            .ok_or(RealmProcessorFullCommitSourceError::ConcurrentMutation)?;
+        let carryover_after = self
+            .deferred_carryover
+            .observe_for_restart(
+                terminal.key(),
+                terminal.activation_digest(),
+                terminal.successor(),
+            )
+            .await
+            .map_err(full_source_backend)?
+            .ok_or(RealmProcessorFullCommitSourceError::ConcurrentMutation)?;
+        if terminal_after != terminal || carryover_after != carryover {
+            return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
+        }
+        terminal
+            .terminal_authorization_envelope()
+            .map_err(full_source_backend)?;
+
+        Ok(RealmProcessorGenerationRotationOutcome::Rotated(
+            RealmProcessorGenerationRotationObservation::try_from_storage(
+                terminal.source(),
+                terminal.successor(),
+                terminal.reserved_next_gathering(),
+                rotated.revision(),
+                terminal.slot(),
+                terminal.digest(),
+                carryover.slot(),
+                carryover.digest(),
+            )?,
+        ))
     }
 
     fn validate_generation_request(
@@ -3610,6 +3897,42 @@ mod tests {
                 "derived recovery must not gain terminal/rotation authority: {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn production_terminal_rotation_is_storage_selected_and_applies_pipeline_last() {
+        let source = include_str!("realm_processor_durable_capture.rs");
+        let method = source
+            .split("pub(super) async fn terminalize_and_rotate_generation")
+            .nth(1)
+            .unwrap()
+            .split("fn validate_generation_request")
+            .next()
+            .unwrap();
+
+        let observe = method.find("observe_generation_continuation_exact").unwrap();
+        let authorize = method.find("terminal_authorizer.authorize_current").unwrap();
+        let reserve = method.find("pending_counter").unwrap();
+        let terminal = method.find("persist_from_authorized_sources").unwrap();
+        let carryover = method.find("persist_from_selected_terminal").unwrap();
+        let revalidate = method.rfind("terminal_authorizer\n            .revalidate_exact").unwrap();
+        let rotation = method.find("seal_recorded_rotation").unwrap();
+        let pipeline = method.find("pipeline\n            .apply(&rotation)").unwrap();
+        let terminal_after = method.rfind("let terminal_after").unwrap();
+
+        assert!(observe < authorize);
+        assert!(authorize < reserve && reserve < terminal);
+        assert!(terminal < carryover && carryover < revalidate);
+        assert!(revalidate < rotation && rotation < pipeline);
+        assert!(pipeline < terminal_after);
+        assert!(method.contains("successor_dependency_pending"));
+        assert!(method.contains("AwaitSuccessorDependency"));
+        assert!(method.contains("PendingCounterExpected::Present(current_gathering)"));
+        assert!(method.contains("PendingCounterAllocationOutcome::Owned"));
+        assert!(method.contains("PendingPipelineWriteOutcome::Applied"));
+        assert!(method.contains("PendingPipelineWriteOutcome::Idempotent"));
+        assert!(!method.contains("qualification_persist"));
+        assert!(!method.contains("ReservedPendingGeneration::qualification"));
     }
 
     #[test]

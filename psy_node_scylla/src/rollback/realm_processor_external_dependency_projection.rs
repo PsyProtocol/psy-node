@@ -182,6 +182,51 @@ where
         })
     }
 
+    /// Select the qualified close for the current pipeline gathering slot and
+    /// rebuild its exact dependency projection. The terminal owner supplies
+    /// only the storage-selected context and immutable assignment digest; it
+    /// cannot choose a close or qualification row.
+    pub(super) async fn read_gathering_selected_exact(
+        &self,
+        context: PendingQueueCaptureContext,
+        expected_assignment_digest: [u8; 32],
+    ) -> Result<
+        PersistedRealmProcessorExternalDependencyProjection,
+        RealmProcessorExternalDependencyProjectionError,
+    > {
+        let key = RealmUserUpdateAdmissionKey::try_new(context).map_err(model)?;
+        let first = self
+            .consumer
+            .read_gathering_selected(key)
+            .await
+            .map_err(RealmProcessorExternalDependencyProjectionError::Consumer)?;
+        let first = RealmProcessorExternalDependencyProjection::try_from_qualified_generation(
+            context,
+            expected_assignment_digest,
+            &first,
+        )
+        .map_err(model)?;
+        let second = self
+            .consumer
+            .read_gathering_selected(key)
+            .await
+            .map_err(RealmProcessorExternalDependencyProjectionError::Consumer)?;
+        let second = RealmProcessorExternalDependencyProjection::try_from_qualified_generation(
+            context,
+            expected_assignment_digest,
+            &second,
+        )
+        .map_err(model)?;
+        if first != second {
+            return Err(RealmProcessorExternalDependencyProjectionError::ConcurrentMutation);
+        }
+        Ok(PersistedRealmProcessorExternalDependencyProjection {
+            projector_fingerprint: self.fingerprint,
+            selection: RealmProcessorExternalDependencySelection::CurrentGathering,
+            projection: second,
+        })
+    }
+
     /// Select and rebuild the currently-processing qualified generation. The
     /// close identity is read from the durable admission header rather than
     /// accepted from the caller; this is the bootstrap counterpart to the
@@ -237,9 +282,8 @@ where
         let commitment = receipt.commitment();
         let fresh = match receipt.selection {
             RealmProcessorExternalDependencySelection::CurrentGathering => {
-                self.read_exact(
+                self.read_gathering_selected_exact(
                     commitment.context(),
-                    commitment.admission_close_intent(),
                     *commitment.assignment_digest(),
                 )
                 .await?

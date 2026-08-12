@@ -181,6 +181,52 @@ impl<Hash: Q256BitHash> RealmProcessorGenerationTerminal<Hash> {
         application: RealmProcessorApplicationContinuation,
         terminal_authorization: Vec<u8>,
     ) -> Result<Self, RealmGenerationTerminalError> {
+        Self::try_new_inner(
+            terminal_pipeline,
+            reserved,
+            assignment_digest,
+            application_store_fingerprint,
+            application,
+            terminal_authorization,
+        )
+    }
+
+    /// Build the same immutable terminal model from a context returned by a
+    /// durable allocator in another storage crate. This remains checked data,
+    /// not mutation authority: the Scylla terminal owner must independently
+    /// prove the allocator receipt, authorization envelope and persisted row
+    /// before it can execute the stored rotation candidate.
+    pub fn try_new_from_reserved_context(
+        terminal_pipeline: &StoredPendingPipeline<Hash>,
+        reserved: PendingGenerationContext,
+        assignment_digest: [u8; 32],
+        application_store_fingerprint: [u8; 32],
+        application: RealmProcessorApplicationContinuation,
+        terminal_authorization: Vec<u8>,
+    ) -> Result<Self, RealmGenerationTerminalError> {
+        let reserved = ReservedPendingGeneration::try_new(
+            reserved.pending_id().get(),
+            reserved.proc_checkpoint_id().as_u128(),
+        )
+        .map_err(|_| RealmGenerationTerminalError::BindingMismatch)?;
+        Self::try_new_inner(
+            terminal_pipeline,
+            reserved,
+            assignment_digest,
+            application_store_fingerprint,
+            application,
+            terminal_authorization,
+        )
+    }
+
+    fn try_new_inner(
+        terminal_pipeline: &StoredPendingPipeline<Hash>,
+        reserved: ReservedPendingGeneration,
+        assignment_digest: [u8; 32],
+        application_store_fingerprint: [u8; 32],
+        application: RealmProcessorApplicationContinuation,
+        terminal_authorization: Vec<u8>,
+    ) -> Result<Self, RealmGenerationTerminalError> {
         if assignment_digest == [0; 32] || application_store_fingerprint == [0; 32] {
             return Err(RealmGenerationTerminalError::EmptyDigest);
         }
@@ -234,6 +280,31 @@ impl<Hash: Q256BitHash> RealmProcessorGenerationTerminal<Hash> {
         };
         terminal.digest = terminal_digest(&terminal.encode_unsigned())?;
         Ok(terminal)
+    }
+
+    /// Rebuild the exact rotation CAS committed inside this immutable record.
+    /// Storage must first select and revalidate this terminal plus its
+    /// successor carryover and authorization; this model method performs no
+    /// I/O and grants no writer/head authority by itself.
+    pub fn seal_recorded_rotation(
+        &self,
+        current: &StoredPendingPipeline<Hash>,
+    ) -> Result<SealedPendingPipelineTransition<Hash>, RealmGenerationTerminalError> {
+        if current != &self.expected_pipeline {
+            return Err(RealmGenerationTerminalError::BindingMismatch);
+        }
+        let reserved = ReservedPendingGeneration::try_new(
+            self.reserved_next_gathering.pending_id().get(),
+            self.reserved_next_gathering.proc_checkpoint_id().as_u128(),
+        )
+        .map_err(|_| RealmGenerationTerminalError::BindingMismatch)?;
+        let sealed = current
+            .seal_rotation(reserved)
+            .map_err(|error| RealmGenerationTerminalError::Pipeline(error.to_string()))?;
+        if sealed.candidate() != &self.candidate_pipeline {
+            return Err(RealmGenerationTerminalError::DigestMismatch);
+        }
+        Ok(sealed)
     }
 
     pub const fn slot(&self) -> RealmProcessorGenerationTerminalSlot { self.slot }

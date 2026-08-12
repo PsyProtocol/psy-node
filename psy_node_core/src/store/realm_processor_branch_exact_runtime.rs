@@ -41,9 +41,11 @@ use crate::queue::{
         RealmProcessorFullCommitSourceFactory,
         RealmProcessorFullCommitPublicationObservation,
         RealmProcessorFullCommitSourceObservation,
+        RealmProcessorGenerationRotationOutcome,
         RealmProcessorVerifiedFullCommitSource,
         SealedRealmProcessorFullCommitPublicationRequest,
         SealedRealmProcessorFullCommitSourceRequest,
+        SealedRealmProcessorGenerationRotationRequest,
     },
     realm_processor_continuation_restart::{
         RealmProcessorContinuationRestartFactory,
@@ -368,6 +370,28 @@ impl<Hash> RealmBranchExactCommitIteration<'_, Hash> {
             runtime.queue_readiness_digest(),
         )?;
         factory.recover_publication(request).await
+    }
+
+    /// Close the exact storage-selected Published/Retired generation, persist
+    /// its terminal and successor carryover, then apply the recorded rotation
+    /// CAS last. No caller-provided pending/proc, slot or digest is accepted.
+    pub async fn terminalize_and_rotate_generation(
+        &mut self,
+    ) -> Result<RealmProcessorGenerationRotationOutcome, RealmProcessorFullCommitSourceError>
+    where
+        Hash: Q256BitHash + 'static,
+    {
+        let runtime = self.owner.runtime();
+        let factory = Arc::clone(self.owner.installed.full_commit_source_factory());
+        let request = SealedRealmProcessorGenerationRotationRequest::seal(
+            self.owner.startup_permit_digest(),
+            runtime.network(),
+            runtime.realm_id(),
+            runtime.realm_sub_id(),
+            runtime.writer_activation_digest(),
+            runtime.queue_readiness_digest(),
+        )?;
+        factory.terminalize_and_rotate(request).await
     }
 
     /// Freshly observes the storage-selected processing generation. This is
@@ -1165,6 +1189,16 @@ mod tests {
         > {
             Err(RealmProcessorFullCommitSourceError::Backend(
                 "full-commit publication fixture is installation-only".to_owned(),
+            ))
+        }
+
+        async fn terminalize_and_rotate(
+            &self,
+            _request: SealedRealmProcessorGenerationRotationRequest,
+        ) -> Result<RealmProcessorGenerationRotationOutcome, RealmProcessorFullCommitSourceError>
+        {
+            Err(RealmProcessorFullCommitSourceError::Backend(
+                "generation rotation fixture is installation-only".to_owned(),
             ))
         }
     }

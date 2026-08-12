@@ -40,7 +40,10 @@ use psy_node_core::{
             RealmProcessorGenerationContinuation,
             RealmProcessorGenerationContinuationPhase,
         },
-        realm_processor_full_commit_source::RealmProcessorVerifiedFullCommitSource,
+        realm_processor_full_commit_source::{
+            RealmProcessorGenerationRotationOutcome,
+            RealmProcessorVerifiedFullCommitSource,
+        },
         realm_processor_narrow_writer::RealmProcessorVerifiedNarrowWriterEvidence,
         realm_processor_semantic_output::{
             RealmProcessorDeferredJob, RealmProcessorSemanticJob,
@@ -782,7 +785,7 @@ where
         )?;
         let source_observation = iteration.execute_full_commit(source).await?;
         tracing::info!(
-            "Branch-exact full commit written, manifested and published: archive={:?}, pending={}, pipeline_revision={}, writer_revision={}, narrow_prepared={:?}, proof={:?}, coordinator={:?}, domains={}, coverage={:?}, typed_rows={}, total_mutations={}, manifest_slot={:?}, manifest={:?}; terminal/rotation remain blocked",
+            "Branch-exact full commit written, manifested and published: archive={:?}, pending={}, pipeline_revision={}, writer_revision={}, narrow_prepared={:?}, proof={:?}, coordinator={:?}, domains={}, coverage={:?}, typed_rows={}, total_mutations={}, manifest_slot={:?}, manifest={:?}; terminal/rotation resume on the next continuation pass",
             source_observation.application().archive_slot(),
             source_observation.processing().pending_id().get(),
             source_observation.pipeline_revision().get(),
@@ -1048,27 +1051,58 @@ where
                         .resume_branch_exact_await_writer_completion(iteration)
                         .await;
                 }
-                if continuation.phase()
-                    == RealmProcessorGenerationContinuationPhase::AwaitPublishedTerminal
-                {
+                if matches!(
+                    continuation.phase(),
+                    RealmProcessorGenerationContinuationPhase::AwaitPublishedTerminal
+                        | RealmProcessorGenerationContinuationPhase::AwaitRetiredNoWorkTerminal
+                ) {
                     let RealmNormalCommitIteration::BranchExact(iteration) = iteration
                     else {
                         anyhow::bail!(
                             "branch-exact continuation observed under legacy iteration"
                         );
                     };
-                    let published = iteration
-                        .recover_full_commit_publication()
-                        .await?;
-                    tracing::info!(
-                        "Branch-exact full commit publication is exact: archive={:?}, pending={}, pipeline_revision={}, writer_revision={}, head_revision={}, manifest={:?}; terminal/rotation remain blocked",
-                        published.application().archive_slot(),
-                        published.processing().pending_id().get(),
-                        published.pipeline_revision().get(),
-                        published.writer_revision(),
-                        published.head_revision(),
-                        published.manifest_digest(),
-                    );
+                    if continuation.phase()
+                        == RealmProcessorGenerationContinuationPhase::AwaitPublishedTerminal
+                    {
+                        let published = iteration
+                            .recover_full_commit_publication()
+                            .await?;
+                        tracing::info!(
+                            "Branch-exact full commit publication is exact: archive={:?}, pending={}, pipeline_revision={}, writer_revision={}, head_revision={}, manifest={:?}",
+                            published.application().archive_slot(),
+                            published.processing().pending_id().get(),
+                            published.pipeline_revision().get(),
+                            published.writer_revision(),
+                            published.head_revision(),
+                            published.manifest_digest(),
+                        );
+                    }
+                    match iteration.terminalize_and_rotate_generation().await? {
+                        RealmProcessorGenerationRotationOutcome::AwaitSuccessorDependency {
+                            source,
+                            successor,
+                            pipeline_revision,
+                        } => {
+                            tracing::debug!(
+                                "Branch-exact generation is published but its successor dependency is not durably qualified yet: source_pending={}, successor_pending={}, pipeline_revision={}",
+                                source.pending_id().get(),
+                                successor.pending_id().get(),
+                                pipeline_revision.get(),
+                            );
+                        }
+                        RealmProcessorGenerationRotationOutcome::Rotated(rotated) => {
+                            tracing::info!(
+                                "Branch-exact generation terminal and carryover are exact and the pipeline rotated: source_pending={}, successor_pending={}, next_gathering_pending={}, pipeline_revision={}, terminal={:?}, carryover={:?}",
+                                rotated.source().pending_id().get(),
+                                rotated.successor().pending_id().get(),
+                                rotated.reserved_next_gathering().pending_id().get(),
+                                rotated.pipeline_revision().get(),
+                                rotated.terminal_digest(),
+                                rotated.carryover_digest(),
+                            );
+                        }
+                    }
                     return Ok(());
                 }
                 tracing::info!(
@@ -1725,6 +1759,40 @@ mod h23c4e3a_tests {
             "authority_head",
         ] {
             assert!(!route.contains(forbidden), "found {forbidden}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod h23_generation_rotation_tests {
+    #[test]
+    fn published_and_no_work_terminal_phases_use_the_storage_owned_rotation_path() {
+        let source = include_str!("process_block.rs");
+        let process = source
+            .split("pub(super) async fn process_block")
+            .nth(1)
+            .unwrap();
+        let terminal_start = process
+            .find(
+                "if matches!(\n                    continuation.phase(),\n                    RealmProcessorGenerationContinuationPhase::AwaitPublishedTerminal",
+            )
+            .unwrap();
+        let terminal = process[terminal_start..]
+            .split("tracing::info!(\n                    \"Branch-exact continuation")
+            .next()
+            .unwrap();
+
+        assert!(terminal.contains(
+            "RealmProcessorGenerationContinuationPhase::AwaitRetiredNoWorkTerminal"
+        ));
+        let recover = terminal.find("recover_full_commit_publication").unwrap();
+        let rotate = terminal.find("terminalize_and_rotate_generation").unwrap();
+        assert!(recover < rotate);
+        assert!(terminal.contains("AwaitSuccessorDependency"));
+        assert!(terminal.contains("RealmProcessorGenerationRotationOutcome::Rotated"));
+        assert!(terminal.contains("return Ok(())"));
+        for forbidden in ["seal_rotation(", "pipeline.apply", "qualification_persist"] {
+            assert!(!terminal.contains(forbidden));
         }
     }
 }

@@ -14,6 +14,7 @@ use psy_node_core::queue::realm_processor_generation_terminal::{
     RealmProcessorGenerationTerminalSlot,
     RealmProcessorGenerationTerminalStoreFingerprint,
 };
+use psy_node_core::queue::realm_processor_generation_continuation::RealmProcessorApplicationContinuation;
 use psy_node_core::store::pending_generation_identity::{
     PendingGenerationActivationDigest, PendingGenerationContext,
     PendingGenerationLedgerKey,
@@ -26,7 +27,15 @@ use scylla::{
 };
 use sha2::{Digest, Sha256};
 
-use super::BranchExactDeploymentNoTabletKeyspace;
+use super::{
+    pending_counter::VerifiedCurrentPendingOwnership,
+    realm_processor_application_archive::ScyllaRealmProcessorApplicationArchiveStore,
+    realm_processor_terminal_authorization::{
+        PersistedRealmProcessorTerminalAuthorization,
+        RealmProcessorTerminalAuthorizationProvider,
+    },
+    BranchExactDeploymentNoTabletKeyspace,
+};
 
 pub(super) const REALM_PROCESSOR_GENERATION_TERMINAL_TABLE: &str =
     "branch_exact_realm_processor_generation_terminal_v1";
@@ -134,6 +143,84 @@ impl ScyllaRealmProcessorGenerationTerminalStore {
         &self,
     ) -> RealmProcessorGenerationTerminalStoreFingerprint {
         self.fingerprint
+    }
+
+    /// The only production sibling-visible terminal write path. It consumes
+    /// an opaque, freshly revalidated terminal authorization plus a current
+    /// durable pending ownership token, selects the application archive from
+    /// the authorized pipeline, then persists and revalidates the immutable
+    /// terminal. Callers cannot provide a terminal model or authorization
+    /// bytes directly.
+    pub(super) async fn persist_from_authorized_sources<Hash: Q256BitHash>(
+        &self,
+        authorizer: &dyn RealmProcessorTerminalAuthorizationProvider<Hash>,
+        authorization: &PersistedRealmProcessorTerminalAuthorization<Hash>,
+        application_store: &ScyllaRealmProcessorApplicationArchiveStore,
+        reserved: VerifiedCurrentPendingOwnership,
+    ) -> Result<RealmProcessorGenerationTerminal<Hash>, RealmProcessorGenerationTerminalStoreError>
+    {
+        authorizer
+            .revalidate_exact(authorization)
+            .await
+            .map_err(|error| RealmProcessorGenerationTerminalStoreError::Authorization(error.to_string()))?;
+        let pipeline = authorization.pipeline();
+        let reserved_context = PendingGenerationContext::try_from_legacy(
+            reserved.pending().get(),
+            reserved.proc_id().as_u128(),
+        )
+        .map_err(|error| RealmProcessorGenerationTerminalStoreError::Binding(error.to_string()))?;
+        if reserved_context.proc_checkpoint_id()
+                != pipeline.proc_namespace_prefix().derive_proc_id(reserved_context.pending_id())
+            || reserved_context.pending_id().get() <= pipeline.gathering().pending_id().get()
+        {
+            return Err(RealmProcessorGenerationTerminalStoreError::AuthorizationBindingMismatch);
+        }
+        let application_slot = match pipeline.processing_state() {
+            psy_node_core::store::pending_generation_pipeline::PendingProcessingState::Published { capture, .. } => {
+                psy_node_core::queue::realm_processor_application_archive::RealmProcessorApplicationArchiveSlot::try_new(
+                    *capture.as_bytes(),
+                )
+                .map_err(|error| RealmProcessorGenerationTerminalStoreError::Application(error.to_string()))?
+            }
+            psy_node_core::store::pending_generation_pipeline::PendingProcessingState::RetiredNoWork { seal, .. } => {
+                psy_node_core::queue::realm_processor_application_archive::RealmProcessorApplicationArchiveSlot::try_new(
+                    *seal.as_bytes(),
+                )
+                .map_err(|error| RealmProcessorGenerationTerminalStoreError::Application(error.to_string()))?
+            }
+            _ => return Err(RealmProcessorGenerationTerminalStoreError::AuthorizationBindingMismatch),
+        };
+        let application = application_store
+            .read_selected(application_slot)
+            .await
+            .map_err(|error| RealmProcessorGenerationTerminalStoreError::Application(error.to_string()))?
+            .ok_or(RealmProcessorGenerationTerminalStoreError::MissingApplication)?;
+        let continuation = RealmProcessorApplicationContinuation::try_from_storage(
+            application.header().slot(),
+            application.header().digest(),
+            application.semantic(),
+        )
+        .map_err(|error| RealmProcessorGenerationTerminalStoreError::Application(error.to_string()))?;
+        let terminal = RealmProcessorGenerationTerminal::try_new_from_reserved_context(
+            pipeline,
+            reserved_context,
+            *application.header().binding().assignment_digest(),
+            *application_store.fingerprint().as_bytes(),
+            continuation,
+            authorization.envelope().to_canonical_bytes(),
+        )?;
+        let receipt = self.persist(terminal).await?;
+
+        authorizer
+            .revalidate_exact(authorization)
+            .await
+            .map_err(|error| RealmProcessorGenerationTerminalStoreError::Authorization(error.to_string()))?;
+        application_store
+            .revalidate_exact(&application)
+            .await
+            .map_err(|error| RealmProcessorGenerationTerminalStoreError::Application(error.to_string()))?;
+        self.revalidate(&receipt).await?;
+        Ok(receipt.terminal)
     }
 
     async fn read<Hash: Q256BitHash>(
@@ -289,6 +376,11 @@ fn cql(error: impl fmt::Display) -> RealmProcessorGenerationTerminalStoreError {
 pub(super) enum RealmProcessorGenerationTerminalStoreError {
     Cql(String),
     Core(RealmGenerationTerminalError),
+    Authorization(String),
+    AuthorizationBindingMismatch,
+    Application(String),
+    MissingApplication,
+    Binding(String),
     MissingColumn,
     MissingAppliedColumn,
     InvalidAppliedColumn,
@@ -381,7 +473,8 @@ mod tests {
         let source = include_str!("realm_processor_generation_terminal.rs");
         let production = source.split("#[cfg(test)]").next().unwrap();
         assert!(production.contains("struct PersistedRealmProcessorGenerationTerminalReceipt"));
-        assert!(!production.contains("pub(super) async fn persist"));
+        assert!(!production.contains("pub(super) async fn persist("));
+        assert!(production.contains("pub(super) async fn persist_from_authorized_sources"));
         assert!(!production.contains("seal_pipeline_rotation"));
         assert!(!production.contains("ScyllaPendingPipelineStore"));
         assert!(!production.contains("pipeline.apply"));

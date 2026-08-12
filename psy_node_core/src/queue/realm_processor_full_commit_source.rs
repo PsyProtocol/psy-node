@@ -40,6 +40,12 @@ use crate::store::{
 use super::{
     realm_processor_application_proof_work::RealmProcessorApplicationProofWork,
     realm_processor_generation_continuation::RealmProcessorApplicationContinuation,
+    realm_processor_generation_terminal::{
+        RealmProcessorDeferredCarryoverRecordDigest,
+        RealmProcessorDeferredCarryoverSlot,
+        RealmProcessorGenerationTerminalDigest,
+        RealmProcessorGenerationTerminalSlot,
+    },
 };
 
 const COORDINATOR_PAYLOAD_DIGEST_DOMAIN: &[u8] =
@@ -298,6 +304,131 @@ pub struct SealedRealmProcessorFullCommitPublicationRequest {
     queue_readiness_digest: [u8; 32],
 }
 
+/// Identity-only request for closing one already-published generation and
+/// rotating its durable pipeline.  The caller cannot choose either the
+/// current/successor generation or any terminal/carryover content.
+pub struct SealedRealmProcessorGenerationRotationRequest {
+    startup_permit_digest: RealmProcessorStartupPermitDigest,
+    network: NetworkId,
+    realm_id: u32,
+    realm_sub_id: u16,
+    writer_activation_digest: [u8; 32],
+    queue_readiness_digest: [u8; 32],
+}
+
+impl SealedRealmProcessorGenerationRotationRequest {
+    pub(crate) fn seal(
+        startup_permit_digest: RealmProcessorStartupPermitDigest,
+        network: NetworkId,
+        realm_id: u32,
+        realm_sub_id: u16,
+        writer_activation_digest: [u8; 32],
+        queue_readiness_digest: [u8; 32],
+    ) -> Result<Self, RealmProcessorFullCommitSourceError> {
+        if writer_activation_digest == [0; 32]
+            || queue_readiness_digest == [0; 32]
+        {
+            return Err(RealmProcessorFullCommitSourceError::IdentityMismatch);
+        }
+        Ok(Self {
+            startup_permit_digest,
+            network,
+            realm_id,
+            realm_sub_id,
+            writer_activation_digest,
+            queue_readiness_digest,
+        })
+    }
+
+    pub const fn startup_permit_digest(&self) -> RealmProcessorStartupPermitDigest {
+        self.startup_permit_digest
+    }
+    pub const fn network(&self) -> NetworkId { self.network }
+    pub const fn realm_id(&self) -> u32 { self.realm_id }
+    pub const fn realm_sub_id(&self) -> u16 { self.realm_sub_id }
+    pub const fn writer_activation_digest(&self) -> &[u8; 32] {
+        &self.writer_activation_digest
+    }
+    pub const fn queue_readiness_digest(&self) -> &[u8; 32] {
+        &self.queue_readiness_digest
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RealmProcessorGenerationRotationObservation {
+    source: PendingGenerationContext,
+    successor: PendingGenerationContext,
+    reserved_next_gathering: PendingGenerationContext,
+    pipeline_revision: PendingPipelineRevision,
+    terminal_slot: RealmProcessorGenerationTerminalSlot,
+    terminal_digest: RealmProcessorGenerationTerminalDigest,
+    carryover_slot: RealmProcessorDeferredCarryoverSlot,
+    carryover_digest: RealmProcessorDeferredCarryoverRecordDigest,
+}
+
+impl RealmProcessorGenerationRotationObservation {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_from_storage(
+        source: PendingGenerationContext,
+        successor: PendingGenerationContext,
+        reserved_next_gathering: PendingGenerationContext,
+        pipeline_revision: PendingPipelineRevision,
+        terminal_slot: RealmProcessorGenerationTerminalSlot,
+        terminal_digest: RealmProcessorGenerationTerminalDigest,
+        carryover_slot: RealmProcessorDeferredCarryoverSlot,
+        carryover_digest: RealmProcessorDeferredCarryoverRecordDigest,
+    ) -> Result<Self, RealmProcessorFullCommitSourceError> {
+        if source.pending_id().get() == 0
+            || successor.pending_id().get() <= source.pending_id().get()
+            || reserved_next_gathering.pending_id().get()
+                <= successor.pending_id().get()
+        {
+            return Err(RealmProcessorFullCommitSourceError::IdentityMismatch);
+        }
+        Ok(Self {
+            source,
+            successor,
+            reserved_next_gathering,
+            pipeline_revision,
+            terminal_slot,
+            terminal_digest,
+            carryover_slot,
+            carryover_digest,
+        })
+    }
+
+    pub const fn source(&self) -> PendingGenerationContext { self.source }
+    pub const fn successor(&self) -> PendingGenerationContext { self.successor }
+    pub const fn reserved_next_gathering(&self) -> PendingGenerationContext {
+        self.reserved_next_gathering
+    }
+    pub const fn pipeline_revision(&self) -> PendingPipelineRevision {
+        self.pipeline_revision
+    }
+    pub const fn terminal_slot(&self) -> RealmProcessorGenerationTerminalSlot {
+        self.terminal_slot
+    }
+    pub const fn terminal_digest(&self) -> RealmProcessorGenerationTerminalDigest {
+        self.terminal_digest
+    }
+    pub const fn carryover_slot(&self) -> RealmProcessorDeferredCarryoverSlot {
+        self.carryover_slot
+    }
+    pub const fn carryover_digest(&self) -> RealmProcessorDeferredCarryoverRecordDigest {
+        self.carryover_digest
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RealmProcessorGenerationRotationOutcome {
+    AwaitSuccessorDependency {
+        source: PendingGenerationContext,
+        successor: PendingGenerationContext,
+        pipeline_revision: PendingPipelineRevision,
+    },
+    Rotated(RealmProcessorGenerationRotationObservation),
+}
+
 impl SealedRealmProcessorFullCommitPublicationRequest {
     pub(crate) fn seal(
         startup_permit_digest: RealmProcessorStartupPermitDigest,
@@ -488,6 +619,11 @@ pub trait RealmProcessorFullCommitSourceFactory<Hash>: Send + Sync {
         RealmProcessorFullCommitPublicationObservation,
         RealmProcessorFullCommitSourceError,
     >;
+
+    async fn terminalize_and_rotate(
+        &self,
+        request: SealedRealmProcessorGenerationRotationRequest,
+    ) -> Result<RealmProcessorGenerationRotationOutcome, RealmProcessorFullCommitSourceError>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

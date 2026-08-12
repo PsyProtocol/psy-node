@@ -224,6 +224,38 @@ where
         Ok(generation)
     }
 
+    /// Rebuild the exact currently-gathering generation without accepting a
+    /// caller-provided close. This is used only by the storage-private
+    /// terminal owner before rotation; the admission header selects the close
+    /// and the full current-pipeline fence proves that the generation is still
+    /// the pipeline gathering slot.
+    pub(super) async fn read_gathering_selected(
+        &self,
+        key: RealmUserUpdateAdmissionKey,
+    ) -> Result<RealmUserUpdateDurableGeneration<F, Hash>, RealmUserUpdateDurableConsumerError>
+    {
+        let before = self
+            .admission
+            .select_qualified_generation_header::<Hash>(key)
+            .await
+            .map_err(admission)?;
+        let close = before
+            .close_intent()
+            .ok_or(RealmUserUpdateDurableConsumerError::GenerationNotQualified)?;
+        let generation = self
+            .read_exact_with_fence(key, close, DurableGenerationFence::CurrentPipeline)
+            .await?;
+        let after = self
+            .admission
+            .select_qualified_generation_header::<Hash>(key)
+            .await
+            .map_err(admission)?;
+        if before != after {
+            return Err(RealmUserUpdateDurableConsumerError::ConcurrentChange);
+        }
+        Ok(generation)
+    }
+
     /// Rebuild an immutable generation after its gathering pipeline has
     /// rotated. The expected qualification digest must come from a durable
     /// terminal authorization envelope; it replaces only the live-pipeline
