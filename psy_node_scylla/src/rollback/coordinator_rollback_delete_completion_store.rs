@@ -275,6 +275,10 @@ impl<Hash: Q256BitHash> CoordinatorRollbackDeleteCompletion<Hash> {
         &self.participant_plan_digest
     }
 
+    pub(super) const fn barrier_digest(&self) -> &[u8; 32] {
+        &self.barrier_digest
+    }
+
     pub(super) const fn slot(&self) -> &[u8; 32] {
         &self.slot
     }
@@ -285,6 +289,14 @@ impl<Hash: Q256BitHash> CoordinatorRollbackDeleteCompletion<Hash> {
 
     pub(super) const fn post_state_digest(&self) -> &[u8; 32] {
         &self.post_state_digest
+    }
+
+    pub(super) const fn physical_delete_count(&self) -> u64 {
+        self.physical_delete_count
+    }
+
+    pub(super) const fn restored_singleton_count(&self) -> u64 {
+        self.restored_singleton_count
     }
 }
 
