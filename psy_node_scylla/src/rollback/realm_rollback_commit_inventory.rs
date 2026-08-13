@@ -37,6 +37,15 @@ pub(crate) struct RealmRollbackCommitInventorySlot([u8; 32]);
 
 impl RealmRollbackCommitInventorySlot {
     pub(crate) const fn as_bytes(&self) -> &[u8; 32] { &self.0 }
+
+    pub(crate) fn for_candidate<Hash: Q256BitHash>(
+        authority: AuthorityScope,
+        candidate: &BranchPendingMapping<Hash>,
+    ) -> Self {
+        inventory_slot(authority, candidate)
+    }
+
+    pub(crate) const fn from_persisted(bytes: [u8; 32]) -> Self { Self(bytes) }
 }
 
 /// Non-Clone complete inventory. A later store may persist it, but this model

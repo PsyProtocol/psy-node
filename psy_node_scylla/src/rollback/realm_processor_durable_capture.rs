@@ -230,6 +230,8 @@ use super::pending_counter::{
 use super::realm_full_commit_execution::RealmFullCommitExecutionSchedule;
 use super::realm_full_commit_manifest_store::ScyllaRealmFullCommitManifestStore;
 use super::realm_full_commit_scylla::RealmFullCommitScyllaExecutor;
+use super::realm_rollback_commit_inventory::RealmRollbackCommitInventory;
+use super::realm_rollback_commit_inventory_store::ScyllaRealmRollbackCommitInventoryStore;
 
 const OWNER_ATTEMPT_DOMAIN: &[u8] =
     b"psy/rollback/realm-processor-capture-owner-attempt/v1";
@@ -263,6 +265,7 @@ pub(crate) struct ScyllaRealmProcessorDurableCaptureFactory<Hash> {
     full_commit_session: Arc<Session>,
     full_commit_executor: Arc<RealmFullCommitScyllaExecutor>,
     full_commit_manifest: Arc<ScyllaRealmFullCommitManifestStore>,
+    full_commit_inventory: Arc<ScyllaRealmRollbackCommitInventoryStore>,
     external_dependency_loader: Arc<dyn RealmProcessorExternalDependencyLoader>,
     _hash: PhantomData<Hash>,
 }
@@ -430,7 +433,16 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
         let full_commit_manifest = Arc::new(
             ScyllaRealmFullCommitManifestStore::prepare(
                 session.clone(),
+                control.clone(),
+            )
+            .await
+            .map_err(backend)?,
+        );
+        let full_commit_inventory = Arc::new(
+            ScyllaRealmRollbackCommitInventoryStore::prepare(
+                session.clone(),
                 control,
+                keyspaces.application_data_keyspace().map_err(backend)?,
             )
             .await
             .map_err(backend)?,
@@ -457,6 +469,7 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
             full_commit_session: session,
             full_commit_executor,
             full_commit_manifest,
+            full_commit_inventory,
             external_dependency_loader,
             _hash: PhantomData,
         })
@@ -869,6 +882,21 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
             verified.prepared(),
         )
         .map_err(|error| RealmProcessorFullCommitSourceError::Writer(error.to_string()))?;
+        let rollback_inventory = RealmRollbackCommitInventory::try_from_schedule(
+            verified.prepared(),
+            &full_plan,
+            &schedule,
+        )
+        .map_err(full_source_backend)?;
+        let rollback_inventory = self
+            .full_commit_inventory
+            .persist_prewrite(rollback_inventory)
+            .await
+            .map_err(full_source_backend)?;
+        self.full_commit_inventory
+            .revalidate_prewrite(&rollback_inventory)
+            .await
+            .map_err(full_source_backend)?;
         self.full_commit_executor
             .write_and_verify(&self.full_commit_session, &schedule)
             .await
@@ -1037,6 +1065,21 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
         if fresh_head != published_head {
             return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
         }
+        let committed_inventory = self
+            .full_commit_inventory
+            .mark_committed(
+                &rollback_inventory,
+                &manifest,
+                &fresh_head,
+                &published_pipeline,
+                &final_writer,
+            )
+            .await
+            .map_err(full_source_backend)?;
+        self.full_commit_inventory
+            .revalidate_committed(&committed_inventory)
+            .await
+            .map_err(full_source_backend)?;
         RealmProcessorFullCommitSourceObservation::try_from_storage(
             processing,
             application,
@@ -1165,6 +1208,30 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
         if final_head != first_head {
             return Err(RealmProcessorFullCommitSourceError::ConcurrentMutation);
         }
+        let candidate = BranchPendingMapping::new(
+            *second.pipeline.frontier().chain(),
+            second.pipeline.processing().pending_id(),
+        );
+        let rollback_inventory = self
+            .full_commit_inventory
+            .read_prewrite_for_candidate(self.authority, &candidate)
+            .await
+            .map_err(full_source_backend)?;
+        let committed_inventory = self
+            .full_commit_inventory
+            .mark_committed(
+                &rollback_inventory,
+                &manifest,
+                &final_head,
+                &second.pipeline,
+                &final_writer,
+            )
+            .await
+            .map_err(full_source_backend)?;
+        self.full_commit_inventory
+            .revalidate_committed(&committed_inventory)
+            .await
+            .map_err(full_source_backend)?;
         RealmProcessorFullCommitPublicationObservation::try_from_storage(
             second.pipeline.processing(),
             application,

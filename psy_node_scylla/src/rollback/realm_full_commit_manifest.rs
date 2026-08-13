@@ -418,6 +418,9 @@ impl<Hash: Q256BitHash> RealmFullCommitCompositeManifest<Hash> {
     pub(crate) const fn write_timestamp(&self) -> CommitWriteTimestampUs {
         self.write_timestamp
     }
+    pub(crate) const fn coverage_digest(&self) -> &[u8; 32] {
+        &self.coverage_digest
+    }
     pub(crate) const fn digest(&self) -> &[u8; 32] { &self.digest }
     pub(crate) const fn typed_row_count(&self) -> u32 { self.typed_row_count }
     pub(crate) const fn total_mutation_count(&self) -> u64 {

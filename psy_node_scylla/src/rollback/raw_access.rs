@@ -123,6 +123,7 @@ pub const RAW_SCYLLA_ACCESS_ALLOWLIST: &[RawScyllaAccessAllowance] = &[
     allow!("psy_node_scylla/src/rollback/realm_processor_generation_terminal.rs", DurableControlAuthority),
     allow!("psy_node_scylla/src/rollback/realm_processor_terminal_authorization.rs", DurableControlAuthority),
     allow!("psy_node_scylla/src/rollback/realm_full_commit_manifest_store.rs", DurableControlAuthority),
+    allow!("psy_node_scylla/src/rollback/realm_rollback_commit_inventory_store.rs", DurableControlAuthority),
     allow!("psy_node_scylla/src/rollback/realm_full_commit_scylla.rs", RollbackPrototypeAdapter),
     allow!("psy_node_scylla/src/rollback/realm_user_update_claim_store.rs", DurableControlAuthority),
     allow!("psy_node_scylla/src/rollback/realm_user_update_admission_store.rs", DurableControlAuthority),

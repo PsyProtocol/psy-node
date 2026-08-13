@@ -72,7 +72,7 @@ psy_node_scylla/src/rollback/pending_queue_segment_ledger.rs|DurableControlAutho
 psy_node_scylla/src/rollback/pending_queue_segment_lifecycle.rs|DurableControlAuthority|6|0|7|6|2|7|1|5
 psy_node_scylla/src/rollback/pending_queue_semantic_aggregate.rs|DurableControlAuthority|6|0|2|5|2|2|1|4
 psy_node_scylla/src/rollback/pending_queue_sidecar_lifecycle.rs|DurableControlAuthority|12|0|6|6|2|5|1|4
-psy_node_scylla/src/rollback/pending_queue_sidecar_schema.rs|DurableControlAuthority|8|0|0|0|0|0|2|3
+psy_node_scylla/src/rollback/pending_queue_sidecar_schema.rs|DurableControlAuthority|9|0|0|0|0|0|2|3
 psy_node_scylla/src/rollback/pending_queue_stream_provision.rs|DurableControlAuthority|8|0|3|6|2|3|1|5
 psy_node_scylla/src/rollback/public_key_projection.rs|RollbackPrototypeAdapter|6|0|0|4|1|2|0|2
 psy_node_scylla/src/rollback/raw_access.rs|GuardImplementation|2|1|1|1|3|8|6|9
@@ -88,6 +88,7 @@ psy_node_scylla/src/rollback/realm_processor_external_dependency_loader.rs|Durab
 psy_node_scylla/src/rollback/realm_processor_external_dependency_projection.rs|DurableControlAuthority|2|0|0|0|0|0|0|0
 psy_node_scylla/src/rollback/realm_processor_generation_terminal.rs|DurableControlAuthority|6|0|3|5|2|3|1|8
 psy_node_scylla/src/rollback/realm_processor_terminal_authorization.rs|DurableControlAuthority|3|0|2|0|0|0|0|0
+psy_node_scylla/src/rollback/realm_rollback_commit_inventory_store.rs|DurableControlAuthority|6|0|4|8|1|4|2|8
 psy_node_scylla/src/rollback/realm_user_update_admission_store.rs|DurableControlAuthority|6|0|3|6|2|3|1|4
 psy_node_scylla/src/rollback/realm_user_update_claim_store.rs|DurableControlAuthority|6|0|4|7|2|4|1|5
 psy_node_scylla/src/rollback/realm_user_update_dependency_store.rs|DurableControlAuthority|5|0|3|4|1|3|1|3

@@ -135,6 +135,7 @@ mod realm_full_commit_plan;
 #[allow(dead_code)]
 mod realm_full_commit_execution;
 mod realm_rollback_commit_inventory;
+mod realm_rollback_commit_inventory_store;
 #[allow(dead_code)]
 mod realm_full_commit_scylla;
 #[allow(dead_code)]

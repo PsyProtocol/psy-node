@@ -1,6 +1,6 @@
 //! Exact, default-off schema boundary for the recoverable Realm queue.
 //!
-//! The twenty-two target tables have production-shaped, default-off adapters. This module
+//! The twenty-four target tables have production-shaped, default-off adapters. This module
 //! gives deployment tooling one deterministic manifest/materializer and gives
 //! node startup an inspect-only capability.  Ordinary setup performs no queue
 //! CQL.  Partial materialization is retained and completed idempotently; this
@@ -57,6 +57,11 @@ use super::{
         ScyllaRealmFullCommitManifestStore,
         REALM_FULL_COMMIT_MANIFEST_TABLE,
     },
+    realm_rollback_commit_inventory_store::{
+        ScyllaRealmRollbackCommitInventoryStore,
+        REALM_ROLLBACK_COMMIT_INVENTORY_FRAGMENT_TABLE,
+        REALM_ROLLBACK_COMMIT_MARKER_TABLE,
+    },
     BranchExactDeploymentNoTabletKeyspace, CqlKeyspaceName,
     PendingQueueArtifactControlKeyspace, PendingQueueArtifactDataKeyspace,
     PendingQueueArtifactKeyspaces, PendingQueuePublishDataKeyspace,
@@ -75,14 +80,13 @@ use super::{
 #[cfg(test)]
 use super::RETIRED_REALM_USER_UPDATE_CLAIM_V1_TABLE;
 
-// v18 keeps the v17 physical manifest but changes the terminal/rotation
-// protocol: RetiredNoWork may now carry a storage-proven deferred-only
-// application. A v17 VERIFIED lifecycle must not authorize a binary whose
-// restart/terminal decoder does not understand that state.
-pub const PENDING_QUEUE_SIDECAR_SCHEMA_VERSION: u16 = 18;
-pub const PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT: usize = 22;
+// v19 adds the complete Realm normal-commit inventory fragments and their
+// independent COMMITTED marker. A v18 VERIFIED lifecycle cannot authorize a
+// binary that depends on those rows for delete-only rollback.
+pub const PENDING_QUEUE_SIDECAR_SCHEMA_VERSION: u16 = 19;
+pub const PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT: usize = 24;
 const FINGERPRINT_DOMAIN: &[u8] =
-    b"psy/rollback/pending-queue-sidecar-schema/v18";
+    b"psy/rollback/pending-queue-sidecar-schema/v19";
 const INSPECT_COLUMNS_CQL: &str = "SELECT column_name, type, kind, position, clustering_order FROM system_schema.columns WHERE keyspace_name = ? AND table_name = ?";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -110,6 +114,8 @@ pub enum PendingQueueSidecarPhysicalTable {
     RealmDeferredCarryover = 20,
     CoordinatorGutaSubmission = 21,
     RealmFullCommitManifest = 22,
+    RealmRollbackCommitInventoryFragment = 23,
+    RealmRollbackCommitMarker = 24,
 }
 
 impl PendingQueueSidecarPhysicalTable {
@@ -136,6 +142,8 @@ impl PendingQueueSidecarPhysicalTable {
         Self::RealmDeferredCarryover,
         Self::CoordinatorGutaSubmission,
         Self::RealmFullCommitManifest,
+        Self::RealmRollbackCommitInventoryFragment,
+        Self::RealmRollbackCommitMarker,
     ];
 
     pub const fn table_name(self) -> &'static str {
@@ -162,6 +170,10 @@ impl PendingQueueSidecarPhysicalTable {
             Self::RealmDeferredCarryover => REALM_PROCESSOR_DEFERRED_CARRYOVER_TABLE,
             Self::CoordinatorGutaSubmission => COORDINATOR_GUTA_DURABLE_SUBMISSION_TABLE,
             Self::RealmFullCommitManifest => REALM_FULL_COMMIT_MANIFEST_TABLE,
+            Self::RealmRollbackCommitInventoryFragment => {
+                REALM_ROLLBACK_COMMIT_INVENTORY_FRAGMENT_TABLE
+            }
+            Self::RealmRollbackCommitMarker => REALM_ROLLBACK_COMMIT_MARKER_TABLE,
         }
     }
 
@@ -170,7 +182,8 @@ impl PendingQueueSidecarPhysicalTable {
             Self::PublishFragment
             | Self::ArtifactFragment
             | Self::UserUpdateDependencyFragment
-            | Self::RealmApplicationArchiveFragment => {
+            | Self::RealmApplicationArchiveFragment
+            | Self::RealmRollbackCommitInventoryFragment => {
                 PendingQueueSidecarKeyspaceKind::StandardData
             }
             _ => PendingQueueSidecarKeyspaceKind::NoTabletControl,
@@ -324,7 +337,7 @@ const fn regular(
     PendingQueueSidecarColumnSpec { table, name, cql_type, kind: PendingQueueSidecarColumnKind::Regular, position: -1, clustering_order: PendingQueueSidecarClusteringOrder::None }
 }
 
-pub const PENDING_QUEUE_SIDECAR_EXPECTED_COLUMNS: [PendingQueueSidecarColumnSpec; 108] = [
+pub const PENDING_QUEUE_SIDECAR_EXPECTED_COLUMNS: [PendingQueueSidecarColumnSpec; 125] = [
     pk(PendingQueueSidecarPhysicalTable::Pipeline, "network_chain_id", "bigint", 0),
     pk(PendingQueueSidecarPhysicalTable::Pipeline, "authority_kind", "tinyint", 1),
     pk(PendingQueueSidecarPhysicalTable::Pipeline, "realm_id", "bigint", 2),
@@ -433,6 +446,23 @@ pub const PENDING_QUEUE_SIDECAR_EXPECTED_COLUMNS: [PendingQueueSidecarColumnSpec
     pk(PendingQueueSidecarPhysicalTable::RealmFullCommitManifest, "manifest_slot", "blob", 0),
     regular(PendingQueueSidecarPhysicalTable::RealmFullCommitManifest, "revision", "bigint"),
     regular(PendingQueueSidecarPhysicalTable::RealmFullCommitManifest, "manifest_payload", "blob"),
+    pk(PendingQueueSidecarPhysicalTable::RealmRollbackCommitInventoryFragment, "inventory_slot", "blob", 0),
+    ck(PendingQueueSidecarPhysicalTable::RealmRollbackCommitInventoryFragment, "fragment_index", "int", 0),
+    regular(PendingQueueSidecarPhysicalTable::RealmRollbackCommitInventoryFragment, "revision", "bigint"),
+    regular(PendingQueueSidecarPhysicalTable::RealmRollbackCommitInventoryFragment, "fragment_count", "int"),
+    regular(PendingQueueSidecarPhysicalTable::RealmRollbackCommitInventoryFragment, "inventory_bytes", "bigint"),
+    regular(PendingQueueSidecarPhysicalTable::RealmRollbackCommitInventoryFragment, "inventory_digest", "blob"),
+    regular(PendingQueueSidecarPhysicalTable::RealmRollbackCommitInventoryFragment, "payload", "blob"),
+    regular(PendingQueueSidecarPhysicalTable::RealmRollbackCommitInventoryFragment, "payload_digest", "blob"),
+    pk(PendingQueueSidecarPhysicalTable::RealmRollbackCommitMarker, "network_chain_id", "bigint", 0),
+    pk(PendingQueueSidecarPhysicalTable::RealmRollbackCommitMarker, "authority_kind", "tinyint", 1),
+    pk(PendingQueueSidecarPhysicalTable::RealmRollbackCommitMarker, "realm_id", "bigint", 2),
+    pk(PendingQueueSidecarPhysicalTable::RealmRollbackCommitMarker, "realm_sub_id", "int", 3),
+    pk(PendingQueueSidecarPhysicalTable::RealmRollbackCommitMarker, "chain_epoch", "bigint", 4),
+    ck(PendingQueueSidecarPhysicalTable::RealmRollbackCommitMarker, "checkpoint_id", "bigint", 0),
+    regular(PendingQueueSidecarPhysicalTable::RealmRollbackCommitMarker, "revision", "bigint"),
+    regular(PendingQueueSidecarPhysicalTable::RealmRollbackCommitMarker, "inventory_slot", "blob"),
+    regular(PendingQueueSidecarPhysicalTable::RealmRollbackCommitMarker, "marker", "blob"),
 ];
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -611,6 +641,24 @@ pub(super) fn current_physical_schema_matches_historical_v17() -> bool {
     ) == historical_v17_schema_fingerprint()
 }
 
+#[cfg(test)]
+pub(super) fn historical_v18_schema_fingerprint() -> PendingQueueSidecarSchemaFingerprint {
+    PendingQueueSidecarSchemaFingerprint::from_persisted([
+        0x10, 0x2a, 0xa6, 0xaa, 0x8d, 0x07, 0x01, 0x41,
+        0xa7, 0x7d, 0xb1, 0x6c, 0x64, 0x04, 0x0f, 0xee,
+        0x9d, 0xde, 0x90, 0xf1, 0x07, 0xeb, 0xf8, 0x7c,
+        0x4a, 0x60, 0xb3, 0x00, 0xfe, 0x3c, 0xd8, 0x13,
+    ])
+}
+
+#[cfg(test)]
+pub(super) fn current_physical_schema_matches_historical_v18() -> bool {
+    sidecar_schema_fingerprint(
+        18,
+        b"psy/rollback/pending-queue-sidecar-schema/v18",
+    ) == historical_v18_schema_fingerprint()
+}
+
 pub fn inspect_pending_queue_sidecar_columns(
     observed: Vec<ObservedPendingQueueSidecarColumn>,
     retired_v1_present: bool,
@@ -683,10 +731,11 @@ impl PendingQueueSidecarSchemaMaterializer {
             }
             PendingQueueSidecarSchemaInspection::Absent | PendingQueueSidecarSchemaInspection::Partial { .. } => {}
         }
-        materialize_pre_v17_tables(session, keyspaces).await?;
-        ScyllaRealmFullCommitManifestStore::create_schema(
+        materialize_pre_v19_tables(session, keyspaces).await?;
+        ScyllaRealmRollbackCommitInventoryStore::create_schema(
             session,
             &keyspaces.control,
+            &keyspaces.application_data_keyspace()?,
         )
         .await
         .map_err(sidecar)?;
@@ -695,6 +744,20 @@ impl PendingQueueSidecarSchemaMaterializer {
         };
         Ok(PendingQueueSidecarSchemaOnlyReceipt { keyspaces: keyspaces.clone(), fingerprint })
     }
+}
+
+async fn materialize_pre_v19_tables(
+    session: &Session,
+    keyspaces: &PendingQueueSidecarKeyspaces,
+) -> Result<(), PendingQueueSidecarSchemaError> {
+    materialize_pre_v17_tables(session, keyspaces).await?;
+    ScyllaRealmFullCommitManifestStore::create_schema(
+        session,
+        &keyspaces.control,
+    )
+    .await
+    .map_err(sidecar)?;
+    Ok(())
 }
 
 async fn materialize_pre_v17_tables(
@@ -825,13 +888,13 @@ mod tests {
     }
 
     #[test]
-    fn exact_manifest_is_twenty_two_unique_tables_with_stable_placement() {
-        assert_eq!(PENDING_QUEUE_SIDECAR_SCHEMA_VERSION, 18);
-        assert_eq!(PendingQueueSidecarPhysicalTable::ALL.len(), 22);
+    fn exact_manifest_is_twenty_four_unique_tables_with_stable_placement() {
+        assert_eq!(PENDING_QUEUE_SIDECAR_SCHEMA_VERSION, 19);
+        assert_eq!(PendingQueueSidecarPhysicalTable::ALL.len(), 24);
         let names = PendingQueueSidecarPhysicalTable::ALL.iter().map(|table| table.table_name()).collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(names.len(), 22);
-        assert_eq!(PendingQueueSidecarPhysicalTable::ALL.iter().filter(|table| table.keyspace_kind() == PendingQueueSidecarKeyspaceKind::StandardData).count(), 4);
-        assert_eq!(PendingQueueSidecarPhysicalTable::ALL.iter().filter(|table| table.keyspace_kind() == PendingQueueSidecarKeyspaceKind::NoTabletControl).count(), 18);
+        assert_eq!(names.len(), 24);
+        assert_eq!(PendingQueueSidecarPhysicalTable::ALL.iter().filter(|table| table.keyspace_kind() == PendingQueueSidecarKeyspaceKind::StandardData).count(), 5);
+        assert_eq!(PendingQueueSidecarPhysicalTable::ALL.iter().filter(|table| table.keyspace_kind() == PendingQueueSidecarKeyspaceKind::NoTabletControl).count(), 19);
         assert!(!names.contains(RETIRED_V1_PIPELINE_TABLE));
         assert!(!names.contains(RETIRED_REALM_USER_UPDATE_CLAIM_V1_TABLE));
         assert_ne!(pending_queue_sidecar_schema_fingerprint().as_bytes(), &[0; 32]);
@@ -839,7 +902,8 @@ mod tests {
         assert!(!current_physical_schema_matches_historical_v13());
         assert!(!current_physical_schema_matches_historical_v15());
         assert!(!current_physical_schema_matches_historical_v16());
-        assert!(current_physical_schema_matches_historical_v17());
+        assert!(!current_physical_schema_matches_historical_v17());
+        assert!(!current_physical_schema_matches_historical_v18());
         assert_eq!(
             hex::encode(historical_v12_schema_fingerprint().as_bytes()),
             "466bf80f7e9f336a5191c2efdecf05129c96f6086f57c1afb14ce6cbe0aca7fb",
@@ -864,6 +928,10 @@ mod tests {
             hex::encode(historical_v17_schema_fingerprint().as_bytes()),
             "921a1940bd463f7a99b0ac6f2002c682f06457d4383f3cf0bfd6a441da676b6c",
         );
+        assert_eq!(
+            hex::encode(historical_v18_schema_fingerprint().as_bytes()),
+            "102aa6aa8d070141a77db16c64040fee9dde90f107ebf87c4a60b300fe3cd813",
+        );
     }
 
     #[test]
@@ -882,6 +950,20 @@ mod tests {
         old_v14.retain(|column| column.table != PendingQueueSidecarPhysicalTable::CoordinatorGutaSubmission);
         let mut old_v16 = exact_columns();
         old_v16.retain(|column| column.table != PendingQueueSidecarPhysicalTable::RealmFullCommitManifest);
+        let mut old_v18 = exact_columns();
+        old_v18.retain(|column| !matches!(
+            column.table,
+            PendingQueueSidecarPhysicalTable::RealmRollbackCommitInventoryFragment
+                | PendingQueueSidecarPhysicalTable::RealmRollbackCommitMarker
+        ));
+        assert!(matches!(
+            inspect_pending_queue_sidecar_columns(old_v18, false).unwrap(),
+            PendingQueueSidecarSchemaInspection::Partial { missing, .. }
+                if missing == vec![
+                    PendingQueueSidecarPhysicalTable::RealmRollbackCommitInventoryFragment,
+                    PendingQueueSidecarPhysicalTable::RealmRollbackCommitMarker,
+                ]
+        ));
         assert!(matches!(
             inspect_pending_queue_sidecar_columns(old_v16, false).unwrap(),
             PendingQueueSidecarSchemaInspection::Partial { missing, .. }

@@ -862,8 +862,12 @@ mod tests {
         assert!(queries.cas().contains("IF revision = ? AND deployment_payload = ?"));
         assert!(!queries.create().contains(&["DROP", " TABLE"].concat()));
         assert!(!queries.create().contains(&["DELETE", " FROM"].concat()));
-        let setup = include_str!("../psy_setup.rs").split("#[cfg(test)]").next().unwrap();
-        assert!(!setup.contains("PendingQueueSidecarDeploymentExecutor::deploy"));
+        let setup = include_str!("../psy_setup.rs");
+        let ordinary_setup = setup
+            .split("pub async fn deploy_pending_queue_sidecar_from_connection_string")
+            .next()
+            .unwrap();
+        assert!(!ordinary_setup.contains("PendingQueueSidecarDeploymentExecutor::deploy"));
         assert!(setup.contains("PendingQueueSidecarSetupMode::Disabled"));
         assert!(setup.contains("PendingQueueSidecarSetupMode::RequireVerified"));
     }
