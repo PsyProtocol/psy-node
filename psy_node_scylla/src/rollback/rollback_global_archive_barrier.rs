@@ -21,7 +21,8 @@ use psy_data::protocol::{
 };
 use psy_node_core::store::{
     canonical_head::{
-        CanonicalHeadReadState, CanonicalHeadTransition, StoredCanonicalHead,
+        CanonicalHeadReadState, CanonicalHeadTransition,
+        CanonicalHeadWriteOutcome, StoredCanonicalHead,
     },
     rollback_control::ROLLBACK_CONTROL_V1_LEN,
     rollback_participant_plan::{
@@ -293,6 +294,18 @@ impl<Hash: Q256BitHash> RollbackGlobalArchiveBarrier<Hash> {
         &self.participant_plan_digest
     }
 
+    pub(super) const fn target(&self) -> &CanonicalChainRef<Hash> {
+        &self.target
+    }
+
+    pub(super) const fn topology_revision(&self) -> u64 {
+        self.topology_revision
+    }
+
+    pub(super) const fn topology_digest(&self) -> &[u8; 32] {
+        &self.topology_digest
+    }
+
     pub(super) const fn participant_count(&self) -> u64 {
         self.participant_count
     }
@@ -311,6 +324,10 @@ impl<Hash: Q256BitHash> RollbackGlobalArchiveBarrier<Hash> {
 
     pub(super) const fn digest(&self) -> &[u8; 32] {
         &self.digest
+    }
+
+    pub(super) const fn store_fingerprint(&self) -> &[u8; 32] {
+        &self.store_fingerprint
     }
 
     pub(super) fn canonical_bytes(&self) -> &[u8] {
@@ -582,6 +599,73 @@ impl ScyllaRollbackGlobalArchiveBarrierStore {
         Ok(Some(current))
     }
 
+    async fn read_selected<Hash: Q256BitHash>(
+        &self,
+        network: NetworkId,
+        old_chain_epoch: u64,
+        archiving_head: &StoredCanonicalHead<Hash>,
+        target: &CanonicalChainRef<Hash>,
+        participant_plan_digest: &[u8; 32],
+        topology_revision: u64,
+        topology_digest: &[u8; 32],
+    ) -> Result<Option<RollbackGlobalArchiveBarrier<Hash>>, RollbackGlobalArchiveBarrierError> {
+        let slot = barrier_slot(
+            network,
+            old_chain_epoch,
+            archiving_head,
+            target,
+            participant_plan_digest,
+            topology_revision,
+            topology_digest,
+            &self.fingerprint,
+        );
+        let coordinates = ArchiveCoordinates {
+            network: i64::from(network.chain_id()),
+            chain_epoch: i64::try_from(old_chain_epoch)
+                .map_err(|_| RollbackGlobalArchiveBarrierError::IntegerOutOfCqlRange)?,
+            participant_plan_digest: *participant_plan_digest,
+            row_slot: slot,
+        };
+        let rows = self.session.execute_unpaged(
+            &self.read_row,
+            (
+                coordinates.network,
+                coordinates.chain_epoch,
+                coordinates.participant_plan_digest.as_slice(),
+                BARRIER_KEY_DOMAIN,
+                coordinates.row_slot.as_slice(),
+            ),
+        ).await.map_err(cql)?.into_rows_result().map_err(cql)?
+            .rows::<(
+                Option<i32>, Option<i64>, Option<i32>, Option<i64>,
+                Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>,
+            )>().map_err(cql)?.collect::<Result<Vec<_>, _>>().map_err(cql)?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let mut fragments = Vec::with_capacity(rows.len());
+        for (index, revision, count, row_bytes, payload, digest, row_digest) in rows {
+            fragments.push(decode_fragment(
+                index, revision, count, row_bytes, payload, digest, row_digest,
+            )?);
+        }
+        let row_digest = fragments[0].row_digest;
+        let bytes = reconstruct_fragments(fragments, &row_digest)?;
+        let current = RollbackGlobalArchiveBarrier::decode_canonical(&bytes)?;
+        if current.slot() != &slot
+            || current.digest() != &row_digest
+            || current.archiving_head() != archiving_head
+            || current.target() != target
+            || current.participant_plan_digest() != participant_plan_digest
+            || current.topology_revision() != topology_revision
+            || current.topology_digest() != topology_digest
+            || current.store_fingerprint() != &self.fingerprint
+        {
+            return Err(RollbackGlobalArchiveBarrierError::Conflict);
+        }
+        Ok(Some(current))
+    }
+
     async fn revalidate<Hash: Q256BitHash>(
         &self,
         receipt: &PersistedRollbackGlobalArchiveBarrier<Hash>,
@@ -636,6 +720,25 @@ pub(super) struct ScyllaRollbackGlobalArchiveBarrierOwner {
     checkpoint_tree_height: u8,
 }
 
+/// Non-Clone proof that the immutable global barrier has been exact-read and
+/// the canonical control row now selects ARCHIVE_BARRIER_READY.  It grants no
+/// hot-row mutation by itself; the delete owner must revalidate it.
+#[derive(Debug)]
+pub(super) struct PublishedRollbackGlobalArchiveBarrier<Hash> {
+    barrier: RollbackGlobalArchiveBarrier<Hash>,
+    barrier_ready_head: StoredCanonicalHead<Hash>,
+}
+
+impl<Hash> PublishedRollbackGlobalArchiveBarrier<Hash> {
+    pub(super) const fn barrier(&self) -> &RollbackGlobalArchiveBarrier<Hash> {
+        &self.barrier
+    }
+
+    pub(super) const fn barrier_ready_head(&self) -> &StoredCanonicalHead<Hash> {
+        &self.barrier_ready_head
+    }
+}
+
 impl ScyllaRollbackGlobalArchiveBarrierOwner {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
@@ -688,6 +791,98 @@ impl ScyllaRollbackGlobalArchiveBarrierOwner {
         }
         store.revalidate(&receipt).await?;
         Ok(receipt)
+    }
+
+    pub(super) async fn publish_or_recover<F, Hash, Hasher>(
+        &mut self,
+        network: NetworkId,
+    ) -> Result<PublishedRollbackGlobalArchiveBarrier<Hash>, RollbackGlobalArchiveBarrierError>
+    where
+        F: QFelt64,
+        Hash: Q256BitHash + QFHashBase<F>,
+        Hasher: MerkleHasher<Hash> + FieldQHasher<F, Hash>,
+    {
+        let current: StoredCanonicalHead<Hash> = match self
+            .canonical_head
+            .read(network)
+            .await
+            .map_err(backend)?
+        {
+            CanonicalHeadReadState::Current(head) => head,
+            CanonicalHeadReadState::Uninitialized => {
+                return Err(RollbackGlobalArchiveBarrierError::HeadMissing);
+            }
+        };
+        if current.rollback_control().is_archiving() {
+            let receipt = self.persist_or_recover::<F, Hash, Hasher>(network).await?;
+            let transition = CanonicalHeadTransition::complete_rollback_archive_barrier(
+                *receipt.barrier.archiving_head(),
+            )
+            .map_err(|error| RollbackGlobalArchiveBarrierError::Canonical(error.to_string()))?;
+            let store = ScyllaRollbackGlobalArchiveBarrierStore::prepare(
+                self.session.clone(),
+                &self.coordinator_archive_keyspace,
+            ).await?;
+            store.revalidate(&receipt).await?;
+            let outcome = self.canonical_head.compare_and_set(&transition.seal()).await
+                .map_err(backend)?;
+            let barrier_ready_head = match outcome {
+                CanonicalHeadWriteOutcome::Applied(head)
+                | CanonicalHeadWriteOutcome::Idempotent(head) => head,
+                CanonicalHeadWriteOutcome::Conflict { .. } => {
+                    return Err(RollbackGlobalArchiveBarrierError::HeadConflict);
+                }
+            };
+            store.revalidate(&receipt).await?;
+            return Ok(PublishedRollbackGlobalArchiveBarrier {
+                barrier: receipt.barrier,
+                barrier_ready_head,
+            });
+        }
+        if !current.rollback_control().archive_barrier_ready() {
+            return Err(RollbackGlobalArchiveBarrierError::NotBarrierReady);
+        }
+        let request = *current.rollback_control().requested()
+            .ok_or(RollbackGlobalArchiveBarrierError::NotBarrierReady)?;
+        let plan = self.participant_plans
+            .read_participant_plan(network, request.plan_digest().as_bytes())
+            .await.map_err(backend)?;
+        let expected_requested = CanonicalHeadTransition::start_rollback(
+            *plan.expected_head(),
+            plan.rollback_request()
+                .map_err(|error| RollbackGlobalArchiveBarrierError::Plan(error.to_string()))?,
+        ).map_err(|error| RollbackGlobalArchiveBarrierError::Canonical(error.to_string()))?;
+        let expected_archiving = CanonicalHeadTransition::begin_rollback_archive(
+            *expected_requested.candidate(),
+        ).map_err(|error| RollbackGlobalArchiveBarrierError::Canonical(error.to_string()))?;
+        let expected_barrier_ready = CanonicalHeadTransition::complete_rollback_archive_barrier(
+            *expected_archiving.candidate(),
+        ).map_err(|error| RollbackGlobalArchiveBarrierError::Canonical(error.to_string()))?;
+        if expected_barrier_ready.candidate() != &current {
+            return Err(RollbackGlobalArchiveBarrierError::HeadConflict);
+        }
+        let store = ScyllaRollbackGlobalArchiveBarrierStore::prepare(
+            self.session.clone(),
+            &self.coordinator_archive_keyspace,
+        ).await?;
+        let barrier = store.read_selected(
+            network,
+            plan.target().chain_epoch().get(),
+            expected_archiving.candidate(),
+            plan.target(),
+            plan.digest(),
+            plan.topology_revision(),
+            plan.topology_digest(),
+        ).await?.ok_or(RollbackGlobalArchiveBarrierError::MissingAfterPersist)?;
+        let receipt = PersistedRollbackGlobalArchiveBarrier {
+            store_fingerprint: store.fingerprint(),
+            barrier,
+        };
+        store.revalidate(&receipt).await?;
+        Ok(PublishedRollbackGlobalArchiveBarrier {
+            barrier: receipt.barrier,
+            barrier_ready_head: current,
+        })
     }
 
     async fn select_current<F, Hash, Hasher>(
@@ -1029,6 +1224,8 @@ pub(super) enum RollbackGlobalArchiveBarrierError {
     TopologyMissing,
     TopologyChanged,
     NotArchiving,
+    NotBarrierReady,
+    HeadConflict,
     BindingMismatch,
     UnexpectedParticipant,
     ParticipantMissing,
@@ -1203,7 +1400,7 @@ mod tests {
     }
 
     #[test]
-    fn barrier_owner_has_no_delete_restore_or_head_transition() {
+    fn barrier_owner_only_publishes_barrier_ready_and_has_no_destructive_api() {
         let source = include_str!("rollback_global_archive_barrier.rs");
         let production = source.split("#[cfg(test)]").next().unwrap();
         for forbidden in [
@@ -1212,10 +1409,11 @@ mod tests {
             "restore_target(",
             "begin_rollback_delete(",
             "complete_rollback(",
-            "compare_and_set(",
         ] {
             assert!(!production.contains(forbidden), "forbidden {forbidden}");
         }
+        assert!(production.contains("complete_rollback_archive_barrier("));
+        assert_eq!(production.matches(".compare_and_set(").count(), 1);
         assert!(production.contains("recover_pre_barrier_readiness"));
         assert!(production.contains("recover_participant_completion"));
         assert!(production.contains("persist_and_readback"));

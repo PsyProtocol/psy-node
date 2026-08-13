@@ -252,6 +252,8 @@ pub enum CanonicalHeadTransitionKind {
     NormalCheckpointAdvance,
     StartRollback,
     BeginRollbackArchive,
+    CompleteRollbackArchiveBarrier,
+    BeginRollbackDelete,
 }
 
 /// A validated transition before its canonical payloads are sealed.
@@ -356,6 +358,49 @@ impl<Hash: Q256BitHash> CanonicalHeadTransition<Hash> {
                 revision: expected.revision.checked_next()?,
                 canonical_ref: *expected.canonical_ref(),
                 rollback_control: RollbackControlState::Archiving(request),
+            },
+        })
+    }
+
+    /// Publish the all-participant archive barrier on the canonical-head row.
+    ///
+    /// The storage adapter must only seal this transition after exact durable
+    /// readback of the global barrier.  The transition itself deliberately
+    /// preserves the old canonical head and remains pre-destructive.
+    pub fn complete_rollback_archive_barrier(
+        expected: StoredCanonicalHead<Hash>,
+    ) -> Result<Self, CanonicalHeadModelError> {
+        let request = match expected.rollback_control() {
+            RollbackControlState::Archiving(request) => *request,
+            _ => return Err(CanonicalHeadModelError::RollbackArchiveNotActive),
+        };
+        Ok(Self {
+            kind: CanonicalHeadTransitionKind::CompleteRollbackArchiveBarrier,
+            expected,
+            candidate: StoredCanonicalHead {
+                revision: expected.revision.checked_next()?,
+                canonical_ref: *expected.canonical_ref(),
+                rollback_control: RollbackControlState::ArchiveBarrierReady(request),
+            },
+        })
+    }
+
+    /// Cross the rollback point of no return after the durable global archive
+    /// barrier has been selected.  No checkpoint changes at this step.
+    pub fn begin_rollback_delete(
+        expected: StoredCanonicalHead<Hash>,
+    ) -> Result<Self, CanonicalHeadModelError> {
+        let request = match expected.rollback_control() {
+            RollbackControlState::ArchiveBarrierReady(request) => *request,
+            _ => return Err(CanonicalHeadModelError::RollbackArchiveBarrierNotReady),
+        };
+        Ok(Self {
+            kind: CanonicalHeadTransitionKind::BeginRollbackDelete,
+            expected,
+            candidate: StoredCanonicalHead {
+                revision: expected.revision.checked_next()?,
+                canonical_ref: *expected.canonical_ref(),
+                rollback_control: RollbackControlState::Deleting(request),
             },
         })
     }
@@ -671,6 +716,8 @@ pub enum CanonicalHeadModelError {
     RollbackAlreadyActive,
     RollbackNotRequested,
     RollbackArchiveAlreadyStarted,
+    RollbackArchiveNotActive,
+    RollbackArchiveBarrierNotReady,
     RollbackRequestedHeadMismatch,
     RequestedControlAtEpochZero,
     AppliedStateMismatch,
@@ -738,6 +785,12 @@ impl fmt::Display for CanonicalHeadModelError {
             ),
             Self::RollbackArchiveAlreadyStarted => formatter.write_str(
                 "rollback archive can begin only from the exact REQUESTED phase",
+            ),
+            Self::RollbackArchiveNotActive => formatter.write_str(
+                "rollback archive barrier can complete only from the exact ARCHIVING phase",
+            ),
+            Self::RollbackArchiveBarrierNotReady => formatter.write_str(
+                "rollback deletion can begin only from the exact ARCHIVE_BARRIER_READY phase",
             ),
             Self::RollbackRequestedHeadMismatch => formatter.write_str(
                 "rollback request head must equal the exact current canonical checkpoint",
@@ -1104,6 +1157,79 @@ mod tests {
                 *archiving.candidate()
             ),
             Err(CanonicalHeadModelError::RollbackArchiveAlreadyStarted)
+        );
+    }
+
+    #[test]
+    fn archive_barrier_then_delete_is_the_only_destructive_phase_path() {
+        let head = canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 10, 50);
+        let target = *canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 7, 40)
+            .checkpoint();
+        let request = rollback_request(*head.checkpoint(), target);
+        let requested = CanonicalHeadTransition::start_rollback(
+            stored_for_test(head),
+            request,
+        )
+        .unwrap();
+        let archiving = CanonicalHeadTransition::begin_rollback_archive(
+            *requested.candidate(),
+        )
+        .unwrap();
+        let barrier = CanonicalHeadTransition::complete_rollback_archive_barrier(
+            *archiving.candidate(),
+        )
+        .unwrap();
+        assert_eq!(
+            barrier.kind(),
+            CanonicalHeadTransitionKind::CompleteRollbackArchiveBarrier
+        );
+        assert_eq!(
+            barrier.candidate().revision().get(),
+            archiving.candidate().revision().get() + 1
+        );
+        assert_eq!(
+            barrier.candidate().canonical_ref(),
+            archiving.candidate().canonical_ref()
+        );
+        assert!(barrier
+            .candidate()
+            .rollback_control()
+            .archive_barrier_ready());
+        assert!(!barrier
+            .candidate()
+            .rollback_control()
+            .destructive_started());
+
+        let deleting = CanonicalHeadTransition::begin_rollback_delete(
+            *barrier.candidate(),
+        )
+        .unwrap();
+        assert_eq!(
+            deleting.kind(),
+            CanonicalHeadTransitionKind::BeginRollbackDelete
+        );
+        assert_eq!(
+            deleting.candidate().revision().get(),
+            barrier.candidate().revision().get() + 1
+        );
+        assert_eq!(
+            deleting.candidate().canonical_ref(),
+            barrier.candidate().canonical_ref()
+        );
+        assert!(deleting
+            .candidate()
+            .rollback_control()
+            .destructive_started());
+
+        assert_eq!(
+            CanonicalHeadTransition::complete_rollback_archive_barrier(
+                *requested.candidate()
+            ),
+            Err(CanonicalHeadModelError::RollbackArchiveNotActive)
+        );
+        assert_eq!(
+            CanonicalHeadTransition::begin_rollback_delete(*archiving.candidate()),
+            Err(CanonicalHeadModelError::RollbackArchiveBarrierNotReady)
         );
     }
 
