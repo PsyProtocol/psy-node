@@ -132,6 +132,7 @@ mod realm_prepared_state_physical_plan;
 #[cfg(test)]
 mod realm_imt_predecessor_rf3_gate;
 mod imt_family;
+mod coordinator_rollback_archive_plan;
 mod rollback_admission;
 mod identity;
 mod key;
@@ -200,6 +201,7 @@ pub use public_key_projection::*;
 pub use realm_imt_predecessor::*;
 pub use realm_normal_commit_coverage::*;
 pub use imt_family::*;
+pub use coordinator_rollback_archive_plan::*;
 pub use rollback_admission::*;
 pub use identity::*;
 pub use key::*;
