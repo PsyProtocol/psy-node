@@ -10,7 +10,7 @@ use parth_core::protocol::core_types::Q256BitHash;
 use psy_data::protocol::canonical_chain::{CanonicalChainRef, NetworkId};
 use psy_node_core::store::coordinator_commit_source::{
     CoordinatorCommitSource, CoordinatorCommitSourceCommitted,
-    CoordinatorCommitSourcePayload,
+    CoordinatorCommitSourcePayload, CoordinatorRollbackFloor,
     COORDINATOR_COMMIT_SOURCE_MAX_FRAGMENTS,
 };
 use scylla::{
@@ -26,6 +26,8 @@ pub(crate) const COORDINATOR_COMMIT_SOURCE_FRAGMENT_TABLE: &str =
     "coordinator_commit_source_fragment_v1";
 pub(crate) const COORDINATOR_COMMIT_SOURCE_COMMITTED_TABLE: &str =
     "coordinator_commit_source_committed_v1";
+pub(crate) const COORDINATOR_ROLLBACK_FLOOR_TABLE: &str =
+    "coordinator_rollback_floor_v1";
 const ROW_REVISION: i64 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -33,12 +35,15 @@ pub(crate) struct CoordinatorCommitSourceQueries {
     create_header: String,
     create_fragment: String,
     create_committed: String,
+    create_floor: String,
     read_header: String,
     read_fragments: String,
     insert_header: String,
     insert_fragment: String,
     read_committed: String,
     insert_committed: String,
+    read_floor: String,
+    insert_floor: String,
     scan_headers: String,
 }
 
@@ -48,6 +53,7 @@ impl CoordinatorCommitSourceQueries {
         let header = format!("{prefix}.{COORDINATOR_COMMIT_SOURCE_HEADER_TABLE}");
         let fragment = format!("{prefix}.{COORDINATOR_COMMIT_SOURCE_FRAGMENT_TABLE}");
         let committed = format!("{prefix}.{COORDINATOR_COMMIT_SOURCE_COMMITTED_TABLE}");
+        let floor = format!("{prefix}.{COORDINATOR_ROLLBACK_FLOOR_TABLE}");
         Self {
             create_header: format!(
                 "CREATE TABLE IF NOT EXISTS {header} (network_chain_id bigint, chain_epoch bigint, checkpoint_id bigint, revision bigint, source_slot blob, header blob, PRIMARY KEY ((network_chain_id, chain_epoch), checkpoint_id))"
@@ -57,6 +63,9 @@ impl CoordinatorCommitSourceQueries {
             ),
             create_committed: format!(
                 "CREATE TABLE IF NOT EXISTS {committed} (network_chain_id bigint, chain_epoch bigint, checkpoint_id bigint, revision bigint, marker blob, PRIMARY KEY ((network_chain_id, chain_epoch), checkpoint_id))"
+            ),
+            create_floor: format!(
+                "CREATE TABLE IF NOT EXISTS {floor} (network_chain_id bigint, chain_epoch bigint, revision bigint, floor blob, PRIMARY KEY ((network_chain_id, chain_epoch)))"
             ),
             read_header: format!(
                 "SELECT revision, source_slot, header FROM {header} WHERE network_chain_id = ? AND chain_epoch = ? AND checkpoint_id = ?"
@@ -76,6 +85,12 @@ impl CoordinatorCommitSourceQueries {
             insert_committed: format!(
                 "INSERT INTO {committed} (network_chain_id, chain_epoch, checkpoint_id, revision, marker) VALUES (?, ?, ?, ?, ?) IF NOT EXISTS"
             ),
+            read_floor: format!(
+                "SELECT revision, floor FROM {floor} WHERE network_chain_id = ? AND chain_epoch = ?"
+            ),
+            insert_floor: format!(
+                "INSERT INTO {floor} (network_chain_id, chain_epoch, revision, floor) VALUES (?, ?, ?, ?) IF NOT EXISTS"
+            ),
             scan_headers: format!(
                 "SELECT checkpoint_id, revision, source_slot, header FROM {header} WHERE network_chain_id = ? AND chain_epoch = ? AND checkpoint_id > ? AND checkpoint_id <= ?"
             ),
@@ -92,6 +107,8 @@ pub(crate) struct ScyllaCoordinatorCommitSourceStore {
     insert_fragment: PreparedStatement,
     read_committed: PreparedStatement,
     insert_committed: PreparedStatement,
+    read_floor: PreparedStatement,
+    insert_floor: PreparedStatement,
     scan_headers: PreparedStatement,
 }
 
@@ -105,6 +122,7 @@ impl ScyllaCoordinatorCommitSourceStore {
             &queries.create_header,
             &queries.create_fragment,
             &queries.create_committed,
+            &queries.create_floor,
         ] {
             session
                 .query_unpaged(query.as_str(), &[])
@@ -127,6 +145,8 @@ impl ScyllaCoordinatorCommitSourceStore {
             insert_fragment: prepare_lwt(&session, &queries.insert_fragment).await?,
             read_committed: prepare_regular(&session, &queries.read_committed).await?,
             insert_committed: prepare_lwt(&session, &queries.insert_committed).await?,
+            read_floor: prepare_regular(&session, &queries.read_floor).await?,
+            insert_floor: prepare_lwt(&session, &queries.insert_floor).await?,
             scan_headers: prepare_regular(&session, &queries.scan_headers).await?,
             session,
             queries,
@@ -135,6 +155,74 @@ impl ScyllaCoordinatorCommitSourceStore {
 
     pub(crate) const fn queries(&self) -> &CoordinatorCommitSourceQueries {
         &self.queries
+    }
+
+    pub(crate) async fn persist_floor_and_readback<Hash: Q256BitHash>(
+        &self,
+        floor: &CoordinatorRollbackFloor<Hash>,
+    ) -> Result<(), CoordinatorCommitSourceStoreError> {
+        let key = floor_key(floor.floor())?;
+        let bytes = floor.encode_canonical();
+        let execution = self
+            .session
+            .execute_unpaged(
+                &self.insert_floor,
+                (key.0, key.1, ROW_REVISION, bytes.as_slice()),
+            )
+            .await;
+        if let Err(error) = execution {
+            return match self
+                .read_floor(floor.floor().network_id(), floor.floor().chain_epoch().get())
+                .await
+            {
+                Ok(Some(current)) if current == *floor => Ok(()),
+                Ok(Some(_)) => Err(CoordinatorCommitSourceStoreError::FloorConflict),
+                Ok(None) => Err(CoordinatorCommitSourceStoreError::IndeterminateWrite(
+                    error.to_string(),
+                )),
+                Err(read) => Err(CoordinatorCommitSourceStoreError::IndeterminateWrite(
+                    format!("execute={error}; read={read}"),
+                )),
+            };
+        }
+        match self
+            .read_floor(floor.floor().network_id(), floor.floor().chain_epoch().get())
+            .await?
+        {
+            Some(current) if current == *floor => Ok(()),
+            Some(_) => Err(CoordinatorCommitSourceStoreError::FloorConflict),
+            None => Err(CoordinatorCommitSourceStoreError::FloorMissingAfterWrite),
+        }
+    }
+
+    pub(crate) async fn read_floor<Hash: Q256BitHash>(
+        &self,
+        network: NetworkId,
+        chain_epoch: u64,
+    ) -> Result<Option<CoordinatorRollbackFloor<Hash>>, CoordinatorCommitSourceStoreError> {
+        let row = self
+            .session
+            .execute_unpaged(
+                &self.read_floor,
+                (i64::from(network.chain_id()), to_i64(chain_epoch)?),
+            )
+            .await
+            .map_err(driver)?
+            .into_rows_result()
+            .map_err(driver)?
+            .maybe_first_row::<(i64, Vec<u8>)>()
+            .map_err(driver)?;
+        let Some((revision, bytes)) = row else {
+            return Ok(None);
+        };
+        CoordinatorRollbackFloor::decode_persisted(
+            network,
+            chain_epoch,
+            revision,
+            &bytes,
+        )
+        .map(Some)
+        .map_err(|error| CoordinatorCommitSourceStoreError::Codec(error.to_string()))
     }
 
     pub(crate) async fn persist_and_readback<Hash: Q256BitHash>(
@@ -399,6 +487,15 @@ fn source_key<Hash: Q256BitHash>(
     ))
 }
 
+fn floor_key<Hash: Q256BitHash>(
+    floor: &CanonicalChainRef<Hash>,
+) -> Result<(i64, i64), CoordinatorCommitSourceStoreError> {
+    Ok((
+        i64::from(floor.network_id().chain_id()),
+        to_i64(floor.chain_epoch().get())?,
+    ))
+}
+
 fn to_i64(value: u64) -> Result<i64, CoordinatorCommitSourceStoreError> {
     i64::try_from(value).map_err(|_| CoordinatorCommitSourceStoreError::IntegerOutOfRange)
 }
@@ -441,6 +538,8 @@ pub(crate) enum CoordinatorCommitSourceStoreError {
     CommittedConflict,
     CommittedMissingAfterWrite,
     CommittedMarkerMissing,
+    FloorConflict,
+    FloorMissingAfterWrite,
     DuplicateCheckpoint,
     IncompleteCommittedSuffix { expected: u64, actual: u64 },
     IndeterminateWrite(String),
@@ -465,17 +564,21 @@ mod tests {
         assert!(queries.insert_header.contains("IF NOT EXISTS"));
         assert!(queries.insert_fragment.contains("IF NOT EXISTS"));
         assert!(queries.insert_committed.contains("IF NOT EXISTS"));
+        assert!(queries.insert_floor.contains("IF NOT EXISTS"));
         let all = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             queries.create_header,
             queries.create_fragment,
             queries.create_committed,
+            queries.create_floor,
             queries.read_header,
             queries.read_fragments,
             queries.insert_header,
             queries.insert_fragment,
             queries.read_committed,
             queries.insert_committed,
+            queries.read_floor,
+            queries.insert_floor,
             queries.scan_headers,
         );
         for forbidden in [" UPDATE ", " DELETE ", " TTL ", " TIMESTAMP "] {
@@ -484,6 +587,9 @@ mod tests {
         assert!(queries.scan_headers.contains("checkpoint_id > ? AND checkpoint_id <= ?"));
         assert!(queries.create_header.contains(
             "PRIMARY KEY ((network_chain_id, chain_epoch), checkpoint_id)"
+        ));
+        assert!(queries.create_floor.contains(
+            "PRIMARY KEY ((network_chain_id, chain_epoch))"
         ));
     }
 

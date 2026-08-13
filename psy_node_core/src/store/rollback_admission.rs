@@ -774,6 +774,23 @@ mod tests {
     impl super::super::coordinator_commit_source::CoordinatorCommitSourceStore<PHash>
         for MemoryCanonicalStore
     {
+        async fn persist_coordinator_rollback_floor(
+            &self,
+            _floor: &super::super::coordinator_commit_source::CoordinatorRollbackFloor<PHash>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("rollback-admission fixture has no rollback-floor writer")
+        }
+
+        async fn read_coordinator_rollback_floor(
+            &self,
+            _network: NetworkId,
+            _chain_epoch: u64,
+        ) -> anyhow::Result<Option<
+            super::super::coordinator_commit_source::CoordinatorRollbackFloor<PHash>,
+        >> {
+            Ok(None)
+        }
+
         async fn persist_coordinator_commit_source(
             &self,
             _source: &super::super::coordinator_commit_source::CoordinatorCommitSource<PHash>,

@@ -15,6 +15,7 @@ use psy_node_core::store::canonical_head::{
 };
 use psy_node_core::store::coordinator_commit_source::{
     CoordinatorCommitSource, CoordinatorCommitSourceStore,
+    CoordinatorRollbackFloor,
 };
 use psy_node_core::store::rollback_admission::{
     CoordinatorRollbackAdmissionReader, CoordinatorRollbackAdmissionStore,
@@ -680,6 +681,27 @@ where
     Hash: QHashBase + Q256BitHash,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
 {
+    async fn persist_coordinator_rollback_floor(
+        &self,
+        floor: &CoordinatorRollbackFloor<Hash>,
+    ) -> anyhow::Result<()> {
+        Ok(self
+            .coordinator_commit_sources()?
+            .persist_floor_and_readback(floor)
+            .await?)
+    }
+
+    async fn read_coordinator_rollback_floor(
+        &self,
+        network: NetworkId,
+        chain_epoch: u64,
+    ) -> anyhow::Result<Option<CoordinatorRollbackFloor<Hash>>> {
+        Ok(self
+            .coordinator_commit_sources()?
+            .read_floor(network, chain_epoch)
+            .await?)
+    }
+
     async fn persist_coordinator_commit_source(
         &self,
         source: &CoordinatorCommitSource<Hash>,

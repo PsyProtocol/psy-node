@@ -42,7 +42,7 @@ use psy_node_core::store::{
     coordinator_commit_source::{
         CoordinatorCommitSource, CoordinatorCommitSourceCommitted,
         CoordinatorCommitSourcePayload,
-        CoordinatorCommitSourceStore,
+        CoordinatorCommitSourceStore, CoordinatorRollbackFloor,
     },
     traits::core_db::{
     CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseBidirectionalU64U128MappingWriter, CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter, CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseHashToManyIdsReader, CoreDatabaseHashToManyIdsWriter, CoreDatabaseIMTKeyIndexReader, CoreDatabaseIMTKeyIndexWriter, CoreDatabaseIMTNextAppendIndexReader, CoreDatabaseIMTNextAppendIndexWriter, CoreDatabaseIMTLeafReader, CoreDatabaseIMTLeafWriter, CoreDatabaseKivReader, CoreDatabaseKivWriter, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter, CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseTagTreeReader, CoreDatabaseTagTreeWriter, CoreDatabaseU64CounterReader, CoreDatabaseU64CounterStore, CoreDatabaseU64CounterWriter, CoreDatabaseU64Reader, CoreDatabaseU64Store, CoreDatabaseU64Writer, CoreDatabaseZeroIdMerkleDumpReader, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter, MerkleTreeDumpStrategy
@@ -76,6 +76,8 @@ pub struct InMemoryCoreStore<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash> + S
         Arc<DashMap<Vec<u8>, CoordinatorCommitSource<Hash>>>,
     coordinator_commit_markers:
         Arc<DashMap<Vec<u8>, CoordinatorCommitSourceCommitted>>,
+    coordinator_rollback_floors:
+        Arc<DashMap<(NetworkId, u64), CoordinatorRollbackFloor<Hash>>>,
     /// Keyspace name for table naming (similar to ScyllaDB keyspace)
     pub keyspace: String,
     /// No-tablet keyspace name (for compatibility with ScyllaDB interface)
@@ -103,6 +105,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash> + Send + Sync> InMemoryCore
             canonical_heads: Arc::new(DashMap::new()),
             coordinator_commit_sources: Arc::new(DashMap::new()),
             coordinator_commit_markers: Arc::new(DashMap::new()),
+            coordinator_rollback_floors: Arc::new(DashMap::new()),
             keyspace: String::new(),
             no_tablet_keyspace: String::new(),
             realm_id: 0,
@@ -121,6 +124,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash> + Send + Sync> InMemoryCore
             canonical_heads: Arc::new(DashMap::new()),
             coordinator_commit_sources: Arc::new(DashMap::new()),
             coordinator_commit_markers: Arc::new(DashMap::new()),
+            coordinator_rollback_floors: Arc::new(DashMap::new()),
             keyspace,
             no_tablet_keyspace,
             realm_id,
@@ -240,6 +244,37 @@ where
     Hash: QHashBase + Q256BitHash + Copy,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
 {
+    async fn persist_coordinator_rollback_floor(
+        &self,
+        floor: &CoordinatorRollbackFloor<Hash>,
+    ) -> anyhow::Result<()> {
+        let key = (
+            floor.floor().network_id(),
+            floor.floor().chain_epoch().get(),
+        );
+        match self.coordinator_rollback_floors.entry(key) {
+            Entry::Vacant(entry) => {
+                entry.insert(*floor);
+                Ok(())
+            }
+            Entry::Occupied(entry) if entry.get() == floor => Ok(()),
+            Entry::Occupied(_) => anyhow::bail!(
+                "Coordinator rollback-floor identity already contains different content"
+            ),
+        }
+    }
+
+    async fn read_coordinator_rollback_floor(
+        &self,
+        network: NetworkId,
+        chain_epoch: u64,
+    ) -> anyhow::Result<Option<CoordinatorRollbackFloor<Hash>>> {
+        Ok(self
+            .coordinator_rollback_floors
+            .get(&(network, chain_epoch))
+            .map(|floor| *floor))
+    }
+
     async fn persist_coordinator_commit_source(
         &self,
         source: &CoordinatorCommitSource<Hash>,

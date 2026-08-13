@@ -657,15 +657,32 @@ impl<
                     .canonical_head_store
                     .bootstrap_canonical_head(&bootstrap)
                     .await?;
-                self.canonical_head = Some(Self::require_published_outcome(
+                let current = Self::require_published_outcome(
                     "startup bootstrap",
                     outcome,
-                )?);
+                )?;
+                self.canonical_head_store
+                    .ensure_coordinator_rollback_floor(&current)
+                    .await?;
+                self.canonical_head = Some(current);
             }
             CanonicalHeadStartupPlan::Current(current) => {
+                // Starting rollback moves the canonical identity into the new
+                // epoch before target restoration. That active epoch has no
+                // normal-commit floor yet and must remain restartable. The
+                // target floor is established only after the restored head is
+                // idle, before the first new-branch normal commit.
+                if current.rollback_control().is_idle() {
+                    self.canonical_head_store
+                        .ensure_coordinator_rollback_floor(&current)
+                        .await?;
+                }
                 self.canonical_head = Some(current);
             }
             CanonicalHeadStartupPlan::PublishMaterialized(sealed) => {
+                self.canonical_head_store
+                    .ensure_coordinator_rollback_floor(sealed.expected())
+                    .await?;
                 let source = self
                     .canonical_head_store
                     .read_coordinator_commit_source(
@@ -1330,6 +1347,9 @@ checkpoint_backup_copy_status={}
                 source_payload.encode_canonical(),
             )?;
             self.canonical_head_store
+                .ensure_coordinator_rollback_floor(&expected)
+                .await?;
+            self.canonical_head_store
                 .persist_coordinator_commit_source(&source)
                 .await?;
             Some(source)
@@ -1848,6 +1868,9 @@ mod tests {
         let source_write = commit
             .find("persist_coordinator_commit_source")
             .unwrap();
+        let rollback_floor = commit
+            .find("ensure_coordinator_rollback_floor")
+            .unwrap();
         let first_hot_write = commit
             .find("set_verifiable_checkpoint_state_transition_and_zkp")
             .unwrap();
@@ -1856,6 +1879,7 @@ mod tests {
             .find("mark_coordinator_commit_source_committed")
             .unwrap();
         let head = commit.rfind("self.publish_canonical_head(").unwrap();
+        assert!(rollback_floor < source_write);
         assert!(source_write < first_hot_write);
         assert!(first_hot_write < backup);
         assert!(backup < committed);
@@ -1876,13 +1900,16 @@ mod tests {
         let read = startup
             .find("read_coordinator_commit_source")
             .unwrap();
+        let rollback_floor = startup
+            .find("ensure_coordinator_rollback_floor")
+            .unwrap();
         let committed = startup
             .find("mark_coordinator_commit_source_committed")
             .unwrap();
         let head = startup
             .find("compare_and_set_canonical_head")
             .unwrap();
-        assert!(read < committed && committed < head);
+        assert!(rollback_floor < read && read < committed && committed < head);
     }
 
     #[test]

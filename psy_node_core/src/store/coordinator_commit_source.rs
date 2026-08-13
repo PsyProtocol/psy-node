@@ -25,6 +25,7 @@ use super::canonical_head::{
 const HEADER_MAGIC: &[u8; 8] = b"PSYCCSRC";
 const MARKER_MAGIC: &[u8; 8] = b"PSYCCCOM";
 const PAYLOAD_MAGIC: &[u8; 8] = b"PSYCCPAY";
+const FLOOR_MAGIC: &[u8; 8] = b"PSYCCFLR";
 const CODEC_VERSION: u16 = 1;
 pub const COORDINATOR_PREPARED_UPDATE_CODEC_VERSION: u16 = 1;
 pub const COORDINATOR_COMMIT_SOURCE_FRAGMENT_BYTES: usize = 4 * 1024 * 1024;
@@ -35,6 +36,8 @@ const SLOT_DOMAIN: &[u8] = b"psy.rollback.coordinator-commit-source-slot.v1\0";
 const SOURCE_DOMAIN: &[u8] = b"psy.rollback.coordinator-commit-source-bytes.v1\0";
 const OBJECT_DOMAIN: &[u8] = b"psy.rollback.coordinator-commit-source-object.v1\0";
 const MARKER_DOMAIN: &[u8] = b"psy.rollback.coordinator-commit-source-committed.v1\0";
+const FLOOR_DOMAIN: &[u8] = b"psy.rollback.coordinator-commit-source-floor.v1\0";
+const FLOOR_ROW_REVISION: i64 = 1;
 
 /// Canonical normal-commit input persisted inside the fragmented source.
 /// Besides the prepared state update it binds the exact proof/circuit bytes
@@ -184,6 +187,50 @@ pub struct CoordinatorCommitSource<Hash> {
 /// same-identity/different-content observation.
 #[async_trait]
 pub trait CoordinatorCommitSourceStore<Hash: Q256BitHash>: Send + Sync {
+    async fn persist_coordinator_rollback_floor(
+        &self,
+        floor: &CoordinatorRollbackFloor<Hash>,
+    ) -> anyhow::Result<()>;
+
+    async fn read_coordinator_rollback_floor(
+        &self,
+        network: psy_data::protocol::canonical_chain::NetworkId,
+        chain_epoch: u64,
+    ) -> anyhow::Result<Option<CoordinatorRollbackFloor<Hash>>>;
+
+    /// Establish the conservative lower bound for source-backed rollback in
+    /// one epoch. Existing rows win only when they are valid for the exact
+    /// current branch; an active rollback can never mint a missing floor.
+    async fn ensure_coordinator_rollback_floor(
+        &self,
+        current: &StoredCanonicalHead<Hash>,
+    ) -> anyhow::Result<CoordinatorRollbackFloor<Hash>> {
+        let network = current.canonical_ref().network_id();
+        let chain_epoch = current.canonical_ref().chain_epoch().get();
+        if let Some(floor) = self
+            .read_coordinator_rollback_floor(network, chain_epoch)
+            .await?
+        {
+            floor.validate_current_head(current)?;
+            return Ok(floor);
+        }
+        let floor = CoordinatorRollbackFloor::try_new(*current)?;
+        self.persist_coordinator_rollback_floor(&floor).await?;
+        let persisted = self
+            .read_coordinator_rollback_floor(network, chain_epoch)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!(
+                "Coordinator rollback floor is missing after exact persistence"
+            ))?;
+        if persisted != floor {
+            anyhow::bail!(
+                "Coordinator rollback floor identity contains different content"
+            );
+        }
+        persisted.validate_current_head(current)?;
+        Ok(persisted)
+    }
+
     async fn persist_coordinator_commit_source(
         &self,
         source: &CoordinatorCommitSource<Hash>,
@@ -198,6 +245,162 @@ pub trait CoordinatorCommitSourceStore<Hash: Q256BitHash>: Send + Sync {
         &self,
         source: &CoordinatorCommitSource<Hash>,
     ) -> anyhow::Result<()>;
+}
+
+/// Immutable lower bound for source-backed rollback in one chain epoch.
+///
+/// The stable physical identity is `(network, chain_epoch)`. The payload binds
+/// the exact canonical head observed when this binary first established the
+/// commit-source contract. It is feasibility evidence only: it cannot archive,
+/// delete, restore, or publish a head.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CoordinatorRollbackFloor<Hash> {
+    activation_head_revision: u64,
+    floor: CanonicalChainRef<Hash>,
+    digest: [u8; 32],
+}
+
+impl<Hash: Q256BitHash> CoordinatorRollbackFloor<Hash> {
+    pub fn try_new(
+        current: StoredCanonicalHead<Hash>,
+    ) -> Result<Self, CoordinatorCommitSourceError> {
+        if !current.rollback_control().is_idle() {
+            return Err(CoordinatorCommitSourceError::RollbackFloorRequiresIdleHead);
+        }
+        let mut floor = Self {
+            activation_head_revision: current.revision().get(),
+            floor: *current.canonical_ref(),
+            digest: [0; 32],
+        };
+        floor.digest = digest_bytes(FLOOR_DOMAIN, &floor.commitment_bytes());
+        Ok(floor)
+    }
+
+    pub fn decode_persisted(
+        partition_network: psy_data::protocol::canonical_chain::NetworkId,
+        partition_epoch: u64,
+        row_revision: i64,
+        bytes: &[u8],
+    ) -> Result<Self, CoordinatorCommitSourceError> {
+        if row_revision != FLOOR_ROW_REVISION {
+            return Err(CoordinatorCommitSourceError::InvalidRollbackFloorRowRevision(
+                row_revision,
+            ));
+        }
+        let mut cursor = Cursor::new(bytes);
+        if cursor.take(8)? != FLOOR_MAGIC {
+            return Err(CoordinatorCommitSourceError::InvalidRollbackFloorMagic);
+        }
+        let version = cursor.u16()?;
+        if version != CODEC_VERSION {
+            return Err(CoordinatorCommitSourceError::UnknownRollbackFloorVersion(version));
+        }
+        let activation_head_revision = cursor.u64()?;
+        if activation_head_revision > i64::MAX as u64 {
+            return Err(CoordinatorCommitSourceError::RevisionOutOfCqlRange(
+                activation_head_revision,
+            ));
+        }
+        let floor = CanonicalChainRef::from_canonical_bytes(
+            cursor.take(CANONICAL_CHAIN_REF_V1_LEN)?,
+        )?;
+        let source_codec_version = cursor.u16()?;
+        let prepared_update_codec_version = cursor.u16()?;
+        let fragment_bytes = cursor.u32()? as usize;
+        let maximum_bytes_u64 = cursor.u64()?;
+        let maximum_bytes = usize::try_from(maximum_bytes_u64).map_err(|_| {
+            CoordinatorCommitSourceError::InvalidPersistedSourceLengthU64(
+                maximum_bytes_u64,
+            )
+        })?;
+        let digest: [u8; 32] = cursor.take(32)?.try_into().expect("fixed length");
+        if !cursor.is_empty() {
+            return Err(CoordinatorCommitSourceError::TrailingRollbackFloorBytes);
+        }
+        if source_codec_version != CODEC_VERSION
+            || prepared_update_codec_version
+                != COORDINATOR_PREPARED_UPDATE_CODEC_VERSION
+            || fragment_bytes != COORDINATOR_COMMIT_SOURCE_FRAGMENT_BYTES
+            || maximum_bytes != COORDINATOR_COMMIT_SOURCE_MAX_BYTES
+        {
+            return Err(CoordinatorCommitSourceError::RollbackFloorContractMismatch);
+        }
+        if floor.network_id() != partition_network
+            || floor.chain_epoch().get() != partition_epoch
+        {
+            return Err(CoordinatorCommitSourceError::RollbackFloorPartitionMismatch);
+        }
+        let decoded = Self {
+            activation_head_revision,
+            floor,
+            digest,
+        };
+        if digest_bytes(FLOOR_DOMAIN, &decoded.commitment_bytes()) != decoded.digest {
+            return Err(CoordinatorCommitSourceError::RollbackFloorDigestMismatch);
+        }
+        if decoded.encode_canonical() != bytes {
+            return Err(CoordinatorCommitSourceError::NonCanonicalRollbackFloor);
+        }
+        Ok(decoded)
+    }
+
+    pub fn encode_canonical(&self) -> Vec<u8> {
+        let mut bytes = self.commitment_bytes();
+        bytes.extend_from_slice(&self.digest);
+        bytes
+    }
+
+    pub const fn activation_head_revision(&self) -> u64 {
+        self.activation_head_revision
+    }
+
+    pub const fn floor(&self) -> &CanonicalChainRef<Hash> {
+        &self.floor
+    }
+
+    pub const fn digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+
+    pub fn validate_current_head(
+        &self,
+        current: &StoredCanonicalHead<Hash>,
+    ) -> Result<(), CoordinatorCommitSourceError> {
+        let current_ref = current.canonical_ref();
+        if current_ref.network_id() != self.floor.network_id()
+            || current_ref.chain_epoch() != self.floor.chain_epoch()
+        {
+            return Err(CoordinatorCommitSourceError::RollbackFloorBranchMismatch);
+        }
+        let floor_checkpoint = self.floor.checkpoint().checkpoint_id().get();
+        let current_checkpoint = current_ref.checkpoint().checkpoint_id().get();
+        if floor_checkpoint > current_checkpoint {
+            return Err(CoordinatorCommitSourceError::RollbackFloorAboveCurrentHead {
+                floor: floor_checkpoint,
+                current: current_checkpoint,
+            });
+        }
+        Ok(())
+    }
+
+    fn commitment_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(
+            8 + 2 + 8 + CANONICAL_CHAIN_REF_V1_LEN + 2 + 2 + 4 + 8,
+        );
+        bytes.extend_from_slice(FLOOR_MAGIC);
+        bytes.extend_from_slice(&CODEC_VERSION.to_be_bytes());
+        bytes.extend_from_slice(&self.activation_head_revision.to_be_bytes());
+        bytes.extend_from_slice(&self.floor.to_canonical_bytes());
+        bytes.extend_from_slice(&CODEC_VERSION.to_be_bytes());
+        bytes.extend_from_slice(&COORDINATOR_PREPARED_UPDATE_CODEC_VERSION.to_be_bytes());
+        bytes.extend_from_slice(
+            &(COORDINATOR_COMMIT_SOURCE_FRAGMENT_BYTES as u32).to_be_bytes(),
+        );
+        bytes.extend_from_slice(
+            &(COORDINATOR_COMMIT_SOURCE_MAX_BYTES as u64).to_be_bytes(),
+        );
+        bytes
+    }
 }
 
 impl<Hash: Q256BitHash> CoordinatorCommitSource<Hash> {
@@ -565,6 +768,17 @@ pub enum CoordinatorCommitSourceError {
     UnknownPayloadVersion(u16),
     TrailingPayloadBytes,
     NonCanonicalPayload,
+    RollbackFloorRequiresIdleHead,
+    InvalidRollbackFloorRowRevision(i64),
+    InvalidRollbackFloorMagic,
+    UnknownRollbackFloorVersion(u16),
+    TrailingRollbackFloorBytes,
+    RollbackFloorContractMismatch,
+    RollbackFloorPartitionMismatch,
+    RollbackFloorDigestMismatch,
+    NonCanonicalRollbackFloor,
+    RollbackFloorBranchMismatch,
+    RollbackFloorAboveCurrentHead { floor: u64, current: u64 },
 }
 
 impl fmt::Display for CoordinatorCommitSourceError {
@@ -585,6 +799,9 @@ impl From<CanonicalChainRefCodecError> for CoordinatorCommitSourceError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
     use parth_core::PHash;
     use psy_data::protocol::canonical_chain::{
         ChainEpoch, CheckpointHash, CheckpointId, CheckpointRef, NetworkId,
@@ -614,6 +831,67 @@ mod tests {
             canonical(0, 7, 7),
         ).unwrap();
         *bootstrap.candidate()
+    }
+
+    #[derive(Default)]
+    struct MemoryFloorStore {
+        floor: Mutex<Option<CoordinatorRollbackFloor<PHash>>>,
+    }
+
+    #[async_trait]
+    impl CoordinatorCommitSourceStore<PHash> for MemoryFloorStore {
+        async fn persist_coordinator_rollback_floor(
+            &self,
+            floor: &CoordinatorRollbackFloor<PHash>,
+        ) -> anyhow::Result<()> {
+            let mut current = self.floor.lock().unwrap();
+            match *current {
+                None => {
+                    *current = Some(*floor);
+                    Ok(())
+                }
+                Some(existing) if existing == *floor => Ok(()),
+                Some(_) => anyhow::bail!("different floor"),
+            }
+        }
+
+        async fn read_coordinator_rollback_floor(
+            &self,
+            network: psy_data::protocol::canonical_chain::NetworkId,
+            chain_epoch: u64,
+        ) -> anyhow::Result<Option<CoordinatorRollbackFloor<PHash>>> {
+            Ok(self
+                .floor
+                .lock()
+                .unwrap()
+                .as_ref()
+                .copied()
+                .filter(|floor| {
+                    floor.floor().network_id() == network
+                        && floor.floor().chain_epoch().get() == chain_epoch
+                }))
+        }
+
+        async fn persist_coordinator_commit_source(
+            &self,
+            _source: &CoordinatorCommitSource<PHash>,
+        ) -> anyhow::Result<()> {
+            unreachable!()
+        }
+
+        async fn read_coordinator_commit_source(
+            &self,
+            _candidate: &CanonicalChainRef<PHash>,
+        ) -> anyhow::Result<Option<CoordinatorCommitSource<PHash>>> {
+            unreachable!()
+        }
+
+        async fn mark_coordinator_commit_source_committed(
+            &self,
+            _source: &CoordinatorCommitSource<PHash>,
+        ) -> anyhow::Result<()> {
+            unreachable!()
+        }
     }
 
     #[test]
@@ -716,5 +994,98 @@ mod tests {
             Vec::new(),
         )
         .is_err());
+    }
+
+    #[test]
+    fn rollback_floor_roundtrips_and_is_a_conservative_epoch_bound() {
+        let floor = CoordinatorRollbackFloor::try_new(head()).unwrap();
+        let bytes = floor.encode_canonical();
+        let decoded = CoordinatorRollbackFloor::decode_persisted(
+            floor.floor().network_id(),
+            floor.floor().chain_epoch().get(),
+            FLOOR_ROW_REVISION,
+            &bytes,
+        )
+        .unwrap();
+        assert_eq!(decoded, floor);
+        decoded.validate_current_head(&head()).unwrap();
+        let later = CanonicalHeadTransition::normal_checkpoint_advance(
+            head(),
+            canonical(0, 8, 8),
+        )
+        .unwrap()
+        .seal()
+        .candidate()
+        .to_owned();
+        decoded.validate_current_head(&later).unwrap();
+
+        let mut forged = bytes;
+        *forged.last_mut().unwrap() ^= 1;
+        assert!(matches!(
+            CoordinatorRollbackFloor::<PHash>::decode_persisted(
+                floor.floor().network_id(),
+                floor.floor().chain_epoch().get(),
+                FLOOR_ROW_REVISION,
+                &forged,
+            ),
+            Err(CoordinatorCommitSourceError::RollbackFloorDigestMismatch)
+        ));
+    }
+
+    #[test]
+    fn rollback_floor_rejects_active_rollback_and_foreign_partition() {
+        let request = RollbackRequest::try_new(
+            *head().canonical_ref().checkpoint(),
+            *canonical(0, 5, 5).checkpoint(),
+            TimestampFenceWindow::try_new(
+                CommitWriteTimestampUs::try_from_i128(10).unwrap(),
+                11,
+                12,
+            )
+            .unwrap(),
+            RollbackExecutionMode::InPlace,
+            RollbackPlanDigest::try_new([7; 32]).unwrap(),
+        )
+        .unwrap();
+        let active = CanonicalHeadTransition::start_rollback(head(), request)
+            .unwrap()
+            .seal()
+            .candidate()
+            .to_owned();
+        assert!(matches!(
+            CoordinatorRollbackFloor::try_new(active),
+            Err(CoordinatorCommitSourceError::RollbackFloorRequiresIdleHead)
+        ));
+
+        let floor = CoordinatorRollbackFloor::try_new(head()).unwrap();
+        assert!(matches!(
+            CoordinatorRollbackFloor::<PHash>::decode_persisted(
+                canonical(1, 7, 7).network_id(),
+                1,
+                FLOOR_ROW_REVISION,
+                &floor.encode_canonical(),
+            ),
+            Err(CoordinatorCommitSourceError::RollbackFloorPartitionMismatch)
+        ));
+    }
+
+    #[tokio::test]
+    async fn ensure_floor_keeps_the_first_idle_head_as_the_epoch_bound() {
+        let store = MemoryFloorStore::default();
+        let first = store.ensure_coordinator_rollback_floor(&head()).await.unwrap();
+        let later = CanonicalHeadTransition::normal_checkpoint_advance(
+            head(),
+            canonical(0, 8, 8),
+        )
+        .unwrap()
+        .seal()
+        .candidate()
+        .to_owned();
+        let reread = store
+            .ensure_coordinator_rollback_floor(&later)
+            .await
+            .unwrap();
+        assert_eq!(reread, first);
+        assert_eq!(reread.floor().checkpoint().checkpoint_id().get(), 7);
     }
 }
