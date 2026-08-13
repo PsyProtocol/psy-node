@@ -144,6 +144,7 @@ mod realm_rollback_physical_catalog;
 mod realm_rollback_physical_before_image;
 mod realm_rollback_physical_archive_store;
 mod realm_rollback_physical_archive_owner;
+mod realm_rollback_delete_restore_executor;
 mod realm_rollback_participant_completion;
 #[allow(dead_code)]
 mod realm_full_commit_scylla;

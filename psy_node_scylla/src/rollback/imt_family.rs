@@ -867,6 +867,18 @@ impl ImtFamilyAdapter {
     pub(crate) async fn delete_leaf_range(&self, session: &Session, plan: &ImtLeafBoundedRangeDeletePlan) -> anyhow::Result<()> { session.execute_unpaged(&self.prepared.leaf_range_delete, plan.driver_values()).await?; Ok(()) }
     pub(crate) async fn delete_index(&self, session: &Session, plan: &ImtIndexPointDeletePlan) -> anyhow::Result<()> { session.execute_unpaged(&self.prepared.index_point_delete, plan.driver_values()).await?; Ok(()) }
     pub(crate) async fn restore_cursor(&self, session: &Session, plan: &ImtCursorRestorePlan) -> anyhow::Result<()> { session.execute_unpaged(&self.prepared.cursor_put, plan.driver_values()).await?; Ok(()) }
+    pub(crate) async fn read_restored_cursor_exact_with_writetime(&self, session: &Session, plan: &ImtCursorRestorePlan) -> anyhow::Result<Option<(Vec<u8>, i64)>> {
+        let result = session.execute_unpaged(
+            &self.prepared.cursor_exact_read,
+            (
+                u64_to_i64_exact(plan.target().tree().get()),
+                u64_to_i64_exact(plan.target().tree_sub().get()),
+            ),
+        ).await?;
+        let Some((value, writetime)) = result.into_rows_result()?.maybe_first_row::<(i64, Option<i64>)>()? else { return Ok(None); };
+        let writetime = writetime.ok_or_else(|| anyhow::anyhow!("restored IMT cursor writetime is null"))?;
+        Ok(Some((i64_to_u64_exact(value).to_be_bytes().to_vec(), writetime)))
+    }
     pub(crate) async fn read_leaf_exact(&self, session: &Session, binding: &ImtLeafPutBinding) -> anyhow::Result<Option<Vec<u8>>> {
         Ok(self.read_leaf_exact_with_writetime(session, binding).await?.map(|(value, _)| value))
     }

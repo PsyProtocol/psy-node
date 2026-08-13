@@ -13,6 +13,7 @@ use psy_node_core::{
             CheckpointId, CheckpointedObjectKey,
             LogicalMutation, MutationOperation, MutationValue, TypedTableKey,
         },
+        timestamp::NewBranchWriteTimestampUs,
     },
 };
 use scylla::{
@@ -30,7 +31,8 @@ use super::{
     CheckpointMerklePutBinding, CheckpointObjectSingleAdapter,
     CheckpointObjectSinglePutBinding, CheckpointRootPairAdapter,
     CheckpointRootPairPutPlan, CqlKeyspaceName, ImtCursorPutBinding,
-    ImtFamilyAdapter, ImtIndexPutBinding, ImtLeafPutBinding,
+    ImtCursorRestorePlan, ImtCursorSnapshot, ImtFamilyAdapter,
+    ImtIndexPutBinding, ImtLeafPutBinding,
     LatestInfoBeforeImage, LatestInfoTransitionPlan, MutableSingletonAdapter,
     ScyllaPhysicalTableId, TimestampedWriteKind, U64SingletonBeforeImage,
     U64SingletonTransitionPlan, physical_descriptor, seal_commit_put_batch,
@@ -748,6 +750,169 @@ impl RealmFullCommitScyllaExecutor {
         );
         expected.require_exact_observation(&observed)?;
         Ok(observed)
+    }
+
+    /// Optional physical point-read used by the destructive rollback
+    /// reconciler.  Unlike `read_inventory_put_physical_exact`, absence is a
+    /// successful observation; any present row is still decoded through the
+    /// production family adapter and retains its exact physical value and
+    /// writetime.
+    pub(crate) async fn read_inventory_put_physical_optional(
+        &self,
+        session: &Session,
+        put: &super::SealedTimestampedPut,
+    ) -> anyhow::Result<Option<RealmFullCommitObservedRow>> {
+        let expected = RealmFullCommitExpectedRow::try_from_inventory(put)?;
+        let Some((logical, logical_writetime)) = self.read_one(session, &expected).await?
+        else {
+            return Ok(None);
+        };
+        let (physical, physical_writetime) = self
+            .read_one_physical(session, &expected)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("logical Realm row exists without physical readback"))?;
+        anyhow::ensure!(
+            logical_writetime == physical_writetime,
+            "logical/physical rollback reads changed writetime",
+        );
+        Ok(Some(RealmFullCommitObservedRow::new_physical(
+            expected.physical_table(),
+            expected.locator().to_vec(),
+            logical,
+            physical,
+            logical_writetime,
+        )))
+    }
+
+    /// Execute one already resealed target PUT and prove its exact logical and
+    /// physical value at the post-fence timestamp.  This is intentionally a
+    /// narrow restore seam: root pairs remain immutable versioned rows, while
+    /// the mutable IMT cursor has a dedicated restore plan below.
+    pub(crate) async fn restore_inventory_put_exact(
+        &self,
+        session: &Session,
+        put: &super::SealedTimestampedPut,
+        target: CheckpointId,
+        archived_current_logical: &[u8],
+    ) -> anyhow::Result<RealmFullCommitObservedRow> {
+        let expected = RealmFullCommitExpectedRow::try_from_inventory(put)?;
+        let execution = match read_family(expected.physical_table())? {
+            RealmFullCommitReadFamily::CheckpointKiv => {
+                self.checkpoint_kiv.put(session, put).await
+            }
+            RealmFullCommitReadFamily::CheckpointObject => {
+                self.checkpoint_object.put(session, put).await
+            }
+            RealmFullCommitReadFamily::CheckpointMerkle => {
+                self.checkpoint_merkle.put(session, put).await
+            }
+            RealmFullCommitReadFamily::MutableSingleton => match put.resolved().mutation().key() {
+                TypedTableKey::LatestInfo(_) => {
+                    let plan = LatestInfoTransitionPlan::try_for_restore(
+                        put,
+                        target,
+                        archived_current_logical.to_vec(),
+                    )?;
+                    self.mutable_singleton.put_latest_info(session, &plan).await
+                }
+                TypedTableKey::U64Singleton(_) => {
+                    let bytes: [u8; 8] = archived_current_logical
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("archived u64 singleton is not eight bytes"))?;
+                    let plan = U64SingletonTransitionPlan::try_for_restore(
+                        put,
+                        target,
+                        u64::from_be_bytes(bytes),
+                    )?;
+                    self.mutable_singleton.put_latest_checkpoint(session, &plan).await
+                }
+                _ => anyhow::bail!("mutable singleton restore received another typed key"),
+            },
+            RealmFullCommitReadFamily::ImtLeaf => {
+                let binding = ImtLeafPutBinding::try_from_sealed(put)?;
+                self.imt.put_leaf(session, &binding).await
+            }
+            RealmFullCommitReadFamily::ImtIndex => {
+                let binding = ImtIndexPutBinding::try_from_sealed(put)?;
+                self.imt.put_index(session, &binding).await
+            }
+            RealmFullCommitReadFamily::GlobalUserProofException => {
+                self.global_user_proof.put(session, &expected).await
+            }
+            RealmFullCommitReadFamily::CheckpointRootPair
+            | RealmFullCommitReadFamily::ImtCursor => {
+                anyhow::bail!("rollback target restore uses an unsupported physical family")
+            }
+        };
+        let write_error = execution.err();
+        self.read_inventory_put_physical_exact(session, put)
+            .await
+            .map_err(|read_error| match write_error {
+                Some(write_error) => anyhow::anyhow!(
+                    "target restore returned {write_error:#}; exact reconciliation failed: {read_error:#}"
+                ),
+                None => read_error,
+            })
+    }
+
+    pub(crate) async fn restore_imt_cursor_exact(
+        &self,
+        session: &Session,
+        current: &super::SealedTimestampedPut,
+        target_checkpoint: CheckpointId,
+        target_next_append_index: u64,
+        timestamp: NewBranchWriteTimestampUs,
+    ) -> anyhow::Result<()> {
+        let (tree, tree_sub) = match current.resolved().mutation().key() {
+            TypedTableKey::ImtCursor { tree, tree_sub } => (*tree, *tree_sub),
+            _ => anyhow::bail!("IMT cursor restore received another typed key"),
+        };
+        let plan = ImtCursorRestorePlan::try_new(
+            target_checkpoint,
+            ImtCursorSnapshot::new(tree, tree_sub, target_next_append_index),
+            timestamp,
+        )?;
+        let write_error = self.imt.restore_cursor(session, &plan).await.err();
+        self.require_imt_cursor_exact(
+            session,
+            current,
+            target_checkpoint,
+            target_next_append_index,
+            timestamp,
+        ).await.map_err(|read_error| match write_error {
+            Some(write_error) => anyhow::anyhow!(
+                "IMT cursor restore returned {write_error:#}; exact reconciliation failed: {read_error:#}"
+            ),
+            None => read_error,
+        })
+    }
+
+    pub(crate) async fn require_imt_cursor_exact(
+        &self,
+        session: &Session,
+        current: &super::SealedTimestampedPut,
+        target_checkpoint: CheckpointId,
+        target_next_append_index: u64,
+        timestamp: NewBranchWriteTimestampUs,
+    ) -> anyhow::Result<()> {
+        let (tree, tree_sub) = match current.resolved().mutation().key() {
+            TypedTableKey::ImtCursor { tree, tree_sub } => (*tree, *tree_sub),
+            _ => anyhow::bail!("IMT cursor readback received another typed key"),
+        };
+        let plan = ImtCursorRestorePlan::try_new(
+            target_checkpoint,
+            ImtCursorSnapshot::new(tree, tree_sub, target_next_append_index),
+            timestamp,
+        )?;
+        let observed = self.imt
+            .read_restored_cursor_exact_with_writetime(session, &plan).await?
+            .ok_or_else(|| anyhow::anyhow!("restored IMT cursor is missing"))?;
+        anyhow::ensure!(
+            observed.0 == target_next_append_index.to_be_bytes()
+                && observed.1 == timestamp.as_commit_timestamp().as_i64(),
+            "restored IMT cursor differs from the fixed target/timestamp",
+        );
+        Ok(())
     }
 
     /// Execute one retry-safe non-h22 write attempt and prove its result by
