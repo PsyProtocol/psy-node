@@ -563,6 +563,19 @@ impl CheckpointRootPairAdapter {
         session: &Session,
         sealed: &super::SealedTimestampedPut,
     ) -> anyhow::Result<Option<(Vec<u8>, i64)>> {
+        self.read_exact_physical(session, sealed)
+            .await?
+            .map(|(stored, writetime)| {
+                Ok((compression::decompress(&stored)?, writetime))
+            })
+            .transpose()
+    }
+
+    pub(crate) async fn read_exact_physical(
+        &self,
+        session: &Session,
+        sealed: &super::SealedTimestampedPut,
+    ) -> anyhow::Result<Option<(Vec<u8>, i64)>> {
         let mutation = sealed.resolved().mutation();
         let (statement, key): (&PreparedStatement, Vec<u8>) =
             match (mutation.physical_table(), mutation.key()) {
@@ -591,7 +604,7 @@ impl CheckpointRootPairAdapter {
             .ok_or_else(|| anyhow::anyhow!("checkpoint root direction value is null"))?;
         let writetime = writetime
             .ok_or_else(|| anyhow::anyhow!("checkpoint root direction writetime is null"))?;
-        Ok(Some((compression::decompress(&stored)?, writetime)))
+        Ok(Some((stored, writetime)))
     }
 }
 

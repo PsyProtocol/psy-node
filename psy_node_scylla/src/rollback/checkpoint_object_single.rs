@@ -677,6 +677,19 @@ impl CheckpointObjectSingleAdapter {
         session: &Session,
         sealed: &SealedTimestampedPut,
     ) -> anyhow::Result<Option<(Vec<u8>, i64)>> {
+        self.read_exact_physical(session, sealed)
+            .await?
+            .map(|(stored, writetime)| {
+                Ok((compression::decompress(&stored)?, writetime))
+            })
+            .transpose()
+    }
+
+    pub(crate) async fn read_exact_physical(
+        &self,
+        session: &Session,
+        sealed: &SealedTimestampedPut,
+    ) -> anyhow::Result<Option<(Vec<u8>, i64)>> {
         let binding = CheckpointObjectSinglePutBinding::try_from_sealed(sealed)?;
         let result = session
             .execute_unpaged(
@@ -697,7 +710,7 @@ impl CheckpointObjectSingleAdapter {
             .ok_or_else(|| anyhow::anyhow!("checkpoint object value is null"))?;
         let writetime = writetime
             .ok_or_else(|| anyhow::anyhow!("checkpoint object writetime is null"))?;
-        Ok(Some((compression::decompress(&stored)?, writetime)))
+        Ok(Some((stored, writetime)))
     }
 
     fn prepared(

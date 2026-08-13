@@ -14,7 +14,8 @@ use parth_core::protocol::core_types::Q256BitHash;
 use psy_node_core::store::{
     authority_commit::AuthorityTimestampKey,
     branch_exact_dual_write::{
-        BranchExactDualWriteIntentDigest, BranchExactDualWriteMutationKind,
+        BranchExactDualWriteIntent, BranchExactDualWriteIntentDigest,
+        BranchExactDualWriteMutationKind,
         SealedBranchExactDualWrite,
     },
     branch_exact_schema::AuthorityScope,
@@ -228,7 +229,13 @@ impl ExecutableRows {
     fn try_from_sealed<Hash: Q256BitHash>(
         sealed: &SealedBranchExactDualWrite<Hash>,
     ) -> Result<Self, BranchExactDualWriteExecutionError> {
-        let intent = sealed.intent();
+        Self::try_from_inventory(sealed.intent(), sealed.write_timestamp())
+    }
+
+    fn try_from_inventory<Hash: Q256BitHash>(
+        intent: &BranchExactDualWriteIntent<Hash>,
+        timestamp: CommitWriteTimestampUs,
+    ) -> Result<Self, BranchExactDualWriteExecutionError> {
         let checkpoint_u64 = intent
             .candidate()
             .canonical_chain()
@@ -252,13 +259,40 @@ impl ExecutableRows {
             // values; raw bytes make same-timestamp crash retry byte-exact
             // across compression-library upgrades.
             proof: intent.reward_proof_canonical().map(ToOwned::to_owned),
-            timestamp: sealed.write_timestamp().as_i64(),
+            timestamp: timestamp.as_i64(),
         })
     }
 
     fn mutation_count(&self) -> usize {
         if self.proof.is_some() { 8 } else { 6 }
     }
+}
+
+/// Exact physical observation for one narrow Realm inventory leg. Both the
+/// logical value and the stored bytes are retained because target mapping
+/// rows carry a separate mapping digest, while proof rows may be compressed.
+/// This value is archive input only and grants no write or delete authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RealmRollbackNarrowObservedRow {
+    kind: BranchExactDualWriteMutationKind,
+    primary_key: Vec<u8>,
+    logical_value: Vec<u8>,
+    stored_value: Vec<u8>,
+    writetime_us: i64,
+}
+
+impl RealmRollbackNarrowObservedRow {
+    pub(crate) const fn kind(&self) -> BranchExactDualWriteMutationKind {
+        self.kind
+    }
+
+    pub(crate) fn primary_key(&self) -> &[u8] { &self.primary_key }
+
+    pub(crate) fn logical_value(&self) -> &[u8] { &self.logical_value }
+
+    pub(crate) fn stored_value(&self) -> &[u8] { &self.stored_value }
+
+    pub(crate) const fn writetime_us(&self) -> i64 { self.writetime_us }
 }
 
 pub(crate) struct ScyllaBranchExactDualWriteAdapter {
@@ -303,6 +337,58 @@ impl ScyllaBranchExactDualWriteAdapter {
 
     pub(crate) const fn queries(&self) -> &BranchExactDualWriteQueries {
         &self.queries
+    }
+
+    /// Read every physical leg retained by one committed Realm inventory and
+    /// require the exact logical value, stored representation, and sealed
+    /// writetime. This is a read-only archive seam; it cannot execute or seal
+    /// the original mutation.
+    pub(crate) async fn read_inventory_exact<Hash: Q256BitHash>(
+        &self,
+        intent: &BranchExactDualWriteIntent<Hash>,
+        timestamp: CommitWriteTimestampUs,
+    ) -> Result<Vec<RealmRollbackNarrowObservedRow>, BranchExactDualWriteExecutionError> {
+        if intent.authority() != self.authority {
+            return Err(BranchExactDualWriteExecutionError::AuthorityMismatch);
+        }
+        let expected = ExecutableRows::try_from_inventory(intent, timestamp)?;
+        let observed = self.read_all(&expected).await?;
+        if observed.len() != intent.mutations().len() {
+            return Err(BranchExactDualWriteExecutionError::InventoryRowCountMismatch {
+                expected: intent.mutations().len(),
+                actual: observed.len(),
+            });
+        }
+        let mut exact = Vec::with_capacity(observed.len());
+        for (index, (mutation, row)) in intent
+            .mutations()
+            .iter()
+            .zip(observed)
+            .enumerate()
+        {
+            let row = row.ok_or_else(|| {
+                BranchExactDualWriteExecutionError::MissingRows(vec![index])
+            })?;
+            if row.kind != mutation.kind() {
+                return Err(BranchExactDualWriteExecutionError::InventoryKindMismatch {
+                    expected: mutation.kind(),
+                    actual: row.kind,
+                });
+            }
+            if row.require_postwrite()? != RowPostwrite::Verified {
+                return Err(BranchExactDualWriteExecutionError::InventoryRowNotExact(
+                    row.kind,
+                ));
+            }
+            exact.push(RealmRollbackNarrowObservedRow {
+                kind: row.kind,
+                primary_key: row.key,
+                logical_value: row.logical,
+                stored_value: row.stored,
+                writetime_us: row.writetime,
+            });
+        }
+        Ok(exact)
     }
 
     async fn execute<Hash: Q256BitHash>(
@@ -694,6 +780,12 @@ pub enum BranchExactDualWriteExecutionError {
     SealedTimestampSuperseded { kind: BranchExactDualWriteMutationKind, sealed: i64, actual: i64 },
     PhysicalProofMismatch(BranchExactDualWriteMutationKind),
     MalformedProof(String),
+    InventoryRowCountMismatch { expected: usize, actual: usize },
+    InventoryKindMismatch {
+        expected: BranchExactDualWriteMutationKind,
+        actual: BranchExactDualWriteMutationKind,
+    },
+    InventoryRowNotExact(BranchExactDualWriteMutationKind),
     MissingRows(Vec<usize>),
     RetryablePartial { missing: Vec<usize>, write_failures: Vec<(usize, String)> },
     InjectedCrash { completed: usize, total: usize },

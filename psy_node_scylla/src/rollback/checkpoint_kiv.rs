@@ -582,6 +582,19 @@ impl CheckpointKivAdapter {
         session: &Session,
         sealed: &SealedTimestampedPut,
     ) -> anyhow::Result<Option<(Vec<u8>, i64)>> {
+        self.read_exact_physical(session, sealed)
+            .await?
+            .map(|(stored, writetime)| {
+                Ok((crate::compression::decompress(&stored)?, writetime))
+            })
+            .transpose()
+    }
+
+    pub(crate) async fn read_exact_physical(
+        &self,
+        session: &Session,
+        sealed: &SealedTimestampedPut,
+    ) -> anyhow::Result<Option<(Vec<u8>, i64)>> {
         let binding = CheckpointKivPutBinding::try_from_sealed(sealed)?;
         let result = session
             .execute_unpaged(
@@ -598,7 +611,7 @@ impl CheckpointKivAdapter {
         let stored = stored.ok_or_else(|| anyhow::anyhow!("checkpoint KIV value is null"))?;
         let writetime = writetime
             .ok_or_else(|| anyhow::anyhow!("checkpoint KIV writetime is null"))?;
-        Ok(Some((crate::compression::decompress(&stored)?, writetime)))
+        Ok(Some((stored, writetime)))
     }
 
     fn prepared(&self, table: CheckpointKivTable) -> &PreparedCheckpointKivTable {

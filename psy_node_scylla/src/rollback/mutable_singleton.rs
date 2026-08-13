@@ -644,6 +644,44 @@ impl MutableSingletonAdapter {
             _ => anyhow::bail!("sealed mutation is not a supported mutable singleton"),
         }
     }
+
+    pub(crate) async fn read_exact_physical(
+        &self,
+        session: &Session,
+        sealed: &SealedTimestampedPut,
+    ) -> anyhow::Result<Option<(Vec<u8>, i64)>> {
+        match (
+            sealed.resolved().mutation().physical_table(),
+            sealed.resolved().mutation().key(),
+        ) {
+            (
+                ScyllaPhysicalTableId::U64Singleton,
+                TypedTableKey::U64Singleton(U64SingletonSlot::LatestCheckpoint),
+            ) => self.read_latest_checkpoint_exact(session).await,
+            (
+                ScyllaPhysicalTableId::LatestInfo,
+                TypedTableKey::LatestInfo(slot),
+            ) => {
+                let result = session
+                    .execute_unpaged(
+                        &self.prepared.latest_info_read,
+                        (u64_to_i64_exact(*slot as u8 as u64),),
+                    )
+                    .await?;
+                let Some((stored, writetime)) = result
+                    .into_rows_result()?
+                    .maybe_first_row::<(Option<Vec<u8>>, Option<i64>)>()?
+                else {
+                    return Ok(None);
+                };
+                Ok(Some((
+                    stored.ok_or_else(|| anyhow::anyhow!("latest info value is null"))?,
+                    writetime.ok_or_else(|| anyhow::anyhow!("latest info writetime is null"))?,
+                )))
+            }
+            _ => anyhow::bail!("sealed mutation is not a supported mutable singleton"),
+        }
+    }
 }
 
 async fn prepare(

@@ -11,7 +11,7 @@ use std::{error::Error, fmt, sync::Arc};
 use futures::TryStreamExt;
 use parth_core::protocol::core_types::Q256BitHash;
 use psy_data::protocol::{
-    canonical_chain::CanonicalChainRef,
+    canonical_chain::{CanonicalChainRef, ChainEpoch, NetworkId},
     chain_context::AuthorityScope,
 };
 use psy_node_core::store::{
@@ -753,8 +753,32 @@ impl ScyllaRealmRollbackCommitInventoryStore {
         authority: AuthorityScope,
         candidate: CanonicalChainRef<Hash>,
     ) -> Result<VerifiedRealmRollbackCommittedSuffixEntry<Hash>, RealmRollbackCommitInventoryStoreError> {
-        let partition = marker_partition_key(authority, &candidate)?;
-        let checkpoint = i64::try_from(candidate.checkpoint().checkpoint_id().get())
+        let selected = self
+            .read_committed_height(
+                authority,
+                candidate.network_id(),
+                candidate.chain_epoch(),
+                candidate.checkpoint().checkpoint_id().get(),
+            )
+            .await?;
+        if selected.inventory.candidate().canonical_chain() != &candidate {
+            return Err(RealmRollbackCommitInventoryStoreError::SourceMismatch);
+        }
+        Ok(selected)
+    }
+
+    /// Select a Realm-local committed chain reference by the product's global
+    /// rollback height. Realm hashes are authority-local and must never be
+    /// copied from the Coordinator participant plan.
+    pub(super) async fn read_committed_height<Hash: Q256BitHash>(
+        &self,
+        authority: AuthorityScope,
+        network: NetworkId,
+        chain_epoch: ChainEpoch,
+        checkpoint_height: u64,
+    ) -> Result<VerifiedRealmRollbackCommittedSuffixEntry<Hash>, RealmRollbackCommitInventoryStoreError> {
+        let partition = marker_partition_coordinates(authority, network, chain_epoch)?;
+        let checkpoint = i64::try_from(checkpoint_height)
             .map_err(|_| RealmRollbackCommitInventoryStoreError::CoordinateOutOfRange)?;
         let row = self
             .session
@@ -788,7 +812,10 @@ impl ScyllaRealmRollbackCommitInventoryStore {
             .await?
             .ok_or(RealmRollbackCommitInventoryStoreError::MissingAfterWrite)?;
         if inventory.authority() != authority
-            || inventory.candidate().canonical_chain() != &candidate
+            || inventory.candidate().canonical_chain().network_id() != network
+            || inventory.candidate().canonical_chain().chain_epoch() != chain_epoch
+            || inventory.candidate().canonical_chain().checkpoint().checkpoint_id().get()
+                != checkpoint_height
         {
             return Err(RealmRollbackCommitInventoryStoreError::SourceMismatch);
         }
@@ -947,6 +974,18 @@ fn marker_partition_key<Hash: Q256BitHash>(
     authority: AuthorityScope,
     source_head: &CanonicalChainRef<Hash>,
 ) -> Result<MarkerKey, RealmRollbackCommitInventoryStoreError> {
+    marker_partition_coordinates(
+        authority,
+        source_head.network_id(),
+        source_head.chain_epoch(),
+    )
+}
+
+fn marker_partition_coordinates(
+    authority: AuthorityScope,
+    network: NetworkId,
+    chain_epoch: ChainEpoch,
+) -> Result<MarkerKey, RealmRollbackCommitInventoryStoreError> {
     let AuthorityScope::Realm {
         realm_id,
         realm_sub_id,
@@ -955,11 +994,11 @@ fn marker_partition_key<Hash: Q256BitHash>(
         return Err(RealmRollbackCommitInventoryStoreError::RealmRequired);
     };
     Ok(MarkerKey {
-        network_chain_id: i64::from(source_head.network_id().chain_id()),
+        network_chain_id: i64::from(network.chain_id()),
         authority_kind: 2,
         realm_id: i64::from(realm_id),
         realm_sub_id: i32::from(realm_sub_id),
-        chain_epoch: i64::try_from(source_head.chain_epoch().get())
+        chain_epoch: i64::try_from(chain_epoch.get())
             .map_err(|_| RealmRollbackCommitInventoryStoreError::CoordinateOutOfRange)?,
         checkpoint_id: 0,
     })

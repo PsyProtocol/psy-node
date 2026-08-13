@@ -256,6 +256,34 @@ impl RealmGlobalUserProofExceptionAdapter {
             .ok_or_else(|| anyhow::anyhow!("global-user proof writetime is null"))?;
         Ok(Some((compression::decompress(&stored)?, writetime)))
     }
+
+    pub(crate) async fn read_exact_physical(
+        &self,
+        session: &Session,
+        row: &RealmFullCommitExpectedRow,
+    ) -> anyhow::Result<Option<(Vec<u8>, i64)>> {
+        let binding = RealmGlobalUserProofBinding::try_from_expected(row)?;
+        let Some((stored, writetime)) = session
+            .execute_unpaged(
+                &self.prepared.exact_read,
+                (
+                    u64_to_i64_exact(
+                        CHECKPOINTED_OBJECT_TABLE_OBJ_ID_REALM_ROOT_TO_GLOBAL_USER_TREE_ROOT_MERKLE_PROOF,
+                    ),
+                    binding.checkpoint_id,
+                ),
+            )
+            .await?
+            .into_rows_result()?
+            .maybe_first_row::<(Option<Vec<u8>>, Option<i64>)>()?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((
+            stored.ok_or_else(|| anyhow::anyhow!("global-user proof value is null"))?,
+            writetime.ok_or_else(|| anyhow::anyhow!("global-user proof writetime is null"))?,
+        )))
+    }
 }
 
 /// Prepared dispatcher for every physical family admitted by the non-h22
@@ -672,6 +700,56 @@ impl RealmFullCommitScyllaExecutor {
         Ok(observed)
     }
 
+    /// Exact point-read for one immutable rollback-inventory PUT. The
+    /// inventory supplies the typed key, logical value, and sealed timestamp;
+    /// this method returns only after the production family adapter observes
+    /// that exact triple in the hot table.
+    pub(crate) async fn read_inventory_put_exact(
+        &self,
+        session: &Session,
+        put: &super::SealedTimestampedPut,
+    ) -> anyhow::Result<RealmFullCommitObservedRow> {
+        let expected = RealmFullCommitExpectedRow::try_from_inventory(put)?;
+        let actual = self
+            .read_one(session, &expected)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("rollback inventory hot row is missing"))?;
+        let observed = RealmFullCommitObservedRow::new(
+            expected.physical_table(),
+            expected.locator().to_vec(),
+            actual.0,
+            actual.1,
+        );
+        expected.require_exact_observation(&observed)?;
+        Ok(observed)
+    }
+
+    pub(crate) async fn read_inventory_put_physical_exact(
+        &self,
+        session: &Session,
+        put: &super::SealedTimestampedPut,
+    ) -> anyhow::Result<RealmFullCommitObservedRow> {
+        let expected = RealmFullCommitExpectedRow::try_from_inventory(put)?;
+        let logical = self
+            .read_one(session, &expected)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("rollback inventory hot row is missing"))?;
+        let physical = self
+            .read_one_physical(session, &expected)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("rollback inventory physical hot row is missing"))?;
+        anyhow::ensure!(logical.1 == physical.1, "logical/physical reads changed writetime");
+        let observed = RealmFullCommitObservedRow::new_physical(
+            expected.physical_table(),
+            expected.locator().to_vec(),
+            logical.0,
+            physical.0,
+            logical.1,
+        );
+        expected.require_exact_observation(&observed)?;
+        Ok(observed)
+    }
+
     /// Execute one retry-safe non-h22 write attempt and prove its result by
     /// re-reading every scheduled row. A driver error never decides the
     /// outcome: if all exact values and writetimes are present, the attempt is
@@ -875,6 +953,25 @@ impl RealmFullCommitScyllaExecutor {
             }
             F::GlobalUserProofException => {
                 self.global_user_proof.read_exact(session, row).await
+            }
+        }
+    }
+
+
+    async fn read_one_physical(
+        &self,
+        session: &Session,
+        row: &RealmFullCommitExpectedRow,
+    ) -> anyhow::Result<Option<(Vec<u8>, i64)>> {
+        use RealmFullCommitReadFamily as F;
+        match read_family(row.physical_table())? {
+            F::CheckpointKiv => self.checkpoint_kiv.read_exact_physical(session, row.sealed()).await,
+            F::CheckpointObject => self.checkpoint_object.read_exact_physical(session, row.sealed()).await,
+            F::CheckpointRootPair => self.checkpoint_root_pair.read_exact_physical(session, row.sealed()).await,
+            F::MutableSingleton => self.mutable_singleton.read_exact_physical(session, row.sealed()).await,
+            F::GlobalUserProofException => self.global_user_proof.read_exact_physical(session, row).await,
+            F::CheckpointMerkle | F::ImtLeaf | F::ImtIndex | F::ImtCursor => {
+                self.read_one(session, row).await
             }
         }
     }

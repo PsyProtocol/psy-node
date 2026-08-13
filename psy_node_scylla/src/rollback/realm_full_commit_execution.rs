@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     BranchExactWriterPrepared, ImtLeafPutBinding, ImtPlanError,
-    ScyllaPhysicalTableId,
+    ScyllaKeyDomain, ScyllaPhysicalTableId,
     realm_full_commit_plan::RealmFullCommitPhysicalPlan,
 };
 
@@ -44,6 +44,38 @@ pub(crate) struct RealmFullCommitExpectedRow {
 }
 
 impl RealmFullCommitExpectedRow {
+    /// Reconstruct the exact read contract retained in a committed rollback
+    /// inventory. This path does not grant write authority; it exists so the
+    /// archive owner uses the same family-specific physical decoder as the
+    /// normal full-commit executor.
+    pub(crate) fn try_from_inventory(
+        put: &super::SealedTimestampedPut,
+    ) -> Result<Self, RealmFullCommitExecutionError> {
+        let mutation = put.resolved().mutation();
+        let domain = inventory_domain(mutation.key_domain())?;
+        let expected_value = expected_readback_value(put)?;
+        let physical_table = mutation.physical_table();
+        let locator = put.resolved().locator_bytes().to_vec();
+        let timestamp = put.timestamp();
+        let row_digest = row_digest(
+            domain,
+            physical_table,
+            &locator,
+            &expected_value,
+            timestamp,
+            put.mutation_digest().as_bytes(),
+        );
+        Ok(Self {
+            domain,
+            physical_table,
+            locator,
+            expected_value,
+            timestamp,
+            row_digest,
+            sealed: put.clone(),
+        })
+    }
+
     pub(crate) const fn domain(&self) -> RealmNormalCommitWriteDomain {
         self.domain
     }
@@ -61,6 +93,23 @@ impl RealmFullCommitExpectedRow {
     }
 
     pub(crate) const fn row_digest(&self) -> &[u8; 32] { &self.row_digest }
+
+    pub(crate) fn require_exact_observation(
+        &self,
+        actual: &RealmFullCommitObservedRow,
+    ) -> Result<(), RealmFullCommitExecutionError> {
+        require_identity(0, self, actual)?;
+        if actual.writetime_us != self.timestamp.as_i64() {
+            return Err(RealmFullCommitExecutionError::PhysicalTimestampMismatch {
+                expected: self.timestamp.as_i64(),
+                actual: actual.writetime_us,
+            });
+        }
+        if actual.value != self.expected_value {
+            return Err(RealmFullCommitExecutionError::PhysicalValueConflict { index: 0 });
+        }
+        Ok(())
+    }
 
     /// The immutable mutation retained from the validated full plan. Family
     /// adapters must consume this value rather than reconstructing a typed key
@@ -271,6 +320,7 @@ pub(crate) struct RealmFullCommitObservedRow {
     physical_table: ScyllaPhysicalTableId,
     locator: Vec<u8>,
     value: Vec<u8>,
+    stored_value: Vec<u8>,
     writetime_us: i64,
 }
 
@@ -281,10 +331,36 @@ impl RealmFullCommitObservedRow {
         value: Vec<u8>,
         writetime_us: i64,
     ) -> Self {
-        Self { physical_table, locator, value, writetime_us }
+        Self {
+            physical_table,
+            locator,
+            stored_value: value.clone(),
+            value,
+            writetime_us,
+        }
+    }
+
+    pub(crate) fn new_physical(
+        physical_table: ScyllaPhysicalTableId,
+        locator: Vec<u8>,
+        value: Vec<u8>,
+        stored_value: Vec<u8>,
+        writetime_us: i64,
+    ) -> Self {
+        Self { physical_table, locator, value, stored_value, writetime_us }
     }
 
     pub(crate) fn value(&self) -> &[u8] { &self.value }
+
+    pub(crate) fn stored_value(&self) -> &[u8] { &self.stored_value }
+
+    pub(crate) const fn physical_table(&self) -> ScyllaPhysicalTableId {
+        self.physical_table
+    }
+
+    pub(crate) fn locator(&self) -> &[u8] { &self.locator }
+
+    pub(crate) const fn writetime_us(&self) -> i64 { self.writetime_us }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -362,6 +438,42 @@ fn expected_readback_value(
     }
 }
 
+fn inventory_domain(
+    key_domain: ScyllaKeyDomain,
+) -> Result<RealmNormalCommitWriteDomain, RealmFullCommitExecutionError> {
+    use RealmNormalCommitWriteDomain as D;
+    use ScyllaKeyDomain as K;
+    Ok(match key_domain {
+        K::PendingToCheckpoint => D::PendingToCheckpoint,
+        K::CheckpointToPending => D::CheckpointToPending,
+        K::PendingToProc => D::PendingToProc,
+        K::ProcToPending => D::ProcToPending,
+        K::CheckpointedGlobalUserProof => D::GlobalUserTopProofAtCheckpoint,
+        K::CheckpointedRewardsProofAtPending => D::RewardsTopProofAtPending,
+        K::CheckpointStateRoots => D::CheckpointStateRoots,
+        K::CheckpointLeaf => D::CheckpointLeaf,
+        K::GlobalCheckpointMerkle => D::GlobalCheckpointMerkle,
+        K::CheckpointRootByHash => D::CheckpointRootByHash,
+        K::CheckpointRootByCheckpoint => D::CheckpointRootByCheckpoint,
+        K::L2BlockState => D::L2BlockState,
+        K::UserLeaf => D::UserLeaf,
+        K::ContractStateMerkle => D::ContractStateMerkle,
+        K::ImtLeaf => D::ImtLeaf,
+        K::ImtKeyIndex => D::ImtKeyIndex,
+        K::ImtCursor => D::ImtCursor,
+        K::UserContractMerkle => D::UserContractMerkle,
+        K::GlobalUserMerkle => D::GlobalUserMerkle,
+        K::U64Singleton => D::LatestCheckpoint,
+        K::LatestInfo => D::LatestL2BlockState,
+        K::RealmAuthorityObservation => D::RealmAuthorityObservation,
+        other => {
+            return Err(RealmFullCommitExecutionError::UnsupportedInventoryKeyDomain(
+                other,
+            ));
+        }
+    })
+}
+
 fn row_digest(
     domain: RealmNormalCommitWriteDomain,
     table: ScyllaPhysicalTableId,
@@ -404,6 +516,7 @@ pub(crate) enum RealmFullCommitExecutionError {
     NarrowTimestampMismatch,
     MutationCountOutOfRange,
     MutationCountMismatch,
+    UnsupportedInventoryKeyDomain(ScyllaKeyDomain),
     UnsupportedValue { table: ScyllaPhysicalTableId },
     InvalidStructuredValue { table: ScyllaPhysicalTableId },
     Imt(ImtPlanError),
@@ -411,6 +524,7 @@ pub(crate) enum RealmFullCommitExecutionError {
     ObservationIdentityMismatch { index: usize },
     SealedTimestampSuperseded { index: usize, sealed: i64, actual: i64 },
     PhysicalValueConflict { index: usize },
+    PhysicalTimestampMismatch { expected: i64, actual: i64 },
     RetryRequired { indices: Vec<usize> },
 }
 
