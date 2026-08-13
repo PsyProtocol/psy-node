@@ -346,6 +346,48 @@ impl<Hash> VerifiedRealmRollbackCommittedSuffixEntry<Hash> {
     }
 }
 
+impl<Hash: Q256BitHash> VerifiedRealmRollbackCommittedSuffixEntry<Hash> {
+    /// Decode the exact authority-local head captured by this immutable
+    /// committed marker. The restore path uses the typed row rather than
+    /// copying marker bytes into the live table.
+    pub(super) fn stored_head(
+        &self,
+    ) -> Result<StoredAuthorityLocalHead<Hash>, RealmRollbackCommitInventoryStoreError> {
+        StoredAuthorityLocalHead::decode_persisted(
+            AuthorityTimestampKey::new(
+                self.inventory.candidate().canonical_chain().network_id(),
+                self.inventory.authority(),
+            ),
+            i64::try_from(self.marker.head_revision)
+                .map_err(|_| RealmRollbackCommitInventoryStoreError::CoordinateOutOfRange)?,
+            &self.marker.head_payload,
+        )
+        .map_err(|_| RealmRollbackCommitInventoryStoreError::MalformedMarker)
+    }
+
+    /// Decode the historical published pipeline only as target evidence. The
+    /// live pipeline is reset at a higher revision with fresh pending/proc
+    /// generations; this historical row is never copied over the live row.
+    pub(super) fn stored_pipeline(
+        &self,
+    ) -> Result<StoredPendingPipeline<Hash>, RealmRollbackCommitInventoryStoreError> {
+        StoredPendingPipeline::decode_persisted(
+            PendingGenerationLedgerKey::new(
+                self.inventory.candidate().canonical_chain().network_id(),
+                self.inventory.authority(),
+            ),
+            i64::try_from(self.marker.pipeline_revision)
+                .map_err(|_| RealmRollbackCommitInventoryStoreError::CoordinateOutOfRange)?,
+            &self.marker.pipeline_payload,
+        )
+        .map_err(|_| RealmRollbackCommitInventoryStoreError::MalformedMarker)
+    }
+
+    pub(super) const fn writer_revision(&self) -> u64 {
+        self.marker.writer_revision
+    }
+}
+
 /// Exact, storage-selected committed Realm suffix in `(target, source_head]`.
 ///
 /// This is deliberately inert evidence. It cannot archive, cross the global

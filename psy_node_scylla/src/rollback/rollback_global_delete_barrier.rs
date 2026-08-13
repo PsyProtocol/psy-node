@@ -360,6 +360,26 @@ impl<Hash> PersistedRollbackGlobalDeleteBarrier<Hash> {
     pub(super) const fn barrier(&self) -> &RollbackGlobalDeleteBarrier<Hash> { &self.barrier }
 }
 
+/// Non-Clone proof that one Realm completion was selected from the exact
+/// plan-ordered set which produced the persisted global delete barrier.
+/// Individual completion rows are not sufficient to authorize restoration.
+#[derive(Debug)]
+pub(super) struct SelectedRealmRollbackDeleteCompletion<Hash> {
+    barrier_store_fingerprint: [u8; 32],
+    barrier: RollbackGlobalDeleteBarrier<Hash>,
+    completion: RealmRollbackDeleteCompletion<Hash>,
+}
+
+impl<Hash> SelectedRealmRollbackDeleteCompletion<Hash> {
+    pub(super) const fn barrier(&self) -> &RollbackGlobalDeleteBarrier<Hash> {
+        &self.barrier
+    }
+
+    pub(super) const fn completion(&self) -> &RealmRollbackDeleteCompletion<Hash> {
+        &self.completion
+    }
+}
+
 pub(super) struct ScyllaRollbackGlobalDeleteBarrierStore {
     session: Arc<Session>,
     fingerprint: [u8; 32],
@@ -463,6 +483,75 @@ impl ScyllaRollbackGlobalDeleteBarrierStore {
             Some(_) => Err(RollbackGlobalDeleteBarrierError::Conflict),
             None => Err(RollbackGlobalDeleteBarrierError::MissingAfterPersist),
         }
+    }
+
+    /// Select one Realm only after reconstructing the complete barrier from
+    /// the same Coordinator completion and plan-ordered Realm completion set.
+    /// This closes the gap where an individually valid but non-member Realm
+    /// completion could otherwise be presented to a target restore executor.
+    pub(super) async fn select_realm<Hash: Q256BitHash>(
+        &self,
+        receipt: &PersistedRollbackGlobalDeleteBarrier<Hash>,
+        authority: &DeletingRollbackGlobalArchiveBarrier<Hash>,
+        coordinator: &PersistedCoordinatorRollbackDeleteCompletion<Hash>,
+        realms: &[PersistedRealmRollbackDeleteCompletion<Hash>],
+        index: usize,
+    ) -> Result<SelectedRealmRollbackDeleteCompletion<Hash>, RollbackGlobalDeleteBarrierError> {
+        self.revalidate(receipt).await?;
+        let reconstructed = RollbackGlobalDeleteBarrier::try_from_receipts(
+            authority,
+            coordinator,
+            realms,
+            self.fingerprint,
+        )?;
+        if reconstructed != receipt.barrier {
+            return Err(RollbackGlobalDeleteBarrierError::BindingMismatch);
+        }
+        let selected = realms
+            .get(index)
+            .ok_or(RollbackGlobalDeleteBarrierError::BindingMismatch)?;
+        let planned = authority
+            .participant_plan()
+            .realms()
+            .get(index)
+            .ok_or(RollbackGlobalDeleteBarrierError::BindingMismatch)?;
+        let completion = selected.completion();
+        if completion.authority()
+            != (psy_data::protocol::chain_context::AuthorityScope::Realm {
+                realm_id: planned.realm_id(),
+                realm_sub_id: planned.realm_sub_id(),
+            })
+        {
+            return Err(RollbackGlobalDeleteBarrierError::BindingMismatch);
+        }
+        Ok(SelectedRealmRollbackDeleteCompletion {
+            barrier_store_fingerprint: self.fingerprint,
+            barrier: reconstructed,
+            completion: completion.clone(),
+        })
+    }
+
+    pub(super) async fn revalidate_selected_realm<Hash: Q256BitHash>(
+        &self,
+        selected: &SelectedRealmRollbackDeleteCompletion<Hash>,
+    ) -> Result<(), RollbackGlobalDeleteBarrierError> {
+        if selected.barrier_store_fingerprint != self.fingerprint {
+            return Err(RollbackGlobalDeleteBarrierError::StoreFingerprintMismatch);
+        }
+        let expected = PersistedRollbackGlobalDeleteBarrier {
+            store_fingerprint: selected.barrier_store_fingerprint,
+            barrier: selected.barrier.clone(),
+        };
+        self.revalidate(&expected).await?;
+        if selected.completion.target() != selected.barrier.target()
+            || selected.completion.participant_plan_digest()
+                != selected.barrier.participant_plan_digest()
+            || selected.completion.barrier_digest()
+                != selected.barrier.archive_barrier_digest()
+        {
+            return Err(RollbackGlobalDeleteBarrierError::BindingMismatch);
+        }
+        Ok(())
     }
 
     async fn read_exact<Hash: Q256BitHash>(

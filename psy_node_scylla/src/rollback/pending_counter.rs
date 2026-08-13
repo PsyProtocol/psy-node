@@ -709,6 +709,15 @@ impl PendingCounterAdapter {
         self.contract
     }
 
+    /// Fresh storage observation used before an immutable rollback allocation
+    /// plan fixes the next two pending/proc identities. Missing remains
+    /// explicit; callers must persist the sealed plan before allocating.
+    pub(super) async fn observe_counter(
+        &self,
+    ) -> Result<PendingCounterReadState, PendingCounterAdapterError> {
+        self.read_counter().await
+    }
+
     pub(crate) async fn allocate(
         &self,
         plan: &SealedPendingCounterAllocation,
