@@ -275,6 +275,17 @@ where
             .map(|floor| *floor))
     }
 
+    async fn ensure_coordinator_rollback_floor_singleton_anchor(
+        &self,
+        _current: &StoredCanonicalHead<Hash>,
+        _floor: &CoordinatorRollbackFloor<Hash>,
+    ) -> anyhow::Result<()> {
+        // The in-memory backend has no physical mutable-singleton tables to
+        // archive. Production Scylla implements the durable companion anchor;
+        // this backend keeps the trait boundary explicit for local models.
+        Ok(())
+    }
+
     async fn persist_coordinator_commit_source(
         &self,
         source: &CoordinatorCommitSource<Hash>,

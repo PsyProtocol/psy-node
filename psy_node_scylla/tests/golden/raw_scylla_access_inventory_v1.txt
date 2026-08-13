@@ -52,6 +52,7 @@ psy_node_scylla/src/rollback/coordinator_guta_durable_submission_store.rs|Durabl
 psy_node_scylla/src/rollback/coordinator_processor_durable_capture.rs|DurableControlAuthority|2|0|0|0|0|0|0|0
 psy_node_scylla/src/rollback/coordinator_rollback_archive_store.rs|DurableControlAuthority|6|0|13|12|2|13|1|13
 psy_node_scylla/src/rollback/coordinator_rollback_branch_catalog.rs|DurableControlAuthority|4|0|4|9|1|4|0|4
+psy_node_scylla/src/rollback/coordinator_rollback_floor_singleton_anchor.rs|DurableControlAuthority|8|0|5|10|1|4|1|6
 psy_node_scylla/src/rollback/coordinator_rollback_realm_reward_catalog.rs|DurableControlAuthority|4|0|2|4|1|2|0|4
 psy_node_scylla/src/rollback/imt_family.rs|RollbackPrototypeAdapter|16|0|0|11|1|10|0|9
 psy_node_scylla/src/rollback/manifest_prepared.rs|DurableControlAuthority|6|0|6|8|2|6|2|7

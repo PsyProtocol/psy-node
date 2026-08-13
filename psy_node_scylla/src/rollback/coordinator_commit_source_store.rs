@@ -25,6 +25,9 @@ use scylla::{
 use super::{
     CanonicalHeadNoTabletKeyspace, CoordinatorCommitPhysicalCatalog,
     CoordinatorCommitPhysicalInventory,
+    CoordinatorRollbackFloorSingletonAnchor,
+    CoordinatorRollbackFloorSingletonAnchorStoreError, CqlKeyspaceName,
+    ScyllaCoordinatorRollbackFloorSingletonAnchorStore,
 };
 
 pub(crate) const COORDINATOR_COMMIT_SOURCE_HEADER_TABLE: &str =
@@ -117,12 +120,14 @@ pub(crate) struct ScyllaCoordinatorCommitSourceStore {
     read_floor: PreparedStatement,
     insert_floor: PreparedStatement,
     scan_headers: PreparedStatement,
+    floor_singletons: ScyllaCoordinatorRollbackFloorSingletonAnchorStore,
 }
 
 impl ScyllaCoordinatorCommitSourceStore {
     pub(crate) async fn create_schema(
         session: &Session,
         keyspace: &CanonicalHeadNoTabletKeyspace,
+        state_keyspace: &CqlKeyspaceName,
     ) -> Result<(), CoordinatorCommitSourceStoreError> {
         let queries = CoordinatorCommitSourceQueries::new(keyspace);
         for query in [
@@ -137,12 +142,19 @@ impl ScyllaCoordinatorCommitSourceStore {
                 .map_err(driver)?;
         }
         session.await_schema_agreement().await.map_err(driver)?;
+        ScyllaCoordinatorRollbackFloorSingletonAnchorStore::create_schema(
+            session,
+            keyspace,
+            state_keyspace,
+        )
+        .await?;
         Ok(())
     }
 
     pub(crate) async fn prepare(
         session: Arc<Session>,
         keyspace: CanonicalHeadNoTabletKeyspace,
+        state_keyspace: CqlKeyspaceName,
     ) -> Result<Self, CoordinatorCommitSourceStoreError> {
         let queries = CoordinatorCommitSourceQueries::new(&keyspace);
         Ok(Self {
@@ -155,9 +167,40 @@ impl ScyllaCoordinatorCommitSourceStore {
             read_floor: prepare_regular(&session, &queries.read_floor).await?,
             insert_floor: prepare_lwt(&session, &queries.insert_floor).await?,
             scan_headers: prepare_regular(&session, &queries.scan_headers).await?,
+            floor_singletons:
+                ScyllaCoordinatorRollbackFloorSingletonAnchorStore::prepare(
+                    session.clone(),
+                    keyspace,
+                    state_keyspace,
+                )
+                .await?,
             session,
             queries,
         })
+    }
+
+    pub(crate) async fn ensure_floor_singleton_anchor<Hash: Q256BitHash>(
+        &self,
+        current: &psy_node_core::store::canonical_head::StoredCanonicalHead<Hash>,
+        floor: &CoordinatorRollbackFloor<Hash>,
+    ) -> Result<CoordinatorRollbackFloorSingletonAnchor<Hash>, CoordinatorCommitSourceStoreError>
+    {
+        self.floor_singletons
+            .ensure(current, floor)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn read_floor_singleton_anchor<Hash: Q256BitHash>(
+        &self,
+        network: NetworkId,
+        chain_epoch: u64,
+    ) -> Result<Option<CoordinatorRollbackFloorSingletonAnchor<Hash>>, CoordinatorCommitSourceStoreError>
+    {
+        self.floor_singletons
+            .read(network, chain_epoch)
+            .await
+            .map_err(Into::into)
     }
 
     pub(crate) const fn queries(&self) -> &CoordinatorCommitSourceQueries {
@@ -653,6 +696,15 @@ pub(crate) enum CoordinatorCommitSourceStoreError {
     FloorMissing,
     Inventory(String),
     IndeterminateWrite(String),
+    FloorSingletonAnchor(CoordinatorRollbackFloorSingletonAnchorStoreError),
+}
+
+impl From<CoordinatorRollbackFloorSingletonAnchorStoreError>
+    for CoordinatorCommitSourceStoreError
+{
+    fn from(error: CoordinatorRollbackFloorSingletonAnchorStoreError) -> Self {
+        Self::FloorSingletonAnchor(error)
+    }
 }
 
 impl fmt::Display for CoordinatorCommitSourceStoreError {

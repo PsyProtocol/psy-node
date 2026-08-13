@@ -38,6 +38,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     CoordinatorCommitPhysicalInventory, CoordinatorCommitPhysicalSourceCell,
+    CoordinatorRollbackFloorSingletonAnchor,
 };
 
 const PAYLOAD_MAGIC: &[u8; 8] = b"PSYCTRP1";
@@ -60,6 +61,10 @@ enum CoordinatorTargetRestoreSource {
         source_slot: [u8; 32],
         source_digest: [u8; 32],
         committed_marker: [u8; 106],
+    },
+    FloorAnchor {
+        floor_digest: [u8; 32],
+        anchor_digest: [u8; 32],
     },
 }
 
@@ -180,6 +185,44 @@ impl<Hash: Q256BitHash> CoordinatorCommitTargetRestorePayload<Hash> {
                 committed_marker: marker.encode_canonical(),
             },
             target_l2,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn try_from_floor_anchor(
+        archiving_head: StoredCanonicalHead<Hash>,
+        target: CanonicalChainRef<Hash>,
+        catalog_digest: [u8; 32],
+        archive_store_fingerprint: [u8; 32],
+        participant_completion_slot: [u8; 32],
+        participant_completion_digest: [u8; 32],
+        floor: &CoordinatorRollbackFloor<Hash>,
+        anchor: &CoordinatorRollbackFloorSingletonAnchor<Hash>,
+    ) -> Result<Self, CoordinatorCommitTargetRestoreError> {
+        if floor.floor() != &target
+            || target.checkpoint().checkpoint_id().get() == 0
+            || anchor.floor() != floor
+            || anchor.latest_checkpoint()
+                != target.checkpoint().checkpoint_id().get()
+        {
+            return Err(CoordinatorCommitTargetRestoreError::FloorTargetMismatch);
+        }
+        let target_l2 = CoordinatorCommitPhysicalSourceCell::value(
+            anchor.latest_l2_stored_value().to_vec(),
+            anchor.target_l2_writetime_us(),
+        );
+        Self::try_from_parts(
+            archiving_head,
+            target,
+            catalog_digest,
+            archive_store_fingerprint,
+            participant_completion_slot,
+            participant_completion_digest,
+            CoordinatorTargetRestoreSource::FloorAnchor {
+                floor_digest: *floor.digest(),
+                anchor_digest: *anchor.digest(),
+            },
+            &target_l2,
         )
     }
 
@@ -318,6 +361,10 @@ impl<Hash: Q256BitHash> CoordinatorCommitTargetRestorePayload<Hash> {
                     committed_marker,
                 }
             }
+            3 => CoordinatorTargetRestoreSource::FloorAnchor {
+                floor_digest: cursor.array_32()?,
+                anchor_digest: cursor.array_32()?,
+            },
             value => {
                 return Err(CoordinatorCommitTargetRestoreError::UnknownSourceKind(
                     value,
@@ -345,6 +392,7 @@ impl<Hash: Q256BitHash> CoordinatorCommitTargetRestorePayload<Hash> {
             || slot == [0; 32]
             || digest == [0; 32]
             || source.floor_digest() == &[0; 32]
+            || source.anchor_digest().is_some_and(|digest| digest == &[0; 32])
         {
             return Err(CoordinatorCommitTargetRestoreError::ZeroCommitment);
         }
@@ -365,8 +413,14 @@ impl<Hash: Q256BitHash> CoordinatorCommitTargetRestorePayload<Hash> {
             {
                 return Err(CoordinatorCommitTargetRestoreError::FloorTargetMismatch);
             }
+            CoordinatorTargetRestoreSource::FloorAnchor { .. }
+                if latest_checkpoint == 0 =>
+            {
+                return Err(CoordinatorCommitTargetRestoreError::FloorTargetMismatch);
+            }
             CoordinatorTargetRestoreSource::GenesisAnchor { .. }
-            | CoordinatorTargetRestoreSource::CommittedSource { .. } => {}
+            | CoordinatorTargetRestoreSource::CommittedSource { .. }
+            | CoordinatorTargetRestoreSource::FloorAnchor { .. } => {}
         }
         let target_cell = CoordinatorCommitPhysicalSourceCell::value(
             target_l2_stored_value.clone(),
@@ -517,6 +571,14 @@ impl<Hash: Q256BitHash> CoordinatorCommitTargetRestorePayload<Hash> {
                 bytes.extend_from_slice(source_digest);
                 bytes.extend_from_slice(committed_marker);
             }
+            CoordinatorTargetRestoreSource::FloorAnchor {
+                floor_digest,
+                anchor_digest,
+            } => {
+                bytes.push(3);
+                bytes.extend_from_slice(floor_digest);
+                bytes.extend_from_slice(anchor_digest);
+            }
         }
         bytes.extend_from_slice(&self.target_l2_source_writetime_us.to_be_bytes());
         encode_bytes(&mut bytes, &self.target_l2_stored_value)?;
@@ -530,7 +592,15 @@ impl CoordinatorTargetRestoreSource {
     const fn floor_digest(&self) -> &[u8; 32] {
         match self {
             Self::GenesisAnchor { floor_digest }
-            | Self::CommittedSource { floor_digest, .. } => floor_digest,
+            | Self::CommittedSource { floor_digest, .. }
+            | Self::FloorAnchor { floor_digest, .. } => floor_digest,
+        }
+    }
+
+    const fn anchor_digest(&self) -> Option<&[u8; 32]> {
+        match self {
+            Self::FloorAnchor { anchor_digest, .. } => Some(anchor_digest),
+            Self::GenesisAnchor { .. } | Self::CommittedSource { .. } => None,
         }
     }
 }
@@ -1078,6 +1148,43 @@ mod tests {
                 &stored_l2(&block_state(7, 41), 7_001),
             ),
             Err(CoordinatorCommitTargetRestoreError::FloorTargetMismatch),
+        );
+    }
+
+    #[test]
+    fn non_genesis_floor_target_uses_exact_singleton_anchor() {
+        let target = canonical(6, 7, 700);
+        let floor = CoordinatorRollbackFloor::try_new(idle_head(6, 7, 700)).unwrap();
+        let target_state = block_state(7, 41);
+        let anchor = CoordinatorRollbackFloorSingletonAnchor::try_new(
+            floor,
+            &stored_l2(&target_state, 7_002),
+            &stored_l2(&target_state, 7_001),
+            &CoordinatorCommitPhysicalSourceCell::value(
+                7_i64.to_be_bytes().to_vec(),
+                7_003,
+            ),
+        )
+        .unwrap();
+        let payload = CoordinatorCommitTargetRestorePayload::try_from_floor_anchor(
+            archiving_head(*target.checkpoint()),
+            target,
+            [0x11; 32],
+            [0x22; 32],
+            [0x33; 32],
+            [0x44; 32],
+            &floor,
+            &anchor,
+        )
+        .unwrap();
+
+        assert_eq!(payload.latest_checkpoint, 7);
+        assert_eq!(payload.target_l2_stored_value, anchor.latest_l2_stored_value());
+        assert_eq!(
+            CoordinatorCommitTargetRestorePayload::decode_canonical(
+                payload.canonical_bytes(),
+            ),
+            Ok(payload),
         );
     }
 

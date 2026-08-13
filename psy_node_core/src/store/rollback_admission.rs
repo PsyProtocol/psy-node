@@ -791,6 +791,14 @@ mod tests {
             Ok(None)
         }
 
+        async fn ensure_coordinator_rollback_floor_singleton_anchor(
+            &self,
+            _current: &StoredCanonicalHead<PHash>,
+            _floor: &super::super::coordinator_commit_source::CoordinatorRollbackFloor<PHash>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("rollback-admission fixture has no rollback-floor anchor writer")
+        }
+
         async fn persist_coordinator_commit_source(
             &self,
             _source: &super::super::coordinator_commit_source::CoordinatorCommitSource<PHash>,

@@ -264,10 +264,17 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
         let keyspace = CanonicalHeadNoTabletKeyspace::try_new(
             self.no_tablet_keyspace.clone(),
         )?;
+        let state_keyspace = crate::rollback::CqlKeyspaceName::try_new(
+            self.keyspace.clone(),
+        )?;
         if create_schema {
             ScyllaCanonicalHeadStore::create_schema(&self.session, &keyspace).await?;
-            ScyllaCoordinatorCommitSourceStore::create_schema(&self.session, &keyspace)
-                .await?;
+            ScyllaCoordinatorCommitSourceStore::create_schema(
+                &self.session,
+                &keyspace,
+                &state_keyspace,
+            )
+            .await?;
         }
         let adapter = Arc::new(
             ScyllaCanonicalHeadStore::prepare(self.session.clone(), keyspace.clone()).await?,
@@ -276,6 +283,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
             ScyllaCoordinatorCommitSourceStore::prepare(
                 self.session.clone(),
                 keyspace,
+                state_keyspace,
             )
             .await?,
         );
@@ -700,6 +708,36 @@ where
             .coordinator_commit_sources()?
             .read_floor(network, chain_epoch)
             .await?)
+    }
+
+    async fn ensure_coordinator_rollback_floor_singleton_anchor(
+        &self,
+        current: &psy_node_core::store::canonical_head::StoredCanonicalHead<Hash>,
+        floor: &CoordinatorRollbackFloor<Hash>,
+    ) -> anyhow::Result<()> {
+        let before = match self
+            .coordinator_canonical_head()?
+            .read::<Hash>(current.canonical_ref().network_id())
+            .await?
+        {
+            CanonicalHeadReadState::Current(before) if before == *current => before,
+            _ => anyhow::bail!(
+                "Coordinator canonical head changed before rollback-floor singleton anchor"
+            ),
+        };
+        self.coordinator_commit_sources()?
+            .ensure_floor_singleton_anchor(&before, floor)
+            .await?;
+        match self
+            .coordinator_canonical_head()?
+            .read::<Hash>(current.canonical_ref().network_id())
+            .await?
+        {
+            CanonicalHeadReadState::Current(after) if after == before => Ok(()),
+            _ => anyhow::bail!(
+                "Coordinator canonical head changed while rollback-floor singleton anchor was established"
+            ),
+        }
     }
 
     async fn persist_coordinator_commit_source(

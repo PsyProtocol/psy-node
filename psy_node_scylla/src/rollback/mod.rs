@@ -87,6 +87,8 @@ mod coordinator_guta_durable_submission_store;
 #[allow(dead_code)]
 mod coordinator_processor_durable_capture;
 mod coordinator_commit_source_store;
+mod coordinator_rollback_floor_singleton_anchor;
+pub(crate) use coordinator_rollback_floor_singleton_anchor::*;
 mod coordinator_commit_physical_inventory;
 mod coordinator_commit_physical_before_image;
 mod coordinator_commit_target_restore;

@@ -198,6 +198,18 @@ pub trait CoordinatorCommitSourceStore<Hash: Q256BitHash>: Send + Sync {
         chain_epoch: u64,
     ) -> anyhow::Result<Option<CoordinatorRollbackFloor<Hash>>>;
 
+    /// Make the exact mutable-singleton values at the immutable rollback floor
+    /// durable. Implementations must be idempotent and may create a missing
+    /// anchor only while `current` is still the exact floor activation head.
+    /// A floor row without this companion evidence must fail closed once the
+    /// live head has advanced because the historical singleton values can no
+    /// longer be inferred from the current mutable rows.
+    async fn ensure_coordinator_rollback_floor_singleton_anchor(
+        &self,
+        current: &StoredCanonicalHead<Hash>,
+        floor: &CoordinatorRollbackFloor<Hash>,
+    ) -> anyhow::Result<()>;
+
     /// Establish the conservative lower bound for source-backed rollback in
     /// one epoch. Existing rows win only when they are valid for the exact
     /// current branch; an active rollback can never mint a missing floor.
@@ -212,6 +224,11 @@ pub trait CoordinatorCommitSourceStore<Hash: Q256BitHash>: Send + Sync {
             .await?
         {
             floor.validate_current_head(current)?;
+            self.ensure_coordinator_rollback_floor_singleton_anchor(
+                current,
+                &floor,
+            )
+            .await?;
             return Ok(floor);
         }
         let floor = CoordinatorRollbackFloor::try_new(*current)?;
@@ -228,6 +245,11 @@ pub trait CoordinatorCommitSourceStore<Hash: Q256BitHash>: Send + Sync {
             );
         }
         persisted.validate_current_head(current)?;
+        self.ensure_coordinator_rollback_floor_singleton_anchor(
+            current,
+            &persisted,
+        )
+        .await?;
         Ok(persisted)
     }
 
@@ -870,6 +892,14 @@ mod tests {
                     floor.floor().network_id() == network
                         && floor.floor().chain_epoch().get() == chain_epoch
                 }))
+        }
+
+        async fn ensure_coordinator_rollback_floor_singleton_anchor(
+            &self,
+            _current: &StoredCanonicalHead<PHash>,
+            _floor: &CoordinatorRollbackFloor<PHash>,
+        ) -> anyhow::Result<()> {
+            Ok(())
         }
 
         async fn persist_coordinator_commit_source(

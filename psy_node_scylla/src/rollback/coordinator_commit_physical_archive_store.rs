@@ -1111,9 +1111,32 @@ impl ScyllaCoordinatorCommitPhysicalArchiveOwner {
             )
             .map_err(Into::into)
         } else if target_checkpoint == floor_checkpoint {
-            Err(
-                CoordinatorCommitPhysicalArchiveOwnerError::NonGenesisFloorTargetUnanchored,
+            let anchor = self
+                .commit_sources
+                .read_floor_singleton_anchor(
+                    scope.target.network_id(),
+                    scope.target.chain_epoch().get(),
+                )
+                .await
+                .map_err(|error| {
+                    CoordinatorCommitPhysicalArchiveOwnerError::CommitSource(
+                        error.to_string(),
+                    )
+                })?
+                .ok_or(
+                    CoordinatorCommitPhysicalArchiveOwnerError::NonGenesisFloorTargetUnanchored,
+                )?;
+            CoordinatorCommitTargetRestorePayload::try_from_floor_anchor(
+                scope.archiving_head,
+                scope.target,
+                *catalog.digest(),
+                store.fingerprint,
+                completion.completion.slot,
+                completion.completion.digest,
+                catalog.floor(),
+                &anchor,
             )
+            .map_err(Into::into)
         } else {
             Err(CoordinatorCommitPhysicalArchiveOwnerError::TargetBelowFloor)
         }
