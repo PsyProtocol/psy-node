@@ -137,6 +137,8 @@ mod coordinator_rollback_archive_plan;
 mod coordinator_rollback_archive_store;
 #[allow(dead_code)]
 mod coordinator_rollback_branch_catalog;
+#[allow(dead_code)]
+mod coordinator_rollback_realm_reward_catalog;
 mod rollback_admission;
 mod identity;
 mod key;

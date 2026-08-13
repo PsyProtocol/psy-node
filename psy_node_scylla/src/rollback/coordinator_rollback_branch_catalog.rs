@@ -11,7 +11,7 @@
 #![allow(dead_code)]
 
 use std::{
-    collections::BTreeSet,
+    collections::BTreeMap,
     error::Error,
     fmt,
     marker::PhantomData,
@@ -318,6 +318,34 @@ pub(super) struct CoordinatorRollbackMappingArchiveSummary {
     archive_digest: [u8; 32],
 }
 
+/// Storage-selected pending coordinates for the discarded checkpoint suffix.
+///
+/// This is deliberately not a participant receipt.  It exists so pending-keyed
+/// legacy tables can be scanned without treating checkpoint height as pending
+/// identity or trusting a caller-provided pending list.
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct VerifiedCoordinatorRollbackSuffixSelection {
+    summary: CoordinatorRollbackBranchCatalogSummary,
+    pending_to_checkpoint: BTreeMap<UniquePendingId, u64>,
+}
+
+impl VerifiedCoordinatorRollbackSuffixSelection {
+    pub(super) const fn summary(&self) -> CoordinatorRollbackBranchCatalogSummary {
+        self.summary
+    }
+
+    pub(super) fn checkpoint_for_pending(
+        &self,
+        pending: UniquePendingId,
+    ) -> Option<u64> {
+        self.pending_to_checkpoint.get(&pending).copied()
+    }
+
+    pub(super) fn pending_rows(&self) -> usize {
+        self.pending_to_checkpoint.len()
+    }
+}
+
 impl CoordinatorRollbackMappingArchiveSummary {
     pub(super) const fn catalog(self) -> CoordinatorRollbackBranchCatalogSummary {
         self.catalog
@@ -356,7 +384,7 @@ struct CoordinatorRollbackBranchCatalogAccumulator<
     next_checkpoint: u64,
     previous_hash: Option<Hash>,
     previous_root_leaf: Option<(Hash, Hash)>,
-    seen_pending: BTreeSet<UniquePendingId>,
+    pending_to_checkpoint: BTreeMap<UniquePendingId, u64>,
     suffix_rows: u64,
     catalog_hasher: Sha256,
     source_hasher: Sha256,
@@ -452,7 +480,7 @@ where
             next_checkpoint,
             previous_hash: None,
             previous_root_leaf: None,
-            seen_pending: BTreeSet::new(),
+            pending_to_checkpoint: BTreeMap::new(),
             suffix_rows: 0,
             catalog_hasher,
             source_hasher,
@@ -517,7 +545,11 @@ where
                 this.require_before_fence(writetime)?;
             }
             let canonical = this.verify_transition(checkpoint_id, &transition.value, false)?;
-            if !this.seen_pending.insert(legacy.pending_id) {
+            if this
+                .pending_to_checkpoint
+                .insert(legacy.pending_id, checkpoint_id)
+                .is_some()
+            {
                 return Err(CoordinatorRollbackBranchCatalogError::PendingMappedTwice(
                     legacy.pending_id.get(),
                 ));
@@ -627,8 +659,13 @@ where
 
     fn finish(
         self,
-    ) -> Result<CoordinatorRollbackBranchCatalogSummary, CoordinatorRollbackBranchCatalogError>
-    {
+    ) -> Result<CoordinatorRollbackBranchCatalogSummary, CoordinatorRollbackBranchCatalogError> {
+        self.finish_selection().map(|selection| selection.summary)
+    }
+
+    fn finish_selection(
+        self,
+    ) -> Result<VerifiedCoordinatorRollbackSuffixSelection, CoordinatorRollbackBranchCatalogError> {
         if self.poisoned {
             return Err(CoordinatorRollbackBranchCatalogError::Poisoned);
         }
@@ -644,10 +681,10 @@ where
                 actual: self.next_checkpoint,
             });
         }
-        if self.suffix_rows != self.seen_pending.len() as u64 {
+        if self.suffix_rows != self.pending_to_checkpoint.len() as u64 {
             return Err(CoordinatorRollbackBranchCatalogError::IncompleteCatalog {
                 expected: self.suffix_rows,
-                actual: self.seen_pending.len() as u64,
+                actual: self.pending_to_checkpoint.len() as u64,
             });
         }
         let last_hash = self
@@ -665,14 +702,17 @@ where
         catalog_hasher.update(self.suffix_rows.to_be_bytes());
         let mut source_hasher = self.source_hasher;
         source_hasher.update(self.suffix_rows.to_be_bytes());
-        Ok(CoordinatorRollbackBranchCatalogSummary {
-            catalog_fingerprint: self.catalog_fingerprint,
-            source_chain_epoch: self.source_epoch,
-            suffix_rows: self.suffix_rows,
-            catalog_digest: CoordinatorRollbackBranchCatalogDigest(
-                catalog_hasher.finalize().into(),
-            ),
-            source_digest: source_hasher.finalize().into(),
+        Ok(VerifiedCoordinatorRollbackSuffixSelection {
+            summary: CoordinatorRollbackBranchCatalogSummary {
+                catalog_fingerprint: self.catalog_fingerprint,
+                source_chain_epoch: self.source_epoch,
+                suffix_rows: self.suffix_rows,
+                catalog_digest: CoordinatorRollbackBranchCatalogDigest(
+                    catalog_hasher.finalize().into(),
+                ),
+                source_digest: source_hasher.finalize().into(),
+            },
+            pending_to_checkpoint: self.pending_to_checkpoint,
         })
     }
 
@@ -1046,7 +1086,7 @@ impl ScyllaCoordinatorRollbackBranchCatalog {
         if first != second {
             return Err(CoordinatorRollbackBranchCatalogError::SourceChanged);
         }
-        Ok(second)
+        Ok(second.summary)
     }
 
     /// Verify, copy and re-verify all four mapping rows for every discarded
@@ -1104,6 +1144,7 @@ impl ScyllaCoordinatorRollbackBranchCatalog {
             CoordinatorRollbackBranchCatalogError::ArchiveSummaryMissing,
         )?;
         let expected_rows = first
+            .summary
             .suffix_rows()
             .checked_mul(4)
             .ok_or(CoordinatorRollbackBranchCatalogError::CheckpointOverflow)?;
@@ -1114,7 +1155,7 @@ impl ScyllaCoordinatorRollbackBranchCatalog {
             });
         }
         Ok(CoordinatorRollbackMappingArchiveSummary {
-            catalog: first,
+            catalog: first.summary,
             archive_rows: archived.rows,
             archive_bytes: archived.bytes,
             archive_digest: archived.digest,
@@ -1128,7 +1169,7 @@ impl ScyllaCoordinatorRollbackBranchCatalog {
         config: BranchExactCheckpointChainConfig<Hash>,
         archive_store: Option<&ScyllaCoordinatorRollbackArchiveStore>,
     ) -> Result<
-        (CoordinatorRollbackBranchCatalogSummary, Option<MappingArchiveFinished>),
+        (VerifiedCoordinatorRollbackSuffixSelection, Option<MappingArchiveFinished>),
         CoordinatorRollbackBranchCatalogError,
     >
     where
@@ -1237,7 +1278,43 @@ impl ScyllaCoordinatorRollbackBranchCatalog {
                 .checked_add(1)
                 .ok_or(CoordinatorRollbackBranchCatalogError::CheckpointOverflow)?;
         }
-        Ok((catalog.finish()?, archived.map(MappingArchiveAccumulator::finish)))
+        Ok((
+            catalog.finish_selection()?,
+            archived.map(MappingArchiveAccumulator::finish),
+        ))
+    }
+
+    /// One complete storage-derived branch selection for a sibling scanner.
+    /// The caller must bracket this with exact canonical-head reads and compare
+    /// multiple selections before treating any copied rows as complete.
+    pub(super) async fn select_verified_suffix_once<
+        F,
+        Hash,
+        Hasher,
+        Proof,
+        Verifier,
+    >(
+        &self,
+        expected_head: StoredCanonicalHead<Hash>,
+        plan: &CoordinatorRollbackArchivePlan<Hash>,
+        config: BranchExactCheckpointChainConfig<Hash>,
+    ) -> Result<VerifiedCoordinatorRollbackSuffixSelection, CoordinatorRollbackBranchCatalogError>
+    where
+        F: QFelt64,
+        Hash: QFHashBase<F> + Q256BitHash,
+        Hasher: FieldQHasher<F, Hash>,
+        Verifier: QZKProofPublicInputsHasherReader<Hash, Proof>,
+        PsyVerifiableCheckpointTransitionWithProof<F, Hash>:
+            PsyCanonicalDatabaseSerializeBaseSingle,
+    {
+        self.scan_once::<F, Hash, Hasher, Proof, Verifier>(
+            expected_head,
+            plan,
+            config,
+            None,
+        )
+        .await
+        .map(|(selection, _)| selection)
     }
 
     async fn require_current_head<Hash: Q256BitHash>(
@@ -1803,7 +1880,23 @@ mod tests {
                 );
             }
         }
-        let summary = catalog.finish().unwrap();
+        let selection = catalog.finish_selection().unwrap();
+        assert_eq!(selection.pending_rows(), 3);
+        for checkpoint in 2..=4 {
+            assert_eq!(
+                selection.checkpoint_for_pending(
+                    UniquePendingId::try_new(100 + checkpoint).unwrap(),
+                ),
+                Some(checkpoint),
+            );
+        }
+        assert_eq!(
+            selection.checkpoint_for_pending(
+                UniquePendingId::try_new(999).unwrap(),
+            ),
+            None,
+        );
+        let summary = selection.summary();
         assert_eq!(summary.source_chain_epoch(), 3);
         assert_eq!(summary.suffix_rows(), 3);
         assert_ne!(summary.catalog_digest().as_bytes(), [0; 32]);

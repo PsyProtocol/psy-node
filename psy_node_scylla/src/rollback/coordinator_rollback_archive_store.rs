@@ -9,13 +9,17 @@
 
 use std::{error::Error, fmt, sync::Arc};
 
-use parth_core::protocol::core_types::Q256BitHash;
+use parth_core::{
+    data::hash::merkle_node_key::SimpleMerkleNodeKey,
+    protocol::core_types::Q256BitHash,
+};
 use psy_data::protocol::canonical_chain::NetworkId;
 use psy_node_core::store::{
     branch_pending_mapping::BranchPendingMapping,
     canonical_head::{CanonicalHeadReadState, StoredCanonicalHead},
     rollback_control::RollbackControlState,
 };
+use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 use scylla::{
     client::session::Session,
     response::query_result::QueryResult,
@@ -23,6 +27,8 @@ use scylla::{
     value::{CqlValue, Row},
 };
 use sha2::{Digest, Sha256};
+
+use crate::compression;
 
 use super::{
     CoordinatorRollbackArchiveAction, CoordinatorRollbackArchivePlan,
@@ -37,6 +43,7 @@ use super::coordinator_rollback_branch_catalog::{
     CoordinatorRollbackMappingSourceKind,
     VerifiedCoordinatorRollbackMappingBundle,
 };
+use super::coordinator_rollback_realm_reward_catalog::VerifiedCoordinatorRollbackRealmRewardRow;
 
 pub(super) const COORDINATOR_ROLLBACK_SUFFIX_ARCHIVE_TABLE: &str =
     "coordinator_rollback_suffix_archive_v1";
@@ -59,6 +66,12 @@ const MAPPING_ROW_SLOT_DOMAIN: &[u8] =
     b"psy/coordinator-rollback-mapping-archive-row-slot/v1";
 const MAPPING_BUNDLE_DIGEST_DOMAIN: &[u8] =
     b"psy/coordinator-rollback-mapping-archive-bundle/v1";
+const REWARD_ROW_MAGIC: [u8; 8] = *b"PSYCRRRW";
+const REWARD_ROW_CODEC_VERSION: u16 = 1;
+const REWARD_ROW_DIGEST_DOMAIN: &[u8] =
+    b"psy/coordinator-rollback-realm-reward-archive-row/v1";
+const REWARD_ROW_SLOT_DOMAIN: &[u8] =
+    b"psy/coordinator-rollback-realm-reward-archive-row-slot/v1";
 const ARCHIVE_REVISION: i64 = 1;
 const MAX_FRAGMENT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FRAGMENTS: usize = 16;
@@ -823,6 +836,461 @@ impl CoordinatorRollbackMappingArchiveRow {
     }
 }
 
+/// Canonical archive image of one physical Realm reward-node row selected by
+/// the exact old-branch pending catalog.  Its slot binds only the physical
+/// `(realm, pending)` source key, so delayed different content conflicts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct CoordinatorRollbackRealmRewardArchiveRow {
+    network: NetworkId,
+    rollback_epoch: u64,
+    source_epoch: u64,
+    catalog_fingerprint: [u8; 32],
+    mapping_catalog_fingerprint: [u8; 32],
+    mapping_catalog_digest: [u8; 32],
+    mapping_source_digest: [u8; 32],
+    participant_plan_digest: CoordinatorRollbackArchivePlanDigest,
+    global_plan_digest: [u8; 32],
+    requested_height: u64,
+    requested_hash: [u8; 32],
+    target_height: u64,
+    target_hash: [u8; 32],
+    orphan_write_max_us: i64,
+    source_checkpoint: u64,
+    source_pending: u64,
+    source_realm: u64,
+    source_value: Vec<u8>,
+    source_writetime_us: i64,
+    slot: CoordinatorRollbackArchiveRowSlot,
+    canonical_bytes: Vec<u8>,
+    digest: CoordinatorRollbackArchiveRowDigest,
+}
+
+impl CoordinatorRollbackRealmRewardArchiveRow {
+    pub(super) fn try_from_verified<Hash: Q256BitHash>(
+        expected_head: StoredCanonicalHead<Hash>,
+        plan: &CoordinatorRollbackArchivePlan<Hash>,
+        source: &VerifiedCoordinatorRollbackRealmRewardRow,
+    ) -> Result<Self, CoordinatorRollbackRealmRewardArchiveRowError> {
+        validate_archiving_head(expected_head, plan)
+            .map_err(|_| CoordinatorRollbackRealmRewardArchiveRowError::NotExactArchivingHead)?;
+        let has_reward_blocker = plan.blockers().iter().any(|blocker| {
+            matches!(
+                blocker,
+                super::CoordinatorRollbackArchivePlanBlocker::RegistryBlocked {
+                    key_domain: ScyllaKeyDomain::RealmRewardNode,
+                    blocker: RegistryBlocker::PendingSuffixReadThrough,
+                }
+            )
+        });
+        if !has_reward_blocker {
+            return Err(CoordinatorRollbackRealmRewardArchiveRowError::PlanContractMismatch);
+        }
+        if source.network() != expected_head.canonical_ref().network_id()
+            || source.rollback_epoch() != expected_head.canonical_ref().chain_epoch().get()
+            || source.source_epoch().checked_add(1) != Some(source.rollback_epoch())
+            || source.source_checkpoint() <= plan.suffix_start_exclusive()
+            || source.source_checkpoint() > plan.suffix_end_inclusive()
+            || source.pending().get() == 0
+            || source.catalog_fingerprint() == [0; 32]
+            || source.mapping_catalog_fingerprint() == [0; 32]
+            || source.mapping_catalog_digest() == [0; 32]
+            || source.mapping_source_digest() == [0; 32]
+        {
+            return Err(CoordinatorRollbackRealmRewardArchiveRowError::IdentityMismatch);
+        }
+        let orphan_write_max_us = plan
+            .request()
+            .fence_window()
+            .delete_fence()
+            .orphan_write_max()
+            .as_i64();
+        validate_reward_source(
+            source.source_value(),
+            source.source_writetime_us(),
+            orphan_write_max_us,
+        )?;
+        let participant_plan_digest = plan.digest();
+        let global_plan_digest = *plan.global_plan_digest().as_bytes();
+        let requested_height = plan.request().requested_head().checkpoint_id().get();
+        let requested_hash = plan
+            .request()
+            .requested_head()
+            .checkpoint_hash()
+            .as_inner()
+            .into_owned_32bytes();
+        let target_height = plan.request().target().checkpoint_id().get();
+        let target_hash = plan
+            .request()
+            .target()
+            .checkpoint_hash()
+            .as_inner()
+            .into_owned_32bytes();
+        let slot = reward_row_slot(
+            source.network(),
+            source.rollback_epoch(),
+            participant_plan_digest,
+            source.realm().get(),
+            source.pending().get(),
+        );
+        let mut canonical_bytes = encode_reward_row_without_digest(
+            source.network(),
+            source.rollback_epoch(),
+            source.source_epoch(),
+            source.catalog_fingerprint(),
+            source.mapping_catalog_fingerprint(),
+            source.mapping_catalog_digest(),
+            source.mapping_source_digest(),
+            participant_plan_digest,
+            global_plan_digest,
+            requested_height,
+            requested_hash,
+            target_height,
+            target_hash,
+            orphan_write_max_us,
+            source.source_checkpoint(),
+            source.pending().get(),
+            source.realm().get(),
+            source.source_value(),
+            source.source_writetime_us(),
+            slot,
+        )?;
+        let digest = reward_row_digest(&canonical_bytes);
+        canonical_bytes.extend_from_slice(digest.as_bytes());
+        if canonical_bytes.len() > MAX_CANONICAL_ROW_BYTES {
+            return Err(CoordinatorRollbackRealmRewardArchiveRowError::RowTooLarge {
+                actual: canonical_bytes.len(),
+                maximum: MAX_CANONICAL_ROW_BYTES,
+            });
+        }
+        Ok(Self {
+            network: source.network(),
+            rollback_epoch: source.rollback_epoch(),
+            source_epoch: source.source_epoch(),
+            catalog_fingerprint: source.catalog_fingerprint(),
+            mapping_catalog_fingerprint: source.mapping_catalog_fingerprint(),
+            mapping_catalog_digest: source.mapping_catalog_digest(),
+            mapping_source_digest: source.mapping_source_digest(),
+            participant_plan_digest,
+            global_plan_digest,
+            requested_height,
+            requested_hash,
+            target_height,
+            target_hash,
+            orphan_write_max_us,
+            source_checkpoint: source.source_checkpoint(),
+            source_pending: source.pending().get(),
+            source_realm: source.realm().get(),
+            source_value: source.source_value().to_vec(),
+            source_writetime_us: source.source_writetime_us(),
+            slot,
+            canonical_bytes,
+            digest,
+        })
+    }
+
+    fn decode_canonical(
+        bytes: &[u8],
+    ) -> Result<Self, CoordinatorRollbackRealmRewardArchiveRowError> {
+        if bytes.len() < REWARD_ROW_MIN_BYTES {
+            return Err(CoordinatorRollbackRealmRewardArchiveRowError::Truncated);
+        }
+        if bytes.len() > MAX_CANONICAL_ROW_BYTES {
+            return Err(CoordinatorRollbackRealmRewardArchiveRowError::RowTooLarge {
+                actual: bytes.len(),
+                maximum: MAX_CANONICAL_ROW_BYTES,
+            });
+        }
+        let (body, stored_digest) = bytes.split_at(bytes.len() - 32);
+        let expected_digest = reward_row_digest(body);
+        if stored_digest != expected_digest.as_bytes().as_slice() {
+            return Err(CoordinatorRollbackRealmRewardArchiveRowError::DigestMismatch);
+        }
+        let mut decoder = Decoder::new(body);
+        if decoder.take(8).map_err(map_reward_decode)? != REWARD_ROW_MAGIC {
+            return Err(CoordinatorRollbackRealmRewardArchiveRowError::InvalidMagic);
+        }
+        let version = decoder.u16().map_err(map_reward_decode)?;
+        if version != REWARD_ROW_CODEC_VERSION {
+            return Err(CoordinatorRollbackRealmRewardArchiveRowError::UnknownVersion(version));
+        }
+        let network = NetworkId::try_from_chain_id(decoder.u32().map_err(map_reward_decode)?)
+            .map_err(|error| CoordinatorRollbackRealmRewardArchiveRowError::Network(error.to_string()))?;
+        let rollback_epoch = decoder.u64().map_err(map_reward_decode)?;
+        let source_epoch = decoder.u64().map_err(map_reward_decode)?;
+        if source_epoch.checked_add(1) != Some(rollback_epoch)
+            || rollback_epoch > i64::MAX as u64
+        {
+            return Err(CoordinatorRollbackRealmRewardArchiveRowError::IdentityMismatch);
+        }
+        let catalog_fingerprint = decoder.array_32().map_err(map_reward_decode)?;
+        let mapping_catalog_fingerprint = decoder.array_32().map_err(map_reward_decode)?;
+        let mapping_catalog_digest = decoder.array_32().map_err(map_reward_decode)?;
+        let mapping_source_digest = decoder.array_32().map_err(map_reward_decode)?;
+        if [
+            catalog_fingerprint,
+            mapping_catalog_fingerprint,
+            mapping_catalog_digest,
+            mapping_source_digest,
+        ]
+        .contains(&[0; 32])
+        {
+            return Err(CoordinatorRollbackRealmRewardArchiveRowError::ZeroDigest);
+        }
+        let participant_plan_digest = CoordinatorRollbackArchivePlanDigest::try_from_archive_bytes(
+            decoder.array_32().map_err(map_reward_decode)?,
+        )
+        .map_err(CoordinatorRollbackRealmRewardArchiveRowError::PlanDigest)?;
+        let global_plan_digest = decoder.array_32().map_err(map_reward_decode)?;
+        if global_plan_digest == [0; 32] {
+            return Err(CoordinatorRollbackRealmRewardArchiveRowError::ZeroDigest);
+        }
+        let key_domain = decoder.u16().map_err(map_reward_decode)?;
+        let physical_table = decoder.u16().map_err(map_reward_decode)?;
+        let blocker = decoder.u8().map_err(map_reward_decode)?;
+        if key_domain != ScyllaKeyDomain::RealmRewardNode.stable_id()
+            || physical_table != ScyllaPhysicalTableId::RealmRewardsTreeNodeKey.stable_id()
+            || blocker != 1
+        {
+            return Err(CoordinatorRollbackRealmRewardArchiveRowError::DomainContractMismatch);
+        }
+        let requested_height = decoder.u64().map_err(map_reward_decode)?;
+        let requested_hash = decoder.array_32().map_err(map_reward_decode)?;
+        let target_height = decoder.u64().map_err(map_reward_decode)?;
+        let target_hash = decoder.array_32().map_err(map_reward_decode)?;
+        let orphan_write_max_us = decoder.i64().map_err(map_reward_decode)?;
+        let source_checkpoint = decoder.u64().map_err(map_reward_decode)?;
+        let source_pending = decoder.u64().map_err(map_reward_decode)?;
+        let source_realm = decoder.u64().map_err(map_reward_decode)?;
+        let source_writetime_us = decoder.i64().map_err(map_reward_decode)?;
+        if target_height >= requested_height
+            || source_checkpoint <= target_height
+            || source_checkpoint > requested_height
+            || source_pending == 0
+            || source_pending > i64::MAX as u64
+            || source_realm > i64::MAX as u64
+        {
+            return Err(CoordinatorRollbackRealmRewardArchiveRowError::SourceOutsideSuffix);
+        }
+        let value_len = usize::try_from(decoder.u64().map_err(map_reward_decode)?)
+            .map_err(|_| CoordinatorRollbackRealmRewardArchiveRowError::LengthOverflow)?;
+        let source_value = decoder.take(value_len).map_err(map_reward_decode)?.to_vec();
+        let slot = CoordinatorRollbackArchiveRowSlot(
+            decoder.array_32().map_err(map_reward_decode)?,
+        );
+        if !decoder.is_empty() {
+            return Err(CoordinatorRollbackRealmRewardArchiveRowError::TrailingBytes);
+        }
+        validate_reward_source(
+            &source_value,
+            source_writetime_us,
+            orphan_write_max_us,
+        )?;
+        let expected_slot = reward_row_slot(
+            network,
+            rollback_epoch,
+            participant_plan_digest,
+            source_realm,
+            source_pending,
+        );
+        if slot != expected_slot {
+            return Err(CoordinatorRollbackRealmRewardArchiveRowError::RowSlotMismatch);
+        }
+        Ok(Self {
+            network,
+            rollback_epoch,
+            source_epoch,
+            catalog_fingerprint,
+            mapping_catalog_fingerprint,
+            mapping_catalog_digest,
+            mapping_source_digest,
+            participant_plan_digest,
+            global_plan_digest,
+            requested_height,
+            requested_hash,
+            target_height,
+            target_hash,
+            orphan_write_max_us,
+            source_checkpoint,
+            source_pending,
+            source_realm,
+            source_value,
+            source_writetime_us,
+            slot,
+            canonical_bytes: bytes.to_vec(),
+            digest: expected_digest,
+        })
+    }
+
+    fn fragments(
+        &self,
+    ) -> Result<Vec<CoordinatorRollbackArchiveFragment>, CoordinatorRollbackRealmRewardArchiveRowError> {
+        let fragment_count = self.canonical_bytes.len().div_ceil(MAX_FRAGMENT_BYTES);
+        if fragment_count == 0 || fragment_count > MAX_FRAGMENTS {
+            return Err(CoordinatorRollbackRealmRewardArchiveRowError::InvalidFragmentCount(
+                fragment_count,
+            ));
+        }
+        let row_bytes = i64::try_from(self.canonical_bytes.len())
+            .map_err(|_| CoordinatorRollbackRealmRewardArchiveRowError::LengthOverflow)?;
+        let count = i32::try_from(fragment_count)
+            .map_err(|_| CoordinatorRollbackRealmRewardArchiveRowError::LengthOverflow)?;
+        Ok(self
+            .canonical_bytes
+            .chunks(MAX_FRAGMENT_BYTES)
+            .enumerate()
+            .map(|(index, payload)| CoordinatorRollbackArchiveFragment {
+                index: index as i32,
+                count,
+                row_bytes,
+                payload: payload.to_vec(),
+                payload_digest: fragment_digest(index as i32, payload),
+                row_digest: self.digest,
+            })
+            .collect())
+    }
+
+    pub(super) const fn slot(&self) -> CoordinatorRollbackArchiveRowSlot {
+        self.slot
+    }
+
+    pub(super) const fn digest(&self) -> CoordinatorRollbackArchiveRowDigest {
+        self.digest
+    }
+
+    pub(super) fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical_bytes
+    }
+}
+
+#[cfg(test)]
+pub(super) fn qualification_reconstruct_reward_archive_row(
+    row: &CoordinatorRollbackRealmRewardArchiveRow,
+) -> Result<CoordinatorRollbackRealmRewardArchiveRow, CoordinatorRollbackArchiveStoreError> {
+    let bytes = reconstruct_fragments(row.fragments()?)?;
+    Ok(CoordinatorRollbackRealmRewardArchiveRow::decode_canonical(&bytes)?)
+}
+
+const REWARD_ROW_MIN_BYTES: usize = 8 + 2 + 4 + 8 + 8 + (32 * 6) + 2 + 2 + 1
+    + 8 + 32 + 8 + 32 + 8 + 8 + 8 + 8 + 8 + 8 + 32 + 32;
+
+#[allow(clippy::too_many_arguments)]
+fn encode_reward_row_without_digest(
+    network: NetworkId,
+    rollback_epoch: u64,
+    source_epoch: u64,
+    catalog_fingerprint: [u8; 32],
+    mapping_catalog_fingerprint: [u8; 32],
+    mapping_catalog_digest: [u8; 32],
+    mapping_source_digest: [u8; 32],
+    participant_plan_digest: CoordinatorRollbackArchivePlanDigest,
+    global_plan_digest: [u8; 32],
+    requested_height: u64,
+    requested_hash: [u8; 32],
+    target_height: u64,
+    target_hash: [u8; 32],
+    orphan_write_max_us: i64,
+    source_checkpoint: u64,
+    source_pending: u64,
+    source_realm: u64,
+    source_value: &[u8],
+    source_writetime_us: i64,
+    slot: CoordinatorRollbackArchiveRowSlot,
+) -> Result<Vec<u8>, CoordinatorRollbackRealmRewardArchiveRowError> {
+    if rollback_epoch > i64::MAX as u64
+        || source_checkpoint > i64::MAX as u64
+        || source_pending > i64::MAX as u64
+        || source_realm > i64::MAX as u64
+    {
+        return Err(CoordinatorRollbackRealmRewardArchiveRowError::IntegerOutOfCqlRange);
+    }
+    let value_len = u64::try_from(source_value.len())
+        .map_err(|_| CoordinatorRollbackRealmRewardArchiveRowError::LengthOverflow)?;
+    let mut bytes = Vec::with_capacity(REWARD_ROW_MIN_BYTES + source_value.len());
+    bytes.extend_from_slice(&REWARD_ROW_MAGIC);
+    bytes.extend_from_slice(&REWARD_ROW_CODEC_VERSION.to_be_bytes());
+    bytes.extend_from_slice(&network.chain_id().to_be_bytes());
+    bytes.extend_from_slice(&rollback_epoch.to_be_bytes());
+    bytes.extend_from_slice(&source_epoch.to_be_bytes());
+    bytes.extend_from_slice(&catalog_fingerprint);
+    bytes.extend_from_slice(&mapping_catalog_fingerprint);
+    bytes.extend_from_slice(&mapping_catalog_digest);
+    bytes.extend_from_slice(&mapping_source_digest);
+    bytes.extend_from_slice(&participant_plan_digest.as_bytes());
+    bytes.extend_from_slice(&global_plan_digest);
+    bytes.extend_from_slice(&ScyllaKeyDomain::RealmRewardNode.stable_id().to_be_bytes());
+    bytes.extend_from_slice(&ScyllaPhysicalTableId::RealmRewardsTreeNodeKey.stable_id().to_be_bytes());
+    bytes.push(1); // RegistryBlocker::PendingSuffixReadThrough
+    bytes.extend_from_slice(&requested_height.to_be_bytes());
+    bytes.extend_from_slice(&requested_hash);
+    bytes.extend_from_slice(&target_height.to_be_bytes());
+    bytes.extend_from_slice(&target_hash);
+    bytes.extend_from_slice(&orphan_write_max_us.to_be_bytes());
+    bytes.extend_from_slice(&source_checkpoint.to_be_bytes());
+    bytes.extend_from_slice(&source_pending.to_be_bytes());
+    bytes.extend_from_slice(&source_realm.to_be_bytes());
+    bytes.extend_from_slice(&source_writetime_us.to_be_bytes());
+    bytes.extend_from_slice(&value_len.to_be_bytes());
+    bytes.extend_from_slice(source_value);
+    bytes.extend_from_slice(slot.as_bytes());
+    Ok(bytes)
+}
+
+fn validate_reward_source(
+    compressed: &[u8],
+    writetime_us: i64,
+    orphan_write_max_us: i64,
+) -> Result<(), CoordinatorRollbackRealmRewardArchiveRowError> {
+    if writetime_us > orphan_write_max_us {
+        return Err(CoordinatorRollbackRealmRewardArchiveRowError::WriteAfterOrphanFence {
+            writetime_us,
+            orphan_write_max_us,
+        });
+    }
+    let canonical = compression::decompress(compressed).map_err(|error| {
+        CoordinatorRollbackRealmRewardArchiveRowError::MalformedSource(error.to_string())
+    })?;
+    let decoded = SimpleMerkleNodeKey::psy_ser_from_owned_bytes_vec(canonical.clone())
+        .map_err(|error| CoordinatorRollbackRealmRewardArchiveRowError::MalformedSource(error.to_string()))?;
+    let rebuilt = decoded.psy_ser_to_bytes_vec().map_err(|error| {
+        CoordinatorRollbackRealmRewardArchiveRowError::MalformedSource(error.to_string())
+    })?;
+    if rebuilt != canonical {
+        return Err(CoordinatorRollbackRealmRewardArchiveRowError::NonCanonicalSource);
+    }
+    Ok(())
+}
+
+fn reward_row_slot(
+    network: NetworkId,
+    rollback_epoch: u64,
+    participant_plan_digest: CoordinatorRollbackArchivePlanDigest,
+    realm: u64,
+    pending: u64,
+) -> CoordinatorRollbackArchiveRowSlot {
+    let mut hasher = Sha256::new();
+    hasher.update(REWARD_ROW_SLOT_DOMAIN);
+    hasher.update(network.chain_id().to_be_bytes());
+    hasher.update(rollback_epoch.to_be_bytes());
+    hasher.update(participant_plan_digest.as_bytes());
+    hasher.update(realm.to_be_bytes());
+    hasher.update(pending.to_be_bytes());
+    CoordinatorRollbackArchiveRowSlot(hasher.finalize().into())
+}
+
+fn reward_row_digest(bytes: &[u8]) -> CoordinatorRollbackArchiveRowDigest {
+    let mut hasher = Sha256::new();
+    hasher.update(REWARD_ROW_DIGEST_DOMAIN);
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+    CoordinatorRollbackArchiveRowDigest(hasher.finalize().into())
+}
+
+fn map_reward_decode(
+    error: CoordinatorRollbackArchiveRowError,
+) -> CoordinatorRollbackRealmRewardArchiveRowError {
+    CoordinatorRollbackRealmRewardArchiveRowError::Decode(error.to_string())
+}
+
 #[cfg(test)]
 pub(super) fn qualification_reconstruct_mapping_archive_row<Hash: Q256BitHash>(
     row: &CoordinatorRollbackMappingArchiveRow,
@@ -1201,6 +1669,12 @@ struct PersistedCoordinatorRollbackMappingArchiveRowReceipt {
     row: CoordinatorRollbackMappingArchiveRow,
 }
 
+#[derive(Debug)]
+struct PersistedCoordinatorRollbackRealmRewardArchiveRowReceipt {
+    store_fingerprint: CoordinatorRollbackArchiveStoreFingerprint,
+    row: CoordinatorRollbackRealmRewardArchiveRow,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct CoordinatorRollbackArchivedMappingBundle {
     rows: u64,
@@ -1215,6 +1689,28 @@ impl CoordinatorRollbackArchivedMappingBundle {
 
     pub(super) const fn canonical_bytes(self) -> u64 {
         self.canonical_bytes
+    }
+
+    pub(super) const fn digest(self) -> [u8; 32] {
+        self.digest
+    }
+}
+
+/// Inert per-row metrics returned to the catalog-owned streaming accumulator.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CoordinatorRollbackArchivedRealmRewardRow {
+    canonical_bytes: u64,
+    slot: [u8; 32],
+    digest: [u8; 32],
+}
+
+impl CoordinatorRollbackArchivedRealmRewardRow {
+    pub(super) const fn canonical_bytes(self) -> u64 {
+        self.canonical_bytes
+    }
+
+    pub(super) const fn slot(self) -> [u8; 32] {
+        self.slot
     }
 
     pub(super) const fn digest(self) -> [u8; 32] {
@@ -1429,6 +1925,29 @@ impl ScyllaCoordinatorRollbackArchiveStore {
         })
     }
 
+    /// The only reward-node archive entry point.  Raw realm/pending/value
+    /// coordinates cannot be supplied by a caller; they must come from the
+    /// storage-selected, mapping-bound source row emitted by the reward catalog.
+    pub(super) async fn persist_verified_realm_reward_row<Hash: Q256BitHash>(
+        &self,
+        expected_head: StoredCanonicalHead<Hash>,
+        plan: &CoordinatorRollbackArchivePlan<Hash>,
+        source: &VerifiedCoordinatorRollbackRealmRewardRow,
+    ) -> Result<CoordinatorRollbackArchivedRealmRewardRow, CoordinatorRollbackArchiveStoreError> {
+        let row = CoordinatorRollbackRealmRewardArchiveRow::try_from_verified(
+            expected_head,
+            plan,
+            source,
+        )?;
+        let receipt = self.persist_reward_exact(row).await?;
+        self.revalidate_reward_exact(&receipt).await?;
+        Ok(CoordinatorRollbackArchivedRealmRewardRow {
+            canonical_bytes: receipt.row.canonical_bytes.len() as u64,
+            slot: *receipt.row.slot.as_bytes(),
+            digest: *receipt.row.digest.as_bytes(),
+        })
+    }
+
     async fn require_current_head<Hash: Q256BitHash>(
         &self,
         canonical_head_store: &ScyllaCanonicalHeadStore,
@@ -1616,6 +2135,80 @@ impl ScyllaCoordinatorRollbackArchiveStore {
         })
     }
 
+    async fn persist_reward_exact(
+        &self,
+        row: CoordinatorRollbackRealmRewardArchiveRow,
+    ) -> Result<PersistedCoordinatorRollbackRealmRewardArchiveRowReceipt, CoordinatorRollbackArchiveStoreError> {
+        let fragments = row.fragments()?;
+        let network = i64::from(row.network.chain_id());
+        let chain_epoch = i64::try_from(row.rollback_epoch)
+            .map_err(|_| CoordinatorRollbackArchiveStoreError::IntegerOutOfCqlRange)?;
+        let key_domain = i16::try_from(ScyllaKeyDomain::RealmRewardNode.stable_id())
+            .map_err(|_| CoordinatorRollbackArchiveStoreError::IntegerOutOfCqlRange)?;
+        let participant = row.participant_plan_digest.as_bytes();
+        for fragment in &fragments {
+            let execution = self
+                .session
+                .execute_unpaged(
+                    &self.insert,
+                    (
+                        network,
+                        chain_epoch,
+                        participant.as_slice(),
+                        key_domain,
+                        row.slot.as_bytes().as_slice(),
+                        fragment.index,
+                        ARCHIVE_REVISION,
+                        fragment.count,
+                        fragment.row_bytes,
+                        fragment.payload.as_slice(),
+                        fragment.payload_digest.as_slice(),
+                        fragment.row_digest.as_bytes().as_slice(),
+                    ),
+                )
+                .await;
+            match execution {
+                Ok(result) => {
+                    if !decode_applied(result)? {
+                        let current = self
+                            .read_reward_fragment(&row, fragment.index)
+                            .await?;
+                        if current.as_ref() != Some(fragment) {
+                            return Err(CoordinatorRollbackArchiveStoreError::Conflict);
+                        }
+                    }
+                }
+                Err(error) => match self
+                    .read_reward_fragment(&row, fragment.index)
+                    .await
+                {
+                    Ok(Some(current)) if current == *fragment => {}
+                    Ok(_) => {
+                        return Err(CoordinatorRollbackArchiveStoreError::Indeterminate(
+                            error.to_string(),
+                        ));
+                    }
+                    Err(read) => {
+                        return Err(CoordinatorRollbackArchiveStoreError::Indeterminate(
+                            format!("execute={error}; read={read}"),
+                        ));
+                    }
+                },
+            }
+        }
+        let current = self
+            .read_exact_reward_row(&row)
+            .await?
+            .ok_or(CoordinatorRollbackArchiveStoreError::MissingAfterPersist)?;
+        if current != row {
+            return Err(CoordinatorRollbackArchiveStoreError::Conflict);
+        }
+        Ok(PersistedCoordinatorRollbackRealmRewardArchiveRowReceipt {
+            store_fingerprint: self.fingerprint,
+            row: current,
+        })
+    }
+
     async fn revalidate_exact(
         &self,
         receipt: &PersistedCoordinatorRollbackArchiveRowReceipt,
@@ -1637,6 +2230,19 @@ impl ScyllaCoordinatorRollbackArchiveStore {
             return Err(CoordinatorRollbackArchiveStoreError::ReceiptBindingMismatch);
         }
         match self.read_exact_mapping_row::<Hash>(&receipt.row).await? {
+            Some(current) if current == receipt.row => Ok(()),
+            _ => Err(CoordinatorRollbackArchiveStoreError::ReceiptStale),
+        }
+    }
+
+    async fn revalidate_reward_exact(
+        &self,
+        receipt: &PersistedCoordinatorRollbackRealmRewardArchiveRowReceipt,
+    ) -> Result<(), CoordinatorRollbackArchiveStoreError> {
+        if receipt.store_fingerprint != self.fingerprint {
+            return Err(CoordinatorRollbackArchiveStoreError::ReceiptBindingMismatch);
+        }
+        match self.read_exact_reward_row(&receipt.row).await? {
             Some(current) if current == receipt.row => Ok(()),
             _ => Err(CoordinatorRollbackArchiveStoreError::ReceiptStale),
         }
@@ -1693,6 +2299,46 @@ impl ScyllaCoordinatorRollbackArchiveStore {
         let chain_epoch = i64::try_from(row.rollback_epoch)
             .map_err(|_| CoordinatorRollbackArchiveStoreError::IntegerOutOfCqlRange)?;
         let key_domain = i16::try_from(row.key_domain.stable_id())
+            .map_err(|_| CoordinatorRollbackArchiveStoreError::IntegerOutOfCqlRange)?;
+        let participant = row.participant_plan_digest.as_bytes();
+        let result = self
+            .session
+            .execute_unpaged(
+                &self.read_fragment,
+                (
+                    network,
+                    chain_epoch,
+                    participant.as_slice(),
+                    key_domain,
+                    row.slot.as_bytes().as_slice(),
+                    index,
+                ),
+            )
+            .await
+            .map_err(cql)?
+            .into_rows_result()
+            .map_err(cql)?
+            .maybe_first_row::<(
+                Option<i64>,
+                Option<i32>,
+                Option<i64>,
+                Option<Vec<u8>>,
+                Option<Vec<u8>>,
+                Option<Vec<u8>>,
+            )>()
+            .map_err(cql)?;
+        result.map(|tuple| decode_fragment(index, tuple)).transpose()
+    }
+
+    async fn read_reward_fragment(
+        &self,
+        row: &CoordinatorRollbackRealmRewardArchiveRow,
+        index: i32,
+    ) -> Result<Option<CoordinatorRollbackArchiveFragment>, CoordinatorRollbackArchiveStoreError> {
+        let network = i64::from(row.network.chain_id());
+        let chain_epoch = i64::try_from(row.rollback_epoch)
+            .map_err(|_| CoordinatorRollbackArchiveStoreError::IntegerOutOfCqlRange)?;
+        let key_domain = i16::try_from(ScyllaKeyDomain::RealmRewardNode.stable_id())
             .map_err(|_| CoordinatorRollbackArchiveStoreError::IntegerOutOfCqlRange)?;
         let participant = row.participant_plan_digest.as_bytes();
         let result = self
@@ -1844,6 +2490,68 @@ impl ScyllaCoordinatorRollbackArchiveStore {
             || row.rollback_epoch != expected.rollback_epoch
             || row.participant_plan_digest != expected.participant_plan_digest
             || row.key_domain != expected.key_domain
+        {
+            return Err(CoordinatorRollbackArchiveStoreError::SelectedRowMismatch);
+        }
+        Ok(Some(row))
+    }
+
+    async fn read_exact_reward_row(
+        &self,
+        expected: &CoordinatorRollbackRealmRewardArchiveRow,
+    ) -> Result<Option<CoordinatorRollbackRealmRewardArchiveRow>, CoordinatorRollbackArchiveStoreError> {
+        let network = i64::from(expected.network.chain_id());
+        let chain_epoch = i64::try_from(expected.rollback_epoch)
+            .map_err(|_| CoordinatorRollbackArchiveStoreError::IntegerOutOfCqlRange)?;
+        let key_domain = i16::try_from(ScyllaKeyDomain::RealmRewardNode.stable_id())
+            .map_err(|_| CoordinatorRollbackArchiveStoreError::IntegerOutOfCqlRange)?;
+        let participant = expected.participant_plan_digest.as_bytes();
+        let rows_result = self
+            .session
+            .execute_unpaged(
+                &self.read_row,
+                (
+                    network,
+                    chain_epoch,
+                    participant.as_slice(),
+                    key_domain,
+                    expected.slot.as_bytes().as_slice(),
+                ),
+            )
+            .await
+            .map_err(cql)?
+            .into_rows_result()
+            .map_err(cql)?;
+        let rows = rows_result
+            .rows::<(
+                Option<i32>,
+                Option<i64>,
+                Option<i32>,
+                Option<i64>,
+                Option<Vec<u8>>,
+                Option<Vec<u8>>,
+                Option<Vec<u8>>,
+            )>()
+            .map_err(cql)?;
+        let mut fragments = Vec::new();
+        for row in rows {
+            let (index, revision, count, row_bytes, payload, payload_digest, row_digest) =
+                row.map_err(cql)?;
+            let index = index.ok_or(CoordinatorRollbackArchiveStoreError::MissingArchiveColumn)?;
+            fragments.push(decode_fragment(
+                index,
+                (revision, count, row_bytes, payload, payload_digest, row_digest),
+            )?);
+        }
+        if fragments.is_empty() {
+            return Ok(None);
+        }
+        let reconstructed = reconstruct_fragments(fragments)?;
+        let row = CoordinatorRollbackRealmRewardArchiveRow::decode_canonical(&reconstructed)?;
+        if row.slot != expected.slot
+            || row.network != expected.network
+            || row.rollback_epoch != expected.rollback_epoch
+            || row.participant_plan_digest != expected.participant_plan_digest
         {
             return Err(CoordinatorRollbackArchiveStoreError::SelectedRowMismatch);
         }
@@ -2086,6 +2794,43 @@ impl fmt::Display for CoordinatorRollbackMappingArchiveRowError {
 
 impl Error for CoordinatorRollbackMappingArchiveRowError {}
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum CoordinatorRollbackRealmRewardArchiveRowError {
+    InvalidMagic,
+    UnknownVersion(u16),
+    Network(String),
+    PlanDigest(CoordinatorRollbackArchivePlanDigestError),
+    ZeroDigest,
+    PlanContractMismatch,
+    NotExactArchivingHead,
+    IdentityMismatch,
+    DomainContractMismatch,
+    SourceOutsideSuffix,
+    WriteAfterOrphanFence {
+        writetime_us: i64,
+        orphan_write_max_us: i64,
+    },
+    MalformedSource(String),
+    NonCanonicalSource,
+    IntegerOutOfCqlRange,
+    LengthOverflow,
+    RowTooLarge { actual: usize, maximum: usize },
+    InvalidFragmentCount(usize),
+    Truncated,
+    DigestMismatch,
+    RowSlotMismatch,
+    TrailingBytes,
+    Decode(String),
+}
+
+impl fmt::Display for CoordinatorRollbackRealmRewardArchiveRowError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "invalid Coordinator reward archive row: {self:?}")
+    }
+}
+
+impl Error for CoordinatorRollbackRealmRewardArchiveRowError {}
+
 impl From<CoordinatorRollbackArchivePlanDigestError>
     for CoordinatorRollbackArchiveRowError
 {
@@ -2107,6 +2852,7 @@ pub(super) enum CoordinatorRollbackArchiveStoreError {
     Cql(String),
     Row(CoordinatorRollbackArchiveRowError),
     MappingRow(CoordinatorRollbackMappingArchiveRowError),
+    RewardRow(CoordinatorRollbackRealmRewardArchiveRowError),
     CanonicalHead(String),
     CanonicalHeadChanged,
     NotExactArchivingHead,
@@ -2146,6 +2892,14 @@ impl From<CoordinatorRollbackMappingArchiveRowError>
 {
     fn from(value: CoordinatorRollbackMappingArchiveRowError) -> Self {
         Self::MappingRow(value)
+    }
+}
+
+impl From<CoordinatorRollbackRealmRewardArchiveRowError>
+    for CoordinatorRollbackArchiveStoreError
+{
+    fn from(value: CoordinatorRollbackRealmRewardArchiveRowError) -> Self {
+        Self::RewardRow(value)
     }
 }
 
@@ -2216,14 +2970,20 @@ impl<'a> Decoder<'a> {
 mod tests {
     use parth_core::PHash;
     use psy_data::protocol::canonical_chain::{
-        CheckpointHash, CheckpointId, CheckpointRef,
+        CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId,
+        CheckpointRef,
     };
     use psy_node_core::store::{
-        rollback_control::{RollbackExecutionMode, RollbackPlanDigest, RollbackRequest},
+        canonical_head::StoredCanonicalHead,
+        rollback_control::{
+            RollbackControlState, RollbackExecutionMode, RollbackPlanDigest,
+            RollbackRequest,
+        },
         timestamp::{CommitWriteTimestampUs, TimestampFenceWindow},
     };
 
     use super::*;
+    use super::super::coordinator_rollback_realm_reward_catalog::qualification_verified_reward_row;
 
     fn checkpoint(height: u64, seed: u64) -> CheckpointRef<PHash> {
         CheckpointRef::new(
@@ -2255,6 +3015,31 @@ mod tests {
         )
     }
 
+    fn archiving_head(plan: &CoordinatorRollbackArchivePlan<PHash>) -> StoredCanonicalHead<PHash> {
+        let network = NetworkId::try_from_chain_id(1).unwrap();
+        let canonical = CanonicalChainRef::new(
+            network,
+            ChainEpoch::new(7),
+            *plan.request().requested_head(),
+        );
+        StoredCanonicalHead::decode_persisted(
+            network,
+            4,
+            &canonical.to_canonical_bytes(),
+            &RollbackControlState::Archiving(*plan.request()).to_canonical_bytes(),
+        )
+        .unwrap()
+    }
+
+    fn compressed_node(level: u8, index: u64) -> Vec<u8> {
+        compression::compress(
+            &SimpleMerkleNodeKey::new(level, index)
+                .psy_ser_to_bytes_vec()
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
     fn row(value: Vec<u8>) -> CoordinatorRollbackCheckpointKivArchiveRow {
         CoordinatorRollbackCheckpointKivArchiveRow::try_checkpoint_zk_proof(
             NetworkId::try_from_chain_id(1).unwrap(),
@@ -2281,6 +3066,134 @@ mod tests {
             first
         );
         assert_eq!(first.fragments().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn reward_archive_roundtrip_binds_mapping_and_physical_source_key() {
+        let plan = plan();
+        let head = archiving_head(&plan);
+        let first_source = qualification_verified_reward_row(
+            NetworkId::try_from_chain_id(1).unwrap(),
+            7,
+            6,
+            95,
+            3,
+            105,
+            compressed_node(4, 8),
+            999,
+        );
+        let first = CoordinatorRollbackRealmRewardArchiveRow::try_from_verified(
+            head,
+            &plan,
+            &first_source,
+        )
+        .unwrap();
+        assert_eq!(
+            CoordinatorRollbackRealmRewardArchiveRow::decode_canonical(
+                first.canonical_bytes(),
+            )
+            .unwrap(),
+            first,
+        );
+        assert_eq!(qualification_reconstruct_reward_archive_row(&first).unwrap(), first);
+
+        let changed_source = qualification_verified_reward_row(
+            NetworkId::try_from_chain_id(1).unwrap(),
+            7,
+            6,
+            95,
+            3,
+            105,
+            compressed_node(4, 9),
+            999,
+        );
+        let changed = CoordinatorRollbackRealmRewardArchiveRow::try_from_verified(
+            head,
+            &plan,
+            &changed_source,
+        )
+        .unwrap();
+        assert_eq!(first.slot(), changed.slot());
+        assert_ne!(first.digest(), changed.digest());
+
+        let other_key_source = qualification_verified_reward_row(
+            NetworkId::try_from_chain_id(1).unwrap(),
+            7,
+            6,
+            95,
+            4,
+            105,
+            compressed_node(4, 8),
+            999,
+        );
+        let other_key = CoordinatorRollbackRealmRewardArchiveRow::try_from_verified(
+            head,
+            &plan,
+            &other_key_source,
+        )
+        .unwrap();
+        assert_ne!(first.slot(), other_key.slot());
+
+        let mut forged = first.canonical_bytes().to_vec();
+        let slot_start = forged.len() - 64;
+        forged[slot_start] ^= 0x80;
+        let digest = reward_row_digest(&forged[..forged.len() - 32]);
+        let digest_start = forged.len() - 32;
+        forged[digest_start..].copy_from_slice(digest.as_bytes());
+        assert_eq!(
+            CoordinatorRollbackRealmRewardArchiveRow::decode_canonical(&forged),
+            Err(CoordinatorRollbackRealmRewardArchiveRowError::RowSlotMismatch),
+        );
+    }
+
+    #[test]
+    fn reward_archive_rejects_wrong_epoch_suffix_fence_and_malformed_value() {
+        let plan = plan();
+        let head = archiving_head(&plan);
+        let make = |rollback_epoch, checkpoint, writetime, value| {
+            qualification_verified_reward_row(
+                NetworkId::try_from_chain_id(1).unwrap(),
+                rollback_epoch,
+                rollback_epoch - 1,
+                checkpoint,
+                3,
+                105,
+                value,
+                writetime,
+            )
+        };
+        assert_eq!(
+            CoordinatorRollbackRealmRewardArchiveRow::try_from_verified(
+                head,
+                &plan,
+                &make(8, 95, 999, compressed_node(4, 8)),
+            ),
+            Err(CoordinatorRollbackRealmRewardArchiveRowError::IdentityMismatch),
+        );
+        assert_eq!(
+            CoordinatorRollbackRealmRewardArchiveRow::try_from_verified(
+                head,
+                &plan,
+                &make(7, 90, 999, compressed_node(4, 8)),
+            ),
+            Err(CoordinatorRollbackRealmRewardArchiveRowError::IdentityMismatch),
+        );
+        assert!(matches!(
+            CoordinatorRollbackRealmRewardArchiveRow::try_from_verified(
+                head,
+                &plan,
+                &make(7, 95, 1_001, compressed_node(4, 8)),
+            ),
+            Err(CoordinatorRollbackRealmRewardArchiveRowError::WriteAfterOrphanFence { .. })
+        ));
+        assert!(matches!(
+            CoordinatorRollbackRealmRewardArchiveRow::try_from_verified(
+                head,
+                &plan,
+                &make(7, 95, 999, b"not-zstd".to_vec()),
+            ),
+            Err(CoordinatorRollbackRealmRewardArchiveRowError::MalformedSource(_))
+        ));
     }
 
     #[test]
