@@ -151,6 +151,14 @@ impl RealmFullCommitExecutionSchedule {
 
     pub(crate) fn rows(&self) -> &[RealmFullCommitExpectedRow] { &self.rows }
 
+    pub(crate) const fn coverage_digest(&self) -> &[u8; 32] {
+        &self.coverage_digest
+    }
+
+    pub(crate) const fn narrow_prepared_digest(&self) -> &[u8; 32] {
+        &self.narrow_prepared_digest
+    }
+
     /// Classify exact point reads before sending any mutation. Missing rows
     /// and rows below the sealed timestamp are safe to retry; a row at the
     /// same timestamp with different content, or any newer row, is a conflict.

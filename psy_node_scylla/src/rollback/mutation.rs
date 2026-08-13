@@ -157,6 +157,23 @@ impl ResolvedScyllaMutation {
     }
 
     pub(crate) fn decode_canonical(bytes: &[u8]) -> Result<Self, MutationDecodeError> {
+        Self::decode_canonical_inner(bytes, false)
+    }
+
+    /// Decode an already-committed Realm inventory row. This narrow read-only
+    /// path admits the checkpoint-axis global-user proof whose generic writer
+    /// registry remains blocked: producing that row still requires the h22
+    /// cutover-fenced builder.
+    pub(super) fn decode_realm_commit_inventory_canonical(
+        bytes: &[u8],
+    ) -> Result<Self, MutationDecodeError> {
+        Self::decode_canonical_inner(bytes, true)
+    }
+
+    fn decode_canonical_inner(
+        bytes: &[u8],
+        allow_committed_realm_global_user_proof: bool,
+    ) -> Result<Self, MutationDecodeError> {
         let mut cursor = MutationCursor::new(bytes);
         if cursor.take(4)? != b"PSRM" {
             return Err(MutationDecodeError::InvalidEncoding("bad mutation magic"));
@@ -166,7 +183,13 @@ impl ResolvedScyllaMutation {
         }
         let locator = cursor.bytes()?;
         let resolved = decode_locator_canonical(locator).map_err(MutationDecodeError::InvalidLocator)?;
-        let ready = resolve_key_for_rollback(resolved.typed_key())?;
+        let ready = if allow_committed_realm_global_user_proof
+            && resolved.key_domain() == ScyllaKeyDomain::CheckpointedGlobalUserProof
+        {
+            resolved
+        } else {
+            resolve_key_for_rollback(resolved.typed_key())?
+        };
         if ready.locator_bytes() != locator {
             return Err(MutationDecodeError::InvalidEncoding("ready locator differs from encoded locator"));
         }

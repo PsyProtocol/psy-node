@@ -938,6 +938,12 @@ pub(crate) mod tests {
         .expect("qualification no-state full plan must remain valid")
     }
 
+    pub(crate) fn qualification_prepared(
+        timestamp: CommitWriteTimestampUs,
+    ) -> BranchExactWriterPrepared<Hash> {
+        prepared(timestamp)
+    }
+
     fn state_without_imt_plan(
         timestamp: CommitWriteTimestampUs,
     ) -> (BranchExactWriterPrepared<Hash>, RealmFullCommitPhysicalPlan) {

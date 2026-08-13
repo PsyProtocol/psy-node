@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     BranchExactWriterPrepared, MutationBuildError, ResolvedScyllaMutation,
+    MutationDecodeError,
     build_realm_global_user_proof_after_cutover, expand_logical_mutation,
 };
 
@@ -53,6 +54,8 @@ pub enum TimestampedMutationError {
     RetryTimestampChanged { sealed: i64, attempted: i64 },
     RetryWriteKindChanged { sealed: TimestampedWriteKind, attempted: TimestampedWriteKind },
     RetryMutationChanged,
+    InvalidResolvedMutation(MutationDecodeError),
+    InvalidEncoding(&'static str),
 }
 
 impl fmt::Display for TimestampedMutationError {
@@ -71,6 +74,10 @@ impl fmt::Display for TimestampedMutationError {
                 write!(f, "retry attempted to replace sealed write kind {sealed:?} with {attempted:?}")
             }
             Self::RetryMutationChanged => write!(f, "retry mutation differs from the sealed mutation"),
+            Self::InvalidResolvedMutation(error) => {
+                write!(f, "invalid resolved mutation: {error}")
+            }
+            Self::InvalidEncoding(reason) => write!(f, "invalid timestamped mutation encoding: {reason}"),
         }
     }
 }
@@ -171,6 +178,77 @@ impl SealedTimestampedPut {
 
     pub fn canonical_bytes(&self) -> &[u8] {
         &self.canonical_bytes
+    }
+
+    /// Strictly reconstruct a persisted timestamped PUT. The decoder
+    /// re-resolves the physical locator and recomputes every digest rather
+    /// than trusting fields from the frame.
+    pub(crate) fn decode_canonical(
+        bytes: &[u8],
+    ) -> Result<Self, TimestampedMutationError> {
+        Self::decode_canonical_inner(bytes, false)
+    }
+
+    /// Strictly decode a row from a committed Realm inventory. The only
+    /// additional accepted locator is the historical mixed-axis global-user
+    /// proof; this remains a read-only decoder and does not bypass its
+    /// cutover-fenced production writer.
+    pub(super) fn decode_realm_commit_inventory_canonical(
+        bytes: &[u8],
+    ) -> Result<Self, TimestampedMutationError> {
+        Self::decode_canonical_inner(bytes, true)
+    }
+
+    fn decode_canonical_inner(
+        bytes: &[u8],
+        allow_committed_realm_global_user_proof: bool,
+    ) -> Result<Self, TimestampedMutationError> {
+        let minimum = 4 + 2 + 1 + 8 + 4;
+        if bytes.len() < minimum || &bytes[..4] != b"PSTP" {
+            return Err(TimestampedMutationError::InvalidEncoding("bad magic or truncated frame"));
+        }
+        let version = u16::from_be_bytes(
+            bytes[4..6]
+                .try_into()
+                .expect("timestamped version has fixed width"),
+        );
+        if version != TIMESTAMPED_PUT_CODEC_VERSION {
+            return Err(TimestampedMutationError::InvalidEncoding("unknown version"));
+        }
+        let write_kind = match bytes[6] {
+            1 => TimestampedWriteKind::AuthorityCommit,
+            2 => TimestampedWriteKind::NewBranchAfterFence,
+            _ => return Err(TimestampedMutationError::InvalidEncoding("unknown write kind")),
+        };
+        let timestamp = i64::from_be_bytes(
+            bytes[7..15]
+                .try_into()
+                .expect("timestamp has fixed width"),
+        );
+        let timestamp = CommitWriteTimestampUs::try_from_i128(i128::from(timestamp))
+            .map_err(|_| TimestampedMutationError::InvalidEncoding("timestamp out of range"))?;
+        let resolved_len = u32::from_be_bytes(
+            bytes[15..19]
+                .try_into()
+                .expect("resolved length has fixed width"),
+        ) as usize;
+        let expected_len = minimum
+            .checked_add(resolved_len)
+            .ok_or(TimestampedMutationError::InvalidEncoding("length overflow"))?;
+        if bytes.len() != expected_len {
+            return Err(TimestampedMutationError::InvalidEncoding("truncated or trailing bytes"));
+        }
+        let resolved = if allow_committed_realm_global_user_proof {
+            ResolvedScyllaMutation::decode_realm_commit_inventory_canonical(&bytes[19..])
+        } else {
+            ResolvedScyllaMutation::decode_canonical(&bytes[19..])
+        }
+        .map_err(TimestampedMutationError::InvalidResolvedMutation)?;
+        let decoded = seal_resolved(resolved, timestamp, write_kind)?;
+        if decoded.canonical_bytes != bytes {
+            return Err(TimestampedMutationError::InvalidEncoding("non-canonical frame"));
+        }
+        Ok(decoded)
     }
 
     /// Checks a retry without changing the original seal. The retry must use
