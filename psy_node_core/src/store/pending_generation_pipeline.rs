@@ -446,6 +446,101 @@ impl<Hash: Q256BitHash> StoredPendingPipeline<Hash> {
         seal(self, candidate, PendingPipelineTransitionKind::Rotate)
     }
 
+    /// Reset the two-slot pipeline after an in-place rollback has restored an
+    /// older committed frontier.
+    ///
+    /// This is intentionally crate-private. A storage-owned rollback
+    /// finalizer must first prove the global delete barrier, the exact target
+    /// committed marker, and two durable counter allocations. Old pending/proc
+    /// identities are never reused: both new slots must be strictly newer than
+    /// the abandoned gathering slot.
+    pub(crate) fn seal_rollback_reset(
+        &self,
+        processing: ReservedPendingGeneration,
+        gathering: ReservedPendingGeneration,
+        restored_frontier: AuthorityObservation<Hash>,
+        target_processed_pending_id: u64,
+    ) -> Result<SealedPendingPipelineTransition<Hash>, PendingPipelineError> {
+        self.require_unblocked()?;
+        if !matches!(
+            self.phase(),
+            PendingProcessingPhase::Published | PendingProcessingPhase::RetiredNoWork
+        ) {
+            return Err(PendingPipelineError::RollbackSourceNotTerminal(self.phase()));
+        }
+        if restored_frontier.chain().network_id() != self.key.network()
+            || restored_frontier.authority() != self.key.authority()
+        {
+            return Err(PendingPipelineError::FrontierAuthorityMismatch);
+        }
+        let source_epoch = self.frontier.chain().chain_epoch().get();
+        let next_epoch = source_epoch
+            .checked_add(1)
+            .ok_or(PendingPipelineError::RollbackEpochOverflow(source_epoch))?;
+        if restored_frontier.chain().chain_epoch().get() != next_epoch {
+            return Err(PendingPipelineError::RollbackEpochNotNext {
+                expected: next_epoch,
+                proposed: restored_frontier.chain().chain_epoch().get(),
+            });
+        }
+        let source_checkpoint = self.frontier.chain().checkpoint().checkpoint_id().get();
+        let target_checkpoint = restored_frontier
+            .chain()
+            .checkpoint()
+            .checkpoint_id()
+            .get();
+        if target_checkpoint >= source_checkpoint {
+            return Err(PendingPipelineError::RollbackTargetNotBeforeCurrent {
+                current: source_checkpoint,
+                target: target_checkpoint,
+            });
+        }
+        if target_processed_pending_id > self.processed_pending_id {
+            return Err(PendingPipelineError::RollbackProcessedPendingAdvanced {
+                current: self.processed_pending_id,
+                target: target_processed_pending_id,
+            });
+        }
+        let processing = PendingGenerationContext::try_from_legacy(
+            processing.pending_id().get(),
+            processing.proc_checkpoint_id().as_u128(),
+        )
+        .map_err(|error| PendingPipelineError::InvalidContext(error.to_string()))?;
+        let gathering = PendingGenerationContext::try_from_legacy(
+            gathering.pending_id().get(),
+            gathering.proc_checkpoint_id().as_u128(),
+        )
+        .map_err(|error| PendingPipelineError::InvalidContext(error.to_string()))?;
+        if processing.pending_id().get() <= self.gathering.pending_id().get() {
+            return Err(PendingPipelineError::RollbackProcessingNotFresh {
+                abandoned_gathering: self.gathering.pending_id().get(),
+                candidate: processing.pending_id().get(),
+            });
+        }
+        if gathering.pending_id().get() <= processing.pending_id().get() {
+            return Err(PendingPipelineError::RollbackGatheringNotAfterProcessing {
+                processing: processing.pending_id().get(),
+                gathering: gathering.pending_id().get(),
+            });
+        }
+        if processing.proc_checkpoint_id()
+            != self.proc_namespace_prefix.derive_proc_id(processing.pending_id())
+            || gathering.proc_checkpoint_id()
+                != self.proc_namespace_prefix.derive_proc_id(gathering.pending_id())
+        {
+            return Err(PendingPipelineError::ProcNamespacePrefixMismatch);
+        }
+        let mut candidate = self.clone();
+        candidate.revision = self.revision.next()?;
+        candidate.processing = processing;
+        candidate.gathering = gathering;
+        candidate.processing_state = PendingProcessingState::Ready;
+        candidate.blocked_reason = None;
+        candidate.frontier = restored_frontier;
+        candidate.processed_pending_id = target_processed_pending_id;
+        seal(self, candidate, PendingPipelineTransitionKind::RollbackReset)
+    }
+
     /// Fill the empty gathering slot once at genesis without turning the zero
     /// processing sentinel into runnable work. Normal rotation is used after
     /// the second reservation exists.
@@ -787,6 +882,7 @@ pub enum PendingPipelineTransitionKind {
     Publish = 8,
     Block = 9,
     RetireDeferredWork = 10,
+    RollbackReset = 11,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1155,6 +1251,13 @@ pub enum PendingPipelineError {
     AlreadyBlocked,
     PipelineBlocked,
     CounterBehindLedger { counter: u64, gathering: u64 },
+    RollbackSourceNotTerminal(PendingProcessingPhase),
+    RollbackEpochOverflow(u64),
+    RollbackEpochNotNext { expected: u64, proposed: u64 },
+    RollbackTargetNotBeforeCurrent { current: u64, target: u64 },
+    RollbackProcessedPendingAdvanced { current: u64, target: u64 },
+    RollbackProcessingNotFresh { abandoned_gathering: u64, candidate: u64 },
+    RollbackGatheringNotAfterProcessing { processing: u64, gathering: u64 },
 }
 
 impl fmt::Display for PendingPipelineError {
@@ -1455,6 +1558,90 @@ mod tests {
                 *captured.frontier(),
             ),
             Err(PendingPipelineError::WorkCaptureMismatch),
+        ));
+    }
+
+    #[test]
+    fn rollback_reset_rewinds_frontier_but_allocates_two_fresh_generations() {
+        let ready = bootstrap()
+            .candidate()
+            .seal_rotation(
+                ReservedPendingGeneration::try_from_prefix(12, prefix()).unwrap(),
+            )
+            .unwrap()
+            .candidate()
+            .clone();
+        let captured = capture_work(&ready, 1, 2);
+        let published = captured
+            .seal_begin_processing(capture(2), intent(3))
+            .unwrap()
+            .candidate()
+            .seal_publish(intent(3), publish(4), observation(14, 14, 140))
+            .unwrap()
+            .candidate()
+            .clone();
+        let restored = observation_custom(key().authority(), 1, 8, 8, 8, 80);
+        let sealed = published
+            .seal_rollback_reset(
+                ReservedPendingGeneration::try_from_prefix(20, prefix()).unwrap(),
+                ReservedPendingGeneration::try_from_prefix(21, prefix()).unwrap(),
+                restored,
+                8,
+            )
+            .unwrap();
+
+        assert_eq!(sealed.kind(), PendingPipelineTransitionKind::RollbackReset);
+        assert_eq!(sealed.candidate().revision().get(), published.revision().get() + 1);
+        assert_eq!(sealed.candidate().processing(), context(20));
+        assert_eq!(sealed.candidate().gathering(), context(21));
+        assert_eq!(sealed.candidate().phase(), PendingProcessingPhase::Ready);
+        assert_eq!(sealed.candidate().frontier(), &restored);
+        assert_eq!(sealed.candidate().processed_pending_id(), 8);
+
+        assert!(matches!(
+            ready.seal_rollback_reset(
+                ReservedPendingGeneration::try_from_prefix(20, prefix()).unwrap(),
+                ReservedPendingGeneration::try_from_prefix(21, prefix()).unwrap(),
+                restored,
+                8,
+            ),
+            Err(PendingPipelineError::RollbackSourceNotTerminal(_))
+        ));
+        assert!(matches!(
+            published.seal_rollback_reset(
+                ReservedPendingGeneration::try_from_prefix(12, prefix()).unwrap(),
+                ReservedPendingGeneration::try_from_prefix(21, prefix()).unwrap(),
+                restored,
+                8,
+            ),
+            Err(PendingPipelineError::RollbackProcessingNotFresh { .. })
+        ));
+        assert!(matches!(
+            published.seal_rollback_reset(
+                ReservedPendingGeneration::try_from_prefix(20, prefix()).unwrap(),
+                ReservedPendingGeneration::try_from_prefix(20, prefix()).unwrap(),
+                restored,
+                8,
+            ),
+            Err(PendingPipelineError::RollbackGatheringNotAfterProcessing { .. })
+        ));
+        assert!(matches!(
+            published.seal_rollback_reset(
+                ReservedPendingGeneration::try_from_prefix(20, prefix()).unwrap(),
+                ReservedPendingGeneration::try_from_prefix(21, prefix()).unwrap(),
+                observation_custom(key().authority(), 0, 8, 8, 8, 80),
+                8,
+            ),
+            Err(PendingPipelineError::RollbackEpochNotNext { .. })
+        ));
+        assert!(matches!(
+            published.seal_rollback_reset(
+                ReservedPendingGeneration::try_from_prefix(20, prefix()).unwrap(),
+                ReservedPendingGeneration::try_from_prefix(21, prefix()).unwrap(),
+                restored,
+                10,
+            ),
+            Err(PendingPipelineError::RollbackProcessedPendingAdvanced { .. })
         ));
     }
 

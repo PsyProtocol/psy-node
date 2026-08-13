@@ -2,8 +2,10 @@
 //!
 //! The payload is one indivisible value: materialized authority observation,
 //! commit timestamp, manifest reference and active storage binding. A normal
-//! commit may only advance it from a verified SEALED manifest. Rollback and
-//! namespace-cutover transitions deliberately remain unavailable here.
+//! commit may only advance it from a verified SEALED manifest. Rollback target
+//! restoration is a separate, strict transition: it consumes an exact
+//! historical head, opens the next chain epoch, and advances the write-time
+//! fence without exposing an arbitrary rewind constructor.
 
 use std::{error::Error, fmt};
 
@@ -11,6 +13,7 @@ use parth_core::protocol::core_types::Q256BitHash;
 use psy_data::protocol::chain_context::{
     AuthorityObservation, ChainContextCodecError, AUTHORITY_OBSERVATION_V1_LEN,
 };
+use psy_data::protocol::canonical_chain::{CanonicalChainRef, ChainEpoch};
 #[cfg(feature = "rf3-test-support")]
 use sha2::{Digest, Sha256};
 
@@ -454,6 +457,91 @@ impl<Hash: Q256BitHash> SealedAuthorityLocalHeadCas<Hash> {
         })
     }
 
+    /// Restore one Realm-local head from an exact historical committed row.
+    ///
+    /// The caller must be the storage-owned rollback finalizer which has
+    /// revalidated the global delete barrier and the historical committed
+    /// marker. This constructor only accepts the immediately next chain epoch,
+    /// a strictly older target checkpoint, an unchanged storage binding, and a
+    /// write timestamp above the abandoned branch.
+    pub(crate) fn seal_rollback_restore(
+        expected: StoredAuthorityLocalHead<Hash>,
+        target: &StoredAuthorityLocalHead<Hash>,
+        rollback_epoch: ChainEpoch,
+        commit_write_timestamp: CommitWriteTimestampUs,
+    ) -> Result<Self, AuthorityLocalHeadModelError> {
+        let key = expected.head.key();
+        if target.head.key() != key {
+            return Err(AuthorityLocalHeadModelError::RollbackTargetAuthorityMismatch);
+        }
+        if target.storage_binding != expected.storage_binding {
+            return Err(AuthorityLocalHeadModelError::RollbackTargetStorageBindingMismatch);
+        }
+        if target.bootstrap_reason != expected.bootstrap_reason {
+            return Err(AuthorityLocalHeadModelError::RollbackTargetBootstrapMismatch);
+        }
+        let expected_epoch = expected.head.chain().chain_epoch().get();
+        if target.head.chain().chain_epoch().get() != expected_epoch {
+            return Err(AuthorityLocalHeadModelError::RollbackTargetEpochMismatch {
+                expected: expected_epoch,
+                target: target.head.chain().chain_epoch().get(),
+            });
+        }
+        let next_epoch = expected_epoch
+            .checked_add(1)
+            .ok_or(AuthorityLocalHeadModelError::RollbackEpochOverflow(expected_epoch))?;
+        if rollback_epoch.get() != next_epoch {
+            return Err(AuthorityLocalHeadModelError::RollbackEpochNotNext {
+                expected: next_epoch,
+                proposed: rollback_epoch.get(),
+            });
+        }
+        let current_checkpoint = expected.head.chain().checkpoint().checkpoint_id().get();
+        let target_checkpoint = target.head.chain().checkpoint().checkpoint_id().get();
+        if target_checkpoint >= current_checkpoint {
+            return Err(AuthorityLocalHeadModelError::RollbackTargetNotBeforeCurrent {
+                current: current_checkpoint,
+                target: target_checkpoint,
+            });
+        }
+        if target.commit_write_timestamp.as_i64() > expected.commit_write_timestamp.as_i64() {
+            return Err(AuthorityLocalHeadModelError::RollbackTargetTimestampAfterCurrent);
+        }
+        if commit_write_timestamp.as_i64() <= expected.commit_write_timestamp.as_i64() {
+            return Err(AuthorityLocalHeadModelError::TimestampDidNotAdvance {
+                previous: expected.commit_write_timestamp.as_i64(),
+                candidate: commit_write_timestamp.as_i64(),
+            });
+        }
+        let restored_chain = CanonicalChainRef::new(
+            key.network(),
+            rollback_epoch,
+            *target.head.chain().checkpoint(),
+        );
+        let restored_head = AuthorityHeadView::try_from_observed(
+            key,
+            restored_chain,
+            target.head.state_checkpoint(),
+            *target.head.state_root(),
+        )?;
+        let manifest_digest = AuthorityHeadManifestDigest::try_from_verified_full_commit(
+            *target.manifest_digest.as_bytes(),
+        )?;
+        let candidate = StoredAuthorityLocalHead {
+            revision: expected.revision.checked_next()?,
+            bootstrap_reason: expected.bootstrap_reason,
+            head: restored_head,
+            commit_write_timestamp,
+            manifest_digest,
+            storage_binding: expected.storage_binding,
+        };
+        Ok(Self {
+            key,
+            expected,
+            candidate,
+        })
+    }
+
     /// Qualification-only bridge for RF=3 compositions that exercise a
     /// later production-shaped reader without pretending that the writer,
     /// manifest, or proof chain has already been integrated.
@@ -590,6 +678,14 @@ pub enum AuthorityLocalHeadModelError {
     ExpectedHeadMismatch,
     AuthorityChanged,
     TimestampDidNotAdvance { previous: i64, candidate: i64 },
+    RollbackTargetAuthorityMismatch,
+    RollbackTargetStorageBindingMismatch,
+    RollbackTargetBootstrapMismatch,
+    RollbackTargetEpochMismatch { expected: u64, target: u64 },
+    RollbackEpochOverflow(u64),
+    RollbackEpochNotNext { expected: u64, proposed: u64 },
+    RollbackTargetNotBeforeCurrent { current: u64, target: u64 },
+    RollbackTargetTimestampAfterCurrent,
     AppliedStateMismatch,
 }
 
@@ -677,6 +773,25 @@ mod tests {
 
     fn expected_head() -> StoredAuthorityLocalHead<PHash> {
         let observation = observation(10, 9, 20);
+        stored_head(
+            observation,
+            100,
+            [3; 32],
+            AuthorityStorageBindingRef::new(
+                AuthorityStorageBindingGeneration::try_new(4).unwrap(),
+                AuthorityStorageNamespaceId::from_verified_namespace_id([
+                    5; 32
+                ]),
+            ),
+        )
+    }
+
+    fn stored_head(
+        observation: AuthorityObservation<PHash>,
+        timestamp: i128,
+        manifest_digest: [u8; 32],
+        storage_binding: AuthorityStorageBindingRef,
+    ) -> StoredAuthorityLocalHead<PHash> {
         let key = AuthorityTimestampKey::new(
             observation.chain().network_id(),
             observation.authority(),
@@ -690,14 +805,9 @@ mod tests {
                 *observation.state_root(),
             )
             .unwrap(),
-            CommitWriteTimestampUs::try_from_i128(100).unwrap(),
-            AuthorityManifestDigest::from_persisted([3; 32]),
-            AuthorityStorageBindingRef::new(
-                AuthorityStorageBindingGeneration::try_new(4).unwrap(),
-                AuthorityStorageNamespaceId::from_verified_namespace_id([
-                    5; 32
-                ]),
-            ),
+            CommitWriteTimestampUs::try_from_i128(timestamp).unwrap(),
+            AuthorityManifestDigest::from_persisted(manifest_digest),
+            storage_binding,
         )
         .candidate()
         .clone()
@@ -740,5 +850,95 @@ mod tests {
             ),
             Err(AuthorityLocalHeadModelError::ZeroManifestDigest)
         ));
+    }
+
+    #[test]
+    fn rollback_restore_uses_exact_historical_head_new_epoch_and_timestamp_fence() {
+        let expected = expected_head();
+        let target = stored_head(
+            observation(7, 6, 70),
+            70,
+            [8; 32],
+            expected.storage_binding(),
+        );
+        let sealed = SealedAuthorityLocalHeadCas::seal_rollback_restore(
+            expected.clone(),
+            &target,
+            ChainEpoch::new(3),
+            CommitWriteTimestampUs::try_from_i128(101).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(sealed.candidate().revision().get(), 1);
+        assert_eq!(sealed.candidate().head().chain().chain_epoch().get(), 3);
+        assert_eq!(
+            sealed.candidate().head().chain().checkpoint(),
+            target.head().chain().checkpoint()
+        );
+        assert_eq!(
+            sealed.candidate().head().state_checkpoint(),
+            target.head().state_checkpoint()
+        );
+        assert_eq!(
+            sealed.candidate().head().state_root(),
+            target.head().state_root()
+        );
+        assert_eq!(sealed.candidate().manifest_digest(), target.manifest_digest());
+        assert_eq!(sealed.candidate().storage_binding(), expected.storage_binding());
+        assert_eq!(sealed.candidate().commit_write_timestamp().as_i64(), 101);
+
+        assert!(matches!(
+            SealedAuthorityLocalHeadCas::seal_rollback_restore(
+                expected.clone(),
+                &target,
+                ChainEpoch::new(2),
+                CommitWriteTimestampUs::try_from_i128(101).unwrap(),
+            ),
+            Err(AuthorityLocalHeadModelError::RollbackEpochNotNext { .. })
+        ));
+        assert!(matches!(
+            SealedAuthorityLocalHeadCas::seal_rollback_restore(
+                expected.clone(),
+                &target,
+                ChainEpoch::new(3),
+                CommitWriteTimestampUs::try_from_i128(100).unwrap(),
+            ),
+            Err(AuthorityLocalHeadModelError::TimestampDidNotAdvance { .. })
+        ));
+
+        let same_height = stored_head(
+            observation(10, 9, 90),
+            90,
+            [9; 32],
+            expected.storage_binding(),
+        );
+        assert!(matches!(
+            SealedAuthorityLocalHeadCas::seal_rollback_restore(
+                expected.clone(),
+                &same_height,
+                ChainEpoch::new(3),
+                CommitWriteTimestampUs::try_from_i128(101).unwrap(),
+            ),
+            Err(AuthorityLocalHeadModelError::RollbackTargetNotBeforeCurrent { .. })
+        ));
+
+        let foreign_binding = stored_head(
+            observation(7, 6, 70),
+            70,
+            [8; 32],
+            AuthorityStorageBindingRef::new(
+                AuthorityStorageBindingGeneration::try_new(5).unwrap(),
+                AuthorityStorageNamespaceId::from_verified_namespace_id([6; 32]),
+            ),
+        );
+        assert_eq!(
+            SealedAuthorityLocalHeadCas::seal_rollback_restore(
+                expected,
+                &foreign_binding,
+                ChainEpoch::new(3),
+                CommitWriteTimestampUs::try_from_i128(101).unwrap(),
+            ),
+            Err(AuthorityLocalHeadModelError::RollbackTargetStorageBindingMismatch)
+        );
     }
 }
