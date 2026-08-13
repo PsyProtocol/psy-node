@@ -39,6 +39,7 @@ use super::{
         SelectedRealmRollbackPostBarrierArchive,
     },
     realm_rollback_physical_archive_store::{
+        PersistedRealmRollbackDeleteCompletion,
         RealmRollbackPhysicalArchiveStoreError,
         ScyllaRealmRollbackPhysicalArchiveStore,
     },
@@ -159,6 +160,25 @@ impl ScyllaRealmRollbackDeleteRestoreExecutor {
             archive_owner,
             typed,
         })
+    }
+
+    /// Execute/recover the fixed Realm mutation set, persist its immutable
+    /// participant completion, then run the same storage-selected operation a
+    /// second time as a post-persist fence.  The result still cannot publish a
+    /// Realm or Coordinator head.
+    pub(super) async fn execute_and_persist<Hash: Q256BitHash>(
+        &mut self,
+        authority: &DeletingRollbackGlobalArchiveBarrier<Hash>,
+        participant: RollbackRealmParticipant,
+    ) -> Result<PersistedRealmRollbackDeleteCompletion<Hash>, RealmRollbackDeleteRestoreExecutorError> {
+        let first = self.execute(authority, participant).await?;
+        let receipt = self.archive.persist_delete_completion(&first).await?;
+        let second = self.execute(authority, participant).await?;
+        if first != second {
+            return Err(RealmRollbackDeleteRestoreExecutorError::PostStateChanged);
+        }
+        self.archive.revalidate_delete_completion(&receipt).await?;
+        Ok(receipt)
     }
 
     pub(super) async fn execute<Hash: Q256BitHash>(
@@ -771,6 +791,7 @@ pub(super) enum RealmRollbackDeleteRestoreExecutorError {
     TargetCheckpointOutOfRange,
     IntegerOutOfCqlRange,
     PostStateMismatch,
+    PostStateChanged,
     HeadMissing,
     HeadChanged,
     LocalHeadMissing,

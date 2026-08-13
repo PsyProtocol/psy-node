@@ -33,6 +33,11 @@ use super::{
         RealmRollbackParticipantCompletion,
         RealmRollbackParticipantCompletionError,
     },
+    realm_rollback_delete_completion::{
+        REALM_DELETE_COMPLETION_KEY_DOMAIN, RealmRollbackDeleteCompletion,
+        RealmRollbackDeleteCompletionError,
+    },
+    realm_rollback_delete_restore_executor::ExecutedRealmRollbackSuffix,
 };
 
 const ARCHIVE_REVISION: i64 = 1;
@@ -90,6 +95,18 @@ impl<Hash> PersistedRealmRollbackPhysicalBeforeImage<Hash> {
 pub(super) struct PersistedRealmRollbackParticipantCompletion<Hash> {
     store_fingerprint: [u8; 32],
     completion: RealmRollbackParticipantCompletion<Hash>,
+}
+
+#[derive(Debug)]
+pub(super) struct PersistedRealmRollbackDeleteCompletion<Hash> {
+    store_fingerprint: [u8; 32],
+    completion: RealmRollbackDeleteCompletion<Hash>,
+}
+
+impl<Hash> PersistedRealmRollbackDeleteCompletion<Hash> {
+    pub(super) const fn completion(&self) -> &RealmRollbackDeleteCompletion<Hash> {
+        &self.completion
+    }
 }
 
 impl<Hash> PersistedRealmRollbackParticipantCompletion<Hash> {
@@ -174,6 +191,81 @@ impl ScyllaRealmRollbackPhysicalArchiveStore {
         Ok(PersistedRealmRollbackParticipantCompletion {
             store_fingerprint: self.fingerprint,
             completion: current,
+        })
+    }
+
+    pub(super) async fn persist_delete_completion<Hash: Q256BitHash>(
+        &self,
+        executed: &ExecutedRealmRollbackSuffix<Hash>,
+    ) -> Result<PersistedRealmRollbackDeleteCompletion<Hash>, RealmRollbackPhysicalArchiveStoreError> {
+        let completion = RealmRollbackDeleteCompletion::try_from_executed(
+            executed,
+            self.fingerprint,
+        )?;
+        let coordinates = ArchiveCoordinates::try_from_delete_completion(&completion)?;
+        self.persist_bytes(
+            &coordinates,
+            completion.canonical_bytes(),
+            completion.digest(),
+        ).await?;
+        let current = self.read_delete_completion::<Hash>(&coordinates).await?
+            .ok_or(RealmRollbackPhysicalArchiveStoreError::MissingAfterPersist)?;
+        if current != completion {
+            return Err(RealmRollbackPhysicalArchiveStoreError::Conflict);
+        }
+        Ok(PersistedRealmRollbackDeleteCompletion {
+            store_fingerprint: self.fingerprint,
+            completion: current,
+        })
+    }
+
+    pub(super) async fn revalidate_delete_completion<Hash: Q256BitHash>(
+        &self,
+        receipt: &PersistedRealmRollbackDeleteCompletion<Hash>,
+    ) -> Result<(), RealmRollbackPhysicalArchiveStoreError> {
+        if receipt.store_fingerprint != self.fingerprint {
+            return Err(RealmRollbackPhysicalArchiveStoreError::ReceiptBindingMismatch);
+        }
+        let coordinates = ArchiveCoordinates::try_from_delete_completion(&receipt.completion)?;
+        match self.read_delete_completion::<Hash>(&coordinates).await? {
+            Some(current) if current == receipt.completion => Ok(()),
+            Some(_) => Err(RealmRollbackPhysicalArchiveStoreError::Conflict),
+            None => Err(RealmRollbackPhysicalArchiveStoreError::MissingAfterPersist),
+        }
+    }
+
+    pub(super) async fn read_delete_completion_selected<Hash: Q256BitHash>(
+        &self,
+        network: psy_data::protocol::canonical_chain::NetworkId,
+        old_chain_epoch: u64,
+        authority: psy_data::protocol::chain_context::AuthorityScope,
+        participant_plan_digest: [u8; 32],
+        slot: [u8; 32],
+        digest: [u8; 32],
+    ) -> Result<PersistedRealmRollbackDeleteCompletion<Hash>, RealmRollbackPhysicalArchiveStoreError> {
+        let coordinates = ArchiveCoordinates {
+            network: i64::from(network.chain_id()),
+            chain_epoch: i64::try_from(old_chain_epoch)
+                .map_err(|_| RealmRollbackPhysicalArchiveStoreError::IntegerOutOfCqlRange)?,
+            participant_plan_digest,
+            key_domain: REALM_DELETE_COMPLETION_KEY_DOMAIN,
+            row_slot: slot,
+        };
+        let completion = self.read_delete_completion::<Hash>(&coordinates).await?
+            .ok_or(RealmRollbackPhysicalArchiveStoreError::MissingAfterPersist)?;
+        if completion.network() != network
+            || completion.old_chain_epoch() != old_chain_epoch
+            || completion.authority() != authority
+            || completion.participant_plan_digest() != &participant_plan_digest
+            || completion.slot() != &slot
+            || completion.digest() != &digest
+            || completion.store_fingerprint() != &self.fingerprint
+        {
+            return Err(RealmRollbackPhysicalArchiveStoreError::Conflict);
+        }
+        Ok(PersistedRealmRollbackDeleteCompletion {
+            store_fingerprint: self.fingerprint,
+            completion,
         })
     }
 
@@ -340,6 +432,25 @@ impl ScyllaRealmRollbackPhysicalArchiveStore {
         Ok(Some(completion))
     }
 
+    async fn read_delete_completion<Hash: Q256BitHash>(
+        &self,
+        coordinates: &ArchiveCoordinates,
+    ) -> Result<Option<RealmRollbackDeleteCompletion<Hash>>, RealmRollbackPhysicalArchiveStoreError> {
+        let Some((bytes, row_digest)) = self.read_selected_bytes(coordinates).await? else {
+            return Ok(None);
+        };
+        let completion = RealmRollbackDeleteCompletion::decode_canonical(&bytes)?;
+        if completion.participant_plan_digest() != &coordinates.participant_plan_digest
+            || coordinates.key_domain != REALM_DELETE_COMPLETION_KEY_DOMAIN
+            || completion.slot() != &coordinates.row_slot
+            || completion.digest() != &row_digest
+            || completion.store_fingerprint() != &self.fingerprint
+        {
+            return Err(RealmRollbackPhysicalArchiveStoreError::Conflict);
+        }
+        Ok(Some(completion))
+    }
+
     async fn read_selected_bytes(
         &self,
         coordinates: &ArchiveCoordinates,
@@ -426,6 +537,20 @@ impl ArchiveCoordinates {
                 .map_err(|_| RealmRollbackPhysicalArchiveStoreError::IntegerOutOfCqlRange)?,
             participant_plan_digest: *completion.participant_plan_digest(),
             key_domain: REALM_PARTICIPANT_COMPLETION_KEY_DOMAIN,
+            row_slot: *completion.slot(),
+        })
+    }
+
+
+    fn try_from_delete_completion<Hash: Q256BitHash>(
+        completion: &RealmRollbackDeleteCompletion<Hash>,
+    ) -> Result<Self, RealmRollbackPhysicalArchiveStoreError> {
+        Ok(Self {
+            network: i64::from(completion.network().chain_id()),
+            chain_epoch: i64::try_from(completion.old_chain_epoch())
+                .map_err(|_| RealmRollbackPhysicalArchiveStoreError::IntegerOutOfCqlRange)?,
+            participant_plan_digest: *completion.participant_plan_digest(),
+            key_domain: REALM_DELETE_COMPLETION_KEY_DOMAIN,
             row_slot: *completion.slot(),
         })
     }
@@ -572,6 +697,7 @@ fn cql(error: impl fmt::Display) -> RealmRollbackPhysicalArchiveStoreError {
 pub(super) enum RealmRollbackPhysicalArchiveStoreError {
     BeforeImage(RealmRollbackPhysicalBeforeImageError),
     ParticipantCompletion(RealmRollbackParticipantCompletionError),
+    DeleteCompletion(RealmRollbackDeleteCompletionError),
     Cql(String),
     Conflict,
     Indeterminate(String),
@@ -593,6 +719,9 @@ impl From<RealmRollbackPhysicalBeforeImageError> for RealmRollbackPhysicalArchiv
 }
 impl From<RealmRollbackParticipantCompletionError> for RealmRollbackPhysicalArchiveStoreError {
     fn from(value: RealmRollbackParticipantCompletionError) -> Self { Self::ParticipantCompletion(value) }
+}
+impl From<RealmRollbackDeleteCompletionError> for RealmRollbackPhysicalArchiveStoreError {
+    fn from(value: RealmRollbackDeleteCompletionError) -> Self { Self::DeleteCompletion(value) }
 }
 
 impl fmt::Display for RealmRollbackPhysicalArchiveStoreError {
