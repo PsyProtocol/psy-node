@@ -287,6 +287,64 @@ impl<Hash: Q256BitHash> RealmRollbackPhysicalBeforeImage<Hash> {
     pub(super) const fn digest(&self) -> &[u8; 32] { &self.digest }
     pub(super) fn canonical_bytes(&self) -> &[u8] { &self.canonical_bytes }
 
+    /// Derive the only archive coordinates accepted for one storage-selected
+    /// catalog entry.  This is intentionally usable after PONR, when the hot
+    /// row may already have been deleted and therefore cannot be used to
+    /// reconstruct an expected before-image.
+    pub(super) fn selector_for_catalog_entry(
+        participant_plan_digest: [u8; 32],
+        catalog: &RealmRollbackPhysicalCatalog<Hash>,
+        entry: &RealmRollbackPhysicalCatalogEntry,
+    ) -> Result<(i16, [u8; 32]), RealmRollbackPhysicalBeforeImageError> {
+        let AuthorityScope::Realm { realm_id, realm_sub_id } =
+            catalog.suffix().authority()
+        else {
+            return Err(RealmRollbackPhysicalBeforeImageError::RealmRequired);
+        };
+        Ok((
+            archive_key_domain(entry.key())?,
+            before_image_slot(
+                participant_plan_digest,
+                realm_id,
+                realm_sub_id,
+                entry.key().locator_bytes(),
+            ),
+        ))
+    }
+
+    /// Bind a decoded immutable archive row back to the exact catalog entry
+    /// that selected it.  Source bytes are trusted only after this complete
+    /// identity/action check succeeds.
+    pub(super) fn require_catalog_entry(
+        &self,
+        participant_plan_digest: [u8; 32],
+        catalog: &RealmRollbackPhysicalCatalog<Hash>,
+        entry: &RealmRollbackPhysicalCatalogEntry,
+    ) -> Result<(), RealmRollbackPhysicalBeforeImageError> {
+        let (key_domain, slot) = Self::selector_for_catalog_entry(
+            participant_plan_digest,
+            catalog,
+            entry,
+        )?;
+        if self.participant_plan_digest != participant_plan_digest
+            || self.authority != catalog.suffix().authority()
+            || self.target != *catalog.suffix().target()
+            || self.source_head != *catalog.suffix().source_head()
+            || self.catalog_digest != *catalog.digest()
+            || self.source_index
+                != u64::try_from(entry.source_index())
+                    .map_err(|_| RealmRollbackPhysicalBeforeImageError::LengthOverflow)?
+            || self.action != entry.action()
+            || self.key != *entry.key()
+            || self.target_restore.as_ref() != entry.target_restore()
+            || self.key_domain != key_domain
+            || self.slot != slot
+        {
+            return Err(RealmRollbackPhysicalBeforeImageError::CatalogBindingMismatch);
+        }
+        Ok(())
+    }
+
     fn encode_without_digest(&self) -> Result<Vec<u8>, RealmRollbackPhysicalBeforeImageError> {
         let mut out = Vec::with_capacity(
             256 + self.key.locator_bytes().len()
@@ -537,6 +595,7 @@ pub(super) enum RealmRollbackPhysicalBeforeImageError {
     UnknownTargetKind(u8),
     InvalidMagic,
     DigestOrSlotMismatch,
+    CatalogBindingMismatch,
     NonCanonicalEncoding,
     FieldTooLarge,
     RowTooLarge,

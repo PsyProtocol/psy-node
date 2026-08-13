@@ -73,6 +73,27 @@ pub(super) struct RealmRollbackPhysicalParticipantArchiveReceipt<Hash> {
     archive_store_fingerprint: [u8; 32],
 }
 
+/// Non-Clone post-barrier selection.  It contains only a catalog rebuilt from
+/// immutable commit inventories and an exact durable participant completion;
+/// no hot-row observation is required after PONR.
+#[derive(Debug)]
+pub(super) struct SelectedRealmRollbackPostBarrierArchive<Hash> {
+    catalog: RealmRollbackPhysicalCatalog<Hash>,
+    completion: PersistedRealmRollbackParticipantCompletion<Hash>,
+}
+
+impl<Hash> SelectedRealmRollbackPostBarrierArchive<Hash> {
+    pub(super) const fn catalog(&self) -> &RealmRollbackPhysicalCatalog<Hash> {
+        &self.catalog
+    }
+
+    pub(super) const fn completion(
+        &self,
+    ) -> &PersistedRealmRollbackParticipantCompletion<Hash> {
+        &self.completion
+    }
+}
+
 impl<Hash> RealmRollbackPhysicalParticipantArchiveReceipt<Hash> {
     pub(super) const fn authority(&self) -> AuthorityScope { self.authority }
     pub(super) const fn entry_count(&self) -> u64 { self.entry_count }
@@ -253,6 +274,124 @@ impl ScyllaRealmRollbackPhysicalArchiveOwner {
         }
         self.archive.revalidate_participant_completion(&persisted).await?;
         Ok(persisted)
+    }
+
+    /// Post-PONR restart path.  Unlike `recover_participant_completion`, this
+    /// path never reads a discarded hot row: it rebuilds the catalog from the
+    /// immutable commit inventories, point-selects every before-image, and
+    /// requires the already-published participant completion to match two
+    /// complete archive passes.
+    pub(super) async fn select_post_barrier_archive<Hash: Q256BitHash>(
+        &mut self,
+        network: NetworkId,
+        authority: AuthorityScope,
+        plan: &RollbackParticipantPlan<Hash>,
+    ) -> Result<SelectedRealmRollbackPostBarrierArchive<Hash>, RealmRollbackPhysicalArchiveOwnerError> {
+        let (first_receipt, catalog) = self
+            .select_archived_dataset(network, authority, plan)
+            .await?;
+        let expected = completion_from_receipt(&first_receipt)?;
+        let current = self
+            .archive
+            .read_participant_completion_exact(&expected)
+            .await?
+            .ok_or(RealmRollbackPhysicalArchiveOwnerError::CompletionMissing)?;
+        if current != expected {
+            return Err(RealmRollbackPhysicalArchiveOwnerError::CompletionChanged);
+        }
+        let persisted = PersistedRealmRollbackParticipantCompletion::from_recovered(
+            *self.archive.fingerprint(),
+            current,
+        );
+        let (second_receipt, second_catalog) = self
+            .select_archived_dataset(network, authority, plan)
+            .await?;
+        if second_receipt != first_receipt || second_catalog != catalog {
+            return Err(RealmRollbackPhysicalArchiveOwnerError::DatasetChanged);
+        }
+        self.archive
+            .revalidate_participant_completion(&persisted)
+            .await?;
+        Ok(SelectedRealmRollbackPostBarrierArchive {
+            catalog,
+            completion: persisted,
+        })
+    }
+
+    async fn select_archived_dataset<Hash: Q256BitHash>(
+        &mut self,
+        network: NetworkId,
+        authority: AuthorityScope,
+        plan: &RollbackParticipantPlan<Hash>,
+    ) -> Result<(RealmRollbackPhysicalParticipantArchiveReceipt<Hash>, RealmRollbackPhysicalCatalog<Hash>), RealmRollbackPhysicalArchiveOwnerError> {
+        require_realm_in_plan(network, authority, plan)?;
+        let source_head = self.read_local_head::<Hash>(network, authority).await?;
+        let source_chain = *source_head.head().chain();
+        if source_chain.network_id() != network
+            || source_chain.chain_epoch() != plan.target().chain_epoch()
+            || source_chain.checkpoint().checkpoint_id().get()
+                != plan
+                    .expected_head()
+                    .canonical_ref()
+                    .checkpoint()
+                    .checkpoint_id()
+                    .get()
+        {
+            return Err(RealmRollbackPhysicalArchiveOwnerError::SourceHeadMismatch);
+        }
+        let target_entry = self
+            .inventory
+            .read_committed_height(
+                authority,
+                network,
+                source_chain.chain_epoch(),
+                plan.target().checkpoint().checkpoint_id().get(),
+            )
+            .await
+            .map_err(backend)?;
+        let target_chain = *target_entry.inventory().candidate().canonical_chain();
+        let suffix = self
+            .inventory
+            .scan_committed_suffix(authority, target_chain, source_chain)
+            .await
+            .map_err(backend)?;
+        let catalog = RealmRollbackPhysicalCatalog::try_from_selected(
+            suffix,
+            Some(&target_entry),
+        )?;
+        let entry_count = u64::try_from(catalog.entries().len())
+            .map_err(|_| RealmRollbackPhysicalArchiveOwnerError::LengthOverflow)?;
+        let mut dataset = participant_dataset_hasher(
+            plan.digest(),
+            authority,
+            &source_head,
+            &target_chain.to_canonical_bytes(),
+            catalog.digest(),
+            entry_count,
+            catalog.delete_count(),
+            catalog.restore_count(),
+            self.archive.fingerprint(),
+        );
+        for (index, entry) in catalog.entries().iter().enumerate() {
+            let image = self
+                .archive
+                .read_catalog_image(*plan.digest(), &catalog, entry)
+                .await?;
+            update_dataset(&mut dataset, index, &image)?;
+        }
+        let receipt = RealmRollbackPhysicalParticipantArchiveReceipt {
+            participant_plan_digest: *plan.digest(),
+            authority,
+            source_head,
+            target_chain,
+            catalog_digest: *catalog.digest(),
+            entry_count,
+            delete_count: catalog.delete_count(),
+            restore_count: catalog.restore_count(),
+            dataset_digest: dataset.finalize().into(),
+            archive_store_fingerprint: *self.archive.fingerprint(),
+        };
+        Ok((receipt, catalog))
     }
 
     async fn select_revalidated_archive<Hash: Q256BitHash>(

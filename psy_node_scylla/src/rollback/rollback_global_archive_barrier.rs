@@ -822,6 +822,7 @@ pub(super) struct DeletingRollbackGlobalArchiveBarrier<Hash> {
     barrier: RollbackGlobalArchiveBarrier<Hash>,
     deleting_head: StoredCanonicalHead<Hash>,
     delete_plan: PersistedCoordinatorCommitDeleteRestorePlan<Hash>,
+    participant_plan: RollbackParticipantPlan<Hash>,
 }
 
 impl<Hash> DeletingRollbackGlobalArchiveBarrier<Hash> {
@@ -837,6 +838,10 @@ impl<Hash> DeletingRollbackGlobalArchiveBarrier<Hash> {
         &self,
     ) -> &PersistedCoordinatorCommitDeleteRestorePlan<Hash> {
         &self.delete_plan
+    }
+
+    pub(super) const fn participant_plan(&self) -> &RollbackParticipantPlan<Hash> {
+        &self.participant_plan
     }
 }
 
@@ -1016,6 +1021,9 @@ impl ScyllaRollbackGlobalArchiveBarrierOwner {
         {
             let published = self.publish_or_recover::<F, Hash, Hasher>(network).await?;
             let delete_plan = self.read_delete_plan(published.barrier()).await?;
+            let participant_plan = self
+                .read_participant_plan_for_barrier(published.barrier())
+                .await?;
             let transition = CanonicalHeadTransition::begin_rollback_delete(
                 *published.barrier_ready_head(),
             )
@@ -1042,6 +1050,7 @@ impl ScyllaRollbackGlobalArchiveBarrierOwner {
                 barrier: published.barrier,
                 deleting_head,
                 delete_plan,
+                participant_plan,
             });
         }
         if !matches!(current.rollback_control(), RollbackControlState::Deleting(_)) {
@@ -1109,7 +1118,33 @@ impl ScyllaRollbackGlobalArchiveBarrierOwner {
             barrier: receipt.barrier,
             deleting_head: current,
             delete_plan,
+            participant_plan: plan,
         })
+    }
+
+    async fn read_participant_plan_for_barrier<Hash: Q256BitHash>(
+        &self,
+        barrier: &RollbackGlobalArchiveBarrier<Hash>,
+    ) -> Result<RollbackParticipantPlan<Hash>, RollbackGlobalArchiveBarrierError> {
+        let plan = self
+            .participant_plans
+            .read_participant_plan(
+                barrier.target().network_id(),
+                barrier.participant_plan_digest(),
+            )
+            .await
+            .map_err(backend)?;
+        if plan.digest() != barrier.participant_plan_digest()
+            || plan.target() != barrier.target()
+            || plan.topology_revision() != barrier.topology_revision()
+            || plan.topology_digest() != barrier.topology_digest()
+            || u64::try_from(plan.participant_count())
+                .map_err(|_| RollbackGlobalArchiveBarrierError::LengthOverflow)?
+                != barrier.participant_count()
+        {
+            return Err(RollbackGlobalArchiveBarrierError::BindingMismatch);
+        }
+        Ok(plan)
     }
 
     async fn read_delete_plan<Hash: Q256BitHash>(

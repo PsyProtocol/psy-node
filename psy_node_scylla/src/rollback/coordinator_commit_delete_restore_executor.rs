@@ -167,19 +167,19 @@ impl ScyllaCoordinatorCommitDeleteRestoreExecutor {
     /// available from this method.
     pub(super) async fn execute_and_persist<Hash: Q256BitHash>(
         &self,
-        authority: DeletingRollbackGlobalArchiveBarrier<Hash>,
+        authority: &DeletingRollbackGlobalArchiveBarrier<Hash>,
     ) -> Result<
         PersistedCoordinatorRollbackDeleteCompletion<Hash>,
         CoordinatorCommitDeleteRestoreExecutorError,
     > {
-        let first = self.execute(&authority).await?;
+        let first = self.execute(authority).await?;
         let store = ScyllaCoordinatorRollbackDeleteCompletionStore::prepare(
             self.session.clone(),
             &self.archive_keyspace,
         )
         .await?;
         let receipt = store.persist_or_recover(&first).await?;
-        let second = self.execute(&authority).await?;
+        let second = self.execute(authority).await?;
         if first.deleting_head != second.deleting_head
             || first.target != second.target
             || first.participant_plan_digest != second.participant_plan_digest

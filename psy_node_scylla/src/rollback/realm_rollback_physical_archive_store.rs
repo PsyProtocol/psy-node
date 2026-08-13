@@ -25,6 +25,9 @@ use super::{
     realm_rollback_physical_before_image::{
         RealmRollbackPhysicalBeforeImage, RealmRollbackPhysicalBeforeImageError,
     },
+    realm_rollback_physical_catalog::{
+        RealmRollbackPhysicalCatalog, RealmRollbackPhysicalCatalogEntry,
+    },
     realm_rollback_participant_completion::{
         REALM_PARTICIPANT_COMPLETION_KEY_DOMAIN,
         RealmRollbackParticipantCompletion,
@@ -266,6 +269,39 @@ impl ScyllaRealmRollbackPhysicalArchiveStore {
             Some(_) => Err(RealmRollbackPhysicalArchiveStoreError::Conflict),
             None => Err(RealmRollbackPhysicalArchiveStoreError::MissingAfterPersist),
         }
+    }
+
+    /// Point-select and strictly bind one immutable before-image using only
+    /// the post-barrier catalog.  It never consults the hot row, so deletion
+    /// retries can recover after a process crash without weakening identity.
+    pub(super) async fn read_catalog_image<Hash: Q256BitHash>(
+        &self,
+        participant_plan_digest: [u8; 32],
+        catalog: &RealmRollbackPhysicalCatalog<Hash>,
+        entry: &RealmRollbackPhysicalCatalogEntry,
+    ) -> Result<RealmRollbackPhysicalBeforeImage<Hash>, RealmRollbackPhysicalArchiveStoreError> {
+        let (key_domain, row_slot) =
+            RealmRollbackPhysicalBeforeImage::selector_for_catalog_entry(
+                participant_plan_digest,
+                catalog,
+                entry,
+            )?;
+        let coordinates = ArchiveCoordinates {
+            network: i64::from(catalog.suffix().target().network_id().chain_id()),
+            chain_epoch: i64::try_from(
+                catalog.suffix().target().chain_epoch().get(),
+            )
+            .map_err(|_| RealmRollbackPhysicalArchiveStoreError::IntegerOutOfCqlRange)?,
+            participant_plan_digest,
+            key_domain,
+            row_slot,
+        };
+        let image = self
+            .read_selected::<Hash>(&coordinates)
+            .await?
+            .ok_or(RealmRollbackPhysicalArchiveStoreError::MissingAfterPersist)?;
+        image.require_catalog_entry(participant_plan_digest, catalog, entry)?;
+        Ok(image)
     }
 
     async fn read_selected<Hash: Q256BitHash>(
