@@ -498,6 +498,22 @@ impl<Hash: Q256BitHash> CoordinatorCommitTargetRestorePayload<Hash> {
         &self.digest
     }
 
+    pub(super) const fn target(&self) -> &CanonicalChainRef<Hash> {
+        &self.target
+    }
+
+    pub(super) const fn target_l2_source_writetime_us(&self) -> i64 {
+        self.target_l2_source_writetime_us
+    }
+
+    pub(super) fn target_l2_stored_value(&self) -> &[u8] {
+        &self.target_l2_stored_value
+    }
+
+    pub(super) const fn latest_checkpoint(&self) -> u64 {
+        self.latest_checkpoint
+    }
+
     pub(super) fn canonical_bytes(&self) -> &[u8] {
         &self.canonical_bytes
     }

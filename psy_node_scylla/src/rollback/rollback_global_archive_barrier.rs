@@ -24,7 +24,7 @@ use psy_node_core::store::{
         CanonicalHeadReadState, CanonicalHeadTransition,
         CanonicalHeadWriteOutcome, StoredCanonicalHead,
     },
-    rollback_control::ROLLBACK_CONTROL_V1_LEN,
+    rollback_control::{RollbackControlState, ROLLBACK_CONTROL_V1_LEN},
     rollback_participant_plan::{
         RollbackParticipantPlan, RollbackRealmParticipant,
     },
@@ -342,6 +342,26 @@ impl<Hash: Q256BitHash> RollbackGlobalArchiveBarrier<Hash> {
 
     pub(super) const fn participant_set_digest(&self) -> &[u8; 32] {
         &self.participant_set_digest
+    }
+
+    pub(super) const fn coordinator_completion_slot(&self) -> &[u8; 32] {
+        &self.coordinator_completion_slot
+    }
+
+    pub(super) const fn coordinator_completion_digest(&self) -> &[u8; 32] {
+        &self.coordinator_completion_digest
+    }
+
+    pub(super) const fn coordinator_target_restore_slot(&self) -> &[u8; 32] {
+        &self.coordinator_target_restore_slot
+    }
+
+    pub(super) const fn coordinator_target_restore_digest(&self) -> &[u8; 32] {
+        &self.coordinator_target_restore_digest
+    }
+
+    pub(super) const fn coordinator_readiness_digest(&self) -> &[u8; 32] {
+        &self.coordinator_readiness_digest
     }
 
     pub(super) const fn slot(&self) -> &[u8; 32] {
@@ -793,6 +813,33 @@ impl<Hash> PublishedRollbackGlobalArchiveBarrier<Hash> {
     }
 }
 
+/// Storage-private proof that the global archive barrier and the exact
+/// Coordinator delete plan were re-read after the canonical control row
+/// crossed the point of no return into `DELETING`.  It grants no physical
+/// mutation by itself; only the Coordinator delete executor consumes it.
+#[derive(Debug)]
+pub(super) struct DeletingRollbackGlobalArchiveBarrier<Hash> {
+    barrier: RollbackGlobalArchiveBarrier<Hash>,
+    deleting_head: StoredCanonicalHead<Hash>,
+    delete_plan: PersistedCoordinatorCommitDeleteRestorePlan<Hash>,
+}
+
+impl<Hash> DeletingRollbackGlobalArchiveBarrier<Hash> {
+    pub(super) const fn barrier(&self) -> &RollbackGlobalArchiveBarrier<Hash> {
+        &self.barrier
+    }
+
+    pub(super) const fn deleting_head(&self) -> &StoredCanonicalHead<Hash> {
+        &self.deleting_head
+    }
+
+    pub(super) const fn delete_plan(
+        &self,
+    ) -> &PersistedCoordinatorCommitDeleteRestorePlan<Hash> {
+        &self.delete_plan
+    }
+}
+
 impl ScyllaRollbackGlobalArchiveBarrierOwner {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
@@ -888,7 +935,7 @@ impl ScyllaRollbackGlobalArchiveBarrierOwner {
                 }
             };
             store.revalidate(&receipt).await?;
-            self.revalidate_delete_plan(&receipt.barrier).await?;
+            let _delete_plan = self.read_delete_plan(&receipt.barrier).await?;
             return Ok(PublishedRollbackGlobalArchiveBarrier {
                 barrier: receipt.barrier,
                 barrier_ready_head,
@@ -934,17 +981,141 @@ impl ScyllaRollbackGlobalArchiveBarrierOwner {
             barrier,
         };
         store.revalidate(&receipt).await?;
-        self.revalidate_delete_plan(&receipt.barrier).await?;
+        let _delete_plan = self.read_delete_plan(&receipt.barrier).await?;
         Ok(PublishedRollbackGlobalArchiveBarrier {
             barrier: receipt.barrier,
             barrier_ready_head: current,
         })
     }
 
-    async fn revalidate_delete_plan<Hash: Q256BitHash>(
+    /// Revalidate the immutable all-participant archive barrier, cross the
+    /// global PONR exactly once, and recover the same evidence after restart.
+    /// No hot row is touched here.
+    pub(super) async fn begin_delete_or_recover<F, Hash, Hasher>(
+        &mut self,
+        network: NetworkId,
+    ) -> Result<DeletingRollbackGlobalArchiveBarrier<Hash>, RollbackGlobalArchiveBarrierError>
+    where
+        F: QFelt64,
+        Hash: Q256BitHash + QFHashBase<F>,
+        Hasher: MerkleHasher<Hash> + FieldQHasher<F, Hash>,
+    {
+        let current: StoredCanonicalHead<Hash> = match self
+            .canonical_head
+            .read(network)
+            .await
+            .map_err(backend)?
+        {
+            CanonicalHeadReadState::Current(head) => head,
+            CanonicalHeadReadState::Uninitialized => {
+                return Err(RollbackGlobalArchiveBarrierError::HeadMissing);
+            }
+        };
+        if current.rollback_control().is_archiving()
+            || current.rollback_control().archive_barrier_ready()
+        {
+            let published = self.publish_or_recover::<F, Hash, Hasher>(network).await?;
+            let delete_plan = self.read_delete_plan(published.barrier()).await?;
+            let transition = CanonicalHeadTransition::begin_rollback_delete(
+                *published.barrier_ready_head(),
+            )
+            .map_err(|error| {
+                RollbackGlobalArchiveBarrierError::Canonical(error.to_string())
+            })?;
+            self.revalidate_barrier_and_plan(published.barrier(), &delete_plan)
+                .await?;
+            let outcome = self
+                .canonical_head
+                .compare_and_set(&transition.seal())
+                .await
+                .map_err(backend)?;
+            let deleting_head = match outcome {
+                CanonicalHeadWriteOutcome::Applied(head)
+                | CanonicalHeadWriteOutcome::Idempotent(head) => head,
+                CanonicalHeadWriteOutcome::Conflict { .. } => {
+                    return Err(RollbackGlobalArchiveBarrierError::HeadConflict);
+                }
+            };
+            self.revalidate_barrier_and_plan(published.barrier(), &delete_plan)
+                .await?;
+            return Ok(DeletingRollbackGlobalArchiveBarrier {
+                barrier: published.barrier,
+                deleting_head,
+                delete_plan,
+            });
+        }
+        if !matches!(current.rollback_control(), RollbackControlState::Deleting(_)) {
+            return Err(RollbackGlobalArchiveBarrierError::NotDeleting);
+        }
+        let request = *current
+            .rollback_control()
+            .requested()
+            .ok_or(RollbackGlobalArchiveBarrierError::NotDeleting)?;
+        let plan = self
+            .participant_plans
+            .read_participant_plan(network, request.plan_digest().as_bytes())
+            .await
+            .map_err(backend)?;
+        let expected_requested = CanonicalHeadTransition::start_rollback(
+            *plan.expected_head(),
+            plan.rollback_request()
+                .map_err(|error| RollbackGlobalArchiveBarrierError::Plan(error.to_string()))?,
+        )
+        .map_err(|error| RollbackGlobalArchiveBarrierError::Canonical(error.to_string()))?;
+        let expected_archiving = CanonicalHeadTransition::begin_rollback_archive(
+            *expected_requested.candidate(),
+        )
+        .map_err(|error| RollbackGlobalArchiveBarrierError::Canonical(error.to_string()))?;
+        let expected_barrier_ready =
+            CanonicalHeadTransition::complete_rollback_archive_barrier(
+                *expected_archiving.candidate(),
+            )
+            .map_err(|error| {
+                RollbackGlobalArchiveBarrierError::Canonical(error.to_string())
+            })?;
+        let expected_deleting = CanonicalHeadTransition::begin_rollback_delete(
+            *expected_barrier_ready.candidate(),
+        )
+        .map_err(|error| RollbackGlobalArchiveBarrierError::Canonical(error.to_string()))?;
+        if expected_deleting.candidate() != &current {
+            return Err(RollbackGlobalArchiveBarrierError::HeadConflict);
+        }
+        let store = ScyllaRollbackGlobalArchiveBarrierStore::prepare(
+            self.session.clone(),
+            &self.coordinator_archive_keyspace,
+        )
+        .await?;
+        let barrier = store
+            .read_selected(
+                network,
+                plan.target().chain_epoch().get(),
+                expected_archiving.candidate(),
+                plan.target(),
+                plan.digest(),
+                plan.topology_revision(),
+                plan.topology_digest(),
+            )
+            .await?
+            .ok_or(RollbackGlobalArchiveBarrierError::MissingAfterPersist)?;
+        let receipt = PersistedRollbackGlobalArchiveBarrier {
+            store_fingerprint: store.fingerprint(),
+            barrier,
+        };
+        store.revalidate(&receipt).await?;
+        let delete_plan = self.read_delete_plan(&receipt.barrier).await?;
+        self.revalidate_barrier_and_plan(&receipt.barrier, &delete_plan)
+            .await?;
+        Ok(DeletingRollbackGlobalArchiveBarrier {
+            barrier: receipt.barrier,
+            deleting_head: current,
+            delete_plan,
+        })
+    }
+
+    async fn read_delete_plan<Hash: Q256BitHash>(
         &self,
         barrier: &RollbackGlobalArchiveBarrier<Hash>,
-    ) -> Result<(), RollbackGlobalArchiveBarrierError> {
+    ) -> Result<PersistedCoordinatorCommitDeleteRestorePlan<Hash>, RollbackGlobalArchiveBarrierError> {
         let store = ScyllaCoordinatorCommitDeleteRestorePlanStore::prepare(
             self.session.clone(),
             &self.coordinator_archive_keyspace,
@@ -965,6 +1136,36 @@ impl ScyllaRollbackGlobalArchiveBarrierOwner {
             return Err(RollbackGlobalArchiveBarrierError::BindingMismatch);
         }
         store.revalidate(&receipt).await?;
+        Ok(receipt)
+    }
+
+    async fn revalidate_barrier_and_plan<Hash: Q256BitHash>(
+        &self,
+        barrier: &RollbackGlobalArchiveBarrier<Hash>,
+        delete_plan: &PersistedCoordinatorCommitDeleteRestorePlan<Hash>,
+    ) -> Result<(), RollbackGlobalArchiveBarrierError> {
+        let store = ScyllaRollbackGlobalArchiveBarrierStore::prepare(
+            self.session.clone(),
+            &self.coordinator_archive_keyspace,
+        )
+        .await?;
+        if store.fingerprint() != *barrier.store_fingerprint() {
+            return Err(RollbackGlobalArchiveBarrierError::StoreFingerprintMismatch);
+        }
+        let current = store
+            .read_exact(barrier)
+            .await?
+            .ok_or(RollbackGlobalArchiveBarrierError::MissingAfterPersist)?;
+        if current != *barrier {
+            return Err(RollbackGlobalArchiveBarrierError::Conflict);
+        }
+        let selected_plan = self.read_delete_plan(barrier).await?;
+        if selected_plan.store_fingerprint() != delete_plan.store_fingerprint()
+            || selected_plan.slot() != delete_plan.slot()
+            || selected_plan.plan() != delete_plan.plan()
+        {
+            return Err(RollbackGlobalArchiveBarrierError::BindingMismatch);
+        }
         Ok(())
     }
 
@@ -1318,6 +1519,7 @@ pub(super) enum RollbackGlobalArchiveBarrierError {
     TopologyChanged,
     NotArchiving,
     NotBarrierReady,
+    NotDeleting,
     HeadConflict,
     BindingMismatch,
     UnexpectedParticipant,
@@ -1504,20 +1706,20 @@ mod tests {
     }
 
     #[test]
-    fn barrier_owner_only_publishes_barrier_ready_and_has_no_destructive_api() {
+    fn barrier_owner_crosses_only_control_ponr_and_has_no_physical_mutation_api() {
         let source = include_str!("rollback_global_archive_barrier.rs");
         let production = source.split("#[cfg(test)]").next().unwrap();
         for forbidden in [
             "delete_hot_suffix(",
             "execute_delete",
             "restore_target(",
-            "begin_rollback_delete(",
             "complete_rollback(",
         ] {
             assert!(!production.contains(forbidden), "forbidden {forbidden}");
         }
         assert!(production.contains("complete_rollback_archive_barrier("));
-        assert_eq!(production.matches(".compare_and_set(").count(), 1);
+        assert!(production.contains("begin_rollback_delete("));
+        assert_eq!(production.matches(".compare_and_set(").count(), 2);
         assert!(production.contains("recover_pre_barrier_readiness"));
         assert!(production.contains("recover_participant_completion"));
         assert!(production.contains("persist_and_readback"));

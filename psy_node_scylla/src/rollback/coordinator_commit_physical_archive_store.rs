@@ -1587,6 +1587,111 @@ pub(crate) struct PersistedCoordinatorCommitPhysicalBeforeImage<Hash> {
     before_image: CoordinatorCommitPhysicalBeforeImage<Hash>,
 }
 
+/// Minimal immutable-evidence reader used only after the global archive
+/// barrier has crossed PONR.  Unlike the pre-barrier store it prepares no hot
+/// source reads and therefore cannot accidentally require rows that may
+/// already have been tombstoned.
+pub(super) struct ScyllaCoordinatorCommitPostBarrierArchiveReader {
+    session: Arc<Session>,
+    read_row: PreparedStatement,
+}
+
+impl ScyllaCoordinatorCommitPostBarrierArchiveReader {
+    pub(super) async fn prepare(
+        session: Arc<Session>,
+        archive_keyspace: &CqlKeyspaceName,
+    ) -> Result<Self, CoordinatorCommitPhysicalArchiveStoreError> {
+        let table = format!(
+            "{}.{}",
+            archive_keyspace.as_str(),
+            COORDINATOR_ROLLBACK_SUFFIX_ARCHIVE_TABLE,
+        );
+        Ok(Self {
+            read_row: prepare_read(
+                &session,
+                &READ_ROW_TEMPLATE.replace("{table}", &table),
+            )
+            .await?,
+            session,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn read_target_restore<Hash: Q256BitHash>(
+        &self,
+        archiving_head: &StoredCanonicalHead<Hash>,
+        target: &CanonicalChainRef<Hash>,
+        catalog_digest: &[u8; 32],
+        target_restore_slot: &[u8; 32],
+        target_restore_digest: &[u8; 32],
+    ) -> Result<CoordinatorCommitTargetRestorePayload<Hash>, CoordinatorCommitPhysicalArchiveStoreError>
+    {
+        let network = i64::from(target.network_id().chain_id());
+        let chain_epoch = i64::try_from(target.chain_epoch().get()).map_err(|_| {
+            CoordinatorCommitPhysicalArchiveStoreError::IntegerOutOfCqlRange
+        })?;
+        let rows = self
+            .session
+            .execute_unpaged(
+                &self.read_row,
+                (
+                    network,
+                    chain_epoch,
+                    catalog_digest.as_slice(),
+                    TARGET_RESTORE_KEY_DOMAIN,
+                    target_restore_slot.as_slice(),
+                ),
+            )
+            .await
+            .map_err(cql)?
+            .into_rows_result()
+            .map_err(cql)?
+            .rows::<(
+                Option<i32>,
+                Option<i64>,
+                Option<i32>,
+                Option<i64>,
+                Option<Vec<u8>>,
+                Option<Vec<u8>>,
+                Option<Vec<u8>>,
+            )>()
+            .map_err(cql)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(cql)?;
+        if rows.is_empty() {
+            return Err(CoordinatorCommitPhysicalArchiveStoreError::MissingAfterPersist);
+        }
+        let mut fragments = Vec::with_capacity(rows.len());
+        for (index, revision, count, row_bytes, payload, digest, row_digest) in rows {
+            fragments.push(decode_fragment(
+                index,
+                revision,
+                count,
+                row_bytes,
+                payload,
+                digest,
+                row_digest,
+            )?);
+        }
+        let bytes = reconstruct_fragments(fragments, target_restore_digest)?;
+        let payload = CoordinatorCommitTargetRestorePayload::decode_canonical(&bytes)?;
+        payload.validate_selected(
+            archiving_head,
+            target,
+            catalog_digest,
+            payload.archive_store_fingerprint(),
+            payload.participant_completion_slot(),
+            payload.participant_completion_digest(),
+        )?;
+        if payload.slot() != target_restore_slot
+            || payload.digest() != target_restore_digest
+        {
+            return Err(CoordinatorCommitPhysicalArchiveStoreError::Conflict);
+        }
+        Ok(payload)
+    }
+}
+
 impl<Hash: Q256BitHash> PersistedCoordinatorCommitPhysicalBeforeImage<Hash> {
     pub(crate) const fn slot(&self) -> &[u8; 32] {
         self.before_image.slot()
@@ -2262,7 +2367,7 @@ impl ScyllaCoordinatorCommitPhysicalArchiveStore {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum CoordinatorCommitPhysicalReadBinding {
+pub(super) enum CoordinatorCommitPhysicalReadBinding {
     BigInt(i64, ScyllaSchemaFamily),
     Blob(Vec<u8>),
     Uuid(Uuid),
@@ -2274,7 +2379,7 @@ enum CoordinatorCommitPhysicalReadBinding {
 }
 
 impl CoordinatorCommitPhysicalReadBinding {
-    fn try_for_key(
+    pub(super) fn try_for_key(
         key: &ResolvedScyllaKey,
     ) -> Result<Self, CoordinatorCommitPhysicalArchiveStoreError> {
         let binding = match key.typed_key() {
@@ -2428,7 +2533,7 @@ impl CoordinatorCommitPhysicalReadBinding {
         )
     }
 
-    const fn family(&self) -> ScyllaSchemaFamily {
+    pub(super) const fn family(&self) -> ScyllaSchemaFamily {
         match self {
             Self::BigInt(_, family) => *family,
             Self::Blob(_) => ScyllaSchemaFamily::Blob,
@@ -2441,7 +2546,7 @@ impl CoordinatorCommitPhysicalReadBinding {
         }
     }
 
-    const fn shape(&self) -> &'static [&'static str] {
+    pub(super) const fn shape(&self) -> &'static [&'static str] {
         match self {
             Self::BigInt(_, _) => &["obj_id:BIGINT"],
             Self::Blob(_) => &["obj_id:BLOB"],
