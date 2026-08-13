@@ -102,7 +102,30 @@ impl CoordinatorRollbackArchivePlanDigest {
     pub const fn as_bytes(self) -> [u8; 32] {
         self.0
     }
+
+    pub(super) fn try_from_archive_bytes(
+        bytes: [u8; 32],
+    ) -> Result<Self, CoordinatorRollbackArchivePlanDigestError> {
+        if bytes == [0; 32] {
+            Err(CoordinatorRollbackArchivePlanDigestError::ZeroDigest)
+        } else {
+            Ok(Self(bytes))
+        }
+    }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CoordinatorRollbackArchivePlanDigestError {
+    ZeroDigest,
+}
+
+impl fmt::Display for CoordinatorRollbackArchivePlanDigestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "invalid Coordinator archive-plan digest: {self:?}")
+    }
+}
+
+impl Error for CoordinatorRollbackArchivePlanDigestError {}
 
 /// Deterministic, non-executable Coordinator participant plan.
 ///

@@ -133,6 +133,8 @@ mod realm_prepared_state_physical_plan;
 mod realm_imt_predecessor_rf3_gate;
 mod imt_family;
 mod coordinator_rollback_archive_plan;
+#[allow(dead_code)]
+mod coordinator_rollback_archive_store;
 mod rollback_admission;
 mod identity;
 mod key;
