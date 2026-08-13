@@ -464,7 +464,7 @@ impl<Hash: Q256BitHash> SealedAuthorityLocalHeadCas<Hash> {
     /// marker. This constructor only accepts the immediately next chain epoch,
     /// a strictly older target checkpoint, an unchanged storage binding, and a
     /// write timestamp above the abandoned branch.
-    pub(crate) fn seal_rollback_restore(
+    pub fn seal_rollback_restore(
         expected: StoredAuthorityLocalHead<Hash>,
         target: &StoredAuthorityLocalHead<Hash>,
         rollback_epoch: ChainEpoch,

@@ -13,14 +13,15 @@ use std::{error::Error, fmt};
 use parth_core::protocol::core_types::Q256BitHash;
 use psy_data::protocol::{
     canonical_chain::{CanonicalChainRef, ChainEpoch, NetworkId, CANONICAL_CHAIN_REF_V1_LEN},
-    chain_context::AuthorityScope,
+    chain_context::{AuthorityObservation, AuthorityScope},
 };
 use psy_node_core::store::{
     authority_commit::{
-        AuthorityTimestampKey, AuthorityTimestampPhase, ObservedAuthorityTimestampState,
-        StoredAuthorityTimestampState,
+        AuthorityCommitIntentDigest, AuthorityTimestampKey, AuthorityTimestampPhase,
+        ObservedAuthorityTimestampState, StoredAuthorityTimestampState,
     },
     authority_local_head::StoredAuthorityLocalHead,
+    branch_pending_mapping::BranchPendingMapping,
     pending_generation::ProcNamespacePrefix,
     pending_generation_identity::{PendingGenerationContext, PendingGenerationLedgerKey},
     pending_generation_pipeline::{PendingProcessingPhase, StoredPendingPipeline},
@@ -460,6 +461,66 @@ impl<Hash: Q256BitHash> RealmRollbackTargetRestorePlan<Hash> {
     pub(super) const fn slot(&self) -> &[u8; 32] { &self.slot }
     pub(super) const fn digest(&self) -> &[u8; 32] { &self.digest }
     pub(super) fn canonical_bytes(&self) -> &[u8] { &self.canonical_bytes }
+
+    pub(super) const fn timestamp_intent(&self) -> AuthorityCommitIntentDigest {
+        AuthorityCommitIntentDigest::from_sealed_commit_digest(self.digest)
+    }
+
+    pub(super) fn processing_allocation(
+        &self,
+    ) -> Result<SealedPendingCounterAllocation, RealmRollbackTargetRestorePlanError> {
+        let plan = SealedPendingCounterAllocation::try_for_rollback(
+            PendingCounterExpected::Present(self.counter_expected),
+            self.processing.proc_checkpoint_id(),
+            self.new_branch_write,
+        )
+        .map_err(model)?;
+        if plan.digest().as_bytes() != &self.processing_allocation_digest {
+            return Err(RealmRollbackTargetRestorePlanError::AllocationMismatch);
+        }
+        Ok(plan)
+    }
+
+    pub(super) fn gathering_allocation(
+        &self,
+    ) -> Result<SealedPendingCounterAllocation, RealmRollbackTargetRestorePlanError> {
+        let plan = SealedPendingCounterAllocation::try_for_rollback(
+            PendingCounterExpected::Present(self.processing.pending_id()),
+            self.gathering.proc_checkpoint_id(),
+            self.new_branch_write,
+        )
+        .map_err(model)?;
+        if plan.digest().as_bytes() != &self.gathering_allocation_digest {
+            return Err(RealmRollbackTargetRestorePlanError::AllocationMismatch);
+        }
+        Ok(plan)
+    }
+
+    pub(super) fn restored_observation(
+        &self,
+    ) -> Result<AuthorityObservation<Hash>, RealmRollbackTargetRestorePlanError> {
+        let chain = CanonicalChainRef::new(
+            self.target.network_id(),
+            self.rollback_epoch,
+            *self.target.checkpoint(),
+        );
+        AuthorityObservation::try_new(
+            chain,
+            self.authority,
+            self.target_head.head().state_checkpoint(),
+            *self.target_head.head().state_root(),
+        )
+        .map_err(model)
+    }
+
+    pub(super) fn restored_writer_watermark(
+        &self,
+    ) -> Result<BranchPendingMapping<Hash>, RealmRollbackTargetRestorePlanError> {
+        Ok(BranchPendingMapping::new(
+            *self.restored_observation()?.chain(),
+            self.target_pipeline.processing().pending_id(),
+        ))
+    }
 
     /// Rebind a recovered immutable plan to the target marker selected by
     /// storage at the global rollback height. Realm hashes are authority-local,

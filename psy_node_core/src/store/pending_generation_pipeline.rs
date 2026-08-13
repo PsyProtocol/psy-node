@@ -461,6 +461,35 @@ impl<Hash: Q256BitHash> StoredPendingPipeline<Hash> {
         restored_frontier: AuthorityObservation<Hash>,
         target_processed_pending_id: u64,
     ) -> Result<SealedPendingPipelineTransition<Hash>, PendingPipelineError> {
+        let processing = PendingGenerationContext::try_from_legacy(
+            processing.pending_id().get(),
+            processing.proc_checkpoint_id().as_u128(),
+        )
+        .map_err(|error| PendingPipelineError::InvalidContext(error.to_string()))?;
+        let gathering = PendingGenerationContext::try_from_legacy(
+            gathering.pending_id().get(),
+            gathering.proc_checkpoint_id().as_u128(),
+        )
+        .map_err(|error| PendingPipelineError::InvalidContext(error.to_string()))?;
+        self.seal_rollback_reset_contexts(
+            processing,
+            gathering,
+            restored_frontier,
+            target_processed_pending_id,
+        )
+    }
+
+    /// Storage-adapter form of [`Self::seal_rollback_reset`]. The adapter must
+    /// first prove both contexts came from exact durable counter allocations;
+    /// this constructor independently revalidates namespace, monotonicity,
+    /// frontier, epoch, and full predecessor state before sealing a CAS.
+    pub fn seal_rollback_reset_contexts(
+        &self,
+        processing: PendingGenerationContext,
+        gathering: PendingGenerationContext,
+        restored_frontier: AuthorityObservation<Hash>,
+        target_processed_pending_id: u64,
+    ) -> Result<SealedPendingPipelineTransition<Hash>, PendingPipelineError> {
         self.require_unblocked()?;
         if !matches!(
             self.phase(),
@@ -501,16 +530,6 @@ impl<Hash: Q256BitHash> StoredPendingPipeline<Hash> {
                 target: target_processed_pending_id,
             });
         }
-        let processing = PendingGenerationContext::try_from_legacy(
-            processing.pending_id().get(),
-            processing.proc_checkpoint_id().as_u128(),
-        )
-        .map_err(|error| PendingPipelineError::InvalidContext(error.to_string()))?;
-        let gathering = PendingGenerationContext::try_from_legacy(
-            gathering.pending_id().get(),
-            gathering.proc_checkpoint_id().as_u128(),
-        )
-        .map_err(|error| PendingPipelineError::InvalidContext(error.to_string()))?;
         if processing.pending_id().get() <= self.gathering.pending_id().get() {
             return Err(PendingPipelineError::RollbackProcessingNotFresh {
                 abandoned_gathering: self.gathering.pending_id().get(),

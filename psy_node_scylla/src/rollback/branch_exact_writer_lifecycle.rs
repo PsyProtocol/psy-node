@@ -10,8 +10,8 @@ use std::{error::Error, fmt};
 use parth_core::protocol::core_types::Q256BitHash;
 use psy_node_core::store::{
     authority_commit::{
-        AuthorityClockSampleUs, AuthorityIntentObservation, AuthorityTimestampKey,
-        AuthorityTimestampPhase,
+        AuthorityClockSampleUs, AuthorityCommitIntentDigest, AuthorityIntentObservation,
+        AuthorityTimestampKey, AuthorityTimestampPhase,
         AuthorityTimestampRevision, ObservedAuthorityTimestampState,
         SealedAuthorityTimestampReservation, StoredAuthorityTimestampState,
         AUTHORITY_TIMESTAMP_STATE_V1_LEN,
@@ -160,6 +160,13 @@ impl BranchExactWriterIntentDigest {
 
     const fn from_intent(digest: BranchExactDualWriteIntentDigest) -> Self {
         Self(*digest.as_bytes())
+    }
+
+    fn from_rollback_plan_digest(plan_digest: [u8; 32]) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"psy.rollback.branch-exact-writer-restore-intent.v1\0");
+        hasher.update(plan_digest);
+        Self(hasher.finalize().into())
     }
 }
 
@@ -971,6 +978,61 @@ impl<Hash: Q256BitHash> SealedBranchExactWriterCas<Hash> {
         Self::transition(expected, BranchExactWriterState::Blocked(reason))
     }
 
+    /// Reset the active writer watermark after an exact delete-only rollback.
+    ///
+    /// This does not itself mutate storage. The storage-private Realm restore
+    /// executor must hold the global delete barrier and a persisted restore
+    /// plan, and must have completed that plan's timestamp intent first.
+    pub(super) fn rollback_restore(
+        expected: &StoredBranchExactWriterLifecycle<Hash>,
+        restored_watermark: BranchPendingMapping<Hash>,
+        completed_timestamp: ObservedAuthorityTimestampState,
+        restore_plan_digest: [u8; 32],
+    ) -> Result<Self, BranchExactWriterLifecycleError> {
+        let BranchExactWriterState::Active(active) = &expected.state else {
+            return Err(BranchExactWriterLifecycleError::RollbackSourceNotActive);
+        };
+        let key = AuthorityTimestampKey::new(
+            restored_watermark.canonical_chain().network_id(),
+            expected.plan.authority,
+        );
+        let source_chain = active.watermark().canonical_chain();
+        let restored_chain = restored_watermark.canonical_chain();
+        let expected_epoch = source_chain
+            .chain_epoch()
+            .get()
+            .checked_add(1)
+            .ok_or(BranchExactWriterLifecycleError::RevisionOverflow)?;
+        let authority_intent = AuthorityCommitIntentDigest::from_sealed_commit_digest(
+            restore_plan_digest,
+        );
+        if key != completed_timestamp.key()
+            || restored_chain.network_id() != source_chain.network_id()
+            || restored_chain.chain_epoch().get() != expected_epoch
+            || restored_chain.checkpoint().checkpoint_id().get()
+                >= source_chain.checkpoint().checkpoint_id().get()
+            || restored_watermark.pending_id() > active.watermark().pending_id()
+            || completed_timestamp.state().high_water() <= active.timestamp_high_water()
+            || !matches!(
+                completed_timestamp.state().phase(),
+                AuthorityTimestampPhase::Idle { last_completed: Some(intent) }
+                    if intent == authority_intent
+            )
+        {
+            return Err(BranchExactWriterLifecycleError::RollbackRestoreMismatch);
+        }
+        let restored = BranchExactWriterActive {
+            watermark: restored_watermark,
+            timestamp_state: completed_timestamp.state(),
+            // Operational write count remains monotonic across branch epochs.
+            committed_writes: active.committed_writes,
+            last_intent: Some(BranchExactWriterIntentDigest::from_rollback_plan_digest(
+                restore_plan_digest,
+            )),
+        };
+        Self::transition(expected, BranchExactWriterState::Active(restored))
+    }
+
     fn transition(
         expected: &StoredBranchExactWriterLifecycle<Hash>,
         state: BranchExactWriterState<Hash>,
@@ -1580,6 +1642,8 @@ pub enum BranchExactWriterLifecycleError {
     TimestampKeyMismatch,
     PublishedHeadMismatch,
     CommittedWritesOverflow,
+    RollbackSourceNotActive,
+    RollbackRestoreMismatch,
     InvalidMagic,
     UnknownCodecVersion(u16),
     UnknownStateKind(u8),
