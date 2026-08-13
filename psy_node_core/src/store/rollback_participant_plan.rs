@@ -8,6 +8,7 @@
 
 use std::{error::Error, fmt};
 
+use async_trait::async_trait;
 use parth_core::protocol::core_types::Q256BitHash;
 use psy_data::protocol::canonical_chain::{
     CanonicalChainRef, NetworkId, CANONICAL_CHAIN_REF_V1_LEN,
@@ -16,15 +17,13 @@ use sha2::{Digest, Sha256};
 
 use super::{
     canonical_head::StoredCanonicalHead,
-    rollback_control::{
-        RollbackControlState, RollbackExecutionMode, RollbackPlanDigest,
-        RollbackRequest,
-    },
+    rollback_control::{RollbackExecutionMode, RollbackPlanDigest, RollbackRequest},
     timestamp::{
         CommitWriteTimestampUs, TimestampFenceWindow, TimestampOrderingError,
         TimestampOutOfCqlRange,
     },
 };
+use super::rollback_topology::RollbackTopologySnapshot;
 
 const PLAN_MAGIC: &[u8; 8] = b"PSYRBPP1";
 const PLAN_VERSION: u16 = 1;
@@ -408,6 +407,28 @@ impl fmt::Display for RollbackParticipantPlanError {
 
 impl Error for RollbackParticipantPlanError {}
 
+/// Coordinator composition boundary for topology-selected participant plans.
+/// Implementations must exact-read the current topology before and after
+/// persisting a plan.  Returning success does not grant barrier or PONR.
+#[async_trait]
+pub trait CoordinatorRollbackParticipantPlanStore<Hash>: Send + Sync {
+    async fn read_current_rollback_topology(
+        &self,
+        network: NetworkId,
+    ) -> anyhow::Result<Option<RollbackTopologySnapshot>>;
+
+    async fn persist_verified_rollback_participant_plan(
+        &self,
+        plan: &RollbackParticipantPlan<Hash>,
+    ) -> anyhow::Result<()>;
+
+    async fn read_verified_rollback_participant_plan(
+        &self,
+        network: NetworkId,
+        digest: [u8; 32],
+    ) -> anyhow::Result<RollbackParticipantPlan<Hash>>;
+}
+
 #[cfg(test)]
 mod tests {
     use parth_core::PHash;
@@ -416,7 +437,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::store::timestamp::CommitWriteTimestampUs;
+    use crate::store::{
+        rollback_control::RollbackControlState,
+        timestamp::CommitWriteTimestampUs,
+    };
 
     fn checkpoint(height: u64, seed: u64) -> CheckpointRef<PHash> {
         CheckpointRef::new(

@@ -104,6 +104,12 @@ pub(crate) struct PersistedRollbackTopologyReceipt {
     snapshot: RollbackTopologySnapshot,
 }
 
+impl PersistedRollbackTopologyReceipt {
+    pub(crate) const fn snapshot(&self) -> &RollbackTopologySnapshot {
+        &self.snapshot
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct PersistedRollbackParticipantPlanReceipt<Hash> {
     store_fingerprint: [u8; 32],
@@ -306,7 +312,7 @@ impl ScyllaRollbackParticipantPlanStore {
         Ok(())
     }
 
-    async fn read_participant_plan<Hash: Q256BitHash>(
+    pub(crate) async fn read_participant_plan<Hash: Q256BitHash>(
         &self,
         network: NetworkId,
         digest: &[u8; 32],

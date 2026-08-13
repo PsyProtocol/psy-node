@@ -95,6 +95,7 @@ mod coordinator_commit_target_restore;
 mod coordinator_commit_physical_archive_store;
 mod coordinator_commit_delete_restore_plan;
 mod rollback_participant_plan_store;
+pub(crate) use rollback_participant_plan_store::ScyllaRollbackParticipantPlanStore;
 pub(crate) use coordinator_commit_source_store::ScyllaCoordinatorCommitSourceStore;
 #[cfg(all(test, feature = "rf3-test-support"))]
 #[path = "../../tests/rf3/d04b6h23c4c4b2b_terminal_carryover.rs"]

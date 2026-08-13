@@ -7,7 +7,7 @@
 use psy_data::protocol::canonical_chain::CanonicalChainRef;
 use serde::{Deserialize, Serialize};
 
-pub const ROLLBACK_ADMIN_START_REQUEST_VERSION: u16 = 1;
+pub const ROLLBACK_ADMIN_START_REQUEST_VERSION: u16 = 2;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -28,8 +28,10 @@ pub struct RollbackAdminStartRequest<Hash> {
     pub delete_fence_timestamp_us: i64,
     pub new_branch_write_timestamp_us: i64,
     pub execution_mode: RollbackAdminExecutionMode,
-    /// Lower-case or upper-case, optional `0x` prefix; exactly 32 bytes.
-    pub plan_digest_hex: String,
+    pub topology_revision: u64,
+    /// Expected current durable deployment-topology digest. Lower/upper-case,
+    /// optional `0x` prefix; exactly 32 bytes.
+    pub topology_digest_hex: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -110,7 +112,8 @@ mod tests {
             delete_fence_timestamp_us: 1_001,
             new_branch_write_timestamp_us: 1_002,
             execution_mode: RollbackAdminExecutionMode::InPlace,
-            plan_digest_hex: "a5".repeat(32),
+            topology_revision: 3,
+            topology_digest_hex: "a5".repeat(32),
         }
     }
 
@@ -118,7 +121,7 @@ mod tests {
     fn start_request_json_is_named_versioned_and_round_trips() {
         let request = request();
         let encoded = serde_json::to_value(&request).unwrap();
-        assert_eq!(encoded["request_version"], 1);
+        assert_eq!(encoded["request_version"], 2);
         assert_eq!(encoded["execution_mode"], "IN_PLACE");
         assert_eq!(encoded["expected_canonical_ref"]["checkpoint_id"], 100);
         assert_eq!(

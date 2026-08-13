@@ -1,8 +1,96 @@
-use psy_core::constants::chain_id::PsyChainNetworkType;
 use crate::store::canonical_head::CanonicalHeadBootstrapProfile;
 use crate::store::realm_processor_startup::RealmProcessorStartupLineage;
+use crate::store::rollback_participant_plan::RollbackRealmParticipant;
+use crate::store::rollback_topology::RollbackTopologySnapshot;
+use psy_core::constants::chain_id::PsyChainNetworkType;
 use psy_data::protocol::canonical_chain::NetworkId;
 use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoordinatorRollbackTopologyRealmConfig {
+    pub realm_id: u32,
+    pub realm_sub_id: u16,
+}
+
+#[cfg(test)]
+mod coordinator_rollback_topology_config_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_topology_is_canonicalized_without_inference() {
+        let snapshot = CoordinatorRollbackTopologyConfig {
+            revision: 4,
+            realms: vec![
+                CoordinatorRollbackTopologyRealmConfig {
+                    realm_id: 9,
+                    realm_sub_id: 2,
+                },
+                CoordinatorRollbackTopologyRealmConfig {
+                    realm_id: 3,
+                    realm_sub_id: 1,
+                },
+            ],
+        }
+        .try_snapshot(PsyChainNetworkType::LocalDevnet)
+        .unwrap();
+
+        assert_eq!(snapshot.revision(), 4);
+        assert_eq!(snapshot.realms()[0], RollbackRealmParticipant::new(3, 1));
+        assert_eq!(snapshot.realms()[1], RollbackRealmParticipant::new(9, 2));
+    }
+
+    #[test]
+    fn empty_or_duplicate_topology_is_rejected() {
+        assert!(CoordinatorRollbackTopologyConfig {
+            revision: 0,
+            realms: Vec::new(),
+        }
+        .try_snapshot(PsyChainNetworkType::LocalDevnet)
+        .is_err());
+        assert!(CoordinatorRollbackTopologyConfig {
+            revision: 0,
+            realms: vec![
+                CoordinatorRollbackTopologyRealmConfig {
+                    realm_id: 3,
+                    realm_sub_id: 1,
+                },
+                CoordinatorRollbackTopologyRealmConfig {
+                    realm_id: 3,
+                    realm_sub_id: 1,
+                },
+            ],
+        }
+        .try_snapshot(PsyChainNetworkType::LocalDevnet)
+        .is_err());
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoordinatorRollbackTopologyConfig {
+    pub revision: u64,
+    pub realms: Vec<CoordinatorRollbackTopologyRealmConfig>,
+}
+
+impl CoordinatorRollbackTopologyConfig {
+    pub fn try_snapshot(
+        &self,
+        network: PsyChainNetworkType,
+    ) -> anyhow::Result<RollbackTopologySnapshot> {
+        RollbackTopologySnapshot::try_new(
+            NetworkId::from_network_type(network),
+            self.revision,
+            self.realms
+                .iter()
+                .map(|realm| {
+                    RollbackRealmParticipant::new(realm.realm_id, realm.realm_sub_id)
+                })
+                .collect(),
+        )
+        .map_err(Into::into)
+    }
+}
 
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -116,6 +204,10 @@ pub struct CoordinatorProcessorStartConfig {
     /// Default-off until an operator has deployed and VERIFIED sidecar v18.
     #[serde(default)]
     pub durable_guta_submission_enabled: bool,
+    /// Explicit deployment topology for global rollback. `None` never infers
+    /// Realm membership from protocol capacity or observed traffic.
+    #[serde(default)]
+    pub rollback_topology: Option<CoordinatorRollbackTopologyConfig>,
     pub verbose: bool,
     pub checkpoint_backup_path: String,
     pub genesis_data_path: Option<String>,
@@ -258,6 +350,10 @@ pub struct CoordinatorEdgeStartConfig {
     /// request; it still cannot publish canonical rollback control.
     #[serde(default)]
     pub rollback_admin_rpc_enabled: bool,
+    /// Optional exact topology install/revalidation. Rollback start remains
+    /// unavailable while no durable topology exists.
+    #[serde(default)]
+    pub rollback_topology: Option<CoordinatorRollbackTopologyConfig>,
     /// Default-off until an operator has deployed and VERIFIED sidecar v18.
     #[serde(default)]
     pub durable_guta_submission_enabled: bool,

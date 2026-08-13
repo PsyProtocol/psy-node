@@ -27,6 +27,9 @@ use super::{
         StoredRollbackAdmissionSlot,
     },
     rollback_control::{RollbackExecutionMode, RollbackPlanDigest, RollbackRequest},
+    rollback_participant_plan::{
+        CoordinatorRollbackParticipantPlanStore, RollbackParticipantPlan,
+    },
     timestamp::TimestampFenceWindow,
 };
 
@@ -47,6 +50,58 @@ pub struct RollbackAdminStartIntent<Hash> {
     fence_window: TimestampFenceWindow,
     execution_mode: RollbackExecutionMode,
     plan_digest: RollbackPlanDigest,
+}
+
+/// Public admin handoff before the server selects and persists the current
+/// deployment topology.  It carries no caller-supplied plan digest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RollbackAdminPlannedStartIntent<Hash> {
+    expected_revision: CanonicalHeadRevision,
+    expected_canonical_ref: CanonicalChainRef<Hash>,
+    target: CheckpointRef<Hash>,
+    fence_window: TimestampFenceWindow,
+    topology_revision: u64,
+    topology_digest: [u8; 32],
+}
+
+impl<Hash> RollbackAdminPlannedStartIntent<Hash> {
+    pub const fn new(
+        expected_revision: CanonicalHeadRevision,
+        expected_canonical_ref: CanonicalChainRef<Hash>,
+        target: CheckpointRef<Hash>,
+        fence_window: TimestampFenceWindow,
+        topology_revision: u64,
+        topology_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            expected_revision,
+            expected_canonical_ref,
+            target,
+            fence_window,
+            topology_revision,
+            topology_digest,
+        }
+    }
+
+    pub const fn expected_revision(&self) -> CanonicalHeadRevision {
+        self.expected_revision
+    }
+
+    pub const fn target(&self) -> &CheckpointRef<Hash> {
+        &self.target
+    }
+
+    pub const fn fence_window(&self) -> TimestampFenceWindow {
+        self.fence_window
+    }
+
+    pub const fn topology_revision(&self) -> u64 {
+        self.topology_revision
+    }
+
+    pub const fn topology_digest(&self) -> &[u8; 32] {
+        &self.topology_digest
+    }
 }
 
 impl<Hash> RollbackAdminStartIntent<Hash> {
@@ -245,6 +300,8 @@ pub struct CoordinatorRollbackAdminInbox<Hash> {
     access: RollbackAdminInboxAccess,
     canonical_head_reader: Arc<dyn CoordinatorCanonicalHeadReader<Hash>>,
     admission_store: Arc<dyn CoordinatorRollbackAdmissionStore<Hash>>,
+    participant_plan_store:
+        Option<Arc<dyn CoordinatorRollbackParticipantPlanStore<Hash>>>,
     maintenance_cache: Mutex<Option<CachedRollbackMaintenanceObservation<Hash>>>,
 }
 
@@ -260,8 +317,17 @@ impl<Hash> CoordinatorRollbackAdminInbox<Hash> {
             access,
             canonical_head_reader,
             admission_store,
+            participant_plan_store: None,
             maintenance_cache: Mutex::new(None),
         }
+    }
+
+    pub fn with_participant_plan_store(
+        mut self,
+        store: Arc<dyn CoordinatorRollbackParticipantPlanStore<Hash>>,
+    ) -> Self {
+        self.participant_plan_store = Some(store);
+        self
     }
 
     pub const fn access(&self) -> RollbackAdminInboxAccess {
@@ -270,6 +336,86 @@ impl<Hash> CoordinatorRollbackAdminInbox<Hash> {
 }
 
 impl<Hash: Q256BitHash + Send + Sync + 'static> CoordinatorRollbackAdminInbox<Hash> {
+    /// Production explicit-start path.  The current durable topology selects
+    /// the complete Realm list; the immutable plan is exact-read before the
+    /// admission inbox can become pending.
+    pub async fn start_planned(
+        &self,
+        intent: RollbackAdminPlannedStartIntent<Hash>,
+    ) -> anyhow::Result<RollbackAdminStartReceipt<Hash>> {
+        let observed = self.status().await?;
+        if self.access == RollbackAdminInboxAccess::Disabled {
+            return Ok(receipt(RollbackAdminStartDisposition::Disabled, observed));
+        }
+        if !observed.canonical_head.rollback_control().is_idle() {
+            return Ok(receipt(
+                RollbackAdminStartDisposition::AlreadyActive,
+                observed,
+            ));
+        }
+        if observed.canonical_head.revision() != intent.expected_revision
+            || observed.canonical_head.canonical_ref() != &intent.expected_canonical_ref
+        {
+            return Ok(receipt(
+                RollbackAdminStartDisposition::HeadMismatch,
+                observed,
+            ));
+        }
+        let store = self
+            .participant_plan_store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("ROLLBACK_PARTICIPANT_PLAN_STORE_NOT_INSTALLED"))?;
+        let topology = store
+            .read_current_rollback_topology(self.network)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("ROLLBACK_TOPOLOGY_UNINITIALIZED"))?;
+        if topology.revision() != intent.topology_revision
+            || topology.digest() != &intent.topology_digest
+        {
+            anyhow::bail!("ROLLBACK_TOPOLOGY_EXPECTATION_MISMATCH");
+        }
+        let target = CanonicalChainRef::new(
+            self.network,
+            observed.canonical_head.canonical_ref().chain_epoch(),
+            intent.target,
+        );
+        let plan = RollbackParticipantPlan::try_new(
+            observed.canonical_head,
+            target,
+            intent.fence_window,
+            topology.revision(),
+            *topology.digest(),
+            topology.realms().to_vec(),
+        )?;
+        store
+            .persist_verified_rollback_participant_plan(&plan)
+            .await?;
+        let stored = store
+            .read_verified_rollback_participant_plan(self.network, *plan.digest())
+            .await?;
+        if stored != plan {
+            anyhow::bail!("ROLLBACK_PARTICIPANT_PLAN_READBACK_MISMATCH");
+        }
+        let receipt = self
+            .start(RollbackAdminStartIntent::new(
+                intent.expected_revision,
+                intent.expected_canonical_ref,
+                intent.target,
+                intent.fence_window,
+                RollbackExecutionMode::InPlace,
+                RollbackPlanDigest::try_new(*plan.digest())?,
+            ))
+            .await?;
+        let topology_after = store
+            .read_current_rollback_topology(self.network)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("ROLLBACK_TOPOLOGY_UNINITIALIZED"))?;
+        if topology_after != topology {
+            anyhow::bail!("ROLLBACK_TOPOLOGY_CHANGED_AFTER_INBOX_OFFER");
+        }
+        Ok(receipt)
+    }
+
     pub async fn status(&self) -> anyhow::Result<RollbackAdminInboxStatus<Hash>> {
         match self.read_status_fresh().await {
             Ok(status) => {
@@ -337,7 +483,7 @@ impl<Hash: Q256BitHash + Send + Sync + 'static> CoordinatorRollbackAdminInbox<Ha
         });
     }
 
-    pub async fn start(
+    async fn start(
         &self,
         intent: RollbackAdminStartIntent<Hash>,
     ) -> anyhow::Result<RollbackAdminStartReceipt<Hash>> {
@@ -510,6 +656,7 @@ mod tests {
         rollback_admission::{
             RollbackAdmissionSlotBootstrap, RollbackAdmissionSlotWriteOutcome,
         },
+        rollback_topology::RollbackTopologySnapshot,
         timestamp::CommitWriteTimestampUs,
     };
 
@@ -555,6 +702,66 @@ mod tests {
     struct MemoryAdmissionStore {
         state: Arc<Mutex<RollbackAdmissionSlotReadState<PHash>>>,
         reads: Arc<AtomicUsize>,
+    }
+
+    #[derive(Clone)]
+    struct MemoryParticipantPlanStore {
+        topology: RollbackTopologySnapshot,
+        plan: Arc<Mutex<Option<Vec<u8>>>>,
+        persists: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl CoordinatorRollbackParticipantPlanStore<PHash> for MemoryParticipantPlanStore {
+        async fn read_current_rollback_topology(
+            &self,
+            requested: NetworkId,
+        ) -> anyhow::Result<Option<RollbackTopologySnapshot>> {
+            if requested != self.topology.network() {
+                anyhow::bail!("wrong network");
+            }
+            Ok(Some(self.topology.clone()))
+        }
+
+        async fn persist_verified_rollback_participant_plan(
+            &self,
+            plan: &RollbackParticipantPlan<PHash>,
+        ) -> anyhow::Result<()> {
+            if !self.topology.validates_plan(plan) {
+                anyhow::bail!("topology mismatch");
+            }
+            self.persists.fetch_add(1, Ordering::SeqCst);
+            let mut stored = self.plan.lock().await;
+            match stored.as_ref() {
+                Some(bytes) if bytes == plan.canonical_bytes() => Ok(()),
+                Some(_) => anyhow::bail!("plan conflict"),
+                None => {
+                    *stored = Some(plan.canonical_bytes().to_vec());
+                    Ok(())
+                }
+            }
+        }
+
+        async fn read_verified_rollback_participant_plan(
+            &self,
+            requested: NetworkId,
+            digest: [u8; 32],
+        ) -> anyhow::Result<RollbackParticipantPlan<PHash>> {
+            if requested != self.topology.network() {
+                anyhow::bail!("wrong network");
+            }
+            let bytes = self
+                .plan
+                .lock()
+                .await
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("missing plan"))?;
+            let plan = RollbackParticipantPlan::decode_canonical(&bytes)?;
+            if plan.digest() != &digest {
+                anyhow::bail!("wrong digest");
+            }
+            Ok(plan)
+        }
     }
 
     #[async_trait]
@@ -626,6 +833,7 @@ mod tests {
         service: Arc<CoordinatorRollbackAdminInbox<PHash>>,
         head_store: MemoryCanonicalHead,
         admission_store: MemoryAdmissionStore,
+        participant_store: MemoryParticipantPlanStore,
         head: StoredCanonicalHead<PHash>,
     }
 
@@ -645,16 +853,32 @@ mod tests {
             state: Arc::new(Mutex::new(RollbackAdmissionSlotReadState::Current(slot))),
             reads: Arc::new(AtomicUsize::new(0)),
         };
-        let service = Arc::new(CoordinatorRollbackAdminInbox::new(
-            network(),
-            access,
-            Arc::new(head_store.clone()),
-            Arc::new(admission_store.clone()),
-        ));
+        let participant_store = MemoryParticipantPlanStore {
+            topology: RollbackTopologySnapshot::try_new(
+                network(),
+                0,
+                vec![super::super::rollback_participant_plan::RollbackRealmParticipant::new(
+                    0, 1,
+                )],
+            )
+            .unwrap(),
+            plan: Arc::new(Mutex::new(None)),
+            persists: Arc::new(AtomicUsize::new(0)),
+        };
+        let service = Arc::new(
+            CoordinatorRollbackAdminInbox::new(
+                network(),
+                access,
+                Arc::new(head_store.clone()),
+                Arc::new(admission_store.clone()),
+            )
+            .with_participant_plan_store(Arc::new(participant_store.clone())),
+        );
         Fixture {
             service,
             head_store,
             admission_store,
+            participant_store,
             head,
         }
     }
@@ -673,6 +897,65 @@ mod tests {
             RollbackExecutionMode::InPlace,
             RollbackPlanDigest::try_new([0xA5; 32]).unwrap(),
         )
+    }
+
+    fn planned_intent(fixture: &Fixture) -> RollbackAdminPlannedStartIntent<PHash> {
+        RollbackAdminPlannedStartIntent::new(
+            fixture.head.revision(),
+            *fixture.head.canonical_ref(),
+            checkpoint(90, 20),
+            TimestampFenceWindow::try_new(
+                CommitWriteTimestampUs::try_from_i128(1_000).unwrap(),
+                1_001,
+                1_002,
+            )
+            .unwrap(),
+            fixture.participant_store.topology.revision(),
+            *fixture.participant_store.topology.digest(),
+        )
+    }
+
+    #[tokio::test]
+    async fn planned_start_persists_topology_selected_plan_before_inbox_offer() {
+        let fixture = fixture(RollbackAdminInboxAccess::ManualPreflight);
+        let receipt = fixture
+            .service
+            .start_planned(planned_intent(&fixture))
+            .await
+            .unwrap();
+        assert_eq!(receipt.disposition(), RollbackAdminStartDisposition::Accepted);
+        assert_eq!(receipt.status().phase(), RollbackAdminInboxPhase::Pending);
+        let stored = fixture.participant_store.plan.lock().await.clone().unwrap();
+        let plan = RollbackParticipantPlan::<PHash>::decode_canonical(&stored).unwrap();
+        let pending = receipt
+            .status()
+            .admission_slot()
+            .state()
+            .pending()
+            .unwrap();
+        assert_eq!(pending.request().plan_digest().as_bytes(), plan.digest());
+        assert_eq!(plan.realms(), fixture.participant_store.topology.realms());
+        assert_eq!(fixture.participant_store.persists.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn planned_start_rejects_wrong_topology_before_plan_or_inbox_write() {
+        let fixture = fixture(RollbackAdminInboxAccess::ManualPreflight);
+        let mut intent = planned_intent(&fixture);
+        intent.topology_digest[0] ^= 1;
+        assert!(fixture
+            .service
+            .start_planned(intent)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("ROLLBACK_TOPOLOGY_EXPECTATION_MISMATCH"));
+        assert!(fixture.participant_store.plan.lock().await.is_none());
+        let state = fixture.admission_store.state.lock().await;
+        let RollbackAdmissionSlotReadState::Current(slot) = *state else {
+            panic!("slot must remain initialized")
+        };
+        assert!(slot.state().is_empty());
     }
 
     #[tokio::test]

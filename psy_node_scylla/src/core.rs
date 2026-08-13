@@ -22,6 +22,10 @@ use psy_node_core::store::rollback_admission::{
     RollbackAdmissionSlotBootstrap, RollbackAdmissionSlotReadState,
     RollbackAdmissionSlotWriteOutcome, SealedRollbackAdmissionSlotCas,
 };
+use psy_node_core::store::rollback_participant_plan::{
+    CoordinatorRollbackParticipantPlanStore, RollbackParticipantPlan,
+};
+use psy_node_core::store::rollback_topology::RollbackTopologySnapshot;
 use psy_node_core::store::realm_processor_startup::{
     RealmProcessorStartupError, RealmProcessorStartupExpectation,
     RealmProcessorStartupPreflightProvider,
@@ -35,6 +39,7 @@ use crate::rollback::{
     BranchExactSchemaSetupOutcome,
     CanonicalHeadNoTabletKeyspace, ScyllaCanonicalHeadStore,
     ScyllaBranchExactSchemaSetupGate, ScyllaRollbackAdmissionStore,
+    ScyllaRollbackParticipantPlanStore,
     ScyllaBranchExactShadowReader, PendingQueueSidecarKeyspaces,
     PendingQueueSidecarLifecycleError, PendingQueueSidecarReady,
     PendingQueueSidecarReadyView, PendingQueueSidecarSetupMode,
@@ -58,6 +63,8 @@ pub struct ScyllaCoreStore<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> {
     coordinator_commit_source_store:
         Arc<OnceLock<Arc<ScyllaCoordinatorCommitSourceStore>>>,
     rollback_admission_store: Arc<OnceLock<Arc<ScyllaRollbackAdmissionStore>>>,
+    rollback_participant_plan_store:
+        Arc<OnceLock<Arc<ScyllaRollbackParticipantPlanStore>>>,
     branch_exact_schema_ready: Arc<OnceLock<Arc<BranchExactSchemaReady>>>,
     pending_queue_sidecar_ready: Arc<OnceLock<Arc<PendingQueueSidecarReady>>>,
     _phantom_hash: std::marker::PhantomData<Hash>,
@@ -192,6 +199,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
             canonical_head_store: Arc::new(OnceLock::new()),
             coordinator_commit_source_store: Arc::new(OnceLock::new()),
             rollback_admission_store: Arc::new(OnceLock::new()),
+            rollback_participant_plan_store: Arc::new(OnceLock::new()),
             branch_exact_schema_ready: Arc::new(OnceLock::new()),
             pending_queue_sidecar_ready: Arc::new(OnceLock::new()),
             _phantom_hash: std::marker::PhantomData,
@@ -309,13 +317,37 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
         )?;
         if create_schema {
             ScyllaRollbackAdmissionStore::create_schema(&self.session, &keyspace).await?;
+            ScyllaRollbackParticipantPlanStore::create_schema(&self.session, &keyspace)
+                .await?;
         }
         let adapter = Arc::new(
-            ScyllaRollbackAdmissionStore::prepare(self.session.clone(), keyspace).await?,
+            ScyllaRollbackAdmissionStore::prepare(self.session.clone(), keyspace.clone()).await?,
+        );
+        let participant_plans = Arc::new(
+            ScyllaRollbackParticipantPlanStore::prepare(
+                self.session.clone(),
+                keyspace,
+            )
+            .await?,
         );
         self.rollback_admission_store
             .set(adapter)
             .map_err(|_| anyhow::anyhow!("Coordinator rollback-admission store initialized more than once"))?;
+        self.rollback_participant_plan_store
+            .set(participant_plans)
+            .map_err(|_| anyhow::anyhow!("Coordinator rollback participant-plan store initialized more than once"))?;
+        Ok(())
+    }
+
+    /// Explicit deployment-management operation.  It is separate from the
+    /// rollback RPC so a rollback request cannot redefine its own Realm set.
+    pub async fn install_coordinator_rollback_topology(
+        &self,
+        snapshot: &RollbackTopologySnapshot,
+    ) -> anyhow::Result<()> {
+        self.coordinator_rollback_participant_plans()?
+            .install_next_topology(snapshot)
+            .await?;
         Ok(())
     }
 
@@ -680,6 +712,17 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
                 "Coordinator rollback-admission store was not initialized by Coordinator setup"
             ))
     }
+
+    fn coordinator_rollback_participant_plans(
+        &self,
+    ) -> anyhow::Result<&ScyllaRollbackParticipantPlanStore> {
+        self.rollback_participant_plan_store
+            .get()
+            .map(Arc::as_ref)
+            .ok_or_else(|| anyhow::anyhow!(
+                "Coordinator rollback participant-plan store was not initialized by Coordinator setup"
+            ))
+    }
 }
 
 #[async_trait]
@@ -871,6 +914,46 @@ where
         Ok(self
             .coordinator_rollback_admission()?
             .compare_and_set(sealed)
+            .await?)
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoordinatorRollbackParticipantPlanStore<Hash>
+    for ScyllaCoreStore<Hash, Hasher>
+where
+    Hash: QHashBase + Q256BitHash,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn read_current_rollback_topology(
+        &self,
+        network: NetworkId,
+    ) -> anyhow::Result<Option<RollbackTopologySnapshot>> {
+        Ok(self
+            .coordinator_rollback_participant_plans()?
+            .read_current_topology(network)
+            .await?
+            .map(|receipt| receipt.snapshot().clone()))
+    }
+
+    async fn persist_verified_rollback_participant_plan(
+        &self,
+        plan: &RollbackParticipantPlan<Hash>,
+    ) -> anyhow::Result<()> {
+        self.coordinator_rollback_participant_plans()?
+            .persist_participant_plan(plan)
+            .await?;
+        Ok(())
+    }
+
+    async fn read_verified_rollback_participant_plan(
+        &self,
+        network: NetworkId,
+        digest: [u8; 32],
+    ) -> anyhow::Result<RollbackParticipantPlan<Hash>> {
+        Ok(self
+            .coordinator_rollback_participant_plans()?
+            .read_participant_plan(network, &digest)
             .await?)
     }
 }

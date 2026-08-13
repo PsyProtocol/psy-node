@@ -81,6 +81,13 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
         psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesJTMBGoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
             let db = setup_coordinator_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, false).await?;
+            if let Some(topology) = &config.rollback_topology {
+                db.store
+                    .install_coordinator_rollback_topology(
+                        &topology.try_snapshot(config.network)?,
+                    )
+                    .await?;
+            }
             let durable_guta_submissions = if config.durable_guta_submission_enabled {
                 db.store.initialize_pending_queue_sidecar_setup(
                     AuthorityScope::Coordinator,
@@ -100,7 +107,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
                 },
                 canonical_head_reader.clone(),
                 db.store.clone(),
-            ));
+            ).with_participant_plan_store(db.store.clone()));
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
             let handler = CoordinatorEdgeHandler::<N, _, _, _, _, _, _, _, _>::new(
@@ -129,6 +136,13 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
         psy_core::constants::chain_id::PsyChainNetworkType::InternalDevnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesJTMBGoldilocksPoseidon, PsyNetworkPsyTeamDevnetConstants>;
             let db = setup_coordinator_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, false).await?;
+            if let Some(topology) = &config.rollback_topology {
+                db.store
+                    .install_coordinator_rollback_topology(
+                        &topology.try_snapshot(config.network)?,
+                    )
+                    .await?;
+            }
             let durable_guta_submissions = if config.durable_guta_submission_enabled {
                 db.store.initialize_pending_queue_sidecar_setup(
                     AuthorityScope::Coordinator,
@@ -148,7 +162,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
                 },
                 canonical_head_reader.clone(),
                 db.store.clone(),
-            ));
+            ).with_participant_plan_store(db.store.clone()));
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
             let handler = CoordinatorEdgeHandler::<N, _, _, _, _, _, _, _, _>::new(

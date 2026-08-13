@@ -71,6 +71,13 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_coordinator_processor_n
         psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesJTMBGoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
             let db = setup_coordinator_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, true).await?;
+            if let Some(topology) = &config.rollback_topology {
+                db.store
+                    .install_coordinator_rollback_topology(
+                        &topology.try_snapshot(config.network)?,
+                    )
+                    .await?;
+            }
             let durable_guta_submissions = if config.durable_guta_submission_enabled {
                 db.store.initialize_pending_queue_sidecar_setup(
                     AuthorityScope::Coordinator,

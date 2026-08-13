@@ -46,11 +46,9 @@ use psy_node_core::{
             CoordinatorRollbackAdminInbox, RollbackAdminInboxAccess,
             RollbackAdminInboxPhase, RollbackAdminInboxStatus,
             RollbackAdminStartDisposition as CoreRollbackAdminStartDisposition,
-            RollbackAdminStartIntent,
+            RollbackAdminPlannedStartIntent,
         },
-        rollback_control::{
-            RollbackExecutionMode, RollbackPlanDigest, RollbackRequest,
-        },
+        rollback_control::{RollbackExecutionMode, RollbackRequest},
         timestamp::{CommitWriteTimestampUs, TimestampFenceWindow},
     },
     store::traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore},
@@ -256,7 +254,8 @@ mod rollback_admin_tests {
             delete_fence_timestamp_us: 1_001,
             new_branch_write_timestamp_us: 1_002,
             execution_mode: RollbackAdminExecutionMode::InPlace,
-            plan_digest_hex: format!("0x{}", "a5".repeat(32)),
+            topology_revision: 3,
+            topology_digest_hex: format!("0x{}", "a5".repeat(32)),
         }
     }
 
@@ -266,7 +265,8 @@ mod rollback_admin_tests {
         assert_eq!(intent.expected_revision().get(), 7);
         assert_eq!(intent.target().checkpoint_id().get(), 90);
         assert_eq!(intent.fence_window().delete_fence().as_i64(), 1_001);
-        assert_eq!(intent.plan_digest().as_bytes(), &[0xA5; 32]);
+        assert_eq!(intent.topology_revision(), 3);
+        assert_eq!(intent.topology_digest(), &[0xA5; 32]);
     }
 
     #[test]
@@ -281,13 +281,20 @@ mod rollback_admin_tests {
         );
 
         let mut invalid = request();
-        invalid.plan_digest_hex = "00".repeat(31);
+        invalid.topology_digest_hex = "00".repeat(31);
         assert!(
             parse_rollback_admin_intent(invalid)
                 .unwrap_err()
                 .to_string()
-                .contains("ROLLBACK_ADMIN_INVALID_PLAN_DIGEST_LENGTH")
+                .contains("ROLLBACK_ADMIN_INVALID_TOPOLOGY_DIGEST_LENGTH")
         );
+
+        let mut invalid = request();
+        invalid.execution_mode = RollbackAdminExecutionMode::SnapshotReplay;
+        assert!(parse_rollback_admin_intent(invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("ROLLBACK_ADMIN_IN_PLACE_ONLY"));
 
         let mut invalid = request();
         invalid.delete_fence_timestamp_us = invalid.orphan_write_max_timestamp_us;
@@ -373,7 +380,7 @@ fn map_admin_request<Hash: Copy>(
 
 fn parse_rollback_admin_intent<Hash: Q256BitHash>(
     request: RollbackAdminStartRequest<Hash>,
-) -> anyhow::Result<RollbackAdminStartIntent<Hash>> {
+) -> anyhow::Result<RollbackAdminPlannedStartIntent<Hash>> {
     if request.request_version != ROLLBACK_ADMIN_START_REQUEST_VERSION {
         anyhow::bail!(
             "ROLLBACK_ADMIN_UNSUPPORTED_REQUEST_VERSION:{}",
@@ -381,22 +388,21 @@ fn parse_rollback_admin_intent<Hash: Q256BitHash>(
         );
     }
     let digest_hex = request
-        .plan_digest_hex
+        .topology_digest_hex
         .strip_prefix("0x")
-        .or_else(|| request.plan_digest_hex.strip_prefix("0X"))
-        .unwrap_or(&request.plan_digest_hex);
+        .or_else(|| request.topology_digest_hex.strip_prefix("0X"))
+        .unwrap_or(&request.topology_digest_hex);
     let digest_bytes = hex::decode(digest_hex)
-        .map_err(|error| anyhow::anyhow!("ROLLBACK_ADMIN_INVALID_PLAN_DIGEST:{error}"))?;
+        .map_err(|error| anyhow::anyhow!("ROLLBACK_ADMIN_INVALID_TOPOLOGY_DIGEST:{error}"))?;
     let digest: [u8; 32] = digest_bytes.try_into().map_err(|bytes: Vec<u8>| {
         anyhow::anyhow!(
-            "ROLLBACK_ADMIN_INVALID_PLAN_DIGEST_LENGTH:{}",
+            "ROLLBACK_ADMIN_INVALID_TOPOLOGY_DIGEST_LENGTH:{}",
             bytes.len()
         )
     })?;
-    let execution_mode = match request.execution_mode {
-        RollbackAdminExecutionMode::InPlace => RollbackExecutionMode::InPlace,
-        RollbackAdminExecutionMode::SnapshotReplay => RollbackExecutionMode::SnapshotReplay,
-    };
+    if request.execution_mode != RollbackAdminExecutionMode::InPlace {
+        anyhow::bail!("ROLLBACK_ADMIN_IN_PLACE_ONLY");
+    }
     let orphan_write_max = CommitWriteTimestampUs::try_from_i128(i128::from(
         request.orphan_write_max_timestamp_us,
     ))?;
@@ -405,7 +411,7 @@ fn parse_rollback_admin_intent<Hash: Q256BitHash>(
         i128::from(request.delete_fence_timestamp_us),
         i128::from(request.new_branch_write_timestamp_us),
     )?;
-    Ok(RollbackAdminStartIntent::new(
+    Ok(RollbackAdminPlannedStartIntent::new(
         CanonicalHeadRevision::try_new(request.expected_revision)?,
         request.expected_canonical_ref,
         CheckpointRef::new(
@@ -413,8 +419,8 @@ fn parse_rollback_admin_intent<Hash: Q256BitHash>(
             CheckpointHash::from_last_chain_hash(request.target_checkpoint_hash),
         ),
         fence_window,
-        execution_mode,
-        RollbackPlanDigest::try_new(digest)?,
+        request.topology_revision,
+        digest,
     ))
 }
 
@@ -617,7 +623,7 @@ impl<
         request: RollbackAdminStartRequest<N::QHash>,
     ) -> anyhow::Result<RollbackAdminStartResponse<N::QHash>> {
         let intent = parse_rollback_admin_intent(request)?;
-        let receipt = self.rollback_admin_inbox.start(intent).await?;
+        let receipt = self.rollback_admin_inbox.start_planned(intent).await?;
         Ok(RollbackAdminStartResponse {
             disposition: map_admin_disposition(receipt.disposition()),
             status: self.map_admin_status(receipt.status()),
