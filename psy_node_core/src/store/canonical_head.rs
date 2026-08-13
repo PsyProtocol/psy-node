@@ -496,6 +496,7 @@ pub trait CoordinatorCanonicalHeadReader<Hash: Q256BitHash>: Send + Sync {
 #[async_trait]
 pub trait CoordinatorCanonicalHeadStore<Hash: Q256BitHash>:
     CoordinatorCanonicalHeadReader<Hash>
+    + super::coordinator_commit_source::CoordinatorCommitSourceStore<Hash>
 {
     async fn bootstrap_canonical_head(
         &self,

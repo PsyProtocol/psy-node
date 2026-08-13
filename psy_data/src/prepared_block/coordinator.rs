@@ -1,6 +1,15 @@
 use parth_core::{
     crypto::hash::{merkle_proof::DeltaMerkleProofCore, traits::MerkleHasher},
     QCoreProcCheckpointUniqueId,
+    felt::QFelt64,
+    protocol::core_types::Q256BitHash,
+};
+#[cfg(feature = "rand_gen")]
+use parth_core::utils::QPGenRandom;
+use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
+use psy_serialize::{
+    FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata,
+    PsyIOReadWrite,
 };
 
 use crate::{
@@ -36,6 +45,159 @@ pub struct PsyPreparedCoordinatorBlockStateUpdates<F, Hash> {
 
     pub checkpoint_tree_update_proof: DeltaMerkleProofCore<Hash>,
 }
+
+#[cfg(feature = "rand_gen")]
+impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom
+    for PsyPreparedCoordinatorBlockStateUpdates<F, Hash>
+{
+    fn qp_rand_gen() -> Self {
+        Self {
+            coordinator_id: QPGenRandom::qp_rand_gen(),
+            checkpoint_id: QPGenRandom::qp_rand_gen(),
+            unique_pending_id: QPGenRandom::qp_rand_gen(),
+            proc_checkpoint_unique_id: QPGenRandom::qp_rand_gen(),
+            old_base: QPGenRandom::qp_rand_gen(),
+            new_base: QPGenRandom::qp_rand_gen(),
+            update_global_contract_tree_nodes_ffs: QPGenRandom::qp_rand_gen_vec(32),
+            update_contract_function_tree_nodes_ffs: QPGenRandom::qp_rand_gen_vec(32),
+            new_contract_leaves_ffs: QPGenRandom::qp_rand_gen_vec(32),
+            new_contract_code_definitions: QPGenRandom::qp_rand_gen_vec(4),
+            update_user_registration_tree_nodes_ffs: QPGenRandom::qp_rand_gen_vec(32),
+            new_user_public_keys_ffs: QPGenRandom::qp_rand_gen_vec(32),
+            new_public_key_hash_to_user_id_rows_ffs: QPGenRandom::qp_rand_gen_vec(32),
+            update_global_user_tree_nodes_ffs: QPGenRandom::qp_rand_gen_vec(32),
+            new_realm_guta_reward_tree_node_keys_ffs: QPGenRandom::qp_rand_gen_vec(32),
+            checkpoint_tree_update_proof: QPGenRandom::qp_rand_gen(),
+        }
+    }
+}
+
+impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata
+    for PsyPreparedCoordinatorBlockStateUpdates<F, Hash>
+{
+    const IS_FIXED_SIZE: bool = false;
+    const FIXED_SIZE: usize = 0;
+}
+
+impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical
+    for PsyPreparedCoordinatorBlockStateUpdates<F, Hash>
+{
+    fn fallback_pio_serialized_size(&self) -> usize {
+        8 + 8 + 8 + 16
+            + self.old_base.pio_serialized_size()
+            + self.new_base.pio_serialized_size()
+            + 4 + self.update_global_contract_tree_nodes_ffs.len()
+            + 4 + self.update_contract_function_tree_nodes_ffs.len()
+            + 4 + self.new_contract_leaves_ffs.len()
+            + 4 + self
+                .new_contract_code_definitions
+                .iter()
+                .map(PsyIOReadWrite::pio_serialized_size)
+                .sum::<usize>()
+            + 4 + self.update_user_registration_tree_nodes_ffs.len()
+            + 4 + self.new_user_public_keys_ffs.len()
+            + 4 + self.new_public_key_hash_to_user_id_rows_ffs.len()
+            + 4 + self.update_global_user_tree_nodes_ffs.len()
+            + 4 + self.new_realm_guta_reward_tree_node_keys_ffs.len()
+            + self.checkpoint_tree_update_proof.pio_serialized_size()
+    }
+
+    fn fallback_pio_write_to_io<W: psy_io::Write>(
+        &self,
+        writer: &mut W,
+    ) -> anyhow::Result<()> {
+        writer.psy_write_u64(self.coordinator_id)?;
+        writer.psy_write_u64(self.checkpoint_id)?;
+        writer.psy_write_u64(self.unique_pending_id)?;
+        writer.psy_write_u128(self.proc_checkpoint_unique_id)?;
+        self.old_base.pio_write_to_io(writer)?;
+        self.new_base.pio_write_to_io(writer)?;
+        writer.psy_write_bytes_vec(&self.update_global_contract_tree_nodes_ffs)?;
+        writer.psy_write_bytes_vec(&self.update_contract_function_tree_nodes_ffs)?;
+        writer.psy_write_bytes_vec(&self.new_contract_leaves_ffs)?;
+        writer.psy_write_vec_length(self.new_contract_code_definitions.len())?;
+        for definition in &self.new_contract_code_definitions {
+            definition.pio_write_to_io(writer)?;
+        }
+        writer.psy_write_bytes_vec(&self.update_user_registration_tree_nodes_ffs)?;
+        writer.psy_write_bytes_vec(&self.new_user_public_keys_ffs)?;
+        writer.psy_write_bytes_vec(&self.new_public_key_hash_to_user_id_rows_ffs)?;
+        writer.psy_write_bytes_vec(&self.update_global_user_tree_nodes_ffs)?;
+        writer.psy_write_bytes_vec(&self.new_realm_guta_reward_tree_node_keys_ffs)?;
+        self.checkpoint_tree_update_proof.pio_write_to_io(writer)?;
+        Ok(())
+    }
+
+    fn fallback_pio_read_from_io<R: psy_io::Read>(
+        reader: &mut R,
+    ) -> anyhow::Result<Self> {
+        let coordinator_id = reader.psy_read_u64()?;
+        let checkpoint_id = reader.psy_read_u64()?;
+        let unique_pending_id = reader.psy_read_u64()?;
+        let proc_checkpoint_unique_id = reader.psy_read_u128()?;
+        let old_base = PsyCoordinatorPendingCheckpointBase::pio_read_from_io(reader)?;
+        let new_base = PsyCoordinatorPendingCheckpointBase::pio_read_from_io(reader)?;
+        let update_global_contract_tree_nodes_ffs = reader.psy_read_bytes_vec()?;
+        let update_contract_function_tree_nodes_ffs = reader.psy_read_bytes_vec()?;
+        let new_contract_leaves_ffs = reader.psy_read_bytes_vec()?;
+        let definition_count = reader.psy_read_vec_length()?;
+        if definition_count > 1_048_576 {
+            anyhow::bail!(
+                "Coordinator prepared update has too many contract definitions: {}",
+                definition_count
+            );
+        }
+        let mut new_contract_code_definitions = Vec::with_capacity(definition_count);
+        for _ in 0..definition_count {
+            new_contract_code_definitions.push(
+                ContractCodeDefinitionWithContractId::pio_read_from_io(reader)?,
+            );
+        }
+        let update_user_registration_tree_nodes_ffs = reader.psy_read_bytes_vec()?;
+        let new_user_public_keys_ffs = reader.psy_read_bytes_vec()?;
+        let new_public_key_hash_to_user_id_rows_ffs = reader.psy_read_bytes_vec()?;
+        let update_global_user_tree_nodes_ffs = reader.psy_read_bytes_vec()?;
+        let new_realm_guta_reward_tree_node_keys_ffs = reader.psy_read_bytes_vec()?;
+        let checkpoint_tree_update_proof = DeltaMerkleProofCore::pio_read_from_io(reader)?;
+        Ok(Self {
+            coordinator_id,
+            checkpoint_id,
+            unique_pending_id,
+            proc_checkpoint_unique_id,
+            old_base,
+            new_base,
+            update_global_contract_tree_nodes_ffs,
+            update_contract_function_tree_nodes_ffs,
+            new_contract_leaves_ffs,
+            new_contract_code_definitions,
+            update_user_registration_tree_nodes_ffs,
+            new_user_public_keys_ffs,
+            new_public_key_hash_to_user_id_rows_ffs,
+            update_global_user_tree_nodes_ffs,
+            new_realm_guta_reward_tree_node_keys_ffs,
+            checkpoint_tree_update_proof,
+        })
+    }
+}
+
+#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
+psy_serialize::impl_psy_canonical_serialize_for_speedy!(
+    PsyPreparedCoordinatorBlockStateUpdates,
+    { F: QFelt64, Hash: Q256BitHash } => { F, Hash }
+);
+
+#[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
+impl<F: QFelt64, Hash: Q256BitHash>
+    psy_serialize::AutoImplementFallbackPsySerializeCanonical
+    for PsyPreparedCoordinatorBlockStateUpdates<F, Hash>
+{
+}
+
+pser::impl_psy_ser_basic_tests_fallback!(
+    PsyPreparedCoordinatorBlockStateUpdates,
+    { parth_core::PF, parth_core::PHash },
+    psy_prepared_coordinator_block_state_updates_tests
+);
 
 impl<F: Copy + PartialEq, Hash: Copy + PartialEq> PsyPreparedCoordinatorBlockStateUpdates<F, Hash> {
     pub fn get_public_inputs_verifiable_state_transition(

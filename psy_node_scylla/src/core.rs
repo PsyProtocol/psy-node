@@ -13,6 +13,9 @@ use psy_node_core::store::canonical_head::{
     CoordinatorCanonicalHeadReader, CoordinatorCanonicalHeadStore, NetworkId,
     SealedCanonicalHeadCas,
 };
+use psy_node_core::store::coordinator_commit_source::{
+    CoordinatorCommitSource, CoordinatorCommitSourceStore,
+};
 use psy_node_core::store::rollback_admission::{
     CoordinatorRollbackAdmissionReader, CoordinatorRollbackAdmissionStore,
     RollbackAdmissionSlotBootstrap, RollbackAdmissionSlotReadState,
@@ -37,6 +40,7 @@ use crate::rollback::{
     PendingQueueSidecarSetupOutcome, ScyllaPendingQueueSidecarSetupGate,
     ScyllaCoordinatorGutaDurableSubmissionStore,
     ScyllaCoordinatorProcessorDurableCaptureFactory,
+    ScyllaCoordinatorCommitSourceStore,
 };
 use crate::rollback::branch_exact_startup_preflight::ScyllaRealmProcessorStartupPreflightProvider;
 use crate::tables::{merkle::ScyllaMerkleNodesZeroPreparedStatements, traits::ScyllaStandardPreparedTableStatements};
@@ -50,6 +54,8 @@ pub struct ScyllaCoreStore<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> {
     pub realm_id: u64,
     pub realm_sub_id: u64,
     canonical_head_store: Arc<OnceLock<Arc<ScyllaCanonicalHeadStore>>>,
+    coordinator_commit_source_store:
+        Arc<OnceLock<Arc<ScyllaCoordinatorCommitSourceStore>>>,
     rollback_admission_store: Arc<OnceLock<Arc<ScyllaRollbackAdmissionStore>>>,
     branch_exact_schema_ready: Arc<OnceLock<Arc<BranchExactSchemaReady>>>,
     pending_queue_sidecar_ready: Arc<OnceLock<Arc<PendingQueueSidecarReady>>>,
@@ -183,6 +189,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
             realm_id,
             realm_sub_id,
             canonical_head_store: Arc::new(OnceLock::new()),
+            coordinator_commit_source_store: Arc::new(OnceLock::new()),
             rollback_admission_store: Arc::new(OnceLock::new()),
             branch_exact_schema_ready: Arc::new(OnceLock::new()),
             pending_queue_sidecar_ready: Arc::new(OnceLock::new()),
@@ -258,13 +265,27 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
         )?;
         if create_schema {
             ScyllaCanonicalHeadStore::create_schema(&self.session, &keyspace).await?;
+            ScyllaCoordinatorCommitSourceStore::create_schema(&self.session, &keyspace)
+                .await?;
         }
         let adapter = Arc::new(
-            ScyllaCanonicalHeadStore::prepare(self.session.clone(), keyspace).await?,
+            ScyllaCanonicalHeadStore::prepare(self.session.clone(), keyspace.clone()).await?,
+        );
+        let commit_sources = Arc::new(
+            ScyllaCoordinatorCommitSourceStore::prepare(
+                self.session.clone(),
+                keyspace,
+            )
+            .await?,
         );
         self.canonical_head_store
             .set(adapter)
             .map_err(|_| anyhow::anyhow!("Coordinator canonical-head store initialized more than once"))?;
+        self.coordinator_commit_source_store
+            .set(commit_sources)
+            .map_err(|_| anyhow::anyhow!(
+                "Coordinator commit-source store initialized more than once"
+            ))?;
         Ok(())
     }
 
@@ -629,6 +650,17 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
             ))
     }
 
+    fn coordinator_commit_sources(
+        &self,
+    ) -> anyhow::Result<&ScyllaCoordinatorCommitSourceStore> {
+        self.coordinator_commit_source_store
+            .get()
+            .map(Arc::as_ref)
+            .ok_or_else(|| anyhow::anyhow!(
+                "Coordinator commit-source store was not initialized by Coordinator setup"
+            ))
+    }
+
     fn coordinator_rollback_admission(
         &self,
     ) -> anyhow::Result<&ScyllaRollbackAdmissionStore> {
@@ -638,6 +670,44 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
             .ok_or_else(|| anyhow::anyhow!(
                 "Coordinator rollback-admission store was not initialized by Coordinator setup"
             ))
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoordinatorCommitSourceStore<Hash>
+    for ScyllaCoreStore<Hash, Hasher>
+where
+    Hash: QHashBase + Q256BitHash,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn persist_coordinator_commit_source(
+        &self,
+        source: &CoordinatorCommitSource<Hash>,
+    ) -> anyhow::Result<()> {
+        Ok(self
+            .coordinator_commit_sources()?
+            .persist_and_readback(source)
+            .await?)
+    }
+
+    async fn read_coordinator_commit_source(
+        &self,
+        candidate: &psy_data::protocol::canonical_chain::CanonicalChainRef<Hash>,
+    ) -> anyhow::Result<Option<CoordinatorCommitSource<Hash>>> {
+        Ok(self
+            .coordinator_commit_sources()?
+            .read_source(candidate)
+            .await?)
+    }
+
+    async fn mark_coordinator_commit_source_committed(
+        &self,
+        source: &CoordinatorCommitSource<Hash>,
+    ) -> anyhow::Result<()> {
+        Ok(self
+            .coordinator_commit_sources()?
+            .mark_committed_and_readback(source)
+            .await?)
     }
 }
 

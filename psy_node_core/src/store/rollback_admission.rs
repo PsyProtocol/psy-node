@@ -771,6 +771,34 @@ mod tests {
     }
 
     #[async_trait]
+    impl super::super::coordinator_commit_source::CoordinatorCommitSourceStore<PHash>
+        for MemoryCanonicalStore
+    {
+        async fn persist_coordinator_commit_source(
+            &self,
+            _source: &super::super::coordinator_commit_source::CoordinatorCommitSource<PHash>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("rollback-admission fixture has no normal commit-source writer")
+        }
+
+        async fn read_coordinator_commit_source(
+            &self,
+            _candidate: &CanonicalChainRef<PHash>,
+        ) -> anyhow::Result<Option<
+            super::super::coordinator_commit_source::CoordinatorCommitSource<PHash>,
+        >> {
+            Ok(None)
+        }
+
+        async fn mark_coordinator_commit_source_committed(
+            &self,
+            _source: &super::super::coordinator_commit_source::CoordinatorCommitSource<PHash>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("rollback-admission fixture has no normal commit-source writer")
+        }
+    }
+
+    #[async_trait]
     impl CoordinatorCanonicalHeadStore<PHash> for MemoryCanonicalStore {
         async fn bootstrap_canonical_head(
             &self,

@@ -39,6 +39,11 @@ use psy_node_core::store::{
         CoordinatorCanonicalHeadStore, NetworkId, SealedCanonicalHeadCas,
         StoredCanonicalHead,
     },
+    coordinator_commit_source::{
+        CoordinatorCommitSource, CoordinatorCommitSourceCommitted,
+        CoordinatorCommitSourcePayload,
+        CoordinatorCommitSourceStore,
+    },
     traits::core_db::{
     CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseBidirectionalU64U128MappingWriter, CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter, CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseHashToManyIdsReader, CoreDatabaseHashToManyIdsWriter, CoreDatabaseIMTKeyIndexReader, CoreDatabaseIMTKeyIndexWriter, CoreDatabaseIMTNextAppendIndexReader, CoreDatabaseIMTNextAppendIndexWriter, CoreDatabaseIMTLeafReader, CoreDatabaseIMTLeafWriter, CoreDatabaseKivReader, CoreDatabaseKivWriter, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter, CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseTagTreeReader, CoreDatabaseTagTreeWriter, CoreDatabaseU64CounterReader, CoreDatabaseU64CounterStore, CoreDatabaseU64CounterWriter, CoreDatabaseU64Reader, CoreDatabaseU64Store, CoreDatabaseU64Writer, CoreDatabaseZeroIdMerkleDumpReader, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter, MerkleTreeDumpStrategy
     },
@@ -67,6 +72,10 @@ pub struct InMemoryCoreStore<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash> + S
     /// Coordinator control-plane authority, separate from the 32 logical state
     /// tables. DashMap entry guards provide per-network atomic CAS semantics.
     canonical_heads: Arc<DashMap<NetworkId, StoredCanonicalHead<Hash>>>,
+    coordinator_commit_sources:
+        Arc<DashMap<Vec<u8>, CoordinatorCommitSource<Hash>>>,
+    coordinator_commit_markers:
+        Arc<DashMap<Vec<u8>, CoordinatorCommitSourceCommitted>>,
     /// Keyspace name for table naming (similar to ScyllaDB keyspace)
     pub keyspace: String,
     /// No-tablet keyspace name (for compatibility with ScyllaDB interface)
@@ -92,6 +101,8 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash> + Send + Sync> InMemoryCore
             tables: Arc::new(DashMap::new()),
             u64_tables: Arc::new(DashMap::new()),
             canonical_heads: Arc::new(DashMap::new()),
+            coordinator_commit_sources: Arc::new(DashMap::new()),
+            coordinator_commit_markers: Arc::new(DashMap::new()),
             keyspace: String::new(),
             no_tablet_keyspace: String::new(),
             realm_id: 0,
@@ -108,6 +119,8 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash> + Send + Sync> InMemoryCore
             tables: Arc::new(DashMap::new()),
             u64_tables: Arc::new(DashMap::new()),
             canonical_heads: Arc::new(DashMap::new()),
+            coordinator_commit_sources: Arc::new(DashMap::new()),
+            coordinator_commit_markers: Arc::new(DashMap::new()),
             keyspace,
             no_tablet_keyspace,
             realm_id,
@@ -217,6 +230,71 @@ where
             Some(current) => CanonicalHeadReadState::Current(*current),
             None => CanonicalHeadReadState::Uninitialized,
         })
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoordinatorCommitSourceStore<Hash>
+    for InMemoryCoreStore<Hash, Hasher>
+where
+    Hash: QHashBase + Q256BitHash + Copy,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn persist_coordinator_commit_source(
+        &self,
+        source: &CoordinatorCommitSource<Hash>,
+    ) -> anyhow::Result<()> {
+        CoordinatorCommitSourcePayload::decode_canonical(
+            source.prepared_update(),
+        )?;
+        let key = source.candidate().to_canonical_bytes().to_vec();
+        match self.coordinator_commit_sources.entry(key) {
+            Entry::Vacant(entry) => {
+                entry.insert(source.clone());
+                Ok(())
+            }
+            Entry::Occupied(entry) if entry.get() == source => Ok(()),
+            Entry::Occupied(_) => anyhow::bail!(
+                "Coordinator commit-source identity already contains different content"
+            ),
+        }
+    }
+
+    async fn read_coordinator_commit_source(
+        &self,
+        candidate: &psy_data::protocol::canonical_chain::CanonicalChainRef<Hash>,
+    ) -> anyhow::Result<Option<CoordinatorCommitSource<Hash>>> {
+        Ok(self
+            .coordinator_commit_sources
+            .get(candidate.to_canonical_bytes().as_slice())
+            .map(|source| source.clone()))
+    }
+
+    async fn mark_coordinator_commit_source_committed(
+        &self,
+        source: &CoordinatorCommitSource<Hash>,
+    ) -> anyhow::Result<()> {
+        let key = source.candidate().to_canonical_bytes().to_vec();
+        match self.coordinator_commit_sources.get(key.as_slice()) {
+            Some(current) if current.value() == source => {}
+            Some(_) => anyhow::bail!(
+                "Coordinator commit source changed before COMMITTED marker"
+            ),
+            None => anyhow::bail!(
+                "Coordinator commit source is missing before COMMITTED marker"
+            ),
+        }
+        let marker = source.committed_marker();
+        match self.coordinator_commit_markers.entry(key) {
+            Entry::Vacant(entry) => {
+                entry.insert(marker);
+                Ok(())
+            }
+            Entry::Occupied(entry) if *entry.get() == marker => Ok(()),
+            Entry::Occupied(_) => anyhow::bail!(
+                "Coordinator COMMITTED marker identity already contains different content"
+            ),
+        }
     }
 }
 

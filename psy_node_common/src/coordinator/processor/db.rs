@@ -57,6 +57,9 @@ use psy_node_core::{
             CanonicalHeadWriteOutcome, CoordinatorCanonicalHeadStore, NetworkId,
             StoredCanonicalHead,
         },
+        coordinator_commit_source::{
+            CoordinatorCommitSource, CoordinatorCommitSourcePayload,
+        },
         rollback_admission::{
             CoordinatorRollbackAdmissionBoundary,
             CoordinatorRollbackAdmissionStore,
@@ -65,6 +68,7 @@ use psy_node_core::{
         traits::proof_store::QParthProofStore,
     },
 };
+use psy_serialize::PsyIOReadWrite;
 
 use crate::{
     backup::{checkpoint_tree::CheckpointTreeBackupManager, coordinator::generate_coordinator_output_from_backups},
@@ -662,6 +666,29 @@ impl<
                 self.canonical_head = Some(current);
             }
             CanonicalHeadStartupPlan::PublishMaterialized(sealed) => {
+                let source = self
+                    .canonical_head_store
+                    .read_coordinator_commit_source(
+                        sealed.candidate().canonical_ref(),
+                    )
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "materialized Coordinator checkpoint cannot be published because its durable commit source is missing"
+                    ))?;
+                if source.expected_revision()
+                    != sealed.expected().revision().get()
+                    || source.expected()
+                        != sealed.expected().canonical_ref()
+                    || source.candidate()
+                        != sealed.candidate().canonical_ref()
+                {
+                    anyhow::bail!(
+                        "materialized Coordinator checkpoint commit source does not match startup canonical-head transition"
+                    );
+                }
+                self.canonical_head_store
+                    .mark_coordinator_commit_source_committed(&source)
+                    .await?;
                 let outcome = self
                     .canonical_head_store
                     .compare_and_set_canonical_head(&sealed)
@@ -679,12 +706,16 @@ impl<
         &mut self,
         checkpoint_id: u64,
         checkpoint_hash: N::QHash,
+        commit_source: Option<&CoordinatorCommitSource<N::QHash>>,
     ) -> anyhow::Result<()> {
         let checkpoint = CheckpointRef::new(
             CheckpointId::new(checkpoint_id),
             CheckpointHash::from_last_chain_hash(checkpoint_hash),
         );
         let published = if checkpoint_id == 0 {
+            if commit_source.is_some() {
+                anyhow::bail!("genesis canonical-head publish cannot consume a normal commit source");
+            }
             let bootstrap = self.pending_genesis_head.as_ref().ok_or_else(|| {
                 anyhow::anyhow!(
                     "genesis canonical-head publish requires an explicit pending GENESIS_NATIVE bootstrap"
@@ -703,6 +734,9 @@ impl<
                 .await?;
             Self::require_published_outcome("genesis publish", outcome)?
         } else {
+            let source = commit_source.ok_or_else(|| anyhow::anyhow!(
+                "normal checkpoint canonical-head publish requires an exact COMMITTED source"
+            ))?;
             let expected = self.canonical_head.ok_or_else(|| {
                 anyhow::anyhow!(
                     "normal checkpoint {} cannot publish before canonical-head bootstrap",
@@ -714,6 +748,14 @@ impl<
                 expected.canonical_ref().chain_epoch(),
                 checkpoint,
             );
+            if source.expected_revision() != expected.revision().get()
+                || source.expected() != expected.canonical_ref()
+                || source.candidate() != &proposed
+            {
+                anyhow::bail!(
+                    "normal checkpoint commit source does not match final canonical-head transition"
+                );
+            }
             let sealed = CanonicalHeadTransition::normal_checkpoint_advance(
                 expected,
                 proposed,
@@ -1244,6 +1286,54 @@ checkpoint_backup_copy_status={}
                 checkpoint_proof_public_inputs_hash,
             )?;
         }
+        let commit_source = if checkpoint_id == 0 {
+            None
+        } else {
+            let expected = self.canonical_head.ok_or_else(|| anyhow::anyhow!(
+                "normal checkpoint {} cannot persist a commit source before canonical-head bootstrap",
+                checkpoint_id
+            ))?;
+            let candidate = CanonicalChainRef::new(
+                self.network_id,
+                expected.canonical_ref().chain_epoch(),
+                CheckpointRef::new(
+                    CheckpointId::new(checkpoint_id),
+                    CheckpointHash::from_last_chain_hash(
+                        checkpoint_proof_public_inputs_hash,
+                    ),
+                ),
+            );
+            let mut prepared_update = Vec::with_capacity(
+                coordinator_update.pio_serialized_size(),
+            );
+            coordinator_update.pio_write_to_io(&mut prepared_update)?;
+            let mut cursor = psy_io::Cursor::new(prepared_update.as_slice());
+            let decoded = PsyPreparedCoordinatorBlockStateUpdates::<
+                N::F,
+                N::QHash,
+            >::pio_read_from_io(&mut cursor)?;
+            if decoded != coordinator_update
+                || cursor.position() != prepared_update.len() as u64
+            {
+                anyhow::bail!(
+                    "Coordinator prepared update failed canonical source roundtrip"
+                );
+            }
+            let source_payload = CoordinatorCommitSourcePayload::try_new(
+                prepared_update,
+                state_transition_circuit_type as u32,
+                zk_proof.clone(),
+            )?;
+            let source = CoordinatorCommitSource::try_new(
+                expected,
+                candidate,
+                source_payload.encode_canonical(),
+            )?;
+            self.canonical_head_store
+                .persist_coordinator_commit_source(&source)
+                .await?;
+            Some(source)
+        };
         let mut verifiable_checkpoint_transition = coordinator_update.get_public_inputs_verifiable_state_transition(
             self.genesis_checkpoint_state_transition_hash,
             self.circuit_fingerprint_config.checkpoint_state_transition_circuit_fingerprint,
@@ -1391,12 +1481,23 @@ checkpoint_backup_copy_status={}
             .await?;
         tracing::info!("Backed up checkpoint tree root for checkpoint ID: {}", checkpoint_id);
 
+        if let Some(source) = commit_source.as_ref() {
+            self.canonical_head_store
+                .mark_coordinator_commit_source_committed(source)
+                .await?;
+            tracing::info!(
+                "Marked durable Coordinator commit source COMMITTED for checkpoint ID: {}",
+                checkpoint_id
+            );
+        }
+
         // This is the final durable publish marker. All materialized state,
         // compatibility singletons, and the checkpoint-tree backup must be
         // durable before the canonical identity becomes externally usable.
         self.publish_canonical_head(
             checkpoint_id,
             checkpoint_proof_public_inputs_hash,
+            commit_source.as_ref(),
         )
         .await?;
         tracing::info!(
@@ -1733,6 +1834,56 @@ Checkpoint Root Hash: {}
 mod tests {
     use super::*;
     use parth_core::{pgoldilocks::PoseidonHasher, PHash};
+
+    #[test]
+    fn coordinator_commit_source_brackets_all_hot_writes_and_head_publish() {
+        let source = include_str!("db.rs");
+        let commit = source
+            .split("pub async fn commit_state(")
+            .nth(1)
+            .unwrap()
+            .split("pub fn print_coordinator_processor_state")
+            .next()
+            .unwrap();
+        let source_write = commit
+            .find("persist_coordinator_commit_source")
+            .unwrap();
+        let first_hot_write = commit
+            .find("set_verifiable_checkpoint_state_transition_and_zkp")
+            .unwrap();
+        let backup = commit.find("append_checkpoint_leaf_hash").unwrap();
+        let committed = commit
+            .find("mark_coordinator_commit_source_committed")
+            .unwrap();
+        let head = commit.rfind("self.publish_canonical_head(").unwrap();
+        assert!(source_write < first_hot_write);
+        assert!(first_hot_write < backup);
+        assert!(backup < committed);
+        assert!(committed < head);
+        assert!(commit.contains("CoordinatorCommitSourcePayload::try_new"));
+    }
+
+    #[test]
+    fn startup_publish_requires_exact_source_before_committed_marker() {
+        let source = include_str!("db.rs");
+        let startup = source
+            .split("CanonicalHeadStartupPlan::PublishMaterialized(sealed) =>")
+            .nth(1)
+            .unwrap()
+            .split("async fn publish_canonical_head")
+            .next()
+            .unwrap();
+        let read = startup
+            .find("read_coordinator_commit_source")
+            .unwrap();
+        let committed = startup
+            .find("mark_coordinator_commit_source_committed")
+            .unwrap();
+        let head = startup
+            .find("compare_and_set_canonical_head")
+            .unwrap();
+        assert!(read < committed && committed < head);
+    }
 
     #[test]
     fn validates_non_genesis_checkpoint_chain_commitment() {

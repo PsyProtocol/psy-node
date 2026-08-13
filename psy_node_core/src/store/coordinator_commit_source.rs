@@ -10,6 +10,8 @@
 
 use std::{error::Error, fmt};
 
+use async_trait::async_trait;
+
 use parth_core::protocol::core_types::Q256BitHash;
 use psy_data::protocol::canonical_chain::{
     CanonicalChainRef, CanonicalChainRefCodecError, CANONICAL_CHAIN_REF_V1_LEN,
@@ -22,16 +24,131 @@ use super::canonical_head::{
 
 const HEADER_MAGIC: &[u8; 8] = b"PSYCCSRC";
 const MARKER_MAGIC: &[u8; 8] = b"PSYCCCOM";
+const PAYLOAD_MAGIC: &[u8; 8] = b"PSYCCPAY";
 const CODEC_VERSION: u16 = 1;
 pub const COORDINATOR_PREPARED_UPDATE_CODEC_VERSION: u16 = 1;
 pub const COORDINATOR_COMMIT_SOURCE_FRAGMENT_BYTES: usize = 4 * 1024 * 1024;
 pub const COORDINATOR_COMMIT_SOURCE_MAX_BYTES: usize = 64 * 1024 * 1024;
-const MAX_FRAGMENTS: usize =
+pub const COORDINATOR_COMMIT_SOURCE_MAX_FRAGMENTS: usize =
     COORDINATOR_COMMIT_SOURCE_MAX_BYTES / COORDINATOR_COMMIT_SOURCE_FRAGMENT_BYTES;
 const SLOT_DOMAIN: &[u8] = b"psy.rollback.coordinator-commit-source-slot.v1\0";
 const SOURCE_DOMAIN: &[u8] = b"psy.rollback.coordinator-commit-source-bytes.v1\0";
 const OBJECT_DOMAIN: &[u8] = b"psy.rollback.coordinator-commit-source-object.v1\0";
 const MARKER_DOMAIN: &[u8] = b"psy.rollback.coordinator-commit-source-committed.v1\0";
+
+/// Canonical normal-commit input persisted inside the fragmented source.
+/// Besides the prepared state update it binds the exact proof/circuit bytes
+/// that are written to the checkpoint proof table. This prevents two commits
+/// with the same state/candidate identity but different proof payloads from
+/// sharing a source object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoordinatorCommitSourcePayload {
+    prepared_update: Vec<u8>,
+    circuit_type: u32,
+    proof: Vec<u8>,
+}
+
+impl CoordinatorCommitSourcePayload {
+    pub fn try_new(
+        prepared_update: Vec<u8>,
+        circuit_type: u32,
+        proof: Vec<u8>,
+    ) -> Result<Self, CoordinatorCommitSourceError> {
+        if prepared_update.is_empty() {
+            return Err(CoordinatorCommitSourceError::EmptyPreparedUpdate);
+        }
+        if proof.is_empty() {
+            return Err(CoordinatorCommitSourceError::EmptyNormalCheckpointProof);
+        }
+        let encoded_len = 8_usize
+            .checked_add(2 + 4 + 8 + 8)
+            .and_then(|length| length.checked_add(prepared_update.len()))
+            .and_then(|length| length.checked_add(proof.len()))
+            .ok_or(CoordinatorCommitSourceError::PreparedUpdateTooLarge {
+                actual: usize::MAX,
+                maximum: COORDINATOR_COMMIT_SOURCE_MAX_BYTES,
+            })?;
+        if encoded_len > COORDINATOR_COMMIT_SOURCE_MAX_BYTES {
+            return Err(CoordinatorCommitSourceError::PreparedUpdateTooLarge {
+                actual: encoded_len,
+                maximum: COORDINATOR_COMMIT_SOURCE_MAX_BYTES,
+            });
+        }
+        Ok(Self {
+            prepared_update,
+            circuit_type,
+            proof,
+        })
+    }
+
+    pub fn encode_canonical(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(
+            8 + 2 + 4 + 8 + 8 + self.prepared_update.len() + self.proof.len(),
+        );
+        bytes.extend_from_slice(PAYLOAD_MAGIC);
+        bytes.extend_from_slice(&CODEC_VERSION.to_be_bytes());
+        bytes.extend_from_slice(&self.circuit_type.to_be_bytes());
+        bytes.extend_from_slice(&(self.prepared_update.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(&(self.proof.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(&self.prepared_update);
+        bytes.extend_from_slice(&self.proof);
+        bytes
+    }
+
+    pub fn decode_canonical(
+        bytes: &[u8],
+    ) -> Result<Self, CoordinatorCommitSourceError> {
+        if bytes.len() > COORDINATOR_COMMIT_SOURCE_MAX_BYTES {
+            return Err(CoordinatorCommitSourceError::PreparedUpdateTooLarge {
+                actual: bytes.len(),
+                maximum: COORDINATOR_COMMIT_SOURCE_MAX_BYTES,
+            });
+        }
+        let mut cursor = Cursor::new(bytes);
+        if cursor.take(8)? != PAYLOAD_MAGIC {
+            return Err(CoordinatorCommitSourceError::InvalidPayloadMagic);
+        }
+        let version = cursor.u16()?;
+        if version != CODEC_VERSION {
+            return Err(CoordinatorCommitSourceError::UnknownPayloadVersion(version));
+        }
+        let circuit_type = cursor.u32()?;
+        let prepared_len_u64 = cursor.u64()?;
+        let proof_len_u64 = cursor.u64()?;
+        let prepared_len = usize::try_from(prepared_len_u64).map_err(|_| {
+            CoordinatorCommitSourceError::InvalidPersistedSourceLengthU64(
+                prepared_len_u64,
+            )
+        })?;
+        let proof_len = usize::try_from(proof_len_u64).map_err(|_| {
+            CoordinatorCommitSourceError::InvalidPersistedSourceLengthU64(
+                proof_len_u64,
+            )
+        })?;
+        let prepared_update = cursor.take(prepared_len)?.to_vec();
+        let proof = cursor.take(proof_len)?.to_vec();
+        if !cursor.is_empty() {
+            return Err(CoordinatorCommitSourceError::TrailingPayloadBytes);
+        }
+        let decoded = Self::try_new(prepared_update, circuit_type, proof)?;
+        if decoded.encode_canonical() != bytes {
+            return Err(CoordinatorCommitSourceError::NonCanonicalPayload);
+        }
+        Ok(decoded)
+    }
+
+    pub fn prepared_update(&self) -> &[u8] {
+        &self.prepared_update
+    }
+
+    pub const fn circuit_type(&self) -> u32 {
+        self.circuit_type
+    }
+
+    pub fn proof(&self) -> &[u8] {
+        &self.proof
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct CoordinatorCommitSourceSlot([u8; 32]);
@@ -58,6 +175,29 @@ pub struct CoordinatorCommitSource<Hash> {
     source_digest: [u8; 32],
     slot: CoordinatorCommitSourceSlot,
     digest: CoordinatorCommitSourceDigest,
+}
+
+/// Durable normal-commit source boundary. The canonical-head writer depends
+/// on this capability so neither the live commit path nor startup recovery can
+/// publish a normal candidate without first making its source and COMMITTED
+/// marker exact. Implementations must be append-only and fail closed on a
+/// same-identity/different-content observation.
+#[async_trait]
+pub trait CoordinatorCommitSourceStore<Hash: Q256BitHash>: Send + Sync {
+    async fn persist_coordinator_commit_source(
+        &self,
+        source: &CoordinatorCommitSource<Hash>,
+    ) -> anyhow::Result<()>;
+
+    async fn read_coordinator_commit_source(
+        &self,
+        candidate: &CanonicalChainRef<Hash>,
+    ) -> anyhow::Result<Option<CoordinatorCommitSource<Hash>>>;
+
+    async fn mark_coordinator_commit_source_committed(
+        &self,
+        source: &CoordinatorCommitSource<Hash>,
+    ) -> anyhow::Result<()>;
 }
 
 impl<Hash: Q256BitHash> CoordinatorCommitSource<Hash> {
@@ -201,7 +341,7 @@ impl<Hash: Q256BitHash> CoordinatorCommitSource<Hash> {
         let expected_fragment_count = source_len.div_ceil(COORDINATOR_COMMIT_SOURCE_FRAGMENT_BYTES);
         if fragment_count != expected_fragment_count
             || fragment_count == 0
-            || fragment_count > MAX_FRAGMENTS
+            || fragment_count > COORDINATOR_COMMIT_SOURCE_MAX_FRAGMENTS
             || fragments.len() != fragment_count
         {
             return Err(CoordinatorCommitSourceError::FragmentCountMismatch {
@@ -402,6 +542,7 @@ pub enum CoordinatorCommitSourceError {
     UnknownPreparedUpdateCodec(u16),
     RevisionOutOfCqlRange(u64),
     EmptyPreparedUpdate,
+    EmptyNormalCheckpointProof,
     PreparedUpdateTooLarge { actual: usize, maximum: usize },
     InvalidHeaderMagic,
     UnknownHeaderVersion(u16),
@@ -420,6 +561,10 @@ pub enum CoordinatorCommitSourceError {
     UnknownMarkerVersion(u16),
     MarkerDigestMismatch,
     NonCanonicalMarker,
+    InvalidPayloadMagic,
+    UnknownPayloadVersion(u16),
+    TrailingPayloadBytes,
+    NonCanonicalPayload,
 }
 
 impl fmt::Display for CoordinatorCommitSourceError {
@@ -544,5 +689,32 @@ mod tests {
             CoordinatorCommitSourceCommitted::decode_canonical(&marker),
             Err(CoordinatorCommitSourceError::MarkerDigestMismatch)
         ));
+    }
+
+    #[test]
+    fn normal_commit_payload_binds_prepared_update_circuit_and_proof() {
+        let payload = CoordinatorCommitSourcePayload::try_new(
+            vec![1, 2, 3],
+            17,
+            vec![4, 5, 6, 7],
+        )
+        .unwrap();
+        let bytes = payload.encode_canonical();
+        assert_eq!(
+            CoordinatorCommitSourcePayload::decode_canonical(&bytes).unwrap(),
+            payload
+        );
+        let mut forged = bytes.clone();
+        forged.push(0);
+        assert!(matches!(
+            CoordinatorCommitSourcePayload::decode_canonical(&forged),
+            Err(CoordinatorCommitSourceError::TrailingPayloadBytes)
+        ));
+        assert!(CoordinatorCommitSourcePayload::try_new(
+            vec![1],
+            17,
+            Vec::new(),
+        )
+        .is_err());
     }
 }

@@ -10,6 +10,8 @@ use parth_core::protocol::core_types::Q256BitHash;
 use psy_data::protocol::canonical_chain::{CanonicalChainRef, NetworkId};
 use psy_node_core::store::coordinator_commit_source::{
     CoordinatorCommitSource, CoordinatorCommitSourceCommitted,
+    CoordinatorCommitSourcePayload,
+    COORDINATOR_COMMIT_SOURCE_MAX_FRAGMENTS,
 };
 use scylla::{
     client::session::Session,
@@ -235,6 +237,8 @@ impl ScyllaCoordinatorCommitSourceStore {
         let fragments = self.read_fragments_for_slot(slot).await?;
         let source = CoordinatorCommitSource::decode_persisted(&header, fragments)
             .map_err(|error| CoordinatorCommitSourceStoreError::Codec(error.to_string()))?;
+        CoordinatorCommitSourcePayload::decode_canonical(source.prepared_update())
+            .map_err(|error| CoordinatorCommitSourceStoreError::Codec(error.to_string()))?;
         if source.candidate() != candidate || source.slot().as_bytes() != slot {
             return Err(CoordinatorCommitSourceStoreError::IdentityMismatch);
         }
@@ -343,6 +347,8 @@ impl ScyllaCoordinatorCommitSourceStore {
             &header,
             self.read_fragments_for_slot(slot).await?,
         ).map_err(|error| CoordinatorCommitSourceStoreError::Codec(error.to_string()))?;
+        CoordinatorCommitSourcePayload::decode_canonical(source.prepared_update())
+            .map_err(|error| CoordinatorCommitSourceStoreError::Codec(error.to_string()))?;
         if source.candidate().network_id() != network
             || source.candidate().chain_epoch().get() != epoch
             || source.candidate().checkpoint().checkpoint_id().get() != checkpoint
@@ -364,7 +370,11 @@ impl ScyllaCoordinatorCommitSourceStore {
         let mut fragments = Vec::new();
         for row in rows {
             let (index, revision, fragment) = row.map_err(driver)?;
-            if index < 0 || revision != ROW_REVISION {
+            if index < 0
+                || index as usize >= COORDINATOR_COMMIT_SOURCE_MAX_FRAGMENTS
+                || revision != ROW_REVISION
+                || fragments.len() >= COORDINATOR_COMMIT_SOURCE_MAX_FRAGMENTS
+            {
                 return Err(CoordinatorCommitSourceStoreError::MalformedRow);
             }
             fragments.push((index as usize, fragment));
