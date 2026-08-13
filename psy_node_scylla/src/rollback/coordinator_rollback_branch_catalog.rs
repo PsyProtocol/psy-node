@@ -77,9 +77,9 @@ const READ_TRANSITION_TEMPLATE: &str =
 const READ_LEGACY_TEMPLATE: &str =
     "SELECT value, WRITETIME(value) FROM {table} WHERE obj_id = ?";
 const READ_TARGET_FORWARD_TEMPLATE: &str =
-    "SELECT pending_id, mapping_digest, WRITETIME(pending_id), WRITETIME(mapping_digest) FROM {table} WHERE canonical_ref = ? LIMIT 2";
+    "SELECT pending_id, mapping_digest, WRITETIME(mapping_digest) FROM {table} WHERE canonical_ref = ? LIMIT 2";
 const READ_TARGET_REVERSE_TEMPLATE: &str =
-    "SELECT canonical_ref, mapping_digest, WRITETIME(canonical_ref), WRITETIME(mapping_digest) FROM {table} WHERE pending_id = ? LIMIT 2";
+    "SELECT canonical_ref, mapping_digest, WRITETIME(mapping_digest) FROM {table} WHERE pending_id = ? LIMIT 2";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CoordinatorRollbackBranchCatalogQueries {
@@ -1401,24 +1401,26 @@ impl ScyllaCoordinatorRollbackBranchCatalog {
             .into_rows_result()
             .map_err(driver)?;
         let rows = rows_result
-            .rows::<(Option<i64>, Option<Vec<u8>>, Option<i64>, Option<i64>)>()
+            .rows::<(Option<i64>, Option<Vec<u8>>, Option<i64>)>()
             .map_err(driver)?;
         rows.map(|row| {
-            let (pending, digest, pending_writetime, digest_writetime) =
-                row.map_err(driver)?;
+            let (pending, digest, row_writetime) = row.map_err(driver)?;
             let pending = pending.ok_or(CoordinatorRollbackBranchCatalogError::MissingColumn)?;
             let pending = u64::try_from(pending)
                 .map_err(|_| CoordinatorRollbackBranchCatalogError::IntegerOutOfRange)?;
+            let row_writetime = row_writetime
+                .ok_or(CoordinatorRollbackBranchCatalogError::MissingColumn)?;
             Ok(TargetForwardRow {
                 pending_id: UniquePendingId::try_new(pending)
                     .map_err(|_| CoordinatorRollbackBranchCatalogError::InvalidPending(pending))?,
                 mapping_digest: array_32(
                     digest.ok_or(CoordinatorRollbackBranchCatalogError::MissingColumn)?,
                 )?,
-                pending_writetime_us: pending_writetime
-                    .ok_or(CoordinatorRollbackBranchCatalogError::MissingColumn)?,
-                digest_writetime_us: digest_writetime
-                    .ok_or(CoordinatorRollbackBranchCatalogError::MissingColumn)?,
+                // Primary-key cells have no independent CQL writetime.  The
+                // mapping digest is the row's sole non-key value and is
+                // written in the same mutation as the complete key.
+                pending_writetime_us: row_writetime,
+                digest_writetime_us: row_writetime,
             })
         })
         .collect()
@@ -1440,21 +1442,20 @@ impl ScyllaCoordinatorRollbackBranchCatalog {
             .into_rows_result()
             .map_err(driver)?;
         let rows = rows_result
-            .rows::<(Option<Vec<u8>>, Option<Vec<u8>>, Option<i64>, Option<i64>)>()
+            .rows::<(Option<Vec<u8>>, Option<Vec<u8>>, Option<i64>)>()
             .map_err(driver)?;
         rows.map(|row| {
-            let (canonical_ref, digest, canonical_writetime, digest_writetime) =
-                row.map_err(driver)?;
+            let (canonical_ref, digest, row_writetime) = row.map_err(driver)?;
+            let row_writetime = row_writetime
+                .ok_or(CoordinatorRollbackBranchCatalogError::MissingColumn)?;
             Ok(TargetReverseRow {
                 canonical_ref: canonical_ref
                     .ok_or(CoordinatorRollbackBranchCatalogError::MissingColumn)?,
                 mapping_digest: array_32(
                     digest.ok_or(CoordinatorRollbackBranchCatalogError::MissingColumn)?,
                 )?,
-                canonical_writetime_us: canonical_writetime
-                    .ok_or(CoordinatorRollbackBranchCatalogError::MissingColumn)?,
-                digest_writetime_us: digest_writetime
-                    .ok_or(CoordinatorRollbackBranchCatalogError::MissingColumn)?,
+                canonical_writetime_us: row_writetime,
+                digest_writetime_us: row_writetime,
             })
         })
         .collect()
@@ -2043,5 +2044,8 @@ mod tests {
         assert!(golden.contains(BRANCH_TO_PENDING_TABLE));
         assert!(golden.contains(PENDING_TO_BRANCH_TABLE));
         assert_eq!(golden.matches("LIMIT 2").count(), 2);
+        assert!(!golden.contains("WRITETIME(pending_id)"));
+        assert!(!golden.contains("WRITETIME(canonical_ref)"));
+        assert_eq!(golden.matches("WRITETIME(mapping_digest)").count(), 2);
     }
 }

@@ -139,6 +139,9 @@ mod coordinator_rollback_archive_store;
 mod coordinator_rollback_branch_catalog;
 #[allow(dead_code)]
 mod coordinator_rollback_realm_reward_catalog;
+#[cfg(all(test, feature = "rf3-test-support"))]
+#[path = "../../tests/rf3/d1a08_coordinator_archive.rs"]
+mod coordinator_rollback_archive_rf3;
 mod rollback_admission;
 mod identity;
 mod key;
