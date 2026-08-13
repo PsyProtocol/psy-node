@@ -45,6 +45,11 @@ use super::{
         CoordinatorCommitPreBarrierReadinessReceipt,
         ScyllaCoordinatorCommitPhysicalArchiveOwner,
     },
+    coordinator_commit_delete_restore_plan_store::{
+        CoordinatorCommitDeleteRestorePlanStoreError,
+        PersistedCoordinatorCommitDeleteRestorePlan,
+        ScyllaCoordinatorCommitDeleteRestorePlanStore,
+    },
     coordinator_rollback_archive_store::COORDINATOR_ROLLBACK_SUFFIX_ARCHIVE_TABLE,
     realm_rollback_participant_completion::RealmRollbackParticipantCompletion,
     realm_rollback_physical_archive_owner::{
@@ -54,7 +59,7 @@ use super::{
 };
 
 const MAGIC: &[u8; 8] = b"PSYRBGAB";
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 const ARCHIVE_REVISION: i64 = 1;
 const BARRIER_KEY_DOMAIN: i16 = -3;
 const MAX_FRAGMENT_BYTES: usize = 4 * 1024 * 1024;
@@ -91,6 +96,9 @@ pub(super) struct RollbackGlobalArchiveBarrier<Hash> {
     coordinator_target_restore_slot: [u8; 32],
     coordinator_target_restore_digest: [u8; 32],
     coordinator_readiness_digest: [u8; 32],
+    coordinator_delete_plan_store_fingerprint: [u8; 32],
+    coordinator_delete_plan_slot: [u8; 32],
+    coordinator_delete_plan_digest: [u8; 32],
     participant_count: u64,
     total_entry_count: u64,
     participant_set_digest: [u8; 32],
@@ -136,6 +144,9 @@ impl<Hash: Q256BitHash> RollbackGlobalArchiveBarrier<Hash> {
         let coordinator_target_restore_slot = cursor.array_32()?;
         let coordinator_target_restore_digest = cursor.array_32()?;
         let coordinator_readiness_digest = cursor.array_32()?;
+        let coordinator_delete_plan_store_fingerprint = cursor.array_32()?;
+        let coordinator_delete_plan_slot = cursor.array_32()?;
+        let coordinator_delete_plan_digest = cursor.array_32()?;
         let participant_count = cursor.u64()?;
         let total_entry_count = cursor.u64()?;
         let participant_set_digest = cursor.array_32()?;
@@ -158,6 +169,9 @@ impl<Hash: Q256BitHash> RollbackGlobalArchiveBarrier<Hash> {
             coordinator_target_restore_slot,
             coordinator_target_restore_digest,
             coordinator_readiness_digest,
+            coordinator_delete_plan_store_fingerprint,
+            coordinator_delete_plan_slot,
+            coordinator_delete_plan_digest,
             participant_count,
             total_entry_count,
             participant_set_digest,
@@ -186,6 +200,9 @@ impl<Hash: Q256BitHash> RollbackGlobalArchiveBarrier<Hash> {
         coordinator_target_restore_slot: [u8; 32],
         coordinator_target_restore_digest: [u8; 32],
         coordinator_readiness_digest: [u8; 32],
+        coordinator_delete_plan_store_fingerprint: [u8; 32],
+        coordinator_delete_plan_slot: [u8; 32],
+        coordinator_delete_plan_digest: [u8; 32],
         participant_count: u64,
         total_entry_count: u64,
         participant_set_digest: [u8; 32],
@@ -212,6 +229,9 @@ impl<Hash: Q256BitHash> RollbackGlobalArchiveBarrier<Hash> {
                 coordinator_target_restore_slot,
                 coordinator_target_restore_digest,
                 coordinator_readiness_digest,
+                coordinator_delete_plan_store_fingerprint,
+                coordinator_delete_plan_slot,
+                coordinator_delete_plan_digest,
                 participant_set_digest,
                 store_fingerprint,
             ]
@@ -242,6 +262,9 @@ impl<Hash: Q256BitHash> RollbackGlobalArchiveBarrier<Hash> {
             coordinator_target_restore_slot,
             coordinator_target_restore_digest,
             coordinator_readiness_digest,
+            coordinator_delete_plan_store_fingerprint,
+            coordinator_delete_plan_slot,
+            coordinator_delete_plan_digest,
             participant_count,
             total_entry_count,
             participant_set_digest,
@@ -278,6 +301,9 @@ impl<Hash: Q256BitHash> RollbackGlobalArchiveBarrier<Hash> {
         bytes.extend_from_slice(&self.coordinator_target_restore_slot);
         bytes.extend_from_slice(&self.coordinator_target_restore_digest);
         bytes.extend_from_slice(&self.coordinator_readiness_digest);
+        bytes.extend_from_slice(&self.coordinator_delete_plan_store_fingerprint);
+        bytes.extend_from_slice(&self.coordinator_delete_plan_slot);
+        bytes.extend_from_slice(&self.coordinator_delete_plan_digest);
         bytes.extend_from_slice(&self.participant_count.to_be_bytes());
         bytes.extend_from_slice(&self.total_entry_count.to_be_bytes());
         bytes.extend_from_slice(&self.participant_set_digest);
@@ -330,6 +356,18 @@ impl<Hash: Q256BitHash> RollbackGlobalArchiveBarrier<Hash> {
         &self.store_fingerprint
     }
 
+    pub(super) const fn coordinator_delete_plan_store_fingerprint(&self) -> &[u8; 32] {
+        &self.coordinator_delete_plan_store_fingerprint
+    }
+
+    pub(super) const fn coordinator_delete_plan_slot(&self) -> &[u8; 32] {
+        &self.coordinator_delete_plan_slot
+    }
+
+    pub(super) const fn coordinator_delete_plan_digest(&self) -> &[u8; 32] {
+        &self.coordinator_delete_plan_digest
+    }
+
     pub(super) fn canonical_bytes(&self) -> &[u8] {
         &self.canonical_bytes
     }
@@ -341,6 +379,9 @@ struct RollbackGlobalArchiveBarrierBuilder<'a, Hash> {
     plan: &'a RollbackParticipantPlan<Hash>,
     readiness: &'a CoordinatorCommitPreBarrierReadinessReceipt<Hash>,
     store_fingerprint: [u8; 32],
+    delete_plan_store_fingerprint: [u8; 32],
+    delete_plan_slot: [u8; 32],
+    delete_plan_digest: [u8; 32],
     next_realm: usize,
     total_entry_count: u64,
     participant_set: Sha256,
@@ -351,6 +392,7 @@ impl<'a, Hash: Q256BitHash> RollbackGlobalArchiveBarrierBuilder<'a, Hash> {
         plan: &'a RollbackParticipantPlan<Hash>,
         readiness: &'a CoordinatorCommitPreBarrierReadinessReceipt<Hash>,
         store_fingerprint: [u8; 32],
+        delete_plan: &PersistedCoordinatorCommitDeleteRestorePlan<Hash>,
     ) -> Result<Self, RollbackGlobalArchiveBarrierError> {
         let expected_requested = CanonicalHeadTransition::start_rollback(
             *plan.expected_head(),
@@ -365,6 +407,12 @@ impl<'a, Hash: Q256BitHash> RollbackGlobalArchiveBarrierBuilder<'a, Hash> {
         if readiness.archiving_head() != expected_archiving.candidate()
             || readiness.target() != plan.target()
             || store_fingerprint == [0; 32]
+            || delete_plan.plan().archiving_head() != readiness.archiving_head()
+            || delete_plan.plan().target() != readiness.target()
+            || delete_plan.plan().catalog_digest() != readiness.catalog_digest()
+            || delete_plan.plan().pre_barrier_readiness_digest() != readiness.digest()
+            || delete_plan.plan().target_restore_slot() != readiness.target_restore_slot()
+            || delete_plan.plan().target_restore_digest() != readiness.target_restore_digest()
         {
             return Err(RollbackGlobalArchiveBarrierError::BindingMismatch);
         }
@@ -384,6 +432,9 @@ impl<'a, Hash: Q256BitHash> RollbackGlobalArchiveBarrierBuilder<'a, Hash> {
             plan,
             readiness,
             store_fingerprint,
+            delete_plan_store_fingerprint: *delete_plan.store_fingerprint(),
+            delete_plan_slot: *delete_plan.slot(),
+            delete_plan_digest: *delete_plan.plan().digest(),
             next_realm: 0,
             total_entry_count: readiness.entry_count(),
             participant_set,
@@ -444,6 +495,9 @@ impl<'a, Hash: Q256BitHash> RollbackGlobalArchiveBarrierBuilder<'a, Hash> {
             *self.readiness.target_restore_slot(),
             *self.readiness.target_restore_digest(),
             *self.readiness.digest(),
+            self.delete_plan_store_fingerprint,
+            self.delete_plan_slot,
+            self.delete_plan_digest,
             u64::try_from(self.plan.participant_count())
                 .map_err(|_| RollbackGlobalArchiveBarrierError::LengthOverflow)?,
             self.total_entry_count,
@@ -834,6 +888,7 @@ impl ScyllaRollbackGlobalArchiveBarrierOwner {
                 }
             };
             store.revalidate(&receipt).await?;
+            self.revalidate_delete_plan(&receipt.barrier).await?;
             return Ok(PublishedRollbackGlobalArchiveBarrier {
                 barrier: receipt.barrier,
                 barrier_ready_head,
@@ -879,10 +934,38 @@ impl ScyllaRollbackGlobalArchiveBarrierOwner {
             barrier,
         };
         store.revalidate(&receipt).await?;
+        self.revalidate_delete_plan(&receipt.barrier).await?;
         Ok(PublishedRollbackGlobalArchiveBarrier {
             barrier: receipt.barrier,
             barrier_ready_head: current,
         })
+    }
+
+    async fn revalidate_delete_plan<Hash: Q256BitHash>(
+        &self,
+        barrier: &RollbackGlobalArchiveBarrier<Hash>,
+    ) -> Result<(), RollbackGlobalArchiveBarrierError> {
+        let store = ScyllaCoordinatorCommitDeleteRestorePlanStore::prepare(
+            self.session.clone(),
+            &self.coordinator_archive_keyspace,
+        ).await?;
+        if store.fingerprint() != barrier.coordinator_delete_plan_store_fingerprint() {
+            return Err(RollbackGlobalArchiveBarrierError::StoreFingerprintMismatch);
+        }
+        let receipt = store.read_selected(
+            barrier.target().network_id(),
+            barrier.target().chain_epoch().get(),
+            *barrier.participant_plan_digest(),
+            *barrier.coordinator_delete_plan_slot(),
+            *barrier.coordinator_delete_plan_digest(),
+        ).await?;
+        if receipt.plan().archiving_head() != barrier.archiving_head()
+            || receipt.plan().target() != barrier.target()
+        {
+            return Err(RollbackGlobalArchiveBarrierError::BindingMismatch);
+        }
+        store.revalidate(&receipt).await?;
+        Ok(())
     }
 
     async fn select_current<F, Hash, Hasher>(
@@ -931,10 +1014,20 @@ impl ScyllaRollbackGlobalArchiveBarrierOwner {
         let readiness = coordinator
             .recover_pre_barrier_readiness::<F, Hash, Hasher>(network)
             .await?;
+        let delete_plan = coordinator
+            .plan_delete_restore_execution::<F, Hash, Hasher>(network)
+            .await?;
+        let delete_plan_store = ScyllaCoordinatorCommitDeleteRestorePlanStore::prepare(
+            self.session.clone(),
+            &self.coordinator_archive_keyspace,
+        ).await?;
+        let delete_plan = delete_plan_store.persist_or_recover(delete_plan).await?;
+        delete_plan_store.revalidate(&delete_plan).await?;
         let mut builder = RollbackGlobalArchiveBarrierBuilder::try_new(
             &plan,
             &readiness,
             store_fingerprint,
+            &delete_plan,
         )?;
         for participant in plan.realms() {
             let authority = AuthorityScope::Realm {
@@ -1245,6 +1338,7 @@ pub(super) enum RollbackGlobalArchiveBarrierError {
     Indeterminate(String),
     MissingAfterPersist,
     StoreFingerprintMismatch,
+    DeletePlanStore(CoordinatorCommitDeleteRestorePlanStoreError),
     Coordinator(CoordinatorCommitPhysicalArchiveOwnerError),
     Realm(RealmRollbackPhysicalArchiveOwnerError),
 }
@@ -1254,6 +1348,13 @@ impl From<CoordinatorCommitPhysicalArchiveOwnerError> for RollbackGlobalArchiveB
 }
 impl From<RealmRollbackPhysicalArchiveOwnerError> for RollbackGlobalArchiveBarrierError {
     fn from(value: RealmRollbackPhysicalArchiveOwnerError) -> Self { Self::Realm(value) }
+}
+impl From<CoordinatorCommitDeleteRestorePlanStoreError>
+    for RollbackGlobalArchiveBarrierError
+{
+    fn from(value: CoordinatorCommitDeleteRestorePlanStoreError) -> Self {
+        Self::DeletePlanStore(value)
+    }
 }
 impl fmt::Display for RollbackGlobalArchiveBarrierError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1338,6 +1439,9 @@ mod tests {
             [4; 32],
             [5; 32],
             [6; 32],
+            [10; 32],
+            [11; 32],
+            [12; 32],
             2,
             11,
             participant_set_digest,

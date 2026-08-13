@@ -102,6 +102,7 @@ pub const RAW_SCYLLA_ACCESS_ALLOWLIST: &[RawScyllaAccessAllowance] = &[
     allow!("psy_node_scylla/src/rollback/pending_namespace_rf3_gate.rs", TestHarness),
     allow!("psy_node_scylla/src/rollback/confinement.rs", RollbackPrototypeAdapter),
     allow!("psy_node_scylla/src/rollback/coordinator_processor_durable_capture.rs", DurableControlAuthority),
+    allow!("psy_node_scylla/src/rollback/coordinator_commit_delete_restore_plan_store.rs", DurableControlAuthority),
     allow!("psy_node_scylla/src/rollback/coordinator_commit_physical_archive_store.rs", DurableControlAuthority),
     allow!("psy_node_scylla/src/rollback/coordinator_commit_physical_before_image.rs", DurableControlAuthority),
     allow!("psy_node_scylla/src/rollback/coordinator_commit_source_store.rs", DurableControlAuthority),

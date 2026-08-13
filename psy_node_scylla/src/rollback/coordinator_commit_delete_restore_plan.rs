@@ -393,7 +393,35 @@ impl<Hash: Q256BitHash> CoordinatorCommitDeleteRestorePlan<Hash> {
         self.fence_window
     }
 
-    pub(crate) fn entries(&self) -> &[CoordinatorCommitDeleteRestoreEntry] {
+    pub(super) const fn archiving_head(&self) -> &StoredCanonicalHead<Hash> {
+        &self.archiving_head
+    }
+
+    pub(super) const fn target(&self) -> &CanonicalChainRef<Hash> {
+        &self.target
+    }
+
+    pub(super) const fn old_head(&self) -> &CanonicalChainRef<Hash> {
+        &self.old_head
+    }
+
+    pub(super) const fn catalog_digest(&self) -> &[u8; 32] {
+        &self.catalog_digest
+    }
+
+    pub(super) const fn pre_barrier_readiness_digest(&self) -> &[u8; 32] {
+        &self.pre_barrier_readiness_digest
+    }
+
+    pub(super) const fn target_restore_slot(&self) -> &[u8; 32] {
+        &self.target_restore_slot
+    }
+
+    pub(super) const fn target_restore_digest(&self) -> &[u8; 32] {
+        &self.target_restore_digest
+    }
+
+    pub(super) fn entries(&self) -> &[CoordinatorCommitDeleteRestoreEntry] {
         &self.entries
     }
 
