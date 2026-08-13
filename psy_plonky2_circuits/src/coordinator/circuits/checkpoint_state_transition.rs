@@ -436,12 +436,16 @@ where
         let todo_add_withdrawals_root = QHashOut::<C::F>::from_string_or_panic(
             "d65af5933a094e8329332a714327ba72b1e4dac93c0cde8ee479b9bb36c3fc43",
         );
+        let todo_validator_tree_root = QHashOut::<C::F>::from_string_or_panic(
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        );
         let old_state_roots = PQEDCheckpointGlobalStateRoots {
             contract_tree_root: witness.partial.part_1_header.deploy_contracts_state_transition.state_transition_start,
             deposit_tree_root: todo_add_deposits_root,
             user_tree_root: witness.partial.part_1_header.guta_proof_header.state_transition.old_node_value,
             withdrawal_tree_root: todo_add_withdrawals_root,
             user_registration_tree_root: witness.partial.part_1_header.register_users_state_transition.state_transition_start,
+            validator_tree_root: todo_validator_tree_root,
         };
         /*let new_state_roots = PQEDCheckpointGlobalStateRoots {
             contract_tree_root: witness.partial.part_1_header.deploy_contracts_state_transition.state_transition_end,

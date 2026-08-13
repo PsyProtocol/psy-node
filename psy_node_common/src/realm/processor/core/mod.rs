@@ -49,4 +49,24 @@ pub struct PsyRealmProcessor<
         RealmGUTAEndCapGathererOutput<N::F, N::QHash, N::JobId>,
     >,
     pub proof_worker_queue_max_time_ms: u64,
+
+    // --- Optional Realm P2P wiring (Slice C) ---
+    // Defaults are `None` / empty in `new`, so the unset path is byte-identical
+    // to today's single-producer HTTP/NATS flow. A non-`None` handle plus an
+    // enabled `RealmRotationConfig` engage the publish + blocking vote wait in
+    // `process_block`; GUTA admission stays on the HTTP `rc_submit_guta_proof`
+    // path regardless.
+    /// Backup directory copy kept on `Self` so `process_block` can read the
+    /// RGE2 gatherer backup file when publishing a Proposal body. The gatherer
+    /// config owns the live `FileSystem` handle; the processor only needs the
+    /// directory path to locate the per-pending backup file.
+    pub guta_gatherer_backup_directory: String,
+    /// Cloneable command sender into the Realm network drive loop. `None` until
+    /// `set_realm_p2p` wires it.
+    pub p2p: Option<crate::realm::network::RealmNetworkCommands>,
+    /// Per-Realm rotation config gating the scheduled-proposer check.
+    pub rotation: Option<parth_common::realm_rotation::RealmRotationConfig>,
+    /// Local validator BLS secret key used to sign the processor's own Vote.
+    /// Required when P2P is enabled; `set_realm_p2p` wires it.
+    pub bls_secret: Option<psy_data::p2p::BlsSecretKey>,
 }

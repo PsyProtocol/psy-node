@@ -274,6 +274,10 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
             user_tree_root: self.guta_gatherer_result.end_global_user_tree_root,
             withdrawal_tree_root: last_committed.checkpoint_state_roots.withdrawal_tree_root,
             user_registration_tree_root: self.register_users_gatherer_result.end_user_registration_tree_hash,
+            // 6th checkpoint global state root (x5 pairing). Validator tree is
+            // not built by the coordinator backup path; zero matches the
+            // serde default on PQEDCheckpointGlobalStateRoots.
+            validator_tree_root: N::QHash::get_zero_value(),
         };
         let checkpoint_leaf_stats = PQEDCheckpointLeafStats {
             guta_fees_collected: self.guta_gatherer_result.guta_stats.guta_fees_collected,
@@ -431,6 +435,10 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
             user_tree_root: self.guta_gatherer_result.end_global_user_tree_root,
             withdrawal_tree_root: last_committed.checkpoint_state_roots.withdrawal_tree_root,
             user_registration_tree_root: self.register_users_gatherer_result.end_user_registration_tree_hash,
+            // 6th checkpoint global state root (x5 pairing). Validator tree is
+            // not built by the coordinator backup path; zero matches the
+            // serde default on PQEDCheckpointGlobalStateRoots.
+            validator_tree_root: N::QHash::get_zero_value(),
         };
         let checkpoint_leaf_stats = PQEDCheckpointLeafStats {
             guta_fees_collected: self.guta_gatherer_result.guta_stats.guta_fees_collected,

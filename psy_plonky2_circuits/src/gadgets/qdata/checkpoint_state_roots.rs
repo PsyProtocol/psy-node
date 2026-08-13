@@ -11,6 +11,7 @@ pub struct QEDCheckpointGlobalStateRootsGadget {
     pub user_tree_root: HashOutTarget,
     pub withdrawal_tree_root: HashOutTarget,
     pub user_registration_tree_root: HashOutTarget,
+    pub validator_tree_root: HashOutTarget,
 }
 
 impl QEDCheckpointGlobalStateRootsGadget {
@@ -19,7 +20,8 @@ impl QEDCheckpointGlobalStateRootsGadget {
         witness.set_hash_target(self.deposit_tree_root, target.deposit_tree_root.0)?;
         witness.set_hash_target(self.user_tree_root, target.user_tree_root.0)?;
         witness.set_hash_target(self.withdrawal_tree_root, target.withdrawal_tree_root.0)?;
-        witness.set_hash_target(self.user_registration_tree_root, target.user_registration_tree_root.0)
+        witness.set_hash_target(self.user_registration_tree_root, target.user_registration_tree_root.0)?;
+        witness.set_hash_target(self.validator_tree_root, target.validator_tree_root.0)
     }
     pub fn to_hash<H:AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(&self, builder: &mut CircuitBuilder<F, D>) -> HashOutTarget {
         let contract_and_deposit = builder.hash_two_to_one::<H>(
@@ -36,9 +38,14 @@ impl QEDCheckpointGlobalStateRootsGadget {
             user_and_withdrawal,
         );
         
+        let reg_and_validator = builder.hash_two_to_one::<H>(
+            self.user_registration_tree_root,
+            self.validator_tree_root,
+        );
+
         builder.hash_two_to_one::<H>(
             base_combo,
-            self.user_registration_tree_root,
+            reg_and_validator,
         )
     }
 }
@@ -56,6 +63,7 @@ impl CreatableTarget for QEDCheckpointGlobalStateRootsGadget {
         let user_tree_root = builder.add_virtual_hash();
         let withdrawal_tree_root = builder.add_virtual_hash();
         let user_registration_tree_root = builder.add_virtual_hash();
+        let validator_tree_root = builder.add_virtual_hash();
         
         Self {
             contract_tree_root,
@@ -63,6 +71,7 @@ impl CreatableTarget for QEDCheckpointGlobalStateRootsGadget {
             user_tree_root,
             withdrawal_tree_root,
             user_registration_tree_root,
+            validator_tree_root,
         }
         
     }
@@ -94,13 +103,18 @@ impl ToTargets for QEDCheckpointGlobalStateRootsGadget {
             self.user_registration_tree_root.elements[1],
             self.user_registration_tree_root.elements[2],
             self.user_registration_tree_root.elements[3],
+
+            self.validator_tree_root.elements[0],
+            self.validator_tree_root.elements[1],
+            self.validator_tree_root.elements[2],
+            self.validator_tree_root.elements[3],
         ]
     }
 }
 impl FromTargets for QEDCheckpointGlobalStateRootsGadget {
     fn from_targets(targets: &[Target]) -> Self {
-        if targets.len() != 20 {
-            panic!("tried to create QEDCheckpointGlobalStateRootsGadget from an array of {} targets, but expected an array of 16 targets", targets.len());
+        if targets.len() != 24 {
+            panic!("tried to create QEDCheckpointGlobalStateRootsGadget from an array of {} targets, but expected an array of 24 targets", targets.len());
         }
         let contract_tree_root = HashOutTarget {
             elements: [
@@ -142,12 +156,21 @@ impl FromTargets for QEDCheckpointGlobalStateRootsGadget {
                 targets[19],
             ]
         };
+        let validator_tree_root = HashOutTarget {
+            elements: [
+                targets[20],
+                targets[21],
+                targets[22],
+                targets[23],
+            ]
+        };
         Self {
             contract_tree_root,
             deposit_tree_root,
             user_tree_root,
             withdrawal_tree_root,
             user_registration_tree_root,
+            validator_tree_root,
         }
     }
 }

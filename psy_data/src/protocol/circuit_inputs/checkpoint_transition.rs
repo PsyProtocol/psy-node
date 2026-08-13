@@ -267,6 +267,7 @@ impl<F: QFelt64, Hash: QFHashBase<F>> QCQEDCheckpointStateTransitionInputPartial
             user_tree_root: self.part_1_header.guta_proof_header.state_transition.new_node_value,
             withdrawal_tree_root:Hasher::get_zero_hash(TODO_WITHDRAWAL_TREE_HEIGHT as usize),
             user_registration_tree_root: self.part_1_header.register_users_state_transition.state_transition_end,
+            validator_tree_root: Hasher::get_zero_hash(0),
         };
         PQEDCheckpointLeaf {
             global_chain_root: new_state_roots.qfhash::<Hasher>(),
@@ -303,6 +304,7 @@ impl<F: QFelt64, Hash: QFHashBase<F>> QCQEDCheckpointStateTransitionInputPartial
             user_tree_root: self.part_1_header.guta_proof_header.state_transition.old_node_value,
             withdrawal_tree_root: Hasher::get_zero_hash(TODO_WITHDRAWAL_TREE_HEIGHT as usize),
             user_registration_tree_root: self.part_1_header.register_users_state_transition.state_transition_start,
+            validator_tree_root: Hasher::get_zero_hash(0),
         };
         old_state_roots
     }

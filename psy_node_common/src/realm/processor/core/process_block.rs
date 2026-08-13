@@ -1,13 +1,20 @@
-use cf_utils::timer::TraceTimer;
-use parth_core::protocol::core_types::QNetworkTypesConfig;
+use std::time::Duration;
+
+use parth_core::{
+    crypto::hash::traits::HashTo4Felts,
+    felt::ToU64Value,
+    protocol::core_types::QNetworkTypesConfig,
+};
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_data::{
     guta::header_extended::{GlobalUserTreeAggregatorHeaderWithTagValue, GlobalUserTreeAggregatorHeaderWithTagValueAndJobType},
     node::node_proving_state::PsyNodeProvingState,
+    p2p::{encode_proposal_body, proposal_from_parts, replication_threshold, sha256},
     prepared_block::realm::PsyPreparedRealmBlockStateUpdates,
     worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId,
 };
 use psy_io::tokio::TokioLikeFileSystem;
+use cf_utils::timer::TraceTimer;
 use psy_node_core::{
     p2p::traits::realm_coordinantor::RealmCoordinatorClient,
     psy_core_db::traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore},
@@ -20,7 +27,13 @@ use psy_node_core::{
 };
 
 use crate::realm::{
-    processor::{core::PsyRealmProcessor, gatherers::realm_end_cap_gatherer::RealmGUTAEndCapGathererOutput},
+    processor::{
+        consensus::{form_certificate, sign_vote},
+        core::PsyRealmProcessor,
+        gatherers::realm_end_cap_gatherer::{
+            get_new_realm_end_cap_gatherer_backup_file_path, RealmGUTAEndCapGathererOutput,
+        },
+    },
     queue_key::RealmProvingWorkQueueKey,
 };
 
@@ -294,6 +307,23 @@ where
         };
         timer.lap("build_submission_header");
 
+        // Optional Realm P2P proposal publish + blocking vote wait (Slice C).
+        // Engages only when a RealmNetworkCommands handle and a
+        // RealmRotationConfig have been wired in via `set_realm_p2p` AND
+        // rotation is enabled. This block publishes the Proposal and the
+        // processor's own Vote, then blocks on `wait_votes` until the
+        // replication threshold is met, and forms a Certificate it does NOT
+        // submit to the coordinator over P2P. GUTA admission stays on the
+        // HTTP `rc_submit_guta_proof` path below regardless of this block.
+        // Every missing input fails closed with a named error; there is no
+        // local fallback after a failed forward.
+        if let (Some(cmds), Some(rotation)) = (&self.p2p, &self.rotation) {
+            if rotation.is_enabled() {
+                self.publish_realm_p2p_proposal(&submission_header, &root_job_proof)
+                    .await?;
+            }
+        }
+
         // 7. Submit to Coordinator
         tracing::info!("Submitting GUTA proof to Coordinator...");
         self.db
@@ -365,5 +395,177 @@ where
         }
 
         Ok(())
+    }
+
+    /// Publish the Realm P2P Proposal + own Vote, block on votes, and form a
+    /// Certificate (without submitting it to the coordinator).
+    ///
+    /// This runs the Slice C sequence: epoch-of-target scheduled-proposer
+    /// check, RGE2 backup read, 410-byte finalizer-output encode, proposal
+    /// publish, own-vote sign + publish, blocking `wait_votes` until
+    /// `ceil(n/2)` replication, and `form_certificate`. The certificate is
+    /// retained (`_certificate`) and never sent over P2P; GUTA admission stays
+    /// on the HTTP path in `process_block`. Every missing input bails
+    /// fail-closed with a named error.
+    async fn publish_realm_p2p_proposal(
+        &mut self,
+        submission_header: &GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
+        root_job_proof: &[u8],
+    ) -> anyhow::Result<()> {
+        let (cmds, rotation) = (
+            self.p2p.as_ref().expect("p2p handle checked by caller"),
+            self.rotation.as_ref().expect("rotation checked by caller"),
+        );
+
+        // A BLS secret key is required to sign the processor's own Vote. If
+        // P2P is enabled without one, fail closed rather than publishing an
+        // unsigned / spoofed vote.
+        let bls_secret = self.bls_secret.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "realm P2P enabled for realm {} but no BLS secret key was wired via set_realm_p2p",
+                self.db.state.realm_id_u64
+            )
+        })?;
+
+        // Epoch-of-target scheduled-proposer check. The target checkpoint T
+        // is the one this GUTA is for (`processing_checkpoint_id`), never the
+        // coordinator's current epoch. The anchor seed is the `random_seed` of
+        // the epoch's anchor checkpoint leaf, as four Goldilocks u64 limbs.
+        // This mirrors the edge EndCap forward path exactly.
+        let target = self.db.state.processing_checkpoint_id;
+        let epoch = parth_common::realm_rotation::epoch(target, rotation.checkpoints_per_epoch);
+        let anchor_id = parth_common::realm_rotation::anchor_checkpoint_id(epoch, rotation.checkpoints_per_epoch);
+        let anchor_leaf = self.db.db.get_checkpoint_leaf_data(anchor_id).await?;
+        let seed_felts = anchor_leaf.stats.random_seed.to_4_felts();
+        let anchor_seed = [
+            seed_felts[0].to_u64_value(),
+            seed_felts[1].to_u64_value(),
+            seed_felts[2].to_u64_value(),
+            seed_felts[3].to_u64_value(),
+        ];
+        let scheduled_proposer = rotation
+            .proposer_sub_id(self.db.state.realm_id_u64 as u32, target, anchor_seed)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "rotation enabled but proposer_sub_id returned None for realm {} target {}",
+                    self.db.state.realm_id_u64,
+                    target
+                )
+            })?;
+        let local_sub_id = self.db.state.realm_sub_id_u64 as u16;
+        if scheduled_proposer != local_sub_id {
+            anyhow::bail!(
+                "local realm_sub_id {} is not the scheduled proposer {} for target checkpoint {} \
+                 (realm {}); fail-closed, will not submit",
+                local_sub_id,
+                scheduled_proposer,
+                target,
+                self.db.state.realm_id_u64
+            );
+        }
+
+        // Read the gatherer RGE2 backup file carried inside the Proposal body.
+        // Fail-closed if the file is missing or unreadable; never invent bytes.
+        let backup_path = get_new_realm_end_cap_gatherer_backup_file_path(
+            &self.guta_gatherer_backup_directory,
+            self.db.state.realm_id_u64,
+            self.db.state.realm_sub_id_u64,
+            self.db.state.processing_unique_pending_id,
+        );
+        let backup_path_str = backup_path.to_string_lossy().to_string();
+        let backup_bytes = tokio::fs::read(&backup_path).await.map_err(|err| {
+            anyhow::anyhow!(
+                "realm P2P backup file missing or unreadable at {}: {}",
+                backup_path_str,
+                err
+            )
+        })?;
+
+        // 410-byte RealmFinalizeGUTAPublicOutput + the checkpoint-bound
+        // validator_tree_root carried by the Proposal. Both require spec
+        // fields (`chain_domain`, `validator_tree_root`, `validator_user_id`,
+        // `action_hash`) that are not yet plumbed into `PsyRealmProcessorStore`
+        // / processor state. Fail-closed: do not zero-fill, do not invent.
+        let (output_bytes, validator_tree_root) = self
+            .build_p2p_finalize_output(submission_header, root_job_proof, anchor_id)
+            .await?;
+
+        let body = encode_proposal_body(&output_bytes, root_job_proof, &backup_bytes)?;
+        let body_hash = sha256(&body);
+        let public_output_hash = sha256(&output_bytes);
+        let finalizer_proof_hash = sha256(root_job_proof);
+        let backup_hash = sha256(&backup_bytes);
+
+        let proposal = proposal_from_parts(
+            self.db.state.chain_id,
+            self.db.state.realm_id_u64 as u32,
+            target,
+            self.db.state.last_committed_checkpoint_id,
+            local_sub_id,
+            validator_tree_root,
+            public_output_hash,
+            finalizer_proof_hash,
+            backup_hash,
+            body_hash,
+        );
+
+        // Publish the Proposal, then sign + publish the processor's own Vote.
+        cmds.publish_proposal(proposal.clone(), body).await?;
+        let own_vote = sign_vote(bls_secret, local_sub_id, &proposal);
+        cmds.publish_vote(own_vote.clone()).await?;
+
+        // Blocking vote collect: `ceil(n/2)` replication threshold, minus the
+        // processor's own already-published vote. `wait_votes` is fulfilled by
+        // the drive loop; a timeout is fail-closed (NetworkError::Timeout).
+        let n = rotation.validator_sub_ids.len();
+        let need = replication_threshold(n);
+        let remaining = need.saturating_sub(1);
+        let mut all_votes = vec![(own_vote.signer_sub_id, own_vote.signature)];
+        if remaining > 0 {
+            let received = cmds
+                .wait_votes(proposal.proposal_id, remaining, Duration::from_secs(120))
+                .await?;
+            for vote in received {
+                all_votes.push((vote.signer_sub_id, vote.signature));
+            }
+        }
+
+        // Aggregate the collected votes into a Certificate. The certificate is
+        // kept locally and is NOT submitted to the coordinator over P2P; GUTA
+        // admission stays on the HTTP `rc_submit_guta_proof` path.
+        let _certificate = form_certificate(&proposal, &all_votes)?;
+        tracing::info!(
+            "realm P2P proposal published and certificate formed for realm {} target {} ({} votes)",
+            self.db.state.realm_id_u64,
+            target,
+            all_votes.len()
+        );
+        Ok(())
+    }
+
+    /// Build the 410-byte `RealmFinalizeGUTAPublicOutput` and the
+    /// checkpoint-bound `validator_tree_root` carried by the Proposal.
+    ///
+    /// Per the Slice C wiring contract, only fields provable from
+    /// `submission_header` + `db.state` + the anchor checkpoint leaf are
+    /// mapped. The spec fields `chain_domain`, `validator_tree_root`,
+    /// `validator_user_id`, and `action_hash` are not yet plumbed into
+    /// `PsyRealmProcessorStore` / processor state, so this fails closed with a
+    /// named error rather than zero-filling or inventing values. When the
+    /// validator-tree record API and chain-domain source land, this is the
+    /// single point to extend; the publish/vote/wait/certificate wiring above
+    /// is already in place.
+    async fn build_p2p_finalize_output(
+        &self,
+        _submission_header: &GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
+        _root_job_proof: &[u8],
+        _anchor_checkpoint_id: u64,
+    ) -> anyhow::Result<([u8; 410], [u8; 32])> {
+        anyhow::bail!(
+            "realm P2P finalize output unavailable for realm {}: spec fields chain_domain, \
+             validator_tree_root, validator_user_id, and action_hash are not plumbed into the \
+             processor state; refusing to zero-fill or invent (fail-closed)",
+            self.db.state.realm_id_u64
+        );
     }
 }

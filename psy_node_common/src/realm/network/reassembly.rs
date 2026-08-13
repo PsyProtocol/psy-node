@@ -131,6 +131,10 @@ impl ProposalReassembly {
         self.body_len
     }
 
+    pub fn contiguous(&self) -> u64 {
+        self.contiguous
+    }
+
     pub fn created_at(&self) -> Instant {
         self.created_at
     }
@@ -138,7 +142,6 @@ impl ProposalReassembly {
     pub fn last_request_at(&self) -> Option<Instant> {
         self.last_request_at
     }
-
     pub fn direct_request_active(&self) -> bool {
         self.direct_request_active
     }
@@ -285,6 +288,10 @@ impl ReassemblyBook {
 
     pub fn get_mut(&mut self, proposal_id: &[u8; 32]) -> Option<&mut ProposalReassembly> {
         self.entries.get_mut(proposal_id)
+    }
+
+    pub fn proposal_ids(&self) -> impl Iterator<Item = [u8; 32]> + '_ {
+        self.insertion_order.iter().copied()
     }
 
     /// Begin a new reassembly. Returns `Duplicate` if one already exists for

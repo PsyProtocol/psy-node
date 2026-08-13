@@ -185,6 +185,8 @@ pub enum ProvingJobCircuitType {
     GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint = 59,
     GUTAVerifyLeftLeafRightLinearUpgradeCheckpoint = 60,
 
+    RealmFinalizeGUTA = 63,
+
     WrappedSignatureProof = 64,
     Secp256K1SignatureProof = 65,
 
@@ -345,6 +347,8 @@ impl TryFrom<u8> for ProvingJobCircuitType {
             59 => Ok(ProvingJobCircuitType::GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint),
             60 => Ok(ProvingJobCircuitType::GUTAVerifyLeftLeafRightLinearUpgradeCheckpoint),
 
+            63 => Ok(ProvingJobCircuitType::RealmFinalizeGUTA),
+
             64 => Ok(ProvingJobCircuitType::WrappedSignatureProof),
             65 => Ok(ProvingJobCircuitType::Secp256K1SignatureProof),
             192 => Ok(ProvingJobCircuitType::NotifyRealmComplete),
@@ -426,7 +430,8 @@ impl QProvingJobDataID {
             ProvingJobCircuitType::GUTATwoGUTALinear |
             ProvingJobCircuitType::GUTATwoGUTALinearUpgradeCheckpoint |
             ProvingJobCircuitType::GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint |
-            ProvingJobCircuitType::GUTAVerifyLeftLeafRightLinearUpgradeCheckpoint => {},
+            ProvingJobCircuitType::GUTAVerifyLeftLeafRightLinearUpgradeCheckpoint |
+            ProvingJobCircuitType::RealmFinalizeGUTA => {},
             _ => anyhow::bail!("circuit type {:?} is not a GUTA circuit type", circuit_type),
         };
 
@@ -784,6 +789,18 @@ impl QProvingJobDataID {
             data_type: ProvingJobDataType::StandardProof,
             data_index: 0,
         }
+    }
+    pub fn realm_finalize_guta(checkpoint_id: u64, realm_id: u32) -> Self {
+        Self::new(
+            QJobTopic::GenerateStandardProof,
+            checkpoint_id,
+            realm_id,
+            0,
+            0,
+            ProvingJobCircuitType::RealmFinalizeGUTA,
+            ProvingJobDataType::StandardProof,
+            0,
+        )
     }
     pub fn claim_deposit_l1_signature_proof(checkpoint_id: u64, group_id: u32, deposit_id: u32) -> Self {
         Self {

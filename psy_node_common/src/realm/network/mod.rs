@@ -20,6 +20,7 @@ mod behaviour;
 mod codec;
 mod config;
 mod reassembly;
+mod drive;
 
 pub use behaviour::{
     add_bootnode_address, add_known_address, proposal_topic, vote_topic, RealmBehaviour,
@@ -37,6 +38,7 @@ pub use reassembly::{
     validate_start, CompleteProposalBody, InsertOutcome, ProposalReassembly, ReassemblyBook,
     StartOutcome, VerifiedProposalBody,
 };
+pub use drive::run_realm_network;
 
 use libp2p::request_response;
 use libp2p::{identity, noise, tcp, yamux, Swarm, SwarmBuilder};
@@ -75,6 +77,8 @@ pub enum NetworkError {
     Rejected(String),
     #[error("Realm finalize submission rejected: {0}")]
     RealmFinalizeRejected(RealmFinalizeSubmitCode),
+    #[error("timed out: {0}")]
+    Timeout(String),
 }
 
 /// Application → network commands. The network's driving loop fulfils each
@@ -84,6 +88,7 @@ pub enum RealmNetworkCommand {
     /// Forward an EndCap stream (56-byte header + input + proof) to the
     /// scheduled proposer for the header's checkpoint.
     ForwardEndCap {
+        destination: NodeId,
         header: EndCapForwardHeader,
         input: Vec<u8>,
         proof: Vec<u8>,
@@ -110,6 +115,14 @@ pub enum RealmNetworkCommand {
         request_id: request_response::InboundRequestId,
         response_body: DirectBodyResponse,
         response: oneshot::Sender<Result<(), NetworkError>>,
+    },
+    /// Block until `threshold` distinct votes for `proposal_id` arrive, or
+    /// `timeout` elapses. Fail-closed: timeout or a closed waiter is an error.
+    WaitVotes {
+        proposal_id: [u8; 32],
+        threshold: usize,
+        timeout: Duration,
+        response: oneshot::Sender<Result<Vec<Vote>, NetworkError>>,
     },
 }
 
@@ -149,42 +162,36 @@ pub enum RealmNetworkEvent {
     },
 }
 
-/// Application-facing handle. The event receiver is single-consumer, so the
-/// handle is not `Clone`; move it to the driving loop.
-pub struct RealmNetworkHandle {
+/// Cloneable command sender. Edge and processor share this; the event
+/// receiver stays single-consumer on [`RealmNetworkHandle`].
+#[derive(Clone)]
+pub struct RealmNetworkCommands {
     commands: mpsc::Sender<RealmNetworkCommand>,
-    events: mpsc::Receiver<RealmNetworkEvent>,
     local_node_id: NodeId,
 }
 
-impl std::fmt::Debug for RealmNetworkHandle {
+impl std::fmt::Debug for RealmNetworkCommands {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RealmNetworkHandle")
+        f.debug_struct("RealmNetworkCommands")
             .field("local_node_id", &self.local_node_id)
             .finish_non_exhaustive()
     }
 }
 
-impl RealmNetworkHandle {
+impl RealmNetworkCommands {
     pub fn local_node_id(&self) -> NodeId {
         self.local_node_id
     }
 
-    pub fn commands(&self) -> &mpsc::Sender<RealmNetworkCommand> {
-        &self.commands
-    }
-
-    pub fn events(&mut self) -> &mut mpsc::Receiver<RealmNetworkEvent> {
-        &mut self.events
-    }
-
     pub async fn forward_end_cap(
         &self,
+        destination: NodeId,
         header: EndCapForwardHeader,
         input: Vec<u8>,
         proof: Vec<u8>,
     ) -> Result<EndCapForwardResponse, NetworkError> {
         self.request(|response| RealmNetworkCommand::ForwardEndCap {
+            destination,
             header,
             input,
             proof,
@@ -232,6 +239,21 @@ impl RealmNetworkHandle {
         .await?
     }
 
+    pub async fn wait_votes(
+        &self,
+        proposal_id: [u8; 32],
+        threshold: usize,
+        timeout: Duration,
+    ) -> Result<Vec<Vote>, NetworkError> {
+        self.request(|response| RealmNetworkCommand::WaitVotes {
+            proposal_id,
+            threshold,
+            timeout,
+            response,
+        })
+        .await?
+    }
+
     async fn request<T>(
         &self,
         command: impl FnOnce(oneshot::Sender<T>) -> RealmNetworkCommand,
@@ -242,6 +264,89 @@ impl RealmNetworkHandle {
             .await
             .map_err(|_| NetworkError::CommandChannelClosed)?;
         rx.await.map_err(|_| NetworkError::ResponseChannelClosed)
+    }
+}
+
+/// Application-facing handle. Commands are cloneable; the event receiver is
+/// single-consumer. Call [`RealmNetworkHandle::into_parts`] to split them.
+pub struct RealmNetworkHandle {
+    commands: RealmNetworkCommands,
+    events: mpsc::Receiver<RealmNetworkEvent>,
+}
+
+impl std::fmt::Debug for RealmNetworkHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RealmNetworkHandle")
+            .field("local_node_id", &self.commands.local_node_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RealmNetworkHandle {
+    pub fn local_node_id(&self) -> NodeId {
+        self.commands.local_node_id()
+    }
+
+    pub fn commands(&self) -> RealmNetworkCommands {
+        self.commands.clone()
+    }
+
+    pub fn events(&mut self) -> &mut mpsc::Receiver<RealmNetworkEvent> {
+        &mut self.events
+    }
+
+    pub fn into_parts(self) -> (RealmNetworkCommands, mpsc::Receiver<RealmNetworkEvent>) {
+        (self.commands, self.events)
+    }
+
+    pub async fn forward_end_cap(
+        &self,
+        destination: NodeId,
+        header: EndCapForwardHeader,
+        input: Vec<u8>,
+        proof: Vec<u8>,
+    ) -> Result<EndCapForwardResponse, NetworkError> {
+        self.commands
+            .forward_end_cap(destination, header, input, proof)
+            .await
+    }
+
+    pub async fn publish_proposal(
+        &self,
+        proposal: Proposal,
+        body: Vec<u8>,
+    ) -> Result<(), NetworkError> {
+        self.commands.publish_proposal(proposal, body).await
+    }
+
+    pub async fn publish_vote(&self, vote: Vote) -> Result<(), NetworkError> {
+        self.commands.publish_vote(vote).await
+    }
+
+    pub async fn submit_finalize(
+        &self,
+        request: RealmFinalizeSubmitRequest,
+    ) -> Result<RealmFinalizeSubmitResponse, NetworkError> {
+        self.commands.submit_finalize(request).await
+    }
+
+    pub async fn serve_body(
+        &self,
+        request_id: request_response::InboundRequestId,
+        response_body: DirectBodyResponse,
+    ) -> Result<(), NetworkError> {
+        self.commands.serve_body(request_id, response_body).await
+    }
+
+    pub async fn wait_votes(
+        &self,
+        proposal_id: [u8; 32],
+        threshold: usize,
+        timeout: Duration,
+    ) -> Result<Vec<Vote>, NetworkError> {
+        self.commands
+            .wait_votes(proposal_id, threshold, timeout)
+            .await
     }
 }
 
@@ -307,9 +412,11 @@ impl RealmNetwork {
         );
 
         let handle = RealmNetworkHandle {
-            commands: command_tx,
+            commands: RealmNetworkCommands {
+                commands: command_tx,
+                local_node_id,
+            },
             events: event_rx,
-            local_node_id,
         };
 
         Ok((

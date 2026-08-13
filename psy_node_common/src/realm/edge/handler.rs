@@ -10,7 +10,7 @@ use parth_core::{
         hash::{
             merkle_proof::MerkleProofCore,
             tag_tree::TagTreeMerkleProof,
-            traits::{MerkleZeroHasher, QFieldHashable, ZeroableHash},
+            traits::{HashTo4Felts, MerkleZeroHasher, QFieldHashable, ZeroableHash},
         },
         secp256k1::{QEDCompressedSecp256K1Signature, SimpleTimedRequest},
     }, data::{hash::{merkle_node_key::SimpleMerkleNodeKey, merkle_store_key::{QMerkleStoreDoubleIdKeyWithHeight, QMerkleStoreSingleIdKey}}, queue::queue_key::QPBaseQueueType}, felt::ToU64Value, node::realm_identifier::QRealmIdentifier, protocol::core_types::{QNetworkTypesConfig, QZKProofPublicInputsHasherReader, QZKProofVerifier}
@@ -53,6 +53,12 @@ use crate::realm::{
     edge::{error::RpcError, utils::end_cap::validate_end_cap_and_generate_node_data_for_edge},
     queue_key::RealmUserUpdateQueueKey,
 };
+use std::collections::HashMap;
+
+use crate::realm::network::RealmNetworkCommands;
+use parth_common::realm_rotation::RealmRotationConfig;
+use psy_data::p2p::{compute_end_cap_id, sha256, EndCapForwardHeader, NodeId};
+use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
 const END_CAP_PROOF_CIRCUIT_TYPE_U32: u32 = ProvingJobCircuitType::UserEndCap as u32;
 pub struct RealmEdgeHandler<
@@ -80,6 +86,10 @@ pub struct RealmEdgeHandler<
 
     pub proof_verifier: Arc<N::ZKVerifier>,
     pub contract_state_tree_height_cache: Arc<DashMapContractHeightCache<N::QHash>>,
+
+    pub p2p: Option<RealmNetworkCommands>,
+    pub rotation: Option<RealmRotationConfig>,
+    pub proposer_node_ids: Option<HashMap<u16, NodeId>>,
 }
 impl<
         N: QNetworkTypesConfig,
@@ -106,6 +116,9 @@ impl<
             node_id: self.node_id.clone(),
             proof_verifier: self.proof_verifier.clone(),
             contract_state_tree_height_cache: self.contract_state_tree_height_cache.clone(),
+            p2p: self.p2p.clone(),
+            rotation: self.rotation.clone(),
+            proposer_node_ids: self.proposer_node_ids.clone(),
         }
     }
 }
@@ -147,7 +160,20 @@ impl<
             node_id,
             proof_verifier,
             contract_state_tree_height_cache: Arc::new(DashMapContractHeightCache::new()),
+            p2p: None,
+            rotation: None,
+            proposer_node_ids: None,
         }
+    }
+    pub fn set_realm_p2p(
+        &mut self,
+        commands: RealmNetworkCommands,
+        rotation: RealmRotationConfig,
+        proposer_node_ids: HashMap<u16, NodeId>,
+    ) {
+        self.p2p = Some(commands);
+        self.rotation = Some(rotation);
+        self.proposer_node_ids = Some(proposer_node_ids);
     }
     pub fn user_belongs_to_realm(&self, user_id: u64) -> bool {
         let users_per_realm = 1u64 << N::REALM_GLOBAL_USER_TREE_HEIGHT;
@@ -474,6 +500,76 @@ impl<
             proof_verifier.verify_zk_proof(END_CAP_PROOF_CIRCUIT_TYPE_U32, &proof)
         }).await??;
         timer.lap_micros("verify_zk_proof");
+
+        // Optional Realm P2P forward (Slice B). When rotation is enabled and
+        // this edge instance is NOT the scheduled proposer for the EndCap's
+        // target checkpoint, forward the EndCap to the scheduled proposer over
+        // the Realm network and return without touching the local gatherer.
+        // Fail-closed: a missing anchor leaf, missing NodeId, forward error,
+        // or rejected response is a hard error — never fall back to local
+        // processing after a failed forward. If this instance IS the proposer,
+        // fall through to the existing local path below.
+        if let (Some(cmds), Some(rotation), Some(node_ids)) = (&self.p2p, &self.rotation, &self.proposer_node_ids) {
+            if rotation.is_enabled() {
+                // Epoch-of-target: the EndCap's own checkpoint, NOT the
+                // coordinator head. The proposer is fixed for the whole epoch.
+                let target = end_cap_checkpoint_id;
+                let epoch = parth_common::realm_rotation::epoch(target, rotation.checkpoints_per_epoch);
+                let anchor_id = parth_common::realm_rotation::anchor_checkpoint_id(epoch, rotation.checkpoints_per_epoch);
+                let leaf = self.db_reader.get_checkpoint_leaf_data(anchor_id).await?;
+                let felts = leaf.stats.random_seed.to_4_felts();
+                let seed = [
+                    felts[0].to_u64_value(),
+                    felts[1].to_u64_value(),
+                    felts[2].to_u64_value(),
+                    felts[3].to_u64_value(),
+                ];
+                let proposer = rotation
+                    .proposer_sub_id(self.realm_id_u64 as u32, target, seed)?
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "rotation enabled but proposer_sub_id returned None for realm {} target {}",
+                        self.realm_id_u64,
+                        target,
+                    ))?;
+                if proposer != self.realm_sub_id_u64 as u16 {
+                    let dest = node_ids
+                        .get(&proposer)
+                        .copied()
+                        .ok_or_else(|| anyhow::anyhow!("no NodeId for scheduled proposer sub_id {proposer}"))?;
+                    // Canonical EndCap input bytes — reuse the existing
+                    // serializer; do not invent a second codec.
+                    let input = user_end_cap_input.psy_ser_to_bytes_vec()?;
+                    let input_hash = sha256(&input);
+                    let proof_hash = sha256(&proof_bytes);
+                    let end_cap_id = compute_end_cap_id(
+                        self.chain_id,
+                        self.realm_id_u64 as u32,
+                        target,
+                        &input_hash,
+                        &proof_hash,
+                    );
+                    let header = EndCapForwardHeader {
+                        chain_id: self.chain_id,
+                        realm_id: self.realm_id_u64 as u32,
+                        checkpoint_id: target,
+                        end_cap_id,
+                        end_cap_input_len: input.len() as u32,
+                        proof_len: proof_bytes.len() as u32,
+                    };
+                    let resp = cmds
+                        .forward_end_cap(dest, header, input, proof_bytes)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("EndCap forward to proposer {proposer} failed: {e}"))?;
+                    if !resp.is_accepted() {
+                        anyhow::bail!("EndCap forward rejected by proposer {proposer}");
+                    }
+                    // Forwarded and accepted — never process locally.
+                    return Ok(());
+                }
+                // Local instance is the scheduled proposer: fall through to
+                // the existing local gatherer / queue publish path.
+            }
+        }
 
         // TODO: maybe modify the job_id.sub_group_id
         let rand_status = rand::random::<u64>();

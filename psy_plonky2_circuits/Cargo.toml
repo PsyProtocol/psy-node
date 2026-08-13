@@ -53,6 +53,8 @@ psy_serialize = { workspace = true }
 psy_worker_core = { workspace = true }
 psy_dummy_prover = { workspace = true }
 pser = { workspace = true }
+psy_common_circuit = { workspace = true }
+psy_crypto = { workspace = true }
 
 
 [dev-dependencies]

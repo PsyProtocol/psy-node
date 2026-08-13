@@ -7,8 +7,19 @@ use plonky2::{
         config::{AlgebraicHasher, GenericConfig},
     },
 };
+use psy_common_circuit::circuits::{
+    traits::qstandard::QStandardCircuit as CommonQStandardCircuit,
+    zk_signature3::core::PsyBasicZKSignatureCircuit,
+};
+use psy_crypto::common::witnesses::zk_signature::PsyZKSignatureCircuitInput;
 use psy_core::{job::job_id::{ProvingJobCircuitType, QProvingJobDataID}, worker::traits::QNextGenWorkerGenericInfo};
-use psy_data::worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse;
+use psy_data::{
+    guta::realm_finalize::{
+        REALM_ROTATION_PERIOD_CHECKPOINTS_PLACEHOLDER,
+        REALM_ROTATION_REGISTERED_SUB_IDS_PLACEHOLDER,
+    },
+    worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse,
+};
 use psy_plonky2_basic_helpers::{lookalike::standard::get_end_cap_type_e_common_data, verifier::circuit_library::{CircuitInfoLibrary, CircuitInfoLibraryBuilder}};
 use psy_worker_core::worker::prover_trait::{PsyWorkerGenericLibraryProver, PsyWorkerGenericLibraryProverInfoProvider};
 
@@ -17,7 +28,7 @@ use super::circuits::{
 };
 use crate::{guta::circuits::
     verify_guta_to_cap_upgrade_checkpoint::GUTAVerifyGUTAToCapUpgradeCheckpointCircuit
-, guta_v2::circuits::{verify_guta_left_linear_right_leaf_upgrade_checkpoint::GUTAVerifyLeftLinearRightLeafUpgradeCheckpointCircuit, verify_guta_linear_transition::GUTAVerifyTwoGUTALinearCircuit, verify_guta_linear_transition_upgrade_checkpoint::GUTAVerifyTwoGUTALinearUpgradeCheckpointCircuit, verify_left_guta_right_end_cap::GUTAVerifyLeftGUTARightEndCapCircuitV2, verify_single_end_cap::GUTAVerifySingleEndCapCircuitV2, verify_two_end_cap::GUTAVerifyTwoEndCapCircuitV2, verify_two_guta::GUTAVerifyTwoGUTACircuitV2, verify_two_guta_upgrade_checkpoint::GUTAVerifyTwoGUTAUpgradeCheckpointCircuitV2}, qstandard::{QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibrary}, utils::proof_serialization::serialize_plonky2_proof};
+, guta_v2::circuits::{realm_finalize_guta::RealmFinalizeGUTACircuit, verify_guta_left_linear_right_leaf_upgrade_checkpoint::GUTAVerifyLeftLinearRightLeafUpgradeCheckpointCircuit, verify_guta_linear_transition::GUTAVerifyTwoGUTALinearCircuit, verify_guta_linear_transition_upgrade_checkpoint::GUTAVerifyTwoGUTALinearUpgradeCheckpointCircuit, verify_left_guta_right_end_cap::GUTAVerifyLeftGUTARightEndCapCircuitV2, verify_single_end_cap::GUTAVerifySingleEndCapCircuitV2, verify_two_end_cap::GUTAVerifyTwoEndCapCircuitV2, verify_two_guta::GUTAVerifyTwoGUTACircuitV2, verify_two_guta_upgrade_checkpoint::GUTAVerifyTwoGUTAUpgradeCheckpointCircuitV2}, qstandard::{QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibrary}, utils::proof_serialization::serialize_plonky2_proof};
 
 #[derive(Debug)]
 pub struct QEDGUTACircuitManager<C: GenericConfig<D> + 'static, const D: usize>
@@ -36,6 +47,8 @@ where
     pub verify_guta_to_cap: GUTAVerifyGUTAToCapCircuit<C, D>,
     pub verify_guta_left_linear_right_leaf_upgrade_checkpoint: GUTAVerifyLeftLinearRightLeafUpgradeCheckpointCircuit<C, D>,
     pub no_change: GUTANoChangeCircuit<C, D>,
+    pub realm_finalize_guta: RealmFinalizeGUTACircuit<C, D>,
+    pub zk_signature: PsyBasicZKSignatureCircuit<C, D>,
 
     pub verify_two_guta_upgrade_checkpoint: GUTAVerifyTwoGUTAUpgradeCheckpointCircuitV2<C, D>,
     pub verify_guta_to_cap_upgrade_checkpoint: GUTAVerifyGUTAToCapUpgradeCheckpointCircuit<C, D>,
@@ -98,12 +111,43 @@ where
         global_user_tree_height: usize,
         guta_circuit_whitelist_tree_height: u8,
         checkpoint_tree_height: usize,
+        group_realm_height: usize,
+        max_users_to_register_per_proof: usize,
+        only_register_max_users_per_proof: usize,
+        known_end_cap_fingerprint: QHashOut<C::F>,
+        default_user_state_tree_root: QHashOut<C::F>,
+        worker_reward_tag: QHashOut<C::F>,
+    ) -> Self {
+        Self::new_with_config_and_chain_domain(
+            end_cap_proof_common_data,
+            end_cap_proof_verifier_data_cap_height,
+            global_user_tree_realm_height,
+            global_user_tree_height,
+            guta_circuit_whitelist_tree_height,
+            checkpoint_tree_height,
+            group_realm_height,
+            max_users_to_register_per_proof,
+            only_register_max_users_per_proof,
+            known_end_cap_fingerprint,
+            default_user_state_tree_root,
+            worker_reward_tag,
+            QHashOut::ZERO,
+        )
+    }
+    pub fn new_with_config_and_chain_domain(
+        end_cap_proof_common_data: &CommonCircuitData<C::F, D>,
+        end_cap_proof_verifier_data_cap_height: usize,
+        global_user_tree_realm_height: usize,
+        global_user_tree_height: usize,
+        guta_circuit_whitelist_tree_height: u8,
+        checkpoint_tree_height: usize,
         _group_realm_height: usize,
         _max_users_to_register_per_proof: usize,
         _only_register_max_users_per_proof: usize,
         known_end_cap_fingerprint: QHashOut<C::F>,
         _default_user_state_tree_root: QHashOut<C::F>,
         worker_reward_tag: QHashOut<C::F>,
+        chain_domain: QHashOut<C::F>,
     ) -> Self {
 
         assert!(global_user_tree_height >= global_user_tree_realm_height, "global_user_tree_height must be >= global_user_tree_realm_height");
@@ -181,7 +225,6 @@ where
             GUTAVerifyGUTAToCapUpgradeCheckpointCircuit::<C, D>::new(guta_proof_common_data, guta_proof_verifier_data_cap_height, coordinator_global_user_tree_height, global_user_tree_height, guta_circuit_whitelist_tree_height, checkpoint_tree_height);
 
         let no_change = GUTANoChangeCircuit::<C, D>::new(checkpoint_tree_height);
-
         let mut guta_circuit_whitelist_proofs = SimpleMerkleTree::<C::Hasher, QHashOut<C::F>>::gen_fast_tree_inclusion_proofs(
             guta_circuit_whitelist_tree_height,
             &[
@@ -200,6 +243,29 @@ where
         )
         .unwrap();
         guta_circuit_whitelist_proofs.reverse();
+        let guta_circuit_whitelist_root = guta_circuit_whitelist_proofs.last()
+            .map(|p| p.root)
+            .unwrap_or_else(|| QHashOut::from_values(0, 0, 0, 0));
+
+        let zk_signature = PsyBasicZKSignatureCircuit::<C, D>::new();
+        let realm_finalize_guta = RealmFinalizeGUTACircuit::<C, D>::new(
+            guta_proof_common_data,
+            guta_proof_verifier_data_cap_height,
+            guta_circuit_whitelist_tree_height,
+            guta_circuit_whitelist_root,
+            CommonQStandardCircuit::get_common_circuit_data_ref(&zk_signature),
+            CommonQStandardCircuit::get_verifier_config_ref(&zk_signature)
+                .constants_sigmas_cap
+                .height(),
+            QHashOut(CommonQStandardCircuit::get_fingerprint(&zk_signature).0),
+            checkpoint_tree_height,
+            coordinator_global_user_tree_height,
+            coordinator_global_user_tree_height + 8,
+            global_user_tree_realm_height,
+            chain_domain,
+            REALM_ROTATION_PERIOD_CHECKPOINTS_PLACEHOLDER,
+            REALM_ROTATION_REGISTERED_SUB_IDS_PLACEHOLDER.to_vec(),
+        );
 
         let verify_single_end_cap_whitelist_proof = guta_circuit_whitelist_proofs.pop().unwrap();
         let verify_two_end_cap_whitelist_proof = guta_circuit_whitelist_proofs.pop().unwrap();
@@ -225,6 +291,8 @@ where
 
             verify_guta_to_cap,
             no_change,
+            realm_finalize_guta,
+            zk_signature,
             verify_two_guta_upgrade_checkpoint,
             verify_guta_to_cap_upgrade_checkpoint,
 
@@ -348,6 +416,16 @@ where
             self.no_change.get_fingerprint(),
             self.no_change.get_verifier_config_ref().into(),
         );
+        library.register_circuit(
+            ProvingJobCircuitType::RealmFinalizeGUTA.into(),
+            self.realm_finalize_guta.get_fingerprint(),
+            self.realm_finalize_guta.get_verifier_config_ref().into(),
+        );
+        library.register_circuit(
+            ProvingJobCircuitType::WrappedSignatureProof.into(),
+            QHashOut(CommonQStandardCircuit::get_fingerprint(&self.zk_signature).0),
+            CommonQStandardCircuit::get_verifier_config_ref(&self.zk_signature).into(),
+        );
 
         let all_group = [
             ProvingJobCircuitType::GUTASingleEndCap,
@@ -362,6 +440,7 @@ where
             ProvingJobCircuitType::GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint,
             ProvingJobCircuitType::GUTANoChange,
         ];
+        let realm_finalize_group = [ProvingJobCircuitType::RealmFinalizeGUTA];
 
         library.add_inclusion_proof(
             &all_group,
@@ -424,6 +503,17 @@ where
         );
 
         library.add_inclusion_proof(&all_group, ProvingJobCircuitType::GUTANoChange, self.no_change_whitelist_proof.clone());
+        library.add_inclusion_proof(&realm_finalize_group, ProvingJobCircuitType::GUTASingleEndCap, self.verify_single_end_cap_whitelist_proof.clone());
+        library.add_inclusion_proof(&realm_finalize_group, ProvingJobCircuitType::GUTATwoEndCap, self.verify_two_end_cap_whitelist_proof.clone());
+        library.add_inclusion_proof(&realm_finalize_group, ProvingJobCircuitType::GUTATwoGUTA, self.verify_two_guta_whitelist_proof.clone());
+        library.add_inclusion_proof(&realm_finalize_group, ProvingJobCircuitType::GUTALeftGUTARightEndCap, self.verify_left_guta_right_end_cap_whitelist_proof.clone());
+        library.add_inclusion_proof(&realm_finalize_group, ProvingJobCircuitType::GUTATwoGUTALinear, self.verify_two_guta_linear_transition_whitelist_proof.clone());
+        library.add_inclusion_proof(&realm_finalize_group, ProvingJobCircuitType::GUTATwoGUTALinearUpgradeCheckpoint, self.verify_two_guta_linear_transition_upgrade_checkpoint_whitelist_proof.clone());
+        library.add_inclusion_proof(&realm_finalize_group, ProvingJobCircuitType::GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint, self.verify_guta_left_linear_right_leaf_upgrade_checkpoint_whitelist_proof.clone());
+        library.add_inclusion_proof(&realm_finalize_group, ProvingJobCircuitType::GUTAVerifyToCap, self.verify_guta_to_cap_whitelist_proof.clone());
+        library.add_inclusion_proof(&realm_finalize_group, ProvingJobCircuitType::GUTATwoGUTAWithCheckpointUpgrade, self.verify_two_guta_upgrade_checkpoint_whitelist_proof.clone());
+        library.add_inclusion_proof(&realm_finalize_group, ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade, self.verify_guta_to_cap_upgrade_checkpoint_whitelist_proof.clone());
+        library.add_inclusion_proof(&realm_finalize_group, ProvingJobCircuitType::GUTANoChange, self.no_change_whitelist_proof.clone());
     }
 }
 
@@ -444,6 +534,8 @@ where
             ProvingJobCircuitType::GUTATwoGUTAWithCheckpointUpgrade => true,
             ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade => true,
             ProvingJobCircuitType::GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint => true,
+            ProvingJobCircuitType::RealmFinalizeGUTA => true,
+            ProvingJobCircuitType::WrappedSignatureProof => true,
             _ => false,
         }
     }
@@ -512,6 +604,18 @@ where
             ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade => {
                 self.verify_guta_to_cap_upgrade_checkpoint
                     .prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag)
+            }
+            ProvingJobCircuitType::RealmFinalizeGUTA => self
+                .realm_finalize_guta
+                .prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag),
+            ProvingJobCircuitType::WrappedSignatureProof => {
+                input.ensure_expected_child_proof_count(0)?;
+                let signature_input: PsyZKSignatureCircuitInput<C::F> =
+                    bincode::deserialize(&input.base.witness)?;
+                self.zk_signature.prove_base(
+                    signature_input.private_key,
+                    signature_input.sig_hash,
+                )
             }
             _ => anyhow::bail!("unsupported circuit: {:?}", input.base.job.job_id.circuit_type),
         }?;

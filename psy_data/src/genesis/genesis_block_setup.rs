@@ -1,9 +1,32 @@
 use psy_core::constants::chain_id::PsyChainNetworkType;
+use serde_with::serde_as;
 
 use crate::v1::qdata::checkpoint::PQEDCheckpointLeafStats;
 use crate::v1::qdata::contract::PQBCDeployContract;
 use crate::user::complete_user_record::PsyCompactUserDefinition;
 
+
+#[serde_as]
+#[pderive::serialize_copy]
+pub struct ValidatorGenesisEntry {
+    pub realm_id: u32,
+    pub realm_sub_id: u16,
+    pub validator_user_id: u64,
+    #[serde(default = "default_zero_node_id")]
+    #[serde_as(as = "serde_with::hex::Hex")]
+    pub node_id: [u8; 38],
+    #[serde(default = "default_zero_bls_public_key")]
+    #[serde_as(as = "serde_with::hex::Hex")]
+    pub bls_public_key: [u8; 48],
+}
+
+fn default_zero_node_id() -> [u8; 38] {
+    [0u8; 38]
+}
+
+fn default_zero_bls_public_key() -> [u8; 48] {
+    [0u8; 48]
+}
 
 #[pderive::serialize_clone_f_hash_ts]
 #[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash))]
@@ -13,6 +36,9 @@ pub struct PsyGenesisBlockSetupData<F, Hash> {
     pub checkpoint_stats: PQEDCheckpointLeafStats<F, Hash>,
     pub deposit_tree_root: Hash,
     pub withdrawal_tree_root: Hash,
+    #[serde(default)]
+    #[ts(skip)]
+    pub validators: Vec<ValidatorGenesisEntry>,
 }
 
 

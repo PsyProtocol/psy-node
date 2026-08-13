@@ -311,6 +311,7 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
             contract_tree_root: self.global_contract_tree_root,
             user_tree_root: self.global_user_tree_root,
             user_registration_tree_root: self.user_registration_tree_root,
+            validator_tree_root: Hash::default(),
         }
     }
 

@@ -58,12 +58,16 @@ impl QEDPart1StateDeltaResultGadget {
         let todo_add_withdrawals_root = builder.constant_qhash(QHashOut::from_string_or_panic(
             "d65af5933a094e8329332a714327ba72b1e4dac93c0cde8ee479b9bb36c3fc43",
         ));
+        let todo_validator_tree_root = builder.constant_qhash(QHashOut::from_string_or_panic(
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        ));
         let old_state_roots = QEDCheckpointGlobalStateRootsGadget {
             contract_tree_root: part_1_header.global_contract_tree_delta.state_transition_start,
             deposit_tree_root: todo_add_deposits_root,
             user_tree_root: part_1_header.global_user_tree_delta.state_transition.old_node_value,
             withdrawal_tree_root: todo_add_withdrawals_root,
             user_registration_tree_root: part_1_header.user_registration_tree_delta.state_transition_start,
+            validator_tree_root: todo_validator_tree_root,
         };
         let new_state_roots = QEDCheckpointGlobalStateRootsGadget {
             contract_tree_root: part_1_header.global_contract_tree_delta.state_transition_end,
@@ -71,6 +75,7 @@ impl QEDPart1StateDeltaResultGadget {
             user_tree_root: part_1_header.global_user_tree_delta.state_transition.new_node_value,
             withdrawal_tree_root: todo_add_withdrawals_root,
             user_registration_tree_root: part_1_header.user_registration_tree_delta.state_transition_end,
+            validator_tree_root: todo_validator_tree_root,
         };
 
         let old_stats = QEDCheckpointLeafStatsGadget::create_virtual(builder);
