@@ -12,6 +12,7 @@ use std::{error::Error, fmt, sync::Arc};
 use parth_core::protocol::core_types::Q256BitHash;
 use psy_data::protocol::canonical_chain::NetworkId;
 use psy_node_core::store::{
+    branch_pending_mapping::BranchPendingMapping,
     canonical_head::{CanonicalHeadReadState, StoredCanonicalHead},
     rollback_control::RollbackControlState,
 };
@@ -27,9 +28,14 @@ use super::{
     CoordinatorRollbackArchiveAction, CoordinatorRollbackArchivePlan,
     CoordinatorRollbackArchivePlanDigest,
     CoordinatorRollbackArchivePlanDigestError, CqlKeyspaceName,
+    RegistryBlocker,
     ScyllaCanonicalHeadStore, ScyllaKeyDomain, ScyllaPhysicalTableId,
     ScyllaSchemaFamily,
     key_domain_descriptor, physical_descriptor,
+};
+use super::coordinator_rollback_branch_catalog::{
+    CoordinatorRollbackMappingSourceKind,
+    VerifiedCoordinatorRollbackMappingBundle,
 };
 
 pub(super) const COORDINATOR_ROLLBACK_SUFFIX_ARCHIVE_TABLE: &str =
@@ -45,6 +51,14 @@ const DATASET_DIGEST_DOMAIN: &[u8] =
     b"psy/coordinator-rollback-archive-dataset/v1";
 const STORE_FINGERPRINT_DOMAIN: &[u8] =
     b"psy/coordinator-rollback-archive-store/v1";
+const MAPPING_ROW_MAGIC: [u8; 8] = *b"PSYCRAMW";
+const MAPPING_ROW_CODEC_VERSION: u16 = 1;
+const MAPPING_ROW_DIGEST_DOMAIN: &[u8] =
+    b"psy/coordinator-rollback-mapping-archive-row/v1";
+const MAPPING_ROW_SLOT_DOMAIN: &[u8] =
+    b"psy/coordinator-rollback-mapping-archive-row-slot/v1";
+const MAPPING_BUNDLE_DIGEST_DOMAIN: &[u8] =
+    b"psy/coordinator-rollback-mapping-archive-bundle/v1";
 const ARCHIVE_REVISION: i64 = 1;
 const MAX_FRAGMENT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FRAGMENTS: usize = 16;
@@ -150,19 +164,19 @@ impl CoordinatorCheckpointPartitionKivSource {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-struct CoordinatorRollbackArchiveRowSlot([u8; 32]);
+pub(super) struct CoordinatorRollbackArchiveRowSlot([u8; 32]);
 
 impl CoordinatorRollbackArchiveRowSlot {
-    const fn as_bytes(&self) -> &[u8; 32] {
+    pub(super) const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct CoordinatorRollbackArchiveRowDigest([u8; 32]);
+pub(super) struct CoordinatorRollbackArchiveRowDigest([u8; 32]);
 
 impl CoordinatorRollbackArchiveRowDigest {
-    const fn as_bytes(&self) -> &[u8; 32] {
+    pub(super) const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 }
@@ -466,6 +480,599 @@ impl CoordinatorRollbackCheckpointKivArchiveRow {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CoordinatorRollbackMappingArchiveColumn {
+    column_id: u8,
+    value: Vec<u8>,
+    writetime_us: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct CoordinatorRollbackMappingArchiveRow {
+    network: NetworkId,
+    rollback_epoch: u64,
+    source_epoch: u64,
+    catalog_fingerprint: [u8; 32],
+    participant_plan_digest: CoordinatorRollbackArchivePlanDigest,
+    global_plan_digest: [u8; 32],
+    key_domain: ScyllaKeyDomain,
+    source_kind: CoordinatorRollbackMappingSourceKind,
+    requested_height: u64,
+    requested_hash: [u8; 32],
+    target_height: u64,
+    target_hash: [u8; 32],
+    orphan_write_max_us: i64,
+    source_checkpoint: u64,
+    source_pending: u64,
+    source_primary_key: Vec<u8>,
+    source_columns: Vec<CoordinatorRollbackMappingArchiveColumn>,
+    slot: CoordinatorRollbackArchiveRowSlot,
+    canonical_bytes: Vec<u8>,
+    digest: CoordinatorRollbackArchiveRowDigest,
+}
+
+impl CoordinatorRollbackMappingArchiveRow {
+    pub(super) fn try_from_verified<Hash: Q256BitHash>(
+        expected_head: StoredCanonicalHead<Hash>,
+        plan: &CoordinatorRollbackArchivePlan<Hash>,
+        bundle: &VerifiedCoordinatorRollbackMappingBundle,
+        source_index: usize,
+    ) -> Result<Self, CoordinatorRollbackMappingArchiveRowError> {
+        validate_archiving_head(expected_head, plan).map_err(|_| {
+            CoordinatorRollbackMappingArchiveRowError::NotExactArchivingHead
+        })?;
+        let source = bundle
+            .sources()
+            .get(source_index)
+            .ok_or(CoordinatorRollbackMappingArchiveRowError::InvalidSourceCount)?;
+        if bundle.network() != expected_head.canonical_ref().network_id()
+            || bundle.rollback_epoch()
+                != expected_head.canonical_ref().chain_epoch().get()
+            || bundle.source_epoch().checked_add(1) != Some(bundle.rollback_epoch())
+            || bundle.checkpoint() <= plan.suffix_start_exclusive()
+            || bundle.checkpoint() > plan.suffix_end_inclusive()
+        {
+            return Err(CoordinatorRollbackMappingArchiveRowError::IdentityMismatch);
+        }
+        let has_mapping_blocker = plan.blockers().iter().any(|blocker| {
+            matches!(
+                blocker,
+                super::CoordinatorRollbackArchivePlanBlocker::RegistryBlocked {
+                    key_domain: ScyllaKeyDomain::CheckpointToPending,
+                    blocker: RegistryBlocker::ReusableCheckpointHeightKey,
+                }
+            )
+        });
+        if !has_mapping_blocker {
+            return Err(CoordinatorRollbackMappingArchiveRowError::PlanContractMismatch);
+        }
+        let key_domain = mapping_key_domain(source.kind());
+        let source_columns = source
+            .columns()
+            .iter()
+            .map(|column| CoordinatorRollbackMappingArchiveColumn {
+                column_id: column.column_id(),
+                value: column.value().to_vec(),
+                writetime_us: column.writetime_us(),
+            })
+            .collect::<Vec<_>>();
+        let orphan_write_max_us = plan
+            .request()
+            .fence_window()
+            .delete_fence()
+            .orphan_write_max()
+            .as_i64();
+        validate_mapping_source::<Hash>(
+            bundle.network(),
+            bundle.source_epoch(),
+            bundle.checkpoint(),
+            bundle.pending().get(),
+            source.kind(),
+            source.primary_key(),
+            &source_columns,
+            orphan_write_max_us,
+        )?;
+        let participant_plan_digest = plan.digest();
+        let global_plan_digest = *plan.global_plan_digest().as_bytes();
+        let requested_height = plan.request().requested_head().checkpoint_id().get();
+        let requested_hash = plan
+            .request()
+            .requested_head()
+            .checkpoint_hash()
+            .as_inner()
+            .into_owned_32bytes();
+        let target_height = plan.request().target().checkpoint_id().get();
+        let target_hash = plan
+            .request()
+            .target()
+            .checkpoint_hash()
+            .as_inner()
+            .into_owned_32bytes();
+        let slot = mapping_row_slot(
+            bundle.network(),
+            bundle.rollback_epoch(),
+            participant_plan_digest,
+            source.kind(),
+            source.primary_key(),
+        );
+        let mut canonical_bytes = encode_mapping_row_without_digest(
+            bundle.network(),
+            bundle.rollback_epoch(),
+            bundle.source_epoch(),
+            bundle.catalog_fingerprint(),
+            participant_plan_digest,
+            global_plan_digest,
+            key_domain,
+            source.kind(),
+            requested_height,
+            requested_hash,
+            target_height,
+            target_hash,
+            orphan_write_max_us,
+            bundle.checkpoint(),
+            bundle.pending().get(),
+            source.primary_key(),
+            &source_columns,
+            slot,
+        )?;
+        let digest = mapping_row_digest(&canonical_bytes);
+        canonical_bytes.extend_from_slice(digest.as_bytes());
+        if canonical_bytes.len() > MAX_CANONICAL_ROW_BYTES {
+            return Err(CoordinatorRollbackMappingArchiveRowError::RowTooLarge {
+                actual: canonical_bytes.len(),
+                maximum: MAX_CANONICAL_ROW_BYTES,
+            });
+        }
+        Ok(Self {
+            network: bundle.network(),
+            rollback_epoch: bundle.rollback_epoch(),
+            source_epoch: bundle.source_epoch(),
+            catalog_fingerprint: bundle.catalog_fingerprint(),
+            participant_plan_digest,
+            global_plan_digest,
+            key_domain,
+            source_kind: source.kind(),
+            requested_height,
+            requested_hash,
+            target_height,
+            target_hash,
+            orphan_write_max_us,
+            source_checkpoint: bundle.checkpoint(),
+            source_pending: bundle.pending().get(),
+            source_primary_key: source.primary_key().to_vec(),
+            source_columns,
+            slot,
+            canonical_bytes,
+            digest,
+        })
+    }
+
+    pub(super) fn decode_canonical<Hash: Q256BitHash>(
+        bytes: &[u8],
+    ) -> Result<Self, CoordinatorRollbackMappingArchiveRowError> {
+        if bytes.len() < MAPPING_ROW_MIN_BYTES {
+            return Err(CoordinatorRollbackMappingArchiveRowError::Truncated);
+        }
+        if bytes.len() > MAX_CANONICAL_ROW_BYTES {
+            return Err(CoordinatorRollbackMappingArchiveRowError::RowTooLarge {
+                actual: bytes.len(),
+                maximum: MAX_CANONICAL_ROW_BYTES,
+            });
+        }
+        let (body, stored_digest) = bytes.split_at(bytes.len() - 32);
+        let expected_digest = mapping_row_digest(body);
+        if stored_digest != expected_digest.as_bytes().as_slice() {
+            return Err(CoordinatorRollbackMappingArchiveRowError::DigestMismatch);
+        }
+        let mut decoder = Decoder::new(body);
+        if decoder.take(8).map_err(map_row_decode)? != MAPPING_ROW_MAGIC {
+            return Err(CoordinatorRollbackMappingArchiveRowError::InvalidMagic);
+        }
+        let version = decoder.u16().map_err(map_row_decode)?;
+        if version != MAPPING_ROW_CODEC_VERSION {
+            return Err(CoordinatorRollbackMappingArchiveRowError::UnknownVersion(version));
+        }
+        let network = NetworkId::try_from_chain_id(decoder.u32().map_err(map_row_decode)?)
+            .map_err(|error| CoordinatorRollbackMappingArchiveRowError::Network(error.to_string()))?;
+        let rollback_epoch = decoder.u64().map_err(map_row_decode)?;
+        let source_epoch = decoder.u64().map_err(map_row_decode)?;
+        if source_epoch.checked_add(1) != Some(rollback_epoch)
+            || rollback_epoch > i64::MAX as u64
+        {
+            return Err(CoordinatorRollbackMappingArchiveRowError::IdentityMismatch);
+        }
+        let catalog_fingerprint = decoder.array_32().map_err(map_row_decode)?;
+        if catalog_fingerprint == [0; 32] {
+            return Err(CoordinatorRollbackMappingArchiveRowError::ZeroDigest);
+        }
+        let participant_plan_digest = CoordinatorRollbackArchivePlanDigest::try_from_archive_bytes(
+            decoder.array_32().map_err(map_row_decode)?,
+        )
+        .map_err(CoordinatorRollbackMappingArchiveRowError::PlanDigest)?;
+        let global_plan_digest = decoder.array_32().map_err(map_row_decode)?;
+        if global_plan_digest == [0; 32] {
+            return Err(CoordinatorRollbackMappingArchiveRowError::ZeroDigest);
+        }
+        let key_domain = decode_mapping_key_domain(decoder.u16().map_err(map_row_decode)?)?;
+        let source_kind = decode_mapping_source_kind(decoder.u8().map_err(map_row_decode)?)?;
+        if key_domain != mapping_key_domain(source_kind) {
+            return Err(CoordinatorRollbackMappingArchiveRowError::IdentityMismatch);
+        }
+        let requested_height = decoder.u64().map_err(map_row_decode)?;
+        let requested_hash = decoder.array_32().map_err(map_row_decode)?;
+        let target_height = decoder.u64().map_err(map_row_decode)?;
+        let target_hash = decoder.array_32().map_err(map_row_decode)?;
+        let orphan_write_max_us = decoder.i64().map_err(map_row_decode)?;
+        let source_checkpoint = decoder.u64().map_err(map_row_decode)?;
+        let source_pending = decoder.u64().map_err(map_row_decode)?;
+        if target_height >= requested_height
+            || source_checkpoint <= target_height
+            || source_checkpoint > requested_height
+        {
+            return Err(CoordinatorRollbackMappingArchiveRowError::SourceOutsideSuffix);
+        }
+        let primary_len = usize::try_from(decoder.u16().map_err(map_row_decode)?)
+            .map_err(|_| CoordinatorRollbackMappingArchiveRowError::LengthOverflow)?;
+        let source_primary_key = decoder.take(primary_len).map_err(map_row_decode)?.to_vec();
+        let column_count = usize::from(decoder.u8().map_err(map_row_decode)?);
+        if column_count == 0 || column_count > 2 {
+            return Err(CoordinatorRollbackMappingArchiveRowError::InvalidColumnSet);
+        }
+        let mut source_columns = Vec::with_capacity(column_count);
+        for _ in 0..column_count {
+            let column_id = decoder.u8().map_err(map_row_decode)?;
+            let writetime_us = decoder.i64().map_err(map_row_decode)?;
+            let value_len = usize::try_from(decoder.u16().map_err(map_row_decode)?)
+                .map_err(|_| CoordinatorRollbackMappingArchiveRowError::LengthOverflow)?;
+            let value = decoder.take(value_len).map_err(map_row_decode)?.to_vec();
+            source_columns.push(CoordinatorRollbackMappingArchiveColumn {
+                column_id,
+                value,
+                writetime_us,
+            });
+        }
+        let slot = CoordinatorRollbackArchiveRowSlot(
+            decoder.array_32().map_err(map_row_decode)?,
+        );
+        if !decoder.is_empty() {
+            return Err(CoordinatorRollbackMappingArchiveRowError::TrailingBytes);
+        }
+        validate_mapping_source::<Hash>(
+            network,
+            source_epoch,
+            source_checkpoint,
+            source_pending,
+            source_kind,
+            &source_primary_key,
+            &source_columns,
+            orphan_write_max_us,
+        )?;
+        let expected_slot = mapping_row_slot(
+            network,
+            rollback_epoch,
+            participant_plan_digest,
+            source_kind,
+            &source_primary_key,
+        );
+        if slot != expected_slot {
+            return Err(CoordinatorRollbackMappingArchiveRowError::RowSlotMismatch);
+        }
+        Ok(Self {
+            network,
+            rollback_epoch,
+            source_epoch,
+            catalog_fingerprint,
+            participant_plan_digest,
+            global_plan_digest,
+            key_domain,
+            source_kind,
+            requested_height,
+            requested_hash,
+            target_height,
+            target_hash,
+            orphan_write_max_us,
+            source_checkpoint,
+            source_pending,
+            source_primary_key,
+            source_columns,
+            slot,
+            canonical_bytes: bytes.to_vec(),
+            digest: expected_digest,
+        })
+    }
+
+    fn fragments(
+        &self,
+    ) -> Result<Vec<CoordinatorRollbackArchiveFragment>, CoordinatorRollbackMappingArchiveRowError>
+    {
+        let fragment_count = self.canonical_bytes.len().div_ceil(MAX_FRAGMENT_BYTES);
+        if fragment_count == 0 || fragment_count > MAX_FRAGMENTS {
+            return Err(CoordinatorRollbackMappingArchiveRowError::InvalidFragmentCount(
+                fragment_count,
+            ));
+        }
+        let row_bytes = i64::try_from(self.canonical_bytes.len())
+            .map_err(|_| CoordinatorRollbackMappingArchiveRowError::LengthOverflow)?;
+        let count = i32::try_from(fragment_count)
+            .map_err(|_| CoordinatorRollbackMappingArchiveRowError::LengthOverflow)?;
+        Ok(self
+            .canonical_bytes
+            .chunks(MAX_FRAGMENT_BYTES)
+            .enumerate()
+            .map(|(index, payload)| CoordinatorRollbackArchiveFragment {
+                index: index as i32,
+                count,
+                row_bytes,
+                payload: payload.to_vec(),
+                payload_digest: fragment_digest(index as i32, payload),
+                row_digest: self.digest,
+            })
+            .collect())
+    }
+
+    pub(super) const fn slot(&self) -> CoordinatorRollbackArchiveRowSlot {
+        self.slot
+    }
+
+    pub(super) const fn digest(&self) -> CoordinatorRollbackArchiveRowDigest {
+        self.digest
+    }
+
+    pub(super) fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical_bytes
+    }
+}
+
+#[cfg(test)]
+pub(super) fn qualification_reconstruct_mapping_archive_row<Hash: Q256BitHash>(
+    row: &CoordinatorRollbackMappingArchiveRow,
+) -> Result<CoordinatorRollbackMappingArchiveRow, CoordinatorRollbackArchiveStoreError> {
+    let bytes = reconstruct_fragments(row.fragments()?)?;
+    Ok(CoordinatorRollbackMappingArchiveRow::decode_canonical::<Hash>(&bytes)?)
+}
+
+const MAPPING_ROW_MIN_BYTES: usize =
+    8 + 2 + 4 + 8 + 8 + 32 + 32 + 32 + 2 + 1 + 8 + 32 + 8 + 32 + 8 + 8 + 8 + 2 + 1 + 32 + 32;
+
+fn encode_mapping_row_without_digest(
+    network: NetworkId,
+    rollback_epoch: u64,
+    source_epoch: u64,
+    catalog_fingerprint: [u8; 32],
+    participant_plan_digest: CoordinatorRollbackArchivePlanDigest,
+    global_plan_digest: [u8; 32],
+    key_domain: ScyllaKeyDomain,
+    source_kind: CoordinatorRollbackMappingSourceKind,
+    requested_height: u64,
+    requested_hash: [u8; 32],
+    target_height: u64,
+    target_hash: [u8; 32],
+    orphan_write_max_us: i64,
+    source_checkpoint: u64,
+    source_pending: u64,
+    source_primary_key: &[u8],
+    source_columns: &[CoordinatorRollbackMappingArchiveColumn],
+    slot: CoordinatorRollbackArchiveRowSlot,
+) -> Result<Vec<u8>, CoordinatorRollbackMappingArchiveRowError> {
+    if rollback_epoch > i64::MAX as u64
+        || source_checkpoint > i64::MAX as u64
+        || source_pending > i64::MAX as u64
+    {
+        return Err(CoordinatorRollbackMappingArchiveRowError::IntegerOutOfCqlRange);
+    }
+    let primary_len = u16::try_from(source_primary_key.len())
+        .map_err(|_| CoordinatorRollbackMappingArchiveRowError::LengthOverflow)?;
+    let column_count = u8::try_from(source_columns.len())
+        .map_err(|_| CoordinatorRollbackMappingArchiveRowError::LengthOverflow)?;
+    let mut bytes = Vec::with_capacity(MAPPING_ROW_MIN_BYTES + source_primary_key.len() + 128);
+    bytes.extend_from_slice(&MAPPING_ROW_MAGIC);
+    bytes.extend_from_slice(&MAPPING_ROW_CODEC_VERSION.to_be_bytes());
+    bytes.extend_from_slice(&network.chain_id().to_be_bytes());
+    bytes.extend_from_slice(&rollback_epoch.to_be_bytes());
+    bytes.extend_from_slice(&source_epoch.to_be_bytes());
+    bytes.extend_from_slice(&catalog_fingerprint);
+    bytes.extend_from_slice(&participant_plan_digest.as_bytes());
+    bytes.extend_from_slice(&global_plan_digest);
+    bytes.extend_from_slice(&key_domain.stable_id().to_be_bytes());
+    bytes.push(source_kind.stable_id());
+    bytes.extend_from_slice(&requested_height.to_be_bytes());
+    bytes.extend_from_slice(&requested_hash);
+    bytes.extend_from_slice(&target_height.to_be_bytes());
+    bytes.extend_from_slice(&target_hash);
+    bytes.extend_from_slice(&orphan_write_max_us.to_be_bytes());
+    bytes.extend_from_slice(&source_checkpoint.to_be_bytes());
+    bytes.extend_from_slice(&source_pending.to_be_bytes());
+    bytes.extend_from_slice(&primary_len.to_be_bytes());
+    bytes.extend_from_slice(source_primary_key);
+    bytes.push(column_count);
+    for column in source_columns {
+        let value_len = u16::try_from(column.value.len())
+            .map_err(|_| CoordinatorRollbackMappingArchiveRowError::LengthOverflow)?;
+        bytes.push(column.column_id);
+        bytes.extend_from_slice(&column.writetime_us.to_be_bytes());
+        bytes.extend_from_slice(&value_len.to_be_bytes());
+        bytes.extend_from_slice(&column.value);
+    }
+    bytes.extend_from_slice(slot.as_bytes());
+    Ok(bytes)
+}
+
+fn validate_mapping_source<Hash: Q256BitHash>(
+    network: NetworkId,
+    source_epoch: u64,
+    checkpoint: u64,
+    pending: u64,
+    kind: CoordinatorRollbackMappingSourceKind,
+    primary_key: &[u8],
+    columns: &[CoordinatorRollbackMappingArchiveColumn],
+    orphan_write_max_us: i64,
+) -> Result<(), CoordinatorRollbackMappingArchiveRowError> {
+    if pending == 0 || pending > i64::MAX as u64 || checkpoint > i64::MAX as u64 {
+        return Err(CoordinatorRollbackMappingArchiveRowError::IntegerOutOfCqlRange);
+    }
+    for column in columns {
+        if column.writetime_us > orphan_write_max_us {
+            return Err(CoordinatorRollbackMappingArchiveRowError::WriteAfterOrphanFence {
+                writetime_us: column.writetime_us,
+                orphan_write_max_us,
+            });
+        }
+    }
+    let checkpoint_bytes = checkpoint.to_be_bytes();
+    let pending_bytes = pending.to_be_bytes();
+    match kind {
+        CoordinatorRollbackMappingSourceKind::LegacyCheckpointToPending
+            if primary_key == checkpoint_bytes
+                && matches!(columns, [column] if column.column_id == 1 && column.value == pending_bytes) => {}
+        CoordinatorRollbackMappingSourceKind::LegacyPendingToCheckpoint
+            if primary_key == pending_bytes
+                && matches!(columns, [column] if column.column_id == 1 && column.value == checkpoint_bytes) => {}
+        CoordinatorRollbackMappingSourceKind::BranchExactCanonicalToPending => {
+            let [pending_column, digest_column] = columns else {
+                return Err(CoordinatorRollbackMappingArchiveRowError::InvalidColumnSet);
+            };
+            if pending_column.column_id != 1
+                || pending_column.value != pending_bytes
+                || digest_column.column_id != 2
+                || digest_column.value.len() != 32
+            {
+                return Err(CoordinatorRollbackMappingArchiveRowError::InvalidColumnSet);
+            }
+            validate_branch_mapping::<Hash>(
+                network,
+                source_epoch,
+                checkpoint,
+                pending,
+                primary_key,
+                &digest_column.value,
+            )?;
+        }
+        CoordinatorRollbackMappingSourceKind::BranchExactPendingToCanonical => {
+            let [canonical_column, digest_column] = columns else {
+                return Err(CoordinatorRollbackMappingArchiveRowError::InvalidColumnSet);
+            };
+            if primary_key != pending_bytes
+                || canonical_column.column_id != 1
+                || digest_column.column_id != 2
+                || digest_column.value.len() != 32
+            {
+                return Err(CoordinatorRollbackMappingArchiveRowError::InvalidColumnSet);
+            }
+            validate_branch_mapping::<Hash>(
+                network,
+                source_epoch,
+                checkpoint,
+                pending,
+                &canonical_column.value,
+                &digest_column.value,
+            )?;
+        }
+        _ => return Err(CoordinatorRollbackMappingArchiveRowError::InvalidColumnSet),
+    }
+    Ok(())
+}
+
+fn validate_branch_mapping<Hash: Q256BitHash>(
+    network: NetworkId,
+    source_epoch: u64,
+    checkpoint: u64,
+    pending: u64,
+    canonical_bytes: &[u8],
+    digest: &[u8],
+) -> Result<(), CoordinatorRollbackMappingArchiveRowError> {
+    let pending = psy_node_core::store::typed::UniquePendingId::try_new(pending)
+        .map_err(|_| CoordinatorRollbackMappingArchiveRowError::InvalidPending)?;
+    let mapping = BranchPendingMapping::<Hash>::from_canonical_chain_bytes(
+        canonical_bytes,
+        pending,
+    )
+    .map_err(|error| CoordinatorRollbackMappingArchiveRowError::Canonical(error.to_string()))?;
+    if mapping.canonical_chain().network_id() != network
+        || mapping.canonical_chain().chain_epoch().get() != source_epoch
+        || mapping
+            .canonical_chain()
+            .checkpoint()
+            .checkpoint_id()
+            .get()
+            != checkpoint
+        || mapping.digest().as_bytes().as_slice() != digest
+    {
+        return Err(CoordinatorRollbackMappingArchiveRowError::IdentityMismatch);
+    }
+    Ok(())
+}
+
+fn mapping_key_domain(kind: CoordinatorRollbackMappingSourceKind) -> ScyllaKeyDomain {
+    match kind {
+        CoordinatorRollbackMappingSourceKind::LegacyCheckpointToPending
+        | CoordinatorRollbackMappingSourceKind::BranchExactCanonicalToPending => {
+            ScyllaKeyDomain::CheckpointToPending
+        }
+        CoordinatorRollbackMappingSourceKind::LegacyPendingToCheckpoint
+        | CoordinatorRollbackMappingSourceKind::BranchExactPendingToCanonical => {
+            ScyllaKeyDomain::PendingToCheckpoint
+        }
+    }
+}
+
+fn decode_mapping_key_domain(
+    value: u16,
+) -> Result<ScyllaKeyDomain, CoordinatorRollbackMappingArchiveRowError> {
+    match value {
+        value if value == ScyllaKeyDomain::CheckpointToPending.stable_id() => {
+            Ok(ScyllaKeyDomain::CheckpointToPending)
+        }
+        value if value == ScyllaKeyDomain::PendingToCheckpoint.stable_id() => {
+            Ok(ScyllaKeyDomain::PendingToCheckpoint)
+        }
+        _ => Err(CoordinatorRollbackMappingArchiveRowError::UnknownKeyDomain(value)),
+    }
+}
+
+fn decode_mapping_source_kind(
+    value: u8,
+) -> Result<CoordinatorRollbackMappingSourceKind, CoordinatorRollbackMappingArchiveRowError> {
+    match value {
+        1 => Ok(CoordinatorRollbackMappingSourceKind::LegacyCheckpointToPending),
+        2 => Ok(CoordinatorRollbackMappingSourceKind::LegacyPendingToCheckpoint),
+        3 => Ok(CoordinatorRollbackMappingSourceKind::BranchExactCanonicalToPending),
+        4 => Ok(CoordinatorRollbackMappingSourceKind::BranchExactPendingToCanonical),
+        _ => Err(CoordinatorRollbackMappingArchiveRowError::UnknownSourceKind(value)),
+    }
+}
+
+fn mapping_row_slot(
+    network: NetworkId,
+    rollback_epoch: u64,
+    participant_plan_digest: CoordinatorRollbackArchivePlanDigest,
+    source_kind: CoordinatorRollbackMappingSourceKind,
+    primary_key: &[u8],
+) -> CoordinatorRollbackArchiveRowSlot {
+    let mut hasher = Sha256::new();
+    hasher.update(MAPPING_ROW_SLOT_DOMAIN);
+    hasher.update(network.chain_id().to_be_bytes());
+    hasher.update(rollback_epoch.to_be_bytes());
+    hasher.update(participant_plan_digest.as_bytes());
+    hasher.update([source_kind.stable_id()]);
+    hasher.update((primary_key.len() as u64).to_be_bytes());
+    hasher.update(primary_key);
+    CoordinatorRollbackArchiveRowSlot(hasher.finalize().into())
+}
+
+pub(super) fn mapping_row_digest(bytes: &[u8]) -> CoordinatorRollbackArchiveRowDigest {
+    let mut hasher = Sha256::new();
+    hasher.update(MAPPING_ROW_DIGEST_DOMAIN);
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+    CoordinatorRollbackArchiveRowDigest(hasher.finalize().into())
+}
+
+fn map_row_decode(
+    error: CoordinatorRollbackArchiveRowError,
+) -> CoordinatorRollbackMappingArchiveRowError {
+    CoordinatorRollbackMappingArchiveRowError::Decode(error.to_string())
+}
+
 const ROW_MIN_BYTES: usize = 8 + 2 + 4 + 8 + 32 + 32 + 2 + 2 + 1 + 8 + 32 + 8 + 32 + 8 + 8 + 8 + 8 + 32 + 32;
 
 fn encode_row_without_digest(
@@ -586,6 +1193,33 @@ struct CoordinatorRollbackArchiveFragment {
 struct PersistedCoordinatorRollbackArchiveRowReceipt {
     store_fingerprint: CoordinatorRollbackArchiveStoreFingerprint,
     row: CoordinatorRollbackCheckpointKivArchiveRow,
+}
+
+#[derive(Debug)]
+struct PersistedCoordinatorRollbackMappingArchiveRowReceipt {
+    store_fingerprint: CoordinatorRollbackArchiveStoreFingerprint,
+    row: CoordinatorRollbackMappingArchiveRow,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CoordinatorRollbackArchivedMappingBundle {
+    rows: u64,
+    canonical_bytes: u64,
+    digest: [u8; 32],
+}
+
+impl CoordinatorRollbackArchivedMappingBundle {
+    pub(super) const fn rows(self) -> u64 {
+        self.rows
+    }
+
+    pub(super) const fn canonical_bytes(self) -> u64 {
+        self.canonical_bytes
+    }
+
+    pub(super) const fn digest(self) -> [u8; 32] {
+        self.digest
+    }
 }
 
 /// Inert evidence for progress/metrics only.  It is intentionally Copy and is
@@ -750,6 +1384,51 @@ impl ScyllaCoordinatorRollbackArchiveStore {
         })
     }
 
+    /// The only mapping archive entry point. The caller cannot provide raw
+    /// mapping bytes: it must present the non-constructible bundle emitted by
+    /// the storage verifier after all four physical directions agree.
+    pub(super) async fn persist_verified_mapping_bundle<Hash: Q256BitHash>(
+        &self,
+        expected_head: StoredCanonicalHead<Hash>,
+        plan: &CoordinatorRollbackArchivePlan<Hash>,
+        bundle: &VerifiedCoordinatorRollbackMappingBundle,
+    ) -> Result<CoordinatorRollbackArchivedMappingBundle, CoordinatorRollbackArchiveStoreError> {
+        let mut rows = 0_u64;
+        let mut canonical_bytes = 0_u64;
+        let mut hasher = Sha256::new();
+        hasher.update(MAPPING_BUNDLE_DIGEST_DOMAIN);
+        hasher.update(bundle.catalog_fingerprint());
+        hasher.update(bundle.source_epoch().to_be_bytes());
+        hasher.update(bundle.checkpoint().to_be_bytes());
+        hasher.update(bundle.pending().get().to_be_bytes());
+        for source_index in 0..bundle.sources().len() {
+            let row = CoordinatorRollbackMappingArchiveRow::try_from_verified(
+                expected_head,
+                plan,
+                bundle,
+                source_index,
+            )?;
+            let receipt = self.persist_mapping_exact::<Hash>(row).await?;
+            self.revalidate_mapping_exact::<Hash>(&receipt).await?;
+            rows = rows
+                .checked_add(1)
+                .ok_or(CoordinatorRollbackArchiveStoreError::LengthOverflow)?;
+            canonical_bytes = canonical_bytes
+                .checked_add(receipt.row.canonical_bytes.len() as u64)
+                .ok_or(CoordinatorRollbackArchiveStoreError::LengthOverflow)?;
+            hasher.update(receipt.row.source_kind.stable_id().to_be_bytes());
+            hasher.update(receipt.row.slot.as_bytes());
+            hasher.update(receipt.row.digest.as_bytes());
+        }
+        hasher.update(rows.to_be_bytes());
+        hasher.update(canonical_bytes.to_be_bytes());
+        Ok(CoordinatorRollbackArchivedMappingBundle {
+            rows,
+            canonical_bytes,
+            digest: hasher.finalize().into(),
+        })
+    }
+
     async fn require_current_head<Hash: Q256BitHash>(
         &self,
         canonical_head_store: &ScyllaCanonicalHeadStore,
@@ -868,6 +1547,75 @@ impl ScyllaCoordinatorRollbackArchiveStore {
         })
     }
 
+    async fn persist_mapping_exact<Hash: Q256BitHash>(
+        &self,
+        row: CoordinatorRollbackMappingArchiveRow,
+    ) -> Result<PersistedCoordinatorRollbackMappingArchiveRowReceipt, CoordinatorRollbackArchiveStoreError> {
+        let fragments = row.fragments()?;
+        let network = i64::from(row.network.chain_id());
+        let chain_epoch = i64::try_from(row.rollback_epoch)
+            .map_err(|_| CoordinatorRollbackArchiveStoreError::IntegerOutOfCqlRange)?;
+        let key_domain = i16::try_from(row.key_domain.stable_id())
+            .map_err(|_| CoordinatorRollbackArchiveStoreError::IntegerOutOfCqlRange)?;
+        let participant = row.participant_plan_digest.as_bytes();
+        for fragment in &fragments {
+            let execution = self
+                .session
+                .execute_unpaged(
+                    &self.insert,
+                    (
+                        network,
+                        chain_epoch,
+                        participant.as_slice(),
+                        key_domain,
+                        row.slot.as_bytes().as_slice(),
+                        fragment.index,
+                        ARCHIVE_REVISION,
+                        fragment.count,
+                        fragment.row_bytes,
+                        fragment.payload.as_slice(),
+                        fragment.payload_digest.as_slice(),
+                        fragment.row_digest.as_bytes().as_slice(),
+                    ),
+                )
+                .await;
+            match execution {
+                Ok(result) => {
+                    if !decode_applied(result)? {
+                        let current = self.read_mapping_fragment(&row, fragment.index).await?;
+                        if current.as_ref() != Some(fragment) {
+                            return Err(CoordinatorRollbackArchiveStoreError::Conflict);
+                        }
+                    }
+                }
+                Err(error) => match self.read_mapping_fragment(&row, fragment.index).await {
+                    Ok(Some(current)) if current == *fragment => {}
+                    Ok(_) => {
+                        return Err(CoordinatorRollbackArchiveStoreError::Indeterminate(
+                            error.to_string(),
+                        ));
+                    }
+                    Err(read) => {
+                        return Err(CoordinatorRollbackArchiveStoreError::Indeterminate(
+                            format!("execute={error}; read={read}"),
+                        ));
+                    }
+                },
+            }
+        }
+        let current = self
+            .read_exact_mapping_row::<Hash>(&row)
+            .await?
+            .ok_or(CoordinatorRollbackArchiveStoreError::MissingAfterPersist)?;
+        if current != row {
+            return Err(CoordinatorRollbackArchiveStoreError::Conflict);
+        }
+        Ok(PersistedCoordinatorRollbackMappingArchiveRowReceipt {
+            store_fingerprint: self.fingerprint,
+            row: current,
+        })
+    }
+
     async fn revalidate_exact(
         &self,
         receipt: &PersistedCoordinatorRollbackArchiveRowReceipt,
@@ -876,6 +1624,19 @@ impl ScyllaCoordinatorRollbackArchiveStore {
             return Err(CoordinatorRollbackArchiveStoreError::ReceiptBindingMismatch);
         }
         match self.read_exact_row(&receipt.row).await? {
+            Some(current) if current == receipt.row => Ok(()),
+            _ => Err(CoordinatorRollbackArchiveStoreError::ReceiptStale),
+        }
+    }
+
+    async fn revalidate_mapping_exact<Hash: Q256BitHash>(
+        &self,
+        receipt: &PersistedCoordinatorRollbackMappingArchiveRowReceipt,
+    ) -> Result<(), CoordinatorRollbackArchiveStoreError> {
+        if receipt.store_fingerprint != self.fingerprint {
+            return Err(CoordinatorRollbackArchiveStoreError::ReceiptBindingMismatch);
+        }
+        match self.read_exact_mapping_row::<Hash>(&receipt.row).await? {
             Some(current) if current == receipt.row => Ok(()),
             _ => Err(CoordinatorRollbackArchiveStoreError::ReceiptStale),
         }
@@ -921,6 +1682,46 @@ impl ScyllaCoordinatorRollbackArchiveStore {
         result
             .map(|tuple| decode_fragment(index, tuple))
             .transpose()
+    }
+
+    async fn read_mapping_fragment(
+        &self,
+        row: &CoordinatorRollbackMappingArchiveRow,
+        index: i32,
+    ) -> Result<Option<CoordinatorRollbackArchiveFragment>, CoordinatorRollbackArchiveStoreError> {
+        let network = i64::from(row.network.chain_id());
+        let chain_epoch = i64::try_from(row.rollback_epoch)
+            .map_err(|_| CoordinatorRollbackArchiveStoreError::IntegerOutOfCqlRange)?;
+        let key_domain = i16::try_from(row.key_domain.stable_id())
+            .map_err(|_| CoordinatorRollbackArchiveStoreError::IntegerOutOfCqlRange)?;
+        let participant = row.participant_plan_digest.as_bytes();
+        let result = self
+            .session
+            .execute_unpaged(
+                &self.read_fragment,
+                (
+                    network,
+                    chain_epoch,
+                    participant.as_slice(),
+                    key_domain,
+                    row.slot.as_bytes().as_slice(),
+                    index,
+                ),
+            )
+            .await
+            .map_err(cql)?
+            .into_rows_result()
+            .map_err(cql)?
+            .maybe_first_row::<(
+                Option<i64>,
+                Option<i32>,
+                Option<i64>,
+                Option<Vec<u8>>,
+                Option<Vec<u8>>,
+                Option<Vec<u8>>,
+            )>()
+            .map_err(cql)?;
+        result.map(|tuple| decode_fragment(index, tuple)).transpose()
     }
 
     async fn read_exact_row(
@@ -978,6 +1779,69 @@ impl ScyllaCoordinatorRollbackArchiveStore {
         if row.slot != expected.slot
             || row.network != expected.network
             || row.chain_epoch != expected.chain_epoch
+            || row.participant_plan_digest != expected.participant_plan_digest
+            || row.key_domain != expected.key_domain
+        {
+            return Err(CoordinatorRollbackArchiveStoreError::SelectedRowMismatch);
+        }
+        Ok(Some(row))
+    }
+
+    async fn read_exact_mapping_row<Hash: Q256BitHash>(
+        &self,
+        expected: &CoordinatorRollbackMappingArchiveRow,
+    ) -> Result<Option<CoordinatorRollbackMappingArchiveRow>, CoordinatorRollbackArchiveStoreError> {
+        let network = i64::from(expected.network.chain_id());
+        let chain_epoch = i64::try_from(expected.rollback_epoch)
+            .map_err(|_| CoordinatorRollbackArchiveStoreError::IntegerOutOfCqlRange)?;
+        let key_domain = i16::try_from(expected.key_domain.stable_id())
+            .map_err(|_| CoordinatorRollbackArchiveStoreError::IntegerOutOfCqlRange)?;
+        let participant = expected.participant_plan_digest.as_bytes();
+        let rows_result = self
+            .session
+            .execute_unpaged(
+                &self.read_row,
+                (
+                    network,
+                    chain_epoch,
+                    participant.as_slice(),
+                    key_domain,
+                    expected.slot.as_bytes().as_slice(),
+                ),
+            )
+            .await
+            .map_err(cql)?
+            .into_rows_result()
+            .map_err(cql)?;
+        let rows = rows_result
+            .rows::<(
+                Option<i32>,
+                Option<i64>,
+                Option<i32>,
+                Option<i64>,
+                Option<Vec<u8>>,
+                Option<Vec<u8>>,
+                Option<Vec<u8>>,
+            )>()
+            .map_err(cql)?;
+        let mut fragments = Vec::new();
+        for row in rows {
+            let (index, revision, count, row_bytes, payload, payload_digest, row_digest) =
+                row.map_err(cql)?;
+            let index = index.ok_or(CoordinatorRollbackArchiveStoreError::MissingArchiveColumn)?;
+            fragments.push(decode_fragment(
+                index,
+                (revision, count, row_bytes, payload, payload_digest, row_digest),
+            )?);
+        }
+        if fragments.is_empty() {
+            return Ok(None);
+        }
+        let reconstructed = reconstruct_fragments(fragments)?;
+        let row = CoordinatorRollbackMappingArchiveRow::decode_canonical::<Hash>(&reconstructed)?;
+        if row.slot != expected.slot
+            || row.network != expected.network
+            || row.rollback_epoch != expected.rollback_epoch
             || row.participant_plan_digest != expected.participant_plan_digest
             || row.key_domain != expected.key_domain
         {
@@ -1063,10 +1927,7 @@ fn reconstruct_fragments(
     if bytes.len() != expected_bytes {
         return Err(CoordinatorRollbackArchiveStoreError::InvalidFragmentSet);
     }
-    if bytes.len() < 32
-        || row_digest(&bytes[..bytes.len() - 32]) != expected_digest
-        || bytes[bytes.len() - 32..] != *expected_digest.as_bytes()
-    {
+    if bytes.len() < 32 || bytes[bytes.len() - 32..] != *expected_digest.as_bytes() {
         return Err(CoordinatorRollbackArchiveStoreError::RowDigestMismatch);
     }
     Ok(bytes)
@@ -1158,7 +2019,7 @@ fn cql(error: impl fmt::Display) -> CoordinatorRollbackArchiveStoreError {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum CoordinatorRollbackArchiveRowError {
+pub(super) enum CoordinatorRollbackArchiveRowError {
     InvalidMagic,
     UnknownVersion(u16),
     Network(String),
@@ -1185,6 +2046,46 @@ enum CoordinatorRollbackArchiveRowError {
     TrailingBytes,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum CoordinatorRollbackMappingArchiveRowError {
+    InvalidMagic,
+    UnknownVersion(u16),
+    Network(String),
+    PlanDigest(CoordinatorRollbackArchivePlanDigestError),
+    ZeroDigest,
+    UnknownKeyDomain(u16),
+    UnknownSourceKind(u8),
+    PlanContractMismatch,
+    NotExactArchivingHead,
+    IdentityMismatch,
+    SourceOutsideSuffix,
+    InvalidSourceCount,
+    InvalidColumnSet,
+    InvalidPending,
+    Canonical(String),
+    WriteAfterOrphanFence {
+        writetime_us: i64,
+        orphan_write_max_us: i64,
+    },
+    IntegerOutOfCqlRange,
+    LengthOverflow,
+    RowTooLarge { actual: usize, maximum: usize },
+    InvalidFragmentCount(usize),
+    Truncated,
+    DigestMismatch,
+    RowSlotMismatch,
+    TrailingBytes,
+    Decode(String),
+}
+
+impl fmt::Display for CoordinatorRollbackMappingArchiveRowError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "invalid Coordinator rollback mapping archive row: {self:?}")
+    }
+}
+
+impl Error for CoordinatorRollbackMappingArchiveRowError {}
+
 impl From<CoordinatorRollbackArchivePlanDigestError>
     for CoordinatorRollbackArchiveRowError
 {
@@ -1205,6 +2106,7 @@ impl Error for CoordinatorRollbackArchiveRowError {}
 pub(super) enum CoordinatorRollbackArchiveStoreError {
     Cql(String),
     Row(CoordinatorRollbackArchiveRowError),
+    MappingRow(CoordinatorRollbackMappingArchiveRowError),
     CanonicalHead(String),
     CanonicalHeadChanged,
     NotExactArchivingHead,
@@ -1236,6 +2138,14 @@ impl From<CoordinatorRollbackArchiveRowError>
 {
     fn from(value: CoordinatorRollbackArchiveRowError) -> Self {
         Self::Row(value)
+    }
+}
+
+impl From<CoordinatorRollbackMappingArchiveRowError>
+    for CoordinatorRollbackArchiveStoreError
+{
+    fn from(value: CoordinatorRollbackMappingArchiveRowError) -> Self {
+        Self::MappingRow(value)
     }
 }
 

@@ -50,8 +50,12 @@ use crate::compression;
 
 use super::{
     BranchExactCheckpointChainConfig, BRANCH_TO_PENDING_TABLE,
-    CqlKeyspaceName, CoordinatorRollbackArchivePlan,
-    PENDING_TO_BRANCH_TABLE, ScyllaCanonicalHeadStore,
+    CqlKeyspaceName, CoordinatorRollbackArchivePlan, PENDING_TO_BRANCH_TABLE,
+    ScyllaCanonicalHeadStore,
+};
+use super::coordinator_rollback_archive_store::{
+    CoordinatorRollbackArchivedMappingBundle,
+    ScyllaCoordinatorRollbackArchiveStore,
 };
 
 const CHECKPOINT_TRANSITION_TABLE: &str =
@@ -63,15 +67,19 @@ const CATALOG_DIGEST_DOMAIN: &[u8] =
     b"psy/coordinator-rollback-branch-catalog/v1";
 const SOURCE_DIGEST_DOMAIN: &[u8] =
     b"psy/coordinator-rollback-branch-catalog-source/v1";
+const CATALOG_FINGERPRINT_DOMAIN: &[u8] =
+    b"psy/coordinator-rollback-branch-catalog-store/v1";
+const MAPPING_ARCHIVE_DATASET_DIGEST_DOMAIN: &[u8] =
+    b"psy/coordinator-rollback-mapping-archive-dataset/v1";
 
 const READ_TRANSITION_TEMPLATE: &str =
     "SELECT value, WRITETIME(value) FROM {table} WHERE obj_id = ?";
 const READ_LEGACY_TEMPLATE: &str =
     "SELECT value, WRITETIME(value) FROM {table} WHERE obj_id = ?";
 const READ_TARGET_FORWARD_TEMPLATE: &str =
-    "SELECT pending_id, mapping_digest, WRITETIME(mapping_digest) FROM {table} WHERE canonical_ref = ? LIMIT 2";
+    "SELECT pending_id, mapping_digest, WRITETIME(pending_id), WRITETIME(mapping_digest) FROM {table} WHERE canonical_ref = ? LIMIT 2";
 const READ_TARGET_REVERSE_TEMPLATE: &str =
-    "SELECT canonical_ref, mapping_digest, WRITETIME(mapping_digest) FROM {table} WHERE pending_id = ? LIMIT 2";
+    "SELECT canonical_ref, mapping_digest, WRITETIME(canonical_ref), WRITETIME(mapping_digest) FROM {table} WHERE pending_id = ? LIMIT 2";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CoordinatorRollbackBranchCatalogQueries {
@@ -145,14 +153,115 @@ struct LegacyMappingPair {
 struct TargetForwardRow {
     pending_id: UniquePendingId,
     mapping_digest: [u8; 32],
-    writetime_us: i64,
+    pending_writetime_us: i64,
+    digest_writetime_us: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TargetReverseRow {
     canonical_ref: Vec<u8>,
     mapping_digest: [u8; 32],
+    canonical_writetime_us: i64,
+    digest_writetime_us: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CoordinatorRollbackMappingSourceKind {
+    LegacyCheckpointToPending = 1,
+    LegacyPendingToCheckpoint = 2,
+    BranchExactCanonicalToPending = 3,
+    BranchExactPendingToCanonical = 4,
+}
+
+impl CoordinatorRollbackMappingSourceKind {
+    pub(super) const fn stable_id(self) -> u8 {
+        self as u8
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct VerifiedCoordinatorRollbackMappingColumn {
+    column_id: u8,
+    value: Vec<u8>,
     writetime_us: i64,
+}
+
+impl VerifiedCoordinatorRollbackMappingColumn {
+    pub(super) const fn column_id(&self) -> u8 {
+        self.column_id
+    }
+
+    pub(super) fn value(&self) -> &[u8] {
+        &self.value
+    }
+
+    pub(super) const fn writetime_us(&self) -> i64 {
+        self.writetime_us
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct VerifiedCoordinatorRollbackMappingSource {
+    kind: CoordinatorRollbackMappingSourceKind,
+    primary_key: Vec<u8>,
+    columns: Vec<VerifiedCoordinatorRollbackMappingColumn>,
+}
+
+impl VerifiedCoordinatorRollbackMappingSource {
+    pub(super) const fn kind(&self) -> CoordinatorRollbackMappingSourceKind {
+        self.kind
+    }
+
+    pub(super) fn primary_key(&self) -> &[u8] {
+        &self.primary_key
+    }
+
+    pub(super) fn columns(&self) -> &[VerifiedCoordinatorRollbackMappingColumn] {
+        &self.columns
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct VerifiedCoordinatorRollbackMappingBundle {
+    catalog_fingerprint: [u8; 32],
+    network: psy_data::protocol::canonical_chain::NetworkId,
+    rollback_epoch: u64,
+    source_epoch: u64,
+    checkpoint: u64,
+    pending: UniquePendingId,
+    sources: [VerifiedCoordinatorRollbackMappingSource; 4],
+}
+
+impl VerifiedCoordinatorRollbackMappingBundle {
+    pub(super) const fn catalog_fingerprint(&self) -> [u8; 32] {
+        self.catalog_fingerprint
+    }
+
+    pub(super) const fn network(
+        &self,
+    ) -> psy_data::protocol::canonical_chain::NetworkId {
+        self.network
+    }
+
+    pub(super) const fn rollback_epoch(&self) -> u64 {
+        self.rollback_epoch
+    }
+
+    pub(super) const fn source_epoch(&self) -> u64 {
+        self.source_epoch
+    }
+
+    pub(super) const fn checkpoint(&self) -> u64 {
+        self.checkpoint
+    }
+
+    pub(super) const fn pending(&self) -> UniquePendingId {
+        self.pending
+    }
+
+    pub(super) fn sources(&self) -> &[VerifiedCoordinatorRollbackMappingSource; 4] {
+        &self.sources
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -168,6 +277,7 @@ impl CoordinatorRollbackBranchCatalogDigest {
 /// delete, timestamp, or head mutation APIs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct CoordinatorRollbackBranchCatalogSummary {
+    catalog_fingerprint: [u8; 32],
     source_chain_epoch: u64,
     suffix_rows: u64,
     catalog_digest: CoordinatorRollbackBranchCatalogDigest,
@@ -175,6 +285,10 @@ pub(super) struct CoordinatorRollbackBranchCatalogSummary {
 }
 
 impl CoordinatorRollbackBranchCatalogSummary {
+    pub(super) const fn catalog_fingerprint(self) -> [u8; 32] {
+        self.catalog_fingerprint
+    }
+
     pub(super) const fn source_chain_epoch(self) -> u64 {
         self.source_chain_epoch
     }
@@ -194,6 +308,34 @@ impl CoordinatorRollbackBranchCatalogSummary {
     }
 }
 
+/// Inert progress evidence for mapping rows copied by the catalog-owned path.
+/// It is not a participant archive receipt and cannot cross the global barrier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CoordinatorRollbackMappingArchiveSummary {
+    catalog: CoordinatorRollbackBranchCatalogSummary,
+    archive_rows: u64,
+    archive_bytes: u64,
+    archive_digest: [u8; 32],
+}
+
+impl CoordinatorRollbackMappingArchiveSummary {
+    pub(super) const fn catalog(self) -> CoordinatorRollbackBranchCatalogSummary {
+        self.catalog
+    }
+
+    pub(super) const fn archive_rows(self) -> u64 {
+        self.archive_rows
+    }
+
+    pub(super) const fn archive_bytes(self) -> u64 {
+        self.archive_bytes
+    }
+
+    pub(super) const fn archive_digest(self) -> [u8; 32] {
+        self.archive_digest
+    }
+}
+
 /// Affine streaming verifier for the target anchor and discarded suffix.
 /// Any failed row poisons the accumulator so a caller cannot skip it.
 struct CoordinatorRollbackBranchCatalogAccumulator<
@@ -204,6 +346,7 @@ struct CoordinatorRollbackBranchCatalogAccumulator<
     Verifier,
 > {
     config: BranchExactCheckpointChainConfig<Hash>,
+    catalog_fingerprint: [u8; 32],
     network: psy_data::protocol::canonical_chain::NetworkId,
     rollback_epoch: u64,
     source_epoch: u64,
@@ -235,6 +378,7 @@ where
         expected_head: StoredCanonicalHead<Hash>,
         plan: &CoordinatorRollbackArchivePlan<Hash>,
         config: BranchExactCheckpointChainConfig<Hash>,
+        catalog_fingerprint: [u8; 32],
     ) -> Result<Self, CoordinatorRollbackBranchCatalogError> {
         validate_archiving_head(expected_head, plan)?;
         let rollback_epoch = expected_head.canonical_ref().chain_epoch().get();
@@ -257,6 +401,7 @@ where
         let next_checkpoint = target.checkpoint_id().get();
         let mut catalog_hasher = Sha256::new();
         catalog_hasher.update(CATALOG_DIGEST_DOMAIN);
+        catalog_hasher.update(catalog_fingerprint);
         catalog_hasher.update(plan.digest().as_bytes());
         catalog_hasher.update(
             expected_head
@@ -279,6 +424,7 @@ where
         );
         let mut source_hasher = Sha256::new();
         source_hasher.update(SOURCE_DIGEST_DOMAIN);
+        source_hasher.update(catalog_fingerprint);
         source_hasher.update(plan.digest().as_bytes());
         source_hasher.update(
             expected_head
@@ -291,6 +437,7 @@ where
         source_hasher.update(source_epoch.to_be_bytes());
         Ok(Self {
             config,
+            catalog_fingerprint,
             network: expected_head.canonical_ref().network_id(),
             rollback_epoch,
             source_epoch,
@@ -352,7 +499,7 @@ where
         legacy: LegacyMappingPair,
         target_forward: Vec<TargetForwardRow>,
         target_reverse: Vec<TargetReverseRow>,
-    ) -> Result<(), CoordinatorRollbackBranchCatalogError> {
+    ) -> Result<VerifiedCoordinatorRollbackMappingBundle, CoordinatorRollbackBranchCatalogError> {
         self.observe_guarded(|this| {
             if checkpoint_id != this.next_checkpoint
                 || checkpoint_id > this.requested_head.checkpoint_id().get()
@@ -383,10 +530,74 @@ where
             );
             verify_target_mapping(
                 &mapping,
-                target_forward,
-                target_reverse,
+                &target_forward,
+                &target_reverse,
                 this.orphan_write_max_us(),
             )?;
+            let forward = &target_forward[0];
+            let reverse = &target_reverse[0];
+            let canonical_bytes = mapping.canonical_chain_bytes();
+            let mapping_digest = mapping.digest().as_bytes();
+            let bundle = VerifiedCoordinatorRollbackMappingBundle {
+                catalog_fingerprint: this.catalog_fingerprint,
+                network: this.network,
+                rollback_epoch: this.rollback_epoch,
+                source_epoch: this.source_epoch,
+                checkpoint: checkpoint_id,
+                pending: legacy.pending_id,
+                sources: [
+                    VerifiedCoordinatorRollbackMappingSource {
+                        kind: CoordinatorRollbackMappingSourceKind::LegacyCheckpointToPending,
+                        primary_key: checkpoint_id.to_be_bytes().to_vec(),
+                        columns: vec![VerifiedCoordinatorRollbackMappingColumn {
+                            column_id: 1,
+                            value: legacy.pending_id.get().to_be_bytes().to_vec(),
+                            writetime_us: legacy.forward_writetime_us,
+                        }],
+                    },
+                    VerifiedCoordinatorRollbackMappingSource {
+                        kind: CoordinatorRollbackMappingSourceKind::LegacyPendingToCheckpoint,
+                        primary_key: legacy.pending_id.get().to_be_bytes().to_vec(),
+                        columns: vec![VerifiedCoordinatorRollbackMappingColumn {
+                            column_id: 1,
+                            value: checkpoint_id.to_be_bytes().to_vec(),
+                            writetime_us: legacy.reverse_writetime_us,
+                        }],
+                    },
+                    VerifiedCoordinatorRollbackMappingSource {
+                        kind: CoordinatorRollbackMappingSourceKind::BranchExactCanonicalToPending,
+                        primary_key: canonical_bytes.to_vec(),
+                        columns: vec![
+                            VerifiedCoordinatorRollbackMappingColumn {
+                                column_id: 1,
+                                value: legacy.pending_id.get().to_be_bytes().to_vec(),
+                                writetime_us: forward.pending_writetime_us,
+                            },
+                            VerifiedCoordinatorRollbackMappingColumn {
+                                column_id: 2,
+                                value: mapping_digest.to_vec(),
+                                writetime_us: forward.digest_writetime_us,
+                            },
+                        ],
+                    },
+                    VerifiedCoordinatorRollbackMappingSource {
+                        kind: CoordinatorRollbackMappingSourceKind::BranchExactPendingToCanonical,
+                        primary_key: legacy.pending_id.get().to_be_bytes().to_vec(),
+                        columns: vec![
+                            VerifiedCoordinatorRollbackMappingColumn {
+                                column_id: 1,
+                                value: reverse.canonical_ref.clone(),
+                                writetime_us: reverse.canonical_writetime_us,
+                            },
+                            VerifiedCoordinatorRollbackMappingColumn {
+                                column_id: 2,
+                                value: mapping_digest.to_vec(),
+                                writetime_us: reverse.digest_writetime_us,
+                            },
+                        ],
+                    },
+                ],
+            };
             this.catalog_hasher.update(checkpoint_id.to_be_bytes());
             this.catalog_hasher.update(mapping.canonical_chain_bytes());
             this.catalog_hasher
@@ -410,7 +621,7 @@ where
                 .next_checkpoint
                 .checked_add(1)
                 .ok_or(CoordinatorRollbackBranchCatalogError::CheckpointOverflow)?;
-            Ok(())
+            Ok(bundle)
         })
     }
 
@@ -455,6 +666,7 @@ where
         let mut source_hasher = self.source_hasher;
         source_hasher.update(self.suffix_rows.to_be_bytes());
         Ok(CoordinatorRollbackBranchCatalogSummary {
+            catalog_fingerprint: self.catalog_fingerprint,
             source_chain_epoch: self.source_epoch,
             suffix_rows: self.suffix_rows,
             catalog_digest: CoordinatorRollbackBranchCatalogDigest(
@@ -640,25 +852,27 @@ fn hash_target_source(
     for row in forward {
         hasher.update(row.pending_id.get().to_be_bytes());
         hasher.update(row.mapping_digest);
-        hasher.update(row.writetime_us.to_be_bytes());
+        hasher.update(row.pending_writetime_us.to_be_bytes());
+        hasher.update(row.digest_writetime_us.to_be_bytes());
     }
     hasher.update((reverse.len() as u64).to_be_bytes());
     for row in reverse {
         hasher.update((row.canonical_ref.len() as u64).to_be_bytes());
         hasher.update(&row.canonical_ref);
         hasher.update(row.mapping_digest);
-        hasher.update(row.writetime_us.to_be_bytes());
+        hasher.update(row.canonical_writetime_us.to_be_bytes());
+        hasher.update(row.digest_writetime_us.to_be_bytes());
     }
 }
 
 fn verify_target_mapping<Hash: Q256BitHash>(
     expected: &BranchPendingMapping<Hash>,
-    forward: Vec<TargetForwardRow>,
-    reverse: Vec<TargetReverseRow>,
+    forward: &[TargetForwardRow],
+    reverse: &[TargetReverseRow],
     orphan_write_max_us: i64,
 ) -> Result<(), CoordinatorRollbackBranchCatalogError> {
     let expected_digest = expected.digest().as_bytes();
-    let forward = match forward.as_slice() {
+    let forward = match forward {
         [row] => row,
         [] => return Err(CoordinatorRollbackBranchCatalogError::MissingTargetForward),
         _ => return Err(CoordinatorRollbackBranchCatalogError::TargetForwardConflict),
@@ -668,13 +882,18 @@ fn verify_target_mapping<Hash: Q256BitHash>(
     {
         return Err(CoordinatorRollbackBranchCatalogError::TargetForwardConflict);
     }
-    if forward.writetime_us > orphan_write_max_us {
-        return Err(CoordinatorRollbackBranchCatalogError::WriteAfterFence {
-            writetime_us: forward.writetime_us,
-            orphan_write_max_us,
-        });
+    for writetime_us in [
+        forward.pending_writetime_us,
+        forward.digest_writetime_us,
+    ] {
+        if writetime_us > orphan_write_max_us {
+            return Err(CoordinatorRollbackBranchCatalogError::WriteAfterFence {
+                writetime_us,
+                orphan_write_max_us,
+            });
+        }
     }
-    let reverse = match reverse.as_slice() {
+    let reverse = match reverse {
         [row] => row,
         [] => return Err(CoordinatorRollbackBranchCatalogError::MissingTargetReverse),
         _ => return Err(CoordinatorRollbackBranchCatalogError::TargetReverseConflict),
@@ -684,11 +903,16 @@ fn verify_target_mapping<Hash: Q256BitHash>(
     {
         return Err(CoordinatorRollbackBranchCatalogError::TargetReverseConflict);
     }
-    if reverse.writetime_us > orphan_write_max_us {
-        return Err(CoordinatorRollbackBranchCatalogError::WriteAfterFence {
-            writetime_us: reverse.writetime_us,
-            orphan_write_max_us,
-        });
+    for writetime_us in [
+        reverse.canonical_writetime_us,
+        reverse.digest_writetime_us,
+    ] {
+        if writetime_us > orphan_write_max_us {
+            return Err(CoordinatorRollbackBranchCatalogError::WriteAfterFence {
+                writetime_us,
+                orphan_write_max_us,
+            });
+        }
     }
     Ok(())
 }
@@ -701,8 +925,56 @@ struct PreparedCatalogReads {
     target_reverse: PreparedStatement,
 }
 
+struct MappingArchiveAccumulator {
+    rows: u64,
+    bytes: u64,
+    hasher: Sha256,
+}
+
+impl MappingArchiveAccumulator {
+    fn new<Hash: Q256BitHash>(plan: &CoordinatorRollbackArchivePlan<Hash>) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(MAPPING_ARCHIVE_DATASET_DIGEST_DOMAIN);
+        hasher.update(plan.digest().as_bytes());
+        Self { rows: 0, bytes: 0, hasher }
+    }
+
+    fn observe(
+        &mut self,
+        persisted: CoordinatorRollbackArchivedMappingBundle,
+    ) -> Result<(), CoordinatorRollbackBranchCatalogError> {
+        self.rows = self
+            .rows
+            .checked_add(persisted.rows())
+            .ok_or(CoordinatorRollbackBranchCatalogError::CheckpointOverflow)?;
+        self.bytes = self
+            .bytes
+            .checked_add(persisted.canonical_bytes())
+            .ok_or(CoordinatorRollbackBranchCatalogError::CheckpointOverflow)?;
+        self.hasher.update(persisted.digest());
+        Ok(())
+    }
+
+    fn finish(mut self) -> MappingArchiveFinished {
+        self.hasher.update(self.rows.to_be_bytes());
+        self.hasher.update(self.bytes.to_be_bytes());
+        MappingArchiveFinished {
+            rows: self.rows,
+            bytes: self.bytes,
+            digest: self.hasher.finalize().into(),
+        }
+    }
+}
+
+struct MappingArchiveFinished {
+    rows: u64,
+    bytes: u64,
+    digest: [u8; 32],
+}
+
 pub(super) struct ScyllaCoordinatorRollbackBranchCatalog {
     session: Arc<Session>,
+    fingerprint: [u8; 32],
     prepared: PreparedCatalogReads,
 }
 
@@ -718,6 +990,12 @@ impl ScyllaCoordinatorRollbackBranchCatalog {
             &authority_keyspace,
             &branch_exact_keyspace,
         );
+        let fingerprint = catalog_fingerprint(
+            &canonical_keyspace,
+            &authority_keyspace,
+            &branch_exact_keyspace,
+            &queries,
+        );
         Ok(Self {
             prepared: PreparedCatalogReads {
                 transition: prepare_read(&session, queries.transition).await?,
@@ -727,6 +1005,7 @@ impl ScyllaCoordinatorRollbackBranchCatalog {
                 target_reverse: prepare_read(&session, queries.target_reverse).await?,
             },
             session,
+            fingerprint,
         })
     }
 
@@ -746,12 +1025,22 @@ impl ScyllaCoordinatorRollbackBranchCatalog {
             PsyCanonicalDatabaseSerializeBaseSingle,
     {
         self.require_current_head(canonical_head_store, expected_head).await?;
-        let first = self
-            .scan_once::<F, Hash, Hasher, Proof, Verifier>(expected_head, plan, config)
+        let (first, _) = self
+            .scan_once::<F, Hash, Hasher, Proof, Verifier>(
+                expected_head,
+                plan,
+                config,
+                None,
+            )
             .await?;
         self.require_current_head(canonical_head_store, expected_head).await?;
-        let second = self
-            .scan_once::<F, Hash, Hasher, Proof, Verifier>(expected_head, plan, config)
+        let (second, _) = self
+            .scan_once::<F, Hash, Hasher, Proof, Verifier>(
+                expected_head,
+                plan,
+                config,
+                None,
+            )
             .await?;
         self.require_current_head(canonical_head_store, expected_head).await?;
         if first != second {
@@ -760,12 +1049,88 @@ impl ScyllaCoordinatorRollbackBranchCatalog {
         Ok(second)
     }
 
+    /// Verify, copy and re-verify all four mapping rows for every discarded
+    /// checkpoint. Any archive written before a later failure is immutable,
+    /// unselected evidence; no participant receipt or destructive capability
+    /// is produced here.
+    pub(super) async fn archive_verified_suffix<F, Hash, Hasher, Proof, Verifier>(
+        &self,
+        archive_store: &ScyllaCoordinatorRollbackArchiveStore,
+        canonical_head_store: &ScyllaCanonicalHeadStore,
+        expected_head: StoredCanonicalHead<Hash>,
+        plan: &CoordinatorRollbackArchivePlan<Hash>,
+        config: BranchExactCheckpointChainConfig<Hash>,
+    ) -> Result<CoordinatorRollbackMappingArchiveSummary, CoordinatorRollbackBranchCatalogError>
+    where
+        F: QFelt64,
+        Hash: QFHashBase<F> + Q256BitHash,
+        Hasher: FieldQHasher<F, Hash>,
+        Verifier: QZKProofPublicInputsHasherReader<Hash, Proof>,
+        PsyVerifiableCheckpointTransitionWithProof<F, Hash>:
+            PsyCanonicalDatabaseSerializeBaseSingle,
+    {
+        self.require_current_head(canonical_head_store, expected_head).await?;
+        let (first, _) = self
+            .scan_once::<F, Hash, Hasher, Proof, Verifier>(
+                expected_head,
+                plan,
+                config,
+                None,
+            )
+            .await?;
+        self.require_current_head(canonical_head_store, expected_head).await?;
+        let (second, archived) = self
+            .scan_once::<F, Hash, Hasher, Proof, Verifier>(
+                expected_head,
+                plan,
+                config,
+                Some(archive_store),
+            )
+            .await?;
+        self.require_current_head(canonical_head_store, expected_head).await?;
+        let (third, _) = self
+            .scan_once::<F, Hash, Hasher, Proof, Verifier>(
+                expected_head,
+                plan,
+                config,
+                None,
+            )
+            .await?;
+        self.require_current_head(canonical_head_store, expected_head).await?;
+        if first != second || second != third {
+            return Err(CoordinatorRollbackBranchCatalogError::SourceChanged);
+        }
+        let archived = archived.ok_or(
+            CoordinatorRollbackBranchCatalogError::ArchiveSummaryMissing,
+        )?;
+        let expected_rows = first
+            .suffix_rows()
+            .checked_mul(4)
+            .ok_or(CoordinatorRollbackBranchCatalogError::CheckpointOverflow)?;
+        if archived.rows != expected_rows {
+            return Err(CoordinatorRollbackBranchCatalogError::ArchiveRowCountMismatch {
+                expected: expected_rows,
+                actual: archived.rows,
+            });
+        }
+        Ok(CoordinatorRollbackMappingArchiveSummary {
+            catalog: first,
+            archive_rows: archived.rows,
+            archive_bytes: archived.bytes,
+            archive_digest: archived.digest,
+        })
+    }
+
     async fn scan_once<F, Hash, Hasher, Proof, Verifier>(
         &self,
         expected_head: StoredCanonicalHead<Hash>,
         plan: &CoordinatorRollbackArchivePlan<Hash>,
         config: BranchExactCheckpointChainConfig<Hash>,
-    ) -> Result<CoordinatorRollbackBranchCatalogSummary, CoordinatorRollbackBranchCatalogError>
+        archive_store: Option<&ScyllaCoordinatorRollbackArchiveStore>,
+    ) -> Result<
+        (CoordinatorRollbackBranchCatalogSummary, Option<MappingArchiveFinished>),
+        CoordinatorRollbackBranchCatalogError,
+    >
     where
         F: QFelt64,
         Hash: QFHashBase<F> + Q256BitHash,
@@ -776,7 +1141,8 @@ impl ScyllaCoordinatorRollbackBranchCatalog {
     {
         let mut catalog = CoordinatorRollbackBranchCatalogAccumulator::<
             F, Hash, Hasher, Proof, Verifier,
-        >::try_new(expected_head, plan, config)?;
+        >::try_new(expected_head, plan, config, self.fingerprint)?;
+        let mut archived = archive_store.map(|_| MappingArchiveAccumulator::new(plan));
         let target = plan.suffix_start_exclusive();
         let anchor = self
             .read_point(&self.prepared.transition, target)
@@ -833,7 +1199,7 @@ impl ScyllaCoordinatorRollbackBranchCatalog {
                 .read_target_forward(expected_mapping.canonical_chain_bytes())
                 .await?;
             let target_reverse = self.read_target_reverse(pending).await?;
-            catalog.observe_suffix(
+            let verified = catalog.observe_suffix(
                 checkpoint,
                 PointValue {
                     value: compression::decompress(&transition.value).map_err(|error| {
@@ -852,6 +1218,18 @@ impl ScyllaCoordinatorRollbackBranchCatalog {
                 target_forward,
                 target_reverse,
             )?;
+            if let Some(store) = archive_store {
+                let persisted = store
+                    .persist_verified_mapping_bundle(expected_head, plan, &verified)
+                    .await
+                    .map_err(|error| {
+                        CoordinatorRollbackBranchCatalogError::Archive(error.to_string())
+                    })?;
+                archived
+                    .as_mut()
+                    .expect("archive accumulator exists with store")
+                    .observe(persisted)?;
+            }
             if checkpoint == plan.suffix_end_inclusive() {
                 break;
             }
@@ -859,7 +1237,7 @@ impl ScyllaCoordinatorRollbackBranchCatalog {
                 .checked_add(1)
                 .ok_or(CoordinatorRollbackBranchCatalogError::CheckpointOverflow)?;
         }
-        catalog.finish()
+        Ok((catalog.finish()?, archived.map(MappingArchiveAccumulator::finish)))
     }
 
     async fn require_current_head<Hash: Q256BitHash>(
@@ -946,10 +1324,11 @@ impl ScyllaCoordinatorRollbackBranchCatalog {
             .into_rows_result()
             .map_err(driver)?;
         let rows = rows_result
-            .rows::<(Option<i64>, Option<Vec<u8>>, Option<i64>)>()
+            .rows::<(Option<i64>, Option<Vec<u8>>, Option<i64>, Option<i64>)>()
             .map_err(driver)?;
         rows.map(|row| {
-            let (pending, digest, writetime) = row.map_err(driver)?;
+            let (pending, digest, pending_writetime, digest_writetime) =
+                row.map_err(driver)?;
             let pending = pending.ok_or(CoordinatorRollbackBranchCatalogError::MissingColumn)?;
             let pending = u64::try_from(pending)
                 .map_err(|_| CoordinatorRollbackBranchCatalogError::IntegerOutOfRange)?;
@@ -959,7 +1338,9 @@ impl ScyllaCoordinatorRollbackBranchCatalog {
                 mapping_digest: array_32(
                     digest.ok_or(CoordinatorRollbackBranchCatalogError::MissingColumn)?,
                 )?,
-                writetime_us: writetime
+                pending_writetime_us: pending_writetime
+                    .ok_or(CoordinatorRollbackBranchCatalogError::MissingColumn)?,
+                digest_writetime_us: digest_writetime
                     .ok_or(CoordinatorRollbackBranchCatalogError::MissingColumn)?,
             })
         })
@@ -982,17 +1363,20 @@ impl ScyllaCoordinatorRollbackBranchCatalog {
             .into_rows_result()
             .map_err(driver)?;
         let rows = rows_result
-            .rows::<(Option<Vec<u8>>, Option<Vec<u8>>, Option<i64>)>()
+            .rows::<(Option<Vec<u8>>, Option<Vec<u8>>, Option<i64>, Option<i64>)>()
             .map_err(driver)?;
         rows.map(|row| {
-            let (canonical_ref, digest, writetime) = row.map_err(driver)?;
+            let (canonical_ref, digest, canonical_writetime, digest_writetime) =
+                row.map_err(driver)?;
             Ok(TargetReverseRow {
                 canonical_ref: canonical_ref
                     .ok_or(CoordinatorRollbackBranchCatalogError::MissingColumn)?,
                 mapping_digest: array_32(
                     digest.ok_or(CoordinatorRollbackBranchCatalogError::MissingColumn)?,
                 )?,
-                writetime_us: writetime
+                canonical_writetime_us: canonical_writetime
+                    .ok_or(CoordinatorRollbackBranchCatalogError::MissingColumn)?,
+                digest_writetime_us: digest_writetime
                     .ok_or(CoordinatorRollbackBranchCatalogError::MissingColumn)?,
             })
         })
@@ -1039,6 +1423,24 @@ async fn prepare_read(
     let mut statement = session.prepare(query).await.map_err(driver)?;
     statement.set_consistency(Consistency::Quorum);
     Ok(statement)
+}
+
+fn catalog_fingerprint(
+    canonical: &CqlKeyspaceName,
+    authority: &CqlKeyspaceName,
+    branch_exact: &CqlKeyspaceName,
+    queries: &CoordinatorRollbackBranchCatalogQueries,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(CATALOG_FINGERPRINT_DOMAIN);
+    for keyspace in [canonical, authority, branch_exact] {
+        hasher.update((keyspace.as_str().len() as u64).to_be_bytes());
+        hasher.update(keyspace.as_str().as_bytes());
+    }
+    let golden = queries.golden();
+    hasher.update((golden.len() as u64).to_be_bytes());
+    hasher.update(golden.as_bytes());
+    hasher.finalize().into()
 }
 
 fn array_32(bytes: Vec<u8>) -> Result<[u8; 32], CoordinatorRollbackBranchCatalogError> {
@@ -1090,6 +1492,9 @@ pub(super) enum CoordinatorRollbackBranchCatalogError {
     Head(String),
     HeadChanged,
     SourceChanged,
+    Archive(String),
+    ArchiveSummaryMissing,
+    ArchiveRowCountMismatch { expected: u64, actual: u64 },
     Driver(String),
     Poisoned,
 }
@@ -1135,6 +1540,11 @@ mod tests {
     };
 
     use super::*;
+    use super::super::coordinator_rollback_archive_store::{
+        CoordinatorRollbackMappingArchiveRow,
+        CoordinatorRollbackMappingArchiveRowError, mapping_row_digest,
+        qualification_reconstruct_mapping_archive_row,
+    };
 
     #[derive(Clone, Copy, Debug)]
     struct HashProofVerifier;
@@ -1274,12 +1684,14 @@ mod tests {
             vec![TargetForwardRow {
                 pending_id: mapping.pending_id(),
                 mapping_digest: digest,
-                writetime_us: 9_000,
+                pending_writetime_us: 9_000,
+                digest_writetime_us: 9_000,
             }],
             vec![TargetReverseRow {
                 canonical_ref: mapping.canonical_chain_bytes().to_vec(),
                 mapping_digest: digest,
-                writetime_us: 9_000,
+                canonical_writetime_us: 9_000,
+                digest_writetime_us: 9_000,
             }],
         )
     }
@@ -1290,7 +1702,7 @@ mod tests {
         let (plan, head) = plan_and_head(&refs, 1);
         let mut catalog = CoordinatorRollbackBranchCatalogAccumulator::<
             PF, PHash, PoseidonHasher, PHash, HashProofVerifier,
-        >::try_new(head, &plan, config)
+        >::try_new(head, &plan, config, [7; 32])
         .unwrap();
         catalog.observe_anchor(1, PointValue { value: rows[1].clone(), writetime_us: 9_000 }).unwrap();
         for checkpoint in 2..=4 {
@@ -1304,13 +1716,92 @@ mod tests {
                 pending,
             );
             let (forward, reverse) = target_rows(&mapping);
-            catalog.observe_suffix(
+            let mut bundle = catalog.observe_suffix(
                 checkpoint,
                 PointValue { value: rows[checkpoint as usize].clone(), writetime_us: 9_000 },
                 LegacyMappingPair { pending_id: pending, forward_writetime_us: 9_000, reverse_writetime_us: 9_000 },
                 forward,
                 reverse,
             ).unwrap();
+            if checkpoint == 2 {
+                assert_eq!(bundle.catalog_fingerprint(), [7; 32]);
+                assert_eq!(bundle.rollback_epoch(), 4);
+                assert_eq!(bundle.source_epoch(), 3);
+                assert_eq!(bundle.checkpoint(), 2);
+                assert_eq!(bundle.pending(), pending);
+                assert_eq!(
+                    bundle
+                        .sources()
+                        .iter()
+                        .map(VerifiedCoordinatorRollbackMappingSource::kind)
+                        .collect::<Vec<_>>(),
+                    [
+                        CoordinatorRollbackMappingSourceKind::LegacyCheckpointToPending,
+                        CoordinatorRollbackMappingSourceKind::LegacyPendingToCheckpoint,
+                        CoordinatorRollbackMappingSourceKind::BranchExactCanonicalToPending,
+                        CoordinatorRollbackMappingSourceKind::BranchExactPendingToCanonical,
+                    ]
+                    .to_vec()
+                );
+                assert_eq!(
+                    bundle
+                        .sources()
+                        .iter()
+                        .map(|source| source.columns().len())
+                        .collect::<Vec<_>>(),
+                    vec![1, 1, 2, 2]
+                );
+
+                let original = CoordinatorRollbackMappingArchiveRow::try_from_verified(
+                    head, &plan, &bundle, 0,
+                )
+                .unwrap();
+                assert_eq!(
+                    CoordinatorRollbackMappingArchiveRow::decode_canonical::<PHash>(
+                        original.canonical_bytes(),
+                    )
+                    .unwrap(),
+                    original
+                );
+                assert_eq!(
+                    qualification_reconstruct_mapping_archive_row::<PHash>(&original)
+                        .unwrap(),
+                    original
+                );
+
+                bundle.sources[0].columns[0].writetime_us -= 1;
+                let same_physical_source =
+                    CoordinatorRollbackMappingArchiveRow::try_from_verified(
+                        head, &plan, &bundle, 0,
+                    )
+                    .unwrap();
+                assert_eq!(original.slot(), same_physical_source.slot());
+                assert_ne!(original.digest(), same_physical_source.digest());
+
+                bundle.sources[0].columns[0].writetime_us = 10_001;
+                assert!(matches!(
+                    CoordinatorRollbackMappingArchiveRow::try_from_verified(
+                        head, &plan, &bundle, 0,
+                    ),
+                    Err(
+                        CoordinatorRollbackMappingArchiveRowError::WriteAfterOrphanFence {
+                            writetime_us: 10_001,
+                            orphan_write_max_us: 10_000,
+                        }
+                    )
+                ));
+
+                let mut rehashed = original.canonical_bytes().to_vec();
+                let slot_start = rehashed.len() - 64;
+                rehashed[slot_start] ^= 0x80;
+                let digest = mapping_row_digest(&rehashed[..rehashed.len() - 32]);
+                let digest_start = rehashed.len() - 32;
+                rehashed[digest_start..].copy_from_slice(digest.as_bytes());
+                assert_eq!(
+                    CoordinatorRollbackMappingArchiveRow::decode_canonical::<PHash>(&rehashed),
+                    Err(CoordinatorRollbackMappingArchiveRowError::RowSlotMismatch)
+                );
+            }
         }
         let summary = catalog.finish().unwrap();
         assert_eq!(summary.source_chain_epoch(), 3);
@@ -1325,7 +1816,7 @@ mod tests {
         let (plan, head) = plan_and_head(&refs, 1);
         let mut catalog = CoordinatorRollbackBranchCatalogAccumulator::<
             PF, PHash, PoseidonHasher, PHash, HashProofVerifier,
-        >::try_new(head, &plan, config)
+        >::try_new(head, &plan, config, [7; 32])
         .unwrap();
         catalog.observe_anchor(1, PointValue { value: rows[1].clone(), writetime_us: 9_000 }).unwrap();
         let pending = UniquePendingId::try_new(102).unwrap();
@@ -1346,7 +1837,7 @@ mod tests {
 
         let mut reused = CoordinatorRollbackBranchCatalogAccumulator::<
             PF, PHash, PoseidonHasher, PHash, HashProofVerifier,
-        >::try_new(head, &plan, config)
+        >::try_new(head, &plan, config, [7; 32])
         .unwrap();
         reused.observe_anchor(1, PointValue { value: rows[1].clone(), writetime_us: 9_000 }).unwrap();
         for checkpoint in 2..=3 {
@@ -1385,7 +1876,7 @@ mod tests {
         let (plan, head) = plan_and_head(&refs, 1);
         let mut gap = CoordinatorRollbackBranchCatalogAccumulator::<
             PF, PHash, PoseidonHasher, PHash, HashProofVerifier,
-        >::try_new(head, &plan, config)
+        >::try_new(head, &plan, config, [7; 32])
         .unwrap();
         gap.observe_anchor(1, PointValue { value: rows[1].clone(), writetime_us: 9_000 }).unwrap();
         let pending = UniquePendingId::try_new(103).unwrap();
@@ -1402,7 +1893,7 @@ mod tests {
 
         let mut fenced = CoordinatorRollbackBranchCatalogAccumulator::<
             PF, PHash, PoseidonHasher, PHash, HashProofVerifier,
-        >::try_new(head, &plan, config)
+        >::try_new(head, &plan, config, [7; 32])
         .unwrap();
         assert_eq!(
             fenced.observe_anchor(1, PointValue { value: rows[1].clone(), writetime_us: 10_001 }),
@@ -1414,7 +1905,7 @@ mod tests {
 
         let mut rehashed = CoordinatorRollbackBranchCatalogAccumulator::<
             PF, PHash, PoseidonHasher, PHash, HashProofVerifier,
-        >::try_new(head, &plan, config)
+        >::try_new(head, &plan, config, [7; 32])
         .unwrap();
         rehashed.observe_anchor(1, PointValue { value: rows[1].clone(), writetime_us: 9_000 }).unwrap();
         let mapping = BranchPendingMapping::new(
@@ -1426,6 +1917,15 @@ mod tests {
             UniquePendingId::try_new(102).unwrap(),
         );
         let (mut forward, reverse) = target_rows(&mapping);
+        let mut after_fence = forward.clone();
+        after_fence[0].pending_writetime_us = 10_001;
+        assert_eq!(
+            verify_target_mapping(&mapping, &after_fence, &reverse, 10_000),
+            Err(CoordinatorRollbackBranchCatalogError::WriteAfterFence {
+                writetime_us: 10_001,
+                orphan_write_max_us: 10_000,
+            })
+        );
         forward[0].mapping_digest[0] ^= 1;
         assert_eq!(
             rehashed.observe_suffix(
