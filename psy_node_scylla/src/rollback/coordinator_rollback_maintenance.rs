@@ -57,7 +57,10 @@ where
             return Ok(CoordinatorRollbackMaintenanceOutcome::Normal(initial));
         }
         RollbackControlState::ArchiveBarrierReady(_)
-        | RollbackControlState::Deleting(_) => {
+        | RollbackControlState::Deleting(_)
+        | RollbackControlState::Restoring(_)
+        | RollbackControlState::Verifying(_)
+        | RollbackControlState::AllRealmsReady(_) => {
             return Ok(CoordinatorRollbackMaintenanceOutcome::AwaitingDownstream(
                 initial,
             ));

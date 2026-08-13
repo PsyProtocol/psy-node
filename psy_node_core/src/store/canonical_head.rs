@@ -254,6 +254,9 @@ pub enum CanonicalHeadTransitionKind {
     BeginRollbackArchive,
     CompleteRollbackArchiveBarrier,
     BeginRollbackDelete,
+    BeginRollbackRestore,
+    BeginRollbackVerify,
+    CompleteRollbackRealmBarrier,
     CompleteRollback,
 }
 
@@ -348,7 +351,10 @@ impl<Hash: Q256BitHash> CanonicalHeadTransition<Hash> {
             }
             RollbackControlState::Archiving(_)
             | RollbackControlState::ArchiveBarrierReady(_)
-            | RollbackControlState::Deleting(_) => {
+            | RollbackControlState::Deleting(_)
+            | RollbackControlState::Restoring(_)
+            | RollbackControlState::Verifying(_)
+            | RollbackControlState::AllRealmsReady(_) => {
                 return Err(CanonicalHeadModelError::RollbackArchiveAlreadyStarted);
             }
         };
@@ -406,19 +412,79 @@ impl<Hash: Q256BitHash> CanonicalHeadTransition<Hash> {
         })
     }
 
-    /// Publish the request's exact target and return rollback control to IDLE.
-    ///
-    /// This transition is valid only from `DELETING`. The storage owner must
-    /// additionally prove the durable all-participant delete-completion
-    /// barrier before applying the sealed CAS. The already-opened rollback
-    /// epoch is preserved, so the restored checkpoint can never be confused
-    /// with the abandoned branch at the same height.
-    pub fn complete_rollback(
+    /// Enter target restoration only after storage has selected the durable
+    /// all-participant delete-completion barrier.
+    pub fn begin_rollback_restore(
         expected: StoredCanonicalHead<Hash>,
     ) -> Result<Self, CanonicalHeadModelError> {
         let request = match expected.rollback_control() {
             RollbackControlState::Deleting(request) => *request,
             _ => return Err(CanonicalHeadModelError::RollbackDeleteNotActive),
+        };
+        Ok(Self {
+            kind: CanonicalHeadTransitionKind::BeginRollbackRestore,
+            expected,
+            candidate: StoredCanonicalHead {
+                revision: expected.revision.checked_next()?,
+                canonical_ref: *expected.canonical_ref(),
+                rollback_control: RollbackControlState::Restoring(request),
+            },
+        })
+    }
+
+    /// Freeze target mutations and enter the exact verification phase.
+    pub fn begin_rollback_verify(
+        expected: StoredCanonicalHead<Hash>,
+    ) -> Result<Self, CanonicalHeadModelError> {
+        let request = match expected.rollback_control() {
+            RollbackControlState::Restoring(request) => *request,
+            _ => return Err(CanonicalHeadModelError::RollbackRestoreNotActive),
+        };
+        Ok(Self {
+            kind: CanonicalHeadTransitionKind::BeginRollbackVerify,
+            expected,
+            candidate: StoredCanonicalHead {
+                revision: expected.revision.checked_next()?,
+                canonical_ref: *expected.canonical_ref(),
+                rollback_control: RollbackControlState::Verifying(request),
+            },
+        })
+    }
+
+    /// Record that Coordinator and every fixed Realm participant are ready.
+    /// The checkpoint remains unpublished until the final, separately fenced
+    /// transition.
+    pub fn complete_rollback_realm_barrier(
+        expected: StoredCanonicalHead<Hash>,
+    ) -> Result<Self, CanonicalHeadModelError> {
+        let request = match expected.rollback_control() {
+            RollbackControlState::Verifying(request) => *request,
+            _ => return Err(CanonicalHeadModelError::RollbackVerifyNotActive),
+        };
+        Ok(Self {
+            kind: CanonicalHeadTransitionKind::CompleteRollbackRealmBarrier,
+            expected,
+            candidate: StoredCanonicalHead {
+                revision: expected.revision.checked_next()?,
+                canonical_ref: *expected.canonical_ref(),
+                rollback_control: RollbackControlState::AllRealmsReady(request),
+            },
+        })
+    }
+
+    /// Publish the request's exact target and return rollback control to IDLE.
+    ///
+    /// This transition is valid only from `ALL_REALMS_READY`. The storage
+    /// owner must additionally prove the durable all-participant restore and
+    /// runtime-rebuild barriers before applying the sealed CAS. The already
+    /// opened rollback epoch is preserved, so the restored checkpoint cannot
+    /// be confused with the abandoned branch at the same height.
+    pub fn complete_rollback(
+        expected: StoredCanonicalHead<Hash>,
+    ) -> Result<Self, CanonicalHeadModelError> {
+        let request = match expected.rollback_control() {
+            RollbackControlState::AllRealmsReady(request) => *request,
+            _ => return Err(CanonicalHeadModelError::RollbackRealmsNotReady),
         };
         let restored = CanonicalChainRef::new(
             expected.canonical_ref().network_id(),
@@ -750,6 +816,9 @@ pub enum CanonicalHeadModelError {
     RollbackArchiveNotActive,
     RollbackArchiveBarrierNotReady,
     RollbackDeleteNotActive,
+    RollbackRestoreNotActive,
+    RollbackVerifyNotActive,
+    RollbackRealmsNotReady,
     RollbackRequestedHeadMismatch,
     RequestedControlAtEpochZero,
     AppliedStateMismatch,
@@ -825,7 +894,16 @@ impl fmt::Display for CanonicalHeadModelError {
                 "rollback deletion can begin only from the exact ARCHIVE_BARRIER_READY phase",
             ),
             Self::RollbackDeleteNotActive => formatter.write_str(
-                "rollback target can be published only from the exact DELETING phase",
+                "rollback restoration can begin only from the exact DELETING phase",
+            ),
+            Self::RollbackRestoreNotActive => formatter.write_str(
+                "rollback verification can begin only from the exact RESTORING phase",
+            ),
+            Self::RollbackVerifyNotActive => formatter.write_str(
+                "rollback Realm barrier can complete only from the exact VERIFYING phase",
+            ),
+            Self::RollbackRealmsNotReady => formatter.write_str(
+                "rollback target can be published only from the exact ALL_REALMS_READY phase",
             ),
             Self::RollbackRequestedHeadMismatch => formatter.write_str(
                 "rollback request head must equal the exact current canonical checkpoint",
@@ -1256,8 +1334,27 @@ mod tests {
             .rollback_control()
             .destructive_started());
 
-        let completed = CanonicalHeadTransition::complete_rollback(
+        let restoring = CanonicalHeadTransition::begin_rollback_restore(
             *deleting.candidate(),
+        )
+        .unwrap();
+        assert_eq!(restoring.kind(), CanonicalHeadTransitionKind::BeginRollbackRestore);
+        assert!(restoring.candidate().rollback_control().destructive_started());
+        let verifying = CanonicalHeadTransition::begin_rollback_verify(
+            *restoring.candidate(),
+        )
+        .unwrap();
+        assert_eq!(verifying.kind(), CanonicalHeadTransitionKind::BeginRollbackVerify);
+        let all_ready = CanonicalHeadTransition::complete_rollback_realm_barrier(
+            *verifying.candidate(),
+        )
+        .unwrap();
+        assert_eq!(
+            all_ready.kind(),
+            CanonicalHeadTransitionKind::CompleteRollbackRealmBarrier
+        );
+        let completed = CanonicalHeadTransition::complete_rollback(
+            *all_ready.candidate(),
         )
         .unwrap();
         assert_eq!(
@@ -1266,11 +1363,11 @@ mod tests {
         );
         assert_eq!(
             completed.candidate().revision().get(),
-            deleting.candidate().revision().get() + 1
+            all_ready.candidate().revision().get() + 1
         );
         assert_eq!(
             completed.candidate().canonical_ref().chain_epoch(),
-            deleting.candidate().canonical_ref().chain_epoch()
+            all_ready.candidate().canonical_ref().chain_epoch()
         );
         assert_eq!(
             completed.candidate().canonical_ref().checkpoint(),
@@ -1290,11 +1387,11 @@ mod tests {
         );
         assert_eq!(
             CanonicalHeadTransition::complete_rollback(*barrier.candidate()),
-            Err(CanonicalHeadModelError::RollbackDeleteNotActive)
+            Err(CanonicalHeadModelError::RollbackRealmsNotReady)
         );
         assert_eq!(
             CanonicalHeadTransition::complete_rollback(*completed.candidate()),
-            Err(CanonicalHeadModelError::RollbackDeleteNotActive)
+            Err(CanonicalHeadModelError::RollbackRealmsNotReady)
         );
     }
 

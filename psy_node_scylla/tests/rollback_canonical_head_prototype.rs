@@ -611,7 +611,10 @@ fn normal_publish_and_rollback_admission_compete_on_one_atomic_row() {
         }
         RollbackControlState::Archiving(_)
         | RollbackControlState::ArchiveBarrierReady(_)
-        | RollbackControlState::Deleting(_) => {
+        | RollbackControlState::Deleting(_)
+        | RollbackControlState::Restoring(_)
+        | RollbackControlState::Verifying(_)
+        | RollbackControlState::AllRealmsReady(_) => {
             panic!("admission race can only publish IDLE or REQUESTED")
         }
     }

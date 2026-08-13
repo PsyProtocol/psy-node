@@ -27,6 +27,9 @@ const PHASE_REQUESTED: u8 = 1;
 const PHASE_ARCHIVING: u8 = 2;
 const PHASE_ARCHIVE_BARRIER_READY: u8 = 3;
 const PHASE_DELETING: u8 = 4;
+const PHASE_RESTORING: u8 = 5;
+const PHASE_VERIFYING: u8 = 6;
+const PHASE_ALL_REALMS_READY: u8 = 7;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RollbackPlanDigest([u8; 32]);
@@ -123,6 +126,9 @@ pub enum RollbackControlState<Hash> {
     Archiving(RollbackRequest<Hash>),
     ArchiveBarrierReady(RollbackRequest<Hash>),
     Deleting(RollbackRequest<Hash>),
+    Restoring(RollbackRequest<Hash>),
+    Verifying(RollbackRequest<Hash>),
+    AllRealmsReady(RollbackRequest<Hash>),
 }
 
 impl<Hash> RollbackControlState<Hash> {
@@ -136,7 +142,10 @@ impl<Hash> RollbackControlState<Hash> {
             Self::Requested(request)
             | Self::Archiving(request)
             | Self::ArchiveBarrierReady(request)
-            | Self::Deleting(request) => Some(request),
+            | Self::Deleting(request)
+            | Self::Restoring(request)
+            | Self::Verifying(request)
+            | Self::AllRealmsReady(request) => Some(request),
         }
     }
 
@@ -149,7 +158,13 @@ impl<Hash> RollbackControlState<Hash> {
     }
 
     pub const fn destructive_started(&self) -> bool {
-        matches!(self, Self::Deleting(_))
+        matches!(
+            self,
+            Self::Deleting(_)
+                | Self::Restoring(_)
+                | Self::Verifying(_)
+                | Self::AllRealmsReady(_)
+        )
     }
 }
 
@@ -165,13 +180,19 @@ impl<Hash: Q256BitHash> RollbackControlState<Hash> {
             Self::Requested(request)
             | Self::Archiving(request)
             | Self::ArchiveBarrierReady(request)
-            | Self::Deleting(request) => {
+            | Self::Deleting(request)
+            | Self::Restoring(request)
+            | Self::Verifying(request)
+            | Self::AllRealmsReady(request) => {
                 encoded[10] = CONTROL_KIND_REQUESTED;
                 encoded[11] = match self {
                     Self::Requested(_) => PHASE_REQUESTED,
                     Self::Archiving(_) => PHASE_ARCHIVING,
                     Self::ArchiveBarrierReady(_) => PHASE_ARCHIVE_BARRIER_READY,
                     Self::Deleting(_) => PHASE_DELETING,
+                    Self::Restoring(_) => PHASE_RESTORING,
+                    Self::Verifying(_) => PHASE_VERIFYING,
+                    Self::AllRealmsReady(_) => PHASE_ALL_REALMS_READY,
                     Self::Idle => unreachable!("active rollback arm excludes IDLE"),
                 };
                 encode_checkpoint_ref(&mut encoded[12..52], request.requested_head());
@@ -194,7 +215,7 @@ impl<Hash: Q256BitHash> RollbackControlState<Hash> {
                 encoded[117..149].copy_from_slice(request.plan_digest().as_bytes());
                 // abort_code=0, error_code=0.  The destructive flag becomes
                 // true only after the global archive barrier.
-                encoded[149] = u8::from(matches!(self, Self::Deleting(_)));
+                encoded[149] = u8::from(self.destructive_started());
             }
         }
         encoded
@@ -229,6 +250,9 @@ impl<Hash: Q256BitHash> RollbackControlState<Hash> {
                         | PHASE_ARCHIVING
                         | PHASE_ARCHIVE_BARRIER_READY
                         | PHASE_DELETING
+                        | PHASE_RESTORING
+                        | PHASE_VERIFYING
+                        | PHASE_ALL_REALMS_READY
                 ) {
                     return Err(RollbackControlCodecError::UnknownPhase(phase));
                 }
@@ -241,12 +265,12 @@ impl<Hash: Q256BitHash> RollbackControlState<Hash> {
                         destructive,
                     ));
                 }
-                if phase == PHASE_DELETING && destructive != 1 {
+                if phase >= PHASE_DELETING && destructive != 1 {
                     return Err(
                         RollbackControlCodecError::DeletingMustBeDestructive,
                     );
                 }
-                if phase != PHASE_DELETING && destructive != 0 {
+                if phase < PHASE_DELETING && destructive != 0 {
                     return Err(
                         RollbackControlCodecError::PreBarrierPhaseMustBeNonDestructive,
                     );
@@ -280,6 +304,9 @@ impl<Hash: Q256BitHash> RollbackControlState<Hash> {
                         Self::ArchiveBarrierReady(request)
                     }
                     PHASE_DELETING => Self::Deleting(request),
+                    PHASE_RESTORING => Self::Restoring(request),
+                    PHASE_VERIFYING => Self::Verifying(request),
+                    PHASE_ALL_REALMS_READY => Self::AllRealmsReady(request),
                     _ => unreachable!("phase validated above"),
                 })
             }
@@ -466,6 +493,9 @@ mod tests {
             RollbackControlState::Archiving(request()),
             RollbackControlState::ArchiveBarrierReady(request()),
             RollbackControlState::Deleting(request()),
+            RollbackControlState::Restoring(request()),
+            RollbackControlState::Verifying(request()),
+            RollbackControlState::AllRealmsReady(request()),
         ] {
             let encoded = state.to_canonical_bytes();
             assert_eq!(
@@ -485,6 +515,11 @@ mod tests {
         );
         assert_eq!(
             RollbackControlState::Deleting(request())
+                .to_canonical_bytes()[149],
+            1
+        );
+        assert_eq!(
+            RollbackControlState::AllRealmsReady(request())
                 .to_canonical_bytes()[149],
             1
         );

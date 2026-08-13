@@ -112,7 +112,10 @@ impl<Hash: Q256BitHash> RollbackAdmissionCommand<Hash> {
             }
             RollbackControlState::Archiving(_)
             | RollbackControlState::ArchiveBarrierReady(_)
-            | RollbackControlState::Deleting(_) => {
+            | RollbackControlState::Deleting(_)
+            | RollbackControlState::Restoring(_)
+            | RollbackControlState::Verifying(_)
+            | RollbackControlState::AllRealmsReady(_) => {
                 unreachable!("admission command cannot contain a post-REQUESTED phase")
             }
         }
