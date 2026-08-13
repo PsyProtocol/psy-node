@@ -28,6 +28,7 @@ use super::{
     CoordinatorRollbackArchivePlanDigest,
     CoordinatorRollbackArchivePlanDigestError, CqlKeyspaceName,
     ScyllaCanonicalHeadStore, ScyllaKeyDomain, ScyllaPhysicalTableId,
+    ScyllaSchemaFamily,
     key_domain_descriptor, physical_descriptor,
 };
 
@@ -62,7 +63,7 @@ struct CoordinatorRollbackArchiveQueries {
     insert: String,
     read_row: String,
     read_fragment: String,
-    read_checkpoint_zk_proof: String,
+    read_checkpoint_kiv: Vec<(CoordinatorCheckpointPartitionKivSource, String)>,
 }
 
 impl CoordinatorRollbackArchiveQueries {
@@ -72,31 +73,79 @@ impl CoordinatorRollbackArchiveQueries {
             archive.as_str(),
             COORDINATOR_ROLLBACK_SUFFIX_ARCHIVE_TABLE
         );
-        let source_descriptor =
-            physical_descriptor(ScyllaPhysicalTableId::CheckpointZkProofAndTransition);
-        let source_table = format!(
-            "{}.{}",
-            source.as_str(),
-            source_descriptor.physical_name
-        );
+        let read_checkpoint_kiv = CoordinatorCheckpointPartitionKivSource::ALL
+            .into_iter()
+            .map(|kind| {
+                let descriptor = physical_descriptor(kind.physical_table());
+                let source_table = format!(
+                    "{}.{}",
+                    source.as_str(),
+                    descriptor.physical_name
+                );
+                (
+                    kind,
+                    READ_SOURCE_TEMPLATE.replace("{table}", &source_table),
+                )
+            })
+            .collect();
         Self {
             create: CREATE_TEMPLATE.replace("{table}", &archive_table),
             insert: INSERT_TEMPLATE.replace("{table}", &archive_table),
             read_row: READ_ROW_TEMPLATE.replace("{table}", &archive_table),
             read_fragment: READ_FRAGMENT_TEMPLATE.replace("{table}", &archive_table),
-            read_checkpoint_zk_proof: READ_SOURCE_TEMPLATE.replace("{table}", &source_table),
+            read_checkpoint_kiv,
         }
     }
 
     fn golden(&self) -> String {
-        format!(
-            "create\n{}\n\ninsert\n{}\n\nread_row\n{}\n\nread_fragment\n{}\n\nread_checkpoint_zk_proof\n{}\n",
+        let mut golden = format!(
+            "create\n{}\n\ninsert\n{}\n\nread_row\n{}\n\nread_fragment\n{}\n",
             self.create,
             self.insert,
             self.read_row,
             self.read_fragment,
-            self.read_checkpoint_zk_proof,
-        )
+        );
+        for (kind, query) in &self.read_checkpoint_kiv {
+            golden.push_str(&format!("\nread_checkpoint_kiv_{kind:?}\n{query}\n"));
+        }
+        golden
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CoordinatorCheckpointPartitionKivSource {
+    CheckpointLeaf,
+    L2BlockState,
+    CheckpointStateRoots,
+    CheckpointZkProof,
+}
+
+impl CoordinatorCheckpointPartitionKivSource {
+    const ALL: [Self; 4] = [
+        Self::CheckpointLeaf,
+        Self::L2BlockState,
+        Self::CheckpointStateRoots,
+        Self::CheckpointZkProof,
+    ];
+
+    const fn key_domain(self) -> ScyllaKeyDomain {
+        match self {
+            Self::CheckpointLeaf => ScyllaKeyDomain::CheckpointLeaf,
+            Self::L2BlockState => ScyllaKeyDomain::L2BlockState,
+            Self::CheckpointStateRoots => ScyllaKeyDomain::CheckpointStateRoots,
+            Self::CheckpointZkProof => ScyllaKeyDomain::CheckpointZkProof,
+        }
+    }
+
+    const fn physical_table(self) -> ScyllaPhysicalTableId {
+        match self {
+            Self::CheckpointLeaf => ScyllaPhysicalTableId::CheckpointLeaf,
+            Self::L2BlockState => ScyllaPhysicalTableId::L2BlockState,
+            Self::CheckpointStateRoots => ScyllaPhysicalTableId::CheckpointStateRoots,
+            Self::CheckpointZkProof => {
+                ScyllaPhysicalTableId::CheckpointZkProofAndTransition
+            }
+        }
     }
 }
 
@@ -157,16 +206,37 @@ impl CoordinatorRollbackCheckpointKivArchiveRow {
         source_value: Vec<u8>,
         source_writetime_us: i64,
     ) -> Result<Self, CoordinatorRollbackArchiveRowError> {
+        Self::try_checkpoint_partition_kiv(
+            network,
+            chain_epoch,
+            plan,
+            CoordinatorCheckpointPartitionKivSource::CheckpointZkProof,
+            source_checkpoint,
+            source_value,
+            source_writetime_us,
+        )
+    }
+
+    fn try_checkpoint_partition_kiv<Hash: Q256BitHash>(
+        network: NetworkId,
+        chain_epoch: u64,
+        plan: &CoordinatorRollbackArchivePlan<Hash>,
+        source: CoordinatorCheckpointPartitionKivSource,
+        source_checkpoint: u64,
+        source_value: Vec<u8>,
+        source_writetime_us: i64,
+    ) -> Result<Self, CoordinatorRollbackArchiveRowError> {
         let domain = plan
             .domains()
             .iter()
-            .find(|domain| domain.key_domain() == ScyllaKeyDomain::CheckpointZkProof)
+            .find(|domain| domain.key_domain() == source.key_domain())
             .copied()
             .ok_or(CoordinatorRollbackArchiveRowError::DomainNotPlanned)?;
-        if domain.physical_table()
-            != ScyllaPhysicalTableId::CheckpointZkProofAndTransition
+        if domain.physical_table() != source.physical_table()
             || domain.action()
                 != CoordinatorRollbackArchiveAction::ArchiveCheckpointPartitions
+            || physical_descriptor(domain.physical_table()).schema_family
+                != ScyllaSchemaFamily::Kiv
         {
             return Err(CoordinatorRollbackArchiveRowError::DomainContractMismatch);
         }
@@ -294,26 +364,12 @@ impl CoordinatorRollbackCheckpointKivArchiveRow {
         if global_plan_digest == [0; 32] {
             return Err(CoordinatorRollbackArchiveRowError::ZeroGlobalPlanDigest);
         }
-        let key_domain = match decoder.u16()? {
-            value if value == ScyllaKeyDomain::CheckpointZkProof.stable_id() => {
-                ScyllaKeyDomain::CheckpointZkProof
-            }
-            value => return Err(CoordinatorRollbackArchiveRowError::UnknownKeyDomain(value)),
-        };
-        let physical_table = match decoder.u16()? {
-            value
-                if value
-                    == ScyllaPhysicalTableId::CheckpointZkProofAndTransition.stable_id() =>
-            {
-                ScyllaPhysicalTableId::CheckpointZkProofAndTransition
-            }
-            value => {
-                return Err(CoordinatorRollbackArchiveRowError::UnknownPhysicalTable(
-                    value,
-                ));
-            }
-        };
-        if key_domain_descriptor(key_domain).physical_table != physical_table {
+        let key_domain = decode_checkpoint_kiv_key_domain(decoder.u16()?)?;
+        let physical_table = decode_checkpoint_kiv_physical_table(decoder.u16()?)?;
+        if key_domain_descriptor(key_domain).physical_table != physical_table
+            || physical_descriptor(physical_table).schema_family
+                != ScyllaSchemaFamily::Kiv
+        {
             return Err(CoordinatorRollbackArchiveRowError::DomainContractMismatch);
         }
         let action = match decoder.u8()? {
@@ -492,6 +548,30 @@ fn fragment_digest(index: i32, bytes: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+fn decode_checkpoint_kiv_key_domain(
+    value: u16,
+) -> Result<ScyllaKeyDomain, CoordinatorRollbackArchiveRowError> {
+    for source in CoordinatorCheckpointPartitionKivSource::ALL {
+        if source.key_domain().stable_id() == value {
+            return Ok(source.key_domain());
+        }
+    }
+    Err(CoordinatorRollbackArchiveRowError::UnknownKeyDomain(value))
+}
+
+fn decode_checkpoint_kiv_physical_table(
+    value: u16,
+) -> Result<ScyllaPhysicalTableId, CoordinatorRollbackArchiveRowError> {
+    for source in CoordinatorCheckpointPartitionKivSource::ALL {
+        if source.physical_table().stable_id() == value {
+            return Ok(source.physical_table());
+        }
+    }
+    Err(CoordinatorRollbackArchiveRowError::UnknownPhysicalTable(
+        value,
+    ))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CoordinatorRollbackArchiveFragment {
     index: i32,
@@ -537,7 +617,10 @@ pub(super) struct ScyllaCoordinatorRollbackArchiveStore {
     read_row: PreparedStatement,
     read_fragment: PreparedStatement,
     insert: PreparedStatement,
-    read_checkpoint_zk_proof: PreparedStatement,
+    read_checkpoint_kiv: Vec<(
+        CoordinatorCheckpointPartitionKivSource,
+        PreparedStatement,
+    )>,
 }
 
 impl ScyllaCoordinatorRollbackArchiveStore {
@@ -571,26 +654,26 @@ impl ScyllaCoordinatorRollbackArchiveStore {
             &source_keyspace,
             &queries,
         );
+        let mut read_checkpoint_kiv = Vec::with_capacity(queries.read_checkpoint_kiv.len());
+        for (kind, query) in queries.read_checkpoint_kiv.iter().cloned() {
+            read_checkpoint_kiv.push((kind, prepare_read(&session, query).await?));
+        }
         Ok(Self {
             read_row: prepare_read(&session, queries.read_row).await?,
             read_fragment: prepare_read(&session, queries.read_fragment).await?,
             insert: prepare_lwt(&session, queries.insert).await?,
-            read_checkpoint_zk_proof: prepare_read(
-                &session,
-                queries.read_checkpoint_zk_proof,
-            )
-            .await?,
+            read_checkpoint_kiv,
             session,
             fingerprint,
         })
     }
 
-    /// Stream the real checkpoint-proof KIV suffix into the append-only
-    /// archive.  This does not require the unrelated participant blockers to
-    /// be resolved because copied rows are orphan-safe and cannot cross the
-    /// global barrier.  The barrier owner must later revalidate all tables and
-    /// prove that every blocker has been closed.
-    pub(super) async fn archive_checkpoint_zk_proof_suffix<Hash: Q256BitHash>(
+    /// Stream every rollback-ready checkpoint-partition KIV suffix into the
+    /// append-only archive. This does not require the unrelated participant
+    /// blockers to be resolved because copied rows are orphan-safe and cannot
+    /// cross the global barrier. The barrier owner must later revalidate all
+    /// tables and prove that every blocker has been closed.
+    pub(super) async fn archive_checkpoint_partition_kiv_suffix<Hash: Q256BitHash>(
         &self,
         canonical_head_store: &ScyllaCanonicalHeadStore,
         expected_head: StoredCanonicalHead<Hash>,
@@ -602,10 +685,6 @@ impl ScyllaCoordinatorRollbackArchiveStore {
 
         let network = expected_head.canonical_ref().network_id();
         let chain_epoch = expected_head.canonical_ref().chain_epoch().get();
-        let mut checkpoint = plan
-            .suffix_start_exclusive()
-            .checked_add(1)
-            .ok_or(CoordinatorRollbackArchiveStoreError::CheckpointOverflow)?;
         let end = plan.suffix_end_inclusive();
         let mut row_count = 0_u64;
         let mut canonical_bytes = 0_u64;
@@ -613,40 +692,51 @@ impl ScyllaCoordinatorRollbackArchiveStore {
         dataset.update(DATASET_DIGEST_DOMAIN);
         dataset.update(plan.digest().as_bytes());
 
-        while checkpoint <= end {
-            if let Some(source) = self.read_checkpoint_zk_proof(checkpoint).await? {
-                let row = CoordinatorRollbackCheckpointKivArchiveRow::try_checkpoint_zk_proof(
-                    network,
-                    chain_epoch,
-                    plan,
-                    checkpoint,
-                    source.value.clone(),
-                    source.writetime_us,
-                )?;
-                let receipt = self.persist_exact(row).await?;
-                self.revalidate_exact(&receipt).await?;
-                let after = self
-                    .read_checkpoint_zk_proof(checkpoint)
-                    .await?
-                    .ok_or(CoordinatorRollbackArchiveStoreError::SourceChanged)?;
-                if after != source {
-                    return Err(CoordinatorRollbackArchiveStoreError::SourceChanged);
-                }
-                row_count = row_count
-                    .checked_add(1)
-                    .ok_or(CoordinatorRollbackArchiveStoreError::LengthOverflow)?;
-                canonical_bytes = canonical_bytes
-                    .checked_add(receipt.row.canonical_bytes.len() as u64)
-                    .ok_or(CoordinatorRollbackArchiveStoreError::LengthOverflow)?;
-                dataset.update(receipt.row.slot.as_bytes());
-                dataset.update(receipt.row.digest.as_bytes());
-            }
-            if checkpoint == end {
-                break;
-            }
-            checkpoint = checkpoint
+        for source_kind in CoordinatorCheckpointPartitionKivSource::ALL {
+            dataset.update(source_kind.key_domain().stable_id().to_be_bytes());
+            let mut checkpoint = plan
+                .suffix_start_exclusive()
                 .checked_add(1)
                 .ok_or(CoordinatorRollbackArchiveStoreError::CheckpointOverflow)?;
+            while checkpoint <= end {
+                if let Some(source) = self
+                    .read_checkpoint_kiv(source_kind, checkpoint)
+                    .await?
+                {
+                    let row = CoordinatorRollbackCheckpointKivArchiveRow::try_checkpoint_partition_kiv(
+                        network,
+                        chain_epoch,
+                        plan,
+                        source_kind,
+                        checkpoint,
+                        source.value.clone(),
+                        source.writetime_us,
+                    )?;
+                    let receipt = self.persist_exact(row).await?;
+                    self.revalidate_exact(&receipt).await?;
+                    let after = self
+                        .read_checkpoint_kiv(source_kind, checkpoint)
+                        .await?
+                        .ok_or(CoordinatorRollbackArchiveStoreError::SourceChanged)?;
+                    if after != source {
+                        return Err(CoordinatorRollbackArchiveStoreError::SourceChanged);
+                    }
+                    row_count = row_count
+                        .checked_add(1)
+                        .ok_or(CoordinatorRollbackArchiveStoreError::LengthOverflow)?;
+                    canonical_bytes = canonical_bytes
+                        .checked_add(receipt.row.canonical_bytes.len() as u64)
+                        .ok_or(CoordinatorRollbackArchiveStoreError::LengthOverflow)?;
+                    dataset.update(receipt.row.slot.as_bytes());
+                    dataset.update(receipt.row.digest.as_bytes());
+                }
+                if checkpoint == end {
+                    break;
+                }
+                checkpoint = checkpoint
+                    .checked_add(1)
+                    .ok_or(CoordinatorRollbackArchiveStoreError::CheckpointOverflow)?;
+            }
         }
 
         self.require_current_head(canonical_head_store, expected_head)
@@ -675,15 +765,21 @@ impl ScyllaCoordinatorRollbackArchiveStore {
         }
     }
 
-    async fn read_checkpoint_zk_proof(
+    async fn read_checkpoint_kiv(
         &self,
+        source: CoordinatorCheckpointPartitionKivSource,
         checkpoint: u64,
     ) -> Result<Option<CheckpointKivSourceRow>, CoordinatorRollbackArchiveStoreError> {
         let checkpoint = i64::try_from(checkpoint)
             .map_err(|_| CoordinatorRollbackArchiveStoreError::IntegerOutOfCqlRange)?;
+        let statement = self
+            .read_checkpoint_kiv
+            .iter()
+            .find_map(|(kind, statement)| (*kind == source).then_some(statement))
+            .ok_or(CoordinatorRollbackArchiveStoreError::MissingPreparedSource)?;
         let row = self
             .session
-            .execute_unpaged(&self.read_checkpoint_zk_proof, (checkpoint,))
+            .execute_unpaged(statement, (checkpoint,))
             .await
             .map_err(cql)?
             .into_rows_result()
@@ -1116,6 +1212,7 @@ pub(super) enum CoordinatorRollbackArchiveStoreError {
     CheckpointOverflow,
     IntegerOutOfCqlRange,
     LengthOverflow,
+    MissingPreparedSource,
     MissingSourceColumn,
     SourceChanged,
     MissingArchiveColumn,
@@ -1277,6 +1374,32 @@ mod tests {
     }
 
     #[test]
+    fn all_checkpoint_partition_kiv_domains_use_the_same_exact_contract() {
+        let plan = plan();
+        for source in CoordinatorCheckpointPartitionKivSource::ALL {
+            let row = CoordinatorRollbackCheckpointKivArchiveRow::try_checkpoint_partition_kiv(
+                NetworkId::try_from_chain_id(1).unwrap(),
+                7,
+                &plan,
+                source,
+                95,
+                vec![source.key_domain().stable_id() as u8],
+                999,
+            )
+            .unwrap();
+            assert_eq!(row.key_domain, source.key_domain());
+            assert_eq!(row.physical_table, source.physical_table());
+            assert_eq!(
+                CoordinatorRollbackCheckpointKivArchiveRow::decode_canonical(
+                    &row.canonical_bytes
+                )
+                .unwrap(),
+                row
+            );
+        }
+    }
+
+    #[test]
     fn structurally_forged_rehashed_slot_is_rejected() {
         let row = row(vec![1, 2, 3]);
         let mut bytes = row.canonical_bytes.clone();
@@ -1357,8 +1480,15 @@ mod tests {
         assert!(!queries.insert.contains("USING TIMESTAMP"));
         assert!(!queries.golden().contains("DELETE FROM"));
         assert!(!queries.golden().contains("UPDATE "));
+        assert_eq!(queries.read_checkpoint_kiv.len(), 4);
         assert_eq!(
-            queries.read_checkpoint_zk_proof,
+            queries
+                .read_checkpoint_kiv
+                .iter()
+                .find_map(|(kind, query)| (*kind
+                    == CoordinatorCheckpointPartitionKivSource::CheckpointZkProof)
+                    .then_some(query.as_str()))
+                .unwrap(),
             "SELECT value, WRITETIME(value) FROM coordinator_state.checkpoint_zk_proof_and_transition_table WHERE obj_id = ?"
         );
     }
