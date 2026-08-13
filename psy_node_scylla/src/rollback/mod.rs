@@ -135,6 +135,8 @@ mod imt_family;
 mod coordinator_rollback_archive_plan;
 #[allow(dead_code)]
 mod coordinator_rollback_archive_store;
+#[allow(dead_code)]
+mod coordinator_rollback_branch_catalog;
 mod rollback_admission;
 mod identity;
 mod key;

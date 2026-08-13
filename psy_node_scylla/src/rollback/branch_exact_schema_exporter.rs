@@ -227,6 +227,24 @@ impl<Hash> BranchExactCheckpointChainConfig<Hash> {
             checkpoint_state_transition_circuit_fingerprint,
         }
     }
+
+    pub(crate) const fn genesis_checkpoint_state_transition_fingerprint(
+        &self,
+    ) -> &Hash {
+        &self.genesis_checkpoint_state_transition_fingerprint
+    }
+
+    pub(crate) const fn genesis_checkpoint_state_transition_hash(
+        &self,
+    ) -> &Hash {
+        &self.genesis_checkpoint_state_transition_hash
+    }
+
+    pub(crate) const fn checkpoint_state_transition_circuit_fingerprint(
+        &self,
+    ) -> &Hash {
+        &self.checkpoint_state_transition_circuit_fingerprint
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
