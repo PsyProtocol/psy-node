@@ -24,7 +24,7 @@ use psy_data::protocol::canonical_chain::{
 use psy_node_core::store::{
     canonical_head::{CanonicalHeadReadState, StoredCanonicalHead},
     rollback_control::{RollbackControlState, RollbackExecutionMode},
-    typed::{CheckpointedObjectKey, TypedTableKey},
+    typed::{CheckpointId, CheckpointedObjectKey, TypedTableKey},
 };
 use scylla::{
     client::session::Session,
@@ -40,8 +40,12 @@ use uuid::Uuid;
 use crate::utils::{u64_to_i64_exact, u8_to_i8_exact};
 
 use super::{
+    coordinator_commit_target_restore::{
+        CoordinatorCommitTargetRestoreError,
+        CoordinatorCommitTargetRestorePayload,
+    },
     coordinator_rollback_archive_store::COORDINATOR_ROLLBACK_SUFFIX_ARCHIVE_TABLE,
-    CanonicalHeadPrototypeError,
+    describe_existing_key, CanonicalHeadPrototypeError,
     CoordinatorCommitPhysicalBeforeImage,
     CoordinatorCommitPhysicalBeforeImageError, CoordinatorCommitPhysicalCatalog,
     CoordinatorCommitPhysicalReadSpec, CoordinatorCommitPhysicalSourceCell,
@@ -63,6 +67,9 @@ const PARTICIPANT_DATASET_DIGEST_DOMAIN: &[u8] =
 const PARTICIPANT_COMPLETION_MAGIC: &[u8; 8] = b"PSYCCPC1";
 const PARTICIPANT_COMPLETION_VERSION: u16 = 1;
 const PARTICIPANT_COMPLETION_KEY_DOMAIN: i16 = 0;
+// Negative one is reserved for the target singleton restore payload.  Real
+// hot-state domains begin at one and participant completion uses zero.
+const TARGET_RESTORE_KEY_DOMAIN: i16 = -1;
 const PARTICIPANT_COMPLETION_SLOT_DOMAIN: &[u8] =
     b"psy.rollback.coordinator-commit-physical-participant-completion-slot.v1\0";
 const PARTICIPANT_COMPLETION_DIGEST_DOMAIN: &[u8] =
@@ -426,6 +433,16 @@ pub(crate) struct PersistedCoordinatorCommitPhysicalParticipantCompletionReceipt
     completion: CoordinatorCommitPhysicalParticipantCompletion,
 }
 
+/// Non-clone, storage-private proof that the target singleton payload was
+/// exact-read after the Coordinator archive completion and all selected target
+/// sources were freshly revalidated. It is still pre-barrier evidence and is
+/// not accepted by any destructive or singleton-write API.
+#[derive(Debug)]
+pub(crate) struct PersistedCoordinatorCommitTargetRestoreReceipt<Hash> {
+    store_fingerprint: [u8; 32],
+    payload: CoordinatorCommitTargetRestorePayload<Hash>,
+}
+
 /// Affine composition boundary for the whole Coordinator catalog. Callers do
 /// not provide target/head/catalog entries or row values; all are selected
 /// from the canonical head and commit-source stores.
@@ -752,6 +769,354 @@ impl ScyllaCoordinatorCommitPhysicalArchiveOwner {
             );
         }
         Ok(())
+    }
+
+    /// Persist the exact target singleton restore payload only after the
+    /// durable participant completion can be fully recovered. The payload is
+    /// storage-selected; callers provide neither target bytes nor source
+    /// identity. Any error after the immutable LWT is commit-indeterminate and
+    /// requires a fresh retry of this same request.
+    pub(crate) async fn persist_target_restore_payload<F, Hash, Hasher>(
+        &mut self,
+        network: NetworkId,
+    ) -> Result<
+        PersistedCoordinatorCommitTargetRestoreReceipt<Hash>,
+        CoordinatorCommitPhysicalArchiveOwnerError,
+    >
+    where
+        F: QFelt64,
+        Hash: Q256BitHash + QFHashBase<F>,
+        Hasher: MerkleHasher<Hash> + FieldQHasher<F, Hash>,
+    {
+        let completion_before = self
+            .recover_participant_completion::<F, Hash, Hasher>(network)
+            .await?;
+        let scope = self.read_scope::<Hash>(network).await?;
+        let catalog = self.scan_catalog::<F, Hash, Hasher>(&scope).await?;
+        let store = ScyllaCoordinatorCommitPhysicalArchiveStore::prepare_for_catalog(
+            self.session.clone(),
+            self.archive_keyspace.clone(),
+            self.source_keyspace.clone(),
+            &catalog,
+        )
+        .await?;
+        self.require_completion_selected(
+            &scope,
+            &catalog,
+            &store,
+            &completion_before,
+        )?;
+        let expected = self
+            .select_target_restore_payload::<F, Hash, Hasher>(
+                &scope,
+                &catalog,
+                &store,
+                &completion_before,
+            )
+            .await?;
+        store
+            .persist_target_restore_exact(&scope, &expected)
+            .await?;
+        let current = store
+            .read_target_restore_exact(&scope, expected.slot())
+            .await?
+            .ok_or(CoordinatorCommitPhysicalArchiveStoreError::MissingAfterPersist)?;
+        if current != expected {
+            return Err(CoordinatorCommitPhysicalArchiveOwnerError::TargetRestoreChanged);
+        }
+
+        let completion_after = self
+            .recover_participant_completion::<F, Hash, Hasher>(network)
+            .await?;
+        if completion_after.store_fingerprint != completion_before.store_fingerprint
+            || completion_after.completion != completion_before.completion
+        {
+            return Err(
+                CoordinatorCommitPhysicalArchiveOwnerError::CompletionChanged,
+            );
+        }
+        let after_scope = self.read_scope::<Hash>(network).await?;
+        let after_catalog = self
+            .scan_catalog::<F, Hash, Hasher>(&after_scope)
+            .await?;
+        let after_store =
+            ScyllaCoordinatorCommitPhysicalArchiveStore::prepare_for_catalog(
+                self.session.clone(),
+                self.archive_keyspace.clone(),
+                self.source_keyspace.clone(),
+                &after_catalog,
+            )
+            .await?;
+        self.require_completion_selected(
+            &after_scope,
+            &after_catalog,
+            &after_store,
+            &completion_after,
+        )?;
+        let after_expected = self
+            .select_target_restore_payload::<F, Hash, Hasher>(
+                &after_scope,
+                &after_catalog,
+                &after_store,
+                &completion_after,
+            )
+            .await?;
+        if after_expected != expected {
+            return Err(CoordinatorCommitPhysicalArchiveOwnerError::TargetSourceChanged);
+        }
+        let after = after_store
+            .read_target_restore_exact(&after_scope, after_expected.slot())
+            .await?
+            .ok_or(CoordinatorCommitPhysicalArchiveStoreError::MissingAfterPersist)?;
+        if after != expected {
+            return Err(CoordinatorCommitPhysicalArchiveOwnerError::TargetRestoreChanged);
+        }
+        self.require_catalog_and_head_unchanged::<F, Hash, Hasher>(
+            &after_scope,
+            &after_catalog,
+        )
+        .await?;
+        Ok(PersistedCoordinatorCommitTargetRestoreReceipt {
+            store_fingerprint: after_store.fingerprint,
+            payload: after,
+        })
+    }
+
+    /// Restart path for the target restore payload. It first recovers the
+    /// participant completion, reconstructs the expected target bytes from the
+    /// exact floor/source and immutable checkpoint row, then strict-reads the
+    /// one stable payload slot. No caller-supplied payload is accepted.
+    pub(crate) async fn recover_target_restore_payload<F, Hash, Hasher>(
+        &mut self,
+        network: NetworkId,
+    ) -> Result<
+        PersistedCoordinatorCommitTargetRestoreReceipt<Hash>,
+        CoordinatorCommitPhysicalArchiveOwnerError,
+    >
+    where
+        F: QFelt64,
+        Hash: Q256BitHash + QFHashBase<F>,
+        Hasher: MerkleHasher<Hash> + FieldQHasher<F, Hash>,
+    {
+        let completion_before = self
+            .recover_participant_completion::<F, Hash, Hasher>(network)
+            .await?;
+        let scope = self.read_scope::<Hash>(network).await?;
+        let catalog = self.scan_catalog::<F, Hash, Hasher>(&scope).await?;
+        let store = ScyllaCoordinatorCommitPhysicalArchiveStore::prepare_for_catalog(
+            self.session.clone(),
+            self.archive_keyspace.clone(),
+            self.source_keyspace.clone(),
+            &catalog,
+        )
+        .await?;
+        self.require_completion_selected(
+            &scope,
+            &catalog,
+            &store,
+            &completion_before,
+        )?;
+        let expected = self
+            .select_target_restore_payload::<F, Hash, Hasher>(
+                &scope,
+                &catalog,
+                &store,
+                &completion_before,
+            )
+            .await?;
+        let current = store
+            .read_target_restore_exact(&scope, expected.slot())
+            .await?
+            .ok_or(CoordinatorCommitPhysicalArchiveOwnerError::TargetRestoreMissing)?;
+        if current != expected {
+            return Err(CoordinatorCommitPhysicalArchiveOwnerError::TargetRestoreChanged);
+        }
+
+        let completion_after = self
+            .recover_participant_completion::<F, Hash, Hasher>(network)
+            .await?;
+        if completion_after.store_fingerprint != completion_before.store_fingerprint
+            || completion_after.completion != completion_before.completion
+        {
+            return Err(
+                CoordinatorCommitPhysicalArchiveOwnerError::CompletionChanged,
+            );
+        }
+        let after_scope = self.read_scope::<Hash>(network).await?;
+        let after_catalog = self
+            .scan_catalog::<F, Hash, Hasher>(&after_scope)
+            .await?;
+        let after_store =
+            ScyllaCoordinatorCommitPhysicalArchiveStore::prepare_for_catalog(
+                self.session.clone(),
+                self.archive_keyspace.clone(),
+                self.source_keyspace.clone(),
+                &after_catalog,
+            )
+            .await?;
+        self.require_completion_selected(
+            &after_scope,
+            &after_catalog,
+            &after_store,
+            &completion_after,
+        )?;
+        let after_expected = self
+            .select_target_restore_payload::<F, Hash, Hasher>(
+                &after_scope,
+                &after_catalog,
+                &after_store,
+                &completion_after,
+            )
+            .await?;
+        if after_expected != expected {
+            return Err(CoordinatorCommitPhysicalArchiveOwnerError::TargetSourceChanged);
+        }
+        let after = after_store
+            .read_target_restore_exact(&after_scope, after_expected.slot())
+            .await?
+            .ok_or(CoordinatorCommitPhysicalArchiveOwnerError::TargetRestoreMissing)?;
+        if after != expected {
+            return Err(CoordinatorCommitPhysicalArchiveOwnerError::TargetRestoreChanged);
+        }
+        self.require_catalog_and_head_unchanged::<F, Hash, Hasher>(
+            &after_scope,
+            &after_catalog,
+        )
+        .await?;
+        Ok(PersistedCoordinatorCommitTargetRestoreReceipt {
+            store_fingerprint: after_store.fingerprint,
+            payload: after,
+        })
+    }
+
+    pub(crate) async fn revalidate_target_restore_payload<F, Hash, Hasher>(
+        &mut self,
+        network: NetworkId,
+        receipt: &PersistedCoordinatorCommitTargetRestoreReceipt<Hash>,
+    ) -> Result<(), CoordinatorCommitPhysicalArchiveOwnerError>
+    where
+        F: QFelt64,
+        Hash: Q256BitHash + QFHashBase<F>,
+        Hasher: MerkleHasher<Hash> + FieldQHasher<F, Hash>,
+    {
+        let current = self
+            .recover_target_restore_payload::<F, Hash, Hasher>(network)
+            .await?;
+        if current.store_fingerprint != receipt.store_fingerprint
+            || current.payload != receipt.payload
+        {
+            return Err(
+                CoordinatorCommitPhysicalArchiveOwnerError::TargetRestoreReceiptMismatch,
+            );
+        }
+        Ok(())
+    }
+
+    fn require_completion_selected<Hash: Q256BitHash>(
+        &self,
+        scope: &CoordinatorCommitPhysicalArchiveScope<Hash>,
+        catalog: &CoordinatorCommitPhysicalCatalog<Hash>,
+        store: &ScyllaCoordinatorCommitPhysicalArchiveStore,
+        receipt: &PersistedCoordinatorCommitPhysicalParticipantCompletionReceipt,
+    ) -> Result<(), CoordinatorCommitPhysicalArchiveOwnerError> {
+        let entry_count = u64::try_from(catalog.entries().len())
+            .map_err(|_| CoordinatorCommitPhysicalArchiveOwnerError::LengthOverflow)?;
+        if receipt.store_fingerprint != store.fingerprint {
+            return Err(
+                CoordinatorCommitPhysicalArchiveOwnerError::CompletionReceiptMismatch,
+            );
+        }
+        receipt.completion.validate_selected(
+            scope,
+            catalog.digest(),
+            entry_count,
+            &store.fingerprint,
+        )?;
+        Ok(())
+    }
+
+    async fn select_target_restore_payload<F, Hash, Hasher>(
+        &self,
+        scope: &CoordinatorCommitPhysicalArchiveScope<Hash>,
+        catalog: &CoordinatorCommitPhysicalCatalog<Hash>,
+        store: &ScyllaCoordinatorCommitPhysicalArchiveStore,
+        completion: &PersistedCoordinatorCommitPhysicalParticipantCompletionReceipt,
+    ) -> Result<CoordinatorCommitTargetRestorePayload<Hash>, CoordinatorCommitPhysicalArchiveOwnerError>
+    where
+        F: QFelt64,
+        Hash: Q256BitHash + QFHashBase<F>,
+        Hasher: MerkleHasher<Hash> + FieldQHasher<F, Hash>,
+    {
+        self.require_completion_selected(scope, catalog, store, completion)?;
+        let target_checkpoint = scope.target.checkpoint().checkpoint_id().get();
+        let target_key = describe_existing_key(&TypedTableKey::L2BlockState(
+            CheckpointId::try_new(target_checkpoint).map_err(|_| {
+                CoordinatorCommitPhysicalArchiveOwnerError::TargetCheckpointOutOfRange
+            })?,
+        ));
+        let target_l2 = match store.read_source(&target_key).await? {
+            CoordinatorCommitPhysicalSourceObservation::Value(cell) => cell,
+            CoordinatorCommitPhysicalSourceObservation::KeyOnlyPresent => {
+                return Err(
+                    CoordinatorCommitPhysicalArchiveOwnerError::TargetL2ValueMissing,
+                );
+            }
+        };
+        let floor_checkpoint = catalog.floor().floor().checkpoint().checkpoint_id().get();
+        if target_checkpoint == 0 && floor_checkpoint == 0 {
+            CoordinatorCommitTargetRestorePayload::try_from_genesis_anchor(
+                scope.archiving_head,
+                scope.target,
+                *catalog.digest(),
+                store.fingerprint,
+                completion.completion.slot,
+                completion.completion.digest,
+                catalog.floor(),
+                &target_l2,
+            )
+            .map_err(Into::into)
+        } else if target_checkpoint > floor_checkpoint {
+            let source = self
+                .commit_sources
+                .read_source(&scope.target)
+                .await
+                .map_err(|error| {
+                    CoordinatorCommitPhysicalArchiveOwnerError::CommitSource(
+                        error.to_string(),
+                    )
+                })?
+                .ok_or(CoordinatorCommitPhysicalArchiveOwnerError::TargetSourceMissing)?;
+            let marker = self
+                .commit_sources
+                .read_committed(&scope.target)
+                .await
+                .map_err(|error| {
+                    CoordinatorCommitPhysicalArchiveOwnerError::CommitSource(
+                        error.to_string(),
+                    )
+                })?
+                .ok_or(CoordinatorCommitPhysicalArchiveOwnerError::TargetMarkerMissing)?;
+            CoordinatorCommitTargetRestorePayload::try_from_committed_source::<F, Hasher>(
+                scope.archiving_head,
+                scope.target,
+                *catalog.digest(),
+                store.fingerprint,
+                completion.completion.slot,
+                completion.completion.digest,
+                catalog.floor(),
+                &source,
+                marker,
+                &target_l2,
+                self.checkpoint_tree_height,
+            )
+            .map_err(Into::into)
+        } else if target_checkpoint == floor_checkpoint {
+            Err(
+                CoordinatorCommitPhysicalArchiveOwnerError::NonGenesisFloorTargetUnanchored,
+            )
+        } else {
+            Err(CoordinatorCommitPhysicalArchiveOwnerError::TargetBelowFloor)
+        }
     }
 
     async fn read_scope<Hash: Q256BitHash>(
@@ -1110,6 +1475,68 @@ impl ScyllaCoordinatorCommitPhysicalArchiveStore {
             return Err(CoordinatorCommitPhysicalArchiveStoreError::Conflict);
         }
         Ok(Some(completion))
+    }
+
+    async fn persist_target_restore_exact<Hash: Q256BitHash>(
+        &self,
+        scope: &CoordinatorCommitPhysicalArchiveScope<Hash>,
+        payload: &CoordinatorCommitTargetRestorePayload<Hash>,
+    ) -> Result<(), CoordinatorCommitPhysicalArchiveStoreError> {
+        if payload.catalog_digest() != &self.catalog_digest
+            || payload.archive_store_fingerprint() != &self.fingerprint
+        {
+            return Err(
+                CoordinatorCommitPhysicalArchiveStoreError::ReceiptBindingMismatch,
+            );
+        }
+        let coordinates = ArchiveCoordinates::try_for_target_restore(
+            scope,
+            *payload.catalog_digest(),
+            *payload.slot(),
+        )?;
+        self.persist_archive_bytes(
+            &coordinates,
+            payload.canonical_bytes(),
+            payload.digest(),
+        )
+        .await
+    }
+
+    async fn read_target_restore_exact<Hash: Q256BitHash>(
+        &self,
+        scope: &CoordinatorCommitPhysicalArchiveScope<Hash>,
+        slot: &[u8; 32],
+    ) -> Result<
+        Option<CoordinatorCommitTargetRestorePayload<Hash>>,
+        CoordinatorCommitPhysicalArchiveStoreError,
+    > {
+        let coordinates = ArchiveCoordinates::try_for_target_restore(
+            scope,
+            self.catalog_digest,
+            *slot,
+        )?;
+        let Some((bytes, row_digest)) =
+            self.read_archive_bytes(&coordinates).await?
+        else {
+            return Ok(None);
+        };
+        let payload = CoordinatorCommitTargetRestorePayload::decode_canonical(&bytes)?;
+        payload.validate_selected(
+            &scope.archiving_head,
+            &scope.target,
+            &self.catalog_digest,
+            &self.fingerprint,
+            payload.participant_completion_slot(),
+            payload.participant_completion_digest(),
+        )?;
+        if payload.slot() != slot
+            || payload.digest() != &row_digest
+            || payload.catalog_digest() != &self.catalog_digest
+            || payload.archive_store_fingerprint() != &self.fingerprint
+        {
+            return Err(CoordinatorCommitPhysicalArchiveStoreError::Conflict);
+        }
+        Ok(Some(payload))
     }
 
     fn require_catalog<Hash: Q256BitHash>(
@@ -1765,6 +2192,22 @@ impl ArchiveCoordinates {
             row_slot,
         })
     }
+
+    fn try_for_target_restore<Hash: Q256BitHash>(
+        scope: &CoordinatorCommitPhysicalArchiveScope<Hash>,
+        catalog_digest: [u8; 32],
+        row_slot: [u8; 32],
+    ) -> Result<Self, CoordinatorCommitPhysicalArchiveStoreError> {
+        Ok(Self {
+            network: i64::from(scope.target.network_id().chain_id()),
+            chain_epoch: i64::try_from(scope.target.chain_epoch().get()).map_err(
+                |_| CoordinatorCommitPhysicalArchiveStoreError::IntegerOutOfCqlRange,
+            )?,
+            catalog_digest,
+            key_domain: TARGET_RESTORE_KEY_DOMAIN,
+            row_slot,
+        })
+    }
 }
 
 fn archive_fragments(
@@ -2189,6 +2632,17 @@ pub(crate) enum CoordinatorCommitPhysicalArchiveOwnerError {
     CompletionChanged,
     CompletionReceiptMismatch,
     Completion(CoordinatorCommitPhysicalParticipantCompletionError),
+    TargetRestore(CoordinatorCommitTargetRestoreError),
+    TargetRestoreMissing,
+    TargetRestoreChanged,
+    TargetRestoreReceiptMismatch,
+    TargetSourceMissing,
+    TargetMarkerMissing,
+    TargetSourceChanged,
+    TargetL2ValueMissing,
+    TargetCheckpointOutOfRange,
+    TargetBelowFloor,
+    NonGenesisFloorTargetUnanchored,
     LengthOverflow,
 }
 
@@ -2226,6 +2680,14 @@ impl From<CoordinatorCommitPhysicalParticipantCompletionError>
     }
 }
 
+impl From<CoordinatorCommitTargetRestoreError>
+    for CoordinatorCommitPhysicalArchiveOwnerError
+{
+    fn from(error: CoordinatorCommitTargetRestoreError) -> Self {
+        Self::TargetRestore(error)
+    }
+}
+
 impl fmt::Display for CoordinatorCommitPhysicalArchiveOwnerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -2241,6 +2703,7 @@ impl Error for CoordinatorCommitPhysicalArchiveOwnerError {}
 pub(crate) enum CoordinatorCommitPhysicalArchiveStoreError {
     BeforeImage(CoordinatorCommitPhysicalBeforeImageError),
     Completion(CoordinatorCommitPhysicalParticipantCompletionError),
+    TargetRestore(CoordinatorCommitTargetRestoreError),
     Cql(String),
     CatalogEntryMissing,
     CatalogMismatch,
@@ -2282,6 +2745,14 @@ impl From<CoordinatorCommitPhysicalParticipantCompletionError>
 {
     fn from(error: CoordinatorCommitPhysicalParticipantCompletionError) -> Self {
         Self::Completion(error)
+    }
+}
+
+impl From<CoordinatorCommitTargetRestoreError>
+    for CoordinatorCommitPhysicalArchiveStoreError
+{
+    fn from(error: CoordinatorCommitTargetRestoreError) -> Self {
+        Self::TargetRestore(error)
     }
 }
 

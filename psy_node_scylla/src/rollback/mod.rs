@@ -89,6 +89,7 @@ mod coordinator_processor_durable_capture;
 mod coordinator_commit_source_store;
 mod coordinator_commit_physical_inventory;
 mod coordinator_commit_physical_before_image;
+mod coordinator_commit_target_restore;
 mod coordinator_commit_physical_archive_store;
 pub(crate) use coordinator_commit_source_store::ScyllaCoordinatorCommitSourceStore;
 #[cfg(all(test, feature = "rf3-test-support"))]
