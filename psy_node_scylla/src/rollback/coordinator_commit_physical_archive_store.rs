@@ -74,6 +74,8 @@ const PARTICIPANT_COMPLETION_SLOT_DOMAIN: &[u8] =
     b"psy.rollback.coordinator-commit-physical-participant-completion-slot.v1\0";
 const PARTICIPANT_COMPLETION_DIGEST_DOMAIN: &[u8] =
     b"psy.rollback.coordinator-commit-physical-participant-completion.v1\0";
+const PRE_BARRIER_READINESS_DIGEST_DOMAIN: &[u8] =
+    b"psy.rollback.coordinator-commit-pre-barrier-readiness.v1\0";
 const MAX_PARTICIPANT_COMPLETION_BYTES: usize = 64 * 1024;
 const MAX_PARTICIPANT_COMPLETION_BINDING_BYTES: usize = 16 * 1024;
 
@@ -441,6 +443,91 @@ pub(crate) struct PersistedCoordinatorCommitPhysicalParticipantCompletionReceipt
 pub(crate) struct PersistedCoordinatorCommitTargetRestoreReceipt<Hash> {
     store_fingerprint: [u8; 32],
     payload: CoordinatorCommitTargetRestorePayload<Hash>,
+}
+
+/// Non-clone, storage-private proof that the exact Coordinator participant
+/// completion and target restore payload were selected and fully revalidated
+/// twice under one unchanged ARCHIVING head. The underlying rows are durable;
+/// this composite receipt is reconstructed after restart. It grants neither
+/// archive-barrier transition nor destructive, restore, or head authority.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct CoordinatorCommitPreBarrierReadinessReceipt<Hash> {
+    archiving_head: StoredCanonicalHead<Hash>,
+    target: CanonicalChainRef<Hash>,
+    catalog_digest: [u8; 32],
+    entry_count: u64,
+    dataset_digest: [u8; 32],
+    archive_store_fingerprint: [u8; 32],
+    participant_completion_slot: [u8; 32],
+    participant_completion_digest: [u8; 32],
+    target_restore_slot: [u8; 32],
+    target_restore_digest: [u8; 32],
+    digest: [u8; 32],
+}
+
+impl<Hash: Q256BitHash> CoordinatorCommitPreBarrierReadinessReceipt<Hash> {
+    fn try_from_selected(
+        scope: &CoordinatorCommitPhysicalArchiveScope<Hash>,
+        completion: &PersistedCoordinatorCommitPhysicalParticipantCompletionReceipt,
+        target_restore: &PersistedCoordinatorCommitTargetRestoreReceipt<Hash>,
+    ) -> Result<Self, CoordinatorCommitPhysicalArchiveOwnerError> {
+        let selected = &completion.completion;
+        if completion.store_fingerprint != target_restore.store_fingerprint
+            || selected.archive_store_fingerprint != completion.store_fingerprint
+        {
+            return Err(
+                CoordinatorCommitPhysicalArchiveOwnerError::PreBarrierBindingMismatch,
+            );
+        }
+        target_restore.payload.validate_selected(
+            &scope.archiving_head,
+            &scope.target,
+            &selected.catalog_digest,
+            &selected.archive_store_fingerprint,
+            &selected.slot,
+            &selected.digest,
+        )?;
+        let digest = pre_barrier_readiness_digest(
+            scope,
+            &selected.catalog_digest,
+            selected.entry_count,
+            &selected.dataset_digest,
+            &selected.archive_store_fingerprint,
+            &selected.slot,
+            &selected.digest,
+            target_restore.payload.slot(),
+            target_restore.payload.digest(),
+        );
+        Ok(Self {
+            archiving_head: scope.archiving_head,
+            target: scope.target,
+            catalog_digest: selected.catalog_digest,
+            entry_count: selected.entry_count,
+            dataset_digest: selected.dataset_digest,
+            archive_store_fingerprint: selected.archive_store_fingerprint,
+            participant_completion_slot: selected.slot,
+            participant_completion_digest: selected.digest,
+            target_restore_slot: *target_restore.payload.slot(),
+            target_restore_digest: *target_restore.payload.digest(),
+            digest,
+        })
+    }
+
+    pub(crate) const fn entry_count(&self) -> u64 {
+        self.entry_count
+    }
+
+    pub(crate) const fn dataset_digest(&self) -> &[u8; 32] {
+        &self.dataset_digest
+    }
+
+    pub(crate) const fn target_restore_slot(&self) -> &[u8; 32] {
+        &self.target_restore_slot
+    }
+
+    pub(crate) const fn digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
 }
 
 /// Affine composition boundary for the whole Coordinator catalog. Callers do
@@ -1010,6 +1097,87 @@ impl ScyllaCoordinatorCommitPhysicalArchiveOwner {
             );
         }
         Ok(())
+    }
+
+    /// Reconstruct a single Coordinator participant readiness receipt from
+    /// the durable completion and target payload. Each private observation is
+    /// itself fully source-revalidated, and the whole composition is repeated
+    /// so no caller can combine evidence from different ARCHIVING snapshots.
+    pub(crate) async fn recover_pre_barrier_readiness<F, Hash, Hasher>(
+        &mut self,
+        network: NetworkId,
+    ) -> Result<
+        CoordinatorCommitPreBarrierReadinessReceipt<Hash>,
+        CoordinatorCommitPhysicalArchiveOwnerError,
+    >
+    where
+        F: QFelt64,
+        Hash: Q256BitHash + QFHashBase<F>,
+        Hasher: MerkleHasher<Hash> + FieldQHasher<F, Hash>,
+    {
+        let first = self
+            .read_pre_barrier_readiness_once::<F, Hash, Hasher>(network)
+            .await?;
+        let second = self
+            .read_pre_barrier_readiness_once::<F, Hash, Hasher>(network)
+            .await?;
+        if first != second {
+            return Err(
+                CoordinatorCommitPhysicalArchiveOwnerError::PreBarrierReadinessChanged,
+            );
+        }
+        Ok(second)
+    }
+
+    pub(crate) async fn revalidate_pre_barrier_readiness<F, Hash, Hasher>(
+        &mut self,
+        network: NetworkId,
+        receipt: &CoordinatorCommitPreBarrierReadinessReceipt<Hash>,
+    ) -> Result<(), CoordinatorCommitPhysicalArchiveOwnerError>
+    where
+        F: QFelt64,
+        Hash: Q256BitHash + QFHashBase<F>,
+        Hasher: MerkleHasher<Hash> + FieldQHasher<F, Hash>,
+    {
+        let current = self
+            .recover_pre_barrier_readiness::<F, Hash, Hasher>(network)
+            .await?;
+        if &current != receipt {
+            return Err(
+                CoordinatorCommitPhysicalArchiveOwnerError::PreBarrierReadinessChanged,
+            );
+        }
+        Ok(())
+    }
+
+    async fn read_pre_barrier_readiness_once<F, Hash, Hasher>(
+        &mut self,
+        network: NetworkId,
+    ) -> Result<
+        CoordinatorCommitPreBarrierReadinessReceipt<Hash>,
+        CoordinatorCommitPhysicalArchiveOwnerError,
+    >
+    where
+        F: QFelt64,
+        Hash: Q256BitHash + QFHashBase<F>,
+        Hasher: MerkleHasher<Hash> + FieldQHasher<F, Hash>,
+    {
+        let scope = self.read_scope::<Hash>(network).await?;
+        let completion = self
+            .recover_participant_completion::<F, Hash, Hasher>(network)
+            .await?;
+        let target_restore = self
+            .recover_target_restore_payload::<F, Hash, Hasher>(network)
+            .await?;
+        let after_scope = self.read_scope::<Hash>(network).await?;
+        if after_scope != scope {
+            return Err(CoordinatorCommitPhysicalArchiveOwnerError::HeadChanged);
+        }
+        CoordinatorCommitPreBarrierReadinessReceipt::try_from_selected(
+            &scope,
+            &completion,
+            &target_restore,
+        )
     }
 
     fn require_completion_selected<Hash: Q256BitHash>(
@@ -2434,6 +2602,35 @@ fn participant_completion_digest(bytes: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+#[allow(clippy::too_many_arguments)]
+fn pre_barrier_readiness_digest<Hash: Q256BitHash>(
+    scope: &CoordinatorCommitPhysicalArchiveScope<Hash>,
+    catalog_digest: &[u8; 32],
+    entry_count: u64,
+    dataset_digest: &[u8; 32],
+    archive_store_fingerprint: &[u8; 32],
+    participant_completion_slot: &[u8; 32],
+    participant_completion_digest: &[u8; 32],
+    target_restore_slot: &[u8; 32],
+    target_restore_digest: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(PRE_BARRIER_READINESS_DIGEST_DOMAIN);
+    hasher.update(scope.archiving_head.revision().as_i64().to_be_bytes());
+    hasher.update(scope.archiving_head.canonical_ref_bytes());
+    hasher.update(scope.archiving_head.rollback_control_bytes());
+    hasher.update(scope.target.to_canonical_bytes());
+    hasher.update(catalog_digest);
+    hasher.update(entry_count.to_be_bytes());
+    hasher.update(dataset_digest);
+    hasher.update(archive_store_fingerprint);
+    hasher.update(participant_completion_slot);
+    hasher.update(participant_completion_digest);
+    hasher.update(target_restore_slot);
+    hasher.update(target_restore_digest);
+    hasher.finalize().into()
+}
+
 struct ParticipantCompletionCursor<'a> {
     bytes: &'a [u8],
     position: usize,
@@ -2659,6 +2856,8 @@ pub(crate) enum CoordinatorCommitPhysicalArchiveOwnerError {
     TargetRestoreMissing,
     TargetRestoreChanged,
     TargetRestoreReceiptMismatch,
+    PreBarrierBindingMismatch,
+    PreBarrierReadinessChanged,
     TargetSourceMissing,
     TargetMarkerMissing,
     TargetSourceChanged,
@@ -2793,15 +2992,20 @@ impl Error for CoordinatorCommitPhysicalArchiveStoreError {}
 #[cfg(test)]
 mod tests {
     use parth_core::PHash;
-    use psy_data::protocol::canonical_chain::{
-        CheckpointHash, CheckpointId as ChainCheckpointId, CheckpointRef,
+    use psy_data::{
+        protocol::canonical_chain::{
+            CheckpointHash, CheckpointId as ChainCheckpointId, CheckpointRef,
+        },
+        v1::qdata::checkpoint::QEDL2BlockState,
     };
+    use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
     use psy_node_core::store::typed::{
         CheckpointId, ContractId, MerkleNode, NodeIndex, PublicKeyHash,
         ProcCheckpointUniqueId, TypedTableKey, U64SingletonSlot,
         UniquePendingId, UserId,
     };
     use psy_node_core::store::{
+        coordinator_commit_source::CoordinatorRollbackFloor,
         rollback_control::{RollbackPlanDigest, RollbackRequest},
         timestamp::{CommitWriteTimestampUs, TimestampFenceWindow},
     };
@@ -2863,6 +3067,30 @@ mod tests {
         .unwrap()
     }
 
+    fn archiving_scope_for_target(
+        target: CheckpointRef<PHash>,
+    ) -> CoordinatorCommitPhysicalArchiveScope<PHash> {
+        let request = RollbackRequest::try_new(
+            checkpoint(100, 10),
+            target,
+            TimestampFenceWindow::try_new(
+                CommitWriteTimestampUs::try_from_i128(1_000).unwrap(),
+                1_001,
+                1_002,
+            )
+            .unwrap(),
+            RollbackExecutionMode::InPlace,
+            RollbackPlanDigest::try_new([0xA5; 32]).unwrap(),
+        )
+        .unwrap();
+        CoordinatorCommitPhysicalArchiveScope::try_from_head(head(
+            7,
+            *request.requested_head(),
+            RollbackControlState::Archiving(request),
+        ))
+        .unwrap()
+    }
+
     fn participant_receipt(
         scope: &CoordinatorCommitPhysicalArchiveScope<PHash>,
         dataset_digest: [u8; 32],
@@ -2874,6 +3102,58 @@ mod tests {
             dataset_digest,
             archive_store_fingerprint: [0x52; 32],
         }
+    }
+
+    fn genesis_pre_barrier_receipts() -> (
+        CoordinatorCommitPhysicalArchiveScope<PHash>,
+        PersistedCoordinatorCommitPhysicalParticipantCompletionReceipt,
+        PersistedCoordinatorCommitTargetRestoreReceipt<PHash>,
+    ) {
+        let target = checkpoint(0, 30);
+        let scope = archiving_scope_for_target(target);
+        let participant = participant_receipt(&scope, [0x63; 32]);
+        let completion =
+            CoordinatorCommitPhysicalParticipantCompletion::try_from_receipt(
+                &scope,
+                &participant,
+            )
+            .unwrap();
+        let completion_receipt =
+            PersistedCoordinatorCommitPhysicalParticipantCompletionReceipt {
+                store_fingerprint: participant.archive_store_fingerprint,
+                completion,
+            };
+        let floor = CoordinatorRollbackFloor::try_new(head(
+            6,
+            target,
+            RollbackControlState::Idle,
+        ))
+        .unwrap();
+        let stored_l2 = CoordinatorCommitPhysicalSourceCell::value(
+            crate::compression::compress(
+                &QEDL2BlockState::get_genesis_value()
+                    .psy_ser_to_bytes_vec()
+                    .unwrap(),
+            )
+            .unwrap(),
+            731,
+        );
+        let payload = CoordinatorCommitTargetRestorePayload::try_from_genesis_anchor(
+            scope.archiving_head,
+            scope.target,
+            participant.catalog_digest,
+            participant.archive_store_fingerprint,
+            completion_receipt.completion.slot,
+            completion_receipt.completion.digest,
+            &floor,
+            &stored_l2,
+        )
+        .unwrap();
+        let target_receipt = PersistedCoordinatorCommitTargetRestoreReceipt {
+            store_fingerprint: participant.archive_store_fingerprint,
+            payload,
+        };
+        (scope, completion_receipt, target_receipt)
     }
 
     #[test]
@@ -3101,6 +3381,58 @@ mod tests {
             "DELETE FROM",
             "UPDATE ",
             "USING TIMESTAMP",
+        ] {
+            assert!(!production.contains(forbidden), "forbidden {forbidden}");
+        }
+    }
+
+    #[test]
+    fn pre_barrier_readiness_binds_completion_target_and_exact_archiving_scope() {
+        let (scope, completion, target) = genesis_pre_barrier_receipts();
+        let readiness = CoordinatorCommitPreBarrierReadinessReceipt::try_from_selected(
+            &scope,
+            &completion,
+            &target,
+        )
+        .unwrap();
+        assert_eq!(readiness.entry_count(), 37);
+        assert_eq!(readiness.dataset_digest(), &[0x63; 32]);
+        assert_eq!(readiness.target_restore_slot(), target.payload.slot());
+        assert_ne!(readiness.digest(), &[0; 32]);
+
+        let (_, completion, mut target) = genesis_pre_barrier_receipts();
+        target.store_fingerprint = [0x99; 32];
+        assert_eq!(
+            CoordinatorCommitPreBarrierReadinessReceipt::try_from_selected(
+                &scope,
+                &completion,
+                &target,
+            ),
+            Err(CoordinatorCommitPhysicalArchiveOwnerError::PreBarrierBindingMismatch),
+        );
+    }
+
+    #[test]
+    fn pre_barrier_readiness_is_reconstructed_and_grants_no_ponr_authority() {
+        let source = include_str!("coordinator_commit_physical_archive_store.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        for required in [
+            "recover_pre_barrier_readiness",
+            "read_pre_barrier_readiness_once",
+            "recover_participant_completion",
+            "recover_target_restore_payload",
+            "PreBarrierReadinessChanged",
+        ] {
+            assert!(production.contains(required), "missing {required}");
+        }
+        assert!(!production.contains(
+            "Clone, Debug, Eq, PartialEq)]\npub(crate) struct CoordinatorCommitPreBarrierReadinessReceipt",
+        ));
+        for forbidden in [
+            "advance_archive_barrier(",
+            "delete_hot_suffix(",
+            "restore_target_singletons(",
+            "publish_target_head(",
         ] {
             assert!(!production.contains(forbidden), "forbidden {forbidden}");
         }
