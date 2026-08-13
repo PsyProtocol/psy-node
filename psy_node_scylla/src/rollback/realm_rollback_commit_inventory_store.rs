@@ -8,10 +8,16 @@
 
 use std::{error::Error, fmt, sync::Arc};
 
+use futures::TryStreamExt;
 use parth_core::protocol::core_types::Q256BitHash;
-use psy_data::protocol::chain_context::AuthorityScope;
+use psy_data::protocol::{
+    canonical_chain::CanonicalChainRef,
+    chain_context::AuthorityScope,
+};
 use psy_node_core::store::{
     authority_local_head::StoredAuthorityLocalHead,
+    authority_commit::AuthorityTimestampKey,
+    pending_generation_identity::PendingGenerationLedgerKey,
     pending_generation_pipeline::{PendingProcessingState, StoredPendingPipeline},
 };
 use scylla::{
@@ -46,6 +52,8 @@ const MARKER_VERSION: u16 = 1;
 const MARKER_DIGEST_DOMAIN: &[u8] = b"psy.rollback.realm-commit-marker.v1\0";
 const FRAGMENT_DIGEST_DOMAIN: &[u8] = b"psy.rollback.realm-commit-inventory-fragment.v1\0";
 const STORE_FINGERPRINT_DOMAIN: &[u8] = b"psy.rollback.realm-commit-inventory-store.v1\0";
+const SUFFIX_DIGEST_DOMAIN: &[u8] = b"psy.rollback.realm-committed-suffix.v1\0";
+const MAX_SUFFIX_ROWS: u64 = 1_048_576;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct RealmRollbackCommitInventoryQueries {
@@ -264,6 +272,43 @@ impl<Hash: Q256BitHash> RealmRollbackCommittedMarker<Hash> {
             marker_payload: payload.to_vec(),
             digest,
         };
+        let selected_head_key = AuthorityTimestampKey::new(
+            inventory.candidate().canonical_chain().network_id(),
+            inventory.authority(),
+        );
+        let typed_head = StoredAuthorityLocalHead::<Hash>::decode_persisted(
+            selected_head_key,
+            i64::try_from(decoded.head_revision)
+                .map_err(|_| RealmRollbackCommitInventoryStoreError::CoordinateOutOfRange)?,
+            &decoded.head_payload,
+        )
+        .map_err(|_| RealmRollbackCommitInventoryStoreError::MalformedMarker)?;
+        if typed_head.head().chain() != inventory.candidate().canonical_chain()
+            || typed_head.commit_write_timestamp() != inventory.timestamp()
+            || typed_head.manifest_digest().as_bytes() != &decoded.manifest_digest
+        {
+            return Err(RealmRollbackCommitInventoryStoreError::SourceMismatch);
+        }
+        let selected_pipeline_key = PendingGenerationLedgerKey::new(
+            inventory.candidate().canonical_chain().network_id(),
+            inventory.authority(),
+        );
+        let typed_pipeline = StoredPendingPipeline::<Hash>::decode_persisted(
+            selected_pipeline_key,
+            i64::try_from(decoded.pipeline_revision)
+                .map_err(|_| RealmRollbackCommitInventoryStoreError::CoordinateOutOfRange)?,
+            &decoded.pipeline_payload,
+        )
+        .map_err(|_| RealmRollbackCommitInventoryStoreError::MalformedMarker)?;
+        if typed_pipeline.frontier().chain() != inventory.candidate().canonical_chain()
+            || typed_pipeline.processing().pending_id() != inventory.candidate().pending_id()
+            || !matches!(
+                typed_pipeline.processing_state(),
+                PendingProcessingState::Published { .. }
+            )
+        {
+            return Err(RealmRollbackCommitInventoryStoreError::SourceMismatch);
+        }
         if encode_marker(store_fingerprint, &decoded)? != payload {
             return Err(RealmRollbackCommitInventoryStoreError::MalformedMarker);
         }
@@ -283,6 +328,46 @@ impl<Hash: Q256BitHash> RealmRollbackCommittedMarker<Hash> {
 pub(super) struct PersistedRealmRollbackCommittedReceipt<Hash> {
     store_fingerprint: RealmRollbackCommitInventoryStoreFingerprint,
     marker: RealmRollbackCommittedMarker<Hash>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct VerifiedRealmRollbackCommittedSuffixEntry<Hash> {
+    inventory: RealmRollbackCommitInventory<Hash>,
+    marker: RealmRollbackCommittedMarker<Hash>,
+}
+
+impl<Hash> VerifiedRealmRollbackCommittedSuffixEntry<Hash> {
+    pub(super) const fn inventory(&self) -> &RealmRollbackCommitInventory<Hash> {
+        &self.inventory
+    }
+
+    pub(super) const fn marker(&self) -> &RealmRollbackCommittedMarker<Hash> {
+        &self.marker
+    }
+}
+
+/// Exact, storage-selected committed Realm suffix in `(target, source_head]`.
+///
+/// This is deliberately inert evidence. It cannot archive, cross the global
+/// barrier, delete, restore, or publish a head.
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct VerifiedRealmRollbackCommittedSuffix<Hash> {
+    store_fingerprint: RealmRollbackCommitInventoryStoreFingerprint,
+    authority: AuthorityScope,
+    target: CanonicalChainRef<Hash>,
+    source_head: CanonicalChainRef<Hash>,
+    entries: Vec<VerifiedRealmRollbackCommittedSuffixEntry<Hash>>,
+    digest: [u8; 32],
+}
+
+impl<Hash> VerifiedRealmRollbackCommittedSuffix<Hash> {
+    pub(super) const fn authority(&self) -> AuthorityScope { self.authority }
+    pub(super) const fn target(&self) -> &CanonicalChainRef<Hash> { &self.target }
+    pub(super) const fn source_head(&self) -> &CanonicalChainRef<Hash> { &self.source_head }
+    pub(super) fn entries(&self) -> &[VerifiedRealmRollbackCommittedSuffixEntry<Hash>] {
+        &self.entries
+    }
+    pub(super) const fn digest(&self) -> &[u8; 32] { &self.digest }
 }
 
 pub(super) struct ScyllaRealmRollbackCommitInventoryStore {
@@ -526,6 +611,222 @@ impl ScyllaRealmRollbackCommitInventoryStore {
         if current != receipt.marker { return Err(RealmRollbackCommitInventoryStoreError::Conflict); }
         Ok(())
     }
+
+    /// Reconstruct the complete committed Realm suffix from the immutable
+    /// checkpoint marker partition. The caller supplies the product request's
+    /// exact target and source head, never a list of inventory slots.
+    pub(super) async fn scan_committed_suffix<Hash: Q256BitHash>(
+        &self,
+        authority: AuthorityScope,
+        target: CanonicalChainRef<Hash>,
+        source_head: CanonicalChainRef<Hash>,
+    ) -> Result<VerifiedRealmRollbackCommittedSuffix<Hash>, RealmRollbackCommitInventoryStoreError> {
+        let partition = marker_partition_key(authority, &source_head)?;
+        if target.network_id() != source_head.network_id()
+            || target.chain_epoch() != source_head.chain_epoch()
+        {
+            return Err(RealmRollbackCommitInventoryStoreError::SourceMismatch);
+        }
+        let target_height = target.checkpoint().checkpoint_id().get();
+        let source_height = source_head.checkpoint().checkpoint_id().get();
+        let expected_rows = source_height
+            .checked_sub(target_height)
+            .ok_or(RealmRollbackCommitInventoryStoreError::InvalidSuffixRange)?;
+        if expected_rows == 0 || expected_rows > MAX_SUFFIX_ROWS {
+            return Err(RealmRollbackCommitInventoryStoreError::InvalidSuffixRange);
+        }
+        let target_i64 = i64::try_from(target_height)
+            .map_err(|_| RealmRollbackCommitInventoryStoreError::CoordinateOutOfRange)?;
+        let source_i64 = i64::try_from(source_height)
+            .map_err(|_| RealmRollbackCommitInventoryStoreError::CoordinateOutOfRange)?;
+        let mut stream = self
+            .session
+            .execute_iter(
+                self.scan_markers.clone(),
+                (
+                    partition.network_chain_id,
+                    partition.authority_kind,
+                    partition.realm_id,
+                    partition.realm_sub_id,
+                    partition.chain_epoch,
+                    target_i64,
+                    source_i64,
+                ),
+            )
+            .await
+            .map_err(cql)?
+            .rows_stream::<(i64, i64, Vec<u8>, Vec<u8>)>()
+            .map_err(cql)?;
+        let capacity = usize::try_from(expected_rows)
+            .map_err(|_| RealmRollbackCommitInventoryStoreError::InvalidSuffixRange)?;
+        let mut entries = Vec::with_capacity(capacity);
+        let mut expected_checkpoint = target_height
+            .checked_add(1)
+            .ok_or(RealmRollbackCommitInventoryStoreError::InvalidSuffixRange)?;
+        let mut previous_pending = None;
+        while let Some((checkpoint, revision, selected_slot, payload)) =
+            stream.try_next().await.map_err(cql)?
+        {
+            let checkpoint = u64::try_from(checkpoint)
+                .map_err(|_| RealmRollbackCommitInventoryStoreError::CoordinateOutOfRange)?;
+            if checkpoint != expected_checkpoint || entries.len() >= capacity {
+                return Err(RealmRollbackCommitInventoryStoreError::IncompleteSuffix);
+            }
+            let slot = RealmRollbackCommitInventorySlot::from_persisted(
+                selected_slot
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| RealmRollbackCommitInventoryStoreError::MalformedMarker)?,
+            );
+            let inventory = self
+                .read_inventory(slot)
+                .await?
+                .ok_or(RealmRollbackCommitInventoryStoreError::MissingAfterWrite)?;
+            let candidate = inventory.candidate();
+            if inventory.authority() != authority
+                || candidate.canonical_chain().network_id() != source_head.network_id()
+                || candidate.canonical_chain().chain_epoch() != source_head.chain_epoch()
+                || candidate.canonical_chain().checkpoint().checkpoint_id().get() != checkpoint
+            {
+                return Err(RealmRollbackCommitInventoryStoreError::SourceMismatch);
+            }
+            if previous_pending
+                .is_some_and(|previous| candidate.pending_id().get() <= previous)
+            {
+                return Err(RealmRollbackCommitInventoryStoreError::NonMonotonicPending);
+            }
+            previous_pending = Some(candidate.pending_id().get());
+            let marker = RealmRollbackCommittedMarker::decode_persisted(
+                self.fingerprint,
+                &inventory,
+                revision,
+                &payload,
+            )?;
+            if marker.inventory_slot != slot {
+                return Err(RealmRollbackCommitInventoryStoreError::SourceMismatch);
+            }
+            let point_marker = self
+                .read_marker(&inventory)
+                .await?
+                .ok_or(RealmRollbackCommitInventoryStoreError::MissingAfterWrite)?;
+            if point_marker != marker {
+                return Err(RealmRollbackCommitInventoryStoreError::Conflict);
+            }
+            entries.push(VerifiedRealmRollbackCommittedSuffixEntry {
+                inventory,
+                marker,
+            });
+            expected_checkpoint = expected_checkpoint
+                .checked_add(1)
+                .ok_or(RealmRollbackCommitInventoryStoreError::InvalidSuffixRange)?;
+        }
+        if entries.len() != capacity
+            || entries
+                .last()
+                .map(|entry| entry.inventory.candidate().canonical_chain())
+                != Some(&source_head)
+        {
+            return Err(RealmRollbackCommitInventoryStoreError::IncompleteSuffix);
+        }
+        let digest = suffix_digest(
+            self.fingerprint,
+            authority,
+            &target,
+            &source_head,
+            &entries,
+        );
+        Ok(VerifiedRealmRollbackCommittedSuffix {
+            store_fingerprint: self.fingerprint,
+            authority,
+            target,
+            source_head,
+            entries,
+            digest,
+        })
+    }
+
+    /// Select one exact committed checkpoint without trusting a pending id or
+    /// inventory slot supplied by the caller. This is used to recover mutable
+    /// target values before any suffix row can be deleted.
+    pub(super) async fn read_committed_checkpoint<Hash: Q256BitHash>(
+        &self,
+        authority: AuthorityScope,
+        candidate: CanonicalChainRef<Hash>,
+    ) -> Result<VerifiedRealmRollbackCommittedSuffixEntry<Hash>, RealmRollbackCommitInventoryStoreError> {
+        let partition = marker_partition_key(authority, &candidate)?;
+        let checkpoint = i64::try_from(candidate.checkpoint().checkpoint_id().get())
+            .map_err(|_| RealmRollbackCommitInventoryStoreError::CoordinateOutOfRange)?;
+        let row = self
+            .session
+            .execute_unpaged(
+                &self.read_marker,
+                (
+                    partition.network_chain_id,
+                    partition.authority_kind,
+                    partition.realm_id,
+                    partition.realm_sub_id,
+                    partition.chain_epoch,
+                    checkpoint,
+                ),
+            )
+            .await
+            .map_err(cql)?
+            .into_rows_result()
+            .map_err(cql)?
+            .maybe_first_row::<(i64, Vec<u8>, Vec<u8>)>()
+            .map_err(cql)?
+            .ok_or(RealmRollbackCommitInventoryStoreError::MissingCommittedCheckpoint)?;
+        let (revision, selected_slot, payload) = row;
+        let slot = RealmRollbackCommitInventorySlot::from_persisted(
+            selected_slot
+                .as_slice()
+                .try_into()
+                .map_err(|_| RealmRollbackCommitInventoryStoreError::MalformedMarker)?,
+        );
+        let inventory = self
+            .read_inventory(slot)
+            .await?
+            .ok_or(RealmRollbackCommitInventoryStoreError::MissingAfterWrite)?;
+        if inventory.authority() != authority
+            || inventory.candidate().canonical_chain() != &candidate
+        {
+            return Err(RealmRollbackCommitInventoryStoreError::SourceMismatch);
+        }
+        let marker = RealmRollbackCommittedMarker::decode_persisted(
+            self.fingerprint,
+            &inventory,
+            revision,
+            &payload,
+        )?;
+        let point_marker = self
+            .read_marker(&inventory)
+            .await?
+            .ok_or(RealmRollbackCommitInventoryStoreError::MissingAfterWrite)?;
+        if marker != point_marker {
+            return Err(RealmRollbackCommitInventoryStoreError::Conflict);
+        }
+        Ok(VerifiedRealmRollbackCommittedSuffixEntry { inventory, marker })
+    }
+
+    pub(super) async fn revalidate_committed_suffix<Hash: Q256BitHash>(
+        &self,
+        suffix: &VerifiedRealmRollbackCommittedSuffix<Hash>,
+    ) -> Result<(), RealmRollbackCommitInventoryStoreError> {
+        if suffix.store_fingerprint != self.fingerprint {
+            return Err(RealmRollbackCommitInventoryStoreError::StoreBindingMismatch);
+        }
+        let current = self
+            .scan_committed_suffix(
+                suffix.authority,
+                suffix.target,
+                suffix.source_head,
+            )
+            .await?;
+        if current != *suffix {
+            return Err(RealmRollbackCommitInventoryStoreError::Conflict);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -642,6 +943,58 @@ fn marker_key<Hash: Q256BitHash>(
     })
 }
 
+fn marker_partition_key<Hash: Q256BitHash>(
+    authority: AuthorityScope,
+    source_head: &CanonicalChainRef<Hash>,
+) -> Result<MarkerKey, RealmRollbackCommitInventoryStoreError> {
+    let AuthorityScope::Realm {
+        realm_id,
+        realm_sub_id,
+    } = authority
+    else {
+        return Err(RealmRollbackCommitInventoryStoreError::RealmRequired);
+    };
+    Ok(MarkerKey {
+        network_chain_id: i64::from(source_head.network_id().chain_id()),
+        authority_kind: 2,
+        realm_id: i64::from(realm_id),
+        realm_sub_id: i32::from(realm_sub_id),
+        chain_epoch: i64::try_from(source_head.chain_epoch().get())
+            .map_err(|_| RealmRollbackCommitInventoryStoreError::CoordinateOutOfRange)?,
+        checkpoint_id: 0,
+    })
+}
+
+fn suffix_digest<Hash: Q256BitHash>(
+    store_fingerprint: RealmRollbackCommitInventoryStoreFingerprint,
+    authority: AuthorityScope,
+    target: &CanonicalChainRef<Hash>,
+    source_head: &CanonicalChainRef<Hash>,
+    entries: &[VerifiedRealmRollbackCommittedSuffixEntry<Hash>],
+) -> [u8; 32] {
+    let AuthorityScope::Realm {
+        realm_id,
+        realm_sub_id,
+    } = authority
+    else {
+        unreachable!("suffix scanner validates Realm authority")
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(SUFFIX_DIGEST_DOMAIN);
+    hasher.update(store_fingerprint.0);
+    hasher.update(realm_id.to_be_bytes());
+    hasher.update(realm_sub_id.to_be_bytes());
+    hasher.update(target.to_canonical_bytes());
+    hasher.update(source_head.to_canonical_bytes());
+    hasher.update((entries.len() as u64).to_be_bytes());
+    for entry in entries {
+        hasher.update(entry.inventory.slot().as_bytes());
+        hasher.update(entry.inventory.digest());
+        hasher.update(entry.marker.digest());
+    }
+    hasher.finalize().into()
+}
+
 async fn prepare_regular(session: &Session, cql_text: &str) -> Result<PreparedStatement, RealmRollbackCommitInventoryStoreError> {
     let mut statement = session.prepare(cql_text).await.map_err(cql)?;
     statement.set_consistency(Consistency::Quorum);
@@ -686,6 +1039,10 @@ impl<'a> Cursor<'a> {
 pub(super) enum RealmRollbackCommitInventoryStoreError {
     RealmRequired,
     CoordinateOutOfRange,
+    InvalidSuffixRange,
+    IncompleteSuffix,
+    NonMonotonicPending,
+    MissingCommittedCheckpoint,
     PayloadTooLarge,
     MalformedFragment,
     MalformedMarker,
