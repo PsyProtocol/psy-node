@@ -60,6 +60,15 @@ const FRAGMENT_DIGEST_DOMAIN: &[u8] =
     b"psy.rollback.coordinator-commit-physical-before-image-fragment.v1\0";
 const PARTICIPANT_DATASET_DIGEST_DOMAIN: &[u8] =
     b"psy.rollback.coordinator-commit-physical-archive-participant.v1\0";
+const PARTICIPANT_COMPLETION_MAGIC: &[u8; 8] = b"PSYCCPC1";
+const PARTICIPANT_COMPLETION_VERSION: u16 = 1;
+const PARTICIPANT_COMPLETION_KEY_DOMAIN: i16 = 0;
+const PARTICIPANT_COMPLETION_SLOT_DOMAIN: &[u8] =
+    b"psy.rollback.coordinator-commit-physical-participant-completion-slot.v1\0";
+const PARTICIPANT_COMPLETION_DIGEST_DOMAIN: &[u8] =
+    b"psy.rollback.coordinator-commit-physical-participant-completion.v1\0";
+const MAX_PARTICIPANT_COMPLETION_BYTES: usize = 64 * 1024;
+const MAX_PARTICIPANT_COMPLETION_BINDING_BYTES: usize = 16 * 1024;
 
 const CREATE_TEMPLATE: &str = "CREATE TABLE IF NOT EXISTS {table} (network_chain_id bigint, chain_epoch bigint, participant_plan_digest blob, key_domain smallint, row_slot blob, fragment_index int, revision bigint, fragment_count int, row_bytes bigint, fragment_payload blob, fragment_digest blob, row_digest blob, PRIMARY KEY ((network_chain_id, chain_epoch, participant_plan_digest, key_domain, row_slot), fragment_index)) WITH CLUSTERING ORDER BY (fragment_index ASC)";
 const INSERT_TEMPLATE: &str = "INSERT INTO {table} (network_chain_id, chain_epoch, participant_plan_digest, key_domain, row_slot, fragment_index, revision, fragment_count, row_bytes, fragment_payload, fragment_digest, row_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS";
@@ -157,6 +166,264 @@ impl<Hash> CoordinatorCommitPhysicalParticipantArchiveReceipt<Hash> {
     pub(crate) const fn dataset_digest(&self) -> &[u8; 32] {
         &self.dataset_digest
     }
+}
+
+/// Canonical append-only completion for one exact Coordinator participant.
+/// The reserved key-domain zero cannot collide with any registered hot-state
+/// domain (their stable identities start at one). The slot omits the dataset
+/// digest deliberately: two different results for the same selected
+/// head/catalog conflict at one immutable location instead of coexisting.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CoordinatorCommitPhysicalParticipantCompletion {
+    network_chain_id: i64,
+    old_chain_epoch: u64,
+    archiving_head_revision: i64,
+    archiving_head_canonical: Vec<u8>,
+    archiving_control_canonical: Vec<u8>,
+    catalog_digest: [u8; 32],
+    entry_count: u64,
+    dataset_digest: [u8; 32],
+    archive_store_fingerprint: [u8; 32],
+    slot: [u8; 32],
+    digest: [u8; 32],
+    canonical_bytes: Vec<u8>,
+}
+
+impl CoordinatorCommitPhysicalParticipantCompletion {
+    fn try_from_receipt<Hash: Q256BitHash>(
+        scope: &CoordinatorCommitPhysicalArchiveScope<Hash>,
+        receipt: &CoordinatorCommitPhysicalParticipantArchiveReceipt<Hash>,
+    ) -> Result<Self, CoordinatorCommitPhysicalParticipantCompletionError> {
+        if receipt.archiving_head != scope.archiving_head {
+            return Err(
+                CoordinatorCommitPhysicalParticipantCompletionError::BindingMismatch,
+            );
+        }
+        if receipt.catalog_digest == [0; 32]
+            || receipt.dataset_digest == [0; 32]
+            || receipt.archive_store_fingerprint == [0; 32]
+        {
+            return Err(
+                CoordinatorCommitPhysicalParticipantCompletionError::ZeroCommitment,
+            );
+        }
+        let network_chain_id = i64::from(scope.target.network_id().chain_id());
+        let old_chain_epoch = scope.target.chain_epoch().get();
+        let archiving_head_revision = scope.archiving_head.revision().as_i64();
+        let archiving_head_canonical =
+            scope.archiving_head.canonical_ref_bytes().to_vec();
+        let archiving_control_canonical =
+            scope.archiving_head.rollback_control_bytes().to_vec();
+        let slot = participant_completion_slot(
+            network_chain_id,
+            old_chain_epoch,
+            archiving_head_revision,
+            &archiving_head_canonical,
+            &archiving_control_canonical,
+            &receipt.catalog_digest,
+            &receipt.archive_store_fingerprint,
+        )?;
+        let mut completion = Self {
+            network_chain_id,
+            old_chain_epoch,
+            archiving_head_revision,
+            archiving_head_canonical,
+            archiving_control_canonical,
+            catalog_digest: receipt.catalog_digest,
+            entry_count: receipt.entry_count,
+            dataset_digest: receipt.dataset_digest,
+            archive_store_fingerprint: receipt.archive_store_fingerprint,
+            slot,
+            digest: [0; 32],
+            canonical_bytes: Vec::new(),
+        };
+        let commitment = completion.encode_without_digest()?;
+        completion.digest = participant_completion_digest(&commitment);
+        completion.canonical_bytes = commitment;
+        completion.canonical_bytes.extend_from_slice(&completion.digest);
+        if completion.canonical_bytes.len() > MAX_PARTICIPANT_COMPLETION_BYTES {
+            return Err(
+                CoordinatorCommitPhysicalParticipantCompletionError::RowTooLarge,
+            );
+        }
+        Ok(completion)
+    }
+
+    fn decode_canonical(
+        bytes: &[u8],
+    ) -> Result<Self, CoordinatorCommitPhysicalParticipantCompletionError> {
+        if bytes.len() > MAX_PARTICIPANT_COMPLETION_BYTES {
+            return Err(
+                CoordinatorCommitPhysicalParticipantCompletionError::RowTooLarge,
+            );
+        }
+        let mut cursor = ParticipantCompletionCursor::new(bytes);
+        if cursor.take(8)? != PARTICIPANT_COMPLETION_MAGIC {
+            return Err(
+                CoordinatorCommitPhysicalParticipantCompletionError::InvalidMagic,
+            );
+        }
+        let version = cursor.u16()?;
+        if version != PARTICIPANT_COMPLETION_VERSION {
+            return Err(
+                CoordinatorCommitPhysicalParticipantCompletionError::UnknownVersion(
+                    version,
+                ),
+            );
+        }
+        let network_chain_id = cursor.i64()?;
+        let old_chain_epoch = cursor.u64()?;
+        let archiving_head_revision = cursor.i64()?;
+        let archiving_head_canonical = cursor.bytes()?.to_vec();
+        let archiving_control_canonical = cursor.bytes()?.to_vec();
+        let catalog_digest = cursor.array_32()?;
+        let entry_count = cursor.u64()?;
+        let dataset_digest = cursor.array_32()?;
+        let archive_store_fingerprint = cursor.array_32()?;
+        let slot = cursor.array_32()?;
+        let digest = cursor.array_32()?;
+        if !cursor.is_empty() {
+            return Err(
+                CoordinatorCommitPhysicalParticipantCompletionError::TrailingBytes,
+            );
+        }
+        if archiving_head_canonical.len()
+            > MAX_PARTICIPANT_COMPLETION_BINDING_BYTES
+            || archiving_control_canonical.len()
+                > MAX_PARTICIPANT_COMPLETION_BINDING_BYTES
+        {
+            return Err(
+                CoordinatorCommitPhysicalParticipantCompletionError::BindingTooLarge,
+            );
+        }
+        if catalog_digest == [0; 32]
+            || dataset_digest == [0; 32]
+            || archive_store_fingerprint == [0; 32]
+            || slot == [0; 32]
+            || digest == [0; 32]
+        {
+            return Err(
+                CoordinatorCommitPhysicalParticipantCompletionError::ZeroCommitment,
+            );
+        }
+        if participant_completion_slot(
+            network_chain_id,
+            old_chain_epoch,
+            archiving_head_revision,
+            &archiving_head_canonical,
+            &archiving_control_canonical,
+            &catalog_digest,
+            &archive_store_fingerprint,
+        )? != slot
+        {
+            return Err(
+                CoordinatorCommitPhysicalParticipantCompletionError::SlotMismatch,
+            );
+        }
+        if bytes.len() < 32
+            || participant_completion_digest(&bytes[..bytes.len() - 32]) != digest
+        {
+            return Err(
+                CoordinatorCommitPhysicalParticipantCompletionError::DigestMismatch,
+            );
+        }
+        let decoded = Self {
+            network_chain_id,
+            old_chain_epoch,
+            archiving_head_revision,
+            archiving_head_canonical,
+            archiving_control_canonical,
+            catalog_digest,
+            entry_count,
+            dataset_digest,
+            archive_store_fingerprint,
+            slot,
+            digest,
+            canonical_bytes: bytes.to_vec(),
+        };
+        if decoded.encode_without_digest()? != bytes[..bytes.len() - 32] {
+            return Err(
+                CoordinatorCommitPhysicalParticipantCompletionError::NonCanonicalEncoding,
+            );
+        }
+        Ok(decoded)
+    }
+
+    fn validate_selected<Hash: Q256BitHash>(
+        &self,
+        scope: &CoordinatorCommitPhysicalArchiveScope<Hash>,
+        catalog_digest: &[u8; 32],
+        entry_count: u64,
+        archive_store_fingerprint: &[u8; 32],
+    ) -> Result<(), CoordinatorCommitPhysicalParticipantCompletionError> {
+        if self.network_chain_id
+            != i64::from(scope.target.network_id().chain_id())
+            || self.old_chain_epoch != scope.target.chain_epoch().get()
+            || self.archiving_head_revision
+                != scope.archiving_head.revision().as_i64()
+            || self.archiving_head_canonical
+                != scope.archiving_head.canonical_ref_bytes()
+            || self.archiving_control_canonical
+                != scope.archiving_head.rollback_control_bytes()
+            || &self.catalog_digest != catalog_digest
+            || self.entry_count != entry_count
+            || &self.archive_store_fingerprint != archive_store_fingerprint
+        {
+            return Err(
+                CoordinatorCommitPhysicalParticipantCompletionError::BindingMismatch,
+            );
+        }
+        Ok(())
+    }
+
+    fn encode_without_digest(
+        &self,
+    ) -> Result<Vec<u8>, CoordinatorCommitPhysicalParticipantCompletionError> {
+        if self.archiving_head_canonical.len()
+            > MAX_PARTICIPANT_COMPLETION_BINDING_BYTES
+            || self.archiving_control_canonical.len()
+                > MAX_PARTICIPANT_COMPLETION_BINDING_BYTES
+        {
+            return Err(
+                CoordinatorCommitPhysicalParticipantCompletionError::BindingTooLarge,
+            );
+        }
+        let head_len = u32::try_from(self.archiving_head_canonical.len()).map_err(
+            |_| CoordinatorCommitPhysicalParticipantCompletionError::LengthOverflow,
+        )?;
+        let control_len =
+            u32::try_from(self.archiving_control_canonical.len()).map_err(|_| {
+                CoordinatorCommitPhysicalParticipantCompletionError::LengthOverflow
+            })?;
+        let mut bytes = Vec::with_capacity(
+            256 + self.archiving_head_canonical.len()
+                + self.archiving_control_canonical.len(),
+        );
+        bytes.extend_from_slice(PARTICIPANT_COMPLETION_MAGIC);
+        bytes.extend_from_slice(&PARTICIPANT_COMPLETION_VERSION.to_be_bytes());
+        bytes.extend_from_slice(&self.network_chain_id.to_be_bytes());
+        bytes.extend_from_slice(&self.old_chain_epoch.to_be_bytes());
+        bytes.extend_from_slice(&self.archiving_head_revision.to_be_bytes());
+        bytes.extend_from_slice(&head_len.to_be_bytes());
+        bytes.extend_from_slice(&self.archiving_head_canonical);
+        bytes.extend_from_slice(&control_len.to_be_bytes());
+        bytes.extend_from_slice(&self.archiving_control_canonical);
+        bytes.extend_from_slice(&self.catalog_digest);
+        bytes.extend_from_slice(&self.entry_count.to_be_bytes());
+        bytes.extend_from_slice(&self.dataset_digest);
+        bytes.extend_from_slice(&self.archive_store_fingerprint);
+        bytes.extend_from_slice(&self.slot);
+        Ok(bytes)
+    }
+}
+
+/// Non-clone storage-private receipt proving that the immutable participant
+/// completion row was exact-read after the entire dataset was revalidated.
+/// It is not accepted by any barrier or destructive API.
+#[derive(Debug)]
+pub(crate) struct PersistedCoordinatorCommitPhysicalParticipantCompletionReceipt {
+    store_fingerprint: [u8; 32],
+    completion: CoordinatorCommitPhysicalParticipantCompletion,
 }
 
 /// Affine composition boundary for the whole Coordinator catalog. Callers do
@@ -321,6 +588,168 @@ impl ScyllaCoordinatorCommitPhysicalArchiveOwner {
         .await?;
         if <[u8; 32]>::from(dataset.finalize()) != receipt.dataset_digest {
             return Err(CoordinatorCommitPhysicalArchiveOwnerError::DatasetChanged);
+        }
+        Ok(())
+    }
+
+    /// Persist the exact participant result only after a fresh full-catalog
+    /// revalidation. Any error after the immutable LWT is commit-indeterminate;
+    /// callers must recover or retry the same selected request.
+    pub(crate) async fn persist_participant_completion<F, Hash, Hasher>(
+        &mut self,
+        network: NetworkId,
+        receipt: &CoordinatorCommitPhysicalParticipantArchiveReceipt<Hash>,
+    ) -> Result<
+        PersistedCoordinatorCommitPhysicalParticipantCompletionReceipt,
+        CoordinatorCommitPhysicalArchiveOwnerError,
+    >
+    where
+        F: QFelt64,
+        Hash: Q256BitHash + QFHashBase<F>,
+        Hasher: MerkleHasher<Hash> + FieldQHasher<F, Hash>,
+    {
+        self.revalidate_participant_receipt::<F, Hash, Hasher>(network, receipt)
+            .await?;
+        let scope = self.read_scope::<Hash>(network).await?;
+        let catalog = self.scan_catalog::<F, Hash, Hasher>(&scope).await?;
+        let store = ScyllaCoordinatorCommitPhysicalArchiveStore::prepare_for_catalog(
+            self.session.clone(),
+            self.archive_keyspace.clone(),
+            self.source_keyspace.clone(),
+            &catalog,
+        )
+        .await?;
+        let completion =
+            CoordinatorCommitPhysicalParticipantCompletion::try_from_receipt(
+                &scope,
+                receipt,
+            )?;
+        completion.validate_selected(
+            &scope,
+            catalog.digest(),
+            u64::try_from(catalog.entries().len())
+                .map_err(|_| CoordinatorCommitPhysicalArchiveOwnerError::LengthOverflow)?,
+            &store.fingerprint,
+        )?;
+        store
+            .persist_participant_completion_exact(&scope, &completion)
+            .await?;
+        let current = store
+            .read_participant_completion_exact(&scope, &completion.slot)
+            .await?
+            .ok_or(CoordinatorCommitPhysicalArchiveStoreError::MissingAfterPersist)?;
+        if current != completion {
+            return Err(CoordinatorCommitPhysicalArchiveOwnerError::CompletionChanged);
+        }
+
+        self.revalidate_participant_receipt::<F, Hash, Hasher>(network, receipt)
+            .await?;
+        let after = store
+            .read_participant_completion_exact(&scope, &completion.slot)
+            .await?
+            .ok_or(CoordinatorCommitPhysicalArchiveStoreError::MissingAfterPersist)?;
+        if after != completion {
+            return Err(CoordinatorCommitPhysicalArchiveOwnerError::CompletionChanged);
+        }
+        self.require_catalog_and_head_unchanged::<F, Hash, Hasher>(
+            &scope,
+            &catalog,
+        )
+        .await?;
+        Ok(PersistedCoordinatorCommitPhysicalParticipantCompletionReceipt {
+            store_fingerprint: store.fingerprint,
+            completion,
+        })
+    }
+
+    /// Restart path: select the only stable completion slot from the current
+    /// ARCHIVING head and catalog, strict-decode it, and then revalidate every
+    /// source/archive row before returning a private receipt.
+    pub(crate) async fn recover_participant_completion<F, Hash, Hasher>(
+        &mut self,
+        network: NetworkId,
+    ) -> Result<
+        PersistedCoordinatorCommitPhysicalParticipantCompletionReceipt,
+        CoordinatorCommitPhysicalArchiveOwnerError,
+    >
+    where
+        F: QFelt64,
+        Hash: Q256BitHash + QFHashBase<F>,
+        Hasher: MerkleHasher<Hash> + FieldQHasher<F, Hash>,
+    {
+        let scope = self.read_scope::<Hash>(network).await?;
+        let catalog = self.scan_catalog::<F, Hash, Hasher>(&scope).await?;
+        let store = ScyllaCoordinatorCommitPhysicalArchiveStore::prepare_for_catalog(
+            self.session.clone(),
+            self.archive_keyspace.clone(),
+            self.source_keyspace.clone(),
+            &catalog,
+        )
+        .await?;
+        let slot = participant_completion_slot_for_selected(
+            &scope,
+            catalog.digest(),
+            &store.fingerprint,
+        )?;
+        let completion = store
+            .read_participant_completion_exact(&scope, &slot)
+            .await?
+            .ok_or(CoordinatorCommitPhysicalArchiveOwnerError::CompletionMissing)?;
+        let entry_count = u64::try_from(catalog.entries().len())
+            .map_err(|_| CoordinatorCommitPhysicalArchiveOwnerError::LengthOverflow)?;
+        completion.validate_selected(
+            &scope,
+            catalog.digest(),
+            entry_count,
+            &store.fingerprint,
+        )?;
+
+        let candidate = CoordinatorCommitPhysicalParticipantArchiveReceipt {
+            archiving_head: scope.archiving_head,
+            catalog_digest: completion.catalog_digest,
+            entry_count: completion.entry_count,
+            dataset_digest: completion.dataset_digest,
+            archive_store_fingerprint: completion.archive_store_fingerprint,
+        };
+        self.revalidate_participant_receipt::<F, Hash, Hasher>(network, &candidate)
+            .await?;
+        let after = store
+            .read_participant_completion_exact(&scope, &slot)
+            .await?
+            .ok_or(CoordinatorCommitPhysicalArchiveOwnerError::CompletionMissing)?;
+        if after != completion {
+            return Err(CoordinatorCommitPhysicalArchiveOwnerError::CompletionChanged);
+        }
+        self.require_catalog_and_head_unchanged::<F, Hash, Hasher>(
+            &scope,
+            &catalog,
+        )
+        .await?;
+        Ok(PersistedCoordinatorCommitPhysicalParticipantCompletionReceipt {
+            store_fingerprint: store.fingerprint,
+            completion,
+        })
+    }
+
+    pub(crate) async fn revalidate_persisted_completion<F, Hash, Hasher>(
+        &mut self,
+        network: NetworkId,
+        receipt: &PersistedCoordinatorCommitPhysicalParticipantCompletionReceipt,
+    ) -> Result<(), CoordinatorCommitPhysicalArchiveOwnerError>
+    where
+        F: QFelt64,
+        Hash: Q256BitHash + QFHashBase<F>,
+        Hasher: MerkleHasher<Hash> + FieldQHasher<F, Hash>,
+    {
+        let current = self
+            .recover_participant_completion::<F, Hash, Hasher>(network)
+            .await?;
+        if current.store_fingerprint != receipt.store_fingerprint
+            || current.completion != receipt.completion
+        {
+            return Err(
+                CoordinatorCommitPhysicalArchiveOwnerError::CompletionReceiptMismatch,
+            );
         }
         Ok(())
     }
@@ -628,6 +1057,61 @@ impl ScyllaCoordinatorCommitPhysicalArchiveStore {
         }
     }
 
+    async fn persist_participant_completion_exact<Hash: Q256BitHash>(
+        &self,
+        scope: &CoordinatorCommitPhysicalArchiveScope<Hash>,
+        completion: &CoordinatorCommitPhysicalParticipantCompletion,
+    ) -> Result<(), CoordinatorCommitPhysicalArchiveStoreError> {
+        if completion.catalog_digest != self.catalog_digest
+            || completion.archive_store_fingerprint != self.fingerprint
+        {
+            return Err(
+                CoordinatorCommitPhysicalArchiveStoreError::ReceiptBindingMismatch,
+            );
+        }
+        let coordinates = ArchiveCoordinates::try_for_completion(
+            scope,
+            completion.catalog_digest,
+            completion.slot,
+        )?;
+        self.persist_archive_bytes(
+            &coordinates,
+            &completion.canonical_bytes,
+            &completion.digest,
+        )
+        .await
+    }
+
+    async fn read_participant_completion_exact<Hash: Q256BitHash>(
+        &self,
+        scope: &CoordinatorCommitPhysicalArchiveScope<Hash>,
+        slot: &[u8; 32],
+    ) -> Result<
+        Option<CoordinatorCommitPhysicalParticipantCompletion>,
+        CoordinatorCommitPhysicalArchiveStoreError,
+    > {
+        let coordinates = ArchiveCoordinates::try_for_completion(
+            scope,
+            self.catalog_digest,
+            *slot,
+        )?;
+        let Some((bytes, row_digest)) =
+            self.read_archive_bytes(&coordinates).await?
+        else {
+            return Ok(None);
+        };
+        let completion =
+            CoordinatorCommitPhysicalParticipantCompletion::decode_canonical(&bytes)?;
+        if completion.slot != *slot
+            || completion.digest != row_digest
+            || completion.catalog_digest != self.catalog_digest
+            || completion.archive_store_fingerprint != self.fingerprint
+        {
+            return Err(CoordinatorCommitPhysicalArchiveStoreError::Conflict);
+        }
+        Ok(Some(completion))
+    }
+
     fn require_catalog<Hash: Q256BitHash>(
         &self,
         catalog: &CoordinatorCommitPhysicalCatalog<Hash>,
@@ -825,8 +1309,22 @@ impl ScyllaCoordinatorCommitPhysicalArchiveStore {
         catalog: &CoordinatorCommitPhysicalCatalog<Hash>,
         before: &CoordinatorCommitPhysicalBeforeImage<Hash>,
     ) -> Result<(), CoordinatorCommitPhysicalArchiveStoreError> {
-        let fragments = archive_fragments(before.canonical_bytes(), before.digest())?;
         let coordinates = ArchiveCoordinates::try_for(catalog, before)?;
+        self.persist_archive_bytes(
+            &coordinates,
+            before.canonical_bytes(),
+            before.digest(),
+        )
+        .await
+    }
+
+    async fn persist_archive_bytes(
+        &self,
+        coordinates: &ArchiveCoordinates,
+        bytes: &[u8],
+        row_digest: &[u8; 32],
+    ) -> Result<(), CoordinatorCommitPhysicalArchiveStoreError> {
+        let fragments = archive_fragments(bytes, row_digest)?;
         for fragment in &fragments {
             let execution = self
                 .session
@@ -887,6 +1385,29 @@ impl ScyllaCoordinatorCommitPhysicalArchiveStore {
     ) -> Result<Option<CoordinatorCommitPhysicalBeforeImage<Hash>>, CoordinatorCommitPhysicalArchiveStoreError>
     {
         let coordinates = ArchiveCoordinates::try_for(catalog, expected)?;
+        let Some((bytes, row_digest)) =
+            self.read_archive_bytes(&coordinates).await?
+        else {
+            return Ok(None);
+        };
+        if &row_digest != expected.digest() {
+            return Err(CoordinatorCommitPhysicalArchiveStoreError::Conflict);
+        }
+        let decoded = CoordinatorCommitPhysicalBeforeImage::decode_for_catalog(
+            &bytes,
+            catalog,
+        )?;
+        if decoded.slot() != expected.slot() || decoded.digest() != expected.digest() {
+            return Err(CoordinatorCommitPhysicalArchiveStoreError::Conflict);
+        }
+        Ok(Some(decoded))
+    }
+
+    async fn read_archive_bytes(
+        &self,
+        coordinates: &ArchiveCoordinates,
+    ) -> Result<Option<(Vec<u8>, [u8; 32])>, CoordinatorCommitPhysicalArchiveStoreError>
+    {
         let rows = self
             .session
             .execute_unpaged(
@@ -930,15 +1451,9 @@ impl ScyllaCoordinatorCommitPhysicalArchiveStore {
                 row_digest,
             )?);
         }
-        let bytes = reconstruct_fragments(fragments, expected.digest())?;
-        let decoded = CoordinatorCommitPhysicalBeforeImage::decode_for_catalog(
-            &bytes,
-            catalog,
-        )?;
-        if decoded.slot() != expected.slot() || decoded.digest() != expected.digest() {
-            return Err(CoordinatorCommitPhysicalArchiveStoreError::Conflict);
-        }
-        Ok(Some(decoded))
+        let row_digest = fragments[0].row_digest;
+        let bytes = reconstruct_fragments(fragments, &row_digest)?;
+        Ok(Some((bytes, row_digest)))
     }
 
     async fn read_archive_fragment(
@@ -1234,6 +1749,22 @@ impl ArchiveCoordinates {
             row_slot: *before.slot(),
         })
     }
+
+    fn try_for_completion<Hash: Q256BitHash>(
+        scope: &CoordinatorCommitPhysicalArchiveScope<Hash>,
+        catalog_digest: [u8; 32],
+        row_slot: [u8; 32],
+    ) -> Result<Self, CoordinatorCommitPhysicalArchiveStoreError> {
+        Ok(Self {
+            network: i64::from(scope.target.network_id().chain_id()),
+            chain_epoch: i64::try_from(scope.target.chain_epoch().get()).map_err(
+                |_| CoordinatorCommitPhysicalArchiveStoreError::IntegerOutOfCqlRange,
+            )?,
+            catalog_digest,
+            key_domain: PARTICIPANT_COMPLETION_KEY_DOMAIN,
+            row_slot,
+        })
+    }
 }
 
 fn archive_fragments(
@@ -1383,6 +1914,131 @@ fn fragment_digest(
     hasher.finalize().into()
 }
 
+fn participant_completion_slot_for_selected<Hash: Q256BitHash>(
+    scope: &CoordinatorCommitPhysicalArchiveScope<Hash>,
+    catalog_digest: &[u8; 32],
+    archive_store_fingerprint: &[u8; 32],
+) -> Result<[u8; 32], CoordinatorCommitPhysicalParticipantCompletionError> {
+    participant_completion_slot(
+        i64::from(scope.target.network_id().chain_id()),
+        scope.target.chain_epoch().get(),
+        scope.archiving_head.revision().as_i64(),
+        &scope.archiving_head.canonical_ref_bytes(),
+        &scope.archiving_head.rollback_control_bytes(),
+        catalog_digest,
+        archive_store_fingerprint,
+    )
+}
+
+fn participant_completion_slot(
+    network_chain_id: i64,
+    old_chain_epoch: u64,
+    archiving_head_revision: i64,
+    archiving_head_canonical: &[u8],
+    archiving_control_canonical: &[u8],
+    catalog_digest: &[u8; 32],
+    archive_store_fingerprint: &[u8; 32],
+) -> Result<[u8; 32], CoordinatorCommitPhysicalParticipantCompletionError> {
+    if archiving_head_canonical.len() > MAX_PARTICIPANT_COMPLETION_BINDING_BYTES
+        || archiving_control_canonical.len()
+            > MAX_PARTICIPANT_COMPLETION_BINDING_BYTES
+    {
+        return Err(
+            CoordinatorCommitPhysicalParticipantCompletionError::BindingTooLarge,
+        );
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(PARTICIPANT_COMPLETION_SLOT_DOMAIN);
+    hasher.update(network_chain_id.to_be_bytes());
+    hasher.update(old_chain_epoch.to_be_bytes());
+    hasher.update(archiving_head_revision.to_be_bytes());
+    hasher.update((archiving_head_canonical.len() as u64).to_be_bytes());
+    hasher.update(archiving_head_canonical);
+    hasher.update((archiving_control_canonical.len() as u64).to_be_bytes());
+    hasher.update(archiving_control_canonical);
+    hasher.update(catalog_digest);
+    hasher.update(archive_store_fingerprint);
+    Ok(hasher.finalize().into())
+}
+
+fn participant_completion_digest(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(PARTICIPANT_COMPLETION_DIGEST_DOMAIN);
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+struct ParticipantCompletionCursor<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> ParticipantCompletionCursor<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, position: 0 }
+    }
+
+    fn take(
+        &mut self,
+        length: usize,
+    ) -> Result<&'a [u8], CoordinatorCommitPhysicalParticipantCompletionError> {
+        let end = self.position.checked_add(length).ok_or(
+            CoordinatorCommitPhysicalParticipantCompletionError::LengthOverflow,
+        )?;
+        if end > self.bytes.len() {
+            return Err(
+                CoordinatorCommitPhysicalParticipantCompletionError::Truncated,
+            );
+        }
+        let value = &self.bytes[self.position..end];
+        self.position = end;
+        Ok(value)
+    }
+
+    fn u16(
+        &mut self,
+    ) -> Result<u16, CoordinatorCommitPhysicalParticipantCompletionError> {
+        Ok(u16::from_be_bytes(
+            self.take(2)?.try_into().expect("fixed u16"),
+        ))
+    }
+
+    fn u64(
+        &mut self,
+    ) -> Result<u64, CoordinatorCommitPhysicalParticipantCompletionError> {
+        Ok(u64::from_be_bytes(
+            self.take(8)?.try_into().expect("fixed u64"),
+        ))
+    }
+
+    fn i64(
+        &mut self,
+    ) -> Result<i64, CoordinatorCommitPhysicalParticipantCompletionError> {
+        Ok(i64::from_be_bytes(
+            self.take(8)?.try_into().expect("fixed i64"),
+        ))
+    }
+
+    fn array_32(
+        &mut self,
+    ) -> Result<[u8; 32], CoordinatorCommitPhysicalParticipantCompletionError> {
+        Ok(self.take(32)?.try_into().expect("fixed array"))
+    }
+
+    fn bytes(
+        &mut self,
+    ) -> Result<&'a [u8], CoordinatorCommitPhysicalParticipantCompletionError> {
+        let length = u32::from_be_bytes(
+            self.take(4)?.try_into().expect("fixed u32"),
+        );
+        self.take(length as usize)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.position == self.bytes.len()
+    }
+}
+
 fn participant_dataset_hasher<Hash: Q256BitHash>(
     scope: &CoordinatorCommitPhysicalArchiveScope<Hash>,
     catalog: &CoordinatorCommitPhysicalCatalog<Hash>,
@@ -1488,6 +2144,33 @@ fn cql(error: impl fmt::Display) -> CoordinatorCommitPhysicalArchiveStoreError {
     CoordinatorCommitPhysicalArchiveStoreError::Cql(error.to_string())
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CoordinatorCommitPhysicalParticipantCompletionError {
+    InvalidMagic,
+    UnknownVersion(u16),
+    BindingMismatch,
+    BindingTooLarge,
+    RowTooLarge,
+    ZeroCommitment,
+    SlotMismatch,
+    DigestMismatch,
+    NonCanonicalEncoding,
+    LengthOverflow,
+    Truncated,
+    TrailingBytes,
+}
+
+impl fmt::Display for CoordinatorCommitPhysicalParticipantCompletionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "invalid Coordinator participant completion: {self:?}",
+        )
+    }
+}
+
+impl Error for CoordinatorCommitPhysicalParticipantCompletionError {}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum CoordinatorCommitPhysicalArchiveOwnerError {
     CanonicalHead(String),
@@ -1502,6 +2185,10 @@ pub(crate) enum CoordinatorCommitPhysicalArchiveOwnerError {
     ReceiptBindingMismatch,
     ArchiveRowChanged,
     DatasetChanged,
+    CompletionMissing,
+    CompletionChanged,
+    CompletionReceiptMismatch,
+    Completion(CoordinatorCommitPhysicalParticipantCompletionError),
     LengthOverflow,
 }
 
@@ -1531,6 +2218,14 @@ impl From<CoordinatorCommitPhysicalBeforeImageError>
     }
 }
 
+impl From<CoordinatorCommitPhysicalParticipantCompletionError>
+    for CoordinatorCommitPhysicalArchiveOwnerError
+{
+    fn from(error: CoordinatorCommitPhysicalParticipantCompletionError) -> Self {
+        Self::Completion(error)
+    }
+}
+
 impl fmt::Display for CoordinatorCommitPhysicalArchiveOwnerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -1545,6 +2240,7 @@ impl Error for CoordinatorCommitPhysicalArchiveOwnerError {}
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum CoordinatorCommitPhysicalArchiveStoreError {
     BeforeImage(CoordinatorCommitPhysicalBeforeImageError),
+    Completion(CoordinatorCommitPhysicalParticipantCompletionError),
     Cql(String),
     CatalogEntryMissing,
     CatalogMismatch,
@@ -1578,6 +2274,14 @@ impl From<CoordinatorCommitPhysicalBeforeImageError>
 {
     fn from(error: CoordinatorCommitPhysicalBeforeImageError) -> Self {
         Self::BeforeImage(error)
+    }
+}
+
+impl From<CoordinatorCommitPhysicalParticipantCompletionError>
+    for CoordinatorCommitPhysicalArchiveStoreError
+{
+    fn from(error: CoordinatorCommitPhysicalParticipantCompletionError) -> Self {
+        Self::Completion(error)
     }
 }
 
@@ -1653,6 +2357,29 @@ mod tests {
             &control.to_canonical_bytes(),
         )
         .unwrap()
+    }
+
+    fn archiving_scope() -> CoordinatorCommitPhysicalArchiveScope<PHash> {
+        let request = rollback_request(RollbackExecutionMode::InPlace);
+        CoordinatorCommitPhysicalArchiveScope::try_from_head(head(
+            7,
+            *request.requested_head(),
+            RollbackControlState::Archiving(request),
+        ))
+        .unwrap()
+    }
+
+    fn participant_receipt(
+        scope: &CoordinatorCommitPhysicalArchiveScope<PHash>,
+        dataset_digest: [u8; 32],
+    ) -> CoordinatorCommitPhysicalParticipantArchiveReceipt<PHash> {
+        CoordinatorCommitPhysicalParticipantArchiveReceipt {
+            archiving_head: scope.archiving_head,
+            catalog_digest: [0x41; 32],
+            entry_count: 37,
+            dataset_digest,
+            archive_store_fingerprint: [0x52; 32],
+        }
     }
 
     #[test]
@@ -1763,6 +2490,126 @@ mod tests {
         assert!(production.contains("revalidate_catalog_entry"));
         assert!(!production.contains("Vec<CoordinatorCommitPhysicalArchivedRow"));
         assert!(!production.contains("Vec<PersistedCoordinatorCommitPhysicalBeforeImage"));
+    }
+
+    #[test]
+    fn participant_completion_is_canonical_strict_and_selected() {
+        let scope = archiving_scope();
+        let receipt = participant_receipt(&scope, [0x63; 32]);
+        let completion =
+            CoordinatorCommitPhysicalParticipantCompletion::try_from_receipt(
+                &scope,
+                &receipt,
+            )
+            .unwrap();
+        let decoded =
+            CoordinatorCommitPhysicalParticipantCompletion::decode_canonical(
+                &completion.canonical_bytes,
+            )
+            .unwrap();
+        assert_eq!(decoded, completion);
+        assert_eq!(decoded.entry_count, 37);
+        assert_eq!(decoded.dataset_digest, [0x63; 32]);
+        assert_eq!(
+            decoded.validate_selected(
+                &scope,
+                &[0x41; 32],
+                37,
+                &[0x52; 32],
+            ),
+            Ok(()),
+        );
+        assert_eq!(
+            decoded.validate_selected(
+                &scope,
+                &[0x41; 32],
+                38,
+                &[0x52; 32],
+            ),
+            Err(CoordinatorCommitPhysicalParticipantCompletionError::BindingMismatch),
+        );
+
+        let mut corrupt = completion.canonical_bytes.clone();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 1;
+        assert_eq!(
+            CoordinatorCommitPhysicalParticipantCompletion::decode_canonical(
+                &corrupt,
+            ),
+            Err(CoordinatorCommitPhysicalParticipantCompletionError::DigestMismatch),
+        );
+        let mut trailing = completion.canonical_bytes.clone();
+        trailing.push(0);
+        assert_eq!(
+            CoordinatorCommitPhysicalParticipantCompletion::decode_canonical(
+                &trailing,
+            ),
+            Err(CoordinatorCommitPhysicalParticipantCompletionError::TrailingBytes),
+        );
+
+        let mut forged_slot = completion.clone();
+        forged_slot.slot = [0x99; 32];
+        let mut forged_bytes = forged_slot.encode_without_digest().unwrap();
+        forged_bytes.extend_from_slice(&participant_completion_digest(&forged_bytes));
+        assert_eq!(
+            CoordinatorCommitPhysicalParticipantCompletion::decode_canonical(
+                &forged_bytes,
+            ),
+            Err(CoordinatorCommitPhysicalParticipantCompletionError::SlotMismatch),
+        );
+    }
+
+    #[test]
+    fn participant_completion_slot_conflicts_different_datasets_for_one_request() {
+        let scope = archiving_scope();
+        let first =
+            CoordinatorCommitPhysicalParticipantCompletion::try_from_receipt(
+                &scope,
+                &participant_receipt(&scope, [0x71; 32]),
+            )
+            .unwrap();
+        let second =
+            CoordinatorCommitPhysicalParticipantCompletion::try_from_receipt(
+                &scope,
+                &participant_receipt(&scope, [0x72; 32]),
+            )
+            .unwrap();
+        assert_eq!(first.slot, second.slot);
+        assert_ne!(first.digest, second.digest);
+        assert_ne!(first.canonical_bytes, second.canonical_bytes);
+        assert_eq!(PARTICIPANT_COMPLETION_KEY_DOMAIN, 0);
+        assert!(
+            crate::rollback::key_domain_registry()
+                .iter()
+                .all(|domain| domain.id.stable_id() != 0),
+        );
+    }
+
+    #[test]
+    fn participant_completion_recovery_remains_pre_barrier_and_pre_delete() {
+        let source = include_str!("coordinator_commit_physical_archive_store.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        for required in [
+            "persist_participant_completion",
+            "recover_participant_completion",
+            "revalidate_persisted_completion",
+            "persist_participant_completion_exact",
+            "read_participant_completion_exact",
+            "IF NOT EXISTS",
+        ] {
+            assert!(production.contains(required), "missing {required}");
+        }
+        for forbidden in [
+            "global_archive_barrier(",
+            "delete_hot_suffix(",
+            "restore_target_head(",
+            "publish_target_head(",
+            "DELETE FROM",
+            "UPDATE ",
+            "USING TIMESTAMP",
+        ] {
+            assert!(!production.contains(forbidden), "forbidden {forbidden}");
+        }
     }
 
     #[test]
