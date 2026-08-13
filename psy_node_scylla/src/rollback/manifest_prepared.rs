@@ -28,10 +28,12 @@ use scylla::{
 };
 
 use super::{
-    decode_manifest_artifact_plan, verify_artifact_chunks,
+    decode_locator_artifact, decode_manifest_artifact_plan,
+    verify_artifact_chunks,
     CanonicalManifestArtifact, CanonicalManifestArtifacts,
     CanonicalPhysicalMutationBatch, CqlKeyspaceName,
     DecodedManifestArtifactPlan, InvalidCqlKeyspaceName,
+    FullPhysicalDeltaRecord,
     ManifestArtifactChunk, ManifestArtifactDescriptor, ManifestArtifactError,
     ManifestArtifactKind, PreparedReferencePlusSupplementRecord,
     ReplayPrototypeError, ReplayRecordKind,
@@ -988,6 +990,92 @@ impl VerifiedPersistedManifestArtifacts {
         self.durable_prepared_payload.as_deref()
     }
 
+    /// Strictly reconstructs the manifest's complete physical mutation batch
+    /// from durable artifact bytes, independent of replay-record strategy.
+    ///
+    /// In addition to replay decoding and mutation-digest verification, this
+    /// cross-checks every physical mutation key against the separately
+    /// persisted locator artifact.  A valid replay record paired with a
+    /// different locator inventory therefore cannot be treated as rollback
+    /// selection evidence.
+    pub(crate) fn decode_verified_physical_replay(
+        &self,
+    ) -> Result<CanonicalPhysicalMutationBatch, ManifestPreparedError> {
+        let batch = match self.plan.replay_record_kind() {
+            Some(ReplayRecordKind::FullPhysicalDelta) => {
+                if self.durable_prepared_payload().is_some() {
+                    return Err(
+                        ManifestPreparedError::UnexpectedDurablePreparedPayload,
+                    );
+                }
+                FullPhysicalDeltaRecord::decode_canonical(
+                    self.replay_record(),
+                )?
+                .batch()
+                .clone()
+            }
+            Some(ReplayRecordKind::PreparedReferencePlusSupplement) => {
+                self.decode_and_expand_compact_replay()?
+            }
+            None => {
+                if self.locator().is_some()
+                    || self.durable_prepared_payload().is_some()
+                {
+                    return Err(
+                        ManifestPreparedError::UnexpectedZeroMutationArtifact,
+                    );
+                }
+                FullPhysicalDeltaRecord::decode_canonical(
+                    self.replay_record(),
+                )?
+                .batch()
+                .clone()
+            }
+        };
+        if batch.digest().as_bytes() != self.plan.mutation_digest() {
+            return Err(ReplayPrototypeError::ManifestMutationDigestMismatch.into());
+        }
+
+        match &self.plan {
+            DecodedManifestArtifactPlan::Chunked { locator, .. } => {
+                let locator_bytes = self
+                    .locator()
+                    .ok_or(ManifestPreparedError::LocatorArtifactMissing)?;
+                let selected = decode_locator_artifact(
+                    locator_bytes,
+                    locator.item_count(),
+                )?;
+                if selected.len() != batch.mutations().len() {
+                    return Err(ManifestPreparedError::ReplayLocatorCountMismatch {
+                        replay: batch.mutations().len(),
+                        locator: selected.len(),
+                    });
+                }
+                for (index, (selected, mutation)) in selected
+                    .iter()
+                    .zip(batch.mutations())
+                    .enumerate()
+                {
+                    if selected.locator_bytes() != mutation.locator_bytes() {
+                        return Err(
+                            ManifestPreparedError::ReplayLocatorMismatch {
+                                index,
+                            },
+                        );
+                    }
+                }
+            }
+            DecodedManifestArtifactPlan::ZeroMutation { .. } => {
+                if !batch.mutations().is_empty() {
+                    return Err(ManifestPreparedError::ZeroMutationReplayNotEmpty(
+                        batch.mutations().len(),
+                    ));
+                }
+            }
+        }
+        Ok(batch)
+    }
+
     /// Rebuilds the executable compact batch solely from durable bytes loaded
     /// after restart. Both the compact record's internal commitment and the
     /// PREPARED manifest's mutation digest must match.
@@ -1619,6 +1707,7 @@ pub enum ManifestPreparedError {
     ManifestRecord(ManifestRecordError),
     ManifestLifecycle(ManifestLifecycleError),
     Artifact(ManifestArtifactError),
+    Replay(ReplayPrototypeError),
     IntentArtifactMismatch,
     VerifiedChunkReceiptMismatch,
     CheckpointBucketOutOfRange,
@@ -1628,6 +1717,12 @@ pub enum ManifestPreparedError {
     NegativeChunkCoordinate,
     InvalidChunkHashLength(usize),
     ExpectedArtifactHasNoChunks,
+    UnexpectedDurablePreparedPayload,
+    UnexpectedZeroMutationArtifact,
+    LocatorArtifactMissing,
+    ReplayLocatorCountMismatch { replay: usize, locator: usize },
+    ReplayLocatorMismatch { index: usize },
+    ZeroMutationReplayNotEmpty(usize),
     LifecycleRevisionOverflow,
     InvalidLifecycleTransition,
     UnexpectedLifecyclePhase {
@@ -1682,6 +1777,12 @@ impl From<ManifestArtifactError> for ManifestPreparedError {
     }
 }
 
+impl From<ReplayPrototypeError> for ManifestPreparedError {
+    fn from(value: ReplayPrototypeError) -> Self {
+        Self::Replay(value)
+    }
+}
+
 impl fmt::Display for ManifestPreparedError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{self:?}")
@@ -1689,3 +1790,204 @@ impl fmt::Display for ManifestPreparedError {
 }
 
 impl Error for ManifestPreparedError {}
+
+#[cfg(test)]
+mod durable_replay_decode_tests {
+    use psy_node_core::store::typed::{
+        CheckpointId, LogicalMutation, MerkleNode, MutationValue, NodeIndex,
+        TypedTableKey,
+    };
+
+    use super::*;
+    use crate::rollback::{
+        DerivedSupplementBatch, DurablePreparedPayloadReference,
+        OperationalReplayAction, PreparedPayload, PreparedPayloadKind,
+        PreparedPayloadSource, PreparedSemanticMutation, ReplayAuthority,
+        ReplayReceipt,
+    };
+
+    fn full_record(
+        checkpoint: CheckpointId,
+        leaf_value: u8,
+    ) -> FullPhysicalDeltaRecord {
+        let batch = CanonicalPhysicalMutationBatch::from_logical(vec![
+            LogicalMutation::Put {
+                key: TypedTableKey::CheckpointLeaf(checkpoint),
+                value: MutationValue::PsyCanonicalBytes(vec![leaf_value; 32]),
+            },
+            LogicalMutation::Put {
+                key: TypedTableKey::GlobalUserMerkle {
+                    checkpoint,
+                    node: MerkleNode::new(2, NodeIndex::new(9)),
+                },
+                value: MutationValue::PsyCanonicalBytes(vec![0x22; 32]),
+            },
+        ])
+        .unwrap();
+        FullPhysicalDeltaRecord::try_new(
+            batch,
+            ReplayReceipt::new(
+                ReplayAuthority::Coordinator,
+                checkpoint,
+                1,
+                1,
+                vec![OperationalReplayAction::RotatePendingCheckpointNamespace],
+            ),
+        )
+        .unwrap()
+    }
+
+    fn persisted(
+        artifacts: &CanonicalManifestArtifacts,
+    ) -> VerifiedPersistedManifestArtifacts {
+        let plan = decode_manifest_artifact_plan(
+            artifacts.canonical_summary(),
+            artifacts.commitment(),
+        )
+        .unwrap();
+        match artifacts.chunked() {
+            Some(set) => VerifiedPersistedManifestArtifacts {
+                plan,
+                locator: Some(
+                    set.locator().verify_and_reassemble().unwrap(),
+                ),
+                replay_record: set
+                    .replay_record()
+                    .verify_and_reassemble()
+                    .unwrap(),
+                durable_prepared_payload: set
+                    .durable_prepared_payload()
+                    .map(|artifact| artifact.verify_and_reassemble().unwrap()),
+            },
+            None => VerifiedPersistedManifestArtifacts {
+                replay_record: plan
+                    .zero_mutation_replay_record()
+                    .unwrap()
+                    .to_vec(),
+                plan,
+                locator: None,
+                durable_prepared_payload: None,
+            },
+        }
+    }
+
+    #[test]
+    fn durable_full_compact_and_zero_replay_share_one_strict_decode_boundary() {
+        let checkpoint = CheckpointId::try_new(17).unwrap();
+        let full = full_record(checkpoint, 0x11);
+        let full_artifacts = CanonicalManifestArtifacts::try_from_full(&full).unwrap();
+        assert_eq!(
+            persisted(&full_artifacts)
+                .decode_verified_physical_replay()
+                .unwrap(),
+            full.batch().clone()
+        );
+
+        let payload = PreparedPayload::try_v1(
+            PreparedPayloadKind::Coordinator,
+            vec![PreparedSemanticMutation::CheckpointLeaf {
+                checkpoint,
+                value: vec![0x11; 32],
+            }],
+        )
+        .unwrap();
+        let payload_bytes = payload.encode_canonical();
+        let reference = DurablePreparedPayloadReference::try_from_source(
+            PreparedPayloadKind::Coordinator,
+            1,
+            1,
+            PreparedPayloadSource::ContentAddressedBytes(&payload_bytes),
+        )
+        .unwrap();
+        let supplements = DerivedSupplementBatch::from_logical(vec![
+            LogicalMutation::Put {
+                key: TypedTableKey::GlobalUserMerkle {
+                    checkpoint,
+                    node: MerkleNode::new(2, NodeIndex::new(9)),
+                },
+                value: MutationValue::PsyCanonicalBytes(vec![0x22; 32]),
+            },
+        ])
+        .unwrap();
+        let compact = PreparedReferencePlusSupplementRecord::try_v1(
+            reference,
+            supplements,
+            full.receipt().clone(),
+            &payload_bytes,
+            full.batch(),
+        )
+        .unwrap();
+        let compact_artifacts = CanonicalManifestArtifacts::try_from_compact(
+            &compact,
+            &payload_bytes,
+        )
+        .unwrap();
+        assert_eq!(
+            persisted(&compact_artifacts)
+                .decode_verified_physical_replay()
+                .unwrap(),
+            full.batch().clone()
+        );
+
+        let zero = FullPhysicalDeltaRecord::try_new(
+            CanonicalPhysicalMutationBatch::try_new(Vec::new()).unwrap(),
+            ReplayReceipt::new(
+                ReplayAuthority::Coordinator,
+                checkpoint,
+                0,
+                0,
+                Vec::new(),
+            ),
+        )
+        .unwrap();
+        let zero_artifacts = CanonicalManifestArtifacts::try_from_full(&zero).unwrap();
+        assert!(persisted(&zero_artifacts)
+            .decode_verified_physical_replay()
+            .unwrap()
+            .mutations()
+            .is_empty());
+    }
+
+    #[test]
+    fn replay_and_independent_locator_inventory_must_select_the_same_keys() {
+        let checkpoint = CheckpointId::try_new(18).unwrap();
+        let winner = full_record(checkpoint, 0x11);
+        let winner_artifacts =
+            CanonicalManifestArtifacts::try_from_full(&winner).unwrap();
+        let mut persisted = persisted(&winner_artifacts);
+
+        let different = CanonicalPhysicalMutationBatch::from_logical(vec![
+            LogicalMutation::Put {
+                key: TypedTableKey::L2BlockState(checkpoint),
+                value: MutationValue::PsyCanonicalBytes(vec![0x33; 32]),
+            },
+            LogicalMutation::Put {
+                key: TypedTableKey::GlobalUserMerkle {
+                    checkpoint,
+                    node: MerkleNode::new(2, NodeIndex::new(9)),
+                },
+                value: MutationValue::PsyCanonicalBytes(vec![0x22; 32]),
+            },
+        ])
+        .unwrap();
+        let different_record = FullPhysicalDeltaRecord::try_new(
+            different,
+            winner.receipt().clone(),
+        )
+        .unwrap();
+        let different_artifacts =
+            CanonicalManifestArtifacts::try_from_full(&different_record).unwrap();
+        persisted.locator = Some(
+            different_artifacts
+                .chunked()
+                .unwrap()
+                .locator()
+                .verify_and_reassemble()
+                .unwrap(),
+        );
+        assert!(matches!(
+            persisted.decode_verified_physical_replay(),
+            Err(ManifestPreparedError::ReplayLocatorMismatch { .. })
+        ));
+    }
+}

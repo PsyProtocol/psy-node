@@ -690,6 +690,43 @@ impl FullPhysicalDeltaRecord {
         put_bytes(&mut out, self.batch.encode_canonical());
         out
     }
+
+    /// Strictly reconstructs a durable full replay record.
+    ///
+    /// The persisted receipt is revalidated against the decoded physical
+    /// batch, including mutation count and IMT cursor invariants.  Re-encoding
+    /// must reproduce every input byte so callers cannot smuggle alternate
+    /// encodings behind an otherwise valid batch digest.
+    pub fn decode_canonical(bytes: &[u8]) -> Result<Self, ReplayPrototypeError> {
+        let mut cursor = Cursor::new(bytes);
+        if cursor.take(4)? != FULL_MAGIC {
+            return Err(ReplayPrototypeError::InvalidCanonicalPayload(
+                "bad full replay magic",
+            ));
+        }
+        if cursor.u16()? != REPLAY_SCHEMA_VERSION {
+            return Err(ReplayPrototypeError::UnknownReplaySchemaVersion);
+        }
+        if ReplayRecordKind::try_from(cursor.u8()?)?
+            != ReplayRecordKind::FullPhysicalDelta
+        {
+            return Err(ReplayPrototypeError::UnexpectedReplayRecordKind);
+        }
+        let receipt = ReplayReceipt::decode_from(&mut cursor)?;
+        let batch = CanonicalPhysicalMutationBatch::decode_canonical(
+            cursor.bytes()?,
+        )?;
+        if !cursor.is_empty() {
+            return Err(ReplayPrototypeError::InvalidCanonicalPayload(
+                "trailing full replay bytes",
+            ));
+        }
+        let decoded = Self::try_new(batch, receipt)?;
+        if decoded.encode_canonical() != bytes {
+            return Err(ReplayPrototypeError::NonCanonicalFullReplayRecord);
+        }
+        Ok(decoded)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -979,6 +1016,7 @@ pub enum ReplayPrototypeError {
     NonCanonicalPreparedOrdering,
     NonCanonicalOperationalActions,
     NonCanonicalPhysicalMutationBatch,
+    NonCanonicalFullReplayRecord,
     NonCanonicalCompactReplayRecord,
     CompactReplayArtifactsRequired,
     DurablePreparedPayloadMissing,

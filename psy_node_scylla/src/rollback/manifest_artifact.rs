@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use super::{
     CanonicalPhysicalMutationBatch, FullPhysicalDeltaRecord,
     PreparedReferencePlusSupplementRecord, ReplayPrototypeError,
-    ReplayRecordKind,
+    ReplayRecordKind, ResolvedScyllaKey, decode_locator_canonical,
 };
 
 pub const MANIFEST_ARTIFACT_ENCODING_VERSION: u16 = 1;
@@ -1084,10 +1084,10 @@ fn encode_locator_artifact(
     Ok(out)
 }
 
-fn decode_locator_artifact(
+pub(super) fn decode_locator_artifact(
     bytes: &[u8],
     expected_rows: u64,
-) -> Result<(), ManifestArtifactError> {
+) -> Result<Vec<ResolvedScyllaKey>, ManifestArtifactError> {
     if bytes.len() < 10 || &bytes[..4] != LOCATOR_MAGIC {
         return Err(ManifestArtifactError::InvalidLocatorEncoding);
     }
@@ -1104,6 +1104,7 @@ fn decode_locator_artifact(
     }
     let mut offset = 10usize;
     let mut previous: Option<&[u8]> = None;
+    let mut resolved = Vec::with_capacity(count as usize);
     for _ in 0..count {
         if offset + 4 > bytes.len() {
             return Err(ManifestArtifactError::InvalidLocatorEncoding);
@@ -1119,13 +1120,17 @@ fn decode_locator_artifact(
         if previous.is_some_and(|value| value >= locator) {
             return Err(ManifestArtifactError::NonCanonicalLocatorOrdering);
         }
+        resolved.push(
+            decode_locator_canonical(locator)
+                .map_err(ManifestArtifactError::InvalidTypedLocator)?,
+        );
         previous = Some(locator);
         offset += length;
     }
     if offset != bytes.len() {
         return Err(ManifestArtifactError::InvalidLocatorEncoding);
     }
-    Ok(())
+    Ok(resolved)
 }
 
 fn encode_artifact_set_summary(
@@ -1174,6 +1179,7 @@ pub enum ManifestArtifactError {
     ArtifactPayloadDigestMismatch,
     ChunkSetDigestMismatch,
     InvalidLocatorEncoding,
+    InvalidTypedLocator(&'static str),
     LocatorCountMismatch { expected: u64, actual: u64 },
     NonCanonicalLocatorOrdering,
     ArtifactSummaryMismatch,
@@ -1257,6 +1263,35 @@ mod tests {
         assert_eq!(first.commitment().affected_row_count(), 2);
         assert!(first.durable_prepared_payload().is_none());
         first.verify_integrity().unwrap();
+    }
+
+    #[test]
+    fn full_replay_record_round_trips_and_rejects_receipt_or_trailing_tamper() {
+        let record = full_record();
+        let encoded = record.encode_canonical();
+        assert_eq!(
+            FullPhysicalDeltaRecord::decode_canonical(&encoded).unwrap(),
+            record
+        );
+
+        let mut wrong_count = encoded.clone();
+        wrong_count[16..20].copy_from_slice(&2_u32.to_be_bytes());
+        assert_eq!(
+            FullPhysicalDeltaRecord::decode_canonical(&wrong_count),
+            Err(ReplayPrototypeError::ReceiptMutationCountMismatch {
+                receipt: 3,
+                actual: 2,
+            })
+        );
+
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert_eq!(
+            FullPhysicalDeltaRecord::decode_canonical(&trailing),
+            Err(ReplayPrototypeError::InvalidCanonicalPayload(
+                "trailing full replay bytes"
+            ))
+        );
     }
 
     #[test]
