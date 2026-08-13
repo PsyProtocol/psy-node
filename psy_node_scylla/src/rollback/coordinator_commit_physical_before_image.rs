@@ -181,9 +181,10 @@ impl TryFrom<u8> for CoordinatorCommitPhysicalCellKind {
     }
 }
 
-/// Raw CQL cell bytes and the exact cell writetime observed before PONR.
-/// `bytes` are physical storage bytes (for example compressed BLOB bytes), not
-/// a decompressed semantic projection.
+/// Canonical bytes for the exact CQL cell value and the cell writetime observed
+/// before PONR. BLOB values remain byte-for-byte unchanged (including existing
+/// compression); BIGINT and UUID values use fixed-width canonical bytes so the
+/// restore adapter can reconstruct the same typed CQL value.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CoordinatorCommitPhysicalSourceCell {
     kind: CoordinatorCommitPhysicalCellKind,
@@ -404,6 +405,10 @@ impl<Hash: Q256BitHash> CoordinatorCommitPhysicalBeforeImage<Hash> {
 
     pub(crate) fn canonical_bytes(&self) -> &[u8] {
         &self.canonical_bytes
+    }
+
+    pub(crate) const fn catalog_digest(&self) -> &[u8; 32] {
+        &self.catalog_digest
     }
 
     pub(crate) const fn slot(&self) -> &[u8; 32] {
