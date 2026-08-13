@@ -99,6 +99,7 @@ psy_node_scylla/src/rollback/realm_user_update_ingress.rs|DurableControlAuthorit
 psy_node_scylla/src/rollback/realm_user_update_router.rs|DurableControlAuthority|4|0|0|0|0|0|0|0
 psy_node_scylla/src/rollback/reward_tag_tree.rs|RollbackPrototypeAdapter|5|0|0|4|1|2|0|2
 psy_node_scylla/src/rollback/rollback_admission.rs|DurableControlAuthority|6|0|3|6|2|3|1|6
+psy_node_scylla/src/rollback/rollback_global_archive_barrier.rs|DurableControlAuthority|7|0|5|6|2|3|0|3
 psy_node_scylla/src/rollback/rollback_participant_plan_store.rs|DurableControlAuthority|6|0|5|10|2|5|2|9
 psy_node_scylla/src/rollback/timestamp_prototype.rs|RollbackPrototypeAdapter|14|0|0|12|1|10|0|10
 psy_node_scylla/src/table_creator.rs|DriverCore|2|0|0|0|0|0|1|0

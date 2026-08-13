@@ -96,6 +96,7 @@ mod coordinator_commit_physical_archive_store;
 mod coordinator_rollback_maintenance;
 pub(crate) use coordinator_rollback_maintenance::prepare_coordinator_rollback_archive;
 mod coordinator_commit_delete_restore_plan;
+mod rollback_global_archive_barrier;
 mod rollback_participant_plan_store;
 pub(crate) use rollback_participant_plan_store::ScyllaRollbackParticipantPlanStore;
 pub(crate) use coordinator_commit_source_store::ScyllaCoordinatorCommitSourceStore;

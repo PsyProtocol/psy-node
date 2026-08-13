@@ -190,6 +190,15 @@ impl<Hash> CoordinatorCommitPhysicalParticipantArchiveReceipt<Hash> {
     pub(crate) const fn dataset_digest(&self) -> &[u8; 32] {
         &self.dataset_digest
     }
+
+    pub(crate) const fn catalog_digest(&self) -> &[u8; 32] {
+        &self.catalog_digest
+    }
+
+    pub(crate) const fn archive_store_fingerprint(&self) -> &[u8; 32] {
+        &self.archive_store_fingerprint
+    }
+
 }
 
 /// Canonical append-only completion for one exact Coordinator participant.
@@ -542,6 +551,22 @@ impl<Hash: Q256BitHash> CoordinatorCommitPreBarrierReadinessReceipt<Hash> {
 
     pub(crate) const fn dataset_digest(&self) -> &[u8; 32] {
         &self.dataset_digest
+    }
+
+    pub(crate) const fn catalog_digest(&self) -> &[u8; 32] {
+        &self.catalog_digest
+    }
+
+    pub(crate) const fn archive_store_fingerprint(&self) -> &[u8; 32] {
+        &self.archive_store_fingerprint
+    }
+
+    pub(crate) const fn participant_completion_slot(&self) -> &[u8; 32] {
+        &self.participant_completion_slot
+    }
+
+    pub(crate) const fn participant_completion_digest(&self) -> &[u8; 32] {
+        &self.participant_completion_digest
     }
 
     pub(crate) const fn target_restore_slot(&self) -> &[u8; 32] {
