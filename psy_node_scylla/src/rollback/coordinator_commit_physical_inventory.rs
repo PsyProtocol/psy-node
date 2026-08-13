@@ -859,7 +859,7 @@ fn validate_canonical_entries(
     Ok(())
 }
 
-fn action_for_key(key: &TypedTableKey) -> CoordinatorCommitInventoryAction {
+pub(super) fn action_for_key(key: &TypedTableKey) -> CoordinatorCommitInventoryAction {
     match key {
         TypedTableKey::LatestInfo(LatestInfoSlot::LatestL2BlockState)
         | TypedTableKey::U64Singleton(U64SingletonSlot::LatestCheckpoint) => {

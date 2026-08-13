@@ -40,6 +40,11 @@ use uuid::Uuid;
 use crate::utils::{u64_to_i64_exact, u8_to_i8_exact};
 
 use super::{
+    coordinator_commit_delete_restore_plan::{
+        CoordinatorCommitDeleteRestoreEntry,
+        CoordinatorCommitDeleteRestorePlan,
+        CoordinatorCommitDeleteRestorePlanError,
+    },
     coordinator_commit_target_restore::{
         CoordinatorCommitTargetRestoreError,
         CoordinatorCommitTargetRestorePayload,
@@ -152,6 +157,16 @@ impl<Hash: Q256BitHash> CoordinatorCommitPhysicalArchiveScope<Hash> {
                 *request.requested_head(),
             ),
         })
+    }
+
+    fn fence_window(
+        &self,
+    ) -> Result<psy_node_core::store::timestamp::TimestampFenceWindow, CoordinatorCommitPhysicalArchiveOwnerError>
+    {
+        match self.archiving_head.rollback_control() {
+            RollbackControlState::Archiving(request) => Ok(request.fence_window()),
+            _ => Err(CoordinatorCommitPhysicalArchiveOwnerError::NotExactArchivingHead),
+        }
     }
 }
 
@@ -525,8 +540,33 @@ impl<Hash: Q256BitHash> CoordinatorCommitPreBarrierReadinessReceipt<Hash> {
         &self.target_restore_slot
     }
 
+    pub(crate) const fn target_restore_digest(&self) -> &[u8; 32] {
+        &self.target_restore_digest
+    }
+
     pub(crate) const fn digest(&self) -> &[u8; 32] {
         &self.digest
+    }
+
+    fn validate_selected(
+        &self,
+        scope: &CoordinatorCommitPhysicalArchiveScope<Hash>,
+        catalog: &CoordinatorCommitPhysicalCatalog<Hash>,
+        archive_store_fingerprint: &[u8; 32],
+    ) -> Result<(), CoordinatorCommitPhysicalArchiveOwnerError> {
+        let entry_count = u64::try_from(catalog.entries().len())
+            .map_err(|_| CoordinatorCommitPhysicalArchiveOwnerError::LengthOverflow)?;
+        if self.archiving_head != scope.archiving_head
+            || self.target != scope.target
+            || self.catalog_digest != *catalog.digest()
+            || self.entry_count != entry_count
+            || self.archive_store_fingerprint != *archive_store_fingerprint
+        {
+            return Err(
+                CoordinatorCommitPhysicalArchiveOwnerError::PreBarrierBindingMismatch,
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1150,6 +1190,64 @@ impl ScyllaCoordinatorCommitPhysicalArchiveOwner {
         Ok(())
     }
 
+    /// Build a canonical, non-executable description of the future
+    /// destructive work. Every entry is reselected from the immutable archive
+    /// and its current hot source before the readiness receipt is revalidated.
+    /// This method neither advances the archive barrier nor issues a write.
+    pub(crate) async fn plan_delete_restore_execution<F, Hash, Hasher>(
+        &mut self,
+        network: NetworkId,
+    ) -> Result<CoordinatorCommitDeleteRestorePlan<Hash>, CoordinatorCommitPhysicalArchiveOwnerError>
+    where
+        F: QFelt64,
+        Hash: Q256BitHash + QFHashBase<F>,
+        Hasher: MerkleHasher<Hash> + FieldQHasher<F, Hash>,
+    {
+        let readiness = self
+            .recover_pre_barrier_readiness::<F, Hash, Hasher>(network)
+            .await?;
+        let scope = self.read_scope::<Hash>(network).await?;
+        let catalog = self.scan_catalog::<F, Hash, Hasher>(&scope).await?;
+        let store = ScyllaCoordinatorCommitPhysicalArchiveStore::prepare_for_catalog(
+            self.session.clone(),
+            self.archive_keyspace.clone(),
+            self.source_keyspace.clone(),
+            &catalog,
+        )
+        .await?;
+        readiness.validate_selected(&scope, &catalog, &store.fingerprint)?;
+
+        let mut entries = Vec::with_capacity(catalog.entries().len());
+        for index in 0..catalog.entries().len() {
+            let before_image = store
+                .revalidate_catalog_entry_before_image(&catalog, index)
+                .await?;
+            entries.push(CoordinatorCommitDeleteRestoreEntry::try_from_before_image(
+                &before_image,
+            )?);
+        }
+        self.require_catalog_and_head_unchanged::<F, Hash, Hasher>(
+            &scope,
+            &catalog,
+        )
+        .await?;
+        self.revalidate_pre_barrier_readiness::<F, Hash, Hasher>(network, &readiness)
+            .await?;
+
+        CoordinatorCommitDeleteRestorePlan::try_from_selected(
+            scope.archiving_head,
+            scope.target,
+            scope.old_head,
+            *catalog.digest(),
+            *readiness.digest(),
+            *readiness.target_restore_slot(),
+            *readiness.target_restore_digest(),
+            scope.fence_window()?,
+            entries,
+        )
+        .map_err(Into::into)
+    }
+
     async fn read_pre_barrier_readiness_once<F, Hash, Hasher>(
         &mut self,
         network: NetworkId,
@@ -1585,11 +1683,11 @@ impl ScyllaCoordinatorCommitPhysicalArchiveStore {
         Ok(())
     }
 
-    async fn revalidate_catalog_entry<Hash: Q256BitHash>(
+    async fn revalidate_catalog_entry_before_image<Hash: Q256BitHash>(
         &self,
         catalog: &CoordinatorCommitPhysicalCatalog<Hash>,
         entry_index: usize,
-    ) -> Result<CoordinatorCommitPhysicalArchivedRow, CoordinatorCommitPhysicalArchiveStoreError>
+    ) -> Result<CoordinatorCommitPhysicalBeforeImage<Hash>, CoordinatorCommitPhysicalArchiveStoreError>
     {
         self.require_catalog(catalog)?;
         let entry = catalog.entries().get(entry_index).ok_or(
@@ -1602,15 +1700,25 @@ impl ScyllaCoordinatorCommitPhysicalArchiveStore {
             source,
         )?;
         match self.read_archive_exact(catalog, &expected).await? {
-            Some(current) if current == expected => {
-                Ok(CoordinatorCommitPhysicalArchivedRow {
-                    slot: *current.slot(),
-                    digest: *current.digest(),
-                })
-            }
+            Some(current) if current == expected => Ok(current),
             Some(_) => Err(CoordinatorCommitPhysicalArchiveStoreError::Conflict),
             None => Err(CoordinatorCommitPhysicalArchiveStoreError::MissingAfterPersist),
         }
+    }
+
+    async fn revalidate_catalog_entry<Hash: Q256BitHash>(
+        &self,
+        catalog: &CoordinatorCommitPhysicalCatalog<Hash>,
+        entry_index: usize,
+    ) -> Result<CoordinatorCommitPhysicalArchivedRow, CoordinatorCommitPhysicalArchiveStoreError>
+    {
+        let current = self
+            .revalidate_catalog_entry_before_image(catalog, entry_index)
+            .await?;
+        Ok(CoordinatorCommitPhysicalArchivedRow {
+            slot: *current.slot(),
+            digest: *current.digest(),
+        })
     }
 
     async fn persist_participant_completion_exact<Hash: Q256BitHash>(
@@ -2862,6 +2970,7 @@ pub(crate) enum CoordinatorCommitPhysicalArchiveOwnerError {
     TargetMarkerMissing,
     TargetSourceChanged,
     TargetL2ValueMissing,
+    DeleteRestorePlan(CoordinatorCommitDeleteRestorePlanError),
     TargetCheckpointOutOfRange,
     TargetBelowFloor,
     NonGenesisFloorTargetUnanchored,
@@ -2907,6 +3016,14 @@ impl From<CoordinatorCommitTargetRestoreError>
 {
     fn from(error: CoordinatorCommitTargetRestoreError) -> Self {
         Self::TargetRestore(error)
+    }
+}
+
+impl From<CoordinatorCommitDeleteRestorePlanError>
+    for CoordinatorCommitPhysicalArchiveOwnerError
+{
+    fn from(error: CoordinatorCommitDeleteRestorePlanError) -> Self {
+        Self::DeleteRestorePlan(error)
     }
 }
 
@@ -3430,6 +3547,31 @@ mod tests {
         ));
         for forbidden in [
             "advance_archive_barrier(",
+            "delete_hot_suffix(",
+            "restore_target_singletons(",
+            "publish_target_head(",
+        ] {
+            assert!(!production.contains(forbidden), "forbidden {forbidden}");
+        }
+    }
+
+    #[test]
+    fn delete_restore_plan_is_storage_selected_and_remains_non_destructive() {
+        let source = include_str!("coordinator_commit_physical_archive_store.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        for required in [
+            "plan_delete_restore_execution",
+            "recover_pre_barrier_readiness",
+            "revalidate_catalog_entry_before_image",
+            "CoordinatorCommitDeleteRestoreEntry::try_from_before_image",
+            "revalidate_pre_barrier_readiness",
+            "CoordinatorCommitDeleteRestorePlan::try_from_selected",
+        ] {
+            assert!(production.contains(required), "missing {required}");
+        }
+        for forbidden in [
+            "advance_archive_barrier(",
+            "execute_delete_restore_plan(",
             "delete_hot_suffix(",
             "restore_target_singletons(",
             "publish_target_head(",

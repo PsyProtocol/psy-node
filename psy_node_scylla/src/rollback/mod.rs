@@ -93,6 +93,7 @@ mod coordinator_commit_physical_inventory;
 mod coordinator_commit_physical_before_image;
 mod coordinator_commit_target_restore;
 mod coordinator_commit_physical_archive_store;
+mod coordinator_commit_delete_restore_plan;
 pub(crate) use coordinator_commit_source_store::ScyllaCoordinatorCommitSourceStore;
 #[cfg(all(test, feature = "rf3-test-support"))]
 #[path = "../../tests/rf3/d04b6h23c4c4b2b_terminal_carryover.rs"]
@@ -217,6 +218,7 @@ pub use checkpoint_root_pair::*;
 pub use coordinator_commit_physical_inventory::*;
 pub(crate) use coordinator_commit_physical_before_image::*;
 pub(crate) use coordinator_commit_physical_archive_store::*;
+pub(crate) use coordinator_commit_delete_restore_plan::*;
 pub use public_key_projection::*;
 pub use realm_imt_predecessor::*;
 pub use realm_normal_commit_coverage::*;
