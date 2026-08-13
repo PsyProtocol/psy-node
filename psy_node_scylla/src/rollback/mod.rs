@@ -98,6 +98,7 @@ pub(crate) use coordinator_rollback_maintenance::prepare_coordinator_rollback_ar
 mod coordinator_commit_delete_restore_plan;
 mod coordinator_commit_delete_restore_plan_store;
 mod coordinator_commit_delete_restore_executor;
+mod coordinator_rollback_delete_completion_store;
 mod rollback_global_archive_barrier;
 mod rollback_participant_plan_store;
 pub(crate) use rollback_participant_plan_store::ScyllaRollbackParticipantPlanStore;

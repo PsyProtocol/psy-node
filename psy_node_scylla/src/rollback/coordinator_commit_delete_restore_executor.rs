@@ -13,6 +13,7 @@
 use std::{collections::BTreeMap, error::Error, fmt, sync::Arc};
 
 use parth_core::protocol::core_types::Q256BitHash;
+use psy_data::protocol::canonical_chain::CanonicalChainRef;
 use psy_node_core::store::{
     canonical_head::{CanonicalHeadReadState, StoredCanonicalHead},
     typed::{LatestInfoSlot, TypedTableKey, U64SingletonSlot},
@@ -39,6 +40,11 @@ use super::{
     },
     coordinator_commit_target_restore::{
         CoordinatorCommitTargetRestoreError, CoordinatorCommitTargetRestorePayload,
+    },
+    coordinator_rollback_delete_completion_store::{
+        CoordinatorRollbackDeleteCompletionStoreError,
+        PersistedCoordinatorRollbackDeleteCompletion,
+        ScyllaCoordinatorRollbackDeleteCompletionStore,
     },
     physical_descriptor, CqlKeyspaceName,
     ResolvedScyllaKey, ScyllaCanonicalHeadStore, ScyllaPhysicalTableId,
@@ -75,7 +81,11 @@ struct CoordinatorCommitDeleteRestoreAdapter {
 #[derive(Debug)]
 pub(super) struct ExecutedCoordinatorRollbackSuffix<Hash> {
     deleting_head: StoredCanonicalHead<Hash>,
+    target: CanonicalChainRef<Hash>,
+    participant_plan_digest: [u8; 32],
     barrier_digest: [u8; 32],
+    delete_plan_store_fingerprint: [u8; 32],
+    delete_plan_slot: [u8; 32],
     delete_plan_digest: [u8; 32],
     target_restore_digest: [u8; 32],
     post_state_digest: [u8; 32],
@@ -88,8 +98,24 @@ impl<Hash> ExecutedCoordinatorRollbackSuffix<Hash> {
         &self.deleting_head
     }
 
+    pub(super) const fn target(&self) -> &CanonicalChainRef<Hash> {
+        &self.target
+    }
+
+    pub(super) const fn participant_plan_digest(&self) -> &[u8; 32] {
+        &self.participant_plan_digest
+    }
+
     pub(super) const fn barrier_digest(&self) -> &[u8; 32] {
         &self.barrier_digest
+    }
+
+    pub(super) const fn delete_plan_store_fingerprint(&self) -> &[u8; 32] {
+        &self.delete_plan_store_fingerprint
+    }
+
+    pub(super) const fn delete_plan_slot(&self) -> &[u8; 32] {
+        &self.delete_plan_slot
     }
 
     pub(super) const fn delete_plan_digest(&self) -> &[u8; 32] {
@@ -135,9 +161,47 @@ impl ScyllaCoordinatorCommitDeleteRestoreExecutor {
         }
     }
 
-    pub(super) async fn execute<Hash: Q256BitHash>(
+    /// Execute or recover the exact physical mutation set, persist its
+    /// immutable participant completion, then execute the same fixed-timestamp
+    /// plan once more as an exact post-persist fence.  No head publication is
+    /// available from this method.
+    pub(super) async fn execute_and_persist<Hash: Q256BitHash>(
         &self,
         authority: DeletingRollbackGlobalArchiveBarrier<Hash>,
+    ) -> Result<
+        PersistedCoordinatorRollbackDeleteCompletion<Hash>,
+        CoordinatorCommitDeleteRestoreExecutorError,
+    > {
+        let first = self.execute(&authority).await?;
+        let store = ScyllaCoordinatorRollbackDeleteCompletionStore::prepare(
+            self.session.clone(),
+            &self.archive_keyspace,
+        )
+        .await?;
+        let receipt = store.persist_or_recover(&first).await?;
+        let second = self.execute(&authority).await?;
+        if first.deleting_head != second.deleting_head
+            || first.target != second.target
+            || first.participant_plan_digest != second.participant_plan_digest
+            || first.barrier_digest != second.barrier_digest
+            || first.delete_plan_store_fingerprint
+                != second.delete_plan_store_fingerprint
+            || first.delete_plan_slot != second.delete_plan_slot
+            || first.delete_plan_digest != second.delete_plan_digest
+            || first.target_restore_digest != second.target_restore_digest
+            || first.post_state_digest != second.post_state_digest
+            || first.physical_delete_count != second.physical_delete_count
+            || first.restored_singleton_count != second.restored_singleton_count
+        {
+            return Err(CoordinatorCommitDeleteRestoreExecutorError::PostStateChanged);
+        }
+        store.revalidate(&receipt).await?;
+        Ok(receipt)
+    }
+
+    pub(super) async fn execute<Hash: Q256BitHash>(
+        &self,
+        authority: &DeletingRollbackGlobalArchiveBarrier<Hash>,
     ) -> Result<ExecutedCoordinatorRollbackSuffix<Hash>, CoordinatorCommitDeleteRestoreExecutorError>
     {
         let barrier = authority.barrier();
@@ -259,7 +323,11 @@ impl ScyllaCoordinatorCommitDeleteRestoreExecutor {
             .map_err(|_| CoordinatorCommitDeleteRestoreExecutorError::LengthOverflow)?;
         Ok(ExecutedCoordinatorRollbackSuffix {
             deleting_head,
+            target: *barrier.target(),
+            participant_plan_digest: *barrier.participant_plan_digest(),
             barrier_digest: *barrier.digest(),
+            delete_plan_store_fingerprint: *plan_receipt.store_fingerprint(),
+            delete_plan_slot: *plan_receipt.slot(),
             delete_plan_digest: *plan.digest(),
             target_restore_digest: *target_restore.digest(),
             post_state_digest: post_state_digest(
@@ -780,6 +848,7 @@ pub(super) enum CoordinatorCommitDeleteRestoreExecutorError {
     BindingMismatch,
     TargetRestoreMismatch,
     TargetRestoreChanged,
+    PostStateChanged,
     RestoreSetMismatch,
     PostStateMismatch,
     MissingPreparedMutation,
@@ -796,6 +865,7 @@ pub(super) enum CoordinatorCommitDeleteRestoreExecutorError {
     Archive(CoordinatorCommitPhysicalArchiveStoreError),
     TargetRestore(CoordinatorCommitTargetRestoreError),
     BeforeImage(super::CoordinatorCommitPhysicalBeforeImageError),
+    Completion(CoordinatorRollbackDeleteCompletionStoreError),
 }
 
 impl From<CoordinatorCommitDeleteRestorePlanStoreError>
@@ -827,6 +897,14 @@ impl From<super::CoordinatorCommitPhysicalBeforeImageError>
 {
     fn from(value: super::CoordinatorCommitPhysicalBeforeImageError) -> Self {
         Self::BeforeImage(value)
+    }
+}
+
+impl From<CoordinatorRollbackDeleteCompletionStoreError>
+    for CoordinatorCommitDeleteRestoreExecutorError
+{
+    fn from(value: CoordinatorRollbackDeleteCompletionStoreError) -> Self {
+        Self::Completion(value)
     }
 }
 
