@@ -1,10 +1,11 @@
 //! Exact hot-row reader and immutable archive adapter for a floor-bound
 //! Coordinator physical catalog.
 //!
-//! This remains pre-PONR. It can copy one selected before-image and prove
-//! source/archive readback, but its private receipt is not a participant
-//! completion receipt and cannot authorize a barrier, delete, restore, or
-//! canonical-head mutation.
+//! This remains pre-PONR. The row adapter can copy one selected before-image;
+//! the affine owner composes the complete storage-selected catalog and returns
+//! an in-memory participant receipt only after exact source/archive readback
+//! and canonical-head/catalog fencing. Neither receipt is durable barrier
+//! authority, and this module cannot delete, restore, or mutate the head.
 
 #![allow(dead_code)]
 
@@ -12,9 +13,18 @@ use std::{
     collections::BTreeMap, error::Error, fmt, sync::Arc,
 };
 
-use parth_core::protocol::core_types::Q256BitHash;
-use psy_node_core::store::typed::{
-    CheckpointedObjectKey, TypedTableKey,
+use parth_core::{
+    crypto::hash::traits::{FieldQHasher, MerkleHasher},
+    felt::QFelt64,
+    protocol::core_types::{Q256BitHash, QFHashBase},
+};
+use psy_data::protocol::canonical_chain::{
+    CanonicalChainRef, ChainEpoch, NetworkId,
+};
+use psy_node_core::store::{
+    canonical_head::{CanonicalHeadReadState, StoredCanonicalHead},
+    rollback_control::{RollbackControlState, RollbackExecutionMode},
+    typed::{CheckpointedObjectKey, TypedTableKey},
 };
 use scylla::{
     client::session::Session,
@@ -31,11 +41,14 @@ use crate::utils::{u64_to_i64_exact, u8_to_i8_exact};
 
 use super::{
     coordinator_rollback_archive_store::COORDINATOR_ROLLBACK_SUFFIX_ARCHIVE_TABLE,
+    CanonicalHeadPrototypeError,
     CoordinatorCommitPhysicalBeforeImage,
     CoordinatorCommitPhysicalBeforeImageError, CoordinatorCommitPhysicalCatalog,
     CoordinatorCommitPhysicalReadSpec, CoordinatorCommitPhysicalSourceCell,
     CoordinatorCommitPhysicalSourceObservation, CqlKeyspaceName,
-    ResolvedScyllaKey, ScyllaPhysicalTableId, ScyllaSchemaFamily,
+    ResolvedScyllaKey, ScyllaCanonicalHeadStore,
+    ScyllaCoordinatorCommitSourceStore, ScyllaPhysicalTableId,
+    ScyllaSchemaFamily,
 };
 
 const ARCHIVE_REVISION: i64 = 1;
@@ -45,11 +58,334 @@ const STORE_FINGERPRINT_DOMAIN: &[u8] =
     b"psy.rollback.coordinator-commit-physical-archive-store.v1\0";
 const FRAGMENT_DIGEST_DOMAIN: &[u8] =
     b"psy.rollback.coordinator-commit-physical-before-image-fragment.v1\0";
+const PARTICIPANT_DATASET_DIGEST_DOMAIN: &[u8] =
+    b"psy.rollback.coordinator-commit-physical-archive-participant.v1\0";
 
 const CREATE_TEMPLATE: &str = "CREATE TABLE IF NOT EXISTS {table} (network_chain_id bigint, chain_epoch bigint, participant_plan_digest blob, key_domain smallint, row_slot blob, fragment_index int, revision bigint, fragment_count int, row_bytes bigint, fragment_payload blob, fragment_digest blob, row_digest blob, PRIMARY KEY ((network_chain_id, chain_epoch, participant_plan_digest, key_domain, row_slot), fragment_index)) WITH CLUSTERING ORDER BY (fragment_index ASC)";
 const INSERT_TEMPLATE: &str = "INSERT INTO {table} (network_chain_id, chain_epoch, participant_plan_digest, key_domain, row_slot, fragment_index, revision, fragment_count, row_bytes, fragment_payload, fragment_digest, row_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS";
 const READ_ROW_TEMPLATE: &str = "SELECT fragment_index, revision, fragment_count, row_bytes, fragment_payload, fragment_digest, row_digest FROM {table} WHERE network_chain_id = ? AND chain_epoch = ? AND participant_plan_digest = ? AND key_domain = ? AND row_slot = ?";
 const READ_FRAGMENT_TEMPLATE: &str = "SELECT revision, fragment_count, row_bytes, fragment_payload, fragment_digest, row_digest FROM {table} WHERE network_chain_id = ? AND chain_epoch = ? AND participant_plan_digest = ? AND key_domain = ? AND row_slot = ? AND fragment_index = ?";
+
+/// Storage-selected scope for the discarded old epoch. The active canonical
+/// head is already in the next epoch, while every catalog row belongs to the
+/// immediately preceding epoch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CoordinatorCommitPhysicalArchiveScope<Hash> {
+    archiving_head: StoredCanonicalHead<Hash>,
+    target: CanonicalChainRef<Hash>,
+    old_head: CanonicalChainRef<Hash>,
+}
+
+/// Small, non-authoritative commitment fed directly into the participant
+/// dataset hash. The full before-image is dropped after each row and
+/// reconstructed from storage during the second pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CoordinatorCommitPhysicalArchivedRow {
+    slot: [u8; 32],
+    digest: [u8; 32],
+}
+
+impl<Hash: Q256BitHash>
+    From<&PersistedCoordinatorCommitPhysicalBeforeImage<Hash>>
+    for CoordinatorCommitPhysicalArchivedRow
+{
+    fn from(receipt: &PersistedCoordinatorCommitPhysicalBeforeImage<Hash>) -> Self {
+        Self {
+            slot: *receipt.slot(),
+            digest: *receipt.digest(),
+        }
+    }
+}
+
+impl<Hash: Q256BitHash> CoordinatorCommitPhysicalArchiveScope<Hash> {
+    fn try_from_head(
+        head: StoredCanonicalHead<Hash>,
+    ) -> Result<Self, CoordinatorCommitPhysicalArchiveOwnerError> {
+        let request = match head.rollback_control() {
+            RollbackControlState::Archiving(request) => *request,
+            _ => {
+                return Err(
+                    CoordinatorCommitPhysicalArchiveOwnerError::NotExactArchivingHead,
+                );
+            }
+        };
+        if request.execution_mode() != RollbackExecutionMode::InPlace
+            || head.canonical_ref().checkpoint() != request.requested_head()
+        {
+            return Err(
+                CoordinatorCommitPhysicalArchiveOwnerError::NotExactArchivingHead,
+            );
+        }
+        let active_epoch = head.canonical_ref().chain_epoch().get();
+        let old_epoch = active_epoch
+            .checked_sub(1)
+            .ok_or(CoordinatorCommitPhysicalArchiveOwnerError::EpochUnderflow)?;
+        let network = head.canonical_ref().network_id();
+        Ok(Self {
+            archiving_head: head,
+            target: CanonicalChainRef::new(
+                network,
+                ChainEpoch::new(old_epoch),
+                *request.target(),
+            ),
+            old_head: CanonicalChainRef::new(
+                network,
+                ChainEpoch::new(old_epoch),
+                *request.requested_head(),
+            ),
+        })
+    }
+}
+
+/// Non-clone, storage-private proof that every row in one exact Coordinator
+/// catalog was archived and revalidated while the control head stayed at the
+/// same ARCHIVING payload. This remains pre-barrier and grants no deletion.
+#[derive(Debug)]
+pub(crate) struct CoordinatorCommitPhysicalParticipantArchiveReceipt<Hash> {
+    archiving_head: StoredCanonicalHead<Hash>,
+    catalog_digest: [u8; 32],
+    entry_count: u64,
+    dataset_digest: [u8; 32],
+    archive_store_fingerprint: [u8; 32],
+}
+
+impl<Hash> CoordinatorCommitPhysicalParticipantArchiveReceipt<Hash> {
+    pub(crate) const fn entry_count(&self) -> u64 {
+        self.entry_count
+    }
+
+    pub(crate) const fn dataset_digest(&self) -> &[u8; 32] {
+        &self.dataset_digest
+    }
+}
+
+/// Affine composition boundary for the whole Coordinator catalog. Callers do
+/// not provide target/head/catalog entries or row values; all are selected
+/// from the canonical head and commit-source stores.
+pub(crate) struct ScyllaCoordinatorCommitPhysicalArchiveOwner {
+    session: Arc<Session>,
+    canonical_head: Arc<ScyllaCanonicalHeadStore>,
+    commit_sources: Arc<ScyllaCoordinatorCommitSourceStore>,
+    archive_keyspace: CqlKeyspaceName,
+    source_keyspace: CqlKeyspaceName,
+    checkpoint_tree_height: u8,
+}
+
+impl ScyllaCoordinatorCommitPhysicalArchiveOwner {
+    pub(crate) fn new(
+        session: Arc<Session>,
+        canonical_head: Arc<ScyllaCanonicalHeadStore>,
+        commit_sources: Arc<ScyllaCoordinatorCommitSourceStore>,
+        archive_keyspace: CqlKeyspaceName,
+        source_keyspace: CqlKeyspaceName,
+        checkpoint_tree_height: u8,
+    ) -> Self {
+        Self {
+            session,
+            canonical_head,
+            commit_sources,
+            archive_keyspace,
+            source_keyspace,
+            checkpoint_tree_height,
+        }
+    }
+
+    pub(crate) async fn archive_current_request<F, Hash, Hasher>(
+        &mut self,
+        network: NetworkId,
+    ) -> Result<
+        CoordinatorCommitPhysicalParticipantArchiveReceipt<Hash>,
+        CoordinatorCommitPhysicalArchiveOwnerError,
+    >
+    where
+        F: QFelt64,
+        Hash: Q256BitHash + QFHashBase<F>,
+        Hasher: MerkleHasher<Hash> + FieldQHasher<F, Hash>,
+    {
+        let scope = self.read_scope::<Hash>(network).await?;
+        let catalog = self.scan_catalog::<F, Hash, Hasher>(&scope).await?;
+        let store = ScyllaCoordinatorCommitPhysicalArchiveStore::prepare_for_catalog(
+            self.session.clone(),
+            self.archive_keyspace.clone(),
+            self.source_keyspace.clone(),
+            &catalog,
+        )
+        .await?;
+
+        let entry_count = u64::try_from(catalog.entries().len())
+            .map_err(|_| CoordinatorCommitPhysicalArchiveOwnerError::LengthOverflow)?;
+        let mut first_dataset = participant_dataset_hasher(
+            &scope,
+            &catalog,
+            entry_count,
+            &store.fingerprint,
+        );
+        for index in 0..catalog.entries().len() {
+            let receipt = store
+                .persist_catalog_entry_and_readback(&catalog, index)
+                .await?;
+            if receipt.before_image.key().locator_bytes()
+                != catalog.entries()[index].key().locator_bytes()
+            {
+                return Err(
+                    CoordinatorCommitPhysicalArchiveOwnerError::EntryReceiptMismatch,
+                );
+            }
+            update_participant_dataset(
+                &mut first_dataset,
+                index,
+                CoordinatorCommitPhysicalArchivedRow::from(&receipt),
+            )?;
+        }
+        let dataset_digest: [u8; 32] = first_dataset.finalize().into();
+
+        self.require_catalog_and_head_unchanged::<F, Hash, Hasher>(
+            &scope,
+            &catalog,
+        )
+        .await?;
+        let mut second_dataset = participant_dataset_hasher(
+            &scope,
+            &catalog,
+            entry_count,
+            &store.fingerprint,
+        );
+        for index in 0..catalog.entries().len() {
+            let row = store.revalidate_catalog_entry(&catalog, index).await?;
+            update_participant_dataset(&mut second_dataset, index, row)?;
+        }
+        if <[u8; 32]>::from(second_dataset.finalize()) != dataset_digest {
+            return Err(CoordinatorCommitPhysicalArchiveOwnerError::ArchiveRowChanged);
+        }
+        self.require_catalog_and_head_unchanged::<F, Hash, Hasher>(
+            &scope,
+            &catalog,
+        )
+        .await?;
+
+        Ok(CoordinatorCommitPhysicalParticipantArchiveReceipt {
+            archiving_head: scope.archiving_head,
+            catalog_digest: *catalog.digest(),
+            entry_count,
+            dataset_digest,
+            archive_store_fingerprint: store.fingerprint,
+        })
+    }
+
+    pub(crate) async fn revalidate_participant_receipt<F, Hash, Hasher>(
+        &mut self,
+        network: NetworkId,
+        receipt: &CoordinatorCommitPhysicalParticipantArchiveReceipt<Hash>,
+    ) -> Result<(), CoordinatorCommitPhysicalArchiveOwnerError>
+    where
+        F: QFelt64,
+        Hash: Q256BitHash + QFHashBase<F>,
+        Hasher: MerkleHasher<Hash> + FieldQHasher<F, Hash>,
+    {
+        let scope = self.read_scope::<Hash>(network).await?;
+        if scope.archiving_head != receipt.archiving_head {
+            return Err(CoordinatorCommitPhysicalArchiveOwnerError::HeadChanged);
+        }
+        let catalog = self.scan_catalog::<F, Hash, Hasher>(&scope).await?;
+        let entry_count = u64::try_from(catalog.entries().len())
+            .map_err(|_| CoordinatorCommitPhysicalArchiveOwnerError::LengthOverflow)?;
+        if catalog.digest() != &receipt.catalog_digest
+            || entry_count != receipt.entry_count
+        {
+            return Err(CoordinatorCommitPhysicalArchiveOwnerError::CatalogChanged);
+        }
+        let store = ScyllaCoordinatorCommitPhysicalArchiveStore::prepare_for_catalog(
+            self.session.clone(),
+            self.archive_keyspace.clone(),
+            self.source_keyspace.clone(),
+            &catalog,
+        )
+        .await?;
+        if store.fingerprint != receipt.archive_store_fingerprint {
+            return Err(CoordinatorCommitPhysicalArchiveOwnerError::ReceiptBindingMismatch);
+        }
+        let mut dataset = participant_dataset_hasher(
+            &scope,
+            &catalog,
+            entry_count,
+            &store.fingerprint,
+        );
+        for index in 0..catalog.entries().len() {
+            let row = store.revalidate_catalog_entry(&catalog, index).await?;
+            update_participant_dataset(&mut dataset, index, row)?;
+        }
+        self.require_catalog_and_head_unchanged::<F, Hash, Hasher>(
+            &scope,
+            &catalog,
+        )
+        .await?;
+        if <[u8; 32]>::from(dataset.finalize()) != receipt.dataset_digest {
+            return Err(CoordinatorCommitPhysicalArchiveOwnerError::DatasetChanged);
+        }
+        Ok(())
+    }
+
+    async fn read_scope<Hash: Q256BitHash>(
+        &self,
+        network: NetworkId,
+    ) -> Result<CoordinatorCommitPhysicalArchiveScope<Hash>, CoordinatorCommitPhysicalArchiveOwnerError>
+    {
+        match self.canonical_head.read(network).await? {
+            CanonicalHeadReadState::Current(head) => {
+                CoordinatorCommitPhysicalArchiveScope::try_from_head(head)
+            }
+            CanonicalHeadReadState::Uninitialized => {
+                Err(CoordinatorCommitPhysicalArchiveOwnerError::HeadMissing)
+            }
+        }
+    }
+
+    async fn scan_catalog<F, Hash, Hasher>(
+        &self,
+        scope: &CoordinatorCommitPhysicalArchiveScope<Hash>,
+    ) -> Result<CoordinatorCommitPhysicalCatalog<Hash>, CoordinatorCommitPhysicalArchiveOwnerError>
+    where
+        F: QFelt64,
+        Hash: Q256BitHash + QFHashBase<F>,
+        Hasher: MerkleHasher<Hash> + FieldQHasher<F, Hash>,
+    {
+        self.commit_sources
+            .scan_floor_bound_physical_catalog::<F, Hash, Hasher>(
+                &scope.target,
+                &scope.old_head,
+                self.checkpoint_tree_height,
+            )
+            .await
+            .map_err(|error| {
+                CoordinatorCommitPhysicalArchiveOwnerError::CommitSource(
+                    error.to_string(),
+                )
+            })
+    }
+
+    async fn require_catalog_and_head_unchanged<F, Hash, Hasher>(
+        &self,
+        scope: &CoordinatorCommitPhysicalArchiveScope<Hash>,
+        expected: &CoordinatorCommitPhysicalCatalog<Hash>,
+    ) -> Result<(), CoordinatorCommitPhysicalArchiveOwnerError>
+    where
+        F: QFelt64,
+        Hash: Q256BitHash + QFHashBase<F>,
+        Hasher: MerkleHasher<Hash> + FieldQHasher<F, Hash>,
+    {
+        let current_catalog = self.scan_catalog::<F, Hash, Hasher>(scope).await?;
+        if &current_catalog != expected {
+            return Err(CoordinatorCommitPhysicalArchiveOwnerError::CatalogChanged);
+        }
+        let current_scope = self
+            .read_scope::<Hash>(scope.archiving_head.canonical_ref().network_id())
+            .await?;
+        if current_scope != *scope {
+            return Err(CoordinatorCommitPhysicalArchiveOwnerError::HeadChanged);
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CoordinatorCommitPhysicalArchiveQueries {
@@ -262,6 +598,34 @@ impl ScyllaCoordinatorCommitPhysicalArchiveStore {
             return Err(CoordinatorCommitPhysicalArchiveStoreError::SourceChanged);
         }
         Ok(())
+    }
+
+    async fn revalidate_catalog_entry<Hash: Q256BitHash>(
+        &self,
+        catalog: &CoordinatorCommitPhysicalCatalog<Hash>,
+        entry_index: usize,
+    ) -> Result<CoordinatorCommitPhysicalArchivedRow, CoordinatorCommitPhysicalArchiveStoreError>
+    {
+        self.require_catalog(catalog)?;
+        let entry = catalog.entries().get(entry_index).ok_or(
+            CoordinatorCommitPhysicalArchiveStoreError::CatalogEntryMissing,
+        )?;
+        let source = self.read_source(entry.key()).await?;
+        let expected = CoordinatorCommitPhysicalBeforeImage::try_from_catalog_entry(
+            catalog,
+            entry_index,
+            source,
+        )?;
+        match self.read_archive_exact(catalog, &expected).await? {
+            Some(current) if current == expected => {
+                Ok(CoordinatorCommitPhysicalArchivedRow {
+                    slot: *current.slot(),
+                    digest: *current.digest(),
+                })
+            }
+            Some(_) => Err(CoordinatorCommitPhysicalArchiveStoreError::Conflict),
+            None => Err(CoordinatorCommitPhysicalArchiveStoreError::MissingAfterPersist),
+        }
     }
 
     fn require_catalog<Hash: Q256BitHash>(
@@ -1019,6 +1383,42 @@ fn fragment_digest(
     hasher.finalize().into()
 }
 
+fn participant_dataset_hasher<Hash: Q256BitHash>(
+    scope: &CoordinatorCommitPhysicalArchiveScope<Hash>,
+    catalog: &CoordinatorCommitPhysicalCatalog<Hash>,
+    entry_count: u64,
+    store_fingerprint: &[u8; 32],
+) -> Sha256 {
+    let mut hasher = Sha256::new();
+    hasher.update(PARTICIPANT_DATASET_DIGEST_DOMAIN);
+    hasher.update(
+        scope
+            .archiving_head
+            .revision()
+            .as_i64()
+            .to_be_bytes(),
+    );
+    hasher.update(scope.archiving_head.canonical_ref_bytes());
+    hasher.update(scope.archiving_head.rollback_control_bytes());
+    hasher.update(catalog.digest());
+    hasher.update(store_fingerprint);
+    hasher.update(entry_count.to_be_bytes());
+    hasher
+}
+
+fn update_participant_dataset(
+    hasher: &mut Sha256,
+    index: usize,
+    row: CoordinatorCommitPhysicalArchivedRow,
+) -> Result<(), CoordinatorCommitPhysicalArchiveOwnerError> {
+    let index = u64::try_from(index)
+        .map_err(|_| CoordinatorCommitPhysicalArchiveOwnerError::LengthOverflow)?;
+    hasher.update(index.to_be_bytes());
+    hasher.update(row.slot);
+    hasher.update(row.digest);
+    Ok(())
+}
+
 fn store_fingerprint(
     archive_keyspace: &CqlKeyspaceName,
     source_keyspace: &CqlKeyspaceName,
@@ -1089,6 +1489,60 @@ fn cql(error: impl fmt::Display) -> CoordinatorCommitPhysicalArchiveStoreError {
 }
 
 #[derive(Debug, Eq, PartialEq)]
+pub(crate) enum CoordinatorCommitPhysicalArchiveOwnerError {
+    CanonicalHead(String),
+    CommitSource(String),
+    Archive(CoordinatorCommitPhysicalArchiveStoreError),
+    HeadMissing,
+    NotExactArchivingHead,
+    EpochUnderflow,
+    CatalogChanged,
+    HeadChanged,
+    EntryReceiptMismatch,
+    ReceiptBindingMismatch,
+    ArchiveRowChanged,
+    DatasetChanged,
+    LengthOverflow,
+}
+
+impl From<CanonicalHeadPrototypeError>
+    for CoordinatorCommitPhysicalArchiveOwnerError
+{
+    fn from(error: CanonicalHeadPrototypeError) -> Self {
+        Self::CanonicalHead(error.to_string())
+    }
+}
+
+impl From<CoordinatorCommitPhysicalArchiveStoreError>
+    for CoordinatorCommitPhysicalArchiveOwnerError
+{
+    fn from(error: CoordinatorCommitPhysicalArchiveStoreError) -> Self {
+        Self::Archive(error)
+    }
+}
+
+impl From<CoordinatorCommitPhysicalBeforeImageError>
+    for CoordinatorCommitPhysicalArchiveOwnerError
+{
+    fn from(error: CoordinatorCommitPhysicalBeforeImageError) -> Self {
+        Self::Archive(CoordinatorCommitPhysicalArchiveStoreError::BeforeImage(
+            error,
+        ))
+    }
+}
+
+impl fmt::Display for CoordinatorCommitPhysicalArchiveOwnerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Coordinator physical archive owner failed: {self:?}",
+        )
+    }
+}
+
+impl Error for CoordinatorCommitPhysicalArchiveOwnerError {}
+
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) enum CoordinatorCommitPhysicalArchiveStoreError {
     BeforeImage(CoordinatorCommitPhysicalBeforeImageError),
     Cql(String),
@@ -1140,14 +1594,112 @@ impl Error for CoordinatorCommitPhysicalArchiveStoreError {}
 
 #[cfg(test)]
 mod tests {
+    use parth_core::PHash;
+    use psy_data::protocol::canonical_chain::{
+        CheckpointHash, CheckpointId as ChainCheckpointId, CheckpointRef,
+    };
     use psy_node_core::store::typed::{
         CheckpointId, ContractId, MerkleNode, NodeIndex, PublicKeyHash,
         ProcCheckpointUniqueId, TypedTableKey, U64SingletonSlot,
         UniquePendingId, UserId,
     };
+    use psy_node_core::store::{
+        rollback_control::{RollbackPlanDigest, RollbackRequest},
+        timestamp::{CommitWriteTimestampUs, TimestampFenceWindow},
+    };
 
     use super::*;
     use crate::rollback::describe_existing_key;
+
+    fn checkpoint(height: u64, seed: u64) -> CheckpointRef<PHash> {
+        CheckpointRef::new(
+            ChainCheckpointId::new(height),
+            CheckpointHash::from_last_chain_hash(PHash::from_values(
+                seed,
+                seed + 1,
+                seed + 2,
+                seed + 3,
+            )),
+        )
+    }
+
+    fn rollback_request(mode: RollbackExecutionMode) -> RollbackRequest<PHash> {
+        RollbackRequest::try_new(
+            checkpoint(100, 10),
+            checkpoint(90, 20),
+            TimestampFenceWindow::try_new(
+                CommitWriteTimestampUs::try_from_i128(1_000).unwrap(),
+                1_001,
+                1_002,
+            )
+            .unwrap(),
+            mode,
+            RollbackPlanDigest::try_new([0xA5; 32]).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn head(
+        epoch: u64,
+        checkpoint: CheckpointRef<PHash>,
+        control: RollbackControlState<PHash>,
+    ) -> StoredCanonicalHead<PHash> {
+        let network = NetworkId::try_from_chain_id(1).unwrap();
+        StoredCanonicalHead::decode_persisted(
+            network,
+            7,
+            &CanonicalChainRef::new(network, ChainEpoch::new(epoch), checkpoint)
+                .to_canonical_bytes(),
+            &control.to_canonical_bytes(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn participant_scope_is_selected_only_from_exact_in_place_archiving_head() {
+        let request = rollback_request(RollbackExecutionMode::InPlace);
+        let scope = CoordinatorCommitPhysicalArchiveScope::try_from_head(head(
+            7,
+            *request.requested_head(),
+            RollbackControlState::Archiving(request),
+        ))
+        .unwrap();
+        assert_eq!(scope.target.chain_epoch(), ChainEpoch::new(6));
+        assert_eq!(scope.target.checkpoint(), request.target());
+        assert_eq!(scope.old_head.chain_epoch(), ChainEpoch::new(6));
+        assert_eq!(scope.old_head.checkpoint(), request.requested_head());
+
+        for control in [
+            RollbackControlState::Idle,
+            RollbackControlState::Requested(request),
+            RollbackControlState::ArchiveBarrierReady(request),
+            RollbackControlState::Deleting(request),
+        ] {
+            assert_eq!(
+                CoordinatorCommitPhysicalArchiveScope::try_from_head(head(
+                    7,
+                    *request.requested_head(),
+                    control,
+                )),
+                Err(CoordinatorCommitPhysicalArchiveOwnerError::NotExactArchivingHead),
+            );
+        }
+
+        let snapshot_request =
+            rollback_request(RollbackExecutionMode::SnapshotReplay);
+        assert_eq!(
+            CoordinatorCommitPhysicalArchiveScope::try_from_head(head(
+                7,
+                *snapshot_request.requested_head(),
+                RollbackControlState::Archiving(snapshot_request),
+            )),
+            Err(CoordinatorCommitPhysicalArchiveOwnerError::NotExactArchivingHead),
+        );
+        // StoredCanonicalHead itself rejects an active rollback whose current
+        // checkpoint differs from requested_head, or whose epoch is zero.
+        // The owner therefore receives only canonical-head-valid inputs and
+        // additionally narrows them to exact ARCHIVING + InPlace above.
+    }
 
     #[test]
     fn typed_bindings_cover_every_supported_physical_shape() {
@@ -1196,6 +1748,21 @@ mod tests {
             assert_eq!(binding.shape(), spec.bind_shape(), "{sample:?}");
             assert_eq!(binding.family(), key.schema_family(), "{sample:?}");
         }
+    }
+
+    #[test]
+    fn participant_owner_streams_fixed_size_row_commitments_into_dataset_hash() {
+        assert_eq!(
+            std::mem::size_of::<CoordinatorCommitPhysicalArchivedRow>(),
+            64,
+        );
+        let source = include_str!("coordinator_commit_physical_archive_store.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        assert!(production.contains("participant_dataset_hasher"));
+        assert!(production.contains("update_participant_dataset"));
+        assert!(production.contains("revalidate_catalog_entry"));
+        assert!(!production.contains("Vec<CoordinatorCommitPhysicalArchivedRow"));
+        assert!(!production.contains("Vec<PersistedCoordinatorCommitPhysicalBeforeImage"));
     }
 
     #[test]
@@ -1255,5 +1822,11 @@ mod tests {
         assert!(!production.contains("DELETE FROM"));
         assert!(!production.contains("UPDATE "));
         assert!(!production.contains("USING TIMESTAMP"));
+        assert!(production.contains("archive_current_request"));
+        assert!(production.contains("scan_floor_bound_physical_catalog"));
+        assert!(production.contains("persist_catalog_entry_and_readback"));
+        assert!(production.contains("revalidate_participant_receipt"));
+        assert!(production.contains("RollbackControlState::Archiving"));
+        assert!(production.contains("RollbackExecutionMode::InPlace"));
     }
 }
