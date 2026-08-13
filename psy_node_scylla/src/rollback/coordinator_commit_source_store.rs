@@ -23,7 +23,8 @@ use scylla::{
 };
 
 use super::{
-    CanonicalHeadNoTabletKeyspace, CoordinatorCommitPhysicalInventory,
+    CanonicalHeadNoTabletKeyspace, CoordinatorCommitPhysicalCatalog,
+    CoordinatorCommitPhysicalInventory,
 };
 
 pub(crate) const COORDINATOR_COMMIT_SOURCE_HEADER_TABLE: &str =
@@ -469,6 +470,59 @@ impl ScyllaCoordinatorCommitSourceStore {
         .map_err(|error| CoordinatorCommitSourceStoreError::Inventory(error.to_string()))
     }
 
+    /// Select the complete old-epoch suffix only after exact-reading its
+    /// immutable rollback floor. Mutable singleton locators are deduplicated
+    /// by the catalog; ordinary delete locators must be globally unique.
+    ///
+    /// The returned value is deliberately non-clone and remains pre-PONR. It
+    /// does not read hot values, persist archive rows, cross the participant
+    /// barrier, or execute any delete/restore/head mutation.
+    pub(crate) async fn scan_floor_bound_physical_catalog<F, Hash, Hasher>(
+        &self,
+        target: &CanonicalChainRef<Hash>,
+        old_head: &CanonicalChainRef<Hash>,
+        checkpoint_tree_height: u8,
+    ) -> Result<CoordinatorCommitPhysicalCatalog<Hash>, CoordinatorCommitSourceStoreError>
+    where
+        F: QFelt64,
+        Hash: Q256BitHash + QFHashBase<F>,
+        Hasher: MerkleHasher<Hash> + FieldQHasher<F, Hash>,
+    {
+        if target.network_id() != old_head.network_id()
+            || target.chain_epoch() != old_head.chain_epoch()
+        {
+            return Err(CoordinatorCommitSourceStoreError::SuffixIdentityMismatch);
+        }
+        let floor = self
+            .read_floor(target.network_id(), target.chain_epoch().get())
+            .await?
+            .ok_or(CoordinatorCommitSourceStoreError::FloorMissing)?;
+        let sources = self
+            .scan_committed_suffix::<Hash>(
+                target.network_id(),
+                target.chain_epoch().get(),
+                target.checkpoint().checkpoint_id().get(),
+                old_head.checkpoint().checkpoint_id().get(),
+            )
+            .await?;
+        let mut committed_sources = Vec::with_capacity(sources.len());
+        for source in sources {
+            let marker = self
+                .read_committed(source.candidate())
+                .await?
+                .ok_or(CoordinatorCommitSourceStoreError::CommittedMarkerMissing)?;
+            committed_sources.push((source, marker));
+        }
+        CoordinatorCommitPhysicalCatalog::try_from_committed_sources::<F, Hasher>(
+            floor,
+            target,
+            old_head,
+            committed_sources,
+            checkpoint_tree_height,
+        )
+        .map_err(|error| CoordinatorCommitSourceStoreError::Inventory(error.to_string()))
+    }
+
     async fn read_source_by_coordinates<Hash: Q256BitHash>(
         &self,
         network: NetworkId,
@@ -596,6 +650,7 @@ pub(crate) enum CoordinatorCommitSourceStoreError {
     DuplicateCheckpoint,
     IncompleteCommittedSuffix { expected: u64, actual: u64 },
     SuffixIdentityMismatch,
+    FloorMissing,
     Inventory(String),
     IndeterminateWrite(String),
 }

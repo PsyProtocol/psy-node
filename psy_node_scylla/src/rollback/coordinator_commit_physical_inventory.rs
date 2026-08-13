@@ -7,7 +7,9 @@
 //! from the hot tables later by the archive executor; this object only freezes
 //! the exact physical primary-key set and its rollback treatment.
 
-use std::{error::Error, fmt, io::Cursor as IoCursor};
+use std::{
+    collections::BTreeSet, error::Error, fmt, io::Cursor as IoCursor,
+};
 
 use parth_core::{
     crypto::hash::traits::{FieldQHasher, MerkleHasher, QFieldHashable},
@@ -30,7 +32,7 @@ use psy_data::{
 use psy_node_core::store::{
     coordinator_commit_source::{
         CoordinatorCommitSource, CoordinatorCommitSourceCommitted,
-        CoordinatorCommitSourcePayload,
+        CoordinatorCommitSourcePayload, CoordinatorRollbackFloor,
     },
     typed::{
         CheckpointId, CheckpointRootKey, ContractId, LatestInfoSlot,
@@ -47,6 +49,8 @@ const INVENTORY_MAGIC: &[u8; 8] = b"PSYCCINV";
 const INVENTORY_CODEC_VERSION: u16 = 1;
 const INVENTORY_DIGEST_DOMAIN: &[u8] =
     b"psy.rollback.coordinator-commit-physical-inventory.v1\0";
+const CATALOG_DIGEST_DOMAIN: &[u8] =
+    b"psy.rollback.coordinator-commit-physical-catalog.v1\0";
 // This byte is a versioned contract for the later executor, not proof that any
 // of these gates has passed. An inventory can describe rows, but it can never
 // authorize deletion by itself.
@@ -568,6 +572,258 @@ impl<Hash: Q256BitHash> CoordinatorCommitPhysicalInventory<Hash> {
     }
 }
 
+/// One storage-selected physical row in the floor-bound suffix catalog.
+///
+/// The source and inventory coordinates remain attached so the archive reader
+/// can fresh-revalidate both objects around the hot-row read. This is still an
+/// observation: it contains no archive receipt, barrier receipt, or delete
+/// capability.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoordinatorCommitPhysicalCatalogEntry<Hash> {
+    source_candidate: CanonicalChainRef<Hash>,
+    source_slot: [u8; 32],
+    source_digest: [u8; 32],
+    inventory_digest: [u8; 32],
+    action: CoordinatorCommitInventoryAction,
+    key: ResolvedScyllaKey,
+}
+
+impl<Hash> CoordinatorCommitPhysicalCatalogEntry<Hash> {
+    pub(crate) const fn source_candidate(&self) -> &CanonicalChainRef<Hash> {
+        &self.source_candidate
+    }
+
+    pub(crate) const fn source_slot(&self) -> &[u8; 32] {
+        &self.source_slot
+    }
+
+    pub(crate) const fn source_digest(&self) -> &[u8; 32] {
+        &self.source_digest
+    }
+
+    pub(crate) const fn inventory_digest(&self) -> &[u8; 32] {
+        &self.inventory_digest
+    }
+
+    pub(crate) const fn action(&self) -> CoordinatorCommitInventoryAction {
+        self.action
+    }
+
+    pub(crate) const fn key(&self) -> &ResolvedScyllaKey {
+        &self.key
+    }
+}
+
+/// Non-clone, storage-selected Coordinator suffix catalog.
+///
+/// It proves that the requested suffix is above the immutable rollback floor,
+/// is a complete source/marker/hash-linked chain, and has no duplicate
+/// delete-row identity. Mutable singletons intentionally occur in every
+/// per-checkpoint inventory; they are required to have the same two locators
+/// throughout and are selected exactly once from the old-head inventory.
+///
+/// The catalog is not durable write authority. A later archive owner must
+/// fresh-read the floor, sources, markers, hot rows and canonical control head
+/// before and after persisting exact before-images.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct CoordinatorCommitPhysicalCatalog<Hash> {
+    floor: CoordinatorRollbackFloor<Hash>,
+    target: CanonicalChainRef<Hash>,
+    old_head: CanonicalChainRef<Hash>,
+    sources: Vec<(CoordinatorCommitSource<Hash>, CoordinatorCommitSourceCommitted)>,
+    inventories: Vec<CoordinatorCommitPhysicalInventory<Hash>>,
+    entries: Vec<CoordinatorCommitPhysicalCatalogEntry<Hash>>,
+    digest: [u8; 32],
+}
+
+impl<Hash: Q256BitHash> CoordinatorCommitPhysicalCatalog<Hash> {
+    pub(crate) fn try_from_committed_sources<F, Hasher>(
+        floor: CoordinatorRollbackFloor<Hash>,
+        target: &CanonicalChainRef<Hash>,
+        old_head: &CanonicalChainRef<Hash>,
+        sources: Vec<(CoordinatorCommitSource<Hash>, CoordinatorCommitSourceCommitted)>,
+        checkpoint_tree_height: u8,
+    ) -> Result<Self, CoordinatorCommitPhysicalInventoryError>
+    where
+        F: QFelt64,
+        Hash: QFHashBase<F>,
+        Hasher: MerkleHasher<Hash> + FieldQHasher<F, Hash>,
+    {
+        if floor.floor().network_id() != target.network_id()
+            || floor.floor().chain_epoch() != target.chain_epoch()
+            || target.network_id() != old_head.network_id()
+            || target.chain_epoch() != old_head.chain_epoch()
+            || floor.floor().checkpoint().checkpoint_id().get()
+                > target.checkpoint().checkpoint_id().get()
+        {
+            return Err(CoordinatorCommitPhysicalInventoryError::CatalogFloorMismatch);
+        }
+        let inventories = CoordinatorCommitPhysicalInventory::try_suffix_from_committed_sources::<
+            F,
+            Hasher,
+        >(target, old_head, &sources, checkpoint_tree_height)?;
+        if inventories.is_empty() {
+            return Err(CoordinatorCommitPhysicalInventoryError::EmptyCatalogSuffix);
+        }
+
+        let mut delete_locators = BTreeSet::new();
+        let mut restore_locators: Option<Vec<Vec<u8>>> = None;
+        let mut entries = Vec::new();
+        for (source_index, inventory) in inventories.iter().enumerate() {
+            let current_restore = inventory
+                .entries()
+                .iter()
+                .filter(|entry| {
+                    entry.action()
+                        == CoordinatorCommitInventoryAction::ArchiveThenRestoreTarget
+                })
+                .map(|entry| entry.key().locator_bytes().to_vec())
+                .collect::<Vec<_>>();
+            if current_restore.len() != 2
+                || restore_locators
+                    .as_ref()
+                    .is_some_and(|expected| *expected != current_restore)
+            {
+                return Err(
+                    CoordinatorCommitPhysicalInventoryError::CatalogRestoreSetMismatch,
+                );
+            }
+            restore_locators.get_or_insert(current_restore);
+
+            for entry in inventory.entries().iter().filter(|entry| {
+                entry.action() == CoordinatorCommitInventoryAction::ArchiveThenDelete
+            }) {
+                if !delete_locators.insert(entry.key().locator_bytes().to_vec()) {
+                    return Err(
+                        CoordinatorCommitPhysicalInventoryError::DuplicateCatalogDeleteKey,
+                    );
+                }
+                entries.push(catalog_entry(
+                    &sources[source_index].0,
+                    inventory,
+                    entry,
+                ));
+            }
+        }
+        let last_index = inventories.len() - 1;
+        for entry in inventories[last_index].entries().iter().filter(|entry| {
+            entry.action()
+                == CoordinatorCommitInventoryAction::ArchiveThenRestoreTarget
+        }) {
+            entries.push(catalog_entry(
+                &sources[last_index].0,
+                &inventories[last_index],
+                entry,
+            ));
+        }
+        entries.sort_by(|left, right| {
+            left.key
+                .locator_bytes()
+                .cmp(right.key.locator_bytes())
+                .then_with(|| {
+                    left.source_candidate
+                        .checkpoint()
+                        .checkpoint_id()
+                        .get()
+                        .cmp(
+                            &right
+                                .source_candidate
+                                .checkpoint()
+                                .checkpoint_id()
+                                .get(),
+                        )
+                })
+        });
+
+        let mut catalog = Self {
+            floor,
+            target: *target,
+            old_head: *old_head,
+            sources,
+            inventories,
+            entries,
+            digest: [0; 32],
+        };
+        catalog.digest = catalog_digest(&catalog);
+        Ok(catalog)
+    }
+
+    pub(crate) const fn floor(&self) -> &CoordinatorRollbackFloor<Hash> {
+        &self.floor
+    }
+
+    pub(crate) const fn target(&self) -> &CanonicalChainRef<Hash> {
+        &self.target
+    }
+
+    pub(crate) const fn old_head(&self) -> &CanonicalChainRef<Hash> {
+        &self.old_head
+    }
+
+    pub(crate) fn sources(
+        &self,
+    ) -> &[(CoordinatorCommitSource<Hash>, CoordinatorCommitSourceCommitted)] {
+        &self.sources
+    }
+
+    pub(crate) fn inventories(&self) -> &[CoordinatorCommitPhysicalInventory<Hash>] {
+        &self.inventories
+    }
+
+    pub(crate) fn entries(&self) -> &[CoordinatorCommitPhysicalCatalogEntry<Hash>] {
+        &self.entries
+    }
+
+    pub(crate) const fn digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+}
+
+fn catalog_entry<Hash: Q256BitHash>(
+    source: &CoordinatorCommitSource<Hash>,
+    inventory: &CoordinatorCommitPhysicalInventory<Hash>,
+    entry: &CoordinatorCommitInventoryEntry,
+) -> CoordinatorCommitPhysicalCatalogEntry<Hash> {
+    CoordinatorCommitPhysicalCatalogEntry {
+        source_candidate: *source.candidate(),
+        source_slot: source.slot().as_bytes(),
+        source_digest: source.digest().as_bytes(),
+        inventory_digest: *inventory.digest(),
+        action: entry.action(),
+        key: entry.key().clone(),
+    }
+}
+
+fn catalog_digest<Hash: Q256BitHash>(
+    catalog: &CoordinatorCommitPhysicalCatalog<Hash>,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(CATALOG_DIGEST_DOMAIN);
+    hasher.update(catalog.floor.digest());
+    hasher.update(catalog.target.to_canonical_bytes());
+    hasher.update(catalog.old_head.to_canonical_bytes());
+    hasher.update((catalog.sources.len() as u64).to_be_bytes());
+    for ((source, marker), inventory) in
+        catalog.sources.iter().zip(catalog.inventories.iter())
+    {
+        hasher.update(source.slot().as_bytes());
+        hasher.update(source.digest().as_bytes());
+        hasher.update(marker.encode_canonical());
+        hasher.update(inventory.digest());
+    }
+    hasher.update((catalog.entries.len() as u64).to_be_bytes());
+    for entry in &catalog.entries {
+        hasher.update(entry.source_candidate.to_canonical_bytes());
+        hasher.update(entry.source_slot);
+        hasher.update(entry.source_digest);
+        hasher.update(entry.inventory_digest);
+        hasher.update([entry.action as u8]);
+        hasher.update((entry.key.locator_bytes().len() as u64).to_be_bytes());
+        hasher.update(entry.key.locator_bytes());
+    }
+    hasher.finalize().into()
+}
+
 fn canonicalize_keys(
     keys: Vec<TypedTableKey>,
 ) -> Result<Vec<CoordinatorCommitInventoryEntry>, CoordinatorCommitPhysicalInventoryError> {
@@ -788,6 +1044,10 @@ pub enum CoordinatorCommitPhysicalInventoryError {
     SuffixLengthMismatch { expected: u64, actual: u64 },
     SuffixLinkMismatch { checkpoint: u64 },
     SuffixHeadMismatch,
+    CatalogFloorMismatch,
+    EmptyCatalogSuffix,
+    CatalogRestoreSetMismatch,
+    DuplicateCatalogDeleteKey,
     Truncated,
     InvalidLength,
 }
@@ -1198,6 +1458,8 @@ mod tests {
 
         let mut second_prepared = prepared();
         second_prepared.checkpoint_id = 9;
+        second_prepared.unique_pending_id = 91;
+        second_prepared.proc_checkpoint_unique_id = 92;
         second_prepared.old_base.block_state.checkpoint_id = 8;
         second_prepared.new_base.block_state.checkpoint_id = 9;
         let proof = DeltaMerkleProofCore::from_params::<PoseidonHasher>(
@@ -1268,6 +1530,122 @@ mod tests {
                 CHECKPOINT_TREE_HEIGHT,
             ),
             Err(CoordinatorCommitPhysicalInventoryError::SuffixHeadMismatch)
+        );
+    }
+
+    #[test]
+    fn floor_bound_catalog_deduplicates_singletons_and_rejects_duplicate_delete_keys() {
+        let first_prepared = prepared();
+        let first = source(&first_prepared);
+
+        let mut second_prepared = prepared();
+        second_prepared.checkpoint_id = 9;
+        second_prepared.unique_pending_id = 91;
+        second_prepared.proc_checkpoint_unique_id = 92;
+        second_prepared.old_base.block_state.checkpoint_id = 8;
+        second_prepared.new_base.block_state.checkpoint_id = 9;
+        let proof = DeltaMerkleProofCore::from_params::<PoseidonHasher>(
+            9,
+            second_prepared.old_base.checkpoint_leaf_hash,
+            second_prepared.new_base.checkpoint_leaf_hash,
+            (0..CHECKPOINT_TREE_HEIGHT as usize)
+                .map(PoseidonHasher::get_zero_hash)
+                .collect(),
+        );
+        second_prepared.old_base.checkpoint_tree_root = proof.old_root;
+        second_prepared.new_base.checkpoint_tree_root = proof.new_root;
+        second_prepared.checkpoint_tree_update_proof = proof;
+        let second = source_between(
+            &second_prepared,
+            stored_head(*first.candidate()),
+            canonical(9, 900),
+        );
+        let sources = vec![
+            (first.clone(), first.committed_marker()),
+            (second.clone(), second.committed_marker()),
+        ];
+        let floor = CoordinatorRollbackFloor::try_new(head()).unwrap();
+        let catalog = CoordinatorCommitPhysicalCatalog::<PHash>::try_from_committed_sources::<
+            PF,
+            PoseidonHasher,
+        >(
+            floor,
+            first.expected(),
+            second.candidate(),
+            sources,
+            CHECKPOINT_TREE_HEIGHT,
+        )
+        .unwrap();
+        assert_eq!(catalog.sources().len(), 2);
+        assert_eq!(catalog.inventories().len(), 2);
+        assert_eq!(catalog.floor(), &floor);
+        assert_eq!(catalog.target(), first.expected());
+        assert_eq!(catalog.old_head(), second.candidate());
+        assert_ne!(catalog.digest(), &[0; 32]);
+        let restore = catalog
+            .entries()
+            .iter()
+            .filter(|entry| {
+                entry.action()
+                    == CoordinatorCommitInventoryAction::ArchiveThenRestoreTarget
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(restore.len(), 2);
+        assert!(restore
+            .iter()
+            .all(|entry| entry.source_candidate() == second.candidate()));
+        assert!(catalog.entries().iter().all(|entry| {
+            entry.source_slot() != &[0; 32]
+                && entry.source_digest() != &[0; 32]
+                && entry.inventory_digest() != &[0; 32]
+                && !entry.key().locator_bytes().is_empty()
+        }));
+
+        let mut duplicate_prepared = second_prepared;
+        duplicate_prepared.unique_pending_id = first_prepared.unique_pending_id;
+        duplicate_prepared.proc_checkpoint_unique_id =
+            first_prepared.proc_checkpoint_unique_id;
+        let duplicate = source_between(
+            &duplicate_prepared,
+            stored_head(*first.candidate()),
+            canonical(9, 900),
+        );
+        assert_eq!(
+            CoordinatorCommitPhysicalCatalog::<PHash>::try_from_committed_sources::<
+                PF,
+                PoseidonHasher,
+            >(
+                floor,
+                first.expected(),
+                duplicate.candidate(),
+                vec![
+                    (first.clone(), first.committed_marker()),
+                    (duplicate.clone(), duplicate.committed_marker()),
+                ],
+                CHECKPOINT_TREE_HEIGHT,
+            ),
+            Err(CoordinatorCommitPhysicalInventoryError::DuplicateCatalogDeleteKey)
+        );
+
+        let floor_above_target = CoordinatorRollbackFloor::try_new(stored_head(
+            canonical(8, 801),
+        ))
+        .unwrap();
+        assert_eq!(
+            CoordinatorCommitPhysicalCatalog::<PHash>::try_from_committed_sources::<
+                PF,
+                PoseidonHasher,
+            >(
+                floor_above_target,
+                first.expected(),
+                second.candidate(),
+                vec![
+                    (first.clone(), first.committed_marker()),
+                    (second.clone(), second.committed_marker()),
+                ],
+                CHECKPOINT_TREE_HEIGHT,
+            ),
+            Err(CoordinatorCommitPhysicalInventoryError::CatalogFloorMismatch)
         );
     }
 }
