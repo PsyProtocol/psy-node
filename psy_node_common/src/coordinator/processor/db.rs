@@ -65,6 +65,10 @@ use psy_node_core::{
             CoordinatorRollbackAdmissionStore,
             RollbackAdmissionBoundaryOutcome,
         },
+        rollback_participant_maintenance::{
+            CoordinatorRollbackMaintenanceExecutor,
+            CoordinatorRollbackMaintenanceOutcome,
+        },
         traits::proof_store::QParthProofStore,
     },
 };
@@ -554,6 +558,20 @@ impl<
                 .await?;
         }
         Ok(outcome)
+    }
+
+    /// Continue the storage-selected Coordinator participant through archive
+    /// and exact readback. The result is pre-barrier evidence only; it cannot
+    /// delete, restore, or publish the target head.
+    pub async fn prepare_coordinator_rollback_archive(
+        &self,
+    ) -> anyhow::Result<CoordinatorRollbackMaintenanceOutcome<N::QHash>>
+    where
+        S: CoordinatorRollbackMaintenanceExecutor<N::F, N::QHash>,
+    {
+        self.db
+            .prepare_coordinator_archive(self.network_id, N::CHECKPOINT_TREE_HEIGHT)
+            .await
     }
 
     fn materialized_pending_context(&self) -> anyhow::Result<PendingContext<N::QHash>> {

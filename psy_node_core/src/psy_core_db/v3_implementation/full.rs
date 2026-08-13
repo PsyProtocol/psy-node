@@ -26,6 +26,7 @@ use parth_core::{
 };
 use psy_data::{
     protocol::{
+        canonical_chain::NetworkId,
         chain_context::AuthorityObservation,
         verifiable_checkpoint_transition::PsyVerifiableCheckpointTransitionWithProof,
     },
@@ -61,6 +62,10 @@ use crate::{
             CoreDatabaseStore, CoreDatabaseU64Reader, CoreDatabaseZeroIdMerkleReader,
         },
         helpers::*,
+    },
+    store::rollback_participant_maintenance::{
+        CoordinatorRollbackMaintenanceExecutor,
+        CoordinatorRollbackMaintenanceOutcome,
     },
 };
 
@@ -186,6 +191,77 @@ pub struct PsyUnifiedCoreDatabaseStore<
     pub _phantom_double_id_table: std::marker::PhantomData<DoubleIdTableIdentifier>,
     // start phantom N
     pub _phantom_n: std::marker::PhantomData<N>,
+}
+
+#[async_trait]
+impl<
+        N: QNetworkDatabaseTypes,
+        BiDirectionalMappingTableIdentifier: Clone + Send + Sync,
+        BiDirectionalU64U128MappingTableIdentifier: Clone + Send + Sync,
+        U64TableIdentifier: Clone + Send + Sync,
+        U64CounterTableIdentifier: Clone + Send + Sync,
+        SingleIdTableIdentifier: Clone + Send + Sync,
+        DoubleIdTableIdentifier: Clone + Send + Sync,
+        KivTableIdentifier: Clone + Send + Sync,
+        SingleIdMerkleTableIdentifier: Clone + Send + Sync,
+        DoubleIdMerkleTableIdentifier: Clone + Send + Sync,
+        ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
+        TagTreeTableIdentifier: Clone + Send + Sync,
+        HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
+        S: CoreDatabaseStore<
+                N::QHash,
+                N::HasherBase,
+                BiDirectionalMappingTableIdentifier,
+                BiDirectionalU64U128MappingTableIdentifier,
+                U64TableIdentifier,
+                U64CounterTableIdentifier,
+                SingleIdTableIdentifier,
+                DoubleIdTableIdentifier,
+                KivTableIdentifier,
+                SingleIdMerkleTableIdentifier,
+                DoubleIdMerkleTableIdentifier,
+                ZeroIdMerkleTableIdentifier,
+                TagTreeTableIdentifier,
+                HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
+            > + CoordinatorRollbackMaintenanceExecutor<N::F, N::QHash>
+            + Send
+            + Sync,
+    > CoordinatorRollbackMaintenanceExecutor<N::F, N::QHash>
+    for PsyUnifiedCoreDatabaseStore<
+        N,
+        BiDirectionalMappingTableIdentifier,
+        BiDirectionalU64U128MappingTableIdentifier,
+        U64TableIdentifier,
+        U64CounterTableIdentifier,
+        SingleIdTableIdentifier,
+        DoubleIdTableIdentifier,
+        KivTableIdentifier,
+        SingleIdMerkleTableIdentifier,
+        DoubleIdMerkleTableIdentifier,
+        ZeroIdMerkleTableIdentifier,
+        TagTreeTableIdentifier,
+        HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
+        S,
+    >
+{
+    async fn prepare_coordinator_archive(
+        &self,
+        network: NetworkId,
+        checkpoint_tree_height: u8,
+    ) -> anyhow::Result<CoordinatorRollbackMaintenanceOutcome<N::QHash>> {
+        self.store
+            .prepare_coordinator_archive(network, checkpoint_tree_height)
+            .await
+    }
 }
 
 impl<

@@ -4,7 +4,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use scylla::client::execution_profile::ExecutionProfile;
 use scylla::client::PoolSize;
-use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::db::table::QDatabaseTableRoutingKey, felt::QFelt64, protocol::core_types::{Q256BitHash, QFHashBase, QHashBase}};
+use parth_core::{crypto::hash::traits::{FieldQHasher, MerkleHasher, MerkleZeroHasher}, data::db::table::QDatabaseTableRoutingKey, felt::QFelt64, protocol::core_types::{Q256BitHash, QFHashBase, QHashBase}};
 use psy_node_core::queue::realm_user_update_publish::GlobalUserTreeHeight;
 use psy_node_core::queue::coordinator_guta_durable_submission::CoordinatorGutaDurableSubmissionStore;
 use psy_node_core::queue::coordinator_processor_durable_capture::CoordinatorProcessorDurableCaptureFactory;
@@ -24,6 +24,9 @@ use psy_node_core::store::rollback_admission::{
 };
 use psy_node_core::store::rollback_participant_plan::{
     CoordinatorRollbackParticipantPlanStore, RollbackParticipantPlan,
+};
+use psy_node_core::store::rollback_participant_maintenance::{
+    CoordinatorRollbackMaintenanceExecutor, CoordinatorRollbackMaintenanceOutcome,
 };
 use psy_node_core::store::rollback_topology::RollbackTopologySnapshot;
 use psy_node_core::store::realm_processor_startup::{
@@ -47,6 +50,8 @@ use crate::rollback::{
     ScyllaCoordinatorGutaDurableSubmissionStore,
     ScyllaCoordinatorProcessorDurableCaptureFactory,
     ScyllaCoordinatorCommitSourceStore,
+    ScyllaCoordinatorCommitPhysicalArchiveStore,
+    prepare_coordinator_rollback_archive,
 };
 use crate::rollback::branch_exact_startup_preflight::ScyllaRealmProcessorStartupPreflightProvider;
 use crate::tables::{merkle::ScyllaMerkleNodesZeroPreparedStatements, traits::ScyllaStandardPreparedTableStatements};
@@ -280,6 +285,11 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
             ScyllaCoordinatorCommitSourceStore::create_schema(
                 &self.session,
                 &keyspace,
+                &state_keyspace,
+            )
+            .await?;
+            ScyllaCoordinatorCommitPhysicalArchiveStore::create_schema(
+                &self.session,
                 &state_keyspace,
             )
             .await?;
@@ -691,12 +701,33 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
             ))
     }
 
+    fn coordinator_canonical_head_arc(
+        &self,
+    ) -> anyhow::Result<Arc<ScyllaCanonicalHeadStore>> {
+        self.canonical_head_store.get().cloned().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Coordinator canonical-head store was not initialized by Coordinator setup"
+            )
+        })
+    }
+
     fn coordinator_commit_sources(
         &self,
     ) -> anyhow::Result<&ScyllaCoordinatorCommitSourceStore> {
         self.coordinator_commit_source_store
             .get()
             .map(Arc::as_ref)
+            .ok_or_else(|| anyhow::anyhow!(
+                "Coordinator commit-source store was not initialized by Coordinator setup"
+            ))
+    }
+
+    fn coordinator_commit_sources_arc(
+        &self,
+    ) -> anyhow::Result<Arc<ScyllaCoordinatorCommitSourceStore>> {
+        self.coordinator_commit_source_store
+            .get()
+            .cloned()
             .ok_or_else(|| anyhow::anyhow!(
                 "Coordinator commit-source store was not initialized by Coordinator setup"
             ))
@@ -719,6 +750,17 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
         self.rollback_participant_plan_store
             .get()
             .map(Arc::as_ref)
+            .ok_or_else(|| anyhow::anyhow!(
+                "Coordinator rollback participant-plan store was not initialized by Coordinator setup"
+            ))
+    }
+
+    fn coordinator_rollback_participant_plans_arc(
+        &self,
+    ) -> anyhow::Result<Arc<ScyllaRollbackParticipantPlanStore>> {
+        self.rollback_participant_plan_store
+            .get()
+            .cloned()
             .ok_or_else(|| anyhow::anyhow!(
                 "Coordinator rollback participant-plan store was not initialized by Coordinator setup"
             ))
@@ -955,6 +997,36 @@ where
             .coordinator_rollback_participant_plans()?
             .read_participant_plan(network, &digest)
             .await?)
+    }
+}
+
+#[async_trait]
+impl<F, Hash, Hasher> CoordinatorRollbackMaintenanceExecutor<F, Hash>
+    for ScyllaCoreStore<Hash, Hasher>
+where
+    F: QFelt64,
+    Hash: QHashBase + Q256BitHash + QFHashBase<F>,
+    Hasher: MerkleZeroHasher<Hash>
+        + MerkleHasher<Hash>
+        + FieldQHasher<F, Hash>
+        + Send
+        + Sync,
+{
+    async fn prepare_coordinator_archive(
+        &self,
+        network: NetworkId,
+        checkpoint_tree_height: u8,
+    ) -> anyhow::Result<CoordinatorRollbackMaintenanceOutcome<Hash>> {
+        prepare_coordinator_rollback_archive::<F, Hash, Hasher>(
+            self.session.clone(),
+            self.coordinator_canonical_head_arc()?,
+            self.coordinator_commit_sources_arc()?,
+            self.coordinator_rollback_participant_plans_arc()?,
+            network,
+            crate::rollback::CqlKeyspaceName::try_new(self.keyspace.clone())?,
+            checkpoint_tree_height,
+        )
+        .await
     }
 }
 

@@ -532,6 +532,14 @@ impl<Hash: Q256BitHash> CoordinatorCommitPreBarrierReadinessReceipt<Hash> {
         self.entry_count
     }
 
+    pub(crate) const fn archiving_head(&self) -> &StoredCanonicalHead<Hash> {
+        &self.archiving_head
+    }
+
+    pub(crate) const fn target(&self) -> &CanonicalChainRef<Hash> {
+        &self.target
+    }
+
     pub(crate) const fn dataset_digest(&self) -> &[u8; 32] {
         &self.dataset_digest
     }

@@ -23,6 +23,7 @@ use psy_node_core::{
         CanonicalHeadBootstrapProfile, CoordinatorCanonicalHeadStore,
     },
     store::rollback_admission::CoordinatorRollbackAdmissionStore,
+    store::rollback_participant_maintenance::CoordinatorRollbackMaintenanceExecutor,
     store::coordinator_processor_branch_exact_runtime::CoordinatorBranchExactProcessorOwner,
 };
 
@@ -30,7 +31,11 @@ use crate::coordinator::processor::{PsyCoordinatorProcessor, db::PsyCoordinatorD
 
 async fn create_coordinator_processor_with_processing_owner<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
-    S: PsyCoordinatorProcessorStore<N::F, N::QHash> + Send + Sync + 'static,
+    S: PsyCoordinatorProcessorStore<N::F, N::QHash>
+        + CoordinatorRollbackMaintenanceExecutor<N::F, N::QHash>
+        + Send
+        + Sync
+        + 'static,
     STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync + 'static,
     GUTAUpdateQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
     RegisterUserQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
@@ -196,7 +201,11 @@ where
 
 pub async fn create_coordinator_processor_with_durable_guta_submissions<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
-    S: PsyCoordinatorProcessorStore<N::F, N::QHash> + Send + Sync + 'static,
+    S: PsyCoordinatorProcessorStore<N::F, N::QHash>
+        + CoordinatorRollbackMaintenanceExecutor<N::F, N::QHash>
+        + Send
+        + Sync
+        + 'static,
     STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash>
         + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash>
         + Send
@@ -291,7 +300,11 @@ where
 /// whole-queue draining for this Processor instance.
 pub async fn create_coordinator_processor_with_branch_exact_capture<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
-    S: PsyCoordinatorProcessorStore<N::F, N::QHash> + Send + Sync + 'static,
+    S: PsyCoordinatorProcessorStore<N::F, N::QHash>
+        + CoordinatorRollbackMaintenanceExecutor<N::F, N::QHash>
+        + Send
+        + Sync
+        + 'static,
     STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash>
         + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash>
         + Send
@@ -389,7 +402,11 @@ where
 
 pub async fn create_coordinator_processor<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
-    S: PsyCoordinatorProcessorStore<N::F, N::QHash> + Send + Sync + 'static,
+    S: PsyCoordinatorProcessorStore<N::F, N::QHash>
+        + CoordinatorRollbackMaintenanceExecutor<N::F, N::QHash>
+        + Send
+        + Sync
+        + 'static,
     STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash>
         + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash>
         + Send
@@ -491,7 +508,11 @@ where
 
 pub async fn create_coordinator_processor_and_run_with_durable_guta_submissions<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
-    S: PsyCoordinatorProcessorStore<N::F, N::QHash> + Send + Sync + 'static,
+    S: PsyCoordinatorProcessorStore<N::F, N::QHash>
+        + CoordinatorRollbackMaintenanceExecutor<N::F, N::QHash>
+        + Send
+        + Sync
+        + 'static,
     STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync + 'static,
     GUTAUpdateQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
     RegisterUserQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
@@ -561,7 +582,11 @@ where
 
 pub async fn create_coordinator_processor_and_run<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
-    S: PsyCoordinatorProcessorStore<N::F, N::QHash> + Send + Sync + 'static,
+    S: PsyCoordinatorProcessorStore<N::F, N::QHash>
+        + CoordinatorRollbackMaintenanceExecutor<N::F, N::QHash>
+        + Send
+        + Sync
+        + 'static,
     STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash>
         + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash>
         + Send

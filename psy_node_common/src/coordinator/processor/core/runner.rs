@@ -12,6 +12,10 @@ use psy_node_core::{
     },
     store::traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore},
     store::rollback_admission::RollbackAdmissionBoundaryOutcome,
+    store::rollback_participant_maintenance::{
+        CoordinatorRollbackMaintenanceExecutor,
+        CoordinatorRollbackMaintenanceOutcome,
+    },
 };
 use tokio::time::sleep;
 
@@ -19,7 +23,10 @@ use crate::coordinator::processor::PsyCoordinatorProcessor;
 
 pub async fn run_coordinator_processor_loop<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
-    S: PsyCoordinatorProcessorStore<N::F, N::QHash> + Send + Sync,
+    S: PsyCoordinatorProcessorStore<N::F, N::QHash>
+        + CoordinatorRollbackMaintenanceExecutor<N::F, N::QHash>
+        + Send
+        + Sync,
     STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync,
     GUTAUpdateQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
     RegisterUserQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
@@ -67,12 +74,41 @@ where
                     .reconcile_rollback_admission_at_loop_boundary()
                     .await;
                 match admission {
-                    Ok(RollbackAdmissionBoundaryOutcome::Maintenance(head)) => {
-                        tracing::warn!(
-                            "[COORDINATOR] Rollback maintenance active at epoch {}, checkpoint {}; normal block processing remains parked",
-                            head.canonical_ref().chain_epoch().get(),
-                            head.canonical_ref().checkpoint().checkpoint_id().get(),
-                        );
+                    Ok(RollbackAdmissionBoundaryOutcome::Maintenance(_head)) => {
+                        match processor.db.prepare_coordinator_rollback_archive().await {
+                            Ok(CoordinatorRollbackMaintenanceOutcome::ArchivePrepared(prepared)) => {
+                                tracing::warn!(
+                                    "[COORDINATOR] Rollback archive prepared at epoch {}, target checkpoint {}, archived entries {}; waiting for every Realm and the global archive barrier",
+                                    prepared.archiving_head().canonical_ref().chain_epoch().get(),
+                                    prepared.target().checkpoint().checkpoint_id().get(),
+                                    prepared.entry_count(),
+                                );
+                            }
+                            Ok(CoordinatorRollbackMaintenanceOutcome::AwaitingDownstream(current)) => {
+                                tracing::warn!(
+                                    "[COORDINATOR] Rollback maintenance awaits downstream global coordination at epoch {}, checkpoint {}",
+                                    current.canonical_ref().chain_epoch().get(),
+                                    current.canonical_ref().checkpoint().checkpoint_id().get(),
+                                );
+                            }
+                            Ok(CoordinatorRollbackMaintenanceOutcome::Normal(current)) => {
+                                let error = format!(
+                                    "Coordinator maintenance observation unexpectedly returned an idle head at epoch {}, checkpoint {}",
+                                    current.canonical_ref().chain_epoch().get(),
+                                    current.canonical_ref().checkpoint().checkpoint_id().get(),
+                                );
+                                processor.db.status.set_error(error.clone());
+                                tracing::error!("{error}");
+                            }
+                            Err(error) => {
+                                let error = format!(
+                                    "Coordinator rollback archive preparation failed closed at slot {}: {:#}",
+                                    current_slot, error,
+                                );
+                                processor.db.status.set_error(error.clone());
+                                tracing::error!("{error}");
+                            }
+                        }
                         continue;
                     }
                     Ok(RollbackAdmissionBoundaryOutcome::StaleCommandRejected(head)) => {
@@ -129,7 +165,11 @@ where
 }
 pub async fn run_coordinator_processor<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
-    S: PsyCoordinatorProcessorStore<N::F, N::QHash> + Send + Sync + 'static,
+    S: PsyCoordinatorProcessorStore<N::F, N::QHash>
+        + CoordinatorRollbackMaintenanceExecutor<N::F, N::QHash>
+        + Send
+        + Sync
+        + 'static,
     STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync + 'static,
     GUTAUpdateQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
     RegisterUserQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
@@ -184,6 +224,35 @@ where
             result?;
             tracing::info!("All coordinator processor threads completed");
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn rollback_maintenance_prepares_archive_and_parks_before_normal_block_processing() {
+        let source = include_str!("runner.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let admission = production
+            .find("RollbackAdmissionBoundaryOutcome::Maintenance")
+            .expect("maintenance branch");
+        let archive = production[admission..]
+            .find("prepare_coordinator_rollback_archive")
+            .map(|offset| admission + offset)
+            .expect("archive preparation");
+        let park = production[archive..]
+            .find("continue;")
+            .map(|offset| archive + offset)
+            .expect("maintenance park");
+        let process = production[park..]
+            .find("processor.process_block()")
+            .map(|offset| park + offset)
+            .expect("normal block processing");
+
+        assert!(admission < archive && archive < park && park < process);
+        for forbidden in ["delete_suffix", "restore_target", "publish_target"] {
+            assert!(!production.contains(forbidden));
         }
     }
 }
