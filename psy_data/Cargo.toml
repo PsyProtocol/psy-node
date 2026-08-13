@@ -41,6 +41,10 @@ ts-rs = { workspace = true }
 dashmap = { workspace = true, optional = true }
 lru = { workspace = true }
 fastbloom-rs = { workspace = true, features = ["serde"] }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+blst = { workspace = true }
+libp2p-identity = { workspace = true }
 
 # start local packages
 parth_core = { workspace = true }

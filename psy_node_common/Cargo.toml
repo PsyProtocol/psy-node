@@ -61,6 +61,9 @@ thiserror = { workspace = true }
 psy_node_store_memory = { workspace = true }
 ts-rs = { workspace = true }
 chrono = { workspace = true}
+libp2p = { workspace = true }
+libp2p-identity = { workspace = true }
+sha2 = { workspace = true }
 
 
 [dev-dependencies]

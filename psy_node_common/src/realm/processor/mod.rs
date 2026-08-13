@@ -1,3 +1,4 @@
+pub mod consensus;
 pub mod core;
 pub mod db;
 pub mod processor_shared_status;

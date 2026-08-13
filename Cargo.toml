@@ -157,6 +157,9 @@ ripemd = "0.1.3"
 blake2 = { version = "0.10", default-features = false }
 blake3 = { version = "1.5", default-features = false }
 tiny-keccak = { version = "2.0", features = ["sha3", "keccak"] }
+blst = "0.3"
+libp2p = { version = "0.55", default-features = false, features = ["tcp", "noise", "yamux", "gossipsub", "identify", "request-response", "relay", "dcutr", "autonat", "macros", "tokio", "dns"] }
+libp2p-identity = { version = "0.2", features = ["peerid", "ed25519"] }
 gnark-plonky2-verifier-ffi = { git = "ssh://git@github.com/QEDProtocol/gnark-plonky2-verifier.git", package = "gnark-plonky2-verifier-ffi", rev = "35fd12a8117e53939703df6d7b98567933e65159" }
 alloy-signer = { version = "=1.6.3", default-features = false }
 alloy-signer-local = { version = "=1.6.3", features = ["mnemonic", "keystore"] }
