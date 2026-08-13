@@ -72,6 +72,10 @@ const REWARD_ROW_DIGEST_DOMAIN: &[u8] =
     b"psy/coordinator-rollback-realm-reward-archive-row/v1";
 const REWARD_ROW_SLOT_DOMAIN: &[u8] =
     b"psy/coordinator-rollback-realm-reward-archive-row-slot/v1";
+const ROOT_PAIR_PAYLOAD_MAGIC: [u8; 8] = *b"PSYCRRTP";
+const ROOT_PAIR_PAYLOAD_VERSION: u16 = 1;
+const ROOT_PAIR_DATASET_DIGEST_DOMAIN: &[u8] =
+    b"psy/coordinator-rollback-root-pair-archive-dataset/v1";
 const ARCHIVE_REVISION: i64 = 1;
 const MAX_FRAGMENT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FRAGMENTS: usize = 16;
@@ -91,6 +95,8 @@ struct CoordinatorRollbackArchiveQueries {
     read_row: String,
     read_fragment: String,
     read_checkpoint_kiv: Vec<(CoordinatorCheckpointPartitionKivSource, String)>,
+    read_checkpoint_root_by_hash: String,
+    read_checkpoint_root_by_checkpoint: String,
 }
 
 impl CoordinatorRollbackArchiveQueries {
@@ -115,12 +121,30 @@ impl CoordinatorRollbackArchiveQueries {
                 )
             })
             .collect();
+        let root_by_hash = physical_descriptor(
+            ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK1,
+        );
+        let root_by_checkpoint = physical_descriptor(
+            ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK2,
+        );
         Self {
             create: CREATE_TEMPLATE.replace("{table}", &archive_table),
             insert: INSERT_TEMPLATE.replace("{table}", &archive_table),
             read_row: READ_ROW_TEMPLATE.replace("{table}", &archive_table),
             read_fragment: READ_FRAGMENT_TEMPLATE.replace("{table}", &archive_table),
             read_checkpoint_kiv,
+            read_checkpoint_root_by_hash: READ_SOURCE_TEMPLATE.replace(
+                "{table}",
+                &format!("{}.{}", source.as_str(), root_by_hash.physical_name),
+            ),
+            read_checkpoint_root_by_checkpoint: READ_SOURCE_TEMPLATE.replace(
+                "{table}",
+                &format!(
+                    "{}.{}",
+                    source.as_str(),
+                    root_by_checkpoint.physical_name
+                ),
+            ),
         }
     }
 
@@ -135,6 +159,11 @@ impl CoordinatorRollbackArchiveQueries {
         for (kind, query) in &self.read_checkpoint_kiv {
             golden.push_str(&format!("\nread_checkpoint_kiv_{kind:?}\n{query}\n"));
         }
+        golden.push_str(&format!(
+            "\nread_checkpoint_root_by_hash\n{}\n\nread_checkpoint_root_by_checkpoint\n{}\n",
+            self.read_checkpoint_root_by_hash,
+            self.read_checkpoint_root_by_checkpoint,
+        ));
         golden
     }
 }
@@ -196,6 +225,96 @@ impl CoordinatorRollbackArchiveRowDigest {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CoordinatorRollbackArchiveStoreFingerprint([u8; 32]);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CheckpointRootPairSourceImage {
+    checkpoint: u64,
+    root: [u8; 32],
+    k1_stored_checkpoint: Vec<u8>,
+    k1_writetime_us: i64,
+    k2_stored_root: Vec<u8>,
+    k2_writetime_us: i64,
+}
+
+impl CheckpointRootPairSourceImage {
+    fn validate(&self) -> Result<(), CoordinatorRollbackArchiveRowError> {
+        let checkpoint = compression::decompress(&self.k1_stored_checkpoint)
+            .map_err(|error| CoordinatorRollbackArchiveRowError::RootPairCodec(error.to_string()))?;
+        let checkpoint: [u8; 8] = checkpoint
+            .try_into()
+            .map_err(|value: Vec<u8>| CoordinatorRollbackArchiveRowError::InvalidRootPairCheckpointLength(value.len()))?;
+        if u64::from_le_bytes(checkpoint) != self.checkpoint {
+            return Err(CoordinatorRollbackArchiveRowError::InconsistentRootPair);
+        }
+        let root = compression::decompress(&self.k2_stored_root)
+            .map_err(|error| CoordinatorRollbackArchiveRowError::RootPairCodec(error.to_string()))?;
+        let root: [u8; 32] = root
+            .try_into()
+            .map_err(|value: Vec<u8>| CoordinatorRollbackArchiveRowError::InvalidRootPairRootLength(value.len()))?;
+        if root != self.root {
+            return Err(CoordinatorRollbackArchiveRowError::InconsistentRootPair);
+        }
+        Ok(())
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, CoordinatorRollbackArchiveRowError> {
+        self.validate()?;
+        let k1_len = u32::try_from(self.k1_stored_checkpoint.len())
+            .map_err(|_| CoordinatorRollbackArchiveRowError::LengthOverflow)?;
+        let k2_len = u32::try_from(self.k2_stored_root.len())
+            .map_err(|_| CoordinatorRollbackArchiveRowError::LengthOverflow)?;
+        let mut bytes = Vec::with_capacity(
+            8 + 2 + 8 + 32 + 4 + self.k1_stored_checkpoint.len() + 8 + 4
+                + self.k2_stored_root.len()
+                + 8,
+        );
+        bytes.extend_from_slice(&ROOT_PAIR_PAYLOAD_MAGIC);
+        bytes.extend_from_slice(&ROOT_PAIR_PAYLOAD_VERSION.to_be_bytes());
+        bytes.extend_from_slice(&self.checkpoint.to_be_bytes());
+        bytes.extend_from_slice(&self.root);
+        bytes.extend_from_slice(&k1_len.to_be_bytes());
+        bytes.extend_from_slice(&self.k1_stored_checkpoint);
+        bytes.extend_from_slice(&self.k1_writetime_us.to_be_bytes());
+        bytes.extend_from_slice(&k2_len.to_be_bytes());
+        bytes.extend_from_slice(&self.k2_stored_root);
+        bytes.extend_from_slice(&self.k2_writetime_us.to_be_bytes());
+        Ok(bytes)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, CoordinatorRollbackArchiveRowError> {
+        let mut decoder = Decoder::new(bytes);
+        if decoder.take(8)? != ROOT_PAIR_PAYLOAD_MAGIC {
+            return Err(CoordinatorRollbackArchiveRowError::InvalidRootPairMagic);
+        }
+        let version = decoder.u16()?;
+        if version != ROOT_PAIR_PAYLOAD_VERSION {
+            return Err(CoordinatorRollbackArchiveRowError::UnknownRootPairVersion(version));
+        }
+        let checkpoint = decoder.u64()?;
+        let root = decoder.array_32()?;
+        let k1_len = usize::try_from(decoder.u32()?)
+            .map_err(|_| CoordinatorRollbackArchiveRowError::LengthOverflow)?;
+        let k1_stored_checkpoint = decoder.take(k1_len)?.to_vec();
+        let k1_writetime_us = decoder.i64()?;
+        let k2_len = usize::try_from(decoder.u32()?)
+            .map_err(|_| CoordinatorRollbackArchiveRowError::LengthOverflow)?;
+        let k2_stored_root = decoder.take(k2_len)?.to_vec();
+        let k2_writetime_us = decoder.i64()?;
+        if !decoder.is_empty() {
+            return Err(CoordinatorRollbackArchiveRowError::TrailingBytes);
+        }
+        let image = Self {
+            checkpoint,
+            root,
+            k1_stored_checkpoint,
+            k1_writetime_us,
+            k2_stored_root,
+            k2_writetime_us,
+        };
+        image.validate()?;
+        Ok(image)
+    }
+}
 
 /// Canonical archive image of one real checkpoint-keyed KIV row.
 ///
@@ -355,6 +474,128 @@ impl CoordinatorRollbackCheckpointKivArchiveRow {
         })
     }
 
+    fn try_checkpoint_root_pair<Hash: Q256BitHash>(
+        network: NetworkId,
+        chain_epoch: u64,
+        plan: &CoordinatorRollbackArchivePlan<Hash>,
+        source: CheckpointRootPairSourceImage,
+    ) -> Result<Self, CoordinatorRollbackArchiveRowError> {
+        let by_hash = plan
+            .domains()
+            .iter()
+            .find(|domain| domain.key_domain() == ScyllaKeyDomain::CheckpointRootByHash)
+            .copied()
+            .ok_or(CoordinatorRollbackArchiveRowError::DomainNotPlanned)?;
+        let by_checkpoint = plan
+            .domains()
+            .iter()
+            .find(|domain| domain.key_domain() == ScyllaKeyDomain::CheckpointRootByCheckpoint)
+            .copied()
+            .ok_or(CoordinatorRollbackArchiveRowError::DomainNotPlanned)?;
+        if by_hash.physical_table()
+            != ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK1
+            || by_checkpoint.physical_table()
+                != ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK2
+            || by_hash.action()
+                != CoordinatorRollbackArchiveAction::ArchiveManifestPointRowsAndRebuild
+            || by_checkpoint.action()
+                != CoordinatorRollbackArchiveAction::ArchiveCheckpointPartitionsAndRebuild
+        {
+            return Err(CoordinatorRollbackArchiveRowError::DomainContractMismatch);
+        }
+        if source.checkpoint <= plan.suffix_start_exclusive()
+            || source.checkpoint > plan.suffix_end_inclusive()
+        {
+            return Err(CoordinatorRollbackArchiveRowError::SourceOutsideSuffix);
+        }
+        source.validate()?;
+        let orphan_write_max_us = plan
+            .request()
+            .fence_window()
+            .delete_fence()
+            .orphan_write_max()
+            .as_i64();
+        for writetime_us in [source.k1_writetime_us, source.k2_writetime_us] {
+            if writetime_us > orphan_write_max_us {
+                return Err(CoordinatorRollbackArchiveRowError::WriteAfterOrphanFence {
+                    writetime_us,
+                    orphan_write_max_us,
+                });
+            }
+        }
+        let source_value = source.encode()?;
+        let source_writetime_us = source.k1_writetime_us.max(source.k2_writetime_us);
+        let participant_plan_digest = plan.digest();
+        let global_plan_digest = *plan.global_plan_digest().as_bytes();
+        let requested_height = plan.request().requested_head().checkpoint_id().get();
+        let requested_hash = plan
+            .request()
+            .requested_head()
+            .checkpoint_hash()
+            .as_inner()
+            .into_owned_32bytes();
+        let target_height = plan.request().target().checkpoint_id().get();
+        let target_hash = plan
+            .request()
+            .target()
+            .checkpoint_hash()
+            .as_inner()
+            .into_owned_32bytes();
+        let slot = row_slot(
+            network,
+            chain_epoch,
+            participant_plan_digest,
+            by_checkpoint.key_domain(),
+            source.checkpoint,
+        );
+        let mut canonical_bytes = encode_row_without_digest(
+            network,
+            chain_epoch,
+            participant_plan_digest,
+            global_plan_digest,
+            by_checkpoint.key_domain(),
+            by_checkpoint.physical_table(),
+            by_checkpoint.action(),
+            requested_height,
+            requested_hash,
+            target_height,
+            target_hash,
+            orphan_write_max_us,
+            source.checkpoint,
+            &source_value,
+            source_writetime_us,
+            slot,
+        )?;
+        let digest = row_digest(&canonical_bytes);
+        canonical_bytes.extend_from_slice(digest.as_bytes());
+        if canonical_bytes.len() > MAX_CANONICAL_ROW_BYTES {
+            return Err(CoordinatorRollbackArchiveRowError::RowTooLarge {
+                actual: canonical_bytes.len(),
+                maximum: MAX_CANONICAL_ROW_BYTES,
+            });
+        }
+        Ok(Self {
+            network,
+            chain_epoch,
+            participant_plan_digest,
+            global_plan_digest,
+            key_domain: by_checkpoint.key_domain(),
+            physical_table: by_checkpoint.physical_table(),
+            action: by_checkpoint.action(),
+            requested_height,
+            requested_hash,
+            target_height,
+            target_hash,
+            orphan_write_max_us,
+            source_checkpoint: source.checkpoint,
+            source_value,
+            source_writetime_us,
+            slot,
+            canonical_bytes,
+            digest,
+        })
+    }
+
     fn decode_canonical(bytes: &[u8]) -> Result<Self, CoordinatorRollbackArchiveRowError> {
         if bytes.len() < ROW_MIN_BYTES {
             return Err(CoordinatorRollbackArchiveRowError::Truncated);
@@ -391,12 +632,9 @@ impl CoordinatorRollbackCheckpointKivArchiveRow {
         if global_plan_digest == [0; 32] {
             return Err(CoordinatorRollbackArchiveRowError::ZeroGlobalPlanDigest);
         }
-        let key_domain = decode_checkpoint_kiv_key_domain(decoder.u16()?)?;
-        let physical_table = decode_checkpoint_kiv_physical_table(decoder.u16()?)?;
-        if key_domain_descriptor(key_domain).physical_table != physical_table
-            || physical_descriptor(physical_table).schema_family
-                != ScyllaSchemaFamily::Kiv
-        {
+        let key_domain = decode_archive_key_domain(decoder.u16()?)?;
+        let physical_table = decode_archive_physical_table(decoder.u16()?)?;
+        if key_domain_descriptor(key_domain).physical_table != physical_table {
             return Err(CoordinatorRollbackArchiveRowError::DomainContractMismatch);
         }
         let action = match decoder.u8()? {
@@ -405,6 +643,13 @@ impl CoordinatorRollbackCheckpointKivArchiveRow {
                     == CoordinatorRollbackArchiveAction::ArchiveCheckpointPartitions as u8 =>
             {
                 CoordinatorRollbackArchiveAction::ArchiveCheckpointPartitions
+            }
+            value
+                if value
+                    == CoordinatorRollbackArchiveAction::ArchiveCheckpointPartitionsAndRebuild
+                        as u8 =>
+            {
+                CoordinatorRollbackArchiveAction::ArchiveCheckpointPartitionsAndRebuild
             }
             value => return Err(CoordinatorRollbackArchiveRowError::UnknownAction(value)),
         };
@@ -443,6 +688,35 @@ impl CoordinatorRollbackCheckpointKivArchiveRow {
         );
         if slot != expected_slot {
             return Err(CoordinatorRollbackArchiveRowError::RowSlotMismatch);
+        }
+        match key_domain {
+            ScyllaKeyDomain::CheckpointRootByCheckpoint => {
+                if physical_table
+                    != ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK2
+                    || action
+                        != CoordinatorRollbackArchiveAction::ArchiveCheckpointPartitionsAndRebuild
+                {
+                    return Err(CoordinatorRollbackArchiveRowError::DomainContractMismatch);
+                }
+                let source = CheckpointRootPairSourceImage::decode(&source_value)?;
+                if source.checkpoint != source_checkpoint
+                    || source_writetime_us
+                        != source.k1_writetime_us.max(source.k2_writetime_us)
+                    || source.k1_writetime_us > orphan_write_max_us
+                    || source.k2_writetime_us > orphan_write_max_us
+                {
+                    return Err(CoordinatorRollbackArchiveRowError::InconsistentRootPair);
+                }
+            }
+            _ => {
+                if action
+                    != CoordinatorRollbackArchiveAction::ArchiveCheckpointPartitions
+                    || physical_descriptor(physical_table).schema_family
+                        != ScyllaSchemaFamily::Kiv
+                {
+                    return Err(CoordinatorRollbackArchiveRowError::DomainContractMismatch);
+                }
+            }
         }
         Ok(Self {
             network,
@@ -1623,7 +1897,7 @@ fn fragment_digest(index: i32, bytes: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-fn decode_checkpoint_kiv_key_domain(
+fn decode_archive_key_domain(
     value: u16,
 ) -> Result<ScyllaKeyDomain, CoordinatorRollbackArchiveRowError> {
     for source in CoordinatorCheckpointPartitionKivSource::ALL {
@@ -1631,16 +1905,22 @@ fn decode_checkpoint_kiv_key_domain(
             return Ok(source.key_domain());
         }
     }
+    if ScyllaKeyDomain::CheckpointRootByCheckpoint.stable_id() == value {
+        return Ok(ScyllaKeyDomain::CheckpointRootByCheckpoint);
+    }
     Err(CoordinatorRollbackArchiveRowError::UnknownKeyDomain(value))
 }
 
-fn decode_checkpoint_kiv_physical_table(
+fn decode_archive_physical_table(
     value: u16,
 ) -> Result<ScyllaPhysicalTableId, CoordinatorRollbackArchiveRowError> {
     for source in CoordinatorCheckpointPartitionKivSource::ALL {
         if source.physical_table().stable_id() == value {
             return Ok(source.physical_table());
         }
+    }
+    if ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK2.stable_id() == value {
+        return Ok(ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK2);
     }
     Err(CoordinatorRollbackArchiveRowError::UnknownPhysicalTable(
         value,
@@ -1741,6 +2021,35 @@ impl CoordinatorRollbackArchiveScanSummary {
     }
 }
 
+/// Inert progress evidence for the bidirectional checkpoint-root source pair.
+/// `source_rows` counts both physical directions; `archive_rows` counts the
+/// single canonical pair image written for each discarded checkpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CoordinatorRollbackRootPairArchiveSummary {
+    source_rows: u64,
+    archive_rows: u64,
+    canonical_bytes: u64,
+    dataset_digest: [u8; 32],
+}
+
+impl CoordinatorRollbackRootPairArchiveSummary {
+    pub(super) const fn source_rows(self) -> u64 {
+        self.source_rows
+    }
+
+    pub(super) const fn archive_rows(self) -> u64 {
+        self.archive_rows
+    }
+
+    pub(super) const fn canonical_bytes(self) -> u64 {
+        self.canonical_bytes
+    }
+
+    pub(super) const fn dataset_digest(self) -> [u8; 32] {
+        self.dataset_digest
+    }
+}
+
 pub(super) struct ScyllaCoordinatorRollbackArchiveStore {
     session: Arc<Session>,
     fingerprint: CoordinatorRollbackArchiveStoreFingerprint,
@@ -1751,6 +2060,8 @@ pub(super) struct ScyllaCoordinatorRollbackArchiveStore {
         CoordinatorCheckpointPartitionKivSource,
         PreparedStatement,
     )>,
+    read_checkpoint_root_by_hash: PreparedStatement,
+    read_checkpoint_root_by_checkpoint: PreparedStatement,
 }
 
 impl ScyllaCoordinatorRollbackArchiveStore {
@@ -1793,6 +2104,16 @@ impl ScyllaCoordinatorRollbackArchiveStore {
             read_fragment: prepare_read(&session, queries.read_fragment).await?,
             insert: prepare_lwt(&session, queries.insert).await?,
             read_checkpoint_kiv,
+            read_checkpoint_root_by_hash: prepare_read(
+                &session,
+                queries.read_checkpoint_root_by_hash,
+            )
+            .await?,
+            read_checkpoint_root_by_checkpoint: prepare_read(
+                &session,
+                queries.read_checkpoint_root_by_checkpoint,
+            )
+            .await?,
             session,
             fingerprint,
         })
@@ -1875,6 +2196,81 @@ impl ScyllaCoordinatorRollbackArchiveStore {
         dataset.update(canonical_bytes.to_be_bytes());
         Ok(CoordinatorRollbackArchiveScanSummary {
             row_count,
+            canonical_bytes,
+            dataset_digest: dataset.finalize().into(),
+        })
+    }
+
+    /// Archive both physical directions of every checkpoint-root mapping in
+    /// `(target, requested_head]` as one immutable canonical pair image.
+    /// Missing, malformed, cross-linked, post-fence, or concurrently changing
+    /// directions fail closed. This remains pre-PONR and cannot delete rows.
+    pub(super) async fn archive_checkpoint_root_pair_suffix<Hash: Q256BitHash>(
+        &self,
+        canonical_head_store: &ScyllaCanonicalHeadStore,
+        expected_head: StoredCanonicalHead<Hash>,
+        plan: &CoordinatorRollbackArchivePlan<Hash>,
+    ) -> Result<CoordinatorRollbackRootPairArchiveSummary, CoordinatorRollbackArchiveStoreError> {
+        validate_archiving_head(expected_head, plan)?;
+        self.require_current_head(canonical_head_store, expected_head)
+            .await?;
+
+        let network = expected_head.canonical_ref().network_id();
+        let chain_epoch = expected_head.canonical_ref().chain_epoch().get();
+        let end = plan.suffix_end_inclusive();
+        let mut source_rows = 0_u64;
+        let mut archive_rows = 0_u64;
+        let mut canonical_bytes = 0_u64;
+        let mut dataset = Sha256::new();
+        dataset.update(ROOT_PAIR_DATASET_DIGEST_DOMAIN);
+        dataset.update(plan.digest().as_bytes());
+
+        let mut checkpoint = plan
+            .suffix_start_exclusive()
+            .checked_add(1)
+            .ok_or(CoordinatorRollbackArchiveStoreError::CheckpointOverflow)?;
+        while checkpoint <= end {
+            let first = self.read_checkpoint_root_pair(checkpoint).await?;
+            let row = CoordinatorRollbackCheckpointKivArchiveRow::try_checkpoint_root_pair(
+                network,
+                chain_epoch,
+                plan,
+                first.clone(),
+            )?;
+            let receipt = self.persist_exact(row).await?;
+            self.revalidate_exact(&receipt).await?;
+            let second = self.read_checkpoint_root_pair(checkpoint).await?;
+            if second != first {
+                return Err(CoordinatorRollbackArchiveStoreError::SourceChanged);
+            }
+            source_rows = source_rows
+                .checked_add(2)
+                .ok_or(CoordinatorRollbackArchiveStoreError::LengthOverflow)?;
+            archive_rows = archive_rows
+                .checked_add(1)
+                .ok_or(CoordinatorRollbackArchiveStoreError::LengthOverflow)?;
+            canonical_bytes = canonical_bytes
+                .checked_add(receipt.row.canonical_bytes.len() as u64)
+                .ok_or(CoordinatorRollbackArchiveStoreError::LengthOverflow)?;
+            dataset.update(checkpoint.to_be_bytes());
+            dataset.update(receipt.row.slot.as_bytes());
+            dataset.update(receipt.row.digest.as_bytes());
+            if checkpoint == end {
+                break;
+            }
+            checkpoint = checkpoint
+                .checked_add(1)
+                .ok_or(CoordinatorRollbackArchiveStoreError::CheckpointOverflow)?;
+        }
+
+        self.require_current_head(canonical_head_store, expected_head)
+            .await?;
+        dataset.update(source_rows.to_be_bytes());
+        dataset.update(archive_rows.to_be_bytes());
+        dataset.update(canonical_bytes.to_be_bytes());
+        Ok(CoordinatorRollbackRootPairArchiveSummary {
+            source_rows,
+            archive_rows,
             canonical_bytes,
             dataset_digest: dataset.finalize().into(),
         })
@@ -1992,6 +2388,63 @@ impl ScyllaCoordinatorRollbackArchiveStore {
             writetime_us: writetime_us
                 .ok_or(CoordinatorRollbackArchiveStoreError::MissingSourceColumn)?,
         }))
+    }
+
+    async fn read_checkpoint_root_pair(
+        &self,
+        checkpoint: u64,
+    ) -> Result<CheckpointRootPairSourceImage, CoordinatorRollbackArchiveStoreError> {
+        let checkpoint_key = checkpoint.to_le_bytes();
+        let (k2_stored_root, k2_writetime_us) = self
+            .read_raw_source(
+                &self.read_checkpoint_root_by_checkpoint,
+                checkpoint_key.as_slice(),
+            )
+            .await?
+            .ok_or(CoordinatorRollbackArchiveStoreError::MissingCheckpointRootDirection)?;
+        let root = compression::decompress(&k2_stored_root)
+            .map_err(|error| CoordinatorRollbackArchiveStoreError::SourceCodec(error.to_string()))?;
+        let root: [u8; 32] = root
+            .try_into()
+            .map_err(|value: Vec<u8>| CoordinatorRollbackArchiveStoreError::InvalidRootLength(value.len()))?;
+        let (k1_stored_checkpoint, k1_writetime_us) = self
+            .read_raw_source(&self.read_checkpoint_root_by_hash, root.as_slice())
+            .await?
+            .ok_or(CoordinatorRollbackArchiveStoreError::MissingCheckpointRootDirection)?;
+        let source = CheckpointRootPairSourceImage {
+            checkpoint,
+            root,
+            k1_stored_checkpoint,
+            k1_writetime_us,
+            k2_stored_root,
+            k2_writetime_us,
+        };
+        source.validate()?;
+        Ok(source)
+    }
+
+    async fn read_raw_source(
+        &self,
+        statement: &PreparedStatement,
+        key: &[u8],
+    ) -> Result<Option<(Vec<u8>, i64)>, CoordinatorRollbackArchiveStoreError> {
+        let row = self
+            .session
+            .execute_unpaged(statement, (key,))
+            .await
+            .map_err(cql)?
+            .into_rows_result()
+            .map_err(cql)?
+            .maybe_first_row::<(Option<Vec<u8>>, Option<i64>)>()
+            .map_err(cql)?;
+        row.map(|(value, writetime_us)| {
+            Ok((
+                value.ok_or(CoordinatorRollbackArchiveStoreError::MissingSourceColumn)?,
+                writetime_us
+                    .ok_or(CoordinatorRollbackArchiveStoreError::MissingSourceColumn)?,
+            ))
+        })
+        .transpose()
     }
 
     async fn persist_exact(
@@ -2736,6 +3189,12 @@ pub(super) enum CoordinatorRollbackArchiveRowError {
     UnknownKeyDomain(u16),
     UnknownPhysicalTable(u16),
     UnknownAction(u8),
+    InvalidRootPairMagic,
+    UnknownRootPairVersion(u16),
+    InvalidRootPairCheckpointLength(usize),
+    InvalidRootPairRootLength(usize),
+    InconsistentRootPair,
+    RootPairCodec(String),
     DomainNotPlanned,
     DomainContractMismatch,
     InvalidRollbackRange,
@@ -2862,6 +3321,9 @@ pub(super) enum CoordinatorRollbackArchiveStoreError {
     LengthOverflow,
     MissingPreparedSource,
     MissingSourceColumn,
+    MissingCheckpointRootDirection,
+    InvalidRootLength(usize),
+    SourceCodec(String),
     SourceChanged,
     MissingArchiveColumn,
     InvalidArchiveRevision,
@@ -3222,6 +3684,83 @@ mod tests {
         }
     }
 
+    fn root_pair_source(
+        checkpoint: u64,
+        root_seed: u8,
+        k1_writetime_us: i64,
+        k2_writetime_us: i64,
+    ) -> CheckpointRootPairSourceImage {
+        let root = [root_seed; 32];
+        CheckpointRootPairSourceImage {
+            checkpoint,
+            root,
+            k1_stored_checkpoint: compression::compress(&checkpoint.to_le_bytes()).unwrap(),
+            k1_writetime_us,
+            k2_stored_root: compression::compress(&root).unwrap(),
+            k2_writetime_us,
+        }
+    }
+
+    #[test]
+    fn checkpoint_root_pair_archive_roundtrip_binds_both_raw_directions() {
+        let first = CoordinatorRollbackCheckpointKivArchiveRow::try_checkpoint_root_pair(
+            NetworkId::try_from_chain_id(1).unwrap(),
+            7,
+            &plan(),
+            root_pair_source(95, 0x31, 998, 999),
+        )
+        .unwrap();
+        assert_eq!(first.key_domain, ScyllaKeyDomain::CheckpointRootByCheckpoint);
+        assert_eq!(
+            first.physical_table,
+            ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK2,
+        );
+        assert_eq!(
+            first.action,
+            CoordinatorRollbackArchiveAction::ArchiveCheckpointPartitionsAndRebuild,
+        );
+        assert_eq!(
+            CoordinatorRollbackCheckpointKivArchiveRow::decode_canonical(
+                &first.canonical_bytes,
+            )
+            .unwrap(),
+            first,
+        );
+        let decoded = CheckpointRootPairSourceImage::decode(&first.source_value).unwrap();
+        assert_eq!(decoded, root_pair_source(95, 0x31, 998, 999));
+
+        let changed = CoordinatorRollbackCheckpointKivArchiveRow::try_checkpoint_root_pair(
+            NetworkId::try_from_chain_id(1).unwrap(),
+            7,
+            &plan(),
+            root_pair_source(95, 0x32, 998, 999),
+        )
+        .unwrap();
+        assert_eq!(first.slot, changed.slot);
+        assert_ne!(first.digest, changed.digest);
+    }
+
+    #[test]
+    fn checkpoint_root_pair_archive_rejects_cross_link_and_post_fence_rows() {
+        let mut cross_linked = root_pair_source(95, 0x41, 998, 999);
+        cross_linked.k1_stored_checkpoint = compression::compress(&94_u64.to_le_bytes()).unwrap();
+        assert_eq!(
+            cross_linked.validate(),
+            Err(CoordinatorRollbackArchiveRowError::InconsistentRootPair),
+        );
+
+        let post_fence = root_pair_source(95, 0x41, 1_001, 999);
+        assert!(matches!(
+            CoordinatorRollbackCheckpointKivArchiveRow::try_checkpoint_root_pair(
+                NetworkId::try_from_chain_id(1).unwrap(),
+                7,
+                &plan(),
+                post_fence,
+            ),
+            Err(CoordinatorRollbackArchiveRowError::WriteAfterOrphanFence { .. }),
+        ));
+    }
+
     #[test]
     fn structurally_forged_rehashed_slot_is_rejected() {
         let row = row(vec![1, 2, 3]);
@@ -3304,6 +3843,14 @@ mod tests {
         assert!(!queries.golden().contains("DELETE FROM"));
         assert!(!queries.golden().contains("UPDATE "));
         assert_eq!(queries.read_checkpoint_kiv.len(), 4);
+        assert_eq!(
+            queries.read_checkpoint_root_by_hash,
+            "SELECT value, WRITETIME(value) FROM coordinator_state.checkpoint_root_to_checkpoint_id_table_k1 WHERE obj_id = ?",
+        );
+        assert_eq!(
+            queries.read_checkpoint_root_by_checkpoint,
+            "SELECT value, WRITETIME(value) FROM coordinator_state.checkpoint_root_to_checkpoint_id_table_k2 WHERE obj_id = ?",
+        );
         assert_eq!(
             queries
                 .read_checkpoint_kiv
