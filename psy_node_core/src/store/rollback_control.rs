@@ -1,8 +1,10 @@
 //! Driver-independent rollback admission data stored beside the canonical head.
 //!
-//! The first control slice deliberately models only `IDLE -> REQUESTED`.
-//! Later phase/PONR transitions must extend this sealed authority rather than
-//! create a second independently writable control row.
+//! Rollback phases extend this one sealed authority instead of creating a
+//! second independently writable control row.  The current public transition
+//! surface stops at `ARCHIVING`; archive-barrier and destructive transitions
+//! require future storage-owned evidence and therefore have no constructor in
+//! this slice.
 
 use std::{error::Error, fmt};
 
@@ -22,6 +24,9 @@ pub const ROLLBACK_CONTROL_V1_LEN: usize = 154;
 const CONTROL_KIND_IDLE: u8 = 0;
 const CONTROL_KIND_REQUESTED: u8 = 1;
 const PHASE_REQUESTED: u8 = 1;
+const PHASE_ARCHIVING: u8 = 2;
+const PHASE_ARCHIVE_BARRIER_READY: u8 = 3;
+const PHASE_DELETING: u8 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RollbackPlanDigest([u8; 32]);
@@ -115,6 +120,9 @@ impl<Hash> RollbackRequest<Hash> {
 pub enum RollbackControlState<Hash> {
     Idle,
     Requested(RollbackRequest<Hash>),
+    Archiving(RollbackRequest<Hash>),
+    ArchiveBarrierReady(RollbackRequest<Hash>),
+    Deleting(RollbackRequest<Hash>),
 }
 
 impl<Hash> RollbackControlState<Hash> {
@@ -125,8 +133,23 @@ impl<Hash> RollbackControlState<Hash> {
     pub const fn requested(&self) -> Option<&RollbackRequest<Hash>> {
         match self {
             Self::Idle => None,
-            Self::Requested(request) => Some(request),
+            Self::Requested(request)
+            | Self::Archiving(request)
+            | Self::ArchiveBarrierReady(request)
+            | Self::Deleting(request) => Some(request),
         }
+    }
+
+    pub const fn is_archiving(&self) -> bool {
+        matches!(self, Self::Archiving(_))
+    }
+
+    pub const fn archive_barrier_ready(&self) -> bool {
+        matches!(self, Self::ArchiveBarrierReady(_))
+    }
+
+    pub const fn destructive_started(&self) -> bool {
+        matches!(self, Self::Deleting(_))
     }
 }
 
@@ -139,9 +162,18 @@ impl<Hash: Q256BitHash> RollbackControlState<Hash> {
             Self::Idle => {
                 encoded[10] = CONTROL_KIND_IDLE;
             }
-            Self::Requested(request) => {
+            Self::Requested(request)
+            | Self::Archiving(request)
+            | Self::ArchiveBarrierReady(request)
+            | Self::Deleting(request) => {
                 encoded[10] = CONTROL_KIND_REQUESTED;
-                encoded[11] = PHASE_REQUESTED;
+                encoded[11] = match self {
+                    Self::Requested(_) => PHASE_REQUESTED,
+                    Self::Archiving(_) => PHASE_ARCHIVING,
+                    Self::ArchiveBarrierReady(_) => PHASE_ARCHIVE_BARRIER_READY,
+                    Self::Deleting(_) => PHASE_DELETING,
+                    Self::Idle => unreachable!("active rollback arm excludes IDLE"),
+                };
                 encode_checkpoint_ref(&mut encoded[12..52], request.requested_head());
                 encode_checkpoint_ref(&mut encoded[52..92], request.target());
                 let orphan_max = request
@@ -160,8 +192,9 @@ impl<Hash: Q256BitHash> RollbackControlState<Hash> {
                 encoded[108..116].copy_from_slice(&new_branch.to_le_bytes());
                 encoded[116] = request.execution_mode() as u8;
                 encoded[117..149].copy_from_slice(request.plan_digest().as_bytes());
-                // destructive_started=false, abort_code=0, error_code=0.
-                encoded[149] = 0;
+                // abort_code=0, error_code=0.  The destructive flag becomes
+                // true only after the global archive barrier.
+                encoded[149] = u8::from(matches!(self, Self::Deleting(_)));
             }
         }
         encoded
@@ -189,11 +222,34 @@ impl<Hash: Q256BitHash> RollbackControlState<Hash> {
                 Ok(Self::Idle)
             }
             CONTROL_KIND_REQUESTED => {
-                if bytes[11] != PHASE_REQUESTED {
-                    return Err(RollbackControlCodecError::UnknownPhase(bytes[11]));
+                let phase = bytes[11];
+                if !matches!(
+                    phase,
+                    PHASE_REQUESTED
+                        | PHASE_ARCHIVING
+                        | PHASE_ARCHIVE_BARRIER_READY
+                        | PHASE_DELETING
+                ) {
+                    return Err(RollbackControlCodecError::UnknownPhase(phase));
                 }
-                if bytes[149] != 0 || bytes[150..154].iter().any(|byte| *byte != 0) {
-                    return Err(RollbackControlCodecError::RequestedMustBePreDestructive);
+                if bytes[150..154].iter().any(|byte| *byte != 0) {
+                    return Err(RollbackControlCodecError::AbortAndErrorCodesUnsupported);
+                }
+                let destructive = bytes[149];
+                if destructive > 1 {
+                    return Err(RollbackControlCodecError::InvalidDestructiveFlag(
+                        destructive,
+                    ));
+                }
+                if phase == PHASE_DELETING && destructive != 1 {
+                    return Err(
+                        RollbackControlCodecError::DeletingMustBeDestructive,
+                    );
+                }
+                if phase != PHASE_DELETING && destructive != 0 {
+                    return Err(
+                        RollbackControlCodecError::PreBarrierPhaseMustBeNonDestructive,
+                    );
                 }
                 let requested_head = decode_checkpoint_ref(&bytes[12..52]);
                 let target = decode_checkpoint_ref(&bytes[52..92]);
@@ -217,7 +273,15 @@ impl<Hash: Q256BitHash> RollbackControlState<Hash> {
                     execution_mode,
                     plan_digest,
                 )?;
-                Ok(Self::Requested(request))
+                Ok(match phase {
+                    PHASE_REQUESTED => Self::Requested(request),
+                    PHASE_ARCHIVING => Self::Archiving(request),
+                    PHASE_ARCHIVE_BARRIER_READY => {
+                        Self::ArchiveBarrierReady(request)
+                    }
+                    PHASE_DELETING => Self::Deleting(request),
+                    _ => unreachable!("phase validated above"),
+                })
             }
             other => Err(RollbackControlCodecError::UnknownControlKind(other)),
         }
@@ -281,7 +345,10 @@ pub enum RollbackControlCodecError {
     UnknownPhase(u8),
     UnknownExecutionMode(u8),
     NonCanonicalIdle,
-    RequestedMustBePreDestructive,
+    InvalidDestructiveFlag(u8),
+    PreBarrierPhaseMustBeNonDestructive,
+    DeletingMustBeDestructive,
+    AbortAndErrorCodesUnsupported,
     Model(RollbackControlError),
 }
 
@@ -299,9 +366,18 @@ impl fmt::Display for RollbackControlCodecError {
             Self::UnknownPhase(phase) => write!(formatter, "unknown rollback phase {phase}"),
             Self::UnknownExecutionMode(mode) => write!(formatter, "unknown rollback execution mode {mode}"),
             Self::NonCanonicalIdle => write!(formatter, "idle rollback control has non-zero trailing fields"),
-            Self::RequestedMustBePreDestructive => write!(
+            Self::InvalidDestructiveFlag(value) => write!(
                 formatter,
-                "REQUESTED rollback control cannot be destructive or carry abort/error codes"
+                "rollback destructive flag must be zero or one, got {value}"
+            ),
+            Self::PreBarrierPhaseMustBeNonDestructive => formatter.write_str(
+                "rollback cannot be destructive before the archive barrier",
+            ),
+            Self::DeletingMustBeDestructive => formatter.write_str(
+                "DELETING rollback control must carry destructive_started=true",
+            ),
+            Self::AbortAndErrorCodesUnsupported => formatter.write_str(
+                "rollback abort/error codes are not supported by control codec v1",
             ),
             Self::Model(error) => error.fmt(formatter),
         }
@@ -384,6 +460,33 @@ mod tests {
         assert_eq!(
             RollbackControlState::from_canonical_bytes(&first).unwrap(),
             requested
+        );
+
+        for state in [
+            RollbackControlState::Archiving(request()),
+            RollbackControlState::ArchiveBarrierReady(request()),
+            RollbackControlState::Deleting(request()),
+        ] {
+            let encoded = state.to_canonical_bytes();
+            assert_eq!(
+                RollbackControlState::from_canonical_bytes(&encoded).unwrap(),
+                state
+            );
+        }
+        assert_eq!(
+            RollbackControlState::Archiving(request())
+                .to_canonical_bytes()[149],
+            0
+        );
+        assert_eq!(
+            RollbackControlState::ArchiveBarrierReady(request())
+                .to_canonical_bytes()[149],
+            0
+        );
+        assert_eq!(
+            RollbackControlState::Deleting(request())
+                .to_canonical_bytes()[149],
+            1
         );
     }
 
@@ -498,7 +601,33 @@ mod tests {
         destructive[149] = 1;
         assert_eq!(
             RollbackControlState::<PHash>::from_canonical_bytes(&destructive),
-            Err(RollbackControlCodecError::RequestedMustBePreDestructive)
+            Err(
+                RollbackControlCodecError::PreBarrierPhaseMustBeNonDestructive
+            )
+        );
+        let mut invalid_destructive = requested;
+        invalid_destructive[149] = 2;
+        assert_eq!(
+            RollbackControlState::<PHash>::from_canonical_bytes(
+                &invalid_destructive
+            ),
+            Err(RollbackControlCodecError::InvalidDestructiveFlag(2))
+        );
+        let mut deleting_without_flag = requested;
+        deleting_without_flag[11] = PHASE_DELETING;
+        assert_eq!(
+            RollbackControlState::<PHash>::from_canonical_bytes(
+                &deleting_without_flag
+            ),
+            Err(RollbackControlCodecError::DeletingMustBeDestructive)
+        );
+        let mut unsupported_abort = requested;
+        unsupported_abort[150] = 1;
+        assert_eq!(
+            RollbackControlState::<PHash>::from_canonical_bytes(
+                &unsupported_abort
+            ),
+            Err(RollbackControlCodecError::AbortAndErrorCodesUnsupported)
         );
     }
 }

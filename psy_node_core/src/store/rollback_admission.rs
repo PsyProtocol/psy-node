@@ -110,6 +110,11 @@ impl<Hash: Q256BitHash> RollbackAdmissionCommand<Hash> {
             RollbackControlState::Idle => {
                 unreachable!("start-rollback command always carries REQUESTED control")
             }
+            RollbackControlState::Archiving(_)
+            | RollbackControlState::ArchiveBarrierReady(_)
+            | RollbackControlState::Deleting(_) => {
+                unreachable!("admission command cannot contain a post-REQUESTED phase")
+            }
         }
     }
 

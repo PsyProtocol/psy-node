@@ -1,10 +1,10 @@
 //! Driver-independent durable canonical-head contracts.
 //!
-//! This module deliberately models only two safe transitions: advancing one
-//! checkpoint in the current epoch and atomically opening the next rollback
-//! epoch with a validated REQUESTED control while keeping the checkpoint
-//! unchanged. Publishing a rewind target remains a responsibility of the
-//! future durable rollback-control state machine.
+//! Besides ordinary checkpoint advance and rollback admission, this module
+//! permits the non-destructive `REQUESTED -> ARCHIVING` transition on the same
+//! canonical-head row.  Crossing the archive barrier, deleting hot rows, and
+//! publishing the target remain unavailable until storage-owned receipts are
+//! introduced.
 
 use std::{error::Error, fmt};
 
@@ -251,6 +251,7 @@ impl<Hash: Q256BitHash> CanonicalHeadBootstrap<Hash> {
 pub enum CanonicalHeadTransitionKind {
     NormalCheckpointAdvance,
     StartRollback,
+    BeginRollbackArchive,
 }
 
 /// A validated transition before its canonical payloads are sealed.
@@ -327,6 +328,34 @@ impl<Hash: Q256BitHash> CanonicalHeadTransition<Hash> {
                 revision: expected.revision.checked_next()?,
                 canonical_ref: proposed,
                 rollback_control: RollbackControlState::Requested(request),
+            },
+        })
+    }
+
+    /// Enter the archive-copy phase without changing checkpoint, epoch, plan,
+    /// or fence.  This remains pre-PONR and grants no archive or delete write
+    /// capability; it only makes the durable maintenance phase explicit.
+    pub fn begin_rollback_archive(
+        expected: StoredCanonicalHead<Hash>,
+    ) -> Result<Self, CanonicalHeadModelError> {
+        let request = match expected.rollback_control() {
+            RollbackControlState::Requested(request) => *request,
+            RollbackControlState::Idle => {
+                return Err(CanonicalHeadModelError::RollbackNotRequested);
+            }
+            RollbackControlState::Archiving(_)
+            | RollbackControlState::ArchiveBarrierReady(_)
+            | RollbackControlState::Deleting(_) => {
+                return Err(CanonicalHeadModelError::RollbackArchiveAlreadyStarted);
+            }
+        };
+        Ok(Self {
+            kind: CanonicalHeadTransitionKind::BeginRollbackArchive,
+            expected,
+            candidate: StoredCanonicalHead {
+                revision: expected.revision.checked_next()?,
+                canonical_ref: *expected.canonical_ref(),
+                rollback_control: RollbackControlState::Archiving(request),
             },
         })
     }
@@ -591,7 +620,7 @@ fn validate_control_against_head<Hash: PartialEq>(
     canonical_ref: &CanonicalChainRef<Hash>,
     control: &RollbackControlState<Hash>,
 ) -> Result<(), CanonicalHeadModelError> {
-    if let RollbackControlState::Requested(request) = control {
+    if let Some(request) = control.requested() {
         if canonical_ref.chain_epoch().get() == 0 {
             return Err(CanonicalHeadModelError::RequestedControlAtEpochZero);
         }
@@ -639,6 +668,8 @@ pub enum CanonicalHeadModelError {
     ChainEpochOverflow(u64),
     NormalAdvanceWhileRollbackActive,
     RollbackAlreadyActive,
+    RollbackNotRequested,
+    RollbackArchiveAlreadyStarted,
     RollbackRequestedHeadMismatch,
     RequestedControlAtEpochZero,
     AppliedStateMismatch,
@@ -701,6 +732,12 @@ impl fmt::Display for CanonicalHeadModelError {
             Self::RollbackAlreadyActive => {
                 formatter.write_str("rollback admission requires idle canonical control")
             }
+            Self::RollbackNotRequested => formatter.write_str(
+                "rollback archive cannot begin before an explicit rollback request",
+            ),
+            Self::RollbackArchiveAlreadyStarted => formatter.write_str(
+                "rollback archive can begin only from the exact REQUESTED phase",
+            ),
             Self::RollbackRequestedHeadMismatch => formatter.write_str(
                 "rollback request head must equal the exact current canonical checkpoint",
             ),
@@ -1010,6 +1047,62 @@ mod tests {
                 &requested_bytes,
             ),
             Err(CanonicalHeadModelError::RollbackRequestedHeadMismatch)
+        );
+    }
+
+    #[test]
+    fn rollback_archive_begin_is_same_row_pre_ponr_and_exactly_once() {
+        let head = canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 10, 50);
+        let expected = stored_for_test(head);
+        let target = *canonical_ref(
+            PsyChainNetworkType::PsyMainnet,
+            0,
+            7,
+            40,
+        )
+        .checkpoint();
+        let request = rollback_request(*head.checkpoint(), target);
+        let requested = CanonicalHeadTransition::start_rollback(expected, request)
+            .unwrap();
+        let archiving = CanonicalHeadTransition::begin_rollback_archive(
+            *requested.candidate(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            archiving.kind(),
+            CanonicalHeadTransitionKind::BeginRollbackArchive
+        );
+        assert_eq!(
+            archiving.candidate().revision().get(),
+            requested.candidate().revision().get() + 1
+        );
+        assert_eq!(
+            archiving.candidate().canonical_ref(),
+            requested.candidate().canonical_ref()
+        );
+        assert!(archiving.candidate().rollback_control().is_archiving());
+        assert!(!archiving
+            .candidate()
+            .rollback_control()
+            .archive_barrier_ready());
+        assert!(!archiving
+            .candidate()
+            .rollback_control()
+            .destructive_started());
+        assert_eq!(
+            archiving.candidate().rollback_control().requested(),
+            Some(&request)
+        );
+        assert_eq!(
+            CanonicalHeadTransition::begin_rollback_archive(expected),
+            Err(CanonicalHeadModelError::RollbackNotRequested)
+        );
+        assert_eq!(
+            CanonicalHeadTransition::begin_rollback_archive(
+                *archiving.candidate()
+            ),
+            Err(CanonicalHeadModelError::RollbackArchiveAlreadyStarted)
         );
     }
 
