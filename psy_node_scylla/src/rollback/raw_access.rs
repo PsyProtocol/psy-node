@@ -131,6 +131,7 @@ pub const RAW_SCYLLA_ACCESS_ALLOWLIST: &[RawScyllaAccessAllowance] = &[
     allow!("psy_node_scylla/src/rollback/realm_user_update_router.rs", DurableControlAuthority),
     allow!("psy_node_scylla/src/rollback/reward_tag_tree.rs", RollbackPrototypeAdapter),
     allow!("psy_node_scylla/src/rollback/rollback_admission.rs", DurableControlAuthority),
+    allow!("psy_node_scylla/src/rollback/rollback_participant_plan_store.rs", DurableControlAuthority),
     allow!("psy_node_scylla/src/rollback/timestamp_prototype.rs", RollbackPrototypeAdapter),
     allow!("psy_node_scylla/src/table_creator.rs", DriverCore),
     allow!("psy_node_scylla/src/tables/blob.rs", LegacyTableAdapter),

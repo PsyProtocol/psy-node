@@ -31,6 +31,7 @@ pub mod rollback_admin;
 pub mod rollback_admission;
 pub mod rollback_control;
 pub mod rollback_participant_plan;
+pub mod rollback_topology;
 pub mod traits;
 pub mod timestamp;
 pub mod typed;
