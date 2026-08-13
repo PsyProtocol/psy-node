@@ -1263,6 +1263,33 @@ checkpoint_backup_copy_status={}
                 );
             }
 
+            if coordinator_update.unique_pending_id != self.ids.unique_pending_id
+                || coordinator_update.proc_checkpoint_unique_id
+                    != self.ids.proc_checkpoint_unique_id
+            {
+                anyhow::bail!(
+                    "Coordinator prepared pending identity does not match the active commit identity"
+                );
+            }
+
+            let checkpoint_proof = &coordinator_update.checkpoint_tree_update_proof;
+            if checkpoint_proof.index != checkpoint_id
+                || checkpoint_proof.siblings.len() != N::CHECKPOINT_TREE_HEIGHT_USIZE
+                || checkpoint_proof.old_root
+                    != coordinator_update.old_base.checkpoint_tree_root
+                || checkpoint_proof.old_value
+                    != coordinator_update.old_base.checkpoint_leaf_hash
+                || checkpoint_proof.new_root
+                    != coordinator_update.new_base.checkpoint_tree_root
+                || checkpoint_proof.new_value
+                    != coordinator_update.new_base.checkpoint_leaf_hash
+                || !checkpoint_proof.verify::<N::HasherBase>()
+            {
+                anyhow::bail!(
+                    "Coordinator prepared checkpoint-tree delta does not match the exact normal commit"
+                );
+            }
+
             let old_checkpoint_root = self.db.checkpoint_tree_get_root_hash(self.ids.checkpoint_id).await?;
             if old_checkpoint_root != coordinator_update.old_base.checkpoint_tree_root {
                 let actual_checkpoint_root = self.checkpoint_tree_backup_manager.checkpoint_tree.get_root();
@@ -1462,6 +1489,14 @@ checkpoint_backup_copy_status={}
         self.db.set_checkpoint_leaf_data(checkpoint_id, &checkpoint_leaf_standard).await?;
         let checkpoint_delta_merkle_proof: DeltaMerkleProofCore<N::QHash> =
             self.db.checkpoint_tree_set_leaf_hash(checkpoint_id, checkpoint_leaf_hash).await?;
+        if checkpoint_id != 0
+            && checkpoint_delta_merkle_proof
+                != coordinator_update.checkpoint_tree_update_proof
+        {
+            anyhow::bail!(
+                "Materialized checkpoint-tree delta differs from the durable Coordinator commit source"
+            );
+        }
         self.db
             .set_checkpoint_root_hash_to_id_mapping(checkpoint_delta_merkle_proof.new_root, checkpoint_id)
             .await?;
@@ -1868,6 +1903,12 @@ mod tests {
         let source_write = commit
             .find("persist_coordinator_commit_source")
             .unwrap();
+        let pending_identity_validation = commit
+            .find("Coordinator prepared pending identity does not match")
+            .unwrap();
+        let prepared_tree_validation = commit
+            .find("Coordinator prepared checkpoint-tree delta does not match")
+            .unwrap();
         let rollback_floor = commit
             .find("ensure_coordinator_rollback_floor")
             .unwrap();
@@ -1879,8 +1920,18 @@ mod tests {
             .find("mark_coordinator_commit_source_committed")
             .unwrap();
         let head = commit.rfind("self.publish_canonical_head(").unwrap();
+        let materialized_tree_delta = commit
+            .find("Materialized checkpoint-tree delta differs")
+            .unwrap();
+        let root_mapping = commit
+            .find("set_checkpoint_root_hash_to_id_mapping")
+            .unwrap();
+        assert!(pending_identity_validation < source_write);
+        assert!(prepared_tree_validation < source_write);
         assert!(rollback_floor < source_write);
         assert!(source_write < first_hot_write);
+        assert!(first_hot_write < materialized_tree_delta);
+        assert!(materialized_tree_delta < root_mapping);
         assert!(first_hot_write < backup);
         assert!(backup < committed);
         assert!(committed < head);

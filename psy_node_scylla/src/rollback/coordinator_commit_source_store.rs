@@ -6,7 +6,11 @@
 
 use std::{error::Error, fmt, sync::Arc};
 
-use parth_core::protocol::core_types::Q256BitHash;
+use parth_core::{
+    crypto::hash::traits::{FieldQHasher, MerkleHasher},
+    felt::QFelt64,
+    protocol::core_types::{Q256BitHash, QFHashBase},
+};
 use psy_data::protocol::canonical_chain::{CanonicalChainRef, NetworkId};
 use psy_node_core::store::coordinator_commit_source::{
     CoordinatorCommitSource, CoordinatorCommitSourceCommitted,
@@ -18,7 +22,9 @@ use scylla::{
     statement::{prepared::PreparedStatement, Consistency, SerialConsistency},
 };
 
-use super::CanonicalHeadNoTabletKeyspace;
+use super::{
+    CanonicalHeadNoTabletKeyspace, CoordinatorCommitPhysicalInventory,
+};
 
 pub(crate) const COORDINATOR_COMMIT_SOURCE_HEADER_TABLE: &str =
     "coordinator_commit_source_header_v1";
@@ -416,6 +422,53 @@ impl ScyllaCoordinatorCommitSourceStore {
         Ok(sources)
     }
 
+    /// Freshly select the exact committed branch suffix and derive its
+    /// driver-independent physical-key inventories. This still performs no
+    /// archive, delete, singleton restore, barrier, or head mutation.
+    pub(crate) async fn scan_committed_inventory_suffix<F, Hash, Hasher>(
+        &self,
+        target: &CanonicalChainRef<Hash>,
+        old_head: &CanonicalChainRef<Hash>,
+        checkpoint_tree_height: u8,
+    ) -> Result<Vec<CoordinatorCommitPhysicalInventory<Hash>>, CoordinatorCommitSourceStoreError>
+    where
+        F: QFelt64,
+        Hash: Q256BitHash + QFHashBase<F>,
+        Hasher: MerkleHasher<Hash> + FieldQHasher<F, Hash>,
+    {
+        if target.network_id() != old_head.network_id()
+            || target.chain_epoch() != old_head.chain_epoch()
+        {
+            return Err(CoordinatorCommitSourceStoreError::SuffixIdentityMismatch);
+        }
+        let sources = self
+            .scan_committed_suffix::<Hash>(
+                target.network_id(),
+                target.chain_epoch().get(),
+                target.checkpoint().checkpoint_id().get(),
+                old_head.checkpoint().checkpoint_id().get(),
+            )
+            .await?;
+        let mut committed_sources = Vec::with_capacity(sources.len());
+        for source in sources {
+            let marker = self
+                .read_committed(source.candidate())
+                .await?
+                .ok_or(CoordinatorCommitSourceStoreError::CommittedMarkerMissing)?;
+            committed_sources.push((source, marker));
+        }
+        CoordinatorCommitPhysicalInventory::<Hash>::try_suffix_from_committed_sources::<
+            F,
+            Hasher,
+        >(
+            target,
+            old_head,
+            &committed_sources,
+            checkpoint_tree_height,
+        )
+        .map_err(|error| CoordinatorCommitSourceStoreError::Inventory(error.to_string()))
+    }
+
     async fn read_source_by_coordinates<Hash: Q256BitHash>(
         &self,
         network: NetworkId,
@@ -542,6 +595,8 @@ pub(crate) enum CoordinatorCommitSourceStoreError {
     FloorMissingAfterWrite,
     DuplicateCheckpoint,
     IncompleteCommittedSuffix { expected: u64, actual: u64 },
+    SuffixIdentityMismatch,
+    Inventory(String),
     IndeterminateWrite(String),
 }
 
