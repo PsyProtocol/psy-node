@@ -151,6 +151,15 @@ impl<Hash: Q256BitHash> RollbackGlobalDeleteBarrier<Hash> {
         )
     }
 
+    pub(super) fn reconstruct_exact(
+        authority: &DeletingRollbackGlobalArchiveBarrier<Hash>,
+        coordinator: &PersistedCoordinatorRollbackDeleteCompletion<Hash>,
+        realms: &[PersistedRealmRollbackDeleteCompletion<Hash>],
+        store_fingerprint: [u8; 32],
+    ) -> Result<Self, RollbackGlobalDeleteBarrierError> {
+        Self::try_from_receipts(authority, coordinator, realms, store_fingerprint)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn try_from_fields(
         deleting_head: StoredCanonicalHead<Hash>,
@@ -345,6 +354,8 @@ impl<Hash: Q256BitHash> RollbackGlobalDeleteBarrier<Hash> {
     pub(super) const fn participant_plan_digest(&self) -> &[u8; 32] { &self.participant_plan_digest }
     pub(super) const fn archive_barrier_slot(&self) -> &[u8; 32] { &self.archive_barrier_slot }
     pub(super) const fn archive_barrier_digest(&self) -> &[u8; 32] { &self.archive_barrier_digest }
+    pub(super) const fn coordinator_completion_slot(&self) -> &[u8; 32] { &self.coordinator_completion_slot }
+    pub(super) const fn coordinator_completion_digest(&self) -> &[u8; 32] { &self.coordinator_completion_digest }
     pub(super) const fn participant_set_digest(&self) -> &[u8; 32] { &self.participant_set_digest }
     pub(super) const fn participant_count(&self) -> u64 { self.participant_count }
     pub(super) const fn slot(&self) -> &[u8; 32] { &self.slot }
@@ -359,6 +370,10 @@ pub(super) struct PersistedRollbackGlobalDeleteBarrier<Hash> {
 
 impl<Hash> PersistedRollbackGlobalDeleteBarrier<Hash> {
     pub(super) const fn barrier(&self) -> &RollbackGlobalDeleteBarrier<Hash> { &self.barrier }
+
+    pub(super) const fn store_fingerprint(&self) -> &[u8; 32] {
+        &self.store_fingerprint
+    }
 }
 
 /// Non-Clone proof that one Realm completion was selected from the exact
