@@ -1150,6 +1150,11 @@ mod tests {
         coordinator_commit_source::{CoordinatorCommitSource, CoordinatorCommitSourcePayload},
     };
 
+    use crate::rollback::{
+        CoordinatorCommitPhysicalBeforeImage, CoordinatorCommitPhysicalBeforeImageError,
+        CoordinatorCommitPhysicalSourceCell, CoordinatorCommitPhysicalSourceObservation,
+    };
+
     use super::*;
 
     const CHECKPOINT_TREE_HEIGHT: u8 = 8;
@@ -1600,6 +1605,46 @@ mod tests {
                 && entry.inventory_digest() != &[0; 32]
                 && !entry.key().locator_bytes().is_empty()
         }));
+        let before = CoordinatorCommitPhysicalBeforeImage::try_from_catalog_entry(
+            &catalog,
+            0,
+            CoordinatorCommitPhysicalSourceObservation::Value(
+                CoordinatorCommitPhysicalSourceCell::value(vec![7, 8, 9], 44),
+            ),
+        )
+        .unwrap();
+        let decoded = CoordinatorCommitPhysicalBeforeImage::<PHash>::decode_for_catalog(
+            before.canonical_bytes(),
+            &catalog,
+        )
+        .unwrap();
+        assert_eq!(decoded.slot(), before.slot());
+        assert_eq!(decoded.digest(), before.digest());
+        assert_eq!(decoded.action(), before.action());
+        assert_eq!(decoded.key(), before.key());
+        let CoordinatorCommitPhysicalSourceObservation::Value(cell) = decoded.observation()
+        else {
+            panic!("ordinary value row decoded as key-only");
+        };
+        assert_eq!(cell.kind(), crate::rollback::CoordinatorCommitPhysicalCellKind::Value);
+        assert_eq!(cell.bytes(), &[7, 8, 9]);
+        assert_eq!(cell.writetime_us(), 44);
+
+        let mut tampered = before.canonical_bytes().to_vec();
+        let value_offset = tampered.len() - 32 - 32 - 3;
+        tampered[value_offset] ^= 1;
+        assert_eq!(
+            CoordinatorCommitPhysicalBeforeImage::<PHash>::decode_canonical(&tampered),
+            Err(CoordinatorCommitPhysicalBeforeImageError::DigestMismatch)
+        );
+        assert_eq!(
+            CoordinatorCommitPhysicalBeforeImage::try_from_catalog_entry(
+                &catalog,
+                0,
+                CoordinatorCommitPhysicalSourceObservation::KeyOnlyPresent,
+            ),
+            Err(CoordinatorCommitPhysicalBeforeImageError::ObservationSchemaMismatch)
+        );
 
         let mut duplicate_prepared = second_prepared;
         duplicate_prepared.unique_pending_id = first_prepared.unique_pending_id;
