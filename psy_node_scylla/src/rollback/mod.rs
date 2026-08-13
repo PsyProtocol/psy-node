@@ -101,6 +101,8 @@ mod coordinator_commit_delete_restore_executor;
 mod coordinator_rollback_delete_completion_store;
 mod rollback_global_archive_barrier;
 mod rollback_global_delete_barrier;
+mod realm_rollback_target_restore_plan;
+mod realm_rollback_target_restore_planner;
 mod rollback_participant_plan_store;
 pub(crate) use rollback_participant_plan_store::ScyllaRollbackParticipantPlanStore;
 pub(crate) use coordinator_commit_source_store::ScyllaCoordinatorCommitSourceStore;

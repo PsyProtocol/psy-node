@@ -347,6 +347,18 @@ impl<Hash> VerifiedRealmRollbackCommittedSuffixEntry<Hash> {
 }
 
 impl<Hash: Q256BitHash> VerifiedRealmRollbackCommittedSuffixEntry<Hash> {
+    pub(super) const fn inventory_slot(&self) -> RealmRollbackCommitInventorySlot {
+        self.inventory.slot()
+    }
+
+    pub(super) const fn inventory_digest(&self) -> &[u8; 32] {
+        self.inventory.digest()
+    }
+
+    pub(super) const fn committed_marker_digest(&self) -> &[u8; 32] {
+        self.marker.digest()
+    }
+
     /// Decode the exact authority-local head captured by this immutable
     /// committed marker. The restore path uses the typed row rather than
     /// copying marker bytes into the live table.

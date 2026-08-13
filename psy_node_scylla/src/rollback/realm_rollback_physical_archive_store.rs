@@ -38,6 +38,11 @@ use super::{
         RealmRollbackDeleteCompletionError,
     },
     realm_rollback_delete_restore_executor::ExecutedRealmRollbackSuffix,
+    realm_rollback_target_restore_plan::{
+        REALM_TARGET_RESTORE_PLAN_KEY_DOMAIN, RealmRollbackTargetRestorePlan,
+        RealmRollbackTargetRestorePlanError,
+    },
+    rollback_global_delete_barrier::SelectedRealmRollbackDeleteCompletion,
 };
 
 const ARCHIVE_REVISION: i64 = 1;
@@ -119,6 +124,22 @@ impl<Hash> PersistedRealmRollbackParticipantCompletion<Hash> {
 
     pub(super) const fn completion(&self) -> &RealmRollbackParticipantCompletion<Hash> {
         &self.completion
+    }
+}
+
+/// Exact immutable readback of the deterministic Realm control-state restore
+/// plan. It is non-Clone and still does not authorize counter or control-row
+/// mutations; the later executor must freshly revalidate it and the global
+/// delete barrier.
+#[derive(Debug)]
+pub(super) struct PersistedRealmRollbackTargetRestorePlan<Hash> {
+    store_fingerprint: [u8; 32],
+    plan: RealmRollbackTargetRestorePlan<Hash>,
+}
+
+impl<Hash> PersistedRealmRollbackTargetRestorePlan<Hash> {
+    pub(super) const fn plan(&self) -> &RealmRollbackTargetRestorePlan<Hash> {
+        &self.plan
     }
 }
 
@@ -217,6 +238,75 @@ impl ScyllaRealmRollbackPhysicalArchiveStore {
             store_fingerprint: self.fingerprint,
             completion: current,
         })
+    }
+
+    pub(super) async fn persist_target_restore_plan<Hash: Q256BitHash>(
+        &self,
+        plan: RealmRollbackTargetRestorePlan<Hash>,
+    ) -> Result<PersistedRealmRollbackTargetRestorePlan<Hash>, RealmRollbackPhysicalArchiveStoreError> {
+        if plan.archive_store_fingerprint() != &self.fingerprint {
+            return Err(RealmRollbackPhysicalArchiveStoreError::ReceiptBindingMismatch);
+        }
+        let coordinates = ArchiveCoordinates::try_from_target_restore_plan(&plan)?;
+        self.persist_bytes(&coordinates, plan.canonical_bytes(), plan.digest()).await?;
+        let current = self.read_target_restore_plan::<Hash>(&coordinates).await?
+            .ok_or(RealmRollbackPhysicalArchiveStoreError::MissingAfterPersist)?;
+        if current != plan {
+            return Err(RealmRollbackPhysicalArchiveStoreError::Conflict);
+        }
+        Ok(PersistedRealmRollbackTargetRestorePlan {
+            store_fingerprint: self.fingerprint,
+            plan: current,
+        })
+    }
+
+    pub(super) async fn revalidate_target_restore_plan<Hash: Q256BitHash>(
+        &self,
+        receipt: &PersistedRealmRollbackTargetRestorePlan<Hash>,
+    ) -> Result<(), RealmRollbackPhysicalArchiveStoreError> {
+        if receipt.store_fingerprint != self.fingerprint {
+            return Err(RealmRollbackPhysicalArchiveStoreError::ReceiptBindingMismatch);
+        }
+        let coordinates = ArchiveCoordinates::try_from_target_restore_plan(&receipt.plan)?;
+        match self.read_target_restore_plan::<Hash>(&coordinates).await? {
+            Some(current) if current == receipt.plan => Ok(()),
+            Some(_) => Err(RealmRollbackPhysicalArchiveStoreError::Conflict),
+            None => Err(RealmRollbackPhysicalArchiveStoreError::MissingAfterPersist),
+        }
+    }
+
+    pub(super) async fn read_target_restore_plan_selected<Hash: Q256BitHash>(
+        &self,
+        selected: &SelectedRealmRollbackDeleteCompletion<Hash>,
+    ) -> Result<Option<PersistedRealmRollbackTargetRestorePlan<Hash>>, RealmRollbackPhysicalArchiveStoreError> {
+        let coordinates = ArchiveCoordinates {
+            network: i64::from(selected.barrier().target().network_id().chain_id()),
+            chain_epoch: i64::try_from(selected.barrier().target().chain_epoch().get())
+                .map_err(|_| RealmRollbackPhysicalArchiveStoreError::IntegerOutOfCqlRange)?,
+            participant_plan_digest: *selected.barrier().participant_plan_digest(),
+            key_domain: REALM_TARGET_RESTORE_PLAN_KEY_DOMAIN,
+            row_slot: RealmRollbackTargetRestorePlan::slot_for_selected(
+                selected,
+                self.fingerprint,
+            ),
+        };
+        let Some(plan) = self.read_target_restore_plan::<Hash>(&coordinates).await? else {
+            return Ok(None);
+        };
+        if plan.authority() != selected.completion().authority()
+            || plan.global_target() != selected.barrier().target()
+            || plan.global_delete_barrier_slot() != selected.barrier().slot()
+            || plan.global_delete_barrier_digest() != selected.barrier().digest()
+            || plan.realm_delete_completion_slot() != selected.completion().slot()
+            || plan.realm_delete_completion_digest() != selected.completion().digest()
+            || plan.new_branch_write() != selected.new_branch_write()
+        {
+            return Err(RealmRollbackPhysicalArchiveStoreError::Conflict);
+        }
+        Ok(Some(PersistedRealmRollbackTargetRestorePlan {
+            store_fingerprint: self.fingerprint,
+            plan,
+        }))
     }
 
     pub(super) async fn revalidate_delete_completion<Hash: Q256BitHash>(
@@ -451,6 +541,25 @@ impl ScyllaRealmRollbackPhysicalArchiveStore {
         Ok(Some(completion))
     }
 
+    async fn read_target_restore_plan<Hash: Q256BitHash>(
+        &self,
+        coordinates: &ArchiveCoordinates,
+    ) -> Result<Option<RealmRollbackTargetRestorePlan<Hash>>, RealmRollbackPhysicalArchiveStoreError> {
+        let Some((bytes, row_digest)) = self.read_selected_bytes(coordinates).await? else {
+            return Ok(None);
+        };
+        let plan = RealmRollbackTargetRestorePlan::decode_canonical(&bytes)?;
+        if plan.participant_plan_digest() != &coordinates.participant_plan_digest
+            || coordinates.key_domain != REALM_TARGET_RESTORE_PLAN_KEY_DOMAIN
+            || plan.slot() != &coordinates.row_slot
+            || plan.digest() != &row_digest
+            || plan.archive_store_fingerprint() != &self.fingerprint
+        {
+            return Err(RealmRollbackPhysicalArchiveStoreError::Conflict);
+        }
+        Ok(Some(plan))
+    }
+
     async fn read_selected_bytes(
         &self,
         coordinates: &ArchiveCoordinates,
@@ -552,6 +661,19 @@ impl ArchiveCoordinates {
             participant_plan_digest: *completion.participant_plan_digest(),
             key_domain: REALM_DELETE_COMPLETION_KEY_DOMAIN,
             row_slot: *completion.slot(),
+        })
+    }
+
+    fn try_from_target_restore_plan<Hash: Q256BitHash>(
+        plan: &RealmRollbackTargetRestorePlan<Hash>,
+    ) -> Result<Self, RealmRollbackPhysicalArchiveStoreError> {
+        Ok(Self {
+            network: i64::from(plan.global_target().network_id().chain_id()),
+            chain_epoch: i64::try_from(plan.global_target().chain_epoch().get())
+                .map_err(|_| RealmRollbackPhysicalArchiveStoreError::IntegerOutOfCqlRange)?,
+            participant_plan_digest: *plan.participant_plan_digest(),
+            key_domain: REALM_TARGET_RESTORE_PLAN_KEY_DOMAIN,
+            row_slot: *plan.slot(),
         })
     }
 }
@@ -698,6 +820,7 @@ pub(super) enum RealmRollbackPhysicalArchiveStoreError {
     BeforeImage(RealmRollbackPhysicalBeforeImageError),
     ParticipantCompletion(RealmRollbackParticipantCompletionError),
     DeleteCompletion(RealmRollbackDeleteCompletionError),
+    TargetRestorePlan(RealmRollbackTargetRestorePlanError),
     Cql(String),
     Conflict,
     Indeterminate(String),
@@ -722,6 +845,9 @@ impl From<RealmRollbackParticipantCompletionError> for RealmRollbackPhysicalArch
 }
 impl From<RealmRollbackDeleteCompletionError> for RealmRollbackPhysicalArchiveStoreError {
     fn from(value: RealmRollbackDeleteCompletionError) -> Self { Self::DeleteCompletion(value) }
+}
+impl From<RealmRollbackTargetRestorePlanError> for RealmRollbackPhysicalArchiveStoreError {
+    fn from(value: RealmRollbackTargetRestorePlanError) -> Self { Self::TargetRestorePlan(value) }
 }
 
 impl fmt::Display for RealmRollbackPhysicalArchiveStoreError {

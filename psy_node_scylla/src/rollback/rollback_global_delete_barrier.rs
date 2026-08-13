@@ -17,6 +17,7 @@ use psy_data::protocol::canonical_chain::{
 use psy_node_core::store::{
     canonical_head::StoredCanonicalHead,
     rollback_control::RollbackControlState,
+    timestamp::NewBranchWriteTimestampUs,
 };
 use scylla::{
     client::session::Session,
@@ -368,6 +369,7 @@ pub(super) struct SelectedRealmRollbackDeleteCompletion<Hash> {
     barrier_store_fingerprint: [u8; 32],
     barrier: RollbackGlobalDeleteBarrier<Hash>,
     completion: RealmRollbackDeleteCompletion<Hash>,
+    new_branch_write: NewBranchWriteTimestampUs,
 }
 
 impl<Hash> SelectedRealmRollbackDeleteCompletion<Hash> {
@@ -377,6 +379,12 @@ impl<Hash> SelectedRealmRollbackDeleteCompletion<Hash> {
 
     pub(super) const fn completion(&self) -> &RealmRollbackDeleteCompletion<Hash> {
         &self.completion
+    }
+
+    /// Exact timestamp fence selected from the same persisted Coordinator
+    /// delete plan which authorized the global archive/delete barriers.
+    pub(super) const fn new_branch_write(&self) -> NewBranchWriteTimestampUs {
+        self.new_branch_write
     }
 }
 
@@ -528,6 +536,11 @@ impl ScyllaRollbackGlobalDeleteBarrierStore {
             barrier_store_fingerprint: self.fingerprint,
             barrier: reconstructed,
             completion: completion.clone(),
+            new_branch_write: authority
+                .delete_plan()
+                .plan()
+                .fence_window()
+                .new_branch_write(),
         })
     }
 
@@ -548,6 +561,15 @@ impl ScyllaRollbackGlobalDeleteBarrierStore {
                 != selected.barrier.participant_plan_digest()
             || selected.completion.barrier_digest()
                 != selected.barrier.archive_barrier_digest()
+            || selected.new_branch_write
+                != selected
+                    .barrier
+                    .deleting_head()
+                    .rollback_control()
+                    .requested()
+                    .ok_or(RollbackGlobalDeleteBarrierError::BindingMismatch)?
+                    .fence_window()
+                    .new_branch_write()
         {
             return Err(RollbackGlobalDeleteBarrierError::BindingMismatch);
         }
