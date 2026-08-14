@@ -11,6 +11,7 @@ use psy_node_core::{
     queue::{ephemeral::QStandardEphemeralQueueSubscriber, worker_queue::QStandardWorkerQueuePublisher},
     store::{
         rollback_runtime_rebuild::RealmRollbackRuntimeControl,
+        rollback_runtime_rebuild::RollbackRuntimeRebuildDirective,
         traits::proof_store::QParthProofStore,
     },
 };
@@ -61,6 +62,7 @@ where
         normal_commit_owner: super::RealmNormalCommitOwner<N::QHash>,
         rollback_runtime_control:
             Option<Arc<dyn RealmRollbackRuntimeControl<N::QHash>>>,
+        rollback_restart_directive: Option<RollbackRuntimeRebuildDirective<N::QHash>>,
     ) -> anyhow::Result<(Self, tokio::task::JoinHandle<Result<(), anyhow::Error>>)> {
         tracing::info!("[REALM_STARTUP] processor new start");
         db.ensure_genesis_applied(genesis_block_update.clone()).await?;
@@ -69,7 +71,13 @@ where
             .await?
             .into_tuple();
         tracing::info!("[REALM_STARTUP] load_realm_memory_trees_from_db done");
-        db.init_with_setup_and_genesis(&file_system, &guta_gatherer_backup_directory, genesis_block_update, &mut global_user_tree)
+        db.init_with_setup_and_genesis(
+            &file_system,
+            &guta_gatherer_backup_directory,
+            genesis_block_update,
+            &mut global_user_tree,
+            rollback_restart_directive,
+        )
             .await?;
         tracing::info!("[REALM_STARTUP] init_with_setup_and_genesis done");
         //db.set_new_unique_ids().await?;

@@ -14,6 +14,7 @@ use psy_node_core::{
     }, store::{
         canonical_head::CanonicalHeadReadState,
         realm_processor_quiescence::RealmProcessorDrainRequest,
+        rollback_runtime_rebuild::RollbackRuntimeRebuildDirective,
         traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore},
     }
 };
@@ -39,9 +40,9 @@ fn owned_iteration_consumes_slot(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RealmProcessorRunExit {
+pub enum RealmProcessorRunExit<Hash> {
     ShutdownRequested,
-    RestartAfterRollback,
+    RestartAfterRollback(RollbackRuntimeRebuildDirective<Hash>),
 }
 
 pub async fn run_realm_processor_loop<
@@ -66,7 +67,7 @@ pub async fn run_realm_processor_loop<
         FileSystem,
         CoordinatorClient,
     >,
-) -> anyhow::Result<RealmProcessorRunExit>
+) -> anyhow::Result<RealmProcessorRunExit<N::QHash>>
 where
     N: 'static, FileSystem::File: Send + Sync + 'static,
 {
@@ -253,7 +254,9 @@ where
                     .guta_queue_gatherer
                     .stop_paused_without_finalize(pause_receipt)
                     .await?;
-                break 'processor RealmProcessorRunExit::RestartAfterRollback;
+                break 'processor RealmProcessorRunExit::RestartAfterRollback(
+                    *selected.directive(),
+                );
             }
         }
 
@@ -629,7 +632,7 @@ pub async fn run_realm_processor<
         CoordinatorClient,
     >,
     guta_gatherer_join_handle: tokio::task::JoinHandle<Result<(), anyhow::Error>>,
-) -> anyhow::Result<RealmProcessorRunExit>
+) -> anyhow::Result<RealmProcessorRunExit<N::QHash>>
 where
     N: 'static,
     FileSystem::File: Send + Sync + 'static,
@@ -650,7 +653,7 @@ where
             )?;
             let exit = processor_result?;
             gatherer_result?;
-            Ok::<RealmProcessorRunExit, anyhow::Error>(exit)
+            Ok::<RealmProcessorRunExit<N::QHash>, anyhow::Error>(exit)
         } => {
             let exit = result?;
             tracing::info!("All realm processor threads completed");

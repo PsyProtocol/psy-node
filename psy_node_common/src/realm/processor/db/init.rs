@@ -33,6 +33,7 @@ use psy_node_core::{
     psy_temp_db::StandardProcessorTempDBStoreBase,
     queue::{ephemeral::QStandardEphemeralQueueSubscriber, worker_queue::QStandardWorkerQueuePublisher},
     store::traits::proof_store::QParthProofStore,
+    store::rollback_runtime_rebuild::RollbackRuntimeRebuildDirective,
 };
 
 use crate::{
@@ -694,6 +695,7 @@ where
         guta_gatherer_backup_directory: &str,
         genesis_block_update: PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate<N::F, N::QHash>,
         global_user_tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
+        rollback_restart_directive: Option<RollbackRuntimeRebuildDirective<N::QHash>>,
     ) -> anyhow::Result<()> {
         let genesis_checkpoint_root = genesis_block_update.coordinator_update.checkpoint_sync_info.checkpoint_tree_root;
 
@@ -752,7 +754,11 @@ where
         self.state.last_committed_checkpoint_root = last_committed_checkpoint_root;
 
         // 7. Initialize Unique IDs for new work
-        self.set_new_unique_ids(Some(current_realm_root)).await?;
+        if let Some(directive) = rollback_restart_directive.as_ref() {
+            self.resume_rollback_unique_ids(directive).await?;
+        } else {
+            self.set_new_unique_ids(Some(current_realm_root)).await?;
+        }
 
         // Sync gatherer queue key to the new gathering proc ID so the
         // gatherer (created shortly after this, in startup.rs) polls the

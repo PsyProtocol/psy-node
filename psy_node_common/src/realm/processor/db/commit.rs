@@ -13,6 +13,7 @@ use psy_data::{
         checkpoint_sync::PQEDCheckpointSyncInfoCompact
     ,
     worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId,
+    protocol::{canonical_chain::NetworkId, chain_context::AuthorityScope},
 };
 use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
@@ -24,6 +25,7 @@ use psy_node_core::{
     queue::{ephemeral::QStandardEphemeralQueueSubscriber, worker_queue::QStandardWorkerQueuePublisher},
     store::{
         realm_normal_commit_coverage::RealmNormalCommitCoveragePlan,
+        rollback_runtime_rebuild::RollbackRuntimeRebuildDirective,
         traits::proof_store::QParthProofStore,
     },
 };
@@ -51,6 +53,109 @@ impl<
 where
     N::HasherBase: 'static + Send + Sync,
 {
+    /// Install the two pending namespaces already allocated and durably bound
+    /// by the global rollback restore. Restart must consume these exact
+    /// contexts; allocating another pending ID here would skip the globally
+    /// verified processing generation and make T+1 unrecoverable.
+    pub(super) async fn resume_rollback_unique_ids(
+        &mut self,
+        directive: &RollbackRuntimeRebuildDirective<N::QHash>,
+    ) -> anyhow::Result<()> {
+        let authority = AuthorityScope::Realm {
+            realm_id: self.state.realm_identifier.realm_id,
+            realm_sub_id: self.state.realm_identifier.realm_sub_id,
+        };
+        let network = NetworkId::try_from_chain_id(self.state.chain_id)?;
+        if directive.authority() != authority
+            || directive.target().network_id() != network
+            || directive.target().checkpoint().checkpoint_id().get()
+                != self.state.last_committed_checkpoint_id
+        {
+            anyhow::bail!("Realm rollback restart directive identity mismatch")
+        }
+        let processing = directive.processing().ok_or_else(|| {
+            anyhow::anyhow!("Realm rollback restart directive is missing processing")
+        })?;
+        let gathering = directive.gathering().ok_or_else(|| {
+            anyhow::anyhow!("Realm rollback restart directive is missing gathering")
+        })?;
+        if gathering.pending_id().get()
+            != processing
+                .pending_id()
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("Realm rollback pending namespace overflow"))?
+        {
+            anyhow::bail!("Realm rollback restart pending contexts are not adjacent")
+        }
+        let current = self.db.get_current_unique_pending_id().await?;
+        if current
+            != (
+                gathering.pending_id().get(),
+                gathering.proc_checkpoint_id().as_u128(),
+            )
+        {
+            anyhow::bail!("Realm rollback gathering context is not the durable current pending")
+        }
+
+        self.guta_update_queue.ensure_stream().await?;
+        self.proof_work_queue.ensure_stream().await?;
+        for proc_id in [processing.proc_checkpoint_id(), gathering.proc_checkpoint_id()] {
+            let realm_id = self.state.realm_id_u64;
+            let realm_sub_id = self.state.realm_sub_id_u64;
+            let guta_key = RealmUserUpdateQueueKey {
+                realm_id,
+                realm_sub_id,
+                unique_id: proc_id.as_u128(),
+                task_group: 0,
+                queue_type: QPBaseQueueType::StandardEphemeral,
+                _phantom_queue_item: std::marker::PhantomData::<
+                    PsyRealmUserUpdateQueueItem<N::F, N::QHash>,
+                >,
+            };
+            let proof_key = RealmProvingWorkQueueKey {
+                realm_id,
+                realm_sub_id,
+                unique_id: proc_id.as_u128(),
+                task_group: 0,
+                queue_type: QPBaseQueueType::WorkerQueue,
+                _phantom_queue_item: std::marker::PhantomData::<
+                    PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>,
+                >,
+            };
+            self.guta_update_queue
+                .ensure_consumer(&guta_key, realm_id, realm_sub_id, proc_id.as_u128(), 0)
+                .await?;
+            self.proof_work_queue
+                .ensure_consumer(&proof_key, realm_id, realm_sub_id, proc_id.as_u128(), 0)
+                .await?;
+        }
+
+        self.state.processing_unique_pending_id = processing.pending_id().get();
+        self.state.processing_proc_checkpoint_unique_id =
+            processing.proc_checkpoint_id().as_u128();
+        self.state.gathering_unique_pending_id = gathering.pending_id().get();
+        self.state.gathering_proc_checkpoint_unique_id =
+            gathering.proc_checkpoint_id().as_u128();
+        self.temp_db
+            .set_unique_pending_ids(
+                &self.state.realm_identifier,
+                self.state.processing_unique_pending_id,
+                self.state.processing_proc_checkpoint_unique_id,
+            )
+            .await?;
+        self.temp_db
+            .set_gathering_unique_pending_ids(
+                &self.state.realm_identifier,
+                self.state.gathering_unique_pending_id,
+                self.state.gathering_proc_checkpoint_unique_id,
+            )
+            .await?;
+        self.publish_current_pending_context().await?;
+        self.shared_state.update_from_core_state(&self.state).await?;
+        Ok(())
+    }
+
     pub async fn set_new_unique_ids(&mut self, gathering_realm_end_root: Option<N::QHash>) -> anyhow::Result<()> {
         println!(
             "old_unique_pending_id: {}, old_proc_checkpoint_unique_id: {}",
@@ -402,5 +507,55 @@ where
         tracing::info!("Updated last committed state for checkpoint ID: {}", checkpoint_id);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod rollback_restart_pending_tests {
+    #[test]
+    fn rollback_restart_consumes_allocated_contexts_without_incrementing_counter() {
+        let source = include_str!("commit.rs");
+        let method = source
+            .split("pub(super) async fn resume_rollback_unique_ids")
+            .nth(1)
+            .unwrap()
+            .split("pub async fn set_new_unique_ids")
+            .next()
+            .unwrap();
+        assert!(!method.contains("inc_unique_pending_id"));
+        let current = method.find("get_current_unique_pending_id()").unwrap();
+        let processing = method
+            .find("self.state.processing_unique_pending_id =")
+            .unwrap();
+        let gathering = method
+            .find("self.state.gathering_unique_pending_id =")
+            .unwrap();
+        let publish = method
+            .find("self.publish_current_pending_context().await")
+            .unwrap();
+        assert!(current < processing && processing < gathering && gathering < publish);
+        assert!(method.contains("directive.target().checkpoint().checkpoint_id()"));
+        assert!(method.contains("gathering.pending_id().get()"));
+        assert!(method.contains("processing.pending_id().get()"));
+        assert_eq!(method.matches("ensure_consumer(").count(), 2);
+    }
+
+    #[test]
+    fn startup_selects_exact_restart_contexts_instead_of_normal_rotation() {
+        let init = include_str!("init.rs");
+        let method = init
+            .split("pub async fn init_with_setup_and_genesis")
+            .nth(1)
+            .unwrap();
+        let restart = method
+            .find("self.resume_rollback_unique_ids(directive)")
+            .unwrap();
+        let normal = method
+            .find("self.set_new_unique_ids(Some(current_realm_root))")
+            .unwrap();
+        let queue = method
+            .find("self.guta_queue_key_status_manager")
+            .unwrap();
+        assert!(restart < normal && normal < queue);
     }
 }

@@ -10,12 +10,12 @@ use psy_node_core::{
     genesis::genesis_db_data_builder::GenesisDatabaseDataBuilder, p2p::traits::realm_coordinantor::RealmCoordinatorClient, psy_core_db::traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore}, psy_temp_db::StandardProcessorTempDBStoreBase, queue::{
         ephemeral::QStandardEphemeralQueueSubscriber,
         worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
-    }, store::{realm_processor_branch_exact_runtime::{RealmBranchExactCommitRuntimeInstaller, RealmBranchExactSingleCommitOwner}, realm_processor_startup::{authorize_realm_processor_startup, RealmProcessorStartupAuthorization, RealmProcessorStartupError, RealmProcessorStartupMode, RealmProcessorStartupPreflightProvider}, rollback_runtime_rebuild::RealmRollbackRuntimeControl, traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore}}
+    }, store::{realm_processor_branch_exact_runtime::{RealmBranchExactCommitRuntimeInstaller, RealmBranchExactSingleCommitOwner}, realm_processor_startup::{authorize_realm_processor_startup, RealmProcessorStartupAuthorization, RealmProcessorStartupError, RealmProcessorStartupMode, RealmProcessorStartupPreflightProvider}, rollback_runtime_rebuild::{RealmRollbackRuntimeControl, RollbackRuntimeRebuildDirective}, traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore}}
 };
 
 use crate::realm::processor::{core::{PsyRealmProcessor, RealmNormalCommitOwner, runner::{run_realm_processor, RealmProcessorRunExit}}, db::PsyRealmDatabaseProcessor};
 
-pub async fn create_realm_processor<
+async fn create_realm_processor_with_restart_directive<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
     S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync + 'static,
     STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync + 'static,
@@ -47,6 +47,7 @@ pub async fn create_realm_processor<
         Option<Arc<dyn RealmBranchExactCommitRuntimeInstaller<N::QHash>>>,
     rollback_runtime_control:
         Option<Arc<dyn RealmRollbackRuntimeControl<N::QHash>>>,
+    rollback_restart_directive: Option<RollbackRuntimeRebuildDirective<N::QHash>>,
 ) -> anyhow::Result<(
     PsyRealmProcessor<
         N,
@@ -212,11 +213,86 @@ where
         proof_verifier,
         normal_commit_owner,
         rollback_runtime_control,
+        rollback_restart_directive,
     )
     .await?;
     tracing::info!("[REALM_CREATE] processor new done");
 
     Ok(processor_result)
+}
+
+pub async fn create_realm_processor<
+    N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
+    S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync + 'static,
+    STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync + 'static,
+    GUTAUpdateQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
+    ProofWorkQueue: QStandardWorkerQueuePublisher + QStandardWorkerQueueSubscriber + Send + Sync + 'static,
+    TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + Send + Sync + 'static,
+    ProofStore: QParthProofStore + QCanonicalProofStoreV2 + Send + Sync + 'static,
+    FileSystem: TokioLikeFileSystem + Send + Sync + 'static,
+    CoordinatorClient: RealmCoordinatorClient<N::F, N::QHash> + Send + Sync + 'static,
+>(
+    chain_id: u32,
+    genesis_data: &PsyGenesisBlockSetupData<N::F, N::QHash>,
+    file_system: Arc<FileSystem>,
+    guta_gatherer_backup_directory: String,
+    checkpoint_tree_root_backup_file_path: String,
+    db: Arc<S>,
+    tag_tree_rewards_store: Arc<STagTreeRewards>,
+    temp_db: Arc<TempDatabase>,
+    proof_store: Arc<ProofStore>,
+    proof_verifier: Option<Arc<N::ZKVerifier>>,
+    guta_update_queue: Arc<GUTAUpdateQueue>,
+    proof_work_queue: Arc<ProofWorkQueue>,
+    realm_identifier: QRealmIdentifier,
+    circuit_fingerprint_config: PsyNodeCircuitFingerprintConfig<N::QHash>,
+    coordinator_client: Arc<CoordinatorClient>,
+    startup_mode: RealmProcessorStartupMode,
+    startup_preflight: Option<Arc<dyn RealmProcessorStartupPreflightProvider>>,
+    commit_runtime_installer:
+        Option<Arc<dyn RealmBranchExactCommitRuntimeInstaller<N::QHash>>>,
+    rollback_runtime_control:
+        Option<Arc<dyn RealmRollbackRuntimeControl<N::QHash>>>,
+) -> anyhow::Result<(
+    PsyRealmProcessor<
+        N,
+        S,
+        STagTreeRewards,
+        GUTAUpdateQueue,
+        ProofWorkQueue,
+        TempDatabase,
+        ProofStore,
+        FileSystem,
+        CoordinatorClient,
+    >,
+    tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+)>
+where
+    FileSystem::File: Send + Sync,
+{
+    create_realm_processor_with_restart_directive::<N, S, STagTreeRewards, GUTAUpdateQueue, ProofWorkQueue, TempDatabase, ProofStore, FileSystem, CoordinatorClient>(
+        chain_id,
+        genesis_data,
+        file_system,
+        guta_gatherer_backup_directory,
+        checkpoint_tree_root_backup_file_path,
+        db,
+        tag_tree_rewards_store,
+        temp_db,
+        proof_store,
+        proof_verifier,
+        guta_update_queue,
+        proof_work_queue,
+        realm_identifier,
+        circuit_fingerprint_config,
+        coordinator_client,
+        startup_mode,
+        startup_preflight,
+        commit_runtime_installer,
+        rollback_runtime_control,
+        None,
+    )
+    .await
 }
 
 pub async fn create_realm_processor_and_run<
@@ -256,8 +332,9 @@ where
     FileSystem::File: Send + Sync,
 {
     tracing::info!("[REALM_CREATE] create_and_run start");
+    let mut rollback_restart_directive = None;
     loop {
-        let (processor, guta_gatherer_join_handle) = create_realm_processor::<N, S, STagTreeRewards, GUTAUpdateQueue, ProofWorkQueue, TempDatabase, ProofStore, FileSystem, CoordinatorClient>(
+        let (processor, guta_gatherer_join_handle) = create_realm_processor_with_restart_directive::<N, S, STagTreeRewards, GUTAUpdateQueue, ProofWorkQueue, TempDatabase, ProofStore, FileSystem, CoordinatorClient>(
             chain_id,
             genesis_data,
             file_system.clone(),
@@ -277,13 +354,15 @@ where
             startup_preflight.clone(),
             commit_runtime_installer.clone(),
             rollback_runtime_control.clone(),
+            rollback_restart_directive.take(),
         )
         .await?;
 
         tracing::info!("Starting realm processor...");
         match run_realm_processor(processor, guta_gatherer_join_handle).await? {
             RealmProcessorRunExit::ShutdownRequested => return Ok(()),
-            RealmProcessorRunExit::RestartAfterRollback => {
+            RealmProcessorRunExit::RestartAfterRollback(directive) => {
+                rollback_restart_directive = Some(directive);
                 tracing::warn!(
                     "Realm rollback restart boundary reached; rebuilding actor and tree from the globally published target"
                 );
@@ -303,7 +382,9 @@ mod tests {
             .nth(1)
             .expect("create-and-run entry must remain present");
         let recreate_loop = function.find("loop {").unwrap();
-        let create = function.find("create_realm_processor::<").unwrap();
+        let create = function
+            .find("create_realm_processor_with_restart_directive::<")
+            .unwrap();
         let run = function
             .find("run_realm_processor(processor, guta_gatherer_join_handle)")
             .unwrap();
@@ -311,11 +392,35 @@ mod tests {
             .find("RealmProcessorRunExit::ShutdownRequested => return Ok(())")
             .unwrap();
         let restart = function
-            .find("RealmProcessorRunExit::RestartAfterRollback =>")
+            .find("RealmProcessorRunExit::RestartAfterRollback(directive) =>")
+            .unwrap();
+        let retain = function
+            .find("rollback_restart_directive = Some(directive)")
+            .unwrap();
+        let consume = function
+            .find("rollback_restart_directive.take()")
             .unwrap();
         assert!(recreate_loop < create && create < run);
-        assert!(run < shutdown && run < restart);
+        assert!(create < consume && consume < run);
+        assert!(run < shutdown && run < restart && restart < retain);
         assert!(!function[restart..].contains("return Ok(())"));
+    }
+
+    #[test]
+    fn ordinary_create_cannot_supply_a_rollback_restart_directive() {
+        let source = include_str!("create.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let wrapper = production
+            .split("pub async fn create_realm_processor<")
+            .nth(1)
+            .unwrap()
+            .split("pub async fn create_realm_processor_and_run<")
+            .next()
+            .unwrap();
+        assert!(wrapper.contains("create_realm_processor_with_restart_directive::<"));
+        assert!(wrapper.contains("rollback_runtime_control,"));
+        assert!(wrapper.contains("None,"));
+        assert!(!wrapper.contains("RollbackRuntimeRebuildDirective"));
     }
 
     #[test]
@@ -323,7 +428,7 @@ mod tests {
         let source = include_str!("create.rs");
         let production = source.split("#[cfg(test)]").next().unwrap();
         let function = production
-            .split("pub async fn create_realm_processor<")
+            .split("async fn create_realm_processor_with_restart_directive<")
             .nth(1)
             .expect("create_realm_processor must remain present");
         let preflight = function
@@ -346,7 +451,7 @@ mod tests {
         let source = include_str!("create.rs");
         let production = source.split("#[cfg(test)]").next().unwrap();
         let function = production
-            .split("pub async fn create_realm_processor<")
+            .split("async fn create_realm_processor_with_restart_directive<")
             .nth(1)
             .expect("create_realm_processor must remain present");
         assert!(function.contains(
@@ -382,7 +487,7 @@ mod tests {
     fn proof_verifier_is_required_only_for_branch_exact_startup() {
         let source = include_str!("create.rs");
         let function = source
-            .split("pub async fn create_realm_processor<")
+            .split("async fn create_realm_processor_with_restart_directive<")
             .nth(1)
             .expect("create_realm_processor must remain present");
         let disabled = function
