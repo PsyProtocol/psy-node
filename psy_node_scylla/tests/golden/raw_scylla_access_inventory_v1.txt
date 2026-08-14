@@ -15,7 +15,7 @@ psy_node_scylla/examples/tst6.rs|Example|2|2|0|0|1|1|2|3
 psy_node_scylla/examples/tst6_nobucket.rs|Example|2|2|0|0|1|1|2|3
 psy_node_scylla/examples/tst7.rs|Example|2|2|0|0|1|1|2|3
 psy_node_scylla/examples/tst7_nobucket.rs|Example|2|2|0|0|1|1|2|3
-psy_node_scylla/src/core.rs|DriverCore|8|2|30|0|0|0|3|4
+psy_node_scylla/src/core.rs|DriverCore|8|2|31|0|0|0|3|4
 psy_node_scylla/src/core_db.rs|DriverCore|0|0|97|0|0|0|0|0
 psy_node_scylla/src/psy_setup.rs|DriverCore|2|0|4|0|0|0|1|1
 psy_node_scylla/src/rollback/authority_local_head_prototype.rs|DurableControlAuthority|6|0|3|6|2|3|1|4

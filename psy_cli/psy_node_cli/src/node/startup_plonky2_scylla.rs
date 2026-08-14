@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use std::time::Duration;
-use parth_core::{node::realm_identifier::QRealmIdentifier, protocol::core_types::{QNetworkHashTypes, QNetworkTypesConfigHelper}};
+use parth_core::{
+    node::realm_identifier::QRealmIdentifier,
+    protocol::core_types::{QNetworkHashTypes, QNetworkTreeConstants, QNetworkTypesConfigHelper},
+};
 use plonky2::plonk::config::PoseidonGoldilocksConfig;
 use psy_core::{job::job_id::QProvingJobDataID, network_config::PsyNetworkLocalDevnetConstants};
 use psy_data::{
@@ -12,6 +15,7 @@ use psy_io::tokio::{TokioLikeFileSystem, TokioStdFileSystem};
 use psy_node_common::{coordinator::processor::create::create_coordinator_processor_and_run_with_durable_guta_submissions, p2p::realm_coordinator::PsyRealmCoordinatorClientAPI, realm::processor::create::create_realm_processor_and_run};
 use psy_node_core::{
     config::node_start_config::{CoordinatorProcessorStartConfig, RealmProcessorStartConfig},
+    genesis::genesis_db_data_builder::GenesisDatabaseDataBuilder,
     store::rollback_runtime_rebuild::RealmRollbackRuntimeControl,
 };
 use psy_node_nats::psy_queue::setup_nats_psy_queue_from_connection_str;
@@ -84,14 +88,46 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
                     )
                     .await?;
             }
-            let durable_guta_submissions = if config.durable_guta_submission_enabled {
+            let (
+                durable_guta_submissions,
+                branch_exact_capture_factory,
+                branch_exact_full_commit,
+            ) = if let Some(startup) = &config.branch_exact_startup {
+                let (genesis_transition, _) = GenesisDatabaseDataBuilder::<
+                    <N as QNetworkHashTypes>::F,
+                    <N as QNetworkHashTypes>::QHash,
+                >::setup_for_coordinator::<<N as QNetworkHashTypes>::HasherBase, N>(
+                    &genesis_data,
+                    circuit_fingerprint_config
+                        .checkpoint_state_transition_circuit_fingerprint,
+                )?;
+                let (submissions, capture, full_commit) = db
+                    .store
+                    .prepare_coordinator_processor_branch_exact_runtime::<<N as QNetworkHashTypes>::F>(
+                        config.network.into(),
+                        nats_queue.clone(),
+                        startup.try_writer_activation_digest()?,
+                        genesis_transition
+                            .state_transition
+                            .genesis_checkpoint_state_transition_hash,
+                        circuit_fingerprint_config
+                            .checkpoint_state_transition_circuit_fingerprint,
+                        N::CHECKPOINT_TREE_HEIGHT,
+                    )
+                    .await?;
+                (Some(submissions), Some(capture), Some(full_commit))
+            } else if config.durable_guta_submission_enabled {
                 db.store.initialize_pending_queue_sidecar_setup(
                     AuthorityScope::Coordinator,
                     PendingQueueSidecarSetupMode::RequireVerified,
                 ).await?;
-                Some(db.store.prepare_coordinator_guta_durable_submission_store(config.network.into()).await?)
+                (
+                    Some(db.store.prepare_coordinator_guta_durable_submission_store(config.network.into()).await?),
+                    None,
+                    None,
+                )
             } else {
-                None
+                (None, None, None)
             };
             let canonical_head_store = db.store.clone();
             let rollback_admission_store = db.store.clone();
@@ -114,6 +150,8 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
                 temp_db,
                 proof_store,
                 durable_guta_submissions,
+                branch_exact_capture_factory,
+                branch_exact_full_commit,
                 guta_update_queue,
                 register_user_queue,
                 deploy_contract_queue,

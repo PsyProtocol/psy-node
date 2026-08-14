@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use crate::{
     config::node_start_config::{
         CoordinatorEdgeStartConfig, CoordinatorProcessorStartConfig,
-        CoordinatorRollbackTopologyConfig, RealmBranchExactStartupConfig,
+        CoordinatorRollbackTopologyConfig, CoordinatorBranchExactStartupConfig,
+        RealmBranchExactStartupConfig,
         RealmEdgeStartConfig, RealmProcessorStartConfig,
     },
     store::canonical_head::CanonicalHeadBootstrapProfile,
@@ -246,6 +247,8 @@ pub struct CoordinatorProcessorCliConfig {
     pub canonical_head_bootstrap_profile: Option<CanonicalHeadBootstrapProfile>,
     #[serde(default)]
     pub rollback_topology: Option<CoordinatorRollbackTopologyConfig>,
+    #[serde(default)]
+    pub branch_exact_startup: Option<CoordinatorBranchExactStartupConfig>,
     pub durable_guta_submission_enabled: Option<bool>,
     pub verbose: Option<bool>,
     pub checkpoint_backup_path: Option<String>,
@@ -263,6 +266,7 @@ impl CoordinatorProcessorCliConfig {
             network: None,
             canonical_head_bootstrap_profile: None,
             rollback_topology: None,
+            branch_exact_startup: None,
             durable_guta_submission_enabled: None,
             verbose: None,
             checkpoint_backup_path: None,
@@ -292,6 +296,7 @@ impl CoordinatorProcessorCliConfig {
             network: network.or(self.network).ok_or_else(|| anyhow::anyhow!("network is required"))?.into(),
             canonical_head_bootstrap_profile: self.canonical_head_bootstrap_profile,
             rollback_topology: self.rollback_topology,
+            branch_exact_startup: self.branch_exact_startup,
             durable_guta_submission_enabled: self.durable_guta_submission_enabled.unwrap_or(false),
             verbose: verbose || self.verbose.unwrap_or(false),
             checkpoint_backup_path: checkpoint_backup_path.or(self.checkpoint_backup_path).ok_or_else(|| anyhow::anyhow!("checkpoint_backup_path is required"))?,

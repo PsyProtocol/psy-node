@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use parth_core::{node::realm_identifier::QRealmIdentifier, protocol::core_types::QNetworkTypesConfig};
+use rand::RngCore;
 use psy_core::{
     constants::chain_id::PsyChainNetworkType,
     job::job_id::QProvingJobDataID,
@@ -17,6 +18,7 @@ use psy_node_core::{
     psy_temp_db::StandardProcessorTempDBStoreBase,
     queue::{
         coordinator_guta_durable_submission::CoordinatorGutaDurableSubmissionStore,
+        coordinator_processor_durable_capture::CoordinatorProcessorDurableCaptureFactory,
         ephemeral::QStandardEphemeralQueueSubscriber,
         worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
     },
@@ -627,6 +629,17 @@ where
 }
 
 
+fn fresh_coordinator_owner_attempt_digest() -> [u8; 32] {
+    loop {
+        let mut digest = [0; 32];
+        rand::thread_rng().fill_bytes(&mut digest);
+        if digest != [0; 32] {
+            return digest;
+        }
+    }
+}
+
+
 
 pub async fn create_coordinator_processor_and_run_with_durable_guta_submissions<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
@@ -662,6 +675,10 @@ pub async fn create_coordinator_processor_and_run_with_durable_guta_submissions<
     proof_store: Arc<ProofStore>,
     durable_guta_submissions:
         Option<Arc<dyn CoordinatorGutaDurableSubmissionStore<N::QHash>>>,
+    branch_exact_capture_factory:
+        Option<Arc<dyn CoordinatorProcessorDurableCaptureFactory>>,
+    branch_exact_full_commit:
+        Option<Arc<dyn CoordinatorProcessorFullCommitStore<N::QHash>>>,
     guta_update_queue: Arc<GUTAUpdateQueue>,
     register_user_queue: Arc<RegisterUserQueue>,
     deploy_contract_queue: Arc<DeployContractQueue>,
@@ -688,6 +705,31 @@ where
             canonical_head_store.as_ref(),
         )
         .await?;
+        let (normal_processing_owner, full_commit) = match (
+            branch_exact_capture_factory.as_ref(),
+            branch_exact_full_commit.as_ref(),
+        ) {
+            (None, None) => (
+                crate::coordinator::processor::CoordinatorNormalProcessingOwner::legacy(),
+                None,
+            ),
+            (Some(factory), Some(full_commit)) => {
+                let owner = CoordinatorBranchExactProcessorOwner::install(
+                    Arc::clone(factory),
+                    NetworkId::from(network),
+                    factory.writer_activation_digest(),
+                    factory.queue_readiness_digest(),
+                    fresh_coordinator_owner_attempt_digest(),
+                )?;
+                (
+                    crate::coordinator::processor::CoordinatorNormalProcessingOwner::branch_exact(owner),
+                    Some(Arc::clone(full_commit)),
+                )
+            }
+            _ => anyhow::bail!(
+                "Coordinator branch-exact capture and full-commit capabilities must be supplied together"
+            ),
+        };
         let (processor, guta_gatherer_join_handle, register_users_gatherer_join_handle, deploy_contracts_gatherer_join_handle) = create_coordinator_processor_with_processing_owner::<N, S, STagTreeRewards, GUTAUpdateQueue, RegisterUserQueue, DeployContractQueue, ProofWorkQueue, TempDatabase, ProofStore, FileSystem>(
             genesis_data,
             network,
@@ -704,8 +746,8 @@ where
             temp_db.clone(),
             proof_store.clone(),
             durable_guta_submissions.clone(),
-            crate::coordinator::processor::CoordinatorNormalProcessingOwner::legacy(),
-            None,
+            normal_processing_owner,
+            full_commit,
             rollback_restart_directive.take(),
             initial_rollback_drain,
             guta_update_queue.clone(),
@@ -824,6 +866,8 @@ where
         temp_db,
         proof_store,
         None,
+        None,
+        None,
         guta_update_queue,
         register_user_queue,
         deploy_contract_queue,
@@ -934,6 +978,32 @@ mod tests {
         assert!(create < consume && consume < run && restart < retain);
         assert!(run < shutdown && run < restart);
         assert!(!function[restart..].contains("return Ok(())"));
+    }
+
+    #[test]
+    fn coordinator_run_loop_installs_branch_exact_capabilities_as_one_pair() {
+        let source = include_str!("create.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let function = production
+            .split("pub async fn create_coordinator_processor_and_run_with_durable_guta_submissions<")
+            .nth(1)
+            .expect("Coordinator create-and-run entry");
+        let recreate_loop = function.find("loop {").expect("recreate loop");
+        let capability_match = function
+            .find("branch_exact_capture_factory.as_ref()")
+            .expect("paired branch-exact capability match");
+        let owner_install = function
+            .find("CoordinatorBranchExactProcessorOwner::install(")
+            .expect("fresh owner installation");
+        let processor_create = function
+            .find("create_coordinator_processor_with_processing_owner::<")
+            .expect("processor construction");
+        assert!(recreate_loop < capability_match);
+        assert!(capability_match < owner_install && owner_install < processor_create);
+        assert!(function.contains("(None, None)"));
+        assert!(function.contains("(Some(factory), Some(full_commit))"));
+        assert!(function.contains("must be supplied together"));
+        assert!(function.contains("fresh_coordinator_owner_attempt_digest()"));
     }
 
     #[test]

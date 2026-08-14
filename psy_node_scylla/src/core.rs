@@ -44,9 +44,12 @@ use scylla::client::session_builder::SessionBuilder;
 use psy_node_nats::queue::NatsJetStreamClient;
 use crate::rollback::{
     AuthorityTimestampNoTabletKeyspace,
+    BranchExactDeploymentNoTabletKeyspace,
     BranchExactSchemaReady, BranchExactSchemaReadyView,
     BranchExactSchemaSetupError, BranchExactSchemaSetupMode,
     BranchExactSchemaSetupOutcome,
+    BranchExactSchemaSetupRequest, BranchExactWriterAuthorityKey,
+    BranchExactWriterReadState, ScyllaBranchExactWriterLifecycleStore,
     CanonicalHeadNoTabletKeyspace, ScyllaCanonicalHeadStore,
     ScyllaBranchExactSchemaSetupGate, ScyllaRollbackAdmissionStore,
     ScyllaRollbackParticipantPlanStore,
@@ -638,6 +641,88 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
             )
             .await?,
         ))
+    }
+
+    /// Enable the default-off Coordinator branch-exact runtime from one
+    /// operator-pinned writer activation. This consumes existing VERIFIED
+    /// schema and sidecar state; it never deploys tables or initializes the
+    /// writer lifecycle.
+    pub async fn prepare_coordinator_processor_branch_exact_runtime<F>(
+        &self,
+        network: psy_data::protocol::canonical_chain::NetworkId,
+        nats: Arc<NatsJetStreamClient>,
+        expected_writer_activation_digest: [u8; 32],
+        genesis_checkpoint_state_transition_hash: Hash,
+        checkpoint_state_transition_circuit_fingerprint: Hash,
+        checkpoint_tree_height: u8,
+    ) -> anyhow::Result<(
+        Arc<dyn CoordinatorGutaDurableSubmissionStore<Hash>>,
+        Arc<dyn CoordinatorProcessorDurableCaptureFactory>,
+        Arc<dyn CoordinatorProcessorFullCommitStore<Hash>>,
+    )>
+    where
+        F: QFelt64 + Send + Sync + 'static,
+        Hash: Q256BitHash + QFHashBase<F> + Send + Sync + 'static,
+        Hasher: MerkleHasher<Hash>
+            + FieldQHasher<F, Hash>
+            + Send
+            + Sync
+            + 'static,
+    {
+        if expected_writer_activation_digest == [0; 32] {
+            anyhow::bail!("Coordinator writer activation digest cannot be zero");
+        }
+        let authority = psy_data::protocol::chain_context::AuthorityScope::Coordinator;
+        let lifecycle = ScyllaBranchExactWriterLifecycleStore::prepare(
+            self.session.clone(),
+            BranchExactDeploymentNoTabletKeyspace::try_new(
+                self.no_tablet_keyspace.clone(),
+            )?,
+        )
+        .await?;
+        let writer = match lifecycle
+            .read::<Hash>(BranchExactWriterAuthorityKey::new(network, authority))
+            .await?
+        {
+            BranchExactWriterReadState::Current(writer) => writer,
+            BranchExactWriterReadState::Uninitialized => {
+                anyhow::bail!("Coordinator branch-exact writer is uninitialized")
+            }
+        };
+        if writer.plan().digest().as_bytes()
+            != &expected_writer_activation_digest
+        {
+            anyhow::bail!("Coordinator writer activation digest mismatch");
+        }
+        self.initialize_branch_exact_schema_setup(
+            authority,
+            BranchExactSchemaSetupMode::RequireVerified(
+                BranchExactSchemaSetupRequest::new(
+                    writer.plan().backfill_receipt().clone(),
+                ),
+            ),
+        )
+        .await?;
+        self.initialize_pending_queue_sidecar_setup(
+            authority,
+            PendingQueueSidecarSetupMode::RequireVerified,
+        )
+        .await?;
+        let submissions = self
+            .prepare_coordinator_guta_durable_submission_store(network)
+            .await?;
+        let capture = self
+            .prepare_coordinator_processor_durable_capture_factory(network, nats)
+            .await?;
+        let full_commit = self
+            .prepare_coordinator_processor_full_commit_store::<F>(
+                network,
+                genesis_checkpoint_state_transition_hash,
+                checkpoint_state_transition_circuit_fingerprint,
+                checkpoint_tree_height,
+            )
+            .await?;
+        Ok((submissions, capture, full_commit))
     }
 
     /// Explicit h21 tooling hook.  Opening a shadow reader requires the exact
@@ -1385,5 +1470,44 @@ mod branch_exact_startup_factory_tests {
             assert!(cli.contains("setup_realm_processor_scylla_startup_composition"));
             assert!(!cli.contains(".prepare_realm_processor_startup_preflight("));
         }
+    }
+
+    #[test]
+    fn coordinator_runtime_requires_verified_writer_schema_and_sidecar_before_prepare() {
+        let source = include_str!("core.rs");
+        let method = source
+            .split("pub async fn prepare_coordinator_processor_branch_exact_runtime")
+            .nth(1)
+            .expect("Coordinator branch-exact runtime preparation")
+            .split("pub async fn prepare_branch_exact_shadow_reader")
+            .next()
+            .unwrap();
+        let writer_read = method
+            .find(".read::<Hash>(BranchExactWriterAuthorityKey::new")
+            .unwrap();
+        let writer_match = method
+            .find("writer.plan().digest().as_bytes()")
+            .unwrap();
+        let schema = method
+            .find("initialize_branch_exact_schema_setup(")
+            .unwrap();
+        let sidecar = method
+            .find("initialize_pending_queue_sidecar_setup(")
+            .unwrap();
+        let submissions = method
+            .find("prepare_coordinator_guta_durable_submission_store")
+            .unwrap();
+        let capture = method
+            .find("prepare_coordinator_processor_durable_capture_factory")
+            .unwrap();
+        let full_commit = method
+            .find("prepare_coordinator_processor_full_commit_store")
+            .unwrap();
+        assert!(writer_read < writer_match && writer_match < schema);
+        assert!(schema < sidecar && sidecar < submissions);
+        assert!(submissions < capture && capture < full_commit);
+        assert!(method.contains("BranchExactSchemaSetupMode::RequireVerified"));
+        assert!(method.contains("PendingQueueSidecarSetupMode::RequireVerified"));
+        assert!(!method.contains("DeployAndVerify"));
     }
 }

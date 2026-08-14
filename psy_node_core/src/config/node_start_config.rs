@@ -101,6 +101,18 @@ pub struct RealmBranchExactStartupConfig {
     pub writer_activation_digest_hex: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoordinatorBranchExactStartupConfig {
+    pub writer_activation_digest_hex: String,
+}
+
+impl CoordinatorBranchExactStartupConfig {
+    pub fn try_writer_activation_digest(&self) -> anyhow::Result<[u8; 32]> {
+        decode_canonical_digest(&self.writer_activation_digest_hex)
+    }
+}
+
 impl RealmBranchExactStartupConfig {
     pub fn try_lineage(
         &self,
@@ -213,6 +225,10 @@ pub struct CoordinatorProcessorStartConfig {
     /// Realm membership from protocol capacity or observed traffic.
     #[serde(default)]
     pub rollback_topology: Option<CoordinatorRollbackTopologyConfig>,
+    /// Explicit, default-off activation of the durable Coordinator Processor.
+    /// The configured digest must match the already-verified writer plan.
+    #[serde(default)]
+    pub branch_exact_startup: Option<CoordinatorBranchExactStartupConfig>,
     pub verbose: bool,
     pub checkpoint_backup_path: String,
     pub genesis_data_path: Option<String>,
@@ -336,6 +352,42 @@ mod realm_branch_exact_startup_tests {
             "listen": "127.0.0.1"
         });
         let parsed: RealmEdgeStartConfig = serde_json::from_value(json).unwrap();
+        assert!(parsed.branch_exact_startup.is_none());
+    }
+
+    #[test]
+    fn coordinator_branch_exact_is_explicit_and_strictly_pinned() {
+        let startup = CoordinatorBranchExactStartupConfig {
+            writer_activation_digest_hex: hex::encode([7; 32]),
+        };
+        assert_eq!(startup.try_writer_activation_digest().unwrap(), [7; 32]);
+
+        for malformed in [
+            "07".to_owned(),
+            format!("0x{}", hex::encode([7; 32])),
+            hex::encode_upper([0xab; 32]),
+        ] {
+            assert!(CoordinatorBranchExactStartupConfig {
+                writer_activation_digest_hex: malformed,
+            }
+            .try_writer_activation_digest()
+            .is_err());
+        }
+
+        let json = serde_json::json!({
+            "scylla_db_url": "scylla",
+            "nats_jetstream_url": "nats",
+            "redis_url": "redis",
+            "db_namespace": "psy",
+            "coordinator_id": 0,
+            "coordinator_sub_id": 0,
+            "network": PsyChainNetworkType::LocalDevnet,
+            "verbose": false,
+            "checkpoint_backup_path": "/tmp/psy",
+            "genesis_data_path": null
+        });
+        let parsed: CoordinatorProcessorStartConfig =
+            serde_json::from_value(json).unwrap();
         assert!(parsed.branch_exact_startup.is_none());
     }
 }
