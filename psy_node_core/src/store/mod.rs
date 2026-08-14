@@ -26,6 +26,7 @@ pub mod realm_processor_quiescence;
 pub mod realm_processor_branch_exact_runtime;
 pub mod coordinator_processor_branch_exact_runtime;
 pub mod coordinator_commit_source;
+pub mod coordinator_normal_commit_coverage;
 pub mod realm_processor_startup;
 pub mod rollback_admin;
 pub mod rollback_admission;
