@@ -1454,6 +1454,21 @@ mod tests {
             .unwrap(),
             plan.typed_row_count(),
         );
+        let typed = crate::rollback::coordinator_commit_physical_execution::exact_observation_fixture(
+            &schedule,
+        );
+        let full = crate::rollback::coordinator_commit_full_write::CoordinatorCommitFullWriteObservation::test_fixture(
+            &source,
+            &schedule,
+            &narrow,
+            typed,
+        )
+        .unwrap();
+        assert_eq!(full.candidate(), source.candidate());
+        assert_eq!(full.semantic_domain_count(), 23);
+        assert_eq!(full.typed_row_count(), plan.typed_row_count());
+        assert_eq!(full.total_physical_row_count(), plan.row_count());
+        assert_ne!(full.digest(), &[0; 32]);
     }
 
     #[test]

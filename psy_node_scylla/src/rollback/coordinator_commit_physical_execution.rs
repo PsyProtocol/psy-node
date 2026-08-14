@@ -141,6 +141,8 @@ pub(crate) struct CoordinatorCommitPhysicalExecutionSchedule<Hash> {
     narrow_intent_digest: [u8; 32],
     timestamp: CommitWriteTimestampUs,
     write_kind: TimestampedWriteKind,
+    semantic_domain_count: usize,
+    total_physical_row_count: usize,
     rows: Vec<CoordinatorCommitExpectedRow>,
 }
 
@@ -196,8 +198,18 @@ impl<Hash: Q256BitHash> CoordinatorCommitPhysicalExecutionSchedule<Hash> {
             narrow_intent_digest: *plan.narrow_intent_digest(),
             timestamp: plan.timestamp(),
             write_kind: plan.write_kind(),
+            semantic_domain_count: plan.semantic_domain_count(),
+            total_physical_row_count: plan.row_count(),
             rows,
         })
+    }
+
+    pub(crate) const fn source_slot(&self) -> &[u8; 32] {
+        &self.source_slot
+    }
+
+    pub(crate) const fn source_digest(&self) -> &[u8; 32] {
+        &self.source_digest
     }
 
     pub(crate) fn rows(&self) -> &[CoordinatorCommitExpectedRow] {
@@ -222,12 +234,24 @@ impl<Hash: Q256BitHash> CoordinatorCommitPhysicalExecutionSchedule<Hash> {
         &self.plan_digest
     }
 
+    pub(crate) const fn inventory_digest(&self) -> &[u8; 32] {
+        &self.inventory_digest
+    }
+
     pub(crate) const fn narrow_prepared_digest(&self) -> &[u8; 32] {
         &self.narrow_prepared_digest
     }
 
     pub(crate) const fn narrow_intent_digest(&self) -> &[u8; 32] {
         &self.narrow_intent_digest
+    }
+
+    pub(crate) const fn semantic_domain_count(&self) -> usize {
+        self.semantic_domain_count
+    }
+
+    pub(crate) const fn total_physical_row_count(&self) -> usize {
+        self.total_physical_row_count
     }
 
     /// Missing/stale value rows are retryable. Key-only rows are always
@@ -484,6 +508,41 @@ impl<Hash> CoordinatorTypedRowsExactObservation<Hash> {
     }
 }
 
+/// Build exact typed-row evidence without a driver. This is limited to tests
+/// that already constructed a production schedule from a decoded durable
+/// Coordinator source and a sealed narrow writer state.
+#[cfg(test)]
+pub(super) fn exact_observation_fixture<Hash: Q256BitHash>(
+    schedule: &CoordinatorCommitPhysicalExecutionSchedule<Hash>,
+) -> CoordinatorTypedRowsExactObservation<Hash> {
+    let mut acknowledged = BTreeSet::new();
+    let observed = schedule
+        .rows()
+        .iter()
+        .enumerate()
+        .map(|(index, row)| match row.expected() {
+            CoordinatorCommitExpectedValue::Value(value) => {
+                Some(CoordinatorCommitObservedRow::value(
+                    row.physical_table(),
+                    row.locator().to_vec(),
+                    value.clone(),
+                    row.timestamp().as_i64(),
+                ))
+            }
+            CoordinatorCommitExpectedValue::KeyOnlyPresent => {
+                acknowledged.insert(index);
+                Some(CoordinatorCommitObservedRow::key_only(
+                    row.physical_table(),
+                    row.locator().to_vec(),
+                ))
+            }
+        })
+        .collect::<Vec<_>>();
+    schedule
+        .verify_after_write(&observed, &acknowledged)
+        .expect("exact schedule fixture")
+}
+
 fn require_identity(
     index: usize,
     expected: &CoordinatorCommitExpectedRow,
@@ -697,6 +756,8 @@ mod tests {
             narrow_intent_digest: [6; 32],
             timestamp: row.timestamp(),
             write_kind: row.sealed().write_kind(),
+            semantic_domain_count: 23,
+            total_physical_row_count: 7,
             rows: vec![row],
         }
     }

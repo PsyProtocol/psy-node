@@ -3,14 +3,16 @@
 //! This executor consumes only a validated Coordinator physical schedule. It
 //! dispatches to the existing rollback-aware family adapters plus two narrow
 //! Coordinator families (key-only public-key projection and pending-keyed
-//! Realm reward materialization). It neither executes the six narrow mapping
-//! rows nor commits the source, persists a manifest, updates backups, or
-//! publishes a canonical head.
+//! Realm reward materialization). Once the independent narrow writer is
+//! durably `WritesVerified`, this executor can bind both exact observations
+//! into the complete 23-domain boundary. It still cannot commit the source,
+//! persist a manifest, update backups, or publish a canonical head.
 
 use std::collections::BTreeSet;
 
 use parth_core::protocol::core_types::Q256BitHash;
 use psy_node_core::store::{
+    coordinator_commit_source::CoordinatorCommitSource,
     coordinator_normal_commit_coverage::CoordinatorNormalCommitWriteDomain,
     typed::{
         CheckpointId, MutationOperation, MutationValue,
@@ -25,6 +27,7 @@ use scylla::{
 use crate::{compression, utils::u64_to_i64_exact};
 
 use super::{
+    BranchExactWriterVerified,
     CheckpointKivAdapter, CheckpointKivPutBinding, CheckpointMerkleAdapter,
     CheckpointMerklePutBinding, CheckpointObjectSingleAdapter,
     CheckpointObjectSinglePutBinding, CheckpointRootPairAdapter,
@@ -38,6 +41,7 @@ use super::{
         CoordinatorCommitObservedRow, CoordinatorCommitPhysicalExecutionSchedule,
         CoordinatorCommitPhysicalPreflight, CoordinatorTypedRowsExactObservation,
     },
+    coordinator_commit_full_write::CoordinatorCommitFullWriteObservation,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -351,6 +355,27 @@ impl CoordinatorCommitPhysicalScyllaExecutor {
                 None => Err(verification.into()),
             },
         }
+    }
+
+    /// Execute/reconcile all typed rows and join them to the already durable
+    /// six-row narrow observation. The resulting value proves the complete
+    /// physical write surface, but grants no committed-source or head-publish
+    /// authority.
+    pub(crate) async fn write_and_verify_full<Hash: Q256BitHash>(
+        &self,
+        session: &Session,
+        source: &CoordinatorCommitSource<Hash>,
+        schedule: &CoordinatorCommitPhysicalExecutionSchedule<Hash>,
+        narrow: &BranchExactWriterVerified<Hash>,
+    ) -> anyhow::Result<CoordinatorCommitFullWriteObservation<Hash>> {
+        let typed = self.write_and_verify(session, schedule).await?;
+        CoordinatorCommitFullWriteObservation::try_from_storage(
+            source,
+            schedule,
+            narrow,
+            typed,
+        )
+        .map_err(Into::into)
     }
 
     async fn execute_action<Hash: Q256BitHash>(
