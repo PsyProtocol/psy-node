@@ -47,6 +47,7 @@ psy_node_scylla/src/rollback/checkpoint_root_pair.rs|RollbackPrototypeAdapter|9|
 psy_node_scylla/src/rollback/confinement.rs|RollbackPrototypeAdapter|4|0|14|0|0|0|1|0
 psy_node_scylla/src/rollback/coordinator_commit_delete_restore_executor.rs|DurableControlAuthority|7|0|15|8|2|11|0|4
 psy_node_scylla/src/rollback/coordinator_commit_delete_restore_plan_store.rs|DurableControlAuthority|5|0|3|6|2|3|0|4
+psy_node_scylla/src/rollback/coordinator_commit_full_completion_store.rs|DurableControlAuthority|6|0|2|5|2|2|1|8
 psy_node_scylla/src/rollback/coordinator_commit_full_manifest_store.rs|DurableControlAuthority|6|0|3|5|2|2|1|8
 psy_node_scylla/src/rollback/coordinator_commit_physical_archive_store.rs|DurableControlAuthority|10|0|14|9|2|5|1|8
 psy_node_scylla/src/rollback/coordinator_commit_physical_before_image.rs|DurableControlAuthority|0|0|0|0|0|0|0|3

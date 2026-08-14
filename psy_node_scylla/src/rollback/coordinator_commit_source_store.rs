@@ -29,7 +29,10 @@ use super::{
     CoordinatorRollbackFloorSingletonAnchorStoreError, CqlKeyspaceName,
     ScyllaCoordinatorRollbackFloorSingletonAnchorStore,
 };
-use super::coordinator_commit_full_manifest_store::ScyllaCoordinatorCommitFullManifestStore;
+use super::{
+    coordinator_commit_full_completion_store::ScyllaCoordinatorCommitFullCompletionStore,
+    coordinator_commit_full_manifest_store::ScyllaCoordinatorCommitFullManifestStore,
+};
 
 pub(crate) const COORDINATOR_COMMIT_SOURCE_HEADER_TABLE: &str =
     "coordinator_commit_source_header_v1";
@@ -123,6 +126,7 @@ pub(crate) struct ScyllaCoordinatorCommitSourceStore {
     scan_headers: PreparedStatement,
     floor_singletons: ScyllaCoordinatorRollbackFloorSingletonAnchorStore,
     full_manifests: ScyllaCoordinatorCommitFullManifestStore,
+    full_completions: ScyllaCoordinatorCommitFullCompletionStore,
 }
 
 impl ScyllaCoordinatorCommitSourceStore {
@@ -153,6 +157,9 @@ impl ScyllaCoordinatorCommitSourceStore {
         ScyllaCoordinatorCommitFullManifestStore::create_schema(session, keyspace)
             .await
             .map_err(|error| CoordinatorCommitSourceStoreError::FullManifest(error.to_string()))?;
+        ScyllaCoordinatorCommitFullCompletionStore::create_schema(session, keyspace)
+            .await
+            .map_err(|error| CoordinatorCommitSourceStoreError::FullCompletion(error.to_string()))?;
         Ok(())
     }
 
@@ -181,10 +188,16 @@ impl ScyllaCoordinatorCommitSourceStore {
                 .await?,
             full_manifests: ScyllaCoordinatorCommitFullManifestStore::prepare(
                 session.clone(),
-                keyspace,
+                keyspace.clone(),
             )
             .await
             .map_err(|error| CoordinatorCommitSourceStoreError::FullManifest(error.to_string()))?,
+            full_completions: ScyllaCoordinatorCommitFullCompletionStore::prepare(
+                session.clone(),
+                keyspace,
+            )
+            .await
+            .map_err(|error| CoordinatorCommitSourceStoreError::FullCompletion(error.to_string()))?,
             session,
             queries,
         })
@@ -222,6 +235,12 @@ impl ScyllaCoordinatorCommitSourceStore {
         &self,
     ) -> &ScyllaCoordinatorCommitFullManifestStore {
         &self.full_manifests
+    }
+
+    pub(crate) const fn full_completions(
+        &self,
+    ) -> &ScyllaCoordinatorCommitFullCompletionStore {
+        &self.full_completions
     }
 
     pub(crate) async fn persist_floor_and_readback<Hash: Q256BitHash>(
@@ -713,6 +732,7 @@ pub(crate) enum CoordinatorCommitSourceStoreError {
     FloorMissing,
     Inventory(String),
     FullManifest(String),
+    FullCompletion(String),
     IndeterminateWrite(String),
     FloorSingletonAnchor(CoordinatorRollbackFloorSingletonAnchorStoreError),
 }

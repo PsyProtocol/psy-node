@@ -15,7 +15,10 @@ use psy_io::tokio::{TokioFileLike, TokioLikeFileSystem};
 use psy_node_core::{
     p2p::traits::realm_coordinantor::RealmCoordinatorClient,
     psy_core_db::traits::full::PsyNodeCheckpointTreeDatabaseReader,
-    store::coordinator_commit_source::{CoordinatorCommitSource, CoordinatorCommitSourcePayload},
+    store::coordinator_commit_source::{
+        CoordinatorCheckpointBackupEvidence, CoordinatorCommitSource,
+        CoordinatorCommitSourceError, CoordinatorCommitSourcePayload,
+    },
 };
 use psy_serialize::PsyIOReadWrite;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -92,6 +95,32 @@ impl<Hash> CoordinatorCheckpointTreeBackupReceipt<Hash> {
 
     pub const fn exact(&self) -> &CheckpointTreeBackupExactReceipt<Hash> {
         &self.exact
+    }
+}
+
+impl<Hash: Q256BitHash> CoordinatorCheckpointTreeBackupReceipt<Hash> {
+    /// Consume the local non-Clone file receipt into an inert observation for
+    /// the affine storage owner. Publication authority remains with that
+    /// owner; this value alone cannot mark a source or publish a head.
+    pub fn into_evidence(
+        self,
+        source: &CoordinatorCommitSource<Hash>,
+    ) -> Result<CoordinatorCheckpointBackupEvidence<Hash>, CoordinatorCommitSourceError> {
+        if self.source_slot != source.slot().as_bytes()
+            || self.source_digest != source.digest().as_bytes()
+            || self.candidate != *source.candidate()
+        {
+            return Err(CoordinatorCommitSourceError::CheckpointBackupIdentityMismatch);
+        }
+        CoordinatorCheckpointBackupEvidence::try_from_exact_source(
+            source,
+            self.exact.checkpoint_id,
+            self.exact.checkpoint_hash,
+            self.exact.old_root,
+            self.exact.new_root,
+            self.exact.min_backed_up_checkpoint_id,
+            self.exact.next_backup_checkpoint_id,
+        )
     }
 }
 

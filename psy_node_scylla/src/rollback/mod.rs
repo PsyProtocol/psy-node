@@ -102,6 +102,10 @@ mod coordinator_commit_full_write;
 mod coordinator_commit_full_manifest;
 #[allow(dead_code)]
 mod coordinator_commit_full_manifest_store;
+#[allow(dead_code)]
+mod coordinator_commit_full_completion;
+#[allow(dead_code)]
+mod coordinator_commit_full_completion_store;
 mod coordinator_commit_physical_before_image;
 mod coordinator_commit_target_restore;
 mod coordinator_commit_physical_archive_store;

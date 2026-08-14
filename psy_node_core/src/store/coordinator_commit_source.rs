@@ -36,6 +36,8 @@ const SLOT_DOMAIN: &[u8] = b"psy.rollback.coordinator-commit-source-slot.v1\0";
 const SOURCE_DOMAIN: &[u8] = b"psy.rollback.coordinator-commit-source-bytes.v1\0";
 const OBJECT_DOMAIN: &[u8] = b"psy.rollback.coordinator-commit-source-object.v1\0";
 const MARKER_DOMAIN: &[u8] = b"psy.rollback.coordinator-commit-source-committed.v1\0";
+const BACKUP_EVIDENCE_DOMAIN: &[u8] =
+    b"psy.rollback.coordinator-checkpoint-backup-evidence.v1\0";
 const FLOOR_DOMAIN: &[u8] = b"psy.rollback.coordinator-commit-source-floor.v1\0";
 const FLOOR_ROW_REVISION: i64 = 1;
 
@@ -178,6 +180,117 @@ pub struct CoordinatorCommitSource<Hash> {
     source_digest: [u8; 32],
     slot: CoordinatorCommitSourceSlot,
     digest: CoordinatorCommitSourceDigest,
+}
+
+/// Inert, source-bound observation of one exact local checkpoint backup.
+///
+/// This is intentionally not a commit marker or head-publication capability.
+/// The controlled full-commit owner may consume it only after independently
+/// re-reading the immutable source and full-write manifest.
+#[derive(Debug, Eq, PartialEq)]
+pub struct CoordinatorCheckpointBackupEvidence<Hash> {
+    source_slot: [u8; 32],
+    source_digest: [u8; 32],
+    candidate: CanonicalChainRef<Hash>,
+    checkpoint_id: u64,
+    checkpoint_hash: Hash,
+    old_root: Hash,
+    new_root: Hash,
+    min_backed_up_checkpoint_id: u64,
+    next_backup_checkpoint_id: u64,
+    digest: [u8; 32],
+}
+
+impl<Hash: Q256BitHash> CoordinatorCheckpointBackupEvidence<Hash> {
+    pub fn try_from_exact_source(
+        source: &CoordinatorCommitSource<Hash>,
+        checkpoint_id: u64,
+        checkpoint_hash: Hash,
+        old_root: Hash,
+        new_root: Hash,
+        min_backed_up_checkpoint_id: u64,
+        next_backup_checkpoint_id: u64,
+    ) -> Result<Self, CoordinatorCommitSourceError> {
+        let expected_next = checkpoint_id
+            .checked_add(1)
+            .ok_or(CoordinatorCommitSourceError::CheckpointBackupIdOverflow)?;
+        if source.candidate().checkpoint().checkpoint_id().get() != checkpoint_id
+            || next_backup_checkpoint_id != expected_next
+            || min_backed_up_checkpoint_id > checkpoint_id
+            || old_root == new_root
+        {
+            return Err(CoordinatorCommitSourceError::CheckpointBackupIdentityMismatch);
+        }
+        let mut evidence = Self {
+            source_slot: source.slot().as_bytes(),
+            source_digest: source.digest().as_bytes(),
+            candidate: *source.candidate(),
+            checkpoint_id,
+            checkpoint_hash,
+            old_root,
+            new_root,
+            min_backed_up_checkpoint_id,
+            next_backup_checkpoint_id,
+            digest: [0; 32],
+        };
+        evidence.digest = evidence.compute_digest();
+        Ok(evidence)
+    }
+
+    fn compute_digest(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(BACKUP_EVIDENCE_DOMAIN);
+        hasher.update(self.source_slot);
+        hasher.update(self.source_digest);
+        hasher.update(self.candidate.to_canonical_bytes());
+        hasher.update(self.checkpoint_id.to_be_bytes());
+        hasher.update(self.checkpoint_hash.into_owned_32bytes());
+        hasher.update(self.old_root.into_owned_32bytes());
+        hasher.update(self.new_root.into_owned_32bytes());
+        hasher.update(self.min_backed_up_checkpoint_id.to_be_bytes());
+        hasher.update(self.next_backup_checkpoint_id.to_be_bytes());
+        hasher.finalize().into()
+    }
+
+    pub const fn source_slot(&self) -> &[u8; 32] {
+        &self.source_slot
+    }
+
+    pub const fn source_digest(&self) -> &[u8; 32] {
+        &self.source_digest
+    }
+
+    pub const fn candidate(&self) -> &CanonicalChainRef<Hash> {
+        &self.candidate
+    }
+
+    pub const fn checkpoint_id(&self) -> u64 {
+        self.checkpoint_id
+    }
+
+    pub const fn checkpoint_hash(&self) -> &Hash {
+        &self.checkpoint_hash
+    }
+
+    pub const fn old_root(&self) -> &Hash {
+        &self.old_root
+    }
+
+    pub const fn new_root(&self) -> &Hash {
+        &self.new_root
+    }
+
+    pub const fn min_backed_up_checkpoint_id(&self) -> u64 {
+        self.min_backed_up_checkpoint_id
+    }
+
+    pub const fn next_backup_checkpoint_id(&self) -> u64 {
+        self.next_backup_checkpoint_id
+    }
+
+    pub const fn digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
 }
 
 /// Durable normal-commit source boundary. The canonical-head writer depends
@@ -801,6 +914,8 @@ pub enum CoordinatorCommitSourceError {
     NonCanonicalRollbackFloor,
     RollbackFloorBranchMismatch,
     RollbackFloorAboveCurrentHead { floor: u64, current: u64 },
+    CheckpointBackupIdOverflow,
+    CheckpointBackupIdentityMismatch,
 }
 
 impl fmt::Display for CoordinatorCommitSourceError {
@@ -986,6 +1101,60 @@ mod tests {
             .candidate()
             .to_owned();
         assert!(CoordinatorCommitSource::try_new(rollback_head, canonical(1, 8, 8), vec![1]).is_err());
+    }
+
+    #[test]
+    fn checkpoint_backup_evidence_binds_exact_source_and_window() {
+        let source = CoordinatorCommitSource::try_new(
+            head(),
+            canonical(0, 8, 8),
+            vec![1, 2, 3],
+        )
+        .unwrap();
+        let old_root = PHash::from_owned_32bytes([0x31; 32]);
+        let new_root = PHash::from_owned_32bytes([0x32; 32]);
+        let checkpoint_hash = PHash::from_owned_32bytes([0x33; 32]);
+        let evidence = CoordinatorCheckpointBackupEvidence::try_from_exact_source(
+            &source,
+            8,
+            checkpoint_hash,
+            old_root,
+            new_root,
+            2,
+            9,
+        )
+        .unwrap();
+        assert_eq!(evidence.source_slot(), &source.slot().as_bytes());
+        assert_eq!(evidence.source_digest(), &source.digest().as_bytes());
+        assert_eq!(evidence.candidate(), source.candidate());
+        assert_eq!(evidence.checkpoint_id(), 8);
+        assert_eq!(evidence.checkpoint_hash(), &checkpoint_hash);
+        assert_eq!(evidence.old_root(), &old_root);
+        assert_eq!(evidence.new_root(), &new_root);
+        assert_eq!(evidence.min_backed_up_checkpoint_id(), 2);
+        assert_eq!(evidence.next_backup_checkpoint_id(), 9);
+        assert_ne!(evidence.digest(), &[0; 32]);
+
+        assert!(CoordinatorCheckpointBackupEvidence::try_from_exact_source(
+            &source,
+            7,
+            checkpoint_hash,
+            old_root,
+            new_root,
+            2,
+            8,
+        )
+        .is_err());
+        assert!(CoordinatorCheckpointBackupEvidence::try_from_exact_source(
+            &source,
+            8,
+            checkpoint_hash,
+            old_root,
+            new_root,
+            9,
+            9,
+        )
+        .is_err());
     }
 
     #[test]

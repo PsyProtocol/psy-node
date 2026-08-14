@@ -110,6 +110,49 @@ impl<Hash: Q256BitHash> CoordinatorCommitFullManifest<Hash> {
         Ok(manifest)
     }
 
+    #[cfg(test)]
+    pub(super) fn test_fixture(
+        candidate: CanonicalChainRef<Hash>,
+        source_slot: [u8; 32],
+        source_digest: [u8; 32],
+    ) -> Self {
+        let typed_row_count = 19_u32;
+        let total_physical_row_count = typed_row_count
+            + u32::try_from(BranchExactDualWriteMutationKind::COORDINATOR.len())
+                .expect("test narrow count");
+        let mut manifest = Self {
+            slot: manifest_slot(source_slot, &candidate),
+            revision: REVISION,
+            candidate,
+            source_slot,
+            source_digest,
+            plan_digest: [0x41; 32],
+            inventory_digest: [0x42; 32],
+            timestamp: CommitWriteTimestampUs::try_from_i128(17).unwrap(),
+            write_kind: TimestampedWriteKind::AuthorityCommit,
+            narrow_prepared_digest: [0x43; 32],
+            narrow_intent_digest: [0x44; 32],
+            narrow_observation_digest: [0x45; 32],
+            narrow_verified_digest: [0x46; 32],
+            typed_observation_digest: [0x47; 32],
+            semantic_domain_count: u32::try_from(
+                CoordinatorNormalCommitWriteDomain::ALL.len(),
+            )
+            .expect("test domain count"),
+            typed_row_count,
+            total_physical_row_count,
+            full_observation_digest: [0x48; 32],
+            canonical_payload: Vec::new(),
+            digest: [0; 32],
+        };
+        manifest.canonical_payload = encode_manifest(&manifest);
+        manifest.digest = manifest.canonical_payload
+            [manifest.canonical_payload.len() - 32..]
+            .try_into()
+            .expect("manifest codec appends digest");
+        manifest
+    }
+
     pub(crate) fn decode_persisted(
         selected_slot: &[u8],
         revision: i64,
