@@ -33,6 +33,9 @@ use super::{
     rollback_global_delete_barrier::ScyllaRollbackGlobalDeleteBarrierStore,
     rollback_global_restore_barrier::ScyllaRollbackGlobalRestoreBarrierStore,
     rollback_global_restore_orchestrator::ScyllaRollbackGlobalRestoreOrchestrator,
+    rollback_abort_convergence_store::{
+        RollbackAbortCoordinatorProgress, ScyllaRollbackAbortConvergenceStore,
+    },
     rollback_runtime_rebuild_store::ScyllaRollbackRuntimeRebuildStore,
 };
 
@@ -69,9 +72,44 @@ where
             return Ok(CoordinatorRollbackGlobalProgress::Progressed(initial));
         }
         RollbackControlState::Aborting(_) => {
-            // Abort convergence has its own all-participant runtime barrier;
-            // the destructive rollback driver must never consume this phase.
-            return Ok(CoordinatorRollbackGlobalProgress::Progressed(initial));
+            let request = initial
+                .rollback_control()
+                .aborting()
+                .expect("matched ABORTING")
+                .request();
+            let plan = participant_plans
+                .read_participant_plan(network, request.plan_digest().as_bytes())
+                .await?;
+            let topology = participant_plans
+                .read_current_topology(network)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("rollback topology is missing"))?;
+            if !topology.snapshot().validates_plan(&plan) {
+                anyhow::bail!("rollback topology changed before abort convergence")
+            }
+            let abort = ScyllaRollbackAbortConvergenceStore::prepare(
+                session.clone(),
+                &state_keyspace,
+            )
+            .await?;
+            return Ok(match abort
+                .progress_coordinator(canonical_head.as_ref(), initial, &plan)
+                .await?
+            {
+                RollbackAbortCoordinatorProgress::AwaitingParticipants {
+                    head,
+                    completed,
+                    expected,
+                } => CoordinatorRollbackGlobalProgress::AwaitingParticipants {
+                    head,
+                    // Include the Coordinator acknowledgement in both counts.
+                    completed: completed + 1,
+                    expected: expected + 1,
+                },
+                RollbackAbortCoordinatorProgress::Published(head) => {
+                    CoordinatorRollbackGlobalProgress::Progressed(head)
+                }
+            });
         }
         RollbackControlState::Restoring(_) => {
             return progress_restoring::<Hash>(

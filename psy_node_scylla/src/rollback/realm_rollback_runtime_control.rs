@@ -41,6 +41,7 @@ use super::{
     realm_rollback_target_restore_planner::ScyllaRealmRollbackTargetRestorePlanner,
     rollback_global_archive_barrier::read_deleting_rollback_authority,
     rollback_global_delete_barrier::ScyllaRollbackGlobalDeleteBarrierStore,
+    rollback_abort_convergence_store::ScyllaRollbackAbortConvergenceStore,
     ScyllaRollbackParticipantPlanStore,
     rollback_runtime_rebuild_store::ScyllaRollbackRuntimeRebuildStore,
     AuthorityLocalHeadNoTabletKeyspace, CanonicalHeadNoTabletKeyspace,
@@ -52,6 +53,7 @@ pub struct ScyllaRealmRollbackRuntimeControl {
     canonical_head: Arc<ScyllaCanonicalHeadStore>,
     participant_plans: Arc<ScyllaRollbackParticipantPlanStore>,
     runtime_rebuild: Arc<ScyllaRollbackRuntimeRebuildStore>,
+    abort_convergence: Arc<ScyllaRollbackAbortConvergenceStore>,
     local_inventory: Arc<super::realm_rollback_commit_inventory_store::ScyllaRealmRollbackCommitInventoryStore>,
     local_head: Arc<ScyllaAuthorityLocalHeadStore>,
     local_control_keyspace: CqlKeyspaceName,
@@ -114,7 +116,10 @@ impl ScyllaRealmRollbackRuntimeControl {
                 .await?,
             ),
             runtime_rebuild: Arc::new(
-                ScyllaRollbackRuntimeRebuildStore::prepare(session, &data).await?,
+                ScyllaRollbackRuntimeRebuildStore::prepare(session.clone(), &data).await?,
+            ),
+            abort_convergence: Arc::new(
+                ScyllaRollbackAbortConvergenceStore::prepare(session, &data).await?,
             ),
             local_inventory,
             local_head,
@@ -370,11 +375,13 @@ impl<Hash: Q256BitHash> RealmRollbackRuntimeControl<Hash>
             anyhow::bail!("rollback topology changed after plan selection")
         }
         match first_head.rollback_control() {
-            RollbackControlState::Requested(_) | RollbackControlState::Aborting(_) => {
-                // Aborting is owned by the dedicated all-participant abort
-                // convergence path.  Realm archive/delete/restore maintenance
-                // must not perform any destructive work in this phase.
+            RollbackControlState::Requested(_) => {
                 Ok(RealmRollbackParticipantProgress::AwaitingCoordinator(first_head))
+            }
+            RollbackControlState::Aborting(_) => {
+                // The dedicated all-participant abort convergence path owns
+                // this phase. Archive/delete/restore maintenance stops here.
+                Ok(RealmRollbackParticipantProgress::AbortRequested(first_head))
             }
             RollbackControlState::Archiving(_) => {
                 let mut owner = self.prepare_archive_owner().await?;
@@ -562,6 +569,73 @@ impl<Hash: Q256BitHash> RealmRollbackRuntimeControl<Hash>
             anyhow::bail!("Coordinator rollback phase no longer matches Realm rebuild")
         }
         Ok(matches!(current.rollback_control(), RollbackControlState::Idle))
+    }
+
+    async fn persist_realm_rollback_abort_ack(
+        &self,
+        aborting_head: StoredCanonicalHead<Hash>,
+        authority: AuthorityScope,
+        paused_runtime_revision: u64,
+        paused_runtime_identity: u128,
+    ) -> anyhow::Result<()> {
+        let request = aborting_head
+            .rollback_control()
+            .aborting()
+            .ok_or_else(|| anyhow::anyhow!("Realm abort acknowledgement requires ABORTING"))?
+            .request();
+        let plan = self
+            .participant_plans
+            .read_participant_plan(
+                aborting_head.canonical_ref().network_id(),
+                request.plan_digest().as_bytes(),
+            )
+            .await?;
+        let topology = self
+            .participant_plans
+            .read_current_topology(aborting_head.canonical_ref().network_id())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("rollback topology is missing"))?;
+        if !topology.snapshot().validates_plan(&plan) {
+            anyhow::bail!("rollback topology changed before Realm abort acknowledgement")
+        }
+        self.abort_convergence
+            .persist_realm_ack(
+                aborting_head,
+                &plan,
+                authority,
+                paused_runtime_revision,
+                paused_runtime_identity,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn is_realm_rollback_abort_published(
+        &self,
+        aborting_head: StoredCanonicalHead<Hash>,
+        authority: AuthorityScope,
+    ) -> anyhow::Result<bool> {
+        let request = aborting_head
+            .rollback_control()
+            .aborting()
+            .ok_or_else(|| anyhow::anyhow!("Realm abort observation requires ABORTING"))?
+            .request();
+        let plan = self
+            .participant_plans
+            .read_participant_plan(
+                aborting_head.canonical_ref().network_id(),
+                request.plan_digest().as_bytes(),
+            )
+            .await?;
+        Ok(self
+            .abort_convergence
+            .is_published(
+                self.canonical_head.as_ref(),
+                aborting_head,
+                &plan,
+                authority,
+            )
+            .await?)
     }
 }
 

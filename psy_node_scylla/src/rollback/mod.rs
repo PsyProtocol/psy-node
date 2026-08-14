@@ -184,6 +184,7 @@ mod coordinator_rollback_realm_reward_catalog;
 #[path = "../../tests/rf3/d1a08_coordinator_archive.rs"]
 mod coordinator_rollback_archive_rf3;
 mod rollback_admission;
+mod rollback_abort_convergence_store;
 mod identity;
 mod key;
 mod manifest_artifact;

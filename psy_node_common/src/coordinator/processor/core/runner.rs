@@ -376,4 +376,23 @@ mod tests {
             assert!(!production.contains(forbidden));
         }
     }
+
+    #[test]
+    fn abort_completion_updates_in_memory_head_before_republishing_pending_context() {
+        let source = include_str!("../db.rs");
+        let progress = source
+            .split("pub async fn progress_coordinator_rollback")
+            .nth(1)
+            .expect("Coordinator rollback progress method");
+        let idle = progress
+            .find("head.rollback_control().is_idle()")
+            .expect("idle completion guard");
+        let update = progress
+            .find("self.canonical_head = Some(*head)")
+            .expect("in-memory canonical head update");
+        let publish = progress
+            .find("self.publish_pending_context_for_head(*head)")
+            .expect("pending context publication");
+        assert!(idle < update && update < publish);
+    }
 }

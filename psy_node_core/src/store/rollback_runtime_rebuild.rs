@@ -512,11 +512,32 @@ where
         &self,
         selected: SelectedRealmRollbackRuntimeRebuild<Hash>,
     ) -> anyhow::Result<bool>;
+
+    /// Append the exact Realm drain boundary for a storage-selected ABORTING
+    /// head. The runtime revision/identity must come from the consumed actor
+    /// pause receipt; this acknowledgement grants no head mutation.
+    async fn persist_realm_rollback_abort_ack(
+        &self,
+        aborting_head: StoredCanonicalHead<Hash>,
+        authority: AuthorityScope,
+        paused_runtime_revision: u64,
+        paused_runtime_identity: u128,
+    ) -> anyhow::Result<()>;
+
+    /// Observe completion of the exact abort that supplied the pause receipt.
+    /// True means the immutable all-participant barrier was selected and the
+    /// canonical head is the exact ABORTING -> IDLE candidate.
+    async fn is_realm_rollback_abort_published(
+        &self,
+        aborting_head: StoredCanonicalHead<Hash>,
+        authority: AuthorityScope,
+    ) -> anyhow::Result<bool>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RealmRollbackParticipantProgress<Hash> {
     AwaitingCoordinator(StoredCanonicalHead<Hash>),
+    AbortRequested(StoredCanonicalHead<Hash>),
     ArchivePrepared {
         head: StoredCanonicalHead<Hash>,
         entry_count: u64,

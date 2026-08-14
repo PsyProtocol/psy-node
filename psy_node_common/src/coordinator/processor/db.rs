@@ -579,7 +579,7 @@ impl<
     }
 
     pub async fn progress_coordinator_rollback(
-        &self,
+        &mut self,
     ) -> anyhow::Result<
         psy_node_core::store::rollback_participant_maintenance::CoordinatorRollbackGlobalProgress<
             N::QHash,
@@ -588,9 +588,16 @@ impl<
     where
         S: CoordinatorRollbackMaintenanceExecutor<N::F, N::QHash>,
     {
-        self.db
+        let progress = self.db
             .progress_coordinator_rollback(self.network_id, N::CHECKPOINT_TREE_HEIGHT)
-            .await
+            .await?;
+        if let psy_node_core::store::rollback_participant_maintenance::CoordinatorRollbackGlobalProgress::Progressed(head) = &progress {
+            if head.rollback_control().is_idle() {
+                self.canonical_head = Some(*head);
+                self.publish_pending_context_for_head(*head).await?;
+            }
+        }
+        Ok(progress)
     }
 
     fn materialized_pending_context(&self) -> anyhow::Result<PendingContext<N::QHash>> {
@@ -599,6 +606,13 @@ impl<
                 "COORDINATOR_PENDING_CONTEXT_UNINITIALIZED: canonical head is not published"
             )
         })?;
+        self.materialized_pending_context_for_head(head)
+    }
+
+    fn materialized_pending_context_for_head(
+        &self,
+        head: psy_node_core::store::canonical_head::StoredCanonicalHead<N::QHash>,
+    ) -> anyhow::Result<PendingContext<N::QHash>> {
         if !head.rollback_control().is_idle() {
             anyhow::bail!(
                 "COORDINATOR_PENDING_CONTEXT_MAINTENANCE: rollback control is active"
@@ -614,6 +628,21 @@ impl<
 
     async fn publish_current_pending_context(&self) -> anyhow::Result<()> {
         let context = self.materialized_pending_context()?;
+        self.publish_pending_context(context).await
+    }
+
+    async fn publish_pending_context_for_head(
+        &self,
+        head: psy_node_core::store::canonical_head::StoredCanonicalHead<N::QHash>,
+    ) -> anyhow::Result<()> {
+        let context = self.materialized_pending_context_for_head(head)?;
+        self.publish_pending_context(context).await
+    }
+
+    async fn publish_pending_context(
+        &self,
+        context: PendingContext<N::QHash>,
+    ) -> anyhow::Result<()> {
         self.temp_db
             .set_current_pending_context(&self.ids.realm_identifier, &context)
             .await?;

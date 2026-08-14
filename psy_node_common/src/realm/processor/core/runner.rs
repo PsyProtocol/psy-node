@@ -187,6 +187,46 @@ where
                                 "Realm rollback control state is restored exactly; awaiting global restore barrier",
                             );
                         }
+                        Ok(psy_node_core::store::rollback_runtime_rebuild::RealmRollbackParticipantProgress::AbortRequested(aborting_head)) => {
+                            rollback_control
+                                .persist_realm_rollback_abort_ack(
+                                    aborting_head,
+                                    authority,
+                                    pause_receipt.revision().get(),
+                                    pause_receipt.unique_id(),
+                                )
+                                .await?;
+                            loop {
+                                match rollback_control
+                                    .is_realm_rollback_abort_published(
+                                        aborting_head,
+                                        authority,
+                                    )
+                                    .await
+                                {
+                                    Ok(true) => break,
+                                    Ok(false) => {
+                                        sleep(std::time::Duration::from_millis(100)).await
+                                    }
+                                    Err(error) => {
+                                        tracing::error!(
+                                            "Realm is waiting for global rollback-abort convergence: {error:#}"
+                                        );
+                                        sleep(std::time::Duration::from_millis(250)).await;
+                                    }
+                                }
+                            }
+                            let resumed = processor
+                                .guta_queue_gatherer
+                                .resume(pause_receipt)
+                                .await?;
+                            tracing::warn!(
+                                "Realm rollback was aborted before deletion; resumed actor namespace {} at revision {}",
+                                resumed.unique_id(),
+                                resumed.revision().get(),
+                            );
+                            continue 'processor;
+                        }
                         Ok(psy_node_core::store::rollback_runtime_rebuild::RealmRollbackParticipantProgress::AwaitingCoordinator(_)) => {}
                         Ok(psy_node_core::store::rollback_runtime_rebuild::RealmRollbackParticipantProgress::ReadyForRuntimeRebuild(_)) => break,
                         Err(error) => {
@@ -607,6 +647,30 @@ mod rollback_runtime_tests {
         let runner = include_str!("runner.rs").split("#[cfg(test)]").next().unwrap();
         assert!(!runner.contains("coordinator_api_urls"));
         assert!(!runner.contains("jsonrpsee"));
+    }
+
+    #[test]
+    fn pre_ponr_abort_acknowledges_paused_actor_then_resumes_after_global_barrier() {
+        let source = include_str!("runner.rs");
+        let pause = source.find(".pause(GathererPauseRequest::new(").unwrap();
+        let requested = source
+            .find("RealmRollbackParticipantProgress::AbortRequested")
+            .unwrap();
+        let acknowledge = source
+            .find(".persist_realm_rollback_abort_ack(")
+            .unwrap();
+        let published = source
+            .find(".is_realm_rollback_abort_published(")
+            .unwrap();
+        let resume = source.find(".resume(pause_receipt)").unwrap();
+        let iteration = source.find(".try_begin_iteration()").unwrap();
+        assert!(
+            pause < requested
+                && requested < acknowledge
+                && acknowledge < published
+                && published < resume
+                && resume < iteration
+        );
     }
 }
 pub async fn run_realm_processor<
