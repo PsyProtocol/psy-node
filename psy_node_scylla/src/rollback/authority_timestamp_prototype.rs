@@ -1,8 +1,9 @@
-//! Isolated D-04a durable authority intent/timestamp allocator prototype.
+//! Durable authority intent/timestamp allocator.
 //!
-//! The adapter owns one LWT row per network/authority. It is deliberately not
-//! registered by production setup and accepts only driver-independent sealed
-//! bootstrap/reservation/completion values.
+//! The adapter owns one LWT row per network/authority and accepts only
+//! driver-independent sealed bootstrap/reservation/completion values.  The
+//! Coordinator-only production composition materializes the table; Realm
+//! branch-exact deployment continues to own its independent readiness path.
 
 use std::{error::Error, fmt, sync::Arc};
 
@@ -1067,8 +1068,25 @@ mod tests {
     }
 
     #[test]
-    fn prototype_is_not_registered_by_production_setup() {
-        let setup = include_str!("../psy_setup.rs");
-        assert!(!setup.contains(D04A_AUTHORITY_TIMESTAMP_TABLE));
+    fn coordinator_setup_materializes_timestamp_without_exposing_it_to_generic_setup() {
+        let setup = include_str!("../core.rs");
+        let coordinator = setup
+            .split("pub async fn initialize_coordinator_canonical_head")
+            .nth(1)
+            .unwrap()
+            .split("pub async fn initialize_coordinator_rollback_admission")
+            .next()
+            .unwrap();
+        assert!(coordinator.contains("ScyllaAuthorityTimestampStore::create_schema"));
+        assert!(coordinator.contains("if create_schema"));
+
+        let generic_setup = include_str!("../psy_setup.rs")
+            .split("pub async fn setup_psy_scylla_database_store_from_connection_string")
+            .nth(1)
+            .unwrap()
+            .split("pub struct PendingQueueSidecarDeploymentSummary")
+            .next()
+            .unwrap();
+        assert!(!generic_setup.contains("ScyllaAuthorityTimestampStore"));
     }
 }

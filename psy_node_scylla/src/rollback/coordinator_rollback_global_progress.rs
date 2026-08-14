@@ -14,15 +14,26 @@ use parth_core::{
 };
 use psy_data::protocol::{canonical_chain::NetworkId, chain_context::AuthorityScope};
 use psy_node_core::store::{
+    authority_commit::{
+        AuthorityClockSampleUs, AuthorityCommitIntentDigest, AuthorityIntentObservation,
+        AuthorityTimestampBootstrap, AuthorityTimestampBootstrapReason, AuthorityTimestampKey,
+        AuthorityTimestampLease, AuthorityTimestampReadState, SealedAuthorityTimestampCompletion,
+        SealedAuthorityTimestampReservation, StoredAuthorityTimestampState,
+    },
     canonical_head::{CanonicalHeadReadState, StoredCanonicalHead},
     rollback_control::RollbackControlState,
     rollback_participant_maintenance::CoordinatorRollbackGlobalProgress,
+    rollback_runtime_rebuild::RollbackRuntimeRebuildDirective,
+    timestamp::{CommitWriteTimestampUs, NewBranchWriteTimestampUs},
 };
 use scylla::client::session::Session;
 
 use super::{
     CqlKeyspaceName, PendingCounterAdapter, ScyllaCanonicalHeadStore,
     ScyllaCoordinatorCommitSourceStore, ScyllaRollbackParticipantPlanStore,
+    authority_timestamp_prototype::{
+        AuthorityTimestampNoTabletKeyspace, ScyllaAuthorityTimestampStore,
+    },
     coordinator_commit_delete_restore_executor::ScyllaCoordinatorCommitDeleteRestoreExecutor,
     coordinator_rollback_delete_completion_store::ScyllaCoordinatorRollbackDeleteCompletionStore,
     realm_rollback_physical_archive_store::ScyllaRealmRollbackPhysicalArchiveStore,
@@ -66,6 +77,13 @@ where
             return Ok(CoordinatorRollbackGlobalProgress::Progressed(initial));
         }
         RollbackControlState::Verifying(_) | RollbackControlState::AllRealmsReady(_) => {
+            ensure_coordinator_post_rollback_timestamp(
+                session,
+                &no_tablet_keyspace,
+                &state_keyspace,
+                initial,
+            )
+            .await?;
             return Ok(CoordinatorRollbackGlobalProgress::ReadyForRuntimeRebuild(initial));
         }
         RollbackControlState::Requested(_) => {
@@ -377,6 +395,162 @@ async fn progress_restoring<Hash: Q256BitHash>(
     Ok(CoordinatorRollbackGlobalProgress::Progressed(current))
 }
 
+/// Durable action required to move the Coordinator allocator beyond the
+/// rollback delete fence.  The runtime directive selects the floor; callers
+/// cannot supply a timestamp or intent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CoordinatorTimestampRestoreAction {
+    Bootstrap(AuthorityTimestampBootstrap),
+    Reserve(SealedAuthorityTimestampReservation),
+    Complete(SealedAuthorityTimestampCompletion),
+    Done(StoredAuthorityTimestampState),
+}
+
+fn plan_coordinator_timestamp_restore(
+    current: AuthorityTimestampReadState,
+    key: AuthorityTimestampKey,
+    intent: AuthorityCommitIntentDigest,
+    floor: NewBranchWriteTimestampUs,
+) -> anyhow::Result<CoordinatorTimestampRestoreAction> {
+    let floor_timestamp = floor.as_commit_timestamp();
+    Ok(match current {
+        AuthorityTimestampReadState::Uninitialized => {
+            // Controlled cutover starts at the delete fence so the sealed
+            // reservation below owns the first legal new-branch timestamp.
+            let fence = CommitWriteTimestampUs::try_from_i128(i128::from(
+                floor.delete_fence().as_i64(),
+            ))?;
+            CoordinatorTimestampRestoreAction::Bootstrap(AuthorityTimestampBootstrap::new(
+                key,
+                fence,
+                AuthorityTimestampBootstrapReason::ControlledWriterCutover,
+            ))
+        }
+        AuthorityTimestampReadState::Current(state) => match state.observe_intent(key, intent) {
+            AuthorityIntentObservation::Idle { .. } => {
+                CoordinatorTimestampRestoreAction::Reserve(state.seal_reservation(
+                    key,
+                    intent,
+                    AuthorityClockSampleUs::try_from_i128(i128::from(
+                        floor_timestamp.as_i64(),
+                    ))?,
+                )?)
+            }
+            AuthorityIntentObservation::Active(lease) => {
+                require_timestamp_floor(lease, floor)?;
+                CoordinatorTimestampRestoreAction::Complete(
+                    state.seal_completion(key, lease)?,
+                )
+            }
+            AuthorityIntentObservation::Completed { timestamp, .. } => {
+                if timestamp.as_i64() < floor_timestamp.as_i64() {
+                    anyhow::bail!(
+                        "Coordinator rollback timestamp intent completed below the delete fence floor"
+                    )
+                }
+                CoordinatorTimestampRestoreAction::Done(state)
+            }
+            AuthorityIntentObservation::BlockedByActive { .. } => {
+                anyhow::bail!(
+                    "Coordinator rollback cannot replace a different active timestamp intent"
+                )
+            }
+        },
+    })
+}
+
+fn require_timestamp_floor(
+    lease: AuthorityTimestampLease,
+    floor: NewBranchWriteTimestampUs,
+) -> anyhow::Result<()> {
+    if lease.timestamp().as_i64() < floor.as_commit_timestamp().as_i64() {
+        anyhow::bail!("Coordinator rollback timestamp lease is below the new-branch floor")
+    }
+    Ok(())
+}
+
+async fn ensure_coordinator_post_rollback_timestamp<Hash: Q256BitHash>(
+    session: Arc<Session>,
+    no_tablet_keyspace: &CqlKeyspaceName,
+    state_keyspace: &CqlKeyspaceName,
+    verifying_head: StoredCanonicalHead<Hash>,
+) -> anyhow::Result<()> {
+    let runtime = ScyllaRollbackRuntimeRebuildStore::prepare(
+        session.clone(),
+        state_keyspace,
+    )
+    .await?;
+    let directive = runtime
+        .read_selected_directive(verifying_head, AuthorityScope::Coordinator)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!("Coordinator rollback runtime directive is missing in VERIFYING")
+        })?;
+    require_coordinator_timestamp_directive(verifying_head, &directive)?;
+
+    let timestamp_store = ScyllaAuthorityTimestampStore::prepare(
+        session,
+        AuthorityTimestampNoTabletKeyspace::try_new(
+            no_tablet_keyspace.as_str().to_owned(),
+        )?,
+    )
+    .await?;
+    let key = AuthorityTimestampKey::new(
+        directive.target().network_id(),
+        AuthorityScope::Coordinator,
+    );
+    let intent = AuthorityCommitIntentDigest::from_sealed_commit_digest(*directive.digest());
+    for _ in 0..6 {
+        let action = plan_coordinator_timestamp_restore(
+            timestamp_store.read(key).await?,
+            key,
+            intent,
+            directive.new_branch_write(),
+        )?;
+        match action {
+            CoordinatorTimestampRestoreAction::Bootstrap(sealed) => {
+                let _ = timestamp_store.bootstrap(sealed).await?;
+            }
+            CoordinatorTimestampRestoreAction::Reserve(sealed) => {
+                let _ = timestamp_store.reserve(sealed).await?;
+            }
+            CoordinatorTimestampRestoreAction::Complete(sealed) => {
+                let _ = timestamp_store.complete(sealed).await?;
+            }
+            CoordinatorTimestampRestoreAction::Done(state) => {
+                // Re-read after the apparent terminal observation so a caller
+                // never proceeds from a stale local classification.
+                if timestamp_store.read(key).await?
+                    != AuthorityTimestampReadState::Current(state)
+                {
+                    anyhow::bail!("Coordinator rollback timestamp changed after completion")
+                }
+                return Ok(());
+            }
+        }
+    }
+    anyhow::bail!("Coordinator rollback timestamp restore did not converge")
+}
+
+fn require_coordinator_timestamp_directive<Hash: Q256BitHash>(
+    verifying_head: StoredCanonicalHead<Hash>,
+    directive: &RollbackRuntimeRebuildDirective<Hash>,
+) -> anyhow::Result<()> {
+    let request = verifying_head
+        .rollback_control()
+        .requested()
+        .ok_or_else(|| anyhow::anyhow!("VERIFYING head has no rollback request"))?;
+    if directive.authority() != AuthorityScope::Coordinator
+        || directive.target().network_id() != verifying_head.canonical_ref().network_id()
+        || directive.target().chain_epoch() != verifying_head.canonical_ref().chain_epoch()
+        || directive.target().checkpoint() != request.target()
+        || directive.participant_plan_digest() != request.plan_digest().as_bytes()
+    {
+        anyhow::bail!("Coordinator rollback timestamp directive binding mismatch")
+    }
+    Ok(())
+}
+
 async fn count_archive_completions<Hash: Q256BitHash>(
     session: Arc<Session>,
     participant_plans: &ScyllaRollbackParticipantPlanStore,
@@ -414,6 +588,127 @@ async fn count_archive_completions<Hash: Q256BitHash>(
 
 #[cfg(test)]
 mod tests {
+    use psy_data::protocol::canonical_chain::NetworkId;
+    use psy_node_core::store::{
+        authority_commit::{AuthorityTimestampKey, AuthorityTimestampReadState},
+        timestamp::{CommitWriteTimestampUs, DeleteFenceTimestampUs, NewBranchWriteTimestampUs},
+    };
+
+    use super::{
+        plan_coordinator_timestamp_restore, AuthorityCommitIntentDigest, AuthorityScope,
+        CoordinatorTimestampRestoreAction,
+    };
+
+    fn timestamp_key() -> AuthorityTimestampKey {
+        AuthorityTimestampKey::new(
+            NetworkId::try_from_chain_id(1337).unwrap(),
+            AuthorityScope::Coordinator,
+        )
+    }
+
+    fn timestamp_floor() -> NewBranchWriteTimestampUs {
+        let orphan = CommitWriteTimestampUs::try_from_i128(10_000).unwrap();
+        let fence = DeleteFenceTimestampUs::try_after(orphan, 10_001).unwrap();
+        NewBranchWriteTimestampUs::try_after(fence, 10_002).unwrap()
+    }
+
+    fn timestamp_intent() -> AuthorityCommitIntentDigest {
+        AuthorityCommitIntentDigest::from_sealed_commit_digest([9; 32])
+    }
+
+    #[test]
+    fn coordinator_timestamp_restore_converges_bootstrap_reserve_complete_done() {
+        let key = timestamp_key();
+        let floor = timestamp_floor();
+        let intent = timestamp_intent();
+        let CoordinatorTimestampRestoreAction::Bootstrap(bootstrap) =
+            plan_coordinator_timestamp_restore(
+                AuthorityTimestampReadState::Uninitialized,
+                key,
+                intent,
+                floor,
+            )
+            .unwrap()
+        else {
+            panic!("missing allocator must bootstrap");
+        };
+        assert_eq!(
+            bootstrap.candidate().high_water().as_i64(),
+            floor.delete_fence().as_i64()
+        );
+
+        let CoordinatorTimestampRestoreAction::Reserve(reservation) =
+            plan_coordinator_timestamp_restore(
+                AuthorityTimestampReadState::Current(bootstrap.candidate()),
+                key,
+                intent,
+                floor,
+            )
+            .unwrap()
+        else {
+            panic!("idle allocator must reserve");
+        };
+        assert_eq!(reservation.lease().timestamp(), floor.as_commit_timestamp());
+
+        let CoordinatorTimestampRestoreAction::Complete(completion) =
+            plan_coordinator_timestamp_restore(
+                AuthorityTimestampReadState::Current(reservation.candidate()),
+                key,
+                intent,
+                floor,
+            )
+            .unwrap()
+        else {
+            panic!("active rollback intent must complete");
+        };
+        assert!(matches!(
+            plan_coordinator_timestamp_restore(
+                AuthorityTimestampReadState::Current(completion.candidate()),
+                key,
+                intent,
+                floor,
+            )
+            .unwrap(),
+            CoordinatorTimestampRestoreAction::Done(_)
+        ));
+    }
+
+    #[test]
+    fn coordinator_timestamp_restore_rejects_foreign_active_intent() {
+        let key = timestamp_key();
+        let floor = timestamp_floor();
+        let bootstrap = match plan_coordinator_timestamp_restore(
+            AuthorityTimestampReadState::Uninitialized,
+            key,
+            timestamp_intent(),
+            floor,
+        )
+        .unwrap()
+        {
+            CoordinatorTimestampRestoreAction::Bootstrap(value) => value,
+            _ => unreachable!(),
+        };
+        let foreign = AuthorityCommitIntentDigest::from_sealed_commit_digest([7; 32]);
+        let reservation = bootstrap
+            .candidate()
+            .seal_reservation(
+                key,
+                foreign,
+                psy_node_core::store::authority_commit::AuthorityClockSampleUs::try_from_i128(
+                    i128::from(floor.as_commit_timestamp().as_i64()),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(plan_coordinator_timestamp_restore(
+            AuthorityTimestampReadState::Current(reservation.candidate()),
+            key,
+            timestamp_intent(),
+            floor,
+        )
+        .is_err());
+    }
+
     #[test]
     fn coordinator_uses_shared_completions_and_orders_global_barriers() {
         let source = include_str!("coordinator_rollback_global_progress.rs")
@@ -450,5 +745,21 @@ mod tests {
         assert!(select < read_restore);
         assert!(read_restore < complete_count);
         assert!(complete_count < verifying);
+    }
+
+    #[test]
+    fn verifying_restores_timestamp_before_runtime_rebuild_is_released() {
+        let source = include_str!("coordinator_rollback_global_progress.rs")
+            .split("match initial.rollback_control()")
+            .nth(1)
+            .unwrap()
+            .split("RollbackControlState::Requested")
+            .next()
+            .unwrap();
+        let timestamp = source
+            .find("ensure_coordinator_post_rollback_timestamp")
+            .unwrap();
+        let ready = source.find("ReadyForRuntimeRebuild").unwrap();
+        assert!(timestamp < ready);
     }
 }

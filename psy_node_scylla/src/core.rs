@@ -42,6 +42,7 @@ use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use psy_node_nats::queue::NatsJetStreamClient;
 use crate::rollback::{
+    AuthorityTimestampNoTabletKeyspace,
     BranchExactSchemaReady, BranchExactSchemaReadyView,
     BranchExactSchemaSetupError, BranchExactSchemaSetupMode,
     BranchExactSchemaSetupOutcome,
@@ -57,6 +58,7 @@ use crate::rollback::{
     ScyllaCoordinatorProcessorDurableCaptureFactory,
     ScyllaCoordinatorCommitSourceStore,
     ScyllaCoordinatorCommitPhysicalArchiveStore,
+    ScyllaAuthorityTimestampStore,
     prepare_coordinator_rollback_archive,
     progress_coordinator_global_rollback,
     try_publish_restored_runtime,
@@ -293,6 +295,19 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
         )?;
         if create_schema {
             ScyllaCanonicalHeadStore::create_schema(&self.session, &keyspace).await?;
+            // Coordinator exact writes and rollback restart share the same
+            // durable timestamp allocator.  Materialize it at the
+            // Coordinator-only composition root so an upgraded Processor can
+            // restore the allocator beyond a rollback delete fence before it
+            // releases T+1 processing.  Realm/generic setup never calls this
+            // initializer.
+            ScyllaAuthorityTimestampStore::create_schema(
+                &self.session,
+                &AuthorityTimestampNoTabletKeyspace::try_new(
+                    self.no_tablet_keyspace.clone(),
+                )?,
+            )
+            .await?;
             ScyllaCoordinatorCommitSourceStore::create_schema(
                 &self.session,
                 &keyspace,
