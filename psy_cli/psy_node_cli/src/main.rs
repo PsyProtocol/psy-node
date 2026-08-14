@@ -1,4 +1,5 @@
 mod subcommand;
+mod rollback_admin;
 
 use clap::Parser;
 use psy_data::protocol::canonical_chain::NetworkId;
@@ -26,6 +27,32 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     //psy_common::setup_logging()?;
     match cli.command {
+        Commands::RollbackStatus { coordinator_url } => {
+            let response = rollback_admin::status(&coordinator_url).await?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+        }
+        Commands::StartRollback {
+            coordinator_url,
+            request_file,
+            apply,
+        } => {
+            if !apply {
+                anyhow::bail!("refusing to start rollback without --apply");
+            }
+            let response = rollback_admin::start(&coordinator_url, &request_file).await?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+        }
+        Commands::AbortRollback {
+            coordinator_url,
+            request_file,
+            apply,
+        } => {
+            if !apply {
+                anyhow::bail!("refusing to abort rollback without --apply");
+            }
+            let response = rollback_admin::abort(&coordinator_url, &request_file).await?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+        }
         Commands::CheckRealmRollbackReadiness {
             scylla_db_url,
             db_namespace,

@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand, command};
 use psy_core::constants::{chain_id::PsyNetworkTypeInput, proving_backends::PsyChainProvingBackendTypeInput};
 
@@ -15,6 +17,41 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    #[command(about = "Read the durable Coordinator rollback status")]
+    RollbackStatus {
+        #[arg(long = "coordinator-url", env = "COORDINATOR_URL")]
+        coordinator_url: String,
+    },
+    #[command(about = "Explicitly start the first-release in-place rollback")]
+    StartRollback {
+        #[arg(long = "coordinator-url", env = "COORDINATOR_URL")]
+        coordinator_url: String,
+
+        #[arg(long = "request-file", help = "Strict v2 rollback request JSON")]
+        request_file: PathBuf,
+
+        #[arg(
+            long = "apply",
+            required = true,
+            help = "Required acknowledgement that this command queues a rollback"
+        )]
+        apply: bool,
+    },
+    #[command(about = "Explicitly abort a rollback before its delete point of no return")]
+    AbortRollback {
+        #[arg(long = "coordinator-url", env = "COORDINATOR_URL")]
+        coordinator_url: String,
+
+        #[arg(long = "request-file", help = "Strict v1 rollback abort request JSON")]
+        request_file: PathBuf,
+
+        #[arg(
+            long = "apply",
+            required = true,
+            help = "Required acknowledgement that this command queues an abort"
+        )]
+        apply: bool,
+    },
     #[command(about = "Run the complete read-only Realm rollback startup preflight")]
     CheckRealmRollbackReadiness {
         #[arg(
@@ -269,6 +306,31 @@ pub enum Commands {
 #[cfg(test)]
 mod rollback_sidecar_command_tests {
     use super::*;
+
+    #[test]
+    fn rollback_mutations_require_explicit_apply() {
+        let start_without_apply = Cli::try_parse_from([
+            "psy_node_cli",
+            "start-rollback",
+            "--coordinator-url",
+            "http://127.0.0.1:8081",
+            "--request-file",
+            "rollback.json",
+        ]);
+        assert!(start_without_apply.is_err());
+
+        let abort = Cli::try_parse_from([
+            "psy_node_cli",
+            "abort-rollback",
+            "--coordinator-url",
+            "http://127.0.0.1:8081",
+            "--request-file",
+            "abort.json",
+            "--apply",
+        ])
+        .unwrap();
+        assert!(matches!(abort.command, Commands::AbortRollback { apply: true, .. }));
+    }
 
     #[test]
     fn readiness_check_requires_backend_and_exact_realm_identity() {
