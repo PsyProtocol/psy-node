@@ -33,6 +33,28 @@ import {
 type ProcessLineVisitor = (line: string, process: RunningProcess) => void;
 // this is an insecure, obviously fake private key for local devnet use only
 const FAKE_MINER_PRIVATE_KEY = "691337BADFACE067320cb499a730fa6c81a756ed912f181f0f20a6b1fa5c1337";
+
+export function buildRollbackTopologyConfig(startRealmId: number, realmsCount: number) {
+    if (!Number.isSafeInteger(startRealmId) || startRealmId < 0 || startRealmId > 0xffff_ffff) {
+        throw new Error("rollback start Realm ID must be a u32");
+    }
+    if (!Number.isSafeInteger(realmsCount) || realmsCount < 1) {
+        throw new Error("rollback topology must contain at least one Realm");
+    }
+    if (startRealmId + realmsCount - 1 > 0xffff_ffff) {
+        throw new Error("rollback topology Realm range exceeds u32");
+    }
+    return {
+        rollback_topology: {
+            revision: 0,
+            realms: Array.from({ length: realmsCount }, (_, index) => ({
+                realm_id: startRealmId + index,
+                realm_sub_id: 1,
+            })),
+        },
+    };
+}
+
 async function killDocker() {
     try {
         const proc = Bun.spawn(['docker', 'stop', 'valkey-server', 'scylla-server', 'nats-server'], {
@@ -2600,6 +2622,7 @@ interface ProcessOptions {
     explorer?: boolean;
     daemonlize?: boolean;
     cleanState?: boolean;
+    rollback?: boolean;
 }
 
 class DevNetProcessManager {
@@ -2880,6 +2903,7 @@ class DevNetProcessManager {
         const coordinatorWorkersCount = options.coordinatorWorkersCount;
         this.genesisDataPath = options.genesisDataPath || "genesis.json";
         const cleanState = !!options.cleanState;
+        const rollbackEnabled = !!options.rollback;
         const skipBuild = skipBuildEnabled();
 
 
@@ -2927,6 +2951,24 @@ class DevNetProcessManager {
 
         const logsDir = path.join(cwd, "logs");
         await mkdir(logsDir, { recursive: true });
+
+        let rollbackTopologyConfigPath: string | undefined;
+        if (rollbackEnabled) {
+            rollbackTopologyConfigPath = path.resolve(logsDir, "rollback-topology.json");
+            const topologyConfig = buildRollbackTopologyConfig(startRealmId, realmsCount);
+            await writeFile(
+                rollbackTopologyConfigPath,
+                JSON.stringify({
+                    canonical_head_bootstrap_profile: "GENESIS_NATIVE",
+                    ...topologyConfig,
+                }, null, 2) + "\n",
+                "utf8",
+            );
+            console.log(
+                `[DevNet][rollback] enabled for Coordinator + ${topologyConfig.rollback_topology.realms.length} Realm(s); ` +
+                `topology=${rollbackTopologyConfigPath}`,
+            );
+        }
 
         const getLogPaths = (baseName: string, isWorkerOrEdge: boolean) => {
             if (isWorkerOrEdge && disableWorkerEdgeLogs) return {};
@@ -2994,8 +3036,7 @@ class DevNetProcessManager {
         if (startCoordinatorProcessor) {
             // await cleanCheckpoint('./local_checkpoints/coordinator_0_0', cwd);
             const coordinatorProcessorLogPath = path.join(logsDir, "coordinator_processor_logs.txt");
-            await this.track(await RunningProcess.spawnWithInitializationHintWithRetry(
-                [
+            const coordinatorProcessorArgs = [
                     nodeCli, 'start-coordinator-processor',
                     '--coordinator-id', '0',
                     '--coordinator-sub-id', '0',
@@ -3008,7 +3049,12 @@ class DevNetProcessManager {
                     '--checkpoint-backup-path', './local_checkpoints',
                     '--proving-backend', backend,
                     '--verbose'
-                ],
+            ];
+            if (rollbackTopologyConfigPath) {
+                coordinatorProcessorArgs.push('--config', rollbackTopologyConfigPath);
+            }
+            await this.track(await RunningProcess.spawnWithInitializationHintWithRetry(
+                coordinatorProcessorArgs,
                 coordinatorProcessorStartedDetector,
                 { cwd, ...getLogPaths("coordinator_processor", false), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
             ));
@@ -3023,21 +3069,28 @@ class DevNetProcessManager {
             const coordEdgePromises: Promise<RunningProcess>[] = [];
             for (let j = 0; j < coordinatorEdgeCount; j++) {
                 const port = 1337 + j;
+                const coordinatorEdgeArgs = [
+                    nodeCli, 'start-coordinator-edge',
+                    '--coordinator-id', '0',
+                    '--coordinator-sub-id', '0',
+                    '--network', this.NETWORK,
+                    '--db-namespace', 'coordinator',
+                    '--scylla-db-url', this.SCYLLA_URL,
+                    '--nats-jetstream-url', this.NATS_URL,
+                    '--redis-url', this.REDIS_URL,
+                    '--port', port.toString(),
+                    '--listen', '0.0.0.0',
+                    '--proving-backend', backend,
+                    '--verbose'
+                ];
+                if (rollbackTopologyConfigPath) {
+                    coordinatorEdgeArgs.push(
+                        '--config', rollbackTopologyConfigPath,
+                        '--rollback-admin-rpc-enabled',
+                    );
+                }
                 const edgePromise = RunningProcess.spawnWithInitializationHintWithRetry(
-                    [
-                        nodeCli, 'start-coordinator-edge',
-                        '--coordinator-id', '0',
-                        '--coordinator-sub-id', '0',
-                        '--network', this.NETWORK,
-                        '--db-namespace', 'coordinator',
-                        '--scylla-db-url', this.SCYLLA_URL,
-                        '--nats-jetstream-url', this.NATS_URL,
-                        '--redis-url', this.REDIS_URL,
-                        '--port', port.toString(),
-                        '--listen', '0.0.0.0',
-                        '--proving-backend', backend,
-                        '--verbose'
-                    ],
+                    coordinatorEdgeArgs,
                     coordinatorEdgeProcessorStartedDetector,
                     { cwd, ...getLogPaths(`coordinator_edge_${j}`, true), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
                 ).then(proc => this.track(proc));
@@ -3102,22 +3155,29 @@ class DevNetProcessManager {
                     const realmProcessorLogPath = path.join(logsDir, `realm_${realmId}_processor_logs.txt`);
 
                     // Start realm processor
+                    const realmProcessorArgs = [
+                        nodeCli, 'start-realm-processor',
+                        '--realm-id', realmId.toString(),
+                        '--realm-sub-id', '1',
+                        '--network', this.NETWORK,
+                        '--db-namespace', 'realm_' + realmId,
+                        '--scylla-db-url', this.SCYLLA_URL,
+                        '--nats-jetstream-url', this.NATS_URL,
+                        '--redis-url', this.REDIS_URL,
+                        '--genesis-data-path', this.genesisDataPath,
+                        '--checkpoint-backup-path', './local_checkpoints',
+                        '--coordinator-api-urls', this.COORD_API_URL,
+                        '--proving-backend', backend,
+                        '--verbose'
+                    ];
+                    if (rollbackEnabled) {
+                        realmProcessorArgs.push(
+                            '--coordinator-rollback-db-namespace',
+                            'coordinator',
+                        );
+                    }
                     const processorPromise = RunningProcess.spawnWithInitializationHintWithRetry(
-                        [
-                            nodeCli, 'start-realm-processor',
-                            '--realm-id', realmId.toString(),
-                            '--realm-sub-id', '1',
-                            '--network', this.NETWORK,
-                            '--db-namespace', 'realm_' + realmId,
-                            '--scylla-db-url', this.SCYLLA_URL,
-                            '--nats-jetstream-url', this.NATS_URL,
-                            '--redis-url', this.REDIS_URL,
-                            '--genesis-data-path', this.genesisDataPath,
-                            '--checkpoint-backup-path', './local_checkpoints',
-                            '--coordinator-api-urls', this.COORD_API_URL,
-                            '--proving-backend', backend,
-                            '--verbose'
-                        ],
+                        realmProcessorArgs,
                         realmProcessorStartedDetector,
                         { cwd, ...getLogPaths(`realm_${realmId}_processor`, false), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
                     ).then(async (proc) => {
@@ -4172,6 +4232,7 @@ async function runMain() {
             "explorer": { type: "boolean" },
             "daemonlize": { type: "boolean" },
             "clean-state": { type: "boolean" }, // deprecated alias
+            rollback: { type: "boolean" },
             "teardown": { type: "boolean" },
             "purge": { type: "boolean" },
             env: { type: "string" },
@@ -4210,6 +4271,7 @@ async function runMain() {
     const teardown = !!values["teardown"];
     const purge = !!values["purge"];
     const cleanState = !!values["clean-state"] || purge;
+    const rollback = !!values.rollback;
     const provingBackend = values["proving-backend"];
     const envString = values["env"];
     const help = !!values["help"];
@@ -4272,6 +4334,7 @@ Usage: bun run dev/locSetupV4.ts [options]
    --explorer                     Start blockchain explorer dev server (psy-dapp/apps/explorer, port 5178)
    --purge                         With --teardown (or startup), also remove local_checkpoints, logs, deployments, and devnet Docker volumes
    --clean-state                   Deprecated alias for --purge during startup
+   --rollback                      Enable explicit Coordinator + all started Realm rollback wiring
    --help, -h                      Show this help message
 
   Examples:
@@ -4280,6 +4343,9 @@ Usage: bun run dev/locSetupV4.ts [options]
 
     # Start full system with multiple realms
     bun run dev/locSetupV4.ts --realms-count 4  # realms 0,1,2,3
+
+    # Start a one-Realm rollback-enabled topology (explicit admin RPC, no automatic trigger)
+    bun run dev/locSetupV4.ts --rollback --realms-count 1
 
     # Start with custom genesis data
     bun run dev/locSetupV4.ts --genesis-data-path ./my-genesis.json  # use custom genesis file
@@ -4431,9 +4497,13 @@ Usage: bun run dev/locSetupV4.ts [options]
             explorer,
             daemonlize: !!values.daemonlize,
             cleanState,
+            rollback,
         };
 
         if (daemonlize) {
+            if (rollback) {
+                throw new Error("[DevNet][rollback] --daemonlize is not supported yet; use foreground mode");
+            }
             await globalManager.setupDaemonized(options);
             releaseDevnetLock();
             process.exit(0);

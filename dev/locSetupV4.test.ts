@@ -1,6 +1,27 @@
 import { describe, expect, it } from "bun:test";
 import { s3CurlArgs } from "./locSetupDefaults";
-import { runStreamingCaptureStderr } from "./locSetupV4";
+import { buildRollbackTopologyConfig, runStreamingCaptureStderr } from "./locSetupV4";
+
+describe("buildRollbackTopologyConfig", () => {
+    it("binds the exact contiguous Realm set started by the local devnet", () => {
+        expect(buildRollbackTopologyConfig(7, 3)).toEqual({
+            rollback_topology: {
+                revision: 0,
+                realms: [
+                    { realm_id: 7, realm_sub_id: 1 },
+                    { realm_id: 8, realm_sub_id: 1 },
+                    { realm_id: 9, realm_sub_id: 1 },
+                ],
+            },
+        });
+    });
+
+    it("rejects empty, negative, or overflowing Realm ranges", () => {
+        expect(() => buildRollbackTopologyConfig(0, 0)).toThrow();
+        expect(() => buildRollbackTopologyConfig(-1, 1)).toThrow();
+        expect(() => buildRollbackTopologyConfig(0xffff_ffff, 2)).toThrow();
+    });
+});
 
 describe("s3CurlArgs", () => {
     it("builds a shell-free curl argv that is fail-closed, follows redirects, and shows progress", () => {
