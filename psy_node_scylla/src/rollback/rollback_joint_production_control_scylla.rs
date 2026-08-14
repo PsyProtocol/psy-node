@@ -1114,6 +1114,12 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
         );
     }
 
+    // Lose every archive owner before the first destructive transition. The
+    // archive barrier must be reconstructed from immutable completions alone.
+    coordinator = coordinator_control().await?;
+    realm_10 = realm_control(REALM_10_KEYSPACE, 10).await?;
+    realm_20 = realm_control(REALM_20_KEYSPACE, 20).await?;
+
     let CoordinatorRollbackGlobalProgress::AwaitingParticipants {
         head: deleting_head,
         completed,
@@ -1272,6 +1278,12 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
         runtime_ready_head == verifying_head,
         "Coordinator runtime rebuild selected a different VERIFYING head",
     );
+
+    // Rebuild the controls after entering VERIFYING. Runtime directives and
+    // participant reports must be selected from storage, not retained owners.
+    coordinator = coordinator_control().await?;
+    realm_10 = realm_control(REALM_10_KEYSPACE, 10).await?;
+    realm_20 = realm_control(REALM_20_KEYSPACE, 20).await?;
     let coordinator_directive =
         <ScyllaCoreStore<PHash, PoseidonHasher> as CoordinatorRollbackRuntimeRebuildStore<
             PHash,
@@ -1318,8 +1330,15 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
         <ScyllaRealmRollbackRuntimeControl as RealmRollbackRuntimeControl<PHash>>
             ::persist_realm_runtime_rebuild_report(control, selected, report)
             .await?;
-        selected_realms.push((control, selected));
+        selected_realms.push(selected);
     }
+
+
+    // Reports are immutable restart evidence. Drop every reporting process
+    // before the Coordinator appends its own report and publishes the target.
+    coordinator = coordinator_control().await?;
+    realm_10 = realm_control(REALM_10_KEYSPACE, 10).await?;
+    realm_20 = realm_control(REALM_20_KEYSPACE, 20).await?;
 
     let coordinator_report = runtime_rebuild_report(&coordinator_directive, hash(0xA1))?;
     <ScyllaCoreStore<PHash, PoseidonHasher> as CoordinatorRollbackRuntimeRebuildStore<
@@ -1346,14 +1365,24 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
             && matches!(published.rollback_control(), RollbackControlState::Idle),
         "runtime publication did not select IDLE at the rollback target in the new epoch",
     );
-    for (control, selected) in &selected_realms {
+    for (control, selected) in [
+        (&realm_10, selected_realms[0]),
+        (&realm_20, selected_realms[1]),
+    ] {
         ensure!(
             <ScyllaRealmRollbackRuntimeControl as RealmRollbackRuntimeControl<PHash>>
-                ::is_realm_runtime_rebuild_published(control, *selected)
+                ::is_realm_runtime_rebuild_published(control, selected)
                 .await?,
             "Realm did not observe the globally published restored runtime",
         );
     }
+
+
+    // The published IDLE target is the only authority carried into normal
+    // execution. Reopen all stores once more before producing T+1/T+2.
+    coordinator = coordinator_control().await?;
+    realm_10 = realm_control(REALM_10_KEYSPACE, 10).await?;
+    realm_20 = realm_control(REALM_20_KEYSPACE, 20).await?;
 
     // Prove the minimum product outcome after publication: the restored
     // target can advance through a different T+1 and T+2 branch using
@@ -1410,8 +1439,11 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
         "Coordinator did not continue from T+1 to new-epoch T+2",
     );
 
-    for ((control, selected), (predecessor_pending, seed)) in selected_realms
-        .iter()
+    for ((control, selected), (predecessor_pending, seed)) in [
+        (&realm_10, selected_realms[0]),
+        (&realm_20, selected_realms[1]),
+    ]
+        .into_iter()
         .zip([(2_u64, 0xE2_u8), (2_u64, 0xF2_u8)])
     {
         let directive = selected.directive();
