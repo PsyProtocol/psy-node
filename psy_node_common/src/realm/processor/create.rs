@@ -13,7 +13,7 @@ use psy_node_core::{
     }, store::{realm_processor_branch_exact_runtime::{RealmBranchExactCommitRuntimeInstaller, RealmBranchExactSingleCommitOwner}, realm_processor_startup::{authorize_realm_processor_startup, RealmProcessorStartupAuthorization, RealmProcessorStartupError, RealmProcessorStartupMode, RealmProcessorStartupPreflightProvider}, rollback_runtime_rebuild::RealmRollbackRuntimeControl, traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore}}
 };
 
-use crate::realm::processor::{core::{PsyRealmProcessor, RealmNormalCommitOwner, runner::run_realm_processor}, db::PsyRealmDatabaseProcessor};
+use crate::realm::processor::{core::{PsyRealmProcessor, RealmNormalCommitOwner, runner::{run_realm_processor, RealmProcessorRunExit}}, db::PsyRealmDatabaseProcessor};
 
 pub async fn create_realm_processor<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
@@ -256,37 +256,68 @@ where
     FileSystem::File: Send + Sync,
 {
     tracing::info!("[REALM_CREATE] create_and_run start");
-    let (processor, guta_gatherer_join_handle) = create_realm_processor::<N, S, STagTreeRewards, GUTAUpdateQueue, ProofWorkQueue, TempDatabase, ProofStore, FileSystem, CoordinatorClient>(
-        chain_id,
-        genesis_data,
-        file_system,
-        guta_gatherer_backup_directory,
-        checkpoint_tree_root_backup_file_path,
-        db,
-        tag_tree_rewards_store,
-        temp_db,
-        proof_store,
-        proof_verifier,
-        guta_update_queue,
-        proof_work_queue,
-        realm_identifier,
-        circuit_fingerprint_config,
-        coordinator_client,
-        startup_mode,
-        startup_preflight,
-        commit_runtime_installer,
-        rollback_runtime_control,
-    )
-    .await?;
+    loop {
+        let (processor, guta_gatherer_join_handle) = create_realm_processor::<N, S, STagTreeRewards, GUTAUpdateQueue, ProofWorkQueue, TempDatabase, ProofStore, FileSystem, CoordinatorClient>(
+            chain_id,
+            genesis_data,
+            file_system.clone(),
+            guta_gatherer_backup_directory.clone(),
+            checkpoint_tree_root_backup_file_path.clone(),
+            db.clone(),
+            tag_tree_rewards_store.clone(),
+            temp_db.clone(),
+            proof_store.clone(),
+            proof_verifier.clone(),
+            guta_update_queue.clone(),
+            proof_work_queue.clone(),
+            realm_identifier,
+            circuit_fingerprint_config.clone(),
+            coordinator_client.clone(),
+            startup_mode,
+            startup_preflight.clone(),
+            commit_runtime_installer.clone(),
+            rollback_runtime_control.clone(),
+        )
+        .await?;
 
-    tracing::info!("Starting realm processor...");
-    run_realm_processor(processor, guta_gatherer_join_handle).await?;
-
-    Ok(())
+        tracing::info!("Starting realm processor...");
+        match run_realm_processor(processor, guta_gatherer_join_handle).await? {
+            RealmProcessorRunExit::ShutdownRequested => return Ok(()),
+            RealmProcessorRunExit::RestartAfterRollback => {
+                tracing::warn!(
+                    "Realm rollback restart boundary reached; rebuilding actor and tree from the globally published target"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rollback_restart_recreates_the_realm_actor_while_shutdown_returns() {
+        let source = include_str!("create.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let function = production
+            .split("pub async fn create_realm_processor_and_run<")
+            .nth(1)
+            .expect("create-and-run entry must remain present");
+        let recreate_loop = function.find("loop {").unwrap();
+        let create = function.find("create_realm_processor::<").unwrap();
+        let run = function
+            .find("run_realm_processor(processor, guta_gatherer_join_handle)")
+            .unwrap();
+        let shutdown = function
+            .find("RealmProcessorRunExit::ShutdownRequested => return Ok(())")
+            .unwrap();
+        let restart = function
+            .find("RealmProcessorRunExit::RestartAfterRollback =>")
+            .unwrap();
+        assert!(recreate_loop < create && create < run);
+        assert!(run < shutdown && run < restart);
+        assert!(!function[restart..].contains("return Ok(())"));
+    }
+
     #[test]
     fn startup_preflight_precedes_every_realm_startup_side_effect() {
         let source = include_str!("create.rs");

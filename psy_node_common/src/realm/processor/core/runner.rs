@@ -38,6 +38,12 @@ fn owned_iteration_consumes_slot(
         )
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RealmProcessorRunExit {
+    ShutdownRequested,
+    RestartAfterRollback,
+}
+
 pub async fn run_realm_processor_loop<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
     S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync,
@@ -60,7 +66,7 @@ pub async fn run_realm_processor_loop<
         FileSystem,
         CoordinatorClient,
     >,
-) -> anyhow::Result<()>
+) -> anyhow::Result<RealmProcessorRunExit>
 where
     N: 'static, FileSystem::File: Send + Sync + 'static,
 {
@@ -71,7 +77,7 @@ where
 
     let mut last_slot: u128 = 0;
 
-    'processor: loop {
+    let exit = 'processor: loop {
         // An explicitly configured Realm reads the Coordinator's durable
         // canonical-head row before admitting each new iteration.  Once any
         // rollback phase is visible, the independent gatherer is parked and
@@ -128,7 +134,7 @@ where
                     *request.plan_digest().as_bytes(),
                     *request.plan_digest().as_bytes(),
                 )?;
-                let _pause = processor
+                let pause_receipt = processor
                     .guta_queue_gatherer
                     .pause(GathererPauseRequest::new(
                         drain_request,
@@ -240,10 +246,14 @@ where
                     }
                 }
                 tracing::warn!(
-                    "Realm rollback target {} is globally published; exiting the stale actor so startup reconstructs its tree at the restored target",
+                    "Realm rollback target {} is globally published; stopping the stale actor without finalization so startup can reconstruct its tree at the restored target",
                     selected.directive().target().checkpoint().checkpoint_id().get(),
                 );
-                break 'processor;
+                processor
+                    .guta_queue_gatherer
+                    .stop_paused_without_finalize(pause_receipt)
+                    .await?;
+                break 'processor RealmProcessorRunExit::RestartAfterRollback;
             }
         }
 
@@ -454,13 +464,13 @@ where
             sleep(std::time::Duration::from_secs(1)).await;
         } else {
             tracing::info!("Realm Processor is shutting down gracefully.");
-            break;
+            break 'processor RealmProcessorRunExit::ShutdownRequested;
         }
-    }
+    };
     processor.db.status.mark_stopped();
     print_cf_log_indicator("PSY_REALM_PROCESSOR_STOPPED", &format!("R{}_{}", realm_id, realm_sub_id));
 
-    Ok(())
+    Ok(exit)
 }
 
 #[cfg(test)]
@@ -575,11 +585,14 @@ mod rollback_runtime_tests {
         let publish = source
             .find(".is_realm_runtime_rebuild_published(selected)")
             .unwrap();
+        let stop = source
+            .find(".stop_paused_without_finalize(pause_receipt)")
+            .unwrap();
         let exit = source
-            .find("Realm rollback target {} is globally published; exiting the stale actor")
+            .find("break 'processor RealmProcessorRunExit::RestartAfterRollback")
             .unwrap();
         assert!(pause < select && select < rebuild && rebuild < report);
-        assert!(report < publish && publish < exit && exit < iteration);
+        assert!(report < publish && publish < stop && stop < exit && exit < iteration);
     }
 
     #[test]
@@ -616,7 +629,7 @@ pub async fn run_realm_processor<
         CoordinatorClient,
     >,
     guta_gatherer_join_handle: tokio::task::JoinHandle<Result<(), anyhow::Error>>,
-) -> anyhow::Result<()>
+) -> anyhow::Result<RealmProcessorRunExit>
 where
     N: 'static,
     FileSystem::File: Send + Sync + 'static,
@@ -628,20 +641,20 @@ where
             tracing::info!("Ctrl-C signal received, cleaning up...");
             status.begin_shutdown();
             sleep(std::time::Duration::from_secs(5)).await;
-            Ok(())
+            Ok(RealmProcessorRunExit::ShutdownRequested)
         }
         result = async {
             let (processor_result, gatherer_result) = tokio::try_join!(
                 tokio::spawn(run_realm_processor_loop(processor)),
                 guta_gatherer_join_handle,
             )?;
-            processor_result?;
+            let exit = processor_result?;
             gatherer_result?;
-            Ok::<(), anyhow::Error>(())
+            Ok::<RealmProcessorRunExit, anyhow::Error>(exit)
         } => {
-            result?;
+            let exit = result?;
             tracing::info!("All realm processor threads completed");
-            Ok(())
+            Ok(exit)
         }
     }
 }

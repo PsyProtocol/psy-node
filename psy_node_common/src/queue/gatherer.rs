@@ -342,6 +342,10 @@ enum TreeGathererCommand<Output> {
         receipt: GathererPauseReceipt,
         responder: oneshot::Sender<Result<GathererBoundaryStatus, GathererPauseError>>,
     },
+    StopPausedWithoutFinalize {
+        receipt: GathererPauseReceipt,
+        responder: oneshot::Sender<Result<(), GathererPauseError>>,
+    },
     Status(oneshot::Sender<GathererBoundaryStatus>),
     ApplyDurableGeneration {
         input: RealmProcessorActorInput,
@@ -909,6 +913,26 @@ impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase + 'static, Output:
             .map_err(|_| GathererPauseError::ResponseChannelClosed)?
     }
 
+    /// Stop a rollback-drained actor without finalizing its stale builder or
+    /// touching its old queue consumer. The pause receipt is consumed so an
+    /// unrelated actor or request cannot be stopped through this path.
+    pub async fn stop_paused_without_finalize(
+        &self,
+        receipt: GathererPauseReceipt,
+    ) -> Result<(), GathererPauseError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.trigger_tx
+            .send(TreeGathererCommand::StopPausedWithoutFinalize {
+                receipt,
+                responder: response_tx,
+            })
+            .await
+            .map_err(|_| GathererPauseError::ControlChannelClosed)?;
+        response_rx
+            .await
+            .map_err(|_| GathererPauseError::ResponseChannelClosed)?
+    }
+
     /// Linearized actor status. A returned status proves that no earlier
     /// command or backend callback remains in flight, but is not authority to
     /// change a storage route.
@@ -1080,6 +1104,9 @@ fn reject_tree_command_at_callback_boundary<Output>(
             let _ = responder.send(Err(GathererPauseError::CallbackBoundaryFailed));
         }
         TreeGathererCommand::Resume { responder, .. } => {
+            let _ = responder.send(Err(GathererPauseError::CallbackBoundaryFailed));
+        }
+        TreeGathererCommand::StopPausedWithoutFinalize { responder, .. } => {
             let _ = responder.send(Err(GathererPauseError::CallbackBoundaryFailed));
         }
         TreeGathererCommand::Status(responder) => {
@@ -1328,6 +1355,9 @@ async fn coordinator_durable_gatherer_runner_for_tree<
                 let _ = responder.send(Err(GathererPauseError::NotPaused));
             }
             TreeGathererCommand::Resume { responder, .. } => {
+                let _ = responder.send(Err(GathererPauseError::NotPaused));
+            }
+            TreeGathererCommand::StopPausedWithoutFinalize { responder, .. } => {
                 let _ = responder.send(Err(GathererPauseError::NotPaused));
             }
             TreeGathererCommand::Status(responder) => {
@@ -1627,6 +1657,18 @@ async fn durable_gatherer_runner_for_tree<
                             }));
                             break;
                         }
+                        TreeGathererCommand::StopPausedWithoutFinalize { receipt, responder } => {
+                            if !Arc::ptr_eq(&actor_identity, &receipt.actor_identity)
+                                || receipt.request != request
+                                || receipt.revision != actor_revision
+                                || receipt.unique_id != active_unique_id
+                            {
+                                let _ = responder.send(Err(GathererPauseError::StaleReceipt));
+                                continue;
+                            }
+                            let _ = responder.send(Ok(()));
+                            return Ok(());
+                        }
                         TreeGathererCommand::Status(responder) => {
                             let _ = responder.send(GathererBoundaryStatus {
                                 revision: actor_revision,
@@ -1664,6 +1706,9 @@ async fn durable_gatherer_runner_for_tree<
                 }
             }
             TreeGathererCommand::Resume { responder, .. } => {
+                let _ = responder.send(Err(GathererPauseError::NotPaused));
+            }
+            TreeGathererCommand::StopPausedWithoutFinalize { responder, .. } => {
                 let _ = responder.send(Err(GathererPauseError::NotPaused));
             }
             TreeGathererCommand::Status(responder) => {
@@ -1896,6 +1941,21 @@ async fn gatherer_runner_for_tree<
                                             }));
                                             break 'paused;
                                         }
+                                        TreeGathererCommand::StopPausedWithoutFinalize { receipt, responder } => {
+                                            if !Arc::ptr_eq(&actor_identity, &receipt.actor_identity) {
+                                                let _ = responder.send(Err(GathererPauseError::ReceiptFromDifferentActor));
+                                                continue;
+                                            }
+                                            if receipt.request != request
+                                                || receipt.revision != actor_revision
+                                                || receipt.unique_id != queue_key.unique_id
+                                            {
+                                                let _ = responder.send(Err(GathererPauseError::StaleReceipt));
+                                                continue;
+                                            }
+                                            let _ = responder.send(Ok(()));
+                                            return Ok(());
+                                        }
                                         TreeGathererCommand::Status(responder) => {
                                             let _ = responder.send(GathererBoundaryStatus {
                                                 revision: actor_revision,
@@ -1941,6 +2001,10 @@ async fn gatherer_runner_for_tree<
                                 continue 'gathering;
                         }
                         TreeGathererCommand::Resume { responder, .. } => {
+                                let _ = responder.send(Err(GathererPauseError::NotPaused));
+                                continue 'gathering;
+                        }
+                        TreeGathererCommand::StopPausedWithoutFinalize { responder, .. } => {
                                 let _ = responder.send(Err(GathererPauseError::NotPaused));
                                 continue 'gathering;
                         }
@@ -2984,6 +3048,55 @@ mod h23b1_tests {
         assert_eq!(resumed.revision().get(), 2);
         join.abort();
         assert!(join.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn rollback_stop_consumes_exact_pause_without_finalizing_or_deleting() {
+        let state = Arc::new(TestGathererState::default());
+        let (gatherer, join) = start_test_gatherer(state.clone());
+        state.dump_started.notified().await;
+
+        let request = GathererPauseRequest::new(
+            drain_request(11),
+            GathererActorRevision::try_new(0).unwrap(),
+            41,
+        );
+        let pause = gatherer.pause(request);
+        tokio::pin!(pause);
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut pause)
+            .await
+            .is_err());
+        state.release_dump.notify_one();
+        state.update_started.notified().await;
+        state.release_update.notify_one();
+        let receipt = pause.await.unwrap();
+
+        gatherer
+            .stop_paused_without_finalize(receipt)
+            .await
+            .unwrap();
+        join.await.unwrap().unwrap();
+        assert_eq!(state.finalize_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.delete_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn rollback_stop_validates_pause_identity_and_has_no_finalize_path() {
+        let source = include_str!("gatherer.rs");
+        for paused in source.match_indices(
+            "TreeGathererCommand::StopPausedWithoutFinalize { receipt, responder }",
+        ) {
+            let branch = &source[paused.0..];
+            let end = branch.find("TreeGathererCommand::Status").unwrap();
+            let branch = &branch[..end];
+            assert!(branch.contains("receipt.actor_identity"));
+            assert!(branch.contains("receipt.request"));
+            assert!(branch.contains("receipt.revision"));
+            assert!(branch.contains("receipt.unique_id"));
+            assert!(branch.contains("return Ok(())"));
+            assert!(!branch.contains("finalize_with_tree"));
+            assert!(!branch.contains("delete_consumer"));
+        }
     }
 
     #[tokio::test]
