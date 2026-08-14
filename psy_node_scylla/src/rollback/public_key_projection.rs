@@ -44,6 +44,7 @@ const MAX_UNLOGGED_BATCH_ROWS: usize = 100;
 pub enum PublicKeyProjectionQueryKind {
     Put = 1,
     PointDelete = 2,
+    ExactRead = 3,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -71,6 +72,7 @@ impl PublicKeyProjectionQuery {
 pub struct PublicKeyProjectionQueries {
     put: PublicKeyProjectionQuery,
     point_delete: PublicKeyProjectionQuery,
+    exact_read: PublicKeyProjectionQuery,
 }
 
 impl PublicKeyProjectionQueries {
@@ -100,6 +102,13 @@ impl PublicKeyProjectionQueries {
                     "user_id:BIGINT",
                 ],
             },
+            exact_read: PublicKeyProjectionQuery {
+                kind: PublicKeyProjectionQueryKind::ExactRead,
+                cql: format!(
+                    "SELECT value_u64 FROM {qualified} WHERE hash_id = ? AND value_u64 = ?"
+                ),
+                bind_shape: &["public_key_hash:BLOB", "user_id:BIGINT"],
+            },
         }
     }
 
@@ -111,9 +120,13 @@ impl PublicKeyProjectionQueries {
         &self.point_delete
     }
 
+    pub const fn exact_read(&self) -> &PublicKeyProjectionQuery {
+        &self.exact_read
+    }
+
     pub fn render_golden(&self) -> String {
         let mut output = String::new();
-        for query in [self.put(), self.point_delete()] {
+        for query in [self.put(), self.point_delete(), self.exact_read()] {
             output.push_str(&format!(
                 "{:?}\n{}\n{}\n",
                 query.kind(),
@@ -377,6 +390,7 @@ impl PublicKeyProjectionPointDeletePlan {
 struct PreparedPublicKeyProjection {
     put: PreparedStatement,
     point_delete: PreparedStatement,
+    exact_read: PreparedStatement,
 }
 
 #[allow(dead_code)]
@@ -399,6 +413,12 @@ impl PublicKeyProjectionAdapter {
             point_delete: prepare_idempotent(
                 session,
                 queries.point_delete().cql(),
+                consistency,
+            )
+            .await?,
+            exact_read: prepare_idempotent(
+                session,
+                queries.exact_read().cql(),
                 consistency,
             )
             .await?,
@@ -444,6 +464,28 @@ impl PublicKeyProjectionAdapter {
             session.batch(&batch, values).await?;
         }
         Ok(())
+    }
+
+    /// Exact full-primary-key presence read. The table has no non-key value
+    /// column, so Scylla exposes no `WRITETIME`; callers must pair presence
+    /// with a fresh acknowledged timestamped INSERT attempt.
+    pub(crate) async fn read_exact(
+        &self,
+        session: &Session,
+        binding: &PublicKeyProjectionPutBinding,
+    ) -> anyhow::Result<bool> {
+        let row = session
+            .execute_unpaged(
+                &self.prepared.exact_read,
+                (
+                    binding.public_key_hash.to_vec(),
+                    u64_to_i64_exact(binding.user.get()),
+                ),
+            )
+            .await?
+            .into_rows_result()?
+            .maybe_first_row::<(i64,)>()?;
+        Ok(row.is_some())
     }
 
     pub(crate) async fn delete_one(

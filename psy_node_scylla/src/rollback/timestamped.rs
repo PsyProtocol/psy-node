@@ -130,6 +130,40 @@ impl SealedTimestampedPutBatch {
         self.intent_digest
     }
 
+    /// Reconstitute a batch retained as individual immutable members by a
+    /// larger storage-private schedule. No key/value/timestamp is accepted
+    /// separately, and all members must carry one exact timestamp/write kind.
+    pub(crate) fn try_from_exact_members(
+        members: Vec<SealedTimestampedPut>,
+    ) -> Result<Self, TimestampedMutationError> {
+        let first = members.first().ok_or(
+            TimestampedMutationError::InvalidEncoding("timestamped batch is empty"),
+        )?;
+        if members.iter().any(|member| member.timestamp != first.timestamp) {
+            return Err(TimestampedMutationError::InvalidEncoding(
+                "timestamped batch mixes write timestamps",
+            ));
+        }
+        if members.iter().any(|member| member.write_kind != first.write_kind) {
+            return Err(TimestampedMutationError::InvalidEncoding(
+                "timestamped batch mixes write kinds",
+            ));
+        }
+        let kind_bytes = [first.write_kind as u8];
+        let timestamp_bytes = first.timestamp.as_i64().to_be_bytes();
+        let member_digests = members
+            .iter()
+            .flat_map(|member| member.mutation_digest.as_bytes().iter().copied())
+            .collect::<Vec<_>>();
+        let intent_digest = TimestampedIntentDigest(sha256(&[
+            b"psy/scylla/timestamped-put-batch/v1",
+            &kind_bytes,
+            &timestamp_bytes,
+            &member_digests,
+        ]));
+        Ok(Self { members, intent_digest })
+    }
+
     pub fn ensure_exact_retry(
         &self,
         intent: LogicalMutation,

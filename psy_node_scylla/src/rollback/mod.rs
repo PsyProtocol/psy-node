@@ -92,6 +92,10 @@ pub(crate) use coordinator_rollback_floor_singleton_anchor::*;
 mod coordinator_commit_physical_inventory;
 #[allow(dead_code)]
 mod coordinator_commit_physical_write_plan;
+#[allow(dead_code)]
+mod coordinator_commit_physical_execution;
+#[allow(dead_code)]
+mod coordinator_commit_physical_scylla;
 mod coordinator_commit_physical_before_image;
 mod coordinator_commit_target_restore;
 mod coordinator_commit_physical_archive_store;

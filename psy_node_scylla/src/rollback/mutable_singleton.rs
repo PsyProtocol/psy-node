@@ -41,6 +41,7 @@ const AUTHORITY_KIND_REALM: u8 = 2;
 pub enum SingletonTransitionKind {
     AuthorityCommit = 1,
     TargetRestore = 2,
+    NewBranchCommit = 3,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -194,6 +195,22 @@ impl LatestInfoTransitionPlan {
         )
     }
 
+    /// Commit a new canonical checkpoint after a rollback fence. This keeps
+    /// ordinary monotonic-before-image checks while requiring the
+    /// `NewBranchAfterFence` timestamp kind; it is not a target restore.
+    pub fn try_for_new_branch_commit(
+        sealed: &SealedTimestampedPut,
+        checkpoint: CheckpointId,
+        before: LatestInfoBeforeImage,
+    ) -> Result<Self, MutableSingletonPlanError> {
+        Self::try_build(
+            sealed,
+            checkpoint,
+            before,
+            SingletonTransitionKind::NewBranchCommit,
+        )
+    }
+
     fn try_build(
         sealed: &SealedTimestampedPut,
         checkpoint: CheckpointId,
@@ -209,7 +226,9 @@ impl LatestInfoTransitionPlan {
             TypedTableKey::LatestInfo(slot) => *slot,
             _ => return Err(MutableSingletonPlanError::WrongTypedKey),
         };
-        if kind == SingletonTransitionKind::AuthorityCommit && slot == LatestInfoSlot::LatestCheckpointTreeRoot {
+        if matches!(kind, SingletonTransitionKind::AuthorityCommit | SingletonTransitionKind::NewBranchCommit)
+            && slot == LatestInfoSlot::LatestCheckpointTreeRoot
+        {
             return Err(MutableSingletonPlanError::ReaderOnlySlotRequiresRestore);
         }
         let canonical_value = match mutation.operation() {
@@ -225,7 +244,7 @@ impl LatestInfoTransitionPlan {
             }
             LatestInfoBeforeImage::Present(value) => {
                 let before_checkpoint = validate_latest_info_value(slot, value)?;
-                if kind == SingletonTransitionKind::AuthorityCommit {
+                if matches!(kind, SingletonTransitionKind::AuthorityCommit | SingletonTransitionKind::NewBranchCommit) {
                     require_prior_not_ahead(before_checkpoint, checkpoint)?;
                 }
             }
@@ -319,6 +338,21 @@ impl U64SingletonTransitionPlan {
         )
     }
 
+    /// Commit a new canonical checkpoint after a rollback fence without
+    /// weakening the ordinary monotonic before-image rule.
+    pub fn try_for_new_branch_commit(
+        sealed: &SealedTimestampedPut,
+        checkpoint: CheckpointId,
+        before: U64SingletonBeforeImage,
+    ) -> Result<Self, MutableSingletonPlanError> {
+        Self::try_build(
+            sealed,
+            checkpoint,
+            before,
+            SingletonTransitionKind::NewBranchCommit,
+        )
+    }
+
     fn try_build(
         sealed: &SealedTimestampedPut,
         checkpoint: CheckpointId,
@@ -348,7 +382,9 @@ impl U64SingletonTransitionPlan {
                 }
             }
             U64SingletonBeforeImage::Present(prior) => {
-                if kind == SingletonTransitionKind::AuthorityCommit && prior > checkpoint.get() {
+                if matches!(kind, SingletonTransitionKind::AuthorityCommit | SingletonTransitionKind::NewBranchCommit)
+                    && prior > checkpoint.get()
+                {
                     return Err(MutableSingletonPlanError::PriorCheckpointAhead { prior, candidate: checkpoint.get() });
                 }
             }
@@ -476,6 +512,7 @@ fn require_write_kind(
     let expected = match kind {
         SingletonTransitionKind::AuthorityCommit => TimestampedWriteKind::AuthorityCommit,
         SingletonTransitionKind::TargetRestore => TimestampedWriteKind::NewBranchAfterFence,
+        SingletonTransitionKind::NewBranchCommit => TimestampedWriteKind::NewBranchAfterFence,
     };
     if sealed.write_kind() != expected {
         return Err(MutableSingletonPlanError::WrongWriteKind { expected, actual: sealed.write_kind() });

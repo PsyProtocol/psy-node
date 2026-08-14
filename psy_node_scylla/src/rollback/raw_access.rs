@@ -106,6 +106,7 @@ pub const RAW_SCYLLA_ACCESS_ALLOWLIST: &[RawScyllaAccessAllowance] = &[
     allow!("psy_node_scylla/src/rollback/coordinator_commit_delete_restore_plan_store.rs", DurableControlAuthority),
     allow!("psy_node_scylla/src/rollback/coordinator_commit_physical_archive_store.rs", DurableControlAuthority),
     allow!("psy_node_scylla/src/rollback/coordinator_commit_physical_before_image.rs", DurableControlAuthority),
+    allow!("psy_node_scylla/src/rollback/coordinator_commit_physical_scylla.rs", DurableControlAuthority),
     allow!("psy_node_scylla/src/rollback/coordinator_commit_source_store.rs", DurableControlAuthority),
     allow!("psy_node_scylla/src/rollback/coordinator_guta_durable_submission_store.rs", DurableControlAuthority),
     allow!("psy_node_scylla/src/rollback/coordinator_rollback_archive_store.rs", DurableControlAuthority),

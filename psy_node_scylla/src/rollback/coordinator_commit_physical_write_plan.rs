@@ -148,6 +148,14 @@ pub(crate) struct CoordinatorCommitPhysicalWritePlan<Hash> {
 }
 
 impl<Hash> CoordinatorCommitPhysicalWritePlan<Hash> {
+    pub(crate) const fn source_slot(&self) -> &[u8; 32] {
+        &self.source_slot
+    }
+
+    pub(crate) const fn source_digest(&self) -> &[u8; 32] {
+        &self.source_digest
+    }
+
     pub(crate) const fn candidate(&self) -> &CanonicalChainRef<Hash> {
         &self.candidate
     }
@@ -1352,6 +1360,18 @@ mod tests {
         );
         assert_ne!(rollback_plan.digest(), ordinary_plan.digest());
         assert_eq!(rollback_plan.inventory_digest(), ordinary_plan.inventory_digest());
+        let rollback_schedule = crate::rollback::coordinator_commit_physical_execution::CoordinatorCommitPhysicalExecutionSchedule::try_from_plan(
+            &rollback_plan,
+            &rollback_narrow,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::rollback::coordinator_commit_physical_scylla::validate_schedule_bindings(
+                &rollback_schedule,
+            )
+            .unwrap(),
+            rollback_plan.typed_row_count(),
+        );
     }
 
     #[test]
@@ -1422,6 +1442,18 @@ mod tests {
         assert_eq!(plan.semantic_domain_count(), 23);
         assert!(plan.batches().iter().all(|batch| !batch.puts().is_empty()));
         assert!(plan.row_count() > HEIGHT as usize + 13);
+        let schedule = crate::rollback::coordinator_commit_physical_execution::CoordinatorCommitPhysicalExecutionSchedule::try_from_plan(
+            &plan,
+            &narrow,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::rollback::coordinator_commit_physical_scylla::validate_schedule_bindings(
+                &schedule,
+            )
+            .unwrap(),
+            plan.typed_row_count(),
+        );
     }
 
     #[test]
