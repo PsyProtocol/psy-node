@@ -20,15 +20,25 @@ use psy_node_core::{
         CoordinatorRollbackRuntimePublication, CoordinatorRollbackRuntimeRebuildStore,
     },
     store::canonical_head::StoredCanonicalHead,
+    store::realm_processor_quiescence::RealmProcessorDrainRequest,
 };
 use tokio::time::sleep;
 
-use crate::coordinator::processor::PsyCoordinatorProcessor;
+use crate::{
+    coordinator::processor::PsyCoordinatorProcessor,
+    queue::gatherer::{GathererBoundaryPhase, GathererPauseReceipt, GathererPauseRequest},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CoordinatorProcessorRunExit<Hash> {
     ShutdownRequested,
     RestartAfterRollback(StoredCanonicalHead<Hash>),
+}
+
+struct CoordinatorRollbackGathererPauseSet {
+    guta: GathererPauseReceipt,
+    registration: GathererPauseReceipt,
+    deploy: GathererPauseReceipt,
 }
 
 pub async fn run_coordinator_processor_loop<
@@ -69,6 +79,7 @@ where
     print_cf_log_indicator("PSY_COORDINATOR_PROCESSOR_STARTED", &format!("R{}_{}", realm_id, realm_sub_id));
 
     let mut last_slot: u128 = 0;
+    let mut rollback_gatherers: Option<CoordinatorRollbackGathererPauseSet> = None;
 
     loop {
         if processor.db.status.should_run() {
@@ -86,6 +97,67 @@ where
                     .await;
                 match admission {
                     Ok(RollbackAdmissionBoundaryOutcome::Maintenance(head)) => {
+                        if rollback_gatherers.is_none() {
+                            let request = head.rollback_control().requested().ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "Coordinator maintenance head has no rollback request"
+                                )
+                            })?;
+                            let drain_request = RealmProcessorDrainRequest::try_new(
+                                head.canonical_ref().network_id(),
+                                u32::try_from(processor.db.ids.realm_id_u64)?,
+                                u16::try_from(processor.db.ids.realm_sub_id_u64)?,
+                                head.canonical_ref().chain_epoch().get(),
+                                head.revision().get(),
+                                *request.plan_digest().as_bytes(),
+                                *request.plan_digest().as_bytes(),
+                            )?;
+                            let guta_status = processor.guta_queue_gatherer.status().await?;
+                            let registration_status =
+                                processor.register_user_queue_gatherer.status().await?;
+                            let deploy_status =
+                                processor.deploy_contract_queue_gatherer.status().await?;
+                            if [guta_status, registration_status, deploy_status]
+                                .iter()
+                                .any(|status| status.phase() != GathererBoundaryPhase::Running)
+                            {
+                                anyhow::bail!(
+                                    "Coordinator rollback requires three running gatherers before drain"
+                                )
+                            }
+                            let guta = processor
+                                .guta_queue_gatherer
+                                .pause(GathererPauseRequest::new(
+                                    drain_request,
+                                    guta_status.revision(),
+                                    guta_status.unique_id(),
+                                ))
+                                .await?;
+                            let registration = processor
+                                .register_user_queue_gatherer
+                                .pause(GathererPauseRequest::new(
+                                    drain_request,
+                                    registration_status.revision(),
+                                    registration_status.unique_id(),
+                                ))
+                                .await?;
+                            let deploy = processor
+                                .deploy_contract_queue_gatherer
+                                .pause(GathererPauseRequest::new(
+                                    drain_request,
+                                    deploy_status.revision(),
+                                    deploy_status.unique_id(),
+                                ))
+                                .await?;
+                            rollback_gatherers = Some(CoordinatorRollbackGathererPauseSet {
+                                guta,
+                                registration,
+                                deploy,
+                            });
+                            tracing::warn!(
+                                "Coordinator rollback drained all three gatherer actors before archive/delete maintenance"
+                            );
+                        }
                         if matches!(
                             head.rollback_control(),
                             psy_node_core::store::rollback_control::RollbackControlState::Verifying(_)
@@ -201,11 +273,35 @@ where
                             }) => tracing::warn!(
                                 "[COORDINATOR] Distributed rollback barrier awaits participant completions: {completed}/{expected}"
                             ),
-                            Ok(psy_node_core::store::rollback_participant_maintenance::CoordinatorRollbackGlobalProgress::Progressed(head)) => tracing::warn!(
-                                "[COORDINATOR] Distributed rollback advanced at epoch {}, checkpoint {}",
-                                head.canonical_ref().chain_epoch().get(),
-                                head.canonical_ref().checkpoint().checkpoint_id().get(),
-                            ),
+                            Ok(psy_node_core::store::rollback_participant_maintenance::CoordinatorRollbackGlobalProgress::Progressed(head)) => {
+                                tracing::warn!(
+                                    "[COORDINATOR] Distributed rollback advanced at epoch {}, checkpoint {}",
+                                    head.canonical_ref().chain_epoch().get(),
+                                    head.canonical_ref().checkpoint().checkpoint_id().get(),
+                                );
+                                if head.rollback_control().is_idle() {
+                                    let paused = rollback_gatherers.take().ok_or_else(|| {
+                                        anyhow::anyhow!(
+                                            "Coordinator abort completed without a gatherer drain"
+                                        )
+                                    })?;
+                                    processor
+                                        .guta_queue_gatherer
+                                        .resume(paused.guta)
+                                        .await?;
+                                    processor
+                                        .register_user_queue_gatherer
+                                        .resume(paused.registration)
+                                        .await?;
+                                    processor
+                                        .deploy_contract_queue_gatherer
+                                        .resume(paused.deploy)
+                                        .await?;
+                                    tracing::warn!(
+                                        "Coordinator rollback aborted before PONR; resumed all three original gatherer actors"
+                                    );
+                                }
+                            }
                             Ok(psy_node_core::store::rollback_participant_maintenance::CoordinatorRollbackGlobalProgress::ReadyForRuntimeRebuild(_)) => {}
                             Err(error) => {
                                 let error = format!(
@@ -424,5 +520,36 @@ mod tests {
             .map(|offset| published + offset)
             .expect("normal processing call");
         assert!(published < restart && restart < normal_processing);
+    }
+
+    #[test]
+    fn rollback_drains_all_coordinator_gatherers_and_only_abort_resumes_them() {
+        let source = include_str!("runner.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let maintenance = production
+            .find("RollbackAdmissionBoundaryOutcome::Maintenance(head)")
+            .expect("maintenance branch");
+        let branch = &production[maintenance..];
+        let guta_pause = branch
+            .find(".guta_queue_gatherer\n                                .pause")
+            .expect("GUTA drain");
+        let registration_pause = branch
+            .find(".register_user_queue_gatherer\n                                .pause")
+            .expect("registration drain");
+        let deploy_pause = branch
+            .find(".deploy_contract_queue_gatherer\n                                .pause")
+            .expect("deploy drain");
+        let archive = branch
+            .find("prepare_coordinator_rollback_archive")
+            .expect("archive preparation");
+        let abort_idle = branch
+            .find("head.rollback_control().is_idle()")
+            .expect("abort completion");
+        let guta_resume = branch[abort_idle..]
+            .find(".guta_queue_gatherer\n                                        .resume")
+            .map(|offset| abort_idle + offset)
+            .expect("GUTA resume");
+        assert!(guta_pause < registration_pause && registration_pause < deploy_pause);
+        assert!(deploy_pause < archive && archive < abort_idle && abort_idle < guta_resume);
     }
 }

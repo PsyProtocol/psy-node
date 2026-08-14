@@ -1351,8 +1351,126 @@ async fn coordinator_durable_gatherer_runner_for_tree<
                     GathererPauseError::LegacyFinalizeOnDurableActor.into(),
                 ));
             }
-            TreeGathererCommand::Pause { responder, .. } => {
-                let _ = responder.send(Err(GathererPauseError::NotPaused));
+            TreeGathererCommand::Pause { request, responder } => {
+                if request.drain_request().realm_id() as u64 != queue_key.realm_id
+                    || request.drain_request().realm_sub_id() as u64 != queue_key.realm_sub_id
+                {
+                    let _ = responder.send(Err(GathererPauseError::RealmIdentityMismatch));
+                    continue;
+                }
+                if request.expected_unique_id() != queue_key.unique_id {
+                    let _ = responder.send(Err(GathererPauseError::UniqueIdMismatch {
+                        current: queue_key.unique_id,
+                        expected: request.expected_unique_id(),
+                    }));
+                    continue;
+                }
+                if request.expected_revision() != actor_revision {
+                    let _ = responder.send(Err(GathererPauseError::RevisionMismatch {
+                        current: actor_revision,
+                        expected: request.expected_revision(),
+                    }));
+                    continue;
+                }
+                actor_revision = actor_revision.checked_next()?;
+                let make_receipt = || GathererPauseReceipt {
+                    actor_identity: actor_identity.clone(),
+                    request,
+                    revision: actor_revision,
+                    queue_topic_id: QUEUE_TOPIC_ID,
+                    realm_id: queue_key.realm_id,
+                    realm_sub_id: queue_key.realm_sub_id,
+                    unique_id: queue_key.unique_id,
+                };
+                let _ = responder.send(Ok(make_receipt()));
+
+                loop {
+                    let Some(paused_command) = trigger_rx.recv().await else {
+                        return Ok(());
+                    };
+                    match paused_command {
+                        TreeGathererCommand::Pause {
+                            request: retry,
+                            responder,
+                        } => {
+                            let result = if retry == request {
+                                Ok(make_receipt())
+                            } else {
+                                Err(GathererPauseError::AlreadyPausedAtDifferentRequest)
+                            };
+                            let _ = responder.send(result);
+                        }
+                        TreeGathererCommand::Resume { receipt, responder } => {
+                            if !Arc::ptr_eq(&actor_identity, &receipt.actor_identity)
+                                || receipt.request != request
+                                || receipt.revision != actor_revision
+                                || receipt.unique_id != queue_key.unique_id
+                            {
+                                let _ = responder.send(Err(GathererPauseError::StaleReceipt));
+                                continue;
+                            }
+                            actor_revision = actor_revision.checked_next()?;
+                            let _ = responder.send(Ok(GathererBoundaryStatus {
+                                revision: actor_revision,
+                                phase: GathererBoundaryPhase::Running,
+                                request: None,
+                                unique_id: queue_key.unique_id,
+                            }));
+                            break;
+                        }
+                        TreeGathererCommand::StopPausedWithoutFinalize { receipt, responder } => {
+                            if !Arc::ptr_eq(&actor_identity, &receipt.actor_identity)
+                                || receipt.request != request
+                                || receipt.revision != actor_revision
+                                || receipt.unique_id != queue_key.unique_id
+                            {
+                                let _ = responder.send(Err(GathererPauseError::StaleReceipt));
+                                continue;
+                            }
+                            let _ = responder.send(Ok(()));
+                            return Ok(());
+                        }
+                        TreeGathererCommand::Status(responder) => {
+                            let _ = responder.send(GathererBoundaryStatus {
+                                revision: actor_revision,
+                                phase: GathererBoundaryPhase::Paused,
+                                request: Some(request),
+                                unique_id: queue_key.unique_id,
+                            });
+                        }
+                        TreeGathererCommand::ApplyCoordinatorDurableSource {
+                            responder, ..
+                        } => {
+                            let _ = responder.send(Err(
+                                GathererPauseError::AlreadyPausedAtDifferentRequest,
+                            ));
+                        }
+                        TreeGathererCommand::FinalizeCoordinatorDurableSource {
+                            responder, ..
+                        } => {
+                            let _ = responder.send(Err(
+                                GathererPauseError::AlreadyPausedAtDifferentRequest,
+                            ));
+                        }
+                        TreeGathererCommand::ApplyDurableGeneration { responder, .. } => {
+                            let _ = responder.send(Err(
+                                GathererPauseError::RealmGenerationOnCoordinatorActor,
+                            ));
+                        }
+                        TreeGathererCommand::FinalizeDurableGeneration {
+                            responder, ..
+                        } => {
+                            let _ = responder.send(Err(
+                                GathererPauseError::RealmGenerationOnCoordinatorActor,
+                            ));
+                        }
+                        TreeGathererCommand::Finalize { responder, .. } => {
+                            let _ = responder.send(Err(
+                                GathererPauseError::LegacyFinalizeOnDurableActor.into(),
+                            ));
+                        }
+                    }
+                }
             }
             TreeGathererCommand::Resume { responder, .. } => {
                 let _ = responder.send(Err(GathererPauseError::NotPaused));
@@ -3083,10 +3201,11 @@ mod h23b1_tests {
     #[test]
     fn rollback_stop_validates_pause_identity_and_has_no_finalize_path() {
         let source = include_str!("gatherer.rs");
-        for paused in source.match_indices(
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        for paused in production.match_indices(
             "TreeGathererCommand::StopPausedWithoutFinalize { receipt, responder }",
         ) {
-            let branch = &source[paused.0..];
+            let branch = &production[paused.0..];
             let end = branch.find("TreeGathererCommand::Status").unwrap();
             let branch = &branch[..end];
             assert!(branch.contains("receipt.actor_identity"));
@@ -3358,6 +3477,48 @@ mod h23b1_tests {
         assert_eq!(state.dump_calls.load(Ordering::SeqCst), 0);
         assert_eq!(state.ensure_calls.load(Ordering::SeqCst), 0);
         assert_eq!(state.delete_calls.load(Ordering::SeqCst), 0);
+
+        let pause_request = GathererPauseRequest::new(
+            drain_request(12),
+            finalized.actor_revision(),
+            41,
+        );
+        let pause_receipt = gatherer.pause(pause_request).await.unwrap();
+        assert_eq!(pause_receipt.revision().get(), 3);
+        let paused = gatherer.status().await.unwrap();
+        assert_eq!(paused.phase(), GathererBoundaryPhase::Paused);
+        assert_eq!(paused.request(), Some(pause_request));
+
+        let paused_generation = coordinator_generation(1);
+        let paused_digest = paused_generation.digest();
+        let (_, _, paused_registration, _, _) = paused_generation.into_sources();
+        assert_eq!(
+            gatherer
+                .apply_coordinator_durable_source(paused_digest, paused_registration)
+                .await
+                .unwrap_err(),
+            GathererPauseError::AlreadyPausedAtDifferentRequest
+        );
+        assert_eq!(state.update_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.finalize_calls.load(Ordering::SeqCst), 1);
+
+        let resumed = gatherer.resume(pause_receipt).await.unwrap();
+        assert_eq!(resumed.phase(), GathererBoundaryPhase::Running);
+        assert_eq!(resumed.revision().get(), 4);
+        let resumed_generation = coordinator_generation(1);
+        let resumed_digest = resumed_generation.digest();
+        let (_, _, resumed_registration, _, _) = resumed_generation.into_sources();
+        let resumed_retry = gatherer
+            .apply_coordinator_durable_source(resumed_digest, resumed_registration)
+            .await
+            .unwrap();
+        let resumed_finalized = gatherer
+            .finalize_coordinator_durable_source(resumed_retry)
+            .await
+            .unwrap();
+        assert_eq!(resumed_finalized.actor_revision(), finalized.actor_revision());
+        assert_eq!(state.update_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.finalize_calls.load(Ordering::SeqCst), 1);
 
         drop(gatherer);
         join.await.unwrap().unwrap();
