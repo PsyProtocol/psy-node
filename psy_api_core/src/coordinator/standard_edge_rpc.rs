@@ -20,7 +20,8 @@ use psy_data::{
 };
 use crate::CheckpointJobStats;
 use crate::coordinator::rollback_admin::{
-    RollbackAdminStartRequest, RollbackAdminStartResponse, RollbackAdminStatus,
+    RollbackAdminAbortRequest, RollbackAdminAbortResponse, RollbackAdminStartRequest,
+    RollbackAdminStartResponse, RollbackAdminStatus,
 };
 
 #[rpc(server, client, namespace = "psy")]
@@ -60,6 +61,14 @@ pub trait CoordinatorEdgeRpc<F, Hash, JobId, ZKProof>: NodeEdgeWorkerRpcServer<H
         &self,
         request: RollbackAdminStartRequest<Hash>,
     ) -> RpcResult<RollbackAdminStartResponse<Hash>>;
+
+    /// Queue an explicit pre-PONR abort. The Processor remains the sole
+    /// canonical-head writer and rejects the command once deletion begins.
+    #[method(name = "admin_abort_rollback")]
+    async fn admin_abort_rollback(
+        &self,
+        request: RollbackAdminAbortRequest,
+    ) -> RpcResult<RollbackAdminAbortResponse<Hash>>;
 
     /// Observe the canonical control and admission inbox together.
     #[method(name = "admin_get_rollback_status")]

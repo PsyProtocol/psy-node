@@ -370,7 +370,10 @@ impl<Hash: Q256BitHash> RealmRollbackRuntimeControl<Hash>
             anyhow::bail!("rollback topology changed after plan selection")
         }
         match first_head.rollback_control() {
-            RollbackControlState::Requested(_) => {
+            RollbackControlState::Requested(_) | RollbackControlState::Aborting(_) => {
+                // Aborting is owned by the dedicated all-participant abort
+                // convergence path.  Realm archive/delete/restore maintenance
+                // must not perform any destructive work in this phase.
                 Ok(RealmRollbackParticipantProgress::AwaitingCoordinator(first_head))
             }
             RollbackControlState::Archiving(_) => {

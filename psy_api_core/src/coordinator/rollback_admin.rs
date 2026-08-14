@@ -8,6 +8,7 @@ use psy_data::protocol::canonical_chain::CanonicalChainRef;
 use serde::{Deserialize, Serialize};
 
 pub const ROLLBACK_ADMIN_START_REQUEST_VERSION: u16 = 2;
+pub const ROLLBACK_ADMIN_ABORT_REQUEST_VERSION: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -83,6 +84,37 @@ pub struct RollbackAdminStartResponse<Hash> {
     pub status: RollbackAdminStatus<Hash>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RollbackAdminAbortRequest {
+    pub request_version: u16,
+    pub expected_revision: u64,
+    pub expected_chain_epoch: u64,
+    /// Exact active rollback plan digest; optional `0x`, exactly 32 bytes.
+    pub expected_plan_digest_hex: String,
+    /// Stable operator reason code. Zero is reserved and rejected.
+    pub reason_code: u32,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RollbackAdminAbortDisposition {
+    Accepted,
+    Idempotent,
+    RollbackAdminDisabled,
+    NoActiveRollback,
+    HeadMismatch,
+    RollbackPointOfNoReturn,
+    RollbackAdmissionConflict,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RollbackAdminAbortResponse<Hash> {
+    pub disposition: RollbackAdminAbortDisposition,
+    pub status: RollbackAdminStatus<Hash>,
+}
+
 #[cfg(test)]
 mod tests {
     use parth_core::PHash;
@@ -150,5 +182,31 @@ mod tests {
             serde_json::to_string(&RollbackAdminPhase::Stale).unwrap(),
             "\"STALE\""
         );
+        assert_eq!(
+            serde_json::to_string(&RollbackAdminAbortDisposition::RollbackPointOfNoReturn)
+                .unwrap(),
+            "\"ROLLBACK_POINT_OF_NO_RETURN\""
+        );
+    }
+
+    #[test]
+    fn abort_request_is_versioned_exact_and_rejects_unknown_fields() {
+        let request = RollbackAdminAbortRequest {
+            request_version: ROLLBACK_ADMIN_ABORT_REQUEST_VERSION,
+            expected_revision: 11,
+            expected_chain_epoch: 4,
+            expected_plan_digest_hex: "a5".repeat(32),
+            reason_code: 7,
+        };
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["request_version"], 1);
+        assert_eq!(encoded["reason_code"], 7);
+        assert_eq!(
+            serde_json::from_value::<RollbackAdminAbortRequest>(encoded.clone()).unwrap(),
+            request
+        );
+        let mut unknown = encoded;
+        unknown["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<RollbackAdminAbortRequest>(unknown).is_err());
     }
 }

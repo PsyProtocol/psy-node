@@ -8,7 +8,8 @@ use parth_core::{
 };
 use psy_api_core::{
     coordinator::rollback_admin::{
-        RollbackAdminStartRequest, RollbackAdminStartResponse, RollbackAdminStatus,
+        RollbackAdminAbortRequest, RollbackAdminAbortResponse, RollbackAdminStartRequest,
+        RollbackAdminStartResponse, RollbackAdminStatus,
     },
     coordinator::standard_edge_rpc::CoordinatorEdgeRpcServer,
     worker::standard_worker_rpc::NodeEdgeWorkerRpcServer,
@@ -121,6 +122,12 @@ impl<
         request: RollbackAdminStartRequest<N::QHash>,
     ) -> QRpcResult<RollbackAdminStartResponse<N::QHash>> {
         res(self.admin_start_rollback_internal(request).await)
+    }
+    async fn admin_abort_rollback(
+        &self,
+        request: RollbackAdminAbortRequest,
+    ) -> QRpcResult<RollbackAdminAbortResponse<N::QHash>> {
+        res(self.admin_abort_rollback_internal(request).await)
     }
     async fn admin_get_rollback_status(&self) -> QRpcResult<RollbackAdminStatus<N::QHash>> {
         res(self.admin_get_rollback_status_internal().await)

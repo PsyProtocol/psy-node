@@ -9,8 +9,10 @@ use psy_crypto::hash::tx_hash::{compute_deploy_contract_content_hash, hash_to_he
 use psy_api_core::{
     CheckpointJobStats,
     coordinator::rollback_admin::{
-        ROLLBACK_ADMIN_START_REQUEST_VERSION, RollbackAdminExecutionMode,
-        RollbackAdminPhase, RollbackAdminRequestSummary, RollbackAdminStartDisposition,
+        ROLLBACK_ADMIN_ABORT_REQUEST_VERSION, ROLLBACK_ADMIN_START_REQUEST_VERSION,
+        RollbackAdminAbortDisposition, RollbackAdminAbortRequest,
+        RollbackAdminAbortResponse, RollbackAdminExecutionMode, RollbackAdminPhase,
+        RollbackAdminRequestSummary, RollbackAdminStartDisposition,
         RollbackAdminStartRequest, RollbackAdminStartResponse, RollbackAdminStatus,
     },
 };
@@ -45,10 +47,15 @@ use psy_node_core::{
         rollback_admin::{
             CoordinatorRollbackAdminInbox, RollbackAdminInboxAccess,
             RollbackAdminInboxPhase, RollbackAdminInboxStatus,
+            RollbackAdminAbortDisposition as CoreRollbackAdminAbortDisposition,
+            RollbackAdminAbortIntent,
             RollbackAdminStartDisposition as CoreRollbackAdminStartDisposition,
             RollbackAdminPlannedStartIntent,
         },
-        rollback_control::{RollbackExecutionMode, RollbackRequest},
+        rollback_control::{
+            RollbackAbortReasonCode, RollbackExecutionMode, RollbackPlanDigest,
+            RollbackRequest,
+        },
         timestamp::{CommitWriteTimestampUs, TimestampFenceWindow},
     },
     store::traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore},
@@ -76,6 +83,32 @@ fn map_admin_disposition(
         }
         CoreRollbackAdminStartDisposition::Conflict => {
             RollbackAdminStartDisposition::RollbackAdmissionConflict
+        }
+    }
+}
+
+fn map_admin_abort_disposition(
+    disposition: CoreRollbackAdminAbortDisposition,
+) -> RollbackAdminAbortDisposition {
+    match disposition {
+        CoreRollbackAdminAbortDisposition::Accepted => RollbackAdminAbortDisposition::Accepted,
+        CoreRollbackAdminAbortDisposition::Idempotent => {
+            RollbackAdminAbortDisposition::Idempotent
+        }
+        CoreRollbackAdminAbortDisposition::Disabled => {
+            RollbackAdminAbortDisposition::RollbackAdminDisabled
+        }
+        CoreRollbackAdminAbortDisposition::NoActiveRollback => {
+            RollbackAdminAbortDisposition::NoActiveRollback
+        }
+        CoreRollbackAdminAbortDisposition::HeadMismatch => {
+            RollbackAdminAbortDisposition::HeadMismatch
+        }
+        CoreRollbackAdminAbortDisposition::PointOfNoReturn => {
+            RollbackAdminAbortDisposition::RollbackPointOfNoReturn
+        }
+        CoreRollbackAdminAbortDisposition::Conflict => {
+            RollbackAdminAbortDisposition::RollbackAdmissionConflict
         }
     }
 }
@@ -172,6 +205,7 @@ mod rollback_admin_tests {
 
         for name in [
             "admin_start_rollback_internal",
+            "admin_abort_rollback_internal",
             "admin_get_rollback_status_internal",
             "get_canonical_chain_ref_internal",
         ] {
@@ -301,6 +335,38 @@ mod rollback_admin_tests {
         assert!(parse_rollback_admin_intent(invalid).is_err());
     }
 
+    #[test]
+    fn abort_wire_request_binds_exact_active_identity_and_rejects_zero_reason() {
+        let request = RollbackAdminAbortRequest {
+            request_version: ROLLBACK_ADMIN_ABORT_REQUEST_VERSION,
+            expected_revision: 12,
+            expected_chain_epoch: 3,
+            expected_plan_digest_hex: format!("0x{}", "a5".repeat(32)),
+            reason_code: 19,
+        };
+        let intent = parse_rollback_admin_abort_intent(request.clone()).unwrap();
+        assert_eq!(intent.expected_revision().get(), 12);
+        assert_eq!(intent.expected_chain_epoch(), 3);
+        assert_eq!(intent.expected_plan_digest().as_bytes(), &[0xA5; 32]);
+        assert_eq!(intent.reason_code().get(), 19);
+
+        let mut invalid = request.clone();
+        invalid.reason_code = 0;
+        assert!(parse_rollback_admin_abort_intent(invalid).is_err());
+        let mut invalid = request.clone();
+        invalid.request_version += 1;
+        assert!(parse_rollback_admin_abort_intent(invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("ROLLBACK_ADMIN_UNSUPPORTED_ABORT_REQUEST_VERSION"));
+        let mut invalid = request;
+        invalid.expected_plan_digest_hex = "aa".repeat(31);
+        assert!(parse_rollback_admin_abort_intent(invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("ROLLBACK_ADMIN_INVALID_PLAN_DIGEST_LENGTH"));
+    }
+
     fn chain_ref(checkpoint_id: u64, hash_seed: u64) -> CanonicalChainRef<PHash> {
         CanonicalChainRef::new(
             NetworkId::try_from_chain_id(0x6979_7350).unwrap(),
@@ -421,6 +487,36 @@ fn parse_rollback_admin_intent<Hash: Q256BitHash>(
         fence_window,
         request.topology_revision,
         digest,
+    ))
+}
+
+fn parse_rollback_admin_abort_intent(
+    request: RollbackAdminAbortRequest,
+) -> anyhow::Result<RollbackAdminAbortIntent> {
+    if request.request_version != ROLLBACK_ADMIN_ABORT_REQUEST_VERSION {
+        anyhow::bail!(
+            "ROLLBACK_ADMIN_UNSUPPORTED_ABORT_REQUEST_VERSION:{}",
+            request.request_version
+        );
+    }
+    let digest_hex = request
+        .expected_plan_digest_hex
+        .strip_prefix("0x")
+        .or_else(|| request.expected_plan_digest_hex.strip_prefix("0X"))
+        .unwrap_or(&request.expected_plan_digest_hex);
+    let digest_bytes = hex::decode(digest_hex)
+        .map_err(|error| anyhow::anyhow!("ROLLBACK_ADMIN_INVALID_PLAN_DIGEST:{error}"))?;
+    let digest: [u8; 32] = digest_bytes.try_into().map_err(|bytes: Vec<u8>| {
+        anyhow::anyhow!(
+            "ROLLBACK_ADMIN_INVALID_PLAN_DIGEST_LENGTH:{}",
+            bytes.len()
+        )
+    })?;
+    Ok(RollbackAdminAbortIntent::new(
+        CanonicalHeadRevision::try_new(request.expected_revision)?,
+        request.expected_chain_epoch,
+        RollbackPlanDigest::try_new(digest)?,
+        RollbackAbortReasonCode::try_new(request.reason_code)?,
     ))
 }
 
@@ -626,6 +722,18 @@ impl<
         let receipt = self.rollback_admin_inbox.start_planned(intent).await?;
         Ok(RollbackAdminStartResponse {
             disposition: map_admin_disposition(receipt.disposition()),
+            status: self.map_admin_status(receipt.status()),
+        })
+    }
+
+    pub async fn admin_abort_rollback_internal(
+        &self,
+        request: RollbackAdminAbortRequest,
+    ) -> anyhow::Result<RollbackAdminAbortResponse<N::QHash>> {
+        let intent = parse_rollback_admin_abort_intent(request)?;
+        let receipt = self.rollback_admin_inbox.abort(intent).await?;
+        Ok(RollbackAdminAbortResponse {
+            disposition: map_admin_abort_disposition(receipt.disposition()),
             status: self.map_admin_status(receipt.status()),
         })
     }

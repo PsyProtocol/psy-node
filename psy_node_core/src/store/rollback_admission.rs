@@ -20,7 +20,8 @@ use super::{
         SealedCanonicalHeadCas, StoredCanonicalHead,
     },
     rollback_control::{
-        RollbackControlCodecError, RollbackControlState, RollbackRequest,
+        RollbackAbortReasonCode, RollbackControlCodecError, RollbackControlState,
+        RollbackRequest,
     },
 };
 
@@ -30,6 +31,10 @@ pub const ROLLBACK_ADMISSION_SLOT_V1_LEN: usize = 243;
 
 const SLOT_KIND_EMPTY: u8 = 0;
 const SLOT_KIND_PENDING: u8 = 1;
+const COMMAND_KIND_START: u8 = 0;
+const COMMAND_KIND_ABORT_REQUESTED: u8 = 1;
+const COMMAND_KIND_ABORT_ARCHIVING: u8 = 2;
+const COMMAND_KIND_ABORT_BARRIER_READY: u8 = 3;
 const HEADER_RESERVED_END: usize = 16;
 const EXPECTED_REVISION_START: usize = 16;
 const EXPECTED_REVISION_END: usize = 24;
@@ -96,6 +101,14 @@ impl<Hash: Q256BitHash> RollbackAdmissionCommand<Hash> {
         Ok(Self { sealed })
     }
 
+    pub fn try_abort(
+        expected: StoredCanonicalHead<Hash>,
+        reason_code: RollbackAbortReasonCode,
+    ) -> Result<Self, RollbackAdmissionError> {
+        let sealed = CanonicalHeadTransition::begin_rollback_abort(expected, reason_code)?.seal();
+        Ok(Self { sealed })
+    }
+
     pub const fn sealed(&self) -> &SealedCanonicalHeadCas<Hash> {
         &self.sealed
     }
@@ -107,6 +120,7 @@ impl<Hash: Q256BitHash> RollbackAdmissionCommand<Hash> {
     pub fn request(&self) -> &RollbackRequest<Hash> {
         match self.sealed.candidate().rollback_control() {
             RollbackControlState::Requested(request) => request,
+            RollbackControlState::Aborting(abort) => abort.request(),
             RollbackControlState::Idle => {
                 unreachable!("start-rollback command always carries REQUESTED control")
             }
@@ -116,14 +130,39 @@ impl<Hash: Q256BitHash> RollbackAdmissionCommand<Hash> {
             | RollbackControlState::Restoring(_)
             | RollbackControlState::Verifying(_)
             | RollbackControlState::AllRealmsReady(_) => {
-                unreachable!("admission command cannot contain a post-REQUESTED phase")
+                unreachable!("admission command cannot contain an unsupported active phase")
             }
+        }
+    }
+
+    pub fn kind(&self) -> RollbackAdmissionCommandKind {
+        match self.sealed.kind() {
+            super::canonical_head::CanonicalHeadTransitionKind::StartRollback => {
+                RollbackAdmissionCommandKind::Start
+            }
+            super::canonical_head::CanonicalHeadTransitionKind::BeginRollbackAbort => {
+                RollbackAdmissionCommandKind::Abort
+            }
+            _ => unreachable!("rollback inbox command contains an unsupported transition"),
+        }
+    }
+
+    pub const fn abort_reason_code(&self) -> Option<RollbackAbortReasonCode> {
+        match self.sealed.candidate().rollback_control() {
+            RollbackControlState::Aborting(abort) => Some(abort.reason_code()),
+            _ => None,
         }
     }
 
     pub const fn network_id(&self) -> NetworkId {
         self.sealed.expected().canonical_ref().network_id()
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RollbackAdmissionCommandKind {
+    Start,
+    Abort,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -154,6 +193,19 @@ impl<Hash: Q256BitHash> RollbackAdmissionSlotState<Hash> {
             Self::Empty => encoded[10] = SLOT_KIND_EMPTY,
             Self::Pending(command) => {
                 encoded[10] = SLOT_KIND_PENDING;
+                encoded[11] = match command.kind() {
+                    RollbackAdmissionCommandKind::Start => COMMAND_KIND_START,
+                    RollbackAdmissionCommandKind::Abort => {
+                        match command.expected().rollback_control() {
+                            RollbackControlState::Requested(_) => COMMAND_KIND_ABORT_REQUESTED,
+                            RollbackControlState::Archiving(_) => COMMAND_KIND_ABORT_ARCHIVING,
+                            RollbackControlState::ArchiveBarrierReady(_) => {
+                                COMMAND_KIND_ABORT_BARRIER_READY
+                            }
+                            _ => unreachable!("abort command expected state must be pre-PONR"),
+                        }
+                    }
+                };
                 encoded[EXPECTED_REVISION_START..EXPECTED_REVISION_END]
                     .copy_from_slice(&command.expected().revision().as_i64().to_le_bytes());
                 encoded[EXPECTED_CANONICAL_START..EXPECTED_CANONICAL_END]
@@ -182,17 +234,18 @@ impl<Hash: Q256BitHash> RollbackAdmissionSlotState<Hash> {
         if version != ROLLBACK_ADMISSION_SLOT_CODEC_VERSION {
             return Err(RollbackAdmissionCodecError::UnsupportedVersion(version));
         }
-        if bytes[11..HEADER_RESERVED_END].iter().any(|byte| *byte != 0) {
+        if bytes[12..HEADER_RESERVED_END].iter().any(|byte| *byte != 0) {
             return Err(RollbackAdmissionCodecError::NonCanonicalReservedBytes);
         }
         match bytes[10] {
             SLOT_KIND_EMPTY => {
-                if bytes[EXPECTED_REVISION_START..].iter().any(|byte| *byte != 0) {
+                if bytes[11..].iter().any(|byte| *byte != 0) {
                     return Err(RollbackAdmissionCodecError::NonCanonicalEmpty);
                 }
                 Ok(Self::Empty)
             }
             SLOT_KIND_PENDING => {
+                let command_kind = bytes[11];
                 let expected_revision = i64::from_le_bytes(
                     bytes[EXPECTED_REVISION_START..EXPECTED_REVISION_END]
                         .try_into()
@@ -207,21 +260,60 @@ impl<Hash: Q256BitHash> RollbackAdmissionSlotState<Hash> {
                         payload: expected_ref.network_id(),
                     });
                 }
-                let idle = RollbackControlState::<Hash>::Idle.to_canonical_bytes();
-                let expected = StoredCanonicalHead::decode_persisted(
-                    partition_network,
-                    expected_revision,
-                    &bytes[EXPECTED_CANONICAL_START..EXPECTED_CANONICAL_END],
-                    &idle,
-                )?;
-                let requested = RollbackControlState::from_canonical_bytes(
+                let candidate_control = RollbackControlState::from_canonical_bytes(
                     &bytes[REQUESTED_CONTROL_START..],
                 )?;
-                let request = requested
-                    .requested()
-                    .copied()
-                    .ok_or(RollbackAdmissionCodecError::PendingMustCarryRequestedControl)?;
-                let command = RollbackAdmissionCommand::try_new(expected, request)?;
+                let command = match command_kind {
+                    COMMAND_KIND_START => {
+                        let request = candidate_control
+                            .requested()
+                            .copied()
+                            .filter(|_| matches!(candidate_control, RollbackControlState::Requested(_)))
+                            .ok_or(
+                                RollbackAdmissionCodecError::PendingMustCarryRequestedControl,
+                            )?;
+                        let idle = RollbackControlState::<Hash>::Idle.to_canonical_bytes();
+                        let expected = StoredCanonicalHead::decode_persisted(
+                            partition_network,
+                            expected_revision,
+                            &bytes[EXPECTED_CANONICAL_START..EXPECTED_CANONICAL_END],
+                            &idle,
+                        )?;
+                        RollbackAdmissionCommand::try_new(expected, request)?
+                    }
+                    COMMAND_KIND_ABORT_REQUESTED
+                    | COMMAND_KIND_ABORT_ARCHIVING
+                    | COMMAND_KIND_ABORT_BARRIER_READY => {
+                        let abort = candidate_control
+                            .aborting()
+                            .copied()
+                            .ok_or(
+                                RollbackAdmissionCodecError::PendingAbortMustCarryAbortingControl,
+                            )?;
+                        let expected_control = match command_kind {
+                            COMMAND_KIND_ABORT_REQUESTED => {
+                                RollbackControlState::Requested(*abort.request())
+                            }
+                            COMMAND_KIND_ABORT_ARCHIVING => {
+                                RollbackControlState::Archiving(*abort.request())
+                            }
+                            COMMAND_KIND_ABORT_BARRIER_READY => {
+                                RollbackControlState::ArchiveBarrierReady(*abort.request())
+                            }
+                            _ => unreachable!("abort command kinds were exhaustively matched"),
+                        };
+                        let expected = StoredCanonicalHead::decode_persisted(
+                            partition_network,
+                            expected_revision,
+                            &bytes[EXPECTED_CANONICAL_START..EXPECTED_CANONICAL_END],
+                            &expected_control.to_canonical_bytes(),
+                        )?;
+                        RollbackAdmissionCommand::try_abort(expected, abort.reason_code())?
+                    }
+                    other => {
+                        return Err(RollbackAdmissionCodecError::UnknownCommandKind(other));
+                    }
+                };
                 Ok(Self::Pending(command))
             }
             other => Err(RollbackAdmissionCodecError::UnknownSlotKind(other)),
@@ -558,10 +650,11 @@ impl<Hash: Q256BitHash + Send + Sync + 'static>
             CanonicalHeadWriteOutcome::Applied(head)
             | CanonicalHeadWriteOutcome::Idempotent(head) => (head, true),
             CanonicalHeadWriteOutcome::Conflict { current } => {
-                let same_active_request = current
-                    .rollback_control()
-                    .requested()
-                    .is_some_and(|request| request == command.request());
+                let same_active_request = command.kind() == RollbackAdmissionCommandKind::Start
+                    && current
+                        .rollback_control()
+                        .requested()
+                        .is_some_and(|request| request == command.request());
                 (current, same_active_request)
             }
         };
@@ -648,9 +741,11 @@ pub enum RollbackAdmissionCodecError {
     InvalidMagic,
     UnsupportedVersion(u16),
     UnknownSlotKind(u8),
+    UnknownCommandKind(u8),
     NonCanonicalReservedBytes,
     NonCanonicalEmpty,
     PendingMustCarryRequestedControl,
+    PendingAbortMustCarryAbortingControl,
     PartitionNetworkMismatch {
         partition: NetworkId,
         payload: NetworkId,
@@ -672,6 +767,9 @@ impl fmt::Display for RollbackAdmissionCodecError {
                 write!(formatter, "unsupported rollback admission inbox version {version}")
             }
             Self::UnknownSlotKind(kind) => write!(formatter, "unknown inbox slot kind {kind}"),
+            Self::UnknownCommandKind(kind) => {
+                write!(formatter, "unknown rollback inbox command kind {kind}")
+            }
             Self::NonCanonicalReservedBytes => {
                 formatter.write_str("rollback admission inbox reserved bytes are non-zero")
             }
@@ -680,6 +778,9 @@ impl fmt::Display for RollbackAdmissionCodecError {
             }
             Self::PendingMustCarryRequestedControl => {
                 formatter.write_str("pending inbox must carry REQUESTED control")
+            }
+            Self::PendingAbortMustCarryAbortingControl => {
+                formatter.write_str("pending abort inbox must carry ABORTING control")
             }
             Self::PartitionNetworkMismatch { partition, payload } => write!(
                 formatter,
@@ -1024,7 +1125,7 @@ mod tests {
         );
 
         let mut malformed = pending_bytes;
-        malformed[11] = 1;
+        malformed[12] = 1;
         assert_eq!(
             RollbackAdmissionSlotState::<PHash>::from_canonical_bytes(network, &malformed),
             Err(RollbackAdmissionCodecError::NonCanonicalReservedBytes)
@@ -1034,6 +1135,46 @@ mod tests {
         assert_eq!(
             RollbackAdmissionSlotState::<PHash>::from_canonical_bytes(network, &unknown),
             Err(RollbackAdmissionCodecError::UnsupportedVersion(2))
+        );
+    }
+
+    #[test]
+    fn abort_command_codec_preserves_exact_pre_ponr_origin_and_reason() {
+        let network = NetworkId::from(PsyChainNetworkType::PsyMainnet);
+        let requested = *command().sealed().candidate();
+        let archiving = *CanonicalHeadTransition::begin_rollback_archive(requested)
+            .unwrap()
+            .candidate();
+        let barrier = *CanonicalHeadTransition::complete_rollback_archive_barrier(archiving)
+            .unwrap()
+            .candidate();
+        let reason = RollbackAbortReasonCode::try_new(9).unwrap();
+
+        for (expected, encoded_kind) in [
+            (requested, COMMAND_KIND_ABORT_REQUESTED),
+            (archiving, COMMAND_KIND_ABORT_ARCHIVING),
+            (barrier, COMMAND_KIND_ABORT_BARRIER_READY),
+        ] {
+            let command = RollbackAdmissionCommand::try_abort(expected, reason).unwrap();
+            assert_eq!(command.kind(), RollbackAdmissionCommandKind::Abort);
+            assert_eq!(command.abort_reason_code(), Some(reason));
+            let state = RollbackAdmissionSlotState::Pending(command);
+            let bytes = state.to_canonical_bytes();
+            assert_eq!(bytes[11], encoded_kind);
+            assert_eq!(
+                RollbackAdmissionSlotState::from_canonical_bytes(network, &bytes).unwrap(),
+                state
+            );
+        }
+
+        let deleting = *CanonicalHeadTransition::begin_rollback_delete(barrier)
+            .unwrap()
+            .candidate();
+        assert_eq!(
+            RollbackAdmissionCommand::try_abort(deleting, reason),
+            Err(RollbackAdmissionError::CanonicalHead(
+                CanonicalHeadModelError::RollbackPointOfNoReturn
+            ))
         );
     }
 
@@ -1069,6 +1210,35 @@ mod tests {
         assert_eq!(command.sealed().kind(), CanonicalHeadTransitionKind::StartRollback);
         assert_eq!(command.request().target().checkpoint_id().get(), 90);
         assert_eq!(command.expected().canonical_ref().checkpoint().checkpoint_id().get(), 100);
+    }
+
+    #[tokio::test]
+    async fn processor_boundary_is_the_only_abort_head_writer_and_clears_inbox() {
+        let network = NetworkId::from(PsyChainNetworkType::PsyMainnet);
+        let requested = *command().sealed().candidate();
+        let canonical = Arc::new(MemoryCanonicalStore::with_current(requested));
+        let inbox = Arc::new(MemoryAdmissionStore::with_empty(network));
+        let reason = RollbackAbortReasonCode::try_new(17).unwrap();
+        let abort = RollbackAdmissionCommand::try_abort(requested, reason).unwrap();
+        offer(network, &inbox, abort).await;
+
+        let boundary = CoordinatorRollbackAdmissionBoundary::new(
+            network,
+            canonical.clone(),
+            inbox.clone(),
+        );
+        let outcome = boundary.reconcile_at_loop_boundary().await.unwrap();
+        assert!(matches!(outcome, RollbackAdmissionBoundaryOutcome::Maintenance(_)));
+        assert_eq!(
+            outcome
+                .canonical_head()
+                .rollback_control()
+                .aborting()
+                .unwrap()
+                .reason_code(),
+            reason
+        );
+        assert!(inbox.current().state().is_empty());
     }
 
     #[test]

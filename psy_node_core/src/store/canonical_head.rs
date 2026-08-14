@@ -258,6 +258,8 @@ pub enum CanonicalHeadTransitionKind {
     BeginRollbackVerify,
     CompleteRollbackRealmBarrier,
     CompleteRollback,
+    BeginRollbackAbort,
+    CompleteRollbackAbort,
 }
 
 /// A validated transition before its canonical payloads are sealed.
@@ -354,7 +356,8 @@ impl<Hash: Q256BitHash> CanonicalHeadTransition<Hash> {
             | RollbackControlState::Deleting(_)
             | RollbackControlState::Restoring(_)
             | RollbackControlState::Verifying(_)
-            | RollbackControlState::AllRealmsReady(_) => {
+            | RollbackControlState::AllRealmsReady(_)
+            | RollbackControlState::Aborting(_) => {
                 return Err(CanonicalHeadModelError::RollbackArchiveAlreadyStarted);
             }
         };
@@ -497,6 +500,61 @@ impl<Hash: Q256BitHash> CanonicalHeadTransition<Hash> {
             candidate: StoredCanonicalHead {
                 revision: expected.revision.checked_next()?,
                 canonical_ref: restored,
+                rollback_control: RollbackControlState::Idle,
+            },
+        })
+    }
+
+    /// Enter the durable pre-PONR abort phase without changing the opened
+    /// epoch or the still-published old checkpoint.
+    pub fn begin_rollback_abort(
+        expected: StoredCanonicalHead<Hash>,
+        reason_code: super::rollback_control::RollbackAbortReasonCode,
+    ) -> Result<Self, CanonicalHeadModelError> {
+        let request = match expected.rollback_control() {
+            RollbackControlState::Requested(request)
+            | RollbackControlState::Archiving(request)
+            | RollbackControlState::ArchiveBarrierReady(request) => *request,
+            RollbackControlState::Deleting(_)
+            | RollbackControlState::Restoring(_)
+            | RollbackControlState::Verifying(_)
+            | RollbackControlState::AllRealmsReady(_) => {
+                return Err(CanonicalHeadModelError::RollbackPointOfNoReturn);
+            }
+            RollbackControlState::Aborting(_) => {
+                return Err(CanonicalHeadModelError::RollbackAbortAlreadyStarted);
+            }
+            RollbackControlState::Idle => {
+                return Err(CanonicalHeadModelError::RollbackNotActiveForAbort);
+            }
+        };
+        Ok(Self {
+            kind: CanonicalHeadTransitionKind::BeginRollbackAbort,
+            expected,
+            candidate: StoredCanonicalHead {
+                revision: expected.revision.checked_next()?,
+                canonical_ref: *expected.canonical_ref(),
+                rollback_control: RollbackControlState::Aborting(
+                    super::rollback_control::RollbackAbort::new(request, reason_code),
+                ),
+            },
+        })
+    }
+
+    /// Return to IDLE only after Coordinator and every Realm have rotated
+    /// away from the aborted request's pending/proc contexts.
+    pub fn complete_rollback_abort(
+        expected: StoredCanonicalHead<Hash>,
+    ) -> Result<Self, CanonicalHeadModelError> {
+        if !matches!(expected.rollback_control(), RollbackControlState::Aborting(_)) {
+            return Err(CanonicalHeadModelError::RollbackAbortNotActive);
+        }
+        Ok(Self {
+            kind: CanonicalHeadTransitionKind::CompleteRollbackAbort,
+            expected,
+            candidate: StoredCanonicalHead {
+                revision: expected.revision.checked_next()?,
+                canonical_ref: *expected.canonical_ref(),
                 rollback_control: RollbackControlState::Idle,
             },
         })
@@ -819,6 +877,10 @@ pub enum CanonicalHeadModelError {
     RollbackRestoreNotActive,
     RollbackVerifyNotActive,
     RollbackRealmsNotReady,
+    RollbackNotActiveForAbort,
+    RollbackAbortAlreadyStarted,
+    RollbackAbortNotActive,
+    RollbackPointOfNoReturn,
     RollbackRequestedHeadMismatch,
     RequestedControlAtEpochZero,
     AppliedStateMismatch,
@@ -905,6 +967,18 @@ impl fmt::Display for CanonicalHeadModelError {
             Self::RollbackRealmsNotReady => formatter.write_str(
                 "rollback target can be published only from the exact ALL_REALMS_READY phase",
             ),
+            Self::RollbackNotActiveForAbort => formatter.write_str(
+                "rollback abort requires an active pre-PONR rollback",
+            ),
+            Self::RollbackAbortAlreadyStarted => {
+                formatter.write_str("rollback abort is already active")
+            }
+            Self::RollbackAbortNotActive => formatter.write_str(
+                "rollback abort completion requires the exact ABORTING phase",
+            ),
+            Self::RollbackPointOfNoReturn => formatter.write_str(
+                "ROLLBACK_POINT_OF_NO_RETURN: destructive rollback work has started",
+            ),
             Self::RollbackRequestedHeadMismatch => formatter.write_str(
                 "rollback request head must equal the exact current canonical checkpoint",
             ),
@@ -968,7 +1042,8 @@ mod tests {
     };
     use crate::store::{
         rollback_control::{
-            RollbackExecutionMode, RollbackPlanDigest, RollbackRequest,
+            RollbackAbortReasonCode, RollbackExecutionMode, RollbackPlanDigest,
+            RollbackRequest,
         },
         timestamp::{CommitWriteTimestampUs, TimestampFenceWindow},
     };
@@ -1270,6 +1345,75 @@ mod tests {
                 *archiving.candidate()
             ),
             Err(CanonicalHeadModelError::RollbackArchiveAlreadyStarted)
+        );
+    }
+
+    #[test]
+    fn rollback_abort_is_pre_ponr_only_and_returns_to_idle_without_rewinding_head() {
+        let head = canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 10, 50);
+        let target = *canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 7, 40)
+            .checkpoint();
+        let request = rollback_request(*head.checkpoint(), target);
+        let requested = CanonicalHeadTransition::start_rollback(
+            stored_for_test(head),
+            request,
+        )
+        .unwrap();
+        let archiving = CanonicalHeadTransition::begin_rollback_archive(
+            *requested.candidate(),
+        )
+        .unwrap();
+        let barrier = CanonicalHeadTransition::complete_rollback_archive_barrier(
+            *archiving.candidate(),
+        )
+        .unwrap();
+        let reason = RollbackAbortReasonCode::try_new(42).unwrap();
+
+        for expected in [
+            *requested.candidate(),
+            *archiving.candidate(),
+            *barrier.candidate(),
+        ] {
+            let aborting = CanonicalHeadTransition::begin_rollback_abort(expected, reason)
+                .unwrap();
+            assert_eq!(aborting.kind(), CanonicalHeadTransitionKind::BeginRollbackAbort);
+            assert_eq!(aborting.candidate().canonical_ref(), expected.canonical_ref());
+            assert_eq!(aborting.candidate().revision().get(), expected.revision().get() + 1);
+            assert_eq!(
+                aborting
+                    .candidate()
+                    .rollback_control()
+                    .aborting()
+                    .unwrap()
+                    .reason_code(),
+                reason
+            );
+            assert!(!aborting.candidate().rollback_control().destructive_started());
+
+            let idle = CanonicalHeadTransition::complete_rollback_abort(
+                *aborting.candidate(),
+            )
+            .unwrap();
+            assert_eq!(idle.kind(), CanonicalHeadTransitionKind::CompleteRollbackAbort);
+            assert_eq!(idle.candidate().canonical_ref(), expected.canonical_ref());
+            assert!(idle.candidate().rollback_control().is_idle());
+        }
+
+        let deleting = CanonicalHeadTransition::begin_rollback_delete(
+            *barrier.candidate(),
+        )
+        .unwrap();
+        assert_eq!(
+            CanonicalHeadTransition::begin_rollback_abort(*deleting.candidate(), reason),
+            Err(CanonicalHeadModelError::RollbackPointOfNoReturn)
+        );
+        assert_eq!(
+            CanonicalHeadTransition::begin_rollback_abort(stored_for_test(head), reason),
+            Err(CanonicalHeadModelError::RollbackNotActiveForAbort)
+        );
+        assert_eq!(
+            CanonicalHeadTransition::complete_rollback_abort(*requested.candidate()),
+            Err(CanonicalHeadModelError::RollbackAbortNotActive)
         );
     }
 

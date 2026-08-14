@@ -68,6 +68,11 @@ where
         RollbackControlState::Requested(_) => {
             return Ok(CoordinatorRollbackGlobalProgress::Progressed(initial));
         }
+        RollbackControlState::Aborting(_) => {
+            // Abort convergence has its own all-participant runtime barrier;
+            // the destructive rollback driver must never consume this phase.
+            return Ok(CoordinatorRollbackGlobalProgress::Progressed(initial));
+        }
         RollbackControlState::Restoring(_) => {
             return progress_restoring::<Hash>(
                 session,

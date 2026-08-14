@@ -1,10 +1,9 @@
 //! Driver-independent rollback admission data stored beside the canonical head.
 //!
 //! Rollback phases extend this one sealed authority instead of creating a
-//! second independently writable control row.  The current public transition
-//! surface stops at `ARCHIVING`; archive-barrier and destructive transitions
-//! require future storage-owned evidence and therefore have no constructor in
-//! this slice.
+//! second independently writable control row. Destructive and completion
+//! transitions are sealed by their storage-owned callers; a pre-PONR abort
+//! remains non-destructive until every participant has rotated its runtime.
 
 use std::{error::Error, fmt};
 
@@ -30,6 +29,28 @@ const PHASE_DELETING: u8 = 4;
 const PHASE_RESTORING: u8 = 5;
 const PHASE_VERIFYING: u8 = 6;
 const PHASE_ALL_REALMS_READY: u8 = 7;
+const PHASE_ABORTING: u8 = 8;
+
+/// Stable operator-selected reason attached to a pre-PONR abort.
+///
+/// Zero is reserved so an `ABORTING` payload can never be confused with an
+/// older active-phase payload whose abort field was left empty.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RollbackAbortReasonCode(u32);
+
+impl RollbackAbortReasonCode {
+    pub const fn try_new(value: u32) -> Result<Self, RollbackControlError> {
+        if value == 0 {
+            Err(RollbackControlError::ZeroAbortReasonCode)
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RollbackPlanDigest([u8; 32]);
@@ -71,6 +92,32 @@ pub struct RollbackRequest<Hash> {
     fence_window: TimestampFenceWindow,
     execution_mode: RollbackExecutionMode,
     plan_digest: RollbackPlanDigest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RollbackAbort<Hash> {
+    request: RollbackRequest<Hash>,
+    reason_code: RollbackAbortReasonCode,
+}
+
+impl<Hash> RollbackAbort<Hash> {
+    pub const fn new(
+        request: RollbackRequest<Hash>,
+        reason_code: RollbackAbortReasonCode,
+    ) -> Self {
+        Self {
+            request,
+            reason_code,
+        }
+    }
+
+    pub const fn request(&self) -> &RollbackRequest<Hash> {
+        &self.request
+    }
+
+    pub const fn reason_code(&self) -> RollbackAbortReasonCode {
+        self.reason_code
+    }
 }
 
 impl<Hash> RollbackRequest<Hash> {
@@ -129,6 +176,7 @@ pub enum RollbackControlState<Hash> {
     Restoring(RollbackRequest<Hash>),
     Verifying(RollbackRequest<Hash>),
     AllRealmsReady(RollbackRequest<Hash>),
+    Aborting(RollbackAbort<Hash>),
 }
 
 impl<Hash> RollbackControlState<Hash> {
@@ -146,6 +194,7 @@ impl<Hash> RollbackControlState<Hash> {
             | Self::Restoring(request)
             | Self::Verifying(request)
             | Self::AllRealmsReady(request) => Some(request),
+            Self::Aborting(abort) => Some(abort.request()),
         }
     }
 
@@ -165,6 +214,13 @@ impl<Hash> RollbackControlState<Hash> {
                 | Self::Verifying(_)
                 | Self::AllRealmsReady(_)
         )
+    }
+
+    pub const fn aborting(&self) -> Option<&RollbackAbort<Hash>> {
+        match self {
+            Self::Aborting(abort) => Some(abort),
+            _ => None,
+        }
     }
 }
 
@@ -193,7 +249,9 @@ impl<Hash: Q256BitHash> RollbackControlState<Hash> {
                     Self::Restoring(_) => PHASE_RESTORING,
                     Self::Verifying(_) => PHASE_VERIFYING,
                     Self::AllRealmsReady(_) => PHASE_ALL_REALMS_READY,
-                    Self::Idle => unreachable!("active rollback arm excludes IDLE"),
+                    Self::Idle | Self::Aborting(_) => {
+                        unreachable!("regular active rollback arm excludes IDLE/ABORTING")
+                    }
                 };
                 encode_checkpoint_ref(&mut encoded[12..52], request.requested_head());
                 encode_checkpoint_ref(&mut encoded[52..92], request.target());
@@ -216,6 +274,36 @@ impl<Hash: Q256BitHash> RollbackControlState<Hash> {
                 // abort_code=0, error_code=0.  The destructive flag becomes
                 // true only after the global archive barrier.
                 encoded[149] = u8::from(self.destructive_started());
+            }
+            Self::Aborting(abort) => {
+                let request = abort.request();
+                encoded[10] = CONTROL_KIND_REQUESTED;
+                encoded[11] = PHASE_ABORTING;
+                encode_checkpoint_ref(&mut encoded[12..52], request.requested_head());
+                encode_checkpoint_ref(&mut encoded[52..92], request.target());
+                encoded[92..100].copy_from_slice(
+                    &request
+                        .fence_window()
+                        .delete_fence()
+                        .orphan_write_max()
+                        .as_i64()
+                        .to_le_bytes(),
+                );
+                encoded[100..108]
+                    .copy_from_slice(&request.fence_window().delete_fence().as_i64().to_le_bytes());
+                encoded[108..116].copy_from_slice(
+                    &request
+                        .fence_window()
+                        .new_branch_write()
+                        .as_commit_timestamp()
+                        .as_i64()
+                        .to_le_bytes(),
+                );
+                encoded[116] = request.execution_mode() as u8;
+                encoded[117..149].copy_from_slice(request.plan_digest().as_bytes());
+                encoded[149] = 0;
+                encoded[150..154]
+                    .copy_from_slice(&abort.reason_code().get().to_le_bytes());
             }
         }
         encoded
@@ -253,11 +341,18 @@ impl<Hash: Q256BitHash> RollbackControlState<Hash> {
                         | PHASE_RESTORING
                         | PHASE_VERIFYING
                         | PHASE_ALL_REALMS_READY
+                        | PHASE_ABORTING
                 ) {
                     return Err(RollbackControlCodecError::UnknownPhase(phase));
                 }
-                if bytes[150..154].iter().any(|byte| *byte != 0) {
-                    return Err(RollbackControlCodecError::AbortAndErrorCodesUnsupported);
+                let abort_reason = u32::from_le_bytes(
+                    bytes[150..154].try_into().expect("fixed abort-reason slice"),
+                );
+                if phase == PHASE_ABORTING && abort_reason == 0 {
+                    return Err(RollbackControlCodecError::AbortingRequiresReason);
+                }
+                if phase != PHASE_ABORTING && abort_reason != 0 {
+                    return Err(RollbackControlCodecError::UnexpectedAbortReason);
                 }
                 let destructive = bytes[149];
                 if destructive > 1 {
@@ -265,12 +360,26 @@ impl<Hash: Q256BitHash> RollbackControlState<Hash> {
                         destructive,
                     ));
                 }
-                if phase >= PHASE_DELETING && destructive != 1 {
+                if matches!(
+                    phase,
+                    PHASE_DELETING
+                        | PHASE_RESTORING
+                        | PHASE_VERIFYING
+                        | PHASE_ALL_REALMS_READY
+                ) && destructive != 1
+                {
                     return Err(
                         RollbackControlCodecError::DeletingMustBeDestructive,
                     );
                 }
-                if phase < PHASE_DELETING && destructive != 0 {
+                if matches!(
+                    phase,
+                    PHASE_REQUESTED
+                        | PHASE_ARCHIVING
+                        | PHASE_ARCHIVE_BARRIER_READY
+                        | PHASE_ABORTING
+                ) && destructive != 0
+                {
                     return Err(
                         RollbackControlCodecError::PreBarrierPhaseMustBeNonDestructive,
                     );
@@ -307,6 +416,10 @@ impl<Hash: Q256BitHash> RollbackControlState<Hash> {
                     PHASE_RESTORING => Self::Restoring(request),
                     PHASE_VERIFYING => Self::Verifying(request),
                     PHASE_ALL_REALMS_READY => Self::AllRealmsReady(request),
+                    PHASE_ABORTING => Self::Aborting(RollbackAbort::new(
+                        request,
+                        RollbackAbortReasonCode::try_new(abort_reason)?,
+                    )),
                     _ => unreachable!("phase validated above"),
                 })
             }
@@ -332,6 +445,7 @@ fn decode_checkpoint_ref<Hash: Q256BitHash>(input: &[u8]) -> CheckpointRef<Hash>
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RollbackControlError {
     ZeroPlanDigest,
+    ZeroAbortReasonCode,
     TargetMustPrecedeRequestedHead {
         requested_height: u64,
         target_height: u64,
@@ -343,6 +457,9 @@ impl fmt::Display for RollbackControlError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ZeroPlanDigest => write!(formatter, "rollback plan digest cannot be zero"),
+            Self::ZeroAbortReasonCode => {
+                write!(formatter, "rollback abort reason code cannot be zero")
+            }
             Self::TargetMustPrecedeRequestedHead {
                 requested_height,
                 target_height,
@@ -375,7 +492,8 @@ pub enum RollbackControlCodecError {
     InvalidDestructiveFlag(u8),
     PreBarrierPhaseMustBeNonDestructive,
     DeletingMustBeDestructive,
-    AbortAndErrorCodesUnsupported,
+    AbortingRequiresReason,
+    UnexpectedAbortReason,
     Model(RollbackControlError),
 }
 
@@ -403,8 +521,11 @@ impl fmt::Display for RollbackControlCodecError {
             Self::DeletingMustBeDestructive => formatter.write_str(
                 "DELETING rollback control must carry destructive_started=true",
             ),
-            Self::AbortAndErrorCodesUnsupported => formatter.write_str(
-                "rollback abort/error codes are not supported by control codec v1",
+            Self::AbortingRequiresReason => {
+                formatter.write_str("ABORTING rollback control requires a non-zero reason code")
+            }
+            Self::UnexpectedAbortReason => formatter.write_str(
+                "non-ABORTING rollback control cannot carry an abort reason code",
             ),
             Self::Model(error) => error.fmt(formatter),
         }
@@ -496,6 +617,10 @@ mod tests {
             RollbackControlState::Restoring(request()),
             RollbackControlState::Verifying(request()),
             RollbackControlState::AllRealmsReady(request()),
+            RollbackControlState::Aborting(RollbackAbort::new(
+                request(),
+                RollbackAbortReasonCode::try_new(7).unwrap(),
+            )),
         ] {
             let encoded = state.to_canonical_bytes();
             assert_eq!(
@@ -522,6 +647,18 @@ mod tests {
             RollbackControlState::AllRealmsReady(request())
                 .to_canonical_bytes()[149],
             1
+        );
+        let aborting = RollbackControlState::Aborting(RollbackAbort::new(
+            request(),
+            RollbackAbortReasonCode::try_new(7).unwrap(),
+        ));
+        let aborting_bytes = aborting.to_canonical_bytes();
+        assert_eq!(aborting_bytes[11], PHASE_ABORTING);
+        assert_eq!(aborting_bytes[149], 0);
+        assert_eq!(&aborting_bytes[150..154], &7_u32.to_le_bytes());
+        assert_eq!(
+            RollbackControlState::from_canonical_bytes(&aborting_bytes).unwrap(),
+            aborting
         );
     }
 
@@ -550,6 +687,10 @@ mod tests {
         assert_eq!(
             RollbackPlanDigest::try_new([0; 32]),
             Err(RollbackControlError::ZeroPlanDigest)
+        );
+        assert_eq!(
+            RollbackAbortReasonCode::try_new(0),
+            Err(RollbackControlError::ZeroAbortReasonCode)
         );
         assert!(TimestampFenceWindow::try_new(
             CommitWriteTimestampUs::try_from_i128(1_000).unwrap(),
@@ -656,13 +797,21 @@ mod tests {
             ),
             Err(RollbackControlCodecError::DeletingMustBeDestructive)
         );
-        let mut unsupported_abort = requested;
-        unsupported_abort[150] = 1;
+        let mut unexpected_abort = requested;
+        unexpected_abort[150] = 1;
         assert_eq!(
             RollbackControlState::<PHash>::from_canonical_bytes(
-                &unsupported_abort
+                &unexpected_abort
             ),
-            Err(RollbackControlCodecError::AbortAndErrorCodesUnsupported)
+            Err(RollbackControlCodecError::UnexpectedAbortReason)
+        );
+        let mut abort_without_reason = requested;
+        abort_without_reason[11] = PHASE_ABORTING;
+        assert_eq!(
+            RollbackControlState::<PHash>::from_canonical_bytes(
+                &abort_without_reason
+            ),
+            Err(RollbackControlCodecError::AbortingRequiresReason)
         );
     }
 }

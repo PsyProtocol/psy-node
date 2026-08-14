@@ -26,7 +26,10 @@ use super::{
         RollbackAdmissionSlotWriteOutcome, SealedRollbackAdmissionSlotCas,
         StoredRollbackAdmissionSlot,
     },
-    rollback_control::{RollbackExecutionMode, RollbackPlanDigest, RollbackRequest},
+    rollback_control::{
+        RollbackAbortReasonCode, RollbackControlState, RollbackExecutionMode,
+        RollbackPlanDigest, RollbackRequest,
+    },
     rollback_participant_plan::{
         CoordinatorRollbackParticipantPlanStore, RollbackParticipantPlan,
     },
@@ -283,6 +286,75 @@ pub struct RollbackAdminStartReceipt<Hash> {
     status: RollbackAdminInboxStatus<Hash>,
 }
 
+/// Explicit pre-PONR cancellation intent.  The revision, epoch, and plan
+/// digest prevent an operator retry from cancelling a different rollback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RollbackAdminAbortIntent {
+    expected_revision: CanonicalHeadRevision,
+    expected_chain_epoch: u64,
+    expected_plan_digest: RollbackPlanDigest,
+    reason_code: RollbackAbortReasonCode,
+}
+
+impl RollbackAdminAbortIntent {
+    pub const fn new(
+        expected_revision: CanonicalHeadRevision,
+        expected_chain_epoch: u64,
+        expected_plan_digest: RollbackPlanDigest,
+        reason_code: RollbackAbortReasonCode,
+    ) -> Self {
+        Self {
+            expected_revision,
+            expected_chain_epoch,
+            expected_plan_digest,
+            reason_code,
+        }
+    }
+
+    pub const fn expected_revision(&self) -> CanonicalHeadRevision {
+        self.expected_revision
+    }
+
+    pub const fn expected_chain_epoch(&self) -> u64 {
+        self.expected_chain_epoch
+    }
+
+    pub const fn expected_plan_digest(&self) -> RollbackPlanDigest {
+        self.expected_plan_digest
+    }
+
+    pub const fn reason_code(&self) -> RollbackAbortReasonCode {
+        self.reason_code
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RollbackAdminAbortDisposition {
+    Accepted,
+    Idempotent,
+    Disabled,
+    NoActiveRollback,
+    HeadMismatch,
+    PointOfNoReturn,
+    Conflict,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RollbackAdminAbortReceipt<Hash> {
+    disposition: RollbackAdminAbortDisposition,
+    status: RollbackAdminInboxStatus<Hash>,
+}
+
+impl<Hash> RollbackAdminAbortReceipt<Hash> {
+    pub const fn disposition(&self) -> RollbackAdminAbortDisposition {
+        self.disposition
+    }
+
+    pub const fn status(&self) -> &RollbackAdminInboxStatus<Hash> {
+        &self.status
+    }
+}
+
 impl<Hash> RollbackAdminStartReceipt<Hash> {
     pub const fn disposition(&self) -> RollbackAdminStartDisposition {
         self.disposition
@@ -430,6 +502,106 @@ impl<Hash: Q256BitHash + Send + Sync + 'static> CoordinatorRollbackAdminInbox<Ha
                 Err(error)
             }
         }
+    }
+
+    /// Queue an explicit abort for the exact active rollback.  Edge only
+    /// writes the inbox; the Processor remains the sole canonical-head writer.
+    pub async fn abort(
+        &self,
+        intent: RollbackAdminAbortIntent,
+    ) -> anyhow::Result<RollbackAdminAbortReceipt<Hash>> {
+        let observed = self.status().await?;
+        if self.access == RollbackAdminInboxAccess::Disabled {
+            return Ok(abort_receipt(
+                RollbackAdminAbortDisposition::Disabled,
+                observed,
+            ));
+        }
+        let control = observed.canonical_head.rollback_control();
+        let Some(request) = control.requested() else {
+            return Ok(abort_receipt(
+                RollbackAdminAbortDisposition::NoActiveRollback,
+                observed,
+            ));
+        };
+        if control.destructive_started() {
+            return Ok(abort_receipt(
+                RollbackAdminAbortDisposition::PointOfNoReturn,
+                observed,
+            ));
+        }
+        if observed.canonical_head.revision() != intent.expected_revision
+            || observed.canonical_head.canonical_ref().chain_epoch().get()
+                != intent.expected_chain_epoch
+            || request.plan_digest() != intent.expected_plan_digest
+        {
+            return Ok(abort_receipt(
+                RollbackAdminAbortDisposition::HeadMismatch,
+                observed,
+            ));
+        }
+        if let RollbackControlState::Aborting(abort) = control {
+            return Ok(abort_receipt(
+                if abort.reason_code() == intent.reason_code {
+                    RollbackAdminAbortDisposition::Idempotent
+                } else {
+                    RollbackAdminAbortDisposition::Conflict
+                },
+                observed,
+            ));
+        }
+
+        let command = RollbackAdmissionCommand::try_abort(
+            observed.canonical_head,
+            intent.reason_code,
+        )?;
+        match observed.admission_slot.state() {
+            RollbackAdmissionSlotState::Pending(current) if *current == command => {
+                return Ok(abort_receipt(
+                    RollbackAdminAbortDisposition::Idempotent,
+                    observed,
+                ));
+            }
+            RollbackAdmissionSlotState::Pending(_) => {
+                return Ok(abort_receipt(
+                    RollbackAdminAbortDisposition::Conflict,
+                    observed,
+                ));
+            }
+            RollbackAdmissionSlotState::Empty => {}
+        }
+
+        let offer = SealedRollbackAdmissionSlotCas::offer(
+            self.network,
+            observed.admission_slot,
+            command,
+        )?;
+        let (disposition, slot) = match self
+            .admission_store
+            .compare_and_set_rollback_admission_slot(&offer)
+            .await?
+        {
+            RollbackAdmissionSlotWriteOutcome::Applied(slot) => {
+                (RollbackAdminAbortDisposition::Accepted, slot)
+            }
+            RollbackAdmissionSlotWriteOutcome::Idempotent(slot) => {
+                (RollbackAdminAbortDisposition::Idempotent, slot)
+            }
+            RollbackAdmissionSlotWriteOutcome::Conflict { current }
+                if current.state().pending() == Some(&command) =>
+            {
+                (RollbackAdminAbortDisposition::Idempotent, current)
+            }
+            RollbackAdmissionSlotWriteOutcome::Conflict { current } => {
+                (RollbackAdminAbortDisposition::Conflict, current)
+            }
+        };
+        let receipt = abort_receipt(
+            disposition,
+            classify_status(observed.canonical_head, slot),
+        );
+        self.cache_status(receipt.status()).await;
+        Ok(receipt)
     }
 
     async fn read_status_fresh(&self) -> anyhow::Result<RollbackAdminInboxStatus<Hash>> {
@@ -631,6 +803,16 @@ const fn receipt<Hash>(
     status: RollbackAdminInboxStatus<Hash>,
 ) -> RollbackAdminStartReceipt<Hash> {
     RollbackAdminStartReceipt {
+        disposition,
+        status,
+    }
+}
+
+const fn abort_receipt<Hash>(
+    disposition: RollbackAdminAbortDisposition,
+    status: RollbackAdminInboxStatus<Hash>,
+) -> RollbackAdminAbortReceipt<Hash> {
+    RollbackAdminAbortReceipt {
         disposition,
         status,
     }
@@ -915,6 +1097,40 @@ mod tests {
         )
     }
 
+    fn active_requested_head(fixture: &Fixture) -> StoredCanonicalHead<PHash> {
+        let request = RollbackRequest::try_new(
+            *fixture.head.canonical_ref().checkpoint(),
+            checkpoint(90, 20),
+            TimestampFenceWindow::try_new(
+                CommitWriteTimestampUs::try_from_i128(1_000).unwrap(),
+                1_001,
+                1_002,
+            )
+            .unwrap(),
+            RollbackExecutionMode::InPlace,
+            RollbackPlanDigest::try_new([0xA5; 32]).unwrap(),
+        )
+        .unwrap();
+        *super::super::canonical_head::CanonicalHeadTransition::start_rollback(
+            fixture.head,
+            request,
+        )
+        .unwrap()
+        .candidate()
+    }
+
+    fn abort_intent(
+        head: StoredCanonicalHead<PHash>,
+        reason: u32,
+    ) -> RollbackAdminAbortIntent {
+        RollbackAdminAbortIntent::new(
+            head.revision(),
+            head.canonical_ref().chain_epoch().get(),
+            head.rollback_control().requested().unwrap().plan_digest(),
+            RollbackAbortReasonCode::try_new(reason).unwrap(),
+        )
+    }
+
     #[tokio::test]
     async fn planned_start_persists_topology_selected_plan_before_inbox_offer() {
         let fixture = fixture(RollbackAdminInboxAccess::ManualPreflight);
@@ -1055,6 +1271,76 @@ mod tests {
             retry.status().admission_slot().revision(),
             first.status().admission_slot().revision()
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_abort_is_queued_idempotently_without_edge_head_write_authority() {
+        let fixture = fixture(RollbackAdminInboxAccess::ManualPreflight);
+        let active = active_requested_head(&fixture);
+        *fixture.head_store.state.lock().await = CanonicalHeadReadState::Current(active);
+        let intent = abort_intent(active, 23);
+
+        let accepted = fixture.service.abort(intent).await.unwrap();
+        assert_eq!(accepted.disposition(), RollbackAdminAbortDisposition::Accepted);
+        assert_eq!(accepted.status().canonical_head(), &active);
+        let command = accepted
+            .status()
+            .admission_slot()
+            .state()
+            .pending()
+            .unwrap();
+        assert_eq!(command.kind(), super::super::rollback_admission::RollbackAdmissionCommandKind::Abort);
+        assert_eq!(command.abort_reason_code(), Some(intent.reason_code()));
+        assert_eq!(command.expected(), &active);
+
+        let retry = fixture.service.abort(intent).await.unwrap();
+        assert_eq!(retry.disposition(), RollbackAdminAbortDisposition::Idempotent);
+        assert_eq!(retry.status().admission_slot(), accepted.status().admission_slot());
+    }
+
+    #[tokio::test]
+    async fn abort_rejects_stale_identity_and_post_ponr_without_writing_inbox() {
+        let fixture = fixture(RollbackAdminInboxAccess::ManualPreflight);
+        let requested = active_requested_head(&fixture);
+        let archiving = *super::super::canonical_head::CanonicalHeadTransition::begin_rollback_archive(
+            requested,
+        )
+        .unwrap()
+        .candidate();
+        let barrier = *super::super::canonical_head::CanonicalHeadTransition::complete_rollback_archive_barrier(
+            archiving,
+        )
+        .unwrap()
+        .candidate();
+        let deleting = *super::super::canonical_head::CanonicalHeadTransition::begin_rollback_delete(
+            barrier,
+        )
+        .unwrap()
+        .candidate();
+
+        *fixture.head_store.state.lock().await = CanonicalHeadReadState::Current(requested);
+        let mut stale = abort_intent(requested, 31);
+        stale.expected_chain_epoch += 1;
+        assert_eq!(
+            fixture.service.abort(stale).await.unwrap().disposition(),
+            RollbackAdminAbortDisposition::HeadMismatch
+        );
+
+        *fixture.head_store.state.lock().await = CanonicalHeadReadState::Current(deleting);
+        assert_eq!(
+            fixture
+                .service
+                .abort(abort_intent(deleting, 31))
+                .await
+                .unwrap()
+                .disposition(),
+            RollbackAdminAbortDisposition::PointOfNoReturn
+        );
+        let state = fixture.admission_store.state.lock().await;
+        let RollbackAdmissionSlotReadState::Current(slot) = *state else {
+            panic!("slot must remain initialized")
+        };
+        assert!(slot.state().is_empty());
     }
 
     #[tokio::test]

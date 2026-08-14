@@ -60,7 +60,8 @@ where
         | RollbackControlState::Deleting(_)
         | RollbackControlState::Restoring(_)
         | RollbackControlState::Verifying(_)
-        | RollbackControlState::AllRealmsReady(_) => {
+        | RollbackControlState::AllRealmsReady(_)
+        | RollbackControlState::Aborting(_) => {
             return Ok(CoordinatorRollbackMaintenanceOutcome::AwaitingDownstream(
                 initial,
             ));
