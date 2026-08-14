@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use super::{
     BranchExactWriterPrepared, MutationBuildError, ResolvedScyllaMutation,
     MutationDecodeError,
+    build_coordinator_reward_node_after_cutover,
     build_realm_global_user_proof_after_cutover, expand_logical_mutation,
 };
 
@@ -394,6 +395,39 @@ pub(super) fn seal_realm_global_user_proof_after_cutover<Hash: Q256BitHash>(
         resolved,
         prepared.timestamp(),
         TimestampedWriteKind::AuthorityCommit,
+    )
+}
+
+pub(super) fn seal_coordinator_reward_node_after_cutover<Hash: Q256BitHash>(
+    prepared: &BranchExactWriterPrepared<Hash>,
+    key: psy_node_core::store::typed::TypedTableKey,
+    value: MutationValue,
+) -> Result<SealedTimestampedPut, TimestampedMutationError> {
+    let resolved = build_coordinator_reward_node_after_cutover(prepared, key, value)?;
+    seal_resolved(
+        resolved,
+        prepared.timestamp(),
+        TimestampedWriteKind::AuthorityCommit,
+    )
+}
+
+pub(super) fn seal_coordinator_reward_node_after_rollback<Hash: Q256BitHash>(
+    prepared: &BranchExactWriterPrepared<Hash>,
+    timestamp: NewBranchWriteTimestampUs,
+    key: psy_node_core::store::typed::TypedTableKey,
+    value: MutationValue,
+) -> Result<SealedTimestampedPut, TimestampedMutationError> {
+    if prepared.timestamp() != timestamp.as_commit_timestamp() {
+        return Err(TimestampedMutationError::RetryTimestampChanged {
+            sealed: prepared.timestamp().as_i64(),
+            attempted: timestamp.as_commit_timestamp().as_i64(),
+        });
+    }
+    let resolved = build_coordinator_reward_node_after_cutover(prepared, key, value)?;
+    seal_resolved(
+        resolved,
+        timestamp.as_commit_timestamp(),
+        TimestampedWriteKind::NewBranchAfterFence,
     )
 }
 

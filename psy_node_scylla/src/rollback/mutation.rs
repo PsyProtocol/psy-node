@@ -322,8 +322,11 @@ pub enum MutationBuildError {
     InvalidImtCursorTransition(ImtCursorTransitionError),
     InvalidImtKeyIndexRow(ImtKeyIndexRowError),
     RealmAuthorityRequiredAfterCutover,
+    CoordinatorAuthorityRequiredAfterCutover,
     BranchExactCutoverFenceRequired,
     GlobalUserProofMutationRequired,
+    CoordinatorRewardNodeMutationRequired,
+    CoordinatorRewardNodePendingMismatch { expected: u64, actual: u64 },
 }
 
 impl fmt::Display for MutationBuildError {
@@ -340,11 +343,20 @@ impl fmt::Display for MutationBuildError {
             Self::RealmAuthorityRequiredAfterCutover => {
                 write!(f, "cutover-bound mixed-axis write requires Realm authority")
             }
+            Self::CoordinatorAuthorityRequiredAfterCutover => {
+                write!(f, "cutover-bound pending-suffix write requires Coordinator authority")
+            }
             Self::BranchExactCutoverFenceRequired => {
                 write!(f, "cutover-bound mixed-axis write requires an exact writer fence")
             }
             Self::GlobalUserProofMutationRequired => {
                 write!(f, "cutover-bound mixed-axis override only accepts the checkpoint global-user proof")
+            }
+            Self::CoordinatorRewardNodeMutationRequired => {
+                write!(f, "cutover-bound pending-suffix override only accepts a Coordinator Realm reward node")
+            }
+            Self::CoordinatorRewardNodePendingMismatch { expected, actual } => {
+                write!(f, "Realm reward node pending {actual} does not match prepared Coordinator candidate {expected}")
             }
         }
     }
@@ -410,6 +422,42 @@ pub(super) fn build_realm_global_user_proof_after_cutover<Hash: Q256BitHash>(
         resolved.key_domain(),
         ScyllaKeyDomain::CheckpointedGlobalUserProof
     );
+    validate_put_value(&resolved, &value)?;
+    Ok(build_resolved(resolved, MutationOperation::Put(value)))
+}
+
+/// Resolve the Coordinator's pending-suffix Realm reward materialization only
+/// for the pending id named by the exact branch writer.  This table is read by
+/// `<= pending`; allowing a caller-selected pending id would let an orphaned
+/// branch row become visible after rollback.
+pub(super) fn build_coordinator_reward_node_after_cutover<Hash: Q256BitHash>(
+    prepared: &BranchExactWriterPrepared<Hash>,
+    key: TypedTableKey,
+    value: MutationValue,
+) -> Result<ResolvedScyllaMutation, MutationBuildError> {
+    if !matches!(prepared.intent().authority(), AuthorityScope::Coordinator) {
+        return Err(
+            MutationBuildError::CoordinatorAuthorityRequiredAfterCutover,
+        );
+    }
+    if prepared.cutover_fence().is_none() {
+        return Err(MutationBuildError::BranchExactCutoverFenceRequired);
+    }
+    let expected = prepared.intent().candidate().pending_id().get();
+    let actual = match &key {
+        TypedTableKey::RealmRewardNode { pending, .. } => pending.get(),
+        _ => {
+            return Err(MutationBuildError::CoordinatorRewardNodeMutationRequired)
+        }
+    };
+    if actual != expected {
+        return Err(MutationBuildError::CoordinatorRewardNodePendingMismatch {
+            expected,
+            actual,
+        });
+    }
+    let resolved = describe_existing_key(&key);
+    debug_assert_eq!(resolved.key_domain(), ScyllaKeyDomain::RealmRewardNode);
     validate_put_value(&resolved, &value)?;
     Ok(build_resolved(resolved, MutationOperation::Put(value)))
 }
