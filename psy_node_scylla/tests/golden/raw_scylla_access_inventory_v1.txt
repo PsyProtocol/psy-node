@@ -102,7 +102,7 @@ psy_node_scylla/src/rollback/realm_rollback_delete_completion.rs|DurableControlA
 psy_node_scylla/src/rollback/realm_rollback_delete_restore_executor.rs|DurableControlAuthority|10|0|21|7|1|21|0|5
 psy_node_scylla/src/rollback/realm_rollback_physical_archive_owner.rs|DurableControlAuthority|4|0|1|0|0|0|0|0
 psy_node_scylla/src/rollback/realm_rollback_physical_archive_store.rs|DurableControlAuthority|5|0|3|6|2|3|0|3
-psy_node_scylla/src/rollback/realm_rollback_runtime_control.rs|DurableControlAuthority|3|0|20|0|0|0|0|0
+psy_node_scylla/src/rollback/realm_rollback_runtime_control.rs|DurableControlAuthority|3|0|22|0|0|0|0|0
 psy_node_scylla/src/rollback/realm_user_update_admission_store.rs|DurableControlAuthority|6|0|3|6|2|3|1|4
 psy_node_scylla/src/rollback/realm_user_update_claim_store.rs|DurableControlAuthority|6|0|4|7|2|4|1|5
 psy_node_scylla/src/rollback/realm_user_update_dependency_store.rs|DurableControlAuthority|5|0|3|4|1|3|1|3

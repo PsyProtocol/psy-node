@@ -493,6 +493,76 @@ impl ScyllaRealmRollbackRuntimeControl {
         Ok((current_head, narrow.timestamp()))
     }
 
+    /// Qualification-only generation rotation used to prove that a restored
+    /// Realm can continue beyond its first new block. The production route
+    /// still requires the application terminal/carryover owner; this helper
+    /// only allocates the next append-only identity and applies the exact
+    /// terminal pipeline CAS selected from storage.
+    #[cfg(all(test, feature = "rf3-test-support"))]
+    pub(crate) async fn qualification_rotate_post_rollback_generation<
+        Hash: Q256BitHash,
+    >(
+        &self,
+        network: NetworkId,
+        authority: AuthorityScope,
+        write_timestamp: psy_node_core::store::timestamp::CommitWriteTimestampUs,
+    ) -> anyhow::Result<
+        psy_node_core::store::pending_generation_identity::PendingGenerationContext,
+    > {
+        let pipeline_store = ScyllaPendingPipelineStore::prepare(
+            self.session.clone(),
+            BranchExactDeploymentNoTabletKeyspace::try_new(
+                self.local_control_keyspace.as_str().to_owned(),
+            )?,
+        )
+        .await?;
+        let key = PendingGenerationLedgerKey::new(network, authority);
+        let PendingPipelineReadState::Current(pipeline) =
+            pipeline_store.read::<Hash>(key).await?
+        else {
+            anyhow::bail!("post-rollback Realm pipeline is missing before rotation")
+        };
+        let next_pending = psy_node_core::store::typed::UniquePendingId::try_new(
+            pipeline
+                .gathering()
+                .pending_id()
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("post-rollback pending id overflow"))?,
+        )?;
+        let prefix = pipeline.proc_namespace_prefix();
+        let next_proc = prefix.derive_proc_id(next_pending);
+        let allocation = super::SealedPendingCounterAllocation::try_for_commit(
+            super::PendingCounterExpected::Present(pipeline.gathering().pending_id()),
+            next_proc,
+            write_timestamp,
+        )?;
+        let counter = PendingCounterAdapter::prepare(
+            self.session.clone(),
+            self.local_control_keyspace.clone(),
+            self.local_state_keyspace.clone(),
+        )
+        .await?;
+        match counter.allocate(&allocation).await? {
+            super::PendingCounterAllocationOutcome::Owned(owned)
+                if owned.pending() == next_pending && owned.proc_id() == next_proc => {}
+            other => anyhow::bail!("post-rollback Realm rotation allocation conflict: {other:?}"),
+        }
+        let reserved =
+            psy_node_core::store::pending_generation::ReservedPendingGeneration::qualification_from_prefix(
+                next_pending.get(),
+                prefix,
+            )?;
+        let rotation = pipeline.seal_rotation(reserved)?;
+        let ready = match pipeline_store.apply(&rotation).await? {
+            PendingPipelineWriteOutcome::Applied(current)
+            | PendingPipelineWriteOutcome::Idempotent(current)
+                if current == *rotation.candidate() => current,
+            other => anyhow::bail!("post-rollback Realm rotation conflict: {other:?}"),
+        };
+        Ok(ready.processing())
+    }
+
     async fn prepare_delete_executor(
         &self,
     ) -> anyhow::Result<ScyllaRealmRollbackDeleteRestoreExecutor> {

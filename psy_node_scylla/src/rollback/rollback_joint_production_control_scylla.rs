@@ -336,6 +336,65 @@ fn narrow_prepared<Hash: parth_core::protocol::core_types::Q256BitHash>(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn qualification_append_post_rollback_coordinator_commit(
+    store: &ScyllaCoreStore<PHash, PoseidonHasher>,
+    expected: psy_node_core::store::canonical_head::StoredCanonicalHead<PHash>,
+    checkpoint: u64,
+    predecessor_pending: u64,
+    processing: PendingGenerationContext,
+    timestamp: CommitWriteTimestampUs,
+    old_leaf_seed: u8,
+    new_leaf_seed: u8,
+) -> anyhow::Result<psy_node_core::store::canonical_head::StoredCanonicalHead<PHash>> {
+    let (source, narrow) = coordinator_commit_source_from(
+        expected,
+        checkpoint,
+        predecessor_pending,
+        processing.pending_id().get(),
+        processing.proc_checkpoint_id(),
+        old_leaf_seed,
+        new_leaf_seed,
+        timestamp,
+    )?;
+    let timestamp_store = ScyllaAuthorityTimestampStore::prepare(
+        store.session.clone(),
+        AuthorityTimestampNoTabletKeyspace::try_new(
+            store.no_tablet_keyspace.clone(),
+        )?,
+    )
+    .await?;
+    let key = AuthorityTimestampKey::new(network(), AuthorityScope::Coordinator);
+    let AuthorityTimestampReadState::Current(timestamp_state) =
+        timestamp_store.read(key).await?
+    else {
+        bail!("restored Coordinator timestamp state is missing")
+    };
+    let reservation = timestamp_state.seal_reservation(
+        key,
+        narrow.intent().intent_digest().authority_intent(),
+        AuthorityClockSampleUs::try_from_i128(i128::from(timestamp.as_i64()))?,
+    )?;
+    ensure!(
+        reservation.lease().timestamp() == timestamp,
+        "Coordinator did not reserve the requested post-fence timestamp",
+    );
+    let _ = timestamp_store.reserve(reservation).await?;
+    qualification_seed_coordinator_commit(store, &source, &narrow).await?;
+    let transition =
+        CanonicalHeadTransition::normal_checkpoint_advance(expected, *source.candidate())?.seal();
+    let outcome = store.compare_and_set_canonical_head(&transition).await?;
+    ensure!(
+        outcome.current() == transition.candidate(),
+        "Coordinator post-rollback head advance conflicted",
+    );
+    let completion = reservation
+        .candidate()
+        .seal_completion(key, reservation.lease())?;
+    let _ = timestamp_store.complete(completion).await?;
+    Ok(outcome.current().clone())
+}
+
 fn realm_chain(checkpoint: u64, seed: u8) -> CanonicalChainRef<PHash> {
     CanonicalChainRef::new(
         network(),
@@ -1273,13 +1332,17 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
     }
 
     // Prove the minimum product outcome after publication: the restored
-    // target can advance to a different T+1 branch using a timestamp strictly
-    // above the delete fence.  The fixture assembles commit inputs, while the
-    // physical writes, timestamp allocator and head CAS use the real stores.
+    // target can advance through a different T+1 and T+2 branch using
+    // timestamps strictly above the delete fence. The fixture assembles
+    // commit inputs, while the physical writes, timestamp allocator and head
+    // CAS use the real stores.
     let coordinator_processing = coordinator_directive
         .processing()
         .ok_or_else(|| anyhow::anyhow!("Coordinator processing context is missing"))?;
-    let coordinator_timestamp = CommitWriteTimestampUs::try_from_i128(
+    let coordinator_gathering = coordinator_directive
+        .gathering()
+        .ok_or_else(|| anyhow::anyhow!("Coordinator gathering context is missing"))?;
+    let coordinator_t1_timestamp = CommitWriteTimestampUs::try_from_i128(
         i128::from(
             coordinator_directive
                 .new_branch_write()
@@ -1287,90 +1350,41 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
                 .as_i64(),
         ) + 1,
     )?;
-    let (new_coordinator_source, new_coordinator_narrow) =
-        coordinator_commit_source_from(
-            published,
-            2,
-            2,
-            coordinator_processing.pending_id().get(),
-            coordinator_processing.proc_checkpoint_id(),
-            0xA1,
-            0xB2,
-            coordinator_timestamp,
-        )?;
-    let coordinator_timestamp_store = ScyllaAuthorityTimestampStore::prepare(
-        coordinator.session.clone(),
-        AuthorityTimestampNoTabletKeyspace::try_new(
-            coordinator.no_tablet_keyspace.clone(),
-        )?,
-    )
-    .await?;
-    let coordinator_timestamp_key =
-        AuthorityTimestampKey::new(network(), AuthorityScope::Coordinator);
-    let AuthorityTimestampReadState::Current(coordinator_timestamp_state) =
-        coordinator_timestamp_store
-            .read(coordinator_timestamp_key)
-            .await?
-    else {
-        bail!("restored Coordinator timestamp state is missing")
-    };
-    let coordinator_reservation = coordinator_timestamp_state.seal_reservation(
-        coordinator_timestamp_key,
-        new_coordinator_narrow
-            .intent()
-            .intent_digest()
-            .authority_intent(),
-        AuthorityClockSampleUs::try_from_i128(i128::from(
-            coordinator_timestamp.as_i64(),
-        ))?,
-    )?;
-    ensure!(
-        coordinator_reservation.lease().timestamp() == coordinator_timestamp,
-        "Coordinator did not reserve the first post-fence timestamp",
-    );
-    let _ = coordinator_timestamp_store
-        .reserve(coordinator_reservation)
-        .await?;
-    qualification_seed_coordinator_commit(
+    let coordinator_t1 = qualification_append_post_rollback_coordinator_commit(
         &coordinator,
-        &new_coordinator_source,
-        &new_coordinator_narrow,
+        published,
+        2,
+        2,
+        coordinator_processing,
+        coordinator_t1_timestamp,
+        0xA1,
+        0xB2,
     )
     .await?;
-    let coordinator_advance = CanonicalHeadTransition::normal_checkpoint_advance(
-        published,
-        *new_coordinator_source.candidate(),
-    )?
-    .seal();
-    let advanced_coordinator = coordinator
-        .compare_and_set_canonical_head(&coordinator_advance)
-        .await?;
     ensure!(
-        advanced_coordinator.current() == coordinator_advance.candidate()
-            && advanced_coordinator
-                .current()
-                .canonical_ref()
-                .checkpoint()
-                .checkpoint_id()
-                .get()
-                == 2
-            && advanced_coordinator
-                .current()
-                .canonical_ref()
-                .chain_epoch()
-                .get()
-                == 1,
+        coordinator_t1.canonical_ref().checkpoint().checkpoint_id().get() == 2
+            && coordinator_t1.canonical_ref().chain_epoch().get() == 1,
         "Coordinator did not advance from restored T to new-epoch T+1",
     );
-    let coordinator_completion = coordinator_reservation
-        .candidate()
-        .seal_completion(
-            coordinator_timestamp_key,
-            coordinator_reservation.lease(),
-        )?;
-    let _ = coordinator_timestamp_store
-        .complete(coordinator_completion)
-        .await?;
+    let coordinator_t2_timestamp = CommitWriteTimestampUs::try_from_i128(
+        i128::from(coordinator_t1_timestamp.as_i64()) + 1,
+    )?;
+    let coordinator_t2 = qualification_append_post_rollback_coordinator_commit(
+        &coordinator,
+        coordinator_t1,
+        3,
+        coordinator_processing.pending_id().get(),
+        coordinator_gathering,
+        coordinator_t2_timestamp,
+        0xB2,
+        0xC3,
+    )
+    .await?;
+    ensure!(
+        coordinator_t2.canonical_ref().checkpoint().checkpoint_id().get() == 3
+            && coordinator_t2.canonical_ref().chain_epoch().get() == 1,
+        "Coordinator did not continue from T+1 to new-epoch T+2",
+    );
 
     for ((control, selected), (predecessor_pending, seed)) in selected_realms
         .iter()
@@ -1413,6 +1427,47 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
                         .delete_fence()
                         .as_i64(),
             "Realm did not advance from restored T to new-epoch T+1 above the fence",
+        );
+
+        let t2_timestamp = CommitWriteTimestampUs::try_from_i128(
+            i128::from(timestamp.as_i64()) + 1,
+        )?;
+        let t2_processing = control
+            .qualification_rotate_post_rollback_generation::<PHash>(
+                directive.target().network_id(),
+                directive.authority(),
+                t2_timestamp,
+            )
+            .await?;
+        ensure!(
+            t2_processing == directive.gathering().ok_or_else(|| {
+                anyhow::anyhow!("Realm gathering context is missing")
+            })?,
+            "Realm rotation did not select the preallocated gathering identity",
+        );
+        let (t2_narrow, t2_observation) = post_rollback_realm_commit(
+            directive.authority(),
+            *head.head().chain(),
+            processing.pending_id().get(),
+            t2_processing,
+            t2_timestamp,
+            seed.wrapping_add(1),
+        )?;
+        let (t2_head, t2_committed_timestamp) = control
+            .qualification_append_post_rollback_narrow_commit(
+                t2_narrow,
+                t2_observation,
+                AuthorityClockSampleUs::try_from_i128(i128::from(
+                    t2_timestamp.as_i64(),
+                ))?,
+            )
+            .await?;
+        ensure!(
+            t2_head.head().chain() == t2_observation.chain()
+                && t2_head.head().chain().checkpoint().checkpoint_id().get() == 3
+                && t2_head.head().chain().chain_epoch().get() == 1
+                && t2_committed_timestamp.as_i64() > committed_timestamp.as_i64(),
+            "Realm did not continue from T+1 to new-epoch T+2",
         );
     }
     Ok(())
