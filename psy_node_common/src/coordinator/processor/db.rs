@@ -73,6 +73,7 @@ use psy_node_core::{
             CoordinatorRollbackRuntimePublication, CoordinatorRollbackRuntimeRebuildStore,
             RollbackRuntimeRebuildDirective, RollbackRuntimeRebuildReport,
         },
+        timestamp::NewBranchWriteTimestampUs,
         traits::proof_store::QParthProofStore,
     },
 };
@@ -203,6 +204,12 @@ pub struct PsyCoordinatorDatabaseProcessor<
     pub ids: CoordinatorProcessorIdState,
     canonical_head: Option<StoredCanonicalHead<N::QHash>>,
     pending_genesis_head: Option<CanonicalHeadBootstrap<N::QHash>>,
+    // A rollback delete fence makes the legacy Coordinator writer unsafe: its
+    // table adapters do not carry an explicit timestamp, so a same-height new
+    // branch could lose to suffix tombstones during repair/compaction.  Keep
+    // the durable restart floor here until the branch-exact Coordinator writer
+    // consumes it.  This field is a fail-closed guard, not write authority.
+    rollback_restart_new_branch_write: Option<NewBranchWriteTimestampUs>,
 
     // config
     network_id: NetworkId,
@@ -533,6 +540,7 @@ impl<
             ids,
             canonical_head: None,
             pending_genesis_head: None,
+            rollback_restart_new_branch_write: None,
         };
         processor
             .reconcile_canonical_head_on_startup(canonical_head_bootstrap_profile)
@@ -1768,6 +1776,13 @@ checkpoint_backup_copy_status={}
         state_transition_circuit_type: ProvingJobCircuitType,
         zk_proof: Vec<u8>,
     ) -> anyhow::Result<()> {
+        if let Some(new_branch_write) = self.rollback_restart_new_branch_write {
+            anyhow::bail!(
+                "COORDINATOR_POST_ROLLBACK_EXACT_WRITER_REQUIRED: legacy commit_state cannot write after rollback; delete_fence_us={}, new_branch_write_us={}",
+                new_branch_write.delete_fence().as_i64(),
+                new_branch_write.as_commit_timestamp().as_i64(),
+            )
+        }
         let checkpoint_id: u64 = coordinator_update.checkpoint_id;
         tracing::info!("vaidation -> Committing coordinator state update to database for checkpoint_id: {}", checkpoint_id);
         let checkpoint_leaf_hash = coordinator_update.new_base.checkpoint_leaf.qfhash::<N::HasherBase>();
@@ -2414,6 +2429,7 @@ Checkpoint Root Hash: {}
         .await?;
         if let Some(directive) = rollback_restart_directive {
             self.resume_rollback_unique_ids(directive).await?;
+            self.rollback_restart_new_branch_write = Some(directive.new_branch_write());
         } else {
             self.set_new_unique_ids().await?;
         }
@@ -2461,6 +2477,43 @@ mod tests {
         assert!(method.contains("publish_current_pending_context"));
         assert_eq!(method.matches("ensure_consumer(").count(), 4);
         assert_eq!(method.matches("set_unique_id(gathering_proc)").count(), 3);
+    }
+
+    #[test]
+    fn rollback_restart_fences_the_legacy_coordinator_writer() {
+        let source = include_str!("db.rs");
+        let startup = source
+            .split("pub async fn init_with_setup_and_genesis(")
+            .nth(1)
+            .expect("Coordinator startup method")
+            .split("self.shared_status.update_status(")
+            .next()
+            .expect("Coordinator startup write-fence section");
+        let resume = startup.find("self.resume_rollback_unique_ids(directive)").unwrap();
+        let fence = startup
+            .find("self.rollback_restart_new_branch_write = Some(directive.new_branch_write())")
+            .unwrap();
+        assert!(resume < fence);
+
+        let commit = source
+            .split("pub async fn commit_state(")
+            .nth(1)
+            .expect("legacy Coordinator commit method")
+            .split("let checkpoint_id: u64")
+            .next()
+            .expect("legacy Coordinator pre-write guard");
+        assert!(commit.contains("if let Some(new_branch_write)"));
+        assert!(commit.contains("COORDINATOR_POST_ROLLBACK_EXACT_WRITER_REQUIRED"));
+        assert!(commit.contains("new_branch_write.delete_fence().as_i64()"));
+        assert!(commit.contains("new_branch_write.as_commit_timestamp().as_i64()"));
+        for forbidden in [
+            "persist_coordinator_commit_source",
+            "set_verifiable_checkpoint_state_transition_and_zkp",
+            "set_latest_checkpoint_id",
+            "publish_canonical_head",
+        ] {
+            assert!(!commit.contains(forbidden), "write before guard: {forbidden}");
+        }
     }
 
     #[test]
