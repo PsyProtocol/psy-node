@@ -16,43 +16,118 @@ use psy_node_core::store::{
     canonical_head::{CanonicalHeadReadState, StoredCanonicalHead},
     rollback_control::RollbackControlState,
     rollback_runtime_rebuild::{
-        RealmRollbackRuntimeControl, RollbackRuntimeRebuildReport,
+        RealmRollbackParticipantProgress, RealmRollbackRuntimeControl,
+        RollbackRuntimeRebuildReport,
         SelectedRealmRollbackRuntimeRebuild,
     },
 };
 use scylla::client::session::Session;
 
 use super::{
+    BranchExactDeploymentNoTabletKeyspace, BranchExactSchemaReady,
+    PendingQueueArtifactDataKeyspace, ScyllaAuthorityLocalHeadStore,
+    branch_exact_dual_write_executor::ScyllaBranchExactDualWriteAdapter,
     canonical_head_prototype::ScyllaCanonicalHeadStore,
+    realm_rollback_physical_archive_owner::{
+        RealmRollbackPhysicalArchiveOwnerError,
+        ScyllaRealmRollbackPhysicalArchiveOwner,
+    },
+    ScyllaRollbackParticipantPlanStore,
     rollback_runtime_rebuild_store::ScyllaRollbackRuntimeRebuildStore,
-    CanonicalHeadNoTabletKeyspace, CqlKeyspaceName,
+    AuthorityLocalHeadNoTabletKeyspace, CanonicalHeadNoTabletKeyspace,
+    CqlKeyspaceName,
 };
 
 pub struct ScyllaRealmRollbackRuntimeControl {
+    session: Arc<Session>,
     canonical_head: Arc<ScyllaCanonicalHeadStore>,
+    participant_plans: Arc<ScyllaRollbackParticipantPlanStore>,
     runtime_rebuild: Arc<ScyllaRollbackRuntimeRebuildStore>,
+    local_inventory: Arc<super::realm_rollback_commit_inventory_store::ScyllaRealmRollbackCommitInventoryStore>,
+    local_head: Arc<ScyllaAuthorityLocalHeadStore>,
+    local_state_keyspace: CqlKeyspaceName,
+    coordinator_archive_keyspace: CqlKeyspaceName,
+    branch_exact_ready: Arc<BranchExactSchemaReady>,
 }
 
 impl ScyllaRealmRollbackRuntimeControl {
     /// Prepare statements against an explicitly configured, already deployed
     /// Coordinator namespace.  No keyspace or table is created here.
-    pub async fn prepare(
+    pub(crate) async fn prepare_with_local_participant(
         session: Arc<Session>,
+        local_keyspace: &str,
+        local_no_tablet_keyspace: &str,
         coordinator_keyspace: &str,
+        branch_exact_ready: Arc<BranchExactSchemaReady>,
     ) -> anyhow::Result<Self> {
         let data = CqlKeyspaceName::try_new(coordinator_keyspace.to_owned())?;
         let control = CanonicalHeadNoTabletKeyspace::try_new(format!(
             "{}_no_tablet",
             coordinator_keyspace
         ))?;
+        let local_state_keyspace = CqlKeyspaceName::try_new(local_keyspace.to_owned())?;
+        let local_control = BranchExactDeploymentNoTabletKeyspace::try_new(
+            local_no_tablet_keyspace.to_owned(),
+        )?;
+        let local_data = PendingQueueArtifactDataKeyspace::try_new(
+            local_keyspace.to_owned(),
+        )?;
+        let local_inventory =
+            ScyllaRealmRollbackPhysicalArchiveOwner::prepare_inventory(
+                session.clone(),
+                local_control,
+                local_data,
+            )
+            .await?;
+        let local_head = Arc::new(
+            ScyllaAuthorityLocalHeadStore::prepare(
+                session.clone(),
+                AuthorityLocalHeadNoTabletKeyspace::try_new(
+                    local_no_tablet_keyspace.to_owned(),
+                )?,
+            )
+            .await?,
+        );
         Ok(Self {
+            session: session.clone(),
             canonical_head: Arc::new(
-                ScyllaCanonicalHeadStore::prepare(session.clone(), control).await?,
+                ScyllaCanonicalHeadStore::prepare(session.clone(), control.clone()).await?,
+            ),
+            participant_plans: Arc::new(
+                ScyllaRollbackParticipantPlanStore::prepare(
+                    session.clone(),
+                    control,
+                )
+                .await?,
             ),
             runtime_rebuild: Arc::new(
                 ScyllaRollbackRuntimeRebuildStore::prepare(session, &data).await?,
             ),
+            local_inventory,
+            local_head,
+            local_state_keyspace,
+            coordinator_archive_keyspace: data,
+            branch_exact_ready,
         })
+    }
+
+    async fn prepare_archive_owner(
+        &self,
+    ) -> anyhow::Result<ScyllaRealmRollbackPhysicalArchiveOwner> {
+        let narrow = ScyllaBranchExactDualWriteAdapter::prepare(
+            self.session.clone(),
+            &self.branch_exact_ready,
+        )
+        .await?;
+        Ok(ScyllaRealmRollbackPhysicalArchiveOwner::prepare(
+            self.session.clone(),
+            self.local_inventory.clone(),
+            self.local_head.clone(),
+            narrow,
+            self.local_state_keyspace.clone(),
+            self.coordinator_archive_keyspace.clone(),
+        )
+        .await?)
     }
 
     async fn read_head<Hash: Q256BitHash>(
@@ -94,6 +169,88 @@ impl ScyllaRealmRollbackRuntimeControl {
 impl<Hash: Q256BitHash> RealmRollbackRuntimeControl<Hash>
     for ScyllaRealmRollbackRuntimeControl
 {
+    async fn progress_realm_rollback_participant(
+        &self,
+        network: NetworkId,
+        authority: AuthorityScope,
+    ) -> anyhow::Result<RealmRollbackParticipantProgress<Hash>> {
+        let AuthorityScope::Realm { realm_id, realm_sub_id } = authority else {
+            anyhow::bail!("Realm rollback participant maintenance requires Realm authority")
+        };
+        let Some(first_head) = self.read_head(network).await? else {
+            anyhow::bail!("Coordinator canonical head is missing")
+        };
+        let Some(request) = first_head.rollback_control().requested() else {
+            return Ok(RealmRollbackParticipantProgress::AwaitingCoordinator(first_head));
+        };
+        let plan: psy_node_core::store::rollback_participant_plan::RollbackParticipantPlan<Hash> = self
+            .participant_plans
+            .read_participant_plan(network, request.plan_digest().as_bytes())
+            .await?;
+        let participant = psy_node_core::store::rollback_participant_plan::RollbackRealmParticipant::new(
+            realm_id,
+            realm_sub_id,
+        );
+        if !plan.realms().contains(&participant)
+            || plan.target().network_id() != network
+            || plan.digest() != request.plan_digest().as_bytes()
+        {
+            anyhow::bail!("Realm is not a member of the storage-selected rollback plan")
+        }
+        let topology = self
+            .participant_plans
+            .read_current_topology(network)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("rollback topology is missing"))?;
+        if !topology.snapshot().validates_plan(&plan) {
+            anyhow::bail!("rollback topology changed after plan selection")
+        }
+        match first_head.rollback_control() {
+            RollbackControlState::Requested(_) => {
+                Ok(RealmRollbackParticipantProgress::AwaitingCoordinator(first_head))
+            }
+            RollbackControlState::Archiving(_) => {
+                let mut owner = self.prepare_archive_owner().await?;
+                let completion = match owner
+                    .recover_participant_completion(network, authority, &plan)
+                    .await
+                {
+                    Ok(completion) => completion,
+                    Err(RealmRollbackPhysicalArchiveOwnerError::CompletionMissing) => {
+                        let archive = owner
+                            .archive_selected_realm(network, authority, &plan)
+                            .await?;
+                        owner
+                            .persist_participant_completion(network, &plan, &archive)
+                            .await?
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                let Some(second_head) = self.read_head(network).await? else {
+                    anyhow::bail!("Coordinator canonical head disappeared after Realm archive")
+                };
+                if second_head != first_head {
+                    anyhow::bail!("Coordinator rollback phase changed during Realm archive")
+                }
+                Ok(RealmRollbackParticipantProgress::ArchivePrepared {
+                    head: second_head,
+                    entry_count: completion.completion().entry_count(),
+                })
+            }
+            RollbackControlState::Verifying(_) | RollbackControlState::AllRealmsReady(_) => {
+                Ok(RealmRollbackParticipantProgress::ReadyForRuntimeRebuild(first_head))
+            }
+            RollbackControlState::ArchiveBarrierReady(_)
+            | RollbackControlState::Deleting(_)
+            | RollbackControlState::Restoring(_) => {
+                Ok(RealmRollbackParticipantProgress::AwaitingCoordinator(first_head))
+            }
+            RollbackControlState::Idle => {
+                Ok(RealmRollbackParticipantProgress::AwaitingCoordinator(first_head))
+            }
+        }
+    }
+
     async fn read_realm_rollback_control_head(
         &self,
         network: NetworkId,

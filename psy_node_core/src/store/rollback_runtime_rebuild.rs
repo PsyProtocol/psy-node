@@ -479,6 +479,16 @@ pub trait RealmRollbackRuntimeControl<Hash>: Send + Sync
 where
     Hash: Q256BitHash,
 {
+    /// Advance this Realm's storage-local participant work for the current
+    /// Coordinator-selected rollback phase. The caller supplies only its
+    /// immutable authority identity; target/plan/phase are selected from the
+    /// Coordinator control namespace.
+    async fn progress_realm_rollback_participant(
+        &self,
+        network: NetworkId,
+        authority: AuthorityScope,
+    ) -> anyhow::Result<RealmRollbackParticipantProgress<Hash>>;
+
     async fn read_realm_rollback_control_head(
         &self,
         network: NetworkId,
@@ -502,6 +512,16 @@ where
         &self,
         selected: SelectedRealmRollbackRuntimeRebuild<Hash>,
     ) -> anyhow::Result<bool>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RealmRollbackParticipantProgress<Hash> {
+    AwaitingCoordinator(StoredCanonicalHead<Hash>),
+    ArchivePrepared {
+        head: StoredCanonicalHead<Hash>,
+        entry_count: u64,
+    },
+    ReadyForRuntimeRebuild(StoredCanonicalHead<Hash>),
 }
 
 #[cfg(test)]

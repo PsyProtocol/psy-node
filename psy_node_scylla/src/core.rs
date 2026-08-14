@@ -711,6 +711,30 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
         .await
     }
 
+    /// Prepare the distributed Realm-side rollback participant owner. Local
+    /// hot tables stay in this Realm namespace; immutable completion evidence
+    /// is written to the explicitly configured Coordinator archive namespace.
+    pub async fn prepare_realm_rollback_runtime_control(
+        &self,
+        coordinator_keyspace: &str,
+    ) -> anyhow::Result<crate::rollback::ScyllaRealmRollbackRuntimeControl> {
+        let ready = self
+            .branch_exact_schema_ready
+            .get()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!(
+                "Realm rollback maintenance requires verified branch-exact schema readiness"
+            ))?;
+        crate::rollback::ScyllaRealmRollbackRuntimeControl::prepare_with_local_participant(
+            self.session.clone(),
+            &self.keyspace,
+            &self.no_tablet_keyspace,
+            coordinator_keyspace,
+            ready,
+        )
+        .await
+    }
+
     fn coordinator_canonical_head(&self) -> anyhow::Result<&ScyllaCanonicalHeadStore> {
         self.canonical_head_store
             .get()

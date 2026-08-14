@@ -25,9 +25,7 @@ use psy_node_scylla::psy_setup::{
     setup_coordinator_psy_scylla_database_store_from_connection_string,
     setup_realm_processor_scylla_startup_composition,
 };
-use psy_node_scylla::rollback::{
-    PendingQueueSidecarSetupMode, ScyllaRealmRollbackRuntimeControl,
-};
+use psy_node_scylla::rollback::PendingQueueSidecarSetupMode;
 use psy_data::protocol::chain_context::AuthorityScope;
 
 pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_coordinator_processor_node(config: &CoordinatorProcessorStartConfig) -> anyhow::Result<()> {
@@ -220,10 +218,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_processor_node(co
                 .as_deref()
             {
                 Some(keyspace) => Some(Arc::new(
-                    ScyllaRealmRollbackRuntimeControl::prepare(
-                        db.store.session.clone(),
-                        keyspace,
-                    )
+                    db.store.prepare_realm_rollback_runtime_control(keyspace)
                     .await?,
                 ) as Arc<dyn RealmRollbackRuntimeControl<<N as QNetworkHashTypes>::QHash>>),
                 None => None,

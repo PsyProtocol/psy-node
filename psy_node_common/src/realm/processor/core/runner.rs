@@ -141,6 +141,36 @@ where
                     request.target().checkpoint_id().get(),
                 );
 
+                // Each Realm owns its private hot tables. It therefore
+                // performs its own storage-selected archive/delete/restore
+                // work while the Coordinator owns only the global barriers.
+                // No runtime rebuild can start until that distributed phase
+                // has reached VERIFYING.
+                loop {
+                    match rollback_control
+                        .progress_realm_rollback_participant(network, authority)
+                        .await
+                    {
+                        Ok(psy_node_core::store::rollback_runtime_rebuild::RealmRollbackParticipantProgress::ArchivePrepared {
+                            entry_count,
+                            ..
+                        }) => {
+                            tracing::warn!(
+                                "Realm rollback archive is exact and durable ({} entries); awaiting global archive barrier",
+                                entry_count,
+                            );
+                        }
+                        Ok(psy_node_core::store::rollback_runtime_rebuild::RealmRollbackParticipantProgress::AwaitingCoordinator(_)) => {}
+                        Ok(psy_node_core::store::rollback_runtime_rebuild::RealmRollbackParticipantProgress::ReadyForRuntimeRebuild(_)) => break,
+                        Err(error) => {
+                            tracing::error!(
+                                "Realm rollback participant maintenance failed closed: {error:#}"
+                            );
+                        }
+                    }
+                    sleep(std::time::Duration::from_millis(100)).await;
+                }
+
                 let selected = loop {
                     match rollback_control
                         .read_selected_realm_runtime_rebuild(network, authority)

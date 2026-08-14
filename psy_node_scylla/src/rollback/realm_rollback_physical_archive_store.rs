@@ -470,6 +470,48 @@ impl ScyllaRealmRollbackPhysicalArchiveStore {
         }
     }
 
+    /// Select the one completion address reserved for a Realm in an immutable
+    /// participant plan.  This is the Coordinator-facing distributed
+    /// readiness seam: it needs no access to the Realm's private hot tables.
+    pub(super) async fn read_participant_completion_selected<Hash: Q256BitHash>(
+        &self,
+        network: psy_data::protocol::canonical_chain::NetworkId,
+        old_chain_epoch: u64,
+        authority: psy_data::protocol::chain_context::AuthorityScope,
+        participant_plan_digest: [u8; 32],
+    ) -> Result<Option<PersistedRealmRollbackParticipantCompletion<Hash>>, RealmRollbackPhysicalArchiveStoreError> {
+        let coordinates = ArchiveCoordinates {
+            network: i64::from(network.chain_id()),
+            chain_epoch: i64::try_from(old_chain_epoch)
+                .map_err(|_| RealmRollbackPhysicalArchiveStoreError::IntegerOutOfCqlRange)?,
+            participant_plan_digest,
+            key_domain: REALM_PARTICIPANT_COMPLETION_KEY_DOMAIN,
+            row_slot: RealmRollbackParticipantCompletion::<Hash>::slot_for_plan(
+                network,
+                old_chain_epoch,
+                authority,
+                &participant_plan_digest,
+                &self.fingerprint,
+            ),
+        };
+        let Some(completion) = self.read_participant_completion::<Hash>(&coordinates).await? else {
+            return Ok(None);
+        };
+        if completion.network() != network
+            || completion.old_chain_epoch() != old_chain_epoch
+            || completion.authority() != authority
+            || completion.participant_plan_digest() != &participant_plan_digest
+            || completion.archive_store_fingerprint() != &self.fingerprint
+            || completion.slot() != &coordinates.row_slot
+        {
+            return Err(RealmRollbackPhysicalArchiveStoreError::Conflict);
+        }
+        Ok(Some(PersistedRealmRollbackParticipantCompletion {
+            store_fingerprint: self.fingerprint,
+            completion,
+        }))
+    }
+
     async fn persist_bytes(
         &self,
         coordinates: &ArchiveCoordinates,

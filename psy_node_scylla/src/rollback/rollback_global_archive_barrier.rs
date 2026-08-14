@@ -52,10 +52,8 @@ use super::{
     },
     coordinator_rollback_archive_store::COORDINATOR_ROLLBACK_SUFFIX_ARCHIVE_TABLE,
     realm_rollback_participant_completion::RealmRollbackParticipantCompletion,
-    realm_rollback_physical_archive_owner::{
-        RealmRollbackPhysicalArchiveOwnerError,
-        ScyllaRealmRollbackPhysicalArchiveOwner,
-    },
+    realm_rollback_physical_archive_owner::RealmRollbackPhysicalArchiveOwnerError,
+    realm_rollback_physical_archive_store::ScyllaRealmRollbackPhysicalArchiveStore,
 };
 
 const MAGIC: &[u8; 8] = b"PSYRBGAB";
@@ -788,7 +786,7 @@ pub(super) struct ScyllaRollbackGlobalArchiveBarrierOwner {
     canonical_head: Arc<ScyllaCanonicalHeadStore>,
     commit_sources: Arc<ScyllaCoordinatorCommitSourceStore>,
     participant_plans: Arc<ScyllaRollbackParticipantPlanStore>,
-    realm: ScyllaRealmRollbackPhysicalArchiveOwner,
+    realm_archive: ScyllaRealmRollbackPhysicalArchiveStore,
     coordinator_archive_keyspace: CqlKeyspaceName,
     coordinator_source_keyspace: CqlKeyspaceName,
     checkpoint_tree_height: u8,
@@ -852,7 +850,7 @@ impl ScyllaRollbackGlobalArchiveBarrierOwner {
         canonical_head: Arc<ScyllaCanonicalHeadStore>,
         commit_sources: Arc<ScyllaCoordinatorCommitSourceStore>,
         participant_plans: Arc<ScyllaRollbackParticipantPlanStore>,
-        realm: ScyllaRealmRollbackPhysicalArchiveOwner,
+        realm_archive: ScyllaRealmRollbackPhysicalArchiveStore,
         coordinator_archive_keyspace: CqlKeyspaceName,
         coordinator_source_keyspace: CqlKeyspaceName,
         checkpoint_tree_height: u8,
@@ -862,7 +860,7 @@ impl ScyllaRollbackGlobalArchiveBarrierOwner {
             canonical_head,
             commit_sources,
             participant_plans,
-            realm,
+            realm_archive,
             coordinator_archive_keyspace,
             coordinator_source_keyspace,
             checkpoint_tree_height,
@@ -1270,9 +1268,21 @@ impl ScyllaRollbackGlobalArchiveBarrierOwner {
                 realm_id: participant.realm_id(),
                 realm_sub_id: participant.realm_sub_id(),
             };
-            let completion = self.realm
-                .recover_participant_completion(network, authority, &plan)
-                .await?;
+            let completion = self
+                .realm_archive
+                .read_participant_completion_selected(
+                    network,
+                    plan.target().chain_epoch().get(),
+                    authority,
+                    *plan.digest(),
+                )
+                .await
+                .map_err(backend)?
+                .ok_or(RollbackGlobalArchiveBarrierError::ParticipantMissing)?;
+            self.realm_archive
+                .revalidate_participant_completion(&completion)
+                .await
+                .map_err(backend)?;
             builder.push_realm(completion.completion())?;
         }
         let barrier = builder.finish()?;

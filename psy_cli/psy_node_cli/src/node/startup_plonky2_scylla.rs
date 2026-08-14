@@ -20,9 +20,7 @@ use psy_node_scylla::psy_setup::{
     setup_coordinator_psy_scylla_database_store_from_connection_string,
     setup_realm_processor_scylla_startup_composition,
 };
-use psy_node_scylla::rollback::{
-    PendingQueueSidecarSetupMode, ScyllaRealmRollbackRuntimeControl,
-};
+use psy_node_scylla::rollback::PendingQueueSidecarSetupMode;
 use psy_plonky2_circuits::{
     node::config::networks::resolver::PsyPlonky2NodeConfigResolver,
     protocol_types::ZKTypesPlonky2GoldilocksPoseidon,
@@ -412,10 +410,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
                 .as_deref()
             {
                 Some(keyspace) => Some(Arc::new(
-                    ScyllaRealmRollbackRuntimeControl::prepare(
-                        db.store.session.clone(),
-                        keyspace,
-                    )
+                    db.store.prepare_realm_rollback_runtime_control(keyspace)
                     .await?,
                 ) as Arc<dyn RealmRollbackRuntimeControl<<N as QNetworkHashTypes>::QHash>>),
                 None => None,

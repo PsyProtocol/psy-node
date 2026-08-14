@@ -79,17 +79,11 @@ impl<Hash: Q256BitHash> RealmRollbackParticipantCompletion<Hash> {
         {
             return Err(RealmRollbackParticipantCompletionError::BindingMismatch);
         }
-        let source_head_canonical = source_head.encode_canonical();
-        let target_canonical = target.to_canonical_bytes();
-        let slot = completion_slot(
+        let slot = Self::slot_for_plan(
             network,
             old_chain_epoch,
             authority,
             &participant_plan_digest,
-            source_head.revision().as_i64(),
-            &source_head_canonical,
-            &target_canonical,
-            &catalog_digest,
             &archive_store_fingerprint,
         );
         let mut selected = Self {
@@ -221,18 +215,33 @@ impl<Hash: Q256BitHash> RealmRollbackParticipantCompletion<Hash> {
     pub(super) const fn slot(&self) -> &[u8; 32] { &self.slot }
     pub(super) const fn digest(&self) -> &[u8; 32] { &self.digest }
     pub(super) fn canonical_bytes(&self) -> &[u8] { &self.canonical_bytes }
+
+    /// Stable participant address selected only by the immutable global plan
+    /// and the shared archive store.  Content is deliberately excluded: a
+    /// second archive result for the same participant/plan must conflict at
+    /// the same IF-NOT-EXISTS row instead of becoming an unselectable sibling.
+    pub(super) fn slot_for_plan(
+        network: NetworkId,
+        old_chain_epoch: u64,
+        authority: AuthorityScope,
+        participant_plan_digest: &[u8; 32],
+        archive_store_fingerprint: &[u8; 32],
+    ) -> [u8; 32] {
+        completion_slot(
+            network,
+            old_chain_epoch,
+            authority,
+            participant_plan_digest,
+            archive_store_fingerprint,
+        )
+    }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn completion_slot(
     network: NetworkId,
     old_chain_epoch: u64,
     authority: AuthorityScope,
     participant_plan_digest: &[u8; 32],
-    source_revision: i64,
-    source_head_canonical: &[u8],
-    target_canonical: &[u8],
-    catalog_digest: &[u8; 32],
     archive_store_fingerprint: &[u8; 32],
 ) -> [u8; 32] {
     let AuthorityScope::Realm { realm_id, realm_sub_id } = authority else { unreachable!() };
@@ -243,10 +252,6 @@ fn completion_slot(
     hasher.update(realm_id.to_be_bytes());
     hasher.update(realm_sub_id.to_be_bytes());
     hasher.update(participant_plan_digest);
-    hasher.update(source_revision.to_be_bytes());
-    hasher.update(source_head_canonical);
-    hasher.update(target_canonical);
-    hasher.update(catalog_digest);
     hasher.update(archive_store_fingerprint);
     hasher.finalize().into()
 }
@@ -311,9 +316,10 @@ mod tests {
     fn slot_is_stable_but_content_digest_is_separate() {
         let network = NetworkId::from_network_type(PsyChainNetworkType::LocalDevnet);
         let authority = AuthorityScope::Realm { realm_id: 3, realm_sub_id: 4 };
-        let first = completion_slot(network, 9, authority, &[1; 32], 7, &[2; 10], &[3; 65], &[4; 32], &[5; 32]);
-        let second = completion_slot(network, 9, authority, &[1; 32], 7, &[2; 10], &[3; 65], &[4; 32], &[5; 32]);
+        let first = completion_slot(network, 9, authority, &[1; 32], &[5; 32]);
+        let second = completion_slot(network, 9, authority, &[1; 32], &[5; 32]);
         assert_eq!(first, second);
+        assert_ne!(first, completion_slot(network, 9, authority, &[2; 32], &[5; 32]));
         assert_ne!(completion_digest(b"first"), completion_digest(b"second"));
     }
 }
