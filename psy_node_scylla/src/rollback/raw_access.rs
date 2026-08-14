@@ -207,6 +207,7 @@ pub const RAW_SCYLLA_ACCESS_ALLOWLIST: &[RawScyllaAccessAllowance] = &[
     allow!("psy_node_scylla/tests/rollback_pending_counter.rs", TestHarness),
     allow!("psy_node_scylla/tests/rollback_reward_tag_tree.rs", TestHarness),
     allow!("psy_node_scylla/tests/rollback_rf3_gate.rs", TestHarness),
+    allow!("psy_node_scylla/tests/rollback_joint_delete_scylla.rs", TestHarness),
     allow!("psy_node_scylla/tests/rollback_timestamp_prototype.rs", TestHarness),
     allow!("psy_node_scylla/tests/rf3/d04b6h22e_consumer_gate.rs", TestHarness),
     allow!("psy_node_scylla/tests/rf3/d04b6h22e2b_segment_lifecycle.rs", TestHarness),
