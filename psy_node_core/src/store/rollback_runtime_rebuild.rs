@@ -14,6 +14,7 @@ use psy_data::protocol::{
 use sha2::{Digest, Sha256};
 
 use super::pending_generation_identity::PendingGenerationContext;
+use super::pending_generation::ProcNamespacePrefix;
 
 const DIRECTIVE_DOMAIN: &[u8] = b"psy.rollback.runtime-rebuild-directive.v1\0";
 const REPORT_DOMAIN: &[u8] = b"psy.rollback.runtime-rebuild-report.v1\0";
@@ -56,25 +57,23 @@ impl<Hash: Q256BitHash> RollbackRuntimeRebuildDirective<Hash> {
         {
             return Err(RollbackRuntimeRebuildError::ZeroCommitment);
         }
-        match authority {
-            AuthorityScope::Coordinator if processing.is_some() || gathering.is_some() => {
-                return Err(RollbackRuntimeRebuildError::UnexpectedPendingContexts)
-            }
-            AuthorityScope::Realm { .. } => {
-                let (Some(processing), Some(gathering)) = (processing, gathering) else {
-                    return Err(RollbackRuntimeRebuildError::MissingPendingContexts);
-                };
-                if gathering.pending_id().get()
-                    != processing
-                        .pending_id()
-                        .get()
-                        .checked_add(1)
-                        .ok_or(RollbackRuntimeRebuildError::PendingOverflow)?
-                {
-                    return Err(RollbackRuntimeRebuildError::NonAdjacentPendingContexts);
-                }
-            }
-            AuthorityScope::Coordinator => {}
+        let (Some(processing), Some(gathering)) = (processing, gathering) else {
+            return Err(RollbackRuntimeRebuildError::MissingPendingContexts);
+        };
+        if gathering.pending_id().get()
+            != processing
+                .pending_id()
+                .get()
+                .checked_add(1)
+                .ok_or(RollbackRuntimeRebuildError::PendingOverflow)?
+        {
+            return Err(RollbackRuntimeRebuildError::NonAdjacentPendingContexts);
+        }
+        let prefix = ProcNamespacePrefix::for_authority(target.network_id(), authority);
+        if processing.proc_checkpoint_id() != prefix.derive_proc_id(processing.pending_id())
+            || gathering.proc_checkpoint_id() != prefix.derive_proc_id(gathering.pending_id())
+        {
+            return Err(RollbackRuntimeRebuildError::ProcNamespaceMismatch);
         }
         let digest = directive_digest(
             authority,
@@ -84,8 +83,8 @@ impl<Hash: Q256BitHash> RollbackRuntimeRebuildDirective<Hash> {
             &global_restore_barrier_digest,
             &participant_restore_slot,
             &participant_restore_digest,
-            processing,
-            gathering,
+            Some(processing),
+            Some(gathering),
         );
         Ok(Self {
             authority,
@@ -95,8 +94,8 @@ impl<Hash: Q256BitHash> RollbackRuntimeRebuildDirective<Hash> {
             global_restore_barrier_digest,
             participant_restore_slot,
             participant_restore_digest,
-            processing,
-            gathering,
+            processing: Some(processing),
+            gathering: Some(gathering),
             digest,
         })
     }
@@ -368,9 +367,9 @@ pub fn restored_target<Hash: Q256BitHash>(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RollbackRuntimeRebuildError {
     ZeroCommitment,
-    UnexpectedPendingContexts,
     MissingPendingContexts,
     NonAdjacentPendingContexts,
+    ProcNamespaceMismatch,
     PendingOverflow,
     EpochOverflow,
     CheckpointOverflow,
@@ -393,6 +392,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::store::typed::UniquePendingId;
 
     type Hash = Hash256;
 
@@ -408,19 +408,35 @@ mod tests {
     }
 
     fn realm_directive() -> RollbackRuntimeRebuildDirective<Hash> {
+        let authority = AuthorityScope::Realm {
+            realm_id: 7,
+            realm_sub_id: 2,
+        };
+        let prefix = ProcNamespacePrefix::for_authority(target().network_id(), authority);
+        let processing = PendingGenerationContext::try_from_legacy(
+            71,
+            prefix
+                .derive_proc_id(UniquePendingId::try_new(71).unwrap())
+                .as_u128(),
+        )
+        .unwrap();
+        let gathering = PendingGenerationContext::try_from_legacy(
+            72,
+            prefix
+                .derive_proc_id(UniquePendingId::try_new(72).unwrap())
+                .as_u128(),
+        )
+        .unwrap();
         RollbackRuntimeRebuildDirective::try_from_storage(
-            AuthorityScope::Realm {
-                realm_id: 7,
-                realm_sub_id: 2,
-            },
+            authority,
             target(),
             [1; 32],
             [2; 32],
             [3; 32],
             [4; 32],
             [5; 32],
-            Some(PendingGenerationContext::try_from_legacy(71, 701).unwrap()),
-            Some(PendingGenerationContext::try_from_legacy(72, 702).unwrap()),
+            Some(processing),
+            Some(gathering),
         )
         .unwrap()
     }
@@ -433,40 +449,99 @@ mod tests {
         assert_eq!(directive.gathering().unwrap().pending_id().get(), 72);
         assert_ne!(directive.digest(), &[0; 32]);
 
+        let authority = directive.authority();
+        let prefix = ProcNamespacePrefix::for_authority(target().network_id(), authority);
+        let processing = PendingGenerationContext::try_from_legacy(
+            71,
+            prefix.derive_proc_id(directive.processing().unwrap().pending_id()).as_u128(),
+        )
+        .unwrap();
+        let non_adjacent = PendingGenerationContext::try_from_legacy(
+            73,
+            prefix
+                .derive_proc_id(UniquePendingId::try_new(73).unwrap())
+                .as_u128(),
+        )
+        .unwrap();
         assert_eq!(
             RollbackRuntimeRebuildDirective::try_from_storage(
-                AuthorityScope::Realm {
-                    realm_id: 7,
-                    realm_sub_id: 2,
-                },
+                authority,
                 target(),
                 [1; 32],
                 [2; 32],
                 [3; 32],
                 [4; 32],
                 [5; 32],
-                Some(PendingGenerationContext::try_from_legacy(71, 701).unwrap()),
-                Some(PendingGenerationContext::try_from_legacy(73, 703).unwrap()),
+                Some(processing),
+                Some(non_adjacent),
             ),
             Err(RollbackRuntimeRebuildError::NonAdjacentPendingContexts)
         );
     }
 
     #[test]
-    fn coordinator_directive_rejects_realm_contexts() {
+    fn coordinator_directive_requires_fresh_authority_contexts() {
+        let target = target();
+        let prefix = ProcNamespacePrefix::for_authority(
+            target.network_id(),
+            AuthorityScope::Coordinator,
+        );
+        let processing_pending = UniquePendingId::try_new(71).unwrap();
+        let gathering_pending = UniquePendingId::try_new(72).unwrap();
+        let processing = PendingGenerationContext::try_from_legacy(
+            71,
+            prefix.derive_proc_id(processing_pending).as_u128(),
+        )
+        .unwrap();
+        let gathering = PendingGenerationContext::try_from_legacy(
+            72,
+            prefix.derive_proc_id(gathering_pending).as_u128(),
+        )
+        .unwrap();
+        let directive = RollbackRuntimeRebuildDirective::try_from_storage(
+            AuthorityScope::Coordinator,
+            target,
+            [1; 32],
+            [2; 32],
+            [3; 32],
+            [4; 32],
+            [5; 32],
+            Some(processing),
+            Some(gathering),
+        )
+        .unwrap();
+        assert_eq!(directive.processing(), Some(processing));
+        assert_eq!(directive.gathering(), Some(gathering));
+
+        let forged = PendingGenerationContext::try_from_legacy(71, 701).unwrap();
         assert_eq!(
             RollbackRuntimeRebuildDirective::try_from_storage(
                 AuthorityScope::Coordinator,
-                target(),
+                target,
                 [1; 32],
                 [2; 32],
                 [3; 32],
                 [4; 32],
                 [5; 32],
-                Some(PendingGenerationContext::try_from_legacy(71, 701).unwrap()),
+                Some(forged),
+                Some(gathering),
+            ),
+            Err(RollbackRuntimeRebuildError::ProcNamespaceMismatch)
+        );
+
+        assert_eq!(
+            RollbackRuntimeRebuildDirective::try_from_storage(
+                AuthorityScope::Coordinator,
+                target,
+                [1; 32],
+                [2; 32],
+                [3; 32],
+                [4; 32],
+                [5; 32],
+                None,
                 None,
             ),
-            Err(RollbackRuntimeRebuildError::UnexpectedPendingContexts)
+            Err(RollbackRuntimeRebuildError::MissingPendingContexts)
         );
     }
 

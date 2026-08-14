@@ -113,15 +113,12 @@ impl ScyllaRollbackGlobalRestoreOrchestrator {
         // harmless and are resumed by exact IFNE readback on retry.
         let coordinator_directive = self
             .runtime_rebuild
-            .coordinator_directive(&barrier, coordinator)
+            .persist_or_recover_coordinator_directive(&barrier, coordinator)
+            .await
             .map_err(backend)?;
         let realm_directives = self
             .runtime_rebuild
             .realm_directives(&barrier, realm_restores)
-            .map_err(backend)?;
-        self.runtime_rebuild
-            .persist_directive(coordinator_directive)
-            .await
             .map_err(backend)?;
         for directive in &realm_directives {
             self.runtime_rebuild

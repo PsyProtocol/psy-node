@@ -15,11 +15,13 @@ use psy_data::protocol::{
 };
 use psy_node_core::store::{
     canonical_head::StoredCanonicalHead,
+    pending_generation::ProcNamespacePrefix,
     pending_generation_identity::PendingGenerationContext,
     rollback_control::RollbackControlState,
     rollback_runtime_rebuild::{
         RollbackRuntimeRebuildDirective, RollbackRuntimeRebuildReport, restored_target,
     },
+    typed::UniquePendingId,
 };
 use scylla::{
     client::session::Session,
@@ -32,8 +34,14 @@ use super::{
     CqlKeyspaceName,
     coordinator_rollback_archive_store::COORDINATOR_ROLLBACK_SUFFIX_ARCHIVE_TABLE,
     coordinator_rollback_delete_completion_store::PersistedCoordinatorRollbackDeleteCompletion,
+    pending_counter::{
+        PendingCounterAdapter, PendingCounterAllocationOutcome, PendingCounterExpected,
+        PendingCounterReadState, SealedPendingCounterAllocation,
+    },
     realm_rollback_physical_archive_store::PersistedRealmRollbackTargetRestoreCompletion,
-    rollback_global_restore_barrier::PersistedRollbackGlobalRestoreBarrier,
+    rollback_global_restore_barrier::{
+        PersistedRollbackGlobalRestoreBarrier, RollbackGlobalRestoreBarrier,
+    },
 };
 
 const DIRECTIVE_KEY_DOMAIN: i16 = -11;
@@ -299,6 +307,7 @@ impl<Hash> PersistedRollbackRuntimeRebuildReport<Hash> {
 
 pub(super) struct ScyllaRollbackRuntimeRebuildStore {
     session: Arc<Session>,
+    counter: Arc<PendingCounterAdapter>,
     fingerprint: [u8; 32],
     insert: PreparedStatement,
     read: PreparedStatement,
@@ -308,6 +317,7 @@ impl ScyllaRollbackRuntimeRebuildStore {
     pub(super) async fn prepare(
         session: Arc<Session>,
         keyspace: &CqlKeyspaceName,
+        counter: Arc<PendingCounterAdapter>,
     ) -> Result<Self, RollbackRuntimeRebuildStoreError> {
         let table = format!(
             "{}.{}",
@@ -323,36 +333,122 @@ impl ScyllaRollbackRuntimeRebuildStore {
         hasher.update(read.as_bytes());
         Ok(Self {
             session: session.clone(),
+            counter,
             fingerprint: hasher.finalize().into(),
             insert: prepare_lwt(&session, &insert).await?,
             read: prepare_read(&session, &read).await?,
         })
     }
 
-    pub(super) fn coordinator_directive<Hash: Q256BitHash>(
+    pub(super) async fn persist_or_recover_coordinator_directive<Hash: Q256BitHash>(
         &self,
         barrier: &PersistedRollbackGlobalRestoreBarrier<Hash>,
         coordinator: &PersistedCoordinatorRollbackDeleteCompletion<Hash>,
     ) -> Result<RollbackRuntimeRebuildDirective<Hash>, RollbackRuntimeRebuildStoreError> {
-        let barrier = barrier.barrier();
-        if barrier.coordinator_completion_slot() != coordinator.completion().slot()
-            || barrier.coordinator_completion_digest() != coordinator.completion().digest()
-            || barrier.target() != coordinator.completion().target()
+        let binding = barrier.barrier();
+        if binding.coordinator_completion_slot() != coordinator.completion().slot()
+            || binding.coordinator_completion_digest() != coordinator.completion().digest()
+            || binding.target() != coordinator.completion().target()
         {
             return Err(RollbackRuntimeRebuildStoreError::BindingMismatch);
         }
-        RollbackRuntimeRebuildDirective::try_from_storage(
-            AuthorityScope::Coordinator,
-            restored_target(*barrier.target()).map_err(model)?,
-            *barrier.participant_plan_digest(),
-            *barrier.slot(),
-            *barrier.digest(),
-            *coordinator.completion().slot(),
-            *coordinator.completion().digest(),
-            None,
-            None,
+        let target = restored_target(*binding.target()).map_err(model)?;
+        let authority = AuthorityScope::Coordinator;
+        let slot = directive_slot_for(
+            &target,
+            binding.participant_plan_digest(),
+            authority,
+            &self.fingerprint,
+        );
+        let selected = self
+            .read_row(
+                target.network_id(),
+                target.chain_epoch().get(),
+                binding.participant_plan_digest(),
+                DIRECTIVE_KEY_DOMAIN,
+                &slot,
+            )
+            .await?
+            .map(|bytes| StoredRuntimeDirective::decode(&bytes))
+            .transpose()?;
+
+        // The immutable directive is selected before observing the global
+        // counter on retry. Once either allocation succeeds, a fresh counter
+        // observation must not choose a different namespace.
+        let directive = match selected {
+            Some(stored) if stored.slot == slot => stored.directive,
+            Some(_) => return Err(RollbackRuntimeRebuildStoreError::Conflict),
+            None => {
+                let current = self.counter.observe_counter().await.map_err(backend)?;
+                let (processing, gathering) = coordinator_contexts(target.network_id(), current)?;
+                let candidate = RollbackRuntimeRebuildDirective::try_from_storage(
+                    authority,
+                    target,
+                    *binding.participant_plan_digest(),
+                    *binding.slot(),
+                    *binding.digest(),
+                    *coordinator.completion().slot(),
+                    *coordinator.completion().digest(),
+                    Some(processing),
+                    Some(gathering),
+                )
+                .map_err(model)?;
+                self.persist_directive(candidate).await?
+            }
+        };
+        require_coordinator_binding(&directive, binding, coordinator)?;
+
+        let request = binding
+            .deleting_head()
+            .rollback_control()
+            .requested()
+            .ok_or(RollbackRuntimeRebuildStoreError::BindingMismatch)?;
+        let processing = directive
+            .processing()
+            .ok_or(RollbackRuntimeRebuildStoreError::BindingMismatch)?;
+        let gathering = directive
+            .gathering()
+            .ok_or(RollbackRuntimeRebuildStoreError::BindingMismatch)?;
+        let processing_expected = pending_predecessor(processing.pending_id())?;
+        let processing_allocation = SealedPendingCounterAllocation::try_for_rollback(
+            processing_expected,
+            processing.proc_checkpoint_id(),
+            request.fence_window().new_branch_write(),
         )
-        .map_err(model)
+        .map_err(model)?;
+        let gathering_allocation = SealedPendingCounterAllocation::try_for_rollback(
+            PendingCounterExpected::Present(processing.pending_id()),
+            gathering.proc_checkpoint_id(),
+            request.fence_window().new_branch_write(),
+        )
+        .map_err(model)?;
+        if processing_allocation.candidate() != processing.pending_id()
+            || gathering_allocation.candidate() != gathering.pending_id()
+        {
+            return Err(RollbackRuntimeRebuildStoreError::BindingMismatch);
+        }
+        for allocation in [&processing_allocation, &gathering_allocation] {
+            let PendingCounterAllocationOutcome::Owned(owned) =
+                self.counter.allocate(allocation).await.map_err(backend)?
+            else {
+                return Err(RollbackRuntimeRebuildStoreError::CounterConflict);
+            };
+            if owned.pending() != allocation.candidate()
+                || owned.proc_id() != allocation.proc_id()
+                || owned.plan_digest() != allocation.digest()
+                || owned.write_timestamp_us() != allocation.write_timestamp_us()
+                || owned.write_kind() != allocation.write_kind()
+            {
+                return Err(RollbackRuntimeRebuildStoreError::BindingMismatch);
+            }
+        }
+        if self.counter.observe_counter().await.map_err(backend)?
+            != PendingCounterReadState::Current(gathering.pending_id())
+        {
+            return Err(RollbackRuntimeRebuildStoreError::CounterConflict);
+        }
+        self.revalidate_directive(&directive).await?;
+        Ok(directive)
     }
 
     pub(super) fn realm_directives<Hash: Q256BitHash>(
@@ -835,6 +931,73 @@ fn decode_context(
     }
 }
 
+fn coordinator_contexts(
+    network: NetworkId,
+    counter: PendingCounterReadState,
+) -> Result<(PendingGenerationContext, PendingGenerationContext), RollbackRuntimeRebuildStoreError> {
+    let processing_pending = match counter {
+        PendingCounterReadState::Uninitialized => UniquePendingId::try_new(1).map_err(model)?,
+        PendingCounterReadState::Current(current) => UniquePendingId::try_new(
+            current
+                .get()
+                .checked_add(1)
+                .ok_or(RollbackRuntimeRebuildStoreError::PendingOverflow)?,
+        )
+        .map_err(model)?,
+    };
+    let gathering_pending = UniquePendingId::try_new(
+        processing_pending
+            .get()
+            .checked_add(1)
+            .ok_or(RollbackRuntimeRebuildStoreError::PendingOverflow)?,
+    )
+    .map_err(model)?;
+    let prefix = ProcNamespacePrefix::for_authority(network, AuthorityScope::Coordinator);
+    Ok((
+        PendingGenerationContext::try_from_legacy(
+            processing_pending.get(),
+            prefix.derive_proc_id(processing_pending).as_u128(),
+        )
+        .map_err(model)?,
+        PendingGenerationContext::try_from_legacy(
+            gathering_pending.get(),
+            prefix.derive_proc_id(gathering_pending).as_u128(),
+        )
+        .map_err(model)?,
+    ))
+}
+
+fn pending_predecessor(
+    processing: UniquePendingId,
+) -> Result<PendingCounterExpected, RollbackRuntimeRebuildStoreError> {
+    match processing.get() {
+        1 => Ok(PendingCounterExpected::Absent),
+        value => UniquePendingId::try_new(value - 1)
+            .map(PendingCounterExpected::Present)
+            .map_err(model),
+    }
+}
+
+fn require_coordinator_binding<Hash: Q256BitHash>(
+    directive: &RollbackRuntimeRebuildDirective<Hash>,
+    barrier: &RollbackGlobalRestoreBarrier<Hash>,
+    coordinator: &PersistedCoordinatorRollbackDeleteCompletion<Hash>,
+) -> Result<(), RollbackRuntimeRebuildStoreError> {
+    if directive.authority() != AuthorityScope::Coordinator
+        || directive.target() != &restored_target(*barrier.target()).map_err(model)?
+        || directive.participant_plan_digest() != barrier.participant_plan_digest()
+        || directive.global_restore_barrier_slot() != barrier.slot()
+        || directive.global_restore_barrier_digest() != barrier.digest()
+        || directive.participant_restore_slot() != coordinator.completion().slot()
+        || directive.participant_restore_digest() != coordinator.completion().digest()
+        || directive.processing().is_none()
+        || directive.gathering().is_none()
+    {
+        return Err(RollbackRuntimeRebuildStoreError::BindingMismatch);
+    }
+    Ok(())
+}
+
 fn decode_applied(result: QueryResult) -> Result<bool, RollbackRuntimeRebuildStoreError> {
     let rows = result
         .into_rows_result()
@@ -878,6 +1041,10 @@ fn model(error: impl fmt::Display) -> RollbackRuntimeRebuildStoreError {
     RollbackRuntimeRebuildStoreError::Model(error.to_string())
 }
 
+fn backend(error: impl fmt::Display) -> RollbackRuntimeRebuildStoreError {
+    RollbackRuntimeRebuildStoreError::Backend(error.to_string())
+}
+
 fn indeterminate_or_read_error(
     execute_error: Option<String>,
     read_error: RollbackRuntimeRebuildStoreError,
@@ -903,11 +1070,14 @@ pub(super) enum RollbackRuntimeRebuildStoreError {
     NonCanonicalEncoding,
     MissingDirective,
     MissingAfterPersist,
+    PendingOverflow,
+    CounterConflict,
     NotVerifying,
     StoreFingerprintMismatch,
     Conflict,
     Indeterminate(String),
     Model(String),
+    Backend(String),
     Cql(String),
 }
 
@@ -942,6 +1112,11 @@ impl<'a> Cursor<'a> {
 
 #[cfg(test)]
 mod tests {
+    use psy_data::protocol::canonical_chain::NetworkId;
+    use psy_node_core::store::typed::UniquePendingId;
+
+    use super::*;
+
     #[test]
     fn runtime_rows_are_append_only_and_cannot_publish_the_head() {
         let source = include_str!("rollback_runtime_rebuild_store.rs")
@@ -954,5 +1129,56 @@ mod tests {
         assert!(!source.contains("CanonicalHeadTransition::complete_rollback"));
         assert!(!source.contains("hard_reset_and_truncate"));
         assert!(!source.contains("DELETE FROM"));
+    }
+
+    #[test]
+    fn coordinator_contexts_are_fresh_adjacent_and_authority_namespaced() {
+        let network = NetworkId::try_from_chain_id(1337).unwrap();
+        let current = UniquePendingId::try_new(40).unwrap();
+        let (processing, gathering) = coordinator_contexts(
+            network,
+            PendingCounterReadState::Current(current),
+        )
+        .unwrap();
+        let prefix = ProcNamespacePrefix::for_authority(network, AuthorityScope::Coordinator);
+        assert_eq!(processing.pending_id().get(), 41);
+        assert_eq!(gathering.pending_id().get(), 42);
+        assert_eq!(
+            processing.proc_checkpoint_id(),
+            prefix.derive_proc_id(processing.pending_id())
+        );
+        assert_eq!(
+            gathering.proc_checkpoint_id(),
+            prefix.derive_proc_id(gathering.pending_id())
+        );
+        assert_eq!(
+            pending_predecessor(processing.pending_id()).unwrap(),
+            PendingCounterExpected::Present(current)
+        );
+
+        let (first, second) = coordinator_contexts(
+            network,
+            PendingCounterReadState::Uninitialized,
+        )
+        .unwrap();
+        assert_eq!(first.pending_id().get(), 1);
+        assert_eq!(second.pending_id().get(), 2);
+        assert_eq!(
+            pending_predecessor(first.pending_id()).unwrap(),
+            PendingCounterExpected::Absent
+        );
+    }
+
+    #[test]
+    fn coordinator_directive_is_durable_before_counter_allocation() {
+        let source = include_str!("rollback_runtime_rebuild_store.rs")
+            .split("pub(super) fn realm_directives")
+            .next()
+            .expect("Coordinator slice");
+        let persist = source.find("self.persist_directive(candidate)").unwrap();
+        let allocate = source.find("self.counter.allocate(allocation)").unwrap();
+        assert!(persist < allocate);
+        assert!(source.contains("Some(stored) if stored.slot == slot"));
+        assert!(source.contains("self.revalidate_directive(&directive)"));
     }
 }
