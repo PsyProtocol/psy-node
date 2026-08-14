@@ -13,6 +13,7 @@ use psy_node_core::{
         worker_queue::QStandardWorkerQueuePublisher,
     },
     store::{
+        realm_processor_quiescence::RealmProcessorDrainRequest,
         rollback_runtime_rebuild::RollbackRuntimeRebuildDirective,
         traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore},
     },
@@ -27,9 +28,12 @@ use crate::{
             deploy_contract_gatherer::{DeployContractGatherer, DeployContractGathererConfig},
             register_user_gatherer::{RegisterUserGatherer, RegisterUserGathererConfig},
         },
-        PsyCoordinatorProcessor,
+        CoordinatorRollbackGathererPauseSet, PsyCoordinatorProcessor,
     },
-    queue::gatherer::EphemeralQueueGathererWithTree,
+    queue::gatherer::{
+        EphemeralQueueGathererWithTree, GathererActorRevision,
+        GathererPauseRequest,
+    },
 };
 
 impl<
@@ -81,6 +85,7 @@ where
             Option<Arc<dyn CoordinatorGutaDurableSubmissionStore<N::QHash>>>,
         normal_processing_owner: super::CoordinatorNormalProcessingOwner,
         rollback_restart_directive: Option<RollbackRuntimeRebuildDirective<N::QHash>>,
+        initial_rollback_drain: Option<RealmProcessorDrainRequest>,
     ) -> anyhow::Result<(
         Self,
         tokio::task::JoinHandle<Result<(), anyhow::Error>>,
@@ -148,21 +153,51 @@ where
         */
         let branch_exact = normal_processing_owner.is_branch_exact();
         let guta_base_queue_key = db.guta_queue_key_status_manager.get_queue_key()?;
-        let (guta_queue_gatherer, guta_join_handle) = if branch_exact {
-            EphemeralQueueGathererWithTree::new_coordinator_durable_with_status::<
+        let (guta_queue_gatherer, guta_join_handle, guta_pause) = if branch_exact {
+            let (gatherer, join) = EphemeralQueueGathererWithTree::new_coordinator_durable_with_status::<
                 CoordinatorGUTAUpdateGathererConfig<N, TempDatabase, ProofStore, FileSystem>,
                 N::QHash,
                 N::HasherBase,
                 CoordinatorGUTAUpdateGatherer<N, TempDatabase, ProofStore, FileSystem>,
             >(
                 guta_create_builder_config,
-                guta_base_queue_key,
+                guta_base_queue_key.clone(),
                 global_user_tree,
                 db.status.clone(),
                 psy_node_core::queue::coordinator_processor_durable_capture::CoordinatorProcessorSourceKind::Guta,
-            )
+            );
+            let pause = if let Some(drain) = initial_rollback_drain {
+                Some(gatherer.pause(GathererPauseRequest::new(
+                    drain,
+                    GathererActorRevision::try_new(0)?,
+                    guta_base_queue_key.unique_id,
+                )).await?)
+            } else {
+                None
+            };
+            (gatherer, join, pause)
+        } else if let Some(drain) = initial_rollback_drain {
+            let (gatherer, join, pause) = EphemeralQueueGathererWithTree::new_with_status_initially_paused::<
+                GUTAUpdateQueue,
+                CoordinatorGUTAUpdateGathererConfig<N, TempDatabase, ProofStore, FileSystem>,
+                N::QHash,
+                N::HasherBase,
+                CoordinatorGUTAUpdateGatherer<N, TempDatabase, ProofStore, FileSystem>,
+            >(
+                db.guta_update_queue.clone(),
+                guta_create_builder_config,
+                guta_base_queue_key.clone(),
+                global_user_tree,
+                db.status.clone(),
+                GathererPauseRequest::new(
+                    drain,
+                    GathererActorRevision::try_new(0)?,
+                    guta_base_queue_key.unique_id,
+                ),
+            ).await?;
+            (gatherer, join, Some(pause))
         } else {
-            EphemeralQueueGathererWithTree::new_with_status::<
+            let (gatherer, join) = EphemeralQueueGathererWithTree::new_with_status::<
             GUTAUpdateQueue,
             CoordinatorGUTAUpdateGathererConfig<N, TempDatabase, ProofStore, FileSystem>,
             N::QHash,
@@ -174,7 +209,8 @@ where
                 guta_base_queue_key,
                 global_user_tree,
                 db.status.clone(),
-            )
+            );
+            (gatherer, join, None)
         };
 
         let register_config = RegisterUserGathererConfig {
@@ -189,21 +225,51 @@ where
             file_system: file_system.clone(),
         };
         let register_base_queue_key = db.register_user_queue_key_status_manager.get_queue_key()?;
-        let (register_user_queue_gatherer, register_user_join_handle) = if branch_exact {
-            EphemeralQueueGathererWithTree::new_coordinator_durable_with_status::<
+        let (register_user_queue_gatherer, register_user_join_handle, registration_pause) = if branch_exact {
+            let (gatherer, join) = EphemeralQueueGathererWithTree::new_coordinator_durable_with_status::<
                 RegisterUserGathererConfig<N, TempDatabase, FileSystem>,
                 N::QHash,
                 N::HasherBase,
                 RegisterUserGatherer<N, TempDatabase, FileSystem>,
             >(
                 register_config,
-                register_base_queue_key,
+                register_base_queue_key.clone(),
                 user_registration_tree,
                 db.status.clone(),
                 psy_node_core::queue::coordinator_processor_durable_capture::CoordinatorProcessorSourceKind::Registration,
-            )
+            );
+            let pause = if let Some(drain) = initial_rollback_drain {
+                Some(gatherer.pause(GathererPauseRequest::new(
+                    drain,
+                    GathererActorRevision::try_new(0)?,
+                    register_base_queue_key.unique_id,
+                )).await?)
+            } else {
+                None
+            };
+            (gatherer, join, pause)
+        } else if let Some(drain) = initial_rollback_drain {
+            let (gatherer, join, pause) = EphemeralQueueGathererWithTree::new_with_status_initially_paused::<
+                RegisterUserQueue,
+                RegisterUserGathererConfig<N, TempDatabase, FileSystem>,
+                N::QHash,
+                N::HasherBase,
+                RegisterUserGatherer<N, TempDatabase, FileSystem>,
+            >(
+                db.register_user_queue.clone(),
+                register_config,
+                register_base_queue_key.clone(),
+                user_registration_tree,
+                db.status.clone(),
+                GathererPauseRequest::new(
+                    drain,
+                    GathererActorRevision::try_new(0)?,
+                    register_base_queue_key.unique_id,
+                ),
+            ).await?;
+            (gatherer, join, Some(pause))
         } else {
-            EphemeralQueueGathererWithTree::new_with_status::<
+            let (gatherer, join) = EphemeralQueueGathererWithTree::new_with_status::<
             RegisterUserQueue,
             RegisterUserGathererConfig<N, TempDatabase, FileSystem>,
             N::QHash,
@@ -215,7 +281,8 @@ where
                 register_base_queue_key,
                 user_registration_tree,
                 db.status.clone(),
-            )
+            );
+            (gatherer, join, None)
         };
         let deploy_config = DeployContractGathererConfig {
             realm_id_u64: db.ids.realm_id_u64,
@@ -229,21 +296,51 @@ where
             file_system: file_system.clone(),
         };
         let deploy_base_queue_key = db.deploy_contract_queue_key_status_manager.get_queue_key()?;
-        let (deploy_contract_queue_gatherer, deploy_contract_join_handle) = if branch_exact {
-            EphemeralQueueGathererWithTree::new_coordinator_durable_with_status::<
+        let (deploy_contract_queue_gatherer, deploy_contract_join_handle, deploy_pause) = if branch_exact {
+            let (gatherer, join) = EphemeralQueueGathererWithTree::new_coordinator_durable_with_status::<
                 DeployContractGathererConfig<N, TempDatabase, FileSystem>,
                 N::QHash,
                 N::HasherBase,
                 DeployContractGatherer<N, TempDatabase, FileSystem>,
             >(
                 deploy_config,
-                deploy_base_queue_key,
+                deploy_base_queue_key.clone(),
                 global_contract_tree,
                 db.status.clone(),
                 psy_node_core::queue::coordinator_processor_durable_capture::CoordinatorProcessorSourceKind::Deploy,
-            )
+            );
+            let pause = if let Some(drain) = initial_rollback_drain {
+                Some(gatherer.pause(GathererPauseRequest::new(
+                    drain,
+                    GathererActorRevision::try_new(0)?,
+                    deploy_base_queue_key.unique_id,
+                )).await?)
+            } else {
+                None
+            };
+            (gatherer, join, pause)
+        } else if let Some(drain) = initial_rollback_drain {
+            let (gatherer, join, pause) = EphemeralQueueGathererWithTree::new_with_status_initially_paused::<
+                DeployContractQueue,
+                DeployContractGathererConfig<N, TempDatabase, FileSystem>,
+                N::QHash,
+                N::HasherBase,
+                DeployContractGatherer<N, TempDatabase, FileSystem>,
+            >(
+                db.deploy_contract_queue.clone(),
+                deploy_config,
+                deploy_base_queue_key.clone(),
+                global_contract_tree,
+                db.status.clone(),
+                GathererPauseRequest::new(
+                    drain,
+                    GathererActorRevision::try_new(0)?,
+                    deploy_base_queue_key.unique_id,
+                ),
+            ).await?;
+            (gatherer, join, Some(pause))
         } else {
-            EphemeralQueueGathererWithTree::new_with_status::<
+            let (gatherer, join) = EphemeralQueueGathererWithTree::new_with_status::<
             DeployContractQueue,
             DeployContractGathererConfig<N, TempDatabase, FileSystem>,
             N::QHash,
@@ -255,7 +352,20 @@ where
                 deploy_base_queue_key,
                 global_contract_tree,
                 db.status.clone(),
-            )
+            );
+            (gatherer, join, None)
+        };
+
+        let initial_rollback_pauses = match (guta_pause, registration_pause, deploy_pause) {
+            (Some(guta), Some(registration), Some(deploy)) => {
+                Some(CoordinatorRollbackGathererPauseSet {
+                    guta,
+                    registration,
+                    deploy,
+                })
+            }
+            (None, None, None) => None,
+            _ => anyhow::bail!("Coordinator gatherers did not share one initial pause boundary"),
         };
 
         Ok((
@@ -266,6 +376,7 @@ where
                 deploy_contract_queue_gatherer: deploy_contract_queue_gatherer,
                 proof_worker_queue_max_time_ms: u64::MAX,
                 normal_processing_owner: Some(normal_processing_owner),
+                initial_rollback_pauses,
             },
             guta_join_handle,
             register_user_join_handle,

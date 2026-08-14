@@ -10,6 +10,7 @@ use psy_node_core::{
     psy_temp_db::StandardProcessorTempDBStoreBase,
     queue::{ephemeral::QStandardEphemeralQueueSubscriber, worker_queue::QStandardWorkerQueuePublisher},
     store::{
+        realm_processor_quiescence::RealmProcessorDrainRequest,
         rollback_runtime_rebuild::RealmRollbackRuntimeControl,
         rollback_runtime_rebuild::RollbackRuntimeRebuildDirective,
         traits::proof_store::QParthProofStore,
@@ -18,7 +19,10 @@ use psy_node_core::{
 
 use crate::{
     backup::realm::load_realm_memory_trees_from_db,
-    queue::gatherer::EphemeralQueueGathererWithTree,
+    queue::gatherer::{
+        EphemeralQueueGathererWithTree, GathererActorRevision,
+        GathererPauseRequest,
+    },
     realm::processor::{
         core::{
             control::new_realm_processor_control_plane, PsyRealmProcessor,
@@ -63,6 +67,7 @@ where
         rollback_runtime_control:
             Option<Arc<dyn RealmRollbackRuntimeControl<N::QHash>>>,
         rollback_restart_directive: Option<RollbackRuntimeRebuildDirective<N::QHash>>,
+        initial_rollback_drain: Option<RealmProcessorDrainRequest>,
     ) -> anyhow::Result<(Self, tokio::task::JoinHandle<Result<(), anyhow::Error>>)> {
         tracing::info!("[REALM_STARTUP] processor new start");
         db.ensure_genesis_applied(genesis_block_update.clone()).await?;
@@ -163,24 +168,60 @@ where
         let branch_exact = normal_commit_owner.is_branch_exact();
         let mut gatherer_queue_key =
             db.guta_queue_key_status_manager.get_queue_key()?;
-        let (guta_queue_gatherer, guta_join_handle) = if branch_exact {
+        let (guta_queue_gatherer, guta_join_handle, initial_rollback_pause) = if branch_exact {
             // The branch-exact actor is command-only: it owns no subscriber
             // and is bound to the already-closed processing generation.
             gatherer_queue_key.unique_id =
                 db.state.processing_proc_checkpoint_unique_id;
-            EphemeralQueueGathererWithTree::new_durable_with_status::<
+            let (gatherer, join) = EphemeralQueueGathererWithTree::new_durable_with_status::<
                 RealmGUTAEndCapGathererConfig<N, TempDatabase, FileSystem>,
                 N::QHash,
                 N::HasherBase,
                 RealmGUTAEndCapGatherer<N, TempDatabase, FileSystem>,
             >(
                 guta_create_builder_config,
-                gatherer_queue_key,
+                gatherer_queue_key.clone(),
                 global_user_tree,
                 db.status.clone(),
-            )
+            );
+            let pause = if let Some(drain) = initial_rollback_drain {
+                Some(
+                    gatherer
+                        .pause(GathererPauseRequest::new(
+                            drain,
+                            GathererActorRevision::try_new(0)?,
+                            gatherer_queue_key.unique_id,
+                        ))
+                        .await?,
+                )
+            } else {
+                None
+            };
+            (gatherer, join, pause)
+        } else if let Some(drain) = initial_rollback_drain {
+            let (gatherer, join, pause) =
+                EphemeralQueueGathererWithTree::new_with_status_initially_paused::<
+                    GUTAUpdateQueue,
+                    RealmGUTAEndCapGathererConfig<N, TempDatabase, FileSystem>,
+                    N::QHash,
+                    N::HasherBase,
+                    RealmGUTAEndCapGatherer<N, TempDatabase, FileSystem>,
+                >(
+                    db.guta_update_queue.clone(),
+                    guta_create_builder_config,
+                    gatherer_queue_key.clone(),
+                    global_user_tree,
+                    db.status.clone(),
+                    GathererPauseRequest::new(
+                        drain,
+                        GathererActorRevision::try_new(0)?,
+                        gatherer_queue_key.unique_id,
+                    ),
+                )
+                .await?;
+            (gatherer, join, Some(pause))
         } else {
-            EphemeralQueueGathererWithTree::new_with_status::<
+            let (gatherer, join) = EphemeralQueueGathererWithTree::new_with_status::<
                 GUTAUpdateQueue,
                 RealmGUTAEndCapGathererConfig<N, TempDatabase, FileSystem>,
                 N::QHash,
@@ -192,7 +233,8 @@ where
                 gatherer_queue_key,
                 global_user_tree,
                 db.status.clone(),
-            )
+            );
+            (gatherer, join, None)
         };
 
         Ok((
@@ -205,6 +247,7 @@ where
                 normal_commit_owner: Some(normal_commit_owner),
                 control_owner: None,
                 rollback_runtime_control,
+                initial_rollback_pause,
             },
             guta_join_handle,
         ))

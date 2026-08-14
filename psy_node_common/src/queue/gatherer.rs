@@ -623,9 +623,68 @@ impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase + 'static, Output:
                 tree,
                 qk.clone(),
                 trigger_rx,
+                None,
             ));
 
         (Self { qk, trigger_tx }, jh)
+    }
+
+    /// Spawn the legacy subscriber-backed actor directly at an exact paused
+    /// boundary.  The initial pause is installed before builder creation,
+    /// consumer provisioning or the first queue poll, so rollback maintenance
+    /// startup cannot consume an abandoned generation before the Processor
+    /// runner gets a chance to issue its ordinary pause command.
+    pub async fn new_with_status_initially_paused<
+        Sub: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
+        C: Clone + Send + Sync + 'static,
+        Hash: QHashBase + Send + Sync + 'static,
+        Hasher: MerkleZeroHasher<Hash> + Send + Sync + 'static,
+        Builder: QueueGathererItemBuilderWithTree<
+                C,
+                SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
+                Output = Output,
+            > + Send
+            + Sync
+            + 'static,
+    >(
+        stream: Arc<Sub>,
+        create_builder_config: C,
+        base_queue_key: QPStandardUniqueIdQueueKey<QUEUE_TOPIC_ID, QueueItem>,
+        tree: SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
+        status: ProcessorStatus,
+        request: GathererPauseRequest,
+    ) -> Result<
+        (
+            Self,
+            tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+            GathererPauseReceipt,
+        ),
+        GathererPauseError,
+    > {
+        let qk = QueueKeyStatusManager::new_with_status(base_queue_key.clone(), status);
+        let (trigger_tx, trigger_rx) = mpsc::channel::<TreeGathererCommand<Output>>(1);
+        let (pause_tx, pause_rx) = oneshot::channel();
+        let jh = tokio::spawn(gatherer_runner_for_tree::<
+            QUEUE_TOPIC_ID,
+            QueueItem,
+            Sub,
+            Builder,
+            C,
+            Hash,
+            Hasher,
+        >(
+            stream,
+            create_builder_config,
+            base_queue_key,
+            tree,
+            qk.clone(),
+            trigger_rx,
+            Some((request, pause_tx)),
+        ));
+        let receipt = pause_rx
+            .await
+            .map_err(|_| GathererPauseError::ResponseChannelClosed)??;
+        Ok((Self { qk, trigger_tx }, jh, receipt))
     }
 
     /// Spawn the branch-exact command-only gatherer.
@@ -1875,6 +1934,106 @@ fn can_advance_durable_actor(
         })
 }
 
+/// Hold a newly spawned legacy actor at a rollback boundary before it has
+/// created a builder or touched its subscriber. `true` means the exact pause
+/// receipt was consumed by a valid resume and ordinary gathering may start;
+/// `false` means the actor was stopped while still side-effect free.
+async fn wait_at_initial_pause<const QUEUE_TOPIC_ID: u32, Output: Send + Sync>(
+    trigger_rx: &mut mpsc::Receiver<TreeGathererCommand<Output>>,
+    actor_identity: &Arc<GathererActorIdentity>,
+    request: GathererPauseRequest,
+    actor_revision: &mut GathererActorRevision,
+    realm_id: u64,
+    realm_sub_id: u64,
+    unique_id: u128,
+) -> Result<bool, GathererPauseError> {
+    loop {
+        let Some(command) = trigger_rx.recv().await else {
+            return Ok(false);
+        };
+        match command {
+            TreeGathererCommand::Pause {
+                request: retry,
+                responder,
+            } => {
+                let result = if retry == request {
+                    Ok(GathererPauseReceipt {
+                        actor_identity: actor_identity.clone(),
+                        request,
+                        revision: *actor_revision,
+                        queue_topic_id: QUEUE_TOPIC_ID,
+                        realm_id,
+                        realm_sub_id,
+                        unique_id,
+                    })
+                } else {
+                    Err(GathererPauseError::AlreadyPausedAtDifferentRequest)
+                };
+                let _ = responder.send(result);
+            }
+            TreeGathererCommand::Resume { receipt, responder } => {
+                if !Arc::ptr_eq(actor_identity, &receipt.actor_identity) {
+                    let _ = responder.send(Err(GathererPauseError::ReceiptFromDifferentActor));
+                    continue;
+                }
+                if receipt.request != request
+                    || receipt.revision != *actor_revision
+                    || receipt.unique_id != unique_id
+                {
+                    let _ = responder.send(Err(GathererPauseError::StaleReceipt));
+                    continue;
+                }
+                *actor_revision = actor_revision.checked_next()?;
+                let _ = responder.send(Ok(GathererBoundaryStatus {
+                    revision: *actor_revision,
+                    phase: GathererBoundaryPhase::Running,
+                    request: None,
+                    unique_id,
+                }));
+                return Ok(true);
+            }
+            TreeGathererCommand::StopPausedWithoutFinalize { receipt, responder } => {
+                if !Arc::ptr_eq(actor_identity, &receipt.actor_identity) {
+                    let _ = responder.send(Err(GathererPauseError::ReceiptFromDifferentActor));
+                    continue;
+                }
+                if receipt.request != request
+                    || receipt.revision != *actor_revision
+                    || receipt.unique_id != unique_id
+                {
+                    let _ = responder.send(Err(GathererPauseError::StaleReceipt));
+                    continue;
+                }
+                let _ = responder.send(Ok(()));
+                return Ok(false);
+            }
+            TreeGathererCommand::Status(responder) => {
+                let _ = responder.send(GathererBoundaryStatus {
+                    revision: *actor_revision,
+                    phase: GathererBoundaryPhase::Paused,
+                    request: Some(request),
+                    unique_id,
+                });
+            }
+            TreeGathererCommand::Finalize { responder, .. } => {
+                let _ = responder.send(Err(GathererPauseError::FinalizeWhilePaused.into()));
+            }
+            TreeGathererCommand::ApplyDurableGeneration { responder, .. } => {
+                let _ = responder.send(Err(GathererPauseError::DurableGenerationOnLegacyActor));
+            }
+            TreeGathererCommand::FinalizeDurableGeneration { responder, .. } => {
+                let _ = responder.send(Err(GathererPauseError::DurableGenerationOnLegacyActor));
+            }
+            TreeGathererCommand::ApplyCoordinatorDurableSource { responder, .. } => {
+                let _ = responder.send(Err(GathererPauseError::CoordinatorSourceOnLegacyActor));
+            }
+            TreeGathererCommand::FinalizeCoordinatorDurableSource { responder, .. } => {
+                let _ = responder.send(Err(GathererPauseError::CoordinatorSourceOnLegacyActor));
+            }
+        }
+    }
+}
+
 async fn gatherer_runner_for_tree<
     const QUEUE_TOPIC_ID: u32,
     QueueItem: PCoreQueueItemBase,
@@ -1890,6 +2049,10 @@ async fn gatherer_runner_for_tree<
     mut tree: SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
     queue_key_helper: QueueKeyStatusManager<QUEUE_TOPIC_ID, QueueItem>,
     mut trigger_rx: mpsc::Receiver<TreeGathererCommand<Builder::Output>>,
+    mut initial_pause: Option<(
+        GathererPauseRequest,
+        oneshot::Sender<Result<GathererPauseReceipt, GathererPauseError>>,
+    )>,
 ) -> anyhow::Result<()> {
     let actor_identity = Arc::new(GathererActorIdentity);
     let mut actor_revision = GathererActorRevision(0);
@@ -1897,6 +2060,61 @@ async fn gatherer_runner_for_tree<
         if !queue_key_helper.should_run() {
             tracing::error!("GATHERER_{QUEUE_TOPIC_ID}: Processor entered {:?}; stopping gatherer", queue_key_helper.status.state());
             return Ok(());
+        }
+        if let Some((request, responder)) = initial_pause.take() {
+            if request.drain_request().realm_id() as u64 != queue_key.realm_id
+                || request.drain_request().realm_sub_id() as u64 != queue_key.realm_sub_id
+            {
+                let _ = responder.send(Err(GathererPauseError::RealmIdentityMismatch));
+                return Ok(());
+            }
+            if request.expected_unique_id() != queue_key.unique_id {
+                let _ = responder.send(Err(GathererPauseError::UniqueIdMismatch {
+                    current: queue_key.unique_id,
+                    expected: request.expected_unique_id(),
+                }));
+                return Ok(());
+            }
+            if request.expected_revision() != actor_revision {
+                let _ = responder.send(Err(GathererPauseError::RevisionMismatch {
+                    current: actor_revision,
+                    expected: request.expected_revision(),
+                }));
+                return Ok(());
+            }
+            actor_revision = actor_revision.checked_next()?;
+            let receipt = GathererPauseReceipt {
+                actor_identity: actor_identity.clone(),
+                request,
+                revision: actor_revision,
+                queue_topic_id: QUEUE_TOPIC_ID,
+                realm_id: queue_key.realm_id,
+                realm_sub_id: queue_key.realm_sub_id,
+                unique_id: queue_key.unique_id,
+            };
+            let response = GathererPauseReceipt {
+                actor_identity: receipt.actor_identity.clone(),
+                request: receipt.request,
+                revision: receipt.revision,
+                queue_topic_id: receipt.queue_topic_id,
+                realm_id: receipt.realm_id,
+                realm_sub_id: receipt.realm_sub_id,
+                unique_id: receipt.unique_id,
+            };
+            let _ = responder.send(Ok(response));
+            let resumed = wait_at_initial_pause::<QUEUE_TOPIC_ID, Builder::Output>(
+                &mut trigger_rx,
+                &actor_identity,
+                request,
+                &mut actor_revision,
+                queue_key.realm_id,
+                queue_key.realm_sub_id,
+                queue_key.unique_id,
+            )
+            .await?;
+            if !resumed {
+                return Ok(());
+            }
         }
         let mut builder = match Builder::create_new_with_tree(&mut tree, queue_key.unique_id, create_builder_config.clone()).await {
             Ok(builder) => builder,
@@ -3097,6 +3315,106 @@ mod h23b1_tests {
     }
 
     #[tokio::test]
+    async fn rollback_startup_pause_precedes_builder_consumer_and_queue_poll() {
+        let state = Arc::new(TestGathererState::default());
+        let status = ProcessorStatus::new();
+        status.mark_running();
+        let request = GathererPauseRequest::new(
+            drain_request(9),
+            GathererActorRevision::try_new(0).unwrap(),
+            41,
+        );
+        let (gatherer, join, receipt) =
+            EphemeralQueueGathererWithTree::new_with_status_initially_paused::<
+                TestSubscriber,
+                Arc<TestGathererState>,
+                PHash,
+                PoseidonHasher,
+                TestBuilder,
+            >(
+                Arc::new(TestSubscriber {
+                    state: state.clone(),
+                }),
+                state.clone(),
+                queue_key(),
+                SimpleMemoryMerkleRecorderStore::new(4),
+                status,
+                request,
+            )
+            .await
+            .unwrap();
+
+        let boundary = gatherer.status().await.unwrap();
+        assert_eq!(boundary.phase(), GathererBoundaryPhase::Paused);
+        assert_eq!(boundary.request(), Some(request));
+        assert_eq!(boundary.revision().get(), 1);
+        assert_eq!(state.ensure_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.dump_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.update_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.finalize_calls.load(Ordering::SeqCst), 0);
+
+        gatherer
+            .stop_paused_without_finalize(receipt)
+            .await
+            .unwrap();
+        join.await.unwrap().unwrap();
+        assert_eq!(state.ensure_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.dump_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.delete_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn aborted_rollback_resumes_initially_paused_actor_in_original_namespace() {
+        let state = Arc::new(TestGathererState::default());
+        let status = ProcessorStatus::new();
+        status.mark_running();
+        let request = GathererPauseRequest::new(
+            drain_request(10),
+            GathererActorRevision::try_new(0).unwrap(),
+            41,
+        );
+        let (gatherer, join, receipt) =
+            EphemeralQueueGathererWithTree::new_with_status_initially_paused::<
+                TestSubscriber,
+                Arc<TestGathererState>,
+                PHash,
+                PoseidonHasher,
+                TestBuilder,
+            >(
+                Arc::new(TestSubscriber {
+                    state: state.clone(),
+                }),
+                state.clone(),
+                queue_key(),
+                SimpleMemoryMerkleRecorderStore::new(4),
+                status,
+                request,
+            )
+            .await
+            .unwrap();
+
+        let resumed = gatherer.resume(receipt).await.unwrap();
+        assert_eq!(resumed.phase(), GathererBoundaryPhase::Running);
+        assert_eq!(resumed.revision().get(), 2);
+        assert_eq!(resumed.unique_id(), 41);
+        tokio::time::timeout(Duration::from_secs(1), state.dump_started.notified())
+            .await
+            .unwrap();
+        assert_eq!(state.ensure_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.dump_calls.load(Ordering::SeqCst), 1);
+        state.release_dump.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), state.update_started.notified())
+            .await
+            .unwrap();
+        state.release_update.notify_one();
+
+        join.abort();
+        assert!(join.await.unwrap_err().is_cancelled());
+        assert_eq!(state.finalize_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.delete_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn pause_waits_for_non_cancelled_dump_and_builder_update_then_parks() {
         let state = Arc::new(TestGathererState::default());
         let (mut gatherer, join) = start_test_gatherer(state.clone());
@@ -3212,7 +3530,9 @@ mod h23b1_tests {
             assert!(branch.contains("receipt.request"));
             assert!(branch.contains("receipt.revision"));
             assert!(branch.contains("receipt.unique_id"));
-            assert!(branch.contains("return Ok(())"));
+            assert!(
+                branch.contains("return Ok(())") || branch.contains("return Ok(false)")
+            );
             assert!(!branch.contains("finalize_with_tree"));
             assert!(!branch.contains("delete_consumer"));
         }

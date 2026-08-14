@@ -1563,20 +1563,14 @@ mod h23c4c3b_tests {
             .split("if branch_exact {")
             .nth(1)
             .unwrap()
-            .split("} else {")
+            .split("} else if")
             .next()
             .unwrap();
         assert!(branch.contains("new_durable_with_status"));
         assert!(!branch.contains("guta_update_queue.clone()"));
-        let legacy = startup
-            .split("} else {")
-            .nth(1)
-            .unwrap()
-            .split("};")
-            .next()
-            .unwrap();
-        assert!(legacy.contains("new_with_status"));
-        assert!(legacy.contains("db.guta_update_queue.clone()"));
+        assert!(startup.contains("new_with_status_initially_paused::<"));
+        assert!(startup.contains("new_with_status::<"));
+        assert!(startup.contains("db.guta_update_queue.clone()"));
 
         let create = include_str!("../create.rs");
         let production_create = create.split("#[cfg(test)]").next().unwrap();

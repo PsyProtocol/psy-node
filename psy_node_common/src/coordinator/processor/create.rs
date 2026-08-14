@@ -26,6 +26,7 @@ use psy_node_core::{
         CoordinatorCanonicalHeadStore,
     },
     store::rollback_control::RollbackControlState,
+    store::realm_processor_quiescence::RealmProcessorDrainRequest,
     store::rollback_admission::CoordinatorRollbackAdmissionStore,
     store::rollback_participant_maintenance::{
         CoordinatorRollbackGlobalProgress, CoordinatorRollbackMaintenanceExecutor,
@@ -103,6 +104,33 @@ async fn resume_coordinator_post_ponr_before_runtime<
     }
 }
 
+async fn read_coordinator_initial_rollback_drain<Hash>(
+    network: PsyChainNetworkType,
+    realm_identifier: QRealmIdentifier,
+    canonical_head_store: &dyn CoordinatorCanonicalHeadStore<Hash>,
+) -> anyhow::Result<Option<RealmProcessorDrainRequest>>
+where
+    Hash: parth_core::protocol::core_types::Q256BitHash,
+{
+    let network_id = NetworkId::from(network);
+    let head = match canonical_head_store.read_canonical_head(network_id).await? {
+        CanonicalHeadReadState::Current(head) => head,
+        CanonicalHeadReadState::Uninitialized => return Ok(None),
+    };
+    let Some(request) = head.rollback_control().requested() else {
+        return Ok(None);
+    };
+    Ok(Some(RealmProcessorDrainRequest::try_new(
+        network_id,
+        realm_identifier.realm_id,
+        realm_identifier.realm_sub_id,
+        head.canonical_ref().chain_epoch().get(),
+        head.revision().get(),
+        *request.plan_digest().as_bytes(),
+        *request.plan_digest().as_bytes(),
+    )?))
+}
+
 async fn create_coordinator_processor_with_processing_owner<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
     S: PsyCoordinatorProcessorStore<N::F, N::QHash>
@@ -139,6 +167,7 @@ async fn create_coordinator_processor_with_processing_owner<
     normal_processing_owner:
         crate::coordinator::processor::CoordinatorNormalProcessingOwner,
     rollback_restart_directive: Option<RollbackRuntimeRebuildDirective<N::QHash>>,
+    initial_rollback_drain: Option<RealmProcessorDrainRequest>,
     guta_update_queue: Arc<GUTAUpdateQueue>,
     register_user_queue: Arc<RegisterUserQueue>,
     deploy_contract_queue: Arc<DeployContractQueue>,
@@ -269,6 +298,7 @@ where
         durable_guta_submissions,
         normal_processing_owner,
         rollback_restart_directive,
+        initial_rollback_drain,
     )
     .await?;
     tracing::info!("[COORD_CREATE] processor new done");
@@ -363,6 +393,7 @@ where
         proof_store,
         durable_guta_submissions,
         crate::coordinator::processor::CoordinatorNormalProcessingOwner::legacy(),
+        None,
         None,
         guta_update_queue,
         register_user_queue,
@@ -470,6 +501,7 @@ where
         crate::coordinator::processor::CoordinatorNormalProcessingOwner::branch_exact(
             branch_exact_owner,
         ),
+        None,
         None,
         guta_update_queue,
         register_user_queue,
@@ -642,6 +674,12 @@ where
             )
             .await?;
         }
+        let initial_rollback_drain = read_coordinator_initial_rollback_drain(
+            network,
+            realm_identifier,
+            canonical_head_store.as_ref(),
+        )
+        .await?;
         let (processor, guta_gatherer_join_handle, register_users_gatherer_join_handle, deploy_contracts_gatherer_join_handle) = create_coordinator_processor_with_processing_owner::<N, S, STagTreeRewards, GUTAUpdateQueue, RegisterUserQueue, DeployContractQueue, ProofWorkQueue, TempDatabase, ProofStore, FileSystem>(
             genesis_data,
             network,
@@ -660,6 +698,7 @@ where
             durable_guta_submissions.clone(),
             crate::coordinator::processor::CoordinatorNormalProcessingOwner::legacy(),
             rollback_restart_directive.take(),
+            initial_rollback_drain,
             guta_update_queue.clone(),
             register_user_queue.clone(),
             deploy_contract_queue.clone(),
@@ -787,6 +826,44 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn active_rollback_is_selected_before_coordinator_actor_construction() {
+        let source = include_str!("create.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let function = production
+            .split("pub async fn create_coordinator_processor_and_run_with_durable_guta_submissions<")
+            .nth(1)
+            .expect("Coordinator create-and-run entry");
+        let read = function
+            .find("read_coordinator_initial_rollback_drain(")
+            .expect("active rollback selector");
+        let create = function
+            .find("create_coordinator_processor_with_processing_owner::<")
+            .expect("actor construction");
+        let consume = function
+            .find("initial_rollback_drain,")
+            .expect("sealed startup drain input");
+        assert!(read < create && create < consume);
+
+        let helper = production
+            .split("async fn read_coordinator_initial_rollback_drain<")
+            .nth(1)
+            .unwrap()
+            .split("async fn create_coordinator_processor_with_processing_owner<")
+            .next()
+            .unwrap();
+        assert!(helper.contains("head.rollback_control().requested()"));
+        assert!(helper.contains("RealmProcessorDrainRequest::try_new("));
+        let startup = include_str!("core/startup.rs");
+        assert_eq!(
+            startup
+                .matches("new_with_status_initially_paused::<")
+                .count(),
+            3
+        );
+        assert!(startup.contains("initial_rollback_pauses,"));
+    }
+
     #[test]
     fn legacy_and_branch_exact_constructors_install_disjoint_processing_owners() {
         let source = include_str!("create.rs");

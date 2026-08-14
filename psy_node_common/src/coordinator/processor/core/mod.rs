@@ -25,13 +25,19 @@ use crate::{
             register_user_gatherer::RegisterUserGathererOutput,
         },
     },
-    queue::gatherer::EphemeralQueueGathererWithTree,
+    queue::gatherer::{EphemeralQueueGathererWithTree, GathererPauseReceipt},
 };
 mod genesis;
 mod process_block;
 mod recover_from_backup;
 pub mod runner;
 pub mod startup;
+
+pub(super) struct CoordinatorRollbackGathererPauseSet {
+    pub(super) guta: GathererPauseReceipt,
+    pub(super) registration: GathererPauseReceipt,
+    pub(super) deploy: GathererPauseReceipt,
+}
 
 pub(crate) enum CoordinatorNormalProcessingOwner {
     Legacy,
@@ -96,4 +102,5 @@ pub struct PsyCoordinatorProcessor<
     >,
     pub proof_worker_queue_max_time_ms: u64,
     normal_processing_owner: Option<CoordinatorNormalProcessingOwner>,
+    initial_rollback_pauses: Option<CoordinatorRollbackGathererPauseSet>,
 }

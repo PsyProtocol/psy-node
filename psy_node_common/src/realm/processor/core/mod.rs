@@ -30,7 +30,7 @@ use crate::{
     constants::queue::
         PQ_REALM_SUBMIT_USER_UPDATE_QUEUE_TOPIC_ID
     ,
-    queue::gatherer::EphemeralQueueGathererWithTree, realm::processor::{db::PsyRealmDatabaseProcessor, gatherers::realm_end_cap_gatherer::RealmGUTAEndCapGathererOutput},
+    queue::gatherer::{EphemeralQueueGathererWithTree, GathererPauseReceipt}, realm::processor::{db::PsyRealmDatabaseProcessor, gatherers::realm_end_cap_gatherer::RealmGUTAEndCapGathererOutput},
 };
 
 mod process_block;
@@ -142,4 +142,8 @@ pub struct PsyRealmProcessor<
     control_owner: Option<control::RealmProcessorControlOwner>,
     rollback_runtime_control:
         Option<std::sync::Arc<dyn RealmRollbackRuntimeControl<N::QHash>>>,
+    /// Present only when startup observed an active explicit rollback before
+    /// spawning the subscriber-backed actor.  The receipt proves that the
+    /// actor has not provisioned or polled its abandoned queue generation.
+    initial_rollback_pause: Option<GathererPauseReceipt>,
 }

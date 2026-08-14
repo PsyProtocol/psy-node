@@ -26,8 +26,8 @@ use psy_node_core::{
 use tokio::time::sleep;
 
 use crate::{
-    coordinator::processor::PsyCoordinatorProcessor,
-    queue::gatherer::{GathererBoundaryPhase, GathererPauseReceipt, GathererPauseRequest},
+    coordinator::processor::{CoordinatorRollbackGathererPauseSet, PsyCoordinatorProcessor},
+    queue::gatherer::{GathererBoundaryPhase, GathererPauseRequest},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,12 +37,6 @@ pub enum CoordinatorProcessorRunExit<Hash> {
         published: StoredCanonicalHead<Hash>,
         directive: RollbackRuntimeRebuildDirective<Hash>,
     },
-}
-
-struct CoordinatorRollbackGathererPauseSet {
-    guta: GathererPauseReceipt,
-    registration: GathererPauseReceipt,
-    deploy: GathererPauseReceipt,
 }
 
 pub async fn run_coordinator_processor_loop<
@@ -83,7 +77,8 @@ where
     print_cf_log_indicator("PSY_COORDINATOR_PROCESSOR_STARTED", &format!("R{}_{}", realm_id, realm_sub_id));
 
     let mut last_slot: u128 = 0;
-    let mut rollback_gatherers: Option<CoordinatorRollbackGathererPauseSet> = None;
+    let mut rollback_gatherers = processor.initial_rollback_pauses.take();
+    let mut startup_pause_validated = rollback_gatherers.is_none();
 
     loop {
         if processor.db.status.should_run() {
@@ -101,6 +96,59 @@ where
                     .await;
                 match admission {
                     Ok(RollbackAdmissionBoundaryOutcome::Maintenance(head)) => {
+                        if !startup_pause_validated {
+                            let pauses = rollback_gatherers.as_ref().ok_or_else(|| {
+                                anyhow::anyhow!("Coordinator startup pause set disappeared")
+                            })?;
+                            let request = head.rollback_control().requested().ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "Coordinator maintenance head has no rollback request"
+                                )
+                            })?;
+                            let expected = RealmProcessorDrainRequest::try_new(
+                                head.canonical_ref().network_id(),
+                                u32::try_from(processor.db.ids.realm_id_u64)?,
+                                u16::try_from(processor.db.ids.realm_sub_id_u64)?,
+                                head.canonical_ref().chain_epoch().get(),
+                                head.revision().get(),
+                                *request.plan_digest().as_bytes(),
+                                *request.plan_digest().as_bytes(),
+                            )?;
+                            let receipts = [&pauses.guta, &pauses.registration, &pauses.deploy];
+                            if receipts.iter().any(|receipt| {
+                                let startup = receipt.request().drain_request();
+                                startup.network() != expected.network()
+                                    || startup.realm_id() != expected.realm_id()
+                                    || startup.realm_sub_id() != expected.realm_sub_id()
+                                    || startup.route_generation() != expected.route_generation()
+                                    || startup.route_revision() > expected.route_revision()
+                                    || startup.binding_digest() != expected.binding_digest()
+                                    || startup.decision_nonce() != expected.decision_nonce()
+                            }) {
+                                anyhow::bail!(
+                                    "startup-paused Coordinator gatherers do not match active rollback"
+                                )
+                            }
+                            let statuses = [
+                                processor.guta_queue_gatherer.status().await?,
+                                processor.register_user_queue_gatherer.status().await?,
+                                processor.deploy_contract_queue_gatherer.status().await?,
+                            ];
+                            if statuses.iter().zip(receipts).any(|(status, receipt)| {
+                                status.phase() != GathererBoundaryPhase::Paused
+                                    || status.revision() != receipt.revision()
+                                    || status.request() != Some(receipt.request())
+                                    || status.unique_id() != receipt.unique_id()
+                            }) {
+                                anyhow::bail!(
+                                    "startup-paused Coordinator boundary changed before maintenance"
+                                )
+                            }
+                            startup_pause_validated = true;
+                            tracing::warn!(
+                                "Coordinator adopted three startup-paused gatherers without polling abandoned queues"
+                            );
+                        }
                         if rollback_gatherers.is_none() {
                             let request = head.rollback_control().requested().ok_or_else(|| {
                                 anyhow::anyhow!(
@@ -356,6 +404,23 @@ where
                         tracing::error!("{error}");
                         continue;
                     }
+                }
+                if let Some(paused) = rollback_gatherers.take() {
+                    processor
+                        .guta_queue_gatherer
+                        .resume(paused.guta)
+                        .await?;
+                    processor
+                        .register_user_queue_gatherer
+                        .resume(paused.registration)
+                        .await?;
+                    processor
+                        .deploy_contract_queue_gatherer
+                        .resume(paused.deploy)
+                        .await?;
+                    tracing::warn!(
+                        "rollback completed while Coordinator was starting; resumed all three actors before normal processing"
+                    );
                 }
                 let start_processing_at = std::time::Instant::now();
                 tracing::debug!("[COORDINATOR] Process block starting...");

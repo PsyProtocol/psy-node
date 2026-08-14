@@ -109,11 +109,22 @@ where
                     continue;
                 }
             };
-            if let Some(request) = head.rollback_control().requested() {
-                let status = processor.guta_queue_gatherer.status().await?;
-                if status.phase() != GathererBoundaryPhase::Running {
-                    anyhow::bail!("Realm gatherer is not running at rollback drain boundary")
+            if head.rollback_control().requested().is_none() {
+                if let Some(receipt) = processor.initial_rollback_pause.take() {
+                    if !head.rollback_control().is_idle() {
+                        anyhow::bail!(
+                            "startup-paused Realm observed a non-idle control state without request"
+                        )
+                    }
+                    let resumed = processor.guta_queue_gatherer.resume(receipt).await?;
+                    tracing::warn!(
+                        "rollback completed while Realm was starting; resumed namespace {} at revision {} without polling the abandoned generation",
+                        resumed.unique_id(),
+                        resumed.revision().get(),
+                    );
                 }
+            }
+            if let Some(request) = head.rollback_control().requested() {
                 let expected_unique_id = if processor
                     .normal_commit_owner
                     .as_ref()
@@ -123,9 +134,6 @@ where
                 } else {
                     processor.db.state.gathering_proc_checkpoint_unique_id
                 };
-                if status.unique_id() != expected_unique_id {
-                    anyhow::bail!("Realm gatherer namespace changed before rollback drain")
-                }
                 let drain_request = RealmProcessorDrainRequest::try_new(
                     network,
                     processor.db.state.realm_identifier.realm_id,
@@ -135,14 +143,53 @@ where
                     *request.plan_digest().as_bytes(),
                     *request.plan_digest().as_bytes(),
                 )?;
-                let pause_receipt = processor
-                    .guta_queue_gatherer
-                    .pause(GathererPauseRequest::new(
-                        drain_request,
-                        status.revision(),
-                        expected_unique_id,
-                    ))
-                    .await?;
+                let pause_receipt = if let Some(receipt) =
+                    processor.initial_rollback_pause.take()
+                {
+                    let startup = receipt.request().drain_request();
+                    if startup.network() != drain_request.network()
+                        || startup.realm_id() != drain_request.realm_id()
+                        || startup.realm_sub_id() != drain_request.realm_sub_id()
+                        || startup.route_generation() != drain_request.route_generation()
+                        || startup.route_revision() > drain_request.route_revision()
+                        || startup.binding_digest() != drain_request.binding_digest()
+                        || startup.decision_nonce() != drain_request.decision_nonce()
+                        || receipt.unique_id() != expected_unique_id
+                    {
+                        anyhow::bail!(
+                            "startup-paused Realm gatherer does not match active rollback"
+                        )
+                    }
+                    let status = processor.guta_queue_gatherer.status().await?;
+                    if status.phase() != GathererBoundaryPhase::Paused
+                        || status.revision() != receipt.revision()
+                        || status.request() != Some(receipt.request())
+                        || status.unique_id() != receipt.unique_id()
+                    {
+                        anyhow::bail!(
+                            "startup-paused Realm gatherer boundary changed before maintenance"
+                        )
+                    }
+                    receipt
+                } else {
+                    let status = processor.guta_queue_gatherer.status().await?;
+                    if status.phase() != GathererBoundaryPhase::Running {
+                        anyhow::bail!(
+                            "Realm gatherer is not running at rollback drain boundary"
+                        )
+                    }
+                    if status.unique_id() != expected_unique_id {
+                        anyhow::bail!("Realm gatherer namespace changed before rollback drain")
+                    }
+                    processor
+                        .guta_queue_gatherer
+                        .pause(GathererPauseRequest::new(
+                            drain_request,
+                            status.revision(),
+                            expected_unique_id,
+                        ))
+                        .await?
+                };
                 tracing::warn!(
                     "Realm Processor drained for explicit rollback target {}; awaiting storage-authored runtime directive",
                     request.target().checkpoint_id().get(),
@@ -577,10 +624,14 @@ mod h23b2_tests {
     #[test]
     fn whole_drain_orders_iteration_then_actor_status_then_pause() {
         let source = include_str!("runner.rs");
-        let iteration = source.find(".try_mint_iteration_drained(request)").unwrap();
-        let status = source.find("guta_queue_gatherer.status().await").unwrap();
-        let pause = source.find(".pause(GathererPauseRequest::new(").unwrap();
-        let install = source.find(".install_whole_lease(").unwrap();
+        let control = source
+            .split(".try_mint_iteration_drained(request)")
+            .nth(1)
+            .expect("process-local drain path");
+        let iteration = 0;
+        let status = control.find("guta_queue_gatherer.status().await").unwrap();
+        let pause = control.find(".pause(GathererPauseRequest::new(").unwrap();
+        let install = control.find(".install_whole_lease(").unwrap();
         assert!(iteration < status && status < pause && pause < install);
     }
 

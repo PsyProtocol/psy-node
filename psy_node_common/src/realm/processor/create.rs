@@ -10,7 +10,7 @@ use psy_node_core::{
     genesis::genesis_db_data_builder::GenesisDatabaseDataBuilder, p2p::traits::realm_coordinantor::RealmCoordinatorClient, psy_core_db::traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore}, psy_temp_db::StandardProcessorTempDBStoreBase, queue::{
         ephemeral::QStandardEphemeralQueueSubscriber,
         worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
-    }, store::{realm_processor_branch_exact_runtime::{RealmBranchExactCommitRuntimeInstaller, RealmBranchExactSingleCommitOwner}, realm_processor_startup::{authorize_realm_processor_startup, RealmProcessorStartupAuthorization, RealmProcessorStartupError, RealmProcessorStartupMode, RealmProcessorStartupPreflightProvider}, rollback_runtime_rebuild::{RealmRollbackRuntimeControl, RollbackRuntimeRebuildDirective}, traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore}}
+    }, store::{realm_processor_branch_exact_runtime::{RealmBranchExactCommitRuntimeInstaller, RealmBranchExactSingleCommitOwner}, realm_processor_quiescence::RealmProcessorDrainRequest, realm_processor_startup::{authorize_realm_processor_startup, RealmProcessorStartupAuthorization, RealmProcessorStartupError, RealmProcessorStartupMode, RealmProcessorStartupPreflightProvider}, rollback_runtime_rebuild::{RealmRollbackRuntimeControl, RollbackRuntimeRebuildDirective}, traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore}}
 };
 
 use crate::realm::processor::{core::{PsyRealmProcessor, RealmNormalCommitOwner, runner::{run_realm_processor, RealmProcessorRunExit}}, db::PsyRealmDatabaseProcessor};
@@ -95,6 +95,37 @@ async fn resume_realm_post_ponr_before_runtime<Hash: parth_core::protocol::core_
     }
 }
 
+async fn read_realm_initial_rollback_drain<
+    Hash: parth_core::protocol::core_types::Q256BitHash,
+>(
+    chain_id: u32,
+    realm_identifier: &QRealmIdentifier,
+    rollback_runtime_control: Option<&dyn RealmRollbackRuntimeControl<Hash>>,
+) -> anyhow::Result<Option<RealmProcessorDrainRequest>> {
+    let Some(control) = rollback_runtime_control else {
+        return Ok(None);
+    };
+    let network = psy_data::protocol::canonical_chain::NetworkId::try_from_chain_id(chain_id)?;
+    let head = match control.read_realm_rollback_control_head(network).await? {
+        psy_node_core::store::canonical_head::CanonicalHeadReadState::Current(head) => head,
+        psy_node_core::store::canonical_head::CanonicalHeadReadState::Uninitialized => {
+            return Ok(None)
+        }
+    };
+    let Some(request) = head.rollback_control().requested() else {
+        return Ok(None);
+    };
+    Ok(Some(RealmProcessorDrainRequest::try_new(
+        network,
+        realm_identifier.realm_id,
+        realm_identifier.realm_sub_id,
+        head.canonical_ref().chain_epoch().get(),
+        head.revision().get(),
+        *request.plan_digest().as_bytes(),
+        *request.plan_digest().as_bytes(),
+    )?))
+}
+
 async fn create_realm_processor_with_restart_directive<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
     S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync + 'static,
@@ -128,6 +159,7 @@ async fn create_realm_processor_with_restart_directive<
     rollback_runtime_control:
         Option<Arc<dyn RealmRollbackRuntimeControl<N::QHash>>>,
     rollback_restart_directive: Option<RollbackRuntimeRebuildDirective<N::QHash>>,
+    initial_rollback_drain: Option<RealmProcessorDrainRequest>,
 ) -> anyhow::Result<(
     PsyRealmProcessor<
         N,
@@ -294,6 +326,7 @@ where
         normal_commit_owner,
         rollback_runtime_control,
         rollback_restart_directive,
+        initial_rollback_drain,
     )
     .await?;
     tracing::info!("[REALM_CREATE] processor new done");
@@ -371,6 +404,7 @@ where
         commit_runtime_installer,
         rollback_runtime_control,
         None,
+        None,
     )
     .await
 }
@@ -422,6 +456,12 @@ where
             )
             .await?;
         }
+        let initial_rollback_drain = read_realm_initial_rollback_drain(
+            chain_id,
+            &realm_identifier,
+            rollback_runtime_control.as_deref(),
+        )
+        .await?;
         let (processor, guta_gatherer_join_handle) = create_realm_processor_with_restart_directive::<N, S, STagTreeRewards, GUTAUpdateQueue, ProofWorkQueue, TempDatabase, ProofStore, FileSystem, CoordinatorClient>(
             chain_id,
             genesis_data,
@@ -443,6 +483,7 @@ where
             commit_runtime_installer.clone(),
             rollback_runtime_control.clone(),
             rollback_restart_directive.take(),
+            initial_rollback_drain,
         )
         .await?;
 
@@ -461,6 +502,39 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn active_rollback_is_selected_before_realm_actor_construction() {
+        let source = include_str!("create.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let function = production
+            .split("pub async fn create_realm_processor_and_run<")
+            .nth(1)
+            .expect("create-and-run entry");
+        let read = function
+            .find("read_realm_initial_rollback_drain(")
+            .expect("active rollback selector");
+        let create = function
+            .find("create_realm_processor_with_restart_directive::<")
+            .expect("actor construction");
+        let consume = function
+            .find("initial_rollback_drain,")
+            .expect("sealed startup drain input");
+        assert!(read < create && create < consume);
+
+        let helper = production
+            .split("async fn read_realm_initial_rollback_drain<")
+            .nth(1)
+            .unwrap()
+            .split("async fn create_realm_processor_with_restart_directive<")
+            .next()
+            .unwrap();
+        assert!(helper.contains("head.rollback_control().requested()"));
+        assert!(helper.contains("RealmProcessorDrainRequest::try_new("));
+        let startup = include_str!("core/startup.rs");
+        assert!(startup.contains("new_with_status_initially_paused::<"));
+        assert!(startup.contains("initial_rollback_pause,"));
+    }
+
     #[test]
     fn rollback_restart_recreates_the_realm_actor_while_shutdown_returns() {
         let source = include_str!("create.rs");
