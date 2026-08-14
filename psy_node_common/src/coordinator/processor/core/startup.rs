@@ -16,9 +16,11 @@ use crate::{
     coordinator::processor::{
         db::PsyCoordinatorDatabaseProcessor,
         gatherers::{
+            contract_gatherer::{ContractGathererConfig, ContractQueueGatherer},
             coordinator_guta_update_gatherer::{CoordinatorGUTAUpdateGatherer, CoordinatorGUTAUpdateGathererConfig},
-            deploy_contract_gatherer::{DeployContractGatherer, DeployContractGathererConfig},
+            deploy_contract_gatherer::DeployContractGathererConfig,
             register_user_gatherer::{RegisterUserGatherer, RegisterUserGathererConfig},
+            update_contract_gatherer::UpdateContractGathererConfig,
         },
         PsyCoordinatorProcessor,
     },
@@ -27,7 +29,7 @@ use crate::{
 
 impl<
         N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
-        S: PsyCoordinatorProcessorStore<N::F, N::QHash> + Send + Sync,
+        S: PsyCoordinatorProcessorStore<N::F, N::QHash> + Send + Sync + 'static,
         STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync,
         GUTAUpdateQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
         RegisterUserQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
@@ -68,6 +70,7 @@ where
         genesis_block_update: PsyPreparedCoordinatorBlockStateUpdates<N::F, N::QHash>,
         file_system: Arc<FileSystem>,
         deploy_contract_gatherer_backup_directory: String,
+        update_contract_gatherer_backup_directory: String,
         register_user_gatherer_backup_directory: String,
         guta_gatherer_backup_directory: String,
     ) -> anyhow::Result<(
@@ -92,6 +95,7 @@ where
         db.init_with_setup_and_genesis(
             &file_system,
             &deploy_contract_gatherer_backup_directory,
+            &update_contract_gatherer_backup_directory,
             &register_user_gatherer_backup_directory,
             &guta_gatherer_backup_directory,
             genesis_block_update,
@@ -170,26 +174,39 @@ where
             user_registration_tree,
             db.status.clone(),
         );
-        let (deploy_contract_queue_gatherer, deploy_contract_join_handle) = EphemeralQueueGathererWithTree::new_with_status::<
+        let (deploy_contract_queue_gatherer, deploy_contract_join_handle) = ContractQueueGatherer::<N>::new_with_status::<
             DeployContractQueue,
-            DeployContractGathererConfig<N, TempDatabase, FileSystem>,
-            N::QHash,
-            N::HasherBase,
-            DeployContractGatherer<N, TempDatabase, FileSystem>,
+            S,
+            TempDatabase,
+            FileSystem,
         >(
             db.deploy_contract_queue.clone(),
-            DeployContractGathererConfig {
-                realm_id_u64: db.ids.realm_id_u64,
-                realm_sub_id_u64: db.ids.realm_sub_id_u64,
-                temp_db: db.temp_db.clone(),
-                backup_file_directory: deploy_contract_gatherer_backup_directory,
-                _phantom_n: std::marker::PhantomData,
-                shared_status: db.shared_status.inner.clone(),
-                deploy_contract_circuit_whitelist: db.circuit_fingerprint_config.deploy_contracts_circuit_whitelist_root,
-                last_job_next_contract_id: Arc::new(std::sync::RwLock::new(db.last_committed.l2_state.next_contract_id as u64)),
-                file_system: file_system.clone(),
+            ContractGathererConfig {
+                deploy: DeployContractGathererConfig {
+                    realm_id_u64: db.ids.realm_id_u64,
+                    realm_sub_id_u64: db.ids.realm_sub_id_u64,
+                    temp_db: db.temp_db.clone(),
+                    backup_file_directory: deploy_contract_gatherer_backup_directory.clone(),
+                    _phantom_n: std::marker::PhantomData,
+                    shared_status: db.shared_status.inner.clone(),
+                    deploy_contract_circuit_whitelist: db.circuit_fingerprint_config.deploy_contracts_circuit_whitelist_root,
+                    last_job_next_contract_id: Arc::new(std::sync::RwLock::new(db.last_committed.l2_state.next_contract_id as u64)),
+                    file_system: file_system.clone(),
+                },
+                update: UpdateContractGathererConfig {
+                    realm_id_u64: db.ids.realm_id_u64,
+                    realm_sub_id_u64: db.ids.realm_sub_id_u64,
+                    shared_status: db.shared_status.inner.clone(),
+                    temp_db: db.temp_db.clone(),
+                    contract_leaf_reader: db.db.clone(),
+                    backup_file_directory: update_contract_gatherer_backup_directory,
+                    update_contract_circuit_whitelist: db.circuit_fingerprint_config.update_contracts_circuit_whitelist_root,
+                    file_system: file_system.clone(),
+                    _phantom_n: std::marker::PhantomData,
+                },
             },
             db.deploy_contract_queue_key_status_manager.get_queue_key()?,
+            db.update_contract_queue_key_status_manager.get_queue_key()?,
             global_contract_tree,
             db.status.clone(),
         );

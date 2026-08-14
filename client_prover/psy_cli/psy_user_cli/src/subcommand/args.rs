@@ -74,8 +74,35 @@ pub struct DeployContractArgs {
     pub output_path: Option<String>,
     #[clap(long, env)]
     pub is_deploy: bool,
+}
+
+#[derive(Clone, Args, Serialize, Deserialize)]
+pub struct UpdateContractArgs {
+    #[clap(env, long, default_value = "config.json", env)]
+    pub rpc_config: String,
     #[clap(long, env)]
-    pub abi_path: Option<String>,
+    pub private_key: String,
+    #[clap(long, short, default_value = "zk")]
+    pub sign_type: SignType,
+    #[clap(long, env)]
+    pub fingerprint: Option<String>,
+    #[clap(long)]
+    pub contract_id: u64,
+    #[clap(long)]
+    pub contract_path: String,
+    /// ABI JSON of the currently deployed contract layout. When omitted the old
+    /// ABI is assumed to match the new ABI in the compilation artifact supplied
+    /// to `--contract-path`.
+    #[clap(long)]
+    pub old_abi_path: Option<String>,
+    /// ABI JSON produced for the updated contract. When omitted the new ABI is
+    /// read from the compilation artifact supplied to `--contract-path`.
+    #[clap(long)]
+    pub new_abi_path: Option<String>,
+    #[clap(long, env)]
+    pub output_path: Option<String>,
+    #[clap(long, env)]
+    pub is_update: bool,
 }
 
 #[derive(Clone, Args, Serialize, Deserialize)]

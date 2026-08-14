@@ -8,7 +8,7 @@ use parth_core::{
 };
 use psy_data::v1::qdata::{
     checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
-    contract::{ContractCodeDefinition, ContractCodeDefinitionWithContractId, PQEDContractLeaf},
+    contract::{ContractCodeDefinition, ContractCodeDefinitionWithContractId, PQEDContractLeafV2},
     public_key::PZKPublicKeyInfo,
     user::PQEDUserLeaf,
 };
@@ -528,7 +528,7 @@ where
         let checkpoint_id = 20;
 
         // Test Contract Leaf
-        let contract_leaf = PQEDContractLeaf::<N::F, N::QHash>::qp_rand_gen();
+        let contract_leaf = PQEDContractLeafV2::<N::F, N::QHash>::default();
         assert!(db.get_contract_leaf(checkpoint_id, contract_id).await.is_err());
         db.set_contract_leaf(checkpoint_id, contract_id, &contract_leaf).await?;
         assert_eq!(db.get_contract_leaf(checkpoint_id, contract_id).await?, contract_leaf);

@@ -14,7 +14,7 @@ use parth_core::{
 };
 use psy_data::{protocol::verifiable_checkpoint_transition::PsyVerifiableCheckpointTransitionWithProof, v1::qdata::{
     checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
-    contract::{ContractCodeDefinition, ContractCodeDefinitionWithContractId, PQEDContractLeaf},
+    contract::{ContractCodeDefinition, ContractCodeDefinitionWithContractId, PQEDContractLeafV2},
     public_key::PZKPublicKeyInfo,
     user::PQEDUserLeaf,
 }};
@@ -386,14 +386,14 @@ pub trait PsyNodeCoreDatabaseBasicContractInfoStoreWriter<F, Hash> {
 #[async_trait]
 #[auto_impl(&, Arc)]
 pub trait PsyNodeCoreDatabaseContractObjectStoreReader<F, Hash>: PsyNodeCoreDatabaseBasicContractInfoStoreReader<F, Hash> {
-    async fn get_contract_leaf(&self, checkpoint_id: u64, contract_id: u64) -> anyhow::Result<PQEDContractLeaf<F, Hash>>;
+    async fn get_contract_leaf(&self, checkpoint_id: u64, contract_id: u64) -> anyhow::Result<PQEDContractLeafV2<F, Hash>>;
     async fn get_contract_code_definition(&self, checkpoint_id: u64, contract_id: u64) -> anyhow::Result<ContractCodeDefinition>;
 }
 
 #[async_trait]
 #[auto_impl(&, Arc)]
 pub trait PsyNodeCoreDatabaseContractObjectStoreWriter<F, Hash>: PsyNodeCoreDatabaseBasicContractInfoStoreWriter<F, Hash> {
-    async fn set_contract_leaf(&self, checkpoint_id: u64, contract_id: u64, leaf: &PQEDContractLeaf<F, Hash>) -> anyhow::Result<()>;
+    async fn set_contract_leaf(&self, checkpoint_id: u64, contract_id: u64, leaf: &PQEDContractLeafV2<F, Hash>) -> anyhow::Result<()>;
     async fn set_contract_leaves_ffs(&self, checkpoint_id: u64, data: &[u8]) -> anyhow::Result<()>;
     async fn set_contract_code_definition(
         &self,

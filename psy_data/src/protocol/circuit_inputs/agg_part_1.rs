@@ -12,18 +12,23 @@ use crate::{agg::AggStateTransitionWithStats, guta::header::GlobalUserTreeAggreg
 pub struct QCAggUserRegistartionDeployContractsGUTAInput<F, Hash> {
     pub register_users_state_transition: AggStateTransitionWithStats<Hash>,
     pub deploy_contracts_state_transition: AggStateTransitionWithStats<Hash>,
+    pub update_contracts_state_transition: AggStateTransitionWithStats<Hash>,
     pub guta_proof_header: GlobalUserTreeAggregatorHeader<F, Hash>,
 }
 impl<F: QFelt64, Hash: QFHashBase<F>> QCAggUserRegistartionDeployContractsGUTAInput<F, Hash> {
     pub fn get_public_inputs_hash_no_rewards_tag<Hasher: FieldQHasher<F, Hash>>(&self) -> Hash {
 
+        // the combined contract tree transition chains deploy then update:
+        // start = deploy.start, end = update.end (deploy.end == update.start
+        // is enforced by the part-1 circuit; for blocks without updates
+        // update.start == update.end == deploy.end)
         let user_registration_deploy_contracts_start = Hasher::two_to_one(
             &self.register_users_state_transition.state_transition_start,
             &self.deploy_contracts_state_transition.state_transition_start,
         );
         let user_registration_deploy_contracts_end = Hasher::two_to_one(
             &self.register_users_state_transition.state_transition_end,
-            &self.deploy_contracts_state_transition.state_transition_end,
+            &self.update_contracts_state_transition.state_transition_end,
         );
         let user_registration_deploy_contracts_combo = Hasher::two_to_one(
             &user_registration_deploy_contracts_start,
@@ -48,6 +53,7 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for QCAggUserRegistartionDep
         Self {
             register_users_state_transition: AggStateTransitionWithStats::qp_rand_gen(),
             deploy_contracts_state_transition: AggStateTransitionWithStats::qp_rand_gen(),
+            update_contracts_state_transition: AggStateTransitionWithStats::qp_rand_gen(),
             guta_proof_header: GlobalUserTreeAggregatorHeader::qp_rand_gen(),
         }
     }
@@ -68,7 +74,7 @@ impl<F: QFelt64, Hash: QFHashBase<F>> PCircuitWitness<F, Hash>
 
 impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for QCAggUserRegistartionDeployContractsGUTAInput<F, Hash> {
     const IS_FIXED_SIZE: bool = true;
-    const FIXED_SIZE: usize = AggStateTransitionWithStats::<Hash>::FIXED_SIZE * 2
+    const FIXED_SIZE: usize = AggStateTransitionWithStats::<Hash>::FIXED_SIZE * 3
         + GlobalUserTreeAggregatorHeader::<F, Hash>::FIXED_SIZE;
 }
 impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for QCAggUserRegistartionDeployContractsGUTAInput<F, Hash> {
@@ -79,6 +85,7 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for QCAggUserR
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
         self.register_users_state_transition.pio_write_to_io(writer)?;
         self.deploy_contracts_state_transition.pio_write_to_io(writer)?;
+        self.update_contracts_state_transition.pio_write_to_io(writer)?;
         self.guta_proof_header.pio_write_to_io(writer)?;
         Ok(())
     }
@@ -86,11 +93,13 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for QCAggUserR
     fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
         let register_users_state_transition = AggStateTransitionWithStats::pio_read_from_io(reader)?;
         let deploy_contracts_state_transition = AggStateTransitionWithStats::pio_read_from_io(reader)?;
+        let update_contracts_state_transition = AggStateTransitionWithStats::pio_read_from_io(reader)?;
         let guta_proof_header = GlobalUserTreeAggregatorHeader::pio_read_from_io(reader)?;
 
         Ok(Self {
             register_users_state_transition,
             deploy_contracts_state_transition,
+            update_contracts_state_transition,
             guta_proof_header,
         })
     }

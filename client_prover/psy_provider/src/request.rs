@@ -18,7 +18,7 @@ use psy_client_common::{
 };
 use psy_client_data::{
     guta::{api::SubmitGUTARealmResultAPINoProofInput, end_cap_input::SubmitUserEndCapNonProofInput},
-    qblock::cmds::deploy_contract::QBCDeployContract,
+    qblock::cmds::deploy_contract::{QBCDeployContractV2, QBCUpdateContract},
     qdata::{
         checkpoint::{PsyBlockState, PsyCheckpointLeaf},
         contract::{ContractCodeDefinition, PsyContractLeaf},
@@ -69,6 +69,8 @@ pub enum RequestParams<F: RichField> {
     /// for coordinator edge
     #[serde(rename = "psy_deploy_contract")]
     DeployContract(QDeployContractRPCRequest<F>),
+    #[serde(rename = "psy_update_contract")]
+    UpdateContract(QUpdateContractRPCRequest<F>),
     #[serde(rename = "psy_register_user")]
     RegisterUser(QRegisterUserRPCRequest<F>),
     #[serde(rename = "psy_build_block")]
@@ -579,7 +581,14 @@ impl<F: RichField> QRegisterUserRPCRequest<F> {
 #[ts(export, concrete(F = GoldilocksField))]
 #[serde(bound = "")]
 pub struct QDeployContractRPCRequest<F: RichField> {
-    pub deploy_contract: QBCDeployContract<F>,
+    pub deploy_contract: QBCDeployContractV2<F>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, concrete(F = GoldilocksField))]
+#[serde(bound = "")]
+pub struct QUpdateContractRPCRequest<F: RichField> {
+    pub update_contract: QBCUpdateContract<F>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -1606,6 +1615,7 @@ pub enum QRPCRequest<F: RichField> {
     QAddWithdrawalRPCRequest((u32, QAddWithdrawalRPCRequest)),
     QRegisterUserRPCRequest((u32, QRegisterUserRPCRequest<F>)),
     QDeployContractRPCRequest((u32, QDeployContractRPCRequest<F>)),
+    QUpdateContractRPCRequest((u32, QUpdateContractRPCRequest<F>)),
     QProduceBlockRPCRequest((u32, ())),
     QSubmitEndCapRPCRequest((u32, QSubmitEndCapRPCRequest<F>)),
 

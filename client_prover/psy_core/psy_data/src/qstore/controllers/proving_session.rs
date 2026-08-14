@@ -1153,6 +1153,33 @@ impl<
                 contract_id: contract_id,
             }))
             .await?;
+        let contract_leaf_hash = contract_leaf.qfhash::<H>();
+        let checkpoint_contract_tree_root = self.get_global_state_tree_roots(self.start_checkpoint_u64).await?.contract_tree_root;
+
+        anyhow::ensure!(
+            contract_tree_merkle_proof.verify::<H>(),
+            "invalid contract tree Merkle proof at checkpoint {} for contract {}: proof_root={}, proof_value={}",
+            self.start_checkpoint_u64,
+            contract_id,
+            contract_tree_merkle_proof.root,
+            contract_tree_merkle_proof.value,
+        );
+        anyhow::ensure!(
+            contract_tree_merkle_proof.value == contract_leaf_hash,
+            "contract leaf/proof checkpoint mismatch for contract {}: session_checkpoint={}, proof_value={}, latest_contract_leaf_hash={}",
+            contract_id,
+            self.start_checkpoint_u64,
+            contract_tree_merkle_proof.value,
+            contract_leaf_hash,
+        );
+        anyhow::ensure!(
+            contract_tree_merkle_proof.root == checkpoint_contract_tree_root,
+            "contract tree root/checkpoint mismatch for contract {}: session_checkpoint={}, proof_root={}, checkpoint_contract_tree_root={}",
+            contract_id,
+            self.start_checkpoint_u64,
+            contract_tree_merkle_proof.root,
+            checkpoint_contract_tree_root,
+        );
 
         Ok(PsyContractInclusionProof {
             contract_leaf,

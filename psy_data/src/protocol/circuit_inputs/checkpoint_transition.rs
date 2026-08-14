@@ -262,7 +262,7 @@ pser::impl_psy_ser_basic_tests_fallback!(
 impl<F: QFelt64, Hash: QFHashBase<F>> QCQEDCheckpointStateTransitionInputPartial<F, Hash> {
     pub fn get_new_checkpoint_leaf<Hasher: FieldQHasher<F, Hash>>(&self, reward_tree_root: Hash) -> PQEDCheckpointLeaf<F, Hash> {
         let new_state_roots = PQEDCheckpointGlobalStateRoots {
-            contract_tree_root: self.part_1_header.deploy_contracts_state_transition.state_transition_end,
+            contract_tree_root: self.part_1_header.update_contracts_state_transition.state_transition_end,
             deposit_tree_root: Hasher::get_zero_hash(TODO_DEPOSIT_TREE_HEIGHT as usize),
             user_tree_root: self.part_1_header.guta_proof_header.state_transition.new_node_value,
             withdrawal_tree_root:Hasher::get_zero_hash(TODO_WITHDRAWAL_TREE_HEIGHT as usize),

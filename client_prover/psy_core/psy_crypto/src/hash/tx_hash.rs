@@ -32,6 +32,31 @@ pub fn compute_deploy_contract_content_hash(deployer: &[u8; 32], function_tree_r
     hash_to_bytes(&hash)
 }
 
+pub fn compute_update_contract_content_hash(
+    contract_id: u64,
+    deployer: &[u8; 32],
+    function_tree_root: &[u8; 32],
+    state_tree_height: u64,
+) -> [u8; 32] {
+    let deployer_felts = bytes32_to_felts(deployer);
+    let function_root_felts = bytes32_to_felts(function_tree_root);
+
+    let hash = PoseidonHash::q_hash_many(&[
+        u64_to_felt(contract_id),
+        deployer_felts[0],
+        deployer_felts[1],
+        deployer_felts[2],
+        deployer_felts[3],
+        function_root_felts[0],
+        function_root_felts[1],
+        function_root_felts[2],
+        function_root_felts[3],
+        u64_to_felt(state_tree_height),
+    ]);
+
+    hash_to_bytes(&hash)
+}
+
 pub fn compute_register_user_content_hash(fingerprint: &[u8; 32], param: &[u8; 32]) -> anyhow::Result<[u8; 32]> {
     // Convert bytes to Hash type and use MerkleHasher::two_to_one
     // This matches the gatherer's hash_two_from_slice function

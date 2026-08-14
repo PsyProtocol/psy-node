@@ -43,6 +43,8 @@ pub trait QNetworkTreeCircuitSpecificConstants: Sized + Send + Sync + Clone {
     const BATCH_USER_REGISTRATION_SUB_TREE_HEIGHT: usize;
     const BATCH_USER_REGISTRATION_MAX_SUB_TREES: usize;
     const BATCH_DEPLOY_CONTRACT_SUB_TREE_HEIGHT: usize;
+    const BATCH_CONTRACT_SUB_TREE_HEIGHT: usize =
+        Self::BATCH_DEPLOY_CONTRACT_SUB_TREE_HEIGHT;
     const DEFAULT_USER_STATE_TREE_ROOT_HASH_U64_X4: [u64; 4];
     const END_CAP_CIRCUIT_FINGERPRINT_HASH_U64_X4: [u64; 4];
 

@@ -25,10 +25,10 @@ use psy_data::{
         verifiable_checkpoint_transition::PsyVerifiableCheckpointTransition,
     },
     v1::qdata::{
-        checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, PQEDCheckpointLeafStats, QEDL2BlockState}, checkpoint_sync::PQEDCheckpointSyncInfoCompact, contract::{ContractCodeDefinitionWithContractId, PQEDContractLeaf}, ffs_sizes::{PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF, PSY_OBJECT_FFS_SIZE_USER_LEAF, PSY_OBJECT_FFS_SIZE_ZK_PUBLIC_KEY}, populated_checkpoint::PsyCheckpointLeafPopulated, user::PQEDUserLeaf
+        checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, PQEDCheckpointLeafStats, QEDL2BlockState}, checkpoint_sync::PQEDCheckpointSyncInfoCompact, contract::{ContractCodeDefinitionWithContractId, PQEDContractLeafV2, CONTRACT_LEAF_SERIALIZED_SIZE}, ffs_sizes::{PSY_OBJECT_FFS_SIZE_USER_LEAF, PSY_OBJECT_FFS_SIZE_ZK_PUBLIC_KEY}, populated_checkpoint::PsyCheckpointLeafPopulated, user::PQEDUserLeaf
     },
 };
-use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingleFixedTemplate;
+use psy_serialize::{PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalDatabaseSerializeBaseSingleFixedTemplate};
 pub const GENESIS_INJEST_ALL_USERS_REALM_ID: u64 = 0xFFFFFFFFFFFFFFFF;
 
 #[derive(Debug, Clone)]
@@ -95,7 +95,10 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
         let mut contract_function_tree_nodes_serializer = SingleIdMerkleNodeBatchSerializer::<Hash>::new();
         let mut global_contract_tree_merkle_leaves = Vec::<MerkleLeafNode<Hash>>::with_capacity(genesis_block.contracts.len());
         if collect_contracts {
-            self.contract_leaves_ffs = Vec::with_capacity(genesis_block.contracts.len() * PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF);
+            self.contract_leaves_ffs = Vec::with_capacity(
+                genesis_block.contracts.len()
+                    * (8 + CONTRACT_LEAF_SERIALIZED_SIZE),
+            );
             self.contract_code_definitions = Vec::with_capacity(genesis_block.contracts.len());
         }
         for (contract_id, contract) in genesis_block.contracts.iter().enumerate() {
@@ -115,11 +118,18 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
                 collect_contracts,
             );
 
-            let contract_leaf = PQEDContractLeaf::<F, Hash> {
+            let contract_leaf = PQEDContractLeafV2::<F, Hash> {
                 deployer: contract.deployer,
                 function_tree_root,
                 code_root: contract.code_root,
                 state_tree_height: F::from_u16_value(contract.code_definition.state_tree_height),
+                // Genesis contracts are supplied in the legacy deploy format and
+                // do not carry compiler-generated layout metadata.  They use the
+                // canonical empty layout until an explicit layout-aware deploy
+                // is introduced for genesis.
+                state_layout_root: Hash::get_zero_value(),
+                state_layout_field_count: F::ZERO_VALUE,
+                state_layout_slot_count: F::ZERO_VALUE,
             };
 
             let contract_leaf_hash = contract_leaf.qfhash::<Hasher>();
@@ -131,7 +141,7 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
             if collect_contracts {
                 self.contract_leaves_ffs.extend_from_slice(&contract_id.to_le_bytes());
                 self.contract_leaves_ffs
-                    .extend_from_slice(&contract_leaf.fx_tpl_psy_ser_into_bytes_vec()?);
+                    .extend_from_slice(&contract_leaf.psy_ser_into_bytes_vec()?);
 
                 self.contract_code_definitions.push(ContractCodeDefinitionWithContractId {
                     contract_id,

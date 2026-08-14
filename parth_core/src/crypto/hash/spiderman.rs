@@ -281,7 +281,8 @@ impl<Hash: Q256BitHash> FallbackPsySerializeCanonical for SpidermanUpdateProof<H
     }
     
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
-        self.top_line_proof.pio_write_to_io(writer)?;
+        self.top_line_proof
+            .fallback_pio_write_to_io(writer)?;
         writer.psy_write_vec_length(self.web_proof_old_leaves.len())?;
         for leaf in &self.web_proof_old_leaves {
             writer.psy_write_bytes_fixed(&leaf.into_owned_32bytes())?;
@@ -294,7 +295,10 @@ impl<Hash: Q256BitHash> FallbackPsySerializeCanonical for SpidermanUpdateProof<H
     }
     
     fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
-        let top_line_proof = DeltaMerkleProofCore::<Hash>::pio_read_from_io(reader)?;
+        let top_line_proof =
+            DeltaMerkleProofCore::<Hash>::fallback_pio_read_from_io(
+                reader,
+            )?;
         let old_leaves_len = reader.psy_read_vec_length()?;
         let mut web_proof_old_leaves = Vec::with_capacity(old_leaves_len);
         for _ in 0..old_leaves_len {

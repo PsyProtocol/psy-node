@@ -19,6 +19,7 @@ fn compile_method_from_sources(sources: &[(ModulePath, String)], method_name: &s
     let output = compile_crate_from_sources(sources).expect("multi-file compilation should succeed");
     let method = output
         .abi
+        .contract
         .methods
         .iter()
         .find(|m| m.name == method_name)

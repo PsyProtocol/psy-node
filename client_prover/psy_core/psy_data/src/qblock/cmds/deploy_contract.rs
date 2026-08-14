@@ -11,6 +11,10 @@ use ts_rs::TS;
 
 use crate::qdata::contract::ContractCodeDefinition;
 
+/// Keep this transport bound aligned with
+/// `psy_core::constants::protocol::STATE_LAYOUT_MAX_PROOF_BYTES`.
+pub const STATE_LAYOUT_MAX_PROOF_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, TS)]
 #[serde(bound = "for<'de2> F: Deserialize<'de2>")]
 #[ts(export, concrete(F = GoldilocksField))]
@@ -53,6 +57,61 @@ impl<F: RichField> KVQSerializable for QBCDeployContract<F> {
 
     fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
         bincode::deserialize(bytes).map_err(|e| anyhow::anyhow!(e))
+    }
+}
+
+/// Layout-aware deploy command produced locally by `gen-deploy-command`.
+///
+/// The manifest/type DAG remain local artifacts. Consensus consumes only
+/// the authenticated layout endpoint and recursively verifies
+/// `canonical_layout_proof` against the configured verifier fingerprint.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, TS)]
+#[ts(export, concrete(F = GoldilocksField))]
+#[serde(bound = "for<'de2> F: Deserialize<'de2>")]
+pub struct QBCDeployContractV2<F: RichField> {
+    pub deploy_contract: QBCDeployContract<F>,
+    pub layout_protocol_version: u16,
+    pub state_layout_root: QHashOut<F>,
+    pub state_layout_field_count: u64,
+    pub state_layout_slot_count: u64,
+    pub canonical_layout_verifier_fingerprint: QHashOut<F>,
+    pub canonical_layout_proof: Vec<u8>,
+}
+
+impl<F: RichField> QBCDeployContractV2<F> {
+    pub fn validate_shape(&self) -> anyhow::Result<()> {
+        ensure!(self.layout_protocol_version != 0, "layout protocol version must be non-zero");
+        ensure!(!self.canonical_layout_proof.is_empty(), "canonical layout proof is empty");
+        ensure!(
+            self.canonical_layout_proof.len() <= STATE_LAYOUT_MAX_PROOF_BYTES,
+            "canonical layout proof exceeds maximum size"
+        );
+        ensure!(
+            self.state_layout_field_count <= self.state_layout_slot_count,
+            "layout field count exceeds slot count"
+        );
+        let state_tree_height = self.deploy_contract.code_definition.state_tree_height;
+        ensure!(state_tree_height < 64, "contract state tree height is unsupported");
+        // Each state-tree leaf stores four felts (a Hash).
+        let capacity = (1u64 << state_tree_height) * 4;
+        ensure!(
+            self.state_layout_slot_count <= capacity,
+            "layout slot count exceeds contract state capacity"
+        );
+        Ok(())
+    }
+}
+
+impl<F: RichField> KVQSerializable for QBCDeployContractV2<F> {
+    fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        self.validate_shape()?;
+        bincode::serialize(self).map_err(|e| anyhow::anyhow!(e))
+    }
+
+    fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
+        let value: Self = bincode::deserialize(bytes).map_err(|e| anyhow::anyhow!(e))?;
+        value.validate_shape()?;
+        Ok(value)
     }
 }
 
@@ -99,6 +158,149 @@ impl<F: RichField> QBCDeployContractWithRoot<F> {
 }
 
 impl<F: RichField> KVQSerializable for QBCDeployContractWithRoot<F> {
+    fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        bincode::serialize(self).map_err(|e| anyhow::anyhow!(e))
+    }
+
+    fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
+        bincode::deserialize(bytes).map_err(|e| anyhow::anyhow!(e))
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, TS)]
+#[serde(bound = "for<'de2> F: Deserialize<'de2>")]
+#[ts(export, concrete(F = GoldilocksField))]
+pub struct QBCUpdateContract<F: RichField> {
+    pub contract_id: u64,
+    pub deployer: QHashOut<F>,
+    pub code_definition: ContractCodeDefinition,
+    pub function_whitelist: Vec<QHashOut<F>>,
+    pub code_root: QHashOut<F>,
+    pub layout_protocol_version: u16,
+    pub state_layout_root: QHashOut<F>,
+    pub state_layout_field_count: u64,
+    pub state_layout_slot_count: u64,
+    pub canonical_layout_verifier_fingerprint: QHashOut<F>,
+    pub canonical_layout_proof: Vec<u8>,
+}
+
+impl<F: RichField> QBCUpdateContract<F> {
+    pub fn new(
+        contract_id: u64,
+        deployer: QHashOut<F>,
+        code_definition: ContractCodeDefinition,
+        function_whitelist: Vec<QHashOut<F>>,
+        code_root: QHashOut<F>,
+        layout_protocol_version: u16,
+        state_layout_root: QHashOut<F>,
+        state_layout_field_count: u64,
+        state_layout_slot_count: u64,
+        canonical_layout_verifier_fingerprint: QHashOut<F>,
+        canonical_layout_proof: Vec<u8>,
+    ) -> Self {
+        Self {
+            contract_id,
+            deployer,
+            code_definition,
+            function_whitelist,
+            code_root,
+            layout_protocol_version,
+            state_layout_root,
+            state_layout_field_count,
+            state_layout_slot_count,
+            canonical_layout_verifier_fingerprint,
+            canonical_layout_proof,
+        }
+    }
+
+    pub fn validate_shape(&self) -> anyhow::Result<()> {
+        ensure!(self.contract_id != 0, "update contract id must be non-zero");
+        ensure!(self.layout_protocol_version != 0, "layout protocol version must be non-zero");
+        ensure!(!self.canonical_layout_proof.is_empty(), "canonical layout proof is empty");
+        ensure!(
+            self.canonical_layout_proof.len() <= STATE_LAYOUT_MAX_PROOF_BYTES,
+            "canonical layout proof exceeds maximum size"
+        );
+        ensure!(
+            self.state_layout_field_count <= self.state_layout_slot_count,
+            "layout field count exceeds slot count"
+        );
+        let state_tree_height = self.code_definition.state_tree_height;
+        ensure!(state_tree_height < 64, "contract state tree height is unsupported");
+        // Each state-tree leaf stores four felts (a Hash).
+        let capacity = (1u64 << state_tree_height) * 4;
+        ensure!(
+            self.state_layout_slot_count <= capacity,
+            "layout slot count exceeds contract state capacity"
+        );
+        Ok(())
+    }
+
+    pub fn into_with_whitelist_root<H: MerkleZeroHasherWithMarkedLeaf<QHashOut<F>>>(self) -> anyhow::Result<QBCUpdateContractWithRoot<F>> {
+        QBCUpdateContractWithRoot::<F>::new::<H>(
+            self.contract_id,
+            self.deployer,
+            self.code_definition,
+            self.function_whitelist,
+            self.code_root,
+        )
+    }
+}
+
+impl<F: RichField> KVQSerializable for QBCUpdateContract<F> {
+    fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        self.validate_shape()?;
+        bincode::serialize(self).map_err(|e| anyhow::anyhow!(e))
+    }
+
+    fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
+        let value: Self = bincode::deserialize(bytes).map_err(|e| anyhow::anyhow!(e))?;
+        value.validate_shape()?;
+        Ok(value)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(bound = "for<'de2> F: Deserialize<'de2>")]
+pub struct QBCUpdateContractWithRoot<F: RichField> {
+    pub contract_id: u64,
+    pub deployer: QHashOut<F>,
+    pub code_definition: ContractCodeDefinition,
+    pub function_whitelist: Vec<QHashOut<F>>,
+    pub function_whitelist_root: QHashOut<F>,
+    pub code_root: QHashOut<F>,
+}
+
+impl<F: RichField> QBCUpdateContractWithRoot<F> {
+    pub fn new<H: MerkleZeroHasherWithMarkedLeaf<QHashOut<F>>>(
+        contract_id: u64,
+        deployer: QHashOut<F>,
+        code_definition: ContractCodeDefinition,
+        function_whitelist: Vec<QHashOut<F>>,
+        code_root: QHashOut<F>,
+    ) -> anyhow::Result<Self> {
+        ensure!(
+            function_whitelist.len() == code_definition.functions.len() * 2,
+            "function_whitelist must contain two entries per function"
+        );
+        let mut whitelist_tree = SimpleMerkleTree::<H, QHashOut<F>>::new(CONTRACT_FUNCTION_TREE_HEIGHT);
+        for (i, leaf) in function_whitelist.iter().enumerate() {
+            whitelist_tree.set_leaf(i as u64, *leaf);
+        }
+        let function_whitelist_root = whitelist_tree.get_root();
+
+        Ok(Self {
+            contract_id,
+            deployer,
+            code_definition,
+            function_whitelist,
+            function_whitelist_root,
+            code_root,
+        })
+    }
+}
+
+impl<F: RichField> KVQSerializable for QBCUpdateContractWithRoot<F> {
     fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
         bincode::serialize(self).map_err(|e| anyhow::anyhow!(e))
     }
@@ -493,6 +695,157 @@ mod tests {
             "PsyTokenContract.other_user_info[3332].amount_sent"
         );
 
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod update_contract_tests {
+    use kvq::traits::KVQSerializable;
+    use plonky2::{field::goldilocks_field::GoldilocksField, hash::poseidon::PoseidonHash};
+    use psy_client_common::data::qhashout::QHashOut;
+
+    use crate::{
+        qblock::cmds::deploy_contract::{QBCDeployContract, QBCDeployContractV2, QBCUpdateContract},
+        qdata::contract::{ContractCodeDefinition, ContractFunctionCodeDefinition},
+    };
+
+    type F = GoldilocksField;
+
+    fn sample_code_definition() -> ContractCodeDefinition {
+        ContractCodeDefinition {
+            state_tree_height: 10,
+            functions: vec![
+                ContractFunctionCodeDefinition {
+                    method_id: 42,
+                    num_inputs: 2,
+                    num_outputs: 1,
+                    vm_type: 0,
+                    code: vec![1, 2, 3, 4],
+                },
+                ContractFunctionCodeDefinition {
+                    method_id: 43,
+                    num_inputs: 0,
+                    num_outputs: 0,
+                    vm_type: 1,
+                    code: vec![5, 6, 7, 8, 9],
+                },
+            ],
+        }
+    }
+
+    fn sample_whitelist() -> Vec<QHashOut<F>> {
+        vec![
+            QHashOut::from_values(1, 2, 3, 4),
+            QHashOut::from_values(5, 6, 7, 8),
+            QHashOut::from_values(9, 10, 11, 12),
+            QHashOut::from_values(13, 14, 15, 16),
+        ]
+    }
+
+    fn sample_update() -> QBCUpdateContract<F> {
+        QBCUpdateContract {
+            contract_id: 1337,
+            deployer: QHashOut::from_values(21, 22, 23, 24),
+            code_definition: sample_code_definition(),
+            function_whitelist: sample_whitelist(),
+            code_root: QHashOut::from_values(31, 32, 33, 34),
+            layout_protocol_version: 1,
+            state_layout_root: QHashOut::from_values(41, 42, 43, 44),
+            state_layout_field_count: 3,
+            state_layout_slot_count: 8,
+            canonical_layout_verifier_fingerprint: QHashOut::from_values(51, 52, 53, 54),
+            canonical_layout_proof: vec![1, 2, 3],
+        }
+    }
+
+    #[test]
+    fn test_update_contract_kvq_serialize_round_trip() -> anyhow::Result<()> {
+        let cmd = sample_update();
+        let bytes = cmd.to_bytes()?;
+        let deserialized = QBCUpdateContract::<F>::from_bytes(&bytes)?;
+        assert_eq!(cmd, deserialized);
+        Ok(())
+    }
+
+    #[test]
+    fn update_rejects_zero_id_missing_proof_and_capacity_overflow() {
+        let mut zero_id = sample_update();
+        zero_id.contract_id = 0;
+        assert!(zero_id.validate_shape().is_err());
+
+        let mut missing_proof = sample_update();
+        missing_proof.canonical_layout_proof.clear();
+        assert!(missing_proof.validate_shape().is_err());
+
+        let mut overflow = sample_update();
+        overflow.state_layout_slot_count = (1 << 10) + 1;
+        assert!(overflow.validate_shape().is_err());
+    }
+
+    fn sample_deploy_v2() -> QBCDeployContractV2<F> {
+        QBCDeployContractV2 {
+            deploy_contract: QBCDeployContract {
+                deployer: QHashOut::from_values(21, 22, 23, 24),
+                code_definition: sample_code_definition(),
+                function_whitelist: sample_whitelist(),
+                code_root: QHashOut::from_values(31, 32, 33, 34),
+            },
+            layout_protocol_version: 1,
+            state_layout_root: QHashOut::from_values(41, 42, 43, 44),
+            state_layout_field_count: 3,
+            state_layout_slot_count: 8,
+            canonical_layout_verifier_fingerprint: QHashOut::from_values(51, 52, 53, 54),
+            canonical_layout_proof: vec![1, 2, 3],
+        }
+    }
+
+    #[test]
+    fn deploy_v2_round_trip_validates_shape() -> anyhow::Result<()> {
+        let command = sample_deploy_v2();
+        let bytes = command.to_bytes()?;
+        assert_eq!(QBCDeployContractV2::<F>::from_bytes(&bytes)?, command);
+        Ok(())
+    }
+
+    #[test]
+    fn deploy_v2_rejects_missing_proof_and_capacity_overflow() {
+        let mut missing_proof = sample_deploy_v2();
+        missing_proof.canonical_layout_proof.clear();
+        assert!(missing_proof.validate_shape().is_err());
+
+        let mut overflow = sample_deploy_v2();
+        overflow.state_layout_slot_count = (1 << 10) + 1;
+        assert!(overflow.validate_shape().is_err());
+    }
+
+    // the update whitelist root must be computed exactly like the deploy
+    // whitelist root for the same inputs
+    #[test]
+    fn test_update_whitelist_root_matches_deploy() -> anyhow::Result<()> {
+        let deployer = QHashOut::from_values(21, 22, 23, 24);
+        let code_definition = sample_code_definition();
+        let whitelist = sample_whitelist();
+        let code_root = QHashOut::from_values(31, 32, 33, 34);
+
+        let deploy_with_root = QBCDeployContract::<F> {
+            deployer,
+            code_definition: code_definition.clone(),
+            function_whitelist: whitelist.clone(),
+            code_root,
+        }
+        .into_with_whitelist_root::<PoseidonHash>()?;
+
+        let update_with_root = QBCUpdateContract::<F> {
+            deployer,
+            code_definition,
+            function_whitelist: whitelist,
+            code_root,
+            ..sample_update()
+        }
+        .into_with_whitelist_root::<PoseidonHash>()?;
+
+        assert_eq!(deploy_with_root.function_whitelist_root, update_with_root.function_whitelist_root);
         Ok(())
     }
 }

@@ -73,7 +73,7 @@ fn local_struct_field_compound_assign_should_work_but_currently_fails() {
     // Current compiler does not support it yet.
     let output = compile(source).expect("expected compiler to support local struct field compound-assign");
     assert!(
-        output.abi.methods.iter().any(|m| m.name == "local_struct_compound_assign"),
+        output.abi.contract.methods.iter().any(|m| m.name == "local_struct_compound_assign"),
         "method should appear in ABI after successful compile"
     );
 }
@@ -120,7 +120,7 @@ fn non_state_struct_methods_should_work_but_currently_fails() {
     // called.
     let output = compile(source).expect("expected compiler to support plain impl methods on non-state structs");
     assert!(
-        output.abi.methods.iter().any(|m| m.name == "use_non_state_struct_methods"),
+        output.abi.contract.methods.iter().any(|m| m.name == "use_non_state_struct_methods"),
         "method should appear in ABI after successful compile"
     );
 }

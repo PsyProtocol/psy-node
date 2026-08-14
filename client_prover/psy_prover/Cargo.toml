@@ -25,6 +25,7 @@ psy_network_circuit = { workspace = true, default-features = false }
 psy_dpn_circuit = { workspace = true, default-features = false }
 psy_vm = { workspace = true }
 psy_client_data = { workspace = true, default-features = false }
+psy_compiler = { workspace = true }
 psy_crypto = { workspace = true }
 psy_provider = { workspace = true }
 psy_ups_circuit = { workspace = true, default-features = false }
@@ -65,7 +66,7 @@ clap = { workspace = true }
 dashmap = { workspace = true }
 quick_cache = { workspace = true }
 psy_plonky2_common_circuits = { workspace = true }
-psy_plonky2_circuits = { workspace = true, optional = true }
+psy_plonky2_circuits = { workspace = true }
 psy_plonky2_basic_helpers = { workspace = true }
 parth_core = { workspace = true }
 gnark-plonky2-verifier-ffi = { workspace = true, optional = true }
@@ -84,7 +85,7 @@ js-sys = { workspace = true }
 flate2 = { workspace = true }
 
 [features]
-gnark-wrap = ["dep:gnark-plonky2-verifier-ffi", "dep:psy_plonky2_circuits", "psy_plonky2_circuits/gnark-wrap"]
+gnark-wrap = ["dep:gnark-plonky2-verifier-ffi", "psy_plonky2_circuits/gnark-wrap"]
 # default = ["is_sync"]
 is_sync = [
     "maybe-async/is_sync",

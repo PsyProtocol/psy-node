@@ -142,16 +142,21 @@ register-random-user:
 deploy-contract:
 	@echo "Deploying contracts..."
 	@echo "USER0 deploying token contract..."
-	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) deploy-contract --private-key=${USER0_PRIVATE_KEY} --contract-path ${PWD}/token.json --abi-path ${PWD}/token.abi.json --is-deploy
+	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) deploy-contract --private-key=${USER0_PRIVATE_KEY} --contract-path ${PWD}/token.json --is-deploy
 	@echo "USER1 deploying token contract..."
-	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) deploy-contract --private-key=${USER1_PRIVATE_KEY} --contract-path ${PWD}/token.json --abi-path ${PWD}/token.abi.json --is-deploy
+	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) deploy-contract --private-key=${USER1_PRIVATE_KEY} --contract-path ${PWD}/token.json --is-deploy
+
+update-contract:
+	@echo "Updating contracts..."
+	@echo "USER0 update token contract(no simple_mint)..."
+	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) update-contract --private-key=${USER0_PRIVATE_KEY} --contract-path ${PWD}/token.update.json --old-abi-path ${PWD}/token.json --is-update --contract-id 6
 
 get-deploy-contract-cmd:
 	@echo "Deploying contracts..."
 	@echo "USER0 deploying token contract..."
-	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) deploy-contract --private-key=${USER0_PRIVATE_KEY} --contract-path ${PWD}/token.json --abi-path ${PWD}/token.abi.json --output-path ./genesis_contracts.json
+	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) deploy-contract --private-key=${USER0_PRIVATE_KEY} --contract-path ${PWD}/token.json --output-path ./genesis_contracts.json
 	@echo "USER1 deploying token contract..."
-	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) deploy-contract --private-key=${USER1_PRIVATE_KEY} --contract-path ${PWD}/token.json --abi-path ${PWD}/token.abi.json --output-path ./genesis_contracts.json
+	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) deploy-contract --private-key=${USER1_PRIVATE_KEY} --contract-path ${PWD}/token.json --output-path ./genesis_contracts.json
 
 multi-contract-call:
 	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) call -p ${USER0_PRIVATE_KEY} --contract-id ${CONTRACT_ID}

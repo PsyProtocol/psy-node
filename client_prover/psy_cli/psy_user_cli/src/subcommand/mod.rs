@@ -13,6 +13,7 @@ pub mod local_prover;
 #[cfg(feature = "gnark-wrap")]
 pub mod prove_proxy;
 pub mod simulate;
+pub mod update_contract;
 
 cfg_if::cfg_if! {
     if #[cfg(not(target_arch = "wasm32"))] {
@@ -59,6 +60,7 @@ pub enum Commands {
     RegisterUser(crate::subcommand::args::RegisterUserArgs),
 
     DeployContract(crate::subcommand::args::DeployContractArgs),
+    UpdateContract(crate::subcommand::args::UpdateContractArgs),
     Call(WalletSessionArgs),
 
     GetUserId(crate::subcommand::args::UserIdArgs),

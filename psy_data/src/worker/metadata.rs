@@ -1,5 +1,5 @@
 use parth_core::{
-    QJOB_ID_SERIALIZED_SIZE, QJobIdBase, crypto::hash::{tag_tree::{TagTreeStorageNode, hash_tag_tree_node, hash_tag_tree_node_three}, traits::{MerkleHasher, ZeroableHash}}, data::hash::merkle_node_key::SimpleMerkleNodeKey, protocol::core_types::Q256BitHash, utils::QPGenRandom
+    QJOB_ID_SERIALIZED_SIZE, QJobIdBase, crypto::hash::{tag_tree::{TagTreeStorageNode, hash_tag_tree_node, hash_tag_tree_node_four, hash_tag_tree_node_three}, traits::{MerkleHasher, ZeroableHash}}, data::hash::merkle_node_key::SimpleMerkleNodeKey, protocol::core_types::Q256BitHash, utils::QPGenRandom
 };
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
@@ -9,6 +9,7 @@ pub const PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD: u8 = 0;
 pub const PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN: u8 = 1;
 pub const PROOF_REWARD_TREE_HASH_MODE_3_CHILDREN_DOUBLE_REWARD: u8 = 2;
 pub const PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD: u8 = 3;
+pub const PROOF_REWARD_TREE_HASH_MODE_4_CHILDREN: u8 = 4;
 
 #[pderive::serialize_clone_hash_job_id_ts]
 #[ts(export, concrete(Hash = parth_core::PHash, JobId = QProvingJobDataID))]
@@ -69,6 +70,12 @@ impl<Hash: ZeroableHash + Copy, JobId> PsyProvingJobMetadata<Hash, JobId> {
                 }
                 hash_tag_tree_node::<Hash, Hasher>(&children[0], &Hash::get_zero_value(), &tag)
             }
+            PROOF_REWARD_TREE_HASH_MODE_4_CHILDREN => {
+                if children.len() != 4 {
+                    anyhow::bail!("Expected 4 children for 4-children reward hash mode, got {}", children.len());
+                }
+                hash_tag_tree_node_four::<Hash, Hasher>(&children[0], &children[1], &children[2], &children[3], &tag)
+            }
             _ => anyhow::bail!("Unknown reward tree hash mode: {}", self.reward_tree_hash_mode),
         };
         Ok(res)
@@ -104,6 +111,38 @@ impl<Hash: ZeroableHash + Copy + PartialEq, JobId> PsyProvingJobMetadata<Hash, J
                 value: top_value,
             }));
             updates.push((right_key, TagTreeStorageNode {
+                tag,
+                value: last_two,
+            }));
+        } else if self.reward_tree_hash_mode == PROOF_REWARD_TREE_HASH_MODE_4_CHILDREN {
+            // special case for 4 children: the children are laid out as
+            // [c0, [c1, [c2, c3]]] under this node
+            if self.dependencies.len() != 4 || children_reward_tree_values.len() != 4 {
+                anyhow::bail!(
+                    "Expected 4 children for 4-children reward hash mode, got {}",
+                    self.dependencies.len()
+                );
+            }
+
+            let last_two = hash_tag_tree_node::<Hash, Hasher>(&children_reward_tree_values[2], &children_reward_tree_values[3], &tag);
+            let last_three = hash_tag_tree_node::<Hash, Hasher>(&children_reward_tree_values[1], &last_two, &tag);
+            let top_value = hash_tag_tree_node::<Hash, Hasher>(&children_reward_tree_values[0], &last_three, &tag);
+            if top_value != reward_tree_value {
+                anyhow::bail!("Computed top value does not match reward tree value for 4-children reward hash mode");
+            }
+            let self_key = self.get_reward_tree_node_key();
+            let right_key = self_key.right_child();
+            let right_right_key = right_key.right_child();
+
+            updates.push((self_key, TagTreeStorageNode {
+                tag,
+                value: top_value,
+            }));
+            updates.push((right_key, TagTreeStorageNode {
+                tag,
+                value: last_three,
+            }));
+            updates.push((right_right_key, TagTreeStorageNode {
                 tag,
                 value: last_two,
             }));
@@ -279,3 +318,49 @@ pser::impl_psy_ser_basic_tests_fallback!(
     psy_proving_job_metadata_tests
 );
 
+
+#[cfg(test)]
+mod mode_four_tests {
+    use parth_core::{crypto::hash::{tag_tree::hash_tag_tree_node_four, traits::MerkleHasher}, utils::QPGenRandom};
+
+    use super::*;
+
+    #[test]
+    fn test_mode_4_children_tag_value_and_updates_are_consistent() -> anyhow::Result<()> {
+        type Hash = parth_core::PHash;
+        type Hasher = parth_core::pgoldilocks::PoseidonHasher;
+
+        let tag = Hash::qp_rand_gen();
+        let children = [
+            Hash::qp_rand_gen(),
+            Hash::qp_rand_gen(),
+            Hash::qp_rand_gen(),
+            Hash::qp_rand_gen(),
+        ];
+        let deps = (0..4).map(|_| QProvingJobDataID::qp_rand_gen()).collect::<Vec<_>>();
+
+        let metadata = PsyProvingJobMetadata::<Hash, QProvingJobDataID> {
+            expected_public_inputs_hash: Hash::qp_rand_gen(),
+            reward_tree_node_index: 0,
+            reward_tree_node_level: 1,
+            reward_tree_hash_mode: PROOF_REWARD_TREE_HASH_MODE_4_CHILDREN,
+            reward_tree_node_children: 4,
+            dependencies: deps,
+        };
+
+        let reward_tree_value = metadata.get_new_rewards_tag_tree_value::<Hasher>(tag, &children)?;
+        let expected = hash_tag_tree_node_four::<Hash, Hasher>(&children[0], &children[1], &children[2], &children[3], &tag);
+        assert_eq!(reward_tree_value, expected);
+
+        let updates = metadata.get_new_rewards_tag_tree_updates::<Hasher>(tag, &children, reward_tree_value)?;
+        assert_eq!(updates.len(), 3);
+        assert_eq!(updates[0].0, metadata.get_reward_tree_node_key());
+        assert_eq!(updates[0].1.value, reward_tree_value);
+        assert_eq!(updates[1].0, metadata.get_reward_tree_node_key().right_child());
+        assert_eq!(updates[2].0, metadata.get_reward_tree_node_key().right_child().right_child());
+
+        // wrong child count must fail
+        assert!(metadata.get_new_rewards_tag_tree_value::<Hasher>(tag, &children[..3]).is_err());
+        Ok(())
+    }
+}

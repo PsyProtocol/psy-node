@@ -6,3 +6,4 @@ pub mod pm_jobs_completed_stats;
 pub mod pm_reward_commitment;
 pub mod user;
 pub mod contract;
+pub mod state_layout;

@@ -14,7 +14,9 @@ use crate::qdata::contract::PsyContractLeaf;
 pub struct QCBatchDeployContractsCircuitInput<F: RichField> {
     pub deploy_contract_circuit_whitelist: QHashOut<F>,
     pub spiderman_append_proof: SpidermanUpdateProof<QHashOut<F>>,
+    pub contract_ids: Vec<u64>,
     pub contract_leaves: Vec<PsyContractLeaf<F>>,
+    pub initial_layout_proofs: Vec<Vec<u8>>,
 }
 
 impl<F: RichField> AggStateTrackableInput<F> for QCBatchDeployContractsCircuitInput<F> {

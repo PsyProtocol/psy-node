@@ -20,6 +20,7 @@ tracing = { workspace = true }
 psy_client_common = { workspace = true }
 psy_cli_common = { path = "../../../psy_cli/psy_cli_common" }
 psy_vm = { workspace = true }
+psy_compiler = { workspace = true }
 psy_prover = { workspace = true, default-features = false }
 psy_client_data = { workspace = true }
 # psy_rust_sdk = { workspace = true }
