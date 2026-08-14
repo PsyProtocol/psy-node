@@ -169,10 +169,35 @@ where
                                 );
                                 processor.db.status.set_error(error.clone());
                                 tracing::error!("{error}");
+                                continue;
                             }
                             Err(error) => {
                                 let error = format!(
                                     "Coordinator rollback archive preparation failed closed at slot {}: {:#}",
+                                    current_slot, error,
+                                );
+                                processor.db.status.set_error(error.clone());
+                                tracing::error!("{error}");
+                                continue;
+                            }
+                        }
+                        match processor.db.progress_coordinator_rollback().await {
+                            Ok(psy_node_core::store::rollback_participant_maintenance::CoordinatorRollbackGlobalProgress::AwaitingParticipants {
+                                completed,
+                                expected,
+                                ..
+                            }) => tracing::warn!(
+                                "[COORDINATOR] Distributed rollback barrier awaits participant completions: {completed}/{expected}"
+                            ),
+                            Ok(psy_node_core::store::rollback_participant_maintenance::CoordinatorRollbackGlobalProgress::Progressed(head)) => tracing::warn!(
+                                "[COORDINATOR] Distributed rollback advanced at epoch {}, checkpoint {}",
+                                head.canonical_ref().chain_epoch().get(),
+                                head.canonical_ref().checkpoint().checkpoint_id().get(),
+                            ),
+                            Ok(psy_node_core::store::rollback_participant_maintenance::CoordinatorRollbackGlobalProgress::ReadyForRuntimeRebuild(_)) => {}
+                            Err(error) => {
+                                let error = format!(
+                                    "Coordinator distributed rollback failed closed at slot {}: {:#}",
                                     current_slot, error,
                                 );
                                 processor.db.status.set_error(error.clone());

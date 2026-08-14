@@ -171,6 +171,15 @@ where
                                 restored_row_count,
                             );
                         }
+                        Ok(psy_node_core::store::rollback_runtime_rebuild::RealmRollbackParticipantProgress::RestorePrepared {
+                            final_rows_digest,
+                            ..
+                        }) => {
+                            tracing::warn!(
+                                ?final_rows_digest,
+                                "Realm rollback control state is restored exactly; awaiting global restore barrier",
+                            );
+                        }
                         Ok(psy_node_core::store::rollback_runtime_rebuild::RealmRollbackParticipantProgress::AwaitingCoordinator(_)) => {}
                         Ok(psy_node_core::store::rollback_runtime_rebuild::RealmRollbackParticipantProgress::ReadyForRuntimeRebuild(_)) => break,
                         Err(error) => {

@@ -1338,7 +1338,15 @@ pub(super) async fn read_deleting_rollback_authority<Hash: Q256BitHash>(
             return Err(RollbackGlobalArchiveBarrierError::HeadMissing);
         }
     };
-    if !matches!(current.rollback_control(), RollbackControlState::Deleting(_)) {
+    let current_is_deleting = matches!(
+        current.rollback_control(),
+        RollbackControlState::Deleting(_)
+    );
+    let current_is_restoring = matches!(
+        current.rollback_control(),
+        RollbackControlState::Restoring(_)
+    );
+    if !current_is_deleting && !current_is_restoring {
         return Err(RollbackGlobalArchiveBarrierError::NotDeleting);
     }
     let request = *current
@@ -1367,7 +1375,13 @@ pub(super) async fn read_deleting_rollback_authority<Hash: Q256BitHash>(
         *expected_barrier_ready.candidate(),
     )
     .map_err(|error| RollbackGlobalArchiveBarrierError::Canonical(error.to_string()))?;
-    if expected_deleting.candidate() != &current {
+    let expected_restoring = CanonicalHeadTransition::begin_rollback_restore(
+        *expected_deleting.candidate(),
+    )
+    .map_err(|error| RollbackGlobalArchiveBarrierError::Canonical(error.to_string()))?;
+    if (current_is_deleting && expected_deleting.candidate() != &current)
+        || (current_is_restoring && expected_restoring.candidate() != &current)
+    {
         return Err(RollbackGlobalArchiveBarrierError::HeadConflict);
     }
 
@@ -1422,7 +1436,7 @@ pub(super) async fn read_deleting_rollback_authority<Hash: Q256BitHash>(
     store.revalidate(&receipt).await?;
     Ok(DeletingRollbackGlobalArchiveBarrier {
         barrier: receipt.barrier,
-        deleting_head: current,
+        deleting_head: *expected_deleting.candidate(),
         delete_plan,
         participant_plan: plan,
     })

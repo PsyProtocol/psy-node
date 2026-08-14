@@ -74,14 +74,27 @@ impl ScyllaRollbackGlobalRestoreOrchestrator {
         &self,
         delete_barrier: &PersistedRollbackGlobalDeleteBarrier<Hash>,
     ) -> Result<StoredCanonicalHead<Hash>, RollbackGlobalRestoreOrchestratorError> {
-        self.delete_barrier.revalidate(delete_barrier).await.map_err(backend)?;
+        Self::begin_restoring_with(
+            &self.canonical_head,
+            &self.delete_barrier,
+            delete_barrier,
+        )
+        .await
+    }
+
+    pub(super) async fn begin_restoring_with<Hash: Q256BitHash>(
+        canonical_head: &ScyllaCanonicalHeadStore,
+        delete_barrier_store: &ScyllaRollbackGlobalDeleteBarrierStore,
+        delete_barrier: &PersistedRollbackGlobalDeleteBarrier<Hash>,
+    ) -> Result<StoredCanonicalHead<Hash>, RollbackGlobalRestoreOrchestratorError> {
+        delete_barrier_store.revalidate(delete_barrier).await.map_err(backend)?;
         let transition = CanonicalHeadTransition::begin_rollback_restore(
             *delete_barrier.barrier().deleting_head(),
         )
         .map_err(backend)?
         .seal();
-        self.ensure_head_transition(&transition).await?;
-        self.delete_barrier.revalidate(delete_barrier).await.map_err(backend)?;
+        ensure_head_transition(canonical_head, &transition).await?;
+        delete_barrier_store.revalidate(delete_barrier).await.map_err(backend)?;
         Ok(*transition.candidate())
     }
 

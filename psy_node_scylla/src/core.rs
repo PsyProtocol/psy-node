@@ -26,7 +26,8 @@ use psy_node_core::store::rollback_participant_plan::{
     CoordinatorRollbackParticipantPlanStore, RollbackParticipantPlan,
 };
 use psy_node_core::store::rollback_participant_maintenance::{
-    CoordinatorRollbackMaintenanceExecutor, CoordinatorRollbackMaintenanceOutcome,
+    CoordinatorRollbackGlobalProgress, CoordinatorRollbackMaintenanceExecutor,
+    CoordinatorRollbackMaintenanceOutcome,
 };
 use psy_node_core::store::rollback_runtime_rebuild::{
     CoordinatorRollbackRuntimePublication, CoordinatorRollbackRuntimeRebuildStore,
@@ -57,6 +58,7 @@ use crate::rollback::{
     ScyllaCoordinatorCommitSourceStore,
     ScyllaCoordinatorCommitPhysicalArchiveStore,
     prepare_coordinator_rollback_archive,
+    progress_coordinator_global_rollback,
     try_publish_restored_runtime,
 };
 use crate::rollback::branch_exact_startup_preflight::ScyllaRealmProcessorStartupPreflightProvider;
@@ -1087,6 +1089,24 @@ where
             self.coordinator_commit_sources_arc()?,
             self.coordinator_rollback_participant_plans_arc()?,
             network,
+            crate::rollback::CqlKeyspaceName::try_new(self.keyspace.clone())?,
+            checkpoint_tree_height,
+        )
+        .await
+    }
+
+    async fn progress_coordinator_rollback(
+        &self,
+        network: NetworkId,
+        checkpoint_tree_height: u8,
+    ) -> anyhow::Result<CoordinatorRollbackGlobalProgress<Hash>> {
+        progress_coordinator_global_rollback::<F, Hash, Hasher>(
+            self.session.clone(),
+            self.coordinator_canonical_head_arc()?,
+            self.coordinator_commit_sources_arc()?,
+            self.coordinator_rollback_participant_plans_arc()?,
+            network,
+            crate::rollback::CqlKeyspaceName::try_new(self.no_tablet_keyspace.clone())?,
             crate::rollback::CqlKeyspaceName::try_new(self.keyspace.clone())?,
             checkpoint_tree_height,
         )

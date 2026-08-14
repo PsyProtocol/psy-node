@@ -95,6 +95,8 @@ mod coordinator_commit_target_restore;
 mod coordinator_commit_physical_archive_store;
 mod coordinator_rollback_maintenance;
 pub(crate) use coordinator_rollback_maintenance::prepare_coordinator_rollback_archive;
+mod coordinator_rollback_global_progress;
+pub(crate) use coordinator_rollback_global_progress::progress_coordinator_global_rollback;
 mod coordinator_commit_delete_restore_plan;
 mod coordinator_commit_delete_restore_plan_store;
 mod coordinator_commit_delete_restore_executor;

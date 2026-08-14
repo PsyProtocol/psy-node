@@ -24,16 +24,23 @@ use psy_node_core::store::{
 use scylla::client::session::Session;
 
 use super::{
-    BranchExactDeploymentNoTabletKeyspace, BranchExactSchemaReady,
-    PendingQueueArtifactDataKeyspace, ScyllaAuthorityLocalHeadStore,
+    AuthorityTimestampNoTabletKeyspace, BranchExactDeploymentNoTabletKeyspace,
+    BranchExactSchemaReady, PendingCounterAdapter, PendingQueueArtifactDataKeyspace,
+    ScyllaAuthorityLocalHeadStore, ScyllaAuthorityTimestampStore,
+    ScyllaBranchExactWriterLifecycleStore, ScyllaPendingPipelineStore,
     branch_exact_dual_write_executor::ScyllaBranchExactDualWriteAdapter,
     canonical_head_prototype::ScyllaCanonicalHeadStore,
+    coordinator_rollback_delete_completion_store::ScyllaCoordinatorRollbackDeleteCompletionStore,
     realm_rollback_physical_archive_owner::{
         RealmRollbackPhysicalArchiveOwnerError,
         ScyllaRealmRollbackPhysicalArchiveOwner,
     },
     realm_rollback_delete_restore_executor::ScyllaRealmRollbackDeleteRestoreExecutor,
+    realm_rollback_physical_archive_store::ScyllaRealmRollbackPhysicalArchiveStore,
+    realm_rollback_target_restore_executor::ScyllaRealmRollbackTargetRestoreExecutor,
+    realm_rollback_target_restore_planner::ScyllaRealmRollbackTargetRestorePlanner,
     rollback_global_archive_barrier::read_deleting_rollback_authority,
+    rollback_global_delete_barrier::ScyllaRollbackGlobalDeleteBarrierStore,
     ScyllaRollbackParticipantPlanStore,
     rollback_runtime_rebuild_store::ScyllaRollbackRuntimeRebuildStore,
     AuthorityLocalHeadNoTabletKeyspace, CanonicalHeadNoTabletKeyspace,
@@ -47,6 +54,7 @@ pub struct ScyllaRealmRollbackRuntimeControl {
     runtime_rebuild: Arc<ScyllaRollbackRuntimeRebuildStore>,
     local_inventory: Arc<super::realm_rollback_commit_inventory_store::ScyllaRealmRollbackCommitInventoryStore>,
     local_head: Arc<ScyllaAuthorityLocalHeadStore>,
+    local_control_keyspace: CqlKeyspaceName,
     local_state_keyspace: CqlKeyspaceName,
     coordinator_archive_keyspace: CqlKeyspaceName,
     branch_exact_ready: Arc<BranchExactSchemaReady>,
@@ -68,6 +76,9 @@ impl ScyllaRealmRollbackRuntimeControl {
             coordinator_keyspace
         ))?;
         let local_state_keyspace = CqlKeyspaceName::try_new(local_keyspace.to_owned())?;
+        let local_control_keyspace = CqlKeyspaceName::try_new(
+            local_no_tablet_keyspace.to_owned(),
+        )?;
         let local_control = BranchExactDeploymentNoTabletKeyspace::try_new(
             local_no_tablet_keyspace.to_owned(),
         )?;
@@ -107,6 +118,7 @@ impl ScyllaRealmRollbackRuntimeControl {
             ),
             local_inventory,
             local_head,
+            local_control_keyspace,
             local_state_keyspace,
             coordinator_archive_keyspace: data,
             branch_exact_ready,
@@ -144,6 +156,132 @@ impl ScyllaRealmRollbackRuntimeControl {
             self.coordinator_archive_keyspace.clone(),
         )
         .await?)
+    }
+
+    /// Select the complete plan-ordered global delete barrier from the shared
+    /// Coordinator archive, then restore only this process's Realm keyspace.
+    /// No caller-provided completion digest or target row is accepted.
+    async fn restore_selected_realm<Hash: Q256BitHash>(
+        &self,
+        deleting: &super::rollback_global_archive_barrier::DeletingRollbackGlobalArchiveBarrier<Hash>,
+        participant: psy_node_core::store::rollback_participant_plan::RollbackRealmParticipant,
+    ) -> anyhow::Result<
+        super::realm_rollback_physical_archive_store::PersistedRealmRollbackTargetRestoreCompletion<Hash>,
+    > {
+        let archive = Arc::new(
+            ScyllaRealmRollbackPhysicalArchiveStore::prepare(
+                self.session.clone(),
+                self.coordinator_archive_keyspace.clone(),
+            )
+            .await?,
+        );
+        let coordinator_store = ScyllaCoordinatorRollbackDeleteCompletionStore::prepare(
+            self.session.clone(),
+            &self.coordinator_archive_keyspace,
+        )
+        .await?;
+        let coordinator = coordinator_store
+            .read_for_authority(deleting)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Coordinator delete completion is missing"))?;
+
+        let mut realm_deletes = Vec::with_capacity(deleting.participant_plan().realms().len());
+        for planned in deleting.participant_plan().realms() {
+            let authority = AuthorityScope::Realm {
+                realm_id: planned.realm_id(),
+                realm_sub_id: planned.realm_sub_id(),
+            };
+            let archived = archive
+                .read_participant_completion_selected::<Hash>(
+                    deleting.participant_plan().target().network_id(),
+                    deleting.participant_plan().target().chain_epoch().get(),
+                    authority,
+                    *deleting.participant_plan().digest(),
+                )
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("planned Realm archive completion is missing"))?;
+            let deleted = archive
+                .read_delete_completion_for_participant(deleting, &archived)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("planned Realm delete completion is missing"))?;
+            realm_deletes.push(deleted);
+        }
+        let index = deleting
+            .participant_plan()
+            .realms()
+            .iter()
+            .position(|planned| planned == &participant)
+            .ok_or_else(|| anyhow::anyhow!("Realm is absent from rollback plan"))?;
+        let global_barrier = Arc::new(
+            ScyllaRollbackGlobalDeleteBarrierStore::prepare(
+                self.session.clone(),
+                &self.coordinator_archive_keyspace,
+            )
+            .await?,
+        );
+        let barrier = global_barrier
+            .read_for_authority(deleting)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("global delete barrier is missing"))?;
+        let selected = global_barrier
+            .select_realm(&barrier, deleting, &coordinator, &realm_deletes, index)
+            .await?;
+
+        let branch_keyspace = BranchExactDeploymentNoTabletKeyspace::try_new(
+            self.local_control_keyspace.as_str().to_owned(),
+        )?;
+        let pipeline = Arc::new(
+            ScyllaPendingPipelineStore::prepare(
+                self.session.clone(),
+                branch_keyspace.clone(),
+            )
+            .await?,
+        );
+        let writer = Arc::new(
+            ScyllaBranchExactWriterLifecycleStore::prepare(
+                self.session.clone(),
+                branch_keyspace,
+            )
+            .await?,
+        );
+        let timestamp = Arc::new(
+            ScyllaAuthorityTimestampStore::prepare(
+                self.session.clone(),
+                AuthorityTimestampNoTabletKeyspace::try_new(
+                    self.local_control_keyspace.as_str().to_owned(),
+                )?,
+            )
+            .await?,
+        );
+        let counter = Arc::new(
+            PendingCounterAdapter::prepare(
+                self.session.clone(),
+                self.local_control_keyspace.clone(),
+                self.local_state_keyspace.clone(),
+            )
+            .await?,
+        );
+        let planner = Arc::new(ScyllaRealmRollbackTargetRestorePlanner::new(
+            global_barrier.clone(),
+            archive.clone(),
+            self.local_inventory.clone(),
+            self.local_head.clone(),
+            pipeline.clone(),
+            writer.clone(),
+            timestamp.clone(),
+            counter.clone(),
+        ));
+        let executor = ScyllaRealmRollbackTargetRestoreExecutor::new(
+            planner,
+            global_barrier,
+            archive,
+            self.local_head.clone(),
+            pipeline,
+            writer,
+            timestamp,
+            counter,
+        );
+        Ok(executor.restore(&selected).await?)
     }
 
     async fn read_head<Hash: Q256BitHash>(
@@ -295,8 +433,32 @@ impl<Hash: Q256BitHash> RealmRollbackRuntimeControl<Hash>
                     restored_row_count: completion.completion().restored_row_count(),
                 })
             }
-            RollbackControlState::ArchiveBarrierReady(_)
-            | RollbackControlState::Restoring(_) => {
+            RollbackControlState::Restoring(_) => {
+                let deleting = read_deleting_rollback_authority::<Hash>(
+                    self.session.clone(),
+                    self.canonical_head.clone(),
+                    self.participant_plans.clone(),
+                    &self.coordinator_archive_keyspace,
+                    network,
+                )
+                .await?;
+                let completion = self
+                    .restore_selected_realm(&deleting, participant)
+                    .await?;
+                let Some(second_head) = self.read_head(network).await? else {
+                    anyhow::bail!("Coordinator canonical head disappeared after Realm restore")
+                };
+                if second_head != first_head
+                    && !Self::same_active_rollback(&first_head, &second_head)
+                {
+                    anyhow::bail!("Coordinator rollback phase changed during Realm restore")
+                }
+                Ok(RealmRollbackParticipantProgress::RestorePrepared {
+                    head: second_head,
+                    final_rows_digest: *completion.completion().final_rows_digest(),
+                })
+            }
+            RollbackControlState::ArchiveBarrierReady(_) => {
                 Ok(RealmRollbackParticipantProgress::AwaitingCoordinator(first_head))
             }
             RollbackControlState::Idle => {
@@ -411,13 +573,41 @@ mod tests {
         assert!(!source.contains("create_schema"));
         assert!(!source.contains("compare_and_set"));
         assert!(!source.contains("persist_directive"));
-        let select = source.find("let Some(first_head)").unwrap();
-        let directive = source.find(".read_selected_directive(first_head, authority)").unwrap();
-        let second = source.find("let Some(second_head)").unwrap();
+        let selection = source
+            .split("async fn read_selected_realm_runtime_rebuild")
+            .nth(1)
+            .unwrap();
+        let select = selection.find("let Some(first_head)").unwrap();
+        let directive = selection
+            .find(".read_selected_directive(first_head, authority)")
+            .unwrap();
+        let second = selection.find("let Some(second_head)").unwrap();
         assert!(select < directive && directive < second);
         let persist = source.find(".persist_and_revalidate_report(").unwrap();
         let before = source[..persist].rfind("let Some(before)").unwrap();
         let after = source[persist..].find("let Some(after)").unwrap() + persist;
         assert!(before < persist && persist < after);
+    }
+
+    #[test]
+    fn realm_restore_is_selected_from_global_barrier_before_local_mutation() {
+        let source = include_str!("realm_rollback_runtime_control.rs");
+        let method = source.split("async fn restore_selected_realm").nth(1).unwrap();
+        let archive = method
+            .find("read_participant_completion_selected::<Hash>")
+            .unwrap();
+        let deleted = method
+            .find("read_delete_completion_for_participant")
+            .unwrap();
+        let barrier = method.find(".read_for_authority(deleting)").unwrap();
+        let selected = method.find(".select_realm(").unwrap();
+        let planner = method
+            .find("ScyllaRealmRollbackTargetRestorePlanner::new")
+            .unwrap();
+        let restore = method.find("executor.restore(&selected)").unwrap();
+        assert!(archive < deleted);
+        assert!(barrier < selected);
+        assert!(selected < planner);
+        assert!(planner < restore);
     }
 }

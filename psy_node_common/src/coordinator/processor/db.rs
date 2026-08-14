@@ -578,6 +578,21 @@ impl<
             .await
     }
 
+    pub async fn progress_coordinator_rollback(
+        &self,
+    ) -> anyhow::Result<
+        psy_node_core::store::rollback_participant_maintenance::CoordinatorRollbackGlobalProgress<
+            N::QHash,
+        >,
+    >
+    where
+        S: CoordinatorRollbackMaintenanceExecutor<N::F, N::QHash>,
+    {
+        self.db
+            .progress_coordinator_rollback(self.network_id, N::CHECKPOINT_TREE_HEIGHT)
+            .await
+    }
+
     fn materialized_pending_context(&self) -> anyhow::Result<PendingContext<N::QHash>> {
         let head = self.canonical_head.ok_or_else(|| {
             anyhow::anyhow!(

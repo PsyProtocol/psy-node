@@ -78,6 +78,17 @@ pub enum CoordinatorRollbackMaintenanceOutcome<Hash> {
     AwaitingDownstream(StoredCanonicalHead<Hash>),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoordinatorRollbackGlobalProgress<Hash> {
+    AwaitingParticipants {
+        head: StoredCanonicalHead<Hash>,
+        completed: u64,
+        expected: u64,
+    },
+    Progressed(StoredCanonicalHead<Hash>),
+    ReadyForRuntimeRebuild(StoredCanonicalHead<Hash>),
+}
+
 #[async_trait]
 pub trait CoordinatorRollbackMaintenanceExecutor<F, Hash>: Send + Sync
 where
@@ -89,6 +100,15 @@ where
         network: NetworkId,
         checkpoint_tree_height: u8,
     ) -> anyhow::Result<CoordinatorRollbackMaintenanceOutcome<Hash>>;
+
+    /// Advance only storage-selected global barriers and the Coordinator's
+    /// own physical participant.  Realm hot tables remain Realm-local and are
+    /// represented here solely by immutable completion rows.
+    async fn progress_coordinator_rollback(
+        &self,
+        network: NetworkId,
+        checkpoint_tree_height: u8,
+    ) -> anyhow::Result<CoordinatorRollbackGlobalProgress<Hash>>;
 }
 
 #[cfg(test)]

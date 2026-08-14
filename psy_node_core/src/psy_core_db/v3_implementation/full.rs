@@ -355,6 +355,20 @@ impl<
             .prepare_coordinator_archive(network, checkpoint_tree_height)
             .await
     }
+
+    async fn progress_coordinator_rollback(
+        &self,
+        network: NetworkId,
+        checkpoint_tree_height: u8,
+    ) -> anyhow::Result<
+        crate::store::rollback_participant_maintenance::CoordinatorRollbackGlobalProgress<
+            N::QHash,
+        >,
+    > {
+        self.store
+            .progress_coordinator_rollback(network, checkpoint_tree_height)
+            .await
+    }
 }
 
 impl<
