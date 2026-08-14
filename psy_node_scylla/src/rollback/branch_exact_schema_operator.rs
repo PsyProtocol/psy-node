@@ -19,12 +19,14 @@ use psy_node_core::store::authority_commit::{
     StoredAuthorityTimestampState,
 };
 use psy_node_core::store::timestamp::CommitWriteTimestampUs;
+use psy_node_core::store::canonical_head::CanonicalHeadBootstrapProfile;
 use scylla::client::session::Session;
 use sha2::{Digest, Sha256};
 
 use super::{
     inspect_branch_exact_local_node_postflight, BranchExactBackfillArtifact,
-    BranchExactBackfillPlan, BranchExactBackfillVerifiedReceipt,
+    BranchExactBackfillPlan, BranchExactBackfillReadbackObservation,
+    BranchExactBackfillVerifiedReceipt,
     BranchExactDeploymentIntent, BranchExactDeploymentLifecycleBootstrap,
     BranchExactDeploymentLifecycleReadState, BranchExactDeploymentLifecycleState,
     BranchExactDeploymentLifecycleWriteOutcome,
@@ -50,6 +52,136 @@ pub(crate) struct BranchExactPostGenesisMigration<'a, Hash> {
     pub(crate) artifact: &'a BranchExactBackfillArtifact<Hash>,
     pub(crate) expected_topology: BranchExactExpectedTopology,
     pub(crate) total_chunks: u32,
+}
+
+/// Resume the narrow schema lifecycle for a brand-new authority.
+///
+/// This is deliberately separate from the post-genesis exporter/backfill
+/// path.  It is legal only for a `GENESIS_NATIVE` materialization plan and
+/// persists the deployment intent before issuing target DDL.  The resulting
+/// receipt authorizes the schema setup gate only; it does not activate a
+/// writer, publish a cutover route, or grant rollback mutation authority.
+pub(crate) async fn resume_genesis_branch_exact_schema_deployment(
+    session: Arc<Session>,
+    targeted_sessions: &[Arc<Session>],
+    control_keyspace: BranchExactDeploymentNoTabletKeyspace,
+    request: &BranchExactSchemaMaterializationRequest,
+    expected_topology: BranchExactExpectedTopology,
+) -> anyhow::Result<BranchExactBackfillVerifiedReceipt> {
+    if request.plan().profile() != CanonicalHeadBootstrapProfile::GenesisNative
+        || request.plan().floor_evidence().is_some()
+    {
+        anyhow::bail!(
+            "genesis branch-exact deployment requires a GENESIS_NATIVE plan without floor evidence"
+        );
+    }
+    if targeted_sessions.len() != expected_topology.nodes().len() {
+        anyhow::bail!(
+            "branch-exact deployment expected {} targeted Scylla sessions, received {}",
+            expected_topology.nodes().len(),
+            targeted_sessions.len(),
+        );
+    }
+
+    ScyllaBranchExactDeploymentLifecycleStore::create_schema(
+        &session,
+        &control_keyspace,
+    )
+    .await?;
+    let lifecycle = ScyllaBranchExactDeploymentLifecycleStore::prepare(
+        Arc::clone(&session),
+        control_keyspace,
+    )
+    .await?;
+    let intent = BranchExactDeploymentIntent::new(request, expected_topology.clone());
+    let bootstrap = BranchExactDeploymentLifecycleBootstrap::new(intent.clone());
+    let mut current = current_after_write(lifecycle.bootstrap(&bootstrap).await?);
+    require_intent(&current, &intent)?;
+
+    let schema = BranchExactSchemaMaterializer::materialize_schema(&session, request).await?;
+    let mut observations = Vec::with_capacity(targeted_sessions.len());
+    for targeted in targeted_sessions {
+        observations.push(
+            inspect_branch_exact_local_node_postflight(
+                targeted,
+                request.keyspace(),
+                request.plan().authority(),
+            )
+            .await?,
+        );
+    }
+    let attestation = BranchExactTopologyAttestation::try_new(
+        &schema,
+        expected_topology,
+        observations,
+    )?;
+    let deployment = BranchExactVerifiedDeploymentReceipt::try_new(intent, attestation)?;
+    let plan = BranchExactBackfillPlan::genesis_empty(request, deployment.clone())?;
+
+    loop {
+        require_intent(&current, deployment.intent())?;
+        current = match current.state() {
+            BranchExactDeploymentLifecycleState::Intent(_) => {
+                let sealed = SealedBranchExactSchemaVerifiedCas::try_new(
+                    &current,
+                    deployment.clone(),
+                )?;
+                current_after_write(lifecycle.mark_schema_verified(&sealed).await?)
+            }
+            BranchExactDeploymentLifecycleState::SchemaVerified(observed) => {
+                if observed != &deployment {
+                    anyhow::bail!("branch-exact verified deployment conflict");
+                }
+                let sealed = SealedBranchExactBackfillPlanCas::try_new(
+                    &current,
+                    plan.clone(),
+                )?;
+                current_after_write(lifecycle.plan_backfill(&sealed).await?)
+            }
+            BranchExactDeploymentLifecycleState::BackfillPlanned(observed) => {
+                require_plan(observed, &plan)?;
+                let sealed = SealedBranchExactBackfillVerifiedCas::try_new(
+                    &current,
+                    BranchExactBackfillReadbackObservation::new(
+                        plan.digest(),
+                        plan.dataset_digest(),
+                        0,
+                        0,
+                        0,
+                    ),
+                )?;
+                current_after_write(lifecycle.mark_backfill_verified(&sealed).await?)
+            }
+            BranchExactDeploymentLifecycleState::BackfillProgress(_) => {
+                anyhow::bail!(
+                    "genesis branch-exact deployment cannot resume a chunked backfill"
+                )
+            }
+            BranchExactDeploymentLifecycleState::BackfillVerified(receipt) => {
+                require_plan(receipt.plan(), &plan)?;
+                let BranchExactDeploymentLifecycleReadState::Current(readback) =
+                    lifecycle.read(current.slot()).await?
+                else {
+                    anyhow::bail!(
+                        "branch-exact lifecycle disappeared after genesis verification"
+                    );
+                };
+                if readback != current {
+                    current = readback;
+                    continue;
+                }
+                let BranchExactDeploymentLifecycleState::BackfillVerified(receipt) =
+                    readback.state()
+                else {
+                    anyhow::bail!(
+                        "branch-exact lifecycle changed after genesis verification"
+                    );
+                };
+                require_plan(receipt.plan(), &plan)?;
+                return Ok(receipt.clone());
+            }
+        };
+    }
 }
 
 /// Resume one exact post-genesis migration until its full readback is
@@ -652,10 +784,14 @@ mod tests {
             "query_unpaged",
             "execute_unpaged",
             "StoredBranchExactDeploymentLifecycle::try_new",
-            "BranchExactBackfillReadbackObservation::new",
         ] {
             assert!(!production.contains(forbidden));
         }
+        let post_genesis = production
+            .split("pub(crate) async fn resume_post_genesis_branch_exact_migration")
+            .nth(1)
+            .unwrap();
+        assert!(!post_genesis.contains("BranchExactBackfillReadbackObservation::new"));
         assert!(production.contains("require_intent"));
         assert!(production.contains("require_plan"));
         assert!(production.contains("lifecycle.read(current.slot())"));
@@ -665,6 +801,9 @@ mod tests {
     fn all_durable_phases_are_handled_without_wildcard_fallback() {
         let source = include_str!("branch_exact_schema_operator.rs");
         let body = source
+            .split("pub(crate) async fn resume_post_genesis_branch_exact_migration")
+            .nth(1)
+            .unwrap()
             .split("loop {")
             .nth(1)
             .unwrap()
@@ -686,13 +825,45 @@ mod tests {
     #[test]
     fn migration_is_post_genesis_and_requires_exact_targeted_topology() {
         let source = include_str!("branch_exact_schema_operator.rs");
-        assert!(source.contains("BranchExactBackfillPlan::post_genesis_artifact"));
-        assert!(source.contains("targeted_sessions.len()"));
-        assert!(source.contains("migration.expected_topology.nodes().len()"));
-        assert!(source.contains("BranchExactTopologyAttestation::try_new"));
-        let validate = source.find("migration.artifact.validate_plan(&plan)").unwrap();
-        let persist = source.find("lifecycle.plan_backfill").unwrap();
+        let body = source
+            .split("pub(crate) async fn resume_post_genesis_branch_exact_migration")
+            .nth(1)
+            .unwrap()
+            .split("fn current_after_write")
+            .next()
+            .unwrap();
+        assert!(body.contains("BranchExactBackfillPlan::post_genesis_artifact"));
+        assert!(body.contains("targeted_sessions.len()"));
+        assert!(body.contains("migration.expected_topology.nodes().len()"));
+        assert!(body.contains("BranchExactTopologyAttestation::try_new"));
+        let validate = body.find("migration.artifact.validate_plan(&plan)").unwrap();
+        let persist = body.find("lifecycle.plan_backfill").unwrap();
         assert!(validate < persist);
+    }
+
+    #[test]
+    fn genesis_operator_is_empty_schema_only_and_intent_first() {
+        let source = include_str!("branch_exact_schema_operator.rs");
+        let body = source
+            .split("pub(crate) async fn resume_genesis_branch_exact_schema_deployment")
+            .nth(1)
+            .unwrap()
+            .split("/// Resume one exact post-genesis migration")
+            .next()
+            .unwrap();
+        assert!(body.contains("CanonicalHeadBootstrapProfile::GenesisNative"));
+        assert!(body.contains("BranchExactBackfillPlan::genesis_empty"));
+        assert!(body.contains("BranchExactBackfillReadbackObservation::new"));
+        assert!(body.find("lifecycle.bootstrap").unwrap() < body.find("materialize_schema").unwrap());
+        for forbidden in [
+            "BranchExactWriterActivationExecutor",
+            "BranchExactCutoverBootstrap",
+            "execute_chunk",
+            "query_unpaged",
+            "execute_unpaged",
+        ] {
+            assert!(!body.contains(forbidden));
+        }
     }
 
     #[test]
