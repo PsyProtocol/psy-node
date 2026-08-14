@@ -13,6 +13,10 @@ use psy_api_core::coordinator::rollback_admin::{
     RollbackAdminStartRequest, RollbackAdminStartResponse, RollbackAdminStatus,
 };
 
+const ROLLBACK_STATUS_METHOD: &str = "psy_admin_get_rollback_status";
+const ROLLBACK_START_METHOD: &str = "psy_admin_start_rollback";
+const ROLLBACK_ABORT_METHOD: &str = "psy_admin_abort_rollback";
+
 fn client(url: &str) -> anyhow::Result<HttpClient> {
     HttpClientBuilder::default()
         .build(url)
@@ -55,7 +59,7 @@ pub(crate) fn decode_abort_request(bytes: &str) -> anyhow::Result<RollbackAdminA
 
 pub(crate) async fn status(url: &str) -> anyhow::Result<RollbackAdminStatus<PHash>> {
     client(url)?
-        .request("admin_get_rollback_status", rpc_params![])
+        .request(ROLLBACK_STATUS_METHOD, rpc_params![])
         .await
         .context("request Coordinator rollback status")
 }
@@ -66,7 +70,7 @@ pub(crate) async fn start(
 ) -> anyhow::Result<RollbackAdminStartResponse<PHash>> {
     let request = decode_start_request(&read_json(request_file)?)?;
     client(url)?
-        .request("admin_start_rollback", rpc_params![request])
+        .request(ROLLBACK_START_METHOD, rpc_params![request])
         .await
         .context("submit explicit Coordinator rollback request")
 }
@@ -77,7 +81,7 @@ pub(crate) async fn abort(
 ) -> anyhow::Result<RollbackAdminAbortResponse<PHash>> {
     let request = decode_abort_request(&read_json(request_file)?)?;
     client(url)?
-        .request("admin_abort_rollback", rpc_params![request])
+        .request(ROLLBACK_ABORT_METHOD, rpc_params![request])
         .await
         .context("submit explicit Coordinator rollback abort")
 }
@@ -89,6 +93,13 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn rollback_cli_uses_the_namespaced_server_methods() {
+        assert_eq!(ROLLBACK_STATUS_METHOD, "psy_admin_get_rollback_status");
+        assert_eq!(ROLLBACK_START_METHOD, "psy_admin_start_rollback");
+        assert_eq!(ROLLBACK_ABORT_METHOD, "psy_admin_abort_rollback");
+    }
 
     #[test]
     fn start_request_is_strict_in_place_v2() {
