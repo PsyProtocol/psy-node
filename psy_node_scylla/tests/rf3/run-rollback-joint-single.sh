@@ -18,3 +18,8 @@ docker compose -f "${COMPOSE_FILE}" up --detach --wait --wait-timeout 300 scylla
 cd "${WORKSPACE_ROOT}"
 PSY_ROLLBACK_JOINT_SINGLE=1 \
 cargo test -p psy_node_scylla --test rollback_joint_delete_scylla -- --ignored --nocapture
+
+PSY_ROLLBACK_JOINT_SINGLE=1 \
+cargo test -p psy_node_scylla \
+  explicit_admin_request_is_selected_by_every_production_realm_control \
+  --lib -- --ignored --nocapture

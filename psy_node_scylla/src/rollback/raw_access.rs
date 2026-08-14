@@ -151,6 +151,7 @@ pub const RAW_SCYLLA_ACCESS_ALLOWLIST: &[RawScyllaAccessAllowance] = &[
     allow!("psy_node_scylla/src/rollback/rollback_global_archive_barrier.rs", DurableControlAuthority),
     allow!("psy_node_scylla/src/rollback/rollback_global_delete_barrier.rs", DurableControlAuthority),
     allow!("psy_node_scylla/src/rollback/rollback_global_restore_barrier.rs", DurableControlAuthority),
+    allow!("psy_node_scylla/src/rollback/rollback_joint_production_control_scylla.rs", TestHarness),
     allow!("psy_node_scylla/src/rollback/rollback_participant_plan_store.rs", DurableControlAuthority),
     allow!("psy_node_scylla/src/rollback/rollback_runtime_rebuild_store.rs", DurableControlAuthority),
     allow!("psy_node_scylla/src/rollback/timestamp_prototype.rs", RollbackPrototypeAdapter),
