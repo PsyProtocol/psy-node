@@ -27,10 +27,20 @@ use psy_node_core::store::{
 use psy_node_core::store::{
     authority_commit::{
         AuthorityClockSampleUs, AuthorityTimestampBootstrap, AuthorityTimestampBootstrapReason,
+        AuthorityTimestampReadState,
     },
+    authority_local_head::AuthorityLocalHeadWriteOutcome,
     pending_generation::ProcNamespacePrefix,
-    pending_generation_pipeline::PendingPipelineWriteOutcome,
+    pending_generation_identity::PendingGenerationLedgerKey,
+    pending_generation_pipeline::{
+        PendingPipelineIntentDigest, PendingPipelineReadState, PendingPipelineWriteOutcome,
+        PendingPublishReceiptDigest, PendingQueueCloseIntentDigest, PendingWorkCaptureDigest,
+    },
 };
+#[cfg(test)]
+use super::BranchExactWriterPrepared;
+#[cfg(test)]
+use sha2::{Digest, Sha256};
 use scylla::client::session::Session;
 
 use super::{
@@ -324,6 +334,163 @@ impl ScyllaRealmRollbackRuntimeControl {
             }
         }
         Ok(())
+    }
+
+    /// Qualification-only post-rollback commit.  It deliberately reuses the
+    /// real timestamp allocator, narrow physical writer and authority-head
+    /// CAS, but does not stand in for the still-gated Processor/full-manifest
+    /// assembly path.
+    #[cfg(test)]
+    pub(crate) async fn qualification_append_post_rollback_narrow_commit<
+        Hash: Q256BitHash,
+    >(
+        &self,
+        narrow: BranchExactWriterPrepared<Hash>,
+        observation: psy_data::protocol::chain_context::AuthorityObservation<Hash>,
+        clock_sample: AuthorityClockSampleUs,
+    ) -> anyhow::Result<(
+        psy_node_core::store::authority_local_head::StoredAuthorityLocalHead<Hash>,
+        psy_node_core::store::timestamp::CommitWriteTimestampUs,
+    )> {
+        let intent = narrow.intent();
+        let authority = intent.authority();
+        let key = AuthorityTimestampKey::new(
+            intent.candidate().canonical_chain().network_id(),
+            authority,
+        );
+        let AuthorityLocalHeadReadState::Current(expected_head) =
+            self.local_head.read(key).await?
+        else {
+            anyhow::bail!("post-rollback Realm head is missing")
+        };
+        if expected_head.head().chain() != intent.predecessor().canonical_chain()
+            || observation.authority() != authority
+            || observation.chain() != intent.candidate().canonical_chain()
+        {
+            anyhow::bail!("post-rollback Realm commit identity mismatch")
+        }
+
+        let timestamp_store = ScyllaAuthorityTimestampStore::prepare(
+            self.session.clone(),
+            AuthorityTimestampNoTabletKeyspace::try_new(
+                self.local_control_keyspace.as_str().to_owned(),
+            )?,
+        )
+        .await?;
+        let AuthorityTimestampReadState::Current(timestamp_state) =
+            timestamp_store.read(key).await?
+        else {
+            anyhow::bail!("post-rollback Realm timestamp state is missing")
+        };
+        let reservation = timestamp_state.seal_reservation(
+            key,
+            intent.intent_digest().authority_intent(),
+            clock_sample,
+        )?;
+        if reservation.lease().timestamp() != narrow.timestamp() {
+            anyhow::bail!("post-rollback Realm writer did not use the allocated timestamp")
+        }
+        let _ = timestamp_store.reserve(reservation).await?;
+
+        let writer = ScyllaBranchExactDualWriteAdapter::prepare(
+            self.session.clone(),
+            &self.branch_exact_ready,
+        )
+        .await?;
+        writer
+            .qualification_write_inventory_exact(intent, narrow.timestamp())
+            .await?;
+
+        let pipeline_store = ScyllaPendingPipelineStore::prepare(
+            self.session.clone(),
+            BranchExactDeploymentNoTabletKeyspace::try_new(
+                self.local_control_keyspace.as_str().to_owned(),
+            )?,
+        )
+        .await?;
+        let pipeline_key = PendingGenerationLedgerKey::new(
+            intent.candidate().canonical_chain().network_id(),
+            authority,
+        );
+        let PendingPipelineReadState::Current(pipeline) =
+            pipeline_store.read::<Hash>(pipeline_key).await?
+        else {
+            anyhow::bail!("post-rollback Realm pipeline is missing")
+        };
+
+        // This qualification seam exercises the real pipeline CAS sequence
+        // around the narrow physical write.  The evidence is derived from the
+        // exact immutable write intent, so retry selects the same candidates;
+        // it is not a substitute for the production application archive or
+        // writer/head authorization path.
+        let evidence = |domain: &[u8]| -> [u8; 32] {
+            let mut hasher = Sha256::new();
+            hasher.update(b"psy.rollback.post-restore-realm-qualification.v1\0");
+            hasher.update(domain);
+            hasher.update(intent.intent_digest().as_bytes());
+            hasher.finalize().into()
+        };
+        let close = PendingQueueCloseIntentDigest::try_new(evidence(b"close"))?;
+        let capture = PendingWorkCaptureDigest::try_new(evidence(b"capture"))?;
+        let processing = PendingPipelineIntentDigest::try_new(evidence(b"processing"))?;
+        let publish = PendingPublishReceiptDigest::try_new(evidence(b"publish"))?;
+        let sealing = pipeline.seal_begin_queue_close(close)?;
+        let sealing = match pipeline_store.apply(&sealing).await? {
+            PendingPipelineWriteOutcome::Applied(current)
+            | PendingPipelineWriteOutcome::Idempotent(current)
+                if current == *sealing.candidate() => current,
+            other => anyhow::bail!("post-rollback Realm close conflict: {other:?}"),
+        };
+        let captured = sealing.seal_capture_work(close, capture)?;
+        let captured = match pipeline_store.apply(&captured).await? {
+            PendingPipelineWriteOutcome::Applied(current)
+            | PendingPipelineWriteOutcome::Idempotent(current)
+                if current == *captured.candidate() => current,
+            other => anyhow::bail!("post-rollback Realm capture conflict: {other:?}"),
+        };
+        let inflight = captured.seal_begin_processing(capture, processing)?;
+        let inflight = match pipeline_store.apply(&inflight).await? {
+            PendingPipelineWriteOutcome::Applied(current)
+            | PendingPipelineWriteOutcome::Idempotent(current)
+                if current == *inflight.candidate() => current,
+            other => anyhow::bail!("post-rollback Realm processing conflict: {other:?}"),
+        };
+        let published = inflight.seal_publish(processing, publish, observation)?;
+        let pipeline = match pipeline_store.apply(&published).await? {
+            PendingPipelineWriteOutcome::Applied(current)
+            | PendingPipelineWriteOutcome::Idempotent(current)
+                if current == *published.candidate() => current,
+            other => anyhow::bail!("post-rollback Realm publish conflict: {other:?}"),
+        };
+
+        let head_outcome = self
+            .local_head
+            .qualification_compare_and_set_realm_advance(
+            expected_head,
+            observation,
+            narrow.timestamp(),
+            *intent.manifest_digest().as_bytes(),
+        )
+            .await?;
+        let current_head = match head_outcome {
+            AuthorityLocalHeadWriteOutcome::Applied(current)
+            | AuthorityLocalHeadWriteOutcome::Idempotent(current)
+                if current.head().chain() == observation.chain() => current,
+            other => anyhow::bail!("post-rollback Realm head publish conflict: {other:?}"),
+        };
+
+        let inventory = super::realm_rollback_commit_inventory::RealmRollbackCommitInventory::qualification_from_narrow(
+            intent.clone(),
+            narrow.timestamp(),
+        )?;
+        self.local_inventory
+            .qualification_persist_committed(inventory, &current_head, &pipeline)
+            .await?;
+        let completion = reservation
+            .candidate()
+            .seal_completion(key, reservation.lease())?;
+        let _ = timestamp_store.complete(completion).await?;
+        Ok((current_head, narrow.timestamp()))
     }
 
     async fn prepare_delete_executor(

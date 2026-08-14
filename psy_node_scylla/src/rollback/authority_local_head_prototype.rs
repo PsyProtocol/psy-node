@@ -511,6 +511,89 @@ impl ScyllaAuthorityLocalHeadStore {
         .await
     }
 
+    /// Qualification-only bridge for the joint rollback test. Production
+    /// callers must use a sealed manifest/full-commit capability; this helper
+    /// is absent outside test builds and only performs the same exact LWT over
+    /// a candidate derived from the selected current row.
+    #[cfg(test)]
+    pub(crate) async fn qualification_compare_and_set_realm_advance<
+        Hash: Q256BitHash,
+    >(
+        &self,
+        expected: StoredAuthorityLocalHead<Hash>,
+        observation: psy_data::protocol::chain_context::AuthorityObservation<Hash>,
+        timestamp: psy_node_core::store::timestamp::CommitWriteTimestampUs,
+        manifest_digest: [u8; 32],
+    ) -> Result<AuthorityLocalHeadWriteOutcome<Hash>, AuthorityLocalHeadPrototypeError> {
+        let key = expected.head().key();
+        let observed_key = AuthorityTimestampKey::new(
+            observation.chain().network_id(),
+            observation.authority(),
+        );
+        if observed_key != key {
+            return Err(AuthorityLocalHeadPrototypeError::Model(
+                AuthorityLocalHeadModelError::AuthorityChanged,
+            ));
+        }
+        let candidate_head =
+            psy_node_core::store::manifest_lifecycle::AuthorityHeadView::try_from_observed(
+                key,
+                *observation.chain(),
+                observation.state_checkpoint_id(),
+                *observation.state_root(),
+            )
+            .map_err(|error| {
+                AuthorityLocalHeadPrototypeError::Qualification(error.to_string())
+            })?;
+        let candidate_bootstrap = AuthorityLocalHeadBootstrap::seal(
+            expected.bootstrap_reason(),
+            candidate_head,
+            timestamp,
+            psy_node_core::store::manifest_record::AuthorityManifestDigest::from_persisted(
+                manifest_digest,
+            ),
+            expected.storage_binding(),
+        );
+        let candidate = StoredAuthorityLocalHead::decode_persisted(
+            key,
+            expected.revision().checked_next()?.as_i64(),
+            &candidate_bootstrap.candidate_payload(),
+        )?;
+        let partition = AuthorityPartition::from_key(key);
+        let binding = AuthorityLocalHeadCasBinding {
+            candidate_revision: candidate.revision().as_i64(),
+            candidate_head: candidate.encode_canonical().to_vec(),
+            network_chain_id: partition.network_chain_id,
+            authority_kind: partition.authority_kind,
+            realm_id: partition.realm_id,
+            realm_sub_id: partition.realm_sub_id,
+            expected_revision: expected.revision().as_i64(),
+            expected_head: expected.encode_canonical().to_vec(),
+        };
+        let execution = self
+            .session
+            .execute_unpaged(&self.compare_and_set, binding)
+            .await;
+        self.finish_write(
+            "qualification_compare_and_set_realm_advance",
+            execution,
+            key,
+            &candidate,
+            |applied, current| {
+                if current == candidate {
+                    Ok(if applied {
+                        AuthorityLocalHeadWriteOutcome::Applied(current)
+                    } else {
+                        AuthorityLocalHeadWriteOutcome::Idempotent(current)
+                    })
+                } else {
+                    Ok(AuthorityLocalHeadWriteOutcome::Conflict(current))
+                }
+            },
+        )
+        .await
+    }
+
     async fn finish_write<Hash: Q256BitHash>(
         &self,
         operation: &'static str,
@@ -667,6 +750,8 @@ pub enum AuthorityLocalHeadPrototypeError {
         read_error: String,
     },
     Cql(String),
+    #[cfg(test)]
+    Qualification(String),
 }
 
 impl From<InvalidCqlKeyspaceName> for AuthorityLocalHeadPrototypeError {

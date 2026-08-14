@@ -628,6 +628,12 @@ impl ObservedPhysicalRow {
     fn require_preflight(&self) -> Result<(), BranchExactDualWriteExecutionError> {
         self.require_logical_match()?;
         match self.writetime.cmp(&self.expected_writetime) {
+            // Pending ownership is first claimed by an append-only IFNE LWT.
+            // That authority row intentionally has no caller timestamp, so a
+            // later exact dual-write read may observe a newer server timestamp.
+            // The identical value is already the desired immutable result;
+            // a different proc id was rejected by require_logical_match above.
+            Ordering::Greater if self.is_exact_pending_ownership() => Ok(()),
             Ordering::Greater => Err(
                 BranchExactDualWriteExecutionError::SealedTimestampSuperseded {
                     kind: self.kind,
@@ -650,6 +656,9 @@ impl ObservedPhysicalRow {
                 self.require_exact_physical_value()?;
                 Ok(RowPostwrite::Verified)
             }
+            Ordering::Greater if self.is_exact_pending_ownership() => {
+                Ok(RowPostwrite::Verified)
+            }
             Ordering::Greater => Err(
                 BranchExactDualWriteExecutionError::SealedTimestampSuperseded {
                     kind: self.kind,
@@ -667,6 +676,11 @@ impl ObservedPhysicalRow {
             return Err(BranchExactDualWriteExecutionError::PhysicalProofMismatch(self.kind));
         }
         Ok(())
+    }
+
+    fn is_exact_pending_ownership(&self) -> bool {
+        self.kind == BranchExactDualWriteMutationKind::LegacyPendingToProc
+            && self.logical == self.expected_logical
     }
 
     fn digest(&self) -> [u8; 32] {
@@ -904,5 +918,36 @@ mod tests {
         ));
         let row = ObservedPhysicalRow::new(kind, vec![1], vec![2], vec![2], vec![9], 11, 11);
         assert_eq!(row.require_postwrite(), Err(BranchExactDualWriteExecutionError::PhysicalProofMismatch(kind)));
+    }
+
+
+    #[test]
+    fn exact_append_only_pending_ownership_accepts_newer_lwt_timestamp() {
+        let kind = BranchExactDualWriteMutationKind::LegacyPendingToProc;
+        let exact = ObservedPhysicalRow::new(
+            kind,
+            vec![1],
+            vec![2],
+            vec![2],
+            vec![2],
+            1_000,
+            100,
+        );
+        assert_eq!(exact.require_preflight(), Ok(()));
+        assert_eq!(exact.require_postwrite(), Ok(RowPostwrite::Verified));
+
+        let conflict = ObservedPhysicalRow::new(
+            kind,
+            vec![1],
+            vec![2],
+            vec![3],
+            vec![3],
+            1_000,
+            100,
+        );
+        assert_eq!(
+            conflict.require_preflight(),
+            Err(BranchExactDualWriteExecutionError::ConflictingRow(kind)),
+        );
     }
 }
