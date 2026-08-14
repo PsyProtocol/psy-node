@@ -86,6 +86,13 @@ async fn connect() -> anyhow::Result<Session> {
         .context("connect to the isolated single-node Scylla fixture")
 }
 
+async fn reconnect(session: Session, window: &str) -> anyhow::Result<Session> {
+    drop(session);
+    connect()
+        .await
+        .with_context(|| format!("reconnect after simulated {window} process exit"))
+}
+
 async fn create_schema(session: &Session) -> anyhow::Result<()> {
     session
         .query_unpaged(
@@ -325,6 +332,30 @@ async fn explicit_joint_delete_archives_every_participant_then_continues_on_a_ne
         ensure!(hot_rows(&session, participant).await?.len() == 3, "no early delete");
     }
 
+    // Simulate losing the maintenance process after only a subset of the
+    // participant archive rows are durable.  A fresh connection must recover
+    // the exact rows and still observe an intact hot suffix for every
+    // participant; it may then idempotently re-run the completed archive work.
+    let session = reconnect(session, "partial archive").await?;
+    for participant in PARTICIPANTS.into_iter().take(2) {
+        ensure!(
+            archive_rows(&session, participant).await?
+                == expected_rows(participant, "A", [OLD_WRITE_TS; 3])
+                    .into_iter()
+                    .skip(1)
+                    .collect::<Vec<_>>(),
+            "completed participant archive must survive restart"
+        );
+        archive_suffix_and_read_back(&session, participant, 1).await?;
+    }
+    ensure!(
+        archive_rows(&session, PARTICIPANTS[2]).await?.is_empty(),
+        "missing participant must remain visibly missing after restart"
+    );
+    for participant in PARTICIPANTS {
+        ensure!(hot_rows(&session, participant).await?.len() == 3, "restart cannot delete early");
+    }
+
     archive_suffix_and_read_back(&session, PARTICIPANTS[2], 1).await?;
     archived.insert(PARTICIPANTS[2]);
     ensure!(archived.len() == plan.participant_count(), "all selected participants archived");
@@ -334,7 +365,30 @@ async fn explicit_joint_delete_archives_every_participant_then_continues_on_a_ne
     let deleting =
         CanonicalHeadTransition::begin_rollback_delete(*archive_barrier.candidate())?;
 
+    let session = reconnect(session, "archive barrier").await?;
+    for participant in PARTICIPANTS {
+        ensure!(
+            archive_rows(&session, participant).await?.len() == 2,
+            "every archive must remain selected after the barrier restart"
+        );
+    }
+
     let delete_started = Instant::now();
+    delete_suffix(&session, PARTICIPANTS[0], 1).await?;
+    ensure!(
+        hot_rows(&session, PARTICIPANTS[0]).await?.len() == 1,
+        "first participant delete is visible before the simulated crash"
+    );
+    for participant in PARTICIPANTS.into_iter().skip(1) {
+        ensure!(
+            hot_rows(&session, participant).await?.len() == 3,
+            "later participants remain intact during a partial delete"
+        );
+    }
+
+    // Restart in the destructive phase.  Deletion is deliberately retried
+    // for all participants, including the already-completed Coordinator row.
+    let session = reconnect(session, "partial delete").await?;
     for participant in PARTICIPANTS {
         delete_suffix(&session, participant, 1).await?;
     }
@@ -350,6 +404,15 @@ async fn explicit_joint_delete_archives_every_participant_then_continues_on_a_ne
         );
     }
 
+    let session = reconnect(session, "completed delete before target publication").await?;
+    for participant in PARTICIPANTS {
+        ensure!(
+            hot_rows(&session, participant).await?.len() == 1
+                && archive_rows(&session, participant).await?.len() == 2,
+            "target row and archived suffix must survive the restore-window restart"
+        );
+    }
+
     let restoring =
         CanonicalHeadTransition::begin_rollback_restore(*deleting.candidate())?;
     let verifying =
@@ -360,8 +423,7 @@ async fn explicit_joint_delete_archives_every_participant_then_continues_on_a_ne
     ensure!(published.candidate().canonical_ref().checkpoint() == target.checkpoint());
     ensure!(published.candidate().canonical_ref().chain_epoch().get() == 1);
 
-    drop(session);
-    let session = connect().await.context("reopen after target publication")?;
+    let session = reconnect(session, "target publication").await?;
     for participant in PARTICIPANTS {
         for checkpoint in 2..=3 {
             put_hot(

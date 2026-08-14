@@ -171,7 +171,7 @@ psy_node_scylla/tests/rollback_checkpoint_merkle.rs|TestHarness|0|0|0|0|0|0|0|1
 psy_node_scylla/tests/rollback_checkpoint_object_single.rs|TestHarness|0|0|0|0|0|0|0|2
 psy_node_scylla/tests/rollback_checkpoint_root_pair.rs|TestHarness|0|0|0|0|0|0|0|2
 psy_node_scylla/tests/rollback_confinement.rs|TestHarness|2|0|1|0|0|0|1|1
-psy_node_scylla/tests/rollback_joint_delete_scylla.rs|TestHarness|8|2|0|0|0|0|8|8
+psy_node_scylla/tests/rollback_joint_delete_scylla.rs|TestHarness|10|2|0|0|0|0|8|8
 psy_node_scylla/tests/rollback_manifest_prepared.rs|TestHarness|0|0|0|0|0|0|0|1
 psy_node_scylla/tests/rollback_manifest_prepared_rf3_gate.rs|TestHarness|3|2|0|0|0|0|2|2
 psy_node_scylla/tests/rollback_namespace_prototype.rs|TestHarness|0|0|0|0|0|0|0|1
