@@ -129,6 +129,7 @@ async fn main() -> anyhow::Result<()> {
             verbose,
             checkpoint_backup_path,
             coordinator_api_urls,
+            coordinator_rollback_db_namespace,
             genesis_data_path,
             proving_backend,
         } => {
@@ -144,6 +145,7 @@ async fn main() -> anyhow::Result<()> {
                 verbose,
                 checkpoint_backup_path,
                 coordinator_api_urls,
+                coordinator_rollback_db_namespace,
                 genesis_data_path,
             )
             .await?;

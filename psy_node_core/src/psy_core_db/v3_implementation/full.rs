@@ -67,6 +67,11 @@ use crate::{
         CoordinatorRollbackMaintenanceExecutor,
         CoordinatorRollbackMaintenanceOutcome,
     },
+    store::rollback_runtime_rebuild::{
+        CoordinatorRollbackRuntimeRebuildStore,
+        RollbackRuntimeRebuildDirective,
+        RollbackRuntimeRebuildReport,
+    },
 };
 
 fn bridge_deposit_leaf_obj_id(chain_id: u64, deposit_index: u64) -> anyhow::Result<u64> {
@@ -79,6 +84,86 @@ fn bridge_deposit_leaf_obj_id(chain_id: u64, deposit_index: u64) -> anyhow::Resu
         );
     }
     Ok(CHECKPOINTED_OBJECT_TABLE_OBJ_ID_BRIDGE_DEPOSIT_LEAF_BASE | (chain_id << 32) | deposit_index)
+}
+
+#[async_trait]
+impl<
+        N: QNetworkDatabaseTypes,
+        BiDirectionalMappingTableIdentifier: Clone + Send + Sync,
+        BiDirectionalU64U128MappingTableIdentifier: Clone + Send + Sync,
+        U64TableIdentifier: Clone + Send + Sync,
+        U64CounterTableIdentifier: Clone + Send + Sync,
+        SingleIdTableIdentifier: Clone + Send + Sync,
+        DoubleIdTableIdentifier: Clone + Send + Sync,
+        KivTableIdentifier: Clone + Send + Sync,
+        SingleIdMerkleTableIdentifier: Clone + Send + Sync,
+        DoubleIdMerkleTableIdentifier: Clone + Send + Sync,
+        ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
+        TagTreeTableIdentifier: Clone + Send + Sync,
+        HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
+        S: CoreDatabaseStore<
+                N::QHash,
+                N::HasherBase,
+                BiDirectionalMappingTableIdentifier,
+                BiDirectionalU64U128MappingTableIdentifier,
+                U64TableIdentifier,
+                U64CounterTableIdentifier,
+                SingleIdTableIdentifier,
+                DoubleIdTableIdentifier,
+                KivTableIdentifier,
+                SingleIdMerkleTableIdentifier,
+                DoubleIdMerkleTableIdentifier,
+                ZeroIdMerkleTableIdentifier,
+                TagTreeTableIdentifier,
+                HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
+            > + CoordinatorRollbackRuntimeRebuildStore<N::QHash>
+            + Send
+            + Sync,
+    > CoordinatorRollbackRuntimeRebuildStore<N::QHash>
+    for PsyUnifiedCoreDatabaseStore<
+        N,
+        BiDirectionalMappingTableIdentifier,
+        BiDirectionalU64U128MappingTableIdentifier,
+        U64TableIdentifier,
+        U64CounterTableIdentifier,
+        SingleIdTableIdentifier,
+        DoubleIdTableIdentifier,
+        KivTableIdentifier,
+        SingleIdMerkleTableIdentifier,
+        DoubleIdMerkleTableIdentifier,
+        ZeroIdMerkleTableIdentifier,
+        TagTreeTableIdentifier,
+        HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
+        S,
+    >
+{
+    async fn read_selected_coordinator_runtime_rebuild(
+        &self,
+        network: NetworkId,
+    ) -> anyhow::Result<Option<RollbackRuntimeRebuildDirective<N::QHash>>> {
+        self.store
+            .read_selected_coordinator_runtime_rebuild(network)
+            .await
+    }
+
+    async fn persist_coordinator_runtime_rebuild_report(
+        &self,
+        directive: RollbackRuntimeRebuildDirective<N::QHash>,
+        report: RollbackRuntimeRebuildReport<N::QHash>,
+    ) -> anyhow::Result<()> {
+        self.store
+            .persist_coordinator_runtime_rebuild_report(directive, report)
+            .await
+    }
 }
 
 fn bridge_chain_tree_node_obj_id(chain_id: u64, level: u8, index: u64) -> anyhow::Result<u64> {

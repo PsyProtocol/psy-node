@@ -9,7 +9,10 @@ use psy_node_core::{
     psy_core_db::traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore},
     psy_temp_db::StandardProcessorTempDBStoreBase,
     queue::{ephemeral::QStandardEphemeralQueueSubscriber, worker_queue::QStandardWorkerQueuePublisher},
-    store::traits::proof_store::QParthProofStore,
+    store::{
+        rollback_runtime_rebuild::RealmRollbackRuntimeControl,
+        traits::proof_store::QParthProofStore,
+    },
 };
 
 use crate::{
@@ -56,6 +59,8 @@ where
         guta_gatherer_backup_directory: String,
         proof_verifier: Option<Arc<N::ZKVerifier>>,
         normal_commit_owner: super::RealmNormalCommitOwner<N::QHash>,
+        rollback_runtime_control:
+            Option<Arc<dyn RealmRollbackRuntimeControl<N::QHash>>>,
     ) -> anyhow::Result<(Self, tokio::task::JoinHandle<Result<(), anyhow::Error>>)> {
         tracing::info!("[REALM_STARTUP] processor new start");
         db.ensure_genesis_applied(genesis_block_update.clone()).await?;
@@ -143,6 +148,7 @@ where
                 iteration_quiescence: Default::default(),
                 normal_commit_owner: Some(normal_commit_owner),
                 control_owner: None,
+                rollback_runtime_control,
             },
             guta_join_handle,
         ))

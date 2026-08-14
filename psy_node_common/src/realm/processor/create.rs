@@ -10,7 +10,7 @@ use psy_node_core::{
     genesis::genesis_db_data_builder::GenesisDatabaseDataBuilder, p2p::traits::realm_coordinantor::RealmCoordinatorClient, psy_core_db::traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore}, psy_temp_db::StandardProcessorTempDBStoreBase, queue::{
         ephemeral::QStandardEphemeralQueueSubscriber,
         worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
-    }, store::{realm_processor_branch_exact_runtime::{RealmBranchExactCommitRuntimeInstaller, RealmBranchExactSingleCommitOwner}, realm_processor_startup::{authorize_realm_processor_startup, RealmProcessorStartupAuthorization, RealmProcessorStartupError, RealmProcessorStartupMode, RealmProcessorStartupPreflightProvider}, traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore}}
+    }, store::{realm_processor_branch_exact_runtime::{RealmBranchExactCommitRuntimeInstaller, RealmBranchExactSingleCommitOwner}, realm_processor_startup::{authorize_realm_processor_startup, RealmProcessorStartupAuthorization, RealmProcessorStartupError, RealmProcessorStartupMode, RealmProcessorStartupPreflightProvider}, rollback_runtime_rebuild::RealmRollbackRuntimeControl, traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore}}
 };
 
 use crate::realm::processor::{core::{PsyRealmProcessor, RealmNormalCommitOwner, runner::run_realm_processor}, db::PsyRealmDatabaseProcessor};
@@ -45,6 +45,8 @@ pub async fn create_realm_processor<
     startup_preflight: Option<Arc<dyn RealmProcessorStartupPreflightProvider>>,
     commit_runtime_installer:
         Option<Arc<dyn RealmBranchExactCommitRuntimeInstaller<N::QHash>>>,
+    rollback_runtime_control:
+        Option<Arc<dyn RealmRollbackRuntimeControl<N::QHash>>>,
 ) -> anyhow::Result<(
     PsyRealmProcessor<
         N,
@@ -209,6 +211,7 @@ where
         guta_gatherer_backup_directory,
         proof_verifier,
         normal_commit_owner,
+        rollback_runtime_control,
     )
     .await?;
     tracing::info!("[REALM_CREATE] processor new done");
@@ -246,6 +249,8 @@ pub async fn create_realm_processor_and_run<
     startup_preflight: Option<Arc<dyn RealmProcessorStartupPreflightProvider>>,
     commit_runtime_installer:
         Option<Arc<dyn RealmBranchExactCommitRuntimeInstaller<N::QHash>>>,
+    rollback_runtime_control:
+        Option<Arc<dyn RealmRollbackRuntimeControl<N::QHash>>>,
 ) -> anyhow::Result<()>
 where
     FileSystem::File: Send + Sync,
@@ -270,6 +275,7 @@ where
         startup_mode,
         startup_preflight,
         commit_runtime_installer,
+        rollback_runtime_control,
     )
     .await?;
 

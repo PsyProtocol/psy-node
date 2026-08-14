@@ -149,6 +149,11 @@ pub struct RealmProcessorStartConfig {
     pub verbose: bool,
     pub checkpoint_backup_path: String,
     pub coordinator_api_urls: Vec<String>,
+    /// Explicit existing Coordinator data keyspace used only for rollback
+    /// task selection/reporting.  Realm startup never derives this name from
+    /// its own namespace and never creates it.
+    #[serde(default)]
+    pub coordinator_rollback_db_namespace: Option<String>,
     pub genesis_data_path: Option<String>,
     #[serde(default)]
     pub branch_exact_startup: Option<RealmBranchExactStartupConfig>,
@@ -301,6 +306,7 @@ mod realm_branch_exact_startup_tests {
             verbose: false,
             checkpoint_backup_path: "/tmp/psy".to_owned(),
             coordinator_api_urls: vec!["http://coordinator".to_owned()],
+            coordinator_rollback_db_namespace: None,
             genesis_data_path: None,
             branch_exact_startup: None,
         };
@@ -312,6 +318,7 @@ mod realm_branch_exact_startup_tests {
         let parsed: RealmProcessorStartConfig =
             serde_json::from_value(encoded).unwrap();
         assert!(parsed.branch_exact_startup.is_none());
+        assert!(parsed.coordinator_rollback_db_namespace.is_none());
     }
 
     #[test]

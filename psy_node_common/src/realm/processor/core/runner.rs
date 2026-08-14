@@ -3,11 +3,19 @@ use cf_utils::log_indicator::print_cf_log_indicator;
 use parth_core::protocol::core_types::QNetworkTypesConfig;
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_io::tokio::TokioLikeFileSystem;
+use psy_data::protocol::{
+    canonical_chain::NetworkId,
+    chain_context::AuthorityScope,
+};
 use psy_node_core::{
     p2p::traits::realm_coordinantor::RealmCoordinatorClient, psy_core_db::traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore}, psy_temp_db::StandardProcessorTempDBStoreBase, queue::{
         ephemeral::QStandardEphemeralQueueSubscriber,
         worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
-    }, store::traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore}
+    }, store::{
+        canonical_head::CanonicalHeadReadState,
+        realm_processor_quiescence::RealmProcessorDrainRequest,
+        traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore},
+    }
 };
 use tokio::time::sleep;
 
@@ -63,7 +71,132 @@ where
 
     let mut last_slot: u128 = 0;
 
-    loop {
+    'processor: loop {
+        // An explicitly configured Realm reads the Coordinator's durable
+        // canonical-head row before admitting each new iteration.  Once any
+        // rollback phase is visible, the independent gatherer is parked and
+        // remains parked through restore/report/global publication.
+        if let Some(rollback_control) = processor.rollback_runtime_control.clone() {
+            let network = NetworkId::try_from_chain_id(processor.db.state.chain_id)?;
+            let authority = AuthorityScope::Realm {
+                realm_id: processor.db.state.realm_identifier.realm_id,
+                realm_sub_id: processor.db.state.realm_identifier.realm_sub_id,
+            };
+            let head = match rollback_control
+                .read_realm_rollback_control_head(network)
+                .await
+            {
+                Ok(CanonicalHeadReadState::Current(head)) => head,
+                Ok(CanonicalHeadReadState::Uninitialized) => {
+                    tracing::error!(
+                        "configured Coordinator rollback control head is uninitialized; Realm iteration admission remains closed"
+                    );
+                    sleep(std::time::Duration::from_millis(250)).await;
+                    continue;
+                }
+                Err(error) => {
+                    tracing::error!(
+                        "failed to read Coordinator rollback control head; Realm iteration admission remains closed: {error:#}"
+                    );
+                    sleep(std::time::Duration::from_millis(250)).await;
+                    continue;
+                }
+            };
+            if let Some(request) = head.rollback_control().requested() {
+                let status = processor.guta_queue_gatherer.status().await?;
+                if status.phase() != GathererBoundaryPhase::Running {
+                    anyhow::bail!("Realm gatherer is not running at rollback drain boundary")
+                }
+                let expected_unique_id = if processor
+                    .normal_commit_owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.is_branch_exact())
+                {
+                    processor.db.state.processing_proc_checkpoint_unique_id
+                } else {
+                    processor.db.state.gathering_proc_checkpoint_unique_id
+                };
+                if status.unique_id() != expected_unique_id {
+                    anyhow::bail!("Realm gatherer namespace changed before rollback drain")
+                }
+                let drain_request = RealmProcessorDrainRequest::try_new(
+                    network,
+                    processor.db.state.realm_identifier.realm_id,
+                    processor.db.state.realm_identifier.realm_sub_id,
+                    head.canonical_ref().chain_epoch().get(),
+                    head.revision().get(),
+                    *request.plan_digest().as_bytes(),
+                    *request.plan_digest().as_bytes(),
+                )?;
+                let _pause = processor
+                    .guta_queue_gatherer
+                    .pause(GathererPauseRequest::new(
+                        drain_request,
+                        status.revision(),
+                        expected_unique_id,
+                    ))
+                    .await?;
+                tracing::warn!(
+                    "Realm Processor drained for explicit rollback target {}; awaiting storage-authored runtime directive",
+                    request.target().checkpoint_id().get(),
+                );
+
+                let selected = loop {
+                    match rollback_control
+                        .read_selected_realm_runtime_rebuild(network, authority)
+                        .await
+                    {
+                        Ok(Some(selected)) => break selected,
+                        Ok(None) => sleep(std::time::Duration::from_millis(100)).await,
+                        Err(error) => {
+                            tracing::error!(
+                                "Realm rollback directive selection failed while drained: {error:#}"
+                            );
+                            sleep(std::time::Duration::from_millis(250)).await;
+                        }
+                    }
+                };
+                let report = processor
+                    .db
+                    .rebuild_realm_runtime_after_rollback(*selected.directive())
+                    .await?;
+                loop {
+                    match rollback_control
+                        .persist_realm_runtime_rebuild_report(selected, report)
+                        .await
+                    {
+                        Ok(()) => break,
+                        Err(error) => {
+                            tracing::error!(
+                                "Realm rollback report persistence is retrying while drained: {error:#}"
+                            );
+                            sleep(std::time::Duration::from_millis(250)).await;
+                        }
+                    }
+                }
+                loop {
+                    match rollback_control
+                        .is_realm_runtime_rebuild_published(selected)
+                        .await
+                    {
+                        Ok(true) => break,
+                        Ok(false) => sleep(std::time::Duration::from_millis(100)).await,
+                        Err(error) => {
+                            tracing::error!(
+                                "Realm is waiting for global restored-target publication: {error:#}"
+                            );
+                            sleep(std::time::Duration::from_millis(250)).await;
+                        }
+                    }
+                }
+                tracing::warn!(
+                    "Realm rollback target {} is globally published; exiting the stale actor so startup reconstructs its tree at the restored target",
+                    selected.directive().target().checkpoint().checkpoint_id().get(),
+                );
+                break 'processor;
+            }
+        }
+
         // The command receiver is owned by this loop. Dequeue happens only
         // between iterations, so a request can never cancel sync, proof,
         // commit, publish, or cleanup that already owns the iteration permit.
@@ -366,6 +499,49 @@ mod h23b2_tests {
         assert!(control.contains("GathererPauseReceipt"));
     }
 
+}
+
+#[cfg(test)]
+mod rollback_runtime_tests {
+    #[test]
+    fn durable_rollback_is_observed_before_iteration_and_exits_stale_actor() {
+        let source = include_str!("runner.rs");
+        let read_head = source
+            .find(".read_realm_rollback_control_head(network)")
+            .unwrap();
+        let iteration = source.find(".try_begin_iteration()").unwrap();
+        assert!(read_head < iteration);
+
+        let pause = source.find(".pause(GathererPauseRequest::new(").unwrap();
+        let select = source
+            .find(".read_selected_realm_runtime_rebuild(network, authority)")
+            .unwrap();
+        let rebuild = source
+            .find(".rebuild_realm_runtime_after_rollback(")
+            .unwrap();
+        let report = source
+            .find(".persist_realm_runtime_rebuild_report(selected, report)")
+            .unwrap();
+        let publish = source
+            .find(".is_realm_runtime_rebuild_published(selected)")
+            .unwrap();
+        let exit = source
+            .find("Realm rollback target {} is globally published; exiting the stale actor")
+            .unwrap();
+        assert!(pause < select && select < rebuild && rebuild < report);
+        assert!(report < publish && publish < exit && exit < iteration);
+    }
+
+    #[test]
+    fn rollback_control_is_explicit_and_not_an_http_report_route() {
+        let config = include_str!(
+            "../../../../../psy_node_core/src/config/node_start_config.rs"
+        );
+        assert!(config.contains("coordinator_rollback_db_namespace"));
+        let runner = include_str!("runner.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(!runner.contains("coordinator_api_urls"));
+        assert!(!runner.contains("jsonrpsee"));
+    }
 }
 pub async fn run_realm_processor<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID>,

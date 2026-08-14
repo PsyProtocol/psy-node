@@ -129,6 +129,13 @@ pub enum Commands {
         #[arg(long = "coordinator-api-urls", value_parser, num_args = 1.., value_delimiter = ' ', help = "Coordinator Edge API URLs for the realm processor to connect to")]
         coordinator_api_urls: Vec<String>,
 
+        #[arg(
+            long = "coordinator-rollback-db-namespace",
+            env = "COORDINATOR_ROLLBACK_DB_NAMESPACE",
+            help = "Existing Coordinator Scylla data keyspace for explicit rollback task selection/reporting; no DDL is performed"
+        )]
+        coordinator_rollback_db_namespace: Option<String>,
+
         #[arg(long = "genesis-data-path", help = "Path to store genesis data")]
         genesis_data_path: Option<String>,
 

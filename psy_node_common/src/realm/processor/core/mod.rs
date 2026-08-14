@@ -21,6 +21,7 @@ use psy_node_core::{
         realm_processor_quiescence::{
             RealmProcessorIterationGate, RealmProcessorIterationPermit,
         },
+        rollback_runtime_rebuild::RealmRollbackRuntimeControl,
         traits::proof_store::QParthProofStore,
     },
 };
@@ -139,4 +140,6 @@ pub struct PsyRealmProcessor<
     /// The sole receiver/lease owner. Ordinary startup leaves it absent; a
     /// later composition root must opt in explicitly after durable preflight.
     control_owner: Option<control::RealmProcessorControlOwner>,
+    rollback_runtime_control:
+        Option<std::sync::Arc<dyn RealmRollbackRuntimeControl<N::QHash>>>,
 }

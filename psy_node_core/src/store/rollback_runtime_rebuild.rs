@@ -16,6 +16,10 @@ use sha2::{Digest, Sha256};
 
 use super::pending_generation_identity::PendingGenerationContext;
 use super::pending_generation::ProcNamespacePrefix;
+use super::{
+    canonical_head::{CanonicalHeadReadState, StoredCanonicalHead},
+    rollback_control::RollbackControlState,
+};
 
 const DIRECTIVE_DOMAIN: &[u8] = b"psy.rollback.runtime-rebuild-directive.v1\0";
 const REPORT_DOMAIN: &[u8] = b"psy.rollback.runtime-rebuild-report.v1\0";
@@ -403,6 +407,82 @@ where
         directive: RollbackRuntimeRebuildDirective<Hash>,
         report: RollbackRuntimeRebuildReport<Hash>,
     ) -> anyhow::Result<()>;
+}
+
+/// Storage-selected Realm rebuild work.  This is a read-only observation:
+/// only the Coordinator control store may select the exact VERIFYING head and
+/// its matching immutable directive, and this value grants no head mutation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SelectedRealmRollbackRuntimeRebuild<Hash> {
+    verifying_head: StoredCanonicalHead<Hash>,
+    directive: RollbackRuntimeRebuildDirective<Hash>,
+}
+
+impl<Hash: Q256BitHash> SelectedRealmRollbackRuntimeRebuild<Hash> {
+    pub fn try_from_storage(
+        verifying_head: StoredCanonicalHead<Hash>,
+        directive: RollbackRuntimeRebuildDirective<Hash>,
+    ) -> Result<Self, RollbackRuntimeRebuildError> {
+        let request = match verifying_head.rollback_control() {
+            RollbackControlState::Verifying(request) => request,
+            _ => return Err(RollbackRuntimeRebuildError::RuntimeStateMismatch),
+        };
+        if !matches!(directive.authority(), AuthorityScope::Realm { .. })
+            || directive.target().network_id()
+                != verifying_head.canonical_ref().network_id()
+            || directive.target().chain_epoch()
+                != verifying_head.canonical_ref().chain_epoch()
+            || directive.target().checkpoint() != request.target()
+            || directive.participant_plan_digest() != request.plan_digest().as_bytes()
+        {
+            return Err(RollbackRuntimeRebuildError::RuntimeStateMismatch);
+        }
+        Ok(Self {
+            verifying_head,
+            directive,
+        })
+    }
+
+    pub const fn verifying_head(&self) -> &StoredCanonicalHead<Hash> {
+        &self.verifying_head
+    }
+
+    pub const fn directive(&self) -> &RollbackRuntimeRebuildDirective<Hash> {
+        &self.directive
+    }
+}
+
+/// Realm-side control-plane boundary backed by the Coordinator's existing
+/// canonical-head and rollback archive tables.  It deliberately contains no
+/// DDL or canonical-head write operation.
+#[async_trait]
+pub trait RealmRollbackRuntimeControl<Hash>: Send + Sync
+where
+    Hash: Q256BitHash,
+{
+    async fn read_realm_rollback_control_head(
+        &self,
+        network: NetworkId,
+    ) -> anyhow::Result<CanonicalHeadReadState<Hash>>;
+
+    async fn read_selected_realm_runtime_rebuild(
+        &self,
+        network: NetworkId,
+        authority: AuthorityScope,
+    ) -> anyhow::Result<Option<SelectedRealmRollbackRuntimeRebuild<Hash>>>;
+
+    async fn persist_realm_runtime_rebuild_report(
+        &self,
+        selected: SelectedRealmRollbackRuntimeRebuild<Hash>,
+        report: RollbackRuntimeRebuildReport<Hash>,
+    ) -> anyhow::Result<()>;
+
+    /// Returns true only after the exact restored target is globally
+    /// published as Idle.  VERIFYING and ALL_REALMS_READY remain false.
+    async fn is_realm_runtime_rebuild_published(
+        &self,
+        selected: SelectedRealmRollbackRuntimeRebuild<Hash>,
+    ) -> anyhow::Result<bool>;
 }
 
 #[cfg(test)]

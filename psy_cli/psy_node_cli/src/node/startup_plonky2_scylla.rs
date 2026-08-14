@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use std::time::Duration;
-use parth_core::{node::realm_identifier::QRealmIdentifier, protocol::core_types::QNetworkTypesConfigHelper};
+use parth_core::{node::realm_identifier::QRealmIdentifier, protocol::core_types::{QNetworkHashTypes, QNetworkTypesConfigHelper}};
 use plonky2::plonk::config::PoseidonGoldilocksConfig;
 use psy_core::{job::job_id::QProvingJobDataID, network_config::PsyNetworkLocalDevnetConstants};
 use psy_data::{
@@ -10,14 +10,19 @@ use psy_data::{
 };
 use psy_io::tokio::{TokioLikeFileSystem, TokioStdFileSystem};
 use psy_node_common::{coordinator::processor::create::create_coordinator_processor_and_run_with_durable_guta_submissions, p2p::realm_coordinator::PsyRealmCoordinatorClientAPI, realm::processor::create::create_realm_processor_and_run};
-use psy_node_core::config::node_start_config::{CoordinatorProcessorStartConfig, RealmProcessorStartConfig};
+use psy_node_core::{
+    config::node_start_config::{CoordinatorProcessorStartConfig, RealmProcessorStartConfig},
+    store::rollback_runtime_rebuild::RealmRollbackRuntimeControl,
+};
 use psy_node_nats::psy_queue::setup_nats_psy_queue_from_connection_str;
 use psy_node_redis::store::{new_redis_async_pool, StandardRedisStore};
 use psy_node_scylla::psy_setup::{
     setup_coordinator_psy_scylla_database_store_from_connection_string,
     setup_realm_processor_scylla_startup_composition,
 };
-use psy_node_scylla::rollback::PendingQueueSidecarSetupMode;
+use psy_node_scylla::rollback::{
+    PendingQueueSidecarSetupMode, ScyllaRealmRollbackRuntimeControl,
+};
 use psy_plonky2_circuits::{
     node::config::networks::resolver::PsyPlonky2NodeConfigResolver,
     protocol_types::ZKTypesPlonky2GoldilocksPoseidon,
@@ -402,6 +407,19 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
                 startup_preflight,
                 commit_runtime_installer,
             ) = composition.into_parts();
+            let rollback_runtime_control = match config
+                .coordinator_rollback_db_namespace
+                .as_deref()
+            {
+                Some(keyspace) => Some(Arc::new(
+                    ScyllaRealmRollbackRuntimeControl::prepare(
+                        db.store.session.clone(),
+                        keyspace,
+                    )
+                    .await?,
+                ) as Arc<dyn RealmRollbackRuntimeControl<<N as QNetworkHashTypes>::QHash>>),
+                None => None,
+            };
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
             let coordinator_client = PsyRealmCoordinatorClientAPI::<N, _>::new(
@@ -428,6 +446,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
                 startup_mode,
                 startup_preflight,
                 commit_runtime_installer,
+                rollback_runtime_control,
 
             )
             .await?;

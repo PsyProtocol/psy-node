@@ -105,6 +105,8 @@ mod rollback_global_restore_barrier;
 mod rollback_global_restore_orchestrator;
 mod rollback_runtime_rebuild_store;
 pub(crate) use rollback_runtime_rebuild_store::ScyllaRollbackRuntimeRebuildStore;
+mod realm_rollback_runtime_control;
+pub use realm_rollback_runtime_control::ScyllaRealmRollbackRuntimeControl;
 mod realm_rollback_target_restore_plan;
 mod realm_rollback_target_restore_planner;
 mod realm_rollback_target_restore_executor;

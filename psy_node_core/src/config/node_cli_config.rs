@@ -52,6 +52,7 @@ pub struct RealmProcessorCliConfig {
     pub verbose: Option<bool>,
     pub checkpoint_backup_path: Option<String>,
     pub coordinator_api_urls: Vec<String>,
+    pub coordinator_rollback_db_namespace: Option<String>,
     pub genesis_data_path: Option<String>,
     #[serde(default)]
     pub branch_exact_startup: Option<RealmBranchExactStartupConfig>,
@@ -69,6 +70,7 @@ impl RealmProcessorCliConfig {
             verbose: None,
             checkpoint_backup_path: None,
             coordinator_api_urls: Vec::new(),
+            coordinator_rollback_db_namespace: None,
             genesis_data_path: None,
             branch_exact_startup: None,
         }
@@ -85,6 +87,7 @@ impl RealmProcessorCliConfig {
         verbose: bool,
         checkpoint_backup_path: Option<String>,
         coordinator_api_urls: Vec<String>,
+        coordinator_rollback_db_namespace: Option<String>,
         genesis_data_path: Option<String>,
     ) -> anyhow::Result<RealmProcessorStartConfig> {
         Ok(RealmProcessorStartConfig {
@@ -98,6 +101,7 @@ impl RealmProcessorCliConfig {
             verbose: verbose || self.verbose.unwrap_or(false),
             checkpoint_backup_path: checkpoint_backup_path.or(self.checkpoint_backup_path).ok_or_else(|| anyhow::anyhow!("checkpoint_backup_path is required"))?,
             coordinator_api_urls: if !coordinator_api_urls.is_empty() { coordinator_api_urls } else { self.coordinator_api_urls },
+            coordinator_rollback_db_namespace: coordinator_rollback_db_namespace.or(self.coordinator_rollback_db_namespace),
             genesis_data_path: genesis_data_path.or(self.genesis_data_path),
             branch_exact_startup: self.branch_exact_startup,
         })
@@ -114,6 +118,7 @@ impl RealmProcessorCliConfig {
         verbose: bool,
         checkpoint_backup_path: Option<String>,
         coordinator_api_urls: Vec<String>,
+        coordinator_rollback_db_namespace: Option<String>,
         genesis_data_path: Option<String>,
     ) -> anyhow::Result<RealmProcessorStartConfig> {
         let cli_config = if let Some(config_path) = config {
@@ -132,6 +137,7 @@ impl RealmProcessorCliConfig {
             verbose,
             checkpoint_backup_path,
             coordinator_api_urls,
+            coordinator_rollback_db_namespace,
             genesis_data_path,
         )
     }
