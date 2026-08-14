@@ -555,35 +555,55 @@ where
     FileSystem::File: Send + Sync,
 {
     tracing::info!("[COORD_CREATE] create_and_run start");
-    let (processor, guta_gatherer_join_handle, register_users_gatherer_join_handle, deploy_contracts_gatherer_join_handle) = create_coordinator_processor_with_durable_guta_submissions::<N, S, STagTreeRewards, GUTAUpdateQueue, RegisterUserQueue, DeployContractQueue, ProofWorkQueue, TempDatabase, ProofStore, FileSystem>(
-        genesis_data,
-        network,
-        canonical_head_bootstrap_profile,
-        canonical_head_store,
-        rollback_admission_store,
-        file_system,
-        deploy_contract_gatherer_backup_directory,
-        register_user_gatherer_backup_directory,
-        guta_gatherer_backup_directory,
-        checkpoint_tree_root_backup_file_path,
-        db,
-        tag_tree_rewards_store,
-        temp_db,
-        proof_store,
-        durable_guta_submissions,
-        guta_update_queue,
-        register_user_queue,
-        deploy_contract_queue,
-        proof_work_queue,
-        realm_identifier,
-        circuit_fingerprint_config,
-    )
-    .await?;
+    loop {
+        let (processor, guta_gatherer_join_handle, register_users_gatherer_join_handle, deploy_contracts_gatherer_join_handle) = create_coordinator_processor_with_durable_guta_submissions::<N, S, STagTreeRewards, GUTAUpdateQueue, RegisterUserQueue, DeployContractQueue, ProofWorkQueue, TempDatabase, ProofStore, FileSystem>(
+            genesis_data,
+            network,
+            canonical_head_bootstrap_profile,
+            canonical_head_store.clone(),
+            rollback_admission_store.clone(),
+            file_system.clone(),
+            deploy_contract_gatherer_backup_directory.clone(),
+            register_user_gatherer_backup_directory.clone(),
+            guta_gatherer_backup_directory.clone(),
+            checkpoint_tree_root_backup_file_path.clone(),
+            db.clone(),
+            tag_tree_rewards_store.clone(),
+            temp_db.clone(),
+            proof_store.clone(),
+            durable_guta_submissions.clone(),
+            guta_update_queue.clone(),
+            register_user_queue.clone(),
+            deploy_contract_queue.clone(),
+            proof_work_queue.clone(),
+            realm_identifier,
+            circuit_fingerprint_config.clone(),
+        )
+        .await?;
 
-    tracing::info!("Starting coordinator processor...");
-    run_coordinator_processor(processor, guta_gatherer_join_handle, register_users_gatherer_join_handle, deploy_contracts_gatherer_join_handle).await?;
-
-    Ok(())
+        tracing::info!("Starting coordinator processor...");
+        match run_coordinator_processor(
+            processor,
+            guta_gatherer_join_handle,
+            register_users_gatherer_join_handle,
+            deploy_contracts_gatherer_join_handle,
+        )
+        .await?
+        {
+            super::core::runner::CoordinatorProcessorRunExit::ShutdownRequested => {
+                return Ok(())
+            }
+            super::core::runner::CoordinatorProcessorRunExit::RestartAfterRollback(
+                published,
+            ) => {
+                tracing::warn!(
+                    "Coordinator rollback target {} at epoch {} is published; recreating all three gatherer trees from restored storage",
+                    published.canonical_ref().checkpoint().checkpoint_id().get(),
+                    published.canonical_ref().chain_epoch().get(),
+                );
+            }
+        }
+    }
 }
 
 pub async fn create_coordinator_processor_and_run<
@@ -701,5 +721,31 @@ mod tests {
         assert!(branch_exact.contains("branch_exact_owner.network() != network.into()"));
         assert!(branch_exact.contains("CoordinatorNormalProcessingOwner::branch_exact"));
         assert!(!branch_exact.contains("CoordinatorNormalProcessingOwner::legacy()"));
+    }
+
+    #[test]
+    fn coordinator_create_loop_rebuilds_all_actors_after_rollback() {
+        let source = include_str!("create.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let function = production
+            .split("pub async fn create_coordinator_processor_and_run_with_durable_guta_submissions<")
+            .nth(1)
+            .expect("Coordinator create-and-run entry");
+        let recreate_loop = function.find("loop {").expect("recreate loop");
+        let create = function
+            .find("create_coordinator_processor_with_durable_guta_submissions::<")
+            .expect("processor construction");
+        let run = function
+            .find("match run_coordinator_processor(")
+            .expect("processor runner");
+        let restart = function
+            .find("CoordinatorProcessorRunExit::RestartAfterRollback")
+            .expect("rollback restart branch");
+        let shutdown = function
+            .find("CoordinatorProcessorRunExit::ShutdownRequested")
+            .expect("shutdown branch");
+        assert!(recreate_loop < create && create < run);
+        assert!(run < shutdown && run < restart);
+        assert!(!function[restart..].contains("return Ok(())"));
     }
 }

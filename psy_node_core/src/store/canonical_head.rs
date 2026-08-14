@@ -1397,6 +1397,22 @@ mod tests {
             assert_eq!(idle.kind(), CanonicalHeadTransitionKind::CompleteRollbackAbort);
             assert_eq!(idle.candidate().canonical_ref(), expected.canonical_ref());
             assert!(idle.candidate().rollback_control().is_idle());
+
+            let continued = CanonicalHeadTransition::normal_checkpoint_advance(
+                *idle.candidate(),
+                canonical_ref(PsyChainNetworkType::PsyMainnet, 1, 11, 60),
+            )
+            .unwrap();
+            assert_eq!(continued.candidate().canonical_ref().chain_epoch().get(), 1);
+            assert_eq!(
+                continued
+                    .candidate()
+                    .canonical_ref()
+                    .checkpoint()
+                    .checkpoint_id()
+                    .get(),
+                11
+            );
         }
 
         let deleting = CanonicalHeadTransition::begin_rollback_delete(
@@ -1518,6 +1534,37 @@ mod tests {
             request.target()
         );
         assert!(completed.candidate().rollback_control().is_idle());
+
+        let b2 = CanonicalHeadTransition::normal_checkpoint_advance(
+            *completed.candidate(),
+            canonical_ref(PsyChainNetworkType::PsyMainnet, 1, 8, 80),
+        )
+        .unwrap();
+        let b3 = CanonicalHeadTransition::normal_checkpoint_advance(
+            *b2.candidate(),
+            canonical_ref(PsyChainNetworkType::PsyMainnet, 1, 9, 90),
+        )
+        .unwrap();
+        assert_eq!(b2.candidate().canonical_ref().chain_epoch().get(), 1);
+        assert_eq!(b3.candidate().canonical_ref().chain_epoch().get(), 1);
+        assert_eq!(
+            b3.candidate()
+                .canonical_ref()
+                .checkpoint()
+                .checkpoint_id()
+                .get(),
+            9
+        );
+        assert_eq!(
+            CanonicalHeadTransition::normal_checkpoint_advance(
+                *completed.candidate(),
+                canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 8, 81),
+            ),
+            Err(CanonicalHeadModelError::ChainEpochChangedDuringNormalAdvance {
+                expected: 1,
+                proposed: 0,
+            })
+        );
 
         assert_eq!(
             CanonicalHeadTransition::complete_rollback_archive_barrier(

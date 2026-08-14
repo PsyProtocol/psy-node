@@ -19,10 +19,17 @@ use psy_node_core::{
     store::rollback_runtime_rebuild::{
         CoordinatorRollbackRuntimePublication, CoordinatorRollbackRuntimeRebuildStore,
     },
+    store::canonical_head::StoredCanonicalHead,
 };
 use tokio::time::sleep;
 
 use crate::coordinator::processor::PsyCoordinatorProcessor;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoordinatorProcessorRunExit<Hash> {
+    ShutdownRequested,
+    RestartAfterRollback(StoredCanonicalHead<Hash>),
+}
 
 pub async fn run_coordinator_processor_loop<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
@@ -52,7 +59,7 @@ pub async fn run_coordinator_processor_loop<
         ProofStore,
         FileSystem,
     >,
-) -> anyhow::Result<()>
+) -> anyhow::Result<CoordinatorProcessorRunExit<N::QHash>>
 where
     N: 'static,
 {
@@ -132,6 +139,11 @@ where
                                         "[COORDINATOR] Globally published restored checkpoint {} at epoch {}; normal block admission may resume",
                                         published.canonical_ref().checkpoint().checkpoint_id().get(),
                                         published.canonical_ref().chain_epoch().get(),
+                                    );
+                                    return Ok(
+                                        CoordinatorProcessorRunExit::RestartAfterRollback(
+                                            published,
+                                        ),
                                     );
                                 }
                                 Err(error) => {
@@ -256,7 +268,7 @@ where
     processor.db.status.mark_stopped();
     print_cf_log_indicator("PSY_COORDINATOR_PROCESSOR_STOPPED", &format!("R{}_{}", realm_id, realm_sub_id));
 
-    Ok(())
+    Ok(CoordinatorProcessorRunExit::ShutdownRequested)
 }
 pub async fn run_coordinator_processor<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
@@ -290,7 +302,7 @@ pub async fn run_coordinator_processor<
     guta_gatherer_join_handle: tokio::task::JoinHandle<Result<(), anyhow::Error>>,
     register_users_gatherer_join_handle: tokio::task::JoinHandle<Result<(), anyhow::Error>>,
     deploy_contracts_gatherer_join_handle: tokio::task::JoinHandle<Result<(), anyhow::Error>>,
-) -> anyhow::Result<()>
+) -> anyhow::Result<CoordinatorProcessorRunExit<N::QHash>>
 where
     N: 'static,
     FileSystem::File: Send + Sync + 'static,
@@ -302,7 +314,7 @@ where
             tracing::info!("Ctrl-C signal received, cleaning up...");
             status.begin_shutdown();
             sleep(std::time::Duration::from_secs(5)).await;
-            Ok(())
+            Ok(CoordinatorProcessorRunExit::ShutdownRequested)
         }
         result = async {
             let (processor_result, guta_result, register_result, deploy_result) = tokio::try_join!(
@@ -311,15 +323,15 @@ where
                 register_users_gatherer_join_handle,
                 deploy_contracts_gatherer_join_handle,
             )?;
-            processor_result?;
+            let exit = processor_result?;
             guta_result?;
             register_result?;
             deploy_result?;
-            Ok::<(), anyhow::Error>(())
+            Ok::<CoordinatorProcessorRunExit<N::QHash>, anyhow::Error>(exit)
         } => {
-            result?;
+            let exit = result?;
             tracing::info!("All coordinator processor threads completed");
-            Ok(())
+            Ok(exit)
         }
     }
 }
@@ -394,5 +406,23 @@ mod tests {
             .find("self.publish_pending_context_for_head(*head)")
             .expect("pending context publication");
         assert!(idle < update && update < publish);
+    }
+
+    #[test]
+    fn published_rollback_target_restarts_coordinator_actor_trees() {
+        let source = include_str!("runner.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let published = production
+            .find("CoordinatorRollbackRuntimePublication::Published(published)")
+            .expect("restored target publication branch");
+        let restart = production[published..]
+            .find("CoordinatorProcessorRunExit::RestartAfterRollback")
+            .map(|offset| published + offset)
+            .expect("Coordinator restart exit");
+        let normal_processing = production[published..]
+            .find("processor.process_block()")
+            .map(|offset| published + offset)
+            .expect("normal processing call");
+        assert!(published < restart && restart < normal_processing);
     }
 }
