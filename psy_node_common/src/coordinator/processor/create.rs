@@ -35,6 +35,7 @@ use psy_node_core::{
         CoordinatorRollbackRuntimeRebuildStore, RollbackRuntimeRebuildDirective,
     },
     store::coordinator_processor_branch_exact_runtime::CoordinatorBranchExactProcessorOwner,
+    store::coordinator_processor_full_commit::CoordinatorProcessorFullCommitStore,
 };
 
 use crate::coordinator::processor::{PsyCoordinatorProcessor, db::PsyCoordinatorDatabaseProcessor, runner::run_coordinator_processor};
@@ -166,6 +167,8 @@ async fn create_coordinator_processor_with_processing_owner<
         Option<Arc<dyn CoordinatorGutaDurableSubmissionStore<N::QHash>>>,
     normal_processing_owner:
         crate::coordinator::processor::CoordinatorNormalProcessingOwner,
+    branch_exact_full_commit:
+        Option<Arc<dyn CoordinatorProcessorFullCommitStore<N::QHash>>>,
     rollback_restart_directive: Option<RollbackRuntimeRebuildDirective<N::QHash>>,
     initial_rollback_drain: Option<RealmProcessorDrainRequest>,
     guta_update_queue: Arc<GUTAUpdateQueue>,
@@ -297,6 +300,7 @@ where
         guta_gatherer_backup_directory,
         durable_guta_submissions,
         normal_processing_owner,
+        branch_exact_full_commit,
         rollback_restart_directive,
         initial_rollback_drain,
     )
@@ -395,6 +399,7 @@ where
         crate::coordinator::processor::CoordinatorNormalProcessingOwner::legacy(),
         None,
         None,
+        None,
         guta_update_queue,
         register_user_queue,
         deploy_contract_queue,
@@ -453,6 +458,8 @@ pub async fn create_coordinator_processor_with_branch_exact_capture<
     durable_guta_submissions:
         Option<Arc<dyn CoordinatorGutaDurableSubmissionStore<N::QHash>>>,
     branch_exact_owner: CoordinatorBranchExactProcessorOwner,
+    branch_exact_full_commit:
+        Arc<dyn CoordinatorProcessorFullCommitStore<N::QHash>>,
     guta_update_queue: Arc<GUTAUpdateQueue>,
     register_user_queue: Arc<RegisterUserQueue>,
     deploy_contract_queue: Arc<DeployContractQueue>,
@@ -501,6 +508,7 @@ where
         crate::coordinator::processor::CoordinatorNormalProcessingOwner::branch_exact(
             branch_exact_owner,
         ),
+        Some(branch_exact_full_commit),
         None,
         None,
         guta_update_queue,
@@ -697,6 +705,7 @@ where
             proof_store.clone(),
             durable_guta_submissions.clone(),
             crate::coordinator::processor::CoordinatorNormalProcessingOwner::legacy(),
+            None,
             rollback_restart_directive.take(),
             initial_rollback_drain,
             guta_update_queue.clone(),
@@ -887,6 +896,7 @@ mod tests {
             .unwrap();
         assert!(branch_exact.contains("branch_exact_owner.network() != network.into()"));
         assert!(branch_exact.contains("CoordinatorNormalProcessingOwner::branch_exact"));
+        assert!(branch_exact.contains("Some(branch_exact_full_commit)"));
         assert!(!branch_exact.contains("CoordinatorNormalProcessingOwner::legacy()"));
     }
 

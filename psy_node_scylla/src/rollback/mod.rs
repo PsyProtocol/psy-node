@@ -86,6 +86,7 @@ mod realm_processor_generation_terminal;
 mod coordinator_guta_durable_submission_store;
 #[allow(dead_code)]
 mod coordinator_processor_durable_capture;
+mod coordinator_processor_full_commit;
 mod coordinator_commit_source_store;
 mod coordinator_rollback_floor_singleton_anchor;
 pub(crate) use coordinator_rollback_floor_singleton_anchor::*;
@@ -258,6 +259,7 @@ pub(crate) use realm_user_update_ingress::*;
 pub use pending_queue_sidecar_lifecycle::*;
 pub(crate) use coordinator_guta_durable_submission_store::*;
 pub(crate) use coordinator_processor_durable_capture::ScyllaCoordinatorProcessorDurableCaptureFactory;
+pub(crate) use coordinator_processor_full_commit::ScyllaCoordinatorProcessorFullCommitStore;
 pub use authority_local_head_prototype::*;
 pub use authority_timestamp_prototype::*;
 pub use checkpoint_kiv::*;

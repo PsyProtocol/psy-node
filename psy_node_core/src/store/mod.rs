@@ -25,6 +25,7 @@ pub mod realm_imt_mutation_graph;
 pub mod realm_processor_quiescence;
 pub mod realm_processor_branch_exact_runtime;
 pub mod coordinator_processor_branch_exact_runtime;
+pub mod coordinator_processor_full_commit;
 pub mod coordinator_commit_source;
 pub mod coordinator_normal_commit_coverage;
 pub mod realm_processor_startup;

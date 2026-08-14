@@ -133,6 +133,11 @@ enum CoordinatorGatheringOutcome<
     ),
     AwaitingDurableClose,
     BranchExactFinalized {
+        proving_state: PsyNodeProvingState,
+        guta_jobs: Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>,
+        register_user_jobs: Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>,
+        deploy_contract_jobs: Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>,
+        output_builder: CoordinatorOutputBuilder<N>,
         generation_digest: CoordinatorProcessorDurableGenerationDigest,
         registration_items: u64,
         deploy_items: u64,
@@ -448,17 +453,24 @@ impl<
             anyhow::bail!("Coordinator command actor finalization mixed durable generations");
         }
 
-        // Build the exact same Coordinator output/job plan as the legacy
-        // path.  c4e/c4f will persist and publish it; until that writer/head
-        // barrier exists, branch-exact stops here and cannot fall through the
-        // legacy proof/commit/head path.
-        let _validated_output = CoordinatorOutputBuilder::<N>::new(
+        let (
+            proving_state,
+            guta_jobs,
+            register_user_jobs,
+            deploy_contract_jobs,
+            output_builder,
+        ) = CoordinatorOutputBuilder::<N>::new(
             &self.db.ids,
             guta.output().clone(),
             registration.output().clone(),
             deploy.output().clone(),
         )?;
         Ok(CoordinatorGatheringOutcome::BranchExactFinalized {
+            proving_state,
+            guta_jobs,
+            register_user_jobs,
+            deploy_contract_jobs,
+            output_builder,
             generation_digest,
             registration_items,
             deploy_items,
@@ -679,7 +691,14 @@ impl<
         let mut timer = TraceTimer::new("process_block");
         tracing::info!("Starting to process new coordinator block with checkpoint_id = {}...", self.db.ids.next_checkpoint_id);
         let gathering = self.get_results_from_gatherers().await?;
-        let (mut proving_state, guta_jobs, register_user_jobs, deploy_contract_jobs, mut output_builder) = match gathering {
+        let (
+            mut proving_state,
+            guta_jobs,
+            register_user_jobs,
+            deploy_contract_jobs,
+            mut output_builder,
+            branch_exact,
+        ) = match gathering {
             CoordinatorGatheringOutcome::Legacy(
                 proving_state,
                 guta_jobs,
@@ -692,6 +711,7 @@ impl<
                 register_user_jobs,
                 deploy_contract_jobs,
                 output_builder,
+                false,
             ),
             CoordinatorGatheringOutcome::AwaitingDurableClose => {
                 tracing::info!(
@@ -700,6 +720,11 @@ impl<
                 return Ok(());
             }
             CoordinatorGatheringOutcome::BranchExactFinalized {
+                proving_state,
+                guta_jobs,
+                register_user_jobs,
+                deploy_contract_jobs,
+                output_builder,
                 generation_digest,
                 registration_items,
                 deploy_items,
@@ -710,9 +735,16 @@ impl<
                     registration_items,
                     deploy_items,
                     guta_items,
-                    "Coordinator branch-exact generation finalized; waiting for c4e/c4f writer/head barrier"
+                    "Coordinator branch-exact generation finalized; entering proof and exact full-commit path"
                 );
-                return Ok(());
+                (
+                    proving_state,
+                    guta_jobs,
+                    register_user_jobs,
+                    deploy_contract_jobs,
+                    output_builder,
+                    true,
+                )
             }
         };
         let worker_queue_key_for_cleanup = self.db.get_proof_worker_queue_key();
@@ -786,9 +818,30 @@ impl<
         tracing::info!("Checkpoint State Transition Proof completed!");
         proving_state.finish();
         self.db.temp_db.set_psy_node_proving_state(&self.db.ids.realm_identifier, &proving_state).await?;
-        self.db
-            .commit_state(coordinator_update, ProvingJobCircuitType::GenerateRollupStateTransitionProof, zk_proof)
-            .await?;
+        if branch_exact {
+            let full_commit = self
+                .branch_exact_full_commit
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!(
+                    "branch-exact Coordinator Processor has no full-commit store"
+                ))?;
+            self.db
+                .commit_state_branch_exact(
+                    full_commit.as_ref(),
+                    coordinator_update,
+                    ProvingJobCircuitType::GenerateRollupStateTransitionProof,
+                    zk_proof,
+                )
+                .await?;
+        } else {
+            self.db
+                .commit_state(
+                    coordinator_update,
+                    ProvingJobCircuitType::GenerateRollupStateTransitionProof,
+                    zk_proof,
+                )
+                .await?;
+        }
         timer.lap("commit_state");
         tracing::info!("Committed new coordinator block with checkpoint_id = {}.", self.db.ids.checkpoint_id);
         self.db.print_coordinator_processor_state();
@@ -824,7 +877,7 @@ mod tests {
     use super::{publish_wait_for_queue_and_job_ready, wait_for_job_ready};
 
     #[test]
-    fn branch_exact_coordinator_route_is_command_only_and_stops_before_legacy_authority() {
+    fn branch_exact_coordinator_route_is_command_only_and_avoids_legacy_gathering() {
         let source = include_str!("process_block.rs");
         let production = source.split("#[cfg(test)]").next().unwrap();
         let branch_exact = production
@@ -867,7 +920,7 @@ mod tests {
             .split("let worker_queue_key_for_cleanup")
             .next()
             .unwrap();
-        assert!(handoff_arm.contains("return Ok(())"));
+        assert!(handoff_arm.contains("true,"));
         assert!(!handoff_arm.contains("get_root_job_ids"));
         assert!(!handoff_arm.contains("publish_jobs"));
         assert!(!handoff_arm.contains("commit_state"));
@@ -1155,5 +1208,19 @@ mod tests {
             "reward must be polled again after the first None, not early-returned"
         );
         Ok(())
+    }
+
+    #[test]
+    fn branch_exact_coordinator_uses_full_commit_and_legacy_keeps_commit_state() {
+        let source = include_str!("process_block.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let process = production
+            .split("pub async fn process_block")
+            .nth(1)
+            .unwrap();
+        assert!(process.contains("if branch_exact"));
+        assert!(process.contains("commit_state_branch_exact("));
+        assert!(process.contains("full_commit.as_ref()"));
+        assert!(process.contains(".commit_state("));
     }
 }

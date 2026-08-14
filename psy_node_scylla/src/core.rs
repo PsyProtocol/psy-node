@@ -17,6 +17,7 @@ use psy_node_core::store::coordinator_commit_source::{
     CoordinatorCommitSource, CoordinatorCommitSourceStore,
     CoordinatorRollbackFloor,
 };
+use psy_node_core::store::coordinator_processor_full_commit::CoordinatorProcessorFullCommitStore;
 use psy_node_core::store::rollback_admission::{
     CoordinatorRollbackAdmissionReader, CoordinatorRollbackAdmissionStore,
     RollbackAdmissionSlotBootstrap, RollbackAdmissionSlotReadState,
@@ -56,6 +57,7 @@ use crate::rollback::{
     PendingQueueSidecarSetupOutcome, ScyllaPendingQueueSidecarSetupGate,
     ScyllaCoordinatorGutaDurableSubmissionStore,
     ScyllaCoordinatorProcessorDurableCaptureFactory,
+    ScyllaCoordinatorProcessorFullCommitStore,
     ScyllaCoordinatorCommitSourceStore,
     ScyllaCoordinatorCommitPhysicalArchiveStore,
     ScyllaAuthorityTimestampStore,
@@ -588,6 +590,51 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
                 network,
                 ready.as_ref(),
                 nats,
+            )
+            .await?,
+        ))
+    }
+
+    /// Prepare the narrow two-stage full-commit backend used by the
+    /// branch-exact Coordinator Processor. This is prepare-only: schema,
+    /// writer activation, source store, and canonical head must already be
+    /// present in the verified Coordinator setup.
+    pub async fn prepare_coordinator_processor_full_commit_store<F>(
+        &self,
+        network: psy_data::protocol::canonical_chain::NetworkId,
+        genesis_checkpoint_state_transition_hash: Hash,
+        checkpoint_state_transition_circuit_fingerprint: Hash,
+        checkpoint_tree_height: u8,
+    ) -> anyhow::Result<Arc<dyn CoordinatorProcessorFullCommitStore<Hash>>>
+    where
+        F: QFelt64 + Send + Sync + 'static,
+        Hash: Q256BitHash + QFHashBase<F> + Send + Sync + 'static,
+        Hasher: MerkleHasher<Hash>
+            + FieldQHasher<F, Hash>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let ready = self.require_branch_exact_schema_ready()?;
+        if ready.view().authority()
+            != psy_data::protocol::chain_context::AuthorityScope::Coordinator
+        {
+            anyhow::bail!(
+                "Coordinator full commit requires Coordinator branch-exact readiness"
+            );
+        }
+        Ok(Arc::new(
+            ScyllaCoordinatorProcessorFullCommitStore::<F, Hash, Hasher>::prepare(
+                self.session.clone(),
+                &self.keyspace,
+                &self.no_tablet_keyspace,
+                network,
+                ready,
+                self.coordinator_commit_sources_arc()?,
+                self.coordinator_canonical_head_arc()?,
+                genesis_checkpoint_state_transition_hash,
+                checkpoint_state_transition_circuit_fingerprint,
+                checkpoint_tree_height,
             )
             .await?,
         ))

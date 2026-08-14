@@ -50,6 +50,7 @@ use psy_node_core::{
     psy_temp_db::StandardProcessorTempDBStoreBase,
     queue::{ephemeral::QStandardEphemeralQueueSubscriber, worker_queue::QStandardWorkerQueuePublisher},
     store::{
+        authority_commit::AuthorityClockSampleUs,
         canonical_head::{
             plan_canonical_head_startup, CanonicalHeadBootstrap,
             CanonicalHeadBootstrapProfile,
@@ -60,6 +61,7 @@ use psy_node_core::{
         coordinator_commit_source::{
             CoordinatorCommitSource, CoordinatorCommitSourcePayload,
         },
+        coordinator_processor_full_commit::CoordinatorProcessorFullCommitStore,
         rollback_admission::{
             CoordinatorRollbackAdmissionBoundary,
             CoordinatorRollbackAdmissionStore,
@@ -74,6 +76,7 @@ use psy_node_core::{
             RollbackRuntimeRebuildDirective, RollbackRuntimeRebuildReport,
         },
         timestamp::NewBranchWriteTimestampUs,
+        typed::{ProcCheckpointUniqueId, UniquePendingId},
         traits::proof_store::QParthProofStore,
     },
 };
@@ -1770,6 +1773,223 @@ checkpoint_backup_copy_status={}
             _phantom_queue_item: std::marker::PhantomData,
         }
     }
+
+    /// Branch-exact normal commit. Proof construction stays in the Processor;
+    /// the backend writes every durable state row, the local backup manager
+    /// appends the exact checkpoint delta, and only then may the backend mark
+    /// the source committed and publish the canonical head.
+    pub async fn commit_state_branch_exact(
+        &mut self,
+        full_commit: &dyn CoordinatorProcessorFullCommitStore<N::QHash>,
+        coordinator_update: PsyPreparedCoordinatorBlockStateUpdates<N::F, N::QHash>,
+        state_transition_circuit_type: ProvingJobCircuitType,
+        zk_proof: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        let checkpoint_id = coordinator_update.checkpoint_id;
+        if checkpoint_id == 0 {
+            anyhow::bail!("branch-exact Coordinator commit requires post-genesis checkpoint");
+        }
+        let checkpoint_leaf_hash = coordinator_update
+            .new_base
+            .checkpoint_leaf
+            .qfhash::<N::HasherBase>();
+        if checkpoint_leaf_hash != coordinator_update.new_base.checkpoint_leaf_hash
+            || coordinator_update.old_base.checkpoint_leaf_hash
+                != self.last_committed.checkpoint_leaf_hash
+            || checkpoint_id != self.ids.checkpoint_id.checked_add(1).ok_or_else(|| {
+                anyhow::anyhow!("Coordinator checkpoint ID overflow")
+            })?
+            || coordinator_update.unique_pending_id != self.ids.unique_pending_id
+            || coordinator_update.proc_checkpoint_unique_id
+                != self.ids.proc_checkpoint_unique_id
+        {
+            anyhow::bail!("branch-exact Coordinator prepared update identity mismatch");
+        }
+        let checkpoint_proof = &coordinator_update.checkpoint_tree_update_proof;
+        if checkpoint_proof.index != checkpoint_id
+            || checkpoint_proof.siblings.len() != N::CHECKPOINT_TREE_HEIGHT_USIZE
+            || checkpoint_proof.old_root
+                != coordinator_update.old_base.checkpoint_tree_root
+            || checkpoint_proof.old_value
+                != coordinator_update.old_base.checkpoint_leaf_hash
+            || checkpoint_proof.new_root
+                != coordinator_update.new_base.checkpoint_tree_root
+            || checkpoint_proof.new_value
+                != coordinator_update.new_base.checkpoint_leaf_hash
+            || !checkpoint_proof.verify::<N::HasherBase>()
+        {
+            anyhow::bail!("branch-exact Coordinator checkpoint delta mismatch");
+        }
+        let old_checkpoint_root = self
+            .db
+            .checkpoint_tree_get_root_hash(self.ids.checkpoint_id)
+            .await?;
+        if old_checkpoint_root != coordinator_update.old_base.checkpoint_tree_root {
+            anyhow::bail!("branch-exact Coordinator predecessor root mismatch");
+        }
+
+        let checkpoint_proof_public_inputs_hash =
+            checkpoint_hash_from_saved_proof_bytes::<
+                N::QHash,
+                N::ZKProof,
+                N::ZKVerifier,
+            >(&zk_proof)?
+            .into_inner();
+        ensure_non_genesis_checkpoint_chain_commitment::<
+            N::F,
+            N::QHash,
+            N::HasherBase,
+        >(
+            checkpoint_id,
+            self.last_committed.last_chain_hash,
+            coordinator_update.new_base.checkpoint_tree_root,
+            coordinator_update.new_base.checkpoint_leaf_hash,
+            self.circuit_fingerprint_config
+                .checkpoint_state_transition_circuit_fingerprint,
+            checkpoint_proof_public_inputs_hash,
+        )?;
+        let expected = self.canonical_head.ok_or_else(|| {
+            anyhow::anyhow!("branch-exact Coordinator canonical head is uninitialized")
+        })?;
+        let candidate = CanonicalChainRef::new(
+            self.network_id,
+            expected.canonical_ref().chain_epoch(),
+            CheckpointRef::new(
+                CheckpointId::new(checkpoint_id),
+                CheckpointHash::from_last_chain_hash(
+                    checkpoint_proof_public_inputs_hash,
+                ),
+            ),
+        );
+        let mut prepared_update = Vec::with_capacity(
+            coordinator_update.pio_serialized_size(),
+        );
+        coordinator_update.pio_write_to_io(&mut prepared_update)?;
+        let mut cursor = psy_io::Cursor::new(prepared_update.as_slice());
+        let decoded = PsyPreparedCoordinatorBlockStateUpdates::<
+            N::F,
+            N::QHash,
+        >::pio_read_from_io(&mut cursor)?;
+        if decoded != coordinator_update
+            || cursor.position() != prepared_update.len() as u64
+        {
+            anyhow::bail!("branch-exact Coordinator source roundtrip mismatch");
+        }
+        let payload = CoordinatorCommitSourcePayload::try_new(
+            prepared_update,
+            state_transition_circuit_type as u32,
+            zk_proof,
+        )?;
+        let source = CoordinatorCommitSource::try_new(
+            expected,
+            candidate,
+            payload.encode_canonical(),
+        )?;
+        self.canonical_head_store
+            .ensure_coordinator_rollback_floor(&expected)
+            .await?;
+
+        let now_us = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_micros();
+        let now_us = i128::try_from(now_us)
+            .map_err(|_| anyhow::anyhow!("wall clock is outside CQL timestamp range"))?;
+        let clock_floor = self
+            .rollback_restart_new_branch_write
+            .map(|timestamp| i128::from(timestamp.as_commit_timestamp().as_i64()))
+            .unwrap_or(i128::MIN);
+        let clock = AuthorityClockSampleUs::try_from_i128(now_us.max(clock_floor))?;
+        let pending = UniquePendingId::try_new(coordinator_update.unique_pending_id)?;
+        let proc_id = ProcCheckpointUniqueId::from_u128(
+            coordinator_update.proc_checkpoint_unique_id,
+        );
+        let post_rollback_fence = self
+            .rollback_restart_new_branch_write
+            .map(NewBranchWriteTimestampUs::delete_fence);
+        full_commit
+            .persist_full_write(
+                &source,
+                pending,
+                proc_id,
+                clock,
+                post_rollback_fence,
+            )
+            .await?;
+
+        let backup = self
+            .checkpoint_tree_backup_manager
+            .append_coordinator_commit_source_exact::<N::F>(&source)
+            .await?
+            .into_evidence(&source)?;
+        let sealed = CanonicalHeadTransition::normal_checkpoint_advance(
+            expected,
+            *source.candidate(),
+        )?
+        .seal();
+        let published = full_commit
+            .publish_after_backup(
+                &source,
+                backup,
+                &sealed,
+                post_rollback_fence,
+            )
+            .await?;
+        if published != *sealed.candidate() {
+            anyhow::bail!("branch-exact Coordinator published a different head");
+        }
+        self.canonical_head = Some(published);
+
+        let verifiable_checkpoint_transition = coordinator_update
+            .get_public_inputs_verifiable_state_transition(
+                self.genesis_checkpoint_state_transition_hash,
+                self.circuit_fingerprint_config
+                    .checkpoint_state_transition_circuit_fingerprint,
+            );
+        self.last_committed.checkpoint_state_transition =
+            CheckpointStateHashTransition {
+                old_checkpoint_tree_root: coordinator_update
+                    .old_base
+                    .checkpoint_tree_root,
+                new_checkpoint_tree_root: coordinator_update
+                    .new_base
+                    .checkpoint_tree_root,
+                old_checkpoint_leaf_hash: coordinator_update
+                    .old_base
+                    .checkpoint_leaf_hash,
+                new_checkpoint_leaf_hash: coordinator_update
+                    .new_base
+                    .checkpoint_leaf_hash,
+            };
+        self.ids.checkpoint_id = checkpoint_id;
+        self.ids.next_checkpoint_id = checkpoint_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("Coordinator next checkpoint overflow"))?;
+        self.last_committed.update_for_block::<N::HasherBase>(
+            coordinator_update.new_base.block_state,
+            verifiable_checkpoint_transition.checkpoint_leaf,
+            verifiable_checkpoint_transition
+                .state_transition
+                .checkpoint_transition,
+        )?;
+        self.last_committed.last_chain_hash = checkpoint_proof_public_inputs_hash;
+        let checkpoint_leaf_standard = coordinator_update
+            .new_base
+            .checkpoint_leaf
+            .to_checkpoint_leaf::<N::HasherBase>();
+        self.shared_status.update_status(
+            self.ids.unique_pending_id,
+            checkpoint_id,
+            checkpoint_leaf_standard,
+            coordinator_update
+                .new_base
+                .checkpoint_leaf
+                .global_state_roots,
+            coordinator_update.new_base.block_state,
+            false,
+        )?;
+        Ok(())
+    }
+
     pub async fn commit_state(
         &mut self,
         coordinator_update: PsyPreparedCoordinatorBlockStateUpdates<N::F, N::QHash>,

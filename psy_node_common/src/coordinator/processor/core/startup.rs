@@ -13,6 +13,7 @@ use psy_node_core::{
         worker_queue::QStandardWorkerQueuePublisher,
     },
     store::{
+        coordinator_processor_full_commit::CoordinatorProcessorFullCommitStore,
         realm_processor_quiescence::RealmProcessorDrainRequest,
         rollback_runtime_rebuild::RollbackRuntimeRebuildDirective,
         traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore},
@@ -84,6 +85,8 @@ where
         durable_guta_submissions:
             Option<Arc<dyn CoordinatorGutaDurableSubmissionStore<N::QHash>>>,
         normal_processing_owner: super::CoordinatorNormalProcessingOwner,
+        branch_exact_full_commit:
+            Option<Arc<dyn CoordinatorProcessorFullCommitStore<N::QHash>>>,
         rollback_restart_directive: Option<RollbackRuntimeRebuildDirective<N::QHash>>,
         initial_rollback_drain: Option<RealmProcessorDrainRequest>,
     ) -> anyhow::Result<(
@@ -376,6 +379,7 @@ where
                 deploy_contract_queue_gatherer: deploy_contract_queue_gatherer,
                 proof_worker_queue_max_time_ms: u64::MAX,
                 normal_processing_owner: Some(normal_processing_owner),
+                branch_exact_full_commit,
                 initial_rollback_pauses,
             },
             guta_join_handle,

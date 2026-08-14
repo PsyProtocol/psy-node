@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use parth_core::protocol::core_types::QNetworkTypesConfig;
 use psy_data::v1::qdata::{contract::PsyDeployContractQueueItem, public_key::PZKPublicKeyInfo};
 use psy_io::tokio::TokioLikeFileSystem;
@@ -11,6 +13,7 @@ use psy_node_core::{
     },
     store::traits::proof_store::QParthProofStore,
     store::coordinator_processor_branch_exact_runtime::CoordinatorBranchExactProcessorOwner,
+    store::coordinator_processor_full_commit::CoordinatorProcessorFullCommitStore,
 };
 
 use crate::{
@@ -102,5 +105,7 @@ pub struct PsyCoordinatorProcessor<
     >,
     pub proof_worker_queue_max_time_ms: u64,
     normal_processing_owner: Option<CoordinatorNormalProcessingOwner>,
+    branch_exact_full_commit:
+        Option<Arc<dyn CoordinatorProcessorFullCommitStore<N::QHash>>>,
     initial_rollback_pauses: Option<CoordinatorRollbackGathererPauseSet>,
 }
