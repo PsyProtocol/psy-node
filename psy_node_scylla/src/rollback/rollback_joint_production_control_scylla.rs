@@ -8,7 +8,7 @@ use std::{
     path::Path,
     process::Command,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, bail, ensure};
@@ -1097,6 +1097,7 @@ async fn qualification_seed_realm_history(
 #[ignore = "runs against the isolated single-node Scylla rollback fixture"]
 async fn explicit_admin_request_is_selected_by_every_production_realm_control(
 ) -> anyhow::Result<()> {
+    let test_started = Instant::now();
     ensure!(
         std::env::var("PSY_ROLLBACK_JOINT_SINGLE").as_deref() == Ok("1")
             || rf3_enabled(),
@@ -1184,6 +1185,7 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
         "a Realm absent from the immutable topology must fail closed"
     );
 
+    let archive_started = Instant::now();
     ensure!(matches!(
         <ScyllaCoreStore<PHash, PoseidonHasher> as CoordinatorRollbackMaintenanceExecutor<
             PF,
@@ -1296,6 +1298,7 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
             "recovered Realm archive selected a different physical dataset",
         );
     }
+    let archive_ms = archive_started.elapsed().as_millis();
 
     // Lose every archive owner before the first destructive transition. Only
     // the Coordinator is reopened now; Realm processes stay down until their
@@ -1308,6 +1311,7 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
         wait_for_replicas(2).await?;
     }
 
+    let delete_started = Instant::now();
     let CoordinatorRollbackGlobalProgress::AwaitingParticipants {
         head: deleting_head,
         completed,
@@ -1377,6 +1381,7 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
             "Realm delete retry selected different physical work",
         );
     }
+    let delete_ms = delete_started.elapsed().as_millis();
 
     // Lose the delete executors after every participant completion but before
     // the global delete barrier. The Coordinator must select the exact rows
@@ -1385,6 +1390,7 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
     realm_10 = realm_control(REALM_10_KEYSPACE, 10).await?;
     realm_20 = realm_control(REALM_20_KEYSPACE, 20).await?;
 
+    let restore_started = Instant::now();
     let CoordinatorRollbackGlobalProgress::Progressed(restoring_head) =
         <ScyllaCoreStore<PHash, PoseidonHasher> as CoordinatorRollbackMaintenanceExecutor<
             PF,
@@ -1431,6 +1437,7 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
             "Realm target restore retry selected different final rows",
         );
     }
+    let restore_ms = restore_started.elapsed().as_millis();
 
     // Drop the target-restore owners before global verification. Only the
     // Coordinator is restarted until VERIFYING asks Realms for reports.
@@ -1438,6 +1445,7 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
     drop(realm_20);
     coordinator = coordinator_control().await?;
 
+    let publication_started = Instant::now();
     let CoordinatorRollbackGlobalProgress::Progressed(verifying_head) =
         <ScyllaCoreStore<PHash, PoseidonHasher> as CoordinatorRollbackMaintenanceExecutor<
             PF,
@@ -1564,6 +1572,7 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
             "Realm did not observe the globally published restored runtime",
         );
     }
+    let publication_ms = publication_started.elapsed().as_millis();
 
 
     // The published IDLE target is the only authority carried into normal
@@ -1591,6 +1600,7 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
                 .as_i64(),
         ) + 1,
     )?;
+    let continuation_started = Instant::now();
     let coordinator_t1 = qualification_append_post_rollback_coordinator_commit(
         &coordinator,
         published,
@@ -1714,9 +1724,21 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
             "Realm did not continue from T+1 to new-epoch T+2",
         );
     }
+    let continuation_ms = continuation_started.elapsed().as_millis();
+    let mut rejoin_repair_ms = 0;
+    let mut direct_one_tables = 0;
+    let mut direct_one_rows = 0;
     if rf3_enabled() {
         let expected = joint_dataset(&coordinator.session).await?;
+        direct_one_tables = expected.len();
+        direct_one_rows = expected.values().map(Vec::len).sum::<usize>();
+        let rejoin_started = Instant::now();
         rejoin_and_repair(&expected).await?;
+        rejoin_repair_ms = rejoin_started.elapsed().as_millis();
     }
+    eprintln!(
+        "ROLLBACK_JOINT_TIMINGS_MS archive={archive_ms} delete={delete_ms} restore={restore_ms} publication={publication_ms} continuation={continuation_ms} rejoin_repair={rejoin_repair_ms} total={} direct_one_tables={direct_one_tables} direct_one_rows={direct_one_rows}",
+        test_started.elapsed().as_millis(),
+    );
     Ok(())
 }
