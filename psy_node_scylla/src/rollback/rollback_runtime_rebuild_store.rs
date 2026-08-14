@@ -305,19 +305,17 @@ impl<Hash> PersistedRollbackRuntimeRebuildReport<Hash> {
     }
 }
 
-pub(super) struct ScyllaRollbackRuntimeRebuildStore {
+pub(crate) struct ScyllaRollbackRuntimeRebuildStore {
     session: Arc<Session>,
-    counter: Arc<PendingCounterAdapter>,
     fingerprint: [u8; 32],
     insert: PreparedStatement,
     read: PreparedStatement,
 }
 
 impl ScyllaRollbackRuntimeRebuildStore {
-    pub(super) async fn prepare(
+    pub(crate) async fn prepare(
         session: Arc<Session>,
         keyspace: &CqlKeyspaceName,
-        counter: Arc<PendingCounterAdapter>,
     ) -> Result<Self, RollbackRuntimeRebuildStoreError> {
         let table = format!(
             "{}.{}",
@@ -333,7 +331,6 @@ impl ScyllaRollbackRuntimeRebuildStore {
         hasher.update(read.as_bytes());
         Ok(Self {
             session: session.clone(),
-            counter,
             fingerprint: hasher.finalize().into(),
             insert: prepare_lwt(&session, &insert).await?,
             read: prepare_read(&session, &read).await?,
@@ -342,6 +339,7 @@ impl ScyllaRollbackRuntimeRebuildStore {
 
     pub(super) async fn persist_or_recover_coordinator_directive<Hash: Q256BitHash>(
         &self,
+        counter: &PendingCounterAdapter,
         barrier: &PersistedRollbackGlobalRestoreBarrier<Hash>,
         coordinator: &PersistedCoordinatorRollbackDeleteCompletion<Hash>,
     ) -> Result<RollbackRuntimeRebuildDirective<Hash>, RollbackRuntimeRebuildStoreError> {
@@ -379,7 +377,7 @@ impl ScyllaRollbackRuntimeRebuildStore {
             Some(stored) if stored.slot == slot => stored.directive,
             Some(_) => return Err(RollbackRuntimeRebuildStoreError::Conflict),
             None => {
-                let current = self.counter.observe_counter().await.map_err(backend)?;
+                let current = counter.observe_counter().await.map_err(backend)?;
                 let (processing, gathering) = coordinator_contexts(target.network_id(), current)?;
                 let candidate = RollbackRuntimeRebuildDirective::try_from_storage(
                     authority,
@@ -429,7 +427,7 @@ impl ScyllaRollbackRuntimeRebuildStore {
         }
         for allocation in [&processing_allocation, &gathering_allocation] {
             let PendingCounterAllocationOutcome::Owned(owned) =
-                self.counter.allocate(allocation).await.map_err(backend)?
+                counter.allocate(allocation).await.map_err(backend)?
             else {
                 return Err(RollbackRuntimeRebuildStoreError::CounterConflict);
             };
@@ -442,7 +440,7 @@ impl ScyllaRollbackRuntimeRebuildStore {
                 return Err(RollbackRuntimeRebuildStoreError::BindingMismatch);
             }
         }
-        if self.counter.observe_counter().await.map_err(backend)?
+        if counter.observe_counter().await.map_err(backend)?
             != PendingCounterReadState::Current(gathering.pending_id())
         {
             return Err(RollbackRuntimeRebuildStoreError::CounterConflict);
@@ -503,7 +501,7 @@ impl ScyllaRollbackRuntimeRebuildStore {
     /// Select the storage-authored directive from the exact VERIFYING head.
     /// The caller supplies only its authority identity; target, epoch, and plan
     /// are selected from the durable Coordinator row.
-    pub(super) async fn read_selected_directive<Hash: Q256BitHash>(
+    pub(crate) async fn read_selected_directive<Hash: Q256BitHash>(
         &self,
         verifying_head: StoredCanonicalHead<Hash>,
         authority: AuthorityScope,
@@ -602,6 +600,15 @@ impl ScyllaRollbackRuntimeRebuildStore {
             store_fingerprint: self.fingerprint,
             stored: current,
         })
+    }
+
+    pub(crate) async fn persist_and_revalidate_report<Hash: Q256BitHash>(
+        &self,
+        directive: RollbackRuntimeRebuildDirective<Hash>,
+        report: RollbackRuntimeRebuildReport<Hash>,
+    ) -> Result<(), RollbackRuntimeRebuildStoreError> {
+        let receipt = self.persist_report(directive, report).await?;
+        self.revalidate_report(&receipt).await
     }
 
     pub(super) async fn revalidate_report<Hash: Q256BitHash>(
@@ -1058,7 +1065,7 @@ fn indeterminate_or_read_error(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum RollbackRuntimeRebuildStoreError {
+pub(crate) enum RollbackRuntimeRebuildStoreError {
     BindingMismatch,
     RowTooLarge,
     LengthOverflow,
@@ -1176,7 +1183,7 @@ mod tests {
             .next()
             .expect("Coordinator slice");
         let persist = source.find("self.persist_directive(candidate)").unwrap();
-        let allocate = source.find("self.counter.allocate(allocation)").unwrap();
+        let allocate = source.find("counter.allocate(allocation)").unwrap();
         assert!(persist < allocate);
         assert!(source.contains("Some(stored) if stored.slot == slot"));
         assert!(source.contains("self.revalidate_directive(&directive)"));

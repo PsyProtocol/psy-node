@@ -16,6 +16,7 @@ use psy_node_core::{
         CoordinatorRollbackMaintenanceExecutor,
         CoordinatorRollbackMaintenanceOutcome,
     },
+    store::rollback_runtime_rebuild::CoordinatorRollbackRuntimeRebuildStore,
 };
 use tokio::time::sleep;
 
@@ -25,6 +26,7 @@ pub async fn run_coordinator_processor_loop<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
     S: PsyCoordinatorProcessorStore<N::F, N::QHash>
         + CoordinatorRollbackMaintenanceExecutor<N::F, N::QHash>
+        + CoordinatorRollbackRuntimeRebuildStore<N::QHash>
         + Send
         + Sync,
     STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync,
@@ -74,7 +76,36 @@ where
                     .reconcile_rollback_admission_at_loop_boundary()
                     .await;
                 match admission {
-                    Ok(RollbackAdmissionBoundaryOutcome::Maintenance(_head)) => {
+                    Ok(RollbackAdmissionBoundaryOutcome::Maintenance(head)) => {
+                        if matches!(
+                            head.rollback_control(),
+                            psy_node_core::store::rollback_control::RollbackControlState::Verifying(_)
+                        ) {
+                            match processor
+                                .db
+                                .rebuild_coordinator_runtime_after_rollback()
+                                .await
+                            {
+                                Ok(Some(report)) => tracing::warn!(
+                                    "[COORDINATOR] Rollback runtime rebuilt at checkpoint {} (backup range [{}, {})); waiting for all Realm runtime reports",
+                                    report.processor_checkpoint(),
+                                    report.backup_min_checkpoint(),
+                                    report.backup_next_checkpoint(),
+                                ),
+                                Ok(None) => tracing::warn!(
+                                    "[COORDINATOR] VERIFYING is active but its runtime rebuild directive is not available yet"
+                                ),
+                                Err(error) => {
+                                    let error = format!(
+                                        "Coordinator rollback runtime rebuild failed closed at slot {}: {:#}",
+                                        current_slot, error,
+                                    );
+                                    processor.db.status.set_error(error.clone());
+                                    tracing::error!("{error}");
+                                }
+                            }
+                            continue;
+                        }
                         match processor.db.prepare_coordinator_rollback_archive().await {
                             Ok(CoordinatorRollbackMaintenanceOutcome::ArchivePrepared(prepared)) => {
                                 tracing::warn!(
@@ -167,6 +198,7 @@ pub async fn run_coordinator_processor<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
     S: PsyCoordinatorProcessorStore<N::F, N::QHash>
         + CoordinatorRollbackMaintenanceExecutor<N::F, N::QHash>
+        + CoordinatorRollbackRuntimeRebuildStore<N::QHash>
         + Send
         + Sync
         + 'static,
@@ -237,6 +269,18 @@ mod tests {
         let admission = production
             .find("RollbackAdmissionBoundaryOutcome::Maintenance")
             .expect("maintenance branch");
+        let verifying = production[admission..]
+            .find("RollbackControlState::Verifying")
+            .map(|offset| admission + offset)
+            .expect("verifying branch");
+        let rebuild = production[verifying..]
+            .find("rebuild_coordinator_runtime_after_rollback")
+            .map(|offset| verifying + offset)
+            .expect("runtime rebuild");
+        let rebuild_park = production[rebuild..]
+            .find("continue;")
+            .map(|offset| rebuild + offset)
+            .expect("runtime rebuild park");
         let archive = production[admission..]
             .find("prepare_coordinator_rollback_archive")
             .map(|offset| admission + offset)
@@ -250,7 +294,14 @@ mod tests {
             .map(|offset| park + offset)
             .expect("normal block processing");
 
-        assert!(admission < archive && archive < park && park < process);
+        assert!(
+            admission < verifying
+                && verifying < rebuild
+                && rebuild < rebuild_park
+                && rebuild_park < archive
+                && archive < park
+                && park < process
+        );
         for forbidden in ["delete_suffix", "restore_target", "publish_target"] {
             assert!(!production.contains(forbidden));
         }

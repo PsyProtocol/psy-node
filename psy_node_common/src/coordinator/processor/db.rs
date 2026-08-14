@@ -53,7 +53,7 @@ use psy_node_core::{
         canonical_head::{
             plan_canonical_head_startup, CanonicalHeadBootstrap,
             CanonicalHeadBootstrapProfile,
-            CanonicalHeadStartupPlan, CanonicalHeadTransition,
+            CanonicalHeadReadState, CanonicalHeadStartupPlan, CanonicalHeadTransition,
             CanonicalHeadWriteOutcome, CoordinatorCanonicalHeadStore, NetworkId,
             StoredCanonicalHead,
         },
@@ -68,6 +68,9 @@ use psy_node_core::{
         rollback_participant_maintenance::{
             CoordinatorRollbackMaintenanceExecutor,
             CoordinatorRollbackMaintenanceOutcome,
+        },
+        rollback_runtime_rebuild::{
+            CoordinatorRollbackRuntimeRebuildStore, RollbackRuntimeRebuildReport,
         },
         traits::proof_store::QParthProofStore,
     },
@@ -842,6 +845,284 @@ impl<
     }
     pub async fn get_current_unique_pending_id_internal(&self) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId)> {
         self.db.get_current_unique_pending_id().await
+    }
+
+    /// Rebuild Coordinator process-local state after the global physical
+    /// restore has reached VERIFYING. The durable target rows are read-only in
+    /// this step: only the derived checkpoint backup, in-memory processor
+    /// state, and temporary pending identities are rebuilt. Publishing the
+    /// target canonical head remains a later global-barrier transition.
+    pub async fn rebuild_coordinator_runtime_after_rollback(
+        &mut self,
+    ) -> anyhow::Result<Option<RollbackRuntimeRebuildReport<N::QHash>>>
+    where
+        S: CoordinatorRollbackRuntimeRebuildStore<N::QHash>,
+    {
+        let verifying_head = match self
+            .canonical_head_store
+            .read_canonical_head(self.network_id)
+            .await?
+        {
+            CanonicalHeadReadState::Current(head) => head,
+            CanonicalHeadReadState::Uninitialized => {
+                anyhow::bail!("Coordinator canonical head is missing during rollback runtime rebuild")
+            }
+        };
+        if !matches!(
+            verifying_head.rollback_control(),
+            psy_node_core::store::rollback_control::RollbackControlState::Verifying(_)
+        ) {
+            anyhow::bail!("Coordinator rollback runtime rebuild requires VERIFYING")
+        }
+        self.canonical_head = Some(verifying_head);
+
+        let Some(directive) = self
+            .db
+            .read_selected_coordinator_runtime_rebuild(self.network_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if directive.authority() != AuthorityScope::Coordinator
+            || directive.target().network_id() != self.network_id
+        {
+            anyhow::bail!("Coordinator rollback runtime directive identity mismatch")
+        }
+        let processing = directive.processing().ok_or_else(|| {
+            anyhow::anyhow!("Coordinator rollback runtime directive is missing processing")
+        })?;
+        let gathering = directive.gathering().ok_or_else(|| {
+            anyhow::anyhow!("Coordinator rollback runtime directive is missing gathering")
+        })?;
+        let target_checkpoint = directive.target().checkpoint().checkpoint_id().get();
+
+        // Validate every durable input before touching the derived backup file
+        // or process-local state. The physical restore executor must already
+        // have made the target the latest visible checkpoint.
+        let latest_checkpoint = self.db.get_latest_checkpoint_id().await?;
+        if latest_checkpoint != target_checkpoint {
+            anyhow::bail!(
+                "Coordinator rollback target is not the latest restored checkpoint: target={}, latest={}",
+                target_checkpoint,
+                latest_checkpoint,
+            )
+        }
+        let checkpoint_leaf = self.db.get_checkpoint_leaf_data(target_checkpoint).await?;
+        let checkpoint_state_roots = self
+            .db
+            .get_checkpoint_global_state_roots(target_checkpoint)
+            .await?;
+        let l2_state = self.db.get_l2_block_state(target_checkpoint).await?;
+        if l2_state.checkpoint_id != target_checkpoint {
+            anyhow::bail!(
+                "Coordinator restored L2 state checkpoint mismatch: target={}, state={}",
+                target_checkpoint,
+                l2_state.checkpoint_id,
+            )
+        }
+        let checkpoint_root = self
+            .db
+            .checkpoint_tree_get_root_hash(target_checkpoint)
+            .await?;
+        let checkpoint_leaf_hash = checkpoint_leaf.qfhash::<N::HasherBase>();
+        let checkpoint_state_transition = if target_checkpoint == 0 {
+            self.genesis_verifiable_state_transition
+                .state_transition
+                .checkpoint_transition
+                .clone()
+        } else {
+            CheckpointStateHashTransition {
+                old_checkpoint_tree_root: self
+                    .db
+                    .checkpoint_tree_get_root_hash(target_checkpoint - 1)
+                    .await?,
+                new_checkpoint_tree_root: checkpoint_root,
+                old_checkpoint_leaf_hash: self
+                    .db
+                    .checkpoint_tree_get_leaf_hash(target_checkpoint, target_checkpoint - 1)
+                    .await?,
+                new_checkpoint_leaf_hash: checkpoint_leaf_hash,
+            }
+        };
+
+        let last_chain_hash = if target_checkpoint == 0 {
+            genesis_checkpoint_hash::<_, N::HasherBase>(
+                checkpoint_root,
+                checkpoint_leaf_hash,
+                self.circuit_fingerprint_config
+                    .genesis_checkpoint_state_transition_fingerprint,
+            )
+            .into_inner()
+        } else {
+            let stored = self
+                .db
+                .get_verifiable_checkpoint_state_transition_and_zkp(target_checkpoint)
+                .await?;
+            let proof_checkpoint_hash =
+                checkpoint_hash_from_saved_proof_bytes::<N::QHash, N::ZKProof, N::ZKVerifier>(
+                    &stored.zk_proof,
+                )?
+                .into_inner();
+            let parent_checkpoint_hash = if target_checkpoint == 1 {
+                let parent_root = self.db.checkpoint_tree_get_root_hash(0).await?;
+                let parent_leaf_hash = self
+                    .db
+                    .get_checkpoint_leaf_data(0)
+                    .await?
+                    .qfhash::<N::HasherBase>();
+                genesis_checkpoint_hash::<_, N::HasherBase>(
+                    parent_root,
+                    parent_leaf_hash,
+                    self.circuit_fingerprint_config
+                        .genesis_checkpoint_state_transition_fingerprint,
+                )
+                .into_inner()
+            } else {
+                let parent = self
+                    .db
+                    .get_verifiable_checkpoint_state_transition_and_zkp(target_checkpoint - 1)
+                    .await?;
+                checkpoint_hash_from_saved_proof_bytes::<N::QHash, N::ZKProof, N::ZKVerifier>(
+                    &parent.zk_proof,
+                )?
+                .into_inner()
+            };
+            ensure_non_genesis_checkpoint_chain_commitment::<
+                N::F,
+                N::QHash,
+                N::HasherBase,
+            >(
+                target_checkpoint,
+                parent_checkpoint_hash,
+                checkpoint_root,
+                checkpoint_leaf_hash,
+                self.circuit_fingerprint_config
+                    .checkpoint_state_transition_circuit_fingerprint,
+                proof_checkpoint_hash,
+            )?;
+            proof_checkpoint_hash
+        };
+        if last_chain_hash
+            != *directive
+                .target()
+                .checkpoint()
+                .checkpoint_hash()
+                .as_inner()
+        {
+            anyhow::bail!("Coordinator rollback target chain hash mismatch")
+        }
+
+        let required_history_start = target_checkpoint
+            .saturating_sub(STALE_CHECKPOINT_AGE_REALM_TO_COORDINATOR_PROOF)
+            .max(if target_checkpoint
+                >= self.checkpoint_tree_backup_manager.max_checkpoints_to_keep
+            {
+                target_checkpoint
+                    - self.checkpoint_tree_backup_manager.max_checkpoints_to_keep
+                    + 1
+            } else {
+                0
+            });
+        self.checkpoint_tree_backup_manager
+            .hard_reset_and_truncate(required_history_start)
+            .await?;
+        self.checkpoint_tree_backup_manager
+            .sync_from_database::<S>(&self.db, 1000, target_checkpoint)
+            .await?;
+        if self
+            .checkpoint_tree_backup_manager
+            .get_current_checkpoint_tree_root_head()
+            != checkpoint_root
+        {
+            anyhow::bail!("Coordinator checkpoint backup root mismatch after rollback rebuild")
+        }
+
+        self.ids.checkpoint_id = target_checkpoint;
+        self.ids.next_checkpoint_id = target_checkpoint
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("Coordinator rollback target checkpoint overflow"))?;
+        self.ids.unique_pending_id = processing.pending_id().get();
+        self.ids.proc_checkpoint_unique_id = processing.proc_checkpoint_id().as_u128();
+        self.ids.gathering_unique_pending_id = gathering.pending_id().get();
+        self.ids.gathering_proc_checkpoint_unique_id = gathering.proc_checkpoint_id().as_u128();
+        self.last_committed = CoordinatorProcessorLastCommittedState {
+            l2_state: l2_state.clone(),
+            checkpoint_leaf_stats: checkpoint_leaf.stats.clone(),
+            checkpoint_leaf: checkpoint_leaf.clone(),
+            checkpoint_state_roots: checkpoint_state_roots.clone(),
+            checkpoint_state_transition,
+            checkpoint_root,
+            checkpoint_leaf_hash,
+            last_chain_hash,
+        };
+        self.temp_db
+            .set_unique_pending_ids(
+                &self.ids.realm_identifier,
+                self.ids.unique_pending_id,
+                self.ids.proc_checkpoint_unique_id,
+            )
+            .await?;
+        self.temp_db
+            .set_gathering_unique_pending_ids(
+                &self.ids.realm_identifier,
+                self.ids.gathering_unique_pending_id,
+                self.ids.gathering_proc_checkpoint_unique_id,
+            )
+            .await?;
+        self.temp_db
+            .clear_current_pending_context(&self.ids.realm_identifier)
+            .await?;
+        self.shared_status.update_status(
+            self.ids.unique_pending_id,
+            target_checkpoint,
+            checkpoint_leaf.clone(),
+            checkpoint_state_roots.clone(),
+            l2_state.clone(),
+            false,
+        )?;
+        self.needs_revert = false;
+
+        // Bracket the process-local mutation with fresh target reads before
+        // producing durable completion evidence.
+        if self.db.get_latest_checkpoint_id().await? != target_checkpoint
+            || self
+                .db
+                .checkpoint_tree_get_root_hash(target_checkpoint)
+                .await?
+                != checkpoint_root
+            || self.db.get_l2_block_state(target_checkpoint).await? != l2_state
+            || self
+                .db
+                .get_checkpoint_global_state_roots(target_checkpoint)
+                .await?
+                != checkpoint_state_roots
+        {
+            anyhow::bail!("Coordinator restored target changed during runtime rebuild")
+        }
+        let report = RollbackRuntimeRebuildReport::try_after_exact_rebuild(
+            &directive,
+            self.checkpoint_tree_backup_manager
+                .min_backed_up_checkpoint_id,
+            self.checkpoint_tree_backup_manager
+                .next_backup_checkpoint_id,
+            self.checkpoint_tree_backup_manager
+                .get_current_checkpoint_tree_root_head(),
+            self.ids.checkpoint_id,
+            l2_state.checkpoint_id,
+            checkpoint_state_roots.qfhash::<N::HasherBase>(),
+            Some(processing),
+            Some(gathering),
+        )?;
+        self.db
+            .persist_coordinator_runtime_rebuild_report(directive, report)
+            .await?;
+        tracing::warn!(
+            "Coordinator rollback runtime rebuilt at checkpoint {} with processing {} and gathering {}",
+            target_checkpoint,
+            processing.pending_id().get(),
+            gathering.pending_id().get(),
+        );
+        Ok(Some(report))
     }
 
     async fn copy_checkpoint_backup_file_for_reset(&mut self, destination_path: &str) -> anyhow::Result<()> {
@@ -1907,6 +2188,40 @@ Checkpoint Root Hash: {}
 mod tests {
     use super::*;
     use parth_core::{pgoldilocks::PoseidonHasher, PHash};
+
+    #[test]
+    fn rollback_runtime_rebuild_only_mutates_derived_process_state() {
+        let source = include_str!("db.rs");
+        let rebuild = source
+            .split("pub async fn rebuild_coordinator_runtime_after_rollback")
+            .nth(1)
+            .expect("runtime rebuild method")
+            .split("async fn copy_checkpoint_backup_file_for_reset")
+            .next()
+            .expect("runtime rebuild method end");
+
+        for required in [
+            "read_selected_coordinator_runtime_rebuild",
+            "hard_reset_and_truncate",
+            "sync_from_database",
+            "set_unique_pending_ids",
+            "set_gathering_unique_pending_ids",
+            "clear_current_pending_context",
+            "persist_coordinator_runtime_rebuild_report",
+        ] {
+            assert!(rebuild.contains(required), "missing {required}");
+        }
+        for forbidden in [
+            "set_latest_checkpoint_id",
+            "set_l2_latest_block_state",
+            "set_unique_pending_id_checkpoint_id_mapping",
+            "set_checkpoint_id_to_unique_pending_id_mapping",
+            "complete_rollback_realm_barrier",
+            "complete_rollback(",
+        ] {
+            assert!(!rebuild.contains(forbidden), "forbidden {forbidden}");
+        }
+    }
 
     #[test]
     fn coordinator_commit_source_brackets_all_hot_writes_and_head_publish() {

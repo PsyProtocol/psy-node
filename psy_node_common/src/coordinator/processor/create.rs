@@ -24,6 +24,7 @@ use psy_node_core::{
     },
     store::rollback_admission::CoordinatorRollbackAdmissionStore,
     store::rollback_participant_maintenance::CoordinatorRollbackMaintenanceExecutor,
+    store::rollback_runtime_rebuild::CoordinatorRollbackRuntimeRebuildStore,
     store::coordinator_processor_branch_exact_runtime::CoordinatorBranchExactProcessorOwner,
 };
 
@@ -33,6 +34,7 @@ async fn create_coordinator_processor_with_processing_owner<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
     S: PsyCoordinatorProcessorStore<N::F, N::QHash>
         + CoordinatorRollbackMaintenanceExecutor<N::F, N::QHash>
+        + CoordinatorRollbackRuntimeRebuildStore<N::QHash>
         + Send
         + Sync
         + 'static,
@@ -203,6 +205,7 @@ pub async fn create_coordinator_processor_with_durable_guta_submissions<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
     S: PsyCoordinatorProcessorStore<N::F, N::QHash>
         + CoordinatorRollbackMaintenanceExecutor<N::F, N::QHash>
+        + CoordinatorRollbackRuntimeRebuildStore<N::QHash>
         + Send
         + Sync
         + 'static,
@@ -302,6 +305,7 @@ pub async fn create_coordinator_processor_with_branch_exact_capture<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
     S: PsyCoordinatorProcessorStore<N::F, N::QHash>
         + CoordinatorRollbackMaintenanceExecutor<N::F, N::QHash>
+        + CoordinatorRollbackRuntimeRebuildStore<N::QHash>
         + Send
         + Sync
         + 'static,
@@ -404,6 +408,7 @@ pub async fn create_coordinator_processor<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
     S: PsyCoordinatorProcessorStore<N::F, N::QHash>
         + CoordinatorRollbackMaintenanceExecutor<N::F, N::QHash>
+        + CoordinatorRollbackRuntimeRebuildStore<N::QHash>
         + Send
         + Sync
         + 'static,
@@ -510,6 +515,7 @@ pub async fn create_coordinator_processor_and_run_with_durable_guta_submissions<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
     S: PsyCoordinatorProcessorStore<N::F, N::QHash>
         + CoordinatorRollbackMaintenanceExecutor<N::F, N::QHash>
+        + CoordinatorRollbackRuntimeRebuildStore<N::QHash>
         + Send
         + Sync
         + 'static,
@@ -584,6 +590,7 @@ pub async fn create_coordinator_processor_and_run<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
     S: PsyCoordinatorProcessorStore<N::F, N::QHash>
         + CoordinatorRollbackMaintenanceExecutor<N::F, N::QHash>
+        + CoordinatorRollbackRuntimeRebuildStore<N::QHash>
         + Send
         + Sync
         + 'static,

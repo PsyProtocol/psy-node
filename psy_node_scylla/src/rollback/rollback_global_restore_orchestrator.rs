@@ -41,6 +41,7 @@ pub(super) struct ScyllaRollbackGlobalRestoreOrchestrator {
     realm_archive: Arc<ScyllaRealmRollbackPhysicalArchiveStore>,
     restore_barrier: Arc<ScyllaRollbackGlobalRestoreBarrierStore>,
     runtime_rebuild: Arc<ScyllaRollbackRuntimeRebuildStore>,
+    counter: Arc<super::PendingCounterAdapter>,
 }
 
 impl ScyllaRollbackGlobalRestoreOrchestrator {
@@ -51,6 +52,7 @@ impl ScyllaRollbackGlobalRestoreOrchestrator {
         realm_archive: Arc<ScyllaRealmRollbackPhysicalArchiveStore>,
         restore_barrier: Arc<ScyllaRollbackGlobalRestoreBarrierStore>,
         runtime_rebuild: Arc<ScyllaRollbackRuntimeRebuildStore>,
+        counter: Arc<super::PendingCounterAdapter>,
     ) -> Self {
         Self {
             canonical_head,
@@ -59,6 +61,7 @@ impl ScyllaRollbackGlobalRestoreOrchestrator {
             realm_archive,
             restore_barrier,
             runtime_rebuild,
+            counter,
         }
     }
 
@@ -113,7 +116,7 @@ impl ScyllaRollbackGlobalRestoreOrchestrator {
         // harmless and are resumed by exact IFNE readback on retry.
         let coordinator_directive = self
             .runtime_rebuild
-            .persist_or_recover_coordinator_directive(&barrier, coordinator)
+            .persist_or_recover_coordinator_directive(&self.counter, &barrier, coordinator)
             .await
             .map_err(backend)?;
         let realm_directives = self

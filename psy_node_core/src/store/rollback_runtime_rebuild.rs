@@ -6,9 +6,10 @@
 
 use std::{error::Error, fmt};
 
+use async_trait::async_trait;
 use parth_core::protocol::core_types::Q256BitHash;
 use psy_data::protocol::{
-    canonical_chain::{CanonicalChainRef, ChainEpoch},
+    canonical_chain::{CanonicalChainRef, ChainEpoch, NetworkId},
     chain_context::AuthorityScope,
 };
 use sha2::{Digest, Sha256};
@@ -383,6 +384,26 @@ impl fmt::Display for RollbackRuntimeRebuildError {
 }
 
 impl Error for RollbackRuntimeRebuildError {}
+
+/// Storage boundary used by a Coordinator process to select its immutable
+/// VERIFYING task and append the exact result of rebuilding process-local
+/// checkpoint/tree state. Neither method can publish the canonical target.
+#[async_trait]
+pub trait CoordinatorRollbackRuntimeRebuildStore<Hash>: Send + Sync
+where
+    Hash: Q256BitHash,
+{
+    async fn read_selected_coordinator_runtime_rebuild(
+        &self,
+        network: NetworkId,
+    ) -> anyhow::Result<Option<RollbackRuntimeRebuildDirective<Hash>>>;
+
+    async fn persist_coordinator_runtime_rebuild_report(
+        &self,
+        directive: RollbackRuntimeRebuildDirective<Hash>,
+        report: RollbackRuntimeRebuildReport<Hash>,
+    ) -> anyhow::Result<()>;
+}
 
 #[cfg(test)]
 mod tests {

@@ -28,6 +28,10 @@ use psy_node_core::store::rollback_participant_plan::{
 use psy_node_core::store::rollback_participant_maintenance::{
     CoordinatorRollbackMaintenanceExecutor, CoordinatorRollbackMaintenanceOutcome,
 };
+use psy_node_core::store::rollback_runtime_rebuild::{
+    CoordinatorRollbackRuntimeRebuildStore, RollbackRuntimeRebuildDirective,
+    RollbackRuntimeRebuildReport,
+};
 use psy_node_core::store::rollback_topology::RollbackTopologySnapshot;
 use psy_node_core::store::realm_processor_startup::{
     RealmProcessorStartupError, RealmProcessorStartupExpectation,
@@ -43,6 +47,7 @@ use crate::rollback::{
     CanonicalHeadNoTabletKeyspace, ScyllaCanonicalHeadStore,
     ScyllaBranchExactSchemaSetupGate, ScyllaRollbackAdmissionStore,
     ScyllaRollbackParticipantPlanStore,
+    ScyllaRollbackRuntimeRebuildStore,
     ScyllaBranchExactShadowReader, PendingQueueSidecarKeyspaces,
     PendingQueueSidecarLifecycleError, PendingQueueSidecarReady,
     PendingQueueSidecarReadyView, PendingQueueSidecarSetupMode,
@@ -70,6 +75,8 @@ pub struct ScyllaCoreStore<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> {
     rollback_admission_store: Arc<OnceLock<Arc<ScyllaRollbackAdmissionStore>>>,
     rollback_participant_plan_store:
         Arc<OnceLock<Arc<ScyllaRollbackParticipantPlanStore>>>,
+    rollback_runtime_rebuild_store:
+        Arc<OnceLock<Arc<ScyllaRollbackRuntimeRebuildStore>>>,
     branch_exact_schema_ready: Arc<OnceLock<Arc<BranchExactSchemaReady>>>,
     pending_queue_sidecar_ready: Arc<OnceLock<Arc<PendingQueueSidecarReady>>>,
     _phantom_hash: std::marker::PhantomData<Hash>,
@@ -205,6 +212,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
             coordinator_commit_source_store: Arc::new(OnceLock::new()),
             rollback_admission_store: Arc::new(OnceLock::new()),
             rollback_participant_plan_store: Arc::new(OnceLock::new()),
+            rollback_runtime_rebuild_store: Arc::new(OnceLock::new()),
             branch_exact_schema_ready: Arc::new(OnceLock::new()),
             pending_queue_sidecar_ready: Arc::new(OnceLock::new()),
             _phantom_hash: std::marker::PhantomData,
@@ -340,12 +348,22 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
             )
             .await?,
         );
+        let runtime_rebuild = Arc::new(
+            ScyllaRollbackRuntimeRebuildStore::prepare(
+                self.session.clone(),
+                &crate::rollback::CqlKeyspaceName::try_new(self.keyspace.clone())?,
+            )
+            .await?,
+        );
         self.rollback_admission_store
             .set(adapter)
             .map_err(|_| anyhow::anyhow!("Coordinator rollback-admission store initialized more than once"))?;
         self.rollback_participant_plan_store
             .set(participant_plans)
             .map_err(|_| anyhow::anyhow!("Coordinator rollback participant-plan store initialized more than once"))?;
+        self.rollback_runtime_rebuild_store
+            .set(runtime_rebuild)
+            .map_err(|_| anyhow::anyhow!("Coordinator rollback runtime-rebuild store initialized more than once"))?;
         Ok(())
     }
 
@@ -765,6 +783,17 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
                 "Coordinator rollback participant-plan store was not initialized by Coordinator setup"
             ))
     }
+
+    fn coordinator_rollback_runtime_rebuild(
+        &self,
+    ) -> anyhow::Result<&ScyllaRollbackRuntimeRebuildStore> {
+        self.rollback_runtime_rebuild_store
+            .get()
+            .map(Arc::as_ref)
+            .ok_or_else(|| anyhow::anyhow!(
+                "Coordinator rollback runtime-rebuild store was not initialized by Coordinator setup"
+            ))
+    }
 }
 
 #[async_trait]
@@ -1027,6 +1056,60 @@ where
             checkpoint_tree_height,
         )
         .await
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoordinatorRollbackRuntimeRebuildStore<Hash>
+    for ScyllaCoreStore<Hash, Hasher>
+where
+    Hash: QHashBase + Q256BitHash,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn read_selected_coordinator_runtime_rebuild(
+        &self,
+        network: NetworkId,
+    ) -> anyhow::Result<Option<RollbackRuntimeRebuildDirective<Hash>>> {
+        let head = match self.coordinator_canonical_head()?.read(network).await? {
+            CanonicalHeadReadState::Current(head) => head,
+            CanonicalHeadReadState::Uninitialized => return Ok(None),
+        };
+        Ok(self
+            .coordinator_rollback_runtime_rebuild()?
+            .read_selected_directive(head, psy_data::protocol::chain_context::AuthorityScope::Coordinator)
+            .await?)
+    }
+
+    async fn persist_coordinator_runtime_rebuild_report(
+        &self,
+        directive: RollbackRuntimeRebuildDirective<Hash>,
+        report: RollbackRuntimeRebuildReport<Hash>,
+    ) -> anyhow::Result<()> {
+        let runtime = self.coordinator_rollback_runtime_rebuild()?;
+        let current = match self
+            .coordinator_canonical_head()?
+            .read(directive.target().network_id())
+            .await?
+        {
+            CanonicalHeadReadState::Current(current) => current,
+            CanonicalHeadReadState::Uninitialized => {
+                anyhow::bail!("Coordinator canonical head disappeared during runtime rebuild")
+            }
+        };
+        let selected = runtime
+            .read_selected_directive(
+                current,
+                psy_data::protocol::chain_context::AuthorityScope::Coordinator,
+            )
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Coordinator runtime rebuild directive is missing"))?;
+        if selected != directive {
+            anyhow::bail!("Coordinator runtime rebuild directive changed before report");
+        }
+        runtime
+            .persist_and_revalidate_report(directive, report)
+            .await?;
+        Ok(())
     }
 }
 
