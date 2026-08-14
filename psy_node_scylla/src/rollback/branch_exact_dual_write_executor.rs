@@ -391,6 +391,27 @@ impl ScyllaBranchExactDualWriteAdapter {
         Ok(exact)
     }
 
+    /// Qualification setup for the rollback archive integration test. The
+    /// production archive path remains read-only; this test-only method writes
+    /// the same sealed physical rows that `read_inventory_exact` later selects.
+    #[cfg(test)]
+    pub(crate) async fn qualification_write_inventory_exact<Hash: Q256BitHash>(
+        &self,
+        intent: &BranchExactDualWriteIntent<Hash>,
+        timestamp: CommitWriteTimestampUs,
+    ) -> Result<(), BranchExactDualWriteExecutionError> {
+        if intent.authority() != self.authority {
+            return Err(BranchExactDualWriteExecutionError::AuthorityMismatch);
+        }
+        let rows = ExecutableRows::try_from_inventory(intent, timestamp)?;
+        self.preflight(&rows).await?;
+        for index in 0..rows.mutation_count() {
+            self.execute_one(index, &rows).await?;
+        }
+        self.read_inventory_exact(intent, timestamp).await?;
+        Ok(())
+    }
+
     async fn execute<Hash: Q256BitHash>(
         &self,
         prepared: &super::BranchExactWriterPrepared<Hash>,

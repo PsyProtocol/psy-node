@@ -127,7 +127,7 @@ pub(crate) use coordinator_rollback_runtime_publication::try_publish_restored_ru
 mod rollback_runtime_rebuild_store;
 pub(crate) use rollback_runtime_rebuild_store::ScyllaRollbackRuntimeRebuildStore;
 mod realm_rollback_runtime_control;
-#[cfg(test)]
+#[cfg(all(test, feature = "rf3-test-support"))]
 mod rollback_joint_production_control_scylla;
 pub use realm_rollback_runtime_control::ScyllaRealmRollbackRuntimeControl;
 mod realm_rollback_target_restore_plan;

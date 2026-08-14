@@ -258,16 +258,27 @@ impl ScyllaRealmRollbackPhysicalArchiveOwner {
         authority: AuthorityScope,
         plan: &RollbackParticipantPlan<Hash>,
     ) -> Result<PersistedRealmRollbackParticipantCompletion<Hash>, RealmRollbackPhysicalArchiveOwnerError> {
+        require_realm_in_plan(network, authority, plan)?;
+        let Some(persisted) = self
+            .archive
+            .read_participant_completion_selected::<Hash>(
+                network,
+                plan.target().chain_epoch().get(),
+                authority,
+                *plan.digest(),
+            )
+            .await?
+        else {
+            // The first archive attempt has no completion row yet. Do not
+            // require before-images that can only be written by the caller's
+            // fresh archive path.
+            return Err(RealmRollbackPhysicalArchiveOwnerError::CompletionMissing);
+        };
         let selected = self.select_revalidated_archive(network, authority, plan).await?;
         let expected = completion_from_receipt(&selected)?;
-        let current = self.archive.read_participant_completion_exact(&expected).await?
-            .ok_or(RealmRollbackPhysicalArchiveOwnerError::CompletionMissing)?;
-        if current != expected {
+        if persisted.completion() != &expected {
             return Err(RealmRollbackPhysicalArchiveOwnerError::CompletionChanged);
         }
-        let persisted = PersistedRealmRollbackParticipantCompletion::from_recovered(
-            *self.archive.fingerprint(), current,
-        );
         let after = self.select_revalidated_archive(network, authority, plan).await?;
         if after != selected {
             return Err(RealmRollbackPhysicalArchiveOwnerError::ParticipantReceiptChanged);

@@ -1,14 +1,15 @@
-//! Single-node production-store composition smoke test for the delete-only
-//! rollback control plane.  Physical archive/delete execution is deliberately
-//! left to the next slice; this test closes the durable request-selection seam
-//! shared by Coordinator and every configured Realm.
+//! Single-node production-store composition test for the delete-only rollback
+//! control plane. It covers durable request selection plus one Realm's exact
+//! physical archive and recovery. Physical deletion remains a later slice.
 
 use std::sync::Arc;
 
 use anyhow::{bail, ensure};
 use parth_core::{
+    crypto::hash::tag_tree::TagTreeMerkleProof,
     data::db::table::QDatabaseTableRoutingKey,
     pgoldilocks::PoseidonHasher,
+    protocol::core_types::{QNetworkHashTypes, QNetworkTreeConstants},
     PHash, PF,
 };
 use psy_data::protocol::{
@@ -17,11 +18,23 @@ use psy_data::protocol::{
         CheckpointRef, NetworkId,
     },
     chain_context::AuthorityScope,
+    chain_context::{
+        AuthorityObservation, AuthorityStateCheckpointId, AuthorityStateRoot,
+    },
 };
 use psy_node_core::store::{
+    authority_commit::AuthorityTimestampKey,
+    authority_local_head::{
+        AuthorityLocalHeadBootstrap, AuthorityLocalHeadBootstrapReason,
+        AuthorityStorageBindingGeneration, AuthorityStorageBindingRef,
+        AuthorityStorageNamespaceId,
+    },
+    branch_exact_dual_write::BranchExactDualWriteIntent,
+    branch_pending_mapping::BranchPendingMapping,
     branch_exact_schema::BranchExactSchemaMaterializationPlan,
     canonical_head::{
         CanonicalHeadBootstrap, CanonicalHeadBootstrapProfile,
+        CanonicalHeadReadState, CoordinatorCanonicalHeadReader,
         CoordinatorCanonicalHeadStore,
     },
     rollback_admin::{
@@ -33,13 +46,28 @@ use psy_node_core::store::{
     },
     rollback_participant_maintenance::{
         CoordinatorRollbackGlobalProgress, CoordinatorRollbackMaintenanceExecutor,
+        CoordinatorRollbackMaintenanceOutcome,
     },
     rollback_participant_plan::RollbackRealmParticipant,
     rollback_runtime_rebuild::{
         RealmRollbackParticipantProgress, RealmRollbackRuntimeControl,
     },
+    rollback_control::RollbackControlState,
     rollback_topology::RollbackTopologySnapshot,
+    manifest_lifecycle::AuthorityHeadView,
+    manifest_record::AuthorityManifestDigest,
+    pending_generation::{ProcNamespacePrefix, ReservedPendingGeneration},
+    pending_generation_identity::{
+        PendingGenerationActivationDigest, PendingGenerationBootstrapReason,
+        PendingGenerationContext, PendingGenerationLedgerKey,
+    },
+    pending_generation_pipeline::{
+        PendingPipelineBootstrap, PendingPipelineIntentDigest,
+        PendingPublishReceiptDigest, PendingQueueCloseIntentDigest,
+        PendingWorkCaptureDigest, StoredPendingPipeline,
+    },
     timestamp::{CommitWriteTimestampUs, TimestampFenceWindow},
+    typed::{ProcCheckpointUniqueId, UniquePendingId},
 };
 
 use crate::core::ScyllaCoreStore;
@@ -71,6 +99,36 @@ const REALM_10_KEYSPACE: &str = "psy_rollback_joint_control_realm_10";
 const REALM_20_KEYSPACE: &str = "psy_rollback_joint_control_realm_20";
 const NODE: &str = "172.29.86.11:9042";
 
+#[derive(Clone, Copy)]
+struct RealmRollbackTestNetwork;
+
+impl QNetworkTreeConstants for RealmRollbackTestNetwork {
+    const CHECKPOINT_TREE_HEIGHT_USIZE: usize = 32;
+    const CHECKPOINT_TREE_HEIGHT: u8 = 32;
+    const GLOBAL_USER_TREE_HEIGHT_USIZE: usize = 32;
+    const GLOBAL_USER_TREE_HEIGHT: u8 = 32;
+    const GLOBAL_CONTRACT_TREE_HEIGHT_USIZE: usize = 24;
+    const GLOBAL_CONTRACT_TREE_HEIGHT: u8 = 24;
+    const CONTRACT_FUNCTION_TREE_HEIGHT_USIZE: usize = 16;
+    const CONTRACT_FUNCTION_TREE_HEIGHT: u8 = 16;
+    const COORDINATOR_GLOBAL_USER_TREE_HEIGHT_USIZE: usize = 12;
+    const COORDINATOR_GLOBAL_USER_TREE_HEIGHT: u8 = 12;
+    const REALM_GLOBAL_USER_TREE_HEIGHT_USIZE: usize = 20;
+    const REALM_GLOBAL_USER_TREE_HEIGHT: u8 = 20;
+    const MAX_CONTRACT_STATE_TREE_HEIGHT_USIZE: usize = 32;
+    const MAX_CONTRACT_STATE_TREE_HEIGHT: u8 = 32;
+    const GROUP_REALM_HEIGHT: u8 = 1;
+    const MAX_USERS: u64 = 1 << 32;
+    const MAX_REALMS: u32 = 1 << 12;
+    const MAX_USERS_PER_REALM: u32 = 1 << 20;
+}
+
+impl QNetworkHashTypes for RealmRollbackTestNetwork {
+    type QHash = PHash;
+    type HasherBase = PoseidonHasher;
+    type F = PF;
+}
+
 fn network() -> NetworkId {
     NetworkId::try_from_chain_id(1).expect("test network")
 }
@@ -89,6 +147,126 @@ fn chain(checkpoint: u64, seed: u8) -> CanonicalChainRef<PHash> {
             CheckpointHash::from_last_chain_hash(hash(seed)),
         ),
     )
+}
+
+fn realm_chain(checkpoint: u64, seed: u8) -> CanonicalChainRef<PHash> {
+    CanonicalChainRef::new(
+        network(),
+        // One explicit rollback request is epoch-scoped across Coordinator and
+        // all Realm participants. Individual Realm state roots may differ,
+        // but their committed history must belong to the selected epoch.
+        ChainEpoch::new(0),
+        CheckpointRef::new(
+            CheckpointId::new(checkpoint),
+            CheckpointHash::from_last_chain_hash(hash(seed)),
+        ),
+    )
+}
+
+fn realm_observation(
+    authority: AuthorityScope,
+    checkpoint: u64,
+    seed: u8,
+) -> anyhow::Result<AuthorityObservation<PHash>> {
+    Ok(AuthorityObservation::try_new(
+        realm_chain(checkpoint, seed),
+        authority,
+        AuthorityStateCheckpointId::new(checkpoint),
+        AuthorityStateRoot::from_local_state_root(hash(seed.wrapping_add(0x20))),
+    )?)
+}
+
+fn realm_commit_models(
+    authority: AuthorityScope,
+    checkpoint: u64,
+    pending: u64,
+    timestamp: i64,
+    seed: u8,
+) -> anyhow::Result<(
+    BranchExactDualWriteIntent<PHash>,
+    CommitWriteTimestampUs,
+    psy_node_core::store::authority_local_head::StoredAuthorityLocalHead<PHash>,
+    StoredPendingPipeline<PHash>,
+    AuthorityLocalHeadBootstrap<PHash>,
+)> {
+    let predecessor = BranchPendingMapping::new(
+        realm_chain(checkpoint - 1, seed.wrapping_sub(1)),
+        UniquePendingId::try_new(pending - 1)?,
+    );
+    let candidate = BranchPendingMapping::new(
+        realm_chain(checkpoint, seed),
+        UniquePendingId::try_new(pending)?,
+    );
+    let intent = BranchExactDualWriteIntent::try_realm(
+        authority,
+        predecessor,
+        candidate,
+        ProcCheckpointUniqueId::from_u128(10_000 + u128::from(pending)),
+        &TagTreeMerkleProof::<PHash>::new_empty(),
+    )?;
+    let timestamp = CommitWriteTimestampUs::try_from_i128(timestamp as i128)?;
+    let observation = realm_observation(authority, checkpoint, seed)?;
+    let head_bootstrap = AuthorityLocalHeadBootstrap::seal(
+        AuthorityLocalHeadBootstrapReason::GenesisNative,
+        AuthorityHeadView::try_from_observed(
+            AuthorityTimestampKey::new(network(), authority),
+            *observation.chain(),
+            observation.state_checkpoint_id(),
+            *observation.state_root(),
+        )?,
+        timestamp,
+        AuthorityManifestDigest::from_persisted([seed.max(1); 32]),
+        AuthorityStorageBindingRef::new(
+            AuthorityStorageBindingGeneration::try_new(1)?,
+            AuthorityStorageNamespaceId::from_verified_namespace_id([0xB1; 32]),
+        ),
+    );
+    let head = head_bootstrap.candidate().clone();
+
+    let key = PendingGenerationLedgerKey::new(network(), authority);
+    let prefix = ProcNamespacePrefix::for_authority(network(), authority);
+    let context = |value: u64| {
+        PendingGenerationContext::try_from_legacy(
+            value,
+            (prefix.get() as u128) << 64 | u128::from(value),
+        )
+    };
+    let bootstrap = PendingPipelineBootstrap::try_new(
+        key,
+        PendingGenerationActivationDigest::try_new([0xA5; 32])?,
+        prefix,
+        PendingGenerationBootstrapReason::LegacyActivation,
+        context(pending - 1)?,
+        context(pending)?,
+        realm_observation(authority, checkpoint - 1, seed.wrapping_sub(1))?,
+        pending - 1,
+    )?;
+    let ready = bootstrap
+        .candidate()
+        .seal_rotation(ReservedPendingGeneration::qualification_from_prefix(
+            pending + 1,
+            prefix,
+        )?)?
+        .candidate()
+        .clone();
+    let close = PendingQueueCloseIntentDigest::try_new([seed.wrapping_add(1); 32])?;
+    let capture = PendingWorkCaptureDigest::try_new([seed.wrapping_add(2); 32])?;
+    let processing = PendingPipelineIntentDigest::try_new([seed.wrapping_add(3); 32])?;
+    let sealing = ready.seal_begin_queue_close(close)?.candidate().clone();
+    let captured = sealing.seal_capture_work(close, capture)?.candidate().clone();
+    let inflight = captured
+        .seal_begin_processing(capture, processing)?
+        .candidate()
+        .clone();
+    let pipeline = inflight
+        .seal_publish(
+            processing,
+            PendingPublishReceiptDigest::try_new([seed.wrapping_add(4); 32])?,
+            observation,
+        )?
+        .candidate()
+        .clone();
+    Ok((intent, timestamp, head, pipeline, head_bootstrap))
 }
 
 fn routing_key(table_id: u64) -> QDatabaseTableRoutingKey {
@@ -126,6 +304,15 @@ async fn establish_realm_branch_ready(
     store: &ScyllaCoreStore<PHash, PoseidonHasher>,
     authority: AuthorityScope,
 ) -> anyhow::Result<()> {
+    // The physical archive reader prepares the complete Realm table catalog,
+    // just as a production node does.  Build that existing production schema
+    // rather than a reduced test-only subset; only the narrow rows seeded
+    // below become part of this qualification fixture's committed inventory.
+    crate::psy_setup::setup_psy_scylla_database_store::<RealmRollbackTestNetwork>(
+        Arc::new(store.clone()),
+    )
+    .await?;
+
     let bootstrap = CanonicalHeadBootstrap::try_new(
         CanonicalHeadBootstrapProfile::GenesisNative,
         chain(0, 0xA0),
@@ -384,5 +571,128 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
         .await?,
         CoordinatorRollbackGlobalProgress::Progressed(current) if current == requested
     ));
+
+    // The archive preparer durably advances the shared control row before it
+    // selects any participant data. With no committed Realm inventory in this
+    // control-only fixture, both production Realm controls must enter the
+    // archive path and fail closed instead of publishing a completion.
+    ensure!(
+        <ScyllaCoreStore<PHash, PoseidonHasher> as CoordinatorRollbackMaintenanceExecutor<
+            PF,
+            PHash,
+        >>::prepare_coordinator_archive(&coordinator, network(), 32)
+        .await
+        .is_err(),
+        "control-only fixture must not fabricate Coordinator archive readiness"
+    );
+    let CanonicalHeadReadState::Current(archiving) = coordinator
+        .read_canonical_head(network())
+        .await?
+    else {
+        bail!("Coordinator canonical head disappeared after archive transition")
+    };
+    ensure!(
+        matches!(archiving.rollback_control(), RollbackControlState::Archiving(_)),
+        "archive preparation must durably enter ARCHIVING before selecting data"
+    );
+    ensure!(
+        !matches!(
+            <ScyllaCoreStore<PHash, PoseidonHasher> as CoordinatorRollbackMaintenanceExecutor<
+                PF,
+                PHash,
+            >>::prepare_coordinator_archive(&coordinator, network(), 32)
+            .await,
+            Ok(CoordinatorRollbackMaintenanceOutcome::ArchivePrepared(_))
+        ),
+        "retry without committed sources must not fabricate archive readiness"
+    );
+    for (control, authority) in [
+        (&realm_10, AuthorityScope::Realm { realm_id: 10, realm_sub_id: 0 }),
+        (&realm_20, AuthorityScope::Realm { realm_id: 20, realm_sub_id: 0 }),
+    ] {
+        ensure!(
+            <ScyllaRealmRollbackRuntimeControl as RealmRollbackRuntimeControl<
+                PHash,
+            >>::progress_realm_rollback_participant(
+                control, network(), authority,
+            )
+            .await
+            .is_err(),
+            "ARCHIVING Realm without committed inventory must fail closed"
+        );
+    }
+
+    // Seed only Realm 10 with a small canonical committed history. The setup
+    // is qualification-only, but the archive selection, physical reads,
+    // immutable writes, exact second pass, completion, and restart recovery
+    // below all use the production runtime control.
+    let realm_10_authority = AuthorityScope::Realm {
+        realm_id: 10,
+        realm_sub_id: 0,
+    };
+    let mut commits = Vec::new();
+    let mut source_bootstrap = None;
+    for checkpoint in 1_u64..=3 {
+        let (intent, timestamp, head, pipeline, bootstrap) = realm_commit_models(
+            realm_10_authority,
+            checkpoint,
+            100 + checkpoint,
+            1_000 + checkpoint as i64,
+            0xC0 + checkpoint as u8,
+        )?;
+        commits.push((intent, timestamp, head, pipeline));
+        if checkpoint == 3 {
+            source_bootstrap = Some(bootstrap);
+        }
+    }
+    realm_10
+        .qualification_seed_narrow_commit_history(
+            commits,
+            source_bootstrap
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("source bootstrap missing"))?,
+        )
+        .await?;
+    let RealmRollbackParticipantProgress::ArchivePrepared {
+        entry_count,
+        ..
+    } = <ScyllaRealmRollbackRuntimeControl as RealmRollbackRuntimeControl<
+        PHash,
+    >>::progress_realm_rollback_participant(
+        &realm_10, network(), realm_10_authority,
+    )
+    .await?
+    else {
+        bail!("Realm 10 did not publish an exact archive completion")
+    };
+    ensure!(entry_count > 0, "Realm archive must contain physical rows");
+    let RealmRollbackParticipantProgress::ArchivePrepared {
+        entry_count: recovered_count,
+        ..
+    } = <ScyllaRealmRollbackRuntimeControl as RealmRollbackRuntimeControl<
+        PHash,
+    >>::progress_realm_rollback_participant(
+        &realm_10, network(), realm_10_authority,
+    )
+    .await?
+    else {
+        bail!("Realm 10 archive completion did not recover after reopen")
+    };
+    ensure!(
+        recovered_count == entry_count,
+        "recovered Realm archive selected a different physical dataset"
+    );
+    ensure!(
+        <ScyllaRealmRollbackRuntimeControl as RealmRollbackRuntimeControl<
+            PHash,
+        >>::progress_realm_rollback_participant(
+            &realm_20,
+            network(),
+            AuthorityScope::Realm { realm_id: 20, realm_sub_id: 0 },
+        )
+        .await
+        .is_err(),
+        "unseeded Realm must remain fail closed after another Realm completes"
+    );
     Ok(())
 }

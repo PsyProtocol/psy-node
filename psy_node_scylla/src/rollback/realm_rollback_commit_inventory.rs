@@ -155,6 +155,29 @@ impl<Hash: Q256BitHash> RealmRollbackCommitInventory<Hash> {
         Ok(decoded)
     }
 
+    /// Qualification-only constructor for exercising the production archive
+    /// owner with a small canonical narrow-write history. It does not create
+    /// a COMMITTED marker and is unavailable outside test builds.
+    #[cfg(test)]
+    pub(crate) fn qualification_from_narrow(
+        narrow_intent: BranchExactDualWriteIntent<Hash>,
+        timestamp: CommitWriteTimestampUs,
+    ) -> Result<Self, RealmRollbackCommitInventoryError> {
+        let mut hasher = Sha256::new();
+        hasher.update(b"psy.rollback.qualification-narrow-inventory.v1\0");
+        hasher.update(narrow_intent.intent_digest().as_bytes());
+        let coverage_digest = hasher.finalize().into();
+        let total_mutation_count = u64::try_from(narrow_intent.mutations().len())
+            .map_err(|_| RealmRollbackCommitInventoryError::CountOutOfRange)?;
+        Self::try_from_parts(
+            narrow_intent,
+            timestamp,
+            coverage_digest,
+            total_mutation_count,
+            Vec::new(),
+        )
+    }
+
     fn try_from_parts(
         narrow_intent: BranchExactDualWriteIntent<Hash>,
         timestamp: CommitWriteTimestampUs,

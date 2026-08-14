@@ -149,6 +149,43 @@ impl ScyllaRealmRollbackRuntimeControl {
         .await?)
     }
 
+    /// Qualification setup only: persist a small canonical Realm commit
+    /// history so the production archive owner can be exercised without
+    /// duplicating the full Processor writer fixture in this integration test.
+    #[cfg(test)]
+    pub(crate) async fn qualification_seed_narrow_commit_history<
+        Hash: Q256BitHash,
+    >(
+        &self,
+        commits: Vec<(
+            psy_node_core::store::branch_exact_dual_write::BranchExactDualWriteIntent<Hash>,
+            psy_node_core::store::timestamp::CommitWriteTimestampUs,
+            psy_node_core::store::authority_local_head::StoredAuthorityLocalHead<Hash>,
+            psy_node_core::store::pending_generation_pipeline::StoredPendingPipeline<Hash>,
+        )>,
+        source_head: &psy_node_core::store::authority_local_head::AuthorityLocalHeadBootstrap<Hash>,
+    ) -> anyhow::Result<()> {
+        let narrow = ScyllaBranchExactDualWriteAdapter::prepare(
+            self.session.clone(),
+            &self.branch_exact_ready,
+        )
+        .await?;
+        for (intent, timestamp, head, pipeline) in commits {
+            narrow
+                .qualification_write_inventory_exact(&intent, timestamp)
+                .await?;
+            let inventory = super::realm_rollback_commit_inventory::RealmRollbackCommitInventory::qualification_from_narrow(
+                intent,
+                timestamp,
+            )?;
+            self.local_inventory
+                .qualification_persist_committed(inventory, &head, &pipeline)
+                .await?;
+        }
+        self.local_head.bootstrap(source_head).await?;
+        Ok(())
+    }
+
     async fn prepare_delete_executor(
         &self,
     ) -> anyhow::Result<ScyllaRealmRollbackDeleteRestoreExecutor> {

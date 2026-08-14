@@ -211,6 +211,51 @@ impl<Hash: Q256BitHash> RealmRollbackCommittedMarker<Hash> {
         Ok(marker)
     }
 
+    #[cfg(test)]
+    fn qualification_from_selected_state(
+        store_fingerprint: RealmRollbackCommitInventoryStoreFingerprint,
+        inventory: &RealmRollbackCommitInventory<Hash>,
+        head: &StoredAuthorityLocalHead<Hash>,
+        pipeline: &StoredPendingPipeline<Hash>,
+    ) -> Result<Self, RealmRollbackCommitInventoryStoreError> {
+        if head.head().key().authority() != inventory.authority()
+            || head.head().chain() != inventory.candidate().canonical_chain()
+            || head.commit_write_timestamp() != inventory.timestamp()
+            || pipeline.key().authority() != inventory.authority()
+            || pipeline.frontier().chain() != inventory.candidate().canonical_chain()
+            || pipeline.processing().pending_id() != inventory.candidate().pending_id()
+            || !matches!(pipeline.processing_state(), PendingProcessingState::Published { .. })
+        {
+            return Err(RealmRollbackCommitInventoryStoreError::SourceMismatch);
+        }
+        let manifest_digest = *head.manifest_digest().as_bytes();
+        let mut slot_hasher = Sha256::new();
+        slot_hasher.update(b"psy.rollback.qualification-manifest-slot.v1\0");
+        slot_hasher.update(inventory.digest());
+        let mut marker = Self {
+            inventory_slot: inventory.slot(),
+            inventory_digest: *inventory.digest(),
+            manifest_slot: slot_hasher.finalize().into(),
+            manifest_digest,
+            candidate: *inventory.candidate(),
+            timestamp: inventory.timestamp().as_i64(),
+            coverage_digest: *inventory.coverage_digest(),
+            total_mutation_count: inventory.total_mutation_count(),
+            head_revision: head.revision().get(),
+            head_payload: head.encode_canonical().to_vec(),
+            pipeline_revision: pipeline.revision().get(),
+            pipeline_payload: pipeline.canonical_payload().to_vec(),
+            writer_revision: 1,
+            marker_payload: Vec::new(),
+            digest: [0; 32],
+        };
+        marker.marker_payload = encode_marker(store_fingerprint, &marker)?;
+        marker.digest = marker.marker_payload[marker.marker_payload.len() - 32..]
+            .try_into()
+            .expect("marker codec appends digest");
+        Ok(marker)
+    }
+
     fn decode_persisted(
         store_fingerprint: RealmRollbackCommitInventoryStoreFingerprint,
         inventory: &RealmRollbackCommitInventory<Hash>,
@@ -630,6 +675,54 @@ impl ScyllaRealmRollbackCommitInventoryStore {
         if current != marker { return Err(RealmRollbackCommitInventoryStoreError::Conflict); }
         self.revalidate_prewrite(inventory).await?;
         Ok(PersistedRealmRollbackCommittedReceipt { store_fingerprint: self.fingerprint, marker: current })
+    }
+
+    /// Test-only setup for a canonical committed inventory. It deliberately
+    /// bypasses normal manifest/writer provenance, while retaining the exact
+    /// marker codec and LWT/readback used by production archive selection.
+    #[cfg(test)]
+    pub(crate) async fn qualification_persist_committed<Hash: Q256BitHash>(
+        &self,
+        inventory: RealmRollbackCommitInventory<Hash>,
+        head: &StoredAuthorityLocalHead<Hash>,
+        pipeline: &StoredPendingPipeline<Hash>,
+    ) -> Result<(), RealmRollbackCommitInventoryStoreError> {
+        let persisted = self.persist_prewrite(inventory).await?;
+        let marker = RealmRollbackCommittedMarker::qualification_from_selected_state(
+            self.fingerprint,
+            persisted.inventory(),
+            head,
+            pipeline,
+        )?;
+        let key = marker_key(persisted.inventory().authority(), marker.candidate())?;
+        let execution = self
+            .session
+            .execute_unpaged(
+                &self.insert_marker,
+                (
+                    key.network_chain_id,
+                    key.authority_kind,
+                    key.realm_id,
+                    key.realm_sub_id,
+                    key.chain_epoch,
+                    key.checkpoint_id,
+                    ROW_REVISION,
+                    marker.inventory_slot.as_bytes().as_slice(),
+                    marker.marker_payload.as_slice(),
+                ),
+            )
+            .await
+            .map_err(cql)?;
+        let _ = decode_applied(execution)?;
+        let current = self
+            .read_marker(persisted.inventory())
+            .await?
+            .ok_or(RealmRollbackCommitInventoryStoreError::MissingAfterWrite)?;
+        if current != marker {
+            return Err(RealmRollbackCommitInventoryStoreError::Conflict);
+        }
+        self.revalidate_prewrite(&persisted).await?;
+        Ok(())
     }
 
     async fn read_marker<Hash: Q256BitHash>(

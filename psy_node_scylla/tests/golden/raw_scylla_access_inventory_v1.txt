@@ -97,7 +97,7 @@ psy_node_scylla/src/rollback/realm_processor_external_dependency_loader.rs|Durab
 psy_node_scylla/src/rollback/realm_processor_external_dependency_projection.rs|DurableControlAuthority|2|0|0|0|0|0|0|0
 psy_node_scylla/src/rollback/realm_processor_generation_terminal.rs|DurableControlAuthority|6|0|3|5|2|3|1|8
 psy_node_scylla/src/rollback/realm_processor_terminal_authorization.rs|DurableControlAuthority|3|0|2|0|0|0|0|0
-psy_node_scylla/src/rollback/realm_rollback_commit_inventory_store.rs|DurableControlAuthority|6|0|6|8|1|6|2|8
+psy_node_scylla/src/rollback/realm_rollback_commit_inventory_store.rs|DurableControlAuthority|6|0|7|8|1|7|2|8
 psy_node_scylla/src/rollback/realm_rollback_delete_completion.rs|DurableControlAuthority|0|0|0|0|0|0|0|2
 psy_node_scylla/src/rollback/realm_rollback_delete_restore_executor.rs|DurableControlAuthority|10|0|19|7|1|21|0|5
 psy_node_scylla/src/rollback/realm_rollback_physical_archive_owner.rs|DurableControlAuthority|4|0|1|0|0|0|0|0
