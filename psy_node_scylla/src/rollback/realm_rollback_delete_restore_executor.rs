@@ -203,20 +203,27 @@ impl ScyllaRealmRollbackDeleteRestoreExecutor {
         self.require_local_head(selected.completion().completion().source_head()).await?;
 
         let delete_fence = plan.fence_window().delete_fence().as_i64();
+        let target_checkpoint = CheckpointId::try_new(
+            plan.target().checkpoint().checkpoint_id().get(),
+        ).map_err(|_| RealmRollbackDeleteRestoreExecutorError::TargetCheckpointOutOfRange)?;
+        let new_branch = plan.fence_window().new_branch_write();
         for entry in selected.catalog().entries() {
             let image = self.read_image(authority, &selected, entry).await?;
             if image.source().writetime_us() >= delete_fence {
                 return Err(RealmRollbackDeleteRestoreExecutorError::FenceNotAfterSource);
+            }
+            if entry.action() == RealmRollbackPhysicalAction::ArchiveThenRestoreTarget
+                && self
+                    .is_restored_image(entry, target_checkpoint, new_branch)
+                    .await
+            {
+                continue;
             }
             self.delete_image(entry, &image, delete_fence).await?;
         }
         self.require_deleting_head(authority).await?;
         self.require_local_head(selected.completion().completion().source_head()).await?;
 
-        let target_checkpoint = CheckpointId::try_new(
-            plan.target().checkpoint().checkpoint_id().get(),
-        ).map_err(|_| RealmRollbackDeleteRestoreExecutorError::TargetCheckpointOutOfRange)?;
-        let new_branch = plan.fence_window().new_branch_write();
         for entry in selected.catalog().entries() {
             if entry.action() != RealmRollbackPhysicalAction::ArchiveThenRestoreTarget {
                 continue;
@@ -276,10 +283,15 @@ impl ScyllaRealmRollbackDeleteRestoreExecutor {
         selected: &SelectedRealmRollbackPostBarrierArchive<Hash>,
     ) -> Result<(), RealmRollbackDeleteRestoreExecutorError> {
         let completion = selected.completion().completion();
+        let local_target = completion.target();
+        let global_target = authority.barrier().target();
         if completion.authority() != realm
             || completion.participant_plan_digest()
                 != authority.barrier().participant_plan_digest()
-            || completion.target() != authority.barrier().target()
+            || local_target.network_id() != global_target.network_id()
+            || local_target.chain_epoch() != global_target.chain_epoch()
+            || local_target.checkpoint().checkpoint_id()
+                != global_target.checkpoint().checkpoint_id()
             || completion.catalog_digest() != selected.catalog().digest()
             || completion.archive_store_fingerprint() != self.archive.fingerprint()
             || completion.entry_count()
@@ -381,6 +393,44 @@ impl ScyllaRealmRollbackDeleteRestoreExecutor {
             None => return Err(RealmRollbackDeleteRestoreExecutorError::MissingTargetRestore),
         }
         Ok(())
+    }
+
+    /// A retry runs after target rows may already have been restored at the
+    /// post-fence timestamp. The older delete fence cannot and must not erase
+    /// those rows; recognize their exact typed state before attempting the
+    /// suffix delete again.
+    async fn is_restored_image(
+        &self,
+        entry: &RealmRollbackPhysicalCatalogEntry,
+        target_checkpoint: CheckpointId,
+        timestamp: psy_node_core::store::timestamp::NewBranchWriteTimestampUs,
+    ) -> bool {
+        let Some(current) = entry.current_put() else {
+            return false;
+        };
+        match entry.target_restore() {
+            Some(RealmRollbackTargetRestore::ExactPut(target)) => {
+                let Ok(resealed) = reseal_target_put(target, timestamp) else {
+                    return false;
+                };
+                self.typed
+                    .read_inventory_put_physical_exact(&self.session, &resealed)
+                    .await
+                    .is_ok()
+            }
+            Some(RealmRollbackTargetRestore::ImtCursorBefore(value)) => self
+                .typed
+                .require_imt_cursor_exact(
+                    &self.session,
+                    current,
+                    target_checkpoint,
+                    *value,
+                    timestamp,
+                )
+                .await
+                .is_ok(),
+            None => false,
+        }
     }
 
     async fn require_post_state<Hash: Q256BitHash>(

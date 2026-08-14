@@ -458,7 +458,10 @@ impl ScyllaRealmRollbackPhysicalArchiveStore {
         participant: &PersistedRealmRollbackParticipantCompletion<Hash>,
     ) -> Result<Option<PersistedRealmRollbackDeleteCompletion<Hash>>, RealmRollbackPhysicalArchiveStoreError> {
         if participant.store_fingerprint != self.fingerprint
-            || participant.completion.target() != deleting.participant_plan().target()
+            || !same_rollback_coordinate(
+                participant.completion.target(),
+                deleting.participant_plan().target(),
+            )
             || participant.completion.participant_plan_digest()
                 != deleting.participant_plan().digest()
         {
@@ -821,6 +824,20 @@ impl ScyllaRealmRollbackPhysicalArchiveStore {
     }
 }
 
+/// Coordinator and Realm checkpoint hashes commit different state roots. A
+/// global rollback therefore aligns participants by network, epoch, and
+/// checkpoint height; requiring the Realm-local hash to equal the Coordinator
+/// hash would reject every valid multi-authority rollback.
+fn same_rollback_coordinate<Hash>(
+    realm: &psy_data::protocol::canonical_chain::CanonicalChainRef<Hash>,
+    coordinator: &psy_data::protocol::canonical_chain::CanonicalChainRef<Hash>,
+) -> bool {
+    realm.network_id() == coordinator.network_id()
+        && realm.chain_epoch() == coordinator.chain_epoch()
+        && realm.checkpoint().checkpoint_id()
+            == coordinator.checkpoint().checkpoint_id()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ArchiveCoordinates {
     network: i64,
@@ -1084,7 +1101,29 @@ impl Error for RealmRollbackPhysicalArchiveStoreError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{archive_fragments, reconstruct_fragments};
+    use parth_core::PHash;
+    use psy_data::protocol::canonical_chain::{
+        CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId,
+        CheckpointRef, NetworkId,
+    };
+
+    use super::{archive_fragments, reconstruct_fragments, same_rollback_coordinate};
+
+    fn chain(checkpoint: u64, seed: u64) -> CanonicalChainRef<PHash> {
+        CanonicalChainRef::new(
+            NetworkId::try_from_chain_id(1).unwrap(),
+            ChainEpoch::new(7),
+            CheckpointRef::new(
+                CheckpointId::new(checkpoint),
+                CheckpointHash::from_last_chain_hash(PHash::from_values(
+                    seed,
+                    seed + 1,
+                    seed + 2,
+                    seed + 3,
+                )),
+            ),
+        )
+    }
 
     #[test]
     fn fragments_are_bounded_ordered_and_exact() {
@@ -1094,6 +1133,22 @@ mod tests {
         assert_eq!(fragments.len(), 2);
         fragments.reverse();
         assert_eq!(reconstruct_fragments(fragments, &digest).unwrap(), bytes);
+    }
+
+    #[test]
+    fn global_rollback_aligns_realm_and_coordinator_by_checkpoint_coordinate() {
+        let coordinator = chain(9, 10);
+        let realm = chain(9, 20);
+        assert!(same_rollback_coordinate(&realm, &coordinator));
+        assert!(!same_rollback_coordinate(&chain(8, 20), &coordinator));
+        assert!(!same_rollback_coordinate(
+            &CanonicalChainRef::new(
+                NetworkId::try_from_chain_id(1).unwrap(),
+                ChainEpoch::new(8),
+                *realm.checkpoint(),
+            ),
+            &coordinator,
+        ));
     }
 
     #[test]

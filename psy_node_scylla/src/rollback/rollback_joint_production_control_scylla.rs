@@ -4,10 +4,13 @@
 
 use std::sync::Arc;
 
-use anyhow::{bail, ensure};
+use anyhow::{Context, bail, ensure};
 use parth_core::{
-    crypto::hash::tag_tree::TagTreeMerkleProof,
-    data::db::table::QDatabaseTableRoutingKey,
+    crypto::hash::{
+        merkle_proof::DeltaMerkleProofCore,
+        tag_tree::TagTreeMerkleProof,
+        traits::{MerkleZeroHasher, QFieldHashable, ZeroableHash},
+    },
     pgoldilocks::PoseidonHasher,
     protocol::core_types::{QNetworkHashTypes, QNetworkTreeConstants},
     PHash, PF,
@@ -15,11 +18,24 @@ use parth_core::{
 use psy_data::protocol::{
     canonical_chain::{
         CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId,
-        CheckpointRef, NetworkId,
+        CheckpointRef, NetworkId, checkpoint_hash_from_previous,
     },
     chain_context::AuthorityScope,
     chain_context::{
         AuthorityObservation, AuthorityStateCheckpointId, AuthorityStateRoot,
+    },
+};
+use psy_data::{
+    prepared_block::{
+        common::PsyCoordinatorPendingCheckpointBase,
+        coordinator::PsyPreparedCoordinatorBlockStateUpdates,
+    },
+    v1::qdata::{
+        checkpoint::{
+            PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeafStats,
+            QEDL2BlockState,
+        },
+        populated_checkpoint::PsyCheckpointLeafPopulated,
     },
 };
 use psy_node_core::store::{
@@ -34,8 +50,12 @@ use psy_node_core::store::{
     branch_exact_schema::BranchExactSchemaMaterializationPlan,
     canonical_head::{
         CanonicalHeadBootstrap, CanonicalHeadBootstrapProfile,
-        CanonicalHeadReadState, CoordinatorCanonicalHeadReader,
-        CoordinatorCanonicalHeadStore,
+        CanonicalHeadReadState, CanonicalHeadTransition,
+        CoordinatorCanonicalHeadReader, CoordinatorCanonicalHeadStore,
+    },
+    coordinator_commit_source::{
+        CoordinatorCommitSource, CoordinatorCommitSourcePayload,
+        CoordinatorCommitSourceStore,
     },
     rollback_admin::{
         CoordinatorRollbackAdminInbox, RollbackAdminInboxAccess,
@@ -69,13 +89,10 @@ use psy_node_core::store::{
     timestamp::{CommitWriteTimestampUs, TimestampFenceWindow},
     typed::{ProcCheckpointUniqueId, UniquePendingId},
 };
+use psy_serialize::PsyIOReadWrite;
+use scylla::statement::Consistency;
 
 use crate::core::ScyllaCoreStore;
-use crate::tables::{
-    object::ScyllaGenericKeyIdValueTablePreparedStatements,
-    u64_table::ScyllaU64ToU64TablePreparedStatements,
-};
-
 use super::{
     AuthorityLocalHeadNoTabletKeyspace, BranchExactBackfillPlan,
     BranchExactBackfillReadbackObservation, BranchExactDeploymentIntent,
@@ -87,12 +104,17 @@ use super::{
     BranchExactSchemaMaterializer, BranchExactSchemaSetupMode,
     BranchExactSchemaSetupRequest, BranchExactScyllaNodeId,
     BranchExactScyllaSchemaVersion, BranchExactTopologyAttestation,
-    BranchExactVerifiedDeploymentReceipt, CqlKeyspaceName,
+    BranchExactVerifiedDeploymentReceipt, BranchExactCutoverPhase,
+    BranchExactWriterCutoverFence, BranchExactWriterPrepared, CqlKeyspaceName,
     PendingQueueSidecarKeyspaces, PendingQueueSidecarSchemaMaterializer,
     ScyllaAuthorityLocalHeadStore, ScyllaBranchExactDeploymentLifecycleStore,
     ScyllaRealmRollbackRuntimeControl, SealedBranchExactBackfillPlanCas,
     SealedBranchExactBackfillVerifiedCas, SealedBranchExactSchemaVerifiedCas,
 };
+use super::branch_exact_dual_write_executor::ScyllaBranchExactDualWriteAdapter;
+use super::coordinator_commit_physical_execution::CoordinatorCommitPhysicalExecutionSchedule;
+use super::coordinator_commit_physical_scylla::CoordinatorCommitPhysicalScyllaExecutor;
+use super::coordinator_commit_physical_write_plan::CoordinatorCommitPhysicalWritePlan;
 
 const COORDINATOR_KEYSPACE: &str = "psy_rollback_joint_control";
 const REALM_10_KEYSPACE: &str = "psy_rollback_joint_control_realm_10";
@@ -147,6 +169,129 @@ fn chain(checkpoint: u64, seed: u8) -> CanonicalChainRef<PHash> {
             CheckpointHash::from_last_chain_hash(hash(seed)),
         ),
     )
+}
+
+fn coordinator_leaf(seed: u8) -> PsyCheckpointLeafPopulated<PF, PHash> {
+    PsyCheckpointLeafPopulated {
+        global_state_roots: PQEDCheckpointGlobalStateRoots {
+            contract_tree_root: hash(seed),
+            deposit_tree_root: PHash::get_zero_value(),
+            user_tree_root: PHash::get_zero_value(),
+            withdrawal_tree_root: PHash::get_zero_value(),
+            user_registration_tree_root: PHash::get_zero_value(),
+        },
+        stats: PQEDCheckpointLeafStats::get_empty_stats(),
+    }
+}
+
+fn coordinator_block_state(checkpoint: u64) -> QEDL2BlockState {
+    QEDL2BlockState {
+        checkpoint_id: checkpoint,
+        next_add_withdrawal_id: 11 + checkpoint,
+        next_process_withdrawal_id: 21 + checkpoint,
+        next_deposit_id: 31 + checkpoint,
+        total_deposits_claimed_epoch: 41 + checkpoint,
+        next_user_id: 51 + checkpoint,
+        end_balance: 61 + checkpoint,
+        next_contract_id: 71 + checkpoint as u32,
+    }
+}
+
+fn coordinator_commit_source(
+    expected: psy_node_core::store::canonical_head::StoredCanonicalHead<PHash>,
+    checkpoint: u64,
+    pending: u64,
+    seed: u8,
+) -> anyhow::Result<(CoordinatorCommitSource<PHash>, BranchExactWriterPrepared<PHash>)> {
+    let old_leaf = coordinator_leaf(seed.wrapping_sub(1));
+    let new_leaf = coordinator_leaf(seed);
+    let old_leaf_hash = old_leaf.qfhash::<PoseidonHasher>();
+    let new_leaf_hash = new_leaf.qfhash::<PoseidonHasher>();
+    let proof = DeltaMerkleProofCore::from_params::<PoseidonHasher>(
+        checkpoint,
+        old_leaf_hash,
+        new_leaf_hash,
+        (0..RealmRollbackTestNetwork::CHECKPOINT_TREE_HEIGHT_USIZE)
+            .map(PoseidonHasher::get_zero_hash)
+            .collect(),
+    );
+    let prepared = PsyPreparedCoordinatorBlockStateUpdates {
+        coordinator_id: 0,
+        checkpoint_id: checkpoint,
+        unique_pending_id: pending,
+        proc_checkpoint_unique_id: 20_000 + u128::from(pending),
+        old_base: PsyCoordinatorPendingCheckpointBase {
+            block_state: coordinator_block_state(checkpoint - 1),
+            checkpoint_leaf: old_leaf,
+            checkpoint_leaf_hash: old_leaf_hash,
+            checkpoint_tree_root: proof.old_root,
+        },
+        new_base: PsyCoordinatorPendingCheckpointBase {
+            block_state: coordinator_block_state(checkpoint),
+            checkpoint_leaf: new_leaf,
+            checkpoint_leaf_hash: new_leaf_hash,
+            checkpoint_tree_root: proof.new_root,
+        },
+        update_global_contract_tree_nodes_ffs: Vec::new(),
+        update_contract_function_tree_nodes_ffs: Vec::new(),
+        new_contract_leaves_ffs: Vec::new(),
+        new_contract_code_definitions: Vec::new(),
+        update_user_registration_tree_nodes_ffs: Vec::new(),
+        new_user_public_keys_ffs: Vec::new(),
+        new_public_key_hash_to_user_id_rows_ffs: Vec::new(),
+        update_global_user_tree_nodes_ffs: Vec::new(),
+        new_realm_guta_reward_tree_node_keys_ffs: Vec::new(),
+        checkpoint_tree_update_proof: proof,
+    };
+    // A Coordinator candidate is committed to the prepared checkpoint-tree
+    // transition.  Derive the chain hash from that exact payload instead of
+    // inventing a fixture hash: the production physical planner independently
+    // recomputes this value and rejects any mismatch.
+    let candidate_hash = checkpoint_hash_from_previous::<_, PoseidonHasher>(
+        *expected.canonical_ref().checkpoint().checkpoint_hash(),
+        prepared.new_base.checkpoint_tree_root,
+        prepared.new_base.checkpoint_leaf_hash,
+        hash(0xE2),
+    )
+    .into_inner();
+    let candidate = CanonicalChainRef::new(
+        expected.canonical_ref().network_id(),
+        expected.canonical_ref().chain_epoch(),
+        CheckpointRef::new(
+            CheckpointId::new(checkpoint),
+            CheckpointHash::from_last_chain_hash(candidate_hash),
+        ),
+    );
+    let mut prepared_bytes = Vec::new();
+    prepared.pio_write_to_io(&mut prepared_bytes)?;
+    let source = CoordinatorCommitSource::try_new(
+        expected,
+        candidate,
+        CoordinatorCommitSourcePayload::try_new(
+            prepared_bytes,
+            17,
+            vec![seed.max(1); 64],
+        )?
+        .encode_canonical(),
+    )?;
+    let intent = BranchExactDualWriteIntent::try_coordinator(
+        BranchPendingMapping::new(*source.expected(), UniquePendingId::try_new(pending - 1)?),
+        BranchPendingMapping::new(*source.candidate(), UniquePendingId::try_new(pending)?),
+        ProcCheckpointUniqueId::from_u128(20_000 + u128::from(pending)),
+    )?;
+    let mut fence_bytes = [0_u8; 81];
+    fence_bytes[..8].copy_from_slice(&9_u64.to_be_bytes());
+    fence_bytes[8..16].copy_from_slice(&3_u64.to_be_bytes());
+    fence_bytes[16..48].fill(0x44);
+    fence_bytes[48..80].fill(0x55);
+    fence_bytes[80] = BranchExactCutoverPhase::LegacyPrimaryDualWrite as u8;
+    let fence = BranchExactWriterCutoverFence::decode_canonical(&fence_bytes)?;
+    let narrow = BranchExactWriterPrepared::test_fixture(
+        intent,
+        CommitWriteTimestampUs::try_from_i128(10_000 + i128::from(checkpoint))?,
+        fence,
+    );
+    Ok((source, narrow))
 }
 
 fn realm_chain(checkpoint: u64, seed: u8) -> CanonicalChainRef<PHash> {
@@ -269,38 +414,7 @@ fn realm_commit_models(
     Ok((intent, timestamp, head, pipeline, head_bootstrap))
 }
 
-fn routing_key(table_id: u64) -> QDatabaseTableRoutingKey {
-    QDatabaseTableRoutingKey::new_with_connection_empty_secondary_routing_key(
-        table_id,
-        0,
-    )
-}
-
-async fn establish_coordinator_floor_tables(
-    store: &ScyllaCoreStore<PHash, PoseidonHasher>,
-) -> anyhow::Result<()> {
-    store
-        .init_std_table::<ScyllaGenericKeyIdValueTablePreparedStatements>(
-            "l2_block_state_table",
-            routing_key(4),
-        )
-        .await?;
-    store
-        .init_std_table::<ScyllaGenericKeyIdValueTablePreparedStatements>(
-            "latest_info_table",
-            routing_key(6),
-        )
-        .await?;
-    store
-        .init_std_table::<ScyllaU64ToU64TablePreparedStatements>(
-            "u64_singleton_table",
-            routing_key(11),
-        )
-        .await?;
-    Ok(())
-}
-
-async fn establish_realm_branch_ready(
+async fn establish_branch_ready(
     store: &ScyllaCoreStore<PHash, PoseidonHasher>,
     authority: AuthorityScope,
 ) -> anyhow::Result<()> {
@@ -433,6 +547,92 @@ async fn establish_realm_branch_ready(
     Ok(())
 }
 
+async fn qualification_seed_coordinator_commit(
+    store: &ScyllaCoreStore<PHash, PoseidonHasher>,
+    source: &CoordinatorCommitSource<PHash>,
+    narrow: &BranchExactWriterPrepared<PHash>,
+) -> anyhow::Result<()> {
+    store.persist_coordinator_commit_source(source).await?;
+    let ready = store.require_branch_exact_schema_ready()?;
+    let narrow_writer = ScyllaBranchExactDualWriteAdapter::prepare(
+        store.session.clone(),
+        ready,
+    )
+    .await?;
+    narrow_writer
+        .qualification_write_inventory_exact(narrow.intent(), narrow.timestamp())
+        .await?;
+    let plan = CoordinatorCommitPhysicalWritePlan::try_new::<PF, PoseidonHasher>(
+        source,
+        narrow,
+        hash(0xE1),
+        hash(0xE2),
+        RealmRollbackTestNetwork::CHECKPOINT_TREE_HEIGHT,
+    )?;
+    let schedule = CoordinatorCommitPhysicalExecutionSchedule::try_from_plan(
+        &plan,
+        narrow,
+    )?;
+    CoordinatorCommitPhysicalScyllaExecutor::prepare_with_consistency(
+        &store.session,
+        CqlKeyspaceName::try_new(store.keyspace.clone())?,
+        Consistency::Quorum,
+    )
+    .await?
+    .write_and_verify(&store.session, &schedule)
+    .await?;
+    store
+        .mark_coordinator_commit_source_committed(source)
+        .await?;
+    Ok(())
+}
+
+async fn qualification_seed_coordinator_history(
+    store: &ScyllaCoreStore<PHash, PoseidonHasher>,
+) -> anyhow::Result<(
+    psy_node_core::store::canonical_head::StoredCanonicalHead<PHash>,
+    CanonicalChainRef<PHash>,
+)> {
+    let floor_predecessor = *CanonicalHeadBootstrap::try_new(
+        CanonicalHeadBootstrapProfile::GenesisNative,
+        chain(0, 0xA0),
+    )?
+    .candidate();
+    let (target_source, target_narrow) =
+        coordinator_commit_source(floor_predecessor, 1, 101, 0xA1)?;
+    let target = *target_source.candidate();
+    let target_bootstrap = CanonicalHeadBootstrap::try_new(
+        CanonicalHeadBootstrapProfile::PostGenesisFloor,
+        target,
+    )?;
+    let target_head = *target_bootstrap.candidate();
+    store.bootstrap_canonical_head(&target_bootstrap).await?;
+
+    qualification_seed_coordinator_commit(store, &target_source, &target_narrow)
+        .await?;
+    store.ensure_coordinator_rollback_floor(&target_head).await?;
+
+    let mut current = target_head;
+    for (checkpoint, pending, seed) in [(2_u64, 102_u64, 0xA2_u8), (3, 103, 0xA3)] {
+        let (source, narrow) =
+            coordinator_commit_source(current, checkpoint, pending, seed)?;
+        let candidate = *source.candidate();
+        qualification_seed_coordinator_commit(store, &source, &narrow).await?;
+        let sealed = CanonicalHeadTransition::normal_checkpoint_advance(
+            current,
+            candidate,
+        )?
+        .seal();
+        let outcome = store.compare_and_set_canonical_head(&sealed).await?;
+        current = *outcome.current();
+        ensure!(
+            current == *sealed.candidate(),
+            "qualification Coordinator head did not advance to its committed source",
+        );
+    }
+    Ok((current, target))
+}
+
 async fn realm_control(
     keyspace: &str,
     realm_id: u32,
@@ -448,9 +648,40 @@ async fn realm_control(
         realm_id,
         realm_sub_id: 0,
     };
-    establish_realm_branch_ready(&store, authority).await?;
+    establish_branch_ready(&store, authority).await?;
     store
         .prepare_realm_rollback_runtime_control(COORDINATOR_KEYSPACE)
+        .await
+}
+
+async fn qualification_seed_realm_history(
+    control: &ScyllaRealmRollbackRuntimeControl,
+    authority: AuthorityScope,
+    pending_base: u64,
+    seed_base: u8,
+) -> anyhow::Result<()> {
+    let mut commits = Vec::new();
+    let mut source_bootstrap = None;
+    for checkpoint in 1_u64..=3 {
+        let (intent, timestamp, head, pipeline, bootstrap) = realm_commit_models(
+            authority,
+            checkpoint,
+            pending_base + checkpoint,
+            1_000 + checkpoint as i64,
+            seed_base.wrapping_add(checkpoint as u8),
+        )?;
+        commits.push((intent, timestamp, head, pipeline));
+        if checkpoint == 3 {
+            source_bootstrap = Some(bootstrap);
+        }
+    }
+    control
+        .qualification_seed_narrow_commit_history(
+            commits,
+            source_bootstrap
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("source bootstrap missing"))?,
+        )
         .await
 }
 
@@ -472,20 +703,16 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
         )
         .await?,
     );
-    establish_coordinator_floor_tables(&coordinator).await?;
+    establish_branch_ready(&coordinator, AuthorityScope::Coordinator).await?;
     coordinator
         .initialize_coordinator_canonical_head(true)
         .await?;
     coordinator
         .initialize_coordinator_rollback_admission(true)
         .await?;
-    let old_head = chain(3, 0xA3);
-    coordinator
-        .bootstrap_canonical_head(&CanonicalHeadBootstrap::try_new(
-            CanonicalHeadBootstrapProfile::PostGenesisFloor,
-            old_head,
-        )?)
-        .await?;
+    let (committed_head, target) =
+        qualification_seed_coordinator_history(&coordinator).await?;
+    let old_head = *committed_head.canonical_ref();
 
     let realms = vec![
         RollbackRealmParticipant::new(10, 0),
@@ -514,13 +741,13 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
     .with_participant_plan_store(coordinator.clone());
     let receipt = inbox
         .start_planned(RollbackAdminPlannedStartIntent::new(
-            psy_node_core::store::canonical_head::CanonicalHeadRevision::try_new(0)?,
+            committed_head.revision(),
             old_head,
-            *chain(1, 0xA1).checkpoint(),
+            *target.checkpoint(),
             TimestampFenceWindow::try_new(
-                CommitWriteTimestampUs::try_from_i128(100)?,
-                200,
-                300,
+                CommitWriteTimestampUs::try_from_i128(11_000)?,
+                12_000,
+                13_000,
             )?,
             topology.revision(),
             *topology.digest(),
@@ -572,18 +799,21 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
         CoordinatorRollbackGlobalProgress::Progressed(current) if current == requested
     ));
 
-    // The archive preparer durably advances the shared control row before it
-    // selects any participant data. With no committed Realm inventory in this
-    // control-only fixture, both production Realm controls must enter the
-    // archive path and fail closed instead of publishing a completion.
-    ensure!(
+    // The Coordinator uses its production archive owner over three exact
+    // qualification commits. This also durably advances the shared control
+    // row before either Realm may publish its own completion.
+    let CoordinatorRollbackMaintenanceOutcome::ArchivePrepared(coordinator_archive) =
         <ScyllaCoreStore<PHash, PoseidonHasher> as CoordinatorRollbackMaintenanceExecutor<
             PF,
             PHash,
         >>::prepare_coordinator_archive(&coordinator, network(), 32)
-        .await
-        .is_err(),
-        "control-only fixture must not fabricate Coordinator archive readiness"
+        .await?
+    else {
+        bail!("Coordinator did not publish exact archive readiness")
+    };
+    ensure!(
+        coordinator_archive.entry_count() > 0,
+        "Coordinator archive must contain physical rows",
     );
     let CanonicalHeadReadState::Current(archiving) = coordinator
         .read_canonical_head(network())
@@ -595,16 +825,18 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
         matches!(archiving.rollback_control(), RollbackControlState::Archiving(_)),
         "archive preparation must durably enter ARCHIVING before selecting data"
     );
+    let CoordinatorRollbackMaintenanceOutcome::ArchivePrepared(recovered_coordinator_archive) =
+        <ScyllaCoreStore<PHash, PoseidonHasher> as CoordinatorRollbackMaintenanceExecutor<
+            PF,
+            PHash,
+        >>::prepare_coordinator_archive(&coordinator, network(), 32)
+        .await?
+    else {
+        bail!("Coordinator archive readiness did not recover after reopen")
+    };
     ensure!(
-        !matches!(
-            <ScyllaCoreStore<PHash, PoseidonHasher> as CoordinatorRollbackMaintenanceExecutor<
-                PF,
-                PHash,
-            >>::prepare_coordinator_archive(&coordinator, network(), 32)
-            .await,
-            Ok(CoordinatorRollbackMaintenanceOutcome::ArchivePrepared(_))
-        ),
-        "retry without committed sources must not fabricate archive readiness"
+        recovered_coordinator_archive == coordinator_archive,
+        "Coordinator archive retry selected different evidence",
     );
     for (control, authority) in [
         (&realm_10, AuthorityScope::Realm { realm_id: 10, realm_sub_id: 0 }),
@@ -622,77 +854,129 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
         );
     }
 
-    // Seed only Realm 10 with a small canonical committed history. The setup
-    // is qualification-only, but the archive selection, physical reads,
-    // immutable writes, exact second pass, completion, and restart recovery
-    // below all use the production runtime control.
+    // Seed both planned Realms with small canonical committed histories. The
+    // setup is qualification-only, but selection, physical reads, immutable
+    // archive writes, exact second pass, completion, and recovery all use the
+    // production runtime control.
     let realm_10_authority = AuthorityScope::Realm {
         realm_id: 10,
         realm_sub_id: 0,
     };
-    let mut commits = Vec::new();
-    let mut source_bootstrap = None;
-    for checkpoint in 1_u64..=3 {
-        let (intent, timestamp, head, pipeline, bootstrap) = realm_commit_models(
-            realm_10_authority,
-            checkpoint,
-            100 + checkpoint,
-            1_000 + checkpoint as i64,
-            0xC0 + checkpoint as u8,
-        )?;
-        commits.push((intent, timestamp, head, pipeline));
-        if checkpoint == 3 {
-            source_bootstrap = Some(bootstrap);
-        }
-    }
-    realm_10
-        .qualification_seed_narrow_commit_history(
-            commits,
-            source_bootstrap
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("source bootstrap missing"))?,
-        )
-        .await?;
-    let RealmRollbackParticipantProgress::ArchivePrepared {
-        entry_count,
-        ..
-    } = <ScyllaRealmRollbackRuntimeControl as RealmRollbackRuntimeControl<
-        PHash,
-    >>::progress_realm_rollback_participant(
-        &realm_10, network(), realm_10_authority,
-    )
-    .await?
-    else {
-        bail!("Realm 10 did not publish an exact archive completion")
+    let realm_20_authority = AuthorityScope::Realm {
+        realm_id: 20,
+        realm_sub_id: 0,
     };
-    ensure!(entry_count > 0, "Realm archive must contain physical rows");
-    let RealmRollbackParticipantProgress::ArchivePrepared {
-        entry_count: recovered_count,
-        ..
-    } = <ScyllaRealmRollbackRuntimeControl as RealmRollbackRuntimeControl<
+    qualification_seed_realm_history(&realm_10, realm_10_authority, 100, 0xC0)
+        .await?;
+    qualification_seed_realm_history(&realm_20, realm_20_authority, 200, 0xD0)
+        .await?;
+    for (control, authority) in [
+        (&realm_10, realm_10_authority),
+        (&realm_20, realm_20_authority),
+    ] {
+        let RealmRollbackParticipantProgress::ArchivePrepared {
+            entry_count,
+            ..
+        } = <ScyllaRealmRollbackRuntimeControl as RealmRollbackRuntimeControl<
+            PHash,
+        >>::progress_realm_rollback_participant(control, network(), authority)
+        .await
+        .with_context(|| format!("first archive progress for {authority:?}"))?
+        else {
+            bail!("planned Realm did not publish an exact archive completion")
+        };
+        ensure!(entry_count > 0, "Realm archive must contain physical rows");
+        let RealmRollbackParticipantProgress::ArchivePrepared {
+            entry_count: recovered_count,
+            ..
+        } = <ScyllaRealmRollbackRuntimeControl as RealmRollbackRuntimeControl<
+            PHash,
+        >>::progress_realm_rollback_participant(control, network(), authority)
+        .await
+        .with_context(|| format!("archive recovery progress for {authority:?}"))?
+        else {
+            bail!("Realm archive completion did not recover after reopen")
+        };
+        ensure!(
+            recovered_count == entry_count,
+            "recovered Realm archive selected a different physical dataset",
+        );
+    }
+
+    let CoordinatorRollbackGlobalProgress::AwaitingParticipants {
+        head: deleting_head,
+        completed,
+        expected,
+    } = <ScyllaCoreStore<PHash, PoseidonHasher> as CoordinatorRollbackMaintenanceExecutor<
+        PF,
         PHash,
-    >>::progress_realm_rollback_participant(
-        &realm_10, network(), realm_10_authority,
-    )
-    .await?
+    >>::progress_coordinator_rollback(&coordinator, network(), 32)
+    .await
+    .context("Coordinator global archive barrier/delete progress")?
     else {
-        bail!("Realm 10 archive completion did not recover after reopen")
+        bail!("Coordinator did not cross the all-participant archive barrier")
     };
     ensure!(
-        recovered_count == entry_count,
-        "recovered Realm archive selected a different physical dataset"
+        matches!(deleting_head.rollback_control(), RollbackControlState::Deleting(_)),
+        "global archive barrier did not enter DELETING",
     );
     ensure!(
-        <ScyllaRealmRollbackRuntimeControl as RealmRollbackRuntimeControl<
+        completed == 1 && expected == 3,
+        "only the Coordinator delete may be complete before Realm execution",
+    );
+
+    for (control, authority) in [
+        (&realm_10, realm_10_authority),
+        (&realm_20, realm_20_authority),
+    ] {
+        let RealmRollbackParticipantProgress::DeletePrepared {
+            physical_delete_count,
+            restored_row_count,
+            ..
+        } = <ScyllaRealmRollbackRuntimeControl as RealmRollbackRuntimeControl<
             PHash,
-        >>::progress_realm_rollback_participant(
-            &realm_20,
-            network(),
-            AuthorityScope::Realm { realm_id: 20, realm_sub_id: 0 },
-        )
+        >>::progress_realm_rollback_participant(control, network(), authority)
         .await
-        .is_err(),
-        "unseeded Realm must remain fail closed after another Realm completes"
+        .with_context(|| format!("Realm delete progress for {authority:?}"))?
+        else {
+            bail!("planned Realm did not execute its production delete")
+        };
+        ensure!(
+            physical_delete_count > 0,
+            "Realm delete must remove its archived suffix rows",
+        );
+        let RealmRollbackParticipantProgress::DeletePrepared {
+            physical_delete_count: recovered_delete_count,
+            restored_row_count: recovered_restore_count,
+            ..
+        } = <ScyllaRealmRollbackRuntimeControl as RealmRollbackRuntimeControl<
+            PHash,
+        >>::progress_realm_rollback_participant(control, network(), authority)
+        .await
+        .with_context(|| format!("Realm delete retry for {authority:?}"))?
+        else {
+            bail!("Realm delete completion did not recover after retry")
+        };
+        ensure!(
+            recovered_delete_count == physical_delete_count
+                && recovered_restore_count == restored_row_count,
+            "Realm delete retry selected different physical work",
+        );
+    }
+
+    let CoordinatorRollbackGlobalProgress::Progressed(restoring_head) =
+        <ScyllaCoreStore<PHash, PoseidonHasher> as CoordinatorRollbackMaintenanceExecutor<
+            PF,
+            PHash,
+        >>::progress_coordinator_rollback(&coordinator, network(), 32)
+        .await
+        .context("Coordinator global delete barrier progress")?
+    else {
+        bail!("Coordinator did not cross the all-participant delete barrier")
+    };
+    ensure!(
+        matches!(restoring_head.rollback_control(), RollbackControlState::Restoring(_)),
+        "all-participant delete barrier did not enter RESTORING",
     );
     Ok(())
 }

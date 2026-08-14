@@ -257,16 +257,30 @@ impl ScyllaCoordinatorCommitDeleteRestoreExecutor {
         )
         .await?;
         let delete_fence = plan.fence_window().delete_fence().as_i64();
-        for entry in plan.entries() {
-            adapter.delete_and_readback(entry.key(), delete_fence).await?;
-        }
-        self.require_deleting_head(&deleting_head).await?;
-
         let new_branch_write = plan
             .fence_window()
             .new_branch_write()
             .as_commit_timestamp()
             .as_i64();
+        for entry in plan.entries() {
+            match entry.action() {
+                CoordinatorCommitDeleteRestoreAction::DeleteHotRow => {
+                    adapter.delete_and_readback(entry.key(), delete_fence).await?;
+                }
+                CoordinatorCommitDeleteRestoreAction::RestoreTargetSingleton => {
+                    adapter
+                        .delete_or_accept_restored(
+                            entry.key(),
+                            delete_fence,
+                            &target_restore,
+                            new_branch_write,
+                        )
+                        .await?;
+                }
+            }
+        }
+        self.require_deleting_head(&deleting_head).await?;
+
         for entry in plan.entries() {
             if entry.action()
                 == CoordinatorCommitDeleteRestoreAction::RestoreTargetSingleton
@@ -500,6 +514,22 @@ impl CoordinatorCommitDeleteRestoreAdapter {
         }
     }
 
+    async fn delete_or_accept_restored<Hash: Q256BitHash>(
+        &self,
+        key: &ResolvedScyllaKey,
+        delete_timestamp_us: i64,
+        target: &CoordinatorCommitTargetRestorePayload<Hash>,
+        restore_timestamp_us: i64,
+    ) -> Result<(), CoordinatorCommitDeleteRestoreExecutorError> {
+        if self
+            .matches_restored(key, target, restore_timestamp_us)
+            .await?
+        {
+            return Ok(());
+        }
+        self.delete_and_readback(key, delete_timestamp_us).await
+    }
+
     async fn restore_and_readback<Hash: Q256BitHash>(
         &self,
         key: &ResolvedScyllaKey,
@@ -553,6 +583,19 @@ impl CoordinatorCommitDeleteRestoreAdapter {
         target: &CoordinatorCommitTargetRestorePayload<Hash>,
         timestamp_us: i64,
     ) -> Result<(), CoordinatorCommitDeleteRestoreExecutorError> {
+        if self.matches_restored(key, target, timestamp_us).await? {
+            Ok(())
+        } else {
+            Err(CoordinatorCommitDeleteRestoreExecutorError::PostStateMismatch)
+        }
+    }
+
+    async fn matches_restored<Hash: Q256BitHash>(
+        &self,
+        key: &ResolvedScyllaKey,
+        target: &CoordinatorCommitTargetRestorePayload<Hash>,
+        timestamp_us: i64,
+    ) -> Result<bool, CoordinatorCommitDeleteRestoreExecutorError> {
         let expected = match key.typed_key() {
             TypedTableKey::LatestInfo(LatestInfoSlot::LatestL2BlockState) => {
                 target.target_l2_stored_value().to_vec()
@@ -565,11 +608,10 @@ impl CoordinatorCommitDeleteRestoreAdapter {
             }
             _ => return Err(CoordinatorCommitDeleteRestoreExecutorError::RestoreSetMismatch),
         };
-        match self.read_current(key).await? {
+        Ok(matches!(self.read_current(key).await?,
             Some(ObservedHotRow::Value { bytes, writetime_us })
-                if bytes == expected && writetime_us == timestamp_us => Ok(()),
-            _ => Err(CoordinatorCommitDeleteRestoreExecutorError::PostStateMismatch),
-        }
+                if bytes == expected && writetime_us == timestamp_us
+        ))
     }
 
     async fn read_current(
