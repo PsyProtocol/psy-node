@@ -1,6 +1,6 @@
-//! Single-node production-store composition test for the delete-only rollback
-//! control plane. It covers durable request selection plus one Realm's exact
-//! physical archive and recovery. Physical deletion remains a later slice.
+//! Production-store composition test for the delete-only rollback control
+//! plane. The same flow runs against an isolated RF=1 or pre-provisioned RF=3
+//! fixture.
 
 use std::sync::Arc;
 
@@ -129,7 +129,47 @@ use super::coordinator_commit_physical_write_plan::CoordinatorCommitPhysicalWrit
 const COORDINATOR_KEYSPACE: &str = "psy_rollback_joint_control";
 const REALM_10_KEYSPACE: &str = "psy_rollback_joint_control_realm_10";
 const REALM_20_KEYSPACE: &str = "psy_rollback_joint_control_realm_20";
-const NODE: &str = "172.29.86.11:9042";
+const NODES: [&str; 3] = [
+    "172.29.86.11:9042",
+    "172.29.86.12:9042",
+    "172.29.86.13:9042",
+];
+
+fn rf3_enabled() -> bool {
+    std::env::var("PSY_ROLLBACK_JOINT_RF3").as_deref() == Ok("1")
+}
+
+fn known_nodes() -> Vec<String> {
+    let count = if rf3_enabled() { NODES.len() } else { 1 };
+    NODES[..count]
+        .iter()
+        .map(|node| (*node).to_owned())
+        .collect()
+}
+
+async fn open_store(
+    realm_id: u64,
+    keyspace: &str,
+) -> anyhow::Result<ScyllaCoreStore<PHash, PoseidonHasher>> {
+    let nodes = known_nodes();
+    if rf3_enabled() {
+        ScyllaCoreStore::<PHash, PoseidonHasher>::new_existing(
+            realm_id,
+            0,
+            keyspace.to_owned(),
+            &nodes,
+        )
+        .await
+    } else {
+        ScyllaCoreStore::<PHash, PoseidonHasher>::new(
+            realm_id,
+            0,
+            keyspace.to_owned(),
+            &nodes,
+        )
+        .await
+    }
+}
 
 #[derive(Clone, Copy)]
 struct RealmRollbackTestNetwork;
@@ -846,13 +886,7 @@ async fn realm_control(
     keyspace: &str,
     realm_id: u32,
 ) -> anyhow::Result<ScyllaRealmRollbackRuntimeControl> {
-    let store = ScyllaCoreStore::<PHash, PoseidonHasher>::new(
-        u64::from(realm_id),
-        0,
-        keyspace.to_owned(),
-        &[NODE.to_owned()],
-    )
-    .await?;
+    let store = open_store(u64::from(realm_id), keyspace).await?;
     let authority = AuthorityScope::Realm {
         realm_id,
         realm_sub_id: 0,
@@ -865,15 +899,7 @@ async fn realm_control(
 
 async fn coordinator_control(
 ) -> anyhow::Result<Arc<ScyllaCoreStore<PHash, PoseidonHasher>>> {
-    let store = Arc::new(
-        ScyllaCoreStore::<PHash, PoseidonHasher>::new(
-            0,
-            0,
-            COORDINATOR_KEYSPACE.to_owned(),
-            &[NODE.to_owned()],
-        )
-        .await?,
-    );
+    let store = Arc::new(open_store(0, COORDINATOR_KEYSPACE).await?);
     establish_branch_ready(&store, AuthorityScope::Coordinator).await?;
     store.initialize_coordinator_canonical_head(true).await?;
     store.initialize_coordinator_rollback_admission(true).await?;
@@ -916,8 +942,9 @@ async fn qualification_seed_realm_history(
 async fn explicit_admin_request_is_selected_by_every_production_realm_control(
 ) -> anyhow::Result<()> {
     ensure!(
-        std::env::var("PSY_ROLLBACK_JOINT_SINGLE").as_deref() == Ok("1"),
-        "run through tests/rf3/run-rollback-joint-single.sh"
+        std::env::var("PSY_ROLLBACK_JOINT_SINGLE").as_deref() == Ok("1")
+            || rf3_enabled(),
+        "run through the rollback joint RF=1 or RF=3 wrapper"
     );
 
     let mut coordinator = coordinator_control().await?;
@@ -1114,11 +1141,12 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
         );
     }
 
-    // Lose every archive owner before the first destructive transition. The
-    // archive barrier must be reconstructed from immutable completions alone.
+    // Lose every archive owner before the first destructive transition. Only
+    // the Coordinator is reopened now; Realm processes stay down until their
+    // post-PONR delete work is selected.
     coordinator = coordinator_control().await?;
-    realm_10 = realm_control(REALM_10_KEYSPACE, 10).await?;
-    realm_20 = realm_control(REALM_20_KEYSPACE, 20).await?;
+    drop(realm_10);
+    drop(realm_20);
 
     let CoordinatorRollbackGlobalProgress::AwaitingParticipants {
         head: deleting_head,
@@ -1142,12 +1170,12 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
         "only the Coordinator delete may be complete before Realm execution",
     );
 
-    // Simulate all three processes exiting immediately after the destructive
-    // PONR. Rebuild every control from the deployed keyspaces; no in-memory
+    // The Coordinator process also exits immediately after the destructive
+    // PONR. Rebuild each Realm from its deployed keyspace; no in-memory
     // archive/delete capability is carried into Realm execution.
     drop(inbox);
     drop(boundary);
-    coordinator = coordinator_control().await?;
+    drop(coordinator);
     realm_10 = realm_control(REALM_10_KEYSPACE, 10).await?;
     realm_20 = realm_control(REALM_20_KEYSPACE, 20).await?;
 
@@ -1244,11 +1272,11 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
         );
     }
 
-    // Drop the target-restore owners before global verification. The next
-    // process may only advance by rereading all participant completions.
+    // Drop the target-restore owners before global verification. Only the
+    // Coordinator is restarted until VERIFYING asks Realms for reports.
+    drop(realm_10);
+    drop(realm_20);
     coordinator = coordinator_control().await?;
-    realm_10 = realm_control(REALM_10_KEYSPACE, 10).await?;
-    realm_20 = realm_control(REALM_20_KEYSPACE, 20).await?;
 
     let CoordinatorRollbackGlobalProgress::Progressed(verifying_head) =
         <ScyllaCoreStore<PHash, PoseidonHasher> as CoordinatorRollbackMaintenanceExecutor<
