@@ -23,6 +23,7 @@ use scylla::{
     client::session::Session,
     response::query_result::QueryResult,
     statement::{prepared::PreparedStatement, Consistency, SerialConsistency},
+    value::{CqlValue, Row},
 };
 use sha2::{Digest, Sha256};
 
@@ -655,11 +656,14 @@ fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), RollbackGlobalResto
 }
 
 fn decode_applied(result: QueryResult) -> Result<bool, RollbackGlobalRestoreBarrierError> {
-    let rows = result.into_rows_result().map_err(cql)?
-        .rows::<(Option<bool>,)>().map_err(cql)?
-        .collect::<Result<Vec<_>, _>>().map_err(cql)?;
-    match rows.as_slice() {
-        [(Some(applied),)] => Ok(*applied),
+    let rows = result.into_rows_result().map_err(cql)?;
+    let column = rows
+        .column_specs()
+        .get_by_name("[applied]")
+        .ok_or(RollbackGlobalRestoreBarrierError::MalformedLwtResponse)?;
+    let row = rows.single_row::<Row>().map_err(cql)?;
+    match row.columns.get(column.0) {
+        Some(Some(CqlValue::Boolean(applied))) => Ok(*applied),
         _ => Err(RollbackGlobalRestoreBarrierError::MalformedLwtResponse),
     }
 }

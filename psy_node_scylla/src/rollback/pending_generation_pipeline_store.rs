@@ -287,6 +287,32 @@ impl ScyllaPendingPipelineStore {
         self.finish(execution, key, candidate).await
     }
 
+    /// Test-only IF-NOT-EXISTS seed for a complete production pipeline row.
+    /// The helper cannot overwrite or advance an existing pipeline.
+    #[cfg(test)]
+    pub(super) async fn qualification_persist_current<Hash: Q256BitHash>(
+        &self,
+        candidate: &StoredPendingPipeline<Hash>,
+    ) -> Result<PendingPipelineWriteOutcome<Hash>, PendingPipelineStoreError> {
+        let key = candidate.key();
+        let (network, kind, realm, sub) = bind_key(key);
+        let execution = self
+            .session
+            .execute_unpaged(
+                &self.bootstrap,
+                (
+                    network,
+                    kind,
+                    realm,
+                    sub,
+                    candidate.revision().as_i64(),
+                    candidate.canonical_payload(),
+                ),
+            )
+            .await;
+        self.finish(execution, key, candidate).await
+    }
+
     pub(crate) async fn apply<Hash: Q256BitHash>(
         &self,
         transition: &SealedPendingPipelineTransition<Hash>,

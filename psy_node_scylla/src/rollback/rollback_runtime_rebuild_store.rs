@@ -30,6 +30,7 @@ use scylla::{
     client::session::Session,
     response::query_result::QueryResult,
     statement::{Consistency, SerialConsistency, prepared::PreparedStatement},
+    value::{CqlValue, Row},
 };
 use sha2::{Digest, Sha256};
 
@@ -1493,13 +1494,14 @@ fn push_bytes(
 fn decode_applied(result: QueryResult) -> Result<bool, RollbackRuntimeRebuildStoreError> {
     let rows = result
         .into_rows_result()
-        .map_err(cql)?
-        .rows::<(Option<bool>,)>()
-        .map_err(cql)?
-        .collect::<Result<Vec<_>, _>>()
         .map_err(cql)?;
-    match rows.as_slice() {
-        [(Some(applied),)] => Ok(*applied),
+    let column = rows
+        .column_specs()
+        .get_by_name("[applied]")
+        .ok_or(RollbackRuntimeRebuildStoreError::MalformedLwtResponse)?;
+    let row = rows.single_row::<Row>().map_err(cql)?;
+    match row.columns.get(column.0) {
+        Some(Some(CqlValue::Boolean(applied))) => Ok(*applied),
         _ => Err(RollbackRuntimeRebuildStoreError::MalformedLwtResponse),
     }
 }

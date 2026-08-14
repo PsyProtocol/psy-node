@@ -94,7 +94,8 @@ use scylla::statement::Consistency;
 
 use crate::core::ScyllaCoreStore;
 use super::{
-    AuthorityLocalHeadNoTabletKeyspace, BranchExactBackfillPlan,
+    AuthorityLocalHeadNoTabletKeyspace, AuthorityTimestampNoTabletKeyspace,
+    BranchExactBackfillPlan,
     BranchExactBackfillReadbackObservation, BranchExactDeploymentIntent,
     BranchExactDeploymentLifecycleBootstrap,
     BranchExactDeploymentLifecycleReadState,
@@ -107,7 +108,9 @@ use super::{
     BranchExactVerifiedDeploymentReceipt, BranchExactCutoverPhase,
     BranchExactWriterCutoverFence, BranchExactWriterPrepared, CqlKeyspaceName,
     PendingQueueSidecarKeyspaces, PendingQueueSidecarSchemaMaterializer,
-    ScyllaAuthorityLocalHeadStore, ScyllaBranchExactDeploymentLifecycleStore,
+    ScyllaAuthorityLocalHeadStore, ScyllaAuthorityTimestampStore,
+    ScyllaBranchExactDeploymentLifecycleStore,
+    ScyllaBranchExactWriterLifecycleStore,
     ScyllaRealmRollbackRuntimeControl, SealedBranchExactBackfillPlanCas,
     SealedBranchExactBackfillVerifiedCas, SealedBranchExactSchemaVerifiedCas,
 };
@@ -537,6 +540,20 @@ async fn establish_branch_ready(
         )?,
     )
     .await?;
+    ScyllaBranchExactWriterLifecycleStore::create_schema(
+        &store.session,
+        &BranchExactDeploymentNoTabletKeyspace::try_new(
+            store.no_tablet_keyspace.clone(),
+        )?,
+    )
+    .await?;
+    ScyllaAuthorityTimestampStore::create_schema(
+        &store.session,
+        &AuthorityTimestampNoTabletKeyspace::try_new(
+            store.no_tablet_keyspace.clone(),
+        )?,
+    )
+    .await?;
     ScyllaAuthorityLocalHeadStore::create_schema(
         &store.session,
         &AuthorityLocalHeadNoTabletKeyspace::try_new(
@@ -866,9 +883,9 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
         realm_id: 20,
         realm_sub_id: 0,
     };
-    qualification_seed_realm_history(&realm_10, realm_10_authority, 100, 0xC0)
+    qualification_seed_realm_history(&realm_10, realm_10_authority, 1, 0xC0)
         .await?;
-    qualification_seed_realm_history(&realm_20, realm_20_authority, 200, 0xD0)
+    qualification_seed_realm_history(&realm_20, realm_20_authority, 1, 0xD0)
         .await?;
     for (control, authority) in [
         (&realm_10, realm_10_authority),
@@ -977,6 +994,53 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
     ensure!(
         matches!(restoring_head.rollback_control(), RollbackControlState::Restoring(_)),
         "all-participant delete barrier did not enter RESTORING",
+    );
+
+    for (control, authority) in [
+        (&realm_10, realm_10_authority),
+        (&realm_20, realm_20_authority),
+    ] {
+        let RealmRollbackParticipantProgress::RestorePrepared {
+            final_rows_digest,
+            ..
+        } = <ScyllaRealmRollbackRuntimeControl as RealmRollbackRuntimeControl<
+            PHash,
+        >>::progress_realm_rollback_participant(control, network(), authority)
+        .await
+        .with_context(|| format!("Realm target restore for {authority:?}"))?
+        else {
+            bail!("planned Realm did not restore its selected target")
+        };
+        let RealmRollbackParticipantProgress::RestorePrepared {
+            final_rows_digest: recovered_digest,
+            ..
+        } = <ScyllaRealmRollbackRuntimeControl as RealmRollbackRuntimeControl<
+            PHash,
+        >>::progress_realm_rollback_participant(control, network(), authority)
+        .await
+        .with_context(|| format!("Realm target restore retry for {authority:?}"))?
+        else {
+            bail!("Realm target restore completion did not recover after retry")
+        };
+        ensure!(
+            recovered_digest == final_rows_digest,
+            "Realm target restore retry selected different final rows",
+        );
+    }
+
+    let CoordinatorRollbackGlobalProgress::Progressed(verifying_head) =
+        <ScyllaCoreStore<PHash, PoseidonHasher> as CoordinatorRollbackMaintenanceExecutor<
+            PF,
+            PHash,
+        >>::progress_coordinator_rollback(&coordinator, network(), 32)
+        .await
+        .context("Coordinator global restore barrier progress")?
+    else {
+        bail!("Coordinator did not cross the all-participant restore barrier")
+    };
+    ensure!(
+        matches!(verifying_head.rollback_control(), RollbackControlState::Verifying(_)),
+        "all-participant restore barrier did not enter VERIFYING",
     );
     Ok(())
 }

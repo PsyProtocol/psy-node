@@ -21,6 +21,15 @@ use psy_node_core::store::{
         SelectedRealmRollbackRuntimeRebuild,
     },
 };
+#[cfg(test)]
+use psy_node_core::store::{
+    authority_commit::{
+        AuthorityClockSampleUs, AuthorityTimestampBootstrap, AuthorityTimestampBootstrapReason,
+        AuthorityTimestampKey,
+    },
+    pending_generation::ProcNamespacePrefix,
+    pending_generation_pipeline::PendingPipelineWriteOutcome,
+};
 use scylla::client::session::Session;
 
 use super::{
@@ -170,7 +179,20 @@ impl ScyllaRealmRollbackRuntimeControl {
             &self.branch_exact_ready,
         )
         .await?;
+        let mut source = None;
+        let mut pending_owners = Vec::new();
         for (intent, timestamp, head, pipeline) in commits {
+            pending_owners.push((
+                intent.candidate().pending_id(),
+                intent.proc_checkpoint_id(),
+            ));
+            source = Some((
+                intent.authority(),
+                *intent.candidate(),
+                timestamp,
+                intent.intent_digest(),
+                pipeline.clone(),
+            ));
             narrow
                 .qualification_write_inventory_exact(&intent, timestamp)
                 .await?;
@@ -183,6 +205,123 @@ impl ScyllaRealmRollbackRuntimeControl {
                 .await?;
         }
         self.local_head.bootstrap(source_head).await?;
+
+        // Seed only the live control rows that the production restore planner
+        // selects.  Every later restore mutation still runs through the real
+        // QUORUM/LWT stores; these test-only IFNE helpers cannot overwrite a
+        // current row or authorize serving.
+        let (authority, watermark, source_write_timestamp, last_intent, source_pipeline) =
+            source.ok_or_else(|| anyhow::anyhow!("source commit missing"))?;
+        let timestamp_key = AuthorityTimestampKey::new(
+            watermark.canonical_chain().network_id(),
+            authority,
+        );
+        let timestamp_bootstrap = AuthorityTimestampBootstrap::new(
+            timestamp_key,
+            psy_node_core::store::timestamp::CommitWriteTimestampUs::try_from_i128(
+                i128::from(source_write_timestamp.as_i64()) - 1,
+            )?,
+            AuthorityTimestampBootstrapReason::ControlledWriterCutover,
+        );
+        let timestamp_reservation = timestamp_bootstrap.candidate().seal_reservation(
+            timestamp_key,
+            last_intent.authority_intent(),
+            AuthorityClockSampleUs::try_from_i128(i128::from(
+                source_write_timestamp.as_i64(),
+            ))?,
+        )?;
+        let timestamp_completion = timestamp_reservation
+            .candidate()
+            .seal_completion(timestamp_key, timestamp_reservation.lease())?;
+        let timestamp_state = timestamp_completion.candidate();
+        let branch_keyspace = BranchExactDeploymentNoTabletKeyspace::try_new(
+            self.local_control_keyspace.as_str().to_owned(),
+        )?;
+        let writer_store = ScyllaBranchExactWriterLifecycleStore::prepare(
+            self.session.clone(),
+            branch_keyspace.clone(),
+        )
+        .await?;
+        let source_writer = super::StoredBranchExactWriterLifecycle::qualification_active_fixture(
+            authority,
+            watermark,
+            timestamp_state,
+            last_intent,
+            u64::try_from(pending_owners.len())?,
+            self.branch_exact_ready.expected_receipt().clone(),
+        );
+        match writer_store
+            .qualification_persist_current(&source_writer)
+            .await?
+        {
+            super::BranchExactWriterWriteOutcome::Applied(current)
+            | super::BranchExactWriterWriteOutcome::Idempotent(current)
+                if current == source_writer => {}
+            other => anyhow::bail!("qualification writer seed conflict: {other:?}"),
+        }
+
+        let pipeline_store = ScyllaPendingPipelineStore::prepare(
+            self.session.clone(),
+            branch_keyspace,
+        )
+        .await?;
+        match pipeline_store
+            .qualification_persist_current(&source_pipeline)
+            .await?
+        {
+            PendingPipelineWriteOutcome::Applied(current)
+            | PendingPipelineWriteOutcome::Idempotent(current)
+                if current == source_pipeline => {}
+            other => anyhow::bail!("qualification pipeline seed conflict: {other:?}"),
+        }
+
+        let timestamp_store = ScyllaAuthorityTimestampStore::prepare(
+            self.session.clone(),
+            AuthorityTimestampNoTabletKeyspace::try_new(
+                self.local_control_keyspace.as_str().to_owned(),
+            )?,
+        )
+        .await?;
+        timestamp_store.bootstrap(timestamp_bootstrap).await?;
+        timestamp_store.reserve(timestamp_reservation).await?;
+        timestamp_store.complete(timestamp_completion).await?;
+
+        let counter = PendingCounterAdapter::prepare(
+            self.session.clone(),
+            self.local_control_keyspace.clone(),
+            self.local_state_keyspace.clone(),
+        )
+        .await?;
+        let prefix = ProcNamespacePrefix::for_authority(
+            watermark.canonical_chain().network_id(),
+            authority,
+        );
+        let counter_target = source_pipeline.gathering().pending_id().get();
+        for value in 1..=counter_target {
+            let candidate = psy_node_core::store::typed::UniquePendingId::try_new(value)?;
+            let expected = if value == 1 {
+                super::PendingCounterExpected::Absent
+            } else {
+                super::PendingCounterExpected::Present(
+                    psy_node_core::store::typed::UniquePendingId::try_new(value - 1)?,
+                )
+            };
+            let allocation = super::SealedPendingCounterAllocation::try_for_commit(
+                expected,
+                pending_owners
+                    .iter()
+                    .find_map(|(pending, proc_id)| (*pending == candidate).then_some(*proc_id))
+                    .unwrap_or_else(|| prefix.derive_proc_id(candidate)),
+                source_write_timestamp,
+            )?;
+            match counter.allocate(&allocation).await? {
+                super::PendingCounterAllocationOutcome::Owned(owned)
+                    if owned.pending() == candidate => {}
+                other => anyhow::bail!(
+                    "qualification pending counter seed conflict at {value}: {other:?}"
+                ),
+            }
+        }
         Ok(())
     }
 

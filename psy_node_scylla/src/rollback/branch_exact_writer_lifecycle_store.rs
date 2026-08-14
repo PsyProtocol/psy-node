@@ -261,6 +261,33 @@ impl ScyllaBranchExactWriterLifecycleStore {
         self.finish(execution, key, candidate).await
     }
 
+    /// Test-only persistence of a complete, production-encoded current row.
+    /// This is intentionally an IF-NOT-EXISTS seed; it cannot replace or CAS
+    /// an existing writer lifecycle.
+    #[cfg(test)]
+    pub(super) async fn qualification_persist_current<Hash: Q256BitHash>(
+        &self,
+        candidate: &StoredBranchExactWriterLifecycle<Hash>,
+    ) -> Result<BranchExactWriterWriteOutcome<Hash>, BranchExactWriterStoreError> {
+        let key = BranchExactWriterAuthorityKey::from_plan(candidate.plan());
+        let (network, kind, realm, sub) = key.bind();
+        let execution = self
+            .session
+            .execute_unpaged(
+                &self.bootstrap,
+                (
+                    network,
+                    kind,
+                    realm,
+                    sub,
+                    candidate.revision().as_i64(),
+                    candidate.to_canonical_bytes(),
+                ),
+            )
+            .await;
+        self.finish(execution, key, candidate).await
+    }
+
     pub async fn compare_and_set<Hash: Q256BitHash>(
         &self,
         sealed: &SealedBranchExactWriterCas<Hash>,

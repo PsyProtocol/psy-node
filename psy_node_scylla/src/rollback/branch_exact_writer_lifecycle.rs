@@ -163,10 +163,11 @@ impl BranchExactWriterIntentDigest {
     }
 
     fn from_rollback_plan_digest(plan_digest: [u8; 32]) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(b"psy.rollback.branch-exact-writer-restore-intent.v1\0");
-        hasher.update(plan_digest);
-        Self(hasher.finalize().into())
+        // The restore-plan digest is already domain-separated by the restore
+        // plan codec.  The timestamp allocator completes that exact digest,
+        // so the writer lifecycle must retain the same bytes just as a normal
+        // writer commit retains its dual-write intent bytes.
+        Self(plan_digest)
     }
 }
 
@@ -754,6 +755,42 @@ impl<Hash: Q256BitHash> StoredBranchExactWriterLifecycle<Hash> {
             revision: BranchExactWriterRevision(0),
             plan,
             state: BranchExactWriterState::ActivationPrepared,
+        }
+    }
+
+    /// Qualification-only source row for integration tests that exercise a
+    /// later storage-private owner.  The row uses the production codec and is
+    /// persisted by the real lifecycle adapter, but it does not mint a writer
+    /// activation receipt or expose a production write path.
+    #[cfg(test)]
+    pub(super) fn qualification_active_fixture(
+        authority: AuthorityScope,
+        watermark: BranchPendingMapping<Hash>,
+        timestamp_state: StoredAuthorityTimestampState,
+        last_intent: BranchExactDualWriteIntentDigest,
+        committed_writes: u64,
+        backfill_receipt: BranchExactBackfillVerifiedReceipt,
+    ) -> Self {
+        let plan = BranchExactWriterActivationPlan::test_fixture(
+            authority,
+            watermark,
+            timestamp_state.high_water(),
+            BranchExactShadowVerifiedDigest::from_persisted([0xA7; 32]),
+            backfill_receipt,
+        );
+        debug_assert_eq!(
+            plan.baseline_timestamp_state().high_water(),
+            timestamp_state.high_water()
+        );
+        Self {
+            revision: BranchExactWriterRevision(1),
+            plan,
+            state: BranchExactWriterState::Active(BranchExactWriterActive {
+                watermark,
+                timestamp_state,
+                committed_writes,
+                last_intent: Some(BranchExactWriterIntentDigest::from_intent(last_intent)),
+            }),
         }
     }
 
@@ -2010,6 +2047,93 @@ mod tests {
             key,
             active.timestamp_state(),
         )
+    }
+
+    #[test]
+    fn rollback_restored_writer_roundtrips_with_completed_restore_intent() {
+        let authority = AuthorityScope::Realm {
+            realm_id: 7,
+            realm_sub_id: 0,
+        };
+        let key = AuthorityTimestampKey::new(
+            NetworkId::try_from_chain_id(1337).unwrap(),
+            authority,
+        );
+        let source_intent = AuthorityCommitIntentDigest::from_sealed_commit_digest([0x55; 32]);
+        let source_idle = AuthorityTimestampBootstrap::new(
+            key,
+            CommitWriteTimestampUs::try_from_i128(1_000).unwrap(),
+            AuthorityTimestampBootstrapReason::ControlledWriterCutover,
+        )
+        .candidate();
+        let source_reservation = source_idle
+            .seal_reservation(
+                key,
+                source_intent,
+                AuthorityClockSampleUs::try_from_i128(1_100).unwrap(),
+            )
+            .unwrap();
+        let source_timestamp = source_reservation
+            .candidate()
+            .seal_completion(key, source_reservation.lease())
+            .unwrap()
+            .candidate();
+        let plan = BranchExactWriterActivationPlan::test_fixture(
+            authority,
+            mapping(1, 1),
+            CommitWriteTimestampUs::try_from_i128(1_000).unwrap(),
+            verified_shadow().digest(),
+            backfill_receipt(authority),
+        );
+        let source = StoredBranchExactWriterLifecycle {
+            revision: BranchExactWriterRevision(1),
+            plan,
+            state: BranchExactWriterState::Active(BranchExactWriterActive {
+                watermark: mapping(4, 4),
+                timestamp_state: source_timestamp,
+                committed_writes: 3,
+                last_intent: Some(BranchExactWriterIntentDigest([0x55; 32])),
+            }),
+        };
+        StoredBranchExactWriterLifecycle::<PHash>::decode_persisted(
+            source.slot().as_bytes(),
+            source.revision().as_i64(),
+            &source.to_canonical_bytes(),
+        )
+        .unwrap();
+
+        let restore_plan_digest = [0x77; 32];
+        let restore_reservation = source_timestamp
+            .seal_reservation(
+                key,
+                AuthorityCommitIntentDigest::from_sealed_commit_digest(restore_plan_digest),
+                AuthorityClockSampleUs::try_from_i128(1_200).unwrap(),
+            )
+            .unwrap();
+        let restore_timestamp = restore_reservation
+            .candidate()
+            .seal_completion(key, restore_reservation.lease())
+            .unwrap()
+            .candidate();
+        let restored_watermark = BranchPendingMapping::new(
+            chain(1, 1, 11),
+            UniquePendingId::try_new(1).unwrap(),
+        );
+        let sealed = SealedBranchExactWriterCas::rollback_restore(
+            &source,
+            restored_watermark,
+            ObservedAuthorityTimestampState::from_selected_row(key, restore_timestamp),
+            restore_plan_digest,
+        )
+        .unwrap();
+        let bytes = sealed.candidate().to_canonical_bytes();
+        let decoded = StoredBranchExactWriterLifecycle::<PHash>::decode_persisted(
+            sealed.candidate().slot().as_bytes(),
+            sealed.candidate().revision().as_i64(),
+            &bytes,
+        )
+        .unwrap();
+        assert_eq!(&decoded, sealed.candidate());
     }
 
     #[test]
