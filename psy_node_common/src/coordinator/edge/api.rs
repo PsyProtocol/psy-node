@@ -79,8 +79,10 @@ impl<
         input: GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
         proof: Vec<u8>,
         _realm_id: u64,
+        proposal: Option<Vec<u8>>,
+        certificate: Option<Vec<u8>>,
     ) -> QRpcResult<String> {
-        res(self.submit_guta_internal(input, proof).await)?;
+        res(self.submit_guta_internal(input, proof, proposal, certificate).await)?;
         Ok("ok".to_string())
     }
 

@@ -47,6 +47,7 @@ struct DriveState {
     >,
     inbound_body: HashMap<InboundRequestId, ResponseChannel<DirectBodyResponse>>,
     pending_direct: HashMap<OutboundRequestId, [u8; 32]>,
+    vote_backlog: HashMap<[u8; 32], Vec<Vote>>,
     vote_waiters: Vec<VoteWaiter>,
     end_cap_replies: FuturesUnordered<
         BoxFuture<'static, (ResponseChannel<EndCapForwardResponse>, Option<EndCapForwardResponse>)>,
@@ -62,6 +63,7 @@ impl DriveState {
             pending_finalize: HashMap::new(),
             inbound_body: HashMap::new(),
             pending_direct: HashMap::new(),
+            vote_backlog: HashMap::new(),
             vote_waiters: Vec::new(),
             end_cap_replies: FuturesUnordered::new(),
         }
@@ -223,12 +225,18 @@ impl RealmNetwork {
                     )));
                     return;
                 }
+                let votes = state.vote_backlog.remove(&proposal_id).unwrap_or_default();
+                if votes.len() >= threshold {
+                    let _ = response.send(Ok(votes));
+                    return;
+                }
+                let seen = votes.iter().map(|vote| vote.signer_sub_id).collect();
                 state.vote_waiters.push(VoteWaiter {
                     proposal_id,
                     threshold,
                     deadline: Instant::now() + timeout,
-                    votes: Vec::new(),
-                    seen: HashSet::new(),
+                    votes,
+                    seen,
                     response,
                 });
             }
@@ -680,17 +688,22 @@ fn sha_body_hash(body: &[u8]) -> [u8; 32] {
 }
 
 fn feed_vote_waiters(state: &mut DriveState, vote: &Vote) {
+    let mut delivered = false;
     let mut completed = Vec::new();
     for (index, waiter) in state.vote_waiters.iter_mut().enumerate() {
-        if waiter.proposal_id != vote.proposal_id {
+        if waiter.proposal_id != vote.proposal_id || !waiter.seen.insert(vote.signer_sub_id) {
             continue;
         }
-        if !waiter.seen.insert(vote.signer_sub_id) {
-            continue;
-        }
+        delivered = true;
         waiter.votes.push(vote.clone());
         if waiter.votes.len() >= waiter.threshold {
             completed.push(index);
+        }
+    }
+    if !delivered {
+        let votes = state.vote_backlog.entry(vote.proposal_id).or_default();
+        if !votes.iter().any(|existing| existing.signer_sub_id == vote.signer_sub_id) {
+            votes.push(vote.clone());
         }
     }
     for index in completed.into_iter().rev() {

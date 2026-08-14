@@ -213,6 +213,12 @@ impl<
         Self::checkpoint_state_from_parts(&self.current_checkpoint_leaf, &self.current_global_state_roots)
     }
 
+    fn checkpoint_state_for_ups_cfc(&self, user_tree_root: QHashOut<F>) -> PsyCheckpointLeafCompactWithStateRoots<F> {
+        let mut roots = self.current_global_state_roots;
+        roots.user_tree_root = user_tree_root;
+        Self::checkpoint_state_from_parts(&self.current_checkpoint_leaf, &roots)
+    }
+
     pub fn get_current_ups_header(&self) -> &UserProvingSessionHeader<F> {
         &self.current_ups_header
     }
@@ -372,6 +378,7 @@ impl<
 
         let mut state_roots = self.current_global_state_roots.clone();
         state_roots.user_tree_root = user_tree_proof.root;
+        self.current_global_state_roots.user_tree_root = user_tree_proof.root;
 
         // Debug logging for checkpoint consistency
         let header_checkpoint_id = self.current_ups_header.session_start_context.checkpoint_id.to_canonical_u64();
@@ -571,6 +578,8 @@ impl<
         }
 
         let inner_public_inputs_hash = input.ups_header.qfhash::<H>();
+        self.current_checkpoint_leaf = input.checkpoint_leaf.clone();
+        self.current_global_state_roots = input.state_roots.clone();
         // When a previously-produced proof is supplied, re-inject it instead of
         // re-proving (staged / multi-session step proving). Otherwise prove now.
         let proof = if let Some(precomputed) = precomputed {

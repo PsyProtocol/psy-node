@@ -15,8 +15,33 @@ pub struct RealmProcessorStartConfig {
     pub checkpoint_backup_path: String,
     pub coordinator_api_urls: Vec<String>,
     pub genesis_data_path: Option<String>,
+    #[serde(default)]
+    pub p2p_identity_key_path: Option<String>,
+    #[serde(default)]
+    pub p2p_bls_key_path: Option<String>,
+    #[serde(default)]
+    pub p2p_listen: Option<String>,
+    #[serde(default)]
+    pub p2p_bootnodes: Vec<String>,
+    #[serde(default)]
+    pub p2p_coordinator: Option<String>,
+    #[serde(default)]
+    pub p2p_validator_sub_ids: Vec<u16>,
+    #[serde(default)]
+    pub p2p_checkpoints_per_epoch: Option<u64>,
+    #[serde(default)]
+    pub p2p_proposer_node_ids: Vec<String>,
+    #[serde(default)]
+    pub p2p_validator_user_id: Option<u64>,
+    #[serde(default)]
+    pub p2p_roster_path: Option<String>,
 }
 impl RealmProcessorStartConfig {
+    /// True when the optional Realm P2P transport is wired. Empty fields
+    /// (the default) leave the node on today's HTTP/NATS path.
+    pub fn realm_p2p_enabled(&self) -> bool {
+        self.p2p_identity_key_path.is_some() && self.p2p_listen.is_some()
+    }
     pub fn get_checkpoint_tree_backup_file_path(&self) -> String {
         format!(
             "{}/realm_{}_{}/checkpoint_tree.bin",
@@ -44,8 +69,32 @@ pub struct RealmEdgeStartConfig {
     pub verbose: bool,
     pub port: u16,
     pub listen: String,
+    #[serde(default)]
+    pub p2p_identity_key_path: Option<String>,
+    #[serde(default)]
+    pub p2p_bls_key_path: Option<String>,
+    #[serde(default)]
+    pub p2p_listen: Option<String>,
+    #[serde(default)]
+    pub p2p_bootnodes: Vec<String>,
+    #[serde(default)]
+    pub p2p_coordinator: Option<String>,
+    #[serde(default)]
+    pub p2p_validator_sub_ids: Vec<u16>,
+    #[serde(default)]
+    pub p2p_checkpoints_per_epoch: Option<u64>,
+    #[serde(default)]
+    pub p2p_proposer_node_ids: Vec<String>,
+    #[serde(default)]
+    pub p2p_validator_user_id: Option<u64>,
 }
-
+impl RealmEdgeStartConfig {
+    /// True when the optional Realm P2P transport is wired. Empty fields
+    /// (the default) leave the node on today's HTTP/NATS path.
+    pub fn realm_p2p_enabled(&self) -> bool {
+        self.p2p_identity_key_path.is_some() && self.p2p_listen.is_some()
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CoordinatorProcessorStartConfig {
     pub scylla_db_url: String,
@@ -99,4 +148,6 @@ pub struct CoordinatorEdgeStartConfig {
     pub verbose: bool,
     pub port: u16,
     pub listen: String,
+    #[serde(default)]
+    pub p2p_roster_path: Option<String>,
 }

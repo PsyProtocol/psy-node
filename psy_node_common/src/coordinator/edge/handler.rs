@@ -8,12 +8,18 @@ use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_crypto::hash::tx_hash::{compute_deploy_contract_content_hash, hash_to_hex};
 use psy_api_core::CheckpointJobStats;
 use psy_data::{
-    guta::header_extended::{GlobalUserTreeAggregatorHeaderWithTagValueAndJobID, GlobalUserTreeAggregatorHeaderWithTagValueAndJobType}, prepared_block::realm::PsyRealmCoordinatorUpdate, v1::{
+    guta::{
+        header_extended::{GlobalUserTreeAggregatorHeaderWithTagValueAndJobID, GlobalUserTreeAggregatorHeaderWithTagValueAndJobType},
+        realm_finalize::protocol_encode_finalize_output,
+    },
+    p2p::{sha256, Certificate, Proposal},
+    prepared_block::realm::PsyRealmCoordinatorUpdate,
+    v1::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
             checkpoint::PQEDCheckpointGlobalStateRoots, checkpoint_sync::PQEDCheckpointSyncInfoCompact, contract::{DashMapContractHeightCache, PQBCDeployContract, PsyDeployContractQueueItem}, public_key::PZKPublicKeyInfo
         },
-    }
+    },
 };
 use psy_node_core::{
     psy_core_db::traits::full::{PsyCoordinatorEdgeAPIStoreReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter},
@@ -23,7 +29,10 @@ use psy_node_core::{
 };
 use psy_serialize::{PsyCanonicalDatabaseSerializeBaseMulti, PsyCanonicalDatabaseSerializeBaseSingle};
 
-use crate::coordinator::queue_key::{CoordinatorDeployContractQueueKey, CoordinatorRegisterUserPublicKeyQueueKey, CoordinatorSubmitRealmGUTAUpdateQueueKey};
+use crate::{
+    coordinator::queue_key::{CoordinatorDeployContractQueueKey, CoordinatorRegisterUserPublicKeyQueueKey, CoordinatorSubmitRealmGUTAUpdateQueueKey},
+    realm::processor::consensus::{build_bound_finalize_output, validate_certificate},
+};
 
 // const END_CAP_PROOF_CIRCUIT_TYPE_U32: u32 = ProvingJobCircuitType::UserEndCap as u32;
 pub struct CoordinatorEdgeHandler<
@@ -55,6 +64,7 @@ pub struct CoordinatorEdgeHandler<
     pub contract_state_tree_height_cache: Arc<DashMapContractHeightCache<N::QHash>>,
 
     pub checkpoint_state_transition_circuit_fingerprint: N::QHash,
+    pub validator_registry: Option<crate::coordinator::validator_registry::ValidatorRegistry>,
 }
 impl<
         N: QNetworkTypesConfig,
@@ -95,6 +105,7 @@ impl<
             proof_verifier: self.proof_verifier.clone(),
             contract_state_tree_height_cache: self.contract_state_tree_height_cache.clone(),
             checkpoint_state_transition_circuit_fingerprint: self.checkpoint_state_transition_circuit_fingerprint.clone(),
+            validator_registry: self.validator_registry.clone(),
         }
     }
 }
@@ -151,8 +162,16 @@ impl<
             proof_verifier,
             contract_state_tree_height_cache: Arc::new(DashMapContractHeightCache::new()),
             checkpoint_state_transition_circuit_fingerprint,
+            validator_registry: None,
         }
     }
+    pub fn set_validator_registry(
+        &mut self,
+        registry: crate::coordinator::validator_registry::ValidatorRegistry,
+    ) {
+        self.validator_registry = Some(registry);
+    }
+
     pub async fn get_checkpoint_leaves_batch_raw_internal(&self, start_checkpoint_id: u64, count: u32) -> anyhow::Result<Vec<u8>>{
         let latest_checkpoint_id = self.get_latest_checkpoint_id_internal().await?;
         if count > 10000 {
@@ -455,6 +474,8 @@ impl<
         &self,
         input: GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
         proof_bytes: Vec<u8>,
+        proposal_bytes: Option<Vec<u8>>,
+        certificate_bytes: Option<Vec<u8>>,
     ) -> anyhow::Result<()>
     where
         N::ZKVerifier: 'static,
@@ -506,6 +527,15 @@ impl<
             unique_pending_id,
             proving_circuit_type,
         )?;
+        self.verify_optional_guta_certificate(
+            realm_id,
+            &input,
+            &proof_bytes,
+            proposal_bytes.as_deref(),
+            certificate_bytes.as_deref(),
+        )
+        .await?;
+
 
         let expected_public_inputs_hash = input.qfhash::<N::HasherBase>();
         let proof_verifier = self.proof_verifier.clone();
@@ -583,4 +613,94 @@ impl<
 
         Ok(())
     }
+
+    async fn verify_optional_guta_certificate(
+        &self,
+        realm_id: u32,
+        input: &GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
+        proof_bytes: &[u8],
+        proposal_bytes: Option<&[u8]>,
+        certificate_bytes: Option<&[u8]>,
+    ) -> anyhow::Result<()> {
+        let Some(registry) = self.validator_registry.as_ref() else {
+            anyhow::ensure!(
+                proposal_bytes.is_none() && certificate_bytes.is_none(),
+                "GUTA Proposal/Certificate supplied but coordinator has no validator roster"
+            );
+            return Ok(());
+        };
+        let (occupied, keys) =
+            crate::coordinator::validator_registry::realm_certificate_roster(realm_id, registry)?;
+        if occupied.is_empty() {
+            anyhow::ensure!(
+                proposal_bytes.is_none() && certificate_bytes.is_none(),
+                "GUTA Proposal/Certificate supplied for realm {realm_id} with empty validator roster"
+            );
+            return Ok(());
+        }
+        let proposal = Proposal::decode_exact(proposal_bytes.ok_or_else(|| {
+            anyhow::anyhow!("rotation enabled but GUTA Proposal missing for realm {realm_id}")
+        })?)
+        .map_err(|error| anyhow::anyhow!("invalid GUTA Proposal for realm {realm_id}: {error}"))?;
+        let certificate = Certificate::decode_exact(certificate_bytes.ok_or_else(|| {
+            anyhow::anyhow!("rotation enabled but GUTA Certificate missing for realm {realm_id}")
+        })?)
+        .map_err(|error| anyhow::anyhow!("invalid GUTA Certificate for realm {realm_id}: {error}"))?;
+        anyhow::ensure!(proposal.compute_proposal_id() == proposal.proposal_id, "GUTA proposal_id mismatch");
+        anyhow::ensure!(proposal.realm_id == realm_id, "GUTA Proposal realm mismatch");
+        anyhow::ensure!(proposal.finalizer_proof_hash == sha256(proof_bytes), "GUTA Proposal proof hash mismatch");
+
+        let committed_head_checkpoint_id = self.get_latest_checkpoint_id_internal().await?;
+        anyhow::ensure!(
+            proposal.base_checkpoint_id == committed_head_checkpoint_id,
+            "GUTA Proposal base checkpoint does not match coordinator committed head"
+        );
+        let expected_target_checkpoint_id = committed_head_checkpoint_id.checked_add(1).ok_or_else(|| {
+            anyhow::anyhow!(
+                "GUTA Proposal target checkpoint cannot be derived because coordinator committed head overflowed"
+            )
+        })?;
+        anyhow::ensure!(
+            proposal.target_checkpoint_id == expected_target_checkpoint_id,
+            "GUTA Proposal target checkpoint does not immediately follow coordinator committed head"
+        );
+        let proof_base_roots = self
+            .db_reader
+            .get_checkpoint_global_state_roots(proposal.base_checkpoint_id)
+            .await?;
+        anyhow::ensure!(
+            proposal.validator_tree_root == proof_base_roots.validator_tree_root.into_owned_32bytes(),
+            "GUTA Proposal validator_tree_root does not match proof-base checkpoint"
+        );
+        let proposer = registry
+            .get(&(realm_id, proposal.proposer_sub_id))
+            .ok_or_else(|| anyhow::anyhow!("GUTA proposer sub_id {} is not occupied", proposal.proposer_sub_id))?;
+        let output = build_bound_finalize_output::<N>(
+            proposal.chain_id,
+            proposal.target_checkpoint_id,
+            proposal.realm_id,
+            proposal.proposer_sub_id,
+            proposer.validator_user_id,
+            proof_base_roots.validator_tree_root,
+            input,
+        );
+        let output_bytes = protocol_encode_finalize_output(&output)?;
+        anyhow::ensure!(proposal.public_output_hash == sha256(&output_bytes), "GUTA Proposal public output hash mismatch");
+        validate_certificate(&proposal, &certificate, &occupied, &keys)
+            .map_err(|error| anyhow::anyhow!("invalid GUTA Certificate for realm {realm_id}: {error}"))?;
+        if occupied.len() > 1 {
+            anyhow::ensure!(
+                certificate.popcount() >= 2,
+                "GUTA Certificate for realm {realm_id} requires at least two signers when the roster has more than one validator"
+            );
+        }
+        tracing::info!(
+            "realm P2P certificate bound realm={} target={} signers={}",
+            realm_id,
+            certificate.target_checkpoint_id,
+            certificate.popcount()
+        );
+        Ok(())
+    }
+
 }

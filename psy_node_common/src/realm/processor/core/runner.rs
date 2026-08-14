@@ -1,6 +1,10 @@
 
 use cf_utils::log_indicator::print_cf_log_indicator;
-use parth_core::protocol::core_types::QNetworkTypesConfig;
+use parth_core::{
+    crypto::hash::traits::HashTo4Felts,
+    felt::ToU64Value,
+    protocol::core_types::QNetworkTypesConfig,
+};
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
@@ -67,6 +71,14 @@ where
 
             if current_slot != last_slot && current_slot % 30 == 0 {
                 last_slot = current_slot;
+                if !processor.is_scheduled_proposer().await? {
+                    tracing::info!(
+                        "realm P2P non-proposer skip produce sub_id={} target={}",
+                        processor.db.state.realm_sub_id_u64,
+                        processor.db.state.processing_checkpoint_id
+                    );
+                    continue;
+                }
                 let start_processing_at = std::time::Instant::now();
 
                 tracing::debug!("[REALM] Process block starting...");
@@ -151,5 +163,53 @@ where
             tracing::info!("All realm processor threads completed");
             Ok(())
         }
+    }
+}
+
+impl<
+        N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
+        S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync,
+        STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync,
+        GUTAUpdateQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
+        ProofWorkQueue: QStandardWorkerQueuePublisher + QStandardWorkerQueueSubscriber + Send + Sync + 'static,
+        TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + Send + Sync + 'static,
+        ProofStore: QParthProofStore + Send + Sync + 'static,
+        FileSystem: TokioLikeFileSystem + Send + Sync + 'static,
+        CoordinatorClient: RealmCoordinatorClient<N::F, N::QHash> + Send + Sync + 'static,
+    > PsyRealmProcessor<N, S, STagTreeRewards, GUTAUpdateQueue, ProofWorkQueue, TempDatabase, ProofStore, FileSystem, CoordinatorClient>
+where
+    N: 'static,
+    FileSystem::File: Send + Sync + 'static,
+{
+    /// True when this processor should produce a block for `processing_checkpoint_id`.
+    /// Unset P2P / rotation (or disabled rotation) keeps today's single-producer path.
+    pub async fn is_scheduled_proposer(&self) -> anyhow::Result<bool> {
+        let Some(rotation) = self.rotation.as_ref() else {
+            return Ok(true);
+        };
+        if self.p2p.is_none() || !rotation.is_enabled() {
+            return Ok(true);
+        }
+        let target = self.db.state.processing_checkpoint_id;
+        let epoch = parth_common::realm_rotation::epoch(target, rotation.checkpoints_per_epoch);
+        let anchor_id = parth_common::realm_rotation::anchor_checkpoint_id(epoch, rotation.checkpoints_per_epoch);
+        let anchor_leaf = self.db.db.get_checkpoint_leaf_data(anchor_id).await?;
+        let seed_felts = anchor_leaf.stats.random_seed.to_4_felts();
+        let anchor_seed = [
+            seed_felts[0].to_u64_value(),
+            seed_felts[1].to_u64_value(),
+            seed_felts[2].to_u64_value(),
+            seed_felts[3].to_u64_value(),
+        ];
+        let scheduled_proposer = rotation
+            .proposer_sub_id(self.db.state.realm_id_u64 as u32, target, anchor_seed)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "rotation enabled but proposer_sub_id returned None for realm {} target {}",
+                    self.db.state.realm_id_u64,
+                    target
+                )
+            })?;
+        Ok(scheduled_proposer == self.db.state.realm_sub_id_u64 as u16)
     }
 }

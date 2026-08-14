@@ -944,7 +944,136 @@ function faucetServerStartedDetector(line: string): boolean {
         || line.includes('Starting psy faucet server')
         || line.includes('psy faucet server mode enabled');
 }
-function l1StartedDetector(line: string): boolean { return line.includes('Listening on'); }
+
+const REALM_P2P_OUT_DIR = "./local_checkpoints/realm_p2p";
+const REALM_P2P_SUB_IDS = [1, 2] as const;
+
+type RealmP2pSubEntry = {
+    processor_node_id_hex38: string;
+    processor_peer_id: string;
+    edge_node_id_hex38: string;
+    edge_peer_id: string;
+    bls_public_hex: string;
+    processor_identity_path: string;
+    edge_identity_path: string;
+    bls_path: string;
+};
+
+type RealmP2pRoster = {
+    coordinator: { peer_id: string; node_id_hex38: string; identity_path: string };
+    realms: Record<string, Record<string, RealmP2pSubEntry>>;
+};
+
+function realmP2pProcessorPort(realmId: number, subId: number): number {
+    return 41000 + realmId * 20 + subId;
+}
+
+function realmP2pEdgePort(realmId: number, subId: number): number {
+    return 41100 + realmId * 20 + subId;
+}
+
+function realmP2pListen(host: string, port: number): string {
+    return `/ip4/${host}/tcp/${port}`;
+}
+
+function realmP2pBootnode(host: string, port: number, peerId: string): string {
+    return `/ip4/${host}/tcp/${port}/p2p/${peerId}`;
+}
+
+function realmP2pValidatorUserId(realmId: number, subId: number): number {
+    return (realmId * (1 << 20)) + subId;
+}
+
+function realmP2pHttpPort(realmId: number, subId: number, edgeIndex: number, realmEdgeCount: number): number {
+    const base = 13380 + realmId * 10;
+    return subId === 1 ? base + edgeIndex : base + realmEdgeCount + edgeIndex;
+}
+
+async function ensureRealmP2pRoster(
+    nodeCli: string,
+    cwd: string,
+    realmIds: number[],
+): Promise<RealmP2pRoster> {
+    const rosterPath = path.join(cwd, "local_checkpoints", "realm_p2p", "roster.json");
+    if (await exists(rosterPath)) {
+        const existing = JSON.parse(await fs.promises.readFile(rosterPath, "utf-8")) as RealmP2pRoster;
+        const complete = realmIds.every((realmId) =>
+            REALM_P2P_SUB_IDS.every((subId) => existing.realms?.[String(realmId)]?.[String(subId)]),
+        );
+        if (complete) {
+            console.log(`[DevNet] Reusing Realm P2P roster at ${REALM_P2P_OUT_DIR}/roster.json`);
+            return existing;
+        }
+    }
+    const args = [
+        nodeCli, "init-realm-p2p-keys",
+        "--out-dir", REALM_P2P_OUT_DIR,
+        "--realm-ids", realmIds.join(","),
+        "--sub-ids", REALM_P2P_SUB_IDS.join(","),
+    ];
+    console.log(`[DevNet] Generating Realm P2P keys: ${args.join(" ")}`);
+    const proc = Bun.spawn(args, { cwd, stdout: "pipe", stderr: "pipe" });
+    const exit = await proc.exited;
+    if (exit !== 0) {
+        const err = await new Response(proc.stderr).text();
+        throw new Error(`init-realm-p2p-keys failed (${exit}): ${err}`);
+    }
+    return JSON.parse(await fs.promises.readFile(rosterPath, "utf-8")) as RealmP2pRoster;
+}
+
+function realmP2pProcessorExtraArgs(
+    host: string,
+    realmId: number,
+    subId: number,
+    roster: RealmP2pRoster,
+): string[] {
+    const self = roster.realms[String(realmId)][String(subId)];
+    const otherSub = subId === 1 ? 2 : 1;
+    const other = roster.realms[String(realmId)][String(otherSub)];
+    return [
+        "--p2p-identity-key", self.processor_identity_path,
+        "--p2p-bls-key", self.bls_path,
+        "--p2p-listen", realmP2pListen(host, realmP2pProcessorPort(realmId, subId)),
+        "--p2p-bootnode", realmP2pBootnode(host, realmP2pProcessorPort(realmId, otherSub), other.processor_peer_id),
+        "--p2p-coordinator", realmP2pBootnode(host, 40999, roster.coordinator.peer_id),
+        "--p2p-validator-sub-ids", "1,2",
+        "--p2p-checkpoints-per-epoch", "10",
+        "--p2p-validator-user-id", realmP2pValidatorUserId(realmId, subId).toString(),
+        "--p2p-roster-path", `${REALM_P2P_OUT_DIR}/roster.json`,
+    ];
+}
+
+function realmP2pEdgeExtraArgs(
+    host: string,
+    realmId: number,
+    subId: number,
+    roster: RealmP2pRoster,
+): string[] {
+    const self = roster.realms[String(realmId)][String(subId)];
+    const subs = roster.realms[String(realmId)];
+    const args = [
+        "--p2p-identity-key", self.edge_identity_path,
+        "--p2p-listen", realmP2pListen(host, realmP2pEdgePort(realmId, subId)),
+        "--p2p-validator-sub-ids", "1,2",
+        "--p2p-checkpoints-per-epoch", "10",
+    ];
+    for (const [otherSub, other] of Object.entries(subs)) {
+        const otherSubId = Number(otherSub);
+        args.push(
+            "--p2p-bootnode",
+            realmP2pBootnode(host, realmP2pProcessorPort(realmId, otherSubId), other.processor_peer_id),
+            "--p2p-proposer-node-id",
+            `${otherSub}:${other.edge_node_id_hex38}`,
+        );
+        if (otherSubId !== subId) {
+            args.push(
+                "--p2p-bootnode",
+                realmP2pBootnode(host, realmP2pEdgePort(realmId, otherSubId), other.edge_peer_id),
+            );
+        }
+    }
+    return args;
+}
 function relayerStartedDetector(line: string): boolean {
     return line.includes("connected to indexer postgres")
         || line.includes("envio schema is ready")
@@ -3060,6 +3189,7 @@ interface ProcessOptions {
     explorer?: boolean;
     daemonlize?: boolean;
     cleanState?: boolean;
+    realmP2p?: boolean;
 }
 
 class DevNetProcessManager {
@@ -3449,6 +3579,14 @@ class DevNetProcessManager {
 
         const nodeCli = './target/release/psy_node_cli';
         const workerCli = './target/release/psy_worker_cli';
+        const realmP2p = !!options.realmP2p;
+        const realmP2pSubIds: readonly number[] = realmP2p ? REALM_P2P_SUB_IDS : [1];
+        let realmP2pRoster: RealmP2pRoster | null = null;
+        if (realmP2p && (startCoordinatorProcessor || startRealmProcessor)) {
+            const allRealmIds = Array.from({ length: realmsCount }, (_, i) => startRealmId + i);
+            realmP2pRoster = await ensureRealmP2pRoster(nodeCli, cwd, allRealmIds);
+        }
+
 
         // 3. Coordinator Processor
         if (startCoordinatorProcessor) {
@@ -3501,7 +3639,8 @@ class DevNetProcessManager {
                         '--port', port.toString(),
                         '--listen', '0.0.0.0',
                         '--proving-backend', backend,
-                        '--verbose'
+                        '--verbose',
+                        ...(realmP2p ? ['--p2p-roster-path', `${REALM_P2P_OUT_DIR}/roster.json`] : []),
                     ],
                     coordinatorEdgeProcessorStartedDetector,
                     { cwd, ...getLogPaths(`coordinator_edge_${j}`, true), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
@@ -3544,7 +3683,8 @@ class DevNetProcessManager {
 
         if (startRealmProcessor) {
             processorReadiness = (async () => {
-                console.log(`[DevNet] Starting ${realmsCount} realm processors and edges sequentially...`);
+                const subLabel = realmP2p ? " (subs 1 and 2)" : "";
+                console.log(`[DevNet] Starting ${realmsCount} realm processors and edges sequentially${subLabel}...`);
                 for (let b = 0; b < realmsCount; b += 4) {
                     const batchSize = Math.min(4, realmsCount - b);
                     const realmIds = Array.from(
@@ -3552,71 +3692,88 @@ class DevNetProcessManager {
                         (_, i) => startRealmId + b + i,
                     );
 
-                    await startRealmProcessorBatchSequentially(
-                        realmIds,
-                        async (realmId) => {
-                            const realmLogPaths = getLogPaths(`realm_${realmId}_processor`, false);
-                            const proc = await retryProcessorStartup(
-                                `realm ${realmId} processor`,
-                                (attempt, totalAttempts) => RunningProcess.spawnWithInitializationHint(
-                                    [
-                                        nodeCli, 'start-realm-processor',
-                                        '--realm-id', realmId.toString(),
-                                        '--realm-sub-id', '1',
-                                        '--network', this.NETWORK,
-                                        '--db-namespace', 'realm_' + realmId,
-                                        '--scylla-db-url', this.SCYLLA_URL,
-                                        '--nats-jetstream-url', this.NATS_URL,
-                                        '--redis-url', this.REDIS_URL,
-                                        '--genesis-data-path', this.genesisDataPath,
-                                        '--checkpoint-backup-path', './local_checkpoints',
-                                        '--coordinator-api-urls', this.COORD_API_URL,
-                                        '--proving-backend', backend,
-                                        '--verbose'
-                                    ],
-                                    (line) => isExactProcessorReadyLine(line, REALM_PROCESSOR_READY_MARKER),
-                                    {
-                                        cwd,
-                                        ...realmLogPaths,
-                                        initializationTimeoutMs: 180_000,
-                                        env: this.getEnv(),
-                                        appendLogs: attempt > 1,
-                                        logBanner: `===== realm ${realmId} processor readiness attempt ${attempt}/${totalAttempts} =====`,
-                                    },
-                                ),
-                                { maxRetries: 3, retryDelayMs: 2000 },
-                            );
-                            this.track(proc);
-                            return proc;
-                        },
-                    );
+                    for (const subId of realmP2pSubIds) {
+                        await startRealmProcessorBatchSequentially(
+                            realmIds,
+                            async (realmId) => {
+                                const logName = subId === 1
+                                    ? `realm_${realmId}_processor`
+                                    : `realm_${realmId}_sub_${subId}_processor`;
+                                const realmLogPaths = getLogPaths(logName, false);
+                                const extra = realmP2pRoster
+                                    ? realmP2pProcessorExtraArgs(this.host, realmId, subId, realmP2pRoster)
+                                    : [];
+                                const proc = await retryProcessorStartup(
+                                    `realm ${realmId} sub ${subId} processor`,
+                                    (attempt, totalAttempts) => RunningProcess.spawnWithInitializationHint(
+                                        [
+                                            nodeCli, 'start-realm-processor',
+                                            '--realm-id', realmId.toString(),
+                                            '--realm-sub-id', subId.toString(),
+                                            '--network', this.NETWORK,
+                                            '--db-namespace', 'realm_' + realmId,
+                                            '--scylla-db-url', this.SCYLLA_URL,
+                                            '--nats-jetstream-url', this.NATS_URL,
+                                            '--redis-url', this.REDIS_URL,
+                                            '--genesis-data-path', this.genesisDataPath,
+                                            '--checkpoint-backup-path', './local_checkpoints',
+                                            '--coordinator-api-urls', this.COORD_API_URL,
+                                            '--proving-backend', backend,
+                                            '--verbose',
+                                            ...extra,
+                                        ],
+                                        (line) => isExactProcessorReadyLine(line, REALM_PROCESSOR_READY_MARKER),
+                                        {
+                                            cwd,
+                                            ...realmLogPaths,
+                                            initializationTimeoutMs: 180_000,
+                                            env: this.getEnv(),
+                                            appendLogs: attempt > 1,
+                                            logBanner: `===== realm ${realmId} sub ${subId} processor readiness attempt ${attempt}/${totalAttempts} =====`,
+                                        },
+                                    ),
+                                    { maxRetries: 3, retryDelayMs: 2000 },
+                                );
+                                this.track(proc);
+                                return proc;
+                            },
+                        );
+                    }
                     console.log(`[DevNet] Batch ${b/4 + 1} realm processors finished genesis initialization.`);
 
                     const realmEdgesPromises: Promise<RunningProcess>[] = [];
                     for (let i = 0; i < batchSize; i++) {
                         const realmId = startRealmId + b + i;
-                        const realmEdgeStartPort = 13380 + realmId * 10;
-                        for (let j = 0; j < realmEdgeCount; j++) {
-                            const port = realmEdgeStartPort + j;
-                            const edgePromise = RunningProcess.spawnWithInitializationHintWithRetry(
-                                [
-                                    nodeCli, 'start-realm-edge',
-                                    '--realm-id', realmId.toString(),
-                                    '--realm-sub-id', '1',
-                                    '--network', this.NETWORK,
-                                    '--db-namespace', 'realm_' + realmId,
-                                    '--scylla-db-url', this.SCYLLA_URL,
-                                    '--nats-jetstream-url', this.NATS_URL,
-                                    '--redis-url', this.REDIS_URL,
-                                    '--port', port.toString(),
-                                    '--listen', '0.0.0.0',
-                                    '--proving-backend', backend,
-                                    '--verbose'
-                                ],
-                                realmEdgeProcessorStartedDetector,
-                                { cwd, ...getLogPaths(`realm_edge_${realmId}_${j}`, true), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
-                            ).then(proc => this.track(proc));
-                            realmEdgesPromises.push(edgePromise);
+                        for (const subId of realmP2pSubIds) {
+                            for (let j = 0; j < realmEdgeCount; j++) {
+                                const port = realmP2pHttpPort(realmId, subId, j, realmEdgeCount);
+                                const extra = realmP2pRoster
+                                    ? realmP2pEdgeExtraArgs(this.host, realmId, subId, realmP2pRoster)
+                                    : [];
+                                const logName = subId === 1
+                                    ? `realm_edge_${realmId}_${j}`
+                                    : `realm_edge_${realmId}_sub_${subId}_${j}`;
+                                const edgePromise = RunningProcess.spawnWithInitializationHintWithRetry(
+                                    [
+                                        nodeCli, 'start-realm-edge',
+                                        '--realm-id', realmId.toString(),
+                                        '--realm-sub-id', subId.toString(),
+                                        '--network', this.NETWORK,
+                                        '--db-namespace', 'realm_' + realmId,
+                                        '--scylla-db-url', this.SCYLLA_URL,
+                                        '--nats-jetstream-url', this.NATS_URL,
+                                        '--redis-url', this.REDIS_URL,
+                                        '--port', port.toString(),
+                                        '--listen', '0.0.0.0',
+                                        '--proving-backend', backend,
+                                        '--verbose',
+                                        ...extra,
+                                    ],
+                                    realmEdgeProcessorStartedDetector,
+                                    { cwd, ...getLogPaths(logName, true), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
+                                ).then(proc => this.track(proc));
+                                realmEdgesPromises.push(edgePromise);
+                            }
                         }
                     }
                     await Promise.all(realmEdgesPromises);
@@ -3644,13 +3801,10 @@ class DevNetProcessManager {
                     const realmUrls: string[] = [];
                     for (let realmIndex = startRealmForWorker; realmIndex < endRealmForWorker; realmIndex++) {
                         const realmId = startRealmId + realmIndex;
-                        const realmEdgeStartPort = 13380 + realmId * 10;
-
-                        // Connect to all edges of this realm for better load distribution
-                        for (let edgeIndex = 0; edgeIndex < realmEdgeCount; edgeIndex++) {
-                            const edgePort = realmEdgeStartPort + edgeIndex;
-                            const realmUrl = `http://${this.host}:${edgePort}`;
-                            realmUrls.push(realmUrl);
+                        for (const subId of realmP2pSubIds) {
+                            for (let edgeIndex = 0; edgeIndex < realmEdgeCount; edgeIndex++) {
+                                realmUrls.push(`http://${this.host}:${realmP2pHttpPort(realmId, subId, edgeIndex, realmEdgeCount)}`);
+                            }
                         }
                     }
 
@@ -3685,14 +3839,11 @@ class DevNetProcessManager {
                 let workerId = 0;
                 for (let realmIndex = 0; realmIndex < realmsCount; realmIndex++) {
                     const realmId = startRealmId + realmIndex;
-                    const realmEdgeStartPort = 13380 + realmId * 10;
-
                     const realmUrls: string[] = [];
-                    // Connect to all edges of this realm
-                    for (let edgeIndex = 0; edgeIndex < realmEdgeCount; edgeIndex++) {
-                        const edgePort = realmEdgeStartPort + edgeIndex;
-                        const realmUrl = `http://${this.host}:${edgePort}`;
-                        realmUrls.push(realmUrl);
+                    for (const subId of realmP2pSubIds) {
+                        for (let edgeIndex = 0; edgeIndex < realmEdgeCount; edgeIndex++) {
+                            realmUrls.push(`http://${this.host}:${realmP2pHttpPort(realmId, subId, edgeIndex, realmEdgeCount)}`);
+                        }
                     }
 
                     const numWorkersForRealm = workersPerRealm + (realmIndex < extraWorkers ? 1 : 0);
@@ -4178,6 +4329,14 @@ class DevNetProcessManager {
         const endRealmId = startRealmId + realmsCount - 1;
 
         const backend = this.provingBackend || (jtmb ? 'jtmb-poseidon-goldilocks' : 'plonky2-poseidon-goldilocks');
+        const realmP2p = !!options.realmP2p;
+        const realmP2pSubIds: readonly number[] = realmP2p ? REALM_P2P_SUB_IDS : [1];
+        let realmP2pRoster: RealmP2pRoster | null = null;
+        if (realmP2p && (startCoordinatorProcessor || startRealmProcessor)) {
+            const allRealmIds = Array.from({ length: realmsCount }, (_, i) => startRealmId + i);
+            realmP2pRoster = await ensureRealmP2pRoster("./target/release/psy_node_cli", cwd, allRealmIds);
+        }
+
 
         const services: any = {};
         const networkName = "psy-devnet";
@@ -4329,7 +4488,8 @@ class DevNetProcessManager {
                         "--port", port.toString(),
                         "--listen", "0.0.0.0",
                         "--proving-backend", backend,
-                        "--verbose"
+                        "--verbose",
+                        ...(realmP2p ? ["--p2p-roster-path", `${REALM_P2P_OUT_DIR}/roster.json`] : []),
                     ]),
                     ports: [`${port}:${port}`]
                 };
@@ -4357,41 +4517,56 @@ class DevNetProcessManager {
         if (startRealmProcessor) {
             for (let i = 0; i < realmsCount; i++) {
                 const realmId = startRealmId + i;
-                services[`realm-${realmId}-processor`] = getRuntimeServiceEntry(`realm-${realmId}-processor`, [
-                    "/app/bin/psy_node_cli", "start-realm-processor",
-                    "--realm-id", realmId.toString(),
-                    "--realm-sub-id", "1",
-                    "--network", this.NETWORK,
-                    "--db-namespace", `realm_${realmId}`,
-                    "--scylla-db-url", "scylla-server:9042",
-                    "--nats-jetstream-url", "nats://nats-server:4222",
-                    "--redis-url", "redis://valkey-server:6379",
-                    "--genesis-data-path", this.genesisDataPath,
-                    "--checkpoint-backup-path", "/app/local_checkpoints",
-                    "--coordinator-api-urls", `http://coordinator-edge-0:1337`,
-                    "--proving-backend", backend,
-                    "--verbose"
-                ]);
-
-                for (let j = 0; j < realmEdgeCount; j++) {
-                    const port = 13380 + realmId * 10 + j;
-                    services[`realm-${realmId}-edge-${j}`] = {
-                        ...getRuntimeServiceEntry(`realm-${realmId}-edge-${j}`, [
-                            "/app/bin/psy_node_cli", "start-realm-edge",
-                            "--realm-id", realmId.toString(),
-                            "--realm-sub-id", "1",
-                            "--network", this.NETWORK,
-                            "--db-namespace", `realm_${realmId}`,
-                            "--scylla-db-url", "scylla-server:9042",
-                            "--nats-jetstream-url", "nats://nats-server:4222",
-                            "--redis-url", "redis://valkey-server:6379",
-                            "--port", port.toString(),
-                            "--listen", "0.0.0.0",
-                            "--proving-backend", backend,
-                            "--verbose"
-                        ]),
-                        ports: [`${port}:${port}`]
-                    };
+                for (const subId of realmP2pSubIds) {
+                    const extra = realmP2pRoster
+                        ? realmP2pProcessorExtraArgs("127.0.0.1", realmId, subId, realmP2pRoster)
+                        : [];
+                    const serviceName = subId === 1
+                        ? `realm-${realmId}-processor`
+                        : `realm-${realmId}-sub-${subId}-processor`;
+                    services[serviceName] = getRuntimeServiceEntry(serviceName, [
+                        "/app/bin/psy_node_cli", "start-realm-processor",
+                        "--realm-id", realmId.toString(),
+                        "--realm-sub-id", subId.toString(),
+                        "--network", this.NETWORK,
+                        "--db-namespace", `realm_${realmId}`,
+                        "--scylla-db-url", "scylla-server:9042",
+                        "--nats-jetstream-url", "nats://nats-server:4222",
+                        "--redis-url", "redis://valkey-server:6379",
+                        "--genesis-data-path", this.genesisDataPath,
+                        "--checkpoint-backup-path", "/app/local_checkpoints",
+                        "--coordinator-api-urls", `http://coordinator-edge-0:1337`,
+                        "--proving-backend", backend,
+                        "--verbose",
+                        ...extra,
+                    ]);
+                    for (let j = 0; j < realmEdgeCount; j++) {
+                        const port = realmP2pHttpPort(realmId, subId, j, realmEdgeCount);
+                        const edgeExtra = realmP2pRoster
+                            ? realmP2pEdgeExtraArgs("127.0.0.1", realmId, subId, realmP2pRoster)
+                            : [];
+                        const edgeName = subId === 1
+                            ? `realm-${realmId}-edge-${j}`
+                            : `realm-${realmId}-sub-${subId}-edge-${j}`;
+                        services[edgeName] = {
+                            ...getRuntimeServiceEntry(edgeName, [
+                                "/app/bin/psy_node_cli", "start-realm-edge",
+                                "--realm-id", realmId.toString(),
+                                "--realm-sub-id", subId.toString(),
+                                "--network", this.NETWORK,
+                                "--db-namespace", `realm_${realmId}`,
+                                "--scylla-db-url", "scylla-server:9042",
+                                "--nats-jetstream-url", "nats://nats-server:4222",
+                                "--redis-url", "redis://valkey-server:6379",
+                                "--port", port.toString(),
+                                "--listen", "0.0.0.0",
+                                "--proving-backend", backend,
+                                "--verbose",
+                                ...edgeExtra,
+                            ]),
+                            ports: [`${port}:${port}`]
+                        };
+                    }
                 }
             }
         }
@@ -4410,9 +4585,14 @@ class DevNetProcessManager {
                 // Connect to all realm edges
                 for (let i = 0; i < realmsCount; i++) {
                     const realmId = startRealmId + i;
-                    for (let j = 0; j < realmEdgeCount; j++) {
-                         const port = 13380 + realmId * 10 + j;
-                         workerArgs.push("--realm-api-url", `http://realm-${realmId}-edge-${j}:${port}`);
+                    for (const subId of realmP2pSubIds) {
+                        for (let j = 0; j < realmEdgeCount; j++) {
+                            const port = realmP2pHttpPort(realmId, subId, j, realmEdgeCount);
+                            const edgeName = subId === 1
+                                ? `realm-${realmId}-edge-${j}`
+                                : `realm-${realmId}-sub-${subId}-edge-${j}`;
+                            workerArgs.push("--realm-api-url", `http://${edgeName}:${port}`);
+                        }
                     }
                 }
                 workerArgs.push("--private-key", FAKE_MINER_PRIVATE_KEY);
@@ -4619,6 +4799,8 @@ async function runMain() {
             "start-realm-id": { type: "string", default: "0" },
             "realms-count": { type: "string", default: "1" },
             "host": { type: "string", default: "127.0.0.1" },
+            "realm-p2p": { type: "boolean" },
+
             "genesis-data-path": { type: "string", default: "genesis.json" },
             "coordinator": { type: "boolean" },
             "db": { type: "boolean" },
@@ -4672,6 +4854,8 @@ async function runMain() {
     const teardown = !!values["teardown"];
     const purge = !!values["purge"];
     const cleanState = !!values["clean-state"] || purge;
+    const realmP2p = !!values["realm-p2p"];
+
     const provingBackend = values["proving-backend"];
     const envString = values["env"];
     const help = !!values["help"];
@@ -4717,6 +4901,7 @@ Usage: bun run dev/locSetupV4.ts [options]
    --coordinator-workers <count>   Number of coordinator workers (default: 1 when starting coordinator, 0 in only modes)
    --start-realm-id <id>           Starting realm ID (default: 0)
    --realms-count <n>              Number of realms to start (default: 1)
+   --realm-p2p                     Enable 2-sub-id Realm P2P (keys + rotation). Default off so make run-all stays HTTP.
    --coordinator                   Start coordinator + realm processors and edges (requires database to be running)
    --db                            Start only database services
    --workers                       Start only workers (requires database to be running)
@@ -4895,6 +5080,7 @@ Usage: bun run dev/locSetupV4.ts [options]
             explorer,
             daemonlize: !!values.daemonlize,
             cleanState,
+            realmP2p,
         };
 
         if (daemonlize) {

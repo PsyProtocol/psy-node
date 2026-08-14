@@ -18,12 +18,26 @@
 //! verified the GUTA proof and commit output. This module performs no replay
 //! into local state and keeps no per-validator tracking set.
 
-use psy_data::p2p::{
-    aggregate_signatures, bitmap_get, bitmap_set, sha256, vote_message, BlsPublicKey, BlsSecretKey,
-    BlsSignature, Certificate, ProtocolError, ProtocolReader, ProtocolResult, Proposal, Vote,
-    MAX_BACKUP_BYTES, MAX_FINALIZER_OUTPUT_BYTES, MAX_FINALIZER_PROOF_BYTES,
-    MAX_PROPOSAL_BODY_BYTES, MAX_VALIDATORS_PER_REALM, MIN_VALIDATORS_PER_REALM,
-    replication_threshold,
+use parth_core::{
+    crypto::hash::traits::QFieldHashable,
+    felt::{FromPrimitiveValuesFelt, ToU64Value},
+    protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofVerifier},
+};
+use psy_data::{
+    guta::{
+        header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobType,
+        realm_finalize::{
+            protocol_decode_finalize_output, realm_finalize_guta_chain_domain,
+            RealmFinalizeGUTAAction, RealmFinalizeGUTAPublicOutput,
+        },
+    },
+    p2p::{
+        aggregate_signatures, bitmap_get, bitmap_set, sha256, vote_message, BlsPublicKey,
+        BlsSecretKey, BlsSignature, Certificate, ProtocolError, ProtocolReader, ProtocolResult,
+        Proposal, Vote, MAX_BACKUP_BYTES, MAX_FINALIZER_OUTPUT_BYTES, MAX_FINALIZER_PROOF_BYTES,
+        MAX_PROPOSAL_BODY_BYTES, MAX_VALIDATORS_PER_REALM, MIN_VALIDATORS_PER_REALM,
+        replication_threshold,
+    },
 };
 
 /// Decoded proposal body: the three length-prefixed sections in wire order.
@@ -88,6 +102,92 @@ pub fn decode_proposal_body(
     }
 
     Ok(DecodedProposalBody { output, proof, backup })
+}
+
+/// Build the canonical 410-byte certificate bind output for an ordinary GUTA submit.
+pub fn build_bound_finalize_output<N>(
+    chain_id: u32,
+    target_checkpoint_id: u64,
+    realm_id: u32,
+    proposer_sub_id: u16,
+    validator_user_id: u64,
+    validator_tree_root: N::QHash,
+    submission: &GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
+) -> RealmFinalizeGUTAPublicOutput<N::F, N::QHash>
+where
+    N: QNetworkTypesConfig,
+{
+    let chain_domain =
+        realm_finalize_guta_chain_domain::<N::F, N::QHash, N::HasherBase>(chain_id);
+    let checkpoint_id = N::F::from_u64_value(target_checkpoint_id);
+    let realm_id_felt = N::F::from_u64_value(realm_id as u64);
+    let root_guta_header_hash = submission.header.header.qfhash::<N::HasherBase>();
+    let action = RealmFinalizeGUTAAction {
+        chain_domain,
+        checkpoint_id,
+        realm_id: realm_id_felt,
+        checkpoint_tree_root: submission.header.header.checkpoint_tree_root,
+        validator_tree_root,
+        root_guta_header_hash,
+    };
+    RealmFinalizeGUTAPublicOutput {
+        chain_domain,
+        checkpoint_id,
+        realm_id: realm_id_felt,
+        realm_sub_id: proposer_sub_id,
+        checkpoint_tree_root: submission.header.header.checkpoint_tree_root,
+        validator_tree_root,
+        validator_user_id: N::F::from_u64_value(validator_user_id),
+        root_guta_header_hash,
+        root_guta_reward_tag: submission.header.new_tag_tree_node_value,
+        action_hash: action.action_hash::<N::HasherBase>(),
+        final_guta_header: submission.header.header,
+    }
+}
+
+/// Verify a decoded Proposal against the ordinary submitted GUTA header/proof.
+pub fn verify_proposal_submission<N>(
+    proposal: &Proposal,
+    body: &[u8],
+    submission: &GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
+    proof_verifier: &N::ZKVerifier,
+) -> anyhow::Result<DecodedProposalBody>
+where
+    N: QNetworkTypesConfig,
+{
+    anyhow::ensure!(
+        proposal.compute_proposal_id() == proposal.proposal_id,
+        "proposal_id does not match canonical Proposal fields"
+    );
+    let decoded = decode_proposal_body(proposal, body)
+        .map_err(|error| anyhow::anyhow!("invalid Proposal body: {error}"))?;
+    let output: RealmFinalizeGUTAPublicOutput<N::F, N::QHash> =
+        protocol_decode_finalize_output(&decoded.output)
+            .map_err(|error| anyhow::anyhow!("invalid Realm finalize output: {error}"))?;
+    let expected_output = build_bound_finalize_output::<N>(
+        proposal.chain_id,
+        proposal.target_checkpoint_id,
+        proposal.realm_id,
+        proposal.proposer_sub_id,
+        output.validator_user_id.to_u64_value(),
+        output.validator_tree_root,
+        submission,
+    );
+    anyhow::ensure!(
+        output == expected_output,
+        "Realm finalize output does not match the canonical submitted GUTA binding"
+    );
+    anyhow::ensure!(
+        output.validator_tree_root.into_owned_32bytes() == proposal.validator_tree_root,
+        "Realm finalize output validator_tree_root mismatch"
+    );
+    let expected_public_inputs_hash = submission.qfhash::<N::HasherBase>();
+    proof_verifier.verify_zk_proof_from_slice_check_public_inputs_hash(
+        submission.job_type_u32,
+        &decoded.proof,
+        expected_public_inputs_hash,
+    )?;
+    Ok(decoded)
 }
 
 /// Sign a [`Vote`] for `proposal` with the local validator's BLS secret key.

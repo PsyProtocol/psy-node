@@ -3,13 +3,16 @@ use std::time::Duration;
 use parth_core::{
     crypto::hash::traits::HashTo4Felts,
     felt::ToU64Value,
-    protocol::core_types::QNetworkTypesConfig,
+    protocol::core_types::{Q256BitHash, QNetworkTypesConfig},
 };
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_data::{
-    guta::header_extended::{GlobalUserTreeAggregatorHeaderWithTagValue, GlobalUserTreeAggregatorHeaderWithTagValueAndJobType},
+    guta::{
+        header_extended::{GlobalUserTreeAggregatorHeaderWithTagValue, GlobalUserTreeAggregatorHeaderWithTagValueAndJobType},
+        realm_finalize::protocol_encode_finalize_output,
+    },
     node::node_proving_state::PsyNodeProvingState,
-    p2p::{encode_proposal_body, proposal_from_parts, replication_threshold, sha256},
+    p2p::{encode_proposal_body, proposal_from_parts, replication_threshold, sha256, vote_message, ProtocolEncode},
     prepared_block::realm::PsyPreparedRealmBlockStateUpdates,
     worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId,
 };
@@ -28,7 +31,7 @@ use psy_node_core::{
 
 use crate::realm::{
     processor::{
-        consensus::{form_certificate, sign_vote},
+        consensus::{build_bound_finalize_output, form_certificate, sign_vote},
         core::PsyRealmProcessor,
         gatherers::realm_end_cap_gatherer::{
             get_new_realm_end_cap_gatherer_backup_file_path, RealmGUTAEndCapGathererOutput,
@@ -328,7 +331,17 @@ where
         tracing::info!("Submitting GUTA proof to Coordinator...");
         self.db
             .coordinator_client
-            .rc_submit_guta_proof(submission_header, root_job_proof.clone(), self.db.state.realm_id_u64)
+            .rc_submit_guta_proof(
+                submission_header,
+                root_job_proof.clone(),
+                self.db.state.realm_id_u64,
+                self.last_p2p_proposal
+                    .as_ref()
+                    .map(|proposal| proposal.protocol_encode_to_vec()),
+                self.last_p2p_certificate
+                    .as_ref()
+                    .map(|certificate| certificate.protocol_encode_to_vec()),
+            )
             .await?;
         timer.lap("submit_guta_proof");
 
@@ -463,6 +476,12 @@ where
                 self.db.state.realm_id_u64
             );
         }
+        tracing::info!(
+            "realm P2P scheduled proposer sub_id={} epoch={} target={}",
+            local_sub_id,
+            epoch,
+            target
+        );
 
         // Read the gatherer RGE2 backup file carried inside the Proposal body.
         // Fail-closed if the file is missing or unreadable; never invent bytes.
@@ -481,15 +500,13 @@ where
             )
         })?;
 
-        // 410-byte RealmFinalizeGUTAPublicOutput + the checkpoint-bound
-        // validator_tree_root carried by the Proposal. Both require spec
-        // fields (`chain_domain`, `validator_tree_root`, `validator_user_id`,
-        // `action_hash`) that are not yet plumbed into `PsyRealmProcessorStore`
-        // / processor state. Fail-closed: do not zero-fill, do not invent.
+        // 410-byte RealmFinalizeGUTAPublicOutput for the target checkpoint plus
+        // the validator_tree_root authenticated at the canonical proof-base
+        // checkpoint carried by the Proposal. Missing validator user id or
+        // proof-base checkpoint roots fail closed.
         let (output_bytes, validator_tree_root) = self
-            .build_p2p_finalize_output(submission_header, root_job_proof, anchor_id)
+            .build_p2p_finalize_output(submission_header)
             .await?;
-
         let body = encode_proposal_body(&output_bytes, root_job_proof, &backup_bytes)?;
         let body_hash = sha256(&body);
         let public_output_hash = sha256(&output_bytes);
@@ -509,33 +526,55 @@ where
             body_hash,
         );
 
-        // Publish the Proposal, then sign + publish the processor's own Vote.
-        cmds.publish_proposal(proposal.clone(), body).await?;
+        let message = vote_message(
+            proposal.chain_id,
+            proposal.realm_id,
+            proposal.target_checkpoint_id,
+            &proposal.validator_tree_root,
+            &proposal.proposal_id,
+        );
         let own_vote = sign_vote(bls_secret, local_sub_id, &proposal);
+        cmds.publish_proposal(proposal.clone(), body).await?;
         cmds.publish_vote(own_vote.clone()).await?;
 
-        // Blocking vote collect: `ceil(n/2)` replication threshold, minus the
-        // processor's own already-published vote. `wait_votes` is fulfilled by
-        // the drive loop; a timeout is fail-closed (NetworkError::Timeout).
         let n = rotation.validator_sub_ids.len();
-        let need = replication_threshold(n);
-        let remaining = need.saturating_sub(1);
+        let required_valid_votes = replication_threshold(n).max(if n > 1 { 2 } else { 1 });
         let mut all_votes = vec![(own_vote.signer_sub_id, own_vote.signature)];
-        if remaining > 0 {
+        let mut seen = std::collections::HashSet::from([local_sub_id]);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        while all_votes.len() < required_valid_votes {
+            let remaining_time = deadline.saturating_duration_since(tokio::time::Instant::now());
+            anyhow::ensure!(!remaining_time.is_zero(), "timed out waiting for valid Realm votes");
             let received = cmds
-                .wait_votes(proposal.proposal_id, remaining, Duration::from_secs(120))
+                .wait_votes(proposal.proposal_id, 1, remaining_time)
                 .await?;
             for vote in received {
+                if seen.contains(&vote.signer_sub_id) {
+                    continue;
+                }
+                let public_key = self
+                    .p2p_bls_public_keys
+                    .as_ref()
+                    .and_then(|keys| keys.get(&vote.signer_sub_id))
+                    .ok_or_else(|| anyhow::anyhow!("missing BLS key for Realm vote signer {}", vote.signer_sub_id))?;
+                if let Err(error) = vote.signature.verify_vote(&message, public_key) {
+                    tracing::warn!(
+                        "dropped invalid Realm vote proposal={} signer_sub_id={} error={}",
+                        hex::encode(proposal.proposal_id),
+                        vote.signer_sub_id,
+                        error
+                    );
+                    continue;
+                }
+                seen.insert(vote.signer_sub_id);
                 all_votes.push((vote.signer_sub_id, vote.signature));
             }
         }
-
-        // Aggregate the collected votes into a Certificate. The certificate is
-        // kept locally and is NOT submitted to the coordinator over P2P; GUTA
-        // admission stays on the HTTP `rc_submit_guta_proof` path.
-        let _certificate = form_certificate(&proposal, &all_votes)?;
+        let certificate = form_certificate(&proposal, &all_votes)?;
+        self.last_p2p_proposal = Some(proposal);
+        self.last_p2p_certificate = Some(certificate);
         tracing::info!(
-            "realm P2P proposal published and certificate formed for realm {} target {} ({} votes)",
+            "realm P2P proposal published and certificate formed for realm {} target {} ({} verified votes)",
             self.db.state.realm_id_u64,
             target,
             all_votes.len()
@@ -543,29 +582,38 @@ where
         Ok(())
     }
 
-    /// Build the 410-byte `RealmFinalizeGUTAPublicOutput` and the
-    /// checkpoint-bound `validator_tree_root` carried by the Proposal.
-    ///
-    /// Per the Slice C wiring contract, only fields provable from
-    /// `submission_header` + `db.state` + the anchor checkpoint leaf are
-    /// mapped. The spec fields `chain_domain`, `validator_tree_root`,
-    /// `validator_user_id`, and `action_hash` are not yet plumbed into
-    /// `PsyRealmProcessorStore` / processor state, so this fails closed with a
-    /// named error rather than zero-filling or inventing values. When the
-    /// validator-tree record API and chain-domain source land, this is the
-    /// single point to extend; the publish/vote/wait/certificate wiring above
-    /// is already in place.
+    /// Build the canonical 410-byte target-checkpoint output using the
+    /// validator tree authenticated at the Proposal's proof-base checkpoint.
     async fn build_p2p_finalize_output(
         &self,
-        _submission_header: &GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
-        _root_job_proof: &[u8],
-        _anchor_checkpoint_id: u64,
+        submission_header: &GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
     ) -> anyhow::Result<([u8; 410], [u8; 32])> {
-        anyhow::bail!(
-            "realm P2P finalize output unavailable for realm {}: spec fields chain_domain, \
-             validator_tree_root, validator_user_id, and action_hash are not plumbed into the \
-             processor state; refusing to zero-fill or invent (fail-closed)",
-            self.db.state.realm_id_u64
+        let validator_user_id = self.p2p_validator_user_id.ok_or_else(|| {
+            anyhow::anyhow!(
+                "realm P2P enabled for realm {} but no validator_user_id was wired via set_realm_p2p",
+                self.db.state.realm_id_u64
+            )
+        })?;
+        let target_checkpoint_id = self.db.state.processing_checkpoint_id;
+        let base_checkpoint_id = self.db.state.last_committed_checkpoint_id;
+        let proof_base_roots = self
+            .db
+            .db
+            .get_checkpoint_global_state_roots(base_checkpoint_id)
+            .await?;
+        let validator_tree_root = proof_base_roots.validator_tree_root;
+        let output = build_bound_finalize_output::<N>(
+            self.db.state.chain_id,
+            target_checkpoint_id,
+            self.db.state.realm_id_u64 as u32,
+            self.db.state.realm_sub_id_u64 as u16,
+            validator_user_id,
+            validator_tree_root,
+            submission_header,
         );
+        Ok((
+            protocol_encode_finalize_output(&output)?,
+            validator_tree_root.into_owned_32bytes(),
+        ))
     }
 }

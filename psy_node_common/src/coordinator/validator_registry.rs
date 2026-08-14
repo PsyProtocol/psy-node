@@ -94,6 +94,39 @@ pub fn ensure_validator_beneficiary(
     }
 }
 
+/// Occupied sub-ids and BLS public keys for one Realm, derived from genesis.
+pub fn realm_certificate_roster(
+    realm_id: u32,
+    registry: &ValidatorRegistry,
+) -> anyhow::Result<(Vec<u16>, Vec<(u16, psy_data::p2p::BlsPublicKey)>)> {
+    let mut occupied: Vec<u16> = registry
+        .iter()
+        .filter_map(|(&(entry_realm, sub_id), _)| {
+            if entry_realm == realm_id {
+                Some(sub_id)
+            } else {
+                None
+            }
+        })
+        .collect();
+    occupied.sort_unstable();
+    occupied.dedup();
+    if occupied.is_empty() {
+        return Ok((occupied, Vec::new()));
+    }
+    let mut keys = Vec::with_capacity(occupied.len());
+    for sub_id in &occupied {
+        let entry = registry
+            .get(&(realm_id, *sub_id))
+            .ok_or_else(|| anyhow::anyhow!("missing genesis validator for realm {realm_id} sub {sub_id}"))?;
+        let key = psy_data::p2p::BlsPublicKey::from_bytes(&entry.bls_public_key)
+            .map_err(|error| anyhow::anyhow!("invalid genesis BLS key for realm {realm_id} sub {sub_id}: {error}"))?;
+        keys.push((*sub_id, key));
+    }
+    Ok((occupied, keys))
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -46,6 +46,26 @@ pub struct RealmProcessorCliConfig {
     pub checkpoint_backup_path: Option<String>,
     pub coordinator_api_urls: Vec<String>,
     pub genesis_data_path: Option<String>,
+    #[serde(default)]
+    pub p2p_identity_key_path: Option<String>,
+    #[serde(default)]
+    pub p2p_bls_key_path: Option<String>,
+    #[serde(default)]
+    pub p2p_listen: Option<String>,
+    #[serde(default)]
+    pub p2p_bootnodes: Vec<String>,
+    #[serde(default)]
+    pub p2p_coordinator: Option<String>,
+    #[serde(default)]
+    pub p2p_validator_sub_ids: Vec<u16>,
+    #[serde(default)]
+    pub p2p_checkpoints_per_epoch: Option<u64>,
+    #[serde(default)]
+    pub p2p_proposer_node_ids: Vec<String>,
+    #[serde(default)]
+    pub p2p_validator_user_id: Option<u64>,
+    #[serde(default)]
+    pub p2p_roster_path: Option<String>,
 }
 impl RealmProcessorCliConfig {
     pub fn get_default_empty() -> Self {
@@ -61,8 +81,19 @@ impl RealmProcessorCliConfig {
             checkpoint_backup_path: None,
             coordinator_api_urls: Vec::new(),
             genesis_data_path: None,
+            p2p_identity_key_path: None,
+            p2p_bls_key_path: None,
+            p2p_listen: None,
+            p2p_bootnodes: Vec::new(),
+            p2p_coordinator: None,
+            p2p_validator_sub_ids: Vec::new(),
+            p2p_checkpoints_per_epoch: None,
+            p2p_proposer_node_ids: Vec::new(),
+            p2p_validator_user_id: None,
+            p2p_roster_path: None,
         }
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn into_start_config_with_cli_args(
         self,
         scylla_db_url: Option<String>,
@@ -76,6 +107,16 @@ impl RealmProcessorCliConfig {
         checkpoint_backup_path: Option<String>,
         coordinator_api_urls: Vec<String>,
         genesis_data_path: Option<String>,
+        p2p_identity_key_path: Option<String>,
+        p2p_bls_key_path: Option<String>,
+        p2p_listen: Option<String>,
+        p2p_bootnodes: Vec<String>,
+        p2p_coordinator: Option<String>,
+        p2p_validator_sub_ids: Vec<u16>,
+        p2p_checkpoints_per_epoch: Option<u64>,
+        p2p_proposer_node_ids: Vec<String>,
+        p2p_validator_user_id: Option<u64>,
+        p2p_roster_path: Option<String>,
     ) -> anyhow::Result<RealmProcessorStartConfig> {
         Ok(RealmProcessorStartConfig {
             scylla_db_url: scylla_db_url.or(self.scylla_db_url).ok_or_else(|| anyhow::anyhow!("scylla_db_url is required"))?,
@@ -89,8 +130,19 @@ impl RealmProcessorCliConfig {
             checkpoint_backup_path: checkpoint_backup_path.or(self.checkpoint_backup_path).ok_or_else(|| anyhow::anyhow!("checkpoint_backup_path is required"))?,
             coordinator_api_urls: if !coordinator_api_urls.is_empty() { coordinator_api_urls } else { self.coordinator_api_urls },
             genesis_data_path: genesis_data_path.or(self.genesis_data_path),
+            p2p_identity_key_path: p2p_identity_key_path.or(self.p2p_identity_key_path),
+            p2p_bls_key_path: p2p_bls_key_path.or(self.p2p_bls_key_path),
+            p2p_listen: p2p_listen.or(self.p2p_listen),
+            p2p_bootnodes: if !p2p_bootnodes.is_empty() { p2p_bootnodes } else { self.p2p_bootnodes },
+            p2p_coordinator: p2p_coordinator.or(self.p2p_coordinator),
+            p2p_validator_sub_ids: if !p2p_validator_sub_ids.is_empty() { p2p_validator_sub_ids } else { self.p2p_validator_sub_ids },
+            p2p_checkpoints_per_epoch: p2p_checkpoints_per_epoch.or(self.p2p_checkpoints_per_epoch),
+            p2p_proposer_node_ids: if !p2p_proposer_node_ids.is_empty() { p2p_proposer_node_ids } else { self.p2p_proposer_node_ids },
+            p2p_validator_user_id: p2p_validator_user_id.or(self.p2p_validator_user_id),
+            p2p_roster_path: p2p_roster_path.or(self.p2p_roster_path),
         })
     }
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_start_config(
         config: Option<String>,
         scylla_db_url: Option<String>,
@@ -104,6 +156,16 @@ impl RealmProcessorCliConfig {
         checkpoint_backup_path: Option<String>,
         coordinator_api_urls: Vec<String>,
         genesis_data_path: Option<String>,
+        p2p_identity_key_path: Option<String>,
+        p2p_bls_key_path: Option<String>,
+        p2p_listen: Option<String>,
+        p2p_bootnodes: Vec<String>,
+        p2p_coordinator: Option<String>,
+        p2p_validator_sub_ids: Vec<u16>,
+        p2p_checkpoints_per_epoch: Option<u64>,
+        p2p_proposer_node_ids: Vec<String>,
+        p2p_validator_user_id: Option<u64>,
+        p2p_roster_path: Option<String>,
     ) -> anyhow::Result<RealmProcessorStartConfig> {
         let cli_config = if let Some(config_path) = config {
             load_cli_config_from_file::<Self>(&config_path).await?
@@ -122,6 +184,16 @@ impl RealmProcessorCliConfig {
             checkpoint_backup_path,
             coordinator_api_urls,
             genesis_data_path,
+            p2p_identity_key_path,
+            p2p_bls_key_path,
+            p2p_listen,
+            p2p_bootnodes,
+            p2p_coordinator,
+            p2p_validator_sub_ids,
+            p2p_checkpoints_per_epoch,
+            p2p_proposer_node_ids,
+            p2p_validator_user_id,
+            p2p_roster_path,
         )
     }
 }
@@ -138,6 +210,24 @@ pub struct RealmEdgeCliConfig {
     pub verbose: Option<bool>,
     pub port: Option<u16>,
     pub listen: Option<String>,
+    #[serde(default)]
+    pub p2p_identity_key_path: Option<String>,
+    #[serde(default)]
+    pub p2p_bls_key_path: Option<String>,
+    #[serde(default)]
+    pub p2p_listen: Option<String>,
+    #[serde(default)]
+    pub p2p_bootnodes: Vec<String>,
+    #[serde(default)]
+    pub p2p_coordinator: Option<String>,
+    #[serde(default)]
+    pub p2p_validator_sub_ids: Vec<u16>,
+    #[serde(default)]
+    pub p2p_checkpoints_per_epoch: Option<u64>,
+    #[serde(default)]
+    pub p2p_proposer_node_ids: Vec<String>,
+    #[serde(default)]
+    pub p2p_validator_user_id: Option<u64>,
 }
 
 impl RealmEdgeCliConfig {
@@ -153,8 +243,18 @@ impl RealmEdgeCliConfig {
             verbose: None,
             port: None,
             listen: None,
+            p2p_identity_key_path: None,
+            p2p_bls_key_path: None,
+            p2p_listen: None,
+            p2p_bootnodes: Vec::new(),
+            p2p_coordinator: None,
+            p2p_validator_sub_ids: Vec::new(),
+            p2p_checkpoints_per_epoch: None,
+            p2p_proposer_node_ids: Vec::new(),
+            p2p_validator_user_id: None,
         }
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn into_start_config_with_cli_args(
         self,
         scylla_db_url: Option<String>,
@@ -167,6 +267,15 @@ impl RealmEdgeCliConfig {
         verbose: bool,
         port: Option<u16>,
         listen: Option<String>,
+        p2p_identity_key_path: Option<String>,
+        p2p_bls_key_path: Option<String>,
+        p2p_listen: Option<String>,
+        p2p_bootnodes: Vec<String>,
+        p2p_coordinator: Option<String>,
+        p2p_validator_sub_ids: Vec<u16>,
+        p2p_checkpoints_per_epoch: Option<u64>,
+        p2p_proposer_node_ids: Vec<String>,
+        p2p_validator_user_id: Option<u64>,
     ) -> anyhow::Result<RealmEdgeStartConfig> {
         Ok(RealmEdgeStartConfig {
             scylla_db_url: scylla_db_url.or(self.scylla_db_url).ok_or_else(|| anyhow::anyhow!("scylla_db_url is required"))?,
@@ -179,8 +288,18 @@ impl RealmEdgeCliConfig {
             verbose: verbose || self.verbose.unwrap_or(false),
             port: port.or(self.port).unwrap_or(8080),
             listen: listen.or(self.listen).unwrap_or_else(|| "0.0.0.0".to_string()),
+            p2p_identity_key_path: p2p_identity_key_path.or(self.p2p_identity_key_path),
+            p2p_bls_key_path: p2p_bls_key_path.or(self.p2p_bls_key_path),
+            p2p_listen: p2p_listen.or(self.p2p_listen),
+            p2p_bootnodes: if !p2p_bootnodes.is_empty() { p2p_bootnodes } else { self.p2p_bootnodes },
+            p2p_coordinator: p2p_coordinator.or(self.p2p_coordinator),
+            p2p_validator_sub_ids: if !p2p_validator_sub_ids.is_empty() { p2p_validator_sub_ids } else { self.p2p_validator_sub_ids },
+            p2p_checkpoints_per_epoch: p2p_checkpoints_per_epoch.or(self.p2p_checkpoints_per_epoch),
+            p2p_proposer_node_ids: if !p2p_proposer_node_ids.is_empty() { p2p_proposer_node_ids } else { self.p2p_proposer_node_ids },
+            p2p_validator_user_id: p2p_validator_user_id.or(self.p2p_validator_user_id),
         })
     }
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_start_config(
         config: Option<String>,
         scylla_db_url: Option<String>,
@@ -193,6 +312,15 @@ impl RealmEdgeCliConfig {
         verbose: bool,
         port: Option<u16>,
         listen: Option<String>,
+        p2p_identity_key_path: Option<String>,
+        p2p_bls_key_path: Option<String>,
+        p2p_listen: Option<String>,
+        p2p_bootnodes: Vec<String>,
+        p2p_coordinator: Option<String>,
+        p2p_validator_sub_ids: Vec<u16>,
+        p2p_checkpoints_per_epoch: Option<u64>,
+        p2p_proposer_node_ids: Vec<String>,
+        p2p_validator_user_id: Option<u64>,
     ) -> anyhow::Result<RealmEdgeStartConfig> {
         let cli_config = if let Some(config_path) = config {
             load_cli_config_from_file::<Self>(&config_path).await?
@@ -210,6 +338,15 @@ impl RealmEdgeCliConfig {
             verbose,
             port,
             listen,
+            p2p_identity_key_path,
+            p2p_bls_key_path,
+            p2p_listen,
+            p2p_bootnodes,
+            p2p_coordinator,
+            p2p_validator_sub_ids,
+            p2p_checkpoints_per_epoch,
+            p2p_proposer_node_ids,
+            p2p_validator_user_id,
         )
     }
 }
@@ -311,6 +448,8 @@ pub struct CoordinatorEdgeCliConfig {
     pub verbose: Option<bool>,
     pub port: Option<u16>,
     pub listen: Option<String>,
+    #[serde(default)]
+    pub p2p_roster_path: Option<String>,
 }
 
 impl CoordinatorEdgeCliConfig {
@@ -326,6 +465,7 @@ impl CoordinatorEdgeCliConfig {
             verbose: None,
             port: None,
             listen: None,
+            p2p_roster_path: None,
         }
     }
     pub fn into_start_config_with_cli_args(
@@ -340,6 +480,7 @@ impl CoordinatorEdgeCliConfig {
         verbose: bool,
         port: Option<u16>,
         listen: Option<String>,
+        p2p_roster_path: Option<String>,
     ) -> anyhow::Result<CoordinatorEdgeStartConfig> {
         Ok(CoordinatorEdgeStartConfig {
             scylla_db_url: scylla_db_url.or(self.scylla_db_url).ok_or_else(|| anyhow::anyhow!("scylla_db_url is required"))?,
@@ -352,6 +493,7 @@ impl CoordinatorEdgeCliConfig {
             verbose: verbose || self.verbose.unwrap_or(false),
             port: port.or(self.port).unwrap_or(8080),
             listen: listen.or(self.listen).unwrap_or_else(|| "0.0.0.0".to_string()),
+            p2p_roster_path: p2p_roster_path.or(self.p2p_roster_path),
         })
     }
     pub async fn get_start_config(
@@ -366,6 +508,7 @@ impl CoordinatorEdgeCliConfig {
         verbose: bool,
         port: Option<u16>,
         listen: Option<String>,
+        p2p_roster_path: Option<String>,
     ) -> anyhow::Result<CoordinatorEdgeStartConfig> {
         let cli_config = if let Some(config_path) = config {
             load_cli_config_from_file::<Self>(&config_path).await?
@@ -383,6 +526,7 @@ impl CoordinatorEdgeCliConfig {
             verbose,
             port,
             listen,
+            p2p_roster_path,
         )
     }
 }

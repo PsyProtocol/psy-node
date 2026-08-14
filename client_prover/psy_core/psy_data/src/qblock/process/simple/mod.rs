@@ -48,6 +48,7 @@ impl SimpleBlockProcessor {
             user_tree_root: store.get_user_tree_root(old_checkpoint_id).await?,
             withdrawal_tree_root: store.get_withdrawal_tree_root(old_checkpoint_id).await?,
             user_registration_tree_root: store.get_user_registration_tree_root(old_checkpoint_id).await?,
+            validator_tree_root: QHashOut::ZERO,
         };
         let new_checkpoint_id = old_checkpoint_id + 1;
         let new_checkpoint_id_f = PsyFelt::from_canonical_u64(new_checkpoint_id);
@@ -160,6 +161,7 @@ impl SimpleBlockProcessor {
             user_tree_root: store.get_user_tree_root(new_checkpoint_id).await?,
             withdrawal_tree_root: store.get_withdrawal_tree_root(new_checkpoint_id).await?,
             user_registration_tree_root: store.get_user_registration_tree_root(new_checkpoint_id).await?,
+            validator_tree_root: QHashOut::ZERO,
         };
         let mut new_leaf_stats = PsyCheckpointLeafStats::<PsyFelt>::new_empty();
         let block_time = u64::try_from(

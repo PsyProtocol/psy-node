@@ -78,6 +78,7 @@ impl<T: KVQBinaryStore> QMetaDataStoreReaderSync<F> for T {
             user_tree_root: UserTreeStore::<T>::get_root_fc(self, checkpoint_id)?,
             withdrawal_tree_root: WithdrawalTreeStore::<T>::get_root_fc(self, checkpoint_id)?,
             user_registration_tree_root: UserRegistrationTreeStore::<T>::get_root_fc(self, checkpoint_id)?,
+            validator_tree_root: QHashOut::ZERO,
         })
     }
 

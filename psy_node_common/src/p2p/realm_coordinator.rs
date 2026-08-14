@@ -72,9 +72,11 @@ impl<N: QNetworkTypesConfig + 'static, C: CoordinatorEdgeRpcClient<N::F, N::QHas
         input: GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
         proof: Vec<u8>,
         realm_id: u64,
+        proposal: Option<Vec<u8>>,
+        certificate: Option<Vec<u8>>,
     ) -> anyhow::Result<()> {
         self.client
-            .submit_guta(input, proof, realm_id)
+            .submit_guta(input, proof, realm_id, proposal, certificate)
             .await
             .map_err(|e| anyhow::anyhow!("{:?}", e))?;
         Ok(())

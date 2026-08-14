@@ -743,6 +743,7 @@ fn bridge_state_witnesses() -> anyhow::Result<(
         user_tree_root: user_tree_proof.root,
         withdrawal_tree_root: <PoseidonHash as MerkleZeroHasher<QHashOut<F>>>::get_zero_hash(32),
         user_registration_tree_root: qhash(9_000),
+        validator_tree_root: <PoseidonHash as MerkleZeroHasher<QHashOut<F>>>::get_zero_hash(0),
     };
 
     let deposit = TreeRootInContractStateWitnessInput {

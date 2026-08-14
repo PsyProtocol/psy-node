@@ -8,7 +8,7 @@ use psy_data::{
     config::network_config::PsyNodeCircuitFingerprintConfigProvider, genesis::genesis_block_setup::PsyGenesisBlockSetupDataProvider,
 };
 use psy_io::tokio::{TokioLikeFileSystem, TokioStdFileSystem};
-use psy_node_common::{coordinator::processor::create::create_coordinator_processor_and_run, p2p::realm_coordinator::PsyRealmCoordinatorClientAPI, realm::processor::create::create_realm_processor_and_run};
+use psy_node_common::{coordinator::processor::create::create_coordinator_processor_and_run, p2p::realm_coordinator::PsyRealmCoordinatorClientAPI, realm::network::load_bls_secret_key, realm::processor::create::create_realm_processor, realm::processor::core::runner::run_realm_processor};
 use psy_node_core::config::node_start_config::{CoordinatorProcessorStartConfig, RealmProcessorStartConfig};
 use psy_node_nats::psy_queue::setup_nats_psy_queue_from_connection_str;
 use psy_node_redis::store::{new_redis_async_pool, StandardRedisStore};
@@ -16,7 +16,12 @@ use psy_node_scylla::psy_setup::setup_psy_scylla_database_store_from_connection_
 use psy_plonky2_circuits::{
     node::config::networks::resolver::PsyPlonky2NodeConfigResolver,
     protocol_types::ZKTypesPlonky2GoldilocksPoseidon,
+    zk_verifier::PsyPlonky2ZKVerifier,
 };
+use plonky2::plonk::config::PoseidonGoldilocksConfig;
+
+type C = PoseidonGoldilocksConfig;
+const D: usize = 2;
 
 pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &CoordinatorProcessorStartConfig) -> anyhow::Result<()> {
     let resolver = PsyPlonky2NodeConfigResolver {};
@@ -339,7 +344,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
             let coordinator_client = PsyRealmCoordinatorClientAPI::<N, _>::new(
                 http_client,
             );
-            create_realm_processor_and_run::<N, _, _, _, _, _, _, _, _>(
+            let (mut processor, guta_gatherer_join_handle) = create_realm_processor::<N, _, _, _, _, _, _, _, _>(
                 chain_id,
                 &genesis_data,
                 file_system,
@@ -350,15 +355,38 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
                 temp_db,
                 proof_store,
                 guta_update_queue,
-
                 proof_work_queue,
                 realm_identifier,
-
                 circuit_fingerprint_config,
                 Arc::new(coordinator_client),
-
             )
             .await?;
+            if let Some(built) = crate::node::realm_p2p::maybe_build_processor_network(config, chain_id)? {
+                let validator_user_id = config.p2p_validator_user_id.ok_or_else(|| {
+                    anyhow::anyhow!("--p2p-validator-user-id is required when Realm P2P is enabled")
+                })?;
+                let roster_path = config.p2p_roster_path.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("--p2p-roster-path is required when Realm P2P is enabled")
+                })?;
+                let bls_public_keys = crate::node::realm_p2p::bls_keys_from_roster_path(
+                    roster_path,
+                    config.realm_id as u32,
+                )?;
+                let bls_path = config.p2p_bls_key_path.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("processor P2P requires --p2p-bls-key")
+                })?;
+                let bls_secret = load_bls_secret_key(bls_path)
+                    .map_err(|error| anyhow::anyhow!("failed to load processor BLS key: {error}"))?;
+                let commands = built.handle.commands();
+                let rotation = built.rotation.clone();
+                processor.set_realm_p2p(commands, rotation, bls_secret, validator_user_id, bls_public_keys);
+                crate::node::realm_p2p::spawn_processor_realm_network::<N>(
+                    built,
+                    config,
+                    PsyPlonky2ZKVerifier::<C, D>::for_network(config.network)?,
+                );
+            }
+            run_realm_processor(processor, guta_gatherer_join_handle).await?;
         }
         _ => {
             anyhow::bail!("Unsupported network type '{:?}' for Plonky2 Scylla coordinator processor node", config.network );

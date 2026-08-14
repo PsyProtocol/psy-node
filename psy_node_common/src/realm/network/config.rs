@@ -7,7 +7,8 @@
 
 use crate::realm::network::NetworkError;
 use libp2p::{identity, Multiaddr, PeerId};
-use psy_data::p2p::BlsSecretKey;
+use psy_data::p2p::{BlsPublicKey, BlsSecretKey, NodeId};
+use rand::RngCore;
 use std::num::NonZeroU32;
 use std::path::Path;
 use std::time::Duration;
@@ -185,6 +186,72 @@ pub fn load_bls_secret_key(path: impl AsRef<Path>) -> Result<BlsSecretKey, Netwo
         details: source.to_string(),
     })?;
     BlsSecretKey::from_bytes(&bytes).map_err(|source| NetworkError::KeyFile {
+        path: path.display().to_string(),
+        details: source.to_string(),
+    })
+}
+
+/// Generate a fresh libp2p Ed25519 identity keypair from 32 random bytes,
+/// write its protobuf encoding to `path`, and return the derived [`NodeId`].
+///
+/// Used by the `init-realm-p2p-keys` CLI to materialize identity files for
+/// local E2E. The file format matches [`load_ed25519_identity_key`].
+pub fn generate_ed25519_identity_file(path: impl AsRef<Path>) -> Result<NodeId, NetworkError> {
+    let path = path.as_ref();
+    let mut seed = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut seed);
+    let keypair = identity::Keypair::ed25519_from_bytes(&mut seed).map_err(|source| {
+        NetworkError::KeyFile {
+            path: path.display().to_string(),
+            details: source.to_string(),
+        }
+    })?;
+    let node_id = NodeId::from_keypair(&keypair).map_err(|source| NetworkError::KeyFile {
+        path: path.display().to_string(),
+        details: source.to_string(),
+    })?;
+    let protobuf = keypair.to_protobuf_encoding().map_err(|source| NetworkError::KeyFile {
+        path: path.display().to_string(),
+        details: source.to_string(),
+    })?;
+    write_key_file(path, &protobuf)?;
+    Ok(node_id)
+}
+
+/// Generate a fresh BLS12-381 secret key from 32 random bytes of IKM, write
+/// exactly 64 hex characters (no newline) to `path`, and return the derived
+/// [`BlsPublicKey`].
+///
+/// The on-disk form matches [`load_bls_secret_key`], which requires exactly
+/// 64 hex characters with no whitespace. Only the public key is returned; the
+/// secret never leaves this function except as the written file.
+pub fn generate_bls_secret_file(path: impl AsRef<Path>) -> Result<BlsPublicKey, NetworkError> {
+    let path = path.as_ref();
+    let mut ikm = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut ikm);
+    let secret = BlsSecretKey::key_gen(&ikm).map_err(|source| NetworkError::KeyFile {
+        path: path.display().to_string(),
+        details: source.to_string(),
+    })?;
+    let public = secret.public_key();
+    let hex_text = hex::encode(secret.to_bytes());
+    write_key_file(path, hex_text.as_bytes())?;
+    Ok(public)
+}
+
+/// Write `bytes` to `path`, creating parent directories as needed. Shared by
+/// the identity and BLS key generators so both honor the same on-disk layout.
+fn write_key_file(path: &Path, bytes: &[u8]) -> Result<(), NetworkError> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|source| NetworkError::KeyFile {
+                    path: path.display().to_string(),
+                    details: source.to_string(),
+                })?;
+        }
+    }
+    std::fs::write(path, bytes).map_err(|source| NetworkError::KeyFile {
         path: path.display().to_string(),
         details: source.to_string(),
     })

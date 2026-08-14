@@ -3149,7 +3149,7 @@ impl WalletSession {
 
             let checkpoint_state = UserProvingSessionManager::<F, PoseidonHash, RpcProvider, C, D>::checkpoint_state_from_parts(
                 &trace.anchor.checkpoint_leaf,
-                &trace.anchor.global_state_roots,
+                &Self::ups_start_state_roots_for_trace(trace),
             );
             let cm = self.wallet.random_circuit_manager();
             let mut mgr = self
@@ -3291,7 +3291,7 @@ impl WalletSession {
 
         let checkpoint_state = UserProvingSessionManager::<F, PoseidonHash, RpcProvider, C, D>::checkpoint_state_from_parts(
             &trace.anchor.checkpoint_leaf,
-            &trace.anchor.global_state_roots,
+            &Self::ups_start_state_roots_for_trace(trace),
         );
         let mut prev_header = trace.ups_start_witness.ups_header.clone();
         let mut second_to_last_header = trace.ups_start_witness.ups_header.clone();
@@ -3512,7 +3512,7 @@ impl WalletSession {
 
         let checkpoint_state = UserProvingSessionManager::<F, PoseidonHash, RpcProvider, C, D>::checkpoint_state_from_parts(
             &trace.anchor.checkpoint_leaf,
-            &trace.anchor.global_state_roots,
+            &Self::ups_start_state_roots_for_trace(trace),
         );
 
         let precomputed = match cfc.proof.as_ref() {

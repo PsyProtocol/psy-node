@@ -57,7 +57,7 @@ use std::collections::HashMap;
 
 use crate::realm::network::RealmNetworkCommands;
 use parth_common::realm_rotation::RealmRotationConfig;
-use psy_data::p2p::{compute_end_cap_id, sha256, EndCapForwardHeader, NodeId};
+use psy_data::p2p::{compute_end_cap_id, sha256, EndCapForwardHeader, EndCapForwardResponse, NodeId};
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
 const END_CAP_PROOF_CIRCUIT_TYPE_U32: u32 = ProvingJobCircuitType::UserEndCap as u32;
@@ -123,7 +123,7 @@ impl<
     }
 }
 impl<
-        N: QNetworkTypesConfig,
+        N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
         S: PsyRealmEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync,
         STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync,
         UserUpdateQueue: QStandardEphemeralQueuePublisher,
@@ -175,6 +175,94 @@ impl<
         self.rotation = Some(rotation);
         self.proposer_node_ids = Some(proposer_node_ids);
     }
+    pub async fn handle_p2p_end_cap_received(
+        &self,
+        header: EndCapForwardHeader,
+        input: Vec<u8>,
+        proof: Vec<u8>,
+    ) -> EndCapForwardResponse
+    where
+        N::ZKVerifier: 'static,
+        N::ZKProof: 'static,
+    {
+        let checkpoint_id = header.checkpoint_id;
+        match self.accept_forwarded_end_cap(header, input, proof).await {
+            Ok(end_cap_id) => {
+                tracing::info!(
+                    "realm P2P EndCap accepted end_cap_id={} checkpoint={}",
+                    hex::encode(end_cap_id),
+                    checkpoint_id
+                );
+                EndCapForwardResponse::new(true)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "realm P2P EndCap rejected checkpoint={} error={}",
+                    checkpoint_id,
+                    error
+                );
+                EndCapForwardResponse::new(false)
+            }
+        }
+    }
+
+    async fn accept_forwarded_end_cap(
+        &self,
+        header: EndCapForwardHeader,
+        input: Vec<u8>,
+        proof: Vec<u8>,
+    ) -> anyhow::Result<[u8; 32]>
+    where
+        N::ZKVerifier: 'static,
+        N::ZKProof: 'static,
+    {
+        if header.chain_id != self.chain_id {
+            anyhow::bail!(
+                "forwarded EndCap chain_id {} does not match local {}",
+                header.chain_id,
+                self.chain_id
+            );
+        }
+        if header.realm_id != self.realm_id_u64 as u32 {
+            anyhow::bail!(
+                "forwarded EndCap realm_id {} does not match local {}",
+                header.realm_id,
+                self.realm_id_u64
+            );
+        }
+        if header.end_cap_input_len as usize != input.len() {
+            anyhow::bail!(
+                "forwarded EndCap input length {} does not match header {}",
+                input.len(),
+                header.end_cap_input_len
+            );
+        }
+        if header.proof_len as usize != proof.len() {
+            anyhow::bail!(
+                "forwarded EndCap proof length {} does not match header {}",
+                proof.len(),
+                header.proof_len
+            );
+        }
+        let user_end_cap_input =
+            SubmitUserEndCapNonProofInput::<N::F, N::QHash>::psy_ser_from_slice(&input)?;
+        let input_hash = sha256(&input);
+        let proof_hash = sha256(&proof);
+        let expected_end_cap_id = compute_end_cap_id(
+            self.chain_id,
+            self.realm_id_u64 as u32,
+            header.checkpoint_id,
+            &input_hash,
+            &proof_hash,
+        );
+        if expected_end_cap_id != header.end_cap_id {
+            anyhow::bail!("forwarded EndCap id does not match canonical hash");
+        }
+        self.handle_user_end_cap_proof_submission(user_end_cap_input, proof)
+            .await?;
+        Ok(header.end_cap_id)
+    }
+
     pub fn user_belongs_to_realm(&self, user_id: u64) -> bool {
         let users_per_realm = 1u64 << N::REALM_GLOBAL_USER_TREE_HEIGHT;
         let min_user_id = self.realm_id_u64 * users_per_realm;
@@ -557,13 +645,18 @@ impl<
                         proof_len: proof_bytes.len() as u32,
                     };
                     let resp = cmds
-                        .forward_end_cap(dest, header, input, proof_bytes)
+                        .forward_end_cap(dest, header.clone(), input, proof_bytes)
                         .await
                         .map_err(|e| anyhow::anyhow!("EndCap forward to proposer {proposer} failed: {e}"))?;
                     if !resp.is_accepted() {
                         anyhow::bail!("EndCap forward rejected by proposer {proposer}");
                     }
-                    // Forwarded and accepted — never process locally.
+                    tracing::info!(
+                        "realm P2P EndCap forwarded end_cap_id={} proposer_sub_id={} dest={:?}",
+                        hex::encode(header.end_cap_id),
+                        proposer,
+                        dest
+                    );
                     return Ok(());
                 }
                 // Local instance is the scheduled proposer: fall through to

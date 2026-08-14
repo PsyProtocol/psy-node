@@ -37,7 +37,7 @@ pub trait CoordinatorEdgeRpc<F, Hash, JobId, ZKProof>: NodeEdgeWorkerRpcServer<H
     //async fn build_block(&self) -> RpcResult<String>;
 
     #[method(name = "submit_guta")]
-    async fn submit_guta(&self, input: GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<F, Hash>, proof: Vec<u8>, realm_id: u64) -> RpcResult<String>;
+    async fn submit_guta(&self, input: GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<F, Hash>, proof: Vec<u8>, realm_id: u64, proposal: Option<Vec<u8>>, certificate: Option<Vec<u8>>) -> RpcResult<String>;
 
 
     #[method(name = "get_latest_checkpoint_id")]

@@ -3,7 +3,7 @@ use parth_core::{
         merkle_proof::{DeltaMerkleProofCore, MerkleProofCore},
         traits::{FieldQHasher, QFieldHashable},
     },
-    felt::QFelt64,
+    felt::{QFelt64, ToU64Value},
     protocol::core_types::{Q256BitHash, QFHashBase},
     utils::QPGenRandom,
 };
@@ -11,7 +11,12 @@ use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{AutoImplementFallbackPsySerializeCanonical, FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
 use crate::{
-    guta::header::GlobalUserTreeAggregatorHeader,
+    guta::{
+        header::GlobalUserTreeAggregatorHeader,
+        stats::GUTAStats,
+        sub_tree_transition::SubTreeNodeStateTransition,
+    },
+    p2p::{validate_goldilocks_limb, ProtocolReader, ProtocolResult, write_fixed, write_u16, write_u64},
     v1::qdata::{
         checkpoint::{PQEDCheckpointLeaf, PQEDCheckpointLeafCompactWithStateRoots},
         user::PQEDUserLeaf,
@@ -154,6 +159,116 @@ impl<F: QFelt64, Hash: QFHashBase<F>> RealmFinalizeGUTAPublicOutput<F, Hash> {
     pub fn public_output_hash<H: FieldQHasher<F, Hash>>(&self) -> Hash {
         <Self as QFieldHashable<F, Hash>>::qfhash::<H>(&self)
     }
+}
+
+/// Canonical 410-byte wire encoding of `RealmFinalizeGUTAPublicOutput`.
+///
+/// Field order is the frozen P2P finalize-output spec. Hashes are raw 32-byte
+/// little-endian limbs via `into_owned_32bytes()`; felts are `to_u64_value()`
+/// then `u64_le`. Length is fail-closed: anything other than 410 is an error.
+pub fn protocol_encode_finalize_output<F, Hash>(
+    output: &RealmFinalizeGUTAPublicOutput<F, Hash>,
+) -> anyhow::Result<[u8; 410]>
+where
+    F: QFelt64,
+    Hash: Q256BitHash + QFHashBase<F>,
+{
+    let header = &output.final_guta_header;
+    let mut out = Vec::with_capacity(410);
+    write_fixed(&mut out, &output.chain_domain.into_owned_32bytes());
+    write_u64(&mut out, output.checkpoint_id.to_u64_value());
+    write_u64(&mut out, output.realm_id.to_u64_value());
+    write_u16(&mut out, output.realm_sub_id);
+    write_fixed(&mut out, &output.checkpoint_tree_root.into_owned_32bytes());
+    write_fixed(&mut out, &output.validator_tree_root.into_owned_32bytes());
+    write_u64(&mut out, output.validator_user_id.to_u64_value());
+    write_fixed(&mut out, &output.root_guta_header_hash.into_owned_32bytes());
+    write_fixed(&mut out, &output.root_guta_reward_tag.into_owned_32bytes());
+    write_fixed(&mut out, &output.action_hash.into_owned_32bytes());
+    write_fixed(&mut out, &header.guta_circuit_whitelist.into_owned_32bytes());
+    write_fixed(&mut out, &header.checkpoint_tree_root.into_owned_32bytes());
+    write_fixed(&mut out, &header.state_transition.old_node_value.into_owned_32bytes());
+    write_fixed(&mut out, &header.state_transition.new_node_value.into_owned_32bytes());
+    write_u64(&mut out, header.state_transition.node_index.to_u64_value());
+    write_u64(&mut out, header.state_transition.node_level.to_u64_value());
+    write_u64(&mut out, header.stats.guta_fees_collected.to_u64_value());
+    write_u64(&mut out, header.stats.da_fees_collected.to_u64_value());
+    write_u64(&mut out, header.stats.user_ops_processed.to_u64_value());
+    write_u64(&mut out, header.stats.total_transactions.to_u64_value());
+    write_u64(&mut out, header.stats.slots_modified.to_u64_value());
+    write_u64(&mut out, header.total_aggregation_proofs_generated.to_u64_value());
+    if out.len() != 410 {
+        anyhow::bail!(
+            "realm finalize public output encode length {} != 410",
+            out.len()
+        );
+    }
+    let mut encoded = [0u8; 410];
+    encoded.copy_from_slice(&out);
+    Ok(encoded)
+}
+
+/// Strictly decode the canonical 410-byte Realm finalizer output.
+pub fn protocol_decode_finalize_output<F, Hash>(
+    bytes: &[u8],
+) -> ProtocolResult<RealmFinalizeGUTAPublicOutput<F, Hash>>
+where
+    F: QFelt64,
+    Hash: Q256BitHash + QFHashBase<F>,
+{
+    fn read_felt<F: QFelt64>(reader: &mut ProtocolReader<'_>) -> ProtocolResult<F> {
+        let value = reader.read_u64()?;
+        validate_goldilocks_limb(value)?;
+        Ok(F::from_u64_value(value))
+    }
+
+    fn read_hash<Hash: Q256BitHash>(reader: &mut ProtocolReader<'_>) -> ProtocolResult<Hash> {
+        Ok(Hash::from_owned_32bytes(reader.read_hash32_canonical()?))
+    }
+
+    let mut reader = ProtocolReader::new(bytes);
+    let chain_domain = read_hash(&mut reader)?;
+    let checkpoint_id = read_felt(&mut reader)?;
+    let realm_id = read_felt(&mut reader)?;
+    let realm_sub_id = reader.read_u16()?;
+    let checkpoint_tree_root = read_hash(&mut reader)?;
+    let validator_tree_root = read_hash(&mut reader)?;
+    let validator_user_id = read_felt(&mut reader)?;
+    let root_guta_header_hash = read_hash(&mut reader)?;
+    let root_guta_reward_tag = read_hash(&mut reader)?;
+    let action_hash = read_hash(&mut reader)?;
+    let final_guta_header = GlobalUserTreeAggregatorHeader {
+        guta_circuit_whitelist: read_hash(&mut reader)?,
+        checkpoint_tree_root: read_hash(&mut reader)?,
+        state_transition: SubTreeNodeStateTransition {
+            old_node_value: read_hash(&mut reader)?,
+            new_node_value: read_hash(&mut reader)?,
+            node_index: read_felt(&mut reader)?,
+            node_level: read_felt(&mut reader)?,
+        },
+        stats: GUTAStats {
+            guta_fees_collected: read_felt(&mut reader)?,
+            da_fees_collected: read_felt(&mut reader)?,
+            user_ops_processed: read_felt(&mut reader)?,
+            total_transactions: read_felt(&mut reader)?,
+            slots_modified: read_felt(&mut reader)?,
+        },
+        total_aggregation_proofs_generated: read_felt(&mut reader)?,
+    };
+    reader.finish()?;
+    Ok(RealmFinalizeGUTAPublicOutput {
+        chain_domain,
+        checkpoint_id,
+        realm_id,
+        realm_sub_id,
+        checkpoint_tree_root,
+        validator_tree_root,
+        validator_user_id,
+        root_guta_header_hash,
+        root_guta_reward_tag,
+        action_hash,
+        final_guta_header,
+    })
 }
 
 // =================================================================================

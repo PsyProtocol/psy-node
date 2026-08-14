@@ -152,6 +152,7 @@ pub struct PsyCheckpointGlobalStateRoots<F: RichField> {
     pub user_tree_root: QHashOut<F>,
     pub withdrawal_tree_root: QHashOut<F>,
     pub user_registration_tree_root: QHashOut<F>,
+    pub validator_tree_root: QHashOut<F>,
 }
 
 impl<F: RichField> KVQSerializable for PsyCheckpointGlobalStateRoots<F> {
@@ -177,7 +178,6 @@ impl<F: RichField> ToQFelts<F> for PsyCheckpointGlobalStateRoots<F> {
         result.extend_from_slice(&self.user_tree_root.0.elements);
         result.extend_from_slice(&self.withdrawal_tree_root.0.elements);
         result.extend_from_slice(&self.user_registration_tree_root.0.elements);
-
         result
     }
 
@@ -206,6 +206,7 @@ impl<F: RichField> ToQFelts<F> for PsyCheckpointGlobalStateRoots<F> {
             user_tree_root,
             withdrawal_tree_root,
             user_registration_tree_root,
+            validator_tree_root: QHashOut::ZERO,
         }
     }
 }
@@ -217,8 +218,8 @@ impl<F: RichField> QFieldHashable<F> for PsyCheckpointGlobalStateRoots<F> {
         let user_and_withdrawal = H::q_two_to_one(self.user_tree_root, self.withdrawal_tree_root);
 
         let base_combo = H::q_two_to_one(contract_and_deposit, user_and_withdrawal);
-
-        H::q_two_to_one(base_combo, self.user_registration_tree_root)
+        let reg_and_validator = H::q_two_to_one(self.user_registration_tree_root, self.validator_tree_root);
+        H::q_two_to_one(base_combo, reg_and_validator)
     }
 }
 

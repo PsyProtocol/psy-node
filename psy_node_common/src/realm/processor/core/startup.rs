@@ -117,6 +117,10 @@ where
                 p2p: None,
                 rotation: None,
                 bls_secret: None,
+                p2p_validator_user_id: None,
+                last_p2p_proposal: None,
+                last_p2p_certificate: None,
+                p2p_bls_public_keys: None,
             },
             guta_join_handle,
         ))
@@ -135,10 +139,14 @@ where
         commands: crate::realm::network::RealmNetworkCommands,
         rotation: parth_common::realm_rotation::RealmRotationConfig,
         bls_secret: psy_data::p2p::BlsSecretKey,
+        validator_user_id: u64,
+        bls_public_keys: std::collections::HashMap<u16, psy_data::p2p::BlsPublicKey>,
     ) {
         self.p2p = Some(commands);
         self.rotation = Some(rotation);
         self.bls_secret = Some(bls_secret);
+        self.p2p_validator_user_id = Some(validator_user_id);
+        self.p2p_bls_public_keys = Some(bls_public_keys);
     }
     pub async fn get_latest_checkpoint_id_internal(&self) -> anyhow::Result<u64> {
         self.db.db.get_latest_checkpoint_id().await

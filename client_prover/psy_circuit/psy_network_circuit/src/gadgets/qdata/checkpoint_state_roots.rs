@@ -30,10 +30,10 @@ impl PsyCheckpointGlobalStateRootsGadget {
     pub fn to_hash<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(&self, builder: &mut CircuitBuilder<F, D>) -> HashOutTarget {
         let contract_and_deposit = builder.hash_two_to_one::<H>(self.contract_tree_root, self.deposit_tree_root);
         let user_and_withdrawal = builder.hash_two_to_one::<H>(self.user_tree_root, self.withdrawal_tree_root);
-
         let base_combo = builder.hash_two_to_one::<H>(contract_and_deposit, user_and_withdrawal);
-
-        builder.hash_two_to_one::<H>(base_combo, self.user_registration_tree_root)
+        let zero_validator = builder.constant_hash(plonky2::hash::hash_types::HashOut::ZERO);
+        let reg_and_validator = builder.hash_two_to_one::<H>(self.user_registration_tree_root, zero_validator);
+        builder.hash_two_to_one::<H>(base_combo, reg_and_validator)
     }
 }
 impl AlgebraicHashableTarget for PsyCheckpointGlobalStateRootsGadget {
@@ -91,7 +91,7 @@ impl FromTargets for PsyCheckpointGlobalStateRootsGadget {
     fn from_targets(targets: &[Target]) -> Self {
         if targets.len() != 20 {
             panic!(
-                "tried to create PsyCheckpointGlobalStateRootsGadget from an array of {} targets, but expected an array of 16 targets",
+                "tried to create PsyCheckpointGlobalStateRootsGadget from an array of {} targets, but expected an array of 20 targets",
                 targets.len()
             );
         }

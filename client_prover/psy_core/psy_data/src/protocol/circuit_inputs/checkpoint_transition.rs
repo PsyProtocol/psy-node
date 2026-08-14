@@ -65,6 +65,7 @@ impl<F: RichField> QCPsyCheckpointStateTransitionInputPartial<F> {
                 ],
             }),
             user_registration_tree_root: self.part_1_header.register_users_state_transition.state_transition_end,
+            validator_tree_root: QHashOut::ZERO,
         };
         PsyCheckpointLeaf {
             global_chain_root: new_state_roots.qfhash::<H>(),
@@ -111,6 +112,7 @@ impl<F: RichField> QCPsyCheckpointStateTransitionInputPartial<F> {
                 ],
             }),
             user_registration_tree_root: self.part_1_header.register_users_state_transition.state_transition_start,
+            validator_tree_root: QHashOut::ZERO,
         };
         old_state_roots
     }

@@ -21,6 +21,8 @@ mod codec;
 mod config;
 mod reassembly;
 mod drive;
+mod startup;
+
 
 pub use behaviour::{
     add_bootnode_address, add_known_address, proposal_topic, vote_topic, RealmBehaviour,
@@ -31,14 +33,20 @@ pub use codec::{
     DIRECT_BODY_PROTOCOL_ID, END_CAP_FORWARD_PROTOCOL_ID, REALM_FINALIZE_SUBMIT_PROTOCOL_ID,
 };
 pub use config::{
-    load_bls_secret_key, load_ed25519_identity_key, RealmNetworkConfig,
-    BOOTNODE_MIN_CIRCUIT_BYTES, BOOTNODE_MIN_CIRCUIT_DURATION_SECS, BOOTNODE_MIN_CIRCUITS,
+    generate_bls_secret_file, generate_ed25519_identity_file, load_bls_secret_key,
+    load_ed25519_identity_key, RealmNetworkConfig, BOOTNODE_MIN_CIRCUIT_BYTES,
+    BOOTNODE_MIN_CIRCUIT_DURATION_SECS, BOOTNODE_MIN_CIRCUITS,
 };
 pub use reassembly::{
     validate_start, CompleteProposalBody, InsertOutcome, ProposalReassembly, ReassemblyBook,
     StartOutcome, VerifiedProposalBody,
 };
 pub use drive::run_realm_network;
+pub use startup::{
+    build_optional_realm_network, parse_bootnode, parse_proposer_node_id, parse_proposer_node_ids,
+    OptionalRealmNetwork,
+};
+
 
 use libp2p::request_response;
 use libp2p::{identity, noise, tcp, yamux, Swarm, SwarmBuilder};
