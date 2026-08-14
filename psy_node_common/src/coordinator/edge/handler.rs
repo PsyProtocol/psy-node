@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tokio::task;
 use parth_core::{
-    QCoreProcCheckpointUniqueId, QProvingJobDataIDWithRewardPath, crypto::hash::{merkle_proof::MerkleProofCore, tag_tree::TagTreeMerkleProof, traits::QFieldHashable}, data::{hash::merkle_node_key::SimpleMerkleNodeKey, queue::queue_key::QPBaseQueueType}, felt::ToU64Value, node::realm_identifier::QRealmIdentifier, protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofVerifier}
+    QCoreProcCheckpointUniqueId, QProvingJobDataIDWithRewardPath, crypto::hash::{merkle_proof::MerkleProofCore, tag_tree::TagTreeMerkleProof, traits::{HashTo4Felts, QFieldHashable}}, data::{hash::merkle_node_key::SimpleMerkleNodeKey, queue::queue_key::QPBaseQueueType}, felt::ToU64Value, node::realm_identifier::QRealmIdentifier, protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofVerifier}
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_crypto::hash::tx_hash::{compute_deploy_contract_content_hash, hash_to_hex};
@@ -12,7 +12,7 @@ use psy_data::{
         header_extended::{GlobalUserTreeAggregatorHeaderWithTagValueAndJobID, GlobalUserTreeAggregatorHeaderWithTagValueAndJobType},
         realm_finalize::protocol_encode_finalize_output,
     },
-    p2p::{sha256, Certificate, Proposal},
+    p2p::{replication_threshold, sha256, Certificate, Proposal, RealmFinalizeSubmitCode},
     prepared_block::realm::PsyRealmCoordinatorUpdate,
     v1::{
         common_api::PsyProoffMinerRewardProof,
@@ -31,6 +31,7 @@ use psy_serialize::{PsyCanonicalDatabaseSerializeBaseMulti, PsyCanonicalDatabase
 
 use crate::{
     coordinator::queue_key::{CoordinatorDeployContractQueueKey, CoordinatorRegisterUserPublicKeyQueueKey, CoordinatorSubmitRealmGUTAUpdateQueueKey},
+    p2p::guta_submit::GutaSubmitError,
     realm::processor::consensus::{build_bound_finalize_output, validate_certificate},
 };
 
@@ -64,7 +65,8 @@ pub struct CoordinatorEdgeHandler<
     pub contract_state_tree_height_cache: Arc<DashMapContractHeightCache<N::QHash>>,
 
     pub checkpoint_state_transition_circuit_fingerprint: N::QHash,
-    pub validator_registry: Option<crate::coordinator::validator_registry::ValidatorRegistry>,
+    pub chain_id: u32,
+    pub validator_roster: Option<(crate::coordinator::validator_registry::ValidatorRegistry, u64)>,
 }
 impl<
         N: QNetworkTypesConfig,
@@ -105,7 +107,8 @@ impl<
             proof_verifier: self.proof_verifier.clone(),
             contract_state_tree_height_cache: self.contract_state_tree_height_cache.clone(),
             checkpoint_state_transition_circuit_fingerprint: self.checkpoint_state_transition_circuit_fingerprint.clone(),
-            validator_registry: self.validator_registry.clone(),
+            chain_id: self.chain_id,
+            validator_roster: self.validator_roster.clone(),
         }
     }
 }
@@ -142,6 +145,7 @@ impl<
         deploy_contract_queue: Arc<DeployContractQueue>,
         get_proof_work_queue: Arc<GetProofWorkQueue>,
         realm_identifier: QRealmIdentifier,
+        chain_id: u32,
         proof_verifier: Arc<N::ZKVerifier>,
         checkpoint_state_transition_circuit_fingerprint: N::QHash,
     ) -> Self {
@@ -162,14 +166,19 @@ impl<
             proof_verifier,
             contract_state_tree_height_cache: Arc::new(DashMapContractHeightCache::new()),
             checkpoint_state_transition_circuit_fingerprint,
-            validator_registry: None,
+            chain_id,
+            validator_roster: None,
         }
     }
-    pub fn set_validator_registry(
+    pub fn set_validator_roster(
         &mut self,
         registry: crate::coordinator::validator_registry::ValidatorRegistry,
-    ) {
-        self.validator_registry = Some(registry);
+        checkpoints_per_epoch: u64,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(!registry.is_empty(), "P2P validator roster must not be empty");
+        anyhow::ensure!(checkpoints_per_epoch > 0, "P2P checkpoints_per_epoch must be greater than zero");
+        self.validator_roster = Some((registry, checkpoints_per_epoch));
+        Ok(())
     }
 
     pub async fn get_checkpoint_leaves_batch_raw_internal(&self, start_checkpoint_id: u64, count: u32) -> anyhow::Result<Vec<u8>>{
@@ -485,16 +494,22 @@ impl<
 
         let realm_level_u64 = input.header.header.state_transition.node_level.to_u64_value();
         if realm_level_u64 != N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT as u64 {
-            anyhow::bail!(
-                "invalid realm level {}, expected {}",
-                realm_level_u64,
-                N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT
-            );
+            return Err(GutaSubmitError::illegal(
+                RealmFinalizeSubmitCode::InvalidOutput,
+                format!(
+                    "invalid realm level {}, expected {}",
+                    realm_level_u64,
+                    N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT
+                ),
+            ).into());
         }
 
         let realm_level = realm_level_u64 as u8;
         if realm_id_u64 > (1u64 << realm_level) || realm_id_u64 > u32::MAX as u64 {
-            anyhow::bail!("invalid realm id {}", realm_id_u64);
+            return Err(GutaSubmitError::illegal(
+                RealmFinalizeSubmitCode::InvalidOutput,
+                format!("invalid realm id {}", realm_id_u64),
+            ).into());
         }
 
         let realm_id = realm_id_u64 as u32;
@@ -503,23 +518,6 @@ impl<
 
         let (unique_pending_id, proc_checkpoint_id) = self.get_current_gathering_unique_pending_id_internal().await?;
         self.ensure_guta_matches_current_coordinator_state(realm_id_u64, &input).await?;
-
-        let status = rand::random::<u64>() & 0x0fff_ffff_ffff_ffff;
-        if self
-            .temp_db
-            .get_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, realm_id_u64)
-            .await?
-            != 0
-        {
-            anyhow::bail!(
-                "GUTA for realm_id {} at unique_pending_id {} has already been submitted",
-                realm_id,
-                unique_pending_id
-            );
-        }
-        self.temp_db
-            .set_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, realm_id_u64, status)
-            .await?;
 
         let output_proof_job_id = QProvingJobDataID::try_get_coordinator_edge_proof_store_output_proof_id_for_realm_submit(
             realm_id,
@@ -535,8 +533,6 @@ impl<
             certificate_bytes.as_deref(),
         )
         .await?;
-
-
         let expected_public_inputs_hash = input.qfhash::<N::HasherBase>();
         let proof_verifier = self.proof_verifier.clone();
         task::spawn_blocking({
@@ -545,17 +541,21 @@ impl<
                 proof_verifier.verify_zk_proof_from_slice_check_public_inputs_hash(input.job_type_u32, &proof_bytes, expected_public_inputs_hash)
             }
         }).await??;
-        if self
+
+        let status = (rand::random::<u64>() & 0x0fff_ffff_ffff_ffff).max(1);
+        if !self
             .temp_db
-            .get_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, realm_id_u64)
+            .put_submitted_status_if_absent(&self.realm_identifier, unique_pending_id, realm_id_u64, status)
             .await?
-            != status
         {
-            anyhow::bail!(
-                "RACE: GUTA for realm_id {} at unique_pending_id {} has already been submitted",
-                realm_id,
-                unique_pending_id
-            );
+            return Err(GutaSubmitError::retryable(
+                RealmFinalizeSubmitCode::AlreadyClaimed,
+                format!(
+                    "GUTA for realm_id {} at unique_pending_id {} has already been submitted",
+                    realm_id,
+                    unique_pending_id
+                ),
+            ).into());
         }
         self.proof_store
             .put_proof_bytes_for_job_id(&output_proof_job_id, unique_pending_id, &proof_bytes)
@@ -599,16 +599,19 @@ impl<
         let submitted_old_realm_root = input.header.header.state_transition.old_node_value;
 
         if current_realm_root.value != submitted_old_realm_root {
-            anyhow::bail!(
-                "stale GUTA update rejected at coordinator edge: realm_id {} latest_checkpoint_id {} realm_last_modified_checkpoint_id {} submitted_old_realm_root {:?} current_realm_root {:?} submitted_new_realm_root {:?} submitted_checkpoint_tree_root {:?}",
-                realm_id,
-                latest_checkpoint_id,
-                current_realm_root.checkpoint_id,
-                submitted_old_realm_root,
-                current_realm_root.value,
-                input.header.header.state_transition.new_node_value,
-                input.header.header.checkpoint_tree_root,
-            );
+            return Err(GutaSubmitError::retryable(
+                RealmFinalizeSubmitCode::CheckpointUnavailable,
+                format!(
+                    "stale GUTA update rejected at coordinator edge: realm_id {} latest_checkpoint_id {} realm_last_modified_checkpoint_id {} submitted_old_realm_root {:?} current_realm_root {:?} submitted_new_realm_root {:?} submitted_checkpoint_tree_root {:?}",
+                    realm_id,
+                    latest_checkpoint_id,
+                    current_realm_root.checkpoint_id,
+                    submitted_old_realm_root,
+                    current_realm_root.value,
+                    input.header.header.state_transition.new_node_value,
+                    input.header.header.checkpoint_tree_root,
+                ),
+            ).into());
         }
 
         Ok(())
@@ -622,7 +625,7 @@ impl<
         proposal_bytes: Option<&[u8]>,
         certificate_bytes: Option<&[u8]>,
     ) -> anyhow::Result<()> {
-        let Some(registry) = self.validator_registry.as_ref() else {
+        let Some((registry, checkpoints_per_epoch)) = self.validator_roster.as_ref() else {
             anyhow::ensure!(
                 proposal_bytes.is_none() && certificate_bytes.is_none(),
                 "GUTA Proposal/Certificate supplied but coordinator has no validator roster"
@@ -631,13 +634,10 @@ impl<
         };
         let (occupied, keys) =
             crate::coordinator::validator_registry::realm_certificate_roster(realm_id, registry)?;
-        if occupied.is_empty() {
-            anyhow::ensure!(
-                proposal_bytes.is_none() && certificate_bytes.is_none(),
-                "GUTA Proposal/Certificate supplied for realm {realm_id} with empty validator roster"
-            );
-            return Ok(());
-        }
+        anyhow::ensure!(
+            !occupied.is_empty(),
+            "configured validator roster has no validators for realm {realm_id}"
+        );
         let proposal = Proposal::decode_exact(proposal_bytes.ok_or_else(|| {
             anyhow::anyhow!("rotation enabled but GUTA Proposal missing for realm {realm_id}")
         })?)
@@ -647,22 +647,18 @@ impl<
         })?)
         .map_err(|error| anyhow::anyhow!("invalid GUTA Certificate for realm {realm_id}: {error}"))?;
         anyhow::ensure!(proposal.compute_proposal_id() == proposal.proposal_id, "GUTA proposal_id mismatch");
+        anyhow::ensure!(proposal.chain_id == self.chain_id, "GUTA Proposal chain_id mismatch");
         anyhow::ensure!(proposal.realm_id == realm_id, "GUTA Proposal realm mismatch");
         anyhow::ensure!(proposal.finalizer_proof_hash == sha256(proof_bytes), "GUTA Proposal proof hash mismatch");
 
-        let committed_head_checkpoint_id = self.get_latest_checkpoint_id_internal().await?;
+        let canonical_base_checkpoint_id = self
+            .db_reader
+            .get_checkpoint_id_for_checkpoint_root_hash(input.header.header.checkpoint_tree_root)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("GUTA checkpoint tree root has no canonical checkpoint ID"))?;
         anyhow::ensure!(
-            proposal.base_checkpoint_id == committed_head_checkpoint_id,
-            "GUTA Proposal base checkpoint does not match coordinator committed head"
-        );
-        let expected_target_checkpoint_id = committed_head_checkpoint_id.checked_add(1).ok_or_else(|| {
-            anyhow::anyhow!(
-                "GUTA Proposal target checkpoint cannot be derived because coordinator committed head overflowed"
-            )
-        })?;
-        anyhow::ensure!(
-            proposal.target_checkpoint_id == expected_target_checkpoint_id,
-            "GUTA Proposal target checkpoint does not immediately follow coordinator committed head"
+            proposal.base_checkpoint_id == canonical_base_checkpoint_id,
+            "GUTA Proposal proof-base checkpoint does not match submitted checkpoint tree root"
         );
         let proof_base_roots = self
             .db_reader
@@ -672,12 +668,48 @@ impl<
             proposal.validator_tree_root == proof_base_roots.validator_tree_root.into_owned_32bytes(),
             "GUTA Proposal validator_tree_root does not match proof-base checkpoint"
         );
+        let inclusion_checkpoint_id = self
+            .get_latest_checkpoint_id_internal()
+            .await?
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("latest checkpoint ID overflow at GUTA admission"))?;
+        let target_checkpoint_id = proposal
+            .base_checkpoint_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("GUTA Proposal proof-base checkpoint overflow"))?;
+        let rotation = parth_common::realm_rotation::RealmRotationConfig {
+            checkpoints_per_epoch: *checkpoints_per_epoch,
+            validator_sub_ids: occupied.clone(),
+        };
+        let epoch = parth_common::realm_rotation::epoch(target_checkpoint_id, *checkpoints_per_epoch);
+        let anchor_checkpoint_id = parth_common::realm_rotation::anchor_checkpoint_id(epoch, *checkpoints_per_epoch);
+        let anchor_leaf = self.db_reader.get_checkpoint_leaf_data(anchor_checkpoint_id).await?;
+        let anchor_felts = anchor_leaf.stats.random_seed.to_4_felts();
+        let anchor_seed = [
+            anchor_felts[0].to_u64_value(),
+            anchor_felts[1].to_u64_value(),
+            anchor_felts[2].to_u64_value(),
+            anchor_felts[3].to_u64_value(),
+        ];
+        let scheduled_proposer = rotation
+            .proposer_sub_id(realm_id, target_checkpoint_id, anchor_seed)?
+            .ok_or_else(|| anyhow::anyhow!("rotation enabled without a scheduled proposer"))?;
+        if proposal.proposer_sub_id != scheduled_proposer {
+            return Err(GutaSubmitError::retryable(
+                RealmFinalizeSubmitCode::NotScheduledProposer,
+                format!(
+                    "GUTA Proposal proposer {} is not scheduled proposer {} for target {}",
+                    proposal.proposer_sub_id,
+                    scheduled_proposer,
+                    target_checkpoint_id
+                ),
+            ).into());
+        }
         let proposer = registry
             .get(&(realm_id, proposal.proposer_sub_id))
             .ok_or_else(|| anyhow::anyhow!("GUTA proposer sub_id {} is not occupied", proposal.proposer_sub_id))?;
         let output = build_bound_finalize_output::<N>(
             proposal.chain_id,
-            proposal.target_checkpoint_id,
             proposal.realm_id,
             proposal.proposer_sub_id,
             proposer.validator_user_id,
@@ -688,16 +720,20 @@ impl<
         anyhow::ensure!(proposal.public_output_hash == sha256(&output_bytes), "GUTA Proposal public output hash mismatch");
         validate_certificate(&proposal, &certificate, &occupied, &keys)
             .map_err(|error| anyhow::anyhow!("invalid GUTA Certificate for realm {realm_id}: {error}"))?;
-        if occupied.len() > 1 {
-            anyhow::ensure!(
-                certificate.popcount() >= 2,
-                "GUTA Certificate for realm {realm_id} requires at least two signers when the roster has more than one validator"
-            );
-        }
+        anyhow::ensure!(
+            certificate.popcount() >= replication_threshold(occupied.len()),
+            "GUTA Certificate for realm {realm_id} below replication threshold"
+        );
+        let signer_sub_ids = certificate.signer_sub_ids();
+        anyhow::ensure!(
+            signer_sub_ids.contains(&proposal.proposer_sub_id),
+            "GUTA Certificate for realm {realm_id} does not include proposer sub_id {}",
+            proposal.proposer_sub_id
+        );
         tracing::info!(
-            "realm P2P certificate bound realm={} target={} signers={}",
+            "realm P2P certificate admitted realm={} inclusion_checkpoint_id={} signers={}",
             realm_id,
-            certificate.target_checkpoint_id,
+            inclusion_checkpoint_id,
             certificate.popcount()
         );
         Ok(())

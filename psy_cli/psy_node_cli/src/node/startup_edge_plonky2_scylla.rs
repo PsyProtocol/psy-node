@@ -79,13 +79,15 @@ pub async fn run_startup_plonky2_scylla_edge_node(config: &CoordinatorEdgeStartC
                 deploy_contract_queue,
                 proof_work_queue,
                 realm_identifier,
+                config.network.get_chain_id(),
                 proof_verifier,
                 checkpoint_state_transition_circuit_fingerprint,
             );
-            if let Some(roster_path) = config.p2p_roster_path.as_deref() {
-                handler.set_validator_registry(
+            if let Some((roster_path, checkpoints_per_epoch)) = config.p2p_validator_roster_config()? {
+                handler.set_validator_roster(
                     crate::node::realm_p2p::validator_registry_from_roster_path(roster_path)?,
-                );
+                    checkpoints_per_epoch,
+                )?;
             }
             start_coordinator_edge_rpc_server::<N, _, _, _, _, _, _, _, _>(
                 handler,

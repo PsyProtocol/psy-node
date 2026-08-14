@@ -258,7 +258,7 @@ impl<
         if expected_end_cap_id != header.end_cap_id {
             anyhow::bail!("forwarded EndCap id does not match canonical hash");
         }
-        self.handle_user_end_cap_proof_submission(user_end_cap_input, proof)
+        self.handle_user_end_cap_proof_submission(user_end_cap_input, proof, false)
             .await?;
         Ok(header.end_cap_id)
     }
@@ -449,6 +449,7 @@ impl<
         &self,
         user_end_cap_input: SubmitUserEndCapNonProofInput<N::F, N::QHash>,
         proof_bytes: Vec<u8>,
+        allow_forward: bool,
     ) -> anyhow::Result<()>
     where
         N::ZKVerifier: 'static,
@@ -589,19 +590,16 @@ impl<
         }).await??;
         timer.lap_micros("verify_zk_proof");
 
-        // Optional Realm P2P forward (Slice B). When rotation is enabled and
-        // this edge instance is NOT the scheduled proposer for the EndCap's
-        // target checkpoint, forward the EndCap to the scheduled proposer over
-        // the Realm network and return without touching the local gatherer.
-        // Fail-closed: a missing anchor leaf, missing NodeId, forward error,
-        // or rejected response is a hard error — never fall back to local
-        // processing after a failed forward. If this instance IS the proposer,
-        // fall through to the existing local path below.
+        // Optional Realm P2P forward. Route by the node's latest committed
+        // checkpoint + 1, never the user-supplied EndCap checkpoint. That
+        // user field remains only the proof-history checkpoint.
+        if allow_forward {
         if let (Some(cmds), Some(rotation), Some(node_ids)) = (&self.p2p, &self.rotation, &self.proposer_node_ids) {
             if rotation.is_enabled() {
-                // Epoch-of-target: the EndCap's own checkpoint, NOT the
-                // coordinator head. The proposer is fixed for the whole epoch.
-                let target = end_cap_checkpoint_id;
+                let latest_checkpoint_id = self.get_latest_checkpoint_id().await?;
+                let target = latest_checkpoint_id
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("latest checkpoint ID overflow at EndCap forward"))?;
                 let epoch = parth_common::realm_rotation::epoch(target, rotation.checkpoints_per_epoch);
                 let anchor_id = parth_common::realm_rotation::anchor_checkpoint_id(epoch, rotation.checkpoints_per_epoch);
                 let leaf = self.db_reader.get_checkpoint_leaf_data(anchor_id).await?;
@@ -662,6 +660,7 @@ impl<
                 // Local instance is the scheduled proposer: fall through to
                 // the existing local gatherer / queue publish path.
             }
+        }
         }
 
         // TODO: maybe modify the job_id.sub_group_id
@@ -929,7 +928,7 @@ impl<
     }
 
     async fn submit_user_end_cap(&self, user_ec_input: SubmitUserEndCapNonProofInput<N::F, N::QHash>, proof: Vec<u8>) -> QRpcResult<String> {
-        res(self.handle_user_end_cap_proof_submission(user_ec_input, proof).await)?;
+        res(self.handle_user_end_cap_proof_submission(user_ec_input, proof, true).await)?;
         Ok("ok".to_string())
     }
 
@@ -939,7 +938,7 @@ impl<
     ) -> QRpcResult<(Vec<u64>, Vec<u64>)> {
         let results: Vec<(u64, bool)> = stream::iter(requests.into_iter().map(|(user_ec_input, proof)| async move {
             let user_id: u64 = user_ec_input.core.state_transition.user_id.to_u64_value();
-            match self.handle_user_end_cap_proof_submission(user_ec_input, proof).await {
+            match self.handle_user_end_cap_proof_submission(user_ec_input, proof, true).await {
                 Ok(_) => (user_id, true),
                 Err(err) => {
                     tracing::warn!("Failed to handle user end cap proof submission for user_id {}: {}", user_id, err);

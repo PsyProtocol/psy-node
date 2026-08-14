@@ -150,4 +150,20 @@ pub struct CoordinatorEdgeStartConfig {
     pub listen: String,
     #[serde(default)]
     pub p2p_roster_path: Option<String>,
+    #[serde(default)]
+    pub p2p_checkpoints_per_epoch: Option<u64>,
+}
+
+impl CoordinatorEdgeStartConfig {
+    pub fn p2p_validator_roster_config(&self) -> anyhow::Result<Option<(&str, u64)>> {
+        match (self.p2p_roster_path.as_deref(), self.p2p_checkpoints_per_epoch) {
+            (None, None) => Ok(None),
+            (Some(roster_path), Some(checkpoints_per_epoch)) => {
+                anyhow::ensure!(checkpoints_per_epoch > 0, "P2P checkpoints_per_epoch must be greater than zero");
+                Ok(Some((roster_path, checkpoints_per_epoch)))
+            }
+            (Some(_), None) => anyhow::bail!("--p2p-checkpoints-per-epoch is required with --p2p-roster-path"),
+            (None, Some(_)) => anyhow::bail!("--p2p-roster-path is required with --p2p-checkpoints-per-epoch"),
+        }
+    }
 }

@@ -1264,6 +1264,7 @@ mod tests {
             user_tree_root: Hash::rand(),
             withdrawal_tree_root: Hash::rand(),
             user_registration_tree_root: Hash::rand(),
+            validator_tree_root: Hash::ZERO,
         };
         let global_chain_root = checkpoint_global_state_roots.qfhash::<Hasher>();
         let checkpoint_leaf = PQEDCheckpointLeaf {

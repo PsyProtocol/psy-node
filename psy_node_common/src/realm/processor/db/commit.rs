@@ -317,6 +317,10 @@ where
         }
         tracing::info!("Committed coordinator processor state for checkpoint ID: {}", checkpoint_id);
         tracing::info!("Backed up checkpoint tree root for checkpoint ID: {}", checkpoint_id);
+        self.state.processing_checkpoint_id = checkpoint_id;
+        self.state.processing_checkpoint_root = coordinator_update.checkpoint_sync_info.checkpoint_tree_root;
+        self.state.processing_realm_start_root = realm_update.old_realm_root;
+        self.state.processing_realm_end_root = realm_update.new_realm_root;
         self.state.commit_processing()?;
         self.shared_state.update_from_core_state(&self.state).await?;
         tracing::info!("Updated last committed state for checkpoint ID: {}", checkpoint_id);

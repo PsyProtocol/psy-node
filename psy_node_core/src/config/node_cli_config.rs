@@ -450,6 +450,8 @@ pub struct CoordinatorEdgeCliConfig {
     pub listen: Option<String>,
     #[serde(default)]
     pub p2p_roster_path: Option<String>,
+    #[serde(default)]
+    pub p2p_checkpoints_per_epoch: Option<u64>,
 }
 
 impl CoordinatorEdgeCliConfig {
@@ -466,6 +468,7 @@ impl CoordinatorEdgeCliConfig {
             port: None,
             listen: None,
             p2p_roster_path: None,
+            p2p_checkpoints_per_epoch: None,
         }
     }
     pub fn into_start_config_with_cli_args(
@@ -481,6 +484,7 @@ impl CoordinatorEdgeCliConfig {
         port: Option<u16>,
         listen: Option<String>,
         p2p_roster_path: Option<String>,
+        p2p_checkpoints_per_epoch: Option<u64>,
     ) -> anyhow::Result<CoordinatorEdgeStartConfig> {
         Ok(CoordinatorEdgeStartConfig {
             scylla_db_url: scylla_db_url.or(self.scylla_db_url).ok_or_else(|| anyhow::anyhow!("scylla_db_url is required"))?,
@@ -494,6 +498,7 @@ impl CoordinatorEdgeCliConfig {
             port: port.or(self.port).unwrap_or(8080),
             listen: listen.or(self.listen).unwrap_or_else(|| "0.0.0.0".to_string()),
             p2p_roster_path: p2p_roster_path.or(self.p2p_roster_path),
+            p2p_checkpoints_per_epoch: p2p_checkpoints_per_epoch.or(self.p2p_checkpoints_per_epoch),
         })
     }
     pub async fn get_start_config(
@@ -509,6 +514,7 @@ impl CoordinatorEdgeCliConfig {
         port: Option<u16>,
         listen: Option<String>,
         p2p_roster_path: Option<String>,
+        p2p_checkpoints_per_epoch: Option<u64>,
     ) -> anyhow::Result<CoordinatorEdgeStartConfig> {
         let cli_config = if let Some(config_path) = config {
             load_cli_config_from_file::<Self>(&config_path).await?
@@ -527,6 +533,7 @@ impl CoordinatorEdgeCliConfig {
             port,
             listen,
             p2p_roster_path,
+            p2p_checkpoints_per_epoch,
         )
     }
 }

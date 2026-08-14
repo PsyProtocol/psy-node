@@ -30,17 +30,17 @@ pub const DIRECT_REQUEST_MAX_BYTES: u32 = 61_440;
 /// Maximum EndCap forward stream total (header + input + proof).
 pub const MAX_END_CAP_FORWARD_BYTES: usize = 536_870_912;
 
-/// Fixed Proposal metadata wire length (218 bytes).
-pub const PROPOSAL_WIRE_BYTES: usize = 218;
+/// Fixed Proposal metadata wire length (210 bytes).
+pub const PROPOSAL_WIRE_BYTES: usize = 210;
 
 /// Fixed Vote wire length.
 pub const VOTE_WIRE_BYTES: usize = 130;
 
 /// Fixed Certificate wire length.
-pub const CERTIFICATE_WIRE_BYTES: usize = 208;
+pub const CERTIFICATE_WIRE_BYTES: usize = 200;
 
 /// Fixed Realm finalize-submit prefix before the variable proof section:
-/// `output[410] || Proposal[218] || Certificate[208]`.
+/// `output[410] || Proposal[210] || Certificate[200]`.
 pub const REALM_FINALIZE_SUBMIT_PREFIX_WIRE_BYTES: usize =
     MAX_FINALIZER_OUTPUT_BYTES + PROPOSAL_WIRE_BYTES + CERTIFICATE_WIRE_BYTES;
 
@@ -130,11 +130,11 @@ mod tests {
     fn proposal_body_and_parts_match_spec() {
         assert_eq!(MAX_PROPOSAL_BODY_BYTES, 105_120_166);
         assert_eq!(MAX_PROPOSAL_PARTS, 1_711);
-        assert_eq!(PROPOSAL_WIRE_BYTES, 218);
+        assert_eq!(PROPOSAL_WIRE_BYTES, 210);
         assert_eq!(VOTE_WIRE_BYTES, 130);
-        assert_eq!(CERTIFICATE_WIRE_BYTES, 208);
+        assert_eq!(CERTIFICATE_WIRE_BYTES, 200);
         assert_eq!(END_CAP_FORWARD_HEADER_WIRE_BYTES, 56);
-        assert_eq!(REALM_FINALIZE_SUBMIT_PREFIX_WIRE_BYTES, 836);
+        assert_eq!(REALM_FINALIZE_SUBMIT_PREFIX_WIRE_BYTES, 820);
         assert_eq!(replication_threshold(1), 1);
         assert_eq!(replication_threshold(2), 1);
         assert_eq!(replication_threshold(3), 2);

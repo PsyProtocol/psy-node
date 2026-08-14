@@ -167,7 +167,7 @@ impl<F: RichField> KVQSerializable for PsyCheckpointGlobalStateRoots<F> {
 
 impl<F: RichField> QFeltSized for PsyCheckpointGlobalStateRoots<F> {
     fn q_felt_size() -> usize {
-        20
+        24
     }
 }
 impl<F: RichField> ToQFelts<F> for PsyCheckpointGlobalStateRoots<F> {
@@ -178,6 +178,7 @@ impl<F: RichField> ToQFelts<F> for PsyCheckpointGlobalStateRoots<F> {
         result.extend_from_slice(&self.user_tree_root.0.elements);
         result.extend_from_slice(&self.withdrawal_tree_root.0.elements);
         result.extend_from_slice(&self.user_registration_tree_root.0.elements);
+        result.extend_from_slice(&self.validator_tree_root.0.elements);
         result
     }
 
@@ -200,13 +201,16 @@ impl<F: RichField> ToQFelts<F> for PsyCheckpointGlobalStateRoots<F> {
         let user_registration_tree_root = QHashOut(HashOut {
             elements: [felts[16], felts[17], felts[18], felts[19]],
         });
+        let validator_tree_root = QHashOut(HashOut {
+            elements: [felts[20], felts[21], felts[22], felts[23]],
+        });
         PsyCheckpointGlobalStateRoots {
             contract_tree_root,
             deposit_tree_root,
             user_tree_root,
             withdrawal_tree_root,
             user_registration_tree_root,
-            validator_tree_root: QHashOut::ZERO,
+            validator_tree_root,
         }
     }
 }

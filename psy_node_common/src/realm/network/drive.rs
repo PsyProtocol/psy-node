@@ -338,7 +338,10 @@ impl RealmNetwork {
                 offset,
                 data,
             } => {
-                state.proposal_source.entry(proposal_id).or_insert(source_peer);
+                if state.proposal_source.get(&proposal_id) != Some(&source_peer) {
+                    tracing::debug!(realm_id = self.realm_id, "dropped ProposalPart::Chunk from non-Start source");
+                    return;
+                }
                 match self.reassembly.insert_chunk(&proposal_id, offset, &data, now) {
                     Ok(InsertOutcome::Complete) => {
                         match self.reassembly.finalize(&proposal_id) {

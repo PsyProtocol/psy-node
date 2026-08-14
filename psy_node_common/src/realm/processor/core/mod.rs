@@ -72,10 +72,6 @@ pub struct PsyRealmProcessor<
     /// Local validator user id carried in the 410-byte finalize output.
     /// Wired by `set_realm_p2p`; `None` until then.
     pub p2p_validator_user_id: Option<u64>,
-    /// Last bound Realm P2P Proposal for the most recent GUTA submit.
-    pub last_p2p_proposal: Option<psy_data::p2p::Proposal>,
-    /// Last formed Realm P2P Certificate for the most recent Proposal.
-    pub last_p2p_certificate: Option<psy_data::p2p::Certificate>,
     /// Authenticated BLS keys used to verify individual votes before aggregation.
     pub p2p_bls_public_keys: Option<std::collections::HashMap<u16, psy_data::p2p::BlsPublicKey>>,
 }

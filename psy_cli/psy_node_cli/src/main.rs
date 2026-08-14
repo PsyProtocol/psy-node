@@ -164,6 +164,7 @@ async fn main() -> anyhow::Result<()> {
             listen,
             proving_backend,
             p2p_roster_path,
+            p2p_checkpoints_per_epoch,
         } => {
             let config = CoordinatorEdgeCliConfig::get_start_config(
                 config,
@@ -178,6 +179,7 @@ async fn main() -> anyhow::Result<()> {
                 port,
                 listen,
                 p2p_roster_path,
+                p2p_checkpoints_per_epoch,
             )
             .await?;
             start_coordinator_edge::run(config, get_proving_backend_from_input(proving_backend)).await?;

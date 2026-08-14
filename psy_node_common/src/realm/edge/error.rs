@@ -10,6 +10,8 @@ use jsonrpsee::{
 };
 use tracing::error;
 
+use crate::p2p::guta_submit::GutaSubmitError;
+
 // Define error enum
 #[derive(Debug, thiserror::Error)]
 pub enum RpcError {
@@ -21,9 +23,10 @@ pub enum RpcError {
     PermissionDenied,
     #[error("Internal error: {0}")]
     Internal(String),
+    #[error(transparent)]
+    GutaSubmit(#[from] GutaSubmitError),
     #[error("Anyhow error: {0}")]
     Anyhow(#[from] anyhow::Error),
-    // ... more
 }
 
 impl From<RpcError> for ErrorObjectOwned {
@@ -35,6 +38,11 @@ impl From<RpcError> for ErrorObjectOwned {
                 ErrorObject::owned(INVALID_REQUEST_CODE, "Permission denied", None::<()>)
             }
             RpcError::Internal(msg) => ErrorObject::owned(INTERNAL_ERROR_CODE, msg, None::<()>),
+            RpcError::GutaSubmit(submit) => ErrorObject::owned(
+                submit.rpc_code(),
+                submit.message().to_string(),
+                Some(serde_json::json!({ "reason": submit.reason() as u8 })),
+            ),
             RpcError::Anyhow(msg) => {
                 ErrorObject::owned(UNKNOWN_ERROR_CODE, msg.to_string(), None::<()>)
             }

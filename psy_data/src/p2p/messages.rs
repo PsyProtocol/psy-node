@@ -84,12 +84,11 @@ impl ProtocolEncode for RealmFinalizeOutputBytes {
     }
 }
 
-/// Pre-commit Proposal metadata (exactly 218 wire bytes).
+/// Pre-commit Proposal metadata (exactly 210 wire bytes).
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct Proposal {
     pub chain_id: u32,
     pub realm_id: u32,
-    pub target_checkpoint_id: u64,
     pub base_checkpoint_id: u64,
     pub proposer_sub_id: u16,
     pub validator_tree_root: [u8; 32],
@@ -101,14 +100,13 @@ pub struct Proposal {
 }
 
 impl Proposal {
-    /// Exact wire length (218 bytes).
+    /// Exact wire length (210 bytes).
     pub const WIRE_BYTES: usize = PROPOSAL_WIRE_BYTES;
 
     pub fn protocol_decode(reader: &mut ProtocolReader<'_>) -> ProtocolResult<Self> {
         Ok(Self {
             chain_id: reader.read_u32()?,
             realm_id: reader.read_u32()?,
-            target_checkpoint_id: reader.read_u64()?,
             base_checkpoint_id: reader.read_u64()?,
             proposer_sub_id: reader.read_u16()?,
             validator_tree_root: reader.read_bytes_32()?,
@@ -129,7 +127,6 @@ impl Proposal {
         compute_proposal_id(
             self.chain_id,
             self.realm_id,
-            self.target_checkpoint_id,
             self.base_checkpoint_id,
             self.proposer_sub_id,
             &self.validator_tree_root,
@@ -145,7 +142,6 @@ impl ProtocolEncode for Proposal {
     fn protocol_encode(&self, out: &mut Vec<u8>) {
         write_u32(out, self.chain_id);
         write_u32(out, self.realm_id);
-        write_u64(out, self.target_checkpoint_id);
         write_u64(out, self.base_checkpoint_id);
         write_u16(out, self.proposer_sub_id);
         write_fixed(out, &self.validator_tree_root);
@@ -158,13 +154,11 @@ impl ProtocolEncode for Proposal {
 }
 
 /// `proposal_id = SHA-256(protocol_encode(DOMAIN_PROPOSAL, chain_id, realm_id,
-///     target_checkpoint_id, base_checkpoint_id, proposer_sub_id,
-///     validator_tree_root, public_output_hash, finalizer_proof_hash,
-///     backup_hash, body_hash))`.
+///     base_checkpoint_id, proposer_sub_id, validator_tree_root,
+///     public_output_hash, finalizer_proof_hash, backup_hash, body_hash))`.
 pub fn compute_proposal_id(
     chain_id: u32,
     realm_id: u32,
-    target_checkpoint_id: u64,
     base_checkpoint_id: u64,
     proposer_sub_id: u16,
     validator_tree_root: &[u8; 32],
@@ -173,11 +167,10 @@ pub fn compute_proposal_id(
     backup_hash: &[u8; 32],
     body_hash: &[u8; 32],
 ) -> [u8; 32] {
-    let mut buf = Vec::with_capacity(8 + 4 + 4 + 8 + 8 + 2 + 5 * 32);
+    let mut buf = Vec::with_capacity(8 + 4 + 4 + 8 + 2 + 5 * 32);
     write_fixed(&mut buf, &DOMAIN_PROPOSAL);
     write_u32(&mut buf, chain_id);
     write_u32(&mut buf, realm_id);
-    write_u64(&mut buf, target_checkpoint_id);
     write_u64(&mut buf, base_checkpoint_id);
     write_u16(&mut buf, proposer_sub_id);
     write_fixed(&mut buf, validator_tree_root);
@@ -192,7 +185,6 @@ pub fn compute_proposal_id(
 pub fn proposal_from_parts(
     chain_id: u32,
     realm_id: u32,
-    target_checkpoint_id: u64,
     base_checkpoint_id: u64,
     proposer_sub_id: u16,
     validator_tree_root: [u8; 32],
@@ -204,7 +196,6 @@ pub fn proposal_from_parts(
     let proposal_id = compute_proposal_id(
         chain_id,
         realm_id,
-        target_checkpoint_id,
         base_checkpoint_id,
         proposer_sub_id,
         &validator_tree_root,
@@ -216,7 +207,6 @@ pub fn proposal_from_parts(
     Proposal {
         chain_id,
         realm_id,
-        target_checkpoint_id,
         base_checkpoint_id,
         proposer_sub_id,
         validator_tree_root,
@@ -441,30 +431,27 @@ impl ProtocolEncode for Vote {
 }
 
 /// `vote_message = protocol_encode(DOMAIN_VOTE, chain_id, realm_id,
-///     target_checkpoint_id, validator_tree_root, proposal_id)`.
+///     validator_tree_root, proposal_id)`.
 pub fn vote_message(
     chain_id: u32,
     realm_id: u32,
-    target_checkpoint_id: u64,
     validator_tree_root: &[u8; 32],
     proposal_id: &[u8; 32],
 ) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(8 + 4 + 4 + 8 + 32 + 32);
+    let mut buf = Vec::with_capacity(8 + 4 + 4 + 32 + 32);
     write_fixed(&mut buf, &DOMAIN_VOTE);
     write_u32(&mut buf, chain_id);
     write_u32(&mut buf, realm_id);
-    write_u64(&mut buf, target_checkpoint_id);
     write_fixed(&mut buf, validator_tree_root);
     write_fixed(&mut buf, proposal_id);
     buf
 }
 
-/// Certificate wire object (exactly 208 bytes).
+/// Certificate wire object (exactly 200 bytes).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Certificate {
     pub chain_id: u32,
     pub realm_id: u32,
-    pub target_checkpoint_id: u64,
     pub validator_tree_root: [u8; 32],
     pub proposal_id: [u8; 32],
     /// Bit `s` <=> `realm_sub_id = s` signed.
@@ -473,7 +460,7 @@ pub struct Certificate {
 }
 
 impl Certificate {
-    /// Exact wire length (208 bytes).
+    /// Exact wire length (200 bytes).
     pub const WIRE_BYTES: usize = CERTIFICATE_WIRE_BYTES;
 
     /// Number of set signer bits.
@@ -500,7 +487,6 @@ impl Certificate {
         vote_message(
             self.chain_id,
             self.realm_id,
-            self.target_checkpoint_id,
             &self.validator_tree_root,
             &self.proposal_id,
         )
@@ -510,7 +496,6 @@ impl Certificate {
         Ok(Self {
             chain_id: reader.read_u32()?,
             realm_id: reader.read_u32()?,
-            target_checkpoint_id: reader.read_u64()?,
             validator_tree_root: reader.read_bytes_32()?,
             proposal_id: reader.read_bytes_32()?,
             signer_bitmap: reader.read_bytes_32()?,
@@ -527,7 +512,6 @@ impl ProtocolEncode for Certificate {
     fn protocol_encode(&self, out: &mut Vec<u8>) {
         write_u32(out, self.chain_id);
         write_u32(out, self.realm_id);
-        write_u64(out, self.target_checkpoint_id);
         write_fixed(out, &self.validator_tree_root);
         write_fixed(out, &self.proposal_id);
         write_fixed(out, &self.signer_bitmap);
@@ -536,7 +520,7 @@ impl ProtocolEncode for Certificate {
 }
 
 /// Validator-to-coordinator Realm finalize submission:
-/// `output[410] || Proposal[218] || Certificate[208] || proof_len:u32 || proof`.
+/// `output[410] || Proposal[210] || Certificate[200] || proof_len:u32 || proof`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RealmFinalizeSubmitRequest {
     output: RealmFinalizeOutputBytes,
@@ -972,7 +956,6 @@ mod tests {
         proposal_from_parts(
             1,
             2,
-            100,
             99,
             3,
             [0x11; 32],
@@ -988,7 +971,7 @@ mod tests {
         let p = sample_proposal();
         let enc = p.protocol_encode_to_vec();
         assert_eq!(enc.len(), PROPOSAL_WIRE_BYTES);
-        assert_eq!(enc.len(), 218);
+        assert_eq!(enc.len(), 210);
         assert_eq!(p.proposal_id, p.compute_proposal_id());
         assert_eq!(Proposal::decode_exact(&enc).unwrap(), p);
 
@@ -997,7 +980,6 @@ mod tests {
         write_fixed(&mut expected, &DOMAIN_PROPOSAL);
         write_u32(&mut expected, 1);
         write_u32(&mut expected, 2);
-        write_u64(&mut expected, 100);
         write_u64(&mut expected, 99);
         write_u16(&mut expected, 3);
         write_fixed(&mut expected, &[0x11; 32]);
@@ -1090,9 +1072,9 @@ mod tests {
     #[test]
     fn vote_and_certificate_wire_sizes() {
         let p = sample_proposal();
-        let msg = vote_message(1, 2, 100, &p.validator_tree_root, &p.proposal_id);
+        let msg = vote_message(1, 2, &p.validator_tree_root, &p.proposal_id);
         assert_eq!(&msg[..8], b"PSYVOT01");
-        assert_eq!(msg.len(), 8 + 4 + 4 + 8 + 32 + 32);
+        assert_eq!(msg.len(), 8 + 4 + 4 + 32 + 32);
 
         let sks: Vec<_> = (1u8..=3)
             .map(|s| BlsSecretKey::key_gen(&[s; 32]).unwrap())
@@ -1119,7 +1101,6 @@ mod tests {
         let cert = Certificate {
             chain_id: 1,
             realm_id: 2,
-            target_checkpoint_id: 100,
             validator_tree_root: p.validator_tree_root,
             proposal_id: p.proposal_id,
             signer_bitmap: bitmap,
@@ -1127,7 +1108,7 @@ mod tests {
         };
         let cenc = cert.protocol_encode_to_vec();
         assert_eq!(cenc.len(), CERTIFICATE_WIRE_BYTES);
-        assert_eq!(cenc.len(), 208);
+        assert_eq!(cenc.len(), 200);
         let dec = Certificate::decode_exact(&cenc).unwrap();
         assert_eq!(dec.popcount(), 3);
         assert_eq!(dec.signer_sub_ids(), vec![1, 2, 4]);
@@ -1247,13 +1228,12 @@ mod tests {
 
         // Realm finalize-submit: output || proposal || certificate || proof_len || proof.
         let sk = BlsSecretKey::key_gen(&[3u8; 32]).unwrap();
-        let msg = vote_message(1, 2, 100, &p.validator_tree_root, &p.proposal_id);
+        let msg = vote_message(1, 2, &p.validator_tree_root, &p.proposal_id);
         let mut bitmap = [0u8; 32];
         bitmap_set(&mut bitmap, 3);
         let cert = Certificate {
             chain_id: 1,
             realm_id: 2,
-            target_checkpoint_id: 100,
             validator_tree_root: p.validator_tree_root,
             proposal_id: p.proposal_id,
             signer_bitmap: bitmap,

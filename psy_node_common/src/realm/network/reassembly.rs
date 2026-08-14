@@ -154,12 +154,12 @@ impl ProposalReassembly {
     }
 
     pub fn is_expired(&self, now: Instant, expiry: Duration) -> bool {
-        now.duration_since(self.created_at) >= expiry
+        now.duration_since(self.last_request_at.unwrap_or(self.created_at)) >= expiry
     }
 
     /// Insert a body chunk. Returns `Duplicate` for an already-recovered
     /// range and `Complete` when the contiguous prefix reaches `body_len`.
-    pub fn insert_chunk(&mut self, offset: u64, data: &[u8]) -> Result<InsertOutcome, NetworkError> {
+    pub fn insert_chunk(&mut self, offset: u64, data: &[u8], now: Instant) -> Result<InsertOutcome, NetworkError> {
         let length = data.len() as u32;
         if length == 0 {
             return Err(NetworkError::Reassembly("chunk data is empty".into()));
@@ -170,6 +170,7 @@ impl ProposalReassembly {
         if end > self.body_len {
             return Err(NetworkError::Reassembly("chunk range exceeds body length".into()));
         }
+        self.last_request_at = Some(now);
         if self.overlaps(offset, length) {
             return Ok(InsertOutcome::Duplicate);
         }
@@ -343,8 +344,7 @@ impl ReassemblyBook {
             .entries
             .get_mut(proposal_id)
             .ok_or_else(|| NetworkError::Reassembly("chunk for unknown proposal".into()))?;
-        let _ = now;
-        reassembly.insert_chunk(offset, data)
+        reassembly.insert_chunk(offset, data, now)
     }
 
     /// Finalize and verify a complete reassembly, removing it from the book.

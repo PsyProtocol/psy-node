@@ -1977,6 +1977,7 @@ pub struct PsyCheckpointGlobalStateRoots<F: RichField> {
     pub user_tree_root: QHashOut<F>,
     pub withdrawal_tree_root: QHashOut<F>,
     pub user_registration_tree_root: QHashOut<F>,
+    pub validator_tree_root: QHashOut<F>,
 }
 ```
 
@@ -1989,6 +1990,7 @@ pub struct PsyCheckpointGlobalStateRoots<F: RichField> {
 | `user_tree_root` | `QHashOut<F>` | Root of the user tree |
 | `withdrawal_tree_root` | `QHashOut<F>` | Root of the withdrawal tree |
 | `user_registration_tree_root` | `QHashOut<F>` | Root of the user registration tree |
+| `validator_tree_root` | `QHashOut<F>` | Root of the validator tree |
 
 **Example**:
 ```json
@@ -1997,7 +1999,8 @@ pub struct PsyCheckpointGlobalStateRoots<F: RichField> {
   "deposit_tree_root": "0x5678...",
   "user_tree_root": "0x9abc...",
   "withdrawal_tree_root": "0xdef0...",
-  "user_registration_tree_root": "0x1234..."
+  "user_registration_tree_root": "0x1234...",
+  "validator_tree_root": "0x5678..."
 }
 ```
 

@@ -36,11 +36,14 @@ use psy_node_core::{
 };
 
 use crate::{
-    backup::{checkpoint_tree::CheckpointTreeBackupManager, realm::generate_realm_output_from_backups},
+    backup::{
+        checkpoint_tree::CheckpointTreeBackupManager,
+        realm::{find_realm_backups_by_end_root, generate_realm_output_from_backup_path, generate_realm_output_from_backups},
+    },
     constants::queue::PQ_REALM_SUBMIT_USER_UPDATE_QUEUE_TOPIC_ID,
     queue::gatherer::QueueKeyStatusManager,
     realm::processor::db::{DatabaseCheckState, PsyRealmDatabaseProcessor},
-    realm::processor::gatherers::realm_end_cap_gatherer::{get_new_realm_end_cap_gatherer_backup_file_path, read_realm_backup_end_root},
+    realm::processor::gatherers::realm_end_cap_gatherer::get_new_realm_end_cap_gatherer_backup_file_path,
     utils::processor_status::ProcessorStatus,
 };
 
@@ -463,134 +466,86 @@ where
                     let (realm_unique_pending_id, realm_proc_checkpoint_id) = match realm_pending_id {
                         Some(res) => res,
                         None => {
-                            // Coordinator has advanced past what realm committed locally.
-                            // Scan all candidate pending_ids to find a backup whose end_root matches.
                             let (current_unique_pending_id, current_proc_checkpoint_id) = self.db.get_latest_mapped_unique_pending_id().await?;
-                            let last_committed_unique_pending_id = self.state.last_committed_unique_pending_id;
-
+                            let matching_backups = find_realm_backups_by_end_root::<FileSystem, N::QHash>(
+                                file_system,
+                                guta_gatherer_backup_directory,
+                                self.state.realm_id_u64,
+                                self.state.realm_sub_id_u64,
+                                target_realm_state.value,
+                            )
+                            .await?;
                             let mut recovered_from_backup = false;
-                            if current_unique_pending_id > last_committed_unique_pending_id {
-                                for candidate in (last_committed_unique_pending_id + 1)..=current_unique_pending_id {
-                                    let path = get_new_realm_end_cap_gatherer_backup_file_path(
-                                        guta_gatherer_backup_directory,
-                                        self.state.realm_id_u64,
-                                        self.state.realm_sub_id_u64,
-                                        candidate,
-                                    );
-                                    match read_realm_backup_end_root::<FileSystem, N::QHash>(file_system, &path.to_string_lossy()).await {
-                                        Ok(end_root) if end_root == target_realm_state.value => {
-                                            let candidate_proc_checkpoint_id = if candidate == current_unique_pending_id {
-                                                current_proc_checkpoint_id
-                                            } else if let Some(mapped_checkpoint_id) =
-                                                self.db.get_checkpoint_id_for_unique_pending_id(candidate).await?
-                                            {
-                                                match self.db.get_unique_pending_id_for_checkpoint_id(mapped_checkpoint_id).await? {
-                                                    Some((mapped_pending_id, mapped_proc_checkpoint_id))
-                                                        if mapped_pending_id == candidate =>
-                                                    {
-                                                        mapped_proc_checkpoint_id
-                                                    }
-                                                    _ => {
-                                                        tracing::warn!(
-                                                            "Backup pending_id {} matches checkpoint {} end_root, but its stored proc_checkpoint_unique_id could not be verified via mapped checkpoint {}. Using current proc_checkpoint_unique_id {}.",
-                                                            candidate,
-                                                            checkpoint_id,
-                                                            mapped_checkpoint_id,
-                                                            current_proc_checkpoint_id
-                                                        );
-                                                        current_proc_checkpoint_id
-                                                    }
-                                                }
-                                            } else {
-                                                tracing::warn!(
-                                                    "Backup pending_id {} matches checkpoint {} end_root, but it has no checkpoint mapping to recover proc_checkpoint_unique_id. Current pending_id is {}; using current proc_checkpoint_unique_id {}.",
-                                                    candidate,
-                                                    checkpoint_id,
-                                                    current_unique_pending_id,
-                                                    current_proc_checkpoint_id
-                                                );
-                                                current_proc_checkpoint_id
-                                            };
-                                            let mut recovery_state = self.state.clone();
-                                            recovery_state.processing_unique_pending_id = candidate;
-                                            recovery_state.processing_proc_checkpoint_unique_id = candidate_proc_checkpoint_id;
-                                            recovery_state.processing_realm_start_root = self.state.last_committed_realm_end_root;
-                                            recovery_state.processing_realm_end_root = target_realm_state.value;
-                                            tracing::info!(
-                                                "Found matching backup for checkpoint {}: pending_id={}. Attempting full load.",
-                                                checkpoint_id,
-                                                candidate
-                                            );
-                                            match generate_realm_output_from_backups::<N, FileSystem>(
-                                                file_system,
-                                                guta_gatherer_backup_directory,
-                                                &recovery_state,
-                                                Some(candidate),
-                                                global_user_tree,
-                                            ).await {
-                                                Ok(updates) if updates.new_realm_root == target_realm_state.value => {
-                                                    tracing::info!(
-                                                        "Backup recovery successful for pending_id {}: end_root matches coordinator target {:?}.",
-                                                        candidate,
-                                                        target_realm_state.value
-                                                    );
-                                                    self.state.processing_unique_pending_id = recovery_state.processing_unique_pending_id;
-                                                    self.state.processing_proc_checkpoint_unique_id =
-                                                        recovery_state.processing_proc_checkpoint_unique_id;
-                                                    self.state.processing_realm_start_root =
-                                                        recovery_state.processing_realm_start_root;
-                                                    self.state.processing_realm_end_root =
-                                                        recovery_state.processing_realm_end_root;
-                                                    self.commit_state(
-                                                        &coordinator_update,
-                                                        &updates,
-                                                        ProvingJobCircuitType::GUTANoChange,
-                                                        vec![],
-                                                        true,
-                                                    ).await?;
-                                                    tracing::info!(
-                                                        "Checkpoint {} recovered from backup (pending_id={}).",
-                                                        checkpoint_id,
-                                                        candidate
-                                                    );
-                                                    recovered_from_backup = true;
-                                                    break;
-                                                }
-                                                Ok(updates) => {
-                                                    tracing::warn!(
-                                                        "Backup end_root {:?} does not match coordinator target {:?} for pending_id {}. Trying next candidate.",
-                                                        updates.new_realm_root,
-                                                        target_realm_state.value,
-                                                        candidate
-                                                    );
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!(
-                                                        "Backup pending_id {} end_root matches but full load failed: {:?}. Trying next candidate.",
-                                                        candidate,
-                                                        e
-                                                    );
-                                                }
+
+                            for backup in matching_backups {
+                                let commit_pending_id = backup.pending_id.unwrap_or(current_unique_pending_id);
+                                let commit_proc_checkpoint_id = if backup.pending_id == Some(current_unique_pending_id) {
+                                    current_proc_checkpoint_id
+                                } else if let Some(candidate) = backup.pending_id {
+                                    if let Some(mapped_checkpoint_id) = self.db.get_checkpoint_id_for_unique_pending_id(candidate).await? {
+                                        match self.db.get_unique_pending_id_for_checkpoint_id(mapped_checkpoint_id).await? {
+                                            Some((mapped_pending_id, mapped_proc_checkpoint_id)) if mapped_pending_id == candidate => {
+                                                mapped_proc_checkpoint_id
                                             }
+                                            _ => current_proc_checkpoint_id,
                                         }
-                                        Ok(end_root) => {
-                                            tracing::debug!(
-                                                "Backup pending_id {} end_root {:?} does not match coordinator target {:?} for checkpoint {}.",
-                                                candidate,
-                                                end_root,
-                                                target_realm_state.value,
-                                                checkpoint_id
-                                            );
-                                        }
-                                        Err(e) => {
-                                            tracing::debug!(
-                                                "Failed to read backup pending_id {} for checkpoint {}: {:?}",
-                                                candidate,
-                                                checkpoint_id,
-                                                e
-                                            );
-                                        }
+                                    } else {
+                                        current_proc_checkpoint_id
                                     }
+                                } else {
+                                    current_proc_checkpoint_id
+                                };
+                                let mut recovery_state = self.state.clone();
+                                recovery_state.processing_checkpoint_id = checkpoint_id;
+                                recovery_state.processing_checkpoint_root = coordinator_update.checkpoint_sync_info.checkpoint_tree_root;
+                                recovery_state.processing_unique_pending_id = commit_pending_id;
+                                recovery_state.processing_proc_checkpoint_unique_id = commit_proc_checkpoint_id;
+                                recovery_state.processing_realm_start_root = self.state.last_committed_realm_end_root;
+                                recovery_state.processing_realm_end_root = target_realm_state.value;
+                                let mut scratch_tree = global_user_tree.clone();
+                                match generate_realm_output_from_backup_path::<N, FileSystem>(
+                                    file_system,
+                                    &backup.path,
+                                    &recovery_state,
+                                    &mut scratch_tree,
+                                )
+                                .await
+                                {
+                                    Ok(updates) if updates.new_realm_root == target_realm_state.value => {
+                                        self.state.processing_checkpoint_id = recovery_state.processing_checkpoint_id;
+                                        self.state.processing_checkpoint_root = recovery_state.processing_checkpoint_root;
+                                        self.state.processing_unique_pending_id = recovery_state.processing_unique_pending_id;
+                                        self.state.processing_proc_checkpoint_unique_id = recovery_state.processing_proc_checkpoint_unique_id;
+                                        self.state.processing_realm_start_root = recovery_state.processing_realm_start_root;
+                                        self.state.processing_realm_end_root = recovery_state.processing_realm_end_root;
+                                        self.commit_state(
+                                            &coordinator_update,
+                                            &updates,
+                                            ProvingJobCircuitType::GUTANoChange,
+                                            vec![],
+                                            true,
+                                        )
+                                        .await?;
+                                        tracing::info!(
+                                            "Applied Realm proposal backup end_root={:?} checkpoint_id={} path={}",
+                                            updates.new_realm_root,
+                                            checkpoint_id,
+                                            backup.path.display()
+                                        );
+                                        recovered_from_backup = true;
+                                        break;
+                                    }
+                                    Ok(updates) => tracing::warn!(
+                                        "Realm backup full load end_root {:?} does not match coordinator target {:?}: path={}",
+                                        updates.new_realm_root,
+                                        target_realm_state.value,
+                                        backup.path.display()
+                                    ),
+                                    Err(error) => tracing::warn!(
+                                        "Realm backup matched header end_root but full load failed: path={} error={:#}",
+                                        backup.path.display(),
+                                        error
+                                    ),
                                 }
                             }
 

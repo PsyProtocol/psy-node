@@ -5,14 +5,14 @@ use parth_core::{
     felt::ToU64Value,
     protocol::core_types::{Q256BitHash, QNetworkTypesConfig},
 };
-use psy_core::job::job_id::QProvingJobDataID;
+use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
     guta::{
         header_extended::{GlobalUserTreeAggregatorHeaderWithTagValue, GlobalUserTreeAggregatorHeaderWithTagValueAndJobType},
         realm_finalize::protocol_encode_finalize_output,
     },
     node::node_proving_state::PsyNodeProvingState,
-    p2p::{encode_proposal_body, proposal_from_parts, replication_threshold, sha256, vote_message, ProtocolEncode},
+    p2p::{encode_proposal_body, proposal_from_parts, replication_threshold, sha256, vote_message, Certificate, Proposal, ProtocolEncode, RealmFinalizeSubmitCode},
     prepared_block::realm::PsyPreparedRealmBlockStateUpdates,
     worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId,
 };
@@ -29,15 +29,17 @@ use psy_node_core::{
     store::traits::proof_store::QParthProofStore,
 };
 
-use crate::realm::{
-    processor::{
-        consensus::{build_bound_finalize_output, form_certificate, sign_vote},
-        core::PsyRealmProcessor,
-        gatherers::realm_end_cap_gatherer::{
-            get_new_realm_end_cap_gatherer_backup_file_path, RealmGUTAEndCapGathererOutput,
+use crate::{
+    backup::realm::{find_realm_backups_by_end_root, generate_realm_output_from_backup_path, load_realm_memory_trees_from_db},
+    p2p::guta_submit::GutaSubmitError,
+    realm::{
+        processor::{
+            consensus::{build_bound_finalize_output, form_certificate, sign_vote},
+            core::PsyRealmProcessor,
+            gatherers::realm_end_cap_gatherer::{get_new_realm_end_cap_gatherer_backup_file_path, RealmGUTAEndCapGathererOutput},
         },
+        queue_key::RealmProvingWorkQueueKey,
     },
-    queue_key::RealmProvingWorkQueueKey,
 };
 
 impl<
@@ -161,43 +163,131 @@ where
     }
 
     pub async fn sync_and_verify(&mut self) -> anyhow::Result<()> {
-        // let mut timer = TraceTimer::new("sync_and_verify");
-        //self.db.print_last_10_checkpoint_roots_and_leaves("process_block before
-        // sync_with_coordinator").await?;
-
-        // 1. Sync & Verify Consistency
-        // We attempt to ensure we are consistent. If we are behind, we catch up.
         self.db.sync_with_coordinator().await?;
-        //self.db.print_last_10_checkpoint_roots_and_leaves("process_block after
-        // sync_with_coordinator").await?;
-
-        match self.db.ensure_db_matches_coordinator_head().await {
-            Ok(_) => {
-                // Consistent, proceed
+        if let Err(error) = self.db.ensure_db_matches_coordinator_head().await {
+            let message = error.to_string();
+            if !message.contains("Local database is stale") && !message.contains("Realm Root mismatch") {
+                return Err(error);
             }
-            Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("Local database is stale") || err_str.contains("Realm Root mismatch") {
-                    tracing::warn!("Coordinator is ahead of local DB ({}), attempting to fast-forward sync...", err_str);
-                    // We are behind. The coordinator has processed updates we missed (perhaps while
-                    // we were down). We must sync to the latest state before
-                    // doing anything else.
-                    self.db.sync_to_coordinator_set_checkpoint_id().await?;
+            tracing::warn!("Coordinator is ahead of local DB ({}), attempting recovery sync...", message);
+            self.apply_included_realm_backup_or_fast_forward().await?;
+            self.db.ensure_db_matches_coordinator_head().await?;
+            tracing::info!("Coordinator recovery sync complete. Resuming block processing.");
+        }
+        Ok(())
+    }
+    async fn ensure_uncommitted_processing_ids(&mut self) -> anyhow::Result<()> {
+        let pending_id = self.db.state.processing_unique_pending_id;
+        if pending_id != 0 && self.db.db.get_checkpoint_id_for_unique_pending_id(pending_id).await?.is_none() {
+            return Ok(());
+        }
+        let (pending_id, proc_checkpoint_unique_id) = self.db.db.inc_unique_pending_id(1).await?;
+        self.db.state.processing_unique_pending_id = pending_id;
+        self.db.state.processing_proc_checkpoint_unique_id = proc_checkpoint_unique_id;
+        self.db
+            .temp_db
+            .set_unique_pending_ids(&self.db.state.realm_identifier, pending_id, proc_checkpoint_unique_id)
+            .await?;
+        Ok(())
+    }
 
-                    // Re-verify after sync
-                    self.db.ensure_db_matches_coordinator_head().await?;
-                    // timer.lap("recovery_sync");
-                    tracing::info!("Fast-forward sync complete. Resuming block processing.");
-                } else {
-                    return Err(e);
+
+    async fn apply_included_realm_backup_or_fast_forward(&mut self) -> anyhow::Result<()> {
+        let coordinator_latest_checkpoint_id = self.db.coordinator_client.rc_get_latest_checkpoint_id().await?;
+        let coordinator_realm_state = self
+            .db
+            .coordinator_client
+            .rc_get_realm_root_and_last_modified_checkpoint(coordinator_latest_checkpoint_id, self.db.state.realm_id_u64)
+            .await?;
+        if coordinator_realm_state.value == self.db.state.last_committed_realm_end_root {
+            return self.db.sync_to_coordinator_set_checkpoint_id().await;
+        }
+        let included_checkpoint_id = coordinator_realm_state.checkpoint_id;
+
+        let file_system = self.db.checkpoint_tree_backup_manager.file_system.clone();
+        let matching_backups = find_realm_backups_by_end_root::<FileSystem, N::QHash>(
+            file_system.as_ref(),
+            &self.guta_gatherer_backup_directory,
+            self.db.state.realm_id_u64,
+            self.db.state.realm_sub_id_u64,
+            coordinator_realm_state.value,
+        )
+        .await?;
+        if matching_backups.is_empty() {
+            anyhow::bail!(
+                "Checkpoint {}: Realm root changed from {:?} to {:?}, but no matching standard or proposal backup was found under {}",
+                included_checkpoint_id,
+                self.db.state.last_committed_realm_end_root,
+                coordinator_realm_state.value,
+                self.guta_gatherer_backup_directory
+            );
+        }
+        self.ensure_uncommitted_processing_ids().await?;
+
+        let coordinator_update = self
+            .db
+            .coordinator_client
+            .rc_get_realm_sync_info(included_checkpoint_id, self.db.state.realm_id_u64)
+            .await?;
+        let (base_scratch_tree,) = load_realm_memory_trees_from_db::<N, _>(
+            &self.db.db,
+            self.db.state.last_committed_checkpoint_id,
+            self.db.state.realm_id_u64,
+        )
+        .await?
+        .into_tuple();
+        for backup in matching_backups {
+            let mut recovery_state = self.db.state.clone();
+            recovery_state.processing_checkpoint_id = included_checkpoint_id;
+            recovery_state.processing_checkpoint_root = coordinator_update.checkpoint_sync_info.checkpoint_tree_root;
+            recovery_state.processing_realm_start_root = self.db.state.last_committed_realm_end_root;
+            recovery_state.processing_realm_end_root = coordinator_realm_state.value;
+            let mut scratch_tree = base_scratch_tree.clone();
+            match generate_realm_output_from_backup_path::<N, FileSystem>(
+                file_system.as_ref(),
+                &backup.path,
+                &recovery_state,
+                &mut scratch_tree,
+            )
+            .await
+            {
+                Ok(updates) if updates.new_realm_root == coordinator_realm_state.value => {
+                    self.db.state.processing_checkpoint_id = recovery_state.processing_checkpoint_id;
+                    self.db.state.processing_checkpoint_root = recovery_state.processing_checkpoint_root;
+                    self.db.state.processing_realm_start_root = recovery_state.processing_realm_start_root;
+                    self.db.state.processing_realm_end_root = recovery_state.processing_realm_end_root;
+                    self.db
+                        .commit_state(&coordinator_update, &updates, ProvingJobCircuitType::GUTANoChange, vec![], true)
+                        .await?;
+                    tracing::info!(
+                        "Applied Realm proposal backup end_root={:?} checkpoint_id={} path={}",
+                        updates.new_realm_root,
+                        included_checkpoint_id,
+                        backup.path.display()
+                    );
+                    self.db.sync_to_coordinator_set_checkpoint_id().await?;
+                    return Ok(());
                 }
+                Ok(updates) => tracing::warn!(
+                    "Realm backup full load end_root {:?} does not match included root {:?}: path={}",
+                    updates.new_realm_root,
+                    coordinator_realm_state.value,
+                    backup.path.display()
+                ),
+                Err(error) => tracing::warn!(
+                    "Realm backup matched included end_root but full load failed: path={} error={:#}",
+                    backup.path.display(),
+                    error
+                ),
             }
         }
-        //self.db.print_last_10_checkpoint_roots_and_leaves("process_block after
-        // ensure_db_matches_coordinator_head").await?;
 
-        // timer.lap("sync_and_verify_coordinator");
-        Ok(())
+        anyhow::bail!(
+            "Checkpoint {}: Realm root changed from {:?} to {:?}, but every matching backup failed full load",
+            included_checkpoint_id,
+            self.db.state.last_committed_realm_end_root,
+            coordinator_realm_state.value
+        )
     }
 
     pub async fn process_block(&mut self) -> anyhow::Result<()> {
@@ -246,6 +336,43 @@ where
         }
         let root_job_id = root_job_id.unwrap();
         timer.lap("get_root_job_ids");
+
+        if self.rotation.as_ref().is_some_and(|rotation| rotation.is_enabled()) {
+            let base_checkpoint_id = self
+                .db
+                .db
+                .get_checkpoint_id_for_checkpoint_root_hash(guta_update.guta_header.header.checkpoint_tree_root)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("GUTA checkpoint tree root has no canonical checkpoint ID"))?;
+            if !self.is_scheduled_proposer_for_base(base_checkpoint_id).await? {
+                tracing::warn!(
+                    "realm P2P nonempty gather is not scheduled at T=base+1 realm={} sub={} base={} end_caps={}; skipping prove/submit/commit so the next gatherer cycle rebases",
+                    self.db.state.realm_id_u64,
+                    self.db.state.realm_sub_id_u64,
+                    base_checkpoint_id,
+                    guta_update.total_users_updated
+                );
+                self.db.sync_to_coordinator_set_checkpoint_id().await?;
+                if let Err(err) = self
+                    .db
+                    .proof_work_queue
+                    .delete_worker_queue_consumer(
+                        &worker_queue_key_for_cleanup,
+                        self.db.state.realm_id_u64,
+                        self.db.state.realm_sub_id_u64,
+                        worker_unique_id_for_cleanup,
+                        0,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to delete realm worker queue consumer after unscheduled nonempty gather: {}",
+                        err
+                    );
+                }
+                return Ok(());
+            }
+        }
 
         // Record the new realm root the upcoming commit will promote to last_committed
         // via commit_processing(). Must happen after the no-jobs early return so that
@@ -310,21 +437,9 @@ where
         };
         timer.lap("build_submission_header");
 
-        // Optional Realm P2P proposal publish + blocking vote wait (Slice C).
-        // Engages only when a RealmNetworkCommands handle and a
-        // RealmRotationConfig have been wired in via `set_realm_p2p` AND
-        // rotation is enabled. This block publishes the Proposal and the
-        // processor's own Vote, then blocks on `wait_votes` until the
-        // replication threshold is met, and forms a Certificate it does NOT
-        // submit to the coordinator over P2P. GUTA admission stays on the
-        // HTTP `rc_submit_guta_proof` path below regardless of this block.
-        // Every missing input fails closed with a named error; there is no
-        // local fallback after a failed forward.
-        if let (Some(cmds), Some(rotation)) = (&self.p2p, &self.rotation) {
-            if rotation.is_enabled() {
-                self.publish_realm_p2p_proposal(&submission_header, &root_job_proof)
-                    .await?;
-            }
+        let mut p2p_submission = None;
+        if self.p2p.is_some() && self.rotation.as_ref().is_some_and(|rotation| rotation.is_enabled()) {
+            p2p_submission = self.publish_realm_p2p_proposal(&submission_header, &root_job_proof).await?;
         }
 
         // 7. Submit to Coordinator
@@ -335,12 +450,12 @@ where
                 submission_header,
                 root_job_proof.clone(),
                 self.db.state.realm_id_u64,
-                self.last_p2p_proposal
+                p2p_submission
                     .as_ref()
-                    .map(|proposal| proposal.protocol_encode_to_vec()),
-                self.last_p2p_certificate
+                    .map(|(proposal, _)| proposal.protocol_encode_to_vec()),
+                p2p_submission
                     .as_ref()
-                    .map(|certificate| certificate.protocol_encode_to_vec()),
+                    .map(|(_, certificate)| certificate.protocol_encode_to_vec()),
             )
             .await?;
         timer.lap("submit_guta_proof");
@@ -424,15 +539,12 @@ where
         &mut self,
         submission_header: &GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
         root_job_proof: &[u8],
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<(Proposal, Certificate)>> {
         let (cmds, rotation) = (
             self.p2p.as_ref().expect("p2p handle checked by caller"),
             self.rotation.as_ref().expect("rotation checked by caller"),
         );
 
-        // A BLS secret key is required to sign the processor's own Vote. If
-        // P2P is enabled without one, fail closed rather than publishing an
-        // unsigned / spoofed vote.
         let bls_secret = self.bls_secret.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "realm P2P enabled for realm {} but no BLS secret key was wired via set_realm_p2p",
@@ -440,51 +552,33 @@ where
             )
         })?;
 
-        // Epoch-of-target scheduled-proposer check. The target checkpoint T
-        // is the one this GUTA is for (`processing_checkpoint_id`), never the
-        // coordinator's current epoch. The anchor seed is the `random_seed` of
-        // the epoch's anchor checkpoint leaf, as four Goldilocks u64 limbs.
-        // This mirrors the edge EndCap forward path exactly.
-        let target = self.db.state.processing_checkpoint_id;
-        let epoch = parth_common::realm_rotation::epoch(target, rotation.checkpoints_per_epoch);
-        let anchor_id = parth_common::realm_rotation::anchor_checkpoint_id(epoch, rotation.checkpoints_per_epoch);
-        let anchor_leaf = self.db.db.get_checkpoint_leaf_data(anchor_id).await?;
-        let seed_felts = anchor_leaf.stats.random_seed.to_4_felts();
-        let anchor_seed = [
-            seed_felts[0].to_u64_value(),
-            seed_felts[1].to_u64_value(),
-            seed_felts[2].to_u64_value(),
-            seed_felts[3].to_u64_value(),
-        ];
-        let scheduled_proposer = rotation
-            .proposer_sub_id(self.db.state.realm_id_u64 as u32, target, anchor_seed)?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "rotation enabled but proposer_sub_id returned None for realm {} target {}",
-                    self.db.state.realm_id_u64,
-                    target
-                )
-            })?;
-        let local_sub_id = self.db.state.realm_sub_id_u64 as u16;
-        if scheduled_proposer != local_sub_id {
-            anyhow::bail!(
-                "local realm_sub_id {} is not the scheduled proposer {} for target checkpoint {} \
-                 (realm {}); fail-closed, will not submit",
-                local_sub_id,
-                scheduled_proposer,
-                target,
-                self.db.state.realm_id_u64
-            );
+        let (output_bytes, base_checkpoint_id, validator_tree_root) = self
+            .build_p2p_finalize_output(submission_header)
+            .await?;
+        let target = base_checkpoint_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("GUTA Proposal proof-base checkpoint overflow"))?;
+        if !self.is_scheduled_proposer_for_base(base_checkpoint_id).await? {
+            return Err(GutaSubmitError::retryable(
+                RealmFinalizeSubmitCode::NotScheduledProposer,
+                format!(
+                    "local realm_sub_id {} is not the scheduled proposer for T={} (base={})",
+                    self.db.state.realm_sub_id_u64,
+                    target,
+                    base_checkpoint_id
+                ),
+            ).into());
         }
+        let local_sub_id = self.db.state.realm_sub_id_u64 as u16;
+        let epoch = parth_common::realm_rotation::epoch(target, rotation.checkpoints_per_epoch);
         tracing::info!(
-            "realm P2P scheduled proposer sub_id={} epoch={} target={}",
+            "realm P2P scheduled proposer sub_id={} epoch={} target={} base={}",
             local_sub_id,
             epoch,
-            target
+            target,
+            base_checkpoint_id
         );
 
-        // Read the gatherer RGE2 backup file carried inside the Proposal body.
-        // Fail-closed if the file is missing or unreadable; never invent bytes.
         let backup_path = get_new_realm_end_cap_gatherer_backup_file_path(
             &self.guta_gatherer_backup_directory,
             self.db.state.realm_id_u64,
@@ -500,13 +594,6 @@ where
             )
         })?;
 
-        // 410-byte RealmFinalizeGUTAPublicOutput for the target checkpoint plus
-        // the validator_tree_root authenticated at the canonical proof-base
-        // checkpoint carried by the Proposal. Missing validator user id or
-        // proof-base checkpoint roots fail closed.
-        let (output_bytes, validator_tree_root) = self
-            .build_p2p_finalize_output(submission_header)
-            .await?;
         let body = encode_proposal_body(&output_bytes, root_job_proof, &backup_bytes)?;
         let body_hash = sha256(&body);
         let public_output_hash = sha256(&output_bytes);
@@ -516,8 +603,7 @@ where
         let proposal = proposal_from_parts(
             self.db.state.chain_id,
             self.db.state.realm_id_u64 as u32,
-            target,
-            self.db.state.last_committed_checkpoint_id,
+            base_checkpoint_id,
             local_sub_id,
             validator_tree_root,
             public_output_hash,
@@ -529,7 +615,6 @@ where
         let message = vote_message(
             proposal.chain_id,
             proposal.realm_id,
-            proposal.target_checkpoint_id,
             &proposal.validator_tree_root,
             &proposal.proposal_id,
         );
@@ -538,7 +623,7 @@ where
         cmds.publish_vote(own_vote.clone()).await?;
 
         let n = rotation.validator_sub_ids.len();
-        let required_valid_votes = replication_threshold(n).max(if n > 1 { 2 } else { 1 });
+        let required_valid_votes = replication_threshold(n);
         let mut all_votes = vec![(own_vote.signer_sub_id, own_vote.signature)];
         let mut seen = std::collections::HashSet::from([local_sub_id]);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
@@ -571,40 +656,69 @@ where
             }
         }
         let certificate = form_certificate(&proposal, &all_votes)?;
-        self.last_p2p_proposal = Some(proposal);
-        self.last_p2p_certificate = Some(certificate);
         tracing::info!(
             "realm P2P proposal published and certificate formed for realm {} target {} ({} verified votes)",
             self.db.state.realm_id_u64,
             target,
             all_votes.len()
         );
-        Ok(())
+        Ok(Some((proposal, certificate)))
     }
 
-    /// Build the canonical 410-byte target-checkpoint output using the
-    /// validator tree authenticated at the Proposal's proof-base checkpoint.
+    async fn is_scheduled_proposer_for_base(&self, base_checkpoint_id: u64) -> anyhow::Result<bool> {
+        let Some(rotation) = self.rotation.as_ref() else {
+            return Ok(true);
+        };
+        if self.p2p.is_none() || !rotation.is_enabled() {
+            return Ok(true);
+        }
+        let target = base_checkpoint_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("GUTA Proposal proof-base checkpoint overflow"))?;
+        let epoch = parth_common::realm_rotation::epoch(target, rotation.checkpoints_per_epoch);
+        let anchor_id = parth_common::realm_rotation::anchor_checkpoint_id(epoch, rotation.checkpoints_per_epoch);
+        let anchor_leaf = self.db.db.get_checkpoint_leaf_data(anchor_id).await?;
+        let seed_felts = anchor_leaf.stats.random_seed.to_4_felts();
+        let anchor_seed = [
+            seed_felts[0].to_u64_value(),
+            seed_felts[1].to_u64_value(),
+            seed_felts[2].to_u64_value(),
+            seed_felts[3].to_u64_value(),
+        ];
+        let scheduled_proposer = rotation
+            .proposer_sub_id(self.db.state.realm_id_u64 as u32, target, anchor_seed)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "rotation enabled but proposer_sub_id returned None for realm {} target {}",
+                    self.db.state.realm_id_u64,
+                    target
+                )
+            })?;
+        Ok(scheduled_proposer == self.db.state.realm_sub_id_u64 as u16)
+    }
+
+    /// Build the canonical unbound 410-byte output using the validator tree
+    /// authenticated at the Proposal's proof-base checkpoint.
     async fn build_p2p_finalize_output(
         &self,
         submission_header: &GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
-    ) -> anyhow::Result<([u8; 410], [u8; 32])> {
+    ) -> anyhow::Result<([u8; 410], u64, [u8; 32])> {
         let validator_user_id = self.p2p_validator_user_id.ok_or_else(|| {
             anyhow::anyhow!(
                 "realm P2P enabled for realm {} but no validator_user_id was wired via set_realm_p2p",
                 self.db.state.realm_id_u64
             )
         })?;
-        let target_checkpoint_id = self.db.state.processing_checkpoint_id;
-        let base_checkpoint_id = self.db.state.last_committed_checkpoint_id;
-        let proof_base_roots = self
+        let base_checkpoint_id = self
             .db
             .db
-            .get_checkpoint_global_state_roots(base_checkpoint_id)
-            .await?;
+            .get_checkpoint_id_for_checkpoint_root_hash(submission_header.header.header.checkpoint_tree_root)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("GUTA checkpoint tree root has no canonical checkpoint ID"))?;
+        let proof_base_roots = self.db.db.get_checkpoint_global_state_roots(base_checkpoint_id).await?;
         let validator_tree_root = proof_base_roots.validator_tree_root;
         let output = build_bound_finalize_output::<N>(
             self.db.state.chain_id,
-            target_checkpoint_id,
             self.db.state.realm_id_u64 as u32,
             self.db.state.realm_sub_id_u64 as u16,
             validator_user_id,
@@ -613,6 +727,7 @@ where
         );
         Ok((
             protocol_encode_finalize_output(&output)?,
+            base_checkpoint_id,
             validator_tree_root.into_owned_32bytes(),
         ))
     }

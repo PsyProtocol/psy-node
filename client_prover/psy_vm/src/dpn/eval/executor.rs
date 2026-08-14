@@ -169,7 +169,7 @@ pub trait StateBackend {
     /// code_root(4), state_tree_height(1)])
     fn get_contract_leaf(&self, contract_id: u64) -> anyhow::Result<Vec<u64>>;
 
-    /// Get checkpoint global state roots (20 felts).
+    /// Get checkpoint global state roots (24 felts).
     fn get_checkpoint_global_state_roots(&self, checkpoint_id: u64) -> anyhow::Result<Vec<u64>>;
 
     /// Read a 256-bit value from the IMT (Indexed Merkle Tree) state by key
@@ -308,7 +308,7 @@ impl StateBackend for InMemoryStateBackend {
             .checkpoint_global_state_roots
             .get(&checkpoint_id)
             .cloned()
-            .unwrap_or_else(|| vec![0; 20]))
+            .unwrap_or_else(|| vec![0; 24]))
     }
 
     fn get_imt_value(&self, user_id: u64, contract_id: u64, key: &[u64; 4]) -> [u64; 4] {

@@ -253,6 +253,11 @@ where
     let backup_directory = config.get_guta_updates_backup_path();
     let proposer_node_ids = proposer_node_ids_from_config(config)
         .expect("processor Realm P2P proposer NodeId config was validated at startup");
+    let roster_path = config.p2p_roster_path.as_deref().expect(
+        "processor Realm P2P roster path was validated at startup",
+    );
+    let validator_registry = validator_registry_from_roster_path(roster_path)
+        .expect("processor Realm P2P roster was validated at startup");
     let proof_verifier = Arc::new(proof_verifier);
     let commands = handle.commands();
     let mut events = handle.into_parts().1;
@@ -271,10 +276,6 @@ where
                     let validation = async {
                         anyhow::ensure!(proposal.chain_id == chain_id, "Proposal chain_id mismatch");
                         anyhow::ensure!(proposal.realm_id == realm_id, "Proposal realm_id mismatch");
-                        anyhow::ensure!(
-                            proposal.base_checkpoint_id <= proposal.target_checkpoint_id,
-                            "Proposal base checkpoint exceeds target"
-                        );
                         anyhow::ensure!(
                             proposal.compute_proposal_id() == proposal.proposal_id,
                             "Proposal proposal_id mismatch"
@@ -299,10 +300,19 @@ where
                             &submission,
                             &decoded.proof,
                         )?;
+                        let proposer = validator_registry
+                            .get(&(proposal.realm_id, proposal.proposer_sub_id))
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "GUTA proposer sub_id {} has no genesis validator",
+                                    proposal.proposer_sub_id
+                                )
+                            })?;
                         let decoded = verify_proposal_submission::<N>(
                             &proposal,
                             body.as_bytes(),
                             &submission,
+                            proposer.validator_user_id,
                             proof_verifier.as_ref(),
                         )?;
                         let backup_directory = Path::new(&backup_directory)
@@ -311,7 +321,7 @@ where
                             &backup_directory.to_string_lossy(),
                             proposal.realm_id as u64,
                             local_sub_id as u64,
-                            proposal.target_checkpoint_id,
+                            0,
                         );
                         persist_backup(&backup_path, &decoded.backup)?;
                         Ok::<(), anyhow::Error>(())

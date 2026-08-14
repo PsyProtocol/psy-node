@@ -39,11 +39,12 @@ use psy_data::{
         replication_threshold,
     },
 };
+use super::gatherers::realm_end_cap_gatherer::REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_BYTES;
 
 /// Decoded proposal body: the three length-prefixed sections in wire order.
 ///
 /// `output` is exactly [`MAX_FINALIZER_OUTPUT_BYTES`] bytes; `proof` and
-/// `backup` are the opaque verifier proof and RGE2 backup file bytes. None of
+/// `backup` are the opaque verifier proof and RGE1 backup file bytes. None of
 /// these are re-encoded or reinterpreted here.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DecodedProposalBody {
@@ -51,7 +52,7 @@ pub struct DecodedProposalBody {
     pub output: Vec<u8>,
     /// Opaque finalizer proof bytes (`<= MAX_FINALIZER_PROOF_BYTES`).
     pub proof: Vec<u8>,
-    /// RGE2 backup file bytes (`<= MAX_BACKUP_BYTES`).
+    /// RGE1 backup file bytes (`<= MAX_BACKUP_BYTES`).
     pub backup: Vec<u8>,
 }
 
@@ -103,11 +104,50 @@ pub fn decode_proposal_body(
 
     Ok(DecodedProposalBody { output, proof, backup })
 }
+/// Verify the RGE1 backup header roots against the decoded GUTA output.
+pub fn verify_backup_matches_guta_output<F, Hash>(
+    backup: &[u8],
+    output: &RealmFinalizeGUTAPublicOutput<F, Hash>,
+) -> anyhow::Result<()>
+where
+    Hash: Q256BitHash,
+{
+    const ROOT_BYTES: usize = 32;
+    const HEADER_BYTES: usize = 4 + ROOT_BYTES + ROOT_BYTES;
 
-/// Build the canonical 410-byte certificate bind output for an ordinary GUTA submit.
+    anyhow::ensure!(
+        backup.len() >= HEADER_BYTES,
+        "Realm backup is too short for RGE1 root header"
+    );
+    anyhow::ensure!(
+        backup[..4] == REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_BYTES,
+        "Realm backup RGE1 magic mismatch"
+    );
+    anyhow::ensure!(
+        backup[4..4 + ROOT_BYTES]
+            == output
+                .final_guta_header
+                .state_transition
+                .old_node_value
+                .into_owned_32bytes(),
+        "Realm backup start_root does not match GUTA old_node_value"
+    );
+    anyhow::ensure!(
+        backup[4 + ROOT_BYTES..HEADER_BYTES]
+            == output
+                .final_guta_header
+                .state_transition
+                .new_node_value
+                .into_owned_32bytes(),
+        "Realm backup end_root does not match GUTA new_node_value"
+    );
+    Ok(())
+}
+
+
+/// Build the canonical unbound 410-byte finalize output for an ordinary GUTA submit.
 pub fn build_bound_finalize_output<N>(
     chain_id: u32,
-    target_checkpoint_id: u64,
     realm_id: u32,
     proposer_sub_id: u16,
     validator_user_id: u64,
@@ -119,7 +159,7 @@ where
 {
     let chain_domain =
         realm_finalize_guta_chain_domain::<N::F, N::QHash, N::HasherBase>(chain_id);
-    let checkpoint_id = N::F::from_u64_value(target_checkpoint_id);
+    let checkpoint_id = N::F::from_u64_value(0);
     let realm_id_felt = N::F::from_u64_value(realm_id as u64);
     let root_guta_header_hash = submission.header.header.qfhash::<N::HasherBase>();
     let action = RealmFinalizeGUTAAction {
@@ -150,6 +190,7 @@ pub fn verify_proposal_submission<N>(
     proposal: &Proposal,
     body: &[u8],
     submission: &GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
+    validator_user_id: u64,
     proof_verifier: &N::ZKVerifier,
 ) -> anyhow::Result<DecodedProposalBody>
 where
@@ -166,11 +207,10 @@ where
             .map_err(|error| anyhow::anyhow!("invalid Realm finalize output: {error}"))?;
     let expected_output = build_bound_finalize_output::<N>(
         proposal.chain_id,
-        proposal.target_checkpoint_id,
         proposal.realm_id,
         proposal.proposer_sub_id,
-        output.validator_user_id.to_u64_value(),
-        output.validator_tree_root,
+        validator_user_id,
+        N::QHash::from_owned_32bytes(proposal.validator_tree_root),
         submission,
     );
     anyhow::ensure!(
@@ -181,6 +221,7 @@ where
         output.validator_tree_root.into_owned_32bytes() == proposal.validator_tree_root,
         "Realm finalize output validator_tree_root mismatch"
     );
+    verify_backup_matches_guta_output(&decoded.backup, &output)?;
     let expected_public_inputs_hash = submission.qfhash::<N::HasherBase>();
     proof_verifier.verify_zk_proof_from_slice_check_public_inputs_hash(
         submission.job_type_u32,
@@ -196,14 +237,12 @@ where
 /// must be in `0..=255` (it is the local node's committed identity, not a
 /// value read from the network). The signature is over the canonical
 /// `vote_message` derived from the proposal's `chain_id`, `realm_id`,
-/// `target_checkpoint_id`, `validator_tree_root`, and `proposal_id`, which
-/// ties the vote to a single network, Realm, checkpoint, and validator-tree
-/// identity and prevents replay across them.
+/// `validator_tree_root`, and `proposal_id`, which ties the vote to a single
+/// network, Realm, and validator-tree identity and prevents replay across them.
 pub fn sign_vote(secret: &BlsSecretKey, signer_sub_id: u16, proposal: &Proposal) -> Vote {
     let message = vote_message(
         proposal.chain_id,
         proposal.realm_id,
-        proposal.target_checkpoint_id,
         &proposal.validator_tree_root,
         &proposal.proposal_id,
     );
@@ -247,7 +286,6 @@ pub fn form_certificate(
     Ok(Certificate {
         chain_id: proposal.chain_id,
         realm_id: proposal.realm_id,
-        target_checkpoint_id: proposal.target_checkpoint_id,
         validator_tree_root: proposal.validator_tree_root,
         proposal_id: proposal.proposal_id,
         signer_bitmap,
@@ -268,9 +306,9 @@ pub fn form_certificate(
 ///
 /// Validation enforces, in order:
 ///
-/// 1. The certificate's `chain_id`, `realm_id`, `target_checkpoint_id`,
-///    `validator_tree_root`, and `proposal_id` tie it to `proposal`, so the
-///    reconstructed `vote_message` is byte-identical for every signer.
+/// 1. The certificate's `chain_id`, `realm_id`, `validator_tree_root`, and
+///    `proposal_id` tie it to `proposal`, so the reconstructed `vote_message`
+///    is byte-identical for every signer.
 /// 2. `popcount(signer_bitmap) >= ceil(n/2)` (the replication threshold, not a
 ///    BFT quorum).
 /// 3. Every set bit names an occupied validator-tree leaf and has a supplied
@@ -296,7 +334,6 @@ pub fn validate_certificate(
 
     if certificate.chain_id != proposal.chain_id
         || certificate.realm_id != proposal.realm_id
-        || certificate.target_checkpoint_id != proposal.target_checkpoint_id
         || certificate.validator_tree_root != proposal.validator_tree_root
         || certificate.proposal_id != proposal.proposal_id
     {
@@ -335,7 +372,6 @@ pub fn validate_certificate(
     let message = vote_message(
         certificate.chain_id,
         certificate.realm_id,
-        certificate.target_checkpoint_id,
         &certificate.validator_tree_root,
         &certificate.proposal_id,
     );
@@ -356,7 +392,6 @@ mod tests {
     fn proposal_with_body(
         chain_id: u32,
         realm_id: u32,
-        target_checkpoint_id: u64,
         base_checkpoint_id: u64,
         proposer_sub_id: u16,
         validator_tree_root: [u8; 32],
@@ -372,7 +407,6 @@ mod tests {
         let proposal = proposal_from_parts(
             chain_id,
             realm_id,
-            target_checkpoint_id,
             base_checkpoint_id,
             proposer_sub_id,
             validator_tree_root,
@@ -397,11 +431,12 @@ mod tests {
         (output, proof, backup)
     }
 
+
     #[test]
     fn decode_proposal_body_roundtrips_canonical_body() {
         let (output, proof, backup) = sample_body_sections();
         let (proposal, body) =
-            proposal_with_body(7, 3, 100, 99, 1, [0u8; 32], &output, &proof, &backup);
+            proposal_with_body(7, 3, 99, 1, [0u8; 32], &output, &proof, &backup);
         let decoded = decode_proposal_body(&proposal, &body).expect("decode");
         assert_eq!(decoded.output, output);
         assert_eq!(decoded.proof, proof);
@@ -412,7 +447,7 @@ mod tests {
     fn decode_proposal_body_rejects_trailing_bytes() {
         let (output, proof, backup) = sample_body_sections();
         let (mut proposal, mut body) =
-            proposal_with_body(7, 3, 100, 99, 1, [0u8; 32], &output, &proof, &backup);
+            proposal_with_body(7, 3, 99, 1, [0u8; 32], &output, &proof, &backup);
         // Recompute body_hash over the tampered body so the only failure is
         // the trailing-bytes check, not the hash check.
         body.push(0);
@@ -426,7 +461,7 @@ mod tests {
         // Hand-roll a body whose output length prefix is not exactly 410.
         let (output, proof, backup) = sample_body_sections();
         let (proposal, _) =
-            proposal_with_body(7, 3, 100, 99, 1, [0u8; 32], &output, &proof, &backup);
+            proposal_with_body(7, 3, 99, 1, [0u8; 32], &output, &proof, &backup);
         let mut body = Vec::new();
         body.extend_from_slice(&409u32.to_le_bytes());
         body.extend_from_slice(&output[..409]);
@@ -442,7 +477,7 @@ mod tests {
     fn decode_proposal_body_rejects_hash_mismatch() {
         let (output, proof, backup) = sample_body_sections();
         let (mut proposal, body) =
-            proposal_with_body(7, 3, 100, 99, 1, [0u8; 32], &output, &proof, &backup);
+            proposal_with_body(7, 3, 99, 1, [0u8; 32], &output, &proof, &backup);
         proposal.body_hash = [0xFF; 32];
         let err = decode_proposal_body(&proposal, &body).unwrap_err();
         assert_eq!(err, ProtocolError::Message("body_hash mismatch"));
@@ -481,7 +516,7 @@ mod tests {
         let (secrets, keys) = build_roster(&occupied);
         let (output, proof, backup) = sample_body_sections();
         let (proposal, _body) =
-            proposal_with_body(7, 3, 100, 99, 1, [0u8; 32], &output, &proof, &backup);
+            proposal_with_body(7, 3, 99, 1, [0u8; 32], &output, &proof, &backup);
 
         // Two signers meets the threshold.
         let votes = signed_votes(&secrets[..2], &occupied[..2], &proposal);
@@ -504,7 +539,7 @@ mod tests {
         let (secrets, keys) = build_roster(&occupied);
         let (output, proof, backup) = sample_body_sections();
         let (proposal, _body) =
-            proposal_with_body(7, 3, 100, 99, 1, [0u8; 32], &output, &proof, &backup);
+            proposal_with_body(7, 3, 99, 1, [0u8; 32], &output, &proof, &backup);
 
         // Forge a vote from a sub-id that is not in the occupied roster and
         // aggregate it with the two honest votes.
@@ -530,7 +565,7 @@ mod tests {
         let (secrets, keys) = build_roster(&occupied);
         let (output, proof, backup) = sample_body_sections();
         let (proposal, _body) =
-            proposal_with_body(7, 3, 100, 99, 1, [0u8; 32], &output, &proof, &backup);
+            proposal_with_body(7, 3, 99, 1, [0u8; 32], &output, &proof, &backup);
 
         // Build a structurally valid aggregate (real G2 point) that signs the
         // same vote_message with three OUTSIDER keys, so it is a legitimate
@@ -560,13 +595,13 @@ mod tests {
         let (secrets, keys) = build_roster(&occupied);
         let (output, proof, backup) = sample_body_sections();
         let (proposal, _body) =
-            proposal_with_body(7, 3, 100, 99, 1, [0u8; 32], &output, &proof, &backup);
+            proposal_with_body(7, 3, 99, 1, [0u8; 32], &output, &proof, &backup);
 
         let votes = signed_votes(&secrets, &occupied, &proposal);
         let cert = form_certificate(&proposal, &votes).expect("form");
 
-        // A different proposal with the same body but a different checkpoint.
-        let (other, _) = proposal_with_body(7, 3, 200, 99, 1, [0u8; 32], &output, &proof, &backup);
+        // A different proposal with the same body but a different proof-base checkpoint.
+        let (other, _) = proposal_with_body(7, 3, 200, 1, [0u8; 32], &output, &proof, &backup);
         let err = validate_certificate(&other, &cert, &occupied, &keys).unwrap_err();
         assert_eq!(
             err,
@@ -580,7 +615,7 @@ mod tests {
         let (secrets, _keys) = build_roster(&occupied);
         let (output, proof, backup) = sample_body_sections();
         let (proposal, _body) =
-            proposal_with_body(7, 3, 100, 99, 1, [0u8; 32], &output, &proof, &backup);
+            proposal_with_body(7, 3, 99, 1, [0u8; 32], &output, &proof, &backup);
 
         let v1 = sign_vote(&secrets[0], 1, &proposal);
         let dup = sign_vote(&secrets[1], 1, &proposal);

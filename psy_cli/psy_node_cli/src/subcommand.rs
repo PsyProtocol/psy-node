@@ -230,6 +230,8 @@ pub enum Commands {
 
         #[arg(long = "p2p-roster-path", help = "Optional Realm P2P roster.json used to verify GUTA certificates.")]
         p2p_roster_path: Option<String>,
+        #[arg(long = "p2p-checkpoints-per-epoch", help = "Rotation period used to verify the scheduled Realm proposer.")]
+        p2p_checkpoints_per_epoch: Option<u64>,
     },
     #[command(about = "Generate Realm P2P identity/BLS key files and a roster.json for local E2E")]
     InitRealmP2pKeys {

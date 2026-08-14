@@ -181,6 +181,14 @@ impl QTempDatabaseRawKVWriterBase for SimpleMemoryTempStore {
         self.kv_map.write().map_err(|e| anyhow::anyhow!(e.to_string()))?.insert(key.to_vec(), value.to_vec());
         Ok(())
     }
+    async fn qtdb_raw_kv_put_value_if_absent(&self, key: &[u8], value: &[u8]) -> anyhow::Result<bool> {
+        let mut kv_map = self.kv_map.write().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        if kv_map.contains_key(key) {
+            return Ok(false);
+        }
+        kv_map.insert(key.to_vec(), value.to_vec());
+        Ok(true)
+    }
     async fn qtdb_raw_kv_delete_key(&self, key: &[u8]) -> anyhow::Result<()> {
         self.kv_map.write().map_err(|e| anyhow::anyhow!(e.to_string()))?.remove(key);
         Ok(())

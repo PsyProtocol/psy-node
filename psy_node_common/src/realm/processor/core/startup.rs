@@ -118,8 +118,6 @@ where
                 rotation: None,
                 bls_secret: None,
                 p2p_validator_user_id: None,
-                last_p2p_proposal: None,
-                last_p2p_certificate: None,
                 p2p_bls_public_keys: None,
             },
             guta_join_handle,

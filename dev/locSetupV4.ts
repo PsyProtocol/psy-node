@@ -946,7 +946,7 @@ function faucetServerStartedDetector(line: string): boolean {
 }
 
 const REALM_P2P_OUT_DIR = "./local_checkpoints/realm_p2p";
-const REALM_P2P_SUB_IDS = [1, 2] as const;
+const REALM_P2P_SUB_IDS = [1, 2, 3] as const;
 
 type RealmP2pSubEntry = {
     processor_node_id_hex38: string;
@@ -984,9 +984,13 @@ function realmP2pValidatorUserId(realmId: number, subId: number): number {
     return (realmId * (1 << 20)) + subId;
 }
 
+function realmDbNamespace(realmId: number, subId: number): string {
+    return `realm_${realmId}_${subId}`;
+}
+
 function realmP2pHttpPort(realmId: number, subId: number, edgeIndex: number, realmEdgeCount: number): number {
     const base = 13380 + realmId * 10;
-    return subId === 1 ? base + edgeIndex : base + realmEdgeCount + edgeIndex;
+    return base + (subId - 1) * realmEdgeCount + edgeIndex;
 }
 
 async function ensureRealmP2pRoster(
@@ -1028,19 +1032,27 @@ function realmP2pProcessorExtraArgs(
     roster: RealmP2pRoster,
 ): string[] {
     const self = roster.realms[String(realmId)][String(subId)];
-    const otherSub = subId === 1 ? 2 : 1;
-    const other = roster.realms[String(realmId)][String(otherSub)];
-    return [
+    const args = [
         "--p2p-identity-key", self.processor_identity_path,
         "--p2p-bls-key", self.bls_path,
         "--p2p-listen", realmP2pListen(host, realmP2pProcessorPort(realmId, subId)),
-        "--p2p-bootnode", realmP2pBootnode(host, realmP2pProcessorPort(realmId, otherSub), other.processor_peer_id),
         "--p2p-coordinator", realmP2pBootnode(host, 40999, roster.coordinator.peer_id),
-        "--p2p-validator-sub-ids", "1,2",
+        "--p2p-validator-sub-ids", REALM_P2P_SUB_IDS.join(","),
         "--p2p-checkpoints-per-epoch", "10",
         "--p2p-validator-user-id", realmP2pValidatorUserId(realmId, subId).toString(),
         "--p2p-roster-path", `${REALM_P2P_OUT_DIR}/roster.json`,
     ];
+    for (const otherSub of REALM_P2P_SUB_IDS) {
+        if (otherSub === subId) {
+            continue;
+        }
+        const other = roster.realms[String(realmId)][String(otherSub)];
+        args.push(
+            "--p2p-bootnode",
+            realmP2pBootnode(host, realmP2pProcessorPort(realmId, otherSub), other.processor_peer_id),
+        );
+    }
+    return args;
 }
 
 function realmP2pEdgeExtraArgs(
@@ -1054,7 +1066,7 @@ function realmP2pEdgeExtraArgs(
     const args = [
         "--p2p-identity-key", self.edge_identity_path,
         "--p2p-listen", realmP2pListen(host, realmP2pEdgePort(realmId, subId)),
-        "--p2p-validator-sub-ids", "1,2",
+        "--p2p-validator-sub-ids", REALM_P2P_SUB_IDS.join(","),
         "--p2p-checkpoints-per-epoch", "10",
     ];
     for (const [otherSub, other] of Object.entries(subs)) {
@@ -3640,7 +3652,7 @@ class DevNetProcessManager {
                         '--listen', '0.0.0.0',
                         '--proving-backend', backend,
                         '--verbose',
-                        ...(realmP2p ? ['--p2p-roster-path', `${REALM_P2P_OUT_DIR}/roster.json`] : []),
+                        ...(realmP2p ? ['--p2p-roster-path', `${REALM_P2P_OUT_DIR}/roster.json`, '--p2p-checkpoints-per-epoch', '10'] : []),
                     ],
                     coordinatorEdgeProcessorStartedDetector,
                     { cwd, ...getLogPaths(`coordinator_edge_${j}`, true), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
@@ -3683,7 +3695,7 @@ class DevNetProcessManager {
 
         if (startRealmProcessor) {
             processorReadiness = (async () => {
-                const subLabel = realmP2p ? " (subs 1 and 2)" : "";
+                const subLabel = realmP2p ? ` (subs ${REALM_P2P_SUB_IDS.join(", ")})` : "";
                 console.log(`[DevNet] Starting ${realmsCount} realm processors and edges sequentially${subLabel}...`);
                 for (let b = 0; b < realmsCount; b += 4) {
                     const batchSize = Math.min(4, realmsCount - b);
@@ -3711,7 +3723,7 @@ class DevNetProcessManager {
                                             '--realm-id', realmId.toString(),
                                             '--realm-sub-id', subId.toString(),
                                             '--network', this.NETWORK,
-                                            '--db-namespace', 'realm_' + realmId,
+                                            '--db-namespace', realmDbNamespace(realmId, subId),
                                             '--scylla-db-url', this.SCYLLA_URL,
                                             '--nats-jetstream-url', this.NATS_URL,
                                             '--redis-url', this.REDIS_URL,
@@ -3759,7 +3771,7 @@ class DevNetProcessManager {
                                         '--realm-id', realmId.toString(),
                                         '--realm-sub-id', subId.toString(),
                                         '--network', this.NETWORK,
-                                        '--db-namespace', 'realm_' + realmId,
+                                        '--db-namespace', realmDbNamespace(realmId, subId),
                                         '--scylla-db-url', this.SCYLLA_URL,
                                         '--nats-jetstream-url', this.NATS_URL,
                                         '--redis-url', this.REDIS_URL,
@@ -4489,7 +4501,7 @@ class DevNetProcessManager {
                         "--listen", "0.0.0.0",
                         "--proving-backend", backend,
                         "--verbose",
-                        ...(realmP2p ? ["--p2p-roster-path", `${REALM_P2P_OUT_DIR}/roster.json`] : []),
+                        ...(realmP2p ? ["--p2p-roster-path", `${REALM_P2P_OUT_DIR}/roster.json`, "--p2p-checkpoints-per-epoch", "10"] : []),
                     ]),
                     ports: [`${port}:${port}`]
                 };
@@ -4529,7 +4541,7 @@ class DevNetProcessManager {
                         "--realm-id", realmId.toString(),
                         "--realm-sub-id", subId.toString(),
                         "--network", this.NETWORK,
-                        "--db-namespace", `realm_${realmId}`,
+                        "--db-namespace", realmDbNamespace(realmId, subId),
                         "--scylla-db-url", "scylla-server:9042",
                         "--nats-jetstream-url", "nats://nats-server:4222",
                         "--redis-url", "redis://valkey-server:6379",
@@ -4554,7 +4566,7 @@ class DevNetProcessManager {
                                 "--realm-id", realmId.toString(),
                                 "--realm-sub-id", subId.toString(),
                                 "--network", this.NETWORK,
-                                "--db-namespace", `realm_${realmId}`,
+                                "--db-namespace", realmDbNamespace(realmId, subId),
                                 "--scylla-db-url", "scylla-server:9042",
                                 "--nats-jetstream-url", "nats://nats-server:4222",
                                 "--redis-url", "redis://valkey-server:6379",
