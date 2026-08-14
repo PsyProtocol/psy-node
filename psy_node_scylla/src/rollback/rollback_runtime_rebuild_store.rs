@@ -57,7 +57,7 @@ const REPORT_MAGIC: &[u8; 8] = b"PSYRRBR2";
 const RUNTIME_READY_MAGIC: &[u8; 8] = b"PSYRRDY2";
 const VERSION: u16 = 2;
 const MAX_BYTES: usize = 16 * 1024;
-const DIRECTIVE_SLOT_DOMAIN: &[u8] = b"psy.rollback.runtime-directive-slot.v2\0";
+const DIRECTIVE_SLOT_DOMAIN: &[u8] = b"psy.rollback.runtime-directive-slot.v3\0";
 const REPORT_SLOT_DOMAIN: &[u8] = b"psy.rollback.runtime-report-slot.v2\0";
 const ROW_DIGEST_DOMAIN: &[u8] = b"psy.rollback.runtime-row.v2\0";
 const FRAGMENT_DOMAIN: &[u8] = b"psy.rollback.runtime-fragment.v2\0";
@@ -825,6 +825,31 @@ impl ScyllaRollbackRuntimeRebuildStore {
             verifying_head.canonical_ref().chain_epoch(),
             *request.target(),
         );
+        self.read_selected_directive_for_target(verifying_head, authority, target)
+            .await
+    }
+
+    /// Realm targets carry an authority-local checkpoint hash, while the
+    /// Coordinator control row carries the global checkpoint hash. Select the
+    /// immutable directive with a target freshly read from that Realm's local
+    /// head, while still binding epoch/height/plan to the VERIFYING row.
+    pub(crate) async fn read_selected_directive_for_target<Hash: Q256BitHash>(
+        &self,
+        verifying_head: StoredCanonicalHead<Hash>,
+        authority: AuthorityScope,
+        target: CanonicalChainRef<Hash>,
+    ) -> Result<Option<RollbackRuntimeRebuildDirective<Hash>>, RollbackRuntimeRebuildStoreError> {
+        let request = match verifying_head.rollback_control() {
+            RollbackControlState::Verifying(request)
+            | RollbackControlState::AllRealmsReady(request) => request,
+            _ => return Err(RollbackRuntimeRebuildStoreError::NotVerifying),
+        };
+        if target.network_id() != verifying_head.canonical_ref().network_id()
+            || target.chain_epoch() != verifying_head.canonical_ref().chain_epoch()
+            || target.checkpoint().checkpoint_id() != request.target().checkpoint_id()
+        {
+            return Err(RollbackRuntimeRebuildStoreError::BindingMismatch);
+        }
         let plan_digest = request.plan_digest();
         let slot = directive_slot_for(
             &target,
@@ -843,7 +868,11 @@ impl ScyllaRollbackRuntimeRebuildStore {
         .map(|bytes| {
             let decoded = StoredRuntimeDirective::decode(&bytes)?;
             if decoded.slot != slot
-                || decoded.directive.target() != &target
+                || !selected_target_matches(
+                    authority,
+                    decoded.directive.target(),
+                    &target,
+                )
                 || decoded.directive.participant_plan_digest() != plan_digest.as_bytes()
                 || decoded.directive.authority() != authority
             {
@@ -1240,11 +1269,32 @@ fn directive_slot_for<Hash: Q256BitHash>(
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(DIRECTIVE_SLOT_DOMAIN);
-    hasher.update(target.to_canonical_bytes());
+    // Coordinator must locate every planned Realm without reading that
+    // Realm's authority-local checkpoint hash. The immutable row payload and
+    // Realm-side local-head read still bind the exact hash.
+    hasher.update(target.network_id().chain_id().to_be_bytes());
+    hasher.update(target.chain_epoch().get().to_be_bytes());
+    hasher.update(target.checkpoint().checkpoint_id().get().to_be_bytes());
     hasher.update(participant_plan_digest);
     hasher.update(encode_authority(authority));
     hasher.update(fingerprint);
     hasher.finalize().into()
+}
+
+fn selected_target_matches<Hash: Q256BitHash>(
+    authority: AuthorityScope,
+    stored: &CanonicalChainRef<Hash>,
+    selected: &CanonicalChainRef<Hash>,
+) -> bool {
+    match authority {
+        AuthorityScope::Coordinator => stored == selected,
+        AuthorityScope::Realm { .. } => {
+            stored.network_id() == selected.network_id()
+                && stored.chain_epoch() == selected.chain_epoch()
+                && stored.checkpoint().checkpoint_id()
+                    == selected.checkpoint().checkpoint_id()
+        }
+    }
 }
 
 fn report_slot<Hash: Q256BitHash>(
@@ -1436,11 +1486,20 @@ fn require_ready_report<Hash: Q256BitHash>(
         .rollback_control()
         .requested()
         .ok_or(RollbackRuntimeRebuildStoreError::BindingMismatch)?;
+    let target_matches = |candidate: &CanonicalChainRef<Hash>| match expected_authority {
+        AuthorityScope::Coordinator => candidate == target,
+        AuthorityScope::Realm { .. } => {
+            candidate.network_id() == target.network_id()
+                && candidate.chain_epoch() == target.chain_epoch()
+                && candidate.checkpoint().checkpoint_id()
+                    == target.checkpoint().checkpoint_id()
+        }
+    };
     if receipt.store_fingerprint() != runtime_store_fingerprint
         || directive.authority() != expected_authority
         || report.authority() != expected_authority
-        || directive.target() != target
-        || report.target() != target
+        || !target_matches(directive.target())
+        || !target_matches(report.target())
         || directive.participant_plan_digest() != restore.participant_plan_digest()
         || directive.global_restore_barrier_slot() != restore.slot()
         || directive.global_restore_barrier_digest() != restore.digest()
@@ -1875,6 +1934,30 @@ mod tests {
             [4; 32],
         )
         .is_err());
+    }
+
+    #[test]
+    fn realm_directive_locator_uses_global_coordinates_not_local_hash() {
+        let first = runtime_target();
+        let second = CanonicalChainRef::new(
+            first.network_id(),
+            first.chain_epoch(),
+            checkpoint(40, 401),
+        );
+        let authority = AuthorityScope::Realm {
+            realm_id: 7,
+            realm_sub_id: 2,
+        };
+        assert_eq!(
+            directive_slot_for(&first, &[1; 32], authority, &[2; 32]),
+            directive_slot_for(&second, &[1; 32], authority, &[2; 32]),
+        );
+        assert!(selected_target_matches(authority, &first, &second));
+        assert!(!selected_target_matches(
+            AuthorityScope::Coordinator,
+            &first,
+            &second,
+        ));
     }
 
     fn checkpoint(id: u64, hash: u64) -> CheckpointRef<PHash> {

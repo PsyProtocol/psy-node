@@ -488,10 +488,20 @@ impl ScyllaRollbackGlobalRestoreBarrierStore {
         {
             return Err(RollbackGlobalRestoreBarrierError::BindingMismatch);
         }
+        // The rollback request opens the new epoch before VERIFYING, while
+        // the immutable restore barrier remains keyed by the abandoned
+        // branch's epoch. The directive binds both epochs through the exact
+        // barrier slot/digest.
+        let archive_epoch = directive
+            .target()
+            .chain_epoch()
+            .get()
+            .checked_sub(1)
+            .ok_or(RollbackGlobalRestoreBarrierError::BindingMismatch)?;
         let barrier = self
             .read_coordinates(
                 directive.target().network_id(),
-                directive.target().chain_epoch().get(),
+                archive_epoch,
                 directive.participant_plan_digest(),
                 directive.global_restore_barrier_slot(),
             )
@@ -511,7 +521,8 @@ impl ScyllaRollbackGlobalRestoreBarrierStore {
             || barrier.digest() != directive.global_restore_barrier_digest()
             || barrier.participant_plan_digest() != directive.participant_plan_digest()
             || barrier.target().network_id() != directive.target().network_id()
-            || barrier.target().chain_epoch() != directive.target().chain_epoch()
+            || barrier.target().chain_epoch().get().checked_add(1)
+                != Some(directive.target().chain_epoch().get())
             || barrier.target().checkpoint() != directive.target().checkpoint()
         {
             return Err(RollbackGlobalRestoreBarrierError::BindingMismatch);

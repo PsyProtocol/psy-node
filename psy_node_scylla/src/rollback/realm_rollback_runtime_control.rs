@@ -13,6 +13,8 @@ use psy_data::protocol::{
     chain_context::AuthorityScope,
 };
 use psy_node_core::store::{
+    authority_commit::AuthorityTimestampKey,
+    authority_local_head::AuthorityLocalHeadReadState,
     canonical_head::{CanonicalHeadReadState, StoredCanonicalHead},
     rollback_control::RollbackControlState,
     rollback_runtime_rebuild::{
@@ -25,7 +27,6 @@ use psy_node_core::store::{
 use psy_node_core::store::{
     authority_commit::{
         AuthorityClockSampleUs, AuthorityTimestampBootstrap, AuthorityTimestampBootstrapReason,
-        AuthorityTimestampKey,
     },
     pending_generation::ProcNamespacePrefix,
     pending_generation_pipeline::PendingPipelineWriteOutcome,
@@ -493,7 +494,12 @@ impl ScyllaRealmRollbackRuntimeControl {
                         == selected.directive().target().chain_epoch()
             }
             RollbackControlState::Idle => {
-                current.canonical_ref() == selected.directive().target()
+                current.canonical_ref().network_id()
+                    == selected.directive().target().network_id()
+                    && current.canonical_ref().chain_epoch()
+                        == selected.directive().target().chain_epoch()
+                    && current.canonical_ref().checkpoint().checkpoint_id()
+                        == selected.directive().target().checkpoint().checkpoint_id()
             }
             _ => false,
         }
@@ -677,9 +683,18 @@ impl<Hash: Q256BitHash> RealmRollbackRuntimeControl<Hash>
         if !matches!(first_head.rollback_control(), RollbackControlState::Verifying(_)) {
             return Ok(None);
         }
+        let local_key = AuthorityTimestampKey::new(network, authority);
+        let first_local = match self.local_head.read(local_key).await? {
+            AuthorityLocalHeadReadState::Current(current) => current,
+            AuthorityLocalHeadReadState::Uninitialized => return Ok(None),
+        };
         let Some(directive) = self
             .runtime_rebuild
-            .read_selected_directive(first_head, authority)
+            .read_selected_directive_for_target(
+                first_head,
+                authority,
+                *first_local.head().chain(),
+            )
             .await?
         else {
             return Ok(None);
@@ -689,6 +704,14 @@ impl<Hash: Q256BitHash> RealmRollbackRuntimeControl<Hash>
         };
         if second_head != first_head {
             anyhow::bail!("Coordinator canonical head changed while selecting Realm rebuild")
+        }
+        let AuthorityLocalHeadReadState::Current(second_local) =
+            self.local_head.read(local_key).await?
+        else {
+            anyhow::bail!("Realm local head disappeared while selecting runtime rebuild")
+        };
+        if second_local != first_local {
+            anyhow::bail!("Realm local head changed while selecting runtime rebuild")
         }
         Ok(Some(SelectedRealmRollbackRuntimeRebuild::try_from_storage(
             second_head,

@@ -486,7 +486,11 @@ impl<Hash: Q256BitHash> SelectedRealmRollbackRuntimeRebuild<Hash> {
                 != verifying_head.canonical_ref().network_id()
             || directive.target().chain_epoch()
                 != verifying_head.canonical_ref().chain_epoch()
-            || directive.target().checkpoint() != request.target()
+            // Realm checkpoint hashes are authority-local. The Coordinator
+            // request fixes the global rollback height; the exact local hash
+            // is selected from the restored Realm local-head row.
+            || directive.target().checkpoint().checkpoint_id()
+                != request.target().checkpoint_id()
             || directive.participant_plan_digest() != request.plan_digest().as_bytes()
             || directive.new_branch_write() != request.fence_window().new_branch_write()
         {

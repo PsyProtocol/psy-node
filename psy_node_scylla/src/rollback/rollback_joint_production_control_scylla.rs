@@ -70,7 +70,10 @@ use psy_node_core::store::{
     },
     rollback_participant_plan::RollbackRealmParticipant,
     rollback_runtime_rebuild::{
-        RealmRollbackParticipantProgress, RealmRollbackRuntimeControl,
+        CoordinatorRollbackRuntimePublication,
+        CoordinatorRollbackRuntimeRebuildStore, RealmRollbackParticipantProgress,
+        RealmRollbackRuntimeControl, RollbackRuntimeRebuildDirective,
+        RollbackRuntimeRebuildReport,
     },
     rollback_control::RollbackControlState,
     rollback_topology::RollbackTopologySnapshot,
@@ -321,6 +324,24 @@ fn realm_observation(
         authority,
         AuthorityStateCheckpointId::new(checkpoint),
         AuthorityStateRoot::from_local_state_root(hash(seed.wrapping_add(0x20))),
+    )?)
+}
+
+fn runtime_rebuild_report(
+    directive: &RollbackRuntimeRebuildDirective<PHash>,
+    state_root: PHash,
+) -> anyhow::Result<RollbackRuntimeRebuildReport<PHash>> {
+    let target_checkpoint = directive.target().checkpoint().checkpoint_id().get();
+    Ok(RollbackRuntimeRebuildReport::try_after_exact_rebuild(
+        directive,
+        0,
+        target_checkpoint + 1,
+        state_root,
+        target_checkpoint,
+        target_checkpoint,
+        state_root,
+        directive.processing(),
+        directive.gathering(),
     )?)
 }
 
@@ -1042,5 +1063,87 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
         matches!(verifying_head.rollback_control(), RollbackControlState::Verifying(_)),
         "all-participant restore barrier did not enter VERIFYING",
     );
+    let coordinator_directive =
+        <ScyllaCoreStore<PHash, PoseidonHasher> as CoordinatorRollbackRuntimeRebuildStore<
+            PHash,
+        >>::read_selected_coordinator_runtime_rebuild(&coordinator, network())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Coordinator runtime rebuild directive is missing"))?;
+
+    // Each process rebuilds its own runtime from the storage-authored
+    // directive. A Realm may only append its report; it cannot publish the
+    // Coordinator head or provide the participant set.
+    let mut selected_realms = Vec::new();
+    for (control, authority, seed) in [
+        (&realm_10, realm_10_authority, 0xC1),
+        (&realm_20, realm_20_authority, 0xD1),
+    ] {
+        let RealmRollbackParticipantProgress::ReadyForRuntimeRebuild(observed) =
+            <ScyllaRealmRollbackRuntimeControl as RealmRollbackRuntimeControl<
+                PHash,
+            >>::progress_realm_rollback_participant(control, network(), authority)
+            .await?
+        else {
+            bail!("VERIFYING Realm did not expose its runtime rebuild task")
+        };
+        ensure!(
+            observed == verifying_head,
+            "Realm runtime rebuild selected a different Coordinator head",
+        );
+        let selected = <ScyllaRealmRollbackRuntimeControl as RealmRollbackRuntimeControl<
+            PHash,
+        >>::read_selected_realm_runtime_rebuild(control, network(), authority)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!("Realm runtime rebuild directive is missing for {authority:?}")
+        })?;
+        let report = runtime_rebuild_report(
+            selected.directive(),
+            *realm_observation(authority, 1, seed)?.state_root().as_inner(),
+        )?;
+        <ScyllaRealmRollbackRuntimeControl as RealmRollbackRuntimeControl<PHash>>
+            ::persist_realm_runtime_rebuild_report(control, selected, report)
+            .await?;
+        // Exact retry must recover the same immutable report rather than
+        // creating a second completion.
+        <ScyllaRealmRollbackRuntimeControl as RealmRollbackRuntimeControl<PHash>>
+            ::persist_realm_runtime_rebuild_report(control, selected, report)
+            .await?;
+        selected_realms.push((control, selected));
+    }
+
+    let coordinator_report = runtime_rebuild_report(&coordinator_directive, hash(0xA1))?;
+    <ScyllaCoreStore<PHash, PoseidonHasher> as CoordinatorRollbackRuntimeRebuildStore<
+        PHash,
+    >>::persist_coordinator_runtime_rebuild_report(
+        &coordinator,
+        coordinator_directive,
+        coordinator_report,
+    )
+    .await?;
+
+    let CoordinatorRollbackRuntimePublication::Published(published) =
+        <ScyllaCoreStore<PHash, PoseidonHasher> as CoordinatorRollbackRuntimeRebuildStore<
+            PHash,
+        >>::try_publish_restored_runtime(&coordinator, network())
+        .await?
+    else {
+        bail!("complete Coordinator and Realm report set did not publish restored runtime")
+    };
+    ensure!(
+        published.canonical_ref().checkpoint() == target.checkpoint()
+            && published.canonical_ref().chain_epoch().get()
+                == target.chain_epoch().get() + 1
+            && matches!(published.rollback_control(), RollbackControlState::Idle),
+        "runtime publication did not select IDLE at the rollback target in the new epoch",
+    );
+    for (control, selected) in selected_realms {
+        ensure!(
+            <ScyllaRealmRollbackRuntimeControl as RealmRollbackRuntimeControl<PHash>>
+                ::is_realm_runtime_rebuild_published(control, selected)
+                .await?,
+            "Realm did not observe the globally published restored runtime",
+        );
+    }
     Ok(())
 }
