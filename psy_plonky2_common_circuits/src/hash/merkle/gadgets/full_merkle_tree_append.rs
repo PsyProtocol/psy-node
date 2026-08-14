@@ -190,6 +190,75 @@ impl FullMerkleTreeAppendGadget {
             new_root,
         }
     }
+    // overwrite variant: leaves at arbitrary positions may be updated, but any
+    // changed position must have a non-zero old leaf (cannot "update" an empty
+    // slot). `added_leaves[i]` is true exactly where old != new.
+    pub fn add_virtual_to_allow_overwrite<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
+        builder: &mut CircuitBuilder<F, D>,
+        height: usize,
+    ) -> Self {
+        let num_leaves = 1usize << height;
+
+        let mut old_leaves = Vec::with_capacity(num_leaves);
+        let mut new_leaves = Vec::with_capacity(num_leaves);
+        let mut added_leaves = Vec::with_capacity(num_leaves);
+
+        let zero = builder.zero();
+
+        for _ in 0..num_leaves {
+            let old_leaf = builder.add_virtual_hash();
+            let new_leaf = builder.add_virtual_hash();
+
+            let is_old_leaf_zero = builder.is_zero_hash(old_leaf);
+            let is_changed_leaf = builder.is_not_equal_hash(old_leaf, new_leaf);
+
+            // a changed leaf must have a non-zero old value (cannot update an
+            // empty slot); unchanged positions are allowed to be anything as
+            // long as old == new (enforced by is_not_equal_hash above)
+            let invalid_update = builder.and(is_changed_leaf, is_old_leaf_zero);
+            builder.connect(invalid_update.target, zero);
+
+            old_leaves.push(old_leaf);
+            new_leaves.push(new_leaf);
+            added_leaves.push(is_changed_leaf);
+        }
+
+        let mut current_level_old_leaves = old_leaves.clone();
+        let mut current_level_new_leaves = new_leaves.clone();
+
+        let mut nodes_in_level = current_level_new_leaves.len();
+
+        while nodes_in_level > 1 {
+            let half = nodes_in_level / 2;
+            current_level_old_leaves = (0..half)
+                .map(|i| {
+                    builder.hash_two_to_one::<H>(
+                        current_level_old_leaves[i * 2],
+                        current_level_old_leaves[i * 2 + 1],
+                    )
+                })
+                .collect::<Vec<_>>();
+            current_level_new_leaves = (0..half)
+                .map(|i| {
+                    builder.hash_two_to_one::<H>(
+                        current_level_new_leaves[i * 2],
+                        current_level_new_leaves[i * 2 + 1],
+                    )
+                })
+                .collect::<Vec<_>>();
+            nodes_in_level = half;
+        }
+
+        let old_root = current_level_old_leaves[0];
+        let new_root = current_level_new_leaves[0];
+        Self {
+            old_leaves,
+            new_leaves,
+            added_leaves,
+            old_root,
+            new_root,
+        }
+    }
     pub fn set_witness<W: Witness<F>, F: Field>(
         &self,
         witness: &mut W,

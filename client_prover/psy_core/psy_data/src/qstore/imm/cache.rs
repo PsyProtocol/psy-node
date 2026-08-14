@@ -257,6 +257,9 @@ impl<F: RichField, S: PsyReadCommandProcessorSync<F> + QUserIdManager + Send> Ps
                 function_tree_root: QHashOut::default(),
                 code_root: QHashOut::default(),
                 state_tree_height: F::from_canonical_u8(MAX_CONTRACT_STATE_TREE_HEIGHT),
+                state_layout_root: QHashOut::default(),
+                state_layout_field_count: F::ZERO,
+                state_layout_slot_count: F::ZERO,
             });
         }
         if self.cache.contract_leaf_cache.contains_key(&input.contract_id) {

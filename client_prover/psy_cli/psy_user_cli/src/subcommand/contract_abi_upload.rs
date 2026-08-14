@@ -1,6 +1,6 @@
 use psy_client_data::{
     config::store_config::{PsyHasher, F},
-    qblock::cmds::deploy_contract::QBCDeployContract,
+    qblock::cmds::deploy_contract::{QBCDeployContract, QBCDeployContractV2},
 };
 use psy_crypto::hash::tx_hash::compute_deploy_contract_content_hash;
 use serde_json::json;
@@ -28,7 +28,7 @@ fn resolve_services_url(network: &psy_config::NetworkConfigGoldilocks) -> anyhow
 
 pub async fn upload_contract_abi(
     network: &psy_config::NetworkConfigGoldilocks,
-    deploy_contract: &QBCDeployContract<F>,
+    deploy_contract: &QBCDeployContractV2<F>,
     abi_json: &str,
 ) -> anyhow::Result<String> {
     if abi_json.len() > MAX_CONTRACT_ABI_JSON_BYTES {
@@ -40,7 +40,7 @@ pub async fn upload_contract_abi(
     }
 
     let abi_value: serde_json::Value = serde_json::from_str(abi_json)?;
-    let content_hash = deploy_contract_content_hash(deploy_contract)?;
+    let content_hash = deploy_contract_content_hash(&deploy_contract.deploy_contract)?;
     let services_url = resolve_services_url(network)?;
     let url = format!("{}/api/v1/contract/abi/pending", services_url);
 

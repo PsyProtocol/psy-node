@@ -92,6 +92,9 @@ impl SimpleBlockProcessor {
                 function_tree_root,
                 state_tree_height: PsyFelt::from_canonical_u16(d.code_definition.state_tree_height),
                 code_root: d.code_root,
+                state_layout_root: QHashOut::default(),
+                state_layout_field_count: PsyFelt::ZERO,
+                state_layout_slot_count: PsyFelt::ZERO,
             };
             let contract_leaf_hash = contract_leaf.qfhash::<PsyHasher>();
             store.set_contract_leaf_data(new_checkpoint_id, contract_id, &contract_leaf)?;

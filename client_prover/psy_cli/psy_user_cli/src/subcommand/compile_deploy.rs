@@ -4,7 +4,7 @@ use psy_client_common::data::qhashout::QHashOut;
 use psy_client_data::config::store_config::{PsyHasher, C, D, F};
 use psy_crypto::hash::traits::qhashable::QFieldHashable;
 use psy_prover::{
-    session::gen_contract_deploy_and_circuits_for_functions,
+    session::{compile_bridge::build_layout_aware_deploy_command, gen_contract_deploy_and_circuits_for_functions},
     wallet::memory_wallet::{get_public_key_info, get_zk_fingerprint},
 };
 use psy_provider::{
@@ -72,8 +72,9 @@ pub async fn run(args: CompileAndDeployArgs) -> anyhow::Result<()> {
     // Use the compiler-computed state tree height (not MAX)
     let state_tree_height = output.state_tree_height() as u8;
 
-    let (_result_circuits, deploy_cmd) =
+    let (_result_circuits, legacy_deploy_cmd) =
         gen_contract_deploy_and_circuits_for_functions::<C, D>(deployer, state_tree_height, &output.circuit_definitions)?;
+    let deploy_cmd = build_layout_aware_deploy_command(&output, legacy_deploy_cmd)?;
 
     tracing::info!("circuits generated successfully");
 
@@ -90,7 +91,7 @@ pub async fn run(args: CompileAndDeployArgs) -> anyhow::Result<()> {
         println!("Dry run: compilation and circuit generation successful");
         println!("  Methods: {}", output.method_count());
         println!("  State tree height: {}", state_tree_height);
-        println!("  Deploy command generated (not submitted)");
+        println!("  Layout-aware deploy command generated (not submitted)");
         return Ok(());
     }
 

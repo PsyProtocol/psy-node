@@ -1,6 +1,6 @@
 use parth_core::{
     crypto::hash::{
-        merkle_proof::MerkleProofCore, tag_tree::hash_tag_tree_node_three, traits::{FieldQHasher, MerkleHasher, MerkleZeroHasher}
+        merkle_proof::MerkleProofCore, tag_tree::hash_tag_tree_node_four, traits::{FieldQHasher, MerkleHasher, MerkleZeroHasher}
     },
     felt::QFelt64,
     pgoldilocks::{QGenericConfig, QHashOut, QRichField},
@@ -68,6 +68,9 @@ where
         deploy_contracts_proof_common_data: &CommonCircuitData<C::F, D>,
         deploy_contracts_transition_circuit_config: &TPAltCircuitFingerprintConfig<QHashOut<C::F>>,
 
+        update_contracts_proof_common_data: &CommonCircuitData<C::F, D>,
+        update_contracts_transition_circuit_config: &TPAltCircuitFingerprintConfig<QHashOut<C::F>>,
+
         guta_proof_common_data: &CommonCircuitData<C::F, D>,
         guta_verifier_data_cap_height: usize,
         guta_circuit_whitelist_tree_height: u8,
@@ -78,6 +81,8 @@ where
             user_reg_transition_circuit_config,
             deploy_contracts_proof_common_data,
             deploy_contracts_transition_circuit_config,
+            update_contracts_proof_common_data,
+            update_contracts_transition_circuit_config,
             guta_proof_common_data,
             guta_verifier_data_cap_height,
             guta_circuit_whitelist_tree_height,
@@ -91,6 +96,9 @@ where
 
         deploy_contracts_proof_common_data: &CommonCircuitData<C::F, D>,
         deploy_contracts_transition_circuit_config: &TPAltCircuitFingerprintConfig<QHashOut<C::F>>,
+
+        update_contracts_proof_common_data: &CommonCircuitData<C::F, D>,
+        update_contracts_transition_circuit_config: &TPAltCircuitFingerprintConfig<QHashOut<C::F>>,
 
         guta_proof_common_data: &CommonCircuitData<C::F, D>,
         guta_verifier_data_cap_height: usize,
@@ -108,6 +116,8 @@ where
             user_reg_transition_circuit_config,
             deploy_contracts_proof_common_data,
             deploy_contracts_transition_circuit_config,
+            update_contracts_proof_common_data,
+            update_contracts_transition_circuit_config,
             guta_proof_common_data,
             guta_verifier_data_cap_height,
             guta_circuit_whitelist_root,
@@ -118,6 +128,7 @@ where
         let guta_proof_rewards_tree_value = verifier_gadget.verify_guta_gadget.rewards_tree_value;
         let register_users_proof_rewards_tree_value = verifier_gadget.verify_register_users_gadget.rewards_tree_value;
         let deploy_contracts_proof_rewards_tree_value = verifier_gadget.verify_deploy_contract_gadget.rewards_tree_value;
+        let update_contracts_proof_rewards_tree_value = verifier_gadget.verify_update_contract_gadget.rewards_tree_value;
         let worker_rewards_tree_tag_target = builder.add_virtual_hash();
         let public_inputs_hash = verifier_gadget.header.get_public_inputs_hash::<C::Hasher, C::F, D>(
             &mut builder,
@@ -125,6 +136,7 @@ where
             guta_proof_rewards_tree_value,
             register_users_proof_rewards_tree_value,
             deploy_contracts_proof_rewards_tree_value,
+            update_contracts_proof_rewards_tree_value,
         );
         //let alt_public_inputs_hash = verifier_gadget.header.get_combined_hash::<C::Hasher, C::F, D>(&mut builder);
         builder.add_qed_type_f_common_gates();
@@ -172,6 +184,12 @@ where
         deploy_contracts_proof_rewards_tree_value: QHashOut<C::F>,
         deploy_contracts_total_proofs_generated: C::F,
 
+        update_contracts_state_transition: &AggStateTransition<QHashOut<C::F>>,
+        update_contracts_proof: &ProofWithPublicInputs<C::F, C, D>,
+        update_contracts_verifier_data: &VerifierOnlyCircuitData<C, D>,
+        update_contracts_proof_rewards_tree_value: QHashOut<C::F>,
+        update_contracts_total_proofs_generated: C::F,
+
         guta_whitelist_merkle_proof: &MerkleProofCore<QHashOut<C::F>>,
         guta_proof_header: &GlobalUserTreeAggregatorHeader<C::F, QHashOut<C::F>>,
         guta_proof: &ProofWithPublicInputs<C::F, C, D>,
@@ -204,6 +222,11 @@ where
             deploy_contracts_verifier_data,
             deploy_contracts_proof_rewards_tree_value,
             deploy_contracts_total_proofs_generated,
+            update_contracts_state_transition,
+            update_contracts_proof,
+            update_contracts_verifier_data,
+            update_contracts_proof_rewards_tree_value,
+            update_contracts_total_proofs_generated,
             guta_whitelist_merkle_proof,
             guta_proof_header,
             guta_proof,
@@ -267,7 +290,7 @@ where
         input: PsyWorkerGetProvingWorkWithChildProofsAPIResponse<QHashOut<C::F>, QProvingJobDataID>,
         worker_reward_tag: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
-        input.ensure_expected_child_proof_count_with_tags(3)?;
+        input.ensure_expected_child_proof_count_with_tags(4)?;
         let witness = QCAggUserRegistartionDeployContractsGUTAInput::<C::F, QHashOut<C::F>>::psy_ser_from_slice(&input.base.witness)?;
         println!("witness: {:#?}", witness);
         println!("metadata: {:#?}", input.base.job);
@@ -285,10 +308,16 @@ where
         let deploy_contracts_zk_proof_verifier_data = library.get_verifier_data(input.get_child_proof_circuit_type(2)?)?;
         let deploy_contracts_proof_rewards_tree_value = input.base.child_proof_tag_values[2];
 
+        let update_contracts_zk_proof = deserialize_plonky2_proof::<C, D>(&input.input_proofs[3])?;
+        let update_contracts_zk_proof_verifier_data = library.get_verifier_data(input.get_child_proof_circuit_type(3)?)?;
+        let update_contracts_proof_rewards_tree_value = input.base.child_proof_tag_values[3];
+
         let (register_users_state_transition, register_users_total_proofs_generated) =
             witness.register_users_state_transition.get_agg_state_transition_and_f::<C::F>();
         let (deploy_contracts_state_transition, deploy_contracts_total_proofs_generated) =
             witness.deploy_contracts_state_transition.get_agg_state_transition_and_f::<C::F>();
+        let (update_contracts_state_transition, update_contracts_total_proofs_generated) =
+            witness.update_contracts_state_transition.get_agg_state_transition_and_f::<C::F>();
 
         //println!("guta_header: {:#?}", witness.guta_proof_header);
         //let guta_proof_header_hash = witness.guta_proof_header.qfhash::<C::Hasher>();
@@ -329,10 +358,11 @@ where
         let metadata_public_inputs_hash_no_rewards = input.base.job.metadata.expected_public_inputs_hash;
         println!("metadata_public_inputs_hash_no_rewards: {:?} ({})", metadata_public_inputs_hash_no_rewards, hex::encode(&metadata_public_inputs_hash_no_rewards.to_le_bytes()));
 
-        let expected_rewards_value = hash_tag_tree_node_three::<QHashOut<C::F>, C::Hasher>(
+        let expected_rewards_value = hash_tag_tree_node_four::<QHashOut<C::F>, C::Hasher>(
             &guta_proof_rewards_tree_value,
             &register_users_proof_rewards_tree_value,
             &deploy_contracts_proof_rewards_tree_value,
+            &update_contracts_proof_rewards_tree_value,
             &worker_reward_tag,
         );
         println!("expected_rewards_value: {:?} ({})", expected_rewards_value, hex::encode(&expected_rewards_value.to_le_bytes()));
@@ -347,6 +377,7 @@ where
                 guta_proof_rewards_tree_value,
                 register_users_proof_rewards_tree_value,
                 deploy_contracts_proof_rewards_tree_value,
+                update_contracts_proof_rewards_tree_value,
             ],
         )?;
         println!("metadata_with_expected_rewards: {:?} ({})", metadata_with_expected_rewards, hex::encode(&metadata_with_expected_rewards.to_le_bytes()));
@@ -363,6 +394,11 @@ where
             &deploy_contracts_zk_proof_verifier_data,
             deploy_contracts_proof_rewards_tree_value,
             deploy_contracts_total_proofs_generated,
+            &update_contracts_state_transition,
+            &update_contracts_zk_proof,
+            &update_contracts_zk_proof_verifier_data,
+            update_contracts_proof_rewards_tree_value,
+            update_contracts_total_proofs_generated,
             &guta_inclusion_proof,
             &witness.guta_proof_header,
             &guta_zk_proof,
@@ -380,7 +416,7 @@ where
         input: PsyWorkerGetProvingWorkWithChildProofsAPIResponse<QHashOut<C::F>, QProvingJobDataID>,
         worker_reward_tag: QHashOut<C::F>,
     ) -> anyhow::Result<Vec<C::F>> {
-        input.ensure_expected_child_proof_count_with_tags(3)?;
+        input.ensure_expected_child_proof_count_with_tags(4)?;
         let witness = QCAggUserRegistartionDeployContractsGUTAInput::<C::F, QHashOut<C::F>>::psy_ser_from_slice(&input.base.witness)?;
 
         let _guta_zk_proof = deserialize_plonky2_proof::<C, D>(&input.input_proofs[0])?;
@@ -396,10 +432,16 @@ where
         let _deploy_contracts_zk_proof_verifier_data = library.get_verifier_data(input.get_child_proof_circuit_type(2)?)?;
         let deploy_contracts_proof_rewards_tree_value = input.base.child_proof_tag_values[2];
 
+        let _update_contracts_zk_proof = deserialize_plonky2_proof::<C, D>(&input.input_proofs[3])?;
+        let _update_contracts_zk_proof_verifier_data = library.get_verifier_data(input.get_child_proof_circuit_type(3)?)?;
+        let update_contracts_proof_rewards_tree_value = input.base.child_proof_tag_values[3];
+
         let (_register_users_state_transition, _register_users_total_proofs_generated) =
             witness.register_users_state_transition.get_agg_state_transition_and_f::<C::F>();
         let (_deploy_contracts_state_transition, _deploy_contracts_total_proofs_generated) =
             witness.deploy_contracts_state_transition.get_agg_state_transition_and_f::<C::F>();
+        let (_update_contracts_state_transition, _update_contracts_total_proofs_generated) =
+            witness.update_contracts_state_transition.get_agg_state_transition_and_f::<C::F>();
 
         let public_inputs_hash_no_rewards_tag = input.base.job.metadata.compute_reward_tagged_expected_public_inputs::<C::Hasher>(
             worker_reward_tag,
@@ -407,6 +449,7 @@ where
                 guta_proof_rewards_tree_value,
                 register_users_proof_rewards_tree_value,
                 deploy_contracts_proof_rewards_tree_value,
+                update_contracts_proof_rewards_tree_value,
             ],
         )?;
         Ok(public_inputs_hash_no_rewards_tag.0.elements.to_vec())

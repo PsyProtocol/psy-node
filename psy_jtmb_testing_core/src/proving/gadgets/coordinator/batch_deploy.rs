@@ -1,13 +1,13 @@
 use parth_core::{
     crypto::hash::{spiderman::SpidermanUpdateProof, traits::{FieldQHasher, QFieldHashable}}, felt::QFelt64, protocol::core_types::{Q256BitHash, QFHashBase}
 };
-use psy_data::v1::qdata::contract::PQEDContractLeaf;
+use psy_data::v1::qdata::contract::PQEDContractLeafV2;
 use crate::proving::{gadgets::coordinator::spiderman::verify_spiderman_append_proof, utils::connect::jtmb_connect_ref};
 
 // Batch deploy logic connects spiderman new leaves to contract leaf hashes if added
 pub fn verify_batch_deploy<Hash: Q256BitHash + QFHashBase<F>, F: QFelt64, Hasher: FieldQHasher<F, Hash>>(
     spiderman_proof: &SpidermanUpdateProof<Hash>,
-    contract_leaves: &[PQEDContractLeaf<F, Hash>],
+    contract_leaves: &[PQEDContractLeafV2<F, Hash>],
     contract_tree_height: usize,
     batch_sub_tree_height: usize,
 ) -> anyhow::Result<()> {

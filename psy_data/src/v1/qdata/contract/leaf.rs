@@ -206,6 +206,7 @@ impl<F: QFelt64, Hash: Q256BitHash> FastFixedSerializable<104> for PQEDContractL
         Ok(PQEDContractLeaf {
             deployer,
             function_tree_root,
+            code_root,
             state_tree_height,
         })
     }

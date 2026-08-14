@@ -62,3 +62,33 @@ pub fn hash_tag_tree_node_three_circuit<H: AlgebraicHasher<F>, F: RichField + Ex
         worker_rewards_tree_tag,
     )
 }
+
+// circuit equivalent of the tag tree `hash_tag_tree_node_four` function in
+// parth_core crypto
+pub fn hash_tag_tree_node_four_circuit<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
+    builder: &mut CircuitBuilder<F, D>,
+    first_child_proof_tag_tree_value: HashOutTarget,
+    second_child_proof_tag_tree_value: HashOutTarget,
+    third_child_proof_tag_tree_value: HashOutTarget,
+    fourth_child_proof_tag_tree_value: HashOutTarget,
+    worker_rewards_tree_tag: HashOutTarget,
+) -> HashOutTarget {
+    let last_two = hash_tag_tree_node_circuit::<H, F, D>(
+        builder,
+        third_child_proof_tag_tree_value,
+        fourth_child_proof_tag_tree_value,
+        worker_rewards_tree_tag,
+    );
+    let last_three = hash_tag_tree_node_circuit::<H, F, D>(
+        builder,
+        second_child_proof_tag_tree_value,
+        last_two,
+        worker_rewards_tree_tag,
+    );
+    hash_tag_tree_node_circuit::<H, F, D>(
+        builder,
+        first_child_proof_tag_tree_value,
+        last_three,
+        worker_rewards_tree_tag,
+    )
+}

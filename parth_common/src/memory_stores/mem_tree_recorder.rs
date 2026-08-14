@@ -506,7 +506,9 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default + Debug>
         } else if sub_tree_height == 1 {
             let left_key = SimpleMerkleNodeKey::new(self.height, sub_tree_index * 2);
             let v = Hasher::two_to_one(&self.get_node_value(&left_key), &self.get_node_value(&left_key.sibling()));
-            self.set_node_value(left_key.parent(), v);
+            let sub_tree_root = left_key.parent();
+            self.set_node_value(sub_tree_root, v);
+            self.rehash_from_node_to_level(sub_tree_root, 0);
             return v;
         }
 
@@ -1078,6 +1080,76 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default + Debug>
         Ok(results)
     }
 
+    /// Overwrite leaves at arbitrary (already occupied or not) indices and
+    /// produce one `SpidermanUpdateProof` per affected sub-tree.
+    ///
+    /// Unlike `append_leaves_spider_man_at_index`, this method does NOT assume
+    /// the old leaves are zero: `web_proof_old_leaves` contains the actual
+    /// previous values for every position of the sub-tree window, and
+    /// `web_proof_new_leaves` keeps the old value for positions that are not
+    /// being updated. `leaf_indices` and `leaves` are parallel arrays; the
+    /// same index may not appear twice.
+    pub fn update_leaves_spider_man(
+        &mut self,
+        sub_tree_height: u8,
+        leaf_indices: &[u64],
+        leaves: &[Hash],
+    ) -> anyhow::Result<Vec<SpidermanUpdateProof<Hash>>> {
+        if leaf_indices.len() != leaves.len() {
+            anyhow::bail!(
+                "leaf_indices len {} does not match leaves len {}",
+                leaf_indices.len(),
+                leaves.len()
+            );
+        }
+        let leaves_per_subtree = 1usize << sub_tree_height;
+        let max_leaves = 1u64 << self.height;
+
+        // sort updates by index and group them by sub-tree
+        let mut sorted_updates = leaf_indices.iter().copied().zip(leaves.iter().copied()).collect::<Vec<_>>();
+        sorted_updates.sort_by_key(|(index, _)| *index);
+        for w in sorted_updates.windows(2) {
+            if w[0].0 == w[1].0 {
+                anyhow::bail!("duplicate leaf index {} in update_leaves_spider_man", w[0].0);
+            }
+        }
+
+        let mut results = Vec::new();
+        let mut pos = 0usize;
+        while pos < sorted_updates.len() {
+            let sub_tree_id = sorted_updates[pos].0 / leaves_per_subtree as u64;
+            let sub_tree_start_idx = sub_tree_id * leaves_per_subtree as u64;
+
+            let mut old_leaves = Vec::with_capacity(leaves_per_subtree);
+            let mut new_leaves = Vec::with_capacity(leaves_per_subtree);
+            for i in 0..leaves_per_subtree as u64 {
+                let old_val = self.get_leaf_value(sub_tree_start_idx + i);
+                old_leaves.push(old_val);
+                new_leaves.push(old_val);
+            }
+
+            while pos < sorted_updates.len() && (sorted_updates[pos].0 / leaves_per_subtree as u64) == sub_tree_id {
+                let (index, value) = sorted_updates[pos];
+                if index >= max_leaves {
+                    anyhow::bail!("leaf index {} exceeds tree capacity {}", index, max_leaves);
+                }
+                let window_index = (index - sub_tree_start_idx) as usize;
+                new_leaves[window_index] = value;
+                self.set_node_value(SimpleMerkleNodeKey::new(self.height, index), value);
+                pos += 1;
+            }
+
+            let dmp = self.rehash_sub_tree_dmp(sub_tree_height, sub_tree_id);
+            results.push(SpidermanUpdateProof {
+                top_line_proof: dmp,
+                web_proof_old_leaves: old_leaves,
+                web_proof_new_leaves: new_leaves,
+            });
+        }
+
+        Ok(results)
+    }
+
     pub fn set_e_leaf(&mut self, index: u64, value: Hash) -> DeltaMerkleProofCore<Hash> {
         let old_proof = self.get_e_leaf(index);
         let mut current_value = value;
@@ -1551,6 +1623,19 @@ mod tests {
         tree_std.set_leaf(15, val);
 
         assert_eq!(tree.get_root(), tree_std.get_root(), "Manual rehash root doesn't match set_leaf root");
+    }
+
+    #[test]
+    fn test_update_spider_man_height_one_rehashes_tree_root() {
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(8);
+        let leaf = Hash::from_u64_le_values(1, 2, 3, 4);
+
+        let proofs = tree.update_leaves_spider_man(1, &[6], &[leaf]).unwrap();
+
+        assert_eq!(proofs.len(), 1);
+        assert!(proofs[0].verify::<Hasher>());
+        assert_eq!(tree.get_root(), proofs[0].top_line_proof.new_root);
+        assert_eq!(tree.get_leaf_value(6), leaf);
     }
 
     #[test]

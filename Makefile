@@ -96,11 +96,12 @@ shutdown:
 clean-db:
 	rm -fr local_checkpoints logs || true
 	rm -fr psy-contracts/deployments/localhost || true
-	-docker stop -t 15 valkey-server nats-server scylla-server nostr-relay 2>/dev/null || true
-	-docker rm -f valkey-server nats-server scylla-server nostr-relay 2>/dev/null || true
-	# generated_db_data is handled by docker compose down -v in shutdown
+	-docker stop -t 15 valkey-server nats-server scylla-server nostr-relay generated-envio-postgres-1 generated-graphql-engine-1 2>/dev/null || true
+	-docker rm -f valkey-server nats-server scylla-server nostr-relay generated-envio-postgres-1 generated-graphql-engine-1 2>/dev/null || true
+	# Drop the envio postgres volume before wiping generated/ so the compose file still exists.
 	-docker compose -f psy_cli/psy_relayer_cli/indexer/envio/generated/docker-compose.yaml down -v 2>/dev/null || true
-	docker volume rm psy-devnet-redis psy-devnet-scylla psy-devnet-scylla-data psy-devnet-nats 2>/dev/null || true
+	rm -fr psy_cli/psy_relayer_cli/indexer/envio/generated || true
+	docker volume rm generated_db_data psy-devnet-redis psy-devnet-scylla psy-devnet-scylla-data psy-devnet-nats 2>/dev/null || true
 
 config_gen_v2:
 	cargo run --release --package psy_plonky2_circuits --example config_gen_v2

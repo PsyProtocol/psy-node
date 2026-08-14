@@ -1,5 +1,11 @@
 pub mod batch_append_user_registration_tree;
-pub mod batch_deploy_contract;
+pub mod batch_deploy_contract_v2;
+pub mod batch_update_contract;
 pub mod agg_user_registration_deploy_guta;
 pub mod checkpoint_state_transition;
 pub mod checkpoint_state_transition_genesis;
+pub mod state_layout_append;
+pub mod state_layout_append_aggregate;
+pub mod state_layout_append_wrapper;
+pub mod type_layout;
+pub mod canonical_type_layout;

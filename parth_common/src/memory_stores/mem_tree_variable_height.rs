@@ -295,11 +295,15 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default>
             return self.get_leaf_value(sub_tree_index);
         } else if sub_tree_height == 1 {
             let left_key = SimpleMerkleNodeKey::new(self.height, sub_tree_index * 2);
+            let right_key =
+                SimpleMerkleNodeKey::new(self.height, sub_tree_index * 2 + 1);
             let v = Hasher::two_to_one(
                 &self.get_node_value(&left_key),
-                &self.get_node_value(&SimpleMerkleNodeKey::new(self.height, sub_tree_index * 2)),
+                &self.get_node_value(&right_key),
             );
-            self.set_node_value(left_key.parent(), v);
+            let sub_tree_root = left_key.parent();
+            self.set_node_value(sub_tree_root, v);
+            self.rehash_from_node_to_level(sub_tree_root, 0);
             return v;
         }
 

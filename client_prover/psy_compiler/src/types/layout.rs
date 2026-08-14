@@ -131,12 +131,37 @@ fn count_imt_maps_in_type(ty: &ResolvedType, structs: &HashMap<String, StructLay
     }
 }
 
+fn contains_imt_map(ty: &ResolvedType, structs: &HashMap<String, StructLayout>) -> Result<bool> {
+    Ok(match ty {
+        ResolvedType::ContractHashMap { .. } => true,
+        ResolvedType::Array { element, .. } | ResolvedType::ContractStateArray { element, .. } => contains_imt_map(element, structs)?,
+        ResolvedType::Struct(name) => {
+            let layout = structs.get(name).ok_or_else(|| anyhow::anyhow!("Unknown struct: {}", name))?;
+            layout
+                .fields
+                .iter()
+                .map(|field| contains_imt_map(&field.ty, structs))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .any(|contains| contains)
+        }
+        _ => false,
+    })
+}
+
 /// Compute struct layout from its fields.
 pub fn compute_struct_layout(name: &str, fields: &[(String, ResolvedType)], structs: &HashMap<String, StructLayout>) -> Result<StructLayout> {
     let mut offset = 0;
     let mut field_layouts = Vec::new();
 
     for (fname, fty) in fields {
+        if contains_imt_map(fty, structs)? {
+            bail!(
+                "state-layout V1 forbids ContractHashMap inside struct '{}.{}'; aligned maps must be direct top-level contract fields",
+                name,
+                fname
+            );
+        }
         let size = fty.felt_size(structs)?;
         field_layouts.push(FieldLayout {
             name: fname.clone(),
@@ -162,6 +187,9 @@ pub fn compute_contract_layout(
 ) -> Result<ContractStateLayout> {
     let mut total_imt_maps = 0usize;
     for (_fname, fty) in fields {
+        if !matches!(fty, ResolvedType::ContractHashMap { .. }) && contains_imt_map(fty, structs)? {
+            bail!("state-layout V1 forbids ContractHashMap nested in arrays or structs; aligned maps must be direct top-level contract fields");
+        }
         total_imt_maps += count_imt_maps_in_type(fty, structs)?;
     }
     if total_imt_maps > 1 {
@@ -242,10 +270,13 @@ pub fn compute_contract_layout(
         }
     }
 
-    // Contract-state Merkle leaves pack four felts. Size the tree from the
-    // number of packed leaves, and retain the protocol's minimum height.
+    // Compute state tree height
     let total_virtual_size = offset;
-    let state_tree_height = state_tree_height_for_total_felts(total_virtual_size);
+    let state_tree_height = if total_virtual_size <= 1 {
+        1
+    } else {
+        (total_virtual_size as f64).log2().ceil() as u16
+    };
 
     Ok(ContractStateLayout {
         contract_name: contract_name.to_string(),
@@ -257,19 +288,6 @@ pub fn compute_contract_layout(
         has_imt_map,
         imt_map_field_name,
     })
-}
-
-/// Compute the contract-state Merkle height for a felt footprint.
-///
-/// This must stay identical to psy-compiler/psy-abi's calculation.
-pub fn state_tree_height_for_total_felts(total_felts: usize) -> u16 {
-    let total_leaves = total_felts.max(1).saturating_add(3) / 4;
-    if total_leaves <= 1 {
-        0
-    } else {
-        (usize::BITS - (total_leaves - 1).leading_zeros()) as u16
-    }
-    .max(4)
 }
 
 /// Resolve an AST Type to a ResolvedType, given known constants.
@@ -353,19 +371,5 @@ impl ContractStateLayout {
             .get(struct_name)
             .and_then(|layout| layout.fields.iter().find(|f| f.name == field_name))
             .map(|f| f.offset)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::state_tree_height_for_total_felts;
-
-    #[test]
-    fn state_tree_height_matches_packed_leaf_boundaries() {
-        assert_eq!(state_tree_height_for_total_felts(0), 4);
-        assert_eq!(state_tree_height_for_total_felts(64), 4);
-        assert_eq!(state_tree_height_for_total_felts(65), 5);
-        assert_eq!(state_tree_height_for_total_felts(128), 5);
-        assert_eq!(state_tree_height_for_total_felts(129), 6);
     }
 }

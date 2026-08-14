@@ -1,12 +1,12 @@
 use async_trait::async_trait;
 use parth_core::{crypto::hash::merkle_proof::MerkleProofCore, protocol::core_types::QNetworkDatabaseTypes, QCoreProcCheckpointUniqueId};
-use psy_data::v1::qdata::{checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState}, checkpoint_sync::PQEDCheckpointSyncInfoCompact, contract::{ContractCodeDefinition, PQEDContractLeaf}};
+use psy_data::v1::qdata::{checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState}, checkpoint_sync::PQEDCheckpointSyncInfoCompact, contract::{ContractCodeDefinition, PQEDContractLeafV2}};
 use crate::data::pending::coordinator::{CoordinatorPendingCheckpointDatabase, CoordinatorPendingCheckpointSync};
 
 
 #[async_trait]
 pub trait QEDCoordinatorObjectStoreReaderAsync<N: QNetworkDatabaseTypes> {
-    async fn get_contract_leaf_data(&self, contract_id: u64) -> anyhow::Result<PQEDContractLeaf<N::F, N::QHash>>;
+    async fn get_contract_leaf_data(&self, contract_id: u64) -> anyhow::Result<PQEDContractLeafV2<N::F, N::QHash>>;
     async fn get_checkpoint_leaf_data(&self, checkpoint_id: u64) -> anyhow::Result<PQEDCheckpointLeaf<N::F, N::QHash>>;
     async fn get_contract_code_definition(&self, contract_id: u64) -> anyhow::Result<ContractCodeDefinition>;
     async fn get_latest_l2_block_state(&self) -> anyhow::Result<QEDL2BlockState>;

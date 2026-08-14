@@ -23,7 +23,7 @@ use psy_client_common::{
 use psy_client_data::{
     config::store_config::PsyHasher,
     guta::end_cap_input::SubmitUserEndCapNonProofInput,
-    qblock::cmds::deploy_contract::{get_code_root_by_code_hashes, QBCDeployContract},
+    qblock::cmds::deploy_contract::{get_code_root_by_code_hashes, QBCDeployContract, QBCUpdateContract},
     qdata::{
         checkpoint::{PsyCheckpointGlobalStateRoots, PsyCheckpointLeafCompactWithStateRoots},
         contract::ContractCodeDefinition,
@@ -67,7 +67,9 @@ use psy_dpn_circuit::circuits::cfc::DapenContractFunctionCircuit;
 pub use psy_provider::session::TxStatus;
 use psy_provider::{
     provider::{ProveProxyRpcProvider, QUserRpcProvider, RpcProvider},
-    request::{DPNSoftwareDefinedSignatureInput, QDeployContractRPCRequest, QRegisterUserRPCRequest, QSubmitEndCapRPCRequest},
+    request::{
+        DPNSoftwareDefinedSignatureInput, QDeployContractRPCRequest, QRegisterUserRPCRequest, QSubmitEndCapRPCRequest, QUpdateContractRPCRequest,
+    },
 };
 use psy_ups_circuit::{circuit_manager::core::PsyUPSStepCircuitManager, session::UserProvingSessionManager};
 use psy_vm::{
@@ -197,6 +199,57 @@ where
     };
 
     Ok((circuits, deploy))
+}
+
+/// Mirrors `gen_contract_deploy_and_circuits_for_functions` but builds a
+/// `QBCUpdateContract` for updating the code of an existing contract. The
+/// whitelist leaves, function circuit fingerprints and code root are computed
+/// exactly like in the deploy path; `contract_state_tree_height` is the
+/// existing on-chain state tree height of the contract (it is immutable).
+pub fn gen_contract_update_and_circuits_for_functions<C: GenericConfig<D>, const D: usize>(
+    contract_id: u64,
+    deployer: QHashOut<C::F>,
+    contract_state_tree_height: u8,
+    defs: &[DPNFunctionCircuitDefinition],
+) -> anyhow::Result<(Vec<DapenContractFunctionCircuit<C, D>>, QBCUpdateContract<C::F>)>
+where
+    C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + MerkleZeroHasherWithMarkedLeaf<QHashOut<C::F>>,
+{
+    let code_defs = defs.iter().map(|x| dapen_fc_to_cfc_code_definition(x)).collect::<Vec<_>>();
+    let mut whitelist_leaves = Vec::with_capacity(defs.len() * 2);
+    let mut code_hashes = Vec::with_capacity(defs.len());
+    let circuits = defs
+        .iter()
+        .map(|x| {
+            let c = DapenContractFunctionCircuit::<C, D>::new(x, contract_state_tree_height as usize, UPS_SESSION_PROOF_TREE_HEIGHT as usize, false);
+            whitelist_leaves.push(c.get_fingerprint());
+
+            let inputs_outputs_combo = ((x.circuit_outputs.len() as u64) << 32u64) | (x.circuit_inputs.len() as u64);
+            whitelist_leaves.push(QHashOut::from_values(x.method_id as u64, inputs_outputs_combo, 0, 0));
+            let code_hash = hash_dpn_function::<C::F>(x);
+            code_hashes.push(code_hash);
+            c
+        })
+        .collect::<Vec<_>>();
+
+    let update = QBCUpdateContract {
+        contract_id,
+        deployer,
+        code_definition: ContractCodeDefinition {
+            state_tree_height: contract_state_tree_height as u16,
+            functions: code_defs,
+        },
+        function_whitelist: whitelist_leaves,
+        code_root: get_code_root_by_code_hashes::<C::F, C::Hasher>(&code_hashes, CONTRACT_FUNCTION_TREE_HEIGHT - 1),
+        layout_protocol_version: 0,
+        state_layout_root: QHashOut::ZERO,
+        state_layout_field_count: 0,
+        state_layout_slot_count: 0,
+        canonical_layout_verifier_fingerprint: QHashOut::ZERO,
+        canonical_layout_proof: Vec::new(),
+    };
+
+    Ok((circuits, update))
 }
 
 type C = PoseidonGoldilocksConfig;
@@ -2545,14 +2598,79 @@ impl WalletSession {
         Ok(deploy_cmd)
     }
 
-    pub async fn deploy_contract(&self, deployer: QHashOut<F>, circuit_defs: Vec<DPNFunctionCircuitDefinition>) -> anyhow::Result<String> {
-        let deploy_cmd = self.get_deploy_contract_cmd(deployer, circuit_defs)?;
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn get_layout_aware_deploy_contract_cmd(
+        &self,
+        deployer: QHashOut<F>,
+        circuit_defs: Vec<DPNFunctionCircuitDefinition>,
+        abi: psy_compiler::abi::Abi,
+    ) -> anyhow::Result<psy_client_data::qblock::cmds::deploy_contract::QBCDeployContractV2<F>> {
+        let contract_state_tree_height =
+            u8::try_from(abi.contract.state_tree_height).map_err(|_| anyhow::anyhow!("contract state tree height does not fit in u8"))?;
+        let (_result_circuits, deploy_cmd) =
+            gen_contract_deploy_and_circuits_for_functions::<C, D>(deployer, contract_state_tree_height, &circuit_defs)?;
+        let contract_output = psy_compiler::output::serialize::ContractOutput {
+            contract_code: deploy_cmd.code_definition.clone(),
+            circuit_definitions: circuit_defs,
+            abi,
+        };
+        crate::session::compile_bridge::build_layout_aware_deploy_command(&contract_output, deploy_cmd)
+    }
 
-        let contract_uuid = self
-            .st_provider
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn deploy_contract_with_abi(
+        &self,
+        deployer: QHashOut<F>,
+        circuit_defs: Vec<DPNFunctionCircuitDefinition>,
+        abi: psy_compiler::abi::Abi,
+    ) -> anyhow::Result<String> {
+        let deploy_cmd = self.get_layout_aware_deploy_contract_cmd(deployer, circuit_defs, abi)?;
+        self.st_provider
             .deploy_contract::<F>(QDeployContractRPCRequest { deploy_contract: deploy_cmd })
+            .await
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub async fn deploy_contract_with_abi(
+        &self,
+        _deployer: QHashOut<F>,
+        _circuit_defs: Vec<DPNFunctionCircuitDefinition>,
+        _abi: psy_compiler::abi::Abi,
+    ) -> anyhow::Result<String> {
+        anyhow::bail!("deploy_contract_with_abi requires native layout proofs and is unavailable on wasm32")
+    }
+
+    pub async fn deploy_contract(&self, deployer: QHashOut<F>, circuit_defs: Vec<DPNFunctionCircuitDefinition>) -> anyhow::Result<String> {
+        let _ = (deployer, circuit_defs);
+        anyhow::bail!("deploy_contract requires ABI; use deploy_contract_with_abi")
+    }
+
+    pub fn get_update_contract_cmd(
+        &self,
+        contract_id: u64,
+        deployer: QHashOut<F>,
+        circuit_defs: Vec<DPNFunctionCircuitDefinition>,
+    ) -> anyhow::Result<QBCUpdateContract<F>> {
+        let contract_state_tree_height = derive_state_tree_height(&circuit_defs);
+
+        let (_result_circuits, update_cmd) =
+            gen_contract_update_and_circuits_for_functions::<C, D>(contract_id, deployer, contract_state_tree_height as u8, &circuit_defs)?;
+        Ok(update_cmd)
+    }
+
+    pub async fn update_contract(
+        &self,
+        contract_id: u64,
+        deployer: QHashOut<F>,
+        circuit_defs: Vec<DPNFunctionCircuitDefinition>,
+    ) -> anyhow::Result<String> {
+        let update_cmd = self.get_update_contract_cmd(contract_id, deployer, circuit_defs)?;
+
+        let update_content_hash = self
+            .st_provider
+            .update_contract::<F>(QUpdateContractRPCRequest { update_contract: update_cmd })
             .await?;
-        Ok(contract_uuid)
+        Ok(update_content_hash)
     }
 
     // pub async fn get_claim_rewards_call_args(&self, mut job_infos: Vec<JobInfo>)

@@ -18,7 +18,7 @@ use psy_plonky2_basic_helpers::builder::hash::core::CircuitBuilderHashCore;
 
 use crate::{
     gadgets::{
-        qdata::pm_jobs_completed_stats::PMJobsCompletedStatsGadget, tag_tree::hash_tag_tree_node_three_circuit, treeprover::{AggStateTransitionGadget, VerifyStateTransitionProofGadget}
+        qdata::pm_jobs_completed_stats::PMJobsCompletedStatsGadget, tag_tree::hash_tag_tree_node_four_circuit, treeprover::{AggStateTransitionGadget, VerifyStateTransitionProofGadget}
     },
     guta::gadgets::{guta_header::GlobalUserTreeAggregatorHeaderGadget, verify_guta_proof::VerifyGUTAProofGadget},
 };
@@ -113,14 +113,16 @@ impl VerifyAggUserRegistartionDeployContractsGUTAHeaderGadget {
         guta_proof_rewards_tree_value: HashOutTarget,
         register_users_proof_rewards_tree_value: HashOutTarget,
         deploy_contracts_proof_rewards_tree_value: HashOutTarget,
+        update_contracts_proof_rewards_tree_value: HashOutTarget,
     ) -> HashOutTarget {
         let verify_agg_user_registration_deploy_guta_header_hash = self.get_combined_hash::<H, F, D>(builder);
 
-        let tag_tree_value = hash_tag_tree_node_three_circuit::<H, F, D>(
+        let tag_tree_value = hash_tag_tree_node_four_circuit::<H, F, D>(
             builder,
             guta_proof_rewards_tree_value,
             register_users_proof_rewards_tree_value,
             deploy_contracts_proof_rewards_tree_value,
+            update_contracts_proof_rewards_tree_value,
             worker_reward_tag,
         );
         builder.hash_two_to_one::<H>(verify_agg_user_registration_deploy_guta_header_hash, tag_tree_value)
@@ -170,6 +172,7 @@ impl VerifyAggUserRegistartionDeployContractsGUTAHeaderGadget {
 pub struct VerifyAggUserRegistartionDeployContractsGUTAGadget<const D: usize> {
     pub verify_register_users_gadget: VerifyStateTransitionProofGadget<D>,
     pub verify_deploy_contract_gadget: VerifyStateTransitionProofGadget<D>,
+    pub verify_update_contract_gadget: VerifyStateTransitionProofGadget<D>,
     pub verify_guta_gadget: VerifyGUTAProofGadget<D>,
 
     // computed
@@ -185,6 +188,9 @@ impl<const D: usize> VerifyAggUserRegistartionDeployContractsGUTAGadget<D> {
 
         deploy_contracts_proof_common_data: &CommonCircuitData<F, D>,
         deploy_contracts_transition_circuit_config: &TPAltCircuitFingerprintConfig<QHashOut<F>>,
+
+        update_contracts_proof_common_data: &CommonCircuitData<F, D>,
+        update_contracts_transition_circuit_config: &TPAltCircuitFingerprintConfig<QHashOut<F>>,
 
         guta_proof_common_data: &CommonCircuitData<F, D>,
         guta_verifier_data_cap_height: usize,
@@ -204,6 +210,11 @@ impl<const D: usize> VerifyAggUserRegistartionDeployContractsGUTAGadget<D> {
             deploy_contracts_proof_common_data,
             deploy_contracts_transition_circuit_config,
         );
+        let verify_update_contract_gadget = VerifyStateTransitionProofGadget::<D>::add_virtual_to_with_config::<C, F>(
+            builder,
+            update_contracts_proof_common_data,
+            update_contracts_transition_circuit_config,
+        );
 
         let verify_guta_gadget = VerifyGUTAProofGadget::<D>::add_virtual_to::<C, F>(
             builder,
@@ -215,11 +226,23 @@ impl<const D: usize> VerifyAggUserRegistartionDeployContractsGUTAGadget<D> {
         let guta_circuit_whitelist_root_target = builder.constant_qhash(guta_circuit_whitelist_root);
         builder.connect_hashes(guta_circuit_whitelist_root_target, verify_guta_gadget.guta_whitelist_merkle_proof.root);
 
+        // the update contracts transition must start where the deploy
+        // contracts transition ended (for blocks without updates both are
+        // equal, i.e. the update transition is a no-op)
+        builder.connect_hashes(
+            verify_deploy_contract_gadget.state_transition.state_transition_end,
+            verify_update_contract_gadget.state_transition.state_transition_start,
+        );
+
         let deploy_contracts_completed = verify_deploy_contract_gadget.total_proofs_generated;
         let register_users_completed = verify_register_users_gadget.total_proofs_generated;
         let header: VerifyAggUserRegistartionDeployContractsGUTAHeaderGadget = VerifyAggUserRegistartionDeployContractsGUTAHeaderGadget {
             user_registration_tree_delta: verify_register_users_gadget.state_transition,
-            global_contract_tree_delta: verify_deploy_contract_gadget.state_transition,
+            // the combined contract tree transition chains deploy then update
+            global_contract_tree_delta: AggStateTransitionGadget {
+                state_transition_start: verify_deploy_contract_gadget.state_transition.state_transition_start,
+                state_transition_end: verify_update_contract_gadget.state_transition.state_transition_end,
+            },
             global_user_tree_delta: verify_guta_gadget.guta_proof_header_gadget,
             combined_pm_jobs_completed: PMJobsCompletedStatsGadget {
                 deploy_contracts_completed,
@@ -231,6 +254,7 @@ impl<const D: usize> VerifyAggUserRegistartionDeployContractsGUTAGadget<D> {
         Self {
             verify_register_users_gadget,
             verify_deploy_contract_gadget,
+            verify_update_contract_gadget,
             verify_guta_gadget,
             header,
         }
@@ -250,6 +274,12 @@ impl<const D: usize> VerifyAggUserRegistartionDeployContractsGUTAGadget<D> {
         deploy_contracts_verifier_data: &VerifierOnlyCircuitData<C, D>,
         deploy_contracts_proof_rewards_tree_value: QHashOut<F>,
         deploy_contracts_total_proofs_generated: F,
+
+        update_contracts_state_transition: &AggStateTransition<QHashOut<F>>,
+        update_contracts_proof: &ProofWithPublicInputs<F, C, D>,
+        update_contracts_verifier_data: &VerifierOnlyCircuitData<C, D>,
+        update_contracts_proof_rewards_tree_value: QHashOut<F>,
+        update_contracts_total_proofs_generated: F,
 
         guta_whitelist_merkle_proof: &MerkleProofCore<QHashOut<F>>,
         guta_proof_header: &GlobalUserTreeAggregatorHeader<F, QHashOut<F>>,
@@ -293,6 +323,18 @@ impl<const D: usize> VerifyAggUserRegistartionDeployContractsGUTAGadget<D> {
             deploy_contracts_total_proofs_generated,
             deploy_contracts_proof,
             deploy_contracts_verifier_data,
+        )?;
+        tracing::info!(
+            "update_contracts_state_transition={}",
+            serde_json::to_string_pretty(&update_contracts_state_transition).unwrap()
+        );
+        self.verify_update_contract_gadget.set_witness::<F, C>(
+            witness,
+            update_contracts_state_transition,
+            update_contracts_proof_rewards_tree_value,
+            update_contracts_total_proofs_generated,
+            update_contracts_proof,
+            update_contracts_verifier_data,
         )?;
 
         self.verify_guta_gadget.set_witness(

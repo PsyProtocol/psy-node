@@ -78,6 +78,12 @@ impl CoordinatorProcessorStartConfig {
             self.checkpoint_backup_path, self.coordinator_id, self.coordinator_sub_id
         )
     }
+    pub fn get_update_contracts_backup_path(&self) -> String {
+        format!(
+            "{}/coordinator_{}_{}/update_contracts_backup",
+            self.checkpoint_backup_path, self.coordinator_id, self.coordinator_sub_id
+        )
+    }
     pub fn get_guta_updates_backup_path(&self) -> String {
         format!(
             "{}/coordinator_{}_{}/guta_updates_backup",

@@ -26,29 +26,35 @@ use psy_data::{
         populated_checkpoint::PsyCheckpointLeafPopulated,
     },
     worker::{
-        metadata::{PROOF_REWARD_TREE_HASH_MODE_3_CHILDREN_DOUBLE_REWARD, PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD, PsyProvingJobMetadata},
+        metadata::{PROOF_REWARD_TREE_HASH_MODE_4_CHILDREN, PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD, PsyProvingJobMetadata},
         metadata_with_job_id::PsyProvingJobMetadataWithJobId,
     },
 };
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
 use crate::coordinator::processor::gatherers::{
-    coordinator_guta_update_gatherer::{CoordinatorGUTAUpdateGathererOutput, CoordinatorGUTAUpdateGathererOutputDatabase}, deploy_contract_gatherer::{DeployContractGathererOutput, DeployContractGathererOutputDatabase},
+    contract_gatherer::ContractGathererOutput,
+    coordinator_guta_update_gatherer::{CoordinatorGUTAUpdateGathererOutput, CoordinatorGUTAUpdateGathererOutputDatabase},
+    deploy_contract_gatherer::DeployContractGathererOutputDatabase,
     register_user_gatherer::{RegisterUserGathererOutput, RegisterUserGathererOutputDatabase},
+    update_contract_gatherer::UpdateContractGathererOutputDatabase,
 };
 
 pub struct CoordinatorOutputBuilder<N: QNetworkTypesConfig<JobId = QProvingJobDataID>> {
     pub guta_gatherer_result: CoordinatorGUTAUpdateGathererOutputDatabase<N::F, N::QHash>,
     pub register_users_gatherer_result: RegisterUserGathererOutputDatabase<N::QHash>,
     pub deploy_contract_gatherer_result: DeployContractGathererOutputDatabase<N::QHash>,
+    pub update_contract_gatherer_result: UpdateContractGathererOutputDatabase<N::QHash>,
 
     pub total_guta_jobs: usize,
     pub total_register_user_jobs: usize,
     pub total_deploy_contract_jobs: usize,
+    pub total_update_contract_jobs: usize,
 
     pub root_guta_job_id: N::JobId,
     pub root_register_user_job_id: N::JobId,
     pub root_deploy_contract_job_id: N::JobId,
+    pub root_update_contract_job_id: N::JobId,
 
     pub agg_state_part_1_job_id: N::JobId,
     pub checkpoint_state_transition_job_id: N::JobId,
@@ -65,15 +71,18 @@ impl<N: QNetworkTypesConfig<JobId = QProvingJobDataID>> CoordinatorOutputBuilder
         guta_gatherer_result: CoordinatorGUTAUpdateGathererOutputDatabase<N::F, N::QHash>,
         register_users_gatherer_result: RegisterUserGathererOutputDatabase<N::QHash>,
         deploy_contract_gatherer_result: DeployContractGathererOutputDatabase<N::QHash>,
+        update_contract_gatherer_result: UpdateContractGathererOutputDatabase<N::QHash>,
         append_checkpoint_tree_siblings: Vec<N::QHash>,
         block_time: u64,
     ) -> anyhow::Result<PsyPreparedCoordinatorBlockStateUpdates<N::F, N::QHash>> {
 let root_guta_job = QProvingJobDataID::new_invalid_job_id();
         let root_register_user_job = QProvingJobDataID::new_invalid_job_id();
         let root_deploy_contract_job = QProvingJobDataID::new_invalid_job_id();
+        let root_update_contract_job = QProvingJobDataID::new_invalid_job_id();
         let total_guta_jobs = guta_gatherer_result.total_guta_proofs_generated.to_u64_value();//guta_gatherer_result.job_ids.iter().map(|level| level.len()).sum();
         let total_register_user_jobs = register_users_gatherer_result.total_jobs;//register_users_gatherer_result.job_ids.iter().map(|level| level.len()).sum();
         let total_deploy_contract_jobs = deploy_contract_gatherer_result.total_jobs;//deploy_contract_gatherer_result.job_ids.iter().map(|level| level.len()).sum();
+        let total_update_contract_jobs = update_contract_gatherer_result.total_jobs;
 
         let last_checkpoint_state_transition_job_id = if coordinator_ids.checkpoint_id == 0 {
             QProvingJobDataID::new_proof_job_id(0, 0, ProvingJobCircuitType::GenesisBlockCheckpointStateTransition, 0, 0)
@@ -86,20 +95,23 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
             coordinator_ids.next_checkpoint_id
         )
         .get_output_id();
-        
+
         let builder = Self {
             total_guta_jobs: total_guta_jobs as usize,
             total_register_user_jobs: total_register_user_jobs as usize,
             total_deploy_contract_jobs: total_deploy_contract_jobs as usize,
+            total_update_contract_jobs: total_update_contract_jobs as usize,
             root_guta_job_id: root_guta_job,
             root_register_user_job_id: root_register_user_job,
             root_deploy_contract_job_id: root_deploy_contract_job,
+            root_update_contract_job_id: root_update_contract_job,
             agg_state_part_1_job_id,
             checkpoint_state_transition_job_id,
             last_checkpoint_state_transition_job_id,
             guta_gatherer_result: guta_gatherer_result,
             register_users_gatherer_result: register_users_gatherer_result,
             deploy_contract_gatherer_result: deploy_contract_gatherer_result,
+            update_contract_gatherer_result: update_contract_gatherer_result,
             agg_state_part_1_witness: None,
             append_checkpoint_tree_siblings,
         };
@@ -114,8 +126,10 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
         coordinator_ids: &CoordinatorProcessorIdState,
         guta_gatherer_result: CoordinatorGUTAUpdateGathererOutput<N::F, N::QHash, N::JobId>,
         register_users_gatherer_result: RegisterUserGathererOutput<N::QHash, N::JobId>,
-        deploy_contract_gatherer_result: DeployContractGathererOutput<N::QHash, N::JobId>,
-    ) -> anyhow::Result<(PsyNodeProvingState, Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>, Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>, Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>, Self)> {
+        contract_gatherer_result: ContractGathererOutput<N::QHash, N::JobId>,
+    ) -> anyhow::Result<(PsyNodeProvingState, Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>, Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>, Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>, Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>, Self)> {
+        let deploy_contract_gatherer_result = contract_gatherer_result.deploy;
+        let update_contract_gatherer_result = contract_gatherer_result.update;
         let root_guta_job = guta_gatherer_result
             .job_ids
             .last()
@@ -134,9 +148,16 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
             .ok_or_else(|| anyhow::anyhow!("No Deploy Contract jobs found"))?
             .first()
             .ok_or_else(|| anyhow::anyhow!("No Deploy Contract jobs found at last level"))?.job_id.get_output_id();
+        let root_update_contract_job = update_contract_gatherer_result
+            .job_ids
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("No Update Contract jobs found"))?
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("No Update Contract jobs found at last level"))?.job_id.get_output_id();
         let total_guta_jobs = guta_gatherer_result.db_output.total_guta_proofs_generated.to_u64_value();//guta_gatherer_result.job_ids.iter().map(|level| level.len()).sum();
         let total_register_user_jobs = register_users_gatherer_result.db_output.total_jobs;//register_users_gatherer_result.job_ids.iter().map(|level| level.len()).sum();
         let total_deploy_contract_jobs = deploy_contract_gatherer_result.db_output.total_jobs;//deploy_contract_gatherer_result.job_ids.iter().map(|level| level.len()).sum();
+        let total_update_contract_jobs = update_contract_gatherer_result.db_output.total_jobs;
 
 
         let proving_state = PsyNodeProvingState::new_standard_coordinator(
@@ -174,22 +195,38 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
     let (deploy_contract_gatherer_result, deploy_contract_jobs) = {
         (deploy_contract_gatherer_result.db_output, deploy_contract_gatherer_result.job_ids)
     };
-        Ok((proving_state,guta_jobs, register_user_jobs, deploy_contract_jobs, Self {
+    let (update_contract_gatherer_result, update_contract_jobs) = {
+        (update_contract_gatherer_result.db_output, update_contract_gatherer_result.job_ids)
+    };
+        Ok((proving_state,guta_jobs, register_user_jobs, deploy_contract_jobs, update_contract_jobs, Self {
             total_guta_jobs: total_guta_jobs as usize,
             total_register_user_jobs: total_register_user_jobs as usize,
             total_deploy_contract_jobs: total_deploy_contract_jobs as usize,
+            total_update_contract_jobs: total_update_contract_jobs as usize,
             root_guta_job_id: root_guta_job.get_output_id(),
             root_register_user_job_id: root_register_user_job.get_output_id(),
             root_deploy_contract_job_id: root_deploy_contract_job.get_output_id(),
+            root_update_contract_job_id: root_update_contract_job.get_output_id(),
             agg_state_part_1_job_id,
             checkpoint_state_transition_job_id,
             last_checkpoint_state_transition_job_id,
             guta_gatherer_result: guta_gatherer_result,
             register_users_gatherer_result: register_users_gatherer_result,
             deploy_contract_gatherer_result: deploy_contract_gatherer_result,
+            update_contract_gatherer_result: update_contract_gatherer_result,
             agg_state_part_1_witness: None,
             append_checkpoint_tree_siblings: vec![],
         }))
+    }
+
+    /// The final global contract tree root after applying this block's deploys
+    /// and then its contract code updates.
+    pub fn final_contract_tree_root(&self) -> N::QHash {
+        if self.update_contract_gatherer_result.has_updates() {
+            self.update_contract_gatherer_result.end_global_contract_tree_root
+        } else {
+            self.deploy_contract_gatherer_result.end_global_contract_tree_root
+        }
     }
 
     pub fn get_part_1_header(
@@ -221,6 +258,13 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
                 state_transition_end: self.deploy_contract_gatherer_result.end_global_contract_tree_root,
                 total_proofs_generated: self.total_deploy_contract_jobs as u64,
             },
+            // the update transition starts where the deploy transition ended
+            // (for blocks without updates it is a no-op: start == end)
+            update_contracts_state_transition: AggStateTransitionWithStats {
+                state_transition_start: self.update_contract_gatherer_result.start_global_contract_tree_root,
+                state_transition_end: self.update_contract_gatherer_result.end_global_contract_tree_root,
+                total_proofs_generated: self.total_update_contract_jobs as u64,
+            },
             guta_proof_header,
         };
         witness
@@ -239,9 +283,14 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
                 expected_public_inputs_hash: witness.get_public_inputs_hash_no_rewards_tag::<N::HasherBase>(),
                 reward_tree_node_index: 0,
                 reward_tree_node_level: 1,
-                reward_tree_hash_mode: PROOF_REWARD_TREE_HASH_MODE_3_CHILDREN_DOUBLE_REWARD,
-                reward_tree_node_children: 3,
-                dependencies: vec![self.root_guta_job_id.get_output_id(), self.root_register_user_job_id.get_output_id(), self.root_deploy_contract_job_id.get_output_id()],
+                reward_tree_hash_mode: PROOF_REWARD_TREE_HASH_MODE_4_CHILDREN,
+                reward_tree_node_children: 4,
+                dependencies: vec![
+                    self.root_guta_job_id.get_output_id(),
+                    self.root_register_user_job_id.get_output_id(),
+                    self.root_deploy_contract_job_id.get_output_id(),
+                    self.root_update_contract_job_id.get_output_id(),
+                ],
             },
         };
 
@@ -269,7 +318,7 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
         //tracing::info!("last committed global_chain_root: {:?} ({})", last_committed.checkpoint_leaf.global_chain_root, hex::encode(&last_committed.checkpoint_leaf.global_chain_root.into_owned_32bytes()));
 
         let checkpoint_state_roots = PQEDCheckpointGlobalStateRoots {
-            contract_tree_root: self.deploy_contract_gatherer_result.end_global_contract_tree_root,
+            contract_tree_root: self.final_contract_tree_root(),
             deposit_tree_root: last_committed.checkpoint_state_roots.deposit_tree_root,
             user_tree_root: self.guta_gatherer_result.end_global_user_tree_root,
             withdrawal_tree_root: last_committed.checkpoint_state_roots.withdrawal_tree_root,
@@ -426,7 +475,7 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
         block_time: u64,
     ) -> anyhow::Result<PsyPreparedCoordinatorBlockStateUpdates<N::F, N::QHash>> {
         let checkpoint_state_roots = PQEDCheckpointGlobalStateRoots {
-            contract_tree_root: self.deploy_contract_gatherer_result.end_global_contract_tree_root,
+            contract_tree_root: self.final_contract_tree_root(),
             deposit_tree_root: last_committed.checkpoint_state_roots.deposit_tree_root,
             user_tree_root: self.guta_gatherer_result.end_global_user_tree_root,
             withdrawal_tree_root: last_committed.checkpoint_state_roots.withdrawal_tree_root,
@@ -497,10 +546,28 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
                 checkpoint_tree_root: new_checkpoint_tree_root,
             },
 
-            update_global_contract_tree_nodes_ffs: self.deploy_contract_gatherer_result.update_global_contract_tree_nodes_ffs,
-            update_contract_function_tree_nodes_ffs: self.deploy_contract_gatherer_result.update_contract_function_tree_nodes_ffs,
-            new_contract_leaves_ffs: self.deploy_contract_gatherer_result.new_contract_leaves_ffs,
-            new_contract_code_definitions: self.deploy_contract_gatherer_result.new_contract_code_definitions,
+            // NOTE on the contract tree change sets: the update gatherer
+            // finalizes on the same in-memory tree AFTER the deploy gatherer,
+            // so when updates exist its `update_global_contract_tree_nodes_ffs`
+            // is the union of the deploy and update changes (and must be used
+            // instead of the deploy-only change set)
+            update_global_contract_tree_nodes_ffs: if self.update_contract_gatherer_result.has_updates() {
+                self.update_contract_gatherer_result.update_global_contract_tree_nodes_ffs
+            } else {
+                self.deploy_contract_gatherer_result.update_global_contract_tree_nodes_ffs
+            },
+            update_contract_function_tree_nodes_ffs: [
+                self.deploy_contract_gatherer_result.update_contract_function_tree_nodes_ffs,
+                self.update_contract_gatherer_result.update_contract_function_tree_nodes_ffs,
+            ].concat(),
+            new_contract_leaves_ffs: [
+                self.deploy_contract_gatherer_result.new_contract_leaves_ffs,
+                self.update_contract_gatherer_result.updated_contract_leaves_ffs,
+            ].concat(),
+            new_contract_code_definitions: [
+                self.deploy_contract_gatherer_result.new_contract_code_definitions,
+                self.update_contract_gatherer_result.updated_contract_code_definitions,
+            ].concat(),
 
             update_global_user_tree_nodes_ffs: self.guta_gatherer_result.update_global_user_tree_nodes_ffs,
             new_realm_guta_reward_tree_node_keys_ffs: self.guta_gatherer_result.new_realm_guta_reward_tree_node_keys_ffs,

@@ -38,15 +38,38 @@ pub fn compute_agg_state_trackable_final_public_inputs<H:AlgebraicHasher<F>, F: 
 
 
 
+pub fn compute_agg_state_trackable_final_public_inputs_no_rewards_tag_leaf<
+    H: AlgebraicHasher<F>,
+    F: RichField + Extendable<D>,
+    const D: usize,
+>(
+    builder: &mut CircuitBuilder<F, D>,
+    allowed_circuit_hashes_root: HashOutTarget,
+    state_transition_hash: HashOutTarget,
+) -> HashOutTarget {
+    let total_proofs_generated = builder.one();
+
+    let allowed_and_state_transition_hash = builder.hash_two_to_one::<H>(
+        allowed_circuit_hashes_root,
+        state_transition_hash,
+    );
+    builder.hash_n_to_hash_no_pad::<H>(
+        vec![
+            allowed_and_state_transition_hash.elements[0],
+            allowed_and_state_transition_hash.elements[1],
+            allowed_and_state_transition_hash.elements[2],
+            allowed_and_state_transition_hash.elements[3],
+            total_proofs_generated,
+        ]
+    )
+}
+
 pub fn compute_agg_state_trackable_final_public_inputs_leaf<H:AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
     builder: &mut CircuitBuilder<F, D>,
     allowed_circuit_hashes_root: HashOutTarget,
     state_transition_hash: HashOutTarget,
     worker_reward_tag: HashOutTarget,
 ) -> HashOutTarget {
-
-
-    let total_proofs_generated = builder.one();
 
 
     let zero_hash = builder.constant_hash(HashOut::ZERO);
@@ -59,19 +82,50 @@ pub fn compute_agg_state_trackable_final_public_inputs_leaf<H:AlgebraicHasher<F>
         rewards_tree_value_combo,
         worker_reward_tag,
     );
-    
-    let allowed_and_state_transition_hash = builder.hash_two_to_one::<H>(
+
+    let public_inputs_without_reward_tag = compute_agg_state_trackable_final_public_inputs_no_rewards_tag_leaf::<H, F, D>(
+        builder,
         allowed_circuit_hashes_root,
         state_transition_hash,
     );
-    let public_inputs_without_reward_tag = builder.hash_n_to_hash_no_pad::<H>(
-        vec![
-            allowed_and_state_transition_hash.elements[0],
-            allowed_and_state_transition_hash.elements[1],
-            allowed_and_state_transition_hash.elements[2],
-            allowed_and_state_transition_hash.elements[3],
-            total_proofs_generated,
-        ]
-    );
     builder.hash_two_to_one::<H>(public_inputs_without_reward_tag, rewards_tree_final_new_value)
+}
+
+/// Variant of the leaf public input hash that additionally commits to the
+/// Merkle root of the updated contract ids. The agg circuit (`AggStateTransitionCircuitV2`)
+/// treats child public inputs as opaque hashes when verifying proofs, so its
+/// own public input formula remains unchanged; only the leaf circuit needs this
+/// extra commitment.
+pub fn compute_agg_state_trackable_final_public_inputs_leaf_with_contract_ids_root<
+    H: AlgebraicHasher<F>,
+    F: RichField + Extendable<D>,
+    const D: usize,
+>(
+    builder: &mut CircuitBuilder<F, D>,
+    allowed_circuit_hashes_root: HashOutTarget,
+    state_transition_hash: HashOutTarget,
+    worker_reward_tag: HashOutTarget,
+    contract_ids_root: HashOutTarget,
+) -> HashOutTarget {
+    let zero_hash = builder.constant_hash(HashOut::ZERO);
+
+    let rewards_tree_value_combo = builder.hash_two_to_one::<H>(
+        zero_hash,
+        zero_hash,
+    );
+    let rewards_tree_final_new_value = builder.hash_two_to_one::<H>(
+        rewards_tree_value_combo,
+        worker_reward_tag,
+    );
+
+    let public_inputs_without_reward_tag = compute_agg_state_trackable_final_public_inputs_no_rewards_tag_leaf::<H, F, D>(
+        builder,
+        allowed_circuit_hashes_root,
+        state_transition_hash,
+    );
+    let public_inputs_without_reward_tag_with_contract_ids_root = builder.hash_two_to_one::<H>(
+        public_inputs_without_reward_tag,
+        contract_ids_root,
+    );
+    builder.hash_two_to_one::<H>(public_inputs_without_reward_tag_with_contract_ids_root, rewards_tree_final_new_value)
 }

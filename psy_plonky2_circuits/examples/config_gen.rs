@@ -297,7 +297,7 @@ fn run_gen_config<N: QNetworkCircuitConstants>(default_user_state_tree_root: QHa
 
     gcv.register_circuit_triplet(
         ProvingJobCircuitType::BatchDeployContracts,
-        coordinator_circuits.batch_deploy_contracts.get_verifier_triplet(),
+        coordinator_circuits.state_layout_circuits.batch_deploy_contracts.get_verifier_triplet(),
     );
     gcv.register_circuit_triplet(
         ProvingJobCircuitType::BatchDeployContractsAggregate,

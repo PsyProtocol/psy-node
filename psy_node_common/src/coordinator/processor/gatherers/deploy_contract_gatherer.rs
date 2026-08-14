@@ -23,8 +23,7 @@ use psy_data::{
     protocol::circuit_inputs::deploy_contracts::QCBatchDeployContractsCircuitInput,
     rewards_tree::offsets::{DEPLOY_CONTRACTS_REWARDS_TREE_OFFSET_ROOT_INDEX, DEPLOY_CONTRACTS_REWARDS_TREE_OFFSET_ROOT_LEVEL},
     v1::qdata::{
-        contract::{ContractCodeDefinition, ContractCodeDefinitionWithContractId, PQEDContractLeaf, PsyDeployContractQueueItem},
-        ffs_sizes::PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF,
+        contract::{ContractCodeDefinition, ContractCodeDefinitionWithContractId, PQEDContractLeafV2, PsyDeployContractQueueItemV2, CONTRACT_LEAF_SERIALIZED_SIZE},
     },
     worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId,
 };
@@ -41,8 +40,8 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use crate::{
     coordinator::processor::processor_shared_status::PsyCoordinatorProcessorSharedStatus, queue::gatherer_builder::QueueGathererItemBuilderWithTree,
 };
-pub const DEPLOY_CONTRACT_GATHERER_BACKUP_V1_MAGIC_BYTES: [u8; 4] = [0x44, 0x43, 0x42, 0x31]; // 'DCB1' in ASCII
-pub const DEPLOY_CONTRACT_GATHERER_BACKUP_V1_MAGIC_U32: u32 = 0x31424344; // 'DCB1' in little-endian u32
+pub const DEPLOY_CONTRACT_GATHERER_BACKUP_MAGIC_BYTES: [u8; 4] = [0x44, 0x43, 0x42, 0x31];
+pub const DEPLOY_CONTRACT_GATHERER_BACKUP_MAGIC_U32: u32 = 0x31424344;
 
 pub const MAX_DEPLOY_CONTRACTS_GATHERER_PER_BLOCK: usize = 2097152;
 pub const DEPLOY_CONTRACT_GATHERER_MAX_CONTRACT_CODE_DEFINITION_LENGTH: usize = 10 * 1024 * 1024; // 10 MB
@@ -81,10 +80,10 @@ pub async fn read_deploy_contract_gatherer_backup_file_path<
         return Err(anyhow::anyhow!("Backup file too small to be valid: {} bytes", metadata.len()));
     }
     let magic = file.read_u32_le().await?;
-    if magic != DEPLOY_CONTRACT_GATHERER_BACKUP_V1_MAGIC_U32 {
+    if magic != DEPLOY_CONTRACT_GATHERER_BACKUP_MAGIC_U32 {
         return Err(anyhow::anyhow!(
             "Backup file magic number mismatch: expected {:x}, got {:x}",
-            DEPLOY_CONTRACT_GATHERER_BACKUP_V1_MAGIC_U32,
+            DEPLOY_CONTRACT_GATHERER_BACKUP_MAGIC_U32,
             magic
         ));
     }
@@ -121,16 +120,16 @@ pub async fn read_deploy_contract_gatherer_backup_file_path<
     let mut update_contract_function_tree_nodes_ffs = Vec::<u8>::new();
     //let mut contract_function_leaves =
     // Vec::<Vec::<Hash>>::with_capacity(num_new_contracts);
-    let mut new_contract_leaves_ffs = Vec::<u8>::with_capacity((num_new_contracts) * (PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF + 8));
+    let mut new_contract_leaves_ffs = Vec::<u8>::with_capacity((num_new_contracts) * (CONTRACT_LEAF_SERIALIZED_SIZE + 8));
     let mut new_contract_code_definitions = Vec::<ContractCodeDefinitionWithContractId>::with_capacity(num_new_contracts as usize);
-    let mut contract_leaf_bytes: [u8; PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF] = [0u8; PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF];
+    let mut contract_leaf_bytes: [u8; CONTRACT_LEAF_SERIALIZED_SIZE] = [0u8; CONTRACT_LEAF_SERIALIZED_SIZE];
 
     for i in 0..num_new_contracts {
         let contract_id = start_next_contract_id + (i as u64);
 
         // contract leaf data
         file.read_exact(&mut contract_leaf_bytes[..]).await?;
-        let leaf: PQEDContractLeaf<F, Hash> = PQEDContractLeaf::<F, Hash>::pio_read_from_io(&mut &contract_leaf_bytes[..])?;
+        let leaf: PQEDContractLeafV2<F, Hash> = PQEDContractLeafV2::<F, Hash>::pio_read_from_io(&mut &contract_leaf_bytes[..])?;
         let leaf_hash = leaf.qfhash::<Hasher>();
         tree.set_leaf(contract_id, leaf_hash);
         new_contract_leaves_ffs.extend_from_slice(&contract_id.to_le_bytes());
@@ -210,7 +209,11 @@ pub async fn read_deploy_contract_gatherer_backup_file_path<
         node.pio_write_to_io(&mut update_global_contract_tree_nodes_ffs)?;
     }
     let total_jobs = file.read_u64_le().await?;
-    tree.commit_changes();
+    // Do not commit here: the update contract gatherer (when present) runs on
+    // the same in-memory tree and its backup recovery relies on seeing the
+    // deploy changes as part of tree.get_changes() so that its
+    // update_global_contract_tree_nodes_ffs is the union of deploy + update
+    // changes, matching normal operation.
 
     let output_db = DeployContractGathererOutputDatabase {
         start_next_contract_id,
@@ -303,7 +306,8 @@ pub struct DeployContractGatherer<
     pub shared_status: PsyCoordinatorProcessorSharedStatus<N::F, N::QHash>,
     pub pending_core_proc_id: QCoreProcCheckpointUniqueId,
     pub new_contract_leaves_ffs: Vec<u8>,
-    pub new_contract_leaves: Vec<PQEDContractLeaf<N::F, N::QHash>>,
+    pub new_contract_leaves: Vec<PQEDContractLeafV2<N::F, N::QHash>>,
+    pub new_contract_layout_proofs: Vec<Vec<u8>>,
     pub update_contract_function_tree_nodes_ffs: Vec<u8>,
     pub new_contract_code_definitions: Vec<ContractCodeDefinitionWithContractId>,
 
@@ -320,6 +324,7 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
     pub fn reset_for_revert(&mut self) -> anyhow::Result<()> {
         self.new_contract_leaves_ffs.clear();
         self.new_contract_leaves.clear();
+        self.new_contract_layout_proofs.clear();
         self.update_contract_function_tree_nodes_ffs.clear();
         self.new_contract_code_definitions.clear();
         self.new_global_contract_tree_leaves.clear();
@@ -381,7 +386,7 @@ impl<
                 ));
             }
         }
-        new_contracts_file.write_u32_le(DEPLOY_CONTRACT_GATHERER_BACKUP_V1_MAGIC_U32).await?;
+        new_contracts_file.write_u32_le(DEPLOY_CONTRACT_GATHERER_BACKUP_MAGIC_U32).await?;
         new_contracts_file.write_u64_le(start_next_contract_id).await?;
         new_contracts_file.write_all(&tree.get_root().into_owned_32bytes()).await?;
         new_contracts_file.write_u32_le(0).await?; // placeholder for num new contracts
@@ -392,6 +397,7 @@ impl<
             shared_status,
             pending_core_proc_id: unique_id,
             new_contract_leaves: Vec::new(),
+            new_contract_layout_proofs: Vec::new(),
             new_contract_leaves_ffs: Vec::new(),
             update_contract_function_tree_nodes_ffs: Vec::new(),
             new_contract_code_definitions: Vec::new(),
@@ -409,22 +415,22 @@ impl<
     ) -> anyhow::Result<()> {
                 println!("update_from_queue_item_with_tree with unique_pending_id: {}, proc_id: {}", self.unique_pending_id, self.pending_core_proc_id);
 
-        if item.len() < PQEDContractLeaf::<N::F, N::QHash>::FIXED_SIZE + 16 + 4 + 32 {
+        if item.len() < PQEDContractLeafV2::<N::F, N::QHash>::FIXED_SIZE + 16 + 4 + 32 {
             // min size for a deploy with one leaf
             // added sanity check
             return Err(anyhow::anyhow!(
                 "Invalid queue item size for DeployContractGatherer: expected at least {}, got {}",
-                PQEDContractLeaf::<N::F, N::QHash>::FIXED_SIZE + 16 + 4 + 32,
+                PQEDContractLeafV2::<N::F, N::QHash>::FIXED_SIZE + 16 + 4 + 32,
                 item.len()
             ));
         }
         let read_item = &mut &item[..];
-        let deploy_contract_item: PsyDeployContractQueueItem<N::F, N::QHash> =
-            PsyDeployContractQueueItem::<N::F, N::QHash>::pio_read_from_io(read_item)?;
+        let deploy_contract_item: PsyDeployContractQueueItemV2<N::F, N::QHash> =
+            PsyDeployContractQueueItemV2::<N::F, N::QHash>::pio_read_from_io(read_item)?;
         let contract_id = self.next_contract_id;
 
         let leaf_hash = deploy_contract_item.contract_leaf.qfhash::<N::HasherBase>();
-        let contract_leaf_data_bytes = deploy_contract_item.contract_leaf.ffs_to_bytes();
+        let contract_leaf_data_bytes = deploy_contract_item.contract_leaf.psy_ser_to_bytes_vec()?;
 
         let realm_identifier = self.config.get_realm_identifier();
         let unique_pending_id = self.unique_pending_id;
@@ -482,6 +488,8 @@ impl<
 
         // START: update in-memory state
         self.new_contract_leaves.push(deploy_contract_item.contract_leaf);
+        self.new_contract_layout_proofs
+            .push(deploy_contract_item.canonical_layout_proof);
         self.new_contract_leaves_ffs.extend_from_slice(&contract_id.to_le_bytes());
         self.new_contract_leaves_ffs.extend_from_slice(&contract_leaf_data_bytes);
         self.new_global_contract_tree_leaves.push(leaf_hash);
@@ -539,6 +547,14 @@ impl<
         //self.new_contracts_file.flush().await?;
 
         let total_new_contracts = self.new_global_contract_tree_leaves.len() as u32;
+        // `shared_status.block_state.next_contract_id` is the last committed
+        // checkpoint and can lag behind `last_job_next_contract_id` while a
+        // previous block is still being committed. Derive this batch's start
+        // from the cursor that was actually used to assign the gathered IDs.
+        let start_next_contract_id = self
+            .next_contract_id
+            .checked_sub(total_new_contracts as u64)
+            .ok_or_else(|| anyhow::anyhow!("deploy contract id cursor underflow"))?;
       
         let start_state_root = tree.get_root();
 
@@ -551,29 +567,94 @@ impl<
         let deploy_contract_circuit_inputs = if self.new_global_contract_tree_leaves.len() == 0 {
             vec![]
         } else {
+            let append_contract_id = start_next_contract_id;
+            let appended_contract_ids =
+                (append_contract_id
+                    ..append_contract_id
+                        + self.new_global_contract_tree_leaves.len()
+                            as u64)
+                    .collect::<Vec<_>>();
+            for contract_id in &appended_contract_ids {
+                anyhow::ensure!(
+                    tree.get_leaf_value(*contract_id)
+                        == N::HasherBase::get_zero_hash(0),
+                    "deploy contract id {} is already occupied",
+                    contract_id,
+                );
+            }
+            // Proof generation mutates the recorder. Keep the coordinator's
+            // live tree unchanged unless every generated proof validates.
+            let mut candidate_tree = tree.clone();
             let spider_map_proofs =
-                tree.append_leaves_spider_man(N::BATCH_DEPLOY_CONTRACT_SUB_TREE_HEIGHT as u8, &self.new_global_contract_tree_leaves)?;
-            // NOTE: I made a change in the DeployContractCircuit so we don't have to
-            // provide the old contract leaves in the append proof, can just make them
-            // anything
-            let dummy_leaf = self.new_contract_leaves[0].clone();
-
+                candidate_tree.update_leaves_spider_man(
+                    N::BATCH_CONTRACT_SUB_TREE_HEIGHT as u8,
+                    &appended_contract_ids,
+                    &self.new_global_contract_tree_leaves,
+                )?;
+            let proof_batch_count = spider_map_proofs.len();
             let mut inputs = Vec::with_capacity(spider_map_proofs.len());
             let mut contract_leaf_data_ind = 0;
-            for proof in spider_map_proofs {
+            println!(
+                "BatchDeployContracts gatherer planning: pending_id={}, new_contracts={}, subtree_height={}, proof_batches={}, start_contract_id={}",
+                pending_unique_id,
+                self.new_global_contract_tree_leaves.len(),
+                N::BATCH_CONTRACT_SUB_TREE_HEIGHT,
+                proof_batch_count,
+                start_next_contract_id,
+            );
+            for (batch_index, proof) in spider_map_proofs.into_iter().enumerate() {
+                anyhow::ensure!(
+                    proof.verify::<N::HasherBase>(),
+                    "gatherer produced an invalid contract-tree Spiderman deploy proof at contract id {} batch {}",
+                    append_contract_id,
+                    batch_index,
+                );
                 let leaf_count = proof.get_modified_leaves_count();
-                let prepend_leaves = (0..proof.get_existing_prepended_leaves_count_including_non_zero())
-                    .map(|_| dummy_leaf.clone())
-                    .collect::<Vec<_>>();
-                let new_contract_leaves = self.new_contract_leaves[contract_leaf_data_ind..(contract_leaf_data_ind + leaf_count)].to_vec();
-                let contract_leaves = [prepend_leaves, new_contract_leaves].concat();
+                let contract_leaves = self.new_contract_leaves
+                    [contract_leaf_data_ind..(contract_leaf_data_ind + leaf_count)]
+                    .to_vec();
+                let initial_layout_proofs = self.new_contract_layout_proofs
+                    [contract_leaf_data_ind..(contract_leaf_data_ind + leaf_count)]
+                    .to_vec();
+                let contract_ids =
+                    (start_next_contract_id
+                        + contract_leaf_data_ind as u64
+                        ..start_next_contract_id
+                            + (contract_leaf_data_ind + leaf_count) as u64)
+                        .collect::<Vec<_>>();
+                println!(
+                    "BatchDeployContracts gatherer batch {}/{}: leaf_count={}, data_offset={}, ids={:?}, leaves_len={}, layout_proofs_len={}, layout_proof_bytes={:?}, spiderman_old_leaves_len={}, spiderman_new_leaves_len={}, top_line_index={}",
+                    batch_index + 1,
+                    proof_batch_count,
+                    leaf_count,
+                    contract_leaf_data_ind,
+                    contract_ids,
+                    contract_leaves.len(),
+                    initial_layout_proofs.len(),
+                    initial_layout_proofs
+                        .iter()
+                        .map(|layout_proof| layout_proof.len())
+                        .collect::<Vec<_>>(),
+                    proof.web_proof_old_leaves.len(),
+                    proof.web_proof_new_leaves.len(),
+                    proof.top_line_proof.index,
+                );
                 contract_leaf_data_ind += leaf_count;
                 inputs.push(QCBatchDeployContractsCircuitInput {
                     deploy_contract_circuit_whitelist: self.config.deploy_contract_circuit_whitelist,
                     spiderman_append_proof: proof,
+                    contract_ids,
                     contract_leaves,
+                    initial_layout_proofs,
                 });
             }
+            println!(
+                "BatchDeployContracts gatherer planning completed: inputs={}, consumed_contracts={}, expected_contracts={}",
+                inputs.len(),
+                contract_leaf_data_ind,
+                self.new_global_contract_tree_leaves.len(),
+            );
+            *tree = candidate_tree;
             inputs
         };
         let (jobs_for_queue, job_temp_data) = plan_jobs_for_tree_agg_offset_root::<
@@ -609,7 +690,6 @@ impl<
             .set_tdb_proof_witnesses_tuple_owned_raw(&realm_identifier, pending_unique_id, job_temp_data)
             .await?;
 
-        let start_next_contract_id = self.shared_status.block_state.next_contract_id as u64;
         let output_database = DeployContractGathererOutputDatabase {
             start_next_contract_id,
             start_global_contract_tree_root: start_state_root,

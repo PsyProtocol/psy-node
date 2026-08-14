@@ -25,10 +25,13 @@ pub fn get_psy_node_circuit_config_for_local_devnet() -> anyhow::Result<PsyNodeC
     let append_user_registration_tree_fingerprint = lib.get_fingerprint(ProvingJobCircuitType::AppendUserRegistrationTree)?;
     let batch_deploy_contracts_fingerprint = lib.get_fingerprint(ProvingJobCircuitType::BatchDeployContracts)?;
     let agg_state_transition_fingerprint = lib.get_fingerprint(ProvingJobCircuitType::BatchDeployContractsAggregate)?;
+    let batch_update_contracts_fingerprint = lib.get_fingerprint(ProvingJobCircuitType::BatchUpdateContracts)?;
 
     let register_users_circuit_whitelist_root = Hasher::two_to_one(&append_user_registration_tree_fingerprint, &agg_state_transition_fingerprint);
 
     let deploy_contracts_circuit_whitelist_root = Hasher::two_to_one(&batch_deploy_contracts_fingerprint, &agg_state_transition_fingerprint);
+
+    let update_contracts_circuit_whitelist_root = Hasher::two_to_one(&batch_update_contracts_fingerprint, &agg_state_transition_fingerprint);
 
     let checkpoint_state_transition_circuit_fingerprint = lib.get_fingerprint(ProvingJobCircuitType::GenerateRollupStateTransitionProof)?;
     let genesis_checkpoint_state_transition_fingerprint = lib.get_fingerprint(ProvingJobCircuitType::GenesisBlockCheckpointStateTransition)?;
@@ -37,6 +40,7 @@ pub fn get_psy_node_circuit_config_for_local_devnet() -> anyhow::Result<PsyNodeC
         guta_circuit_whitelist_root,
         register_users_circuit_whitelist_root,
         deploy_contracts_circuit_whitelist_root,
+        update_contracts_circuit_whitelist_root,
         checkpoint_state_transition_circuit_fingerprint,
         genesis_checkpoint_state_transition_fingerprint,
     })

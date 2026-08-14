@@ -25,18 +25,10 @@ use parth_core::{
     QCoreProcCheckpointUniqueId,
 };
 use psy_data::{
-    protocol::verifiable_checkpoint_transition::PsyVerifiableCheckpointTransitionWithProof,
-    v1::qdata::{
-        checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
-        checkpoint_sync::PQEDCheckpointSyncInfo,
-        contract::{
-            deserialize_imt_leaf_ffs_entry_v2, encode_imt_key_for_sorting, imt_key_bucket, imt_key_bucket_to_i16, ContractCodeDefinition,
-            ContractCodeDefinitionWithContractId, IMTContractStateLeaf, PQEDContractLeaf,
-            IMT_LEAF_FFS_ENTRY_SIZE_V2,
-        },
-        ffs_sizes::{PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF, PSY_OBJECT_FFS_SIZE_USER_LEAF, PSY_OBJECT_FFS_SIZE_ZK_PUBLIC_KEY},
-        public_key::PZKPublicKeyInfo,
-        user::PQEDUserLeaf,
+    protocol::verifiable_checkpoint_transition::PsyVerifiableCheckpointTransitionWithProof, v1::qdata::{
+        checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState}, checkpoint_sync::PQEDCheckpointSyncInfo, contract::{
+            CONTRACT_LEAF_SERIALIZED_SIZE, ContractCodeDefinition, ContractCodeDefinitionWithContractId, IMT_LEAF_FFS_ENTRY_SIZE_V2, IMTContractStateLeaf, PQEDContractLeafV2, deserialize_imt_leaf_ffs_entry_v2, encode_imt_key_for_sorting, imt_key_bucket, imt_key_bucket_to_i16,
+        }, ffs_sizes::{PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF, PSY_OBJECT_FFS_SIZE_USER_LEAF, PSY_OBJECT_FFS_SIZE_ZK_PUBLIC_KEY}, public_key::PZKPublicKeyInfo, user::PQEDUserLeaf,
     },
 };
 
@@ -2927,9 +2919,15 @@ impl<
         S,
     >
 {
-    async fn get_contract_leaf(&self, checkpoint_id: u64, contract_id: u64) -> anyhow::Result<PQEDContractLeaf<N::F, N::QHash>> {
+    async fn get_contract_leaf(
+        &self,
+        checkpoint_id: u64,
+        contract_id: u64,
+    ) -> anyhow::Result<PQEDContractLeafV2<N::F, N::QHash>> {
         self.store
-            .db_select_one_single_checkpointed_object_value::<PQEDContractLeaf<N::F, N::QHash>>(&self.contract_leaf_table, contract_id, checkpoint_id)
+            .db_select_one_single_checkpointed_object_value::<
+                PQEDContractLeafV2<N::F, N::QHash>,
+            >(&self.contract_leaf_table, contract_id, checkpoint_id)
             .await?
             .ok_or_else(|| {
                 anyhow::anyhow!(
@@ -3017,17 +3015,34 @@ impl<
         S,
     >
 {
-    async fn set_contract_leaf(&self, checkpoint_id: u64, contract_id: u64, leaf: &PQEDContractLeaf<N::F, N::QHash>) -> anyhow::Result<()> {
+    async fn set_contract_leaf(
+        &self,
+        checkpoint_id: u64,
+        contract_id: u64,
+        leaf: &PQEDContractLeafV2<N::F, N::QHash>,
+    ) -> anyhow::Result<()> {
         self.store
-            .db_insert_one_single_checkpointed_object(&self.contract_leaf_table, contract_id, checkpoint_id, leaf)
+            .db_insert_one_single_checkpointed_object(
+                &self.contract_leaf_table,
+                contract_id,
+                checkpoint_id,
+                leaf,
+            )
             .await
     }
 
     async fn set_contract_leaves_ffs(&self, checkpoint_id: u64, data: &[u8]) -> anyhow::Result<()> {
+        const CONTRACT_RECORD_SIZE: usize = 8 + CONTRACT_LEAF_SERIALIZED_SIZE;
+        anyhow::ensure!(
+            data.len() % CONTRACT_RECORD_SIZE == 0,
+            "invalid contract leaf bulk data length: expected a multiple of {}, got {}",
+            CONTRACT_RECORD_SIZE,
+            data.len()
+        );
         self.store
             .db_insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_start(
                 &self.contract_leaf_table,
-                PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF,
+                CONTRACT_LEAF_SERIALIZED_SIZE,
                 checkpoint_id,
                 data,
             )

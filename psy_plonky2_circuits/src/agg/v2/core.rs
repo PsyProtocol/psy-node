@@ -18,7 +18,7 @@ use plonky2::{
 };
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_data::{agg::{AggStateTransitionInput, AggStateTransitionInputV2, AggStateWitnessV2}, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse};
-use psy_plonky2_basic_helpers::{builder::{hash::core::CircuitBuilderHashCore, pad_circuit::CircuitBuilderQEDCommonGates, verify::CircuitBuilderVerifyProofHelpers}, verifier::circuit_library::CircuitInfoLibrary};
+use psy_plonky2_basic_helpers::{builder::{hash::core::CircuitBuilderHashCore, pad_circuit::{pad_circuit_degree, CircuitBuilderQEDCommonGates}, verify::CircuitBuilderVerifyProofHelpers}, verifier::circuit_library::CircuitInfoLibrary};
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
 use crate::{agg::{ common::compute_agg_state_trackable_final_public_inputs}, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibrary}, utils::proof_serialization::deserialize_plonky2_proof};
@@ -139,6 +139,11 @@ impl AggStateTrackableCircuitHeaderGadgetV2 {
         let worker_reward_tag = builder.add_virtual_hash();
 
 
+        // NOTE: this circuit only verifies the child proofs and recomputes the
+        // aggregate public input from the state transition; it does not
+        // constrain the child proofs' public input contents. Leaf circuits can
+        // therefore include extra commitments (e.g. the batch update contracts
+        // `contract_ids_root`) without changing the agg public input formula.
         let expected_left_public_inputs_hash = compute_agg_state_trackable_final_public_inputs::<H, F, D>(
             builder,
             state_transition_gadget.allowed_circuit_hashes_root,
@@ -288,6 +293,7 @@ where
 
         builder.register_public_inputs(&header_gadget.new_public_inputs_hash.elements);
         builder.add_qed_type_d_common_gates();
+        pad_circuit_degree(&mut builder, 12);
         let circuit_data = builder.build::<C>();
 
         let fingerprint = QHashOut(get_circuit_fingerprint_generic(&circuit_data.verifier_only));

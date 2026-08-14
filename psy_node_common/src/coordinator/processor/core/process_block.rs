@@ -82,14 +82,13 @@ use psy_data::{
     node::node_proving_state::PsyNodeProvingState,
     prepared_block::coordinator::PsyPreparedCoordinatorBlockStateUpdates,
     proof_input::genesis::PsyCheckpointStateTransitionGenesisCircuitInput,
-    v1::qdata::{contract::PsyDeployContractQueueItem, public_key::PZKPublicKeyInfo},
+    v1::qdata::{contract::{PsyDeployContractQueueItemV2, PsyUpdateContractQueueItem}, public_key::PZKPublicKeyInfo},
     worker::{
         metadata::{PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN, PsyProvingJobMetadata},
         metadata_with_job_id::PsyProvingJobMetadataWithJobId,
     },
 };
 use psy_io::tokio::TokioLikeFileSystem;
-use tokio::time::{sleep, Duration, Instant};
 use psy_node_core::{
     psy_core_db::traits::full::{PsyCoordinatorProcessorStore, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter},
     psy_temp_db::StandardProcessorTempDBStoreBase,
@@ -100,6 +99,7 @@ use psy_node_core::{
     store::traits::proof_store::QParthProofStore,
 };
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
+use tokio::time::{sleep, Duration, Instant};
 
 use crate::{
     backup::output::coordinator_output_builder::CoordinatorOutputBuilder,
@@ -110,6 +110,7 @@ use crate::{
             CoordinatorSubmitRealmGUTAUpdateQueueKey,
             CoordinatorRegisterUserPublicKeyQueueKey,
             CoordinatorDeployContractQueueKey,
+            CoordinatorUpdateContractQueueKey,
         },
     },
 };
@@ -165,7 +166,8 @@ impl<
         guta_jobs: &[Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>],
         register_user_jobs: &[Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>],
         deploy_contract_jobs: &[Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>],
-    ) -> anyhow::Result<Option<(QProvingJobDataID, QProvingJobDataID, QProvingJobDataID)>> {
+        update_contract_jobs: &[Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>],
+    ) -> anyhow::Result<Option<(QProvingJobDataID, QProvingJobDataID, QProvingJobDataID, QProvingJobDataID)>> {
         let guta_root_job = guta_jobs
             .last()
             .ok_or_else(|| anyhow::anyhow!("No GUTA jobs found"))?
@@ -181,18 +183,25 @@ impl<
             .ok_or_else(|| anyhow::anyhow!("No Deploy Contract jobs found"))?
             .first()
             .ok_or_else(|| anyhow::anyhow!("No Deploy Contract jobs found at last level"))?;
+        let update_contract_root_job = update_contract_jobs
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("No Update Contract jobs found"))?
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("No Update Contract jobs found at last level"))?;
 
         if guta_root_job.job_id.circuit_type == ProvingJobCircuitType::GUTANoChange
             && register_user_root_job.job_id.circuit_type == ProvingJobCircuitType::DummyAppendUserRegistrationTreeAggregate
             && deploy_contract_root_job.job_id.circuit_type == ProvingJobCircuitType::DummyBatchDeployContractsAggregate
+            && update_contract_root_job.job_id.circuit_type == ProvingJobCircuitType::DummyBatchUpdateContractsAggregate
         {
-            tracing::info!("No changes detected in GUTA, Register User, and Deploy Contract jobs.");
+            tracing::info!("No changes detected in GUTA, Register User, Deploy Contract, and Update Contract jobs.");
             return Ok(None);
         }
         Ok(Some((
             guta_root_job.job_id,
             register_user_root_job.job_id,
             deploy_contract_root_job.job_id,
+            update_contract_root_job.job_id,
         )))
     }
 
@@ -202,6 +211,7 @@ impl<
         guta_jobs: &[Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>],
         register_user_jobs: &[Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>],
         deploy_contract_jobs: &[Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>],
+        update_contract_jobs: &[Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>],
         min_level: Option<usize>,
         max_level: Option<usize>,
         wait_for_jobs_completion: bool,
@@ -211,6 +221,7 @@ impl<
             .len()
             .max(register_user_jobs.len())
             .max(deploy_contract_jobs.len())
+            .max(update_contract_jobs.len())
             .min(max_level.unwrap_or(usize::MAX));
         let min_level = min_level.unwrap_or(0).min(max_level);
 
@@ -221,6 +232,7 @@ impl<
                 self.publish_worker_jobs_if_exists(&queue_key, i, guta_jobs),
                 self.publish_worker_jobs_if_exists(&queue_key, i, register_user_jobs),
                 self.publish_worker_jobs_if_exists(&queue_key, i, deploy_contract_jobs),
+                self.publish_worker_jobs_if_exists(&queue_key, i, update_contract_jobs),
             )?;
             if wait_for_jobs_completion {
                 self.db
@@ -234,9 +246,61 @@ impl<
                         self.proof_worker_queue_max_time_ms,
                     )
                     .await?;
+                self.wait_for_level_proofs(
+                    i,
+                    [guta_jobs, register_user_jobs, deploy_contract_jobs, update_contract_jobs],
+                )
+                .await?;
             }
         }
         Ok(())
+    }
+
+    async fn wait_for_level_proofs(
+        &self,
+        level: usize,
+        job_groups: [&[Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>]; 4],
+    ) -> anyhow::Result<()> {
+        let jobs = job_groups
+            .into_iter()
+            .filter_map(|levels| levels.get(level))
+            .flatten()
+            .collect::<Vec<_>>();
+        if jobs.is_empty() {
+            return Ok(());
+        }
+
+        let started = Instant::now();
+        loop {
+            let mut missing = Vec::new();
+            for job in &jobs {
+                if self
+                    .db
+                    .proof_store
+                    .get_proof_bytes_by_job_id(
+                        job.job_id.get_output_id(),
+                        self.db.ids.unique_pending_id,
+                    )
+                    .await?
+                    .is_none()
+                {
+                    missing.push(job.job_id);
+                }
+            }
+            if missing.is_empty() {
+                return Ok(());
+            }
+
+            if self.proof_worker_queue_max_time_ms != u64::MAX
+                && started.elapsed()
+                    >= Duration::from_millis(self.proof_worker_queue_max_time_ms)
+            {
+                anyhow::bail!(
+                    "timed out waiting for level {level} proofs to become readable: {missing:?}"
+                );
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
     }
 
     pub async fn wait_for_jobs_completion(&self) -> anyhow::Result<()> {
@@ -317,6 +381,7 @@ impl<
         Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>,
         Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>,
         Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>,
+        Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>,
         CoordinatorOutputBuilder<N>
     )> {
         if self.db.ids.gathering_proc_checkpoint_unique_id == self.db.ids.proc_checkpoint_unique_id || self.db.ids.gathering_unique_pending_id == self.db.ids.unique_pending_id {
@@ -346,7 +411,11 @@ impl<
                 };
                 let deploy_processing_key = CoordinatorDeployContractQueueKey {
                     realm_id, realm_sub_id, unique_id, task_group: 0,
-                    queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<PsyDeployContractQueueItem<N::F, N::QHash>>,
+                    queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<PsyDeployContractQueueItemV2<N::F, N::QHash>>,
+                };
+                let update_processing_key = CoordinatorUpdateContractQueueKey {
+                    realm_id, realm_sub_id, unique_id, task_group: 0,
+                    queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<PsyUpdateContractQueueItem<N::F, N::QHash>>,
                 };
                 let proof_processing_key = CoordinatorProvingWorkQueueKey {
                     realm_id, realm_sub_id, unique_id, task_group: 0,
@@ -357,6 +426,7 @@ impl<
                 self.db.guta_update_queue.ensure_consumer(&guta_processing_key, realm_id, realm_sub_id, unique_id, 0).await?;
                 self.db.register_user_queue.ensure_consumer(&user_reg_processing_key, realm_id, realm_sub_id, unique_id, 0).await?;
                 self.db.deploy_contract_queue.ensure_consumer(&deploy_processing_key, realm_id, realm_sub_id, unique_id, 0).await?;
+                self.db.deploy_contract_queue.ensure_consumer(&update_processing_key, realm_id, realm_sub_id, unique_id, 0).await?;
                 self.db.proof_work_queue.ensure_consumer(&proof_processing_key, realm_id, realm_sub_id, unique_id, 0).await?;
 
                 self.db.set_new_unique_ids().await?;
@@ -393,7 +463,7 @@ impl<
         if self.db.needs_revert {
             self.db.needs_revert = false;
         }
-        let (guta_result, register_users_result, deploy_contract_result) = tokio::try_join!(
+        let (guta_result, register_users_result, contract_gatherer_result) = tokio::try_join!(
             self.guta_queue_gatherer
                 .finalize_gathering_and_update_queue_key(self.db.ids.gathering_proc_checkpoint_unique_id),
             self.register_user_queue_gatherer
@@ -402,13 +472,13 @@ impl<
                 .finalize_gathering_and_update_queue_key(self.db.ids.gathering_proc_checkpoint_unique_id),
         )?;
 
-        let (proving_state, guta_jobs, register_user_jobs, deploy_contract_jobs, output_builder) = CoordinatorOutputBuilder::new(
+        let (proving_state, guta_jobs, register_user_jobs, deploy_contract_jobs, update_contract_jobs, output_builder) = CoordinatorOutputBuilder::new(
             &self.db.ids,
             guta_result,
             register_users_result,
-            deploy_contract_result,
+            contract_gatherer_result,
         )?;
-        Ok((proving_state, guta_jobs, register_user_jobs, deploy_contract_jobs, output_builder))
+        Ok((proving_state, guta_jobs, register_user_jobs, deploy_contract_jobs, update_contract_jobs, output_builder))
     }
     pub async fn plan_agg_guta_register_users_deploy_contracts_job(
         &self,
@@ -500,7 +570,7 @@ impl<
     pub async fn process_block(&mut self) -> anyhow::Result<()> {
         let mut timer = TraceTimer::new("process_block");
         tracing::info!("Starting to process new coordinator block with checkpoint_id = {}...", self.db.ids.next_checkpoint_id);
-        let (mut proving_state, guta_jobs, register_user_jobs, deploy_contract_jobs, mut output_builder) = self.get_results_from_gatherers().await?;
+        let (mut proving_state, guta_jobs, register_user_jobs, deploy_contract_jobs, update_contract_jobs, mut output_builder) = self.get_results_from_gatherers().await?;
         let worker_queue_key_for_cleanup = self.db.get_proof_worker_queue_key();
         let worker_unique_id_for_cleanup = self.db.ids.proc_checkpoint_unique_id;
 
@@ -509,6 +579,7 @@ impl<
             &guta_jobs,
             &register_user_jobs,
             &deploy_contract_jobs,
+            &update_contract_jobs,
         )?;
         timer.lap("get_root_job_ids");
         if self.db.ids.next_checkpoint_id > 1 && has_jobs.is_none() {
@@ -522,6 +593,7 @@ impl<
             &guta_jobs,
             &register_user_jobs,
             &deploy_contract_jobs,
+            &update_contract_jobs,
             Some(0),
             Some(1),
             false,
@@ -548,6 +620,7 @@ impl<
             &guta_jobs,
             &register_user_jobs,
             &deploy_contract_jobs,
+            &update_contract_jobs,
             Some(1),
             None,
             true,

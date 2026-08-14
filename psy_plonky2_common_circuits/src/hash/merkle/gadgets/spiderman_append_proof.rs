@@ -69,6 +69,34 @@ impl SpidermanAppendProofGadget {
         }
     }
 
+    // overwrite variant: allows updating leaves at arbitrary positions; any
+    // changed position must have a non-zero old leaf. See
+    // FullMerkleTreeAppendGadget::add_virtual_to_allow_overwrite.
+    pub fn add_virtual_to_allow_overwrite<H:AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
+        builder: &mut CircuitBuilder<F, D>,
+        top_line_height: usize,
+        web_tree_height: usize,
+    ) -> Self {
+
+        let top_line_proof = DeltaMerkleProofGadget::add_virtual_to::<H, F, D>(builder, top_line_height);
+        let web_proof = FullMerkleTreeAppendGadget::add_virtual_to_allow_overwrite::<H, F, D>(builder, web_tree_height);
+
+        // connect the node at the bottom of the top line to the root of the subtree
+        builder.connect_hashes(top_line_proof.old_value, web_proof.old_root);
+        builder.connect_hashes(top_line_proof.new_value, web_proof.new_root);
+
+
+        let old_root = top_line_proof.old_root;
+        let new_root = top_line_proof.new_root;
+
+        Self {
+            top_line_proof,
+            web_proof,
+            old_root,
+            new_root,
+        }
+    }
+
     pub fn set_witness_params<W: Witness<F>, F: Field>(
         &self,
         witness: &mut W,
@@ -194,6 +222,7 @@ mod tests {
     }
     #[test]
     fn test_spiderman_tree_basic_small() {
+        test_spiderman_tree_basic(3, 1, 1, 0);
         test_spiderman_tree_basic(12, 4, 5, 0);
         test_spiderman_tree_basic(12, 4, 50, 1);
         test_spiderman_tree_basic(3, 3, 9, 2);

@@ -1,7 +1,7 @@
 use parth_core::protocol::core_types::QNetworkTypesConfig;
 use psy_data::{
     guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobID,
-    v1::qdata::{contract::PsyDeployContractQueueItem, public_key::PZKPublicKeyInfo},
+    v1::qdata::public_key::PZKPublicKeyInfo,
 };
 use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
@@ -13,13 +13,14 @@ use psy_node_core::{
 
 use crate::{
     constants::queue::{
-        PQ_COORDINATOR_DEPLOY_CONTRACT_QUEUE_TOPIC_ID, PQ_COORDINATOR_REGISTER_USER_PUBLIC_KEY_QUEUE_TOPIC_ID,
+        PQ_COORDINATOR_REGISTER_USER_PUBLIC_KEY_QUEUE_TOPIC_ID,
         PQ_COORDINATOR_SUBMIT_REALM_GUTA_UPDATE_QUEUE_TOPIC_ID,
     },
     coordinator::processor::{
         db::PsyCoordinatorDatabaseProcessor,
         gatherers::{
-            coordinator_guta_update_gatherer::CoordinatorGUTAUpdateGathererOutput, deploy_contract_gatherer::DeployContractGathererOutput,
+            contract_gatherer::ContractQueueGatherer,
+            coordinator_guta_update_gatherer::CoordinatorGUTAUpdateGathererOutput,
             register_user_gatherer::RegisterUserGathererOutput,
         },
     },
@@ -68,10 +69,6 @@ pub struct PsyCoordinatorProcessor<
         PZKPublicKeyInfo<N::QHash>,
         RegisterUserGathererOutput<N::QHash, N::JobId>,
     >,
-    pub deploy_contract_queue_gatherer: EphemeralQueueGathererWithTree<
-        PQ_COORDINATOR_DEPLOY_CONTRACT_QUEUE_TOPIC_ID,
-        PsyDeployContractQueueItem<N::F, N::QHash>,
-        DeployContractGathererOutput<N::QHash, N::JobId>,
-    >,
+    pub deploy_contract_queue_gatherer: ContractQueueGatherer<N>,
     pub proof_worker_queue_max_time_ms: u64,
 }

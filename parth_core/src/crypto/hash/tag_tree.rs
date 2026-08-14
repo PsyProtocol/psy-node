@@ -42,6 +42,13 @@ pub fn hash_tag_tree_node_three<Hash: ZeroableHash, Hasher: MerkleHasher<Hash>>(
     hash_tag_tree_node::<Hash, Hasher>(first_tag_tree_value, &last_two, tag)
 }
 
+#[inline]
+pub fn hash_tag_tree_node_four<Hash: ZeroableHash, Hasher: MerkleHasher<Hash>>(first_tag_tree_value: &Hash, second_tag_tree_value: &Hash, third_tag_tree_value: &Hash, fourth_tag_tree_value: &Hash, tag: &Hash) -> Hash {
+    let last_two = hash_tag_tree_node::<Hash, Hasher>(third_tag_tree_value, fourth_tag_tree_value, tag);
+    let last_three = hash_tag_tree_node::<Hash, Hasher>(second_tag_tree_value, &last_two, tag);
+    hash_tag_tree_node::<Hash, Hasher>(first_tag_tree_value, &last_three, tag)
+}
+
 
 #[inline]
 pub fn hash_tag_tree_node_owned<Hash, Hasher: MerkleHasher<Hash>>(left: Hash, right: Hash, tag: Hash) -> Hash {
