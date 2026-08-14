@@ -21,6 +21,9 @@ use psy_node_core::store::{
     rollback_runtime_rebuild::{
         RollbackRuntimeRebuildDirective, RollbackRuntimeRebuildReport, restored_target,
     },
+    timestamp::{
+        CommitWriteTimestampUs, DeleteFenceTimestampUs, NewBranchWriteTimestampUs,
+    },
     typed::UniquePendingId,
 };
 use scylla::{
@@ -48,18 +51,18 @@ const DIRECTIVE_KEY_DOMAIN: i16 = -11;
 const REPORT_KEY_DOMAIN: i16 = -12;
 const RUNTIME_READY_KEY_DOMAIN: i16 = -13;
 const REVISION: i64 = 1;
-const DIRECTIVE_MAGIC: &[u8; 8] = b"PSYRRBD1";
-const REPORT_MAGIC: &[u8; 8] = b"PSYRRBR1";
-const RUNTIME_READY_MAGIC: &[u8; 8] = b"PSYRRDY1";
-const VERSION: u16 = 1;
+const DIRECTIVE_MAGIC: &[u8; 8] = b"PSYRRBD2";
+const REPORT_MAGIC: &[u8; 8] = b"PSYRRBR2";
+const RUNTIME_READY_MAGIC: &[u8; 8] = b"PSYRRDY2";
+const VERSION: u16 = 2;
 const MAX_BYTES: usize = 16 * 1024;
-const DIRECTIVE_SLOT_DOMAIN: &[u8] = b"psy.rollback.runtime-directive-slot.v1\0";
-const REPORT_SLOT_DOMAIN: &[u8] = b"psy.rollback.runtime-report-slot.v1\0";
-const ROW_DIGEST_DOMAIN: &[u8] = b"psy.rollback.runtime-row.v1\0";
-const FRAGMENT_DOMAIN: &[u8] = b"psy.rollback.runtime-fragment.v1\0";
-const STORE_DOMAIN: &[u8] = b"psy.rollback.runtime-rebuild-store.v1\0";
-const RUNTIME_READY_SLOT_DOMAIN: &[u8] = b"psy.rollback.runtime-ready-slot.v1\0";
-const RUNTIME_READY_REALM_SET_DOMAIN: &[u8] = b"psy.rollback.runtime-ready-realms.v1\0";
+const DIRECTIVE_SLOT_DOMAIN: &[u8] = b"psy.rollback.runtime-directive-slot.v2\0";
+const REPORT_SLOT_DOMAIN: &[u8] = b"psy.rollback.runtime-report-slot.v2\0";
+const ROW_DIGEST_DOMAIN: &[u8] = b"psy.rollback.runtime-row.v2\0";
+const FRAGMENT_DOMAIN: &[u8] = b"psy.rollback.runtime-fragment.v2\0";
+const STORE_DOMAIN: &[u8] = b"psy.rollback.runtime-rebuild-store.v2\0";
+const RUNTIME_READY_SLOT_DOMAIN: &[u8] = b"psy.rollback.runtime-ready-slot.v2\0";
+const RUNTIME_READY_REALM_SET_DOMAIN: &[u8] = b"psy.rollback.runtime-ready-realms.v2\0";
 
 const INSERT_TEMPLATE: &str = "INSERT INTO {table} (network_chain_id, chain_epoch, participant_plan_digest, key_domain, row_slot, fragment_index, revision, fragment_count, row_bytes, fragment_payload, fragment_digest, row_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS";
 const READ_TEMPLATE: &str = "SELECT fragment_index, revision, fragment_count, row_bytes, fragment_payload, fragment_digest, row_digest FROM {table} WHERE network_chain_id = ? AND chain_epoch = ? AND participant_plan_digest = ? AND key_domain = ? AND row_slot = ?";
@@ -89,6 +92,11 @@ impl<Hash: Q256BitHash> StoredRuntimeDirective<Hash> {
             directive.global_restore_barrier_digest(),
             directive.participant_restore_slot(),
             directive.participant_restore_digest(),
+        ] {
+            bytes.extend_from_slice(field);
+        }
+        encode_new_branch_write(&mut bytes, directive.new_branch_write());
+        for field in [
             directive.digest(),
             &fingerprint,
             &slot,
@@ -133,6 +141,7 @@ impl<Hash: Q256BitHash> StoredRuntimeDirective<Hash> {
         let barrier_digest = cursor.array32()?;
         let participant_slot = cursor.array32()?;
         let participant_digest = cursor.array32()?;
+        let new_branch_write = decode_new_branch_write(&mut cursor)?;
         let encoded_directive_digest = cursor.array32()?;
         let fingerprint = cursor.array32()?;
         let encoded_slot = cursor.array32()?;
@@ -149,6 +158,7 @@ impl<Hash: Q256BitHash> StoredRuntimeDirective<Hash> {
             barrier_digest,
             participant_slot,
             participant_digest,
+            new_branch_write,
             processing,
             gathering,
         )
@@ -183,6 +193,7 @@ impl<Hash: Q256BitHash> StoredRuntimeReport<Hash> {
         if report.directive_digest() != directive.digest()
             || report.authority() != directive.authority()
             || report.target() != directive.target()
+            || report.new_branch_write() != directive.new_branch_write()
         {
             return Err(RollbackRuntimeRebuildStoreError::BindingMismatch);
         }
@@ -201,6 +212,7 @@ impl<Hash: Q256BitHash> StoredRuntimeReport<Hash> {
         ] {
             bytes.extend_from_slice(field);
         }
+        encode_new_branch_write(&mut bytes, report.new_branch_write());
         bytes.extend_from_slice(&report.backup_min_checkpoint().to_be_bytes());
         bytes.extend_from_slice(&report.backup_next_checkpoint().to_be_bytes());
         bytes.extend_from_slice(&report.backup_root().into_owned_32bytes());
@@ -249,6 +261,7 @@ impl<Hash: Q256BitHash> StoredRuntimeReport<Hash> {
         let encoded_report_digest = cursor.array32()?;
         let fingerprint = cursor.array32()?;
         let encoded_slot = cursor.array32()?;
+        let new_branch_write = decode_new_branch_write(&mut cursor)?;
         let backup_min = cursor.u64()?;
         let backup_next = cursor.u64()?;
         let backup_root = Hash::from_owned_32bytes(cursor.array32()?);
@@ -262,6 +275,7 @@ impl<Hash: Q256BitHash> StoredRuntimeReport<Hash> {
             || target != *directive.target()
             || participant_plan_digest != *directive.participant_plan_digest()
             || directive_digest != *directive.digest()
+            || new_branch_write != directive.new_branch_write()
         {
             return Err(RollbackRuntimeRebuildStoreError::BindingMismatch);
         }
@@ -658,6 +672,11 @@ impl ScyllaRollbackRuntimeRebuildStore {
             .await?
             .map(|bytes| StoredRuntimeDirective::decode(&bytes))
             .transpose()?;
+        let request = binding
+            .deleting_head()
+            .rollback_control()
+            .requested()
+            .ok_or(RollbackRuntimeRebuildStoreError::BindingMismatch)?;
 
         // The immutable directive is selected before observing the global
         // counter on retry. Once either allocation succeeds, a fresh counter
@@ -676,6 +695,7 @@ impl ScyllaRollbackRuntimeRebuildStore {
                     *binding.digest(),
                     *coordinator.completion().slot(),
                     *coordinator.completion().digest(),
+                    request.fence_window().new_branch_write(),
                     Some(processing),
                     Some(gathering),
                 )
@@ -685,11 +705,6 @@ impl ScyllaRollbackRuntimeRebuildStore {
         };
         require_coordinator_binding(&directive, binding, coordinator)?;
 
-        let request = binding
-            .deleting_head()
-            .rollback_control()
-            .requested()
-            .ok_or(RollbackRuntimeRebuildStoreError::BindingMismatch)?;
         let processing = directive
             .processing()
             .ok_or(RollbackRuntimeRebuildStoreError::BindingMismatch)?;
@@ -766,6 +781,7 @@ impl ScyllaRollbackRuntimeRebuildStore {
                     *barrier.digest(),
                     *completion.slot(),
                     *completion.digest(),
+                    completion.new_branch_write(),
                     Some(completion.processing()),
                     Some(completion.gathering()),
                 )
@@ -1383,6 +1399,11 @@ fn require_coordinator_binding<Hash: Q256BitHash>(
     barrier: &RollbackGlobalRestoreBarrier<Hash>,
     coordinator: &PersistedCoordinatorRollbackDeleteCompletion<Hash>,
 ) -> Result<(), RollbackRuntimeRebuildStoreError> {
+    let request = barrier
+        .deleting_head()
+        .rollback_control()
+        .requested()
+        .ok_or(RollbackRuntimeRebuildStoreError::BindingMismatch)?;
     if directive.authority() != AuthorityScope::Coordinator
         || directive.target() != &restored_target(*barrier.target()).map_err(model)?
         || directive.participant_plan_digest() != barrier.participant_plan_digest()
@@ -1390,6 +1411,7 @@ fn require_coordinator_binding<Hash: Q256BitHash>(
         || directive.global_restore_barrier_digest() != barrier.digest()
         || directive.participant_restore_slot() != coordinator.completion().slot()
         || directive.participant_restore_digest() != coordinator.completion().digest()
+        || directive.new_branch_write() != request.fence_window().new_branch_write()
         || directive.processing().is_none()
         || directive.gathering().is_none()
     {
@@ -1408,6 +1430,11 @@ fn require_ready_report<Hash: Q256BitHash>(
     let directive = receipt.directive();
     let report = receipt.report();
     let target_checkpoint = target.checkpoint().checkpoint_id().get();
+    let request = restore
+        .deleting_head()
+        .rollback_control()
+        .requested()
+        .ok_or(RollbackRuntimeRebuildStoreError::BindingMismatch)?;
     if receipt.store_fingerprint() != runtime_store_fingerprint
         || directive.authority() != expected_authority
         || report.authority() != expected_authority
@@ -1416,7 +1443,9 @@ fn require_ready_report<Hash: Q256BitHash>(
         || directive.participant_plan_digest() != restore.participant_plan_digest()
         || directive.global_restore_barrier_slot() != restore.slot()
         || directive.global_restore_barrier_digest() != restore.digest()
+        || directive.new_branch_write() != request.fence_window().new_branch_write()
         || report.directive_digest() != directive.digest()
+        || report.new_branch_write() != directive.new_branch_write()
         || report.processor_checkpoint() != target_checkpoint
         || report.authority_state_checkpoint() != target_checkpoint
         || report.processing() != directive.processing()
@@ -1425,6 +1454,29 @@ fn require_ready_report<Hash: Q256BitHash>(
         return Err(RollbackRuntimeRebuildStoreError::BindingMismatch);
     }
     Ok(())
+}
+
+fn encode_new_branch_write(output: &mut Vec<u8>, timestamp: NewBranchWriteTimestampUs) {
+    output.extend_from_slice(
+        &timestamp
+            .delete_fence()
+            .orphan_write_max()
+            .as_i64()
+            .to_be_bytes(),
+    );
+    output.extend_from_slice(&timestamp.delete_fence().as_i64().to_be_bytes());
+    output.extend_from_slice(&timestamp.as_commit_timestamp().as_i64().to_be_bytes());
+}
+
+fn decode_new_branch_write(
+    cursor: &mut Cursor<'_>,
+) -> Result<NewBranchWriteTimestampUs, RollbackRuntimeRebuildStoreError> {
+    let orphan_write_max = CommitWriteTimestampUs::try_from_i128(i128::from(cursor.i64()?))
+        .map_err(model)?;
+    let delete_fence =
+        DeleteFenceTimestampUs::try_after(orphan_write_max, i128::from(cursor.i64()?))
+            .map_err(model)?;
+    NewBranchWriteTimestampUs::try_after(delete_fence, i128::from(cursor.i64()?)).map_err(model)
 }
 
 fn push_bytes(
@@ -1572,6 +1624,92 @@ mod tests {
     };
 
     use super::*;
+
+    fn runtime_target() -> CanonicalChainRef<PHash> {
+        CanonicalChainRef::new(
+            NetworkId::try_from_chain_id(1337).unwrap(),
+            ChainEpoch::new(8),
+            checkpoint(40, 400),
+        )
+    }
+
+    fn runtime_new_branch_write() -> NewBranchWriteTimestampUs {
+        TimestampFenceWindow::try_new(
+            CommitWriteTimestampUs::try_from_i128(100).unwrap(),
+            101,
+            102,
+        )
+        .unwrap()
+        .new_branch_write()
+    }
+
+    fn runtime_directive() -> RollbackRuntimeRebuildDirective<PHash> {
+        let target = runtime_target();
+        let (processing, gathering) = coordinator_contexts(
+            target.network_id(),
+            PendingCounterReadState::Uninitialized,
+        )
+        .unwrap();
+        RollbackRuntimeRebuildDirective::try_from_storage(
+            AuthorityScope::Coordinator,
+            target,
+            [1; 32],
+            [2; 32],
+            [3; 32],
+            [4; 32],
+            [5; 32],
+            runtime_new_branch_write(),
+            Some(processing),
+            Some(gathering),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn runtime_rows_roundtrip_the_complete_new_branch_fence_window() {
+        let directive = runtime_directive();
+        let stored = StoredRuntimeDirective::from_directive(directive, [9; 32]).unwrap();
+        let decoded = StoredRuntimeDirective::decode(&stored.canonical_bytes).unwrap();
+        assert_eq!(decoded, stored);
+        assert_eq!(
+            decoded.directive.new_branch_write(),
+            runtime_new_branch_write()
+        );
+
+        let report = RollbackRuntimeRebuildReport::try_after_exact_rebuild(
+            &directive,
+            0,
+            41,
+            PHash::from_owned_32bytes([6; 32]),
+            40,
+            40,
+            PHash::from_owned_32bytes([7; 32]),
+            directive.processing(),
+            directive.gathering(),
+        )
+        .unwrap();
+        let stored_report = StoredRuntimeReport::from_report(directive, report, [9; 32]).unwrap();
+        assert_eq!(
+            StoredRuntimeReport::decode(&stored_report.canonical_bytes, directive).unwrap(),
+            stored_report
+        );
+    }
+
+    #[test]
+    fn runtime_directive_rejects_a_rehashed_invalid_fence_window() {
+        let stored = StoredRuntimeDirective::from_directive(runtime_directive(), [9; 32]).unwrap();
+        let mut forged = stored.canonical_bytes.clone();
+        let timestamp_offset = 8 + 2 + 7 + CANONICAL_CHAIN_REF_V1_LEN + 5 * 32;
+        let orphan = forged[timestamp_offset..timestamp_offset + 8].to_vec();
+        forged[timestamp_offset + 8..timestamp_offset + 16].copy_from_slice(&orphan);
+        let body_len = forged.len() - 32;
+        let forged_digest = row_digest(&forged[..body_len]);
+        forged[body_len..].copy_from_slice(&forged_digest);
+        assert!(matches!(
+            StoredRuntimeDirective::<PHash>::decode(&forged),
+            Err(RollbackRuntimeRebuildStoreError::Model(_))
+        ));
+    }
 
     #[test]
     fn runtime_rows_are_append_only_and_cannot_publish_the_head() {

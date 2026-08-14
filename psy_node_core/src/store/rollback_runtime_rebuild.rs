@@ -19,10 +19,11 @@ use super::pending_generation::ProcNamespacePrefix;
 use super::{
     canonical_head::{CanonicalHeadReadState, StoredCanonicalHead},
     rollback_control::RollbackControlState,
+    timestamp::NewBranchWriteTimestampUs,
 };
 
-const DIRECTIVE_DOMAIN: &[u8] = b"psy.rollback.runtime-rebuild-directive.v1\0";
-const REPORT_DOMAIN: &[u8] = b"psy.rollback.runtime-rebuild-report.v1\0";
+const DIRECTIVE_DOMAIN: &[u8] = b"psy.rollback.runtime-rebuild-directive.v2\0";
+const REPORT_DOMAIN: &[u8] = b"psy.rollback.runtime-rebuild-report.v2\0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RollbackRuntimeRebuildDirective<Hash> {
@@ -33,6 +34,7 @@ pub struct RollbackRuntimeRebuildDirective<Hash> {
     global_restore_barrier_digest: [u8; 32],
     participant_restore_slot: [u8; 32],
     participant_restore_digest: [u8; 32],
+    new_branch_write: NewBranchWriteTimestampUs,
     processing: Option<PendingGenerationContext>,
     gathering: Option<PendingGenerationContext>,
     digest: [u8; 32],
@@ -48,6 +50,7 @@ impl<Hash: Q256BitHash> RollbackRuntimeRebuildDirective<Hash> {
         global_restore_barrier_digest: [u8; 32],
         participant_restore_slot: [u8; 32],
         participant_restore_digest: [u8; 32],
+        new_branch_write: NewBranchWriteTimestampUs,
         processing: Option<PendingGenerationContext>,
         gathering: Option<PendingGenerationContext>,
     ) -> Result<Self, RollbackRuntimeRebuildError> {
@@ -88,6 +91,7 @@ impl<Hash: Q256BitHash> RollbackRuntimeRebuildDirective<Hash> {
             &global_restore_barrier_digest,
             &participant_restore_slot,
             &participant_restore_digest,
+            new_branch_write,
             Some(processing),
             Some(gathering),
         );
@@ -99,6 +103,7 @@ impl<Hash: Q256BitHash> RollbackRuntimeRebuildDirective<Hash> {
             global_restore_barrier_digest,
             participant_restore_slot,
             participant_restore_digest,
+            new_branch_write,
             processing: Some(processing),
             gathering: Some(gathering),
             digest,
@@ -133,6 +138,10 @@ impl<Hash: Q256BitHash> RollbackRuntimeRebuildDirective<Hash> {
         &self.participant_restore_digest
     }
 
+    pub const fn new_branch_write(&self) -> NewBranchWriteTimestampUs {
+        self.new_branch_write
+    }
+
     pub const fn processing(&self) -> Option<PendingGenerationContext> {
         self.processing
     }
@@ -157,6 +166,7 @@ pub struct RollbackRuntimeRebuildReport<Hash> {
     processor_checkpoint: u64,
     authority_state_checkpoint: u64,
     authority_state_root: Hash,
+    new_branch_write: NewBranchWriteTimestampUs,
     processing: Option<PendingGenerationContext>,
     gathering: Option<PendingGenerationContext>,
     digest: [u8; 32],
@@ -203,6 +213,7 @@ impl<Hash: Q256BitHash> RollbackRuntimeRebuildReport<Hash> {
             processor_checkpoint,
             authority_state_checkpoint,
             authority_state_root,
+            directive.new_branch_write,
             processing,
             gathering,
         );
@@ -216,6 +227,7 @@ impl<Hash: Q256BitHash> RollbackRuntimeRebuildReport<Hash> {
             processor_checkpoint,
             authority_state_checkpoint,
             authority_state_root,
+            new_branch_write: directive.new_branch_write,
             processing,
             gathering,
             digest,
@@ -258,6 +270,10 @@ impl<Hash: Q256BitHash> RollbackRuntimeRebuildReport<Hash> {
         self.authority_state_root
     }
 
+    pub const fn new_branch_write(&self) -> NewBranchWriteTimestampUs {
+        self.new_branch_write
+    }
+
     pub const fn processing(&self) -> Option<PendingGenerationContext> {
         self.processing
     }
@@ -279,6 +295,7 @@ fn directive_digest<Hash: Q256BitHash>(
     global_restore_barrier_digest: &[u8; 32],
     participant_restore_slot: &[u8; 32],
     participant_restore_digest: &[u8; 32],
+    new_branch_write: NewBranchWriteTimestampUs,
     processing: Option<PendingGenerationContext>,
     gathering: Option<PendingGenerationContext>,
 ) -> [u8; 32] {
@@ -291,6 +308,7 @@ fn directive_digest<Hash: Q256BitHash>(
     hasher.update(global_restore_barrier_digest);
     hasher.update(participant_restore_slot);
     hasher.update(participant_restore_digest);
+    encode_new_branch_write(&mut hasher, new_branch_write);
     encode_context(&mut hasher, processing);
     encode_context(&mut hasher, gathering);
     hasher.finalize().into()
@@ -307,6 +325,7 @@ fn report_digest<Hash: Q256BitHash>(
     processor_checkpoint: u64,
     authority_state_checkpoint: u64,
     authority_state_root: Hash,
+    new_branch_write: NewBranchWriteTimestampUs,
     processing: Option<PendingGenerationContext>,
     gathering: Option<PendingGenerationContext>,
 ) -> [u8; 32] {
@@ -321,9 +340,22 @@ fn report_digest<Hash: Q256BitHash>(
     hasher.update(processor_checkpoint.to_be_bytes());
     hasher.update(authority_state_checkpoint.to_be_bytes());
     hasher.update(authority_state_root.into_owned_32bytes());
+    encode_new_branch_write(&mut hasher, new_branch_write);
     encode_context(&mut hasher, processing);
     encode_context(&mut hasher, gathering);
     hasher.finalize().into()
+}
+
+fn encode_new_branch_write(hasher: &mut Sha256, timestamp: NewBranchWriteTimestampUs) {
+    hasher.update(
+        timestamp
+            .delete_fence()
+            .orphan_write_max()
+            .as_i64()
+            .to_be_bytes(),
+    );
+    hasher.update(timestamp.delete_fence().as_i64().to_be_bytes());
+    hasher.update(timestamp.as_commit_timestamp().as_i64().to_be_bytes());
 }
 
 fn encode_context(hasher: &mut Sha256, context: Option<PendingGenerationContext>) {
@@ -456,6 +488,7 @@ impl<Hash: Q256BitHash> SelectedRealmRollbackRuntimeRebuild<Hash> {
                 != verifying_head.canonical_ref().chain_epoch()
             || directive.target().checkpoint() != request.target()
             || directive.participant_plan_digest() != request.plan_digest().as_bytes()
+            || directive.new_branch_write() != request.fence_window().new_branch_write()
         {
             return Err(RollbackRuntimeRebuildError::RuntimeStateMismatch);
         }
@@ -565,7 +598,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::store::typed::UniquePendingId;
+    use crate::store::{
+        timestamp::{CommitWriteTimestampUs, TimestampFenceWindow},
+        typed::UniquePendingId,
+    };
 
     type Hash = Hash256;
 
@@ -578,6 +614,16 @@ mod tests {
                 CheckpointHash::from_last_chain_hash(Hash256([9; 32])),
             ),
         )
+    }
+
+    fn new_branch_write() -> NewBranchWriteTimestampUs {
+        TimestampFenceWindow::try_new(
+            CommitWriteTimestampUs::try_from_i128(100).unwrap(),
+            101,
+            102,
+        )
+        .unwrap()
+        .new_branch_write()
     }
 
     fn realm_directive() -> RollbackRuntimeRebuildDirective<Hash> {
@@ -608,6 +654,7 @@ mod tests {
             [3; 32],
             [4; 32],
             [5; 32],
+            new_branch_write(),
             Some(processing),
             Some(gathering),
         )
@@ -620,7 +667,30 @@ mod tests {
         assert_eq!(directive.target(), &target());
         assert_eq!(directive.processing().unwrap().pending_id().get(), 71);
         assert_eq!(directive.gathering().unwrap().pending_id().get(), 72);
+        assert_eq!(directive.new_branch_write(), new_branch_write());
         assert_ne!(directive.digest(), &[0; 32]);
+
+        let later_new_branch = TimestampFenceWindow::try_new(
+            CommitWriteTimestampUs::try_from_i128(100).unwrap(),
+            101,
+            103,
+        )
+        .unwrap()
+        .new_branch_write();
+        let changed_timestamp = RollbackRuntimeRebuildDirective::try_from_storage(
+            directive.authority(),
+            *directive.target(),
+            *directive.participant_plan_digest(),
+            *directive.global_restore_barrier_slot(),
+            *directive.global_restore_barrier_digest(),
+            *directive.participant_restore_slot(),
+            *directive.participant_restore_digest(),
+            later_new_branch,
+            directive.processing(),
+            directive.gathering(),
+        )
+        .unwrap();
+        assert_ne!(changed_timestamp.digest(), directive.digest());
 
         let authority = directive.authority();
         let prefix = ProcNamespacePrefix::for_authority(target().network_id(), authority);
@@ -645,6 +715,7 @@ mod tests {
                 [3; 32],
                 [4; 32],
                 [5; 32],
+                new_branch_write(),
                 Some(processing),
                 Some(non_adjacent),
             ),
@@ -679,6 +750,7 @@ mod tests {
             [3; 32],
             [4; 32],
             [5; 32],
+            new_branch_write(),
             Some(processing),
             Some(gathering),
         )
@@ -696,6 +768,7 @@ mod tests {
                 [3; 32],
                 [4; 32],
                 [5; 32],
+                new_branch_write(),
                 Some(forged),
                 Some(gathering),
             ),
@@ -711,6 +784,7 @@ mod tests {
                 [3; 32],
                 [4; 32],
                 [5; 32],
+                new_branch_write(),
                 None,
                 None,
             ),
@@ -734,6 +808,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(report.directive_digest(), directive.digest());
+        assert_eq!(report.new_branch_write(), directive.new_branch_write());
         assert_eq!(report.backup_next_checkpoint(), 41);
         assert_ne!(report.digest(), &[0; 32]);
 
