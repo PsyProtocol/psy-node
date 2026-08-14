@@ -411,6 +411,30 @@ impl<Hash: Q256BitHash> CoordinatorCommitPhysicalExecutionSchedule<Hash> {
         })
     }
 
+    /// Reconstruct the deterministic typed-row observation while a trusted
+    /// full-write observation or immutable manifest is being revalidated.
+    ///
+    /// Primary-key-only rows have no readable writetime in Scylla. The live
+    /// writer path must therefore use `verify_after_write` with acknowledgments
+    /// from the current attempt. This narrower helper is only for bracketing a
+    /// non-forgeable full-write observation or its persisted manifest after
+    /// that acknowledgement has already been bound; it still requires every
+    /// selected key to be present and every value row to match at the sealed
+    /// timestamp.
+    pub(crate) fn verify_manifest_revalidation(
+        &self,
+        observed: &[Option<CoordinatorCommitObservedRow>],
+    ) -> Result<CoordinatorTypedRowsExactObservation<Hash>, CoordinatorCommitPhysicalExecutionError>
+    {
+        let acknowledged = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| row.requires_write_acknowledgement().then_some(index))
+            .collect();
+        self.verify_after_write(observed, &acknowledged)
+    }
+
     fn require_observation_count(
         &self,
         observed: &[Option<CoordinatorCommitObservedRow>],

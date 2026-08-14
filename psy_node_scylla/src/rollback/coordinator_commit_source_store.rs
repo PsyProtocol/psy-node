@@ -29,6 +29,7 @@ use super::{
     CoordinatorRollbackFloorSingletonAnchorStoreError, CqlKeyspaceName,
     ScyllaCoordinatorRollbackFloorSingletonAnchorStore,
 };
+use super::coordinator_commit_full_manifest_store::ScyllaCoordinatorCommitFullManifestStore;
 
 pub(crate) const COORDINATOR_COMMIT_SOURCE_HEADER_TABLE: &str =
     "coordinator_commit_source_header_v1";
@@ -121,6 +122,7 @@ pub(crate) struct ScyllaCoordinatorCommitSourceStore {
     insert_floor: PreparedStatement,
     scan_headers: PreparedStatement,
     floor_singletons: ScyllaCoordinatorRollbackFloorSingletonAnchorStore,
+    full_manifests: ScyllaCoordinatorCommitFullManifestStore,
 }
 
 impl ScyllaCoordinatorCommitSourceStore {
@@ -148,6 +150,9 @@ impl ScyllaCoordinatorCommitSourceStore {
             state_keyspace,
         )
         .await?;
+        ScyllaCoordinatorCommitFullManifestStore::create_schema(session, keyspace)
+            .await
+            .map_err(|error| CoordinatorCommitSourceStoreError::FullManifest(error.to_string()))?;
         Ok(())
     }
 
@@ -170,10 +175,16 @@ impl ScyllaCoordinatorCommitSourceStore {
             floor_singletons:
                 ScyllaCoordinatorRollbackFloorSingletonAnchorStore::prepare(
                     session.clone(),
-                    keyspace,
+                    keyspace.clone(),
                     state_keyspace,
                 )
                 .await?,
+            full_manifests: ScyllaCoordinatorCommitFullManifestStore::prepare(
+                session.clone(),
+                keyspace,
+            )
+            .await
+            .map_err(|error| CoordinatorCommitSourceStoreError::FullManifest(error.to_string()))?,
             session,
             queries,
         })
@@ -205,6 +216,12 @@ impl ScyllaCoordinatorCommitSourceStore {
 
     pub(crate) const fn queries(&self) -> &CoordinatorCommitSourceQueries {
         &self.queries
+    }
+
+    pub(crate) const fn full_manifests(
+        &self,
+    ) -> &ScyllaCoordinatorCommitFullManifestStore {
+        &self.full_manifests
     }
 
     pub(crate) async fn persist_floor_and_readback<Hash: Q256BitHash>(
@@ -695,6 +712,7 @@ pub(crate) enum CoordinatorCommitSourceStoreError {
     SuffixIdentityMismatch,
     FloorMissing,
     Inventory(String),
+    FullManifest(String),
     IndeterminateWrite(String),
     FloorSingletonAnchor(CoordinatorRollbackFloorSingletonAnchorStoreError),
 }

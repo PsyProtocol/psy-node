@@ -1469,6 +1469,57 @@ mod tests {
         assert_eq!(full.typed_row_count(), plan.typed_row_count());
         assert_eq!(full.total_physical_row_count(), plan.row_count());
         assert_ne!(full.digest(), &[0; 32]);
+        let manifest = crate::rollback::coordinator_commit_full_manifest::CoordinatorCommitFullManifest::try_from_exact_observation(
+            &full,
+        )
+        .unwrap();
+        let decoded = crate::rollback::coordinator_commit_full_manifest::CoordinatorCommitFullManifest::decode_persisted(
+            manifest.slot().as_bytes(),
+            manifest.revision() as i64,
+            manifest.canonical_payload(),
+        )
+        .unwrap();
+        assert_eq!(decoded, manifest);
+        manifest.revalidate_exact_observation(&full).unwrap();
+        assert_eq!(manifest.full_observation_digest(), full.digest());
+
+        let mut tampered_payload = manifest.canonical_payload().to_vec();
+        let payload_index = tampered_payload.len() - 33;
+        tampered_payload[payload_index] ^= 1;
+        assert!(
+            crate::rollback::coordinator_commit_full_manifest::CoordinatorCommitFullManifest::<
+                PHash,
+            >::decode_persisted(
+                manifest.slot().as_bytes(),
+                manifest.revision() as i64,
+                &tampered_payload,
+            )
+            .is_err()
+        );
+        let mut trailing_payload = manifest.canonical_payload().to_vec();
+        trailing_payload.push(0);
+        assert!(
+            crate::rollback::coordinator_commit_full_manifest::CoordinatorCommitFullManifest::<
+                PHash,
+            >::decode_persisted(
+                manifest.slot().as_bytes(),
+                manifest.revision() as i64,
+                &trailing_payload,
+            )
+            .is_err()
+        );
+        let mut wrong_slot = *manifest.slot().as_bytes();
+        wrong_slot[0] ^= 1;
+        assert!(
+            crate::rollback::coordinator_commit_full_manifest::CoordinatorCommitFullManifest::<
+                PHash,
+            >::decode_persisted(
+                &wrong_slot,
+                manifest.revision() as i64,
+                manifest.canonical_payload(),
+            )
+            .is_err()
+        );
     }
 
     #[test]

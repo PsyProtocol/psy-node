@@ -98,6 +98,10 @@ mod coordinator_commit_physical_execution;
 mod coordinator_commit_physical_scylla;
 #[allow(dead_code)]
 mod coordinator_commit_full_write;
+#[allow(dead_code)]
+mod coordinator_commit_full_manifest;
+#[allow(dead_code)]
+mod coordinator_commit_full_manifest_store;
 mod coordinator_commit_physical_before_image;
 mod coordinator_commit_target_restore;
 mod coordinator_commit_physical_archive_store;
