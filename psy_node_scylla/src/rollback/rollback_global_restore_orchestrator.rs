@@ -1,8 +1,9 @@
 //! Storage-private global control-state restore orchestration.
 //!
 //! This owner advances `DELETING -> RESTORING -> VERIFYING` only after exact
-//! durable barriers. It deliberately cannot mark runtime backups ready or
-//! publish the target; those require a later runtime-rebuild receipt.
+//! durable barriers.  Target publication is a separate operation which first
+//! persists and revalidates one immutable barrier over the Coordinator and
+//! every plan-selected Realm runtime-rebuild report.
 
 #![allow(dead_code)]
 
@@ -31,7 +32,9 @@ use super::{
     rollback_global_restore_barrier::{
         PersistedRollbackGlobalRestoreBarrier, ScyllaRollbackGlobalRestoreBarrierStore,
     },
-    rollback_runtime_rebuild_store::ScyllaRollbackRuntimeRebuildStore,
+    rollback_runtime_rebuild_store::{
+        PersistedRollbackRuntimeRebuildReport, ScyllaRollbackRuntimeRebuildStore,
+    },
 };
 
 pub(super) struct ScyllaRollbackGlobalRestoreOrchestrator {
@@ -163,6 +166,95 @@ impl ScyllaRollbackGlobalRestoreOrchestrator {
         Ok(barrier)
     }
 
+    /// Publish the restored target only after one immutable barrier commits
+    /// the exact Coordinator report and the strictly ordered complete Realm
+    /// report set. Retries may resume from VERIFYING, ALL_REALMS_READY, or the
+    /// exact final IDLE target without weakening any durable revalidation.
+    pub(super) async fn persist_runtime_ready_and_publish<Hash: Q256BitHash>(
+        &self,
+        restore: &PersistedRollbackGlobalRestoreBarrier<Hash>,
+        coordinator: &PersistedRollbackRuntimeRebuildReport<Hash>,
+        realms: &[PersistedRollbackRuntimeRebuildReport<Hash>],
+    ) -> Result<StoredCanonicalHead<Hash>, RollbackGlobalRestoreOrchestratorError> {
+        let restoring = CanonicalHeadTransition::begin_rollback_restore(
+            *restore.barrier().deleting_head(),
+        )
+        .map_err(backend)?;
+        let verifying = CanonicalHeadTransition::begin_rollback_verify(*restoring.candidate())
+            .map_err(backend)?;
+        let all_realms_ready =
+            CanonicalHeadTransition::complete_rollback_realm_barrier(*verifying.candidate())
+                .map_err(backend)?;
+        let published = CanonicalHeadTransition::complete_rollback(*all_realms_ready.candidate())
+            .map_err(backend)?;
+
+        self.require_runtime_inputs(restore, coordinator, realms).await?;
+        self.require_head_one_of(
+            verifying.candidate(),
+            all_realms_ready.candidate(),
+            published.candidate(),
+        )
+        .await?;
+        let ready = self
+            .runtime_rebuild
+            .persist_runtime_ready_barrier(
+                *verifying.candidate(),
+                restore,
+                coordinator,
+                realms,
+            )
+            .await
+            .map_err(backend)?;
+        self.require_runtime_inputs(restore, coordinator, realms).await?;
+        self.runtime_rebuild
+            .revalidate_runtime_ready_barrier(&ready)
+            .await
+            .map_err(backend)?;
+
+        self.ensure_head_transition(&all_realms_ready.seal()).await?;
+        self.require_runtime_inputs(restore, coordinator, realms).await?;
+        self.runtime_rebuild
+            .revalidate_runtime_ready_barrier(&ready)
+            .await
+            .map_err(backend)?;
+
+        self.ensure_head_transition(&published.seal()).await?;
+        self.require_runtime_inputs(restore, coordinator, realms).await?;
+        self.runtime_rebuild
+            .revalidate_runtime_ready_barrier(&ready)
+            .await
+            .map_err(backend)?;
+        self.require_head(published.candidate()).await?;
+        if ready.verifying_head() != verifying.candidate()
+            || ready.target() != published.candidate().canonical_ref()
+        {
+            return Err(RollbackGlobalRestoreOrchestratorError::IdentityMismatch(
+                "runtime-ready barrier",
+            ));
+        }
+        Ok(*published.candidate())
+    }
+
+    async fn require_runtime_inputs<Hash: Q256BitHash>(
+        &self,
+        restore: &PersistedRollbackGlobalRestoreBarrier<Hash>,
+        coordinator: &PersistedRollbackRuntimeRebuildReport<Hash>,
+        realms: &[PersistedRollbackRuntimeRebuildReport<Hash>],
+    ) -> Result<(), RollbackGlobalRestoreOrchestratorError> {
+        self.restore_barrier.revalidate(restore).await.map_err(backend)?;
+        self.runtime_rebuild
+            .revalidate_report(coordinator)
+            .await
+            .map_err(backend)?;
+        for realm in realms {
+            self.runtime_rebuild
+                .revalidate_report(realm)
+                .await
+                .map_err(backend)?;
+        }
+        Ok(())
+    }
+
     async fn revalidate_inputs<Hash: Q256BitHash>(
         &self,
         delete_barrier: &PersistedRollbackGlobalDeleteBarrier<Hash>,
@@ -208,6 +300,21 @@ impl ScyllaRollbackGlobalRestoreOrchestrator {
         Ok(())
     }
 
+    async fn require_head_one_of<Hash: Q256BitHash>(
+        &self,
+        first: &StoredCanonicalHead<Hash>,
+        second: &StoredCanonicalHead<Hash>,
+        third: &StoredCanonicalHead<Hash>,
+    ) -> Result<(), RollbackGlobalRestoreOrchestratorError> {
+        let current = self.read_head(first.canonical_ref().network_id()).await?;
+        if current != *first && current != *second && current != *third {
+            return Err(RollbackGlobalRestoreOrchestratorError::ConcurrentMutation(
+                "canonical head",
+            ));
+        }
+        Ok(())
+    }
+
     async fn read_head<Hash: Q256BitHash>(
         &self,
         network: psy_data::protocol::canonical_chain::NetworkId,
@@ -244,7 +351,7 @@ impl Error for RollbackGlobalRestoreOrchestratorError {}
 #[cfg(test)]
 mod tests {
     #[test]
-    fn orchestrator_stops_before_runtime_ready_and_target_publish() {
+    fn orchestrator_persists_runtime_ready_before_target_publish() {
         let source = include_str!("rollback_global_restore_orchestrator.rs")
             .split("#[cfg(test)]")
             .next()
@@ -254,8 +361,23 @@ mod tests {
         assert!(source.contains("revalidate_target_restore_completion"));
         assert!(source.contains("persist_directive"));
         assert!(source.contains("revalidate_directive"));
-        assert!(!source.contains("complete_rollback_realm_barrier"));
-        assert!(!source.contains("complete_rollback("));
+        let ready = source.find("persist_runtime_ready_barrier").unwrap();
+        let realm_barrier = source
+            .find("CanonicalHeadTransition::complete_rollback_realm_barrier")
+            .unwrap();
+        let publish = source
+            .find("CanonicalHeadTransition::complete_rollback(*")
+            .unwrap();
+        assert!(realm_barrier < publish);
+        // Construction may happen before persistence, but neither sealed CAS
+        // is applied until after the immutable runtime-ready row exists.
+        let apply_realm_barrier = source[ready..]
+            .find("ensure_head_transition(&all_realms_ready.seal())")
+            .unwrap();
+        let apply_publish = source[ready..]
+            .find("ensure_head_transition(&published.seal())")
+            .unwrap();
+        assert!(apply_realm_barrier < apply_publish);
         assert!(!source.contains("hard_reset_and_truncate"));
     }
 }
