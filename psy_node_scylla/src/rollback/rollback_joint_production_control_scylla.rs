@@ -863,6 +863,23 @@ async fn realm_control(
         .await
 }
 
+async fn coordinator_control(
+) -> anyhow::Result<Arc<ScyllaCoreStore<PHash, PoseidonHasher>>> {
+    let store = Arc::new(
+        ScyllaCoreStore::<PHash, PoseidonHasher>::new(
+            0,
+            0,
+            COORDINATOR_KEYSPACE.to_owned(),
+            &[NODE.to_owned()],
+        )
+        .await?,
+    );
+    establish_branch_ready(&store, AuthorityScope::Coordinator).await?;
+    store.initialize_coordinator_canonical_head(true).await?;
+    store.initialize_coordinator_rollback_admission(true).await?;
+    Ok(store)
+}
+
 async fn qualification_seed_realm_history(
     control: &ScyllaRealmRollbackRuntimeControl,
     authority: AuthorityScope,
@@ -903,22 +920,7 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
         "run through tests/rf3/run-rollback-joint-single.sh"
     );
 
-    let coordinator = Arc::new(
-        ScyllaCoreStore::<PHash, PoseidonHasher>::new(
-            0,
-            0,
-            COORDINATOR_KEYSPACE.to_owned(),
-            &[NODE.to_owned()],
-        )
-        .await?,
-    );
-    establish_branch_ready(&coordinator, AuthorityScope::Coordinator).await?;
-    coordinator
-        .initialize_coordinator_canonical_head(true)
-        .await?;
-    coordinator
-        .initialize_coordinator_rollback_admission(true)
-        .await?;
+    let mut coordinator = coordinator_control().await?;
     let (committed_head, target) =
         qualification_seed_coordinator_history(&coordinator).await?;
     let old_head = *committed_head.canonical_ref();
@@ -973,8 +975,8 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
     };
     ensure!(requested.rollback_control().requested().is_some());
 
-    let realm_10 = realm_control(REALM_10_KEYSPACE, 10).await?;
-    let realm_20 = realm_control(REALM_20_KEYSPACE, 20).await?;
+    let mut realm_10 = realm_control(REALM_10_KEYSPACE, 10).await?;
+    let mut realm_20 = realm_control(REALM_20_KEYSPACE, 20).await?;
     for (control, authority) in [
         (&realm_10, AuthorityScope::Realm { realm_id: 10, realm_sub_id: 0 }),
         (&realm_20, AuthorityScope::Realm { realm_id: 20, realm_sub_id: 0 }),
@@ -1134,6 +1136,15 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
         "only the Coordinator delete may be complete before Realm execution",
     );
 
+    // Simulate all three processes exiting immediately after the destructive
+    // PONR. Rebuild every control from the deployed keyspaces; no in-memory
+    // archive/delete capability is carried into Realm execution.
+    drop(inbox);
+    drop(boundary);
+    coordinator = coordinator_control().await?;
+    realm_10 = realm_control(REALM_10_KEYSPACE, 10).await?;
+    realm_20 = realm_control(REALM_20_KEYSPACE, 20).await?;
+
     for (control, authority) in [
         (&realm_10, realm_10_authority),
         (&realm_20, realm_20_authority),
@@ -1172,6 +1183,13 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
             "Realm delete retry selected different physical work",
         );
     }
+
+    // Lose the delete executors after every participant completion but before
+    // the global delete barrier. The Coordinator must select the exact rows
+    // again rather than trusting the previous process's return values.
+    coordinator = coordinator_control().await?;
+    realm_10 = realm_control(REALM_10_KEYSPACE, 10).await?;
+    realm_20 = realm_control(REALM_20_KEYSPACE, 20).await?;
 
     let CoordinatorRollbackGlobalProgress::Progressed(restoring_head) =
         <ScyllaCoreStore<PHash, PoseidonHasher> as CoordinatorRollbackMaintenanceExecutor<
@@ -1219,6 +1237,12 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
             "Realm target restore retry selected different final rows",
         );
     }
+
+    // Drop the target-restore owners before global verification. The next
+    // process may only advance by rereading all participant completions.
+    coordinator = coordinator_control().await?;
+    realm_10 = realm_control(REALM_10_KEYSPACE, 10).await?;
+    realm_20 = realm_control(REALM_20_KEYSPACE, 20).await?;
 
     let CoordinatorRollbackGlobalProgress::Progressed(verifying_head) =
         <ScyllaCoreStore<PHash, PoseidonHasher> as CoordinatorRollbackMaintenanceExecutor<
