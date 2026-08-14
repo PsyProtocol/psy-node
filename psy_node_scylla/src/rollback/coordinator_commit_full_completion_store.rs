@@ -80,13 +80,13 @@ impl CoordinatorCommitFullCompletionQueries {
 struct CoordinatorCommitFullCompletionStoreFingerprint([u8; 32]);
 
 #[derive(Debug)]
-pub(crate) struct PersistedCoordinatorCommitFullCompletionReceipt<Hash> {
+pub(super) struct PersistedCoordinatorCommitFullCompletionReceipt<Hash> {
     store_fingerprint: CoordinatorCommitFullCompletionStoreFingerprint,
     completion: CoordinatorCommitFullCompletion<Hash>,
 }
 
 impl<Hash> PersistedCoordinatorCommitFullCompletionReceipt<Hash> {
-    pub(crate) const fn completion(&self) -> &CoordinatorCommitFullCompletion<Hash> {
+    pub(super) const fn completion(&self) -> &CoordinatorCommitFullCompletion<Hash> {
         &self.completion
     }
 }
@@ -129,7 +129,7 @@ impl ScyllaCoordinatorCommitFullCompletionStore {
     /// into source-bound evidence. Once the LWT starts, any error is
     /// commit-indeterminate and must be recovered by retrying the same source.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn persist_after_exact_backup<Hash: Q256BitHash>(
+    pub(super) async fn persist_after_exact_backup<Hash: Q256BitHash>(
         &self,
         manifests: &ScyllaCoordinatorCommitFullManifestStore,
         sources: &ScyllaCoordinatorCommitSourceStore,
@@ -178,7 +178,7 @@ impl ScyllaCoordinatorCommitFullCompletionStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn read_after_exact_backup<Hash: Q256BitHash>(
+    pub(super) async fn read_after_exact_backup<Hash: Q256BitHash>(
         &self,
         manifests: &ScyllaCoordinatorCommitFullManifestStore,
         sources: &ScyllaCoordinatorCommitSourceStore,
@@ -220,6 +220,26 @@ impl ScyllaCoordinatorCommitFullCompletionStore {
             .completion
             .revalidate_manifest_and_backup(manifest_receipt.manifest(), backup)?;
         Ok(receipt)
+    }
+
+    /// Re-read the immutable completion immediately before or after the
+    /// COMMITTED/head sequence. This is deliberately narrower than exposing a
+    /// raw completion selector: only a receipt minted by this store and the
+    /// exact durable source can pass.
+    pub(super) async fn revalidate_for_commit<Hash: Q256BitHash>(
+        &self,
+        receipt: &PersistedCoordinatorCommitFullCompletionReceipt<Hash>,
+        source: &CoordinatorCommitSource<Hash>,
+    ) -> Result<(), CoordinatorCommitFullCompletionStoreError> {
+        self.revalidate(receipt).await?;
+        let completion = receipt.completion();
+        if completion.source_slot() != &source.slot().as_bytes()
+            || completion.source_digest() != &source.digest().as_bytes()
+            || completion.candidate() != source.candidate()
+        {
+            return Err(CoordinatorCommitFullCompletionStoreError::ReceiptBindingMismatch);
+        }
+        Ok(())
     }
 
     async fn read<Hash: Q256BitHash>(

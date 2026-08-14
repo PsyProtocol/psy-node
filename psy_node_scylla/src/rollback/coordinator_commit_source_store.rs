@@ -17,6 +17,10 @@ use psy_node_core::store::coordinator_commit_source::{
     CoordinatorCommitSourcePayload, CoordinatorRollbackFloor,
     COORDINATOR_COMMIT_SOURCE_MAX_FRAGMENTS,
 };
+use psy_node_core::store::canonical_head::{
+    CanonicalHeadReadState, CanonicalHeadWriteOutcome, SealedCanonicalHeadCas,
+    StoredCanonicalHead,
+};
 use scylla::{
     client::session::Session,
     statement::{prepared::PreparedStatement, Consistency, SerialConsistency},
@@ -28,9 +32,13 @@ use super::{
     CoordinatorRollbackFloorSingletonAnchor,
     CoordinatorRollbackFloorSingletonAnchorStoreError, CqlKeyspaceName,
     ScyllaCoordinatorRollbackFloorSingletonAnchorStore,
+    ScyllaCanonicalHeadStore,
 };
 use super::{
-    coordinator_commit_full_completion_store::ScyllaCoordinatorCommitFullCompletionStore,
+    coordinator_commit_full_completion_store::{
+        PersistedCoordinatorCommitFullCompletionReceipt,
+        ScyllaCoordinatorCommitFullCompletionStore,
+    },
     coordinator_commit_full_manifest_store::ScyllaCoordinatorCommitFullManifestStore,
 };
 
@@ -237,7 +245,7 @@ impl ScyllaCoordinatorCommitSourceStore {
         &self.full_manifests
     }
 
-    pub(crate) const fn full_completions(
+    pub(super) const fn full_completions(
         &self,
     ) -> &ScyllaCoordinatorCommitFullCompletionStore {
         &self.full_completions
@@ -392,6 +400,107 @@ impl ScyllaCoordinatorCommitSourceStore {
             Some(_) => Err(CoordinatorCommitSourceStoreError::CommittedConflict),
             None => Err(CoordinatorCommitSourceStoreError::CommittedMissingAfterWrite),
         }
+    }
+
+    /// The branch-exact route may create the append-only marker only after an
+    /// exact full-completion receipt exists. The legacy trait method remains
+    /// temporarily available until Processor cutover, but the new publisher
+    /// is statically constrained to this entry point.
+    pub(super) async fn mark_committed_after_full_completion<Hash: Q256BitHash>(
+        &self,
+        source: &CoordinatorCommitSource<Hash>,
+        completion: &PersistedCoordinatorCommitFullCompletionReceipt<Hash>,
+    ) -> Result<CoordinatorCommitSourceCommitted, CoordinatorCommitSourceStoreError> {
+        self.full_completions
+            .revalidate_for_commit(completion, source)
+            .await
+            .map_err(|error| CoordinatorCommitSourceStoreError::FullCompletion(error.to_string()))?;
+        self.mark_committed_and_readback(source).await?;
+        self.revalidate_committed_after_full_completion(source, completion)
+            .await
+    }
+
+    pub(super) async fn revalidate_committed_after_full_completion<Hash: Q256BitHash>(
+        &self,
+        source: &CoordinatorCommitSource<Hash>,
+        completion: &PersistedCoordinatorCommitFullCompletionReceipt<Hash>,
+    ) -> Result<CoordinatorCommitSourceCommitted, CoordinatorCommitSourceStoreError> {
+        self.full_completions
+            .revalidate_for_commit(completion, source)
+            .await
+            .map_err(|error| CoordinatorCommitSourceStoreError::FullCompletion(error.to_string()))?;
+        match self.read_source(source.candidate()).await? {
+            Some(current) if current == *source => {}
+            Some(_) => return Err(CoordinatorCommitSourceStoreError::SourceConflict),
+            None => return Err(CoordinatorCommitSourceStoreError::SourceMissingBeforeCommit),
+        }
+        let marker = self
+            .read_committed(source.candidate())
+            .await?
+            .ok_or(CoordinatorCommitSourceStoreError::CommittedMarkerMissing)?;
+        if !marker.matches(source) {
+            return Err(CoordinatorCommitSourceStoreError::CommittedConflict);
+        }
+        Ok(marker)
+    }
+
+    /// Minimal branch-exact finalization: completion first, COMMITTED second,
+    /// canonical head last. No generic publication capability is returned.
+    pub(super) async fn mark_committed_and_publish_head_after_full_completion<
+        Hash: Q256BitHash,
+    >(
+        &self,
+        heads: &ScyllaCanonicalHeadStore,
+        source: &CoordinatorCommitSource<Hash>,
+        completion: &PersistedCoordinatorCommitFullCompletionReceipt<Hash>,
+        sealed: &SealedCanonicalHeadCas<Hash>,
+    ) -> Result<StoredCanonicalHead<Hash>, CoordinatorCommitSourceStoreError> {
+        if source.expected_revision() != sealed.expected().revision().get()
+            || source.expected() != sealed.expected().canonical_ref()
+            || source.candidate() != sealed.candidate().canonical_ref()
+        {
+            return Err(CoordinatorCommitSourceStoreError::PublishTransitionMismatch);
+        }
+
+        match heads
+            .read(source.candidate().network_id())
+            .await
+            .map_err(|error| CoordinatorCommitSourceStoreError::CanonicalHead(error.to_string()))?
+        {
+            CanonicalHeadReadState::Current(current) if current == *sealed.candidate() => {
+                self.revalidate_committed_after_full_completion(source, completion)
+                    .await?;
+                return Ok(current);
+            }
+            CanonicalHeadReadState::Current(current) if current == *sealed.expected() => {}
+            CanonicalHeadReadState::Current(_) => {
+                return Err(CoordinatorCommitSourceStoreError::CanonicalHeadConflict);
+            }
+            CanonicalHeadReadState::Uninitialized => {
+                return Err(CoordinatorCommitSourceStoreError::CanonicalHeadMissing);
+            }
+        }
+
+        self.mark_committed_after_full_completion(source, completion)
+            .await?;
+
+        let published = match heads
+            .compare_and_set(sealed)
+            .await
+            .map_err(|error| CoordinatorCommitSourceStoreError::CanonicalHead(error.to_string()))?
+        {
+            CanonicalHeadWriteOutcome::Applied(current)
+            | CanonicalHeadWriteOutcome::Idempotent(current)
+                if current == *sealed.candidate() => current,
+            CanonicalHeadWriteOutcome::Applied(_)
+            | CanonicalHeadWriteOutcome::Idempotent(_)
+            | CanonicalHeadWriteOutcome::Conflict { .. } => {
+                return Err(CoordinatorCommitSourceStoreError::CanonicalHeadConflict);
+            }
+        };
+        self.revalidate_committed_after_full_completion(source, completion)
+            .await?;
+        Ok(published)
     }
 
     pub(crate) async fn read_source<Hash: Q256BitHash>(
@@ -733,6 +842,10 @@ pub(crate) enum CoordinatorCommitSourceStoreError {
     Inventory(String),
     FullManifest(String),
     FullCompletion(String),
+    PublishTransitionMismatch,
+    CanonicalHead(String),
+    CanonicalHeadMissing,
+    CanonicalHeadConflict,
     IndeterminateWrite(String),
     FloorSingletonAnchor(CoordinatorRollbackFloorSingletonAnchorStoreError),
 }
@@ -794,13 +907,20 @@ mod tests {
     }
 
     #[test]
-    fn production_api_does_not_expose_delete_or_head_mutation() {
+    fn branch_exact_publish_is_completion_gated_and_head_last() {
         let source = include_str!("coordinator_commit_source_store.rs")
             .split("#[cfg(test)]")
             .next()
             .unwrap();
         assert!(!source.contains("DELETE FROM"));
-        assert!(!source.contains("compare_and_set_canonical_head"));
         assert!(!source.contains("global_archive_barrier"));
+        let completion = source
+            .find("mark_committed_after_full_completion(source, completion)")
+            .unwrap();
+        let head = source.find(".compare_and_set(sealed)").unwrap();
+        let final_readback = source
+            .rfind("revalidate_committed_after_full_completion(source, completion)")
+            .unwrap();
+        assert!(completion < head && head < final_readback);
     }
 }
