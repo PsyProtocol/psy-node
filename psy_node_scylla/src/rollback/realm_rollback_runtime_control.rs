@@ -32,6 +32,8 @@ use super::{
         RealmRollbackPhysicalArchiveOwnerError,
         ScyllaRealmRollbackPhysicalArchiveOwner,
     },
+    realm_rollback_delete_restore_executor::ScyllaRealmRollbackDeleteRestoreExecutor,
+    rollback_global_archive_barrier::read_deleting_rollback_authority,
     ScyllaRollbackParticipantPlanStore,
     rollback_runtime_rebuild_store::ScyllaRollbackRuntimeRebuildStore,
     AuthorityLocalHeadNoTabletKeyspace, CanonicalHeadNoTabletKeyspace,
@@ -130,6 +132,20 @@ impl ScyllaRealmRollbackRuntimeControl {
         .await?)
     }
 
+    async fn prepare_delete_executor(
+        &self,
+    ) -> anyhow::Result<ScyllaRealmRollbackDeleteRestoreExecutor> {
+        Ok(ScyllaRealmRollbackDeleteRestoreExecutor::prepare(
+            self.session.clone(),
+            self.canonical_head.clone(),
+            self.local_head.clone(),
+            self.prepare_archive_owner().await?,
+            self.local_state_keyspace.clone(),
+            self.coordinator_archive_keyspace.clone(),
+        )
+        .await?)
+    }
+
     async fn read_head<Hash: Q256BitHash>(
         &self,
         network: NetworkId,
@@ -162,6 +178,16 @@ impl ScyllaRealmRollbackRuntimeControl {
             }
             _ => false,
         }
+    }
+
+    fn same_active_rollback<Hash: Q256BitHash>(
+        first: &StoredCanonicalHead<Hash>,
+        second: &StoredCanonicalHead<Hash>,
+    ) -> bool {
+        first.canonical_ref() == second.canonical_ref()
+            && first.rollback_control().requested()
+                == second.rollback_control().requested()
+            && first.rollback_control().requested().is_some()
     }
 }
 
@@ -229,7 +255,9 @@ impl<Hash: Q256BitHash> RealmRollbackRuntimeControl<Hash>
                 let Some(second_head) = self.read_head(network).await? else {
                     anyhow::bail!("Coordinator canonical head disappeared after Realm archive")
                 };
-                if second_head != first_head {
+                if second_head != first_head
+                    && !Self::same_active_rollback(&first_head, &second_head)
+                {
                     anyhow::bail!("Coordinator rollback phase changed during Realm archive")
                 }
                 Ok(RealmRollbackParticipantProgress::ArchivePrepared {
@@ -240,8 +268,34 @@ impl<Hash: Q256BitHash> RealmRollbackRuntimeControl<Hash>
             RollbackControlState::Verifying(_) | RollbackControlState::AllRealmsReady(_) => {
                 Ok(RealmRollbackParticipantProgress::ReadyForRuntimeRebuild(first_head))
             }
+            RollbackControlState::Deleting(_) => {
+                let deleting = read_deleting_rollback_authority::<Hash>(
+                    self.session.clone(),
+                    self.canonical_head.clone(),
+                    self.participant_plans.clone(),
+                    &self.coordinator_archive_keyspace,
+                    network,
+                )
+                .await?;
+                let mut executor = self.prepare_delete_executor().await?;
+                let completion = executor
+                    .execute_and_persist(&deleting, participant)
+                    .await?;
+                let Some(second_head) = self.read_head(network).await? else {
+                    anyhow::bail!("Coordinator canonical head disappeared after Realm delete")
+                };
+                if second_head != first_head
+                    && !Self::same_active_rollback(&first_head, &second_head)
+                {
+                    anyhow::bail!("Coordinator rollback phase changed during Realm delete")
+                }
+                Ok(RealmRollbackParticipantProgress::DeletePrepared {
+                    head: second_head,
+                    physical_delete_count: completion.completion().physical_delete_count(),
+                    restored_row_count: completion.completion().restored_row_count(),
+                })
+            }
             RollbackControlState::ArchiveBarrierReady(_)
-            | RollbackControlState::Deleting(_)
             | RollbackControlState::Restoring(_) => {
                 Ok(RealmRollbackParticipantProgress::AwaitingCoordinator(first_head))
             }

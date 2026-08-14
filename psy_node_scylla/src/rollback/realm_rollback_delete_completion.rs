@@ -45,6 +45,37 @@ pub(super) struct RealmRollbackDeleteCompletion<Hash> {
 }
 
 impl<Hash: Q256BitHash> RealmRollbackDeleteCompletion<Hash> {
+    pub(super) fn slot_for_selected(
+        network: NetworkId,
+        old_chain_epoch: u64,
+        authority: AuthorityScope,
+        participant_plan_digest: [u8; 32],
+        barrier_digest: [u8; 32],
+        archive_completion_slot: [u8; 32],
+        store_fingerprint: [u8; 32],
+    ) -> Result<[u8; 32], RealmRollbackDeleteCompletionError> {
+        if !matches!(authority, AuthorityScope::Realm { .. })
+            || [
+                participant_plan_digest,
+                barrier_digest,
+                archive_completion_slot,
+                store_fingerprint,
+            ]
+            .contains(&[0; 32])
+        {
+            return Err(RealmRollbackDeleteCompletionError::BindingMismatch);
+        }
+        Ok(completion_slot(
+            network,
+            old_chain_epoch,
+            authority,
+            &participant_plan_digest,
+            &barrier_digest,
+            &archive_completion_slot,
+            &store_fingerprint,
+        ))
+    }
+
     pub(super) fn try_from_executed(
         executed: &ExecutedRealmRollbackSuffix<Hash>,
         store_fingerprint: [u8; 32],

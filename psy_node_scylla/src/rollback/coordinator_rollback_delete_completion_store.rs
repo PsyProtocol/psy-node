@@ -24,6 +24,7 @@ use sha2::{Digest, Sha256};
 use super::{
     coordinator_commit_delete_restore_executor::ExecutedCoordinatorRollbackSuffix,
     coordinator_rollback_archive_store::COORDINATOR_ROLLBACK_SUFFIX_ARCHIVE_TABLE,
+    rollback_global_archive_barrier::DeletingRollbackGlobalArchiveBarrier,
     CqlKeyspaceName,
 };
 
@@ -62,6 +63,32 @@ pub(super) struct CoordinatorRollbackDeleteCompletion<Hash> {
 }
 
 impl<Hash: Q256BitHash> CoordinatorRollbackDeleteCompletion<Hash> {
+    pub(super) fn slot_for_authority(
+        deleting_head: &StoredCanonicalHead<Hash>,
+        target: &CanonicalChainRef<Hash>,
+        participant_plan_digest: [u8; 32],
+        store_fingerprint: [u8; 32],
+    ) -> Result<[u8; 32], CoordinatorRollbackDeleteCompletionStoreError> {
+        let Some(request) = deleting_head.rollback_control().requested() else {
+            return Err(CoordinatorRollbackDeleteCompletionStoreError::BindingMismatch);
+        };
+        if !matches!(
+            deleting_head.rollback_control(),
+            psy_node_core::store::rollback_control::RollbackControlState::Deleting(_)
+        ) || request.plan_digest().as_bytes() != &participant_plan_digest
+            || deleting_head.canonical_ref().network_id() != target.network_id()
+            || [participant_plan_digest, store_fingerprint].contains(&[0; 32])
+        {
+            return Err(CoordinatorRollbackDeleteCompletionStoreError::BindingMismatch);
+        }
+        Ok(completion_slot(
+            deleting_head,
+            target,
+            &participant_plan_digest,
+            &store_fingerprint,
+        ))
+    }
+
     fn try_from_executed(
         executed: &ExecutedCoordinatorRollbackSuffix<Hash>,
         store_fingerprint: [u8; 32],
@@ -287,6 +314,10 @@ impl<Hash: Q256BitHash> CoordinatorRollbackDeleteCompletion<Hash> {
         &self.digest
     }
 
+    pub(super) const fn store_fingerprint(&self) -> &[u8; 32] {
+        &self.store_fingerprint
+    }
+
     pub(super) const fn post_state_digest(&self) -> &[u8; 32] {
         &self.post_state_digest
     }
@@ -474,6 +505,43 @@ impl ScyllaCoordinatorRollbackDeleteCompletionStore {
             store_fingerprint: self.fingerprint,
             completion,
         })
+    }
+
+    pub(super) async fn read_for_authority<Hash: Q256BitHash>(
+        &self,
+        authority: &DeletingRollbackGlobalArchiveBarrier<Hash>,
+    ) -> Result<Option<PersistedCoordinatorRollbackDeleteCompletion<Hash>>, CoordinatorRollbackDeleteCompletionStoreError> {
+        let slot = CoordinatorRollbackDeleteCompletion::<Hash>::slot_for_authority(
+            authority.deleting_head(),
+            authority.participant_plan().target(),
+            *authority.participant_plan().digest(),
+            self.fingerprint,
+        )?;
+        let Some(completion) = self
+            .read_at::<Hash>(
+                authority.participant_plan().target().network_id(),
+                authority.participant_plan().target().chain_epoch().get(),
+                authority.participant_plan().digest(),
+                &slot,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        if completion.deleting_head() != authority.deleting_head()
+            || completion.target() != authority.participant_plan().target()
+            || completion.participant_plan_digest()
+                != authority.participant_plan().digest()
+            || completion.barrier_digest() != authority.barrier().digest()
+            || completion.store_fingerprint() != &self.fingerprint
+            || completion.slot() != &slot
+        {
+            return Err(CoordinatorRollbackDeleteCompletionStoreError::Conflict);
+        }
+        Ok(Some(PersistedCoordinatorRollbackDeleteCompletion {
+            store_fingerprint: self.fingerprint,
+            completion,
+        }))
     }
 
     async fn read_exact<Hash: Q256BitHash>(

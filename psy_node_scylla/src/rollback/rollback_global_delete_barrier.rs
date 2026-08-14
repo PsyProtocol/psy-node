@@ -591,19 +591,83 @@ impl ScyllaRollbackGlobalDeleteBarrierStore {
         Ok(())
     }
 
+    pub(super) async fn read_for_authority<Hash: Q256BitHash>(
+        &self,
+        authority: &DeletingRollbackGlobalArchiveBarrier<Hash>,
+    ) -> Result<Option<PersistedRollbackGlobalDeleteBarrier<Hash>>, RollbackGlobalDeleteBarrierError> {
+        let slot = barrier_slot(
+            authority.deleting_head(),
+            authority.participant_plan().target(),
+            authority.participant_plan().digest(),
+            authority.barrier().slot(),
+            authority.barrier().digest(),
+            &self.fingerprint,
+        );
+        let Some(barrier) = self
+            .read_at(
+                authority.participant_plan().target().network_id(),
+                authority.participant_plan().target().chain_epoch().get(),
+                authority.participant_plan().digest(),
+                &slot,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        if barrier.deleting_head() != authority.deleting_head()
+            || barrier.target() != authority.participant_plan().target()
+            || barrier.participant_plan_digest() != authority.participant_plan().digest()
+            || barrier.archive_barrier_slot() != authority.barrier().slot()
+            || barrier.archive_barrier_digest() != authority.barrier().digest()
+            || barrier.store_fingerprint != self.fingerprint
+            || barrier.slot() != &slot
+        {
+            return Err(RollbackGlobalDeleteBarrierError::Conflict);
+        }
+        Ok(Some(PersistedRollbackGlobalDeleteBarrier {
+            store_fingerprint: self.fingerprint,
+            barrier,
+        }))
+    }
+
     async fn read_exact<Hash: Q256BitHash>(
         &self,
         expected: &RollbackGlobalDeleteBarrier<Hash>,
     ) -> Result<Option<RollbackGlobalDeleteBarrier<Hash>>, RollbackGlobalDeleteBarrierError> {
+        let current = self
+            .read_at(
+                expected.target.network_id(),
+                expected.target.chain_epoch().get(),
+                &expected.participant_plan_digest,
+                &expected.slot,
+            )
+            .await?;
+        match current {
+            Some(current)
+                if current.digest == expected.digest
+                    && current.participant_plan_digest == expected.participant_plan_digest
+                    && current.slot == expected.slot => Ok(Some(current)),
+            Some(_) => Err(RollbackGlobalDeleteBarrierError::Conflict),
+            None => Ok(None),
+        }
+    }
+
+    async fn read_at<Hash: Q256BitHash>(
+        &self,
+        network: psy_data::protocol::canonical_chain::NetworkId,
+        old_chain_epoch: u64,
+        participant_plan_digest: &[u8; 32],
+        slot: &[u8; 32],
+    ) -> Result<Option<RollbackGlobalDeleteBarrier<Hash>>, RollbackGlobalDeleteBarrierError> {
         let rows = self.session.execute_unpaged(
             &self.read,
             (
-                i64::from(expected.target.network_id().chain_id()),
-                i64::try_from(expected.target.chain_epoch().get())
+                i64::from(network.chain_id()),
+                i64::try_from(old_chain_epoch)
                     .map_err(|_| RollbackGlobalDeleteBarrierError::IntegerOutOfCqlRange)?,
-                expected.participant_plan_digest.as_slice(),
+                participant_plan_digest.as_slice(),
                 KEY_DOMAIN,
-                expected.slot.as_slice(),
+                slot.as_slice(),
             ),
         ).await.map_err(cql)?.into_rows_result().map_err(cql)?
             .rows::<(
@@ -633,8 +697,10 @@ impl ScyllaRollbackGlobalDeleteBarrierStore {
         }
         let barrier = RollbackGlobalDeleteBarrier::decode_canonical(&payload)?;
         if barrier.digest != row_digest
-            || barrier.participant_plan_digest != expected.participant_plan_digest
-            || barrier.slot != expected.slot
+            || barrier.target.network_id() != network
+            || barrier.target.chain_epoch().get() != old_chain_epoch
+            || barrier.participant_plan_digest != *participant_plan_digest
+            || barrier.slot != *slot
         {
             return Err(RollbackGlobalDeleteBarrierError::Conflict);
         }

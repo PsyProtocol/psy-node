@@ -160,6 +160,17 @@ where
                                 entry_count,
                             );
                         }
+                        Ok(psy_node_core::store::rollback_runtime_rebuild::RealmRollbackParticipantProgress::DeletePrepared {
+                            physical_delete_count,
+                            restored_row_count,
+                            ..
+                        }) => {
+                            tracing::warn!(
+                                "Realm rollback hot suffix is deleted ({} physical rows, {} target rows restored); awaiting global delete barrier",
+                                physical_delete_count,
+                                restored_row_count,
+                            );
+                        }
                         Ok(psy_node_core::store::rollback_runtime_rebuild::RealmRollbackParticipantProgress::AwaitingCoordinator(_)) => {}
                         Ok(psy_node_core::store::rollback_runtime_rebuild::RealmRollbackParticipantProgress::ReadyForRuntimeRebuild(_)) => break,
                         Err(error) => {

@@ -48,6 +48,7 @@ use super::{
         REALM_TARGET_RESTORE_PLAN_KEY_DOMAIN, RealmRollbackTargetRestorePlan,
         RealmRollbackTargetRestorePlanError,
     },
+    rollback_global_archive_barrier::DeletingRollbackGlobalArchiveBarrier,
     rollback_global_delete_barrier::SelectedRealmRollbackDeleteCompletion,
 };
 
@@ -446,6 +447,62 @@ impl ScyllaRealmRollbackPhysicalArchiveStore {
             store_fingerprint: self.fingerprint,
             completion,
         })
+    }
+
+    /// Deterministically select a Realm delete completion from the exact
+    /// pre-delete archive completion and global PONR authority.  No caller
+    /// supplied result digest is used to address the row.
+    pub(super) async fn read_delete_completion_for_participant<Hash: Q256BitHash>(
+        &self,
+        deleting: &DeletingRollbackGlobalArchiveBarrier<Hash>,
+        participant: &PersistedRealmRollbackParticipantCompletion<Hash>,
+    ) -> Result<Option<PersistedRealmRollbackDeleteCompletion<Hash>>, RealmRollbackPhysicalArchiveStoreError> {
+        if participant.store_fingerprint != self.fingerprint
+            || participant.completion.target() != deleting.participant_plan().target()
+            || participant.completion.participant_plan_digest()
+                != deleting.participant_plan().digest()
+        {
+            return Err(RealmRollbackPhysicalArchiveStoreError::ReceiptBindingMismatch);
+        }
+        let completion_slot = RealmRollbackDeleteCompletion::<Hash>::slot_for_selected(
+            deleting.participant_plan().target().network_id(),
+            deleting.participant_plan().target().chain_epoch().get(),
+            participant.completion.authority(),
+            *deleting.participant_plan().digest(),
+            *deleting.barrier().digest(),
+            *participant.completion.slot(),
+            self.fingerprint,
+        )?;
+        let coordinates = ArchiveCoordinates {
+            network: i64::from(
+                deleting.participant_plan().target().network_id().chain_id(),
+            ),
+            chain_epoch: i64::try_from(
+                deleting.participant_plan().target().chain_epoch().get(),
+            )
+            .map_err(|_| RealmRollbackPhysicalArchiveStoreError::IntegerOutOfCqlRange)?,
+            participant_plan_digest: *deleting.participant_plan().digest(),
+            key_domain: REALM_DELETE_COMPLETION_KEY_DOMAIN,
+            row_slot: completion_slot,
+        };
+        let Some(completion) = self.read_delete_completion::<Hash>(&coordinates).await? else {
+            return Ok(None);
+        };
+        if completion.authority() != participant.completion.authority()
+            || completion.target() != deleting.participant_plan().target()
+            || completion.participant_plan_digest() != deleting.participant_plan().digest()
+            || completion.barrier_digest() != deleting.barrier().digest()
+            || completion.archive_completion_slot() != participant.completion.slot()
+            || completion.archive_completion_digest() != participant.completion.digest()
+            || completion.store_fingerprint() != &self.fingerprint
+            || completion.slot() != &completion_slot
+        {
+            return Err(RealmRollbackPhysicalArchiveStoreError::Conflict);
+        }
+        Ok(Some(PersistedRealmRollbackDeleteCompletion {
+            store_fingerprint: self.fingerprint,
+            completion,
+        }))
     }
 
     pub(super) async fn read_participant_completion_exact<Hash: Q256BitHash>(

@@ -521,6 +521,11 @@ pub enum RealmRollbackParticipantProgress<Hash> {
         head: StoredCanonicalHead<Hash>,
         entry_count: u64,
     },
+    DeletePrepared {
+        head: StoredCanonicalHead<Hash>,
+        physical_delete_count: u64,
+        restored_row_count: u64,
+    },
     ReadyForRuntimeRebuild(StoredCanonicalHead<Hash>),
 }
 
