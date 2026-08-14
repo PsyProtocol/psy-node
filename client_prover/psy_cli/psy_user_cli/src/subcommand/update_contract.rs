@@ -14,7 +14,7 @@ use psy_provider::{
 };
 use psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition;
 
-use super::args::UpdateContractArgs;
+use super::{args::UpdateContractArgs, contract_abi_upload};
 use crate::result::{CommandResult, UpdateResult, UpdateStatus};
 
 // #[cfg(feature = "is_sync")]
@@ -67,6 +67,7 @@ pub async fn run(args: UpdateContractArgs) -> anyhow::Result<CommandResult> {
     );
     let contract_state_tree_height =
         u8::try_from(old_abi.contract.state_tree_height).map_err(|_| anyhow::anyhow!("contract state tree height does not fit in u8"))?;
+    let new_abi_json = serde_json::to_string(&new_abi)?;
 
     tracing::info!(
         "generating circuits with immutable contract state tree height {}",
@@ -103,6 +104,16 @@ pub async fn run(args: UpdateContractArgs) -> anyhow::Result<CommandResult> {
 
     if args.is_update {
         tracing::info!("user cli updating contract {}", args.contract_id);
+        let uploaded_content_hash = contract_abi_upload::upload_update_contract_abi(
+            &rpc_config,
+            &update_cmd,
+            &new_abi_json,
+        )
+        .await?;
+        tracing::info!(
+            "uploaded updated contract ABI to psy-services for content_hash={}",
+            uploaded_content_hash
+        );
         let update_content_hash = rpc_provider
             .update_contract(QUpdateContractRPCRequest { update_contract: update_cmd })
             .await?;
