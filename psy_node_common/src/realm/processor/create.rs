@@ -15,6 +15,86 @@ use psy_node_core::{
 
 use crate::realm::processor::{core::{PsyRealmProcessor, RealmNormalCommitOwner, runner::{run_realm_processor, RealmProcessorRunExit}}, db::PsyRealmDatabaseProcessor};
 
+/// Resume only this Realm's storage-owned post-PONR executor before normal
+/// DB/tree initialization. A crash may leave the selected hot suffix partly
+/// deleted; constructing the ordinary Processor first would read that
+/// intentional intermediate state and fail before the idempotent executor can
+/// finish it.
+async fn resume_realm_post_ponr_before_runtime<Hash: parth_core::protocol::core_types::Q256BitHash>(
+    chain_id: u32,
+    realm_identifier: &QRealmIdentifier,
+    rollback_runtime_control: Option<&dyn RealmRollbackRuntimeControl<Hash>>,
+) -> anyhow::Result<Option<RollbackRuntimeRebuildDirective<Hash>>> {
+    let Some(control) = rollback_runtime_control else {
+        return Ok(None);
+    };
+    let network = psy_data::protocol::canonical_chain::NetworkId::try_from_chain_id(chain_id)?;
+    let authority = psy_data::protocol::chain_context::AuthorityScope::Realm {
+        realm_id: realm_identifier.realm_id,
+        realm_sub_id: realm_identifier.realm_sub_id,
+    };
+    loop {
+        let head = match control.read_realm_rollback_control_head(network).await? {
+            psy_node_core::store::canonical_head::CanonicalHeadReadState::Current(head) => head,
+            psy_node_core::store::canonical_head::CanonicalHeadReadState::Uninitialized => {
+                return Ok(None)
+            }
+        };
+        if !matches!(
+            head.rollback_control(),
+            psy_node_core::store::rollback_control::RollbackControlState::Deleting(_)
+                | psy_node_core::store::rollback_control::RollbackControlState::Restoring(_)
+        ) {
+            if matches!(
+                head.rollback_control(),
+                psy_node_core::store::rollback_control::RollbackControlState::Verifying(_)
+                    | psy_node_core::store::rollback_control::RollbackControlState::AllRealmsReady(_)
+            ) {
+                if let Some(selected) = control
+                    .read_selected_realm_runtime_rebuild(network, authority)
+                    .await?
+                {
+                    return Ok(Some(*selected.directive()));
+                }
+                tracing::warn!(
+                    "Realm startup recovery awaits its durable runtime rebuild directive"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+            return Ok(None);
+        }
+        match control
+            .progress_realm_rollback_participant(network, authority)
+            .await?
+        {
+            psy_node_core::store::rollback_runtime_rebuild::RealmRollbackParticipantProgress::ReadyForRuntimeRebuild(_) => {
+                continue
+            }
+            psy_node_core::store::rollback_runtime_rebuild::RealmRollbackParticipantProgress::DeletePrepared {
+                physical_delete_count,
+                restored_row_count,
+                ..
+            } => tracing::warn!(
+                "Realm startup recovery completed post-PONR delete/restore pass: {physical_delete_count} mutations, {restored_row_count} restored rows"
+            ),
+            psy_node_core::store::rollback_runtime_rebuild::RealmRollbackParticipantProgress::RestorePrepared {
+                final_rows_digest,
+                ..
+            } => tracing::warn!(
+                ?final_rows_digest,
+                "Realm startup recovery restored the selected target rows"
+            ),
+            psy_node_core::store::rollback_runtime_rebuild::RealmRollbackParticipantProgress::AwaitingCoordinator(_)
+            | psy_node_core::store::rollback_runtime_rebuild::RealmRollbackParticipantProgress::ArchivePrepared { .. } => {}
+            psy_node_core::store::rollback_runtime_rebuild::RealmRollbackParticipantProgress::AbortRequested(_) => {
+                anyhow::bail!("post-PONR Realm startup recovery observed an abort phase")
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 async fn create_realm_processor_with_restart_directive<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
     S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync + 'static,
@@ -334,6 +414,14 @@ where
     tracing::info!("[REALM_CREATE] create_and_run start");
     let mut rollback_restart_directive = None;
     loop {
+        if rollback_restart_directive.is_none() {
+            rollback_restart_directive = resume_realm_post_ponr_before_runtime(
+                chain_id,
+                &realm_identifier,
+                rollback_runtime_control.as_deref(),
+            )
+            .await?;
+        }
         let (processor, guta_gatherer_join_handle) = create_realm_processor_with_restart_directive::<N, S, STagTreeRewards, GUTAUpdateQueue, ProofWorkQueue, TempDatabase, ProofStore, FileSystem, CoordinatorClient>(
             chain_id,
             genesis_data,
@@ -421,6 +509,25 @@ mod tests {
         assert!(wrapper.contains("rollback_runtime_control,"));
         assert!(wrapper.contains("None,"));
         assert!(!wrapper.contains("RollbackRuntimeRebuildDirective"));
+    }
+
+    #[test]
+    fn post_ponr_executor_runs_before_realm_db_tree_or_actor_construction() {
+        let source = include_str!("create.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let helper = production
+            .split("async fn resume_realm_post_ponr_before_runtime")
+            .nth(1)
+            .expect("maintenance-only startup helper")
+            .split("async fn create_realm_processor_with_restart_directive")
+            .next()
+            .unwrap();
+        assert!(helper.contains("RollbackControlState::Deleting"));
+        assert!(helper.contains("RollbackControlState::Restoring"));
+        assert!(helper.contains("progress_realm_rollback_participant"));
+        assert!(helper.contains("read_selected_realm_runtime_rebuild"));
+        assert!(!helper.contains("PsyRealmDatabaseProcessor::<"));
+        assert!(!helper.contains("PsyRealmProcessor::new"));
     }
 
     #[test]

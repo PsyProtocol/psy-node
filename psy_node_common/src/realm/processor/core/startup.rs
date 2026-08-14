@@ -71,12 +71,60 @@ where
             .await?
             .into_tuple();
         tracing::info!("[REALM_STARTUP] load_realm_memory_trees_from_db done");
+        let rollback_target_is_published = if let Some(directive) = rollback_restart_directive.as_ref() {
+            let control = rollback_runtime_control.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Realm rollback restart directive requires durable rollback control"
+                )
+            })?;
+            let network = psy_data::protocol::canonical_chain::NetworkId::try_from_chain_id(
+                db.state.chain_id,
+            )?;
+            let head = match control.read_realm_rollback_control_head(network).await? {
+                psy_node_core::store::canonical_head::CanonicalHeadReadState::Current(head) => head,
+                psy_node_core::store::canonical_head::CanonicalHeadReadState::Uninitialized => {
+                    anyhow::bail!("Realm rollback restart canonical head is missing")
+                }
+            };
+            match head.rollback_control() {
+                psy_node_core::store::rollback_control::RollbackControlState::Idle => {
+                    if head.canonical_ref() != directive.target() {
+                        anyhow::bail!(
+                            "Realm rollback restart directive does not match published target"
+                        )
+                    }
+                    true
+                }
+                psy_node_core::store::rollback_control::RollbackControlState::Verifying(request)
+                | psy_node_core::store::rollback_control::RollbackControlState::AllRealmsReady(
+                    request,
+                ) => {
+                    if head.canonical_ref().network_id() != directive.target().network_id()
+                        || head.canonical_ref().chain_epoch() != directive.target().chain_epoch()
+                        || request.target() != directive.target().checkpoint()
+                        || request.plan_digest().as_bytes()
+                            != directive.participant_plan_digest()
+                    {
+                        anyhow::bail!(
+                            "Realm rollback restart directive does not match active request"
+                        )
+                    }
+                    false
+                }
+                _ => anyhow::bail!(
+                    "Realm rollback restart requires VERIFYING, ALL_REALMS_READY, or published target"
+                ),
+            }
+        } else {
+            false
+        };
         db.init_with_setup_and_genesis(
             &file_system,
             &guta_gatherer_backup_directory,
             genesis_block_update,
             &mut global_user_tree,
             rollback_restart_directive,
+            rollback_target_is_published,
         )
             .await?;
         tracing::info!("[REALM_STARTUP] init_with_setup_and_genesis done");

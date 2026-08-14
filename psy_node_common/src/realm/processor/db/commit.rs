@@ -60,6 +60,7 @@ where
     pub(super) async fn resume_rollback_unique_ids(
         &mut self,
         directive: &RollbackRuntimeRebuildDirective<N::QHash>,
+        rollback_target_is_published: bool,
     ) -> anyhow::Result<()> {
         let authority = AuthorityScope::Realm {
             realm_id: self.state.realm_identifier.realm_id,
@@ -151,7 +152,13 @@ where
                 self.state.gathering_proc_checkpoint_unique_id,
             )
             .await?;
-        self.publish_current_pending_context().await?;
+        if rollback_target_is_published {
+            self.publish_current_pending_context().await?;
+        } else {
+            self.temp_db
+                .clear_current_pending_context(&self.state.realm_identifier)
+                .await?;
+        }
         self.shared_state.update_from_core_state(&self.state).await?;
         Ok(())
     }
@@ -531,12 +538,13 @@ mod rollback_restart_pending_tests {
             .find("self.state.gathering_unique_pending_id =")
             .unwrap();
         let publish = method
-            .find("self.publish_current_pending_context().await")
+            .find("if rollback_target_is_published")
             .unwrap();
         assert!(current < processing && processing < gathering && gathering < publish);
         assert!(method.contains("directive.target().checkpoint().checkpoint_id()"));
         assert!(method.contains("gathering.pending_id().get()"));
         assert!(method.contains("processing.pending_id().get()"));
+        assert!(method.contains("clear_current_pending_context"));
         assert_eq!(method.matches("ensure_consumer(").count(), 2);
     }
 
@@ -548,7 +556,7 @@ mod rollback_restart_pending_tests {
             .nth(1)
             .unwrap();
         let restart = method
-            .find("self.resume_rollback_unique_ids(directive)")
+            .find("self.resume_rollback_unique_ids(directive, rollback_target_is_published)")
             .unwrap();
         let normal = method
             .find("self.set_new_unique_ids(Some(current_realm_root))")
@@ -557,5 +565,15 @@ mod rollback_restart_pending_tests {
             .find("self.guta_queue_key_status_manager")
             .unwrap();
         assert!(restart < normal && normal < queue);
+        let prefix = method
+            .split("// 4. Ordinary startup may fast-forward from Coordinator")
+            .nth(1)
+            .expect("rollback-aware Coordinator sync guard")
+            .split("// 7. Initialize Unique IDs")
+            .next()
+            .unwrap();
+        assert_eq!(prefix.matches("if !rollback_restart").count(), 2);
+        assert!(prefix.contains("sync_to_coordinator_set_checkpoint_id"));
+        assert!(prefix.contains("sync_from_coordinator_client"));
     }
 }

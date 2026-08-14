@@ -18,6 +18,7 @@ use psy_node_core::{
     },
     store::rollback_runtime_rebuild::{
         CoordinatorRollbackRuntimePublication, CoordinatorRollbackRuntimeRebuildStore,
+        RollbackRuntimeRebuildDirective,
     },
     store::canonical_head::StoredCanonicalHead,
     store::realm_processor_quiescence::RealmProcessorDrainRequest,
@@ -32,7 +33,10 @@ use crate::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CoordinatorProcessorRunExit<Hash> {
     ShutdownRequested,
-    RestartAfterRollback(StoredCanonicalHead<Hash>),
+    RestartAfterRollback {
+        published: StoredCanonicalHead<Hash>,
+        directive: RollbackRuntimeRebuildDirective<Hash>,
+    },
 }
 
 struct CoordinatorRollbackGathererPauseSet {
@@ -195,6 +199,28 @@ where
                                     }
                                 }
                             }
+                            let rollback_restart_directive = match processor
+                                .db
+                                .read_selected_coordinator_runtime_rebuild()
+                                .await
+                            {
+                                Ok(Some(directive)) => directive,
+                                Ok(None) => {
+                                    tracing::warn!(
+                                        "[COORDINATOR] Rollback runtime directive is not available before target publication"
+                                    );
+                                    continue;
+                                }
+                                Err(error) => {
+                                    let error = format!(
+                                        "Coordinator rollback runtime directive selection failed closed at slot {}: {:#}",
+                                        current_slot, error,
+                                    );
+                                    processor.db.status.set_error(error.clone());
+                                    tracing::error!("{error}");
+                                    continue;
+                                }
+                            };
                             match processor
                                 .db
                                 .try_publish_restored_runtime()
@@ -212,11 +238,10 @@ where
                                         published.canonical_ref().checkpoint().checkpoint_id().get(),
                                         published.canonical_ref().chain_epoch().get(),
                                     );
-                                    return Ok(
-                                        CoordinatorProcessorRunExit::RestartAfterRollback(
-                                            published,
-                                        ),
-                                    );
+                                    return Ok(CoordinatorProcessorRunExit::RestartAfterRollback {
+                                        published,
+                                        directive: rollback_restart_directive,
+                                    });
                                 }
                                 Err(error) => {
                                     let error = format!(

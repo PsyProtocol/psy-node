@@ -6,7 +6,9 @@ use psy_core::{
     job::job_id::QProvingJobDataID,
 };
 use psy_data::{
-    config::network_config::PsyNodeCircuitFingerprintConfig, genesis::genesis_block_setup::PsyGenesisBlockSetupData,
+    config::network_config::PsyNodeCircuitFingerprintConfig,
+    genesis::genesis_block_setup::PsyGenesisBlockSetupData,
+    protocol::canonical_chain::NetworkId,
 };
 use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
@@ -20,15 +22,86 @@ use psy_node_core::{
     },
     store::traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore},
     store::canonical_head::{
-        CanonicalHeadBootstrapProfile, CoordinatorCanonicalHeadStore,
+        CanonicalHeadBootstrapProfile, CanonicalHeadReadState,
+        CoordinatorCanonicalHeadStore,
     },
+    store::rollback_control::RollbackControlState,
     store::rollback_admission::CoordinatorRollbackAdmissionStore,
-    store::rollback_participant_maintenance::CoordinatorRollbackMaintenanceExecutor,
-    store::rollback_runtime_rebuild::CoordinatorRollbackRuntimeRebuildStore,
+    store::rollback_participant_maintenance::{
+        CoordinatorRollbackGlobalProgress, CoordinatorRollbackMaintenanceExecutor,
+    },
+    store::rollback_runtime_rebuild::{
+        CoordinatorRollbackRuntimeRebuildStore, RollbackRuntimeRebuildDirective,
+    },
     store::coordinator_processor_branch_exact_runtime::CoordinatorBranchExactProcessorOwner,
 };
 
 use crate::coordinator::processor::{PsyCoordinatorProcessor, db::PsyCoordinatorDatabaseProcessor, runner::run_coordinator_processor};
+
+/// Resume only the storage-owned post-PONR executor before constructing a
+/// normal Coordinator runtime. During DELETING/RESTORING the hot singleton
+/// and suffix rows may be intentionally absent, so normal startup must not
+/// inspect them until the idempotent executor has reached VERIFYING.
+async fn resume_coordinator_post_ponr_before_runtime<
+    N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
+    S: CoordinatorRollbackMaintenanceExecutor<N::F, N::QHash>
+        + CoordinatorRollbackRuntimeRebuildStore<N::QHash>
+        + Send
+        + Sync,
+>(
+    network: PsyChainNetworkType,
+    canonical_head_store: &dyn CoordinatorCanonicalHeadStore<N::QHash>,
+    db: &S,
+) -> anyhow::Result<Option<RollbackRuntimeRebuildDirective<N::QHash>>> {
+    let network_id = NetworkId::from(network);
+    loop {
+        let head = match canonical_head_store.read_canonical_head(network_id).await? {
+            CanonicalHeadReadState::Current(head) => head,
+            CanonicalHeadReadState::Uninitialized => return Ok(None),
+        };
+        if !matches!(
+            head.rollback_control(),
+            RollbackControlState::Deleting(_) | RollbackControlState::Restoring(_)
+        ) {
+            if matches!(
+                head.rollback_control(),
+                RollbackControlState::Verifying(_) | RollbackControlState::AllRealmsReady(_)
+            ) {
+                if let Some(directive) = db
+                    .read_selected_coordinator_runtime_rebuild(network_id)
+                    .await?
+                {
+                    return Ok(Some(directive));
+                }
+                tracing::warn!(
+                    "Coordinator startup recovery awaits its durable runtime rebuild directive"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+            return Ok(None);
+        }
+        match db
+            .progress_coordinator_rollback(network_id, N::CHECKPOINT_TREE_HEIGHT)
+            .await?
+        {
+            CoordinatorRollbackGlobalProgress::ReadyForRuntimeRebuild(_) => continue,
+            CoordinatorRollbackGlobalProgress::AwaitingParticipants {
+                completed,
+                expected,
+                ..
+            } => tracing::warn!(
+                "Coordinator startup recovery awaits post-PONR participants: {completed}/{expected}"
+            ),
+            CoordinatorRollbackGlobalProgress::Progressed(current) => tracing::warn!(
+                "Coordinator startup recovery advanced durable rollback phase at epoch {}, checkpoint {}",
+                current.canonical_ref().chain_epoch().get(),
+                current.canonical_ref().checkpoint().checkpoint_id().get(),
+            ),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
 
 async fn create_coordinator_processor_with_processing_owner<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
@@ -65,6 +138,7 @@ async fn create_coordinator_processor_with_processing_owner<
         Option<Arc<dyn CoordinatorGutaDurableSubmissionStore<N::QHash>>>,
     normal_processing_owner:
         crate::coordinator::processor::CoordinatorNormalProcessingOwner,
+    rollback_restart_directive: Option<RollbackRuntimeRebuildDirective<N::QHash>>,
     guta_update_queue: Arc<GUTAUpdateQueue>,
     register_user_queue: Arc<RegisterUserQueue>,
     deploy_contract_queue: Arc<DeployContractQueue>,
@@ -194,6 +268,7 @@ where
         guta_gatherer_backup_directory,
         durable_guta_submissions,
         normal_processing_owner,
+        rollback_restart_directive,
     )
     .await?;
     tracing::info!("[COORD_CREATE] processor new done");
@@ -288,6 +363,7 @@ where
         proof_store,
         durable_guta_submissions,
         crate::coordinator::processor::CoordinatorNormalProcessingOwner::legacy(),
+        None,
         guta_update_queue,
         register_user_queue,
         deploy_contract_queue,
@@ -394,6 +470,7 @@ where
         crate::coordinator::processor::CoordinatorNormalProcessingOwner::branch_exact(
             branch_exact_owner,
         ),
+        None,
         guta_update_queue,
         register_user_queue,
         deploy_contract_queue,
@@ -555,8 +632,17 @@ where
     FileSystem::File: Send + Sync,
 {
     tracing::info!("[COORD_CREATE] create_and_run start");
+    let mut rollback_restart_directive = None;
     loop {
-        let (processor, guta_gatherer_join_handle, register_users_gatherer_join_handle, deploy_contracts_gatherer_join_handle) = create_coordinator_processor_with_durable_guta_submissions::<N, S, STagTreeRewards, GUTAUpdateQueue, RegisterUserQueue, DeployContractQueue, ProofWorkQueue, TempDatabase, ProofStore, FileSystem>(
+        if rollback_restart_directive.is_none() {
+            rollback_restart_directive = resume_coordinator_post_ponr_before_runtime::<N, S>(
+                network,
+                canonical_head_store.as_ref(),
+                db.as_ref(),
+            )
+            .await?;
+        }
+        let (processor, guta_gatherer_join_handle, register_users_gatherer_join_handle, deploy_contracts_gatherer_join_handle) = create_coordinator_processor_with_processing_owner::<N, S, STagTreeRewards, GUTAUpdateQueue, RegisterUserQueue, DeployContractQueue, ProofWorkQueue, TempDatabase, ProofStore, FileSystem>(
             genesis_data,
             network,
             canonical_head_bootstrap_profile,
@@ -572,6 +658,8 @@ where
             temp_db.clone(),
             proof_store.clone(),
             durable_guta_submissions.clone(),
+            crate::coordinator::processor::CoordinatorNormalProcessingOwner::legacy(),
+            rollback_restart_directive.take(),
             guta_update_queue.clone(),
             register_user_queue.clone(),
             deploy_contract_queue.clone(),
@@ -593,9 +681,11 @@ where
             super::core::runner::CoordinatorProcessorRunExit::ShutdownRequested => {
                 return Ok(())
             }
-            super::core::runner::CoordinatorProcessorRunExit::RestartAfterRollback(
+            super::core::runner::CoordinatorProcessorRunExit::RestartAfterRollback {
                 published,
-            ) => {
+                directive,
+            } => {
+                rollback_restart_directive = Some(directive);
                 tracing::warn!(
                     "Coordinator rollback target {} at epoch {} is published; recreating all three gatherer trees from restored storage",
                     published.canonical_ref().checkpoint().checkpoint_id().get(),
@@ -732,8 +822,11 @@ mod tests {
             .nth(1)
             .expect("Coordinator create-and-run entry");
         let recreate_loop = function.find("loop {").expect("recreate loop");
+        let maintenance_resume = function
+            .find("resume_coordinator_post_ponr_before_runtime::<")
+            .expect("post-PONR maintenance resume");
         let create = function
-            .find("create_coordinator_processor_with_durable_guta_submissions::<")
+            .find("create_coordinator_processor_with_processing_owner::<")
             .expect("processor construction");
         let run = function
             .find("match run_coordinator_processor(")
@@ -744,8 +837,34 @@ mod tests {
         let shutdown = function
             .find("CoordinatorProcessorRunExit::ShutdownRequested")
             .expect("shutdown branch");
-        assert!(recreate_loop < create && create < run);
+        let consume = function
+            .find("rollback_restart_directive.take()")
+            .expect("restart directive consumption");
+        let retain = function
+            .find("rollback_restart_directive = Some(directive)")
+            .expect("restart directive retention");
+        assert!(recreate_loop < maintenance_resume && maintenance_resume < create && create < run);
+        assert!(create < consume && consume < run && restart < retain);
         assert!(run < shutdown && run < restart);
         assert!(!function[restart..].contains("return Ok(())"));
+    }
+
+    #[test]
+    fn post_ponr_executor_runs_before_coordinator_db_or_actor_construction() {
+        let source = include_str!("create.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let helper = production
+            .split("async fn resume_coordinator_post_ponr_before_runtime")
+            .nth(1)
+            .expect("maintenance-only startup helper")
+            .split("async fn create_coordinator_processor_with_processing_owner")
+            .next()
+            .unwrap();
+        assert!(helper.contains("RollbackControlState::Deleting"));
+        assert!(helper.contains("RollbackControlState::Restoring"));
+        assert!(helper.contains("progress_coordinator_rollback"));
+        assert!(helper.contains("read_selected_coordinator_runtime_rebuild"));
+        assert!(!helper.contains("PsyCoordinatorDatabaseProcessor::<"));
+        assert!(!helper.contains("PsyCoordinatorProcessor::new"));
     }
 }

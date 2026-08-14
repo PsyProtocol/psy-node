@@ -429,8 +429,10 @@ pub enum CoordinatorRollbackRuntimePublication<Hash> {
 }
 
 /// Storage-selected Realm rebuild work.  This is a read-only observation:
-/// only the Coordinator control store may select the exact VERIFYING head and
-/// its matching immutable directive, and this value grants no head mutation.
+/// only the Coordinator control store may select the exact VERIFYING or
+/// ALL_REALMS_READY head and its matching immutable directive, and this value
+/// grants no head mutation. The latter phase is needed when a process restarts
+/// after its report was already included in the global ready barrier.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SelectedRealmRollbackRuntimeRebuild<Hash> {
     verifying_head: StoredCanonicalHead<Hash>,
@@ -443,7 +445,8 @@ impl<Hash: Q256BitHash> SelectedRealmRollbackRuntimeRebuild<Hash> {
         directive: RollbackRuntimeRebuildDirective<Hash>,
     ) -> Result<Self, RollbackRuntimeRebuildError> {
         let request = match verifying_head.rollback_control() {
-            RollbackControlState::Verifying(request) => request,
+            RollbackControlState::Verifying(request)
+            | RollbackControlState::AllRealmsReady(request) => request,
             _ => return Err(RollbackRuntimeRebuildError::RuntimeStateMismatch),
         };
         if !matches!(directive.authority(), AuthorityScope::Realm { .. })

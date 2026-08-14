@@ -12,7 +12,10 @@ use psy_node_core::{
         ephemeral::QStandardEphemeralQueueSubscriber,
         worker_queue::QStandardWorkerQueuePublisher,
     },
-    store::traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore},
+    store::{
+        rollback_runtime_rebuild::RollbackRuntimeRebuildDirective,
+        traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore},
+    },
 };
 
 use crate::{
@@ -77,6 +80,7 @@ where
         durable_guta_submissions:
             Option<Arc<dyn CoordinatorGutaDurableSubmissionStore<N::QHash>>>,
         normal_processing_owner: super::CoordinatorNormalProcessingOwner,
+        rollback_restart_directive: Option<RollbackRuntimeRebuildDirective<N::QHash>>,
     ) -> anyhow::Result<(
         Self,
         tokio::task::JoinHandle<Result<(), anyhow::Error>>,
@@ -105,6 +109,7 @@ where
             &mut global_user_tree,
             &mut global_contract_tree,
             &mut user_registration_tree,
+            rollback_restart_directive.as_ref(),
         )
         .await?;
         tracing::info!("[COORD_STARTUP] init_with_setup_and_genesis done");

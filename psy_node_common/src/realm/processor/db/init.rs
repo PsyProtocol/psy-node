@@ -696,8 +696,10 @@ where
         genesis_block_update: PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate<N::F, N::QHash>,
         global_user_tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
         rollback_restart_directive: Option<RollbackRuntimeRebuildDirective<N::QHash>>,
+        rollback_target_is_published: bool,
     ) -> anyhow::Result<()> {
         let genesis_checkpoint_root = genesis_block_update.coordinator_update.checkpoint_sync_info.checkpoint_tree_root;
+        let rollback_restart = rollback_restart_directive.is_some();
 
         // 1. Genesis Check
         self.ensure_genesis_applied(genesis_block_update).await?;
@@ -713,8 +715,13 @@ where
                 .await?;
         }
 
-        // 4. Fast Forward / Sync with Coordinator
-        self.sync_to_coordinator_set_checkpoint_id().await?;
+        // 4. Ordinary startup may fast-forward from Coordinator. A rollback
+        // restart must instead remain on the locally restored target selected
+        // by its immutable directive: until global publication the
+        // Coordinator control row can still expose the abandoned old height.
+        if !rollback_restart {
+            self.sync_to_coordinator_set_checkpoint_id().await?;
+        }
 
         // 5. Refresh Internal State
         let current_realm_root = self.db.global_user_tree_get_node(self.state.last_committed_checkpoint_id, self.realm_root_node).await?;
@@ -726,9 +733,14 @@ where
         self.state.gathering_realm_start_root = current_realm_root;
 
         // 6. Final Sync of Checkpoint Manager (Tip Verification)
-        self.checkpoint_tree_backup_manager
-            .sync_from_coordinator_client::<CoordinatorClient, N::F>(&self.coordinator_client, 2000)
-            .await?;
+        if !rollback_restart {
+            self.checkpoint_tree_backup_manager
+                .sync_from_coordinator_client::<CoordinatorClient, N::F>(
+                    &self.coordinator_client,
+                    2000,
+                )
+                .await?;
+        }
 
         let head_checkpoint_id = self.checkpoint_tree_backup_manager.get_current_checkpoint_id_head();
         let head_checkpoint_root = self.checkpoint_tree_backup_manager.get_current_checkpoint_tree_root_head();
@@ -755,7 +767,8 @@ where
 
         // 7. Initialize Unique IDs for new work
         if let Some(directive) = rollback_restart_directive.as_ref() {
-            self.resume_rollback_unique_ids(directive).await?;
+            self.resume_rollback_unique_ids(directive, rollback_target_is_published)
+                .await?;
         } else {
             self.set_new_unique_ids(Some(current_realm_root)).await?;
         }

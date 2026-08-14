@@ -71,7 +71,7 @@ use psy_node_core::{
         },
         rollback_runtime_rebuild::{
             CoordinatorRollbackRuntimePublication, CoordinatorRollbackRuntimeRebuildStore,
-            RollbackRuntimeRebuildReport,
+            RollbackRuntimeRebuildDirective, RollbackRuntimeRebuildReport,
         },
         traits::proof_store::QParthProofStore,
     },
@@ -1170,6 +1170,21 @@ impl<
         Ok(Some(report))
     }
 
+    /// Re-select the immutable rollback restart directive while VERIFYING or
+    /// ALL_REALMS_READY is still durable. The runner retains this exact value
+    /// across target publication because an Idle head intentionally no longer
+    /// exposes the maintenance selector.
+    pub async fn read_selected_coordinator_runtime_rebuild(
+        &self,
+    ) -> anyhow::Result<Option<RollbackRuntimeRebuildDirective<N::QHash>>>
+    where
+        S: CoordinatorRollbackRuntimeRebuildStore<N::QHash>,
+    {
+        self.db
+            .read_selected_coordinator_runtime_rebuild(self.network_id)
+            .await
+    }
+
     pub async fn try_publish_restored_runtime(
         &mut self,
     ) -> anyhow::Result<CoordinatorRollbackRuntimePublication<N::QHash>>
@@ -1469,6 +1484,173 @@ checkpoint_backup_copy_status={}
         );
         Ok(())
     }
+    /// Install the exact processing/gathering pair allocated by the durable
+    /// rollback restore. Startup must not increment the pending counter here:
+    /// doing so would skip the globally verified generation immediately after
+    /// publishing the restored target.
+    async fn resume_rollback_unique_ids(
+        &mut self,
+        directive: &RollbackRuntimeRebuildDirective<N::QHash>,
+    ) -> anyhow::Result<()> {
+        if directive.authority() != AuthorityScope::Coordinator
+            || directive.target().network_id() != self.network_id
+            || directive.target().checkpoint().checkpoint_id().get() != self.ids.checkpoint_id
+        {
+            anyhow::bail!("Coordinator rollback restart directive identity mismatch")
+        }
+        let processing = directive.processing().ok_or_else(|| {
+            anyhow::anyhow!("Coordinator rollback restart directive is missing processing")
+        })?;
+        let gathering = directive.gathering().ok_or_else(|| {
+            anyhow::anyhow!("Coordinator rollback restart directive is missing gathering")
+        })?;
+        if gathering.pending_id().get()
+            != processing
+                .pending_id()
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("Coordinator rollback pending namespace overflow"))?
+        {
+            anyhow::bail!("Coordinator rollback restart pending contexts are not adjacent")
+        }
+        let head = self
+            .canonical_head
+            .ok_or_else(|| anyhow::anyhow!("Coordinator rollback restart canonical head is missing"))?;
+        match head.rollback_control() {
+            psy_node_core::store::rollback_control::RollbackControlState::Verifying(request)
+            | psy_node_core::store::rollback_control::RollbackControlState::AllRealmsReady(
+                request,
+            ) => {
+                if head.canonical_ref().network_id() != directive.target().network_id()
+                    || head.canonical_ref().chain_epoch() != directive.target().chain_epoch()
+                    || request.target() != directive.target().checkpoint()
+                    || request.plan_digest().as_bytes() != directive.participant_plan_digest()
+                {
+                    anyhow::bail!(
+                        "Coordinator rollback restart directive does not match active request"
+                    )
+                }
+            }
+            psy_node_core::store::rollback_control::RollbackControlState::Idle => {
+                if head.canonical_ref() != directive.target() {
+                    anyhow::bail!(
+                        "Coordinator rollback restart directive does not match published target"
+                    )
+                }
+            }
+            _ => anyhow::bail!(
+                "Coordinator rollback restart requires VERIFYING, ALL_REALMS_READY, or published target"
+            ),
+        }
+        let durable_current = self.db.get_current_unique_pending_id().await?;
+        if durable_current
+            != (
+                gathering.pending_id().get(),
+                QCoreProcCheckpointUniqueId::from(
+                    gathering.proc_checkpoint_id().as_u128(),
+                ),
+            )
+        {
+            anyhow::bail!(
+                "Coordinator rollback gathering context is not the durable current pending"
+            )
+        }
+
+        self.guta_update_queue.ensure_stream().await?;
+        self.register_user_queue.ensure_stream().await?;
+        self.deploy_contract_queue.ensure_stream().await?;
+        self.proof_work_queue.ensure_stream().await?;
+        let realm_id = self.ids.realm_id_u64;
+        let realm_sub_id = self.ids.realm_sub_id_u64;
+        for proc_id in [processing.proc_checkpoint_id(), gathering.proc_checkpoint_id()] {
+            let unique_id = proc_id.as_u128();
+            let guta_key = CoordinatorSubmitRealmGUTAUpdateQueueKey {
+                realm_id,
+                realm_sub_id,
+                unique_id,
+                task_group: 0,
+                queue_type: QPBaseQueueType::StandardEphemeral,
+                _phantom_queue_item: std::marker::PhantomData::<
+                    CoordinatorGutaQueueItem<N::F, N::QHash>,
+                >,
+            };
+            let registration_key = CoordinatorRegisterUserPublicKeyQueueKey {
+                realm_id,
+                realm_sub_id,
+                unique_id,
+                task_group: 0,
+                queue_type: QPBaseQueueType::StandardEphemeral,
+                _phantom_queue_item: std::marker::PhantomData::<PZKPublicKeyInfo<N::QHash>>,
+            };
+            let deploy_key = CoordinatorDeployContractQueueKey {
+                realm_id,
+                realm_sub_id,
+                unique_id,
+                task_group: 0,
+                queue_type: QPBaseQueueType::StandardEphemeral,
+                _phantom_queue_item: std::marker::PhantomData::<
+                    PsyDeployContractQueueItem<N::F, N::QHash>,
+                >,
+            };
+            let proof_key = CoordinatorProvingWorkQueueKey {
+                realm_id,
+                realm_sub_id,
+                unique_id,
+                task_group: 0,
+                queue_type: QPBaseQueueType::WorkerQueue,
+                _phantom_queue_item: std::marker::PhantomData::<
+                    PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>,
+                >,
+            };
+            self.guta_update_queue
+                .ensure_consumer(&guta_key, realm_id, realm_sub_id, unique_id, 0)
+                .await?;
+            self.register_user_queue
+                .ensure_consumer(&registration_key, realm_id, realm_sub_id, unique_id, 0)
+                .await?;
+            self.deploy_contract_queue
+                .ensure_consumer(&deploy_key, realm_id, realm_sub_id, unique_id, 0)
+                .await?;
+            self.proof_work_queue
+                .ensure_consumer(&proof_key, realm_id, realm_sub_id, unique_id, 0)
+                .await?;
+        }
+
+        self.ids.unique_pending_id = processing.pending_id().get();
+        self.ids.proc_checkpoint_unique_id = processing.proc_checkpoint_id().as_u128();
+        self.ids.gathering_unique_pending_id = gathering.pending_id().get();
+        self.ids.gathering_proc_checkpoint_unique_id = gathering.proc_checkpoint_id().as_u128();
+        let gathering_proc = gathering.proc_checkpoint_id().as_u128();
+        self.guta_queue_key_status_manager
+            .set_unique_id(gathering_proc)?;
+        self.register_user_queue_key_status_manager
+            .set_unique_id(gathering_proc)?;
+        self.deploy_contract_queue_key_status_manager
+            .set_unique_id(gathering_proc)?;
+        self.temp_db
+            .set_unique_pending_ids(
+                &self.ids.realm_identifier,
+                self.ids.unique_pending_id,
+                self.ids.proc_checkpoint_unique_id,
+            )
+            .await?;
+        self.temp_db
+            .set_gathering_unique_pending_ids(
+                &self.ids.realm_identifier,
+                self.ids.gathering_unique_pending_id,
+                self.ids.gathering_proc_checkpoint_unique_id,
+            )
+            .await?;
+        if head.rollback_control().is_idle() {
+            self.publish_current_pending_context().await?;
+        } else {
+            self.temp_db
+                .clear_current_pending_context(&self.ids.realm_identifier)
+                .await?;
+        }
+        Ok(())
+    }
+
     pub async fn set_new_unique_ids(&mut self) -> anyhow::Result<()> {
         println!(
             "old_unique_pending_id: {}, old_proc_checkpoint_unique_id: {}",
@@ -2217,6 +2399,7 @@ Checkpoint Root Hash: {}
         global_user_tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
         global_contract_tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
         user_registration_tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
+        rollback_restart_directive: Option<&RollbackRuntimeRebuildDirective<N::QHash>>,
     ) -> anyhow::Result<()> {
         self.ensure_genesis_applied(genesis_block_update).await?;
         self.ensure_backup_restored_if_necessary(
@@ -2229,7 +2412,11 @@ Checkpoint Root Hash: {}
             user_registration_tree,
         )
         .await?;
-        self.set_new_unique_ids().await?;
+        if let Some(directive) = rollback_restart_directive {
+            self.resume_rollback_unique_ids(directive).await?;
+        } else {
+            self.set_new_unique_ids().await?;
+        }
 
         self.shared_status.update_status(
             self.ids.gathering_unique_pending_id,
@@ -2254,6 +2441,27 @@ Checkpoint Root Hash: {}
 mod tests {
     use super::*;
     use parth_core::{pgoldilocks::PoseidonHasher, PHash};
+
+    #[test]
+    fn rollback_restart_reuses_exact_coordinator_pending_pair_without_allocation() {
+        let source = include_str!("db.rs");
+        let method = source
+            .split("async fn resume_rollback_unique_ids")
+            .nth(1)
+            .expect("Coordinator rollback restart method")
+            .split("pub async fn set_new_unique_ids")
+            .next()
+            .unwrap();
+        assert!(!method.contains("inc_unique_pending_id"));
+        assert!(method.contains("get_current_unique_pending_id"));
+        assert!(method.contains("RollbackControlState::Verifying"));
+        assert!(method.contains("RollbackControlState::AllRealmsReady"));
+        assert!(method.contains("RollbackControlState::Idle"));
+        assert!(method.contains("clear_current_pending_context"));
+        assert!(method.contains("publish_current_pending_context"));
+        assert_eq!(method.matches("ensure_consumer(").count(), 4);
+        assert_eq!(method.matches("set_unique_id(gathering_proc)").count(), 3);
+    }
 
     #[test]
     fn rollback_runtime_rebuild_only_mutates_derived_process_state() {

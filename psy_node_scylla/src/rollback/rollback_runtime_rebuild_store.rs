@@ -787,7 +787,10 @@ impl ScyllaRollbackRuntimeRebuildStore {
         Ok(current.directive)
     }
 
-    /// Select the storage-authored directive from the exact VERIFYING head.
+    /// Select the storage-authored directive from the exact VERIFYING or
+    /// ALL_REALMS_READY head. The directive is immutable; accepting the
+    /// latter phase lets a restarted participant recover after its report was
+    /// already included in the global ready barrier.
     /// The caller supplies only its authority identity; target, epoch, and plan
     /// are selected from the durable Coordinator row.
     pub(crate) async fn read_selected_directive<Hash: Q256BitHash>(
@@ -796,7 +799,8 @@ impl ScyllaRollbackRuntimeRebuildStore {
         authority: AuthorityScope,
     ) -> Result<Option<RollbackRuntimeRebuildDirective<Hash>>, RollbackRuntimeRebuildStoreError> {
         let request = match verifying_head.rollback_control() {
-            RollbackControlState::Verifying(request) => request,
+            RollbackControlState::Verifying(request)
+            | RollbackControlState::AllRealmsReady(request) => request,
             _ => return Err(RollbackRuntimeRebuildStoreError::NotVerifying),
         };
         let target = CanonicalChainRef::new(
