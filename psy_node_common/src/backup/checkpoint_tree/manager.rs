@@ -2,22 +2,182 @@ use std::sync::Arc;
 
 use parth_common::memory_stores::{dash_tree_append_only::PsyDashMemoryAppendOnlyMerkleStore, traits::PsyMemoryMerkleStoreImm};
 use parth_core::{
-    crypto::hash::{merkle_proof::DeltaMerkleProofCore, traits::MerkleZeroHasher},
+    crypto::hash::{merkle_proof::DeltaMerkleProofCore, traits::MerkleZeroHasher}, felt::QFelt64,
     data::hash::{merkle_node_key::SimpleMerkleNodeKey, merkle_node_nest::MerkleLeafNode},
     protocol::core_types::Q256BitHash,
+};
+use psy_data::{
+    prepared_block::coordinator::PsyPreparedCoordinatorBlockStateUpdates,
+    protocol::canonical_chain::CanonicalChainRef,
 };
 use psy_core::constants::stale_checkpoint::STALE_CHECKPOINT_AGE_REALM_TO_COORDINATOR_PROOF;
 use psy_io::tokio::{TokioFileLike, TokioLikeFileSystem};
 use psy_node_core::{
     p2p::traits::realm_coordinantor::RealmCoordinatorClient,
     psy_core_db::traits::full::PsyNodeCheckpointTreeDatabaseReader,
+    store::coordinator_commit_source::{CoordinatorCommitSource, CoordinatorCommitSourcePayload},
 };
+use psy_serialize::PsyIOReadWrite;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 pub const CHECKPOINT_BACKUP_MAGIC_LEN: usize = 8;
 pub const CHECKPOINT_BACKUP_MAGIC_BYTES: [u8; 8] = [0x50, 0x73, 0x79, 0x43, 0x68, 0x6B, 0x70, 0x74]; // "PsyChkpt"
 pub const CHECKPOINT_BACKUP_MAGIC_U64_LE: u64 = 0x74_70_6B_68_43_79_73_50; // little-endian representation
 pub const CHECKPOINT_BACKUP_ITEM_SIZE: usize = 8 + 32; // u64 checkpoint id + 32 bytes checkpoint hash
+
+/// Exact durable observation for one checkpoint-tree backup append.
+///
+/// This value is deliberately non-Clone. It proves that the ring-buffer row
+/// was flushed and read back and that the in-memory tree reached the expected
+/// source-provided delta root. It is not a commit-source marker or canonical
+/// head publication capability.
+#[derive(Debug, Eq, PartialEq)]
+pub struct CheckpointTreeBackupExactReceipt<Hash> {
+    checkpoint_id: u64,
+    checkpoint_hash: Hash,
+    old_root: Hash,
+    new_root: Hash,
+    min_backed_up_checkpoint_id: u64,
+    next_backup_checkpoint_id: u64,
+}
+
+impl<Hash> CheckpointTreeBackupExactReceipt<Hash> {
+    pub const fn checkpoint_id(&self) -> u64 {
+        self.checkpoint_id
+    }
+
+    pub const fn checkpoint_hash(&self) -> &Hash {
+        &self.checkpoint_hash
+    }
+
+    pub const fn old_root(&self) -> &Hash {
+        &self.old_root
+    }
+
+    pub const fn new_root(&self) -> &Hash {
+        &self.new_root
+    }
+
+    pub const fn min_backed_up_checkpoint_id(&self) -> u64 {
+        self.min_backed_up_checkpoint_id
+    }
+    pub const fn next_backup_checkpoint_id(&self) -> u64 {
+        self.next_backup_checkpoint_id
+    }
+}
+
+/// Source-bound Coordinator backup receipt. The inner file receipt can only
+/// be wrapped after the canonical prepared update has been decoded from the
+/// exact durable commit source and matched to its candidate checkpoint.
+#[derive(Debug, Eq, PartialEq)]
+pub struct CoordinatorCheckpointTreeBackupReceipt<Hash> {
+    source_slot: [u8; 32],
+    source_digest: [u8; 32],
+    candidate: CanonicalChainRef<Hash>,
+    exact: CheckpointTreeBackupExactReceipt<Hash>,
+}
+
+impl<Hash> CoordinatorCheckpointTreeBackupReceipt<Hash> {
+    pub const fn source_slot(&self) -> &[u8; 32] {
+        &self.source_slot
+    }
+
+    pub const fn source_digest(&self) -> &[u8; 32] {
+        &self.source_digest
+    }
+
+    pub const fn candidate(&self) -> &CanonicalChainRef<Hash> {
+        &self.candidate
+    }
+
+    pub const fn exact(&self) -> &CheckpointTreeBackupExactReceipt<Hash> {
+        &self.exact
+    }
+}
+
+#[cfg(test)]
+mod exact_backup_tests {
+    use std::{io::Cursor, sync::Arc};
+
+    use parth_common::memory_stores::{
+        dash_tree_append_only::PsyDashMemoryAppendOnlyMerkleStore,
+        traits::PsyMemoryMerkleStoreImm,
+    };
+    use parth_core::{
+        PHash,
+        pgoldilocks::PoseidonHasher,
+        protocol::core_types::Q256BitHash,
+    };
+    use psy_node_core::file::memory_fs::SimpleMockMemoryFileSystem;
+
+    use super::{
+        CHECKPOINT_BACKUP_MAGIC_BYTES, CheckpointTreeBackupManager,
+    };
+
+    fn manager(
+        height: u8,
+    ) -> CheckpointTreeBackupManager<
+        PoseidonHasher,
+        PHash,
+        SimpleMockMemoryFileSystem,
+    > {
+        CheckpointTreeBackupManager {
+            checkpoint_tree: Arc::new(
+                PsyDashMemoryAppendOnlyMerkleStore::new(height),
+            ),
+            max_checkpoints_to_keep: 8,
+            min_backed_up_checkpoint_id: 0,
+            next_backup_checkpoint_id: 0,
+            backup_file_path: "checkpoint-backup".to_owned(),
+            backup_file: Cursor::new(CHECKPOINT_BACKUP_MAGIC_BYTES.to_vec()),
+            file_system: Arc::new(SimpleMockMemoryFileSystem::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_backup_flushes_reads_back_and_recovers_same_retry() {
+        let mut manager = manager(4);
+        let checkpoint_hash = PHash::from_owned_32bytes([7; 32]);
+        let expected = manager.checkpoint_tree.set_leaf(0, checkpoint_hash);
+        manager.checkpoint_tree.set_leaf(0, PHash::default());
+
+        let first = manager
+            .append_checkpoint_leaf_hash_exact(0, checkpoint_hash, &expected)
+            .await
+            .unwrap();
+        assert_eq!(first.checkpoint_id(), 0);
+        assert_eq!(first.checkpoint_hash(), &checkpoint_hash);
+        assert_eq!(first.old_root(), &expected.old_root);
+        assert_eq!(first.new_root(), &expected.new_root);
+        assert_eq!(first.min_backed_up_checkpoint_id(), 0);
+        assert_eq!(first.next_backup_checkpoint_id(), 1);
+
+        let retry = manager
+            .append_checkpoint_leaf_hash_exact(0, checkpoint_hash, &expected)
+            .await
+            .unwrap();
+        assert_eq!(retry.checkpoint_hash(), &checkpoint_hash);
+        assert_eq!(retry.new_root(), &expected.new_root);
+        assert_eq!(retry.next_backup_checkpoint_id(), 1);
+    }
+
+    #[tokio::test]
+    async fn exact_backup_rejects_foreign_source_proof_before_file_write() {
+        let mut manager = manager(4);
+        let checkpoint_hash = PHash::from_owned_32bytes([7; 32]);
+        let mut expected = manager.checkpoint_tree.set_leaf(0, checkpoint_hash);
+        manager.checkpoint_tree.set_leaf(0, PHash::default());
+        expected.index = 1;
+
+        let error = manager
+            .append_checkpoint_leaf_hash_exact(0, checkpoint_hash, &expected)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("differs from expected delta proof"));
+        assert_eq!(manager.next_backup_checkpoint_id, 0);
+        assert_eq!(manager.backup_file.get_ref(), &CHECKPOINT_BACKUP_MAGIC_BYTES);
+    }
+}
 
 pub struct CheckpointTreeBackupManager<
     Hasher: MerkleZeroHasher<Hash>,
@@ -265,6 +425,113 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
         );
 
         Ok(p)
+    }
+
+    /// Append one source-bound checkpoint leaf, flush it, then read the exact
+    /// physical ring-buffer row back before returning a non-Clone receipt.
+    ///
+    /// On a retry after a successful append, the current tree may already be
+    /// at `expected.new_root`; this is accepted only when the exact leaf and
+    /// file row match. A first attempt additionally requires the current root
+    /// to equal `expected.old_root` and the live append proof to equal the
+    /// source-provided proof.
+    pub async fn append_checkpoint_leaf_hash_exact(
+        &mut self,
+        checkpoint_id: u64,
+        checkpoint_hash: Hash,
+        expected: &DeltaMerkleProofCore<Hash>,
+    ) -> anyhow::Result<CheckpointTreeBackupExactReceipt<Hash>> {
+        if expected.index != checkpoint_id || expected.new_value != checkpoint_hash {
+            anyhow::bail!("checkpoint backup request differs from expected delta proof");
+        }
+        let root_before = self.checkpoint_tree.get_root();
+        let expected_next = checkpoint_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("checkpoint backup id overflow"))?;
+        let already_applied = self.next_backup_checkpoint_id == expected_next
+            && self.checkpoint_tree.get_leaf_value(checkpoint_id) == checkpoint_hash
+            && root_before == expected.new_root;
+        if !already_applied && root_before != expected.old_root {
+            anyhow::bail!("checkpoint backup predecessor root differs from commit source");
+        }
+
+        let applied = self
+            .append_checkpoint_leaf_hash(checkpoint_id, checkpoint_hash)
+            .await?;
+        if !already_applied && applied != *expected {
+            anyhow::bail!("checkpoint backup append proof differs from commit source");
+        }
+        if self.next_backup_checkpoint_id != expected_next
+            || self.checkpoint_tree.get_leaf_value(checkpoint_id) != checkpoint_hash
+            || self.checkpoint_tree.get_root() != expected.new_root
+        {
+            anyhow::bail!("checkpoint backup memory state differs after append");
+        }
+
+        let offset = CHECKPOINT_BACKUP_MAGIC_LEN as u64
+            + (checkpoint_id % self.max_checkpoints_to_keep)
+                * CHECKPOINT_BACKUP_ITEM_SIZE as u64;
+        self.backup_file.seek(std::io::SeekFrom::Start(offset)).await?;
+        let stored_id = self.backup_file.read_u64_le().await?;
+        let mut stored_hash = [0_u8; 32];
+        self.backup_file.read_exact(&mut stored_hash).await?;
+        if stored_id != checkpoint_id
+            || Hash::from_ref_32bytes(&stored_hash) != checkpoint_hash
+        {
+            anyhow::bail!("checkpoint backup file row differs after flush");
+        }
+
+        Ok(CheckpointTreeBackupExactReceipt {
+            checkpoint_id,
+            checkpoint_hash,
+            old_root: expected.old_root,
+            new_root: expected.new_root,
+            min_backed_up_checkpoint_id: self.min_backed_up_checkpoint_id,
+            next_backup_checkpoint_id: self.next_backup_checkpoint_id,
+        })
+    }
+
+    /// Decode the canonical prepared update from an exact durable Coordinator
+    /// source and append precisely the checkpoint-tree delta committed there.
+    /// This is the only branch-exact Coordinator backup entry point: callers
+    /// cannot pair a source identity with an unrelated checkpoint proof.
+    pub async fn append_coordinator_commit_source_exact<F: QFelt64>(
+        &mut self,
+        source: &CoordinatorCommitSource<Hash>,
+    ) -> anyhow::Result<CoordinatorCheckpointTreeBackupReceipt<Hash>> {
+        let payload = CoordinatorCommitSourcePayload::decode_canonical(
+            source.prepared_update(),
+        )?;
+        let mut cursor = psy_io::Cursor::new(payload.prepared_update());
+        let prepared = PsyPreparedCoordinatorBlockStateUpdates::<F, Hash>::pio_read_from_io(
+            &mut cursor,
+        )?;
+        if cursor.position() != payload.prepared_update().len() as u64 {
+            anyhow::bail!("Coordinator backup source has trailing prepared-update bytes");
+        }
+        let checkpoint_id = source.candidate().checkpoint().checkpoint_id().get();
+        if prepared.checkpoint_id != checkpoint_id
+            || prepared.old_base.block_state.checkpoint_id
+                != source.expected().checkpoint().checkpoint_id().get()
+            || prepared.checkpoint_tree_update_proof.index != checkpoint_id
+            || prepared.checkpoint_tree_update_proof.new_value
+                != prepared.new_base.checkpoint_leaf_hash
+        {
+            anyhow::bail!("Coordinator backup source checkpoint identity differs");
+        }
+        let exact = self
+            .append_checkpoint_leaf_hash_exact(
+                checkpoint_id,
+                prepared.new_base.checkpoint_leaf_hash,
+                &prepared.checkpoint_tree_update_proof,
+            )
+            .await?;
+        Ok(CoordinatorCheckpointTreeBackupReceipt {
+            source_slot: source.slot().as_bytes(),
+            source_digest: source.digest().as_bytes(),
+            candidate: *source.candidate(),
+            exact,
+        })
     }
 
     pub fn has_appropriate_checkpoint_history_for_stale_proofs(&self, max_stale_checkpoint_age: u64, current_checkpoint_id: u64) -> bool {
