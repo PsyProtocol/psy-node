@@ -103,6 +103,7 @@ mod rollback_global_archive_barrier;
 mod rollback_global_delete_barrier;
 mod rollback_global_restore_barrier;
 mod rollback_global_restore_orchestrator;
+mod rollback_runtime_rebuild_store;
 mod realm_rollback_target_restore_plan;
 mod realm_rollback_target_restore_planner;
 mod realm_rollback_target_restore_executor;

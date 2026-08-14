@@ -1,0 +1,514 @@
+//! Typed hand-off between durable rollback coordination and process-local
+//! checkpoint/tree reconstruction.
+//!
+//! These values are observations, not storage capabilities.  A backend must
+//! freshly revalidate every binding before accepting a completion report.
+
+use std::{error::Error, fmt};
+
+use parth_core::protocol::core_types::Q256BitHash;
+use psy_data::protocol::{
+    canonical_chain::{CanonicalChainRef, ChainEpoch},
+    chain_context::AuthorityScope,
+};
+use sha2::{Digest, Sha256};
+
+use super::pending_generation_identity::PendingGenerationContext;
+
+const DIRECTIVE_DOMAIN: &[u8] = b"psy.rollback.runtime-rebuild-directive.v1\0";
+const REPORT_DOMAIN: &[u8] = b"psy.rollback.runtime-rebuild-report.v1\0";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RollbackRuntimeRebuildDirective<Hash> {
+    authority: AuthorityScope,
+    target: CanonicalChainRef<Hash>,
+    participant_plan_digest: [u8; 32],
+    global_restore_barrier_slot: [u8; 32],
+    global_restore_barrier_digest: [u8; 32],
+    participant_restore_slot: [u8; 32],
+    participant_restore_digest: [u8; 32],
+    processing: Option<PendingGenerationContext>,
+    gathering: Option<PendingGenerationContext>,
+    digest: [u8; 32],
+}
+
+impl<Hash: Q256BitHash> RollbackRuntimeRebuildDirective<Hash> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_from_storage(
+        authority: AuthorityScope,
+        target: CanonicalChainRef<Hash>,
+        participant_plan_digest: [u8; 32],
+        global_restore_barrier_slot: [u8; 32],
+        global_restore_barrier_digest: [u8; 32],
+        participant_restore_slot: [u8; 32],
+        participant_restore_digest: [u8; 32],
+        processing: Option<PendingGenerationContext>,
+        gathering: Option<PendingGenerationContext>,
+    ) -> Result<Self, RollbackRuntimeRebuildError> {
+        if [
+            participant_plan_digest,
+            global_restore_barrier_slot,
+            global_restore_barrier_digest,
+            participant_restore_slot,
+            participant_restore_digest,
+        ]
+        .contains(&[0; 32])
+        {
+            return Err(RollbackRuntimeRebuildError::ZeroCommitment);
+        }
+        match authority {
+            AuthorityScope::Coordinator if processing.is_some() || gathering.is_some() => {
+                return Err(RollbackRuntimeRebuildError::UnexpectedPendingContexts)
+            }
+            AuthorityScope::Realm { .. } => {
+                let (Some(processing), Some(gathering)) = (processing, gathering) else {
+                    return Err(RollbackRuntimeRebuildError::MissingPendingContexts);
+                };
+                if gathering.pending_id().get()
+                    != processing
+                        .pending_id()
+                        .get()
+                        .checked_add(1)
+                        .ok_or(RollbackRuntimeRebuildError::PendingOverflow)?
+                {
+                    return Err(RollbackRuntimeRebuildError::NonAdjacentPendingContexts);
+                }
+            }
+            AuthorityScope::Coordinator => {}
+        }
+        let digest = directive_digest(
+            authority,
+            &target,
+            &participant_plan_digest,
+            &global_restore_barrier_slot,
+            &global_restore_barrier_digest,
+            &participant_restore_slot,
+            &participant_restore_digest,
+            processing,
+            gathering,
+        );
+        Ok(Self {
+            authority,
+            target,
+            participant_plan_digest,
+            global_restore_barrier_slot,
+            global_restore_barrier_digest,
+            participant_restore_slot,
+            participant_restore_digest,
+            processing,
+            gathering,
+            digest,
+        })
+    }
+
+    pub const fn authority(&self) -> AuthorityScope {
+        self.authority
+    }
+
+    pub const fn target(&self) -> &CanonicalChainRef<Hash> {
+        &self.target
+    }
+
+    pub const fn participant_plan_digest(&self) -> &[u8; 32] {
+        &self.participant_plan_digest
+    }
+
+    pub const fn global_restore_barrier_slot(&self) -> &[u8; 32] {
+        &self.global_restore_barrier_slot
+    }
+
+    pub const fn global_restore_barrier_digest(&self) -> &[u8; 32] {
+        &self.global_restore_barrier_digest
+    }
+
+    pub const fn participant_restore_slot(&self) -> &[u8; 32] {
+        &self.participant_restore_slot
+    }
+
+    pub const fn participant_restore_digest(&self) -> &[u8; 32] {
+        &self.participant_restore_digest
+    }
+
+    pub const fn processing(&self) -> Option<PendingGenerationContext> {
+        self.processing
+    }
+
+    pub const fn gathering(&self) -> Option<PendingGenerationContext> {
+        self.gathering
+    }
+
+    pub const fn digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RollbackRuntimeRebuildReport<Hash> {
+    directive_digest: [u8; 32],
+    authority: AuthorityScope,
+    target: CanonicalChainRef<Hash>,
+    backup_min_checkpoint: u64,
+    backup_next_checkpoint: u64,
+    backup_root: Hash,
+    processor_checkpoint: u64,
+    authority_state_checkpoint: u64,
+    authority_state_root: Hash,
+    processing: Option<PendingGenerationContext>,
+    gathering: Option<PendingGenerationContext>,
+    digest: [u8; 32],
+}
+
+impl<Hash: Q256BitHash> RollbackRuntimeRebuildReport<Hash> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_after_exact_rebuild(
+        directive: &RollbackRuntimeRebuildDirective<Hash>,
+        backup_min_checkpoint: u64,
+        backup_next_checkpoint: u64,
+        backup_root: Hash,
+        processor_checkpoint: u64,
+        authority_state_checkpoint: u64,
+        authority_state_root: Hash,
+        processing: Option<PendingGenerationContext>,
+        gathering: Option<PendingGenerationContext>,
+    ) -> Result<Self, RollbackRuntimeRebuildError> {
+        let target_checkpoint = directive.target.checkpoint().checkpoint_id().get();
+        let expected_next = target_checkpoint
+            .checked_add(1)
+            .ok_or(RollbackRuntimeRebuildError::CheckpointOverflow)?;
+        // A genesis database may deliberately contain no materialized leaf;
+        // all non-genesis rebuilds must end exactly one past the target.
+        let backup_range_exact = backup_next_checkpoint == expected_next
+            || (target_checkpoint == 0 && backup_next_checkpoint == 0);
+        if !backup_range_exact
+            || backup_min_checkpoint > backup_next_checkpoint
+            || backup_min_checkpoint > target_checkpoint
+            || processor_checkpoint != target_checkpoint
+            || authority_state_checkpoint > target_checkpoint
+            || processing != directive.processing
+            || gathering != directive.gathering
+        {
+            return Err(RollbackRuntimeRebuildError::RuntimeStateMismatch);
+        }
+        let digest = report_digest(
+            directive.digest,
+            directive.authority,
+            &directive.target,
+            backup_min_checkpoint,
+            backup_next_checkpoint,
+            backup_root,
+            processor_checkpoint,
+            authority_state_checkpoint,
+            authority_state_root,
+            processing,
+            gathering,
+        );
+        Ok(Self {
+            directive_digest: directive.digest,
+            authority: directive.authority,
+            target: directive.target,
+            backup_min_checkpoint,
+            backup_next_checkpoint,
+            backup_root,
+            processor_checkpoint,
+            authority_state_checkpoint,
+            authority_state_root,
+            processing,
+            gathering,
+            digest,
+        })
+    }
+
+    pub const fn directive_digest(&self) -> &[u8; 32] {
+        &self.directive_digest
+    }
+
+    pub const fn authority(&self) -> AuthorityScope {
+        self.authority
+    }
+
+    pub const fn target(&self) -> &CanonicalChainRef<Hash> {
+        &self.target
+    }
+
+    pub const fn backup_min_checkpoint(&self) -> u64 {
+        self.backup_min_checkpoint
+    }
+
+    pub const fn backup_next_checkpoint(&self) -> u64 {
+        self.backup_next_checkpoint
+    }
+
+    pub const fn backup_root(&self) -> Hash {
+        self.backup_root
+    }
+
+    pub const fn processor_checkpoint(&self) -> u64 {
+        self.processor_checkpoint
+    }
+
+    pub const fn authority_state_checkpoint(&self) -> u64 {
+        self.authority_state_checkpoint
+    }
+
+    pub const fn authority_state_root(&self) -> Hash {
+        self.authority_state_root
+    }
+
+    pub const fn processing(&self) -> Option<PendingGenerationContext> {
+        self.processing
+    }
+
+    pub const fn gathering(&self) -> Option<PendingGenerationContext> {
+        self.gathering
+    }
+
+    pub const fn digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+}
+
+fn directive_digest<Hash: Q256BitHash>(
+    authority: AuthorityScope,
+    target: &CanonicalChainRef<Hash>,
+    participant_plan_digest: &[u8; 32],
+    global_restore_barrier_slot: &[u8; 32],
+    global_restore_barrier_digest: &[u8; 32],
+    participant_restore_slot: &[u8; 32],
+    participant_restore_digest: &[u8; 32],
+    processing: Option<PendingGenerationContext>,
+    gathering: Option<PendingGenerationContext>,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(DIRECTIVE_DOMAIN);
+    hasher.update(encode_authority(authority));
+    hasher.update(target.to_canonical_bytes());
+    hasher.update(participant_plan_digest);
+    hasher.update(global_restore_barrier_slot);
+    hasher.update(global_restore_barrier_digest);
+    hasher.update(participant_restore_slot);
+    hasher.update(participant_restore_digest);
+    encode_context(&mut hasher, processing);
+    encode_context(&mut hasher, gathering);
+    hasher.finalize().into()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn report_digest<Hash: Q256BitHash>(
+    directive_digest: [u8; 32],
+    authority: AuthorityScope,
+    target: &CanonicalChainRef<Hash>,
+    backup_min_checkpoint: u64,
+    backup_next_checkpoint: u64,
+    backup_root: Hash,
+    processor_checkpoint: u64,
+    authority_state_checkpoint: u64,
+    authority_state_root: Hash,
+    processing: Option<PendingGenerationContext>,
+    gathering: Option<PendingGenerationContext>,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(REPORT_DOMAIN);
+    hasher.update(directive_digest);
+    hasher.update(encode_authority(authority));
+    hasher.update(target.to_canonical_bytes());
+    hasher.update(backup_min_checkpoint.to_be_bytes());
+    hasher.update(backup_next_checkpoint.to_be_bytes());
+    hasher.update(backup_root.into_owned_32bytes());
+    hasher.update(processor_checkpoint.to_be_bytes());
+    hasher.update(authority_state_checkpoint.to_be_bytes());
+    hasher.update(authority_state_root.into_owned_32bytes());
+    encode_context(&mut hasher, processing);
+    encode_context(&mut hasher, gathering);
+    hasher.finalize().into()
+}
+
+fn encode_context(hasher: &mut Sha256, context: Option<PendingGenerationContext>) {
+    match context {
+        None => hasher.update([0]),
+        Some(context) => {
+            hasher.update([1]);
+            hasher.update(context.pending_id().get().to_be_bytes());
+            hasher.update(context.proc_checkpoint_id().as_u128().to_be_bytes());
+        }
+    }
+}
+
+fn encode_authority(authority: AuthorityScope) -> [u8; 7] {
+    match authority {
+        AuthorityScope::Coordinator => [0; 7],
+        AuthorityScope::Realm {
+            realm_id,
+            realm_sub_id,
+        } => {
+            let mut encoded = [0; 7];
+            encoded[0] = 1;
+            encoded[1..5].copy_from_slice(&realm_id.to_be_bytes());
+            encoded[5..7].copy_from_slice(&realm_sub_id.to_be_bytes());
+            encoded
+        }
+    }
+}
+
+pub fn restored_target<Hash: Q256BitHash>(
+    old_target: CanonicalChainRef<Hash>,
+) -> Result<CanonicalChainRef<Hash>, RollbackRuntimeRebuildError> {
+    Ok(CanonicalChainRef::new(
+        old_target.network_id(),
+        ChainEpoch::new(
+            old_target
+                .chain_epoch()
+                .get()
+                .checked_add(1)
+                .ok_or(RollbackRuntimeRebuildError::EpochOverflow)?,
+        ),
+        *old_target.checkpoint(),
+    ))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RollbackRuntimeRebuildError {
+    ZeroCommitment,
+    UnexpectedPendingContexts,
+    MissingPendingContexts,
+    NonAdjacentPendingContexts,
+    PendingOverflow,
+    EpochOverflow,
+    CheckpointOverflow,
+    RuntimeStateMismatch,
+}
+
+impl fmt::Display for RollbackRuntimeRebuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "rollback runtime rebuild error: {self:?}")
+    }
+}
+
+impl Error for RollbackRuntimeRebuildError {}
+
+#[cfg(test)]
+mod tests {
+    use parth_core::data::hash::hash256::Hash256;
+    use psy_data::protocol::canonical_chain::{
+        ChainEpoch, CheckpointHash, CheckpointId, CheckpointRef, NetworkId,
+    };
+
+    use super::*;
+
+    type Hash = Hash256;
+
+    fn target() -> CanonicalChainRef<Hash> {
+        CanonicalChainRef::new(
+            NetworkId::try_from_chain_id(1337).unwrap(),
+            ChainEpoch::new(8),
+            CheckpointRef::new(
+                CheckpointId::new(40),
+                CheckpointHash::from_last_chain_hash(Hash256([9; 32])),
+            ),
+        )
+    }
+
+    fn realm_directive() -> RollbackRuntimeRebuildDirective<Hash> {
+        RollbackRuntimeRebuildDirective::try_from_storage(
+            AuthorityScope::Realm {
+                realm_id: 7,
+                realm_sub_id: 2,
+            },
+            target(),
+            [1; 32],
+            [2; 32],
+            [3; 32],
+            [4; 32],
+            [5; 32],
+            Some(PendingGenerationContext::try_from_legacy(71, 701).unwrap()),
+            Some(PendingGenerationContext::try_from_legacy(72, 702).unwrap()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn realm_directive_requires_exact_adjacent_contexts() {
+        let directive = realm_directive();
+        assert_eq!(directive.target(), &target());
+        assert_eq!(directive.processing().unwrap().pending_id().get(), 71);
+        assert_eq!(directive.gathering().unwrap().pending_id().get(), 72);
+        assert_ne!(directive.digest(), &[0; 32]);
+
+        assert_eq!(
+            RollbackRuntimeRebuildDirective::try_from_storage(
+                AuthorityScope::Realm {
+                    realm_id: 7,
+                    realm_sub_id: 2,
+                },
+                target(),
+                [1; 32],
+                [2; 32],
+                [3; 32],
+                [4; 32],
+                [5; 32],
+                Some(PendingGenerationContext::try_from_legacy(71, 701).unwrap()),
+                Some(PendingGenerationContext::try_from_legacy(73, 703).unwrap()),
+            ),
+            Err(RollbackRuntimeRebuildError::NonAdjacentPendingContexts)
+        );
+    }
+
+    #[test]
+    fn coordinator_directive_rejects_realm_contexts() {
+        assert_eq!(
+            RollbackRuntimeRebuildDirective::try_from_storage(
+                AuthorityScope::Coordinator,
+                target(),
+                [1; 32],
+                [2; 32],
+                [3; 32],
+                [4; 32],
+                [5; 32],
+                Some(PendingGenerationContext::try_from_legacy(71, 701).unwrap()),
+                None,
+            ),
+            Err(RollbackRuntimeRebuildError::UnexpectedPendingContexts)
+        );
+    }
+
+    #[test]
+    fn report_is_bound_to_target_range_roots_and_contexts() {
+        let directive = realm_directive();
+        let report = RollbackRuntimeRebuildReport::try_after_exact_rebuild(
+            &directive,
+            8,
+            41,
+            Hash256([6; 32]),
+            40,
+            39,
+            Hash256([7; 32]),
+            directive.processing(),
+            directive.gathering(),
+        )
+        .unwrap();
+        assert_eq!(report.directive_digest(), directive.digest());
+        assert_eq!(report.backup_next_checkpoint(), 41);
+        assert_ne!(report.digest(), &[0; 32]);
+
+        assert_eq!(
+            RollbackRuntimeRebuildReport::try_after_exact_rebuild(
+                &directive,
+                8,
+                42,
+                Hash256([6; 32]),
+                40,
+                39,
+                Hash256([7; 32]),
+                directive.processing(),
+                directive.gathering(),
+            ),
+            Err(RollbackRuntimeRebuildError::RuntimeStateMismatch)
+        );
+    }
+
+    #[test]
+    fn restored_target_advances_epoch_without_changing_checkpoint() {
+        let restored = restored_target(target()).unwrap();
+        assert_eq!(restored.chain_epoch().get(), 9);
+        assert_eq!(restored.checkpoint(), target().checkpoint());
+    }
+}

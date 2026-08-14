@@ -31,6 +31,7 @@ use super::{
     rollback_global_restore_barrier::{
         PersistedRollbackGlobalRestoreBarrier, ScyllaRollbackGlobalRestoreBarrierStore,
     },
+    rollback_runtime_rebuild_store::ScyllaRollbackRuntimeRebuildStore,
 };
 
 pub(super) struct ScyllaRollbackGlobalRestoreOrchestrator {
@@ -39,6 +40,7 @@ pub(super) struct ScyllaRollbackGlobalRestoreOrchestrator {
     delete_barrier: Arc<ScyllaRollbackGlobalDeleteBarrierStore>,
     realm_archive: Arc<ScyllaRealmRollbackPhysicalArchiveStore>,
     restore_barrier: Arc<ScyllaRollbackGlobalRestoreBarrierStore>,
+    runtime_rebuild: Arc<ScyllaRollbackRuntimeRebuildStore>,
 }
 
 impl ScyllaRollbackGlobalRestoreOrchestrator {
@@ -48,6 +50,7 @@ impl ScyllaRollbackGlobalRestoreOrchestrator {
         delete_barrier: Arc<ScyllaRollbackGlobalDeleteBarrierStore>,
         realm_archive: Arc<ScyllaRealmRollbackPhysicalArchiveStore>,
         restore_barrier: Arc<ScyllaRollbackGlobalRestoreBarrierStore>,
+        runtime_rebuild: Arc<ScyllaRollbackRuntimeRebuildStore>,
     ) -> Self {
         Self {
             canonical_head,
@@ -55,6 +58,7 @@ impl ScyllaRollbackGlobalRestoreOrchestrator {
             delete_barrier,
             realm_archive,
             restore_barrier,
+            runtime_rebuild,
         }
     }
 
@@ -104,6 +108,40 @@ impl ScyllaRollbackGlobalRestoreOrchestrator {
         self.revalidate_inputs(delete_barrier, coordinator, realm_deletes, realm_restores).await?;
         self.restore_barrier.revalidate(&barrier).await.map_err(backend)?;
 
+        // Every local participant must have a durable, storage-selected task
+        // before the global phase says VERIFYING. Partial directive writes are
+        // harmless and are resumed by exact IFNE readback on retry.
+        let coordinator_directive = self
+            .runtime_rebuild
+            .coordinator_directive(&barrier, coordinator)
+            .map_err(backend)?;
+        let realm_directives = self
+            .runtime_rebuild
+            .realm_directives(&barrier, realm_restores)
+            .map_err(backend)?;
+        self.runtime_rebuild
+            .persist_directive(coordinator_directive)
+            .await
+            .map_err(backend)?;
+        for directive in &realm_directives {
+            self.runtime_rebuild
+                .persist_directive(*directive)
+                .await
+                .map_err(backend)?;
+        }
+        self.revalidate_inputs(delete_barrier, coordinator, realm_deletes, realm_restores).await?;
+        self.restore_barrier.revalidate(&barrier).await.map_err(backend)?;
+        self.runtime_rebuild
+            .revalidate_directive(&coordinator_directive)
+            .await
+            .map_err(backend)?;
+        for directive in &realm_directives {
+            self.runtime_rebuild
+                .revalidate_directive(directive)
+                .await
+                .map_err(backend)?;
+        }
+
         let verifying = CanonicalHeadTransition::begin_rollback_verify(*restoring.candidate())
             .map_err(backend)?
             .seal();
@@ -111,6 +149,16 @@ impl ScyllaRollbackGlobalRestoreOrchestrator {
 
         self.revalidate_inputs(delete_barrier, coordinator, realm_deletes, realm_restores).await?;
         self.restore_barrier.revalidate(&barrier).await.map_err(backend)?;
+        self.runtime_rebuild
+            .revalidate_directive(&coordinator_directive)
+            .await
+            .map_err(backend)?;
+        for directive in &realm_directives {
+            self.runtime_rebuild
+                .revalidate_directive(directive)
+                .await
+                .map_err(backend)?;
+        }
         self.require_head(verifying.candidate()).await?;
         Ok(barrier)
     }
@@ -204,6 +252,8 @@ mod tests {
         assert!(source.contains("begin_rollback_restore"));
         assert!(source.contains("begin_rollback_verify"));
         assert!(source.contains("revalidate_target_restore_completion"));
+        assert!(source.contains("persist_directive"));
+        assert!(source.contains("revalidate_directive"));
         assert!(!source.contains("complete_rollback_realm_barrier"));
         assert!(!source.contains("complete_rollback("));
         assert!(!source.contains("hard_reset_and_truncate"));

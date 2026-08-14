@@ -326,6 +326,8 @@ impl<Hash: Q256BitHash> RollbackGlobalRestoreBarrier<Hash> {
     pub(super) const fn participant_plan_digest(&self) -> &[u8; 32] { &self.participant_plan_digest }
     pub(super) const fn delete_barrier_slot(&self) -> &[u8; 32] { &self.delete_barrier_slot }
     pub(super) const fn delete_barrier_digest(&self) -> &[u8; 32] { &self.delete_barrier_digest }
+    pub(super) const fn coordinator_completion_slot(&self) -> &[u8; 32] { &self.coordinator_completion_slot }
+    pub(super) const fn coordinator_completion_digest(&self) -> &[u8; 32] { &self.coordinator_completion_digest }
     pub(super) const fn realm_count(&self) -> u64 { self.realm_count }
     pub(super) const fn realm_restore_set_digest(&self) -> &[u8; 32] { &self.realm_restore_set_digest }
     pub(super) const fn slot(&self) -> &[u8; 32] { &self.slot }
@@ -340,6 +342,7 @@ pub(super) struct PersistedRollbackGlobalRestoreBarrier<Hash> {
 
 impl<Hash> PersistedRollbackGlobalRestoreBarrier<Hash> {
     pub(super) const fn barrier(&self) -> &RollbackGlobalRestoreBarrier<Hash> { &self.barrier }
+    pub(super) const fn store_fingerprint(&self) -> &[u8; 32] { &self.store_fingerprint }
 }
 
 pub(super) struct ScyllaRollbackGlobalRestoreBarrierStore {
