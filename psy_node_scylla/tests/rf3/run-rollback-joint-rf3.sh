@@ -41,6 +41,7 @@ done
 
 cd "${WORKSPACE_ROOT}"
 PSY_ROLLBACK_JOINT_RF3=1 \
+PSY_ROLLBACK_JOINT_COMPOSE_FILE="${COMPOSE_FILE}" \
 RUST_MIN_STACK="${RUST_MIN_STACK:-67108864}" \
 cargo test -p psy_node_scylla \
   --features rf3-test-support \

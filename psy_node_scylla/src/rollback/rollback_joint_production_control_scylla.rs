@@ -2,7 +2,14 @@
 //! plane. The same flow runs against an isolated RF=1 or pre-provisioned RF=3
 //! fixture.
 
-use std::sync::Arc;
+use std::{
+    collections::BTreeMap,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::Path,
+    process::Command,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, bail, ensure};
 use parth_core::{
@@ -95,7 +102,18 @@ use psy_node_core::store::{
     typed::{ProcCheckpointUniqueId, UniquePendingId},
 };
 use psy_serialize::PsyIOReadWrite;
-use scylla::statement::Consistency;
+use scylla::{
+    client::{
+        execution_profile::ExecutionProfile,
+        session::Session,
+        session_builder::SessionBuilder,
+    },
+    policies::load_balancing::{
+        NodeIdentifier, SingleTargetLoadBalancingPolicy,
+    },
+    statement::Consistency,
+};
+use tokio::time::sleep;
 
 use crate::core::ScyllaCoreStore;
 use super::{
@@ -134,6 +152,26 @@ const NODES: [&str; 3] = [
     "172.29.86.12:9042",
     "172.29.86.13:9042",
 ];
+const NODE_IPS: [Ipv4Addr; 3] = [
+    Ipv4Addr::new(172, 29, 86, 11),
+    Ipv4Addr::new(172, 29, 86, 12),
+    Ipv4Addr::new(172, 29, 86, 13),
+];
+const NODE_CONTAINERS: [&str; 3] = [
+    "psy-g0-02-rf3-scylla1-1",
+    "psy-g0-02-rf3-scylla2-1",
+    "psy-g0-02-rf3-scylla3-1",
+];
+const JOINT_KEYSPACES: [&str; 6] = [
+    COORDINATOR_KEYSPACE,
+    "psy_rollback_joint_control_no_tablet",
+    REALM_10_KEYSPACE,
+    "psy_rollback_joint_control_realm_10_no_tablet",
+    REALM_20_KEYSPACE,
+    "psy_rollback_joint_control_realm_20_no_tablet",
+];
+
+type JointDataset = BTreeMap<String, Vec<String>>;
 
 fn rf3_enabled() -> bool {
     std::env::var("PSY_ROLLBACK_JOINT_RF3").as_deref() == Ok("1")
@@ -169,6 +207,124 @@ async fn open_store(
         )
         .await
     }
+}
+
+fn command(mut command: Command, label: &str) -> anyhow::Result<String> {
+    let output = command.output()?;
+    if !output.status.success() {
+        bail!(
+            "{label} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8(output.stdout)?)
+}
+
+fn compose(args: &[&str], label: &str) -> anyhow::Result<String> {
+    let compose_file = std::env::var("PSY_ROLLBACK_JOINT_COMPOSE_FILE")?;
+    let mut invocation = Command::new("docker");
+    invocation
+        .arg("compose")
+        .arg("-f")
+        .arg(Path::new(&compose_file))
+        .args(args);
+    command(invocation, label)
+}
+
+fn docker_exec(container: &str, args: &[&str], label: &str) -> anyhow::Result<String> {
+    let mut invocation = Command::new("docker");
+    invocation.arg("exec").arg(container).args(args);
+    command(invocation, label)
+}
+
+async fn wait_for_replicas(expected: usize) -> anyhow::Result<()> {
+    for _ in 0..90 {
+        let status = docker_exec(
+            NODE_CONTAINERS[0],
+            &["nodetool", "status"],
+            "read rollback RF=3 status",
+        )?;
+        if status.lines().filter(|line| line.starts_with("UN ")).count() == expected {
+            return Ok(());
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
+    bail!("rollback RF=3 cluster did not reach {expected} Up/Normal replicas")
+}
+
+async fn direct_session(target: Ipv4Addr) -> anyhow::Result<Session> {
+    let profile = ExecutionProfile::builder()
+        .consistency(Consistency::One)
+        .request_timeout(Some(Duration::from_secs(300)))
+        .load_balancing_policy(SingleTargetLoadBalancingPolicy::new(
+            NodeIdentifier::NodeAddress(SocketAddr::new(IpAddr::V4(target), 9042)),
+            None,
+        ))
+        .build();
+    Ok(SessionBuilder::new()
+        .known_nodes_addr(NODE_IPS.map(|ip| SocketAddr::new(IpAddr::V4(ip), 9042)))
+        .default_execution_profile_handle(profile.into_handle())
+        .connection_timeout(Duration::from_secs(120))
+        .build()
+        .await?)
+}
+
+async fn joint_dataset(session: &Session) -> anyhow::Result<JointDataset> {
+    let mut dataset = BTreeMap::new();
+    for keyspace in JOINT_KEYSPACES {
+        let mut tables = session
+            .query_unpaged(
+                "SELECT table_name FROM system_schema.tables WHERE keyspace_name = ?",
+                (keyspace,),
+            )
+            .await?
+            .into_rows_result()?
+            .rows::<(String,)>()?
+            .map(|row| row.map(|(table,)| table))
+            .collect::<Result<Vec<_>, _>>()?;
+        tables.sort();
+        for table in tables {
+            let mut rows = session
+                .query_unpaged(format!("SELECT JSON * FROM {keyspace}.{table}"), &[])
+                .await?
+                .into_rows_result()?
+                .rows::<(String,)>()?
+                .map(|row| row.map(|(json,)| json))
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.sort();
+            dataset.insert(format!("{keyspace}.{table}"), rows);
+        }
+    }
+    Ok(dataset)
+}
+
+async fn rejoin_and_repair(expected: &JointDataset) -> anyhow::Result<()> {
+    compose(&["start", "scylla3"], "restart rollback RF=3 replica")?;
+    wait_for_replicas(3).await?;
+    for keyspace in JOINT_KEYSPACES {
+        docker_exec(
+            NODE_CONTAINERS[0],
+            &["nodetool", "repair", keyspace],
+            "repair rollback RF=3 keyspace",
+        )?;
+    }
+    for node in NODE_CONTAINERS {
+        for keyspace in JOINT_KEYSPACES {
+            docker_exec(node, &["nodetool", "flush", keyspace], "flush rollback RF=3 keyspace")?;
+            docker_exec(
+                node,
+                &["nodetool", "compact", keyspace],
+                "compact rollback RF=3 keyspace",
+            )?;
+        }
+    }
+    for ip in NODE_IPS {
+        ensure!(
+            joint_dataset(&direct_session(ip).await?).await? == *expected,
+            "direct-ONE rollback dataset differs after replica repair",
+        );
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -1147,6 +1303,10 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
     coordinator = coordinator_control().await?;
     drop(realm_10);
     drop(realm_20);
+    if rf3_enabled() {
+        compose(&["stop", "scylla3"], "stop rollback RF=3 replica")?;
+        wait_for_replicas(2).await?;
+    }
 
     let CoordinatorRollbackGlobalProgress::AwaitingParticipants {
         head: deleting_head,
@@ -1553,6 +1713,10 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
                 && t2_committed_timestamp.as_i64() > committed_timestamp.as_i64(),
             "Realm did not continue from T+1 to new-epoch T+2",
         );
+    }
+    if rf3_enabled() {
+        let expected = joint_dataset(&coordinator.session).await?;
+        rejoin_and_repair(&expected).await?;
     }
     Ok(())
 }
