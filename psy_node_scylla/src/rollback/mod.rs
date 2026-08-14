@@ -103,6 +103,8 @@ mod rollback_global_archive_barrier;
 mod rollback_global_delete_barrier;
 mod rollback_global_restore_barrier;
 mod rollback_global_restore_orchestrator;
+mod coordinator_rollback_runtime_publication;
+pub(crate) use coordinator_rollback_runtime_publication::try_publish_restored_runtime;
 mod rollback_runtime_rebuild_store;
 pub(crate) use rollback_runtime_rebuild_store::ScyllaRollbackRuntimeRebuildStore;
 mod realm_rollback_runtime_control;

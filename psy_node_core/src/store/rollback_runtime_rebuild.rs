@@ -390,8 +390,10 @@ impl fmt::Display for RollbackRuntimeRebuildError {
 impl Error for RollbackRuntimeRebuildError {}
 
 /// Storage boundary used by a Coordinator process to select its immutable
-/// VERIFYING task and append the exact result of rebuilding process-local
-/// checkpoint/tree state. Neither method can publish the canonical target.
+/// VERIFYING task, append the exact process-local rebuild result, and ask the
+/// backend to storage-select the complete fixed Realm report set. Only the
+/// final method may publish the canonical target; it accepts no caller-supplied
+/// participant list or report.
 #[async_trait]
 pub trait CoordinatorRollbackRuntimeRebuildStore<Hash>: Send + Sync
 where
@@ -407,6 +409,23 @@ where
         directive: RollbackRuntimeRebuildDirective<Hash>,
         report: RollbackRuntimeRebuildReport<Hash>,
     ) -> anyhow::Result<()>;
+
+    /// Storage-select every plan participant's exact rebuild report and, only
+    /// when the complete immutable set exists, publish the restored target.
+    /// A caller cannot supply or truncate the Realm set.
+    async fn try_publish_restored_runtime(
+        &self,
+        network: NetworkId,
+    ) -> anyhow::Result<CoordinatorRollbackRuntimePublication<Hash>>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoordinatorRollbackRuntimePublication<Hash> {
+    AwaitingRealmReports {
+        completed: u64,
+        expected: u64,
+    },
+    Published(StoredCanonicalHead<Hash>),
 }
 
 /// Storage-selected Realm rebuild work.  This is a read-only observation:

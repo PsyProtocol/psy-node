@@ -15,7 +15,10 @@ use psy_data::protocol::{
     canonical_chain::{CanonicalChainRef, NetworkId, CANONICAL_CHAIN_REF_V1_LEN},
     chain_context::AuthorityScope,
 };
-use psy_node_core::store::canonical_head::StoredCanonicalHead;
+use psy_node_core::store::{
+    canonical_head::{CanonicalHeadTransition, StoredCanonicalHead},
+    rollback_runtime_rebuild::RollbackRuntimeRebuildDirective,
+};
 use scylla::{
     client::session::Session,
     response::query_result::QueryResult,
@@ -468,19 +471,95 @@ impl ScyllaRollbackGlobalRestoreBarrierStore {
         }
     }
 
+    /// Recover the immutable restore barrier selected by the Coordinator's
+    /// storage-authored runtime directive. The caller supplies no barrier
+    /// payload and therefore cannot substitute a different participant set.
+    pub(super) async fn read_selected_for_runtime<Hash: Q256BitHash>(
+        &self,
+        verifying_head: StoredCanonicalHead<Hash>,
+        directive: RollbackRuntimeRebuildDirective<Hash>,
+    ) -> Result<PersistedRollbackGlobalRestoreBarrier<Hash>, RollbackGlobalRestoreBarrierError> {
+        if directive.authority() != AuthorityScope::Coordinator
+            || directive.target().network_id()
+                != verifying_head.canonical_ref().network_id()
+            || directive.target().chain_epoch()
+                != verifying_head.canonical_ref().chain_epoch()
+        {
+            return Err(RollbackGlobalRestoreBarrierError::BindingMismatch);
+        }
+        let barrier = self
+            .read_coordinates(
+                directive.target().network_id(),
+                directive.target().chain_epoch().get(),
+                directive.participant_plan_digest(),
+                directive.global_restore_barrier_slot(),
+            )
+            .await?
+            .ok_or(RollbackGlobalRestoreBarrierError::MissingAfterPersist)?;
+        let restoring = CanonicalHeadTransition::begin_rollback_restore(
+            *barrier.deleting_head(),
+        )
+        .map_err(model)?;
+        let expected_verifying = CanonicalHeadTransition::begin_rollback_verify(
+            *restoring.candidate(),
+        )
+        .map_err(model)?;
+        if expected_verifying.candidate() != &verifying_head
+            || barrier.store_fingerprint != self.fingerprint
+            || barrier.slot() != directive.global_restore_barrier_slot()
+            || barrier.digest() != directive.global_restore_barrier_digest()
+            || barrier.participant_plan_digest() != directive.participant_plan_digest()
+            || barrier.target().network_id() != directive.target().network_id()
+            || barrier.target().chain_epoch() != directive.target().chain_epoch()
+            || barrier.target().checkpoint() != directive.target().checkpoint()
+        {
+            return Err(RollbackGlobalRestoreBarrierError::BindingMismatch);
+        }
+        let receipt = PersistedRollbackGlobalRestoreBarrier {
+            store_fingerprint: self.fingerprint,
+            barrier,
+        };
+        self.revalidate(&receipt).await?;
+        Ok(receipt)
+    }
+
     async fn read_exact<Hash: Q256BitHash>(
         &self,
         expected: &RollbackGlobalRestoreBarrier<Hash>,
     ) -> Result<Option<RollbackGlobalRestoreBarrier<Hash>>, RollbackGlobalRestoreBarrierError> {
+        let barrier = self
+            .read_coordinates(
+                expected.target.network_id(),
+                expected.target.chain_epoch().get(),
+                &expected.participant_plan_digest,
+                &expected.slot,
+            )
+            .await?;
+        if barrier.as_ref().is_some_and(|barrier| {
+            barrier.slot != expected.slot
+                || barrier.participant_plan_digest != expected.participant_plan_digest
+        }) {
+            return Err(RollbackGlobalRestoreBarrierError::Conflict);
+        }
+        Ok(barrier)
+    }
+
+    async fn read_coordinates<Hash: Q256BitHash>(
+        &self,
+        network: NetworkId,
+        chain_epoch: u64,
+        participant_plan_digest: &[u8; 32],
+        slot: &[u8; 32],
+    ) -> Result<Option<RollbackGlobalRestoreBarrier<Hash>>, RollbackGlobalRestoreBarrierError> {
         let rows = self.session.execute_unpaged(
             &self.read,
             (
-                i64::from(expected.target.network_id().chain_id()),
-                i64::try_from(expected.target.chain_epoch().get())
+                i64::from(network.chain_id()),
+                i64::try_from(chain_epoch)
                     .map_err(|_| RollbackGlobalRestoreBarrierError::IntegerOutOfCqlRange)?,
-                expected.participant_plan_digest.as_slice(),
+                participant_plan_digest.as_slice(),
                 KEY_DOMAIN,
-                expected.slot.as_slice(),
+                slot.as_slice(),
             ),
         ).await.map_err(cql)?.into_rows_result().map_err(cql)?
             .rows::<(
@@ -510,8 +589,8 @@ impl ScyllaRollbackGlobalRestoreBarrierStore {
         }
         let barrier = RollbackGlobalRestoreBarrier::decode_canonical(&payload)?;
         if barrier.digest != row_digest
-            || barrier.slot != expected.slot
-            || barrier.participant_plan_digest != expected.participant_plan_digest
+            || barrier.slot.as_slice() != slot.as_slice()
+            || &barrier.participant_plan_digest != participant_plan_digest
         {
             return Err(RollbackGlobalRestoreBarrierError::Conflict);
         }

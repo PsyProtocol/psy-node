@@ -69,6 +69,7 @@ use crate::{
     },
     store::rollback_runtime_rebuild::{
         CoordinatorRollbackRuntimeRebuildStore,
+        CoordinatorRollbackRuntimePublication,
         RollbackRuntimeRebuildDirective,
         RollbackRuntimeRebuildReport,
     },
@@ -163,6 +164,13 @@ impl<
         self.store
             .persist_coordinator_runtime_rebuild_report(directive, report)
             .await
+    }
+
+    async fn try_publish_restored_runtime(
+        &self,
+        network: NetworkId,
+    ) -> anyhow::Result<CoordinatorRollbackRuntimePublication<N::QHash>> {
+        self.store.try_publish_restored_runtime(network).await
     }
 }
 

@@ -29,8 +29,8 @@ use psy_node_core::store::rollback_participant_maintenance::{
     CoordinatorRollbackMaintenanceExecutor, CoordinatorRollbackMaintenanceOutcome,
 };
 use psy_node_core::store::rollback_runtime_rebuild::{
-    CoordinatorRollbackRuntimeRebuildStore, RollbackRuntimeRebuildDirective,
-    RollbackRuntimeRebuildReport,
+    CoordinatorRollbackRuntimePublication, CoordinatorRollbackRuntimeRebuildStore,
+    RollbackRuntimeRebuildDirective, RollbackRuntimeRebuildReport,
 };
 use psy_node_core::store::rollback_topology::RollbackTopologySnapshot;
 use psy_node_core::store::realm_processor_startup::{
@@ -57,6 +57,7 @@ use crate::rollback::{
     ScyllaCoordinatorCommitSourceStore,
     ScyllaCoordinatorCommitPhysicalArchiveStore,
     prepare_coordinator_rollback_archive,
+    try_publish_restored_runtime,
 };
 use crate::rollback::branch_exact_startup_preflight::ScyllaRealmProcessorStartupPreflightProvider;
 use crate::tables::{merkle::ScyllaMerkleNodesZeroPreparedStatements, traits::ScyllaStandardPreparedTableStatements};
@@ -794,6 +795,16 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
                 "Coordinator rollback runtime-rebuild store was not initialized by Coordinator setup"
             ))
     }
+
+    fn coordinator_rollback_runtime_rebuild_arc(
+        &self,
+    ) -> anyhow::Result<Arc<ScyllaRollbackRuntimeRebuildStore>> {
+        self.rollback_runtime_rebuild_store.get().cloned().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Coordinator rollback runtime-rebuild store was not initialized by Coordinator setup"
+            )
+        })
+    }
 }
 
 #[async_trait]
@@ -1110,6 +1121,21 @@ where
             .persist_and_revalidate_report(directive, report)
             .await?;
         Ok(())
+    }
+
+    async fn try_publish_restored_runtime(
+        &self,
+        network: NetworkId,
+    ) -> anyhow::Result<CoordinatorRollbackRuntimePublication<Hash>> {
+        try_publish_restored_runtime(
+            self.coordinator_canonical_head_arc()?,
+            self.coordinator_rollback_participant_plans_arc()?,
+            self.coordinator_rollback_runtime_rebuild_arc()?,
+            self.session.clone(),
+            crate::rollback::CqlKeyspaceName::try_new(self.keyspace.clone())?,
+            network,
+        )
+        .await
     }
 }
 

@@ -70,7 +70,8 @@ use psy_node_core::{
             CoordinatorRollbackMaintenanceOutcome,
         },
         rollback_runtime_rebuild::{
-            CoordinatorRollbackRuntimeRebuildStore, RollbackRuntimeRebuildReport,
+            CoordinatorRollbackRuntimePublication, CoordinatorRollbackRuntimeRebuildStore,
+            RollbackRuntimeRebuildReport,
         },
         traits::proof_store::QParthProofStore,
     },
@@ -1123,6 +1124,27 @@ impl<
             gathering.pending_id().get(),
         );
         Ok(Some(report))
+    }
+
+    pub async fn try_publish_restored_runtime(
+        &mut self,
+    ) -> anyhow::Result<CoordinatorRollbackRuntimePublication<N::QHash>>
+    where
+        S: CoordinatorRollbackRuntimeRebuildStore<N::QHash>,
+    {
+        let outcome = self.db.try_publish_restored_runtime(self.network_id).await?;
+        if let CoordinatorRollbackRuntimePublication::Published(head) = outcome {
+            if !head.rollback_control().is_idle()
+                || head.canonical_ref().network_id() != self.network_id
+                || head.canonical_ref().checkpoint().checkpoint_id().get()
+                    != self.ids.checkpoint_id
+            {
+                anyhow::bail!("published rollback target differs from rebuilt Coordinator runtime");
+            }
+            self.canonical_head = Some(head);
+            self.publish_current_pending_context().await?;
+        }
+        Ok(outcome)
     }
 
     async fn copy_checkpoint_backup_file_for_reset(&mut self, destination_path: &str) -> anyhow::Result<()> {
@@ -2196,7 +2218,7 @@ mod tests {
             .split("pub async fn rebuild_coordinator_runtime_after_rollback")
             .nth(1)
             .expect("runtime rebuild method")
-            .split("async fn copy_checkpoint_backup_file_for_reset")
+            .split("pub async fn try_publish_restored_runtime")
             .next()
             .expect("runtime rebuild method end");
 
@@ -2221,6 +2243,24 @@ mod tests {
         ] {
             assert!(!rebuild.contains(forbidden), "forbidden {forbidden}");
         }
+    }
+
+    #[test]
+    fn restored_target_is_published_before_the_new_pending_context() {
+        let source = include_str!("db.rs");
+        let publish = source
+            .split("pub async fn try_publish_restored_runtime")
+            .nth(1)
+            .unwrap()
+            .split("async fn copy_checkpoint_backup_file_for_reset")
+            .next()
+            .unwrap();
+        let durable = publish
+            .find("self.db.try_publish_restored_runtime(self.network_id)")
+            .unwrap();
+        let local_head = publish.find("self.canonical_head = Some(head)").unwrap();
+        let pending = publish.find("self.publish_current_pending_context()").unwrap();
+        assert!(durable < local_head && local_head < pending);
     }
 
     #[test]

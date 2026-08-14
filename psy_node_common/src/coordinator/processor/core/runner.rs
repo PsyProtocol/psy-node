@@ -16,7 +16,9 @@ use psy_node_core::{
         CoordinatorRollbackMaintenanceExecutor,
         CoordinatorRollbackMaintenanceOutcome,
     },
-    store::rollback_runtime_rebuild::CoordinatorRollbackRuntimeRebuildStore,
+    store::rollback_runtime_rebuild::{
+        CoordinatorRollbackRuntimePublication, CoordinatorRollbackRuntimeRebuildStore,
+    },
 };
 use tokio::time::sleep;
 
@@ -80,24 +82,61 @@ where
                         if matches!(
                             head.rollback_control(),
                             psy_node_core::store::rollback_control::RollbackControlState::Verifying(_)
+                                | psy_node_core::store::rollback_control::RollbackControlState::AllRealmsReady(_)
                         ) {
+                            if matches!(
+                                head.rollback_control(),
+                                psy_node_core::store::rollback_control::RollbackControlState::Verifying(_)
+                            ) {
+                                match processor
+                                    .db
+                                    .rebuild_coordinator_runtime_after_rollback()
+                                    .await
+                                {
+                                    Ok(Some(report)) => tracing::warn!(
+                                        "[COORDINATOR] Rollback runtime rebuilt at checkpoint {} (backup range [{}, {})); selecting the complete Realm report set",
+                                        report.processor_checkpoint(),
+                                        report.backup_min_checkpoint(),
+                                        report.backup_next_checkpoint(),
+                                    ),
+                                    Ok(None) => {
+                                        tracing::warn!(
+                                            "[COORDINATOR] VERIFYING is active but its runtime rebuild directive is not available yet"
+                                        );
+                                        continue;
+                                    }
+                                    Err(error) => {
+                                        let error = format!(
+                                            "Coordinator rollback runtime rebuild failed closed at slot {}: {:#}",
+                                            current_slot, error,
+                                        );
+                                        processor.db.status.set_error(error.clone());
+                                        tracing::error!("{error}");
+                                        continue;
+                                    }
+                                }
+                            }
                             match processor
                                 .db
-                                .rebuild_coordinator_runtime_after_rollback()
+                                .try_publish_restored_runtime()
                                 .await
                             {
-                                Ok(Some(report)) => tracing::warn!(
-                                    "[COORDINATOR] Rollback runtime rebuilt at checkpoint {} (backup range [{}, {})); waiting for all Realm runtime reports",
-                                    report.processor_checkpoint(),
-                                    report.backup_min_checkpoint(),
-                                    report.backup_next_checkpoint(),
+                                Ok(CoordinatorRollbackRuntimePublication::AwaitingRealmReports {
+                                    completed,
+                                    expected,
+                                }) => tracing::warn!(
+                                    "[COORDINATOR] Rollback runtime barrier awaits Realm reports: {completed}/{expected} complete"
                                 ),
-                                Ok(None) => tracing::warn!(
-                                    "[COORDINATOR] VERIFYING is active but its runtime rebuild directive is not available yet"
-                                ),
+                                Ok(CoordinatorRollbackRuntimePublication::Published(published)) => {
+                                    tracing::warn!(
+                                        "[COORDINATOR] Globally published restored checkpoint {} at epoch {}; normal block admission may resume",
+                                        published.canonical_ref().checkpoint().checkpoint_id().get(),
+                                        published.canonical_ref().chain_epoch().get(),
+                                    );
+                                }
                                 Err(error) => {
                                     let error = format!(
-                                        "Coordinator rollback runtime rebuild failed closed at slot {}: {:#}",
+                                        "Coordinator global runtime publication failed closed at slot {}: {:#}",
                                         current_slot, error,
                                     );
                                     processor.db.status.set_error(error.clone());
@@ -281,6 +320,10 @@ mod tests {
             .find("continue;")
             .map(|offset| rebuild + offset)
             .expect("runtime rebuild park");
+        let publication = production[rebuild..]
+            .find("try_publish_restored_runtime")
+            .map(|offset| rebuild + offset)
+            .expect("runtime target publication");
         let archive = production[admission..]
             .find("prepare_coordinator_rollback_archive")
             .map(|offset| admission + offset)
@@ -298,6 +341,8 @@ mod tests {
             admission < verifying
                 && verifying < rebuild
                 && rebuild < rebuild_park
+                && rebuild < publication
+                && publication < archive
                 && rebuild_park < archive
                 && archive < park
                 && park < process
