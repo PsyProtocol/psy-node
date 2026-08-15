@@ -253,6 +253,107 @@ where
         Ok(())
     }
 
+    /// Restore the already-allocated successor generation while rollback
+    /// maintenance is active. This is a read/adopt operation: it must not
+    /// increment the pending counter or publish an ordinary Edge context.
+    pub(in crate::realm::processor) async fn resume_pre_ponr_unique_ids(
+        &mut self,
+        gathering_realm_end_root: N::QHash,
+    ) -> anyhow::Result<()> {
+        let (gathering_pending, gathering_proc) =
+            self.db.get_current_unique_pending_id().await?;
+        let processing_pending = gathering_pending.checked_sub(1).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Realm pre-PONR maintenance requires an allocated successor generation"
+            )
+        })?;
+        let processing_proc = self
+            .db
+            .get_proc_checkpoint_unique_id_for_pending_id(processing_pending)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Realm pre-PONR processing namespace is missing its durable mapping"
+                )
+            })?;
+        if processing_proc == gathering_proc {
+            anyhow::bail!(
+                "Realm pre-PONR gathering identity is not the exact durable successor"
+            )
+        }
+
+        self.guta_update_queue.ensure_stream().await?;
+        self.proof_work_queue.ensure_stream().await?;
+        let realm_id = self.state.realm_id_u64;
+        let realm_sub_id = self.state.realm_sub_id_u64;
+        for unique_id in [processing_proc, gathering_proc] {
+            self.guta_update_queue
+                .ensure_consumer(
+                &RealmUserUpdateQueueKey {
+                    realm_id,
+                    realm_sub_id,
+                    unique_id,
+                    task_group: 0,
+                    queue_type: QPBaseQueueType::StandardEphemeral,
+                    _phantom_queue_item: std::marker::PhantomData::<
+                        PsyRealmUserUpdateQueueItem<N::F, N::QHash>,
+                    >,
+                },
+                realm_id,
+                realm_sub_id,
+                unique_id,
+                0,
+            )
+            .await?;
+            self.proof_work_queue
+                .ensure_consumer(
+                &RealmProvingWorkQueueKey {
+                    realm_id,
+                    realm_sub_id,
+                    unique_id,
+                    task_group: 0,
+                    queue_type: QPBaseQueueType::WorkerQueue,
+                    _phantom_queue_item: std::marker::PhantomData::<
+                        PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>,
+                    >,
+                },
+                realm_id,
+                realm_sub_id,
+                unique_id,
+                0,
+            )
+            .await?;
+        }
+
+        self.state.processing_unique_pending_id = processing_pending;
+        self.state.processing_proc_checkpoint_unique_id = processing_proc;
+        self.state.gathering_unique_pending_id = gathering_pending;
+        self.state.gathering_proc_checkpoint_unique_id = gathering_proc;
+        self.state.processing_realm_end_root = gathering_realm_end_root;
+        self.state.gathering_realm_start_root = gathering_realm_end_root;
+        self.guta_queue_key_status_manager
+            .set_unique_id(gathering_proc)?;
+        self.temp_db
+            .set_unique_pending_ids(
+                &self.state.realm_identifier,
+                self.state.processing_unique_pending_id,
+                self.state.processing_proc_checkpoint_unique_id,
+            )
+            .await?;
+        self.temp_db
+            .set_gathering_unique_pending_ids(
+                &self.state.realm_identifier,
+                gathering_pending,
+                gathering_proc,
+            )
+            .await?;
+        self.temp_db
+            .clear_current_pending_context(&self.state.realm_identifier)
+            .await?;
+        self.shared_state.update_from_core_state(&self.state).await?;
+        Ok(())
+    }
+
     pub async fn commit_checkpoint_state_no_guta_update(
         &mut self,
         checkpoint_sync_info: &PQEDCheckpointSyncInfoCompact<N::F, N::QHash>,
@@ -558,13 +659,16 @@ mod rollback_restart_pending_tests {
         let restart = method
             .find("self.resume_rollback_unique_ids(directive, rollback_target_is_published)")
             .unwrap();
+        let maintenance = method
+            .find("self.resume_pre_ponr_unique_ids(current_realm_root)")
+            .unwrap();
         let normal = method
             .find("self.set_new_unique_ids(Some(current_realm_root))")
             .unwrap();
         let queue = method
             .find("self.guta_queue_key_status_manager")
             .unwrap();
-        assert!(restart < normal && normal < queue);
+        assert!(restart < maintenance && maintenance < normal && normal < queue);
         let prefix = method
             .split("// 4. Ordinary startup may fast-forward from Coordinator")
             .nth(1)
@@ -575,5 +679,23 @@ mod rollback_restart_pending_tests {
         assert_eq!(prefix.matches("if !rollback_restart").count(), 2);
         assert!(prefix.contains("sync_to_coordinator_set_checkpoint_id"));
         assert!(prefix.contains("sync_from_coordinator_client"));
+    }
+
+    #[test]
+    fn pre_ponr_startup_adopts_durable_successor_without_allocation() {
+        let source = include_str!("commit.rs");
+        let method = source
+            .split("async fn resume_pre_ponr_unique_ids")
+            .nth(1)
+            .expect("Realm maintenance successor method")
+            .split("pub async fn commit_checkpoint_state_no_guta_update")
+            .next()
+            .unwrap();
+        assert!(!method.contains("inc_unique_pending_id"));
+        assert!(method.contains("get_current_unique_pending_id"));
+        assert!(method.contains("checked_sub(1)"));
+        assert!(method.contains("get_proc_checkpoint_unique_id_for_pending_id"));
+        assert!(method.contains("clear_current_pending_context"));
+        assert_eq!(method.matches("ensure_consumer(").count(), 2);
     }
 }

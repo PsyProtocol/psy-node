@@ -533,6 +533,16 @@ mod tests {
         let startup = include_str!("core/startup.rs");
         assert!(startup.contains("new_with_status_initially_paused::<"));
         assert!(startup.contains("initial_rollback_pause,"));
+        assert!(startup.contains(
+            "let rollback_maintenance_startup = initial_rollback_drain.is_some();"
+        ));
+        let database_init = include_str!("db/init.rs");
+        assert!(database_init.contains(
+            "if !rollback_restart && !rollback_maintenance_startup"
+        ));
+        assert!(database_init.contains(
+            "} else if !rollback_maintenance_startup {\n            self.set_new_unique_ids"
+        ));
     }
 
     #[test]

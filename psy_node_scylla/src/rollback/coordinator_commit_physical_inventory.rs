@@ -186,14 +186,30 @@ impl<Hash: Q256BitHash> CoordinatorCommitPhysicalInventory<Hash> {
         let mut inventories = Vec::with_capacity(sources.len());
         for (offset, (source, marker)) in sources.iter().enumerate() {
             let expected_checkpoint = target_checkpoint + 1 + offset as u64;
-            if source.expected() != &preceding
-                || source.candidate().network_id() != target.network_id()
-                || source.candidate().chain_epoch() != target.chain_epoch()
-                || source.candidate().checkpoint().checkpoint_id().get()
-                    != expected_checkpoint
+            let predecessor_matches = source.expected() == &preceding;
+            let network_matches =
+                source.candidate().network_id() == target.network_id();
+            let epoch_matches =
+                source.candidate().chain_epoch() == target.chain_epoch();
+            let checkpoint_matches = source
+                .candidate()
+                .checkpoint()
+                .checkpoint_id()
+                .get()
+                == expected_checkpoint;
+            if !predecessor_matches
+                || !network_matches
+                || !epoch_matches
+                || !checkpoint_matches
             {
                 return Err(CoordinatorCommitPhysicalInventoryError::SuffixLinkMismatch {
                     checkpoint: expected_checkpoint,
+                    predecessor_matches,
+                    network_matches,
+                    epoch_matches,
+                    checkpoint_matches,
+                    source_expected: source.expected().to_canonical_bytes().to_vec(),
+                    preceding: preceding.to_canonical_bytes().to_vec(),
                 });
             }
             let inventory = Self::try_from_committed_source::<F, Hasher>(
@@ -1042,7 +1058,15 @@ pub enum CoordinatorCommitPhysicalInventoryError {
     SourceBindingMismatch,
     SuffixBranchMismatch,
     SuffixLengthMismatch { expected: u64, actual: u64 },
-    SuffixLinkMismatch { checkpoint: u64 },
+    SuffixLinkMismatch {
+        checkpoint: u64,
+        predecessor_matches: bool,
+        network_matches: bool,
+        epoch_matches: bool,
+        checkpoint_matches: bool,
+        source_expected: Vec<u8>,
+        preceding: Vec<u8>,
+    },
     SuffixHeadMismatch,
     CatalogFloorMismatch,
     EmptyCatalogSuffix,
@@ -1510,7 +1534,7 @@ mod tests {
             (first.clone(), first.committed_marker()),
             (wrong_link.clone(), wrong_link.committed_marker()),
         ];
-        assert_eq!(
+        assert!(matches!(
             CoordinatorCommitPhysicalInventory::<PHash>::try_suffix_from_committed_sources::<
                 PF,
                 PoseidonHasher,
@@ -1522,8 +1546,13 @@ mod tests {
             ),
             Err(CoordinatorCommitPhysicalInventoryError::SuffixLinkMismatch {
                 checkpoint: 9,
+                predecessor_matches: false,
+                network_matches: true,
+                epoch_matches: true,
+                checkpoint_matches: true,
+                ..
             })
-        );
+        ));
         assert_eq!(
             CoordinatorCommitPhysicalInventory::<PHash>::try_suffix_from_committed_sources::<
                 PF,

@@ -40,6 +40,8 @@ use psy_node_core::store::{
 #[cfg(test)]
 use super::BranchExactWriterPrepared;
 #[cfg(test)]
+use super::qualification_persist_realm_genesis_rollback_anchor;
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use scylla::client::session::Session;
 
@@ -167,6 +169,31 @@ impl ScyllaRealmRollbackRuntimeControl {
             self.coordinator_archive_keyspace.clone(),
         )
         .await?)
+    }
+
+    /// Qualification-only persistence of the same immutable checkpoint-zero
+    /// anchor written by the production Genesis activation.  No live writer,
+    /// pipeline, head, or serving route is changed here.
+    #[cfg(test)]
+    pub(crate) async fn qualification_seed_genesis_rollback_anchor<
+        Hash: Q256BitHash,
+    >(
+        &self,
+        genesis: psy_data::protocol::chain_context::AuthorityObservation<Hash>,
+        genesis_l2_block_state: Vec<u8>,
+        writer_activation_digest: [u8; 32],
+    ) -> anyhow::Result<()> {
+        qualification_persist_realm_genesis_rollback_anchor(
+            self.session.clone(),
+            self.local_state_keyspace.clone(),
+            BranchExactDeploymentNoTabletKeyspace::try_new(
+                self.local_control_keyspace.as_str().to_owned(),
+            )?,
+            genesis,
+            genesis_l2_block_state,
+            writer_activation_digest,
+        )
+        .await
     }
 
     /// Qualification setup only: persist a small canonical Realm commit

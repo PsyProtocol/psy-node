@@ -79,9 +79,7 @@ impl<Hash: Q256BitHash> StoredAbortAck<Hash> {
             .rollback_control()
             .aborting()
             .ok_or(RollbackAbortConvergenceError::NotAborting)?;
-        if matches!(authority, AuthorityScope::Coordinator) != paused_runtime.is_none()
-            || paused_runtime.is_some_and(|runtime| runtime.identity == 0)
-        {
+        if matches!(authority, AuthorityScope::Coordinator) != paused_runtime.is_none() {
             return Err(RollbackAbortConvergenceError::InvalidRuntimeBoundary);
         }
         let plan_digest = *abort.request().plan_digest().as_bytes();
@@ -1219,7 +1217,7 @@ mod tests {
     }
 
     #[test]
-    fn coordinator_ack_cannot_claim_realm_pause_and_realm_requires_identity() {
+    fn coordinator_ack_cannot_claim_realm_pause_and_genesis_identity_is_valid() {
         let head = aborting();
         assert!(matches!(
             StoredAbortAck::try_new(
@@ -1230,15 +1228,17 @@ mod tests {
             ),
             Err(RollbackAbortConvergenceError::InvalidRuntimeBoundary)
         ));
-        assert!(matches!(
-            StoredAbortAck::try_new(
-                head,
-                AuthorityScope::Realm { realm_id: 1, realm_sub_id: 1 },
-                Some(PausedRuntimeBoundary { revision: 1, identity: 0 }),
-                [3; 32],
-            ),
-            Err(RollbackAbortConvergenceError::InvalidRuntimeBoundary)
-        ));
+        let genesis = StoredAbortAck::try_new(
+            head,
+            AuthorityScope::Realm { realm_id: 1, realm_sub_id: 1 },
+            Some(PausedRuntimeBoundary { revision: 1, identity: 0 }),
+            [3; 32],
+        )
+        .expect("generation zero is the valid paused Realm identity at genesis");
+        assert_eq!(
+            genesis.paused_runtime,
+            Some(PausedRuntimeBoundary { revision: 1, identity: 0 })
+        );
     }
 
     #[test]
@@ -1315,7 +1315,11 @@ mod tests {
             .candidate()
             .to_owned();
         assert!(idle.rollback_control().is_idle());
-        assert_eq!(idle.canonical_ref(), head.canonical_ref());
+        assert_eq!(
+            idle.canonical_ref().chain_epoch().get().checked_add(1),
+            Some(head.canonical_ref().chain_epoch().get())
+        );
+        assert_eq!(idle.canonical_ref().checkpoint(), head.canonical_ref().checkpoint());
     }
 
     #[test]

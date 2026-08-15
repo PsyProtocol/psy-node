@@ -303,8 +303,22 @@ where
     pub async fn ensure_genesis_applied(
         &mut self,
         genesis_block_update: PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate<N::F, N::QHash>,
+        rollback_maintenance_startup: bool,
     ) -> anyhow::Result<()> {
-        let database_check_state = self.get_database_check_state().await?;
+        let database_check_state = if rollback_maintenance_startup {
+            let local_latest_checkpoint_id = self.db.get_latest_checkpoint_id().await?;
+            if local_latest_checkpoint_id == 0 {
+                match self.db.get_unique_pending_id_for_checkpoint_id(0).await? {
+                    Some((0, 0)) => DatabaseCheckState::Ready,
+                    Some(_) => DatabaseCheckState::NeedsRecovery,
+                    None => DatabaseCheckState::NeedsGenesis,
+                }
+            } else {
+                DatabaseCheckState::Ready
+            }
+        } else {
+            self.get_database_check_state().await?
+        };
         if database_check_state == DatabaseCheckState::NeedsGenesis {
             tracing::info!("Applying genesis block setup data to realm processor database...");
             println!("genesis_block_update.coordinator_update: {:?}", genesis_block_update.coordinator_update);
@@ -698,16 +712,24 @@ where
         global_user_tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
         rollback_restart_directive: Option<RollbackRuntimeRebuildDirective<N::QHash>>,
         rollback_target_is_published: bool,
+        rollback_maintenance_startup: bool,
     ) -> anyhow::Result<()> {
         let genesis_checkpoint_root = genesis_block_update.coordinator_update.checkpoint_sync_info.checkpoint_tree_root;
         let rollback_restart = rollback_restart_directive.is_some();
 
         // 1. Genesis Check
-        self.ensure_genesis_applied(genesis_block_update).await?;
+        self.ensure_genesis_applied(genesis_block_update, rollback_maintenance_startup)
+            .await?;
 
         // 2. Recovery Check
-        self.ensure_backup_restored_if_necessary(file_system, guta_gatherer_backup_directory, global_user_tree)
+        if !rollback_maintenance_startup {
+            self.ensure_backup_restored_if_necessary(
+                file_system,
+                guta_gatherer_backup_directory,
+                global_user_tree,
+            )
             .await?;
+        }
 
         // 3. Hydrate Checkpoint Manager from Local DB (if we have data)
         if self.state.last_committed_checkpoint_id > 0 {
@@ -720,7 +742,7 @@ where
         // restart must instead remain on the locally restored target selected
         // by its immutable directive: until global publication the
         // Coordinator control row can still expose the abandoned old height.
-        if !rollback_restart {
+        if !rollback_restart && !rollback_maintenance_startup {
             self.sync_to_coordinator_set_checkpoint_id().await?;
         }
 
@@ -734,7 +756,7 @@ where
         self.state.gathering_realm_start_root = current_realm_root;
 
         // 6. Final Sync of Checkpoint Manager (Tip Verification)
-        if !rollback_restart {
+        if !rollback_restart && !rollback_maintenance_startup {
             self.checkpoint_tree_backup_manager
                 .sync_from_coordinator_client::<CoordinatorClient, N::F>(
                     &self.coordinator_client,
@@ -770,7 +792,9 @@ where
         if let Some(directive) = rollback_restart_directive.as_ref() {
             self.resume_rollback_unique_ids(directive, rollback_target_is_published)
                 .await?;
-        } else {
+        } else if rollback_maintenance_startup {
+            self.resume_pre_ponr_unique_ids(current_realm_root).await?;
+        } else if !rollback_maintenance_startup {
             self.set_new_unique_ids(Some(current_realm_root)).await?;
         }
 

@@ -2896,6 +2896,12 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
             ProvingJobCircuitType::GUTATwoGUTALinear,
         )?
         .root;
+    let genesis_checkpoint_state_transition_fingerprint = verifier
+        .gcv
+        .library
+        .get_fingerprint(
+            ProvingJobCircuitType::GenesisBlockCheckpointStateTransition,
+        )?;
     let profile = verifier.realm_user_update_verifier_profile(network_type)?;
     let activated = realm_fixture::activate_realm_writer_with_profile(
         Arc::clone(&session),
@@ -5868,6 +5874,7 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                                             coordinator_rid,
                                             Arc::clone(&verifier),
                                             guta_circuit_whitelist,
+                                            genesis_checkpoint_state_transition_fingerprint,
                                             network,
                                         )
                                         .install_durable_guta_submissions(

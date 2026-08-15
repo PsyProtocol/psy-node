@@ -70,7 +70,12 @@ where
         initial_rollback_drain: Option<RealmProcessorDrainRequest>,
     ) -> anyhow::Result<(Self, tokio::task::JoinHandle<Result<(), anyhow::Error>>)> {
         tracing::info!("[REALM_STARTUP] processor new start");
-        db.ensure_genesis_applied(genesis_block_update.clone()).await?;
+        let rollback_maintenance_startup = initial_rollback_drain.is_some();
+        db.ensure_genesis_applied(
+            genesis_block_update.clone(),
+            rollback_maintenance_startup,
+        )
+        .await?;
         tracing::info!("[REALM_STARTUP] ensure_genesis_applied done");
         let (mut global_user_tree,) = load_realm_memory_trees_from_db::<N, _>(&db.db, db.state.gathering_checkpoint_id, db.state.realm_id_u64)
             .await?
@@ -130,6 +135,7 @@ where
             &mut global_user_tree,
             rollback_restart_directive,
             rollback_target_is_published,
+            rollback_maintenance_startup,
         )
             .await?;
         tracing::info!("[REALM_STARTUP] init_with_setup_and_genesis done");

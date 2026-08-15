@@ -510,7 +510,11 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
             new_public_key_hash_to_user_id_rows_ffs: self.register_users_gatherer_result.new_public_key_hash_to_user_id_rows_ffs,
             checkpoint_tree_update_proof: DeltaMerkleProofCore {
                 old_root: last_committed.checkpoint_root,
-                old_value: last_committed.checkpoint_leaf_hash,
+                // The delta targets the newly appended checkpoint slot, not
+                // the predecessor slot. Its previous value must therefore be
+                // the empty leaf; the predecessor commitment is carried by
+                // `old_base` and the separate previous-checkpoint proof.
+                old_value: N::QHash::get_zero_value(),
                 new_root: new_checkpoint_tree_root,
                 new_value: new_checkpoint_leaf_hash,
                 index: coordinator_ids.checkpoint_id + 1,

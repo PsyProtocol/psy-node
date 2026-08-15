@@ -543,18 +543,32 @@ impl<Hash: Q256BitHash> CanonicalHeadTransition<Hash> {
 
     /// Return to IDLE only after Coordinator and every Realm have rotated
     /// away from the aborted request's pending/proc contexts.
+    ///
+    /// No destructive work is allowed before this transition, so abort also
+    /// closes the provisional rollback epoch and restores the exact source
+    /// epoch. Keeping the provisional epoch would make a later rollback scan
+    /// look for the unchanged hot history in the wrong epoch partition.
     pub fn complete_rollback_abort(
         expected: StoredCanonicalHead<Hash>,
     ) -> Result<Self, CanonicalHeadModelError> {
         if !matches!(expected.rollback_control(), RollbackControlState::Aborting(_)) {
             return Err(CanonicalHeadModelError::RollbackAbortNotActive);
         }
+        let opened_epoch = expected.canonical_ref().chain_epoch().get();
+        let source_epoch = opened_epoch
+            .checked_sub(1)
+            .ok_or(CanonicalHeadModelError::RollbackAbortEpochUnderflow)?;
+        let restored = CanonicalChainRef::new(
+            expected.canonical_ref().network_id(),
+            ChainEpoch::new(source_epoch),
+            *expected.canonical_ref().checkpoint(),
+        );
         Ok(Self {
             kind: CanonicalHeadTransitionKind::CompleteRollbackAbort,
             expected,
             candidate: StoredCanonicalHead {
                 revision: expected.revision.checked_next()?,
-                canonical_ref: *expected.canonical_ref(),
+                canonical_ref: restored,
                 rollback_control: RollbackControlState::Idle,
             },
         })
@@ -880,6 +894,7 @@ pub enum CanonicalHeadModelError {
     RollbackNotActiveForAbort,
     RollbackAbortAlreadyStarted,
     RollbackAbortNotActive,
+    RollbackAbortEpochUnderflow,
     RollbackPointOfNoReturn,
     RollbackRequestedHeadMismatch,
     RequestedControlAtEpochZero,
@@ -975,6 +990,9 @@ impl fmt::Display for CanonicalHeadModelError {
             }
             Self::RollbackAbortNotActive => formatter.write_str(
                 "rollback abort completion requires the exact ABORTING phase",
+            ),
+            Self::RollbackAbortEpochUnderflow => formatter.write_str(
+                "rollback abort completion requires an opened non-zero epoch",
             ),
             Self::RollbackPointOfNoReturn => formatter.write_str(
                 "ROLLBACK_POINT_OF_NO_RETURN: destructive rollback work has started",
@@ -1349,7 +1367,7 @@ mod tests {
     }
 
     #[test]
-    fn rollback_abort_is_pre_ponr_only_and_returns_to_idle_without_rewinding_head() {
+    fn rollback_abort_is_pre_ponr_only_and_closes_the_provisional_epoch() {
         let head = canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 10, 50);
         let target = *canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 7, 40)
             .checkpoint();
@@ -1395,15 +1413,19 @@ mod tests {
             )
             .unwrap();
             assert_eq!(idle.kind(), CanonicalHeadTransitionKind::CompleteRollbackAbort);
-            assert_eq!(idle.candidate().canonical_ref(), expected.canonical_ref());
+            assert_eq!(idle.candidate().canonical_ref(), &head);
+            assert_eq!(
+                idle.candidate().revision().get(),
+                aborting.candidate().revision().get() + 1
+            );
             assert!(idle.candidate().rollback_control().is_idle());
 
             let continued = CanonicalHeadTransition::normal_checkpoint_advance(
                 *idle.candidate(),
-                canonical_ref(PsyChainNetworkType::PsyMainnet, 1, 11, 60),
+                canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 11, 60),
             )
             .unwrap();
-            assert_eq!(continued.candidate().canonical_ref().chain_epoch().get(), 1);
+            assert_eq!(continued.candidate().canonical_ref().chain_epoch().get(), 0);
             assert_eq!(
                 continued
                     .candidate()
@@ -1412,6 +1434,20 @@ mod tests {
                     .checkpoint_id()
                     .get(),
                 11
+            );
+
+            let retry = CanonicalHeadTransition::start_rollback(
+                *idle.candidate(),
+                request,
+            )
+            .unwrap();
+            assert_eq!(
+                retry.candidate().canonical_ref().chain_epoch().get(),
+                1
+            );
+            assert_eq!(
+                retry.candidate().canonical_ref().chain_epoch().get().checked_sub(1),
+                Some(head.chain_epoch().get())
             );
         }
 

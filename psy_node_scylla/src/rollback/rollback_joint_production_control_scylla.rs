@@ -7,8 +7,8 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
     process::Command,
-    sync::Arc,
-    time::{Duration, Instant},
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, bail, ensure};
@@ -51,8 +51,7 @@ use psy_node_core::store::{
     },
     authority_local_head::{
         AuthorityLocalHeadBootstrap, AuthorityLocalHeadBootstrapReason,
-        AuthorityStorageBindingGeneration, AuthorityStorageBindingRef,
-        AuthorityStorageNamespaceId,
+        AuthorityStorageBindingRef,
     },
     branch_exact_dual_write::BranchExactDualWriteIntent,
     branch_pending_mapping::BranchPendingMapping,
@@ -101,7 +100,10 @@ use psy_node_core::store::{
     timestamp::{CommitWriteTimestampUs, TimestampFenceWindow},
     typed::{ProcCheckpointUniqueId, UniquePendingId},
 };
-use psy_serialize::PsyIOReadWrite;
+use psy_node_core::psy_core_db::traits::full::PsyNodeCheckpointObjectDatabaseWriter;
+use psy_serialize::{
+    PsyCanonicalDatabaseSerializeBaseSingle, PsyIOReadWrite,
+};
 use scylla::{
     client::{
         execution_profile::ExecutionProfile,
@@ -137,7 +139,7 @@ use super::{
     ScyllaBranchExactWriterLifecycleStore,
     ScyllaRealmRollbackRuntimeControl, SealedBranchExactBackfillPlanCas,
     SealedBranchExactBackfillVerifiedCas, SealedBranchExactSchemaVerifiedCas,
-    SealedPendingCounterAllocation,
+    SealedPendingCounterAllocation, qualification_realm_genesis_storage_binding,
 };
 use super::branch_exact_dual_write_executor::ScyllaBranchExactDualWriteAdapter;
 use super::coordinator_commit_physical_execution::CoordinatorCommitPhysicalExecutionSchedule;
@@ -170,11 +172,62 @@ const JOINT_KEYSPACES: [&str; 6] = [
     REALM_20_KEYSPACE,
     "psy_rollback_joint_control_realm_20_no_tablet",
 ];
+static TARGET_ZERO_HISTORY_TIMESTAMP_BASE_US: OnceLock<i128> = OnceLock::new();
 
 type JointDataset = BTreeMap<String, Vec<String>>;
 
 fn rf3_enabled() -> bool {
     std::env::var("PSY_ROLLBACK_JOINT_RF3").as_deref() == Ok("1")
+}
+
+fn target_zero_enabled() -> bool {
+    std::env::var("PSY_ROLLBACK_JOINT_TARGET_ZERO").as_deref() == Ok("1")
+}
+
+fn target_zero_history_timestamp_base_us() -> anyhow::Result<i128> {
+    if let Some(value) = TARGET_ZERO_HISTORY_TIMESTAMP_BASE_US.get() {
+        return Ok(*value);
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock precedes Unix epoch")?;
+    let now_us = i128::try_from(now.as_micros())?;
+    // The physical Genesis rows are written immediately before this value is
+    // first selected.  Keep the test commit above them while remaining well
+    // inside Scylla's three-day future-timestamp guard.
+    let selected = now_us
+        .checked_add(60_000_000)
+        .ok_or_else(|| anyhow::anyhow!("qualification timestamp overflow"))?;
+    let _ = TARGET_ZERO_HISTORY_TIMESTAMP_BASE_US.set(selected);
+    Ok(*TARGET_ZERO_HISTORY_TIMESTAMP_BASE_US
+        .get()
+        .expect("timestamp base set above"))
+}
+
+fn qualification_commit_timestamp(checkpoint: u64) -> anyhow::Result<CommitWriteTimestampUs> {
+    let value = if target_zero_enabled() {
+        target_zero_history_timestamp_base_us()? + i128::from(checkpoint)
+    } else {
+        10_000 + i128::from(checkpoint)
+    };
+    Ok(CommitWriteTimestampUs::try_from_i128(value)?)
+}
+
+fn rollback_fence_window() -> anyhow::Result<TimestampFenceWindow> {
+    if target_zero_enabled() {
+        let base = target_zero_history_timestamp_base_us()?;
+        Ok(TimestampFenceWindow::try_new(
+            CommitWriteTimestampUs::try_from_i128(base + 1_000)?,
+            base + 2_000,
+            base + 3_000,
+        )?)
+    } else {
+        Ok(TimestampFenceWindow::try_new(
+            CommitWriteTimestampUs::try_from_i128(11_000)?,
+            12_000,
+            13_000,
+        )?)
+    }
 }
 
 fn known_nodes() -> Vec<String> {
@@ -391,6 +444,9 @@ fn coordinator_leaf(seed: u8) -> PsyCheckpointLeafPopulated<PF, PHash> {
 }
 
 fn coordinator_block_state(checkpoint: u64) -> QEDL2BlockState {
+    if checkpoint == 0 {
+        return QEDL2BlockState::get_genesis_value();
+    }
     QEDL2BlockState {
         checkpoint_id: checkpoint,
         next_add_withdrawal_id: 11 + checkpoint,
@@ -417,7 +473,7 @@ fn coordinator_commit_source(
         ProcCheckpointUniqueId::from_u128(20_000 + u128::from(pending)),
         seed.wrapping_sub(1),
         seed,
-        CommitWriteTimestampUs::try_from_i128(10_000 + i128::from(checkpoint))?,
+        qualification_commit_timestamp(checkpoint)?,
     )
 }
 
@@ -642,6 +698,7 @@ fn realm_commit_models(
     pending: u64,
     timestamp: i64,
     seed: u8,
+    storage_binding: AuthorityStorageBindingRef,
 ) -> anyhow::Result<(
     BranchExactDualWriteIntent<PHash>,
     CommitWriteTimestampUs,
@@ -676,10 +733,7 @@ fn realm_commit_models(
         )?,
         timestamp,
         AuthorityManifestDigest::from_persisted([seed.max(1); 32]),
-        AuthorityStorageBindingRef::new(
-            AuthorityStorageBindingGeneration::try_new(1)?,
-            AuthorityStorageNamespaceId::from_verified_namespace_id([0xB1; 32]),
-        ),
+        storage_binding,
     );
     let head = head_bootstrap.candidate().clone();
 
@@ -971,22 +1025,47 @@ async fn qualification_seed_coordinator_history(
         chain(0, 0xA0),
     )?
     .candidate();
-    let (target_source, target_narrow) =
-        coordinator_commit_source(floor_predecessor, 1, 2, 0xA1)?;
-    let target = *target_source.candidate();
-    let target_bootstrap = CanonicalHeadBootstrap::try_new(
-        CanonicalHeadBootstrapProfile::PostGenesisFloor,
-        target,
-    )?;
-    let target_head = *target_bootstrap.candidate();
-    store.bootstrap_canonical_head(&target_bootstrap).await?;
+    let (mut current, target, first_checkpoint) = if target_zero_enabled() {
+        let genesis_bootstrap = CanonicalHeadBootstrap::try_new(
+            CanonicalHeadBootstrapProfile::GenesisNative,
+            *floor_predecessor.canonical_ref(),
+        )?;
+        let genesis_head = *genesis_bootstrap.candidate();
+        store.bootstrap_canonical_head(&genesis_bootstrap).await?;
 
-    qualification_seed_coordinator_commit(store, &target_source, &target_narrow)
+        // A checkpoint-zero rollback restores the real immutable Genesis L2
+        // row, not a synthesized ordinary commit.  Seed the three physical
+        // sources observed by the rollback-floor store before the head can
+        // advance beyond Genesis.
+        let db = crate::psy_setup::setup_psy_scylla_database_store::<
+            RealmRollbackTestNetwork,
+        >(Arc::new(store.clone()))
         .await?;
-    store.ensure_coordinator_rollback_floor(&target_head).await?;
+        let genesis_l2 = QEDL2BlockState::get_genesis_value();
+        db.set_l2_block_state(0, &genesis_l2).await?;
+        db.set_l2_latest_block_state(&genesis_l2).await?;
+        db.set_latest_checkpoint_id(0).await?;
+        store.ensure_coordinator_rollback_floor(&genesis_head).await?;
+        (genesis_head, *genesis_head.canonical_ref(), 1_u64)
+    } else {
+        let (target_source, target_narrow) =
+            coordinator_commit_source(floor_predecessor, 1, 2, 0xA1)?;
+        let target = *target_source.candidate();
+        let target_bootstrap = CanonicalHeadBootstrap::try_new(
+            CanonicalHeadBootstrapProfile::PostGenesisFloor,
+            target,
+        )?;
+        let target_head = *target_bootstrap.candidate();
+        store.bootstrap_canonical_head(&target_bootstrap).await?;
+        qualification_seed_coordinator_commit(store, &target_source, &target_narrow)
+            .await?;
+        store.ensure_coordinator_rollback_floor(&target_head).await?;
+        (target_head, target, 2_u64)
+    };
 
-    let mut current = target_head;
-    for (checkpoint, pending, seed) in [(2_u64, 3_u64, 0xA2_u8), (3, 4, 0xA3)] {
+    for checkpoint in first_checkpoint..=3 {
+        let pending = checkpoint + 1;
+        let seed = 0xA0_u8.wrapping_add(checkpoint as u8);
         let (source, narrow) =
             coordinator_commit_source(current, checkpoint, pending, seed)?;
         let candidate = *source.candidate();
@@ -1070,6 +1149,8 @@ async fn qualification_seed_realm_history(
 ) -> anyhow::Result<()> {
     let mut commits = Vec::new();
     let mut source_bootstrap = None;
+    let genesis = realm_observation(authority, 0, seed_base)?;
+    let storage_binding = qualification_realm_genesis_storage_binding(genesis)?;
     for checkpoint in 1_u64..=3 {
         let (intent, timestamp, head, pipeline, bootstrap) = realm_commit_models(
             authority,
@@ -1077,6 +1158,7 @@ async fn qualification_seed_realm_history(
             pending_base + checkpoint,
             1_000 + checkpoint as i64,
             seed_base.wrapping_add(checkpoint as u8),
+            storage_binding,
         )?;
         commits.push((intent, timestamp, head, pipeline));
         if checkpoint == 3 {
@@ -1090,7 +1172,18 @@ async fn qualification_seed_realm_history(
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("source bootstrap missing"))?,
         )
-        .await
+        .await?;
+
+    if target_zero_enabled() {
+        control
+            .qualification_seed_genesis_rollback_anchor(
+                genesis,
+                QEDL2BlockState::get_genesis_value().psy_ser_to_bytes_vec()?,
+                [0xA5; 32],
+            )
+            .await?;
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -1108,6 +1201,7 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
     let (committed_head, target) =
         qualification_seed_coordinator_history(&coordinator).await?;
     let old_head = *committed_head.canonical_ref();
+    let target_checkpoint = target.checkpoint().checkpoint_id().get();
 
     let realms = vec![
         RollbackRealmParticipant::new(10, 0),
@@ -1139,11 +1233,7 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
             committed_head.revision(),
             old_head,
             *target.checkpoint(),
-            TimestampFenceWindow::try_new(
-                CommitWriteTimestampUs::try_from_i128(11_000)?,
-                12_000,
-                13_000,
-            )?,
+            rollback_fence_window()?,
             topology.revision(),
             *topology.digest(),
         ))
@@ -1491,9 +1581,9 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
     // directive. A Realm may only append its report; it cannot publish the
     // Coordinator head or provide the participant set.
     let mut selected_realms = Vec::new();
-    for (control, authority, seed) in [
-        (&realm_10, realm_10_authority, 0xC1),
-        (&realm_20, realm_20_authority, 0xD1),
+    for (control, authority, seed_base) in [
+        (&realm_10, realm_10_authority, 0xC0_u8),
+        (&realm_20, realm_20_authority, 0xD0_u8),
     ] {
         let RealmRollbackParticipantProgress::ReadyForRuntimeRebuild(observed) =
             <ScyllaRealmRollbackRuntimeControl as RealmRollbackRuntimeControl<
@@ -1516,7 +1606,13 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
         })?;
         let report = runtime_rebuild_report(
             selected.directive(),
-            *realm_observation(authority, 1, seed)?.state_root().as_inner(),
+            *realm_observation(
+                authority,
+                target_checkpoint,
+                seed_base.wrapping_add(target_checkpoint as u8),
+            )?
+            .state_root()
+            .as_inner(),
         )?;
         <ScyllaRealmRollbackRuntimeControl as RealmRollbackRuntimeControl<PHash>>
             ::persist_realm_runtime_rebuild_report(control, selected, report)
@@ -1536,7 +1632,10 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
     realm_10 = realm_control(REALM_10_KEYSPACE, 10).await?;
     realm_20 = realm_control(REALM_20_KEYSPACE, 20).await?;
 
-    let coordinator_report = runtime_rebuild_report(&coordinator_directive, hash(0xA1))?;
+    let coordinator_report = runtime_rebuild_report(
+        &coordinator_directive,
+        hash(0xA0_u8.wrapping_add(target_checkpoint as u8)),
+    )?;
     <ScyllaCoreStore<PHash, PoseidonHasher> as CoordinatorRollbackRuntimeRebuildStore<
         PHash,
     >>::persist_coordinator_runtime_rebuild_report(
@@ -1604,16 +1703,17 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
     let coordinator_t1 = qualification_append_post_rollback_coordinator_commit(
         &coordinator,
         published,
-        2,
-        2,
+        target_checkpoint + 1,
+        target_checkpoint + 1,
         coordinator_processing,
         coordinator_t1_timestamp,
-        0xA1,
-        0xB2,
+        0xA0_u8.wrapping_add(target_checkpoint as u8),
+        0xB0_u8.wrapping_add((target_checkpoint + 1) as u8),
     )
     .await?;
     ensure!(
-        coordinator_t1.canonical_ref().checkpoint().checkpoint_id().get() == 2
+        coordinator_t1.canonical_ref().checkpoint().checkpoint_id().get()
+            == target_checkpoint + 1
             && coordinator_t1.canonical_ref().chain_epoch().get() == 1,
         "Coordinator did not advance from restored T to new-epoch T+1",
     );
@@ -1623,16 +1723,17 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
     let coordinator_t2 = qualification_append_post_rollback_coordinator_commit(
         &coordinator,
         coordinator_t1,
-        3,
+        target_checkpoint + 2,
         coordinator_processing.pending_id().get(),
         coordinator_gathering,
         coordinator_t2_timestamp,
-        0xB2,
-        0xC3,
+        0xB0_u8.wrapping_add((target_checkpoint + 1) as u8),
+        0xC0_u8.wrapping_add((target_checkpoint + 2) as u8),
     )
     .await?;
     ensure!(
-        coordinator_t2.canonical_ref().checkpoint().checkpoint_id().get() == 3
+        coordinator_t2.canonical_ref().checkpoint().checkpoint_id().get()
+            == target_checkpoint + 2
             && coordinator_t2.canonical_ref().chain_epoch().get() == 1,
         "Coordinator did not continue from T+1 to new-epoch T+2",
     );
@@ -1642,7 +1743,16 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
         (&realm_20, selected_realms[1]),
     ]
         .into_iter()
-        .zip([(2_u64, 0xE2_u8), (2_u64, 0xF2_u8)])
+        .zip([
+            (
+                target_checkpoint + 1,
+                0xE0_u8.wrapping_add((target_checkpoint + 1) as u8),
+            ),
+            (
+                target_checkpoint + 1,
+                0xF0_u8.wrapping_add((target_checkpoint + 1) as u8),
+            ),
+        ])
     {
         let directive = selected.directive();
         let processing = directive
@@ -1673,7 +1783,8 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
             .await?;
         ensure!(
             head.head().chain() == observation.chain()
-                && head.head().chain().checkpoint().checkpoint_id().get() == 2
+                && head.head().chain().checkpoint().checkpoint_id().get()
+                    == target_checkpoint + 1
                 && head.head().chain().chain_epoch().get() == 1
                 && committed_timestamp.as_i64()
                     > directive
@@ -1718,7 +1829,8 @@ async fn explicit_admin_request_is_selected_by_every_production_realm_control(
             .await?;
         ensure!(
             t2_head.head().chain() == t2_observation.chain()
-                && t2_head.head().chain().checkpoint().checkpoint_id().get() == 3
+                && t2_head.head().chain().checkpoint().checkpoint_id().get()
+                    == target_checkpoint + 2
                 && t2_head.head().chain().chain_epoch().get() == 1
                 && t2_committed_timestamp.as_i64() > committed_timestamp.as_i64(),
             "Realm did not continue from T+1 to new-epoch T+2",

@@ -2290,6 +2290,21 @@ impl<
             .await
     }
 
+    async fn get_proc_checkpoint_unique_id_for_pending_id(
+        &self,
+        unique_pending_id: u64,
+    ) -> anyhow::Result<Option<QCoreProcCheckpointUniqueId>> {
+        if unique_pending_id == 0 {
+            return Ok(Some(0));
+        }
+        self.store
+            .db_select_one_u128_value_by_u64(
+                &self.pending_id_to_pending_proc_id_table,
+                unique_pending_id,
+            )
+            .await
+    }
+
     async fn get_current_unique_pending_id(&self) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId)> {
         let pending_id = self.get_latest_pending_id().await?;
         if pending_id == 0 {

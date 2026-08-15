@@ -100,6 +100,35 @@ pub enum DatabaseCheckState {
     Ready = 2,
 }
 
+fn classify_database_check_state(
+    actual_checkpoint: u64,
+    genesis_materialized: bool,
+    latest_mapped_pending: u64,
+    mapped_checkpoint: Option<u64>,
+) -> anyhow::Result<DatabaseCheckState> {
+    let Some(expected_checkpoint) = mapped_checkpoint else {
+        return if actual_checkpoint == 0 && !genesis_materialized {
+            Ok(DatabaseCheckState::NeedsGenesis)
+        } else {
+            Ok(DatabaseCheckState::Ready)
+        };
+    };
+    if expected_checkpoint == actual_checkpoint {
+        return Ok(DatabaseCheckState::Ready);
+    }
+    if expected_checkpoint < actual_checkpoint {
+        anyhow::bail!(
+            "Inconsistent database state detected: expected checkpoint ID ({expected_checkpoint}) for unique pending ID ({latest_mapped_pending}) is less than actual latest applied checkpoint ID ({actual_checkpoint}). This indicates a serious inconsistency in the database state."
+        );
+    }
+    if actual_checkpoint.checked_add(1) == Some(expected_checkpoint) {
+        return Ok(DatabaseCheckState::NeedsRecovery);
+    }
+    anyhow::bail!(
+        "Inconsistent database state detected: expected checkpoint ID ({expected_checkpoint}) for unique pending ID ({latest_mapped_pending}) is greater than actual latest applied checkpoint ID + 1. This indicates a serious inconsistency in the database state."
+    )
+}
+
 pub async fn create_new_checkpoint_backup_manager_from_file_path<
     Hasher: MerkleZeroHasher<Hash> + 'static + Send + Sync,
     Hash: Eq + Copy + PartialEq + Default + std::hash::Hash + Q256BitHash,
@@ -288,41 +317,36 @@ impl<
     }
     pub async fn get_database_check_state(&self) -> anyhow::Result<DatabaseCheckState> {
         let actual_latest_applied_checkpoint_id: u64 = self.db.get_latest_checkpoint_id().await?;
+        let genesis_materialized = if actual_latest_applied_checkpoint_id == 0 {
+            match self.db.get_unique_pending_id_for_checkpoint_id(0).await? {
+                Some((0, proc_checkpoint_id)) if proc_checkpoint_id == 0 => true,
+                Some((pending_id, proc_checkpoint_id)) => anyhow::bail!(
+                    "Genesis checkpoint mapping must be the exact (pending=0, proc=0) pair, got ({pending_id}, {proc_checkpoint_id})"
+                ),
+                None => false,
+            }
+        } else {
+            true
+        };
         let (last_unique_pending_id, _last_unique_proc_checkpoint_id): (u64, QCoreProcCheckpointUniqueId) =
             match self.db.get_latest_mapped_unique_pending_id().await {
                 Ok(ids) => ids,
-                Err(_) if actual_latest_applied_checkpoint_id == 0 => return Ok(DatabaseCheckState::NeedsGenesis),
+                Err(_) if actual_latest_applied_checkpoint_id == 0 && !genesis_materialized => {
+                    return Ok(DatabaseCheckState::NeedsGenesis)
+                }
                 Err(e) => return Err(e),
             };
 
-        let expected_checkpoint_id: Option<u64> = self.db.get_checkpoint_id_for_unique_pending_id(last_unique_pending_id).await?;
-        let database_check_state = if expected_checkpoint_id.is_none() && actual_latest_applied_checkpoint_id == 0 {
-            // needs genesis
-            DatabaseCheckState::NeedsGenesis
-        } else if expected_checkpoint_id.is_none(){
-            // died before setting anything in the database, we don't need to recover
-            DatabaseCheckState::Ready
-        }else{
-            let expected_checkpoint_id = expected_checkpoint_id.unwrap();
-            if expected_checkpoint_id != actual_latest_applied_checkpoint_id {
-                if expected_checkpoint_id < actual_latest_applied_checkpoint_id {
-                    anyhow::bail!("Inconsistent database state detected: expected checkpoint ID ({}) for unique pending ID ({}) is less than actual latest applied checkpoint ID ({}). This indicates a serious inconsistency in the database state.",
-                        expected_checkpoint_id, last_unique_pending_id, actual_latest_applied_checkpoint_id);
-                } else if expected_checkpoint_id > actual_latest_applied_checkpoint_id + 1 {
-                    anyhow::bail!("Inconsistent database state detected: expected checkpoint ID ({}) for unique pending ID ({}) is greater than actual latest applied checkpoint ID + 1 ({}). This indicates a serious inconsistency in the database state.",
-                        expected_checkpoint_id, last_unique_pending_id, actual_latest_applied_checkpoint_id + 1);
-                } else if expected_checkpoint_id == 0 {
-                    // needs genesis
-                    DatabaseCheckState::NeedsGenesis
-                } else {
-                    // needs recovery
-                    DatabaseCheckState::NeedsRecovery
-                }
-            } else {
-                DatabaseCheckState::Ready
-            }
-        };
-        Ok(database_check_state)
+        let expected_checkpoint_id = self
+            .db
+            .get_checkpoint_id_for_unique_pending_id(last_unique_pending_id)
+            .await?;
+        classify_database_check_state(
+            actual_latest_applied_checkpoint_id,
+            genesis_materialized,
+            last_unique_pending_id,
+            expected_checkpoint_id,
+        )
     }
     pub async fn new_init(
         db: Arc<S>,
@@ -348,6 +372,17 @@ impl<
         tracing::info!("[COORD_INIT] new_init start");
 
         let last_committed_checkpoint_id = db.get_latest_checkpoint_id().await?;
+        let genesis_materialized = if last_committed_checkpoint_id == 0 {
+            match db.get_unique_pending_id_for_checkpoint_id(0).await? {
+                Some((0, proc_checkpoint_id)) if proc_checkpoint_id == 0 => true,
+                Some((pending_id, proc_checkpoint_id)) => anyhow::bail!(
+                    "Genesis checkpoint mapping must be the exact (pending=0, proc=0) pair, got ({pending_id}, {proc_checkpoint_id})"
+                ),
+                None => false,
+            }
+        } else {
+            true
+        };
         let local_genesis_checkpoint_state_transition_hash =
             Self::local_genesis_checkpoint_state_transition_hash(&genesis_verifiable_state_transition);
         let genesis_checkpoint_state_transition_hash =
@@ -394,14 +429,18 @@ impl<
         )
         .await?;
         tracing::info!("[COORD_INIT] checkpoint backup manager created");
-        if last_committed_checkpoint_id > 0 {
+        // Checkpoint 0 is both the pre-genesis sentinel and the first real
+        // checkpoint. Once its exact pending mapping exists, the backup tree
+        // must contain leaf 0 before preparing checkpoint 1. Otherwise a
+        // restart builds the next checkpoint proof from an empty tree.
+        if last_committed_checkpoint_id > 0 || genesis_materialized {
             checkpoint_tree_backup_manager
                 .sync_from_database::<S>(&db, 1000, last_committed_checkpoint_id)
                 .await?;
             tracing::info!("[COORD_INIT] checkpoint backup manager synced from db");
         }
 
-        let shared_status = if last_committed_checkpoint_id == 0 {
+        let shared_status = if last_committed_checkpoint_id == 0 && !genesis_materialized {
             PsyCoordinatorProcessorSharedStatus {
                 last_committed_checkpoint_id,
                 unique_pending_id: current_unique_pending_id,
@@ -1662,6 +1701,145 @@ checkpoint_backup_copy_status={}
         Ok(())
     }
 
+    /// Recover the already-allocated processing/gathering pair when a
+    /// pre-PONR rollback is active during startup.  Admission paused normal
+    /// work after the gathering generation had been durably allocated, so a
+    /// restart must select that generation instead of incrementing the
+    /// counter or collapsing both sides onto the newest mapping. Normal
+    /// allocation always makes the durable current row the gathering side and
+    /// its immediate predecessor the processing side.
+    async fn resume_pre_ponr_unique_ids(&mut self) -> anyhow::Result<()> {
+        let (gathering_pending, gathering_proc) = self.db.get_current_unique_pending_id().await?;
+        let processing_pending = gathering_pending.checked_sub(1).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Coordinator pre-PONR maintenance requires an allocated successor generation"
+            )
+        })?;
+        let processing_proc = self
+            .db
+            .get_proc_checkpoint_unique_id_for_pending_id(processing_pending)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Coordinator pre-PONR processing namespace is missing its durable mapping"
+                )
+            })?;
+        if processing_proc == gathering_proc {
+            anyhow::bail!(
+                "Coordinator pre-PONR gathering identity is not the exact durable successor"
+            )
+        }
+
+        self.guta_update_queue.ensure_stream().await?;
+        self.register_user_queue.ensure_stream().await?;
+        self.deploy_contract_queue.ensure_stream().await?;
+        self.proof_work_queue.ensure_stream().await?;
+        let realm_id = self.ids.realm_id_u64;
+        let realm_sub_id = self.ids.realm_sub_id_u64;
+        for unique_id in [processing_proc, gathering_proc] {
+            self.guta_update_queue
+                .ensure_consumer(
+                &CoordinatorSubmitRealmGUTAUpdateQueueKey {
+                    realm_id,
+                    realm_sub_id,
+                    unique_id,
+                    task_group: 0,
+                    queue_type: QPBaseQueueType::StandardEphemeral,
+                    _phantom_queue_item: std::marker::PhantomData::<
+                        CoordinatorGutaQueueItem<N::F, N::QHash>,
+                    >,
+                },
+                realm_id,
+                realm_sub_id,
+                unique_id,
+                0,
+            )
+            .await?;
+            self.register_user_queue
+                .ensure_consumer(
+                &CoordinatorRegisterUserPublicKeyQueueKey {
+                    realm_id,
+                    realm_sub_id,
+                    unique_id,
+                    task_group: 0,
+                    queue_type: QPBaseQueueType::StandardEphemeral,
+                    _phantom_queue_item: std::marker::PhantomData::<
+                        PZKPublicKeyInfo<N::QHash>,
+                    >,
+                },
+                realm_id,
+                realm_sub_id,
+                unique_id,
+                0,
+            )
+            .await?;
+            self.deploy_contract_queue
+                .ensure_consumer(
+                &CoordinatorDeployContractQueueKey {
+                    realm_id,
+                    realm_sub_id,
+                    unique_id,
+                    task_group: 0,
+                    queue_type: QPBaseQueueType::StandardEphemeral,
+                    _phantom_queue_item: std::marker::PhantomData::<
+                        PsyDeployContractQueueItem<N::F, N::QHash>,
+                    >,
+                },
+                realm_id,
+                realm_sub_id,
+                unique_id,
+                0,
+            )
+            .await?;
+            self.proof_work_queue
+                .ensure_consumer(
+                &CoordinatorProvingWorkQueueKey {
+                    realm_id,
+                    realm_sub_id,
+                    unique_id,
+                    task_group: 0,
+                    queue_type: QPBaseQueueType::WorkerQueue,
+                    _phantom_queue_item: std::marker::PhantomData::<
+                        PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>,
+                    >,
+                },
+                realm_id,
+                realm_sub_id,
+                unique_id,
+                0,
+            )
+            .await?;
+        }
+
+        self.ids.unique_pending_id = processing_pending;
+        self.ids.proc_checkpoint_unique_id = processing_proc;
+        self.ids.gathering_unique_pending_id = gathering_pending;
+        self.ids.gathering_proc_checkpoint_unique_id = gathering_proc;
+        self.guta_queue_key_status_manager.set_unique_id(gathering_proc)?;
+        self.register_user_queue_key_status_manager
+            .set_unique_id(gathering_proc)?;
+        self.deploy_contract_queue_key_status_manager
+            .set_unique_id(gathering_proc)?;
+        self.temp_db
+            .set_unique_pending_ids(
+                &self.ids.realm_identifier,
+                self.ids.unique_pending_id,
+                self.ids.proc_checkpoint_unique_id,
+            )
+            .await?;
+        self.temp_db
+            .set_gathering_unique_pending_ids(
+                &self.ids.realm_identifier,
+                gathering_pending,
+                gathering_proc,
+            )
+            .await?;
+        self.temp_db
+            .clear_current_pending_context(&self.ids.realm_identifier)
+            .await?;
+        Ok(())
+    }
+
     pub async fn set_new_unique_ids(&mut self) -> anyhow::Result<()> {
         println!(
             "old_unique_pending_id: {}, old_proc_checkpoint_unique_id: {}",
@@ -1811,14 +1989,25 @@ checkpoint_backup_copy_status={}
             || checkpoint_proof.old_root
                 != coordinator_update.old_base.checkpoint_tree_root
             || checkpoint_proof.old_value
-                != coordinator_update.old_base.checkpoint_leaf_hash
+                != N::HasherBase::get_zero_hash(0)
             || checkpoint_proof.new_root
                 != coordinator_update.new_base.checkpoint_tree_root
             || checkpoint_proof.new_value
                 != coordinator_update.new_base.checkpoint_leaf_hash
             || !checkpoint_proof.verify::<N::HasherBase>()
         {
-            anyhow::bail!("branch-exact Coordinator checkpoint delta mismatch");
+            anyhow::bail!(
+                "branch-exact Coordinator checkpoint delta mismatch: index={}/{}, siblings={}/{}, old_root_match={}, old_value_zero={}, new_root_match={}, new_value_match={}, proof_valid={}",
+                checkpoint_proof.index,
+                checkpoint_id,
+                checkpoint_proof.siblings.len(),
+                N::CHECKPOINT_TREE_HEIGHT_USIZE,
+                checkpoint_proof.old_root == coordinator_update.old_base.checkpoint_tree_root,
+                checkpoint_proof.old_value == N::HasherBase::get_zero_hash(0),
+                checkpoint_proof.new_root == coordinator_update.new_base.checkpoint_tree_root,
+                checkpoint_proof.new_value == coordinator_update.new_base.checkpoint_leaf_hash,
+                checkpoint_proof.verify::<N::HasherBase>(),
+            );
         }
         let old_checkpoint_root = self
             .db
@@ -2060,7 +2249,7 @@ checkpoint_backup_copy_status={}
                 || checkpoint_proof.old_root
                     != coordinator_update.old_base.checkpoint_tree_root
                 || checkpoint_proof.old_value
-                    != coordinator_update.old_base.checkpoint_leaf_hash
+                    != N::HasherBase::get_zero_hash(0)
                 || checkpoint_proof.new_root
                     != coordinator_update.new_base.checkpoint_tree_root
                 || checkpoint_proof.new_value
@@ -2068,7 +2257,16 @@ checkpoint_backup_copy_status={}
                 || !checkpoint_proof.verify::<N::HasherBase>()
             {
                 anyhow::bail!(
-                    "Coordinator prepared checkpoint-tree delta does not match the exact normal commit"
+                    "Coordinator prepared checkpoint-tree delta does not match the exact normal commit: index={}/{}, siblings={}/{}, old_root_match={}, old_value_zero={}, new_root_match={}, new_value_match={}, proof_valid={}",
+                    checkpoint_proof.index,
+                    checkpoint_id,
+                    checkpoint_proof.siblings.len(),
+                    N::CHECKPOINT_TREE_HEIGHT_USIZE,
+                    checkpoint_proof.old_root == coordinator_update.old_base.checkpoint_tree_root,
+                    checkpoint_proof.old_value == N::HasherBase::get_zero_hash(0),
+                    checkpoint_proof.new_root == coordinator_update.new_base.checkpoint_tree_root,
+                    checkpoint_proof.new_value == coordinator_update.new_base.checkpoint_leaf_hash,
+                    checkpoint_proof.verify::<N::HasherBase>(),
                 );
             }
 
@@ -2650,6 +2848,16 @@ Checkpoint Root Hash: {}
         if let Some(directive) = rollback_restart_directive {
             self.resume_rollback_unique_ids(directive).await?;
             self.rollback_restart_new_branch_write = Some(directive.new_branch_write());
+        } else if self
+            .canonical_head
+            .is_some_and(|head| !head.rollback_control().is_idle())
+        {
+            // A pre-PONR restart must resume the maintenance runner with the
+            // existing processing identity. Allocating the next pending ID
+            // here would both mutate normal-processing state and attempt to
+            // republish a PendingContext while rollback maintenance has
+            // intentionally cleared it.
+            self.resume_pre_ponr_unique_ids().await?;
         } else {
             self.set_new_unique_ids().await?;
         }
@@ -2677,6 +2885,39 @@ Checkpoint Root Hash: {}
 mod tests {
     use super::*;
     use parth_core::{pgoldilocks::PoseidonHasher, PHash};
+
+    #[test]
+    fn materialized_genesis_survives_uncommitted_pending_allocations() {
+        assert_eq!(
+            classify_database_check_state(0, true, 2, None).unwrap(),
+            DatabaseCheckState::Ready,
+        );
+        assert_eq!(
+            classify_database_check_state(0, false, 0, None).unwrap(),
+            DatabaseCheckState::NeedsGenesis,
+        );
+        assert_eq!(
+            classify_database_check_state(0, true, 2, Some(1)).unwrap(),
+            DatabaseCheckState::NeedsRecovery,
+        );
+        assert_eq!(
+            classify_database_check_state(0, true, 0, Some(0)).unwrap(),
+            DatabaseCheckState::Ready,
+        );
+        assert!(classify_database_check_state(3, true, 4, Some(2)).is_err());
+        assert!(classify_database_check_state(3, true, 4, Some(5)).is_err());
+
+        let source = include_str!("db.rs");
+        assert!(source.contains(
+            "if last_committed_checkpoint_id > 0 || genesis_materialized"
+        ));
+        let output_builder = include_str!(
+            "../../backup/output/coordinator_output_builder.rs"
+        );
+        assert!(output_builder.contains(
+            "old_value: N::QHash::get_zero_value()"
+        ));
+    }
 
     #[test]
     fn rollback_restart_reuses_exact_coordinator_pending_pair_without_allocation() {
@@ -2734,6 +2975,43 @@ mod tests {
         ] {
             assert!(!commit.contains(forbidden), "write before guard: {forbidden}");
         }
+    }
+
+    #[test]
+    fn active_pre_ponr_startup_adopts_durable_successor_without_allocation() {
+        let source = include_str!("db.rs");
+        let startup = source
+            .split("pub async fn init_with_setup_and_genesis(")
+            .nth(1)
+            .expect("Coordinator startup method")
+            .split("self.shared_status.update_status(")
+            .next()
+            .expect("Coordinator startup identity section");
+        let active = startup
+            .find("!head.rollback_control().is_idle()")
+            .expect("active rollback branch");
+        let adopt = startup[active..]
+            .find("self.resume_pre_ponr_unique_ids().await?")
+            .expect("maintenance successor adoption");
+        let allocate = startup[active..]
+            .find("self.set_new_unique_ids()")
+            .expect("normal allocation branch");
+        assert!(adopt < allocate);
+
+        let resume = source
+            .split("async fn resume_pre_ponr_unique_ids")
+            .nth(1)
+            .expect("maintenance successor method")
+            .split("pub async fn set_new_unique_ids")
+            .next()
+            .unwrap();
+        assert!(!resume.contains("inc_unique_pending_id"));
+        assert!(resume.contains("get_current_unique_pending_id"));
+        assert!(resume.contains("checked_sub(1)"));
+        assert!(resume.contains("get_proc_checkpoint_unique_id_for_pending_id"));
+        assert!(resume.contains("clear_current_pending_context"));
+        assert_eq!(resume.matches("ensure_consumer(").count(), 4);
+        assert_eq!(resume.matches("set_unique_id(gathering_proc)").count(), 3);
     }
 
     #[test]

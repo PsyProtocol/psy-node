@@ -281,6 +281,13 @@ pub trait PsyNodeCheckpointObjectDatabaseReader<F, Hash> {
     async fn get_checkpoint_global_state_roots(&self, checkpoint_id: u64) -> anyhow::Result<PQEDCheckpointGlobalStateRoots<Hash>>;
     async fn get_unique_pending_id_for_checkpoint_id(&self, checkpoint_id: u64) -> anyhow::Result<Option<(u64, QCoreProcCheckpointUniqueId)>>;
     async fn get_checkpoint_id_for_unique_pending_id(&self, unique_pending_id: u64) -> anyhow::Result<Option<u64>>;
+    /// Resolve one durable pending namespace to its processor namespace.
+    /// Pending zero is the typed genesis namespace even though legacy stores
+    /// may omit its physical mapping row.
+    async fn get_proc_checkpoint_unique_id_for_pending_id(
+        &self,
+        unique_pending_id: u64,
+    ) -> anyhow::Result<Option<QCoreProcCheckpointUniqueId>>;
     async fn get_current_unique_pending_id(&self) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId)>;
     /// Returns the newest pending generation whose pending -> processor ID mapping was durably written.
     ///

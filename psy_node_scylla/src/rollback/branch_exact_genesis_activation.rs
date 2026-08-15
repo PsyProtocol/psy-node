@@ -496,6 +496,65 @@ async fn persist_genesis_rollback_anchor<Hash: Q256BitHash>(
     Ok(())
 }
 
+/// Qualification-only seed for the checkpoint-zero rollback anchor.
+///
+/// The joint rollback fixture already has a later qualification commit in
+/// the live writer/head/pipeline rows, so it cannot replay the operator
+/// activation without conflicting with that current state.  This helper
+/// persists only the same immutable Genesis anchor that the production
+/// activation writes.  It cannot activate a writer, advance a pipeline,
+/// publish a head, or authorize serving.
+#[cfg(test)]
+pub(crate) async fn qualification_persist_realm_genesis_rollback_anchor<Hash>(
+    session: Arc<Session>,
+    data_keyspace: CqlKeyspaceName,
+    control_keyspace: BranchExactDeploymentNoTabletKeyspace,
+    genesis: AuthorityObservation<Hash>,
+    genesis_l2_block_state: Vec<u8>,
+    writer_activation_digest: [u8; 32],
+) -> anyhow::Result<()>
+where
+    Hash: Q256BitHash,
+{
+    let target_head = genesis_local_head_bootstrap(
+        genesis,
+        CommitWriteTimestampUs::try_from_i128(1)?,
+    )?
+    .candidate()
+    .clone();
+    let target_pipeline =
+        genesis_pipeline_bootstrap(genesis, &writer_activation_digest)?
+            .candidate()
+            .clone();
+    persist_genesis_rollback_anchor(
+        session,
+        &data_keyspace,
+        &control_keyspace,
+        genesis,
+        genesis_l2_block_state,
+        target_head,
+        target_pipeline,
+    )
+    .await
+}
+
+/// Return the exact namespace identity that production Genesis activation
+/// installs and every later normal Realm commit must preserve.
+#[cfg(test)]
+pub(crate) fn qualification_realm_genesis_storage_binding<Hash>(
+    genesis: AuthorityObservation<Hash>,
+) -> anyhow::Result<AuthorityStorageBindingRef>
+where
+    Hash: Q256BitHash,
+{
+    Ok(genesis_local_head_bootstrap(
+        genesis,
+        CommitWriteTimestampUs::try_from_i128(1)?,
+    )?
+    .candidate()
+    .storage_binding())
+}
+
 #[cfg(test)]
 mod tests {
     use parth_core::PHash;
