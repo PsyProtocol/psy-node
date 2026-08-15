@@ -498,6 +498,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
                 config.realm_sub_id,
                 branch_exact_lineage,
                 nats_queue.clone(),
+                config.coordinator_rollback_db_namespace.as_deref(),
             )
             .await?;
             let (

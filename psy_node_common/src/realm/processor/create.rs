@@ -253,6 +253,7 @@ where
         guta_update_queue,
         proof_work_queue,
         coordinator_client,
+        rollback_runtime_control.clone(),
         chain_id,
         realm_identifier,
         circuit_fingerprint_config,

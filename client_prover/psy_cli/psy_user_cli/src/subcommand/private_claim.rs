@@ -16,8 +16,10 @@ use psy_prover::session::{ClaimBatchItem, PrivateTransferClaim, WalletSession};
 use psy_provider::provider::RpcProvider;
 use tokio::time::sleep;
 
-use crate::subcommand::{args::PrivateClaimArgs, note_proof_common::NoteProofOutput};
-use crate::result::{CommandResult, TransactionResult, TransactionStatus};
+use crate::{
+    result::{CommandResult, TransactionResult, TransactionStatus},
+    subcommand::{args::PrivateClaimArgs, note_proof_common::NoteProofOutput},
+};
 
 const NOTE_TREE_HEIGHT: usize = 20;
 

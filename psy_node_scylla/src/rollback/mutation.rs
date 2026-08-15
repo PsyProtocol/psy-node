@@ -1,6 +1,7 @@
 use std::{error::Error, fmt};
 
 use parth_core::protocol::core_types::Q256BitHash;
+use psy_data::protocol::chain_context::AuthorityObservation;
 use psy_node_core::store::{
     branch_exact_schema::AuthorityScope,
     typed::{
@@ -417,6 +418,49 @@ pub(super) fn build_realm_global_user_proof_after_cutover<Hash: Q256BitHash>(
     ) {
         return Err(MutationBuildError::GlobalUserProofMutationRequired);
     }
+    let resolved = describe_existing_key(&key);
+    debug_assert_eq!(
+        resolved.key_domain(),
+        ScyllaKeyDomain::CheckpointedGlobalUserProof
+    );
+    validate_put_value(&resolved, &value)?;
+    Ok(build_resolved(resolved, MutationOperation::Put(value)))
+}
+
+/// Resolve an already committed checkpoint-axis Realm proof while building
+/// the rollback journal for a normal Coordinator sync.  This is deliberately
+/// separate from the normal writer cutover seam above: it can only name the
+/// checkpoint committed by the exact Realm authority observation, and its
+/// sole caller immediately point-reads the row and preserves the observed
+/// value/writetime.  It does not write the hot table.
+pub(super) fn build_realm_global_user_proof_from_sync_observation<
+    Hash: Q256BitHash,
+>(
+    observation: &AuthorityObservation<Hash>,
+    key: TypedTableKey,
+    value: MutationValue,
+) -> Result<ResolvedScyllaMutation, MutationBuildError> {
+    if !matches!(observation.authority(), AuthorityScope::Realm { .. }) {
+        return Err(MutationBuildError::RealmAuthorityRequiredAfterCutover);
+    }
+    let TypedTableKey::CheckpointedObject(
+        CheckpointedObjectKey::GlobalUserProofAtCheckpoint(checkpoint),
+    ) = key
+    else {
+        return Err(MutationBuildError::GlobalUserProofMutationRequired);
+    };
+    if checkpoint.get()
+        != observation
+            .chain()
+            .checkpoint()
+            .checkpoint_id()
+            .get()
+    {
+        return Err(MutationBuildError::GlobalUserProofMutationRequired);
+    }
+    let key = TypedTableKey::CheckpointedObject(
+        CheckpointedObjectKey::GlobalUserProofAtCheckpoint(checkpoint),
+    );
     let resolved = describe_existing_key(&key);
     debug_assert_eq!(
         resolved.key_domain(),

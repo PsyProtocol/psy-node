@@ -209,7 +209,9 @@ impl<Hash: Q256BitHash> RealmRollbackTargetRestorePlan<Hash> {
             gathering_allocation_digest,
             archive_store_fingerprint,
         ].contains(&[0; 32]) {
-            return Err(RealmRollbackTargetRestorePlanError::BindingMismatch);
+            return Err(RealmRollbackTargetRestorePlanError::BindingMismatch(
+                "zero durable identity",
+            ));
         }
         let network = global_target.network_id();
         let key = AuthorityTimestampKey::new(network, authority);
@@ -224,42 +226,104 @@ impl<Hash: Q256BitHash> RealmRollbackTargetRestorePlan<Hash> {
         let BranchExactWriterState::Active(active) = source_writer.state() else {
             return Err(RealmRollbackTargetRestorePlanError::WriterNotActive);
         };
-        if rollback_epoch.get() != expected_rollback_epoch
-            || target.network_id() != network
-            || target.chain_epoch().get() != target_epoch
-            || target.checkpoint().checkpoint_id().get() != target_checkpoint
-            || target_head.head().key() != key
-            || target_head.head().chain() != &target
-            || target_pipeline.key() != pipeline_key
-            || target_pipeline.frontier().chain() != target_head.head().chain()
-            || !valid_target_pipeline(target_checkpoint, &target_pipeline)
-            || source_head.head().key() != key
-            || source_chain.chain_epoch().get() != target_epoch
-            || source_checkpoint <= target_checkpoint
-            || source_pipeline.key() != pipeline_key
-            || source_pipeline.frontier().chain() != source_chain
-            || !matches!(
-                source_pipeline.phase(),
-                PendingProcessingPhase::Published | PendingProcessingPhase::RetiredNoWork
-            )
-            || BranchExactWriterAuthorityKey::from_plan(source_writer.plan()) != writer_key
-            || active.watermark().canonical_chain() != source_chain
-            || active.watermark().pending_id() != source_pipeline.processing().pending_id()
-            || active.timestamp_state() != source_timestamp
-            || !matches!(source_timestamp.phase(), AuthorityTimestampPhase::Idle { .. })
-            || source_timestamp.high_water().as_i64()
-                >= new_branch_write.as_commit_timestamp().as_i64()
-            || source_head.commit_write_timestamp().as_i64()
-                >= new_branch_write.as_commit_timestamp().as_i64()
-            || new_branch_write.delete_fence() != delete_fence
-            || counter_expected.get() < source_pipeline.gathering().pending_id().get()
-            || processing.pending_id().get() != counter_expected.get().checked_add(1)
-                .ok_or(RealmRollbackTargetRestorePlanError::CounterOverflow)?
-            || gathering.pending_id().get() != processing.pending_id().get().checked_add(1)
-                .ok_or(RealmRollbackTargetRestorePlanError::CounterOverflow)?
-        {
-            return Err(RealmRollbackTargetRestorePlanError::BindingMismatch);
+        macro_rules! require_binding {
+            ($condition:expr, $name:literal $(,)?) => {
+                if !($condition) {
+                    return Err(RealmRollbackTargetRestorePlanError::BindingMismatch($name));
+                }
+            };
         }
+        require_binding!(rollback_epoch.get() == expected_rollback_epoch, "rollback epoch");
+        require_binding!(target.network_id() == network, "target network");
+        require_binding!(target.chain_epoch().get() == target_epoch, "target epoch");
+        require_binding!(
+            target.checkpoint().checkpoint_id().get() == target_checkpoint,
+            "target checkpoint",
+        );
+        require_binding!(target_head.head().key() == key, "target head key");
+        require_binding!(target_head.head().chain() == &target, "target head chain");
+        require_binding!(target_pipeline.key() == pipeline_key, "target pipeline key");
+        require_binding!(
+            pipeline_at_or_before(&target_pipeline, &target),
+            "target pipeline frontier",
+        );
+        require_binding!(
+            valid_target_pipeline(target_checkpoint, &target_pipeline),
+            "target pipeline phase",
+        );
+        require_binding!(source_head.head().key() == key, "source head key");
+        require_binding!(
+            source_chain.chain_epoch().get() == target_epoch,
+            "source head epoch",
+        );
+        require_binding!(source_checkpoint > target_checkpoint, "source checkpoint");
+        require_binding!(source_pipeline.key() == pipeline_key, "source pipeline key");
+        require_binding!(
+            pipeline_at_or_before(&source_pipeline, source_chain),
+            "source pipeline frontier",
+        );
+        require_binding!(
+            matches!(
+                source_pipeline.phase(),
+                PendingProcessingPhase::Ready
+                    | PendingProcessingPhase::Sealing
+                    | PendingProcessingPhase::WorkCaptured
+                    | PendingProcessingPhase::InFlight
+                    | PendingProcessingPhase::EmptyQueueSealed
+                    | PendingProcessingPhase::Published
+                    | PendingProcessingPhase::RetiredNoWork
+            ),
+            "source pipeline phase",
+        );
+        require_binding!(
+            BranchExactWriterAuthorityKey::from_plan(source_writer.plan()) == writer_key,
+            "writer authority",
+        );
+        require_binding!(
+            active.watermark().canonical_chain() == source_pipeline.frontier().chain(),
+            "writer frontier",
+        );
+        require_binding!(
+            active.watermark().pending_id() <= source_pipeline.processing().pending_id(),
+            "writer pending order",
+        );
+        require_binding!(active.timestamp_state() == source_timestamp, "writer timestamp");
+        require_binding!(
+            matches!(source_timestamp.phase(), AuthorityTimestampPhase::Idle { .. }),
+            "timestamp phase",
+        );
+        require_binding!(
+            source_timestamp.high_water().as_i64()
+                < new_branch_write.as_commit_timestamp().as_i64(),
+            "timestamp fence",
+        );
+        require_binding!(
+            source_head.commit_write_timestamp().as_i64()
+                < new_branch_write.as_commit_timestamp().as_i64(),
+            "head timestamp fence",
+        );
+        require_binding!(new_branch_write.delete_fence() == delete_fence, "delete fence");
+        require_binding!(
+            counter_expected.get() >= source_pipeline.gathering().pending_id().get(),
+            "pending counter",
+        );
+        require_binding!(
+            processing.pending_id().get()
+                == counter_expected
+                    .get()
+                    .checked_add(1)
+                    .ok_or(RealmRollbackTargetRestorePlanError::CounterOverflow)?,
+            "processing allocation",
+        );
+        require_binding!(
+            gathering.pending_id().get()
+                == processing
+                    .pending_id()
+                    .get()
+                    .checked_add(1)
+                    .ok_or(RealmRollbackTargetRestorePlanError::CounterOverflow)?,
+            "gathering allocation",
+        );
         let prefix = ProcNamespacePrefix::for_authority(network, authority);
         if processing.proc_checkpoint_id() != prefix.derive_proc_id(processing.pending_id())
             || gathering.proc_checkpoint_id() != prefix.derive_proc_id(gathering.pending_id())
@@ -346,7 +410,11 @@ impl<Hash: Q256BitHash> RealmRollbackTargetRestorePlan<Hash> {
         let authority = decode_authority(cursor.take(7)?)?;
         let global_target = CanonicalChainRef::from_canonical_bytes(cursor.take(CANONICAL_CHAIN_REF_V1_LEN)?).map_err(model)?;
         let target = CanonicalChainRef::from_canonical_bytes(cursor.take(CANONICAL_CHAIN_REF_V1_LEN)?).map_err(model)?;
-        if global_target.network_id() != network { return Err(RealmRollbackTargetRestorePlanError::BindingMismatch); }
+        if global_target.network_id() != network {
+            return Err(RealmRollbackTargetRestorePlanError::BindingMismatch(
+                "decoded target network",
+            ));
+        }
         let rollback_epoch = ChainEpoch::new(cursor.u64()?);
         let participant_plan_digest = cursor.array32()?;
         let global_delete_barrier_slot = cursor.array32()?;
@@ -543,7 +611,9 @@ impl<Hash: Q256BitHash> RealmRollbackTargetRestorePlan<Hash> {
             || head != self.target_head
             || pipeline != self.target_pipeline
         {
-            return Err(RealmRollbackTargetRestorePlanError::BindingMismatch);
+            return Err(RealmRollbackTargetRestorePlanError::BindingMismatch(
+                "recovered target inventory",
+            ));
         }
         Ok(())
     }
@@ -557,9 +627,29 @@ fn valid_target_pipeline<Hash: Q256BitHash>(
         matches!(pipeline.phase(), PendingProcessingPhase::Ready)
             && pipeline.processed_pending_id() == 0
     } else {
-        matches!(pipeline.phase(), PendingProcessingPhase::Published)
-            && pipeline.processed_pending_id() == pipeline.processing().pending_id().get()
+        matches!(
+            pipeline.phase(),
+            PendingProcessingPhase::Ready
+                | PendingProcessingPhase::Published
+                | PendingProcessingPhase::RetiredNoWork
+        )
     }
+}
+
+fn pipeline_at_or_before<Hash: Q256BitHash>(
+    pipeline: &StoredPendingPipeline<Hash>,
+    head: &CanonicalChainRef<Hash>,
+) -> bool {
+    let frontier = pipeline.frontier().chain();
+    if frontier.network_id() != head.network_id()
+        || frontier.chain_epoch() != head.chain_epoch()
+    {
+        return false;
+    }
+    let frontier_checkpoint = frontier.checkpoint().checkpoint_id().get();
+    let head_checkpoint = head.checkpoint().checkpoint_id().get();
+    frontier_checkpoint < head_checkpoint
+        || (frontier_checkpoint == head_checkpoint && frontier == head)
 }
 
 fn next_pending(current: UniquePendingId) -> Result<UniquePendingId, RealmRollbackTargetRestorePlanError> {
@@ -673,7 +763,7 @@ pub(super) enum RealmRollbackTargetRestorePlanError {
     WriterNotActive,
     ProcNamespaceMismatch,
     AllocationMismatch,
-    BindingMismatch,
+    BindingMismatch(&'static str),
     RowTooLarge,
     MalformedRow,
     InvalidMagic,

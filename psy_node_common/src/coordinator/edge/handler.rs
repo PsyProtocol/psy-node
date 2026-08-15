@@ -867,13 +867,50 @@ impl<
                 self.genesis_checkpoint_state_transition_fingerprint,
             )
         } else {
-            let computed_checkpoint_hash = stored_transition
-                .get_computed_public_inputs_hash::<N::HasherBase>();
             let extracted = checkpoint_hash_from_saved_proof_bytes::<
                 N::QHash,
                 N::ZKProof,
                 N::ZKVerifier,
             >(&stored_transition.zk_proof)?;
+
+            // Non-genesis checkpoint proofs commit to the chain-mode public
+            // input, not the legacy single-transition hash.  Derive the
+            // predecessor identity with the same rule used by Coordinator
+            // commit/startup and then validate the stored proof against the
+            // exact chained transition.
+            let previous_checkpoint_hash = if checkpoint_id == 1 {
+                let genesis = self
+                    .db_reader
+                    .get_verifiable_checkpoint_state_transition_and_zkp(0)
+                    .await?;
+                if !genesis.zk_proof.is_empty() {
+                    anyhow::bail!("REALM_SYNC_GENESIS_PROOF_MUST_BE_EMPTY");
+                }
+                let transition = &genesis.info.state_transition.checkpoint_transition;
+                genesis_checkpoint_hash::<_, N::HasherBase>(
+                    transition.new_checkpoint_tree_root,
+                    transition.new_checkpoint_leaf_hash,
+                    self.genesis_checkpoint_state_transition_fingerprint,
+                )
+                .into_inner()
+            } else {
+                let previous = self
+                    .db_reader
+                    .get_verifiable_checkpoint_state_transition_and_zkp(checkpoint_id - 1)
+                    .await?;
+                checkpoint_hash_from_saved_proof_bytes::<
+                    N::QHash,
+                    N::ZKProof,
+                    N::ZKVerifier,
+                >(&previous.zk_proof)?
+                .into_inner()
+            };
+            let computed_checkpoint_hash = stored_transition
+                .info
+                .state_transition
+                .get_chain_hash_from_previous::<N::HasherBase>(
+                    &previous_checkpoint_hash,
+                );
             if extracted.as_inner() != &computed_checkpoint_hash {
                 anyhow::bail!(
                     "REALM_SYNC_CHECKPOINT_PROOF_HASH_MISMATCH:checkpoint_id={}",

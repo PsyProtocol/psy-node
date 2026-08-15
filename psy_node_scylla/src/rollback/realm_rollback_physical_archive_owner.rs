@@ -478,8 +478,10 @@ impl ScyllaRealmRollbackPhysicalArchiveOwner {
                 if !narrow_cache.contains_key(&entry.source_index()) {
                     let source = catalog.suffix().entries().get(entry.source_index())
                         .ok_or(RealmRollbackPhysicalArchiveOwnerError::CatalogMismatch)?;
+                    let intent = source.inventory().narrow_intent()
+                        .ok_or(RealmRollbackPhysicalArchiveOwnerError::CatalogMismatch)?;
                     let rows = self.narrow.read_inventory_exact(
-                        source.inventory().narrow_intent(), source.inventory().timestamp(),
+                        intent, source.inventory().timestamp(),
                     ).await?;
                     narrow_cache.insert(entry.source_index(), rows);
                 }

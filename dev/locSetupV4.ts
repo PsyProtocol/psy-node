@@ -55,6 +55,17 @@ export function buildRollbackTopologyConfig(startRealmId: number, realmsCount: n
     };
 }
 
+export function buildRollbackScyllaConfig(host: string, rf3: boolean) {
+    const ports = rf3 ? [9042, 9043, 9044] : [9042];
+    return {
+        url: ports.map((port) => `${host}:${port}`).join(","),
+        ports,
+        startDbArgs: rf3
+            ? ["./dev/start_db.sh", "--persist", "--rf3"]
+            : ["./dev/start_db.sh", "--persist"],
+    };
+}
+
 async function killDocker() {
     try {
         const proc = Bun.spawn([
@@ -2636,6 +2647,7 @@ interface ProcessOptions {
     daemonlize?: boolean;
     cleanState?: boolean;
     rollback?: boolean;
+    rollbackRf3?: boolean;
 }
 
 class DevNetProcessManager {
@@ -2917,9 +2929,9 @@ class DevNetProcessManager {
         this.genesisDataPath = options.genesisDataPath || "genesis.json";
         const cleanState = !!options.cleanState;
         const rollbackEnabled = !!options.rollback;
-        const scyllaUrl = rollbackEnabled
-            ? `${this.host}:9042,${this.host}:9043,${this.host}:9044`
-            : this.SCYLLA_URL;
+        const rollbackRf3 = !!options.rollbackRf3;
+        const scylla = buildRollbackScyllaConfig(this.host, rollbackRf3);
+        const scyllaUrl = rollbackEnabled ? scylla.url : this.SCYLLA_URL;
         const checkpointBackupPath = rollbackEnabled
             ? './local_checkpoints/rollback'
             : './local_checkpoints';
@@ -3039,8 +3051,9 @@ class DevNetProcessManager {
 
             console.log("[DevNet] Killing existing docker containers...");
             await killDocker();
-            const startDbCmd = ['./dev/start_db.sh', '--persist'];
-            if (rollbackEnabled) startDbCmd.push('--rf3');
+            const startDbCmd = rollbackEnabled
+                ? scylla.startDbArgs
+                : ['./dev/start_db.sh', '--persist'];
             await this.track(
                 await RunningProcess.spawnWithInitializationHint(
                     startDbCmd, dbStartedDetector, { cwd, ...getLogPaths("db", false), env: this.getEnv() }
@@ -3051,9 +3064,9 @@ class DevNetProcessManager {
             await waitForTcpPort(this.host, 6379, { attempts: 30, delayMs: 500, timeoutMs: 1500, name: "Valkey/Redis" });
             await waitForTcpPort(this.host, 4222, { attempts: 30, delayMs: 500, timeoutMs: 1500, name: "NATS" });
             await waitForTcpPort(this.host, 9042, { attempts: 30, delayMs: 500, timeoutMs: 1500, name: "Scylla" });
-            if (rollbackEnabled) {
-                await waitForTcpPort(this.host, 9043, { attempts: 30, delayMs: 500, timeoutMs: 1500, name: "Scylla replica 2" });
-                await waitForTcpPort(this.host, 9044, { attempts: 30, delayMs: 500, timeoutMs: 1500, name: "Scylla replica 3" });
+            if (rollbackRf3) {
+                await waitForTcpPort(this.host, scylla.ports[1], { attempts: 30, delayMs: 500, timeoutMs: 1500, name: "Scylla replica 2" });
+                await waitForTcpPort(this.host, scylla.ports[2], { attempts: 30, delayMs: 500, timeoutMs: 1500, name: "Scylla replica 3" });
             }
             console.log("[DevNet] Infrastructure is ready.");
         }
@@ -4262,6 +4275,7 @@ async function runMain() {
             "daemonlize": { type: "boolean" },
             "clean-state": { type: "boolean" }, // deprecated alias
             rollback: { type: "boolean" },
+            "rollback-rf3": { type: "boolean" },
             "teardown": { type: "boolean" },
             "purge": { type: "boolean" },
             env: { type: "string" },
@@ -4300,7 +4314,8 @@ async function runMain() {
     const teardown = !!values["teardown"];
     const purge = !!values["purge"];
     const cleanState = !!values["clean-state"] || purge;
-    const rollback = !!values.rollback;
+    const rollbackRf3 = !!values["rollback-rf3"];
+    const rollback = !!values.rollback || rollbackRf3;
     const provingBackend = values["proving-backend"];
     const envString = values["env"];
     const help = !!values["help"];
@@ -4364,6 +4379,7 @@ Usage: bun run dev/locSetupV4.ts [options]
    --purge                         With --teardown (or startup), also remove local_checkpoints, logs, deployments, and devnet Docker volumes
    --clean-state                   Deprecated alias for --purge during startup
    --rollback                      Enable explicit Coordinator + all started Realm rollback wiring
+   --rollback-rf3                  Enable rollback wiring with a three-replica Scylla cluster (default rollback mode uses one replica)
    --help, -h                      Show this help message
 
   Examples:
@@ -4375,6 +4391,9 @@ Usage: bun run dev/locSetupV4.ts [options]
 
     # Start a one-Realm rollback-enabled topology (explicit admin RPC, no automatic trigger)
     bun run dev/locSetupV4.ts --rollback --realms-count 1
+
+    # Run the same topology against a local three-replica Scylla cluster
+    bun run dev/locSetupV4.ts --rollback-rf3 --realms-count 1
 
     # Start with custom genesis data
     bun run dev/locSetupV4.ts --genesis-data-path ./my-genesis.json  # use custom genesis file
@@ -4527,6 +4546,7 @@ Usage: bun run dev/locSetupV4.ts [options]
             daemonlize: !!values.daemonlize,
             cleanState,
             rollback,
+            rollbackRf3,
         };
 
         if (daemonlize) {

@@ -4,7 +4,10 @@ use psy_client_common::data::qhashout::QHashOut;
 use psy_client_data::traits::qdatastore::qmetadata::QMetaDataStoreReaderSync;
 use psy_provider::provider::RpcProvider;
 
-use crate::{result::{CommandResult, StatusResult, TransactionStatus}, subcommand::args::TxGetStatusArgs};
+use crate::{
+    result::{CommandResult, StatusResult, TransactionStatus},
+    subcommand::args::TxGetStatusArgs,
+};
 
 type F = GoldilocksField;
 pub async fn get_status(args: TxGetStatusArgs) -> Result<CommandResult> {

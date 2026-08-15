@@ -29,6 +29,10 @@ use psy_node_core::{
             RealmProcessorStartupRoutePhase,
         },
         realm_processor_branch_exact_runtime::RealmBranchExactCommitRuntimeInstaller,
+        rollback_control::RollbackControlState,
+        rollback_runtime_rebuild::{
+            RealmRollbackParticipantProgress, RealmRollbackRuntimeControl,
+        },
     },
 };
 use psy_node_nats::queue::NatsJetStreamClient;
@@ -1182,6 +1186,7 @@ pub async fn setup_realm_processor_scylla_startup_composition<
     realm_sub_id: u16,
     lineage: Option<RealmProcessorStartupLineage>,
     nats: Arc<NatsJetStreamClient>,
+    coordinator_rollback_keyspace: Option<&str>,
 ) -> anyhow::Result<ScyllaRealmProcessorStartupComposition<N>>
 where
     N::QHash: Q256BitHash + Send + Sync + 'static,
@@ -1257,10 +1262,111 @@ where
         )
         .await?;
 
-    let recovery_expectation = lineage.seal_attempt(fresh_startup_nonce())?;
-    db.store
+    // A process may restart after the global delete barrier while its normal
+    // writer/head rows are intentionally between the source and restored
+    // candidates. In that state the ordinary branch-exact startup preflight
+    // must not run first: only the storage-selected rollback owner can finish
+    // the idempotent post-PONR restore.
+    if let Some(coordinator_keyspace) = coordinator_rollback_keyspace {
+        let rollback = db
+            .store
+            .prepare_realm_rollback_runtime_control(coordinator_keyspace)
+            .await?;
+        loop {
+            match RealmRollbackRuntimeControl::<N::QHash>::progress_realm_rollback_participant(
+                &rollback,
+                lineage.network(),
+                authority,
+            )
+            .await
+            {
+                Ok(RealmRollbackParticipantProgress::RestorePrepared { .. })
+                | Ok(RealmRollbackParticipantProgress::ReadyForRuntimeRebuild(_)) => break,
+                Ok(RealmRollbackParticipantProgress::AwaitingCoordinator(head))
+                    if matches!(head.rollback_control(), RollbackControlState::Idle) =>
+                {
+                    break;
+                }
+                Ok(RealmRollbackParticipantProgress::AbortRequested(_)) => {
+                    // Abort convergence still needs the live actor drain
+                    // receipt and is therefore owned by the normal runtime.
+                    break;
+                }
+                Ok(progress) => {
+                    tracing::warn!(
+                        ?progress,
+                        "Realm startup is continuing storage-selected rollback maintenance before normal preflight"
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
+                        "Realm startup rollback maintenance failed closed; retrying from durable state"
+                    );
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+
+    let mut recovery_expectation = lineage.seal_attempt(fresh_startup_nonce())?;
+    if let Err(startup_error) = db
+        .store
         .recover_realm_processor_startup(recovery_expectation)
-        .await?;
+        .await
+    {
+        let Some(coordinator_keyspace) = coordinator_rollback_keyspace else {
+            return Err(startup_error.into());
+        };
+        let rollback = db
+            .store
+            .prepare_realm_rollback_runtime_control(coordinator_keyspace)
+            .await?;
+        tracing::warn!(
+            error = %startup_error,
+            "Realm startup detected an interrupted explicit rollback; recovering durable participant state before normal startup preflight"
+        );
+        loop {
+            match RealmRollbackRuntimeControl::<N::QHash>::progress_realm_rollback_participant(
+                &rollback,
+                lineage.network(),
+                authority,
+            )
+                .await
+            {
+                Ok(RealmRollbackParticipantProgress::RestorePrepared { .. })
+                | Ok(RealmRollbackParticipantProgress::ReadyForRuntimeRebuild(_)) => break,
+                Ok(RealmRollbackParticipantProgress::AwaitingCoordinator(head))
+                    if matches!(head.rollback_control(), RollbackControlState::Idle) =>
+                {
+                    break;
+                }
+                Ok(progress) => {
+                    tracing::warn!(
+                        ?progress,
+                        "Realm startup rollback recovery is waiting for the distributed barrier"
+                    );
+                }
+                Err(error) => {
+                    // Once deletion may have started, an error cannot be
+                    // interpreted as zero mutation. Keep the process alive
+                    // and re-enter only through the same storage-selected,
+                    // idempotent recovery owner.
+                    tracing::error!(
+                        error = %error,
+                        "Realm startup rollback recovery failed closed; retrying from durable state"
+                    );
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        recovery_expectation = lineage.seal_attempt(fresh_startup_nonce_excluding(
+            recovery_expectation.startup_nonce(),
+        ))?;
+        db.store
+            .recover_realm_processor_startup(recovery_expectation)
+            .await?;
+    }
     // Recovery admission is never serving authority. A distinct, freshly
     // sampled nonce seals the full post-recovery preflight/run attempt.
     let expectation = lineage.seal_attempt(fresh_startup_nonce_excluding(

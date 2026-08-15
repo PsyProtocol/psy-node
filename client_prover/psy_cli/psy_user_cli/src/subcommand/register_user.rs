@@ -35,7 +35,11 @@ pub async fn run(args: RegisterUserArgs) -> Result<CommandResult> {
         }));
     }
 
-    let register_user_uuid = provider.register_user(QRegisterUserRPCRequest { public_key: public_key_info.clone() }).await?;
+    let register_user_uuid = provider
+        .register_user(QRegisterUserRPCRequest {
+            public_key: public_key_info.clone(),
+        })
+        .await?;
     println!("registered user uuid: {}", register_user_uuid);
     print_key_info(generated_private_key, private_key, public_key_hash, &public_key_info);
     Ok(CommandResult::RegisterUser(RegisterUserResult {

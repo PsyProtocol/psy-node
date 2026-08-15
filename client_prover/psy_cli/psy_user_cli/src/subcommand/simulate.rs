@@ -70,8 +70,7 @@ fn load_contract(args: &SimulateArgs) -> anyhow::Result<(Vec<DPNFunctionCircuitD
             psy_prover::session::compile_bridge::compile_crate_output(path)
                 .map_err(|error| anyhow::anyhow!("failed to compile crate source {}: {:#}", path.display(), error))?
         } else {
-            let source = fs::read_to_string(path)
-                .map_err(|error| anyhow::anyhow!("failed to read source file {}: {}", path.display(), error))?;
+            let source = fs::read_to_string(path).map_err(|error| anyhow::anyhow!("failed to read source file {}: {}", path.display(), error))?;
             psy_prover::session::compile_bridge::compile_contract_output(&source)
                 .map_err(|error| anyhow::anyhow!("failed to compile source {}: {:#}", path.display(), error))?
         };
@@ -79,14 +78,13 @@ fn load_contract(args: &SimulateArgs) -> anyhow::Result<(Vec<DPNFunctionCircuitD
         Ok((output.circuit_definitions, output.abi))
     } else if let Some(defs_path) = &args.circuit_defs_path {
         // Load pre-compiled circuit definitions + ABI
-        let defs_source = fs::read_to_string(defs_path)
-            .map_err(|error| anyhow::anyhow!("failed to read circuit definitions {}: {}", defs_path, error))?;
-        let defs: Vec<DPNFunctionCircuitDefinition> = serde_json::from_str(&defs_source)
-            .map_err(|error| anyhow::anyhow!("failed to parse circuit definitions {}: {}", defs_path, error))?;
+        let defs_source =
+            fs::read_to_string(defs_path).map_err(|error| anyhow::anyhow!("failed to read circuit definitions {}: {}", defs_path, error))?;
+        let defs: Vec<DPNFunctionCircuitDefinition> =
+            serde_json::from_str(&defs_source).map_err(|error| anyhow::anyhow!("failed to parse circuit definitions {}: {}", defs_path, error))?;
 
         let abi = if let Some(abi_path) = &args.abi_path {
-            let abi_source = fs::read_to_string(abi_path)
-                .map_err(|error| anyhow::anyhow!("failed to read ABI {}: {}", abi_path, error))?;
+            let abi_source = fs::read_to_string(abi_path).map_err(|error| anyhow::anyhow!("failed to read ABI {}: {}", abi_path, error))?;
             serde_json::from_str(&abi_source).map_err(|error| anyhow::anyhow!("failed to parse ABI {}: {}", abi_path, error))?
         } else {
             // If no ABI path, create a minimal ABI from the circuit definitions

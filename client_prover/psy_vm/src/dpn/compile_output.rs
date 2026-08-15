@@ -1,5 +1,4 @@
-use psy_client_data::abi::Abi;
-use psy_client_data::qdata::contract::ContractCodeDefinition;
+use psy_client_data::{abi::Abi, qdata::contract::ContractCodeDefinition};
 
 use crate::dpn::vm::def::DPNFunctionCircuitDefinition;
 

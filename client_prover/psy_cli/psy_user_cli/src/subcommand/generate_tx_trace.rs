@@ -37,8 +37,7 @@ pub async fn run(args: GenerateTxTraceArgs) -> anyhow::Result<CommandResult> {
             );
         }
         psy_client_common::args::SignType::SoftwareDefinedDPNSign => {
-            let user_sdc: psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition =
-                serde_json::from_str(&std::fs::read_to_string("sdc.json")?)?;
+            let user_sdc: psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition = serde_json::from_str(&std::fs::read_to_string("sdc.json")?)?;
             let fingerprint = wallet_session.wallet.register_psy_software_defined_circuit(user_sdc, false).await?;
             anyhow::ensure!(
                 info.fingerprint == fingerprint,

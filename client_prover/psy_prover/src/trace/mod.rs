@@ -404,16 +404,9 @@ impl TxMetadata {
 }
 
 impl SimulatedTxMetadata {
-    pub fn from_view_steps(
-        user_id: u64,
-        steps: &[TraceStep],
-        software_defined_call: DPNSoftwareDefinedCallData,
-    ) -> anyhow::Result<Self> {
+    pub fn from_view_steps(user_id: u64, steps: &[TraceStep], software_defined_call: DPNSoftwareDefinedCallData) -> anyhow::Result<Self> {
         let storage_data = TxStorageData::from_steps(user_id, steps);
-        anyhow::ensure!(
-            storage_data.writes.is_empty(),
-            "fee-free view simulation produced storage writes"
-        );
+        anyhow::ensure!(storage_data.writes.is_empty(), "fee-free view simulation produced storage writes");
         Ok(Self {
             tx_hash: None,
             end_cap_data: None,

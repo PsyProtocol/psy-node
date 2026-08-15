@@ -28,8 +28,8 @@ pub async fn run(args: CompileAndDeployArgs) -> anyhow::Result<()> {
         psy_prover::session::compile_bridge::compile_crate_output(source_path)
             .map_err(|error| anyhow::anyhow!("failed to compile crate source {}: {:#}", source_path.display(), error))?
     } else {
-        let source = fs::read_to_string(source_path)
-            .map_err(|error| anyhow::anyhow!("failed to read source file {}: {}", source_path.display(), error))?;
+        let source =
+            fs::read_to_string(source_path).map_err(|error| anyhow::anyhow!("failed to read source file {}: {}", source_path.display(), error))?;
         psy_prover::session::compile_bridge::compile_contract_output(&source)
             .map_err(|error| anyhow::anyhow!("failed to compile source {}: {:#}", source_path.display(), error))?
     };
@@ -45,8 +45,7 @@ pub async fn run(args: CompileAndDeployArgs) -> anyhow::Result<()> {
         fs::create_dir_all(out_dir).map_err(|error| anyhow::anyhow!("failed to create output directory {}: {}", out_dir, error))?;
 
         let abi_json = output.abi_to_json()?;
-        fs::write(format!("{}/abi.json", out_dir), &abi_json)
-            .map_err(|error| anyhow::anyhow!("failed to write ABI under {}: {}", out_dir, error))?;
+        fs::write(format!("{}/abi.json", out_dir), &abi_json).map_err(|error| anyhow::anyhow!("failed to write ABI under {}: {}", out_dir, error))?;
 
         let code_bytes = output.to_bytes()?;
         fs::write(format!("{}/contract_code.bin", out_dir), &code_bytes)

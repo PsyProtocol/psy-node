@@ -207,9 +207,10 @@ impl ScyllaRealmRollbackTargetRestoreExecutor {
         &self,
         plan: &super::realm_rollback_target_restore_plan::RealmRollbackTargetRestorePlan<Hash>,
     ) -> Result<(), RealmRollbackTargetRestoreExecutorError> {
-        let transition = plan.source_pipeline().seal_rollback_reset_contexts(
+        let transition = plan.source_pipeline().seal_rollback_reset_from_synced_head_contexts(
             plan.processing(),
             plan.gathering(),
+            *plan.source_head().head().chain(),
             plan.restored_observation().map_err(backend)?,
             plan.target_processed_pending_id(),
         ).map_err(backend)?;

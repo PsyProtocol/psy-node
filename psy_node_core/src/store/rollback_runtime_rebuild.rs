@@ -519,6 +519,25 @@ pub trait RealmRollbackRuntimeControl<Hash>: Send + Sync
 where
     Hash: Q256BitHash,
 {
+    /// Return the checkpoint currently covered by this Realm's immutable
+    /// rollback journal. This is storage-selected and may lag the normal DB
+    /// after a crash; callers append the missing checkpoints in order.
+    async fn read_realm_rollback_journal_checkpoint(
+        &self,
+        network: NetworkId,
+        authority: AuthorityScope,
+    ) -> anyhow::Result<u64>;
+
+    /// Append one already-durable normal Realm sync checkpoint to the
+    /// rollback journal. The adapter re-reads every typed row and owns the
+    /// inventory/marker/local-head sequence; this call does not mutate the
+    /// normal business tables, pipeline, or writer lifecycle.
+    async fn persist_realm_sync_checkpoint(
+        &self,
+        observation: psy_data::protocol::chain_context::AuthorityObservation<Hash>,
+        batches: Vec<super::realm_full_commit_write_set::RealmCommitLogicalDomainBatch>,
+    ) -> anyhow::Result<()>;
+
     /// Advance this Realm's storage-local participant work for the current
     /// Coordinator-selected rollback phase. The caller supplies only its
     /// immutable authority identity; target/plan/phase are selected from the

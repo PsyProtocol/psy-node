@@ -216,8 +216,7 @@ fn generate_precompile_constants_from_genesis_contracts() -> Result<String, Box<
         .map(|p| p.join("psy-genesis/genesis_contracts.json"))
         .ok_or_else(|| "Cannot resolve psy-genesis/genesis_contracts.json path from manifest dir".to_string())?;
 
-    let contracts_bytes = fs::read(&contracts_path)
-        .map_err(|error| format!("Failed to read {}: {error}", contracts_path.display()))?;
+    let contracts_bytes = fs::read(&contracts_path).map_err(|error| format!("Failed to read {}: {error}", contracts_path.display()))?;
     let contracts: Vec<serde_json::Value> = match serde_json::from_slice(&contracts_bytes) {
         Ok(v) => v,
         Err(_) => {

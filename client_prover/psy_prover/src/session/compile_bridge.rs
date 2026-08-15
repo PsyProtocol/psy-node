@@ -15,9 +15,6 @@ use psy_vm::dpn::{
     vm::def::DPNFunctionCircuitDefinition,
 };
 use serde::{Deserialize, Serialize};
-
-use super::gen_contract_deploy_and_circuits_for_functions;
-
 #[cfg(not(target_arch = "wasm32"))]
 use {
     anyhow::Context,
@@ -39,6 +36,8 @@ use {
         process::{Command, Stdio},
     },
 };
+
+use super::gen_contract_deploy_and_circuits_for_functions;
 
 #[cfg(not(target_arch = "wasm32"))]
 const NODE_COMPILE_DRIVER: &str = include_str!("node_compile_driver.mjs");
@@ -178,7 +177,9 @@ fn invoke_compiler(request: &CompilerRequest<'_>) -> anyhow::Result<ContractOutp
         .write_all(&request_json)
         .context("failed to send the compiler request to Node.js")?;
 
-    let output = child.wait_with_output().context("failed while waiting for the Node.js local-web-compiler adapter")?;
+    let output = child
+        .wait_with_output()
+        .context("failed while waiting for the Node.js local-web-compiler adapter")?;
     if !output.status.success() {
         let diagnostics = String::from_utf8_lossy(&output.stderr);
         let diagnostics = diagnostics.trim();
@@ -189,8 +190,8 @@ fn invoke_compiler(request: &CompilerRequest<'_>) -> anyhow::Result<ContractOutp
     }
 
     let stdout = output.stdout.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&output.stdout);
-    let response: CompilerResponse = serde_json::from_slice(stdout)
-        .context("local-web-compiler stdout was not a valid raw compile-result JSON object")?;
+    let response: CompilerResponse =
+        serde_json::from_slice(stdout).context("local-web-compiler stdout was not a valid raw compile-result JSON object")?;
     contract_output_from_response(response)
 }
 
@@ -285,9 +286,9 @@ fn contract_output_from_response(response: CompilerResponse) -> anyhow::Result<C
             "compiler contract_code contains duplicate method_id {}",
             function.method_id
         );
-        let definition = definitions_by_id.get(&function.method_id).with_context(|| {
-            format!("compiler contract_code method_id {} has no matching DPN definition", function.method_id)
-        })?;
+        let definition = definitions_by_id
+            .get(&function.method_id)
+            .with_context(|| format!("compiler contract_code method_id {} has no matching DPN definition", function.method_id))?;
         anyhow::ensure!(
             function.num_inputs == definition.circuit_inputs.len() && function.num_outputs == definition.circuit_outputs.len(),
             "compiler contract_code metadata does not match DPN definition for method_id {}",
@@ -302,8 +303,12 @@ fn contract_output_from_response(response: CompilerResponse) -> anyhow::Result<C
         let emitted_bytes = BASE64_STANDARD
             .decode(&function.code_base64)
             .with_context(|| format!("compiler contract_code method_id {} has invalid base64 code", function.method_id))?;
-        let emitted_definition: DPNFunctionCircuitDefinition = serde_cbor::from_slice(&emitted_bytes)
-            .with_context(|| format!("compiler contract_code method_id {} code is not a CBOR DPN definition", function.method_id))?;
+        let emitted_definition: DPNFunctionCircuitDefinition = serde_cbor::from_slice(&emitted_bytes).with_context(|| {
+            format!(
+                "compiler contract_code method_id {} code is not a CBOR DPN definition",
+                function.method_id
+            )
+        })?;
         anyhow::ensure!(
             serde_cbor::to_vec(&emitted_definition).context("failed to re-encode compiler-emitted DPN definition")? == emitted_bytes,
             "compiler contract_code method_id {} code has trailing or non-canonical CBOR data",
@@ -390,9 +395,10 @@ fn validate_circuit_definition(definition: &DPNFunctionCircuitDefinition) -> any
                     "{} TargetAt index operand must reference a preceding Constant target",
                     operation_context()
                 );
-                let indexed_length = indexed_lengths.get(&(array_type, array_index)).copied().with_context(|| {
-                    format!("{} TargetAt source has no known downstream index bound", operation_context())
-                })?;
+                let indexed_length = indexed_lengths
+                    .get(&(array_type, array_index))
+                    .copied()
+                    .with_context(|| format!("{} TargetAt source has no known downstream index bound", operation_context()))?;
                 anyhow::ensure!(
                     (index_value.unwrap() as usize) < indexed_length,
                     "{} TargetAt index {} exceeds source length {}",
@@ -403,9 +409,10 @@ fn validate_circuit_definition(definition: &DPNFunctionCircuitDefinition) -> any
             }
             DPNOpType::GetStateCommandResultSingle | DPNOpType::GetStateCommandResultArray | DPNOpType::GetStateCommandResultHash => {
                 let command_index = operation.inputs[0] as usize;
-                let command = definition.state_commands.get(command_index).with_context(|| {
-                    format!("{} references missing state command {command_index}", operation_context())
-                })?;
+                let command = definition
+                    .state_commands
+                    .get(command_index)
+                    .with_context(|| format!("{} references missing state command {command_index}", operation_context()))?;
                 let resolution_index = definition.state_command_resolution_indices[command_index];
                 anyhow::ensure!(
                     (resolution_index > 0 && resolution_index <= definition_index) || (resolution_index == 0 && definition_index > 0),
@@ -414,8 +421,14 @@ fn validate_circuit_definition(definition: &DPNFunctionCircuitDefinition) -> any
                 );
                 let output_size = command.get_output_felt_size();
                 match operation.op_type {
-                    DPNOpType::GetStateCommandResultSingle => anyhow::ensure!(output_size >= 1, "{} reads an empty state command result", operation_context()),
-                    DPNOpType::GetStateCommandResultHash => anyhow::ensure!(output_size >= 4, "{} reads a state command result shorter than four felts", operation_context()),
+                    DPNOpType::GetStateCommandResultSingle => {
+                        anyhow::ensure!(output_size >= 1, "{} reads an empty state command result", operation_context())
+                    }
+                    DPNOpType::GetStateCommandResultHash => anyhow::ensure!(
+                        output_size >= 4,
+                        "{} reads a state command result shorter than four felts",
+                        operation_context()
+                    ),
                     DPNOpType::GetStateCommandResultArray => {}
                     _ => unreachable!(),
                 }
@@ -502,7 +515,11 @@ fn validate_circuit_definition(definition: &DPNFunctionCircuitDefinition) -> any
         }
 
         let output_key = (operation.data_type, operation.index);
-        anyhow::ensure!(available.insert(output_key), "{} assigns an already-defined output index", operation_context());
+        anyhow::ensure!(
+            available.insert(output_key),
+            "{} assigns an already-defined output index",
+            operation_context()
+        );
         match operation.op_type {
             DPNOpType::Constant if operation.data_type == DPNBuiltInDataType::Target => {
                 constant_targets.insert(operation.index, operation.inputs[0]);
@@ -529,7 +546,11 @@ fn validate_circuit_definition(definition: &DPNFunctionCircuitDefinition) -> any
             DPNOpType::GetStateCommandResultHash => {
                 indexed_lengths.insert(output_key, 4);
             }
-            _ if matches!(operation.data_type, DPNBuiltInDataType::Target | DPNBuiltInDataType::Bool | DPNBuiltInDataType::U32Target) => {
+            _ if matches!(
+                operation.data_type,
+                DPNBuiltInDataType::Target | DPNBuiltInDataType::Bool | DPNBuiltInDataType::U32Target
+            ) =>
+            {
                 indexed_lengths.insert(output_key, 1);
             }
             _ => {}
@@ -568,14 +589,21 @@ fn validate_circuit_definition(definition: &DPNFunctionCircuitDefinition) -> any
 #[cfg(not(target_arch = "wasm32"))]
 fn validate_operation_shape(operation: &psy_vm::dpn::ops::op_types::DPNIndexedVarDef, circuit_input_count: usize) -> anyhow::Result<()> {
     let exact = |expected: usize| -> anyhow::Result<()> {
-        anyhow::ensure!(operation.inputs.len() == expected, "expected {expected} operands, got {}", operation.inputs.len());
+        anyhow::ensure!(
+            operation.inputs.len() == expected,
+            "expected {expected} operands, got {}",
+            operation.inputs.len()
+        );
         Ok(())
     };
     match operation.op_type {
         DPNOpType::InputTarget => {
             anyhow::ensure!(!operation.inputs.is_empty(), "InputTarget requires at least one input index");
             for &index in &operation.inputs {
-                anyhow::ensure!((index as usize) < circuit_input_count, "input index {index} exceeds circuit input count {circuit_input_count}");
+                anyhow::ensure!(
+                    (index as usize) < circuit_input_count,
+                    "input index {index} exceeds circuit input count {circuit_input_count}"
+                );
             }
             if operation.data_type != DPNBuiltInDataType::U32TargetArray {
                 exact(1)?;
@@ -583,7 +611,11 @@ fn validate_operation_shape(operation: &psy_vm::dpn::ops::op_types::DPNIndexedVa
         }
         DPNOpType::U32InputTarget | DPNOpType::BoolInputTarget => {
             exact(1)?;
-            anyhow::ensure!((operation.inputs[0] as usize) < circuit_input_count, "input index {} exceeds circuit input count {circuit_input_count}", operation.inputs[0]);
+            anyhow::ensure!(
+                (operation.inputs[0] as usize) < circuit_input_count,
+                "input index {} exceeds circuit input count {circuit_input_count}",
+                operation.inputs[0]
+            );
         }
         DPNOpType::Constant | DPNOpType::ConstantU32 => exact(1)?,
         // The SDK compiler serializes boolean constants inline as
@@ -694,8 +726,14 @@ fn validate_reference(id: u64, available: &HashSet<(DPNBuiltInDataType, usize)>,
             data_type,
             DPNBuiltInDataType::Target | DPNBuiltInDataType::Bool | DPNBuiltInDataType::U32Target
         ),
-        ReferenceKind::Bool => matches!(data_type, DPNBuiltInDataType::Target | DPNBuiltInDataType::Bool | DPNBuiltInDataType::U32Target),
-        ReferenceKind::U32 => matches!(data_type, DPNBuiltInDataType::Target | DPNBuiltInDataType::Bool | DPNBuiltInDataType::U32Target),
+        ReferenceKind::Bool => matches!(
+            data_type,
+            DPNBuiltInDataType::Target | DPNBuiltInDataType::Bool | DPNBuiltInDataType::U32Target
+        ),
+        ReferenceKind::U32 => matches!(
+            data_type,
+            DPNBuiltInDataType::Target | DPNBuiltInDataType::Bool | DPNBuiltInDataType::U32Target
+        ),
         ReferenceKind::Indexable => matches!(
             data_type,
             DPNBuiltInDataType::Target
@@ -709,22 +747,23 @@ fn validate_reference(id: u64, available: &HashSet<(DPNBuiltInDataType, usize)>,
         ),
     };
     anyhow::ensure!(allowed, "operand {id} has incompatible data type {data_type}");
-    anyhow::ensure!(available.contains(&(data_type, index)), "operand {id} references unavailable {data_type} index {index}");
+    anyhow::ensure!(
+        available.contains(&(data_type, index)),
+        "operand {id} references unavailable {data_type} index {index}"
+    );
     Ok(())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn resolve_sdk_compiler_dir() -> anyhow::Result<PathBuf> {
     if let Some(override_dir) = env::var_os("PSY_SDK_DIR") {
-        let canonical_override = fs::canonicalize(&override_dir).with_context(|| {
-            format!("failed to canonicalize PSY_SDK_DIR {}", Path::new(&override_dir).display())
-        })?;
+        let canonical_override =
+            fs::canonicalize(&override_dir).with_context(|| format!("failed to canonicalize PSY_SDK_DIR {}", Path::new(&override_dir).display()))?;
         return resolve_explicit_sdk_compiler_dir(&canonical_override);
     }
 
     let executable = env::current_exe().context("failed to resolve the current executable path")?;
-    let executable = fs::canonicalize(&executable)
-        .with_context(|| format!("failed to canonicalize current executable {}", executable.display()))?;
+    let executable = fs::canonicalize(&executable).with_context(|| format!("failed to canonicalize current executable {}", executable.display()))?;
     let sidecar = executable
         .parent()
         .context("current executable has no parent directory")?
@@ -748,18 +787,14 @@ fn resolve_sdk_compiler_dir() -> anyhow::Result<PathBuf> {
 #[cfg(not(target_arch = "wasm32"))]
 fn resolve_explicit_sdk_compiler_dir(base: &Path) -> anyhow::Result<PathBuf> {
     let artifact_path = base.join(".compiler-artifact.json");
-    validate_compiler_artifact(&artifact_path)
-        .with_context(|| format!("invalid compiler provenance for {}", base.display()))?;
+    validate_compiler_artifact(&artifact_path).with_context(|| format!("invalid compiler provenance for {}", base.display()))?;
 
     if has_compiler_module(base) {
-        return fs::canonicalize(base)
-            .with_context(|| format!("failed to canonicalize compiler directory {}", base.display()));
+        return fs::canonicalize(base).with_context(|| format!("failed to canonicalize compiler directory {}", base.display()));
     }
     let dist_candidate = base.join("dist/local-web-compiler");
     if has_compiler_module(&dist_candidate) {
-        return fs::canonicalize(&dist_candidate).with_context(|| {
-            format!("failed to canonicalize compiler directory {}", dist_candidate.display())
-        });
+        return fs::canonicalize(&dist_candidate).with_context(|| format!("failed to canonicalize compiler directory {}", dist_candidate.display()));
     }
     anyhow::bail!(
         "PSY_SDK_DIR {} does not contain psy_compiler.mjs and wasm-binary.mjs at its root or dist/local-web-compiler",
@@ -779,10 +814,8 @@ fn resolve_sidecar_compiler_dir(sidecar: &Path) -> anyhow::Result<PathBuf> {
         }
     }
     let artifact_path = sidecar.join(".compiler-artifact.json");
-    validate_compiler_artifact(&artifact_path)
-        .with_context(|| format!("invalid compiler provenance for {}", sidecar.display()))?;
-    fs::canonicalize(sidecar)
-        .with_context(|| format!("failed to canonicalize compiler directory {}", sidecar.display()))
+    validate_compiler_artifact(&artifact_path).with_context(|| format!("invalid compiler provenance for {}", sidecar.display()))?;
+    fs::canonicalize(sidecar).with_context(|| format!("failed to canonicalize compiler directory {}", sidecar.display()))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -808,10 +841,9 @@ struct CompilerArtifact {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn validate_compiler_artifact(artifact_path: &Path) -> anyhow::Result<()> {
-    let contents = fs::read_to_string(artifact_path)
-        .with_context(|| format!("failed to read compiler artifact {}", artifact_path.display()))?;
-    let artifact: CompilerArtifact = serde_json::from_str(&contents)
-        .with_context(|| format!("compiler artifact {} is not valid JSON", artifact_path.display()))?;
+    let contents = fs::read_to_string(artifact_path).with_context(|| format!("failed to read compiler artifact {}", artifact_path.display()))?;
+    let artifact: CompilerArtifact =
+        serde_json::from_str(&contents).with_context(|| format!("compiler artifact {} is not valid JSON", artifact_path.display()))?;
 
     if !is_lowercase_hex(&artifact.compiler_revision, &[40, 64]) {
         anyhow::bail!(
@@ -840,17 +872,14 @@ fn is_lowercase_hex(value: &str, allowed_lengths: &[usize]) -> bool {
     if len == 0 || !allowed_lengths.contains(&len) {
         return false;
     }
-    value
-        .bytes()
-        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn collect_project_input(root_input: &Path) -> anyhow::Result<ProjectInput> {
     let root_file = resolve_crate_root(root_input)?;
     let root_dir = root_file.parent().unwrap_or_else(|| Path::new("."));
-    let root_source = fs::read_to_string(&root_file)
-        .with_context(|| format!("failed to read crate root {}", root_input.display()))?;
+    let root_source = fs::read_to_string(&root_file).with_context(|| format!("failed to read crate root {}", root_input.display()))?;
 
     let mut source_paths = Vec::new();
     collect_source_paths(root_dir, &mut source_paths)?;
@@ -870,15 +899,14 @@ fn collect_project_input(root_input: &Path) -> anyhow::Result<ProjectInput> {
         if source_path == root_file {
             continue;
         }
-        let module_path = module_path_for_source(root_dir, &source_path)
-            .with_context(|| format!("failed to map crate module {}", source_path.display()))?;
+        let module_path =
+            module_path_for_source(root_dir, &source_path).with_context(|| format!("failed to map crate module {}", source_path.display()))?;
         anyhow::ensure!(
             logical_paths.insert(module_path.clone()),
             "multiple crate sources map to the same compiler module path {:?}",
             module_path
         );
-        let source = fs::read_to_string(&source_path)
-            .with_context(|| format!("failed to read crate module {}", source_path.display()))?;
+        let source = fs::read_to_string(&source_path).with_context(|| format!("failed to read crate module {}", source_path.display()))?;
         files.push((module_path, source));
     }
 
@@ -988,7 +1016,10 @@ fn module_path_for_source(root_dir: &Path, source_path: &Path) -> anyhow::Result
     }
 
     anyhow::ensure!(!module_path.is_empty(), "crate module has an empty compiler path");
-    anyhow::ensure!(module_path.iter().all(|component| !component.is_empty()), "crate module has an empty compiler path component");
+    anyhow::ensure!(
+        module_path.iter().all(|component| !component.is_empty()),
+        "crate module has an empty compiler path component"
+    );
     Ok(module_path)
 }
 
@@ -1091,10 +1122,7 @@ mod tests {
 
         let error = validate_circuit_definition(&malformed).unwrap_err();
         let error_chain = format!("{error:#}");
-        assert!(
-            error_chain.contains("expected 2 operands"),
-            "unexpected error: {error_chain}"
-        );
+        assert!(error_chain.contains("expected 2 operands"), "unexpected error: {error_chain}");
     }
 
     fn mk_var_def(op_type: DPNOpType, data_type: DPNBuiltInDataType, inputs: Vec<u64>) -> psy_vm::dpn::ops::op_types::DPNIndexedVarDef {
@@ -1112,15 +1140,13 @@ mod tests {
         // (const_param = 1). The VM (psy_vm exec.rs) ignores this operand and
         // hardcodes the boolean, accepting the 1-operand shape the compiler emits.
         let op = mk_var_def(DPNOpType::ConstantTrue, DPNBuiltInDataType::Bool, vec![1]);
-        validate_operation_shape(&op, 0)
-            .expect("compiler-emitted ConstantTrue (1 operand, value 1) must pass the shape check");
+        validate_operation_shape(&op, 0).expect("compiler-emitted ConstantTrue (1 operand, value 1) must pass the shape check");
     }
 
     #[test]
     fn validate_operation_shape_accepts_compiler_constant_false() {
         let op = mk_var_def(DPNOpType::ConstantFalse, DPNBuiltInDataType::Bool, vec![0]);
-        validate_operation_shape(&op, 0)
-            .expect("compiler-emitted ConstantFalse (1 operand, value 0) must pass the shape check");
+        validate_operation_shape(&op, 0).expect("compiler-emitted ConstantFalse (1 operand, value 0) must pass the shape check");
     }
 
     #[test]
@@ -1195,8 +1221,7 @@ mod tests {
             definitions: vec![constant_true],
             events: Vec::new(),
         };
-        validate_circuit_definition(&definition)
-            .expect("a circuit definition using the compiler-emitted ConstantTrue shape must validate");
+        validate_circuit_definition(&definition).expect("a circuit definition using the compiler-emitted ConstantTrue shape must validate");
     }
 
     #[test]
@@ -1263,8 +1288,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         write_artifact(dir.path(), VALID_REVISION_40, VALID_SOURCES_HASH);
         let artifact_path = dir.path().join(".compiler-artifact.json");
-        validate_compiler_artifact(&artifact_path)
-            .expect("a real SHA-1 compilerRevision plus a 64-hex compilerSourcesHash must be accepted");
+        validate_compiler_artifact(&artifact_path).expect("a real SHA-1 compilerRevision plus a 64-hex compilerSourcesHash must be accepted");
     }
 
     #[test]
@@ -1272,8 +1296,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         write_artifact(dir.path(), VALID_REVISION_64, VALID_SOURCES_HASH);
         let artifact_path = dir.path().join(".compiler-artifact.json");
-        validate_compiler_artifact(&artifact_path)
-            .expect("a 64-hex (SHA-256) compilerRevision plus a 64-hex compilerSourcesHash must be accepted");
+        validate_compiler_artifact(&artifact_path).expect("a 64-hex (SHA-256) compilerRevision plus a 64-hex compilerSourcesHash must be accepted");
     }
 
     #[test]
@@ -1331,10 +1354,7 @@ mod tests {
         let artifact_path = dir.path().join(".compiler-artifact.json");
         let error = validate_compiler_artifact(&artifact_path).unwrap_err();
         let chain = format!("{error:#}");
-        assert!(
-            chain.contains("invalid compilerRevision"),
-            "uppercase hex must be rejected; got: {chain}"
-        );
+        assert!(chain.contains("invalid compilerRevision"), "uppercase hex must be rejected; got: {chain}");
     }
 
     #[test]
@@ -1370,8 +1390,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         touch_sidecar_files(dir.path());
         write_artifact(dir.path(), VALID_REVISION_40, VALID_SOURCES_HASH);
-        let resolved = resolve_sidecar_compiler_dir(dir.path())
-            .expect("a sidecar with both .mjs files and a valid artifact must resolve");
+        let resolved = resolve_sidecar_compiler_dir(dir.path()).expect("a sidecar with both .mjs files and a valid artifact must resolve");
         assert_eq!(resolved, std::fs::canonicalize(dir.path()).unwrap());
     }
 
@@ -1422,8 +1441,7 @@ mod tests {
         let root = tempfile::TempDir::new().unwrap();
         write_artifact(root.path(), VALID_REVISION_40, VALID_SOURCES_HASH);
         touch_sidecar_files(root.path());
-        let resolved = resolve_explicit_sdk_compiler_dir(root.path())
-            .expect("explicit SDK root with artifact and module colocated must resolve");
+        let resolved = resolve_explicit_sdk_compiler_dir(root.path()).expect("explicit SDK root with artifact and module colocated must resolve");
         assert_eq!(resolved, std::fs::canonicalize(root.path()).unwrap());
     }
 
@@ -1474,5 +1492,4 @@ mod tests {
             "missing module files must be reported; got: {chain}"
         );
     }
-
 }

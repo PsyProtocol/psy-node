@@ -105,19 +105,24 @@ impl ClaimRewardJobsWithRealm {
     }
 }
 
-fn validate_and_deduplicate_jobs(
-    jobs: ClaimRewardJobsWithRealm,
-    expected_user_id: u64,
-    jobs_file: &str,
-) -> Result<ClaimRewardJobsWithRealm> {
+fn validate_and_deduplicate_jobs(jobs: ClaimRewardJobsWithRealm, expected_user_id: u64, jobs_file: &str) -> Result<ClaimRewardJobsWithRealm> {
     let mut seen: HashMap<QProvingJobDataID, (Option<u64>, u64, u64, QHashOut<GoldilocksField>)> = HashMap::new();
     let mut deduplicated = ClaimRewardJobsWithRealm::new_empty();
     for (realm_id, unique_pending_id, job) in jobs.realm_jobs {
         validate_reward_preimage_user(&job, expected_user_id, jobs_file, &format!("realm_id={realm_id}"))?;
-        let identity = (Some(realm_id), unique_pending_id, job.inner.reward_path_info, job.reward_tree_tag_preimage);
+        let identity = (
+            Some(realm_id),
+            unique_pending_id,
+            job.inner.reward_path_info,
+            job.reward_tree_tag_preimage,
+        );
         match seen.get(&job.inner.job_data_id) {
             Some(existing) if existing == &identity => {}
-            Some(_) => anyhow::bail!("jobs file {} contains conflicting duplicate job_id {:?}", jobs_file, job.inner.job_data_id),
+            Some(_) => anyhow::bail!(
+                "jobs file {} contains conflicting duplicate job_id {:?}",
+                jobs_file,
+                job.inner.job_data_id
+            ),
             None => {
                 seen.insert(job.inner.job_data_id, identity);
                 deduplicated.realm_jobs.push((realm_id, unique_pending_id, job));
@@ -129,7 +134,11 @@ fn validate_and_deduplicate_jobs(
         let identity = (None, unique_pending_id, job.inner.reward_path_info, job.reward_tree_tag_preimage);
         match seen.get(&job.inner.job_data_id) {
             Some(existing) if existing == &identity => {}
-            Some(_) => anyhow::bail!("jobs file {} contains conflicting duplicate job_id {:?}", jobs_file, job.inner.job_data_id),
+            Some(_) => anyhow::bail!(
+                "jobs file {} contains conflicting duplicate job_id {:?}",
+                jobs_file,
+                job.inner.job_data_id
+            ),
             None => {
                 seen.insert(job.inner.job_data_id, identity);
                 deduplicated.coordinator_jobs.push((unique_pending_id, job));
@@ -139,12 +148,7 @@ fn validate_and_deduplicate_jobs(
     Ok(deduplicated)
 }
 
-fn validate_reward_preimage_user(
-    job: &QProvingJobDataIDWithRewardPreimage,
-    expected_user_id: u64,
-    jobs_file: &str,
-    source: &str,
-) -> Result<()> {
+fn validate_reward_preimage_user(job: &QProvingJobDataIDWithRewardPreimage, expected_user_id: u64, jobs_file: &str, source: &str) -> Result<()> {
     let preimage_user_id = job.reward_tree_tag_preimage.0.elements[0].0;
     anyhow::ensure!(
         preimage_user_id == expected_user_id,
@@ -158,13 +162,15 @@ fn validate_reward_preimage_user(
     Ok(())
 }
 
-fn index_reward_preimages(
-    jobs: &[QProvingJobDataIDWithRewardPreimage],
-) -> Result<HashMap<QProvingJobDataID, QHashOut<GoldilocksField>>> {
+fn index_reward_preimages(jobs: &[QProvingJobDataIDWithRewardPreimage]) -> Result<HashMap<QProvingJobDataID, QHashOut<GoldilocksField>>> {
     let mut index = HashMap::new();
     for job in jobs {
         if let Some(existing) = index.insert(job.inner.job_data_id, job.reward_tree_tag_preimage) {
-            anyhow::ensure!(existing == job.reward_tree_tag_preimage, "conflicting reward preimages for duplicate job_id {:?}", job.inner.job_data_id);
+            anyhow::ensure!(
+                existing == job.reward_tree_tag_preimage,
+                "conflicting reward preimages for duplicate job_id {:?}",
+                job.inner.job_data_id
+            );
         }
     }
     Ok(index)
@@ -188,7 +194,10 @@ fn attach_reward_preimages(
             source,
             proof.job_id,
         );
-        attached.push(PsyProoffMinerRewardProofWithRewardPreimage { inner: proof, reward_tree_tag_preimage });
+        attached.push(PsyProoffMinerRewardProofWithRewardPreimage {
+            inner: proof,
+            reward_tree_tag_preimage,
+        });
     }
     if matched.len() != preimages.len() {
         let missing = preimages
@@ -217,10 +226,7 @@ pub async fn build_realm_proofs(
         });
 
     let mut total_proofs = 0;
-    let mut proofs_with_unique_pending_id: HashMap<
-        u64,
-        Vec<PsyProoffMinerRewardProofWithRewardPreimage<QHashOut<GoldilocksField>>>,
-    > = HashMap::new();
+    let mut proofs_with_unique_pending_id: HashMap<u64, Vec<PsyProoffMinerRewardProofWithRewardPreimage<QHashOut<GoldilocksField>>>> = HashMap::new();
 
     for ((realm_id, unique_pending_id), job_id_with_preimages) in job_ids_with_realm_and_unique_pending_id.iter() {
         let job_ids = job_id_with_preimages
@@ -284,10 +290,7 @@ pub async fn build_proofs(
         });
 
     let mut total_proofs = 0;
-    let mut proofs_with_unique_pending_id: HashMap<
-        u64,
-        Vec<PsyProoffMinerRewardProofWithRewardPreimage<QHashOut<GoldilocksField>>>,
-    > = HashMap::new();
+    let mut proofs_with_unique_pending_id: HashMap<u64, Vec<PsyProoffMinerRewardProofWithRewardPreimage<QHashOut<GoldilocksField>>>> = HashMap::new();
 
     for (unique_pending_id, job_id_with_preimages) in job_ids_with_unique_pending_id.iter() {
         let job_ids = job_id_with_preimages
@@ -307,9 +310,7 @@ pub async fn build_proofs(
             (checkpoint_id, proofs)
         } else {
             let checkpoint_id = require_checkpoint_id(
-                provider
-                    .get_coordinator_checkpoint_id_for_unique_pending_id(*unique_pending_id)
-                    .await?,
+                provider.get_coordinator_checkpoint_id_for_unique_pending_id(*unique_pending_id).await?,
                 &format!("coordinator unique_pending_id {}", unique_pending_id),
             )?;
             let proofs = provider
@@ -383,11 +384,7 @@ fn load_job_ids_from_file(path: &str) -> Result<ClaimRewardJobsWithRealm> {
         let offset = record_index * record_size;
         let metadata = PsyProvingJobClaimMetadata::<QHashOut<GoldilocksField>, QProvingJobDataID>::psy_ser_from_slice(record_data)
             .with_context(|| format!("failed to parse jobs backup record at offset {}", offset))?;
-        let job = QProvingJobDataIDWithRewardPreimage::new(
-            metadata.job_id,
-            metadata.reward_tree_node_key.index,
-            metadata.reward_tree_tag_preimage,
-        );
+        let job = QProvingJobDataIDWithRewardPreimage::new(metadata.job_id, metadata.reward_tree_node_key.index, metadata.reward_tree_tag_preimage);
         if metadata.node_type == 1 {
             claim_jobs.realm_jobs.push((metadata.realm_id, metadata.unique_pending_id, job));
         } else {
@@ -522,10 +519,9 @@ pub async fn build_claim_calls_from_proofs(
 
 #[cfg(test)]
 mod tests {
+    use psy_client_common::job::id::{ProvingJobCircuitType, ProvingJobDataType, QJobTopic};
+
     use super::*;
-    use psy_client_common::job::id::{
-        ProvingJobCircuitType, ProvingJobDataType, QJobTopic,
-    };
 
     fn job(task_index: u32, user_id: u64, marker: u64) -> QProvingJobDataIDWithRewardPreimage {
         QProvingJobDataIDWithRewardPreimage::new(

@@ -457,6 +457,42 @@ impl<Hash: Q256BitHash> SealedAuthorityLocalHeadCas<Hash> {
         })
     }
 
+    /// Advance a Realm-local rollback journal after the normal database has
+    /// durably followed one Coordinator checkpoint without producing a Realm
+    /// business commit. The immutable sync inventory is used as the manifest
+    /// reference; pipeline and writer state deliberately remain unchanged.
+    pub fn seal_realm_sync_advance(
+        expected: StoredAuthorityLocalHead<Hash>,
+        observation: AuthorityObservation<Hash>,
+        commit_write_timestamp: CommitWriteTimestampUs,
+        sync_inventory_digest: [u8; 32],
+    ) -> Result<Self, AuthorityLocalHeadModelError> {
+        let previous = expected.head.chain();
+        let candidate = observation.chain();
+        if previous.network_id() != candidate.network_id()
+            || previous.chain_epoch() != candidate.chain_epoch()
+            || candidate.checkpoint().checkpoint_id().get()
+                != previous
+                    .checkpoint()
+                    .checkpoint_id()
+                    .get()
+                    .checked_add(1)
+                    .ok_or(AuthorityLocalHeadModelError::SyncCheckpointOverflow)?
+            || observation.state_checkpoint_id().get()
+                < expected.head.state_checkpoint().get()
+            || observation.state_checkpoint_id().get()
+                > candidate.checkpoint().checkpoint_id().get()
+        {
+            return Err(AuthorityLocalHeadModelError::InvalidSyncAdvance);
+        }
+        Self::seal_realm_full_commit_advance(
+            expected,
+            observation,
+            commit_write_timestamp,
+            sync_inventory_digest,
+        )
+    }
+
     /// Restore one Realm-local head from an exact historical committed row.
     ///
     /// The caller must be the storage-owned rollback finalizer which has
@@ -687,6 +723,8 @@ pub enum AuthorityLocalHeadModelError {
     RollbackTargetNotBeforeCurrent { current: u64, target: u64 },
     RollbackTargetTimestampAfterCurrent,
     AppliedStateMismatch,
+    InvalidSyncAdvance,
+    SyncCheckpointOverflow,
 }
 
 impl From<ChainContextCodecError> for AuthorityLocalHeadModelError {
@@ -849,6 +887,31 @@ mod tests {
                 [0; 32],
             ),
             Err(AuthorityLocalHeadModelError::ZeroManifestDigest)
+        ));
+    }
+
+    #[test]
+    fn realm_sync_head_advance_is_contiguous_and_manifest_bound() {
+        let expected = expected_head();
+        let next = observation(11, 9, 20);
+        let sealed = SealedAuthorityLocalHeadCas::seal_realm_sync_advance(
+            expected.clone(),
+            next,
+            CommitWriteTimestampUs::try_from_i128(101).unwrap(),
+            [0x5a; 32],
+        )
+        .unwrap();
+        assert_eq!(sealed.candidate().head().chain(), next.chain());
+        assert_eq!(sealed.candidate().head().state_checkpoint().get(), 9);
+        assert_eq!(sealed.candidate().manifest_digest().as_bytes(), &[0x5a; 32]);
+        assert!(matches!(
+            SealedAuthorityLocalHeadCas::seal_realm_sync_advance(
+                expected,
+                observation(12, 9, 20),
+                CommitWriteTimestampUs::try_from_i128(101).unwrap(),
+                [0x5a; 32],
+            ),
+            Err(AuthorityLocalHeadModelError::InvalidSyncAdvance)
         ));
     }
 

@@ -2,7 +2,10 @@ use anyhow::Result;
 use psy_client_data::traits::qdatastore::qmetadata::QMetaDataStoreReaderSync;
 use psy_provider::provider::RpcProvider;
 
-use crate::{result::{ClaimAmountResult, CommandResult}, subcommand::args::ClaimAmountArgs};
+use crate::{
+    result::{ClaimAmountResult, CommandResult},
+    subcommand::args::ClaimAmountArgs,
+};
 
 pub async fn run(args: ClaimAmountArgs) -> Result<CommandResult> {
     tracing::info!("claim amount: {}", serde_json::to_string_pretty(&args)?);

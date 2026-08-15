@@ -113,7 +113,9 @@ impl<Hash: Q256BitHash> RealmRollbackPhysicalCatalog<Hash> {
         let mut entries = Vec::new();
         let mut typed = BTreeMap::<Vec<u8>, TypedAccumulator>::new();
         for (source_index, source) in suffix.entries().iter().enumerate() {
-            push_narrow_entries(source_index, source, &mut entries)?;
+            if source.inventory().narrow_intent().is_some() {
+                push_narrow_entries(source_index, source, &mut entries)?;
+            }
             for put in source.inventory().typed_puts() {
                 let key = describe_existing_key(put.resolved().mutation().key());
                 if key.locator_bytes() != put.resolved().locator_bytes() {
@@ -195,7 +197,10 @@ fn push_narrow_entries<Hash: Q256BitHash>(
     source: &VerifiedRealmRollbackCommittedSuffixEntry<Hash>,
     entries: &mut Vec<RealmRollbackPhysicalCatalogEntry>,
 ) -> Result<(), RealmRollbackPhysicalCatalogError> {
-    let intent = source.inventory().narrow_intent();
+    let intent = source
+        .inventory()
+        .narrow_intent()
+        .ok_or(RealmRollbackPhysicalCatalogError::NarrowMutationSetMismatch)?;
     let observed = intent
         .mutations()
         .iter()

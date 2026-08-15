@@ -1,6 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import { s3CurlArgs } from "./locSetupDefaults";
-import { buildRollbackTopologyConfig, runStreamingCaptureStderr } from "./locSetupV4";
+import {
+    buildRollbackScyllaConfig,
+    buildRollbackTopologyConfig,
+    runStreamingCaptureStderr,
+} from "./locSetupV4";
 
 describe("buildRollbackTopologyConfig", () => {
     it("binds the exact contiguous Realm set started by the local devnet", () => {
@@ -20,6 +24,24 @@ describe("buildRollbackTopologyConfig", () => {
         expect(() => buildRollbackTopologyConfig(0, 0)).toThrow();
         expect(() => buildRollbackTopologyConfig(-1, 1)).toThrow();
         expect(() => buildRollbackTopologyConfig(0xffff_ffff, 2)).toThrow();
+    });
+});
+
+describe("buildRollbackScyllaConfig", () => {
+    it("uses one local replica unless RF3 is explicitly requested", () => {
+        expect(buildRollbackScyllaConfig("127.0.0.1", false)).toEqual({
+            url: "127.0.0.1:9042",
+            ports: [9042],
+            startDbArgs: ["./dev/start_db.sh", "--persist"],
+        });
+    });
+
+    it("uses all three endpoints only for the explicit RF3 mode", () => {
+        expect(buildRollbackScyllaConfig("10.0.0.5", true)).toEqual({
+            url: "10.0.0.5:9042,10.0.0.5:9043,10.0.0.5:9044",
+            ports: [9042, 9043, 9044],
+            startDbArgs: ["./dev/start_db.sh", "--persist", "--rf3"],
+        });
     });
 });
 

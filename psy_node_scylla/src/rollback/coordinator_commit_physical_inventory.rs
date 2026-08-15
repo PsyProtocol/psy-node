@@ -12,7 +12,9 @@ use std::{
 };
 
 use parth_core::{
-    crypto::hash::traits::{FieldQHasher, MerkleHasher, QFieldHashable},
+    crypto::hash::traits::{
+        FieldQHasher, MerkleHasher, MerkleZeroHasher, QFieldHashable,
+    },
     data::hash::{
         fast_node_serializer::QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE,
         merkle_node_key::PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE,
@@ -164,7 +166,7 @@ impl<Hash: Q256BitHash> CoordinatorCommitPhysicalInventory<Hash> {
     where
         F: QFelt64,
         Hash: QFHashBase<F>,
-        Hasher: MerkleHasher<Hash> + FieldQHasher<F, Hash>,
+        Hasher: MerkleHasher<Hash> + MerkleZeroHasher<Hash> + FieldQHasher<F, Hash>,
     {
         let target_checkpoint = target.checkpoint().checkpoint_id().get();
         let old_head_checkpoint = old_head.checkpoint().checkpoint_id().get();
@@ -236,7 +238,7 @@ impl<Hash: Q256BitHash> CoordinatorCommitPhysicalInventory<Hash> {
     where
         F: QFelt64,
         Hash: QFHashBase<F>,
-        Hasher: MerkleHasher<Hash> + FieldQHasher<F, Hash>,
+        Hasher: MerkleHasher<Hash> + MerkleZeroHasher<Hash> + FieldQHasher<F, Hash>,
     {
         if !marker.matches(source) {
             return Err(CoordinatorCommitPhysicalInventoryError::CommittedMarkerMismatch);
@@ -274,7 +276,7 @@ impl<Hash: Q256BitHash> CoordinatorCommitPhysicalInventory<Hash> {
     where
         F: QFelt64,
         Hash: QFHashBase<F>,
-        Hasher: MerkleHasher<Hash> + FieldQHasher<F, Hash>,
+        Hasher: MerkleHasher<Hash> + MerkleZeroHasher<Hash> + FieldQHasher<F, Hash>,
     {
         let checkpoint_u64 = source
             .candidate()
@@ -304,7 +306,13 @@ impl<Hash: Q256BitHash> CoordinatorCommitPhysicalInventory<Hash> {
         if computed_leaf_hash != prepared.new_base.checkpoint_leaf_hash
             || proof.index != checkpoint_u64
             || proof.old_root != prepared.old_base.checkpoint_tree_root
-            || proof.old_value != prepared.old_base.checkpoint_leaf_hash
+            // The checkpoint tree is append-only: the predecessor checkpoint
+            // leaf belongs at index `checkpoint - 1`, while this delta opens
+            // the previously empty `checkpoint` index.  Comparing old_value
+            // with old_base.checkpoint_leaf_hash incorrectly treats an append
+            // as an in-place replacement and rejects every real checkpoint
+            // after genesis.
+            || proof.old_value != Hasher::get_zero_hash(0)
             || proof.new_root != prepared.new_base.checkpoint_tree_root
             || proof.new_value != prepared.new_base.checkpoint_leaf_hash
             || !proof.verify::<Hasher>()
@@ -663,7 +671,7 @@ impl<Hash: Q256BitHash> CoordinatorCommitPhysicalCatalog<Hash> {
     where
         F: QFelt64,
         Hash: QFHashBase<F>,
-        Hasher: MerkleHasher<Hash> + FieldQHasher<F, Hash>,
+        Hasher: MerkleHasher<Hash> + MerkleZeroHasher<Hash> + FieldQHasher<F, Hash>,
     {
         if floor.floor().network_id() != target.network_id()
             || floor.floor().chain_epoch() != target.chain_epoch()
@@ -1247,7 +1255,7 @@ mod tests {
             .collect::<Vec<_>>();
         let proof = DeltaMerkleProofCore::from_params::<PoseidonHasher>(
             8,
-            old_leaf_hash,
+            PoseidonHasher::get_zero_hash(0),
             new_leaf_hash,
             siblings,
         );
@@ -1310,7 +1318,17 @@ mod tests {
 
     #[test]
     fn committed_source_yields_canonical_inventory_and_two_restore_singletons() {
-        let source = source(&prepared());
+        let prepared = prepared();
+        assert_ne!(
+            prepared.old_base.checkpoint_leaf_hash,
+            PoseidonHasher::get_zero_hash(0),
+            "the predecessor checkpoint leaf must not be confused with the empty target index",
+        );
+        assert_eq!(
+            prepared.checkpoint_tree_update_proof.old_value,
+            PoseidonHasher::get_zero_hash(0),
+        );
+        let source = source(&prepared);
         let inventory = CoordinatorCommitPhysicalInventory::<PHash>::try_from_committed_source::<
             PF,
             PoseidonHasher,
@@ -1493,7 +1511,7 @@ mod tests {
         second_prepared.new_base.block_state.checkpoint_id = 9;
         let proof = DeltaMerkleProofCore::from_params::<PoseidonHasher>(
             9,
-            second_prepared.old_base.checkpoint_leaf_hash,
+            PoseidonHasher::get_zero_hash(0),
             second_prepared.new_base.checkpoint_leaf_hash,
             (0..CHECKPOINT_TREE_HEIGHT as usize)
                 .map(PoseidonHasher::get_zero_hash)
@@ -1580,7 +1598,7 @@ mod tests {
         second_prepared.new_base.block_state.checkpoint_id = 9;
         let proof = DeltaMerkleProofCore::from_params::<PoseidonHasher>(
             9,
-            second_prepared.old_base.checkpoint_leaf_hash,
+            PoseidonHasher::get_zero_hash(0),
             second_prepared.new_base.checkpoint_leaf_hash,
             (0..CHECKPOINT_TREE_HEIGHT as usize)
                 .map(PoseidonHasher::get_zero_hash)

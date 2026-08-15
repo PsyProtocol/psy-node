@@ -9,6 +9,7 @@ use psy_config::network_constants::MAX_CONTRACT_STATE_TREE_HEIGHT;
 use psy_prover::session::WalletSession;
 use psy_provider::provider::RpcProvider;
 use psy_vm::dpn::{contract::cfc_code_definition_to_dapen_fc, vm::def::DPNFunctionCircuitDefinition};
+
 use crate::result::{CommandResult, TransactionResult, TransactionStatus};
 
 fn allowed_contract_method_pairs(allowed_contract_ids: &[u64], allowed_method_ids: &[u32]) -> anyhow::Result<Vec<(u64, u32)>> {

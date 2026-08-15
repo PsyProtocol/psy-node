@@ -33,11 +33,13 @@ use tokio::time::{sleep, Duration};
 #[cfg(not(target_arch = "wasm32"))]
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-use crate::result::{CommandResult, TransactionResult, TransactionStatus};
-use crate::subcommand::{
-    args::PrivateTransferArgs,
-    note_proof_common::{qhash_to_u64x4, NoteProofOutput},
-    submit_end_cap_proof,
+use crate::{
+    result::{CommandResult, TransactionResult, TransactionStatus},
+    subcommand::{
+        args::PrivateTransferArgs,
+        note_proof_common::{qhash_to_u64x4, NoteProofOutput},
+        submit_end_cap_proof,
+    },
 };
 const NOTE_TREE_HEIGHT: usize = 20; // 2^20 = 1048576 notes
 
@@ -896,19 +898,9 @@ pub async fn run(args: PrivateTransferArgs) -> anyhow::Result<CommandResult> {
     let note_payload = std::fs::read_to_string(&args.output).with_context(|| format!("failed to read generated note proof {}", args.output))?;
     let note_data: NoteProofOutput = serde_json::from_str(&note_payload).context("generated note proof is not valid json")?;
     if let Some(npub) = &args.nostr_recipient_pubkey {
-        let (proof_id, secrets_id) = publish_private_transfer_backup(
-            &note_data,
-            note_commitment_q,
-            note_secret,
-            nullifier_secret,
-            npub,
-            &args.nostr_relay,
-        )
-        .await?;
-        println!(
-            "private transfer backup sent via Nostr: proof={}, secrets={}",
-            proof_id, secrets_id
-        );
+        let (proof_id, secrets_id) =
+            publish_private_transfer_backup(&note_data, note_commitment_q, note_secret, nullifier_secret, npub, &args.nostr_relay).await?;
+        println!("private transfer backup sent via Nostr: proof={}, secrets={}", proof_id, secrets_id);
     } else {
         println!("Note proof saved to {} (file mode)", args.output);
     }

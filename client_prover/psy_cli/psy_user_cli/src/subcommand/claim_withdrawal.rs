@@ -532,9 +532,7 @@ pub async fn run(args: ClaimWithdrawalArgs) -> anyhow::Result<CommandResult> {
                 serde_json::json!([format!("{:#x}", tx_hash), {"tracer": "callTracer"}]),
             )
             .await;
-            let revert_reason = trace
-                .ok()
-                .and_then(|value| value["revertReason"].as_str().map(str::to_owned));
+            let revert_reason = trace.ok().and_then(|value| value["revertReason"].as_str().map(str::to_owned));
             anyhow::bail!(
                 "L1 claim-withdrawal transaction reverted: tx_hash={:#x}, reason={}",
                 tx_hash,
@@ -568,8 +566,10 @@ mod tests {
         normalize_u256_hex_32bytes, parse_u256_word_array, resolve_bridge_address_for_network, run, to_32byte_hex,
         LEGACY_WITHDRAWAL_BATCH_CLAIM_SIGNATURE, WITHDRAWAL_BATCH_CLAIM_SIGNATURE, WITHDRAWAL_BATCH_CLAIM_SLOT_DATA_WORDS,
     };
-    use crate::subcommand::args::ClaimWithdrawalArgs;
-    use crate::result::{CommandResult, L1TransactionStatus};
+    use crate::{
+        result::{CommandResult, L1TransactionStatus},
+        subcommand::args::ClaimWithdrawalArgs,
+    };
 
     fn spawn_single_response_server(body: serde_json::Value) -> String {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();

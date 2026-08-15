@@ -1,7 +1,17 @@
 use anyhow::Ok;
 use parth_common::memory_stores::traits::PsyMemoryMerkleStoreImm;
 use parth_core::protocol::core_types::QNetworkTypesConfig;
-use psy_data::{prepared_block::realm::PsyRealmCoordinatorUpdate, v1::qdata::checkpoint::QEDL2BlockState};
+use psy_data::{
+    prepared_block::realm::PsyRealmCoordinatorUpdate,
+    protocol::{
+        canonical_chain::NetworkId,
+        chain_context::{
+            AuthorityObservation, AuthorityScope, AuthorityStateCheckpointId,
+            AuthorityStateRoot,
+        },
+    },
+    v1::qdata::checkpoint::QEDL2BlockState,
+};
 use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
     p2p::traits::realm_coordinantor::RealmCoordinatorClient,
@@ -19,8 +29,8 @@ impl<
         N: QNetworkTypesConfig,
         S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync,
         STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync,
-        GUTAUpdateQueue: QStandardEphemeralQueueSubscriber,
-        ProofWorkQueue: QStandardWorkerQueuePublisher,
+        GUTAUpdateQueue: QStandardEphemeralQueueSubscriber + Send + Sync,
+        ProofWorkQueue: QStandardWorkerQueuePublisher + Send + Sync,
         TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>,
         ProofStore: QParthProofStore,
         FileSystem: TokioLikeFileSystem + Send + Sync + 'static,
@@ -29,6 +39,72 @@ impl<
 where
     N::HasherBase: 'static + Send + Sync,
 {
+    async fn reconcile_rollback_sync_journal(
+        &self,
+        up_to_checkpoint: u64,
+    ) -> anyhow::Result<()> {
+        let Some(control) = self.rollback_runtime_control.clone() else {
+            return Ok(());
+        };
+        let realm_id = u32::try_from(self.state.realm_id_u64)
+            .map_err(|_| anyhow::anyhow!("realm_id exceeds authority-scope u32"))?;
+        let realm_sub_id = u16::try_from(self.state.realm_sub_id_u64)
+            .map_err(|_| anyhow::anyhow!("realm_sub_id exceeds authority-scope u16"))?;
+        let authority = AuthorityScope::Realm {
+            realm_id,
+            realm_sub_id,
+        };
+        let network = NetworkId::try_from_chain_id(self.state.chain_id)?;
+        let journaled = control
+            .read_realm_rollback_journal_checkpoint(network, authority)
+            .await?;
+        if journaled > up_to_checkpoint {
+            anyhow::bail!(
+                "REALM_ROLLBACK_JOURNAL_AHEAD_OF_NORMAL_DB:journal={},normal={}",
+                journaled,
+                up_to_checkpoint
+            );
+        }
+
+        for checkpoint in journaled.saturating_add(1)..=up_to_checkpoint {
+            let sync_info = self
+                .coordinator_client
+                .rc_get_realm_sync_info(checkpoint, self.state.realm_id_u64)
+                .await?;
+            self.validate_realm_sync_context(&sync_info)?;
+            let realm_state = self
+                .coordinator_client
+                .rc_get_realm_root_and_last_modified_checkpoint(
+                    checkpoint,
+                    self.state.realm_id_u64,
+                )
+                .await?;
+            let local_root = self
+                .db
+                .global_user_tree_get_node(checkpoint, self.realm_root_node)
+                .await?;
+            if local_root != realm_state.value {
+                anyhow::bail!(
+                    "REALM_ROLLBACK_JOURNAL_ROOT_MISMATCH:checkpoint={},local={:?},coordinator={:?}",
+                    checkpoint,
+                    local_root,
+                    realm_state.value
+                );
+            }
+            let observation = AuthorityObservation::try_new(
+                sync_info.canonical_chain_ref,
+                authority,
+                AuthorityStateCheckpointId::new(realm_state.checkpoint_id),
+                AuthorityStateRoot::from_local_state_root(realm_state.value),
+            )?;
+            let batches = self.build_non_state_batches(&sync_info, observation)?;
+            control
+                .persist_realm_sync_checkpoint(observation, batches)
+                .await?;
+        }
+        Ok(())
+    }
+
     pub async fn sync_to_coordinator_set_checkpoint_id(&mut self) -> anyhow::Result<()> {
         // 1. Sync Headers
         self.checkpoint_tree_backup_manager
@@ -98,6 +174,8 @@ where
                 realm_state.value,
             )
             .await?;
+            self.reconcile_rollback_sync_journal(latest_synced_checkpoint_id)
+                .await?;
             tracing::debug!(
                 "Coordinator processor database is already synced to latest checkpoint ID: {} and root: {:?}",
                 latest_synced_checkpoint_id,
@@ -180,6 +258,8 @@ where
             realm_root_state.value,
         )
         .await?;
+        self.reconcile_rollback_sync_journal(latest_synced_checkpoint_id)
+            .await?;
 
         tracing::info!(
             "Synchronized coordinator processor database to checkpoint ID: {}. New Base Realm Root: {:?}.", 

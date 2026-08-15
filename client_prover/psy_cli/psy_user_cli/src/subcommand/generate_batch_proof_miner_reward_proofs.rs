@@ -30,7 +30,10 @@ pub async fn run(args: GenerateBatchProofMinerRewardProofsArgs) -> Result<Comman
     std::fs::write(&args.output_file, output)?;
     tracing::info!("Wrote {} proofs to {}", proofs.len(), args.output_file);
     println!("Generated {} proofs to {}", proofs.len(), args.output_file);
-    Ok(CommandResult::Proofs(ProofsResult { count: proofs.len(), output_file: args.output_file }))
+    Ok(CommandResult::Proofs(ProofsResult {
+        count: proofs.len(),
+        output_file: args.output_file,
+    }))
 }
 
 fn load_job_ids_from_file(path: &str) -> Result<Vec<QProvingJobDataIDWithRewardPath>> {

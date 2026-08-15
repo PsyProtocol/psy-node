@@ -32,8 +32,12 @@ use psy_node_core::{
     },
     psy_temp_db::StandardProcessorTempDBStoreBase,
     queue::{ephemeral::QStandardEphemeralQueueSubscriber, worker_queue::QStandardWorkerQueuePublisher},
-    store::traits::proof_store::QParthProofStore,
-    store::rollback_runtime_rebuild::RollbackRuntimeRebuildDirective,
+    store::{
+        rollback_runtime_rebuild::{
+            RealmRollbackRuntimeControl, RollbackRuntimeRebuildDirective,
+        },
+        traits::proof_store::QParthProofStore,
+    },
 };
 
 use crate::{
@@ -165,6 +169,8 @@ where
         guta_update_queue: Arc<GUTAUpdateQueue>,
         proof_work_queue: Arc<ProofWorkQueue>,
         coordinator_client: Arc<CoordinatorClient>,
+        rollback_runtime_control:
+            Option<Arc<dyn RealmRollbackRuntimeControl<N::QHash>>>,
         chain_id: u32,
         realm_identifier: QRealmIdentifier,
         circuit_fingerprint_config: PsyNodeCircuitFingerprintConfig<N::QHash>,
@@ -182,7 +188,7 @@ where
         tracing::info!("[REALM_INIT] new_init start");
 
         // 1. Recover basic state from DB
-        let mut last_committed_checkpoint_id = db.get_latest_checkpoint_id().await?;
+        let last_committed_checkpoint_id = db.get_latest_checkpoint_id().await?;
         tracing::info!("[REALM_INIT] latest checkpoint id = {}", last_committed_checkpoint_id);
         let (current_unique_pending_id, current_core_proc_unique_pending_id) = if last_committed_checkpoint_id == 0 {
             (0, 0u128)
@@ -195,33 +201,18 @@ where
             current_core_proc_unique_pending_id
         );
 
-        // 2. Validate consistency of unique pending IDs
-        // Defensive: if a previous run fast-forwarded and set latest_checkpoint_id
-        // without writing the unique_pending_id mapping, roll back to the last
-        // checkpoint that actually has a mapping.
-        let (last_committed_unique_pending_id, last_committed_proc_checkpoint_unique_id) = loop {
-            match db.get_unique_pending_id_for_checkpoint_id(last_committed_checkpoint_id).await {
-                Ok(Some(res)) => break res,
-                Ok(None) if last_committed_checkpoint_id == 0 => break (0, 0u128),
-                Ok(None) => {
-                    tracing::warn!(
-                        "No unique pending ID for checkpoint {}. Rolling back to previous checkpoint.",
-                        last_committed_checkpoint_id
-                    );
-                    last_committed_checkpoint_id -= 1;
-                }
-                Err(e) => {
-                    if last_committed_checkpoint_id == 0 {
-                        break (0, 0u128);
-                    } else {
-                        return Err(e);
-                    }
-                }
-            }
-        };
-        if last_committed_checkpoint_id != db.get_latest_checkpoint_id().await? {
-            db.set_latest_checkpoint_id(last_committed_checkpoint_id).await?;
-        }
+        // 2. Restore the pending lineage independently from the canonical
+        // checkpoint head. Coordinator checkpoints can advance while this
+        // Realm has no work, in which case no new checkpoint->pending row is
+        // expected. Rewinding the checkpoint marker to the last Realm work
+        // would discard valid sync metadata and make restart non-monotonic.
+        let (
+            last_committed_unique_pending_id,
+            last_committed_proc_checkpoint_unique_id,
+        ) = (
+            current_unique_pending_id,
+            current_core_proc_unique_pending_id,
+        );
 
         // 3. Get Checkpoint Root
         let last_committed_checkpoint_root = match db.checkpoint_tree_get_root_hash(last_committed_checkpoint_id).await {
@@ -280,6 +271,7 @@ where
             guta_update_queue,
             proof_work_queue,
             coordinator_client,
+            rollback_runtime_control,
             checkpoint_tree_backup_manager,
             shared_state: RealmProcessorCoreStateWrapper::new(state.clone()),
             circuit_fingerprint_config,

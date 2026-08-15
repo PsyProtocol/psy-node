@@ -30,6 +30,7 @@ use psy_node_core::{
     psy_temp_db::StandardProcessorTempDBStoreBase,
     queue::{ephemeral::QStandardEphemeralQueueSubscriber, worker_queue::QStandardWorkerQueuePublisher},
     store::traits::proof_store::QParthProofStore,
+    store::rollback_runtime_rebuild::RealmRollbackRuntimeControl,
 };
 
 use crate::{
@@ -75,6 +76,10 @@ pub struct PsyRealmDatabaseProcessor<
 
     // coordinator connection
     pub coordinator_client: Arc<CoordinatorClient>,
+    /// Optional storage-owned rollback journal/control boundary. Normal Realm
+    /// sync uses this only to append already-durable checkpoint evidence.
+    pub rollback_runtime_control:
+        Option<Arc<dyn RealmRollbackRuntimeControl<N::QHash>>>,
     // status
     pub status: ProcessorStatus,
     pub guta_queue_key_status_manager: QueueKeyStatusManager<PQ_REALM_SUBMIT_USER_UPDATE_QUEUE_TOPIC_ID, PsyRealmUserUpdateQueueItem<N::F, N::QHash>>,

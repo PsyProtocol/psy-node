@@ -309,6 +309,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_processor_node(co
                 config.realm_sub_id,
                 branch_exact_lineage,
                 nats_queue.clone(),
+                config.coordinator_rollback_db_namespace.as_deref(),
             )
             .await?;
             let (

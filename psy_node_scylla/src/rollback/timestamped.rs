@@ -5,13 +5,16 @@ use psy_node_core::store::{
     timestamp::{CommitWriteTimestampUs, NewBranchWriteTimestampUs},
     typed::{LogicalMutation, MutationOperation, MutationValue},
 };
+use psy_data::protocol::chain_context::AuthorityObservation;
 use sha2::{Digest, Sha256};
 
 use super::{
     BranchExactWriterPrepared, MutationBuildError, ResolvedScyllaMutation,
     MutationDecodeError,
     build_coordinator_reward_node_after_cutover,
-    build_realm_global_user_proof_after_cutover, expand_logical_mutation,
+    build_realm_global_user_proof_after_cutover,
+    build_realm_global_user_proof_from_sync_observation,
+    expand_logical_mutation,
 };
 
 const TIMESTAMPED_PUT_CODEC_VERSION: u16 = 1;
@@ -416,6 +419,20 @@ pub fn seal_commit_put(
     seal_inner(intent, timestamp, TimestampedWriteKind::AuthorityCommit)
 }
 
+/// Re-seal an already registry-resolved PUT at the writetime observed from
+/// the normal Realm database. This is used only to journal existing sync
+/// rows; it performs no write and cannot change the resolved physical key.
+pub(super) fn reseal_observed_authority_put(
+    source: &SealedTimestampedPut,
+    timestamp: CommitWriteTimestampUs,
+) -> Result<SealedTimestampedPut, TimestampedMutationError> {
+    seal_resolved(
+        source.resolved().clone(),
+        timestamp,
+        TimestampedWriteKind::AuthorityCommit,
+    )
+}
+
 /// Seal the checkpoint global-user proof only after the exact h22 writer
 /// preparation captured a non-quiescing cutover fence. Generic typed sealing
 /// intentionally continues to reject the historical mixed-axis table.
@@ -428,6 +445,30 @@ pub(super) fn seal_realm_global_user_proof_after_cutover<Hash: Q256BitHash>(
     seal_resolved(
         resolved,
         prepared.timestamp(),
+        TimestampedWriteKind::AuthorityCommit,
+    )
+}
+
+/// Seal the read identity of a global-user proof that was already committed
+/// by normal Realm synchronization.  The rollback journal caller must replace
+/// this placeholder timestamp with the value obtained from an exact physical
+/// point read before retaining the row.
+pub(super) fn seal_realm_global_user_proof_from_sync_observation<
+    Hash: Q256BitHash,
+>(
+    observation: &AuthorityObservation<Hash>,
+    key: psy_node_core::store::typed::TypedTableKey,
+    value: MutationValue,
+    timestamp: CommitWriteTimestampUs,
+) -> Result<SealedTimestampedPut, TimestampedMutationError> {
+    let resolved = build_realm_global_user_proof_from_sync_observation(
+        observation,
+        key,
+        value,
+    )?;
+    seal_resolved(
+        resolved,
+        timestamp,
         TimestampedWriteKind::AuthorityCommit,
     )
 }

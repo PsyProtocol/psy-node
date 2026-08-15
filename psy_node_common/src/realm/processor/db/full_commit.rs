@@ -295,7 +295,7 @@ where
         >(prepared, &sealed, cursors)?)
     }
 
-    fn build_non_state_batches(
+    pub(in crate::realm::processor) fn build_non_state_batches(
         &self,
         coordinator: &PsyRealmCoordinatorUpdate<N::F, N::QHash>,
         observation: AuthorityObservation<N::QHash>,

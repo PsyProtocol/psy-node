@@ -3,9 +3,8 @@
 
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
-
 use psy_client_data::abi::{Abi, AbiMethod, TypeRef};
+use serde::{Deserialize, Serialize};
 
 use super::executor::{ExecutionContext, ExecutionResult, StateBackend, VmExecutor};
 use crate::dpn::vm::def::DPNFunctionCircuitDefinition;
@@ -81,7 +80,13 @@ impl<S: StateBackend> AbiExecutor<S> {
         let method_index: HashMap<String, usize> = circuit_defs
             .iter()
             .enumerate()
-            .filter_map(|(i, d)| abi.contract.methods.iter().find(|m| m.method_id == d.method_id).map(|m| (m.name.clone(), i)))
+            .filter_map(|(i, d)| {
+                abi.contract
+                    .methods
+                    .iter()
+                    .find(|m| m.method_id == d.method_id)
+                    .map(|m| (m.name.clone(), i))
+            })
             .collect();
 
         AbiExecutor {

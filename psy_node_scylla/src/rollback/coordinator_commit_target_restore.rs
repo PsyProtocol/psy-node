@@ -4,10 +4,9 @@
 //! immutable checkpoint-keyed L2 row at the selected target.  The latest
 //! checkpoint singleton is restored to the target checkpoint number.  A
 //! target above the rollback floor must additionally be backed by its exact
-//! normal-commit source and COMMITTED marker. Genesis is the only source-less
-//! target accepted here because its L2 singleton value is deterministic. A
-//! non-genesis target equal to an upgrade floor remains fail-closed until a
-//! floor-time singleton anchor is durably available.
+//! normal-commit source and COMMITTED marker. A target equal to the rollback
+//! floor, including checkpoint zero, must be backed by the exact singleton
+//! anchor captured when that floor was activated.
 
 use std::{error::Error, fmt, io::Cursor as IoCursor};
 
@@ -198,19 +197,18 @@ impl<Hash: Q256BitHash> CoordinatorCommitTargetRestorePayload<Hash> {
         participant_completion_digest: [u8; 32],
         floor: &CoordinatorRollbackFloor<Hash>,
         anchor: &CoordinatorRollbackFloorSingletonAnchor<Hash>,
+        target_l2: &CoordinatorCommitPhysicalSourceCell,
     ) -> Result<Self, CoordinatorCommitTargetRestoreError> {
         if floor.floor() != &target
-            || target.checkpoint().checkpoint_id().get() == 0
             || anchor.floor() != floor
             || anchor.latest_checkpoint()
                 != target.checkpoint().checkpoint_id().get()
         {
             return Err(CoordinatorCommitTargetRestoreError::FloorTargetMismatch);
         }
-        let target_l2 = CoordinatorCommitPhysicalSourceCell::value(
-            anchor.latest_l2_stored_value().to_vec(),
-            anchor.target_l2_writetime_us(),
-        );
+        anchor.validate_target_l2(target_l2).map_err(|error| {
+            CoordinatorCommitTargetRestoreError::TargetSource(error.to_string())
+        })?;
         Self::try_from_parts(
             archiving_head,
             target,
@@ -222,7 +220,7 @@ impl<Hash: Q256BitHash> CoordinatorCommitTargetRestorePayload<Hash> {
                 floor_digest: *floor.digest(),
                 anchor_digest: *anchor.digest(),
             },
-            &target_l2,
+            target_l2,
         )
     }
 
@@ -409,11 +407,6 @@ impl<Hash: Q256BitHash> CoordinatorCommitTargetRestorePayload<Hash> {
                 return Err(CoordinatorCommitTargetRestoreError::FloorTargetMismatch);
             }
             CoordinatorTargetRestoreSource::CommittedSource { .. }
-                if latest_checkpoint == 0 =>
-            {
-                return Err(CoordinatorCommitTargetRestoreError::FloorTargetMismatch);
-            }
-            CoordinatorTargetRestoreSource::FloorAnchor { .. }
                 if latest_checkpoint == 0 =>
             {
                 return Err(CoordinatorCommitTargetRestoreError::FloorTargetMismatch);
@@ -974,7 +967,7 @@ mod tests {
             .collect::<Vec<_>>();
         let proof = DeltaMerkleProofCore::from_params::<PoseidonHasher>(
             8,
-            old_leaf_hash,
+            PoseidonHasher::get_zero_hash(0),
             new_leaf_hash,
             siblings,
         );
@@ -1191,11 +1184,51 @@ mod tests {
             [0x44; 32],
             &floor,
             &anchor,
+            &stored_l2(&target_state, 7_001),
         )
         .unwrap();
 
         assert_eq!(payload.latest_checkpoint, 7);
         assert_eq!(payload.target_l2_stored_value, anchor.latest_l2_stored_value());
+        assert_eq!(
+            CoordinatorCommitTargetRestorePayload::decode_canonical(
+                payload.canonical_bytes(),
+            ),
+            Ok(payload),
+        );
+    }
+
+    #[test]
+    fn populated_genesis_floor_target_uses_exact_singleton_anchor() {
+        let target = canonical(6, 0, 700);
+        let floor = CoordinatorRollbackFloor::try_new(idle_head(6, 0, 700)).unwrap();
+        let populated_genesis = block_state(0, 6);
+        let target_l2 = stored_l2(&populated_genesis, 7_001);
+        let anchor = CoordinatorRollbackFloorSingletonAnchor::try_new(
+            floor,
+            &stored_l2(&populated_genesis, 7_002),
+            &target_l2,
+            &CoordinatorCommitPhysicalSourceCell::value(
+                0_i64.to_be_bytes().to_vec(),
+                7_003,
+            ),
+        )
+        .unwrap();
+        let payload = CoordinatorCommitTargetRestorePayload::try_from_floor_anchor(
+            archiving_head(*target.checkpoint()),
+            target,
+            [0x11; 32],
+            [0x22; 32],
+            [0x33; 32],
+            [0x44; 32],
+            &floor,
+            &anchor,
+            &target_l2,
+        )
+        .unwrap();
+
+        assert_eq!(payload.latest_checkpoint, 0);
+        assert_eq!(payload.target_l2_stored_value, target_l2.bytes());
         assert_eq!(
             CoordinatorCommitTargetRestorePayload::decode_canonical(
                 payload.canonical_bytes(),

@@ -22,12 +22,14 @@ use psy_prover::{
 use psy_provider::provider::RpcProvider;
 use serde::Deserialize;
 
-use crate::subcommand::{
-    args::BatchClaimArgs,
-    claim_deposit::{load_deposit_proof_file, qhash_from_u64x4},
-    note_proof_common::NoteProofOutput,
+use crate::{
+    result::{CommandResult, TransactionResult, TransactionStatus, TxTraceResult},
+    subcommand::{
+        args::BatchClaimArgs,
+        claim_deposit::{load_deposit_proof_file, qhash_from_u64x4},
+        note_proof_common::NoteProofOutput,
+    },
 };
-use crate::result::{CommandResult, TransactionResult, TransactionStatus, TxTraceResult};
 
 const NOTE_TREE_HEIGHT: usize = 20;
 

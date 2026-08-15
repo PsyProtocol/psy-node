@@ -744,15 +744,8 @@ impl<'a> TraceBuildSession<'a> {
                 .ok_or_else(|| anyhow::format_err!("user {} not found", self.public_key.to_string()))?
                 .require_lps()?
                 .get_current_user_id_64();
-            let metadata = crate::trace::SimulatedTxMetadata::from_view_steps(
-                user_id,
-                &self.trace_arena.steps,
-                call_data.software_defined_call,
-            )?;
-            return Ok(crate::trace::SimulatedTxJson {
-                generated: None,
-                metadata,
-            });
+            let metadata = crate::trace::SimulatedTxMetadata::from_view_steps(user_id, &self.trace_arena.steps, call_data.software_defined_call)?;
+            return Ok(crate::trace::SimulatedTxJson { generated: None, metadata });
         }
 
         let call_data_json = serde_json::to_value(&call_data)?;
@@ -4691,7 +4684,6 @@ mod tests {
         let error = ensure_private_transfer_contract_matches(5, 4).unwrap_err();
         assert!(error.to_string().contains("proof token_contract_id=4"));
     }
-
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -5489,7 +5481,10 @@ mod async_split_tests {
         }]);
 
         let simulated = wallet_session.simulate_contract_call(user0, call_data.clone()).await?;
-        let generated = simulated.generated.as_ref().expect("external simulation must retain a provable trace envelope");
+        let generated = simulated
+            .generated
+            .as_ref()
+            .expect("external simulation must retain a provable trace envelope");
         assert_eq!(simulated.metadata.tx_hash.as_ref().unwrap().to_string(), generated.tx_hash);
         assert!(simulated.metadata.end_cap_data.is_some());
         assert_eq!(simulated.metadata.contract_call_data.contract_calls.len(), 1);
@@ -6495,7 +6490,6 @@ mod async_split_tests {
     #[tokio::test]
     #[ignore = "debug baseline only"]
     async fn async_local_prove_minimal_add_balance_baseline() -> anyhow::Result<()> {
-
         let project_path =
             std::env::var("CARGO_MANIFEST_DIR").map_err(|e| anyhow::format_err!("Error `{}`, cannot get CARGO_MANIFEST_DIR env", e))?;
         let deployer_private_key = QHashOut::<GoldilocksField>::from_str("17c975c2668ebe0ca7c87f67c6414ebb7fd664f46370a0af2a3b204c8824ac5a")?;

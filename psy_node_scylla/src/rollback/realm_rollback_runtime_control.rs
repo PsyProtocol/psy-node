@@ -4,7 +4,7 @@
 //! operator.  It never guesses the namespace and never exposes canonical-head
 //! mutation or raw report writes.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
 use parth_core::protocol::core_types::Q256BitHash;
@@ -14,8 +14,15 @@ use psy_data::protocol::{
 };
 use psy_node_core::store::{
     authority_commit::AuthorityTimestampKey,
-    authority_local_head::AuthorityLocalHeadReadState,
+    authority_local_head::{AuthorityLocalHeadReadState, AuthorityLocalHeadWriteOutcome,
+        SealedAuthorityLocalHeadCas},
     canonical_head::{CanonicalHeadReadState, StoredCanonicalHead},
+    pending_generation_identity::PendingGenerationLedgerKey,
+    pending_generation_pipeline::PendingPipelineReadState,
+    realm_full_commit_write_set::RealmCommitLogicalDomainBatch,
+    realm_normal_commit_coverage::RealmNormalCommitWriteDomain,
+    typed::{CheckpointedObjectKey, LatestInfoSlot, MutationValue,
+        TypedTableKey, U64SingletonSlot},
     rollback_control::RollbackControlState,
     rollback_runtime_rebuild::{
         RealmRollbackParticipantProgress, RealmRollbackRuntimeControl,
@@ -29,11 +36,9 @@ use psy_node_core::store::{
         AuthorityClockSampleUs, AuthorityTimestampBootstrap, AuthorityTimestampBootstrapReason,
         AuthorityTimestampReadState,
     },
-    authority_local_head::AuthorityLocalHeadWriteOutcome,
     pending_generation::ProcNamespacePrefix,
-    pending_generation_identity::PendingGenerationLedgerKey,
     pending_generation_pipeline::{
-        PendingPipelineIntentDigest, PendingPipelineReadState, PendingPipelineWriteOutcome,
+        PendingPipelineIntentDigest, PendingPipelineWriteOutcome,
         PendingPublishReceiptDigest, PendingQueueCloseIntentDigest, PendingWorkCaptureDigest,
     },
 };
@@ -44,11 +49,13 @@ use super::qualification_persist_realm_genesis_rollback_anchor;
 #[cfg(test)]
 use sha2::{Digest, Sha256};
 use scylla::client::session::Session;
+use scylla::statement::Consistency;
 
 use super::{
     AuthorityTimestampNoTabletKeyspace, BranchExactDeploymentNoTabletKeyspace,
     BranchExactSchemaReady, PendingCounterAdapter, PendingQueueArtifactDataKeyspace,
     ScyllaAuthorityLocalHeadStore, ScyllaAuthorityTimestampStore,
+    BranchExactWriterAuthorityKey, BranchExactWriterReadState,
     ScyllaBranchExactWriterLifecycleStore, ScyllaPendingPipelineStore,
     branch_exact_dual_write_executor::ScyllaBranchExactDualWriteAdapter,
     canonical_head_prototype::ScyllaCanonicalHeadStore,
@@ -68,6 +75,11 @@ use super::{
     rollback_runtime_rebuild_store::ScyllaRollbackRuntimeRebuildStore,
     AuthorityLocalHeadNoTabletKeyspace, CanonicalHeadNoTabletKeyspace,
     CqlKeyspaceName,
+    VersionAxis, physical_descriptor, reseal_observed_authority_put,
+    seal_realm_global_user_proof_from_sync_observation,
+    seal_commit_put_batch,
+    realm_full_commit_execution::RealmFullCommitExpectedRow,
+    realm_full_commit_scylla::RealmFullCommitScyllaExecutor,
 };
 
 pub struct ScyllaRealmRollbackRuntimeControl {
@@ -169,6 +181,188 @@ impl ScyllaRealmRollbackRuntimeControl {
             self.coordinator_archive_keyspace.clone(),
         )
         .await?)
+    }
+
+    async fn persist_sync_checkpoint<Hash: Q256BitHash>(
+        &self,
+        observation: psy_data::protocol::chain_context::AuthorityObservation<Hash>,
+        batches: Vec<RealmCommitLogicalDomainBatch>,
+    ) -> anyhow::Result<()> {
+        let authority = observation.authority();
+        let network = observation.chain().network_id();
+        let key = AuthorityTimestampKey::new(network, authority);
+        let AuthorityLocalHeadReadState::Current(expected_head) = self.local_head.read(key).await?
+        else {
+            anyhow::bail!("Realm rollback journal local head is missing")
+        };
+        let expected_checkpoint = expected_head.head().chain().checkpoint().checkpoint_id().get();
+        let checkpoint = observation.chain().checkpoint().checkpoint_id().get();
+        if checkpoint <= expected_checkpoint {
+            let selected = self.local_inventory
+                .read_committed_checkpoint(authority, *observation.chain()).await?;
+            anyhow::ensure!(
+                selected.stored_head()?.head().state_checkpoint()
+                    == observation.state_checkpoint_id()
+                    && selected.stored_head()?.head().state_root() == observation.state_root(),
+                "existing Realm rollback journal checkpoint differs from sync observation",
+            );
+            return Ok(());
+        }
+        anyhow::ensure!(
+            checkpoint == expected_checkpoint.checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("Realm rollback journal checkpoint overflow"))?,
+            "Realm rollback sync journal must advance exactly one checkpoint",
+        );
+
+        validate_sync_batches(&observation, &batches)?;
+        let dummy_timestamp = psy_node_core::store::timestamp::CommitWriteTimestampUs::try_from_i128(1)?;
+        let mut unresolved = BTreeMap::new();
+        for batch in &batches {
+            for mutation in batch.mutations() {
+                let members = if batch.domain()
+                    == RealmNormalCommitWriteDomain::GlobalUserTopProofAtCheckpoint
+                {
+                    let psy_node_core::store::typed::LogicalMutation::Put {
+                        key,
+                        value,
+                    } = mutation
+                    else {
+                        anyhow::bail!("Realm sync global-user proof must be one PUT")
+                    };
+                    vec![seal_realm_global_user_proof_from_sync_observation(
+                        &observation,
+                        key.clone(),
+                        value.clone(),
+                        dummy_timestamp,
+                    )?]
+                } else {
+                    seal_commit_put_batch(mutation.clone(), dummy_timestamp)?
+                        .members()
+                        .to_vec()
+                };
+                let selected = members
+                    .iter()
+                    .filter_map(|member| {
+                        RealmFullCommitExpectedRow::try_from_inventory(member)
+                            .ok()
+                            .filter(|expected| expected.domain() == batch.domain())
+                            .map(|_| member)
+                    })
+                    .collect::<Vec<_>>();
+                anyhow::ensure!(
+                    selected.len() == 1,
+                    "Realm sync logical mutation must resolve to exactly one row in its domain",
+                );
+                for member in selected {
+                    let locator = (
+                        member
+                            .resolved()
+                            .mutation()
+                            .physical_table()
+                            .stable_id(),
+                        member.resolved().locator_bytes().to_vec(),
+                    );
+                    if let Some(previous) = unresolved.insert(locator, member.clone()) {
+                        anyhow::ensure!(
+                            previous.resolved() == member.resolved(),
+                            "Realm sync batches disagree on one physical row",
+                        );
+                    }
+                }
+            }
+        }
+
+        let reader = RealmFullCommitScyllaExecutor::prepare_with_consistency(
+            &self.session,
+            self.local_state_keyspace.clone(),
+            Consistency::Quorum,
+        ).await?;
+        let mut typed_puts = Vec::with_capacity(unresolved.len());
+        let mut maximum_writetime = expected_head.commit_write_timestamp().as_i64();
+        let mut physical_latest_checkpoint = None;
+        for member in unresolved.values() {
+            let expected = RealmFullCommitExpectedRow::try_from_inventory(member)?;
+            let observed = reader
+                .read_inventory_put_physical_optional(&self.session, member)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Realm sync metadata row is missing"))?;
+            maximum_writetime = maximum_writetime.max(observed.writetime_us());
+            if matches!(
+                member.resolved().mutation().key(),
+                TypedTableKey::U64Singleton(U64SingletonSlot::LatestCheckpoint)
+            ) {
+                let value: [u8; 8] = observed.value().try_into()
+                    .map_err(|_| anyhow::anyhow!("latest checkpoint row is malformed"))?;
+                physical_latest_checkpoint = Some(u64::from_be_bytes(value));
+            }
+            if physical_descriptor(observed.physical_table()).version_axis != VersionAxis::Singleton {
+                anyhow::ensure!(
+                    observed.value() == expected.expected_value(),
+                    "Realm sync versioned row differs from Coordinator-derived metadata",
+                );
+            }
+            let timestamp = psy_node_core::store::timestamp::CommitWriteTimestampUs::try_from_i128(
+                i128::from(observed.writetime_us()),
+            )?;
+            typed_puts.push(reseal_observed_authority_put(member, timestamp)?);
+        }
+        anyhow::ensure!(
+            physical_latest_checkpoint.is_some_and(|latest| latest >= checkpoint),
+            "normal Realm database has not durably reached the journal checkpoint",
+        );
+        let journal_timestamp = psy_node_core::store::timestamp::CommitWriteTimestampUs::try_from_i128(
+            i128::from(maximum_writetime)
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("Realm sync journal timestamp overflow"))?,
+        )?;
+        let inventory = super::realm_rollback_commit_inventory::RealmRollbackCommitInventory::try_from_realm_sync(
+            observation,
+            journal_timestamp,
+            typed_puts,
+        )?;
+        let transition = SealedAuthorityLocalHeadCas::seal_realm_sync_advance(
+            expected_head,
+            observation,
+            journal_timestamp,
+            *inventory.digest(),
+        )?;
+        let persisted = self.local_inventory.persist_prewrite(inventory).await?;
+
+        let control = BranchExactDeploymentNoTabletKeyspace::try_new(
+            self.local_control_keyspace.as_str().to_owned(),
+        )?;
+        let pipeline_store = ScyllaPendingPipelineStore::prepare(
+            self.session.clone(), control.clone(),
+        ).await?;
+        let writer_store = ScyllaBranchExactWriterLifecycleStore::prepare(
+            self.session.clone(), control,
+        ).await?;
+        let PendingPipelineReadState::Current(pipeline) = pipeline_store
+            .read::<Hash>(PendingGenerationLedgerKey::new(network, authority)).await?
+        else {
+            anyhow::bail!("Realm rollback sync pipeline is missing")
+        };
+        let BranchExactWriterReadState::Current(writer) = writer_store
+            .read::<Hash>(BranchExactWriterAuthorityKey::new(network, authority)).await?
+        else {
+            anyhow::bail!("Realm rollback sync writer is missing")
+        };
+        let committed = self.local_inventory
+            .mark_realm_sync_committed(&persisted, transition.candidate(), &pipeline, &writer)
+            .await
+            .map_err(|error| anyhow::anyhow!(
+                "Realm sync marker binding failed at checkpoint {checkpoint}: {error:?}"
+            ))?;
+        let current_head = match self.local_head.compare_and_set(&transition).await? {
+            AuthorityLocalHeadWriteOutcome::Applied(current)
+            | AuthorityLocalHeadWriteOutcome::Idempotent(current) => current,
+            AuthorityLocalHeadWriteOutcome::Conflict(_) => {
+                anyhow::bail!("Realm rollback sync local head changed concurrently")
+            }
+        };
+        anyhow::ensure!(current_head == *transition.candidate(), "Realm sync head readback mismatch");
+        self.local_inventory.revalidate_committed(&committed).await?;
+        Ok(())
     }
 
     /// Qualification-only persistence of the same immutable checkpoint-zero
@@ -780,10 +974,117 @@ impl ScyllaRealmRollbackRuntimeControl {
     }
 }
 
+fn validate_sync_batches<Hash: Q256BitHash>(
+    observation: &psy_data::protocol::chain_context::AuthorityObservation<Hash>,
+    batches: &[RealmCommitLogicalDomainBatch],
+) -> anyhow::Result<()> {
+    use RealmNormalCommitWriteDomain as D;
+    let expected_domains = [
+        D::GlobalUserTopProofAtCheckpoint,
+        D::CheckpointStateRoots,
+        D::CheckpointLeaf,
+        D::GlobalCheckpointMerkle,
+        D::CheckpointRootByHash,
+        D::CheckpointRootByCheckpoint,
+        D::L2BlockState,
+        D::LatestCheckpoint,
+        D::LatestL2BlockState,
+        D::RealmAuthorityObservation,
+    ];
+    anyhow::ensure!(
+        matches!(observation.authority(), AuthorityScope::Realm { .. })
+            && observation.state_checkpoint_id().get()
+                <= observation.chain().checkpoint().checkpoint_id().get(),
+        "Realm sync observation is invalid",
+    );
+    anyhow::ensure!(
+        batches.iter().map(RealmCommitLogicalDomainBatch::domain).eq(expected_domains),
+        "Realm sync batches are incomplete or not canonical",
+    );
+    let checkpoint = observation.chain().checkpoint().checkpoint_id().get();
+    let mut l2_value = None;
+    let mut latest_l2_value = None;
+    for batch in batches {
+        anyhow::ensure!(!batch.mutations().is_empty(), "Realm sync domain is empty");
+        if batch.domain() != D::GlobalCheckpointMerkle {
+            anyhow::ensure!(batch.mutations().len() == 1, "Realm sync singleton domain has extra rows");
+        }
+        for mutation in batch.mutations() {
+            let valid = match (batch.domain(), mutation) {
+                (D::GlobalUserTopProofAtCheckpoint, psy_node_core::store::typed::LogicalMutation::Put {
+                    key: TypedTableKey::CheckpointedObject(
+                        CheckpointedObjectKey::GlobalUserProofAtCheckpoint(value),
+                    ), ..
+                }) => value.get() == checkpoint,
+                (D::CheckpointStateRoots, psy_node_core::store::typed::LogicalMutation::Put {
+                    key: TypedTableKey::CheckpointStateRoots(value), ..
+                })
+                | (D::CheckpointLeaf, psy_node_core::store::typed::LogicalMutation::Put {
+                    key: TypedTableKey::CheckpointLeaf(value), ..
+                }) => value.get() == checkpoint,
+                (D::L2BlockState, psy_node_core::store::typed::LogicalMutation::Put {
+                    key: TypedTableKey::L2BlockState(value), value: payload,
+                }) => {
+                    l2_value = Some(payload);
+                    value.get() == checkpoint
+                }
+                (D::GlobalCheckpointMerkle, psy_node_core::store::typed::LogicalMutation::Put {
+                    key: TypedTableKey::GlobalCheckpointMerkle { checkpoint: value, .. }, ..
+                }) => value.get() == checkpoint,
+                (D::CheckpointRootByHash, psy_node_core::store::typed::LogicalMutation::CheckpointRootMapping {
+                    checkpoint: value, ..
+                })
+                | (D::CheckpointRootByCheckpoint, psy_node_core::store::typed::LogicalMutation::CheckpointRootMapping {
+                    checkpoint: value, ..
+                }) => value.get() == checkpoint,
+                (D::LatestCheckpoint, psy_node_core::store::typed::LogicalMutation::Put {
+                    key: TypedTableKey::U64Singleton(U64SingletonSlot::LatestCheckpoint),
+                    value: MutationValue::CqlU64(value),
+                }) => *value == checkpoint,
+                (D::LatestL2BlockState, psy_node_core::store::typed::LogicalMutation::Put {
+                    key: TypedTableKey::LatestInfo(LatestInfoSlot::LatestL2BlockState), value,
+                }) => {
+                    latest_l2_value = Some(value);
+                    true
+                }
+                (D::RealmAuthorityObservation, psy_node_core::store::typed::LogicalMutation::Put {
+                    key: TypedTableKey::LatestInfo(LatestInfoSlot::RealmAuthorityObservation),
+                    value: MutationValue::PsyCanonicalBytes(bytes),
+                }) => bytes.as_slice() == observation.to_canonical_bytes(),
+                _ => false,
+            };
+            anyhow::ensure!(valid, "Realm sync mutation identity mismatch");
+        }
+    }
+    anyhow::ensure!(l2_value == latest_l2_value, "Realm sync latest L2 value mismatch");
+    Ok(())
+}
+
 #[async_trait]
 impl<Hash: Q256BitHash> RealmRollbackRuntimeControl<Hash>
     for ScyllaRealmRollbackRuntimeControl
 {
+    async fn read_realm_rollback_journal_checkpoint(
+        &self,
+        network: NetworkId,
+        authority: AuthorityScope,
+    ) -> anyhow::Result<u64> {
+        let key = AuthorityTimestampKey::new(network, authority);
+        let AuthorityLocalHeadReadState::Current(head) = self.local_head.read::<Hash>(key).await?
+        else {
+            anyhow::bail!("Realm rollback journal local head is missing")
+        };
+        Ok(head.head().chain().checkpoint().checkpoint_id().get())
+    }
+
+    async fn persist_realm_sync_checkpoint(
+        &self,
+        observation: psy_data::protocol::chain_context::AuthorityObservation<Hash>,
+        batches: Vec<RealmCommitLogicalDomainBatch>,
+    ) -> anyhow::Result<()> {
+        self.persist_sync_checkpoint(observation, batches).await
+    }
+
     async fn progress_realm_rollback_participant(
         &self,
         network: NetworkId,

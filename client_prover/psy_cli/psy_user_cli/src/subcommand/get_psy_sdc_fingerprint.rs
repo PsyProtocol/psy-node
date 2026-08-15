@@ -2,7 +2,10 @@ use psy_config::network_constants::{DEFAULT_CALLER_CONTRACT_ID_U64, MAX_CONTRACT
 use psy_ups_circuit::signature::software_defined::DPNSoftwareDefinedSignatureGadget;
 use psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition;
 
-use crate::{result::{CommandResult, FingerprintResult}, subcommand::args::GetPsySdcFingerprintArgs};
+use crate::{
+    result::{CommandResult, FingerprintResult},
+    subcommand::args::GetPsySdcFingerprintArgs,
+};
 
 type F = plonky2::field::goldilocks_field::GoldilocksField;
 const D: usize = 2;
@@ -30,5 +33,7 @@ pub async fn run(args: GetPsySdcFingerprintArgs) -> anyhow::Result<CommandResult
 
     tracing::info!("register PSY software defined circuit: {}", fingerprint.to_string());
 
-    Ok(CommandResult::Fingerprint(FingerprintResult { fingerprint: fingerprint.to_string() }))
+    Ok(CommandResult::Fingerprint(FingerprintResult {
+        fingerprint: fingerprint.to_string(),
+    }))
 }

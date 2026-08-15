@@ -10,6 +10,7 @@ use std::{error::Error, fmt};
 
 use parth_core::protocol::core_types::Q256BitHash;
 use psy_data::protocol::{
+    canonical_chain::CanonicalChainRef,
     chain_context::{AuthorityObservation, AuthorityScope, AUTHORITY_OBSERVATION_V1_LEN},
 };
 
@@ -490,11 +491,64 @@ impl<Hash: Q256BitHash> StoredPendingPipeline<Hash> {
         restored_frontier: AuthorityObservation<Hash>,
         target_processed_pending_id: u64,
     ) -> Result<SealedPendingPipelineTransition<Hash>, PendingPipelineError> {
+        self.seal_rollback_reset_against_source_chain_contexts(
+            processing,
+            gathering,
+            *self.frontier.chain(),
+            restored_frontier,
+            target_processed_pending_id,
+            false,
+        )
+    }
+
+    /// Reset a Realm pipeline whose normal Coordinator-sync head is ahead of
+    /// its last Realm-work frontier. The storage owner calls this only after
+    /// the process-local actor has drained and the distributed archive/delete
+    /// barrier is durable. Consequently an in-progress generation
+    /// (`Sealing`, captured, in-flight, or empty-sealed) is abandoned suffix,
+    /// just like a `Ready` generation with no Realm work. `Baseline` and
+    /// `Blocked` remain ineligible.
+    pub fn seal_rollback_reset_from_synced_head_contexts(
+        &self,
+        processing: PendingGenerationContext,
+        gathering: PendingGenerationContext,
+        source_chain: CanonicalChainRef<Hash>,
+        restored_frontier: AuthorityObservation<Hash>,
+        target_processed_pending_id: u64,
+    ) -> Result<SealedPendingPipelineTransition<Hash>, PendingPipelineError> {
+        self.seal_rollback_reset_against_source_chain_contexts(
+            processing,
+            gathering,
+            source_chain,
+            restored_frontier,
+            target_processed_pending_id,
+            true,
+        )
+    }
+
+    fn seal_rollback_reset_against_source_chain_contexts(
+        &self,
+        processing: PendingGenerationContext,
+        gathering: PendingGenerationContext,
+        source_chain: CanonicalChainRef<Hash>,
+        restored_frontier: AuthorityObservation<Hash>,
+        target_processed_pending_id: u64,
+        allow_ready_source: bool,
+    ) -> Result<SealedPendingPipelineTransition<Hash>, PendingPipelineError> {
         self.require_unblocked()?;
         if !matches!(
             self.phase(),
             PendingProcessingPhase::Published | PendingProcessingPhase::RetiredNoWork
-        ) {
+        ) && !(allow_ready_source
+            && matches!(
+                self.phase(),
+                PendingProcessingPhase::Ready
+                    | PendingProcessingPhase::Sealing
+                    | PendingProcessingPhase::WorkCaptured
+                    | PendingProcessingPhase::InFlight
+                    | PendingProcessingPhase::EmptyQueueSealed
+            ))
+        {
             return Err(PendingPipelineError::RollbackSourceNotTerminal(self.phase()));
         }
         if restored_frontier.chain().network_id() != self.key.network()
@@ -502,7 +556,14 @@ impl<Hash: Q256BitHash> StoredPendingPipeline<Hash> {
         {
             return Err(PendingPipelineError::FrontierAuthorityMismatch);
         }
-        let source_epoch = self.frontier.chain().chain_epoch().get();
+        if source_chain.network_id() != self.key.network()
+            || source_chain.chain_epoch() != self.frontier.chain().chain_epoch()
+            || source_chain.checkpoint().checkpoint_id().get()
+                < self.frontier.chain().checkpoint().checkpoint_id().get()
+        {
+            return Err(PendingPipelineError::RollbackSourceHeadMismatch);
+        }
+        let source_epoch = source_chain.chain_epoch().get();
         let next_epoch = source_epoch
             .checked_add(1)
             .ok_or(PendingPipelineError::RollbackEpochOverflow(source_epoch))?;
@@ -512,7 +573,7 @@ impl<Hash: Q256BitHash> StoredPendingPipeline<Hash> {
                 proposed: restored_frontier.chain().chain_epoch().get(),
             });
         }
-        let source_checkpoint = self.frontier.chain().checkpoint().checkpoint_id().get();
+        let source_checkpoint = source_chain.checkpoint().checkpoint_id().get();
         let target_checkpoint = restored_frontier
             .chain()
             .checkpoint()
@@ -1329,6 +1390,7 @@ pub enum PendingPipelineError {
     PipelineBlocked,
     CounterBehindLedger { counter: u64, gathering: u64 },
     RollbackSourceNotTerminal(PendingProcessingPhase),
+    RollbackSourceHeadMismatch,
     RollbackEpochOverflow(u64),
     RollbackEpochNotNext { expected: u64, proposed: u64 },
     RollbackTargetNotBeforeCurrent { current: u64, target: u64 },
@@ -1720,6 +1782,64 @@ mod tests {
             ),
             Err(PendingPipelineError::RollbackProcessedPendingAdvanced { .. })
         ));
+    }
+
+    #[test]
+    fn rollback_reset_accepts_ready_pipeline_behind_exact_realm_sync_head() {
+        let ready = bootstrap()
+            .candidate()
+            .seal_rotation(
+                ReservedPendingGeneration::try_from_prefix(12, prefix()).unwrap(),
+            )
+            .unwrap()
+            .candidate()
+            .clone();
+        assert_eq!(ready.phase(), PendingProcessingPhase::Ready);
+        assert_eq!(
+            ready.frontier().chain().checkpoint().checkpoint_id().get(),
+            8
+        );
+        let source_chain = *observation(14, 8, 80).chain();
+        let restored = observation_custom(key().authority(), 1, 0, 0, 0, 10);
+        let sealed = ready
+            .seal_rollback_reset_from_synced_head_contexts(
+                context(20),
+                context(21),
+                source_chain,
+                restored,
+                0,
+            )
+            .unwrap();
+        assert_eq!(sealed.candidate().phase(), PendingProcessingPhase::Ready);
+        assert_eq!(sealed.candidate().frontier(), &restored);
+        assert_eq!(sealed.candidate().processed_pending_id(), 0);
+        assert!(matches!(
+            ready.seal_rollback_reset_from_synced_head_contexts(
+                context(20),
+                context(21),
+                *observation(7, 7, 70).chain(),
+                restored,
+                0,
+            ),
+            Err(PendingPipelineError::RollbackSourceHeadMismatch)
+        ));
+
+        let sealing = ready
+            .seal_begin_queue_close(close(9))
+            .unwrap()
+            .candidate()
+            .clone();
+        let reset = sealing
+            .seal_rollback_reset_from_synced_head_contexts(
+                context(22),
+                context(23),
+                source_chain,
+                observation_custom(key().authority(), 1, 0, 0, 0, 10),
+                0,
+            )
+            .unwrap();
+        assert_eq!(reset.candidate().phase(), PendingProcessingPhase::Ready);
+        assert_eq!(reset.candidate().processing(), context(22));
     }
 
     #[test]

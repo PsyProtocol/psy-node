@@ -21,8 +21,8 @@ pub async fn run(args: CompileArgs) -> anyhow::Result<()> {
             .map_err(|error| anyhow::anyhow!("failed to compile crate source {}: {:#}", source_path.display(), error))?
     } else {
         tracing::info!("compiling single file");
-        let source = fs::read_to_string(source_path)
-            .map_err(|error| anyhow::anyhow!("failed to read source file {}: {}", source_path.display(), error))?;
+        let source =
+            fs::read_to_string(source_path).map_err(|error| anyhow::anyhow!("failed to read source file {}: {}", source_path.display(), error))?;
         psy_prover::session::compile_bridge::compile_contract_output(&source)
             .map_err(|error| anyhow::anyhow!("failed to compile source {}: {:#}", source_path.display(), error))?
     };

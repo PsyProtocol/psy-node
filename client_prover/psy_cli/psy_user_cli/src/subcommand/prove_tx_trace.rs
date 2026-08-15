@@ -102,12 +102,7 @@ pub async fn run(args: ProveTxTraceArgs) -> anyhow::Result<CommandResult> {
     let user_pk_hash = wallet_session.add_user(info.private_key, info.fingerprint).await?;
     let tx_hash = wallet_session.prove_tx_trace(user_pk_hash, &trace).await?;
     let end_user_leaf_hash = trace.finalization.submit_end_cap_input.core.state_transition.end_user_leaf_hash;
-    let proved = psy_prover::trace::ProvedTxResultJson::new(
-        envelope.sig_hash,
-        tx_hash.to_string(),
-        None,
-        "submitted".to_string(),
-    );
+    let proved = psy_prover::trace::ProvedTxResultJson::new(envelope.sig_hash, tx_hash.to_string(), None, "submitted".to_string());
     let rendered = serde_json::to_string_pretty(&proved)?;
     println!("{}", rendered);
     if let Some(path) = &args.output {

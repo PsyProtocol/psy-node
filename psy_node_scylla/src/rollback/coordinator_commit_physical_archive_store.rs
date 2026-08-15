@@ -1362,19 +1362,7 @@ impl ScyllaCoordinatorCommitPhysicalArchiveOwner {
             }
         };
         let floor_checkpoint = catalog.floor().floor().checkpoint().checkpoint_id().get();
-        if target_checkpoint == 0 && floor_checkpoint == 0 {
-            CoordinatorCommitTargetRestorePayload::try_from_genesis_anchor(
-                scope.archiving_head,
-                scope.target,
-                *catalog.digest(),
-                store.fingerprint,
-                completion.completion.slot,
-                completion.completion.digest,
-                catalog.floor(),
-                &target_l2,
-            )
-            .map_err(Into::into)
-        } else if target_checkpoint > floor_checkpoint {
+        if target_checkpoint > floor_checkpoint {
             let source = self
                 .commit_sources
                 .read_source(&scope.target)
@@ -1434,6 +1422,7 @@ impl ScyllaCoordinatorCommitPhysicalArchiveOwner {
                 completion.completion.digest,
                 catalog.floor(),
                 &anchor,
+                &target_l2,
             )
             .map_err(Into::into)
         } else {

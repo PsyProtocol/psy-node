@@ -62,7 +62,6 @@ fn parse_cli(args: Vec<String>) -> anyhow::Result<Option<Cli>> {
     }
 }
 
-
 fn normalized_path(path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -161,13 +160,21 @@ fn command_paths(cli: &Cli) -> Vec<&str> {
     let mut paths = Vec::new();
     match &cli.command {
         Commands::Wallet(args) => match &args.command {
-            WalletCommands::Create { output, wallet, .. } => { push_wallet_paths(&mut paths, wallet); paths.extend(output.as_deref()); }
+            WalletCommands::Create { output, wallet, .. } => {
+                push_wallet_paths(&mut paths, wallet);
+                paths.extend(output.as_deref());
+            }
             WalletCommands::Load { wallet } | WalletCommands::Info { wallet } => push_wallet_paths(&mut paths, wallet),
             WalletCommands::List { keystore_dir } => paths.extend(keystore_dir.as_deref()),
             WalletCommands::Random { .. } | WalletCommands::SdKeyFingerprint { .. } => {}
         },
         Commands::RegisterUser(args) => push_wallet_paths(&mut paths, &args.wallet),
-        Commands::DeployContract(args) => { push_wallet_paths(&mut paths, &args.wallet); paths.extend([args.rpc_config.as_str(), args.contract_path.as_str()]); paths.extend(args.output_path.as_deref()); paths.extend(args.abi_path.as_deref()); }
+        Commands::DeployContract(args) => {
+            push_wallet_paths(&mut paths, &args.wallet);
+            paths.extend([args.rpc_config.as_str(), args.contract_path.as_str()]);
+            paths.extend(args.output_path.as_deref());
+            paths.extend(args.abi_path.as_deref());
+        }
         Commands::Call(args) => push_session_paths(&mut paths, args),
         Commands::GetUserId(args) => paths.push(&args.rpc_config),
         Commands::GetUserEventData(args) => paths.push(&args.rpc_config),
@@ -207,24 +214,64 @@ fn command_paths(cli: &Cli) -> Vec<&str> {
         Commands::ProveProxy(args) => paths.push(&args.rpc_config),
         Commands::FaucetServer(args) => paths.push(&args.rpc_config),
         Commands::GetClaimAmount(args) => paths.push(&args.rpc_config),
-        Commands::BatchClaim(args) => { push_wallet_paths(&mut paths, &args.wallet); paths.extend([args.rpc_config.as_str(), args.input.as_str()]); paths.extend(args.trace_out.as_deref()); }
-        Commands::Tx(args) => match &args.command { TxCommands::GetStatus(args) => paths.push(&args.rpc_config) },
+        Commands::BatchClaim(args) => {
+            push_wallet_paths(&mut paths, &args.wallet);
+            paths.extend([args.rpc_config.as_str(), args.input.as_str()]);
+            paths.extend(args.trace_out.as_deref());
+        }
+        Commands::Tx(args) => match &args.command {
+            TxCommands::GetStatus(args) => paths.push(&args.rpc_config),
+        },
         Commands::GetCheckpointIdForUniquePendingId(args) => paths.push(&args.rpc_config),
-        Commands::GenerateBatchProofMinerRewardProofs(args) => paths.extend([args.rpc_config.as_str(), args.jobs_file.as_str(), args.output_file.as_str()]),
-        Commands::ClaimRewards(args) => { push_wallet_paths(&mut paths, &args.wallet); paths.extend([args.rpc_config.as_str(), args.jobs_file.as_str()]); }
+        Commands::GenerateBatchProofMinerRewardProofs(args) => {
+            paths.extend([args.rpc_config.as_str(), args.jobs_file.as_str(), args.output_file.as_str()])
+        }
+        Commands::ClaimRewards(args) => {
+            push_wallet_paths(&mut paths, &args.wallet);
+            paths.extend([args.rpc_config.as_str(), args.jobs_file.as_str()]);
+        }
         Commands::GetPsySdcFingerprint(args) => paths.push(&args.sdc_path),
         Commands::GetUserEndCapCommonData => {}
-        Commands::Compile(args) => { paths.push(&args.source); paths.extend(args.output_dir.as_deref()); }
-        Commands::CompileAndDeploy(args) => { paths.extend([args.source.as_str(), args.rpc_config.as_str()]); paths.extend(args.output_dir.as_deref()); }
-        Commands::Simulate(args) => { paths.extend(args.source.as_deref()); paths.extend(args.circuit_defs_path.as_deref()); paths.extend(args.abi_path.as_deref()); }
-        Commands::GenerateTxTrace(args) => { push_session_paths(&mut paths, &args.session); paths.extend([args.session.rpc_config.as_str(), args.output.as_str()]); }
-        Commands::ProveTxTrace(args) => { push_session_paths(&mut paths, &args.session); paths.extend([args.session.rpc_config.as_str(), args.input.as_str()]); paths.extend(args.output.as_deref()); }
+        Commands::Compile(args) => {
+            paths.push(&args.source);
+            paths.extend(args.output_dir.as_deref());
+        }
+        Commands::CompileAndDeploy(args) => {
+            paths.extend([args.source.as_str(), args.rpc_config.as_str()]);
+            paths.extend(args.output_dir.as_deref());
+        }
+        Commands::Simulate(args) => {
+            paths.extend(args.source.as_deref());
+            paths.extend(args.circuit_defs_path.as_deref());
+            paths.extend(args.abi_path.as_deref());
+        }
+        Commands::GenerateTxTrace(args) => {
+            push_session_paths(&mut paths, &args.session);
+            paths.extend([args.session.rpc_config.as_str(), args.output.as_str()]);
+        }
+        Commands::ProveTxTrace(args) => {
+            push_session_paths(&mut paths, &args.session);
+            paths.extend([args.session.rpc_config.as_str(), args.input.as_str()]);
+            paths.extend(args.output.as_deref());
+        }
         Commands::PrivateTransfer(args) => paths.extend([args.rpc_config.as_str(), args.output.as_str()]),
-        Commands::PrivateClaim(args) => { paths.push(&args.rpc_config); paths.extend(args.note_proof.as_deref()); }
+        Commands::PrivateClaim(args) => {
+            paths.push(&args.rpc_config);
+            paths.extend(args.note_proof.as_deref());
+        }
         Commands::DeriveNoteOwner(args) => paths.push(&args.rpc_config),
-        Commands::ClaimDeposit(args) => { push_wallet_paths(&mut paths, &args.wallet); paths.extend([args.rpc_config.as_str(), args.deposit_proof.as_str()]); }
-        Commands::Withdraw(args) => { push_wallet_paths(&mut paths, &args.wallet); paths.push(&args.rpc_config); }
-        Commands::Deposit(args) => { paths.push(&args.rpc_config); paths.extend(args.deposit_proof_output.as_deref()); }
+        Commands::ClaimDeposit(args) => {
+            push_wallet_paths(&mut paths, &args.wallet);
+            paths.extend([args.rpc_config.as_str(), args.deposit_proof.as_str()]);
+        }
+        Commands::Withdraw(args) => {
+            push_wallet_paths(&mut paths, &args.wallet);
+            paths.push(&args.rpc_config);
+        }
+        Commands::Deposit(args) => {
+            paths.push(&args.rpc_config);
+            paths.extend(args.deposit_proof_output.as_deref());
+        }
         Commands::ClaimWithdrawal(args) => paths.push(&args.rpc_config),
         Commands::ExportPrivateKey(args) => paths.push(&args.keystore_path),
     }
@@ -260,7 +307,9 @@ fn reject_command_path_conflicts(cli: &Cli) -> anyhow::Result<()> {
 }
 
 fn reject_result_path_conflict(cli: &Cli) -> anyhow::Result<()> {
-    let Some(result_file) = cli.result_file.as_deref() else { return Ok(()); };
+    let Some(result_file) = cli.result_file.as_deref() else {
+        return Ok(());
+    };
     let comparable_result = comparable_path(result_file)?;
     for path in command_paths(cli) {
         anyhow::ensure!(
@@ -276,9 +325,7 @@ fn reject_legacy_deploy_fingerprint_env(args: &[String]) -> anyhow::Result<()> {
     let is_deploy = args.iter().any(|arg| arg == "deploy-contract");
     let has_explicit_fingerprint = args.iter().any(|arg| arg == "--fingerprint" || arg.starts_with("--fingerprint="));
     if is_deploy && !has_explicit_fingerprint && std::env::var_os("FINGERPRINT").is_some() {
-        anyhow::bail!(
-            "deploy-contract no longer reads FINGERPRINT implicitly; pass --fingerprint explicitly with the intended --sign-type"
-        );
+        anyhow::bail!("deploy-contract no longer reads FINGERPRINT implicitly; pass --fingerprint explicitly with the intended --sign-type");
     }
     Ok(())
 }
