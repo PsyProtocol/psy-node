@@ -35,10 +35,11 @@ use psy_data::{
         aggregate_signatures, bitmap_get, bitmap_set, sha256, vote_message, BlsPublicKey,
         BlsSecretKey, BlsSignature, Certificate, ProtocolError, ProtocolReader, ProtocolResult,
         Proposal, Vote, MAX_BACKUP_BYTES, MAX_FINALIZER_OUTPUT_BYTES, MAX_FINALIZER_PROOF_BYTES,
-        MAX_PROPOSAL_BODY_BYTES, MAX_VALIDATORS_PER_REALM, MIN_VALIDATORS_PER_REALM,
-        replication_threshold,
+        MAX_INCLUSION_LAG_CHECKPOINTS, MAX_PROPOSAL_BODY_BYTES, MAX_VALIDATORS_PER_REALM,
+        MIN_VALIDATORS_PER_REALM, replication_threshold,
     },
 };
+use std::collections::HashSet;
 use super::gatherers::realm_end_cap_gatherer::REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_BYTES;
 
 /// Decoded proposal body: the three length-prefixed sections in wire order.
@@ -200,6 +201,9 @@ where
         proposal.compute_proposal_id() == proposal.proposal_id,
         "proposal_id does not match canonical Proposal fields"
     );
+    require_nonzero_validator_tree_root(&proposal.validator_tree_root)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+
     let decoded = decode_proposal_body(proposal, body)
         .map_err(|error| anyhow::anyhow!("invalid Proposal body: {error}"))?;
     let output: RealmFinalizeGUTAPublicOutput<N::F, N::QHash> =
@@ -339,6 +343,9 @@ pub fn validate_certificate(
     {
         return Err(ProtocolError::Message("certificate does not match proposal"));
     }
+    require_nonzero_validator_tree_root(&proposal.validator_tree_root)?;
+    require_nonzero_validator_tree_root(&certificate.validator_tree_root)?;
+
 
     let threshold = replication_threshold(n);
     let popcount = certificate
@@ -379,6 +386,58 @@ pub fn validate_certificate(
         .aggregated_signature
         .fast_aggregate_verify(&message, &keys)?;
     Ok(())
+}
+
+/// Reject a GUTA Proposal whose `validator_tree_root` is all zeros: the zero
+/// root is not a committed validator tree and must never be admitted as a
+/// proof-base root.
+pub fn require_nonzero_validator_tree_root(root: &[u8; 32]) -> Result<(), ProtocolError> {
+    if root.iter().all(|byte| *byte == 0) {
+        return Err(ProtocolError::Message("validator_tree_root is zero"));
+    }
+    Ok(())
+}
+
+/// True when the Proposal's `validator_tree_root` matches the validator tree
+/// root authenticated at the proof-base checkpoint.
+pub fn validator_tree_root_matches_proof_base(
+    proposal_root: &[u8; 32],
+    proof_base_root: &[u8; 32],
+) -> bool {
+    proposal_root == proof_base_root
+}
+
+/// Inclusion lag of a GUTA Proposal proof-base checkpoint against the
+/// coordinator's inclusion checkpoint: the proof base must strictly precede
+/// inclusion (`lag >= 1`) and must not be older than
+/// [`MAX_INCLUSION_LAG_CHECKPOINTS`]. Returns `Some(lag)` when admissible.
+pub fn inclusion_lag_within_limit(
+    base_checkpoint_id: u64,
+    inclusion_checkpoint_id: u64,
+) -> Option<u64> {
+    inclusion_checkpoint_id
+        .checked_sub(base_checkpoint_id)
+        .filter(|lag| (1..=MAX_INCLUSION_LAG_CHECKPOINTS).contains(lag))
+}
+
+/// True when the certificate's signer set includes the proposal's proposer.
+pub fn certificate_includes_proposer(certificate: &Certificate, proposer_sub_id: u16) -> bool {
+    certificate.signer_sub_ids().contains(&proposer_sub_id)
+}
+
+/// True when the collected votes satisfy the proposal's replication wait:
+/// at least `replication_threshold(n)` distinct signers and — for realms with
+/// two or more validators — at least one signer other than the proposer (a
+/// proposal must not be certified by the proposer alone).
+pub fn votes_meet_wait(n: usize, proposer_sub_id: u16, signer_sub_ids: &[u16]) -> bool {
+    let unique: HashSet<u16> = signer_sub_ids.iter().copied().collect();
+    if unique.len() < replication_threshold(n) {
+        return false;
+    }
+    if n >= 2 && !unique.iter().any(|sub_id| *sub_id != proposer_sub_id) {
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -516,7 +575,7 @@ mod tests {
         let (secrets, keys) = build_roster(&occupied);
         let (output, proof, backup) = sample_body_sections();
         let (proposal, _body) =
-            proposal_with_body(7, 3, 99, 1, [0u8; 32], &output, &proof, &backup);
+            proposal_with_body(7, 3, 99, 1, [1u8; 32], &output, &proof, &backup);
 
         // Two signers meets the threshold.
         let votes = signed_votes(&secrets[..2], &occupied[..2], &proposal);
@@ -539,7 +598,7 @@ mod tests {
         let (secrets, keys) = build_roster(&occupied);
         let (output, proof, backup) = sample_body_sections();
         let (proposal, _body) =
-            proposal_with_body(7, 3, 99, 1, [0u8; 32], &output, &proof, &backup);
+            proposal_with_body(7, 3, 99, 1, [1u8; 32], &output, &proof, &backup);
 
         // Forge a vote from a sub-id that is not in the occupied roster and
         // aggregate it with the two honest votes.
@@ -565,7 +624,7 @@ mod tests {
         let (secrets, keys) = build_roster(&occupied);
         let (output, proof, backup) = sample_body_sections();
         let (proposal, _body) =
-            proposal_with_body(7, 3, 99, 1, [0u8; 32], &output, &proof, &backup);
+            proposal_with_body(7, 3, 99, 1, [1u8; 32], &output, &proof, &backup);
 
         // Build a structurally valid aggregate (real G2 point) that signs the
         // same vote_message with three OUTSIDER keys, so it is a legitimate
@@ -595,13 +654,13 @@ mod tests {
         let (secrets, keys) = build_roster(&occupied);
         let (output, proof, backup) = sample_body_sections();
         let (proposal, _body) =
-            proposal_with_body(7, 3, 99, 1, [0u8; 32], &output, &proof, &backup);
+            proposal_with_body(7, 3, 99, 1, [1u8; 32], &output, &proof, &backup);
 
         let votes = signed_votes(&secrets, &occupied, &proposal);
         let cert = form_certificate(&proposal, &votes).expect("form");
 
         // A different proposal with the same body but a different proof-base checkpoint.
-        let (other, _) = proposal_with_body(7, 3, 200, 1, [0u8; 32], &output, &proof, &backup);
+        let (other, _) = proposal_with_body(7, 3, 200, 1, [1u8; 32], &output, &proof, &backup);
         let err = validate_certificate(&other, &cert, &occupied, &keys).unwrap_err();
         assert_eq!(
             err,
@@ -615,7 +674,7 @@ mod tests {
         let (secrets, _keys) = build_roster(&occupied);
         let (output, proof, backup) = sample_body_sections();
         let (proposal, _body) =
-            proposal_with_body(7, 3, 99, 1, [0u8; 32], &output, &proof, &backup);
+            proposal_with_body(7, 3, 99, 1, [1u8; 32], &output, &proof, &backup);
 
         let v1 = sign_vote(&secrets[0], 1, &proposal);
         let dup = sign_vote(&secrets[1], 1, &proposal);
@@ -626,5 +685,96 @@ mod tests {
         let bad = sign_vote(&secrets[0], 300, &proposal);
         let err = form_certificate(&proposal, &[(300, bad.signature)]).unwrap_err();
         assert_eq!(err, ProtocolError::Message("signer sub_id exceeds 255"));
+    }
+
+    #[test]
+    fn require_nonzero_validator_tree_root_rejects_zero_root() {
+        let err = require_nonzero_validator_tree_root(&[0u8; 32]).unwrap_err();
+        assert_eq!(err, ProtocolError::Message("validator_tree_root is zero"));
+
+        let mut one_byte = [0u8; 32];
+        one_byte[31] = 0x01;
+        assert!(require_nonzero_validator_tree_root(&one_byte).is_ok());
+        assert!(require_nonzero_validator_tree_root(&[1u8; 32]).is_ok());
+    }
+
+    #[test]
+    fn validator_tree_root_matches_proof_base_checks_equality() {
+        assert!(validator_tree_root_matches_proof_base(&[7u8; 32], &[7u8; 32]));
+        assert!(!validator_tree_root_matches_proof_base(&[7u8; 32], &[8u8; 32]));
+        // The all-zero root never matches a real committed proof-base root.
+        assert!(!validator_tree_root_matches_proof_base(&[0u8; 32], &[7u8; 32]));
+    }
+
+    #[test]
+    fn inclusion_lag_within_limit_accepts_one_to_max() {
+        assert_eq!(inclusion_lag_within_limit(10, 11), Some(1));
+        assert_eq!(inclusion_lag_within_limit(10, 26), Some(16));
+    }
+
+    #[test]
+    fn inclusion_lag_within_limit_rejects_zero_lag() {
+        // The proof base must strictly precede the inclusion checkpoint.
+        assert_eq!(inclusion_lag_within_limit(10, 10), None);
+    }
+
+    #[test]
+    fn inclusion_lag_within_limit_rejects_lag_beyond_max_and_underflow() {
+        // lag 17 > MAX_INCLUSION_LAG_CHECKPOINTS (16).
+        assert_eq!(inclusion_lag_within_limit(10, 27), None);
+        // A proof base after the inclusion checkpoint cannot compute a lag.
+        assert_eq!(inclusion_lag_within_limit(20, 10), None);
+    }
+
+    #[test]
+    fn certificate_includes_proposer_requires_proposer_signature() {
+        let occupied: [u16; 3] = [1, 2, 3];
+        let (secrets, _keys) = build_roster(&occupied);
+        let (output, proof, backup) = sample_body_sections();
+        let (proposal, _body) =
+            proposal_with_body(7, 3, 99, 1, [1u8; 32], &output, &proof, &backup);
+
+        // Votes from sub-ids 2 and 3 only: the proposer (sub-id 1) is absent.
+        let votes = signed_votes(&secrets[1..], &occupied[1..], &proposal);
+        let cert = form_certificate(&proposal, &votes).expect("form");
+        assert!(!certificate_includes_proposer(&cert, 1));
+        assert!(certificate_includes_proposer(&cert, 2));
+
+        // Full roster including the proposer.
+        let all_votes = signed_votes(&secrets, &occupied, &proposal);
+        let full = form_certificate(&proposal, &all_votes).expect("form");
+        assert!(certificate_includes_proposer(&full, 1));
+    }
+
+    #[test]
+    fn votes_meet_wait_requires_non_proposer_signer_when_n_is_two() {
+        // n = 2: the replication threshold is 1, but the proposer alone must
+        // not certify its own proposal.
+        assert!(!votes_meet_wait(2, 1, &[1]));
+        assert!(!votes_meet_wait(2, 1, &[1, 1]));
+        assert!(votes_meet_wait(2, 1, &[1, 2]));
+    }
+
+    #[test]
+    fn votes_meet_wait_proposer_only_is_enough_when_n_is_one() {
+        assert!(votes_meet_wait(1, 1, &[1]));
+    }
+
+    #[test]
+    fn votes_meet_wait_enforces_replication_threshold() {
+        // n = 3: ceil(3/2) = 2 distinct signers required.
+        assert!(!votes_meet_wait(3, 1, &[1]));
+        assert!(!votes_meet_wait(3, 1, &[1, 1])); // duplicates do not count twice
+        assert!(votes_meet_wait(3, 1, &[1, 2]));
+        assert!(votes_meet_wait(3, 1, &[2, 3]));
+    }
+
+    #[test]
+    fn votes_meet_wait_duplicate_signer_does_not_count_twice() {
+        // Three reported votes from two distinct signers still satisfy the
+        // n = 3 wait (threshold 2) with a non-proposer signer.
+        assert!(votes_meet_wait(3, 1, &[1, 1, 2]));
+        // n = 2 with only duplicated proposer votes has no non-proposer signer.
+        assert!(!votes_meet_wait(2, 1, &[1, 1]));
     }
 }

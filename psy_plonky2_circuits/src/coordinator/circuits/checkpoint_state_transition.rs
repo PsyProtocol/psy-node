@@ -10,7 +10,7 @@ use plonky2::{
     }
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
-use psy_data::{protocol::{checkpoint_transition_hash::{CheckpointStateHashTransition, CheckpointStateTransitionPublicInputs}, circuit_inputs::checkpoint_transition::QCQEDCheckpointStateTransitionInput}, v1::qdata::checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf}, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse};
+use psy_data::{guta::realm_finalize::VALIDATOR_TREE_HEIGHT, protocol::{checkpoint_transition_hash::{CheckpointStateHashTransition, CheckpointStateTransitionPublicInputs}, circuit_inputs::checkpoint_transition::QCQEDCheckpointStateTransitionInput}, v1::qdata::checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf}, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse};
 use psy_plonky2_basic_helpers::{
     builder::pad_circuit::CircuitBuilderQEDCommonGates, verifier::circuit_library::CircuitInfoLibrary,
 
@@ -49,6 +49,7 @@ impl<C: GenericConfig<D>, const D: usize> QEDCheckpointStateTransitionCircuit<C,
 where
     C::Hasher: AlgebraicHasher<C::F>
         + MerkleZeroHasher<HashOut<C::F>>
+        + MerkleZeroHasher<QHashOut<C::F>>
         + FieldQHasher<C::F, QHashOut<C::F>>,
     C::F: QFelt64,
     QHashOut<C::F>: QHashBase + QFHashBase<C::F>,
@@ -436,8 +437,8 @@ where
         let todo_add_withdrawals_root = QHashOut::<C::F>::from_string_or_panic(
             "d65af5933a094e8329332a714327ba72b1e4dac93c0cde8ee479b9bb36c3fc43",
         );
-        let todo_validator_tree_root = QHashOut::<C::F>::from_string_or_panic(
-            "0000000000000000000000000000000000000000000000000000000000000000",
+        let validator_tree_root = <C::Hasher as MerkleZeroHasher<QHashOut<C::F>>>::get_zero_hash(
+            VALIDATOR_TREE_HEIGHT,
         );
         let old_state_roots = PQEDCheckpointGlobalStateRoots {
             contract_tree_root: witness.partial.part_1_header.deploy_contracts_state_transition.state_transition_start,
@@ -445,7 +446,7 @@ where
             user_tree_root: witness.partial.part_1_header.guta_proof_header.state_transition.old_node_value,
             withdrawal_tree_root: todo_add_withdrawals_root,
             user_registration_tree_root: witness.partial.part_1_header.register_users_state_transition.state_transition_start,
-            validator_tree_root: todo_validator_tree_root,
+            validator_tree_root,
         };
         /*let new_state_roots = PQEDCheckpointGlobalStateRoots {
             contract_tree_root: witness.partial.part_1_header.deploy_contracts_state_transition.state_transition_end,

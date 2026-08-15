@@ -177,6 +177,7 @@ impl<
     }
     pub async fn handle_p2p_end_cap_received(
         &self,
+        source: NodeId,
         header: EndCapForwardHeader,
         input: Vec<u8>,
         proof: Vec<u8>,
@@ -186,7 +187,7 @@ impl<
         N::ZKProof: 'static,
     {
         let checkpoint_id = header.checkpoint_id;
-        match self.accept_forwarded_end_cap(header, input, proof).await {
+        match self.accept_forwarded_end_cap(source, header, input, proof).await {
             Ok(end_cap_id) => {
                 tracing::info!(
                     "realm P2P EndCap accepted end_cap_id={} checkpoint={}",
@@ -208,6 +209,7 @@ impl<
 
     async fn accept_forwarded_end_cap(
         &self,
+        source: NodeId,
         header: EndCapForwardHeader,
         input: Vec<u8>,
         proof: Vec<u8>,
@@ -216,48 +218,21 @@ impl<
         N::ZKVerifier: 'static,
         N::ZKProof: 'static,
     {
-        if header.chain_id != self.chain_id {
-            anyhow::bail!(
-                "forwarded EndCap chain_id {} does not match local {}",
-                header.chain_id,
-                self.chain_id
-            );
-        }
-        if header.realm_id != self.realm_id_u64 as u32 {
-            anyhow::bail!(
-                "forwarded EndCap realm_id {} does not match local {}",
-                header.realm_id,
-                self.realm_id_u64
-            );
-        }
-        if header.end_cap_input_len as usize != input.len() {
-            anyhow::bail!(
-                "forwarded EndCap input length {} does not match header {}",
-                input.len(),
-                header.end_cap_input_len
-            );
-        }
-        if header.proof_len as usize != proof.len() {
-            anyhow::bail!(
-                "forwarded EndCap proof length {} does not match header {}",
-                proof.len(),
-                header.proof_len
-            );
-        }
-        let user_end_cap_input =
-            SubmitUserEndCapNonProofInput::<N::F, N::QHash>::psy_ser_from_slice(&input)?;
-        let input_hash = sha256(&input);
-        let proof_hash = sha256(&proof);
-        let expected_end_cap_id = compute_end_cap_id(
+        let proposer_node_ids = self
+            .proposer_node_ids
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("forwarded EndCap Realm edge identity roster is missing"))?;
+        validate_forwarded_end_cap(
+            source,
+            &header,
+            &input,
+            &proof,
             self.chain_id,
             self.realm_id_u64 as u32,
-            header.checkpoint_id,
-            &input_hash,
-            &proof_hash,
-        );
-        if expected_end_cap_id != header.end_cap_id {
-            anyhow::bail!("forwarded EndCap id does not match canonical hash");
-        }
+            proposer_node_ids,
+        )?;
+        let user_end_cap_input =
+            SubmitUserEndCapNonProofInput::<N::F, N::QHash>::psy_ser_from_slice(&input)?;
         self.handle_user_end_cap_proof_submission(user_end_cap_input, proof, false)
             .await?;
         Ok(header.end_cap_id)
@@ -354,6 +329,120 @@ impl<
 
         Ok(miner_proofs)
     }
+}
+
+/// Pure validation for a forwarded EndCap header against the local Realm
+/// identity: the source must be an occupied roster NodeId, chain/realm must
+/// match the local instance, input/proof lengths must match the header, and
+/// the header `end_cap_id` must equal the canonical hash of the payload.
+/// Returns the validated `end_cap_id` on success.
+fn validate_forwarded_end_cap(
+    source: NodeId,
+    header: &EndCapForwardHeader,
+    input: &[u8],
+    proof: &[u8],
+    local_chain_id: u32,
+    local_realm_id: u32,
+    proposer_node_ids: &HashMap<u16, NodeId>,
+) -> anyhow::Result<[u8; 32]> {
+    anyhow::ensure!(
+        proposer_node_ids.values().any(|node_id| node_id == &source),
+        "forwarded EndCap source NodeId {source} is not an occupied Realm identity"
+    );
+    if header.chain_id != local_chain_id {
+        anyhow::bail!(
+            "forwarded EndCap chain_id {} does not match local {}",
+            header.chain_id,
+            local_chain_id
+        );
+    }
+    if header.realm_id != local_realm_id {
+        anyhow::bail!(
+            "forwarded EndCap realm_id {} does not match local {}",
+            header.realm_id,
+            local_realm_id
+        );
+    }
+    if header.end_cap_input_len as usize != input.len() {
+        anyhow::bail!(
+            "forwarded EndCap input length {} does not match header {}",
+            input.len(),
+            header.end_cap_input_len
+        );
+    }
+    if header.proof_len as usize != proof.len() {
+        anyhow::bail!(
+            "forwarded EndCap proof length {} does not match header {}",
+            proof.len(),
+            header.proof_len
+        );
+    }
+    let input_hash = sha256(input);
+    let proof_hash = sha256(proof);
+    let expected_end_cap_id = compute_end_cap_id(
+        local_chain_id,
+        local_realm_id,
+        header.checkpoint_id,
+        &input_hash,
+        &proof_hash,
+    );
+    if expected_end_cap_id != header.end_cap_id {
+        anyhow::bail!("forwarded EndCap id does not match canonical hash");
+    }
+    Ok(header.end_cap_id)
+}
+
+/// Pure equality check of the EndCap `start_user_leaf_hash` against the
+/// expected current user leaf hash. Preserves the production log/error text.
+fn ensure_start_user_leaf_hash<QHash: PartialEq + std::fmt::Debug>(
+    supplied: &QHash,
+    expected: &QHash,
+) -> anyhow::Result<()> {
+    if supplied != expected {
+        tracing::error!(
+            "Invalid start_user_leaf_hash, left: {:?}, right: {:?}",
+            supplied,
+            expected
+        );
+        anyhow::bail!(
+            "Invalid start_user_leaf_hash, left: {:?}, right: {:?}",
+            supplied,
+            expected
+        );
+    }
+    Ok(())
+}
+
+/// Pure Realm P2P EndCap forward routing for a target checkpoint: returns
+/// `Some((proposer_sub_id, dest NodeId))` when the local instance is NOT the
+/// scheduled proposer, `None` when rotation is disabled or the local instance
+/// IS the scheduled proposer (local intake).
+fn resolve_end_cap_forward_dest(
+    realm_id: u32,
+    local_sub_id: u16,
+    target_checkpoint_id: u64,
+    anchor_seed: parth_common::realm_rotation::RotationAnchorSeed,
+    rotation: &RealmRotationConfig,
+    proposer_node_ids: &HashMap<u16, NodeId>,
+) -> anyhow::Result<Option<(u16, NodeId)>> {
+    if !rotation.is_enabled() {
+        return Ok(None);
+    }
+    let proposer = rotation
+        .proposer_sub_id(realm_id, target_checkpoint_id, anchor_seed)?
+        .ok_or_else(|| anyhow::anyhow!(
+            "rotation enabled but proposer_sub_id returned None for realm {} target {}",
+            realm_id,
+            target_checkpoint_id,
+        ))?;
+    if proposer == local_sub_id {
+        return Ok(None);
+    }
+    let dest = proposer_node_ids
+        .get(&proposer)
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("no NodeId for scheduled proposer sub_id {proposer}"))?;
+    Ok(Some((proposer, dest)))
 }
 
 impl<
@@ -512,18 +601,10 @@ impl<
             old_user_leaf.qfhash::<N::HasherBase>()
         };
         
-        if user_end_cap_input.core.state_transition.start_user_leaf_hash != old_leaf_hash {
-            tracing::error!(
-                "Invalid start_user_leaf_hash, left: {:?}, right: {:?}",
-                user_end_cap_input.core.state_transition.start_user_leaf_hash,
-                old_leaf_hash
-            );
-            anyhow::bail!(
-                "Invalid start_user_leaf_hash, left: {:?}, right: {:?}",
-                user_end_cap_input.core.state_transition.start_user_leaf_hash,
-                old_leaf_hash
-            );
-        }
+        ensure_start_user_leaf_hash(
+            &user_end_cap_input.core.state_transition.start_user_leaf_hash,
+            &old_leaf_hash,
+        )?;
 
         let checkpoint_tree_proof: MerkleProofCore<N::QHash> = self
             .db_reader
@@ -610,18 +691,14 @@ impl<
                     felts[2].to_u64_value(),
                     felts[3].to_u64_value(),
                 ];
-                let proposer = rotation
-                    .proposer_sub_id(self.realm_id_u64 as u32, target, seed)?
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "rotation enabled but proposer_sub_id returned None for realm {} target {}",
-                        self.realm_id_u64,
-                        target,
-                    ))?;
-                if proposer != self.realm_sub_id_u64 as u16 {
-                    let dest = node_ids
-                        .get(&proposer)
-                        .copied()
-                        .ok_or_else(|| anyhow::anyhow!("no NodeId for scheduled proposer sub_id {proposer}"))?;
+                if let Some((proposer, dest)) = resolve_end_cap_forward_dest(
+                    self.realm_id_u64 as u32,
+                    self.realm_sub_id_u64 as u16,
+                    target,
+                    seed,
+                    rotation,
+                    node_ids,
+                )? {
                     // Canonical EndCap input bytes — reuse the existing
                     // serializer; do not invent a second codec.
                     let input = user_end_cap_input.psy_ser_to_bytes_vec()?;
@@ -1312,5 +1389,347 @@ impl<
             .try_into()
             .map_err(|_| RpcError::InvalidInput("public_key must be 33 bytes (compressed secp256k1)".to_string()))?;
         res(self.get_worker_reputation_internal(&key).await)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libp2p_identity::Keypair;
+    use parth_core::PHash;
+
+    const TEST_CHAIN_ID: u32 = 7;
+    const TEST_REALM_ID: u32 = 3;
+
+    /// Deterministic Ed25519 NodeId per seed byte.
+    fn test_node(seed: u8) -> NodeId {
+        let mut ikm = [0u8; 32];
+        ikm[0] = seed;
+        let kp = Keypair::ed25519_from_bytes(&mut ikm)
+            .expect("32-byte seed yields Ed25519 Keypair");
+        NodeId::from_keypair(&kp).expect("ed25519 keypair yields NodeId")
+    }
+
+    fn build_roster(sub_ids: &[u16]) -> HashMap<u16, NodeId> {
+        sub_ids
+            .iter()
+            .enumerate()
+            .map(|(i, &sub_id)| (sub_id, test_node((i + 1) as u8)))
+            .collect()
+    }
+
+    fn end_cap_header(
+        chain_id: u32,
+        realm_id: u32,
+        checkpoint_id: u64,
+        input: &[u8],
+        proof: &[u8],
+    ) -> EndCapForwardHeader {
+        let input_hash = sha256(input);
+        let proof_hash = sha256(proof);
+        EndCapForwardHeader {
+            chain_id,
+            realm_id,
+            checkpoint_id,
+            end_cap_id: compute_end_cap_id(chain_id, realm_id, checkpoint_id, &input_hash, &proof_hash),
+            end_cap_input_len: input.len() as u32,
+            proof_len: proof.len() as u32,
+        }
+    }
+
+    fn sample_input_and_proof() -> (Vec<u8>, Vec<u8>) {
+        (vec![0x11u8; 64], vec![0xABu8; 128])
+    }
+
+    #[test]
+    fn validate_forwarded_end_cap_accepts_occupied_source_with_matching_header() {
+        let roster = build_roster(&[1, 2, 3]);
+        let (input, proof) = sample_input_and_proof();
+        let header = end_cap_header(TEST_CHAIN_ID, TEST_REALM_ID, 25, &input, &proof);
+        let validated = validate_forwarded_end_cap(
+            roster[&1],
+            &header,
+            &input,
+            &proof,
+            TEST_CHAIN_ID,
+            TEST_REALM_ID,
+            &roster,
+        )
+        .expect("occupied source with matching header is accepted");
+        assert_eq!(validated, header.end_cap_id);
+    }
+
+    #[test]
+    fn validate_forwarded_end_cap_rejects_source_outside_roster() {
+        let roster = build_roster(&[1, 2, 3]);
+        let (input, proof) = sample_input_and_proof();
+        let header = end_cap_header(TEST_CHAIN_ID, TEST_REALM_ID, 25, &input, &proof);
+        let forged = test_node(99);
+        let err = validate_forwarded_end_cap(
+            forged,
+            &header,
+            &input,
+            &proof,
+            TEST_CHAIN_ID,
+            TEST_REALM_ID,
+            &roster,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("forwarded EndCap source NodeId {forged} is not an occupied Realm identity")
+        );
+    }
+
+    #[test]
+    fn validate_forwarded_end_cap_rejects_chain_id_mismatch() {
+        let roster = build_roster(&[1, 2, 3]);
+        let (input, proof) = sample_input_and_proof();
+        // Keep the header internally consistent (end_cap_id over chain 8) so
+        // only the chain_id check can fail.
+        let header = end_cap_header(TEST_CHAIN_ID + 1, TEST_REALM_ID, 25, &input, &proof);
+        let err = validate_forwarded_end_cap(
+            roster[&1],
+            &header,
+            &input,
+            &proof,
+            TEST_CHAIN_ID,
+            TEST_REALM_ID,
+            &roster,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "forwarded EndCap chain_id {} does not match local {}",
+                TEST_CHAIN_ID + 1,
+                TEST_CHAIN_ID
+            )
+        );
+    }
+
+    #[test]
+    fn validate_forwarded_end_cap_rejects_realm_id_mismatch() {
+        let roster = build_roster(&[1, 2, 3]);
+        let (input, proof) = sample_input_and_proof();
+        let header = end_cap_header(TEST_CHAIN_ID, TEST_REALM_ID + 1, 25, &input, &proof);
+        let err = validate_forwarded_end_cap(
+            roster[&1],
+            &header,
+            &input,
+            &proof,
+            TEST_CHAIN_ID,
+            TEST_REALM_ID,
+            &roster,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "forwarded EndCap realm_id {} does not match local {}",
+                TEST_REALM_ID + 1,
+                TEST_REALM_ID
+            )
+        );
+    }
+
+    #[test]
+    fn validate_forwarded_end_cap_rejects_input_length_mismatch() {
+        let roster = build_roster(&[1, 2, 3]);
+        let (input, proof) = sample_input_and_proof();
+        let header = end_cap_header(TEST_CHAIN_ID, TEST_REALM_ID, 25, &input, &proof);
+        let mut padded = input.clone();
+        padded.push(0xEE);
+        let err = validate_forwarded_end_cap(
+            roster[&1],
+            &header,
+            &padded,
+            &proof,
+            TEST_CHAIN_ID,
+            TEST_REALM_ID,
+            &roster,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "forwarded EndCap input length {} does not match header {}",
+                padded.len(),
+                header.end_cap_input_len
+            )
+        );
+    }
+
+    #[test]
+    fn validate_forwarded_end_cap_rejects_proof_length_mismatch() {
+        let roster = build_roster(&[1, 2, 3]);
+        let (input, proof) = sample_input_and_proof();
+        let header = end_cap_header(TEST_CHAIN_ID, TEST_REALM_ID, 25, &input, &proof);
+        let truncated = proof[..proof.len() - 1].to_vec();
+        let err = validate_forwarded_end_cap(
+            roster[&1],
+            &header,
+            &input,
+            &truncated,
+            TEST_CHAIN_ID,
+            TEST_REALM_ID,
+            &roster,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "forwarded EndCap proof length {} does not match header {}",
+                truncated.len(),
+                header.proof_len
+            )
+        );
+    }
+
+    #[test]
+    fn validate_forwarded_end_cap_rejects_end_cap_id_mismatch() {
+        let roster = build_roster(&[1, 2, 3]);
+        let (input, proof) = sample_input_and_proof();
+        let mut header = end_cap_header(TEST_CHAIN_ID, TEST_REALM_ID, 25, &input, &proof);
+        header.end_cap_id = [0xFF; 32];
+        let err = validate_forwarded_end_cap(
+            roster[&1],
+            &header,
+            &input,
+            &proof,
+            TEST_CHAIN_ID,
+            TEST_REALM_ID,
+            &roster,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "forwarded EndCap id does not match canonical hash"
+        );
+    }
+
+    #[test]
+    fn ensure_start_user_leaf_hash_accepts_matching_hash() {
+        let hash = PHash::ZERO;
+        ensure_start_user_leaf_hash(&hash, &hash)
+            .expect("matching start_user_leaf_hash is accepted");
+    }
+
+    #[test]
+    fn ensure_start_user_leaf_hash_rejects_mismatch() {
+        let supplied = PHash::ZERO;
+        let expected = PHash::from_values(1, 2, 3, 4);
+        let err = ensure_start_user_leaf_hash(&supplied, &expected).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("Invalid start_user_leaf_hash, left: {supplied:?}, right: {expected:?}")
+        );
+    }
+
+    /// Rotation over sub-ids {1, 2, 3}; the scheduled proposer is whatever the
+    /// canonical schedule picks for the given realm/checkpoint/seed.
+    fn rotation_config() -> RealmRotationConfig {
+        RealmRotationConfig {
+            checkpoints_per_epoch: 10,
+            validator_sub_ids: vec![1, 2, 3],
+        }
+    }
+
+    fn scheduled_proposer(rotation: &RealmRotationConfig, target: u64) -> u16 {
+        rotation
+            .proposer_sub_id(TEST_REALM_ID, target, [1, 2, 3, 4])
+            .expect("schedule")
+            .expect("enabled rotation always schedules a proposer")
+    }
+
+    #[test]
+    fn resolve_forward_dest_local_is_scheduled_proposer_does_not_forward() {
+        let rotation = rotation_config();
+        let roster = build_roster(&[1, 2, 3]);
+        let proposer = scheduled_proposer(&rotation, 25);
+        let dest = resolve_end_cap_forward_dest(
+            TEST_REALM_ID,
+            proposer,
+            25,
+            [1, 2, 3, 4],
+            &rotation,
+            &roster,
+        )
+        .expect("routing decision");
+        assert!(
+            dest.is_none(),
+            "local instance is the scheduled proposer: keep local intake"
+        );
+    }
+
+    #[test]
+    fn resolve_forward_dest_non_proposer_routes_to_scheduled_proposer_node_id() {
+        let rotation = rotation_config();
+        let roster = build_roster(&[1, 2, 3]);
+        let proposer = scheduled_proposer(&rotation, 25);
+        let local_sub_id = rotation
+            .validator_sub_ids
+            .iter()
+            .copied()
+            .find(|&s| s != proposer)
+            .expect("at least one other validator sub id");
+        let dest = resolve_end_cap_forward_dest(
+            TEST_REALM_ID,
+            local_sub_id,
+            25,
+            [1, 2, 3, 4],
+            &rotation,
+            &roster,
+        )
+        .expect("routing decision");
+        assert_eq!(dest, Some((proposer, roster[&proposer])));
+    }
+
+    #[test]
+    fn resolve_forward_dest_missing_dest_node_id_rejects() {
+        let rotation = rotation_config();
+        let proposer = scheduled_proposer(&rotation, 25);
+        let other_sub_ids: Vec<u16> = rotation
+            .validator_sub_ids
+            .iter()
+            .copied()
+            .filter(|&s| s != proposer)
+            .collect();
+        let roster = build_roster(&other_sub_ids);
+        let err = resolve_end_cap_forward_dest(
+            TEST_REALM_ID,
+            other_sub_ids[0],
+            25,
+            [1, 2, 3, 4],
+            &rotation,
+            &roster,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("no NodeId for scheduled proposer sub_id {proposer}")
+        );
+    }
+
+    #[test]
+    fn resolve_forward_dest_rotation_disabled_does_not_forward() {
+        let rotation = RealmRotationConfig {
+            checkpoints_per_epoch: 0,
+            validator_sub_ids: vec![1, 2, 3],
+        };
+        let roster = build_roster(&[1, 2, 3]);
+        let dest = resolve_end_cap_forward_dest(
+            TEST_REALM_ID,
+            1,
+            25,
+            [1, 2, 3, 4],
+            &rotation,
+            &roster,
+        )
+        .expect("routing decision");
+        assert!(
+            dest.is_none(),
+            "rotation disabled: local intake"
+        );
     }
 }

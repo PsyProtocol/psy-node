@@ -47,6 +47,11 @@ where
 }
 
 pub const VALIDATOR_SUB_ID_BITS: u8 = 8;
+/// Height of the checkpoint validator tree: coordinator user-tree height (12)
+/// plus [`VALIDATOR_SUB_ID_BITS`]. Empty-tree root is `get_zero_hash(this)`,
+/// which is not the all-zero hash.
+pub const VALIDATOR_TREE_HEIGHT: usize = 12 + VALIDATOR_SUB_ID_BITS as usize;
+
 
 pub fn validator_tree_index(realm_id: u32, realm_sub_id: u16) -> u64 {
     assert!(

@@ -12,7 +12,7 @@ use psy_data::{
         realm_finalize::protocol_encode_finalize_output,
     },
     node::node_proving_state::PsyNodeProvingState,
-    p2p::{encode_proposal_body, proposal_from_parts, replication_threshold, sha256, vote_message, Certificate, Proposal, ProtocolEncode, RealmFinalizeSubmitCode},
+    p2p::{encode_proposal_body, proposal_from_parts, sha256, vote_message, Certificate, Proposal, ProtocolEncode, RealmFinalizeSubmitCode},
     prepared_block::realm::PsyPreparedRealmBlockStateUpdates,
     worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId,
 };
@@ -34,7 +34,7 @@ use crate::{
     p2p::guta_submit::GutaSubmitError,
     realm::{
         processor::{
-            consensus::{build_bound_finalize_output, form_certificate, sign_vote},
+            consensus::{build_bound_finalize_output, form_certificate, require_nonzero_validator_tree_root, sign_vote, validate_certificate, votes_meet_wait},
             core::PsyRealmProcessor,
             gatherers::realm_end_cap_gatherer::{get_new_realm_end_cap_gatherer_backup_file_path, RealmGUTAEndCapGathererOutput},
         },
@@ -251,7 +251,7 @@ where
             )
             .await
             {
-                Ok(updates) if updates.new_realm_root == coordinator_realm_state.value => {
+                Ok(updates) if backup_matches_included_root(&updates.new_realm_root, &coordinator_realm_state.value) => {
                     self.db.state.processing_checkpoint_id = recovery_state.processing_checkpoint_id;
                     self.db.state.processing_checkpoint_root = recovery_state.processing_checkpoint_root;
                     self.db.state.processing_realm_start_root = recovery_state.processing_realm_start_root;
@@ -623,11 +623,14 @@ where
         cmds.publish_vote(own_vote.clone()).await?;
 
         let n = rotation.validator_sub_ids.len();
-        let required_valid_votes = replication_threshold(n);
         let mut all_votes = vec![(own_vote.signer_sub_id, own_vote.signature)];
         let mut seen = std::collections::HashSet::from([local_sub_id]);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-        while all_votes.len() < required_valid_votes {
+        while !votes_meet_wait(
+            n,
+            local_sub_id,
+            &all_votes.iter().map(|(sub_id, _)| *sub_id).collect::<Vec<_>>(),
+        ) {
             let remaining_time = deadline.saturating_duration_since(tokio::time::Instant::now());
             anyhow::ensure!(!remaining_time.is_zero(), "timed out waiting for valid Realm votes");
             let received = cmds
@@ -656,6 +659,24 @@ where
             }
         }
         let certificate = form_certificate(&proposal, &all_votes)?;
+        let occupied = rotation.validator_sub_ids.as_slice();
+        let bls_public_keys = self.p2p_bls_public_keys.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "realm P2P enabled for realm {} but no BLS public keys were wired via set_realm_p2p",
+                self.db.state.realm_id_u64
+            )
+        })?;
+        let leaf_bls_keys = occupied
+            .iter()
+            .map(|sub_id| {
+                bls_public_keys
+                    .get(sub_id)
+                    .copied()
+                    .map(|key| (*sub_id, key))
+                    .ok_or_else(|| anyhow::anyhow!("missing BLS key for occupied Realm sub_id {sub_id}"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        validate_certificate(&proposal, &certificate, occupied, &leaf_bls_keys)?;
         tracing::info!(
             "realm P2P proposal published and certificate formed for realm {} target {} ({} verified votes)",
             self.db.state.realm_id_u64,
@@ -717,6 +738,8 @@ where
             .ok_or_else(|| anyhow::anyhow!("GUTA checkpoint tree root has no canonical checkpoint ID"))?;
         let proof_base_roots = self.db.db.get_checkpoint_global_state_roots(base_checkpoint_id).await?;
         let validator_tree_root = proof_base_roots.validator_tree_root;
+        require_nonzero_validator_tree_root(&validator_tree_root.into_owned_32bytes())
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
         let output = build_bound_finalize_output::<N>(
             self.db.state.chain_id,
             self.db.state.realm_id_u64 as u32,
@@ -730,5 +753,30 @@ where
             base_checkpoint_id,
             validator_tree_root.into_owned_32bytes(),
         ))
+    }
+}
+
+/// True when a freshly generated backup's realm end root equals the root the
+/// coordinator included for the checkpoint.
+fn backup_matches_included_root<Hash>(backup_new_root: &Hash, included_root: &Hash) -> bool
+where
+    Hash: PartialEq,
+{
+    backup_new_root == included_root
+}
+
+#[cfg(test)]
+mod tests {
+    use super::backup_matches_included_root;
+
+    #[test]
+    fn backup_matches_included_root_accepts_equal_roots() {
+        assert!(backup_matches_included_root(&[0xAA; 32], &[0xAA; 32]));
+    }
+
+    #[test]
+    fn backup_matches_included_root_rejects_different_roots() {
+        assert!(!backup_matches_included_root(&[0xAA; 32], &[0xBB; 32]));
+        assert!(!backup_matches_included_root(&[0xAA; 32], &[0xAB; 32]));
     }
 }

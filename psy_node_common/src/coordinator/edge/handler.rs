@@ -12,7 +12,7 @@ use psy_data::{
         header_extended::{GlobalUserTreeAggregatorHeaderWithTagValueAndJobID, GlobalUserTreeAggregatorHeaderWithTagValueAndJobType},
         realm_finalize::protocol_encode_finalize_output,
     },
-    p2p::{replication_threshold, sha256, Certificate, Proposal, RealmFinalizeSubmitCode},
+    p2p::{sha256, Certificate, Proposal, RealmFinalizeSubmitCode},
     prepared_block::realm::PsyRealmCoordinatorUpdate,
     v1::{
         common_api::PsyProoffMinerRewardProof,
@@ -32,7 +32,11 @@ use psy_serialize::{PsyCanonicalDatabaseSerializeBaseMulti, PsyCanonicalDatabase
 use crate::{
     coordinator::queue_key::{CoordinatorDeployContractQueueKey, CoordinatorRegisterUserPublicKeyQueueKey, CoordinatorSubmitRealmGUTAUpdateQueueKey},
     p2p::guta_submit::GutaSubmitError,
-    realm::processor::consensus::{build_bound_finalize_output, validate_certificate},
+    realm::processor::consensus::{
+        build_bound_finalize_output, certificate_includes_proposer, inclusion_lag_within_limit,
+        require_nonzero_validator_tree_root, validate_certificate, validator_tree_root_matches_proof_base,
+        votes_meet_wait,
+    },
 };
 
 // const END_CAP_PROOF_CIRCUIT_TYPE_U32: u32 = ProvingJobCircuitType::UserEndCap as u32;
@@ -664,8 +668,16 @@ impl<
             .db_reader
             .get_checkpoint_global_state_roots(proposal.base_checkpoint_id)
             .await?;
+        let proof_base_validator_tree_root = proof_base_roots.validator_tree_root.into_owned_32bytes();
+        require_nonzero_validator_tree_root(&proposal.validator_tree_root)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        require_nonzero_validator_tree_root(&proof_base_validator_tree_root)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
         anyhow::ensure!(
-            proposal.validator_tree_root == proof_base_roots.validator_tree_root.into_owned_32bytes(),
+            validator_tree_root_matches_proof_base(
+                &proposal.validator_tree_root,
+                &proof_base_validator_tree_root,
+            ),
             "GUTA Proposal validator_tree_root does not match proof-base checkpoint"
         );
         let inclusion_checkpoint_id = self
@@ -673,6 +685,22 @@ impl<
             .await?
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("latest checkpoint ID overflow at GUTA admission"))?;
+        let inclusion_lag = inclusion_lag_within_limit(
+            proposal.base_checkpoint_id,
+            inclusion_checkpoint_id,
+        )
+            .ok_or_else(|| {
+                GutaSubmitError::retryable(
+                    RealmFinalizeSubmitCode::InvalidProposal,
+                    format!(
+                        "GUTA Proposal proof-base checkpoint {} is not within the maximum inclusion lag {} at inclusion checkpoint {}",
+                        proposal.base_checkpoint_id,
+                        psy_data::p2p::MAX_INCLUSION_LAG_CHECKPOINTS,
+                        inclusion_checkpoint_id
+                    ),
+                )
+            })?;
+        let _ = inclusion_lag;
         let target_checkpoint_id = proposal
             .base_checkpoint_id
             .checked_add(1)
@@ -718,15 +746,18 @@ impl<
         );
         let output_bytes = protocol_encode_finalize_output(&output)?;
         anyhow::ensure!(proposal.public_output_hash == sha256(&output_bytes), "GUTA Proposal public output hash mismatch");
-        validate_certificate(&proposal, &certificate, &occupied, &keys)
-            .map_err(|error| anyhow::anyhow!("invalid GUTA Certificate for realm {realm_id}: {error}"))?;
+        validate_certificate(&proposal, &certificate, &occupied, &keys).map_err(|error| {
+            GutaSubmitError::illegal(
+                RealmFinalizeSubmitCode::InvalidCertificate,
+                format!("invalid GUTA Certificate for realm {realm_id}: {error}"),
+            )
+        })?;
         anyhow::ensure!(
-            certificate.popcount() >= replication_threshold(occupied.len()),
-            "GUTA Certificate for realm {realm_id} below replication threshold"
+            votes_meet_wait(occupied.len(), proposal.proposer_sub_id, &certificate.signer_sub_ids()),
+            "GUTA Certificate for realm {realm_id} below replication wait"
         );
-        let signer_sub_ids = certificate.signer_sub_ids();
         anyhow::ensure!(
-            signer_sub_ids.contains(&proposal.proposer_sub_id),
+            certificate_includes_proposer(&certificate, proposal.proposer_sub_id),
             "GUTA Certificate for realm {realm_id} does not include proposer sub_id {}",
             proposal.proposer_sub_id
         );

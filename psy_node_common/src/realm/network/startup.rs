@@ -144,7 +144,7 @@ pub fn build_optional_realm_network(
         bootnode_max_circuit_duration_secs: None,
         bootnode_max_circuits: None,
         command_channel_capacity: 64,
-        event_channel_capacity: 64,
+        event_channel_capacity: 256,
         max_in_flight_proposals: 2,
         reassembly_chunk_bytes: 61_440,
         reassembly_expiry_secs: 1_800,

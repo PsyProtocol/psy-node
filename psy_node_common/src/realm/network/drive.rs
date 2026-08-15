@@ -219,10 +219,8 @@ impl RealmNetwork {
                 timeout,
                 response,
             } => {
-                if threshold == 0 {
-                    let _ = response.send(Err(NetworkError::Configuration(
-                        "wait_votes threshold must be non-zero".into(),
-                    )));
+                if let Err(error) = validate_wait_votes_threshold(threshold) {
+                    let _ = response.send(Err(error));
                     return;
                 }
                 let votes = state.vote_backlog.remove(&proposal_id).unwrap_or_default();
@@ -486,11 +484,15 @@ impl RealmNetwork {
                     ) {
                         Ok(InsertOutcome::Complete) => {
                             if let Ok(complete) = self.reassembly.finalize(&proposal_id) {
-                                let source = state
-                                    .proposal_source
-                                    .get(&proposal_id)
-                                    .and_then(|peer| NodeId::from_peer_id(peer).ok())
-                                    .unwrap_or(self.local_node_id);
+                                let Some(source) = resolve_proposal_ready_source(
+                                    state.proposal_source.get(&proposal_id),
+                                ) else {
+                                    tracing::warn!(
+                                        realm_id = self.realm_id,
+                                        "dropped ProposalReady: missing or invalid source NodeId"
+                                    );
+                                    return;
+                                };
                                 let _ = self.event_tx.try_send(RealmNetworkEvent::ProposalReady {
                                     source,
                                     proposal: complete.proposal,
@@ -727,4 +729,87 @@ fn first_coordinator_peer(addresses: &[Multiaddr]) -> Result<PeerId, NetworkErro
         .ok_or_else(|| {
             NetworkError::Configuration("coordinator address has no /p2p PeerId".into())
         })
+}
+
+/// Fail-closed `wait_votes` configuration check: a zero threshold would
+/// complete immediately with whatever votes are already known, so it is
+/// rejected.
+fn validate_wait_votes_threshold(threshold: usize) -> Result<(), NetworkError> {
+    if threshold == 0 {
+        return Err(NetworkError::Configuration(
+            "wait_votes threshold must be non-zero".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve the `ProposalReady` source `NodeId` from the recorded gossip
+/// source peer for a proposal. Fails closed: a missing source or a peer that
+/// is not an Ed25519 identity multihash yields `None` — it never falls back
+/// to the local node id.
+///
+/// Wired from the direct-body completion path by the coordinator; kept as a
+/// pure function so the fail-closed policy is unit-tested without a Swarm.
+fn resolve_proposal_ready_source(source_peer: Option<&PeerId>) -> Option<NodeId> {
+    source_peer.and_then(|peer| NodeId::from_peer_id(peer).ok())
+}
+
+/// Fail-closed answer for an inbound end-cap forward whose `EndCapReceived`
+/// event could not be delivered: the requesting peer must be told the
+/// end-cap was not accepted (`accepted = false`) instead of being left
+/// hanging. A successful delivery is answered later over the reply channel,
+/// so nothing is sent here.
+#[allow(dead_code)]
+fn end_cap_reject_response(delivered: Result<(), ()>) -> Option<EndCapForwardResponse> {
+    delivered.err().map(|()| EndCapForwardResponse::new(false))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libp2p_identity::Keypair;
+
+    #[test]
+    fn resolve_proposal_ready_source_returns_recorded_source() {
+        let keypair = Keypair::generate_ed25519();
+        let peer = keypair.public().to_peer_id();
+        let node = NodeId::from_peer_id(&peer).expect("ed25519 peer yields NodeId");
+        assert_eq!(resolve_proposal_ready_source(Some(&peer)), Some(node));
+        assert_eq!(node.to_peer_id(), peer);
+    }
+
+    #[test]
+    fn resolve_proposal_ready_source_missing_source_is_none() {
+        // No recorded source must fail closed — never fall back to the local
+        // node id.
+        assert_eq!(resolve_proposal_ready_source(None), None);
+    }
+
+    #[test]
+    fn resolve_proposal_ready_source_rejects_non_ed25519_peer() {
+        // A SHA-2-256 multihash is a valid libp2p PeerId but not an Ed25519
+        // identity multihash, so NodeId conversion fails and the source must
+        // resolve to None.
+        let mut bytes = Vec::new();
+        bytes.push(0x12); // sha2-256 multihash code
+        bytes.push(0x20); // 32-byte digest length
+        bytes.extend_from_slice(&[0u8; 32]);
+        let peer = PeerId::from_bytes(&bytes).expect("sha256 multihash is a valid PeerId");
+        assert!(NodeId::from_peer_id(&peer).is_err());
+        assert_eq!(resolve_proposal_ready_source(Some(&peer)), None);
+    }
+
+    #[test]
+    fn end_cap_reject_response_fails_closed_on_delivery_error() {
+        assert_eq!(end_cap_reject_response(Ok(())), None);
+        let rejected = end_cap_reject_response(Err(())).expect("failure yields a response");
+        assert!(!rejected.is_accepted());
+    }
+
+    #[test]
+    fn validate_wait_votes_threshold_rejects_zero() {
+        assert!(validate_wait_votes_threshold(0).is_err());
+        assert!(validate_wait_votes_threshold(1).is_ok());
+        assert!(validate_wait_votes_threshold(7).is_ok());
+    }
 }

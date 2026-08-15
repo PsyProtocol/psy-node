@@ -6,7 +6,7 @@ use psy_core::constants::protocol::{DA_CHALLENGE_WINDOW, TODO_DEPOSIT_TREE_HEIGH
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
-use crate::{protocol::checkpoint_transition_hash::{CheckpointStateHashTransition, CheckpointStateTransitionPublicInputs}, v1::qdata::{checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, PQEDCheckpointLeafStats}, pm_jobs_completed_stats::PPMJobsCompletedStats, pm_rewards_commitment::PPMRewardCommitment}};
+use crate::{guta::realm_finalize::VALIDATOR_TREE_HEIGHT, protocol::checkpoint_transition_hash::{CheckpointStateHashTransition, CheckpointStateTransitionPublicInputs}, v1::qdata::{checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, PQEDCheckpointLeafStats}, pm_jobs_completed_stats::PPMJobsCompletedStats, pm_rewards_commitment::PPMRewardCommitment}};
 
 use super::agg_part_1::QCAggUserRegistartionDeployContractsGUTAInput;
 
@@ -267,7 +267,7 @@ impl<F: QFelt64, Hash: QFHashBase<F>> QCQEDCheckpointStateTransitionInputPartial
             user_tree_root: self.part_1_header.guta_proof_header.state_transition.new_node_value,
             withdrawal_tree_root:Hasher::get_zero_hash(TODO_WITHDRAWAL_TREE_HEIGHT as usize),
             user_registration_tree_root: self.part_1_header.register_users_state_transition.state_transition_end,
-            validator_tree_root: Hasher::get_zero_hash(0),
+            validator_tree_root: Hasher::get_zero_hash(VALIDATOR_TREE_HEIGHT),
         };
         PQEDCheckpointLeaf {
             global_chain_root: new_state_roots.qfhash::<Hasher>(),
@@ -304,7 +304,7 @@ impl<F: QFelt64, Hash: QFHashBase<F>> QCQEDCheckpointStateTransitionInputPartial
             user_tree_root: self.part_1_header.guta_proof_header.state_transition.old_node_value,
             withdrawal_tree_root: Hasher::get_zero_hash(TODO_WITHDRAWAL_TREE_HEIGHT as usize),
             user_registration_tree_root: self.part_1_header.register_users_state_transition.state_transition_start,
-            validator_tree_root: Hasher::get_zero_hash(0),
+            validator_tree_root: Hasher::get_zero_hash(VALIDATOR_TREE_HEIGHT),
         };
         old_state_roots
     }

@@ -371,7 +371,18 @@ where
     let expected = submission.header.qfhash::<N::HasherBase>();
     for circuit_type in [
         ProvingJobCircuitType::GUTASingleEndCap,
+        ProvingJobCircuitType::GUTATwoEndCap,
         ProvingJobCircuitType::GUTATwoGUTA,
+        ProvingJobCircuitType::GUTALeftEndCapRightGUTA,
+        ProvingJobCircuitType::GUTALeftGUTARightEndCap,
+        ProvingJobCircuitType::GUTAVerifyToCap,
+        ProvingJobCircuitType::GUTANoChange,
+        ProvingJobCircuitType::GUTATwoGUTAWithCheckpointUpgrade,
+        ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade,
+        ProvingJobCircuitType::GUTATwoGUTALinear,
+        ProvingJobCircuitType::GUTATwoGUTALinearUpgradeCheckpoint,
+        ProvingJobCircuitType::GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint,
+        ProvingJobCircuitType::GUTAVerifyLeftLeafRightLinearUpgradeCheckpoint,
     ] {
         if proof_verifier
             .verify_zk_proof_from_slice_check_public_inputs_hash(circuit_type as u32, proof, expected)
@@ -380,7 +391,7 @@ where
             return Ok(circuit_type as u32);
         }
     }
-    anyhow::bail!("Proposal proof is not a valid ordinary GUTASingleEndCap/TwoGUTA proof")
+    anyhow::bail!("Proposal proof is not a valid ordinary GUTA root proof")
 }
 
 fn persist_backup(path: &Path, backup: &[u8]) -> anyhow::Result<()> {
@@ -413,6 +424,7 @@ where
         while let Some(event) = events.recv().await {
             match event {
                 RealmNetworkEvent::EndCapReceived {
+                    source,
                     header,
                     input,
                     proof,
@@ -420,7 +432,7 @@ where
                     ..
                 } => {
                     let response = handler
-                        .handle_p2p_end_cap_received(header, input, proof)
+                        .handle_p2p_end_cap_received(source, header, input, proof)
                         .await;
                     let _ = reply.send(response);
                 }
@@ -435,6 +447,7 @@ where
 pub trait EdgeEndCapReceiver {
     fn handle_p2p_end_cap_received(
         &self,
+        source: NodeId,
         header: EndCapForwardHeader,
         input: Vec<u8>,
         proof: Vec<u8>,
@@ -469,12 +482,13 @@ where
 {
     fn handle_p2p_end_cap_received(
         &self,
+        source: NodeId,
         header: EndCapForwardHeader,
         input: Vec<u8>,
         proof: Vec<u8>,
     ) -> impl Future<Output = EndCapForwardResponse> + Send {
         psy_node_common::realm::edge::handler::RealmEdgeHandler::handle_p2p_end_cap_received(
-            self, header, input, proof,
+            self, source, header, input, proof,
         )
     }
 }

@@ -944,9 +944,13 @@ function faucetServerStartedDetector(line: string): boolean {
         || line.includes('Starting psy faucet server')
         || line.includes('psy faucet server mode enabled');
 }
+function l1StartedDetector(line: string): boolean {
+    return line.includes('Listening on');
+}
+
 
 const REALM_P2P_OUT_DIR = "./local_checkpoints/realm_p2p";
-const REALM_P2P_SUB_IDS = [1, 2, 3] as const;
+const REALM_P2P_SUB_IDS = [1, 2] as const;
 
 type RealmP2pSubEntry = {
     processor_node_id_hex38: string;

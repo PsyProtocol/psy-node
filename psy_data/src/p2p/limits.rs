@@ -92,6 +92,9 @@ pub const MIN_VALIDATORS_PER_REALM: usize = 1;
 /// Maximum in-flight proposals retained per Realm.
 pub const MAX_IN_FLIGHT_PROPOSALS: usize = 2;
 
+/// Maximum checkpoints between a proposal's proof base and coordinator inclusion.
+pub const MAX_INCLUSION_LAG_CHECKPOINTS: u64 = 16;
+
 /// Maximum concurrent direct body exchanges.
 pub const MAX_CONCURRENT_DIRECT_EXCHANGES: usize = 64;
 

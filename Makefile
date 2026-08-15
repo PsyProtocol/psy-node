@@ -6,7 +6,7 @@ include .env
 export
 endif
 
-LOG_LEVEL    := psy_node_common=debug,psy_worker_core=debug,psy_node_core=debug
+LOG_LEVEL    := psy_node_common=debug,psy_node_cli=info,psy_worker_core=debug,psy_node_core=debug
 VITE_NETWORK  ?= localhost
 VITE_FORK    ?= false
 SEPOLIA_RPC_URL ?= https://ethereum-sepolia-rpc.publicnode.com

@@ -2,7 +2,7 @@ use parth_common::memory_stores::{dash_tree_append_only::PsyDashMemoryAppendOnly
 use parth_core::{
     QJobIdBase, crypto::hash::{
         merkle_proof::{DeltaMerkleProofCore, compute_root_merkle_proof_generic},
-        traits::{QFieldHashable, ZeroableHash},
+        traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable, ZeroableHash},
     }, felt::{FromPrimitiveValuesFelt, ToU64Value, ZeroableFelt}, protocol::core_types::{Q256BitHash, QNetworkTypesConfig}
 };
 use psy_core::{
@@ -12,7 +12,7 @@ use psy_core::{
 use psy_data::{
     agg::AggStateTransitionWithStats,
     config::network_config::PsyNodeCircuitFingerprintConfig,
-    guta::{header::GlobalUserTreeAggregatorHeader, sub_tree_transition::SubTreeNodeStateTransition},
+    guta::{header::GlobalUserTreeAggregatorHeader, realm_finalize::VALIDATOR_TREE_HEIGHT, sub_tree_transition::SubTreeNodeStateTransition},
     node::{coordinator_processor::{CoordinatorProcessorIdState, CoordinatorProcessorLastCommittedState}, node_proving_state::PsyNodeProvingState},
     prepared_block::{common::PsyCoordinatorPendingCheckpointBase, coordinator::PsyPreparedCoordinatorBlockStateUpdates},
     protocol::circuit_inputs::{
@@ -274,10 +274,7 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
             user_tree_root: self.guta_gatherer_result.end_global_user_tree_root,
             withdrawal_tree_root: last_committed.checkpoint_state_roots.withdrawal_tree_root,
             user_registration_tree_root: self.register_users_gatherer_result.end_user_registration_tree_hash,
-            // 6th checkpoint global state root (x5 pairing). Validator tree is
-            // not built by the coordinator backup path; zero matches the
-            // serde default on PQEDCheckpointGlobalStateRoots.
-            validator_tree_root: N::QHash::get_zero_value(),
+            validator_tree_root: N::HasherBase::get_zero_hash(VALIDATOR_TREE_HEIGHT),
         };
         let checkpoint_leaf_stats = PQEDCheckpointLeafStats {
             guta_fees_collected: self.guta_gatherer_result.guta_stats.guta_fees_collected,
@@ -435,10 +432,7 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
             user_tree_root: self.guta_gatherer_result.end_global_user_tree_root,
             withdrawal_tree_root: last_committed.checkpoint_state_roots.withdrawal_tree_root,
             user_registration_tree_root: self.register_users_gatherer_result.end_user_registration_tree_hash,
-            // 6th checkpoint global state root (x5 pairing). Validator tree is
-            // not built by the coordinator backup path; zero matches the
-            // serde default on PQEDCheckpointGlobalStateRoots.
-            validator_tree_root: N::QHash::get_zero_value(),
+            validator_tree_root: N::HasherBase::get_zero_hash(VALIDATOR_TREE_HEIGHT),
         };
         let checkpoint_leaf_stats = PQEDCheckpointLeafStats {
             guta_fees_collected: self.guta_gatherer_result.guta_stats.guta_fees_collected,
