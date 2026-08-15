@@ -41,13 +41,14 @@ fix:
 	@cd $(ROOT_DIR) && cargo fix --all-targets --allow-dirty --allow-staged
 
 build:
-	@RUSTFLAGS="-A warnings" $(CARGO) build --profile $(PROFILE) --bin psy_user_cli
+	@RUSTFLAGS="-A warnings" $(CARGO) build --profile $(PROFILE) --bin psy_user_cli --bin psy-mcp-server
 
 fmt:
 	@cd $(ROOT_DIR) && cargo fmt
 
 install:
 	@cd $(ROOT_DIR) && cargo install --path client_prover/psy_cli/psy_user_cli --locked
+	@cd $(ROOT_DIR) && cargo install --path client_prover/psy_mcp_server --locked
 
 clean:
 	@cd $(ROOT_DIR) && rm -rf target
