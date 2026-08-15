@@ -15,7 +15,7 @@ psy_node_scylla/examples/tst6.rs|Example|2|2|0|0|1|1|2|3
 psy_node_scylla/examples/tst6_nobucket.rs|Example|2|2|0|0|1|1|2|3
 psy_node_scylla/examples/tst7.rs|Example|2|2|0|0|1|1|2|3
 psy_node_scylla/examples/tst7_nobucket.rs|Example|2|2|0|0|1|1|2|3
-psy_node_scylla/src/core.rs|DriverCore|8|2|31|0|0|0|3|4
+psy_node_scylla/src/core.rs|DriverCore|9|3|31|0|0|0|3|4
 psy_node_scylla/src/core_db.rs|DriverCore|0|0|97|0|0|0|0|0
 psy_node_scylla/src/psy_setup.rs|DriverCore|2|0|4|0|0|0|1|1
 psy_node_scylla/src/rollback/authority_local_head_prototype.rs|DurableControlAuthority|6|0|4|6|2|4|1|4
@@ -23,13 +23,14 @@ psy_node_scylla/src/rollback/authority_timestamp_prototype.rs|DurableControlAuth
 psy_node_scylla/src/rollback/branch_exact_cutover_runtime.rs|DurableControlAuthority|2|0|0|0|0|0|0|0
 psy_node_scylla/src/rollback/branch_exact_cutover_store.rs|DurableControlAuthority|6|0|3|6|2|3|1|4
 psy_node_scylla/src/rollback/branch_exact_dual_write_executor.rs|RollbackPrototypeAdapter|3|0|13|3|1|13|0|11
+psy_node_scylla/src/rollback/branch_exact_genesis_activation.rs|DurableControlAuthority|7|0|0|0|0|0|0|0
 psy_node_scylla/src/rollback/branch_exact_pending_runtime.rs|DurableControlAuthority|4|0|0|0|0|0|0|0
 psy_node_scylla/src/rollback/branch_exact_schema_backfill_executor.rs|RollbackPrototypeAdapter|3|0|7|0|0|0|0|0
-psy_node_scylla/src/rollback/branch_exact_schema_deployment.rs|RollbackPrototypeAdapter|5|0|0|0|0|0|1|2
+psy_node_scylla/src/rollback/branch_exact_schema_deployment.rs|RollbackPrototypeAdapter|6|0|0|0|0|0|2|3
 psy_node_scylla/src/rollback/branch_exact_schema_deployment_lifecycle.rs|RollbackPrototypeAdapter|6|0|3|6|2|3|1|4
 psy_node_scylla/src/rollback/branch_exact_schema_exporter.rs|RollbackPrototypeAdapter|7|0|0|7|4|3|0|4
 psy_node_scylla/src/rollback/branch_exact_schema_migration.rs|RollbackPrototypeAdapter|12|0|0|11|1|7|2|17
-psy_node_scylla/src/rollback/branch_exact_schema_operator.rs|DurableControlAuthority|4|0|0|0|0|0|0|0
+psy_node_scylla/src/rollback/branch_exact_schema_operator.rs|DurableControlAuthority|6|0|0|0|0|0|0|0
 psy_node_scylla/src/rollback/branch_exact_schema_setup.rs|RollbackPrototypeAdapter|4|0|0|8|1|0|0|0
 psy_node_scylla/src/rollback/branch_exact_schema_setup_rf3_gate.rs|TestHarness|4|2|0|0|0|0|3|3
 psy_node_scylla/src/rollback/branch_exact_shadow_audit.rs|DurableControlAuthority|6|0|3|6|2|3|1|4
@@ -97,7 +98,7 @@ psy_node_scylla/src/rollback/realm_processor_external_dependency_loader.rs|Durab
 psy_node_scylla/src/rollback/realm_processor_external_dependency_projection.rs|DurableControlAuthority|2|0|0|0|0|0|0|0
 psy_node_scylla/src/rollback/realm_processor_generation_terminal.rs|DurableControlAuthority|6|0|3|5|2|3|1|8
 psy_node_scylla/src/rollback/realm_processor_terminal_authorization.rs|DurableControlAuthority|3|0|2|0|0|0|0|0
-psy_node_scylla/src/rollback/realm_rollback_commit_inventory_store.rs|DurableControlAuthority|6|0|7|8|1|7|2|8
+psy_node_scylla/src/rollback/realm_rollback_commit_inventory_store.rs|DurableControlAuthority|6|0|9|8|1|9|2|8
 psy_node_scylla/src/rollback/realm_rollback_delete_completion.rs|DurableControlAuthority|0|0|0|0|0|0|0|2
 psy_node_scylla/src/rollback/realm_rollback_delete_restore_executor.rs|DurableControlAuthority|10|0|21|7|1|21|0|5
 psy_node_scylla/src/rollback/realm_rollback_physical_archive_owner.rs|DurableControlAuthority|4|0|1|0|0|0|0|0

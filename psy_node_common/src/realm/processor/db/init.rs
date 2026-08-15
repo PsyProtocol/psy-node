@@ -91,14 +91,15 @@ where
         
         // 1. Check for Genesis requirement
         if local_latest_checkpoint_id == 0 {
-            // Check if we actually have genesis applied (unique IDs > 0 usually implies initialization)
-            let (last_unique_pending_id, _) = match self.db.get_latest_mapped_unique_pending_id().await {
-                Ok(ids) => ids,
-                Err(_) => return Ok(DatabaseCheckState::NeedsGenesis),
-            };
-            if last_unique_pending_id == 0 {
-                // Completely empty
-                return Ok(DatabaseCheckState::NeedsGenesis);
+            // Checkpoint zero and pending zero are both valid Genesis identities,
+            // so the latest numeric value cannot distinguish an empty database
+            // from a committed Genesis block. The exact checkpoint-to-pending
+            // mapping is written as part of the Genesis commit and is therefore
+            // the durable presence marker.
+            match self.db.get_unique_pending_id_for_checkpoint_id(0).await {
+                Ok(Some((0, 0))) => {}
+                Ok(Some(_)) => return Ok(DatabaseCheckState::NeedsRecovery),
+                Ok(None) | Err(_) => return Ok(DatabaseCheckState::NeedsGenesis),
             }
         }
 

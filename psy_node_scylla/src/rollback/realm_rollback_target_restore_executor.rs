@@ -211,7 +211,7 @@ impl ScyllaRealmRollbackTargetRestoreExecutor {
             plan.processing(),
             plan.gathering(),
             plan.restored_observation().map_err(backend)?,
-            plan.target_pipeline().processing().pending_id().get(),
+            plan.target_processed_pending_id(),
         ).map_err(backend)?;
         let key = PendingGenerationLedgerKey::new(plan.target().network_id(), plan.authority());
         match self.pipeline.read::<Hash>(key).await.map_err(backend)? {
@@ -304,7 +304,7 @@ impl ScyllaRealmRollbackTargetRestoreExecutor {
         let timestamp = reservation.candidate().seal_completion(timestamp_key, reservation.lease()).map_err(backend)?.candidate();
         let pipeline = plan.source_pipeline().seal_rollback_reset_contexts(
             plan.processing(), plan.gathering(), plan.restored_observation().map_err(backend)?,
-            plan.target_pipeline().processing().pending_id().get(),
+            plan.target_processed_pending_id(),
         ).map_err(backend)?;
         let writer = SealedBranchExactWriterCas::rollback_restore(
             plan.source_writer(), plan.restored_writer_watermark().map_err(backend)?,

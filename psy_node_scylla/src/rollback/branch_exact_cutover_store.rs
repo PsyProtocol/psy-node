@@ -463,9 +463,8 @@ mod tests {
     }
 
     #[test]
-    fn prototype_is_not_registered_in_production_setup() {
+    fn cutover_table_is_not_registered_in_generic_setup() {
         let setup = include_str!("../psy_setup.rs");
         assert!(!setup.contains(TABLE));
-        assert!(!setup.contains("ScyllaBranchExactCutoverStore"));
     }
 }

@@ -470,8 +470,10 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
             update_user_contract_tree_nodes_ffs: builder.user_contract_tree_nodes_ffs,
             update_contract_state_tree_nodes_ffs: builder.contract_state_tree_nodes_ffs,
             update_user_leaves_ffs: builder.user_leaves_ffs,
-            old_realm_root: coordinator_update.merkle_proof_to_realm_root.root,
-            new_realm_root: coordinator_update.merkle_proof_to_realm_root.root,
+            // The proof root is the global user tree root. A Realm processor
+            // commits the selected leaf value, which is its own Realm root.
+            old_realm_root: coordinator_update.merkle_proof_to_realm_root.value,
+            new_realm_root: coordinator_update.merkle_proof_to_realm_root.value,
             update_global_user_tree_nodes_ffs: builder.global_user_tree_nodes_ffs,
             update_contract_state_imt_leaves_ffs: vec![],
         };

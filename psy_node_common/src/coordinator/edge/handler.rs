@@ -19,8 +19,8 @@ use psy_api_core::{
 use psy_data::{
     guta::header_extended::{GlobalUserTreeAggregatorHeaderWithTagValueAndJobID, GlobalUserTreeAggregatorHeaderWithTagValueAndJobType}, prepared_block::realm::PsyRealmCoordinatorUpdate,
     protocol::canonical_chain::{
-        checkpoint_hash_from_saved_proof_bytes, CanonicalChainRef, CheckpointHash,
-        CheckpointId, CheckpointRef, NetworkId,
+        checkpoint_hash_from_saved_proof_bytes, genesis_checkpoint_hash,
+        CanonicalChainRef, CheckpointHash, CheckpointId, CheckpointRef, NetworkId,
     }, v1::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
@@ -586,6 +586,7 @@ pub struct CoordinatorEdgeHandler<
     pub contract_state_tree_height_cache: Arc<DashMapContractHeightCache<N::QHash>>,
 
     pub checkpoint_state_transition_circuit_fingerprint: N::QHash,
+    pub genesis_checkpoint_state_transition_fingerprint: N::QHash,
     pub network_id: NetworkId,
 }
 impl<
@@ -630,6 +631,7 @@ impl<
             proof_verifier: self.proof_verifier.clone(),
             contract_state_tree_height_cache: self.contract_state_tree_height_cache.clone(),
             checkpoint_state_transition_circuit_fingerprint: self.checkpoint_state_transition_circuit_fingerprint.clone(),
+            genesis_checkpoint_state_transition_fingerprint: self.genesis_checkpoint_state_transition_fingerprint.clone(),
             network_id: self.network_id,
         }
     }
@@ -671,6 +673,7 @@ impl<
         realm_identifier: QRealmIdentifier,
         proof_verifier: Arc<N::ZKVerifier>,
         checkpoint_state_transition_circuit_fingerprint: N::QHash,
+        genesis_checkpoint_state_transition_fingerprint: N::QHash,
         network_id: NetworkId,
     ) -> Self {
         let realm_id_u64 = realm_identifier.realm_id as u64;
@@ -693,6 +696,7 @@ impl<
             proof_verifier,
             contract_state_tree_height_cache: Arc::new(DashMapContractHeightCache::new()),
             checkpoint_state_transition_circuit_fingerprint,
+            genesis_checkpoint_state_transition_fingerprint,
             network_id,
         }
     }
@@ -855,11 +859,16 @@ impl<
             .db_reader
             .get_verifiable_checkpoint_state_transition_and_zkp(checkpoint_id)
             .await?;
-        let computed_checkpoint_hash = stored_transition
-            .get_computed_public_inputs_hash::<N::HasherBase>();
         let checkpoint_hash = if checkpoint_id == 0 && stored_transition.zk_proof.is_empty() {
-            CheckpointHash::from_proof_public_inputs_hash(computed_checkpoint_hash)
+            let transition = &stored_transition.info.state_transition.checkpoint_transition;
+            genesis_checkpoint_hash::<_, N::HasherBase>(
+                transition.new_checkpoint_tree_root,
+                transition.new_checkpoint_leaf_hash,
+                self.genesis_checkpoint_state_transition_fingerprint,
+            )
         } else {
+            let computed_checkpoint_hash = stored_transition
+                .get_computed_public_inputs_hash::<N::HasherBase>();
             let extracted = checkpoint_hash_from_saved_proof_bytes::<
                 N::QHash,
                 N::ZKProof,

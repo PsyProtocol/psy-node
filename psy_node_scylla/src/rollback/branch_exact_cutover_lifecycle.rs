@@ -465,15 +465,39 @@ pub struct BranchExactCutoverBootstrap<Hash> {
 
 impl<Hash: Q256BitHash> BranchExactCutoverBootstrap<Hash> {
     pub(super) fn seal(binding: BranchExactCutoverBinding<Hash>) -> Self {
+        Self::seal_phase(
+            binding,
+            BranchExactCutoverPhase::LegacyPrimaryDualWrite,
+        )
+    }
+
+    /// A brand-new Realm has no legacy history to serve.  After the exact
+    /// empty legacy/target inventories have been audited and consumed by the
+    /// active writer, bootstrap directly into the target-primary route.  This
+    /// does not bypass the normal binding closure: callers still need the
+    /// matching writer, consumed shadow receipt and authority-local head.
+    pub(super) fn seal_genesis_target(
+        binding: BranchExactCutoverBinding<Hash>,
+    ) -> Self {
+        Self::seal_phase(
+            binding,
+            BranchExactCutoverPhase::TargetPrimaryDualWrite,
+        )
+    }
+
+    fn seal_phase(
+        binding: BranchExactCutoverBinding<Hash>,
+        phase: BranchExactCutoverPhase,
+    ) -> Self {
         let decision = decision_digest(
             binding.digest,
             BranchExactCutoverRevision(0),
-            BranchExactCutoverPhase::LegacyPrimaryDualWrite,
+            phase,
         );
         let mut candidate = StoredBranchExactCutover {
             revision: BranchExactCutoverRevision(0),
             binding,
-            phase: BranchExactCutoverPhase::LegacyPrimaryDualWrite,
+            phase,
             last_decision: decision,
             state_digest: BranchExactCutoverStateDigest([1; 32]),
         };
@@ -967,6 +991,25 @@ mod tests {
         BranchExactCutoverBootstrap::seal(binding(8))
             .candidate()
             .clone()
+    }
+
+    #[test]
+    fn genesis_bootstrap_starts_target_primary_without_quiescing() {
+        let state = BranchExactCutoverBootstrap::seal_genesis_target(binding(9))
+            .candidate()
+            .clone();
+        assert_eq!(state.revision().get(), 0);
+        assert_eq!(
+            state.phase(),
+            BranchExactCutoverPhase::TargetPrimaryDualWrite
+        );
+        let decoded = StoredBranchExactCutover::<PHash>::decode_persisted(
+            state.binding().generation().get().try_into().unwrap(),
+            0,
+            &state.to_canonical_bytes(),
+        )
+        .unwrap();
+        assert_eq!(decoded, state);
     }
 
     fn permit(state: &StoredBranchExactCutover<PHash>, seed: u8) -> BranchExactCutoverPermit {

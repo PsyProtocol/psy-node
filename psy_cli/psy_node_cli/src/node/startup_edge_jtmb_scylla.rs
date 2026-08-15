@@ -38,6 +38,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
 
     let fingerprint_config = PsyJTMBPoseidonGoldilocksNodeConfigResolver::new().get_circuit_fingerprint_config_for_network(config.network)?;
     let checkpoint_state_transition_circuit_fingerprint = fingerprint_config.checkpoint_state_transition_circuit_fingerprint;
+    let genesis_checkpoint_state_transition_fingerprint = fingerprint_config.genesis_checkpoint_state_transition_fingerprint;
 
     let pool = new_redis_async_pool(&config.redis_url, 10).await?;
 
@@ -124,6 +125,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
                 realm_identifier,
                 proof_verifier,
                 checkpoint_state_transition_circuit_fingerprint,
+                genesis_checkpoint_state_transition_fingerprint,
                 config.network.into(),
             );
             let handler = if let Some(store) = durable_guta_submissions {
@@ -179,6 +181,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
                 realm_identifier,
                 proof_verifier,
                 checkpoint_state_transition_circuit_fingerprint,
+                genesis_checkpoint_state_transition_fingerprint,
                 config.network.into(),
             );
             let handler = if let Some(store) = durable_guta_submissions {

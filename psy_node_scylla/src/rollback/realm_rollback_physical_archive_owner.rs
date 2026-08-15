@@ -33,7 +33,7 @@ use super::{
     realm_full_commit_scylla::RealmFullCommitScyllaExecutor,
     realm_rollback_commit_inventory_store::{
         ScyllaRealmRollbackCommitInventoryStore,
-        VerifiedRealmRollbackCommittedSuffixEntry,
+        VerifiedRealmRollbackTarget,
     },
     realm_rollback_physical_archive_store::{
         PersistedRealmRollbackParticipantCompletion,
@@ -159,18 +159,18 @@ impl ScyllaRealmRollbackPhysicalArchiveOwner {
         {
             return Err(RealmRollbackPhysicalArchiveOwnerError::SourceHeadMismatch);
         }
-        let target_entry = self.inventory.read_committed_height(
+        let target = self.inventory.read_rollback_target(
             authority,
             network,
             source_chain.chain_epoch(),
             plan.target().checkpoint().checkpoint_id().get(),
         ).await.map_err(backend)?;
-        let target_chain = *target_entry.inventory().candidate().canonical_chain();
+        let target_chain = *target.chain();
         let suffix = self.inventory.scan_committed_suffix(
             authority, target_chain, source_chain,
         ).await.map_err(backend)?;
         let catalog = RealmRollbackPhysicalCatalog::try_from_selected(
-            suffix, Some(&target_entry),
+            suffix, &target,
         )?;
         let entry_count = u64::try_from(catalog.entries().len())
             .map_err(|_| RealmRollbackPhysicalArchiveOwnerError::LengthOverflow)?;
@@ -187,7 +187,7 @@ impl ScyllaRealmRollbackPhysicalArchiveOwner {
         }
         let dataset_digest: [u8; 32] = first.finalize().into();
 
-        self.require_sources_unchanged(plan, authority, &source_head, &target_entry, &catalog).await?;
+        self.require_sources_unchanged(plan, authority, &source_head, &target, &catalog).await?;
         narrow_cache.clear();
         let mut second = participant_dataset_hasher(
             plan.digest(), authority, &source_head, &target_chain.to_canonical_bytes(),
@@ -202,7 +202,7 @@ impl ScyllaRealmRollbackPhysicalArchiveOwner {
         if <[u8; 32]>::from(second.finalize()) != dataset_digest {
             return Err(RealmRollbackPhysicalArchiveOwnerError::DatasetChanged);
         }
-        self.require_sources_unchanged(plan, authority, &source_head, &target_entry, &catalog).await?;
+        self.require_sources_unchanged(plan, authority, &source_head, &target, &catalog).await?;
 
         Ok(RealmRollbackPhysicalParticipantArchiveReceipt {
             participant_plan_digest: *plan.digest(),
@@ -350,9 +350,9 @@ impl ScyllaRealmRollbackPhysicalArchiveOwner {
         {
             return Err(RealmRollbackPhysicalArchiveOwnerError::SourceHeadMismatch);
         }
-        let target_entry = self
+        let target = self
             .inventory
-            .read_committed_height(
+            .read_rollback_target(
                 authority,
                 network,
                 source_chain.chain_epoch(),
@@ -360,7 +360,7 @@ impl ScyllaRealmRollbackPhysicalArchiveOwner {
             )
             .await
             .map_err(backend)?;
-        let target_chain = *target_entry.inventory().candidate().canonical_chain();
+        let target_chain = *target.chain();
         let suffix = self
             .inventory
             .scan_committed_suffix(authority, target_chain, source_chain)
@@ -368,7 +368,7 @@ impl ScyllaRealmRollbackPhysicalArchiveOwner {
             .map_err(backend)?;
         let catalog = RealmRollbackPhysicalCatalog::try_from_selected(
             suffix,
-            Some(&target_entry),
+            &target,
         )?;
         let entry_count = u64::try_from(catalog.entries().len())
             .map_err(|_| RealmRollbackPhysicalArchiveOwnerError::LengthOverflow)?;
@@ -421,16 +421,16 @@ impl ScyllaRealmRollbackPhysicalArchiveOwner {
         {
             return Err(RealmRollbackPhysicalArchiveOwnerError::SourceHeadMismatch);
         }
-        let target_entry = self.inventory.read_committed_height(
+        let target = self.inventory.read_rollback_target(
             authority,
             network,
             source_chain.chain_epoch(),
             plan.target().checkpoint().checkpoint_id().get(),
         ).await.map_err(backend)?;
-        let target_chain = *target_entry.inventory().candidate().canonical_chain();
+        let target_chain = *target.chain();
         let suffix = self.inventory.scan_committed_suffix(authority, target_chain, source_chain)
             .await.map_err(backend)?;
-        let catalog = RealmRollbackPhysicalCatalog::try_from_selected(suffix, Some(&target_entry))?;
+        let catalog = RealmRollbackPhysicalCatalog::try_from_selected(suffix, &target)?;
         let entry_count = u64::try_from(catalog.entries().len())
             .map_err(|_| RealmRollbackPhysicalArchiveOwnerError::LengthOverflow)?;
         let mut dataset = participant_dataset_hasher(
@@ -445,7 +445,7 @@ impl ScyllaRealmRollbackPhysicalArchiveOwner {
             update_dataset(&mut dataset, index, &image)?;
         }
         let dataset_digest: [u8; 32] = dataset.finalize().into();
-        self.require_sources_unchanged(plan, authority, &source_head, &target_entry, &catalog).await?;
+        self.require_sources_unchanged(plan, authority, &source_head, &target, &catalog).await?;
         Ok(RealmRollbackPhysicalParticipantArchiveReceipt {
             participant_plan_digest: *plan.digest(),
             authority,
@@ -497,7 +497,7 @@ impl ScyllaRealmRollbackPhysicalArchiveOwner {
         plan: &RollbackParticipantPlan<Hash>,
         authority: AuthorityScope,
         source_head: &StoredAuthorityLocalHead<Hash>,
-        target: &VerifiedRealmRollbackCommittedSuffixEntry<Hash>,
+        target: &VerifiedRealmRollbackTarget<Hash>,
         catalog: &RealmRollbackPhysicalCatalog<Hash>,
     ) -> Result<(), RealmRollbackPhysicalArchiveOwnerError> {
         if self.read_local_head::<Hash>(
@@ -505,15 +505,7 @@ impl ScyllaRealmRollbackPhysicalArchiveOwner {
         ).await? != *source_head {
             return Err(RealmRollbackPhysicalArchiveOwnerError::SourceChanged);
         }
-        let current_target = self.inventory.read_committed_height(
-            authority,
-            plan.target().network_id(),
-            source_head.head().chain().chain_epoch(),
-            plan.target().checkpoint().checkpoint_id().get(),
-        ).await.map_err(backend)?;
-        if current_target != *target {
-            return Err(RealmRollbackPhysicalArchiveOwnerError::SourceChanged);
-        }
+        self.inventory.revalidate_rollback_target(target).await.map_err(backend)?;
         self.inventory.revalidate_committed_suffix(catalog.suffix()).await.map_err(backend)?;
         Ok(())
     }
@@ -662,7 +654,7 @@ mod tests {
         for forbidden in ["execute_delete", "execute_restore", "cross_archive_barrier", "publish_head", "seal_rotation"] {
             assert!(!production.contains(forbidden));
         }
-        assert!(production.contains("read_committed_height"));
+        assert!(production.contains("read_rollback_target"));
         assert!(production.contains("persist_and_readback"));
         assert!(production.contains("revalidate_image_exact"));
     }

@@ -8,6 +8,7 @@
 use std::{error::Error, fmt};
 
 use parth_core::protocol::core_types::Q256BitHash;
+use psy_data::protocol::canonical_chain::CanonicalChainRef;
 use psy_node_core::store::{
     authority_commit::{
         AuthorityClockSampleUs, AuthorityCommitIntentDigest, AuthorityIntentObservation,
@@ -20,9 +21,14 @@ use psy_node_core::store::{
         BranchExactDualWriteIntent, BranchExactDualWriteIntentDigest,
         SealedBranchExactDualWrite,
     },
-    branch_exact_schema::AuthorityScope,
+    branch_exact_schema::{
+        AuthorityScope, BranchExactSchemaMaterializationPlan,
+    },
     branch_pending_mapping::{
         BranchPendingMapping, BRANCH_PENDING_CANONICAL_REF_LEN,
+    },
+    canonical_head::{
+        CanonicalHeadBootstrap, CanonicalHeadBootstrapProfile,
     },
     timestamp::CommitWriteTimestampUs,
     typed::UniquePendingId,
@@ -39,12 +45,13 @@ use sha2::{Digest, Sha256};
 
 use super::{
     source_receipt_digest, BranchExactBackfillArtifact,
-    BranchExactBackfillDatasetDigest, BranchExactFrozenLegacyExportPermit,
-    BranchExactBackfillVerifiedReceipt, BranchExactLegacyExportReceipt,
+    BranchExactBackfillDatasetDigest, BranchExactBackfillMode,
+    BranchExactBackfillVerifiedReceipt, BranchExactFrozenLegacyExportPermit,
+    BranchExactLegacyExportReceipt,
     BranchExactSchemaReady,
     BranchExactSchemaReadyDigest, BranchExactShadowSourceReceiptDigest,
     BranchExactShadowVerifiedDigest, BranchExactShadowVerifiedReceipt,
-    BranchExactWriterCutoverFence,
+    BranchExactSchemaMaterializationRequest, BranchExactWriterCutoverFence,
 };
 
 const MAGIC: [u8; 8] = *b"PSYBEXWL";
@@ -316,6 +323,106 @@ impl<Hash: Q256BitHash> BranchExactWriterActivationPlan<Hash> {
             plan.baseline.canonical_chain().network_id(),
             authority,
         );
+        Ok(plan)
+    }
+
+    /// Activate the existing writer lifecycle for a brand-new Realm without
+    /// fabricating a legacy export.  The empty shadow receipt must come from
+    /// full live scans, and the baseline is derived from the exact genesis
+    /// anchor retained by the verified schema deployment.
+    pub(crate) fn try_genesis_realm(
+        generation: BranchExactWriterGeneration,
+        ready: &BranchExactSchemaReady,
+        shadow: &BranchExactShadowVerifiedReceipt,
+        genesis: CanonicalChainRef<Hash>,
+        timestamp_state: ObservedAuthorityTimestampState,
+        verifier_profile: BranchExactWriterVerifierProfile,
+    ) -> Result<Self, BranchExactWriterLifecycleError> {
+        let view = ready.view();
+        let AuthorityScope::Realm { .. } = view.authority() else {
+            return Err(BranchExactWriterLifecycleError::AuthorityOrKeyspaceMismatch);
+        };
+        let backfill = ready.expected_receipt();
+        if view.profile() != CanonicalHeadBootstrapProfile::GenesisNative
+            || backfill.plan().mode() != BranchExactBackfillMode::GenesisEmpty
+            || backfill.plan().total_chunks() != 0
+            || backfill.plan().pair_rows_per_direction() != 0
+            || backfill.plan().proof_rows() != 0
+            || backfill.digest() != view.backfill_receipt_digest()
+            || backfill.plan().dataset_digest() != view.dataset_digest()
+        {
+            return Err(BranchExactWriterLifecycleError::BackfillEvidenceMismatch);
+        }
+        let shadow_plan = shadow.plan();
+        if shadow_plan.schema_ready_digest() != view.digest()
+            || shadow_plan.dataset_digest() != view.dataset_digest()
+            || shadow_plan.mapping_rows() != 0
+            || shadow_plan.proof_rows() != 0
+        {
+            return Err(BranchExactWriterLifecycleError::ShadowEvidenceMismatch);
+        }
+        if genesis.checkpoint().checkpoint_id().get() != 0
+            || genesis.chain_epoch().get() != 0
+        {
+            return Err(BranchExactWriterLifecycleError::BackfillEvidenceMismatch);
+        }
+        let bootstrap = CanonicalHeadBootstrap::try_new(
+            CanonicalHeadBootstrapProfile::GenesisNative,
+            genesis,
+        )
+        .map_err(|error| BranchExactWriterLifecycleError::Intent(error.to_string()))?;
+        let materialization = BranchExactSchemaMaterializationPlan::try_new(
+            &bootstrap,
+            view.authority(),
+            None,
+        )
+        .map_err(|error| BranchExactWriterLifecycleError::Intent(error.to_string()))?;
+        let request = BranchExactSchemaMaterializationRequest::try_new(
+            view.keyspace().clone(),
+            materialization,
+        )
+        .map_err(|error| BranchExactWriterLifecycleError::Intent(error.to_string()))?;
+        if !backfill.plan().deployment().intent().matches_request(&request) {
+            return Err(BranchExactWriterLifecycleError::BackfillEvidenceMismatch);
+        }
+        let baseline = BranchPendingMapping::new(
+            genesis,
+            UniquePendingId::try_new(0)
+                .map_err(|error| BranchExactWriterLifecycleError::Intent(error.to_string()))?,
+        );
+        let observed_key = timestamp_state.key();
+        let observed = timestamp_state.state();
+        if observed_key.network() != genesis.network_id()
+            || observed_key.authority() != view.authority()
+            || !matches!(observed.phase(), AuthorityTimestampPhase::Idle { .. })
+        {
+            return Err(BranchExactWriterLifecycleError::TimestampAllocatorNotReady);
+        }
+        if BranchExactWriterVerifierProfile::for_authority(
+            view.authority(),
+            verifier_profile.realm_profile(),
+        )? != verifier_profile
+        {
+            return Err(BranchExactWriterLifecycleError::VerifierProfileBindingMismatch);
+        }
+
+        let mut plan = Self {
+            generation,
+            authority: view.authority(),
+            schema_ready_digest: view.digest(),
+            backfill_receipt: backfill.clone(),
+            shadow_audit_slot: shadow_plan.slot(),
+            shadow_verified_digest: shadow.digest(),
+            source_receipt_digest: shadow_plan.source_receipt_digest(),
+            dataset_digest: view.dataset_digest(),
+            baseline,
+            baseline_timestamp_state: observed,
+            verifier_profile,
+            digest: BranchExactWriterActivationDigest([0; 32]),
+            slot: BranchExactWriterSlot([0; 32]),
+        };
+        plan.digest = activation_digest(&plan);
+        plan.slot = writer_slot(genesis.network_id(), view.authority());
         Ok(plan)
     }
 

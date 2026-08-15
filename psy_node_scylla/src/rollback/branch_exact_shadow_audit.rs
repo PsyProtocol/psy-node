@@ -19,10 +19,11 @@ use scylla::{
 use sha2::{Digest, Sha256};
 
 use super::{
-    BranchExactBackfillArtifact,
-    BranchExactBackfillDatasetDigest, BranchExactLegacyExportReceipt,
+    BranchExactBackfillArtifact, BranchExactBackfillDatasetDigest,
+    BranchExactBackfillMode, BranchExactLegacyExportReceipt,
     BranchExactFrozenLegacyExportPermit,
-    BranchExactSchemaReadyDigest, BranchExactShadowAuditDigest,
+    BranchExactSchemaReady, BranchExactSchemaReadyDigest,
+    BranchExactShadowAuditDigest,
     BranchExactShadowAuditObservation, BranchExactShadowReadError,
     BranchExactDeploymentNoTabletKeyspace,
     ScyllaBranchExactShadowReader,
@@ -34,6 +35,8 @@ const STATE_CODEC_VERSION: u16 = 1;
 const PLAN_DIGEST_DOMAIN: &[u8] = b"psy/rollback/branch-exact-shadow-audit-plan/v1";
 const SOURCE_RECEIPT_DIGEST_DOMAIN: &[u8] =
     b"psy/rollback/branch-exact-shadow-source-receipt/v1";
+const GENESIS_EMPTY_SOURCE_DIGEST_DOMAIN: &[u8] =
+    b"psy/rollback/branch-exact-genesis-empty-source/v1";
 const VERIFIED_DIGEST_DOMAIN: &[u8] =
     b"psy/rollback/branch-exact-shadow-verified/v1";
 const BLOCKED_DIGEST_DOMAIN: &[u8] =
@@ -122,6 +125,42 @@ impl BranchExactShadowAuditPlan {
             source_receipt_digest,
             mapping_rows: source.pair_rows(),
             proof_rows: source.proof_rows(),
+            digest: BranchExactShadowAuditPlanDigest([0; 32]),
+            slot: BranchExactShadowAuditSlot([0; 32]),
+        };
+        plan.digest = plan_digest(&plan);
+        plan.slot = slot_digest(plan.digest, generation);
+        Ok(plan)
+    }
+
+    pub(crate) fn try_genesis_empty(
+        generation: BranchExactShadowAuditGeneration,
+        ready: &BranchExactSchemaReady,
+    ) -> Result<Self, BranchExactShadowAuditError> {
+        let view = ready.view();
+        let backfill = ready.expected_receipt().plan();
+        if backfill.mode() != BranchExactBackfillMode::GenesisEmpty
+            || backfill.total_chunks() != 0
+            || backfill.pair_rows_per_direction() != 0
+            || backfill.proof_rows() != 0
+            || backfill.dataset_digest() != view.dataset_digest()
+        {
+            return Err(BranchExactShadowAuditError::GenesisEvidenceMismatch);
+        }
+        let mut source = Sha256::new();
+        source.update(GENESIS_EMPTY_SOURCE_DIGEST_DOMAIN);
+        source.update(view.digest().as_bytes());
+        source.update(view.backfill_receipt_digest().as_bytes());
+        source.update(view.dataset_digest().as_bytes());
+        let mut plan = Self {
+            generation,
+            schema_ready_digest: view.digest(),
+            dataset_digest: view.dataset_digest(),
+            source_receipt_digest: BranchExactShadowSourceReceiptDigest(
+                source.finalize().into(),
+            ),
+            mapping_rows: 0,
+            proof_rows: 0,
             digest: BranchExactShadowAuditPlanDigest([0; 32]),
             slot: BranchExactShadowAuditSlot([0; 32]),
         };
@@ -629,6 +668,84 @@ impl ScyllaBranchExactShadowAuditExecutor {
             }
         }
     }
+
+    /// Persist a real empty-baseline audit for a brand-new authority.  The
+    /// reader performs full legacy/target scans before a VERIFIED row can be
+    /// published; this path accepts neither an artifact nor a caller supplied
+    /// zero-row observation.
+    pub(crate) async fn run_genesis_empty<
+        Hash: parth_core::protocol::core_types::Q256BitHash,
+    >(
+        store: &ScyllaBranchExactShadowAuditStore,
+        reader: &ScyllaBranchExactShadowReader<Hash>,
+        ready: &BranchExactSchemaReady,
+        generation: BranchExactShadowAuditGeneration,
+    ) -> Result<BranchExactShadowAuditExecutionOutcome, BranchExactShadowAuditRunError> {
+        if reader.setup_view() != ready.view() {
+            return Err(BranchExactShadowAuditError::GenesisEvidenceMismatch.into());
+        }
+        let plan = BranchExactShadowAuditPlan::try_genesis_empty(generation, ready)?;
+        let bootstrap = BranchExactShadowAuditBootstrap::new(plan.clone());
+        let current = match store.bootstrap(&bootstrap).await? {
+            BranchExactShadowAuditWriteOutcome::Applied(current)
+            | BranchExactShadowAuditWriteOutcome::Idempotent(current) => current,
+            BranchExactShadowAuditWriteOutcome::Conflict(current) => {
+                return existing_terminal(current)
+            }
+        };
+        match current.state() {
+            BranchExactShadowAuditState::Verified(receipt) => {
+                return Ok(BranchExactShadowAuditExecutionOutcome::Idempotent(
+                    receipt.clone(),
+                ))
+            }
+            BranchExactShadowAuditState::Blocked(receipt) => {
+                return Err(BranchExactShadowAuditRunError::PreviouslyBlocked(
+                    receipt.mismatch_digest(),
+                ))
+            }
+            BranchExactShadowAuditState::Consumed(receipt) => {
+                return Err(BranchExactShadowAuditRunError::AlreadyConsumed(
+                    receipt.digest(),
+                ))
+            }
+            BranchExactShadowAuditState::Comparing(_) => {}
+        }
+
+        match reader.audit_genesis_empty().await {
+            Ok(observation) => {
+                let receipt = BranchExactShadowVerifiedReceipt::try_new(
+                    plan,
+                    &observation,
+                )?;
+                let sealed = SealedBranchExactShadowAuditCas::verify(
+                    &current,
+                    receipt.clone(),
+                )?;
+                match store.compare_and_set(&sealed).await? {
+                    BranchExactShadowAuditWriteOutcome::Applied(_)
+                    | BranchExactShadowAuditWriteOutcome::Idempotent(_) => Ok(
+                        BranchExactShadowAuditExecutionOutcome::Verified(receipt),
+                    ),
+                    BranchExactShadowAuditWriteOutcome::Conflict(other) => {
+                        existing_terminal(other)
+                    }
+                }
+            }
+            Err(read_error) => {
+                let blocked = BranchExactShadowBlockedReceipt::from_error(
+                    plan,
+                    &read_error,
+                );
+                let blocked_digest = blocked.mismatch_digest();
+                persist_blocked(store, current, blocked).await?;
+                Err(BranchExactShadowAuditRunError::Comparison {
+                    mismatch_digest: blocked_digest,
+                    source: read_error,
+                })
+            }
+        }
+    }
 }
 
 /// A mismatch is monotonic and dominates a concurrently published VERIFIED
@@ -1127,6 +1244,7 @@ pub enum BranchExactShadowAuditError {
     InvalidAppliedColumn,
     CurrentMissingAfterLwt,
     FreezePermitMismatch,
+    GenesisEvidenceMismatch,
     Cql(String),
 }
 

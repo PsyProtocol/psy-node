@@ -27,6 +27,7 @@ use super::{
 pub const BRANCH_EXACT_DEPLOYMENT_CODEC_VERSION: u16 = 1;
 pub const INSPECT_LOCAL_SCHEMA_POSTFLIGHT_CQL: &str =
     "SELECT host_id, schema_version FROM system.local";
+pub const INSPECT_LOCAL_HOST_ID_CQL: &str = "SELECT host_id FROM system.local";
 
 const MIN_EXPECTED_TOPOLOGY_NODES: usize = 3;
 const MAX_EXPECTED_TOPOLOGY_NODES: usize = u16::MAX as usize;
@@ -98,7 +99,10 @@ impl BranchExactExpectedTopology {
     pub fn try_new(
         mut nodes: Vec<BranchExactScyllaNodeId>,
     ) -> Result<Self, BranchExactDeploymentError> {
-        if nodes.len() < MIN_EXPECTED_TOPOLOGY_NODES {
+        // One node is reserved for the explicitly guarded LocalDevnet
+        // functional path. Production callers require at least three; two is
+        // never a valid topology in either mode.
+        if nodes.len() != 1 && nodes.len() < MIN_EXPECTED_TOPOLOGY_NODES {
             return Err(BranchExactDeploymentError::TopologyTooSmall {
                 actual: nodes.len(),
                 minimum: MIN_EXPECTED_TOPOLOGY_NODES,
@@ -118,6 +122,15 @@ impl BranchExactExpectedTopology {
         Ok(Self { nodes, digest })
     }
 
+    /// Explicit single-replica topology for LocalDevnet functional testing.
+    /// Production callers must use `try_new`, whose minimum remains three
+    /// distinct replicas.
+    pub(crate) fn local_devnet_single(node: BranchExactScyllaNodeId) -> Self {
+        let nodes = vec![node];
+        let digest = expected_topology_digest(&nodes);
+        Self { nodes, digest }
+    }
+
     pub fn nodes(&self) -> &[BranchExactScyllaNodeId] {
         &self.nodes
     }
@@ -125,6 +138,21 @@ impl BranchExactExpectedTopology {
     pub const fn digest(&self) -> BranchExactExpectedTopologyDigest {
         self.digest
     }
+}
+
+/// Read the identity of one operator-targeted node before DDL.  The returned
+/// identity is later closed by the full schema postflight; it is not schema
+/// readiness evidence by itself.
+pub async fn inspect_branch_exact_local_node_id(
+    targeted_session: &Session,
+) -> anyhow::Result<BranchExactScyllaNodeId> {
+    let host_id = targeted_session
+        .query_unpaged(INSPECT_LOCAL_HOST_ID_CQL, &[])
+        .await?
+        .into_rows_result()?
+        .single_row::<(Uuid,)>()?
+        .0;
+    Ok(BranchExactScyllaNodeId::from_uuid(host_id)?)
 }
 
 fn expected_topology_digest(

@@ -36,6 +36,9 @@ use super::{
         RealmRollbackCommitInventory, RealmRollbackCommitInventoryError,
         RealmRollbackCommitInventorySlot,
     },
+    realm_rollback_genesis_anchor::{
+        RealmRollbackGenesisAnchor, RealmRollbackGenesisAnchorError,
+    },
     realm_full_commit_manifest_store::PersistedRealmFullCommitManifestReceipt,
 };
 
@@ -445,6 +448,91 @@ impl<Hash: Q256BitHash> VerifiedRealmRollbackCommittedSuffixEntry<Hash> {
     }
 }
 
+/// Exact immutable evidence for the requested Realm rollback height.
+///
+/// Checkpoint zero is selected from the activation-time Genesis anchor;
+/// later checkpoints are selected from normal COMMITTED inventory markers.
+/// Keeping this distinction typed prevents Genesis from being forged into a
+/// normal full commit while allowing the physical delete/restore path to stay
+/// common after target selection.
+#[derive(Debug, Eq, PartialEq)]
+pub(super) enum VerifiedRealmRollbackTarget<Hash> {
+    Genesis(RealmRollbackGenesisAnchor<Hash>),
+    Committed(VerifiedRealmRollbackCommittedSuffixEntry<Hash>),
+}
+
+impl<Hash: Q256BitHash> VerifiedRealmRollbackTarget<Hash> {
+    pub(super) const fn authority(&self) -> AuthorityScope {
+        match self {
+            Self::Genesis(anchor) => anchor.authority(),
+            Self::Committed(entry) => entry.inventory().authority(),
+        }
+    }
+
+    pub(super) const fn chain(&self) -> &CanonicalChainRef<Hash> {
+        match self {
+            Self::Genesis(anchor) => anchor.genesis().chain(),
+            Self::Committed(entry) => entry.inventory().candidate().canonical_chain(),
+        }
+    }
+
+    pub(super) fn target_puts(&self) -> &[super::SealedTimestampedPut] {
+        match self {
+            Self::Genesis(anchor) => anchor.target_puts(),
+            Self::Committed(entry) => entry.inventory().typed_puts(),
+        }
+    }
+
+    pub(super) const fn evidence_slot(&self) -> [u8; 32] {
+        match self {
+            Self::Genesis(anchor) => *anchor.slot(),
+            Self::Committed(entry) => *entry.inventory_slot().as_bytes(),
+        }
+    }
+
+    pub(super) const fn evidence_digest(&self) -> &[u8; 32] {
+        match self {
+            Self::Genesis(anchor) => anchor.digest(),
+            Self::Committed(entry) => entry.inventory_digest(),
+        }
+    }
+
+    pub(super) const fn marker_digest(&self) -> &[u8; 32] {
+        match self {
+            // The Genesis anchor is the selected row and its own committed
+            // content evidence, so its digest intentionally fills both
+            // generic identity positions in the restore plan.
+            Self::Genesis(anchor) => anchor.digest(),
+            Self::Committed(entry) => entry.committed_marker_digest(),
+        }
+    }
+
+    pub(super) fn stored_head(
+        &self,
+    ) -> Result<StoredAuthorityLocalHead<Hash>, RealmRollbackCommitInventoryStoreError> {
+        match self {
+            Self::Genesis(anchor) => Ok(anchor.target_head().clone()),
+            Self::Committed(entry) => entry.stored_head(),
+        }
+    }
+
+    pub(super) fn stored_pipeline(
+        &self,
+    ) -> Result<StoredPendingPipeline<Hash>, RealmRollbackCommitInventoryStoreError> {
+        match self {
+            Self::Genesis(anchor) => Ok(anchor.target_pipeline().clone()),
+            Self::Committed(entry) => entry.stored_pipeline(),
+        }
+    }
+
+    pub(super) const fn writer_revision(&self) -> u64 {
+        match self {
+            Self::Genesis(anchor) => anchor.target_writer_revision(),
+            Self::Committed(entry) => entry.writer_revision(),
+        }
+    }
+}
+
 /// Exact, storage-selected committed Realm suffix in `(target, source_head]`.
 ///
 /// This is deliberately inert evidence. It cannot archive, cross the global
@@ -513,6 +601,97 @@ impl ScyllaRealmRollbackCommitInventoryStore {
 
     pub(super) const fn queries(&self) -> &RealmRollbackCommitInventoryQueries {
         &self.queries
+    }
+
+    pub(super) const fn genesis_anchor_fingerprint(&self) -> [u8; 32] {
+        self.fingerprint.0
+    }
+
+    /// Persist the checkpoint-0 target anchor in the otherwise-unused height
+    /// zero marker row. Normal COMMITTED scans are strictly `(target, head]`,
+    /// so this row can never be mistaken for an ordinary full commit.
+    pub(super) async fn persist_genesis_anchor<Hash: Q256BitHash>(
+        &self,
+        anchor: RealmRollbackGenesisAnchor<Hash>,
+    ) -> Result<RealmRollbackGenesisAnchor<Hash>, RealmRollbackCommitInventoryStoreError> {
+        if anchor.store_fingerprint() != &self.fingerprint.0 {
+            return Err(RealmRollbackCommitInventoryStoreError::StoreBindingMismatch);
+        }
+        let key = genesis_marker_key(anchor.authority(), anchor.genesis().chain())?;
+        let execution = self.session.execute_unpaged(
+            &self.insert_marker,
+            (
+                key.network_chain_id,
+                key.authority_kind,
+                key.realm_id,
+                key.realm_sub_id,
+                key.chain_epoch,
+                key.checkpoint_id,
+                ROW_REVISION,
+                anchor.slot().as_slice(),
+                anchor.canonical_bytes(),
+            ),
+        ).await;
+        if let Err(error) = execution {
+            return match self.read_genesis_anchor(
+                anchor.authority(),
+                anchor.genesis().chain().network_id(),
+                anchor.genesis().chain().chain_epoch(),
+            ).await {
+                Ok(Some(current)) if current == anchor => Ok(current),
+                Ok(_) => Err(RealmRollbackCommitInventoryStoreError::Indeterminate(error.to_string())),
+                Err(read) => Err(RealmRollbackCommitInventoryStoreError::Indeterminate(
+                    format!("execute={error}; read={read}"),
+                )),
+            };
+        }
+        let _ = decode_applied(execution.expect("checked success"))?;
+        let current = self.read_genesis_anchor(
+            anchor.authority(),
+            anchor.genesis().chain().network_id(),
+            anchor.genesis().chain().chain_epoch(),
+        ).await?.ok_or(RealmRollbackCommitInventoryStoreError::MissingAfterWrite)?;
+        if current != anchor {
+            return Err(RealmRollbackCommitInventoryStoreError::Conflict);
+        }
+        Ok(current)
+    }
+
+    pub(super) async fn read_genesis_anchor<Hash: Q256BitHash>(
+        &self,
+        authority: AuthorityScope,
+        network: NetworkId,
+        chain_epoch: ChainEpoch,
+    ) -> Result<Option<RealmRollbackGenesisAnchor<Hash>>, RealmRollbackCommitInventoryStoreError> {
+        let key = marker_partition_coordinates(authority, network, chain_epoch)?;
+        let row = self.session.execute_unpaged(
+            &self.read_marker,
+            (
+                key.network_chain_id,
+                key.authority_kind,
+                key.realm_id,
+                key.realm_sub_id,
+                key.chain_epoch,
+                0_i64,
+            ),
+        ).await.map_err(cql)?.into_rows_result().map_err(cql)?
+            .maybe_first_row::<(i64, Vec<u8>, Vec<u8>)>().map_err(cql)?;
+        let Some((revision, selected_slot, payload)) = row else {
+            return Ok(None);
+        };
+        if revision != ROW_REVISION {
+            return Err(RealmRollbackCommitInventoryStoreError::MalformedMarker);
+        }
+        let anchor = RealmRollbackGenesisAnchor::decode_persisted(&payload)?;
+        if selected_slot.as_slice() != anchor.slot()
+            || anchor.authority() != authority
+            || anchor.genesis().chain().network_id() != network
+            || anchor.genesis().chain().chain_epoch() != chain_epoch
+            || anchor.store_fingerprint() != &self.fingerprint.0
+        {
+            return Err(RealmRollbackCommitInventoryStoreError::SourceMismatch);
+        }
+        Ok(Some(anchor))
     }
 
     pub(super) async fn persist_prewrite<Hash: Q256BitHash>(
@@ -982,6 +1161,46 @@ impl ScyllaRealmRollbackCommitInventoryStore {
         Ok(VerifiedRealmRollbackCommittedSuffixEntry { inventory, marker })
     }
 
+    /// Select the exact target evidence for a product rollback height.
+    /// Genesis is not a COMMITTED full-commit row and therefore has an
+    /// explicit, separate selector.
+    pub(super) async fn read_rollback_target<Hash: Q256BitHash>(
+        &self,
+        authority: AuthorityScope,
+        network: NetworkId,
+        chain_epoch: ChainEpoch,
+        checkpoint_height: u64,
+    ) -> Result<VerifiedRealmRollbackTarget<Hash>, RealmRollbackCommitInventoryStoreError> {
+        if checkpoint_height == 0 {
+            return self
+                .read_genesis_anchor(authority, network, chain_epoch)
+                .await?
+                .map(VerifiedRealmRollbackTarget::Genesis)
+                .ok_or(RealmRollbackCommitInventoryStoreError::MissingGenesisAnchor);
+        }
+        self.read_committed_height(authority, network, chain_epoch, checkpoint_height)
+            .await
+            .map(VerifiedRealmRollbackTarget::Committed)
+    }
+
+    pub(super) async fn revalidate_rollback_target<Hash: Q256BitHash>(
+        &self,
+        target: &VerifiedRealmRollbackTarget<Hash>,
+    ) -> Result<(), RealmRollbackCommitInventoryStoreError> {
+        let current = self
+            .read_rollback_target(
+                target.authority(),
+                target.chain().network_id(),
+                target.chain().chain_epoch(),
+                target.chain().checkpoint().checkpoint_id().get(),
+            )
+            .await?;
+        if current != *target {
+            return Err(RealmRollbackCommitInventoryStoreError::Conflict);
+        }
+        Ok(())
+    }
+
     pub(super) async fn revalidate_committed_suffix<Hash: Q256BitHash>(
         &self,
         suffix: &VerifiedRealmRollbackCommittedSuffix<Hash>,
@@ -1117,6 +1336,18 @@ fn marker_key<Hash: Q256BitHash>(
     })
 }
 
+fn genesis_marker_key<Hash: Q256BitHash>(
+    authority: AuthorityScope,
+    genesis: &CanonicalChainRef<Hash>,
+) -> Result<MarkerKey, RealmRollbackCommitInventoryStoreError> {
+    if genesis.chain_epoch().get() != 0
+        || genesis.checkpoint().checkpoint_id().get() != 0
+    {
+        return Err(RealmRollbackCommitInventoryStoreError::SourceMismatch);
+    }
+    marker_partition_coordinates(authority, genesis.network_id(), genesis.chain_epoch())
+}
+
 fn marker_partition_key<Hash: Q256BitHash>(
     authority: AuthorityScope,
     source_head: &CanonicalChainRef<Hash>,
@@ -1229,6 +1460,7 @@ pub(super) enum RealmRollbackCommitInventoryStoreError {
     IncompleteSuffix,
     NonMonotonicPending,
     MissingCommittedCheckpoint,
+    MissingGenesisAnchor,
     PayloadTooLarge,
     MalformedFragment,
     MalformedMarker,
@@ -1239,11 +1471,15 @@ pub(super) enum RealmRollbackCommitInventoryStoreError {
     Conflict,
     Indeterminate(String),
     Inventory(RealmRollbackCommitInventoryError),
+    GenesisAnchor(RealmRollbackGenesisAnchorError),
     Cql(String),
 }
 
 impl From<RealmRollbackCommitInventoryError> for RealmRollbackCommitInventoryStoreError {
     fn from(value: RealmRollbackCommitInventoryError) -> Self { Self::Inventory(value) }
+}
+impl From<RealmRollbackGenesisAnchorError> for RealmRollbackCommitInventoryStoreError {
+    fn from(value: RealmRollbackGenesisAnchorError) -> Self { Self::GenesisAnchor(value) }
 }
 impl fmt::Display for RealmRollbackCommitInventoryStoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { write!(formatter, "{self:?}") }

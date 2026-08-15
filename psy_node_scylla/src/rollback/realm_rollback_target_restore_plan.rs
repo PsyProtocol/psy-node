@@ -37,7 +37,7 @@ use super::{
     PendingCounterReadState, SealedPendingCounterAllocation,
     StoredBranchExactWriterLifecycle, TimestampedWriteKind,
 };
-use super::realm_rollback_commit_inventory_store::VerifiedRealmRollbackCommittedSuffixEntry;
+use super::realm_rollback_commit_inventory_store::VerifiedRealmRollbackTarget;
 use super::rollback_global_delete_barrier::SelectedRealmRollbackDeleteCompletion;
 
 pub(super) const REALM_TARGET_RESTORE_PLAN_KEY_DOMAIN: i16 = -8;
@@ -100,7 +100,7 @@ impl<Hash: Q256BitHash> RealmRollbackTargetRestorePlan<Hash> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn try_from_selected(
         selected: &SelectedRealmRollbackDeleteCompletion<Hash>,
-        target: &VerifiedRealmRollbackCommittedSuffixEntry<Hash>,
+        target: &VerifiedRealmRollbackTarget<Hash>,
         source_head: StoredAuthorityLocalHead<Hash>,
         source_pipeline: StoredPendingPipeline<Hash>,
         source_writer: StoredBranchExactWriterLifecycle<Hash>,
@@ -135,16 +135,16 @@ impl<Hash: Q256BitHash> RealmRollbackTargetRestorePlan<Hash> {
         Self::try_from_fields(
             authority,
             *selected.barrier().target(),
-            *target.inventory().candidate().canonical_chain(),
+            *target.chain(),
             ChainEpoch::new(selected.barrier().deleting_head().canonical_ref().chain_epoch().get()),
             *selected.barrier().participant_plan_digest(),
             *selected.barrier().slot(),
             *selected.barrier().digest(),
             *selected.completion().slot(),
             *selected.completion().digest(),
-            *target.inventory_slot().as_bytes(),
-            *target.inventory_digest(),
-            *target.committed_marker_digest(),
+            target.evidence_slot(),
+            *target.evidence_digest(),
+            *target.marker_digest(),
             target.writer_revision(),
             target_head,
             target_pipeline,
@@ -232,9 +232,7 @@ impl<Hash: Q256BitHash> RealmRollbackTargetRestorePlan<Hash> {
             || target_head.head().chain() != &target
             || target_pipeline.key() != pipeline_key
             || target_pipeline.frontier().chain() != target_head.head().chain()
-            || !matches!(target_pipeline.phase(), PendingProcessingPhase::Published)
-            || target_pipeline.processed_pending_id()
-                != target_pipeline.processing().pending_id().get()
+            || !valid_target_pipeline(target_checkpoint, &target_pipeline)
             || source_head.head().key() != key
             || source_chain.chain_epoch().get() != target_epoch
             || source_checkpoint <= target_checkpoint
@@ -518,8 +516,12 @@ impl<Hash: Q256BitHash> RealmRollbackTargetRestorePlan<Hash> {
     ) -> Result<BranchPendingMapping<Hash>, RealmRollbackTargetRestorePlanError> {
         Ok(BranchPendingMapping::new(
             *self.restored_observation()?.chain(),
-            self.target_pipeline.processing().pending_id(),
+            unique_pending(self.target_pipeline.processed_pending_id())?,
         ))
+    }
+
+    pub(super) const fn target_processed_pending_id(&self) -> u64 {
+        self.target_pipeline.processed_pending_id()
     }
 
     /// Rebind a recovered immutable plan to the target marker selected by
@@ -528,15 +530,15 @@ impl<Hash: Q256BitHash> RealmRollbackTargetRestorePlan<Hash> {
     /// copied into the plan.
     pub(super) fn revalidate_target_entry(
         &self,
-        target: &VerifiedRealmRollbackCommittedSuffixEntry<Hash>,
+        target: &VerifiedRealmRollbackTarget<Hash>,
     ) -> Result<(), RealmRollbackTargetRestorePlanError> {
         let head = target.stored_head().map_err(model)?;
         let pipeline = target.stored_pipeline().map_err(model)?;
-        if target.inventory().authority() != self.authority
-            || target.inventory().candidate().canonical_chain() != &self.target
-            || target.inventory_slot().as_bytes() != &self.target_inventory_slot
-            || target.inventory_digest() != &self.target_inventory_digest
-            || target.committed_marker_digest() != &self.target_committed_marker_digest
+        if target.authority() != self.authority
+            || target.chain() != &self.target
+            || target.evidence_slot() != self.target_inventory_slot
+            || target.evidence_digest() != &self.target_inventory_digest
+            || target.marker_digest() != &self.target_committed_marker_digest
             || target.writer_revision() != self.target_writer_revision
             || head != self.target_head
             || pipeline != self.target_pipeline
@@ -544,6 +546,19 @@ impl<Hash: Q256BitHash> RealmRollbackTargetRestorePlan<Hash> {
             return Err(RealmRollbackTargetRestorePlanError::BindingMismatch);
         }
         Ok(())
+    }
+}
+
+fn valid_target_pipeline<Hash: Q256BitHash>(
+    target_checkpoint: u64,
+    pipeline: &StoredPendingPipeline<Hash>,
+) -> bool {
+    if target_checkpoint == 0 {
+        matches!(pipeline.phase(), PendingProcessingPhase::Ready)
+            && pipeline.processed_pending_id() == 0
+    } else {
+        matches!(pipeline.phase(), PendingProcessingPhase::Published)
+            && pipeline.processed_pending_id() == pipeline.processing().pending_id().get()
     }
 }
 

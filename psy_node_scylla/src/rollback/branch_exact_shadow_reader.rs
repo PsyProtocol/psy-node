@@ -25,7 +25,8 @@ use crate::utils::{i64_to_u64_exact, u64_to_i64_exact};
 
 use super::{
     BranchExactBackfillArtifact, BranchExactBackfillArtifactRow,
-    BranchExactBackfillDatasetDigest, BranchExactBackfillVerifiedReceipt,
+    BranchExactBackfillDatasetDigest, BranchExactBackfillMode,
+    BranchExactBackfillVerifiedReceipt,
     BranchExactSchemaReady, BranchExactSchemaReadyDigest,
     BranchExactSchemaReadyView,
     BranchExactQueries, BranchExactQueryId,
@@ -473,8 +474,8 @@ impl<Hash: Q256BitHash> ScyllaBranchExactShadowReader<Hash> {
         // The target and legacy inventories are both checked as exact sets.
         // Legacy is checked again after all point reads so an authority that
         // violates the required stopped/drained contract fails closed.
-        self.verify_complete_target_set(artifact).await?;
-        self.verify_complete_legacy_set(artifact).await?;
+        self.verify_complete_target_set(artifact.rows()).await?;
+        self.verify_complete_legacy_set(artifact.rows()).await?;
 
         let mut proof_rows = 0_u64;
         let mut aggregate = Sha256::new();
@@ -496,7 +497,7 @@ impl<Hash: Q256BitHash> ScyllaBranchExactShadowReader<Hash> {
             .map_err(|_| BranchExactShadowReadError::RowCountOverflow)?;
         aggregate.update(mapping_rows.to_be_bytes());
         aggregate.update(proof_rows.to_be_bytes());
-        self.verify_complete_legacy_set(artifact).await?;
+        self.verify_complete_legacy_set(artifact.rows()).await?;
         Ok(BranchExactShadowAuditObservation {
             schema_ready_digest: self.setup_view.digest(),
             dataset_digest: artifact.dataset_digest(),
@@ -506,14 +507,48 @@ impl<Hash: Q256BitHash> ScyllaBranchExactShadowReader<Hash> {
         })
     }
 
+    /// Verify the only baseline that is legal before a brand-new authority
+    /// has processed genesis: both the legacy and target mapping inventories
+    /// are exact empty sets.  This is a live Scylla scan, not a synthetic
+    /// zero-row observation.
+    pub(crate) async fn audit_genesis_empty(
+        &self,
+    ) -> Result<BranchExactShadowAuditObservation, BranchExactShadowReadError> {
+        let plan = self.expected_receipt.plan();
+        if plan.mode() != BranchExactBackfillMode::GenesisEmpty
+            || plan.total_chunks() != 0
+            || plan.pair_rows_per_direction() != 0
+            || plan.proof_rows() != 0
+            || plan.dataset_digest() != self.setup_view.dataset_digest()
+        {
+            return Err(BranchExactShadowReadError::BackfillPlanMismatch);
+        }
+        self.verify_complete_target_set(&[]).await?;
+        self.verify_complete_legacy_set(&[]).await?;
+
+        let mut aggregate = Sha256::new();
+        aggregate.update(SHADOW_AUDIT_DIGEST_DOMAIN);
+        aggregate.update(self.setup_view.digest().as_bytes());
+        aggregate.update(plan.dataset_digest().as_bytes());
+        aggregate.update(0_u64.to_be_bytes());
+        aggregate.update(0_u64.to_be_bytes());
+        self.verify_complete_legacy_set(&[]).await?;
+        Ok(BranchExactShadowAuditObservation {
+            schema_ready_digest: self.setup_view.digest(),
+            dataset_digest: plan.dataset_digest(),
+            mapping_rows: 0,
+            proof_rows: 0,
+            digest: BranchExactShadowAuditDigest(aggregate.finalize().into()),
+        })
+    }
+
     async fn verify_complete_legacy_set(
         &self,
-        artifact: &BranchExactBackfillArtifact<Hash>,
+        rows: &[BranchExactBackfillArtifactRow<Hash>],
     ) -> Result<(), BranchExactShadowReadError> {
         use futures::TryStreamExt;
 
-        let expected_forward = artifact
-            .rows()
+        let expected_forward = rows
             .iter()
             .map(|row| {
                 (
@@ -530,8 +565,7 @@ impl<Hash: Q256BitHash> ScyllaBranchExactShadowReader<Hash> {
             .iter()
             .map(|(checkpoint, pending)| (*pending, *checkpoint))
             .collect::<BTreeSet<_>>();
-        let expected_proofs = artifact
-            .rows()
+        let expected_proofs = rows
             .iter()
             .filter_map(|row| {
                 row.reward_proof_canonical().map(|proof| {
@@ -603,12 +637,11 @@ impl<Hash: Q256BitHash> ScyllaBranchExactShadowReader<Hash> {
 
     async fn verify_complete_target_set(
         &self,
-        artifact: &BranchExactBackfillArtifact<Hash>,
+        rows: &[BranchExactBackfillArtifactRow<Hash>],
     ) -> Result<(), BranchExactShadowReadError> {
         use futures::TryStreamExt;
 
-        let expected_forward = artifact
-            .rows()
+        let expected_forward = rows
             .iter()
             .map(|row| {
                 (
@@ -621,8 +654,7 @@ impl<Hash: Q256BitHash> ScyllaBranchExactShadowReader<Hash> {
             .iter()
             .map(|(canonical, pending)| (*pending, canonical.clone()))
             .collect::<BTreeSet<_>>();
-        let expected_proofs = artifact
-            .rows()
+        let expected_proofs = rows
             .iter()
             .filter_map(|row| {
                 row.reward_proof_canonical().map(|proof| {

@@ -5,20 +5,34 @@ set -o pipefail
 VALKEY_NAME="valkey-server"
 NATS_NAME="nats-server"
 SCYLLA_NAME="scylla-server"
+SCYLLA_RF3_NAMES=("scylla-server-1" "scylla-server-2" "scylla-server-3")
+SCYLLA_RF3_NETWORK="psy-devnet-scylla-rf3"
+SCYLLA_RF3_IMAGE="scylladb/scylla@sha256:17496f2dd6e72056d0b0d7e2bd18bd62638872d1d80a5dd9db96ba017fd426fc"
 NOSTR_NAME="nostr-relay"
 
 VALKEY_VOLUME="psy-devnet-redis"
 SCYLLA_VOLUME="psy-devnet-scylla"
 SCYLLA_DATA_VOLUME="psy-devnet-scylla-data"
+SCYLLA_RF3_VOLUMES=("psy-devnet-scylla-1" "psy-devnet-scylla-2" "psy-devnet-scylla-3")
 NATS_VOLUME="psy-devnet-nats"
 
-# Parse --persist flag
+# Parse runtime flags.
 PERSIST=false
+SCYLLA_RF3=false
 for arg in "$@"; do
     if [ "$arg" = "--persist" ]; then
         PERSIST=true
+    elif [ "$arg" = "--rf3" ]; then
+        SCYLLA_RF3=true
     fi
 done
+
+if [ "$SCYLLA_RF3" = "true" ]; then
+    SCYLLA_CONTAINER_NAMES=("${SCYLLA_RF3_NAMES[@]}")
+else
+    SCYLLA_CONTAINER_NAMES=("$SCYLLA_NAME")
+fi
+ALL_CONTAINER_NAMES=("$VALKEY_NAME" "$NATS_NAME" "${SCYLLA_CONTAINER_NAMES[@]}" "$NOSTR_NAME")
 
 # Get absolute path for repo-local logs
 PARENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)"
@@ -33,8 +47,8 @@ SCYLLA_LOGS="$PARENT_DIR/logs/scylla_logs.txt"
 NOSTR_LOGS="$PARENT_DIR/logs/nostr_logs.txt"
 
 # Clean up any previous runs
-docker stop -t 15 "$VALKEY_NAME" "$NATS_NAME" "$SCYLLA_NAME" "$NOSTR_NAME" 2>/dev/null
-docker rm -f "$VALKEY_NAME" "$NATS_NAME" "$SCYLLA_NAME" "$NOSTR_NAME" 2>/dev/null || true
+docker stop -t 15 "${ALL_CONTAINER_NAMES[@]}" 2>/dev/null
+docker rm -f "${ALL_CONTAINER_NAMES[@]}" 2>/dev/null || true
 
 # Reentrancy-guarded cleanup for intentional SIGINT/SIGTERM. Does NOT exit on
 # its own: it stops all containers once and sets INTENTIONAL_EXIT so the
@@ -53,12 +67,15 @@ cleanup() {
     echo "Stopping containers (Graceful Shutdown)..."
     echo "-----------------------------------------------------"
 
-    docker stop -t 15 "$VALKEY_NAME" "$NATS_NAME" "$SCYLLA_NAME" "$NOSTR_NAME" 2>/dev/null
+    docker stop -t 15 "${ALL_CONTAINER_NAMES[@]}" 2>/dev/null
 
     echo "All services stopped."
     if [ "$PERSIST" = "true" ]; then
-        echo "Persistent data kept in Docker volumes: $VALKEY_VOLUME, $SCYLLA_VOLUME, $SCYLLA_DATA_VOLUME"
-        echo "To delete: docker volume rm $VALKEY_VOLUME $SCYLLA_VOLUME $SCYLLA_DATA_VOLUME"
+        if [ "$SCYLLA_RF3" = "true" ]; then
+            echo "Persistent Scylla data kept in Docker volumes: ${SCYLLA_RF3_VOLUMES[*]}"
+        else
+            echo "Persistent Scylla data kept in Docker volumes: $SCYLLA_VOLUME, $SCYLLA_DATA_VOLUME"
+        fi
     fi
 }
 
@@ -131,7 +148,12 @@ COMMITLOG_BATCH_WINDOW="${SCYLLA_COMMITLOG_BATCH_WINDOW:-2}"
 COMMITLOG_PERIOD="${SCYLLA_COMMITLOG_PERIOD:-10}"
 SCYLLA_SMP="${SCYLLA_SMP:-2}"
 SCYLLA_CPUSET="${SCYLLA_CPUSET:-}"
-SCYLLA_MEMORY="${SCYLLA_MEMORY:-8G}"
+if [ "$SCYLLA_RF3" = "true" ]; then
+    SCYLLA_MEMORY="${SCYLLA_RF3_MEMORY_PER_NODE:-2G}"
+    SCYLLA_SMP="${SCYLLA_RF3_SMP_PER_NODE:-1}"
+else
+    SCYLLA_MEMORY="${SCYLLA_MEMORY:-8G}"
+fi
 SCYLLA_CAS_CONTENTION_TIMEOUT_MS="${SCYLLA_CAS_CONTENTION_TIMEOUT_MS:-10000}"
 SCYLLA_WRITE_REQUEST_TIMEOUT_MS="${SCYLLA_WRITE_REQUEST_TIMEOUT_MS:-10000}"
 
@@ -144,12 +166,6 @@ done
 
 echo "[SYSTEM] ScyllaDB Commitlog Config: sync=$COMMITLOG_SYNC, batch_window=${COMMITLOG_BATCH_WINDOW}ms, period=${COMMITLOG_PERIOD}ms"
 echo "[SYSTEM] ScyllaDB Runtime Config: smp=$SCYLLA_SMP, cpuset=${SCYLLA_CPUSET:-shared}, memory=$SCYLLA_MEMORY, cas_timeout=${SCYLLA_CAS_CONTENTION_TIMEOUT_MS}ms, write_timeout=${SCYLLA_WRITE_REQUEST_TIMEOUT_MS}ms"
-
-SCYLLA_VOLUME_ARGS=()
-if [ "$PERSIST" = "true" ]; then
-    echo "[SYSTEM] ScyllaDB data will be stored in Docker volumes: $SCYLLA_VOLUME, $SCYLLA_DATA_VOLUME"
-    SCYLLA_VOLUME_ARGS=(-v "$SCYLLA_VOLUME:/var/lib/scylla" -v "$SCYLLA_DATA_VOLUME:/run/udev/data")
-fi
 
 SCYLLA_DOCKER_RESOURCE_ARGS=()
 SCYLLA_RUNTIME_ARGS=(
@@ -170,16 +186,54 @@ else
 fi
 SCYLLA_RUNTIME_ARGS+=(--memory "$SCYLLA_MEMORY")
 
-docker run --rm --name "$SCYLLA_NAME" \
-    --cap-add=PERFMON \
-    -p 9042:9042 \
-    "${SCYLLA_DOCKER_RESOURCE_ARGS[@]}" \
-    "${SCYLLA_VOLUME_ARGS[@]}" \
-    scylladb/scylla:latest \
-    "${SCYLLA_RUNTIME_ARGS[@]}" 2>&1 \
-    | tee "$SCYLLA_LOGS" \
-    | sed -u 's/^/[SCYLLA] /' &
-SCYLLA_PID=$!
+SCYLLA_PIDS=()
+if [ "$SCYLLA_RF3" = "true" ]; then
+    docker network inspect "$SCYLLA_RF3_NETWORK" >/dev/null 2>&1 \
+        || docker network create "$SCYLLA_RF3_NETWORK" >/dev/null
+    echo "[SYSTEM] Starting three-node Scylla RF=3 cluster on host ports 9042, 9043, 9044"
+    for index in 0 1 2; do
+        node_number=$((index + 1))
+        node_name="${SCYLLA_RF3_NAMES[$index]}"
+        host_port=$((9042 + index))
+        node_log="$PARENT_DIR/logs/scylla_${node_number}_logs.txt"
+        node_volume_args=()
+        if [ "$PERSIST" = "true" ]; then
+            node_volume_args=(-v "${SCYLLA_RF3_VOLUMES[$index]}:/var/lib/scylla")
+        fi
+        docker run --rm --name "$node_name" \
+            --hostname "$node_name" \
+            --network "$SCYLLA_RF3_NETWORK" \
+            --cap-add=PERFMON \
+            --security-opt seccomp=unconfined \
+            -p "${host_port}:9042" \
+            "${SCYLLA_DOCKER_RESOURCE_ARGS[@]}" \
+            "${node_volume_args[@]}" \
+            "$SCYLLA_RF3_IMAGE" \
+            "${SCYLLA_RUNTIME_ARGS[@]}" \
+            --reactor-backend=io_uring \
+            --api-address=0.0.0.0 \
+            --seeds "${SCYLLA_RF3_NAMES[0]}" 2>&1 \
+            | tee "$node_log" \
+            | sed -u "s/^/[SCYLLA${node_number}] /" &
+        SCYLLA_PIDS+=("$!")
+    done
+else
+    SCYLLA_VOLUME_ARGS=()
+    if [ "$PERSIST" = "true" ]; then
+        echo "[SYSTEM] ScyllaDB data will be stored in Docker volumes: $SCYLLA_VOLUME, $SCYLLA_DATA_VOLUME"
+        SCYLLA_VOLUME_ARGS=(-v "$SCYLLA_VOLUME:/var/lib/scylla" -v "$SCYLLA_DATA_VOLUME:/run/udev/data")
+    fi
+    docker run --rm --name "$SCYLLA_NAME" \
+        --cap-add=PERFMON \
+        -p 9042:9042 \
+        "${SCYLLA_DOCKER_RESOURCE_ARGS[@]}" \
+        "${SCYLLA_VOLUME_ARGS[@]}" \
+        scylladb/scylla:latest \
+        "${SCYLLA_RUNTIME_ARGS[@]}" 2>&1 \
+        | tee "$SCYLLA_LOGS" \
+        | sed -u 's/^/[SCYLLA] /' &
+    SCYLLA_PIDS+=("$!")
+fi
 
 # 3b. Start Nostr relay
 NOSTR_DATA_DIR="$PARENT_DIR/local_checkpoints/nostr"
@@ -226,13 +280,17 @@ docker run --rm --name "$NOSTR_NAME" \
     | sed -u 's/^/[NOSTR]  /' &
 NOSTR_PID=$!
 # Tracked background service pipeline PIDs and labels (used by supervision).
-SERVICE_PIDS=("$VALKEY_PID" "$NATS_PID" "$SCYLLA_PID" "$NOSTR_PID")
-SERVICE_NAMES=("valkey" "nats" "scylla" "nostr")
+SERVICE_PIDS=("$VALKEY_PID" "$NATS_PID" "${SCYLLA_PIDS[@]}" "$NOSTR_PID")
+if [ "$SCYLLA_RF3" = "true" ]; then
+    SERVICE_NAMES=("valkey" "nats" "scylla1" "scylla2" "scylla3" "nostr")
+else
+    SERVICE_NAMES=("valkey" "nats" "scylla" "nostr")
+fi
 
 # 4. Wait for Scylla to be healthy (abort if any service pipeline exits first)
 echo "[SYSTEM] Waiting for ScyllaDB node to be UP and NORMAL..."
 while true; do
-    for spid in "$VALKEY_PID" "$NATS_PID" "$SCYLLA_PID" "$NOSTR_PID"; do
+    for spid in "${SERVICE_PIDS[@]}"; do
         if ! kill -0 "$spid" 2>/dev/null; then
             echo ""
             echo "-----------------------------------------------------"
@@ -240,11 +298,15 @@ while true; do
             echo "[SYSTEM] Stopping containers and exiting non-zero for supervisor restart."
             echo "-----------------------------------------------------"
             trap - SIGINT SIGTERM
-            docker stop -t 15 "$VALKEY_NAME" "$NATS_NAME" "$SCYLLA_NAME" "$NOSTR_NAME" 2>/dev/null
+            docker stop -t 15 "${ALL_CONTAINER_NAMES[@]}" 2>/dev/null
             exit 1
         fi
     done
-    if docker exec "$SCYLLA_NAME" nodetool status | grep -q "UN"; then
+    if [ "$SCYLLA_RF3" = "true" ]; then
+        if [ "$(docker exec "${SCYLLA_RF3_NAMES[0]}" nodetool status 2>/dev/null | grep -c '^UN ' || true)" = "3" ]; then
+            break
+        fi
+    elif docker exec "$SCYLLA_NAME" nodetool status | grep -q "UN"; then
         break
     fi
     sleep 5
@@ -289,6 +351,6 @@ echo "-----------------------------------------------------"
 echo "[SYSTEM] DB service '${EXITED_LABEL}' pipeline exited unexpectedly (code=${EXIT_CODE})."
 echo "[SYSTEM] Stopping remaining containers and exiting non-zero for supervisor restart."
 echo "-----------------------------------------------------"
-docker stop -t 15 "$VALKEY_NAME" "$NATS_NAME" "$SCYLLA_NAME" "$NOSTR_NAME" 2>/dev/null
+docker stop -t 15 "${ALL_CONTAINER_NAMES[@]}" 2>/dev/null
 echo "[SYSTEM] Remaining containers stopped. Persistent volumes preserved."
 exit 1

@@ -1079,9 +1079,16 @@ impl<Hash: Q256BitHash> RealmRollbackRuntimeControl<Hash>
 mod tests {
     #[test]
     fn realm_control_is_prepare_only_and_brackets_reports() {
-        let source = include_str!("realm_rollback_runtime_control.rs")
-            .split("#[cfg(test)]")
-            .next()
+        let file = include_str!("realm_rollback_runtime_control.rs")
+            .rsplit_once("\n#[cfg(test)]\nmod tests")
+            .map(|(production, _)| production)
+            .unwrap();
+        // Qualification-only fixtures above `prepare_delete_executor` are
+        // compiled only for tests and deliberately exercise the underlying
+        // stores.  This guard covers the production runtime-control route.
+        let source = file
+            .split("    async fn prepare_delete_executor")
+            .nth(1)
             .unwrap();
         assert!(!source.contains("create_schema"));
         assert!(!source.contains("compare_and_set"));
@@ -1092,7 +1099,7 @@ mod tests {
             .unwrap();
         let select = selection.find("let Some(first_head)").unwrap();
         let directive = selection
-            .find(".read_selected_directive(first_head, authority)")
+            .find(".read_selected_directive_for_target(")
             .unwrap();
         let second = selection.find("let Some(second_head)").unwrap();
         assert!(select < directive && directive < second);

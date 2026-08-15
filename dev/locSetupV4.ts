@@ -57,7 +57,12 @@ export function buildRollbackTopologyConfig(startRealmId: number, realmsCount: n
 
 async function killDocker() {
     try {
-        const proc = Bun.spawn(['docker', 'stop', 'valkey-server', 'scylla-server', 'nats-server'], {
+        const proc = Bun.spawn([
+            'docker', 'stop',
+            'valkey-server', 'scylla-server',
+            'scylla-server-1', 'scylla-server-2', 'scylla-server-3',
+            'nats-server', 'nostr-relay',
+        ], {
             stderr: "ignore",
             stdout: "ignore"
         });
@@ -2580,7 +2585,10 @@ async function teardownDevnet(cwd: string = ".", purge: boolean = false): Promis
 [DevNet] Tearing down...${purge ? " (purge)" : ""}`);
     await killKnownProcesses();
     await killDocker();
-    await runIgnoreErrors(["docker", "rm", "-f", "valkey-server", "nats-server", "scylla-server", "nostr-relay"]);
+    await runIgnoreErrors([
+        "docker", "rm", "-f", "valkey-server", "nats-server", "scylla-server",
+        "scylla-server-1", "scylla-server-2", "scylla-server-3", "nostr-relay",
+    ]);
     await killGeneratedEnvioStack(cwd, purge);
     await killKnownPorts();
     if (purge) {
@@ -2590,7 +2598,12 @@ async function teardownDevnet(cwd: string = ".", purge: boolean = false): Promis
         await cleanCheckpoint("./psy-contracts/deployments/localhost", cwd);
         await cleanCheckpoint("./psy-contracts/deployments/sepolia", cwd);
         await cleanCheckpoint("./psy-contracts/deployments/ethereum", cwd);
-        await runIgnoreErrors(["docker", "volume", "rm", "-f", "psy-devnet-redis", "psy-devnet-scylla", "psy-devnet-scylla-data", "psy-devnet-nats"]);
+        await runIgnoreErrors([
+            "docker", "volume", "rm", "-f",
+            "psy-devnet-redis", "psy-devnet-scylla", "psy-devnet-scylla-data",
+            "psy-devnet-scylla-1", "psy-devnet-scylla-2", "psy-devnet-scylla-3",
+            "psy-devnet-nats",
+        ]);
     }
 }
 
@@ -2904,6 +2917,12 @@ class DevNetProcessManager {
         this.genesisDataPath = options.genesisDataPath || "genesis.json";
         const cleanState = !!options.cleanState;
         const rollbackEnabled = !!options.rollback;
+        const scyllaUrl = rollbackEnabled
+            ? `${this.host}:9042,${this.host}:9043,${this.host}:9044`
+            : this.SCYLLA_URL;
+        const checkpointBackupPath = rollbackEnabled
+            ? './local_checkpoints/rollback'
+            : './local_checkpoints';
         const skipBuild = skipBuildEnabled();
 
 
@@ -3010,12 +3029,18 @@ class DevNetProcessManager {
                 console.log("[DevNet] Cleaning local checkpoints...");
                 await cleanCheckpoint('./local_checkpoints', cwd);
                 console.log("[DevNet] Removing persisted devnet Docker volumes...");
-                await runAndCapture(["docker", "volume", "rm", "-f", "psy-devnet-redis", "psy-devnet-scylla", "psy-devnet-scylla-data", "psy-devnet-nats"]);
+                await runAndCapture([
+                    "docker", "volume", "rm", "-f",
+                    "psy-devnet-redis", "psy-devnet-scylla", "psy-devnet-scylla-data",
+                    "psy-devnet-scylla-1", "psy-devnet-scylla-2", "psy-devnet-scylla-3",
+                    "psy-devnet-nats",
+                ]);
             }
 
             console.log("[DevNet] Killing existing docker containers...");
             await killDocker();
             const startDbCmd = ['./dev/start_db.sh', '--persist'];
+            if (rollbackEnabled) startDbCmd.push('--rf3');
             await this.track(
                 await RunningProcess.spawnWithInitializationHint(
                     startDbCmd, dbStartedDetector, { cwd, ...getLogPaths("db", false), env: this.getEnv() }
@@ -3026,6 +3051,10 @@ class DevNetProcessManager {
             await waitForTcpPort(this.host, 6379, { attempts: 30, delayMs: 500, timeoutMs: 1500, name: "Valkey/Redis" });
             await waitForTcpPort(this.host, 4222, { attempts: 30, delayMs: 500, timeoutMs: 1500, name: "NATS" });
             await waitForTcpPort(this.host, 9042, { attempts: 30, delayMs: 500, timeoutMs: 1500, name: "Scylla" });
+            if (rollbackEnabled) {
+                await waitForTcpPort(this.host, 9043, { attempts: 30, delayMs: 500, timeoutMs: 1500, name: "Scylla replica 2" });
+                await waitForTcpPort(this.host, 9044, { attempts: 30, delayMs: 500, timeoutMs: 1500, name: "Scylla replica 3" });
+            }
             console.log("[DevNet] Infrastructure is ready.");
         }
 
@@ -3042,11 +3071,11 @@ class DevNetProcessManager {
                     '--coordinator-sub-id', '0',
                     '--network', this.NETWORK,
                     '--db-namespace', 'coordinator',
-                    '--scylla-db-url', this.SCYLLA_URL,
+                    '--scylla-db-url', scyllaUrl,
                     '--nats-jetstream-url', this.NATS_URL,
                     '--redis-url', this.REDIS_URL,
                     '--genesis-data-path', this.genesisDataPath,
-                    '--checkpoint-backup-path', './local_checkpoints',
+                    '--checkpoint-backup-path', checkpointBackupPath,
                     '--proving-backend', backend,
                     '--verbose'
             ];
@@ -3075,7 +3104,7 @@ class DevNetProcessManager {
                     '--coordinator-sub-id', '0',
                     '--network', this.NETWORK,
                     '--db-namespace', 'coordinator',
-                    '--scylla-db-url', this.SCYLLA_URL,
+                    '--scylla-db-url', scyllaUrl,
                     '--nats-jetstream-url', this.NATS_URL,
                     '--redis-url', this.REDIS_URL,
                     '--port', port.toString(),
@@ -3161,11 +3190,11 @@ class DevNetProcessManager {
                         '--realm-sub-id', '1',
                         '--network', this.NETWORK,
                         '--db-namespace', 'realm_' + realmId,
-                        '--scylla-db-url', this.SCYLLA_URL,
+                        '--scylla-db-url', scyllaUrl,
                         '--nats-jetstream-url', this.NATS_URL,
                         '--redis-url', this.REDIS_URL,
                         '--genesis-data-path', this.genesisDataPath,
-                        '--checkpoint-backup-path', './local_checkpoints',
+                        '--checkpoint-backup-path', checkpointBackupPath,
                         '--coordinator-api-urls', this.COORD_API_URL,
                         '--proving-backend', backend,
                         '--verbose'
@@ -3212,7 +3241,7 @@ class DevNetProcessManager {
                                 '--realm-sub-id', '1',
                                 '--network', this.NETWORK,
                                 '--db-namespace', 'realm_' + realmId,
-                                '--scylla-db-url', this.SCYLLA_URL,
+                                '--scylla-db-url', scyllaUrl,
                                 '--nats-jetstream-url', this.NATS_URL,
                                 '--redis-url', this.REDIS_URL,
                                 '--port', port.toString(),

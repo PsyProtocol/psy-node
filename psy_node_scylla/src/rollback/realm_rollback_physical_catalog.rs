@@ -23,6 +23,7 @@ use super::{
     realm_rollback_commit_inventory_store::{
         VerifiedRealmRollbackCommittedSuffix,
         VerifiedRealmRollbackCommittedSuffixEntry,
+        VerifiedRealmRollbackTarget,
     },
 };
 
@@ -98,26 +99,16 @@ pub(super) struct RealmRollbackPhysicalCatalog<Hash> {
 impl<Hash: Q256BitHash> RealmRollbackPhysicalCatalog<Hash> {
     pub(super) fn try_from_selected(
         suffix: VerifiedRealmRollbackCommittedSuffix<Hash>,
-        target: Option<&VerifiedRealmRollbackCommittedSuffixEntry<Hash>>,
+        target: &VerifiedRealmRollbackTarget<Hash>,
     ) -> Result<Self, RealmRollbackPhysicalCatalogError> {
         if suffix.entries().is_empty() {
             return Err(RealmRollbackPhysicalCatalogError::EmptySuffix);
         }
-        let target_inventory_digest = match target {
-            Some(target) => {
-                if target.inventory().authority() != suffix.authority()
-                    || target.inventory().candidate().canonical_chain() != suffix.target()
-                {
-                    return Err(RealmRollbackPhysicalCatalogError::TargetMismatch);
-                }
-                Some(*target.inventory().digest())
-            }
-            None => None,
-        };
-        let target_puts = target
-            .map(|target| canonical_target_puts(target.inventory().typed_puts()))
-            .transpose()?
-            .unwrap_or_default();
+        if target.authority() != suffix.authority() || target.chain() != suffix.target() {
+            return Err(RealmRollbackPhysicalCatalogError::TargetMismatch);
+        }
+        let target_inventory_digest = Some(*target.evidence_digest());
+        let target_puts = canonical_target_puts(target.target_puts())?;
 
         let mut entries = Vec::new();
         let mut typed = BTreeMap::<Vec<u8>, TypedAccumulator>::new();

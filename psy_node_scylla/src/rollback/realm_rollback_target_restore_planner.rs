@@ -115,8 +115,8 @@ impl ScyllaRealmRollbackTargetRestorePlanner {
     async fn read_target<Hash: Q256BitHash>(
         &self,
         selected: &SelectedRealmRollbackDeleteCompletion<Hash>,
-    ) -> Result<super::realm_rollback_commit_inventory_store::VerifiedRealmRollbackCommittedSuffixEntry<Hash>, RealmRollbackTargetRestorePlannerError> {
-        self.inventory.read_committed_height(
+    ) -> Result<super::realm_rollback_commit_inventory_store::VerifiedRealmRollbackTarget<Hash>, RealmRollbackTargetRestorePlannerError> {
+        self.inventory.read_rollback_target(
             selected.completion().authority(),
             selected.barrier().target().network_id(),
             selected.barrier().target().chain_epoch(),

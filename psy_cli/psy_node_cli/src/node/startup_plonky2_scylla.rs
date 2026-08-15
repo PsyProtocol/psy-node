@@ -21,10 +21,13 @@ use psy_node_core::{
 use psy_node_nats::psy_queue::setup_nats_psy_queue_from_connection_str;
 use psy_node_redis::store::{new_redis_async_pool, StandardRedisStore};
 use psy_node_scylla::psy_setup::{
+    activate_realm_genesis_branch_exact_from_connection_string,
     setup_coordinator_psy_scylla_database_store_from_connection_string,
+    setup_realm_psy_scylla_database_store_with_branch_exact_schema,
     setup_realm_processor_scylla_startup_composition,
 };
 use psy_node_scylla::rollback::PendingQueueSidecarSetupMode;
+use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 use psy_plonky2_circuits::{
     node::config::networks::resolver::PsyPlonky2NodeConfigResolver,
     protocol_types::ZKTypesPlonky2GoldilocksPoseidon,
@@ -380,7 +383,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
         realm_id,
         realm_sub_id: config.realm_sub_id,
     };
-    let branch_exact_lineage = config
+    let mut branch_exact_lineage = config
         .branch_exact_startup
         .as_ref()
         .map(|activation| {
@@ -391,7 +394,9 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
             )
         })
         .transpose()?;
-    let proof_verifier = if branch_exact_lineage.is_some() {
+    let branch_exact_requested = branch_exact_lineage.is_some()
+        || config.coordinator_rollback_db_namespace.is_some();
+    let proof_verifier = if branch_exact_requested {
         Some(Arc::new(PsyPlonky2ZKVerifier::<C, D>::for_network(
             config.network,
         )?))
@@ -427,6 +432,64 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
     match config.network {
         psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
+            if branch_exact_lineage.is_none()
+                && config.coordinator_rollback_db_namespace.is_some()
+            {
+                drop(
+                    setup_realm_psy_scylla_database_store_with_branch_exact_schema::<N>(
+                        &config.db_namespace,
+                        &config.scylla_db_url,
+                        true,
+                        realm_id,
+                        config.realm_sub_id,
+                        psy_node_scylla::rollback::BranchExactSchemaSetupMode::Disabled,
+                    )
+                    .await?,
+                );
+                let genesis = GenesisDatabaseDataBuilder::<
+                    <N as QNetworkHashTypes>::F,
+                    <N as QNetworkHashTypes>::QHash,
+                >::setup_for_realm::<<N as QNetworkHashTypes>::HasherBase, N>(
+                    &genesis_data,
+                    u64::from(realm_id),
+                    u64::from(config.realm_sub_id),
+                    chain_id,
+                    circuit_fingerprint_config
+                        .genesis_checkpoint_state_transition_fingerprint,
+                )?;
+                let authority = psy_data::protocol::chain_context::AuthorityScope::Realm {
+                    realm_id,
+                    realm_sub_id: config.realm_sub_id,
+                };
+                let observation = psy_data::protocol::chain_context::AuthorityObservation::try_new(
+                    genesis.coordinator_update.canonical_chain_ref,
+                    authority,
+                    psy_data::protocol::chain_context::AuthorityStateCheckpointId::new(0),
+                    psy_data::protocol::chain_context::AuthorityStateRoot::from_local_state_root(
+                        genesis.prepared_updates.new_realm_root,
+                    ),
+                )?;
+                let verifier = proof_verifier.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("Genesis branch-exact activation requires a proof verifier")
+                })?;
+                let profile = verifier
+                    .realm_user_update_verifier_profile(config.network)?;
+                let activation =
+                    activate_realm_genesis_branch_exact_from_connection_string(
+                        &config.db_namespace,
+                        &config.scylla_db_url,
+                        observation,
+                        genesis.coordinator_update.checkpoint_sync_info.block_state
+                            .psy_ser_to_bytes_vec()?,
+                        profile.id(),
+                    )
+                    .await?;
+                branch_exact_lineage = Some(activation.lineage());
+                tracing::info!(
+                    generation = activation.startup_config().generation,
+                    "[REALM_BOOT] Genesis branch-exact activation verified"
+                );
+            }
             let composition = setup_realm_processor_scylla_startup_composition::<N>(
                 &config.db_namespace,
                 &config.scylla_db_url,

@@ -786,7 +786,19 @@ impl<Hash: Q256BitHash> StoredPendingPipeline<Hash> {
         if self.processing_state != PendingProcessingState::Ready {
             return Err(PendingPipelineError::ProcessingNotReady(self.phase()));
         }
-        if self.processing.pending_id().get() <= self.processed_pending_id {
+        // Early Genesis-native activations encoded `processed_pending_id=1`
+        // even though generation 1 had not run. Accept only that exact
+        // durable shape; new bootstraps encode the correct value 0 below.
+        let legacy_genesis_ready = self.bootstrap_reason
+            == PendingGenerationBootstrapReason::Genesis
+            && self.derived_start_pending_id == 1
+            && self.processing.pending_id().get() == 1
+            && self.processed_pending_id == 1
+            && self.frontier.chain().checkpoint().checkpoint_id().get() == 0
+            && self.frontier.state_checkpoint_id().get() == 0;
+        if self.processing.pending_id().get() <= self.processed_pending_id
+            && !legacy_genesis_ready
+        {
             return Err(PendingPipelineError::ProcessingNotAheadOfFrontier);
         }
         Ok(())
@@ -873,6 +885,52 @@ impl<Hash: Q256BitHash> PendingPipelineBootstrap<Hash> {
             }
             _ => {}
         }
+        Ok(Self {
+            payload: candidate.canonical_payload(),
+            candidate,
+        })
+    }
+
+    /// Bootstrap a brand-new authority directly at its deterministic first
+    /// runnable generation. The ordinary Genesis commit owns the legacy
+    /// pending counter; this sidecar bootstrap must not advance that counter
+    /// before the legacy Genesis rows are installed.
+    pub fn try_new_ready_genesis(
+        key: PendingGenerationLedgerKey,
+        activation_digest: PendingGenerationActivationDigest,
+        proc_namespace_prefix: ProcNamespacePrefix,
+        processing: PendingGenerationContext,
+        gathering: PendingGenerationContext,
+        frontier: AuthorityObservation<Hash>,
+    ) -> Result<Self, PendingPipelineError> {
+        if processing.pending_id().get() != 1
+            || gathering.pending_id().get() != 2
+            || processing.proc_checkpoint_id()
+                != proc_namespace_prefix.derive_proc_id(processing.pending_id())
+            || gathering.proc_checkpoint_id()
+                != proc_namespace_prefix.derive_proc_id(gathering.pending_id())
+        {
+            return Err(PendingPipelineError::GenesisNotPrimeable);
+        }
+        let candidate = StoredPendingPipeline {
+            key,
+            // Baseline -> PrimeGenesis -> Rotate are represented by the
+            // durable allocator evidence consumed before this single IFNE.
+            revision: PendingPipelineRevision::try_new(2)?,
+            activation_digest,
+            proc_namespace_prefix,
+            derived_start_pending_id: 1,
+            bootstrap_reason: PendingGenerationBootstrapReason::Genesis,
+            processing,
+            gathering,
+            processing_state: PendingProcessingState::Ready,
+            blocked_reason: None,
+            frontier,
+            // Genesis is the committed frontier; generation 1 is the first
+            // unprocessed queue generation and must be ahead of it.
+            processed_pending_id: 0,
+        };
+        validate_state(&candidate)?;
         Ok(Self {
             payload: candidate.canonical_payload(),
             candidate,
@@ -1953,5 +2011,43 @@ mod tests {
         assert!(captured
             .seal_begin_processing(capture(2), intent(1))
             .is_ok());
+    }
+
+    #[test]
+    fn genesis_bootstrap_is_ready_and_rejects_wrong_identities() {
+        let ready = PendingPipelineBootstrap::try_new_ready_genesis(
+            key(),
+            PendingGenerationActivationDigest::try_new([0xa5; 32]).unwrap(),
+            prefix(),
+            context(1),
+            context(2),
+            observation(0, 0, 80),
+        )
+        .unwrap();
+        assert_eq!(ready.candidate().revision().get(), 2);
+        assert_eq!(ready.candidate().phase(), PendingProcessingPhase::Ready);
+        assert_eq!(ready.candidate().processing(), context(1));
+        assert_eq!(ready.candidate().gathering(), context(2));
+        assert_eq!(ready.candidate().processed_pending_id(), 0);
+        assert!(ready
+            .candidate()
+            .seal_begin_queue_close(close(1))
+            .is_ok());
+
+        let mut legacy = ready.candidate().clone();
+        legacy.processed_pending_id = 1;
+        assert!(legacy.seal_begin_queue_close(close(1)).is_ok());
+
+        assert_eq!(
+            PendingPipelineBootstrap::try_new_ready_genesis(
+                key(),
+                PendingGenerationActivationDigest::try_new([0xa5; 32]).unwrap(),
+                prefix(),
+                context(2),
+                context(3),
+                observation(0, 0, 80),
+            ),
+            Err(PendingPipelineError::GenesisNotPrimeable)
+        );
     }
 }

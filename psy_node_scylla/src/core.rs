@@ -1,3 +1,4 @@
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -41,6 +42,9 @@ use psy_node_core::store::realm_processor_startup::{
 };
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
+use scylla::policies::load_balancing::{
+    NodeIdentifier, SingleTargetLoadBalancingPolicy,
+};
 use psy_node_nats::queue::NatsJetStreamClient;
 use crate::rollback::{
     AuthorityTimestampNoTabletKeyspace,
@@ -109,6 +113,50 @@ pub(crate) async fn connect_existing_scylla_session(
         execution_profile = execution_profile.consistency(scylla::statement::Consistency::One)
     };
     let execution_profile = execution_profile.build();
+    let session = SessionBuilder::new()
+        .known_nodes(known_nodes.iter())
+        .default_execution_profile_handle(execution_profile.into_handle())
+        .connection_timeout(Duration::from_secs(120))
+        .keepalive_timeout(Duration::from_secs(60))
+        .keepalive_interval(Duration::from_secs(30))
+        .pool_size(PoolSize::PerHost(NonZeroUsize::new(1).unwrap()))
+        .build()
+        .await?;
+    Ok(Arc::new(session))
+}
+
+/// Connect to an existing cluster while forcing every query onto one
+/// operator-selected contact point.  A session opened with only one known
+/// node is not sufficient: after metadata discovery the driver can still
+/// route `system.local` and direct-ONE postflight reads to another replica.
+pub(crate) async fn connect_targeted_existing_scylla_session(
+    known_nodes: &[String],
+    target: &str,
+) -> anyhow::Result<Arc<Session>> {
+    if known_nodes.is_empty() || known_nodes.iter().any(|node| node.trim().is_empty()) {
+        anyhow::bail!("at least one non-empty Scylla node address is required");
+    }
+    let mut resolved = target
+        .to_socket_addrs()
+        .map_err(|error| anyhow::anyhow!("cannot resolve targeted Scylla node {target:?}: {error}"))?
+        .collect::<Vec<SocketAddr>>();
+    resolved.sort_unstable();
+    resolved.dedup();
+    let [target_address] = resolved.as_slice() else {
+        anyhow::bail!(
+            "targeted Scylla node {target:?} must resolve to exactly one socket address, got {}",
+            resolved.len()
+        );
+    };
+
+    let execution_profile = ExecutionProfile::builder()
+        .consistency(scylla::statement::Consistency::One)
+        .request_timeout(Some(Duration::from_secs(300)))
+        .load_balancing_policy(SingleTargetLoadBalancingPolicy::new(
+            NodeIdentifier::NodeAddress(*target_address),
+            None,
+        ))
+        .build();
     let session = SessionBuilder::new()
         .known_nodes(known_nodes.iter())
         .default_execution_profile_handle(execution_profile.into_handle())

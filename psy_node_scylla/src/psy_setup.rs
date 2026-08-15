@@ -13,7 +13,9 @@ use psy_node_core::{
             RealmUserUpdateArtifactFactory, RealmUserUpdateIngressPort,
         },
         realm_user_update_publish::GlobalUserTreeHeight,
-        realm_user_update_verifier_profile::RealmUserUpdateVerifierRegistry,
+        realm_user_update_verifier_profile::{
+            RealmUserUpdateVerifierProfileId, RealmUserUpdateVerifierRegistry,
+        },
     },
     psy_core_db::v3_implementation::full::PsyUnifiedCoreDatabaseStore,
     store::{
@@ -33,11 +35,17 @@ use psy_node_nats::queue::NatsJetStreamClient;
 use rand::{rngs::OsRng, RngCore};
 
 use crate::{
-    core::{connect_existing_scylla_session, ScyllaCoreStore},
+    core::{
+        connect_existing_scylla_session, connect_targeted_existing_scylla_session,
+        ScyllaCoreStore,
+    },
     rollback::{
+        activate_realm_genesis_branch_exact,
+        inspect_branch_exact_local_node_id,
         BranchExactCutoverAuthorityKey, BranchExactCutoverPhase,
         BranchExactCutoverReadState,
-        BranchExactDeploymentNoTabletKeyspace, BranchExactSchemaSetupMode,
+        BranchExactDeploymentNoTabletKeyspace, BranchExactExpectedTopology,
+        BranchExactSchemaSetupMode,
         BranchExactSchemaSetupRequest, BranchExactWriterAuthorityKey,
         BranchExactWriterActivationPlan, BranchExactWriterReadState,
         BranchExactWriterState, ScyllaBranchExactCutoverStore,
@@ -46,7 +54,8 @@ use crate::{
         ScyllaBranchExactWriterLifecycleStore,
         ScyllaRealmAuthorityObservationReader,
         ScyllaRealmUserUpdateDurableRouter, ScyllaRealmUserUpdateIngress,
-        AuthorityLocalHeadNoTabletKeyspace, PENDING_QUEUE_SIDECAR_SCHEMA_VERSION,
+        AuthorityLocalHeadNoTabletKeyspace, CqlKeyspaceName,
+        PENDING_QUEUE_SIDECAR_SCHEMA_VERSION,
     },
     tables::{
         blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements, bridge::{deposit_leaf::ScyllaBridgeDepositLeafPreparedStatements, next_index::ScyllaBridgeDepositNextIndexPreparedStatements}, counter::u64_counter::ScyllaU64ToU64CounterTablePreparedStatements, hash_to_many_ids::ScyllaHashToManyIdsTablePreparedStatements, imt::{imt_key_index::ScyllaIMTKeyIndexPreparedStatements, imt_leaf::ScyllaIMTLeafPreparedStatements, imt_next_append_index::ScyllaIMTNextAppendIndexPreparedStatements}, merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements, ScyllaMerkleNodesZeroPreparedStatements}, object::{
@@ -513,6 +522,81 @@ pub async fn deploy_pending_queue_sidecar_from_connection_string(
         schema_fingerprint: *stored.schema_fingerprint().as_bytes(),
         ready_digest: *receipt.ready_digest(),
     })
+}
+
+/// Explicitly activate a fresh Realm at its checkpoint-0 branch-exact
+/// baseline.  The caller must already have created the normal Realm keyspaces
+/// and tables; this operator only deploys the versioned sidecar/branch-exact
+/// extension and its exact durable activation rows.
+pub async fn activate_realm_genesis_branch_exact_from_connection_string<
+    Hash: Q256BitHash,
+>(
+    data_keyspace: &str,
+    connection_string: &str,
+    genesis: psy_data::protocol::chain_context::AuthorityObservation<Hash>,
+    genesis_l2_block_state: Vec<u8>,
+    verifier_profile: RealmUserUpdateVerifierProfileId,
+) -> anyhow::Result<RealmBranchExactActivationSummary> {
+    let nodes = parse_scylla_known_nodes(connection_string)?;
+    // NetworkId::chain_id() is the canonical mapping; LocalDevnet is chain 0.
+    let local_devnet = genesis.chain().network_id().chain_id() == 0;
+    if nodes.len() < 3 && !(local_devnet && nodes.len() == 1) {
+        anyhow::bail!(
+            "Realm Genesis branch-exact activation requires three explicitly targeted Scylla nodes; only LocalDevnet may explicitly use one functional-test replica"
+        );
+    }
+    let control_keyspace_name = format!("{data_keyspace}_no_tablet");
+    let session = connect_existing_scylla_session(&nodes).await?;
+    require_existing_scylla_keyspace(&session, data_keyspace).await?;
+    require_existing_scylla_keyspace(&session, &control_keyspace_name).await?;
+
+    // Sidecar deployment is part of the same explicit operator action and is
+    // idempotent. It is deliberately not called by generic node setup.
+    deploy_pending_queue_sidecar_from_connection_string(
+        data_keyspace,
+        connection_string,
+    )
+    .await?;
+
+    let mut targeted_sessions = Vec::with_capacity(nodes.len());
+    let mut node_ids = Vec::with_capacity(nodes.len());
+    for node in &nodes {
+        let targeted = connect_targeted_existing_scylla_session(&nodes, node).await?;
+        node_ids.push(inspect_branch_exact_local_node_id(&targeted).await?);
+        targeted_sessions.push(targeted);
+    }
+    let topology = if local_devnet && node_ids.len() == 1 {
+        BranchExactExpectedTopology::local_devnet_single(node_ids[0])
+    } else {
+        BranchExactExpectedTopology::try_new(node_ids)?
+    };
+    activate_realm_genesis_branch_exact(
+        session,
+        &targeted_sessions,
+        CqlKeyspaceName::try_new(data_keyspace.to_owned())?,
+        BranchExactDeploymentNoTabletKeyspace::try_new(control_keyspace_name)?,
+        topology,
+        genesis,
+        genesis_l2_block_state,
+        verifier_profile,
+    )
+    .await?;
+
+    let psy_data::protocol::chain_context::AuthorityScope::Realm {
+        realm_id,
+        realm_sub_id,
+    } = genesis.authority()
+    else {
+        anyhow::bail!("Realm Genesis activation received Coordinator authority");
+    };
+    inspect_realm_branch_exact_activation::<Hash>(
+        data_keyspace,
+        connection_string,
+        genesis.chain().network_id(),
+        realm_id,
+        realm_sub_id,
+    )
+    .await
 }
 
 /// Read the exact durable Realm cutover identity needed by

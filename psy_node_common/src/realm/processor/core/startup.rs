@@ -166,6 +166,15 @@ where
         }
         */
         let branch_exact = normal_commit_owner.is_branch_exact();
+        let iteration_quiescence = if branch_exact {
+            // A branch-exact commit owner rejects compatibility permits from
+            // the disabled gate.  Install the controlled gate with the owner
+            // so the first normal iteration is authorized even when the
+            // optional admin drain control plane is not installed yet.
+            psy_node_core::store::realm_processor_quiescence::RealmProcessorIterationGate::controlled()
+        } else {
+            Default::default()
+        };
         let mut gatherer_queue_key =
             db.guta_queue_key_status_manager.get_queue_key()?;
         let (guta_queue_gatherer, guta_join_handle, initial_rollback_pause) = if branch_exact {
@@ -243,7 +252,7 @@ where
                 guta_queue_gatherer: guta_queue_gatherer,
                 proof_worker_queue_max_time_ms: u64::MAX,
                 proof_verifier,
-                iteration_quiescence: Default::default(),
+                iteration_quiescence,
                 normal_commit_owner: Some(normal_commit_owner),
                 control_owner: None,
                 rollback_runtime_control,
