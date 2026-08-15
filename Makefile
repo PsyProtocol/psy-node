@@ -20,7 +20,7 @@ PSY_SKIP_BUILD ?= 1
 all: build
 
 build:
-	PSY_CONFIG_PATH=$(PSY_CONFIG_PATH) cargo build --release --example realm_repl --example coordinator_repl --bin psy_worker_cli --bin psy_node_cli --bin psy_dev_cli --bin psy_relayer_cli --bin psy_user_cli
+	PSY_CONFIG_PATH=$(PSY_CONFIG_PATH) cargo build --release --example realm_repl --example coordinator_repl --bin psy_worker_cli --bin psy_node_cli --bin psy_dev_cli --bin psy_relayer_cli --bin psy_user_cli --bin psy-mcp-server
 
 clean:
 	cargo clean

@@ -10,14 +10,28 @@ path = "src/main.rs"
 
 [dependencies]
 # ── Psy wallet engine (the whole point: real proving via WalletSession) ──
+# default-features = false keeps the `gnark-wrap` (Go/cgo Groth16) feature OFF:
+# nothing here does L1 wrapping, and pulling it in would make a clean-machine
+# build require Go 1.22+/cgo plus a ../gnark-plonky2-verifier sibling checkout.
+# Same reason psy_user_cli opts out.
 psy_prover = { path = "../psy_prover", default-features = false }
 psy_provider = { path = "../psy_provider" }
 psy_client_common = { path = "../psy_core/psy_common" }
+psy_client_data = { path = "../psy_core/psy_data" }
 psy_config = { path = "../psy_core/psy_config" }
 psy_crypto = { path = "../psy_core/psy_crypto" }
+psy_dpn_circuit = { path = "../psy_circuit/psy_dpn_circuit" }
+psy_common_circuit = { path = "../psy_circuit/psy_common_circuit" }
 
 # ── Field / proof types ──
 plonky2 = { workspace = true }
+
+# ── Cross-process advisory file locking ──
+# Two servers legitimately share one keystore dir (the owner dashboard spawns
+# its own child; the agent host spawns another), and both mutate policies.json.
+# Without a lock their read-modify-write cycles lose each other's updates —
+# a pause gets rewritten to active, and spend counters double.
+fs2 = "0.4"
 
 # ── MCP transport (official Rust SDK) ──
 rmcp = { version = "0.2", features = ["server", "transport-io", "macros"] }
@@ -28,14 +42,32 @@ nostr = { version = "0.44", default-features = false, features = ["std", "nip44"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = { workspace = true }
 
+# ── HTTPS for chain RPC ──
+# The workspace declares reqwest with `default-features = false` and NO TLS
+# feature; binaries with a large dependency graph get TLS switched on by feature
+# unification from some other crate. This crate's graph is small, so without an
+# explicit opt-in reqwest is built with no TLS backend and EVERY https:// chain
+# call fails instantly (`is_connect=true`, no DNS/TCP attempt) — i.e. the server
+# could only ever reach a plain-HTTP local devnet, never staging or mainnet.
+# We depend on reqwest solely to turn this feature on for the whole graph.
+reqwest = { workspace = true, features = ["rustls-tls-webpki-roots"] }
+
 # ── Runtime (features are additive on top of the workspace base set) ──
 tokio = { workspace = true, features = ["rt-multi-thread", "io-std", "signal"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+base64 = { workspace = true }
+bincode = { workspace = true }
+hex = { workspace = true }
+alloy-primitives = { workspace = true }
+alloy-consensus = "=1.6.3"
+alloy-eips = "=1.6.3"
+alloy-signer = { workspace = true }
+alloy-signer-local = { workspace = true }
+
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
-hex = { workspace = true }
 schemars = "0.8"
