@@ -17,7 +17,10 @@ import {
     startAfterPrerequisite,
     startRealmProcessorBatchSequentially,
     writeCompilerArtifactStamp,
+    realmP2pHttpPort,
+    REALM_P2P_SUB_IDS,
 } from "./locSetupV4";
+import allConfig from "../psy-genesis/config.json";
 import type { GenesisContractsArtifactFingerprint } from "./locSetupV4";
 
 describe("s3CurlArgs", () => {
@@ -318,6 +321,23 @@ describe("planPsyDappNestedSubmodulesFromDisk", () => {
             expect(plan.missingPayloads["psy-genesis"]).toEqual(["config.json"]);
         } finally {
             await Bun.$`rm -rf ${dir}`.quiet();
+        }
+    });
+});
+
+describe("realm P2P HTTP ports", () => {
+    it("uses subs 1 and 2 only", () => {
+        expect([...REALM_P2P_SUB_IDS]).toEqual([1, 2]);
+    });
+
+    it("matches psy-genesis localhost realm RPC URLs at default edge count", () => {
+        const localhost = allConfig.networks.localhost;
+        const realmEdgeCount = 1;
+        for (const realm of localhost.realm_configs) {
+            const expected = REALM_P2P_SUB_IDS.map((subId) =>
+                `http://127.0.0.1:${realmP2pHttpPort(realm.id, subId, 0, realmEdgeCount)}`,
+            );
+            expect(realm.rpc_url).toEqual(expected);
         }
     });
 });

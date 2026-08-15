@@ -950,7 +950,7 @@ function l1StartedDetector(line: string): boolean {
 
 
 const REALM_P2P_OUT_DIR = "./local_checkpoints/realm_p2p";
-const REALM_P2P_SUB_IDS = [1, 2] as const;
+export const REALM_P2P_SUB_IDS = [1, 2] as const;
 
 type RealmP2pSubEntry = {
     processor_node_id_hex38: string;
@@ -992,7 +992,7 @@ function realmDbNamespace(realmId: number, subId: number): string {
     return `realm_${realmId}_${subId}`;
 }
 
-function realmP2pHttpPort(realmId: number, subId: number, edgeIndex: number, realmEdgeCount: number): number {
+export function realmP2pHttpPort(realmId: number, subId: number, edgeIndex: number, realmEdgeCount: number): number {
     const base = 13380 + realmId * 10;
     return base + (subId - 1) * realmEdgeCount + edgeIndex;
 }
@@ -3148,7 +3148,7 @@ async function killKnownPorts(): Promise<void> {
     const ports: number[] = [3000, 5433, 8080, 8081, 8545, 9898, 9998, 5174, 5175, 5176, 5177, 5178];
     for (let p = 1337; p <= 1346; p++) ports.push(p);
     for (let p = 9999; p <= 10008; p++) ports.push(p);
-    for (let p = 13380; p <= 14670; p += 10) ports.push(p);
+    for (let p = 13380; p <= 14679; p++) ports.push(p);
     for (const port of ports) {
         await runIgnoreErrors([
             "bash",
@@ -4167,33 +4167,34 @@ class DevNetProcessManager {
             console.log('[DevNet] psy-indexer coordinator started');
 
             for (let realmId = startRealmId; realmId <= endRealmId; realmId++) {
-                const edgePort = 13380 + (realmId * 10);
-                const realmSubId = 1;
-                await this.track(await RunningProcess.spawnWithInitializationHintWithRetry(
-                    [
-                        ...psyIndexerCmdBase,
-                        '--edge-url', `http://127.0.0.1:${edgePort}`,
-                        '--psy-services-url', 'http://127.0.0.1:3000',
-                        '--jwt-secret', 'dev-secret-key',
-                        '--backup-dir', backupDir,
-                        '--poll-interval-ms', '5000',
-                        'realm',
-                        '--realm-id', realmId.toString(),
-                        '--realm-sub-id', realmSubId.toString(),
-                    ],
-                    psyIndexerStartedDetector,
-                    {
-                        cwd: psyServicesCwd,
-                        ...getLogPaths(`psy_indexer_realm_${realmId}_${realmSubId}`, false),
-                        env: {
-                            ...this.getEnvWithRustLogDirective('psy_services=info'),
-                            PSY_LOG_LEVEL: 'info',
-                        },
-                        maxRetries: 3,
-                        retryDelayMs: 2000
-                    }
-                ));
-                console.log(`[DevNet] psy-indexer realm ${realmId}/${realmSubId} started`);
+                for (const realmSubId of realmP2pSubIds) {
+                    const edgePort = realmP2pHttpPort(realmId, realmSubId, 0, realmEdgeCount);
+                    await this.track(await RunningProcess.spawnWithInitializationHintWithRetry(
+                        [
+                            ...psyIndexerCmdBase,
+                            '--edge-url', `http://127.0.0.1:${edgePort}`,
+                            '--psy-services-url', 'http://127.0.0.1:3000',
+                            '--jwt-secret', 'dev-secret-key',
+                            '--backup-dir', backupDir,
+                            '--poll-interval-ms', '5000',
+                            'realm',
+                            '--realm-id', realmId.toString(),
+                            '--realm-sub-id', realmSubId.toString(),
+                        ],
+                        psyIndexerStartedDetector,
+                        {
+                            cwd: psyServicesCwd,
+                            ...getLogPaths(`psy_indexer_realm_${realmId}_${realmSubId}`, false),
+                            env: {
+                                ...this.getEnvWithRustLogDirective('psy_services=info'),
+                                PSY_LOG_LEVEL: 'info',
+                            },
+                            maxRetries: 3,
+                            retryDelayMs: 2000
+                        }
+                    ));
+                    console.log(`[DevNet] psy-indexer realm ${realmId}/${realmSubId} started`);
+                }
             }
         }
 
