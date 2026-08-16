@@ -175,6 +175,14 @@ impl RealmNetwork {
                     .publish(vote_topic(self.realm_id), vote.protocol_encode_to_vec())
                     .map(|_| ())
                     .map_err(|error| NetworkError::Behaviour(error.to_string()));
+                if result.is_ok() {
+                    tracing::info!(
+                        "realm P2P vote published proposal={} signer_sub_id={} realm={}",
+                        hex::encode(vote.proposal_id),
+                        vote.signer_sub_id,
+                        self.realm_id
+                    );
+                }
                 let _ = response.send(result);
             }
             RealmNetworkCommand::SubmitFinalize { request, response } => {
@@ -264,6 +272,13 @@ impl RealmNetwork {
                 } else if message.topic == vote_hash {
                     match Vote::decode_exact(&message.data) {
                         Ok(vote) => {
+                            tracing::info!(
+                                "realm P2P vote received proposal={} signer_sub_id={} realm={} source={:?}",
+                                hex::encode(vote.proposal_id),
+                                vote.signer_sub_id,
+                                self.realm_id,
+                                source
+                            );
                             feed_vote_waiters(state, &vote);
                             let _ = self.event_tx.try_send(RealmNetworkEvent::VoteReceived {
                                 source,

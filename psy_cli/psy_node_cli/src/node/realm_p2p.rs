@@ -345,9 +345,11 @@ where
                         continue;
                     }
                     tracing::info!(
-                        "realm P2P non-proposer vote published proposal={} signer_sub_id={}",
+                        "realm P2P non-proposer vote published proposal={} signer_sub_id={} realm={} source={:?}",
                         hex::encode(proposal.proposal_id),
-                        local_sub_id
+                        local_sub_id,
+                        realm_id,
+                        source
                     );
                 }
                 RealmNetworkEvent::EndCapReceived { reply, .. } => {

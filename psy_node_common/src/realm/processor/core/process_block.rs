@@ -445,8 +445,16 @@ where
             p2p_submission = self.publish_realm_p2p_proposal(&submission_header, &root_job_proof).await?;
         }
 
-        // 7. Submit to Coordinator
-        tracing::info!("Submitting GUTA proof to Coordinator...");
+        if let Some((proposal, _)) = p2p_submission.as_ref() {
+            tracing::info!(
+                "Submitting GUTA proof to Coordinator proposal={} realm={} sub_id={}",
+                hex::encode(proposal.proposal_id),
+                self.db.state.realm_id_u64,
+                self.db.state.realm_sub_id_u64
+            );
+        } else {
+            tracing::info!("Submitting GUTA proof to Coordinator...");
+        }
         self.db
             .coordinator_client
             .rc_submit_guta_proof(
@@ -575,7 +583,8 @@ where
         let local_sub_id = self.db.state.realm_sub_id_u64 as u16;
         let epoch = parth_common::realm_rotation::epoch(target, rotation.checkpoints_per_epoch);
         tracing::info!(
-            "realm P2P scheduled proposer sub_id={} epoch={} target={} base={}",
+            "realm P2P scheduled proposer realm={} sub_id={} epoch={} target={} base={}",
+            self.db.state.realm_id_u64,
             local_sub_id,
             epoch,
             target,
@@ -624,7 +633,16 @@ where
         let own_vote = sign_vote(bls_secret, local_sub_id, &proposal);
         cmds.publish_proposal(proposal.clone(), body).await?;
         cmds.publish_vote(own_vote.clone()).await?;
-
+        tracing::info!(
+            "realm P2P proposal published proposal={} realm={} sub_id={} epoch={} target={} base={} validator_tree_root={}",
+            hex::encode(proposal.proposal_id),
+            self.db.state.realm_id_u64,
+            local_sub_id,
+            epoch,
+            target,
+            base_checkpoint_id,
+            hex::encode(proposal.validator_tree_root)
+        );
         let tree_rotation = self.rotation_from_validator_tree(base_checkpoint_id).await?;
         let n = tree_rotation.validator_sub_ids.len();
         let mut all_votes = vec![(own_vote.signer_sub_id, own_vote.signature)];
@@ -660,6 +678,14 @@ where
                 }
                 seen.insert(vote.signer_sub_id);
                 all_votes.push((vote.signer_sub_id, vote.signature));
+                tracing::info!(
+                    "realm P2P vote accepted proposal={} signer_sub_id={} realm={} epoch={} target={}",
+                    hex::encode(proposal.proposal_id),
+                    vote.signer_sub_id,
+                    self.db.state.realm_id_u64,
+                    epoch,
+                    target
+                );
             }
         }
         let certificate = form_certificate(&proposal, &all_votes)?;
@@ -681,10 +707,14 @@ where
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         validate_certificate(&proposal, &certificate, validator_sub_ids, &leaf_bls_keys)?;
+        let signer_ids = all_votes.iter().map(|(sub_id, _)| *sub_id).collect::<Vec<_>>();
         tracing::info!(
-            "realm P2P proposal published and certificate formed for realm {} target {} ({} verified votes)",
+            "realm P2P certificate formed proposal={} realm={} target={} epoch={} signers={:?} verified_votes={}",
+            hex::encode(proposal.proposal_id),
             self.db.state.realm_id_u64,
             target,
+            epoch,
+            signer_ids,
             all_votes.len()
         );
         Ok(Some((proposal, certificate)))

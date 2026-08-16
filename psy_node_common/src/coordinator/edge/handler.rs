@@ -771,10 +771,13 @@ impl<
             proposal.proposer_sub_id
         );
         tracing::info!(
-            "realm P2P certificate admitted realm={} inclusion_checkpoint_id={} signers={}",
+            "realm P2P certificate admitted realm={} inclusion_checkpoint_id={} proposal={} proposer_sub_id={} signers={} signer_sub_ids={:?}",
             realm_id,
             inclusion_checkpoint_id,
-            certificate.popcount()
+            hex::encode(proposal.proposal_id),
+            proposal.proposer_sub_id,
+            certificate.popcount(),
+            certificate.signer_sub_ids()
         );
         Ok(())
     }
