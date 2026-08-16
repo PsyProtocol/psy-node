@@ -207,6 +207,41 @@ impl<
         }
     }
 
+    async fn ensure_local_is_scheduled_end_cap_receiver(&self, header_checkpoint_id: u64) -> anyhow::Result<()> {
+        let Some(rotation) = self.rotation.as_ref() else {
+            return Ok(());
+        };
+        if !rotation.is_enabled() {
+            return Ok(());
+        }
+        let latest_checkpoint_id = self.get_latest_checkpoint_id().await?;
+        let admissible_target = latest_checkpoint_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("latest checkpoint ID overflow at EndCap receive"))?;
+        anyhow::ensure!(
+            header_checkpoint_id == admissible_target,
+            "forwarded EndCap checkpoint {} is not the admissible target {}",
+            header_checkpoint_id,
+            admissible_target
+        );
+        let epoch = parth_common::realm_rotation::epoch(admissible_target, rotation.checkpoints_per_epoch);
+        let anchor_id = parth_common::realm_rotation::anchor_checkpoint_id(epoch, rotation.checkpoints_per_epoch);
+        let leaf = self.db_reader.get_checkpoint_leaf_data(anchor_id).await?;
+        let felts = leaf.stats.random_seed.to_4_felts();
+        let seed = [
+            felts[0].to_u64_value(),
+            felts[1].to_u64_value(),
+            felts[2].to_u64_value(),
+            felts[3].to_u64_value(),
+        ];
+        ensure_local_is_scheduled_end_cap_receiver(
+            self.realm_id_u64 as u32,
+            self.realm_sub_id_u64 as u16,
+            admissible_target,
+            seed,
+            rotation,
+        )
+    }
     async fn accept_forwarded_end_cap(
         &self,
         source: NodeId,
@@ -231,6 +266,8 @@ impl<
             self.realm_id_u64 as u32,
             proposer_node_ids,
         )?;
+        self.ensure_local_is_scheduled_end_cap_receiver(header.checkpoint_id)
+            .await?;
         let user_end_cap_input =
             SubmitUserEndCapNonProofInput::<N::F, N::QHash>::psy_ser_from_slice(&input)?;
         self.handle_user_end_cap_proof_submission(user_end_cap_input, proof, false)
@@ -445,6 +482,30 @@ fn resolve_end_cap_forward_dest(
     Ok(Some((proposer, dest)))
 }
 
+fn ensure_local_is_scheduled_end_cap_receiver(
+    realm_id: u32,
+    local_sub_id: u16,
+    target_checkpoint_id: u64,
+    anchor_seed: parth_common::realm_rotation::RotationAnchorSeed,
+    rotation: &RealmRotationConfig,
+) -> anyhow::Result<()> {
+    if !rotation.is_enabled() {
+        return Ok(());
+    }
+    let proposer = rotation
+        .proposer_sub_id(realm_id, target_checkpoint_id, anchor_seed)?
+        .ok_or_else(|| anyhow::anyhow!(
+            "rotation enabled but proposer_sub_id returned None for realm {} target {}",
+            realm_id,
+            target_checkpoint_id,
+        ))?;
+    anyhow::ensure!(
+        proposer == local_sub_id,
+        "forwarded EndCap rejected: local sub_id {local_sub_id} is not scheduled proposer {proposer} for target {target_checkpoint_id}"
+    );
+    Ok(())
+}
+
 impl<
         N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
         S: PsyRealmEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync,
@@ -545,6 +606,15 @@ impl<
         N::ZKProof: 'static,
     {
         let mut timer = DebugTimer::new("handle_user_end_cap_proof_submission");
+        if allow_forward {
+            if self
+                .try_forward_end_cap_to_scheduled_proposer(&user_end_cap_input, proof_bytes.clone())
+                .await?
+            {
+                return Ok(());
+            }
+        }
+
         let end_cap_checkpoint_id = user_end_cap_input.core.checkpoint_id.to_u64_value();
 
         let secondary_end_cap_checkpoint_id = user_end_cap_input.core.new_user_leaf.last_checkpoint_id.to_u64_value();
@@ -614,10 +684,7 @@ impl<
 
         let job_id =
             QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(user_id, N::GLOBAL_USER_TREE_HEIGHT, unique_pending_id)?;
-        //println!("checkpoint_tree_proof: {:#?}", checkpoint_tree_proof);
-        //println!("verify_checkpoint_tree_proof: {}", checkpoint_tree_proof.verify::<N::HasherBase>());
         let historical_root = checkpoint_tree_proof.get_append_root::<N::HasherBase>();
-        //let (historical_root, current_root) = compute_historical_and_current_merkle_roots_core_gt::<N::QHash, N::HasherBase>(&checkpoint_tree_proof);
         if historical_root != user_end_cap_input.core.state_transition.checkpoint_tree_root_hash {
             anyhow::bail!(
                 "Invalid checkpoint tree proof historical root, left: {:?}, right: {:?}",
@@ -625,9 +692,6 @@ impl<
                 user_end_cap_input.core.state_transition.checkpoint_tree_root_hash
             );
         }
-        //tracing::info!("[{:?}] checkpoint_tree_proof ({} @ LATEST) (append_root: {:?}): {:?}", job_id, end_cap_checkpoint_id, checkpoint_tree_proof.get_append_root::<N::HasherBase>(), checkpoint_tree_proof);
-
-
 
         self.ensure_user_has_not_submitted(user_id, unique_pending_id).await?;
         timer.lap_micros("ensure_user_has_not_submitted (2)");
@@ -654,7 +718,6 @@ impl<
         contract_ids.dedup();
         self.ensure_contract_heights_in_cache(&contract_ids).await?;
         timer.lap_micros("ensure_contract_heights_in_cache");
-        //println!("old_user_leaf: {:?}", old_user_leaf);
 
         user_end_cap_input.ensure_simple_self_consistent::<N::HasherBase, _>(
             &old_user_leaf,
@@ -671,77 +734,100 @@ impl<
         }).await??;
         timer.lap_micros("verify_zk_proof");
 
-        // Optional Realm P2P forward. Route by the node's latest committed
-        // checkpoint + 1, never the user-supplied EndCap checkpoint. That
-        // user field remains only the proof-history checkpoint.
-        if allow_forward {
-        if let (Some(cmds), Some(rotation), Some(node_ids)) = (&self.p2p, &self.rotation, &self.proposer_node_ids) {
-            if rotation.is_enabled() {
-                let latest_checkpoint_id = self.get_latest_checkpoint_id().await?;
-                let target = latest_checkpoint_id
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("latest checkpoint ID overflow at EndCap forward"))?;
-                let epoch = parth_common::realm_rotation::epoch(target, rotation.checkpoints_per_epoch);
-                let anchor_id = parth_common::realm_rotation::anchor_checkpoint_id(epoch, rotation.checkpoints_per_epoch);
-                let leaf = self.db_reader.get_checkpoint_leaf_data(anchor_id).await?;
-                let felts = leaf.stats.random_seed.to_4_felts();
-                let seed = [
-                    felts[0].to_u64_value(),
-                    felts[1].to_u64_value(),
-                    felts[2].to_u64_value(),
-                    felts[3].to_u64_value(),
-                ];
-                if let Some((proposer, dest)) = resolve_end_cap_forward_dest(
-                    self.realm_id_u64 as u32,
-                    self.realm_sub_id_u64 as u16,
-                    target,
-                    seed,
-                    rotation,
-                    node_ids,
-                )? {
-                    // Canonical EndCap input bytes — reuse the existing
-                    // serializer; do not invent a second codec.
-                    let input = user_end_cap_input.psy_ser_to_bytes_vec()?;
-                    let input_hash = sha256(&input);
-                    let proof_hash = sha256(&proof_bytes);
-                    let end_cap_id = compute_end_cap_id(
-                        self.chain_id,
-                        self.realm_id_u64 as u32,
-                        target,
-                        &input_hash,
-                        &proof_hash,
-                    );
-                    let header = EndCapForwardHeader {
-                        chain_id: self.chain_id,
-                        realm_id: self.realm_id_u64 as u32,
-                        checkpoint_id: target,
-                        end_cap_id,
-                        end_cap_input_len: input.len() as u32,
-                        proof_len: proof_bytes.len() as u32,
-                    };
-                    let resp = cmds
-                        .forward_end_cap(dest, header.clone(), input, proof_bytes)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("EndCap forward to proposer {proposer} failed: {e}"))?;
-                    if !resp.is_accepted() {
-                        anyhow::bail!("EndCap forward rejected by proposer {proposer}");
-                    }
-                    tracing::info!(
-                        "realm P2P EndCap forwarded end_cap_id={} proposer_sub_id={} dest={:?}",
-                        hex::encode(header.end_cap_id),
-                        proposer,
-                        dest
-                    );
-                    return Ok(());
-                }
-                // Local instance is the scheduled proposer: fall through to
-                // the existing local gatherer / queue publish path.
-            }
-        }
-        }
+        self.store_and_publish_local_end_cap(
+            &mut timer,
+            user_end_cap_input,
+            proof_bytes,
+            user_id,
+            unique_pending_id,
+            job_id,
+            old_leaf_hash,
+        )
+        .await
+    }
 
-        // TODO: maybe modify the job_id.sub_group_id
+    async fn try_forward_end_cap_to_scheduled_proposer(
+        &self,
+        user_end_cap_input: &SubmitUserEndCapNonProofInput<N::F, N::QHash>,
+        proof_bytes: Vec<u8>,
+    ) -> anyhow::Result<bool> {
+        let (Some(cmds), Some(rotation), Some(node_ids)) = (&self.p2p, &self.rotation, &self.proposer_node_ids) else {
+            return Ok(false);
+        };
+        if !rotation.is_enabled() {
+            return Ok(false);
+        }
+        let latest_checkpoint_id = self.get_latest_checkpoint_id().await?;
+        let target = latest_checkpoint_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("latest checkpoint ID overflow at EndCap forward"))?;
+        let epoch = parth_common::realm_rotation::epoch(target, rotation.checkpoints_per_epoch);
+        let anchor_id = parth_common::realm_rotation::anchor_checkpoint_id(epoch, rotation.checkpoints_per_epoch);
+        let leaf = self.db_reader.get_checkpoint_leaf_data(anchor_id).await?;
+        let felts = leaf.stats.random_seed.to_4_felts();
+        let seed = [
+            felts[0].to_u64_value(),
+            felts[1].to_u64_value(),
+            felts[2].to_u64_value(),
+            felts[3].to_u64_value(),
+        ];
+        let Some((proposer, dest)) = resolve_end_cap_forward_dest(
+            self.realm_id_u64 as u32,
+            self.realm_sub_id_u64 as u16,
+            target,
+            seed,
+            rotation,
+            node_ids,
+        )?
+        else {
+            return Ok(false);
+        };
+        let input = user_end_cap_input.psy_ser_to_bytes_vec()?;
+        let input_hash = sha256(&input);
+        let proof_hash = sha256(&proof_bytes);
+        let end_cap_id = compute_end_cap_id(
+            self.chain_id,
+            self.realm_id_u64 as u32,
+            target,
+            &input_hash,
+            &proof_hash,
+        );
+        let header = EndCapForwardHeader {
+            chain_id: self.chain_id,
+            realm_id: self.realm_id_u64 as u32,
+            checkpoint_id: target,
+            end_cap_id,
+            end_cap_input_len: input.len() as u32,
+            proof_len: proof_bytes.len() as u32,
+        };
+        let resp = cmds
+            .forward_end_cap(dest, header.clone(), input, proof_bytes)
+            .await
+            .map_err(|e| anyhow::anyhow!("EndCap forward to proposer {proposer} failed: {e}"))?;
+        if !resp.is_accepted() {
+            anyhow::bail!("EndCap forward rejected by proposer {proposer}");
+        }
+        tracing::info!(
+            "realm P2P EndCap forwarded end_cap_id={} proposer_sub_id={} dest={:?}",
+            hex::encode(header.end_cap_id),
+            proposer,
+            dest
+        );
+        Ok(true)
+    }
+
+    async fn store_and_publish_local_end_cap(
+        &self,
+        timer: &mut DebugTimer,
+        user_end_cap_input: SubmitUserEndCapNonProofInput<N::F, N::QHash>,
+        proof_bytes: Vec<u8>,
+        user_id: u64,
+        unique_pending_id: u64,
+        job_id: QProvingJobDataID,
+        old_leaf_hash: N::QHash,
+    ) -> anyhow::Result<()> {
         let rand_status = rand::random::<u64>();
+
 
         let fake_checkpoint_id = rand_status;
         let context = QBlobWriterContextMetadataHeader::new_at_now(
@@ -1730,6 +1816,73 @@ mod tests {
         assert!(
             dest.is_none(),
             "rotation disabled: local intake"
+        );
+    }
+
+    #[test]
+    fn scheduled_receiver_accepts_local_proposer() {
+        let rotation = rotation_config();
+        let proposer = scheduled_proposer(&rotation, 25);
+        ensure_local_is_scheduled_end_cap_receiver(TEST_REALM_ID, proposer, 25, [1, 2, 3, 4], &rotation)
+            .expect("scheduled proposer may receive");
+    }
+
+    #[test]
+    fn scheduled_dest_means_forward_only_local_means_store() {
+        let rotation = rotation_config();
+        let validators = build_validators(&[1, 2, 3]);
+        let proposer = scheduled_proposer(&rotation, 25);
+        let other = rotation
+            .validator_sub_ids
+            .iter()
+            .copied()
+            .find(|&sub_id| sub_id != proposer)
+            .expect("other validator");
+        let forwarded = resolve_end_cap_forward_dest(
+            TEST_REALM_ID,
+            other,
+            25,
+            [1, 2, 3, 4],
+            &rotation,
+            &validators,
+        )
+        .expect("routing");
+        assert!(forwarded.is_some(), "non-proposer must forward and skip store/NATS");
+        let local = resolve_end_cap_forward_dest(
+            TEST_REALM_ID,
+            proposer,
+            25,
+            [1, 2, 3, 4],
+            &rotation,
+            &validators,
+        )
+        .expect("routing");
+        assert!(local.is_none(), "scheduled proposer must store and publish locally");
+    }
+
+    #[test]
+    fn scheduled_receiver_rejects_non_proposer() {
+        let rotation = rotation_config();
+        let proposer = scheduled_proposer(&rotation, 25);
+        let local_sub_id = rotation
+            .validator_sub_ids
+            .iter()
+            .copied()
+            .find(|&sub_id| sub_id != proposer)
+            .expect("other validator");
+        let err = ensure_local_is_scheduled_end_cap_receiver(
+            TEST_REALM_ID,
+            local_sub_id,
+            25,
+            [1, 2, 3, 4],
+            &rotation,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "forwarded EndCap rejected: local sub_id {local_sub_id} is not scheduled proposer {proposer} for target 25"
+            )
         );
     }
 }

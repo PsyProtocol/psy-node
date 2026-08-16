@@ -501,10 +501,18 @@ impl<
         config: RealmGUTAEndCapGathererConfig<N, TempDatabase, FileSystem>,
     ) -> anyhow::Result<Self> {
         let status = config.status.read().unwrap().clone();
-        if tree.get_root() != status.last_committed_realm_end_root {
+        let live_root = tree.get_root();
+        let snapshot_root = status.gathering_realm_start_root;
+        if live_root == snapshot_root {
+            tracing::info!(
+                "Keeping RealmGUTAEndCapGatherer A-snapshot tree root {:?} at checkpoint {}",
+                live_root,
+                status.last_committed_checkpoint_id
+            );
+        } else if live_root != status.last_committed_realm_end_root {
             tracing::info!(
                 "Rebasing RealmGUTAEndCapGatherer tree from {:?} onto committed root {:?} at checkpoint {}",
-                tree.get_root(),
+                live_root,
                 status.last_committed_realm_end_root,
                 status.last_committed_checkpoint_id
             );
@@ -726,6 +734,9 @@ impl<
                     self.status.gathering_unique_pending_id
                 );
                 tree.commit_changes();
+                if let Ok(mut shared) = self.config.status.write() {
+                    shared.gathering_realm_start_root = tree.get_root();
+                }
                 return Ok(result);
             }
         }
@@ -767,6 +778,9 @@ impl<
             .file_system
             .file_like_fs_sync_file_with_path(&self.pending_file_path, &mut self.new_realm_end_cap_gatherer_file)
             .await?;
+        if let Ok(mut shared) = self.config.status.write() {
+            shared.gathering_realm_start_root = tree.get_root();
+        }
         Ok(RealmGUTAEndCapGathererOutput {
             db_output: RealmGUTAEndCapGathererOutputDatabase::<N::F, N::QHash>::get_empty(tree.get_root()),
             job_ids: vec![],

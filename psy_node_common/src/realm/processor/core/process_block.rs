@@ -141,7 +141,9 @@ where
         // no manual ensure_stream / ensure_consumer is needed here. Calling it twice — as
         // the previous genesis branch did — would advance unique_pending_id by two for
         // the first block and silently drop the genesis-time finalize output.
-        self.db.set_new_unique_ids(None).await?;
+        self.db
+            .set_new_unique_ids(Some(self.db.state.processing_realm_end_root))
+            .await?;
 
         // Sync the gatherer's queue key to the new gathering proc ID so the
         // gatherer polls the same queue that end-cap submissions write to.
