@@ -24,7 +24,7 @@ use crate::{
 
 impl<
         N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
-        S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync,
+        S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync + 'static,
         STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync,
         GUTAUpdateQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
         ProofWorkQueue: QStandardWorkerQueuePublisher + Send + Sync,
@@ -76,6 +76,7 @@ where
             file_system: file_system.clone(),
             _phantom_n: std::marker::PhantomData,
             future_pending_end_cap_jobs: Arc::new(std::sync::RwLock::new(Vec::new())),
+            tree_store: db.db.clone(),
         };
         /*
         if db.last_committed.l2_state.next_contract_id as u64 != db_tree_next_contract_id {

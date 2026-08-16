@@ -11,7 +11,7 @@
 //! - [`sign_vote`]: produce a BLS [`Vote`] over the canonical `vote_message`.
 //! - [`form_certificate`]: aggregate validator votes into a [`Certificate`].
 //! - [`validate_certificate`]: enforce the `ceil(n/2)` replication threshold,
-//!   require every signer bitmap bit to name an occupied validator-tree leaf,
+//!   require every signer bitmap bit to name a validator leaf,
 //!   and run `FastAggregateVerify` over the reconstructed `vote_message`.
 //!
 //! A [`Vote`] only attests that the signer durably stored the backup file and
@@ -237,7 +237,7 @@ where
 
 /// Sign a [`Vote`] for `proposal` with the local validator's BLS secret key.
 ///
-/// `signer_sub_id` is the signer's own occupied validator-tree leaf sub-id and
+/// `signer_sub_id` is the signer's own validator leaf sub-id and
 /// must be in `0..=255` (it is the local node's committed identity, not a
 /// value read from the network). The signature is over the canonical
 /// `vote_message` derived from the proposal's `chain_id`, `realm_id`,
@@ -297,14 +297,14 @@ pub fn form_certificate(
     })
 }
 
-/// Validate a [`Certificate`] against a [`Proposal`] and the Realm roster.
+/// Validate a [`Certificate`] against a [`Proposal`] and the Realm validators.
 ///
-/// `occupied_sub_ids` is the ascending list of the Realm's occupied
-/// validator-tree leaf sub-ids at the proof-base checkpoint, with
-/// `n = occupied_sub_ids.len()` satisfying
+/// `validator_sub_ids` is the ascending list of the Realm's validator leaf
+/// sub-ids at the proof-base checkpoint, with
+/// `n = validator_sub_ids.len()` satisfying
 /// [`MIN_VALIDATORS_PER_REALM`] `<= n <=` [`MAX_VALIDATORS_PER_REALM`].
 /// `leaf_bls_keys` must contain the authenticated BLS public key for every
-/// sub-id in `occupied_sub_ids`; the caller is responsible for reconstructing
+/// sub-id in `validator_sub_ids`; the caller is responsible for reconstructing
 /// each `ValidatorLeaf` against the checkpoint `validator_tree_root` so that
 /// only keys anchored to the committed tree are supplied here.
 ///
@@ -315,24 +315,24 @@ pub fn form_certificate(
 ///    is byte-identical for every signer.
 /// 2. `popcount(signer_bitmap) >= ceil(n/2)` (the replication threshold, not a
 ///    BFT quorum).
-/// 3. Every set bit names an occupied validator-tree leaf and has a supplied
-///    BLS key (no bit names an empty or mismatching leaf). This also enforces
-///    `popcount <= n`, since at most `n` distinct occupied sub-ids can be set.
+/// 3. Every set bit names a validator leaf and has a supplied BLS key (no bit
+///    names an empty or mismatching leaf). This also enforces `popcount <= n`,
+///    since at most `n` distinct validator sub-ids can be set.
 /// 4. `FastAggregateVerify` succeeds over the single `vote_message` using the
 ///    authenticated keys of the signers, in ascending sub-id order.
 pub fn validate_certificate(
     proposal: &Proposal,
     certificate: &Certificate,
-    occupied_sub_ids: &[u16],
+    validator_sub_ids: &[u16],
     leaf_bls_keys: &[(u16, BlsPublicKey)],
 ) -> ProtocolResult<()> {
-    let n = occupied_sub_ids.len();
+    let n = validator_sub_ids.len();
     if !(MIN_VALIDATORS_PER_REALM..=MAX_VALIDATORS_PER_REALM).contains(&n) {
-        return Err(ProtocolError::Message("occupied sub-id count out of range"));
+        return Err(ProtocolError::Message("validator sub-id count out of range"));
     }
-    for &sub_id in occupied_sub_ids {
+    for &sub_id in validator_sub_ids {
         if sub_id > 255 {
-            return Err(ProtocolError::Message("occupied sub_id exceeds 255"));
+            return Err(ProtocolError::Message("validator sub_id exceeds 255"));
         }
     }
 
@@ -357,7 +357,7 @@ pub fn validate_certificate(
         return Err(ProtocolError::Message("certificate below replication threshold"));
     }
 
-    // Every set bit must name an occupied validator-tree leaf with a supplied,
+    // Every set bit must name a validator leaf with a supplied,
     // authenticated BLS key. Collecting them in ascending sub-id order yields a
     // deterministic signer set for FastAggregateVerify.
     let mut keys: Vec<BlsPublicKey> = Vec::with_capacity(popcount);
@@ -365,14 +365,14 @@ pub fn validate_certificate(
         if !bitmap_get(&certificate.signer_bitmap, sub_id) {
             continue;
         }
-        if !occupied_sub_ids.contains(&sub_id) {
+        if !validator_sub_ids.contains(&sub_id) {
             return Err(ProtocolError::Message("signer bit names empty validator leaf"));
         }
         let key = leaf_bls_keys
             .iter()
             .find(|(s, _)| *s == sub_id)
             .map(|(_, key)| *key)
-            .ok_or_else(|| ProtocolError::Message("missing BLS key for occupied sub_id"))?;
+            .ok_or_else(|| ProtocolError::Message("missing BLS key for validator sub_id"))?;
         keys.push(key);
     }
 
@@ -542,7 +542,7 @@ mod tests {
         assert_eq!(err, ProtocolError::Message("body_hash mismatch"));
     }
 
-    fn build_roster(sub_ids: &[u16]) -> (Vec<BlsSecretKey>, Vec<(u16, BlsPublicKey)>) {
+    fn build_validators(sub_ids: &[u16]) -> (Vec<BlsSecretKey>, Vec<(u16, BlsPublicKey)>) {
         let mut secrets = Vec::new();
         let mut keys = Vec::new();
         for (i, &s) in sub_ids.iter().enumerate() {
@@ -571,21 +571,21 @@ mod tests {
     #[test]
     fn certificate_threshold_is_ceil_half_n() {
         // n = 3 => ceil(3/2) = 2.
-        let occupied: [u16; 3] = [1, 2, 3];
-        let (secrets, keys) = build_roster(&occupied);
+        let validator_sub_ids: [u16; 3] = [1, 2, 3];
+        let (secrets, keys) = build_validators(&validator_sub_ids);
         let (output, proof, backup) = sample_body_sections();
         let (proposal, _body) =
             proposal_with_body(7, 3, 99, 1, [1u8; 32], &output, &proof, &backup);
 
         // Two signers meets the threshold.
-        let votes = signed_votes(&secrets[..2], &occupied[..2], &proposal);
+        let votes = signed_votes(&secrets[..2], &validator_sub_ids[..2], &proposal);
         let cert = form_certificate(&proposal, &votes).expect("form");
-        validate_certificate(&proposal, &cert, &occupied, &keys).expect("valid");
+        validate_certificate(&proposal, &cert, &validator_sub_ids, &keys).expect("valid");
 
         // One signer is below ceil(3/2) = 2.
-        let votes1 = signed_votes(&secrets[..1], &occupied[..1], &proposal);
+        let votes1 = signed_votes(&secrets[..1], &validator_sub_ids[..1], &proposal);
         let cert1 = form_certificate(&proposal, &votes1).expect("form");
-        let err = validate_certificate(&proposal, &cert1, &occupied, &keys).unwrap_err();
+        let err = validate_certificate(&proposal, &cert1, &validator_sub_ids, &keys).unwrap_err();
         assert_eq!(
             err,
             ProtocolError::Message("certificate below replication threshold")
@@ -593,25 +593,25 @@ mod tests {
     }
 
     #[test]
-    fn certificate_rejects_signer_outside_roster() {
-        let occupied: [u16; 2] = [1, 2];
-        let (secrets, keys) = build_roster(&occupied);
+    fn certificate_rejects_signer_outside_validators() {
+        let validator_sub_ids: [u16; 2] = [1, 2];
+        let (secrets, keys) = build_validators(&validator_sub_ids);
         let (output, proof, backup) = sample_body_sections();
         let (proposal, _body) =
             proposal_with_body(7, 3, 99, 1, [1u8; 32], &output, &proof, &backup);
 
-        // Forge a vote from a sub-id that is not in the occupied roster and
+        // Forge a vote from a sub-id that is not one of the validators and
         // aggregate it with the two honest votes.
         let outsider = validator_key(9);
         let outsider_vote = sign_vote(&outsider, 5, &proposal);
-        let votes = signed_votes(&secrets, &occupied, &proposal);
+        let votes = signed_votes(&secrets, &validator_sub_ids, &proposal);
         let mut all_votes = votes.clone();
         all_votes.push((5, outsider_vote.signature));
 
         let cert = form_certificate(&proposal, &all_votes).expect("form");
-        // Bit 5 names a leaf outside the occupied roster; the per-bit
-        // occupied-leaf check must catch it.
-        let err = validate_certificate(&proposal, &cert, &occupied, &keys).unwrap_err();
+        // Bit 5 names a leaf outside the validators; the per-bit validator-leaf
+        // check must catch it.
+        let err = validate_certificate(&proposal, &cert, &validator_sub_ids, &keys).unwrap_err();
         assert_eq!(
             err,
             ProtocolError::Message("signer bit names empty validator leaf")
@@ -620,15 +620,15 @@ mod tests {
 
     #[test]
     fn certificate_rejects_mismatched_aggregate() {
-        let occupied: [u16; 3] = [1, 2, 3];
-        let (secrets, keys) = build_roster(&occupied);
+        let validator_sub_ids: [u16; 3] = [1, 2, 3];
+        let (secrets, keys) = build_validators(&validator_sub_ids);
         let (output, proof, backup) = sample_body_sections();
         let (proposal, _body) =
             proposal_with_body(7, 3, 99, 1, [1u8; 32], &output, &proof, &backup);
 
         // Build a structurally valid aggregate (real G2 point) that signs the
         // same vote_message with three OUTSIDER keys, so it is a legitimate
-        // aggregate but does not verify against the roster's keys.
+        // aggregate but does not verify against the validators' keys.
         let outsiders = [
             validator_key(31),
             validator_key(32),
@@ -640,28 +640,28 @@ mod tests {
             .collect();
         let mismatched_agg = aggregate_signatures(&outsider_sigs).expect("aggregate");
 
-        let real_votes = signed_votes(&secrets, &occupied, &proposal);
+        let real_votes = signed_votes(&secrets, &validator_sub_ids, &proposal);
         let mut cert = form_certificate(&proposal, &real_votes).expect("form");
         cert.aggregated_signature = mismatched_agg;
 
-        let err = validate_certificate(&proposal, &cert, &occupied, &keys).unwrap_err();
+        let err = validate_certificate(&proposal, &cert, &validator_sub_ids, &keys).unwrap_err();
         assert_eq!(err, ProtocolError::BlsVerifyFailed);
     }
 
     #[test]
     fn certificate_rejects_mismatched_proposal() {
-        let occupied: [u16; 3] = [1, 2, 3];
-        let (secrets, keys) = build_roster(&occupied);
+        let validator_sub_ids: [u16; 3] = [1, 2, 3];
+        let (secrets, keys) = build_validators(&validator_sub_ids);
         let (output, proof, backup) = sample_body_sections();
         let (proposal, _body) =
             proposal_with_body(7, 3, 99, 1, [1u8; 32], &output, &proof, &backup);
 
-        let votes = signed_votes(&secrets, &occupied, &proposal);
+        let votes = signed_votes(&secrets, &validator_sub_ids, &proposal);
         let cert = form_certificate(&proposal, &votes).expect("form");
 
         // A different proposal with the same body but a different proof-base checkpoint.
         let (other, _) = proposal_with_body(7, 3, 200, 1, [1u8; 32], &output, &proof, &backup);
-        let err = validate_certificate(&other, &cert, &occupied, &keys).unwrap_err();
+        let err = validate_certificate(&other, &cert, &validator_sub_ids, &keys).unwrap_err();
         assert_eq!(
             err,
             ProtocolError::Message("certificate does not match proposal")
@@ -670,8 +670,8 @@ mod tests {
 
     #[test]
     fn form_certificate_rejects_duplicate_and_out_of_range_sub_ids() {
-        let occupied: [u16; 2] = [1, 2];
-        let (secrets, _keys) = build_roster(&occupied);
+        let validator_sub_ids: [u16; 2] = [1, 2];
+        let (secrets, _keys) = build_validators(&validator_sub_ids);
         let (output, proof, backup) = sample_body_sections();
         let (proposal, _body) =
             proposal_with_body(7, 3, 99, 1, [1u8; 32], &output, &proof, &backup);
@@ -728,20 +728,20 @@ mod tests {
 
     #[test]
     fn certificate_includes_proposer_requires_proposer_signature() {
-        let occupied: [u16; 3] = [1, 2, 3];
-        let (secrets, _keys) = build_roster(&occupied);
+        let validator_sub_ids: [u16; 3] = [1, 2, 3];
+        let (secrets, _keys) = build_validators(&validator_sub_ids);
         let (output, proof, backup) = sample_body_sections();
         let (proposal, _body) =
             proposal_with_body(7, 3, 99, 1, [1u8; 32], &output, &proof, &backup);
 
         // Votes from sub-ids 2 and 3 only: the proposer (sub-id 1) is absent.
-        let votes = signed_votes(&secrets[1..], &occupied[1..], &proposal);
+        let votes = signed_votes(&secrets[1..], &validator_sub_ids[1..], &proposal);
         let cert = form_certificate(&proposal, &votes).expect("form");
         assert!(!certificate_includes_proposer(&cert, 1));
         assert!(certificate_includes_proposer(&cert, 2));
 
-        // Full roster including the proposer.
-        let all_votes = signed_votes(&secrets, &occupied, &proposal);
+        // All validators including the proposer.
+        let all_votes = signed_votes(&secrets, &validator_sub_ids, &proposal);
         let full = form_certificate(&proposal, &all_votes).expect("form");
         assert!(certificate_includes_proposer(&full, 1));
     }

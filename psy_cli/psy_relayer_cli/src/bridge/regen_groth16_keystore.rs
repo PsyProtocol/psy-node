@@ -27,7 +27,12 @@ use psy_core::{
 };
 use psy_data::{
     agg::AggStateTransitionWithStats,
-    guta::{header::GlobalUserTreeAggregatorHeader, stats::GUTAStats, sub_tree_transition::SubTreeNodeStateTransition},
+    guta::{
+        header::GlobalUserTreeAggregatorHeader,
+        realm_finalize::VALIDATOR_TREE_HEIGHT,
+        stats::GUTAStats,
+        sub_tree_transition::SubTreeNodeStateTransition,
+    },
     protocol::circuit_inputs::{
         agg_part_1::QCAggUserRegistartionDeployContractsGUTAInput,
         checkpoint_transition::{QCQEDCheckpointStateTransitionInput, QCQEDCheckpointStateTransitionInputPartial},
@@ -272,6 +277,9 @@ fn regenerate_bridge_agg(keystore_dir: &Path) -> anyhow::Result<()> {
             register_users_completed: F::ONE,
             gutas_completed: F::ONE,
         },
+        validator_tree_root: <PoseidonHash as MerkleZeroHasher<QHashOut<F>>>::get_zero_hash(
+            VALIDATOR_TREE_HEIGHT,
+        ),
     };
     let checkpoint_reward_root =
         hash_tag_tree_node_single::<QHashOut<F>, PoseidonHash>(&part_1_reward, &worker_rewards_tree_tag);

@@ -7,6 +7,7 @@ import {
 } from "./locSetupDefaults";
 import {
     evaluateCompilerArtifactStamp,
+    injectGenesisValidators,
     isUsableGenesisData,
     planPsyDappNestedSubmodulesFromDisk,
     readGenesisContractsArtifactStamp,
@@ -338,6 +339,102 @@ describe("realm P2P HTTP ports", () => {
                 `http://127.0.0.1:${realmP2pHttpPort(realm.id, subId, 0, realmEdgeCount)}`,
             );
             expect(realm.rpc_url).toEqual(expected);
+        }
+    });
+});
+
+describe("injectGenesisValidators", () => {
+    it("writes the two-layer realm/sub validator ids without inventing fields", async () => {
+        const dir = (await Bun.$`mktemp -d`.text()).trim();
+        try {
+            const genesisPath = `${dir}/genesis.json`;
+            await Bun.write(genesisPath, JSON.stringify({ checkpoint_stats: { block_time: 1764248609 } }));
+            await injectGenesisValidators(genesisPath, {
+                coordinator: { peer_id: "coordinator-peer", node_id_hex38: "ff".repeat(38), identity_path: "coordinator-identity" },
+                realms: {
+                    "0": {
+                        "1": {
+                            processor_node_id_hex38: "aa".repeat(38),
+                            processor_peer_id: "processor-peer-0-1",
+                            edge_node_id_hex38: "aa".repeat(38),
+                            edge_peer_id: "edge-peer-0-1",
+                            bls_public_hex: "11".repeat(48),
+                            processor_identity_path: "identity-0-1",
+                            edge_identity_path: "edge-identity-0-1",
+                            bls_path: "bls-0-1",
+                        },
+                        "2": {
+                            processor_node_id_hex38: "bb".repeat(38),
+                            processor_peer_id: "processor-peer-0-2",
+                            edge_node_id_hex38: "bb".repeat(38),
+                            edge_peer_id: "edge-peer-0-2",
+                            bls_public_hex: "22".repeat(48),
+                            processor_identity_path: "identity-0-2",
+                            edge_identity_path: "edge-identity-0-2",
+                            bls_path: "bls-0-2",
+                        },
+                    },
+                    "1": {
+                        "1": {
+                            processor_node_id_hex38: "cc".repeat(38),
+                            processor_peer_id: "processor-peer-1-1",
+                            edge_node_id_hex38: "cc".repeat(38),
+                            edge_peer_id: "edge-peer-1-1",
+                            bls_public_hex: "33".repeat(48),
+                            processor_identity_path: "identity-1-1",
+                            edge_identity_path: "edge-identity-1-1",
+                            bls_path: "bls-1-1",
+                        },
+                    },
+                },
+            });
+            const written = JSON.parse(await Bun.file(genesisPath).text());
+            expect(written.checkpoint_stats).toEqual({ block_time: 1764248609 });
+            expect(written.validators).toEqual([
+                {
+                    realm_id: 0,
+                    realm_sub_id: 1,
+                    validator_user_id: 1,
+                    node_id: "aa".repeat(38),
+                    bls_public_key: "11".repeat(48),
+                },
+                {
+                    realm_id: 0,
+                    realm_sub_id: 2,
+                    validator_user_id: 2,
+                    node_id: "bb".repeat(38),
+                    bls_public_key: "22".repeat(48),
+                },
+                {
+                    realm_id: 1,
+                    realm_sub_id: 1,
+                    validator_user_id: (1 << 20) + 1,
+                    node_id: "cc".repeat(38),
+                    bls_public_key: "33".repeat(48),
+                },
+            ]);
+            for (const entry of written.validators) {
+                expect(Object.keys(entry).sort()).toEqual(
+                    ["bls_public_key", "node_id", "realm_id", "realm_sub_id", "validator_user_id"],
+                );
+            }
+        } finally {
+            await Bun.$`rm -rf ${dir}`.quiet();
+        }
+    });
+
+    it("clears stale validators when no roster is present", async () => {
+        const dir = (await Bun.$`mktemp -d`.text()).trim();
+        try {
+            const genesisPath = `${dir}/genesis.json`;
+            await Bun.write(genesisPath, JSON.stringify({
+                validators: [{ realm_id: 0, realm_sub_id: 1, validator_user_id: 1, node_id: "aa".repeat(38), bls_public_key: "11".repeat(48) }],
+            }));
+            await injectGenesisValidators(genesisPath, null);
+            const written = JSON.parse(await Bun.file(genesisPath).text());
+            expect(written.validators).toEqual([]);
+        } finally {
+            await Bun.$`rm -rf ${dir}`.quiet();
         }
     });
 });

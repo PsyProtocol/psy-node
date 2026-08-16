@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tokio::task;
 use parth_core::{
-    QCoreProcCheckpointUniqueId, QProvingJobDataIDWithRewardPath, crypto::hash::{merkle_proof::MerkleProofCore, tag_tree::TagTreeMerkleProof, traits::{HashTo4Felts, QFieldHashable}}, data::{hash::merkle_node_key::SimpleMerkleNodeKey, queue::queue_key::QPBaseQueueType}, felt::ToU64Value, node::realm_identifier::QRealmIdentifier, protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofVerifier}
+    QCoreProcCheckpointUniqueId, QProvingJobDataIDWithRewardPath, crypto::hash::{merkle_proof::MerkleProofCore, tag_tree::TagTreeMerkleProof, traits::{HashTo4Felts, MerkleZeroHasher, QFieldHashable}}, data::{hash::merkle_node_key::SimpleMerkleNodeKey, queue::queue_key::QPBaseQueueType}, felt::ToU64Value, node::realm_identifier::QRealmIdentifier, protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofVerifier}
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_crypto::hash::tx_hash::{compute_deploy_contract_content_hash, hash_to_hex};
@@ -22,6 +22,7 @@ use psy_data::{
     },
 };
 use psy_node_core::{
+    p2p::validator_lookup::load_realm_validators_from_tree,
     psy_core_db::traits::full::{PsyCoordinatorEdgeAPIStoreReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter},
     psy_temp_db::StandardEdgeAPITempDBStoreBase,
     queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber},
@@ -70,7 +71,7 @@ pub struct CoordinatorEdgeHandler<
 
     pub checkpoint_state_transition_circuit_fingerprint: N::QHash,
     pub chain_id: u32,
-    pub validator_roster: Option<(crate::coordinator::validator_registry::ValidatorRegistry, u64)>,
+    pub validators: Option<(crate::coordinator::validator_registry::ValidatorRegistry, u64)>,
 }
 impl<
         N: QNetworkTypesConfig,
@@ -112,7 +113,7 @@ impl<
             contract_state_tree_height_cache: self.contract_state_tree_height_cache.clone(),
             checkpoint_state_transition_circuit_fingerprint: self.checkpoint_state_transition_circuit_fingerprint.clone(),
             chain_id: self.chain_id,
-            validator_roster: self.validator_roster.clone(),
+            validators: self.validators.clone(),
         }
     }
 }
@@ -171,17 +172,17 @@ impl<
             contract_state_tree_height_cache: Arc::new(DashMapContractHeightCache::new()),
             checkpoint_state_transition_circuit_fingerprint,
             chain_id,
-            validator_roster: None,
+            validators: None,
         }
     }
-    pub fn set_validator_roster(
+    pub fn set_validators(
         &mut self,
         registry: crate::coordinator::validator_registry::ValidatorRegistry,
         checkpoints_per_epoch: u64,
     ) -> anyhow::Result<()> {
-        anyhow::ensure!(!registry.is_empty(), "P2P validator roster must not be empty");
+        anyhow::ensure!(!registry.is_empty(), "P2P validators must not be empty");
         anyhow::ensure!(checkpoints_per_epoch > 0, "P2P checkpoints_per_epoch must be greater than zero");
-        self.validator_roster = Some((registry, checkpoints_per_epoch));
+        self.validators = Some((registry, checkpoints_per_epoch));
         Ok(())
     }
 
@@ -629,19 +630,13 @@ impl<
         proposal_bytes: Option<&[u8]>,
         certificate_bytes: Option<&[u8]>,
     ) -> anyhow::Result<()> {
-        let Some((registry, checkpoints_per_epoch)) = self.validator_roster.as_ref() else {
+        let Some((_registry, checkpoints_per_epoch)) = self.validators.as_ref() else {
             anyhow::ensure!(
                 proposal_bytes.is_none() && certificate_bytes.is_none(),
-                "GUTA Proposal/Certificate supplied but coordinator has no validator roster"
+                "GUTA Proposal/Certificate supplied but coordinator has no validators"
             );
             return Ok(());
         };
-        let (occupied, keys) =
-            crate::coordinator::validator_registry::realm_certificate_roster(realm_id, registry)?;
-        anyhow::ensure!(
-            !occupied.is_empty(),
-            "configured validator roster has no validators for realm {realm_id}"
-        );
         let proposal = Proposal::decode_exact(proposal_bytes.ok_or_else(|| {
             anyhow::anyhow!("rotation enabled but GUTA Proposal missing for realm {realm_id}")
         })?)
@@ -668,6 +663,18 @@ impl<
             .db_reader
             .get_checkpoint_global_state_roots(proposal.base_checkpoint_id)
             .await?;
+        let (validator_sub_ids, keys, user_ids) = load_realm_validators_from_tree::<N::HasherBase, N::QHash, _>(
+            &*self.db_reader,
+            proposal.base_checkpoint_id,
+            realm_id,
+            &proof_base_roots.validator_tree_root,
+        )
+        .await?;
+        anyhow::ensure!(
+            !validator_sub_ids.is_empty(),
+            "validator tree has no leaves for realm {realm_id} at checkpoint {}",
+            proposal.base_checkpoint_id
+        );
         let proof_base_validator_tree_root = proof_base_roots.validator_tree_root.into_owned_32bytes();
         require_nonzero_validator_tree_root(&proposal.validator_tree_root)
             .map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -707,7 +714,7 @@ impl<
             .ok_or_else(|| anyhow::anyhow!("GUTA Proposal proof-base checkpoint overflow"))?;
         let rotation = parth_common::realm_rotation::RealmRotationConfig {
             checkpoints_per_epoch: *checkpoints_per_epoch,
-            validator_sub_ids: occupied.clone(),
+            validator_sub_ids: validator_sub_ids.clone(),
         };
         let epoch = parth_common::realm_rotation::epoch(target_checkpoint_id, *checkpoints_per_epoch);
         let anchor_checkpoint_id = parth_common::realm_rotation::anchor_checkpoint_id(epoch, *checkpoints_per_epoch);
@@ -733,27 +740,29 @@ impl<
                 ),
             ).into());
         }
-        let proposer = registry
-            .get(&(realm_id, proposal.proposer_sub_id))
-            .ok_or_else(|| anyhow::anyhow!("GUTA proposer sub_id {} is not occupied", proposal.proposer_sub_id))?;
+        let proposer_user_id = user_ids
+            .iter()
+            .find(|(sub_id, _)| *sub_id == proposal.proposer_sub_id)
+            .map(|(_, user_id)| *user_id)
+            .ok_or_else(|| anyhow::anyhow!("GUTA proposer sub_id {} is not a validator", proposal.proposer_sub_id))?;
         let output = build_bound_finalize_output::<N>(
             proposal.chain_id,
             proposal.realm_id,
             proposal.proposer_sub_id,
-            proposer.validator_user_id,
+            proposer_user_id,
             proof_base_roots.validator_tree_root,
             input,
         );
         let output_bytes = protocol_encode_finalize_output(&output)?;
         anyhow::ensure!(proposal.public_output_hash == sha256(&output_bytes), "GUTA Proposal public output hash mismatch");
-        validate_certificate(&proposal, &certificate, &occupied, &keys).map_err(|error| {
+        validate_certificate(&proposal, &certificate, &validator_sub_ids, &keys).map_err(|error| {
             GutaSubmitError::illegal(
                 RealmFinalizeSubmitCode::InvalidCertificate,
                 format!("invalid GUTA Certificate for realm {realm_id}: {error}"),
             )
         })?;
         anyhow::ensure!(
-            votes_meet_wait(occupied.len(), proposal.proposer_sub_id, &certificate.signer_sub_ids()),
+            votes_meet_wait(validator_sub_ids.len(), proposal.proposer_sub_id, &certificate.signer_sub_ids()),
             "GUTA Certificate for realm {realm_id} below replication wait"
         );
         anyhow::ensure!(

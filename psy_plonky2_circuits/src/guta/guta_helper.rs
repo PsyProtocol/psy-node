@@ -16,7 +16,7 @@ use psy_core::{job::job_id::{ProvingJobCircuitType, QProvingJobDataID}, worker::
 use psy_data::{
     guta::realm_finalize::{
         REALM_ROTATION_PERIOD_CHECKPOINTS_PLACEHOLDER,
-        REALM_ROTATION_REGISTERED_SUB_IDS_PLACEHOLDER,
+        REALM_ROTATION_VALIDATOR_SUB_IDS_PLACEHOLDER,
     },
     worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse,
 };
@@ -264,7 +264,7 @@ where
             global_user_tree_realm_height,
             chain_domain,
             REALM_ROTATION_PERIOD_CHECKPOINTS_PLACEHOLDER,
-            REALM_ROTATION_REGISTERED_SUB_IDS_PLACEHOLDER.to_vec(),
+            REALM_ROTATION_VALIDATOR_SUB_IDS_PLACEHOLDER.to_vec(),
         );
 
         let verify_single_end_cap_whitelist_proof = guta_circuit_whitelist_proofs.pop().unwrap();

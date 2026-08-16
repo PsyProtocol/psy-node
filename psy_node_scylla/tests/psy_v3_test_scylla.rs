@@ -175,6 +175,13 @@ impl SimpleStoreEx {
                 SimpleTestNetworkConfig::GLOBAL_USER_TREE_HEIGHT,
             )
             .await?;
+        let validator_tree_table = store
+            .init_zero_id_merkle_table(
+                "validator_tree_table",
+                get_rk(33),
+                psy_data::guta::realm_finalize::VALIDATOR_TREE_HEIGHT as u8,
+            )
+            .await?;
         let global_contract_tree_table = store
             .init_zero_id_merkle_table(
                 "global_contract_tree_table",
@@ -228,6 +235,7 @@ impl SimpleStoreEx {
             Arc::new(guta_reward_tag_tree_table),
             // added tables for completeness
             Arc::new(user_registration_tree_table),
+            Arc::new(validator_tree_table),
             Arc::new(global_contract_tree_table),
             Arc::new(contract_function_tree_table),
             Arc::new(contract_leaf_table),

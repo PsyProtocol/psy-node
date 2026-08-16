@@ -18,6 +18,7 @@ pub struct QCQEDCheckpointStateTransitionInputPartial<F, Hash> {
     pub block_time: F,
     pub final_random_seed_contribution: Hash,
     pub pm_jobs_completed: PPMJobsCompletedStats<F>,
+    pub validator_tree_root: Hash,
 }
 #[cfg(feature = "rand_gen")]
 impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for QCQEDCheckpointStateTransitionInputPartial<F, Hash> {
@@ -28,6 +29,7 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for QCQEDCheckpointStateTran
             block_time: F::qp_rand_gen(),
             final_random_seed_contribution: Hash::qp_rand_gen(),
             pm_jobs_completed: PPMJobsCompletedStats::qp_rand_gen(),
+            validator_tree_root: Hash::qp_rand_gen(),
         }
     }
 }
@@ -38,35 +40,39 @@ impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for QCQEDCheck
         + PQEDCheckpointLeafStats::<F, Hash>::FIXED_SIZE
         + 8 // block_time
         + 32 // final_random_seed_contribution
-        + PPMJobsCompletedStats::<F>::FIXED_SIZE;
+        + PPMJobsCompletedStats::<F>::FIXED_SIZE
+        + 32; // validator_tree_root
 }
 
 impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for QCQEDCheckpointStateTransitionInputPartial<F, Hash> {
     fn fallback_pio_serialized_size(&self) -> usize {
         Self::FIXED_SIZE
     }
-    
+
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
         self.part_1_header.pio_write_to_io(writer)?;
         self.old_stats.pio_write_to_io(writer)?;
         writer.psy_write_u64(self.block_time.to_u64_value())?;
         writer.psy_write_bytes_fixed(&self.final_random_seed_contribution.into_owned_32bytes())?;
         self.pm_jobs_completed.pio_write_to_io(writer)?;
+        writer.psy_write_bytes_fixed(&self.validator_tree_root.into_owned_32bytes())?;
         Ok(())
     }
-    
+
     fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
         let part_1_header = QCAggUserRegistartionDeployContractsGUTAInput::pio_read_from_io(reader)?;
         let old_stats = PQEDCheckpointLeafStats::pio_read_from_io(reader)?;
         let block_time = F::from_u64_value(reader.psy_read_u64()?);
         let final_random_seed_contribution = Hash::from_owned_32bytes(reader.psy_read_bytes_32()?);
         let pm_jobs_completed = PPMJobsCompletedStats::pio_read_from_io(reader)?;
+        let validator_tree_root = Hash::from_owned_32bytes(reader.psy_read_bytes_32()?);
         Ok(Self {
             part_1_header,
             old_stats,
             block_time,
             final_random_seed_contribution,
             pm_jobs_completed,
+            validator_tree_root,
         })
     }
 }
@@ -267,7 +273,7 @@ impl<F: QFelt64, Hash: QFHashBase<F>> QCQEDCheckpointStateTransitionInputPartial
             user_tree_root: self.part_1_header.guta_proof_header.state_transition.new_node_value,
             withdrawal_tree_root:Hasher::get_zero_hash(TODO_WITHDRAWAL_TREE_HEIGHT as usize),
             user_registration_tree_root: self.part_1_header.register_users_state_transition.state_transition_end,
-            validator_tree_root: Hasher::get_zero_hash(VALIDATOR_TREE_HEIGHT),
+            validator_tree_root: self.validator_tree_root,
         };
         PQEDCheckpointLeaf {
             global_chain_root: new_state_roots.qfhash::<Hasher>(),
@@ -304,7 +310,7 @@ impl<F: QFelt64, Hash: QFHashBase<F>> QCQEDCheckpointStateTransitionInputPartial
             user_tree_root: self.part_1_header.guta_proof_header.state_transition.old_node_value,
             withdrawal_tree_root: Hasher::get_zero_hash(TODO_WITHDRAWAL_TREE_HEIGHT as usize),
             user_registration_tree_root: self.part_1_header.register_users_state_transition.state_transition_start,
-            validator_tree_root: Hasher::get_zero_hash(VALIDATOR_TREE_HEIGHT),
+            validator_tree_root: self.validator_tree_root,
         };
         old_state_roots
     }

@@ -274,7 +274,7 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
             user_tree_root: self.guta_gatherer_result.end_global_user_tree_root,
             withdrawal_tree_root: last_committed.checkpoint_state_roots.withdrawal_tree_root,
             user_registration_tree_root: self.register_users_gatherer_result.end_user_registration_tree_hash,
-            validator_tree_root: N::HasherBase::get_zero_hash(VALIDATOR_TREE_HEIGHT),
+            validator_tree_root: last_committed.checkpoint_state_roots.validator_tree_root,
         };
         let checkpoint_leaf_stats = PQEDCheckpointLeafStats {
             guta_fees_collected: self.guta_gatherer_result.guta_stats.guta_fees_collected,
@@ -328,6 +328,7 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
                 old_stats: last_committed.checkpoint_leaf_stats.clone(),
                 block_time: N::F::from_u64_value(block_time),
                 final_random_seed_contribution: self.guta_gatherer_result.random_seed_guta,
+                validator_tree_root: last_committed.checkpoint_state_roots.validator_tree_root,
             },
             append_checkpoint_tree_proof,
             previous_checkpoint_proof,
@@ -432,7 +433,7 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
             user_tree_root: self.guta_gatherer_result.end_global_user_tree_root,
             withdrawal_tree_root: last_committed.checkpoint_state_roots.withdrawal_tree_root,
             user_registration_tree_root: self.register_users_gatherer_result.end_user_registration_tree_hash,
-            validator_tree_root: N::HasherBase::get_zero_hash(VALIDATOR_TREE_HEIGHT),
+            validator_tree_root: last_committed.checkpoint_state_roots.validator_tree_root,
         };
         let checkpoint_leaf_stats = PQEDCheckpointLeafStats {
             guta_fees_collected: self.guta_gatherer_result.guta_stats.guta_fees_collected,
@@ -510,6 +511,8 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
             update_user_registration_tree_nodes_ffs: self.register_users_gatherer_result.update_user_registration_tree_nodes_ffs,
             new_user_public_keys_ffs: self.register_users_gatherer_result.new_user_public_keys_ffs,
             new_public_key_hash_to_user_id_rows_ffs: self.register_users_gatherer_result.new_public_key_hash_to_user_id_rows_ffs,
+            update_validator_tree_nodes_ffs: Vec::new(),
+            new_validator_leaf_preimages: Vec::new(),
             checkpoint_tree_update_proof: DeltaMerkleProofCore {
                 old_root: last_committed.checkpoint_root,
                 old_value: last_committed.checkpoint_leaf_hash,

@@ -38,6 +38,7 @@ pub struct QEDPart1StateDeltaResultGadget {
     pub old_stats: QEDCheckpointLeafStatsGadget,
     pub block_time: Target,
     pub final_random_seed_contribution: HashOutTarget,
+    pub validator_tree_root: HashOutTarget,
 
     // computed
     pub old_state_roots: QEDCheckpointGlobalStateRootsGadget,
@@ -59,9 +60,7 @@ impl QEDPart1StateDeltaResultGadget {
         let todo_add_withdrawals_root = builder.constant_qhash(QHashOut::from_string_or_panic(
             "d65af5933a094e8329332a714327ba72b1e4dac93c0cde8ee479b9bb36c3fc43",
         ));
-        let validator_tree_root = builder.constant_qhash(
-            <H as MerkleZeroHasher<QHashOut<F>>>::get_zero_hash(VALIDATOR_TREE_HEIGHT),
-        );
+        let validator_tree_root = builder.add_virtual_hash();
         let old_state_roots = QEDCheckpointGlobalStateRootsGadget {
             contract_tree_root: part_1_header.global_contract_tree_delta.state_transition_start,
             deposit_tree_root: todo_add_deposits_root,
@@ -126,6 +125,7 @@ impl QEDPart1StateDeltaResultGadget {
             old_stats,
             block_time,
             final_random_seed_contribution,
+            validator_tree_root,
             new_stats,
             old_checkpoint_leaf,
             new_checkpoint_leaf,
@@ -143,12 +143,14 @@ impl QEDPart1StateDeltaResultGadget {
         old_stats: &PQEDCheckpointLeafStats<F, QHashOut<F>>,
         block_time: F,
         final_random_seed_contribution: QHashOut<F>,
+        validator_tree_root: QHashOut<F>,
     ) -> anyhow::Result<()> {
         self.part_1_header
             .set_witness_params(witness, user_registration_tree_delta, global_contract_tree_delta, global_user_tree_delta, deploy_contracts_completed, register_users_completed)?;
         self.old_stats.set_witness(witness, old_stats)?;
         witness.set_target(self.block_time, block_time)?;
         witness.set_hash_target(self.final_random_seed_contribution, final_random_seed_contribution.0)?;
+        witness.set_hash_target(self.validator_tree_root, validator_tree_root.0)?;
         Ok(())
     }
 }
@@ -223,6 +225,7 @@ impl<const D: usize> CheckpointStateTransitionChildProofsGadget<D> {
         old_stats: &PQEDCheckpointLeafStats<F, QHashOut<F>>,
         block_time: F,
         final_random_seed_contribution: QHashOut<F>,
+        validator_tree_root: QHashOut<F>,
         part_1_worker_reward_tree_value: QHashOut<F>,
         part_1_proof: &ProofWithPublicInputs<F, C, D>,
         part_1_verifier_data: &VerifierOnlyCircuitData<C, D>,
@@ -243,9 +246,8 @@ impl<const D: usize> CheckpointStateTransitionChildProofsGadget<D> {
             old_stats,
             block_time,
             final_random_seed_contribution,
-
+            validator_tree_root,
         )?;
-
         Ok(())
     }
 }

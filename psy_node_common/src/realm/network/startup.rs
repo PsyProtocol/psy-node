@@ -1,8 +1,8 @@
 //! Optional Realm P2P construction from start-config strings.
 //!
 //! Empty identity/listen means the caller keeps today's HTTP path. When P2P
-//! is enabled, rotation must be fully specified (period > 0 and a non-empty
-//! sub-id roster) so the scheduled-proposer check cannot silently disable.
+//! is enabled, rotation must be fully specified (period > 0 and non-empty
+//! validator sub-ids) so the scheduled-proposer check cannot silently disable.
 
 use crate::realm::network::{
     load_bls_secret_key, NetworkError, RealmNetwork, RealmNetworkConfig, RealmNetworkHandle,
@@ -77,7 +77,7 @@ pub fn parse_proposer_node_ids(values: &[String]) -> anyhow::Result<HashMap<u16,
 /// Build a Realm network when P2P identity + listen are configured.
 ///
 /// Validators (`is_edge = false`) require a BLS key and a coordinator
-/// multiaddr. Edges leave BLS unset. Rotation is fail-closed: empty roster
+/// multiaddr. Edges leave BLS unset. Rotation is fail-closed: empty validators
 /// or zero period is a configuration error, not a silent disable.
 pub fn build_optional_realm_network(
     chain_id: u32,

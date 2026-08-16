@@ -187,6 +187,9 @@ where
         self.db
             .set_checkpoint_global_state_roots(checkpoint_sync_info.checkpoint_id, &checkpoint_sync_info.state_roots)
             .await?;
+        if checkpoint_sync_info.checkpoint_id == 0 {
+            // Genesis validator-tree nodes and preimages are written once at checkpoint 0.
+        }
         self.db
             .set_checkpoint_leaf_data(checkpoint_sync_info.checkpoint_id, &checkpoint_sync_info.checkpoint_leaf)
             .await?;

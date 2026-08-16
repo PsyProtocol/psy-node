@@ -215,6 +215,7 @@ where
             &witness.partial.old_stats,
             witness.partial.block_time,
             witness.partial.final_random_seed_contribution,
+            witness.partial.validator_tree_root,
             part_1_worker_reward_tree_value,
             part_1_proof,
             part_1_verifier_data,
@@ -437,9 +438,7 @@ where
         let todo_add_withdrawals_root = QHashOut::<C::F>::from_string_or_panic(
             "d65af5933a094e8329332a714327ba72b1e4dac93c0cde8ee479b9bb36c3fc43",
         );
-        let validator_tree_root = <C::Hasher as MerkleZeroHasher<QHashOut<C::F>>>::get_zero_hash(
-            VALIDATOR_TREE_HEIGHT,
-        );
+        let validator_tree_root = witness.partial.validator_tree_root;
         let old_state_roots = PQEDCheckpointGlobalStateRoots {
             contract_tree_root: witness.partial.part_1_header.deploy_contracts_state_transition.state_transition_start,
             deposit_tree_root: todo_add_deposits_root,

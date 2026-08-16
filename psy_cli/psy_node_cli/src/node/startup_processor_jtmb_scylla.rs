@@ -61,6 +61,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_coordinator_processor_n
         realm_id: config.coordinator_id as u32,
         realm_sub_id: config.coordinator_sub_id,
     };
+    let chain_id = config.network.get_chain_id();
 
     match config.network {
         psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet => {
@@ -71,6 +72,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_coordinator_processor_n
             let tag_tree_rewards_store = db.clone();
             tracing::info!("[COORD_BOOT] creating coordinator processor");
             create_coordinator_processor_and_run::<N, _, _, _, _, _, _, _, _, _>(
+                chain_id,
                 &genesis_data,
                 circuit_fingerprint_config,
                 file_system,

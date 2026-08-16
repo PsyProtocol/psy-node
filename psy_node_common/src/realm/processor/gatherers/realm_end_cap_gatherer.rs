@@ -30,6 +30,7 @@ use psy_data::{
 };
 use psy_io::tokio::{TokioFileLike, TokioLikeFileSystem};
 use psy_node_core::{
+    psy_core_db::traits::full::PsyNodeGlobalUserTreeDatabaseReader,
     psy_temp_db::StandardProcessorTempDBStoreBase,
     qblob::{
         data_views::{
@@ -44,6 +45,7 @@ use psy_serialize::{PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSeriali
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::{
+    backup::realm::load_realm_memory_trees_from_db,
     guta_planner::realm_guta_planner::{PlannedFutureEndCapJob, RealmGUTAPlanner},
     queue::gatherer_builder::QueueGathererItemBuilderWithTree,
 };
@@ -380,7 +382,7 @@ pub struct RealmGUTAEndCapGathererConfig<
     pub coordinator_guta_updates_circuit_whitelist: N::QHash,
     pub checkpoint_tree: Arc<PsyDashMemoryAppendOnlyMerkleStore<N::HasherBase, N::QHash>>,
     pub future_pending_end_cap_jobs: Arc<RwLock<Vec<PlannedFutureEndCapJob<N::F, N::QHash>>>>,
-
+    pub tree_store: Arc<dyn PsyNodeGlobalUserTreeDatabaseReader<N::QHash> + Send + Sync>,
     pub _phantom_n: std::marker::PhantomData<N>,
 }
 impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>, FileSystem: TokioLikeFileSystem> Clone
@@ -397,6 +399,7 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
             coordinator_guta_updates_circuit_whitelist: self.coordinator_guta_updates_circuit_whitelist,
             checkpoint_tree: self.checkpoint_tree.clone(),
             future_pending_end_cap_jobs: self.future_pending_end_cap_jobs.clone(),
+            tree_store: self.tree_store.clone(),
             _phantom_n: std::marker::PhantomData,
         }
     }
@@ -498,6 +501,30 @@ impl<
         config: RealmGUTAEndCapGathererConfig<N, TempDatabase, FileSystem>,
     ) -> anyhow::Result<Self> {
         let status = config.status.read().unwrap().clone();
+        if tree.get_root() != status.last_committed_realm_end_root {
+            tracing::info!(
+                "Rebasing RealmGUTAEndCapGatherer tree from {:?} onto committed root {:?} at checkpoint {}",
+                tree.get_root(),
+                status.last_committed_realm_end_root,
+                status.last_committed_checkpoint_id
+            );
+            let reloaded = load_realm_memory_trees_from_db::<N, _>(
+                &config.tree_store,
+                status.last_committed_checkpoint_id,
+                config.realm_id_u64,
+            )
+            .await?
+            .into_tuple()
+            .0;
+            anyhow::ensure!(
+                reloaded.get_root() == status.last_committed_realm_end_root,
+                "reloaded realm user tree root {:?} does not match last committed realm end root {:?} at checkpoint {}",
+                reloaded.get_root(),
+                status.last_committed_realm_end_root,
+                status.last_committed_checkpoint_id
+            );
+            *tree = reloaded;
+        }
         let new_realm_end_cap_gatherer_file_path = get_new_realm_end_cap_gatherer_backup_file_path(
             &config.backup_file_directory,
             config.realm_id_u64,

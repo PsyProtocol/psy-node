@@ -302,14 +302,14 @@ where
         realm_id: Target,
         realm_sub_id: Target,
         rotation_period_checkpoints: u64,
-        registered_sub_ids: &[u16],
+        validator_sub_ids: &[u16],
         checkpoint_tree_height: usize,
         checkpoint_tree_root: HashOutTarget,
     ) -> (QEDCheckpointLeafGadget, MerkleProofGadget) {
         assert!(rotation_period_checkpoints > 0, "rotation period must be nonzero");
-        assert!(!registered_sub_ids.is_empty(), "rotation roster must be nonempty");
-        assert!(registered_sub_ids.len() <= 256, "rotation roster exceeds 8-bit sub-ID space");
-        assert!(registered_sub_ids.iter().all(|&id| id <= u8::MAX as u16));
+        assert!(!validator_sub_ids.is_empty(), "rotation validators must be nonempty");
+        assert!(validator_sub_ids.len() <= 256, "rotation validators exceed 8-bit sub-ID space");
+        assert!(validator_sub_ids.iter().all(|&id| id <= u8::MAX as u16));
 
         // `checkpoint_id` is the target checkpoint `T`. Epoch/anchor still use
         // the quotient; the remainder/slot is unused so one proposer is fixed
@@ -366,9 +366,9 @@ where
             anchor_seed.elements[3],
         ]);
 
-        let roster_len = registered_sub_ids.len() as u64;
-        let index_bits = Self::nonzero_bit_width(roster_len - 1);
-        let roster_len_target = builder.constant(C::F::from_canonical_u64(roster_len));
+        let validator_count = validator_sub_ids.len() as u64;
+        let index_bits = Self::nonzero_bit_width(validator_count - 1);
+        let validator_count_target = builder.constant(C::F::from_canonical_u64(validator_count));
         let mut index = builder.zero();
         for round in 0..ROTATION_ROUNDS {
             let round_target = builder.constant(C::F::from_canonical_usize(round));
@@ -382,13 +382,13 @@ where
                 round_target,
             ]);
             let pivot_word = Self::canonical_goldilocks_word(builder, pivot_hash.elements[0]);
-            let (_, pivot) = Self::strict_div_rem_const(builder, pivot_word, 32, roster_len);
+            let (_, pivot) = Self::strict_div_rem_const(builder, pivot_word, 32, validator_count);
 
-            let pivot_plus_n = builder.add(pivot, roster_len_target);
+            let pivot_plus_n = builder.add(pivot, validator_count_target);
             let flip_sum = builder.sub(pivot_plus_n, index);
             let flip_ge_n =
-                builder.is_greater_than_or_equal(index_bits + 1, flip_sum, roster_len_target);
-            let flip_minus_n = builder.sub(flip_sum, roster_len_target);
+                builder.is_greater_than_or_equal(index_bits + 1, flip_sum, validator_count_target);
+            let flip_minus_n = builder.sub(flip_sum, validator_count_target);
             let flip = builder.select(flip_ge_n, flip_minus_n, flip_sum);
             builder.range_check(flip, index_bits);
             let flip_is_greater = builder.is_greater_than(index_bits, flip, index);
@@ -409,11 +409,11 @@ where
             index = builder.select(source_bit, flip, index);
         }
 
-        let registered_sub_id_targets = registered_sub_ids
+        let validator_sub_id_targets = validator_sub_ids
             .iter()
             .map(|&id| builder.constant(C::F::from_canonical_u64(id as u64)))
             .collect::<Vec<_>>();
-        let expected_sub_id = builder.select_in_array(&registered_sub_id_targets, index);
+        let expected_sub_id = builder.select_in_array(&validator_sub_id_targets, index);
         builder.connect(realm_sub_id, expected_sub_id);
         (anchor_checkpoint_leaf, anchor_checkpoint_tree_proof)
     }
@@ -459,7 +459,7 @@ where
         realm_global_user_tree_height: usize,
         chain_domain: QHashOut<C::F>,
         rotation_period_checkpoints: u64,
-        registered_sub_ids: Vec<u16>,
+        validator_sub_ids: Vec<u16>,
     ) -> Self {
         assert_eq!(
             validator_tree_height,
@@ -467,7 +467,7 @@ where
             "validator tree height must equal realm bits plus 8 sub-ID bits",
         );
         assert!(
-            rotation_period_checkpoints > 0 && !registered_sub_ids.is_empty(),
+            rotation_period_checkpoints > 0 && !validator_sub_ids.is_empty(),
             "RealmFinalizeGUTA rotation must be configured",
         );
 
@@ -507,7 +507,7 @@ where
             realm_id,
             realm_sub_id,
             rotation_period_checkpoints,
-            &registered_sub_ids,
+            &validator_sub_ids,
             checkpoint_tree_height,
             root_header.checkpoint_tree_root,
         );
@@ -1150,7 +1150,7 @@ mod tests {
         anchor_checkpoint_leaf: &PQEDCheckpointLeaf<F, Hash>,
         realm_sub_id: u16,
         rotation_period_checkpoints: u64,
-        registered_sub_ids: &[u16],
+        validator_sub_ids: &[u16],
     ) -> anyhow::Result<()> {
         const CHECKPOINT_TREE_HEIGHT: usize = 8;
         let mut checkpoint_tree =
@@ -1181,7 +1181,7 @@ mod tests {
                 realm_id_target,
                 realm_sub_id_target,
                 rotation_period_checkpoints,
-                registered_sub_ids,
+                validator_sub_ids,
                 CHECKPOINT_TREE_HEIGHT,
                 root_target,
             );
@@ -1208,32 +1208,32 @@ mod tests {
 
     #[test]
     fn realm_finalize_rotation_matches_native_poseidon_shuffle() -> anyhow::Result<()> {
-        let registered_sub_ids = [1, 2];
+        let validator_sub_ids = [1, 2];
         let leaf = rotation_leaf([1, 2, 3, 4]);
         let native = RealmRotationConfig {
             checkpoints_per_epoch: 10,
-            validator_sub_ids: registered_sub_ids.to_vec(),
+            validator_sub_ids: validator_sub_ids.to_vec(),
         };
         let seed = leaf.stats.random_seed.to_u64x4();
         for checkpoint_id in [0, 9, 10, 17, 20] {
             let expected = native
                 .proposer_sub_id(42, checkpoint_id, seed)?
                 .expect("rotation enabled");
-            prove_rotation(checkpoint_id, 42, &leaf, expected, 10, &registered_sub_ids)?;
+            prove_rotation(checkpoint_id, 42, &leaf, expected, 10, &validator_sub_ids)?;
             let wrong = if expected == 1 { 2 } else { 1 };
-            assert!(prove_rotation(checkpoint_id, 42, &leaf, wrong, 10, &registered_sub_ids).is_err());
+            assert!(prove_rotation(checkpoint_id, 42, &leaf, wrong, 10, &validator_sub_ids).is_err());
         }
         Ok(())
     }
 
     #[test]
     fn realm_finalize_rotation_changes_with_anchor_seed() -> anyhow::Result<()> {
-        let registered_sub_ids = [1, 2];
+        let validator_sub_ids = [1, 2];
         let first = rotation_leaf([1, 2, 3, 4]);
         let second = rotation_leaf([5, 8, 13, 21]);
         let native = RealmRotationConfig {
             checkpoints_per_epoch: 10,
-            validator_sub_ids: registered_sub_ids.to_vec(),
+            validator_sub_ids: validator_sub_ids.to_vec(),
         };
         let first_expected = native
             .proposer_sub_id(42, 17, first.stats.random_seed.to_u64x4())?
@@ -1241,8 +1241,8 @@ mod tests {
         let second_expected = native
             .proposer_sub_id(42, 17, second.stats.random_seed.to_u64x4())?
             .unwrap();
-        prove_rotation(17, 42, &first, first_expected, 10, &registered_sub_ids)?;
-        prove_rotation(17, 42, &second, second_expected, 10, &registered_sub_ids)?;
+        prove_rotation(17, 42, &first, first_expected, 10, &validator_sub_ids)?;
+        prove_rotation(17, 42, &second, second_expected, 10, &validator_sub_ids)?;
         Ok(())
     }
 

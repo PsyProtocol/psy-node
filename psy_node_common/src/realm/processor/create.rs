@@ -61,6 +61,7 @@ where
     let genesis =
         GenesisDatabaseDataBuilder::<N::F, N::QHash>::setup_for_realm::<N::HasherBase, N>(
             genesis_data,
+            chain_id,
             realm_identifier.realm_id as u64,
             realm_identifier.realm_sub_id as u64,
         )?;

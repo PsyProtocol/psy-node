@@ -31,6 +31,7 @@ pub async fn create_coordinator_processor<
     ProofStore: QParthProofStore + Send + Sync + 'static,
     FileSystem: TokioLikeFileSystem + Send + Sync + 'static,
 >(
+    chain_id: u32,
     genesis_data: &PsyGenesisBlockSetupData<N::F, N::QHash>,
     file_system: Arc<FileSystem>,
     deploy_contract_gatherer_backup_directory: String,
@@ -71,6 +72,7 @@ where
     let (genesis_verifiable_checkpoint_transition, genesis_block_update) =
         GenesisDatabaseDataBuilder::<N::F, N::QHash>::setup_for_coordinator::<N::HasherBase, N>(
             genesis_data,
+            chain_id,
             circuit_fingerprint_config.checkpoint_state_transition_circuit_fingerprint,
         )?;
     tracing::info!("[COORD_CREATE] setup_for_coordinator done");
@@ -185,6 +187,7 @@ pub async fn create_coordinator_processor_and_run<
     ProofStore: QParthProofStore + Send + Sync + 'static,
     FileSystem: TokioLikeFileSystem + Send + Sync + 'static,
 >(
+    chain_id: u32,
     genesis_data: &PsyGenesisBlockSetupData<N::F, N::QHash>,
     circuit_fingerprint_config: PsyNodeCircuitFingerprintConfig<N::QHash>,
     file_system: Arc<FileSystem>,
@@ -207,6 +210,7 @@ where
 {
     tracing::info!("[COORD_CREATE] create_and_run start");
     let (processor, guta_gatherer_join_handle, register_users_gatherer_join_handle, deploy_contracts_gatherer_join_handle) = create_coordinator_processor::<N, S, STagTreeRewards, GUTAUpdateQueue, RegisterUserQueue, DeployContractQueue, ProofWorkQueue, TempDatabase, ProofStore, FileSystem>(
+        chain_id,
         genesis_data,
         file_system,
         deploy_contract_gatherer_backup_directory,

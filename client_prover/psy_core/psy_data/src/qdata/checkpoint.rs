@@ -1,17 +1,19 @@
 use kvq::traits::KVQSerializable;
 use plonky2::{
     field::goldilocks_field::GoldilocksField,
-    hash::hash_types::{HashOut, RichField},
+    hash::{hash_types::{HashOut, RichField}, poseidon::PoseidonHash},
 };
 use psy_client_common::{
     data::qhashout::QHashOut,
     traits::to_qfelts::{QFeltSized, ToQFelts},
 };
+use psy_crypto::hash::traits::{
+    hasher::{FieldQHasher, MerkleZeroHasher},
+    qhashable::QFieldHashable,
+};
 use psy_config::network_constants::DA_CHALLENGE_WINDOW;
-use psy_crypto::hash::traits::{hasher::FieldQHasher, qhashable::QFieldHashable};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
-
 use super::{pm_jobs_completed_stats::PMJobsCompletedStats, pm_reward_commitment::PMRewardCommitment};
 use crate::qsync::coordinator::PsyCheckpointSyncInfoCompact;
 
@@ -153,6 +155,15 @@ pub struct PsyCheckpointGlobalStateRoots<F: RichField> {
     pub withdrawal_tree_root: QHashOut<F>,
     pub user_registration_tree_root: QHashOut<F>,
     pub validator_tree_root: QHashOut<F>,
+}
+
+/// Height of the checkpoint validator tree: coordinator user-tree height (12)
+/// plus 8 sub-id bits. Empty-tree root is `get_zero_hash(this)`, not `[0;32]`.
+pub const VALIDATOR_TREE_HEIGHT: usize = 20;
+
+/// Poseidon empty-tree root at [`VALIDATOR_TREE_HEIGHT`].
+pub fn empty_validator_tree_root() -> QHashOut<GoldilocksField> {
+    PoseidonHash::get_zero_hash(VALIDATOR_TREE_HEIGHT)
 }
 
 impl<F: RichField> KVQSerializable for PsyCheckpointGlobalStateRoots<F> {
@@ -499,3 +510,20 @@ impl<F: RichField + Serialize + for<'de> Deserialize<'de>> KVQSerializable for C
 //         }
 //     }
 // }
+
+
+#[cfg(test)]
+mod tests {
+    use super::{empty_validator_tree_root, VALIDATOR_TREE_HEIGHT};
+    use plonky2::hash::poseidon::PoseidonHash;
+    use psy_client_common::data::qhashout::QHashOut;
+    use psy_crypto::hash::traits::hasher::MerkleZeroHasher;
+
+    #[test]
+    fn empty_validator_tree_root_is_poseidon_zero_hash_at_height_20() {
+        let root = empty_validator_tree_root();
+        assert_ne!(root, QHashOut::ZERO);
+        assert_eq!(root, PoseidonHash::get_zero_hash(VALIDATOR_TREE_HEIGHT));
+        assert_eq!(VALIDATOR_TREE_HEIGHT, 20);
+    }
+}

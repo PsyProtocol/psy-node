@@ -13,7 +13,7 @@ use parth_core::felt::FromPrimitiveValuesFelt;
 use parth_core::pgoldilocks::PoseidonHasher;
 use parth_core::{PHash, PF};
 
-/// Occupied validator-tree leaf payload.
+/// Validator-tree leaf payload.
 ///
 /// `realm_id` / `realm_sub_id` come from leaf index `(realm_id << 8) | realm_sub_id`
 /// and are not stored in the record.

@@ -94,12 +94,12 @@ pub fn ensure_validator_beneficiary(
     }
 }
 
-/// Occupied sub-ids and BLS public keys for one Realm, derived from genesis.
-pub fn realm_certificate_roster(
+/// Validator sub-ids and BLS public keys for one Realm, derived from genesis.
+pub fn realm_validators(
     realm_id: u32,
     registry: &ValidatorRegistry,
 ) -> anyhow::Result<(Vec<u16>, Vec<(u16, psy_data::p2p::BlsPublicKey)>)> {
-    let mut occupied: Vec<u16> = registry
+    let mut validator_sub_ids: Vec<u16> = registry
         .iter()
         .filter_map(|(&(entry_realm, sub_id), _)| {
             if entry_realm == realm_id {
@@ -109,13 +109,13 @@ pub fn realm_certificate_roster(
             }
         })
         .collect();
-    occupied.sort_unstable();
-    occupied.dedup();
-    if occupied.is_empty() {
-        return Ok((occupied, Vec::new()));
+    validator_sub_ids.sort_unstable();
+    validator_sub_ids.dedup();
+    if validator_sub_ids.is_empty() {
+        return Ok((validator_sub_ids, Vec::new()));
     }
-    let mut keys = Vec::with_capacity(occupied.len());
-    for sub_id in &occupied {
+    let mut keys = Vec::with_capacity(validator_sub_ids.len());
+    for sub_id in &validator_sub_ids {
         let entry = registry
             .get(&(realm_id, *sub_id))
             .ok_or_else(|| anyhow::anyhow!("missing genesis validator for realm {realm_id} sub {sub_id}"))?;
@@ -123,7 +123,7 @@ pub fn realm_certificate_roster(
             .map_err(|error| anyhow::anyhow!("invalid genesis BLS key for realm {realm_id} sub {sub_id}: {error}"))?;
         keys.push((*sub_id, key));
     }
-    Ok((occupied, keys))
+    Ok((validator_sub_ids, keys))
 }
 
 

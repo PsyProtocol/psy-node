@@ -64,6 +64,7 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
         realm_id: config.coordinator_id as u32,
         realm_sub_id: config.coordinator_sub_id,
     };
+    let chain_id = config.network.get_chain_id();
 
     match config.network {
         psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet => {
@@ -72,6 +73,7 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
             create_coordinator_processor_and_run::<N, _, _, _, _, _, _, _, _, _>(
+                chain_id,
                 &genesis_data,
                 circuit_fingerprint_config,
                 file_system,

@@ -30,7 +30,7 @@ use crate::{
 pub const SIGNATURE_TYPE_ZK: u8 = 0;
 /// Temporary baked rotation configuration until network config propagation lands.
 pub const REALM_ROTATION_PERIOD_CHECKPOINTS_PLACEHOLDER: u64 = 10;
-pub const REALM_ROTATION_REGISTERED_SUB_IDS_PLACEHOLDER: [u16; 2] = [1, 2];
+pub const REALM_ROTATION_VALIDATOR_SUB_IDS_PLACEHOLDER: [u16; 2] = [1, 2];
 
 // =================================================================================
 // Validator Leaf Hash

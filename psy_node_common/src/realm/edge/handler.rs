@@ -221,7 +221,7 @@ impl<
         let proposer_node_ids = self
             .proposer_node_ids
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("forwarded EndCap Realm edge identity roster is missing"))?;
+            .ok_or_else(|| anyhow::anyhow!("forwarded EndCap Realm edge validator identities are missing"))?;
         validate_forwarded_end_cap(
             source,
             &header,
@@ -332,7 +332,7 @@ impl<
 }
 
 /// Pure validation for a forwarded EndCap header against the local Realm
-/// identity: the source must be an occupied roster NodeId, chain/realm must
+/// identity: the source must be a validator NodeId, chain/realm must
 /// match the local instance, input/proof lengths must match the header, and
 /// the header `end_cap_id` must equal the canonical hash of the payload.
 /// Returns the validated `end_cap_id` on success.
@@ -347,7 +347,7 @@ fn validate_forwarded_end_cap(
 ) -> anyhow::Result<[u8; 32]> {
     anyhow::ensure!(
         proposer_node_ids.values().any(|node_id| node_id == &source),
-        "forwarded EndCap source NodeId {source} is not an occupied Realm identity"
+        "forwarded EndCap source NodeId {source} is not a Realm validator identity"
     );
     if header.chain_id != local_chain_id {
         anyhow::bail!(
@@ -1410,7 +1410,7 @@ mod tests {
         NodeId::from_keypair(&kp).expect("ed25519 keypair yields NodeId")
     }
 
-    fn build_roster(sub_ids: &[u16]) -> HashMap<u16, NodeId> {
+    fn build_validators(sub_ids: &[u16]) -> HashMap<u16, NodeId> {
         sub_ids
             .iter()
             .enumerate()
@@ -1442,26 +1442,26 @@ mod tests {
     }
 
     #[test]
-    fn validate_forwarded_end_cap_accepts_occupied_source_with_matching_header() {
-        let roster = build_roster(&[1, 2, 3]);
+    fn validate_forwarded_end_cap_accepts_validator_source_with_matching_header() {
+        let validators = build_validators(&[1, 2, 3]);
         let (input, proof) = sample_input_and_proof();
         let header = end_cap_header(TEST_CHAIN_ID, TEST_REALM_ID, 25, &input, &proof);
         let validated = validate_forwarded_end_cap(
-            roster[&1],
+            validators[&1],
             &header,
             &input,
             &proof,
             TEST_CHAIN_ID,
             TEST_REALM_ID,
-            &roster,
+            &validators,
         )
-        .expect("occupied source with matching header is accepted");
+        .expect("validator source with matching header is accepted");
         assert_eq!(validated, header.end_cap_id);
     }
 
     #[test]
-    fn validate_forwarded_end_cap_rejects_source_outside_roster() {
-        let roster = build_roster(&[1, 2, 3]);
+    fn validate_forwarded_end_cap_rejects_source_outside_validators() {
+        let validators = build_validators(&[1, 2, 3]);
         let (input, proof) = sample_input_and_proof();
         let header = end_cap_header(TEST_CHAIN_ID, TEST_REALM_ID, 25, &input, &proof);
         let forged = test_node(99);
@@ -1472,30 +1472,30 @@ mod tests {
             &proof,
             TEST_CHAIN_ID,
             TEST_REALM_ID,
-            &roster,
+            &validators,
         )
         .unwrap_err();
         assert_eq!(
             err.to_string(),
-            format!("forwarded EndCap source NodeId {forged} is not an occupied Realm identity")
+            format!("forwarded EndCap source NodeId {forged} is not a Realm validator identity")
         );
     }
 
     #[test]
     fn validate_forwarded_end_cap_rejects_chain_id_mismatch() {
-        let roster = build_roster(&[1, 2, 3]);
+        let validators = build_validators(&[1, 2, 3]);
         let (input, proof) = sample_input_and_proof();
         // Keep the header internally consistent (end_cap_id over chain 8) so
         // only the chain_id check can fail.
         let header = end_cap_header(TEST_CHAIN_ID + 1, TEST_REALM_ID, 25, &input, &proof);
         let err = validate_forwarded_end_cap(
-            roster[&1],
+            validators[&1],
             &header,
             &input,
             &proof,
             TEST_CHAIN_ID,
             TEST_REALM_ID,
-            &roster,
+            &validators,
         )
         .unwrap_err();
         assert_eq!(
@@ -1510,17 +1510,17 @@ mod tests {
 
     #[test]
     fn validate_forwarded_end_cap_rejects_realm_id_mismatch() {
-        let roster = build_roster(&[1, 2, 3]);
+        let validators = build_validators(&[1, 2, 3]);
         let (input, proof) = sample_input_and_proof();
         let header = end_cap_header(TEST_CHAIN_ID, TEST_REALM_ID + 1, 25, &input, &proof);
         let err = validate_forwarded_end_cap(
-            roster[&1],
+            validators[&1],
             &header,
             &input,
             &proof,
             TEST_CHAIN_ID,
             TEST_REALM_ID,
-            &roster,
+            &validators,
         )
         .unwrap_err();
         assert_eq!(
@@ -1535,19 +1535,19 @@ mod tests {
 
     #[test]
     fn validate_forwarded_end_cap_rejects_input_length_mismatch() {
-        let roster = build_roster(&[1, 2, 3]);
+        let validators = build_validators(&[1, 2, 3]);
         let (input, proof) = sample_input_and_proof();
         let header = end_cap_header(TEST_CHAIN_ID, TEST_REALM_ID, 25, &input, &proof);
         let mut padded = input.clone();
         padded.push(0xEE);
         let err = validate_forwarded_end_cap(
-            roster[&1],
+            validators[&1],
             &header,
             &padded,
             &proof,
             TEST_CHAIN_ID,
             TEST_REALM_ID,
-            &roster,
+            &validators,
         )
         .unwrap_err();
         assert_eq!(
@@ -1562,18 +1562,18 @@ mod tests {
 
     #[test]
     fn validate_forwarded_end_cap_rejects_proof_length_mismatch() {
-        let roster = build_roster(&[1, 2, 3]);
+        let validators = build_validators(&[1, 2, 3]);
         let (input, proof) = sample_input_and_proof();
         let header = end_cap_header(TEST_CHAIN_ID, TEST_REALM_ID, 25, &input, &proof);
         let truncated = proof[..proof.len() - 1].to_vec();
         let err = validate_forwarded_end_cap(
-            roster[&1],
+            validators[&1],
             &header,
             &input,
             &truncated,
             TEST_CHAIN_ID,
             TEST_REALM_ID,
-            &roster,
+            &validators,
         )
         .unwrap_err();
         assert_eq!(
@@ -1588,18 +1588,18 @@ mod tests {
 
     #[test]
     fn validate_forwarded_end_cap_rejects_end_cap_id_mismatch() {
-        let roster = build_roster(&[1, 2, 3]);
+        let validators = build_validators(&[1, 2, 3]);
         let (input, proof) = sample_input_and_proof();
         let mut header = end_cap_header(TEST_CHAIN_ID, TEST_REALM_ID, 25, &input, &proof);
         header.end_cap_id = [0xFF; 32];
         let err = validate_forwarded_end_cap(
-            roster[&1],
+            validators[&1],
             &header,
             &input,
             &proof,
             TEST_CHAIN_ID,
             TEST_REALM_ID,
-            &roster,
+            &validators,
         )
         .unwrap_err();
         assert_eq!(
@@ -1645,7 +1645,7 @@ mod tests {
     #[test]
     fn resolve_forward_dest_local_is_scheduled_proposer_does_not_forward() {
         let rotation = rotation_config();
-        let roster = build_roster(&[1, 2, 3]);
+        let validators = build_validators(&[1, 2, 3]);
         let proposer = scheduled_proposer(&rotation, 25);
         let dest = resolve_end_cap_forward_dest(
             TEST_REALM_ID,
@@ -1653,7 +1653,7 @@ mod tests {
             25,
             [1, 2, 3, 4],
             &rotation,
-            &roster,
+            &validators,
         )
         .expect("routing decision");
         assert!(
@@ -1665,7 +1665,7 @@ mod tests {
     #[test]
     fn resolve_forward_dest_non_proposer_routes_to_scheduled_proposer_node_id() {
         let rotation = rotation_config();
-        let roster = build_roster(&[1, 2, 3]);
+        let validators = build_validators(&[1, 2, 3]);
         let proposer = scheduled_proposer(&rotation, 25);
         let local_sub_id = rotation
             .validator_sub_ids
@@ -1679,10 +1679,10 @@ mod tests {
             25,
             [1, 2, 3, 4],
             &rotation,
-            &roster,
+            &validators,
         )
         .expect("routing decision");
-        assert_eq!(dest, Some((proposer, roster[&proposer])));
+        assert_eq!(dest, Some((proposer, validators[&proposer])));
     }
 
     #[test]
@@ -1695,14 +1695,14 @@ mod tests {
             .copied()
             .filter(|&s| s != proposer)
             .collect();
-        let roster = build_roster(&other_sub_ids);
+        let validators = build_validators(&other_sub_ids);
         let err = resolve_end_cap_forward_dest(
             TEST_REALM_ID,
             other_sub_ids[0],
             25,
             [1, 2, 3, 4],
             &rotation,
-            &roster,
+            &validators,
         )
         .unwrap_err();
         assert_eq!(
@@ -1717,14 +1717,14 @@ mod tests {
             checkpoints_per_epoch: 0,
             validator_sub_ids: vec![1, 2, 3],
         };
-        let roster = build_roster(&[1, 2, 3]);
+        let validators = build_validators(&[1, 2, 3]);
         let dest = resolve_end_cap_forward_dest(
             TEST_REALM_ID,
             1,
             25,
             [1, 2, 3, 4],
             &rotation,
-            &roster,
+            &validators,
         )
         .expect("routing decision");
         assert!(

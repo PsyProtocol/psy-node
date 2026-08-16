@@ -988,6 +988,46 @@ function realmP2pValidatorUserId(realmId: number, subId: number): number {
     return (realmId * (1 << 20)) + subId;
 }
 
+type GenesisValidatorEntry = {
+    realm_id: number;
+    realm_sub_id: number;
+    validator_user_id: number;
+    node_id: string;
+    bls_public_key: string;
+};
+
+/**
+ * Inject the Realm P2P roster's processor identities into genesis.json so the
+ * genesis validator tree matches the P2P key material. A null roster (non-P2P
+ * run) rewrites validators to an empty list, leaving no stale entries behind.
+ */
+export async function injectGenesisValidators(
+    genesisPath: string,
+    roster: RealmP2pRoster | null,
+): Promise<void> {
+    const genesis = JSON.parse(await fs.promises.readFile(genesisPath, "utf-8")) as {
+        validators?: GenesisValidatorEntry[];
+    };
+    const validators: GenesisValidatorEntry[] = [];
+    if (roster) {
+        for (const realmId of Object.keys(roster.realms).map(Number).sort((a, b) => a - b)) {
+            const subs = roster.realms[String(realmId)];
+            for (const subId of Object.keys(subs).map(Number).sort((a, b) => a - b)) {
+                const entry = subs[String(subId)];
+                validators.push({
+                    realm_id: realmId,
+                    realm_sub_id: subId,
+                    validator_user_id: realmP2pValidatorUserId(realmId, subId),
+                    node_id: entry.processor_node_id_hex38,
+                    bls_public_key: entry.bls_public_hex,
+                });
+            }
+        }
+    }
+    genesis.validators = validators;
+    await fs.promises.writeFile(genesisPath, JSON.stringify(genesis, null, 2), "utf-8");
+}
+
 function realmDbNamespace(realmId: number, subId: number): string {
     return `realm_${realmId}_${subId}`;
 }
@@ -3603,6 +3643,8 @@ class DevNetProcessManager {
             realmP2pRoster = await ensureRealmP2pRoster(nodeCli, cwd, allRealmIds);
         }
 
+        await injectGenesisValidators(path.join(cwd, this.genesisDataPath), realmP2pRoster);
+
 
         // 3. Coordinator Processor
         if (startCoordinatorProcessor) {
@@ -4353,6 +4395,8 @@ class DevNetProcessManager {
             const allRealmIds = Array.from({ length: realmsCount }, (_, i) => startRealmId + i);
             realmP2pRoster = await ensureRealmP2pRoster("./target/release/psy_node_cli", cwd, allRealmIds);
         }
+
+        await injectGenesisValidators(path.join(cwd, this.genesisDataPath), realmP2pRoster);
 
 
         const services: any = {};

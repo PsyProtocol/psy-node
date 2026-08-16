@@ -12,6 +12,7 @@ pub mod limits;
 pub mod messages;
 pub mod node_id;
 pub mod validator_leaf;
+pub mod validator_tree;
 
 pub use bls::{
     aggregate_signatures, validate_key_with_proof_of_possession, BlsPublicKey, BlsSecretKey,
@@ -37,3 +38,8 @@ pub use messages::{
 };
 pub use node_id::NodeId;
 pub use validator_leaf::ValidatorLeaf;
+pub use validator_tree::{
+    authenticate_validator_preimage, build_validator_tree_genesis, empty_validator_tree_root,
+    realm_validator_indexes, require_realm_validator_count, validator_tree_root_from_genesis,
+    ValidatorLeafPreimage, ValidatorTreeGenesis,
+};

@@ -30,6 +30,10 @@ pub struct PsyPreparedCoordinatorBlockStateUpdates<F, Hash> {
     pub update_user_registration_tree_nodes_ffs: Vec<u8>,
     pub new_user_public_keys_ffs: Vec<u8>,
     pub new_public_key_hash_to_user_id_rows_ffs: Vec<u8>,
+    #[ts(skip)]
+    pub update_validator_tree_nodes_ffs: Vec<u8>,
+    #[ts(skip)]
+    pub new_validator_leaf_preimages: Vec<crate::p2p::ValidatorLeafPreimage>,
 
     pub update_global_user_tree_nodes_ffs: Vec<u8>,
     pub new_realm_guta_reward_tree_node_keys_ffs: Vec<u8>,
