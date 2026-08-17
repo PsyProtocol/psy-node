@@ -7070,6 +7070,7 @@ dependencies = [
  "serde_json",
  "serde_repr",
  "serde_with 3.16.1",
+ "sha2",
  "speedy",
  "strum 0.27.2",
  "strum_macros 0.27.2",
