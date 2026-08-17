@@ -14,6 +14,7 @@
 
 mod canonical_head_store;
 mod commit_source_store;
+mod control_plane;
 mod identity;
 mod key;
 mod keyspace;
@@ -27,6 +28,7 @@ mod registry;
 
 pub use canonical_head_store::*;
 pub use commit_source_store::*;
+pub use control_plane::*;
 pub use identity::{ScyllaKeyDomain, ScyllaPhysicalTableId, UnknownScyllaPhysicalTableId};
 pub use keyspace::{CqlKeyspaceName, InvalidCqlKeyspaceName};
 pub use manifest_artifact_store::*;
