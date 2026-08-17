@@ -10,5 +10,6 @@ pub mod coordinator_commit_source;
 pub mod manifest_intent;
 pub mod manifest_lifecycle;
 pub mod manifest_record;
+pub mod manifest_store;
 pub mod rollback_control;
 pub mod timestamp;

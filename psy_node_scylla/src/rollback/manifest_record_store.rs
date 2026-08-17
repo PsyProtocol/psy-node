@@ -24,6 +24,7 @@ use parth_core::protocol::core_types::Q256BitHash;
 use psy_data::protocol::chain_context::AuthorityScope;
 use psy_node_core::store::{
     manifest_lifecycle::{CommittedAuthorityManifest, SealedAuthorityManifest},
+    manifest_store::{AuthorityManifestStore, PersistedManifestRow},
     manifest_record::{
         AUTHORITY_MANIFEST_CHECKPOINT_BUCKET_SIZE, AuthorityManifestIdentity,
         AuthorityManifestStatus, ManifestRevision, PreparedAuthorityManifestRecord,
@@ -146,21 +147,6 @@ impl fmt::Display for ManifestStoreError {
 }
 
 impl Error for ManifestStoreError {}
-
-/// One persisted lifecycle row, still in its canonical byte form.
-///
-/// Decoding needs the identity the caller selected, so the store returns bytes
-/// and lets `PreparedAuthorityManifestRecord` / `SealedAuthorityManifest` /
-/// `CommittedAuthorityManifest` do the typed decode against that identity.  A
-/// store that decoded on its own would be choosing which identity to trust.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PersistedManifestRow {
-    pub checkpoint_id: u64,
-    pub revision: ManifestRevision,
-    pub status: AuthorityManifestStatus,
-    pub digest: Vec<u8>,
-    pub payload: Vec<u8>,
-}
 
 pub struct ManifestQueries {
     pub create_table: String,
@@ -350,7 +336,7 @@ impl ScyllaAuthorityManifestStore {
 
     /// Append the PREPARED row.  It must exist before any hot-table write, so a
     /// crash can never leave physical rows no manifest names (design-r1 §3).
-    pub async fn append_prepared<Hash: Q256BitHash>(
+    async fn append_prepared_row<Hash: Q256BitHash>(
         &self,
         prepared: &PreparedAuthorityManifestRecord<Hash>,
     ) -> anyhow::Result<()> {
@@ -364,7 +350,7 @@ impl ScyllaAuthorityManifestStore {
         .await
     }
 
-    pub async fn append_sealed<Hash: Q256BitHash>(
+    async fn append_sealed_row<Hash: Q256BitHash>(
         &self,
         sealed: &SealedAuthorityManifest<Hash>,
     ) -> anyhow::Result<()> {
@@ -378,7 +364,7 @@ impl ScyllaAuthorityManifestStore {
         .await
     }
 
-    pub async fn append_committed<Hash: Q256BitHash>(
+    async fn append_committed_row<Hash: Q256BitHash>(
         &self,
         committed: &CommittedAuthorityManifest<Hash>,
     ) -> anyhow::Result<()> {
@@ -392,7 +378,7 @@ impl ScyllaAuthorityManifestStore {
         .await
     }
 
-    pub async fn read<Hash: Q256BitHash>(
+    async fn read_identity_row<Hash: Q256BitHash>(
         &self,
         identity: &AuthorityManifestIdentity<Hash>,
         revision: ManifestRevision,
@@ -409,7 +395,7 @@ impl ScyllaAuthorityManifestStore {
     /// bucket boundary: silently returning a partial suffix would let the
     /// planner believe it had the whole discarded set and delete less than it
     /// archived.
-    pub async fn read_suffix<Hash: Q256BitHash>(
+    async fn read_identity_suffix<Hash: Q256BitHash>(
         &self,
         identity: &AuthorityManifestIdentity<Hash>,
         from_checkpoint: u64,
@@ -602,5 +588,44 @@ mod tests {
         .to_canonical_bytes();
         assert_ne!(coordinator, realm);
         assert_ne!(realm, other_realm);
+    }
+}
+
+#[async_trait::async_trait]
+impl<Hash: Q256BitHash> AuthorityManifestStore<Hash> for ScyllaAuthorityManifestStore {
+    async fn append_prepared(
+        &self,
+        prepared: &PreparedAuthorityManifestRecord<Hash>,
+    ) -> anyhow::Result<()> {
+        self.append_prepared_row(prepared).await
+    }
+
+    async fn append_sealed(&self, sealed: &SealedAuthorityManifest<Hash>) -> anyhow::Result<()> {
+        self.append_sealed_row(sealed).await
+    }
+
+    async fn append_committed(
+        &self,
+        committed: &CommittedAuthorityManifest<Hash>,
+    ) -> anyhow::Result<()> {
+        self.append_committed_row(committed).await
+    }
+
+    async fn read_manifest_row(
+        &self,
+        identity: &AuthorityManifestIdentity<Hash>,
+        revision: ManifestRevision,
+    ) -> anyhow::Result<Option<PersistedManifestRow>> {
+        self.read_identity_row(identity, revision).await
+    }
+
+    async fn read_manifest_suffix(
+        &self,
+        identity: &AuthorityManifestIdentity<Hash>,
+        from_checkpoint: u64,
+        to_checkpoint: u64,
+    ) -> anyhow::Result<Vec<PersistedManifestRow>> {
+        self.read_identity_suffix(identity, from_checkpoint, to_checkpoint)
+            .await
     }
 }

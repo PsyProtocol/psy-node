@@ -16,7 +16,10 @@
 use std::{error::Error, fmt, sync::Arc};
 
 use parth_core::protocol::core_types::Q256BitHash;
-use psy_node_core::store::manifest_record::AuthorityManifestIdentity;
+use psy_node_core::store::{
+    manifest_record::AuthorityManifestIdentity,
+    manifest_store::{ManifestArtifactKind, ManifestArtifactStore},
+};
 use scylla::{
     client::session::Session,
     statement::{Consistency, SerialConsistency, prepared::PreparedStatement},
@@ -29,21 +32,6 @@ pub const AUTHORITY_MANIFEST_ARTIFACT_TABLE: &str = "authority_manifest_artifact
 
 const ARTIFACT_SLOT_DOMAIN: &[u8] = b"psy.rollback.manifest-artifact-slot.v1\0";
 const ARTIFACT_ROW_REVISION: i64 = 1;
-
-/// Which artifact of a manifest a chunk belongs to.
-///
-/// R1 has no replay artifact: replay existed for the snapshot fallback, and
-/// design-r1 §0.0 removed snapshot rollback from scope.  The discriminant space
-/// leaves room for it rather than renumbering later.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-#[repr(u8)]
-pub enum ManifestArtifactKind {
-    /// Physical keys of every row the commit wrote (`manifest_locator`).
-    Locator = 1,
-    /// Before/after images for the three overwrite-in-place tables that cannot
-    /// be recomputed from target state (design-r1 §2.2.1).
-    DurablePayload = 2,
-}
 
 /// Explicit trust boundary for a keyspace provisioned with tablets disabled.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -242,7 +230,7 @@ impl ScyllaManifestArtifactStore {
     /// Chunks are written before the manifest record that commits to them, so a
     /// crash in between leaves chunks no manifest names, which reads as an
     /// unfinished commit rather than as history.
-    pub async fn persist_chunks<Hash: Q256BitHash>(
+    async fn persist_chunks_for<Hash: Q256BitHash>(
         &self,
         identity: &AuthorityManifestIdentity<Hash>,
         kind: ManifestArtifactKind,
@@ -291,7 +279,7 @@ impl ScyllaManifestArtifactStore {
     /// commitment, not from the store.  Trusting whatever the store happens to
     /// hold would let a lost chunk pass as a shorter mutation set, and rollback
     /// would then delete less than it archived.
-    pub async fn read_chunks<Hash: Q256BitHash>(
+    async fn read_chunks_for<Hash: Q256BitHash>(
         &self,
         identity: &AuthorityManifestIdentity<Hash>,
         kind: ManifestArtifactKind,
@@ -457,5 +445,28 @@ mod tests {
                 kind: ManifestArtifactKind::Locator,
             })
         );
+    }
+}
+
+#[async_trait::async_trait]
+impl<Hash: Q256BitHash> ManifestArtifactStore<Hash> for ScyllaManifestArtifactStore {
+    async fn persist_artifact_chunks(
+        &self,
+        identity: &AuthorityManifestIdentity<Hash>,
+        kind: ManifestArtifactKind,
+        chunks: &[Vec<u8>],
+    ) -> anyhow::Result<()> {
+        self.persist_chunks_for(identity, kind, chunks).await?;
+        Ok(())
+    }
+
+    async fn read_artifact_chunks(
+        &self,
+        identity: &AuthorityManifestIdentity<Hash>,
+        kind: ManifestArtifactKind,
+        committed_chunk_count: u32,
+    ) -> anyhow::Result<Vec<Vec<u8>>> {
+        self.read_chunks_for(identity, kind, committed_chunk_count)
+            .await
     }
 }
