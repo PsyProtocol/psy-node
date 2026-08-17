@@ -15,7 +15,7 @@ use std::sync::Mutex;
 
 use psy_node_core::store::typed::{
     CheckpointId, CheckpointLeafKey, CheckpointRootKey, ContractId, LatestInfoSlot, MerkleNode,
-    NodeIndex, PublicKeyHash, TypedTableKey, U64SingletonSlot, UniquePendingId, UserId,
+    NodeIndex, PublicKeyHash, RealmId, TypedTableKey, U64SingletonSlot, UniquePendingId, UserId,
 };
 
 use super::{
@@ -418,6 +418,39 @@ pub fn u64_singleton_key() -> TypedTableKey {
     TypedTableKey::U64Singleton(U64SingletonSlot::LatestCheckpoint)
 }
 
+/// Typed key for one `realm_rewards_tree_node_key_table` row.
+///
+/// Needs its own mapper because the table lies about its own shape: the
+/// clustering column is named `checkpoint_id` but the Coordinator writes a
+/// unique pending id into it (inventory §9 B3).  Keying it as
+/// `(obj_id, checkpoint)` would name a row at a checkpoint height that happens
+/// to equal a pending id -- plausible, wrong, and invisible.
+pub fn realm_reward_node_key(
+    realm_id: u64,
+    pending_id: u64,
+) -> Result<TypedTableKey, UnsupportedU64MappingTable> {
+    Ok(TypedTableKey::RealmRewardNode {
+        realm: RealmId::new(realm_id),
+        pending: UniquePendingId::try_new(pending_id)
+            .map_err(|_| UnsupportedU64MappingTable::ObjIdOutOfRange(pending_id))?,
+    })
+}
+
+/// Record a put of one Realm reward node row.
+pub fn record_realm_reward_node_put(
+    sink: &dyn CommitMutationSink,
+    realm_id: u64,
+    pending_id: u64,
+) -> anyhow::Result<()> {
+    let resolved = describe_existing_key(&realm_reward_node_key(realm_id, pending_id)?);
+    sink.record(MutationLocatorRecord::try_new(
+        resolved.physical_table(),
+        RecordedOperation::Put,
+        resolved.locator_bytes().to_vec(),
+    )?);
+    Ok(())
+}
+
 /// Receives every physical row an adapter writes, in write order.
 ///
 /// Implementations must be cheap: this sits on the commit path, and a busy
@@ -616,8 +649,11 @@ pub fn locator_support(physical: ScyllaPhysicalTableId) -> LocatorSupport {
         | T::CheckpointLeafToCheckpointIdK1 | T::CheckpointLeafToCheckpointIdK2 => Recorded,
         // Content-addressed projection
         T::PublicKeyHashToUserIds => Recorded,
-        // Mixed axes, refused until modelled
-        T::CheckpointedObject | T::RealmRewardsTreeNodeKey => BlockedOnAxisModelling,
+        // Pending axis, modelled explicitly by `realm_reward_node_key`
+        T::RealmRewardsTreeNodeKey => Recorded,
+        // Still mixed: one clustering column carries both a checkpoint and a
+        // pending domain, and the Coordinator commit path does not write it.
+        T::CheckpointedObject => BlockedOnAxisModelling,
         // Asserted unused by the registry
         T::CheckpointIdToRealmRoot => AssertedUnused,
         // Monotonic counter, never rolled back
@@ -685,8 +721,8 @@ mod tests {
         }
         let total: usize = counts.values().sum();
         assert_eq!(total, 35, "the physical inventory moved");
-        assert_eq!(counts[&LocatorSupport::Recorded], 24);
-        assert_eq!(counts[&LocatorSupport::BlockedOnAxisModelling], 2);
+        assert_eq!(counts[&LocatorSupport::Recorded], 25);
+        assert_eq!(counts[&LocatorSupport::BlockedOnAxisModelling], 1);
         assert_eq!(counts[&LocatorSupport::AssertedUnused], 1);
         assert_eq!(counts[&LocatorSupport::OperationalOnly], 1);
         assert_eq!(counts[&LocatorSupport::RealmSliceB], 7);
@@ -727,6 +763,9 @@ mod tests {
             describe_existing_key(&public_key_to_user_key(vec![0u8; 32], 1)).physical_table(),
         );
         produced.insert(describe_existing_key(&u64_singleton_key()).physical_table());
+        produced.insert(
+            describe_existing_key(&realm_reward_node_key(1, 1).unwrap()).physical_table(),
+        );
 
         let recorded: std::collections::BTreeSet<_> = ScyllaPhysicalTableId::iter()
             .filter(|id| locator_support(*id) == LocatorSupport::Recorded)
@@ -970,6 +1009,32 @@ mod tests {
             );
         }
         assert_eq!(locators.len(), 5);
+    }
+
+    #[test]
+    fn a_reward_node_is_keyed_by_pending_and_never_by_checkpoint() {
+        // The table names its clustering column checkpoint_id but stores a
+        // pending id.  Keying it generically would name a row at a checkpoint
+        // height that happens to equal that pending id: plausible, wrong, and
+        // undetectable downstream.
+        let reward = describe_existing_key(&realm_reward_node_key(4, 900).unwrap());
+        assert_eq!(
+            reward.physical_table(),
+            ScyllaPhysicalTableId::RealmRewardsTreeNodeKey
+        );
+        // The generic object mapper must still refuse it, so no caller can take
+        // the wrong route by accident.
+        assert!(versioned_object_key(
+            ScyllaPhysicalTableId::RealmRewardsTreeNodeKey,
+            4,
+            CheckpointId::try_new(900).unwrap()
+        )
+        .is_err());
+        // Realm and pending both reach the locator.
+        let other_realm = describe_existing_key(&realm_reward_node_key(5, 900).unwrap());
+        let other_pending = describe_existing_key(&realm_reward_node_key(4, 901).unwrap());
+        assert_ne!(reward.locator_bytes(), other_realm.locator_bytes());
+        assert_ne!(reward.locator_bytes(), other_pending.locator_bytes());
     }
 
     #[test]
