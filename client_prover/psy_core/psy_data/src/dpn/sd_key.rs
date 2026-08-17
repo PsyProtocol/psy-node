@@ -10,6 +10,15 @@ use ts_rs::TS;
 
 use crate::dpn::proving_session::DPNProvingSessionCompactMethodCall;
 
+/// Maximum number of transactions available to transaction introspection.
+pub const MAX_INTROSPECTABLE_TRANSACTIONS: u32 = 32;
+
+/// Maximum number of Felt words available from each transaction's calldata.
+pub const SDKEY_MAX_CALLDATA_WORDS: u32 = 128;
+
+/// Backwards-compatible name for the calldata capacity limit.
+pub const SDKEY_MAX_INPUTS_PER_TX: u32 = SDKEY_MAX_CALLDATA_WORDS;
+
 /// Compact transaction info for SD key introspection.
 ///
 /// Each transaction in a proving session can be introspected by the SD key
@@ -100,10 +109,7 @@ impl<F: RichField> KVQSerializable for SDKeyTransactionInfo<F> {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Default, TS)]
 #[ts(export)]
 pub struct SDKeyConfig {
-    /// Number of transactions the key circuit can introspect (compile-time
-    /// constant). Each introspectable transaction adds circuit constraints
-    /// for the merkle proof of that transaction's position in the
-    /// tx_stack_hash chain.
+    /// Number of transactions the key circuit can introspect.
     pub num_introspectable_transactions: u32,
 
     /// Whether this key circuit can read contract state at the current
@@ -118,23 +124,20 @@ pub struct SDKeyConfig {
 
     /// Number of secp256k1 signature verification slots in the circuit.
     pub num_secp256k1_slots: u32,
+
+    /// Contract id used for DPN state reads.
+    pub contract_id: u64,
 }
 
 /// Compiled output of an SD key definition.
-///
-/// This is the output of compiling a PSY source file as an SD key.
-/// It contains the DPN circuit definition for the key authorization logic
-/// plus the SD key configuration metadata.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, TS)]
 #[ts(export)]
 pub struct SDKeyDefinition {
     /// The compiled authorization logic as a DPN function circuit.
     pub authorization_circuit: Vec<u8>,
-
     /// SD key configuration.
     pub config: SDKeyConfig,
-
-    /// Name of the key definition (from the contract name).
+    /// Name of the key definition.
     pub name: String,
 }
 
@@ -153,12 +156,8 @@ impl KVQSerializable for SDKeyDefinition {
 #[serde(bound = "for<'de2> F: Deserialize<'de2>")]
 #[ts(export, concrete(F = GoldilocksField))]
 pub struct SDKeySecp256k1WitnessSlot<F: RichField> {
-    /// The compressed public key (as 16 field elements for circuit
-    /// representation).
     pub public_key: [F; 16],
-    /// The message hash being signed.
     pub msg_hash: QHashOut<F>,
-    /// The signature (as 16 field elements for circuit representation).
     pub signature: [F; 16],
 }
 

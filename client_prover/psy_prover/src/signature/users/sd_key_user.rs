@@ -56,6 +56,9 @@ impl SignatureUser for SDKeyUser {
         if context.psy_signature_input.is_some() || context.plonky2_signature_input.is_some() {
             return Err(anyhow!("SDKeyUser cannot handle DPN or PLONKY2 SDC inputs"));
         }
+        if wallet.get_sd_key_policy(&self.fingerprint).is_none() {
+            return Err(anyhow!("SDKeyUser cannot use programmable SD-key DPN circuit `{}`", self.fingerprint));
+        }
 
         let circuit = wallet
             .get_sd_key_circuit(&self.fingerprint)
@@ -72,6 +75,9 @@ impl SignatureUser for SDKeyUser {
     ) -> Result<SignatureCircuitInfo> {
         if context.sd_key_signature_input.is_none() {
             return Err(anyhow!("SD key witness input missing for SD key user"));
+        }
+        if wallet.get_sd_key_policy(&self.fingerprint).is_none() {
+            return Err(anyhow!("SDKeyUser cannot use programmable SD-key DPN circuit `{}`", self.fingerprint));
         }
 
         let circuit = wallet

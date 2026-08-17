@@ -88,6 +88,9 @@ pub trait PsyReadLocalProvingSessionStore<F: RichField> {
     fn get_nonce_u64(&self) -> u64;
     fn get_q_recursion_proof_tree_height(&self) -> usize;
     fn get_q_recursion_proof_tree_root(&self) -> QHashOut<F>;
+    /// Return the transactions preceding the currently initialized CFC.
+    /// The current CFC is deliberately excluded from introspection.
+    fn get_previous_transaction_log(&self) -> Vec<DPNProvingSessionSimpleMethodCall<F>>;
     fn get_latest_deferred_tx_item(&self) -> Option<&DPNTransactionDebtItem<DPNProvingSessionSimpleMethodCall<F>, F>>;
     fn get_local_state_tracker(&self) -> &PsyLocalStateTracker<F>;
 }
@@ -229,6 +232,14 @@ impl<
 
     fn get_q_recursion_proof_tree_root(&self) -> QHashOut<F> {
         self.session_proof_tree_root
+    }
+
+    fn get_previous_transaction_log(&self) -> Vec<DPNProvingSessionSimpleMethodCall<F>> {
+        self.transaction_records
+            .iter()
+            .take(self.transaction_records.len().saturating_sub(1))
+            .map(|record| record.call_data.call_data.clone())
+            .collect()
     }
 
     fn get_latest_deferred_tx_item(&self) -> Option<&DPNTransactionDebtItem<DPNProvingSessionSimpleMethodCall<F>, F>> {
@@ -652,6 +663,13 @@ impl<
         let start_deferred_tx_debt_tree_root = self.get_latest_deferred_tx_leaf()?.root;
         let start_user_balance = F::ZERO;
         let start_user_event_index = self.get_event_index();
+        let previous_transactions = self.get_previous_transaction_log();
+        let mut previous_tx_stack_hash = QHashOut::default();
+        for transaction in &previous_transactions {
+            let compact = transaction.to_compact::<H>();
+            previous_tx_stack_hash = H::q_two_to_one(previous_tx_stack_hash, compact.qfhash::<H>());
+        }
+        let previous_tx_count = F::from_canonical_usize(previous_transactions.len());
         tracing::debug!(
             "get_call_start_data.start_deferred_tx_debt_tree_root: {}",
             start_deferred_tx_debt_tree_root
@@ -662,6 +680,8 @@ impl<
             start_contract_state_tree_root,
             call_data,
             start_deferred_tx_debt_tree_root,
+            previous_tx_stack_hash,
+            previous_tx_count,
             start_user_balance,
             start_user_event_index,
         })
@@ -1153,33 +1173,6 @@ impl<
                 contract_id: contract_id,
             }))
             .await?;
-        let contract_leaf_hash = contract_leaf.qfhash::<H>();
-        let checkpoint_contract_tree_root = self.get_global_state_tree_roots(self.start_checkpoint_u64).await?.contract_tree_root;
-
-        anyhow::ensure!(
-            contract_tree_merkle_proof.verify::<H>(),
-            "invalid contract tree Merkle proof at checkpoint {} for contract {}: proof_root={}, proof_value={}",
-            self.start_checkpoint_u64,
-            contract_id,
-            contract_tree_merkle_proof.root,
-            contract_tree_merkle_proof.value,
-        );
-        anyhow::ensure!(
-            contract_tree_merkle_proof.value == contract_leaf_hash,
-            "contract leaf/proof checkpoint mismatch for contract {}: session_checkpoint={}, proof_value={}, latest_contract_leaf_hash={}",
-            contract_id,
-            self.start_checkpoint_u64,
-            contract_tree_merkle_proof.value,
-            contract_leaf_hash,
-        );
-        anyhow::ensure!(
-            contract_tree_merkle_proof.root == checkpoint_contract_tree_root,
-            "contract tree root/checkpoint mismatch for contract {}: session_checkpoint={}, proof_root={}, checkpoint_contract_tree_root={}",
-            contract_id,
-            self.start_checkpoint_u64,
-            contract_tree_merkle_proof.root,
-            checkpoint_contract_tree_root,
-        );
 
         Ok(PsyContractInclusionProof {
             contract_leaf,

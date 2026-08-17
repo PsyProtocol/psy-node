@@ -18,6 +18,14 @@ pub trait ContextInput {
     fn get_checkpoint_id(&self) -> u64;
     fn get_user_public_key_hash(&self) -> [u64; 4];
     fn get_session_proof_tree_root(&self) -> [u64; 4];
+    fn get_transaction_count(&self) -> u64;
+    fn get_transaction_stack_hash(&self) -> [u64; 4];
+    fn get_transaction_contract_id(&self, index: u64) -> u64;
+    fn get_transaction_caller_contract_id(&self, index: u64) -> u64;
+    fn get_transaction_method_id(&self, index: u64) -> u64;
+    fn get_transaction_inputs_hash(&self, index: u64) -> [u64; 4];
+    fn get_transaction_input_length(&self, index: u64) -> u64;
+    fn get_transaction_input_word(&self, tx_index: u64, word_index: u64) -> u64;
     fn get_self_current_contract_slot(&self, index: u64) -> u64;
     fn get_self_contract_slot(&self, contract_id: u64, index: u64) -> u64;
     fn get_global_contract_slot(&self, user_id: u64, contract_id: u64, index: u64) -> u64;

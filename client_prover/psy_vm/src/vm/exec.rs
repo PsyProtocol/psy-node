@@ -48,7 +48,10 @@ use crate::dpn::{
         op_types::{decode_indexed_op_id, DPNBuiltInDataType, DPNOpType},
         state_cmd::{data::DPNStateCmd, types::DPNStateCmdCore},
     },
-    vm::{def::DPNFunctionCircuitDefinition, exec::SimpleDPNExecutor},
+    vm::{
+        def::DPNFunctionCircuitDefinition,
+        exec::{DPNTransactionEntry, SimpleDPNExecutor},
+    },
 };
 fn mp_to_dmp<H: PartialEq + Copy>(mp: MerkleProofCore<H>) -> DeltaMerkleProofCore<H> {
     DeltaMerkleProofCore {
@@ -2215,6 +2218,7 @@ impl<F: RichField + PrimeField64> PsyEvalSessionResult<F> {
             + PsyReadLocalProvingSessionStoreMut<F>
             + PsyCmdInputWitnessResolver<F, <S as PsyReadLocalProvingSessionStoreMut<F>>::Hasher>,
     {
+        fn_def.validate_state_command_resolution_semantics()?;
         let start_session_ctx = sesh.get_fresh_start_ctx_for_user(sesh.get_current_user_id()).await?;
         let mut call_data_ctx = sesh
             .get_call_start_data(sesh.get_current_contract_id(), F::from_canonical_u32(fn_def.method_id), &inputs)
@@ -2231,6 +2235,29 @@ impl<F: RichField + PrimeField64> PsyEvalSessionResult<F> {
             start_session_ctx.start_session_user_leaf.public_key.0.elements,
             sesh.get_q_recursion_proof_tree_root().0.elements,
         );
+        let previous_transactions = sesh.get_previous_transaction_log();
+        let transaction_infos = previous_transactions
+            .iter()
+            .map(|call| psy_client_data::dpn::sd_key::SDKeyTransactionInfo::from(call.to_compact::<S::Hasher>()))
+            .collect::<Vec<_>>();
+        let transaction_inputs = previous_transactions.iter().map(|call| call.inputs.clone()).collect::<Vec<_>>();
+        let mut transaction_stack_hash = QHashOut::default();
+        let transaction_log = previous_transactions
+            .iter()
+            .map(|call| {
+                let compact = call.to_compact::<S::Hasher>();
+                transaction_stack_hash = S::Hasher::q_two_to_one(transaction_stack_hash, compact.qfhash::<S::Hasher>());
+                DPNTransactionEntry {
+                    contract_id: call.contract_id,
+                    caller_contract_id: call.caller_contract_id,
+                    method_id: call.method_id,
+                    inputs_length: compact.inputs_length,
+                    inputs_hash: compact.inputs_hash.0.elements,
+                    inputs: call.inputs.clone(),
+                }
+            })
+            .collect();
+        executor.set_transaction_context(transaction_log, transaction_stack_hash.0.elements);
         let state_cmd_len = fn_def.state_command_resolution_indices.len();
         let mut next_state_cmd_id = 0;
         let mut next_state_cmd_index = if state_cmd_len == 0 {
@@ -2239,6 +2266,16 @@ impl<F: RichField + PrimeField64> PsyEvalSessionResult<F> {
             fn_def.state_command_resolution_indices[0]
         };
         for (i, def) in fn_def.definitions.iter().enumerate() {
+            while i >= next_state_cmd_index && next_state_cmd_id < state_cmd_len {
+                self.process_state_cmd(&mut executor, sesh, &fn_def.state_commands[next_state_cmd_id])
+                    .await?;
+                next_state_cmd_id += 1;
+                if next_state_cmd_id >= state_cmd_len {
+                    next_state_cmd_index = fn_def.definitions.len() + 10;
+                } else {
+                    next_state_cmd_index = fn_def.state_command_resolution_indices[next_state_cmd_id];
+                }
+            }
             if def.op_type.eq(&DPNOpType::GetStateCommandResultSingle) {
                 let ind = def.inputs[0] as usize;
                 executor.push_external_target(def.index, self.cmd_witnesses[ind].result[0]);
@@ -2259,16 +2296,11 @@ impl<F: RichField + PrimeField64> PsyEvalSessionResult<F> {
             } else {
                 executor.process_var_def(&def);
             }
-            while (i + 1) >= next_state_cmd_index {
-                self.process_state_cmd(&mut executor, sesh, &fn_def.state_commands[next_state_cmd_id])
-                    .await?;
-                next_state_cmd_id += 1;
-                if next_state_cmd_id >= state_cmd_len {
-                    next_state_cmd_index = fn_def.definitions.len() + 10;
-                } else {
-                    next_state_cmd_index = fn_def.state_command_resolution_indices[next_state_cmd_id];
-                }
-            }
+        }
+        while next_state_cmd_id < state_cmd_len {
+            self.process_state_cmd(&mut executor, sesh, &fn_def.state_commands[next_state_cmd_id])
+                .await?;
+            next_state_cmd_id += 1;
         }
         for assertion in fn_def.assertions.iter() {
             let left = executor.resolve_target(assertion.left).to_canonical_u64();
@@ -2368,6 +2400,9 @@ impl<F: RichField + PrimeField64> PsyEvalSessionResult<F> {
             cmd_witnesses: self.cmd_witnesses,
             session_proof_tree_root: sesh.get_q_recursion_proof_tree_root(),
             tx_input_ctx: input_ctx,
+            transaction_infos,
+            transaction_inputs,
+            transaction_stack_hash,
         })
     }
 }

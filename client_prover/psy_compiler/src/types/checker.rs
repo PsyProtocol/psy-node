@@ -426,8 +426,10 @@ pub fn compute_method_id(contract_name: &str, method_name: &str, params: &[Resol
         .filter_map(|p| match &p.ty {
             ResolvedParamType::SelfRef { .. } => None,
             ResolvedParamType::Typed { ty, .. } => {
-                if *ty == ResolvedType::Struct("ChainContext".to_string()) {
-                    None // ChainContext is implicit
+                if *ty == ResolvedType::Struct("ChainContext".to_string())
+                    || *ty == ResolvedType::Struct("SDKeyContext".to_string())
+                {
+                    None // compiler-provided contexts are implicit
                 } else {
                     Some(format!("{:?}", ty))
                 }

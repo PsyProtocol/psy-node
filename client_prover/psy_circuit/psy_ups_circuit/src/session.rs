@@ -438,6 +438,13 @@ impl<
             .collect()
     }
 
+    /// Return the raw input vectors for every logged transaction, in order.
+    ///
+    /// This is needed by SDKey circuits that enforce parameter constraints.
+    pub fn sd_key_transaction_inputs(&self) -> Vec<Vec<F>> {
+        self.tx_log.iter().map(|tx| tx.inputs.clone()).collect()
+    }
+
     pub async fn prove_ups_start<CM: UPSCircuitManager<C, D> + ?Sized>(&mut self, circuit_mgr: &CM) -> anyhow::Result<()> {
         let mut timer = DebugTimer::new("prove_ups_start");
         timer.lap("start");

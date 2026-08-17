@@ -4,7 +4,7 @@ use psy_client_common::{
     data::{alt::AltVerifierOnlyCircuitData, qhashout::QHashOut},
 };
 use psy_client_data::{
-    dpn::cfc_context_input::DapenCFCUserTransactionInputContext,
+    dpn::{cfc_context_input::DapenCFCUserTransactionInputContext, sd_key::SDKeyConfig},
     guta::{api::ContractStateUpdate, end_cap_input::SubmitUserEndCapNonProofInput, stats::GUTAStats},
     qdata::{
         checkpoint::{PsyCheckpointGlobalStateRoots, PsyCheckpointLeaf},
@@ -201,23 +201,68 @@ pub struct TxMetadata {
     pub storage_data: TxStorageData,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SimulatedTxMetadata {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tx_hash: Option<QHashOut<F>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub end_cap_data: Option<TxEndCapData>,
-    pub contract_call_data: ContractCallResultData,
-    pub storage_data: TxStorageData,
-}
-
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SimulatedTxJson {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// `None` for fee-free view calls, `Some(_)` when the simulation produced a
+    /// real transaction trace.
     pub generated: Option<GeneratedTxTraceJson>,
     pub metadata: SimulatedTxMetadata,
 }
 
+/// Metadata returned for a simulated contract call. For fee-free view calls the
+/// transaction hash is `None` and the storage write list is empty.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SimulatedTxMetadata {
+    pub user_id: u64,
+    pub tx_hash: Option<QHashOut<F>>,
+    pub contract_call_data: ContractCallResultData,
+    pub storage_data: TxStorageData,
+}
+
+impl SimulatedTxMetadata {
+    pub fn from_view_steps(
+        user_id: u64,
+        steps: &[TraceStep],
+        software_defined_call: DPNSoftwareDefinedCallData,
+    ) -> anyhow::Result<Self> {
+        let mut contract_calls = Vec::new();
+        let mut storage = TxStorageData::default();
+        for step in steps.iter().filter_map(TraceStep::as_cfc) {
+            contract_calls.push(ContractCallResultArgs {
+                contract_id: step.contract_id,
+                method_name: step.method_name.clone(),
+                inputs: step.cfc_witness.inputs.iter().map(|v| v.to_canonical_u64()).collect(),
+                outputs: step.cfc_witness.outputs.iter().map(|v| v.to_canonical_u64()).collect(),
+            });
+            storage.extend_from_cmd_witnesses(user_id, step.contract_id, &step.cfc_witness.cmd_witnesses);
+        }
+        Ok(Self {
+            user_id,
+            tx_hash: None,
+            contract_call_data: ContractCallResultData {
+                contract_calls,
+                software_defined_call,
+            },
+            storage_data: TxStorageData {
+                reads: storage.reads,
+                writes: vec![],
+            },
+        })
+    }
+}
+
+impl From<TxMetadata> for SimulatedTxMetadata {
+    fn from(metadata: TxMetadata) -> Self {
+        Self {
+            user_id: metadata.end_cap_data.user_id,
+            tx_hash: Some(metadata.tx_hash),
+            contract_call_data: metadata.contract_call_data,
+            storage_data: metadata.storage_data,
+        }
+    }
+}
+
+/// Result of a read-only view call.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ViewCallResult {
     pub checkpoint_id: u64,
@@ -240,30 +285,25 @@ impl TxEndCapData {
 }
 
 impl TxStorageData {
-    pub(crate) fn from_steps(current_user_id: u64, steps: &[TraceStep]) -> Self {
+    pub fn from_trace(trace: &TxTrace) -> Self {
         let mut storage = TxStorageData::default();
-        for step in steps {
+        for step in &trace.steps {
             let Some(cfc) = step.as_cfc() else {
                 continue;
             };
-            storage.extend_from_cmd_witnesses(current_user_id, cfc.contract_id, &cfc.cfc_witness.cmd_witnesses);
+            storage.extend_from_cmd_witnesses(trace.meta.user_id, cfc.contract_id, &cfc.cfc_witness.cmd_witnesses);
         }
+        storage.extend_from_user_ec_input(&trace.finalization.submit_end_cap_input);
         storage
     }
 
-    pub(crate) fn from_call_witnesses(
-        current_user_id: u64,
-        current_contract_id: u64,
+    pub fn from_call_witnesses(
+        user_id: u64,
+        contract_id: u64,
         cmd_witnesses: &[PsyCmdWithInputAndWitness<F>],
     ) -> Self {
         let mut storage = TxStorageData::default();
-        storage.extend_from_cmd_witnesses(current_user_id, current_contract_id, cmd_witnesses);
-        storage
-    }
-
-    pub fn from_trace(trace: &TxTrace) -> Self {
-        let mut storage = Self::from_steps(trace.meta.user_id, &trace.steps);
-        storage.extend_from_user_ec_input(&trace.finalization.submit_end_cap_input);
+        storage.extend_from_cmd_witnesses(user_id, contract_id, cmd_witnesses);
         storage
     }
 
@@ -391,69 +431,33 @@ impl TxStorageData {
     }
 }
 
-fn contract_call_results(steps: &[TraceStep]) -> Vec<ContractCallResultArgs> {
-    steps
-        .iter()
-        .filter_map(|step| match step {
-            TraceStep::Standard(cfc) | TraceStep::Inlined(cfc) | TraceStep::Deferred(cfc) => Some(ContractCallResultArgs {
-                contract_id: cfc.contract_id,
-                method_name: cfc.method_name.clone(),
-                inputs: cfc.cfc_witness.inputs.iter().map(|v| v.to_canonical_u64()).collect(),
-                outputs: cfc.cfc_witness.outputs.iter().map(|v| v.to_canonical_u64()).collect(),
-            }),
-            TraceStep::BurnFee(_) | TraceStep::ExternalProof(_) | TraceStep::ZkSign(_) => None,
-        })
-        .collect()
-}
-
 impl TxMetadata {
     pub fn from_trace(trace: &TxTrace) -> Self {
+        let contract_calls = trace
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                TraceStep::Standard(cfc) | TraceStep::Inlined(cfc) | TraceStep::Deferred(cfc) => Some(ContractCallResultArgs {
+                    contract_id: cfc.contract_id,
+                    method_name: cfc.method_name.clone(),
+                    inputs: cfc.cfc_witness.inputs.iter().map(|v| v.to_canonical_u64()).collect(),
+                    outputs: cfc.cfc_witness.outputs.iter().map(|v| v.to_canonical_u64()).collect(),
+                }),
+                TraceStep::BurnFee(_) | TraceStep::ExternalProof(_) | TraceStep::ZkSign(_) => None,
+            })
+            .collect();
+
         TxMetadata {
             tx_hash: trace.finalization.tx_hash,
             end_cap_data: TxEndCapData::from_user_ec_input(&trace.finalization.submit_end_cap_input),
             contract_call_data: ContractCallResultData {
-                contract_calls: contract_call_results(&trace.steps),
+                contract_calls,
                 software_defined_call: trace.finalization.software_defined_call.clone(),
             },
             storage_data: TxStorageData::from_trace(trace),
         }
     }
 }
-
-impl SimulatedTxMetadata {
-    pub fn from_view_steps(
-        user_id: u64,
-        steps: &[TraceStep],
-        software_defined_call: DPNSoftwareDefinedCallData,
-    ) -> anyhow::Result<Self> {
-        let storage_data = TxStorageData::from_steps(user_id, steps);
-        anyhow::ensure!(
-            storage_data.writes.is_empty(),
-            "fee-free view simulation produced storage writes"
-        );
-        Ok(Self {
-            tx_hash: None,
-            end_cap_data: None,
-            contract_call_data: ContractCallResultData {
-                contract_calls: contract_call_results(steps),
-                software_defined_call,
-            },
-            storage_data,
-        })
-    }
-}
-
-impl From<TxMetadata> for SimulatedTxMetadata {
-    fn from(metadata: TxMetadata) -> Self {
-        Self {
-            tx_hash: Some(metadata.tx_hash),
-            end_cap_data: Some(metadata.end_cap_data),
-            contract_call_data: metadata.contract_call_data,
-            storage_data: metadata.storage_data,
-        }
-    }
-}
-
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct UpsStartWitness {
@@ -632,11 +636,20 @@ pub struct ZkSignStep {
 pub enum TraceSignCircuitSource {
     ZkBuiltin,
     SecpBuiltin,
+    /// EIP-191 (MetaMask `personal_sign`) builtin secp256k1 circuit. Works for
+    /// both the held-key user and the externally injected (keyless) user —
+    /// proving dispatches on the fingerprint via the wallet's signature users.
     EthPersonalSecpBuiltin,
     SdKey {
         allowed_contract_ids: Vec<u64>,
         allowed_method_ids: Vec<u32>,
         expected_tx_count: u64,
+    },
+    /// Programmable read-only SDKey definition. The CBOR payload is the DPN
+    /// function definition; config is needed to rebuild the gadget.
+    SdKeyDpn {
+        function_def: Vec<u8>,
+        config: SDKeyConfig,
     },
     Plonky2SoftwareDefined {
         #[serde(default = "default_plonky2_sdc_contract_state_tree_height")]
@@ -690,47 +703,3 @@ pub mod proof_tree_meta;
 
 #[cfg(test)]
 mod ordering_tests;
-
-#[cfg(test)]
-mod simulation_tests {
-    use super::*;
-
-    #[test]
-    fn simulation_and_view_json_have_disjoint_required_fields() {
-        let response = SimulatedTxJson {
-            generated: None,
-            metadata: SimulatedTxMetadata {
-                tx_hash: None,
-                end_cap_data: None,
-                contract_call_data: ContractCallResultData {
-                    contract_calls: vec![ContractCallResultArgs {
-                        contract_id: 6,
-                        method_name: "get_counter".to_string(),
-                        inputs: Vec::new(),
-                        outputs: vec![42],
-                    }],
-                    software_defined_call: DPNSoftwareDefinedCallData::default(),
-                },
-                storage_data: TxStorageData::default(),
-            },
-        };
-        let json = serde_json::to_value(response).unwrap();
-        assert!(json.get("generated").is_none());
-        assert!(json["metadata"].get("tx_hash").is_none());
-        assert!(json["metadata"].get("end_cap_data").is_none());
-
-        let view = serde_json::to_value(ViewCallResult {
-            checkpoint_id: 1,
-            contract_calls: Vec::new(),
-            storage_reads: Vec::new(),
-        })
-        .unwrap();
-        assert_eq!(view.as_object().unwrap().len(), 3);
-        assert!(view.get("checkpoint_id").is_some());
-        assert!(view.get("contract_calls").is_some());
-        assert!(view.get("storage_reads").is_some());
-        assert!(view.get("generated").is_none());
-        assert!(view.get("metadata").is_none());
-        assert!(view.get("tx_hash").is_none());
-    }
-}

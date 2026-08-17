@@ -235,6 +235,33 @@ impl ContextEval for SymFeltStore {
                 DPNOpType::GetSessionProofTreeRoot => {
                     panic!("GetSessionProofTreeRoot is hash-typed and should not be resolved as a felt")
                 }
+                DPNOpType::GetTransactionCount => input.get_transaction_count(),
+                DPNOpType::GetTransactionStackHash => {
+                    panic!("GetTransactionStackHash is hash-typed and should not be resolved as a felt")
+                }
+                DPNOpType::GetTransactionContractId => {
+                    let index = self.resolve_unary_felt_arg(felt_ref, input, cache);
+                    input.get_transaction_contract_id(index)
+                }
+                DPNOpType::GetTransactionCallerContractId => {
+                    let index = self.resolve_unary_felt_arg(felt_ref, input, cache);
+                    input.get_transaction_caller_contract_id(index)
+                }
+                DPNOpType::GetTransactionMethodId => {
+                    let index = self.resolve_unary_felt_arg(felt_ref, input, cache);
+                    input.get_transaction_method_id(index)
+                }
+                DPNOpType::GetTransactionInputsHash => {
+                    panic!("GetTransactionInputsHash is hash-typed and should not be resolved as a felt")
+                }
+                DPNOpType::GetTransactionInputLength => {
+                    let index = self.resolve_unary_felt_arg(felt_ref, input, cache);
+                    input.get_transaction_input_length(index)
+                }
+                DPNOpType::GetTransactionInputWord => {
+                    let args = self.resolve_array_args(felt_ref, input, cache);
+                    input.get_transaction_input_word(args[0], args[1])
+                }
                 DPNOpType::GetStateQueryResult => todo!(),
                 DPNOpType::GetStateQueryResultSingle => todo!(),
                 DPNOpType::UnaryInverse => self.resolve_unary_felt_arg_gl(felt_ref, input, cache).inverse().to_canonical_u64(),

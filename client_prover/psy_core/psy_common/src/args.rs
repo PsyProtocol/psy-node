@@ -73,14 +73,19 @@ impl ContractCallData {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+/// Arguments for a read-only view call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ViewCallData {
     pub contract_calls: Vec<ContractCallArgs>,
+    pub software_defined_call: DPNSoftwareDefinedCallData,
 }
 
 impl ViewCallData {
     pub fn new(contract_calls: Vec<ContractCallArgs>) -> Self {
-        Self { contract_calls }
+        Self {
+            contract_calls,
+            software_defined_call: DPNSoftwareDefinedCallData::default(),
+        }
     }
 }
 
@@ -109,6 +114,11 @@ pub struct WalletSourceArgs {
     #[clap(long, default_value_t = 2)]
     #[serde(default)]
     pub sd_key_expected_tx_count: u64,
+    /// JSON file containing a programmable SDKey definition. The file must
+    /// contain `{ "function": <DPNFunctionCircuitDefinition>,
+    /// "config": <SDKeyConfig> }`.
+    #[clap(long, env = "SD_KEY_DEFINITION")]
+    pub sd_key_definition: Option<String>,
 }
 
 #[derive(Clone, Args, Serialize, Deserialize)]

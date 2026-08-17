@@ -2,8 +2,12 @@ use super::{cache::SimpleEvalCache, simple::DummyContextEvalInput, traits::Conte
 use crate::dpn::ops::{exec_context::QExecContext, sym_felt::SymFeltRef};
 
 pub fn exec_eval_simple(inputs: Vec<u64>, ctx: &QExecContext, output: Option<Vec<SymFeltRef>>) -> Vec<u64> {
+    exec_eval_with_context(DummyContextEvalInput::new(inputs), ctx, output)
+}
+
+/// Evaluate symbolic DPN operations against a fully populated runtime context.
+pub fn exec_eval_with_context(input: DummyContextEvalInput, ctx: &QExecContext, output: Option<Vec<SymFeltRef>>) -> Vec<u64> {
     let mut cache = SimpleEvalCache::new();
-    let input = DummyContextEvalInput::new(inputs);
 
     //for i in 0..ctx.state_cmd_store.any_order_cmd_map
 

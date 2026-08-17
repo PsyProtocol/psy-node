@@ -139,7 +139,7 @@ mod tests {
         plonk::config::{Hasher, PoseidonGoldilocksConfig},
     };
     use psy_client_common::data::{qhashout::QHashOut, secp256k1::CompressedPublicKey};
-    use psy_crypto::signature::secp256k1::wallet::{ethereum_address_for_verifying_key, hash_no_pad_compressed_public_key, recover_eth_personal_signature};
+    use psy_crypto::signature::secp256k1::wallet::{hash_no_pad_compressed_public_key, secp256k1_sign_eth_personal};
 
     use super::EthPersonalSignSecp256K1SignatureCircuit;
 
@@ -151,21 +151,15 @@ mod tests {
         let circuit = EthPersonalSignSecp256K1SignatureCircuit::<C, D>::new();
         let signing_key = k256::ecdsa::SigningKey::from_slice(&[13u8; 32]).unwrap();
         let message = psy_client_common::data::base_types::hash256::Hash256([0x51; 32]);
-        let digest = psy_crypto::signature::secp256k1::wallet::eth_personal_sign_digest(&message.0);
-        let (signature, recovery_id) = signing_key.sign_prehash_recoverable(&digest).unwrap();
-        let address_digest = ethereum_address_for_verifying_key(signing_key.verifying_key());
-        let mut signature_bytes = [0u8; 65];
-        signature_bytes[..64].copy_from_slice(&signature.to_bytes());
-        signature_bytes[64] = recovery_id.to_byte();
-        let recovered = recover_eth_personal_signature(address_digest, message, signature_bytes).unwrap();
+        let signature = secp256k1_sign_eth_personal::<GoldilocksField>(signing_key, QHashOut::from(message)).unwrap();
 
-        let proof = circuit.prove(&recovered).unwrap();
+        let proof = circuit.prove(&signature).unwrap();
         circuit.minifier_chain.verify(proof.clone()).unwrap();
 
         let public_key_hash = hash_no_pad_compressed_public_key::<GoldilocksField, plonky2::hash::poseidon::PoseidonPermutation<GoldilocksField>>(
-            CompressedPublicKey(recovered.public_key),
+            CompressedPublicKey(signature.public_key),
         );
-        let message_hash = QHashOut::<GoldilocksField>::from(recovered.message);
+        let message_hash = QHashOut::<GoldilocksField>::from(signature.message);
         let expected = plonky2::hash::poseidon::PoseidonHash::two_to_one(message_hash.0, public_key_hash.0);
         assert_eq!(proof.public_inputs, expected.elements);
     }

@@ -643,21 +643,21 @@ impl StateReaderGadget {
         };
         Ok(())
     }
-    pub fn set_witness<W: Witness<F>, F: RichField>(
+    pub fn set_command_witnesses<W: Witness<F>, F: RichField>(
         &self,
         witness: &mut W,
-        input: &DapenContractFunctionCircuitInput<F>,
+        cmd_witnesses: &[PsyCmdWithInputAndWitness<F>],
         fn_def: &DPNFunctionCircuitDefinition,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
-            fn_def.state_commands.len() == input.cmd_witnesses.len(),
+            fn_def.state_commands.len() == cmd_witnesses.len(),
             "state command/witness count mismatch: commands={} witnesses={}",
             fn_def.state_commands.len(),
-            input.cmd_witnesses.len()
+            cmd_witnesses.len()
         );
         let mut wb = StateReaderGadgetWitnessBuilderState::new();
 
-        for (command_index, (dsc, ciw)) in fn_def.state_commands.iter().zip(input.cmd_witnesses.iter()).enumerate() {
+        for (command_index, (dsc, ciw)) in fn_def.state_commands.iter().zip(cmd_witnesses.iter()).enumerate() {
             tracing::debug!(
                 target: "state_reader_witness_dump",
                 "set_witness dsc: {}, ciw: {}",
@@ -674,5 +674,14 @@ impl StateReaderGadget {
             })?;
         }
         Ok(())
+    }
+
+    pub fn set_witness<W: Witness<F>, F: RichField>(
+        &self,
+        witness: &mut W,
+        input: &DapenContractFunctionCircuitInput<F>,
+        fn_def: &DPNFunctionCircuitDefinition,
+    ) -> anyhow::Result<()> {
+        self.set_command_witnesses(witness, &input.cmd_witnesses, fn_def)
     }
 }

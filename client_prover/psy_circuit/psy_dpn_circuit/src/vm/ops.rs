@@ -6,7 +6,7 @@ use plonky2::{
     iop::target::{BoolTarget, Target},
     plonk::circuit_builder::CircuitBuilder,
 };
-use psy_client_data::config::store_config::PsyHasher;
+use psy_client_data::{config::store_config::PsyHasher, dpn::sd_key::SDKEY_MAX_CALLDATA_WORDS};
 use psy_common_circuit::{
     builder::{comparison::CircuitBuilderComparison, hash::core::CircuitBuilderHashCore},
     crypto::secp256k1::{
@@ -29,6 +29,24 @@ use psy_plonky2_common_circuits::hash::keccak::keccak256_u32_words_be_abi;
 use psy_vm::dpn::ops::op_types::{decode_indexed_op_id, DPNBuiltInDataType, DPNIndexedVarDef, DPNOpType};
 
 const COMPARISON_BITS: usize = 63;
+
+#[derive(Clone, Debug)]
+pub struct DPNTransactionEntryTargets {
+    pub caller_contract_id: Target,
+    pub contract_id: Target,
+    pub method_id: Target,
+    pub inputs_length: Target,
+    pub inputs_hash: HashOutTarget,
+    pub inputs: Vec<Target>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DPNTransactionContextTargets {
+    pub tx_count: Target,
+    pub tx_stack_hash: HashOutTarget,
+    pub entries: Vec<DPNTransactionEntryTargets>,
+}
+
 pub struct SimpleDPNBuilder<F: RichField + Extendable<D>, const D: usize> {
     pub targets: Vec<Option<Target>>,
     pub target_arrays: Vec<Option<Vec<Target>>>,
@@ -47,6 +65,7 @@ pub struct SimpleDPNBuilder<F: RichField + Extendable<D>, const D: usize> {
     pub nonce: Target,
     pub inputs: Vec<Target>,
     pub constant_targets: HashMap<usize, F>,
+    pub transaction_context: Option<DPNTransactionContextTargets>,
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> SimpleDPNBuilder<F, D> {
@@ -162,7 +181,99 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleDPNBuilder<F, D> {
             nonce,
             inputs,
             constant_targets: HashMap::new(),
+            transaction_context: None,
         }
+    }
+    pub fn set_transaction_context(&mut self, context: DPNTransactionContextTargets) {
+        self.transaction_context = Some(context);
+    }
+
+    fn transaction_index_target(&self, op: &DPNIndexedVarDef) -> Target {
+        assert_eq!(op.inputs.len(), 1, "transaction introspection opcode requires one index input");
+        self.resolve_target(op.inputs[0])
+    }
+
+    fn select_transaction_target(
+        &self,
+        builder: &mut CircuitBuilder<F, D>,
+        index: Target,
+        field: fn(&DPNTransactionEntryTargets) -> Target,
+    ) -> Target {
+        let context = self
+            .transaction_context
+            .as_ref()
+            .expect("transaction introspection context is not attached");
+        let in_range = builder.is_less_than(COMPARISON_BITS, index, context.tx_count);
+        builder.assert_one(in_range.target);
+        let mut selected = builder.zero();
+        let mut valid = builder._false();
+        for (entry_index, entry) in context.entries.iter().enumerate() {
+            let matches = builder.is_equal_to_u64(index, entry_index as u64);
+            selected = builder.select(matches, field(entry), selected);
+            valid = builder.or(valid, matches);
+        }
+        builder.assert_one(valid.target);
+        selected
+    }
+
+    fn select_transaction_hash(&self, builder: &mut CircuitBuilder<F, D>, index: Target) -> HashOutTarget {
+        let context = self
+            .transaction_context
+            .as_ref()
+            .expect("transaction introspection context is not attached");
+        let in_range = builder.is_less_than(COMPARISON_BITS, index, context.tx_count);
+        builder.assert_one(in_range.target);
+        let mut selected = HashOutTarget {
+            elements: [builder.zero(); 4],
+        };
+        let mut valid = builder._false();
+        for (entry_index, entry) in context.entries.iter().enumerate() {
+            let matches = builder.is_equal_to_u64(index, entry_index as u64);
+            for limb in 0..4 {
+                selected.elements[limb] = builder.select(matches, entry.inputs_hash.elements[limb], selected.elements[limb]);
+            }
+            valid = builder.or(valid, matches);
+        }
+        builder.assert_one(valid.target);
+        selected
+    }
+
+    fn select_transaction_length(&self, builder: &mut CircuitBuilder<F, D>, index: Target) -> Target {
+        self.select_transaction_target(builder, index, |entry| entry.inputs_length)
+    }
+
+    fn select_transaction_input_word(&self, builder: &mut CircuitBuilder<F, D>, tx_index: Target, word_index: Target) -> Target {
+        let context = self
+            .transaction_context
+            .as_ref()
+            .expect("transaction introspection context is not attached");
+        let in_range = builder.is_less_than(COMPARISON_BITS, tx_index, context.tx_count);
+        builder.assert_one(in_range.target);
+        let max_word_index = builder.constant(F::from_canonical_u64(SDKEY_MAX_CALLDATA_WORDS as u64));
+        let word_in_range = builder.is_less_than(COMPARISON_BITS, word_index, max_word_index);
+        builder.assert_one(word_in_range.target);
+        // The fixed transaction context has 128 witness targets per slot, but
+        // only the prefix below inputs_length is authenticated by inputs_hash.
+        // Reject reads from the padded tail instead of exposing unconstrained
+        // witness values.
+        let inputs_length = self.select_transaction_length(builder, tx_index);
+        let word_is_in_calldata = builder.is_less_than(COMPARISON_BITS, word_index, inputs_length);
+        builder.assert_one(word_is_in_calldata.target);
+
+        let mut selected = builder.zero();
+        let mut valid_tx = builder._false();
+        for (entry_index, entry) in context.entries.iter().enumerate() {
+            let tx_matches = builder.is_equal_to_u64(tx_index, entry_index as u64);
+            valid_tx = builder.or(valid_tx, tx_matches);
+            let mut selected_word = builder.zero();
+            for (word, value) in entry.inputs.iter().enumerate() {
+                let word_matches = builder.is_equal_to_u64(word_index, word as u64);
+                selected_word = builder.select(word_matches, *value, selected_word);
+            }
+            selected = builder.select(tx_matches, selected_word, selected);
+        }
+        builder.assert_one(valid_tx.target);
+        selected
     }
     pub fn push_external_target(&mut self, index: usize, target: Target) {
         self.set_target_at(index, target, "external_target");
@@ -840,6 +951,52 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleDPNBuilder<F, D> {
             DPNOpType::GetNonce => self.set_target_at(op.index as usize, self.nonce, "GetNonce"),
             DPNOpType::GetUserPublicKeyHash => self.set_hash_at(op.index as usize, self.user_public_key, "GetUserPublicKeyHash"),
             DPNOpType::GetSessionProofTreeRoot => self.set_hash_at(op.index as usize, self.session_proof_tree_root, "GetSessionProofTreeRoot"),
+            DPNOpType::GetTransactionCount => {
+                let context = self
+                    .transaction_context
+                    .as_ref()
+                    .expect("transaction introspection context is not attached");
+                self.set_target_at(op.index as usize, context.tx_count, "GetTransactionCount");
+            }
+            DPNOpType::GetTransactionStackHash => {
+                let context = self
+                    .transaction_context
+                    .as_ref()
+                    .expect("transaction introspection context is not attached");
+                self.set_hash_at(op.index as usize, context.tx_stack_hash, "GetTransactionStackHash");
+            }
+            DPNOpType::GetTransactionContractId => {
+                let index = self.transaction_index_target(op);
+                let value = self.select_transaction_target(builder, index, |entry| entry.contract_id);
+                self.set_target_at(op.index as usize, value, "GetTransactionContractId");
+            }
+            DPNOpType::GetTransactionCallerContractId => {
+                let index = self.transaction_index_target(op);
+                let value = self.select_transaction_target(builder, index, |entry| entry.caller_contract_id);
+                self.set_target_at(op.index as usize, value, "GetTransactionCallerContractId");
+            }
+            DPNOpType::GetTransactionMethodId => {
+                let index = self.transaction_index_target(op);
+                let value = self.select_transaction_target(builder, index, |entry| entry.method_id);
+                self.set_target_at(op.index as usize, value, "GetTransactionMethodId");
+            }
+            DPNOpType::GetTransactionInputsHash => {
+                let index = self.transaction_index_target(op);
+                let value = self.select_transaction_hash(builder, index);
+                self.set_hash_at(op.index as usize, value, "GetTransactionInputsHash");
+            }
+            DPNOpType::GetTransactionInputLength => {
+                let index = self.transaction_index_target(op);
+                let value = self.select_transaction_length(builder, index);
+                self.set_target_at(op.index as usize, value, "GetTransactionInputLength");
+            }
+            DPNOpType::GetTransactionInputWord => {
+                assert_eq!(op.inputs.len(), 2, "GetTransactionInputWord requires transaction and word indices");
+                let tx_index = self.resolve_target(op.inputs[0]);
+                let word_index = self.resolve_target(op.inputs[1]);
+                let value = self.select_transaction_input_word(builder, tx_index, word_index);
+                self.set_target_at(op.index as usize, value, "GetTransactionInputWord");
+            }
 
             // GetStateQueryResult is deprecated, use GetStateCommandResult instead
             DPNOpType::GetStateQueryResult => unimplemented!("deprecated"),

@@ -162,9 +162,10 @@ impl<F: RichField + Extendable<D>, const D: usize> StateReaderGadget<F, D> {
     ) -> anyhow::Result<HashOutTarget> {
         let merkle_proof_gadget = MerkleProofGadget::add_virtual_to::<PoseidonHash, F, D>(builder, contract_state_tree_height as usize);
 
+        // Legacy Policy state-reader compatibility: this reader only authenticates
+        // the current contract state root. Proper cross-contract reads must use the
+        // DPN state reader's complete user/contract/state Merkle proof chain.
         builder.connect_hashes(merkle_proof_gadget.root, self.state.start_contract_state_root);
-        tracing::info!("merkle_proof_gadget.root: {:?}", merkle_proof_gadget.root);
-        tracing::info!("self.state.start_contract_state_root: {:?}", self.state.start_contract_state_root);
         let expected_slot_index_target = builder.constant(slot_index);
         builder.connect(merkle_proof_gadget.index, expected_slot_index_target);
 
@@ -282,6 +283,9 @@ impl<F: RichField + Extendable<D>, const D: usize> StateReaderGadget<F, D> {
         contract_state_tree_height: u8,
     ) -> anyhow::Result<HashOutTarget> {
         let merkle_proof_gadget = MerkleProofGadget::add_virtual_to::<PoseidonHash, F, D>(builder, contract_state_tree_height as usize);
+        // Legacy Policy state-reader compatibility: this prevents an unconstrained
+        // proof root, but does not implement authenticated cross-user reads. Those
+        // reads must use the DPN state reader's complete Merkle proof chain.
         builder.connect_hashes(merkle_proof_gadget.root, self.state.start_contract_state_root);
         let expected_slot_index = builder.constant(slot_index);
         builder.connect(merkle_proof_gadget.index, expected_slot_index);

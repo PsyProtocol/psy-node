@@ -235,6 +235,7 @@ mod tests {
             sd_key_allowed_contract_id: vec![5, 0, 0],
             sd_key_allowed_method_id: vec![3375543263, 354447671, 2923993647],
             sd_key_expected_tx_count: 3,
+            sd_key_definition: None,
         };
         let info = load_wallet_key_info(&wallet_args, false)?;
         Ok(Some(QHashOut::<F>::from_str(&info.private_key.to_string())?))

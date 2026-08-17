@@ -2,6 +2,7 @@ use plonky2::{
     hash::{hash_types::RichField, poseidon::PoseidonHash},
     plonk::config::Hasher,
 };
+use psy_client_data::dpn::sd_key::{SDKEY_MAX_CALLDATA_WORDS, MAX_INTROSPECTABLE_TRANSACTIONS};
 use psy_config::network_constants::DEFAULT_CALLER_CONTRACT_ID_U64;
 use tiny_keccak::{Hasher as _, Keccak};
 
@@ -23,6 +24,18 @@ pub struct SimpleDPNExecutor<F: RichField> {
     pub user_public_key: [F; 4],
     pub session_proof_tree_root: [F; 4],
     pub nonce: F,
+    pub inputs: Vec<F>,
+    pub transaction_log: Vec<DPNTransactionEntry<F>>,
+    pub transaction_stack_hash: [F; 4],
+}
+
+#[derive(Clone, Debug)]
+pub struct DPNTransactionEntry<F: RichField> {
+    pub contract_id: F,
+    pub caller_contract_id: F,
+    pub method_id: F,
+    pub inputs_hash: [F; 4],
+    pub inputs_length: F,
     pub inputs: Vec<F>,
 }
 
@@ -221,6 +234,8 @@ impl<F: RichField> SimpleDPNExecutor<F> {
             session_proof_tree_root: [F::ZERO; 4],
             nonce: F::ZERO,
             inputs: Vec::new(),
+            transaction_log: Vec::new(),
+            transaction_stack_hash: [F::ZERO; 4],
         }
     }
     pub fn new_with_contract_ctx(
@@ -250,7 +265,24 @@ impl<F: RichField> SimpleDPNExecutor<F> {
             session_proof_tree_root,
             nonce,
             inputs,
+            transaction_log: Vec::new(),
+            transaction_stack_hash: [F::ZERO; 4],
         }
+    }
+
+    pub fn set_transaction_context(&mut self, transaction_log: Vec<DPNTransactionEntry<F>>, transaction_stack_hash: [F; 4]) {
+        assert!(
+            transaction_log.len() <= MAX_INTROSPECTABLE_TRANSACTIONS as usize,
+            "transaction introspection exceeds MAX_TX_COUNT"
+        );
+        assert!(
+            transaction_log.iter().all(|entry| {
+                entry.inputs.len() <= SDKEY_MAX_CALLDATA_WORDS as usize && entry.inputs_length.to_canonical_u64() == entry.inputs.len() as u64
+            }),
+            "transaction calldata length exceeds MAX_CALLDATA_WORDS or does not match inputs_length"
+        );
+        self.transaction_log = transaction_log;
+        self.transaction_stack_hash = transaction_stack_hash;
     }
     pub fn push_external_target(&mut self, index: usize, target: F) {
         self.set_target_at(index, target, "external_target");
@@ -831,6 +863,47 @@ impl<F: RichField> SimpleDPNExecutor<F> {
             DPNOpType::GetNonce => self.set_target_at(op.index, self.nonce, "GetNonce"),
             DPNOpType::GetUserPublicKeyHash => self.set_hash_at(op.index, self.user_public_key, "GetUserPublicKeyHash"),
             DPNOpType::GetSessionProofTreeRoot => self.set_hash_at(op.index, self.session_proof_tree_root, "GetSessionProofTreeRoot"),
+            DPNOpType::GetTransactionCount => {
+                self.set_target_at(op.index, F::from_canonical_u64(self.transaction_log.len() as u64), "GetTransactionCount")
+            }
+            DPNOpType::GetTransactionStackHash => self.set_hash_at(op.index, self.transaction_stack_hash, "GetTransactionStackHash"),
+            DPNOpType::GetTransactionContractId => {
+                let index = self.resolve_target(op.inputs[0]).to_canonical_u64() as usize;
+                let entry = self.transaction_log.get(index).expect("transaction index out of bounds");
+                self.set_target_at(op.index, entry.contract_id, "GetTransactionContractId");
+            }
+            DPNOpType::GetTransactionCallerContractId => {
+                let index = self.resolve_target(op.inputs[0]).to_canonical_u64() as usize;
+                let entry = self.transaction_log.get(index).expect("transaction index out of bounds");
+                self.set_target_at(op.index, entry.caller_contract_id, "GetTransactionCallerContractId");
+            }
+            DPNOpType::GetTransactionMethodId => {
+                let index = self.resolve_target(op.inputs[0]).to_canonical_u64() as usize;
+                let entry = self.transaction_log.get(index).expect("transaction index out of bounds");
+                self.set_target_at(op.index, entry.method_id, "GetTransactionMethodId");
+            }
+            DPNOpType::GetTransactionInputsHash => {
+                let index = self.resolve_target(op.inputs[0]).to_canonical_u64() as usize;
+                let entry = self.transaction_log.get(index).expect("transaction index out of bounds");
+                self.set_hash_at(op.index, entry.inputs_hash, "GetTransactionInputsHash");
+            }
+            DPNOpType::GetTransactionInputLength => {
+                let index = self.resolve_target(op.inputs[0]).to_canonical_u64() as usize;
+                let entry = self.transaction_log.get(index).expect("transaction index out of bounds");
+                self.set_target_at(op.index, entry.inputs_length, "GetTransactionInputLength");
+            }
+            DPNOpType::GetTransactionInputWord => {
+                let tx_index = self.resolve_target(op.inputs[0]).to_canonical_u64() as usize;
+                let word_index = self.resolve_target(op.inputs[1]).to_canonical_u64() as usize;
+                assert!(word_index < SDKEY_MAX_CALLDATA_WORDS as usize, "calldata word index out of bounds");
+                let entry = self.transaction_log.get(tx_index).expect("transaction index out of bounds");
+                let value = if word_index < entry.inputs.len() {
+                    entry.inputs[word_index]
+                } else {
+                    F::ZERO
+                };
+                self.set_target_at(op.index, value, "GetTransactionInputWord");
+            }
 
             // GetStateQueryResult is deprecated, use GetStateCommandResult instead
             DPNOpType::GetStateQueryResult => unimplemented!("deprecated"),
@@ -923,8 +996,9 @@ impl<F: RichField> SimpleDPNExecutor<F> {
                     }
                     DPNBuiltInDataType::Target => {
                         assert!(index < self.targets.len(), "Invalid target index");
-                        assert!(self.targets[index].to_canonical_u64() <= 1, "Invalid bool value");
-                        self.targets[index].to_canonical_u64() != 0
+                        let value = self.targets[index].to_canonical_u64();
+                        assert!(value <= 1, "Invalid bool value");
+                        value != 0
                     }
                     _ => panic!("Invalid data type for Target"),
                 };
@@ -1102,6 +1176,90 @@ mod tests {
             exec.targets.last().unwrap().to_canonical_u64(),
             13,
             "TargetAt should read 4th limb from [u32;8] parameter",
+        );
+    }
+
+    #[test]
+    fn transaction_introspection_reads_calldata_words() {
+        let mut exec = mk_exec(vec![]);
+        exec.set_transaction_context(
+            vec![DPNTransactionEntry {
+                contract_id: GoldilocksField::from_canonical_u64(7),
+                caller_contract_id: GoldilocksField::from_canonical_u64(8),
+                method_id: GoldilocksField::from_canonical_u64(9),
+                inputs_length: GoldilocksField::from_canonical_u64(3),
+                inputs_hash: [GoldilocksField::ZERO; 4],
+                inputs: vec![
+                    GoldilocksField::from_canonical_u64(11),
+                    GoldilocksField::from_canonical_u64(22),
+                    GoldilocksField::from_canonical_u64(33),
+                ],
+            }],
+            [GoldilocksField::ZERO; 4],
+        );
+        exec.process_var_def(&DPNIndexedVarDef {
+            data_type: DPNBuiltInDataType::Target,
+            index: 0,
+            op_type: DPNOpType::Constant,
+            inputs: vec![0],
+        });
+        exec.process_var_def(&DPNIndexedVarDef {
+            data_type: DPNBuiltInDataType::Target,
+            index: 1,
+            op_type: DPNOpType::GetTransactionInputLength,
+            inputs: vec![encode_indexed_op_id(DPNBuiltInDataType::Target, 0)],
+        });
+        assert_eq!(exec.targets[1].to_canonical_u64(), 3);
+
+        exec.process_var_def(&DPNIndexedVarDef {
+            data_type: DPNBuiltInDataType::Target,
+            index: 2,
+            op_type: DPNOpType::Constant,
+            inputs: vec![1],
+        });
+        exec.process_var_def(&DPNIndexedVarDef {
+            data_type: DPNBuiltInDataType::Target,
+            index: 3,
+            op_type: DPNOpType::GetTransactionInputWord,
+            inputs: vec![
+                encode_indexed_op_id(DPNBuiltInDataType::Target, 0),
+                encode_indexed_op_id(DPNBuiltInDataType::Target, 2),
+            ],
+        });
+        assert_eq!(exec.targets[3].to_canonical_u64(), 22);
+    }
+
+    #[test]
+    #[should_panic(expected = "transaction introspection exceeds MAX_TX_COUNT")]
+    fn transaction_context_rejects_too_many_transactions() {
+        let mut exec = mk_exec(vec![]);
+        let entries = (0..=MAX_INTROSPECTABLE_TRANSACTIONS)
+            .map(|_| DPNTransactionEntry {
+                contract_id: GoldilocksField::ZERO,
+                caller_contract_id: GoldilocksField::ZERO,
+                method_id: GoldilocksField::ZERO,
+                inputs_length: GoldilocksField::ZERO,
+                inputs_hash: [GoldilocksField::ZERO; 4],
+                inputs: vec![],
+            })
+            .collect();
+        exec.set_transaction_context(entries, [GoldilocksField::ZERO; 4]);
+    }
+
+    #[test]
+    #[should_panic(expected = "transaction calldata length exceeds MAX_CALLDATA_WORDS")]
+    fn transaction_context_rejects_oversized_calldata() {
+        let mut exec = mk_exec(vec![]);
+        exec.set_transaction_context(
+            vec![DPNTransactionEntry {
+                contract_id: GoldilocksField::ZERO,
+                caller_contract_id: GoldilocksField::ZERO,
+                method_id: GoldilocksField::ZERO,
+                inputs_length: GoldilocksField::from_canonical_u64((SDKEY_MAX_CALLDATA_WORDS + 1) as u64),
+                inputs_hash: [GoldilocksField::ZERO; 4],
+                inputs: vec![GoldilocksField::ZERO; SDKEY_MAX_CALLDATA_WORDS as usize + 1],
+            }],
+            [GoldilocksField::ZERO; 4],
         );
     }
 
@@ -1356,6 +1514,31 @@ mod tests {
             62,
             "a[0]-b[0] + a[1]-b[1] + c[0] + c[1] should equal 62",
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "Sparse target assignment")]
+    fn sparse_target_assignment_is_rejected() {
+        let mut exec = mk_exec(vec![]);
+        exec.process_var_def(&DPNIndexedVarDef {
+            data_type: DPNBuiltInDataType::Target,
+            index: 1,
+            op_type: DPNOpType::Constant,
+            inputs: vec![0],
+        });
+    }
+
+    #[test]
+    fn repeated_external_target_binding_requires_equal_values() {
+        let mut exec = mk_exec(vec![]);
+        let value = GoldilocksField::from_canonical_u64(42);
+        exec.push_external_target(0, value);
+        exec.push_external_target(0, value);
+
+        let different = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            exec.push_external_target(0, GoldilocksField::from_canonical_u64(43));
+        }));
+        assert!(different.is_err());
     }
 
     #[test]

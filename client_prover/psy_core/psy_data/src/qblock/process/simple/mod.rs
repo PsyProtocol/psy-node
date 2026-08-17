@@ -165,12 +165,7 @@ impl SimpleBlockProcessor {
             user_registration_tree_root: store.get_user_registration_tree_root(new_checkpoint_id).await?,
         };
         let mut new_leaf_stats = PsyCheckpointLeafStats::<PsyFelt>::new_empty();
-        let block_time = u64::try_from(
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)?
-                .as_secs(),
-        )?;
-        new_leaf_stats.block_time = PsyFelt::from_canonical_u64(block_time);
+        new_leaf_stats.block_time = PsyFelt::from_canonical_u64(SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs());
         new_leaf_stats.user_ops_processed = PsyFelt::from_canonical_u64(cmds.update_users.len() as u64);
         new_leaf_stats.total_transactions =
             PsyFelt::from_canonical_u64(cmds.update_users.len() as u64 + cmds.register_users.len() as u64 + cmds.deploy_contracts.len() as u64);

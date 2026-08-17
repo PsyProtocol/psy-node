@@ -62,21 +62,24 @@ impl<F: RichField> ToQFelts<F> for PsyContractLeaf<F> {
     }
 
     fn from_qfelts(felts: &[F]) -> Self {
-        if felts.len() != 13 {
+        if felts.len() != 19 {
             panic!("Invalid number of elements for PsyContractLeaf");
         }
         let deployer = QHashOut::from_qfelts(&felts[0..4]);
         let function_tree_root = QHashOut::from_qfelts(&felts[4..8]);
         let code_root = QHashOut::from_qfelts(&felts[8..12]);
         let state_tree_height = felts[12];
+        let state_layout_root = QHashOut::from_qfelts(&felts[13..17]);
+        let state_layout_field_count = felts[17];
+        let state_layout_slot_count = felts[18];
         PsyContractLeaf {
             deployer,
             function_tree_root,
             code_root,
             state_tree_height,
-            state_layout_root: QHashOut::from_qfelts(&felts[13..17]),
-            state_layout_field_count: felts[17],
-            state_layout_slot_count: felts[18],
+            state_layout_root,
+            state_layout_field_count,
+            state_layout_slot_count,
         }
     }
 }
@@ -84,7 +87,6 @@ impl<F: RichField> ToQFelts<F> for PsyContractLeaf<F> {
 impl<F: RichField> QFieldHashable<F> for PsyContractLeaf<F> {
     fn qfhash<H: FieldQHasher<F>>(&self) -> QHashOut<F> {
         H::q_hash_many(&[
-            F::from_canonical_u64(0x434c_5632),
             self.deployer.0.elements[0],
             self.deployer.0.elements[1],
             self.deployer.0.elements[2],

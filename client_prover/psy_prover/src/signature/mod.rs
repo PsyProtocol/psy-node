@@ -4,4 +4,4 @@ pub mod users;
 
 pub use context::SignContext;
 pub use traits::{SignatureCircuitInfo, SignatureResult, SignatureUser};
-pub use users::{SECP256K1User, SoftwareDefinedDpnUser, SoftwareDefinedPlonky2User, ZKUser};
+pub use users::{SDKeyPlonky2User, SECP256K1User, SoftwareDefinedDpnUser, ZKUser};

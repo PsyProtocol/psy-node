@@ -136,6 +136,8 @@ pub struct DapenCFCUserTransactionCallStartContextGadget {
 
     pub call_data: DPNProvingSessionCompactMethodCallGadget,
     pub start_deferred_tx_debt_tree_root: HashOutTarget,
+    pub previous_tx_stack_hash: HashOutTarget,
+    pub previous_tx_count: Target,
 
     pub start_user_balance: Target,
     pub start_user_event_index: Target,
@@ -148,6 +150,8 @@ impl DapenCFCUserTransactionCallStartContextGadget {
 
         let call_data = DPNProvingSessionCompactMethodCallGadget::create_virtual(builder);
         let start_deferred_tx_debt_tree_root = builder.add_virtual_hash();
+        let previous_tx_stack_hash = builder.add_virtual_hash();
+        let previous_tx_count = builder.add_virtual_target();
 
         let start_user_balance = builder.add_virtual_target();
         let start_user_event_index = builder.add_virtual_target();
@@ -157,6 +161,8 @@ impl DapenCFCUserTransactionCallStartContextGadget {
             start_contract_state_tree_root,
             call_data,
             start_deferred_tx_debt_tree_root,
+            previous_tx_stack_hash,
+            previous_tx_count,
             start_user_balance,
             start_user_event_index,
         }
@@ -171,6 +177,8 @@ impl DapenCFCUserTransactionCallStartContextGadget {
 
         self.call_data.set_witness(witness, &target.call_data)?;
         witness.set_hash_target(self.start_deferred_tx_debt_tree_root, target.start_deferred_tx_debt_tree_root.0)?;
+        witness.set_hash_target(self.previous_tx_stack_hash, target.previous_tx_stack_hash.0)?;
+        witness.set_target(self.previous_tx_count, target.previous_tx_count)?;
 
         witness.set_target(self.start_user_balance, target.start_user_balance)?;
         witness.set_target(self.start_user_event_index, target.start_user_event_index)
@@ -182,14 +190,22 @@ impl DapenCFCUserTransactionCallStartContextGadget {
         let call_data_hash = self.call_data.to_hash::<H, F, D>(builder);
 
         let call_data_debt_combo = builder.hash_two_to_one::<H>(call_data_hash, debt_combo);
+        let previous_tx_context_hash = builder.hash_n_to_hash_no_pad::<H>(vec![
+            self.previous_tx_count,
+            self.previous_tx_stack_hash.elements[0],
+            self.previous_tx_stack_hash.elements[1],
+            self.previous_tx_stack_hash.elements[2],
+            self.previous_tx_stack_hash.elements[3],
+        ]);
 
         let state_call_combo = builder.hash_two_to_one::<H>(uct_cst_combo, call_data_debt_combo);
+        let state_call_tx_combo = builder.hash_two_to_one::<H>(state_call_combo, previous_tx_context_hash);
 
         builder.hash_n_to_hash_no_pad::<H>(vec![
-            state_call_combo.elements[0],
-            state_call_combo.elements[1],
-            state_call_combo.elements[2],
-            state_call_combo.elements[3],
+            state_call_tx_combo.elements[0],
+            state_call_tx_combo.elements[1],
+            state_call_tx_combo.elements[2],
+            state_call_tx_combo.elements[3],
             self.start_user_balance,
             self.start_user_event_index,
         ])

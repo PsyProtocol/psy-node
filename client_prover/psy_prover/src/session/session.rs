@@ -61,7 +61,7 @@ use psy_crypto::{
             qhashable::QFieldHashable,
         },
     },
-    signature::zk::data::ZKPublicKeyInfo,
+    signature::{secp256k1::core::PsyCompressedSecp256K1Signature, zk::data::ZKPublicKeyInfo},
 };
 use psy_dpn_circuit::circuits::cfc::DapenContractFunctionCircuit;
 pub use psy_provider::session::TxStatus;
@@ -708,11 +708,9 @@ impl<'a> TraceBuildSession<'a> {
             secp_builtin_fingerprint,
             eth_personal_builtin_fingerprint,
         );
-        let circuit_manager = if matches!(builtin_source, Some(TraceSignCircuitSource::EthPersonalSecpBuiltin)) {
-            self.wallet_session.wallet.eth_personal_circuit_manager().await?
-        } else {
-            initial_circuit_manager
-        };
+        // The eth-personal circuit lives on the same managers as the other
+        // signature circuits; reuse the initially selected manager.
+        let circuit_manager = initial_circuit_manager;
         let (sign_circuit_source, zksign_fingerprint) = if let Some(source) = builtin_source {
             (source, pk_info.fingerprint)
         } else if self.wallet_session.wallet.has_psy_software_defined_circuit(&pk_info.fingerprint) {
@@ -839,6 +837,9 @@ impl<'a> TraceBuildSession<'a> {
                             .ok_or_else(|| anyhow::anyhow!("SD key verifier config missing"))?,
                     ),
                 )
+            }
+            TraceSignCircuitSource::SdKeyDpn { .. } => {
+                anyhow::bail!("programmable SDKey-DPN signing is not supported during trace generation")
             }
         };
 
@@ -1483,7 +1484,12 @@ impl WalletSession {
             message,
             signature,
         )?;
-        self.wallet.inject_eth_personal_signature(expected_public_key, recovered).await?;
+        let compressed_signature = PsyCompressedSecp256K1Signature {
+            public_key: recovered.public_key,
+            signature: signature[..64].try_into().expect("signature array is 65 bytes"),
+            message,
+        };
+        self.wallet.inject_eth_personal_signature(expected_public_key, compressed_signature).await?;
         Ok(expected_public_key)
     }
 
@@ -2374,6 +2380,9 @@ impl WalletSession {
                 );
                 Ok(())
             }
+            crate::trace::TraceSignCircuitSource::SdKeyDpn { .. } => {
+                anyhow::bail!("programmable SDKey-DPN signing circuits must be registered before trace proving")
+            }
         }
     }
 
@@ -2477,6 +2486,7 @@ impl WalletSession {
         drop(sd_key);
 
         let transaction_infos = user_session_mgr.sd_key_transaction_infos();
+        let transaction_inputs = user_session_mgr.sd_key_transaction_inputs();
         let expected_slots = config.num_introspectable_transactions as usize;
         if transaction_infos.len() != expected_slots {
             anyhow::bail!(
@@ -2492,15 +2502,20 @@ impl WalletSession {
         let circuit_inputs = call_data.inputs.iter().map(|x| F::from_noncanonical_u64(*x)).collect::<Vec<_>>();
         let tx_stack_hash = user_session_mgr.current_tx_hash_stack();
         let tx_count = user_session_mgr.current_tx_count();
-        let start_contract_state_tree_root = current_header.current_state.user_leaf.user_state_tree_root;
         let checkpoint_tree_root = current_header.session_start_context.checkpoint_tree_root;
 
         let signature_input = SDKeyCircuitWitnessInput {
             circuit_inputs,
             transaction_infos,
+            transaction_inputs,
             tx_stack_hash,
             tx_count,
             state_reader_results: None,
+            dpn_state_command_witnesses: vec![],
+            dpn_state_reader_context: None,
+            signature_context: None,
+            contract_state_root_proof: None,
+            start_contract_state_root: QHashOut::ZERO,
             secp256k1_slots: vec![],
             checkpoint_id: F::from_canonical_u64(checkpoint_id),
             user_id: F::from_canonical_u64(user_id),
@@ -2512,7 +2527,7 @@ impl WalletSession {
                 signature_input,
                 checkpoint_id,
                 user_id,
-                start_contract_state_tree_root,
+                QHashOut::ZERO,
                 checkpoint_tree_root,
             ))
     }
@@ -2544,12 +2559,16 @@ impl WalletSession {
         let config = sd_key.config.clone();
         drop(sd_key);
 
-        let transaction_infos = trace_steps
+        let cfc_steps: Vec<_> = trace_steps.iter().filter_map(crate::trace::TraceStep::as_cfc).collect();
+        let transaction_infos = cfc_steps
             .iter()
-            .filter_map(crate::trace::TraceStep::as_cfc)
             .map(|cfc| {
                 psy_client_data::dpn::sd_key::SDKeyTransactionInfo::from(cfc.cfc_witness.tx_input_ctx.transaction_call_start_ctx.call_data.clone())
             })
+            .collect::<Vec<_>>();
+        let transaction_inputs = cfc_steps
+            .iter()
+            .map(|cfc| cfc.cfc_witness.inputs.clone())
             .collect::<Vec<_>>();
         let expected_slots = config.num_introspectable_transactions as usize;
         if transaction_infos.len() != expected_slots {
@@ -2567,9 +2586,15 @@ impl WalletSession {
         let signature_input = SDKeyCircuitWitnessInput {
             circuit_inputs,
             transaction_infos,
+            transaction_inputs,
             tx_stack_hash: current_header.current_state.tx_hash_stack,
             tx_count: current_header.current_state.tx_count,
             state_reader_results: None,
+            dpn_state_command_witnesses: vec![],
+            dpn_state_reader_context: None,
+            signature_context: None,
+            contract_state_root_proof: None,
+            start_contract_state_root: QHashOut::ZERO,
             secp256k1_slots: vec![],
             checkpoint_id: F::from_canonical_u64(checkpoint_id),
             user_id: F::from_canonical_u64(user_id),
@@ -4462,6 +4487,9 @@ impl WalletSession {
                     .await?
                 }
             }
+            crate::trace::TraceSignCircuitSource::SdKeyDpn { .. } => {
+                anyhow::bail!("programmable SDKey-DPN signing is not supported for stateless trace signing")
+            }
         };
 
         let sighash = UserProvingSessionManager::<F, PoseidonHash, RpcProvider, C, D>::compute_sighash_from_header(
@@ -4792,6 +4820,9 @@ impl WalletSession {
                         )
                         .await?;
                 }
+            }
+            crate::trace::TraceSignCircuitSource::SdKeyDpn { .. } => {
+                anyhow::bail!("programmable SDKey-DPN signing is not supported for stateful trace finalization")
             }
         }
         let sighash = UserProvingSessionManager::<F, PoseidonHash, RpcProvider, C, D>::compute_sighash_from_header(

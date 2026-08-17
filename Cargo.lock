@@ -7448,6 +7448,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bincode",
+ "ciborium",
  "clap",
  "console_error_panic_hook",
  "dashmap",

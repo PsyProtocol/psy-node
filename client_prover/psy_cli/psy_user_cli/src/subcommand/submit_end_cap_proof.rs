@@ -13,10 +13,10 @@ use crate::result::{CommandResult, TransactionResult, TransactionStatus};
 
 fn allowed_contract_method_pairs(allowed_contract_ids: &[u64], allowed_method_ids: &[u32]) -> anyhow::Result<Vec<(u64, u32)>> {
     if allowed_contract_ids.is_empty() {
-        anyhow::bail!("sdk-key sign needs at least one --sdk-key-allowed-contract-id");
+        anyhow::bail!("sd-key sign needs at least one --sd-key-allowed-contract-id");
     }
     if allowed_method_ids.is_empty() {
-        anyhow::bail!("sdk-key sign needs at least one --sdk-key-allowed-method-id");
+        anyhow::bail!("sd-key sign needs at least one --sd-key-allowed-method-id");
     }
 
     if allowed_contract_ids.len() == allowed_method_ids.len() {
@@ -37,10 +37,10 @@ fn allowed_contract_method_pairs(allowed_contract_ids: &[u64], allowed_method_id
             .collect());
     }
 
-    anyhow::bail!("sdk-key allowed contract_id and method_id lists must have the same length, or one list must contain exactly one value");
+    anyhow::bail!("sd-key allowed contract_id and method_id lists must have the same length, or one list must contain exactly one value");
 }
 
-async fn validate_sdk_key_allowed_calls(
+async fn validate_sd_key_allowed_calls(
     provider: &RpcProvider,
     contract_calls: &[ContractCallArgs],
     allowed_contract_ids: &[u64],
@@ -64,7 +64,7 @@ async fn validate_sdk_key_allowed_calls(
 
         if !allowed_pairs.contains(&(call.contract_id, method)) {
             anyhow::bail!(
-                "SDK key policy denied call_index={} contract_id={} method_name={} method_id={}; expected_tx_count={}; allowed_pairs={:?}",
+                "SD key policy denied call_index={} contract_id={} method_name={} method_id={}; expected_tx_count={}; allowed_pairs={:?}",
                 call_index,
                 call.contract_id,
                 call.method_name,
@@ -116,14 +116,14 @@ pub async fn configure_wallet_session_for_signer(
         SignType::SDKeySign => {
             let allowed_contract_ids = &wallet.sd_key_allowed_contract_id;
             if allowed_contract_ids.is_empty() {
-                anyhow::bail!("sdk-key sign needs at least one --sdk-key-allowed-contract-id");
+                anyhow::bail!("sd-key sign needs at least one --sd-key-allowed-contract-id");
             }
             let allowed_method_ids = &wallet.sd_key_allowed_method_id;
             if allowed_method_ids.is_empty() {
-                anyhow::bail!("sdk-key sign needs at least one --sdk-key-allowed-method-id");
+                anyhow::bail!("sd-key sign needs at least one --sd-key-allowed-method-id");
             }
             let expected_tx_count = wallet.sd_key_expected_tx_count;
-            validate_sdk_key_allowed_calls(
+            validate_sd_key_allowed_calls(
                 &wallet_session.st_provider,
                 contract_calls,
                 allowed_contract_ids,

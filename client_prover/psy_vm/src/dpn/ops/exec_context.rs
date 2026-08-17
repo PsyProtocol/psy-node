@@ -872,6 +872,72 @@ impl DPNContext<SymFeltRef> for QExecContext {
         self.op_target_at_array(SymFeltRef::new_valueless(DPNOpType::GetSessionProofTreeRoot))
     }
 
+    fn get_transaction_count(&mut self) -> SymFeltRef {
+        self.store.insert(SymFeltRefValue {
+            op_type: DPNOpType::GetTransactionCount,
+            const_param: 0,
+            inputs: vec![],
+        })
+    }
+
+    fn get_transaction_stack_hash(&mut self) -> [SymFeltRef; 4] {
+        let hash = self.store.insert(SymFeltRefValue {
+            op_type: DPNOpType::GetTransactionStackHash,
+            const_param: 0,
+            inputs: vec![],
+        });
+        self.op_target_at_array(hash)
+    }
+
+    fn get_transaction_contract_id(&mut self, index: SymFeltRef) -> SymFeltRef {
+        self.store.insert(SymFeltRefValue {
+            op_type: DPNOpType::GetTransactionContractId,
+            const_param: 0,
+            inputs: vec![index],
+        })
+    }
+
+    fn get_transaction_caller_contract_id(&mut self, index: SymFeltRef) -> SymFeltRef {
+        self.store.insert(SymFeltRefValue {
+            op_type: DPNOpType::GetTransactionCallerContractId,
+            const_param: 0,
+            inputs: vec![index],
+        })
+    }
+
+    fn get_transaction_method_id(&mut self, index: SymFeltRef) -> SymFeltRef {
+        self.store.insert(SymFeltRefValue {
+            op_type: DPNOpType::GetTransactionMethodId,
+            const_param: 0,
+            inputs: vec![index],
+        })
+    }
+
+    fn get_transaction_inputs_hash(&mut self, index: SymFeltRef) -> [SymFeltRef; 4] {
+        let hash = self.store.insert(SymFeltRefValue {
+            op_type: DPNOpType::GetTransactionInputsHash,
+            const_param: 0,
+            inputs: vec![index],
+        });
+        self.op_target_at_array(hash)
+    }
+
+    fn get_transaction_input_length(&mut self, index: SymFeltRef) -> SymFeltRef {
+        self.store.insert(SymFeltRefValue {
+            op_type: DPNOpType::GetTransactionInputLength,
+            const_param: 0,
+            inputs: vec![index],
+        })
+    }
+
+    fn get_transaction_input_word(&mut self, transaction_index: SymFeltRef, word_index: SymFeltRef) -> SymFeltRef {
+        self.store.insert(SymFeltRefValue {
+            op_type: DPNOpType::GetTransactionInputWord,
+            const_param: 0,
+            inputs: vec![transaction_index, word_index],
+        })
+    }
+
     fn get_checkpoint_stats(&mut self, checkpoint_id: SymFeltRef) -> Vec<SymFeltRef> {
         let cmd = DPNStateCmd::GetCheckpointLeafStats(DPNStateCmdGetCheckpointLeafStats { checkpoint_id });
         let b = self.resolve_state_cmd_base(cmd);

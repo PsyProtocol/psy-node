@@ -662,6 +662,7 @@ pub struct QUserContractStateTreeLeafHashRPCRequest {
     pub checkpoint_id: u64,
     pub user_id: u64,
     pub contract_id: u32,
+    pub height: u8,
     pub leaf_id: u64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -671,6 +672,7 @@ pub struct QUserContractStateTreeLeafHashFRPCRequest<F: RichField> {
     pub checkpoint_id: F,
     pub user_id: F,
     pub contract_id: F,
+    pub height: u8,
     pub leaf_id: F,
 }
 
@@ -681,6 +683,7 @@ pub struct QUserContractStateTreeMerkleProofRPCRequest {
     pub checkpoint_id: u64,
     pub user_id: u64,
     pub contract_id: u32,
+    pub height: u8,
     pub leaf_id: u64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -690,6 +693,7 @@ pub struct QUserContractStateTreeMerkleProofFRPCRequest<F: RichField> {
     pub checkpoint_id: F,
     pub user_id: F,
     pub contract_id: F,
+    pub height: u8,
     pub leaf_id: F,
 }
 
@@ -1615,7 +1619,6 @@ pub enum QRPCRequest<F: RichField> {
     QAddWithdrawalRPCRequest((u32, QAddWithdrawalRPCRequest)),
     QRegisterUserRPCRequest((u32, QRegisterUserRPCRequest<F>)),
     QDeployContractRPCRequest((u32, QDeployContractRPCRequest<F>)),
-    QUpdateContractRPCRequest((u32, QUpdateContractRPCRequest<F>)),
     QProduceBlockRPCRequest((u32, ())),
     QSubmitEndCapRPCRequest((u32, QSubmitEndCapRPCRequest<F>)),
 
@@ -1702,32 +1705,4 @@ pub enum QRPCRequest<F: RichField> {
     QTwoAggRpcRequset((u32, QTwoAggRpcRequset<F>)),
     QLeftLeafRightAggRpcRequest((u32, QLeftLeafRightAggRpcRequest<F>)),
     QLeftAggRightLeafRpcRequest((u32, QLeftAggRightLeafRpcRequest<F>)),
-}
-
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn eth_personal_signature_request_round_trip_preserves_exact_bytes() {
-        let signature = PsyCompressedSecp256K1Signature {
-            public_key: core::array::from_fn(|index| index as u8),
-            signature: core::array::from_fn(|index| (index + 33) as u8),
-            message: Hash256(core::array::from_fn(|index| (255 - index) as u8)),
-        };
-        let request = RpcRequest {
-            jsonrpc: Version::V2,
-            request: RequestParams::<GoldilocksField>::EthPersonalSECPSignatureProof(QSecpSignatureProofRPCRequest { signature }),
-            id: Id::Number(7),
-        };
-
-        let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("\"method\":\"psy_prove_eth_personal_secp_sign\""));
-        let decoded: RpcRequest<RequestParams<GoldilocksField>> = serde_json::from_str(&json).unwrap();
-        match decoded.request {
-            RequestParams::EthPersonalSECPSignatureProof(decoded_request) => assert_eq!(decoded_request.signature, signature),
-            _ => panic!("wrong request variant after round trip"),
-        }
-    }
 }

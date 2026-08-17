@@ -816,6 +816,7 @@ pub async fn run(args: PrivateTransferArgs) -> anyhow::Result<CommandResult> {
             sd_key_allowed_contract_id: vec![],
             sd_key_allowed_method_id: vec![],
             sd_key_expected_tx_count: 2,
+            sd_key_definition: None,
         },
         contract_id: vec![args.contract_id],
         method_name: vec!["private_transfer".to_string()],

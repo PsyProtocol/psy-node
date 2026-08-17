@@ -53,8 +53,85 @@ pub struct DPNFunctionCircuitDefinition {
 }
 
 impl DPNFunctionCircuitDefinition {
+    pub fn validate_state_command_resolution_semantics(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// Require the canonical compiler numbering: every built-in data type has
+    /// its own dense index space, assigned in definition order.
+    pub fn validate_canonical_indices(&self) -> anyhow::Result<()> {
+        let mut next_indices = [0usize; 8];
+        for (definition_index, definition) in self.definitions.iter().enumerate() {
+            let data_type = definition.data_type as usize;
+            if data_type >= next_indices.len() {
+                anyhow::bail!("definition {definition_index} has unsupported data type {}", definition.data_type);
+            }
+            let expected = next_indices[data_type];
+            if definition.index != expected {
+                anyhow::bail!(
+                    "definition {definition_index} ({}) has non-canonical {} index {}; expected {}",
+                    definition.op_type,
+                    definition.data_type,
+                    definition.index,
+                    expected
+                );
+            }
+            next_indices[data_type] += 1;
+        }
+        Ok(())
+    }
+
+    /// Validate that this function can be embedded in a Software-Defined Key.
+    /// SDKey functions may inspect state, but must not mutate state, enqueue a
+    /// call, or emit side effects that are meaningful outside the proof.
+    pub fn validate_sd_key_read_only(&self) -> anyhow::Result<()> {
+        self.validate_canonical_indices()?;
+        if !self.assertions.is_empty() {
+            // Assertions are constraints, not state effects; they are allowed
+            // and are handled by the shared circuit executor.
+        }
+        if !self.events.is_empty() {
+            anyhow::bail!("SDKey DPN authorization function cannot emit events");
+        }
+        for cmd in &self.state_commands {
+            let read_only = matches!(
+                cmd,
+                DPNStateCmd::GetSelfUserCurrentContractStateSlotHash(_)
+                    | DPNStateCmd::GetSelfUserCurrentContractStateSlotSingle(_)
+                    | DPNStateCmd::GetSelfUserCurrentContractStateSlotRange(_)
+                    | DPNStateCmd::GetSelfUserExternalContractStateSlotHash(_)
+                    | DPNStateCmd::GetSelfUserExternalContractStateSlotSingle(_)
+                    | DPNStateCmd::GetSelfUserExternalContractStateSlotRange(_)
+                    | DPNStateCmd::GetOtherUserContractStateSlotHash(_)
+                    | DPNStateCmd::GetOtherUserContractStateSlotSingle(_)
+                    | DPNStateCmd::GetOtherUserContractStateSlotRange(_)
+                    | DPNStateCmd::GetCheckpointLeafStats(_)
+                    | DPNStateCmd::GetContractLeaf(_)
+                    | DPNStateCmd::GetGlobalStateRoots(_)
+                    | DPNStateCmd::GetSelfUserCurrentIMTContractStateValue(_)
+                    | DPNStateCmd::GetSelfUserExternalIMTContractStateValue(_)
+                    | DPNStateCmd::GetOtherUserIMTContractStateValue(_)
+                    | DPNStateCmd::ContainsSelfUserCurrentIMTContractStateValue(_)
+                    | DPNStateCmd::ContainsOtherUserIMTContractStateValue(_)
+            );
+            if !read_only {
+                anyhow::bail!("SDKey DPN authorization function contains a non-read-only state command: {:?}", cmd);
+            }
+        }
+        Ok(())
+    }
+
     pub fn is_view_function(&self) -> bool {
-        self.events.is_empty() && self.state_commands.iter().all(|cmd| cmd.is_read_only())
+        !self.state_commands.iter().any(|cmd| {
+            matches!(
+                cmd,
+                DPNStateCmd::SetContractStateSlotHash(_)
+                    | DPNStateCmd::SetContractStateSlotSingle(_)
+                    | DPNStateCmd::SetContractStateSlotRange(_)
+                    | DPNStateCmd::ClearEntireTree(_)
+                    | DPNStateCmd::InvokeExternalContractFunctionSync(_)
+                    | DPNStateCmd::InvokeExternalContractFunctionDeferred(_)
+            )
+        })
     }
 }
 

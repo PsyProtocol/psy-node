@@ -518,12 +518,11 @@ impl<F: RichField> PsyConfig<F> {
         let content = match std::fs::read_to_string(path) {
             Ok(content) => content,
             Err(err) => {
-                // Canonical config lives in the psy-genesis submodule at
-                // psy-genesis/config.json. The CLI default --rpc-config is the
-                // bare "config.json"; resolve that to the canonical path.
-                let canonical_path = "psy-genesis/config.json";
+                // Backward compatibility for repo-root invocations after moving the canonical
+                // config to client_prover/config.json.
+                let fallback_path = "client_prover/config.json";
                 if path == "config.json" {
-                    std::fs::read_to_string(canonical_path).map_err(|_| ConfigError::IoError(err))?
+                    std::fs::read_to_string(fallback_path).map_err(|_| ConfigError::IoError(err))?
                 } else {
                     return Err(ConfigError::IoError(err));
                 }

@@ -1,6 +1,6 @@
 use std::sync::Mutex;
 
-use psy_compiler::{abi::ContractABI, output::serialize::ContractOutput, sdk_key::context::SDKKeyCompileOutput};
+use psy_compiler::{abi::ContractABI, output::serialize::ContractOutput, sd_key::context::SDKeyCompileOutput};
 use psy_vm::dpn::{
     contract::dapen_fc_to_cfc_code_definition,
     eval::executor::{ExecutionContext, InMemoryStateBackend, StateBackend, VmExecutor},
@@ -529,6 +529,8 @@ fn default_execution_context() -> ExecutionContext {
         checkpoint_id: 0,
         nonce: 0,
         user_public_key_hash: [0; 4],
+        transaction_log: vec![],
+        transaction_stack_hash: [0; 4],
     }
 }
 
@@ -541,6 +543,8 @@ impl From<ExecutionContextInput> for ExecutionContext {
             checkpoint_id: value.checkpoint_id.unwrap_or(0),
             nonce: value.nonce.unwrap_or(0),
             user_public_key_hash: value.user_public_key_hash.unwrap_or([0; 4]),
+            transaction_log: vec![],
+            transaction_stack_hash: [0; 4],
         }
     }
 }
@@ -846,6 +850,8 @@ pub fn call_contract(caller_id: u64, contract_id: u64, method_name: &str, args_j
             checkpoint_id: chain.checkpoint_id,
             nonce: chain.transaction_log.len() as u64,
             user_public_key_hash: [0; 4],
+            transaction_log: vec![],
+            transaction_stack_hash: [0; 4],
         };
 
         // Clone the state to create the executor
@@ -1012,15 +1018,15 @@ pub fn get_contract_abi(contract_id: u64) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// SDK Key compilation
+// SD Key compilation
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize)]
-struct JsSDKKeyCompileResult {
+struct JsSDKeyCompileResult {
     success: bool,
     error: Option<String>,
     name: Option<String>,
-    config: Option<JsSDKKeyConfig>,
+    config: Option<JsSDKeyConfig>,
     /// DPN bytecode (JSON-serialized DPNFunctionCircuitDefinition).
     dpn_bytecode: Option<String>,
     /// Dapen bytecode (hex-encoded CBOR of ContractFunctionCodeDefinition).
@@ -1038,19 +1044,20 @@ struct JsSDKKeyCompileResult {
 }
 
 #[derive(Serialize)]
-struct JsSDKKeyConfig {
+struct JsSDKeyConfig {
     num_introspectable_transactions: u32,
     can_read_state: bool,
     contract_state_tree_height: u8,
     requires_secp256k1: bool,
     num_secp256k1_slots: u32,
+    contract_id: u64,
 }
 
 fn bytes_to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-fn sdk_key_output_to_js(output: &SDKKeyCompileOutput, include_dapen: bool) -> JsSDKKeyCompileResult {
+fn sd_key_output_to_js(output: &SDKeyCompileOutput, include_dapen: bool) -> JsSDKeyCompileResult {
     let dpn_bytecode = serde_json::to_string(&output.circuit_def).ok();
     let dapen_bytecode = if include_dapen {
         let cfc = dapen_fc_to_cfc_code_definition(&output.circuit_def);
@@ -1059,16 +1066,17 @@ fn sdk_key_output_to_js(output: &SDKKeyCompileOutput, include_dapen: bool) -> Js
         None
     };
 
-    JsSDKKeyCompileResult {
+    JsSDKeyCompileResult {
         success: true,
         error: None,
         name: Some(output.name.clone()),
-        config: Some(JsSDKKeyConfig {
+        config: Some(JsSDKeyConfig {
             num_introspectable_transactions: output.config.num_introspectable_transactions,
             can_read_state: output.config.can_read_state,
             contract_state_tree_height: output.config.contract_state_tree_height,
             requires_secp256k1: output.config.requires_secp256k1,
             num_secp256k1_slots: output.config.num_secp256k1_slots,
+            contract_id: output.config.contract_id,
         }),
         dpn_bytecode,
         dapen_bytecode,
@@ -1080,8 +1088,8 @@ fn sdk_key_output_to_js(output: &SDKKeyCompileOutput, include_dapen: bool) -> Js
     }
 }
 
-fn sdk_key_error_result(error_msg: String) -> String {
-    let result = JsSDKKeyCompileResult {
+fn sd_key_error_result(error_msg: String) -> String {
+    let result = JsSDKeyCompileResult {
         success: false,
         error: Some(error_msg),
         name: None,
@@ -1097,35 +1105,63 @@ fn sdk_key_error_result(error_msg: String) -> String {
     serde_json::to_string(&result).unwrap_or_else(|e| format!("{{\"success\":false,\"error\":\"Serialization error: {}\"}}", e))
 }
 
-/// Compile a single-file PSY source as an SDK key. Returns JSON.
+/// Compile a single-file PSY source as an SD key. Returns JSON.
 ///
 /// The result includes both DPN bytecode (JSON) and Dapen bytecode (hex CBOR).
 #[wasm_bindgen]
-pub fn compile_sdk_key_source(source: &str) -> String {
-    match psy_compiler::compile_sdk_key(source) {
+pub fn compile_sd_key_source(source: &str) -> String {
+    match psy_compiler::compile_sd_key(source) {
         Ok(output) => {
-            let result = sdk_key_output_to_js(&output, true);
-            serde_json::to_string(&result).unwrap_or_else(|e| sdk_key_error_result(format!("Serialization error: {}", e)))
+            let result = sd_key_output_to_js(&output, true);
+            serde_json::to_string(&result).unwrap_or_else(|e| sd_key_error_result(format!("Serialization error: {}", e)))
         }
-        Err(e) => sdk_key_error_result(format!("{:#}", e)),
+        Err(e) => sd_key_error_result(format!("{:#}", e)),
     }
 }
 
-/// Compile a multi-file PSY project as an SDK key. Returns JSON.
+/// Compile a single-file SD key bound to a contract for state reads.
+#[wasm_bindgen]
+pub fn compile_sd_key_source_for_contract(source: &str, contract_id: u64) -> String {
+    match psy_compiler::compile_sd_key_for_contract(source, contract_id) {
+        Ok(output) => {
+            let result = sd_key_output_to_js(&output, true);
+            serde_json::to_string(&result).unwrap_or_else(|e| sd_key_error_result(format!("Serialization error: {}", e)))
+        }
+        Err(e) => sd_key_error_result(format!("{:#}", e)),
+    }
+}
+
+/// Compile a multi-file PSY project as an SD key. Returns JSON.
 ///
 /// `files_json` is a JSON array of `[module_path_parts[], source_text]` pairs.
 /// The result includes both DPN bytecode (JSON) and Dapen bytecode (hex CBOR).
 #[wasm_bindgen]
-pub fn compile_sdk_key_project(files_json: &str) -> String {
+pub fn compile_sd_key_project(files_json: &str) -> String {
     let files: Result<Vec<(Vec<String>, String)>, _> = serde_json::from_str(files_json);
     match files {
-        Ok(file_list) => match psy_compiler::compile_sdk_key_from_sources(&file_list) {
+        Ok(file_list) => match psy_compiler::compile_sd_key_from_sources(&file_list) {
             Ok(output) => {
-                let result = sdk_key_output_to_js(&output, true);
-                serde_json::to_string(&result).unwrap_or_else(|e| sdk_key_error_result(format!("Serialization error: {}", e)))
+                let result = sd_key_output_to_js(&output, true);
+                serde_json::to_string(&result).unwrap_or_else(|e| sd_key_error_result(format!("Serialization error: {}", e)))
             }
-            Err(e) => sdk_key_error_result(format!("{:#}", e)),
+            Err(e) => sd_key_error_result(format!("{:#}", e)),
         },
-        Err(e) => sdk_key_error_result(format!("Invalid files JSON: {}", e)),
+        Err(e) => sd_key_error_result(format!("Invalid files JSON: {}", e)),
+    }
+}
+
+/// Compile a multi-file SD key bound to a contract for state reads.
+#[wasm_bindgen]
+pub fn compile_sd_key_project_for_contract(files_json: &str, contract_id: u64) -> String {
+    let files: Result<Vec<(Vec<String>, String)>, _> = serde_json::from_str(files_json);
+    match files {
+        Ok(file_list) => match psy_compiler::compile_sd_key_from_sources_for_contract(&file_list, contract_id) {
+            Ok(output) => {
+                let result = sd_key_output_to_js(&output, true);
+                serde_json::to_string(&result).unwrap_or_else(|e| sd_key_error_result(format!("Serialization error: {}", e)))
+            }
+            Err(e) => sd_key_error_result(format!("{:#}", e)),
+        },
+        Err(e) => sd_key_error_result(format!("Invalid files JSON: {}", e)),
     }
 }

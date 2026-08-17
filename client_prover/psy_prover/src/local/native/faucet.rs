@@ -55,7 +55,6 @@ struct PsyFaucetOperatorsConfig {
     faucet_method_name: String,
     faucet_method_id: u32,
     faucet_per_claim_amount: String,
-    #[serde(alias = "sdkKeyExpectedTxCount")]
     sd_key_expected_tx_count: u64,
     sd_key_allowed_contract_ids: Option<Vec<u64>>,
     sd_key_allowed_method_ids: Option<Vec<u32>>,
@@ -212,7 +211,7 @@ impl PsyFaucetService {
         let mut operators = Vec::with_capacity(config.operators.len());
         for operator in &config.operators {
             anyhow::ensure!(
-                operator.sign_type == "sd-key" || operator.sign_type == "sdk-key" || operator.sign_type == "SDKeySign",
+                operator.sign_type == "sd-key" || operator.sign_type == "SDKeySign",
                 "faucet operator {} uses unsupported signType {}; server faucet requires sd-key",
                 operator.user_id,
                 operator.sign_type

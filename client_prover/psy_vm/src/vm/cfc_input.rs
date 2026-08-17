@@ -1,7 +1,7 @@
 use kvq::traits::KVQSerializable;
 use plonky2::{field::goldilocks_field::GoldilocksField, hash::hash_types::RichField};
 use psy_client_common::data::qhashout::QHashOut;
-use psy_client_data::dpn::{cfc_context_input::DapenCFCUserTransactionInputContext, event::PsyUserEventRecord};
+use psy_client_data::dpn::{cfc_context_input::DapenCFCUserTransactionInputContext, event::PsyUserEventRecord, sd_key::SDKeyTransactionInfo};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
@@ -17,6 +17,15 @@ pub struct DapenContractFunctionCircuitInput<F: RichField> {
     pub cmd_witnesses: Vec<PsyCmdWithInputAndWitness<F>>,
     pub session_proof_tree_root: QHashOut<F>,
     pub tx_input_ctx: DapenCFCUserTransactionInputContext<F>,
+    /// Previously executed CFCs visible to read-only DPN introspection.
+    #[serde(default)]
+    pub transaction_infos: Vec<SDKeyTransactionInfo<F>>,
+    /// Raw calldata for each preceding transaction.
+    #[serde(default)]
+    pub transaction_inputs: Vec<Vec<F>>,
+    /// Commitment of `transaction_infos`, chained from the empty hash.
+    #[serde(default)]
+    pub transaction_stack_hash: QHashOut<F>,
 }
 
 impl<F: RichField> KVQSerializable for DapenContractFunctionCircuitInput<F> {

@@ -52,7 +52,8 @@ use serde_json;
 
 use super::request::{
     Id, QAddWithdrawalRPCRequest, QClaimDepositRPCRequest, QDeployContractRPCRequest, QGetUserIdsRPCRequest, QRegisterUserRPCRequest,
-    QSubmitEndCapRPCRequest, QTokenTransferRPCRequest, QUpdateContractRPCRequest, RequestParams, ResponseResult, RpcRequest, RpcResponse, Version,
+    QSubmitEndCapRPCRequest, QTokenTransferRPCRequest, QUpdateContractRPCRequest, RequestParams, ResponseResult, RpcRequest, RpcResponse,
+    Version,
 };
 use crate::{
     request::{
@@ -428,7 +429,6 @@ impl QUserRpcProvider for RpcProvider {
     }
 
     async fn deploy_contract<F: RichField>(&self, req: QDeployContractRPCRequest<F>) -> anyhow::Result<String> {
-        req.deploy_contract.validate_shape()?;
         let url = self.get_coordinator_url()?;
         let response = psy_rpc_call_back!(self, url, RequestParams::<F>::DeployContract(req), String);
         match response.result {
@@ -444,13 +444,12 @@ impl QUserRpcProvider for RpcProvider {
     }
 
     async fn update_contract<F: RichField>(&self, req: QUpdateContractRPCRequest<F>) -> anyhow::Result<String> {
-        req.update_contract.validate_shape()?;
         let url = self.get_coordinator_url()?;
         let response = psy_rpc_call_back!(self, url, RequestParams::<F>::UpdateContract(req), String);
         match response.result {
-            ResponseResult::Success(update_content_hash) => {
-                tracing::debug!("updated contract {}", update_content_hash);
-                Ok(update_content_hash)
+            ResponseResult::Success(update_uuid) => {
+                tracing::debug!("updated contract {}", update_uuid);
+                Ok(update_uuid)
             }
             ResponseResult::Error(e) => {
                 tracing::error!("RPC call failed: {:?}", e);

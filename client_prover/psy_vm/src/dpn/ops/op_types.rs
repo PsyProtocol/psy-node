@@ -107,6 +107,20 @@ pub enum DPNOpType {
     GetCallerContractId = 79,
     GetSessionProofTreeRoot = 80,
     Keccak256 = 81,
+
+    /// Read the number of entries in the authenticated transaction log.
+    GetTransactionCount = 82,
+    /// Read the current transaction-log commitment.
+    GetTransactionStackHash = 83,
+    /// Read a transaction-log entry by its transaction index.
+    GetTransactionContractId = 84,
+    GetTransactionMethodId = 85,
+    GetTransactionInputsHash = 86,
+    /// Read the calldata length of a transaction by transaction index.
+    GetTransactionInputLength = 87,
+    /// Read one Felt calldata word by transaction index and word index.
+    GetTransactionInputWord = 88,
+    GetTransactionCallerContractId = 89,
 }
 
 impl From<u16> for DPNOpType {
@@ -185,6 +199,14 @@ impl From<u16> for DPNOpType {
             79 => DPNOpType::GetCallerContractId,
             80 => DPNOpType::GetSessionProofTreeRoot,
             81 => DPNOpType::Keccak256,
+            82 => DPNOpType::GetTransactionCount,
+            83 => DPNOpType::GetTransactionStackHash,
+            84 => DPNOpType::GetTransactionContractId,
+            85 => DPNOpType::GetTransactionMethodId,
+            86 => DPNOpType::GetTransactionInputsHash,
+            87 => DPNOpType::GetTransactionInputLength,
+            88 => DPNOpType::GetTransactionInputWord,
+            89 => DPNOpType::GetTransactionCallerContractId,
             _ => panic!("Unknown DPNOpType: {}", value),
         }
     }
@@ -331,6 +353,14 @@ impl DPNOpType {
             DPNOpType::GetNonce => DPNBuiltInDataType::Target,
             DPNOpType::GetUserPublicKeyHash => DPNBuiltInDataType::HashOut,
             DPNOpType::GetSessionProofTreeRoot => DPNBuiltInDataType::HashOut,
+            DPNOpType::GetTransactionCount => DPNBuiltInDataType::Target,
+            DPNOpType::GetTransactionStackHash => DPNBuiltInDataType::HashOut,
+            DPNOpType::GetTransactionContractId => DPNBuiltInDataType::Target,
+            DPNOpType::GetTransactionMethodId => DPNBuiltInDataType::Target,
+            DPNOpType::GetTransactionInputsHash => DPNBuiltInDataType::HashOut,
+            DPNOpType::GetTransactionInputLength => DPNBuiltInDataType::Target,
+            DPNOpType::GetTransactionInputWord => DPNBuiltInDataType::Target,
+            DPNOpType::GetTransactionCallerContractId => DPNBuiltInDataType::Target,
             DPNOpType::GetStateQueryResult => DPNBuiltInDataType::HashOut,
             DPNOpType::GetStateQueryResultSingle => DPNBuiltInDataType::Target,
             DPNOpType::GetStateCommandResultHash => DPNBuiltInDataType::HashOut,
@@ -365,6 +395,8 @@ impl DPNOpType {
             DPNOpType::GetNonce => true,
             DPNOpType::GetUserPublicKeyHash => true,
             DPNOpType::GetSessionProofTreeRoot => true,
+            DPNOpType::GetTransactionCount => true,
+            DPNOpType::GetTransactionStackHash => true,
             _ => false,
         }
     }
@@ -381,6 +413,8 @@ impl DPNOpType {
             DPNOpType::GetNonce => false,
             DPNOpType::GetUserPublicKeyHash => false,
             DPNOpType::GetSessionProofTreeRoot => false,
+            DPNOpType::GetTransactionCount => false,
+            DPNOpType::GetTransactionStackHash => false,
             _ => true,
         }
     }
@@ -486,6 +520,14 @@ impl std::fmt::Display for DPNOpType {
             DPNOpType::Secp256k1Verify => "Secp256k1Verify",
             DPNOpType::HashTwoToOne => "HashTwoToOne",
             DPNOpType::Keccak256 => "Keccak256",
+            DPNOpType::GetTransactionCount => "GetTransactionCount",
+            DPNOpType::GetTransactionStackHash => "GetTransactionStackHash",
+            DPNOpType::GetTransactionContractId => "GetTransactionContractId",
+            DPNOpType::GetTransactionMethodId => "GetTransactionMethodId",
+            DPNOpType::GetTransactionInputsHash => "GetTransactionInputsHash",
+            DPNOpType::GetTransactionInputLength => "GetTransactionInputLength",
+            DPNOpType::GetTransactionInputWord => "GetTransactionInputWord",
+            DPNOpType::GetTransactionCallerContractId => "GetTransactionCallerContractId",
         };
         write!(f, "DPNOpType::{}", r)
     }

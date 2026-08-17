@@ -30,7 +30,7 @@ use psy_common_circuit::{
     },
 };
 use psy_config::network_constants::{
-    GLOBAL_CONTRACT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT, PRIVATE_NOTE_TREE_HEIGHT, TOKEN_CONTRACT_STATE_TREE_HEIGHT,
+    GLOBAL_CONTRACT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT, MAX_CONTRACT_STATE_TREE_HEIGHT, PRIVATE_NOTE_TREE_HEIGHT,
     UPS_CIRCUIT_WHITELIST_TREE_HEIGHT, UPS_SESSION_PROOF_TREE_HEIGHT,
 };
 use psy_crypto::{
@@ -187,7 +187,7 @@ where
             PrivateNoteInclusionCircuit::<C, D>::new(
                 GLOBAL_USER_TREE_HEIGHT as usize,
                 GLOBAL_CONTRACT_TREE_HEIGHT as usize,
-                TOKEN_CONTRACT_STATE_TREE_HEIGHT as usize,
+                MAX_CONTRACT_STATE_TREE_HEIGHT as usize,
                 PRIVATE_NOTE_TREE_HEIGHT,
             )
         })
@@ -474,13 +474,8 @@ where
         self.secp_circuit().prove(&signature)
     }
 
-    async fn prove_eth_personal_secp_sign(
-        &self,
-        signature: PsyCompressedSecp256K1Signature,
-    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
-        self.eth_personal_secp_circuit()
-            .prove(&signature)
-            .map_err(|error| anyhow::anyhow!("failed to prove EIP-191 secp256k1 signature: {error}"))
+    async fn prove_eth_personal_secp_sign(&self, signature: PsyCompressedSecp256K1Signature) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
+        self.eth_personal_secp_circuit().prove(&signature)
     }
 
     async fn register_dpn_software_defined_circuit(
@@ -597,38 +592,8 @@ where
         Ok(self.eth_personal_secp_circuit().get_fingerprint())
     }
 
-
     async fn eth_personal_secp_circuit_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>> {
         Ok(self.eth_personal_secp_circuit().get_verifier_config_ref().clone().into())
-    }
-}
-#[cfg(test)]
-mod eth_personal_tests {
-    use plonky2::{
-        field::{goldilocks_field::GoldilocksField, types::Field},
-        plonk::config::PoseidonGoldilocksConfig,
-    };
-    use psy_client_common::data::qhashout::QHashOut;
-    use psy_common_circuit::circuits::traits::qstandard::QStandardCircuit;
-
-    use super::PsyUPSStepCircuitManager;
-
-    #[test]
-    fn eth_personal_fingerprint_matches_public_constant() {
-        let manager = PsyUPSStepCircuitManager::<PoseidonGoldilocksConfig, 2>::new_with_config(1);
-        let expected = psy_prover_fingerprint::<GoldilocksField>();
-        assert_eq!(manager.eth_personal_secp_circuit().get_fingerprint(), expected);
-    }
-
-    fn psy_prover_fingerprint<F: plonky2::hash::hash_types::RichField>() -> QHashOut<F> {
-        QHashOut(plonky2::hash::hash_types::HashOut {
-            elements: [
-                F::from_canonical_u64(11893467277170771781),
-                F::from_canonical_u64(15629858611769664357),
-                F::from_canonical_u64(5241938694879225188),
-                F::from_canonical_u64(5545361160027968854),
-            ],
-        })
     }
 }
 

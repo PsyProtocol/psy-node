@@ -8,30 +8,30 @@ fn main() {
             if cargo_toml.exists() {
                 if let Ok(cargo_content) = fs::read_to_string(&cargo_toml) {
                     if cargo_content.contains("[workspace]") {
-                        let genesis_config = current_dir.join("psy-genesis").join("config.json");
-                        if genesis_config.exists() {
-                            return genesis_config;
-                        }
                         let root_config = current_dir.join("config.json");
                         if root_config.exists() {
                             return root_config;
                         }
-                        return genesis_config;
+                        let client_prover_config = current_dir.join("client_prover").join("config.json");
+                        if client_prover_config.exists() {
+                            return client_prover_config;
+                        }
+                        return root_config;
                     }
                 }
             }
             if let Some(parent) = current_dir.parent() {
                 current_dir = parent.to_path_buf();
             } else {
-                let local_genesis_config = Path::new("psy-genesis").join("config.json");
-                if local_genesis_config.exists() {
-                    return local_genesis_config;
-                }
                 let local_config = Path::new("config.json").to_path_buf();
                 if local_config.exists() {
                     return local_config;
                 }
-                return local_genesis_config;
+                let local_client_prover_config = Path::new("client_prover").join("config.json");
+                if local_client_prover_config.exists() {
+                    return local_client_prover_config;
+                }
+                return local_config;
             }
         }
     });
@@ -131,10 +131,14 @@ fn main() {
 
     let genesis_constants = String::new();
 
-    let precompile_constants = generate_precompile_constants_from_genesis_contracts().unwrap_or_default();
+    let genesis_contracts_path = config_path
+        .parent()
+        .expect("config path must have a parent directory")
+        .join("genesis_contracts.json");
+    println!("cargo:rerun-if-changed={}", genesis_contracts_path.display());
 
-    // Also re-generate config if the committed genesis contracts change.
-    println!("cargo:rerun-if-changed=../../../psy-genesis/genesis_contracts.json");
+    let precompile_constants =
+        generate_precompile_constants_from_genesis_contracts(&genesis_contracts_path).unwrap_or_default();
 
     let out_dir = env::var_os("OUT_DIR").unwrap();
     let dest_path = Path::new(&out_dir).join("generated_constants.rs");
@@ -203,21 +207,11 @@ pub const REALM_RPC_URLS: &[&str] = &{:?};
     fs::write(&json_path, serde_json::to_string_pretty(&json_constants).unwrap()).expect("Failed to write JSON constants");
 }
 
-fn generate_precompile_constants_from_genesis_contracts() -> Result<String, Box<dyn std::error::Error>> {
-    // CARGO_MANIFEST_DIR = client_prover/psy_core/psy_config
-    // Parent 1: client_prover/psy_core
-    // Parent 2: client_prover
-    // Parent 3: project root
-    let manifest_dir_str = env::var("CARGO_MANIFEST_DIR")?;
-    let contracts_path = Path::new(&manifest_dir_str)
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .map(|p| p.join("psy-genesis/genesis_contracts.json"))
-        .ok_or_else(|| "Cannot resolve psy-genesis/genesis_contracts.json path from manifest dir".to_string())?;
-
-    let contracts_bytes = fs::read(&contracts_path)
-        .map_err(|error| format!("Failed to read {}: {error}", contracts_path.display()))?;
+fn generate_precompile_constants_from_genesis_contracts(
+    contracts_path: &Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let contracts_bytes =
+        fs::read(contracts_path).unwrap_or_else(|_| panic!("Failed to read genesis_contracts.json at {}", contracts_path.display()));
     let contracts: Vec<serde_json::Value> = match serde_json::from_slice(&contracts_bytes) {
         Ok(v) => v,
         Err(_) => {
