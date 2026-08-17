@@ -1032,10 +1032,19 @@ mod tests {
         assert_eq!(calc_best_batch_size(127, &[256, 128, 64]), 64);
         assert_eq!(calc_best_batch_size(65, &[256, 128, 64]), 64);
         assert_eq!(calc_best_batch_size(64, &[256, 128, 64]), 64);
-        assert_eq!(calc_best_batch_size(63, &[256, 128, 64]), 32);
-        assert_eq!(calc_best_batch_size(33, &[256, 128, 64]), 32);
-        assert_eq!(calc_best_batch_size(32, &[256, 128, 64]), 32);
-        assert_eq!(calc_best_batch_size(31, &[256, 128, 64]), 32);
-        assert_eq!(calc_best_batch_size(1, &[256, 128, 64]), 32);
+        // Below the smallest configured batch there is nothing to choose, so
+        // the last entry is used and the batch is partially filled.  32 was
+        // never a candidate here; the old expectation could not be produced by
+        // any input.
+        assert_eq!(calc_best_batch_size(63, &[256, 128, 64]), 64);
+        assert_eq!(calc_best_batch_size(33, &[256, 128, 64]), 64);
+        assert_eq!(calc_best_batch_size(32, &[256, 128, 64]), 64);
+        assert_eq!(calc_best_batch_size(31, &[256, 128, 64]), 64);
+        assert_eq!(calc_best_batch_size(1, &[256, 128, 64]), 64);
+        // With 32 configured it is reachable, which is what the old
+        // expectations were presumably written against.
+        assert_eq!(calc_best_batch_size(63, &[256, 128, 64, 32]), 32);
+        assert_eq!(calc_best_batch_size(32, &[256, 128, 64, 32]), 32);
+        assert_eq!(calc_best_batch_size(1, &[256, 128, 64, 32]), 32);
     }
 }
