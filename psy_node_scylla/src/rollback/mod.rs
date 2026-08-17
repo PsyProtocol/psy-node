@@ -12,6 +12,7 @@
 //! the 586-line write core into a 21,399-line closure.  `tests/module_boundary.rs`
 //! asserts that this does not happen again.
 
+mod authority_timestamp_store;
 mod canonical_head_store;
 mod commit_planner_scylla;
 mod commit_source_store;
@@ -28,6 +29,7 @@ mod raw_access;
 mod rollback_floor_store;
 mod registry;
 
+pub use authority_timestamp_store::*;
 pub use canonical_head_store::*;
 pub use commit_planner_scylla::*;
 pub use commit_source_store::*;

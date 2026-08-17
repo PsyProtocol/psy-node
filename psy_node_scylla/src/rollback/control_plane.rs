@@ -21,14 +21,17 @@ use scylla::client::session::Session;
 use crate::core::ScyllaCoreStore;
 
 use super::{
-    CanonicalHeadNoTabletKeyspace, CommitSourceNoTabletKeyspace, CqlKeyspaceName,
+    AuthorityTimestampNoTabletKeyspace, CanonicalHeadNoTabletKeyspace,
+    CommitSourceNoTabletKeyspace, CqlKeyspaceName,
     ManifestArtifactNoTabletKeyspace, ManifestNoTabletKeyspace, RollbackFloorNoTabletKeyspace,
-    ScyllaAuthorityManifestStore, ScyllaCanonicalHeadStore, ScyllaCoordinatorCommitSourceStore,
-    ScyllaCoordinatorRollbackFloorStore, ScyllaManifestArtifactStore,
+    ScyllaAuthorityManifestStore, ScyllaAuthorityTimestampStore, ScyllaCanonicalHeadStore,
+    ScyllaCoordinatorCommitSourceStore, ScyllaCoordinatorRollbackFloorStore,
+    ScyllaManifestArtifactStore,
 };
 
 /// Every table this control plane owns, for inventory assertions.
 pub const COORDINATOR_ROLLBACK_CONTROL_TABLES: &[&str] = &[
+    super::AUTHORITY_COMMIT_TIMESTAMP_TABLE,
     super::COORDINATOR_CANONICAL_HEAD_TABLE,
     super::COORDINATOR_COMMIT_SOURCE_HEADER_TABLE,
     super::COORDINATOR_COMMIT_SOURCE_FRAGMENT_TABLE,
@@ -43,6 +46,7 @@ pub const COORDINATOR_ROLLBACK_CONTROL_TABLES: &[&str] = &[
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RollbackControlKeyspaces {
     state: CqlKeyspaceName,
+    authority_timestamp: AuthorityTimestampNoTabletKeyspace,
     canonical_head: CanonicalHeadNoTabletKeyspace,
     commit_source: CommitSourceNoTabletKeyspace,
     manifest: ManifestNoTabletKeyspace,
@@ -62,6 +66,7 @@ impl RollbackControlKeyspaces {
     pub fn try_new(state: &str, no_tablet: &str) -> anyhow::Result<Self> {
         Ok(Self {
             state: CqlKeyspaceName::try_new(state)?,
+            authority_timestamp: AuthorityTimestampNoTabletKeyspace::try_new(no_tablet)?,
             canonical_head: CanonicalHeadNoTabletKeyspace::try_new(no_tablet)?,
             commit_source: CommitSourceNoTabletKeyspace::try_new(no_tablet)?,
             manifest: ManifestNoTabletKeyspace::try_new(no_tablet)?,
@@ -77,6 +82,7 @@ impl RollbackControlKeyspaces {
 
 /// All rollback control stores for one Coordinator authority.
 pub struct CoordinatorRollbackControlPlane {
+    authority_timestamp: Arc<ScyllaAuthorityTimestampStore>,
     canonical_head: Arc<ScyllaCanonicalHeadStore>,
     commit_source: Arc<ScyllaCoordinatorCommitSourceStore>,
     manifest: Arc<ScyllaAuthorityManifestStore>,
@@ -93,6 +99,8 @@ impl CoordinatorRollbackControlPlane {
         session: &Session,
         keyspaces: &RollbackControlKeyspaces,
     ) -> anyhow::Result<()> {
+        ScyllaAuthorityTimestampStore::create_schema(session, &keyspaces.authority_timestamp)
+            .await?;
         ScyllaCanonicalHeadStore::create_schema(session, &keyspaces.canonical_head).await?;
         ScyllaCoordinatorCommitSourceStore::create_tables(session, &keyspaces.commit_source)
             .await?;
@@ -112,6 +120,13 @@ impl CoordinatorRollbackControlPlane {
         keyspaces: &RollbackControlKeyspaces,
     ) -> anyhow::Result<Self> {
         Ok(Self {
+            authority_timestamp: Arc::new(
+                ScyllaAuthorityTimestampStore::prepare(
+                    session.clone(),
+                    keyspaces.authority_timestamp.clone(),
+                )
+                .await?,
+            ),
             canonical_head: Arc::new(
                 ScyllaCanonicalHeadStore::prepare(
                     session.clone(),
@@ -173,6 +188,16 @@ impl CoordinatorRollbackControlPlane {
         )
     }
 
+    /// The commit timestamp allocator.
+    ///
+    /// design-r1 §3.1 wants one explicit timestamp per commit.  This half
+    /// allocates and persists it and changes no existing write; threading
+    /// `USING TIMESTAMP` through the table adapters is separate, because that is
+    /// the part that changes how a deployed node writes.
+    pub fn authority_timestamp(&self) -> &ScyllaAuthorityTimestampStore {
+        &self.authority_timestamp
+    }
+
     pub fn canonical_head(&self) -> &ScyllaCanonicalHeadStore {
         &self.canonical_head
     }
@@ -205,7 +230,7 @@ mod tests {
         let mut deduped = sorted.clone();
         deduped.dedup();
         assert_eq!(sorted, deduped, "a control table is listed twice");
-        assert_eq!(COORDINATOR_ROLLBACK_CONTROL_TABLES.len(), 8);
+        assert_eq!(COORDINATOR_ROLLBACK_CONTROL_TABLES.len(), 9);
     }
 
     #[test]
@@ -238,6 +263,7 @@ mod tests {
         assert_eq!(keyspaces.manifest_artifact.as_str(), "psy_no_tablet");
         assert_eq!(keyspaces.floor.as_str(), "psy_no_tablet");
         assert_eq!(keyspaces.canonical_head.as_str(), "psy_no_tablet");
+        assert_eq!(keyspaces.authority_timestamp.as_str(), "psy_no_tablet");
     }
 
     #[test]
