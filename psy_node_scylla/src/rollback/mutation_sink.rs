@@ -15,7 +15,7 @@ use std::sync::Mutex;
 
 use psy_node_core::store::typed::{
     CheckpointId, CheckpointLeafKey, CheckpointRootKey, ContractId, LatestInfoSlot, MerkleNode,
-    NodeIndex, TypedTableKey, UniquePendingId, UserId,
+    NodeIndex, PublicKeyHash, TypedTableKey, U64SingletonSlot, UniquePendingId, UserId,
 };
 
 use super::{
@@ -362,6 +362,62 @@ pub fn bidirectional_pair_keys(
     }
 }
 
+/// Length of one fast-serialized public-key-to-user pair: 32-byte hash then a
+/// little-endian user id.
+pub const PUBLIC_KEY_TO_USER_PAIR_LEN: usize = 32 + 8;
+
+/// Typed key for one `public_key_hash_to_user_ids_table` row.
+///
+/// The table is `DerivedBirth`: its rows can be rebuilt from the target
+/// `user_public_key_table`.  They are still recorded, because rollback has to
+/// delete precisely the birth rows the discarded branch added, and rebuilding
+/// cannot tell which those were.
+pub fn public_key_to_user_key(public_key_hash: Vec<u8>, user: u64) -> TypedTableKey {
+    TypedTableKey::PublicKeyToUser {
+        public_key_hash: PublicKeyHash::new(public_key_hash),
+        user: UserId::new(user),
+    }
+}
+
+/// Decode fast-serialized public-key pairs and record every row.
+///
+/// Returns the decoded pairs so the caller writes exactly what was recorded.
+pub fn plan_public_key_to_user_pairs(
+    data: &[u8],
+    sink: &dyn CommitMutationSink,
+) -> anyhow::Result<Vec<(Vec<u8>, u64)>> {
+    if data.len() % PUBLIC_KEY_TO_USER_PAIR_LEN != 0 {
+        anyhow::bail!(
+            "expected a multiple of {PUBLIC_KEY_TO_USER_PAIR_LEN} bytes, got {}",
+            data.len()
+        );
+    }
+    let mut pairs = Vec::with_capacity(data.len() / PUBLIC_KEY_TO_USER_PAIR_LEN);
+    for chunk in data.chunks(PUBLIC_KEY_TO_USER_PAIR_LEN) {
+        let hash = chunk[..32].to_vec();
+        let user = u64::from_le_bytes(chunk[32..40].try_into().expect("checked length"));
+        pairs.push((hash, user));
+    }
+    for (hash, user) in &pairs {
+        let resolved = describe_existing_key(&public_key_to_user_key(hash.clone(), *user));
+        sink.record(MutationLocatorRecord::try_new(
+            resolved.physical_table(),
+            RecordedOperation::Put,
+            resolved.locator_bytes().to_vec(),
+        )?);
+    }
+    Ok(pairs)
+}
+
+/// Typed key for the Coordinator's latest-checkpoint singleton.
+///
+/// A `RestoreSingleton` table: rollback restores its target value from the
+/// manifest head payload rather than deleting a version.  It still needs a
+/// locator so the manifest names the cell that was overwritten.
+pub fn u64_singleton_key() -> TypedTableKey {
+    TypedTableKey::U64Singleton(U64SingletonSlot::LatestCheckpoint)
+}
+
 /// Receives every physical row an adapter writes, in write order.
 ///
 /// Implementations must be cheap: this sits on the commit path, and a busy
@@ -516,6 +572,65 @@ pub fn record_bidirectional_pair_put(
     Ok(())
 }
 
+/// Why a physical table has, or does not have, a locator mapper.
+///
+/// Exhaustive on purpose.  A table that is simply missing from the mappers would
+/// have its writes go unrecorded, and rollback would leave those rows behind at
+/// a reused height.  Forcing every one of the 35 into a category means adding a
+/// table is a compile error until someone decides which it is.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum LocatorSupport {
+    /// A mapper exists and the family's writer records through it.
+    Recorded,
+    /// The axes are not yet modelled, so keying it generically would be wrong in
+    /// a way nothing downstream could detect (inventory §9 B2/B3).
+    BlockedOnAxisModelling,
+    /// Registry asserts no production reader or writer; a write here is a Gate
+    /// failure rather than something to record.
+    AssertedUnused,
+    /// Operational counter that never rolls back, so it has no locator.
+    OperationalOnly,
+    /// Belongs to slice B's Realm writers, not to a Coordinator commit.
+    RealmSliceB,
+}
+
+pub fn locator_support(physical: ScyllaPhysicalTableId) -> LocatorSupport {
+    use LocatorSupport::*;
+    use ScyllaPhysicalTableId as T;
+    match physical {
+        // Zero-id Merkle
+        T::GlobalUserTree | T::GlobalCheckpointTree | T::UserRegistrationTree
+        | T::GlobalContractTree => Recorded,
+        // Single-id Merkle
+        T::UserContractTree | T::ContractFunctionTree => Recorded,
+        // Versioned objects
+        T::UserLeaf | T::UserPublicKey | T::ContractStateTreeHeight | T::ContractLeaf
+        | T::ContractCodeDefinition => Recorded,
+        // Key-id-value
+        T::CheckpointLeaf | T::L2BlockState | T::CheckpointStateRoots
+        | T::CheckpointZkProofAndTransition | T::LatestInfo => Recorded,
+        // u64 mappings
+        T::CheckpointIdToPendingId | T::PendingIdToCheckpointId => Recorded,
+        // Bidirectional pairs
+        T::CheckpointRootToCheckpointIdK1 | T::CheckpointRootToCheckpointIdK2
+        | T::CheckpointLeafToCheckpointIdK1 | T::CheckpointLeafToCheckpointIdK2 => Recorded,
+        // Content-addressed projection
+        T::PublicKeyHashToUserIds => Recorded,
+        // Mixed axes, refused until modelled
+        T::CheckpointedObject | T::RealmRewardsTreeNodeKey => BlockedOnAxisModelling,
+        // Asserted unused by the registry
+        T::CheckpointIdToRealmRoot => AssertedUnused,
+        // Monotonic counter, never rolled back
+        T::U64CounterSingleton => OperationalOnly,
+        // Singleton restored from the manifest head payload rather than deleted
+        T::U64Singleton => Recorded,
+        // Realm-owned
+        T::ContractStateTree | T::GutaRewardTagTree | T::ImtLeaf | T::ImtKeyIndex
+        | T::ImtNextAppendIndex | T::PendingIdToPendingProcIdU64ToU128
+        | T::PendingIdToPendingProcIdU128ToU64 => RealmSliceB,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,6 +672,125 @@ mod tests {
             );
         }
         assert_eq!(locators.len(), 4);
+    }
+
+    #[test]
+    fn every_physical_table_has_a_decided_locator_status() {
+        // The closure assertion for the typed boundary.  `locator_support` is an
+        // exhaustive match, so a newly registered table will not compile until
+        // someone classifies it; this checks the counts have not drifted.
+        let mut counts = std::collections::BTreeMap::new();
+        for id in ScyllaPhysicalTableId::iter() {
+            *counts.entry(locator_support(id)).or_insert(0usize) += 1;
+        }
+        let total: usize = counts.values().sum();
+        assert_eq!(total, 35, "the physical inventory moved");
+        assert_eq!(counts[&LocatorSupport::Recorded], 24);
+        assert_eq!(counts[&LocatorSupport::BlockedOnAxisModelling], 2);
+        assert_eq!(counts[&LocatorSupport::AssertedUnused], 1);
+        assert_eq!(counts[&LocatorSupport::OperationalOnly], 1);
+        assert_eq!(counts[&LocatorSupport::RealmSliceB], 7);
+    }
+
+    #[test]
+    fn the_tables_a_mapper_can_produce_are_exactly_the_recorded_ones() {
+        // Compare in both directions rather than probing each id.  A table
+        // marked Recorded with no mapper behind it is the worst case: it looks
+        // covered and records nothing.  A mapper for a table not marked
+        // Recorded is the mirror mistake -- rows recorded that no policy
+        // accounts for.
+        let checkpoint = CheckpointId::try_new(12).unwrap();
+        let mut produced = std::collections::BTreeSet::new();
+        for id in ScyllaPhysicalTableId::iter() {
+            if let Ok(key) = zero_merkle_node_key(id, 0, 0, checkpoint) {
+                produced.insert(describe_existing_key(&key).physical_table());
+            }
+            if let Ok(key) = single_merkle_node_key(id, 0, 0, 0, checkpoint) {
+                produced.insert(describe_existing_key(&key).physical_table());
+            }
+            if let Ok(key) = versioned_object_key(id, 0, checkpoint) {
+                produced.insert(describe_existing_key(&key).physical_table());
+            }
+            if let Ok(key) = key_id_value_key(id, 1) {
+                produced.insert(describe_existing_key(&key).physical_table());
+            }
+            if let Ok(key) = u64_mapping_key(id, 1) {
+                produced.insert(describe_existing_key(&key).physical_table());
+            }
+            // Both halves of a pair come out of one call, which is the point.
+            if let Ok(keys) = bidirectional_pair_keys(id, vec![0u8; 32], 1) {
+                produced.insert(describe_existing_key(&keys.by_content).physical_table());
+                produced.insert(describe_existing_key(&keys.by_checkpoint).physical_table());
+            }
+        }
+        produced.insert(
+            describe_existing_key(&public_key_to_user_key(vec![0u8; 32], 1)).physical_table(),
+        );
+        produced.insert(describe_existing_key(&u64_singleton_key()).physical_table());
+
+        let recorded: std::collections::BTreeSet<_> = ScyllaPhysicalTableId::iter()
+            .filter(|id| locator_support(*id) == LocatorSupport::Recorded)
+            .collect();
+        let missing: Vec<_> = recorded.difference(&produced).collect();
+        assert!(
+            missing.is_empty(),
+            "marked Recorded but no mapper produces them: {missing:?}"
+        );
+        // An AssertedUnused table may be keyable: the registry claims nothing
+        // writes it, and having a locator means an unexpected write is recorded
+        // and therefore visible rather than silent.  The other three categories
+        // must not be keyable at all, since a generic key for them would be
+        // wrong in a way nothing downstream could detect.
+        let must_not_be_keyable: Vec<_> = produced
+            .iter()
+            .copied()
+            .filter(|id| {
+                matches!(
+                    locator_support(*id),
+                    LocatorSupport::BlockedOnAxisModelling
+                        | LocatorSupport::OperationalOnly
+                        | LocatorSupport::RealmSliceB
+                )
+            })
+            .collect();
+        assert!(
+            must_not_be_keyable.is_empty(),
+            "a mapper accepts tables whose axes are not modelled: {must_not_be_keyable:?}"
+        );
+    }
+
+    #[test]
+    fn public_key_pairs_are_recorded_per_row_and_stay_distinct() {
+        // One hash can map to several users, and one user can appear under
+        // several hashes, so both halves have to reach the locator.
+        let mut data = Vec::new();
+        for (hash_byte, user) in [(1u8, 10u64), (1, 11), (2, 10)] {
+            data.extend_from_slice(&[hash_byte; 32]);
+            data.extend_from_slice(&user.to_le_bytes());
+        }
+        let sink = CollectingMutationSink::new();
+        let pairs = plan_public_key_to_user_pairs(&data, &sink).unwrap();
+        assert_eq!(pairs.len(), 3);
+        let records = sink.take();
+        assert_eq!(records.len(), pairs.len());
+        let locators: std::collections::BTreeSet<_> = records
+            .iter()
+            .map(|record| record.locator_bytes().to_vec())
+            .collect();
+        assert_eq!(locators.len(), 3, "a pair collided with another");
+        for record in &records {
+            assert_eq!(
+                record.physical_table(),
+                ScyllaPhysicalTableId::PublicKeyHashToUserIds
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_public_key_buffer_records_nothing() {
+        let sink = CollectingMutationSink::new();
+        assert!(plan_public_key_to_user_pairs(&[0u8; 39], &sink).is_err());
+        assert!(sink.is_empty());
     }
 
     #[test]
