@@ -20,6 +20,10 @@ use scylla::{
 
 use crate::table_creator::create_table_if_not_exists;
 use crate::utils::{calc_best_batch_size, generate_batch_prepared_statement};
+use psy_node_core::store::typed::CheckpointId;
+use crate::rollback::{
+    CommitMutationSink, ScyllaPhysicalTableId, physical_table_by_name, record_single_merkle_put,
+};
 use crate::{
     tables::traits::ScyllaStandardPreparedTableStatements,
     utils::{convert_checkpoint_id_to_i64, u64_to_i64_exact, u8_to_i8_exact},
@@ -39,9 +43,87 @@ pub struct ScyllaMerkleNodesPreparedStatements {
     pub keyspace: String,
     pub table_name: String,
     pub table_key: QDatabaseTableRoutingKey,
+    /// Which of the two single-id Merkle tables this adapter serves.
+    ///
+    /// Required, not optional: a single-id table missing from the typed registry
+    /// would have its writes go unrecorded, and rollback would not know they
+    /// happened.  Startup is the only place that failure is visible.
+    pub physical_table: ScyllaPhysicalTableId,
+}
+
+/// Decode a fast-serialized single-id node set and hand every row to `sink`.
+///
+/// Same contract as the zero-id writer: design-r1 §3 needs the mutation set
+/// before any hot write, so decoding is separate from execution and the blob is
+/// parsed once.
+pub fn plan_single_merkle_nodes<Hash: QHash256Base>(
+    physical_table: ScyllaPhysicalTableId,
+    checkpoint_id: u64,
+    data: &[u8],
+    sink: &dyn CommitMutationSink,
+) -> anyhow::Result<SingleMerkleWritePlan> {
+    let checkpoint_i64 = convert_checkpoint_id_to_i64(checkpoint_id);
+    if data.len() % QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE != 0 {
+        anyhow::bail!("Data length is not a multiple of single id node size");
+    }
+    let values: Vec<(i64, i8, i64, i64, [u8; 32])> = data
+        .par_chunks(QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE)
+        .map(|slice| {
+            QMerkleStoreFastSingleNodeSerializer::deserialize_single_id_node_signed_insert_tuple::<Hash>(
+                slice,
+                checkpoint_i64,
+            )
+        })
+        .collect();
+    let checkpoint = CheckpointId::try_new(checkpoint_id)?;
+    for (tree_id, level, node_index, _, _) in &values {
+        record_single_merkle_put(
+            sink,
+            physical_table,
+            u64::try_from(*tree_id)?,
+            u8::try_from(*level)?,
+            u64::try_from(*node_index)?,
+            checkpoint,
+        )?;
+    }
+    Ok(SingleMerkleWritePlan { values })
+}
+
+/// A decoded single-id Merkle node set, recorded and ready to write.
+pub struct SingleMerkleWritePlan {
+    values: Vec<(i64, i8, i64, i64, [u8; 32])>,
+}
+
+impl SingleMerkleWritePlan {
+    /// How many physical rows this plan will write.
+    pub fn row_count(&self) -> usize {
+        self.values.len()
+    }
 }
 
 impl ScyllaMerkleNodesPreparedStatements {
+    pub fn plan_single_id_merkle_nodes_fast_serialize<Hash: QHash256Base>(
+        &self,
+        checkpoint_id: u64,
+        data: &[u8],
+        sink: &dyn CommitMutationSink,
+    ) -> anyhow::Result<SingleMerkleWritePlan> {
+        plan_single_merkle_nodes::<Hash>(self.physical_table, checkpoint_id, data, sink)
+    }
+
+    pub async fn execute_single_id_merkle_write_plan(
+        &self,
+        session: &Session,
+        plan: SingleMerkleWritePlan,
+    ) -> anyhow::Result<()> {
+        if plan.values.is_empty() {
+            return Ok(());
+        }
+        let batch_size = calc_best_batch_size(plan.values.len(), &[256, 128, 64]);
+        self.execute_single_id_merkle_values(session, &plan.values, batch_size)
+            .await
+    }
+
     pub async fn new_from_session(
         session: Arc<Session>,
         keyspace: &str,
@@ -70,6 +152,12 @@ impl ScyllaMerkleNodesPreparedStatements {
             keyspace: keyspace.to_string(),
             table_name: table_name.to_string(),
             table_key,
+            physical_table: physical_table_by_name(table_name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "single-id Merkle table {table_name:?} is not in the typed registry, so its \
+                     writes could not be recorded for rollback"
+                )
+            })?,
         })
     }
     pub async fn create_table(session: Arc<Session>, keyspace: &str, table_name: &str, _table_key: QDatabaseTableRoutingKey) -> anyhow::Result<()> {
@@ -276,9 +364,6 @@ impl ScyllaMerkleNodesPreparedStatements {
             return Ok(());
         }
 
-        const CONCURRENCY_LIMIT: usize = 64; // Tuned for typical Scylla clusters
-
-
         // Parallel deserialization using rayon
         let values: Vec<(i64, i8, i64, i64, [u8; 32])> = data
             .par_chunks(QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE)
@@ -286,6 +371,24 @@ impl ScyllaMerkleNodesPreparedStatements {
                 QMerkleStoreFastSingleNodeSerializer::deserialize_single_id_node_signed_insert_tuple::<Hash>(slice, checkpoint_i64)
             })
             .collect();
+        self.execute_single_id_merkle_values(session, &values, batch_size).await
+    }
+
+    /// Issue the batched inserts for an already decoded node set.
+    ///
+    /// Shared by the recording path and the plain one, so both write through the
+    /// same statements.
+    async fn execute_single_id_merkle_values(
+        &self,
+        session: &Session,
+        values: &[(i64, i8, i64, i64, [u8; 32])],
+        batch_size: usize,
+    ) -> anyhow::Result<()> {
+        if values.is_empty() {
+            return Ok(());
+        }
+
+        const CONCURRENCY_LIMIT: usize = 64; // Tuned for typical Scylla clusters
 
         // Map batch size to pre-prepared batch
         let batch_prepared = match batch_size {
@@ -338,5 +441,109 @@ impl ScyllaMerkleNodesPreparedStatements {
         let batch_size = calc_best_batch_size(num_nodes, &[256, 128, 64]);
         self.set_single_id_merkle_nodes_batch_fast_serialize_with_batch_size_internal::<Hash>(session, checkpoint_id, data, batch_size).await
 
+    }
+}
+#[cfg(test)]
+mod recording_tests {
+    use super::*;
+    use crate::rollback::{
+        CollectingMutationSink, RecordedOperation, describe_existing_key, single_merkle_node_key,
+    };
+    use parth_core::PHash;
+
+    /// 49 bytes per node: little-endian tree id, level, little-endian index,
+    /// 32-byte value.
+    fn blob(nodes: &[(u64, u8, u64)]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(nodes.len() * QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE);
+        for (tree_id, level, index) in nodes {
+            out.extend_from_slice(&tree_id.to_le_bytes());
+            out.push(*level);
+            out.extend_from_slice(&index.to_le_bytes());
+            out.extend_from_slice(&[3u8; 32]);
+        }
+        out
+    }
+
+    #[test]
+    fn every_row_that_will_be_written_is_recorded_exactly_once() {
+        let nodes = [(1u64, 0u8, 0u64), (1, 1, 0), (2, 0, 5), (2, 3, 1)];
+        let sink = CollectingMutationSink::new();
+        let plan = plan_single_merkle_nodes::<PHash>(
+            ScyllaPhysicalTableId::ContractFunctionTree,
+            77,
+            &blob(&nodes),
+            &sink,
+        )
+        .unwrap();
+        assert_eq!(plan.row_count(), nodes.len());
+        let records = sink.take();
+        assert_eq!(records.len(), plan.row_count());
+        let checkpoint = CheckpointId::try_new(77).unwrap();
+        for (record, (tree_id, level, index)) in records.iter().zip(nodes) {
+            assert_eq!(record.operation(), RecordedOperation::Put);
+            let expected = describe_existing_key(
+                &single_merkle_node_key(
+                    ScyllaPhysicalTableId::ContractFunctionTree,
+                    tree_id,
+                    level,
+                    index,
+                    checkpoint,
+                )
+                .unwrap(),
+            );
+            assert_eq!(record.locator_bytes(), expected.locator_bytes());
+        }
+    }
+
+    #[test]
+    fn nodes_from_different_subtrees_never_share_a_locator() {
+        // One blob can carry nodes of many trees, so the tree id has to reach
+        // the locator or a rollback would collapse two subtrees into one.
+        let nodes = [(1u64, 0u8, 0u64), (2, 0, 0), (3, 0, 0)];
+        let sink = CollectingMutationSink::new();
+        plan_single_merkle_nodes::<PHash>(
+            ScyllaPhysicalTableId::UserContractTree,
+            9,
+            &blob(&nodes),
+            &sink,
+        )
+        .unwrap();
+        let locators: std::collections::BTreeSet<_> = sink
+            .take()
+            .into_iter()
+            .map(|record| record.locator_bytes().to_vec())
+            .collect();
+        assert_eq!(locators.len(), nodes.len());
+    }
+
+    #[test]
+    fn a_malformed_blob_is_refused_before_anything_is_recorded() {
+        let sink = CollectingMutationSink::new();
+        let mut truncated = blob(&[(1, 0, 0)]);
+        truncated.pop();
+        assert!(
+            plan_single_merkle_nodes::<PHash>(
+                ScyllaPhysicalTableId::UserContractTree,
+                1,
+                &truncated,
+                &sink,
+            )
+            .is_err()
+        );
+        assert!(sink.is_empty());
+    }
+
+    #[test]
+    fn a_table_outside_the_single_id_family_is_refused() {
+        let sink = CollectingMutationSink::new();
+        assert!(
+            plan_single_merkle_nodes::<PHash>(
+                ScyllaPhysicalTableId::GlobalUserTree,
+                1,
+                &blob(&[(1, 0, 0)]),
+                &sink,
+            )
+            .is_err()
+        );
     }
 }

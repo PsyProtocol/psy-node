@@ -13,7 +13,9 @@
 
 use std::sync::Mutex;
 
-use psy_node_core::store::typed::{CheckpointId, MerkleNode, NodeIndex, TypedTableKey};
+use psy_node_core::store::typed::{
+    CheckpointId, ContractId, MerkleNode, NodeIndex, TypedTableKey, UserId,
+};
 
 use super::{
     MutationLocatorRecord, RecordedOperation, ScyllaPhysicalTableId, describe_existing_key,
@@ -73,6 +75,51 @@ pub fn zero_merkle_node_key(
             Ok(TypedTableKey::GlobalContractMerkle { node, checkpoint })
         }
         other => Err(UnsupportedZeroMerkleTable(other)),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UnsupportedSingleMerkleTable(pub ScyllaPhysicalTableId);
+
+impl std::fmt::Display for UnsupportedSingleMerkleTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:?} is not a single-id Merkle table and has no node key",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedSingleMerkleTable {}
+
+/// Typed key for one node of a single-id Merkle table.
+///
+/// The partition id means different things per table -- a user for
+/// `user_contract_tree`, a contract for `contract_function_tree` -- so it is
+/// interpreted by physical table rather than carried as a bare number.
+pub fn single_merkle_node_key(
+    physical: ScyllaPhysicalTableId,
+    tree_id: u64,
+    level: u8,
+    node_index: u64,
+    checkpoint: CheckpointId,
+) -> Result<TypedTableKey, UnsupportedSingleMerkleTable> {
+    let node = MerkleNode::new(level, NodeIndex::new(node_index));
+    match physical {
+        ScyllaPhysicalTableId::UserContractTree => Ok(TypedTableKey::UserContractMerkle {
+            user: UserId::new(tree_id),
+            node,
+            checkpoint,
+        }),
+        ScyllaPhysicalTableId::ContractFunctionTree => {
+            Ok(TypedTableKey::ContractFunctionMerkle {
+                contract: ContractId::new(tree_id),
+                node,
+                checkpoint,
+            })
+        }
+        other => Err(UnsupportedSingleMerkleTable(other)),
     }
 }
 
@@ -139,6 +186,25 @@ pub fn record_zero_merkle_put(
     Ok(())
 }
 
+/// Record a put of one single-id Merkle node.
+pub fn record_single_merkle_put(
+    sink: &dyn CommitMutationSink,
+    physical: ScyllaPhysicalTableId,
+    tree_id: u64,
+    level: u8,
+    node_index: u64,
+    checkpoint: CheckpointId,
+) -> anyhow::Result<()> {
+    let key = single_merkle_node_key(physical, tree_id, level, node_index, checkpoint)?;
+    let resolved = describe_existing_key(&key);
+    sink.record(MutationLocatorRecord::try_new(
+        resolved.physical_table(),
+        RecordedOperation::Put,
+        resolved.locator_bytes().to_vec(),
+    )?);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,6 +246,80 @@ mod tests {
             );
         }
         assert_eq!(locators.len(), 4);
+    }
+
+    #[test]
+    fn each_single_merkle_table_reads_its_partition_id_differently() {
+        // user_contract_tree partitions by user, contract_function_tree by
+        // contract.  The same numeric id must therefore produce different
+        // locators, or a rollback would delete a user subtree while thinking it
+        // was deleting a contract's.
+        let checkpoint = CheckpointId::try_new(6).unwrap();
+        let user_tree = describe_existing_key(
+            &single_merkle_node_key(
+                ScyllaPhysicalTableId::UserContractTree,
+                12,
+                1,
+                2,
+                checkpoint,
+            )
+            .unwrap(),
+        );
+        let contract_tree = describe_existing_key(
+            &single_merkle_node_key(
+                ScyllaPhysicalTableId::ContractFunctionTree,
+                12,
+                1,
+                2,
+                checkpoint,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            user_tree.physical_table(),
+            ScyllaPhysicalTableId::UserContractTree
+        );
+        assert_eq!(
+            contract_tree.physical_table(),
+            ScyllaPhysicalTableId::ContractFunctionTree
+        );
+        assert_ne!(user_tree.locator_bytes(), contract_tree.locator_bytes());
+    }
+
+    #[test]
+    fn the_single_merkle_tree_id_is_part_of_the_locator() {
+        let checkpoint = CheckpointId::try_new(6).unwrap();
+        let locator = |tree_id: u64| {
+            describe_existing_key(
+                &single_merkle_node_key(
+                    ScyllaPhysicalTableId::UserContractTree,
+                    tree_id,
+                    1,
+                    2,
+                    checkpoint,
+                )
+                .unwrap(),
+            )
+            .locator_bytes()
+            .to_vec()
+        };
+        assert_ne!(locator(1), locator(2));
+    }
+
+    #[test]
+    fn a_non_single_merkle_table_is_refused_rather_than_guessed() {
+        assert_eq!(
+            single_merkle_node_key(
+                ScyllaPhysicalTableId::GlobalUserTree,
+                0,
+                0,
+                0,
+                CheckpointId::try_new(1).unwrap()
+            ),
+            Err(UnsupportedSingleMerkleTable(
+                ScyllaPhysicalTableId::GlobalUserTree
+            ))
+        );
     }
 
     #[test]
