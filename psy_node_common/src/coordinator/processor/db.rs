@@ -929,6 +929,8 @@ checkpoint_backup_copy_status={}
         &mut self,
         coordinator_update: &PsyPreparedCoordinatorBlockStateUpdates<N::F, N::QHash>,
         checkpoint_proof_public_inputs_hash: N::QHash,
+        state_transition_circuit_type: ProvingJobCircuitType,
+        zk_proof: &[u8],
     ) -> anyhow::Result<PreparedCommitRecording<N::QHash>> {
         let checkpoint_id = coordinator_update.checkpoint_id;
         let key = AuthorityTimestampKey::new(self.network_id, AuthorityScope::Coordinator);
@@ -941,27 +943,23 @@ checkpoint_backup_copy_status={}
         let candidate_hash =
             CheckpointHash::from_proof_public_inputs_hash(checkpoint_proof_public_inputs_hash);
 
-        // An epoch only advances through a rollback, so a missing head means this
-        // authority has not recorded before and epoch 0 is correct.  It cannot
-        // mean "after a rollback": a rollback writes the head.
-        let chain_epoch = match self
+        // The stored head, not just its reference: the commit source binds the
+        // exact revision it advances from, so a retry cannot be mistaken for a
+        // fork.  An epoch only advances through a rollback, and a rollback writes
+        // the head, so a missing head cannot mean "after a rollback".
+        let expected_head = match self
             .recording
             .canonical_head()
             .read_canonical_head(self.network_id)
             .await?
         {
-            CanonicalHeadReadState::Current(head) => head.canonical_ref().chain_epoch(),
-            CanonicalHeadReadState::Uninitialized => ChainEpoch::new(0),
-        };
-
-        let expected_chain = CanonicalChainRef::new(
-            self.network_id,
-            chain_epoch,
-            CheckpointRef::new(
-                CheckpointId::new(self.ids.checkpoint_id),
-                CheckpointHash::from_last_chain_hash(self.last_committed.last_chain_hash),
+            CanonicalHeadReadState::Current(head) => head,
+            CanonicalHeadReadState::Uninitialized => anyhow::bail!(
+                "the canonical head is missing at checkpoint {checkpoint_id}; genesis must \
+                 bootstrap it before any recorded commit"
             ),
-        );
+        };
+        let chain_epoch = expected_head.canonical_ref().chain_epoch();
         let candidate_chain = CanonicalChainRef::new(
             self.network_id,
             chain_epoch,
@@ -1011,15 +1009,26 @@ checkpoint_backup_copy_status={}
                 .map_err(|_| anyhow::anyhow!("wall clock is outside CQL timestamp range"))?,
         )?;
 
+        // bincode rather than the pio codec: the pio impls this type gets from
+        // `serialize_clone_f_hash_ts` need bounds on `F` and `Hash` that the
+        // processor's `N` does not declare, and adding them here would cascade
+        // through every caller of `commit_state`.  What the commit source needs
+        // is a deterministic encoding it can hand back byte-identically, and
+        // bincode over the derived `Serialize` gives that.
+        let prepared_update_bytes = bincode::serialize(coordinator_update)?;
+
         prepare_commit_recording(
             &self.recording,
             key,
             &inputs,
-            expected_chain,
+            expected_head,
             candidate_chain,
             state_transition,
             AuthorityHeadPayload::try_new(Self::commit_head_payload_bytes(coordinator_update)?)?,
             clock_sample,
+            prepared_update_bytes,
+            state_transition_circuit_type as u32,
+            zk_proof.to_vec(),
             // An existing chain adopting the recording scheme; this bootstrap is
             // where the rollback floor lands (design-r1 §13 Q1).
             AuthorityTimestampBootstrapReason::ControlledWriterCutover,
@@ -1149,6 +1158,15 @@ checkpoint_backup_copy_status={}
         };
         let committed = sealed.mark_committed(receipt)?;
         self.recording.manifest().append_committed(&committed).await?;
+
+        // The COMMITTED marker binds this exact source object.  It is written
+        // only after the whole source reads back, so a marker can never outlive
+        // the source it names, and a source without a marker stays a crash
+        // remnant rather than becoming history (design-r1 §2.2, §9).
+        self.recording
+            .commit_source()
+            .mark_coordinator_commit_source_committed(prepared.source())
+            .await?;
 
         // Release the lease so the next commit can reserve.
         let state = match self
@@ -1319,6 +1337,9 @@ checkpoint_backup_copy_status={}
             verifiable_checkpoint_transition.state_transition.checkpoint_transition.old_checkpoint_leaf_hash = verifiable_checkpoint_transition.state_transition.checkpoint_transition.new_checkpoint_leaf_hash;
         }
 
+        // The commit source keeps the proof bytes, and the transition below takes
+        // ownership of them, so capture them first.
+        let recorded_proof_bytes = zk_proof.clone();
         let verifiable_checkpoint_transition_with_proof = PsyVerifiableCheckpointTransitionWithProof {
             info: verifiable_checkpoint_transition,
             circuit_type: state_transition_circuit_type as u32,
@@ -1345,6 +1366,8 @@ checkpoint_backup_copy_status={}
                 self.record_commit_prepared(
                     &coordinator_update,
                     checkpoint_proof_public_inputs_hash,
+                    state_transition_circuit_type,
+                    &recorded_proof_bytes,
                 )
                 .await?,
             )

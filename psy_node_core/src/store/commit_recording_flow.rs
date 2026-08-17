@@ -20,7 +20,9 @@ use super::{
         AuthorityTimestampBootstrapReason, AuthorityTimestampLease, AuthorityTimestampReadState,
         AuthorityTimestampWriteOutcome,
     },
+    canonical_head::StoredCanonicalHead,
     commit_planner::{CollectingPhysicalMutationSink, CoordinatorCommitPlanInputs},
+    coordinator_commit_source::{CoordinatorCommitSource, CoordinatorCommitSourcePayload},
     manifest_intent::{
         AuthorityHeadPayload, AuthorityStateTransition, ManifestArtifactSetCommitment,
         SealedAuthorityCommitIntent,
@@ -37,6 +39,7 @@ use super::{
 pub struct PreparedCommitRecording<Hash: Q256BitHash> {
     record: PreparedAuthorityManifestRecord<Hash>,
     lease: AuthorityTimestampLease,
+    source: CoordinatorCommitSource<Hash>,
 }
 
 impl<Hash: Q256BitHash> PreparedCommitRecording<Hash> {
@@ -50,6 +53,13 @@ impl<Hash: Q256BitHash> PreparedCommitRecording<Hash> {
 
     pub const fn identity(&self) -> &AuthorityManifestIdentity<Hash> {
         self.record.identity()
+    }
+
+    /// The durable input to this commit.  The rollback planner needs it as well
+    /// as the manifest: a checkpoint whose source is missing returns
+    /// `NOT_FEASIBLE`, because there is nothing to archive against.
+    pub const fn source(&self) -> &CoordinatorCommitSource<Hash> {
+        &self.source
     }
 }
 
@@ -102,11 +112,19 @@ pub async fn prepare_commit_recording<Hash: Q256BitHash>(
     recording: &CoordinatorCommitRecording<Hash>,
     key: AuthorityTimestampKey,
     inputs: &CoordinatorCommitPlanInputs<'_>,
-    expected_chain: CanonicalChainRef<Hash>,
+    // The stored head, not just its reference: the commit source binds the exact
+    // revision it advances from, so a retry cannot be mistaken for a fork.
+    expected_head: StoredCanonicalHead<Hash>,
     candidate_chain: CanonicalChainRef<Hash>,
     state_transition: AuthorityStateTransition<Hash>,
     head_payload: AuthorityHeadPayload,
     clock_sample: AuthorityClockSampleUs,
+    // Canonical prepared update, the circuit type and the proof: the exact input
+    // this commit was produced from.  Archiving a discarded suffix needs it, so a
+    // manifest without it is not enough (design-r1 §2.2).
+    prepared_update_bytes: Vec<u8>,
+    state_transition_circuit_type: u32,
+    zk_proof: Vec<u8>,
     // How this authority's allocator row came to exist, if it has to be created
     // now.  GenesisNative only for a chain that starts under the recording
     // scheme; an existing chain adopting it is ControlledWriterCutover, which is
@@ -138,14 +156,28 @@ pub async fn prepare_commit_recording<Hash: Q256BitHash>(
     )?;
     let intent = SealedAuthorityCommitIntent::seal_normal_advance(
         key,
-        expected_chain,
+        *expected_head.canonical_ref(),
         candidate_chain,
         state_transition,
         head_payload,
         artifacts,
     )?;
 
-    // 3. Take the lease.  It binds the intent digest, so it cannot be reused for
+    // 3. Establish the rollback floor before taking the lease.
+    //
+    //    The floor is the lower bound of feasible rollback in this epoch, and it
+    //    has to exist before the first commit is recorded: below it there are no
+    //    manifests, so a planner asked to roll back there must return
+    //    NOT_FEASIBLE rather than guess.  It is idempotent -- an existing row for
+    //    this branch wins -- and it carries the singleton anchor with it, which
+    //    can only be observed while the head still stands where the floor was
+    //    activated (design-r1 §13 Q1).
+    recording
+        .floor()
+        .ensure_coordinator_rollback_floor(&expected_head)
+        .await?;
+
+    // 4. Take the lease.  It binds the intent digest, so it cannot be reused for
     //    a different commit, and it fails closed if another writer holds it.
     let state =
         read_or_bootstrap_timestamp_state(recording, key, clock_sample, bootstrap_reason).await?;
@@ -166,7 +198,7 @@ pub async fn prepare_commit_recording<Hash: Q256BitHash>(
         }
     }
 
-    // 4. Seal the PREPARED record against the exact summary the intent committed
+    // 5. Seal the PREPARED record against the exact summary the intent committed
     //    to, then make the chunks durable before the row that names them.
     let prepared_intent = intent.attach_timestamp_lease(reservation.lease())?;
     let record = PreparedAuthorityManifestRecord::seal(
@@ -183,9 +215,29 @@ pub async fn prepare_commit_recording<Hash: Q256BitHash>(
         .await?;
     recording.manifest().append_prepared(&record).await?;
 
+    // 6. Persist the commit source.  It goes after the manifest rather than
+    //    before because the manifest is what a restart classifies on, and a
+    //    source with no manifest naming it would read as history.  Both are on
+    //    disk before any state write either way.
+    let payload = CoordinatorCommitSourcePayload::try_new(
+        prepared_update_bytes,
+        state_transition_circuit_type,
+        zk_proof,
+    )?;
+    let source = CoordinatorCommitSource::try_new(
+        expected_head,
+        candidate_chain,
+        payload.encode_canonical(),
+    )?;
+    recording
+        .commit_source()
+        .persist_coordinator_commit_source(&source)
+        .await?;
+
     Ok(PreparedCommitRecording {
         record,
         lease: reservation.lease(),
+        source,
     })
 }
 
