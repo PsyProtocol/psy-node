@@ -13,6 +13,11 @@ use parth_core::{
     protocol::core_types::{QDBHashBase, QHash256Base, QHashBase},
 };
 use psy_node_core::store::traits::core_db::MerkleTreeDumpStrategy;
+use psy_node_core::store::typed::CheckpointId;
+
+use crate::rollback::{
+    CommitMutationSink, ScyllaPhysicalTableId, physical_table_by_name, record_zero_merkle_put,
+};
 use rayon::{iter::ParallelIterator, slice::ParallelSlice};
 use scylla::{
     client::session::Session,
@@ -23,6 +28,59 @@ use scylla::{
 use crate::{table_creator::create_table_if_not_exists, utils::{
     calc_best_batch_size, convert_checkpoint_id_to_i64, generate_batch_prepared_statement, i64_to_u64_exact, u8_to_i8_exact, u64_to_i64_exact
 }};
+
+/// Decode a fast-serialized zero-id node set and hand every row to `sink`.
+///
+/// A free function rather than a method: it needs only the physical table
+/// identity, and keeping it session-free means the property that matters -- one
+/// locator recorded per row that will be written -- is testable directly.
+pub fn plan_zero_merkle_nodes<Hash: QHash256Base>(
+    physical_table: ScyllaPhysicalTableId,
+    checkpoint_id: u64,
+    data: &[u8],
+    sink: &dyn CommitMutationSink,
+) -> anyhow::Result<ZeroMerkleWritePlan> {
+    let checkpoint_i64 = convert_checkpoint_id_to_i64(checkpoint_id);
+    if data.len() % QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE != 0 {
+        anyhow::bail!("Data length is not a multiple of zero id node size");
+    }
+    let values: Vec<(i8, i64, i64, [u8; 32])> = data
+        .par_chunks(QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE)
+        .map(|slice| {
+            QMerkleStoreFastZeroNodeSerializer::deserialize_zero_id_node_signed_insert_tuple::<Hash>(
+                slice,
+                checkpoint_i64,
+            )
+        })
+        .collect();
+    let checkpoint = CheckpointId::try_new(checkpoint_id)?;
+    for (level, node_index, _, _) in &values {
+        record_zero_merkle_put(
+            sink,
+            physical_table,
+            u8::try_from(*level)?,
+            u64::try_from(*node_index)?,
+            checkpoint,
+        )?;
+    }
+    Ok(ZeroMerkleWritePlan { values })
+}
+
+/// A decoded zero-id Merkle node set, recorded and ready to write.
+///
+/// Carrying the decoded rows forward means the fast-serialized blob is parsed
+/// once even though planning and execution are separate steps.
+pub struct ZeroMerkleWritePlan {
+    values: Vec<(i8, i64, i64, [u8; 32])>,
+}
+
+impl ZeroMerkleWritePlan {
+    /// How many physical rows this plan will write.  Equal to the number of
+    /// locators handed to the sink, which a caller can assert.
+    pub fn row_count(&self) -> usize {
+        self.values.len()
+    }
+}
 
 #[derive(Clone)]
 pub struct ScyllaMerkleNodesZeroPreparedStatements {
@@ -42,6 +100,13 @@ pub struct ScyllaMerkleNodesZeroPreparedStatements {
     pub table_name: String,
     pub table_key: QDatabaseTableRoutingKey,
     pub tree_height: u8,
+    /// Which of the four zero-id Merkle tables this adapter serves.
+    ///
+    /// Resolved once at construction and required, not optional: registering a
+    /// new zero-id table without adding it to the typed registry would
+    /// otherwise leave its writes unrecorded, and rollback would not know they
+    /// happened.  Failing at startup is the only place that is visible.
+    pub physical_table: ScyllaPhysicalTableId,
 }
 
 impl ScyllaMerkleNodesZeroPreparedStatements {
@@ -86,6 +151,12 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
             table_name: table_name.to_string(),
             table_key,
             tree_height,
+            physical_table: physical_table_by_name(table_name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "zero-id Merkle table {table_name:?} is not in the typed registry, so its \
+                     writes could not be recorded for rollback"
+                )
+            })?,
         })
     }
 
@@ -385,13 +456,29 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
             return Ok(());
         }
 
-        const CONCURRENCY_LIMIT: usize = 64; // Tuned for typical Scylla clusters
-
         // Parallel deserialization using rayon
         let values: Vec<(i8, i64, i64, [u8; 32])> = data
             .par_chunks(QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE)
             .map(|slice| QMerkleStoreFastZeroNodeSerializer::deserialize_zero_id_node_signed_insert_tuple::<Hash>(slice, checkpoint_i64))
             .collect();
+        self.execute_zero_id_merkle_values(session, &values, batch_size).await
+    }
+
+    /// Issue the batched inserts for an already decoded node set.
+    ///
+    /// Shared by the recording path and the plain one, so both write through
+    /// exactly the same statements.
+    async fn execute_zero_id_merkle_values(
+        &self,
+        session: &Session,
+        values: &[(i8, i64, i64, [u8; 32])],
+        batch_size: usize,
+    ) -> anyhow::Result<()> {
+        if values.is_empty() {
+            return Ok(());
+        }
+
+        const CONCURRENCY_LIMIT: usize = 64; // Tuned for typical Scylla clusters
 
         // Map batch size to pre-prepared batch
         let batch_prepared = match batch_size {
@@ -425,6 +512,36 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
             .await?;
 
         Ok(())
+    }
+
+    /// Decode the node set without writing anything.
+    ///
+    /// design-r1 §3 puts the manifest on disk before any hot write, so a crash
+    /// can never leave rows that no manifest names.  That means the mutation
+    /// set has to be known before execution, which is why decoding is split out
+    /// here rather than happening inside the write.  The decoded rows are
+    /// carried forward so the blob is parsed exactly once.
+    pub fn plan_zero_id_merkle_nodes_fast_serialize<Hash: QHash256Base>(
+        &self,
+        checkpoint_id: u64,
+        data: &[u8],
+        sink: &dyn CommitMutationSink,
+    ) -> anyhow::Result<ZeroMerkleWritePlan> {
+        plan_zero_merkle_nodes::<Hash>(self.physical_table, checkpoint_id, data, sink)
+    }
+
+    /// Execute a plan produced by [`Self::plan_zero_id_merkle_nodes_fast_serialize`].
+    pub async fn execute_zero_id_merkle_write_plan(
+        &self,
+        session: &Session,
+        plan: ZeroMerkleWritePlan,
+    ) -> anyhow::Result<()> {
+        if plan.values.is_empty() {
+            return Ok(());
+        }
+        let batch_size = calc_best_batch_size(plan.values.len(), &[256, 128, 64]);
+        self.execute_zero_id_merkle_values(session, &plan.values, batch_size)
+            .await
     }
 
     pub async fn set_zero_id_merkle_nodes_batch_fast_serialize<Hash: QHash256Base>(
@@ -606,5 +723,122 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
             .collect();
         vec.sort_by_key(|n| n.key.index); // Ensure ordered if needed
         Ok(vec)
+    }
+}
+
+#[cfg(test)]
+mod recording_tests {
+    use super::*;
+    use crate::rollback::{
+        CollectingMutationSink, RecordedOperation, describe_existing_key, zero_merkle_node_key,
+    };
+    use parth_core::PHash;
+
+    /// 41 bytes per node: level, little-endian index, 32-byte value.
+    fn blob(nodes: &[(u8, u64)]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(nodes.len() * QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE);
+        for (level, index) in nodes {
+            out.push(*level);
+            out.extend_from_slice(&index.to_le_bytes());
+            out.extend_from_slice(&[7u8; 32]);
+        }
+        out
+    }
+
+    #[test]
+    fn every_row_that_will_be_written_is_recorded_exactly_once() {
+        // The property the whole typed boundary rests on.  If the sink saw fewer
+        // rows than the plan writes, rollback would delete less than the commit
+        // wrote and leave ghost rows behind at a reused height.
+        let nodes = [(0u8, 0u64), (0, 1), (1, 0), (2, 0), (24, 0)];
+        let sink = CollectingMutationSink::new();
+        let plan = plan_zero_merkle_nodes::<PHash>(
+            ScyllaPhysicalTableId::GlobalUserTree,
+            41,
+            &blob(&nodes),
+            &sink,
+        )
+        .unwrap();
+        assert_eq!(plan.row_count(), nodes.len());
+        let records = sink.take();
+        assert_eq!(records.len(), plan.row_count());
+        let checkpoint = CheckpointId::try_new(41).unwrap();
+        for (record, (level, index)) in records.iter().zip(nodes) {
+            assert_eq!(record.operation(), RecordedOperation::Put);
+            assert_eq!(
+                record.physical_table(),
+                ScyllaPhysicalTableId::GlobalUserTree
+            );
+            let expected = describe_existing_key(
+                &zero_merkle_node_key(
+                    ScyllaPhysicalTableId::GlobalUserTree,
+                    level,
+                    index,
+                    checkpoint,
+                )
+                .unwrap(),
+            );
+            assert_eq!(record.locator_bytes(), expected.locator_bytes());
+        }
+    }
+
+    #[test]
+    fn an_empty_node_set_records_nothing_and_writes_nothing() {
+        let sink = CollectingMutationSink::new();
+        let plan =
+            plan_zero_merkle_nodes::<PHash>(ScyllaPhysicalTableId::GlobalUserTree, 1, &[], &sink)
+                .unwrap();
+        assert_eq!(plan.row_count(), 0);
+        assert!(sink.is_empty());
+    }
+
+    #[test]
+    fn a_malformed_blob_is_refused_before_anything_is_recorded() {
+        // Recording a partial set would be worse than recording none: the
+        // manifest would claim a row count the commit never wrote.
+        let sink = CollectingMutationSink::new();
+        let mut truncated = blob(&[(0, 0)]);
+        truncated.pop();
+        assert!(
+            plan_zero_merkle_nodes::<PHash>(
+                ScyllaPhysicalTableId::GlobalUserTree,
+                1,
+                &truncated,
+                &sink,
+            )
+            .is_err()
+        );
+        assert!(sink.is_empty());
+    }
+
+    #[test]
+    fn each_zero_id_tree_records_against_its_own_table() {
+        let nodes = [(3u8, 9u64)];
+        for physical in [
+            ScyllaPhysicalTableId::GlobalUserTree,
+            ScyllaPhysicalTableId::GlobalCheckpointTree,
+            ScyllaPhysicalTableId::UserRegistrationTree,
+            ScyllaPhysicalTableId::GlobalContractTree,
+        ] {
+            let sink = CollectingMutationSink::new();
+            plan_zero_merkle_nodes::<PHash>(physical, 5, &blob(&nodes), &sink).unwrap();
+            let records = sink.take();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].physical_table(), physical);
+        }
+    }
+
+    #[test]
+    fn a_table_outside_the_zero_id_family_is_refused() {
+        let sink = CollectingMutationSink::new();
+        assert!(
+            plan_zero_merkle_nodes::<PHash>(
+                ScyllaPhysicalTableId::UserLeaf,
+                1,
+                &blob(&[(0, 0)]),
+                &sink,
+            )
+            .is_err()
+        );
     }
 }
