@@ -99,3 +99,82 @@ pub trait ManifestArtifactStore<Hash: Q256BitHash>: Send + Sync {
         committed_chunk_count: u32,
     ) -> anyhow::Result<Vec<Vec<u8>>>;
 }
+
+/// Everything a Coordinator needs to record a commit, as one value.
+///
+/// There is no `Default`, no `Option` field and no partial constructor.  A
+/// Coordinator processor takes this by value, so "recording is off" is not a
+/// state the type system permits (design-r1 §0.2 D3).
+pub struct CoordinatorCommitRecording<Hash: Q256BitHash> {
+    canonical_head: std::sync::Arc<dyn super::canonical_head::CoordinatorCanonicalHeadStore<Hash>>,
+    commit_source: std::sync::Arc<
+        dyn super::coordinator_commit_source::CoordinatorCommitSourceStore<Hash>,
+    >,
+    manifest: std::sync::Arc<dyn AuthorityManifestStore<Hash>>,
+    manifest_artifact: std::sync::Arc<dyn ManifestArtifactStore<Hash>>,
+    floor: std::sync::Arc<
+        dyn super::coordinator_commit_source::CoordinatorRollbackFloorStore<Hash>,
+    >,
+}
+
+impl<Hash: Q256BitHash> Clone for CoordinatorCommitRecording<Hash> {
+    fn clone(&self) -> Self {
+        Self {
+            canonical_head: self.canonical_head.clone(),
+            commit_source: self.commit_source.clone(),
+            manifest: self.manifest.clone(),
+            manifest_artifact: self.manifest_artifact.clone(),
+            floor: self.floor.clone(),
+        }
+    }
+}
+
+impl<Hash: Q256BitHash> CoordinatorCommitRecording<Hash> {
+    pub fn new(
+        canonical_head: std::sync::Arc<
+            dyn super::canonical_head::CoordinatorCanonicalHeadStore<Hash>,
+        >,
+        commit_source: std::sync::Arc<
+            dyn super::coordinator_commit_source::CoordinatorCommitSourceStore<Hash>,
+        >,
+        manifest: std::sync::Arc<dyn AuthorityManifestStore<Hash>>,
+        manifest_artifact: std::sync::Arc<dyn ManifestArtifactStore<Hash>>,
+        floor: std::sync::Arc<
+            dyn super::coordinator_commit_source::CoordinatorRollbackFloorStore<Hash>,
+        >,
+    ) -> Self {
+        Self {
+            canonical_head,
+            commit_source,
+            manifest,
+            manifest_artifact,
+            floor,
+        }
+    }
+
+    pub fn canonical_head(
+        &self,
+    ) -> &dyn super::canonical_head::CoordinatorCanonicalHeadStore<Hash> {
+        self.canonical_head.as_ref()
+    }
+
+    pub fn commit_source(
+        &self,
+    ) -> &dyn super::coordinator_commit_source::CoordinatorCommitSourceStore<Hash> {
+        self.commit_source.as_ref()
+    }
+
+    pub fn manifest(&self) -> &dyn AuthorityManifestStore<Hash> {
+        self.manifest.as_ref()
+    }
+
+    pub fn manifest_artifact(&self) -> &dyn ManifestArtifactStore<Hash> {
+        self.manifest_artifact.as_ref()
+    }
+
+    pub fn floor(
+        &self,
+    ) -> &dyn super::coordinator_commit_source::CoordinatorRollbackFloorStore<Hash> {
+        self.floor.as_ref()
+    }
+}

@@ -708,9 +708,11 @@ pub trait CoordinatorCanonicalHeadReader<Hash: Q256BitHash>: Send + Sync {
 /// exact LWT semantics modeled by [`CanonicalHeadBootstrap`] and
 /// [`SealedCanonicalHeadCas`].
 #[async_trait]
+/// Publishing a head and recording a commit source are separate capabilities.
+/// The spike bundled them because one Scylla type happened to implement both;
+/// a caller that needs both now takes both, so neither can drag the other in.
 pub trait CoordinatorCanonicalHeadStore<Hash: Q256BitHash>:
     CoordinatorCanonicalHeadReader<Hash>
-    + super::coordinator_commit_source::CoordinatorCommitSourceStore<Hash>
 {
     async fn bootstrap_canonical_head(
         &self,

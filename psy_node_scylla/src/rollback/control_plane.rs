@@ -77,11 +77,11 @@ impl RollbackControlKeyspaces {
 
 /// All rollback control stores for one Coordinator authority.
 pub struct CoordinatorRollbackControlPlane {
-    canonical_head: ScyllaCanonicalHeadStore,
-    commit_source: ScyllaCoordinatorCommitSourceStore,
-    manifest: ScyllaAuthorityManifestStore,
-    manifest_artifact: ScyllaManifestArtifactStore,
-    floor: ScyllaCoordinatorRollbackFloorStore,
+    canonical_head: Arc<ScyllaCanonicalHeadStore>,
+    commit_source: Arc<ScyllaCoordinatorCommitSourceStore>,
+    manifest: Arc<ScyllaAuthorityManifestStore>,
+    manifest_artifact: Arc<ScyllaManifestArtifactStore>,
+    floor: Arc<ScyllaCoordinatorRollbackFloorStore>,
 }
 
 impl CoordinatorRollbackControlPlane {
@@ -112,29 +112,39 @@ impl CoordinatorRollbackControlPlane {
         keyspaces: &RollbackControlKeyspaces,
     ) -> anyhow::Result<Self> {
         Ok(Self {
-            canonical_head: ScyllaCanonicalHeadStore::prepare(
-                session.clone(),
-                keyspaces.canonical_head.clone(),
-            )
-            .await?,
-            commit_source: ScyllaCoordinatorCommitSourceStore::prepare(
-                session.clone(),
-                &keyspaces.commit_source,
-            )
-            .await?,
-            manifest: ScyllaAuthorityManifestStore::prepare(session.clone(), &keyspaces.manifest)
+            canonical_head: Arc::new(
+                ScyllaCanonicalHeadStore::prepare(
+                    session.clone(),
+                    keyspaces.canonical_head.clone(),
+                )
                 .await?,
-            manifest_artifact: ScyllaManifestArtifactStore::prepare(
-                session.clone(),
-                &keyspaces.manifest_artifact,
-            )
-            .await?,
-            floor: ScyllaCoordinatorRollbackFloorStore::prepare(
-                session,
-                &keyspaces.floor,
-                &keyspaces.state,
-            )
-            .await?,
+            ),
+            commit_source: Arc::new(
+                ScyllaCoordinatorCommitSourceStore::prepare(
+                    session.clone(),
+                    &keyspaces.commit_source,
+                )
+                .await?,
+            ),
+            manifest: Arc::new(
+                ScyllaAuthorityManifestStore::prepare(session.clone(), &keyspaces.manifest)
+                    .await?,
+            ),
+            manifest_artifact: Arc::new(
+                ScyllaManifestArtifactStore::prepare(
+                    session.clone(),
+                    &keyspaces.manifest_artifact,
+                )
+                .await?,
+            ),
+            floor: Arc::new(
+                ScyllaCoordinatorRollbackFloorStore::prepare(
+                    session,
+                    &keyspaces.floor,
+                    &keyspaces.state,
+                )
+                .await?,
+            ),
         })
     }
 
@@ -145,6 +155,22 @@ impl CoordinatorRollbackControlPlane {
         let keyspaces = RollbackControlKeyspaces::from_core_store(store)?;
         Self::create_tables(&store.session, &keyspaces).await?;
         Self::prepare(store.session.clone(), &keyspaces).await
+    }
+
+    /// The driver-independent capability bundle a Coordinator processor takes.
+    ///
+    /// Handing out the whole set at once is what keeps design-r1 §0.2 D3 true:
+    /// there is no way to obtain four of the five.
+    pub fn recording<Hash: parth_core::protocol::core_types::Q256BitHash>(
+        &self,
+    ) -> psy_node_core::store::manifest_store::CoordinatorCommitRecording<Hash> {
+        psy_node_core::store::manifest_store::CoordinatorCommitRecording::new(
+            self.canonical_head.clone(),
+            self.commit_source.clone(),
+            self.manifest.clone(),
+            self.manifest_artifact.clone(),
+            self.floor.clone(),
+        )
     }
 
     pub fn canonical_head(&self) -> &ScyllaCanonicalHeadStore {

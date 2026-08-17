@@ -307,3 +307,34 @@ pub async fn setup_psy_scylla_database_store_from_connection_string<N: QNetworkD
         prepare_psy_scylla_database_store::<N>(Arc::new(scylla_db)).await
     }
 }
+
+/// Bring up a Coordinator's state store together with its rollback control
+/// plane.
+///
+/// Returning the two as one value is the point.  design-r1 §0.2 D3 makes commit
+/// recording unconditional, so there must be no way to obtain a Coordinator
+/// store that cannot record.  The Edge path keeps using
+/// `setup_psy_scylla_database_store_from_connection_string`, which yields no
+/// control plane and therefore cannot be handed to a Coordinator processor.
+///
+/// Both keyspaces are derived from one `ScyllaCoreStore`, so the control plane
+/// can never describe a different keyspace than the state it accompanies.
+pub async fn setup_coordinator_psy_scylla_store_from_connection_string<N: QNetworkDatabaseTypes>(
+    keyspace: &str,
+    connection_string: &str,
+) -> anyhow::Result<(
+    ScyllaUnifiedPsyStore<N, N::QHash, N::HasherBase>,
+    crate::rollback::CoordinatorRollbackControlPlane,
+)> {
+    if connection_string.is_empty() {
+        anyhow::bail!("Scylla Connection string is empty");
+    }
+    let addresses = connection_string
+        .split(',')
+        .map(|s| s.to_string())
+        .collect::<Vec<String>>();
+    let core = Arc::new(ScyllaCoreStore::<N::QHash, N::HasherBase>::new(0, 0, keyspace.to_string(), &addresses).await?);
+    let control = crate::rollback::CoordinatorRollbackControlPlane::setup(core.as_ref()).await?;
+    let store = setup_psy_scylla_database_store::<N>(core).await?;
+    Ok((store, control))
+}

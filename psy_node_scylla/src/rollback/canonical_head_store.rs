@@ -694,3 +694,34 @@ impl From<CanonicalHeadModelError> for CanonicalHeadStoreError {
         Self::Model(value)
     }
 }
+
+#[async_trait::async_trait]
+impl<Hash: Q256BitHash> psy_node_core::store::canonical_head::CoordinatorCanonicalHeadReader<Hash>
+    for ScyllaCanonicalHeadStore
+{
+    async fn read_canonical_head(
+        &self,
+        network: NetworkId,
+    ) -> anyhow::Result<CanonicalHeadReadState<Hash>> {
+        Ok(self.read(network).await?)
+    }
+}
+
+#[async_trait::async_trait]
+impl<Hash: Q256BitHash> psy_node_core::store::canonical_head::CoordinatorCanonicalHeadStore<Hash>
+    for ScyllaCanonicalHeadStore
+{
+    async fn bootstrap_canonical_head(
+        &self,
+        bootstrap: &CanonicalHeadBootstrap<Hash>,
+    ) -> anyhow::Result<CanonicalHeadWriteOutcome<Hash>> {
+        Ok(self.bootstrap(bootstrap).await?)
+    }
+
+    async fn compare_and_set_canonical_head(
+        &self,
+        sealed: &SealedCanonicalHeadCas<Hash>,
+    ) -> anyhow::Result<CanonicalHeadWriteOutcome<Hash>> {
+        Ok(self.compare_and_set(sealed).await?)
+    }
+}
