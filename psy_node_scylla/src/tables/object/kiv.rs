@@ -6,6 +6,9 @@ use parth_core::data::db::{row::{QDatabaseKeyIdValueTableRow, QDatabaseKeyIdValu
 use psy_serialize::PsySerializeCanonicalAsyncSafe;
 use scylla::{client::session::Session, statement::{batch::Batch, prepared::PreparedStatement, Statement}};
 
+use crate::rollback::{
+    CommitMutationSink, ScyllaPhysicalTableId, physical_table_by_name, record_key_id_value_put,
+};
 use crate::{constants::{INSERT_KEY_ID_VALUE_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_KEY_ID_VALUE_CHECKPOINTED_OBJECT_BATCH_SIZE}, table_creator::create_table_if_not_exists, tables::traits::ScyllaStandardPreparedTableStatements, utils::{i64_to_u64_exact, u64_to_i64_exact}};
 
 
@@ -29,9 +32,45 @@ pub struct ScyllaGenericKeyIdValueTablePreparedStatements {
     pub keyspace: String,
     pub table_name: String,
     pub table_key: QDatabaseTableRoutingKey,
+    /// Which key-id-value table this adapter serves.
+    ///
+    /// Required at construction: these tables are indistinguishable by shape,
+    /// so without an identity a write could be recorded against the wrong one.
+    pub physical_table: ScyllaPhysicalTableId,
 }
 
 impl ScyllaGenericKeyIdValueTablePreparedStatements {
+    /// Record a single row this adapter is about to write.
+    ///
+    /// Key-id-value writes take their `obj_id` from the caller rather than from a
+    /// blob, so there is nothing to decode; recording still happens here so the
+    /// locator is built from the adapter's own identity and one caller cannot
+    /// attribute a row to the wrong table.
+    pub fn record_kiv_put(
+        &self,
+        obj_id: u64,
+        sink: &dyn CommitMutationSink,
+    ) -> anyhow::Result<()> {
+        record_key_id_value_put(sink, self.physical_table, obj_id)
+    }
+
+    /// Insert one row and record it.
+    ///
+    /// Recording happens before the write, so a crash between the two leaves a
+    /// recorded row that was never written rather than a written row that was
+    /// never recorded.  The first is harmless -- rollback deletes a row that is
+    /// not there -- while the second leaves a ghost at a reused height.
+    pub async fn insert_one_kiv_recorded<V: PsySerializeCanonicalAsyncSafe>(
+        &self,
+        session: &Session,
+        obj_id: u64,
+        value: &V,
+        sink: &dyn CommitMutationSink,
+    ) -> anyhow::Result<()> {
+        self.record_kiv_put(obj_id, sink)?;
+        self.insert_one_kiv(session, obj_id, value).await
+    }
+
     pub async fn new_from_session(session: Arc<Session>, keyspace: &str, table_name: &str, table_key: QDatabaseTableRoutingKey) -> anyhow::Result<Self> {
         let insert_1_statement = Statement::new(format!("INSERT INTO {}.{} (obj_id, value) VALUES (?, ?)", keyspace, table_name));
         let insert_1_prepared = session.prepare(insert_1_statement.clone()).await?;
@@ -57,6 +96,12 @@ impl ScyllaGenericKeyIdValueTablePreparedStatements {
             keyspace: keyspace.to_string(),
             table_name: table_name.to_string(),
             table_key,
+            physical_table: physical_table_by_name(table_name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "key-id-value table {table_name:?} is not in the typed registry, so its \
+                     writes could not be recorded for rollback"
+                )
+            })?,
         })
     }
     pub async fn create_table(session: Arc<Session>, keyspace: &str, table_name: &str, _table_key: QDatabaseTableRoutingKey) -> anyhow::Result<()> {

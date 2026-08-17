@@ -14,7 +14,7 @@
 use std::sync::Mutex;
 
 use psy_node_core::store::typed::{
-    CheckpointId, ContractId, MerkleNode, NodeIndex, TypedTableKey, UserId,
+    CheckpointId, ContractId, LatestInfoSlot, MerkleNode, NodeIndex, TypedTableKey, UserId,
 };
 
 use super::{
@@ -194,6 +194,71 @@ pub fn versioned_object_key(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnsupportedKeyIdValueTable {
+    NotAKeyIdValueTable(ScyllaPhysicalTableId),
+    /// `latest_info_table` shares the key-id-value shape but its `obj_id` is a
+    /// singleton slot, not a checkpoint, and only slots 1..=3 exist.
+    UnknownLatestInfoSlot(u64),
+}
+
+impl std::fmt::Display for UnsupportedKeyIdValueTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAKeyIdValueTable(id) => {
+                write!(f, "{id:?} is not a key-id-value table")
+            }
+            Self::UnknownLatestInfoSlot(slot) => {
+                write!(f, "latest_info slot {slot} is not a known singleton slot")
+            }
+        }
+    }
+}
+
+impl std::error::Error for UnsupportedKeyIdValueTable {}
+
+/// Typed key for one row of a key-id-value table.
+///
+/// These tables all look identical -- `PRIMARY KEY ((obj_id))` -- but `obj_id`
+/// is a checkpoint in five of them and a singleton slot in `latest_info_table`.
+/// Treating a slot as a checkpoint would produce a locator naming checkpoint 1,
+/// 2 or 3, which is a real row in another table, so the distinction is made here
+/// rather than left to the caller.
+pub fn key_id_value_key(
+    physical: ScyllaPhysicalTableId,
+    obj_id: u64,
+) -> Result<TypedTableKey, UnsupportedKeyIdValueTable> {
+    let checkpoint = |obj_id: u64| CheckpointId::try_new(obj_id);
+    match physical {
+        ScyllaPhysicalTableId::CheckpointLeaf => checkpoint(obj_id)
+            .map(TypedTableKey::CheckpointLeaf)
+            .map_err(|_| UnsupportedKeyIdValueTable::NotAKeyIdValueTable(physical)),
+        ScyllaPhysicalTableId::L2BlockState => checkpoint(obj_id)
+            .map(TypedTableKey::L2BlockState)
+            .map_err(|_| UnsupportedKeyIdValueTable::NotAKeyIdValueTable(physical)),
+        ScyllaPhysicalTableId::CheckpointStateRoots => checkpoint(obj_id)
+            .map(TypedTableKey::CheckpointStateRoots)
+            .map_err(|_| UnsupportedKeyIdValueTable::NotAKeyIdValueTable(physical)),
+        ScyllaPhysicalTableId::CheckpointZkProofAndTransition => checkpoint(obj_id)
+            .map(TypedTableKey::CheckpointZkProof)
+            .map_err(|_| UnsupportedKeyIdValueTable::NotAKeyIdValueTable(physical)),
+        ScyllaPhysicalTableId::CheckpointIdToRealmRoot => checkpoint(obj_id)
+            .map(TypedTableKey::UnusedCheckpointRealmRoot)
+            .map_err(|_| UnsupportedKeyIdValueTable::NotAKeyIdValueTable(physical)),
+        ScyllaPhysicalTableId::LatestInfo => match obj_id {
+            1 => Ok(TypedTableKey::LatestInfo(LatestInfoSlot::LatestL2BlockState)),
+            2 => Ok(TypedTableKey::LatestInfo(
+                LatestInfoSlot::LatestCheckpointTreeRoot,
+            )),
+            3 => Ok(TypedTableKey::LatestInfo(
+                LatestInfoSlot::RealmAuthorityObservation,
+            )),
+            other => Err(UnsupportedKeyIdValueTable::UnknownLatestInfoSlot(other)),
+        },
+        other => Err(UnsupportedKeyIdValueTable::NotAKeyIdValueTable(other)),
+    }
+}
+
 /// Receives every physical row an adapter writes, in write order.
 ///
 /// Implementations must be cheap: this sits on the commit path, and a busy
@@ -293,6 +358,22 @@ pub fn record_versioned_object_put(
     Ok(())
 }
 
+/// Record a put of one key-id-value row.
+pub fn record_key_id_value_put(
+    sink: &dyn CommitMutationSink,
+    physical: ScyllaPhysicalTableId,
+    obj_id: u64,
+) -> anyhow::Result<()> {
+    let key = key_id_value_key(physical, obj_id)?;
+    let resolved = describe_existing_key(&key);
+    sink.record(MutationLocatorRecord::try_new(
+        resolved.physical_table(),
+        RecordedOperation::Put,
+        resolved.locator_bytes().to_vec(),
+    )?);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,6 +415,51 @@ mod tests {
             );
         }
         assert_eq!(locators.len(), 4);
+    }
+
+    #[test]
+    fn a_latest_info_slot_is_never_read_as_a_checkpoint() {
+        // The trap in this family: every key-id-value table has the same
+        // PRIMARY KEY ((obj_id)), but latest_info stores a slot there.  Reading
+        // slot 1 as checkpoint 1 would name a row that exists in a different
+        // table, so the two must not share a locator.
+        let slot = describe_existing_key(
+            &key_id_value_key(ScyllaPhysicalTableId::LatestInfo, 1).unwrap(),
+        );
+        let checkpoint = describe_existing_key(
+            &key_id_value_key(ScyllaPhysicalTableId::CheckpointLeaf, 1).unwrap(),
+        );
+        assert_eq!(slot.physical_table(), ScyllaPhysicalTableId::LatestInfo);
+        assert_eq!(
+            checkpoint.physical_table(),
+            ScyllaPhysicalTableId::CheckpointLeaf
+        );
+        assert_ne!(slot.locator_bytes(), checkpoint.locator_bytes());
+        // Only the three declared slots exist.
+        assert_eq!(
+            key_id_value_key(ScyllaPhysicalTableId::LatestInfo, 4),
+            Err(UnsupportedKeyIdValueTable::UnknownLatestInfoSlot(4))
+        );
+    }
+
+    #[test]
+    fn each_checkpoint_keyed_table_gets_its_own_locator() {
+        let mut locators = std::collections::BTreeSet::new();
+        for physical in [
+            ScyllaPhysicalTableId::CheckpointLeaf,
+            ScyllaPhysicalTableId::L2BlockState,
+            ScyllaPhysicalTableId::CheckpointStateRoots,
+            ScyllaPhysicalTableId::CheckpointZkProofAndTransition,
+            ScyllaPhysicalTableId::CheckpointIdToRealmRoot,
+        ] {
+            let resolved = describe_existing_key(&key_id_value_key(physical, 500).unwrap());
+            assert_eq!(resolved.physical_table(), physical);
+            assert!(
+                locators.insert(resolved.locator_bytes().to_vec()),
+                "{physical:?} shares a locator with another key-id-value table"
+            );
+        }
+        assert_eq!(locators.len(), 5);
     }
 
     #[test]
