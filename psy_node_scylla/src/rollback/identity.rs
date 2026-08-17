@@ -100,3 +100,29 @@ impl ScyllaKeyDomain {
         self as u16
     }
 }
+
+/// A physical table id that is not in the registry.  Decoding a locator record
+/// written by a newer schema must fail rather than land on a neighbouring table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UnknownScyllaPhysicalTableId(pub u16);
+
+impl std::fmt::Display for UnknownScyllaPhysicalTableId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown physical table id {}", self.0)
+    }
+}
+
+impl std::error::Error for UnknownScyllaPhysicalTableId {}
+
+impl TryFrom<u16> for ScyllaPhysicalTableId {
+    type Error = UnknownScyllaPhysicalTableId;
+
+    /// Derived from the enum rather than a hand-written match, so a new physical
+    /// table is decodable the moment it is registered.
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        use strum::IntoEnumIterator;
+        Self::iter()
+            .find(|id| *id as u16 == value)
+            .ok_or(UnknownScyllaPhysicalTableId(value))
+    }
+}
