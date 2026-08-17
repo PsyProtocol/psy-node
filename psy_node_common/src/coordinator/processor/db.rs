@@ -1178,6 +1178,52 @@ checkpoint_backup_copy_status={}
         }
     }
 
+
+    /// Publish the genesis head without recording a commit.
+    ///
+    /// Genesis has no predecessor, so there is no advance to CAS and no discarded
+    /// suffix a rollback could target.  Bootstrapping here gives later commits an
+    /// expected head to advance from, which is all they need.
+    async fn bootstrap_genesis_canonical_head(
+        &mut self,
+        checkpoint_proof_public_inputs_hash: N::QHash,
+    ) -> anyhow::Result<()> {
+        if let CanonicalHeadReadState::Current(_) = self
+            .recording
+            .canonical_head()
+            .read_canonical_head(self.network_id)
+            .await?
+        {
+            return Ok(());
+        }
+        let genesis = CanonicalChainRef::new(
+            self.network_id,
+            ChainEpoch::new(0),
+            CheckpointRef::new(
+                CheckpointId::new(0),
+                CheckpointHash::from_proof_public_inputs_hash(
+                    checkpoint_proof_public_inputs_hash,
+                ),
+            ),
+        );
+        let bootstrap = CanonicalHeadBootstrap::try_new(
+            CanonicalHeadBootstrapProfile::GenesisNative,
+            genesis,
+        )?;
+        match self
+            .recording
+            .canonical_head()
+            .bootstrap_canonical_head(&bootstrap)
+            .await?
+        {
+            CanonicalHeadWriteOutcome::Applied(_)
+            | CanonicalHeadWriteOutcome::Idempotent(_)
+            // A concurrent bootstrap wrote the same genesis; its row is as valid
+            // as ours would have been.
+            | CanonicalHeadWriteOutcome::Conflict { .. } => Ok(()),
+        }
+    }
+
     pub async fn commit_state(
         &mut self,
         coordinator_update: PsyPreparedCoordinatorBlockStateUpdates<N::F, N::QHash>,
@@ -1284,9 +1330,25 @@ checkpoint_backup_copy_status={}
         // crash between the two can never leave rows nothing names.  This also
         // takes the commit timestamp lease, which is what makes the commit
         // exclusive.
-        let recorded = self
-            .record_commit_prepared(&coordinator_update, checkpoint_proof_public_inputs_hash)
-            .await?;
+        //
+        // Genesis is exempt.  It has no predecessor to advance from, its write
+        // set is not the one the planner enumerates, and rolling back to below
+        // it is meaningless -- so it bootstraps the head instead of recording a
+        // commit.  The first recorded commit is checkpoint 1, and that is where
+        // the rollback floor sits on a chain that starts under this scheme.
+        let recorded = if checkpoint_id == 0 {
+            self.bootstrap_genesis_canonical_head(checkpoint_proof_public_inputs_hash)
+                .await?;
+            None
+        } else {
+            Some(
+                self.record_commit_prepared(
+                    &coordinator_update,
+                    checkpoint_proof_public_inputs_hash,
+                )
+                .await?,
+            )
+        };
 
         let contract_tree_heights = coordinator_update
             .new_contract_code_definitions
@@ -1386,13 +1448,16 @@ checkpoint_backup_copy_status={}
         tracing::info!("Set checkpoint root hash to ID mapping for checkpoint ID: {}\n{:#?}", checkpoint_id, checkpoint_delta_merkle_proof);
 
         // Seal the manifest against what was actually written, publish the head,
-        // and release the lease.
-        self.complete_commit_record(
-            recorded,
-            checkpoint_delta_merkle_proof.new_root,
-            &coordinator_update,
-        )
-        .await?;
+        // and release the lease.  Genesis recorded nothing, so there is nothing
+        // to seal.
+        if let Some(recorded) = recorded {
+            self.complete_commit_record(
+                recorded,
+                checkpoint_delta_merkle_proof.new_root,
+                &coordinator_update,
+            )
+            .await?;
+        }
         // END STANDARD STATE UPDATES (technically these can be done in any order after
         // the above two are done)
 

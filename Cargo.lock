@@ -7058,6 +7058,7 @@ dependencies = [
  "pderive",
  "postcard",
  "pser",
+ "psy_core",
  "psy_data",
  "psy_node_core",
  "psy_serialize",
