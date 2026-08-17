@@ -37,7 +37,7 @@ use psy_node_core::{
     },
     psy_temp_db::StandardProcessorTempDBStoreBase,
     queue::{ephemeral::QStandardEphemeralQueueSubscriber, worker_queue::QStandardWorkerQueuePublisher},
-    store::traits::proof_store::QParthProofStore,
+    store::{manifest_store::CoordinatorCommitRecording, traits::proof_store::QParthProofStore},
 };
 
 use crate::{
@@ -128,6 +128,12 @@ pub struct PsyCoordinatorDatabaseProcessor<
 > {
     // stores
     pub db: Arc<S>,
+    /// Durable record of every commit this Coordinator makes.
+    ///
+    /// Held by value rather than as an option: design-r1 §0.2 D3 makes
+    /// recording unconditional, and a Coordinator that cannot record a commit
+    /// must not be able to make one.
+    pub recording: CoordinatorCommitRecording<N::QHash>,
     pub tag_tree_rewards_store: Arc<STagTreeRewards>,
     pub temp_db: Arc<TempDatabase>,
     pub proof_store: Arc<ProofStore>,
@@ -269,6 +275,7 @@ impl<
     }
     pub async fn new_init(
         db: Arc<S>,
+        recording: CoordinatorCommitRecording<N::QHash>,
         tag_tree_rewards_store: Arc<STagTreeRewards>,
         temp_db: Arc<TempDatabase>,
         proof_store: Arc<ProofStore>,
@@ -419,6 +426,7 @@ impl<
         let status = ProcessorStatus::new();
         Ok(Self {
             db,
+            recording,
             status: status.clone(),
             tag_tree_rewards_store,
             temp_db,

@@ -14,7 +14,7 @@ use psy_node_core::{
         ephemeral::QStandardEphemeralQueueSubscriber,
         worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
     },
-    store::traits::proof_store::QParthProofStore,
+    store::{manifest_store::CoordinatorCommitRecording, traits::proof_store::QParthProofStore},
 };
 
 use crate::coordinator::processor::{PsyCoordinatorProcessor, db::PsyCoordinatorDatabaseProcessor, runner::run_coordinator_processor};
@@ -38,6 +38,9 @@ pub async fn create_coordinator_processor<
     guta_gatherer_backup_directory: String,
     checkpoint_tree_root_backup_file_path: String,
     db: Arc<S>,
+    // design-r1 §0.2 D3: a Coordinator that cannot record a commit must not be
+    // able to make one, so this is taken by value rather than as an option.
+    recording: CoordinatorCommitRecording<N::QHash>,
     tag_tree_rewards_store: Arc<STagTreeRewards>,
     temp_db: Arc<TempDatabase>,
     proof_store: Arc<ProofStore>,
@@ -99,6 +102,7 @@ where
 
     let db = PsyCoordinatorDatabaseProcessor::<N, _, _, _, _, _, _, _, _, FileSystem>::new_init(
         db,
+        recording,
         tag_tree_rewards_store,
         temp_db,
         proof_store,
@@ -193,6 +197,9 @@ pub async fn create_coordinator_processor_and_run<
     guta_gatherer_backup_directory: String,
     checkpoint_tree_root_backup_file_path: String,
     db: Arc<S>,
+    // design-r1 §0.2 D3: a Coordinator that cannot record a commit must not be
+    // able to make one, so this is taken by value rather than as an option.
+    recording: CoordinatorCommitRecording<N::QHash>,
     tag_tree_rewards_store: Arc<STagTreeRewards>,
     temp_db: Arc<TempDatabase>,
     proof_store: Arc<ProofStore>,
@@ -214,6 +221,7 @@ where
         guta_gatherer_backup_directory,
         checkpoint_tree_root_backup_file_path,
         db,
+        recording,
         tag_tree_rewards_store,
         temp_db,
         proof_store,

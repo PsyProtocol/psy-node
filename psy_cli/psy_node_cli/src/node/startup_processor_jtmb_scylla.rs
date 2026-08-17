@@ -13,7 +13,7 @@ use psy_node_common::{coordinator::processor::create::create_coordinator_process
 use psy_node_core::config::node_start_config::{CoordinatorProcessorStartConfig, RealmProcessorStartConfig};
 use psy_node_nats::psy_queue::setup_nats_psy_queue_from_connection_str;
 use psy_node_redis::store::{new_redis_async_pool, StandardRedisStore};
-use psy_node_scylla::psy_setup::setup_psy_scylla_database_store_from_connection_string;
+use psy_node_scylla::psy_setup::{setup_coordinator_psy_scylla_store_from_connection_string, setup_psy_scylla_database_store_from_connection_string};
 
 pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_coordinator_processor_node(config: &CoordinatorProcessorStartConfig) -> anyhow::Result<()> {
     let resolver = PsyJTMBPoseidonGoldilocksNodeConfigResolver {};
@@ -60,9 +60,10 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_coordinator_processor_n
     match config.network {
         psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesJTMBGoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
-            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, true).await?;
-            tracing::info!("[COORD_BOOT] scylla store ready");
+            let (db, rollback_control) = setup_coordinator_psy_scylla_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url).await?;
+            tracing::info!("[COORD_BOOT] scylla store and rollback control plane ready");
             let db = Arc::new(db);
+            let recording = rollback_control.recording();
             let tag_tree_rewards_store = db.clone();
             tracing::info!("[COORD_BOOT] creating coordinator processor");
             create_coordinator_processor_and_run::<N, _, _, _, _, _, _, _, _, _>(
@@ -74,6 +75,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_coordinator_processor_n
                 guta_gatherer_backup_directory,
                 checkpoint_tree_root_backup_file_path,
                 db,
+                recording,
                 tag_tree_rewards_store,
                 temp_db,
                 proof_store,

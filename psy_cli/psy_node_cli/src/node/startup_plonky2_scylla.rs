@@ -12,7 +12,7 @@ use psy_node_common::{coordinator::processor::create::create_coordinator_process
 use psy_node_core::config::node_start_config::{CoordinatorProcessorStartConfig, RealmProcessorStartConfig};
 use psy_node_nats::psy_queue::setup_nats_psy_queue_from_connection_str;
 use psy_node_redis::store::{new_redis_async_pool, StandardRedisStore};
-use psy_node_scylla::psy_setup::setup_psy_scylla_database_store_from_connection_string;
+use psy_node_scylla::psy_setup::{setup_coordinator_psy_scylla_store_from_connection_string, setup_psy_scylla_database_store_from_connection_string};
 use psy_plonky2_circuits::{
     node::config::networks::resolver::PsyPlonky2NodeConfigResolver,
     protocol_types::ZKTypesPlonky2GoldilocksPoseidon,
@@ -63,8 +63,9 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
     match config.network {
         psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
-            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, true).await?;
+            let (db, rollback_control) = setup_coordinator_psy_scylla_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url).await?;
             let db = Arc::new(db);
+            let recording = rollback_control.recording();
             let tag_tree_rewards_store = db.clone();
             create_coordinator_processor_and_run::<N, _, _, _, _, _, _, _, _, _>(
                 &genesis_data,
@@ -75,6 +76,7 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
                 guta_gatherer_backup_directory,
                 checkpoint_tree_root_backup_file_path,
                 db,
+                recording,
                 tag_tree_rewards_store,
                 temp_db,
                 proof_store,
@@ -104,6 +106,7 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
                 guta_gatherer_backup_directory,
                 checkpoint_tree_root_backup_file_path,
                 db,
+                recording,
                 tag_tree_rewards_store,
                 temp_db,
                 proof_store,
@@ -129,6 +132,7 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
                 guta_gatherer_backup_directory,
                 checkpoint_tree_root_backup_file_path,
                 db,
+                recording,
                 tag_tree_rewards_store,
                 temp_db,
                 proof_store,
@@ -154,6 +158,7 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
                 guta_gatherer_backup_directory,
                 checkpoint_tree_root_backup_file_path,
                 db,
+                recording,
                 tag_tree_rewards_store,
                 temp_db,
                 proof_store,
@@ -179,6 +184,7 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
                 guta_gatherer_backup_directory,
                 checkpoint_tree_root_backup_file_path,
                 db,
+                recording,
                 tag_tree_rewards_store,
                 temp_db,
                 proof_store,
@@ -204,6 +210,7 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
                 guta_gatherer_backup_directory,
                 checkpoint_tree_root_backup_file_path,
                 db,
+                recording,
                 tag_tree_rewards_store,
                 temp_db,
                 proof_store,
@@ -229,6 +236,7 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
                 guta_gatherer_backup_directory,
                 checkpoint_tree_root_backup_file_path,
                 db,
+                recording,
                 tag_tree_rewards_store,
                 temp_db,
                 proof_store,
@@ -254,6 +262,7 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
                 guta_gatherer_backup_directory,
                 checkpoint_tree_root_backup_file_path,
                 db,
+                recording,
                 tag_tree_rewards_store,
                 temp_db,
                 proof_store,
@@ -378,6 +387,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
                 guta_gatherer_backup_directory,
                 checkpoint_tree_root_backup_file_path,
                 db,
+                recording,
                 tag_tree_rewards_store,
                 temp_db,
                 proof_store,
@@ -403,6 +413,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
                 guta_gatherer_backup_directory,
                 checkpoint_tree_root_backup_file_path,
                 db,
+                recording,
                 tag_tree_rewards_store,
                 temp_db,
                 proof_store,
@@ -428,6 +439,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
                 guta_gatherer_backup_directory,
                 checkpoint_tree_root_backup_file_path,
                 db,
+                recording,
                 tag_tree_rewards_store,
                 temp_db,
                 proof_store,
@@ -453,6 +465,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
                 guta_gatherer_backup_directory,
                 checkpoint_tree_root_backup_file_path,
                 db,
+                recording,
                 tag_tree_rewards_store,
                 temp_db,
                 proof_store,
@@ -478,6 +491,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
                 guta_gatherer_backup_directory,
                 checkpoint_tree_root_backup_file_path,
                 db,
+                recording,
                 tag_tree_rewards_store,
                 temp_db,
                 proof_store,
@@ -503,6 +517,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
                 guta_gatherer_backup_directory,
                 checkpoint_tree_root_backup_file_path,
                 db,
+                recording,
                 tag_tree_rewards_store,
                 temp_db,
                 proof_store,
@@ -528,6 +543,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
                 guta_gatherer_backup_directory,
                 checkpoint_tree_root_backup_file_path,
                 db,
+                recording,
                 tag_tree_rewards_store,
                 temp_db,
                 proof_store,
