@@ -29,7 +29,7 @@ pub const WORK_CONTEXT_MAGIC: [u8; 8] = *b"PSYWORKC";
 pub const HISTORICAL_READ_CONTEXT_MAGIC: [u8; 8] = *b"PSYHISTC";
 
 const CONTEXT_HEADER_LEN: usize = 10;
-const AUTHORITY_SCOPE_LEN: usize = 7;
+pub const AUTHORITY_SCOPE_LEN: usize = 7;
 pub const AUTHORITY_OBSERVATION_V1_LEN: usize =
     CONTEXT_HEADER_LEN + CANONICAL_CHAIN_REF_V1_LEN + AUTHORITY_SCOPE_LEN + 8 + 32;
 pub const PENDING_CONTEXT_V1_LEN: usize =
@@ -159,7 +159,10 @@ pub enum AuthorityScope {
 }
 
 impl AuthorityScope {
-    fn to_canonical_bytes(self) -> [u8; AUTHORITY_SCOPE_LEN] {
+    /// Canonical partition-key form.  Public because storage keys an authority
+    /// by these exact bytes, and they must not diverge from the encoding the
+    /// manifest payload already carries.
+    pub fn to_canonical_bytes(self) -> [u8; AUTHORITY_SCOPE_LEN] {
         let mut bytes = [0u8; AUTHORITY_SCOPE_LEN];
         match self {
             Self::Coordinator => bytes[0] = AUTHORITY_KIND_COORDINATOR,
