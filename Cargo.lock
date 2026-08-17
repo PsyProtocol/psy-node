@@ -6950,6 +6950,7 @@ dependencies = [
  "serde_repr",
  "serde_with 3.16.1",
  "serde_yaml",
+ "sha2",
  "speedy",
  "strum 0.27.2",
  "strum_macros 0.27.2",

@@ -13,6 +13,7 @@
 //! asserts that this does not happen again.
 
 mod canonical_head_store;
+mod commit_source_store;
 mod identity;
 mod key;
 mod keyspace;
@@ -21,6 +22,7 @@ mod raw_access;
 mod registry;
 
 pub use canonical_head_store::*;
+pub use commit_source_store::*;
 pub use identity::{ScyllaKeyDomain, ScyllaPhysicalTableId};
 pub use keyspace::{CqlKeyspaceName, InvalidCqlKeyspaceName};
 pub use key::{

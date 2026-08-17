@@ -300,6 +300,30 @@ impl<Hash: Q256BitHash> CoordinatorCheckpointBackupEvidence<Hash> {
 /// same-identity/different-content observation.
 #[async_trait]
 pub trait CoordinatorCommitSourceStore<Hash: Q256BitHash>: Send + Sync {
+    async fn persist_coordinator_commit_source(
+        &self,
+        source: &CoordinatorCommitSource<Hash>,
+    ) -> anyhow::Result<()>;
+
+    async fn read_coordinator_commit_source(
+        &self,
+        candidate: &CanonicalChainRef<Hash>,
+    ) -> anyhow::Result<Option<CoordinatorCommitSource<Hash>>>;
+
+    async fn mark_coordinator_commit_source_committed(
+        &self,
+        source: &CoordinatorCommitSource<Hash>,
+    ) -> anyhow::Result<()>;
+}
+
+/// Feasibility evidence for source-backed rollback, kept separate from the
+/// commit-source boundary above.
+///
+/// Establishing a floor is not part of persisting a commit: it needs the exact
+/// mutable-singleton values observed at the activation head, which no commit
+/// carries.  Splitting the capability lets each land and be verified on its own.
+#[async_trait]
+pub trait CoordinatorRollbackFloorStore<Hash: Q256BitHash>: Send + Sync {
     async fn persist_coordinator_rollback_floor(
         &self,
         floor: &CoordinatorRollbackFloor<Hash>,
@@ -365,21 +389,6 @@ pub trait CoordinatorCommitSourceStore<Hash: Q256BitHash>: Send + Sync {
         .await?;
         Ok(persisted)
     }
-
-    async fn persist_coordinator_commit_source(
-        &self,
-        source: &CoordinatorCommitSource<Hash>,
-    ) -> anyhow::Result<()>;
-
-    async fn read_coordinator_commit_source(
-        &self,
-        candidate: &CanonicalChainRef<Hash>,
-    ) -> anyhow::Result<Option<CoordinatorCommitSource<Hash>>>;
-
-    async fn mark_coordinator_commit_source_committed(
-        &self,
-        source: &CoordinatorCommitSource<Hash>,
-    ) -> anyhow::Result<()>;
 }
 
 /// Immutable lower bound for source-backed rollback in one chain epoch.
@@ -976,7 +985,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl CoordinatorCommitSourceStore<PHash> for MemoryFloorStore {
+    impl CoordinatorRollbackFloorStore<PHash> for MemoryFloorStore {
         async fn persist_coordinator_rollback_floor(
             &self,
             floor: &CoordinatorRollbackFloor<PHash>,
@@ -1015,27 +1024,6 @@ mod tests {
             _floor: &CoordinatorRollbackFloor<PHash>,
         ) -> anyhow::Result<()> {
             Ok(())
-        }
-
-        async fn persist_coordinator_commit_source(
-            &self,
-            _source: &CoordinatorCommitSource<PHash>,
-        ) -> anyhow::Result<()> {
-            unreachable!()
-        }
-
-        async fn read_coordinator_commit_source(
-            &self,
-            _candidate: &CanonicalChainRef<PHash>,
-        ) -> anyhow::Result<Option<CoordinatorCommitSource<PHash>>> {
-            unreachable!()
-        }
-
-        async fn mark_coordinator_commit_source_committed(
-            &self,
-            _source: &CoordinatorCommitSource<PHash>,
-        ) -> anyhow::Result<()> {
-            unreachable!()
         }
     }
 
