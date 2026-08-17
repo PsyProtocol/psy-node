@@ -235,15 +235,27 @@ fn no_allow_dead_code_in_rollback_module() {
 }
 
 /// design-r1 §11.5: no source-text self-assertions.
+///
+/// The rule is about `include_str!` aimed at Rust source.  Pulling in a golden
+/// vector file is a data fixture and stays allowed; asserting that a `.rs` file
+/// contains a given string is what froze "not integrated" into a passing
+/// condition in the spike.
 #[test]
-fn no_include_str_source_assertions() {
-    let offenders: Vec<_> = modules()
-        .iter()
-        .filter(|(_, source)| source.contains("include_str!"))
-        .map(|(name, _)| name.clone())
-        .collect();
+fn no_include_str_of_rust_source() {
+    let mut offenders = Vec::new();
+    for (name, source) in modules() {
+        let mut rest = source.as_str();
+        while let Some(at) = rest.find("include_str!") {
+            rest = &rest[at + "include_str!".len()..];
+            let end = rest.find(')').unwrap_or(rest.len());
+            if rest[..end].contains(".rs") {
+                offenders.push(name.clone());
+                break;
+            }
+        }
+    }
     assert!(
         offenders.is_empty(),
-        "design-r1 §11.5 forbids include_str! source assertions; found {offenders:?}"
+        "design-r1 §11.5 forbids include_str! of Rust source; found {offenders:?}"
     );
 }

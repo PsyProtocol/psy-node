@@ -12,13 +12,17 @@
 //! the 586-line write core into a 21,399-line closure.  `tests/module_boundary.rs`
 //! asserts that this does not happen again.
 
+mod canonical_head_store;
 mod identity;
 mod key;
+mod keyspace;
 mod mutation;
 mod raw_access;
 mod registry;
 
+pub use canonical_head_store::*;
 pub use identity::{ScyllaKeyDomain, ScyllaPhysicalTableId};
+pub use keyspace::{CqlKeyspaceName, InvalidCqlKeyspaceName};
 pub use key::{
     CqlPrimaryKeyFingerprint, ResolvedScyllaKey, describe_existing_key, resolve_key_for_rollback,
 };
