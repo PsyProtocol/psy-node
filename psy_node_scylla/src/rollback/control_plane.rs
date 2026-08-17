@@ -181,6 +181,8 @@ impl CoordinatorRollbackControlPlane {
     ) -> psy_node_core::store::manifest_store::CoordinatorCommitRecording<Hash> {
         psy_node_core::store::manifest_store::CoordinatorCommitRecording::new(
             self.canonical_head.clone(),
+            self.authority_timestamp.clone(),
+            Arc::new(super::ScyllaCoordinatorCommitPlanner::new()),
             self.commit_source.clone(),
             self.manifest.clone(),
             self.manifest_artifact.clone(),

@@ -1079,3 +1079,36 @@ mod tests {
     // control plane is a separate composition and only the Coordinator setup
     // builds it, so a generic or Edge setup has no way to reach this store.
 }
+
+#[async_trait::async_trait]
+impl psy_node_core::store::authority_commit::AuthorityCommitTimestampStore
+    for ScyllaAuthorityTimestampStore
+{
+    async fn read_timestamp_state(
+        &self,
+        key: AuthorityTimestampKey,
+    ) -> anyhow::Result<AuthorityTimestampReadState> {
+        Ok(self.read(key).await?)
+    }
+
+    async fn bootstrap_timestamp_state(
+        &self,
+        bootstrap: &AuthorityTimestampBootstrap,
+    ) -> anyhow::Result<AuthorityTimestampWriteOutcome> {
+        Ok(self.bootstrap(*bootstrap).await?)
+    }
+
+    async fn reserve_timestamp(
+        &self,
+        reservation: &SealedAuthorityTimestampReservation,
+    ) -> anyhow::Result<AuthorityTimestampWriteOutcome> {
+        Ok(self.reserve(*reservation).await?)
+    }
+
+    async fn complete_timestamp(
+        &self,
+        completion: &SealedAuthorityTimestampCompletion,
+    ) -> anyhow::Result<AuthorityTimestampWriteOutcome> {
+        Ok(self.complete(*completion).await?)
+    }
+}

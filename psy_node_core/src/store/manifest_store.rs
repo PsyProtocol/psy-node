@@ -107,6 +107,8 @@ pub trait ManifestArtifactStore<Hash: Q256BitHash>: Send + Sync {
 /// state the type system permits (design-r1 §0.2 D3).
 pub struct CoordinatorCommitRecording<Hash: Q256BitHash> {
     canonical_head: std::sync::Arc<dyn super::canonical_head::CoordinatorCanonicalHeadStore<Hash>>,
+    timestamp: std::sync::Arc<dyn super::authority_commit::AuthorityCommitTimestampStore>,
+    planner: std::sync::Arc<dyn super::commit_planner::CoordinatorCommitPlanner>,
     commit_source: std::sync::Arc<
         dyn super::coordinator_commit_source::CoordinatorCommitSourceStore<Hash>,
     >,
@@ -121,6 +123,8 @@ impl<Hash: Q256BitHash> Clone for CoordinatorCommitRecording<Hash> {
     fn clone(&self) -> Self {
         Self {
             canonical_head: self.canonical_head.clone(),
+            timestamp: self.timestamp.clone(),
+            planner: self.planner.clone(),
             commit_source: self.commit_source.clone(),
             manifest: self.manifest.clone(),
             manifest_artifact: self.manifest_artifact.clone(),
@@ -134,6 +138,8 @@ impl<Hash: Q256BitHash> CoordinatorCommitRecording<Hash> {
         canonical_head: std::sync::Arc<
             dyn super::canonical_head::CoordinatorCanonicalHeadStore<Hash>,
         >,
+        timestamp: std::sync::Arc<dyn super::authority_commit::AuthorityCommitTimestampStore>,
+        planner: std::sync::Arc<dyn super::commit_planner::CoordinatorCommitPlanner>,
         commit_source: std::sync::Arc<
             dyn super::coordinator_commit_source::CoordinatorCommitSourceStore<Hash>,
         >,
@@ -145,6 +151,8 @@ impl<Hash: Q256BitHash> CoordinatorCommitRecording<Hash> {
     ) -> Self {
         Self {
             canonical_head,
+            timestamp,
+            planner,
             commit_source,
             manifest,
             manifest_artifact,
@@ -156,6 +164,14 @@ impl<Hash: Q256BitHash> CoordinatorCommitRecording<Hash> {
         &self,
     ) -> &dyn super::canonical_head::CoordinatorCanonicalHeadStore<Hash> {
         self.canonical_head.as_ref()
+    }
+
+    pub fn timestamp(&self) -> &dyn super::authority_commit::AuthorityCommitTimestampStore {
+        self.timestamp.as_ref()
+    }
+
+    pub fn planner(&self) -> &dyn super::commit_planner::CoordinatorCommitPlanner {
+        self.planner.as_ref()
     }
 
     pub fn commit_source(

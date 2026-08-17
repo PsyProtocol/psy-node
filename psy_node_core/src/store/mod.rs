@@ -7,6 +7,7 @@ pub mod typed;
 pub mod authority_commit;
 pub mod canonical_head;
 pub mod commit_planner;
+pub mod commit_recording_flow;
 pub mod coordinator_commit_source;
 pub mod manifest_intent;
 pub mod manifest_lifecycle;

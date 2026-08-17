@@ -866,3 +866,35 @@ mod tests {
         );
     }
 }
+
+/// Durable boundary for the per-authority commit timestamp allocator.
+///
+/// Defined here rather than beside the Scylla adapter because `commit_state`
+/// reserves a timestamp and must not name a driver.  Implementations must keep
+/// the LWT semantics the sealed reservation and completion model above expresses:
+/// a write only lands against the exact expected revision.
+#[async_trait::async_trait]
+pub trait AuthorityCommitTimestampStore: Send + Sync {
+    async fn read_timestamp_state(
+        &self,
+        key: AuthorityTimestampKey,
+    ) -> anyhow::Result<AuthorityTimestampReadState>;
+
+    /// Materialise the first row for an authority.
+    async fn bootstrap_timestamp_state(
+        &self,
+        bootstrap: &AuthorityTimestampBootstrap,
+    ) -> anyhow::Result<AuthorityTimestampWriteOutcome>;
+
+    /// Take the lease.  Fails closed when another writer holds it.
+    async fn reserve_timestamp(
+        &self,
+        reservation: &SealedAuthorityTimestampReservation,
+    ) -> anyhow::Result<AuthorityTimestampWriteOutcome>;
+
+    /// Release the lease once the commit it covers is durable.
+    async fn complete_timestamp(
+        &self,
+        completion: &SealedAuthorityTimestampCompletion,
+    ) -> anyhow::Result<AuthorityTimestampWriteOutcome>;
+}
