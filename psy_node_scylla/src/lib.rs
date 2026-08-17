@@ -5,4 +5,5 @@ pub mod core;
 pub mod core_db;
 pub mod utils;
 pub mod psy_setup;
+pub mod rollback;
 pub mod table_creator;
