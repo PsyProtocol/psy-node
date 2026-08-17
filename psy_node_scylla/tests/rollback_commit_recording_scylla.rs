@@ -36,6 +36,7 @@ use psy_node_core::psy_core_db::core_implementation::constants::{
     LATEST_INFO_TABLE_OBJ_ID_LATEST_L2_BLOCK_STATE, U64_SINGLETON_TABLE_OBJ_ID_CHECKPOINT_ID,
 };
 use psy_node_core::store::canonical_head::StoredCanonicalHead;
+use psy_node_core::store::timestamp::CommitWriteTimestampUs;
 use psy_node_core::store::manifest_record::ManifestRevision;
 use psy_node_core::store::rollback_control::RollbackControlState;
 use psy_node_core::store::manifest_store::ManifestArtifactKind;
@@ -541,6 +542,103 @@ async fn a_prepared_commit_populates_every_control_table_it_owns() -> anyhow::Re
         empty.is_empty(),
         "a prepared commit left these control tables empty: {empty:?}"
     );
+
+    drop_keyspaces(&core).await;
+    Ok(())
+}
+
+/// A commit window really does decide the write timestamp of the rows it covers.
+///
+/// The driver takes a statement's own timestamp and otherwise calls the session
+/// generator, in the connection layer below every statement kind.  That is read
+/// from the driver's source; this checks it against a running Scylla, because the
+/// whole timestamp design rests on it and a misreading would be invisible until a
+/// fence silently shadowed a live row.
+///
+/// `WRITETIME()` is the assertion that cannot be fooled by the code path: it
+/// reports what the row actually carries.
+#[tokio::test]
+#[ignore = "requires a reachable Scylla"]
+async fn a_commit_window_decides_the_write_timestamp_of_its_rows() -> anyhow::Result<()> {
+    let (core, control, keyspace) = bring_up("writetime").await?;
+    let recording = control.recording::<PHash>();
+
+    core.session
+        .query_unpaged(
+            format!(
+                "CREATE TABLE IF NOT EXISTS {keyspace}.window_probe_table \
+                 (obj_id BIGINT, value BLOB, PRIMARY KEY ((obj_id)))"
+            ),
+            &[],
+        )
+        .await?;
+    core.session.await_schema_agreement().await?;
+
+    // A timestamp no wall clock would produce right now, so a row carrying it
+    // can only have got it from the window.
+    const WINDOW_US: i64 = 1_600_000_000_000_123;
+    let stamp = CommitWriteTimestampUs::try_from_i128(WINDOW_US as i128)?;
+
+    {
+        let _window = recording.open_commit_window(4242, stamp)?;
+        assert_eq!(recording.require_commit_window(4242)?, stamp);
+        // Two statements, one window: a commit is one point on the axis, not a
+        // spread, so both must come back identical.
+        for obj_id in [1i64, 2i64] {
+            core.session
+                .query_unpaged(
+                    format!(
+                        "INSERT INTO {keyspace}.window_probe_table (obj_id, value) VALUES (?, ?)"
+                    ),
+                    (obj_id, vec![9u8; 8]),
+                )
+                .await?;
+        }
+    }
+
+    // Outside the window the generator falls back to the clock, which is where
+    // the edge and query paths live.
+    core.session
+        .query_unpaged(
+            format!("INSERT INTO {keyspace}.window_probe_table (obj_id, value) VALUES (?, ?)"),
+            (3i64, vec![9u8; 8]),
+        )
+        .await?;
+
+    let mut stamps = Vec::new();
+    for obj_id in [1i64, 2i64, 3i64] {
+        let written = core
+            .session
+            .query_unpaged(
+                format!(
+                    "SELECT WRITETIME(value) FROM {keyspace}.window_probe_table WHERE obj_id = ?"
+                ),
+                (obj_id,),
+            )
+            .await?
+            .into_rows_result()?
+            .first_row::<(i64,)>()?
+            .0;
+        stamps.push(written);
+    }
+
+    assert_eq!(
+        stamps[0], WINDOW_US,
+        "a row written inside the window must carry the window's timestamp"
+    );
+    assert_eq!(
+        stamps[1], WINDOW_US,
+        "every row of one commit shares one timestamp"
+    );
+    assert!(
+        stamps[2] > WINDOW_US,
+        "a row written outside the window must come from the clock, not the window \
+         (got {}, window was {WINDOW_US})",
+        stamps[2]
+    );
+
+    // And the window really closed, rather than merely stopping being consulted.
+    assert!(recording.require_commit_window(4242).is_err());
 
     drop_keyspaces(&core).await;
     Ok(())
