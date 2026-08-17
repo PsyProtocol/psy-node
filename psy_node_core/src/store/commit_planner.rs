@@ -87,6 +87,25 @@ impl fmt::Display for CommitPlanError {
 
 impl Error for CommitPlanError {}
 
+/// A planned mutation set, encoded and summarised.
+///
+/// The chunk codec belongs to the storage layer, so this carries its output
+/// rather than its types.  `canonical_summary` is what the manifest commits to;
+/// it must be the exact bytes the artifact-set commitment was built from, or the
+/// PREPARED record will refuse to seal.
+pub struct PlannedLocatorArtifact {
+    pub chunks: Vec<Vec<u8>>,
+    pub mutation_digest: [u8; 32],
+    pub canonical_summary: Vec<u8>,
+    pub affected_row_count: u64,
+}
+
+impl PlannedLocatorArtifact {
+    pub fn chunk_count(&self) -> u32 {
+        self.chunks.len() as u32
+    }
+}
+
 /// Enumerates the physical rows one Coordinator commit will write.
 ///
 /// Implemented by the storage layer, because only it can decode the blobs and
@@ -98,6 +117,16 @@ pub trait CoordinatorCommitPlanner: Send + Sync {
         inputs: &CoordinatorCommitPlanInputs<'_>,
         sink: &dyn PhysicalMutationSink,
     ) -> anyhow::Result<()>;
+
+    /// Validate the planned rows and encode them into canonical chunks.
+    ///
+    /// Validation happens here, on the way in, because a locator that cannot be
+    /// resolved back to a key is useless to rollback and finding that out at
+    /// delete time is far too late.
+    fn encode_planned_locators(
+        &self,
+        rows: Vec<(u16, Vec<u8>)>,
+    ) -> anyhow::Result<PlannedLocatorArtifact>;
 }
 
 /// Positions of a checkpoint-tree leaf and every ancestor above it.

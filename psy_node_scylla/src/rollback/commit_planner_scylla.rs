@@ -21,13 +21,15 @@ use psy_data::v1::qdata::ffs_sizes::{
 use psy_node_core::store::{
     commit_planner::{
         CommitPlanError, CoordinatorCommitPlanInputs, CoordinatorCommitPlanner,
-        PhysicalMutationSink, checkpoint_tree_path_positions,
+        PhysicalMutationSink, PlannedLocatorArtifact, checkpoint_tree_path_positions,
     },
     typed::CheckpointId,
 };
+use sha2::{Digest, Sha256};
 
 use super::{
     CommitMutationSink, MutationLocatorRecord, RecordedOperation, ScyllaPhysicalTableId,
+    encode_locator_chunks,
     describe_existing_key, key_id_value_key, public_key_to_user_key, realm_reward_node_key,
     record_bidirectional_pair_put, u64_mapping_key, u64_singleton_key, versioned_object_key,
     zero_merkle_node_key,
@@ -308,6 +310,13 @@ impl CoordinatorCommitPlanner for ScyllaCoordinatorCommitPlanner {
         )?;
         Ok(())
     }
+
+    fn encode_planned_locators(
+        &self,
+        rows: Vec<(u16, Vec<u8>)>,
+    ) -> anyhow::Result<PlannedLocatorArtifact> {
+        Self::encode_locators(rows)
+    }
 }
 
 fn plan_public_key_pairs(
@@ -352,12 +361,12 @@ fn plan_reward_node_keys(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use psy_node_core::store::commit_planner::CollectingPhysicalMutationSink;
     use std::collections::BTreeSet;
 
-    fn empty_inputs() -> CoordinatorCommitPlanInputs<'static> {
+    pub(super) fn empty_inputs() -> CoordinatorCommitPlanInputs<'static> {
         CoordinatorCommitPlanInputs {
             checkpoint_id: 1001,
             unique_pending_id: 55,
@@ -539,5 +548,167 @@ mod tests {
             .map(|record| (record.physical_table(), record.locator_bytes().to_vec()))
             .collect();
         assert_eq!(distinct.len(), records.len(), "a locator was planned twice");
+    }
+}
+
+const LOCATOR_SUMMARY_MAGIC: [u8; 8] = *b"PSYMSUM1";
+const LOCATOR_SUMMARY_VERSION: u16 = 1;
+const MUTATION_DIGEST_DOMAIN: &[u8] = b"psy.rollback.planned-mutation-set.v1\0";
+const SUMMARY_DIGEST_DOMAIN: &[u8] = b"psy.rollback.locator-chunk.v1\0";
+
+/// Canonical description of a chunk set: one digest per chunk, in order.
+///
+/// Small and fixed-width, so the manifest commits to the whole artifact set
+/// without carrying it.  Order is part of the commitment, since chunk index is
+/// how a gap is detected on read.
+fn encode_locator_summary(chunks: &[Vec<u8>], affected_row_count: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + 2 + 4 + 8 + chunks.len() * 32);
+    out.extend_from_slice(&LOCATOR_SUMMARY_MAGIC);
+    out.extend_from_slice(&LOCATOR_SUMMARY_VERSION.to_be_bytes());
+    out.extend_from_slice(&(chunks.len() as u32).to_be_bytes());
+    out.extend_from_slice(&affected_row_count.to_be_bytes());
+    for chunk in chunks {
+        let mut hasher = Sha256::new();
+        hasher.update(SUMMARY_DIGEST_DOMAIN);
+        hasher.update((chunk.len() as u64).to_be_bytes());
+        hasher.update(chunk);
+        out.extend_from_slice(&hasher.finalize());
+    }
+    out
+}
+
+impl ScyllaCoordinatorCommitPlanner {
+    fn validate_planned_rows(
+        rows: Vec<(u16, Vec<u8>)>,
+    ) -> anyhow::Result<Vec<MutationLocatorRecord>> {
+        rows.into_iter()
+            .map(|(table_id, locator)| {
+                MutationLocatorRecord::try_new(
+                    ScyllaPhysicalTableId::try_from(table_id)?,
+                    RecordedOperation::Put,
+                    locator,
+                )
+                .map_err(anyhow::Error::from)
+            })
+            .collect()
+    }
+}
+
+impl ScyllaCoordinatorCommitPlanner {
+    /// Digest over the planned set, order-independent.
+    ///
+    /// A commit's rows are a set, and planning order is an implementation
+    /// detail; making the digest depend on it would turn a harmless reordering
+    /// into a false mismatch during recovery.
+    fn mutation_digest(records: &[MutationLocatorRecord]) -> [u8; 32] {
+        let mut leaves: Vec<[u8; 32]> = records
+            .iter()
+            .map(|record| {
+                let mut hasher = Sha256::new();
+                hasher.update((record.physical_table() as u16).to_be_bytes());
+                hasher.update((record.locator_bytes().len() as u32).to_be_bytes());
+                hasher.update(record.locator_bytes());
+                hasher.finalize().into()
+            })
+            .collect();
+        leaves.sort_unstable();
+        let mut hasher = Sha256::new();
+        hasher.update(MUTATION_DIGEST_DOMAIN);
+        hasher.update((leaves.len() as u64).to_be_bytes());
+        for leaf in leaves {
+            hasher.update(leaf);
+        }
+        hasher.finalize().into()
+    }
+}
+
+impl ScyllaCoordinatorCommitPlanner {
+    fn encode_locators(rows: Vec<(u16, Vec<u8>)>) -> anyhow::Result<PlannedLocatorArtifact> {
+        let records = Self::validate_planned_rows(rows)?;
+        let affected_row_count = records.len() as u64;
+        let mutation_digest = Self::mutation_digest(&records);
+        let chunks = encode_locator_chunks(&records)?;
+        let canonical_summary = encode_locator_summary(&chunks, affected_row_count);
+        Ok(PlannedLocatorArtifact {
+            chunks,
+            mutation_digest,
+            canonical_summary,
+            affected_row_count,
+        })
+    }
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    use super::*;
+    use psy_node_core::store::commit_planner::CollectingPhysicalMutationSink;
+
+    fn plan_artifact() -> PlannedLocatorArtifact {
+        let sink = CollectingPhysicalMutationSink::new();
+        let inputs = tests::empty_inputs();
+        ScyllaCoordinatorCommitPlanner::new()
+            .plan_coordinator_commit(&inputs, &sink)
+            .unwrap();
+        ScyllaCoordinatorCommitPlanner::new()
+            .encode_planned_locators(sink.take())
+            .unwrap()
+    }
+
+    #[test]
+    fn the_summary_commits_to_every_chunk_and_the_row_count() {
+        let artifact = plan_artifact();
+        assert!(artifact.affected_row_count > 0);
+        assert_eq!(artifact.chunk_count(), artifact.chunks.len() as u32);
+        // magic + version + chunk count + row count + one digest per chunk
+        assert_eq!(
+            artifact.canonical_summary.len(),
+            8 + 2 + 4 + 8 + artifact.chunks.len() * 32
+        );
+    }
+
+    #[test]
+    fn a_changed_chunk_changes_the_summary() {
+        let artifact = plan_artifact();
+        let mut tampered = artifact.chunks.clone();
+        tampered[0][artifact.chunks[0].len() - 1] ^= 0xff;
+        assert_ne!(
+            encode_locator_summary(&tampered, artifact.affected_row_count),
+            artifact.canonical_summary
+        );
+    }
+
+    #[test]
+    fn the_mutation_digest_ignores_planning_order() {
+        // A commit's rows are a set.  Making the digest order-sensitive would
+        // turn a harmless reordering of plan steps into a recovery mismatch.
+        let sink = CollectingPhysicalMutationSink::new();
+        let inputs = tests::empty_inputs();
+        ScyllaCoordinatorCommitPlanner::new()
+            .plan_coordinator_commit(&inputs, &sink)
+            .unwrap();
+        let mut rows = sink.take();
+        let forward = ScyllaCoordinatorCommitPlanner::encode_locators(rows.clone()).unwrap();
+        rows.reverse();
+        let reversed = ScyllaCoordinatorCommitPlanner::encode_locators(rows).unwrap();
+        assert_eq!(forward.mutation_digest, reversed.mutation_digest);
+        assert_eq!(forward.affected_row_count, reversed.affected_row_count);
+    }
+
+    #[test]
+    fn an_unresolvable_locator_is_refused_on_the_way_in() {
+        assert!(
+            ScyllaCoordinatorCommitPlanner::new()
+                .encode_planned_locators(vec![(1u16, vec![0xff; 12])])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn an_unknown_physical_table_is_refused() {
+        assert!(
+            ScyllaCoordinatorCommitPlanner::new()
+                .encode_planned_locators(vec![(9999u16, vec![1u8; 12])])
+                .is_err()
+        );
     }
 }
