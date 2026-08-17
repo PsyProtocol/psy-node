@@ -117,6 +117,14 @@ pub struct CoordinatorCommitRecording<Hash: Q256BitHash> {
     floor: std::sync::Arc<
         dyn super::coordinator_commit_source::CoordinatorRollbackFloorStore<Hash>,
     >,
+    /// The store's commit window.
+    ///
+    /// It rides here rather than on the store trait because `commit_state` is
+    /// generic over the store and cannot name a driver type, while the recording
+    /// is already the thing that means "this commit is being recorded".  The
+    /// session's timestamp generator reads the same clock, so opening the window
+    /// is what makes the commit's rows share one write timestamp.
+    commit_window: std::sync::Arc<super::commit_window::CommitWindowClock>,
 }
 
 impl<Hash: Q256BitHash> Clone for CoordinatorCommitRecording<Hash> {
@@ -129,6 +137,7 @@ impl<Hash: Q256BitHash> Clone for CoordinatorCommitRecording<Hash> {
             manifest: self.manifest.clone(),
             manifest_artifact: self.manifest_artifact.clone(),
             floor: self.floor.clone(),
+            commit_window: self.commit_window.clone(),
         }
     }
 }
@@ -148,6 +157,7 @@ impl<Hash: Q256BitHash> CoordinatorCommitRecording<Hash> {
         floor: std::sync::Arc<
             dyn super::coordinator_commit_source::CoordinatorRollbackFloorStore<Hash>,
         >,
+        commit_window: std::sync::Arc<super::commit_window::CommitWindowClock>,
     ) -> Self {
         Self {
             canonical_head,
@@ -157,7 +167,39 @@ impl<Hash: Q256BitHash> CoordinatorCommitRecording<Hash> {
             manifest,
             manifest_artifact,
             floor,
+            commit_window,
         }
+    }
+
+    /// Open the commit window for one checkpoint.
+    ///
+    /// Every statement the session sends while the returned guard lives carries
+    /// this timestamp, which is what makes the commit one point on the
+    /// conflict-resolution axis instead of a spread.  Dropping the guard -- on
+    /// success or on the early return of a failure -- closes it, so the next
+    /// commit cannot inherit it.
+    pub fn open_commit_window(
+        &self,
+        checkpoint_id: u64,
+        timestamp: super::timestamp::CommitWriteTimestampUs,
+    ) -> Result<
+        super::commit_window::CommitWindowGuard,
+        super::commit_window::CommitWindowError,
+    > {
+        self.commit_window
+            .open(super::commit_window::CommitWindow::new(
+                checkpoint_id,
+                timestamp,
+            ))
+    }
+
+    /// Assert the open window belongs to this checkpoint, and yield its stamp.
+    pub fn require_commit_window(
+        &self,
+        checkpoint_id: u64,
+    ) -> Result<super::timestamp::CommitWriteTimestampUs, super::commit_window::CommitWindowError>
+    {
+        self.commit_window.require_checkpoint(checkpoint_id)
     }
 
     pub fn canonical_head(

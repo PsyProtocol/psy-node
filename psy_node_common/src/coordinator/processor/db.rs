@@ -1373,6 +1373,21 @@ checkpoint_backup_copy_status={}
             )
         };
 
+        // Open the commit window before the first state write.  From here every
+        // statement the session sends carries this commit's allocated timestamp,
+        // so the whole commit lands on one point of the conflict-resolution axis
+        // -- which is what lets a rollback fence dominate it as a unit, and what
+        // stops a later write from being shadowed by that fence.  Genesis has no
+        // recording and therefore no window: it predates the rollback floor, so
+        // nothing will ever roll back through it.
+        let _commit_window = match &recorded {
+            Some(prepared) => Some(
+                self.recording
+                    .open_commit_window(checkpoint_id, prepared.lease().timestamp())?,
+            ),
+            None => None,
+        };
+
         let contract_tree_heights = coordinator_update
             .new_contract_code_definitions
             .iter()

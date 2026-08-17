@@ -15,6 +15,8 @@
 
 use std::sync::Arc;
 
+use psy_node_core::store::commit_window::CommitWindowClock;
+
 use parth_core::{crypto::hash::traits::MerkleZeroHasher, protocol::core_types::QHashBase};
 use scylla::client::session::Session;
 
@@ -88,6 +90,10 @@ pub struct CoordinatorRollbackControlPlane {
     manifest: Arc<ScyllaAuthorityManifestStore>,
     manifest_artifact: Arc<ScyllaManifestArtifactStore>,
     floor: Arc<ScyllaCoordinatorRollbackFloorStore>,
+    /// The clock the session's timestamp generator reads.  Taken from the store
+    /// rather than made here: it must be the very one the session was built with,
+    /// or a commit would open a window nothing is watching.
+    commit_window: Arc<CommitWindowClock>,
 }
 
 impl CoordinatorRollbackControlPlane {
@@ -117,9 +123,11 @@ impl CoordinatorRollbackControlPlane {
 
     pub async fn prepare(
         session: Arc<Session>,
+        commit_window: Arc<CommitWindowClock>,
         keyspaces: &RollbackControlKeyspaces,
     ) -> anyhow::Result<Self> {
         Ok(Self {
+            commit_window,
             authority_timestamp: Arc::new(
                 ScyllaAuthorityTimestampStore::prepare(
                     session.clone(),
@@ -169,7 +177,7 @@ impl CoordinatorRollbackControlPlane {
     ) -> anyhow::Result<Self> {
         let keyspaces = RollbackControlKeyspaces::from_core_store(store)?;
         Self::create_tables(&store.session, &keyspaces).await?;
-        Self::prepare(store.session.clone(), &keyspaces).await
+        Self::prepare(store.session.clone(), store.commit_window.clone(), &keyspaces).await
     }
 
     /// The driver-independent capability bundle a Coordinator processor takes.
@@ -187,6 +195,7 @@ impl CoordinatorRollbackControlPlane {
             self.manifest.clone(),
             self.manifest_artifact.clone(),
             self.floor.clone(),
+            self.commit_window.clone(),
         )
     }
 

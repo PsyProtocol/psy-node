@@ -7,12 +7,21 @@ use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::db::table::QDatab
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use tokio::time::sleep;
+use psy_node_core::store::commit_window::CommitWindowClock;
+use crate::rollback::CommitWindowTimestampGenerator;
 use crate::tables::{merkle::ScyllaMerkleNodesZeroPreparedStatements, traits::ScyllaStandardPreparedTableStatements};
 use crate::tables::traits::ScyllaNoTabletPreparedTableStatements;
 
 #[derive(Clone)]
 pub struct ScyllaCoreStore<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> {
     pub session: Arc<Session>,
+    /// The commit this store is currently writing, if any.
+    ///
+    /// The session's timestamp generator reads it on every statement, so opening
+    /// a window is what makes a commit's rows share one write timestamp.  It has
+    /// to be built before the session, because the generator is installed at
+    /// session construction and cannot be swapped afterwards.
+    pub commit_window: Arc<CommitWindowClock>,
     pub keyspace: String,
     pub no_tablet_keyspace: String,
     pub realm_id: u64,
@@ -29,8 +38,17 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
                 execution_profile = execution_profile.consistency(scylla::statement::Consistency::One)
         };
         let execution_profile = execution_profile.build();
+        // Client-side timestamps, so a commit can decide its own.  This moves
+        // every write on this session -- not only commits -- from a
+        // server-assigned timestamp to a client-assigned one; both are wall clock
+        // microseconds from a single process per node, and outside a commit the
+        // generator delegates to the driver's monotonic implementation.
+        let commit_window = Arc::new(CommitWindowClock::new());
         let session = SessionBuilder::new()
             .known_nodes(known_nodes.iter())
+            .timestamp_generator(Arc::new(CommitWindowTimestampGenerator::new(
+                commit_window.clone(),
+            )))
             .default_execution_profile_handle(execution_profile.into_handle())
             .connection_timeout(Duration::from_secs(120))
             .keepalive_timeout(Duration::from_secs(60))
@@ -66,6 +84,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
         session.await_schema_agreement().await?;
         Ok(Self {
             session,
+            commit_window,
             keyspace,
             no_tablet_keyspace,
             realm_id,

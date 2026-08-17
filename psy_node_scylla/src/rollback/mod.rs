@@ -15,6 +15,7 @@
 mod authority_timestamp_store;
 mod canonical_head_store;
 mod commit_planner_scylla;
+mod commit_window_generator;
 mod commit_source_store;
 mod control_plane;
 mod identity;
@@ -32,6 +33,7 @@ mod registry;
 pub use authority_timestamp_store::*;
 pub use canonical_head_store::*;
 pub use commit_planner_scylla::*;
+pub use commit_window_generator::*;
 pub use commit_source_store::*;
 pub use control_plane::*;
 pub use identity::{ScyllaKeyDomain, ScyllaPhysicalTableId, UnknownScyllaPhysicalTableId};

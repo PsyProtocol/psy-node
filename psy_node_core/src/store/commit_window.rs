@@ -20,10 +20,19 @@
 //! query paths that hold no timestamp at all and could only pass `None` -- which
 //! puts the mixing hazard back, and in the one place the compiler stops helping.
 //!
-//! So the window is ambient state on the store, and the safety comes from
-//! failing closed instead: a commit-path table written with no window open is an
-//! error, never a silent fall back to the server clock.  That matters because the
-//! silent case is unrecoverable in a specific way -- see below.
+//! So the window is ambient, and the driver's session timestamp generator reads
+//! it on every statement (see `rollback::commit_window_generator`).  That is a
+//! chokepoint below prepared statements, unprepared statements and batches
+//! alike, so no adapter can write around it and there is no per-adapter stamping
+//! to forget.
+//!
+//! What the window deliberately does *not* do is refuse writes that happen
+//! outside it.  The generator cannot decline -- it returns an `i64` -- and the
+//! same session carries the edge and query paths, which never write a table a
+//! rollback deletes from.  The guard against a write escaping its commit is
+//! therefore [`require_checkpoint`](CommitWindowClock::require_checkpoint) in
+//! process, and `WRITETIME()` on the stored rows after the fact: every row of a
+//! checkpoint must carry that checkpoint's timestamp exactly.
 //!
 //! ## The failure this prevents
 //!
@@ -35,7 +44,7 @@
 
 use std::error::Error;
 use std::fmt;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use super::timestamp::CommitWriteTimestampUs;
 
@@ -69,20 +78,14 @@ impl CommitWindow {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommitWindowError {
-    /// A table on the recorded commit path was written outside any commit.
+    /// The commit path asked for its timestamp with no window open.
+    NoActiveWindow { checkpoint_id: u64 },
+    /// The open window belongs to a different checkpoint than the one being
+    /// committed.
     ///
-    /// Failing here is the whole design: the alternative is the server clock,
-    /// which is exactly the value that goes silently missing after a fence.
-    NoActiveWindow { physical_table: u16 },
-    /// A commit-path write named a different checkpoint than the open window.
-    ///
-    /// Either two commits are running at once or a stale write escaped its own
-    /// commit; both would stamp rows with a timestamp that is not theirs.
-    CheckpointMismatch {
-        physical_table: u16,
-        window: u64,
-        write: u64,
-    },
+    /// Either two commits are running at once or one outlived its guard; both
+    /// would stamp rows with a timestamp that is not theirs.
+    CheckpointMismatch { window: u64, commit: u64 },
     /// A second window was opened while one was still open.  Commits are
     /// serialised by construction, so this means the caller lost track of one.
     AlreadyOpen { open: u64, requested: u64 },
@@ -91,19 +94,14 @@ pub enum CommitWindowError {
 impl fmt::Display for CommitWindowError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NoActiveWindow { physical_table } => write!(
+            Self::NoActiveWindow { checkpoint_id } => write!(
                 f,
-                "physical table {physical_table} is on the recorded commit path but was written \
-                 with no commit window open, so its rows would carry a server clock timestamp"
+                "checkpoint {checkpoint_id} asked for its write timestamp with no commit window \
+                 open, so its rows would carry a wall clock timestamp instead"
             ),
-            Self::CheckpointMismatch {
-                physical_table,
-                window,
-                write,
-            } => write!(
+            Self::CheckpointMismatch { window, commit } => write!(
                 f,
-                "physical table {physical_table} wrote checkpoint {write} while the open commit \
-                 window belongs to checkpoint {window}"
+                "the open commit window belongs to checkpoint {window}, not to checkpoint {commit}"
             ),
             Self::AlreadyOpen { open, requested } => write!(
                 f,
@@ -137,7 +135,13 @@ impl CommitWindowClock {
     /// The returned guard closes it on drop, including on the early return of a
     /// failed commit: a window left open would let the next commit's rows borrow
     /// this one's timestamp.
-    pub fn open(&self, window: CommitWindow) -> Result<CommitWindowGuard<'_>, CommitWindowError> {
+    /// Takes `&Arc<Self>` so the guard can own its handle.  A guard borrowing the
+    /// clock would borrow whatever holds it for the length of the commit, and the
+    /// commit needs `&mut self` on the processor after opening it.
+    pub fn open(
+        self: &Arc<Self>,
+        window: CommitWindow,
+    ) -> Result<CommitWindowGuard, CommitWindowError> {
         let mut slot = self.open.lock().expect("commit window mutex poisoned");
         if let Some(existing) = *slot {
             return Err(CommitWindowError::AlreadyOpen {
@@ -146,53 +150,40 @@ impl CommitWindowClock {
             });
         }
         *slot = Some(window);
-        Ok(CommitWindowGuard { clock: self })
+        drop(slot);
+        Ok(CommitWindowGuard {
+            clock: Arc::clone(self),
+        })
     }
 
-    /// The timestamp for a row that carries the checkpoint it belongs to.
+    /// The timestamp this checkpoint's rows must carry, proving the open window
+    /// is in fact its own.
     ///
-    /// Comparing the two is nearly free -- every versioned row already has the
-    /// column -- and it turns a concurrent writer that wandered into the window
-    /// from a silent mis-stamp into an error.
-    pub fn require_for_checkpoint(
+    /// The comparison costs nothing and it is the only in-process guard against
+    /// a second commit borrowing this window: the generator that stamps the rows
+    /// sees statements, not checkpoints, so it cannot notice the difference.
+    /// After the fact `WRITETIME()` on the stored rows checks the same property
+    /// against the data rather than the code.
+    pub fn require_checkpoint(
         &self,
-        physical_table: u16,
         checkpoint_id: u64,
     ) -> Result<CommitWriteTimestampUs, CommitWindowError> {
-        let window = self.require_open(physical_table)?;
+        let window = self
+            .peek()
+            .ok_or(CommitWindowError::NoActiveWindow { checkpoint_id })?;
         if window.checkpoint_id() != checkpoint_id {
             return Err(CommitWindowError::CheckpointMismatch {
-                physical_table,
                 window: window.checkpoint_id(),
-                write: checkpoint_id,
+                commit: checkpoint_id,
             });
         }
         Ok(window.timestamp())
     }
 
-    /// The timestamp for a row with no checkpoint column to compare against.
-    ///
-    /// Only for rows that genuinely have none -- the singletons and cursors that
-    /// are overwritten in place.  Anything with a checkpoint must use
-    /// [`require_for_checkpoint`](Self::require_for_checkpoint); reaching for
-    /// this instead would drop the one cross-check available.
-    pub fn require_unversioned(
-        &self,
-        physical_table: u16,
-    ) -> Result<CommitWriteTimestampUs, CommitWindowError> {
-        Ok(self.require_open(physical_table)?.timestamp())
-    }
-
-    /// The open window, without consuming it.  For assertions and diagnostics.
+    /// The open window, if any.  This is what the session's timestamp generator
+    /// reads on every statement.
     pub fn peek(&self) -> Option<CommitWindow> {
         *self.open.lock().expect("commit window mutex poisoned")
-    }
-
-    fn require_open(&self, physical_table: u16) -> Result<CommitWindow, CommitWindowError> {
-        self.open
-            .lock()
-            .expect("commit window mutex poisoned")
-            .ok_or(CommitWindowError::NoActiveWindow { physical_table })
     }
 
     fn close(&self) {
@@ -202,11 +193,11 @@ impl CommitWindowClock {
 
 /// Closes the commit window when it goes out of scope.
 #[must_use = "dropping the guard immediately closes the window the commit needs"]
-pub struct CommitWindowGuard<'a> {
-    clock: &'a CommitWindowClock,
+pub struct CommitWindowGuard {
+    clock: Arc<CommitWindowClock>,
 }
 
-impl CommitWindowGuard<'_> {
+impl CommitWindowGuard {
     /// The window this guard holds open.
     pub fn window(&self) -> CommitWindow {
         self.clock
@@ -215,7 +206,7 @@ impl CommitWindowGuard<'_> {
     }
 }
 
-impl Drop for CommitWindowGuard<'_> {
+impl Drop for CommitWindowGuard {
     fn drop(&mut self) {
         self.clock.close();
     }
@@ -230,52 +221,48 @@ mod tests {
     }
 
     #[test]
-    fn a_write_outside_any_window_is_an_error() {
-        // The point of the whole module: no window must never mean "use the
-        // server clock", because that value is what a fence silently shadows.
-        let clock = CommitWindowClock::new();
+    fn asking_for_a_timestamp_with_no_window_is_an_error() {
+        // No window must never quietly mean "use the wall clock": that value is
+        // exactly what a fence shadows afterwards.
+        let clock = Arc::new(CommitWindowClock::new());
         assert_eq!(
-            clock.require_for_checkpoint(7, 100),
-            Err(CommitWindowError::NoActiveWindow { physical_table: 7 })
-        );
-        assert_eq!(
-            clock.require_unversioned(7),
-            Err(CommitWindowError::NoActiveWindow { physical_table: 7 })
+            clock.require_checkpoint(100),
+            Err(CommitWindowError::NoActiveWindow {
+                checkpoint_id: 100
+            })
         );
     }
 
     #[test]
-    fn every_row_of_one_commit_gets_the_same_timestamp() {
-        let clock = CommitWindowClock::new();
-        let _guard = clock
-            .open(CommitWindow::new(100, ts(1_700_000_000_000_000)))
-            .expect("no window is open");
-        let first = clock.require_for_checkpoint(1, 100).expect("open");
-        let second = clock.require_for_checkpoint(2, 100).expect("open");
-        let singleton = clock.require_unversioned(3).expect("open");
-        assert_eq!(first, second);
-        assert_eq!(first, singleton);
-    }
-
-    #[test]
-    fn a_row_from_another_checkpoint_is_refused() {
-        let clock = CommitWindowClock::new();
+    fn a_window_yields_one_timestamp_for_its_own_checkpoint() {
+        let clock = Arc::new(CommitWindowClock::new());
         let _guard = clock
             .open(CommitWindow::new(100, ts(1_700_000_000_000_000)))
             .expect("no window is open");
         assert_eq!(
-            clock.require_for_checkpoint(9, 101),
+            clock.require_checkpoint(100),
+            Ok(ts(1_700_000_000_000_000))
+        );
+    }
+
+    #[test]
+    fn another_checkpoint_cannot_borrow_this_window() {
+        let clock = Arc::new(CommitWindowClock::new());
+        let _guard = clock
+            .open(CommitWindow::new(100, ts(1_700_000_000_000_000)))
+            .expect("no window is open");
+        assert_eq!(
+            clock.require_checkpoint(101),
             Err(CommitWindowError::CheckpointMismatch {
-                physical_table: 9,
                 window: 100,
-                write: 101,
+                commit: 101,
             })
         );
     }
 
     #[test]
     fn windows_do_not_nest() {
-        let clock = CommitWindowClock::new();
+        let clock = Arc::new(CommitWindowClock::new());
         let _guard = clock
             .open(CommitWindow::new(100, ts(1_700_000_000_000_000)))
             .expect("no window is open");
@@ -294,7 +281,7 @@ mod tests {
     fn a_failed_commit_does_not_leave_the_window_open() {
         // The next commit must not be able to borrow this one's timestamp, so
         // the guard has to close on the early return of a failure too.
-        let clock = CommitWindowClock::new();
+        let clock = Arc::new(CommitWindowClock::new());
         let failed: Result<(), &str> = (|| {
             let _guard = clock
                 .open(CommitWindow::new(100, ts(1_700_000_000_000_000)))
@@ -304,20 +291,22 @@ mod tests {
         assert!(failed.is_err());
         assert_eq!(clock.peek(), None);
         assert_eq!(
-            clock.require_unversioned(1),
-            Err(CommitWindowError::NoActiveWindow { physical_table: 1 })
+            clock.require_checkpoint(101),
+            Err(CommitWindowError::NoActiveWindow {
+                checkpoint_id: 101
+            })
         );
     }
 
     #[test]
     fn a_reopened_window_carries_the_new_timestamp() {
-        let clock = CommitWindowClock::new();
+        let clock = Arc::new(CommitWindowClock::new());
         {
             let _guard = clock
                 .open(CommitWindow::new(100, ts(1_700_000_000_000_000)))
                 .expect("no window is open");
             assert_eq!(
-                clock.require_for_checkpoint(1, 100).expect("open"),
+                clock.require_checkpoint(100).expect("open"),
                 ts(1_700_000_000_000_000)
             );
         }
@@ -325,7 +314,7 @@ mod tests {
             .open(CommitWindow::new(101, ts(1_700_000_000_000_050)))
             .expect("the first window closed");
         assert_eq!(
-            clock.require_for_checkpoint(1, 101).expect("open"),
+            clock.require_checkpoint(101).expect("open"),
             ts(1_700_000_000_000_050)
         );
     }
