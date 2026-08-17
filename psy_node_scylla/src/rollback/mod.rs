@@ -13,6 +13,7 @@
 //! asserts that this does not happen again.
 
 mod canonical_head_store;
+mod commit_planner_scylla;
 mod commit_source_store;
 mod control_plane;
 mod identity;
@@ -28,6 +29,7 @@ mod rollback_floor_store;
 mod registry;
 
 pub use canonical_head_store::*;
+pub use commit_planner_scylla::*;
 pub use commit_source_store::*;
 pub use control_plane::*;
 pub use identity::{ScyllaKeyDomain, ScyllaPhysicalTableId, UnknownScyllaPhysicalTableId};

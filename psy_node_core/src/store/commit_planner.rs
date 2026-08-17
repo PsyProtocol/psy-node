@@ -154,3 +154,51 @@ mod tests {
         assert_eq!(left[1..], right[1..]);
     }
 }
+
+/// Collects planned rows for one commit.
+///
+/// Lives here rather than beside the storage adapters because `commit_state`
+/// builds it, and `commit_state` must not name a driver.  The rows come out as
+/// primitives; turning them back into validated typed records is the storage
+/// layer's job, and doing that on the way back means a malformed locator is
+/// caught before it reaches a manifest.
+#[derive(Default)]
+pub struct CollectingPhysicalMutationSink {
+    rows: std::sync::Mutex<Vec<(u16, Vec<u8>)>>,
+}
+
+impl CollectingPhysicalMutationSink {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Planned rows in plan order.
+    pub fn take(&self) -> Vec<(u16, Vec<u8>)> {
+        std::mem::take(&mut self.rows.lock().expect("sink mutex poisoned"))
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.lock().expect("sink mutex poisoned").len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl PhysicalMutationSink for CollectingPhysicalMutationSink {
+    fn record_physical_put(
+        &self,
+        physical_table_id: u16,
+        locator_bytes: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        if locator_bytes.is_empty() {
+            anyhow::bail!("a planned row must carry a locator");
+        }
+        self.rows
+            .lock()
+            .expect("sink mutex poisoned")
+            .push((physical_table_id, locator_bytes));
+        Ok(())
+    }
+}
