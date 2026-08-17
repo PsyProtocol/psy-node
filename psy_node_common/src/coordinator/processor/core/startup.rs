@@ -142,7 +142,7 @@ where
             db.guta_update_queue.clone(),
             guta_create_builder_config,
             db.guta_queue_key_status_manager.get_queue_key()?,
-            global_user_tree,
+            Arc::new(tokio::sync::RwLock::new(global_user_tree)),
             db.status.clone(),
         );
 
@@ -167,7 +167,7 @@ where
                 file_system: file_system.clone(),
             },
             db.register_user_queue_key_status_manager.get_queue_key()?,
-            user_registration_tree,
+            Arc::new(tokio::sync::RwLock::new(user_registration_tree)),
             db.status.clone(),
         );
         let (deploy_contract_queue_gatherer, deploy_contract_join_handle) = EphemeralQueueGathererWithTree::new_with_status::<
@@ -190,7 +190,7 @@ where
                 file_system: file_system.clone(),
             },
             db.deploy_contract_queue_key_status_manager.get_queue_key()?,
-            global_contract_tree,
+            Arc::new(tokio::sync::RwLock::new(global_contract_tree)),
             db.status.clone(),
         );
 

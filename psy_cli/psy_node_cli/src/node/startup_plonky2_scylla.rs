@@ -386,7 +386,9 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
                     built,
                     config,
                     PsyPlonky2ZKVerifier::<C, D>::for_network(config.network)?,
+                    processor.included_proposal_backup.clone(),
                 );
+
             }
             run_realm_processor(processor, guta_gatherer_join_handle).await?;
         }

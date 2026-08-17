@@ -127,6 +127,7 @@ A change is rejected until any applicable item is corrected:
 14. Credentials, private endpoints, machine-local absolute paths, home-directory credential paths, internal hostnames, or private IPs.
 15. Log-level abuse or critical paths with no existing observability integration.
 16. Tests that prove plumbing rather than the observable contract.
+17. Duplicated state under alias names: the same concept kept as multiple variables (live copy, snapshot, aligned copy, stale-detection mirror) that must be manually kept in sync. Model state as one cohesive data structure with a single explicit shared reference (e.g. Arc<RwLock<T>>); never replace it with copy-and-pass channels, copied-snapshot stale detection, or copy-then-replay machinery. When data is already authoritative and in-band (e.g. a Proposal body carries the backup and its hash is verified), consume it directly; never rediscover it by scanning directories or matching hashes.
 
 ## Documentation Standards
 

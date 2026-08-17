@@ -150,7 +150,7 @@ impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase + 'static, Output:
         stream: Arc<Sub>,
         create_builder_config: C,
         base_queue_key: QPStandardUniqueIdQueueKey<QUEUE_TOPIC_ID, QueueItem>,
-        tree: SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
+        tree: Arc<tokio::sync::RwLock<SimpleMemoryMerkleRecorderStore<Hasher, Hash>>>,
     ) -> (Self, tokio::task::JoinHandle<Result<(), anyhow::Error>>) {
         Self::new_with_status::<Sub, C, Hash, Hasher, Builder>(stream, create_builder_config, base_queue_key, tree, {
             let status = ProcessorStatus::new();
@@ -171,7 +171,7 @@ impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase + 'static, Output:
         stream: Arc<Sub>,
         create_builder_config: C,
         base_queue_key: QPStandardUniqueIdQueueKey<QUEUE_TOPIC_ID, QueueItem>,
-        tree: SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
+        tree: Arc<tokio::sync::RwLock<SimpleMemoryMerkleRecorderStore<Hasher, Hash>>>,
         status: ProcessorStatus,
     ) -> (Self, tokio::task::JoinHandle<Result<(), anyhow::Error>>) {
         let qk = QueueKeyStatusManager::new_with_status(base_queue_key.clone(), status);
@@ -356,7 +356,7 @@ pub async fn gatherer_runner_for_tree<
     stream: Arc<Sub>,
     create_builder_config: C,
     mut queue_key: QPStandardUniqueIdQueueKey<QUEUE_TOPIC_ID, QueueItem>,
-    mut tree: SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
+    tree: Arc<tokio::sync::RwLock<SimpleMemoryMerkleRecorderStore<Hasher, Hash>>>,
     queue_key_helper: QueueKeyStatusManager<QUEUE_TOPIC_ID, QueueItem>,
     mut trigger_rx: mpsc::Receiver<oneshot::Sender<Builder::Output>>,
 ) -> anyhow::Result<()> {
@@ -365,7 +365,10 @@ pub async fn gatherer_runner_for_tree<
             tracing::error!("GATHERER_{QUEUE_TOPIC_ID}: Processor entered {:?}; stopping gatherer", queue_key_helper.status.state());
             return Ok(());
         }
-        let mut builder = match Builder::create_new_with_tree(&mut tree, queue_key.unique_id, create_builder_config.clone()).await {
+        let mut builder = match {
+            let mut tree = tree.write().await;
+            Builder::create_new_with_tree(&mut *tree, queue_key.unique_id, create_builder_config.clone()).await
+        } {
             Ok(builder) => builder,
             Err(err) => {
                 tracing::error!(
@@ -450,7 +453,10 @@ pub async fn gatherer_runner_for_tree<
                     };
                     tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Processing {} remaining items from old unique_id {} before finalize", remaining_items_bytes.len(), old_unique_id);
                     if !remaining_items_bytes.is_empty() {
-                        if let Err(err) = builder.update_from_many_queue_items_with_tree(&mut tree, remaining_items_bytes).await {
+                        if let Err(err) = {
+                            let mut tree = tree.write().await;
+                            builder.update_from_many_queue_items_with_tree(&mut *tree, remaining_items_bytes).await
+                        } {
                             tracing::error!(
                                 "GATHERER_{QUEUE_TOPIC_ID}: Error updating from remaining items: {:?}; processor will retry",
                                 err
@@ -481,7 +487,10 @@ pub async fn gatherer_runner_for_tree<
                                 "GATHERER_{QUEUE_TOPIC_ID}: Captured {} pre-finalize items for old unique_id {}",
                                 pre_final_items.len(), old_unique_id
                             );
-                            if let Err(err) = builder.update_from_many_queue_items_with_tree(&mut tree, pre_final_items).await {
+                            if let Err(err) = {
+                                let mut tree = tree.write().await;
+                                builder.update_from_many_queue_items_with_tree(&mut *tree, pre_final_items).await
+                            } {
                                 tracing::error!(
                                     "GATHERER_{QUEUE_TOPIC_ID}: Error updating from pre-finalize items: {:?}; processor will retry",
                                     err
@@ -492,7 +501,10 @@ pub async fn gatherer_runner_for_tree<
                     }
 
                     if trigger_ok {
-                        match builder.finalize_with_tree(&mut tree).await {
+                        match {
+                            let mut tree = tree.write().await;
+                            builder.finalize_with_tree(&mut *tree).await
+                        } {
                             Ok(finalized_output) => {
                                 tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Finalized output prepared, sending to processor.");
                                 if responder.send(finalized_output).is_err() {
@@ -570,7 +582,10 @@ pub async fn gatherer_runner_for_tree<
                         Ok(d) => {
                             if d.len() != 0 {
                                 tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Received {} items from queue.", d.len());
-                                if let Err(err) = builder.update_from_many_queue_items_with_tree(&mut tree, d).await {
+                                if let Err(err) = {
+                                    let mut tree = tree.write().await;
+                                    builder.update_from_many_queue_items_with_tree(&mut *tree, d).await
+                                } {
                                     tracing::error!(
                                         "GATHERER_{QUEUE_TOPIC_ID}: Error updating from queue items: {:?}; restarting gather cycle",
                                         err

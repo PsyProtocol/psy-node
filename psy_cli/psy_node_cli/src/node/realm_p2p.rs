@@ -7,9 +7,9 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::io::Write;
-use std::path::Path;
 use std::sync::Arc;
+
+
 
 use parth_common::realm_rotation::RealmRotationConfig;
 use parth_core::{
@@ -28,15 +28,16 @@ use psy_data::{
     },
     p2p::{BlsPublicKey, EndCapForwardHeader, EndCapForwardResponse, NodeId},
 };
+use psy_node_common::backup::realm::backup_end_root_from_bytes;
 use psy_node_common::coordinator::validator_registry::ValidatorRegistry;
 use psy_node_common::realm::network::{
     build_optional_realm_network, parse_proposer_node_ids, run_realm_network, OptionalRealmNetwork,
     RealmNetworkEvent,
 };
-use psy_node_common::realm::processor::{
-    consensus::{decode_proposal_body, sign_vote, verify_proposal_submission},
-    gatherers::realm_end_cap_gatherer::get_new_realm_end_cap_gatherer_backup_file_path,
-};
+use psy_node_common::realm::processor::consensus::{decode_proposal_body, sign_vote, verify_proposal_submission};
+use psy_node_common::realm::processor::core::IncludedProposalBackup;
+
+
 use psy_node_core::config::node_start_config::{RealmEdgeStartConfig, RealmProcessorStartConfig};
 use serde::Deserialize;
 
@@ -236,6 +237,7 @@ pub fn spawn_processor_realm_network<N>(
     built: OptionalRealmNetwork,
     config: &RealmProcessorStartConfig,
     proof_verifier: N::ZKVerifier,
+    included_proposal_backup: Arc<tokio::sync::RwLock<Option<IncludedProposalBackup>>>,
 )
 where
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
@@ -250,9 +252,10 @@ where
     let local_sub_id = config.realm_sub_id;
     let realm_id = config.realm_id as u32;
     let chain_id = config.network.get_chain_id();
-    let backup_directory = config.get_guta_updates_backup_path();
     let proposer_node_ids = proposer_node_ids_from_config(config)
         .expect("processor Realm P2P proposer NodeId config was validated at startup");
+    let included_proposal_backup = included_proposal_backup.clone();
+
     let roster_path = config.p2p_roster_path.as_deref().expect(
         "processor Realm P2P roster path was validated at startup",
     );
@@ -315,15 +318,14 @@ where
                             proposer.validator_user_id,
                             proof_verifier.as_ref(),
                         )?;
-                        let backup_directory = Path::new(&backup_directory)
-                            .join(format!("proposal_{}", hex::encode(proposal.proposal_id)));
-                        let backup_path = get_new_realm_end_cap_gatherer_backup_file_path(
-                            &backup_directory.to_string_lossy(),
-                            proposal.realm_id as u64,
-                            local_sub_id as u64,
-                            0,
-                        );
-                        persist_backup(&backup_path, &decoded.backup)?;
+                        let end_root = backup_end_root_from_bytes(&decoded.backup)?;
+                        *included_proposal_backup.write().await = Some(IncludedProposalBackup {
+                            proposal_id: proposal.proposal_id,
+                            end_root,
+                            backup: decoded.backup,
+                        });
+
+
                         Ok::<(), anyhow::Error>(())
                     }
                     .await;
@@ -396,19 +398,6 @@ where
     anyhow::bail!("Proposal proof is not a valid ordinary GUTA root proof")
 }
 
-fn persist_backup(path: &Path, backup: &[u8]) -> anyhow::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Realm backup path has no parent"))?;
-    std::fs::create_dir_all(parent)?;
-    let temporary = path.with_extension("backup.tmp");
-    let mut file = std::fs::File::create(&temporary)?;
-    file.write_all(backup)?;
-    file.sync_all()?;
-    std::fs::rename(&temporary, path)?;
-    std::fs::File::open(parent)?.sync_all()?;
-    Ok(())
-}
 
 /// Drive loop + edge event consumer. Inbound EndCaps are accepted locally.
 pub fn spawn_edge_realm_network<H>(built: OptionalRealmNetwork, handler: H)

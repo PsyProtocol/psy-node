@@ -1,4 +1,4 @@
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
 use parth_core::protocol::core_types::QNetworkTypesConfig;
@@ -20,6 +20,14 @@ use crate::{
 mod process_block;
 pub mod runner;
 pub mod startup;
+
+#[derive(Clone, Debug)]
+pub struct IncludedProposalBackup {
+    pub proposal_id: [u8; 32],
+    pub end_root: [u8; 32],
+    pub backup: Vec<u8>,
+}
+
 
 pub struct PsyRealmProcessor<
     N: QNetworkTypesConfig,
@@ -77,5 +85,7 @@ pub struct PsyRealmProcessor<
     pub p2p_validator_user_id: Option<u64>,
     /// Authenticated BLS keys used to verify individual votes before aggregation.
     pub p2p_bls_public_keys: Option<std::collections::HashMap<u16, psy_data::p2p::BlsPublicKey>>,
-    pub aligned_processing_tree: Arc<RwLock<Option<SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>>>>,
+    pub shared_user_tree: Arc<tokio::sync::RwLock<SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>>>,
+    pub included_proposal_backup: Arc<tokio::sync::RwLock<Option<crate::realm::processor::core::IncludedProposalBackup>>>,
+
 }

@@ -65,7 +65,7 @@ where
         //db.set_new_unique_ids().await?;
         tracing::info!("intialized realm processor database, building gatherers...");
 
-        let aligned_processing_tree = Arc::new(std::sync::RwLock::new(None));
+        let shared_user_tree = Arc::new(tokio::sync::RwLock::new(global_user_tree));
         let guta_create_builder_config = RealmGUTAEndCapGathererConfig::<N, TempDatabase, FileSystem> {
             realm_id_u64: db.state.realm_id_u64,
             realm_sub_id_u64: db.state.realm_sub_id_u64,
@@ -78,7 +78,6 @@ where
             _phantom_n: std::marker::PhantomData,
             future_pending_end_cap_jobs: Arc::new(std::sync::RwLock::new(Vec::new())),
             tree_store: db.db.clone(),
-            aligned_processing_tree: aligned_processing_tree.clone(),
         };
         let (guta_queue_gatherer, guta_join_handle) = EphemeralQueueGathererWithTree::new_with_status::<
             GUTAUpdateQueue,
@@ -90,7 +89,7 @@ where
             db.guta_update_queue.clone(),
             guta_create_builder_config,
             db.guta_queue_key_status_manager.get_queue_key()?,
-            global_user_tree,
+            shared_user_tree.clone(),
             db.status.clone(),
         );
 
@@ -106,7 +105,9 @@ where
                 bls_secret: None,
                 p2p_validator_user_id: None,
                 p2p_bls_public_keys: None,
-                aligned_processing_tree,
+                shared_user_tree,
+                included_proposal_backup: Arc::new(tokio::sync::RwLock::new(None)),
+
             },
             guta_join_handle,
         ))
@@ -134,6 +135,8 @@ where
         self.p2p_validator_user_id = Some(validator_user_id);
         self.p2p_bls_public_keys = Some(bls_public_keys);
     }
+
+
     pub async fn get_latest_checkpoint_id_internal(&self) -> anyhow::Result<u64> {
         self.db.db.get_latest_checkpoint_id().await
     }

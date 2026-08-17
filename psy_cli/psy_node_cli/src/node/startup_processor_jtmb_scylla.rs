@@ -200,7 +200,9 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_processor_node(co
                     built,
                     config,
                     PsyJTMBZKVerifier::new(verifier),
+                    processor.included_proposal_backup.clone(),
                 );
+
             }
             run_realm_processor(processor, guta_gatherer_join_handle).await?;
             tracing::info!("[REALM_BOOT] realm processor exited");

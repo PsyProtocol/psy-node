@@ -63,28 +63,160 @@ pub fn get_new_realm_end_cap_gatherer_backup_file_path(
     ))
 }
 
-/// Reads only the end_root hash from a realm gatherer backup file header.
-/// This is a lightweight check to find which backup matches a target root
-/// without mutating any in-memory tree.
-pub async fn read_realm_backup_end_root<FileSystem: TokioLikeFileSystem, Hash: QDBHashBase>(
-    file_system: &FileSystem,
-    path: &str,
-) -> anyhow::Result<Hash> {
-    let mut file: FileSystem::File = file_system.file_like_fs_open(path).await?;
-    let magic_u32 = file.read_u32_le().await?;
-    if magic_u32 != REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32 {
-        return Err(anyhow::anyhow!(
-            "Backup file magic number mismatch: expected {:x}, got {:x}",
-            REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32,
-            magic_u32
-        ));
+
+pub fn read_realm_end_cap_gatherer_backup_bytes<
+    Hasher: MerkleZeroHasher<Hash>,
+    Hash: QDBHashBase + QFHashBase<F>,
+    F: QFelt64,
+>(
+    backup: &[u8],
+    tree: &mut SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
+    realm_id_u64: u64,
+    realm_global_user_tree_height: u8,
+    coordinator_global_user_tree_height: u8,
+    insert_old_leaves: bool,
+) -> anyhow::Result<RealmGUTAEndCapGathererOutputDatabase<F, Hash>> {
+    const HEADER_LEN: usize = 4 + 32 + 32 + 8;
+    anyhow::ensure!(
+        backup.len() >= HEADER_LEN,
+        "Realm proposal backup is too small to be valid: {} bytes",
+        backup.len()
+    );
+    let magic_u32 = u32::from_le_bytes(backup[0..4].try_into().expect("4-byte magic"));
+    anyhow::ensure!(
+        magic_u32 == REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32,
+        "Realm proposal backup magic mismatch: expected {:x}, got {:x}",
+        REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32,
+        magic_u32
+    );
+    let start_global_user_tree_root = Hash::from_owned_32bytes(backup[4..36].try_into().expect("start root"));
+    anyhow::ensure!(
+        start_global_user_tree_root == tree.get_root(),
+        "Realm proposal backup start global user tree root {:?} does not match tree root {:?}",
+        start_global_user_tree_root,
+        tree.get_root()
+    );
+    let expected_end_global_user_tree_root = Hash::from_owned_32bytes(backup[36..68].try_into().expect("end root"));
+    let expected_end_caps_processed = u64::from_le_bytes(backup[68..76].try_into().expect("end-cap count"));
+    let mut cursor = Cursor::new(&backup[HEADER_LEN..]);
+    let mut actual_end_caps_processed = 0usize;
+    let mut update_user_leaves_ffs = Vec::new();
+    let mut update_user_contract_tree_nodes_ffs = Vec::new();
+    let mut update_contract_state_tree_nodes_ffs = Vec::new();
+    let mut update_contract_state_imt_leaves_ffs = Vec::new();
+    let min_user_id = realm_id_u64 << (realm_global_user_tree_height as u64);
+    let max_user_id = ((realm_id_u64 + 1) << (realm_global_user_tree_height as u64)) - 1;
+    let mut merkle_header = [0u8; QBLOB_TREE_NODE_BATCH_HEADER_SIZE];
+
+    for _ in 0..expected_end_caps_processed {
+        let mut job_id_bytes = [0u8; 24];
+        Read::read_exact(&mut cursor, &mut job_id_bytes)?;
+        let mut expected_checkpoint_bytes = [0u8; 8];
+        Read::read_exact(&mut cursor, &mut expected_checkpoint_bytes)?;
+        let mut old_hash_bytes = [0u8; 32];
+        Read::read_exact(&mut cursor, &mut old_hash_bytes)?;
+        let old_user_leaf_hash = Hash::from_owned_32bytes(old_hash_bytes);
+        let mut new_hash_bytes = [0u8; 32];
+        Read::read_exact(&mut cursor, &mut new_hash_bytes)?;
+        let new_user_leaf_hash = Hash::from_owned_32bytes(new_hash_bytes);
+        let user_leaf_node = PQEDUserLeaf::<F, Hash>::pio_read_from_io(&mut cursor)?;
+        let user_id = user_leaf_node.user_id.to_u64_value();
+        if user_id < min_user_id || user_id > max_user_id {
+            return Err(anyhow::anyhow!(
+                "User ID {} in end cap gatherer backup is out of realm {} bounds ({} - {})",
+                user_id,
+                realm_id_u64,
+                min_user_id,
+                max_user_id
+            ));
+        }
+        let mut stats_bytes = [0u8; 40];
+        Read::read_exact(&mut cursor, &mut stats_bytes)?;
+        let mut events_len_bytes = [0u8; 4];
+        Read::read_exact(&mut cursor, &mut events_len_bytes)?;
+        let events_len = u32::from_le_bytes(events_len_bytes);
+        for _ in 0..events_len {
+            let mut event_fixed = [0u8; 44];
+            Read::read_exact(&mut cursor, &mut event_fixed)?;
+            let data_len = u32::from_le_bytes(event_fixed[40..44].try_into().unwrap());
+            let mut event_data = vec![0u8; (data_len as usize) * 8];
+            Read::read_exact(&mut cursor, &mut event_data)?;
+        }
+        Read::read_exact(&mut cursor, &mut merkle_header)?;
+        let single_header_parsed = QBlobSingleMerkleNodeBatchDataView::try_read_single_node_blob_header(&merkle_header)?;
+        let user_contract_tree_nodes_size = single_header_parsed.total_size as usize - QBLOB_TREE_NODE_BATCH_HEADER_SIZE;
+        let mut user_contract_tree_nodes = vec![0u8; user_contract_tree_nodes_size];
+        Read::read_exact(&mut cursor, &mut user_contract_tree_nodes)?;
+        Read::read_exact(&mut cursor, &mut merkle_header)?;
+        let double_header_parsed = QBlobDoubleMerkleNodeBatchDataView::try_read_double_node_blob_header(&merkle_header)?;
+        let contract_state_tree_nodes_size = double_header_parsed.total_size as usize - QBLOB_TREE_NODE_BATCH_HEADER_SIZE;
+        let mut contract_state_tree_nodes = vec![0u8; contract_state_tree_nodes_size];
+        Read::read_exact(&mut cursor, &mut contract_state_tree_nodes)?;
+        let cursor_pos = cursor.position() as usize;
+        let data_ref = cursor.get_ref();
+        let footer_size = GlobalUserTreeAggregatorHeaderWithJobId::<F, Hash>::FIXED_SIZE;
+        if cursor_pos + QBLOB_TREE_NODE_BATCH_HEADER_SIZE + footer_size <= data_ref.len() {
+            let possible_header = &data_ref[cursor_pos..cursor_pos + QBLOB_TREE_NODE_BATCH_HEADER_SIZE];
+            if let Ok(imt_header_parsed) = QBlobMerkleTreeNodeBatchHeaderV1::try_read_header_from_slice(possible_header) {
+                let imt_blob_size = imt_header_parsed.total_size as usize;
+                if imt_blob_size >= QBLOB_TREE_NODE_BATCH_HEADER_SIZE && cursor_pos + imt_blob_size + footer_size <= data_ref.len() {
+                    cursor.set_position((cursor_pos + QBLOB_TREE_NODE_BATCH_HEADER_SIZE) as u64);
+                    let imt_leaf_size = imt_blob_size - QBLOB_TREE_NODE_BATCH_HEADER_SIZE;
+                    let mut imt_leaves = vec![0u8; imt_leaf_size];
+                    Read::read_exact(&mut cursor, &mut imt_leaves)?;
+                    update_contract_state_imt_leaves_ffs.extend_from_slice(&imt_leaves);
+                }
+            }
+        }
+        user_leaf_node.pio_write_to_io(&mut update_user_leaves_ffs)?;
+        update_user_contract_tree_nodes_ffs.extend_from_slice(&user_contract_tree_nodes);
+        update_contract_state_tree_nodes_ffs.extend_from_slice(&contract_state_tree_nodes);
+        if insert_old_leaves {
+            tree.set_leaf(user_id - min_user_id, old_user_leaf_hash);
+        } else {
+            tree.set_leaf(user_id - min_user_id, new_user_leaf_hash);
+        }
+        actual_end_caps_processed += 1;
     }
-    let mut start_root_hash_bytes = [0u8; 32];
-    file.read_exact(&mut start_root_hash_bytes).await?; // discard start_root
-    let mut end_root_hash_bytes = [0u8; 32];
-    file.read_exact(&mut end_root_hash_bytes).await?;
-    Ok(Hash::from_owned_32bytes(end_root_hash_bytes))
+    if actual_end_caps_processed != expected_end_caps_processed as usize {
+        anyhow::bail!(
+            "Realm proposal backup corruption: expected {} end caps, but recovered {}",
+            expected_end_caps_processed,
+            actual_end_caps_processed
+        );
+    }
+    let footer_start = cursor.position() as usize;
+    if footer_start + GlobalUserTreeAggregatorHeaderWithJobId::<F, Hash>::FIXED_SIZE > cursor.get_ref().len() {
+        anyhow::bail!(
+            "Realm proposal backup is missing GUTA footer: footer_start={}, remaining_len={}",
+            footer_start,
+            cursor.get_ref().len()
+        );
+    }
+    let mut header_bytes = vec![0u8; GlobalUserTreeAggregatorHeaderWithJobId::<F, Hash>::FIXED_SIZE];
+    Read::read_exact(&mut cursor, &mut header_bytes)?;
+    let guta_header = read_guta_header_with_job_id_from_backup_bytes::<F, Hash>(&header_bytes)?;
+    let update_global_user_tree_nodes_ffs = create_ffs_merkle_nodes_zero_id_from_hash_map_with_offset::<Hash>(
+        tree.get_changes(),
+        SimpleMerkleNodeKey {
+            level: coordinator_global_user_tree_height,
+            index: realm_id_u64,
+        },
+    );
+    Ok(RealmGUTAEndCapGathererOutputDatabase {
+        old_realm_root: start_global_user_tree_root,
+        new_realm_root: expected_end_global_user_tree_root,
+        update_global_user_tree_nodes_ffs,
+        update_user_contract_tree_nodes_ffs,
+        update_contract_state_tree_nodes_ffs,
+        update_user_leaves_ffs,
+        update_contract_state_imt_leaves_ffs,
+        total_proofs_generated: 0,
+        total_users_updated: actual_end_caps_processed as u64,
+        guta_header,
+    })
 }
+
 
 pub async fn read_realm_end_cap_gatherer_backup_file<
     Hasher: MerkleZeroHasher<Hash>,
@@ -112,200 +244,19 @@ pub async fn read_realm_end_cap_gatherer_backup_file<
             return Err(e.into());
         }
     };
-    let metadata = file.file_like_metadata().await?;
-    let file_len = metadata.len();
-    let const_size_len = 4 + 32 + 32 + 8;
-    if file_len < const_size_len as u64 {
-        return Err(anyhow::anyhow!("Backup file too small to be valid: {} bytes", metadata.len()));
-    }
-
-    let magic_u32 = file.read_u32_le().await?;
-    if magic_u32 != REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32 {
-        return Err(anyhow::anyhow!(
-            "Backup file magic number mismatch: expected {:x}, got {:x}",
-            REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32,
-            magic_u32
-        ));
-    }
-
-    let mut start_root_hash_bytes = [0u8; 32];
-    file.read_exact(&mut start_root_hash_bytes).await?;
-    let start_global_user_tree_root = Hash::from_owned_32bytes(start_root_hash_bytes);
-    if start_global_user_tree_root != tree.get_root() {
-        return Err(anyhow::anyhow!(
-            "Backup file start global user tree root {:?} does not match tree root {:?}",
-            start_global_user_tree_root,
-            tree.get_root()
-        ));
-    }
-    let mut end_root_hash_bytes = [0u8; 32];
-    file.read_exact(&mut end_root_hash_bytes).await?;
-    let expected_end_global_user_tree_root = Hash::from_owned_32bytes(end_root_hash_bytes);
-
-    let expected_end_caps_processed = file.read_u64_le().await?;
-
-    let remaining_data_len = file_len.saturating_sub(const_size_len) as usize;
-    let mut remaining_data = vec![0u8; remaining_data_len];
-    file.read_exact(&mut remaining_data).await?;
-
-    let mut cursor = Cursor::new(remaining_data);
-    let mut actual_end_caps_processed = 0usize;
-    let mut update_user_leaves_ffs = Vec::new();
-    let mut update_user_contract_tree_nodes_ffs = Vec::new();
-    let mut update_contract_state_tree_nodes_ffs = Vec::new();
-    let mut update_contract_state_imt_leaves_ffs = Vec::new();
-
-    let min_user_id = realm_id_u64 << (realm_global_user_tree_height as u64);
-    let max_user_id = ((realm_id_u64 + 1) << (realm_global_user_tree_height as u64)) - 1;
-    let mut merkle_header = [0u8; QBLOB_TREE_NODE_BATCH_HEADER_SIZE];
-
-    for _ in 0..expected_end_caps_processed {
-        // A. Read queue item fields manually to match backup body layout
-        // Layout: job_id(24) + expected_checkpoint(8) + old_hash(32) + new_hash(32)
-        //         + user_leaf(104) + stats(40) + events_len(4) + events(variable)
-        let mut job_id_bytes = [0u8; 24];
-        Read::read_exact(&mut cursor, &mut job_id_bytes)?;
-
-        let mut expected_checkpoint_bytes = [0u8; 8];
-        Read::read_exact(&mut cursor, &mut expected_checkpoint_bytes)?;
-
-        let mut old_hash_bytes = [0u8; 32];
-        Read::read_exact(&mut cursor, &mut old_hash_bytes)?;
-        let old_user_leaf_hash = Hash::from_owned_32bytes(old_hash_bytes);
-
-        let mut new_hash_bytes = [0u8; 32];
-        Read::read_exact(&mut cursor, &mut new_hash_bytes)?;
-        let new_user_leaf_hash = Hash::from_owned_32bytes(new_hash_bytes);
-
-        let user_leaf_node = PQEDUserLeaf::<F, Hash>::pio_read_from_io(&mut cursor)?;
-        let user_id = user_leaf_node.user_id.to_u64_value();
-        if user_id < min_user_id || user_id > max_user_id {
-            return Err(anyhow::anyhow!(
-                "User ID {} in end cap gatherer backup file is out of realm {} bounds ({} - {})",
-                user_id,
-                realm_id_u64,
-                min_user_id,
-                max_user_id
-            ));
-        }
-
-        // Skip stats (40 bytes)
-        let mut stats_bytes = [0u8; 40];
-        Read::read_exact(&mut cursor, &mut stats_bytes)?;
-
-        // Read events_len and skip events
-        let mut events_len_bytes = [0u8; 4];
-        Read::read_exact(&mut cursor, &mut events_len_bytes)?;
-        let events_len = u32::from_le_bytes(events_len_bytes);
-        for _ in 0..events_len {
-            // Skip fixed event fields: checkpoint_id(8) + user_id(8) + contract_id(8) + method_id(8) + event_index(8) + data_len(4) = 44 bytes
-            let mut event_fixed = [0u8; 44];
-            Read::read_exact(&mut cursor, &mut event_fixed)?;
-            let data_len = u32::from_le_bytes(event_fixed[40..44].try_into().unwrap());
-            // Skip event data: data_len * 8 bytes
-            let mut event_data = vec![0u8; (data_len as usize) * 8];
-            Read::read_exact(&mut cursor, &mut event_data)?;
-        }
-
-        // B. Read Variable Contract Blobs
-        // 1. Single Tree Nodes (User Contract Tree)
-        Read::read_exact(&mut cursor, &mut merkle_header)?;
-
-        let single_header_parsed = QBlobSingleMerkleNodeBatchDataView::try_read_single_node_blob_header(&merkle_header)?;
-
-        let user_contract_tree_nodes_size = single_header_parsed.total_size as usize - QBLOB_TREE_NODE_BATCH_HEADER_SIZE;
-        let mut user_contract_tree_nodes = vec![0u8; user_contract_tree_nodes_size];
-        Read::read_exact(&mut cursor, &mut user_contract_tree_nodes)?;
-
-        // 2. Double Tree Nodes (Contract State Tree)
-        Read::read_exact(&mut cursor, &mut merkle_header)?;
-
-        let double_header_parsed = QBlobDoubleMerkleNodeBatchDataView::try_read_double_node_blob_header(&merkle_header)?;
-
-        let contract_state_tree_nodes_size = double_header_parsed.total_size as usize - QBLOB_TREE_NODE_BATCH_HEADER_SIZE;
-        let mut contract_state_tree_nodes = vec![0u8; contract_state_tree_nodes_size];
-        Read::read_exact(&mut cursor, &mut contract_state_tree_nodes)?;
-
-        // 3. Optional IMT leaf blob. Older backups have two blobs; newer ones may include
-        // a third QBlob immediately before the footer.
-        let cursor_pos = cursor.position() as usize;
-        let data_ref = cursor.get_ref();
-        let footer_size = GlobalUserTreeAggregatorHeaderWithJobId::<F, Hash>::FIXED_SIZE;
-        if cursor_pos + QBLOB_TREE_NODE_BATCH_HEADER_SIZE + footer_size <= data_ref.len() {
-            let possible_header = &data_ref[cursor_pos..cursor_pos + QBLOB_TREE_NODE_BATCH_HEADER_SIZE];
-            if let Ok(imt_header_parsed) = QBlobMerkleTreeNodeBatchHeaderV1::try_read_header_from_slice(possible_header) {
-                let imt_blob_size = imt_header_parsed.total_size as usize;
-                if imt_blob_size >= QBLOB_TREE_NODE_BATCH_HEADER_SIZE && cursor_pos + imt_blob_size + footer_size <= data_ref.len() {
-                    cursor.set_position((cursor_pos + QBLOB_TREE_NODE_BATCH_HEADER_SIZE) as u64);
-                    let imt_leaf_size = imt_blob_size - QBLOB_TREE_NODE_BATCH_HEADER_SIZE;
-                    let mut imt_leaves = vec![0u8; imt_leaf_size];
-                    Read::read_exact(&mut cursor, &mut imt_leaves)?;
-                    update_contract_state_imt_leaves_ffs.extend_from_slice(&imt_leaves);
-                }
-            }
-        }
-
-        // C. Apply Logic
-        user_leaf_node.pio_write_to_io(&mut update_user_leaves_ffs)?;
-        update_user_contract_tree_nodes_ffs.extend_from_slice(&user_contract_tree_nodes);
-        update_contract_state_tree_nodes_ffs.extend_from_slice(&contract_state_tree_nodes);
-
-        if insert_old_leaves {
-            tree.set_leaf(user_id - min_user_id, old_user_leaf_hash);
-        } else {
-            tree.set_leaf(user_id - min_user_id, new_user_leaf_hash);
-        }
-        actual_end_caps_processed += 1;
-    }
-
-    if actual_end_caps_processed != expected_end_caps_processed as usize {
-        anyhow::bail!(
-            "Backup file corruption: expected {} end caps, but recovered {}. This indicates file corruption or incomplete write.",
-            expected_end_caps_processed,
-            actual_end_caps_processed
-        );
-    }
-
-    tracing::info!(
-        "Expected end_global_user_tree_root: {:?},  actual end_global_user_tree_root: {:?}",
-        expected_end_global_user_tree_root,
-        tree.get_root(),
-    );
-
-    let footer_start = cursor.position() as usize;
-    if footer_start + GlobalUserTreeAggregatorHeaderWithJobId::<F, Hash>::FIXED_SIZE > cursor.get_ref().len() {
-        anyhow::bail!(
-            "Realm backup file {} is missing GUTA footer: footer_start={}, remaining_len={}",
-            file_path,
-            footer_start,
-            cursor.get_ref().len()
-        );
-    }
-    let mut header_bytes = vec![0u8; GlobalUserTreeAggregatorHeaderWithJobId::<F, Hash>::FIXED_SIZE];
-    Read::read_exact(&mut cursor, &mut header_bytes)?;
-    let guta_header = read_guta_header_with_job_id_from_backup_bytes::<F, Hash>(&header_bytes)?;
-
-    let update_global_user_tree_nodes_ffs = create_ffs_merkle_nodes_zero_id_from_hash_map_with_offset::<Hash>(
-        tree.get_changes(),
-        SimpleMerkleNodeKey {
-            level: coordinator_global_user_tree_height,
-            index: realm_id_u64,
-        },
-    );
-
-    Ok(RealmGUTAEndCapGathererOutputDatabase {
-        old_realm_root: start_global_user_tree_root,
-        new_realm_root: expected_end_global_user_tree_root,
-        update_global_user_tree_nodes_ffs,
-        update_user_contract_tree_nodes_ffs,
-        update_contract_state_tree_nodes_ffs,
-        update_user_leaves_ffs,
-        update_contract_state_imt_leaves_ffs,
-        total_proofs_generated: 0,
-        total_users_updated: actual_end_caps_processed as u64,
-        guta_header,
-    })
+    let file_len = file.file_like_metadata().await?.len() as usize;
+    let mut backup = vec![0u8; file_len];
+    file.read_exact(&mut backup).await?;
+    read_realm_end_cap_gatherer_backup_bytes(
+        &backup,
+        tree,
+        realm_id_u64,
+        realm_global_user_tree_height,
+        coordinator_global_user_tree_height,
+        insert_old_leaves,
+    )
 }
+
 
 fn write_guta_header_with_job_id_backup_bytes<F: QFelt64, Hash: Q256BitHash>(
     guta_header: &GlobalUserTreeAggregatorHeaderWithJobId<F, Hash>,
@@ -382,7 +333,7 @@ pub struct RealmGUTAEndCapGathererConfig<
     pub checkpoint_tree: Arc<PsyDashMemoryAppendOnlyMerkleStore<N::HasherBase, N::QHash>>,
     pub future_pending_end_cap_jobs: Arc<RwLock<Vec<PlannedFutureEndCapJob<N::F, N::QHash>>>>,
     pub tree_store: Arc<dyn PsyNodeGlobalUserTreeDatabaseReader<N::QHash> + Send + Sync>,
-    pub aligned_processing_tree: Arc<RwLock<Option<SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>>>>,
+
     pub _phantom_n: std::marker::PhantomData<N>,
 }
 impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>, FileSystem: TokioLikeFileSystem> Clone
@@ -400,7 +351,6 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
             checkpoint_tree: self.checkpoint_tree.clone(),
             future_pending_end_cap_jobs: self.future_pending_end_cap_jobs.clone(),
             tree_store: self.tree_store.clone(),
-            aligned_processing_tree: self.aligned_processing_tree.clone(),
             _phantom_n: std::marker::PhantomData,
         }
     }
@@ -418,15 +368,9 @@ pub struct RealmGUTAEndCapGatherer<
     pub total_users_updated: u64,
     pub new_realm_end_cap_gatherer_file: FileSystem::File,
     pub pending_file_path: String,
-    applied_queue_items: Vec<Vec<u8>>,
+
 }
 
-fn gathering_base_is_current<Hash: PartialEq>(
-    shared: &RealmProcessorCoreState<Hash>,
-    snapshot: &RealmProcessorCoreState<Hash>,
-) -> bool {
-    shared.processing_realm_end_root == snapshot.processing_realm_end_root
-}
 fn publish_gathering_snapshot_if_current<Hash: PartialEq + Copy + std::fmt::Debug>(
     shared_status: &Arc<RwLock<RealmProcessorCoreState<Hash>>>,
     snapshot: &RealmProcessorCoreState<Hash>,
@@ -461,126 +405,6 @@ fn publish_gathering_snapshot_if_current<Hash: PartialEq + Copy + std::fmt::Debu
     }
 }
 
-impl<
-        N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
-        TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + Send + Sync + 'static,
-        FileSystem: TokioLikeFileSystem,
-    > RealmGUTAEndCapGatherer<N, TempDatabase, FileSystem>
-{
-    async fn align_recorder_to_processing_root(
-        &mut self,
-        tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
-        live_status: &RealmProcessorCoreState<N::QHash>,
-    ) -> anyhow::Result<()> {
-        if let Some(aligned) = self
-            .config
-            .aligned_processing_tree
-            .write()
-            .map_err(|e| anyhow::anyhow!("error writing aligned processing tree {:?}", e))?
-            .take()
-        {
-            anyhow::ensure!(
-                aligned.get_root() == live_status.processing_realm_end_root,
-                "aligned processing tree root {:?} does not match processing_realm_end_root {:?}",
-                aligned.get_root(),
-                live_status.processing_realm_end_root
-            );
-            tracing::info!(
-                "Aligning RealmGUTAEndCapGatherer recorder from {:?} to in-process processing tree {:?}",
-                tree.get_root(),
-                aligned.get_root()
-            );
-            *tree = aligned;
-        } else {
-            anyhow::ensure!(
-                tree.get_root() == live_status.processing_realm_end_root
-                    || tree.get_root() == live_status.gathering_realm_start_root,
-                "live recorder root {:?} matches neither processing_realm_end_root {:?} nor gathering_realm_start_root {:?}",
-                tree.get_root(),
-                live_status.processing_realm_end_root,
-                live_status.gathering_realm_start_root
-            );
-            tracing::info!(
-                "Keeping live RealmGUTAEndCapGatherer recorder root {:?} at processing checkpoint {}",
-                tree.get_root(),
-                live_status.processing_checkpoint_id
-            );
-        }
-        self.start_global_user_tree_root = tree.get_root();
-        self.last_committed_checkpoint_root = self.config.checkpoint_tree.get_root();
-        Ok(())
-    }
-
-    async fn replay_applied_end_caps_on_processing_root(
-        &mut self,
-        tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
-        live_status: RealmProcessorCoreState<N::QHash>,
-    ) -> anyhow::Result<()> {
-        self.align_recorder_to_processing_root(tree, &live_status).await?;
-        if tree.get_root() != live_status.processing_realm_end_root {
-            tracing::info!(
-                "Skipping EndCap replay because live recorder root {:?} is already the processing suffix, not the processing base {:?}",
-                tree.get_root(),
-                live_status.processing_realm_end_root
-            );
-            return Ok(());
-        }
-        self.new_realm_end_cap_gatherer_file.seek(tokio::io::SeekFrom::Start(0)).await?;
-        self.new_realm_end_cap_gatherer_file.file_like_set_len(0).await?;
-        self.new_realm_end_cap_gatherer_file
-            .write_u32_le(REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32)
-            .await?;
-        self.new_realm_end_cap_gatherer_file
-            .write_all(&tree.get_root().into_owned_32bytes())
-            .await?;
-        self.new_realm_end_cap_gatherer_file
-            .write_all(&tree.get_root().into_owned_32bytes())
-            .await?;
-        self.new_realm_end_cap_gatherer_file.write_u64_le(0).await?;
-        self.config
-            .file_system
-            .file_like_fs_flush_file_with_path(&self.pending_file_path, &mut self.new_realm_end_cap_gatherer_file)
-            .await?;
-
-        self.guta_planner = RealmGUTAPlanner::<N::F, N::QHash>::new(
-            live_status.chain_id,
-            live_status.realm_identifier,
-            live_status.gathering_checkpoint_root,
-            live_status.gathering_checkpoint_id,
-            self.status.gathering_unique_pending_id,
-            tree.get_root(),
-            N::REALM_GLOBAL_USER_TREE_HEIGHT,
-            N::GLOBAL_USER_TREE_HEIGHT,
-            self.config.coordinator_guta_updates_circuit_whitelist,
-        );
-        let replay_items = self.applied_queue_items.clone();
-        tracing::info!(
-            "Replaying {} gathered EndCaps on processing_realm_end_root {:?} at processing checkpoint {}",
-            replay_items.len(),
-            tree.get_root(),
-            live_status.processing_checkpoint_id
-        );
-        for item in replay_items {
-            let update_header = PsyRealmUserUpdateQueueItem::<N::F, N::QHash>::psy_ser_from_slice(&item)?;
-            self.guta_planner
-                .add_end_cap_job(
-                    &self.config.checkpoint_tree,
-                    tree,
-                    &mut self.new_realm_end_cap_gatherer_file,
-                    self.config.temp_db.clone(),
-                    &item,
-                    update_header,
-                )
-                .await?;
-        }
-        self.total_users_updated = self.guta_planner.total_end_caps_processed as u64;
-        self.config
-            .file_system
-            .file_like_fs_flush_file_with_path(&self.pending_file_path, &mut self.new_realm_end_cap_gatherer_file)
-            .await?;
-        Ok(())
-    }
-}
 #[derive(Clone)]
 pub struct RealmGUTAEndCapGathererOutputDatabase<F, Hash> {
     pub old_realm_root: Hash,
@@ -739,7 +563,7 @@ impl<
             new_realm_end_cap_gatherer_file,
             start_global_user_tree_root: tree.get_root(),
             pending_file_path: new_realm_end_cap_gatherer_file_path.to_string_lossy().to_string(),
-            applied_queue_items: Vec::new(),
+
         })
     }
     async fn update_from_queue_item_with_tree(
@@ -758,7 +582,6 @@ impl<
         }
         let update_header = PsyRealmUserUpdateQueueItem::<N::F, N::QHash>::psy_ser_from_slice(&item)?;
         tracing::info!("RealmGUTAEndCapGatherer processing queue item update_header {:?}", update_header);
-        self.applied_queue_items.push(item.clone());
         self.guta_planner
             .add_end_cap_job(
                 &self.config.checkpoint_tree,
@@ -793,15 +616,6 @@ impl<
             self.status.gathering_unique_pending_id,
             tree.get_root()
         );
-        let live_status = self
-            .config
-            .status
-            .read()
-            .map_err(|e| anyhow::anyhow!("error reading status {:?}", e))?
-            .clone();
-        if !gathering_base_is_current(&live_status, &self.status) {
-            self.replay_applied_end_caps_on_processing_root(tree, live_status).await?;
-        }
         let needs_revert = {
             self.config
                 .status

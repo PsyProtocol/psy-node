@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+
 use parth_core::{
     crypto::hash::traits::{HashTo4Felts, MerkleZeroHasher},
     felt::ToU64Value,
@@ -33,17 +34,22 @@ use psy_node_core::{
 };
 
 use crate::{
-    backup::realm::{find_realm_backups_by_end_root, generate_realm_output_from_backup_path, load_realm_memory_trees_from_db},
+    backup::realm::{
+        backup_end_root_from_bytes, generate_realm_output_from_backup_bytes, load_realm_memory_trees_from_db,
+    },
     p2p::guta_submit::GutaSubmitError,
     realm::{
         processor::{
             consensus::{build_bound_finalize_output, form_certificate, require_nonzero_validator_tree_root, sign_vote, validate_certificate, votes_meet_wait},
-            core::PsyRealmProcessor,
-            gatherers::realm_end_cap_gatherer::{get_new_realm_end_cap_gatherer_backup_file_path, RealmGUTAEndCapGathererOutput},
+            core::{IncludedProposalBackup, PsyRealmProcessor},
+            gatherers::realm_end_cap_gatherer::{
+                get_new_realm_end_cap_gatherer_backup_file_path, RealmGUTAEndCapGathererOutput,
+            },
         },
         queue_key::RealmProvingWorkQueueKey,
     },
 };
+
 
 impl<
         N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
@@ -208,25 +214,6 @@ where
             return self.db.sync_to_coordinator_set_checkpoint_id().await;
         }
         let included_checkpoint_id = coordinator_realm_state.checkpoint_id;
-
-        let file_system = self.db.checkpoint_tree_backup_manager.file_system.clone();
-        let matching_backups = find_realm_backups_by_end_root::<FileSystem, N::QHash>(
-            file_system.as_ref(),
-            &self.guta_gatherer_backup_directory,
-            self.db.state.realm_id_u64,
-            self.db.state.realm_sub_id_u64,
-            coordinator_realm_state.value,
-        )
-        .await?;
-        if matching_backups.is_empty() {
-            anyhow::bail!(
-                "Checkpoint {}: Realm root changed from {:?} to {:?}, but no matching standard or proposal backup was found under {}",
-                included_checkpoint_id,
-                self.db.state.last_committed_realm_end_root,
-                coordinator_realm_state.value,
-                self.guta_gatherer_backup_directory
-            );
-        }
         self.ensure_uncommitted_processing_ids().await?;
 
         let coordinator_update = self
@@ -234,6 +221,27 @@ where
             .coordinator_client
             .rc_get_realm_sync_info(included_checkpoint_id, self.db.state.realm_id_u64)
             .await?;
+        let included = self
+            .included_proposal_backup
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Checkpoint {}: Realm root changed from {:?} to {:?}, but no verified Proposal backup is in memory",
+                    included_checkpoint_id,
+                    self.db.state.last_committed_realm_end_root,
+                    coordinator_realm_state.value
+                )
+            })?;
+        let included_root_bytes = coordinator_realm_state.value.into_owned_32bytes();
+        anyhow::ensure!(
+            included.end_root == included_root_bytes,
+            "Checkpoint {}: verified Proposal backup end_root {:?} does not match included root {:?}",
+            included_checkpoint_id,
+            included.end_root,
+            included_root_bytes
+        );
         let (base_scratch_tree,) = load_realm_memory_trees_from_db::<N, _>(
             &self.db.db,
             self.db.state.last_committed_checkpoint_id,
@@ -241,74 +249,57 @@ where
         )
         .await?
         .into_tuple();
-        for backup in matching_backups {
-            let mut recovery_state = self.db.state.clone();
-            recovery_state.processing_checkpoint_id = included_checkpoint_id;
-            recovery_state.processing_checkpoint_root = coordinator_update.checkpoint_sync_info.checkpoint_tree_root;
-            recovery_state.processing_realm_start_root = self.db.state.last_committed_realm_end_root;
-            recovery_state.processing_realm_end_root = coordinator_realm_state.value;
-            let mut scratch_tree = base_scratch_tree.clone();
-            match generate_realm_output_from_backup_path::<N, FileSystem>(
-                file_system.as_ref(),
-                &backup.path,
-                &recovery_state,
-                &mut scratch_tree,
-            )
-            .await
-            {
-                Ok(updates) if backup_matches_included_root(&updates.new_realm_root, &coordinator_realm_state.value) => {
-                    self.db.state.processing_checkpoint_id = recovery_state.processing_checkpoint_id;
-                    self.db.state.processing_checkpoint_root = recovery_state.processing_checkpoint_root;
-                    self.db.state.processing_realm_start_root = recovery_state.processing_realm_start_root;
-                    self.db.state.processing_realm_end_root = recovery_state.processing_realm_end_root;
-                    self.db
-                        .commit_state(&coordinator_update, &updates, ProvingJobCircuitType::GUTANoChange, vec![], true)
-                        .await?;
-                    self.db.state.processing_realm_end_root = coordinator_realm_state.value;
-                    self.db.state.gathering_realm_start_root = coordinator_realm_state.value;
-                    self.db
-                        .shared_state
-                        .update_from_core_state(&self.db.state)
-                        .await?;
-                    *self
-                        .aligned_processing_tree
-                        .write()
-                        .map_err(|e| anyhow::anyhow!("error writing aligned processing tree {:?}", e))? = Some(scratch_tree);
-                    tracing::info!(
-                        "Published authenticated gatherer base end_root={:?} checkpoint_id={}",
-                        coordinator_realm_state.value,
-                        included_checkpoint_id
-                    );
-                    tracing::info!(
-                        "Applied Realm proposal backup end_root={:?} checkpoint_id={} path={}",
-                        updates.new_realm_root,
-                        included_checkpoint_id,
-                        backup.path.display()
-                    );
-                    self.db.sync_to_coordinator_set_checkpoint_id().await?;
-                    return Ok(());
-                }
-                Ok(updates) => tracing::warn!(
-                    "Realm backup full load end_root {:?} does not match included root {:?}: path={}",
-                    updates.new_realm_root,
-                    coordinator_realm_state.value,
-                    backup.path.display()
-                ),
-                Err(error) => tracing::warn!(
-                    "Realm backup matched included end_root but full load failed: path={} error={:#}",
-                    backup.path.display(),
-                    error
-                ),
-            }
-        }
-
-        anyhow::bail!(
-            "Checkpoint {}: Realm root changed from {:?} to {:?}, but every matching backup failed full load",
+        let mut recovery_state = self.db.state.clone();
+        recovery_state.processing_checkpoint_id = included_checkpoint_id;
+        recovery_state.processing_checkpoint_root = coordinator_update.checkpoint_sync_info.checkpoint_tree_root;
+        recovery_state.processing_realm_start_root = self.db.state.last_committed_realm_end_root;
+        recovery_state.processing_realm_end_root = coordinator_realm_state.value;
+        let mut scratch_tree = base_scratch_tree;
+        let updates = generate_realm_output_from_backup_bytes::<N>(
+            &included.backup,
+            &recovery_state,
+            &mut scratch_tree,
+        )?;
+        anyhow::ensure!(
+            backup_matches_included_root(&updates.new_realm_root, &coordinator_realm_state.value),
+            "Checkpoint {}: Realm proposal backup new_realm_root {:?} does not match included root {:?} proposal={}",
             included_checkpoint_id,
-            self.db.state.last_committed_realm_end_root,
-            coordinator_realm_state.value
-        )
+            updates.new_realm_root,
+            coordinator_realm_state.value,
+            hex::encode(included.proposal_id)
+        );
+        self.db.state.processing_checkpoint_id = recovery_state.processing_checkpoint_id;
+        self.db.state.processing_checkpoint_root = recovery_state.processing_checkpoint_root;
+        self.db.state.processing_realm_start_root = recovery_state.processing_realm_start_root;
+        self.db.state.processing_realm_end_root = recovery_state.processing_realm_end_root;
+        self.db
+            .commit_state(&coordinator_update, &updates, ProvingJobCircuitType::GUTANoChange, vec![], true)
+            .await?;
+        self.db.state.processing_realm_end_root = coordinator_realm_state.value;
+        self.db.state.gathering_realm_start_root = coordinator_realm_state.value;
+        self.db
+            .shared_state
+            .update_from_core_state(&self.db.state)
+            .await?;
+        *self.shared_user_tree.write().await = scratch_tree;
+        tracing::info!(
+            "Replaced shared gatherer tree with authenticated end_root={:?} checkpoint_id={}",
+            coordinator_realm_state.value,
+            included_checkpoint_id
+        );
+        tracing::info!(
+            "Applied Realm proposal backup end_root={:?} checkpoint_id={} proposal={}",
+            updates.new_realm_root,
+            included_checkpoint_id,
+            hex::encode(included.proposal_id)
+        );
+        self.db.sync_to_coordinator_set_checkpoint_id().await?;
+        Ok(())
     }
+
+
+
+
 
     pub async fn process_block(&mut self) -> anyhow::Result<()> {
         self.db.run_sanity_check("process_block start").await?;
@@ -643,6 +634,12 @@ where
             backup_hash,
             body_hash,
         );
+        *self.included_proposal_backup.write().await = Some(IncludedProposalBackup {
+            proposal_id: proposal.proposal_id,
+            end_root: backup_end_root_from_bytes(&backup_bytes)?,
+            backup: backup_bytes.clone(),
+        });
+
 
         let message = vote_message(
             proposal.chain_id,
@@ -861,3 +858,4 @@ mod tests {
         assert!(!backup_matches_included_root(&[0xAA; 32], &[0xAB; 32]));
     }
 }
+
