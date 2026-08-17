@@ -17,6 +17,11 @@ use scylla::{
     statement::{batch::Batch, prepared::PreparedStatement, Statement},
 };
 
+use psy_node_core::store::typed::CheckpointId;
+use crate::rollback::{
+    CommitMutationSink, ScyllaPhysicalTableId, physical_table_by_name,
+    record_versioned_object_put,
+};
 use crate::{
     constants::{INSERT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE},
     table_creator::create_table_if_not_exists,
@@ -48,6 +53,109 @@ pub struct ScyllaGenericObjectSingleIdTablePreparedStatements {
     pub keyspace: String,
     pub table_name: String,
     pub table_key: QDatabaseTableRoutingKey,
+    /// Which versioned object table this adapter serves.
+    ///
+    /// Required at construction, like the Merkle writers: a table absent from
+    /// the typed registry would write unrecorded rows.
+    pub physical_table: ScyllaPhysicalTableId,
+}
+
+/// A decoded versioned-object row set, recorded and ready to write.
+pub struct VersionedObjectWritePlan {
+    values: Vec<(i64, i64, Vec<u8>)>,
+}
+
+impl VersionedObjectWritePlan {
+    /// How many physical rows this plan will write.
+    pub fn row_count(&self) -> usize {
+        self.values.len()
+    }
+}
+
+/// Decode a fast-serialized row set whose object id sits in the first eight
+/// bytes, and hand every row to `sink`.
+///
+/// Same contract as the Merkle writers: design-r1 §3 needs the mutation set
+/// before any hot write, so decoding is separate from execution.
+pub fn plan_versioned_objects_id_at_start(
+    physical_table: ScyllaPhysicalTableId,
+    object_size_without_id: usize,
+    checkpoint_id: u64,
+    data: &[u8],
+    sink: &dyn CommitMutationSink,
+) -> anyhow::Result<VersionedObjectWritePlan> {
+    let object_size_with_id = object_size_without_id + 8;
+    let checkpoint_i64 = convert_checkpoint_id_to_i64(checkpoint_id);
+    if data.len() % object_size_with_id != 0 {
+        anyhow::bail!("Data length is not a multiple of object size with id");
+    }
+    let values: Vec<(i64, i64, Vec<u8>)> = data
+        .par_chunks(object_size_with_id)
+        .map(|slice| {
+            let value_bytes = crate::compression::compress(&slice[8..object_size_with_id])
+                .expect("zstd compress failed");
+            (
+                i64::from_le_bytes(slice[0..8].try_into().unwrap()),
+                checkpoint_i64,
+                value_bytes,
+            )
+        })
+        .collect();
+    record_versioned_object_rows(physical_table, checkpoint_id, &values, sink)?;
+    Ok(VersionedObjectWritePlan { values })
+}
+
+/// Decode a fast-serialized row set whose object id sits at a fixed offset.
+pub fn plan_versioned_objects_id_at_index(
+    physical_table: ScyllaPhysicalTableId,
+    object_size: usize,
+    object_id_location: usize,
+    checkpoint_id: u64,
+    rows: &[u8],
+    sink: &dyn CommitMutationSink,
+) -> anyhow::Result<VersionedObjectWritePlan> {
+    let checkpoint_i64 = convert_checkpoint_id_to_i64(checkpoint_id);
+    if rows.len() % object_size != 0 {
+        anyhow::bail!("Data length is not a multiple of object size");
+    }
+    if object_id_location + 8 > object_size {
+        anyhow::bail!("Object id does not fit inside the row");
+    }
+    let values: Vec<(i64, i64, Vec<u8>)> = rows
+        .par_chunks(object_size)
+        .map(|slice| {
+            let value_bytes = crate::compression::compress(slice).expect("zstd compress failed");
+            (
+                i64::from_le_bytes(
+                    slice[object_id_location..object_id_location + 8]
+                        .try_into()
+                        .unwrap(),
+                ),
+                checkpoint_i64,
+                value_bytes,
+            )
+        })
+        .collect();
+    record_versioned_object_rows(physical_table, checkpoint_id, &values, sink)?;
+    Ok(VersionedObjectWritePlan { values })
+}
+
+fn record_versioned_object_rows(
+    physical_table: ScyllaPhysicalTableId,
+    checkpoint_id: u64,
+    values: &[(i64, i64, Vec<u8>)],
+    sink: &dyn CommitMutationSink,
+) -> anyhow::Result<()> {
+    let checkpoint = CheckpointId::try_new(checkpoint_id)?;
+    for (obj_id, _, _) in values {
+        record_versioned_object_put(
+            sink,
+            physical_table,
+            i64_to_u64_exact(*obj_id),
+            checkpoint,
+        )?;
+    }
+    Ok(())
 }
 
 impl ScyllaGenericObjectSingleIdTablePreparedStatements {
@@ -93,6 +201,12 @@ impl ScyllaGenericObjectSingleIdTablePreparedStatements {
             keyspace: keyspace.to_string(),
             table_name: table_name.to_string(),
             table_key,
+            physical_table: physical_table_by_name(table_name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "versioned object table {table_name:?} is not in the typed registry, so its \
+                     writes could not be recorded for rollback"
+                )
+            })?,
         })
     }
     pub async fn create_table(session: Arc<Session>, keyspace: &str, table_name: &str, _table_key: QDatabaseTableRoutingKey) -> anyhow::Result<()> {
@@ -752,5 +866,144 @@ impl ScyllaGenericObjectSingleIdTablePreparedStatements {
             }
         }
         Ok(results)
+    }
+}
+
+#[cfg(test)]
+mod recording_tests {
+    use super::*;
+    use crate::rollback::{
+        CollectingMutationSink, RecordedOperation, describe_existing_key, versioned_object_key,
+    };
+
+    const VALUE_LEN: usize = 16;
+
+    fn blob_id_at_start(ids: &[u64]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for id in ids {
+            out.extend_from_slice(&id.to_le_bytes());
+            out.extend_from_slice(&[1u8; VALUE_LEN]);
+        }
+        out
+    }
+
+    fn blob_id_at_index(ids: &[u64], offset: usize, row_len: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for id in ids {
+            let mut row = vec![2u8; row_len];
+            row[offset..offset + 8].copy_from_slice(&id.to_le_bytes());
+            out.extend_from_slice(&row);
+        }
+        out
+    }
+
+    #[test]
+    fn every_row_that_will_be_written_is_recorded_exactly_once() {
+        let ids = [7u64, 8, 9, 10];
+        let sink = CollectingMutationSink::new();
+        let plan = plan_versioned_objects_id_at_start(
+            ScyllaPhysicalTableId::ContractLeaf,
+            VALUE_LEN,
+            31,
+            &blob_id_at_start(&ids),
+            &sink,
+        )
+        .unwrap();
+        assert_eq!(plan.row_count(), ids.len());
+        let records = sink.take();
+        assert_eq!(records.len(), plan.row_count());
+        let checkpoint = CheckpointId::try_new(31).unwrap();
+        for (record, id) in records.iter().zip(ids) {
+            assert_eq!(record.operation(), RecordedOperation::Put);
+            let expected = describe_existing_key(
+                &versioned_object_key(ScyllaPhysicalTableId::ContractLeaf, id, checkpoint).unwrap(),
+            );
+            assert_eq!(record.locator_bytes(), expected.locator_bytes());
+        }
+    }
+
+    #[test]
+    fn an_id_at_a_fixed_offset_is_read_from_that_offset() {
+        // user_leaf rows carry the id somewhere other than the front, so reading
+        // it from the wrong place would record a locator for a row that was
+        // never written while missing the one that was.
+        let ids = [100u64, 200];
+        let offset = 24;
+        let row_len = 64;
+        let sink = CollectingMutationSink::new();
+        let plan = plan_versioned_objects_id_at_index(
+            ScyllaPhysicalTableId::UserLeaf,
+            row_len,
+            offset,
+            5,
+            &blob_id_at_index(&ids, offset, row_len),
+            &sink,
+        )
+        .unwrap();
+        assert_eq!(plan.row_count(), ids.len());
+        let checkpoint = CheckpointId::try_new(5).unwrap();
+        for (record, id) in sink.take().iter().zip(ids) {
+            let expected = describe_existing_key(
+                &versioned_object_key(ScyllaPhysicalTableId::UserLeaf, id, checkpoint).unwrap(),
+            );
+            assert_eq!(record.locator_bytes(), expected.locator_bytes());
+        }
+    }
+
+    #[test]
+    fn an_id_that_does_not_fit_the_row_is_refused() {
+        let sink = CollectingMutationSink::new();
+        assert!(
+            plan_versioned_objects_id_at_index(
+                ScyllaPhysicalTableId::UserLeaf,
+                16,
+                12,
+                1,
+                &vec![0u8; 16],
+                &sink,
+            )
+            .is_err()
+        );
+        assert!(sink.is_empty());
+    }
+
+    #[test]
+    fn a_malformed_blob_is_refused_before_anything_is_recorded() {
+        let sink = CollectingMutationSink::new();
+        let mut truncated = blob_id_at_start(&[1]);
+        truncated.pop();
+        assert!(
+            plan_versioned_objects_id_at_start(
+                ScyllaPhysicalTableId::ContractLeaf,
+                VALUE_LEN,
+                1,
+                &truncated,
+                &sink,
+            )
+            .is_err()
+        );
+        assert!(sink.is_empty());
+    }
+
+    #[test]
+    fn a_mixed_axis_object_table_is_refused() {
+        // checkpointed_object_table and realm_rewards_tree_node_key_table need
+        // an explicit axis; a generic (obj_id, checkpoint) key would be wrong.
+        let sink = CollectingMutationSink::new();
+        for physical in [
+            ScyllaPhysicalTableId::CheckpointedObject,
+            ScyllaPhysicalTableId::RealmRewardsTreeNodeKey,
+        ] {
+            assert!(
+                plan_versioned_objects_id_at_start(
+                    physical,
+                    VALUE_LEN,
+                    1,
+                    &blob_id_at_start(&[1]),
+                    &sink,
+                )
+                .is_err()
+            );
+        }
     }
 }

@@ -123,6 +123,77 @@ pub fn single_merkle_node_key(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnsupportedVersionedObjectTable {
+    /// Not a versioned single-id object table at all.
+    NotAnObjectTable(ScyllaPhysicalTableId),
+    /// `checkpointed_object_table` carries both a checkpoint and a pending axis
+    /// in one clustering column, and `realm_rewards_tree_node_key_table` names
+    /// its clustering column `checkpoint_id` while the value is a pending id
+    /// (inventory §9 B2 and B3).  A generic `(obj_id, checkpoint)` key would be
+    /// wrong for both, and wrong in a way nothing downstream could detect, so
+    /// they are refused here until their axes are modelled explicitly.
+    MixedAxisNeedsExplicitDomain(ScyllaPhysicalTableId),
+}
+
+impl std::fmt::Display for UnsupportedVersionedObjectTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAnObjectTable(id) => {
+                write!(f, "{id:?} is not a versioned single-id object table")
+            }
+            Self::MixedAxisNeedsExplicitDomain(id) => write!(
+                f,
+                "{id:?} mixes checkpoint and pending axes and needs an explicit domain key"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for UnsupportedVersionedObjectTable {}
+
+/// Typed key for one row of a versioned single-id object table.
+///
+/// `obj_id` means a different thing per table -- a user, a contract -- so it is
+/// interpreted by physical table rather than carried as a bare number.
+pub fn versioned_object_key(
+    physical: ScyllaPhysicalTableId,
+    obj_id: u64,
+    checkpoint: CheckpointId,
+) -> Result<TypedTableKey, UnsupportedVersionedObjectTable> {
+    match physical {
+        ScyllaPhysicalTableId::UserLeaf => Ok(TypedTableKey::UserLeaf {
+            user: UserId::new(obj_id),
+            checkpoint,
+        }),
+        ScyllaPhysicalTableId::UserPublicKey => Ok(TypedTableKey::UserPublicKey {
+            user: UserId::new(obj_id),
+            checkpoint,
+        }),
+        ScyllaPhysicalTableId::ContractStateTreeHeight => {
+            Ok(TypedTableKey::ContractStateTreeHeight {
+                contract: ContractId::new(obj_id),
+                checkpoint,
+            })
+        }
+        ScyllaPhysicalTableId::ContractLeaf => Ok(TypedTableKey::ContractLeaf {
+            contract: ContractId::new(obj_id),
+            checkpoint,
+        }),
+        ScyllaPhysicalTableId::ContractCodeDefinition => {
+            Ok(TypedTableKey::ContractCodeDefinition {
+                contract: ContractId::new(obj_id),
+                checkpoint,
+            })
+        }
+        ScyllaPhysicalTableId::CheckpointedObject
+        | ScyllaPhysicalTableId::RealmRewardsTreeNodeKey => Err(
+            UnsupportedVersionedObjectTable::MixedAxisNeedsExplicitDomain(physical),
+        ),
+        other => Err(UnsupportedVersionedObjectTable::NotAnObjectTable(other)),
+    }
+}
+
 /// Receives every physical row an adapter writes, in write order.
 ///
 /// Implementations must be cheap: this sits on the commit path, and a busy
@@ -205,6 +276,23 @@ pub fn record_single_merkle_put(
     Ok(())
 }
 
+/// Record a put of one versioned single-id object row.
+pub fn record_versioned_object_put(
+    sink: &dyn CommitMutationSink,
+    physical: ScyllaPhysicalTableId,
+    obj_id: u64,
+    checkpoint: CheckpointId,
+) -> anyhow::Result<()> {
+    let key = versioned_object_key(physical, obj_id, checkpoint)?;
+    let resolved = describe_existing_key(&key);
+    sink.record(MutationLocatorRecord::try_new(
+        resolved.physical_table(),
+        RecordedOperation::Put,
+        resolved.locator_bytes().to_vec(),
+    )?);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,6 +334,48 @@ mod tests {
             );
         }
         assert_eq!(locators.len(), 4);
+    }
+
+    #[test]
+    fn each_versioned_object_table_reads_its_obj_id_differently() {
+        let checkpoint = CheckpointId::try_new(3).unwrap();
+        let mut locators = std::collections::BTreeSet::new();
+        for physical in [
+            ScyllaPhysicalTableId::UserLeaf,
+            ScyllaPhysicalTableId::UserPublicKey,
+            ScyllaPhysicalTableId::ContractStateTreeHeight,
+            ScyllaPhysicalTableId::ContractLeaf,
+            ScyllaPhysicalTableId::ContractCodeDefinition,
+        ] {
+            let resolved =
+                describe_existing_key(&versioned_object_key(physical, 42, checkpoint).unwrap());
+            assert_eq!(resolved.physical_table(), physical);
+            assert!(
+                locators.insert(resolved.locator_bytes().to_vec()),
+                "{physical:?} shares a locator with another object table"
+            );
+        }
+        assert_eq!(locators.len(), 5);
+    }
+
+    #[test]
+    fn the_mixed_axis_object_tables_are_refused_rather_than_keyed_generically() {
+        // inventory §9 B2/B3.  checkpointed_object_table carries both a
+        // checkpoint and a pending axis in one clustering column, and
+        // realm_rewards_tree_node_key_table calls its clustering column
+        // checkpoint_id while storing a pending id.  A generic (obj_id,
+        // checkpoint) key would be wrong for both, and wrong invisibly.
+        for physical in [
+            ScyllaPhysicalTableId::CheckpointedObject,
+            ScyllaPhysicalTableId::RealmRewardsTreeNodeKey,
+        ] {
+            assert_eq!(
+                versioned_object_key(physical, 1, CheckpointId::try_new(1).unwrap()),
+                Err(UnsupportedVersionedObjectTable::MixedAxisNeedsExplicitDomain(
+                    physical
+                ))
+            );
+        }
     }
 
     #[test]
