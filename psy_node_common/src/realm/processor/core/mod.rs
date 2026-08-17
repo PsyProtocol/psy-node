@@ -1,3 +1,6 @@
+use std::sync::{Arc, RwLock};
+
+use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
 use parth_core::protocol::core_types::QNetworkTypesConfig;
 use psy_data::
     queue_items::realm_user_update::PsyRealmUserUpdateQueueItem
@@ -74,4 +77,5 @@ pub struct PsyRealmProcessor<
     pub p2p_validator_user_id: Option<u64>,
     /// Authenticated BLS keys used to verify individual votes before aggregation.
     pub p2p_bls_public_keys: Option<std::collections::HashMap<u16, psy_data::p2p::BlsPublicKey>>,
+    pub aligned_processing_tree: Arc<RwLock<Option<SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>>>>,
 }

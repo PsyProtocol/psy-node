@@ -264,6 +264,21 @@ where
                     self.db
                         .commit_state(&coordinator_update, &updates, ProvingJobCircuitType::GUTANoChange, vec![], true)
                         .await?;
+                    self.db.state.processing_realm_end_root = coordinator_realm_state.value;
+                    self.db.state.gathering_realm_start_root = coordinator_realm_state.value;
+                    self.db
+                        .shared_state
+                        .update_from_core_state(&self.db.state)
+                        .await?;
+                    *self
+                        .aligned_processing_tree
+                        .write()
+                        .map_err(|e| anyhow::anyhow!("error writing aligned processing tree {:?}", e))? = Some(scratch_tree);
+                    tracing::info!(
+                        "Published authenticated gatherer base end_root={:?} checkpoint_id={}",
+                        coordinator_realm_state.value,
+                        included_checkpoint_id
+                    );
                     tracing::info!(
                         "Applied Realm proposal backup end_root={:?} checkpoint_id={} path={}",
                         updates.new_realm_root,
@@ -383,7 +398,10 @@ where
         // via commit_processing(). Must happen after the no-jobs early return so that
         // path leaves processing_realm_end_root untouched.
         self.db.state.processing_realm_end_root = guta_update.new_realm_root;
-
+        self.db
+            .shared_state
+            .update_from_core_state(&self.db.state)
+            .await?;
         let proving_state = PsyNodeProvingState::new_standard_realm(
             self.db.state.realm_id_u64,
             self.db.state.realm_identifier.realm_sub_id as u32,

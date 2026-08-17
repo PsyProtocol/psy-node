@@ -65,6 +65,7 @@ where
         //db.set_new_unique_ids().await?;
         tracing::info!("intialized realm processor database, building gatherers...");
 
+        let aligned_processing_tree = Arc::new(std::sync::RwLock::new(None));
         let guta_create_builder_config = RealmGUTAEndCapGathererConfig::<N, TempDatabase, FileSystem> {
             realm_id_u64: db.state.realm_id_u64,
             realm_sub_id_u64: db.state.realm_sub_id_u64,
@@ -77,23 +78,8 @@ where
             _phantom_n: std::marker::PhantomData,
             future_pending_end_cap_jobs: Arc::new(std::sync::RwLock::new(Vec::new())),
             tree_store: db.db.clone(),
+            aligned_processing_tree: aligned_processing_tree.clone(),
         };
-        /*
-        if db.last_committed.l2_state.next_contract_id as u64 != db_tree_next_contract_id {
-            return Err(anyhow::anyhow!(
-                "Inconsistent next contract id between db last committed l2 state {} and loaded tree next contract id {}",
-                db.last_committed.l2_state.next_contract_id,
-                db_tree_next_contract_id
-            ));
-        }
-        if db.last_committed.l2_state.next_user_id != db_tree_next_user_registration_id {
-            return Err(anyhow::anyhow!(
-                "Inconsistent next user registration id between db last committed l2 state {} and loaded tree next user registration id {}",
-                db.last_committed.l2_state.next_user_id,
-                db_tree_next_user_registration_id
-            ));
-        }
-        */
         let (guta_queue_gatherer, guta_join_handle) = EphemeralQueueGathererWithTree::new_with_status::<
             GUTAUpdateQueue,
             RealmGUTAEndCapGathererConfig<N, TempDatabase, FileSystem>,
@@ -120,6 +106,7 @@ where
                 bls_secret: None,
                 p2p_validator_user_id: None,
                 p2p_bls_public_keys: None,
+                aligned_processing_tree,
             },
             guta_join_handle,
         ))

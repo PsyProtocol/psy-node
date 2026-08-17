@@ -45,7 +45,6 @@ use psy_serialize::{PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSeriali
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::{
-    backup::realm::load_realm_memory_trees_from_db,
     guta_planner::realm_guta_planner::{PlannedFutureEndCapJob, RealmGUTAPlanner},
     queue::gatherer_builder::QueueGathererItemBuilderWithTree,
 };
@@ -383,6 +382,7 @@ pub struct RealmGUTAEndCapGathererConfig<
     pub checkpoint_tree: Arc<PsyDashMemoryAppendOnlyMerkleStore<N::HasherBase, N::QHash>>,
     pub future_pending_end_cap_jobs: Arc<RwLock<Vec<PlannedFutureEndCapJob<N::F, N::QHash>>>>,
     pub tree_store: Arc<dyn PsyNodeGlobalUserTreeDatabaseReader<N::QHash> + Send + Sync>,
+    pub aligned_processing_tree: Arc<RwLock<Option<SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>>>>,
     pub _phantom_n: std::marker::PhantomData<N>,
 }
 impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>, FileSystem: TokioLikeFileSystem> Clone
@@ -400,6 +400,7 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
             checkpoint_tree: self.checkpoint_tree.clone(),
             future_pending_end_cap_jobs: self.future_pending_end_cap_jobs.clone(),
             tree_store: self.tree_store.clone(),
+            aligned_processing_tree: self.aligned_processing_tree.clone(),
             _phantom_n: std::marker::PhantomData,
         }
     }
@@ -417,18 +418,169 @@ pub struct RealmGUTAEndCapGatherer<
     pub total_users_updated: u64,
     pub new_realm_end_cap_gatherer_file: FileSystem::File,
     pub pending_file_path: String,
+    applied_queue_items: Vec<Vec<u8>>,
 }
-/*
-impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>, FileSystem: TokioLikeFileSystem> RealmGUTAEndCapGatherer<N, TempDatabase, FileSystem>
-{
-    fn update_status(&mut self) -> anyhow::Result<()> {
 
-        let status: RealmProcessorCoreState<<N as QNetworkHashTypes>::QHash> = self.config.status.read().map_err(|e| anyhow::anyhow!("{:?}", e))?.clone();
-        self.status = status;
+fn gathering_base_is_current<Hash: PartialEq>(
+    shared: &RealmProcessorCoreState<Hash>,
+    snapshot: &RealmProcessorCoreState<Hash>,
+) -> bool {
+    shared.processing_realm_end_root == snapshot.processing_realm_end_root
+}
+fn publish_gathering_snapshot_if_current<Hash: PartialEq + Copy + std::fmt::Debug>(
+    shared_status: &Arc<RwLock<RealmProcessorCoreState<Hash>>>,
+    snapshot: &RealmProcessorCoreState<Hash>,
+    tree_root: Hash,
+) {
+    if let Ok(mut shared) = shared_status.write() {
+        let processing_root = shared.processing_realm_end_root;
+        let gathering_start = shared.gathering_realm_start_root;
+        if snapshot.processing_realm_end_root == processing_root {
+            shared.gathering_realm_start_root = tree_root;
+            return;
+        }
+        if tree_root == processing_root || tree_root == gathering_start {
+            tracing::info!(
+                "Skipping displaced gatherer snapshot write pending={} tree_root={:?} processing_root={:?}",
+                snapshot.gathering_unique_pending_id,
+                tree_root,
+                processing_root
+            );
+            return;
+        }
+        if gathering_start == processing_root {
+            shared.gathering_realm_start_root = tree_root;
+            return;
+        }
+        tracing::info!(
+            "Skipping stale gatherer snapshot write pending={} snapshot_processing_root={:?} live_processing_root={:?}",
+            snapshot.gathering_unique_pending_id,
+            snapshot.processing_realm_end_root,
+            processing_root
+        );
+    }
+}
+
+impl<
+        N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
+        TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + Send + Sync + 'static,
+        FileSystem: TokioLikeFileSystem,
+    > RealmGUTAEndCapGatherer<N, TempDatabase, FileSystem>
+{
+    async fn align_recorder_to_processing_root(
+        &mut self,
+        tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
+        live_status: &RealmProcessorCoreState<N::QHash>,
+    ) -> anyhow::Result<()> {
+        if let Some(aligned) = self
+            .config
+            .aligned_processing_tree
+            .write()
+            .map_err(|e| anyhow::anyhow!("error writing aligned processing tree {:?}", e))?
+            .take()
+        {
+            anyhow::ensure!(
+                aligned.get_root() == live_status.processing_realm_end_root,
+                "aligned processing tree root {:?} does not match processing_realm_end_root {:?}",
+                aligned.get_root(),
+                live_status.processing_realm_end_root
+            );
+            tracing::info!(
+                "Aligning RealmGUTAEndCapGatherer recorder from {:?} to in-process processing tree {:?}",
+                tree.get_root(),
+                aligned.get_root()
+            );
+            *tree = aligned;
+        } else {
+            anyhow::ensure!(
+                tree.get_root() == live_status.processing_realm_end_root
+                    || tree.get_root() == live_status.gathering_realm_start_root,
+                "live recorder root {:?} matches neither processing_realm_end_root {:?} nor gathering_realm_start_root {:?}",
+                tree.get_root(),
+                live_status.processing_realm_end_root,
+                live_status.gathering_realm_start_root
+            );
+            tracing::info!(
+                "Keeping live RealmGUTAEndCapGatherer recorder root {:?} at processing checkpoint {}",
+                tree.get_root(),
+                live_status.processing_checkpoint_id
+            );
+        }
+        self.start_global_user_tree_root = tree.get_root();
+        self.last_committed_checkpoint_root = self.config.checkpoint_tree.get_root();
+        Ok(())
+    }
+
+    async fn replay_applied_end_caps_on_processing_root(
+        &mut self,
+        tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
+        live_status: RealmProcessorCoreState<N::QHash>,
+    ) -> anyhow::Result<()> {
+        self.align_recorder_to_processing_root(tree, &live_status).await?;
+        if tree.get_root() != live_status.processing_realm_end_root {
+            tracing::info!(
+                "Skipping EndCap replay because live recorder root {:?} is already the processing suffix, not the processing base {:?}",
+                tree.get_root(),
+                live_status.processing_realm_end_root
+            );
+            return Ok(());
+        }
+        self.new_realm_end_cap_gatherer_file.seek(tokio::io::SeekFrom::Start(0)).await?;
+        self.new_realm_end_cap_gatherer_file.file_like_set_len(0).await?;
+        self.new_realm_end_cap_gatherer_file
+            .write_u32_le(REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32)
+            .await?;
+        self.new_realm_end_cap_gatherer_file
+            .write_all(&tree.get_root().into_owned_32bytes())
+            .await?;
+        self.new_realm_end_cap_gatherer_file
+            .write_all(&tree.get_root().into_owned_32bytes())
+            .await?;
+        self.new_realm_end_cap_gatherer_file.write_u64_le(0).await?;
+        self.config
+            .file_system
+            .file_like_fs_flush_file_with_path(&self.pending_file_path, &mut self.new_realm_end_cap_gatherer_file)
+            .await?;
+
+        self.guta_planner = RealmGUTAPlanner::<N::F, N::QHash>::new(
+            live_status.chain_id,
+            live_status.realm_identifier,
+            live_status.gathering_checkpoint_root,
+            live_status.gathering_checkpoint_id,
+            self.status.gathering_unique_pending_id,
+            tree.get_root(),
+            N::REALM_GLOBAL_USER_TREE_HEIGHT,
+            N::GLOBAL_USER_TREE_HEIGHT,
+            self.config.coordinator_guta_updates_circuit_whitelist,
+        );
+        let replay_items = self.applied_queue_items.clone();
+        tracing::info!(
+            "Replaying {} gathered EndCaps on processing_realm_end_root {:?} at processing checkpoint {}",
+            replay_items.len(),
+            tree.get_root(),
+            live_status.processing_checkpoint_id
+        );
+        for item in replay_items {
+            let update_header = PsyRealmUserUpdateQueueItem::<N::F, N::QHash>::psy_ser_from_slice(&item)?;
+            self.guta_planner
+                .add_end_cap_job(
+                    &self.config.checkpoint_tree,
+                    tree,
+                    &mut self.new_realm_end_cap_gatherer_file,
+                    self.config.temp_db.clone(),
+                    &item,
+                    update_header,
+                )
+                .await?;
+        }
+        self.total_users_updated = self.guta_planner.total_end_caps_processed as u64;
+        self.config
+            .file_system
+            .file_like_fs_flush_file_with_path(&self.pending_file_path, &mut self.new_realm_end_cap_gatherer_file)
+            .await?;
         Ok(())
     }
 }
-    */
 #[derive(Clone)]
 pub struct RealmGUTAEndCapGathererOutputDatabase<F, Hash> {
     pub old_realm_root: Hash,
@@ -503,35 +655,19 @@ impl<
         let status = config.status.read().unwrap().clone();
         let live_root = tree.get_root();
         let snapshot_root = status.gathering_realm_start_root;
-        if live_root == snapshot_root {
+        if live_root == snapshot_root || live_root == status.processing_realm_end_root {
             tracing::info!(
-                "Keeping RealmGUTAEndCapGatherer A-snapshot tree root {:?} at checkpoint {}",
+                "Keeping RealmGUTAEndCapGatherer processing tree root {:?} at processing checkpoint {}",
                 live_root,
-                status.last_committed_checkpoint_id
+                status.processing_checkpoint_id
             );
-        } else if live_root != status.last_committed_realm_end_root {
-            tracing::info!(
-                "Rebasing RealmGUTAEndCapGatherer tree from {:?} onto committed root {:?} at checkpoint {}",
+        } else {
+            anyhow::bail!(
+                "live recorder root {:?} matches neither gathering_realm_start_root {:?} nor processing_realm_end_root {:?}",
                 live_root,
-                status.last_committed_realm_end_root,
-                status.last_committed_checkpoint_id
+                snapshot_root,
+                status.processing_realm_end_root
             );
-            let reloaded = load_realm_memory_trees_from_db::<N, _>(
-                &config.tree_store,
-                status.last_committed_checkpoint_id,
-                config.realm_id_u64,
-            )
-            .await?
-            .into_tuple()
-            .0;
-            anyhow::ensure!(
-                reloaded.get_root() == status.last_committed_realm_end_root,
-                "reloaded realm user tree root {:?} does not match last committed realm end root {:?} at checkpoint {}",
-                reloaded.get_root(),
-                status.last_committed_realm_end_root,
-                status.last_committed_checkpoint_id
-            );
-            *tree = reloaded;
         }
         let new_realm_end_cap_gatherer_file_path = get_new_realm_end_cap_gatherer_backup_file_path(
             &config.backup_file_directory,
@@ -603,6 +739,7 @@ impl<
             new_realm_end_cap_gatherer_file,
             start_global_user_tree_root: tree.get_root(),
             pending_file_path: new_realm_end_cap_gatherer_file_path.to_string_lossy().to_string(),
+            applied_queue_items: Vec::new(),
         })
     }
     async fn update_from_queue_item_with_tree(
@@ -621,6 +758,7 @@ impl<
         }
         let update_header = PsyRealmUserUpdateQueueItem::<N::F, N::QHash>::psy_ser_from_slice(&item)?;
         tracing::info!("RealmGUTAEndCapGatherer processing queue item update_header {:?}", update_header);
+        self.applied_queue_items.push(item.clone());
         self.guta_planner
             .add_end_cap_job(
                 &self.config.checkpoint_tree,
@@ -655,6 +793,15 @@ impl<
             self.status.gathering_unique_pending_id,
             tree.get_root()
         );
+        let live_status = self
+            .config
+            .status
+            .read()
+            .map_err(|e| anyhow::anyhow!("error reading status {:?}", e))?
+            .clone();
+        if !gathering_base_is_current(&live_status, &self.status) {
+            self.replay_applied_end_caps_on_processing_root(tree, live_status).await?;
+        }
         let needs_revert = {
             self.config
                 .status
@@ -734,9 +881,7 @@ impl<
                     self.status.gathering_unique_pending_id
                 );
                 tree.commit_changes();
-                if let Ok(mut shared) = self.config.status.write() {
-                    shared.gathering_realm_start_root = tree.get_root();
-                }
+                publish_gathering_snapshot_if_current(&self.config.status, &self.status, tree.get_root());
                 return Ok(result);
             }
         }
@@ -778,9 +923,7 @@ impl<
             .file_system
             .file_like_fs_sync_file_with_path(&self.pending_file_path, &mut self.new_realm_end_cap_gatherer_file)
             .await?;
-        if let Ok(mut shared) = self.config.status.write() {
-            shared.gathering_realm_start_root = tree.get_root();
-        }
+        publish_gathering_snapshot_if_current(&self.config.status, &self.status, tree.get_root());
         Ok(RealmGUTAEndCapGathererOutput {
             db_output: RealmGUTAEndCapGathererOutputDatabase::<N::F, N::QHash>::get_empty(tree.get_root()),
             job_ids: vec![],
