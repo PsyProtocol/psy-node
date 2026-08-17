@@ -334,7 +334,12 @@ pub async fn setup_coordinator_psy_scylla_store_from_connection_string<N: QNetwo
         .map(|s| s.to_string())
         .collect::<Vec<String>>();
     let core = Arc::new(ScyllaCoreStore::<N::QHash, N::HasherBase>::new(0, 0, keyspace.to_string(), &addresses).await?);
+    // State tables first.  The rollback floor's singleton anchor prepares reads
+    // against `latest_info_table` and `u64_singleton_table`, so preparing the
+    // control plane on a fresh keyspace fails until those exist.  The first run
+    // against a real database is what surfaced this; neither the unit tests nor
+    // `cargo check --all-targets` can see it.
+    let store = setup_psy_scylla_database_store::<N>(core.clone()).await?;
     let control = crate::rollback::CoordinatorRollbackControlPlane::setup(core.as_ref()).await?;
-    let store = setup_psy_scylla_database_store::<N>(core).await?;
     Ok((store, control))
 }
