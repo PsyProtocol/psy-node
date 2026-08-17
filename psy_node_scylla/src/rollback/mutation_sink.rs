@@ -14,7 +14,8 @@
 use std::sync::Mutex;
 
 use psy_node_core::store::typed::{
-    CheckpointId, ContractId, LatestInfoSlot, MerkleNode, NodeIndex, TypedTableKey, UserId,
+    CheckpointId, CheckpointLeafKey, CheckpointRootKey, ContractId, LatestInfoSlot, MerkleNode,
+    NodeIndex, TypedTableKey, UniquePendingId, UserId,
 };
 
 use super::{
@@ -259,6 +260,108 @@ pub fn key_id_value_key(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnsupportedU64MappingTable {
+    NotAU64MappingTable(ScyllaPhysicalTableId),
+    ObjIdOutOfRange(u64),
+}
+
+impl std::fmt::Display for UnsupportedU64MappingTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAU64MappingTable(id) => write!(f, "{id:?} is not a u64 mapping table"),
+            Self::ObjIdOutOfRange(value) => {
+                write!(f, "{value} is outside the CQL bigint alias range")
+            }
+        }
+    }
+}
+
+impl std::error::Error for UnsupportedU64MappingTable {}
+
+/// Typed key for one row of a u64-to-u64 mapping table.
+///
+/// The two directions are separate logical tables, not a pair:
+/// `checkpoint_id_to_pending_id_table` is keyed by a reusable checkpoint height
+/// and `pending_id_to_checkpoint_id_table` by a monotonic pending id.  Their
+/// `obj_id` columns hold different kinds of number, and mixing them up would
+/// name a real row of the other table.
+pub fn u64_mapping_key(
+    physical: ScyllaPhysicalTableId,
+    obj_id: u64,
+) -> Result<TypedTableKey, UnsupportedU64MappingTable> {
+    match physical {
+        ScyllaPhysicalTableId::CheckpointIdToPendingId => CheckpointId::try_new(obj_id)
+            .map(TypedTableKey::CheckpointToPending)
+            .map_err(|_| UnsupportedU64MappingTable::ObjIdOutOfRange(obj_id)),
+        ScyllaPhysicalTableId::PendingIdToCheckpointId => UniquePendingId::try_new(obj_id)
+            .map(TypedTableKey::PendingToCheckpoint)
+            .map_err(|_| UnsupportedU64MappingTable::ObjIdOutOfRange(obj_id)),
+        other => Err(UnsupportedU64MappingTable::NotAU64MappingTable(other)),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UnsupportedBidirectionalTable {
+    NotABidirectionalPair(ScyllaPhysicalTableId),
+    CheckpointOutOfRange(u64),
+}
+
+impl std::fmt::Display for UnsupportedBidirectionalTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotABidirectionalPair(id) => {
+                write!(f, "{id:?} is not one direction of a bidirectional pair")
+            }
+            Self::CheckpointOutOfRange(value) => {
+                write!(f, "{value} is outside the CQL bigint alias range")
+            }
+        }
+    }
+}
+
+impl std::error::Error for UnsupportedBidirectionalTable {}
+
+/// One logical bidirectional write, as the two physical rows it really is.
+///
+/// This is the gap that made bidirectional tables worth singling out.  A caller
+/// sees one `set_or_insert_one_qpk`, but two rows land in two tables, and the
+/// content-keyed direction is the dangerous one: after a rollback reuses a
+/// height, a surviving `root -> id` row maps a discarded root onto a live
+/// checkpoint with different content, and no root check can see it because the
+/// row is not part of any tree.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BidirectionalPairKeys {
+    /// Keyed by content: the root or leaf hash.
+    pub by_content: TypedTableKey,
+    /// Keyed by height: the checkpoint.
+    pub by_checkpoint: TypedTableKey,
+}
+
+/// Typed keys for both physical rows of one bidirectional mapping write.
+///
+/// Returning both together is deliberate: a caller cannot record one direction
+/// and forget the other.
+pub fn bidirectional_pair_keys(
+    logical_by_content: ScyllaPhysicalTableId,
+    content_bytes: Vec<u8>,
+    checkpoint_id: u64,
+) -> Result<BidirectionalPairKeys, UnsupportedBidirectionalTable> {
+    let checkpoint = CheckpointId::try_new(checkpoint_id)
+        .map_err(|_| UnsupportedBidirectionalTable::CheckpointOutOfRange(checkpoint_id))?;
+    match logical_by_content {
+        ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK1 => Ok(BidirectionalPairKeys {
+            by_content: TypedTableKey::CheckpointRootByHash(CheckpointRootKey::new(content_bytes)),
+            by_checkpoint: TypedTableKey::CheckpointRootByCheckpoint(checkpoint),
+        }),
+        ScyllaPhysicalTableId::CheckpointLeafToCheckpointIdK1 => Ok(BidirectionalPairKeys {
+            by_content: TypedTableKey::CheckpointLeafByHash(CheckpointLeafKey::new(content_bytes)),
+            by_checkpoint: TypedTableKey::CheckpointLeafByCheckpoint(checkpoint),
+        }),
+        other => Err(UnsupportedBidirectionalTable::NotABidirectionalPair(other)),
+    }
+}
+
 /// Receives every physical row an adapter writes, in write order.
 ///
 /// Implementations must be cheap: this sits on the commit path, and a busy
@@ -374,6 +477,45 @@ pub fn record_key_id_value_put(
     Ok(())
 }
 
+/// Record a put of one u64-to-u64 mapping row.
+pub fn record_u64_mapping_put(
+    sink: &dyn CommitMutationSink,
+    physical: ScyllaPhysicalTableId,
+    obj_id: u64,
+) -> anyhow::Result<()> {
+    let key = u64_mapping_key(physical, obj_id)?;
+    let resolved = describe_existing_key(&key);
+    sink.record(MutationLocatorRecord::try_new(
+        resolved.physical_table(),
+        RecordedOperation::Put,
+        resolved.locator_bytes().to_vec(),
+    )?);
+    Ok(())
+}
+
+/// Record both physical rows of one bidirectional mapping write.
+///
+/// There is no single-direction variant on purpose.  Recording only the
+/// height-keyed row is the mistake that leaves an orphan `root -> id` mapping
+/// behind after a rollback.
+pub fn record_bidirectional_pair_put(
+    sink: &dyn CommitMutationSink,
+    logical_by_content: ScyllaPhysicalTableId,
+    content_bytes: Vec<u8>,
+    checkpoint_id: u64,
+) -> anyhow::Result<()> {
+    let keys = bidirectional_pair_keys(logical_by_content, content_bytes, checkpoint_id)?;
+    for key in [&keys.by_content, &keys.by_checkpoint] {
+        let resolved = describe_existing_key(key);
+        sink.record(MutationLocatorRecord::try_new(
+            resolved.physical_table(),
+            RecordedOperation::Put,
+            resolved.locator_bytes().to_vec(),
+        )?);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,6 +557,118 @@ mod tests {
             );
         }
         assert_eq!(locators.len(), 4);
+    }
+
+    #[test]
+    fn one_bidirectional_write_records_two_rows_in_two_tables() {
+        // The correctness gap: a caller sees one write, but two rows land.
+        // Recording only the height-keyed one leaves the discarded branch's
+        // root mapped onto a reused height, and no root check can see it
+        // because that row belongs to no tree.
+        let sink = CollectingMutationSink::new();
+        record_bidirectional_pair_put(
+            &sink,
+            ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK1,
+            vec![9u8; 32],
+            1001,
+        )
+        .unwrap();
+        let records = sink.take();
+        assert_eq!(records.len(), 2);
+        let tables: Vec<_> = records.iter().map(|r| r.physical_table()).collect();
+        assert!(tables.contains(&ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK1));
+        assert!(tables.contains(&ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK2));
+    }
+
+    #[test]
+    fn the_content_keyed_direction_does_not_depend_on_the_height() {
+        // Two branches at one height carry different roots, so their
+        // content-keyed rows are different rows and both must be deletable.
+        // The height-keyed row, by contrast, is the same row overwritten.
+        let keys_a =
+            bidirectional_pair_keys(
+                ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK1,
+                vec![1u8; 32],
+                1001,
+            )
+            .unwrap();
+        let keys_b =
+            bidirectional_pair_keys(
+                ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK1,
+                vec![2u8; 32],
+                1001,
+            )
+            .unwrap();
+        assert_ne!(
+            describe_existing_key(&keys_a.by_content).locator_bytes(),
+            describe_existing_key(&keys_b.by_content).locator_bytes(),
+        );
+        assert_eq!(
+            describe_existing_key(&keys_a.by_checkpoint).locator_bytes(),
+            describe_existing_key(&keys_b.by_checkpoint).locator_bytes(),
+        );
+    }
+
+    #[test]
+    fn the_root_and_leaf_pairs_are_distinct_tables() {
+        let root = bidirectional_pair_keys(
+            ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK1,
+            vec![5u8; 32],
+            7,
+        )
+        .unwrap();
+        let leaf = bidirectional_pair_keys(
+            ScyllaPhysicalTableId::CheckpointLeafToCheckpointIdK1,
+            vec![5u8; 32],
+            7,
+        )
+        .unwrap();
+        assert_ne!(
+            describe_existing_key(&root.by_content).physical_table(),
+            describe_existing_key(&leaf.by_content).physical_table(),
+        );
+        assert_ne!(
+            describe_existing_key(&root.by_checkpoint).physical_table(),
+            describe_existing_key(&leaf.by_checkpoint).physical_table(),
+        );
+    }
+
+    #[test]
+    fn the_two_pending_mapping_directions_never_share_a_locator() {
+        // One is keyed by a reusable checkpoint height, the other by a
+        // monotonic pending id.  The same number appears in both, so confusing
+        // them would name a real row of the other table -- and after a rollback
+        // reuses a height, exactly the wrong real row.
+        let by_checkpoint = describe_existing_key(
+            &u64_mapping_key(ScyllaPhysicalTableId::CheckpointIdToPendingId, 77).unwrap(),
+        );
+        let by_pending = describe_existing_key(
+            &u64_mapping_key(ScyllaPhysicalTableId::PendingIdToCheckpointId, 77).unwrap(),
+        );
+        assert_eq!(
+            by_checkpoint.physical_table(),
+            ScyllaPhysicalTableId::CheckpointIdToPendingId
+        );
+        assert_eq!(
+            by_pending.physical_table(),
+            ScyllaPhysicalTableId::PendingIdToCheckpointId
+        );
+        assert_ne!(by_checkpoint.locator_bytes(), by_pending.locator_bytes());
+    }
+
+    #[test]
+    fn a_u64_mapping_obj_id_outside_the_cql_alias_range_is_refused() {
+        // The physical column is a signed bigint, so anything above i64::MAX
+        // would wrap to a negative key rather than fail.
+        assert_eq!(
+            u64_mapping_key(
+                ScyllaPhysicalTableId::PendingIdToCheckpointId,
+                i64::MAX as u64 + 1
+            ),
+            Err(UnsupportedU64MappingTable::ObjIdOutOfRange(
+                i64::MAX as u64 + 1
+            ))
+        );
     }
 
     #[test]
