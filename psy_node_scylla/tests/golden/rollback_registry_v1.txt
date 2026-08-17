@@ -33,4 +33,4 @@
 33|ImtLeaf|30|imt_leaf_table||Standard|ImtLeaf|Realm|Authoritative|ReaderWriter|Direct|CheckpointClustering|ArchiveVersioned|[Point, BoundedRange, SnapshotOnly]|ArchiveAndSnapshot|ExactMutation|ImtRoot|PRIMARY KEY ((tree_id, tree_sub_id, leaf_index), checkpoint_id)|Ready
 34|ImtKeyIndex|31|imt_key_index_table||Standard|ImtKeyIndex|Realm|Derived|ReaderWriter|Indirect|ImtBirthOrdinaryColumn|DerivedBirth|[Point, SnapshotOnly]|RebuildFromAuthoritative|DerivedSupplement|ImtIndexRebuild|PRIMARY KEY ((tree_id, tree_sub_id, key_bucket), encoded_key)|Ready
 35|ImtNextAppendIndex|32|imt_next_append_index_table||Standard|ImtCursor|Realm|Derived|ReaderWriter|Indirect|MutableCursor|RestoreSingleton|[]|RestoreFromTargetManifest|CursorBeforeAfter|ImtCursor|PRIMARY KEY ((tree_id, tree_sub_id))|Ready
-FULL_METADATA_FNV1A64=d649a2c12edbd842
+FULL_METADATA_FNV1A64=88630618f9bad352
