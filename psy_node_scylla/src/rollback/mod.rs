@@ -22,6 +22,7 @@ mod manifest_locator;
 mod manifest_record_store;
 mod mutation;
 mod raw_access;
+mod rollback_floor_store;
 mod registry;
 
 pub use canonical_head_store::*;
@@ -42,3 +43,4 @@ pub use raw_access::{
 };
 pub use mutation::*;
 pub use registry::*;
+pub use rollback_floor_store::*;
