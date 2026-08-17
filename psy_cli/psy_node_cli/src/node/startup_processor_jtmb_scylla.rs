@@ -76,6 +76,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_coordinator_processor_n
                 checkpoint_tree_root_backup_file_path,
                 db,
                 recording,
+                config.network,
                 tag_tree_rewards_store,
                 temp_db,
                 proof_store,

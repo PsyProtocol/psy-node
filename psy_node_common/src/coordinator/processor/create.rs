@@ -41,6 +41,7 @@ pub async fn create_coordinator_processor<
     // design-r1 §0.2 D3: a Coordinator that cannot record a commit must not be
     // able to make one, so this is taken by value rather than as an option.
     recording: CoordinatorCommitRecording<N::QHash>,
+    network: psy_core::constants::chain_id::PsyChainNetworkType,
     tag_tree_rewards_store: Arc<STagTreeRewards>,
     temp_db: Arc<TempDatabase>,
     proof_store: Arc<ProofStore>,
@@ -103,6 +104,7 @@ where
     let db = PsyCoordinatorDatabaseProcessor::<N, _, _, _, _, _, _, _, _, FileSystem>::new_init(
         db,
         recording,
+        network,
         tag_tree_rewards_store,
         temp_db,
         proof_store,
@@ -200,6 +202,7 @@ pub async fn create_coordinator_processor_and_run<
     // design-r1 §0.2 D3: a Coordinator that cannot record a commit must not be
     // able to make one, so this is taken by value rather than as an option.
     recording: CoordinatorCommitRecording<N::QHash>,
+    network: psy_core::constants::chain_id::PsyChainNetworkType,
     tag_tree_rewards_store: Arc<STagTreeRewards>,
     temp_db: Arc<TempDatabase>,
     proof_store: Arc<ProofStore>,
@@ -222,6 +225,7 @@ where
         checkpoint_tree_root_backup_file_path,
         db,
         recording,
+        network,
         tag_tree_rewards_store,
         temp_db,
         proof_store,

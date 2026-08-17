@@ -39,6 +39,33 @@ use psy_node_core::{
     queue::{ephemeral::QStandardEphemeralQueueSubscriber, worker_queue::QStandardWorkerQueuePublisher},
     store::{manifest_store::CoordinatorCommitRecording, traits::proof_store::QParthProofStore},
 };
+use psy_core::constants::chain_id::PsyChainNetworkType;
+use psy_data::protocol::canonical_chain::{
+    CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId, CheckpointRef, NetworkId,
+};
+use psy_data::protocol::chain_context::{
+    AuthorityScope, AuthorityStateCheckpointId, AuthorityStateRoot,
+};
+use psy_node_core::store::authority_commit::{
+    AuthorityClockSampleUs, AuthorityTimestampBootstrapReason, AuthorityTimestampKey,
+};
+use psy_node_core::store::canonical_head::{
+    CanonicalHeadBootstrap, CanonicalHeadBootstrapProfile, CanonicalHeadReadState,
+    CanonicalHeadTransition, CanonicalHeadWriteOutcome,
+};
+use psy_node_core::store::authority_commit::{
+    AuthorityTimestampReadState, AuthorityTimestampWriteOutcome,
+};
+use psy_node_core::store::manifest_lifecycle::{
+    AuthorityHeadPayloadDigest, AuthorityHeadPublishDecision, AuthorityHeadView,
+    AuthorityPostWriteObservation, AuthorityProofObservation, SealedAuthorityManifest,
+};
+use psy_node_core::store::commit_planner::CoordinatorCommitPlanInputs;
+use psy_node_core::store::commit_recording_flow::{
+    PreparedCommitRecording, prepare_commit_recording,
+};
+use psy_node_core::store::manifest_intent::{AuthorityHeadPayload, AuthorityStateTransition};
+use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
 use crate::{
     backup::{checkpoint_tree::CheckpointTreeBackupManager, coordinator::generate_coordinator_output_from_backups},
@@ -128,6 +155,11 @@ pub struct PsyCoordinatorDatabaseProcessor<
 > {
     // stores
     pub db: Arc<S>,
+    /// Which chain this Coordinator is the authority for.
+    ///
+    /// Part of every canonical reference and every manifest identity, so a
+    /// record can never be mistaken for one belonging to another network.
+    pub network_id: NetworkId,
     /// Durable record of every commit this Coordinator makes.
     ///
     /// Held by value rather than as an option: design-r1 §0.2 D3 makes
@@ -276,6 +308,7 @@ impl<
     pub async fn new_init(
         db: Arc<S>,
         recording: CoordinatorCommitRecording<N::QHash>,
+        network: PsyChainNetworkType,
         tag_tree_rewards_store: Arc<STagTreeRewards>,
         temp_db: Arc<TempDatabase>,
         proof_store: Arc<ProofStore>,
@@ -427,6 +460,7 @@ impl<
         Ok(Self {
             db,
             recording,
+            network_id: NetworkId::from_network_type(network),
             status: status.clone(),
             tag_tree_rewards_store,
             temp_db,
@@ -858,6 +892,292 @@ checkpoint_backup_copy_status={}
             _phantom_queue_item: std::marker::PhantomData,
         }
     }
+
+    /// Canonical commitment to the singleton cells this commit overwrites.
+    ///
+    /// design-r1 §2.2.1 keeps before images for exactly the tables that are
+    /// overwritten in place and cannot be recomputed.  For the Coordinator those
+    /// are the latest-info slot and the latest-checkpoint singleton, so their
+    /// post-state travels with the manifest rather than in a separate artifact.
+    fn commit_head_payload_bytes(
+        coordinator_update: &PsyPreparedCoordinatorBlockStateUpdates<N::F, N::QHash>,
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(8 + 64 + 32 + 32);
+        out.extend_from_slice(&coordinator_update.checkpoint_id.to_le_bytes());
+        out.extend_from_slice(&coordinator_update.new_base.block_state.psy_ser_to_bytes_vec()?);
+        out.extend_from_slice(
+            &coordinator_update
+                .new_base
+                .checkpoint_leaf_hash
+                .into_owned_32bytes(),
+        );
+        out.extend_from_slice(
+            &coordinator_update
+                .new_base
+                .checkpoint_tree_root
+                .into_owned_32bytes(),
+        );
+        Ok(out)
+    }
+
+    /// Plan this commit and make its manifest durable, before any state write.
+    ///
+    /// design-r1 §3: a crash after the state writes but before the manifest would
+    /// leave physical rows that no manifest names, and rollback could not find
+    /// them afterwards.  So this runs first and its failure aborts the commit.
+    async fn record_commit_prepared(
+        &mut self,
+        coordinator_update: &PsyPreparedCoordinatorBlockStateUpdates<N::F, N::QHash>,
+        checkpoint_proof_public_inputs_hash: N::QHash,
+    ) -> anyhow::Result<PreparedCommitRecording<N::QHash>> {
+        let checkpoint_id = coordinator_update.checkpoint_id;
+        let key = AuthorityTimestampKey::new(self.network_id, AuthorityScope::Coordinator);
+
+        // The candidate's content identity comes from the proof's public inputs,
+        // not from the height: two branches at one height differ here and nowhere
+        // else (design-r1 I2).  The caller has already verified this hash against
+        // the chain commitment, so re-deriving it from the proof bytes would only
+        // add a second place for the two to disagree.
+        let candidate_hash =
+            CheckpointHash::from_proof_public_inputs_hash(checkpoint_proof_public_inputs_hash);
+
+        // An epoch only advances through a rollback, so a missing head means this
+        // authority has not recorded before and epoch 0 is correct.  It cannot
+        // mean "after a rollback": a rollback writes the head.
+        let chain_epoch = match self
+            .recording
+            .canonical_head()
+            .read_canonical_head(self.network_id)
+            .await?
+        {
+            CanonicalHeadReadState::Current(head) => head.canonical_ref().chain_epoch(),
+            CanonicalHeadReadState::Uninitialized => ChainEpoch::new(0),
+        };
+
+        let expected_chain = CanonicalChainRef::new(
+            self.network_id,
+            chain_epoch,
+            CheckpointRef::new(
+                CheckpointId::new(self.ids.checkpoint_id),
+                CheckpointHash::from_last_chain_hash(self.last_committed.last_chain_hash),
+            ),
+        );
+        let candidate_chain = CanonicalChainRef::new(
+            self.network_id,
+            chain_epoch,
+            CheckpointRef::new(CheckpointId::new(checkpoint_id), candidate_hash),
+        );
+
+        let state_transition = AuthorityStateTransition::Changed {
+            previous_checkpoint: AuthorityStateCheckpointId::new(self.ids.checkpoint_id),
+            checkpoint: AuthorityStateCheckpointId::new(checkpoint_id),
+            old_root: AuthorityStateRoot::from_local_state_root(coordinator_update.old_base.checkpoint_tree_root),
+            new_root: AuthorityStateRoot::from_local_state_root(coordinator_update.new_base.checkpoint_tree_root),
+        };
+
+        let inputs = CoordinatorCommitPlanInputs {
+            checkpoint_id,
+            unique_pending_id: coordinator_update.unique_pending_id,
+            next_contract_id: coordinator_update.old_base.block_state.next_contract_id as u64,
+            new_contract_code_definition_count: coordinator_update
+                .new_contract_code_definitions
+                .len(),
+            update_global_contract_tree_nodes_ffs: &coordinator_update
+                .update_global_contract_tree_nodes_ffs,
+            update_contract_function_tree_nodes_ffs: &coordinator_update
+                .update_contract_function_tree_nodes_ffs,
+            new_contract_leaves_ffs: &coordinator_update.new_contract_leaves_ffs,
+            update_user_registration_tree_nodes_ffs: &coordinator_update
+                .update_user_registration_tree_nodes_ffs,
+            new_user_public_keys_ffs: &coordinator_update.new_user_public_keys_ffs,
+            new_public_key_hash_to_user_id_rows_ffs: &coordinator_update
+                .new_public_key_hash_to_user_id_rows_ffs,
+            update_global_user_tree_nodes_ffs: &coordinator_update
+                .update_global_user_tree_nodes_ffs,
+            new_realm_guta_reward_tree_node_keys_ffs: &coordinator_update
+                .new_realm_guta_reward_tree_node_keys_ffs,
+            checkpoint_root_bytes: &coordinator_update
+                .new_base
+                .checkpoint_tree_root
+                .into_owned_32bytes(),
+            checkpoint_tree_height: N::CHECKPOINT_TREE_HEIGHT,
+        };
+
+        let clock_sample = AuthorityClockSampleUs::try_from_i128(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)?
+                .as_micros()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("wall clock is outside CQL timestamp range"))?,
+        )?;
+
+        prepare_commit_recording(
+            &self.recording,
+            key,
+            &inputs,
+            expected_chain,
+            candidate_chain,
+            state_transition,
+            AuthorityHeadPayload::try_new(Self::commit_head_payload_bytes(coordinator_update)?)?,
+            clock_sample,
+            // An existing chain adopting the recording scheme; this bootstrap is
+            // where the rollback floor lands (design-r1 §13 Q1).
+            AuthorityTimestampBootstrapReason::ControlledWriterCutover,
+        )
+        .await
+    }
+
+
+    /// Seal the manifest, publish the head, and release the timestamp lease.
+    ///
+    /// Runs after the state writes.  Sealing re-derives the head from what was
+    /// actually observed and compares it against what the PREPARED record
+    /// committed to, so a commit whose writes did not land where the manifest
+    /// said cannot be published.
+    ///
+    /// The lease is released last.  Leaving it held would block the next commit's
+    /// reservation, so a crash before this point stalls the authority rather than
+    /// letting a half-recorded commit look finished -- which is the safer of the
+    /// two failures.
+    async fn complete_commit_record(
+        &mut self,
+        prepared: PreparedCommitRecording<N::QHash>,
+        observed_checkpoint_tree_root: N::QHash,
+        coordinator_update: &PsyPreparedCoordinatorBlockStateUpdates<N::F, N::QHash>,
+    ) -> anyhow::Result<()> {
+        // inventory §9 B7: the prepared update carries a checkpoint tree proof
+        // that the commit path never consumed.  Comparing the recomputed root
+        // against it closes that gap, and it is also what makes the plan sound:
+        // the bidirectional mapping was planned from the prepared root.
+        if observed_checkpoint_tree_root != coordinator_update.new_base.checkpoint_tree_root {
+            anyhow::bail!(
+                "recomputed checkpoint tree root does not match the prepared update, so the \
+                 recorded manifest names a checkpoint-root mapping the commit did not write"
+            );
+        }
+
+        let record = prepared.record().clone();
+        let key = record.intent().key();
+        let candidate_chain = *record.identity().canonical_chain();
+        let checkpoint_id = candidate_chain.checkpoint().checkpoint_id().get();
+
+        let observed_head = AuthorityHeadView::try_from_observed(
+            key,
+            candidate_chain,
+            AuthorityStateCheckpointId::new(checkpoint_id),
+            AuthorityStateRoot::from_local_state_root(observed_checkpoint_tree_root),
+        )?;
+        let observation = AuthorityPostWriteObservation::new(
+            observed_head,
+            record.intent().artifacts().mutation_digest(),
+            AuthorityHeadPayloadDigest::from_verified_payload_bytes(
+                record.intent().head_payload().as_bytes(),
+            ),
+            AuthorityProofObservation::CoordinatorPublicInput(
+                *candidate_chain.checkpoint().checkpoint_hash(),
+            ),
+        );
+        let sealed = SealedAuthorityManifest::verify_and_seal(record, observation)?;
+        self.recording.manifest().append_sealed(&sealed).await?;
+
+        // Publish the head.  A fresh authority is bootstrapped at the predecessor
+        // first, which is where the rollback floor lands: nothing below it has a
+        // manifest, so nothing below it is reachable (design-r1 §13 Q1).
+        let expected = match self
+            .recording
+            .canonical_head()
+            .read_canonical_head(self.network_id)
+            .await?
+        {
+            CanonicalHeadReadState::Current(head) => head,
+            CanonicalHeadReadState::Uninitialized => {
+                let predecessor = CanonicalChainRef::new(
+                    self.network_id,
+                    ChainEpoch::new(0),
+                    CheckpointRef::new(
+                        CheckpointId::new(self.ids.checkpoint_id),
+                        CheckpointHash::from_last_chain_hash(
+                            self.last_committed.last_chain_hash,
+                        ),
+                    ),
+                );
+                let profile = if self.ids.checkpoint_id == 0 {
+                    CanonicalHeadBootstrapProfile::GenesisNative
+                } else {
+                    CanonicalHeadBootstrapProfile::PostGenesisFloor
+                };
+                let bootstrap = CanonicalHeadBootstrap::try_new(profile, predecessor)?;
+                match self
+                    .recording
+                    .canonical_head()
+                    .bootstrap_canonical_head(&bootstrap)
+                    .await?
+                {
+                    CanonicalHeadWriteOutcome::Applied(head)
+                    | CanonicalHeadWriteOutcome::Idempotent(head)
+                    | CanonicalHeadWriteOutcome::Conflict { current: head } => head,
+                }
+            }
+        };
+        let cas = CanonicalHeadTransition::normal_checkpoint_advance(expected, candidate_chain)?
+            .seal();
+        let published = match self
+            .recording
+            .canonical_head()
+            .compare_and_set_canonical_head(&cas)
+            .await?
+        {
+            CanonicalHeadWriteOutcome::Applied(head)
+            | CanonicalHeadWriteOutcome::Idempotent(head) => head,
+            CanonicalHeadWriteOutcome::Conflict { current } => anyhow::bail!(
+                "canonical head moved under this commit: expected revision {}, observed {}",
+                expected.revision().get(),
+                current.revision().get()
+            ),
+        };
+
+        let published_view = AuthorityHeadView::try_from_observed(
+            key,
+            *published.canonical_ref(),
+            AuthorityStateCheckpointId::new(checkpoint_id),
+            AuthorityStateRoot::from_local_state_root(observed_checkpoint_tree_root),
+        )?;
+        let receipt = match sealed.classify_head_cas(true, published_view)? {
+            AuthorityHeadPublishDecision::Published(receipt)
+            | AuthorityHeadPublishDecision::Idempotent(receipt) => receipt,
+            other => anyhow::bail!("head publication was not accepted: {other:?}"),
+        };
+        let committed = sealed.mark_committed(receipt)?;
+        self.recording.manifest().append_committed(&committed).await?;
+
+        // Release the lease so the next commit can reserve.
+        let state = match self
+            .recording
+            .timestamp()
+            .read_timestamp_state(key)
+            .await?
+        {
+            AuthorityTimestampReadState::Current(state) => state,
+            AuthorityTimestampReadState::Uninitialized => anyhow::bail!(
+                "the commit timestamp allocator row vanished while its lease was held"
+            ),
+        };
+        let completion = state.seal_completion(key, prepared.lease())?;
+        match self
+            .recording
+            .timestamp()
+            .complete_timestamp(&completion)
+            .await?
+        {
+            AuthorityTimestampWriteOutcome::Applied(_)
+            | AuthorityTimestampWriteOutcome::Idempotent(_) => Ok(()),
+            AuthorityTimestampWriteOutcome::Conflict(current) => anyhow::bail!(
+                "the commit timestamp lease was taken by another writer (observed revision {})",
+                current.revision().get()
+            ),
+        }
+    }
+
     pub async fn commit_state(
         &mut self,
         coordinator_update: PsyPreparedCoordinatorBlockStateUpdates<N::F, N::QHash>,
@@ -960,6 +1280,14 @@ checkpoint_backup_copy_status={}
         };
         let unique_pending_id = coordinator_update.unique_pending_id;
 
+        // design-r1 §3: the manifest reaches disk before any state write, so a
+        // crash between the two can never leave rows nothing names.  This also
+        // takes the commit timestamp lease, which is what makes the commit
+        // exclusive.
+        let recorded = self
+            .record_commit_prepared(&coordinator_update, checkpoint_proof_public_inputs_hash)
+            .await?;
+
         let contract_tree_heights = coordinator_update
             .new_contract_code_definitions
             .iter()
@@ -1056,6 +1384,15 @@ checkpoint_backup_copy_status={}
             .set_checkpoint_root_hash_to_id_mapping(checkpoint_delta_merkle_proof.new_root, checkpoint_id)
             .await?;
         tracing::info!("Set checkpoint root hash to ID mapping for checkpoint ID: {}\n{:#?}", checkpoint_id, checkpoint_delta_merkle_proof);
+
+        // Seal the manifest against what was actually written, publish the head,
+        // and release the lease.
+        self.complete_commit_record(
+            recorded,
+            checkpoint_delta_merkle_proof.new_root,
+            &coordinator_update,
+        )
+        .await?;
         // END STANDARD STATE UPDATES (technically these can be done in any order after
         // the above two are done)
 
