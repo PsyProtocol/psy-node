@@ -5864,8 +5864,16 @@ mod async_split_tests {
         };
 
         let simulated = wallet_session.simulate_contract_call(user0, call_data.clone()).await?;
-        let generated = &simulated.generated;
-        assert_eq!(simulated.metadata.tx_hash.to_string(), generated.tx_hash);
+        let generated = simulated
+            .generated
+            .as_ref()
+            .expect("simulate_contract_call must return a generated trace");
+        let tx_hash = simulated
+            .metadata
+            .tx_hash
+            .as_ref()
+            .expect("simulate_contract_call must return a tx hash");
+        assert_eq!(tx_hash.to_string(), generated.tx_hash);
         assert!(!generated.trace.payload.is_empty());
         assert_eq!(simulated.metadata.contract_call_data.contract_calls.len(), 1);
         assert_eq!(simulated.metadata.contract_call_data.contract_calls[0].contract_id, contract_id);
