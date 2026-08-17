@@ -22,6 +22,7 @@ mod manifest_artifact_store;
 mod manifest_locator;
 mod manifest_record_store;
 mod mutation;
+mod mutation_sink;
 mod raw_access;
 mod rollback_floor_store;
 mod registry;
@@ -44,5 +45,6 @@ pub use raw_access::{
     raw_scylla_access_allowance, require_raw_scylla_access_allowlisted,
 };
 pub use mutation::*;
+pub use mutation_sink::*;
 pub use registry::*;
 pub use rollback_floor_store::*;
