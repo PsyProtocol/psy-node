@@ -79,7 +79,7 @@ where
             future_pending_end_cap_jobs: Arc::new(std::sync::RwLock::new(Vec::new())),
             tree_store: db.db.clone(),
         };
-        let (guta_queue_gatherer, guta_join_handle) = EphemeralQueueGathererWithTree::new_with_status::<
+        let (guta_queue_gatherer, guta_join_handle) = EphemeralQueueGathererWithTree::new_with_status_shared::<
             GUTAUpdateQueue,
             RealmGUTAEndCapGathererConfig<N, TempDatabase, FileSystem>,
             N::QHash,

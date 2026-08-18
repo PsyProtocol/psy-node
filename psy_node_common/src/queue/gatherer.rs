@@ -150,7 +150,7 @@ impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase + 'static, Output:
         stream: Arc<Sub>,
         create_builder_config: C,
         base_queue_key: QPStandardUniqueIdQueueKey<QUEUE_TOPIC_ID, QueueItem>,
-        tree: Arc<tokio::sync::RwLock<SimpleMemoryMerkleRecorderStore<Hasher, Hash>>>,
+        tree: SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
     ) -> (Self, tokio::task::JoinHandle<Result<(), anyhow::Error>>) {
         Self::new_with_status::<Sub, C, Hash, Hasher, Builder>(stream, create_builder_config, base_queue_key, tree, {
             let status = ProcessorStatus::new();
@@ -159,6 +159,30 @@ impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase + 'static, Output:
         })
     }
     pub fn new_with_status<
+        Sub: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
+        C: Clone + Send + Sync + 'static,
+        Hash: QHashBase + Send + Sync + 'static,
+        Hasher: MerkleZeroHasher<Hash> + Send + Sync + 'static,
+        Builder: QueueGathererItemBuilderWithTree<C, SimpleMemoryMerkleRecorderStore<Hasher, Hash>, Output = Output>
+            + Send
+            + Sync
+            + 'static,
+    >(
+        stream: Arc<Sub>,
+        create_builder_config: C,
+        base_queue_key: QPStandardUniqueIdQueueKey<QUEUE_TOPIC_ID, QueueItem>,
+        tree: SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
+        status: ProcessorStatus,
+    ) -> (Self, tokio::task::JoinHandle<Result<(), anyhow::Error>>) {
+        Self::new_with_status_shared::<Sub, C, Hash, Hasher, Builder>(
+            stream,
+            create_builder_config,
+            base_queue_key,
+            Arc::new(tokio::sync::RwLock::new(tree)),
+            status,
+        )
+    }
+    pub fn new_with_status_shared<
         Sub: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
         C: Clone + Send + Sync + 'static,
         Hash: QHashBase + Send + Sync + 'static,
