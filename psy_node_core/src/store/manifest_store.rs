@@ -125,6 +125,12 @@ pub struct CoordinatorCommitRecording<Hash: Q256BitHash> {
     /// session's timestamp generator reads the same clock, so opening the window
     /// is what makes the commit's rows share one write timestamp.
     commit_window: std::sync::Arc<super::commit_window::CommitWindowClock>,
+    /// The verification journal, when this deployment asked for one.
+    ///
+    /// Optional on purpose and only here: it decides nothing, so its absence
+    /// costs evidence rather than correctness.  §0.2 D3's "no optional
+    /// recording" is about the manifest, which stays mandatory.
+    journal: Option<std::sync::Arc<dyn super::verification_journal::CommitVerificationJournal>>,
 }
 
 impl<Hash: Q256BitHash> Clone for CoordinatorCommitRecording<Hash> {
@@ -138,6 +144,7 @@ impl<Hash: Q256BitHash> Clone for CoordinatorCommitRecording<Hash> {
             manifest_artifact: self.manifest_artifact.clone(),
             floor: self.floor.clone(),
             commit_window: self.commit_window.clone(),
+            journal: self.journal.clone(),
         }
     }
 }
@@ -158,6 +165,9 @@ impl<Hash: Q256BitHash> CoordinatorCommitRecording<Hash> {
             dyn super::coordinator_commit_source::CoordinatorRollbackFloorStore<Hash>,
         >,
         commit_window: std::sync::Arc<super::commit_window::CommitWindowClock>,
+        journal: Option<
+            std::sync::Arc<dyn super::verification_journal::CommitVerificationJournal>,
+        >,
     ) -> Self {
         Self {
             canonical_head,
@@ -168,7 +178,15 @@ impl<Hash: Q256BitHash> CoordinatorCommitRecording<Hash> {
             manifest_artifact,
             floor,
             commit_window,
+            journal,
         }
+    }
+
+    /// The verification journal, when one was configured.
+    pub fn journal(
+        &self,
+    ) -> Option<&dyn super::verification_journal::CommitVerificationJournal> {
+        self.journal.as_deref()
     }
 
     /// Open the commit window for one checkpoint.

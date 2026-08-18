@@ -320,37 +320,57 @@ impl ScyllaRowImageReader {
     /// removed.  On a sparse version-axis table most checkpoints hold no row for
     /// a given key and `None` is the correct answer.
     pub async fn read(&self, key: &ResolvedScyllaKey) -> anyhow::Result<Option<RowImage>> {
-        self.read_inner(key, false).await
+        self.read_inner(key, None).await
     }
 
-    /// What a production read of this key returns at this checkpoint.
+    /// What a production read of this key returns at `as_of_checkpoint`.
     ///
     /// On a version-axis table that is the newest row at or below the height,
     /// exactly as the table adapters query it.  This is the read the journal has
     /// to use: its assertion is that after a rollback a production read returns
     /// the value observed before, and a point read asks a different question.
-    pub async fn read_as_of(&self, key: &ResolvedScyllaKey) -> anyhow::Result<Option<RowImage>> {
-        self.read_inner(key, true).await
+    ///
+    /// The height is a parameter rather than the key's own, because the journal
+    /// asks what a key looked like *before* the commit that wrote it -- the key
+    /// names checkpoint `c` while the question is about `c - 1`.  Tables with no
+    /// version axis ignore it: they are overwritten in place, so their only state
+    /// is the current one.
+    pub async fn read_as_of(
+        &self,
+        key: &ResolvedScyllaKey,
+        as_of_checkpoint: u64,
+    ) -> anyhow::Result<Option<RowImage>> {
+        self.read_inner(key, Some(as_of_checkpoint)).await
     }
 
     async fn read_inner(
         &self,
         key: &ResolvedScyllaKey,
-        as_of: bool,
+        as_of: Option<u64>,
     ) -> anyhow::Result<Option<RowImage>> {
         let table = key.physical_table();
         let read = self
             .reads
             .get(&table)
             .ok_or(RowImageError::UnrecordedTable(table))?;
-        let values = cql_key_values(key.typed_key())?;
-        let statement = if as_of { &read.as_of } else { &read.exact };
+        let mut values = cql_key_values(key.typed_key())?;
+        let statement = match as_of {
+            Some(height) if read.has_checkpoint_axis => {
+                // The trailing bind is the checkpoint predicate, so replacing it
+                // asks the same key at a different height.
+                *values.last_mut().expect("a checkpoint axis implies a bind") =
+                    CqlValue::BigInt(height as i64);
+                &read.as_of
+            }
+            Some(_) => &read.exact,
+            None => &read.exact,
+        };
         let rows = self
             .session
             .execute_unpaged(statement, values)
             .await?
             .into_rows_result()?;
-        let wants_version = as_of && read.has_checkpoint_axis;
+        let wants_version = as_of.is_some() && read.has_checkpoint_axis;
 
         if read.columns.is_empty() {
             // Key-only table: presence is the whole image.

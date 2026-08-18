@@ -16,3 +16,4 @@ pub mod manifest_record;
 pub mod manifest_store;
 pub mod rollback_control;
 pub mod timestamp;
+pub mod verification_journal;

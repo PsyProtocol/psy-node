@@ -94,6 +94,11 @@ pub struct CoordinatorRollbackControlPlane {
     /// rather than made here: it must be the very one the session was built with,
     /// or a commit would open a window nothing is watching.
     commit_window: Arc<CommitWindowClock>,
+    /// Set only when this deployment asked for a verification journal.
+    ///
+    /// It is off by default because §2.2.2 scopes it to development and test: it
+    /// reads every recorded key twice per commit and keeps both images.
+    journal: Option<Arc<super::ScyllaVerificationJournal>>,
 }
 
 impl CoordinatorRollbackControlPlane {
@@ -128,6 +133,7 @@ impl CoordinatorRollbackControlPlane {
     ) -> anyhow::Result<Self> {
         Ok(Self {
             commit_window,
+            journal: None,
             authority_timestamp: Arc::new(
                 ScyllaAuthorityTimestampStore::prepare(
                     session.clone(),
@@ -177,7 +183,23 @@ impl CoordinatorRollbackControlPlane {
     ) -> anyhow::Result<Self> {
         let keyspaces = RollbackControlKeyspaces::from_core_store(store)?;
         Self::create_tables(&store.session, &keyspaces).await?;
-        Self::prepare(store.session.clone(), store.commit_window.clone(), &keyspaces).await
+        let mut control =
+            Self::prepare(store.session.clone(), store.commit_window.clone(), &keyspaces).await?;
+
+        // The journal lives in the state keyspace beside the tables it observes,
+        // and is created only when asked for -- see §2.2.2 on why it is a
+        // development and test layer rather than a production one.
+        if std::env::var("PSY_ROLLBACK_VERIFICATION_JOURNAL").is_ok() {
+            super::ScyllaVerificationJournal::create_table(&store.session, &store.keyspace).await?;
+            control.journal = Some(Arc::new(
+                super::ScyllaVerificationJournal::prepare(
+                    store.session.clone(),
+                    &store.keyspace,
+                )
+                .await?,
+            ));
+        }
+        Ok(control)
     }
 
     /// The driver-independent capability bundle a Coordinator processor takes.
@@ -196,6 +218,9 @@ impl CoordinatorRollbackControlPlane {
             self.manifest_artifact.clone(),
             self.floor.clone(),
             self.commit_window.clone(),
+            self.journal.clone().map(|journal| {
+                journal as Arc<dyn psy_node_core::store::verification_journal::CommitVerificationJournal>
+            }),
         )
     }
 

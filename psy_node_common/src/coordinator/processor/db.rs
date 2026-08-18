@@ -1388,6 +1388,16 @@ checkpoint_backup_copy_status={}
             None => None,
         };
 
+        // Observe every key this commit will write, before it writes any of them.
+        // It has to be before: the singletons and cursors are overwritten in
+        // place, so once written their previous value exists nowhere and the
+        // journal could only guess at it (design-r1 §2.2.2).
+        if let (Some(prepared), Some(journal)) = (&recorded, self.recording.journal()) {
+            journal
+                .record_before(checkpoint_id, prepared.planned_rows())
+                .await?;
+        }
+
         let contract_tree_heights = coordinator_update
             .new_contract_code_definitions
             .iter()
@@ -1488,6 +1498,16 @@ checkpoint_backup_copy_status={}
         // Seal the manifest against what was actually written, publish the head,
         // and release the lease.  Genesis recorded nothing, so there is nothing
         // to seal.
+        // Observe the same keys now that the writes have landed.  The after image
+        // is what lets the journal check the manifest itself: a stored value that
+        // differs from the newest recorded after image was written by something
+        // the manifest never named.
+        if let (Some(prepared), Some(journal)) = (&recorded, self.recording.journal()) {
+            journal
+                .record_after(checkpoint_id, prepared.planned_rows())
+                .await?;
+        }
+
         if let Some(recorded) = recorded {
             self.complete_commit_record(
                 recorded,

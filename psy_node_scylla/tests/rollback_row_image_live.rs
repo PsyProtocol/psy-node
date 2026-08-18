@@ -193,7 +193,16 @@ async fn the_reader_finds_rows_the_production_writers_wrote() -> anyhow::Result<
         }
         // An as-of read at the very checkpoint a row was written must return that
         // same row: the fallback can only reach further back, never past it.
-        match reader.read_as_of(&resolved).await? {
+        let own_height = match &key {
+            TypedTableKey::GlobalUserMerkle { checkpoint, .. }
+            | TypedTableKey::UserRegistrationMerkle { checkpoint, .. }
+            | TypedTableKey::GlobalContractMerkle { checkpoint, .. }
+            | TypedTableKey::GlobalCheckpointMerkle { checkpoint, .. }
+            | TypedTableKey::ContractLeaf { checkpoint, .. }
+            | TypedTableKey::UserPublicKey { checkpoint, .. } => checkpoint.get(),
+            _ => latest,
+        };
+        match reader.read_as_of(&resolved, own_height).await? {
             Some(image) => {
                 let exact = reader.read(&resolved).await?.expect("just read above");
                 assert_eq!(
@@ -283,7 +292,7 @@ async fn a_read_falls_back_to_the_newest_version_at_or_below_the_height() -> any
     );
     // ... yet a production-shaped read there returns the older row, unchanged.
     let fallen_back = reader
-        .read_as_of(&much_later)
+        .read_as_of(&much_later, latest as u64)
         .await?
         .expect("a read at a later height must fall back, not return nothing");
     let original = reader

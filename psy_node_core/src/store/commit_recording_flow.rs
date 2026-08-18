@@ -40,6 +40,12 @@ pub struct PreparedCommitRecording<Hash: Q256BitHash> {
     record: PreparedAuthorityManifestRecord<Hash>,
     lease: AuthorityTimestampLease,
     source: CoordinatorCommitSource<Hash>,
+    /// The rows this commit will write, as planned.
+    ///
+    /// Kept alongside the encoded artifact because the verification journal reads
+    /// each of them before and after the commit, and decoding them back out of
+    /// the chunks would re-derive what the planner just produced.
+    planned_rows: Vec<(u16, Vec<u8>)>,
 }
 
 impl<Hash: Q256BitHash> PreparedCommitRecording<Hash> {
@@ -60,6 +66,10 @@ impl<Hash: Q256BitHash> PreparedCommitRecording<Hash> {
     /// `NOT_FEASIBLE`, because there is nothing to archive against.
     pub const fn source(&self) -> &CoordinatorCommitSource<Hash> {
         &self.source
+    }
+
+    pub fn planned_rows(&self) -> &[(u16, Vec<u8>)] {
+        &self.planned_rows
     }
 }
 
@@ -136,7 +146,10 @@ pub async fn prepare_commit_recording<Hash: Q256BitHash>(
     recording
         .planner()
         .plan_coordinator_commit(inputs, &sink)?;
-    let planned = recording.planner().encode_planned_locators(sink.take())?;
+    let planned_rows = sink.take();
+    let planned = recording
+        .planner()
+        .encode_planned_locators(planned_rows.clone())?;
     if planned.affected_row_count == 0 {
         anyhow::bail!("a Coordinator commit that writes no row cannot be recorded");
     }
@@ -238,6 +251,7 @@ pub async fn prepare_commit_recording<Hash: Q256BitHash>(
         record,
         lease: reservation.lease(),
         source,
+        planned_rows,
     })
 }
 
