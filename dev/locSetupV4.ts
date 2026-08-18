@@ -2439,6 +2439,20 @@ async function buildProject(cwd?: string) {
 }
 
 async function ensureUiDependencies(uiDir: string) {
+    // Some apps ship their own pnpm-workspace.yaml (e.g. mode-a-web-wallet-bridge)
+    // even though they live under a parent workspace. Install them in-place so
+    // pnpm can resolve their `link:` deps correctly.
+    if (await exists(path.join(uiDir, "pnpm-workspace.yaml"))) {
+        console.log(`[DevNet] Installing UI deps in standalone pnpm workspace ${uiDir}...`);
+        await ensurePnpmBuildScriptsApproved(uiDir, ["esbuild"]);
+        const result = await runAndCapture(["pnpm", "install"], uiDir);
+        if (result.code !== 0) {
+            throw new Error(`pnpm install failed in ${uiDir}: ${result.stderr || result.stdout}`);
+        }
+        console.log(`[DevNet] UI deps installed in ${uiDir}`);
+        return;
+    }
+
     const workspaceDir = path.resolve(uiDir, "..", "..");
     if (await exists(path.join(workspaceDir, "pnpm-workspace.yaml"))) {
         await ensureNpmDeps(workspaceDir, "psy-dapp");
@@ -3059,6 +3073,7 @@ interface ProcessOptions {
     psyPrivacyBridge?: boolean;
     ide?: boolean;
     explorer?: boolean;
+    modeAWebWalletBridge?: boolean;
     daemonlize?: boolean;
     cleanState?: boolean;
 }
@@ -3346,7 +3361,7 @@ class DevNetProcessManager {
 
         const disableWorkerEdgeLogs = !!options.disableWorkerEdgeLogs;
         // Determine what components to start
-        const hasOnlyOptions = !!options.db || !!options.coordinator || (options.proveProxyCount || 0) > 0 || !!options.faucetServer || (options.dummyProvers || 0) > 0 || !!options.l1 || !!options.relayer || !!options.bridgeUi || !!options.privacyUi || !!options.psyPrivacyBridge || !!options.ide || !!options.explorer;
+        const hasOnlyOptions = !!options.db || !!options.coordinator || (options.proveProxyCount || 0) > 0 || !!options.faucetServer || (options.dummyProvers || 0) > 0 || !!options.l1 || !!options.relayer || !!options.bridgeUi || !!options.privacyUi || !!options.psyPrivacyBridge || !!options.ide || !!options.explorer || !!options.modeAWebWalletBridge;
         const startAll = !hasOnlyOptions;
         const startBridgeProposerDaemon = startAll || !!options.bridgeProposerDaemon || !!options.relayer || !!options.bridgeUi;
 
@@ -4172,7 +4187,58 @@ class DevNetProcessManager {
             ));
             console.log('[DevNet] Explorer started on port 5178');
         }
-        await waitForProveProxy("DevNet ready");
+
+        // 18. Mode A Web Wallet Bridge
+        if (options.modeAWebWalletBridge || startAll) {
+            const modeAWebWalletBridgeDir = path.join(cwd, 'psy-dapp', 'mode-a-web-wallet-bridge');
+            // The app uses `link:` deps to `@psy-protocol/psy-sdk` and `@psy-protocol/evm-wallet`.
+            // Those packages are not part of this repo (client_prover/psy_sdk only has generated
+            // types), so we can only start the dev server if the linked workspace is present.
+            const modeAPackageJson = await (async (): Promise<Record<string, unknown> | null> => {
+                try {
+                    return await Bun.file(path.join(modeAWebWalletBridgeDir, 'package.json')).json();
+                } catch {
+                    return null;
+                }
+            })();
+            const linkedDeps: string[] = [];
+            if (modeAPackageJson && typeof modeAPackageJson.dependencies === 'object' && modeAPackageJson.dependencies !== null) {
+                for (const [name, spec] of Object.entries(modeAPackageJson.dependencies as Record<string, string>)) {
+                    if (typeof spec === 'string' && spec.startsWith('link:')) {
+                        linkedDeps.push(name);
+                        const resolved = path.resolve(modeAWebWalletBridgeDir, spec.slice(5));
+                        if (!(await exists(path.join(resolved, 'package.json')))) {
+                            console.warn(
+                                `[DevNet] Skipping Mode A Web Wallet Bridge: linked dependency ${name}@${spec} does not resolve to a valid package (${resolved}).\n`
+                                + `[DevNet] Make sure the psy-sdk workspace is checked out at the path expected by psy-dapp/mode-a-web-wallet-bridge/package.json.`,
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+            if (linkedDeps.length > 0) {
+                console.log(`[DevNet] Mode A Web Wallet Bridge linked dependencies resolved: ${linkedDeps.join(', ')}`);
+            }
+            await ensureUiDependencies(modeAWebWalletBridgeDir);
+            await this.track(await RunningProcess.spawnWithInitializationHintWithRetry(
+                ['bun', 'run', 'dev', '--', '--host', '0.0.0.0', '--port', '5179', '--strictPort'],
+                uiStartedDetector,
+                {
+                    cwd: modeAWebWalletBridgeDir,
+                    ...getLogPaths('mode_a_web_wallet_bridge', false),
+                    env: {
+                        ...this.getEnv(),
+                        VITE_NETWORK: l1Network,
+                        VITE_FORK: String(l1Fork),
+                        PSY_DEPLOYMENTS_DIR: path.resolve(cwd, 'psy-contracts', 'deployments'),
+                    },
+                    maxRetries: 3,
+                    retryDelayMs: 2000
+                }
+            ));
+            console.log('[DevNet] Mode A Web Wallet Bridge started on port 5179');
+        }
     }
 
     async setupDaemonized(options: ProcessOptions): Promise<void> {
@@ -4184,7 +4250,7 @@ class DevNetProcessManager {
         const coordinatorWorkersCount = options.coordinatorWorkersCount;
         this.genesisDataPath = options.genesisDataPath || "genesis.json";
 
-        const hasOnlyOptions = !!options.db || !!options.coordinator || (options.proveProxyCount || 0) > 0 || !!options.faucetServer || (options.dummyProvers || 0) > 0 || !!options.l1 || !!options.relayer || !!options.bridgeUi || !!options.privacyUi || !!options.psyPrivacyBridge || !!options.ide || !!options.explorer;
+        const hasOnlyOptions = !!options.db || !!options.coordinator || (options.proveProxyCount || 0) > 0 || !!options.faucetServer || (options.dummyProvers || 0) > 0 || !!options.l1 || !!options.relayer || !!options.bridgeUi || !!options.privacyUi || !!options.psyPrivacyBridge || !!options.ide || !!options.explorer || !!options.modeAWebWalletBridge;
         const startAll = !hasOnlyOptions;
 
         const startCoordinatorProcessor = startAll || !!options.coordinator;
@@ -4652,6 +4718,7 @@ async function runMain() {
             "psy-privacy-bridge": { type: "boolean" },
             "ide": { type: "boolean" },
             "explorer": { type: "boolean" },
+            "mode-a-web-wallet-bridge": { type: "boolean" },
             "daemonlize": { type: "boolean" },
             "clean-state": { type: "boolean" }, // deprecated alias
             "teardown": { type: "boolean" },
@@ -4664,7 +4731,7 @@ async function runMain() {
 
 
 
-    const hasOnlyOptions = !!values["db"] || !!values["coordinator"] || !!values["prove-proxy"] || !!values["faucet-server"] || !!values["dummy-provers"] || !!values["l1"] || !!values["relayer"] || !!values["bridge-proposer-daemon"] || !!values["psy-privacy-bridge"] || !!values["ide"] || !!values["explorer"];
+    const hasOnlyOptions = !!values["db"] || !!values["coordinator"] || !!values["prove-proxy"] || !!values["faucet-server"] || !!values["dummy-provers"] || !!values["l1"] || !!values["relayer"] || !!values["bridge-proposer-daemon"] || !!values["psy-privacy-bridge"] || !!values["ide"] || !!values["explorer"] || !!values["mode-a-web-wallet-bridge"];
     const workerRealmCount = resolveRealmWorkerCount(
         values["realm-workers"],
         hasOnlyOptions,
@@ -4688,6 +4755,7 @@ async function runMain() {
     const psyPrivacyBridge = !!values["psy-privacy-bridge"];
     const ide = !!values["ide"];
     const explorer = !!values["explorer"];
+    const modeAWebWalletBridge = !!values["mode-a-web-wallet-bridge"];
     const daemonlize = !!values["daemonlize"];
     const teardown = !!values["teardown"];
     const purge = !!values["purge"];
@@ -4752,6 +4820,7 @@ Usage: bun run dev/locSetupV4.ts [options]
    --psy-privacy-bridge           Start integrated privacy+bridge shell (psy-dapp/apps/bridge, port 5177)
    --ide                          Start IDE dev server (psy-dapp/apps/ide, port 5176)
    --explorer                     Start blockchain explorer dev server (psy-dapp/apps/explorer, port 5178)
+   --mode-a-web-wallet-bridge     Start Mode A web wallet bridge dev server (psy-dapp/mode-a-web-wallet-bridge, port 5179)
    --daemonlize                    Generate docker-compose.yml and start in background
    --teardown                      Stop local devnet processes/containers and exit
    --purge                         With --teardown (or startup), also remove local_checkpoints, logs, deployments, and devnet Docker volumes
@@ -4788,6 +4857,7 @@ Usage: bun run dev/locSetupV4.ts [options]
    bun run dev/locSetupV4.ts --bridge-proposer-daemon  # alias for unified bridge relayer
    bun run dev/locSetupV4.ts --psy-privacy-bridge  # start integrated privacy+bridge shell on port 5177
    bun run dev/locSetupV4.ts --explorer            # start blockchain explorer on port 5178
+   bun run dev/locSetupV4.ts --mode-a-web-wallet-bridge  # start Mode A web wallet bridge on port 5179
    bun run dev/locSetupV4.ts --l1 --relayer --psy-privacy-bridge  # full bridge stack
 
  Notes:
@@ -4866,7 +4936,7 @@ Usage: bun run dev/locSetupV4.ts [options]
         await ensureDevEnvironment(REPO_ROOT, {
             requireDocker: !hasOnlyOptions || db || relayer || bridgeProposerDaemon,
             requireAnvil: !hasOnlyOptions || l1,
-            requireBun: !hasOnlyOptions || psyPrivacyBridge || ide,
+            requireBun: !hasOnlyOptions || psyPrivacyBridge || ide || modeAWebWalletBridge,
         });
     }
 
@@ -4913,6 +4983,7 @@ Usage: bun run dev/locSetupV4.ts [options]
             psyPrivacyBridge,
             ide,
             explorer,
+            modeAWebWalletBridge,
             daemonlize: !!values.daemonlize,
             cleanState,
         };
