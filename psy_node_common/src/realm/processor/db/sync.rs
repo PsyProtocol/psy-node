@@ -138,6 +138,54 @@ where
         Ok(())
     }
 
+    /// Point this Realm back at `target` so its next sync re-fetches from there.
+    ///
+    /// A Realm holds two different kinds of state, and only one of them is its
+    /// own.  Its transactions -- user leaves, contract state, the IMT -- are
+    /// written by `commit_state`, recorded in its manifest, and rolled back by
+    /// deleting what the manifest names.  Everything this module writes is a
+    /// *copy* of checkpoints the Coordinator published: leaf data, state roots,
+    /// the root mapping, the block state.  Copies do not need their old values
+    /// restored, because the authoritative source still has them -- they need to
+    /// be fetched again.
+    ///
+    /// Two things make that work, and neither is optional.
+    ///
+    /// The marker has to move first.  `persist_checkpoint_metadata_range` starts
+    /// at `latest_checkpoint_id + 1`, so a Realm that still believes it is at 100
+    /// while the Coordinator has rolled back to 95 computes `from = 101,
+    /// to = 95`, returns immediately, and never syncs again.  It does not drift
+    /// -- it stops.
+    ///
+    /// The local checkpoint tree has to be truncated too.  `sync` validates each
+    /// fetched checkpoint against the root its own in-memory tree computes, and
+    /// after a rollback that tree still holds the discarded branch's leaves, so
+    /// the first re-fetched height fails the check.  That path does recover --
+    /// it hard-resets and asks the caller to retry -- but recovering through a
+    /// deliberate error is not the same as not needing one, and the reset it
+    /// performs uses whatever marker it happened to read.  Truncating here makes
+    /// the first attempt correct.
+    ///
+    /// Rows the Realm holds above `target` are left to be overwritten as the
+    /// chain climbs back through those heights; each write in the loop is an
+    /// unconditional `set_*`, so a re-synced height replaces what was there.
+    /// Heights the new branch never reaches keep stale copies, which is a leak
+    /// rather than a ghost: nothing reads a checkpoint above the current head.
+    pub async fn reset_for_rollback_to(&mut self, target: u64) -> anyhow::Result<()> {
+        let resync_from = target.saturating_sub(1);
+        tracing::warn!(
+            "[REALM_ROLLBACK] resetting Realm sync state to checkpoint {} so the next sync \
+             re-fetches {} onward",
+            resync_from,
+            target
+        );
+        self.checkpoint_tree_backup_manager
+            .hard_reset_and_truncate(resync_from)
+            .await?;
+        self.db.set_latest_checkpoint_id(resync_from).await?;
+        Ok(())
+    }
+
     pub async fn sync_with_coordinator(&mut self) -> anyhow::Result<()> {
         let coordinator_latest_checkpoint_id: u64 = self.coordinator_client.rc_get_latest_checkpoint_id().await?;
         let last_synced_checkpoint_id = self.checkpoint_tree_backup_manager.get_current_checkpoint_id_head();
