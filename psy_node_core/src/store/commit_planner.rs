@@ -61,6 +61,34 @@ pub struct CoordinatorCommitPlanInputs<'a> {
     pub checkpoint_tree_height: u8,
 }
 
+/// Everything needed to enumerate the rows one Realm commit will write.
+///
+/// The Realm writes a different set of tables than the Coordinator but through
+/// the same kind of opaque blobs, so it gets its own inputs rather than sharing
+/// a struct where half the fields would always be empty -- an empty field and an
+/// absent one look the same to a planner, and the difference is exactly what
+/// under-recording is made of.
+pub struct RealmCommitPlanInputs<'a> {
+    pub checkpoint_id: u64,
+    pub unique_pending_id: u64,
+    /// The Realm this commit belongs to, which keys its reward-tree rows.
+    pub realm_id: u64,
+    pub update_user_leaves_ffs: &'a [u8],
+    pub update_user_contract_tree_nodes_ffs: &'a [u8],
+    pub update_contract_state_tree_nodes_ffs: &'a [u8],
+    pub update_contract_state_imt_leaves_ffs: &'a [u8],
+    pub update_global_user_tree_nodes_ffs: &'a [u8],
+}
+
+/// Enumerates the physical rows one Realm commit will write.
+pub trait RealmCommitPlanner: Send + Sync {
+    fn plan_realm_commit(
+        &self,
+        inputs: &RealmCommitPlanInputs<'_>,
+        sink: &dyn PhysicalMutationSink,
+    ) -> anyhow::Result<()>;
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommitPlanError {
     /// A blob field is not a whole number of rows.  Planning stops before

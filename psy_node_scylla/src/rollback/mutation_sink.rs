@@ -99,6 +99,29 @@ impl std::error::Error for UnsupportedSingleMerkleTable {}
 /// The partition id means different things per table -- a user for
 /// `user_contract_tree`, a contract for `contract_function_tree` -- so it is
 /// interpreted by physical table rather than carried as a bare number.
+/// The typed key for a node in a tree partitioned by a tree pair.
+pub fn double_merkle_node_key(
+    physical: ScyllaPhysicalTableId,
+    tree_id: u64,
+    tree_sub_id: u64,
+    level: u8,
+    index: u64,
+    checkpoint: CheckpointId,
+) -> Result<TypedTableKey, UnsupportedSingleMerkleTable> {
+    match physical {
+        // The contract state tree is keyed by (user, contract): the pair is not
+        // interchangeable, and swapping them would silently name another user's
+        // contract.
+        ScyllaPhysicalTableId::ContractStateTree => Ok(TypedTableKey::ContractStateMerkle {
+            user: UserId::new(tree_id),
+            contract: ContractId::new(tree_sub_id),
+            node: MerkleNode::new(level, NodeIndex::new(index)),
+            checkpoint,
+        }),
+        other => Err(UnsupportedSingleMerkleTable(other)),
+    }
+}
+
 pub fn single_merkle_node_key(
     physical: ScyllaPhysicalTableId,
     tree_id: u64,
