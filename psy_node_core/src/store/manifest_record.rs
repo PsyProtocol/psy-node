@@ -232,6 +232,25 @@ impl<Hash: Q256BitHash> PreparedAuthorityManifestRecord<Hash> {
         })
     }
 
+    /// The intent a persisted PREPARED payload carries.
+    ///
+    /// [`decode_persisted`](Self::decode_persisted) verifies a payload against an
+    /// identity the caller already holds, which the rollback planner does not:
+    /// it walks a range of checkpoint ids and learns each one's hash from the
+    /// record itself.  The payload is self-describing, so reading the intent out
+    /// of it needs nothing external -- and the digest is still checked, so a
+    /// corrupted payload cannot pass as a chain reference.
+    pub fn peek_intent(
+        canonical_payload: &[u8],
+        persisted_digest: &[u8],
+    ) -> Result<SealedAuthorityCommitIntent<Hash>, ManifestRecordError> {
+        let digest = AuthorityManifestDigest::calculate(canonical_payload);
+        if digest.as_bytes().as_slice() != persisted_digest {
+            return Err(ManifestRecordError::ManifestDigestMismatch);
+        }
+        Ok(decode_prepared_payload::<Hash>(canonical_payload)?.intent)
+    }
+
     pub fn decode_persisted(
         selected_identity: AuthorityManifestIdentity<Hash>,
         revision: i64,

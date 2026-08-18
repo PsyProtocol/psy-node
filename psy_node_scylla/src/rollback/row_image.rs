@@ -74,6 +74,22 @@ pub struct RowImage {
 }
 
 impl RowImage {
+    /// Build an image directly, for tests that exercise encoders over it.
+    #[cfg(test)]
+    pub fn for_test(write_times: Vec<Option<i64>>) -> Self {
+        Self {
+            columns: write_times
+                .into_iter()
+                .map(|write_time_us| RowColumn {
+                    name: "value",
+                    value: Some(vec![1]),
+                    write_time_us,
+                })
+                .collect(),
+            resolved_checkpoint: None,
+        }
+    }
+
     pub fn columns(&self) -> &[RowColumn] {
         &self.columns
     }
