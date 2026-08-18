@@ -239,21 +239,22 @@ impl RealmCommitPlanner for ScyllaRealmCommitPlanner {
             record(sink, &key)?;
         }
 
-        // 7. The singletons this commit overwrites in place.  They have no
-        //    version axis, so a rollback restores rather than uncovers them.
-        record(
-            sink,
-            &TypedTableKey::U64Singleton(
-                psy_node_core::store::typed::U64SingletonSlot::LatestCheckpoint,
-            ),
-        )?;
-        record(
-            sink,
-            &TypedTableKey::LatestInfo(
-                psy_node_core::store::typed::LatestInfoSlot::LatestL2BlockState,
-            ),
-        )?;
-
+        // 7. The two singletons this commit also writes are deliberately absent.
+        //
+        //    On the Realm they are sync's markers, not the commit's: `sync.rs`
+        //    writes `set_latest_checkpoint_id` three times and
+        //    `set_l2_latest_block_state` twice for every one time `commit_state`
+        //    does.  A rollback restores them by pointing the Realm back at the
+        //    target (`reset_for_rollback_to`), not from a manifest.
+        //
+        //    Recording them anyway would not be harmless over-recording.  That
+        //    rule -- a locator for a row that was never written deletes nothing
+        //    -- holds for a version axis, where the locator names one version
+        //    among many.  A singleton has no version axis: deleting it destroys
+        //    the only copy.  Worse, deleting it fences the key, and every later
+        //    write to it would then have to clear that fence -- while sync writes
+        //    with a plain clock and would be shadowed, succeeding and staying
+        //    unreadable.  The marker would look frozen while the chain advanced.
         let _ = RealmId::new(inputs.realm_id);
         Ok(())
     }
@@ -382,6 +383,28 @@ mod tests {
                 .any(|(_, locator)| locator.as_slice() == expected.locator_bytes()),
             "the planned user leaf does not name user 7"
         );
+    }
+
+    #[test]
+    fn the_sync_owned_singletons_are_not_planned() {
+        // They are markers sync writes far more often than commit does, and a
+        // rollback restores them by pointing the Realm back at the target.
+        // Planning them would delete the only copy -- there is no version axis
+        // to fall back to -- and fence the key against sync's plain-clock writes.
+        let sink = CollectingPhysicalMutationSink::new();
+        ScyllaRealmCommitPlanner::new()
+            .plan_realm_commit(&inputs(&[], &[], &[]), &sink)
+            .expect("plans");
+        let tables: Vec<u16> = sink.take().into_iter().map(|(table, _)| table).collect();
+        for absent in [
+            ScyllaPhysicalTableId::U64Singleton,
+            ScyllaPhysicalTableId::LatestInfo,
+        ] {
+            assert!(
+                !tables.contains(&(absent as u16)),
+                "{absent:?} is sync's marker on the Realm and must not be planned"
+            );
+        }
     }
 
     #[test]
