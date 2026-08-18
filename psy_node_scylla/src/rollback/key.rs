@@ -766,7 +766,12 @@ fn typed_key_from_fields(domain: ScyllaKeyDomain, fields: &[DecodedField]) -> Re
 
 /// Strictly decodes the stable locator codec and reconstructs its typed key.
 /// The result is accepted only when resolving that key reproduces every byte.
-pub(crate) fn decode_locator_canonical(bytes: &[u8]) -> Result<ResolvedScyllaKey, &'static str> {
+/// Decode a locator back to the typed key it names.
+///
+/// Public because the rollback path outside this module -- archive, delete and
+/// the acceptance assertion -- all start from a recorded locator and must resolve
+/// it exactly as the recorder did.  A second decoder would verify itself.
+pub fn decode_locator_canonical(bytes: &[u8]) -> Result<ResolvedScyllaKey, &'static str> {
     let mut cursor = LocatorCursor::new(bytes);
     if cursor.take(4)? != LOCATOR_MAGIC {
         return Err("bad locator magic");

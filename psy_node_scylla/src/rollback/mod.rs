@@ -54,7 +54,7 @@ pub use manifest_record_store::*;
 pub use key::{
     CqlPrimaryKeyFingerprint, ResolvedScyllaKey, describe_existing_key, resolve_key_for_rollback,
 };
-pub(crate) use key::decode_locator_canonical;
+pub use key::decode_locator_canonical;
 pub use raw_access::{
     RAW_SCYLLA_ACCESS_ALLOWLIST, RawScyllaAccessAllowance, RawScyllaAccessCounts,
     RawScyllaAccessScope, RawScyllaAccessViolation, inspect_raw_scylla_source,

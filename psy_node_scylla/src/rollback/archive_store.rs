@@ -19,6 +19,15 @@
 //! read back and compared byte for byte. A count proves only that something was
 //! written.
 //!
+//! **A slot holds one row, because the hot table holds one row.** Tables with no
+//! version axis are touched by every checkpoint in the range under the *same*
+//! physical key, so they all address one slot -- and that is correct, since the
+//! hot table only ever held the newest value.  The slot therefore keeps the first
+//! `checkpoint_id` that reached it, which is `c(K)`: the lowest height above the
+//! target that wrote the key, and so the boundary the restore cares about.  What
+//! a re-visit must match is the *content*; a differing checkpoint id is expected
+//! and is not a conflict.
+//!
 //! **An absent row is archived as absent.** A planned key that no longer exists
 //! is evidence, not an error to skip: the manifest deliberately over-records, so
 //! "planned but not present" is a normal and expected state, and recording it is
@@ -179,14 +188,23 @@ impl ScyllaRollbackArchive {
             );
         };
 
-        let matches = stored_checkpoint as u64 == checkpoint_id
-            && stored_present == image.is_some()
+        // Content only.  A slot reached by several checkpoints keeps the first
+        // one, so comparing the height would report every axis-less table as a
+        // conflict on its second visit.  Differing *content* for one source key
+        // is the real conflict: two observations disagree about what was stored.
+        let content_matches = stored_present == image.is_some()
             && stored_image.unwrap_or_default() == image.clone().unwrap_or_default()
             && stored_times.unwrap_or_default() == write_times;
-        if !matches {
+        if !content_matches {
             return Ok(ArchiveOutcome::Conflict);
         }
-        Ok(ArchiveOutcome::Archived)
+        if stored_checkpoint as u64 == checkpoint_id {
+            Ok(ArchiveOutcome::Archived)
+        } else {
+            // The slot was already filled by a lower checkpoint in this same
+            // plan, which is how an overwrite-in-place table looks from here.
+            Ok(ArchiveOutcome::AlreadyIdentical)
+        }
     }
 
     /// Everything archived for one plan and table.
