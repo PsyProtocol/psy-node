@@ -296,8 +296,19 @@ where
         let old_root = self.state.last_committed_realm_end_root;
         let new_root = realm_update.new_realm_root;
         let transition = if old_root == new_root {
+            // `Unchanged` names the checkpoint the state is still *at*, so it has
+            // to be at or below the expected head -- naming the height being
+            // committed would say "nothing changed, and it did not change at a
+            // height nobody has published yet".  The right value is the Realm's
+            // last committed height, which is §6.3's sparse "last height that
+            // actually changed" semantics: a Realm's state checkpoint does not
+            // advance in step with the Coordinator's.
             AuthorityStateTransition::Unchanged {
-                checkpoint: AuthorityStateCheckpointId::new(checkpoint_id),
+                checkpoint: AuthorityStateCheckpointId::new(
+                    self.state.last_committed_checkpoint_id.min(
+                        checkpoint_id.saturating_sub(1),
+                    ),
+                ),
                 root: AuthorityStateRoot::from_local_state_root(new_root),
             }
         } else {
