@@ -14,6 +14,8 @@ pub mod manifest_intent;
 pub mod manifest_lifecycle;
 pub mod manifest_record;
 pub mod manifest_store;
+pub mod realm_commit_recording;
+pub mod realm_recording_flow;
 pub mod rollback_control;
 pub mod rollback_plan;
 pub mod timestamp;

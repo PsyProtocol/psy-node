@@ -343,3 +343,38 @@ pub async fn setup_coordinator_psy_scylla_store_from_connection_string<N: QNetwo
     let control = crate::rollback::CoordinatorRollbackControlPlane::setup(core.as_ref()).await?;
     Ok((store, control))
 }
+
+/// Bring up a Realm's state store together with its rollback control plane.
+///
+/// Returns both or neither, like the Coordinator's, so §0.2 D3 holds on this
+/// side too: a Realm processor cannot be handed a store it can write without
+/// also being handed the means to record what it wrote.
+///
+/// The Realm's control plane creates three tables rather than nine (§6.3): it
+/// publishes no head and keeps no commit source, because §6 gives the chain one
+/// authority over its head and the Realms read it.  The ordering constraint the
+/// Coordinator has does not apply here for the same reason -- there is no
+/// singleton anchor to prepare -- but the state store is still created first, so
+/// the two paths stay the same shape.
+pub async fn setup_realm_psy_scylla_store_from_connection_string<N: QNetworkDatabaseTypes>(
+    keyspace: &str,
+    connection_string: &str,
+) -> anyhow::Result<(
+    ScyllaUnifiedPsyStore<N, N::QHash, N::HasherBase>,
+    crate::rollback::RealmRollbackControlPlane,
+)> {
+    if connection_string.is_empty() {
+        anyhow::bail!("Scylla Connection string is empty");
+    }
+    let addresses = connection_string
+        .split(',')
+        .map(|s| s.to_string())
+        .collect::<Vec<String>>();
+    let core = Arc::new(
+        ScyllaCoreStore::<N::QHash, N::HasherBase>::new(0, 0, keyspace.to_string(), &addresses)
+            .await?,
+    );
+    let store = setup_psy_scylla_database_store::<N>(core.clone()).await?;
+    let control = crate::rollback::RealmRollbackControlPlane::setup(core.as_ref()).await?;
+    Ok((store, control))
+}
