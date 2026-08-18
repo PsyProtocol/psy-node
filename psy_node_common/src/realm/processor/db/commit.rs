@@ -383,10 +383,20 @@ where
         let candidate_chain = *record.identity().canonical_chain();
         let checkpoint_id = candidate_chain.checkpoint().checkpoint_id().get();
 
+        // The observation has to restate what the intent committed to, not
+        // rebuild it from the caller's own variables.  The state checkpoint is
+        // the transition's, which for an unchanged Realm is its last committed
+        // height rather than the height being written -- deriving it here from
+        // `checkpoint_id` made the two disagree and sealing failed with
+        // PostWriteHeadMismatch, leaving a PREPARED row with no SEALED sibling.
+        //
+        // The root still comes from what was actually observed after the writes:
+        // that is the half the check exists to compare.
+        let transition = record.intent().state_transition();
         let observed_head = AuthorityHeadView::try_from_observed(
             key,
             candidate_chain,
-            AuthorityStateCheckpointId::new(checkpoint_id),
+            transition.state_checkpoint(),
             AuthorityStateRoot::from_local_state_root(observed_realm_root),
         )?;
         let observation = AuthorityPostWriteObservation::new(
