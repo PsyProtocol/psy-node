@@ -211,7 +211,7 @@ pub(crate) fn table_shape(table: ScyllaPhysicalTableId) -> Option<TableShape> {
         },
         // Versioned objects: the checkpoint is a clustering column.
         P::ContractLeaf | P::UserPublicKey | P::ContractCodeDefinition
-        | P::ContractStateTreeHeight | P::RealmRewardsTreeNodeKey => TableShape {
+        | P::ContractStateTreeHeight | P::RealmRewardsTreeNodeKey | P::UserLeaf => TableShape {
             value_columns: BLOB_VALUE,
         },
         // Merkle trees partitioned by level.
@@ -220,8 +220,40 @@ pub(crate) fn table_shape(table: ScyllaPhysicalTableId) -> Option<TableShape> {
             value_columns: BLOB_VALUE,
         },
         // Merkle trees partitioned by tree id.
-        P::ContractFunctionTree => TableShape {
+        P::ContractFunctionTree | P::UserContractTree => TableShape {
             value_columns: BLOB_VALUE,
+        },
+        // Merkle trees partitioned by a tree pair.
+        P::ContractStateTree => TableShape {
+            value_columns: BLOB_VALUE,
+        },
+        // The IMT leaf: five regular columns, and the successor pointers among
+        // them are why a rollback cannot rebuild this table from the tree alone.
+        P::ImtLeaf => TableShape {
+            value_columns: &[
+                ("leaf_key", ColumnKind::Blob),
+                ("leaf_value", ColumnKind::Blob),
+                ("leaf_hash", ColumnKind::Blob),
+                ("next_key", ColumnKind::Blob),
+                ("next_index", ColumnKind::BigInt),
+            ],
+        },
+        // The key index is derived from the leaves, but it carries
+        // `birth_checkpoint` as an ordinary column rather than in the key -- so
+        // deleting a version does not uncover the previous one and the index has
+        // to be rebuilt from the target's leaves (§2.4 rows 34/35).
+        P::ImtKeyIndex => TableShape {
+            value_columns: &[
+                ("leaf_index", ColumnKind::BigInt),
+                ("leaf_key", ColumnKind::Blob),
+                ("birth_checkpoint", ColumnKind::BigInt),
+            ],
+        },
+        // A cursor with no version axis at all: overwritten in place, so its
+        // previous value exists nowhere once written and it can only be restored
+        // from the target manifest.
+        P::ImtNextAppendIndex => TableShape {
+            value_columns: &[("next_append_index", ColumnKind::BigInt)],
         },
         // Two value columns, and the reason the reader had to stop assuming one.
         // Keyed by unique_pending_id with no version axis: the discarded range's
@@ -541,6 +573,39 @@ pub(crate) fn cql_key_values(key: &TypedTableKey) -> Result<Vec<CqlValue>, RowIm
             CqlValue::BigInt(contract.get() as i64),
             CqlValue::BigInt(checkpoint.get() as i64),
         ],
+        K::UserLeaf { user, checkpoint } => vec![
+            CqlValue::BigInt(user.get() as i64),
+            CqlValue::BigInt(checkpoint.get() as i64),
+        ],
+        K::UserContractMerkle { user, node, checkpoint } => vec![
+            CqlValue::BigInt(user.get() as i64),
+            CqlValue::TinyInt(node.level() as i8),
+            CqlValue::BigInt(node.index().get() as i64),
+            CqlValue::BigInt(checkpoint.get() as i64),
+        ],
+        K::ContractStateMerkle { user, contract, node, checkpoint } => vec![
+            CqlValue::BigInt(user.get() as i64),
+            CqlValue::BigInt(contract.get() as i64),
+            CqlValue::TinyInt(node.level() as i8),
+            CqlValue::BigInt(node.index().get() as i64),
+            CqlValue::BigInt(checkpoint.get() as i64),
+        ],
+        K::ImtLeaf { tree, tree_sub, leaf, checkpoint } => vec![
+            CqlValue::BigInt(tree.get() as i64),
+            CqlValue::BigInt(tree_sub.get() as i64),
+            CqlValue::BigInt(leaf.get() as i64),
+            CqlValue::BigInt(checkpoint.get() as i64),
+        ],
+        K::ImtKeyIndex { tree, tree_sub, encoded_key } => vec![
+            CqlValue::BigInt(tree.get() as i64),
+            CqlValue::BigInt(tree_sub.get() as i64),
+            CqlValue::SmallInt(encoded_key.cql_bucket()),
+            CqlValue::Blob(encoded_key.as_bytes().to_vec()),
+        ],
+        K::ImtCursor { tree, tree_sub } => vec![
+            CqlValue::BigInt(tree.get() as i64),
+            CqlValue::BigInt(tree_sub.get() as i64),
+        ],
         K::UserPublicKey { user, checkpoint } => vec![
             CqlValue::BigInt(user.get() as i64),
             CqlValue::BigInt(checkpoint.get() as i64),
@@ -572,21 +637,21 @@ pub(crate) fn cql_key_values(key: &TypedTableKey) -> Result<Vec<CqlValue>, RowIm
             CqlValue::Blob(public_key_hash.as_bytes().to_vec()),
             CqlValue::BigInt(user.get() as i64),
         ],
-        // Not written by the Coordinator commit path, so never recorded and
-        // never read here.  Slice B and the IMT work will each add their own.
-        K::CheckpointLeafByHash(_)
+        // `checkpointed_object_table` mixes axes: obj_id 1 and 3 put a checkpoint
+        // in the `checkpoint_id` column while obj_id 2's pending domain puts a
+        // pending id in the same column.  An as-of read would then compare a
+        // pending id against a checkpoint height, so R1 leaves the table alone --
+        // the registry marks it NO_DELETE and blocked (§7.2), and reading it here
+        // would invite exactly that comparison.
+        K::CheckpointedObject(_)
+        // Not written by any commit path this build records.
+        | K::CheckpointLeafByHash(_)
         | K::CheckpointLeafByCheckpoint(_)
         | K::UnusedCheckpointRealmRoot(_)
-        | K::CheckpointedObject(_)
-        | K::UserLeaf { .. }
         | K::U64Counter(_)
         | K::PendingToProc(_)
         | K::ProcToPending(_)
-        | K::UserContractMerkle { .. }
-        | K::ContractStateMerkle { .. }
-        | K::ImtLeaf { .. }
-        | K::ImtKeyIndex { .. }
-        | K::ImtCursor { .. } => {
+        => {
             return Err(RowImageError::UnrecordedTable(
                 super::describe_existing_key(key).physical_table(),
             ));
@@ -682,6 +747,31 @@ mod tests {
                 user: UserId::new(5),
             },
             TypedTableKey::RewardTagMerkle { pending, node },
+            // Realm-authority tables (slice B).
+            TypedTableKey::UserLeaf { user: UserId::new(5), checkpoint },
+            TypedTableKey::UserContractMerkle { user: UserId::new(5), node, checkpoint },
+            TypedTableKey::ContractStateMerkle {
+                user: UserId::new(5),
+                contract: ContractId::new(4),
+                node,
+                checkpoint,
+            },
+            TypedTableKey::ImtLeaf {
+                tree: TreeId::new(1),
+                tree_sub: TreeSubId::new(2),
+                leaf: LeafIndex::new(3),
+                checkpoint,
+            },
+            TypedTableKey::ImtKeyIndex {
+                tree: TreeId::new(1),
+                tree_sub: TreeSubId::new(2),
+                encoded_key: ImtEncodedKey::new({
+                    let mut bytes = [0x33; 32];
+                    bytes[..2].copy_from_slice(&0x8001u16.to_be_bytes());
+                    bytes
+                }),
+            },
+            TypedTableKey::ImtCursor { tree: TreeId::new(1), tree_sub: TreeSubId::new(2) },
         ]
     }
 
@@ -712,10 +802,13 @@ mod tests {
         // Returning "absent" for these would read, in a journal, as "this row was
         // born at this checkpoint" -- inventing history rather than reporting a
         // gap.
-        let key = TypedTableKey::ImtCursor {
-            tree: psy_node_core::store::typed::TreeId::new(1),
-            tree_sub: psy_node_core::store::typed::TreeSubId::new(2),
-        };
+        // The mixed-axis table: an as-of read there would compare a pending id
+        // against a checkpoint height, so it is refused rather than read.
+        let key = TypedTableKey::CheckpointedObject(
+            psy_node_core::store::typed::CheckpointedObjectKey::RewardsProofAtPending(
+                psy_node_core::store::typed::UniquePendingId::try_new(9).unwrap(),
+            ),
+        );
         assert!(matches!(
             cql_key_values(&key),
             Err(RowImageError::UnrecordedTable(_))
@@ -737,6 +830,9 @@ mod tests {
             P::GlobalUserTree, P::GlobalContractTree, P::GlobalCheckpointTree,
             P::UserRegistrationTree, P::ContractFunctionTree, P::PublicKeyHashToUserIds,
             P::GutaRewardTagTree,
+            // Realm-authority tables (slice B).
+            P::UserLeaf, P::UserContractTree, P::ContractStateTree,
+            P::ImtLeaf, P::ImtKeyIndex, P::ImtNextAppendIndex,
         ] {
             assert!(
                 table_shape(table).is_some(),
