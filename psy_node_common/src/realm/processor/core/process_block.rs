@@ -1,8 +1,13 @@
 use std::time::Duration;
 
 
+use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
 use parth_core::{
     crypto::hash::traits::{HashTo4Felts, MerkleZeroHasher},
+    data::hash::{
+        fast_node_serializer::{QMerkleStoreFastZeroNodeSerializer, QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE},
+        merkle_node_key::SimpleMerkleNodeKey,
+    },
     felt::ToU64Value,
     protocol::core_types::{Q256BitHash, QNetworkTypesConfig},
 };
@@ -286,7 +291,8 @@ where
                     );
                 }
                 shared_tree.revert_changes();
-                shared_tree.apply_zero_id_ffs_nodes(
+                apply_zero_id_ffs_nodes(
+                    &mut shared_tree,
                     &included.updates.update_global_user_tree_nodes_ffs,
                     N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
                     self.db.state.realm_id_u64,
@@ -836,5 +842,75 @@ where
     }
 }
 
+fn apply_zero_id_ffs_nodes<Hasher, Hash>(
+    tree: &mut SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
+    ffs: &[u8],
+    coordinator_global_user_tree_height: u8,
+    realm_id: u64,
+) -> anyhow::Result<()>
+where
+    Hasher: MerkleZeroHasher<Hash>,
+    Hash: Copy + PartialEq + Default + std::fmt::Debug + Q256BitHash,
+{
+    if ffs.is_empty() {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        ffs.len() % QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE == 0,
+        "global user tree FFS length {} is not a multiple of {}",
+        ffs.len(),
+        QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE
+    );
+    let nodes = QMerkleStoreFastZeroNodeSerializer::deserialize_zero_id_nodes_from_slice::<Hash>(ffs);
+    for node in nodes {
+        let local_key = realm_local_key_from_offset_ffs_key(
+            node.key,
+            coordinator_global_user_tree_height,
+            realm_id,
+        )?;
+        tree.set_node_value(local_key, node.value);
+    }
+    Ok(())
+}
 
-
+fn realm_local_key_from_offset_ffs_key(
+    key: SimpleMerkleNodeKey,
+    coordinator_height: u8,
+    realm_id: u64,
+) -> anyhow::Result<SimpleMerkleNodeKey> {
+    anyhow::ensure!(
+        key.level >= coordinator_height,
+        "global user tree FFS node level {} is below coordinator height {}",
+        key.level,
+        coordinator_height
+    );
+    let local_level = key.level - coordinator_height;
+    let expected_realm_id = if local_level >= 64 {
+        anyhow::ensure!(
+            key.index == 0,
+            "global user tree FFS node index {} does not fit in local level {}",
+            key.index,
+            local_level
+        );
+        0
+    } else {
+        key.index >> local_level
+    };
+    anyhow::ensure!(
+        expected_realm_id == realm_id,
+        "global user tree FFS node realm_id {} does not match {}",
+        expected_realm_id,
+        realm_id
+    );
+    let local_index = if local_level == 0 {
+        0
+    } else if local_level >= 64 {
+        key.index
+    } else {
+        key.index & ((1u64 << local_level) - 1)
+    };
+    Ok(SimpleMerkleNodeKey {
+        level: local_level,
+        index: local_index,
+    })
+}
