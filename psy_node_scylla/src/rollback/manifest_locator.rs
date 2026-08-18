@@ -281,6 +281,34 @@ mod tests {
     }
 
     #[test]
+    fn planning_carries_every_row_the_manifest_names() {
+        // Including the pending mappings.  Leaving those out was tried and made
+        // the Coordinator fail G-W on ten keys the discarded range created; see
+        // the open problem on `plan_rows_from_chunks`.
+        let pending = psy_node_core::store::typed::UniquePendingId::try_new(615).unwrap();
+        let rows = vec![
+            from_key(TypedTableKey::PendingToProc(pending)),
+            from_key(TypedTableKey::PendingToCheckpoint(pending)),
+            from_key(TypedTableKey::CheckpointToPending(
+                CheckpointId::try_new(296).unwrap(),
+            )),
+            record(7, RecordedOperation::Put),
+        ];
+        let chunks = encode_locator_chunks(&rows).unwrap();
+        assert_eq!(plan_rows_from_chunks(&chunks).unwrap().len(), rows.len());
+    }
+
+    fn from_key(key: TypedTableKey) -> MutationLocatorRecord {
+        let resolved = describe_existing_key(&key);
+        MutationLocatorRecord::try_new(
+            resolved.physical_table(),
+            RecordedOperation::Put,
+            resolved.locator_bytes().to_vec(),
+        )
+        .unwrap()
+    }
+
+    #[test]
     fn records_round_trip_through_a_chunk() {
         let records = vec![
             record(1, RecordedOperation::Put),
@@ -414,4 +442,51 @@ mod tests {
         assert_eq!(chunks.len(), 1, "20k locators must not need chunking");
         assert!(chunks[0].len() < 1024 * 1024, "expected well under 1 MiB");
     }
+}
+
+/// Turn manifest locator chunks into the rows a rollback plan will act on.
+///
+/// One function for both authorities, so the Coordinator and a Realm cannot
+/// drift into planning different things from the same manifest.
+///
+/// # An open problem this does not solve
+///
+/// Every row the manifest names is planned for deletion.  For a table with a
+/// version axis that is exactly right: deleting the discarded version leaves
+/// the earlier one, and a read at the target finds it.  For a table without
+/// one, deletion is right only when the discarded commit **created** the row.
+/// When it **rewrote** an existing row, deleting destroys the only copy and the
+/// earlier value is gone with it.
+///
+/// This is not hypothetical.  A Realm rollback on the local testnet deleted
+/// `pending_id_to_pending_proc_id_table_u64_to_u128` at pending id 615, a row
+/// the discarded commit had rewritten rather than created; G-W failed on
+/// exactly that one key out of 160.  The Coordinator never sees it because it
+/// writes each pending mapping once -- the same shape as every other Realm
+/// defect this work has turned up, where a property that always holds on the
+/// Coordinator was taken for universal.
+///
+/// Excluding those tables is **not** the fix: it was tried, and the Coordinator
+/// then failed G-W on ten keys the discarded range had *created*, which must be
+/// deleted for "a hot read after a rollback sees only T" to hold.  Created and
+/// rewritten need opposite treatment, and the manifest records neither -- it
+/// names the locator and the operation, not whether anything was there before.
+///
+/// Resolving it means the archive carrying the before-image for axis-less
+/// tables, so RESTORING can put back what a rewrite overwrote.  That is a
+/// design change rather than a patch, and it is recorded here rather than
+/// papered over.
+pub fn plan_rows_from_chunks(
+    chunks: &[Vec<u8>],
+) -> Result<Vec<(u16, Vec<u8>)>, MutationLocatorError> {
+    let mut rows = Vec::new();
+    for chunk in chunks {
+        for record in decode_locator_chunk(chunk)? {
+            rows.push((
+                record.physical_table().stable_id(),
+                record.locator_bytes().to_vec(),
+            ));
+        }
+    }
+    Ok(rows)
 }

@@ -196,12 +196,18 @@ async fn a_realm_rollback_restores_exactly_what_was_observed_before() -> anyhow:
             CheckpointHash::from_last_chain_hash(PHash::from_values(0, 0, 0, 0)),
         ),
     );
+    // Skipping the destructive half lets the G-W assertion be re-run against a
+    // Realm that has already been rolled back.  Verification that can only run
+    // in the same process as the rollback it checks cannot be repeated when it
+    // fails, which is exactly when it is needed.
+    let verify_only = std::env::var("PSY_ROLLBACK_VERIFY_ONLY").is_ok();
     let plan_id = format!("realm-acceptance-{head}-{target}").into_bytes();
     // A Realm only ever follows phases the Coordinator published, so driving it
     // needs something to publish them.  This stands in for a Coordinator
     // rollback running against the same chain, advancing on each observation in
     // the order §4.1 lays out.
     let view = ScriptedCoordinator::new(head, target);
+    if !verify_only {
     let report = executor
         .roll_back(
             &recording,
@@ -223,8 +229,9 @@ async fn a_realm_rollback_restores_exactly_what_was_observed_before() -> anyhow:
     );
     println!("{report:?}");
     assert_eq!(report.archived_rows, report.planned_rows);
-    assert_eq!(view.observations(), 3, "one observation per phase gate");
     assert_eq!(report.deleted_rows, report.planned_rows);
+    assert_eq!(view.observations(), 3, "one observation per phase gate");
+    }
 
     // G-W on the Realm's own state.  The checkpoint copies are deliberately not
     // asserted here: they are re-fetched rather than restored, so their content
@@ -242,6 +249,13 @@ async fn a_realm_rollback_restores_exactly_what_was_observed_before() -> anyhow:
         checked += 1;
         let live_bytes = live.as_ref().map(|image| image.canonical_bytes());
         if live_bytes != witness.before {
+            println!(
+                "MISMATCH table={:?} locator={} before={:?} live={:?}",
+                resolved.physical_table(),
+                hex::encode(&witness.locator),
+                witness.before.as_ref().map(hex::encode),
+                live_bytes.as_ref().map(hex::encode),
+            );
             mismatches.push(format!("{:?}", resolved.physical_table()));
         }
     }

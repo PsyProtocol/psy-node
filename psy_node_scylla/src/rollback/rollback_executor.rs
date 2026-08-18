@@ -45,7 +45,7 @@ use psy_node_core::store::rollback_participants::{
 };
 
 use super::{
-    ArchiveOutcome, ScyllaDeleteExecutor, ScyllaRollbackArchive, decode_locator_chunk,
+    ArchiveOutcome, ScyllaDeleteExecutor, ScyllaRollbackArchive, plan_rows_from_chunks,
     describe_existing_key, fence_from_archive,
 };
 
@@ -116,18 +116,7 @@ impl ScyllaRollbackExecutor {
         head: &CanonicalChainRef<Hash>,
         target: u64,
     ) -> anyhow::Result<RollbackPlan<Hash>> {
-        build_rollback_plan(recording, head, target, &|chunks| {
-            let mut rows = Vec::new();
-            for chunk in chunks {
-                for record in decode_locator_chunk(chunk)? {
-                    rows.push((
-                        record.physical_table().stable_id(),
-                        record.locator_bytes().to_vec(),
-                    ));
-                }
-            }
-            Ok(rows)
-        })
+        build_rollback_plan(recording, head, target, &|chunks| Ok(plan_rows_from_chunks(chunks)?))
         .await
     }
 

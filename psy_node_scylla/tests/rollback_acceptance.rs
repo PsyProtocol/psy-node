@@ -203,14 +203,20 @@ async fn a_rollback_restores_exactly_what_was_observed_before() -> anyhow::Resul
     // and it is what stops the type from being satisfiable by an empty set.
     let coordinator = RollbackParticipant::new(AuthorityScope::Coordinator);
     let participants = RollbackParticipantSet::try_new([coordinator])?;
-    let report = executor
-        .roll_back(&recording, &head_ref, target, &plan_id, &participants, None)
-        .await?;
-    println!("{report:?}");
-    assert_eq!(report.target, target);
-    assert_eq!(report.head, head, "the plan must start from the published head");
-    assert_eq!(report.archived_rows, report.planned_rows);
-    assert_eq!(report.deleted_rows, report.planned_rows);
+    // Verification that can only run in the same process as the rollback it
+    // checks cannot be repeated when it fails, which is exactly when its detail
+    // is needed.  This runs the assertion alone against a chain already rolled
+    // back.
+    if std::env::var("PSY_ROLLBACK_VERIFY_ONLY").is_err() {
+        let report = executor
+            .roll_back(&recording, &head_ref, target, &plan_id, &participants, None)
+            .await?;
+        println!("{report:?}");
+        assert_eq!(report.target, target);
+        assert_eq!(report.head, head, "the plan must start from the published head");
+        assert_eq!(report.archived_rows, report.planned_rows);
+        assert_eq!(report.deleted_rows, report.planned_rows);
+    }
 
     // G-W: every key the range touched must now read back as it was observed
     // before the first commit above the target that wrote it.
@@ -231,8 +237,8 @@ async fn a_rollback_restores_exactly_what_was_observed_before() -> anyhow::Resul
                 "{:?} at c={} : live={:?} before={:?}",
                 resolved.physical_table(),
                 witness.checkpoint_id,
-                live_bytes.as_ref().map(|b| b.len()),
-                witness.before.as_ref().map(|b| b.len()),
+                live_bytes.as_ref().map(hex::encode),
+                witness.before.as_ref().map(hex::encode),
             ));
         }
     }
@@ -270,8 +276,7 @@ async fn a_rollback_restores_exactly_what_was_observed_before() -> anyhow::Resul
         "the discarded range's reward-tag partitions still hold {orphan_rows} rows"
     );
     println!(
-        "swept {} orphan reward-tag rows across {} pending ids",
-        report.orphan_reward_rows,
+        "the discarded range's {} pending ids hold no reward-tag rows",
         discarded_pending.len()
     );
 

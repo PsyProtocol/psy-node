@@ -41,7 +41,7 @@ use psy_node_core::store::timestamp::{DeleteFenceTimestampUs, TimestampFenceWind
 use scylla::client::session::Session;
 
 use super::{
-    ArchiveOutcome, ScyllaDeleteExecutor, ScyllaRollbackArchive, decode_locator_chunk,
+    ArchiveOutcome, ScyllaDeleteExecutor, ScyllaRollbackArchive, plan_rows_from_chunks,
     fence_from_archive,
 };
 
@@ -105,18 +105,7 @@ impl ScyllaRealmRollbackExecutor {
             ManifestCompletionMarker::Sealed,
             head,
             target,
-            &|chunks| {
-                let mut rows = Vec::new();
-                for chunk in chunks {
-                    for record in decode_locator_chunk(chunk)? {
-                        rows.push((
-                            record.physical_table().stable_id(),
-                            record.locator_bytes().to_vec(),
-                        ));
-                    }
-                }
-                Ok(rows)
-            },
+            &|chunks| Ok(plan_rows_from_chunks(chunks)?),
         )
         .await
     }
