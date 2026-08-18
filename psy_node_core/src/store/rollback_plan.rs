@@ -16,7 +16,10 @@ use psy_data::protocol::canonical_chain::CanonicalChainRef;
 use super::manifest_record::{
     AuthorityManifestIdentity, AuthorityManifestStatus, PreparedAuthorityManifestRecord,
 };
-use super::manifest_store::{CoordinatorCommitRecording, ManifestArtifactKind};
+use super::manifest_store::{
+    AuthorityManifestStore, CoordinatorCommitRecording, ManifestArtifactKind,
+    ManifestArtifactStore,
+};
 
 /// Why a range cannot be rolled back.
 ///
@@ -125,8 +128,41 @@ impl<Hash: Q256BitHash> RollbackPlan<Hash> {
 }
 
 /// Read the manifests for `(target, head]` and enumerate what they wrote.
-pub async fn build_rollback_plan<Hash: Q256BitHash>(
-    recording: &CoordinatorCommitRecording<Hash>,
+/// Which manifest state means "this commit finished".
+///
+/// The two authorities answer differently, and the difference is §6 rather than
+/// a convention.  A Coordinator commit ends at COMMITTED, which asserts that the
+/// head was published.  A Realm never publishes a head, so its manifest ends at
+/// SEALED -- which already asserts what a Realm can claim: its writes landed and
+/// they match what it recorded.  Demanding COMMITTED of a Realm would find none
+/// and call every one of its commits unfinished.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManifestCompletionMarker {
+    Committed,
+    Sealed,
+}
+
+impl ManifestCompletionMarker {
+    fn matches(self, status: AuthorityManifestStatus) -> bool {
+        match self {
+            Self::Committed => status == AuthorityManifestStatus::Committed,
+            Self::Sealed => status == AuthorityManifestStatus::Sealed,
+        }
+    }
+}
+
+/// Read the manifests for `(target, head]` and enumerate what they wrote.
+///
+/// Takes the two stores rather than an authority's capability bundle, because
+/// the read is the same on both sides: manifests are partitioned by
+/// `authority_scope`, so the scope is what selects whose commits are being
+/// planned.  Sharing the code means a Realm plan cannot drift from a
+/// Coordinator plan in how it decodes an artifact.
+pub async fn build_rollback_plan_for<Hash: Q256BitHash>(
+    manifest: &dyn AuthorityManifestStore<Hash>,
+    manifest_artifact: &dyn ManifestArtifactStore<Hash>,
+    authority: psy_data::protocol::chain_context::AuthorityScope,
+    marker: ManifestCompletionMarker,
     head: &CanonicalChainRef<Hash>,
     target: u64,
     decode_locators: &dyn Fn(&[Vec<u8>]) -> anyhow::Result<Vec<(u16, Vec<u8>)>>,
@@ -139,15 +175,11 @@ pub async fn build_rollback_plan<Hash: Q256BitHash>(
         });
     }
     let identity = AuthorityManifestIdentity::try_new(
-        super::authority_commit::AuthorityTimestampKey::new(
-            head.network_id(),
-            psy_data::protocol::chain_context::AuthorityScope::Coordinator,
-        ),
+        super::authority_commit::AuthorityTimestampKey::new(head.network_id(), authority),
         *head,
     )?;
 
-    let rows = recording
-        .manifest()
+    let rows = manifest
         .read_manifest_suffix(&identity, target, head_height)
         .await?;
 
@@ -155,18 +187,13 @@ pub async fn build_rollback_plan<Hash: Q256BitHash>(
     // PREPARED row with no COMMITTED sibling is a commit that died in flight;
     // its keys may or may not have landed, so the range is not plannable.
     let mut committed: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
-    let mut digests: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
     let mut prepared: BTreeMap<u64, (Vec<u8>, Vec<u8>)> = BTreeMap::new();
     for row in rows {
-        match row.status {
-            AuthorityManifestStatus::Committed => {
-                committed.insert(row.checkpoint_id, row.payload);
-                digests.insert(row.checkpoint_id, row.digest);
-            }
-            AuthorityManifestStatus::Prepared => {
-                prepared.insert(row.checkpoint_id, (row.payload, row.digest));
-            }
-            _ => {}
+        if marker.matches(row.status) {
+            committed.insert(row.checkpoint_id, row.payload.clone());
+        }
+        if row.status == AuthorityManifestStatus::Prepared {
+            prepared.insert(row.checkpoint_id, (row.payload, row.digest));
         }
     }
 
@@ -191,14 +218,10 @@ pub async fn build_rollback_plan<Hash: Q256BitHash>(
         let chunk_count = intent.artifacts().locator_chunk_count();
 
         let per_checkpoint_identity = AuthorityManifestIdentity::try_new(
-            super::authority_commit::AuthorityTimestampKey::new(
-                chain.network_id(),
-                psy_data::protocol::chain_context::AuthorityScope::Coordinator,
-            ),
+            super::authority_commit::AuthorityTimestampKey::new(chain.network_id(), authority),
             chain,
         )?;
-        let chunks = recording
-            .manifest_artifact()
+        let chunks = manifest_artifact
             .read_artifact_chunks(
                 &per_checkpoint_identity,
                 ManifestArtifactKind::Locator,
@@ -223,4 +246,23 @@ pub async fn build_rollback_plan<Hash: Q256BitHash>(
         head: head_height,
         checkpoints,
     })
+}
+
+/// The Coordinator's plan: its manifests, and COMMITTED as the completion mark.
+pub async fn build_rollback_plan<Hash: Q256BitHash>(
+    recording: &CoordinatorCommitRecording<Hash>,
+    head: &CanonicalChainRef<Hash>,
+    target: u64,
+    decode_locators: &dyn Fn(&[Vec<u8>]) -> anyhow::Result<Vec<(u16, Vec<u8>)>>,
+) -> anyhow::Result<RollbackPlan<Hash>> {
+    build_rollback_plan_for(
+        recording.manifest(),
+        recording.manifest_artifact(),
+        psy_data::protocol::chain_context::AuthorityScope::Coordinator,
+        ManifestCompletionMarker::Committed,
+        head,
+        target,
+        decode_locators,
+    )
+    .await
 }
