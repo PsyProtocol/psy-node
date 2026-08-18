@@ -39,9 +39,23 @@ pub struct RealmRollbackControlPlane {
     manifest_artifact: Arc<ScyllaManifestArtifactStore>,
     commit_window: Arc<CommitWindowClock>,
     journal: Option<Arc<ScyllaVerificationJournal>>,
+    /// How this Realm watches the rollback it is a participant in.
+    ///
+    /// Reads the Coordinator's control row and files this Realm's receipts, and
+    /// deliberately cannot advance a phase: §6.2 puts every barrier on the
+    /// Coordinator.  Present only when the Coordinator's keyspace was named,
+    /// because a Realm that cannot see the control row must not guess at a
+    /// phase -- it would either freeze a chain nobody asked to freeze, or keep
+    /// committing through one that was.
+    participant_view: Option<Arc<super::ScyllaRollbackParticipantView>>,
 }
 
 impl RealmRollbackControlPlane {
+    /// The Realm's participant view, when the Coordinator's keyspace is known.
+    pub fn participant_view(&self) -> Option<&super::ScyllaRollbackParticipantView> {
+        self.participant_view.as_deref()
+    }
+
     /// Create then prepare, for a Realm bringing a keyspace up.
     pub async fn setup<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>(
         store: &ScyllaCoreStore<Hash, Hasher>,
@@ -88,7 +102,37 @@ impl RealmRollbackControlPlane {
             ),
             commit_window: store.commit_window.clone(),
             journal: None,
+            participant_view: None,
         };
+
+        // Watching the rollback needs the Coordinator's keyspace, because that
+        // is where the control row and the receipt table live (§6.2).  A Realm
+        // deployed without it still commits and records normally; it simply
+        // cannot take part in a coordinated rollback, and saying so by absence
+        // is better than defaulting to a keyspace name that might belong to
+        // another network on the same cluster.
+        if let Ok(coordinator_no_tablet) =
+            std::env::var("PSY_ROLLBACK_COORDINATOR_NO_TABLET_KEYSPACE")
+        {
+            super::ScyllaRollbackParticipantView::create_table(
+                &store.session,
+                &coordinator_no_tablet,
+            )
+            .await?;
+            let head_reader = super::ScyllaCanonicalHeadStore::prepare(
+                store.session.clone(),
+                super::CanonicalHeadNoTabletKeyspace::try_new(&coordinator_no_tablet)?,
+            )
+            .await?;
+            control.participant_view = Some(Arc::new(
+                super::ScyllaRollbackParticipantView::prepare(
+                    store.session.clone(),
+                    &coordinator_no_tablet,
+                    Arc::new(head_reader),
+                )
+                .await?,
+            ));
+        }
 
         if std::env::var("PSY_ROLLBACK_VERIFICATION_JOURNAL").is_ok() {
             ScyllaVerificationJournal::create_table(&store.session, &store.keyspace).await?;
