@@ -49,7 +49,12 @@ use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 
 const REALM_ID: u32 = 0;
-const REALM_SUB_ID: u16 = 0;
+/// The deployment runs realms with sub id 1, not 0.  The allocator and the
+/// manifest are partitioned by the exact scope, so a test guessing 0 looks in a
+/// partition nothing ever wrote and reports the Realm as having committed
+/// nothing.  Overridable, because a differently configured deployment would
+/// place them somewhere else again.
+const REALM_SUB_ID: u16 = 1;
 
 fn known_nodes() -> Vec<String> {
     vec![std::env::var("PSY_SCYLLA_URL").unwrap_or_else(|_| "127.0.0.1:9042".to_string())]
@@ -111,6 +116,10 @@ async fn witnesses_first_touch(
 #[tokio::test]
 #[ignore = "requires a Realm chain with committed transactions; see the module note"]
 async fn a_realm_rollback_restores_exactly_what_was_observed_before() -> anyhow::Result<()> {
+    let realm_sub_id: u16 = std::env::var("PSY_ROLLBACK_REALM_SUB_ID")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(REALM_SUB_ID);
     let keyspace = std::env::var("PSY_ROLLBACK_REALM_KEYSPACE")
         .expect("set PSY_ROLLBACK_REALM_KEYSPACE to a Realm keyspace with committed transactions");
     let no_tablet = format!("{keyspace}_no_tablet");
@@ -129,7 +138,7 @@ async fn a_realm_rollback_restores_exactly_what_was_observed_before() -> anyhow:
                 "SELECT checkpoint_id FROM {no_tablet}.authority_manifest \
                  WHERE network_chain_id = ? ALLOW FILTERING"
             ),
-            (network().chain_id() as i32,),
+            (network().chain_id() as i64,),
         )
         .await?
         .into_rows_result()?
@@ -186,7 +195,7 @@ async fn a_realm_rollback_restores_exactly_what_was_observed_before() -> anyhow:
         .roll_back(
             &recording,
             REALM_ID,
-            REALM_SUB_ID,
+            realm_sub_id,
             &head_ref,
             target,
             &plan_id,

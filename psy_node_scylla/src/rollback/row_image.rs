@@ -152,6 +152,10 @@ struct TableRead {
 pub(crate) enum ColumnKind {
     Blob,
     BigInt,
+    /// A 128-bit id stored as a CQL uuid.  Distinct from Blob because the driver
+    /// hands back a `Uuid`, and encoding its debug form instead of its bytes
+    /// would make two equal rows compare unequal.
+    Uuid,
 }
 
 /// The regular columns of one recorded table.
@@ -186,6 +190,7 @@ pub(crate) fn key_column_names(table: ScyllaPhysicalTableId) -> Vec<&'static str
 
 const BLOB_VALUE: &[(&str, ColumnKind)] = &[("value", ColumnKind::Blob)];
 const BIGINT_VALUE: &[(&str, ColumnKind)] = &[("value", ColumnKind::BigInt)];
+const UUID_VALUE: &[(&str, ColumnKind)] = &[("value", ColumnKind::Uuid)];
 const NO_VALUE: &[(&str, ColumnKind)] = &[];
 
 /// Every table the Coordinator commit path records, and nothing else.
@@ -207,6 +212,16 @@ pub(crate) fn table_shape(table: ScyllaPhysicalTableId) -> Option<TableShape> {
         },
         // Bigint to bigint.
         P::U64Singleton | P::CheckpointIdToPendingId | P::PendingIdToCheckpointId => TableShape {
+            value_columns: BIGINT_VALUE,
+        },
+        // The pending-to-proc mapping, whose 128-bit side is a CQL uuid.  Both
+        // directions are recorded by the Realm's commit, so both need a shape:
+        // a table the planner names but the reader cannot read makes the archive
+        // report an existing row as absent.
+        P::PendingIdToPendingProcIdU64ToU128 => TableShape {
+            value_columns: UUID_VALUE,
+        },
+        P::PendingIdToPendingProcIdU128ToU64 => TableShape {
             value_columns: BIGINT_VALUE,
         },
         // Versioned objects: the checkpoint is a clustering column.
@@ -532,6 +547,7 @@ fn encode_cell(value: CqlValue, kind: ColumnKind) -> Vec<u8> {
     match (value, kind) {
         (CqlValue::Blob(bytes), ColumnKind::Blob) => bytes,
         (CqlValue::BigInt(number), ColumnKind::BigInt) => number.to_be_bytes().to_vec(),
+        (CqlValue::Uuid(id), ColumnKind::Uuid) => id.as_bytes().to_vec(),
         // The shape table and the schema disagree.  Encoding the debug form keeps
         // the comparison honest -- it will differ from any correctly typed image
         // rather than silently matching.
@@ -554,6 +570,11 @@ pub(crate) fn cql_key_values(key: &TypedTableKey) -> Result<Vec<CqlValue>, RowIm
             vec![CqlValue::BigInt(checkpoint.get() as i64)]
         }
         K::PendingToCheckpoint(pending) => vec![CqlValue::BigInt(pending.get() as i64)],
+        K::PendingToProc(pending) => vec![CqlValue::BigInt(pending.get() as i64)],
+        // The reverse direction keys on the 128-bit proc id, stored as a uuid.
+        K::ProcToPending(proc_id) => {
+            vec![CqlValue::Uuid(uuid::Uuid::from_bytes(*proc_id.as_bytes()))]
+        }
         K::LatestInfo(slot) => vec![CqlValue::BigInt(*slot as u8 as i64)],
         K::U64Singleton(slot) => vec![CqlValue::BigInt(*slot as u8 as i64)],
         // Blob-keyed halves of the root mapping.  The hash arrives as the bytes
@@ -649,8 +670,6 @@ pub(crate) fn cql_key_values(key: &TypedTableKey) -> Result<Vec<CqlValue>, RowIm
         | K::CheckpointLeafByCheckpoint(_)
         | K::UnusedCheckpointRealmRoot(_)
         | K::U64Counter(_)
-        | K::PendingToProc(_)
-        | K::ProcToPending(_)
         => {
             return Err(RowImageError::UnrecordedTable(
                 super::describe_existing_key(key).physical_table(),

@@ -143,6 +143,22 @@ pub enum ManifestCompletionMarker {
 }
 
 impl ManifestCompletionMarker {
+    /// Whether every height in the discarded range must carry a commit.
+    ///
+    /// The Coordinator commits at every checkpoint, so a gap there means a
+    /// commit is missing and its writes are unknown.  A Realm commits only when
+    /// it has transactions of its own -- §6.3's sparse semantics -- so a height
+    /// it skipped wrote nothing through its manifest, and demanding one would
+    /// call every quiet stretch a corrupt range.  What a Realm does write at
+    /// those heights comes from `sync`, and that is undone by re-fetching rather
+    /// than from a manifest.
+    const fn requires_every_height(self) -> bool {
+        match self {
+            Self::Committed => true,
+            Self::Sealed => false,
+        }
+    }
+
     fn matches(self, status: AuthorityManifestStatus) -> bool {
         match self {
             Self::Committed => status == AuthorityManifestStatus::Committed,
@@ -200,6 +216,11 @@ pub async fn build_rollback_plan_for<Hash: Q256BitHash>(
     let mut checkpoints = Vec::new();
     for height in (target + 1)..=head_height {
         if !committed.contains_key(&height) {
+            if !marker.requires_every_height() {
+                // This authority did not commit here, so its manifest names
+                // nothing to undo at this height.
+                continue;
+            }
             anyhow::bail!(RollbackInfeasible::MissingManifest {
                 checkpoint: height,
                 chain_epoch: head.chain_epoch().get(),
