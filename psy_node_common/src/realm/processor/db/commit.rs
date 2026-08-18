@@ -282,15 +282,33 @@ where
             self.state.last_committed_checkpoint_root,
         );
 
-        let transition = AuthorityStateTransition::Changed {
-            previous_checkpoint: AuthorityStateCheckpointId::new(
-                checkpoint_id.saturating_sub(1),
-            ),
-            checkpoint: AuthorityStateCheckpointId::new(checkpoint_id),
-            old_root: AuthorityStateRoot::from_local_state_root(
-                self.state.last_committed_realm_end_root,
-            ),
-            new_root: AuthorityStateRoot::from_local_state_root(realm_update.new_realm_root),
+        // Changed or Unchanged by what the roots actually say, not by assumption.
+        //
+        // A Realm commits at every checkpoint the Coordinator publishes, and most
+        // of them change nothing of its own -- it is following, not transacting.
+        // `Changed` asserts the two roots differ, so declaring it unconditionally
+        // makes the manifest claim a state change it cannot show, and sealing
+        // fails with ChangedStateHasSameRoot.  It failed exactly that way on the
+        // testnet: the Realm processor parked in Error and stopped gathering, so
+        // the faucet transaction never landed.
+        //
+        // The assertion is right; the caller was wrong to bypass the question.
+        let old_root = self.state.last_committed_realm_end_root;
+        let new_root = realm_update.new_realm_root;
+        let transition = if old_root == new_root {
+            AuthorityStateTransition::Unchanged {
+                checkpoint: AuthorityStateCheckpointId::new(checkpoint_id),
+                root: AuthorityStateRoot::from_local_state_root(new_root),
+            }
+        } else {
+            AuthorityStateTransition::Changed {
+                previous_checkpoint: AuthorityStateCheckpointId::new(
+                    checkpoint_id.saturating_sub(1),
+                ),
+                checkpoint: AuthorityStateCheckpointId::new(checkpoint_id),
+                old_root: AuthorityStateRoot::from_local_state_root(old_root),
+                new_root: AuthorityStateRoot::from_local_state_root(new_root),
+            }
         };
 
         // The realm root goes in through the state transition above, which already
