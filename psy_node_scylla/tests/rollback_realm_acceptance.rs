@@ -34,6 +34,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use parth_core::PHash;
+use psy_node_core::store::rollback_coordination::{
+    ObservedRollbackPhase, RollbackParticipantView,
+};
+use psy_node_core::store::rollback_participants::{
+    ArchiveReceipt, FreezeReceipt, RollbackParticipant, VerifyReceipt,
+};
 use psy_core::constants::chain_id::PsyChainNetworkType;
 use psy_data::protocol::canonical_chain::{
     CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId, CheckpointRef, NetworkId,
@@ -191,6 +197,11 @@ async fn a_realm_rollback_restores_exactly_what_was_observed_before() -> anyhow:
         ),
     );
     let plan_id = format!("realm-acceptance-{head}-{target}").into_bytes();
+    // A Realm only ever follows phases the Coordinator published, so driving it
+    // needs something to publish them.  This stands in for a Coordinator
+    // rollback running against the same chain, advancing on each observation in
+    // the order §4.1 lays out.
+    let view = ScriptedCoordinator::new(head, target);
     let report = executor
         .roll_back(
             &recording,
@@ -199,10 +210,20 @@ async fn a_realm_rollback_restores_exactly_what_was_observed_before() -> anyhow:
             &head_ref,
             target,
             &plan_id,
+            &view,
         )
         .await?;
+    assert_eq!(
+        view.filed(),
+        vec![
+            "freeze".to_string(),
+            "archive".to_string()
+        ],
+        "a Realm files a receipt at each barrier it reaches"
+    );
     println!("{report:?}");
     assert_eq!(report.archived_rows, report.planned_rows);
+    assert_eq!(view.observations(), 3, "one observation per phase gate");
     assert_eq!(report.deleted_rows, report.planned_rows);
 
     // G-W on the Realm's own state.  The checkpoint copies are deliberately not
@@ -233,4 +254,98 @@ async fn a_realm_rollback_restores_exactly_what_was_observed_before() -> anyhow:
     );
 
     Ok(())
+}
+
+/// A Coordinator that publishes the rollback phases in order, one per look.
+///
+/// The Realm side is what this test is about; what it needs from a Coordinator
+/// is only that FROZEN, then ARCHIVING, then DELETING become visible, and that
+/// its receipts are accepted.  Advancing on each observation is what a real
+/// Coordinator does once every participant has filed -- with one Realm in the
+/// set, that is immediately.
+struct ScriptedCoordinator {
+    head: u64,
+    target: u64,
+    looks: std::sync::atomic::AtomicUsize,
+    filed: std::sync::Mutex<Vec<String>>,
+}
+
+impl ScriptedCoordinator {
+    fn new(head: u64, target: u64) -> Self {
+        Self {
+            head,
+            target,
+            looks: std::sync::atomic::AtomicUsize::new(0),
+            filed: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn filed(&self) -> Vec<String> {
+        self.filed.lock().expect("not poisoned").clone()
+    }
+
+    fn observations(&self) -> usize {
+        self.looks.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl RollbackParticipantView<PHash> for ScriptedCoordinator {
+    async fn observe_phase(
+        &self,
+        _coordinator_head: &CanonicalChainRef<PHash>,
+    ) -> anyhow::Result<ObservedRollbackPhase> {
+        let look = self.looks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(match look {
+            0 => ObservedRollbackPhase::Freeze { head: self.head },
+            1 => ObservedRollbackPhase::Archive {
+                target: self.target,
+                head: self.head,
+            },
+            _ => ObservedRollbackPhase::Delete {
+                target: self.target,
+                head: self.head,
+            },
+        })
+    }
+
+    async fn file_archive_receipt(&self, _receipt: &ArchiveReceipt) -> anyhow::Result<()> {
+        self.filed.lock().expect("not poisoned").push("archive".into());
+        Ok(())
+    }
+
+    async fn read_archive_receipts_for(
+        &self,
+        _target: u64,
+        _head: u64,
+        _expected: &[RollbackParticipant],
+    ) -> anyhow::Result<Vec<ArchiveReceipt>> {
+        Ok(Vec::new())
+    }
+
+    async fn file_freeze_receipt(&self, _receipt: &FreezeReceipt) -> anyhow::Result<()> {
+        self.filed.lock().expect("not poisoned").push("freeze".into());
+        Ok(())
+    }
+
+    async fn read_freeze_receipts_for(
+        &self,
+        _head: u64,
+        _expected: &[RollbackParticipant],
+    ) -> anyhow::Result<Vec<FreezeReceipt>> {
+        Ok(Vec::new())
+    }
+
+    async fn file_verify_receipt(&self, _receipt: &VerifyReceipt) -> anyhow::Result<()> {
+        self.filed.lock().expect("not poisoned").push("verify".into());
+        Ok(())
+    }
+
+    async fn read_verify_receipts_for(
+        &self,
+        _target: u64,
+        _expected: &[RollbackParticipant],
+    ) -> anyhow::Result<Vec<VerifyReceipt>> {
+        Ok(Vec::new())
+    }
 }

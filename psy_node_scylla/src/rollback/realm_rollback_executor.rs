@@ -31,6 +31,12 @@ use psy_node_core::store::realm_commit_recording::RealmCommitRecording;
 use psy_node_core::store::rollback_plan::{
     ManifestCompletionMarker, RollbackPlan, build_rollback_plan_for,
 };
+use psy_node_core::store::rollback_coordination::{
+    ObservedRollbackPhase, RollbackParticipantView,
+};
+use psy_node_core::store::rollback_participants::{
+    ArchiveReceipt, FreezeReceipt, RollbackParticipant,
+};
 use psy_node_core::store::timestamp::{DeleteFenceTimestampUs, TimestampFenceWindow};
 use scylla::client::session::Session;
 
@@ -230,6 +236,16 @@ impl ScyllaRealmRollbackExecutor {
     /// caller runs `reset_for_rollback_to` after this returns, and the order
     /// matters -- lowering the marker first would let a sync race the delete and
     /// re-fetch heights this is about to remove.
+    /// Run this Realm's half of a rollback, taking each step only when the
+    /// Coordinator has published the phase that permits it.
+    ///
+    /// The participant view is how a Realm learns where the rollback is; it can
+    /// read the phase and file receipts, and there is deliberately no way from
+    /// it to advance one (§6.2).  Without this gate a Realm could archive
+    /// against a head the Coordinator had not frozen, or -- much worse -- delete
+    /// before the global archive barrier, which is I6 breached from the
+    /// participant side: the Coordinator's own barrier check cannot see it,
+    /// because the rows are gone from a keyspace it does not read.
     pub async fn roll_back<Hash: Q256BitHash>(
         &self,
         recording: &RealmCommitRecording<Hash>,
@@ -238,7 +254,29 @@ impl ScyllaRealmRollbackExecutor {
         head: &CanonicalChainRef<Hash>,
         target: u64,
         plan_id: &[u8],
+        view: &dyn RollbackParticipantView<Hash>,
     ) -> anyhow::Result<RealmRollbackReport> {
+        let me = RollbackParticipant::new(AuthorityScope::Realm {
+            realm_id,
+            realm_sub_id,
+        });
+
+        // ---- freeze ----
+        let phase = view.observe_phase(head).await?;
+        let ObservedRollbackPhase::Freeze { head: frozen_head } = phase else {
+            anyhow::bail!(
+                "this Realm was asked to roll back to {target} while the Coordinator has \
+                 published {phase:?}; a participant follows the published phase rather than \
+                 deciding for itself when to start"
+            );
+        };
+        if frozen_head != head.checkpoint().checkpoint_id().get() {
+            anyhow::bail!(
+                "the Coordinator froze head {frozen_head} but this Realm was asked to roll back \
+                 from {}",
+                head.checkpoint().checkpoint_id().get(),
+            );
+        }
         let plan = self
             .plan(recording, realm_id, realm_sub_id, head, target)
             .await?;
@@ -247,7 +285,29 @@ impl ScyllaRealmRollbackExecutor {
             .fence_window(recording, head, realm_id, realm_sub_id)
             .await?;
         let fence = window.delete_fence();
+        view.file_freeze_receipt(&FreezeReceipt::new(
+            me,
+            plan.head,
+            head.checkpoint()
+                .checkpoint_hash()
+                .as_inner()
+                .into_owned_32bytes(),
+        ))
+        .await?;
 
+        // ---- archive ----
+        //
+        // Waiting for the Coordinator to publish ARCHIVING rather than starting
+        // on the strength of having filed a freeze receipt: the freeze barrier
+        // is met when *everyone* has filed, and only the Coordinator knows that.
+        let phase = view.observe_phase(head).await?;
+        let ObservedRollbackPhase::Archive { .. } = phase else {
+            anyhow::bail!(
+                "this Realm froze at {} and is waiting to archive, but the Coordinator has \
+                 published {phase:?}",
+                plan.head,
+            );
+        };
         let archived_rows = self.archive(plan_id, &plan).await?;
         if archived_rows != planned_rows {
             anyhow::bail!(
@@ -256,7 +316,29 @@ impl ScyllaRealmRollbackExecutor {
             );
         }
         self.verify_archive_under_fence(plan_id, &plan, fence).await?;
+        view.file_archive_receipt(&ArchiveReceipt::new(
+            me,
+            target,
+            plan.head,
+            archived_rows as u64,
+            super::rollback_executor::plan_digest(plan_id),
+        ))
+        .await?;
 
+        // ---- delete ----
+        //
+        // `permits_destruction` answers this in one place so no caller has to
+        // read it off a phase name.  Only DELETING says yes, and DELETING is
+        // published only after the Coordinator sealed the archive barrier with
+        // the receipt filed just above.
+        let phase = view.observe_phase(head).await?;
+        if !phase.permits_destruction() {
+            anyhow::bail!(
+                "this Realm archived {archived_rows} rows and is waiting to delete, but the \
+                 Coordinator has published {phase:?}; deleting here would breach the global \
+                 archive barrier from the side the Coordinator cannot see"
+            );
+        }
         let deleted_rows = self.delete(&plan, fence).await?;
 
         Ok(RealmRollbackReport {

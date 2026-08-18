@@ -71,7 +71,10 @@ pub struct RollbackReport {
 pub const DEFAULT_FENCE_GAP_US: i64 = 1_000_000;
 
 /// A stable digest for one rollback plan id.
-fn plan_digest(plan_id: &[u8]) -> [u8; 32] {
+///
+/// Shared with the Realm executor so both sides of a rollback derive the same
+/// digest from the same plan id rather than each inventing one.
+pub(crate) fn plan_digest(plan_id: &[u8]) -> [u8; 32] {
     use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"PSYROLLBACKPLAN");
