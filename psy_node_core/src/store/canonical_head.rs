@@ -476,13 +476,27 @@ impl<Hash: Q256BitHash> CanonicalHeadTransition<Hash> {
     /// Record that Coordinator and every fixed Realm participant are ready.
     /// The checkpoint remains unpublished until the final, separately fenced
     /// transition.
+    /// Takes the sealed publish barrier by value, for the same reason the
+    /// archive barrier does: a transition named after every participant being
+    /// ready should not be reachable while one of them is not.  The archive
+    /// barrier stops a rollback destroying what nobody copied; this one stops it
+    /// publishing a new epoch while a participant has not confirmed it reached
+    /// the target.  Publishing early cannot be undone by waiting -- the epoch is
+    /// spent and the chain has told the world where it is.
     pub fn complete_rollback_realm_barrier(
         expected: StoredCanonicalHead<Hash>,
+        barrier: super::rollback_participants::SealedPublishBarrier,
     ) -> Result<Self, CanonicalHeadModelError> {
         let request = match expected.rollback_control() {
             RollbackControlState::Verifying(request) => *request,
             _ => return Err(CanonicalHeadModelError::RollbackVerifyNotActive),
         };
+        if barrier.target() != request.target().checkpoint_id().get() {
+            return Err(CanonicalHeadModelError::PublishBarrierTargetMismatch {
+                barrier: barrier.target(),
+                request: request.target().checkpoint_id().get(),
+            });
+        }
         Ok(Self {
             kind: CanonicalHeadTransitionKind::CompleteRollbackRealmBarrier,
             expected,
@@ -894,6 +908,9 @@ pub enum CanonicalHeadModelError {
         barrier: (u64, u64),
         request: (u64, u64),
     },
+    /// The sealed publish barrier verified a different target than this
+    /// rollback is restoring to.
+    PublishBarrierTargetMismatch { barrier: u64, request: u64 },
     RevisionOutOfCqlRange(u64),
     NegativeRevision(i64),
     RevisionOverflow(u64),
@@ -936,6 +953,11 @@ pub enum CanonicalHeadModelError {
 impl fmt::Display for CanonicalHeadModelError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::PublishBarrierTargetMismatch { barrier, request } => write!(
+                formatter,
+                "the sealed publish barrier verified target {barrier} but this rollback \
+                 restores to {request}; publishing needs evidence about this target"
+            ),
             Self::ArchiveBarrierRangeMismatch { barrier, request } => write!(
                 formatter,
                 "the sealed archive barrier covers ({}, {}] but this rollback discards \
@@ -1085,6 +1107,29 @@ impl From<RollbackControlCodecError> for CanonicalHeadModelError {
 
 #[cfg(test)]
 mod tests {
+    /// A sealed publish barrier for the request a head is carrying.
+    fn publish_barrier_for<Hash: super::Q256BitHash>(
+        head: &super::StoredCanonicalHead<Hash>,
+    ) -> crate::store::rollback_participants::SealedPublishBarrier {
+        use crate::store::rollback_participants::{
+            PublishBarrier, RollbackParticipant, RollbackParticipantSet, VerifyReceipt,
+        };
+        let request = head
+            .rollback_control()
+            .requested()
+            .expect("a barrier is only sealed while a rollback is active");
+        let target = request.target().checkpoint_id().get();
+        let coordinator = RollbackParticipant::new(
+            psy_data::protocol::chain_context::AuthorityScope::Coordinator,
+        );
+        let set = RollbackParticipantSet::try_new([coordinator]).expect("valid set");
+        let mut barrier = PublishBarrier::new(set, target);
+        barrier
+            .file(VerifyReceipt::new(coordinator, target, [2u8; 32]))
+            .expect("valid receipt");
+        barrier.seal().expect("met")
+    }
+
     /// A sealed barrier for the request a head is carrying.
     ///
     /// These tests exercise phase ordering, not participant aggregation, so the
@@ -1605,6 +1650,7 @@ mod tests {
         assert_eq!(verifying.kind(), CanonicalHeadTransitionKind::BeginRollbackVerify);
         let all_ready = CanonicalHeadTransition::complete_rollback_realm_barrier(
             *verifying.candidate(),
+            publish_barrier_for(verifying.candidate()),
         )
         .unwrap();
         assert_eq!(

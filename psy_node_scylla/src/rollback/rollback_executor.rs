@@ -40,7 +40,8 @@ use psy_node_core::store::typed::{MerkleNode, NodeIndex, TypedTableKey, UniquePe
 use parth_core::PHash;
 use psy_node_core::store::rollback_coordination::RollbackParticipantView;
 use psy_node_core::store::rollback_participants::{
-    ArchiveBarrier, ArchiveReceipt, RollbackParticipant, RollbackParticipantSet,
+    ArchiveBarrier, ArchiveReceipt, PublishBarrier, RollbackParticipant, RollbackParticipantSet,
+    VerifyReceipt,
 };
 
 use super::{
@@ -455,12 +456,33 @@ impl ScyllaRollbackExecutor {
         stored = self
             .advance(recording, CanonicalHeadTransition::begin_rollback_verify(stored)?)
             .await?;
-        // Slice A has one participant, so the realm barrier is satisfied as soon
-        // as this one is.  Slice C is what makes it wait for the others.
+        // The publish barrier, on the same terms as the archive one: every
+        // participant must have confirmed it reached the target before the new
+        // epoch is published.  A Coordinator-only rollback files its own and the
+        // barrier is met; a coordinated one waits for the Realms.
+        let mut publish = PublishBarrier::new(participants.clone(), target);
+        publish.file(VerifyReceipt::new(
+            RollbackParticipant::new(AuthorityScope::Coordinator),
+            target,
+            plan_digest(plan_id),
+        ))?;
+        if let Some(view) = receipts {
+            for receipt in view
+                .read_verify_receipts_for(target, participants.participants())
+                .await?
+            {
+                publish.file(receipt)?;
+            }
+        }
+        let sealed_publish = publish.seal()?;
+
         stored = self
             .advance(
                 recording,
-                CanonicalHeadTransition::complete_rollback_realm_barrier(stored)?,
+                CanonicalHeadTransition::complete_rollback_realm_barrier(
+                    stored,
+                    sealed_publish,
+                )?,
             )
             .await?;
         self.advance(recording, CanonicalHeadTransition::complete_rollback(stored)?)

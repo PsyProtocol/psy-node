@@ -23,7 +23,7 @@ use psy_data::protocol::canonical_chain::CanonicalChainRef;
 
 use super::canonical_head::CanonicalHeadReadState;
 use super::rollback_control::RollbackControlState;
-use super::rollback_participants::{ArchiveReceipt, RollbackParticipant};
+use super::rollback_participants::{ArchiveReceipt, RollbackParticipant, VerifyReceipt};
 
 /// Where a rollback stands, as a participant sees it.
 ///
@@ -124,6 +124,20 @@ pub trait RollbackParticipantView<Hash: Q256BitHash>: Send + Sync {
         head: u64,
         expected: &[RollbackParticipant],
     ) -> anyhow::Result<Vec<ArchiveReceipt>>;
+
+    /// Record that this participant verified the restored target.
+    ///
+    /// Filed after RESTORING and read at the publish barrier.  Durable for the
+    /// same reason the archive receipt is: the barrier aggregates across
+    /// processes and restarts.
+    async fn file_verify_receipt(&self, receipt: &VerifyReceipt) -> anyhow::Result<()>;
+
+    /// Verify receipts for one target, resolved against the expected set.
+    async fn read_verify_receipts_for(
+        &self,
+        target: u64,
+        expected: &[RollbackParticipant],
+    ) -> anyhow::Result<Vec<VerifyReceipt>>;
 }
 
 /// Read a phase from a head-read result.
