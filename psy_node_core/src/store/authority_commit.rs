@@ -12,7 +12,7 @@ pub use psy_data::protocol::{
     chain_context::AuthorityScope,
 };
 
-use super::timestamp::{CommitWriteTimestampUs, TimestampOutOfCqlRange};
+use super::timestamp::{CommitWriteTimestampUs, TimestampOutOfCqlRange, NewBranchWriteTimestampUs, TimestampOrderingError};
 
 pub const AUTHORITY_TIMESTAMP_STATE_MAGIC: [u8; 8] = *b"PSYATINT";
 pub const AUTHORITY_TIMESTAMP_STATE_CODEC_VERSION: u16 = 1;
@@ -331,6 +331,40 @@ impl StoredAuthorityTimestampState {
                 AuthorityIntentObservation::Idle { last_completed }
             }
         }
+    }
+
+    /// Lift the high water above a completed rollback's fence.
+    ///
+    /// Required by I7 and not optional.  `seal_reservation` allocates
+    /// `max(high_water + 1, clock)`, and a fence sits deliberately *above* the
+    /// discarded writes and therefore above the clock that produced them.  Left
+    /// alone, the next commit would allocate under the tombstones just written
+    /// and its rows would be shadowed -- the write succeeding, returning no
+    /// error, and unreadable.  A restart that happens to take longer than the
+    /// fence gap hides this behind the wall clock, which is luck rather than
+    /// design.
+    ///
+    /// Only ever raises: a lower value would let a new branch reuse timestamps
+    /// the discarded one already spent.
+    pub fn lift_high_water(
+        self,
+        to: NewBranchWriteTimestampUs,
+    ) -> Result<Option<Self>, AuthorityCommitModelError> {
+        let raised = to.as_commit_timestamp();
+        if raised.as_i64() <= self.high_water.as_i64() {
+            // Already past the fence.  Writing anyway would burn a revision and
+            // invite a concurrent writer's CAS to fail for no reason.
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            revision: self.revision.checked_next()?,
+            bootstrap_reason: self.bootstrap_reason,
+            high_water: raised,
+            // The phase is carried through untouched: a rollback does not release
+            // a lease it never took, and clearing one here would let a commit
+            // that is still in flight lose its exclusivity.
+            phase: self.phase,
+        }))
     }
 
     pub fn seal_reservation(
@@ -893,6 +927,18 @@ pub trait AuthorityCommitTimestampStore: Send + Sync {
     ) -> anyhow::Result<AuthorityTimestampWriteOutcome>;
 
     /// Release the lease once the commit it covers is durable.
+    /// Raise the allocator past a completed rollback's fence (I7).
+    ///
+    /// Separate from `complete_timestamp` because it is not part of a commit: no
+    /// lease is being released, and the reason the row moves is that a fence was
+    /// placed above every timestamp this authority had issued.
+    async fn lift_timestamp_high_water(
+        &self,
+        key: AuthorityTimestampKey,
+        expected: StoredAuthorityTimestampState,
+        candidate: StoredAuthorityTimestampState,
+    ) -> anyhow::Result<AuthorityTimestampWriteOutcome>;
+
     async fn complete_timestamp(
         &self,
         completion: &SealedAuthorityTimestampCompletion,

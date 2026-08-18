@@ -330,6 +330,46 @@ impl ScyllaRowImageReader {
         Ok(Self { session, reads })
     }
 
+    /// The key's identity with its version dropped.
+    ///
+    /// A version-axis locator encodes the checkpoint, so the same node at two
+    /// heights encodes to two locators.  For anything reasoning about what a
+    /// production read returns -- the G-W assertion above all -- those are one
+    /// key observed twice, not two keys: reads resolve by position and fall back
+    /// along the version axis.  Grouping by the raw locator instead treats every
+    /// height as its own key, and then "the first checkpoint above the target
+    /// that touched K" degenerates into "every checkpoint", which is the wrong
+    /// question.
+    ///
+    /// Built from the same column list the reads bind, so it cannot drift from
+    /// them.
+    pub fn position_key(&self, key: &ResolvedScyllaKey) -> anyhow::Result<Vec<u8>> {
+        let table = key.physical_table();
+        let read = self
+            .reads
+            .get(&table)
+            .ok_or(RowImageError::UnrecordedTable(table))?;
+        let mut values = cql_key_values(key.typed_key())?;
+        if read.has_checkpoint_axis {
+            values.pop();
+        }
+        let mut out = Vec::with_capacity(16 + values.len() * 12);
+        out.extend_from_slice(b"PSYPOS01");
+        out.extend_from_slice(&table.stable_id().to_be_bytes());
+        for value in values {
+            let bytes = match value {
+                CqlValue::BigInt(number) => number.to_be_bytes().to_vec(),
+                CqlValue::TinyInt(number) => vec![number as u8],
+                CqlValue::SmallInt(number) => number.to_be_bytes().to_vec(),
+                CqlValue::Blob(bytes) => bytes,
+                other => format!("{other:?}").into_bytes(),
+            };
+            out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            out.extend_from_slice(&bytes);
+        }
+        Ok(out)
+    }
+
     /// The row recorded at exactly this checkpoint, or `None`.
     ///
     /// What delete and archive need: the row to remove, or to save before it is

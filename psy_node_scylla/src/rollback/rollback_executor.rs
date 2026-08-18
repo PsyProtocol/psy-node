@@ -387,6 +387,15 @@ impl ScyllaRollbackExecutor {
             .await?;
         let restored_singletons = self.restore_singletons(target, fence).await?;
 
+        // Lift the allocator past the fence before anything can commit again.
+        // seal_reservation allocates max(high_water + 1, clock), and the fence
+        // sits above every timestamp this authority issued -- so without this the
+        // next commit would land under the tombstones just written and its rows
+        // would be shadowed: succeeding, silent, unreadable.  A restart that
+        // happens to outlast the fence gap hides it behind the wall clock, which
+        // is luck rather than design.
+        self.lift_allocator(recording, head, window).await?;
+
         stored = self
             .advance(recording, CanonicalHeadTransition::begin_rollback_verify(stored)?)
             .await?;
@@ -410,6 +419,42 @@ impl ScyllaRollbackExecutor {
             fence_us: fence.as_i64(),
             restored_singletons,
         })
+    }
+
+    async fn lift_allocator<Hash: Q256BitHash>(
+        &self,
+        recording: &CoordinatorCommitRecording<Hash>,
+        head: &CanonicalChainRef<Hash>,
+        window: TimestampFenceWindow,
+    ) -> anyhow::Result<()> {
+        let key = AuthorityTimestampKey::new(head.network_id(), AuthorityScope::Coordinator);
+        let expected = match recording.timestamp().read_timestamp_state(key).await? {
+            AuthorityTimestampReadState::Current(state) => state,
+            AuthorityTimestampReadState::Uninitialized => {
+                anyhow::bail!("the allocator row vanished mid-rollback")
+            }
+        };
+        let Some(candidate) = expected.lift_high_water(window.new_branch_write())? else {
+            // Already above the fence.  Writing anyway would burn a revision.
+            return Ok(());
+        };
+        match recording
+            .timestamp()
+            .lift_timestamp_high_water(key, expected, candidate)
+            .await?
+        {
+            psy_node_core::store::authority_commit::AuthorityTimestampWriteOutcome::Applied(_)
+            | psy_node_core::store::authority_commit::AuthorityTimestampWriteOutcome::Idempotent(_) => {
+                Ok(())
+            }
+            psy_node_core::store::authority_commit::AuthorityTimestampWriteOutcome::Conflict(
+                current,
+            ) => anyhow::bail!(
+                "the allocator moved under this rollback (observed revision {}); the fence \
+                 cannot be guaranteed to precede the next commit",
+                current.revision().get()
+            ),
+        }
     }
 
     /// The target checkpoint's own identity, read from its manifest.

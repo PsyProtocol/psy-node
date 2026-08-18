@@ -27,9 +27,17 @@ use super::manifest_store::{CoordinatorCommitRecording, ManifestArtifactKind};
 pub enum RollbackInfeasible {
     /// The target is at or above the head, so there is nothing to undo.
     EmptyRange { target: u64, head: u64 },
-    /// A height in the range has no COMMITTED manifest.  Either it predates the
-    /// rollback floor or its commit never finished.
-    MissingManifest { checkpoint: u64 },
+    /// A height in the range has no COMMITTED manifest under this chain epoch.
+    ///
+    /// Three causes, and the epoch one is easy to mistake for the others.
+    /// Manifests are partitioned by `chain_epoch` because heights are reused: a
+    /// checkpoint 25 in epoch 0 and a checkpoint 25 in epoch 1 are different
+    /// commits and must not share a row.  A rollback bumps the epoch, so the
+    /// manifests of everything committed before it are in another partition and
+    /// a later rollback cannot reach below where this epoch's commits begin.
+    /// The other two are the ordinary ones: the height predates the rollback
+    /// floor, or its commit never finished.
+    MissingManifest { checkpoint: u64, chain_epoch: u64 },
     /// The range has a hole: rolling back to `T` requires undoing every height
     /// above it, and a gap means some height's writes are unknown.
     MissingCheckpoint { checkpoint: u64 },
@@ -46,10 +54,13 @@ impl std::fmt::Display for RollbackInfeasible {
                 "rollback target {target} is not below the head {head}, so there is nothing \
                  to undo"
             ),
-            Self::MissingManifest { checkpoint } => write!(
+            Self::MissingManifest { checkpoint, chain_epoch } => write!(
                 f,
-                "checkpoint {checkpoint} has no committed manifest, so what it wrote is \
-                 unknown; scanning the hot tables to guess is forbidden"
+                "checkpoint {checkpoint} has no committed manifest in chain epoch \
+                 {chain_epoch}, so what it wrote is unknown and scanning the hot tables to \
+                 guess is forbidden.  If this epoch began above that height, its predecessors \
+                 were committed under an earlier epoch and live in a different partition: a \
+                 rollback cannot reach below the point where the current epoch starts"
             ),
             Self::MissingCheckpoint { checkpoint } => write!(
                 f,
@@ -162,13 +173,19 @@ pub async fn build_rollback_plan<Hash: Q256BitHash>(
     let mut checkpoints = Vec::new();
     for height in (target + 1)..=head_height {
         if !committed.contains_key(&height) {
-            anyhow::bail!(RollbackInfeasible::MissingManifest { checkpoint: height });
+            anyhow::bail!(RollbackInfeasible::MissingManifest {
+                checkpoint: height,
+                chain_epoch: head.chain_epoch().get(),
+            });
         }
         // The PREPARED row carries the intent and the artifact commitment; the
         // COMMITTED row only marks that the commit finished.
         let (payload, digest) = prepared
             .get(&height)
-            .ok_or(RollbackInfeasible::MissingManifest { checkpoint: height })?;
+            .ok_or(RollbackInfeasible::MissingManifest {
+                checkpoint: height,
+                chain_epoch: head.chain_epoch().get(),
+            })?;
         let intent = PreparedAuthorityManifestRecord::<Hash>::peek_intent(payload, digest)?;
         let chain = *intent.candidate_chain();
         let chunk_count = intent.artifacts().locator_chunk_count();

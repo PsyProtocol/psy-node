@@ -350,7 +350,7 @@ impl AuthorityTimestampCasBinding {
         Self::from_parts(sealed.key(), sealed.expected(), sealed.candidate())
     }
 
-    fn from_parts(
+    pub(crate) fn from_parts(
         key: AuthorityTimestampKey,
         expected: StoredAuthorityTimestampState,
         candidate: StoredAuthorityTimestampState,
@@ -567,6 +567,37 @@ impl ScyllaAuthorityTimestampStore {
             sealed.candidate(),
             |applied, current| sealed.classify_lwt_observation(applied, current),
         )
+        .await
+    }
+
+    /// Raise the high water above a completed rollback's fence.
+    ///
+    /// Goes through the same revision-guarded CAS as every other allocator
+    /// write, so a concurrent writer cannot be trampled; a failed CAS means
+    /// somebody else moved the row and the caller must re-read rather than
+    /// retry blindly.
+    pub async fn lift_high_water(
+        &self,
+        key: AuthorityTimestampKey,
+        expected: StoredAuthorityTimestampState,
+        candidate: StoredAuthorityTimestampState,
+    ) -> Result<AuthorityTimestampWriteOutcome, AuthorityTimestampStoreError> {
+        let execution = self
+            .session
+            .execute_unpaged(
+                &self.compare_and_set,
+                AuthorityTimestampCasBinding::from_parts(key, expected, candidate),
+            )
+            .await;
+        self.finish_write("lift_high_water", execution, key, candidate, |applied, current| {
+            Ok(if applied {
+                AuthorityTimestampWriteOutcome::Applied(candidate)
+            } else if current == candidate {
+                AuthorityTimestampWriteOutcome::Idempotent(candidate)
+            } else {
+                AuthorityTimestampWriteOutcome::Conflict(current)
+            })
+        })
         .await
     }
 
@@ -1103,6 +1134,15 @@ impl psy_node_core::store::authority_commit::AuthorityCommitTimestampStore
         reservation: &SealedAuthorityTimestampReservation,
     ) -> anyhow::Result<AuthorityTimestampWriteOutcome> {
         Ok(self.reserve(*reservation).await?)
+    }
+
+    async fn lift_timestamp_high_water(
+        &self,
+        key: AuthorityTimestampKey,
+        expected: StoredAuthorityTimestampState,
+        candidate: StoredAuthorityTimestampState,
+    ) -> anyhow::Result<AuthorityTimestampWriteOutcome> {
+        Ok(ScyllaAuthorityTimestampStore::lift_high_water(self, key, expected, candidate).await?)
     }
 
     async fn complete_timestamp(

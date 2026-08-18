@@ -48,14 +48,20 @@ struct Witness {
     before: Option<Vec<u8>>,
 }
 
-/// Every key the discarded range touched, with the state observed just before
-/// the *first* checkpoint above the target that touched it.
+/// Every key *position* the discarded range touched, with the state observed
+/// just before the first checkpoint above the target that touched it.
 ///
-/// That first touch is `c(K)`: everything below it survives the rollback, so its
-/// before image is what a production read must return afterwards.
+/// Grouping is by position, not by locator.  A version-axis locator encodes the
+/// checkpoint, so one tree node written at ten heights encodes to ten locators --
+/// and treating those as ten keys makes "the first checkpoint above the target
+/// that touched K" collapse into "every checkpoint", which asserts the wrong
+/// thing: at c the before image is the value at c-1, while after a rollback to T
+/// a read returns the value at T.  Those agree only for the first touch, which is
+/// exactly what `c(K)` means.
 async fn witnesses_first_touch(
     session: &Session,
     keyspace: &str,
+    reader: &ScyllaRowImageReader,
     target: u64,
     head: u64,
 ) -> anyhow::Result<Vec<Witness>> {
@@ -73,7 +79,13 @@ async fn witnesses_first_touch(
             .into_rows_result()?;
         for row in rows.rows::<(Vec<u8>, Option<Vec<u8>>, Option<bool>)>()? {
             let (locator, before, present) = row?;
-            first.entry(locator.clone()).or_insert(Witness {
+            let Ok(resolved) = decode_locator_canonical(&locator) else {
+                continue;
+            };
+            let Ok(position) = reader.position_key(&resolved) else {
+                continue;
+            };
+            first.entry(position).or_insert(Witness {
                 checkpoint_id: checkpoint,
                 locator,
                 before: before.filter(|_| present.unwrap_or(false)),
@@ -141,17 +153,17 @@ async fn a_rollback_restores_exactly_what_was_observed_before() -> anyhow::Resul
     assert!(target > 5, "the chain is too short to roll back meaningfully");
     println!("rolling back from {head} to {target}");
 
-    let witnesses = witnesses_first_touch(&session, &keyspace, target, head).await?;
+    let reader = ScyllaRowImageReader::prepare(session.clone(), &keyspace).await?;
+    let witnesses = witnesses_first_touch(&session, &keyspace, &reader, target, head).await?;
     assert!(
         !witnesses.is_empty(),
         "the journal recorded nothing for the discarded range; run the chain with \
          PSY_ROLLBACK_VERIFICATION_JOURNAL set"
     );
-    println!("{} distinct keys were touched above the target", witnesses.len());
+    println!("{} distinct key positions were touched above the target", witnesses.len());
 
     let executor =
         ScyllaRollbackExecutor::prepare(session.clone(), &keyspace, &no_tablet).await?;
-    let reader = ScyllaRowImageReader::prepare(session.clone(), &keyspace).await?;
 
     // The chain reference the plan starts from.  Read from the committed head
     // rather than constructed, so the plan walks the manifests the chain really
