@@ -163,6 +163,8 @@ where
         chain_id: u32,
         realm_identifier: QRealmIdentifier,
         circuit_fingerprint_config: PsyNodeCircuitFingerprintConfig<N::QHash>,
+        network: psy_core::constants::chain_id::PsyChainNetworkType,
+        recording: psy_node_core::store::realm_commit_recording::RealmCommitRecording<N::QHash>,
         file_system: Arc<FileSystem>,
         checkpoint_tree_root_backup_file_path: String,
         genesis_realm_root: N::QHash,
@@ -278,6 +280,8 @@ where
             checkpoint_tree_backup_manager,
             shared_state: RealmProcessorCoreStateWrapper::new(state.clone()),
             circuit_fingerprint_config,
+            recording,
+            network_id: psy_data::protocol::canonical_chain::NetworkId::from_network_type(network),
             guta_queue_key_status_manager: QueueKeyStatusManager::<
                 PQ_REALM_SUBMIT_USER_UPDATE_QUEUE_TOPIC_ID,
                 PsyRealmUserUpdateQueueItem<N::F, N::QHash>,

@@ -212,6 +212,185 @@ where
         Ok(previous)
     }
 
+    /// Plan this Realm commit and make its manifest durable.
+    ///
+    /// The chain reference is the Coordinator's, not one this Realm invents: a
+    /// Realm commits at a checkpoint it was told to commit, so both manifests
+    /// name the same `(chain_epoch, checkpoint)` and a rollback can line them up
+    /// rather than infer a correspondence (§6.3).
+    async fn record_realm_commit_prepared(
+        &self,
+        coordinator_update: &PsyRealmCoordinatorUpdate<N::F, N::QHash>,
+        realm_update: &PsyPreparedRealmBlockStateUpdates<N::QHash>,
+    ) -> anyhow::Result<
+        psy_node_core::store::realm_recording_flow::PreparedRealmCommit<N::QHash>,
+    > {
+        use psy_data::protocol::canonical_chain::{
+            CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId, CheckpointRef,
+        };
+        use psy_node_core::store::authority_commit::{
+            AuthorityClockSampleUs, AuthorityTimestampBootstrapReason, AuthorityTimestampKey,
+        };
+        use psy_node_core::store::commit_planner::RealmCommitPlanInputs;
+        use psy_data::protocol::chain_context::{
+            AuthorityScope, AuthorityStateCheckpointId, AuthorityStateRoot,
+        };
+        use psy_node_core::store::manifest_intent::{AuthorityHeadPayload, AuthorityStateTransition};
+
+        let checkpoint_id = coordinator_update.checkpoint_sync_info.checkpoint_id;
+        let unique_pending_id = self.state.processing_unique_pending_id;
+
+        let inputs = RealmCommitPlanInputs {
+            checkpoint_id,
+            unique_pending_id,
+            realm_id: self.state.realm_id_u64,
+            update_user_leaves_ffs: &realm_update.update_user_leaves_ffs,
+            update_user_contract_tree_nodes_ffs: &realm_update.update_user_contract_tree_nodes_ffs,
+            update_contract_state_tree_nodes_ffs: &realm_update
+                .update_contract_state_tree_nodes_ffs,
+            update_contract_state_imt_leaves_ffs: &realm_update
+                .update_contract_state_imt_leaves_ffs,
+            update_global_user_tree_nodes_ffs: &realm_update.update_global_user_tree_nodes_ffs,
+        };
+
+        // The allocator and the manifest are partitioned by this exact scope, so
+        // a Realm's records sit beside the Coordinator's at the same height.
+        let key = AuthorityTimestampKey::new(
+            self.network_id,
+            AuthorityScope::Realm {
+                realm_id: self.state.realm_identifier.realm_id,
+                realm_sub_id: self.state.realm_identifier.realm_sub_id,
+            },
+        );
+        // The Coordinator's coordinate, carried through untouched.
+        let chain_at = |height: u64, hash: N::QHash| {
+            CanonicalChainRef::new(
+                self.network_id,
+                ChainEpoch::new(0),
+                CheckpointRef::new(
+                    CheckpointId::new(height),
+                    CheckpointHash::from_last_chain_hash(hash),
+                ),
+            )
+        };
+        let candidate = chain_at(
+            checkpoint_id,
+            coordinator_update.checkpoint_sync_info.checkpoint_tree_root,
+        );
+        let expected = chain_at(
+            checkpoint_id.saturating_sub(1),
+            self.state.last_committed_checkpoint_root,
+        );
+
+        let transition = AuthorityStateTransition::Changed {
+            previous_checkpoint: AuthorityStateCheckpointId::new(
+                checkpoint_id.saturating_sub(1),
+            ),
+            checkpoint: AuthorityStateCheckpointId::new(checkpoint_id),
+            old_root: AuthorityStateRoot::from_local_state_root(
+                self.state.last_committed_realm_end_root,
+            ),
+            new_root: AuthorityStateRoot::from_local_state_root(realm_update.new_realm_root),
+        };
+
+        // The realm root goes in through the state transition above, which already
+        // binds it; the payload carries only what the transition does not -- the
+        // height and the pending id this commit consumed.  Adding the root here
+        // would need a serializer bound this impl does not declare, and would say
+        // the same thing twice.
+        let mut head_payload = Vec::with_capacity(16);
+        head_payload.extend_from_slice(&checkpoint_id.to_le_bytes());
+        head_payload.extend_from_slice(&unique_pending_id.to_le_bytes());
+
+        let clock_sample = AuthorityClockSampleUs::try_from_i128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_micros() as i128,
+        )?;
+
+        psy_node_core::store::realm_recording_flow::prepare_realm_commit(
+            &self.recording,
+            key,
+            &inputs,
+            expected,
+            candidate,
+            transition,
+            AuthorityHeadPayload::try_new(head_payload)?,
+            clock_sample,
+            AuthorityTimestampBootstrapReason::ControlledWriterCutover,
+        )
+        .await
+    }
+
+    /// Seal the Realm manifest against what was actually written.
+    ///
+    /// A Realm manifest ends at SEALED, and that is a statement about authority
+    /// rather than an omission.
+    ///
+    /// COMMITTED is defined as "the head was published" -- `mark_committed`
+    /// takes a `HeadPublishReceipt`, which only a head CAS produces.  §6 gives
+    /// the chain one head authority and it is the Coordinator's, so a Realm has
+    /// no CAS to produce one and manufacturing a receipt would assert exactly the
+    /// authority §6 withholds.
+    ///
+    /// SEALED already carries what a Realm can honestly claim: `verify_and_seal`
+    /// checks the observation against the record, so the row means "my state
+    /// writes landed and they match what I recorded".  A Realm rollback planner
+    /// therefore takes SEALED as its completeness marker where the Coordinator's
+    /// takes COMMITTED.
+    async fn complete_realm_commit_record(
+        &self,
+        prepared: psy_node_core::store::realm_recording_flow::PreparedRealmCommit<N::QHash>,
+        observed_realm_root: N::QHash,
+    ) -> anyhow::Result<()> {
+        use psy_data::protocol::chain_context::{AuthorityStateCheckpointId, AuthorityStateRoot};
+        use psy_node_core::store::manifest_lifecycle::{
+            AuthorityHeadPayloadDigest, AuthorityHeadView, AuthorityPostWriteObservation,
+            AuthorityProofObservation, SealedAuthorityManifest,
+        };
+
+        let record = prepared.record().clone();
+        let key = record.intent().key();
+        let candidate_chain = *record.identity().canonical_chain();
+        let checkpoint_id = candidate_chain.checkpoint().checkpoint_id().get();
+
+        let observed_head = AuthorityHeadView::try_from_observed(
+            key,
+            candidate_chain,
+            AuthorityStateCheckpointId::new(checkpoint_id),
+            AuthorityStateRoot::from_local_state_root(observed_realm_root),
+        )?;
+        let observation = AuthorityPostWriteObservation::new(
+            observed_head,
+            record.intent().artifacts().mutation_digest(),
+            AuthorityHeadPayloadDigest::from_verified_payload_bytes(
+                record.intent().head_payload().as_bytes(),
+            ),
+            // A Realm proves no checkpoint public input: the checkpoint is the
+            // Coordinator's, and claiming it here would assert an authority §6
+            // does not give this side.
+            AuthorityProofObservation::NotApplicableForRealm,
+        );
+        let sealed = SealedAuthorityManifest::verify_and_seal(record, observation)?;
+        self.recording.manifest().append_sealed(&sealed).await?;
+
+        // Release the lease so the next commit can reserve.
+        let state = match self.recording.timestamp().read_timestamp_state(key).await? {
+            psy_node_core::store::authority_commit::AuthorityTimestampReadState::Current(state) => {
+                state
+            }
+            psy_node_core::store::authority_commit::AuthorityTimestampReadState::Uninitialized => {
+                anyhow::bail!("this Realm's allocator row vanished mid-commit")
+            }
+        };
+        let completion = state.seal_completion(key, prepared.lease())?;
+        self.recording
+            .timestamp()
+            .complete_timestamp(&completion)
+            .await?;
+        Ok(())
+    }
+
     pub async fn commit_state(
         &mut self,
         coordinator_update: &PsyRealmCoordinatorUpdate<N::F, N::QHash>,
@@ -222,6 +401,36 @@ where
     ) -> anyhow::Result<()> {
         let checkpoint_id = coordinator_update.checkpoint_sync_info.checkpoint_id;
         let unique_pending_id = self.state.processing_unique_pending_id;
+
+        // Record what this commit will write before it writes any of it.  Same
+        // rule as the Coordinator's (§3): a crash after the state writes but
+        // before the manifest leaves physical rows that no manifest names, and a
+        // rollback then has no way to find them.
+        //
+        // Genesis is exempt on this side too -- it precedes the rollback floor,
+        // which is the Coordinator's, so nothing will ever roll back through it.
+        let recorded = if checkpoint_id == 0 {
+            None
+        } else {
+            Some(
+                self.record_realm_commit_prepared(coordinator_update, realm_update)
+                    .await?,
+            )
+        };
+
+        let _commit_window = match &recorded {
+            Some(prepared) => Some(
+                self.recording
+                    .open_commit_window(checkpoint_id, prepared.lease().timestamp())?,
+            ),
+            None => None,
+        };
+
+        if let (Some(prepared), Some(journal)) = (&recorded, self.recording.journal()) {
+            journal
+                .record_before(checkpoint_id, prepared.planned_rows())
+                .await?;
+        }
         // CRITICAL: set unique_pending_id to checkpoint_id mapping BEFORE ANY OTHER
         // STATE UPDATES so we can recover if something goes wrong.
         //
@@ -315,6 +524,18 @@ where
                 }
             }
         }
+        // Observe the recorded keys now that the writes have landed, then seal
+        // the manifest against what was actually written.
+        if let (Some(prepared), Some(journal)) = (&recorded, self.recording.journal()) {
+            journal
+                .record_after(checkpoint_id, prepared.planned_rows())
+                .await?;
+        }
+        if let Some(prepared) = recorded {
+            self.complete_realm_commit_record(prepared, realm_update.new_realm_root)
+                .await?;
+        }
+
         tracing::info!("Committed coordinator processor state for checkpoint ID: {}", checkpoint_id);
         tracing::info!("Backed up checkpoint tree root for checkpoint ID: {}", checkpoint_id);
         self.state.commit_processing()?;

@@ -88,6 +88,14 @@ pub struct PsyRealmDatabaseProcessor<
 
     // config
     pub circuit_fingerprint_config: PsyNodeCircuitFingerprintConfig<N::QHash>,
+    /// How this Realm records what it commits.
+    ///
+    /// Not optional and not constructed here: it arrives with the store, so a
+    /// processor that can write state necessarily holds the means to record it
+    /// (design-r1 §0.2 D3).
+    pub recording: psy_node_core::store::realm_commit_recording::RealmCommitRecording<N::QHash>,
+    /// This Realm's slot in the allocator and manifest partitions.
+    pub network_id: psy_data::protocol::canonical_chain::NetworkId,
 }
 
 impl<

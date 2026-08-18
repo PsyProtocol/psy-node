@@ -87,6 +87,16 @@ pub trait RealmCommitPlanner: Send + Sync {
         inputs: &RealmCommitPlanInputs<'_>,
         sink: &dyn PhysicalMutationSink,
     ) -> anyhow::Result<()>;
+
+    /// Validate the planned rows and encode them into canonical chunks.
+    ///
+    /// Same contract as the Coordinator's: validation happens on the way in,
+    /// because a locator that cannot be resolved back to a key is useless to
+    /// rollback and finding that out at delete time is far too late.
+    fn encode_planned_locators(
+        &self,
+        rows: Vec<(u16, Vec<u8>)>,
+    ) -> anyhow::Result<PlannedLocatorArtifact>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

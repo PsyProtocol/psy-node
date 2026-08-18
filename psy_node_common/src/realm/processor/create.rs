@@ -40,6 +40,8 @@ pub async fn create_realm_processor<
     realm_identifier: QRealmIdentifier,
     circuit_fingerprint_config: PsyNodeCircuitFingerprintConfig<N::QHash>,
     coordinator_client: Arc<CoordinatorClient>,
+    network: psy_core::constants::chain_id::PsyChainNetworkType,
+    recording: psy_node_core::store::realm_commit_recording::RealmCommitRecording<N::QHash>,
 ) -> anyhow::Result<(
     PsyRealmProcessor<
         N,
@@ -96,6 +98,8 @@ where
         chain_id,
         realm_identifier,
         circuit_fingerprint_config,
+        network,
+        recording,
         file_system.clone(),
         checkpoint_tree_root_backup_file_path,
         genesis.prepared_updates.new_realm_root,
@@ -196,6 +200,8 @@ pub async fn create_realm_processor_and_run<
     realm_identifier: QRealmIdentifier,
     circuit_fingerprint_config: PsyNodeCircuitFingerprintConfig<N::QHash>,
     coordinator_client: Arc<CoordinatorClient>,
+    network: psy_core::constants::chain_id::PsyChainNetworkType,
+    recording: psy_node_core::store::realm_commit_recording::RealmCommitRecording<N::QHash>,
 ) -> anyhow::Result<()>
 where
     FileSystem::File: Send + Sync,
@@ -216,6 +222,8 @@ where
         realm_identifier,
         circuit_fingerprint_config,
         coordinator_client,
+        network,
+        recording,
     )
     .await?;
 

@@ -13,7 +13,7 @@ use psy_node_common::{coordinator::processor::create::create_coordinator_process
 use psy_node_core::config::node_start_config::{CoordinatorProcessorStartConfig, RealmProcessorStartConfig};
 use psy_node_nats::psy_queue::setup_nats_psy_queue_from_connection_str;
 use psy_node_redis::store::{new_redis_async_pool, StandardRedisStore};
-use psy_node_scylla::psy_setup::{setup_coordinator_psy_scylla_store_from_connection_string, setup_psy_scylla_database_store_from_connection_string};
+use psy_node_scylla::psy_setup::{setup_coordinator_psy_scylla_store_from_connection_string, setup_psy_scylla_database_store_from_connection_string, setup_realm_psy_scylla_store_from_connection_string};
 
 pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_coordinator_processor_node(config: &CoordinatorProcessorStartConfig) -> anyhow::Result<()> {
     let resolver = PsyJTMBPoseidonGoldilocksNodeConfigResolver {};
@@ -147,7 +147,15 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_processor_node(co
     match config.network {
         psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesJTMBGoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
-            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, true).await?;
+            // Store and control plane together: a Realm processor cannot be
+            // handed a store it can write without the means to record what it
+            // wrote (design-r1 §0.2 D3).
+            let (db, rollback_control) = setup_realm_psy_scylla_store_from_connection_string::<N>(
+                &config.db_namespace,
+                &config.scylla_db_url,
+            )
+            .await?;
+            let realm_recording = rollback_control.recording();
             tracing::info!("[REALM_BOOT] scylla store ready");
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
@@ -172,7 +180,8 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_processor_node(co
 
                 circuit_fingerprint_config,
                 Arc::new(coordinator_client),
-
+                config.network,
+                realm_recording,
             )
             .await?;
             tracing::info!("[REALM_BOOT] realm processor exited");

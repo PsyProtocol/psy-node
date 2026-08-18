@@ -74,6 +74,15 @@ fn require_stride(field: &'static str, len: usize, stride: usize) -> anyhow::Res
 }
 
 impl RealmCommitPlanner for ScyllaRealmCommitPlanner {
+    fn encode_planned_locators(
+        &self,
+        rows: Vec<(u16, Vec<u8>)>,
+    ) -> anyhow::Result<psy_node_core::store::commit_planner::PlannedLocatorArtifact> {
+        // The chunk codec is the manifest's, not an authority's: both sides must
+        // produce artifacts a single rollback planner can decode.
+        super::ScyllaCoordinatorCommitPlanner::encode_locators(rows)
+    }
+
     fn plan_realm_commit(
         &self,
         inputs: &RealmCommitPlanInputs<'_>,

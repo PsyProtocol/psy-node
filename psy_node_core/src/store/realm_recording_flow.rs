@@ -97,9 +97,6 @@ pub async fn prepare_realm_commit<Hash: Q256BitHash>(
     head_payload: AuthorityHeadPayload,
     clock_sample: AuthorityClockSampleUs,
     bootstrap_reason: AuthorityTimestampBootstrapReason,
-    encode_locators: &dyn Fn(
-        Vec<(u16, Vec<u8>)>,
-    ) -> anyhow::Result<super::commit_planner::PlannedLocatorArtifact>,
 ) -> anyhow::Result<PreparedRealmCommit<Hash>> {
     let sink = CollectingPhysicalMutationSink::new();
     recording.planner().plan_realm_commit(inputs, &sink)?;
@@ -107,7 +104,9 @@ pub async fn prepare_realm_commit<Hash: Q256BitHash>(
     if planned_rows.is_empty() {
         anyhow::bail!("a Realm commit that writes no row cannot be recorded");
     }
-    let planned = encode_locators(planned_rows.clone())?;
+    let planned = recording
+        .planner()
+        .encode_planned_locators(planned_rows.clone())?;
 
     let artifacts = ManifestArtifactSetCommitment::from_verified_artifact_summary(
         &planned.canonical_summary,

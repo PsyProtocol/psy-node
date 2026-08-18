@@ -623,7 +623,12 @@ impl ScyllaCoordinatorCommitPlanner {
 }
 
 impl ScyllaCoordinatorCommitPlanner {
-    fn encode_locators(rows: Vec<(u16, Vec<u8>)>) -> anyhow::Result<PlannedLocatorArtifact> {
+    /// The chunk codec both authorities share.
+    ///
+    /// `pub(crate)` rather than private because the Realm planner encodes with
+    /// it too: one rollback planner decodes artifacts from either side, so a
+    /// second encoder would be a second format to keep in step.
+    pub(crate) fn encode_locators(rows: Vec<(u16, Vec<u8>)>) -> anyhow::Result<PlannedLocatorArtifact> {
         let records = Self::validate_planned_rows(rows)?;
         let affected_row_count = records.len() as u64;
         let mutation_digest = Self::mutation_digest(&records);
