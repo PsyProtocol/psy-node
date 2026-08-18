@@ -63,11 +63,23 @@ pub struct RowColumn {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RowImage {
     columns: Vec<RowColumn>,
+    /// Which version an as-of read actually landed on, for version-axis tables.
+    ///
+    /// Deliberately outside [`canonical_bytes`](Self::canonical_bytes).  The
+    /// journal's assertion is about the value a production read returns; the
+    /// version it came from is corroborating evidence, checked separately so a
+    /// mistake in that reasoning shows up as its own failure rather than as a
+    /// value mismatch.
+    resolved_checkpoint: Option<u64>,
 }
 
 impl RowImage {
     pub fn columns(&self) -> &[RowColumn] {
         &self.columns
+    }
+
+    pub const fn resolved_checkpoint(&self) -> Option<u64> {
+        self.resolved_checkpoint
     }
 
     /// True when the row exists but carries no regular column at all.
@@ -105,9 +117,19 @@ impl RowImage {
 }
 
 /// How a physical table's regular columns are read back.
+///
+/// Two statements, because the two callers ask different questions.  Delete and
+/// archive want *this* row: the one recorded at exactly this checkpoint, which is
+/// the row that has to be removed or saved.  The journal wants what a production
+/// read returns, which on a version-axis table is the latest row at or below the
+/// checkpoint -- that fallback is the whole meaning of design-r1's claim that the
+/// version axis drops back on its own, so a journal that point-read instead would
+/// be checking a different statement than the one it is trying to prove.
 struct TableRead {
-    prepared: PreparedStatement,
+    exact: PreparedStatement,
+    as_of: PreparedStatement,
     columns: &'static [(&'static str, ColumnKind)],
+    has_checkpoint_axis: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -252,31 +274,83 @@ impl ScyllaRowImageReader {
                 .map(|column| format!("{column} = ?"))
                 .collect::<Vec<_>>()
                 .join(" AND ");
-            let cql = format!("SELECT {selected} FROM {keyspace}.{name} WHERE {predicate}");
+            let exact = format!("SELECT {selected} FROM {keyspace}.{name} WHERE {predicate}");
+
+            // A version axis exists when the last clustering column is the
+            // checkpoint.  Then an as-of read is the production read: drop back
+            // to the newest version at or below the asked height.  Without one
+            // the row is overwritten in place or keyed by content, and the two
+            // reads are the same question.
+            let has_checkpoint_axis = key_columns
+                .last()
+                .is_some_and(|column| *column == "checkpoint_id");
+            let as_of = if has_checkpoint_axis {
+                let (last, leading) = key_columns
+                    .split_last()
+                    .expect("a checkpoint axis implies at least one column");
+                let mut predicate: Vec<String> = leading
+                    .iter()
+                    .map(|column| format!("{column} = ?"))
+                    .collect();
+                predicate.push(format!("{last} <= ?"));
+                format!(
+                    "SELECT {selected}, {last} FROM {keyspace}.{name} WHERE {} LIMIT 1",
+                    predicate.join(" AND ")
+                )
+            } else {
+                exact.clone()
+            };
+
             reads.insert(
                 table,
                 TableRead {
-                    prepared: session.prepare(cql).await?,
+                    exact: session.prepare(exact).await?,
+                    as_of: session.prepare(as_of).await?,
                     columns: shape.value_columns,
+                    has_checkpoint_axis,
                 },
             );
         }
         Ok(Self { session, reads })
     }
 
-    /// Read one row, or `None` when it does not exist.
+    /// The row recorded at exactly this checkpoint, or `None`.
+    ///
+    /// What delete and archive need: the row to remove, or to save before it is
+    /// removed.  On a sparse version-axis table most checkpoints hold no row for
+    /// a given key and `None` is the correct answer.
     pub async fn read(&self, key: &ResolvedScyllaKey) -> anyhow::Result<Option<RowImage>> {
+        self.read_inner(key, false).await
+    }
+
+    /// What a production read of this key returns at this checkpoint.
+    ///
+    /// On a version-axis table that is the newest row at or below the height,
+    /// exactly as the table adapters query it.  This is the read the journal has
+    /// to use: its assertion is that after a rollback a production read returns
+    /// the value observed before, and a point read asks a different question.
+    pub async fn read_as_of(&self, key: &ResolvedScyllaKey) -> anyhow::Result<Option<RowImage>> {
+        self.read_inner(key, true).await
+    }
+
+    async fn read_inner(
+        &self,
+        key: &ResolvedScyllaKey,
+        as_of: bool,
+    ) -> anyhow::Result<Option<RowImage>> {
         let table = key.physical_table();
         let read = self
             .reads
             .get(&table)
             .ok_or(RowImageError::UnrecordedTable(table))?;
         let values = cql_key_values(key.typed_key())?;
+        let statement = if as_of { &read.as_of } else { &read.exact };
         let rows = self
             .session
-            .execute_unpaged(&read.prepared, values)
+            .execute_unpaged(statement, values)
             .await?
             .into_rows_result()?;
+        let wants_version = as_of && read.has_checkpoint_axis;
 
         if read.columns.is_empty() {
             // Key-only table: presence is the whole image.
@@ -284,15 +358,27 @@ impl ScyllaRowImageReader {
                 .rows::<(Option<Vec<u8>>,)>()?
                 .next()
                 .transpose()?
-                .map(|_| RowImage { columns: Vec::new() }));
+                .map(|_| RowImage {
+                    columns: Vec::new(),
+                    resolved_checkpoint: None,
+                }));
         }
 
-        // One (value, WRITETIME) pair per regular column, in schema order.
-        let mut iter = rows.rows::<(Option<CqlValue>, Option<i64>)>()?;
-        let Some(row) = iter.next().transpose()? else {
-            return Ok(None);
+        // One (value, WRITETIME) pair per regular column, in schema order, plus
+        // the version an as-of read landed on.
+        let (raw, write_time_us, resolved_checkpoint) = if wants_version {
+            let mut iter = rows.rows::<(Option<CqlValue>, Option<i64>, i64)>()?;
+            let Some(row) = iter.next().transpose()? else {
+                return Ok(None);
+            };
+            (row.0, row.1, Some(row.2 as u64))
+        } else {
+            let mut iter = rows.rows::<(Option<CqlValue>, Option<i64>)>()?;
+            let Some(row) = iter.next().transpose()? else {
+                return Ok(None);
+            };
+            (row.0, row.1, None)
         };
-        let (raw, write_time_us) = row;
         let (name, kind) = read.columns[0];
         Ok(Some(RowImage {
             columns: vec![RowColumn {
@@ -300,6 +386,7 @@ impl ScyllaRowImageReader {
                 value: raw.map(|value| encode_cell(value, kind)),
                 write_time_us,
             }],
+            resolved_checkpoint,
         }))
     }
 }
@@ -409,6 +496,7 @@ mod tests {
         // let a cleared value pass as an absent one.
         let null = RowImage {
             columns: vec![RowColumn { name: "value", value: None, write_time_us: Some(1) }],
+            resolved_checkpoint: None,
         };
         let empty = RowImage {
             columns: vec![RowColumn {
@@ -416,19 +504,22 @@ mod tests {
                 value: Some(Vec::new()),
                 write_time_us: Some(1),
             }],
+            resolved_checkpoint: None,
         };
         assert_ne!(null.canonical_bytes(), empty.canonical_bytes());
     }
 
     #[test]
-    fn the_write_time_is_not_part_of_the_image() {
-        // A restored row is the same row even though it was written later.
+    fn neither_the_write_time_nor_the_resolved_version_is_part_of_the_image() {
+        // A restored row is the same row even though it was written later, and a
+        // fallback that lands on an older version still returns the same value.
         let early = RowImage {
             columns: vec![RowColumn {
                 name: "value",
                 value: Some(vec![7, 7]),
                 write_time_us: Some(100),
             }],
+            resolved_checkpoint: None,
         };
         let late = RowImage {
             columns: vec![RowColumn {
@@ -436,13 +527,14 @@ mod tests {
                 value: Some(vec![7, 7]),
                 write_time_us: Some(900_000),
             }],
+            resolved_checkpoint: Some(7),
         };
         assert_eq!(early.canonical_bytes(), late.canonical_bytes());
     }
 
     #[test]
     fn a_key_only_row_is_a_state_not_an_absence() {
-        let present = RowImage { columns: Vec::new() };
+        let present = RowImage { columns: Vec::new(), resolved_checkpoint: None };
         assert!(present.is_key_only());
         // It still encodes to something, so `Some(image)` and `None` stay
         // distinguishable for a table whose rows are pure primary key.

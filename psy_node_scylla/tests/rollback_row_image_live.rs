@@ -179,6 +179,7 @@ async fn the_reader_finds_rows_the_production_writers_wrote() -> anyhow::Result<
     }
 
     let mut missing = Vec::new();
+    let mut as_of_missing = Vec::new();
     for (label, key) in probes {
         let resolved = describe_existing_key(&key);
         match reader.read(&resolved).await? {
@@ -190,10 +191,114 @@ async fn the_reader_finds_rows_the_production_writers_wrote() -> anyhow::Result<
             }
             None => missing.push(label),
         }
+        // An as-of read at the very checkpoint a row was written must return that
+        // same row: the fallback can only reach further back, never past it.
+        match reader.read_as_of(&resolved).await? {
+            Some(image) => {
+                let exact = reader.read(&resolved).await?.expect("just read above");
+                assert_eq!(
+                    image.canonical_bytes(),
+                    exact.canonical_bytes(),
+                    "{label}: an as-of read at the row's own checkpoint returned a different row"
+                );
+            }
+            None => as_of_missing.push(label),
+        }
     }
     assert!(
         missing.is_empty(),
         "the reader could not find rows the production writers wrote: {missing:?}"
+    );
+    assert!(
+        as_of_missing.is_empty(),
+        "an as-of read found nothing where a point read found a row: {as_of_missing:?}"
+    );
+    Ok(())
+}
+
+/// The version axis really does drop back on its own.
+///
+/// design-r1 §2.2.1 keeps the manifest to keys alone because deleting a version
+/// makes a read return the previous one without anything being restored.  That
+/// is an assumption about Scylla's clustering order, and the minimal manifest is
+/// worthless if it does not hold, so it is checked against a real chain rather
+/// than argued.
+///
+/// The user tree is the right witness: it is sparse, written only at the
+/// checkpoints that change it, so an as-of read from a far later height has to
+/// travel backwards to find anything at all.
+#[tokio::test]
+#[ignore = "requires a keyspace holding a chain that has already run"]
+async fn a_read_falls_back_to_the_newest_version_at_or_below_the_height() -> anyhow::Result<()> {
+    let keyspace = std::env::var("PSY_ROLLBACK_LIVE_KEYSPACE")
+        .expect("set PSY_ROLLBACK_LIVE_KEYSPACE to a keyspace with committed checkpoints");
+    let session = Arc::new(
+        SessionBuilder::new()
+            .known_nodes(known_nodes().iter())
+            .build()
+            .await?,
+    );
+    let reader = ScyllaRowImageReader::prepare(session.clone(), &keyspace).await?;
+
+    let (level, index, written_at) = session
+        .query_unpaged(
+            format!(
+                "SELECT level, node_index, checkpoint_id FROM {keyspace}.global_user_tree_table \
+                 LIMIT 1"
+            ),
+            &[],
+        )
+        .await?
+        .into_rows_result()?
+        .first_row::<(i8, i64, i64)>()?;
+    let node = MerkleNode::new(level as u8, NodeIndex::new(index as u64));
+
+    let latest = session
+        .query_unpaged(
+            format!("SELECT value FROM {keyspace}.u64_singleton_table WHERE obj_id = 1"),
+            &[],
+        )
+        .await?
+        .into_rows_result()?
+        .first_row::<(i64,)>()?
+        .0;
+    assert!(
+        latest > written_at,
+        "the chain must have advanced past the sampled node for the fallback to mean anything"
+    );
+
+    let at_write = describe_existing_key(&TypedTableKey::GlobalUserMerkle {
+        node,
+        checkpoint: CheckpointId::try_new(written_at as u64)?,
+    });
+    let much_later = describe_existing_key(&TypedTableKey::GlobalUserMerkle {
+        node,
+        checkpoint: CheckpointId::try_new(latest as u64)?,
+    });
+
+    // Nothing was written at the later height for this node ...
+    assert!(
+        reader.read(&much_later).await?.is_none(),
+        "the sampled node is not sparse after all; pick a table that is"
+    );
+    // ... yet a production-shaped read there returns the older row, unchanged.
+    let fallen_back = reader
+        .read_as_of(&much_later)
+        .await?
+        .expect("a read at a later height must fall back, not return nothing");
+    let original = reader
+        .read(&at_write)
+        .await?
+        .expect("the sampled row exists at the checkpoint it was written");
+    assert_eq!(
+        fallen_back.canonical_bytes(),
+        original.canonical_bytes(),
+        "the fallback returned a different value than the version it should have landed on"
+    );
+    assert_eq!(
+        fallen_back.resolved_checkpoint(),
+        Some(written_at as u64),
+        "the fallback landed on an unexpected version"
     );
     Ok(())
 }
