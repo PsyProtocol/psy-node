@@ -29,11 +29,13 @@ mod mutation_sink;
 mod raw_access;
 mod rollback_floor_store;
 mod registry;
+mod row_image;
 
 pub use authority_timestamp_store::*;
 pub use canonical_head_store::*;
 pub use commit_planner_scylla::*;
 pub use commit_window_generator::*;
+pub use row_image::*;
 pub use commit_source_store::*;
 pub use control_plane::*;
 pub use identity::{ScyllaKeyDomain, ScyllaPhysicalTableId, UnknownScyllaPhysicalTableId};
