@@ -20,7 +20,9 @@ use parth_core::PHash;
 use psy_core::constants::chain_id::PsyChainNetworkType;
 use psy_data::protocol::canonical_chain::{CanonicalChainRef, NetworkId};
 use psy_node_core::store::canonical_head::CanonicalHeadReadState;
+use psy_data::protocol::chain_context::AuthorityScope;
 use psy_node_core::store::manifest_store::CoordinatorCommitRecording;
+use psy_node_core::store::rollback_participants::{RollbackParticipant, RollbackParticipantSet};
 use psy_node_scylla::rollback::{
     CoordinatorRollbackControlPlane, RollbackControlKeyspaces, ScyllaRollbackExecutor,
     ScyllaRowImageReader, decode_locator_canonical,
@@ -196,8 +198,13 @@ async fn a_rollback_restores_exactly_what_was_observed_before() -> anyhow::Resul
     let head_ref = read_head_chain_ref(&control).await?;
     let plan_id = format!("acceptance-{head}-{target}").into_bytes();
 
+    // A Coordinator rolling back alone is a participant set of one.  That is
+    // still a real barrier -- it files its own receipt and the seal succeeds --
+    // and it is what stops the type from being satisfiable by an empty set.
+    let coordinator = RollbackParticipant::new(AuthorityScope::Coordinator);
+    let participants = RollbackParticipantSet::try_new([coordinator])?;
     let report = executor
-        .roll_back(&recording, &head_ref, target, &plan_id)
+        .roll_back(&recording, &head_ref, target, &plan_id, &participants, &[])
         .await?;
     println!("{report:?}");
     assert_eq!(report.target, target);

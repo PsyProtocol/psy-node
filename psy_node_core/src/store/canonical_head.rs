@@ -374,16 +374,35 @@ impl<Hash: Q256BitHash> CanonicalHeadTransition<Hash> {
 
     /// Publish the all-participant archive barrier on the canonical-head row.
     ///
-    /// The storage adapter must only seal this transition after exact durable
-    /// readback of the global barrier.  The transition itself deliberately
-    /// preserves the old canonical head and remains pre-destructive.
+    /// Takes the sealed barrier by value, so the phase that precedes the point
+    /// of no return cannot be entered without evidence that every participant
+    /// archived the requested range.  This used to be a comment asking the
+    /// storage adapter to check first, which is the kind of requirement that
+    /// holds until someone adds a second caller: nothing stopped a Coordinator
+    /// from crossing while a Realm had archived nothing, and §0.2 D2 makes
+    /// archiving a precondition rather than a backup.
+    ///
+    /// The barrier must describe this rollback.  A barrier sealed for another
+    /// range is evidence about something else.
     pub fn complete_rollback_archive_barrier(
         expected: StoredCanonicalHead<Hash>,
+        barrier: super::rollback_participants::SealedArchiveBarrier,
     ) -> Result<Self, CanonicalHeadModelError> {
         let request = match expected.rollback_control() {
             RollbackControlState::Archiving(request) => *request,
             _ => return Err(CanonicalHeadModelError::RollbackArchiveNotActive),
         };
+        if barrier.target() != request.target().checkpoint_id().get()
+            || barrier.head() != request.requested_head().checkpoint_id().get()
+        {
+            return Err(CanonicalHeadModelError::ArchiveBarrierRangeMismatch {
+                barrier: (barrier.target(), barrier.head()),
+                request: (
+                    request.target().checkpoint_id().get(),
+                    request.requested_head().checkpoint_id().get(),
+                ),
+            });
+        }
         Ok(Self {
             kind: CanonicalHeadTransitionKind::CompleteRollbackArchiveBarrier,
             expected,
@@ -869,6 +888,12 @@ fn classify_lwt_observation<Hash: Copy + PartialEq>(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CanonicalHeadModelError {
+    /// The sealed archive barrier describes a different range than this
+    /// rollback requested, so it is evidence about something else.
+    ArchiveBarrierRangeMismatch {
+        barrier: (u64, u64),
+        request: (u64, u64),
+    },
     RevisionOutOfCqlRange(u64),
     NegativeRevision(i64),
     RevisionOverflow(u64),
@@ -911,6 +936,12 @@ pub enum CanonicalHeadModelError {
 impl fmt::Display for CanonicalHeadModelError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ArchiveBarrierRangeMismatch { barrier, request } => write!(
+                formatter,
+                "the sealed archive barrier covers ({}, {}] but this rollback discards \
+                 ({}, {}]; crossing the point of no return needs evidence about this range",
+                barrier.0, barrier.1, request.0, request.1
+            ),
             Self::RevisionOutOfCqlRange(value) => {
                 write!(formatter, "canonical-head revision {value} exceeds CQL BIGINT")
             }
@@ -1054,6 +1085,33 @@ impl From<RollbackControlCodecError> for CanonicalHeadModelError {
 
 #[cfg(test)]
 mod tests {
+    /// A sealed barrier for the request a head is carrying.
+    ///
+    /// These tests exercise phase ordering, not participant aggregation, so the
+    /// set is the Coordinator alone -- which is still a real barrier: it files
+    /// its own receipt for the requested range and the seal succeeds.
+    fn barrier_for<Hash: super::Q256BitHash>(
+        head: &super::StoredCanonicalHead<Hash>,
+    ) -> crate::store::rollback_participants::SealedArchiveBarrier {
+        use crate::store::rollback_participants::{
+            ArchiveBarrier, ArchiveReceipt, RollbackParticipant, RollbackParticipantSet,
+        };
+        let request = head
+            .rollback_control()
+            .requested()
+            .expect("a barrier is only sealed while a rollback is active");
+        let target = request.target().checkpoint_id().get();
+        let requested_head = request.requested_head().checkpoint_id().get();
+        let coordinator = RollbackParticipant::new(
+            psy_data::protocol::chain_context::AuthorityScope::Coordinator,
+        );
+        let set = RollbackParticipantSet::try_new([coordinator]).expect("valid set");
+        let mut barrier = ArchiveBarrier::new(set, target, requested_head);
+        barrier
+            .file(ArchiveReceipt::new(coordinator, target, requested_head, 1, [1u8; 32]))
+            .expect("valid receipt");
+        barrier.seal().expect("met")
+    }
     use super::*;
     use parth_core::PHash;
     use psy_core::constants::chain_id::PsyChainNetworkType;
@@ -1385,6 +1443,7 @@ mod tests {
         .unwrap();
         let barrier = CanonicalHeadTransition::complete_rollback_archive_barrier(
             *archiving.candidate(),
+            barrier_for(archiving.candidate()),
         )
         .unwrap();
         let reason = RollbackAbortReasonCode::try_new(42).unwrap();
@@ -1488,6 +1547,7 @@ mod tests {
         .unwrap();
         let barrier = CanonicalHeadTransition::complete_rollback_archive_barrier(
             *archiving.candidate(),
+            barrier_for(archiving.candidate()),
         )
         .unwrap();
         assert_eq!(
@@ -1606,7 +1666,8 @@ mod tests {
 
         assert_eq!(
             CanonicalHeadTransition::complete_rollback_archive_barrier(
-                *requested.candidate()
+                *requested.candidate(),
+                barrier_for(requested.candidate()),
             ),
             Err(CanonicalHeadModelError::RollbackArchiveNotActive)
         );

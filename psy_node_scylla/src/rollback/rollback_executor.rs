@@ -37,6 +37,10 @@ use psy_node_core::store::timestamp::{CommitWriteTimestampUs, TimestampFenceWind
 
 use psy_node_core::store::typed::{MerkleNode, NodeIndex, TypedTableKey, UniquePendingId};
 
+use psy_node_core::store::rollback_participants::{
+    ArchiveBarrier, ArchiveReceipt, RollbackParticipant, RollbackParticipantSet,
+};
+
 use super::{
     ArchiveOutcome, ScyllaDeleteExecutor, ScyllaRollbackArchive, decode_locator_chunk,
     describe_existing_key, fence_from_archive,
@@ -334,6 +338,11 @@ impl ScyllaRollbackExecutor {
         head: &CanonicalChainRef<Hash>,
         target: u64,
         plan_id: &[u8],
+        // Who else takes part, and what they have proven.  A Coordinator-only
+        // rollback passes a set of one and no extra receipts; a coordinated one
+        // passes every Realm and the receipts they filed.
+        participants: &RollbackParticipantSet,
+        extra_receipts: &[ArchiveReceipt],
     ) -> anyhow::Result<RollbackReport> {
         let plan = self.plan(recording, head, target).await?;
         let planned_rows = plan.row_count();
@@ -374,10 +383,37 @@ impl ScyllaRollbackExecutor {
         self.verify_archive_under_fence(plan_id, &plan, fence).await?;
 
         // ---- point of no return ----
+        //
+        // Crossing needs a sealed barrier, and a barrier is sealed only when
+        // every participant has filed a receipt for this exact range (§6.2).
+        // A Coordinator rolling back alone is still a participant set of one --
+        // it files its own receipt and the barrier is met.  What the type
+        // forbids is crossing while a Realm in the set has archived nothing,
+        // which is I6: no participant deletes before every participant copied.
+        let mut barrier = ArchiveBarrier::new(
+            participants.clone(),
+            target,
+            plan.head,
+        );
+        barrier.file(ArchiveReceipt::new(
+            RollbackParticipant::new(AuthorityScope::Coordinator),
+            target,
+            plan.head,
+            archived_rows as u64,
+            plan_digest(plan_id),
+        ))?;
+        for receipt in extra_receipts {
+            barrier.file(*receipt)?;
+        }
+        let sealed_barrier = barrier.seal()?;
+
         stored = self
             .advance(
                 recording,
-                CanonicalHeadTransition::complete_rollback_archive_barrier(stored)?,
+                CanonicalHeadTransition::complete_rollback_archive_barrier(
+                    stored,
+                    sealed_barrier,
+                )?,
             )
             .await?;
 
