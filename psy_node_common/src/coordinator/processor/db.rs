@@ -373,6 +373,43 @@ impl<
         )
         .await?;
         tracing::info!("[COORD_INIT] checkpoint backup manager created");
+
+        // The backup file is a derived cache and must never sit ahead of the
+        // authority (design-r1 I10, §8.1).  After a rollback it does: the file
+        // still holds the leaves of the discarded suffix, `new_from_file_path`
+        // loads them, and `sync_from_database` only fills gaps -- it does not
+        // remove what the database no longer has.  The node then builds proofs
+        // from a tree that disagrees with its own state, and the failure surfaces
+        // in the *worker* as a witness conflict ("Wire ... was set twice with
+        // different values") while the processor logs nothing at all.
+        //
+        // Resetting first costs one truncation on a path that already re-syncs.
+        let cached_head = checkpoint_tree_backup_manager.get_current_checkpoint_id_head();
+        if cached_head > last_committed_checkpoint_id {
+            tracing::warn!(
+                "[COORD_INIT] checkpoint backup cache is ahead of the database ({} > {}); \
+                 truncating and rebuilding from the database",
+                cached_head,
+                last_committed_checkpoint_id
+            );
+            let required_history_start = last_committed_checkpoint_id
+                .saturating_sub(STALE_CHECKPOINT_AGE_REALM_TO_COORDINATOR_PROOF)
+                .max(
+                    if last_committed_checkpoint_id
+                        >= checkpoint_tree_backup_manager.max_checkpoints_to_keep
+                    {
+                        last_committed_checkpoint_id
+                            - checkpoint_tree_backup_manager.max_checkpoints_to_keep
+                            + 1
+                    } else {
+                        0
+                    },
+                );
+            checkpoint_tree_backup_manager
+                .hard_reset_and_truncate(required_history_start)
+                .await?;
+        }
+
         if last_committed_checkpoint_id > 0 {
             checkpoint_tree_backup_manager
                 .sync_from_database::<S>(&db, 1000, last_committed_checkpoint_id)
