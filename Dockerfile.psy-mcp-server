@@ -22,10 +22,10 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends git ca-certi
     && rm -rf /var/lib/apt/lists/* \
 # Debian bookworm ships golang 1.19, which rejects go.mod's `toolchain`
 # directive (a 1.21+ feature) — install upstream Go instead.
-    && curl -fsSL https://go.dev/dl/go1.24.5.linux-arm64.tar.gz | tar -C /usr/local -xz \
+RUN curl -fsSL https://golang.google.cn/dl/go1.24.5.linux-arm64.tar.gz | tar -C /usr/local -xz \
     && ln -s /usr/local/go/bin/go /usr/local/bin/go \
     && git config --global url."https://github.com/".insteadOf "ssh://git@github.com/" \
-    && git config --global url."https://github.com/".insteadOf "git@github.com:"
+    && git config --global --add url."https://github.com/".insteadOf "git@github.com:"
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 COPY . .
 RUN cargo build --release -p psy_mcp_server
@@ -35,14 +35,11 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends ca-certifica
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=builder /build/target/release/psy-mcp-server /app/psy-mcp-server
-# Container config: the stock staging config points prove-proxy at
-# 127.0.0.1, which inside a container is the container itself — the MCP
-# server is fail-closed (exits) when a configured proxy is unreachable. This
-# variant rewrites both proxy URLs to host.docker.internal so the host-run
-# proxies serve the container. Colleagues must run the two proxies from
-# MCP_DOCKER_TEST_GUIDE_ZH.md §1.
-COPY test-env/configs/psy-mcp-config-container.json /app/config.json
-ENV PSY_CONFIG=/app/config.json \
+
+# Runtime config is supplied by the host so changing defaultNetwork does not
+# require rebuilding the image:
+#   -v "$HOME/.psy/config.json:/root/.psy/config.json:ro"
+ENV PSY_CONFIG=/root/.psy/config.json \
     PSY_MCP_KEYSTORE_DIR=/app/keys
 VOLUME /app/keys
 ENTRYPOINT ["/app/psy-mcp-server"]
