@@ -204,7 +204,7 @@ async fn a_rollback_restores_exactly_what_was_observed_before() -> anyhow::Resul
     let coordinator = RollbackParticipant::new(AuthorityScope::Coordinator);
     let participants = RollbackParticipantSet::try_new([coordinator])?;
     let report = executor
-        .roll_back(&recording, &head_ref, target, &plan_id, &participants, &[])
+        .roll_back(&recording, &head_ref, target, &plan_id, &participants, None)
         .await?;
     println!("{report:?}");
     assert_eq!(report.target, target);

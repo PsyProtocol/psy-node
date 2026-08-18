@@ -37,6 +37,8 @@ use psy_node_core::store::timestamp::{CommitWriteTimestampUs, TimestampFenceWind
 
 use psy_node_core::store::typed::{MerkleNode, NodeIndex, TypedTableKey, UniquePendingId};
 
+use parth_core::PHash;
+use psy_node_core::store::rollback_coordination::RollbackParticipantView;
 use psy_node_core::store::rollback_participants::{
     ArchiveBarrier, ArchiveReceipt, RollbackParticipant, RollbackParticipantSet,
 };
@@ -338,11 +340,12 @@ impl ScyllaRollbackExecutor {
         head: &CanonicalChainRef<Hash>,
         target: u64,
         plan_id: &[u8],
-        // Who else takes part, and what they have proven.  A Coordinator-only
-        // rollback passes a set of one and no extra receipts; a coordinated one
-        // passes every Realm and the receipts they filed.
+        // Who takes part.  What they have proven is read from durable storage
+        // rather than passed in: a caller that supplied the receipts would be
+        // deciding whether the barrier is met, which is the one decision the
+        // barrier exists to take away from callers.
         participants: &RollbackParticipantSet,
-        extra_receipts: &[ArchiveReceipt],
+        receipts: Option<&dyn RollbackParticipantView<PHash>>,
     ) -> anyhow::Result<RollbackReport> {
         let plan = self.plan(recording, head, target).await?;
         let planned_rows = plan.row_count();
@@ -402,8 +405,17 @@ impl ScyllaRollbackExecutor {
             archived_rows as u64,
             plan_digest(plan_id),
         ))?;
-        for receipt in extra_receipts {
-            barrier.file(*receipt)?;
+        // Everyone else's receipts come from the table they filed them in, so a
+        // Coordinator that crashed between a Realm's receipt and the barrier
+        // finds it again instead of waiting for a participant that already
+        // finished.
+        if let Some(view) = receipts {
+            for receipt in view
+                .read_archive_receipts_for(target, plan.head, participants.participants())
+                .await?
+            {
+                barrier.file(receipt)?;
+            }
         }
         let sealed_barrier = barrier.seal()?;
 
