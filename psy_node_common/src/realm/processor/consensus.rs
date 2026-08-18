@@ -5,18 +5,18 @@
 //! [`psy_data::p2p`] types:
 //!
 //! - [`decode_proposal_body`]: strict decode of the three length-prefixed body
-//!   sections (finalizer output, finalizer proof, backup) with hash verification
-//!   against the [`Proposal`] metadata. There are exactly three `u32` length
-//!   prefixes and no other sections.
+//!   sections (finalizer output, finalizer proof, state updates) with hash
+//!   verification against the [`Proposal`] metadata. There are exactly three
+//!   `u32` length prefixes and no other sections.
 //! - [`sign_vote`]: produce a BLS [`Vote`] over the canonical `vote_message`.
 //! - [`form_certificate`]: aggregate validator votes into a [`Certificate`].
 //! - [`validate_certificate`]: enforce the `ceil(n/2)` replication threshold,
 //!   require every signer bitmap bit to name a validator leaf,
 //!   and run `FastAggregateVerify` over the reconstructed `vote_message`.
 //!
-//! A [`Vote`] only attests that the signer durably stored the backup file and
-//! verified the GUTA proof and commit output. This module performs no replay
-//! into local state and keeps no per-validator tracking set.
+//! A [`Vote`] attests that the signer verified the GUTA proof, commit output,
+//! and in-band FFS state updates. This module performs no replay into local
+//! state and keeps no per-validator tracking set.
 
 use parth_core::{
     crypto::hash::traits::QFieldHashable,
@@ -38,33 +38,34 @@ use psy_data::{
         MAX_INCLUSION_LAG_CHECKPOINTS, MAX_PROPOSAL_BODY_BYTES, MAX_VALIDATORS_PER_REALM,
         MIN_VALIDATORS_PER_REALM, replication_threshold,
     },
+    prepared_block::realm::PsyPreparedRealmBlockStateUpdates,
 };
+use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 use std::collections::HashSet;
-use super::gatherers::realm_end_cap_gatherer::REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_BYTES;
 
 /// Decoded proposal body: the three length-prefixed sections in wire order.
 ///
-/// `output` is exactly [`MAX_FINALIZER_OUTPUT_BYTES`] bytes; `proof` and
-/// `backup` are the opaque verifier proof and RGE1 backup file bytes. None of
-/// these are re-encoded or reinterpreted here.
+/// `output` is exactly [`MAX_FINALIZER_OUTPUT_BYTES`] bytes; `proof` is the
+/// opaque verifier proof; `state_updates` is the canonical encoding of
+/// [`PsyPreparedRealmBlockStateUpdates`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DecodedProposalBody {
     /// Finalizer public output (exactly `MAX_FINALIZER_OUTPUT_BYTES` bytes).
     pub output: Vec<u8>,
     /// Opaque finalizer proof bytes (`<= MAX_FINALIZER_PROOF_BYTES`).
     pub proof: Vec<u8>,
-    /// RGE1 backup file bytes (`<= MAX_BACKUP_BYTES`).
-    pub backup: Vec<u8>,
+    /// Canonical `PsyPreparedRealmBlockStateUpdates` bytes (`<= MAX_BACKUP_BYTES`).
+    pub state_updates: Vec<u8>,
 }
 
 /// Decode a proposal body into its three length-prefixed sections.
 ///
 /// The wire layout is exactly `u32_le(output_len) || output ||
-/// u32_le(proof_len) || proof || u32_le(backup_len) || backup`, with no
-/// trailing bytes. `output_len` must equal [`MAX_FINALIZER_OUTPUT_BYTES`];
-/// `proof_len` and `backup_len` must not exceed their frozen maxima. The
-/// decoded sections and the full body are then checked against the matching
-/// hashes carried by `proposal`.
+/// u32_le(proof_len) || proof || u32_le(state_updates_len) || state_updates`,
+/// with no trailing bytes. `output_len` must equal
+/// [`MAX_FINALIZER_OUTPUT_BYTES`]; `proof_len` and `state_updates_len` must
+/// not exceed their frozen maxima. The decoded sections and the full body
+/// are then checked against the matching hashes carried by `proposal`.
 pub fn decode_proposal_body(
     proposal: &Proposal,
     body: &[u8],
@@ -87,7 +88,7 @@ pub fn decode_proposal_body(
         });
     }
     let proof = reader.read_bytes_u32("finalizer proof", MAX_FINALIZER_PROOF_BYTES as u32)?;
-    let backup = reader.read_bytes_u32("backup", MAX_BACKUP_BYTES as u32)?;
+    let state_updates = reader.read_bytes_u32("state updates", MAX_BACKUP_BYTES as u32)?;
     reader.finish()?;
 
     if sha256(body) != proposal.body_hash {
@@ -99,51 +100,48 @@ pub fn decode_proposal_body(
     if sha256(&proof) != proposal.finalizer_proof_hash {
         return Err(ProtocolError::Message("finalizer_proof_hash mismatch"));
     }
-    if sha256(&backup) != proposal.backup_hash {
+    if sha256(&state_updates) != proposal.backup_hash {
         return Err(ProtocolError::Message("backup_hash mismatch"));
     }
 
-    Ok(DecodedProposalBody { output, proof, backup })
+    Ok(DecodedProposalBody { output, proof, state_updates })
 }
-/// Verify the RGE1 backup header roots against the decoded GUTA output.
-pub fn verify_backup_matches_guta_output<F, Hash>(
-    backup: &[u8],
+
+/// Verify the in-band FFS roots against the decoded GUTA output.
+pub fn verify_state_updates_match_guta_output<F, Hash>(
+    state_updates: &PsyPreparedRealmBlockStateUpdates<Hash>,
     output: &RealmFinalizeGUTAPublicOutput<F, Hash>,
 ) -> anyhow::Result<()>
 where
     Hash: Q256BitHash,
 {
-    const ROOT_BYTES: usize = 32;
-    const HEADER_BYTES: usize = 4 + ROOT_BYTES + ROOT_BYTES;
-
     anyhow::ensure!(
-        backup.len() >= HEADER_BYTES,
-        "Realm backup is too short for RGE1 root header"
-    );
-    anyhow::ensure!(
-        backup[..4] == REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_BYTES,
-        "Realm backup RGE1 magic mismatch"
-    );
-    anyhow::ensure!(
-        backup[4..4 + ROOT_BYTES]
+        state_updates.old_realm_root.into_owned_32bytes()
             == output
                 .final_guta_header
                 .state_transition
                 .old_node_value
                 .into_owned_32bytes(),
-        "Realm backup start_root does not match GUTA old_node_value"
+        "Realm state updates old_realm_root does not match GUTA old_node_value"
     );
     anyhow::ensure!(
-        backup[4 + ROOT_BYTES..HEADER_BYTES]
+        state_updates.new_realm_root.into_owned_32bytes()
             == output
                 .final_guta_header
                 .state_transition
                 .new_node_value
                 .into_owned_32bytes(),
-        "Realm backup end_root does not match GUTA new_node_value"
+        "Realm state updates new_realm_root does not match GUTA new_node_value"
     );
     Ok(())
 }
+
+pub fn decode_proposal_state_updates<Hash: Q256BitHash>(
+    state_updates: &[u8],
+) -> anyhow::Result<PsyPreparedRealmBlockStateUpdates<Hash>> {
+    PsyPreparedRealmBlockStateUpdates::<Hash>::psy_ser_from_slice(state_updates)
+}
+
 
 
 /// Build the canonical unbound 410-byte finalize output for an ordinary GUTA submit.
@@ -225,7 +223,8 @@ where
         output.validator_tree_root.into_owned_32bytes() == proposal.validator_tree_root,
         "Realm finalize output validator_tree_root mismatch"
     );
-    verify_backup_matches_guta_output(&decoded.backup, &output)?;
+    let state_updates = decode_proposal_state_updates::<N::QHash>(&decoded.state_updates)?;
+    verify_state_updates_match_guta_output(&state_updates, &output)?;
     let expected_public_inputs_hash = submission.qfhash::<N::HasherBase>();
     proof_verifier.verify_zk_proof_from_slice_check_public_inputs_hash(
         submission.job_type_u32,
@@ -456,12 +455,12 @@ mod tests {
         validator_tree_root: [u8; 32],
         output: &[u8],
         proof: &[u8],
-        backup: &[u8],
+        state_updates: &[u8],
     ) -> (Proposal, Vec<u8>) {
-        let body = encode_proposal_body(output, proof, backup).expect("encode body");
+        let body = encode_proposal_body(output, proof, state_updates).expect("encode body");
         let public_output_hash = sha256(output);
         let finalizer_proof_hash = sha256(proof);
-        let backup_hash = sha256(backup);
+        let backup_hash = sha256(state_updates);
         let body_hash = sha256(&body);
         let proposal = proposal_from_parts(
             chain_id,
@@ -486,27 +485,27 @@ mod tests {
     fn sample_body_sections() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let output = vec![0u8; MAX_FINALIZER_OUTPUT_BYTES];
         let proof = vec![0xABu8; 128];
-        let backup = vec![0xCDu8; 256];
-        (output, proof, backup)
+        let state_updates = vec![0xCDu8; 256];
+        (output, proof, state_updates)
     }
 
 
     #[test]
     fn decode_proposal_body_roundtrips_canonical_body() {
-        let (output, proof, backup) = sample_body_sections();
+        let (output, proof, state_updates) = sample_body_sections();
         let (proposal, body) =
-            proposal_with_body(7, 3, 99, 1, [0u8; 32], &output, &proof, &backup);
+            proposal_with_body(7, 3, 99, 1, [0u8; 32], &output, &proof, &state_updates);
         let decoded = decode_proposal_body(&proposal, &body).expect("decode");
         assert_eq!(decoded.output, output);
         assert_eq!(decoded.proof, proof);
-        assert_eq!(decoded.backup, backup);
+        assert_eq!(decoded.state_updates, state_updates);
     }
 
     #[test]
     fn decode_proposal_body_rejects_trailing_bytes() {
-        let (output, proof, backup) = sample_body_sections();
+        let (output, proof, state_updates) = sample_body_sections();
         let (mut proposal, mut body) =
-            proposal_with_body(7, 3, 99, 1, [0u8; 32], &output, &proof, &backup);
+            proposal_with_body(7, 3, 99, 1, [0u8; 32], &output, &proof, &state_updates);
         // Recompute body_hash over the tampered body so the only failure is
         // the trailing-bytes check, not the hash check.
         body.push(0);
@@ -518,25 +517,25 @@ mod tests {
     #[test]
     fn decode_proposal_body_rejects_wrong_output_length() {
         // Hand-roll a body whose output length prefix is not exactly 410.
-        let (output, proof, backup) = sample_body_sections();
+        let (output, proof, state_updates) = sample_body_sections();
         let (proposal, _) =
-            proposal_with_body(7, 3, 99, 1, [0u8; 32], &output, &proof, &backup);
+            proposal_with_body(7, 3, 99, 1, [0u8; 32], &output, &proof, &state_updates);
         let mut body = Vec::new();
         body.extend_from_slice(&409u32.to_le_bytes());
         body.extend_from_slice(&output[..409]);
         body.extend_from_slice(&(proof.len() as u32).to_le_bytes());
         body.extend_from_slice(&proof);
-        body.extend_from_slice(&(backup.len() as u32).to_le_bytes());
-        body.extend_from_slice(&backup);
+        body.extend_from_slice(&(state_updates.len() as u32).to_le_bytes());
+        body.extend_from_slice(&state_updates);
         let err = decode_proposal_body(&proposal, &body).unwrap_err();
         assert!(matches!(err, ProtocolError::InvalidLength { .. }));
     }
 
     #[test]
     fn decode_proposal_body_rejects_hash_mismatch() {
-        let (output, proof, backup) = sample_body_sections();
+        let (output, proof, state_updates) = sample_body_sections();
         let (mut proposal, body) =
-            proposal_with_body(7, 3, 99, 1, [0u8; 32], &output, &proof, &backup);
+            proposal_with_body(7, 3, 99, 1, [0u8; 32], &output, &proof, &state_updates);
         proposal.body_hash = [0xFF; 32];
         let err = decode_proposal_body(&proposal, &body).unwrap_err();
         assert_eq!(err, ProtocolError::Message("body_hash mismatch"));

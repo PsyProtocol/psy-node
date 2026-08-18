@@ -200,7 +200,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_processor_node(co
                     built,
                     config,
                     PsyJTMBZKVerifier::new(verifier),
-                    processor.included_proposal_backup.clone(),
+                    processor.included_proposal_updates.clone(),
                 );
 
             }

@@ -7,46 +7,9 @@ use psy_data::{node::realm_processor::RealmProcessorCoreState, prepared_block::r
 use psy_io::tokio::TokioLikeFileSystem;
 
 use crate::realm::processor::gatherers::realm_end_cap_gatherer::{
-    get_new_realm_end_cap_gatherer_backup_file_path, read_realm_end_cap_gatherer_backup_bytes,
-    read_realm_end_cap_gatherer_backup_file,
+    get_new_realm_end_cap_gatherer_backup_file_path, read_realm_end_cap_gatherer_backup_file,
 };
 
-pub fn backup_end_root_from_bytes(backup: &[u8]) -> anyhow::Result<[u8; 32]> {
-    const HEADER_LEN: usize = 4 + 32 + 32;
-    anyhow::ensure!(
-        backup.len() >= HEADER_LEN,
-        "Realm proposal backup is shorter than the RGE1 header"
-    );
-    Ok(backup[36..68].try_into().expect("32-byte end_root slice"))
-}
-
-pub fn generate_realm_output_from_backup_bytes<N: QNetworkTypesConfig<JobId = QProvingJobDataID>>(
-    backup: &[u8],
-    state: &RealmProcessorCoreState<N::QHash>,
-    global_user_tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
-) -> anyhow::Result<PsyPreparedRealmBlockStateUpdates<N::QHash>> {
-    let guta_gatherer_result = read_realm_end_cap_gatherer_backup_bytes::<N::HasherBase, N::QHash, N::F>(
-        backup,
-        global_user_tree,
-        state.realm_id_u64,
-        N::REALM_GLOBAL_USER_TREE_HEIGHT,
-        N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
-        false,
-    )?;
-    Ok(PsyPreparedRealmBlockStateUpdates {
-        realm_id: state.realm_id_u64,
-        realm_sub_id: state.realm_sub_id_u64,
-        unique_pending_id: state.processing_unique_pending_id,
-        proc_checkpoint_unique_id: state.processing_proc_checkpoint_unique_id,
-        old_realm_root: guta_gatherer_result.old_realm_root,
-        new_realm_root: guta_gatherer_result.new_realm_root,
-        update_global_user_tree_nodes_ffs: guta_gatherer_result.update_global_user_tree_nodes_ffs,
-        update_user_contract_tree_nodes_ffs: guta_gatherer_result.update_user_contract_tree_nodes_ffs,
-        update_contract_state_tree_nodes_ffs: guta_gatherer_result.update_contract_state_tree_nodes_ffs,
-        update_user_leaves_ffs: guta_gatherer_result.update_user_leaves_ffs,
-        update_contract_state_imt_leaves_ffs: guta_gatherer_result.update_contract_state_imt_leaves_ffs,
-    })
-}
 
 pub async fn generate_realm_output_from_backup_path<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID>,

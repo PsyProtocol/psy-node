@@ -106,7 +106,7 @@ where
                 p2p_validator_user_id: None,
                 p2p_bls_public_keys: None,
                 shared_user_tree,
-                included_proposal_backup: Arc::new(tokio::sync::RwLock::new(None)),
+                included_proposal_updates: Arc::new(tokio::sync::RwLock::new(None)),
 
             },
             guta_join_handle,

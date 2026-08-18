@@ -633,7 +633,25 @@ impl<
                 tree.get_root()
             );
             tree.revert_changes();
-            todo!("Handle revert properly in GUTA end cap gatherer by reading from the previous backup file");
+            {
+                let mut shared = self
+                    .config
+                    .status
+                    .write()
+                    .map_err(|e| anyhow::anyhow!("error writing status {:?}", e))?;
+                shared.should_revert_processing_changes = false;
+            }
+            let reverted_root = tree.get_root();
+            tracing::info!(
+                "Reverted GUTA updates gatherer for pending id {} to committed root {:?}",
+                self.status.gathering_unique_pending_id,
+                reverted_root
+            );
+            publish_gathering_snapshot_if_current(&self.config.status, &self.status, reverted_root);
+            return Ok(RealmGUTAEndCapGathererOutput {
+                db_output: RealmGUTAEndCapGathererOutputDatabase::<N::F, N::QHash>::get_empty(reverted_root),
+                job_ids: vec![],
+            });
         } else {
             tracing::info!(
                 "Committing GUTA updates gatherer changes for pending id {}, finalizing root {:?}",

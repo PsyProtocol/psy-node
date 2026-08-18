@@ -219,14 +219,15 @@ pub fn proposal_from_parts(
 }
 
 /// Encode the proposal body: `u32_le(410) || output || u32_le(proof) || proof
-/// || u32_le(backup) || backup`.
+/// || u32_le(state_updates) || state_updates`.
 ///
 /// `finalizer_output` must be exactly 410 bytes; `finalizer_proof` and
-/// `backup` must not exceed their frozen maxima.
+/// `state_updates` must not exceed their frozen maxima. `state_updates` is
+/// the canonical encoding of `PsyPreparedRealmBlockStateUpdates`.
 pub fn encode_proposal_body(
     finalizer_output: &[u8],
     finalizer_proof: &[u8],
-    backup: &[u8],
+    state_updates: &[u8],
 ) -> ProtocolResult<Vec<u8>> {
     if finalizer_output.len() != MAX_FINALIZER_OUTPUT_BYTES {
         return Err(ProtocolError::InvalidLength {
@@ -242,24 +243,24 @@ pub fn encode_proposal_body(
             max: MAX_FINALIZER_PROOF_BYTES as u64,
         });
     }
-    if backup.len() > MAX_BACKUP_BYTES {
+    if state_updates.len() > MAX_BACKUP_BYTES {
         return Err(ProtocolError::LengthLimit {
-            what: "backup",
-            got: backup.len() as u64,
+            what: "state updates",
+            got: state_updates.len() as u64,
             max: MAX_BACKUP_BYTES as u64,
         });
     }
     let mut body = Vec::with_capacity(
-        3 * 4 + finalizer_output.len() + finalizer_proof.len() + backup.len(),
+        3 * 4 + finalizer_output.len() + finalizer_proof.len() + state_updates.len(),
     );
     write_bytes_u32(&mut body, finalizer_output)?;
     write_bytes_u32(&mut body, finalizer_proof)?;
-    write_bytes_u32(&mut body, backup)?;
+    write_bytes_u32(&mut body, state_updates)?;
     Ok(body)
 }
 
-/// Strictly decode a proposal body into `(output, proof, backup)` with exact
-/// component limits and no trailing bytes.
+/// Strictly decode a proposal body into `(output, proof, state_updates)`
+/// with exact component limits and no trailing bytes.
 pub fn decode_proposal_body(body: &[u8]) -> ProtocolResult<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     decode_exact(body, |reader| {
         let output = reader.read_bytes_u32("finalizer output", MAX_FINALIZER_OUTPUT_BYTES as u32)?;
@@ -271,8 +272,8 @@ pub fn decode_proposal_body(body: &[u8]) -> ProtocolResult<(Vec<u8>, Vec<u8>, Ve
             });
         }
         let proof = reader.read_bytes_u32("finalizer proof", MAX_FINALIZER_PROOF_BYTES as u32)?;
-        let backup = reader.read_bytes_u32("backup", MAX_BACKUP_BYTES as u32)?;
-        Ok((output, proof, backup))
+        let state_updates = reader.read_bytes_u32("state updates", MAX_BACKUP_BYTES as u32)?;
+        Ok((output, proof, state_updates))
     })
 }
 
@@ -1029,23 +1030,23 @@ mod tests {
     fn proposal_body_three_sections() {
         let output = vec![0xAA; MAX_FINALIZER_OUTPUT_BYTES];
         let proof = vec![0xBB; 100];
-        let backup = vec![0xCC; 200];
-        let body = encode_proposal_body(&output, &proof, &backup).unwrap();
+        let state_updates = vec![0xCC; 200];
+        let body = encode_proposal_body(&output, &proof, &state_updates).unwrap();
         assert_eq!(body.len(), 12 + MAX_FINALIZER_OUTPUT_BYTES + 100 + 200);
         assert_eq!(&body[0..4], &(MAX_FINALIZER_OUTPUT_BYTES as u32).to_le_bytes());
         assert_eq!(&body[4..4 + MAX_FINALIZER_OUTPUT_BYTES], output.as_slice());
         assert_eq!(&body[414..418], &100u32.to_le_bytes());
         assert_eq!(&body[418..518], proof.as_slice());
         assert_eq!(&body[518..522], &200u32.to_le_bytes());
-        assert_eq!(&body[522..], backup.as_slice());
+        assert_eq!(&body[522..], state_updates.as_slice());
 
-        let (out2, proof2, backup2) = decode_proposal_body(&body).unwrap();
+        let (out2, proof2, state_updates2) = decode_proposal_body(&body).unwrap();
         assert_eq!(out2, output);
         assert_eq!(proof2, proof);
-        assert_eq!(backup2, backup);
+        assert_eq!(state_updates2, state_updates);
 
-        assert!(encode_proposal_body(&output[..MAX_FINALIZER_OUTPUT_BYTES - 1], &proof, &backup).is_err());
-        assert!(encode_proposal_body(&output, &vec![0u8; MAX_FINALIZER_PROOF_BYTES + 1], &backup).is_err());
+        assert!(encode_proposal_body(&output[..MAX_FINALIZER_OUTPUT_BYTES - 1], &proof, &state_updates).is_err());
+        assert!(encode_proposal_body(&output, &vec![0u8; MAX_FINALIZER_PROOF_BYTES + 1], &state_updates).is_err());
         assert!(encode_proposal_body(&output, &proof, &vec![0u8; MAX_BACKUP_BYTES + 1]).is_err());
         let mut trailing = body;
         trailing.push(0);
