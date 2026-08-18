@@ -149,7 +149,7 @@ struct TableRead {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ColumnKind {
+pub(crate) enum ColumnKind {
     Blob,
     BigInt,
 }
@@ -161,15 +161,15 @@ enum ColumnKind {
 /// per schema family -- copying them into a second list here is precisely the
 /// kind of duplicate that drifts, and the drift would be silent: a stale column
 /// name reads a row that does not exist and reports it absent.
-struct TableShape {
-    value_columns: &'static [(&'static str, ColumnKind)],
+pub(crate) struct TableShape {
+    pub(crate) value_columns: &'static [(&'static str, ColumnKind)],
 }
 
 /// The primary-key column names of a table, partition first, in CQL order.
 ///
 /// The registry declares them as `"name TYPE"` (with a clustering direction
 /// suffix), so the name is the leading token.
-fn key_column_names(table: ScyllaPhysicalTableId) -> Vec<&'static str> {
+pub(crate) fn key_column_names(table: ScyllaPhysicalTableId) -> Vec<&'static str> {
     let shape = physical_descriptor(table).cql_primary_key();
     shape
         .partition
@@ -192,7 +192,7 @@ const NO_VALUE: &[(&str, ColumnKind)] = &[];
 ///
 /// Exhaustive over `ScyllaPhysicalTableId`: a table added to the recorded set
 /// without a shape here fails to compile rather than failing to be read.
-fn table_shape(table: ScyllaPhysicalTableId) -> Option<TableShape> {
+pub(crate) fn table_shape(table: ScyllaPhysicalTableId) -> Option<TableShape> {
     use ScyllaPhysicalTableId as P;
     let shape = match table {
         // Key/id/value: one bigint key, one blob value.
@@ -442,7 +442,7 @@ fn encode_cell(value: CqlValue, kind: ColumnKind) -> Vec<u8> {
 ///
 /// Exhaustive on purpose: a new key domain must state how it is read, and a
 /// domain the Coordinator does not record must say so rather than fall through.
-fn cql_key_values(key: &TypedTableKey) -> Result<Vec<CqlValue>, RowImageError> {
+pub(crate) fn cql_key_values(key: &TypedTableKey) -> Result<Vec<CqlValue>, RowImageError> {
     use TypedTableKey as K;
     let values = match key {
         K::CheckpointLeaf(checkpoint)
