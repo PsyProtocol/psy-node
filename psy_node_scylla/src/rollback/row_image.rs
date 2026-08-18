@@ -223,6 +223,17 @@ pub(crate) fn table_shape(table: ScyllaPhysicalTableId) -> Option<TableShape> {
         P::ContractFunctionTree => TableShape {
             value_columns: BLOB_VALUE,
         },
+        // Two value columns, and the reason the reader had to stop assuming one.
+        // Keyed by unique_pending_id with no version axis: the discarded range's
+        // partitions become orphans that nothing reads, because pending ids are
+        // never reused (§7.1), but §2.4 deletes them with the suffix rather than
+        // leaving an asynchronous GC tail.
+        P::GutaRewardTagTree => TableShape {
+            value_columns: &[
+                ("node_value", ColumnKind::Blob),
+                ("node_tag", ColumnKind::Blob),
+            ],
+        },
         // Entirely primary key: the row is its own content.
         P::PublicKeyHashToUserIds => TableShape {
             value_columns: NO_VALUE,
@@ -441,27 +452,45 @@ impl ScyllaRowImageReader {
         }
 
         // One (value, WRITETIME) pair per regular column, in schema order, plus
-        // the version an as-of read landed on.
-        let (raw, write_time_us, resolved_checkpoint) = if wants_version {
-            let mut iter = rows.rows::<(Option<CqlValue>, Option<i64>, i64)>()?;
-            let Some(row) = iter.next().transpose()? else {
-                return Ok(None);
-            };
-            (row.0, row.1, Some(row.2 as u64))
-        } else {
-            let mut iter = rows.rows::<(Option<CqlValue>, Option<i64>)>()?;
-            let Some(row) = iter.next().transpose()? else {
-                return Ok(None);
-            };
-            (row.0, row.1, None)
+        // the version an as-of read landed on.  Decoded positionally rather than
+        // by tuple arity, because tables differ in column count -- the reward tag
+        // tree carries two, the IMT leaf five -- and a fixed shape here would
+        // read a two-column row as a one-column one and drop the rest silently.
+        let mut columns = Vec::with_capacity(read.columns.len());
+        let mut resolved_checkpoint = None;
+
+        let cells = match rows.rows::<scylla::value::Row>()?.next().transpose()? {
+            Some(row) => row.columns,
+            None => return Ok(None),
         };
-        let (name, kind) = read.columns[0];
-        Ok(Some(RowImage {
-            columns: vec![RowColumn {
+        let expected = read.columns.len() * 2 + usize::from(wants_version);
+        if cells.len() < expected {
+            anyhow::bail!(
+                "read {} cells for a row declaring {} regular columns; the projection and the \
+                 shape table disagree",
+                cells.len(),
+                read.columns.len()
+            );
+        }
+        for (index, (name, kind)) in read.columns.iter().copied().enumerate() {
+            let value = cells[index * 2].clone();
+            let write_time_us = match &cells[index * 2 + 1] {
+                Some(CqlValue::BigInt(number)) => Some(*number),
+                _ => None,
+            };
+            columns.push(RowColumn {
                 name,
-                value: raw.map(|value| encode_cell(value, kind)),
+                value: value.map(|value| encode_cell(value, kind)),
                 write_time_us,
-            }],
+            });
+        }
+        if wants_version {
+            if let Some(CqlValue::BigInt(height)) = &cells[read.columns.len() * 2] {
+                resolved_checkpoint = Some(*height as u64);
+            }
+        }
+        Ok(Some(RowImage {
+            columns,
             resolved_checkpoint,
         }))
     }
@@ -534,6 +563,11 @@ pub(crate) fn cql_key_values(key: &TypedTableKey) -> Result<Vec<CqlValue>, RowIm
             CqlValue::BigInt(node.index().get() as i64),
             CqlValue::BigInt(checkpoint.get() as i64),
         ],
+        K::RewardTagMerkle { pending, node } => vec![
+            CqlValue::BigInt(pending.get() as i64),
+            CqlValue::TinyInt(node.level() as i8),
+            CqlValue::BigInt(node.index().get() as i64),
+        ],
         K::PublicKeyToUser { public_key_hash, user } => vec![
             CqlValue::Blob(public_key_hash.as_bytes().to_vec()),
             CqlValue::BigInt(user.get() as i64),
@@ -550,7 +584,6 @@ pub(crate) fn cql_key_values(key: &TypedTableKey) -> Result<Vec<CqlValue>, RowIm
         | K::ProcToPending(_)
         | K::UserContractMerkle { .. }
         | K::ContractStateMerkle { .. }
-        | K::RewardTagMerkle { .. }
         | K::ImtLeaf { .. }
         | K::ImtKeyIndex { .. }
         | K::ImtCursor { .. } => {
@@ -648,6 +681,7 @@ mod tests {
                 public_key_hash: PublicKeyHash::new(vec![7; 33]),
                 user: UserId::new(5),
             },
+            TypedTableKey::RewardTagMerkle { pending, node },
         ]
     }
 
@@ -702,6 +736,7 @@ mod tests {
             P::ContractStateTreeHeight, P::RealmRewardsTreeNodeKey,
             P::GlobalUserTree, P::GlobalContractTree, P::GlobalCheckpointTree,
             P::UserRegistrationTree, P::ContractFunctionTree, P::PublicKeyHashToUserIds,
+            P::GutaRewardTagTree,
         ] {
             assert!(
                 table_shape(table).is_some(),

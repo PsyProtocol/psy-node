@@ -168,6 +168,29 @@ async fn a_rollback_restores_exactly_what_was_observed_before() -> anyhow::Resul
     // The chain reference the plan starts from.  Read from the committed head
     // rather than constructed, so the plan walks the manifests the chain really
     // wrote.
+    // Read the pending ids the discarded range used before the rollback removes
+    // the mapping rows, so the sweep can be checked afterwards.
+    let mut discarded_pending: Vec<u64> = Vec::new();
+    for checkpoint in (target + 1)..=head {
+        if let Some((value,)) = session
+            .query_unpaged(
+                format!(
+                    "SELECT value FROM {keyspace}.checkpoint_id_to_pending_id_table WHERE obj_id = ?"
+                ),
+                (checkpoint as i64,),
+            )
+            .await?
+            .into_rows_result()?
+            .maybe_first_row::<(i64,)>()?
+        {
+            discarded_pending.push(value as u64);
+        }
+    }
+    assert!(
+        !discarded_pending.is_empty(),
+        "the discarded range has no pending mappings, so the orphan sweep would prove nothing"
+    );
+
     let control = control_plane(session.clone(), &keyspace, &no_tablet).await?;
     let recording: CoordinatorCommitRecording<PHash> = control.recording::<PHash>();
     let head_ref = read_head_chain_ref(&control).await?;
@@ -213,6 +236,36 @@ async fn a_rollback_restores_exactly_what_was_observed_before() -> anyhow::Resul
         "G-W failed for {} of {checked} keys:\n{}",
         mismatches.len(),
         mismatches.join("\n")
+    );
+
+    // The orphaned reward-tag partitions are gone.  They are keyed by pending id
+    // with no version axis, so nothing in the manifest names them and a rollback
+    // that only replayed the manifest would leave them behind -- a leak rather
+    // than a ghost, since pending ids are never reused, but §2.4 closes it with
+    // the suffix instead of leaving an asynchronous GC tail.
+    let mut orphan_rows = 0i64;
+    for pending in &discarded_pending {
+        orphan_rows += session
+            .query_unpaged(
+                format!(
+                    "SELECT count(*) FROM {keyspace}.guta_reward_tag_tree_table \
+                     WHERE unique_pending_id = ?"
+                ),
+                (*pending as i64,),
+            )
+            .await?
+            .into_rows_result()?
+            .first_row::<(i64,)>()?
+            .0;
+    }
+    assert_eq!(
+        orphan_rows, 0,
+        "the discarded range's reward-tag partitions still hold {orphan_rows} rows"
+    );
+    println!(
+        "swept {} orphan reward-tag rows across {} pending ids",
+        report.orphan_reward_rows,
+        discarded_pending.len()
     );
 
     // The head singleton really moved back.

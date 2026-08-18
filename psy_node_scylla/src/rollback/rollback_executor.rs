@@ -35,9 +35,11 @@ use psy_node_core::store::rollback_control::{
 };
 use psy_node_core::store::timestamp::{CommitWriteTimestampUs, TimestampFenceWindow};
 
+use psy_node_core::store::typed::{MerkleNode, NodeIndex, TypedTableKey, UniquePendingId};
+
 use super::{
     ArchiveOutcome, ScyllaDeleteExecutor, ScyllaRollbackArchive, decode_locator_chunk,
-    fence_from_archive,
+    describe_existing_key, fence_from_archive,
 };
 
 /// What one rollback did.
@@ -48,6 +50,8 @@ pub struct RollbackReport {
     pub planned_rows: usize,
     pub archived_rows: usize,
     pub deleted_rows: usize,
+    /// Rows removed from the orphaned reward-tag partitions.
+    pub orphan_reward_rows: usize,
     pub fence_us: i64,
     pub restored_singletons: usize,
 }
@@ -380,7 +384,11 @@ impl ScyllaRollbackExecutor {
         stored = self
             .advance(recording, CanonicalHeadTransition::begin_rollback_delete(stored)?)
             .await?;
+        let discarded_pending = self.read_discarded_pending_ids(&plan).await?;
         let deleted_rows = self.delete(&plan, fence).await?;
+        let orphan_reward_rows = self
+            .sweep_orphan_reward_tags(plan_id, target, &discarded_pending, fence)
+            .await?;
 
         stored = self
             .advance(recording, CanonicalHeadTransition::begin_rollback_restore(stored)?)
@@ -416,9 +424,123 @@ impl ScyllaRollbackExecutor {
             planned_rows,
             archived_rows,
             deleted_rows,
+            orphan_reward_rows,
             fence_us: fence.as_i64(),
             restored_singletons,
         })
+    }
+
+    /// Archive and remove the reward-tag partitions the discarded range opened.
+    ///
+    /// `guta_reward_tag_tree_table` is keyed by `unique_pending_id` and has no
+    /// version axis, so the manifest cannot name its rows the way it names a
+    /// versioned key -- a rollback replaying only the manifest leaves them
+    /// behind.  They are not ghosts: pending ids are never reused (§7.1), so the
+    /// new branch allocates fresh ones and never reads these.  They are a leak,
+    /// and §2.4 closes it with the suffix rather than leaving an asynchronous GC
+    /// tail behind a rollback.
+    ///
+    /// Archived first, like everything else: D2 admits no exception for rows
+    /// that happen to be unreachable.
+    async fn sweep_orphan_reward_tags(
+        &self,
+        plan_id: &[u8],
+        target: u64,
+        pending_ids: &[u64],
+        fence: DeleteFenceTimestampUs,
+    ) -> anyhow::Result<usize> {
+        let mut swept = 0usize;
+        for pending in pending_ids.iter().copied() {
+            // Enumerate the partition rather than assume its shape: the tree's
+            // height and fill depend on the checkpoint that produced it.
+            let nodes = self
+                .session
+                .query_unpaged(
+                    format!(
+                        "SELECT level, node_index FROM {}.guta_reward_tag_tree_table \
+                         WHERE unique_pending_id = ?",
+                        self.state_keyspace
+                    ),
+                    (pending as i64,),
+                )
+                .await?
+                .into_rows_result()?
+                .rows::<(i8, i64)>()?
+                .collect::<Result<Vec<_>, _>>()?;
+            if nodes.is_empty() {
+                continue;
+            }
+
+            for (level, index) in &nodes {
+                let key = TypedTableKey::RewardTagMerkle {
+                    pending: UniquePendingId::try_new(pending)?,
+                    node: MerkleNode::new(*level as u8, NodeIndex::new(*index as u64)),
+                };
+                let resolved = describe_existing_key(&key);
+                match self
+                    .archive
+                    .archive_row(
+                        plan_id,
+                        target,
+                        resolved.physical_table().stable_id(),
+                        resolved.locator_bytes(),
+                    )
+                    .await?
+                {
+                    ArchiveOutcome::Archived | ArchiveOutcome::AlreadyIdentical => {}
+                    ArchiveOutcome::Conflict => anyhow::bail!(
+                        "an orphaned reward-tag row for pending {pending} is already archived \
+                         with different content under this plan"
+                    ),
+                }
+            }
+
+            // One partition delete rather than one per node: the whole partition
+            // is orphaned and the fence covers every cell in it.
+            self.session
+                .query_unpaged(
+                    format!(
+                        "DELETE FROM {}.guta_reward_tag_tree_table USING TIMESTAMP ? \
+                         WHERE unique_pending_id = ?",
+                        self.state_keyspace
+                    ),
+                    (fence.as_i64(), pending as i64),
+                )
+                .await?;
+            swept += nodes.len();
+        }
+        Ok(swept)
+    }
+
+    /// The pending ids the discarded checkpoints used.
+    ///
+    /// Read before the mapping rows are deleted, because they are part of the
+    /// plan and will be gone by the time the sweep runs.
+    async fn read_discarded_pending_ids<Hash: Q256BitHash>(
+        &self,
+        plan: &RollbackPlan<Hash>,
+    ) -> anyhow::Result<Vec<u64>> {
+        let mut pending = Vec::new();
+        for checkpoint in &plan.checkpoints {
+            let mapped = self
+                .session
+                .query_unpaged(
+                    format!(
+                        "SELECT value FROM {}.checkpoint_id_to_pending_id_table WHERE obj_id = ?",
+                        self.state_keyspace
+                    ),
+                    (checkpoint.checkpoint_id() as i64,),
+                )
+                .await?
+                .into_rows_result()?
+                .maybe_first_row::<(i64,)>()?;
+            if let Some((value,)) = mapped {
+                pending.push(value as u64);
+            }
+        }
+        pending.sort_unstable();
+        pending.dedup();
+        Ok(pending)
     }
 
     async fn lift_allocator<Hash: Q256BitHash>(
