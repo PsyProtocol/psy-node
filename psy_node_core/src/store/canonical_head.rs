@@ -251,6 +251,7 @@ impl<Hash: Q256BitHash> CanonicalHeadBootstrap<Hash> {
 pub enum CanonicalHeadTransitionKind {
     NormalCheckpointAdvance,
     StartRollback,
+    BeginRollbackFreeze,
     BeginRollbackArchive,
     CompleteRollbackArchiveBarrier,
     BeginRollbackDelete,
@@ -340,16 +341,63 @@ impl<Hash: Q256BitHash> CanonicalHeadTransition<Hash> {
         })
     }
 
-    /// Enter the archive-copy phase without changing checkpoint, epoch, plan,
-    /// or fence.  This remains pre-PONR and grants no archive or delete write
-    /// capability; it only makes the durable maintenance phase explicit.
-    pub fn begin_rollback_archive(
+    /// Enter the freeze phase: every participant stops producing new side
+    /// effects and drains what is in flight, so that the old head stops moving.
+    ///
+    /// Archiving is only meaningful against a head that has settled.  A copy
+    /// taken while the head is still advancing is a state the chain was never
+    /// in, and nothing downstream can tell -- the archive verifies against
+    /// itself, the ranges line up, and the corruption only appears when someone
+    /// restores from it.
+    pub fn begin_rollback_freeze(
         expected: StoredCanonicalHead<Hash>,
     ) -> Result<Self, CanonicalHeadModelError> {
         let request = match expected.rollback_control() {
             RollbackControlState::Requested(request) => *request,
             RollbackControlState::Idle => {
                 return Err(CanonicalHeadModelError::RollbackNotRequested);
+            }
+            RollbackControlState::Frozen(_)
+            | RollbackControlState::Archiving(_)
+            | RollbackControlState::ArchiveBarrierReady(_)
+            | RollbackControlState::Deleting(_)
+            | RollbackControlState::Restoring(_)
+            | RollbackControlState::Verifying(_)
+            | RollbackControlState::AllRealmsReady(_)
+            | RollbackControlState::Aborting(_) => {
+                return Err(CanonicalHeadModelError::RollbackFreezeAlreadyStarted);
+            }
+        };
+        Ok(Self {
+            kind: CanonicalHeadTransitionKind::BeginRollbackFreeze,
+            expected,
+            candidate: StoredCanonicalHead {
+                revision: expected.revision.checked_next()?,
+                canonical_ref: *expected.canonical_ref(),
+                rollback_control: RollbackControlState::Frozen(request),
+            },
+        })
+    }
+
+    /// Enter the archive-copy phase without changing checkpoint, epoch, plan,
+    /// or fence.  This remains pre-PONR and grants no archive or delete write
+    /// capability; it only makes the durable maintenance phase explicit.
+    ///
+    /// Takes the sealed freeze barrier by value: the copy may not begin until
+    /// every participant has reported the old head settled.  Of the three
+    /// barriers this is the one whose breach is hardest to see, because it
+    /// produces a well-formed archive of a state that never existed.
+    pub fn begin_rollback_archive(
+        expected: StoredCanonicalHead<Hash>,
+        barrier: super::rollback_participants::SealedFreezeBarrier,
+    ) -> Result<Self, CanonicalHeadModelError> {
+        let request = match expected.rollback_control() {
+            RollbackControlState::Frozen(request) => *request,
+            RollbackControlState::Idle => {
+                return Err(CanonicalHeadModelError::RollbackNotRequested);
+            }
+            RollbackControlState::Requested(_) => {
+                return Err(CanonicalHeadModelError::RollbackFreezeNotActive);
             }
             RollbackControlState::Archiving(_)
             | RollbackControlState::ArchiveBarrierReady(_)
@@ -361,6 +409,12 @@ impl<Hash: Q256BitHash> CanonicalHeadTransition<Hash> {
                 return Err(CanonicalHeadModelError::RollbackArchiveAlreadyStarted);
             }
         };
+        if barrier.head() != request.requested_head().checkpoint_id().get() {
+            return Err(CanonicalHeadModelError::FreezeBarrierHeadMismatch {
+                barrier: barrier.head(),
+                request: request.requested_head().checkpoint_id().get(),
+            });
+        }
         Ok(Self {
             kind: CanonicalHeadTransitionKind::BeginRollbackArchive,
             expected,
@@ -546,6 +600,7 @@ impl<Hash: Q256BitHash> CanonicalHeadTransition<Hash> {
     ) -> Result<Self, CanonicalHeadModelError> {
         let request = match expected.rollback_control() {
             RollbackControlState::Requested(request)
+            | RollbackControlState::Frozen(request)
             | RollbackControlState::Archiving(request)
             | RollbackControlState::ArchiveBarrierReady(request) => *request,
             RollbackControlState::Deleting(_)
@@ -911,6 +966,11 @@ pub enum CanonicalHeadModelError {
     /// The sealed publish barrier verified a different target than this
     /// rollback is restoring to.
     PublishBarrierTargetMismatch { barrier: u64, request: u64 },
+    /// The sealed freeze barrier froze a different head than this rollback
+    /// discards from.
+    FreezeBarrierHeadMismatch { barrier: u64, request: u64 },
+    RollbackFreezeAlreadyStarted,
+    RollbackFreezeNotActive,
     RevisionOutOfCqlRange(u64),
     NegativeRevision(i64),
     RevisionOverflow(u64),
@@ -953,6 +1013,20 @@ pub enum CanonicalHeadModelError {
 impl fmt::Display for CanonicalHeadModelError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::FreezeBarrierHeadMismatch { barrier, request } => write!(
+                formatter,
+                "the sealed freeze barrier froze head {barrier} but this rollback discards \
+                 from head {request}; archiving needs the head it is about to copy to be \
+                 the one that stopped moving"
+            ),
+            Self::RollbackFreezeAlreadyStarted => write!(
+                formatter,
+                "the rollback freeze phase has already been entered"
+            ),
+            Self::RollbackFreezeNotActive => write!(
+                formatter,
+                "archiving needs the rollback to be frozen first; the old head is still moving"
+            ),
             Self::PublishBarrierTargetMismatch { barrier, request } => write!(
                 formatter,
                 "the sealed publish barrier verified target {barrier} but this rollback \
@@ -1107,6 +1181,39 @@ impl From<RollbackControlCodecError> for CanonicalHeadModelError {
 
 #[cfg(test)]
 mod tests {
+    /// Take a requested head through the freeze phase, the way the executor
+    /// does, so that archive tests start from a settled head.
+    fn frozen<Hash: super::Q256BitHash>(
+        requested: &super::StoredCanonicalHead<Hash>,
+    ) -> super::StoredCanonicalHead<Hash> {
+        *CanonicalHeadTransition::begin_rollback_freeze(*requested)
+            .expect("a requested rollback can freeze")
+            .candidate()
+    }
+
+    /// A sealed freeze barrier for the request a head is carrying.
+    fn freeze_barrier_for<Hash: super::Q256BitHash>(
+        head: &super::StoredCanonicalHead<Hash>,
+    ) -> crate::store::rollback_participants::SealedFreezeBarrier {
+        use crate::store::rollback_participants::{
+            FreezeBarrier, FreezeReceipt, RollbackParticipant, RollbackParticipantSet,
+        };
+        let request = head
+            .rollback_control()
+            .requested()
+            .expect("a barrier is only sealed while a rollback is active");
+        let head_height = request.requested_head().checkpoint_id().get();
+        let coordinator = RollbackParticipant::new(
+            psy_data::protocol::chain_context::AuthorityScope::Coordinator,
+        );
+        let set = RollbackParticipantSet::try_new([coordinator]).expect("valid set");
+        let mut barrier = FreezeBarrier::new(set, head_height);
+        barrier
+            .file(FreezeReceipt::new(coordinator, head_height, [5u8; 32]))
+            .expect("valid receipt");
+        barrier.seal().expect("met")
+    }
+
     /// A sealed publish barrier for the request a head is carrying.
     fn publish_barrier_for<Hash: super::Q256BitHash>(
         head: &super::StoredCanonicalHead<Hash>,
@@ -1429,8 +1536,10 @@ mod tests {
         let request = rollback_request(*head.checkpoint(), target);
         let requested = CanonicalHeadTransition::start_rollback(expected, request)
             .unwrap();
+        let frozen_head = frozen(requested.candidate());
         let archiving = CanonicalHeadTransition::begin_rollback_archive(
-            *requested.candidate(),
+            frozen_head,
+            freeze_barrier_for(&frozen_head),
         )
         .unwrap();
 
@@ -1438,8 +1547,14 @@ mod tests {
             archiving.kind(),
             CanonicalHeadTransitionKind::BeginRollbackArchive
         );
+        // Freeze is its own durable step, so archiving is two revisions past
+        // the request rather than one.
         assert_eq!(
             archiving.candidate().revision().get(),
+            frozen_head.revision().get() + 1
+        );
+        assert_eq!(
+            frozen_head.revision().get(),
             requested.candidate().revision().get() + 1
         );
         assert_eq!(
@@ -1460,14 +1575,76 @@ mod tests {
             Some(&request)
         );
         assert_eq!(
-            CanonicalHeadTransition::begin_rollback_archive(expected),
+            CanonicalHeadTransition::begin_rollback_archive(
+                expected,
+                freeze_barrier_for(&frozen_head),
+            ),
             Err(CanonicalHeadModelError::RollbackNotRequested)
         );
         assert_eq!(
             CanonicalHeadTransition::begin_rollback_archive(
-                *archiving.candidate()
+                *archiving.candidate(),
+                freeze_barrier_for(&frozen_head),
             ),
             Err(CanonicalHeadModelError::RollbackArchiveAlreadyStarted)
+        );
+    }
+
+    #[test]
+    fn archiving_a_head_that_never_froze_is_refused() {
+        // The freeze barrier is the one whose breach produces a well-formed
+        // archive of a state that never existed, so the phase machine refuses
+        // to skip it rather than trusting the caller to have waited.
+        let head = canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 10, 50);
+        let target = *canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 7, 40)
+            .checkpoint();
+        let request = rollback_request(*head.checkpoint(), target);
+        let requested = CanonicalHeadTransition::start_rollback(
+            stored_for_test(head),
+            request,
+        )
+        .unwrap();
+        let frozen_head = frozen(requested.candidate());
+        assert_eq!(
+            CanonicalHeadTransition::begin_rollback_archive(
+                *requested.candidate(),
+                freeze_barrier_for(&frozen_head),
+            ),
+            Err(CanonicalHeadModelError::RollbackFreezeNotActive)
+        );
+    }
+
+    #[test]
+    fn a_freeze_barrier_for_another_head_does_not_admit_archiving() {
+        let head = canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 10, 50);
+        let target = *canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 7, 40)
+            .checkpoint();
+        let request = rollback_request(*head.checkpoint(), target);
+        let frozen_head = frozen(
+            CanonicalHeadTransition::start_rollback(stored_for_test(head), request)
+                .unwrap()
+                .candidate(),
+        );
+
+        let other = canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 11, 60);
+        let other_frozen = frozen(
+            CanonicalHeadTransition::start_rollback(
+                stored_for_test(other),
+                rollback_request(*other.checkpoint(), target),
+            )
+            .unwrap()
+            .candidate(),
+        );
+
+        assert_eq!(
+            CanonicalHeadTransition::begin_rollback_archive(
+                frozen_head,
+                freeze_barrier_for(&other_frozen),
+            ),
+            Err(CanonicalHeadModelError::FreezeBarrierHeadMismatch {
+                barrier: 11,
+                request: 10,
+            })
         );
     }
 
@@ -1482,8 +1659,10 @@ mod tests {
             request,
         )
         .unwrap();
+        let frozen_head = frozen(requested.candidate());
         let archiving = CanonicalHeadTransition::begin_rollback_archive(
-            *requested.candidate(),
+            frozen_head,
+            freeze_barrier_for(&frozen_head),
         )
         .unwrap();
         let barrier = CanonicalHeadTransition::complete_rollback_archive_barrier(
@@ -1586,8 +1765,10 @@ mod tests {
             request,
         )
         .unwrap();
+        let frozen_head = frozen(requested.candidate());
         let archiving = CanonicalHeadTransition::begin_rollback_archive(
-            *requested.candidate(),
+            frozen_head,
+            freeze_barrier_for(&frozen_head),
         )
         .unwrap();
         let barrier = CanonicalHeadTransition::complete_rollback_archive_barrier(

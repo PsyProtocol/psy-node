@@ -30,6 +30,11 @@ const PHASE_RESTORING: u8 = 5;
 const PHASE_VERIFYING: u8 = 6;
 const PHASE_ALL_REALMS_READY: u8 = 7;
 const PHASE_ABORTING: u8 = 8;
+// Appended rather than slotted in at 2 where it belongs in the phase order.
+// This byte is written into durable control rows; renumbering the existing
+// phases would silently reinterpret every row already on disk.  The byte is an
+// identity tag, not a rank.
+const PHASE_FROZEN: u8 = 9;
 
 /// Stable operator-selected reason attached to a pre-PONR abort.
 ///
@@ -170,6 +175,10 @@ impl<Hash> RollbackRequest<Hash> {
 pub enum RollbackControlState<Hash> {
     Idle,
     Requested(RollbackRequest<Hash>),
+    /// Every participant has stopped producing new side effects and drained
+    /// what was in flight, so the old head is byte-stable (design-r1 §4.1).
+    /// Archiving a head that is still moving copies a state that never existed.
+    Frozen(RollbackRequest<Hash>),
     Archiving(RollbackRequest<Hash>),
     ArchiveBarrierReady(RollbackRequest<Hash>),
     Deleting(RollbackRequest<Hash>),
@@ -188,6 +197,7 @@ impl<Hash> RollbackControlState<Hash> {
         match self {
             Self::Idle => None,
             Self::Requested(request)
+            | Self::Frozen(request)
             | Self::Archiving(request)
             | Self::ArchiveBarrierReady(request)
             | Self::Deleting(request)
@@ -196,6 +206,10 @@ impl<Hash> RollbackControlState<Hash> {
             | Self::AllRealmsReady(request) => Some(request),
             Self::Aborting(abort) => Some(abort.request()),
         }
+    }
+
+    pub const fn is_frozen(&self) -> bool {
+        matches!(self, Self::Frozen(_))
     }
 
     pub const fn is_archiving(&self) -> bool {
@@ -234,6 +248,7 @@ impl<Hash: Q256BitHash> RollbackControlState<Hash> {
                 encoded[10] = CONTROL_KIND_IDLE;
             }
             Self::Requested(request)
+            | Self::Frozen(request)
             | Self::Archiving(request)
             | Self::ArchiveBarrierReady(request)
             | Self::Deleting(request)
@@ -243,6 +258,7 @@ impl<Hash: Q256BitHash> RollbackControlState<Hash> {
                 encoded[10] = CONTROL_KIND_REQUESTED;
                 encoded[11] = match self {
                     Self::Requested(_) => PHASE_REQUESTED,
+                    Self::Frozen(_) => PHASE_FROZEN,
                     Self::Archiving(_) => PHASE_ARCHIVING,
                     Self::ArchiveBarrierReady(_) => PHASE_ARCHIVE_BARRIER_READY,
                     Self::Deleting(_) => PHASE_DELETING,
@@ -335,6 +351,7 @@ impl<Hash: Q256BitHash> RollbackControlState<Hash> {
                 if !matches!(
                     phase,
                     PHASE_REQUESTED
+                        | PHASE_FROZEN
                         | PHASE_ARCHIVING
                         | PHASE_ARCHIVE_BARRIER_READY
                         | PHASE_DELETING
@@ -375,6 +392,7 @@ impl<Hash: Q256BitHash> RollbackControlState<Hash> {
                 if matches!(
                     phase,
                     PHASE_REQUESTED
+                        | PHASE_FROZEN
                         | PHASE_ARCHIVING
                         | PHASE_ARCHIVE_BARRIER_READY
                         | PHASE_ABORTING
@@ -408,6 +426,7 @@ impl<Hash: Q256BitHash> RollbackControlState<Hash> {
                 )?;
                 Ok(match phase {
                     PHASE_REQUESTED => Self::Requested(request),
+                    PHASE_FROZEN => Self::Frozen(request),
                     PHASE_ARCHIVING => Self::Archiving(request),
                     PHASE_ARCHIVE_BARRIER_READY => {
                         Self::ArchiveBarrierReady(request)

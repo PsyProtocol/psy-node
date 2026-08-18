@@ -22,13 +22,14 @@ use psy_node_core::store::rollback_coordination::{
     ObservedRollbackPhase, RollbackParticipantView, phase_from_head_state,
 };
 use psy_node_core::store::rollback_participants::{
-    ArchiveReceipt, RollbackParticipant, VerifyReceipt,
+    ArchiveReceipt, FreezeReceipt, RollbackParticipant, VerifyReceipt,
 };
 use scylla::client::session::Session;
 use scylla::statement::prepared::PreparedStatement;
 
 pub const ROLLBACK_ARCHIVE_RECEIPT_TABLE: &str = "rollback_archive_receipt";
 pub const ROLLBACK_VERIFY_RECEIPT_TABLE: &str = "rollback_verify_receipt";
+pub const ROLLBACK_FREEZE_RECEIPT_TABLE: &str = "rollback_freeze_receipt";
 
 /// Reads the Coordinator's phase and files this participant's receipts.
 pub struct ScyllaRollbackParticipantView {
@@ -38,6 +39,8 @@ pub struct ScyllaRollbackParticipantView {
     read_range: PreparedStatement,
     insert_verify: PreparedStatement,
     read_verify: PreparedStatement,
+    insert_freeze: PreparedStatement,
+    read_freeze: PreparedStatement,
 }
 
 impl ScyllaRollbackParticipantView {
@@ -67,6 +70,20 @@ impl ScyllaRollbackParticipantView {
                         authority_scope BLOB,
                         state_root BLOB,
                         PRIMARY KEY ((network_chain_id, target), authority_scope)
+                    )"
+                ),
+                &[],
+            )
+            .await?;
+        session
+            .query_unpaged(
+                format!(
+                    "CREATE TABLE IF NOT EXISTS {no_tablet_keyspace}.{ROLLBACK_FREEZE_RECEIPT_TABLE} (
+                        network_chain_id BIGINT,
+                        head BIGINT,
+                        authority_scope BLOB,
+                        head_digest BLOB,
+                        PRIMARY KEY ((network_chain_id, head), authority_scope)
                     )"
                 ),
                 &[],
@@ -109,6 +126,20 @@ impl ScyllaRollbackParticipantView {
                  WHERE network_chain_id = ? AND target = ?"
             ))
             .await?;
+        let insert_freeze = session
+            .prepare(format!(
+                "INSERT INTO {no_tablet_keyspace}.{ROLLBACK_FREEZE_RECEIPT_TABLE} \
+                 (network_chain_id, head, authority_scope, head_digest) \
+                 VALUES (?, ?, ?, ?) IF NOT EXISTS"
+            ))
+            .await?;
+        let read_freeze = session
+            .prepare(format!(
+                "SELECT authority_scope, head_digest FROM \
+                 {no_tablet_keyspace}.{ROLLBACK_FREEZE_RECEIPT_TABLE} \
+                 WHERE network_chain_id = ? AND head = ?"
+            ))
+            .await?;
         Ok(Self {
             session,
             head_reader,
@@ -116,6 +147,8 @@ impl ScyllaRollbackParticipantView {
             read_range,
             insert_verify,
             read_verify,
+            insert_freeze,
+            read_freeze,
         })
     }
 }
@@ -240,6 +273,51 @@ impl RollbackParticipantView<PHash> for ScyllaRollbackParticipantView {
                 state_root.copy_from_slice(&root);
             }
             receipts.push(VerifyReceipt::new(participant, target, state_root));
+        }
+        Ok(receipts)
+    }
+
+    async fn file_freeze_receipt(&self, receipt: &FreezeReceipt) -> anyhow::Result<()> {
+        let scope = receipt.participant().scope().to_canonical_bytes().to_vec();
+        self.session
+            .execute_unpaged(
+                &self.insert_freeze,
+                (
+                    0i64,
+                    receipt.head() as i64,
+                    scope,
+                    receipt.head_digest().to_vec(),
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn read_freeze_receipts_for(
+        &self,
+        head: u64,
+        expected: &[RollbackParticipant],
+    ) -> anyhow::Result<Vec<FreezeReceipt>> {
+        let rows = self
+            .session
+            .execute_unpaged(&self.read_freeze, (0i64, head as i64))
+            .await?
+            .into_rows_result()?;
+        let mut receipts = Vec::new();
+        for row in rows.rows::<(Vec<u8>, Vec<u8>)>()? {
+            let (scope_bytes, digest) = row?;
+            let Some(participant) = expected
+                .iter()
+                .copied()
+                .find(|p| p.scope().to_canonical_bytes().as_slice() == scope_bytes.as_slice())
+            else {
+                continue;
+            };
+            let mut head_digest = [0u8; 32];
+            if digest.len() == 32 {
+                head_digest.copy_from_slice(&digest);
+            }
+            receipts.push(FreezeReceipt::new(participant, head, head_digest));
         }
         Ok(receipts)
     }

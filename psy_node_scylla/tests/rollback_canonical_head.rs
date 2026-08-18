@@ -609,7 +609,8 @@ fn normal_publish_and_rollback_admission_compete_on_one_atomic_row() {
                 bootstrap.candidate().canonical_ref().checkpoint()
             );
         }
-        RollbackControlState::Archiving(_)
+        RollbackControlState::Frozen(_)
+        | RollbackControlState::Archiving(_)
         | RollbackControlState::ArchiveBarrierReady(_)
         | RollbackControlState::Deleting(_)
         | RollbackControlState::Restoring(_)

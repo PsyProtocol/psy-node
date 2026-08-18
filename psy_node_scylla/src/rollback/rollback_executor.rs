@@ -40,8 +40,8 @@ use psy_node_core::store::typed::{MerkleNode, NodeIndex, TypedTableKey, UniquePe
 use parth_core::PHash;
 use psy_node_core::store::rollback_coordination::RollbackParticipantView;
 use psy_node_core::store::rollback_participants::{
-    ArchiveBarrier, ArchiveReceipt, PublishBarrier, RollbackParticipant, RollbackParticipantSet,
-    VerifyReceipt,
+    ArchiveBarrier, ArchiveReceipt, FreezeBarrier, FreezeReceipt, PublishBarrier,
+    RollbackParticipant, RollbackParticipantSet, VerifyReceipt,
 };
 
 use super::{
@@ -373,8 +373,56 @@ impl ScyllaRollbackExecutor {
         stored = self
             .advance(recording, CanonicalHeadTransition::start_rollback(stored, request)?)
             .await?;
+        // ---- freeze ----
+        //
+        // Publishing FROZEN is what tells every participant to stop producing
+        // side effects and drain what is in flight (§6.2).  Archiving a head
+        // that is still moving copies a state the chain was never in, and
+        // nothing downstream notices: the archive verifies against itself, the
+        // ranges line up, and the damage only appears at restore time.
         stored = self
-            .advance(recording, CanonicalHeadTransition::begin_rollback_archive(stored)?)
+            .advance(recording, CanonicalHeadTransition::begin_rollback_freeze(stored)?)
+            .await?;
+
+        let head_digest = head
+            .checkpoint()
+            .checkpoint_hash()
+            .as_inner()
+            .into_owned_32bytes();
+        let mut freeze = FreezeBarrier::new(participants.clone(), plan.head);
+        // The Coordinator's own evidence is a re-read, not an assumption.  If
+        // it were still producing blocks the published head would have moved
+        // past the one this rollback names, and this is where that shows.
+        let observed = self.read_head(recording, head).await?;
+        if observed.canonical_ref().checkpoint() != head.checkpoint() {
+            anyhow::bail!(
+                "the canonical head moved to {} while freezing for a rollback from {}; \
+                 the Coordinator is still producing and the archive would copy a state \
+                 that never existed",
+                observed.canonical_ref().checkpoint().checkpoint_id().get(),
+                plan.head,
+            );
+        }
+        freeze.file(FreezeReceipt::new(
+            RollbackParticipant::new(AuthorityScope::Coordinator),
+            plan.head,
+            head_digest,
+        ))?;
+        if let Some(view) = receipts {
+            for receipt in view
+                .read_freeze_receipts_for(plan.head, participants.participants())
+                .await?
+            {
+                freeze.file(receipt)?;
+            }
+        }
+        let sealed_freeze = freeze.seal()?;
+
+        stored = self
+            .advance(
+                recording,
+                CanonicalHeadTransition::begin_rollback_archive(stored, sealed_freeze)?,
+            )
             .await?;
 
         let archived_rows = self.archive(plan_id, &plan).await?;

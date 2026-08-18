@@ -355,6 +355,134 @@ impl ArchiveBarrier {
     }
 }
 
+/// What one participant proved about the head it froze.
+///
+/// Carries the head's digest, not just its height, because "I stopped" is not
+/// the claim that matters -- the claim is that the old head is byte-stable and
+/// will still be byte-identical when it is archived.  A participant that is
+/// still draining reports a digest that changes between two reads of the same
+/// height, and its own idempotence check then rejects the second receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FreezeReceipt {
+    participant: RollbackParticipant,
+    head: u64,
+    head_digest: [u8; 32],
+}
+
+impl FreezeReceipt {
+    pub const fn new(
+        participant: RollbackParticipant,
+        head: u64,
+        head_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            participant,
+            head,
+            head_digest,
+        }
+    }
+
+    pub const fn participant(&self) -> RollbackParticipant {
+        self.participant
+    }
+
+    pub const fn head(&self) -> u64 {
+        self.head
+    }
+
+    pub const fn head_digest(&self) -> [u8; 32] {
+        self.head_digest
+    }
+}
+
+/// Collects freeze receipts and decides whether the freeze barrier is met.
+///
+/// This is the cheapest of the three barriers to cross correctly and the most
+/// expensive to skip.  Crossing it early does not corrupt anything by itself;
+/// it corrupts the *archive*, by copying a head that was still moving.  The
+/// damage then surfaces one phase later, at the point of no return, wearing the
+/// archive barrier's clothes: every receipt present, every range correct, and
+/// the contents describing a state the chain was never in.
+#[derive(Clone, Debug)]
+pub struct FreezeBarrier {
+    participants: RollbackParticipantSet,
+    head: u64,
+    receipts: BTreeMap<RollbackParticipant, FreezeReceipt>,
+}
+
+impl FreezeBarrier {
+    pub fn new(participants: RollbackParticipantSet, head: u64) -> Self {
+        Self {
+            participants,
+            head,
+            receipts: BTreeMap::new(),
+        }
+    }
+
+    pub fn file(&mut self, receipt: FreezeReceipt) -> Result<(), BarrierError> {
+        let participant = receipt.participant();
+        if !self.participants.contains(participant) {
+            return Err(BarrierError::NotAParticipant(participant));
+        }
+        if receipt.head() != self.head {
+            return Err(BarrierError::RangeMismatch {
+                participant,
+                expected: (self.head, self.head),
+                found: (receipt.head(), receipt.head()),
+            });
+        }
+        match self.receipts.get(&participant) {
+            Some(existing) if *existing == receipt => Ok(()),
+            Some(_) => Err(BarrierError::ConflictingReceipt(participant)),
+            None => {
+                self.receipts.insert(participant, receipt);
+                Ok(())
+            }
+        }
+    }
+
+    pub fn missing(&self) -> Vec<RollbackParticipant> {
+        self.participants
+            .participants()
+            .iter()
+            .copied()
+            .filter(|participant| !self.receipts.contains_key(participant))
+            .collect()
+    }
+
+    pub fn is_met(&self) -> bool {
+        self.missing().is_empty()
+    }
+
+    pub fn seal(&self) -> Result<SealedFreezeBarrier, BarrierError> {
+        let missing = self.missing();
+        if !missing.is_empty() {
+            return Err(BarrierError::Missing(missing));
+        }
+        Ok(SealedFreezeBarrier {
+            head: self.head,
+            participant_count: self.participants.len(),
+        })
+    }
+}
+
+/// Evidence that every participant froze the old head.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SealedFreezeBarrier {
+    head: u64,
+    participant_count: usize,
+}
+
+impl SealedFreezeBarrier {
+    pub const fn head(&self) -> u64 {
+        self.head
+    }
+
+    pub const fn participant_count(&self) -> usize {
+        self.participant_count
+    }
+}
+
 /// What one participant proved about its restored state.
 ///
 /// Filed after RESTORING, read at the publish barrier.  Carries the target's
@@ -593,6 +721,53 @@ mod tests {
             barrier.file(ArchiveReceipt::new(coordinator(), 100, 110, 11, [7u8; 32])),
             Err(BarrierError::ConflictingReceipt(_))
         ));
+    }
+
+    #[test]
+    fn archiving_waits_for_every_participant_to_freeze() {
+        let set = RollbackParticipantSet::try_new([coordinator(), realm(0)]).unwrap();
+        let mut barrier = FreezeBarrier::new(set, 100);
+        barrier
+            .file(FreezeReceipt::new(coordinator(), 100, [7u8; 32]))
+            .unwrap();
+        assert_eq!(barrier.missing(), vec![realm(0)]);
+        assert!(barrier.seal().is_err());
+
+        // A Realm's own head digest differs from the Coordinator's; what has to
+        // agree is the height they froze at, not what they hold there.
+        barrier
+            .file(FreezeReceipt::new(realm(0), 100, [8u8; 32]))
+            .unwrap();
+        assert_eq!(barrier.seal().unwrap().participant_count(), 2);
+    }
+
+    #[test]
+    fn a_participant_still_draining_cannot_pass_the_freeze_barrier() {
+        // The symptom of an incomplete drain is that the same height hashes
+        // differently on a second look.  Reporting twice is how a participant
+        // shows it settled; two different digests say it did not.
+        let set = RollbackParticipantSet::try_new([coordinator()]).unwrap();
+        let mut barrier = FreezeBarrier::new(set, 100);
+        barrier
+            .file(FreezeReceipt::new(coordinator(), 100, [7u8; 32]))
+            .unwrap();
+        barrier
+            .file(FreezeReceipt::new(coordinator(), 100, [7u8; 32]))
+            .expect("a settled head reports the same digest twice");
+        assert!(matches!(
+            barrier.file(FreezeReceipt::new(coordinator(), 100, [9u8; 32])),
+            Err(BarrierError::ConflictingReceipt(_))
+        ));
+    }
+
+    #[test]
+    fn freezing_the_wrong_head_does_not_count() {
+        let set = RollbackParticipantSet::try_new([coordinator()]).unwrap();
+        let mut barrier = FreezeBarrier::new(set, 100);
+        assert!(barrier
+            .file(FreezeReceipt::new(coordinator(), 99, [7u8; 32]))
+            .is_err());
+        assert!(!barrier.is_met());
     }
 
     #[test]

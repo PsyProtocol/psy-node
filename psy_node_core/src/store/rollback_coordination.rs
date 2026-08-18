@@ -23,7 +23,9 @@ use psy_data::protocol::canonical_chain::CanonicalChainRef;
 
 use super::canonical_head::CanonicalHeadReadState;
 use super::rollback_control::RollbackControlState;
-use super::rollback_participants::{ArchiveReceipt, RollbackParticipant, VerifyReceipt};
+use super::rollback_participants::{
+    ArchiveReceipt, FreezeReceipt, RollbackParticipant, VerifyReceipt,
+};
 
 /// Where a rollback stands, as a participant sees it.
 ///
@@ -37,6 +39,9 @@ pub enum ObservedRollbackPhase {
     Requested,
     /// Archive your share of the range and file a receipt.
     Archive { target: u64, head: u64 },
+    /// Stop producing new side effects, drain what is in flight, and report the
+    /// head once it stops changing.
+    Freeze { head: u64 },
     /// Every participant archived; the Coordinator has crossed the barrier.
     /// Deleting is now permitted -- and only now.
     Delete { target: u64, head: u64 },
@@ -62,6 +67,9 @@ impl ObservedRollbackPhase {
         match state {
             RollbackControlState::Idle => Self::Idle,
             RollbackControlState::Requested(_) => Self::Requested,
+            RollbackControlState::Frozen(request) => Self::Freeze {
+                head: request.requested_head().checkpoint_id().get(),
+            },
             RollbackControlState::Archiving(request) => Self::Archive {
                 target: request.target().checkpoint_id().get(),
                 head: request.requested_head().checkpoint_id().get(),
@@ -124,6 +132,16 @@ pub trait RollbackParticipantView<Hash: Q256BitHash>: Send + Sync {
         head: u64,
         expected: &[RollbackParticipant],
     ) -> anyhow::Result<Vec<ArchiveReceipt>>;
+
+    /// Record that this participant froze the old head and drained.
+    async fn file_freeze_receipt(&self, receipt: &FreezeReceipt) -> anyhow::Result<()>;
+
+    /// Freeze receipts for one head, resolved against the expected set.
+    async fn read_freeze_receipts_for(
+        &self,
+        head: u64,
+        expected: &[RollbackParticipant],
+    ) -> anyhow::Result<Vec<FreezeReceipt>>;
 
     /// Record that this participant verified the restored target.
     ///
