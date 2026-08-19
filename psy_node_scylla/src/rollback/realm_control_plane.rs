@@ -154,6 +154,16 @@ impl<Hash: Q256BitHash + QHashBase> RealmRollbackControlPlane<Hash> {
                 &coordinator_no_tablet,
             )
             .await?;
+            // The rollback history, created here as well as by the executor.
+            // A Realm reads it to find where a rollback it slept through began,
+            // and on a chain that has never rolled back the executor has never
+            // run -- so without this the Realm prepares a statement against a
+            // table nothing has created yet and dies at startup.
+            super::ScyllaRollbackEventStore::create_table(
+                &store.session,
+                &coordinator_no_tablet,
+            )
+            .await?;
             let head_reader = super::ScyllaCanonicalHeadStore::prepare(
                 store.session.clone(),
                 super::CanonicalHeadNoTabletKeyspace::try_new(&coordinator_no_tablet)?,

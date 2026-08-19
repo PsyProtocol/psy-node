@@ -704,6 +704,22 @@ where
         // 1. Genesis Check
         self.ensure_genesis_applied(genesis_block_update).await?;
 
+        // 1b. Reconcile against any rollback this Realm was not present for.
+        //
+        // Before the recovery check below, not after, and that ordering is the
+        // whole point: the checks below compare this Realm's roots against the
+        // Coordinator's, and after a rollback they disagree *because of* the
+        // rollback.  Run second, they see a Realm that looks corrupt, try to
+        // repair it against a history that no longer exists, and fail -- which
+        // is what killed a Realm holding real transactions the first time a
+        // rollback ran under load.
+        //
+        // Run first, they see a Realm that has already given back everything
+        // above the target, and their comparison is against a state that
+        // matches.
+        self.truncate_if_ahead_of_published_head().await?;
+        self.reconcile_missed_rollback_epochs().await?;
+
         // 2. Recovery Check
         self.ensure_backup_restored_if_necessary(file_system, guta_gatherer_backup_directory, global_user_tree)
             .await?;

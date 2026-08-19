@@ -332,6 +332,33 @@ pub fn apply_phase_to_commit_path(
     }
 }
 
+/// The Coordinator's record of a Realm's root is neither the value the Realm
+/// started from nor the one it is proposing.
+///
+/// A rollback is the expected cause: it moves the Realm root back to what it was
+/// at the target, which is neither end of the transition an in-flight Realm
+/// update is proving.  The Realm cannot see this coming -- it is blocked inside
+/// a wait when the rollback lands, so the phase check at the top of its loop has
+/// already been passed.
+///
+/// Typed so it can be recognised.  It was an `anyhow::bail!` with "CRITICAL" and
+/// "Aborting" in the text, and the Realm holding real transaction state died on
+/// it the first time a rollback ran under load -- the fourth guard in this
+/// design to work correctly and stop a node anyway.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RealmRootMovedUnderUs;
+
+impl std::fmt::Display for RealmRootMovedUnderUs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the Coordinator's record of this Realm's root is neither the value this update \
+             started from nor the one it proposes; a rollback has moved it",
+        )
+    }
+}
+
+impl std::error::Error for RealmRootMovedUnderUs {}
+
 /// Whether a failed commit failed *because* a rollback is running.
 ///
 /// A processor loop cannot check the phase and then commit atomically, so a
@@ -358,6 +385,13 @@ pub fn is_refused_because_rollback(err: &anyhow::Error) -> bool {
     if let Some(CanonicalHeadModelError::NormalAdvanceWhileRollbackActive) =
         err.downcast_ref::<CanonicalHeadModelError>()
     {
+        return true;
+    }
+    // The Realm's counterpart: it was blocked in a wait when the rollback moved
+    // the root out from under the update it was proving.  Abandoning that block
+    // is right; dying is not, because the next iteration re-derives from the
+    // state the rollback left.
+    if err.downcast_ref::<RealmRootMovedUnderUs>().is_some() {
         return true;
     }
 
@@ -545,6 +579,11 @@ mod tests {
         )));
         assert!(is_refused_because_rollback(&anyhow::Error::new(
             super::super::canonical_head::CanonicalHeadModelError::NormalAdvanceWhileRollbackActive
+        )));
+        // The Realm's, which is the only one a node can meet while blocked
+        // inside a wait rather than while committing.
+        assert!(is_refused_because_rollback(&anyhow::Error::new(
+            RealmRootMovedUnderUs
         )));
     }
 

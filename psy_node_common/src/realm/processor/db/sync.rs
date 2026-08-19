@@ -242,12 +242,39 @@ where
     /// A Realm with no transactions in the range does nothing here beyond one
     /// manifest read, which is the ordinary case.
     pub async fn undo_everything_above(&mut self, target: u64) -> anyhow::Result<()> {
+        self.undo_everything_above_bounded(target, None).await
+    }
+
+    /// As above, with an explicit bound on how far the Realm's own manifest is
+    /// searched.
+    ///
+    /// The bound matters more than it looks.  Derived from this Realm's own
+    /// caches it is only right while they are intact, and the recovery paths
+    /// truncate exactly those -- so a reconciliation that truncated first and
+    /// searched second found an empty range and concluded the Realm had nothing
+    /// of its own above the target, for a Realm that had plenty.  The
+    /// Coordinator's published head is not derived from anything this Realm can
+    /// damage, and no Realm commits above it.
+    pub async fn undo_everything_above_bounded(
+        &mut self,
+        target: u64,
+        search_head_height: Option<u64>,
+    ) -> anyhow::Result<()> {
         if let Some(driver) = self.recording.self_rollback() {
-            // The last height this Realm synced bounds how far its own commits
-            // can reach: it never commits at a checkpoint the Coordinator has
-            // not published to it.  Read before the sync reset, which is why
-            // own state is undone first.
-            let search_head = self.coordinator_chain_ref_last_synced();
+            let mut search_head = self.coordinator_chain_ref_last_synced();
+            if let Some(height) = search_head_height {
+                use psy_data::protocol::canonical_chain::{
+                    CanonicalChainRef, CheckpointId, CheckpointRef,
+                };
+                search_head = CanonicalChainRef::new(
+                    search_head.network_id(),
+                    search_head.chain_epoch(),
+                    CheckpointRef::new(
+                        CheckpointId::new(height),
+                        *search_head.checkpoint().checkpoint_hash(),
+                    ),
+                );
+            }
             let report = driver
                 .recover_own_state_to(
                     &self.recording,
@@ -350,6 +377,7 @@ where
             return Ok(());
         };
         let published_epoch = published.chain_epoch().get();
+        let published_now = published.checkpoint().checkpoint_id().get();
         let recorded_epoch = {
             let store = self
                 .recording
@@ -380,7 +408,14 @@ where
             targets.len()
         );
         match lowest {
-            Some(target) => self.undo_everything_above(target).await?,
+            // Bounded by the Coordinator's published head rather than by
+            // anything of this Realm's, because the step that follows truncates
+            // this Realm's caches and a bound taken from them would already be
+            // wrong by the time it was used.
+            Some(target) => {
+                self.undo_everything_above_bounded(target, Some(published_now))
+                    .await?
+            }
             None => {
                 // The epoch moved but no rollback recorded a target for it.
                 // Refusing is the safe direction: the alternative is to carry on
@@ -440,22 +475,34 @@ where
         self.recording.follow_published_phase(&seen).await
     }
 
-    /// The Coordinator coordinate this Realm last actually synced.
+    /// The highest Coordinator checkpoint this Realm has seen.
     ///
-    /// Only the network is read from it by the control-row queries; it is built
-    /// from what this Realm has seen rather than from something it assumed, so
-    /// that a wrong value here can never be mistaken for evidence.
+    /// The higher of the in-memory sync marker and the checkpoint cache, because
+    /// the two are current at different times: at startup the marker is still
+    /// zero and only the cache, loaded from its backup file, knows where the
+    /// Realm had got to.  Taking the marker alone made the reconciliation at
+    /// init search an empty range and conclude there was nothing of its own to
+    /// undo -- for a Realm holding real transactions, the opposite of the truth.
+    ///
+    /// Only the network is read from it by the control-row queries; the height
+    /// bounds how far the Realm's own manifest is searched.  Built from what
+    /// this Realm has seen rather than from something it assumed, so a wrong
+    /// value here can never be mistaken for evidence.
     fn coordinator_chain_ref_last_synced(
         &self,
     ) -> psy_data::protocol::canonical_chain::CanonicalChainRef<N::QHash> {
         use psy_data::protocol::canonical_chain::{
             CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId, CheckpointRef,
         };
+        let seen = self
+            .state
+            .coordinator_head_synced_checkpoint_id
+            .max(self.checkpoint_tree_backup_manager.get_current_checkpoint_id_head());
         CanonicalChainRef::new(
             self.network_id,
             ChainEpoch::new(0),
             CheckpointRef::new(
-                CheckpointId::new(self.state.coordinator_head_synced_checkpoint_id),
+                CheckpointId::new(seen),
                 CheckpointHash::from_last_chain_hash(
                     self.state.coordinator_head_synced_checkpoint_root,
                 ),
@@ -589,10 +636,24 @@ where
                 // Case: The root changed to something else entirely.
                 // This implies a race condition (someone else updated the realm) or a reorg.
                 // Our calculated proof is now invalid. We must abort.
-                anyhow::bail!(
-                    "CRITICAL: Realm state diverged! Expected transition {:?} -> {:?}, but found root {:?} at Checkpoint {}. Aborting.",
-                    old_realm_root, new_realm_root, realm_state.value, realm_state.checkpoint_id
+                // A rollback is the expected cause, and it is not a fault: it
+                // moves the Realm root back to the target's, which is neither
+                // end of the transition this update is proving.  A genuine race
+                // -- two writers for one Realm -- produces the same reading, so
+                // this stays loud; what changed is that it no longer kills the
+                // node, because the next iteration re-derives from whatever the
+                // rollback left.
+                tracing::error!(
+                    "Realm state diverged: expected transition {:?} -> {:?}, found root {:?} at \
+                     checkpoint {}; abandoning this block",
+                    old_realm_root,
+                    new_realm_root,
+                    realm_state.value,
+                    realm_state.checkpoint_id
                 );
+                return Err(anyhow::Error::new(
+                    psy_node_core::store::rollback_coordination::RealmRootMovedUnderUs,
+                ));
             }
         }
     }
