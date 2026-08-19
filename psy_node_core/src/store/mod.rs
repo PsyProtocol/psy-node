@@ -18,6 +18,7 @@ pub mod realm_commit_recording;
 pub mod realm_recording_flow;
 pub mod rollback_control;
 pub mod rollback_coordination;
+pub mod rollback_event;
 pub mod rollback_participants;
 pub mod rollback_plan;
 pub mod timestamp;

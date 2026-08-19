@@ -165,7 +165,13 @@ async fn a_rollback_restores_exactly_what_was_observed_before() -> anyhow::Resul
     println!("{} distinct key positions were touched above the target", witnesses.len());
 
     let executor =
-        ScyllaRollbackExecutor::prepare(session.clone(), &keyspace, &no_tablet).await?;
+        ScyllaRollbackExecutor::prepare(
+            session.clone(),
+            &keyspace,
+            &no_tablet,
+            network().chain_id() as i64,
+        )
+        .await?;
 
     // The chain reference the plan starts from.  Read from the committed head
     // rather than constructed, so the plan walks the manifests the chain really
@@ -213,9 +219,51 @@ async fn a_rollback_restores_exactly_what_was_observed_before() -> anyhow::Resul
             .await?;
         println!("{report:?}");
         assert_eq!(report.target, target);
-        assert_eq!(report.head, head, "the plan must start from the published head");
+        // Against a live chain the head moves between the test reading it and
+        // the executor planning from the manifests, so the plan legitimately
+        // covers more than the test saw.  The dangerous direction is the other
+        // one: a plan starting *below* the published head leaves rows above the
+        // target that nothing will ever delete.
+        assert!(
+            report.head >= head,
+            "the plan must not start below the published head: planned from {} but {head} was \
+             already published",
+            report.head
+        );
         assert_eq!(report.archived_rows, report.planned_rows);
         assert_eq!(report.deleted_rows, report.planned_rows);
+
+        // The audit record has to agree with what actually happened.  A history
+        // that merely exists is worth nothing: the whole reason to keep one is
+        // to be believed later, by someone who was not here and cannot check.
+        let events = executor.rollback_events(1).await?;
+        let recorded = events
+            .first()
+            .expect("a completed rollback leaves a record of itself");
+        assert_eq!(recorded.head(), report.head);
+        assert_eq!(recorded.target(), target);
+        assert_eq!(recorded.discarded_checkpoints(), report.head - target);
+        assert_eq!(
+            recorded.outcome(),
+            psy_node_core::store::rollback_event::RollbackOutcome::Completed {
+                archived_rows: report.archived_rows as u64,
+                deleted_rows: report.deleted_rows as u64,
+            },
+            "the record must say what the rollback did, not what it was asked to do"
+        );
+        assert!(
+            recorded.includes(psy_node_core::store::rollback_participants::RollbackParticipant::new(
+                psy_data::protocol::chain_context::AuthorityScope::Coordinator
+            )),
+            "the Coordinator took part in its own rollback and the record must say so"
+        );
+        assert_eq!(recorded.plan_id(), plan_id.as_slice());
+        println!(
+            "recorded as epoch {} (was {}), {} checkpoints discarded",
+            recorded.chain_epoch(),
+            recorded.previous_epoch(),
+            recorded.discarded_checkpoints()
+        );
     }
 
     // G-W: every key the range touched must now read back as it was observed

@@ -40,6 +40,7 @@ use psy_node_core::store::typed::{MerkleNode, NodeIndex, TypedTableKey, UniquePe
 
 use parth_core::PHash;
 use psy_node_core::store::rollback_coordination::RollbackParticipantView;
+use psy_node_core::store::rollback_event::{RollbackEvent, RollbackEventStore, RollbackOutcome};
 use psy_node_core::store::rollback_participants::{
     ArchiveBarrier, ArchiveReceipt, FreezeBarrier, FreezeReceipt, PublishBarrier,
     RollbackParticipant, RollbackParticipantSet, VerifyReceipt,
@@ -88,6 +89,9 @@ pub struct ScyllaRollbackExecutor {
     state_keyspace: String,
     archive: ScyllaRollbackArchive,
     delete: ScyllaDeleteExecutor,
+    /// The chain's rollback history.  Written twice per rollback and never
+    /// otherwise, which is what keeps the audit trail off the commit path.
+    events: super::ScyllaRollbackEventStore,
 }
 
 impl ScyllaRollbackExecutor {
@@ -95,8 +99,16 @@ impl ScyllaRollbackExecutor {
         session: Arc<Session>,
         state_keyspace: &str,
         no_tablet_keyspace: &str,
+        network_chain_id: i64,
     ) -> anyhow::Result<Self> {
         ScyllaRollbackArchive::create_table(&session, no_tablet_keyspace).await?;
+        super::ScyllaRollbackEventStore::create_table(&session, no_tablet_keyspace).await?;
+        let events = super::ScyllaRollbackEventStore::prepare(
+            session.clone(),
+            no_tablet_keyspace,
+            network_chain_id,
+        )
+        .await?;
         Ok(Self {
             session: session.clone(),
             state_keyspace: state_keyspace.to_string(),
@@ -107,7 +119,20 @@ impl ScyllaRollbackExecutor {
             )
             .await?,
             delete: ScyllaDeleteExecutor::prepare(session, state_keyspace).await?,
+            events,
         })
+    }
+
+    /// This chain's rollback history, newest first.
+    ///
+    /// The read side of the record the executor writes.  Exposed here rather
+    /// than only on the store so that anything holding an executor can check
+    /// what it did, which is what makes the record testable at all.
+    pub async fn rollback_events(
+        &self,
+        limit: i32,
+    ) -> anyhow::Result<Vec<psy_node_core::store::rollback_event::RollbackEvent>> {
+        self.events.read_rollback_events(limit).await
     }
 
     /// Plan the discarded suffix from the manifests alone.
@@ -363,9 +388,28 @@ impl ScyllaRollbackExecutor {
             RollbackPlanDigest::try_new(plan_digest(plan_id))?,
         )?;
 
+        let previous_epoch = stored.canonical_ref().chain_epoch().get();
         stored = self
             .advance(recording, CanonicalHeadTransition::start_rollback(stored, request)?)
             .await?;
+
+        // The audit record goes in here, not at the end.  A rollback that dies
+        // between the archive and the delete leaves the chain in the state
+        // hardest to reason about, and writing only on success would leave that
+        // state with no record that anything had been attempted -- the one case
+        // an audit exists for.  The epoch start_rollback just allocated names
+        // this attempt for the life of the chain.
+        let event = RollbackEvent::try_new(
+            stored.canonical_ref().chain_epoch().get(),
+            previous_epoch,
+            plan.head,
+            target,
+            plan_id.to_vec(),
+            participants.participants(),
+            fence.as_i64(),
+        )?;
+        self.events.record_rollback_requested(&event).await?;
+
         // ---- freeze ----
         //
         // Publishing FROZEN is what tells every participant to stop producing
@@ -536,6 +580,15 @@ impl ScyllaRollbackExecutor {
             )
             .await?;
         self.advance(recording, CanonicalHeadTransition::complete_rollback(stored)?)
+            .await?;
+        self.events
+            .record_rollback_outcome(
+                event.chain_epoch(),
+                RollbackOutcome::Completed {
+                    archived_rows: archived_rows as u64,
+                    deleted_rows: deleted_rows as u64,
+                },
+            )
             .await?;
 
         Ok(RollbackReport {
