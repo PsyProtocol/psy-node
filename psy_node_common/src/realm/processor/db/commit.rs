@@ -293,7 +293,11 @@ where
         // the faucet transaction never landed.
         //
         // The assertion is right; the caller was wrong to bypass the question.
-        let old_root = self.state.last_committed_realm_end_root;
+        // The root this block started from, captured before the commit began.
+        // `last_committed_realm_end_root` is not it: by the time this runs the
+        // sync has already advanced it to the new root, so comparing against it
+        // said "unchanged" for every commit the Realm ever made.
+        let old_root = self.state.processing_realm_start_root;
         let new_root = realm_update.new_realm_root;
         let transition = if old_root == new_root {
             // `Unchanged` names the checkpoint the state is still *at*, so it has

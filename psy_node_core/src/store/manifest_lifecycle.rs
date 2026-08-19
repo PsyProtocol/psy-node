@@ -831,30 +831,42 @@ fn validate_proof_evidence<Hash: Q256BitHash>(
         (AuthorityScope::Coordinator, _, _) => {
             Err(ManifestLifecycleError::CoordinatorProofRequired)
         }
+        // A Realm carries no proof evidence, whether its state changed or not.
+        //
+        // It seals its own manifest and answers for its own state; the
+        // Coordinator neither seals nor validates it.  The extra evidence a
+        // changed Realm used to owe was designed for the other arrangement --
+        // the error it raised said so, that a *Coordinator* must not seal a
+        // Realm manifest it cannot validate -- and it guarded a case that does
+        // not arise.
+        //
+        // What is checked is unchanged and is the part that matters: by this
+        // point `verify_and_seal` has already compared the root observed after
+        // the writes against the one the record claims, the mutation digest
+        // against the rows the manifest names, and the head payload digest.  A
+        // Realm has nothing further it can prove locally.
+        //
+        // This mattered more than it looked.  The requirement was unsatisfiable
+        // -- the evidence type is a reserved placeholder nothing constructs --
+        // so a Realm that genuinely changed state could never seal.  It never
+        // showed because a second defect made every Realm record claim its state
+        // had not changed; the two cancelled out until a crash recovery computed
+        // the roots from an untouched source and met the wall.
         (
             AuthorityScope::Realm { .. },
-            false,
+            _,
             AuthoritySealProofEvidence::Public(
                 AuthorityProofObservation::NotApplicableForRealm,
             ),
         ) => Ok(()),
+        // Still refused, and now for a reason rather than for want of an
+        // implementation: nothing produces it, and a record carrying it would
+        // be claiming an authority this side does not have.
         (
             AuthorityScope::Realm { .. },
-            true,
+            _,
             AuthoritySealProofEvidence::ChangedRealm(_),
         ) => Err(ManifestLifecycleError::ChangedRealmEvidenceNotSupported),
-        (
-            AuthorityScope::Realm { .. },
-            true,
-            AuthoritySealProofEvidence::Public(
-                AuthorityProofObservation::NotApplicableForRealm,
-            ),
-        ) => Err(ManifestLifecycleError::ChangedRealmEvidenceRequired),
-        (
-            AuthorityScope::Realm { .. },
-            false,
-            AuthoritySealProofEvidence::ChangedRealm(_),
-        ) => Err(ManifestLifecycleError::UnchangedRealmEvidenceForbidden),
         (
             AuthorityScope::Realm { .. },
             _,

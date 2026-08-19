@@ -235,6 +235,16 @@ where
         // via commit_processing(). Must happen after the no-jobs early return so that
         // path leaves processing_realm_end_root untouched.
         self.db.state.processing_realm_end_root = guta_update.new_realm_root;
+        // And the root this block starts from, captured here because it does not
+        // survive to the commit: `wait_for_realm_update_sync_with_coordinator`
+        // below sets `last_committed_realm_end_root` to the *new* root once the
+        // Coordinator picks the update up.  Reading it at commit time therefore
+        // compares the new root against itself, always concludes the state did
+        // not change, and writes that into every manifest -- including the
+        // commits that changed everything.  The pair is what the recovery path
+        // already sets explicitly, so both paths now describe the transition the
+        // same way.
+        self.db.state.processing_realm_start_root = self.db.state.last_committed_realm_end_root;
 
         let proving_state = PsyNodeProvingState::new_standard_realm(
             self.db.state.realm_id_u64,
