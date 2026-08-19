@@ -55,6 +55,17 @@ where
         );
         return Err(e);
     }
+    // The height check above only sees a rollback this Realm came back to
+    // before the Coordinator produced past the old head.  After that the
+    // heights agree and only the contents differ, and the epoch is the only
+    // thing left that can tell.
+    if let Err(e) = processor.db.reconcile_missed_rollback_epochs().await {
+        tracing::error!(
+            "[REALM] could not reconcile against rollbacks that happened while this Realm was \
+             down ({e:#}); refusing to start on a cache whose provenance is unknown"
+        );
+        return Err(e);
+    }
 
     let mut last_slot: u128 = 0;
     // Logged on the edge, not every second, so a long rollback does not bury the log.
@@ -88,7 +99,17 @@ where
                                 "[REALM] the rollback to {target} was aborted; keeping the sync \
                                  state the Coordinator never discarded"
                             );
-                        } else if let Err(e) = processor.db.reset_for_rollback_to(target).await {
+                        } else if let Err(e) = processor
+                            .db
+                            .reset_for_rollback_to(target)
+                            .await
+                            // Recording the epoch is part of finishing the
+                            // reset, not a separate step: a Realm that
+                            // truncated and then failed to record which epoch
+                            // it truncated *to* would reconcile again on the
+                            // next start, against a chain that has moved on.
+                            .and(processor.db.note_current_chain_epoch().await)
+                        {
                             tracing::error!(
                                 "[REALM] could not reset to the rollback target {target} \
                                  ({e:#}); retrying rather than resuming on a discarded branch"

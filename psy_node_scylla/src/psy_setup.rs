@@ -359,6 +359,7 @@ pub async fn setup_coordinator_psy_scylla_store_from_connection_string<N: QNetwo
 pub async fn setup_realm_psy_scylla_store_from_connection_string<N: QNetworkDatabaseTypes>(
     keyspace: &str,
     connection_string: &str,
+    network_chain_id: i64,
 ) -> anyhow::Result<(
     ScyllaUnifiedPsyStore<N, N::QHash, N::HasherBase>,
     crate::rollback::RealmRollbackControlPlane<N::QHash>,
@@ -375,6 +376,7 @@ pub async fn setup_realm_psy_scylla_store_from_connection_string<N: QNetworkData
             .await?,
     );
     let store = setup_psy_scylla_database_store::<N>(core.clone()).await?;
-    let control = crate::rollback::RealmRollbackControlPlane::setup(core.as_ref()).await?;
+    let control =
+        crate::rollback::RealmRollbackControlPlane::setup(core.as_ref(), network_chain_id).await?;
     Ok((store, control))
 }

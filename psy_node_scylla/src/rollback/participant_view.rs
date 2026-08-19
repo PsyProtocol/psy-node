@@ -26,6 +26,7 @@ use psy_node_core::store::rollback_participants::{
 };
 use parth_core::protocol::core_types::Q256BitHash;
 use psy_node_core::store::canonical_head::CanonicalHeadReadState;
+use super::event_store::ROLLBACK_EVENT_TABLE;
 use scylla::client::session::Session;
 use scylla::statement::prepared::PreparedStatement;
 
@@ -41,6 +42,12 @@ pub const ROLLBACK_FREEZE_RECEIPT_TABLE: &str = "rollback_freeze_receipt";
 /// unusable from the generic capability bundle every processor receives.
 pub struct ScyllaRollbackParticipantView<Hash: Q256BitHash> {
     session: Arc<Session>,
+    /// Which chain these receipts belong to.  Carried rather than assumed: the
+    /// receipt tables are partitioned by it, and a hardcoded zero happens to be
+    /// right on the local devnet and silently wrong everywhere else -- a
+    /// participant would file its evidence into a partition the barrier never
+    /// reads, and the barrier would wait forever for a receipt that exists.
+    network_chain_id: i64,
     head_reader: Arc<dyn CoordinatorCanonicalHeadReader<Hash>>,
     insert: PreparedStatement,
     read_range: PreparedStatement,
@@ -48,6 +55,9 @@ pub struct ScyllaRollbackParticipantView<Hash: Q256BitHash> {
     read_verify: PreparedStatement,
     insert_freeze: PreparedStatement,
     read_freeze: PreparedStatement,
+    /// The chain's rollback history, which is how a participant that missed a
+    /// rollback finds out where the discarded branch began.
+    read_targets_after: PreparedStatement,
 }
 
 impl<Hash: Q256BitHash> ScyllaRollbackParticipantView<Hash> {
@@ -103,6 +113,7 @@ impl<Hash: Q256BitHash> ScyllaRollbackParticipantView<Hash> {
     pub async fn prepare(
         session: Arc<Session>,
         no_tablet_keyspace: &str,
+        network_chain_id: i64,
         head_reader: Arc<dyn CoordinatorCanonicalHeadReader<Hash>>,
     ) -> anyhow::Result<Self> {
         let insert = session
@@ -147,9 +158,17 @@ impl<Hash: Q256BitHash> ScyllaRollbackParticipantView<Hash> {
                  WHERE network_chain_id = ? AND head = ?"
             ))
             .await?;
+        let read_targets_after = session
+            .prepare(format!(
+                "SELECT chain_epoch, target FROM {no_tablet_keyspace}.{ROLLBACK_EVENT_TABLE} \
+                 WHERE network_chain_id = ? AND chain_epoch > ?"
+            ))
+            .await?;
         Ok(Self {
             session,
+            network_chain_id,
             head_reader,
+            read_targets_after,
             insert,
             read_range,
             insert_verify,
@@ -187,6 +206,23 @@ impl<Hash: Q256BitHash> RollbackParticipantView<Hash> for ScyllaRollbackParticip
         })
     }
 
+    async fn read_rollback_targets_after(
+        &self,
+        epoch: u64,
+    ) -> anyhow::Result<Vec<(u64, u64)>> {
+        let rows = self
+            .session
+            .execute_unpaged(&self.read_targets_after, (self.network_chain_id, epoch as i64))
+            .await?
+            .into_rows_result()?
+            .rows::<(i64, i64)>()?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .map(|(epoch, target)| (epoch as u64, target as u64))
+            .collect())
+    }
+
     async fn file_archive_receipt(&self, receipt: &ArchiveReceipt) -> anyhow::Result<()> {
         // The scope's canonical bytes are the clustering key, the same encoding
         // manifests and allocator rows partition by, so a participant's receipt
@@ -196,7 +232,7 @@ impl<Hash: Q256BitHash> RollbackParticipantView<Hash> for ScyllaRollbackParticip
             .execute_unpaged(
                 &self.insert,
                 (
-                    0i64,
+                    self.network_chain_id,
                     receipt.target() as i64,
                     receipt.head() as i64,
                     scope,
@@ -225,7 +261,10 @@ impl<Hash: Q256BitHash> RollbackParticipantView<Hash> for ScyllaRollbackParticip
     ) -> anyhow::Result<Vec<ArchiveReceipt>> {
         let rows = self
             .session
-            .execute_unpaged(&self.read_range, (0i64, target as i64, head as i64))
+            .execute_unpaged(
+                &self.read_range,
+                (self.network_chain_id, target as i64, head as i64),
+            )
             .await?
             .into_rows_result()?;
         let mut receipts = Vec::new();
@@ -259,7 +298,7 @@ impl<Hash: Q256BitHash> RollbackParticipantView<Hash> for ScyllaRollbackParticip
             .execute_unpaged(
                 &self.insert_verify,
                 (
-                    0i64,
+                    self.network_chain_id,
                     receipt.target() as i64,
                     scope,
                     receipt.state_root().to_vec(),
@@ -276,7 +315,7 @@ impl<Hash: Q256BitHash> RollbackParticipantView<Hash> for ScyllaRollbackParticip
     ) -> anyhow::Result<Vec<VerifyReceipt>> {
         let rows = self
             .session
-            .execute_unpaged(&self.read_verify, (0i64, target as i64))
+            .execute_unpaged(&self.read_verify, (self.network_chain_id, target as i64))
             .await?
             .into_rows_result()?;
         let mut receipts = Vec::new();
@@ -304,7 +343,7 @@ impl<Hash: Q256BitHash> RollbackParticipantView<Hash> for ScyllaRollbackParticip
             .execute_unpaged(
                 &self.insert_freeze,
                 (
-                    0i64,
+                    self.network_chain_id,
                     receipt.head() as i64,
                     scope,
                     receipt.head_digest().to_vec(),
@@ -321,7 +360,7 @@ impl<Hash: Q256BitHash> RollbackParticipantView<Hash> for ScyllaRollbackParticip
     ) -> anyhow::Result<Vec<FreezeReceipt>> {
         let rows = self
             .session
-            .execute_unpaged(&self.read_freeze, (0i64, head as i64))
+            .execute_unpaged(&self.read_freeze, (self.network_chain_id, head as i64))
             .await?
             .into_rows_result()?;
         let mut receipts = Vec::new();

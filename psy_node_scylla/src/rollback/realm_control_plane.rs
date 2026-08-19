@@ -55,6 +55,9 @@ pub struct RealmRollbackControlPlane<Hash: Q256BitHash + QHashBase> {
     /// phase -- it would either freeze a chain nobody asked to freeze, or keep
     /// committing through one that was.
     participant_view: Option<Arc<super::ScyllaRollbackParticipantView<Hash>>>,
+    /// Lives in this Realm's own keyspace, not the Coordinator's: it records
+    /// what *this* Realm believes, and only this Realm may write it.
+    sync_epoch: Arc<super::ScyllaRealmSyncEpochStore>,
 }
 
 impl<Hash: Q256BitHash + QHashBase> RealmRollbackControlPlane<Hash> {
@@ -64,8 +67,13 @@ impl<Hash: Q256BitHash + QHashBase> RealmRollbackControlPlane<Hash> {
     }
 
     /// Create then prepare, for a Realm bringing a keyspace up.
+    /// `network_chain_id` is taken rather than assumed.  The Coordinator's
+    /// receipt and history tables are partitioned by it, and a Realm that
+    /// guessed would file its evidence where the barrier never looks -- which
+    /// reads as a participant that never responded, not as a misconfiguration.
     pub async fn setup<Hasher: MerkleZeroHasher<Hash>>(
         store: &ScyllaCoreStore<Hash, Hasher>,
+        network_chain_id: i64,
     ) -> anyhow::Result<Self> {
         let no_tablet = store.no_tablet_keyspace.clone();
         ScyllaAuthorityTimestampStore::create_schema(
@@ -83,6 +91,7 @@ impl<Hash: Q256BitHash + QHashBase> RealmRollbackControlPlane<Hash> {
             &ManifestArtifactNoTabletKeyspace::try_new(&no_tablet)?,
         )
         .await?;
+        super::ScyllaRealmSyncEpochStore::create_table(&store.session, &no_tablet).await?;
         store.session.await_schema_agreement().await?;
 
         let mut control = Self {
@@ -110,6 +119,14 @@ impl<Hash: Q256BitHash + QHashBase> RealmRollbackControlPlane<Hash> {
             commit_window: store.commit_window.clone(),
             journal: None,
             participant_view: None,
+            sync_epoch: Arc::new(
+                super::ScyllaRealmSyncEpochStore::prepare(
+                    store.session.clone(),
+                    &no_tablet,
+                    network_chain_id,
+                )
+                .await?,
+            ),
         };
 
         // Watching the rollback needs the Coordinator's keyspace, because that
@@ -135,6 +152,7 @@ impl<Hash: Q256BitHash + QHashBase> RealmRollbackControlPlane<Hash> {
                 super::ScyllaRollbackParticipantView::prepare(
                     store.session.clone(),
                     &coordinator_no_tablet,
+                    network_chain_id,
                     Arc::new(head_reader),
                 )
                 .await?,
@@ -173,5 +191,7 @@ impl<Hash: Q256BitHash + QHashBase> RealmRollbackControlPlane<Hash> {
                 dyn psy_node_core::store::rollback_coordination::RollbackParticipantView<Hash>,
             >
         }))
+        .with_sync_epoch_store(Some(self.sync_epoch.clone()
+            as Arc<dyn psy_node_core::store::realm_sync_epoch::RealmSyncEpochStore>))
     }
 }

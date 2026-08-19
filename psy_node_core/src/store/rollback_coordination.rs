@@ -153,6 +153,20 @@ pub trait RollbackParticipantView<Hash: Q256BitHash>: Send + Sync {
         coordinator_head: &CanonicalChainRef<Hash>,
     ) -> anyhow::Result<Option<CanonicalChainRef<Hash>>>;
 
+    /// The target of every rollback this chain performed after `epoch`,
+    /// newest first, as `(chain_epoch, target)`.
+    ///
+    /// A participant that missed a rollback learns *that* one happened from the
+    /// epoch, but the epoch does not say where the discarded branch began --
+    /// and by the time the participant looks, the Coordinator has usually
+    /// produced past it again, so the current head does not say either.  The
+    /// lowest target across the rollbacks it missed is the height above which
+    /// everything it still holds belongs to a branch that no longer exists.
+    async fn read_rollback_targets_after(
+        &self,
+        epoch: u64,
+    ) -> anyhow::Result<Vec<(u64, u64)>>;
+
     /// Record that this participant archived the range.
     ///
     /// Durable, because the barrier aggregates across restarts: a Coordinator
@@ -321,6 +335,12 @@ mod tests {
             _coordinator_head: &CanonicalChainRef<Hash>,
         ) -> anyhow::Result<Option<CanonicalChainRef<Hash>>> {
             unreachable!("following a phase does not read the head separately")
+        }
+        async fn read_rollback_targets_after(
+            &self,
+            _epoch: u64,
+        ) -> anyhow::Result<Vec<(u64, u64)>> {
+            unreachable!("following a phase does not read the history")
         }
         async fn file_archive_receipt(&self, _receipt: &ArchiveReceipt) -> anyhow::Result<()> {
             unreachable!("following a phase files nothing")

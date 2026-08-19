@@ -224,6 +224,104 @@ where
         self.reset_for_rollback_to(published_height).await
     }
 
+    /// Reconcile this Realm against rollbacks it slept through.
+    ///
+    /// The height check next to this one only sees a rollback the Realm comes
+    /// back to immediately: once the Coordinator has produced past the old head
+    /// again the heights agree and only the contents differ, which no height
+    /// comparison can detect.  The epoch can, because it advances if and only
+    /// if a rollback published one and it is carried on the head the
+    /// Coordinator publishes.
+    ///
+    /// The epoch says a rollback happened, not where the discarded branch
+    /// began, so the targets come from the Coordinator's rollback history.  The
+    /// lowest one across the rollbacks this Realm missed is the height above
+    /// which everything it still holds belongs to a branch that no longer
+    /// exists.
+    ///
+    /// A Realm with no recorded epoch is one that has never synced, not one at
+    /// epoch zero: it has no stale cache, and truncating it would discard a
+    /// chain that was never rolled back.
+    pub async fn reconcile_missed_rollback_epochs(&mut self) -> anyhow::Result<()> {
+        if self.recording.sync_epoch_store().is_none() {
+            return Ok(());
+        }
+        let seen = self.coordinator_chain_ref_last_synced();
+        let Some(published) = self.recording.observe_published_head(&seen).await? else {
+            return Ok(());
+        };
+        let published_epoch = published.chain_epoch().get();
+        let recorded_epoch = {
+            let store = self
+                .recording
+                .sync_epoch_store()
+                .expect("checked above and the bundle is immutable");
+            match store.read_synced_epoch().await? {
+                Some(epoch) => epoch,
+                None => {
+                    store.write_synced_epoch(published_epoch).await?;
+                    return Ok(());
+                }
+            }
+        };
+        if recorded_epoch >= published_epoch {
+            return Ok(());
+        }
+
+        let targets = self
+            .recording
+            .rollback_targets_after(recorded_epoch)
+            .await?;
+        let lowest = targets.iter().map(|(_, target)| *target).min();
+        tracing::warn!(
+            "[REALM_INIT] this Realm last synced under epoch {} and the chain is now at {}; {} \
+             rollback(s) happened while it was not watching",
+            recorded_epoch,
+            published_epoch,
+            targets.len()
+        );
+        match lowest {
+            Some(target) => self.reset_for_rollback_to(target).await?,
+            None => {
+                // The epoch moved but no rollback recorded a target for it.
+                // Refusing is the safe direction: the alternative is to carry on
+                // with a cache whose provenance cannot be established, and the
+                // damage from that surfaces as an unprovable witness long after
+                // the cause.
+                anyhow::bail!(
+                    "the chain advanced from epoch {} to {} with no recorded rollback target; \
+                     this Realm cannot establish which of its cached checkpoints are still real",
+                    recorded_epoch,
+                    published_epoch
+                );
+            }
+        }
+        // Written after the truncation, not before: a crash in between must
+        // leave the Realm looking like it still has to reconcile, because it
+        // does.
+        self.recording
+            .sync_epoch_store()
+            .expect("checked above and the bundle is immutable")
+            .write_synced_epoch(published_epoch)
+            .await?;
+        Ok(())
+    }
+
+    /// Record the epoch the chain is in now, after a rollback this Realm
+    /// watched and has just undone its share of.
+    pub async fn note_current_chain_epoch(&mut self) -> anyhow::Result<()> {
+        let Some(store) = self.recording.sync_epoch_store() else {
+            return Ok(());
+        };
+        let seen = self.coordinator_chain_ref_last_synced();
+        let Some(published) = self.recording.observe_published_head(&seen).await? else {
+            return Ok(());
+        };
+        store
+            .write_synced_epoch(published.chain_epoch().get())
+            .await
+    }
+
     /// Bring this Realm's commit path into line with the rollback phase the
     /// Coordinator has published, and report that phase.
     ///

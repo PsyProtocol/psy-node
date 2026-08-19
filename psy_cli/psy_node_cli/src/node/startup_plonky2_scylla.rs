@@ -356,6 +356,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
             let (db, rollback_control) = setup_realm_psy_scylla_store_from_connection_string::<N>(
                 &config.db_namespace,
                 &config.scylla_db_url,
+                chain_id as i64,
             )
             .await?;
             let realm_recording = rollback_control.recording();

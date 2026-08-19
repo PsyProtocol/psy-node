@@ -49,6 +49,13 @@ pub struct RealmCommitRecording<Hash: Q256BitHash> {
     /// read the control row must not guess at a phase -- it would either freeze
     /// a chain nobody asked to freeze, or commit through one that was frozen.
     participant_view: Option<Arc<dyn RollbackParticipantView<Hash>>>,
+    /// The epoch this Realm's cached view of the chain was built under.
+    ///
+    /// Rides with the participant view because the two are only useful
+    /// together: the view says which epoch the chain is in now, this says which
+    /// one this Realm's data came from, and a rollback it slept through is the
+    /// difference between them.
+    sync_epoch: Option<Arc<dyn super::realm_sync_epoch::RealmSyncEpochStore>>,
     journal: Option<Arc<dyn CommitVerificationJournal>>,
 }
 
@@ -61,6 +68,7 @@ impl<Hash: Q256BitHash> Clone for RealmCommitRecording<Hash> {
             manifest_artifact: self.manifest_artifact.clone(),
             commit_window: self.commit_window.clone(),
             participant_view: self.participant_view.clone(),
+            sync_epoch: self.sync_epoch.clone(),
             journal: self.journal.clone(),
         }
     }
@@ -83,6 +91,7 @@ impl<Hash: Q256BitHash> RealmCommitRecording<Hash> {
             commit_window,
             journal,
             participant_view: None,
+            sync_epoch: None,
         }
     }
 
@@ -101,6 +110,19 @@ impl<Hash: Q256BitHash> RealmCommitRecording<Hash> {
         self.participant_view.as_deref()
     }
 
+    #[must_use]
+    pub fn with_sync_epoch_store(
+        mut self,
+        store: Option<Arc<dyn super::realm_sync_epoch::RealmSyncEpochStore>>,
+    ) -> Self {
+        self.sync_epoch = store;
+        self
+    }
+
+    pub fn sync_epoch_store(&self) -> Option<&dyn super::realm_sync_epoch::RealmSyncEpochStore> {
+        self.sync_epoch.as_deref()
+    }
+
     /// The head the Coordinator publishes right now.
     ///
     /// `Ok(None)` covers both "no view configured" and "the Coordinator has
@@ -113,6 +135,14 @@ impl<Hash: Q256BitHash> RealmCommitRecording<Hash> {
             return Ok(None);
         };
         view.observe_published_head(coordinator_head).await
+    }
+
+    /// The target of every rollback the chain performed after `epoch`.
+    pub async fn rollback_targets_after(&self, epoch: u64) -> anyhow::Result<Vec<(u64, u64)>> {
+        let Some(view) = self.participant_view.as_deref() else {
+            return Ok(Vec::new());
+        };
+        view.read_rollback_targets_after(epoch).await
     }
 
     /// Bring this node's commit path into line with the phase the Coordinator

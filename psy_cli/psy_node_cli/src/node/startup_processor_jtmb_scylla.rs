@@ -153,6 +153,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_processor_node(co
             let (db, rollback_control) = setup_realm_psy_scylla_store_from_connection_string::<N>(
                 &config.db_namespace,
                 &config.scylla_db_url,
+                chain_id as i64,
             )
             .await?;
             let realm_recording = rollback_control.recording();
