@@ -63,6 +63,18 @@ impl ObservedRollbackPhase {
         matches!(self, Self::Delete { .. })
     }
 
+    /// Whether a participant may commit a new checkpoint in this phase.
+    ///
+    /// Only Idle.  Every phase of a rollback needs the old head to stay
+    /// byte-for-byte stable -- before the archive because the plan is read from
+    /// it, after because the archive is compared against it -- and the phases
+    /// past DELETING are rewriting the very rows a commit would touch.  Aborting
+    /// is no exception: the abort has not finished, and the node learns it may
+    /// resume by observing Idle rather than by guessing from the abort.
+    pub const fn permits_commit(self) -> bool {
+        matches!(self, Self::Idle)
+    }
+
     pub fn from_control<Hash: Q256BitHash>(state: &RollbackControlState<Hash>) -> Self {
         match state {
             RollbackControlState::Idle => Self::Idle,
@@ -173,6 +185,38 @@ pub fn phase_from_head_state<Hash: Q256BitHash>(
     }
 }
 
+/// Bring this node's commit path into line with the phase the Coordinator has
+/// published, and report the phase.
+///
+/// Called once per processor loop iteration, before the loop decides whether to
+/// produce.  It is the whole of a participant's obligation outside its own
+/// rollback work: freeze while a rollback is in flight, resume when it is over.
+///
+/// Freezing here rather than in the loop's own branches is the same argument the
+/// commit window itself rests on -- one place that cannot be bypassed beats a
+/// check at every site that decides to commit.  The loop may still forget to
+/// call this, but that failure is visible (the node never freezes at all), where
+/// a missed branch would be a node that freezes on most paths and commits on
+/// one.
+///
+/// Thaws only on Idle.  A rollback that ended in an abort returns to Idle the
+/// same way a successful one does, so the node needs no separate rule for it,
+/// and a node that thawed on any earlier phase would resume committing while the
+/// Coordinator was still restoring.
+pub async fn follow_published_rollback_phase<Hash: Q256BitHash>(
+    view: &dyn RollbackParticipantView<Hash>,
+    coordinator_head: &CanonicalChainRef<Hash>,
+    commit_window: &super::commit_window::CommitWindowClock,
+) -> anyhow::Result<ObservedRollbackPhase> {
+    let phase = view.observe_phase(coordinator_head).await?;
+    if phase.permits_commit() {
+        commit_window.thaw_after_rollback();
+    } else {
+        commit_window.freeze_for_rollback();
+    }
+    Ok(phase)
+}
+
 /// The participant this node is.
 pub fn participant_for(scope: psy_data::protocol::chain_context::AuthorityScope) -> RollbackParticipant {
     RollbackParticipant::new(scope)
@@ -181,6 +225,124 @@ pub fn participant_for(scope: psy_data::protocol::chain_context::AuthorityScope)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::commit_window::{CommitWindow, CommitWindowClock};
+    use super::super::timestamp::CommitWriteTimestampUs;
+    use std::sync::Arc;
+
+    /// A Coordinator control row frozen at one phase, so the rule under test is
+    /// the participant's reaction to it and nothing else.
+    struct PublishedPhase(ObservedRollbackPhase);
+
+    #[async_trait]
+    impl<Hash: Q256BitHash> RollbackParticipantView<Hash> for PublishedPhase {
+        async fn observe_phase(
+            &self,
+            _coordinator_head: &CanonicalChainRef<Hash>,
+        ) -> anyhow::Result<ObservedRollbackPhase> {
+            Ok(self.0)
+        }
+        async fn file_archive_receipt(&self, _receipt: &ArchiveReceipt) -> anyhow::Result<()> {
+            unreachable!("following a phase files nothing")
+        }
+        async fn read_archive_receipts_for(
+            &self,
+            _target: u64,
+            _head: u64,
+            _expected: &[RollbackParticipant],
+        ) -> anyhow::Result<Vec<ArchiveReceipt>> {
+            unreachable!("following a phase reads no receipts")
+        }
+        async fn file_freeze_receipt(&self, _receipt: &FreezeReceipt) -> anyhow::Result<()> {
+            unreachable!("following a phase files nothing")
+        }
+        async fn read_freeze_receipts_for(
+            &self,
+            _head: u64,
+            _expected: &[RollbackParticipant],
+        ) -> anyhow::Result<Vec<FreezeReceipt>> {
+            unreachable!("following a phase reads no receipts")
+        }
+        async fn file_verify_receipt(&self, _receipt: &VerifyReceipt) -> anyhow::Result<()> {
+            unreachable!("following a phase files nothing")
+        }
+        async fn read_verify_receipts_for(
+            &self,
+            _target: u64,
+            _expected: &[RollbackParticipant],
+        ) -> anyhow::Result<Vec<VerifyReceipt>> {
+            unreachable!("following a phase reads no receipts")
+        }
+    }
+
+    fn head() -> CanonicalChainRef<parth_core::PHash> {
+        use parth_core::PHash;
+        use psy_core::constants::chain_id::PsyChainNetworkType;
+        use psy_data::protocol::canonical_chain::{
+            ChainEpoch, CheckpointHash, CheckpointId, CheckpointRef, NetworkId,
+        };
+        CanonicalChainRef::new(
+            NetworkId::from(PsyChainNetworkType::PsyMainnet),
+            ChainEpoch::new(1),
+            CheckpointRef::new(
+                CheckpointId::new(100),
+                CheckpointHash::from_last_chain_hash(PHash::from_values(7, 8, 9, 10)),
+            ),
+        )
+    }
+
+    async fn phase_leaves_clock(phase: ObservedRollbackPhase) -> bool {
+        let clock = Arc::new(CommitWindowClock::new());
+        follow_published_rollback_phase(&PublishedPhase(phase), &head(), &clock)
+            .await
+            .expect("the fake view always answers");
+        clock.is_frozen()
+    }
+
+    #[tokio::test]
+    async fn every_phase_of_a_rollback_freezes_the_commit_path() {
+        // Not just the freeze phase.  The plan is read from the old head before
+        // the archive and compared against it after, and past DELETING the rows
+        // a commit would write are the ones being rewritten.
+        for phase in [
+            ObservedRollbackPhase::Requested,
+            ObservedRollbackPhase::Freeze { head: 100 },
+            ObservedRollbackPhase::Archive { target: 90, head: 100 },
+            ObservedRollbackPhase::Delete { target: 90, head: 100 },
+            ObservedRollbackPhase::Restore { target: 90 },
+            ObservedRollbackPhase::Verify { target: 90 },
+            ObservedRollbackPhase::Aborting,
+        ] {
+            assert!(
+                phase_leaves_clock(phase).await,
+                "{phase:?} must not leave this node committing"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn only_idle_lets_the_chain_run() {
+        assert!(!phase_leaves_clock(ObservedRollbackPhase::Idle).await);
+    }
+
+    #[tokio::test]
+    async fn an_abort_thaws_by_returning_to_idle_like_any_other_ending() {
+        // The node needs no separate rule for abort: it resumes when the
+        // Coordinator publishes Idle, whatever put it there.
+        let clock = Arc::new(CommitWindowClock::new());
+        follow_published_rollback_phase(&PublishedPhase(ObservedRollbackPhase::Aborting), &head(), &clock)
+            .await
+            .expect("the fake view always answers");
+        assert!(clock.is_frozen());
+        follow_published_rollback_phase(&PublishedPhase(ObservedRollbackPhase::Idle), &head(), &clock)
+            .await
+            .expect("the fake view always answers");
+        assert!(!clock.is_frozen());
+        let stamp = CommitWriteTimestampUs::try_from_i128(1_700_000_000_000_000).expect("in range");
+        assert!(
+            clock.open(CommitWindow::new(101, stamp)).is_ok(),
+            "an aborted rollback must give the chain back"
+        );
+    }
 
     #[test]
     fn only_the_deleting_phase_permits_destruction() {
