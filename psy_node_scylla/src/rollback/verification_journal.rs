@@ -86,6 +86,22 @@ impl psy_node_core::store::verification_journal::CommitVerificationJournal
             .await?
             .into_iter()
             .filter_map(|entry| {
+                // Only rows whose previous value lived in *this* row.
+                //
+                // `before_version` is the checkpoint an as-of read landed on,
+                // and it is set only for tables with a version axis -- where the
+                // earlier value is a different row that the rollback leaves
+                // standing.  Restoring those would rebuild a version at a
+                // checkpoint the chain no longer has, which is how the first
+                // version of this filter corrupted the user registration tree:
+                // the descent found a leaf that should not have existed and the
+                // proof above it would not verify.
+                //
+                // `None` means the read found the value in the row itself, which
+                // is the axis-less case this restore exists for.
+                if entry.before_version.is_some() {
+                    return None;
+                }
                 entry
                     .before
                     .map(|before| (entry.physical_table as u16, entry.locator, before))

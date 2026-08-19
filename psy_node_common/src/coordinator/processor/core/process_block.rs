@@ -223,17 +223,7 @@ impl<
                 self.publish_worker_jobs_if_exists(&queue_key, i, deploy_contract_jobs),
             )?;
             if wait_for_jobs_completion {
-                self.db
-                    .proof_work_queue
-                    .wait_until_all_jobs_complete_or_timeout_worker(
-                        &queue_key,
-                        self.db.ids.realm_id_u64,
-                        self.db.ids.realm_sub_id_u64,
-                        self.db.ids.proc_checkpoint_unique_id,
-                        0,
-                        self.proof_worker_queue_max_time_ms,
-                    )
-                    .await?;
+                self.wait_jobs_or_rollback(&queue_key).await?;
             }
         }
         Ok(())
@@ -249,11 +239,25 @@ impl<
     /// blocks, which is luck rather than design.
     pub async fn wait_for_jobs_completion(&self) -> anyhow::Result<()> {
         let queue_key = self.db.get_proof_worker_queue_key();
+        self.wait_jobs_or_rollback(&queue_key).await
+    }
+
+    /// Every place this processor waits for proofs goes through here.
+    ///
+    /// Guarding one of the three sites was not enough and the chain showed it:
+    /// a rollback that landed while the block was waiting at one of the others
+    /// left the Coordinator waiting forever, because the wait has no timeout and
+    /// the phase check that would restart it sits at the top of a loop the block
+    /// never returns to.
+    pub async fn wait_jobs_or_rollback(
+        &self,
+        queue_key: &CoordinatorProvingWorkQueueKey<N::QHash, N::JobId>,
+    ) -> anyhow::Result<()> {
         let jobs = self
             .db
             .proof_work_queue
             .wait_until_all_jobs_complete_or_timeout_worker(
-                &queue_key,
+                queue_key,
                 self.db.ids.realm_id_u64,
                 self.db.ids.realm_sub_id_u64,
                 self.db.ids.proc_checkpoint_unique_id,
@@ -328,16 +332,7 @@ impl<
                     job,
                 )
             },
-            || {
-                self.db.proof_work_queue.wait_until_all_jobs_complete_or_timeout_worker(
-                    &queue_key,
-                    self.db.ids.realm_id_u64,
-                    self.db.ids.realm_sub_id_u64,
-                    self.db.ids.proc_checkpoint_unique_id,
-                    0,
-                    self.proof_worker_queue_max_time_ms,
-                )
-            },
+            || self.wait_jobs_or_rollback(&queue_key),
             || self.db.proof_store.get_proof_bytes_by_job_id(output_job_id, unique_pending_id),
             || {
                 self.db.temp_db.get_proof_miner_rewards_tree_value_or_none(

@@ -40,9 +40,13 @@ pub trait CommitVerificationJournal: Send + Sync {
     /// deleted -- from one it *rewrote*, whose previous value exists nowhere
     /// else.
     ///
-    /// Only rows with a before image are returned.  Their absence is the answer
-    /// for the created case, and returning them would make every caller repeat
-    /// the same filter.
+    /// Only rows whose previous value lived in the row itself are returned:
+    /// those with a before image and no recorded version.  A version is recorded
+    /// exactly when the table has a version axis, and there the earlier value is
+    /// a separate row the rollback leaves standing -- putting it back at the
+    /// discarded locator would rebuild a version the chain no longer has.  Rows
+    /// with no before image at all were created by the discarded range and are
+    /// right to stay deleted.
     async fn rewritten_before_images(
         &self,
         checkpoint_id: u64,
