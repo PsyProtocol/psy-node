@@ -112,6 +112,24 @@ where
                         tracing::debug!("[COORDINATOR] Process block finished.");
                         tracing::info!("Generated block in {}ms at slot {}", duration_ms, current_slot);
                     }
+                    Err(e)
+                        if psy_node_core::store::rollback_coordination::is_refused_because_rollback(
+                            &e,
+                        ) =>
+                    {
+                        // A rollback started while this block was already being
+                        // committed.  The guard that refused it is the one
+                        // keeping the archive honest, so this is the system
+                        // working; parking the processor here would stop the
+                        // chain over a rollback that succeeded.
+                        tracing::info!(
+                            "[COORDINATOR] block at slot {} was refused because a rollback \
+                             started under it ({:#}); waiting for the rollback rather than \
+                             treating this as a fault",
+                            current_slot,
+                            e
+                        );
+                    }
                     Err(e) => {
                         let error = format!("coordinator process_block failed at slot {}: {:#}", current_slot, e);
                         processor.db.status.set_error(error.clone());

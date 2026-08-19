@@ -118,6 +118,20 @@ where
                         tracing::debug!("[REALM] Process block finished.");
                         tracing::info!("Generated GUTA Realm update in {}ms at slot {}", duration_ms, current_slot);
                     }
+                    Err(e)
+                        if psy_node_core::store::rollback_coordination::is_refused_because_rollback(
+                            &e,
+                        ) =>
+                    {
+                        // Same race as the Coordinator's: the phase was Idle
+                        // when this iteration started and is not any more.
+                        tracing::info!(
+                            "[REALM] block at slot {} was refused because a rollback started \
+                             under it ({:#}); waiting rather than treating this as a fault",
+                            current_slot,
+                            e
+                        );
+                    }
                     Err(e) => {
                         let error = format!("realm process_block failed at slot {}: {:#}", current_slot, e);
                         processor.db.status.set_error(error.clone());

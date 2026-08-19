@@ -230,6 +230,38 @@ pub fn apply_phase_to_commit_path(
     }
 }
 
+/// Whether a failed commit failed *because* a rollback is running.
+///
+/// A processor loop cannot check the phase and then commit atomically, so a
+/// rollback that starts in between will meet a commit already under way.  Both
+/// guards below refuse it, which is the outcome the guards exist for -- but a
+/// refusal is not a fault, and treating it as one parks the node in Error and
+/// stops the chain over a rollback that worked exactly as designed.  That is
+/// what happened the first time a rollback ran against a live Coordinator: the
+/// floor rejected the commit, the rollback completed correctly, and the
+/// processor died anyway.
+///
+/// Two distinct guards answer here because they catch the race at different
+/// depths: the commit window refuses to open at all, while the rollback floor
+/// refuses a commit source built on a head that is no longer idle.  A node can
+/// meet either depending on how far into the commit it had got.
+pub fn is_refused_because_rollback(err: &anyhow::Error) -> bool {
+    use super::commit_window::CommitWindowError;
+    use super::coordinator_commit_source::CoordinatorCommitSourceError;
+
+    if let Some(CommitWindowError::FrozenForRollback { .. }) =
+        err.downcast_ref::<CommitWindowError>()
+    {
+        return true;
+    }
+    if let Some(CoordinatorCommitSourceError::RollbackFloorRequiresIdleHead) =
+        err.downcast_ref::<CoordinatorCommitSourceError>()
+    {
+        return true;
+    }
+    false
+}
+
 /// The participant this node is.
 pub fn participant_for(scope: psy_data::protocol::chain_context::AuthorityScope) -> RollbackParticipant {
     RollbackParticipant::new(scope)
@@ -372,5 +404,49 @@ mod tests {
         ] {
             assert!(!phase.permits_destruction(), "{phase:?} must not permit destruction");
         }
+    }
+
+    #[test]
+    fn a_commit_refused_by_a_rollback_is_not_a_fault() {
+        use super::super::commit_window::CommitWindowError;
+        use super::super::coordinator_commit_source::CoordinatorCommitSourceError;
+
+        // Both depths, because a commit meets one or the other depending on how
+        // far it had got when the rollback started.
+        assert!(is_refused_because_rollback(&anyhow::Error::new(
+            CommitWindowError::FrozenForRollback { requested: 92 }
+        )));
+        assert!(is_refused_because_rollback(&anyhow::Error::new(
+            CoordinatorCommitSourceError::RollbackFloorRequiresIdleHead
+        )));
+    }
+
+    #[test]
+    fn it_survives_the_context_a_commit_path_adds() {
+        use anyhow::Context;
+        use super::super::commit_window::CommitWindowError;
+
+        // The processor sees this error through several layers of context, and
+        // a classification that only worked on the bare error would quietly
+        // stop working the first time someone annotated the call.
+        let wrapped = Err::<(), _>(CommitWindowError::FrozenForRollback { requested: 92 })
+            .context("recording checkpoint 92")
+            .context("process_block")
+            .unwrap_err();
+        assert!(is_refused_because_rollback(&wrapped));
+    }
+
+    #[test]
+    fn an_ordinary_failure_still_parks_the_node() {
+        use super::super::commit_window::CommitWindowError;
+
+        // A window left open by a lost guard is a real defect and must not be
+        // waved through as backpressure.
+        assert!(!is_refused_because_rollback(&anyhow::Error::new(
+            CommitWindowError::AlreadyOpen { open: 91, requested: 92 }
+        )));
+        assert!(!is_refused_because_rollback(&anyhow::anyhow!(
+            "the worker returned no proof"
+        )));
     }
 }
