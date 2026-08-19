@@ -24,7 +24,8 @@ use psy_data::protocol::chain_context::AuthorityScope;
 use psy_node_core::store::manifest_store::CoordinatorCommitRecording;
 use psy_node_core::store::rollback_participants::{RollbackParticipant, RollbackParticipantSet};
 use psy_node_scylla::rollback::{
-    CoordinatorRollbackControlPlane, RollbackControlKeyspaces, ScyllaRollbackExecutor,
+    CanonicalHeadNoTabletKeyspace, CoordinatorRollbackControlPlane, RollbackControlKeyspaces,
+    ScyllaCanonicalHeadStore, ScyllaRollbackExecutor, ScyllaRollbackParticipantView,
     ScyllaRowImageReader, decode_locator_canonical,
 };
 use scylla::client::session::Session;
@@ -149,11 +150,48 @@ async fn a_rollback_restores_exactly_what_was_observed_before() -> anyhow::Resul
         .first_row::<(i64,)>()?
         .0 as u64;
 
-    // Roll back far enough that the range spans many commits, but leave a deep
-    // history below the target so the fallback has somewhere to land.
-    let target = head.saturating_sub(10);
-    assert!(target > 5, "the chain is too short to roll back meaningfully");
-    println!("rolling back from {head} to {target}");
+    // A rollback already under way is finished rather than replaced.  Deriving
+    // a fresh target from the live head would compute one *below* the
+    // interrupted rollback's, because the head has already been deleted down to
+    // it -- and the executor rightly refuses to resume something towards a
+    // target nobody asked for.  Finishing it is also the operator's real
+    // workflow after a crash.
+    let in_progress = {
+        let control = control_plane(session.clone(), &keyspace, &no_tablet).await;
+        match control {
+            Ok(control) => {
+                let recording = control.recording::<PHash>();
+                match recording.canonical_head().read_canonical_head(network()).await? {
+                    CanonicalHeadReadState::Current(stored) => stored
+                        .rollback_control()
+                        .requested()
+                        .map(|r| {
+                            (
+                                r.requested_head().checkpoint_id().get(),
+                                r.target().checkpoint_id().get(),
+                            )
+                        }),
+                    CanonicalHeadReadState::Uninitialized => None,
+                }
+            }
+            Err(_) => None,
+        }
+    };
+    let (head, target) = match in_progress {
+        Some((resume_head, resume_target)) => {
+            println!("finishing the rollback already under way: {resume_head} -> {resume_target}");
+            (resume_head, resume_target)
+        }
+        None => {
+            // Roll back far enough that the range spans many commits, but leave
+            // a deep history below the target so the fallback has somewhere to
+            // land.
+            let target = head.saturating_sub(10);
+            assert!(target > 5, "the chain is too short to roll back meaningfully");
+            println!("rolling back from {head} to {target}");
+            (head, target)
+        }
+    };
 
     let reader = ScyllaRowImageReader::prepare(session.clone(), &keyspace).await?;
     let witnesses = witnesses_first_touch(&session, &keyspace, &reader, target, head).await?;
@@ -195,7 +233,7 @@ async fn a_rollback_restores_exactly_what_was_observed_before() -> anyhow::Resul
         }
     }
     assert!(
-        !discarded_pending.is_empty(),
+        !discarded_pending.is_empty() || in_progress.is_some(),
         "the discarded range has no pending mappings, so the orphan sweep would prove nothing"
     );
 
@@ -204,18 +242,50 @@ async fn a_rollback_restores_exactly_what_was_observed_before() -> anyhow::Resul
     let head_ref = read_head_chain_ref(&control).await?;
     let plan_id = format!("acceptance-{head}-{target}").into_bytes();
 
-    // A Coordinator rolling back alone is a participant set of one.  That is
-    // still a real barrier -- it files its own receipt and the seal succeeds --
-    // and it is what stops the type from being satisfiable by an empty set.
+    // A Coordinator rolling back alone is a participant set of one, and that
+    // set is why the barriers looked correct for so long: it files its own
+    // receipt and every seal succeeds immediately.  Naming the Realms is what
+    // makes the barriers wait for evidence they did not produce themselves.
+    //
+    // `PSY_ROLLBACK_PARTICIPANT_REALMS=0:1,1:1` adds them, spelled realm:sub.
     let coordinator = RollbackParticipant::new(AuthorityScope::Coordinator);
-    let participants = RollbackParticipantSet::try_new([coordinator])?;
+    let mut set = vec![coordinator];
+    if let Ok(spec) = std::env::var("PSY_ROLLBACK_PARTICIPANT_REALMS") {
+        for entry in spec.split(',').filter(|e| !e.trim().is_empty()) {
+            let (realm, sub) = entry
+                .split_once(':')
+                .unwrap_or_else(|| panic!("participant {entry} is not realm:sub"));
+            set.push(RollbackParticipant::new(AuthorityScope::Realm {
+                realm_id: realm.trim().parse().expect("realm id"),
+                realm_sub_id: sub.trim().parse().expect("realm sub id"),
+            }));
+        }
+    }
+    println!("participant set: {} member(s)", set.len());
+    let participants = RollbackParticipantSet::try_new(set)?;
+
+    // The receipt view.  Passing None left every barrier reading nothing and
+    // sealing on the Coordinator's own receipt, which is a barrier in name
+    // only once anyone else is in the set.
+    let head_reader = ScyllaCanonicalHeadStore::prepare(
+        session.clone(),
+        CanonicalHeadNoTabletKeyspace::try_new(&no_tablet)?,
+    )
+    .await?;
+    let view = ScyllaRollbackParticipantView::<PHash>::prepare(
+        session.clone(),
+        &no_tablet,
+        network().chain_id() as i64,
+        std::sync::Arc::new(head_reader),
+    )
+    .await?;
     // Verification that can only run in the same process as the rollback it
     // checks cannot be repeated when it fails, which is exactly when its detail
     // is needed.  This runs the assertion alone against a chain already rolled
     // back.
     if std::env::var("PSY_ROLLBACK_VERIFY_ONLY").is_err() {
         let report = executor
-            .roll_back(&recording, &head_ref, target, &plan_id, &participants, None)
+            .roll_back(&recording, &head_ref, target, &plan_id, &participants, Some(&view))
             .await?;
         println!("{report:?}");
         assert_eq!(report.target, target);

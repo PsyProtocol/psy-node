@@ -36,7 +36,7 @@ use psy_node_core::store::rollback_coordination::{
     ObservedRollbackPhase, RollbackParticipantView,
 };
 use psy_node_core::store::rollback_participants::{
-    ArchiveReceipt, FreezeReceipt, RollbackParticipant,
+    ArchiveReceipt, FreezeReceipt, RollbackParticipant, VerifyReceipt,
 };
 use psy_node_core::store::timestamp::{DeleteFenceTimestampUs, TimestampFenceWindow};
 use scylla::client::session::Session;
@@ -253,7 +253,7 @@ impl ScyllaRealmRollbackExecutor {
 
         // ---- freeze ----
         let phase = view.observe_phase(head).await?;
-        let ObservedRollbackPhase::Freeze { head: frozen_head } = phase else {
+        let ObservedRollbackPhase::Freeze { head: frozen_head, .. } = phase else {
             anyhow::bail!(
                 "this Realm was asked to roll back to {target} while the Coordinator has \
                  published {phase:?}; a participant follows the published phase rather than \
@@ -279,10 +279,22 @@ impl ScyllaRealmRollbackExecutor {
             .plan(recording, realm_id, realm_sub_id, head, target)
             .await?;
         let planned_rows = plan.row_count();
-        let window = self
-            .fence_window(recording, head, realm_id, realm_sub_id)
-            .await?;
-        let fence = window.delete_fence();
+        // The fence is derived only when there is something to delete.  A Realm
+        // that has never committed has no allocator row to derive one from, and
+        // demanding one would make it unable to take part at all -- which is
+        // backwards: a Realm with nothing of its own in the range is the one
+        // participant that can be certain it has nothing to lose.  It still
+        // files every receipt, because the barriers are counting participants,
+        // not rows.
+        let fence = if planned_rows > 0 {
+            Some(
+                self.fence_window(recording, head, realm_id, realm_sub_id)
+                    .await?
+                    .delete_fence(),
+            )
+        } else {
+            None
+        };
         view.file_freeze_receipt(&FreezeReceipt::new(
             me,
             plan.head,
@@ -298,14 +310,10 @@ impl ScyllaRealmRollbackExecutor {
         // Waiting for the Coordinator to publish ARCHIVING rather than starting
         // on the strength of having filed a freeze receipt: the freeze barrier
         // is met when *everyone* has filed, and only the Coordinator knows that.
-        let phase = view.observe_phase(head).await?;
-        let ObservedRollbackPhase::Archive { .. } = phase else {
-            anyhow::bail!(
-                "this Realm froze at {} and is waiting to archive, but the Coordinator has \
-                 published {phase:?}",
-                plan.head,
-            );
-        };
+        wait_for_phase(view, head, "ARCHIVING", |phase| {
+            matches!(phase, ObservedRollbackPhase::Archive { .. })
+        })
+        .await?;
         let archived_rows = self.archive(plan_id, &plan).await?;
         if archived_rows != planned_rows {
             anyhow::bail!(
@@ -313,7 +321,9 @@ impl ScyllaRealmRollbackExecutor {
                  not be crossed with an incomplete archive"
             );
         }
-        self.verify_archive_under_fence(plan_id, &plan, fence).await?;
+        if let Some(fence) = fence {
+            self.verify_archive_under_fence(plan_id, &plan, fence).await?;
+        }
         view.file_archive_receipt(&ArchiveReceipt::new(
             me,
             target,
@@ -329,15 +339,30 @@ impl ScyllaRealmRollbackExecutor {
         // read it off a phase name.  Only DELETING says yes, and DELETING is
         // published only after the Coordinator sealed the archive barrier with
         // the receipt filed just above.
-        let phase = view.observe_phase(head).await?;
-        if !phase.permits_destruction() {
-            anyhow::bail!(
-                "this Realm archived {archived_rows} rows and is waiting to delete, but the \
-                 Coordinator has published {phase:?}; deleting here would breach the global \
-                 archive barrier from the side the Coordinator cannot see"
-            );
-        }
-        let deleted_rows = self.delete(&plan, fence).await?;
+        wait_for_phase(view, head, "DELETING", ObservedRollbackPhase::permits_destruction).await?;
+        let deleted_rows = match fence {
+            Some(fence) => self.delete(&plan, fence).await?,
+            None => 0,
+        };
+
+        // ---- verify ----
+        //
+        // The last receipt, and without it PUBLISH_ALL waits forever: the
+        // Coordinator will not announce the new epoch until every participant
+        // has said it reached the target.  Filed here, once this Realm's rows
+        // above the target are gone, which is the claim it is making.  Resetting
+        // its sync markers follows and is bookkeeping -- the state the chain
+        // cares about is already correct.
+        //
+        // The digest is this Realm's own plan, not a value shared with the
+        // others.  Each participant is answering for what it restored, and the
+        // barrier counts participants rather than comparing their answers.
+        view.file_verify_receipt(&VerifyReceipt::new(
+            me,
+            target,
+            super::rollback_executor::plan_digest(plan_id),
+        ))
+        .await?;
 
         Ok(RealmRollbackReport {
             target,
@@ -345,7 +370,7 @@ impl ScyllaRealmRollbackExecutor {
             planned_rows,
             archived_rows,
             deleted_rows,
-            fence_us: fence.as_i64(),
+            fence_us: fence.map(|f| f.as_i64()).unwrap_or(0),
         })
     }
 }
@@ -370,6 +395,21 @@ impl<Hash: Q256BitHash> psy_node_core::store::realm_self_rollback::RealmSelfRoll
             realm_id,
             realm_sub_id,
         };
+        // A search range at or below the target has nothing above the target in
+        // it, which is the answer rather than a failure.  The manifest store
+        // rejects an empty range, and it is right to -- a planner asking for one
+        // has lost track of what it is planning -- but here it is the ordinary
+        // case: a Realm whose sync markers have already been reset to the target
+        // is asking whether anything is left, and the shape of the question
+        // already says no.
+        let search_height = search_head.checkpoint().checkpoint_id().get();
+        if search_height <= target {
+            return Ok(RealmSelfRollbackReport {
+                own_head: target,
+                target,
+                ..Default::default()
+            });
+        }
         // The Realm's own head, from its own manifest.  Reading the whole
         // suffix above the target costs one query and answers the question that
         // decides everything else: a Realm with no rows of its own up there --
@@ -431,5 +471,130 @@ impl<Hash: Q256BitHash> psy_node_core::store::realm_self_rollback::RealmSelfRoll
             archived_rows,
             deleted_rows,
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl<Hash: Q256BitHash>
+    psy_node_core::store::realm_self_rollback::RealmRollbackParticipation<Hash>
+    for ScyllaRealmRollbackExecutor
+{
+    async fn take_part_in_rollback(
+        &self,
+        recording: &RealmCommitRecording<Hash>,
+        realm_id: u32,
+        realm_sub_id: u16,
+        head: &CanonicalChainRef<Hash>,
+        target: u64,
+    ) -> anyhow::Result<psy_node_core::store::realm_self_rollback::RealmSelfRollbackReport> {
+        use psy_node_core::store::realm_self_rollback::RealmSelfRollbackReport;
+
+        let Some(view) = recording.participant_view() else {
+            anyhow::bail!(
+                "this Realm cannot take part in a rollback without a view of the Coordinator's \
+                 control row; it can only recover after the fact"
+            );
+        };
+        // Derived rather than agreed.  Every participant archives into its own
+        // keyspace, so the id only has to be stable for this Realm and this
+        // range; correlating the pieces afterwards is what the (target, head)
+        // pair in the receipts and the rollback event are for.
+        let plan_id =
+            format!("realm-{realm_id}-{realm_sub_id}-{}-{target}", head.checkpoint().checkpoint_id().get())
+                .into_bytes();
+        let report = self
+            .roll_back(recording, realm_id, realm_sub_id, head, target, &plan_id, view)
+            .await?;
+        Ok(RealmSelfRollbackReport {
+            own_head: report.head,
+            target: report.target,
+            planned_rows: report.planned_rows,
+            archived_rows: report.archived_rows,
+            deleted_rows: report.deleted_rows,
+        })
+    }
+
+    async fn confirm_target_reached(
+        &self,
+        recording: &RealmCommitRecording<Hash>,
+        realm_id: u32,
+        realm_sub_id: u16,
+        search_head: &CanonicalChainRef<Hash>,
+        target: u64,
+    ) -> anyhow::Result<()> {
+        use psy_node_core::store::realm_self_rollback::RealmSelfRollback;
+
+        let Some(view) = recording.participant_view() else {
+            anyhow::bail!("this Realm cannot file a verify receipt without a participant view");
+        };
+        // Undoes whatever is left, and does nothing when nothing is -- which is
+        // the ordinary case by the time this runs.
+        let report = self
+            .recover_own_state_to(recording, realm_id, realm_sub_id, search_head, target)
+            .await?;
+        if report.changed_anything() {
+            tracing::warn!(
+                "[REALM_ROLLBACK] {} rows above {target} were still here when the verify receipt \
+                 was due; they have been undone",
+                report.deleted_rows
+            );
+        }
+        view.file_verify_receipt(&VerifyReceipt::new(
+            RollbackParticipant::new(AuthorityScope::Realm {
+                realm_id,
+                realm_sub_id,
+            }),
+            target,
+            super::rollback_executor::plan_digest(
+                format!("realm-{realm_id}-{realm_sub_id}-verify-{target}").as_bytes(),
+            ),
+        ))
+        .await?;
+        Ok(())
+    }
+}
+
+/// Wait until the Coordinator publishes a phase this Realm may act on.
+///
+/// A participant reaches each step before the Coordinator has published it --
+/// it files its receipt and the Coordinator only advances once *everyone* has
+/// filed, so by construction there is a gap.  Treating that gap as an error
+/// meant a Realm could only ever take part in a rollback it happened to be
+/// perfectly in step with, which is to say never.
+///
+/// Going backwards is a different matter and is not waited out.  A phase below
+/// the one expected means the rollback was abandoned or is being aborted, and
+/// the Realm must stop rather than sit until the deadline: it would be waiting
+/// for something that is not coming.
+async fn wait_for_phase<Hash: Q256BitHash>(
+    view: &dyn RollbackParticipantView<Hash>,
+    head: &CanonicalChainRef<Hash>,
+    expected: &str,
+    accepts: impl Fn(ObservedRollbackPhase) -> bool,
+) -> anyhow::Result<()> {
+    let started = std::time::Instant::now();
+    let limit = super::barrier_wait_limit();
+    loop {
+        let phase = view.observe_phase(head).await?;
+        if accepts(phase) {
+            return Ok(());
+        }
+        if matches!(
+            phase,
+            ObservedRollbackPhase::Idle | ObservedRollbackPhase::Aborting
+        ) {
+            anyhow::bail!(
+                "this Realm is waiting for {expected} but the Coordinator has published \
+                 {phase:?}; the rollback it was taking part in is over"
+            );
+        }
+        if started.elapsed() >= limit {
+            anyhow::bail!(
+                "this Realm waited {}s for {expected} and the Coordinator has published \
+                 {phase:?}",
+                limit.as_secs()
+            );
+        }
+        tokio::time::sleep(super::BARRIER_POLL).await;
     }
 }

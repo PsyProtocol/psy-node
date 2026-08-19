@@ -330,7 +330,7 @@ impl RollbackParticipantView<PHash> for ScriptedCoordinator {
     ) -> anyhow::Result<ObservedRollbackPhase> {
         let look = self.looks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(match look {
-            0 => ObservedRollbackPhase::Freeze { head: self.head },
+            0 => ObservedRollbackPhase::Freeze { head: self.head, target: self.target },
             1 => ObservedRollbackPhase::Archive {
                 target: self.target,
                 head: self.head,

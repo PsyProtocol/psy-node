@@ -264,7 +264,7 @@ impl CommitWindowClock {
 /// Both recordings own a `CommitWindowClock`; this is the part of them a
 /// rollback executor uses, and naming it keeps the executor from having to know
 /// which role it is driving.
-pub trait CommitFreeze {
+pub trait CommitFreeze: Send + Sync {
     /// Stop admitting commits.
     fn freeze_for_rollback(&self);
     /// Admit them again.

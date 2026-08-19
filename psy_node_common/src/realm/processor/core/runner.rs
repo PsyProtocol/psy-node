@@ -78,6 +78,11 @@ where
     // would be indistinguishable and an aborted rollback would throw away sync
     // state the Coordinator never discarded.
     let mut rollback_aborted = false;
+    // Set once this Realm has run its own share, so neither the participation
+    // nor the recovery path repeats it.
+    let mut took_part = false;
+    // Set once the verify receipt for this rollback has been filed.
+    let mut confirmed = false;
 
     loop {
         if processor.db.status.should_run() {
@@ -120,6 +125,8 @@ where
                         }
                     }
                     rollback_aborted = false;
+                    took_part = false;
+                    confirmed = false;
                 }
                 Ok(Some(phase)) => {
                     // Remember the target while it is still being published.
@@ -127,6 +134,63 @@ where
                     // one that counts.
                     if let Some(target) = phase.target() {
                         rollback_target = Some(target);
+                    }
+                    // FROZEN is the only moment this Realm can join.  Taking
+                    // part is what the archive barrier waits for: without a
+                    // receipt from here the Coordinator would cross the point
+                    // of no return while this Realm had copied none of its
+                    // share.  Recovering afterwards still works and is what a
+                    // Realm that was down has to fall back on, but it happens
+                    // with no barrier protecting it.
+                    // The verify receipt is owed by every participant, however
+                    // it got here: one that took part, one restarted half way
+                    // through and no longer knows it did, and one that never
+                    // had anything above the target all owe the same thing.
+                    // Filing it on the phase rather than on memory is what lets
+                    // the last two file it at all.
+                    if let psy_node_core::store::rollback_coordination::ObservedRollbackPhase::Verify {
+                        target,
+                    } = phase
+                    {
+                        if !confirmed {
+                            match processor.db.confirm_rollback_target_reached(target).await {
+                                Ok(true) => confirmed = true,
+                                Ok(false) => {}
+                                Err(e) => tracing::error!(
+                                    "[REALM] could not confirm this Realm reached {target} \
+                                     ({e:#}); the Coordinator cannot publish until it can"
+                                ),
+                            }
+                        }
+                    }
+                    if let psy_node_core::store::rollback_coordination::ObservedRollbackPhase::Freeze {
+                        target,
+                        ..
+                    } = phase
+                    {
+                        if !took_part {
+                            match processor.db.take_part_in_rollback(target).await {
+                                Ok(true) => {
+                                    took_part = true;
+                                    // Its own share is done, so the recovery
+                                    // path must not run as well: replanning
+                                    // from a manifest whose rows are already
+                                    // gone would archive them as absent and
+                                    // overwrite the record of what was
+                                    // discarded.
+                                    rollback_target = None;
+                                }
+                                Ok(false) => {}
+                                Err(e) => {
+                                    tracing::error!(
+                                        "[REALM] could not take part in the rollback to \
+                                         {target} ({e:#}); it will be recovered after the fact \
+                                         instead, without the archive barrier waiting for it"
+                                    );
+                                    took_part = true;
+                                }
+                            }
+                        }
                     }
                     if matches!(
                         phase,

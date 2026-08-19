@@ -36,12 +36,18 @@ pub enum ObservedRollbackPhase {
     /// No rollback in progress.
     Idle,
     /// Requested but not yet archiving.  A participant freezes here.
-    Requested,
+    Requested { target: u64 },
     /// Archive your share of the range and file a receipt.
     Archive { target: u64, head: u64 },
     /// Stop producing new side effects, drain what is in flight, and report the
     /// head once it stops changing.
-    Freeze { head: u64 },
+    ///
+    /// Carries the target because this is where a participant joins: it files a
+    /// freeze receipt and then runs its own share, and the archive barrier can
+    /// only wait for a receipt a running participant files.  An earlier version
+    /// left the target out on the reasoning that nothing acts this early; that
+    /// was wrong, and it was what made Realms unable to take part at all.
+    Freeze { head: u64, target: u64 },
     /// Every participant archived; the Coordinator has crossed the barrier.
     /// Deleting is now permitted -- and only now.
     Delete { target: u64, head: u64 },
@@ -77,27 +83,31 @@ impl ObservedRollbackPhase {
 
     /// The height this rollback is heading for, when the phase names one.
     ///
-    /// `Requested` and `Freeze` do not: at those points the participant set is
-    /// fixed and the head is being settled, but the target is not yet something
-    /// a participant acts on.  A participant that only ever saw those phases
-    /// therefore learns no target, which is correct -- it has nothing to undo
-    /// to.
+    /// Every phase of a live rollback does.  `Aborting` deliberately does not:
+    /// it carries a request like the others, but a participant that acted on
+    /// the target of a rollback being abandoned would undo state the chain
+    /// never discarded.
     pub const fn target(self) -> Option<u64> {
         match self {
-            Self::Archive { target, .. }
+            Self::Requested { target }
+            | Self::Freeze { target, .. }
+            | Self::Archive { target, .. }
             | Self::Delete { target, .. }
             | Self::Restore { target }
             | Self::Verify { target } => Some(target),
-            Self::Idle | Self::Requested | Self::Freeze { .. } | Self::Aborting => None,
+            Self::Idle | Self::Aborting => None,
         }
     }
 
     pub fn from_control<Hash: Q256BitHash>(state: &RollbackControlState<Hash>) -> Self {
         match state {
             RollbackControlState::Idle => Self::Idle,
-            RollbackControlState::Requested(_) => Self::Requested,
+            RollbackControlState::Requested(request) => Self::Requested {
+                target: request.target().checkpoint_id().get(),
+            },
             RollbackControlState::Frozen(request) => Self::Freeze {
                 head: request.requested_head().checkpoint_id().get(),
+                target: request.target().checkpoint_id().get(),
             },
             RollbackControlState::Archiving(request) => Self::Archive {
                 target: request.target().checkpoint_id().get(),
@@ -405,8 +415,8 @@ mod tests {
         // the archive and compared against it after, and past DELETING the rows
         // a commit would write are the ones being rewritten.
         for phase in [
-            ObservedRollbackPhase::Requested,
-            ObservedRollbackPhase::Freeze { head: 100 },
+            ObservedRollbackPhase::Requested { target: 90 },
+            ObservedRollbackPhase::Freeze { head: 100, target: 90 },
             ObservedRollbackPhase::Archive { target: 90, head: 100 },
             ObservedRollbackPhase::Delete { target: 90, head: 100 },
             ObservedRollbackPhase::Restore { target: 90 },
@@ -452,7 +462,7 @@ mod tests {
         assert!(ObservedRollbackPhase::Delete { target: 1, head: 2 }.permits_destruction());
         for phase in [
             ObservedRollbackPhase::Idle,
-            ObservedRollbackPhase::Requested,
+            ObservedRollbackPhase::Requested { target: 90 },
             ObservedRollbackPhase::Archive { target: 1, head: 2 },
             ObservedRollbackPhase::Restore { target: 1 },
             ObservedRollbackPhase::Verify { target: 1 },
@@ -520,29 +530,35 @@ mod tests {
         );
         assert_eq!(ObservedRollbackPhase::Restore { target: 90 }.target(), Some(90));
         assert_eq!(ObservedRollbackPhase::Verify { target: 90 }.target(), Some(90));
-        for phase in [
-            ObservedRollbackPhase::Idle,
-            ObservedRollbackPhase::Requested,
-            ObservedRollbackPhase::Freeze { head: 100 },
-            ObservedRollbackPhase::Aborting,
-        ] {
+        assert_eq!(
+            ObservedRollbackPhase::Requested { target: 90 }.target(),
+            Some(90)
+        );
+        assert_eq!(
+            ObservedRollbackPhase::Freeze { head: 100, target: 90 }.target(),
+            Some(90)
+        );
+        for phase in [ObservedRollbackPhase::Idle, ObservedRollbackPhase::Aborting] {
             assert_eq!(phase.target(), None, "{phase:?} must not name a target");
         }
     }
 
     #[test]
-    fn a_participant_that_only_saw_the_freeze_learns_no_target() {
-        // The case that decides whether the recovery may be driven from the
-        // phase alone: a Realm that observed the rollback only while the head
-        // was being settled has nothing to reset to, and must fall back to the
-        // published head instead of guessing.
-        let seen: Vec<Option<u64>> = [
-            ObservedRollbackPhase::Requested,
-            ObservedRollbackPhase::Freeze { head: 100 },
-        ]
-        .into_iter()
-        .map(|p| p.target())
-        .collect();
-        assert!(seen.into_iter().all(|t| t.is_none()));
+    fn a_participant_learns_the_target_at_the_freeze_where_it_joins() {
+        // The freeze is the only moment a Realm can join: it files a receipt
+        // and runs its own share, and the archive barrier waits for that.  An
+        // earlier version left the target out of this phase, which is exactly
+        // what made Realms unable to take part.
+        assert_eq!(
+            ObservedRollbackPhase::Freeze { head: 100, target: 90 }.target(),
+            Some(90)
+        );
+    }
+
+    #[test]
+    fn an_aborting_rollback_names_no_target_to_act_on() {
+        // It carries a request like any other phase, but acting on it would
+        // undo state the chain never discarded.
+        assert_eq!(ObservedRollbackPhase::Aborting.target(), None);
     }
 }

@@ -553,12 +553,33 @@ impl ScyllaRollbackExecutor {
             plan.head,
             head_digest,
         ))?;
+        // Wait for the rest of the set rather than reading once.  A barrier is
+        // a rendezvous, and reading the table in the same breath as publishing
+        // the phase makes it a race the Coordinator always wins: a Realm has to
+        // notice the phase, plan its own share and archive it before it has
+        // anything to file.
         if let Some(view) = receipts {
-            for receipt in view
-                .read_freeze_receipts_for(plan.head, participants.participants())
-                .await?
-            {
-                freeze.file(receipt)?;
+            let started = std::time::Instant::now();
+            let limit = super::barrier_wait_limit();
+            while !freeze.is_met() {
+                for receipt in view
+                    .read_freeze_receipts_for(plan.head, participants.participants())
+                    .await?
+                {
+                    freeze.file(receipt)?;
+                }
+                if freeze.is_met() {
+                    break;
+                }
+                if started.elapsed() >= limit {
+                    anyhow::bail!(
+                        "FREEZE_ALL waited {}s for {:?} and they have not frozen; the rollback \
+                         cannot proceed and the chain stays frozen until it is aborted",
+                        limit.as_secs(),
+                        freeze.missing()
+                    );
+                }
+                tokio::time::sleep(super::BARRIER_POLL).await;
             }
         }
         let sealed_freeze = freeze.seal()?;
@@ -617,11 +638,31 @@ impl ScyllaRollbackExecutor {
         // finds it again instead of waiting for a participant that already
         // finished.
         if let Some(view) = receipts {
-            for receipt in view
-                .read_archive_receipts_for(target, plan.head, participants.participants())
-                .await?
-            {
-                barrier.file(receipt)?;
+            let started = std::time::Instant::now();
+            let limit = super::barrier_wait_limit();
+            while !barrier.is_met() {
+                for receipt in view
+                    .read_archive_receipts_for(target, plan.head, participants.participants())
+                    .await?
+                {
+                    barrier.file(receipt)?;
+                }
+                if barrier.is_met() {
+                    break;
+                }
+                if started.elapsed() >= limit {
+                    // Failing here is the safe direction and the reason this
+                    // barrier exists: crossing it with a participant that has
+                    // archived nothing is the one mistake nothing downstream
+                    // can repair.
+                    anyhow::bail!(
+                        "GLOBAL_ARCHIVE_BARRIER waited {}s for {:?} and they have not archived; \
+                         nothing has been deleted and the rollback can still be abandoned",
+                        limit.as_secs(),
+                        barrier.missing()
+                    );
+                }
+                tokio::time::sleep(super::BARRIER_POLL).await;
             }
         }
         let sealed_barrier = barrier.seal()?;
@@ -686,11 +727,31 @@ impl ScyllaRollbackExecutor {
             plan_digest(plan_id),
         ))?;
         if let Some(view) = receipts {
-            for receipt in view
-                .read_verify_receipts_for(target, participants.participants())
-                .await?
-            {
-                publish.file(receipt)?;
+            let started = std::time::Instant::now();
+            let limit = super::barrier_wait_limit();
+            while !publish.is_met() {
+                for receipt in view
+                    .read_verify_receipts_for(target, participants.participants())
+                    .await?
+                {
+                    publish.file(receipt)?;
+                }
+                if publish.is_met() {
+                    break;
+                }
+                if started.elapsed() >= limit {
+                    // Past the point of no return, so this is not abandonable:
+                    // the rollback is resumable and must be finished once the
+                    // straggler reports.
+                    anyhow::bail!(
+                        "PUBLISH_ALL waited {}s for {:?} and they have not verified; the \
+                         rollback is past the point of no return and must be resumed, not \
+                         abandoned",
+                        limit.as_secs(),
+                        publish.missing()
+                    );
+                }
+                tokio::time::sleep(super::BARRIER_POLL).await;
             }
         }
         let sealed_publish = publish.seal()?;

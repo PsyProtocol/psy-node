@@ -106,3 +106,30 @@ pub async fn drain_in_flight_commit(
     }
     Ok(())
 }
+
+/// How long a barrier waits for the participants it is missing.
+///
+/// A barrier is a rendezvous.  Reading the receipt table once and failing if it
+/// is incomplete turns it into a race, and one the Coordinator always wins: it
+/// publishes the phase and reads in the same breath, while a Realm has to
+/// notice the phase, plan its own share and archive it before it has anything
+/// to file.  With a participant set of one that never showed -- the Coordinator
+/// files its own receipt and the barrier is met immediately -- which is why it
+/// survived until a Realm joined the set.
+///
+/// Bounded, because the alternative to failing is not waiting forever: a
+/// participant that is never coming leaves the chain frozen, and an operator
+/// needs to be told rather than left watching a process that looks busy.
+pub fn barrier_wait_limit() -> std::time::Duration {
+    std::time::Duration::from_secs(
+        std::env::var("PSY_ROLLBACK_BARRIER_WAIT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(180),
+    )
+}
+
+/// Poll interval while a barrier waits.  Short relative to how long a
+/// participant takes to archive, so the wait is bounded by the slow participant
+/// rather than by this.
+pub const BARRIER_POLL: std::time::Duration = std::time::Duration::from_millis(500);

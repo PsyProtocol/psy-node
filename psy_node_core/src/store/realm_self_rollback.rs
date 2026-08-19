@@ -77,3 +77,47 @@ pub trait RealmSelfRollback<Hash: Q256BitHash>: Send + Sync {
         target: u64,
     ) -> anyhow::Result<RealmSelfRollbackReport>;
 }
+
+/// Taking part in a rollback while it is happening, as opposed to recovering
+/// from one afterwards.
+///
+/// The two are not alternatives.  Recovery has to exist because a Realm can be
+/// down for the whole rollback, and participation has to exist because without
+/// it the archive barrier means nothing for Realms: the Coordinator would cross
+/// the point of no return while a Realm had copied none of its share.  A Realm
+/// that is up does this; one that was not does the other when it returns.
+#[async_trait]
+pub trait RealmRollbackParticipation<Hash: Q256BitHash>: Send + Sync {
+    /// Run this Realm's share of the rollback the Coordinator has published,
+    /// filing the receipts its barriers wait for.
+    async fn take_part_in_rollback(
+        &self,
+        recording: &RealmCommitRecording<Hash>,
+        realm_id: u32,
+        realm_sub_id: u16,
+        head: &CanonicalChainRef<Hash>,
+        target: u64,
+    ) -> anyhow::Result<RealmSelfRollbackReport>;
+
+    /// Confirm this Realm holds nothing above `target` and file the verify
+    /// receipt PUBLISH_ALL waits for.
+    ///
+    /// Earned by checking rather than by remembering.  A Realm that took part,
+    /// one that was restarted half way through and lost the fact, and one that
+    /// never had anything above the target all owe the same receipt, and only
+    /// the first would be able to file it from memory.  Checking costs one
+    /// manifest read and is true for all three.
+    ///
+    /// Anything still found above the target is undone here rather than
+    /// reported: the receipt says the Realm reached the target, and filing it
+    /// while rows remained would be the participant lying to the barrier that
+    /// exists to catch exactly that.
+    async fn confirm_target_reached(
+        &self,
+        recording: &RealmCommitRecording<Hash>,
+        realm_id: u32,
+        realm_sub_id: u16,
+        search_head: &CanonicalChainRef<Hash>,
+        target: u64,
+    ) -> anyhow::Result<()>;
+}

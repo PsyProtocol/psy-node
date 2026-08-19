@@ -171,6 +171,66 @@ where
     /// unconditional `set_*`, so a re-synced height replaces what was there.
     /// Heights the new branch never reaches keep stale copies, which is a leak
     /// rather than a ghost: nothing reads a checkpoint above the current head.
+    /// Run this Realm's share of a rollback the Coordinator has published, and
+    /// report whether it did.
+    ///
+    /// Called when the Coordinator publishes FROZEN, which is the only moment a
+    /// Realm can join: the archive barrier is what stops the Coordinator
+    /// crossing the point of no return while a participant has copied nothing,
+    /// and it can only wait for a receipt that a running Realm files.  A Realm
+    /// that is down for this misses it and recovers afterwards instead --
+    /// slower, and without the barrier's protection, but the only option left
+    /// to it.
+    ///
+    /// `Ok(false)` means this Realm has no way to take part, which is the
+    /// configuration before rollback participation is enabled.
+    pub async fn take_part_in_rollback(&mut self, target: u64) -> anyhow::Result<bool> {
+        let Some(driver) = self.recording.participation() else {
+            return Ok(false);
+        };
+        let head = self.coordinator_chain_ref_last_synced();
+        let report = driver
+            .take_part_in_rollback(
+                &self.recording,
+                self.state.realm_identifier.realm_id,
+                self.state.realm_identifier.realm_sub_id,
+                &head,
+                target,
+            )
+            .await?;
+        tracing::warn!(
+            "[REALM_ROLLBACK] took part in the rollback to {}: {} rows planned, {} archived, {} \
+             deleted from this Realm's own share",
+            report.target,
+            report.planned_rows,
+            report.archived_rows,
+            report.deleted_rows
+        );
+        // The sync markers still describe the discarded range: the rows are
+        // gone but this Realm still believes it is at the old height.
+        self.reset_for_rollback_to(target).await?;
+        Ok(true)
+    }
+
+    /// Confirm this Realm has reached `target` and file the verify receipt the
+    /// Coordinator's publish barrier waits for.
+    pub async fn confirm_rollback_target_reached(&mut self, target: u64) -> anyhow::Result<bool> {
+        let Some(driver) = self.recording.participation() else {
+            return Ok(false);
+        };
+        let search_head = self.coordinator_chain_ref_last_synced();
+        driver
+            .confirm_target_reached(
+                &self.recording,
+                self.state.realm_identifier.realm_id,
+                self.state.realm_identifier.realm_sub_id,
+                &search_head,
+                target,
+            )
+            .await?;
+        Ok(true)
+    }
+
     /// Undo everything above `target`: what this Realm wrote itself, then what
     /// it copied from the Coordinator.
     ///

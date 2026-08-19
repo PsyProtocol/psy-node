@@ -61,6 +61,9 @@ pub struct RealmCommitRecording<Hash: Q256BitHash> {
     /// Separate from the sync reset because the two undo different things: the
     /// reset gives back what the Realm copied, this gives back what it wrote.
     self_rollback: Option<Arc<dyn super::realm_self_rollback::RealmSelfRollback<Hash>>>,
+    /// Taking part in a rollback as it happens, as opposed to recovering from
+    /// one afterwards.  Both are needed and neither replaces the other.
+    participation: Option<Arc<dyn super::realm_self_rollback::RealmRollbackParticipation<Hash>>>,
     journal: Option<Arc<dyn CommitVerificationJournal>>,
 }
 
@@ -75,6 +78,7 @@ impl<Hash: Q256BitHash> Clone for RealmCommitRecording<Hash> {
             participant_view: self.participant_view.clone(),
             sync_epoch: self.sync_epoch.clone(),
             self_rollback: self.self_rollback.clone(),
+            participation: self.participation.clone(),
             journal: self.journal.clone(),
         }
     }
@@ -99,6 +103,7 @@ impl<Hash: Q256BitHash> RealmCommitRecording<Hash> {
             participant_view: None,
             sync_epoch: None,
             self_rollback: None,
+            participation: None,
         }
     }
 
@@ -143,6 +148,21 @@ impl<Hash: Q256BitHash> RealmCommitRecording<Hash> {
         &self,
     ) -> Option<&dyn super::realm_self_rollback::RealmSelfRollback<Hash>> {
         self.self_rollback.as_deref()
+    }
+
+    #[must_use]
+    pub fn with_participation(
+        mut self,
+        driver: Option<Arc<dyn super::realm_self_rollback::RealmRollbackParticipation<Hash>>>,
+    ) -> Self {
+        self.participation = driver;
+        self
+    }
+
+    pub fn participation(
+        &self,
+    ) -> Option<&dyn super::realm_self_rollback::RealmRollbackParticipation<Hash>> {
+        self.participation.as_deref()
     }
 
     /// The head the Coordinator publishes right now.

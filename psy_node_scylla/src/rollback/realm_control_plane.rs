@@ -206,5 +206,9 @@ impl<Hash: Q256BitHash + QHashBase> RealmRollbackControlPlane<Hash> {
             as Arc<dyn psy_node_core::store::realm_sync_epoch::RealmSyncEpochStore>))
         .with_self_rollback(Some(self.self_rollback.clone()
             as Arc<dyn psy_node_core::store::realm_self_rollback::RealmSelfRollback<Hash>>))
+        .with_participation(Some(self.self_rollback.clone()
+            as Arc<
+                dyn psy_node_core::store::realm_self_rollback::RealmRollbackParticipation<Hash>,
+            >))
     }
 }
