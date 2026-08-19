@@ -4,17 +4,22 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+
 use async_trait::async_trait;
 use parth_common::memory_stores::{
     dash_tree_append_only::PsyDashMemoryAppendOnlyMerkleStore, mem_tree_recorder::SimpleMemoryMerkleRecorderStore, traits::PsyMemoryMerkleStoreImm,
 };
 use parth_core::{
     crypto::hash::traits::{MerkleZeroHasher, ZeroableHash},
-    data::hash::merkle_node_key::SimpleMerkleNodeKey,
+    data::hash::{
+        fast_node_serializer::{QMerkleStoreFastZeroNodeSerializer, QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE},
+        merkle_node_key::SimpleMerkleNodeKey,
+    },
     felt::{QFelt64, ZeroableFelt},
     protocol::core_types::{Q256BitHash, QDBHashBase, QFHashBase, QNetworkTypesConfig},
     QCoreProcCheckpointUniqueId, QJobIdBase,
 };
+
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_data::{
     guta::{
@@ -24,6 +29,7 @@ use psy_data::{
         sub_tree_transition::SubTreeNodeStateTransition,
     },
     node::realm_processor::RealmProcessorCoreState,
+    prepared_block::realm::PsyPreparedRealmBlockStateUpdates,
     queue_items::realm_user_update::PsyRealmUserUpdateQueueItem,
     v1::qdata::{ffs_sizes::PSY_OBJECT_FFS_SIZE_USER_LEAF, user::PQEDUserLeaf},
     worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId,
@@ -50,6 +56,7 @@ use crate::{
 };
 pub const REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_BYTES: [u8; 4] = [0x52, 0x47, 0x45, 0x31]; // 'RGE1' in ASCII
 pub const REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32: u32 = 0x31_45_47_52; // 'RGE1' in little-endian u32
+
 
 pub fn get_new_realm_end_cap_gatherer_backup_file_path(
     backup_file_directory: &str,
@@ -333,8 +340,9 @@ pub struct RealmGUTAEndCapGathererConfig<
     pub checkpoint_tree: Arc<PsyDashMemoryAppendOnlyMerkleStore<N::HasherBase, N::QHash>>,
     pub future_pending_end_cap_jobs: Arc<RwLock<Vec<PlannedFutureEndCapJob<N::F, N::QHash>>>>,
     pub tree_store: Arc<dyn PsyNodeGlobalUserTreeDatabaseReader<N::QHash> + Send + Sync>,
-
     pub _phantom_n: std::marker::PhantomData<N>,
+
+
 }
 impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>, FileSystem: TokioLikeFileSystem> Clone
     for RealmGUTAEndCapGathererConfig<N, TempDatabase, FileSystem>
@@ -355,6 +363,123 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
         }
     }
 }
+
+fn apply_state_updates_to_tree<Hasher, Hash>(
+    tree: &mut SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
+    old_root: Hash,
+    new_root: Hash,
+    gut_ffs: &[u8],
+    coordinator_global_user_tree_height: u8,
+    realm_id: u64,
+) -> anyhow::Result<()>
+where
+    Hasher: MerkleZeroHasher<Hash>,
+    Hash: Copy + PartialEq + Default + std::fmt::Debug + Q256BitHash,
+{
+    if tree.get_last_commit_root() == new_root {
+        return Ok(());
+    }
+
+    tree.revert_changes();
+    anyhow::ensure!(
+        tree.get_last_commit_root() == old_root,
+        "gatherer FastForward committed root {:?} is not old_root {:?}",
+        tree.get_last_commit_root(),
+        old_root
+    );
+    apply_zero_id_ffs_nodes(tree, gut_ffs, coordinator_global_user_tree_height, realm_id)?;
+    if tree.get_root() != new_root {
+        tree.revert_changes();
+        anyhow::bail!(
+            "gatherer FastForward root {:?} is not new_root {:?}",
+            tree.get_root(),
+            new_root
+        );
+    }
+    tree.commit_changes();
+    anyhow::ensure!(
+        tree.get_last_commit_root() == new_root,
+        "gatherer FastForward committed root {:?} is not new_root {:?}",
+        tree.get_last_commit_root(),
+        new_root
+    );
+    Ok(())
+}
+
+
+fn apply_zero_id_ffs_nodes<Hasher, Hash>(
+    tree: &mut SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
+    ffs: &[u8],
+    coordinator_global_user_tree_height: u8,
+    realm_id: u64,
+) -> anyhow::Result<()>
+where
+    Hasher: MerkleZeroHasher<Hash>,
+    Hash: Copy + PartialEq + Default + std::fmt::Debug + Q256BitHash,
+{
+    if ffs.is_empty() {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        ffs.len() % QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE == 0,
+        "global user tree FFS length {} is not a multiple of {}",
+        ffs.len(),
+        QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE
+    );
+    let nodes = QMerkleStoreFastZeroNodeSerializer::deserialize_zero_id_nodes_from_slice::<Hash>(ffs);
+    for node in nodes {
+        let local_key = realm_local_key_from_offset_ffs_key(
+            node.key,
+            coordinator_global_user_tree_height,
+            realm_id,
+        )?;
+        tree.set_node_value(local_key, node.value);
+    }
+    Ok(())
+}
+
+fn realm_local_key_from_offset_ffs_key(
+    key: SimpleMerkleNodeKey,
+    coordinator_height: u8,
+    realm_id: u64,
+) -> anyhow::Result<SimpleMerkleNodeKey> {
+    anyhow::ensure!(
+        key.level >= coordinator_height,
+        "global user tree FFS node level {} is below coordinator height {}",
+        key.level,
+        coordinator_height
+    );
+    let local_level = key.level - coordinator_height;
+    let expected_realm_id = if local_level >= 64 {
+        anyhow::ensure!(
+            key.index == 0,
+            "global user tree FFS node index {} does not fit in local level {}",
+            key.index,
+            local_level
+        );
+        0
+    } else {
+        key.index >> local_level
+    };
+    anyhow::ensure!(
+        expected_realm_id == realm_id,
+        "global user tree FFS node realm_id {} does not match {}",
+        expected_realm_id,
+        realm_id
+    );
+    let local_index = if local_level == 0 {
+        0
+    } else if local_level >= 64 {
+        key.index
+    } else {
+        key.index & ((1u64 << local_level) - 1)
+    };
+    Ok(SimpleMerkleNodeKey {
+        level: local_level,
+        index: local_index,
+    })
+}
+
 pub struct RealmGUTAEndCapGatherer<
     N: QNetworkTypesConfig,
     TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>,
@@ -477,6 +602,8 @@ impl<
         config: RealmGUTAEndCapGathererConfig<N, TempDatabase, FileSystem>,
     ) -> anyhow::Result<Self> {
         let status = config.status.read().unwrap().clone();
+
+
         let live_root = tree.get_root();
         let snapshot_root = status.gathering_realm_start_root;
         if live_root == snapshot_root || live_root == status.processing_realm_end_root {
@@ -499,22 +626,20 @@ impl<
             config.realm_sub_id_u64,
             status.gathering_unique_pending_id,
         );
-        let mut new_realm_end_cap_gatherer_file = config
-            .file_system
-            .file_like_fs_create(&new_realm_end_cap_gatherer_file_path.to_string_lossy())
-            .await?;
+        let backup_path = new_realm_end_cap_gatherer_file_path.to_string_lossy().to_string();
+        if config.file_system.file_like_exists(&backup_path).await? {
+            config.file_system.file_like_remove_file(&backup_path).await?;
+        }
+        let mut new_realm_end_cap_gatherer_file = config.file_system.file_like_fs_create(&backup_path).await?;
         new_realm_end_cap_gatherer_file
             .write_u32_le(REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32)
             .await?;
         new_realm_end_cap_gatherer_file.write_all(&tree.get_root().into_owned_32bytes()).await?;
         new_realm_end_cap_gatherer_file.write_all(&tree.get_root().into_owned_32bytes()).await?;
-        new_realm_end_cap_gatherer_file.write_u64_le(0).await?; // place holder for total number end caps processed
+        new_realm_end_cap_gatherer_file.write_u64_le(0).await?;
         config
             .file_system
-            .file_like_fs_flush_file_with_path(
-                &new_realm_end_cap_gatherer_file_path.to_string_lossy(),
-                &mut new_realm_end_cap_gatherer_file,
-            )
+            .file_like_fs_flush_file_with_path(&backup_path, &mut new_realm_end_cap_gatherer_file)
             .await?;
 
         let mut guta_planner = RealmGUTAPlanner::<N::F, N::QHash>::new(
@@ -528,16 +653,17 @@ impl<
             N::GLOBAL_USER_TREE_HEIGHT,
             config.coordinator_guta_updates_circuit_whitelist,
         );
-        let future_end_cap_jobs = {
+        let future_end_cap_jobs: Vec<PlannedFutureEndCapJob<N::F, N::QHash>> = {
             std::mem::take(
-                config
+                &mut *config
                     .future_pending_end_cap_jobs
                     .write()
-                    .map_err(|_| anyhow::anyhow!("error writing to future pending end cap jobs"))?
-                    .as_mut(),
+                    .map_err(|_| anyhow::anyhow!("error writing to future pending end cap jobs"))?,
             )
         };
-        let end_cap_jobs_added = guta_planner
+
+        let restore_future_jobs = future_end_cap_jobs.clone();
+        let end_cap_jobs_added = match guta_planner
             .add_future_end_cap_jobs(
                 &config.checkpoint_tree,
                 tree,
@@ -545,7 +671,18 @@ impl<
                 config.temp_db.clone(),
                 future_end_cap_jobs,
             )
-            .await?;
+            .await
+        {
+            Ok(count) => count,
+            Err(error) => {
+                if let Ok(mut pending) = config.future_pending_end_cap_jobs.write() {
+                    pending.extend(restore_future_jobs);
+                    pending.extend(std::mem::take(&mut guta_planner.future_pending_end_cap_jobs));
+                }
+                return Err(error);
+            }
+        };
+
         config
             .file_system
             .file_like_fs_flush_file_with_path(
@@ -572,6 +709,8 @@ impl<
         item: Vec<u8>,
     ) -> anyhow::Result<()> {
         tracing::info!("RealmGUTAEndCapGatherer processing queue item of size {}", item.len());
+
+
         if PsyRealmUserUpdateQueueItem::<N::F, N::QHash>::IS_FIXED_SIZE && item.len() != PsyRealmUserUpdateQueueItem::<N::F, N::QHash>::FIXED_SIZE {
             // added sanity check
             return Err(anyhow::anyhow!(
@@ -616,6 +755,8 @@ impl<
             self.status.gathering_unique_pending_id,
             tree.get_root()
         );
+
+
         let needs_revert = {
             self.config
                 .status
@@ -760,6 +901,28 @@ impl<
             db_output: RealmGUTAEndCapGathererOutputDatabase::<N::F, N::QHash>::get_empty(tree.get_root()),
             job_ids: vec![],
         })
+    }
+
+    async fn apply_fast_forward_with_tree(
+        tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
+        config: &RealmGUTAEndCapGathererConfig<N, TempDatabase, FileSystem>,
+        state_updates: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        let updates = PsyPreparedRealmBlockStateUpdates::<N::QHash>::psy_ser_from_slice(&state_updates)?;
+        apply_state_updates_to_tree(
+            tree,
+            updates.old_realm_root,
+            updates.new_realm_root,
+            &updates.update_global_user_tree_nodes_ffs,
+            N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+            config.realm_id_u64,
+        )?;
+        tracing::info!(
+            "Applied Realm gatherer FastForward old_root={:?} new_root={:?}",
+            updates.old_realm_root,
+            updates.new_realm_root
+        );
+        Ok(())
     }
 }
 

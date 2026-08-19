@@ -64,8 +64,6 @@ where
         tracing::info!("[REALM_STARTUP] init_with_setup_and_genesis done");
         //db.set_new_unique_ids().await?;
         tracing::info!("intialized realm processor database, building gatherers...");
-
-        let shared_user_tree = Arc::new(tokio::sync::RwLock::new(global_user_tree));
         let guta_create_builder_config = RealmGUTAEndCapGathererConfig::<N, TempDatabase, FileSystem> {
             realm_id_u64: db.state.realm_id_u64,
             realm_sub_id_u64: db.state.realm_sub_id_u64,
@@ -79,7 +77,8 @@ where
             future_pending_end_cap_jobs: Arc::new(std::sync::RwLock::new(Vec::new())),
             tree_store: db.db.clone(),
         };
-        let (guta_queue_gatherer, guta_join_handle) = EphemeralQueueGathererWithTree::new_with_status_shared::<
+
+        let (guta_queue_gatherer, guta_join_handle) = EphemeralQueueGathererWithTree::new_with_status::<
             GUTAUpdateQueue,
             RealmGUTAEndCapGathererConfig<N, TempDatabase, FileSystem>,
             N::QHash,
@@ -89,7 +88,7 @@ where
             db.guta_update_queue.clone(),
             guta_create_builder_config,
             db.guta_queue_key_status_manager.get_queue_key()?,
-            shared_user_tree.clone(),
+            global_user_tree,
             db.status.clone(),
         );
 
@@ -98,17 +97,16 @@ where
                 db,
                 guta_queue_gatherer: guta_queue_gatherer,
                 proof_worker_queue_max_time_ms: u64::MAX,
-                // Slice C: optional Realm P2P wiring defaults to disabled.
                 guta_gatherer_backup_directory,
                 p2p: None,
                 rotation: None,
                 bls_secret: None,
                 p2p_validator_user_id: None,
                 p2p_bls_public_keys: None,
-                shared_user_tree,
-                included_proposal_updates: Arc::new(tokio::sync::RwLock::new(None)),
-
+                verified_state_updates: None,
+                held_state_updates: None,
             },
+
             guta_join_handle,
         ))
     }

@@ -33,10 +33,12 @@ use psy_node_common::realm::network::{
     build_optional_realm_network, parse_proposer_node_ids, run_realm_network, OptionalRealmNetwork,
     RealmNetworkEvent,
 };
-use psy_node_common::realm::processor::consensus::{
-    decode_proposal_state_updates, sign_vote, verify_proposal_submission,
-};
-use psy_node_common::realm::processor::core::IncludedProposalStateUpdates;
+use psy_node_common::realm::processor::consensus::{sign_vote, verify_proposal_submission};
+
+
+
+
+
 
 
 use psy_node_core::config::node_start_config::{RealmEdgeStartConfig, RealmProcessorStartConfig};
@@ -238,8 +240,12 @@ pub fn spawn_processor_realm_network<N>(
     built: OptionalRealmNetwork,
     config: &RealmProcessorStartConfig,
     proof_verifier: N::ZKVerifier,
-    included_proposal_updates: Arc<tokio::sync::RwLock<Option<IncludedProposalStateUpdates<N::QHash>>>>,
+    verified_state_updates: tokio::sync::mpsc::Sender<Vec<u8>>,
 )
+
+
+
+
 where
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
     N::ZKVerifier: 'static,
@@ -255,7 +261,7 @@ where
     let chain_id = config.network.get_chain_id();
     let proposer_node_ids = proposer_node_ids_from_config(config)
         .expect("processor Realm P2P proposer NodeId config was validated at startup");
-    let included_proposal_updates = included_proposal_updates.clone();
+
 
     let roster_path = config.p2p_roster_path.as_deref().expect(
         "processor Realm P2P roster path was validated at startup",
@@ -322,12 +328,10 @@ where
                             proposer.validator_user_id,
                             proof_verifier.as_ref(),
                         )?;
-                        let updates = decode_proposal_state_updates::<N::QHash>(&decoded.state_updates)?;
-                        *included_proposal_updates.write().await = Some(IncludedProposalStateUpdates {
-                            proposal_id: proposal.proposal_id,
-                            end_root: updates.new_realm_root.into_owned_32bytes(),
-                            updates,
-                        });
+                        verified_state_updates
+                            .send(decoded.state_updates)
+                            .await
+                            .map_err(|_| anyhow::anyhow!("verified state_updates receiver dropped"))?;
                         Ok::<(), anyhow::Error>(())
                     }
                     .await;

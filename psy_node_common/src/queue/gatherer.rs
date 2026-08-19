@@ -13,6 +13,20 @@ use crate::{
     utils::processor_status::ProcessorStatus,
 };
 
+pub enum GathererTreeCommand<Output> {
+    Finalize {
+        reply: oneshot::Sender<Output>,
+    },
+    FastForward {
+        state_updates: Vec<u8>,
+        reply: oneshot::Sender<anyhow::Result<()>>,
+    },
+    Stop {
+        reply: oneshot::Sender<Output>,
+    },
+}
+
+
 
 #[derive(Clone)]
 pub struct GathererValue<T> {
@@ -131,8 +145,9 @@ pub struct EphemeralQueueGathererWithTree<
     Output: Sized + Send + Sync + 'static,
 > {
     qk: QueueKeyStatusManager<QUEUE_TOPIC_ID, QueueItem>,
-    trigger_tx: mpsc::Sender<oneshot::Sender<Output>>,
+    trigger_tx: mpsc::Sender<GathererTreeCommand<Output>>,
 }
+
 
 impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase + 'static, Output: Send + Sync>
     EphemeralQueueGathererWithTree<QUEUE_TOPIC_ID, QueueItem, Output>
@@ -199,7 +214,8 @@ impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase + 'static, Output:
         status: ProcessorStatus,
     ) -> (Self, tokio::task::JoinHandle<Result<(), anyhow::Error>>) {
         let qk = QueueKeyStatusManager::new_with_status(base_queue_key.clone(), status);
-        let (trigger_tx, trigger_rx) = mpsc::channel::<oneshot::Sender<Output>>(1);
+        let (trigger_tx, trigger_rx) = mpsc::channel::<GathererTreeCommand<Output>>(1);
+
 
         let jh: tokio::task::JoinHandle<Result<(), anyhow::Error>> =
             tokio::spawn(gatherer_runner_for_tree::<
@@ -225,7 +241,9 @@ impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase + 'static, Output:
     pub async fn stop_gracefully(&mut self) -> anyhow::Result<()> {
         self.qk.begin_shutdown()?;
         let (response_tx, response_rx) = oneshot::channel();
-        self.trigger_tx.send(response_tx).await?;
+        self.trigger_tx
+            .send(GathererTreeCommand::Stop { reply: response_tx })
+            .await?;
         let _result = response_rx.await?;
         Ok(())
     }
@@ -238,15 +256,29 @@ impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase + 'static, Output:
         let (response_tx, response_rx) = oneshot::channel();
         if response_rx.is_terminated() {
             anyhow::bail!("GATHERER_{QUEUE_TOPIC_ID}: Response channel was terminated before sending.");
-        }else if response_tx.is_closed() {
+        } else if response_tx.is_closed() {
             anyhow::bail!("GATHERER_{QUEUE_TOPIC_ID}: Response channel was closed before sending.");
         }
         tracing::info!("start finish finalize_gathering_and_update_queue_key for GATHERER_{QUEUE_TOPIC_ID}");
-        self.trigger_tx.send(response_tx).await?;
+        self.trigger_tx
+            .send(GathererTreeCommand::Finalize { reply: response_tx })
+            .await?;
         let result = response_rx.await?;
         tracing::info!("end finish finalize_gathering_and_update_queue_key for GATHERER_{QUEUE_TOPIC_ID}");
         Ok(result)
     }
+
+    pub async fn fast_forward(&mut self, state_updates: Vec<u8>) -> anyhow::Result<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.trigger_tx
+            .send(GathererTreeCommand::FastForward {
+                state_updates,
+                reply: response_tx,
+            })
+            .await?;
+        response_rx.await?
+    }
+
 }
 pub async fn gatherer_runner<
     const QUEUE_TOPIC_ID: u32,
@@ -382,25 +414,53 @@ pub async fn gatherer_runner_for_tree<
     mut queue_key: QPStandardUniqueIdQueueKey<QUEUE_TOPIC_ID, QueueItem>,
     tree: Arc<tokio::sync::RwLock<SimpleMemoryMerkleRecorderStore<Hasher, Hash>>>,
     queue_key_helper: QueueKeyStatusManager<QUEUE_TOPIC_ID, QueueItem>,
-    mut trigger_rx: mpsc::Receiver<oneshot::Sender<Builder::Output>>,
+    mut trigger_rx: mpsc::Receiver<GathererTreeCommand<Builder::Output>>,
+
 ) -> anyhow::Result<()> {
+    let mut pending_cycle_items: Vec<Vec<u8>> = Vec::new();
+    let mut pending_handoff: Option<GathererTreeCommand<Builder::Output>> = None;
     loop {
         if !queue_key_helper.should_run() {
             tracing::error!("GATHERER_{QUEUE_TOPIC_ID}: Processor entered {:?}; stopping gatherer", queue_key_helper.status.state());
             return Ok(());
         }
-        let mut builder = match {
-            let mut tree = tree.write().await;
-            Builder::create_new_with_tree(&mut *tree, queue_key.unique_id, create_builder_config.clone()).await
-        } {
-            Ok(builder) => builder,
-            Err(err) => {
-                tracing::error!(
-                    "GATHERER_{QUEUE_TOPIC_ID}: Error creating new builder: {:?}, retrying in 5s",
-                    err
-                );
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                continue;
+        let mut builder = loop {
+            if !queue_key_helper.should_run() {
+                tracing::error!("GATHERER_{QUEUE_TOPIC_ID}: Processor entered {:?}; stopping gatherer", queue_key_helper.status.state());
+                return Ok(());
+            }
+            while let Ok(command) = trigger_rx.try_recv() {
+                match command {
+                    GathererTreeCommand::FastForward { state_updates, reply } => {
+                        let result = {
+                            let mut tree = tree.write().await;
+                            Builder::apply_fast_forward_with_tree(
+                                &mut *tree,
+                                &create_builder_config,
+                                state_updates,
+                            ).await
+                        };
+                        if reply.send(result).is_err() {
+                            tracing::error!("GATHERER_{QUEUE_TOPIC_ID}: FastForward reply dropped");
+                        }
+                    }
+                    handoff @ (GathererTreeCommand::Finalize { .. } | GathererTreeCommand::Stop { .. }) => {
+                        pending_handoff = Some(handoff);
+                    }
+                }
+            }
+            match {
+                let mut tree = tree.write().await;
+                Builder::create_new_with_tree(&mut *tree, queue_key.unique_id, create_builder_config.clone()).await
+            } {
+                Ok(builder) => break builder,
+                Err(err) => {
+                    tracing::error!(
+                        "GATHERER_{QUEUE_TOPIC_ID}: Error creating new builder: {:?}, retrying in 5s",
+                        err
+                    );
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
             }
         };
         tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Starting new gathering phase with unique_id: {}, realm_id: {}, realm_sub_id: {}",
@@ -412,29 +472,127 @@ pub async fn gatherer_runner_for_tree<
             tracing::warn!("GATHERER_{QUEUE_TOPIC_ID}: ensure_consumer for unique_id {} failed: {}; proceeding with existing consumer state",
                 queue_key.unique_id, e);
         }
-        if trigger_rx.is_closed() {
+        if trigger_rx.is_closed() && pending_handoff.is_none() {
             tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Trigger channel closed before gathering started, stopping gatherer.");
             return Ok(());
+        }
+        let mut cycle_items = std::mem::take(&mut pending_cycle_items);
+        if !cycle_items.is_empty() {
+            if let Err(err) = {
+                let mut tree = tree.write().await;
+                builder.update_from_many_queue_items_with_tree(&mut *tree, cycle_items.clone()).await
+            } {
+                tracing::error!(
+                    "GATHERER_{QUEUE_TOPIC_ID}: Error replaying {} retained cycle items after create: {:?}",
+                    cycle_items.len(),
+                    err
+                );
+                pending_cycle_items = cycle_items;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
         }
         'gathering: loop {
             if !queue_key_helper.should_run() {
                 tracing::error!("GATHERER_{QUEUE_TOPIC_ID}: Processor entered {:?}; stopping gatherer", queue_key_helper.status.state());
                 return Ok(());
             }
-            /*
-            if trigger_rx.is_closed() {
-                tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Trigger channel closed, stopping gatherer.");
-                return Ok(());
-            }
-            */
-            //tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Waiting for messages or trigger...");
 
-            tokio::select! {
-                // Biased ensures we check for a processor trigger first for better responsiveness.
-                biased;
+            let command = if let Some(command) = pending_handoff.take() {
+                Some(command)
+            } else {
+                tokio::select! {
+                    biased;
+                    Some(command) = trigger_rx.recv() => Some(command),
+                    msgs = stream.dump_entire_ephemeral_queue_bytes(&queue_key, queue_key.realm_id, queue_key.realm_sub_id, queue_key.unique_id, queue_key.task_group as u32, 50000) => {
+                        match msgs {
+                            Ok(d) => {
+                                if !d.is_empty() {
+                                    tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Received {} items from queue.", d.len());
+                                    let update_result = {
+                                        let mut tree = tree.write().await;
+                                        builder.update_from_many_queue_items_with_tree(&mut *tree, d.clone()).await
+                                    };
+                                    cycle_items.extend(d);
+                                    if let Err(err) = update_result {
+                                        tracing::error!(
+                                            "GATHERER_{QUEUE_TOPIC_ID}: Error updating from queue items: {:?}; retaining ACK'd cycle items",
+                                            err
+                                        );
+                                    }
+                                }
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            },
+                            Err(err) => {
+                                tracing::error!("GATHERER_{QUEUE_TOPIC_ID}: Error receiving message: {}", err);
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                            },
+                        }
+                        None
+                    }
+                }
+            };
 
-                // A trigger from the Processor was received.
-                Some(responder) = trigger_rx.recv() => {
+            let Some(command) = command else {
+                continue;
+            };
+            match command {
+                GathererTreeCommand::FastForward { state_updates, reply } => {
+                    let replacement = async {
+                        let mut tree_guard = tree.write().await;
+                        let committed_before = tree_guard.get_last_commit_root();
+                        Builder::apply_fast_forward_with_tree(
+                            &mut *tree_guard,
+                            &create_builder_config,
+                            state_updates,
+                        ).await?;
+                        if tree_guard.get_last_commit_root() == committed_before {
+                            return Ok(None);
+                        }
+                        drop(tree_guard);
+                        let mut tree_guard = tree.write().await;
+                        let mut replacement = Builder::create_new_with_tree(
+                            &mut *tree_guard,
+                            queue_key.unique_id,
+                            create_builder_config.clone(),
+                        ).await?;
+                        if !cycle_items.is_empty() {
+                            replacement
+                                .update_from_many_queue_items_with_tree(&mut *tree_guard, cycle_items.clone())
+                                .await?;
+                        }
+                        Ok(Some(replacement))
+                    }
+                    .await;
+
+                    match replacement {
+                        Ok(Some(replacement)) => {
+                            builder = replacement;
+                            if reply.send(Ok(())).is_err() {
+                                tracing::error!("GATHERER_{QUEUE_TOPIC_ID}: FastForward reply dropped");
+                            }
+                        }
+                        Ok(None) => {
+                            if reply.send(Ok(())).is_err() {
+                                tracing::error!("GATHERER_{QUEUE_TOPIC_ID}: FastForward reply dropped");
+                            }
+                        }
+                        Err(err) => {
+                            tracing::error!(
+                                "GATHERER_{QUEUE_TOPIC_ID}: FastForward recreate/replay failed: {:?}; retaining {} cycle items",
+                                err,
+                                cycle_items.len()
+                            );
+                            pending_cycle_items = cycle_items;
+                            if reply.send(Err(err)).is_err() {
+                                tracing::error!("GATHERER_{QUEUE_TOPIC_ID}: FastForward reply dropped");
+                            }
+                            break 'gathering;
+                        }
+                    }
+                }
+
+                GathererTreeCommand::Finalize { reply: responder } | GathererTreeCommand::Stop { reply: responder } => {
                     let old_unique_id = queue_key.unique_id;
                     let old_queue_key = queue_key.clone();
                     tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Interrupted by Processor. Preparing to hand over");
@@ -477,10 +635,12 @@ pub async fn gatherer_runner_for_tree<
                     };
                     tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Processing {} remaining items from old unique_id {} before finalize", remaining_items_bytes.len(), old_unique_id);
                     if !remaining_items_bytes.is_empty() {
-                        if let Err(err) = {
+                        let update_result = {
                             let mut tree = tree.write().await;
-                            builder.update_from_many_queue_items_with_tree(&mut *tree, remaining_items_bytes).await
-                        } {
+                            builder.update_from_many_queue_items_with_tree(&mut *tree, remaining_items_bytes.clone()).await
+                        };
+                        cycle_items.extend(remaining_items_bytes);
+                        if let Err(err) = update_result {
                             tracing::error!(
                                 "GATHERER_{QUEUE_TOPIC_ID}: Error updating from remaining items: {:?}; processor will retry",
                                 err
@@ -489,9 +649,6 @@ pub async fn gatherer_runner_for_tree<
                         }
                     }
                     if trigger_ok {
-                        // Pre-finalize drain: one more drain right before finalize
-                        // to capture endcaps that arrived during the initial drain +
-                        // update_from_many_queue_items_with_tree above.
                         let pre_final_items = match stream
                             .dump_entire_ephemeral_queue_bytes(
                                 &old_queue_key,
@@ -511,10 +668,12 @@ pub async fn gatherer_runner_for_tree<
                                 "GATHERER_{QUEUE_TOPIC_ID}: Captured {} pre-finalize items for old unique_id {}",
                                 pre_final_items.len(), old_unique_id
                             );
-                            if let Err(err) = {
+                            let update_result = {
                                 let mut tree = tree.write().await;
-                                builder.update_from_many_queue_items_with_tree(&mut *tree, pre_final_items).await
-                            } {
+                                builder.update_from_many_queue_items_with_tree(&mut *tree, pre_final_items.clone()).await
+                            };
+                            cycle_items.extend(pre_final_items);
+                            if let Err(err) = update_result {
                                 tracing::error!(
                                     "GATHERER_{QUEUE_TOPIC_ID}: Error updating from pre-finalize items: {:?}; processor will retry",
                                     err
@@ -533,29 +692,24 @@ pub async fn gatherer_runner_for_tree<
                                 tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Finalized output prepared, sending to processor.");
                                 if responder.send(finalized_output).is_err() {
                                     tracing::error!("GATHERER_{QUEUE_TOPIC_ID}: Failed to send data to processor. The receiver was dropped.");
-                                }else{
+                                } else {
                                     tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Successfully handed over data to processor.");
                                 }
+                                cycle_items.clear();
                             }
                             Err(err) => {
                                 tracing::error!(
                                     "GATHERER_{QUEUE_TOPIC_ID}: Error during finalize: {:?}; processor will retry",
                                     err
                                 );
+                                pending_cycle_items = cycle_items;
                             }
                         }
                     } else {
                         tracing::error!("GATHERER_{QUEUE_TOPIC_ID}: Skipped finalize after update error; processor will retry.");
+                        pending_cycle_items = cycle_items;
                     }
 
-                    // Post-finalize drain: capture any items that arrived during finalize.
-                    // If found, they need to be processed — but the builder is already
-                    // finalized/consumed. Since we use ensure_consumer (not recreate),
-                    // the consumer still exists and these messages will be replayed
-                    // via DeliverPolicy::All on the next dump_entire_ephemeral_queue_bytes
-                    // call for this unique_id. The next gatherer cycle won't drain this
-                    // old unique_id, so we must NOT delete the consumer here. The processor
-                    // will eventually re-process this checkpoint and pick up the messages.
                     let late_items = match stream
                         .dump_entire_ephemeral_queue_bytes(
                             &old_queue_key,
@@ -597,39 +751,11 @@ pub async fn gatherer_runner_for_tree<
                         return Ok(());
                     }
 
-                    break 'gathering; // Break inner loop to start a new cycle.
-                },
-
-                // A new message from NATS stream.
-                msgs =     stream.dump_entire_ephemeral_queue_bytes(&queue_key, queue_key.realm_id, queue_key.realm_sub_id, queue_key.unique_id, queue_key.task_group as u32, 50000) => {
-                    match msgs {
-                        Ok(d) => {
-                            if d.len() != 0 {
-                                tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Received {} items from queue.", d.len());
-                                if let Err(err) = {
-                                    let mut tree = tree.write().await;
-                                    builder.update_from_many_queue_items_with_tree(&mut *tree, d).await
-                                } {
-                                    tracing::error!(
-                                        "GATHERER_{QUEUE_TOPIC_ID}: Error updating from queue items: {:?}; restarting gather cycle",
-                                        err
-                                    );
-                                    break 'gathering;
-                                }
-
-                            }
-                            tokio::time::sleep(Duration::from_millis(10)).await;
-                            //builder.update_from_queue_item(d).await?;
-                        },
-                        Err(err) => {
-                            tracing::error!("GATHERER_{QUEUE_TOPIC_ID}: Error receiving message: {}", err);
-                            // Potentially break or sleep before retrying
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                        },
-                    }
+                    break 'gathering;
                 }
             }
         }
         tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Handoff complete. Cycle restarting.");
     }
 }
+

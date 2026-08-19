@@ -1,16 +1,13 @@
 use std::time::Duration;
 
-
-use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
 use parth_core::{
     crypto::hash::traits::{HashTo4Felts, MerkleZeroHasher},
-    data::hash::{
-        fast_node_serializer::{QMerkleStoreFastZeroNodeSerializer, QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE},
-        merkle_node_key::SimpleMerkleNodeKey,
-    },
     felt::ToU64Value,
     protocol::core_types::{Q256BitHash, QNetworkTypesConfig},
 };
+
+
+
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
     guta::{
@@ -43,7 +40,7 @@ use crate::{
     realm::{
         processor::{
             consensus::{build_bound_finalize_output, form_certificate, require_nonzero_validator_tree_root, sign_vote, validate_certificate, votes_meet_wait},
-            core::{IncludedProposalStateUpdates, PsyRealmProcessor},
+            core::PsyRealmProcessor,
             gatherers::realm_end_cap_gatherer::RealmGUTAEndCapGathererOutput,
         },
         queue_key::RealmProvingWorkQueueKey,
@@ -182,7 +179,8 @@ where
                 return Err(error);
             }
             tracing::warn!("Coordinator is ahead of local DB ({}), attempting recovery sync...", message);
-            self.apply_included_realm_backup_or_fast_forward().await?;
+            self.commit_included_proposal_ffs().await?;
+
             self.db.ensure_db_matches_coordinator_head().await?;
             tracing::info!("Coordinator recovery sync complete. Resuming block processing.");
         }
@@ -204,119 +202,96 @@ where
     }
 
 
-    async fn apply_included_realm_backup_or_fast_forward(&mut self) -> anyhow::Result<()> {
+    async fn commit_included_proposal_ffs(&mut self) -> anyhow::Result<()> {
         let coordinator_latest_checkpoint_id = self.db.coordinator_client.rc_get_latest_checkpoint_id().await?;
         let coordinator_realm_state = self
             .db
             .coordinator_client
             .rc_get_realm_root_and_last_modified_checkpoint(coordinator_latest_checkpoint_id, self.db.state.realm_id_u64)
             .await?;
-        if coordinator_realm_state.value == self.db.state.last_committed_realm_end_root {
+        let included_checkpoint_id = coordinator_realm_state.checkpoint_id;
+        let db_matches = coordinator_realm_state.value == self.db.state.last_committed_realm_end_root;
+
+        if let Some(rx) = self.verified_state_updates.as_mut() {
+            while let Ok(updates_bytes) = rx.try_recv() {
+                self.held_state_updates = Some(updates_bytes);
+            }
+        }
+        let Some(updates_bytes) = self.held_state_updates.clone() else {
+            return self.db.sync_to_coordinator_set_checkpoint_id().await;
+        };
+        let updates = PsyPreparedRealmBlockStateUpdates::<N::QHash>::psy_ser_from_slice(&updates_bytes)?;
+        if updates.new_realm_root != coordinator_realm_state.value {
+            anyhow::ensure!(
+                db_matches,
+                "Checkpoint {}: in-band new_realm_root {:?} does not match included root {:?}",
+                included_checkpoint_id,
+                updates.new_realm_root,
+                coordinator_realm_state.value
+            );
             return self.db.sync_to_coordinator_set_checkpoint_id().await;
         }
-        let included_checkpoint_id = coordinator_realm_state.checkpoint_id;
-        self.ensure_uncommitted_processing_ids().await?;
 
-        let coordinator_update = self
-            .db
-            .coordinator_client
-            .rc_get_realm_sync_info(included_checkpoint_id, self.db.state.realm_id_u64)
-            .await?;
-        let included = self
-            .included_proposal_updates
-            .read()
-            .await
-            .clone()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Checkpoint {}: Realm root changed from {:?} to {:?}, but no verified Proposal FFS is in memory",
-                    included_checkpoint_id,
-                    self.db.state.last_committed_realm_end_root,
-                    coordinator_realm_state.value
-                )
-            })?;
-        let included_root_bytes = coordinator_realm_state.value.into_owned_32bytes();
-        anyhow::ensure!(
-            included.end_root == included_root_bytes,
-            "Checkpoint {}: verified Proposal FFS end_root {:?} does not match included root {:?}",
-            included_checkpoint_id,
-            included.end_root,
-            included_root_bytes
-        );
-        anyhow::ensure!(
-            included.updates.old_realm_root == self.db.state.last_committed_realm_end_root,
-            "Checkpoint {}: Proposal FFS old_realm_root {:?} does not match last committed {:?}",
-            included_checkpoint_id,
-            included.updates.old_realm_root,
-            self.db.state.last_committed_realm_end_root
-        );
-        anyhow::ensure!(
-            included.updates.new_realm_root == coordinator_realm_state.value,
-            "Checkpoint {}: Proposal FFS new_realm_root {:?} does not match included root {:?} proposal={}",
-            included_checkpoint_id,
-            included.updates.new_realm_root,
-            coordinator_realm_state.value,
-            hex::encode(included.proposal_id)
-        );
-
-        self.db.state.processing_checkpoint_id = included_checkpoint_id;
-        self.db.state.processing_checkpoint_root = coordinator_update.checkpoint_sync_info.checkpoint_tree_root;
-        self.db.state.processing_realm_start_root = self.db.state.last_committed_realm_end_root;
         self.db.state.processing_realm_end_root = coordinator_realm_state.value;
         self.db
-            .commit_state(
-                &coordinator_update,
-                &included.updates,
-                ProvingJobCircuitType::GUTANoChange,
-                vec![],
-                true,
-            )
+            .shared_state
+            .update_from_core_state(&self.db.state)
             .await?;
-        self.db.state.processing_realm_end_root = coordinator_realm_state.value;
+
+        if updates.realm_sub_id != self.db.state.realm_sub_id_u64 {
+            self.guta_queue_gatherer.fast_forward(updates_bytes).await?;
+            tracing::info!(
+                "Applied Realm proposal FFS end_root={:?} checkpoint_id={}",
+                updates.new_realm_root,
+                included_checkpoint_id
+            );
+        }
+        self.held_state_updates = None;
         self.db.state.gathering_realm_start_root = coordinator_realm_state.value;
         self.db
             .shared_state
             .update_from_core_state(&self.db.state)
             .await?;
 
-        {
-            let mut shared_tree = self.shared_user_tree.write().await;
-            if shared_tree.get_root() != coordinator_realm_state.value {
-                if shared_tree.get_last_commit_root() != included.updates.old_realm_root {
-                    anyhow::bail!(
-                        "Checkpoint {}: shared tree committed root {:?} is not Proposal FFS old_realm_root {:?}",
-                        included_checkpoint_id,
-                        shared_tree.get_last_commit_root(),
-                        included.updates.old_realm_root
-                    );
-                }
-                shared_tree.revert_changes();
-                apply_zero_id_ffs_nodes(
-                    &mut shared_tree,
-                    &included.updates.update_global_user_tree_nodes_ffs,
-                    N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
-                    self.db.state.realm_id_u64,
-                )?;
-                shared_tree.commit_changes();
-                anyhow::ensure!(
-                    shared_tree.get_root() == coordinator_realm_state.value,
-                    "Checkpoint {}: shared tree root {:?} does not match included root {:?} after FFS apply proposal={}",
-                    included_checkpoint_id,
-                    shared_tree.get_root(),
-                    coordinator_realm_state.value,
-                    hex::encode(included.proposal_id)
-                );
-            }
+
+        if !db_matches {
+            anyhow::ensure!(
+                updates.old_realm_root == self.db.state.last_committed_realm_end_root,
+                "Checkpoint {}: in-band old_realm_root {:?} does not match last committed {:?}",
+                included_checkpoint_id,
+                updates.old_realm_root,
+                self.db.state.last_committed_realm_end_root
+            );
+            self.ensure_uncommitted_processing_ids().await?;
+            let coordinator_update = self
+                .db
+                .coordinator_client
+                .rc_get_realm_sync_info(included_checkpoint_id, self.db.state.realm_id_u64)
+                .await?;
+            self.db.state.processing_checkpoint_id = included_checkpoint_id;
+            self.db.state.processing_checkpoint_root = coordinator_update.checkpoint_sync_info.checkpoint_tree_root;
+            self.db.state.processing_realm_start_root = self.db.state.last_committed_realm_end_root;
+            self.db
+                .commit_state(
+                    &coordinator_update,
+                    &updates,
+                    ProvingJobCircuitType::GUTANoChange,
+                    vec![],
+                    true,
+                )
+                .await?;
+            tracing::info!(
+                "Committed Realm proposal FFS end_root={:?} checkpoint_id={}",
+                updates.new_realm_root,
+                included_checkpoint_id
+            );
         }
-        tracing::info!(
-            "Applied Realm proposal FFS end_root={:?} checkpoint_id={} proposal={}",
-            included.updates.new_realm_root,
-            included_checkpoint_id,
-            hex::encode(included.proposal_id)
-        );
-        self.db.sync_to_coordinator_set_checkpoint_id().await?;
-        Ok(())
+
+        self.db.sync_to_coordinator_set_checkpoint_id().await
     }
+
+
+
 
 
 
@@ -643,12 +618,6 @@ where
             backup_hash,
             body_hash,
         );
-        *self.included_proposal_updates.write().await = Some(IncludedProposalStateUpdates {
-            proposal_id: proposal.proposal_id,
-            end_root: state_updates.new_realm_root.into_owned_32bytes(),
-            updates: state_updates.clone(),
-        });
-
         let message = vote_message(
             proposal.chain_id,
             proposal.realm_id,
@@ -840,77 +809,4 @@ where
             validator_tree_root.into_owned_32bytes(),
         ))
     }
-}
-
-fn apply_zero_id_ffs_nodes<Hasher, Hash>(
-    tree: &mut SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
-    ffs: &[u8],
-    coordinator_global_user_tree_height: u8,
-    realm_id: u64,
-) -> anyhow::Result<()>
-where
-    Hasher: MerkleZeroHasher<Hash>,
-    Hash: Copy + PartialEq + Default + std::fmt::Debug + Q256BitHash,
-{
-    if ffs.is_empty() {
-        return Ok(());
-    }
-    anyhow::ensure!(
-        ffs.len() % QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE == 0,
-        "global user tree FFS length {} is not a multiple of {}",
-        ffs.len(),
-        QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE
-    );
-    let nodes = QMerkleStoreFastZeroNodeSerializer::deserialize_zero_id_nodes_from_slice::<Hash>(ffs);
-    for node in nodes {
-        let local_key = realm_local_key_from_offset_ffs_key(
-            node.key,
-            coordinator_global_user_tree_height,
-            realm_id,
-        )?;
-        tree.set_node_value(local_key, node.value);
-    }
-    Ok(())
-}
-
-fn realm_local_key_from_offset_ffs_key(
-    key: SimpleMerkleNodeKey,
-    coordinator_height: u8,
-    realm_id: u64,
-) -> anyhow::Result<SimpleMerkleNodeKey> {
-    anyhow::ensure!(
-        key.level >= coordinator_height,
-        "global user tree FFS node level {} is below coordinator height {}",
-        key.level,
-        coordinator_height
-    );
-    let local_level = key.level - coordinator_height;
-    let expected_realm_id = if local_level >= 64 {
-        anyhow::ensure!(
-            key.index == 0,
-            "global user tree FFS node index {} does not fit in local level {}",
-            key.index,
-            local_level
-        );
-        0
-    } else {
-        key.index >> local_level
-    };
-    anyhow::ensure!(
-        expected_realm_id == realm_id,
-        "global user tree FFS node realm_id {} does not match {}",
-        expected_realm_id,
-        realm_id
-    );
-    let local_index = if local_level == 0 {
-        0
-    } else if local_level >= 64 {
-        key.index
-    } else {
-        key.index & ((1u64 << local_level) - 1)
-    };
-    Ok(SimpleMerkleNodeKey {
-        level: local_level,
-        index: local_index,
-    })
 }

@@ -382,12 +382,17 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
                 let commands = built.handle.commands();
                 let rotation = built.rotation.clone();
                 processor.set_realm_p2p(commands, rotation, bls_secret, validator_user_id, bls_public_keys);
+                let (state_updates_tx, state_updates_rx) = tokio::sync::mpsc::channel(4);
+                processor.verified_state_updates = Some(state_updates_rx);
                 crate::node::realm_p2p::spawn_processor_realm_network::<N>(
                     built,
                     config,
                     PsyPlonky2ZKVerifier::<C, D>::for_network(config.network)?,
-                    processor.included_proposal_updates.clone(),
+                    state_updates_tx,
                 );
+
+
+
 
             }
             run_realm_processor(processor, guta_gatherer_join_handle).await?;

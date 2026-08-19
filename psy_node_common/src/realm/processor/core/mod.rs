@@ -1,33 +1,25 @@
-use std::sync::Arc;
-
-use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
 use parth_core::protocol::core_types::QNetworkTypesConfig;
-use psy_data::{
-    prepared_block::realm::PsyPreparedRealmBlockStateUpdates,
-    queue_items::realm_user_update::PsyRealmUserUpdateQueueItem,
-};
+use psy_data::queue_items::realm_user_update::PsyRealmUserUpdateQueueItem;
 use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
     p2p::traits::realm_coordinantor::RealmCoordinatorClient, psy_core_db::traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore}, psy_temp_db::StandardProcessorTempDBStoreBase, queue::{ephemeral::QStandardEphemeralQueueSubscriber, worker_queue::QStandardWorkerQueuePublisher}, store::traits::proof_store::QParthProofStore
 };
+use tokio::sync::mpsc;
 
 use crate::{
     constants::queue::
         PQ_REALM_SUBMIT_USER_UPDATE_QUEUE_TOPIC_ID
     ,
-    queue::gatherer::EphemeralQueueGathererWithTree, realm::processor::{db::PsyRealmDatabaseProcessor, gatherers::realm_end_cap_gatherer::RealmGUTAEndCapGathererOutput},
+    queue::gatherer::EphemeralQueueGathererWithTree,
+    realm::processor::{
+        db::PsyRealmDatabaseProcessor,
+        gatherers::realm_end_cap_gatherer::RealmGUTAEndCapGathererOutput,
+    },
 };
 
 mod process_block;
 pub mod runner;
 pub mod startup;
-
-#[derive(Clone)]
-pub struct IncludedProposalStateUpdates<Hash> {
-    pub proposal_id: [u8; 32],
-    pub end_root: [u8; 32],
-    pub updates: PsyPreparedRealmBlockStateUpdates<Hash>,
-}
 
 
 pub struct PsyRealmProcessor<
@@ -68,7 +60,7 @@ pub struct PsyRealmProcessor<
     // enabled `RealmRotationConfig` engage the publish + blocking vote wait in
     // `process_block`; GUTA admission stays on the HTTP `rc_submit_guta_proof`
     // path regardless.
-    /// Restart-only RGE2 directory. Apply after inclusion uses in-memory FFS.
+    /// Restart-only RGE2 gatherer backup directory.
     pub guta_gatherer_backup_directory: String,
     /// Cloneable command sender into the Realm network drive loop. `None` until
     /// `set_realm_p2p` wires it.
@@ -81,9 +73,10 @@ pub struct PsyRealmProcessor<
     /// Local validator user id carried in the 410-byte finalize output.
     /// Wired by `set_realm_p2p`; `None` until then.
     pub p2p_validator_user_id: Option<u64>,
-    /// Authenticated BLS keys used to verify individual votes before aggregation.
     pub p2p_bls_public_keys: Option<std::collections::HashMap<u16, psy_data::p2p::BlsPublicKey>>,
-    pub shared_user_tree: Arc<tokio::sync::RwLock<SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>>>,
-    pub included_proposal_updates: Arc<tokio::sync::RwLock<Option<IncludedProposalStateUpdates<N::QHash>>>>,
+    pub verified_state_updates: Option<mpsc::Receiver<Vec<u8>>>,
+    pub held_state_updates: Option<Vec<u8>>,
+
+
 
 }
