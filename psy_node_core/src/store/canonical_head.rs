@@ -2188,4 +2188,324 @@ mod tests {
         )
         .unwrap()
     }
+
+    /// Every phase a crash can leave behind, so the matrix below is exhaustive
+    /// by construction rather than by whoever wrote it remembering them all.
+    fn every_rollback_phase() -> Vec<(&'static str, StoredCanonicalHead<PHash>)> {
+        let head = canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 10, 50);
+        let target = *canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 7, 40).checkpoint();
+        let idle = stored_for_test(head);
+        let requested = *CanonicalHeadTransition::start_rollback(
+            idle,
+            rollback_request(*head.checkpoint(), target),
+        )
+        .unwrap()
+        .candidate();
+        let frozen_head = frozen(&requested);
+        let archiving = *CanonicalHeadTransition::begin_rollback_archive(
+            frozen_head,
+            freeze_barrier_for(&frozen_head),
+        )
+        .unwrap()
+        .candidate();
+        let barrier_ready = *CanonicalHeadTransition::complete_rollback_archive_barrier(
+            archiving,
+            barrier_for(&archiving),
+        )
+        .unwrap()
+        .candidate();
+        let deleting = *CanonicalHeadTransition::begin_rollback_delete(barrier_ready)
+            .unwrap()
+            .candidate();
+        let restoring = *CanonicalHeadTransition::begin_rollback_restore(deleting)
+            .unwrap()
+            .candidate();
+        let verifying = *CanonicalHeadTransition::begin_rollback_verify(restoring)
+            .unwrap()
+            .candidate();
+        let realms_ready = *CanonicalHeadTransition::complete_rollback_realm_barrier(
+            verifying,
+            publish_barrier_for(&verifying),
+        )
+        .unwrap()
+        .candidate();
+        let aborting = *CanonicalHeadTransition::begin_rollback_abort(
+            requested,
+            RollbackAbortReasonCode::try_new(42).expect("non-zero"),
+        )
+        .unwrap()
+        .candidate();
+        vec![
+            ("Idle", idle),
+            ("Requested", requested),
+            ("Frozen", frozen_head),
+            ("Archiving", archiving),
+            ("ArchiveBarrierReady", barrier_ready),
+            ("Deleting", deleting),
+            ("Restoring", restoring),
+            ("Verifying", verifying),
+            ("AllRealmsReady", realms_ready),
+            ("Aborting", aborting),
+        ]
+    }
+
+    /// Which transitions a head in each phase accepts.
+    ///
+    /// This is the crash matrix.  A rollback that dies leaves one of these
+    /// phases durable, and what an operator or a restarted executor may do next
+    /// is exactly this row -- so the table is the recovery procedure, written
+    /// where it can be checked instead of in a runbook.
+    fn moves_from(stored: &StoredCanonicalHead<PHash>) -> Vec<&'static str> {
+        let head = canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 10, 50);
+        let target = *canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 7, 40).checkpoint();
+        let mut legal = Vec::new();
+        if CanonicalHeadTransition::start_rollback(
+            *stored,
+            rollback_request(*head.checkpoint(), target),
+        )
+        .is_ok()
+        {
+            legal.push("start");
+        }
+        if CanonicalHeadTransition::begin_rollback_freeze(*stored).is_ok() {
+            legal.push("freeze");
+        }
+        if CanonicalHeadTransition::begin_rollback_archive(*stored, freeze_barrier_for_any(stored))
+            .is_ok()
+        {
+            legal.push("archive");
+        }
+        if CanonicalHeadTransition::complete_rollback_archive_barrier(
+            *stored,
+            barrier_for_any(stored),
+        )
+        .is_ok()
+        {
+            legal.push("archive_barrier");
+        }
+        if CanonicalHeadTransition::begin_rollback_delete(*stored).is_ok() {
+            legal.push("delete");
+        }
+        if CanonicalHeadTransition::begin_rollback_restore(*stored).is_ok() {
+            legal.push("restore");
+        }
+        if CanonicalHeadTransition::begin_rollback_verify(*stored).is_ok() {
+            legal.push("verify");
+        }
+        if CanonicalHeadTransition::complete_rollback_realm_barrier(
+            *stored,
+            publish_barrier_for_any(stored),
+        )
+        .is_ok()
+        {
+            legal.push("publish_barrier");
+        }
+        if CanonicalHeadTransition::complete_rollback(*stored).is_ok() {
+            legal.push("complete");
+        }
+        if CanonicalHeadTransition::begin_rollback_abort(
+            *stored,
+            RollbackAbortReasonCode::try_new(42).expect("non-zero"),
+        )
+        .is_ok()
+        {
+            legal.push("abort");
+        }
+        if CanonicalHeadTransition::complete_rollback_abort(*stored).is_ok() {
+            legal.push("complete_abort");
+        }
+        legal
+    }
+
+    /// Barriers for a head that may not be carrying a request.  A phase that
+    /// holds no request cannot produce a matching barrier, and must be refused
+    /// for that reason rather than for a missing argument -- so these stand in
+    /// with a barrier for an unrelated head, which is what an operator holding
+    /// the wrong evidence would present.
+    fn freeze_barrier_for_any(
+        stored: &StoredCanonicalHead<PHash>,
+    ) -> crate::store::rollback_participants::SealedFreezeBarrier {
+        if stored.rollback_control().requested().is_some() {
+            freeze_barrier_for(stored)
+        } else {
+            let head = canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 10, 50);
+            let target = *canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 7, 40).checkpoint();
+            let requested = *CanonicalHeadTransition::start_rollback(
+                stored_for_test(head),
+                rollback_request(*head.checkpoint(), target),
+            )
+            .unwrap()
+            .candidate();
+            freeze_barrier_for(&frozen(&requested))
+        }
+    }
+
+    fn barrier_for_any(
+        stored: &StoredCanonicalHead<PHash>,
+    ) -> crate::store::rollback_participants::SealedArchiveBarrier {
+        if stored.rollback_control().requested().is_some() {
+            barrier_for(stored)
+        } else {
+            let head = canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 10, 50);
+            let target = *canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 7, 40).checkpoint();
+            let requested = *CanonicalHeadTransition::start_rollback(
+                stored_for_test(head),
+                rollback_request(*head.checkpoint(), target),
+            )
+            .unwrap()
+            .candidate();
+            barrier_for(&requested)
+        }
+    }
+
+    fn publish_barrier_for_any(
+        stored: &StoredCanonicalHead<PHash>,
+    ) -> crate::store::rollback_participants::SealedPublishBarrier {
+        if stored.rollback_control().requested().is_some() {
+            publish_barrier_for(stored)
+        } else {
+            let head = canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 10, 50);
+            let target = *canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 7, 40).checkpoint();
+            let requested = *CanonicalHeadTransition::start_rollback(
+                stored_for_test(head),
+                rollback_request(*head.checkpoint(), target),
+            )
+            .unwrap()
+            .candidate();
+            publish_barrier_for(&requested)
+        }
+    }
+
+    #[test]
+    fn a_crash_leaves_exactly_one_way_forward_and_no_way_around() {
+        // The recovery procedure, as a table.  Each row is a phase a crash can
+        // leave durable and everything a restarted executor may do from it.
+        let expected: &[(&str, &[&str])] = &[
+            ("Idle", &["start"]),
+            ("Requested", &["freeze", "abort"]),
+            ("Frozen", &["archive", "abort"]),
+            ("Archiving", &["archive_barrier", "abort"]),
+            // Still abortable: the barrier is met but nothing has been deleted,
+            // so there is still a chain to go back to.  The point of no return
+            // is entering Deleting, not reaching the barrier.
+            ("ArchiveBarrierReady", &["delete", "abort"]),
+            ("Deleting", &["restore"]),
+            ("Restoring", &["verify"]),
+            ("Verifying", &["publish_barrier"]),
+            ("AllRealmsReady", &["complete"]),
+            ("Aborting", &["complete_abort"]),
+        ];
+
+        for (name, stored) in every_rollback_phase() {
+            let legal = moves_from(&stored);
+            let want = expected
+                .iter()
+                .find(|(phase, _)| *phase == name)
+                .map(|(_, moves)| *moves)
+                .unwrap_or_else(|| panic!("{name} is a phase the matrix does not cover"));
+            assert_eq!(
+                legal, want,
+                "from {name} the legal moves must be exactly {want:?}, not {legal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_phase_past_the_barrier_must_be_finished_not_abandoned() {
+        // The asymmetry the whole design turns on.  Before rows are deleted a
+        // rollback can be given up; after, the only way out is through, because
+        // the state it was going to restore is the state it is in the middle of
+        // destroying.
+        for (name, stored) in every_rollback_phase() {
+            let destructive = matches!(
+                name,
+                "Deleting" | "Restoring" | "Verifying" | "AllRealmsReady"
+            );
+            let abortable = CanonicalHeadTransition::begin_rollback_abort(
+                stored,
+                RollbackAbortReasonCode::try_new(42).expect("non-zero"),
+            )
+            .is_ok();
+            assert_eq!(
+                abortable, !destructive && name != "Idle" && name != "Aborting",
+                "{name} disagrees with the point of no return"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rollback_cannot_be_restarted_on_top_of_itself() {
+        // What a crashed rollback must not be recovered by: asking for it
+        // again.  A second request would open a second epoch and plan a second
+        // range while the first is still half applied.
+        for (name, stored) in every_rollback_phase() {
+            if name == "Idle" {
+                continue;
+            }
+            let head = canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 10, 50);
+            let target = *canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 7, 40).checkpoint();
+            assert!(
+                matches!(
+                    CanonicalHeadTransition::start_rollback(
+                        stored,
+                        rollback_request(*head.checkpoint(), target),
+                    ),
+                    Err(CanonicalHeadModelError::RollbackAlreadyActive)
+                ),
+                "{name} must refuse a fresh request"
+            );
+        }
+    }
+
+    #[test]
+    fn the_phase_ordinal_agrees_with_the_order_the_transitions_enforce() {
+        // The executor skips work by comparing ordinals; the phase machine
+        // decides what is legal by matching on variants.  Two ideas of the
+        // order would mean a resumed rollback skipping a step the machine
+        // thinks it still owes, or redoing one it has already crossed -- and
+        // the second is destructive, because re-archiving after the delete
+        // records the discarded rows as absent.
+        let phases = every_rollback_phase();
+        let sequence = [
+            "Idle",
+            "Requested",
+            "Frozen",
+            "Archiving",
+            "ArchiveBarrierReady",
+            "Deleting",
+            "Restoring",
+            "Verifying",
+            "AllRealmsReady",
+        ];
+        let mut previous = None;
+        for name in sequence {
+            let (_, stored) = phases
+                .iter()
+                .find(|(phase, _)| *phase == name)
+                .expect("every sequence phase is constructible");
+            let ordinal = stored.rollback_control().phase_ordinal();
+            if let Some(previous) = previous {
+                assert!(
+                    ordinal > previous,
+                    "{name} must rank above the phase before it: {ordinal} !> {previous}"
+                );
+            }
+            previous = Some(ordinal);
+        }
+
+        // Aborting ranks with Idle rather than after the phase it left, so
+        // nothing forward can be skipped on the strength of an abort.
+        let (_, aborting) = phases
+            .iter()
+            .find(|(phase, _)| *phase == "Aborting")
+            .expect("constructible");
+        let (_, idle) = phases
+            .iter()
+            .find(|(phase, _)| *phase == "Idle")
+            .expect("constructible");
+        assert_eq!(
+            aborting.rollback_control().phase_ordinal(),
+            idle.rollback_control().phase_ordinal()
+        );
+    }
 }

@@ -22,7 +22,7 @@ use psy_node_core::store::commit_window::CommitFreeze;
 use psy_node_core::store::manifest_store::CoordinatorCommitRecording;
 use psy_node_core::store::rollback_plan::{RollbackPlan, build_rollback_plan};
 use psy_node_core::store::timestamp::DeleteFenceTimestampUs;
-use psy_data::protocol::canonical_chain::CanonicalChainRef;
+use psy_data::protocol::canonical_chain::{CanonicalChainRef, ChainEpoch};
 use parth_core::protocol::core_types::Q256BitHash;
 use scylla::client::session::Session;
 
@@ -31,6 +31,7 @@ use psy_node_core::store::authority_commit::{AuthorityTimestampKey, AuthorityTim
 use psy_node_core::store::canonical_head::{
     CanonicalHeadReadState, CanonicalHeadTransition, StoredCanonicalHead,
 };
+use psy_node_core::store::rollback_control::RollbackControlState;
 use psy_node_core::store::rollback_control::{
     RollbackExecutionMode, RollbackPlanDigest, RollbackRequest,
 };
@@ -41,6 +42,10 @@ use psy_node_core::store::typed::{MerkleNode, NodeIndex, TypedTableKey, UniquePe
 use parth_core::PHash;
 use psy_node_core::store::rollback_coordination::RollbackParticipantView;
 use psy_node_core::store::rollback_event::{RollbackEvent, RollbackEventStore, RollbackOutcome};
+use psy_node_core::store::rollback_control::{
+    PHASE_ORDINAL_ALL_REALMS_READY, PHASE_ORDINAL_ARCHIVE_BARRIER_READY, PHASE_ORDINAL_ARCHIVING,
+    PHASE_ORDINAL_DELETING, PHASE_ORDINAL_FROZEN, PHASE_ORDINAL_RESTORING, PHASE_ORDINAL_VERIFYING,
+};
 use psy_node_core::store::rollback_participants::{
     ArchiveBarrier, ArchiveReceipt, FreezeBarrier, FreezeReceipt, PublishBarrier,
     RollbackParticipant, RollbackParticipantSet, VerifyReceipt,
@@ -366,32 +371,109 @@ impl ScyllaRollbackExecutor {
         participants: &RollbackParticipantSet,
         receipts: Option<&dyn RollbackParticipantView<PHash>>,
     ) -> anyhow::Result<RollbackReport> {
-        let plan = self.plan(recording, head, target).await?;
-        let planned_rows = plan.row_count();
-        // The target's identity comes from its own manifest.  There is no
-        // fallback on purpose: substituting a neighbouring checkpoint, or
-        // constructing a reference, would publish a head whose hash names a
-        // checkpoint that never existed at that height.
-        let target_ref = self
-            .target_checkpoint_ref::<Hash>(recording, head, target)
-            .await?;
-
-        let window = self.fence_window_from_allocator(recording, head).await?;
-        let fence = window.delete_fence();
-
         let mut stored = self.read_head(recording, head).await?;
-        let request = RollbackRequest::try_new(
-            *head.checkpoint(),
-            target_ref,
-            window,
-            RollbackExecutionMode::InPlace,
-            RollbackPlanDigest::try_new(plan_digest(plan_id))?,
-        )?;
-
         let previous_epoch = stored.canonical_ref().chain_epoch().get();
-        stored = self
-            .advance(recording, CanonicalHeadTransition::start_rollback(stored, request)?)
-            .await?;
+
+        // Plan against the epoch the discarded range was committed under, which
+        // is not the epoch the head is in once a rollback has started.
+        // `start_rollback` opens the next epoch immediately, and manifests are
+        // partitioned by epoch -- so a resumed run planning from the live head
+        // looks for the range in a partition that by construction cannot hold
+        // it, and reports the range as unplannable rather than as already
+        // half-deleted.  Only `start_rollback` moves the epoch before
+        // completion, and it moves it by one.
+        let plan_head = match stored.rollback_control() {
+            RollbackControlState::Idle => *head,
+            _ => CanonicalChainRef::new(
+                head.network_id(),
+                ChainEpoch::new(previous_epoch.saturating_sub(1)),
+                *head.checkpoint(),
+            ),
+        };
+        let plan = self.plan(recording, &plan_head, target).await?;
+        let planned_rows = plan.row_count();
+
+        // A rollback that died leaves its phase durable, and this is what makes
+        // that readable state usable: the run resumes from it instead of
+        // starting again.  Without this a crashed rollback could go neither
+        // forward -- a second request is refused, and rightly, since it would
+        // open a second epoch over a half-applied first -- nor back, once the
+        // point of no return was behind it.  The chain simply stopped, because
+        // every participant correctly refuses to commit while a rollback is
+        // published.
+        //
+        // The fence comes from the durable request rather than the allocator on
+        // a resume.  Allocating a fresh one would delete the remainder of the
+        // range under a different timestamp than the part already deleted,
+        // splitting one rollback across two points on the conflict-resolution
+        // axis -- the same hazard one timestamp per commit exists to prevent.
+        let (request, fence, resumed) = match stored.rollback_control().requested() {
+            Some(existing) => {
+                let existing = *existing;
+                if existing.requested_head() != head.checkpoint() {
+                    anyhow::bail!(
+                        "a rollback from {} is already in progress; this run was asked to roll \
+                         back from {}",
+                        existing.requested_head().checkpoint_id().get(),
+                        head.checkpoint().checkpoint_id().get(),
+                    );
+                }
+                if existing.target().checkpoint_id().get() != target {
+                    anyhow::bail!(
+                        "the rollback already in progress targets {}, not {target}; resuming it \
+                         with a different target would restore a state nobody asked for",
+                        existing.target().checkpoint_id().get(),
+                    );
+                }
+                // The digest is what makes resuming safe to do at all: it
+                // proves the plan recomputed here is the plan the interrupted
+                // run committed to, rather than one the manifests have drifted
+                // into meaning since.
+                let recomputed = RollbackPlanDigest::try_new(plan_digest(plan_id))?;
+                if existing.plan_digest() != recomputed {
+                    anyhow::bail!(
+                        "the plan recomputed for this resume does not match the one the \
+                         interrupted rollback committed to; the range it was deleting is not \
+                         the range this run would delete"
+                    );
+                }
+                let window = existing.fence_window();
+                (existing, window.delete_fence(), true)
+            }
+            None => {
+                // The target's identity comes from its own manifest.  There is
+                // no fallback on purpose: substituting a neighbouring
+                // checkpoint, or constructing a reference, would publish a head
+                // whose hash names a checkpoint that never existed at that
+                // height.
+                let target_ref = self
+                    .target_checkpoint_ref::<Hash>(recording, head, target)
+                    .await?;
+                let window = self.fence_window_from_allocator(recording, head).await?;
+                let fence = window.delete_fence();
+                let request = RollbackRequest::try_new(
+                    *head.checkpoint(),
+                    target_ref,
+                    window,
+                    RollbackExecutionMode::InPlace,
+                    RollbackPlanDigest::try_new(plan_digest(plan_id))?,
+                )?;
+                let _ = fence;
+                (request, window.delete_fence(), false)
+            }
+        };
+
+        if !resumed {
+            stored = self
+                .advance(recording, CanonicalHeadTransition::start_rollback(stored, request)?)
+                .await?;
+        } else {
+            tracing::warn!(
+                "resuming a rollback from {} to {target} that was left in {:?}",
+                head.checkpoint().checkpoint_id().get(),
+                stored.rollback_control(),
+            );
+        }
 
         // The audit record goes in here, not at the end.  A rollback that dies
         // between the archive and the delete leaves the chain in the state
@@ -399,16 +481,27 @@ impl ScyllaRollbackExecutor {
         // state with no record that anything had been attempted -- the one case
         // an audit exists for.  The epoch start_rollback just allocated names
         // this attempt for the life of the chain.
+        // On a resume the epoch was already opened by the run that died, so
+        // the epoch this record names is the one the head is in and the one it
+        // came from is the one below.  Recomputing it from the live head would
+        // read them as equal and refuse the record for an epoch that did not
+        // advance -- which is the right check, applied to the wrong pair.
         let event = RollbackEvent::try_new(
             stored.canonical_ref().chain_epoch().get(),
-            previous_epoch,
+            if resumed {
+                previous_epoch.saturating_sub(1)
+            } else {
+                previous_epoch
+            },
             plan.head,
             target,
             plan_id.to_vec(),
             participants.participants(),
             fence.as_i64(),
         )?;
-        self.events.record_rollback_requested(&event).await?;
+        if !resumed {
+            self.events.record_rollback_requested(&event).await?;
+        }
 
         // ---- freeze ----
         //
@@ -417,10 +510,10 @@ impl ScyllaRollbackExecutor {
         // that is still moving copies a state the chain was never in, and
         // nothing downstream notices: the archive verifies against itself, the
         // ranges line up, and the damage only appears at restore time.
-        stored = self
-            .advance(recording, CanonicalHeadTransition::begin_rollback_freeze(stored)?)
-            .await?;
-
+        // Freezing this process's commit path is done on every run, resumed or
+        // not: it is a property of this process, not a step in the sequence, and
+        // a restarted executor starts with it open.
+        //
         // Stop this process's own commit path before asking whether the head
         // moved.  The re-read below still matters -- a Coordinator running in
         // another process has its own clock and is stopped only by observing
@@ -429,6 +522,12 @@ impl ScyllaRollbackExecutor {
         // keeps it from becoming wrong.
         recording.freeze_for_rollback();
         super::drain_in_flight_commit(recording).await?;
+
+        if stored.rollback_control().phase_ordinal() < PHASE_ORDINAL_FROZEN {
+            stored = self
+                .advance(recording, CanonicalHeadTransition::begin_rollback_freeze(stored)?)
+                .await?;
+        }
 
         let head_digest = head
             .checkpoint()
@@ -464,14 +563,27 @@ impl ScyllaRollbackExecutor {
         }
         let sealed_freeze = freeze.seal()?;
 
-        stored = self
-            .advance(
-                recording,
-                CanonicalHeadTransition::begin_rollback_archive(stored, sealed_freeze)?,
-            )
-            .await?;
+        if stored.rollback_control().phase_ordinal() < PHASE_ORDINAL_ARCHIVING {
+            stored = self
+                .advance(
+                    recording,
+                    CanonicalHeadTransition::begin_rollback_archive(stored, sealed_freeze)?,
+                )
+                .await?;
+        }
 
-        let archived_rows = self.archive(plan_id, &plan).await?;
+        // Archiving is skipped once the barrier is behind us.  Not as an
+        // optimisation: past that point the rows are being deleted, so a second
+        // archive of the same plan would record them as absent and overwrite the
+        // copy of what was discarded with a record saying there was nothing to
+        // discard.
+        let archived_rows = if stored.rollback_control().phase_ordinal()
+            < PHASE_ORDINAL_ARCHIVE_BARRIER_READY
+        {
+            self.archive(plan_id, &plan).await?
+        } else {
+            planned_rows
+        };
         if archived_rows != planned_rows {
             anyhow::bail!(
                 "archived {archived_rows} of {planned_rows} planned rows; the barrier must not \
@@ -514,28 +626,39 @@ impl ScyllaRollbackExecutor {
         }
         let sealed_barrier = barrier.seal()?;
 
-        stored = self
-            .advance(
-                recording,
-                CanonicalHeadTransition::complete_rollback_archive_barrier(
-                    stored,
-                    sealed_barrier,
-                )?,
-            )
-            .await?;
+        if stored.rollback_control().phase_ordinal() < PHASE_ORDINAL_ARCHIVE_BARRIER_READY {
+            stored = self
+                .advance(
+                    recording,
+                    CanonicalHeadTransition::complete_rollback_archive_barrier(
+                        stored,
+                        sealed_barrier,
+                    )?,
+                )
+                .await?;
+        }
 
-        stored = self
-            .advance(recording, CanonicalHeadTransition::begin_rollback_delete(stored)?)
-            .await?;
+        if stored.rollback_control().phase_ordinal() < PHASE_ORDINAL_DELETING {
+            stored = self
+                .advance(recording, CanonicalHeadTransition::begin_rollback_delete(stored)?)
+                .await?;
+        }
+        // Deleting and sweeping are redone on a resume rather than skipped.
+        // They are idempotent -- a delete under the same fence removes what is
+        // there and does nothing to what is already gone -- and a run that
+        // crashed part-way through leaves no record of how far it got, so
+        // repeating is the only way to be sure the range is empty.
         let discarded_pending = self.read_discarded_pending_ids(&plan).await?;
         let deleted_rows = self.delete(&plan, fence).await?;
         let orphan_reward_rows = self
             .sweep_orphan_reward_tags(plan_id, target, &discarded_pending, fence)
             .await?;
 
-        stored = self
-            .advance(recording, CanonicalHeadTransition::begin_rollback_restore(stored)?)
-            .await?;
+        if stored.rollback_control().phase_ordinal() < PHASE_ORDINAL_RESTORING {
+            stored = self
+                .advance(recording, CanonicalHeadTransition::begin_rollback_restore(stored)?)
+                .await?;
+        }
         let restored_singletons = self.restore_singletons(target, fence).await?;
 
         // Lift the allocator past the fence before anything can commit again.
@@ -545,11 +668,13 @@ impl ScyllaRollbackExecutor {
         // would be shadowed: succeeding, silent, unreadable.  A restart that
         // happens to outlast the fence gap hides it behind the wall clock, which
         // is luck rather than design.
-        self.lift_allocator(recording, head, window).await?;
+        self.lift_allocator(recording, head, request.fence_window()).await?;
 
-        stored = self
-            .advance(recording, CanonicalHeadTransition::begin_rollback_verify(stored)?)
-            .await?;
+        if stored.rollback_control().phase_ordinal() < PHASE_ORDINAL_VERIFYING {
+            stored = self
+                .advance(recording, CanonicalHeadTransition::begin_rollback_verify(stored)?)
+                .await?;
+        }
         // The publish barrier, on the same terms as the archive one: every
         // participant must have confirmed it reached the target before the new
         // epoch is published.  A Coordinator-only rollback files its own and the
@@ -570,6 +695,7 @@ impl ScyllaRollbackExecutor {
         }
         let sealed_publish = publish.seal()?;
 
+        if stored.rollback_control().phase_ordinal() < PHASE_ORDINAL_ALL_REALMS_READY {
         stored = self
             .advance(
                 recording,
@@ -579,6 +705,7 @@ impl ScyllaRollbackExecutor {
                 )?,
             )
             .await?;
+        }
         self.advance(recording, CanonicalHeadTransition::complete_rollback(stored)?)
             .await?;
         self.events

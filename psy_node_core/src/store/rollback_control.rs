@@ -171,6 +171,22 @@ impl<Hash> RollbackRequest<Hash> {
     }
 }
 
+/// Ordinals for [`RollbackControlState::phase_ordinal`].
+///
+/// Named here, beside the match that assigns them, so a resumed run and the
+/// phase machine cannot end up with two different ideas of the order.  The
+/// executor guards its steps with these; writing the numbers there instead is
+/// how a bare `< 4` survives a refactor while meaning something else.
+pub const PHASE_ORDINAL_IDLE: u8 = 0;
+pub const PHASE_ORDINAL_REQUESTED: u8 = 1;
+pub const PHASE_ORDINAL_FROZEN: u8 = 2;
+pub const PHASE_ORDINAL_ARCHIVING: u8 = 3;
+pub const PHASE_ORDINAL_ARCHIVE_BARRIER_READY: u8 = 4;
+pub const PHASE_ORDINAL_DELETING: u8 = 5;
+pub const PHASE_ORDINAL_RESTORING: u8 = 6;
+pub const PHASE_ORDINAL_VERIFYING: u8 = 7;
+pub const PHASE_ORDINAL_ALL_REALMS_READY: u8 = 8;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RollbackControlState<Hash> {
     Idle,
@@ -239,6 +255,33 @@ impl<Hash> RollbackControlState<Hash> {
 }
 
 impl<Hash: Q256BitHash> RollbackControlState<Hash> {
+    /// How far a rollback has got, as a number, so "already past this step" is
+    /// expressible.
+    ///
+    /// A resumed rollback needs it: the phase machine refuses a transition
+    /// whose predecessor has already been left, which is right, but it means a
+    /// run that starts again has no way to ask "have I done this yet?" without
+    /// one.  Exhaustive on purpose -- a phase added later must be placed here
+    /// deliberately rather than inheriting some default position.
+    ///
+    /// Aborting sits outside the sequence.  It is not a further step along it
+    /// but a different ending, so it is given the same ordinal as Idle: nothing
+    /// forward may be skipped on the strength of an abort.
+    pub const fn phase_ordinal(&self) -> u8 {
+        match self {
+            Self::Idle => PHASE_ORDINAL_IDLE,
+            Self::Aborting(_) => PHASE_ORDINAL_IDLE,
+            Self::Requested(_) => PHASE_ORDINAL_REQUESTED,
+            Self::Frozen(_) => PHASE_ORDINAL_FROZEN,
+            Self::Archiving(_) => PHASE_ORDINAL_ARCHIVING,
+            Self::ArchiveBarrierReady(_) => PHASE_ORDINAL_ARCHIVE_BARRIER_READY,
+            Self::Deleting(_) => PHASE_ORDINAL_DELETING,
+            Self::Restoring(_) => PHASE_ORDINAL_RESTORING,
+            Self::Verifying(_) => PHASE_ORDINAL_VERIFYING,
+            Self::AllRealmsReady(_) => PHASE_ORDINAL_ALL_REALMS_READY,
+        }
+    }
+
     pub fn to_canonical_bytes(&self) -> [u8; ROLLBACK_CONTROL_V1_LEN] {
         let mut encoded = [0_u8; ROLLBACK_CONTROL_V1_LEN];
         encoded[0..8].copy_from_slice(&ROLLBACK_CONTROL_MAGIC);
