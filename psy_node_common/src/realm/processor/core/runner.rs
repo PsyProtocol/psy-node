@@ -129,11 +129,17 @@ where
                     confirmed = false;
                 }
                 Ok(Some(phase)) => {
-                    // Remember the target while it is still being published.
-                    // Only some phases carry one, and the last one seen is the
-                    // one that counts.
-                    if let Some(target) = phase.target() {
-                        rollback_target = Some(target);
+                    // Remember the target while it is still being published,
+                    // but only until this Realm has done its share.  A later
+                    // phase re-arming it would send the recovery path over
+                    // ground participation already covered, and replanning from
+                    // a manifest whose rows are gone archives them as absent --
+                    // overwriting the record of what was discarded with one
+                    // saying there was nothing there.
+                    if !took_part {
+                        if let Some(target) = phase.target() {
+                            rollback_target = Some(target);
+                        }
                     }
                     // FROZEN is the only moment this Realm can join.  Taking
                     // part is what the archive barrier waits for: without a

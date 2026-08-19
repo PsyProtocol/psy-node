@@ -295,13 +295,23 @@ pub fn apply_phase_to_commit_path(
 /// floor rejected the commit, the rollback completed correctly, and the
 /// processor died anyway.
 ///
-/// Two distinct guards answer here because they catch the race at different
-/// depths: the commit window refuses to open at all, while the rollback floor
-/// refuses a commit source built on a head that is no longer idle.  A node can
-/// meet either depending on how far into the commit it had got.
+/// Three distinct guards answer here because they catch the race at different
+/// depths: the commit window refuses to open at all, the rollback floor refuses
+/// a commit source built on a head that is no longer idle, and the head itself
+/// refuses a normal advance while rollback control is active.  Which one a node
+/// meets depends on how far into the commit it had got, so all three count --
+/// the third was found only when a second rollback landed on a Coordinator that
+/// had just restarted from the first.
 pub fn is_refused_because_rollback(err: &anyhow::Error) -> bool {
+    use super::canonical_head::CanonicalHeadModelError;
     use super::commit_window::CommitWindowError;
     use super::coordinator_commit_source::CoordinatorCommitSourceError;
+
+    if let Some(CanonicalHeadModelError::NormalAdvanceWhileRollbackActive) =
+        err.downcast_ref::<CanonicalHeadModelError>()
+    {
+        return true;
+    }
 
     if let Some(CommitWindowError::FrozenForRollback { .. }) =
         err.downcast_ref::<CommitWindowError>()
@@ -484,6 +494,9 @@ mod tests {
         )));
         assert!(is_refused_because_rollback(&anyhow::Error::new(
             CoordinatorCommitSourceError::RollbackFloorRequiresIdleHead
+        )));
+        assert!(is_refused_because_rollback(&anyhow::Error::new(
+            super::super::canonical_head::CanonicalHeadModelError::NormalAdvanceWhileRollbackActive
         )));
     }
 

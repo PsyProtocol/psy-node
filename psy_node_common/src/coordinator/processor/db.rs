@@ -417,6 +417,51 @@ impl<
             tracing::info!("[COORD_INIT] checkpoint backup manager synced from db");
         }
 
+        // An allocator lease held at startup belonged to a commit that did not
+        // survive to release it -- a crash, or one a rollback refused.  The
+        // allocator is deliberately conservative about this while the node is
+        // running, because clearing a lease would rob a commit still in flight
+        // of its exclusivity; a process that has just started has no commit in
+        // flight, so here the same caution only blocks the chain with
+        // `authority already has active intent` and nothing ever clears it.
+        {
+            use psy_node_core::store::authority_commit::{
+                AuthorityIntentObservation, AuthorityTimestampPhase, AuthorityTimestampReadState,
+                AuthorityTimestampWriteOutcome,
+            };
+            let key = AuthorityTimestampKey::new(
+                NetworkId::from_network_type(network),
+                AuthorityScope::Coordinator,
+            );
+            if let AuthorityTimestampReadState::Current(state) =
+                recording.timestamp().read_timestamp_state(key).await?
+            {
+                if let AuthorityTimestampPhase::Active { intent } = state.phase() {
+                    if let AuthorityIntentObservation::Active(lease) =
+                        state.observe_intent(key, intent)
+                    {
+                        tracing::warn!(
+                            "[COORD_INIT] the commit timestamp lease was still held at startup by \
+                             a commit that never finished; releasing it so the next commit can \
+                             reserve"
+                        );
+                        let completion = state.seal_completion(key, lease)?;
+                        match recording.timestamp().complete_timestamp(&completion).await? {
+                            AuthorityTimestampWriteOutcome::Applied(_)
+                            | AuthorityTimestampWriteOutcome::Idempotent(_) => {}
+                            AuthorityTimestampWriteOutcome::Conflict(current) => {
+                                anyhow::bail!(
+                                    "another writer holds the commit timestamp allocator \
+                                     (observed revision {}); two Coordinators are running",
+                                    current.revision().get()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let shared_status = if last_committed_checkpoint_id == 0 {
             PsyCoordinatorProcessorSharedStatus {
                 last_committed_checkpoint_id,
@@ -1085,6 +1130,36 @@ checkpoint_backup_copy_status={}
     /// reservation, so a crash before this point stalls the authority rather than
     /// letting a half-recorded commit look finished -- which is the safer of the
     /// two failures.
+    /// Release the lease of a commit that is definitively not happening.
+    ///
+    /// Normally only `complete_commit_record` releases it, and the allocator is
+    /// deliberately conservative about the lease -- a rollback lifting the high
+    /// water carries the phase through untouched, because clearing it would rob
+    /// a commit that is still in flight of its exclusivity.
+    ///
+    /// A commit refused *because of* a rollback is not in flight.  It will never
+    /// be retried under that lease: the head it was building on no longer
+    /// exists.  Leaving the lease held made the refusal survive the rollback and
+    /// block the next start with `authority already has active intent`, which is
+    /// the same shape as the refusal being read as fatal -- a guard working
+    /// correctly and stopping the chain anyway.
+    async fn release_abandoned_commit_lease(
+        &self,
+        lease: psy_node_core::store::authority_commit::AuthorityTimestampLease,
+    ) -> anyhow::Result<()> {
+        let key = AuthorityTimestampKey::new(self.network_id, AuthorityScope::Coordinator);
+        let state = match self.recording.timestamp().read_timestamp_state(key).await? {
+            AuthorityTimestampReadState::Current(state) => state,
+            AuthorityTimestampReadState::Uninitialized => return Ok(()),
+        };
+        let completion = state.seal_completion(key, lease)?;
+        self.recording
+            .timestamp()
+            .complete_timestamp(&completion)
+            .await?;
+        Ok(())
+    }
+
     async fn complete_commit_record(
         &mut self,
         prepared: PreparedCommitRecording<N::QHash>,
@@ -1279,11 +1354,50 @@ checkpoint_backup_copy_status={}
         }
     }
 
+    /// Commit, and give back the timestamp lease if a rollback refuses the
+    /// commit part way through.
+    ///
+    /// The refusal itself is expected -- a rollback can start at any point and
+    /// the guards are there to catch a commit already under way.  What is not
+    /// expected is the lease outliving it: the commit will never be retried,
+    /// because the head it was building on is gone, and a held lease stops the
+    /// *next* one with `authority already has active intent`.  That turned a
+    /// working guard into a stopped chain one restart later, which is the same
+    /// shape as reading the refusal as fatal.
     pub async fn commit_state(
         &mut self,
         coordinator_update: PsyPreparedCoordinatorBlockStateUpdates<N::F, N::QHash>,
         state_transition_circuit_type: ProvingJobCircuitType,
         zk_proof: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        let mut lease = None;
+        let result = self
+            .commit_state_inner(
+                coordinator_update,
+                state_transition_circuit_type,
+                zk_proof,
+                &mut lease,
+            )
+            .await;
+        if let (Err(error), Some(lease)) = (&result, lease) {
+            if psy_node_core::store::rollback_coordination::is_refused_because_rollback(error) {
+                if let Err(release) = self.release_abandoned_commit_lease(lease).await {
+                    tracing::error!(
+                        "a commit refused by a rollback could not give its timestamp lease back \
+                         ({release:#}); the next commit will be refused for holding it"
+                    );
+                }
+            }
+        }
+        result
+    }
+
+    async fn commit_state_inner(
+        &mut self,
+        coordinator_update: PsyPreparedCoordinatorBlockStateUpdates<N::F, N::QHash>,
+        state_transition_circuit_type: ProvingJobCircuitType,
+        zk_proof: Vec<u8>,
+        lease_out: &mut Option<psy_node_core::store::authority_commit::AuthorityTimestampLease>,
     ) -> anyhow::Result<()> {
         let checkpoint_id: u64 = coordinator_update.checkpoint_id;
         tracing::info!("vaidation -> Committing coordinator state update to database for checkpoint_id: {}", checkpoint_id);
@@ -1409,6 +1523,12 @@ checkpoint_backup_copy_status={}
                 .await?,
             )
         };
+
+        if let Some(prepared) = &recorded {
+            // Carried out so the caller can give it back if a rollback refuses
+            // what follows.
+            *lease_out = Some(prepared.lease());
+        }
 
         // Open the commit window before the first state write.  From here every
         // statement the session sends carries this commit's allocated timestamp,
