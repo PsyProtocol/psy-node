@@ -259,6 +259,20 @@ impl CommitWindowClock {
     }
 }
 
+/// What a rollback needs from a node's commit path, whichever role it is.
+///
+/// Both recordings own a `CommitWindowClock`; this is the part of them a
+/// rollback executor uses, and naming it keeps the executor from having to know
+/// which role it is driving.
+pub trait CommitFreeze {
+    /// Stop admitting commits.
+    fn freeze_for_rollback(&self);
+    /// Admit them again.
+    fn thaw_after_rollback(&self);
+    /// Frozen and drained: nothing running and nothing able to start.
+    fn is_quiesced_for_rollback(&self) -> bool;
+}
+
 /// Closes the commit window when it goes out of scope.
 #[must_use = "dropping the guard immediately closes the window the commit needs"]
 pub struct CommitWindowGuard {

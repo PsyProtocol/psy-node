@@ -72,3 +72,33 @@ pub use mutation::*;
 pub use mutation_sink::*;
 pub use registry::*;
 pub use rollback_floor_store::*;
+
+/// Wait for the commit that was already running when the freeze landed.
+///
+/// Freezing refuses new commits but lets the running one finish, so between the
+/// two there is a window in which the head is still being written.  A plan built
+/// in that window would describe a commit that grew after it was read, and the
+/// archive taken from it would be short by however much landed afterwards.
+///
+/// Bounded rather than unbounded: a commit that has not finished in this long is
+/// not draining, it is stuck, and a rollback that waits forever for it holds the
+/// whole participant set frozen with no way to tell why.
+pub async fn drain_in_flight_commit(
+    recording: &dyn psy_node_core::store::commit_window::CommitFreeze,
+) -> anyhow::Result<()> {
+    const POLL: std::time::Duration = std::time::Duration::from_millis(50);
+    const LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+    let started = std::time::Instant::now();
+    while !recording.is_quiesced_for_rollback() {
+        if started.elapsed() >= LIMIT {
+            anyhow::bail!(
+                "a commit was still in flight {}s after this node froze; the head has not \
+                 stopped moving, so no freeze receipt may be filed for it",
+                LIMIT.as_secs()
+            );
+        }
+        tokio::time::sleep(POLL).await;
+    }
+    Ok(())
+}

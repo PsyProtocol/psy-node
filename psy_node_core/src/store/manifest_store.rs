@@ -272,3 +272,15 @@ impl<Hash: Q256BitHash> CoordinatorCommitRecording<Hash> {
         self.floor.as_ref()
     }
 }
+
+impl<Hash: Q256BitHash> super::commit_window::CommitFreeze for CoordinatorCommitRecording<Hash> {
+    fn freeze_for_rollback(&self) {
+        self.commit_window.freeze_for_rollback();
+    }
+    fn thaw_after_rollback(&self) {
+        self.commit_window.thaw_after_rollback();
+    }
+    fn is_quiesced_for_rollback(&self) -> bool {
+        self.commit_window.is_quiesced()
+    }
+}

@@ -158,22 +158,16 @@ impl<Hash: Q256BitHash> RealmCommitRecording<Hash> {
         self.commit_window.require_checkpoint(checkpoint_id)
     }
 
-    /// Stop admitting commits, because this node is a participant in a rollback
-    /// that has reached its freeze phase.
-    ///
-    /// The Coordinator and every Realm reach their commit path through one of
-    /// these, so this is the whole of a node's freeze.
-    pub fn freeze_for_rollback(&self) {
+}
+
+impl<Hash: Q256BitHash> super::commit_window::CommitFreeze for RealmCommitRecording<Hash> {
+    fn freeze_for_rollback(&self) {
         self.commit_window.freeze_for_rollback();
     }
-
-    /// Admit commits again, once the rollback has finished or been abandoned.
-    pub fn thaw_after_rollback(&self) {
+    fn thaw_after_rollback(&self) {
         self.commit_window.thaw_after_rollback();
     }
-
-    /// Frozen and drained, which is what a freeze receipt claims.
-    pub fn is_quiesced_for_rollback(&self) -> bool {
+    fn is_quiesced_for_rollback(&self) -> bool {
         self.commit_window.is_quiesced()
     }
 }

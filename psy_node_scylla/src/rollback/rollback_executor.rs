@@ -18,6 +18,7 @@
 
 use std::sync::Arc;
 
+use psy_node_core::store::commit_window::CommitFreeze;
 use psy_node_core::store::manifest_store::CoordinatorCommitRecording;
 use psy_node_core::store::rollback_plan::{RollbackPlan, build_rollback_plan};
 use psy_node_core::store::timestamp::DeleteFenceTimestampUs;
@@ -375,6 +376,15 @@ impl ScyllaRollbackExecutor {
         stored = self
             .advance(recording, CanonicalHeadTransition::begin_rollback_freeze(stored)?)
             .await?;
+
+        // Stop this process's own commit path before asking whether the head
+        // moved.  The re-read below still matters -- a Coordinator running in
+        // another process has its own clock and is stopped only by observing
+        // FROZEN -- but between the two, prevention beats detection: the re-read
+        // can only report that the archive would have been wrong, whereas this
+        // keeps it from becoming wrong.
+        recording.freeze_for_rollback();
+        super::drain_in_flight_commit(recording).await?;
 
         let head_digest = head
             .checkpoint()
