@@ -101,6 +101,20 @@ impl<Hash: Q256BitHash> RealmCommitRecording<Hash> {
         self.participant_view.as_deref()
     }
 
+    /// The head the Coordinator publishes right now.
+    ///
+    /// `Ok(None)` covers both "no view configured" and "the Coordinator has
+    /// never published", because a node can act on neither.
+    pub async fn observe_published_head(
+        &self,
+        coordinator_head: &psy_data::protocol::canonical_chain::CanonicalChainRef<Hash>,
+    ) -> anyhow::Result<Option<psy_data::protocol::canonical_chain::CanonicalChainRef<Hash>>> {
+        let Some(view) = self.participant_view.as_deref() else {
+            return Ok(None);
+        };
+        view.observe_published_head(coordinator_head).await
+    }
+
     /// Bring this node's commit path into line with the phase the Coordinator
     /// has published.  Called once per processor loop iteration.
     ///

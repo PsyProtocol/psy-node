@@ -25,6 +25,7 @@ use psy_node_core::store::rollback_participants::{
     ArchiveReceipt, FreezeReceipt, RollbackParticipant, VerifyReceipt,
 };
 use parth_core::protocol::core_types::Q256BitHash;
+use psy_node_core::store::canonical_head::CanonicalHeadReadState;
 use scylla::client::session::Session;
 use scylla::statement::prepared::PreparedStatement;
 
@@ -170,6 +171,20 @@ impl<Hash: Q256BitHash> RollbackParticipantView<Hash> for ScyllaRollbackParticip
             .read_canonical_head(coordinator_head.network_id())
             .await?;
         Ok(phase_from_head_state(&state))
+    }
+
+    async fn observe_published_head(
+        &self,
+        coordinator_head: &CanonicalChainRef<Hash>,
+    ) -> anyhow::Result<Option<CanonicalChainRef<Hash>>> {
+        let state = self
+            .head_reader
+            .read_canonical_head(coordinator_head.network_id())
+            .await?;
+        Ok(match state {
+            CanonicalHeadReadState::Current(head) => Some(*head.canonical_ref()),
+            CanonicalHeadReadState::Uninitialized => None,
+        })
     }
 
     async fn file_archive_receipt(&self, receipt: &ArchiveReceipt) -> anyhow::Result<()> {

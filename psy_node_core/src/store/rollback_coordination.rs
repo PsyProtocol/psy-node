@@ -75,6 +75,23 @@ impl ObservedRollbackPhase {
         matches!(self, Self::Idle)
     }
 
+    /// The height this rollback is heading for, when the phase names one.
+    ///
+    /// `Requested` and `Freeze` do not: at those points the participant set is
+    /// fixed and the head is being settled, but the target is not yet something
+    /// a participant acts on.  A participant that only ever saw those phases
+    /// therefore learns no target, which is correct -- it has nothing to undo
+    /// to.
+    pub const fn target(self) -> Option<u64> {
+        match self {
+            Self::Archive { target, .. }
+            | Self::Delete { target, .. }
+            | Self::Restore { target }
+            | Self::Verify { target } => Some(target),
+            Self::Idle | Self::Requested | Self::Freeze { .. } | Self::Aborting => None,
+        }
+    }
+
     pub fn from_control<Hash: Q256BitHash>(state: &RollbackControlState<Hash>) -> Self {
         match state {
             RollbackControlState::Idle => Self::Idle,
@@ -122,6 +139,19 @@ pub trait RollbackParticipantView<Hash: Q256BitHash>: Send + Sync {
         &self,
         coordinator_head: &CanonicalChainRef<Hash>,
     ) -> anyhow::Result<ObservedRollbackPhase>;
+
+    /// The head the Coordinator currently publishes, or `None` when it has
+    /// never published one.
+    ///
+    /// Separate from `observe_phase` because it answers a different question: a
+    /// participant that missed the whole rollback -- because it was down for it
+    /// -- sees Idle and learns nothing, while the published head still says
+    /// where the chain is.  That is the only evidence available to a node that
+    /// was not watching.
+    async fn observe_published_head(
+        &self,
+        coordinator_head: &CanonicalChainRef<Hash>,
+    ) -> anyhow::Result<Option<CanonicalChainRef<Hash>>>;
 
     /// Record that this participant archived the range.
     ///
@@ -286,6 +316,12 @@ mod tests {
         ) -> anyhow::Result<ObservedRollbackPhase> {
             Ok(self.0)
         }
+        async fn observe_published_head(
+            &self,
+            _coordinator_head: &CanonicalChainRef<Hash>,
+        ) -> anyhow::Result<Option<CanonicalChainRef<Hash>>> {
+            unreachable!("following a phase does not read the head separately")
+        }
         async fn file_archive_receipt(&self, _receipt: &ArchiveReceipt) -> anyhow::Result<()> {
             unreachable!("following a phase files nothing")
         }
@@ -448,5 +484,45 @@ mod tests {
         assert!(!is_refused_because_rollback(&anyhow::anyhow!(
             "the worker returned no proof"
         )));
+    }
+
+    #[test]
+    fn only_the_phases_a_participant_acts_on_name_a_target() {
+        // Requested and Freeze deliberately do not: the participant set is
+        // fixed and the head is settling, but there is nothing yet to undo to.
+        assert_eq!(
+            ObservedRollbackPhase::Archive { target: 90, head: 100 }.target(),
+            Some(90)
+        );
+        assert_eq!(
+            ObservedRollbackPhase::Delete { target: 90, head: 100 }.target(),
+            Some(90)
+        );
+        assert_eq!(ObservedRollbackPhase::Restore { target: 90 }.target(), Some(90));
+        assert_eq!(ObservedRollbackPhase::Verify { target: 90 }.target(), Some(90));
+        for phase in [
+            ObservedRollbackPhase::Idle,
+            ObservedRollbackPhase::Requested,
+            ObservedRollbackPhase::Freeze { head: 100 },
+            ObservedRollbackPhase::Aborting,
+        ] {
+            assert_eq!(phase.target(), None, "{phase:?} must not name a target");
+        }
+    }
+
+    #[test]
+    fn a_participant_that_only_saw_the_freeze_learns_no_target() {
+        // The case that decides whether the recovery may be driven from the
+        // phase alone: a Realm that observed the rollback only while the head
+        // was being settled has nothing to reset to, and must fall back to the
+        // published head instead of guessing.
+        let seen: Vec<Option<u64>> = [
+            ObservedRollbackPhase::Requested,
+            ObservedRollbackPhase::Freeze { head: 100 },
+        ]
+        .into_iter()
+        .map(|p| p.target())
+        .collect();
+        assert!(seen.into_iter().all(|t| t.is_none()));
     }
 }

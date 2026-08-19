@@ -186,6 +186,44 @@ where
         Ok(())
     }
 
+    /// Truncate this Realm's cached view of the chain when the Coordinator has
+    /// published a head below it.
+    ///
+    /// This is the check the Coordinator has had since the first rollback
+    /// ([`db.rs`] `COORD_INIT`) and the Realm has not.  The Realm's own
+    /// divergence detector compares its computed root against the Coordinator's
+    /// **for each checkpoint it syncs**, which structurally cannot catch this
+    /// case: after a rollback the Realm already holds those heights, so it never
+    /// re-fetches them and the comparison never runs on the leaves that went
+    /// stale.  The damage surfaces much later, as a witness the worker cannot
+    /// prove -- `Wire ... was set twice with different values` -- because the
+    /// witness mixes the discarded branch's leaves with the current database.
+    ///
+    /// Runs at startup, which is where a node that was down for the rollback
+    /// gets its only chance to notice: it comes back to an Idle control row and
+    /// no phase to observe, and only the published head still says where the
+    /// chain is.
+    pub async fn truncate_if_ahead_of_published_head(&mut self) -> anyhow::Result<()> {
+        let seen = self.coordinator_chain_ref_last_synced();
+        let Some(published) = self.recording.observe_published_head(&seen).await? else {
+            return Ok(());
+        };
+        let published_height = published.checkpoint().checkpoint_id().get();
+        let cached = self
+            .checkpoint_tree_backup_manager
+            .get_current_checkpoint_id_head();
+        if cached <= published_height {
+            return Ok(());
+        }
+        tracing::warn!(
+            "[REALM_INIT] checkpoint cache is ahead of the published head ({} > {}); truncating \
+             so the discarded branch is re-fetched rather than reused",
+            cached,
+            published_height
+        );
+        self.reset_for_rollback_to(published_height).await
+    }
+
     /// Bring this Realm's commit path into line with the rollback phase the
     /// Coordinator has published, and report that phase.
     ///
@@ -201,14 +239,22 @@ where
         &self,
     ) -> anyhow::Result<Option<psy_node_core::store::rollback_coordination::ObservedRollbackPhase>>
     {
+        let seen = self.coordinator_chain_ref_last_synced();
+        self.recording.follow_published_phase(&seen).await
+    }
+
+    /// The Coordinator coordinate this Realm last actually synced.
+    ///
+    /// Only the network is read from it by the control-row queries; it is built
+    /// from what this Realm has seen rather than from something it assumed, so
+    /// that a wrong value here can never be mistaken for evidence.
+    fn coordinator_chain_ref_last_synced(
+        &self,
+    ) -> psy_data::protocol::canonical_chain::CanonicalChainRef<N::QHash> {
         use psy_data::protocol::canonical_chain::{
             CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId, CheckpointRef,
         };
-        // Only the network is read from this; the phase lives on the
-        // Coordinator's control row, not in the coordinate we pass in.  Built
-        // from the last head this Realm actually synced so that the value is one
-        // it has seen rather than one it assumed.
-        let seen = CanonicalChainRef::new(
+        CanonicalChainRef::new(
             self.network_id,
             ChainEpoch::new(0),
             CheckpointRef::new(
@@ -217,8 +263,7 @@ where
                     self.state.coordinator_head_synced_checkpoint_root,
                 ),
             ),
-        );
-        self.recording.follow_published_phase(&seen).await
+        )
     }
 
     pub async fn sync_with_coordinator(&mut self) -> anyhow::Result<()> {

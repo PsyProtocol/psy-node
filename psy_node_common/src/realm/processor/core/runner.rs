@@ -44,9 +44,29 @@ where
     processor.db.status.mark_running();
     print_cf_log_indicator("PSY_REALM_PROCESSOR_STARTED", &format!("R{}_{}", realm_id, realm_sub_id));
 
+    // A node that was down for a rollback comes back to an Idle control row and
+    // no phase left to observe, so the published head is the only evidence it
+    // has.  Checked once, here, for the same reason the Coordinator checks at
+    // startup: this is the one moment such a node can still notice.
+    if let Err(e) = processor.db.truncate_if_ahead_of_published_head().await {
+        tracing::error!(
+            "[REALM] could not reconcile the checkpoint cache against the published head \
+             ({e:#}); starting anyway would risk proving a witness built from a discarded branch"
+        );
+        return Err(e);
+    }
+
     let mut last_slot: u128 = 0;
     // Logged on the edge, not every second, so a long rollback does not bury the log.
     let mut reported_frozen = false;
+    // What this Realm must undo once the rollback it is watching finishes.  Held
+    // in memory only: it is evidence of a rollback this process *watched*, and a
+    // process that did not watch one must not act on a leftover value.
+    let mut rollback_target: Option<u64> = None;
+    // An abort ends at Idle exactly as a success does, so without this the two
+    // would be indistinguishable and an aborted rollback would throw away sync
+    // state the Coordinator never discarded.
+    let mut rollback_aborted = false;
 
     loop {
         if processor.db.status.should_run() {
@@ -57,8 +77,42 @@ where
             // height inside the deleted range.
             match processor.db.follow_coordinator_rollback_phase().await {
                 Ok(None) => {}
-                Ok(Some(phase)) if phase.permits_commit() => {}
+                Ok(Some(phase)) if phase.permits_commit() => {
+                    // Idle.  If this process watched a rollback reach a target,
+                    // now is when it undoes its own copy of the discarded range:
+                    // the Coordinator has finished and is publishing again, and
+                    // the Realm still holds heights that no longer exist.
+                    if let Some(target) = rollback_target.take() {
+                        if rollback_aborted {
+                            tracing::info!(
+                                "[REALM] the rollback to {target} was aborted; keeping the sync \
+                                 state the Coordinator never discarded"
+                            );
+                        } else if let Err(e) = processor.db.reset_for_rollback_to(target).await {
+                            tracing::error!(
+                                "[REALM] could not reset to the rollback target {target} \
+                                 ({e:#}); retrying rather than resuming on a discarded branch"
+                            );
+                            rollback_target = Some(target);
+                            sleep(std::time::Duration::from_secs(1)).await;
+                            continue;
+                        }
+                    }
+                    rollback_aborted = false;
+                }
                 Ok(Some(phase)) => {
+                    // Remember the target while it is still being published.
+                    // Only some phases carry one, and the last one seen is the
+                    // one that counts.
+                    if let Some(target) = phase.target() {
+                        rollback_target = Some(target);
+                    }
+                    if matches!(
+                        phase,
+                        psy_node_core::store::rollback_coordination::ObservedRollbackPhase::Aborting
+                    ) {
+                        rollback_aborted = true;
+                    }
                     if !std::mem::replace(&mut reported_frozen, true) {
                         tracing::info!(
                             "[REALM] frozen for a rollback: the Coordinator has published \

@@ -305,6 +305,15 @@ impl ScriptedCoordinator {
 
 #[async_trait::async_trait]
 impl RollbackParticipantView<PHash> for ScriptedCoordinator {
+    async fn observe_published_head(
+        &self,
+        coordinator_head: &CanonicalChainRef<PHash>,
+    ) -> anyhow::Result<Option<CanonicalChainRef<PHash>>> {
+        // The stand-in publishes whatever it was handed; the Realm's recovery
+        // path is exercised against a real control row, not this.
+        Ok(Some(*coordinator_head))
+    }
+
     async fn observe_phase(
         &self,
         _coordinator_head: &CanonicalChainRef<PHash>,
