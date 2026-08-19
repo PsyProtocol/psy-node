@@ -22,6 +22,7 @@ pub mod realm_self_rollback;
 pub mod realm_sync_epoch;
 pub mod rollback_event;
 pub mod rollback_participants;
+pub mod rollback_reload;
 pub mod rollback_plan;
 pub mod timestamp;
 pub mod verification_journal;

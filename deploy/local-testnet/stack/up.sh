@@ -503,10 +503,25 @@ start_process() {
     env_args+=("$kv")
   done
 
+  # Exit 75 (EX_TEMPFAIL) is a processor asking to be restarted after a
+  # rollback: it has done its part and needs its in-memory state rebuilt by the
+  # startup path.  A production deployment gets this from systemd or k8s; this
+  # stack runs under nohup, so the loop is here.  Only that one code restarts --
+  # a real crash still stops, because a stack that silently restarts through a
+  # crash loop hides the thing you most need to see.
+  local runner='
+    while true; do
+      bash "$1" "$2"
+      code=$?
+      if [ "$code" -ne 75 ]; then exit "$code"; fi
+      echo "[local-staging] $2 asked to reload after a rollback; restarting"
+    done
+  '
+
   if command -v setsid >/dev/null 2>&1; then
-    env "${env_args[@]}" setsid bash "$PARTH_DIR/deploy/bin/run-parth-service" "$service" >"$log_file" 2>&1 &
+    env "${env_args[@]}" setsid bash -c "$runner" _ "$PARTH_DIR/deploy/bin/run-parth-service" "$service" >"$log_file" 2>&1 &
   else
-    env "${env_args[@]}" nohup bash "$PARTH_DIR/deploy/bin/run-parth-service" "$service" >"$log_file" 2>&1 &
+    env "${env_args[@]}" nohup bash -c "$runner" _ "$PARTH_DIR/deploy/bin/run-parth-service" "$service" >"$log_file" 2>&1 &
   fi
 
   echo "$!" > "$pid_file"

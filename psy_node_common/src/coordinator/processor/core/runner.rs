@@ -52,6 +52,14 @@ where
     let mut last_slot: u128 = 0;
     // Logged on the edge so a long rollback does not bury the log.
     let mut reported_frozen = false;
+    // What this processor must rebuild itself against once the rollback ends.
+    // Held in memory only: it is evidence of a rollback this process watched,
+    // and a process that did not watch one must not act on a leftover value.
+    let mut rollback_target: Option<u64> = None;
+    // An abort returns to Idle exactly as a success does, and an abort changed
+    // no state, so resetting after one would throw away a head that was never
+    // discarded.
+    let mut rollback_aborted = false;
 
     loop {
         if processor.db.status.should_run() {
@@ -75,8 +83,59 @@ where
                     .follow_published_phase(processor.db.network_id)
                     .await
                 {
-                    Ok(phase) if phase.permits_commit() => {}
+                    Ok(phase) if phase.permits_commit() => {
+                        // Idle.  A rollback rewrote the database under this
+                        // process while it was frozen; everything it holds in
+                        // memory -- the checkpoint tree cache, the next
+                        // checkpoint id, the pending id counters, the last
+                        // committed roots -- still describes the branch that was
+                        // discarded.  Nothing tells it so: it plans the next
+                        // block from the stale head, publishes jobs for a
+                        // checkpoint that no longer exists, and waits forever
+                        // without logging an error.
+                        if let Some(target) = rollback_target.take() {
+                            if rollback_aborted {
+                                tracing::info!(
+                                    "[COORDINATOR] the rollback to {target} was aborted; keeping \
+                                     the head it never discarded"
+                                );
+                            } else {
+                                // Everything this process holds in memory now
+                                // describes the branch that was discarded.  See
+                                // `rollback_reload` for why it restarts instead
+                                // of repairing in place.
+                                tracing::warn!(
+                                    "[COORDINATOR] the chain was rolled back to {target}; \
+                                     restarting so state is rebuilt by the path that already \
+                                     does it on every start (exit {})",
+                                    psy_node_core::store::rollback_reload::EXIT_CODE_ROLLBACK_RELOAD
+                                );
+                                print_cf_log_indicator(
+                                    "PSY_COORDINATOR_PROCESSOR_ROLLBACK_RELOAD",
+                                    &format!("R{}_{}", realm_id, realm_sub_id),
+                                );
+                                // Stop the gatherers before going, so the
+                                // restart does not race the tasks this one
+                                // spawned.
+                                processor.db.status.begin_shutdown();
+                                sleep(std::time::Duration::from_millis(500)).await;
+                                std::process::exit(
+                                    psy_node_core::store::rollback_reload::EXIT_CODE_ROLLBACK_RELOAD,
+                                );
+                            }
+                        }
+                        rollback_aborted = false;
+                    }
                     Ok(phase) => {
+                        if let Some(target) = phase.target() {
+                            rollback_target = Some(target);
+                        }
+                        if matches!(
+                            phase,
+                            psy_node_core::store::rollback_coordination::ObservedRollbackPhase::Aborting
+                        ) {
+                            rollback_aborted = true;
+                        }
                         if !std::mem::replace(&mut reported_frozen, true) {
                             tracing::info!(
                                 "[COORDINATOR] frozen for a rollback: the control row says \
