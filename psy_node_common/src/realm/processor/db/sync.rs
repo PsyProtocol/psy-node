@@ -186,6 +186,41 @@ where
         Ok(())
     }
 
+    /// Bring this Realm's commit path into line with the rollback phase the
+    /// Coordinator has published, and report that phase.
+    ///
+    /// Called at the top of the processor loop, before anything decides to sync
+    /// or produce.  Freezing has to cover the sync as well as the commit: a
+    /// Realm that only stopped producing would still copy the Coordinator
+    /// checkpoints that are about to be discarded, and then hold a recorded
+    /// coordinator height inside the range the rollback is deleting.
+    ///
+    /// `Ok(None)` means this Realm has no view of the control row, which is the
+    /// configuration before rollback is enabled and leaves the loop as it was.
+    pub async fn follow_coordinator_rollback_phase(
+        &self,
+    ) -> anyhow::Result<Option<psy_node_core::store::rollback_coordination::ObservedRollbackPhase>>
+    {
+        use psy_data::protocol::canonical_chain::{
+            CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId, CheckpointRef,
+        };
+        // Only the network is read from this; the phase lives on the
+        // Coordinator's control row, not in the coordinate we pass in.  Built
+        // from the last head this Realm actually synced so that the value is one
+        // it has seen rather than one it assumed.
+        let seen = CanonicalChainRef::new(
+            self.network_id,
+            ChainEpoch::new(0),
+            CheckpointRef::new(
+                CheckpointId::new(self.state.coordinator_head_synced_checkpoint_id),
+                CheckpointHash::from_last_chain_hash(
+                    self.state.coordinator_head_synced_checkpoint_root,
+                ),
+            ),
+        );
+        self.recording.follow_published_phase(&seen).await
+    }
+
     pub async fn sync_with_coordinator(&mut self) -> anyhow::Result<()> {
         let coordinator_latest_checkpoint_id: u64 = self.coordinator_client.rc_get_latest_checkpoint_id().await?;
         let last_synced_checkpoint_id = self.checkpoint_tree_backup_manager.get_current_checkpoint_id_head();

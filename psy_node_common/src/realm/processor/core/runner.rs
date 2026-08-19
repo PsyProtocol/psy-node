@@ -45,9 +45,48 @@ where
     print_cf_log_indicator("PSY_REALM_PROCESSOR_STARTED", &format!("R{}_{}", realm_id, realm_sub_id));
 
     let mut last_slot: u128 = 0;
+    // Logged on the edge, not every second, so a long rollback does not bury the log.
+    let mut reported_frozen = false;
 
     loop {
         if processor.db.status.should_run() {
+            // A rollback the Coordinator has published outranks anything this
+            // loop was about to do.  Checked before the sync and not only before
+            // producing: a Realm that kept syncing would copy the very
+            // checkpoints being discarded and end up recording a coordinator
+            // height inside the deleted range.
+            match processor.db.follow_coordinator_rollback_phase().await {
+                Ok(None) => {}
+                Ok(Some(phase)) if phase.permits_commit() => {}
+                Ok(Some(phase)) => {
+                    if !std::mem::replace(&mut reported_frozen, true) {
+                        tracing::info!(
+                            "[REALM] frozen for a rollback: the Coordinator has published \
+                             {phase:?}; this Realm will not sync or produce until it publishes \
+                             Idle again"
+                        );
+                    }
+                    sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+                Err(e) => {
+                    // Fail closed.  A Realm that cannot read the control row
+                    // does not know whether a rollback is running, and the cost
+                    // of guessing wrong in the two directions is not
+                    // symmetric: guessing Idle writes rows into a range that is
+                    // about to be treated as final, while guessing frozen only
+                    // costs the liveness this loop already gives up on a failed
+                    // sync.
+                    tracing::error!(
+                        "[REALM] cannot read the Coordinator's rollback phase ({e:#}); holding \
+                         off rather than committing through a rollback that may be running"
+                    );
+                    sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+            }
+            reported_frozen = false;
+
             // tracing::debug!("[REALM] Sync and verify starting...");
             let sync_result = processor.sync_and_verify().await;
             match sync_result {

@@ -23,6 +23,9 @@ use parth_core::protocol::core_types::Q256BitHash;
 use super::authority_commit::AuthorityCommitTimestampStore;
 use super::commit_planner::RealmCommitPlanner;
 use super::commit_window::{CommitWindow, CommitWindowClock, CommitWindowError, CommitWindowGuard};
+use super::rollback_coordination::{
+    follow_published_rollback_phase, ObservedRollbackPhase, RollbackParticipantView,
+};
 use super::manifest_store::{AuthorityManifestStore, ManifestArtifactStore};
 use super::timestamp::CommitWriteTimestampUs;
 use super::verification_journal::CommitVerificationJournal;
@@ -34,6 +37,18 @@ pub struct RealmCommitRecording<Hash: Q256BitHash> {
     manifest: Arc<dyn AuthorityManifestStore<Hash>>,
     manifest_artifact: Arc<dyn ManifestArtifactStore<Hash>>,
     commit_window: Arc<CommitWindowClock>,
+    /// How this node watches the rollback it is a participant in.
+    ///
+    /// It rides with the rest of the bundle rather than being threaded through
+    /// the processor's constructor because it is the same kind of thing: what
+    /// this node needs in order to take part in the rollback protocol.  Every
+    /// processor already receives the bundle, so nothing new has to be plumbed
+    /// to reach the loop.
+    ///
+    /// `None` when the Coordinator's keyspace was not named.  A node that cannot
+    /// read the control row must not guess at a phase -- it would either freeze
+    /// a chain nobody asked to freeze, or commit through one that was frozen.
+    participant_view: Option<Arc<dyn RollbackParticipantView<Hash>>>,
     journal: Option<Arc<dyn CommitVerificationJournal>>,
 }
 
@@ -45,6 +60,7 @@ impl<Hash: Q256BitHash> Clone for RealmCommitRecording<Hash> {
             manifest: self.manifest.clone(),
             manifest_artifact: self.manifest_artifact.clone(),
             commit_window: self.commit_window.clone(),
+            participant_view: self.participant_view.clone(),
             journal: self.journal.clone(),
         }
     }
@@ -66,7 +82,40 @@ impl<Hash: Q256BitHash> RealmCommitRecording<Hash> {
             manifest_artifact,
             commit_window,
             journal,
+            participant_view: None,
         }
+    }
+
+    /// Attach the participant view, when the Coordinator's control row is
+    /// reachable.
+    #[must_use]
+    pub fn with_participant_view(
+        mut self,
+        view: Option<Arc<dyn RollbackParticipantView<Hash>>>,
+    ) -> Self {
+        self.participant_view = view;
+        self
+    }
+
+    pub fn participant_view(&self) -> Option<&dyn RollbackParticipantView<Hash>> {
+        self.participant_view.as_deref()
+    }
+
+    /// Bring this node's commit path into line with the phase the Coordinator
+    /// has published.  Called once per processor loop iteration.
+    ///
+    /// `Ok(None)` means this node has no view of the control row, which is the
+    /// pre-rollback configuration and leaves the loop running as before.
+    pub async fn follow_published_phase(
+        &self,
+        coordinator_head: &psy_data::protocol::canonical_chain::CanonicalChainRef<Hash>,
+    ) -> anyhow::Result<Option<ObservedRollbackPhase>> {
+        let Some(view) = self.participant_view.as_deref() else {
+            return Ok(None);
+        };
+        follow_published_rollback_phase(view, coordinator_head, &self.commit_window)
+            .await
+            .map(Some)
     }
 
     pub fn timestamp(&self) -> &dyn AuthorityCommitTimestampStore {

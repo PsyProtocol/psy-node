@@ -361,7 +361,7 @@ pub async fn setup_realm_psy_scylla_store_from_connection_string<N: QNetworkData
     connection_string: &str,
 ) -> anyhow::Result<(
     ScyllaUnifiedPsyStore<N, N::QHash, N::HasherBase>,
-    crate::rollback::RealmRollbackControlPlane,
+    crate::rollback::RealmRollbackControlPlane<N::QHash>,
 )> {
     if connection_string.is_empty() {
         anyhow::bail!("Scylla Connection string is empty");

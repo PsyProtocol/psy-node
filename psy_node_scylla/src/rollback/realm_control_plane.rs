@@ -14,7 +14,10 @@
 
 use std::sync::Arc;
 
-use parth_core::{crypto::hash::traits::MerkleZeroHasher, protocol::core_types::QHashBase};
+use parth_core::{
+    crypto::hash::traits::MerkleZeroHasher,
+    protocol::core_types::{Q256BitHash, QHashBase},
+};
 use psy_node_core::store::commit_window::CommitWindowClock;
 
 use crate::core::ScyllaCoreStore;
@@ -33,7 +36,11 @@ pub const REALM_ROLLBACK_CONTROL_TABLES: &[&str] = &[
     super::AUTHORITY_MANIFEST_ARTIFACT_TABLE,
 ];
 
-pub struct RealmRollbackControlPlane {
+/// Generic in the chain's hash, because the participant view it holds reads the
+/// Coordinator's head and a head is hashed.  The rest of the plane is
+/// hash-agnostic and used to make the whole struct so; that was only true while
+/// it could not watch a rollback.
+pub struct RealmRollbackControlPlane<Hash: Q256BitHash + QHashBase> {
     authority_timestamp: Arc<ScyllaAuthorityTimestampStore>,
     manifest: Arc<ScyllaAuthorityManifestStore>,
     manifest_artifact: Arc<ScyllaManifestArtifactStore>,
@@ -47,17 +54,17 @@ pub struct RealmRollbackControlPlane {
     /// because a Realm that cannot see the control row must not guess at a
     /// phase -- it would either freeze a chain nobody asked to freeze, or keep
     /// committing through one that was.
-    participant_view: Option<Arc<super::ScyllaRollbackParticipantView>>,
+    participant_view: Option<Arc<super::ScyllaRollbackParticipantView<Hash>>>,
 }
 
-impl RealmRollbackControlPlane {
+impl<Hash: Q256BitHash + QHashBase> RealmRollbackControlPlane<Hash> {
     /// The Realm's participant view, when the Coordinator's keyspace is known.
-    pub fn participant_view(&self) -> Option<&super::ScyllaRollbackParticipantView> {
+    pub fn participant_view(&self) -> Option<&super::ScyllaRollbackParticipantView<Hash>> {
         self.participant_view.as_deref()
     }
 
     /// Create then prepare, for a Realm bringing a keyspace up.
-    pub async fn setup<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>(
+    pub async fn setup<Hasher: MerkleZeroHasher<Hash>>(
         store: &ScyllaCoreStore<Hash, Hasher>,
     ) -> anyhow::Result<Self> {
         let no_tablet = store.no_tablet_keyspace.clone();
@@ -114,7 +121,7 @@ impl RealmRollbackControlPlane {
         if let Ok(coordinator_no_tablet) =
             std::env::var("PSY_ROLLBACK_COORDINATOR_NO_TABLET_KEYSPACE")
         {
-            super::ScyllaRollbackParticipantView::create_table(
+            super::ScyllaRollbackParticipantView::<Hash>::create_table(
                 &store.session,
                 &coordinator_no_tablet,
             )
@@ -147,7 +154,7 @@ impl RealmRollbackControlPlane {
     ///
     /// Handed out whole, like the Coordinator's, so §0.2 D3 holds on this side
     /// too: there is no way to obtain the state store without it.
-    pub fn recording<Hash: parth_core::protocol::core_types::Q256BitHash>(
+    pub fn recording(
         &self,
     ) -> psy_node_core::store::realm_commit_recording::RealmCommitRecording<Hash> {
         psy_node_core::store::realm_commit_recording::RealmCommitRecording::new(
@@ -161,5 +168,10 @@ impl RealmRollbackControlPlane {
                     as Arc<dyn psy_node_core::store::verification_journal::CommitVerificationJournal>
             }),
         )
+        .with_participant_view(self.participant_view.clone().map(|view| {
+            view as Arc<
+                dyn psy_node_core::store::rollback_coordination::RollbackParticipantView<Hash>,
+            >
+        }))
     }
 }

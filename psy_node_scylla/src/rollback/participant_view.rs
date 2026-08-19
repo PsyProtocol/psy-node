@@ -24,6 +24,7 @@ use psy_node_core::store::rollback_coordination::{
 use psy_node_core::store::rollback_participants::{
     ArchiveReceipt, FreezeReceipt, RollbackParticipant, VerifyReceipt,
 };
+use parth_core::protocol::core_types::Q256BitHash;
 use scylla::client::session::Session;
 use scylla::statement::prepared::PreparedStatement;
 
@@ -32,9 +33,14 @@ pub const ROLLBACK_VERIFY_RECEIPT_TABLE: &str = "rollback_verify_receipt";
 pub const ROLLBACK_FREEZE_RECEIPT_TABLE: &str = "rollback_freeze_receipt";
 
 /// Reads the Coordinator's phase and files this participant's receipts.
-pub struct ScyllaRollbackParticipantView {
+///
+/// Generic in the hash for the same reason the control plane is: the only thing
+/// here that knows about a hash at all is the head reader it borrows, and that
+/// is already generic.  Pinning it to one concrete hash would make the view
+/// unusable from the generic capability bundle every processor receives.
+pub struct ScyllaRollbackParticipantView<Hash: Q256BitHash> {
     session: Arc<Session>,
-    head_reader: Arc<dyn CoordinatorCanonicalHeadReader<PHash>>,
+    head_reader: Arc<dyn CoordinatorCanonicalHeadReader<Hash>>,
     insert: PreparedStatement,
     read_range: PreparedStatement,
     insert_verify: PreparedStatement,
@@ -43,7 +49,7 @@ pub struct ScyllaRollbackParticipantView {
     read_freeze: PreparedStatement,
 }
 
-impl ScyllaRollbackParticipantView {
+impl<Hash: Q256BitHash> ScyllaRollbackParticipantView<Hash> {
     pub async fn create_table(session: &Session, no_tablet_keyspace: &str) -> anyhow::Result<()> {
         session
             .query_unpaged(
@@ -96,7 +102,7 @@ impl ScyllaRollbackParticipantView {
     pub async fn prepare(
         session: Arc<Session>,
         no_tablet_keyspace: &str,
-        head_reader: Arc<dyn CoordinatorCanonicalHeadReader<PHash>>,
+        head_reader: Arc<dyn CoordinatorCanonicalHeadReader<Hash>>,
     ) -> anyhow::Result<Self> {
         let insert = session
             .prepare(format!(
@@ -154,10 +160,10 @@ impl ScyllaRollbackParticipantView {
 }
 
 #[async_trait]
-impl RollbackParticipantView<PHash> for ScyllaRollbackParticipantView {
+impl<Hash: Q256BitHash> RollbackParticipantView<Hash> for ScyllaRollbackParticipantView<Hash> {
     async fn observe_phase(
         &self,
-        coordinator_head: &CanonicalChainRef<PHash>,
+        coordinator_head: &CanonicalChainRef<Hash>,
     ) -> anyhow::Result<ObservedRollbackPhase> {
         let state = self
             .head_reader
