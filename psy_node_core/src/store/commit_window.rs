@@ -89,6 +89,12 @@ pub enum CommitWindowError {
     /// A second window was opened while one was still open.  Commits are
     /// serialised by construction, so this means the caller lost track of one.
     AlreadyOpen { open: u64, requested: u64 },
+    /// A commit tried to start while this node is frozen for a rollback.
+    ///
+    /// Not a fault: the node has been told to stop producing so the head it is
+    /// about to hand over stops moving.  The caller should back off and try
+    /// again once the rollback finishes.
+    FrozenForRollback { requested: u64 },
 }
 
 impl fmt::Display for CommitWindowError {
@@ -108,6 +114,11 @@ impl fmt::Display for CommitWindowError {
                 "a commit window for checkpoint {open} is still open; checkpoint {requested} \
                  cannot open another"
             ),
+            Self::FrozenForRollback { requested } => write!(
+                f,
+                "checkpoint {requested} cannot commit: this node is frozen for a rollback and \
+                 its head must stay byte-for-byte stable until the archive is taken"
+            ),
         }
     }
 }
@@ -122,7 +133,17 @@ impl Error for CommitWindowError {}
 /// between writers.
 #[derive(Debug, Default)]
 pub struct CommitWindowClock {
-    open: Mutex<Option<CommitWindow>>,
+    state: Mutex<ClockState>,
+}
+
+/// The window and the freeze flag share one lock deliberately.  Held apart, a
+/// commit could read "not frozen", be preempted, and insert its window after the
+/// freeze took effect -- writing a row into the range a rollback is about to
+/// treat as final.
+#[derive(Debug, Default)]
+struct ClockState {
+    open: Option<CommitWindow>,
+    frozen: bool,
 }
 
 impl CommitWindowClock {
@@ -142,15 +163,20 @@ impl CommitWindowClock {
         self: &Arc<Self>,
         window: CommitWindow,
     ) -> Result<CommitWindowGuard, CommitWindowError> {
-        let mut slot = self.open.lock().expect("commit window mutex poisoned");
-        if let Some(existing) = *slot {
+        let mut state = self.state.lock().expect("commit window mutex poisoned");
+        if state.frozen {
+            return Err(CommitWindowError::FrozenForRollback {
+                requested: window.checkpoint_id(),
+            });
+        }
+        if let Some(existing) = state.open {
             return Err(CommitWindowError::AlreadyOpen {
                 open: existing.checkpoint_id(),
                 requested: window.checkpoint_id(),
             });
         }
-        *slot = Some(window);
-        drop(slot);
+        state.open = Some(window);
+        drop(state);
         Ok(CommitWindowGuard {
             clock: Arc::clone(self),
         })
@@ -183,11 +209,53 @@ impl CommitWindowClock {
     /// The open window, if any.  This is what the session's timestamp generator
     /// reads on every statement.
     pub fn peek(&self) -> Option<CommitWindow> {
-        *self.open.lock().expect("commit window mutex poisoned")
+        self.state.lock().expect("commit window mutex poisoned").open
+    }
+
+    /// Stop admitting commits, for a rollback this node takes part in.
+    ///
+    /// This is the freeze `FREEZE_ALL` waits on, and it is placed here rather
+    /// than in the processor loops for the reason the ambient window itself
+    /// exists: both roles open their window through this one object, so freezing
+    /// it freezes every commit path at once and there is no call site that has
+    /// to remember to check.
+    ///
+    /// It deliberately does not touch a window that is already open.  A commit
+    /// halfway through its writes must be allowed to finish, because the rows it
+    /// has already written are recorded in the manifest under a checkpoint the
+    /// rollback plan knows about; killing it mid-way would leave rows the
+    /// manifest describes as a complete commit.  Draining is what
+    /// [`is_quiesced`](Self::is_quiesced) reports and what the freeze receipt
+    /// must wait for.
+    ///
+    /// Idempotent: a participant that observes the freeze phase repeatedly, or
+    /// restarts during it, calls this every time it looks.
+    pub fn freeze_for_rollback(&self) {
+        self.state.lock().expect("commit window mutex poisoned").frozen = true;
+    }
+
+    /// Admit commits again, once the rollback has finished or been abandoned.
+    pub fn thaw_after_rollback(&self) {
+        self.state.lock().expect("commit window mutex poisoned").frozen = false;
+    }
+
+    pub fn is_frozen(&self) -> bool {
+        self.state.lock().expect("commit window mutex poisoned").frozen
+    }
+
+    /// Frozen *and* drained: no commit is running and no further one can start.
+    ///
+    /// Only in this state is the head byte-for-byte stable, so this -- not
+    /// `is_frozen` -- is the precondition for filing a freeze receipt.  A receipt
+    /// filed while a commit was still draining would tell the Coordinator the
+    /// head had stopped moving while it was still being written to.
+    pub fn is_quiesced(&self) -> bool {
+        let state = self.state.lock().expect("commit window mutex poisoned");
+        state.frozen && state.open.is_none()
     }
 
     fn close(&self) {
-        *self.open.lock().expect("commit window mutex poisoned") = None;
+        self.state.lock().expect("commit window mutex poisoned").open = None;
     }
 }
 
@@ -317,5 +385,79 @@ mod tests {
             clock.require_checkpoint(101).expect("open"),
             ts(1_700_000_000_000_050)
         );
+    }
+
+    #[test]
+    fn a_frozen_clock_admits_no_new_commit() {
+        let clock = Arc::new(CommitWindowClock::new());
+        clock.freeze_for_rollback();
+        let refused = clock.open(CommitWindow::new(100, ts(1_700_000_000_000_000)));
+        assert!(
+            matches!(
+                refused,
+                Err(CommitWindowError::FrozenForRollback { requested: 100 })
+            ),
+            "a frozen node must not start a commit"
+        );
+    }
+
+    #[test]
+    fn freezing_lets_the_commit_already_running_finish() {
+        // Its rows are already recorded in the manifest under this checkpoint.
+        // Cutting it off would leave the manifest describing a commit that the
+        // database only half contains.
+        let clock = Arc::new(CommitWindowClock::new());
+        let guard = clock
+            .open(CommitWindow::new(100, ts(1_700_000_000_000_000)))
+            .expect("no window is open");
+        clock.freeze_for_rollback();
+        assert_eq!(
+            clock.require_checkpoint(100).expect("still committing"),
+            ts(1_700_000_000_000_000)
+        );
+        assert!(!clock.is_quiesced(), "a draining commit is not quiesced");
+        drop(guard);
+        assert!(clock.is_quiesced());
+    }
+
+    #[test]
+    fn a_freeze_that_has_not_drained_is_not_a_stable_head() {
+        // The distinction the freeze receipt turns on: frozen says no commit can
+        // start, quiesced says none is running either.
+        let clock = Arc::new(CommitWindowClock::new());
+        let _guard = clock
+            .open(CommitWindow::new(7, ts(9_000_000_000_000_000)))
+            .expect("no window is open");
+        clock.freeze_for_rollback();
+        assert!(clock.is_frozen());
+        assert!(!clock.is_quiesced());
+    }
+
+    #[test]
+    fn an_unfrozen_idle_clock_is_not_quiesced_either() {
+        // Otherwise a node that was never asked to freeze would report a stable
+        // head simply because it happened to be between commits.
+        let clock = Arc::new(CommitWindowClock::new());
+        assert!(!clock.is_quiesced());
+    }
+
+    #[test]
+    fn thawing_lets_the_chain_continue() {
+        let clock = Arc::new(CommitWindowClock::new());
+        clock.freeze_for_rollback();
+        clock.thaw_after_rollback();
+        let guard = clock.open(CommitWindow::new(88, ts(1_700_000_000_000_000)));
+        assert!(guard.is_ok(), "a finished rollback must not park the node");
+    }
+
+    #[test]
+    fn freezing_twice_is_the_same_as_freezing_once() {
+        // A participant polls the phase in a loop and restarts during it.
+        let clock = Arc::new(CommitWindowClock::new());
+        clock.freeze_for_rollback();
+        clock.freeze_for_rollback();
+        assert!(clock.is_quiesced());
+        clock.thaw_after_rollback();
+        assert!(!clock.is_frozen());
     }
 }
