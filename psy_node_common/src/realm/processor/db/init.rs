@@ -717,6 +717,8 @@ where
         // Run first, they see a Realm that has already given back everything
         // above the target, and their comparison is against a state that
         // matches.
+        // A held lease blocks every commit, so it goes first.
+        self.release_stale_commit_lease().await?;
         self.truncate_if_ahead_of_published_head().await?;
         self.reconcile_missed_rollback_epochs().await?;
 

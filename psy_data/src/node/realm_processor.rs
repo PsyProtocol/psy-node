@@ -37,6 +37,18 @@ pub struct RealmProcessorCoreState<Hash> {
 
     pub coordinator_head_synced_checkpoint_id: u64,
     pub coordinator_head_synced_checkpoint_root: Hash,
+    /// The chain epoch this Realm believes the Coordinator is in.
+    ///
+    /// Its manifest is partitioned by this, so it is what keeps two branches
+    /// apart at the same height.  It was hardcoded to zero, which meant a
+    /// checkpoint the chain rolled back and then produced again collided with
+    /// the record of the branch that was discarded -- the Realm could not
+    /// re-commit a height it had already committed once.
+    ///
+    /// Not persisted here: the durable copy is `realm_sync_epoch`, read at
+    /// startup, and this is the in-memory value the commit path stamps records
+    /// with.
+    pub coordinator_chain_epoch: u64,
     pub should_revert_processing_changes: bool,
 }
 
@@ -104,6 +116,9 @@ impl<Hash: Copy> RealmProcessorCoreState<Hash> {
             gathering_realm_start_root: last_committed_realm_root,
             coordinator_head_synced_checkpoint_id: last_committed_checkpoint_id,
             coordinator_head_synced_checkpoint_root: last_committed_checkpoint_root,
+            // Zero until the Realm reads the Coordinator's published head, which
+            // it does before it can commit anything.
+            coordinator_chain_epoch: 0,
             should_revert_processing_changes: false,
         }
     }

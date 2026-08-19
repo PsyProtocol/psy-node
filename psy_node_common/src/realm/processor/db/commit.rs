@@ -263,10 +263,14 @@ where
             },
         );
         // The Coordinator's coordinate, carried through untouched.
+        // The epoch the Coordinator is in, not zero.  The manifest is
+        // partitioned by it, so a hardcoded zero put the record of a discarded
+        // branch and the record of its replacement in the same partition at the
+        // same height -- and the second one could not be written.
         let chain_at = |height: u64, hash: N::QHash| {
             CanonicalChainRef::new(
                 self.network_id,
-                ChainEpoch::new(0),
+                ChainEpoch::new(self.state.coordinator_chain_epoch),
                 CheckpointRef::new(
                     CheckpointId::new(height),
                     CheckpointHash::from_last_chain_hash(hash),
@@ -325,6 +329,26 @@ where
                 new_root: AuthorityStateRoot::from_local_state_root(new_root),
             }
         };
+
+        // Logged because the choice is invisible otherwise, and it was wrong for
+        // the life of the project without anything showing: the comparison read
+        // a root the sync had already advanced, so every commit recorded
+        // Unchanged.  A line naming the transition and both roots makes the next
+        // such mistake visible in the log rather than only in a manifest nobody
+        // decodes.
+        if old_root != new_root {
+            // Only the state changes are logged.  Unchanged is every other
+            // checkpoint and would drown the log; Changed is the case that was
+            // silently impossible to record for the life of the project, and is
+            // worth a line on its own account -- a Realm changing state is not a
+            // routine event.
+            tracing::warn!(
+                "[REALM_COMMIT] checkpoint {} records Changed: {:?} -> {:?}",
+                checkpoint_id,
+                old_root,
+                new_root
+            );
+        }
 
         // The realm root goes in through the state transition above, which already
         // binds it; the payload carries only what the transition does not -- the

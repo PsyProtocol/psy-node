@@ -198,14 +198,28 @@ where
                         if !took_part {
                             match processor.db.take_part_in_rollback(target).await {
                                 Ok(true) => {
-                                    took_part = true;
-                                    // Its own share is done, so the recovery
-                                    // path must not run as well: replanning
-                                    // from a manifest whose rows are already
-                                    // gone would archive them as absent and
-                                    // overwrite the record of what was
-                                    // discarded.
-                                    rollback_target = None;
+                                    // Its share is done, so restart -- for the
+                                    // same reason the recovery path does, plus
+                                    // one this path has on its own: the chain
+                                    // epoch moved, records are partitioned by
+                                    // it, and a Realm carrying the old one
+                                    // writes the replacement of a discarded
+                                    // checkpoint into the discarded branch's
+                                    // partition, where it collides with what is
+                                    // already there.  Startup adopts the
+                                    // Coordinator's epoch before anything can
+                                    // stamp a record with it.
+                                    tracing::warn!(
+                                        "[REALM] took part in the rollback to {target}; \
+                                         restarting so its state and the chain epoch it stamps \
+                                         records with are both taken fresh (exit {})",
+                                        psy_node_core::store::rollback_reload::EXIT_CODE_ROLLBACK_RELOAD
+                                    );
+                                    processor.db.status.begin_shutdown();
+                                    sleep(std::time::Duration::from_millis(500)).await;
+                                    std::process::exit(
+                                        psy_node_core::store::rollback_reload::EXIT_CODE_ROLLBACK_RELOAD,
+                                    );
                                 }
                                 Ok(false) => {}
                                 Err(e) => {

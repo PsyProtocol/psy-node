@@ -239,9 +239,18 @@ impl<
         Ok(())
     }
 
+    /// Wait for this block's proofs, or until a rollback makes the block moot.
+    ///
+    /// The wait is configured with no timeout, so without the second half a
+    /// rollback landing mid-block left the Coordinator waiting forever for
+    /// proofs of a checkpoint that no longer exists -- and it never reached the
+    /// phase check at the top of the loop, which is what would have restarted
+    /// it.  Recovery worked only when the rollback happened to land between
+    /// blocks, which is luck rather than design.
     pub async fn wait_for_jobs_completion(&self) -> anyhow::Result<()> {
         let queue_key = self.db.get_proof_worker_queue_key();
-        self.db
+        let jobs = self
+            .db
             .proof_work_queue
             .wait_until_all_jobs_complete_or_timeout_worker(
                 &queue_key,
@@ -250,9 +259,48 @@ impl<
                 self.db.ids.proc_checkpoint_unique_id,
                 0,
                 self.proof_worker_queue_max_time_ms,
-            )
-            .await?;
-        Ok(())
+            );
+        tokio::select! {
+            result = jobs => {
+                result?;
+                Ok(())
+            }
+            reason = self.rollback_interrupted_this_block() => Err(reason),
+        }
+    }
+
+    /// Resolves when a rollback has been published, and never otherwise.
+    ///
+    /// Polled rather than pushed because the phase lives on a durable row that
+    /// another process writes; there is nothing to subscribe to.  The interval
+    /// is long relative to a block and short relative to a rollback, so it costs
+    /// a read every few seconds and saves an unbounded wait.
+    ///
+    /// The error it produces is the one the loop already recognises as a
+    /// rollback refusing a commit, so the block is abandoned rather than treated
+    /// as a fault -- which is exactly what it is: a normal advance, forbidden
+    /// now that a rollback is active.
+    async fn rollback_interrupted_this_block(&self) -> anyhow::Error {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            match self
+                .db
+                .recording
+                .follow_published_phase(self.db.network_id)
+                .await
+            {
+                Ok(phase) if phase.permits_commit() => {}
+                Ok(_) => {
+                    return anyhow::Error::new(
+                        psy_node_core::store::canonical_head::CanonicalHeadModelError
+                            ::NormalAdvanceWhileRollbackActive,
+                    );
+                }
+                // Unreadable is not evidence of a rollback; keep waiting for the
+                // jobs, which is what this process was doing anyway.
+                Err(_) => {}
+            }
+        }
     }
     pub async fn publish_and_wait_for_job_ready(
         &self,

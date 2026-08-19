@@ -312,6 +312,60 @@ where
         Ok(())
     }
 
+    /// Release an allocator lease left held by a commit that never finished.
+    ///
+    /// The same shape as the Coordinator's, and for the same reason: the
+    /// allocator keeps a lease through a rollback deliberately, because
+    /// clearing one would rob a commit still in flight of its exclusivity.  A
+    /// process that has just started has no commit in flight, so here that
+    /// caution only leaves the Realm unable to reserve -- `authority already has
+    /// active intent` -- with nothing to ever clear it.
+    pub async fn release_stale_commit_lease(&mut self) -> anyhow::Result<()> {
+        use psy_node_core::store::authority_commit::{
+            AuthorityIntentObservation, AuthorityTimestampKey, AuthorityTimestampPhase,
+            AuthorityTimestampReadState, AuthorityTimestampWriteOutcome,
+        };
+        use psy_data::protocol::chain_context::AuthorityScope;
+
+        let key = AuthorityTimestampKey::new(
+            self.network_id,
+            AuthorityScope::Realm {
+                realm_id: self.state.realm_identifier.realm_id,
+                realm_sub_id: self.state.realm_identifier.realm_sub_id,
+            },
+        );
+        let AuthorityTimestampReadState::Current(state) =
+            self.recording.timestamp().read_timestamp_state(key).await?
+        else {
+            return Ok(());
+        };
+        let AuthorityTimestampPhase::Active { intent } = state.phase() else {
+            return Ok(());
+        };
+        let AuthorityIntentObservation::Active(lease) = state.observe_intent(key, intent) else {
+            return Ok(());
+        };
+        tracing::warn!(
+            "[REALM_INIT] the commit timestamp lease was still held at startup by a commit that \
+             never finished; releasing it so the next commit can reserve"
+        );
+        let completion = state.seal_completion(key, lease)?;
+        match self
+            .recording
+            .timestamp()
+            .complete_timestamp(&completion)
+            .await?
+        {
+            AuthorityTimestampWriteOutcome::Applied(_)
+            | AuthorityTimestampWriteOutcome::Idempotent(_) => Ok(()),
+            AuthorityTimestampWriteOutcome::Conflict(current) => anyhow::bail!(
+                "another writer holds this Realm's commit timestamp allocator (observed \
+                 revision {}); two processors are running for one Realm",
+                current.revision().get()
+            ),
+        }
+    }
+
     /// Truncate this Realm's cached view of the chain when the Coordinator has
     /// published a head below it.
     ///
@@ -334,6 +388,11 @@ where
         let Some(published) = self.recording.observe_published_head(&seen).await? else {
             return Ok(());
         };
+        // Adopt the Coordinator's epoch before anything stamps a record with it.
+        // This runs at startup and after every rollback this Realm follows, and
+        // the epoch only moves at a rollback, so those are the only moments it
+        // can be stale.
+        self.state.coordinator_chain_epoch = published.chain_epoch().get();
         let published_height = published.checkpoint().checkpoint_id().get();
         let cached = self
             .checkpoint_tree_backup_manager
@@ -500,7 +559,7 @@ where
             .max(self.checkpoint_tree_backup_manager.get_current_checkpoint_id_head());
         CanonicalChainRef::new(
             self.network_id,
-            ChainEpoch::new(0),
+            ChainEpoch::new(self.state.coordinator_chain_epoch),
             CheckpointRef::new(
                 CheckpointId::new(seen),
                 CheckpointHash::from_last_chain_hash(
