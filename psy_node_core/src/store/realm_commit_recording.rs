@@ -56,6 +56,11 @@ pub struct RealmCommitRecording<Hash: Q256BitHash> {
     /// one this Realm's data came from, and a rollback it slept through is the
     /// difference between them.
     sync_epoch: Option<Arc<dyn super::realm_sync_epoch::RealmSyncEpochStore>>,
+    /// How this Realm undoes what it wrote itself above a rollback target.
+    ///
+    /// Separate from the sync reset because the two undo different things: the
+    /// reset gives back what the Realm copied, this gives back what it wrote.
+    self_rollback: Option<Arc<dyn super::realm_self_rollback::RealmSelfRollback<Hash>>>,
     journal: Option<Arc<dyn CommitVerificationJournal>>,
 }
 
@@ -69,6 +74,7 @@ impl<Hash: Q256BitHash> Clone for RealmCommitRecording<Hash> {
             commit_window: self.commit_window.clone(),
             participant_view: self.participant_view.clone(),
             sync_epoch: self.sync_epoch.clone(),
+            self_rollback: self.self_rollback.clone(),
             journal: self.journal.clone(),
         }
     }
@@ -92,6 +98,7 @@ impl<Hash: Q256BitHash> RealmCommitRecording<Hash> {
             journal,
             participant_view: None,
             sync_epoch: None,
+            self_rollback: None,
         }
     }
 
@@ -121,6 +128,21 @@ impl<Hash: Q256BitHash> RealmCommitRecording<Hash> {
 
     pub fn sync_epoch_store(&self) -> Option<&dyn super::realm_sync_epoch::RealmSyncEpochStore> {
         self.sync_epoch.as_deref()
+    }
+
+    #[must_use]
+    pub fn with_self_rollback(
+        mut self,
+        driver: Option<Arc<dyn super::realm_self_rollback::RealmSelfRollback<Hash>>>,
+    ) -> Self {
+        self.self_rollback = driver;
+        self
+    }
+
+    pub fn self_rollback(
+        &self,
+    ) -> Option<&dyn super::realm_self_rollback::RealmSelfRollback<Hash>> {
+        self.self_rollback.as_deref()
     }
 
     /// The head the Coordinator publishes right now.

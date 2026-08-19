@@ -181,7 +181,11 @@ pub async fn build_rollback_plan_for<Hash: Q256BitHash>(
     marker: ManifestCompletionMarker,
     head: &CanonicalChainRef<Hash>,
     target: u64,
-    decode_locators: &dyn Fn(&[Vec<u8>]) -> anyhow::Result<Vec<(u16, Vec<u8>)>>,
+    // `Send + Sync` so a planner can be called from a trait object whose future
+    // must be Send.  Nothing here is shared across threads; the bound exists so
+    // the caller is not forced to choose between planning and being callable
+    // through a trait.
+    decode_locators: &(dyn Fn(&[Vec<u8>]) -> anyhow::Result<Vec<(u16, Vec<u8>)>> + Send + Sync),
 ) -> anyhow::Result<RollbackPlan<Hash>> {
     let head_height = head.checkpoint().checkpoint_id().get();
     if target >= head_height {
@@ -274,7 +278,11 @@ pub async fn build_rollback_plan<Hash: Q256BitHash>(
     recording: &CoordinatorCommitRecording<Hash>,
     head: &CanonicalChainRef<Hash>,
     target: u64,
-    decode_locators: &dyn Fn(&[Vec<u8>]) -> anyhow::Result<Vec<(u16, Vec<u8>)>>,
+    // `Send + Sync` so a planner can be called from a trait object whose future
+    // must be Send.  Nothing here is shared across threads; the bound exists so
+    // the caller is not forced to choose between planning and being callable
+    // through a trait.
+    decode_locators: &(dyn Fn(&[Vec<u8>]) -> anyhow::Result<Vec<(u16, Vec<u8>)>> + Send + Sync),
 ) -> anyhow::Result<RollbackPlan<Hash>> {
     build_rollback_plan_for(
         recording.manifest(),

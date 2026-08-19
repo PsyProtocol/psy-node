@@ -58,6 +58,9 @@ pub struct RealmRollbackControlPlane<Hash: Q256BitHash + QHashBase> {
     /// Lives in this Realm's own keyspace, not the Coordinator's: it records
     /// what *this* Realm believes, and only this Realm may write it.
     sync_epoch: Arc<super::ScyllaRealmSyncEpochStore>,
+    /// The Realm's own rollback executor, so the processor loop can undo what
+    /// this Realm wrote without psy_node_common having to know about Scylla.
+    self_rollback: Arc<super::ScyllaRealmRollbackExecutor>,
 }
 
 impl<Hash: Q256BitHash + QHashBase> RealmRollbackControlPlane<Hash> {
@@ -127,6 +130,14 @@ impl<Hash: Q256BitHash + QHashBase> RealmRollbackControlPlane<Hash> {
                 )
                 .await?,
             ),
+            self_rollback: Arc::new(
+                super::ScyllaRealmRollbackExecutor::prepare(
+                    store.session.clone(),
+                    &store.keyspace,
+                    &no_tablet,
+                )
+                .await?,
+            ),
         };
 
         // Watching the rollback needs the Coordinator's keyspace, because that
@@ -193,5 +204,7 @@ impl<Hash: Q256BitHash + QHashBase> RealmRollbackControlPlane<Hash> {
         }))
         .with_sync_epoch_store(Some(self.sync_epoch.clone()
             as Arc<dyn psy_node_core::store::realm_sync_epoch::RealmSyncEpochStore>))
+        .with_self_rollback(Some(self.self_rollback.clone()
+            as Arc<dyn psy_node_core::store::realm_self_rollback::RealmSelfRollback<Hash>>))
     }
 }

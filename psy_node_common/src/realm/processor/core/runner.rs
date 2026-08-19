@@ -101,7 +101,7 @@ where
                             );
                         } else if let Err(e) = processor
                             .db
-                            .reset_for_rollback_to(target)
+                            .undo_everything_above(target)
                             .await
                             // Recording the epoch is part of finishing the
                             // reset, not a separate step: a Realm that

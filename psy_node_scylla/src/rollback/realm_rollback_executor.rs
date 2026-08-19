@@ -24,7 +24,7 @@
 use std::sync::Arc;
 
 use parth_core::protocol::core_types::Q256BitHash;
-use psy_data::protocol::canonical_chain::CanonicalChainRef;
+use psy_data::protocol::canonical_chain::{CanonicalChainRef, CheckpointId, CheckpointRef};
 use psy_data::protocol::chain_context::AuthorityScope;
 use psy_node_core::store::commit_window::CommitFreeze;
 use psy_node_core::store::authority_commit::{AuthorityTimestampKey, AuthorityTimestampReadState};
@@ -346,6 +346,90 @@ impl ScyllaRealmRollbackExecutor {
             archived_rows,
             deleted_rows,
             fence_us: fence.as_i64(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl<Hash: Q256BitHash> psy_node_core::store::realm_self_rollback::RealmSelfRollback<Hash>
+    for ScyllaRealmRollbackExecutor
+{
+    async fn recover_own_state_to(
+        &self,
+        recording: &RealmCommitRecording<Hash>,
+        realm_id: u32,
+        realm_sub_id: u16,
+        search_head: &CanonicalChainRef<Hash>,
+        target: u64,
+    ) -> anyhow::Result<psy_node_core::store::realm_self_rollback::RealmSelfRollbackReport> {
+        use psy_node_core::store::authority_commit::AuthorityTimestampKey;
+        use psy_node_core::store::manifest_record::AuthorityManifestIdentity;
+        use psy_node_core::store::realm_self_rollback::RealmSelfRollbackReport;
+
+        let scope = AuthorityScope::Realm {
+            realm_id,
+            realm_sub_id,
+        };
+        // The Realm's own head, from its own manifest.  Reading the whole
+        // suffix above the target costs one query and answers the question that
+        // decides everything else: a Realm with no rows of its own up there --
+        // the ordinary case -- stops here.
+        let identity = AuthorityManifestIdentity::try_new(
+            AuthorityTimestampKey::new(search_head.network_id(), scope),
+            *search_head,
+        )?;
+        let own = recording
+            .manifest()
+            .read_manifest_suffix(
+                &identity,
+                target,
+                search_head.checkpoint().checkpoint_id().get(),
+            )
+            .await?;
+        let Some(own_head) = own.iter().map(|row| row.checkpoint_id).max() else {
+            return Ok(RealmSelfRollbackReport {
+                own_head: target,
+                target,
+                ..Default::default()
+            });
+        };
+
+        // Plan against the Realm's own head, which is above the Coordinator's
+        // right after a rollback.  The chain reference only carries the height
+        // the planner bounds by; its hash is the Coordinator's coordinate and is
+        // not consulted for a Realm's own manifest.
+        let head_ref = CanonicalChainRef::new(
+            search_head.network_id(),
+            search_head.chain_epoch(),
+            CheckpointRef::new(
+                CheckpointId::new(own_head),
+                *search_head.checkpoint().checkpoint_hash(),
+            ),
+        );
+        let plan = self
+            .plan(recording, realm_id, realm_sub_id, &head_ref, target)
+            .await?;
+        let planned_rows = plan.row_count();
+        let window = self
+            .fence_window(recording, &head_ref, realm_id, realm_sub_id)
+            .await?;
+        let fence = window.delete_fence();
+
+        // The plan id names the recovery rather than the rollback, because this
+        // Realm was not present for the rollback and cannot know what the id
+        // was.  Encoding the range keeps a second attempt at the same recovery
+        // from colliding with a different one in the archive.
+        let plan_id = format!("realm-recovery-{realm_id}-{realm_sub_id}-{own_head}-{target}")
+            .into_bytes();
+        let archived_rows = self.archive(&plan_id, &plan).await?;
+        let deleted_rows = self.delete(&plan, fence).await?;
+
+        Ok(RealmSelfRollbackReport {
+            own_head,
+            target,
+            planned_rows,
+            archived_rows,
+            deleted_rows,
         })
     }
 }

@@ -172,7 +172,8 @@ async fn a_realm_rollback_restores_exactly_what_was_observed_before() -> anyhow:
         ScyllaCoreStore::<PHash, PoseidonHasher>::new(0, 0, keyspace.clone(), &known_nodes())
             .await?,
     );
-    let control = RealmRollbackControlPlane::setup(core.as_ref()).await?;
+    let control =
+        RealmRollbackControlPlane::setup(core.as_ref(), network().chain_id() as i64).await?;
     let recording: RealmCommitRecording<PHash> = control.recording();
     let reader = ScyllaRowImageReader::prepare(session.clone(), &keyspace).await?;
     let executor =
@@ -305,6 +306,15 @@ impl ScriptedCoordinator {
 
 #[async_trait::async_trait]
 impl RollbackParticipantView<PHash> for ScriptedCoordinator {
+    async fn read_rollback_targets_after(
+        &self,
+        _epoch: u64,
+    ) -> anyhow::Result<Vec<(u64, u64)>> {
+        // The stand-in drives one rollback and keeps no history; the recovery
+        // path that reads this runs against a real Coordinator.
+        Ok(Vec::new())
+    }
+
     async fn observe_published_head(
         &self,
         coordinator_head: &CanonicalChainRef<PHash>,

@@ -171,6 +171,45 @@ where
     /// unconditional `set_*`, so a re-synced height replaces what was there.
     /// Heights the new branch never reaches keep stale copies, which is a leak
     /// rather than a ghost: nothing reads a checkpoint above the current head.
+    /// Undo everything above `target`: what this Realm wrote itself, then what
+    /// it copied from the Coordinator.
+    ///
+    /// Own state first.  The sync reset makes the Realm re-fetch the
+    /// Coordinator's view of the range, and doing that while the Realm still
+    /// holds its own discarded writes would have it compare a rebuilt copy
+    /// against state that should no longer exist.
+    ///
+    /// A Realm with no transactions in the range does nothing here beyond one
+    /// manifest read, which is the ordinary case.
+    pub async fn undo_everything_above(&mut self, target: u64) -> anyhow::Result<()> {
+        if let Some(driver) = self.recording.self_rollback() {
+            // The last height this Realm synced bounds how far its own commits
+            // can reach: it never commits at a checkpoint the Coordinator has
+            // not published to it.  Read before the sync reset, which is why
+            // own state is undone first.
+            let search_head = self.coordinator_chain_ref_last_synced();
+            let report = driver
+                .recover_own_state_to(
+                    &self.recording,
+                    self.state.realm_identifier.realm_id,
+                    self.state.realm_identifier.realm_sub_id,
+                    &search_head,
+                    target,
+                )
+                .await?;
+            if report.changed_anything() {
+                tracing::warn!(
+                    "[REALM_ROLLBACK] undid this Realm's own state from checkpoint {} down to \
+                     {}: {} rows archived and deleted",
+                    report.own_head,
+                    report.target,
+                    report.deleted_rows
+                );
+            }
+        }
+        self.reset_for_rollback_to(target).await
+    }
+
     pub async fn reset_for_rollback_to(&mut self, target: u64) -> anyhow::Result<()> {
         let resync_from = target.saturating_sub(1);
         tracing::warn!(
@@ -221,7 +260,7 @@ where
             cached,
             published_height
         );
-        self.reset_for_rollback_to(published_height).await
+        self.undo_everything_above(published_height).await
     }
 
     /// Reconcile this Realm against rollbacks it slept through.
@@ -281,7 +320,7 @@ where
             targets.len()
         );
         match lowest {
-            Some(target) => self.reset_for_rollback_to(target).await?,
+            Some(target) => self.undo_everything_above(target).await?,
             None => {
                 // The epoch moved but no rollback recorded a target for it.
                 // Refusing is the safe direction: the alternative is to carry on
