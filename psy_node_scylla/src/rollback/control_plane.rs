@@ -131,9 +131,28 @@ impl CoordinatorRollbackControlPlane {
         commit_window: Arc<CommitWindowClock>,
         keyspaces: &RollbackControlKeyspaces,
     ) -> anyhow::Result<Self> {
+        // Attached here as well as in `setup`, because a control plane built
+        // this way still drives rollbacks and a rollback now needs the journal
+        // to tell a row the discarded range created from one it rewrote.  It
+        // was absent here while the journal was only evidence, and the first
+        // rollback driven through this path after that changed refused to
+        // restore -- correctly, and confusingly.
+        let journal = if std::env::var("PSY_ROLLBACK_VERIFICATION_JOURNAL").is_ok() {
+            super::ScyllaVerificationJournal::create_table(&session, keyspaces.state.as_str())
+                .await?;
+            Some(Arc::new(
+                super::ScyllaVerificationJournal::prepare(
+                    session.clone(),
+                    keyspaces.state.as_str(),
+                )
+                .await?,
+            ))
+        } else {
+            None
+        };
         Ok(Self {
             commit_window,
-            journal: None,
+            journal,
             authority_timestamp: Arc::new(
                 ScyllaAuthorityTimestampStore::prepare(
                     session.clone(),
@@ -186,9 +205,11 @@ impl CoordinatorRollbackControlPlane {
         let mut control =
             Self::prepare(store.session.clone(), store.commit_window.clone(), &keyspaces).await?;
 
-        // The journal lives in the state keyspace beside the tables it observes,
-        // and is created only when asked for -- see §2.2.2 on why it is a
-        // development and test layer rather than a production one.
+        // The journal lives in the state keyspace beside the tables it observes.
+        // It began as evidence a deployment could decline to keep; it is now a
+        // correctness dependency, because a rollback restores a rewritten row
+        // from the before image recorded here and nothing else records one.  A
+        // deployment that may roll back has to run with it on.
         if std::env::var("PSY_ROLLBACK_VERIFICATION_JOURNAL").is_ok() {
             super::ScyllaVerificationJournal::create_table(&store.session, &store.keyspace).await?;
             control.journal = Some(Arc::new(

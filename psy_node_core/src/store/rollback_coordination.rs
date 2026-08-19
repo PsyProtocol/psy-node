@@ -69,6 +69,28 @@ impl ObservedRollbackPhase {
         matches!(self, Self::Delete { .. })
     }
 
+    /// Whether a participant that joined this rollback may now do the work of
+    /// `required`.
+    ///
+    /// At-or-past rather than exactly-equal.  The Coordinator does not wait for
+    /// Realms -- it guarantees its own consistency and leaves each Realm to
+    /// reach the same target at its own pace -- so by the time a Realm looks,
+    /// the phase it was waiting for has often gone by.  Insisting on the exact
+    /// phase made a Realm able to take part only in a rollback it happened to
+    /// be in step with.
+    ///
+    /// Idle counts as past everything, and that is the case this exists for: a
+    /// rollback is never abandoned once requested, so a participant that
+    /// started sees Idle only after the rollback it joined has finished.
+    /// Everything it still owes is in its own keyspace, and the Coordinator
+    /// having finished can only ever have authorised more.
+    pub const fn permits_work_of(self, required: u8) -> bool {
+        match self.reached_ordinal() {
+            Some(reached) => reached >= required,
+            None => matches!(self, Self::Idle),
+        }
+    }
+
     /// Whether a participant may commit a new checkpoint in this phase.
     ///
     /// Only Idle.  Every phase of a rollback needs the old head to stay
@@ -79,6 +101,32 @@ impl ObservedRollbackPhase {
     /// resume by observing Idle rather than by guessing from the abort.
     pub const fn permits_commit(self) -> bool {
         matches!(self, Self::Idle)
+    }
+
+    /// How far the rollback has got, on the same scale the phase machine uses.
+    ///
+    /// `None` for Idle, which on this side means "not in a rollback" and cannot
+    /// be compared with the others -- a participant that read it as "before
+    /// everything" would conclude it must wait for a rollback that has already
+    /// finished.
+    pub const fn reached_ordinal(self) -> Option<u8> {
+        use super::rollback_control::{
+            PHASE_ORDINAL_ARCHIVE_BARRIER_READY, PHASE_ORDINAL_ARCHIVING, PHASE_ORDINAL_DELETING,
+            PHASE_ORDINAL_FROZEN, PHASE_ORDINAL_REQUESTED, PHASE_ORDINAL_RESTORING,
+            PHASE_ORDINAL_VERIFYING,
+        };
+        match self {
+            Self::Requested { .. } => Some(PHASE_ORDINAL_REQUESTED),
+            Self::Freeze { .. } => Some(PHASE_ORDINAL_FROZEN),
+            // ArchiveBarrierReady is reported as Archive, so this is the floor
+            // of the two: a participant may archive, and must not assume the
+            // barrier is sealed.
+            Self::Archive { .. } => Some(PHASE_ORDINAL_ARCHIVING),
+            Self::Delete { .. } => Some(PHASE_ORDINAL_DELETING),
+            Self::Restore { .. } => Some(PHASE_ORDINAL_RESTORING),
+            Self::Verify { .. } => Some(PHASE_ORDINAL_VERIFYING),
+            Self::Idle | Self::Aborting => None,
+        }
     }
 
     /// The height this rollback is heading for, when the phase names one.
@@ -573,5 +621,53 @@ mod tests {
         // It carries a request like any other phase, but acting on it would
         // undo state the chain never discarded.
         assert_eq!(ObservedRollbackPhase::Aborting.target(), None);
+    }
+
+    #[test]
+    fn a_participant_may_act_on_a_phase_the_rollback_has_already_passed() {
+        use super::super::rollback_control::{PHASE_ORDINAL_ARCHIVING, PHASE_ORDINAL_DELETING};
+
+        // The Coordinator does not wait for Realms, so by the time one looks the
+        // phase it needed has usually gone by.  Requiring the exact phase made a
+        // Realm able to take part only in a rollback it happened to be in step
+        // with.
+        assert!(
+            ObservedRollbackPhase::Delete { target: 90, head: 100 }
+                .permits_work_of(PHASE_ORDINAL_ARCHIVING)
+        );
+        assert!(
+            ObservedRollbackPhase::Verify { target: 90 }.permits_work_of(PHASE_ORDINAL_DELETING)
+        );
+    }
+
+    #[test]
+    fn a_participant_may_not_delete_before_the_rollback_reaches_deleting() {
+        use super::super::rollback_control::PHASE_ORDINAL_DELETING;
+
+        // The half of the rule that still bites: deleting before the archive
+        // barrier is the one mistake nothing downstream can repair.
+        for phase in [
+            ObservedRollbackPhase::Requested { target: 90 },
+            ObservedRollbackPhase::Freeze { head: 100, target: 90 },
+            ObservedRollbackPhase::Archive { target: 90, head: 100 },
+        ] {
+            assert!(
+                !phase.permits_work_of(PHASE_ORDINAL_DELETING),
+                "{phase:?} must not authorise a delete"
+            );
+        }
+    }
+
+    #[test]
+    fn idle_counts_as_past_everything_for_a_participant_that_joined() {
+        use super::super::rollback_control::PHASE_ORDINAL_DELETING;
+
+        // A rollback is never abandoned once requested, so a Realm that started
+        // sees Idle only after the one it joined finished.  What it still owes
+        // is in its own keyspace, and the Coordinator finishing can only have
+        // authorised more of it.  Reading Idle as "before everything" would
+        // leave the Realm waiting for a rollback that already happened.
+        assert!(ObservedRollbackPhase::Idle.permits_work_of(PHASE_ORDINAL_DELETING));
+        assert_eq!(ObservedRollbackPhase::Idle.reached_ordinal(), None);
     }
 }

@@ -27,6 +27,7 @@ use parth_core::protocol::core_types::Q256BitHash;
 use psy_data::protocol::canonical_chain::{CanonicalChainRef, CheckpointId, CheckpointRef};
 use psy_data::protocol::chain_context::AuthorityScope;
 use psy_node_core::store::commit_window::CommitFreeze;
+use psy_node_core::store::rollback_control::{PHASE_ORDINAL_ARCHIVING, PHASE_ORDINAL_DELETING};
 use psy_node_core::store::authority_commit::{AuthorityTimestampKey, AuthorityTimestampReadState};
 use psy_node_core::store::realm_commit_recording::RealmCommitRecording;
 use psy_node_core::store::rollback_plan::{
@@ -354,10 +355,7 @@ impl ScyllaRealmRollbackExecutor {
         // Waiting for the Coordinator to publish ARCHIVING rather than starting
         // on the strength of having filed a freeze receipt: the freeze barrier
         // is met when *everyone* has filed, and only the Coordinator knows that.
-        wait_for_phase(view, head, "ARCHIVING", |phase| {
-            matches!(phase, ObservedRollbackPhase::Archive { .. })
-        })
-        .await?;
+        wait_for_phase(view, head, "ARCHIVING", PHASE_ORDINAL_ARCHIVING).await?;
         let archived_rows = self.archive(plan_id, &plan).await?;
         if archived_rows != planned_rows {
             anyhow::bail!(
@@ -383,7 +381,7 @@ impl ScyllaRealmRollbackExecutor {
         // read it off a phase name.  Only DELETING says yes, and DELETING is
         // published only after the Coordinator sealed the archive barrier with
         // the receipt filed just above.
-        wait_for_phase(view, head, "DELETING", ObservedRollbackPhase::permits_destruction).await?;
+        wait_for_phase(view, head, "DELETING", PHASE_ORDINAL_DELETING).await?;
         let deleted_rows = match fence {
             Some(fence) => self.delete(&plan, fence).await?,
             None => 0,
@@ -613,44 +611,38 @@ impl<Hash: Q256BitHash>
     }
 }
 
-/// Wait until the Coordinator publishes a phase this Realm may act on.
+/// Wait until the rollback has reached a phase this Realm may act on.
 ///
-/// A participant reaches each step before the Coordinator has published it --
-/// it files its receipt and the Coordinator only advances once *everyone* has
-/// filed, so by construction there is a gap.  Treating that gap as an error
-/// meant a Realm could only ever take part in a rollback it happened to be
-/// perfectly in step with, which is to say never.
+/// At-or-past, not exactly-equal.  The Coordinator guarantees its own
+/// consistency and does not wait for Realms; it publishes a path and each Realm
+/// walks it at its own pace.  So by the time a Realm looks, the phase it needed
+/// has usually gone by, and insisting on the exact one made a Realm able to take
+/// part only in a rollback it happened to be in step with.
 ///
-/// Idle is a different matter and is not waited out.  A rollback is never
-/// abandoned once requested, so seeing Idle means this one finished while the
-/// Realm was between observations -- there is nothing left to take part in, and
-/// sitting until the deadline would be waiting for something that already
-/// happened.
+/// Idle counts as past everything.  A rollback is never abandoned once
+/// requested, so a Realm that already joined sees Idle only after the rollback
+/// it joined has finished -- and everything it still owes is in its own
+/// keyspace, which the Coordinator finishing can only have authorised more of.
+///
+/// The deadline remains for the one case that is neither: a rollback that has
+/// not reached this step and is not moving.  A Realm blocked there is not
+/// keeping up with anything and should say so rather than sit.
 async fn wait_for_phase<Hash: Q256BitHash>(
     view: &dyn RollbackParticipantView<Hash>,
     head: &CanonicalChainRef<Hash>,
     expected: &str,
-    accepts: impl Fn(ObservedRollbackPhase) -> bool,
+    required: u8,
 ) -> anyhow::Result<()> {
     let started = std::time::Instant::now();
     let limit = super::barrier_wait_limit();
     loop {
         let phase = view.observe_phase(head).await?;
-        if accepts(phase) {
+        if phase.permits_work_of(required) {
             return Ok(());
-        }
-        if matches!(
-            phase,
-            ObservedRollbackPhase::Idle | ObservedRollbackPhase::Aborting
-        ) {
-            anyhow::bail!(
-                "this Realm is waiting for {expected} but the Coordinator has published \
-                 {phase:?}; the rollback it was taking part in is over"
-            );
         }
         if started.elapsed() >= limit {
             anyhow::bail!(
-                "this Realm waited {}s for {expected} and the Coordinator has published \
+                "this Realm waited {}s to reach {expected} and the rollback has published \
                  {phase:?}",
                 limit.as_secs()
             );
