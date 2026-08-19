@@ -123,6 +123,27 @@ where
                             sleep(std::time::Duration::from_secs(1)).await;
                             continue;
                         }
+                        // The database work is done by the process that knows
+                        // the target; the in-memory state is rebuilt by the
+                        // path that rebuilds it on every start.  Repairing the
+                        // caches in place looked like it worked -- the Realm
+                        // returned to step after several rollbacks -- and then
+                        // produced a witness the worker could not prove, mixing
+                        // the discarded branch's leaves with the current
+                        // database, with no error logged anywhere.  A restart
+                        // cleared it every time.  Same conclusion as the
+                        // Coordinator's, reached the same way.
+                        tracing::warn!(
+                            "[REALM] undid this Realm's share of the rollback to {target}; \
+                             restarting so its in-memory state is rebuilt by the path that \
+                             already does it on every start (exit {})",
+                            psy_node_core::store::rollback_reload::EXIT_CODE_ROLLBACK_RELOAD
+                        );
+                        processor.db.status.begin_shutdown();
+                        sleep(std::time::Duration::from_millis(500)).await;
+                        std::process::exit(
+                            psy_node_core::store::rollback_reload::EXIT_CODE_ROLLBACK_RELOAD,
+                        );
                     }
                     rollback_aborted = false;
                     took_part = false;
