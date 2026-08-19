@@ -29,4 +29,22 @@ pub trait CommitVerificationJournal: Send + Sync {
         checkpoint_id: u64,
         planned: &[(u16, Vec<u8>)],
     ) -> anyhow::Result<()>;
+
+    /// What was observed at one checkpoint, as `(physical_table, locator,
+    /// before_image)` for the keys that existed before that commit wrote them.
+    ///
+    /// Reading is part of the contract now, not a convenience.  A rollback
+    /// restores a rewritten row from the image recorded here, so the journal has
+    /// stopped being evidence a deployment may decline to keep: without it there
+    /// is no way to tell a row the discarded range *created* -- which must stay
+    /// deleted -- from one it *rewrote*, whose previous value exists nowhere
+    /// else.
+    ///
+    /// Only rows with a before image are returned.  Their absence is the answer
+    /// for the created case, and returning them would make every caller repeat
+    /// the same filter.
+    async fn rewritten_before_images(
+        &self,
+        checkpoint_id: u64,
+    ) -> anyhow::Result<Vec<(u16, Vec<u8>, Vec<u8>)>>;
 }

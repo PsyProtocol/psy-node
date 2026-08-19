@@ -224,7 +224,10 @@ async fn a_realm_rollback_restores_exactly_what_was_observed_before() -> anyhow:
         view.filed(),
         vec![
             "freeze".to_string(),
-            "archive".to_string()
+            "archive".to_string(),
+            // The last one, and the one PUBLISH_ALL waits for: without it the
+            // Coordinator never announces the new epoch.
+            "verify".to_string()
         ],
         "a Realm files a receipt at each barrier it reaches"
     );

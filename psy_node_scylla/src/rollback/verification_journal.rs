@@ -77,6 +77,22 @@ pub struct JournalEntry {
 impl psy_node_core::store::verification_journal::CommitVerificationJournal
     for ScyllaVerificationJournal
 {
+    async fn rewritten_before_images(
+        &self,
+        checkpoint_id: u64,
+    ) -> anyhow::Result<Vec<(u16, Vec<u8>, Vec<u8>)>> {
+        Ok(self
+            .entries_for(checkpoint_id)
+            .await?
+            .into_iter()
+            .filter_map(|entry| {
+                entry
+                    .before
+                    .map(|before| (entry.physical_table as u16, entry.locator, before))
+            })
+            .collect())
+    }
+
     async fn record_before(
         &self,
         checkpoint_id: u64,

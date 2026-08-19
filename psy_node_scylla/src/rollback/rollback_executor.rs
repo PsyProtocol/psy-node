@@ -94,6 +94,11 @@ pub struct ScyllaRollbackExecutor {
     state_keyspace: String,
     archive: ScyllaRollbackArchive,
     delete: ScyllaDeleteExecutor,
+    /// Puts back rows the plan deleted that existed before the range began.
+    restore: super::ScyllaRestoreExecutor,
+    /// Resolves a locator to the key *position* it names, so one key written at
+    /// many heights is recognised as one key.
+    reader: super::ScyllaRowImageReader,
     /// The chain's rollback history.  Written twice per rollback and never
     /// otherwise, which is what keeps the audit trail off the commit path.
     events: super::ScyllaRollbackEventStore,
@@ -123,7 +128,9 @@ impl ScyllaRollbackExecutor {
                 no_tablet_keyspace,
             )
             .await?,
-            delete: ScyllaDeleteExecutor::prepare(session, state_keyspace).await?,
+            delete: ScyllaDeleteExecutor::prepare(session.clone(), state_keyspace).await?,
+            restore: super::ScyllaRestoreExecutor::prepare(session.clone(), state_keyspace).await?,
+            reader: super::ScyllaRowImageReader::prepare(session, state_keyspace).await?,
             events,
         })
     }
@@ -235,6 +242,73 @@ impl ScyllaRollbackExecutor {
     ///
     /// Written above the fence, because a value written under it is shadowed by
     /// the tombstones just laid down -- succeeding, silent, and unreadable.
+    /// Put back the rows the plan deleted that existed before the range began.
+    ///
+    /// See `restore_executor` for why this is per row rather than per table, and
+    /// why the journal is the only thing that can answer it.  The image used is
+    /// the one recorded at `c(K)` -- the first checkpoint above the target that
+    /// touched this key position -- because that is the only observation of what
+    /// a reader saw just before the discarded range.
+    ///
+    /// Grouped by position rather than by locator, for the reason the G-W
+    /// assertion is: a version-axis locator encodes the checkpoint, so one key
+    /// written at ten heights is ten locators, and treating those as ten keys
+    /// would make `c(K)` collapse into "every checkpoint".
+    pub async fn restore_rewritten_rows<Hash: Q256BitHash>(
+        &self,
+        recording: &CoordinatorCommitRecording<Hash>,
+        plan: &RollbackPlan<Hash>,
+        target: u64,
+        fence: DeleteFenceTimestampUs,
+    ) -> anyhow::Result<usize> {
+        let Some(journal) = recording.journal() else {
+            // Fail closed.  Without the journal there is no way to tell a row the
+            // range created from one it rewrote, and carrying on would leave the
+            // second kind deleted -- silently, and only discoverable much later
+            // as a key that reads as absent.
+            anyhow::bail!(
+                "a rollback cannot restore rewritten rows without the verification journal; \
+                 run the chain with PSY_ROLLBACK_VERIFICATION_JOURNAL set"
+            );
+        };
+
+        // The first touch above the target wins, so walk upwards and keep the
+        // earliest observation of each position.
+        let mut first_touch: std::collections::BTreeMap<Vec<u8>, Vec<u8>> =
+            std::collections::BTreeMap::new();
+        for checkpoint in (target + 1)..=plan.head {
+            // Only rows that existed before their commit come back; the rest
+            // were created by the discarded range and the delete stands.
+            for (_, locator, before) in journal.rewritten_before_images(checkpoint).await? {
+                let Ok(resolved) = super::decode_locator_canonical(&locator) else {
+                    continue;
+                };
+                let Ok(position) = self.reader.position_key(&resolved) else {
+                    continue;
+                };
+                first_touch.entry(position).or_insert_with(|| {
+                    // The locator is kept with the image: the row is written back
+                    // to where it was, and for a version-axis table that is a
+                    // different locator per checkpoint.
+                    let mut packed = (locator.len() as u32).to_be_bytes().to_vec();
+                    packed.extend_from_slice(&locator);
+                    packed.extend_from_slice(&before);
+                    packed
+                });
+            }
+        }
+
+        let mut restored = 0usize;
+        for packed in first_touch.values() {
+            let len = u32::from_be_bytes(packed[..4].try_into().expect("four bytes")) as usize;
+            let locator = &packed[4..4 + len];
+            let before = &packed[4 + len..];
+            self.restore.restore_row(fence, locator, before).await?;
+            restored += 1;
+        }
+        Ok(restored)
+    }
+
     pub async fn restore_singletons(
         &self,
         target: u64,
@@ -701,6 +775,20 @@ impl ScyllaRollbackExecutor {
                 .await?;
         }
         let restored_singletons = self.restore_singletons(target, fence).await?;
+        // Put back what the delete removed but should not have: rows the
+        // discarded range rewrote rather than created.  After the singletons,
+        // because the singleton restore reads the target's own rows and this
+        // writes above the fence -- ordering them the other way would have the
+        // singleton read see a row this step had just put back.
+        let restored_rows = self
+            .restore_rewritten_rows(recording, &plan, target, fence)
+            .await?;
+        if restored_rows > 0 {
+            tracing::warn!(
+                "restored {restored_rows} rows the discarded range had rewritten; deleting them \
+                 would have destroyed the only copy of their previous value"
+            );
+        }
 
         // Lift the allocator past the fence before anything can commit again.
         // seal_reservation allocates max(high_water + 1, clock), and the fence

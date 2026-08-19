@@ -132,6 +132,66 @@ impl RowImage {
     }
 }
 
+/// Read a canonical image back into its column values, in schema order.
+///
+/// The inverse of [`RowImage::canonical_bytes`], and it has to live beside it:
+/// the encoding carries no column names and no types, only presence, length and
+/// bytes in schema order, so a decoder written anywhere else would be guessing
+/// at a layout it cannot see.
+///
+/// Column *names* deliberately stay out of the encoding.  A restore pairs these
+/// values with the names from `table_shape`, which is the same source the reader
+/// used to produce them -- so a schema change moves both sides at once instead
+/// of leaving a stored image that decodes into the wrong columns.
+pub(crate) fn decode_canonical_row(bytes: &[u8]) -> anyhow::Result<Vec<Option<Vec<u8>>>> {
+    const MAGIC: &[u8] = b"PSYROW01";
+    if bytes.len() < MAGIC.len() + 1 || &bytes[..MAGIC.len()] != MAGIC {
+        anyhow::bail!("a stored row image does not start with the canonical row magic");
+    }
+    let count = bytes[MAGIC.len()] as usize;
+    let mut cursor = MAGIC.len() + 1;
+    let mut columns = Vec::with_capacity(count);
+    for index in 0..count {
+        let present = *bytes.get(cursor).ok_or_else(|| {
+            anyhow::anyhow!("a stored row image ends before column {index}'s presence byte")
+        })?;
+        cursor += 1;
+        match present {
+            0 => columns.push(None),
+            1 => {
+                let len_bytes: [u8; 4] = bytes
+                    .get(cursor..cursor + 4)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("a stored row image ends inside column {index}'s length")
+                    })?
+                    .try_into()
+                    .expect("four bytes");
+                cursor += 4;
+                let len = u32::from_be_bytes(len_bytes) as usize;
+                let value = bytes.get(cursor..cursor + len).ok_or_else(|| {
+                    anyhow::anyhow!("a stored row image ends inside column {index}'s value")
+                })?;
+                cursor += len;
+                columns.push(Some(value.to_vec()));
+            }
+            other => anyhow::bail!(
+                "a stored row image has presence byte {other} for column {index}, which is \
+                 neither absent nor present"
+            ),
+        }
+    }
+    if cursor != bytes.len() {
+        // Trailing bytes mean the image was written by something that encodes
+        // more than this build reads.  Restoring from the part it understands
+        // would put back a row missing whatever the rest described.
+        anyhow::bail!(
+            "a stored row image has {} trailing bytes after {count} columns",
+            bytes.len() - cursor
+        );
+    }
+    Ok(columns)
+}
+
 /// How a physical table's regular columns are read back.
 ///
 /// Two statements, because the two callers ask different questions.  Delete and
@@ -858,5 +918,59 @@ mod tests {
                 "{table:?} is recorded by the commit planner but has no read shape"
             );
         }
+    }
+
+    #[test]
+    fn a_canonical_image_survives_the_round_trip() {
+        // The restore writes back exactly what the journal recorded, so the
+        // encoder and the decoder have to agree on every case the encoder can
+        // produce -- including a null column, which is a real state and not an
+        // absent row.
+        let image = RowImage {
+            columns: vec![
+                RowColumn { name: "a", value: Some(vec![1, 2, 3]), write_time_us: Some(7) },
+                RowColumn { name: "b", value: None, write_time_us: None },
+                RowColumn { name: "c", value: Some(Vec::new()), write_time_us: Some(9) },
+            ],
+            resolved_checkpoint: Some(42),
+        };
+        let decoded = decode_canonical_row(&image.canonical_bytes()).expect("round trips");
+        assert_eq!(
+            decoded,
+            vec![Some(vec![1, 2, 3]), None, Some(Vec::new())],
+            "an empty value and an absent one must stay apart"
+        );
+    }
+
+    #[test]
+    fn a_key_only_row_decodes_to_no_columns() {
+        // Presence with no columns at all is a real state for a table that is
+        // entirely primary key, and restoring it means writing the key back.
+        let image = RowImage { columns: Vec::new(), resolved_checkpoint: None };
+        assert!(decode_canonical_row(&image.canonical_bytes())
+            .expect("round trips")
+            .is_empty());
+    }
+
+    #[test]
+    fn a_truncated_or_padded_image_is_refused() {
+        let image = RowImage {
+            columns: vec![RowColumn {
+                name: "a",
+                value: Some(vec![1, 2, 3]),
+                write_time_us: Some(7),
+            }],
+            resolved_checkpoint: None,
+        };
+        let bytes = image.canonical_bytes();
+        assert!(decode_canonical_row(&bytes[..bytes.len() - 1]).is_err());
+        let mut padded = bytes.clone();
+        padded.push(0);
+        assert!(
+            decode_canonical_row(&padded).is_err(),
+            "trailing bytes mean a newer encoder wrote more than this build reads, and \
+             restoring the part it understands would put back an incomplete row"
+        );
+        assert!(decode_canonical_row(b"NOTAROW0").is_err());
     }
 }
