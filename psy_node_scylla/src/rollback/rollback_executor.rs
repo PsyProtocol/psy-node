@@ -431,7 +431,9 @@ impl ScyllaRollbackExecutor {
     /// Every phase is a CAS on the canonical head, so the phase a crash leaves
     /// behind is readable rather than inferred, and the archive barrier is the
     /// single point of no return: before it nothing has been deleted and the
-    /// rollback can still be abandoned, after it the only way out is forwards.
+    /// nothing has been deleted, after it rows are gone.  A rollback is never
+    /// abandoned either side of it: the way out is always forwards, and a run
+    /// that stops early is resumed rather than undone.
     pub async fn roll_back<Hash: Q256BitHash>(
         &self,
         recording: &CoordinatorCommitRecording<Hash>,
@@ -647,8 +649,9 @@ impl ScyllaRollbackExecutor {
                 }
                 if started.elapsed() >= limit {
                     anyhow::bail!(
-                        "FREEZE_ALL waited {}s for {:?} and they have not frozen; the rollback \
-                         cannot proceed and the chain stays frozen until it is aborted",
+                        "FREEZE_ALL waited {}s for {:?} and they have not frozen; the chain \
+                         stays frozen until they do -- bring them back and run the rollback \
+                         again, which resumes from here rather than starting over",
                         limit.as_secs(),
                         freeze.missing()
                     );
@@ -731,7 +734,8 @@ impl ScyllaRollbackExecutor {
                     // can repair.
                     anyhow::bail!(
                         "GLOBAL_ARCHIVE_BARRIER waited {}s for {:?} and they have not archived; \
-                         nothing has been deleted and the rollback can still be abandoned",
+                         nothing has been deleted yet, and nothing will be until they do -- \
+                         bring them back and run the rollback again to resume from here",
                         limit.as_secs(),
                         barrier.missing()
                     );

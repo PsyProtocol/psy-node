@@ -621,10 +621,11 @@ impl<Hash: Q256BitHash>
 /// meant a Realm could only ever take part in a rollback it happened to be
 /// perfectly in step with, which is to say never.
 ///
-/// Going backwards is a different matter and is not waited out.  A phase below
-/// the one expected means the rollback was abandoned or is being aborted, and
-/// the Realm must stop rather than sit until the deadline: it would be waiting
-/// for something that is not coming.
+/// Idle is a different matter and is not waited out.  A rollback is never
+/// abandoned once requested, so seeing Idle means this one finished while the
+/// Realm was between observations -- there is nothing left to take part in, and
+/// sitting until the deadline would be waiting for something that already
+/// happened.
 async fn wait_for_phase<Hash: Q256BitHash>(
     view: &dyn RollbackParticipantView<Hash>,
     head: &CanonicalChainRef<Hash>,
