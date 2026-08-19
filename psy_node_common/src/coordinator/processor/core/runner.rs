@@ -50,6 +50,8 @@ where
     print_cf_log_indicator("PSY_COORDINATOR_PROCESSOR_STARTED", &format!("R{}_{}", realm_id, realm_sub_id));
 
     let mut last_slot: u128 = 0;
+    // Logged on the edge so a long rollback does not bury the log.
+    let mut reported_frozen = false;
 
     loop {
         if processor.db.status.should_run() {
@@ -61,6 +63,44 @@ where
 
             if current_slot != last_slot && current_slot % 60 == 0 {
                 last_slot = current_slot;
+
+                // A rollback may be driven from another process -- an operator
+                // command -- and nothing else would connect it to this loop,
+                // which would otherwise keep publishing checkpoints on top of
+                // the head being archived.  Read once per block attempt rather
+                // than every tick: this is the only moment it changes anything.
+                match processor
+                    .db
+                    .recording
+                    .follow_published_phase(processor.db.network_id)
+                    .await
+                {
+                    Ok(phase) if phase.permits_commit() => {}
+                    Ok(phase) => {
+                        if !std::mem::replace(&mut reported_frozen, true) {
+                            tracing::info!(
+                                "[COORDINATOR] frozen for a rollback: the control row says \
+                                 {phase:?}; no checkpoint will be produced until it returns to \
+                                 Idle"
+                            );
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        // Fail closed, as the Realm does: a Coordinator that
+                        // cannot read its own control row does not know whether
+                        // it is mid-rollback, and producing a checkpoint on top
+                        // of a head that is being archived is the one mistake
+                        // that cannot be waited out.
+                        tracing::error!(
+                            "[COORDINATOR] cannot read the rollback control row ({e:#}); holding \
+                             off rather than producing through a rollback that may be running"
+                        );
+                        continue;
+                    }
+                }
+                reported_frozen = false;
+
                 let start_processing_at = std::time::Instant::now();
                 tracing::debug!("[COORDINATOR] Process block starting...");
                 let result = processor.process_block().await;

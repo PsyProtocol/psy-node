@@ -209,12 +209,25 @@ pub async fn follow_published_rollback_phase<Hash: Q256BitHash>(
     commit_window: &super::commit_window::CommitWindowClock,
 ) -> anyhow::Result<ObservedRollbackPhase> {
     let phase = view.observe_phase(coordinator_head).await?;
+    apply_phase_to_commit_path(phase, commit_window);
+    Ok(phase)
+}
+
+/// The one place that turns a phase into a freeze or a thaw.
+///
+/// Shared by the participant that reads the phase over a view and the
+/// Coordinator that reads it out of its own head store: the source of the phase
+/// differs, the obligation it creates does not.  Two copies of this would be two
+/// chances for the roles to disagree about what a phase means.
+pub fn apply_phase_to_commit_path(
+    phase: ObservedRollbackPhase,
+    commit_window: &super::commit_window::CommitWindowClock,
+) {
     if phase.permits_commit() {
         commit_window.thaw_after_rollback();
     } else {
         commit_window.freeze_for_rollback();
     }
-    Ok(phase)
 }
 
 /// The participant this node is.

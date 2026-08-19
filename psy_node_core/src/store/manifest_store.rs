@@ -182,6 +182,24 @@ impl<Hash: Q256BitHash> CoordinatorCommitRecording<Hash> {
         }
     }
 
+    /// Bring the Coordinator's commit path into line with the rollback phase on
+    /// its own control row, and report that phase.
+    ///
+    /// The Coordinator needs no participant view: the control row it would read
+    /// through one is the row it owns.  What it does need is the same
+    /// obligation, because the rollback may well be driven from another process
+    /// -- an operator command -- and nothing then connects it to the loop that
+    /// is still producing checkpoints.
+    pub async fn follow_published_phase(
+        &self,
+        network_id: psy_data::protocol::canonical_chain::NetworkId,
+    ) -> anyhow::Result<super::rollback_coordination::ObservedRollbackPhase> {
+        let state = self.canonical_head.read_canonical_head(network_id).await?;
+        let phase = super::rollback_coordination::phase_from_head_state(&state);
+        super::rollback_coordination::apply_phase_to_commit_path(phase, &self.commit_window);
+        Ok(phase)
+    }
+
     /// The verification journal, when one was configured.
     pub fn journal(
         &self,
