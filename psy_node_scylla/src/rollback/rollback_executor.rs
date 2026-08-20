@@ -29,7 +29,8 @@ use scylla::client::session::Session;
 use psy_data::protocol::chain_context::AuthorityScope;
 use psy_node_core::store::authority_commit::{AuthorityTimestampKey, AuthorityTimestampReadState};
 use psy_node_core::store::canonical_head::{
-    CanonicalHeadReadState, CanonicalHeadTransition, StoredCanonicalHead,
+    CanonicalHeadReadState, CanonicalHeadTransition, CanonicalHeadTransitionKind,
+    StoredCanonicalHead,
 };
 use psy_node_core::store::rollback_control::RollbackControlState;
 use psy_node_core::store::rollback_control::{
@@ -1071,11 +1072,13 @@ impl ScyllaRollbackExecutor {
         transition: CanonicalHeadTransition<Hash>,
     ) -> anyhow::Result<StoredCanonicalHead<Hash>> {
         let kind = transition.kind();
+        crash_here_if_asked("PSY_ROLLBACK_CRASH_BEFORE", kind);
         let sealed = transition.seal();
         let outcome = recording
             .canonical_head()
             .compare_and_set_canonical_head(&sealed)
             .await?;
+        crash_here_if_asked("PSY_ROLLBACK_CRASH_AFTER", kind);
         if !(outcome.was_applied() || outcome.was_idempotent()) {
             anyhow::bail!(
                 "the canonical head moved under this rollback while entering {kind:?}; another \
@@ -1084,4 +1087,33 @@ impl ScyllaRollbackExecutor {
         }
         Ok(*outcome.current())
     }
+}
+
+/// Kills this process at a named phase transition, for testing resume.
+///
+/// Every phase advance goes through `advance`, so this one call site covers all
+/// of them and no phase can be forgotten -- which matters, because a resume
+/// path is only ever exercised by the phases someone remembered to crash in.
+/// `_BEFORE` leaves the work of a phase done and the phase unrecorded;
+/// `_AFTER` leaves the phase durable and its executor gone.  Both are real:
+/// the first is a process killed mid-write, the second one killed just after.
+///
+/// `process::abort` rather than an error return or a panic: an error would be
+/// handled and a panic would unwind, and neither is what a killed node does.
+/// Unwinding in particular would run the freeze guard's destructor and thaw the
+/// commit path, which is precisely the state a crashed rollback does *not*
+/// leave behind.
+///
+/// Compiled only into debug builds.  A release binary has no way to be asked to
+/// abort in the middle of a rollback, whatever its environment says.
+fn crash_here_if_asked(variable: &str, kind: CanonicalHeadTransitionKind) {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let Ok(requested) = std::env::var(variable) else { return };
+    if requested != format!("{kind:?}") {
+        return;
+    }
+    eprintln!("[fault injection] {variable}={requested}: aborting inside the rollback");
+    std::process::abort();
 }
