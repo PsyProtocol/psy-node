@@ -554,10 +554,14 @@ impl<Hash: Q256BitHash> psy_node_core::store::realm_self_rollback::RealmSelfRoll
         // from colliding with a different one in the archive.
         let plan_id = format!("realm-recovery-{realm_id}-{realm_sub_id}-{own_head}-{target}")
             .into_bytes();
+        crash_realm_step("RecoverBeforeArchive");
         let archived_rows = self.archive(&plan_id, &plan).await?;
+        crash_realm_step("RecoverAfterArchive");
         let deleted_rows = self.delete(&plan, fence).await?;
+        crash_realm_step("RecoverAfterDelete");
         // The recovery path needs this as much as the participation one: it
         // deletes the same rows and would destroy the same only copies.
+        crash_realm_step("RecoverBeforeRestore");
         self.restore_rewritten_rows(recording, &plan, target, fence, head_ref.chain_epoch().get())
             .await?;
 
@@ -694,13 +698,21 @@ async fn wait_for_phase<Hash: Q256BitHash>(
 
 /// Abort at a named point in a Realm's part of a rollback.
 ///
-/// The Realm has no phase transitions of its own to hang a hook on: it observes
-/// the phases the Coordinator publishes and files receipts that let the
-/// barriers close.  So the points are named after what it is about to do, and
-/// the interesting ones are the gaps -- a Realm that dies after observing
-/// DELETING and before filing its verify receipt leaves the Coordinator waiting
-/// on a barrier that can never close, which no Coordinator-side crash can
-/// produce.
+/// The Realm has no phase transitions of its own to hang a hook on, so the
+/// points are named after what it is about to do. There are two sets, because
+/// there are two paths and only one of them runs here.
+///
+/// The `Before*`/`After*` points are the **join** path: a Realm that is running
+/// and caught up when FROZEN is published files receipts that let the barriers
+/// close, and dying in the gaps between observing a phase and filing its
+/// receipt is what no Coordinator-side crash can produce. On this deployment
+/// that path is never taken -- Realms participate without blocking, discover
+/// the rollback from the epoch change, and recover afterwards.
+///
+/// The `Recover*` points are that second path, and it is the one the Realms
+/// actually walk. It is also where the archive re-read defect lived: a Realm
+/// stuck for 816 retries because re-archiving after its own delete no longer
+/// matched the copy.
 fn crash_realm_step(point: &str) {
     super::rollback_executor::crash_if_named("PSY_ROLLBACK_REALM_CRASH_AT", point);
 }

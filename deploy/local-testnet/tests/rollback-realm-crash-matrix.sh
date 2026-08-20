@@ -32,14 +32,18 @@ LOG=/tmp/realm-crash
 # `AfterArchiveReceipt` are the gaps that matter most: the receipt is filed, the
 # Coordinator has counted it, and the participant that owes the *next* one is
 # gone.
+# The recover-afterwards path, which is the one Realms actually walk on this
+# deployment: they participate without blocking, discover the rollback from the
+# epoch change, and reset themselves.  The join-at-FROZEN points
+# (Before/AfterFreezeReceipt, Before/AfterArchive, AfterArchiveReceipt,
+# BeforeDelete, BeforeVerifyReceipt) exist in the binary but are never reached
+# here -- a matrix over them passes every point without ever crashing, which
+# proves nothing and took two runs to notice.
 ALL_POINTS=(
-  BeforeFreezeReceipt
-  AfterFreezeReceipt
-  BeforeArchive
-  AfterArchive
-  AfterArchiveReceipt
-  BeforeDelete
-  BeforeVerifyReceipt
+  RecoverBeforeArchive
+  RecoverAfterArchive
+  RecoverAfterDelete
+  RecoverBeforeRestore
 )
 POINTS=("$@")
 [ ${#POINTS[@]} -gt 0 ] || POINTS=("${ALL_POINTS[@]}")
@@ -87,6 +91,23 @@ start_realm() {  # start_realm [crash-point]
   fail "realm-$REALM would not start"
 }
 
+# A Realm can only join a rollback at the moment FROZEN is published, and only
+# if it is running and caught up then.  One that is still starting misses the
+# join and takes the recover-afterwards path instead -- a different code path,
+# with different crash points, reached silently.  Waiting for it to be level
+# with the Coordinator is what makes the crash point under test the one the
+# Realm actually reaches.
+wait_for_realm_synced() {
+  local waited=0
+  while :; do
+    local c r
+    c=$(height "$KEYSPACE"); r=$(height "realm_$REALM")
+    [ -n "$c" ] && [ -n "$r" ] && [ "$r" -ge $((c - 1)) ] 2>/dev/null && return 0
+    sleep 5; waited=$((waited + 5))
+    [ "$waited" -lt 300 ] || fail "realm-$REALM never caught up (coordinator=$c realm=$r)"
+  done
+}
+
 run_rollback() {
   PSY_ROLLBACK_LIVE_KEYSPACE="$KEYSPACE" PSY_ROLLBACK_VERIFICATION_JOURNAL=1 \
     timeout 1200 cargo test -p psy_node_scylla --test rollback_acceptance \
@@ -106,6 +127,23 @@ for point in "${POINTS[@]}"; do
   done
   head_before=$(height "$KEYSPACE")
 
+  # A Realm changes state only when it has transactions, so a ten-checkpoint
+  # window may hold none of its writes -- and then its recovery returns at the
+  # first check, having nothing to undo, and the crash point is never reached.
+  # The round would fail on "the Realm never aborted" while nothing was wrong.
+  waited=0
+  while :; do
+    own=$("${CQL[@]}" "SELECT MAX(checkpoint_id) FROM realm_${REALM}_no_tablet.authority_manifest;" \
+            2>/dev/null | sed -n '4p' | tr -d ' ')
+    now=$(height "$KEYSPACE")
+    [ -n "$own" ] && [ -n "$now" ] && [ "$own" -gt $((now - 10)) ] 2>/dev/null && break
+    sleep 15; waited=$((waited + 15))
+    [ "$waited" -lt "$GROW_LIMIT" ] || fail \
+      "$point: realm-$REALM has committed nothing since ${own:-never} while the chain is at \
+       ${now:-?}; it needs transactions of its own inside the range about to be discarded"
+    head_before=$(height "$KEYSPACE")
+  done
+
   # `grep -c` exits non-zero on no match while still printing 0, so `|| echo 0`
   # yields "0\n0" and every comparison below becomes "integer expected" -- which
   # `if` reads as false, quietly skipping the check that the crash happened at
@@ -113,6 +151,7 @@ for point in "${POINTS[@]}"; do
   crashes_before=$(grep -ac "fault injection" "$LOGS/realm-$REALM-processor.log" 2>/dev/null) || crashes_before=0
   stop_realm
   start_realm "$point"
+  wait_for_realm_synced
 
   # The rollback publishes the phases this Realm is waiting on, so it is what
   # walks the Realm into the point it is armed to die at.
