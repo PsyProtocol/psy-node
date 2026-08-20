@@ -15,6 +15,7 @@ So this harness reports what actually landed rather than what was attempted,
 and keeps its population on disk: registering a user costs a proof, and a run
 that has to rebuild its users every time is a run nobody repeats.
 
+    workload.py shapes 20        compile 20 distinct contract shapes
     workload.py users 100        register 100 users, keys saved
     workload.py fund             faucet everyone not yet funded
     workload.py deploy 20        20 users each deploy the sample contract
@@ -49,6 +50,7 @@ REPO = Path(__file__).resolve().parents[3]
 CLI = REPO / "target/release/psy_user_cli"
 CFG = REPO / "client_prover/config.json"
 SAMPLE_CONTRACT = REPO / "client_prover/psy_cli/psy_user_cli/contract.json"
+COMPILER = Path(os.environ.get("PSY_COMPILER_HOME", REPO.parent / "psy-compiler"))
 LEDGER = Path(os.environ.get("PSY_WORKLOAD_LEDGER", REPO / ".local-staging/workload/ledger.json"))
 FAUCET = os.environ.get("PSY_WORKLOAD_FAUCET", "http://127.0.0.1:9998")
 
@@ -73,6 +75,10 @@ _log_lock = threading.Lock()
 # user in flight together fail with "end cap for user_id N at unique_pending_id
 # M has already been submitted", which looks like a chain fault and is not one.
 _busy = set()
+
+# Merkle-proof rejections seen this run, surfaced at the end rather than left
+# in the middle of a thousand lines of progress.
+_suspicious = []
 
 
 def log(msg):
@@ -207,6 +213,24 @@ def register_one(state):
 
 
 def fund_one(state, user):
+    # The faucet operators are a small fixed set, so parallel claims contend on
+    # the *operator's* end cap rather than the recipient's: 41 of 100 claims
+    # failed this way in one pass, all of them "stale nonce".
+    ok, why = with_retry(lambda: attempt_fund(user), attempts=4, pause=20)
+    if ok is None:
+        log(f"faucet {user['user_id']}: {why}")
+        record(state, fund_failed=1)
+        return False
+    with _lock:
+        user["funded"] = True
+        user["funded_at"] = user.get("funded_at") or time.time()
+        save(state)
+    log(f"funded {user['user_id']} at checkpoint {ok.get('checkpoint_id')}")
+    record(state, funded=1)
+    return True
+
+
+def attempt_fund(user):
     import urllib.request
 
     body = json.dumps({
@@ -219,36 +243,41 @@ def fund_one(state, user):
         with urllib.request.urlopen(request, timeout=600) as response:
             payload = json.loads(response.read())
     except Exception as exc:  # noqa: BLE001 - the faucet fails in many ways
-        log(f"faucet {user['user_id']}: {exc}")
-        record(state, fund_failed=1)
-        return False
+        return None, str(exc)[:160]
     if "error" in payload:
-        log(f"faucet {user['user_id']}: {str(payload['error'])[:120]}")
-        record(state, fund_failed=1)
-        return False
-    with _lock:
-        user["funded"] = True
-        user["funded_at"] = user.get("funded_at") or time.time()
-        save(state)
-    log(f"funded {user['user_id']} at checkpoint {payload.get('result', {}).get('checkpoint_id')}")
-    record(state, funded=1)
-    return True
+        return None, str(payload["error"])[:200]
+    return payload.get("result", {}), None
 
 
 # Failures that mean "the chain moved under you, build it again" rather than
 # "this transaction is wrong".  A real client retries these; counting them as
-# defects would bury the failures that matter under normal contention.
+# defects would bury the failures that matter under normal contention.  The
+# last three appear only while a rollback is in flight -- the client is holding
+# a checkpoint the chain has just discarded -- and during rollback testing they
+# are the majority of everything that goes wrong.
 TRANSIENT = (
     "stale nonce",
     "stale trace anchor",
     "has already been submitted",
     "chain state advanced",
     "rebuild the trace",
+    "but current checkpoint is",
+    "Global state roots not found",
+    "Latest L2 block state not found",
 )
+
+# Retried like the rest, but never quietly: this is what a client sees both
+# when a rollback discarded the branch its proof was built against *and* when
+# a tree is genuinely corrupt.  Dropping it in with the transients would have
+# hidden the keyspace that was destroyed once already, so it is counted apart
+# and said out loud, and whether it is benign depends on whether a rollback
+# was running -- which the harness cannot know and the reader can.
+SUSPICIOUS = ("user tree merkle proof verify failed", "merkle proof")
 
 
 def is_transient(reason):
-    return any(marker in (reason or "") for marker in TRANSIENT)
+    text = reason or ""
+    return any(marker in text for marker in TRANSIENT) or any(m in text for m in SUSPICIOUS)
 
 
 def with_retry(action, attempts=3, pause=25):
@@ -257,6 +286,9 @@ def with_retry(action, attempts=3, pause=25):
         # `None` is the only failure signal: a successful command may return an
         # empty result object, which is falsy and would otherwise be retried.
         ok, reason = action()
+        if ok is None and any(m in (reason or "") for m in SUSPICIOUS):
+            log(f"  !! merkle proof rejected: {reason[:120]}")
+            _suspicious.append(reason[:200])
         if ok is not None or not is_transient(reason):
             return ok, reason
         if attempt + 1 < attempts:
@@ -301,10 +333,10 @@ def call(state, user, contract_id, method, inputs, timeout=900):
     return True
 
 
-def deploy_one(state, user):
+def deploy_one(state, user, shape=None):
     result, why = run_cli(
         ["deploy-contract", "--sign-type", "secp256k1", "-p", user["key"],
-         "--contract-path", str(SAMPLE_CONTRACT), "--is-deploy"],
+         "--contract-path", str(shape or SAMPLE_CONTRACT), "--is-deploy"],
         timeout=3600,
     )
     if result is None:
@@ -321,6 +353,7 @@ def deploy_one(state, user):
         state["contracts"].append({
             "tx": result.get("transaction_hash") or result.get("tx_hash"),
             "deployer": user["user_id"],
+            "shape": Path(shape).name if shape else SAMPLE_CONTRACT.name,
             "contract_id": None,
         })
         save(state)
@@ -359,6 +392,88 @@ def attempt_withdraw(user):
 # commands
 
 
+SHAPE_TEMPLATE = """use std::prelude::*;
+
+#[derive(Storage)]
+struct Slot {{
+    pub a: Felt,
+    pub b: Felt,
+}}
+
+#[contract]
+#[derive(Storage)]
+struct Contract {{
+    pub balance: Felt,
+    pub slots: [Slot; {slots}],
+}}
+
+impl ContractRef {{
+    #[contract_method]
+    pub fn simple_mint_debug(amount: Felt) {{
+        let c = ContractRef::new(ContractMetadata::current());
+        c.balance += amount;
+    }}
+{extra}}}
+"""
+
+EXTRA_METHOD = """
+    #[contract_method]
+    pub fn bump_{index}(amount: Felt) {{
+        let c = ContractRef::new(ContractMetadata::current());
+        c.balance += amount + {index};
+    }}
+"""
+
+
+def cmd_shapes(state, args):
+    """Compile N distinct contracts.
+
+    Two axes are varied because they land in different tables: the storage
+    array size sets `contract_state_tree_height` (genesis contracts sit at 32,
+    the checked-in sample at 4), and the method count changes the function tree.
+    Deploying the same source from different users already yields distinct
+    contract ids -- this exists so the *shapes* differ too, rather than one
+    shape repeated a hundred times.
+    """
+    dargo = COMPILER / "target/release/dargo"
+    std = COMPILER / "psy-std/std.psy"
+    if not dargo.exists():
+        sys.exit(f"{dargo} is missing; cargo build --release --package dargo in {COMPILER}")
+    root = LEDGER.parent / "shapes"
+    root.mkdir(parents=True, exist_ok=True)
+    built = []
+    for index in range(args.count):
+        # 2^(6..17): small enough to compile quickly, spread widely enough that
+        # the derived tree heights are not all the same number.
+        slots = 1 << (6 + index % 12)
+        methods = ["simple_mint_debug"] + [f"bump_{i}" for i in range(index % 3)]
+        package = root / f"shape_{index:03d}"
+        (package / "src").mkdir(parents=True, exist_ok=True)
+        (package / "Dargo.toml").write_text(
+            f'[package]\nname = "shape_{index:03d}"\ntype = "bin"\nauthors = [""]\n'
+        )
+        extra = "".join(EXTRA_METHOD.format(index=i) for i in range(index % 3))
+        (package / "src/main.psy").write_text(SHAPE_TEMPLATE.format(slots=slots, extra=extra))
+        done = subprocess.run(
+            [str(dargo), "compile", "--contract-name=ContractRef", "--method-names", *methods],
+            cwd=package, capture_output=True, text=True,
+            env={**os.environ, "DARGO_STD_PATH": str(std), "RUST_LOG": "dargo=error"},
+            timeout=1200,
+        )
+        artifact = package / f"target/shape_{index:03d}.json"
+        if done.returncode != 0 or not artifact.exists():
+            log(f"shape {index}: compile failed ({last_error(done.stdout + done.stderr)})")
+            record(state, shape_failed=1)
+            continue
+        built.append(str(artifact))
+        log(f"shape {index}: {slots} slots, {len(methods)} methods")
+    with _lock:
+        state["shapes"] = sorted(set(state.get("shapes", []) + built))
+        save(state)
+    record(state, shapes_built=len(built))
+    report(state)
+
+
 def cmd_users(state, args):
     log(f"registering {args.count} users at parallelism {args.parallel}")
     with ThreadPoolExecutor(max_workers=args.parallel) as pool:
@@ -386,8 +501,9 @@ def cmd_deploy(state, args):
     chosen = random.sample(eligible, min(args.count, len(eligible)))
     before = contract_ids_on_chain()
     log(f"{len(chosen)} deploys (chain has {len(before)} contracts)")
+    shapes = state.get("shapes") or [None]
     with ThreadPoolExecutor(max_workers=args.parallel) as pool:
-        list(pool.map(lambda u: deploy_one(state, u), chosen))
+        list(pool.map(lambda u: deploy_one(state, u, random.choice(shapes)), chosen))
 
     # Wait for the ids to appear.  A deploy that returns success but never
     # lands is exactly the failure this harness exists to make visible, so the
@@ -515,7 +631,11 @@ def report(state, verbose=False):
     print()
     print(f"users      {len(users)} ({funded} funded, {realm0} in realm 0, {len(users)-realm0} in realm 1)")
     print(f"contracts  {len(state['contracts'])} submitted, {len(assigned)} with an id on chain")
+    print(f"shapes     {len(state.get('shapes', []))} compiled")
     print(f"ledger     {LEDGER}")
+    if _suspicious:
+        print(f"merkle proof rejections  {len(_suspicious)}"
+              f"  (expected while a rollback runs; a defect otherwise)")
     if state["stats"]:
         print("operations")
         for key in sorted(state["stats"]):
@@ -529,6 +649,10 @@ def main():
     parser.add_argument("--parallel", type=int, default=4,
                         help="concurrent CLI invocations; each one occupies the prover (default 4)")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("shapes", help="compile N distinct contract sources")
+    p.add_argument("count", type=int)
+    p.set_defaults(func=cmd_shapes)
 
     p = sub.add_parser("users", help="register users and save their keys")
     p.add_argument("count", type=int)
