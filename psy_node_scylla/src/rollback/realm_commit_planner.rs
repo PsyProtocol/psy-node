@@ -201,7 +201,14 @@ impl RealmCommitPlanner for ScyllaRealmCommitPlanner {
                 &TypedTableKey::ImtKeyIndex {
                     tree: TreeId::new(tree_id),
                     tree_sub: TreeSubId::new(tree_sub_id),
-                    encoded_key: ImtEncodedKey::new(leaf_key),
+                    // The index is keyed by the *sort* encoding of the key, not
+                    // by the key.  Recording the raw one named a row that does
+                    // not exist and left the one that does unnamed: unarchived,
+                    // undeleted, and still pointing at a leaf the rollback
+                    // removed.  Nothing reported it -- the plan's own read found
+                    // the invented locator absent, which reads exactly like a
+                    // key the manifest over-recorded.
+                    encoded_key: ImtEncodedKey::new(imt_sort_encode(&leaf_key)),
                 },
             )?;
             if !cursors.contains(&(tree_id, tree_sub_id)) {
@@ -417,5 +424,59 @@ mod tests {
                 .plan_realm_commit(&inputs(&[], &vec![0u8; DOUBLE_MERKLE_NODE_LEN + 1], &[]), &sink)
                 .is_err()
         );
+    }
+}
+
+/// The comparison-compatible encoding the IMT key index is clustered by.
+///
+/// `encode_imt_key_for_sorting` is the writer's version and needs the hash type;
+/// this planner sees the key as the thirty-two bytes the end cap carried, so it
+/// does the same transform on those: most-significant limb first, each limb
+/// big-endian, where the source holds them least-significant first in
+/// little-endian.
+fn imt_sort_encode(leaf_key: &[u8; 32]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for limb in 0..4 {
+        let src = &leaf_key[(3 - limb) * 8..(3 - limb) * 8 + 8];
+        for (i, byte) in src.iter().rev().enumerate() {
+            out[limb * 8 + i] = *byte;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod imt_key_encoding {
+    use super::imt_sort_encode;
+
+    #[test]
+    fn it_matches_a_row_the_chain_actually_wrote() {
+        // Taken from realm_0.imt_key_index_table after a contract call that
+        // inserted into the IMT: the row the planner failed to name.  Checking
+        // against real stored bytes rather than against a restatement of the
+        // rule, because a restatement would have agreed with the bug.
+        let leaf_key = hex_lit(
+            "652ac297317d21f9c01abb92062a2dab5ecfd616a30799be2e87768fcc7d3f2b",
+        );
+        let encoded = hex_lit(
+            "2b3f7dcc8f76872ebe9907a316d6cf5eab2d2a0692bb1ac0f9217d3197c22a65",
+        );
+        assert_eq!(imt_sort_encode(&leaf_key), encoded);
+    }
+
+    #[test]
+    fn the_sentinel_key_encodes_to_itself() {
+        // All zeroes either way, which is why the sentinel row *was* deleted and
+        // only the real key survived -- the bug is invisible on exactly the row
+        // that is easiest to test with.
+        assert_eq!(imt_sort_encode(&[0u8; 32]), [0u8; 32]);
+    }
+
+    fn hex_lit(s: &str) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).expect("hex");
+        }
+        out
     }
 }
