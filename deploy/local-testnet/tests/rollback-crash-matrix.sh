@@ -87,12 +87,23 @@ for target in "${PHASES[@]}"; do
     # make the rest of this round meaningless.
     fail "$target: the injected crash never fired (see $LOG-$target-crash.log)"
   fi
-  echo "crashed at $target, chain left in $(phase)"
+  left_in=$(phase)
+  echo "crashed at $target, chain left in $left_in"
 
-  run_rollback "$LOG-$target-resume.log"
-  grep -q "^test result: ok" "$LOG-$target-resume.log" \
-    || fail "$target: the rollback could not be resumed (see $LOG-$target-resume.log)"
-  grep -aE "rolling back|RollbackReport|recorded as|G-W checked" "$LOG-$target-resume.log" || true
+  # A crash at the last transition lands on Idle: the rollback finished, and
+  # there is nothing to resume.  Running one anyway starts a *fresh* rollback
+  # from the head the finished one left behind, which is the epoch's own start,
+  # so its target falls below it -- and the round fails on a range no rollback
+  # was ever allowed to ask for.  What is left to check here is recovery, which
+  # the loop below does.
+  if [ "${left_in#0x505359524243544c010000}" != "$left_in" ]; then
+    echo "$target: the rollback completed before the crash; nothing to resume"
+  else
+    run_rollback "$LOG-$target-resume.log"
+    grep -q "^test result: ok" "$LOG-$target-resume.log" \
+      || fail "$target: the rollback could not be resumed (see $LOG-$target-resume.log)"
+    grep -aE "rolling back|RollbackReport|recorded as|G-W checked" "$LOG-$target-resume.log" || true
+  fi
 
   waited=0
   while :; do
