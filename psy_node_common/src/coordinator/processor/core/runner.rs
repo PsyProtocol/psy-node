@@ -60,6 +60,18 @@ where
     // no state, so resetting after one would throw away a head that was never
     // discarded.
     let mut rollback_aborted = false;
+    // The epoch this process started under.  A block that fails an integrity
+    // check while the chain has moved to a later epoch failed because of a
+    // rollback, not because anything is corrupt -- and the difference decides
+    // whether the node restarts or parks.  Read once: it changes only when a
+    // rollback publishes, and this process does not survive that.
+    let started_epoch = processor
+        .db
+        .recording
+        .published_chain_epoch(processor.db.network_id)
+        .await
+        .ok()
+        .flatten();
 
     loop {
         if processor.db.status.should_run() {
@@ -187,6 +199,46 @@ where
                              treating this as a fault",
                             current_slot,
                             e
+                        );
+                    }
+                    Err(e)
+                        if matches!(
+                            (
+                                started_epoch,
+                                processor
+                                    .db
+                                    .recording
+                                    .published_chain_epoch(processor.db.network_id)
+                                    .await
+                                    .ok()
+                                    .flatten(),
+                            ),
+                            (Some(started), Some(now)) if now > started
+                        ) =>
+                    {
+                        // The chain is in a later epoch than this process began
+                        // in, so a rollback happened underneath the block that
+                        // just failed.  Integrity checks comparing in-memory
+                        // state against the database are *supposed* to fail
+                        // then; what they must not do is park the node, because
+                        // the state they are comparing is about to be rebuilt.
+                        //
+                        // Attributed by the epoch rather than by the error,
+                        // which is the point: the same check failing without a
+                        // rollback behind it is a real corruption and still
+                        // parks.
+                        tracing::warn!(
+                            "[COORDINATOR] block at slot {} failed under a rollback ({:#}); \
+                             restarting so state is rebuilt by the path that already does it on \
+                             every start (exit {})",
+                            current_slot,
+                            e,
+                            psy_node_core::store::rollback_reload::EXIT_CODE_ROLLBACK_RELOAD
+                        );
+                        processor.db.status.begin_shutdown();
+                        sleep(std::time::Duration::from_millis(500)).await;
+                        std::process::exit(
+                            psy_node_core::store::rollback_reload::EXIT_CODE_ROLLBACK_RELOAD,
                         );
                     }
                     Err(e) => {

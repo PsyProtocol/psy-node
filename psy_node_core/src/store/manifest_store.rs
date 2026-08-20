@@ -200,6 +200,27 @@ impl<Hash: Q256BitHash> CoordinatorCommitRecording<Hash> {
         Ok(phase)
     }
 
+    /// The chain epoch the Coordinator currently publishes.
+    ///
+    /// A process compares this against the one it started under to tell whether
+    /// a rollback has happened beneath it.  The epoch moves only when a rollback
+    /// publishes, so a difference is that and nothing else -- which is what lets
+    /// an integrity failure be attributed to a rollback without blanket-excusing
+    /// integrity failures.
+    pub async fn published_chain_epoch(
+        &self,
+        network_id: psy_data::protocol::canonical_chain::NetworkId,
+    ) -> anyhow::Result<Option<u64>> {
+        Ok(
+            match self.canonical_head.read_canonical_head(network_id).await? {
+                super::canonical_head::CanonicalHeadReadState::Current(head) => {
+                    Some(head.canonical_ref().chain_epoch().get())
+                }
+                super::canonical_head::CanonicalHeadReadState::Uninitialized => None,
+            },
+        )
+    }
+
     /// The verification journal, when one was configured.
     pub fn journal(
         &self,
