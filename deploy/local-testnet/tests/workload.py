@@ -34,6 +34,7 @@ need; contract-state traffic comes from the genesis token instead.
 """
 
 import argparse
+import fcntl
 import json
 import os
 import random
@@ -80,6 +81,10 @@ _busy = set()
 # in the middle of a thousand lines of progress.
 _suspicious = []
 
+# Counters this process has produced but not yet folded into the ledger file.
+_delta = {}
+_delta_lock = threading.Lock()
+
 
 def log(msg):
     with _log_lock:
@@ -97,18 +102,71 @@ def load():
 
 
 def save(state):
-    """Write through a temporary file: a run interrupted mid-save must not cost
-    the population, since the keys in it cannot be regenerated."""
+    """Merge this process's changes into the ledger under a lock.
+
+    Writing the whole in-memory copy back was wrong as soon as two commands ran
+    at once: a long `run` holds the snapshot it loaded at startup and, on every
+    save, put it back over whatever `deploy` and `shapes` had added in the
+    meantime.  Twelve deploys and six compiled shapes disappeared that way
+    while looking like they had succeeded.
+
+    Written through a temporary file as well, because the private keys in here
+    cannot be regenerated and a save interrupted halfway would cost the whole
+    population.
+    """
     LEDGER.parent.mkdir(parents=True, exist_ok=True)
-    tmp = LEDGER.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=1))
-    tmp.replace(LEDGER)
+    lock = LEDGER.with_suffix(".lock")
+    with open(lock, "w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            disk = json.loads(LEDGER.read_text()) if LEDGER.exists() else {}
+            merged = {
+                "users": merge_users(disk.get("users", []), state["users"]),
+                "contracts": merge_by(disk.get("contracts", []), state["contracts"], "tx"),
+                "shapes": sorted(set(disk.get("shapes", [])) | set(state.get("shapes", []))),
+                "stats": dict(disk.get("stats", {})),
+            }
+            with _delta_lock:
+                for key, value in _delta.items():
+                    merged["stats"][key] = merged["stats"].get(key, 0) + value
+                _delta.clear()
+            tmp = LEDGER.with_suffix(".tmp")
+            tmp.write_text(json.dumps(merged, indent=1))
+            tmp.replace(LEDGER)
+            state["stats"] = merged["stats"]
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def merge_users(disk, memory):
+    """Union by user id, with this process's copy winning for users it touched.
+
+    Flags like `funded` and `minted_at` only ever move forward, so preferring
+    the in-memory entry loses nothing another process could have set."""
+    by_id = {u["user_id"]: u for u in disk}
+    by_id.update({u["user_id"]: u for u in memory})
+    return sorted(by_id.values(), key=lambda u: u["user_id"])
+
+
+def merge_by(disk, memory, key):
+    combined = {entry.get(key): entry for entry in disk}
+    for entry in memory:
+        existing = combined.get(entry.get(key))
+        # A contract id filled in by whichever process saw it first must survive.
+        if existing and existing.get("contract_id") is not None and entry.get("contract_id") is None:
+            continue
+        combined[entry.get(key)] = entry
+    return list(combined.values())
 
 
 def record(state, **counts):
-    with _lock:
+    """Count into a per-process delta, applied to the file at save time.
+
+    Adding straight into `state["stats"]` double-counted as soon as the merge
+    above started carrying the file's own totals back in."""
+    with _delta_lock:
         for key, value in counts.items():
-            state["stats"][key] = state["stats"].get(key, 0) + value
+            _delta[key] = _delta.get(key, 0) + value
 
 
 # --------------------------------------------------------------------------
