@@ -79,6 +79,25 @@ pub enum ArchiveOutcome {
     AlreadyArchivedByAnEarlierAttempt,
 }
 
+/// What a read-back that disagrees with the live row means.
+///
+/// Pulled out of the I/O so the rule can be stated once and pinned: which of
+/// the two it is turns entirely on whether this call created the slot, and
+/// getting that backwards either hides a second writer or stops a Realm
+/// forever. The whole difference is one boolean that used to be discarded.
+pub(crate) const fn classify_readback(applied: bool, content_matches: bool) -> ArchiveOutcome {
+    match (content_matches, applied) {
+        (true, _) => ArchiveOutcome::AlreadyIdentical,
+        // Written a moment ago and already different: something else is writing
+        // the archive.
+        (false, true) => ArchiveOutcome::Conflict,
+        // The slot was already there, so it is an earlier attempt of this same
+        // plan -- taken before that attempt deleted and restored the live row.
+        (false, false) => ArchiveOutcome::AlreadyArchivedByAnEarlierAttempt,
+    }
+}
+
+
 /// Copies planned rows into the archive and proves each copy.
 pub struct ScyllaRollbackArchive {
     session: Arc<Session>,
@@ -218,13 +237,7 @@ impl ScyllaRollbackArchive {
             && stored_image.unwrap_or_default() == image.clone().unwrap_or_default()
             && stored_times.unwrap_or_default() == write_times;
         if !content_matches {
-            return Ok(if applied {
-                // We wrote this slot a moment ago and it already reads back
-                // differently, so something else is writing the archive.
-                ArchiveOutcome::Conflict
-            } else {
-                ArchiveOutcome::AlreadyArchivedByAnEarlierAttempt
-            });
+            return Ok(classify_readback(applied, content_matches));
         }
         if stored_checkpoint as u64 == checkpoint_id {
             Ok(ArchiveOutcome::Archived)
@@ -366,5 +379,36 @@ mod tests {
         let absent = encode_write_times(&RowImage::for_test(vec![None]));
         assert_ne!(present, absent);
         assert_eq!(absent, vec![1, 0]);
+    }
+}
+
+#[cfg(test)]
+mod readback_rules {
+    use super::{classify_readback, ArchiveOutcome};
+
+    #[test]
+    fn a_slot_this_call_created_that_already_differs_is_someone_else_writing() {
+        assert_eq!(
+            classify_readback(true, false),
+            ArchiveOutcome::Conflict,
+            "nothing legitimate can change a slot between writing it and reading it back"
+        );
+    }
+
+    #[test]
+    fn a_slot_that_was_already_there_is_this_plans_own_earlier_attempt() {
+        // The Realm's recovery re-archives after its own delete and restore, so
+        // the live row cannot match the copy any more. Calling that a conflict
+        // stopped a chain for 816 retries.
+        assert_eq!(
+            classify_readback(false, false),
+            ArchiveOutcome::AlreadyArchivedByAnEarlierAttempt
+        );
+    }
+
+    #[test]
+    fn matching_content_is_a_plain_retry_whoever_wrote_it() {
+        assert_eq!(classify_readback(true, true), ArchiveOutcome::AlreadyIdentical);
+        assert_eq!(classify_readback(false, true), ArchiveOutcome::AlreadyIdentical);
     }
 }
