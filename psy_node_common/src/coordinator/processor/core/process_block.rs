@@ -285,24 +285,47 @@ impl<
     /// as a fault -- which is exactly what it is: a normal advance, forbidden
     /// now that a rollback is active.
     async fn rollback_interrupted_this_block(&self) -> anyhow::Error {
+        // The base this block is building on.  If the chain's published head
+        // drops below it, the block is building on a checkpoint that no longer
+        // exists and no proof of it will ever arrive.
+        let base = self.db.ids.checkpoint_id;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            match self
+
+            // Watching the *phase* was not enough and the chain showed it: a
+            // rollback finishes in seconds, so by the time this block was
+            // waiting the phase had returned to Idle and the poll saw nothing
+            // wrong.  Meanwhile the head had moved back underneath it.  The head
+            // is the durable consequence; the phase is only the window in which
+            // it changes.
+            if let Ok(Some(published)) = self
                 .db
                 .recording
-                .follow_published_phase(self.db.network_id)
+                .published_head_checkpoint(self.db.network_id)
                 .await
             {
-                Ok(phase) if phase.permits_commit() => {}
-                Ok(_) => {
+                if published < base {
                     return anyhow::Error::new(
                         psy_node_core::store::canonical_head::CanonicalHeadModelError
                             ::NormalAdvanceWhileRollbackActive,
                     );
                 }
-                // Unreadable is not evidence of a rollback; keep waiting for the
-                // jobs, which is what this process was doing anyway.
-                Err(_) => {}
+            }
+
+            // Freezing this process's commit path while a rollback is published
+            // still matters, and is what this call does besides reporting.
+            if let Ok(phase) = self
+                .db
+                .recording
+                .follow_published_phase(self.db.network_id)
+                .await
+            {
+                if !phase.permits_commit() {
+                    return anyhow::Error::new(
+                        psy_node_core::store::canonical_head::CanonicalHeadModelError
+                            ::NormalAdvanceWhileRollbackActive,
+                    );
+                }
             }
         }
     }

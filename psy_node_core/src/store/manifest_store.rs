@@ -221,6 +221,25 @@ impl<Hash: Q256BitHash> CoordinatorCommitRecording<Hash> {
         )
     }
 
+    /// The checkpoint the Coordinator currently publishes.
+    ///
+    /// A block in flight compares it against the checkpoint it is building on:
+    /// a published head *below* that base means a rollback discarded the ground
+    /// the block stands on, and the proofs it is waiting for are never coming.
+    pub async fn published_head_checkpoint(
+        &self,
+        network_id: psy_data::protocol::canonical_chain::NetworkId,
+    ) -> anyhow::Result<Option<u64>> {
+        Ok(
+            match self.canonical_head.read_canonical_head(network_id).await? {
+                super::canonical_head::CanonicalHeadReadState::Current(head) => {
+                    Some(head.canonical_ref().checkpoint().checkpoint_id().get())
+                }
+                super::canonical_head::CanonicalHeadReadState::Uninitialized => None,
+            },
+        )
+    }
+
     /// The verification journal, when one was configured.
     pub fn journal(
         &self,
