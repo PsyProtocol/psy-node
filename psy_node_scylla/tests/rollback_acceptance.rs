@@ -148,6 +148,14 @@ async fn a_rollback_restores_exactly_what_was_observed_before() -> anyhow::Resul
     let no_tablet = format!("{keyspace}_no_tablet");
     let session = session().await?;
 
+    // Optional, because between DELETING and RESTORING the Coordinator has no
+    // head singleton at all: the delete has taken it and restore_singletons has
+    // not yet put it back.  A rollback interrupted in that window is exactly the
+    // one most in need of resuming, and insisting on this row made the attempt
+    // fail in twenty milliseconds with "no rows were returned" -- before
+    // reaching the request that still says, durably, what to finish.  Anything
+    // that derives the head from this table cannot operate in that window; the
+    // canonical head row can, and is read below.
     let head = session
         .query_unpaged(
             format!("SELECT value FROM {keyspace}.u64_singleton_table WHERE obj_id = 1"),
@@ -155,8 +163,8 @@ async fn a_rollback_restores_exactly_what_was_observed_before() -> anyhow::Resul
         )
         .await?
         .into_rows_result()?
-        .first_row::<(i64,)>()?
-        .0 as u64;
+        .maybe_first_row::<(i64,)>()?
+        .map(|row| row.0 as u64);
 
     // A rollback already under way is finished rather than replaced.  Deriving
     // a fresh target from the live head would compute one *below* the
@@ -199,6 +207,10 @@ async fn a_rollback_restores_exactly_what_was_observed_before() -> anyhow::Resul
             (resume_head, resume_target)
         }
         None => {
+            let head = head.expect(
+                "no rollback is in progress and the chain has no head singleton; \
+                 this keyspace holds no chain to roll back",
+            );
             // Roll back far enough that the range spans many commits, but leave
             // a deep history below the target so the fallback has somewhere to
             // land.  `PSY_ROLLBACK_TARGET` overrides it, for checking that a
