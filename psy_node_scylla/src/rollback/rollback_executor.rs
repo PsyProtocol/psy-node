@@ -90,6 +90,41 @@ pub(crate) fn plan_digest(plan_id: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Digest of what a rollback will actually delete.
+///
+/// The request used to carry `plan_digest(plan_id)` instead -- a hash of the
+/// caller's *label* for the run.  Its comment claimed it proved a resumed run
+/// had rebuilt the same plan, and it proved nothing of the kind: two genuinely
+/// different plans under one label passed, and one plan under two labels was
+/// refused.  The second is what stopped a testnet. The acceptance harness builds
+/// its label from the head it read out of the singleton table, the executor
+/// takes the head from the canonical head row, and the chain had advanced one
+/// checkpoint between the two reads -- so the label said 6971, the request said
+/// 6972, and the resume was refused for a plan that was in fact identical.
+///
+/// Covering the contents makes the guard mean what it always claimed. Row order
+/// is the plan's own: it comes from the manifest suffix, in checkpoint order,
+/// and rebuilding from the same manifests reproduces it.
+pub(crate) fn plan_contents_digest<Hash: Q256BitHash>(plan: &RollbackPlan<Hash>) -> [u8; 32] {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"PSYROLLBACKPLANCONTENTS");
+    hasher.update(plan.target.to_be_bytes());
+    hasher.update(plan.head.to_be_bytes());
+    hasher.update((plan.checkpoints.len() as u64).to_be_bytes());
+    for checkpoint in &plan.checkpoints {
+        hasher.update(checkpoint.checkpoint_id().to_be_bytes());
+        hasher.update((checkpoint.rows.len() as u64).to_be_bytes());
+        for (table, locator) in &checkpoint.rows {
+            hasher.update(table.to_be_bytes());
+            // Length-prefixed, so two locators cannot run together into a third.
+            hasher.update((locator.len() as u64).to_be_bytes());
+            hasher.update(locator);
+        }
+    }
+    hasher.finalize().into()
+}
+
 pub struct ScyllaRollbackExecutor {
     session: Arc<Session>,
     state_keyspace: String,
@@ -527,7 +562,7 @@ impl ScyllaRollbackExecutor {
                 // 6588.  Nothing has been copied or deleted at this point, so a
                 // wider plan contradicts no work; from Archiving onward it does,
                 // and there the refusal stands.
-                let recomputed = RollbackPlanDigest::try_new(plan_digest(plan_id))?;
+                let recomputed = RollbackPlanDigest::try_new(plan_contents_digest(&plan))?;
                 let mut existing = existing;
                 if existing.plan_digest() != recomputed {
                     let refreshed = existing.with_plan_digest(recomputed);
@@ -569,7 +604,7 @@ impl ScyllaRollbackExecutor {
                     target_ref,
                     window,
                     RollbackExecutionMode::InPlace,
-                    RollbackPlanDigest::try_new(plan_digest(plan_id))?,
+                    RollbackPlanDigest::try_new(plan_contents_digest(&plan))?,
                 )?;
                 let _ = fence;
                 (request, window.delete_fence(), false)
@@ -1163,4 +1198,69 @@ fn crash_here_if_asked(variable: &str, kind: CanonicalHeadTransitionKind) {
     }
     eprintln!("[fault injection] {variable}={requested}: aborting inside the rollback");
     std::process::abort();
+}
+
+#[cfg(test)]
+mod plan_digest_tests {
+    use super::{plan_contents_digest, plan_digest};
+    use parth_core::PHash;
+    use psy_data::protocol::canonical_chain::{
+        CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId, CheckpointRef, NetworkId,
+    };
+    use psy_node_core::store::rollback_plan::{PlannedCheckpoint, RollbackPlan};
+
+    type H = PHash;
+
+    fn plan(head: u64, rows: Vec<(u16, Vec<u8>)>) -> RollbackPlan<H> {
+        let chain = CanonicalChainRef::new(
+            NetworkId::try_from_chain_id(1).expect("a valid chain id"),
+            ChainEpoch::new(1),
+            CheckpointRef::new(
+                CheckpointId::new(head),
+                CheckpointHash::from_last_chain_hash(PHash::from_values(1, 2, 3, 4)),
+            ),
+        );
+        RollbackPlan {
+            target: 10,
+            head,
+            checkpoints: vec![PlannedCheckpoint { chain, rows }],
+        }
+    }
+
+    #[test]
+    fn the_same_plan_digests_the_same_whatever_it_is_called() {
+        // The whole point.  The label the caller passes is not part of the plan,
+        // and a resume that rebuilds the same rows must reproduce the digest --
+        // a label built from a racily-read head once refused a resume whose plan
+        // was identical, and stopped a chain.
+        let rows = vec![(22u16, vec![1, 2, 3]), (30u16, vec![4, 5])];
+        assert_eq!(
+            plan_contents_digest(&plan(20, rows.clone())),
+            plan_contents_digest(&plan(20, rows))
+        );
+    }
+
+    #[test]
+    fn a_different_row_set_digests_differently() {
+        let a = plan(20, vec![(22u16, vec![1, 2, 3])]);
+        let b = plan(20, vec![(22u16, vec![1, 2, 4])]);
+        assert_ne!(plan_contents_digest(&a), plan_contents_digest(&b));
+    }
+
+    #[test]
+    fn locators_are_length_prefixed_so_two_cannot_merge_into_one() {
+        // Without the length prefix these two plans hash the same: "ab" + "c"
+        // and "a" + "bc" are the same bytes once concatenated, and a rollback
+        // would accept a resume that deletes different rows.
+        let a = plan(20, vec![(22u16, vec![b'a', b'b']), (22u16, vec![b'c'])]);
+        let b = plan(20, vec![(22u16, vec![b'a']), (22u16, vec![b'b', b'c'])]);
+        assert_ne!(plan_contents_digest(&a), plan_contents_digest(&b));
+    }
+
+    #[test]
+    fn the_label_hash_is_still_there_for_receipts() {
+        // Receipts identify which run filed them, so hashing a label is right
+        // there; it was only ever wrong as the resume guard.
+        assert_ne!(plan_digest(b"realm-0-1-verify-500"), plan_digest(b"realm-0-1-verify-501"));
+    }
 }
