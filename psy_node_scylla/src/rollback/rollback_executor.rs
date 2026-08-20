@@ -1248,14 +1248,29 @@ impl ScyllaRollbackExecutor {
 /// commit path, which is precisely the state a crashed rollback does *not*
 /// leave behind.
 ///
-/// Compiled only into debug builds.  A release binary has no way to be asked to
+/// Compiled only into debug builds and into a release built with
+/// `rollback-fault-injection`.  A production binary has no way to be asked to
 /// abort in the middle of a rollback, whatever its environment says.
 fn crash_here_if_asked(variable: &str, kind: CanonicalHeadTransitionKind) {
-    if !cfg!(debug_assertions) {
+    crash_if_named(variable, &format!("{kind:?}"));
+}
+
+/// The mechanism behind both halves of the crash matrix.
+///
+/// The Coordinator names its points by phase transition; the Realm names its
+/// own steps, because it has no transitions of its own -- it follows phases the
+/// Coordinator publishes, and dies between observing one and filing the receipt
+/// that lets the barrier close.
+///
+/// `process::abort` rather than an error or a panic: an error would be handled
+/// and a panic would unwind, running the freeze guard's destructor and thawing
+/// the commit path, which is precisely what a killed node does not do.
+pub(crate) fn crash_if_named(variable: &str, point: &str) {
+    if !(cfg!(debug_assertions) || cfg!(feature = "rollback-fault-injection")) {
         return;
     }
     let Ok(requested) = std::env::var(variable) else { return };
-    if requested != format!("{kind:?}") {
+    if requested != point {
         return;
     }
     eprintln!("[fault injection] {variable}={requested}: aborting inside the rollback");

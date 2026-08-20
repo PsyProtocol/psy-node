@@ -13,6 +13,14 @@ serialize_rkyv = ["dep:rkyv","pser/serialize_rkyv", "parth_core/serialize_rkyv"]
 serialize_speedy = ["dep:speedy", "pser/serialize_speedy", "parth_core/serialize_speedy"]
 serialize_postcard = ["dep:postcard", "pser/serialize_postcard", "parth_core/serialize_postcard"]
 parallel_rayon = ["dep:rayon"]
+# Compiles the rollback fault-injection hooks into a release binary.
+#
+# Off by default and never in `default`: a production node must have no way to
+# be told to abort in the middle of a rollback, whatever its environment says.
+# It exists because the Realm's half of the rollback runs in a processor that is
+# only ever built in release, so `debug_assertions` -- which is how the
+# Coordinator's half is reached from `cargo test` -- cannot reach it.
+rollback-fault-injection = []
 [dependencies]
 rayon = { workspace = true, optional = true }
 postcard = { workspace = true, optional = true }

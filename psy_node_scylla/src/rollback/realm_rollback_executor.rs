@@ -348,6 +348,7 @@ impl ScyllaRealmRollbackExecutor {
         } else {
             None
         };
+        crash_realm_step("BeforeFreezeReceipt");
         view.file_freeze_receipt(&FreezeReceipt::new(
             me,
             plan.head,
@@ -363,8 +364,11 @@ impl ScyllaRealmRollbackExecutor {
         // Waiting for the Coordinator to publish ARCHIVING rather than starting
         // on the strength of having filed a freeze receipt: the freeze barrier
         // is met when *everyone* has filed, and only the Coordinator knows that.
+        crash_realm_step("AfterFreezeReceipt");
         wait_for_phase(view, head, "ARCHIVING", PHASE_ORDINAL_ARCHIVING).await?;
+        crash_realm_step("BeforeArchive");
         let archived_rows = self.archive(plan_id, &plan).await?;
+        crash_realm_step("AfterArchive");
         if archived_rows != planned_rows {
             anyhow::bail!(
                 "archived {archived_rows} of {planned_rows} planned Realm rows; the barrier must \
@@ -389,7 +393,9 @@ impl ScyllaRealmRollbackExecutor {
         // read it off a phase name.  Only DELETING says yes, and DELETING is
         // published only after the Coordinator sealed the archive barrier with
         // the receipt filed just above.
+        crash_realm_step("AfterArchiveReceipt");
         wait_for_phase(view, head, "DELETING", PHASE_ORDINAL_DELETING).await?;
+        crash_realm_step("BeforeDelete");
         let deleted_rows = match fence {
             Some(fence) => self.delete(&plan, fence).await?,
             None => 0,
@@ -610,6 +616,7 @@ impl<Hash: Q256BitHash>
                 report.deleted_rows
             );
         }
+        crash_realm_step("BeforeVerifyReceipt");
         view.file_verify_receipt(&VerifyReceipt::new(
             RollbackParticipant::new(AuthorityScope::Realm {
                 realm_id,
@@ -663,4 +670,17 @@ async fn wait_for_phase<Hash: Q256BitHash>(
         }
         tokio::time::sleep(super::BARRIER_POLL).await;
     }
+}
+
+/// Abort at a named point in a Realm's part of a rollback.
+///
+/// The Realm has no phase transitions of its own to hang a hook on: it observes
+/// the phases the Coordinator publishes and files receipts that let the
+/// barriers close.  So the points are named after what it is about to do, and
+/// the interesting ones are the gaps -- a Realm that dies after observing
+/// DELETING and before filing its verify receipt leaves the Coordinator waiting
+/// on a barrier that can never close, which no Coordinator-side crash can
+/// produce.
+fn crash_realm_step(point: &str) {
+    super::rollback_executor::crash_if_named("PSY_ROLLBACK_REALM_CRASH_AT", point);
 }
