@@ -394,25 +394,18 @@ def attempt_withdraw(user):
 
 SHAPE_TEMPLATE = """use std::prelude::*;
 
-#[derive(Storage)]
-struct Slot {{
-    pub a: Felt,
-    pub b: Felt,
-}}
-
 #[contract]
 #[derive(Storage)]
 struct Contract {{
     pub balance: Felt,
-    pub slots: [Slot; {slots}],
-}}
+{fields}}}
 
 impl ContractRef {{
     #[contract_method]
     pub fn simple_mint_debug(amount: Felt) {{
         let c = ContractRef::new(ContractMetadata::current());
         c.balance += amount;
-    }}
+{writes}    }}
 {extra}}}
 """
 
@@ -424,13 +417,21 @@ EXTRA_METHOD = """
     }}
 """
 
+# The state tree height is ceil_log2(highest slot index a method *writes*),
+# floored at 4 -- see derive_state_tree_height.  A large storage array that
+# nothing touches contributes nothing, which is why a first attempt varying an
+# array from 64 to 131072 slots produced twelve contracts all at height 4.
+# These counts are chosen to land on distinct heights above the floor.
+SLOT_COUNTS = (1, 20, 40, 80, 160, 320)
+
 
 def cmd_shapes(state, args):
     """Compile N distinct contracts.
 
     Two axes are varied because they land in different tables: the storage
-    array size sets `contract_state_tree_height` (genesis contracts sit at 32,
-    the checked-in sample at 4), and the method count changes the function tree.
+    number of slots a method writes sets `contract_state_tree_height` (genesis
+    contracts sit at 32, the checked-in sample at 4), and the method count
+    changes the function tree.
     Deploying the same source from different users already yields distinct
     contract ids -- this exists so the *shapes* differ too, rather than one
     shape repeated a hundred times.
@@ -443,9 +444,7 @@ def cmd_shapes(state, args):
     root.mkdir(parents=True, exist_ok=True)
     built = []
     for index in range(args.count):
-        # 2^(6..17): small enough to compile quickly, spread widely enough that
-        # the derived tree heights are not all the same number.
-        slots = 1 << (6 + index % 12)
+        slots = SLOT_COUNTS[index % len(SLOT_COUNTS)]
         methods = ["simple_mint_debug"] + [f"bump_{i}" for i in range(index % 3)]
         package = root / f"shape_{index:03d}"
         (package / "src").mkdir(parents=True, exist_ok=True)
@@ -453,7 +452,11 @@ def cmd_shapes(state, args):
             f'[package]\nname = "shape_{index:03d}"\ntype = "bin"\nauthors = [""]\n'
         )
         extra = "".join(EXTRA_METHOD.format(index=i) for i in range(index % 3))
-        (package / "src/main.psy").write_text(SHAPE_TEMPLATE.format(slots=slots, extra=extra))
+        fields = "".join(f"    pub f{i}: Felt,\n" for i in range(slots))
+        writes = "".join(f"        c.f{i} += amount;\n" for i in range(slots))
+        (package / "src/main.psy").write_text(
+            SHAPE_TEMPLATE.format(fields=fields, writes=writes, extra=extra)
+        )
         done = subprocess.run(
             [str(dargo), "compile", "--contract-name=ContractRef", "--method-names", *methods],
             cwd=package, capture_output=True, text=True,
@@ -466,7 +469,7 @@ def cmd_shapes(state, args):
             record(state, shape_failed=1)
             continue
         built.append(str(artifact))
-        log(f"shape {index}: {slots} slots, {len(methods)} methods")
+        log(f"shape {index}: {slots} written slots, {len(methods)} methods")
     with _lock:
         state["shapes"] = sorted(set(state.get("shapes", []) + built))
         save(state)
