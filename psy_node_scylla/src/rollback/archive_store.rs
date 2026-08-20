@@ -66,6 +66,17 @@ pub enum ArchiveOutcome {
     /// overwritten: the two disagree about history and only a human can say
     /// which is right.
     Conflict,
+    /// The slot was **already there** and holds different content -- an earlier
+    /// attempt of this same plan archived it, and the live row has moved since
+    /// because that attempt went on to delete and restore it.
+    ///
+    /// Kept apart from `Conflict` because it is not a disagreement about
+    /// history: the stored copy is the one taken before anything was destroyed,
+    /// and it is the copy that must survive.  The Coordinator never sees this,
+    /// because it skips archiving once the barrier is behind it; a Realm
+    /// re-running its own recovery has no phase to skip on and reaches it every
+    /// retry.
+    AlreadyArchivedByAnEarlierAttempt,
 }
 
 /// Copies planned rows into the archive and proves each copy.
@@ -169,7 +180,18 @@ impl ScyllaRollbackArchive {
                 ),
             )
             .await?;
-        let _ = applied;
+        // Whether the conditional applied is what separates "the slot was empty
+        // and this run filled it" from "the slot was already there".  It was
+        // discarded before, and without it a retry cannot tell its own earlier
+        // observation from someone else's contradictory one.
+        let rows = applied.into_rows_result()?;
+        let applied = match rows.column_specs().get_by_name("[applied]") {
+            Some(column) => matches!(
+                rows.single_row::<scylla::value::Row>()?.columns.get(column.0),
+                Some(Some(scylla::value::CqlValue::Boolean(true)))
+            ),
+            None => true,
+        };
 
         // Read back by the full source key, whether or not the conditional
         // applied: an existing slot has to be proven identical, not assumed so.
@@ -196,7 +218,13 @@ impl ScyllaRollbackArchive {
             && stored_image.unwrap_or_default() == image.clone().unwrap_or_default()
             && stored_times.unwrap_or_default() == write_times;
         if !content_matches {
-            return Ok(ArchiveOutcome::Conflict);
+            return Ok(if applied {
+                // We wrote this slot a moment ago and it already reads back
+                // differently, so something else is writing the archive.
+                ArchiveOutcome::Conflict
+            } else {
+                ArchiveOutcome::AlreadyArchivedByAnEarlierAttempt
+            });
         }
         if stored_checkpoint as u64 == checkpoint_id {
             Ok(ArchiveOutcome::Archived)

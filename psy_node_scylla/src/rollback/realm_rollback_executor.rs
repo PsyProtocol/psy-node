@@ -215,9 +215,29 @@ impl ScyllaRealmRollbackExecutor {
                     .await?
                 {
                     ArchiveOutcome::Archived | ArchiveOutcome::AlreadyIdentical => archived += 1,
+                    // An earlier attempt of this same recovery archived the row
+                    // and then deleted and restored it, so the live row has
+                    // moved and cannot match the copy any more.  The copy is
+                    // the one taken before anything was destroyed; keeping it is
+                    // the whole point.  The Coordinator never reaches this
+                    // because it skips archiving once the barrier is behind it
+                    // -- a Realm re-running its own recovery has no phase to
+                    // skip on, and reached it on every retry, once a second,
+                    // for eight hundred and sixteen tries while the chain stood
+                    // still.
+                    ArchiveOutcome::AlreadyArchivedByAnEarlierAttempt => {
+                        tracing::warn!(
+                            table,
+                            height,
+                            "keeping the copy an earlier attempt of this recovery archived; the \
+                             live row has since been rolled back by that attempt"
+                        );
+                        archived += 1;
+                    }
                     ArchiveOutcome::Conflict => anyhow::bail!(
-                        "the Realm archive slot for table {table} at checkpoint {height} already \
-                         holds different content for this plan"
+                        "the Realm archive slot for table {table} at checkpoint {height} was \
+                         written by this run and already reads back differently; something else \
+                         is writing the archive"
                     ),
                 }
             }

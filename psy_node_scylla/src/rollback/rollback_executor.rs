@@ -214,7 +214,12 @@ impl ScyllaRollbackExecutor {
                     .await?
                 {
                     ArchiveOutcome::Archived | ArchiveOutcome::AlreadyIdentical => archived += 1,
-                    ArchiveOutcome::Conflict => anyhow::bail!(
+                    // Fatal on the Coordinator, both of them.  It archives once,
+                    // before the barrier, and skips archiving entirely once the
+                    // barrier is behind it -- so it has no legitimate way to
+                    // meet a slot it filled earlier holding something else.
+                    ArchiveOutcome::AlreadyArchivedByAnEarlierAttempt
+                    | ArchiveOutcome::Conflict => anyhow::bail!(
                         "archive slot for table {table} at checkpoint {height} already holds \
                          different content for this plan; refusing to overwrite it"
                     ),
@@ -1086,7 +1091,8 @@ impl ScyllaRollbackExecutor {
                     .await?
                 {
                     ArchiveOutcome::Archived | ArchiveOutcome::AlreadyIdentical => {}
-                    ArchiveOutcome::Conflict => anyhow::bail!(
+                    ArchiveOutcome::AlreadyArchivedByAnEarlierAttempt
+                    | ArchiveOutcome::Conflict => anyhow::bail!(
                         "an orphaned reward-tag row for pending {pending} is already archived \
                          with different content under this plan"
                     ),
