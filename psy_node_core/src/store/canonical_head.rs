@@ -350,35 +350,41 @@ impl<Hash: Q256BitHash> CanonicalHeadTransition<Hash> {
     /// in, and nothing downstream can tell -- the archive verifies against
     /// itself, the ranges line up, and the corruption only appears when someone
     /// restores from it.
-    /// Replace the plan a not-yet-archiving rollback committed to.
+    /// Replace the plan a rollback committed to, with a reason it may be.
     ///
-    /// The plan is computed before the freeze is published, so participants are
-    /// still writing manifests inside the range while it is being built.  An
-    /// executor that dies before freezing therefore leaves a digest that no
-    /// resume can reproduce -- the range really has grown -- and the resume
-    /// guard, which is right to refuse a plan it did not commit to, refuses
-    /// forever.  Meanwhile the chain will not advance while a rollback is
-    /// active.  Two correct guards, and between them the chain stops for good;
-    /// a crash injected right after StartRollback wedged a live testnet exactly
-    /// this way.
-    ///
-    /// Refreshing is safe only here.  Before the archive barrier not one row
-    /// has been copied or deleted, so there is no partial work a wider plan
-    /// could contradict; from Archiving onward the digest is a commitment and
-    /// the caller must keep refusing.  Head and target are still immovable --
-    /// only the plan may widen under them.
-    pub fn refresh_rollback_plan(
+    /// Two reasons, and they are not interchangeable.  Before the archive
+    /// barrier nothing has been copied, so a wider plan contradicts no work.
+    /// After it, the only acceptable reason is that the plan being adopted is
+    /// the one already in the archive -- which `PlanRefreshReason` can only say
+    /// with a proof the archive itself produced.
+    pub fn refresh_rollback_plan_with(
         expected: StoredCanonicalHead<Hash>,
         request: RollbackRequest<Hash>,
+        reason: PlanRefreshReason,
     ) -> Result<Self, CanonicalHeadModelError> {
         let existing = match expected.rollback_control() {
-            RollbackControlState::Requested(existing) | RollbackControlState::Frozen(existing) => {
-                *existing
-            }
             RollbackControlState::Idle => {
                 return Err(CanonicalHeadModelError::RollbackNotRequested);
             }
-            _ => return Err(CanonicalHeadModelError::RollbackPlanAlreadyCommitted),
+            RollbackControlState::Requested(existing) | RollbackControlState::Frozen(existing) => {
+                *existing
+            }
+            RollbackControlState::Archiving(existing)
+            | RollbackControlState::ArchiveBarrierReady(existing)
+            | RollbackControlState::Deleting(existing)
+            | RollbackControlState::Restoring(existing)
+            | RollbackControlState::Verifying(existing)
+            | RollbackControlState::AllRealmsReady(existing) => match reason {
+                PlanRefreshReason::MatchesTheArchive(proof)
+                    if proof.covers(&request) =>
+                {
+                    *existing
+                }
+                _ => return Err(CanonicalHeadModelError::RollbackPlanAlreadyCommitted),
+            },
+            RollbackControlState::Aborting(_) => {
+                return Err(CanonicalHeadModelError::RollbackPlanAlreadyCommitted);
+            }
         };
         if existing.requested_head() != request.requested_head() {
             return Err(CanonicalHeadModelError::RollbackRequestedHeadMismatch);
@@ -388,7 +394,20 @@ impl<Hash: Q256BitHash> CanonicalHeadTransition<Hash> {
         }
         let control = match expected.rollback_control() {
             RollbackControlState::Requested(_) => RollbackControlState::Requested(request),
-            _ => RollbackControlState::Frozen(request),
+            RollbackControlState::Frozen(_) => RollbackControlState::Frozen(request),
+            RollbackControlState::Archiving(_) => RollbackControlState::Archiving(request),
+            RollbackControlState::ArchiveBarrierReady(_) => {
+                RollbackControlState::ArchiveBarrierReady(request)
+            }
+            RollbackControlState::Deleting(_) => RollbackControlState::Deleting(request),
+            RollbackControlState::Restoring(_) => RollbackControlState::Restoring(request),
+            RollbackControlState::Verifying(_) => RollbackControlState::Verifying(request),
+            RollbackControlState::AllRealmsReady(_) => {
+                RollbackControlState::AllRealmsReady(request)
+            }
+            RollbackControlState::Idle | RollbackControlState::Aborting(_) => {
+                return Err(CanonicalHeadModelError::RollbackNotRequested);
+            }
         };
         Ok(Self {
             kind: CanonicalHeadTransitionKind::RefreshRollbackPlan,
@@ -399,6 +418,17 @@ impl<Hash: Q256BitHash> CanonicalHeadTransition<Hash> {
                 rollback_control: control,
             },
         })
+    }
+
+    /// Replace the plan of a rollback that has not begun archiving.
+    ///
+    /// Kept as the name for the common case; `refresh_rollback_plan_with`
+    /// carries the reasoning and the post-archive case.
+    pub fn refresh_rollback_plan(
+        expected: StoredCanonicalHead<Hash>,
+        request: RollbackRequest<Hash>,
+    ) -> Result<Self, CanonicalHeadModelError> {
+        Self::refresh_rollback_plan_with(expected, request, PlanRefreshReason::NothingArchivedYet)
     }
 
     pub fn begin_rollback_freeze(
@@ -1007,6 +1037,54 @@ fn classify_lwt_observation<Hash: Copy + PartialEq>(
     }
 }
 
+/// Why a rollback in flight may swap the plan it committed to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlanRefreshReason {
+    /// Nothing has been copied yet, so a wider plan contradicts no work. Valid
+    /// only in Requested and Frozen; the transition enforces that.
+    NothingArchivedYet,
+    /// The plan being adopted is the one the archive already holds. This is the
+    /// only thing that makes a swap safe once rows have been copied against a
+    /// plan, and it is a claim about the archive, so only the archive can make
+    /// it.
+    MatchesTheArchive(ArchivedPlanProof),
+}
+
+/// Evidence that every row a plan names is already in the archive.
+///
+/// Carries the range and the row count rather than the rows: the transition
+/// only needs to know the proof is about *this* rollback, and re-checking the
+/// rows here would mean holding the whole plan in the model.
+///
+/// Constructed by the storage layer after reading the archive back. It is a
+/// plain value and nothing stops a caller fabricating one; what stops that
+/// mattering is that there is exactly one caller, and it is the code that does
+/// the reading. The type exists so the transition cannot be reached *by
+/// accident* -- so that "adopt a plan after archiving" always names the archive
+/// in the call that does it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArchivedPlanProof {
+    target: u64,
+    head: u64,
+    rows: usize,
+}
+
+impl ArchivedPlanProof {
+    pub const fn every_row_found(target: u64, head: u64, rows: usize) -> Self {
+        Self { target, head, rows }
+    }
+
+    pub const fn rows(self) -> usize {
+        self.rows
+    }
+
+    /// The proof is about the range this request names.
+    fn covers<Hash>(self, request: &RollbackRequest<Hash>) -> bool {
+        self.target == request.target().checkpoint_id().get()
+            && self.head == request.requested_head().checkpoint_id().get()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CanonicalHeadModelError {
     /// The sealed archive barrier describes a different range than this
@@ -1588,6 +1666,87 @@ mod tests {
             ),
             Err(CanonicalHeadModelError::RollbackRequestedHeadMismatch)
         );
+    }
+
+    #[test]
+    fn a_plan_may_be_swapped_before_archiving_on_no_evidence_at_all() {
+        // Nothing has been copied, so there is nothing a wider plan could
+        // contradict.  This is the case that used to wedge the chain: refusing
+        // it is refusing forever, because the chain will not advance while a
+        // rollback is published.
+        let head = canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 10, 50);
+        let target = *canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 7, 40).checkpoint();
+        let request = rollback_request(*head.checkpoint(), target);
+        let requested = *CanonicalHeadTransition::start_rollback(stored_for_test(head), request)
+            .unwrap()
+            .candidate();
+
+        let wider = request.with_plan_digest(RollbackPlanDigest::try_new([9; 32]).unwrap());
+        let refreshed =
+            CanonicalHeadTransition::refresh_rollback_plan(requested, wider).unwrap();
+        assert_eq!(
+            refreshed.candidate().rollback_control().requested().unwrap().plan_digest(),
+            RollbackPlanDigest::try_new([9; 32]).unwrap()
+        );
+    }
+
+    #[test]
+    fn after_archiving_a_plan_may_only_be_swapped_for_one_the_archive_holds() {
+        // Rows have been copied against a plan by now, so a different plan
+        // could delete beyond what was copied.  Only evidence about the archive
+        // gets past this, and only evidence about *this* range.
+        let head = canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 10, 50);
+        let target = *canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 7, 40).checkpoint();
+        let request = rollback_request(*head.checkpoint(), target);
+        let requested = *CanonicalHeadTransition::start_rollback(stored_for_test(head), request)
+            .unwrap()
+            .candidate();
+        let frozen_head = frozen(&requested);
+        let archiving = *CanonicalHeadTransition::begin_rollback_archive(
+            frozen_head,
+            freeze_barrier_for(&frozen_head),
+        )
+        .unwrap()
+        .candidate();
+
+        let wider = request.with_plan_digest(RollbackPlanDigest::try_new([9; 32]).unwrap());
+
+        assert_eq!(
+            CanonicalHeadTransition::refresh_rollback_plan(archiving, wider).unwrap_err(),
+            CanonicalHeadModelError::RollbackPlanAlreadyCommitted,
+            "no evidence is not enough once rows have been copied"
+        );
+
+        let about_another_range = PlanRefreshReason::MatchesTheArchive(
+            ArchivedPlanProof::every_row_found(1, 2, 500),
+        );
+        assert_eq!(
+            CanonicalHeadTransition::refresh_rollback_plan_with(
+                archiving,
+                wider,
+                about_another_range,
+            )
+            .unwrap_err(),
+            CanonicalHeadModelError::RollbackPlanAlreadyCommitted,
+            "a proof about some other range proves nothing about this one"
+        );
+
+        // Head 10, target 7 -- the third argument of `canonical_ref` is the
+        // checkpoint, not the hash seed.
+        let about_this_range = PlanRefreshReason::MatchesTheArchive(
+            ArchivedPlanProof::every_row_found(7, 10, 500),
+        );
+        let adopted = CanonicalHeadTransition::refresh_rollback_plan_with(
+            archiving,
+            wider,
+            about_this_range,
+        )
+        .expect("the archive holds this plan");
+        // The phase is carried through: adopting a plan is not progress.
+        assert!(matches!(
+            adopted.candidate().rollback_control(),
+            RollbackControlState::Archiving(_)
+        ));
     }
 
     #[test]

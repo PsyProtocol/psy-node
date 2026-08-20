@@ -239,6 +239,51 @@ impl ScyllaRollbackArchive {
         Ok(out)
     }
 
+    /// Every `(table, locator)` the archive holds in a range, whatever plan put
+    /// it there.
+    ///
+    /// Without the checkpoint, because the archive keeps **one row per key**:
+    /// a slot several checkpoints reached keeps the first one, which is the
+    /// value a restore needs. Including the height here reported every
+    /// singleton as missing on its second visit -- twenty rows of LatestInfo
+    /// and U64Singleton out of 2904, one per checkpoint past the first.
+    ///
+    /// Deliberately not filtered by plan id.  The question a resume needs
+    /// answered is whether these rows were archived, not who archived them --
+    /// and the plan id is caller-supplied, so keying on it is what let one run
+    /// archive under `acceptance-6971-6961` and its own resume look under
+    /// `acceptance-6972-6961` and find nothing.
+    ///
+    /// This scans, because the archive is partitioned by plan id and nothing
+    /// indexes the checkpoint. That is affordable only because it runs on the
+    /// resume path after a digest mismatch, which is rare, and never during a
+    /// commit.
+    pub async fn rows_in_range(
+        &self,
+        target: u64,
+        head: u64,
+    ) -> anyhow::Result<std::collections::HashSet<(i16, Vec<u8>)>> {
+        let rows = self
+            .session
+            .query_unpaged(
+                format!(
+                    "SELECT source_kind, locator FROM \
+                     {}.{ROLLBACK_ARCHIVE_TABLE} WHERE checkpoint_id > ? AND checkpoint_id <= ? \
+                     ALLOW FILTERING",
+                    self.keyspace
+                ),
+                (target as i64, head as i64),
+            )
+            .await?
+            .into_rows_result()?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows.rows::<(i16, Vec<u8>)>()? {
+            let (source_kind, locator) = row?;
+            out.insert((source_kind, locator));
+        }
+        Ok(out)
+    }
+
     /// How many rows one plan holds, across every table it touched.
     pub async fn row_count(&self, plan_id: &[u8]) -> anyhow::Result<i64> {
         let count = self

@@ -29,8 +29,8 @@ use scylla::client::session::Session;
 use psy_data::protocol::chain_context::AuthorityScope;
 use psy_node_core::store::authority_commit::{AuthorityTimestampKey, AuthorityTimestampReadState};
 use psy_node_core::store::canonical_head::{
-    CanonicalHeadReadState, CanonicalHeadTransition, CanonicalHeadTransitionKind,
-    StoredCanonicalHead,
+    ArchivedPlanProof, CanonicalHeadReadState, CanonicalHeadTransition,
+    CanonicalHeadTransitionKind, PlanRefreshReason, StoredCanonicalHead,
 };
 use psy_node_core::store::rollback_control::RollbackControlState;
 use psy_node_core::store::rollback_control::{
@@ -417,6 +417,69 @@ impl ScyllaRollbackExecutor {
     ///
     /// What the archive observes afterwards is then a cross-check rather than the
     /// source -- see `verify_archive_under_fence`.
+    /// Decide on what grounds a resumed run may adopt the plan it just rebuilt.
+    ///
+    /// Before the archive barrier the grounds are simply that nothing has been
+    /// copied. The plan is built before FROZEN is published, so participants
+    /// keep writing manifests into the range while it is being built, and a run
+    /// that dies in Requested or Frozen leaves a digest no resume can reproduce
+    /// because the range really did grow. Refusing there is a refusal forever,
+    /// and the chain does not advance while a rollback is published -- a crash
+    /// injected right after StartRollback stopped a live testnet exactly so.
+    ///
+    /// After it, the grounds have to be about the archive, because rows have
+    /// been copied against a plan and a different plan could delete beyond what
+    /// was copied. So the check is the direct one: **is every row this plan
+    /// names already in the archive?** If it is, this is the plan that was
+    /// archived, whatever digest was recorded for it, and finishing with it
+    /// deletes nothing that was not copied first.
+    ///
+    /// That is a stronger question than the digest ever answered, and it is
+    /// deliberately asked of the archive rather than of a plan id: the id is
+    /// caller-supplied, and keying on it is what let one run archive under
+    /// `acceptance-6971-6961` while its own resume looked under
+    /// `acceptance-6972-6961`.
+    async fn why_this_plan_may_be_adopted<Hash: Q256BitHash>(
+        &self,
+        stored: &StoredCanonicalHead<Hash>,
+        plan: &RollbackPlan<Hash>,
+    ) -> anyhow::Result<PlanRefreshReason> {
+        if stored.rollback_control().phase_ordinal() < PHASE_ORDINAL_ARCHIVING {
+            return Ok(PlanRefreshReason::NothingArchivedYet);
+        }
+        let archived = self.archive.rows_in_range(plan.target, plan.head).await?;
+        let mut found = 0usize;
+        let mut missing = Vec::new();
+        for checkpoint in &plan.checkpoints {
+            let height = checkpoint.checkpoint_id();
+            for (table, locator) in &checkpoint.rows {
+                if archived.contains(&(*table as i16, locator.clone())) {
+                    found += 1;
+                } else if missing.len() < 4 {
+                    missing.push(format!("{table} at c={height}"));
+                }
+            }
+        }
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "this resume rebuilt a plan the archive does not hold: {} of {} rows are \
+                 missing, first {:?}; the interrupted run archived a different range and \
+                 finishing with this one would delete rows nothing copied",
+                plan.row_count() - found,
+                plan.row_count(),
+                missing
+            );
+        }
+        tracing::warn!(
+            rows = found,
+            "adopting the plan this resume rebuilt: every row it names is already in the \
+             archive, so it is the plan the interrupted run was working from"
+        );
+        Ok(PlanRefreshReason::MatchesTheArchive(
+            ArchivedPlanProof::every_row_found(plan.target, plan.head, found),
+        ))
+    }
+
     async fn fence_window_from_allocator<Hash: Q256BitHash>(
         &self,
         recording: &CoordinatorCommitRecording<Hash>,
@@ -565,24 +628,23 @@ impl ScyllaRollbackExecutor {
                 let recomputed = RollbackPlanDigest::try_new(plan_contents_digest(&plan))?;
                 let mut existing = existing;
                 if existing.plan_digest() != recomputed {
+                    let reason = self.why_this_plan_may_be_adopted(&stored, &plan).await?;
                     let refreshed = existing.with_plan_digest(recomputed);
                     stored = self
                         .advance(
                             recording,
-                            CanonicalHeadTransition::refresh_rollback_plan(stored, refreshed)
-                                .map_err(|error| {
-                                    anyhow::anyhow!(
-                                        "the plan recomputed for this resume does not match the \
-                                         one the interrupted rollback committed to, and it is \
-                                         too late to adopt it: {error}"
-                                    )
-                                })?,
+                            CanonicalHeadTransition::refresh_rollback_plan_with(
+                                stored, refreshed, reason,
+                            )
+                            .map_err(|error| {
+                                anyhow::anyhow!(
+                                    "the plan recomputed for this resume does not match the one \
+                                     the interrupted rollback committed to, and it is too late \
+                                     to adopt it: {error}"
+                                )
+                            })?,
                         )
                         .await?;
-                    tracing::warn!(
-                        "resuming with a plan recomputed after the interrupted run; nothing had \
-                         been archived, so the wider range is adopted rather than refused"
-                    );
                     existing = refreshed;
                 }
                 let window = existing.fence_window();
