@@ -45,8 +45,14 @@ while true; do
   if [ -z "$USERID" ]; then say "round $round: user id never landed"; continue; fi
   say "round $round: user_id=$USERID"
 
-  if timeout 500 $CLI deploy-contract --rpc-config "$CFG" --sign-type secp256k1 \
-       -p "$KEY" --contract-path "$CONTRACT" >> "$OUT" 2>&1; then
+  # --is-deploy is what submits it.  Without the flag the subcommand generates
+  # the circuits locally and returns success having sent nothing, so 1292
+  # consecutive "deploy ok" lines coexisted with a chain whose only contracts
+  # were the six from genesis -- and contract_leaf, contract_code_definition,
+  # contract_state_tree_height and contract_function_tree were never written
+  # inside a rollback window, so no rollback ever archived one.
+  if timeout 900 $CLI deploy-contract --rpc-config "$CFG" --sign-type secp256k1 \
+       -p "$KEY" --contract-path "$CONTRACT" --is-deploy >> "$OUT" 2>&1; then
     say "round $round: deploy ok"
   else
     say "round $round: deploy FAILED"
