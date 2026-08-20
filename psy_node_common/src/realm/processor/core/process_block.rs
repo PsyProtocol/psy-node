@@ -274,13 +274,33 @@ where
         tracing::info!("GUTA jobs completed!");
 
         // 5. Retrieve Proof
-        let root_job_proof = self
-            .db
-            .proof_store
-            .get_proof_bytes_by_job_id(root_job_id, self.db.state.processing_unique_pending_id)
-            .await?;
+        //
+        // Retried, because "the jobs are complete" and "the proof is readable"
+        // are not the same instant.  This Realm declared the proof missing 923ms
+        // before the worker's submission landed, treated it as fatal, and sat
+        // dead for four hours while the chain ran on -- the proof it wanted was
+        // in the store the whole time, just not yet.
+        //
+        // Bounded, so a proof that genuinely never arrives still stops the
+        // block rather than being waited on forever.
+        let mut root_job_proof = None;
+        let proof_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            root_job_proof = self
+                .db
+                .proof_store
+                .get_proof_bytes_by_job_id(root_job_id, self.db.state.processing_unique_pending_id)
+                .await?;
+            if root_job_proof.is_some() || std::time::Instant::now() >= proof_deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
         if root_job_proof.is_none() {
-            anyhow::bail!("No proof found for root GUTA job id: {:?}", root_job_id);
+            anyhow::bail!(
+                "No proof found for root GUTA job id after waiting 30s: {:?}",
+                root_job_id
+            );
         }
         let root_job_proof = root_job_proof.unwrap();
         timer.lap("get_root_job_proof");
