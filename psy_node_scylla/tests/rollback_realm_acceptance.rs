@@ -89,6 +89,10 @@ async fn witnesses_first_touch(
     reader: &ScyllaRowImageReader,
     target: u64,
     head: u64,
+    // Checkpoint heights are reused after a rollback, so a height carries an
+    // observation per branch that ever reached it. Reading them together
+    // compares this branch against one that no longer exists.
+    chain_epoch: u64,
 ) -> anyhow::Result<Vec<Witness>> {
     let mut first: BTreeMap<Vec<u8>, Witness> = BTreeMap::new();
     for checkpoint in (target + 1)..=head {
@@ -96,9 +100,10 @@ async fn witnesses_first_touch(
             .query_unpaged(
                 format!(
                     "SELECT locator, before_image, before_present FROM \
-                     {keyspace}.rollback_verification_journal WHERE checkpoint_id = ?"
+                     {keyspace}.rollback_verification_journal_by_epoch \
+                     WHERE checkpoint_id = ? AND chain_epoch = ?"
                 ),
-                (checkpoint as i64,),
+                (checkpoint as i64, chain_epoch as i64),
             )
             .await?
             .into_rows_result()?;
@@ -179,7 +184,29 @@ async fn a_realm_rollback_restores_exactly_what_was_observed_before() -> anyhow:
     let executor =
         ScyllaRealmRollbackExecutor::prepare(session.clone(), &keyspace, &no_tablet).await?;
 
-    let witnesses = witnesses_first_touch(&session, &keyspace, &reader, target, head).await?;
+    // Taken from the Realm's own manifest at the head, not assumed. This was
+    // `ChainEpoch::new(0)` below, written when the chain had never rolled back;
+    // on a chain at epoch 49 it planned against a partition that by
+    // construction holds nothing.
+    let chain_epoch: u64 = session
+        .query_unpaged(
+            format!(
+                "SELECT chain_epoch FROM {no_tablet}.authority_manifest \
+                 WHERE network_chain_id = ? AND checkpoint_id = ? ALLOW FILTERING"
+            ),
+            (network().chain_id() as i64, head as i64),
+        )
+        .await?
+        .into_rows_result()?
+        .rows::<(i64,)>()?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|(epoch,)| epoch as u64)
+        .max()
+        .expect("the head this Realm committed has a manifest");
+    println!("Realm branch: chain_epoch {chain_epoch}");
+    let witnesses =
+        witnesses_first_touch(&session, &keyspace, &reader, target, head, chain_epoch).await?;
     assert!(
         !witnesses.is_empty(),
         "the journal recorded nothing for this Realm's discarded range; run the chain with \
@@ -191,7 +218,7 @@ async fn a_realm_rollback_restores_exactly_what_was_observed_before() -> anyhow:
     // is built from the same coordinate the Coordinator's manifests name.
     let head_ref = CanonicalChainRef::new(
         network(),
-        ChainEpoch::new(0),
+        ChainEpoch::new(chain_epoch),
         CheckpointRef::new(
             CheckpointId::new(head),
             CheckpointHash::from_last_chain_hash(PHash::from_values(0, 0, 0, 0)),
