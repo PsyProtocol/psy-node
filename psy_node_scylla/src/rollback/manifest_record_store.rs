@@ -23,7 +23,10 @@ use std::{error::Error, fmt, sync::Arc};
 use parth_core::protocol::core_types::Q256BitHash;
 use psy_data::protocol::chain_context::AuthorityScope;
 use psy_node_core::store::{
-    manifest_lifecycle::{CommittedAuthorityManifest, SealedAuthorityManifest},
+    manifest_lifecycle::{
+        CommittedAuthorityManifest, MANIFEST_REVISION_COMMITTED, MANIFEST_REVISION_SEALED,
+        SealedAuthorityManifest,
+    },
     manifest_store::{AuthorityManifestStore, PersistedManifestRow},
     manifest_record::{
         AUTHORITY_MANIFEST_CHECKPOINT_BUCKET_SIZE, AuthorityManifestIdentity,
@@ -153,6 +156,7 @@ pub struct ManifestQueries {
     pub insert_row: String,
     pub read_row: String,
     pub read_range: String,
+    pub replace_row: String,
 }
 
 impl ManifestQueries {
@@ -184,6 +188,15 @@ impl ManifestQueries {
                  WHERE network_chain_id = ? AND authority_scope = ? AND chain_epoch = ? \
                  AND checkpoint_bucket = ? AND checkpoint_id > ? AND checkpoint_id <= ?"
             ),
+            // No IF NOT EXISTS.  Used for one case only -- replacing a PREPARED
+            // row belonging to an attempt that was abandoned before it sealed --
+            // and `replace_abandoned_prepared_row` is what establishes that the
+            // case holds before this is ever sent.
+            replace_row: format!(
+                "INSERT INTO {table} (network_chain_id, authority_scope, chain_epoch, \
+                 checkpoint_bucket, checkpoint_id, revision, status, digest, payload) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            ),
         }
     }
 }
@@ -191,6 +204,7 @@ impl ManifestQueries {
 pub struct ScyllaAuthorityManifestStore {
     session: Arc<Session>,
     insert_row: PreparedStatement,
+    replace_row: PreparedStatement,
     read_row: PreparedStatement,
     read_range: PreparedStatement,
 }
@@ -227,9 +241,12 @@ impl ScyllaAuthorityManifestStore {
         read_row.set_consistency(Consistency::Quorum);
         let mut read_range = session.prepare(queries.read_range).await?;
         read_range.set_consistency(Consistency::Quorum);
+        let mut replace_row = session.prepare(queries.replace_row).await?;
+        replace_row.set_consistency(Consistency::Quorum);
         Ok(Self {
             session,
             insert_row,
+            replace_row,
             read_row,
             read_range,
         })
@@ -340,14 +357,115 @@ impl ScyllaAuthorityManifestStore {
         &self,
         prepared: &PreparedAuthorityManifestRecord<Hash>,
     ) -> anyhow::Result<()> {
-        self.append_row(
-            prepared.identity(),
-            prepared.revision(),
-            prepared.status(),
-            prepared.digest().as_bytes(),
-            prepared.encode_canonical(),
-        )
-        .await
+        let outcome = self
+            .append_row(
+                prepared.identity(),
+                prepared.revision(),
+                prepared.status(),
+                prepared.digest().as_bytes(),
+                prepared.encode_canonical(),
+            )
+            .await;
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(error) => match error.downcast_ref::<ManifestStoreError>() {
+                Some(ManifestStoreError::Conflict { .. }) => {
+                    self.replace_abandoned_prepared_row(prepared, error).await
+                }
+                _ => Err(error),
+            },
+        }
+    }
+
+    /// Retry a checkpoint whose previous attempt died before it sealed.
+    ///
+    /// A commit writes PREPARED, then the hot tables, then SEALED and COMMITTED,
+    /// and only then advances the canonical head.  So a checkpoint holding
+    /// PREPARED and nothing above it is an attempt **nobody ever saw**: the head
+    /// never reached it, and by construction cannot have.  Replacing that row is
+    /// not a fork, because a fork needs two published histories and this one was
+    /// never published.
+    ///
+    /// Refusing it is what a live chain cannot afford.  A Scylla LWT timeout on
+    /// the canonical head left exactly this state on the testnet -- PREPARED at
+    /// 6941 written one second before the timeout, head still at 6940 -- and the
+    /// restarted Coordinator re-planned the block, got different bytes (a fresh
+    /// lease timestamp, and whatever transactions had arrived since), and parked
+    /// itself in Error. One crash in that window, and the chain never produces
+    /// again.
+    ///
+    /// The bytes differing is not a symptom to fix: a checkpoint's content is
+    /// not settled until it commits, so a re-planned attempt *should* differ.
+    ///
+    /// Only PREPARED, and only when SEALED and COMMITTED are both absent. Once
+    /// SEALED exists the commit progressed past the point where the head may
+    /// have moved, and the conflict is a real one that must still stop the node.
+    async fn replace_abandoned_prepared_row<Hash: Q256BitHash>(
+        &self,
+        prepared: &PreparedAuthorityManifestRecord<Hash>,
+        conflict: anyhow::Error,
+    ) -> anyhow::Result<()> {
+        let identity = prepared.identity();
+        let checkpoint_id = identity.checkpoint().checkpoint_id().get();
+        let partition = Self::partition(identity);
+
+        let stored = self
+            .read_row(&partition, checkpoint_id, prepared.revision())
+            .await?;
+        let stored_is_prepared = matches!(
+            stored.as_ref().map(|row| row.status),
+            Some(AuthorityManifestStatus::Prepared)
+        );
+        if !stored_is_prepared {
+            return Err(conflict);
+        }
+        for later in [MANIFEST_REVISION_SEALED, MANIFEST_REVISION_COMMITTED] {
+            let Ok(revision) = ManifestRevision::try_new(later) else {
+                return Err(conflict);
+            };
+            if self
+                .read_row(&partition, checkpoint_id, revision)
+                .await?
+                .is_some()
+            {
+                return Err(conflict);
+            }
+        }
+
+        tracing::warn!(
+            checkpoint_id,
+            "replacing the PREPARED manifest of an attempt that never sealed; the previous \
+             Coordinator died between preparing this checkpoint and publishing it, so nothing \
+             ever observed the content being replaced"
+        );
+        let payload = prepared.encode_canonical();
+        let digest = prepared.digest();
+        let digest = digest.as_bytes();
+        self.session
+            .execute_unpaged(
+                &self.replace_row,
+                (
+                    partition.network_chain_id,
+                    partition.authority_scope.clone(),
+                    partition.chain_epoch,
+                    partition.checkpoint_bucket,
+                    checkpoint_id as i64,
+                    prepared.revision().as_i64(),
+                    prepared.status() as i8,
+                    digest.to_vec(),
+                    payload.to_vec(),
+                ),
+            )
+            .await?;
+        // Read back for the same reason the first write does: a replace that did
+        // not take must not be reported as a retry that succeeded.
+        match self
+            .read_row(&partition, checkpoint_id, prepared.revision())
+            .await?
+        {
+            Some(row) if row.digest == digest && row.payload == payload => Ok(()),
+            _ => Err(conflict),
+        }
     }
 
     async fn append_sealed_row<Hash: Q256BitHash>(
@@ -494,6 +612,39 @@ mod tests {
     fn manifest_rows_require_a_no_tablet_keyspace() {
         assert!(ManifestNoTabletKeyspace::try_new("psy").is_err());
         assert!(ManifestNoTabletKeyspace::try_new("psy_no_tablet").is_ok());
+    }
+
+    #[test]
+    fn the_replace_statement_is_unconditional_and_the_normal_one_is_not() {
+        // The two differ only in IF NOT EXISTS, and which one a write uses is
+        // the whole safety argument.  Asserted here because a copy-paste that
+        // dropped the condition from `insert_row` would turn every manifest
+        // write into an overwrite and nothing else would notice.
+        let queries = ManifestQueries::new(&keyspace());
+        assert!(queries.insert_row.ends_with("IF NOT EXISTS"));
+        assert!(!queries.replace_row.contains("IF NOT EXISTS"));
+        assert!(queries.replace_row.starts_with("INSERT INTO"));
+    }
+
+    #[test]
+    fn the_stage_revisions_match_the_stage_machine() {
+        // `replace_abandoned_prepared_row` decides whether a checkpoint sealed
+        // by probing these two revisions directly.  If the stage machine ever
+        // moved SEALED off 1, that probe would look at an empty row and happily
+        // replace a manifest the chain had already published.
+        use psy_node_core::store::manifest_lifecycle::AuthorityManifestLifecyclePhase;
+        assert_eq!(
+            AuthorityManifestLifecyclePhase::Sealed.revision().get(),
+            MANIFEST_REVISION_SEALED
+        );
+        assert_eq!(
+            AuthorityManifestLifecyclePhase::Committed.revision().get(),
+            MANIFEST_REVISION_COMMITTED
+        );
+        assert_eq!(
+            AuthorityManifestLifecyclePhase::Prepared.revision(),
+            ManifestRevision::prepared()
+        );
     }
 
     #[test]

@@ -130,17 +130,26 @@ impl AuthorityManifestLifecyclePhase {
     pub const fn revision(self) -> ManifestRevision {
         match self {
             Self::Prepared => ManifestRevision::prepared(),
-            Self::Sealed => match ManifestRevision::try_new(1) {
+            Self::Sealed => match ManifestRevision::try_new(MANIFEST_REVISION_SEALED) {
                 Ok(revision) => revision,
                 Err(_) => unreachable!(),
             },
-            Self::Committed => match ManifestRevision::try_new(2) {
+            Self::Committed => match ManifestRevision::try_new(MANIFEST_REVISION_COMMITTED) {
                 Ok(revision) => revision,
                 Err(_) => unreachable!(),
             },
         }
     }
 }
+
+/// The revision each lifecycle stage occupies.
+///
+/// Named beside the match that assigns them so a caller asking "has this
+/// checkpoint sealed yet?" cannot end up with a different idea of the numbers
+/// than the stage machine has. The revision is a **stage**, not a retry
+/// counter: a second attempt at the same checkpoint writes revision 0 again.
+pub const MANIFEST_REVISION_SEALED: u64 = 1;
+pub const MANIFEST_REVISION_COMMITTED: u64 = 2;
 
 /// Exact authority head used by the lifecycle model. It deliberately excludes
 /// mutable operational namespaces; those rotate under the Processor guard.
