@@ -49,7 +49,13 @@ use super::{ScyllaRowImageReader, decode_locator_canonical};
 ///
 /// Its own table, in the state keyspace: it is dropped wholesale between runs and
 /// never enters production capacity planning (§2.2.2).
-pub const VERIFICATION_JOURNAL_TABLE: &str = "rollback_verification_journal";
+// Renamed alongside the schema change that added chain_epoch to the key.  The
+// old table cannot be altered into this shape -- a primary key is immutable --
+// and keeping the old name would have this code read rows written without an
+// epoch and silently treat them as belonging to whichever epoch it asked for.
+// A chain that upgrades starts with an empty journal and fails closed on any
+// range recorded only in the old one, which is the safe direction.
+pub const VERIFICATION_JOURNAL_TABLE: &str = "rollback_verification_journal_by_epoch";
 
 /// Records before/after images for the keys one commit writes.
 pub struct ScyllaVerificationJournal {
@@ -80,9 +86,10 @@ impl psy_node_core::store::verification_journal::CommitVerificationJournal
     async fn rewritten_before_images(
         &self,
         checkpoint_id: u64,
+        chain_epoch: u64,
     ) -> anyhow::Result<Vec<(u16, Vec<u8>, Vec<u8>)>> {
         Ok(self
-            .entries_for(checkpoint_id)
+            .entries_for(checkpoint_id, chain_epoch)
             .await?
             .into_iter()
             .filter_map(|entry| {
@@ -112,17 +119,19 @@ impl psy_node_core::store::verification_journal::CommitVerificationJournal
     async fn record_before(
         &self,
         checkpoint_id: u64,
+        chain_epoch: u64,
         planned: &[(u16, Vec<u8>)],
     ) -> anyhow::Result<()> {
-        ScyllaVerificationJournal::record_before(self, checkpoint_id, planned).await
+        ScyllaVerificationJournal::record_before(self, checkpoint_id, chain_epoch, planned).await
     }
 
     async fn record_after(
         &self,
         checkpoint_id: u64,
+        chain_epoch: u64,
         planned: &[(u16, Vec<u8>)],
     ) -> anyhow::Result<()> {
-        ScyllaVerificationJournal::record_after(self, checkpoint_id, planned).await
+        ScyllaVerificationJournal::record_after(self, checkpoint_id, chain_epoch, planned).await
     }
 }
 
@@ -133,6 +142,7 @@ impl ScyllaVerificationJournal {
                 format!(
                     "CREATE TABLE IF NOT EXISTS {keyspace}.{VERIFICATION_JOURNAL_TABLE} (
                         checkpoint_id BIGINT,
+                        chain_epoch BIGINT,
                         physical_table SMALLINT,
                         locator BLOB,
                         before_image BLOB,
@@ -140,7 +150,7 @@ impl ScyllaVerificationJournal {
                         before_version BIGINT,
                         after_image BLOB,
                         after_present BOOLEAN,
-                        PRIMARY KEY ((checkpoint_id), physical_table, locator)
+                        PRIMARY KEY ((checkpoint_id), chain_epoch, physical_table, locator)
                     )"
                 ),
                 &[],
@@ -155,15 +165,15 @@ impl ScyllaVerificationJournal {
         let write_before = session
             .prepare(format!(
                 "INSERT INTO {keyspace}.{VERIFICATION_JOURNAL_TABLE} \
-                 (checkpoint_id, physical_table, locator, before_image, before_present, \
-                  before_version) VALUES (?, ?, ?, ?, ?, ?)"
+                 (checkpoint_id, chain_epoch, physical_table, locator, before_image, \
+                  before_present, before_version) VALUES (?, ?, ?, ?, ?, ?, ?)"
             ))
             .await?;
         let write_after = session
             .prepare(format!(
                 "INSERT INTO {keyspace}.{VERIFICATION_JOURNAL_TABLE} \
-                 (checkpoint_id, physical_table, locator, after_image, after_present) \
-                 VALUES (?, ?, ?, ?, ?)"
+                 (checkpoint_id, chain_epoch, physical_table, locator, after_image, \
+                  after_present) VALUES (?, ?, ?, ?, ?, ?)"
             ))
             .await?;
         Ok(Self {
@@ -184,6 +194,7 @@ impl ScyllaVerificationJournal {
     pub async fn record_before(
         &self,
         checkpoint_id: u64,
+        chain_epoch: u64,
         planned: &[(u16, Vec<u8>)],
     ) -> anyhow::Result<()> {
         // The state as a production read saw it just before this commit.  For a
@@ -191,7 +202,7 @@ impl ScyllaVerificationJournal {
         // reading at `c` would find this commit's own row once it lands, and
         // reading a sparse table at `c` beforehand would find nothing at all.
         let previous = checkpoint_id.saturating_sub(1);
-        self.record_pass(checkpoint_id, planned, previous, true)
+        self.record_pass(checkpoint_id, chain_epoch, planned, previous, true)
             .await
     }
 
@@ -204,15 +215,17 @@ impl ScyllaVerificationJournal {
     pub async fn record_after(
         &self,
         checkpoint_id: u64,
+        chain_epoch: u64,
         planned: &[(u16, Vec<u8>)],
     ) -> anyhow::Result<()> {
-        self.record_pass(checkpoint_id, planned, checkpoint_id, false)
+        self.record_pass(checkpoint_id, chain_epoch, planned, checkpoint_id, false)
             .await
     }
 
     async fn record_pass(
         &self,
         checkpoint_id: u64,
+        chain_epoch: u64,
         planned: &[(u16, Vec<u8>)],
         as_of: u64,
         is_before: bool,
@@ -245,6 +258,7 @@ impl ScyllaVerificationJournal {
                 batch.append_statement(statement.clone());
                 let mut row = vec![
                     scylla::value::CqlValue::BigInt(checkpoint_id as i64),
+                    scylla::value::CqlValue::BigInt(chain_epoch as i64),
                     scylla::value::CqlValue::SmallInt(*physical_table as i16),
                     scylla::value::CqlValue::Blob(locator.clone()),
                     match &bytes {
@@ -269,8 +283,20 @@ impl ScyllaVerificationJournal {
         Ok(())
     }
 
-    /// Every observation recorded for one checkpoint.
-    pub async fn entries_for(&self, checkpoint_id: u64) -> anyhow::Result<Vec<JournalEntry>> {
+    /// Every observation recorded for one checkpoint **on one branch**.
+    ///
+    /// The epoch is not optional.  Checkpoint heights are reused after a
+    /// rollback, so a height that has been discarded three times carries four
+    /// branches' observations, and reading them together compares this branch's
+    /// state against a branch that no longer exists.  That is how a rollback
+    /// came to restore RealmRewardsTreeNodeKey rows belonging to a discarded
+    /// branch -- the table has no version axis, so its rows are restored from
+    /// exactly these observations.
+    pub async fn entries_for(
+        &self,
+        checkpoint_id: u64,
+        chain_epoch: u64,
+    ) -> anyhow::Result<Vec<JournalEntry>> {
         let table = format!("{}.{VERIFICATION_JOURNAL_TABLE}", self.keyspace);
         let rows = self
             .session
@@ -278,9 +304,9 @@ impl ScyllaVerificationJournal {
                 format!(
                     "SELECT physical_table, locator, before_image, before_present, \
                      before_version, after_image, after_present FROM {table} \
-                     WHERE checkpoint_id = ?"
+                     WHERE checkpoint_id = ? AND chain_epoch = ?"
                 ),
-                (checkpoint_id as i64,),
+                (checkpoint_id as i64, chain_epoch as i64),
             )
             .await?
             .into_rows_result()?;

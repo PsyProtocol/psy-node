@@ -261,6 +261,12 @@ impl ScyllaRollbackExecutor {
         plan: &RollbackPlan<Hash>,
         target: u64,
         fence: DeleteFenceTimestampUs,
+        // The epoch the discarded range was produced under, not the one this
+        // rollback opened.  Checkpoint heights are reused, so a height that has
+        // been rolled back before carries observations from every branch that
+        // ever reached it, and restoring without naming the branch writes back
+        // rows belonging to a chain that no longer exists.
+        discarded_epoch: u64,
     ) -> anyhow::Result<usize> {
         let Some(journal) = recording.journal() else {
             // Fail closed.  Without the journal there is no way to tell a row the
@@ -280,7 +286,9 @@ impl ScyllaRollbackExecutor {
         for checkpoint in (target + 1)..=plan.head {
             // Only rows that existed before their commit come back; the rest
             // were created by the discarded range and the delete stands.
-            for (_, locator, before) in journal.rewritten_before_images(checkpoint).await? {
+            for (_, locator, before) in journal
+                .rewritten_before_images(checkpoint, discarded_epoch)
+                .await? {
                 let Ok(resolved) = super::decode_locator_canonical(&locator) else {
                     continue;
                 };
@@ -819,7 +827,13 @@ impl ScyllaRollbackExecutor {
         // writes above the fence -- ordering them the other way would have the
         // singleton read see a row this step had just put back.
         let restored_rows = self
-            .restore_rewritten_rows(recording, &plan, target, fence)
+            .restore_rewritten_rows(
+                recording,
+                &plan,
+                target,
+                fence,
+                plan_head.chain_epoch().get(),
+            )
             .await?;
         if restored_rows > 0 {
             tracing::warn!(

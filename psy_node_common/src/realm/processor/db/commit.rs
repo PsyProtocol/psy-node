@@ -495,7 +495,7 @@ where
 
         if let (Some(prepared), Some(journal)) = (&recorded, self.recording.journal()) {
             journal
-                .record_before(checkpoint_id, prepared.planned_rows())
+                .record_before(checkpoint_id, self.state.coordinator_chain_epoch, prepared.planned_rows())
                 .await?;
         }
         // CRITICAL: set unique_pending_id to checkpoint_id mapping BEFORE ANY OTHER
@@ -595,7 +595,7 @@ where
         // the manifest against what was actually written.
         if let (Some(prepared), Some(journal)) = (&recorded, self.recording.journal()) {
             journal
-                .record_after(checkpoint_id, prepared.planned_rows())
+                .record_after(checkpoint_id, self.state.coordinator_chain_epoch, prepared.planned_rows())
                 .await?;
         }
         if let Some(prepared) = recorded {

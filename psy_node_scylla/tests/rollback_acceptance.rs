@@ -67,6 +67,13 @@ async fn witnesses_first_touch(
     reader: &ScyllaRowImageReader,
     target: u64,
     head: u64,
+    // The branch these observations belong to.  Heights are reused after a
+    // rollback, so a height discarded three times holds four branches' worth,
+    // and comparing this branch's live state against a witness from a branch
+    // that no longer exists fails an assertion that nothing is wrong with --
+    // which is how this check started reporting GlobalUserTree mismatches on a
+    // healthy chain.
+    chain_epoch: u64,
 ) -> anyhow::Result<Vec<Witness>> {
     let mut first: BTreeMap<Vec<u8>, Witness> = BTreeMap::new();
     for checkpoint in (target + 1)..=head {
@@ -74,9 +81,10 @@ async fn witnesses_first_touch(
             .query_unpaged(
                 format!(
                     "SELECT locator, before_image, before_present FROM \
-                     {keyspace}.rollback_verification_journal WHERE checkpoint_id = ?"
+                     {keyspace}.rollback_verification_journal_by_epoch \
+                     WHERE checkpoint_id = ? AND chain_epoch = ?"
                 ),
-                (checkpoint as i64,),
+                (checkpoint as i64, chain_epoch as i64),
             )
             .await?
             .into_rows_result()?;
@@ -156,25 +164,33 @@ async fn a_rollback_restores_exactly_what_was_observed_before() -> anyhow::Resul
     // it -- and the executor rightly refuses to resume something towards a
     // target nobody asked for.  Finishing it is also the operator's real
     // workflow after a crash.
-    let in_progress = {
+    // Also picks up the epoch the range being discarded was committed under,
+    // by the same rule the executor plans with: `start_rollback` opens the next
+    // epoch straight away, so once a rollback is under way the branch that
+    // produced the range is one below the live head's.
+    let (in_progress, discarded_epoch) = {
         let control = control_plane(session.clone(), &keyspace, &no_tablet).await;
         match control {
             Ok(control) => {
                 let recording = control.recording::<PHash>();
                 match recording.canonical_head().read_canonical_head(network()).await? {
-                    CanonicalHeadReadState::Current(stored) => stored
-                        .rollback_control()
-                        .requested()
-                        .map(|r| {
-                            (
-                                r.requested_head().checkpoint_id().get(),
-                                r.target().checkpoint_id().get(),
-                            )
-                        }),
-                    CanonicalHeadReadState::Uninitialized => None,
+                    CanonicalHeadReadState::Current(stored) => {
+                        let epoch = stored.canonical_ref().chain_epoch().get();
+                        match stored.rollback_control().requested() {
+                            Some(r) => (
+                                Some((
+                                    r.requested_head().checkpoint_id().get(),
+                                    r.target().checkpoint_id().get(),
+                                )),
+                                epoch.saturating_sub(1),
+                            ),
+                            None => (None, epoch),
+                        }
+                    }
+                    CanonicalHeadReadState::Uninitialized => (None, 0),
                 }
             }
-            Err(_) => None,
+            Err(_) => (None, 0),
         }
     };
     let (head, target) = match in_progress {
@@ -185,8 +201,13 @@ async fn a_rollback_restores_exactly_what_was_observed_before() -> anyhow::Resul
         None => {
             // Roll back far enough that the range spans many commits, but leave
             // a deep history below the target so the fallback has somewhere to
-            // land.
-            let target = head.saturating_sub(10);
+            // land.  `PSY_ROLLBACK_TARGET` overrides it, for checking that a
+            // *particular* write is undone -- a table only some contract calls
+            // touch will not fall inside a fixed ten-checkpoint window.
+            let target = std::env::var("PSY_ROLLBACK_TARGET")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| head.saturating_sub(10));
             assert!(target > 5, "the chain is too short to roll back meaningfully");
             println!("rolling back from {head} to {target}");
             (head, target)
@@ -194,7 +215,8 @@ async fn a_rollback_restores_exactly_what_was_observed_before() -> anyhow::Resul
     };
 
     let reader = ScyllaRowImageReader::prepare(session.clone(), &keyspace).await?;
-    let witnesses = witnesses_first_touch(&session, &keyspace, &reader, target, head).await?;
+    let witnesses =
+        witnesses_first_touch(&session, &keyspace, &reader, target, head, discarded_epoch).await?;
     assert!(
         !witnesses.is_empty(),
         "the journal recorded nothing for the discarded range; run the chain with \
@@ -351,10 +373,14 @@ async fn a_rollback_restores_exactly_what_was_observed_before() -> anyhow::Resul
         checked += 1;
         let live_bytes = live.as_ref().map(|image| image.canonical_bytes());
         if live_bytes != witness.before {
+            // The locator is what makes a mismatch investigable: without it
+            // the report names a table and a height, and the row it is actually
+            // talking about cannot be found again.
             mismatches.push(format!(
-                "{:?} at c={} : live={:?} before={:?}",
+                "{:?} at c={} key={} : live={:?} before={:?}",
                 resolved.physical_table(),
                 witness.checkpoint_id,
+                hex::encode(&witness.locator),
                 live_bytes.as_ref().map(hex::encode),
                 witness.before.as_ref().map(hex::encode),
             ));

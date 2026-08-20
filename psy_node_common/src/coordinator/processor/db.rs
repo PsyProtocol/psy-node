@@ -1551,7 +1551,11 @@ checkpoint_backup_copy_status={}
         // journal could only guess at it (design-r1 §2.2.2).
         if let (Some(prepared), Some(journal)) = (&recorded, self.recording.journal()) {
             journal
-                .record_before(checkpoint_id, prepared.planned_rows())
+                .record_before(
+                    checkpoint_id,
+                    prepared.identity().canonical_chain().chain_epoch().get(),
+                    prepared.planned_rows(),
+                )
                 .await?;
         }
 
@@ -1661,7 +1665,11 @@ checkpoint_backup_copy_status={}
         // the manifest never named.
         if let (Some(prepared), Some(journal)) = (&recorded, self.recording.journal()) {
             journal
-                .record_after(checkpoint_id, prepared.planned_rows())
+                .record_after(
+                    checkpoint_id,
+                    prepared.identity().canonical_chain().chain_epoch().get(),
+                    prepared.planned_rows(),
+                )
                 .await?;
         }
 

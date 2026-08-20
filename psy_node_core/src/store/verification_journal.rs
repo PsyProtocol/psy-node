@@ -20,6 +20,7 @@ pub trait CommitVerificationJournal: Send + Sync {
     async fn record_before(
         &self,
         checkpoint_id: u64,
+        chain_epoch: u64,
         planned: &[(u16, Vec<u8>)],
     ) -> anyhow::Result<()>;
 
@@ -27,6 +28,7 @@ pub trait CommitVerificationJournal: Send + Sync {
     async fn record_after(
         &self,
         checkpoint_id: u64,
+        chain_epoch: u64,
         planned: &[(u16, Vec<u8>)],
     ) -> anyhow::Result<()>;
 
@@ -50,5 +52,6 @@ pub trait CommitVerificationJournal: Send + Sync {
     async fn rewritten_before_images(
         &self,
         checkpoint_id: u64,
+        chain_epoch: u64,
     ) -> anyhow::Result<Vec<(u16, Vec<u8>, Vec<u8>)>>;
 }

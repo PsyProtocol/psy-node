@@ -100,6 +100,12 @@ impl ScyllaRealmRollbackExecutor {
         plan: &RollbackPlan<Hash>,
         target: u64,
         fence: DeleteFenceTimestampUs,
+        // The epoch the discarded range was produced under, not the one this
+        // rollback opened.  Checkpoint heights are reused, so a height that has
+        // been rolled back before carries observations from every branch that
+        // ever reached it, and restoring without naming the branch writes back
+        // rows belonging to a chain that no longer exists.
+        discarded_epoch: u64,
     ) -> anyhow::Result<usize> {
         let Some(journal) = recording.journal() else {
             anyhow::bail!(
@@ -110,7 +116,9 @@ impl ScyllaRealmRollbackExecutor {
         let mut first_touch: std::collections::BTreeMap<Vec<u8>, (Vec<u8>, Vec<u8>)> =
             std::collections::BTreeMap::new();
         for checkpoint in (target + 1)..=plan.head {
-            for (_, locator, before) in journal.rewritten_before_images(checkpoint).await? {
+            for (_, locator, before) in journal
+                .rewritten_before_images(checkpoint, discarded_epoch)
+                .await? {
                 let Ok(resolved) = super::decode_locator_canonical(&locator) else {
                     continue;
                 };
@@ -388,7 +396,13 @@ impl ScyllaRealmRollbackExecutor {
         };
         if let Some(fence) = fence {
             let restored = self
-                .restore_rewritten_rows(recording, &plan, target, fence)
+                .restore_rewritten_rows(
+                    recording,
+                    &plan,
+                    target,
+                    fence,
+                    head.chain_epoch().get(),
+                )
                 .await?;
             if restored > 0 {
                 tracing::warn!(
@@ -518,7 +532,7 @@ impl<Hash: Q256BitHash> psy_node_core::store::realm_self_rollback::RealmSelfRoll
         let deleted_rows = self.delete(&plan, fence).await?;
         // The recovery path needs this as much as the participation one: it
         // deletes the same rows and would destroy the same only copies.
-        self.restore_rewritten_rows(recording, &plan, target, fence)
+        self.restore_rewritten_rows(recording, &plan, target, fence, head_ref.chain_epoch().get())
             .await?;
 
         Ok(RealmSelfRollbackReport {
