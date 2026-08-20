@@ -48,7 +48,14 @@ height() { "${CQL[@]}" "SELECT value FROM $1.u64_singleton_table WHERE obj_id = 
              | sed -n '4p' | tr -d ' '; }
 fail() { echo "FAIL: $*"; exit 1; }
 
-realm_pids() { pgrep -f "start-realm-processor --realm-id $REALM" || true; }
+# Matched on the program, not the arguments: `pgrep -f` also matches the shell
+# running this script, so an argument pattern counts one process that is not a
+# processor and, worse, kills it.
+realm_pids() {
+  pgrep -a psy_node_cli 2>/dev/null \
+    | grep "start-realm-processor --realm-id $REALM " \
+    | awk '{print $1}'
+}
 
 stop_realm() {
   for p in $(realm_pids); do
@@ -99,7 +106,11 @@ for point in "${POINTS[@]}"; do
   done
   head_before=$(height "$KEYSPACE")
 
-  crashes_before=$(grep -ac "fault injection" "$LOGS/realm-$REALM-processor.log" 2>/dev/null || echo 0)
+  # `grep -c` exits non-zero on no match while still printing 0, so `|| echo 0`
+  # yields "0\n0" and every comparison below becomes "integer expected" -- which
+  # `if` reads as false, quietly skipping the check that the crash happened at
+  # all. A round that cannot fail is worse than no round.
+  crashes_before=$(grep -ac "fault injection" "$LOGS/realm-$REALM-processor.log" 2>/dev/null) || crashes_before=0
   stop_realm
   start_realm "$point"
 
@@ -107,7 +118,7 @@ for point in "${POINTS[@]}"; do
   # walks the Realm into the point it is armed to die at.
   run_rollback "$LOG-$point-rollback.log"
 
-  crashes_after=$(grep -ac "fault injection" "$LOGS/realm-$REALM-processor.log" 2>/dev/null || echo 0)
+  crashes_after=$(grep -ac "fault injection" "$LOGS/realm-$REALM-processor.log" 2>/dev/null) || crashes_after=0
   if [ "$crashes_after" -le "$crashes_before" ]; then
     # Either the Realm never reached the point or the hooks are not compiled in.
     # Both make everything below meaningless.
@@ -134,6 +145,20 @@ for point in "${POINTS[@]}"; do
       "$point: did not recover within ${RECOVER_LIMIT}s (coordinator=$c realm_0=$r0 realm_1=$r1, was $head_before)"
   done
 done
+
+# Hand the Realm back to its supervisor.  Left bare it no longer restarts on
+# exit 75, and starting the wrapper on top of it is how two processors for one
+# Realm end up running at once -- the same hazard as two Coordinators, and it
+# happened once already.
+stop_realm
+if [ -n "${PSY_ROLLBACK_REALM_LOOP:-}" ]; then
+  setsid nohup bash "$PSY_ROLLBACK_REALM_LOOP" "$REALM" \
+    >> "$LOGS/realm-$REALM-processor.log" 2>&1 < /dev/null &
+  echo "realm-$REALM handed back to $PSY_ROLLBACK_REALM_LOOP"
+else
+  start_realm
+  echo "realm-$REALM restarted bare; set PSY_ROLLBACK_REALM_LOOP to hand it to a supervisor"
+fi
 
 echo
 echo "== ${#POINTS[@]} Realm crash points survived =="
