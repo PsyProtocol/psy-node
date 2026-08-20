@@ -67,6 +67,11 @@ for r in 0 1; do
     "realm-$r has never recorded a state change; start tests/txgen.sh and let it run first"
 done
 
+# A Realm changes state only when it has transactions, so a single round may
+# legitimately have nothing of its own to check.  A whole run with nothing to
+# check is a run that proves nothing, and only this loop can tell the difference.
+realm_gw_total=0
+
 for round in $(seq 1 "$ROUNDS"); do
   echo
   echo "== round $round of $ROUNDS =="
@@ -94,6 +99,35 @@ for round in $(seq 1 "$ROUNDS"); do
   grep -q "^test result: ok" /tmp/rollback-round.log \
     || fail "round $round: the rollback itself failed (see /tmp/rollback-round.log)"
 
+  # The Realms took part in that rollback -- they deleted and restored their own
+  # rows -- and until now nothing checked that what they restored is what was
+  # there before.  Heights in step, no locator conflicts and a live chain were
+  # all this harness asked of them, and none of those can tell a correct restore
+  # from a wrong one.
+  #
+  # The range and the branch come from the Coordinator's own report rather than
+  # from the Realm's history: after a rollback the head carries manifests from
+  # both branches, so a Realm left to pick for itself would compare against the
+  # branch that replaced the discarded range.
+  rolled_head=$(sed -n 's/.*RollbackReport { target: [0-9]*, head: \([0-9]*\).*/\1/p' /tmp/rollback-round.log | head -1)
+  rolled_target=$(sed -n 's/.*RollbackReport { target: \([0-9]*\),.*/\1/p' /tmp/rollback-round.log | head -1)
+  discarded_epoch=$(sed -n 's/.*recorded as epoch [0-9]* (was \([0-9]*\)).*/\1/p' /tmp/rollback-round.log | head -1)
+  [ -n "$rolled_head" ] && [ -n "$rolled_target" ] && [ -n "$discarded_epoch" ] \
+    || fail "round $round: could not read the range out of the rollback report"
+
+  for r in 0 1; do
+    PSY_ROLLBACK_REALM_KEYSPACE="realm_$r" PSY_ROLLBACK_REALM_SUB_ID=1 \
+      PSY_ROLLBACK_VERIFY_ONLY=1 PSY_ROLLBACK_HEAD="$rolled_head" \
+      PSY_ROLLBACK_TARGET="$rolled_target" PSY_ROLLBACK_CHAIN_EPOCH="$discarded_epoch" \
+      timeout 600 cargo test -p psy_node_scylla --test rollback_realm_acceptance \
+      -- --ignored --nocapture > "/tmp/rollback-round-realm-$r.log" 2>&1 || true
+    grep -q "^test result: ok" "/tmp/rollback-round-realm-$r.log" \
+      || fail "round $round: realm-$r did not restore what it had (see /tmp/rollback-round-realm-$r.log)"
+    checked=$(sed -n 's/.*G-W checked \([0-9]*\) Realm key positions.*/\1/p' "/tmp/rollback-round-realm-$r.log" | head -1)
+    echo "realm-$r G-W: ${checked:-0} key positions"
+    realm_gw_total=$((realm_gw_total + ${checked:-0}))
+  done
+
   # Recovery is the part no one drives: the Coordinator and both Realms have to
   # notice, undo their share, restart themselves and pass the old head again.
   waited=0
@@ -119,5 +153,9 @@ for round in $(seq 1 "$ROUNDS"); do
   echo "round $round: ok"
 done
 
+[ "$realm_gw_total" -gt 0 ] || fail \
+  "no Realm key was ever checked across $ROUNDS rounds; the Realms were idle, so nothing here \
+   says anything about their restore -- drive transactions and run it again"
+
 echo
-echo "== $ROUNDS rounds passed =="
+echo "== $ROUNDS rounds passed, $realm_gw_total Realm key positions checked =="

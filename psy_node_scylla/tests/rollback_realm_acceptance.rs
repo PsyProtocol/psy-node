@@ -164,13 +164,26 @@ async fn a_realm_rollback_restores_exactly_what_was_observed_before() -> anyhow:
          with transactions of its own, not merely one it has synced"
     );
 
-    let head = *realm_committed.iter().max().expect("non-empty");
-    let target = realm_committed
-        .iter()
-        .copied()
-        .filter(|height| *height < head)
-        .max()
-        .expect("a Realm that committed twice");
+    // Overridable so a Coordinator-driven rollback can hand over the range it
+    // just discarded. Left to itself this test picks a range out of the Realm's
+    // own history, which is the right choice when it drives the rollback and
+    // the wrong one when it is checking somebody else's.
+    let explicit_range = std::env::var("PSY_ROLLBACK_HEAD").is_ok();
+    let head = std::env::var("PSY_ROLLBACK_HEAD")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| *realm_committed.iter().max().expect("non-empty"));
+    let target = std::env::var("PSY_ROLLBACK_TARGET")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| {
+            realm_committed
+                .iter()
+                .copied()
+                .filter(|height| *height < head)
+                .max()
+                .expect("a Realm that committed twice")
+        });
     println!("rolling this Realm back from {head} to {target}");
 
     let core = Arc::new(
@@ -188,7 +201,17 @@ async fn a_realm_rollback_restores_exactly_what_was_observed_before() -> anyhow:
     // `ChainEpoch::new(0)` below, written when the chain had never rolled back;
     // on a chain at epoch 49 it planned against a partition that by
     // construction holds nothing.
-    let chain_epoch: u64 = session
+    // The branch the range was committed under. Overridable because after a
+    // rollback the head carries manifests from both branches, and taking the
+    // greater one would compare this Realm against the branch that replaced the
+    // discarded range rather than the discarded range itself. The Coordinator's
+    // report names it: "recorded as epoch N (was M)" -- M is this.
+    let chain_epoch: u64 = match std::env::var("PSY_ROLLBACK_CHAIN_EPOCH")
+        .ok()
+        .and_then(|value| value.parse().ok())
+    {
+        Some(epoch) => epoch,
+        None => session
         .query_unpaged(
             format!(
                 "SELECT chain_epoch FROM {no_tablet}.authority_manifest \
@@ -201,12 +224,23 @@ async fn a_realm_rollback_restores_exactly_what_was_observed_before() -> anyhow:
         .rows::<(i64,)>()?
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
-        .map(|(epoch,)| epoch as u64)
-        .max()
-        .expect("the head this Realm committed has a manifest");
+            .map(|(epoch,)| epoch as u64)
+            .max()
+            .expect("the head this Realm committed has a manifest"),
+    };
     println!("Realm branch: chain_epoch {chain_epoch}");
     let witnesses =
         witnesses_first_touch(&session, &keyspace, &reader, target, head, chain_epoch).await?;
+    // A Realm commits at every checkpoint but changes state only when it has
+    // transactions, so a Coordinator-driven range may legitimately contain none
+    // of this Realm's writes. Saying so and stopping is right; asserting would
+    // fail a Realm for being idle. The caller aggregates -- a run where *no*
+    // round ever checked anything is the one that proves nothing, and only the
+    // caller can see that.
+    if explicit_range && witnesses.is_empty() {
+        println!("G-W checked 0 Realm key positions: this Realm wrote nothing in that range");
+        return Ok(());
+    }
     assert!(
         !witnesses.is_empty(),
         "the journal recorded nothing for this Realm's discarded range; run the chain with \
