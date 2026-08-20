@@ -169,6 +169,25 @@ impl<Hash> RollbackRequest<Hash> {
     pub const fn plan_digest(&self) -> RollbackPlanDigest {
         self.plan_digest
     }
+
+    /// The same request against a re-derived plan.
+    ///
+    /// Head, target and fence are copied rather than taken as arguments so that
+    /// this cannot become a way to move them: only the plan may change, and
+    /// only while the caller is allowed to change it -- which
+    /// `CanonicalHeadTransition::refresh_rollback_plan` is what decides.
+    pub fn with_plan_digest(&self, plan_digest: RollbackPlanDigest) -> Self
+    where
+        Hash: Clone,
+    {
+        Self {
+            requested_head: self.requested_head.clone(),
+            target: self.target.clone(),
+            fence_window: self.fence_window,
+            execution_mode: self.execution_mode,
+            plan_digest,
+        }
+    }
 }
 
 /// Ordinals for [`RollbackControlState::phase_ordinal`].

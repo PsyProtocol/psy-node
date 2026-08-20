@@ -506,13 +506,41 @@ impl ScyllaRollbackExecutor {
                 // proves the plan recomputed here is the plan the interrupted
                 // run committed to, rather than one the manifests have drifted
                 // into meaning since.
+                //
+                // Except before anything has been archived.  The plan is built
+                // before the freeze is published, so participants are still
+                // writing manifests into the range while it is being built; an
+                // executor that dies in Requested or Frozen leaves behind a
+                // digest that no resume can reproduce, because the range really
+                // did grow.  Refusing then is a refusal forever, and the chain
+                // does not advance while a rollback is active -- a crash
+                // injected right after StartRollback stopped a live testnet at
+                // 6588 with realm_0's manifests ending at 6587 and realm_1's at
+                // 6588.  Nothing has been copied or deleted at this point, so a
+                // wider plan contradicts no work; from Archiving onward it does,
+                // and there the refusal stands.
                 let recomputed = RollbackPlanDigest::try_new(plan_digest(plan_id))?;
+                let mut existing = existing;
                 if existing.plan_digest() != recomputed {
-                    anyhow::bail!(
-                        "the plan recomputed for this resume does not match the one the \
-                         interrupted rollback committed to; the range it was deleting is not \
-                         the range this run would delete"
+                    let refreshed = existing.with_plan_digest(recomputed);
+                    stored = self
+                        .advance(
+                            recording,
+                            CanonicalHeadTransition::refresh_rollback_plan(stored, refreshed)
+                                .map_err(|error| {
+                                    anyhow::anyhow!(
+                                        "the plan recomputed for this resume does not match the \
+                                         one the interrupted rollback committed to, and it is \
+                                         too late to adopt it: {error}"
+                                    )
+                                })?,
+                        )
+                        .await?;
+                    tracing::warn!(
+                        "resuming with a plan recomputed after the interrupted run; nothing had \
+                         been archived, so the wider range is adopted rather than refused"
                     );
+                    existing = refreshed;
                 }
                 let window = existing.fence_window();
                 (existing, window.delete_fence(), true)
@@ -576,9 +604,14 @@ impl ScyllaRollbackExecutor {
             participants.participants(),
             fence.as_i64(),
         )?;
-        if !resumed {
-            self.events.record_rollback_requested(&event).await?;
-        }
+        // Recorded on a resume as well, not only on a first run.  Skipping it
+        // here left no audit record at all when the original run died between
+        // opening the epoch and writing the event -- a crash injected right
+        // after StartRollback produced exactly that, and the completing run
+        // then wrote an outcome with no request behind it.  The insert carries
+        // the same values either way, because everything in the event comes
+        // from the durable request rather than from this process's state.
+        self.events.record_rollback_requested(&event).await?;
 
         // ---- freeze ----
         //

@@ -252,6 +252,7 @@ pub enum CanonicalHeadTransitionKind {
     NormalCheckpointAdvance,
     StartRollback,
     BeginRollbackFreeze,
+    RefreshRollbackPlan,
     BeginRollbackArchive,
     CompleteRollbackArchiveBarrier,
     BeginRollbackDelete,
@@ -349,6 +350,57 @@ impl<Hash: Q256BitHash> CanonicalHeadTransition<Hash> {
     /// in, and nothing downstream can tell -- the archive verifies against
     /// itself, the ranges line up, and the corruption only appears when someone
     /// restores from it.
+    /// Replace the plan a not-yet-archiving rollback committed to.
+    ///
+    /// The plan is computed before the freeze is published, so participants are
+    /// still writing manifests inside the range while it is being built.  An
+    /// executor that dies before freezing therefore leaves a digest that no
+    /// resume can reproduce -- the range really has grown -- and the resume
+    /// guard, which is right to refuse a plan it did not commit to, refuses
+    /// forever.  Meanwhile the chain will not advance while a rollback is
+    /// active.  Two correct guards, and between them the chain stops for good;
+    /// a crash injected right after StartRollback wedged a live testnet exactly
+    /// this way.
+    ///
+    /// Refreshing is safe only here.  Before the archive barrier not one row
+    /// has been copied or deleted, so there is no partial work a wider plan
+    /// could contradict; from Archiving onward the digest is a commitment and
+    /// the caller must keep refusing.  Head and target are still immovable --
+    /// only the plan may widen under them.
+    pub fn refresh_rollback_plan(
+        expected: StoredCanonicalHead<Hash>,
+        request: RollbackRequest<Hash>,
+    ) -> Result<Self, CanonicalHeadModelError> {
+        let existing = match expected.rollback_control() {
+            RollbackControlState::Requested(existing) | RollbackControlState::Frozen(existing) => {
+                *existing
+            }
+            RollbackControlState::Idle => {
+                return Err(CanonicalHeadModelError::RollbackNotRequested);
+            }
+            _ => return Err(CanonicalHeadModelError::RollbackPlanAlreadyCommitted),
+        };
+        if existing.requested_head() != request.requested_head() {
+            return Err(CanonicalHeadModelError::RollbackRequestedHeadMismatch);
+        }
+        if existing.target() != request.target() {
+            return Err(CanonicalHeadModelError::RollbackTargetMismatch);
+        }
+        let control = match expected.rollback_control() {
+            RollbackControlState::Requested(_) => RollbackControlState::Requested(request),
+            _ => RollbackControlState::Frozen(request),
+        };
+        Ok(Self {
+            kind: CanonicalHeadTransitionKind::RefreshRollbackPlan,
+            expected,
+            candidate: StoredCanonicalHead {
+                revision: expected.revision.checked_next()?,
+                canonical_ref: *expected.canonical_ref(),
+                rollback_control: control,
+            },
+        })
+    }
+
     pub fn begin_rollback_freeze(
         expected: StoredCanonicalHead<Hash>,
     ) -> Result<Self, CanonicalHeadModelError> {
@@ -971,6 +1023,12 @@ pub enum CanonicalHeadModelError {
     FreezeBarrierHeadMismatch { barrier: u64, request: u64 },
     RollbackFreezeAlreadyStarted,
     RollbackFreezeNotActive,
+    /// The plan may only be refreshed while nothing has been archived; past
+    /// that it is a commitment and a wider one would contradict work already
+    /// done.
+    RollbackPlanAlreadyCommitted,
+    /// A refreshed plan named a different target than the rollback in flight.
+    RollbackTargetMismatch,
     RevisionOutOfCqlRange(u64),
     NegativeRevision(i64),
     RevisionOverflow(u64),
@@ -1026,6 +1084,16 @@ impl fmt::Display for CanonicalHeadModelError {
             Self::RollbackFreezeNotActive => write!(
                 formatter,
                 "archiving needs the rollback to be frozen first; the old head is still moving"
+            ),
+            Self::RollbackPlanAlreadyCommitted => write!(
+                formatter,
+                "the plan cannot be refreshed once archiving has begun; rows have been copied \
+                 against it and a wider plan would delete beyond what was archived"
+            ),
+            Self::RollbackTargetMismatch => write!(
+                formatter,
+                "a refreshed plan must keep the target the rollback in flight was requested \
+                 for; only the range of rows reaching it may widen"
             ),
             Self::PublishBarrierTargetMismatch { barrier, request } => write!(
                 formatter,
