@@ -121,15 +121,24 @@ pub async fn drain_in_flight_commit(
 /// files its own receipt and the barrier is met immediately -- which is why it
 /// survived until a Realm joined the set.
 ///
-/// Bounded, because the alternative to failing is not waiting forever: a
-/// participant that is never coming leaves the chain frozen, and an operator
-/// needs to be told rather than left watching a process that looks busy.
+/// A **grace window**, not a deadline the chain depends on. If every
+/// participant reports inside it, the rollback is the lockstep one design-r1
+/// §1 described; if one does not, the Coordinator goes on without it and that
+/// Realm undoes its own share when it returns. Thirty seconds is long enough
+/// for a Realm that is merely busy and short enough that one that is offline
+/// does not hold everybody else.
+///
+/// This is what abandoning I9 costs and buys. The chain no longer guarantees
+/// that it serves only from a state every Realm has reached -- a Realm that was
+/// away is behind, and answers from a branch that is gone until it catches up.
+/// In exchange, no single Realm can stop the chain by being absent, which under
+/// an asynchronous link is ordinary rather than exceptional.
 pub fn barrier_wait_limit() -> std::time::Duration {
     std::time::Duration::from_secs(
         std::env::var("PSY_ROLLBACK_BARRIER_WAIT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(180),
+            .unwrap_or(30),
     )
 }
 
