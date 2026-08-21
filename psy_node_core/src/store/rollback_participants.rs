@@ -25,7 +25,7 @@
 //! the digest of what it archived, so the aggregate is checkable rather than
 //! merely counted.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
@@ -285,6 +285,7 @@ pub struct ArchiveBarrier {
     target: u64,
     head: u64,
     receipts: BTreeMap<RollbackParticipant, ArchiveReceipt>,
+    excused: BTreeSet<RollbackParticipant>,
 }
 
 impl ArchiveBarrier {
@@ -294,7 +295,35 @@ impl ArchiveBarrier {
             target,
             head,
             receipts: BTreeMap::new(),
+            excused: BTreeSet::new(),
         }
+    }
+
+    /// Stop waiting for a participant that is not here.
+    ///
+    /// A Realm's link to the Coordinator is asynchronous: it may be offline at
+    /// any moment and back at any moment. A barrier that blocks until an absent
+    /// Realm answers therefore stops the whole chain on something the design
+    /// treats as ordinary, and it stops it permanently -- a Realm that restarts
+    /// mid-rollback has no memory of having joined and no trigger left to
+    /// rejoin, so the receipt it owes will never come.
+    ///
+    /// Excusing it is safe for its data because each participant archives and
+    /// deletes **its own keyspace**: the Coordinator crossing the point of no
+    /// return destroys nothing of the Realm's, which still holds everything
+    /// above the target and undoes it on its next start. What the excused Realm
+    /// loses is the barrier's ordering, which is exactly what the design already
+    /// says a Realm that missed FROZEN gives up.
+    ///
+    /// Recorded rather than forgotten: `excused()` is what tells an audit that
+    /// this barrier was crossed without one of its participants.
+    pub fn excuse(&mut self, participant: RollbackParticipant) {
+        self.excused.insert(participant);
+    }
+
+    /// Participants this barrier stopped waiting for.
+    pub fn excused(&self) -> Vec<RollbackParticipant> {
+        self.excused.iter().copied().collect()
     }
 
     /// Record one participant's receipt.
@@ -329,7 +358,9 @@ impl ArchiveBarrier {
             .participants()
             .iter()
             .copied()
-            .filter(|participant| !self.receipts.contains_key(participant))
+            .filter(|participant| {
+                !self.receipts.contains_key(participant) && !self.excused.contains(participant)
+            })
             .collect()
     }
 
@@ -408,6 +439,7 @@ pub struct FreezeBarrier {
     participants: RollbackParticipantSet,
     head: u64,
     receipts: BTreeMap<RollbackParticipant, FreezeReceipt>,
+    excused: BTreeSet<RollbackParticipant>,
 }
 
 impl FreezeBarrier {
@@ -416,8 +448,21 @@ impl FreezeBarrier {
             participants,
             head,
             receipts: BTreeMap::new(),
+            excused: BTreeSet::new(),
         }
     }
+
+    /// Stop waiting for a participant that is not here.  See
+    /// `ArchiveBarrier::excuse` for why this is safe and what it gives up.
+    pub fn excuse(&mut self, participant: RollbackParticipant) {
+        self.excused.insert(participant);
+    }
+
+    /// Participants this barrier stopped waiting for.
+    pub fn excused(&self) -> Vec<RollbackParticipant> {
+        self.excused.iter().copied().collect()
+    }
+
 
     pub fn file(&mut self, receipt: FreezeReceipt) -> Result<(), BarrierError> {
         let participant = receipt.participant();
@@ -446,7 +491,9 @@ impl FreezeBarrier {
             .participants()
             .iter()
             .copied()
-            .filter(|participant| !self.receipts.contains_key(participant))
+            .filter(|participant| {
+                !self.receipts.contains_key(participant) && !self.excused.contains(participant)
+            })
             .collect()
     }
 
@@ -534,6 +581,7 @@ pub struct PublishBarrier {
     participants: RollbackParticipantSet,
     target: u64,
     receipts: BTreeMap<RollbackParticipant, VerifyReceipt>,
+    excused: BTreeSet<RollbackParticipant>,
 }
 
 impl PublishBarrier {
@@ -542,7 +590,19 @@ impl PublishBarrier {
             participants,
             target,
             receipts: BTreeMap::new(),
+            excused: BTreeSet::new(),
         }
+    }
+
+    /// Stop waiting for a participant that is not here.  See
+    /// `ArchiveBarrier::excuse` for why this is safe and what it gives up.
+    pub fn excuse(&mut self, participant: RollbackParticipant) {
+        self.excused.insert(participant);
+    }
+
+    /// Participants this barrier stopped waiting for.
+    pub fn excused(&self) -> Vec<RollbackParticipant> {
+        self.excused.iter().copied().collect()
     }
 
     pub fn file(&mut self, receipt: VerifyReceipt) -> Result<(), BarrierError> {
@@ -572,7 +632,9 @@ impl PublishBarrier {
             .participants()
             .iter()
             .copied()
-            .filter(|participant| !self.receipts.contains_key(participant))
+            .filter(|participant| {
+                !self.receipts.contains_key(participant) && !self.excused.contains(participant)
+            })
             .collect()
     }
 
@@ -641,6 +703,41 @@ impl SealedArchiveBarrier {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_barrier_can_go_on_without_a_participant_that_is_not_here() {
+        use super::*;
+        let me = RollbackParticipant::new(
+            psy_data::protocol::chain_context::AuthorityScope::Coordinator,
+        );
+        let absent = RollbackParticipant::new(
+            psy_data::protocol::chain_context::AuthorityScope::Realm {
+                realm_id: 0,
+                realm_sub_id: 1,
+            },
+        );
+        let set = RollbackParticipantSet::try_new(vec![me, absent]).expect("two participants");
+        let mut barrier = FreezeBarrier::new(set, 100);
+        barrier
+            .file(FreezeReceipt::new(me, 100, [7u8; 32]))
+            .expect("the Coordinator froze");
+
+        assert_eq!(barrier.missing(), vec![absent], "still owed by the absent Realm");
+        assert!(!barrier.is_met());
+
+        barrier.excuse(absent);
+        assert!(barrier.missing().is_empty(), "excused is not still owed");
+        assert!(barrier.is_met());
+        barrier.seal().expect("a barrier with nothing outstanding seals");
+
+        // Kept, not forgotten. Crossing without a participant is a fact an
+        // audit needs, and the only trace of it is here.
+        assert_eq!(
+            barrier.excused(),
+            vec![absent],
+            "the barrier must remember whom it went on without"
+        );
+    }
+
     use super::*;
 
     fn coordinator() -> RollbackParticipant {

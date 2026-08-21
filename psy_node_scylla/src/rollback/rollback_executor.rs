@@ -792,13 +792,40 @@ impl ScyllaRollbackExecutor {
                     break;
                 }
                 if started.elapsed() >= limit {
-                    anyhow::bail!(
-                        "FREEZE_ALL waited {}s for {:?} and they have not frozen; the chain \
-                         stays frozen until they do -- bring them back and run the rollback \
-                         again, which resumes from here rather than starting over",
-                        limit.as_secs(),
-                        freeze.missing()
-                    );
+                    // Not here, and the chain must not stop for it.
+                    //
+                    // A Realm's link to the Coordinator is asynchronous -- it
+                    // may be offline at any moment and back at any moment -- so
+                    // waiting for one that is absent halts the chain on
+                    // something ordinary, and halts it for good: a Realm that
+                    // restarted mid-rollback has no memory of having joined and
+                    // no trigger left to rejoin, so the receipt it owes never
+                    // comes.
+                    //
+                    // Safe for the absent Realm's data because each participant
+                    // archives and deletes its **own** keyspace. Crossing here
+                    // destroys nothing of theirs; they still hold everything
+                    // above the target and undo it on their next start, through
+                    // the reconciliation that exists for exactly this. What they
+                    // lose is this barrier's ordering, which is what the design
+                    // already says a Realm that missed FROZEN gives up.
+                    //
+                    // This barrier is the one to be uneasy about: an unfrozen
+                    // Realm may still be committing its own state while the
+                    // range is archived. Its own commits go to its own keyspace
+                    // and its own reconciliation undoes everything above the
+                    // target, so the range stays correct -- but it is the
+                    // weakest of the three arguments, and worth revisiting if a
+                    // Realm ever archives anything the Coordinator owns.
+                    for absent in freeze.missing() {
+                        tracing::warn!(
+                            "FREEZE_ALL waited {}s for {} and is going on without it; that Realm \
+                             has not frozen and must undo its own share when it returns",
+                            limit.as_secs(),
+                            absent
+                        );
+                        freeze.excuse(absent);
+                    }
                 }
                 tokio::time::sleep(super::BARRIER_POLL).await;
             }
@@ -872,17 +899,27 @@ impl ScyllaRollbackExecutor {
                     break;
                 }
                 if started.elapsed() >= limit {
-                    // Failing here is the safe direction and the reason this
-                    // barrier exists: crossing it with a participant that has
-                    // archived nothing is the one mistake nothing downstream
-                    // can repair.
-                    anyhow::bail!(
-                        "GLOBAL_ARCHIVE_BARRIER waited {}s for {:?} and they have not archived; \
-                         nothing has been deleted yet, and nothing will be until they do -- \
-                         bring them back and run the rollback again to resume from here",
-                        limit.as_secs(),
-                        barrier.missing()
-                    );
+                    // Crossing with a participant that archived nothing is the
+                    // one mistake nothing downstream can repair -- for that
+                    // participant's own keyspace, which is the only thing it
+                    // archives and the only thing it deletes. The Coordinator's
+                    // delete does not reach it. So an absent Realm keeps
+                    // everything above the target and undoes it itself later;
+                    // what it forfeits is this barrier's ordering, not its data.
+                    //
+                    // Waiting instead would stop the chain permanently, because
+                    // a Realm that restarted mid-rollback cannot rejoin: it
+                    // joins only on FROZEN, which has been published and gone.
+                    for absent in barrier.missing() {
+                        tracing::warn!(
+                            "GLOBAL_ARCHIVE_BARRIER waited {}s for {} and is going on without \
+                             it; that Realm has archived nothing of its own and must undo its \
+                             own share when it returns",
+                            limit.as_secs(),
+                            absent
+                        );
+                        barrier.excuse(absent);
+                    }
                 }
                 tokio::time::sleep(super::BARRIER_POLL).await;
             }
@@ -982,16 +1019,22 @@ impl ScyllaRollbackExecutor {
                     break;
                 }
                 if started.elapsed() >= limit {
-                    // Past the point of no return, so this is not abandonable:
-                    // the rollback is resumable and must be finished once the
-                    // straggler reports.
-                    anyhow::bail!(
-                        "PUBLISH_ALL waited {}s for {:?} and they have not verified; the \
-                         rollback is past the point of no return and must be resumed, not \
-                         abandoned",
-                        limit.as_secs(),
-                        publish.missing()
-                    );
+                    // Past the point of no return, so stopping here is not an
+                    // option either: the epoch has to be published or the chain
+                    // never produces again. An absent Realm confirms it reached
+                    // the target when it returns and reconciles; holding the
+                    // epoch back until then stops everyone else for one Realm
+                    // that may be offline for hours.
+                    for absent in publish.missing() {
+                        tracing::warn!(
+                            "PUBLISH_ALL waited {}s for {} and is publishing without it; that \
+                             Realm has not confirmed it reached the target and must reconcile \
+                             when it returns",
+                            limit.as_secs(),
+                            absent
+                        );
+                        publish.excuse(absent);
+                    }
                 }
                 tokio::time::sleep(super::BARRIER_POLL).await;
             }
