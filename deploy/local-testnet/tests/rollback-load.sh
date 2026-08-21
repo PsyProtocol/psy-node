@@ -85,6 +85,15 @@ done
 # legitimately have nothing of its own to check.  A whole run with nothing to
 # check is a run that proves nothing, and only this loop can tell the difference.
 realm_gw_total=0
+realm_resync_total=0
+
+# Test mode by default: both halves of the Realm assertion run, and every row a
+# Realm touched has to be accounted for.  `PSY_ROLLBACK_REALM_ASSERT_SCOPE=lean`
+# runs only the manifest-named half -- the rows the rollback plan is actually
+# responsible for -- which is the sensible setting once the mechanism is
+# trusted and the run is about something else. It is not the default, because a
+# narrower assertion is a choice someone should make on purpose.
+ASSERT_SCOPE="${PSY_ROLLBACK_REALM_ASSERT_SCOPE:-strict}"
 
 for round in $(seq 1 "$ROUNDS"); do
   echo
@@ -153,12 +162,13 @@ for round in $(seq 1 "$ROUNDS"); do
     PSY_ROLLBACK_REALM_KEYSPACE="realm_$r" PSY_ROLLBACK_REALM_SUB_ID=1 \
       PSY_ROLLBACK_VERIFY_ONLY=1 PSY_ROLLBACK_HEAD="$rolled_head" \
       PSY_ROLLBACK_TARGET="$rolled_target" PSY_ROLLBACK_CHAIN_EPOCH="$discarded_epoch" \
+      PSY_ROLLBACK_REALM_ASSERT=manifest \
       timeout 600 cargo test -p psy_node_scylla --test rollback_realm_acceptance \
       -- --ignored --nocapture > "/tmp/rollback-round-realm-$r.log" 2>&1 || true
     grep -q "^test result: ok" "/tmp/rollback-round-realm-$r.log" \
-      || fail "round $round: realm-$r did not restore what it had (see /tmp/rollback-round-realm-$r.log)"
+      || fail "round $round: realm-$r did not restore the rows its manifest names (see /tmp/rollback-round-realm-$r.log)"
     checked=$(sed -n 's/.*G-W checked \([0-9]*\) Realm key positions.*/\1/p' "/tmp/rollback-round-realm-$r.log" | head -1)
-    echo "realm-$r G-W: ${checked:-0} key positions"
+    echo "realm-$r G-W (manifest-named): ${checked:-0} key positions"
     realm_gw_total=$((realm_gw_total + ${checked:-0}))
   done
 
@@ -188,6 +198,26 @@ for round in $(seq 1 "$ROUNDS"); do
       "round $round: did not recover within ${RECOVER_LIMIT}s (coordinator=$c realm_0=$r0 realm_1=$r1, was $head_before)"
   done
 
+  # The other half, and only now: the rows a Realm wrote while syncing are
+  # undone by re-fetching from the Coordinator, which is precisely what the
+  # recovery above waited for. Checking them while the Realm was stopped asked
+  # whether something had happened that had been deliberately prevented.
+  if [ "$ASSERT_SCOPE" = "strict" ]; then
+    for r in 0 1; do
+      PSY_ROLLBACK_REALM_KEYSPACE="realm_$r" PSY_ROLLBACK_REALM_SUB_ID=1 \
+        PSY_ROLLBACK_VERIFY_ONLY=1 PSY_ROLLBACK_HEAD="$rolled_head" \
+        PSY_ROLLBACK_TARGET="$rolled_target" PSY_ROLLBACK_CHAIN_EPOCH="$discarded_epoch" \
+        PSY_ROLLBACK_REALM_ASSERT=resync \
+        timeout 600 cargo test -p psy_node_scylla --test rollback_realm_acceptance \
+        -- --ignored --nocapture > "/tmp/rollback-round-realm-$r-resync.log" 2>&1 || true
+      grep -q "^test result: ok" "/tmp/rollback-round-realm-$r-resync.log" \
+        || fail "round $round: realm-$r still holds what the discarded branch wrote (see /tmp/rollback-round-realm-$r-resync.log)"
+      checked=$(sed -n 's/.*G-W checked \([0-9]*\) Realm key positions.*/\1/p' "/tmp/rollback-round-realm-$r-resync.log" | head -1)
+      echo "realm-$r G-W (re-fetched): ${checked:-0} key positions"
+      realm_resync_total=$((realm_resync_total + ${checked:-0}))
+    done
+  fi
+
   merkle_after=$(count_in coordinator-processor.log 'Failed to verify merkle proof')
   conflict_after=$(( $(count_in realm-0-processor.log 'Conflict { kind: Locator') \
                    + $(count_in realm-1-processor.log 'Conflict { kind: Locator') ))
@@ -204,4 +234,5 @@ done
    says anything about their restore -- drive transactions and run it again"
 
 echo
-echo "== $ROUNDS rounds passed, $realm_gw_total Realm key positions checked =="
+echo "== $ROUNDS rounds passed: $realm_gw_total manifest-named and $realm_resync_total \
+re-fetched Realm key positions checked ($ASSERT_SCOPE) =="

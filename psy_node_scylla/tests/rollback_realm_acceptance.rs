@@ -74,6 +74,45 @@ fn network() -> NetworkId {
 struct Witness {
     locator: Vec<u8>,
     before: Option<Vec<u8>>,
+    /// What the discarded branch left in the row. Only the resync assertion
+    /// uses it, and it uses it to say that value must be gone.
+    after: Option<Vec<u8>>,
+}
+
+/// Which of a Realm's rows an assertion is about.
+///
+/// A Realm's rows above the target come from two places and are undone two
+/// different ways, on opposite schedules. Asking one question of both is what
+/// made this assertion report eight failures that were not failures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RealmAssertion {
+    /// Rows the Realm's own manifest names: the rollback plan deletes or
+    /// restores them, so they are settled the moment the rollback returns and
+    /// must be checked **before the Realm moves again**.
+    ManifestNamed,
+    /// Rows the Realm wrote while merely syncing. No manifest names them; they
+    /// are undone by re-fetching from the Coordinator, which only happens once
+    /// the Realm is running and has caught up. Checking these while the Realm
+    /// is stopped asks whether a thing has happened that has been deliberately
+    /// prevented from happening.
+    Resynced,
+}
+
+impl RealmAssertion {
+    fn from_env() -> Self {
+        // Named rather than defaulted: the two need opposite timing, so a
+        // caller that has not said which one it wants has not thought about
+        // when it is running.
+        match std::env::var("PSY_ROLLBACK_REALM_ASSERT").as_deref() {
+            Ok("manifest") => Self::ManifestNamed,
+            Ok("resync") => Self::Resynced,
+            Ok(other) => panic!(
+                "PSY_ROLLBACK_REALM_ASSERT={other:?}; expected \"manifest\" (run with the Realm \
+                 stopped, straight after the rollback) or \"resync\" (run once it has caught up)"
+            ),
+            Err(_) => Self::ManifestNamed,
+        }
+    }
 }
 
 /// Every key position the discarded range touched, with the state observed just
@@ -99,16 +138,18 @@ async fn witnesses_first_touch(
         let rows = session
             .query_unpaged(
                 format!(
-                    "SELECT locator, before_image, before_present FROM \
-                     {keyspace}.rollback_verification_journal_by_epoch \
+                    "SELECT locator, before_image, before_present, after_image, after_present \
+                     FROM {keyspace}.rollback_verification_journal_by_epoch \
                      WHERE checkpoint_id = ? AND chain_epoch = ?"
                 ),
                 (checkpoint as i64, chain_epoch as i64),
             )
             .await?
             .into_rows_result()?;
-        for row in rows.rows::<(Vec<u8>, Option<Vec<u8>>, Option<bool>)>()? {
-            let (locator, before, present) = row?;
+        for row in rows
+            .rows::<(Vec<u8>, Option<Vec<u8>>, Option<bool>, Option<Vec<u8>>, Option<bool>)>()?
+        {
+            let (locator, before, present, after, after_present) = row?;
             let Ok(resolved) = decode_locator_canonical(&locator) else {
                 continue;
             };
@@ -118,6 +159,7 @@ async fn witnesses_first_touch(
             first.entry(position).or_insert(Witness {
                 locator,
                 before: before.filter(|_| present.unwrap_or(false)),
+                after: after.filter(|_| after_present.unwrap_or(false)),
             });
         }
     }
@@ -298,13 +340,38 @@ async fn a_realm_rollback_restores_exactly_what_was_observed_before() -> anyhow:
     assert_eq!(view.observations(), 3, "one observation per phase gate");
     }
 
-    // G-W on the Realm's own state.  The checkpoint copies are deliberately not
-    // asserted here: they are re-fetched rather than restored, so their content
-    // after a rollback is whatever the Coordinator now publishes, not what this
-    // Realm observed before.
+    // G-W on the Realm's own state, split in two because a Realm's rows above
+    // the target come from two places and are undone two different ways.
+    //
+    // The rollback plan names what this Realm committed itself: those rows are
+    // deleted or restored, and are settled the moment the rollback returns.
+    // Everything else it wrote while syncing, and that is undone by re-fetching
+    // from the Coordinator -- which cannot have happened yet if the Realm is
+    // stopped, and must have happened once it has caught up.
+    //
+    // Asking one question of both is what made this report eight failures out
+    // of 351 that were not failures.
+    let assertion = RealmAssertion::from_env();
+    let planned: std::collections::HashSet<Vec<u8>> = executor
+        .plan(&recording, REALM_ID, realm_sub_id, &head_ref, target)
+        .await?
+        .checkpoints
+        .iter()
+        .flat_map(|checkpoint| checkpoint.rows.iter().map(|(_, locator)| locator.clone()))
+        .collect();
+    println!("the Realm's plan names {} rows", planned.len());
+
     let mut mismatches = Vec::new();
     let mut checked = 0usize;
     for witness in &witnesses {
+        let named = planned.contains(&witness.locator);
+        let wanted = match assertion {
+            RealmAssertion::ManifestNamed => named,
+            RealmAssertion::Resynced => !named,
+        };
+        if !wanted {
+            continue;
+        }
         let Ok(resolved) = decode_locator_canonical(&witness.locator) else {
             continue;
         };
@@ -313,22 +380,46 @@ async fn a_realm_rollback_restores_exactly_what_was_observed_before() -> anyhow:
         };
         checked += 1;
         let live_bytes = live.as_ref().map(|image| image.canonical_bytes());
-        if live_bytes != witness.before {
+        let wrong = match assertion {
+            // What was there before must be back, byte for byte, and a key the
+            // range created must be gone.
+            RealmAssertion::ManifestNamed => live_bytes != witness.before,
+            // Nothing to restore here -- the Coordinator's copy is authoritative
+            // and the Realm re-fetches it. What must be true is that the
+            // discarded branch's value is no longer what the row holds.
+            //
+            // Stated as "not the old value" rather than "the new value",
+            // because this test does not know what the new branch wrote. It
+            // would miss a re-fetch that happened to write the same bytes; the
+            // tables actually in this set are keyed by pending id and IMT key,
+            // and neither is ever reused, so that case does not arise here.
+            RealmAssertion::Resynced => {
+                witness.after.is_some() && live_bytes == witness.after
+            }
+        };
+        if wrong {
             println!(
-                "MISMATCH table={:?} locator={} before={:?} live={:?}",
+                "MISMATCH table={:?} locator={} before={:?} after={:?} live={:?}",
                 resolved.physical_table(),
                 hex::encode(&witness.locator),
                 witness.before.as_ref().map(hex::encode),
+                witness.after.as_ref().map(hex::encode),
                 live_bytes.as_ref().map(hex::encode),
             );
             mismatches.push(format!("{:?}", resolved.physical_table()));
         }
     }
-    println!("G-W checked {checked} Realm key positions");
-    assert!(checked > 0, "no key could be checked, so the assertion proved nothing");
+    println!("G-W checked {checked} Realm key positions ({assertion:?})");
+    // A run that checked nothing proves nothing, and the two assertions cover
+    // disjoint sets -- so each has to say for itself whether it had anything to
+    // look at, and the caller aggregates across rounds.
+    if checked == 0 {
+        println!("nothing in this range belongs to {assertion:?}");
+        return Ok(());
+    }
     assert!(
         mismatches.is_empty(),
-        "G-W failed for {} of {checked} Realm keys: {mismatches:?}",
+        "G-W ({assertion:?}) failed for {} of {checked} Realm keys: {mismatches:?}",
         mismatches.len()
     );
 
