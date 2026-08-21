@@ -59,7 +59,7 @@ where
     // before the Coordinator produced past the old head.  After that the
     // heights agree and only the contents differ, and the epoch is the only
     // thing left that can tell.
-    if let Err(e) = processor.db.reconcile_missed_rollback_epochs().await {
+    if let Err(e) = processor.db.reconcile_missed_rollback_epochs().await.map(|_| ()) {
         tracing::error!(
             "[REALM] could not reconcile against rollbacks that happened while this Realm was \
              down ({e:#}); refusing to start on a cache whose provenance is unknown"
@@ -144,6 +144,54 @@ where
                         std::process::exit(
                             psy_node_core::store::rollback_reload::EXIT_CODE_ROLLBACK_RELOAD,
                         );
+                    }
+                    // Nothing watched, so nothing to undo from memory -- which
+                    // is not the same as nothing to undo.  A Realm the grace
+                    // window left behind never saw a phase at all: by the time
+                    // it looked the Coordinator had finished and published Idle
+                    // again, and the only evidence left that it missed
+                    // something is the chain epoch on that head.  Without this
+                    // it would sync and produce straight onto a branch that no
+                    // longer exists, which is the cost of retiring I9 and this
+                    // is where it is paid.
+                    //
+                    // Reached only when the branch above did not fire, so this
+                    // never runs against a rollback this process took part in
+                    // or watched to its end -- both of those restart, and
+                    // startup reconciles.
+                    match processor.db.reconcile_missed_rollback_epochs().await {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            // Same reason the two watched paths restart: the
+                            // database is back on the surviving branch but the
+                            // in-memory state was built from the discarded one,
+                            // and repairing that in place is what produced
+                            // unprovable witnesses before.
+                            tracing::warn!(
+                                "[REALM] this Realm was left behind by a rollback it never saw \
+                                 and has undone its share; restarting so its in-memory state is \
+                                 rebuilt from the surviving branch (exit {})",
+                                psy_node_core::store::rollback_reload::EXIT_CODE_ROLLBACK_RELOAD
+                            );
+                            processor.db.status.begin_shutdown();
+                            sleep(std::time::Duration::from_millis(500)).await;
+                            std::process::exit(
+                                psy_node_core::store::rollback_reload::EXIT_CODE_ROLLBACK_RELOAD,
+                            );
+                        }
+                        Err(e) => {
+                            // Fail closed, as the phase read above does: a
+                            // Realm that cannot establish which of its
+                            // checkpoints are still real must not build
+                            // witnesses from them.
+                            tracing::error!(
+                                "[REALM] could not check whether a rollback happened without \
+                                 this Realm ({e:#}); holding off rather than producing on a \
+                                 branch that may be gone"
+                            );
+                            sleep(std::time::Duration::from_secs(1)).await;
+                            continue;
+                        }
                     }
                     rollback_aborted = false;
                     took_part = false;

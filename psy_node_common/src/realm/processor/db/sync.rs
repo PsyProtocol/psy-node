@@ -480,7 +480,14 @@ where
         self.undo_everything_above(published_height).await
     }
 
-    /// Reconcile this Realm against rollbacks it slept through.
+    /// Reconcile this Realm against rollbacks it did not watch.
+    ///
+    /// Not only ones it slept through.  Since the archive barrier became a
+    /// grace window rather than a deadline (design-r1, the entry that retired
+    /// I9) a Realm that was merely slow is left behind by a rollback while
+    /// still running: it looks again, finds the phase back at Idle, and has no
+    /// watched target to undo.  So this runs in the processor loop as well as
+    /// at startup, and the epoch is what both rely on.
     ///
     /// The height check next to this one only sees a rollback the Realm comes
     /// back to immediately: once the Coordinator has produced past the old head
@@ -498,13 +505,16 @@ where
     /// A Realm with no recorded epoch is one that has never synced, not one at
     /// epoch zero: it has no stale cache, and truncating it would discard a
     /// chain that was never rolled back.
-    pub async fn reconcile_missed_rollback_epochs(&mut self) -> anyhow::Result<()> {
+    /// Reports whether it had to undo anything, because the caller's next step
+    /// depends on it: a Realm that just truncated has in-memory state built
+    /// from the branch that is gone, and only a restart rebuilds it.
+    pub async fn reconcile_missed_rollback_epochs(&mut self) -> anyhow::Result<bool> {
         if self.recording.sync_epoch_store().is_none() {
-            return Ok(());
+            return Ok(false);
         }
         let seen = self.coordinator_chain_ref_last_synced();
         let Some(published) = self.recording.observe_published_head(&seen).await? else {
-            return Ok(());
+            return Ok(false);
         };
         let published_epoch = published.chain_epoch().get();
         let published_now = published.checkpoint().checkpoint_id().get();
@@ -517,12 +527,12 @@ where
                 Some(epoch) => epoch,
                 None => {
                     store.write_synced_epoch(published_epoch).await?;
-                    return Ok(());
+                    return Ok(false);
                 }
             }
         };
         if recorded_epoch >= published_epoch {
-            return Ok(());
+            return Ok(false);
         }
 
         let targets = self
@@ -576,7 +586,7 @@ where
             .expect("checked above and the bundle is immutable")
             .write_synced_epoch(published_epoch)
             .await?;
-        Ok(())
+        Ok(true)
     }
 
     /// Record the epoch the chain is in now, after a rollback this Realm
