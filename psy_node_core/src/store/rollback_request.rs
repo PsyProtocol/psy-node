@@ -111,6 +111,34 @@ pub fn decide_pickup(entry: &RollbackRequestEntry, live_head: u64) -> PickupDeci
     }
 }
 
+/// The mailbox itself, as everything above the storage layer sees it.
+///
+/// A trait for the same reason the rest of this control plane is one: the edge
+/// that writes a request and the processor that takes it up both live in
+/// `psy_node_common`, which does not -- and must not -- know what database is
+/// underneath.
+#[async_trait::async_trait]
+pub trait RollbackRequestMailbox: Send + Sync {
+    /// Write a request down and return the microsecond identifying it.
+    ///
+    /// Nothing here judges it.  Whether it still stands when the processor
+    /// arrives is `decide_pickup`'s answer and whether the range can be planned
+    /// is the planner's; a mailbox that also refused requests would be a third
+    /// opinion on the same question.
+    async fn submit(
+        &self,
+        target: u64,
+        expected_head: u64,
+        requested_by: &str,
+    ) -> anyhow::Result<i64>;
+
+    /// The request that counts: the most recently written one.
+    async fn newest(&self) -> anyhow::Result<Option<RollbackRequestEntry>>;
+
+    /// Record that a rollback was started for this request, in this epoch.
+    async fn mark_consumed(&self, requested_at_us: i64, chain_epoch: u64) -> anyhow::Result<()>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

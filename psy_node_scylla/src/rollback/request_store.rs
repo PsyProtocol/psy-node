@@ -222,3 +222,25 @@ fn now_us() -> anyhow::Result<i64> {
         .as_micros();
     Ok(i64::try_from(micros)?)
 }
+
+#[async_trait::async_trait]
+impl psy_node_core::store::rollback_request::RollbackRequestMailbox
+    for ScyllaRollbackRequestStore
+{
+    async fn submit(
+        &self,
+        target: u64,
+        expected_head: u64,
+        requested_by: &str,
+    ) -> anyhow::Result<i64> {
+        Self::submit(self, target, expected_head, requested_by).await
+    }
+
+    async fn newest(&self) -> anyhow::Result<Option<RollbackRequestEntry>> {
+        Self::newest(self).await
+    }
+
+    async fn mark_consumed(&self, requested_at_us: i64, chain_epoch: u64) -> anyhow::Result<()> {
+        Self::mark_consumed(self, requested_at_us, chain_epoch).await
+    }
+}

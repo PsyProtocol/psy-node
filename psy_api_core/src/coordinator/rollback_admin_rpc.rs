@@ -161,7 +161,14 @@ pub struct RollbackStatusReport {
     /// an operator who sees `idle` after asking is told why rather than left to
     /// guess.
     pub last_request_expired: Option<RollbackRequestExpiry>,
-    pub participants: Vec<RollbackParticipantProgress>,
+    /// Per-participant progress, when the responder is able to read the
+    /// receipts.
+    ///
+    /// `None` rather than an empty list when it is not, because those mean
+    /// opposite things: "nobody has filed anything" would be alarming halfway
+    /// through a rollback, while "this endpoint does not report progress" is
+    /// merely a limit of the answer.
+    pub participants: Option<Vec<RollbackParticipantProgress>>,
 }
 
 impl RollbackStatusReport {
@@ -174,7 +181,7 @@ impl RollbackStatusReport {
             head,
             target: None,
             last_request_expired: None,
-            participants: Vec::new(),
+            participants: None,
         }
     }
 
@@ -187,7 +194,7 @@ impl RollbackStatusReport {
             head: Some(head),
             target: Some(target),
             last_request_expired: None,
-            participants: Vec::new(),
+            participants: None,
         }
     }
 }
@@ -325,12 +332,12 @@ mod tests {
             head: Some(120),
             target: Some(90),
             last_request_expired: Some(RollbackRequestExpiry::AlreadyConsumed),
-            participants: vec![RollbackParticipantProgress {
+            participants: Some(vec![RollbackParticipantProgress {
                 scope: "realm:0:1".to_string(),
                 froze: true,
                 archived: true,
                 verified: false,
-            }],
+            }]),
         };
         let text = serde_json::to_string(&report).unwrap();
         assert_eq!(
