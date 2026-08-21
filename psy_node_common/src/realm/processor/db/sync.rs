@@ -242,7 +242,10 @@ where
     /// A Realm with no transactions in the range does nothing here beyond one
     /// manifest read, which is the ordinary case.
     pub async fn undo_everything_above(&mut self, target: u64) -> anyhow::Result<()> {
-        self.undo_everything_above_bounded(target, None).await
+        // No epoch override: a Realm following a rollback while running has not
+        // adopted the new one yet, so the epoch it is carrying is still the
+        // branch its own state was written on.
+        self.undo_everything_above_bounded(target, None, None).await
     }
 
     /// As above, with an explicit bound on how far the Realm's own manifest is
@@ -255,20 +258,41 @@ where
     /// of its own above the target, for a Realm that had plenty.  The
     /// Coordinator's published head is not derived from anything this Realm can
     /// damage, and no Realm commits above it.
+    ///
+    /// `plan_epoch` names the branch the state being undone was committed
+    /// under, and it is not the epoch this Realm is now on.  Startup adopts the
+    /// Coordinator's epoch before anything else runs -- it has to, so nothing
+    /// stamps a record with a stale one -- so by the time a reconciliation gets
+    /// here, `coordinator_chain_epoch` is the *new* branch's.  Planning with it
+    /// searches a manifest partition that by construction cannot hold the range,
+    /// finds nothing, and reports that the Realm had nothing of its own to undo.
+    ///
+    /// realm_0 wedged that way for 954 retries: its own commits at 144 through
+    /// 149 were written under epoch 3, the chain moved to epoch 4, and the
+    /// restart planned against epoch 4. Nothing was undone, so the Realm sat at
+    /// checkpoint 149 while the Coordinator said its root was at 141, and
+    /// `Sync and verify failed: Realm Root mismatch` every second after that.
+    ///
+    /// The live path passes `None` and is right to: a Realm that follows a
+    /// rollback while running has not adopted the new epoch yet.
     pub async fn undo_everything_above_bounded(
         &mut self,
         target: u64,
         search_head_height: Option<u64>,
+        plan_epoch: Option<u64>,
     ) -> anyhow::Result<()> {
         if let Some(driver) = self.recording.self_rollback() {
             let mut search_head = self.coordinator_chain_ref_last_synced();
-            if let Some(height) = search_head_height {
+            if search_head_height.is_some() || plan_epoch.is_some() {
                 use psy_data::protocol::canonical_chain::{
-                    CanonicalChainRef, CheckpointId, CheckpointRef,
+                    CanonicalChainRef, ChainEpoch, CheckpointId, CheckpointRef,
                 };
+                let height = search_head_height
+                    .unwrap_or_else(|| search_head.checkpoint().checkpoint_id().get());
+                let epoch = plan_epoch.unwrap_or_else(|| search_head.chain_epoch().get());
                 search_head = CanonicalChainRef::new(
                     search_head.network_id(),
-                    search_head.chain_epoch(),
+                    ChainEpoch::new(epoch),
                     CheckpointRef::new(
                         CheckpointId::new(height),
                         *search_head.checkpoint().checkpoint_hash(),
@@ -291,6 +315,22 @@ where
                     report.own_head,
                     report.target,
                     report.deleted_rows
+                );
+            } else if plan_epoch.is_some() {
+                // Saying so out loud, because this is the shape the failure took
+                // and it took a day to see. A reconciliation runs only when a
+                // rollback was missed; finding nothing to undo is possible -- a
+                // Realm with no transactions in the range -- but it is also what
+                // searching the wrong epoch looks like, and the two are
+                // indistinguishable from in here. Whichever it is, the epoch
+                // gets recorded next and the Realm will never look again, so
+                // this line is the only trace left if it was the second.
+                tracing::warn!(
+                    "[REALM_ROLLBACK] found nothing of this Realm's own above {} under epoch {}; \
+                     recording the epoch regardless -- if this Realm did commit up there, it is \
+                     about to keep state from a branch that no longer exists",
+                    target,
+                    plan_epoch.unwrap_or_default(),
                 );
             }
         }
@@ -472,8 +512,16 @@ where
             // this Realm's caches and a bound taken from them would already be
             // wrong by the time it was used.
             Some(target) => {
-                self.undo_everything_above_bounded(target, Some(published_now))
-                    .await?
+                // `recorded_epoch` is the branch this Realm's own state was
+                // committed under -- the one it last synced with, before the
+                // rollbacks it missed. Its manifests live in that partition and
+                // nowhere else.
+                self.undo_everything_above_bounded(
+                    target,
+                    Some(published_now),
+                    Some(recorded_epoch),
+                )
+                .await?
             }
             None => {
                 // The epoch moved but no rollback recorded a target for it.
