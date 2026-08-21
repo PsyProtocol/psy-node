@@ -239,7 +239,7 @@ impl Chain {
                     "SELECT chain_epoch FROM {keyspace}_no_tablet.realm_sync_epoch \
                      WHERE network_chain_id = ?"
                 ),
-                (self.network.get() as i64,),
+                (self.network.chain_id() as i64,),
             )
             .await?
             .into_rows_result()?;
