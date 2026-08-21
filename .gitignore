@@ -83,3 +83,10 @@ AGENTS.md
 .claude
 .codex
 .omp
+genesis_abi
+client_prover/config.json
+client_prover/psy-privacy-bridge/
+# Local testnet runtime: logs, checkpoint backups, the workload ledger (which
+# holds private keys), and the genesis contracts psy-compiler regenerates.
+.local-staging/
+genesis_contracts.json
