@@ -13,6 +13,7 @@
 //! asserts that this does not happen again.
 
 mod authority_timestamp_store;
+mod branch_namespace;
 mod canonical_head_store;
 mod commit_planner_scylla;
 mod commit_window_generator;
@@ -44,6 +45,7 @@ mod row_image;
 mod verification_journal;
 
 pub use authority_timestamp_store::*;
+pub use branch_namespace::*;
 pub use canonical_head_store::*;
 pub use commit_planner_scylla::*;
 pub use commit_window_generator::*;
