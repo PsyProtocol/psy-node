@@ -287,8 +287,24 @@ where
                 use psy_data::protocol::canonical_chain::{
                     CanonicalChainRef, ChainEpoch, CheckpointId, CheckpointRef,
                 };
+                // The higher of the two, not whichever was passed.
+                //
+                // The Coordinator's published head is here because it is not
+                // derived from anything this Realm can damage. But right after a
+                // rollback it *is* the target, so on its own it makes the search
+                // range empty at exactly the moment this reconciliation exists
+                // for: a Realm that missed the rollback and restarts before the
+                // Coordinator has climbed back finds nothing of its own to undo,
+                // records the epoch, and can never look again -- the same latch
+                // as searching the wrong epoch, reached by the bound instead.
+                //
+                // The Realm's own view is safe to raise it with: the truncation
+                // the original comment warned about happens in
+                // `reset_for_rollback_to`, which runs after this search, not
+                // before.
                 let height = search_head_height
-                    .unwrap_or_else(|| search_head.checkpoint().checkpoint_id().get());
+                    .unwrap_or(0)
+                    .max(search_head.checkpoint().checkpoint_id().get());
                 let epoch = plan_epoch.unwrap_or_else(|| search_head.chain_epoch().get());
                 search_head = CanonicalChainRef::new(
                     search_head.network_id(),
@@ -325,10 +341,25 @@ where
                 // indistinguishable from in here. Whichever it is, the epoch
                 // gets recorded next and the Realm will never look again, so
                 // this line is the only trace left if it was the second.
-                tracing::warn!(
-                    "[REALM_ROLLBACK] found nothing of this Realm's own above {} under epoch {}; \
-                     recording the epoch regardless -- if this Realm did commit up there, it is \
-                     about to keep state from a branch that no longer exists",
+                // Ordinary in one case and serious in another, and from here
+                // they look the same. A Realm that took part in the rollback
+                // while running has already undone its share, so this
+                // reconciliation on the restart that followed correctly finds
+                // nothing -- that is the common path and it fires every time.
+                // A Realm that *missed* the rollback and finds nothing has been
+                // told to look somewhere its rows are not, and is about to
+                // record the epoch and never look again.
+                //
+                // Said at info, with the range and branch it searched, because a
+                // warning that fires on every ordinary rollback is one nobody
+                // reads by the time it matters. What distinguishes the two is
+                // whether this Realm has manifests up there, which is a question
+                // for whoever is reading -- `psy_dev_cli rollback verify --who
+                // <realm> --assert manifest` answers it.
+                tracing::info!(
+                    "[REALM_ROLLBACK] nothing of this Realm's own to undo above {} on epoch {}; \
+                     expected when it already took part in the rollback, and worth checking if \
+                     it did not",
                     target,
                     plan_epoch.unwrap_or_default(),
                 );
