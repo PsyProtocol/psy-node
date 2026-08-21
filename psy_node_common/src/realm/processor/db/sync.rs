@@ -593,6 +593,42 @@ where
         Ok(true)
     }
 
+    /// Whether a rollback happened under this Realm while it was working.
+    ///
+    /// Read-only, deliberately: the caller is a Realm whose block just failed,
+    /// and the question it needs answered is whether that failure is a fault or
+    /// a branch that was taken out from under it.  Undoing anything is the job
+    /// of the startup path, from a process whose in-memory state was not built
+    /// half way through the block that failed.
+    ///
+    /// The failure this exists for is a proof that never arrives.  A Realm left
+    /// behind mid-block published its jobs against a checkpoint that no longer
+    /// exists, waits thirty seconds for a root proof nothing will produce, and
+    /// without this parks in Error until somebody restarts it by hand.  It
+    /// could not happen while the archive barrier blocked -- the Coordinator
+    /// waited, so a Realm finished its block and met the freeze at the top of
+    /// the loop.  The grace window made it ordinary.
+    ///
+    /// An unreadable head answers `false`: it is the reading that failed, and
+    /// claiming a rollback on that basis would turn every transient database
+    /// error into a restart.
+    pub async fn chain_rolled_back_under_us(&self) -> bool {
+        let Some(store) = self.recording.sync_epoch_store() else {
+            return false;
+        };
+        let seen = self.coordinator_chain_ref_last_synced();
+        let published = match self.recording.observe_published_head(&seen).await {
+            std::result::Result::Ok(Some(published)) => published,
+            _ => return false,
+        };
+        match store.read_synced_epoch().await {
+            std::result::Result::Ok(Some(recorded)) => {
+                recorded < published.chain_epoch().get()
+            }
+            _ => false,
+        }
+    }
+
     /// Record the epoch the chain is in now, after a rollback this Realm
     /// watched and has just undone its share of.
     pub async fn note_current_chain_epoch(&mut self) -> anyhow::Result<()> {

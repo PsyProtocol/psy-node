@@ -360,6 +360,33 @@ where
                             e
                         );
                     }
+                    Err(e) if processor.db.chain_rolled_back_under_us().await => {
+                        // Not a fault: the branch this block was being built on
+                        // was discarded while it was being built.  The usual
+                        // shape is a root proof that never arrives -- the jobs
+                        // were published against a checkpoint that no longer
+                        // exists -- and parking on that would leave the Realm
+                        // waiting for a hand it should not need: being left
+                        // behind is ordinary now, not exceptional.
+                        //
+                        // Restarting rather than reconciling here, because the
+                        // in-memory state of a process that failed half way
+                        // through a block is the last thing that should be
+                        // deciding what to undo.  Startup does it from clean.
+                        tracing::warn!(
+                            "[REALM] the block at slot {} failed ({:#}) and a rollback has \
+                             happened under this Realm since it last synced; restarting to \
+                             reconcile rather than parking on a branch that is gone (exit {})",
+                            current_slot,
+                            e,
+                            psy_node_core::store::rollback_reload::EXIT_CODE_ROLLBACK_RELOAD
+                        );
+                        processor.db.status.begin_shutdown();
+                        sleep(std::time::Duration::from_millis(500)).await;
+                        std::process::exit(
+                            psy_node_core::store::rollback_reload::EXIT_CODE_ROLLBACK_RELOAD,
+                        );
+                    }
                     Err(e) => {
                         let error = format!("realm process_block failed at slot {}: {:#}", current_slot, e);
                         processor.db.status.set_error(error.clone());
