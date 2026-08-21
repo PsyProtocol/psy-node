@@ -5,10 +5,16 @@
 # The Coordinator-side matrix cannot produce these failures. A Realm has no
 # phase transitions of its own: it observes the phases the Coordinator
 # publishes and files receipts that let the barriers close. The dangerous
-# moments are therefore the *gaps* -- a Realm that dies after observing
-# DELETING and before filing its verify receipt leaves the Coordinator waiting
-# on a barrier that can never close, and the chain does not advance while a
-# rollback is published.
+# moments are therefore the *gaps* -- a Realm that dies after observing DELETING
+# and before filing its verify receipt owes a receipt nothing will produce.
+#
+# What that costs changed when I9 was retired. The barrier is a grace window
+# now, so the Coordinator excuses the dead Realm after thirty seconds and
+# finishes without it: the chain no longer stops, and the question each point
+# asks is no longer "does the barrier deadlock" but "does the Realm that missed
+# it undo its own share when it comes back". Every point below was written
+# against the blocking barrier and only one of them was ever run, so what they
+# test now is largely untested.
 #
 # Needs a binary built with the hooks compiled in:
 #
@@ -90,13 +96,32 @@ stop_realm() {
   fail "realm-$REALM would not stop"
 }
 
+# Under an exit-75 supervisor, exactly as the stack runs it, because the
+# recovery paths this matrix exists to test end in exit 75: a Realm that finds
+# it was left behind undoes its share and asks to be restarted so its in-memory
+# state is rebuilt from the surviving branch. Started bare it would undo its
+# share, exit, and stay dead -- and the round would fail on "did not recover"
+# about a Realm that did exactly the right thing.
+#
+# An abort is not exit 75, so a Realm armed to die still dies for good, and the
+# wrapper goes with it. That is what the matrix wants: the crash is the event
+# under test, the restart afterwards is the test's own doing.
 start_realm() {  # start_realm [crash-point]
   local point="${1:-}"
   local extra=()
   [ -n "$point" ] && extra=(env "PSY_ROLLBACK_REALM_CRASH_AT=$point")
+  local runner='
+    while true; do
+      "$@"
+      code=$?
+      if [ "$code" -ne 75 ]; then exit "$code"; fi
+      echo "[realm-crash-matrix] realm asked to reload after a rollback; restarting"
+    done
+  '
   setsid nohup "${extra[@]}" env \
     PSY_ROLLBACK_VERIFICATION_JOURNAL=1 \
     PSY_ROLLBACK_COORDINATOR_NO_TABLET_KEYSPACE=coordinator_no_tablet \
+    bash -c "$runner" _ \
     ./target/release/psy_node_cli start-realm-processor --realm-id "$REALM" --realm-sub-id 1 \
       --network local-devnet --db-namespace "realm_$REALM" --scylla-db-url 127.0.0.1:9042 \
       --nats-jetstream-url nats://127.0.0.1:4222 --redis-url redis://127.0.0.1:6379 \
@@ -210,10 +235,11 @@ for point in "${POINTS[@]}"; do
   done
 done
 
-# Hand the Realm back to its supervisor.  Left bare it no longer restarts on
-# exit 75, and starting the wrapper on top of it is how two processors for one
-# Realm end up running at once -- the same hazard as two Coordinators, and it
-# happened once already.
+# Hand the Realm back to whatever supervises it normally.  `start_realm` runs
+# its own exit-75 loop, which is enough for the matrix but is not the stack's,
+# and starting the stack's wrapper on top of a running one is how two processors
+# for one Realm end up running at once -- the same hazard as two Coordinators,
+# and it happened once already.  So stop first, then hand over.
 stop_realm
 if [ -n "${PSY_ROLLBACK_REALM_LOOP:-}" ]; then
   setsid nohup bash "$PSY_ROLLBACK_REALM_LOOP" "$REALM" \
@@ -221,7 +247,8 @@ if [ -n "${PSY_ROLLBACK_REALM_LOOP:-}" ]; then
   echo "realm-$REALM handed back to $PSY_ROLLBACK_REALM_LOOP"
 else
   start_realm
-  echo "realm-$REALM restarted bare; set PSY_ROLLBACK_REALM_LOOP to hand it to a supervisor"
+  echo "realm-$REALM restarted under this script's own exit-75 loop; set \
+PSY_ROLLBACK_REALM_LOOP to hand it back to the stack's supervisor instead"
 fi
 
 echo
