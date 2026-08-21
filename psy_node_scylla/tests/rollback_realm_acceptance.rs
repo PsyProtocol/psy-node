@@ -54,7 +54,20 @@ use parth_core::pgoldilocks::PoseidonHasher;
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 
+/// Default only. A Realm's manifests are written under its own scope, so
+/// running against `realm_1`'s keyspace with this left at 0 reads a partition
+/// that scope never wrote: the plan comes back empty, the manifest-named half
+/// of the assertion checks nothing, and the round passes having proved nothing.
+/// It did exactly that until someone went looking for a row it should have
+/// named.
 const REALM_ID: u32 = 0;
+
+fn realm_id() -> u32 {
+    std::env::var("PSY_ROLLBACK_REALM_ID")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(REALM_ID)
+}
 /// The deployment runs realms with sub id 1, not 0.  The allocator and the
 /// manifest are partitioned by the exact scope, so a test guessing 0 looks in a
 /// partition nothing ever wrote and reports the Realm as having committed
@@ -315,7 +328,7 @@ async fn a_realm_rollback_restores_exactly_what_was_observed_before() -> anyhow:
     let report = executor
         .roll_back(
             &recording,
-            REALM_ID,
+            realm_id(),
             realm_sub_id,
             &head_ref,
             target,
@@ -353,7 +366,7 @@ async fn a_realm_rollback_restores_exactly_what_was_observed_before() -> anyhow:
     // of 351 that were not failures.
     let assertion = RealmAssertion::from_env();
     let planned: std::collections::HashSet<Vec<u8>> = executor
-        .plan(&recording, REALM_ID, realm_sub_id, &head_ref, target)
+        .plan(&recording, realm_id(), realm_sub_id, &head_ref, target)
         .await?
         .checkpoints
         .iter()

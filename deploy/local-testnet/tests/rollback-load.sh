@@ -162,7 +162,7 @@ for round in $(seq 1 "$ROUNDS"); do
     PSY_ROLLBACK_REALM_KEYSPACE="realm_$r" PSY_ROLLBACK_REALM_SUB_ID=1 \
       PSY_ROLLBACK_VERIFY_ONLY=1 PSY_ROLLBACK_HEAD="$rolled_head" \
       PSY_ROLLBACK_TARGET="$rolled_target" PSY_ROLLBACK_CHAIN_EPOCH="$discarded_epoch" \
-      PSY_ROLLBACK_REALM_ASSERT=manifest \
+      PSY_ROLLBACK_REALM_ID="$r" PSY_ROLLBACK_REALM_ASSERT=manifest \
       timeout 600 cargo test -p psy_node_scylla --test rollback_realm_acceptance \
       -- --ignored --nocapture > "/tmp/rollback-round-realm-$r.log" 2>&1 || true
     grep -q "^test result: ok" "/tmp/rollback-round-realm-$r.log" \
@@ -207,7 +207,7 @@ for round in $(seq 1 "$ROUNDS"); do
       PSY_ROLLBACK_REALM_KEYSPACE="realm_$r" PSY_ROLLBACK_REALM_SUB_ID=1 \
         PSY_ROLLBACK_VERIFY_ONLY=1 PSY_ROLLBACK_HEAD="$rolled_head" \
         PSY_ROLLBACK_TARGET="$rolled_target" PSY_ROLLBACK_CHAIN_EPOCH="$discarded_epoch" \
-        PSY_ROLLBACK_REALM_ASSERT=resync \
+        PSY_ROLLBACK_REALM_ID="$r" PSY_ROLLBACK_REALM_ASSERT=resync \
         timeout 600 cargo test -p psy_node_scylla --test rollback_realm_acceptance \
         -- --ignored --nocapture > "/tmp/rollback-round-realm-$r-resync.log" 2>&1 || true
       grep -q "^test result: ok" "/tmp/rollback-round-realm-$r-resync.log" \
