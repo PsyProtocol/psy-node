@@ -20,6 +20,15 @@ that has to rebuild its users every time is a run nobody repeats.
     workload.py fund             faucet everyone not yet funded
     workload.py deploy 20        20 users each deploy the sample contract
     workload.py run 200          200 random operations against the population
+
+Or as three long-lived processes, which is what the rollback flow uses -- a
+chain busy in the ordinary way rather than a batch that runs once and stops:
+
+    workload.py registrar   --every 30    register and fund, forever
+    workload.py deployer    --every 120   deploy contracts, forever
+    workload.py transferrer --every 20    move tokens between users, forever
+
+They share the ledger and its locked merge lets them write at the same time.
     workload.py status           what the ledger holds
 
 `run` is the one to leave going in the background during rollback testing;
@@ -680,6 +689,91 @@ def pick_idle(users):
     return None
 
 
+def cmd_registrar(state, args):
+    """Register a user every so often, forever.
+
+    One of three long-lived processes that share the ledger, which is what the
+    rollback flow wants: a chain that looks busy in the ordinary way rather than
+    a batch that runs once and stops. They can be started and stopped
+    independently, and the ledger's locked merge is what lets them write to it
+    at the same time.
+    """
+    log(f"registering a user every ~{args.every}s; ledger {LEDGER}")
+    while True:
+        user = register_one(state)
+        if user is not None and args.fund:
+            # Funded here rather than in a fourth process: an unfunded user can
+            # do nothing, so a registrar that leaves them unfunded is producing
+            # rows nobody can use.
+            fund_one(state, user)
+        time.sleep(args.every)
+
+
+def cmd_deployer(state, args):
+    """Deploy a contract from a settled user every so often, forever."""
+    log(f"deploying every ~{args.every}s from users that have settled")
+    while True:
+        state = load()
+        shapes = state.get("shapes") or [None]
+        ready = [u for u in state["users"] if u["funded"] and settled(u, "funded_at")]
+        if not ready:
+            log("no settled user yet")
+            time.sleep(args.every)
+            continue
+        user = pick_idle(ready)
+        if user is None:
+            time.sleep(args.every)
+            continue
+        try:
+            deploy_one(state, user, random.choice(shapes))
+        finally:
+            with _lock:
+                _busy.discard(user["user_id"])
+        time.sleep(args.every)
+
+
+def cmd_transferrer(state, args):
+    """Move tokens between users every so often, forever.
+
+    Transfers only. It is the operation that makes a Realm commit state of its
+    own, which is what a rollback needs to have anything of a Realm's to undo,
+    and one shape of traffic is enough to keep the chain honestly busy.
+    """
+    log(f"transferring every ~{args.every}s")
+    while True:
+        state = load()
+        ready = [u for u in state["users"] if u["funded"] and settled(u, "funded_at")]
+        if len(ready) < 2:
+            log(f"only {len(ready)} settled user(s); need two to transfer")
+            time.sleep(args.every)
+            continue
+        sender = pick_idle(ready)
+        if sender is None:
+            time.sleep(args.every)
+            continue
+        try:
+            # Mint first if this user has never had a balance: transfer asserts
+            # on one, and a transferrer that only ever fails is a process that
+            # looks alive and does nothing.
+            if not sender["minted"]:
+                if call(state, sender, TOKEN_CONTRACT_ID, "simple_mint", [10_000_000_000]):
+                    with _lock:
+                        sender["minted"] = True
+                        sender["minted_at"] = sender.get("minted_at") or time.time()
+                        save(state)
+            elif settled(sender, "minted_at"):
+                recipient = random.choice([u for u in ready if u["user_id"] != sender["user_id"]])
+                if call(state, sender, TOKEN_CONTRACT_ID, "simple_transfer",
+                        [recipient["user_id"], 1000]):
+                    with _lock:
+                        sender["sent_to"].append(recipient["user_id"])
+                        save(state)
+        finally:
+            with _lock:
+                _busy.discard(sender["user_id"])
+        time.sleep(args.every)
+
+
 def cmd_status(state, _args):
     report(state, verbose=True)
 
@@ -729,6 +823,20 @@ def main():
     p = sub.add_parser("run", help="random operations against the population")
     p.add_argument("rounds", type=int)
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("registrar", help="register (and fund) a user on a loop, forever")
+    p.add_argument("--every", type=int, default=30, help="seconds between users (default 30)")
+    p.add_argument("--no-fund", dest="fund", action="store_false",
+                   help="leave the users unfunded; they can then do nothing")
+    p.set_defaults(func=cmd_registrar, fund=True)
+
+    p = sub.add_parser("deployer", help="deploy a contract on a loop, forever")
+    p.add_argument("--every", type=int, default=120, help="seconds between deploys (default 120)")
+    p.set_defaults(func=cmd_deployer)
+
+    p = sub.add_parser("transferrer", help="move tokens between users on a loop, forever")
+    p.add_argument("--every", type=int, default=20, help="seconds between transfers (default 20)")
+    p.set_defaults(func=cmd_transferrer)
 
     p = sub.add_parser("status", help="what the ledger holds")
     p.set_defaults(func=cmd_status)
