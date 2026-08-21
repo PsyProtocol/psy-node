@@ -23,6 +23,7 @@ cd "$REPO_ROOT"
 REALM="${PSY_ROLLBACK_CRASH_REALM:-0}"
 KEYSPACE="${PSY_ROLLBACK_LIVE_KEYSPACE:-coordinator}"
 CQL=(docker exec parth-local-scylla cqlsh -e)
+CLI="${PSY_DEV_CLI:-$REPO_ROOT/target/release/psy_dev_cli}"
 LOGS="${PSY_LOCAL_STAGING_LOGS:-$REPO_ROOT/.local-staging/logs}"
 GROW_LIMIT="${PSY_ROLLBACK_GROW_SECS:-600}"
 RECOVER_LIMIT="${PSY_ROLLBACK_RECOVER_SECS:-900}"
@@ -32,14 +33,29 @@ LOG=/tmp/realm-crash
 # `AfterArchiveReceipt` are the gaps that matter most: the receipt is filed, the
 # Coordinator has counted it, and the participant that owes the *next* one is
 # gone.
-# The recover-afterwards path, which is the one Realms actually walk on this
-# deployment: they participate without blocking, discover the rollback from the
-# epoch change, and reset themselves.  The join-at-FROZEN points
-# (Before/AfterFreezeReceipt, Before/AfterArchive, AfterArchiveReceipt,
-# BeforeDelete, BeforeVerifyReceipt) exist in the binary but are never reached
-# here -- a matrix over them passes every point without ever crashing, which
-# proves nothing and took two runs to notice.
+# Both paths, because both are now live.
+#
+# A Realm joins at the moment FROZEN is published and files the receipts the
+# barriers wait for -- the `Before*`/`After*` points. That path was dead for as
+# long as the Realms were left out of the participant set, and every barrier
+# sealed on the Coordinator's own receipt; it is real now, and the Coordinator
+# genuinely waits.
+#
+# The `Recover*` points are the other path: a Realm that was down when FROZEN
+# was published finds out from the epoch change and undoes its share on the next
+# start, with no barrier protecting it.
+#
+# The gaps are what matter. A Realm that dies after observing a phase and before
+# filing the receipt it owes leaves a barrier that can never close, and no
+# Coordinator-side crash can produce that.
 ALL_POINTS=(
+  BeforeFreezeReceipt
+  AfterFreezeReceipt
+  BeforeArchive
+  AfterArchive
+  AfterArchiveReceipt
+  BeforeDelete
+  BeforeVerifyReceipt
   RecoverBeforeArchive
   RecoverAfterArchive
   RecoverAfterDelete
@@ -108,10 +124,19 @@ wait_for_realm_synced() {
   done
 }
 
-run_rollback() {
-  PSY_ROLLBACK_LIVE_KEYSPACE="$KEYSPACE" PSY_ROLLBACK_VERIFICATION_JOURNAL=1 \
-    timeout 1200 cargo test -p psy_node_scylla --test rollback_acceptance \
-    -- --ignored --nocapture > "$1" 2>&1 || true
+# Driven through the CLI, which names the Realms as participants. The old test
+# driver left `PSY_ROLLBACK_PARTICIPANT_REALMS` unset, so every barrier sealed on
+# the Coordinator's own receipt and FROZEN was published and gone in a moment --
+# a Realm armed to die at a receipt it was never waited for simply never got
+# there, and the round reported "the Realm never aborted" about a Realm that had
+# nothing to abort in.
+run_rollback() {  # run_rollback <logfile> [target]
+  local target="${2:-}"
+  if [ -n "$target" ]; then
+    timeout 1200 "$CLI" rollback to "$target" > "$1" 2>&1 || true
+  else
+    timeout 1200 "$CLI" rollback resume > "$1" 2>&1 || true
+  fi
 }
 
 echo "== realm-$REALM crash matrix: ${#POINTS[@]} points =="
@@ -155,7 +180,7 @@ for point in "${POINTS[@]}"; do
 
   # The rollback publishes the phases this Realm is waiting on, so it is what
   # walks the Realm into the point it is armed to die at.
-  run_rollback "$LOG-$point-rollback.log"
+  run_rollback "$LOG-$point-rollback.log" "$((head_before - 10))"
 
   crashes_after=$(grep -ac "fault injection" "$LOGS/realm-$REALM-processor.log" 2>/dev/null) || crashes_after=0
   if [ "$crashes_after" -le "$crashes_before" ]; then

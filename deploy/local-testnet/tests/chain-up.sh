@@ -105,14 +105,31 @@ done
 # already loops on it. Checking rather than assuming, because a chain whose
 # processors are unsupervised stops dead at the first rollback and looks exactly
 # like a rollback that failed.
-supervised=0
-for pid in $(pgrep -a psy_node_cli 2>/dev/null | grep processor | awk '{print $1}'); do
-  parent=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null || true)
-  tr '\0' ' ' < "/proc/${parent:-0}/cmdline" 2>/dev/null | grep -q 'ne 75' && supervised=$((supervised + 1))
+# Exit 75 is a processor asking to be restarted after a rollback, and up.sh
+# already loops on it. Checked rather than assumed, because a chain whose
+# processors are unsupervised stops dead at the first rollback and looks exactly
+# like a rollback that failed.
+#
+# Given time to become true: the chain can be producing before `up.sh` has
+# finished starting the last processor, and counting once at that moment failed
+# a chain that was fine a second later.
+count_supervised() {
+  local n=0 parent
+  for pid in $(pgrep -a psy_node_cli 2>/dev/null | grep processor | awk '{print $1}'); do
+    parent=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null || true)
+    tr '\0' ' ' < "/proc/${parent:-0}/cmdline" 2>/dev/null | grep -q 'ne 75' && n=$((n + 1))
+  done
+  echo "$n"
+}
+waited=0
+supervised=$(count_supervised)
+while [ "$supervised" -lt 3 ]; do
+  sleep 10; waited=$((waited + 10))
+  supervised=$(count_supervised)
+  [ "$waited" -lt 300 ] || fail \
+    "only $supervised of 3 processors are under an exit-75 supervisor after ${waited}s; a rollback \
+     would stop this chain and look like the rollback's fault"
 done
-[ "$supervised" -ge 3 ] || fail \
-  "only $supervised of 3 processors are under an exit-75 supervisor; a rollback would stop this \
-   chain and look like the rollback's fault"
 say "$supervised processors are under an exit-75 supervisor"
 
 say "ready: coordinator=$(height coordinator) realm_0=$(height realm_0) realm_1=$(height realm_1)"

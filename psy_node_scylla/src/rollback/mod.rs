@@ -133,6 +133,28 @@ pub fn barrier_wait_limit() -> std::time::Duration {
     )
 }
 
+/// How long a *participant* waits for the Coordinator to publish the next
+/// phase, as against how long the Coordinator waits for its participants.
+///
+/// Deliberately longer, and the asymmetry is the point. Given the same budget
+/// the two wait each other out: a Coordinator held up by one slow participant
+/// cannot publish the next phase, every other participant times out waiting for
+/// it and drops to the recover-afterwards path, and when the slow one finally
+/// returns the barrier is left counting participants that have stopped
+/// answering. It then cannot close at all -- from one Realm being late.
+///
+/// Seen exactly so: realm-0 was killed before filing its freeze receipt,
+/// realm-1 waited out its 180s for ARCHIVING and gave up, realm-0 came back and
+/// FREEZE_ALL closed, and GLOBAL_ARCHIVE_BARRIER then waited forever for a
+/// realm-1 that was no longer taking part.
+///
+/// A participant frozen for a rollback has nothing else it may do, so waiting
+/// longer costs it nothing, and the Coordinator giving up first is what an
+/// operator can act on: its error names who it waited for.
+pub fn participant_wait_limit() -> std::time::Duration {
+    barrier_wait_limit() * 4
+}
+
 /// Poll interval while a barrier waits.  Short relative to how long a
 /// participant takes to archive, so the wait is bounded by the slow participant
 /// rather than by this.

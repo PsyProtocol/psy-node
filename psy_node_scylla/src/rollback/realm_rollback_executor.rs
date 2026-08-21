@@ -679,7 +679,10 @@ async fn wait_for_phase<Hash: Q256BitHash>(
     required: u8,
 ) -> anyhow::Result<()> {
     let started = std::time::Instant::now();
-    let limit = super::barrier_wait_limit();
+    // Longer than the Coordinator's own patience, so it gives up first. Equal
+    // budgets make the two wait each other out and leave a barrier counting a
+    // participant that has stopped answering.
+    let limit = super::participant_wait_limit();
     loop {
         let phase = view.observe_phase(head).await?;
         if phase.permits_work_of(required) {
@@ -688,7 +691,8 @@ async fn wait_for_phase<Hash: Q256BitHash>(
         if started.elapsed() >= limit {
             anyhow::bail!(
                 "this Realm waited {}s to reach {expected} and the rollback has published \
-                 {phase:?}",
+                 {phase:?}; the barrier is still counting this Realm, so it cannot close until \
+                 this Realm is brought back and takes part",
                 limit.as_secs()
             );
         }

@@ -1273,6 +1273,18 @@ fn crash_here_if_asked(variable: &str, kind: CanonicalHeadTransitionKind) {
 /// the commit path, which is precisely what a killed node does not do.
 pub(crate) fn crash_if_named(variable: &str, point: &str) {
     if !(cfg!(debug_assertions) || cfg!(feature = "rollback-fault-injection")) {
+        // Being asked to do something this build cannot do, and saying so.
+        // Silence here reads as "the point was never reached", which is what a
+        // harness concludes and reports -- so a binary built without the
+        // feature passes every crash point by never crashing at any of them.
+        // The environment variable's name is in the binary either way, so
+        // `strings` cannot tell the two apart; this can.
+        if std::env::var(variable).is_ok() {
+            eprintln!(
+                "[fault injection] {variable} is set, but this binary was built without \
+                 --features rollback-fault-injection, so nothing will be crashed"
+            );
+        }
         return;
     }
     let Ok(requested) = std::env::var(variable) else { return };
