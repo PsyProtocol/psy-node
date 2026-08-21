@@ -51,7 +51,21 @@ alive() {
   echo "$n"
 }
 
-fail() { echo "FAIL: $*"; exit 1; }
+# Hands the Realms back before giving up.  A round that stops them for the G-W
+# check and then fails used to exit with no Realm running at all, so the chain
+# the failure was meant to be diagnosed on had stopped too.
+fail() {
+  if [ "${realm_procs_stopped:-0}" -gt 0 ] && [ -n "${PSY_ROLLBACK_REALM_LOOP:-}" ]; then
+    for r in 0 1; do
+      pgrep -a psy_node_cli 2>/dev/null | grep -q "start-realm-processor --realm-id $r " || \
+        setsid nohup bash "$PSY_ROLLBACK_REALM_LOOP" "$r" \
+          >> "$LOGS/realm-$r-processor.log" 2>&1 < /dev/null &
+    done
+    echo "(Realms handed back to $PSY_ROLLBACK_REALM_LOOP)"
+  fi
+  echo "FAIL: $*"
+  exit 1
+}
 
 echo "== preflight =="
 COORD=$(height "$KEYSPACE")
