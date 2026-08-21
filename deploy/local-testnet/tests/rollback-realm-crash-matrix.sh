@@ -83,16 +83,40 @@ realm_pids() {
     | awk '{print $1}'
 }
 
+# By process group, and confirmed by staying empty.
+#
+# Killing the child and waiting for "no child" is not enough, and the exit-75
+# supervisor is why: between a child exiting and its wrapper starting the next
+# one there is a gap in which no processor exists.  `stop_realm` returned inside
+# that gap, reporting success while the wrapper was alive and about to spawn --
+# and `start_realm` then added a second.  Two processors for one Realm both
+# submit, one submission is stale, and the Realm parks on "stale GUTA update
+# rejected at coordinator edge".  It looked exactly like a rollback defect.
+#
+# Both wrappers are session leaders (`setsid`), so the group is the unit that
+# has to die -- the stack's supervisor as well as this script's.  And emptiness
+# has to hold for several consecutive seconds, because one reading of it means
+# nothing.
 stop_realm() {
   for p in $(realm_pids); do
-    # The wrapper first: it restarts its child on exit 75, and an abort is not
-    # that, but killing the child first races the wrapper's own decision.
-    ppid=$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null || true)
-    [ -n "${ppid:-}" ] && kill "$ppid" 2>/dev/null || true
-    sleep 1
+    pgid=$(ps -o pgid= -p "$p" 2>/dev/null | tr -d ' ')
+    [ -n "${pgid:-}" ] && kill -TERM -"$pgid" 2>/dev/null || true
     kill "$p" 2>/dev/null || true
   done
-  for _ in $(seq 1 40); do [ -z "$(realm_pids)" ] && return 0; sleep 1; done
+  local settled=0
+  for _ in $(seq 1 60); do
+    if [ -z "$(realm_pids)" ]; then
+      settled=$((settled + 1))
+      [ "$settled" -ge 5 ] && return 0
+    else
+      settled=0
+      for p in $(realm_pids); do
+        pgid=$(ps -o pgid= -p "$p" 2>/dev/null | tr -d ' ')
+        [ -n "${pgid:-}" ] && kill -TERM -"$pgid" 2>/dev/null || true
+      done
+    fi
+    sleep 1
+  done
   fail "realm-$REALM would not stop"
 }
 
@@ -128,8 +152,17 @@ start_realm() {  # start_realm [crash-point]
       --genesis-data-path ./genesis.json --checkpoint-backup-path ./.local-staging/checkpoints \
       --proving-backend plonky2-poseidon-goldilocks --coordinator-api-urls http://127.0.0.1:1337 \
       --verbose >> "$LOGS/realm-$REALM-processor.log" 2>&1 < /dev/null &
-  for _ in $(seq 1 40); do [ -n "$(realm_pids)" ] && return 0; sleep 1; done
-  fail "realm-$REALM would not start"
+  for _ in $(seq 1 40); do [ -n "$(realm_pids)" ] && break; sleep 1; done
+  [ -n "$(realm_pids)" ] || fail "realm-$REALM would not start"
+  # One, and only one.  Two processors for one Realm is the same hazard as two
+  # Coordinators: both submit, one submission is stale, and the Realm parks on
+  # an error that reads like a rollback defect and is not one.  Cheaper to
+  # notice here than to diagnose from the log an hour later.
+  sleep 3
+  local n
+  n=$(realm_pids | wc -l)
+  [ "$n" -eq 1 ] || fail "realm-$REALM has $n processors running; exactly one was started"
+  return 0
 }
 
 # A Realm can only join a rollback at the moment FROZEN is published, and only
