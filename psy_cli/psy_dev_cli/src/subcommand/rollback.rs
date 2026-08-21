@@ -28,6 +28,7 @@ use psy_node_core::store::rollback_participants::{RollbackParticipant, RollbackP
 use psy_node_scylla::rollback::{
     CanonicalHeadNoTabletKeyspace, CoordinatorRollbackControlPlane, RollbackControlKeyspaces,
     ScyllaCanonicalHeadStore, ScyllaRollbackExecutor, ScyllaRollbackParticipantView,
+    ScyllaRowImageReader, decode_locator_canonical,
 };
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
@@ -63,6 +64,12 @@ pub enum RollbackCommand {
     Status,
     /// Discard everything above a height.
     To(ToArgs),
+    /// Check that a rollback restored what was there before.
+    ///
+    /// The G-W assertion of design-r1 §11: every physical key the discarded
+    /// range touched reads, byte for byte, as it did before the range wrote it,
+    /// and every key the range created no longer exists.
+    Verify(VerifyArgs),
     /// Carry an interrupted rollback to Idle.
     ///
     /// Separate from `to` so that finishing one is never something that happens
@@ -70,6 +77,48 @@ pub enum RollbackCommand {
     /// already decided, and a resume that took a target would invite giving it
     /// a different one.
     Resume,
+}
+
+#[derive(Args)]
+pub struct VerifyArgs {
+    /// Which keyspace's own state to check. `coordinator`, or `0` / `1` for a
+    /// Realm.
+    #[arg(long, default_value = "coordinator")]
+    pub who: String,
+
+    /// For a Realm, which of its two kinds of row.
+    ///
+    /// A Realm's rows above the target come from two places and are undone two
+    /// different ways, on opposite schedules, and one question cannot be asked
+    /// of both.
+    ///
+    /// `manifest` covers what the Realm committed itself, which the rollback
+    /// plan deletes or restores. Those are settled the moment the rollback
+    /// returns and must be checked **before the Realm runs again** -- the tables
+    /// have no version axis, so an as-of read returns whatever is stored now and
+    /// a Realm that has resynced a few heights has overwritten the answer.
+    ///
+    /// `resync` covers what it wrote while merely syncing. No manifest names it;
+    /// it is undone by re-fetching from the Coordinator, which cannot have
+    /// happened while the Realm is stopped and must have happened once it has
+    /// caught up. So that one runs **after** recovery, and asks the question
+    /// that fits: the discarded branch's value must no longer be what the row
+    /// holds.
+    #[arg(long, default_value = "manifest")]
+    pub assert: String,
+
+    /// The range and branch. Taken from the most recent rollback when omitted,
+    /// which is what an operator checking the rollback they just ran wants.
+    #[arg(long)]
+    pub head: Option<u64>,
+    #[arg(long)]
+    pub target: Option<u64>,
+    /// The epoch the discarded range was committed under -- **not** the one the
+    /// rollback opened. After a rollback a height carries manifests from both
+    /// branches, and taking the later one compares this chain against the branch
+    /// that replaced the discarded range: it passes, and proves nothing.
+    #[arg(long)]
+    pub epoch: Option<u64>,
 }
 
 #[derive(Args)]
@@ -208,6 +257,7 @@ pub async fn run(args: RollbackArgs) -> anyhow::Result<()> {
         RollbackCommand::Status => status(&chain, &args).await,
         RollbackCommand::To(to) => roll_back(&chain, &args, Some(to.target)).await,
         RollbackCommand::Resume => roll_back(&chain, &args, None).await,
+        RollbackCommand::Verify(verify) => run_verify(&chain, &args, verify).await,
     }
 }
 
@@ -328,5 +378,283 @@ async fn roll_back(chain: &Chain, args: &RollbackArgs, target: Option<u64>) -> a
         );
     }
     println!("done; the Coordinator and Realms restart themselves from here");
+    Ok(())
+}
+
+/// One journal observation, as the assertion needs it.
+struct Witness {
+    locator: Vec<u8>,
+    before: Option<Vec<u8>>,
+    /// What the discarded branch left in the row. Only the resync assertion uses
+    /// it, and it uses it to say that value must be gone.
+    after: Option<Vec<u8>>,
+    /// The checkpoint an as-of read landed on when the before image was taken,
+    /// and set **only** for tables with a version axis.
+    ///
+    /// That makes it the discriminator for whether this key can still be judged
+    /// once the chain has moved on. A version-axis row is still readable as it
+    /// was at the target, because the earlier version is a different row the
+    /// rollback left standing. An axis-less row has one row and one value, so
+    /// the moment the chain re-produces the range it holds the new branch's
+    /// value and the question can no longer be asked.
+    versioned: bool,
+}
+
+/// The last rollback the chain recorded, as (head, target, discarded epoch).
+async fn last_rollback(chain: &Chain) -> anyhow::Result<(u64, u64, u64)> {
+    let rows = chain
+        .session
+        .query_unpaged(
+            format!(
+                "SELECT chain_epoch, previous_epoch, head, target FROM {}.rollback_event \
+                 WHERE network_chain_id = ? LIMIT 8",
+                chain.no_tablet
+            ),
+            (chain.network.chain_id() as i64,),
+        )
+        .await?
+        .into_rows_result()?;
+    // Nullable because a rollback whose request was never recorded leaves a row
+    // with an outcome and nothing else; skipping those beats refusing to read
+    // the table.
+    for row in rows.rows::<(i64, Option<i64>, Option<i64>, Option<i64>)>()? {
+        let (_, previous, head, target) = row?;
+        if let (Some(previous), Some(head), Some(target)) = (previous, head, target) {
+            return Ok((head as u64, target as u64, previous as u64));
+        }
+    }
+    anyhow::bail!("this chain has no complete rollback record to check")
+}
+
+/// Every key position the discarded range touched, with what was there just
+/// before the first commit above the target that wrote it.
+///
+/// Keyed by **position**, not by locator. A version-axis table encodes the
+/// checkpoint into the locator, so one tree node written at ten heights is ten
+/// locators; treating those as ten keys collapses "the first checkpoint above
+/// the target that touched K" into "every checkpoint", which asserts the wrong
+/// thing. At `c` the before image is the value at `c - 1`, while after a
+/// rollback to T a read returns the value at T, and those agree only for the
+/// first touch.
+async fn witnesses_first_touch(
+    chain: &Chain,
+    keyspace: &str,
+    reader: &ScyllaRowImageReader,
+    target: u64,
+    head: u64,
+    chain_epoch: u64,
+) -> anyhow::Result<Vec<Witness>> {
+    let mut first: std::collections::BTreeMap<Vec<u8>, Witness> = std::collections::BTreeMap::new();
+    for checkpoint in (target + 1)..=head {
+        let rows = chain
+            .session
+            .query_unpaged(
+                format!(
+                    "SELECT locator, before_image, before_present, after_image, after_present \
+                     , before_version FROM {keyspace}.rollback_verification_journal_by_epoch \
+                     WHERE checkpoint_id = ? AND chain_epoch = ?"
+                ),
+                (checkpoint as i64, chain_epoch as i64),
+            )
+            .await?
+            .into_rows_result()?;
+        for row in rows.rows::<(
+            Vec<u8>,
+            Option<Vec<u8>>,
+            Option<bool>,
+            Option<Vec<u8>>,
+            Option<bool>,
+            Option<i64>,
+        )>()?
+        {
+            let (locator, before, present, after, after_present, before_version) = row?;
+            let Ok(resolved) = decode_locator_canonical(&locator) else { continue };
+            let Ok(position) = reader.position_key(&resolved) else { continue };
+            first.entry(position).or_insert(Witness {
+                locator,
+                before: before.filter(|_| present.unwrap_or(false)),
+                after: after.filter(|_| after_present.unwrap_or(false)),
+                versioned: before_version.is_some_and(|version| version >= 0),
+            });
+        }
+    }
+    Ok(first.into_values().collect())
+}
+
+async fn run_verify(chain: &Chain, args: &RollbackArgs, verify: &VerifyArgs) -> anyhow::Result<()> {
+    let (head, target, epoch) = match (verify.head, verify.target, verify.epoch) {
+        (Some(h), Some(t), Some(e)) => (h, t, e),
+        (None, None, None) => {
+            let found = last_rollback(chain).await?;
+            line(format!(
+                "checking the last rollback: {} -> {} on epoch {}",
+                found.0, found.1, found.2
+            ));
+            found
+        }
+        _ => anyhow::bail!("give all three of --head, --target and --epoch, or none of them"),
+    };
+
+    let realm: Option<u32> = match verify.who.as_str() {
+        "coordinator" => None,
+        other => Some(other.parse().map_err(|_| {
+            anyhow::anyhow!("--who takes `coordinator` or a realm id, not {other:?}")
+        })?),
+    };
+    let keyspace = match realm {
+        None => chain.keyspace.clone(),
+        Some(id) => format!("realm_{id}"),
+    };
+
+    let reader = ScyllaRowImageReader::prepare(chain.session.clone(), &keyspace).await?;
+    let witnesses = witnesses_first_touch(chain, &keyspace, &reader, target, head, epoch).await?;
+    if witnesses.is_empty() {
+        // Not a failure. A Realm changes state only when it has transactions,
+        // so a range may hold none of its writes -- but a caller running this
+        // over many rounds and never seeing a key checked is being told nothing,
+        // and only that caller can tell the difference.
+        line(format!("nothing in ({target}, {head}] on epoch {epoch} belongs to {keyspace}"));
+        line("G-W checked 0 key positions");
+        return Ok(());
+    }
+
+    // For a Realm, which half of its rows this run is about.
+    let planned: Option<std::collections::HashSet<Vec<u8>>> = match realm {
+        None => None,
+        Some(realm_id) => {
+            let sub_id: u16 = 1;
+            let core = std::sync::Arc::new(
+                psy_node_scylla::core::ScyllaCoreStore::<PHash, parth_core::pgoldilocks::PoseidonHasher>::new(
+                    0,
+                    0,
+                    keyspace.clone(),
+                    &[args.scylla_url.clone()],
+                )
+                .await?,
+            );
+            let control = psy_node_scylla::rollback::RealmRollbackControlPlane::setup(
+                core.as_ref(),
+                chain.network.chain_id() as i64,
+            )
+            .await?;
+            let recording: psy_node_core::store::realm_commit_recording::RealmCommitRecording<PHash> =
+                control.recording();
+            let executor = psy_node_scylla::rollback::ScyllaRealmRollbackExecutor::prepare(
+                chain.session.clone(),
+                &keyspace,
+                &format!("{keyspace}_no_tablet"),
+            )
+            .await?;
+            // The head of the range being checked, not the chain's head now.
+            // After the rollback the live head *is* the target, and planning
+            // from it asks a Realm to undo a range of zero length. The hash is
+            // the Coordinator's coordinate and is not consulted for a Realm's
+            // own manifest, so carrying the current one over is harmless; the
+            // height is what bounds the search.
+            let live = chain
+                .head()
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("no canonical head"))?;
+            let head_ref = CanonicalChainRef::new(
+                chain.network,
+                psy_data::protocol::canonical_chain::ChainEpoch::new(epoch),
+                psy_data::protocol::canonical_chain::CheckpointRef::new(
+                    psy_data::protocol::canonical_chain::CheckpointId::new(head),
+                    *live.checkpoint().checkpoint_hash(),
+                ),
+            );
+            let plan = executor
+                .plan(&recording, realm_id, sub_id, &head_ref, target)
+                .await?;
+            let set: std::collections::HashSet<Vec<u8>> = plan
+                .checkpoints
+                .iter()
+                .flat_map(|c| c.rows.iter().map(|(_, locator)| locator.clone()))
+                .collect();
+            line(format!("the Realm's plan names {} rows", set.len()));
+            Some(set)
+        }
+    };
+
+    // Whether the chain has already re-produced the range. An axis-less row has
+    // one row and one value, so once the range is back the row holds the new
+    // branch's value and no question can be asked of it -- which is not a
+    // mismatch, though it reads exactly like one. The same `verify` passed on
+    // 746 keys and then failed on a CheckpointLeaf a minute later, with nothing
+    // changed but the clock.
+    let live_head = chain
+        .published_height(&chain.keyspace)
+        .await?
+        .unwrap_or(target);
+    let too_late = live_head > target;
+    if too_late {
+        line(format!(
+            "the chain has re-produced past the target ({live_head} > {target}), so rows in              tables without a version axis now hold the new branch's value; they are skipped"
+        ));
+    }
+
+    let manifest_named = verify.assert == "manifest";
+    if realm.is_some() && !matches!(verify.assert.as_str(), "manifest" | "resync") {
+        anyhow::bail!("--assert takes `manifest` or `resync`, not {:?}", verify.assert);
+    }
+
+    let mut checked = 0usize;
+    let mut skipped = 0usize;
+    let mut wrong = Vec::new();
+    for witness in &witnesses {
+        if let Some(planned) = &planned {
+            let named = planned.contains(&witness.locator);
+            if named != manifest_named {
+                continue;
+            }
+        }
+        if too_late && !witness.versioned {
+            skipped += 1;
+            continue;
+        }
+        let Ok(resolved) = decode_locator_canonical(&witness.locator) else { continue };
+        let Ok(live) = reader.read_as_of(&resolved, target).await else { continue };
+        checked += 1;
+        let live_bytes = live.as_ref().map(|image| image.canonical_bytes());
+        let bad = if planned.is_some() && !manifest_named {
+            // Nothing to restore here: the Coordinator's copy is authoritative
+            // and the Realm re-fetches it. What must be true is that the
+            // discarded branch's value is no longer what the row holds. Said
+            // that way round rather than "the new value", because this does not
+            // know what the new branch wrote.
+            witness.after.is_some() && live_bytes == witness.after
+        } else {
+            live_bytes != witness.before
+        };
+        if bad {
+            line(format!(
+                "MISMATCH {:?} locator={} before={:?} after={:?} live={:?}",
+                resolved.physical_table(),
+                hex::encode(&witness.locator),
+                witness.before.as_ref().map(hex::encode),
+                witness.after.as_ref().map(hex::encode),
+                live_bytes.as_ref().map(hex::encode),
+            ));
+            wrong.push(format!("{:?}", resolved.physical_table()));
+        }
+    }
+
+    line(format!("G-W checked {checked} key positions in {keyspace}"));
+    if skipped > 0 {
+        line(format!(
+            "  {skipped} skipped: no version axis, and the range has already been re-produced.              Run verify before the chain comes back to judge those."
+        ));
+    }
+    if checked == 0 {
+        line("nothing in this range belongs to the half being checked");
+        return Ok(());
+    }
+    if !wrong.is_empty() {
+        anyhow::bail!(
+            "G-W failed for {} of {checked} keys in {keyspace}: {wrong:?}",
+            wrong.len()
+        );
+    }
+    line("G-W passed");
     Ok(())
 }
