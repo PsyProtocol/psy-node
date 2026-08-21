@@ -115,6 +115,26 @@ for round in $(seq 1 "$ROUNDS"); do
   [ -n "$rolled_head" ] && [ -n "$rolled_target" ] && [ -n "$discarded_epoch" ] \
     || fail "round $round: could not read the range out of the rollback report"
 
+  # The Realms have to be still for this.  The tables that carry a Realm's own
+  # rollback -- the pending-id maps, the IMT cursor -- have no version axis, so
+  # an as-of read returns whatever is stored *now*, and a Realm that has already
+  # resynced a few heights has overwritten exactly the rows being checked. The
+  # answer then depends on how fast it restarted, which is how one round passed
+  # with 474 key positions and the next failed on eight.
+  realm_procs_stopped=0
+  for r in 0 1; do
+    for p in $(pgrep -a psy_node_cli 2>/dev/null | grep "start-realm-processor --realm-id $r " | awk '{print $1}'); do
+      ppid=$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null || true)
+      [ -n "${ppid:-}" ] && [ "$ppid" != 1 ] && kill "$ppid" 2>/dev/null || true
+      sleep 1; kill "$p" 2>/dev/null || true
+      realm_procs_stopped=$((realm_procs_stopped + 1))
+    done
+  done
+  for _ in $(seq 1 40); do
+    [ "$(pgrep -a psy_node_cli 2>/dev/null | grep -c 'start-realm-processor')" -eq 0 ] && break
+    sleep 1
+  done
+
   for r in 0 1; do
     PSY_ROLLBACK_REALM_KEYSPACE="realm_$r" PSY_ROLLBACK_REALM_SUB_ID=1 \
       PSY_ROLLBACK_VERIFY_ONLY=1 PSY_ROLLBACK_HEAD="$rolled_head" \
@@ -127,6 +147,18 @@ for round in $(seq 1 "$ROUNDS"); do
     echo "realm-$r G-W: ${checked:-0} key positions"
     realm_gw_total=$((realm_gw_total + ${checked:-0}))
   done
+
+  # Back under their supervisors, or the next round finds no Realm at all.
+  if [ "$realm_procs_stopped" -gt 0 ]; then
+    [ -n "${PSY_ROLLBACK_REALM_LOOP:-}" ] || fail \
+      "set PSY_ROLLBACK_REALM_LOOP to the realm supervisor script; the Realms were stopped for \
+       the G-W check and there is nothing to start them again with"
+    for r in 0 1; do
+      setsid nohup bash "$PSY_ROLLBACK_REALM_LOOP" "$r" \
+        >> "$LOGS/realm-$r-processor.log" 2>&1 < /dev/null &
+    done
+    sleep 5
+  fi
 
   # Recovery is the part no one drives: the Coordinator and both Realms have to
   # notice, undo their share, restart themselves and pass the old head again.
