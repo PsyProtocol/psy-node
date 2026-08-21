@@ -73,23 +73,87 @@ where
 
             // We wait level-by-level because higher levels usually depend on the output of
             // lower levels.
-            self.db
-                .proof_work_queue
-                .wait_until_all_jobs_complete_or_timeout_worker(
-                    queue_key,
-                    self.db.state.realm_id_u64,
-                    self.db.state.realm_sub_id_u64,
-                    self.db.state.processing_proc_checkpoint_unique_id,
-                    0,
-                    self.proof_worker_queue_max_time_ms,
-                )
-                .await?;
+            self.wait_jobs_or_rollback(queue_key).await?;
             timer.lap("waited for jobs to complete");
             tracing::info!("All jobs at level {} completed", level);
         }
         proving_state.finish();
         self.db.temp_db.set_psy_node_proving_state(&self.db.state.realm_identifier, &proving_state).await?;
         Ok(())
+    }
+
+    /// Wait for this level's jobs, or give up the block if a rollback started.
+    ///
+    /// A Realm can only join a rollback at the moment FROZEN is published, and
+    /// the only place it looks is the top of its loop. A Realm that is here when
+    /// that happens never gets back there: the Coordinator is frozen, so the
+    /// jobs this is waiting on will not be produced, and the wait runs to its
+    /// timeout -- which is longer than the freeze barrier's patience.
+    ///
+    /// The Coordinator waits FREEZE_ALL out and then stops the chain, naming a
+    /// Realm that is alive, healthy and simply somewhere else. That is what
+    /// happened the first time the Realms were made real participants: realm-1
+    /// happened to be at the top of its loop and filed, realm-0 was here, and
+    /// the barrier waited 180 seconds for a Realm that had no way to answer.
+    ///
+    /// Returning an error abandons the block, which is right: every proof it is
+    /// waiting for is against a checkpoint that is about to stop existing. The
+    /// loop then reaches the phase check and the Realm takes part.
+    ///
+    /// The Coordinator learned this already -- `wait_jobs_or_rollback` there,
+    /// for the same reason -- and this is that, on the side that has to answer a
+    /// barrier rather than publish one.
+    async fn wait_jobs_or_rollback(
+        &self,
+        queue_key: &RealmProvingWorkQueueKey<N::QHash, N::JobId>,
+    ) -> anyhow::Result<()> {
+        let jobs = self
+            .db
+            .proof_work_queue
+            .wait_until_all_jobs_complete_or_timeout_worker(
+                queue_key,
+                self.db.state.realm_id_u64,
+                self.db.state.realm_sub_id_u64,
+                self.db.state.processing_proc_checkpoint_unique_id,
+                0,
+                self.proof_worker_queue_max_time_ms,
+            );
+        tokio::select! {
+            result = jobs => result,
+            reason = self.rollback_published_while_waiting() => Err(reason),
+        }
+    }
+
+    /// Resolves when a rollback has been published, and never otherwise.
+    ///
+    /// Polled, because the phase lives on a durable row another process writes
+    /// and there is nothing to subscribe to. Every few seconds against a wait
+    /// that would otherwise run for minutes.
+    ///
+    /// The error is **typed**, and has to be. `is_refused_because_rollback`
+    /// classifies by downcasting, not by reading the message, and the loop parks
+    /// the Realm in Error for anything it does not recognise. A plain
+    /// `anyhow!("a rollback started")` would abandon the block and then stop the
+    /// Realm for having abandoned it -- a correct guard killing the node, which
+    /// this codebase has done five times already. `NormalAdvanceWhileRollbackActive`
+    /// is what the Coordinator returns in the same situation and what the
+    /// classifier already knows.
+    async fn rollback_published_while_waiting(&self) -> anyhow::Error {
+        use psy_node_core::store::canonical_head::CanonicalHeadModelError;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            if let Ok(Some(phase)) = self.db.follow_coordinator_rollback_phase().await {
+                if !phase.permits_commit() {
+                    return anyhow::Error::new(
+                        CanonicalHeadModelError::NormalAdvanceWhileRollbackActive,
+                    )
+                    .context(
+                        "a rollback was published while this block waited for proofs; abandoning \
+                         it so this Realm can reach the phase check and take part",
+                    );
+                }
+            }
+        }
     }
 
     pub fn get_root_job_id(&self, guta_jobs: &[Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>]) -> anyhow::Result<Option<N::JobId>> {

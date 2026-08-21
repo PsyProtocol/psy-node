@@ -415,6 +415,28 @@ pub fn participant_for(scope: psy_data::protocol::chain_context::AuthorityScope)
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_refusal_is_still_a_refusal_under_context() {
+        // The Realm abandons a block from inside a proof wait and explains why
+        // with `.context`. The classifier downcasts rather than reading the
+        // message, and the Realm's loop parks the processor in Error for
+        // anything it does not recognise -- so a refusal that stopped being
+        // recognised once wrapped would abandon the block and then stop the
+        // Realm for having abandoned it.
+        use super::super::canonical_head::CanonicalHeadModelError;
+        use anyhow::Context;
+        let bare = anyhow::Error::new(CanonicalHeadModelError::NormalAdvanceWhileRollbackActive);
+        assert!(super::is_refused_because_rollback(&bare));
+        let explained = anyhow::Error::new(
+            CanonicalHeadModelError::NormalAdvanceWhileRollbackActive,
+        )
+        .context("a rollback was published while this block waited for proofs");
+        assert!(
+            super::is_refused_because_rollback(&explained),
+            "context must not hide the type the classifier looks for"
+        );
+    }
+
     use super::*;
     use super::super::commit_window::{CommitWindow, CommitWindowClock};
     use super::super::timestamp::CommitWriteTimestampUs;
