@@ -24,5 +24,6 @@ pub mod rollback_event;
 pub mod rollback_participants;
 pub mod rollback_reload;
 pub mod rollback_plan;
+pub mod rollback_request;
 pub mod timestamp;
 pub mod verification_journal;
