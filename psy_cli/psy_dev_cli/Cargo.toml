@@ -69,6 +69,9 @@ psy_data = { workspace = true }
 psy_io = { workspace = true }
 psy_api_core = { workspace = true }
 psy_node_core = { workspace = true, features = ["clap_cli"] }
+# The rollback driver talks only to Scylla -- no RPC to any processor -- so it
+# needs the store layer directly.
+psy_node_scylla = { workspace = true }
 psy_node_common = { workspace = true }
 psy_config = { workspace = true }
 psy_plonky2_circuits = { workspace = true }

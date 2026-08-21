@@ -286,6 +286,27 @@ impl<Hash: Q256BitHash> RollbackControlState<Hash> {
     /// Aborting sits outside the sequence.  It is not a further step along it
     /// but a different ending, so it is given the same ordinal as Idle: nothing
     /// forward may be skipped on the strength of an abort.
+    /// The phase as one word.
+    ///
+    /// Here rather than in whatever is printing, so an operator reading a log
+    /// line, a CLI and an error message are all told the same name for the same
+    /// state. The `Debug` of this type carries the whole request with it and is
+    /// no use for saying where a chain is.
+    pub const fn phase_name(&self) -> &'static str {
+        match self {
+            Self::Idle => "Idle",
+            Self::Requested(_) => "Requested",
+            Self::Frozen(_) => "Frozen",
+            Self::Archiving(_) => "Archiving",
+            Self::ArchiveBarrierReady(_) => "ArchiveBarrierReady",
+            Self::Deleting(_) => "Deleting",
+            Self::Restoring(_) => "Restoring",
+            Self::Verifying(_) => "Verifying",
+            Self::AllRealmsReady(_) => "AllRealmsReady",
+            Self::Aborting(_) => "Aborting",
+        }
+    }
+
     pub const fn phase_ordinal(&self) -> u8 {
         match self {
             Self::Idle => PHASE_ORDINAL_IDLE,

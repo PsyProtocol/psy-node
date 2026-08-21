@@ -7,6 +7,7 @@ pub mod redis_inspect;
 pub mod scylla_inspect;
 pub mod nats_inspect;
 pub mod chain_info;
+pub mod rollback;
 
 use chain_info::ChainInfoArgs;
 use nats_inspect::NatsInspectArgs;
@@ -14,6 +15,7 @@ use read_checkpoint_backup::ReadCheckpointBackupArgs;
 use read_realm_backup::ReadRealmBackupArgs;
 use read_worker_backup::ReadWorkerBackupArgs;
 use redis_inspect::RedisInspectArgs;
+use rollback::RollbackArgs;
 use scylla_inspect::ScyllaInspectArgs;
 
 #[derive(Parser)]
@@ -38,4 +40,6 @@ pub enum Commands {
     NatsInspect(NatsInspectArgs),
     #[command(about = "Config-driven chain info query across coordinator and realms")]
     ChainInfo(ChainInfoArgs),
+    #[command(about = "Drive a rollback from outside the chain, over the database alone")]
+    Rollback(RollbackArgs),
 }

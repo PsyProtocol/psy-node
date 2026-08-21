@@ -30,6 +30,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::NatsInspect(args) => {
             subcommand::nats_inspect::run(args).await?;
         }
+        Commands::Rollback(args) => {
+            crate::subcommand::rollback::run(args).await?;
+        }
         Commands::ChainInfo(args) => {
             subcommand::chain_info::run(args).await?;
         }
