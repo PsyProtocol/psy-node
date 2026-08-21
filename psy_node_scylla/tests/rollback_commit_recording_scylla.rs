@@ -42,8 +42,9 @@ use psy_node_core::store::rollback_control::RollbackControlState;
 use psy_node_core::store::manifest_store::ManifestArtifactKind;
 use psy_node_scylla::core::ScyllaCoreStore;
 use psy_node_scylla::rollback::{
-    CoordinatorRollbackControlPlane, decode_locator_chunk,
+    CoordinatorRollbackControlPlane, ScyllaRollbackRequestStore, decode_locator_chunk,
 };
+use psy_node_core::store::rollback_request::{PickupDecision, StaleReason, decide_pickup};
 
 const CHECKPOINT_TREE_HEIGHT: u8 = 32;
 
@@ -639,6 +640,88 @@ async fn a_commit_window_decides_the_write_timestamp_of_its_rows() -> anyhow::Re
 
     // And the window really closed, rather than merely stopping being consulted.
     assert!(recording.require_commit_window(4242).is_err());
+
+    drop_keyspaces(&core).await;
+    Ok(())
+}
+
+/// Re-sending is the operator's retry, so two attempts are two rows.
+///
+/// A request that is not taken up expires on its own -- it names the head the
+/// operator saw -- so the retry has to be a *new* request naming the new head,
+/// not an edit of the old one.  Both stay on the record: "asked three times
+/// before the chain took it up" is exactly the kind of thing someone reading
+/// this table afterwards needs to be able to see.
+#[tokio::test]
+#[ignore = "requires a reachable Scylla"]
+async fn resending_a_request_records_both_and_offers_the_newest() -> anyhow::Result<()> {
+    let (core, _control, keyspace) = bring_up("request_inbox").await?;
+    let no_tablet = format!("{keyspace}_no_tablet");
+    ScyllaRollbackRequestStore::create_table(&core.session, &no_tablet).await?;
+    let store =
+        ScyllaRollbackRequestStore::prepare(core.session.clone(), &no_tablet, 0).await?;
+
+    assert!(
+        store.newest().await?.is_none(),
+        "a chain nobody has asked to roll back has an empty mailbox"
+    );
+
+    let first = store.submit(90, 100, "operator-a").await?;
+    let second = store.submit(90, 104, "operator-a").await?;
+    assert!(second > first, "the retry must sort above the first attempt");
+
+    let newest = store.newest().await?.expect("a request was submitted");
+    assert_eq!(newest.expected_head, 104, "the newest request is the one that counts");
+    assert_eq!(newest.target, 90);
+    assert_eq!(newest.requested_by, "operator-a");
+    assert_eq!(newest.consumed_epoch, None);
+    assert_eq!(store.recent(10).await?.len(), 2, "both attempts stay on the record");
+
+    drop_keyspaces(&core).await;
+    Ok(())
+}
+
+/// Marking an entry consumed cannot invent one.
+///
+/// The same lesson as `set_outcome` on the event table: a bare UPDATE creates
+/// the row, so a mark that arrived for an entry nobody wrote would leave a
+/// half-row carrying a consumed epoch and no request -- and the mailbox would
+/// then offer a request that was never made.
+#[tokio::test]
+#[ignore = "requires a reachable Scylla"]
+async fn a_consumed_request_is_not_offered_again() -> anyhow::Result<()> {
+    let (core, _control, keyspace) = bring_up("request_consumed").await?;
+    let no_tablet = format!("{keyspace}_no_tablet");
+    ScyllaRollbackRequestStore::create_table(&core.session, &no_tablet).await?;
+    let store =
+        ScyllaRollbackRequestStore::prepare(core.session.clone(), &no_tablet, 0).await?;
+
+    let at = store.submit(90, 100, "operator-a").await?;
+    assert!(
+        matches!(
+            decide_pickup(&store.newest().await?.unwrap(), 100),
+            PickupDecision::Take { target: 90 }
+        ),
+        "an unconsumed request against the head it named must be taken up"
+    );
+
+    store.mark_consumed(at, 1).await?;
+    let after = store.newest().await?.expect("the row is still there");
+    assert_eq!(after.consumed_epoch, Some(1));
+    assert!(matches!(
+        decide_pickup(&after, 100),
+        PickupDecision::Stale {
+            reason: StaleReason::AlreadyConsumed
+        }
+    ));
+
+    // A mark for an entry that does not exist must not create one.
+    store.mark_consumed(at + 1_000_000, 2).await?;
+    assert_eq!(
+        store.recent(10).await?.len(),
+        1,
+        "marking an absent entry consumed must not invent it"
+    );
 
     drop_keyspaces(&core).await;
     Ok(())
