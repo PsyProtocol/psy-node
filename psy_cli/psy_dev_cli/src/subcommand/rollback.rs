@@ -192,6 +192,16 @@ impl Chain {
     }
 }
 
+/// Print a line, and do not mind if nobody is listening.
+///
+/// `println!` panics when the write fails, and a closed stdout is what
+/// `| head -2` looks like from in here. Reporting a chain's state should not
+/// end in a backtrace because the reader had seen enough.
+fn line(text: impl AsRef<str>) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stdout().lock(), "{}", text.as_ref());
+}
+
 pub async fn run(args: RollbackArgs) -> anyhow::Result<()> {
     let chain = Chain::open(&args).await?;
     match &args.command {
@@ -203,7 +213,7 @@ pub async fn run(args: RollbackArgs) -> anyhow::Result<()> {
 
 async fn status(chain: &Chain, args: &RollbackArgs) -> anyhow::Result<()> {
     let Some(head) = chain.head().await? else {
-        println!("no canonical head in {}: this keyspace holds no chain", chain.keyspace);
+        line(format!("no canonical head in {}: this keyspace holds no chain", chain.keyspace));
         return Ok(());
     };
     let recording = chain.control.recording::<PHash>();
@@ -211,35 +221,41 @@ async fn status(chain: &Chain, args: &RollbackArgs) -> anyhow::Result<()> {
         CanonicalHeadReadState::Current(stored) => stored,
         CanonicalHeadReadState::Uninitialized => unreachable!("head was just read"),
     };
-    println!(
+    line(format!(
         "chain      epoch {} at checkpoint {}",
         head.chain_epoch().get(),
         head.checkpoint().checkpoint_id().get()
-    );
-    println!("phase      {}", stored.rollback_control().phase_name());
+    ));
+    line(format!("phase      {}", stored.rollback_control().phase_name()));
 
-    print!("heights    {}=", chain.keyspace);
-    match chain.published_height(&chain.keyspace).await? {
-        Some(height) => print!("{height}"),
-        // Only ever seen mid-rollback, and worth naming rather than printing a
-        // dash: it is the fingerprint of a run interrupted between the delete
-        // and the restore.
-        None => print!("(none: delete has run, restore has not)"),
-    }
+    let mut heights = format!(
+        "heights    {}={}",
+        chain.keyspace,
+        match chain.published_height(&chain.keyspace).await? {
+            Some(height) => height.to_string(),
+            // Only ever seen mid-rollback, and worth naming rather than printing
+            // a dash: it is the fingerprint of a run interrupted between the
+            // delete and the restore.
+            None => "(none: delete has run, restore has not)".to_string(),
+        }
+    );
     for entry in args.realms.split(',').map(str::trim).filter(|e| !e.is_empty()) {
         if let Some((realm, _)) = entry.split_once(':') {
             let keyspace = format!("realm_{}", realm.trim());
             let height = chain.published_height(&keyspace).await?;
-            print!("  {keyspace}={}", height.map(|h| h.to_string()).unwrap_or_else(|| "-".into()));
+            heights.push_str(&format!(
+                "  {keyspace}={}",
+                height.map(|h| h.to_string()).unwrap_or_else(|| "-".into())
+            ));
         }
     }
-    println!();
+    line(heights);
 
     match chain.in_flight().await? {
-        Some((head, target)) => println!(
-            "in flight  {head} -> {target}; finish it with `rollback resume`"
-        ),
-        None => println!("in flight  none"),
+        Some((head, target)) => {
+            line(format!("in flight  {head} -> {target}; finish it with `rollback resume`"))
+        }
+        None => line("in flight  none"),
     }
     Ok(())
 }

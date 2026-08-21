@@ -33,10 +33,29 @@ fail() { echo "[soak] FAIL: $*" >&2; exit 1; }
 status() { "$CLI" rollback status 2>/dev/null; }
 head_of() { status | sed -n 's/^chain.*checkpoint \([0-9]*\)/\1/p'; }
 phase_of() { status | sed -n 's/^phase *\(.*\)/\1/p' | tr -d ' '; }
-height() { "${CQL[@]}" "SELECT value FROM $1.u64_singleton_table WHERE obj_id = 1;" 2>/dev/null \
-             | sed -n '4p' | tr -d ' '; }
-realm_own() { "${CQL[@]}" "SELECT MAX(checkpoint_id) FROM realm_$1_no_tablet.authority_manifest;" \
-                2>/dev/null | sed -n '4p' | tr -d ' '; }
+# Never fails, because it is read inside `set -e` and a database that hiccups
+# once must not end the run. cqlsh exits non-zero on any error and `pipefail`
+# carries that out of the pipeline, so an unguarded `now=$(height ...)` kills
+# the script *silently* -- no message, no FAIL line, just a log that stops. That
+# is exactly how a bring-up appeared to hang for forty minutes while nothing was
+# running.
+#
+# An unreadable height comes back empty, and empty means "not yet" to every
+# caller here.
+height() {
+  local out
+  out=$("${CQL[@]}" "SELECT value FROM $1.u64_singleton_table WHERE obj_id = 1;" 2>/dev/null) || return 0
+  echo "$out" | sed -n '4p' | tr -d ' '
+}
+realm_own() {
+  local out
+  out=$("${CQL[@]}" "SELECT MAX(checkpoint_id) FROM realm_$1_no_tablet.authority_manifest;" \
+          2>/dev/null) || return 0
+  # `null` is what cqlsh prints for a Realm that has never committed. Left as
+  # itself it compares as a string against a number and the round dies on
+  # "integer expression expected"; empty is what the callers already handle.
+  echo "$out" | sed -n '4p' | tr -d ' ' | grep -v '^null$' || true
+}
 
 say "$ROUNDS round(s), $DEPTH checkpoints deep, ${SETTLE}s of ordinary life between them"
 [ "$(phase_of)" = "Idle" ] || fail "a rollback is already in flight: $(status | tail -1)"

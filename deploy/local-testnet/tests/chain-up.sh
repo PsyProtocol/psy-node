@@ -52,8 +52,20 @@ wait_for_port() {  # wait_for_port <port> <what> <seconds>
   say "$2 is listening on $1 (after ${waited}s)"
 }
 
-height() { "${CQL[@]}" "SELECT value FROM $1.u64_singleton_table WHERE obj_id = 1;" 2>/dev/null \
-             | sed -n '4p' | tr -d ' '; }
+# Never fails, because it is read inside `set -e` and a database that hiccups
+# once must not end the run. cqlsh exits non-zero on any error and `pipefail`
+# carries that out of the pipeline, so an unguarded `now=$(height ...)` kills
+# the script *silently* -- no message, no FAIL line, just a log that stops. That
+# is exactly how a bring-up appeared to hang for forty minutes while nothing was
+# running.
+#
+# An unreadable height comes back empty, and empty means "not yet" to every
+# caller here.
+height() {
+  local out
+  out=$("${CQL[@]}" "SELECT value FROM $1.u64_singleton_table WHERE obj_id = 1;" 2>/dev/null) || return 0
+  echo "$out" | sed -n '4p' | tr -d ' '
+}
 
 [ -n "${say_reset:-}" ] && say "--reset given: the existing chain will be archived and wiped"
 say "starting the stack; full output in $UP_LOG"
@@ -74,9 +86,12 @@ before=""
 while :; do
   now=$(height coordinator)
   if [ -n "$now" ] && [ -n "$before" ] && [ "$now" -gt "$before" ]; then break; fi
+  # Said out loud every minute. A wait with nothing to show for it is
+  # indistinguishable from a wait that has died, and this one has been both.
+  [ $((waited % 60)) -eq 0 ] && say "  still waiting; coordinator at ${now:-unreadable} (${waited}s)"
   before="$now"
   sleep 15; waited=$((waited + 15))
-  [ "$waited" -lt 900 ] || fail "the chain is not producing (coordinator at ${now:-nothing})"
+  [ "$waited" -lt 900 ] || fail "the chain is not producing (coordinator at ${now:-unreadable})"
 done
 
 # Exit 75 is a processor asking to be restarted after a rollback, and up.sh
