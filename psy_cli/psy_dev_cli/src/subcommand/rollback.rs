@@ -23,7 +23,7 @@ use parth_core::PHash;
 use psy_data::protocol::canonical_chain::{CanonicalChainRef, NetworkId};
 use psy_data::protocol::chain_context::AuthorityScope;
 use psy_core::constants::chain_id::PsyChainNetworkType;
-use psy_node_core::store::canonical_head::CanonicalHeadReadState;
+use psy_node_core::store::canonical_head::{CanonicalHeadModelError, CanonicalHeadReadState};
 use psy_node_core::store::rollback_participants::{RollbackParticipant, RollbackParticipantSet};
 use psy_node_scylla::rollback::{
     CanonicalHeadNoTabletKeyspace, CoordinatorRollbackControlPlane, RollbackControlKeyspaces,
@@ -360,16 +360,47 @@ async fn roll_back(chain: &Chain, args: &RollbackArgs, target: Option<u64>) -> a
     .await?;
     let participants = participants(&args.realms)?;
 
-    // Names this run in the archive. The range is in it so a second attempt at
-    // the same rollback lands on the same rows, and a different one does not
-    // collide with it.
-    let plan_id = format!("dev-cli-{head}-{target}").into_bytes();
-
-    println!("rolling back from {head} to {target}, {} participant(s)", participants.participants().len());
-    let report = executor
-        .roll_back(&recording, &head_ref, target, &plan_id, &participants, Some(&view))
-        .await?;
-    println!("{report:?}");
+    // The head moves between reading it and asking to roll back from it, and on
+    // a busy chain it moves often. The executor requires the request to name the
+    // exact current head -- rightly, since a request naming a stale one would
+    // leave the checkpoints above it undiscarded -- so the answer is to read it
+    // again and ask again, not to treat an ordinary block as a failure.
+    let mut head_ref = head_ref;
+    let mut head = head;
+    let mut attempt = 0;
+    let report = loop {
+        attempt += 1;
+        line(format!(
+            "rolling back from {head} to {target}, {} participant(s)",
+            participants.participants().len()
+        ));
+        let plan_id = format!("dev-cli-{head}-{target}").into_bytes();
+        match executor
+            .roll_back(&recording, &head_ref, target, &plan_id, &participants, Some(&view))
+            .await
+        {
+            Ok(report) => break report,
+            Err(error) => {
+                let moved = matches!(
+                    error.downcast_ref::<CanonicalHeadModelError>(),
+                    Some(CanonicalHeadModelError::RollbackRequestedHeadMismatch)
+                );
+                if !moved || attempt >= 5 {
+                    return Err(error);
+                }
+                let Some(current) = chain.head().await? else {
+                    return Err(error);
+                };
+                head_ref = current;
+                head = head_ref.checkpoint().checkpoint_id().get();
+                if target >= head {
+                    anyhow::bail!("target {target} is no longer below the head {head}");
+                }
+                line(format!("  the head moved while asking; retrying from {head}"));
+            }
+        }
+    };
+    line(format!("{report:?}"));
     if report.head < head {
         anyhow::bail!(
             "the plan started below the published head: planned from {} but {head} was already \
@@ -377,7 +408,7 @@ async fn roll_back(chain: &Chain, args: &RollbackArgs, target: Option<u64>) -> a
             report.head
         );
     }
-    println!("done; the Coordinator and Realms restart themselves from here");
+    line("done; the Coordinator and Realms restart themselves from here");
     Ok(())
 }
 

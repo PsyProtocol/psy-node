@@ -120,39 +120,7 @@ where
             );
         tokio::select! {
             result = jobs => result,
-            reason = self.rollback_published_while_waiting() => Err(reason),
-        }
-    }
-
-    /// Resolves when a rollback has been published, and never otherwise.
-    ///
-    /// Polled, because the phase lives on a durable row another process writes
-    /// and there is nothing to subscribe to. Every few seconds against a wait
-    /// that would otherwise run for minutes.
-    ///
-    /// The error is **typed**, and has to be. `is_refused_because_rollback`
-    /// classifies by downcasting, not by reading the message, and the loop parks
-    /// the Realm in Error for anything it does not recognise. A plain
-    /// `anyhow!("a rollback started")` would abandon the block and then stop the
-    /// Realm for having abandoned it -- a correct guard killing the node, which
-    /// this codebase has done five times already. `NormalAdvanceWhileRollbackActive`
-    /// is what the Coordinator returns in the same situation and what the
-    /// classifier already knows.
-    async fn rollback_published_while_waiting(&self) -> anyhow::Error {
-        use psy_node_core::store::canonical_head::CanonicalHeadModelError;
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            if let Ok(Some(phase)) = self.db.follow_coordinator_rollback_phase().await {
-                if !phase.permits_commit() {
-                    return anyhow::Error::new(
-                        CanonicalHeadModelError::NormalAdvanceWhileRollbackActive,
-                    )
-                    .context(
-                        "a rollback was published while this block waited for proofs; abandoning \
-                         it so this Realm can reach the phase check and take part",
-                    );
-                }
-            }
+            reason = self.db.rollback_published_while_waiting() => Err(reason),
         }
     }
 
@@ -200,10 +168,29 @@ where
             self.db.needs_revert = false;
         }
 
-        let guta_result = self
-            .guta_queue_gatherer
-            .finalize_gathering_and_update_queue_key(self.db.state.gathering_proc_checkpoint_unique_id)
-            .await?;
+        // The second place a Realm can be caught when FROZEN is published, and
+        // the one it was actually caught in. This waits on a oneshot the
+        // gatherer answers when its batch is complete, and a frozen chain
+        // produces nothing more to complete it with -- so the Realm sits here,
+        // never reaches the phase check at the top of its loop, and FREEZE_ALL
+        // waits 180 seconds for a participant that has no way to answer.
+        //
+        // Safe to race because this is a pure wait: no write of this task's is
+        // in flight, so dropping the future abandons nothing half-done.
+        let guta_result = {
+            let unique_id = self.db.state.gathering_proc_checkpoint_unique_id;
+            // Borrowed field by field: the gatherer mutably, the database
+            // immutably. Going through a method on `self` would borrow the whole
+            // processor and the two could not be raced.
+            let db = &self.db;
+            let gathering = self
+                .guta_queue_gatherer
+                .finalize_gathering_and_update_queue_key(unique_id);
+            tokio::select! {
+                result = gathering => result?,
+                reason = db.rollback_published_while_waiting() => return Err(reason),
+            }
+        };
 
         Ok(guta_result)
     }

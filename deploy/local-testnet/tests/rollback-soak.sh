@@ -23,11 +23,35 @@ ROUNDS="${1:-3}"
 DEPTH="${PSY_ROLLBACK_DEPTH:-10}"
 SETTLE="${PSY_ROLLBACK_SETTLE:-270}"
 RECOVER_LIMIT="${PSY_ROLLBACK_RECOVER_SECS:-600}"
+KEYSPACE="${PSY_ROLLBACK_LIVE_KEYSPACE:-coordinator}"
 CQL=(docker exec parth-local-scylla cqlsh -e)
 
 [ -x "$CLI" ] || { echo "FAIL: $CLI is missing; cargo build --release -p psy_dev_cli" >&2; exit 1; }
 
 say() { echo "[soak] $*"; }
+
+# Run a G-W check and add what it looked at to the running total.
+#
+# Immediately after the rollback and *before* waiting for recovery, because the
+# answer expires: a row in a table with no version axis has one value, so once
+# the chain re-produces the range it holds the new branch's and the question
+# cannot be asked. `verify` knows this and skips those rows rather than
+# reporting them as wrong, but skipping them is a smaller check -- the window is
+# now.
+verify_now() {  # verify_now <who> <assert>
+  local out
+  out=$("$CLI" rollback verify --who "$1" --assert "$2" --head "$rolled_head" \
+          --target "$rolled_target" --epoch "$discarded_epoch" 2>&1) || {
+    echo "$out" | grep -aE "MISMATCH|Error" | head -5
+    fail "round $round: $1 ($2) did not restore what was there before"
+  }
+  local n
+  n=$(echo "$out" | sed -n 's/.*G-W checked \([0-9]*\) key positions.*/\1/p' | head -1)
+  local skipped
+  skipped=$(echo "$out" | sed -n 's/.*  \([0-9]*\) skipped:.*/\1/p' | head -1)
+  say "  $1 ($2): ${n:-0} checked${skipped:+, $skipped skipped}"
+  gw_total=$((gw_total + ${n:-0}))
+}
 fail() { echo "[soak] FAIL: $*" >&2; exit 1; }
 
 status() { "$CLI" rollback status 2>/dev/null; }
@@ -56,6 +80,10 @@ realm_own() {
   # "integer expression expected"; empty is what the callers already handle.
   echo "$out" | sed -n '4p' | tr -d ' ' | grep -v '^null$' || true
 }
+
+# A run in which nothing was ever checked proves nothing, however many rounds
+# it passed. Only this loop can see that across rounds.
+gw_total=0
 
 say "$ROUNDS round(s), $DEPTH checkpoints deep, ${SETTLE}s of ordinary life between them"
 [ "$(phase_of)" = "Idle" ] || fail "a rollback is already in flight: $(status | tail -1)"
@@ -93,6 +121,25 @@ for round in $(seq 1 "$ROUNDS"); do
   fi
   [ "$(phase_of)" = "Idle" ] || fail "round $round: still in $(phase_of) after resuming"
 
+  # The range that was actually discarded, from the Coordinator's own record
+  # rather than from what was asked for: the head moves between reading it and
+  # the executor planning, so the plan legitimately covers more.
+  # The range that was actually discarded, from the Coordinator's own record
+  # rather than from what was asked for: the head moves between reading it and
+  # the executor planning, so the plan legitimately covers more than was typed.
+  record=$("${CQL[@]}" "SELECT head, target, previous_epoch FROM \
+             ${KEYSPACE}_no_tablet.rollback_event WHERE network_chain_id = 0 LIMIT 1;" \
+             2>/dev/null | sed -n '4p') || record=""
+  rolled_head=$(echo "$record" | awk -F'|' '{gsub(/ /,"",$1); print $1}')
+  rolled_target=$(echo "$record" | awk -F'|' '{gsub(/ /,"",$2); print $2}')
+  discarded_epoch=$(echo "$record" | awk -F'|' '{gsub(/ /,"",$3); print $3}')
+  [ -n "$rolled_head" ] && [ -n "$rolled_target" ] && [ -n "$discarded_epoch" ] \
+    || fail "round $round: could not read the discarded range out of the rollback record"
+  say "checking ($rolled_target, $rolled_head] on epoch $discarded_epoch"
+  verify_now coordinator manifest
+  verify_now 0 manifest
+  verify_now 1 manifest
+
   say "waiting for the chain to come back past $head_before"
   waited=0
   while :; do
@@ -107,6 +154,13 @@ for round in $(seq 1 "$ROUNDS"); do
        was $head_before)"
   done
 
+  # The other half, and only now: rows a Realm wrote while syncing are undone by
+  # re-fetching from the Coordinator, which is what the recovery above waited
+  # for. Asking before it would be asking whether something had happened that
+  # had been prevented from happening.
+  verify_now 0 resync
+  verify_now 1 resync
+
   if [ "$round" -lt "$ROUNDS" ]; then
     say "letting the chain live for ${SETTLE}s"
     sleep "$SETTLE"
@@ -120,4 +174,8 @@ for round in $(seq 1 "$ROUNDS"); do
 done
 
 echo
-say "== $ROUNDS round(s) passed =="
+[ "$gw_total" -gt 0 ] || fail \
+  "$ROUNDS round(s) passed without a single key being checked; the ranges held nothing, so this \
+   says nothing about what was restored"
+
+say "== $ROUNDS round(s) passed, $gw_total key positions checked =="

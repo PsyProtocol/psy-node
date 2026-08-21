@@ -29,12 +29,19 @@ export LOCAL_STAGING_REALMS="${LOCAL_STAGING_REALMS:-0 1}"
 # Exported it survives into anything the caller runs next, and a second
 # bring-up then wipes a chain nobody asked to wipe -- which is how a frozen
 # rollback under investigation was lost.
-RESET_ENV=()
+# `stack/local.env` sets LOCAL_STAGING_RESET=1, so an unqualified `up.sh` wipes
+# whatever chain is there. That is reasonable for a stack script whose job is to
+# hand you a clean environment, and wrong for one whose job is to bring an
+# existing chain back -- twice a chain under investigation was destroyed by a
+# bring-up that was only meant to restart a processor.
+#
+# So this passes the flag explicitly, in both directions, and never leaves the
+# choice to a file.
+RESET_ENV=(LOCAL_STAGING_RESET=0)
 if [ "${1:-}" = "--reset" ]; then
   RESET_ENV=(LOCAL_STAGING_RESET=1)
   say_reset=1
 fi
-unset LOCAL_STAGING_RESET
 
 LOGS="${PSY_LOCAL_STAGING_LOGS:-$REPO_ROOT/.local-staging/logs}"
 UP_LOG="${PSY_CHAIN_UP_LOG:-/tmp/chain-up.log}"

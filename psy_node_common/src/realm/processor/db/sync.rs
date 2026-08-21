@@ -574,6 +574,43 @@ where
     ///
     /// `Ok(None)` means this Realm has no view of the control row, which is the
     /// configuration before rollback is enabled and leaves the loop as it was.
+    /// Resolves when a rollback has been published, and never otherwise.
+    ///
+    /// Lives here, on the database handle, rather than on the processor: the
+    /// waits it guards borrow other fields of the processor mutably, and a
+    /// method taking `&self` on the whole processor cannot be raced against
+    /// them. Both call sites want the same guard, and a guard that has to be
+    /// written twice is one that drifts.
+    ///
+    /// Polled, because the phase lives on a durable row another process writes
+    /// and there is nothing to subscribe to. Every few seconds, against waits
+    /// that would otherwise run for minutes.
+    ///
+    /// The error is **typed**, and has to be. `is_refused_because_rollback`
+    /// classifies by downcasting, not by reading the message, and the Realm's
+    /// loop parks the processor in Error for anything it does not recognise. A
+    /// plain `anyhow!` here would abandon the block and then stop the Realm for
+    /// having abandoned it -- a correct guard killing the node, which this
+    /// codebase has done five times.
+    pub async fn rollback_published_while_waiting(&self) -> anyhow::Error {
+        use psy_node_core::store::canonical_head::CanonicalHeadModelError;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let observed = self.follow_coordinator_rollback_phase().await;
+            if let core::result::Result::Ok(core::option::Option::Some(phase)) = observed {
+                if !phase.permits_commit() {
+                    return anyhow::Error::new(
+                        CanonicalHeadModelError::NormalAdvanceWhileRollbackActive,
+                    )
+                    .context(
+                        "a rollback was published while this block was waiting; abandoning it so \
+                         this Realm can reach the phase check and take part",
+                    );
+                }
+            }
+        }
+    }
+
     pub async fn follow_coordinator_rollback_phase(
         &self,
     ) -> anyhow::Result<Option<psy_node_core::store::rollback_coordination::ObservedRollbackPhase>>
