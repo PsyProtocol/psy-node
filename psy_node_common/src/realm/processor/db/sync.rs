@@ -541,8 +541,12 @@ where
             .await?;
         let lowest = targets.iter().map(|(_, target)| *target).min();
         tracing::warn!(
-            "[REALM_INIT] this Realm last synced under epoch {} and the chain is now at {}; {} \
-             rollback(s) happened while it was not watching",
+            // Not [REALM_INIT] any more: since the barrier became a grace
+            // window this fires from the processor loop too, for a Realm that
+            // was left behind while running.  A tag that says "init" would send
+            // whoever reads it looking at startup for a cause that is not there.
+            "[REALM_ROLLBACK] this Realm last synced under epoch {} and the chain is now at {}; \
+             {} rollback(s) happened while it was not watching",
             recorded_epoch,
             published_epoch,
             targets.len()
