@@ -47,11 +47,11 @@ You should see version information for both the Psy compiler and language server
 Set the `DARGO_STD_PATH` environment variable to point to the standard library:
 
 ```bash
-# For bash/zsh
-export DARGO_STD_PATH="$HOME/Projects/psy-compiler/psy-std/std.psy"
+# For bash/zsh — point at the psy-compiler checkout next to this repo
+export DARGO_STD_PATH="$PWD/../psy-compiler/psy-std/std.psy"
 
 # For fish shell
-set -gx DARGO_STD_PATH "$HOME/Projects/psy-compiler/psy-std/std.psy"
+set -gx DARGO_STD_PATH "$PWD/../psy-compiler/psy-std/std.psy"
 ```
 
 Add this to your shell configuration file (`.bashrc`, `.zshrc`, or `~/.config/fish/config.fish`) to make it persistent.

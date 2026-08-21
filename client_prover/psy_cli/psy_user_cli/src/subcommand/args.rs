@@ -734,10 +734,6 @@ pub struct BatchClaimArgs {
     pub generate_only: bool,
     #[arg(long)]
     pub wait: bool,
-    #[arg(long)]
-    pub services_url: Option<String>,
-    #[arg(long, env, default_value = "http://127.0.0.1:8545")]
-    pub l1_rpc_url: String,
 }
 
 #[derive(Clone, Args)]

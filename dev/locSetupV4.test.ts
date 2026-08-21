@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import path from "node:path";
 import {
     COORDINATOR_PROCESSOR_READY_MARKER,
     REALM_PROCESSOR_READY_MARKER,
@@ -235,6 +236,17 @@ describe("resolveProjectsDir", () => {
         try {
             process.env.PSY_PROJECTS_DIR = "<workspace>/mainnet-beta";
             expect(resolveProjectsDir()).toEndWith("<workspace>/mainnet-beta");
+        } finally {
+            if (originalProjectsDir === undefined) delete process.env.PSY_PROJECTS_DIR;
+            else process.env.PSY_PROJECTS_DIR = originalProjectsDir;
+        }
+    });
+
+    it("defaults to the sibling of the psy-node repo, not HOME/Projects", () => {
+        const originalProjectsDir = process.env.PSY_PROJECTS_DIR;
+        try {
+            delete process.env.PSY_PROJECTS_DIR;
+            expect(resolveProjectsDir()).toBe(path.resolve(import.meta.dir, "..", ".."));
         } finally {
             if (originalProjectsDir === undefined) delete process.env.PSY_PROJECTS_DIR;
             else process.env.PSY_PROJECTS_DIR = originalProjectsDir;

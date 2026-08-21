@@ -149,18 +149,6 @@ fn qhash_to_u64x4(hash: QHashOut<F>) -> [u64; 4] {
     ]
 }
 
-fn resolve_services_url(psy_config: &psy_config::PsyConfigGoldilocks, override_url: Option<&str>) -> anyhow::Result<String> {
-    if let Some(url) = override_url {
-        return Ok(url.trim_end_matches('/').to_string());
-    }
-    let network = psy_config.get_current_network()?;
-    if let Some(urls) = &network.api_services_url {
-        if let Some(first) = urls.first() {
-            return Ok(first.trim_end_matches('/').to_string());
-        }
-    }
-    anyhow::bail!("no psy-services URL configured in api_services_url")
-}
 
 pub(crate) async fn run_items(
     rpc_config_path: &str,
@@ -169,8 +157,6 @@ pub(crate) async fn run_items(
     trace_out: Option<String>,
     generate_only: bool,
     wait: bool,
-    _services_url_override: Option<String>,
-    _l1_rpc_url: Option<String>,
 ) -> anyhow::Result<CommandResult> {
     anyhow::ensure!(!(generate_only && wait), "batch claim cannot use --generate-only and --wait together");
     if generate_only {
@@ -446,8 +432,6 @@ pub async fn run(args: BatchClaimArgs) -> anyhow::Result<CommandResult> {
         args.trace_out,
         args.generate_only,
         args.wait,
-        args.services_url,
-        Some(args.l1_rpc_url.clone()),
     )
     .await
 }

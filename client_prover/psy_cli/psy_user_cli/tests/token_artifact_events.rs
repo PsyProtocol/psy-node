@@ -254,6 +254,18 @@ fn deployed_token_artifact_exposes_claim_events_for_all_claim_paths() {
         event_len(&methods, "claim_deposit") >= 1,
         "client_prover/token.json claim_deposit must expose DepositClaimEvent"
     );
+
+    assert_eq!(
+        method(&methods, "claim_deposit")
+            .get("events")
+            .and_then(Value::as_array)
+            .and_then(|events| events.first())
+            .and_then(|event| event.get("data"))
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(15),
+        "client_prover/token.json claim_deposit must expose the exact 15-felt DepositClaimEvent",
+    );
 }
 
 #[test]

@@ -1322,7 +1322,8 @@ function gitWithoutLfs(...args: string[]): string[] {
 
 export function resolveProjectsDir(): string {
     const configuredProjectsDir = process.env.PSY_PROJECTS_DIR?.trim();
-    return path.resolve(configuredProjectsDir || process.env.HOME || ".", configuredProjectsDir ? "." : "Projects");
+    if (configuredProjectsDir) return path.resolve(configuredProjectsDir);
+    return path.resolve(REPO_ROOT, "..");
 }
 
 function normalizeGitRemoteUrl(url: string): string {
@@ -3748,6 +3749,10 @@ class DevNetProcessManager {
         }
 
         // 9. Prove Proxy
+        // Groth16 preload is 3–4 minutes and does not depend on Anvil/Envio.
+        // Spawn now, keep warming in the background, and only wait for :9999
+        // before the proof-consuming relayer (and before setupProcesses returns).
+        const proveProxyReady: Promise<void>[] = [];
         const proveProxyCount = options.proveProxyCount || 0;
         if (proveProxyCount > 0 || startAll) {
             const count = proveProxyCount || 1;
@@ -3766,43 +3771,24 @@ class DevNetProcessManager {
                     { cwd, ...getLogPaths(`prove_proxy_${i}`, false), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
                 );
                 this.track(proveProxyProc);
-                await waitForTcpPort('127.0.0.1', port, {
-                    attempts: 600,
-                    delayMs: 1000,
-                    timeoutMs: 1500,
-                    name: `Prove proxy ${i}`,
-                });
-                console.log(`[DevNet] Prove proxy instance ${i} started on port ${port}`);
+                proveProxyReady.push(
+                    waitForTcpPort('127.0.0.1', port, {
+                        attempts: 600,
+                        delayMs: 1000,
+                        timeoutMs: 1500,
+                        name: `Prove proxy ${i}`,
+                    }).then(() => {
+                        console.log(`[DevNet] Prove proxy instance ${i} started on port ${port}`);
+                    }),
+                );
+                console.log(`[DevNet] Prove proxy instance ${i} process started; continuing while Groth16 warms on port ${port}`);
             }
         }
-        // 9b. Faucet Server (port 9998)
-        if (options.faucetServer || startAll) {
-            const faucetPort = 9998;
-            const faucetProc = await RunningProcess.spawnWithInitializationHintWithRetry(
-                [
-                    './target/release/psy_user_cli',
-                    'faucet-server',
-                    '--listen-addr',
-                    `0.0.0.0:${faucetPort}`,
-                    '--rpc-config',
-                    'psy-genesis/config.json',
-                ],
-                faucetServerStartedDetector,
-                { cwd, ...getLogPaths('faucet_server', false), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
-            );
-            this.track(faucetProc);
-            void waitForTcpPort('127.0.0.1', faucetPort, {
-                attempts: 600,
-                delayMs: 1000,
-                timeoutMs: 1500,
-                name: 'Faucet server',
-            }).then(() => {
-                console.log(`[DevNet] Faucet server started on port ${faucetPort}`);
-            }).catch((error) => {
-                console.warn(`[DevNet] Faucet server has not opened port ${faucetPort} yet: ${error}`);
-            });
-            console.log(`[DevNet] Faucet server process started; continuing while it warms on port ${faucetPort}`);
-        }
+        const waitForProveProxy = async (reason: string): Promise<void> => {
+            if (proveProxyReady.length === 0) return;
+            console.log(`[DevNet] Waiting for prove-proxy listen before ${reason}...`);
+            await Promise.all(proveProxyReady);
+        };
 
         // 10. L1 (Anvil)
         if (options.l1 || startAll) {
@@ -4030,8 +4016,41 @@ class DevNetProcessManager {
             }
         }
 
-        // 11.5 Unified bridge relayer
+        // Faucet refuses to start unless prove-proxy is already reachable.
+        if (options.faucetServer || startAll) {
+            await waitForProveProxy("faucet-server");
+            const faucetPort = 9998;
+            const faucetProc = await RunningProcess.spawnWithInitializationHintWithRetry(
+                [
+                    './target/release/psy_user_cli',
+                    'faucet-server',
+                    '--listen-addr',
+                    `0.0.0.0:${faucetPort}`,
+                    '--rpc-config',
+                    'psy-genesis/config.json',
+                ],
+                faucetServerStartedDetector,
+                { cwd, ...getLogPaths('faucet_server', false), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
+            );
+            this.track(faucetProc);
+            void waitForTcpPort('127.0.0.1', faucetPort, {
+                attempts: 600,
+                delayMs: 1000,
+                timeoutMs: 1500,
+                name: 'Faucet server',
+            }).then(() => {
+                console.log(`[DevNet] Faucet server started on port ${faucetPort}`);
+            }).catch((error) => {
+                console.warn(`[DevNet] Faucet server has not opened port ${faucetPort} yet: ${error}`);
+            });
+            console.log(`[DevNet] Faucet server process started; continuing while it warms on port ${faucetPort}`);
+        }
+
+        // Relayer immediately requests Groth16 proofs; wait for listen first.
         if (startBridgeProposerDaemon) {
+            await waitForProveProxy("bridge relayer");
+
+            // 11.5 Unified bridge relayer
             const proofDir = path.resolve(cwd, 'local_checkpoints', 'bridge_proposer');
             await mkdir(proofDir, { recursive: true });
             const daemonConfigPath = path.join(proofDir, 'daemon.toml');
@@ -4153,6 +4172,7 @@ class DevNetProcessManager {
             ));
             console.log('[DevNet] Explorer started on port 5178');
         }
+        await waitForProveProxy("DevNet ready");
     }
 
     async setupDaemonized(options: ProcessOptions): Promise<void> {
