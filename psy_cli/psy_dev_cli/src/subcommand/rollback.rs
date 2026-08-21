@@ -223,6 +223,29 @@ impl Chain {
         Ok(rows.maybe_first_row::<(i64,)>()?.map(|row| row.0 as u64))
     }
 
+    /// The chain epoch a Realm last reconciled itself to.
+    ///
+    /// The one thing that separates a Realm holding the current branch from one
+    /// holding a branch that was discarded.  Heights cannot: once the
+    /// Coordinator has produced past the old head the two agree and only the
+    /// contents differ, which is exactly when a stale Realm looks healthiest.
+    ///
+    /// Absent means a Realm that has never synced, not one at epoch zero.
+    async fn synced_epoch(&self, keyspace: &str) -> anyhow::Result<Option<u64>> {
+        let rows = self
+            .session
+            .query_unpaged(
+                format!(
+                    "SELECT chain_epoch FROM {keyspace}_no_tablet.realm_sync_epoch \
+                     WHERE network_chain_id = ?"
+                ),
+                (self.network.get() as i64,),
+            )
+            .await?
+            .into_rows_result()?;
+        Ok(rows.maybe_first_row::<(i64,)>()?.map(|row| row.0 as u64))
+    }
+
     async fn in_flight(&self) -> anyhow::Result<Option<(u64, u64)>> {
         let recording = self.control.recording::<PHash>();
         Ok(
@@ -300,6 +323,39 @@ async fn status(chain: &Chain, args: &RollbackArgs) -> anyhow::Result<()> {
         }
     }
     line(heights);
+
+    // Heights alone say nothing about which branch a Realm is on, and after the
+    // Coordinator has produced past the old head they agree while the contents
+    // do not.  So the epoch each Realm last reconciled to is printed next to
+    // the Coordinator's, and a Realm behind it is named as being behind rather
+    // than left to look healthy.
+    let mut epochs = format!("epochs     {}={}", chain.keyspace, head.chain_epoch().get());
+    let mut behind: Vec<String> = Vec::new();
+    for entry in args.realms.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        if let Some((realm, _)) = entry.split_once(':') {
+            let keyspace = format!("realm_{}", realm.trim());
+            match chain.synced_epoch(&keyspace).await {
+                Ok(Some(epoch)) => {
+                    epochs.push_str(&format!("  {keyspace}={epoch}"));
+                    if epoch < head.chain_epoch().get() {
+                        behind.push(keyspace);
+                    }
+                }
+                Ok(None) => epochs.push_str(&format!("  {keyspace}=(never synced)")),
+                // Not fatal: a keyspace that is not there is a Realm this chain
+                // does not run, and status is the wrong place to insist on it.
+                Err(_) => epochs.push_str(&format!("  {keyspace}=?")),
+            }
+        }
+    }
+    line(epochs);
+    if !behind.is_empty() {
+        line(format!(
+            "BEHIND     {} on a branch this chain discarded; answers from there are stale \
+             until each one reconciles",
+            behind.join(", ")
+        ));
+    }
 
     match chain.in_flight().await? {
         Some((head, target)) => {

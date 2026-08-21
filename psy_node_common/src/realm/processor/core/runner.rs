@@ -198,6 +198,33 @@ where
                     confirmed = false;
                 }
                 Ok(Some(phase)) => {
+                    // A Realm more than one rollback behind is not a
+                    // participant in this one.  Following the published phase
+                    // would have it undo down to *this* target and then record
+                    // itself as current, leaving whatever an earlier rollback
+                    // discarded above this target in place and no longer
+                    // visible as wrong.
+                    //
+                    // Standing down is the whole response: file nothing, keep
+                    // no target, wait.  The grace window excuses it, the
+                    // Coordinator finishes, and once Idle is published the
+                    // epoch check reconciles every rollback it missed at once,
+                    // down to the lowest of their targets.
+                    if matches!(
+                        processor.db.epochs_behind_the_rollback_in_flight().await,
+                        Some(behind) if behind > 1
+                    ) {
+                        if !std::mem::replace(&mut reported_frozen, true) {
+                            tracing::warn!(
+                                "[REALM_ROLLBACK] standing down from the rollback in flight: \
+                                 this Realm is more than one rollback behind it and would undo \
+                                 the wrong range. It reconciles them all together once the \
+                                 Coordinator publishes Idle"
+                            );
+                        }
+                        sleep(std::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
                     // Remember the target while it is still being published,
                     // but only until this Realm has done its share.  A later
                     // phase re-arming it would send the recovery path over

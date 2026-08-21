@@ -218,6 +218,28 @@ where
         let Some(driver) = self.recording.participation() else {
             return Ok(false);
         };
+        // Only if it is true.  This receipt is what closes PUBLISH_ALL, and it
+        // used to be filed by whoever reached the phase -- including a Realm
+        // that woke up inside the rollback holding every height above the
+        // target, which undoes them only once Idle is published.  It would say
+        // it had reached the target while it plainly had not, and the barrier
+        // would close on that.
+        //
+        // Staying silent is strictly better than saying so.  A Realm that files
+        // nothing is excused after the grace window and the excuse is recorded;
+        // a Realm that files this is counted as having arrived, and nothing
+        // anywhere records that it had not.
+        let held = self
+            .checkpoint_tree_backup_manager
+            .get_current_checkpoint_id_head();
+        if held > target {
+            tracing::warn!(
+                "[REALM_ROLLBACK] not confirming {target} reached: this Realm still holds \
+                 checkpoint {held}. It will be excused rather than counted, and undoes its own \
+                 share when the rollback finishes"
+            );
+            return Ok(false);
+        }
         let search_head = self.coordinator_chain_ref_last_synced();
         driver
             .confirm_target_reached(
@@ -591,6 +613,36 @@ where
             .write_synced_epoch(published_epoch)
             .await?;
         Ok(true)
+    }
+
+    /// How many rollbacks this Realm is behind the rollback now in flight.
+    ///
+    /// `start_rollback` opens the next epoch immediately, so a rollback in
+    /// flight publishes a head already carrying the new epoch.  A Realm that is
+    /// current for that rollback therefore records exactly one less; anything
+    /// lower means it also missed earlier ones.
+    ///
+    /// That distinction decides whether this Realm may take part at all.  A
+    /// Realm two epochs behind that follows the published phase undoes down to
+    /// *this* rollback's target and then records itself as current -- and the
+    /// range the earlier rollback discarded, which may sit entirely above this
+    /// target, is never undone and never looked at again.  It stops being
+    /// visible as a problem at the moment it becomes one.
+    ///
+    /// `None` when the question does not apply: no epoch store, no readable
+    /// head, or a Realm that has never synced.
+    pub async fn epochs_behind_the_rollback_in_flight(&self) -> Option<u64> {
+        let store = self.recording.sync_epoch_store()?;
+        let seen = self.coordinator_chain_ref_last_synced();
+        let published = match self.recording.observe_published_head(&seen).await {
+            std::result::Result::Ok(Some(published)) => published.chain_epoch().get(),
+            _ => return None,
+        };
+        let recorded = match store.read_synced_epoch().await {
+            std::result::Result::Ok(Some(recorded)) => recorded,
+            _ => return None,
+        };
+        Some(published.saturating_sub(recorded))
     }
 
     /// Whether a rollback happened under this Realm while it was working.
