@@ -301,11 +301,11 @@ where
         &mut self,
         target: u64,
         search_head_height: Option<u64>,
-        plan_epoch: Option<u64>,
+        plan_epochs: Option<std::ops::RangeInclusive<u64>>,
     ) -> anyhow::Result<()> {
         if let Some(driver) = self.recording.self_rollback() {
             let mut search_head = self.coordinator_chain_ref_last_synced();
-            if search_head_height.is_some() || plan_epoch.is_some() {
+            if search_head_height.is_some() || plan_epochs.is_some() {
                 use psy_data::protocol::canonical_chain::{
                     CanonicalChainRef, ChainEpoch, CheckpointId, CheckpointRef,
                 };
@@ -327,7 +327,10 @@ where
                 let height = search_head_height
                     .unwrap_or(0)
                     .max(search_head.checkpoint().checkpoint_id().get());
-                let epoch = plan_epoch.unwrap_or_else(|| search_head.chain_epoch().get());
+                let epoch = plan_epochs
+                    .clone()
+                    .map(|epochs| *epochs.start())
+                    .unwrap_or_else(|| search_head.chain_epoch().get());
                 search_head = CanonicalChainRef::new(
                     search_head.network_id(),
                     ChainEpoch::new(epoch),
@@ -337,24 +340,62 @@ where
                     ),
                 );
             }
-            let report = driver
-                .recover_own_state_to(
-                    &self.recording,
-                    self.state.realm_identifier.realm_id,
-                    self.state.realm_identifier.realm_sub_id,
-                    &search_head,
-                    target,
-                )
-                .await?;
-            if report.changed_anything() {
-                tracing::warn!(
-                    "[REALM_ROLLBACK] undid this Realm's own state from checkpoint {} down to \
-                     {}: {} rows archived and deleted",
-                    report.own_head,
-                    report.target,
-                    report.deleted_rows
+            // Every epoch this Realm could have stamped a manifest with, not
+            // only the one its state was committed under.
+            //
+            // Startup adopts the Coordinator's epoch before anything else runs
+            // -- it has to, so nothing stamps a record with a stale one -- which
+            // leaves a window where this Realm carries the *new* epoch while
+            // still holding the *old* branch's state.  A commit in that window
+            // is written into the new epoch's partition for a checkpoint that is
+            // about to be undone, and a reconciliation searching only the
+            // recorded epoch cannot see it.
+            //
+            // realm-0 ended up exactly there: a completed commit at 2756 stamped
+            // epoch 18, its head reset to 2753 by the undo that searched epoch
+            // 17, and every restart afterwards replanning 2756 and dying on the
+            // artifact it had already written. Permanently unstartable, while
+            // its chain carried on three hundred checkpoints without it.
+            //
+            // Safe to include the newer epochs because this only runs while
+            // `recorded < published` -- before this Realm has adopted the new
+            // branch. Anything it holds up there under a newer epoch is from
+            // that window by construction; legitimate work on the new branch
+            // cannot start until the reconciliation records the epoch, which
+            // happens after this.
+            let epochs: Vec<u64> = match &plan_epochs {
+                Some(range) => range.clone().collect(),
+                None => vec![search_head.chain_epoch().get()],
+            };
+            let mut changed_anything = false;
+            for epoch in epochs {
+                let search_head = psy_data::protocol::canonical_chain::CanonicalChainRef::new(
+                    search_head.network_id(),
+                    psy_data::protocol::canonical_chain::ChainEpoch::new(epoch),
+                    *search_head.checkpoint(),
                 );
-            } else if plan_epoch.is_some() {
+                let report = driver
+                    .recover_own_state_to(
+                        &self.recording,
+                        self.state.realm_identifier.realm_id,
+                        self.state.realm_identifier.realm_sub_id,
+                        &search_head,
+                        target,
+                    )
+                    .await?;
+                if report.changed_anything() {
+                    changed_anything = true;
+                    tracing::warn!(
+                        "[REALM_ROLLBACK] undid this Realm's own state from checkpoint {} down \
+                         to {} on epoch {}: {} rows archived and deleted",
+                        report.own_head,
+                        report.target,
+                        epoch,
+                        report.deleted_rows
+                    );
+                }
+            }
+            if !changed_anything && plan_epochs.is_some() {
                 // Saying so out loud, because this is the shape the failure took
                 // and it took a day to see. A reconciliation runs only when a
                 // rollback was missed; finding nothing to undo is possible -- a
@@ -383,7 +424,7 @@ where
                      expected when it already took part in the rollback, and worth checking if \
                      it did not",
                     target,
-                    plan_epoch.unwrap_or_default(),
+                    plan_epochs.as_ref().map(|e| *e.start()).unwrap_or_default(),
                 );
             }
         }
@@ -583,10 +624,12 @@ where
                 // committed under -- the one it last synced with, before the
                 // rollbacks it missed. Its manifests live in that partition and
                 // nowhere else.
+                // Through the published epoch, not only the recorded one: see
+                // the window described in `undo_everything_above_bounded`.
                 self.undo_everything_above_bounded(
                     target,
                     Some(published_now),
-                    Some(recorded_epoch),
+                    Some(recorded_epoch..=published_epoch),
                 )
                 .await?
             }
