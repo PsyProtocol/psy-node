@@ -121,6 +121,114 @@ pub async fn realm_chain_epoch(
     Ok(rows.maybe_first_row::<(i64,)>()?.map(|row| row.0 as u64).unwrap_or(0))
 }
 
+/// The branch namespace a Coordinator node should come up on, and the epoch it
+/// names.
+///
+/// Both, because an Edge needs the epoch afterwards to notice it has changed --
+/// see `watch_branch_and_reload` -- and re-reading it separately would let the
+/// two disagree across a rollback that landed in between.
+///
+/// Opens its own short-lived session rather than borrowing the node's, because
+/// this has to answer *before* the stores it names are built, and on an Edge
+/// the node's Scylla store is built after them.  One connection at startup, for
+/// one row.
+pub async fn coordinator_branch_namespace(
+    scylla_url: &str,
+    db_namespace: &str,
+    network_chain_id: i64,
+) -> anyhow::Result<(String, u64)> {
+    let session = open_reader_session(scylla_url).await?;
+    let epoch =
+        coordinator_chain_epoch(&session, &format!("{db_namespace}_no_tablet"), network_chain_id)
+            .await?;
+    Ok((branch_namespace(db_namespace, epoch), epoch))
+}
+
+/// The branch namespace a Realm node should come up on, and the epoch it names.
+pub async fn realm_branch_namespace(
+    scylla_url: &str,
+    db_namespace: &str,
+    network_chain_id: i64,
+) -> anyhow::Result<(String, u64)> {
+    let session = open_reader_session(scylla_url).await?;
+    let epoch =
+        realm_chain_epoch(&session, &format!("{db_namespace}_no_tablet"), network_chain_id).await?;
+    Ok((branch_namespace(db_namespace, epoch), epoch))
+}
+
+/// Restart this process when the branch changes under it.
+///
+/// For Edges, and only for Edges.  A processor already restarts on its own
+/// schedule -- it knows when it has finished its share of a rollback, and a
+/// watcher racing that would cut it off part way.  An Edge has no such moment:
+/// it holds the stores it opened at startup, and after a rollback the processor
+/// beside it comes back on a name the Edge has never heard of.  Workers then ask
+/// an Edge that is still serving the discarded branch's queue, find nothing, and
+/// the chain stalls with every part of it apparently healthy.
+///
+/// Restarting is the whole response, because the supervisor already restarts on
+/// exit 75 and startup already reads the branch.  Nothing here needs to know
+/// what changed.
+///
+/// A read that fails is not a change: the branch is only ever declared to have
+/// moved on an epoch this actually read, so a database blip costs a poll rather
+/// than a restart.
+pub fn watch_branch_and_reload(
+    scylla_url: String,
+    db_namespace: String,
+    network_chain_id: i64,
+    realm: bool,
+    started_on: u64,
+) {
+    tokio::spawn(async move {
+        let no_tablet = format!("{db_namespace}_no_tablet");
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let Ok(session) = open_reader_session(&scylla_url).await else {
+                continue;
+            };
+            let now = if realm {
+                realm_chain_epoch(&session, &no_tablet, network_chain_id).await
+            } else {
+                coordinator_chain_epoch(&session, &no_tablet, network_chain_id).await
+            };
+            let std::result::Result::Ok(now) = now else {
+                continue;
+            };
+            if now != started_on {
+                tracing::warn!(
+                    "[EDGE] the chain moved from epoch {} to {} while this Edge was serving \
+                     epoch {}; restarting so its queue and Redis namespaces are the ones the \
+                     processor is now using (exit {})",
+                    started_on,
+                    now,
+                    started_on,
+                    psy_node_core::store::rollback_reload::EXIT_CODE_ROLLBACK_RELOAD
+                );
+                // Given a moment to reach the log before the process goes.
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                std::process::exit(
+                    psy_node_core::store::rollback_reload::EXIT_CODE_ROLLBACK_RELOAD,
+                );
+            }
+        }
+    });
+}
+
+/// A plain session for one read.
+///
+/// Deliberately without the commit-window timestamp generator the node's own
+/// session carries: nothing here writes, and borrowing that machinery would
+/// tie the question "which branch am I on" to the clock a commit uses.
+async fn open_reader_session(scylla_url: &str) -> anyhow::Result<Session> {
+    use scylla::client::session_builder::SessionBuilder;
+    Ok(SessionBuilder::new()
+        .known_nodes(scylla_url.split(',').map(str::trim).collect::<Vec<_>>())
+        .connection_timeout(std::time::Duration::from_secs(120))
+        .build()
+        .await?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

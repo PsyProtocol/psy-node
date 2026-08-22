@@ -11,6 +11,7 @@ use psy_io::tokio::{TokioLikeFileSystem, TokioStdFileSystem};
 use psy_node_common::{coordinator::processor::create::create_coordinator_processor_and_run, p2p::realm_coordinator::PsyRealmCoordinatorClientAPI, realm::processor::create::create_realm_processor_and_run};
 use psy_node_core::config::node_start_config::{CoordinatorProcessorStartConfig, RealmProcessorStartConfig};
 use psy_node_nats::psy_queue::setup_nats_psy_queue_from_connection_str;
+use psy_node_scylla::rollback::{coordinator_branch_namespace, realm_branch_namespace};
 use psy_node_redis::store::{new_redis_async_pool, StandardRedisStore};
 use psy_node_scylla::psy_setup::{setup_coordinator_psy_scylla_store_from_connection_string, setup_psy_scylla_database_store_from_connection_string, setup_realm_psy_scylla_store_from_connection_string};
 use psy_plonky2_circuits::{
@@ -25,13 +26,26 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
 
     let pool = new_redis_async_pool(&config.redis_url, 2).await?;
 
+    // Redis and NATS answer to the branch this node is on, not merely to the
+    // deployment: a rollback leaves the discarded branch's queue messages and
+    // Redis entries behind, and they are keyed by ids the new branch issues
+    // again.  See `psy_node_scylla::rollback::branch_namespace`.  Read before
+    // either store is built, because the name is what they are built with --
+    // and the Scylla keyspaces keep their plain names, since they hold the
+    // state that was repaired rather than abandoned.
+    let (branch_ns, _branch_epoch) = coordinator_branch_namespace(
+        &config.scylla_db_url,
+        &config.db_namespace,
+        config.network.get_chain_id() as i64,
+    )
+    .await?;
     let temp_store = StandardRedisStore::new(
         pool,
-        config.db_namespace.to_string(),
+        branch_ns.clone(),
         config.coordinator_id,
         config.coordinator_sub_id as u64,
     );
-    let nats_queue = setup_nats_psy_queue_from_connection_str(&config.nats_jetstream_url, &config.db_namespace).await?;
+    let nats_queue = setup_nats_psy_queue_from_connection_str(&config.nats_jetstream_url, &branch_ns).await?;
 
     let file_system = TokioStdFileSystem {};
 
@@ -295,13 +309,26 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
 
     let pool = new_redis_async_pool(&config.redis_url, 2).await?;
 
+    // Redis and NATS answer to the branch this node is on, not merely to the
+    // deployment: a rollback leaves the discarded branch's queue messages and
+    // Redis entries behind, and they are keyed by ids the new branch issues
+    // again.  See `psy_node_scylla::rollback::branch_namespace`.  Read before
+    // either store is built, because the name is what they are built with --
+    // and the Scylla keyspaces keep their plain names, since they hold the
+    // state that was repaired rather than abandoned.
+    let (branch_ns, _branch_epoch) = realm_branch_namespace(
+        &config.scylla_db_url,
+        &config.db_namespace,
+        config.network.get_chain_id() as i64,
+    )
+    .await?;
     let temp_store = StandardRedisStore::new(
         pool,
-        config.db_namespace.to_string(),
+        branch_ns.clone(),
         config.realm_id as u64,
         config.realm_sub_id as u64,
     );
-    let nats_queue = setup_nats_psy_queue_from_connection_str(&config.nats_jetstream_url, &config.db_namespace).await?;
+    let nats_queue = setup_nats_psy_queue_from_connection_str(&config.nats_jetstream_url, &branch_ns).await?;
 
     let file_system = TokioStdFileSystem {};
 
