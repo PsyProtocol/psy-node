@@ -355,6 +355,54 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
     
     let http_client: HttpClient = HttpClientBuilder::default().set_keep_alive(Some(Duration::from_secs(10))).build(&config.coordinator_api_urls[0])?;
 
+    // A Realm cannot start without the Coordinator, so waiting for it is part of
+    // starting rather than a failure to start.  The first thing startup does is
+    // talk to the Coordinator Edge, and an Edge that is restarting refuses the
+    // connection for a few seconds -- which used to end the process with a
+    // non-75 code, so the supervisor treated a five-second outage as a crash and
+    // the Realm stayed down.  That happened the moment Edges began restarting on
+    // a rollback: realm-0 died at 02:06 and was still down when the chain had
+    // moved thirty checkpoints on.
+    //
+    // Bounded, so a Coordinator that is genuinely gone still stops this node
+    // rather than hiding behind a restart that never succeeds.
+    {
+        // Untyped, because the concrete proof and hash types are not chosen
+        // until the backend match further down, and this only needs to know
+        // whether anyone is listening.
+        use jsonrpsee::core::client::ClientT;
+        let waited_from = std::time::Instant::now();
+        let limit = Duration::from_secs(120);
+        loop {
+            match http_client
+                .request::<u64, _>("psy_get_latest_checkpoint_id", jsonrpsee::rpc_params![])
+                .await
+            {
+                Ok(head) => {
+                    tracing::info!(
+                        "[REALM_STARTUP] the Coordinator Edge at {} is answering (head {head})",
+                        config.coordinator_api_urls[0]
+                    );
+                    break;
+                }
+                Err(e) if waited_from.elapsed() < limit => {
+                    tracing::warn!(
+                        "[REALM_STARTUP] the Coordinator Edge at {} is not answering yet ({e}); \
+                         waiting, since it may be restarting for a rollback",
+                        config.coordinator_api_urls[0]
+                    );
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                Err(e) => anyhow::bail!(
+                    "the Coordinator Edge at {} did not answer within {}s ({e}); this Realm \
+                     cannot start without it",
+                    config.coordinator_api_urls[0],
+                    limit.as_secs()
+                ),
+            }
+        }
+    }
+
     /*
     
     
