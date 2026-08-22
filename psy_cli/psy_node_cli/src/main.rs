@@ -50,7 +50,39 @@ async fn main() -> anyhow::Result<()> {
                 genesis_data_path,
             )
             .await?;
-            start_realm_processor::run(config, get_proving_backend_from_input(proving_backend)).await?;
+            // A Realm cannot start without the Coordinator Edge, and the Edge
+            // now restarts on a rollback.  Startup takes minutes -- loading the
+            // global user tree alone -- and talks to the Edge at several points
+            // along the way, so the few seconds it is away can land anywhere in
+            // there, not only at the beginning where the bounded wait looks.
+            //
+            // Exit 75 rather than 1, which is what EX_TEMPFAIL means and what
+            // the supervisor restarts on.  A Coordinator that is genuinely gone
+            // still stops this node: the next attempt's bounded wait gives up
+            // after two minutes and says so, so this cannot hide a real outage
+            // behind a loop -- it only refuses to call a restarting Edge a
+            // crash. realm-0 died on one twice, and stayed down while the chain
+            // moved seven hundred checkpoints.
+            if let Err(error) =
+                start_realm_processor::run(config, get_proving_backend_from_input(proving_backend))
+                    .await
+            {
+                if error
+                    .chain()
+                    .any(|cause| cause.to_string().contains("tcp connect error"))
+                {
+                    tracing::warn!(
+                        "[REALM_STARTUP] could not reach the Coordinator Edge while starting \
+                         ({error:#}); asking to be restarted rather than reporting a crash, since \
+                         an Edge restarting for a rollback looks exactly like this (exit {})",
+                        psy_node_core::store::rollback_reload::EXIT_CODE_ROLLBACK_RELOAD
+                    );
+                    std::process::exit(
+                        psy_node_core::store::rollback_reload::EXIT_CODE_ROLLBACK_RELOAD,
+                    );
+                }
+                return Err(error);
+            }
         }
         Commands::StartRealmEdge {
             config,
