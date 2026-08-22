@@ -89,6 +89,34 @@ pub trait ManifestArtifactStore<Hash: Q256BitHash>: Send + Sync {
         chunks: &[Vec<u8>],
     ) -> anyhow::Result<()>;
 
+    /// Replace chunks left by an attempt that never sealed.
+    ///
+    /// The ordinary write is write-once and verifies its own read-back, which
+    /// is what makes an artifact set a fact rather than a guess.  That is right
+    /// while a manifest identity names one plan, and a manifest identity does
+    /// not: it is `(epoch, height, parent hash)`, and two attempts to build the
+    /// same checkpoint on the same parent share it while planning different
+    /// content, because what a node gathers before it crashes and what it
+    /// gathers after are not the same set.
+    ///
+    /// So a Realm that died mid-commit came back, replanned, wrote chunks that
+    /// differed from the ones already there, and failed on the conflict --
+    /// during startup, before anything else, so it failed the same way every
+    /// time.  It was permanently unstartable, while the chain it belonged to
+    /// carried on without it.
+    ///
+    /// The caller must have established that no SEALED or COMMITTED manifest
+    /// exists at this identity, which is the same thing
+    /// `replace_abandoned_prepared_row` establishes for the manifest row it
+    /// replaces, and for the same reason: until a manifest seals, nothing has
+    /// observed the content being replaced.
+    async fn replace_artifact_chunks(
+        &self,
+        identity: &AuthorityManifestIdentity<Hash>,
+        kind: ManifestArtifactKind,
+        chunks: &[Vec<u8>],
+    ) -> anyhow::Result<()>;
+
     /// `committed_chunk_count` comes from the manifest's artifact set
     /// commitment, never from the store: trusting what the store happens to
     /// hold would let a lost chunk read as a shorter mutation set.
@@ -323,4 +351,56 @@ impl<Hash: Q256BitHash> super::commit_window::CommitFreeze for CoordinatorCommit
     fn is_quiesced_for_rollback(&self) -> bool {
         self.commit_window.is_quiesced()
     }
+}
+
+/// Write an artifact set, replacing one an abandoned attempt left behind.
+///
+/// A manifest identity is `(epoch, height, parent hash)`, which two attempts to
+/// build the same checkpoint on the same parent share -- while planning
+/// different content, because what a node gathered before it crashed and what
+/// it gathers after are not the same set of transactions.  The artifact slot is
+/// write-once and verifies its own read-back, so the second attempt failed on
+/// the conflict, during startup, before anything else, the same way every time.
+/// The Realm that hit it was permanently unstartable while its chain carried on
+/// without it.
+///
+/// Replacing is safe exactly when nothing has observed what is being replaced,
+/// and that is decided the same way `replace_abandoned_prepared_row` decides it
+/// for the manifest row: no SEALED and no COMMITTED at this identity.  Until a
+/// manifest seals, its artifact is the working note of an attempt, not history.
+///
+/// A conflict with a sealed manifest above it is left to fail, and must: that
+/// is an artifact something committed to, and a plan that no longer matches it
+/// is a fault, not a retry.
+pub async fn persist_artifact_chunks_replacing_abandoned<Hash: Q256BitHash>(
+    manifest: &dyn AuthorityManifestStore<Hash>,
+    artifacts: &dyn ManifestArtifactStore<Hash>,
+    identity: &AuthorityManifestIdentity<Hash>,
+    kind: ManifestArtifactKind,
+    chunks: &[Vec<u8>],
+) -> anyhow::Result<()> {
+    let conflict = match artifacts.persist_artifact_chunks(identity, kind, chunks).await {
+        Ok(()) => return Ok(()),
+        Err(conflict) => conflict,
+    };
+
+    for later in [
+        crate::store::manifest_lifecycle::MANIFEST_REVISION_SEALED,
+        crate::store::manifest_lifecycle::MANIFEST_REVISION_COMMITTED,
+    ] {
+        let Ok(revision) = ManifestRevision::try_new(later) else {
+            return Err(conflict);
+        };
+        if manifest.read_manifest_row(identity, revision).await?.is_some() {
+            return Err(conflict);
+        }
+    }
+
+    tracing::warn!(
+        checkpoint_id = identity.checkpoint().checkpoint_id().get(),
+        "replacing the artifact of an attempt that never sealed ({conflict:#}); the previous \
+         process died between planning this checkpoint and sealing it, so nothing ever observed \
+         the content being replaced"
+    );
+    artifacts.replace_artifact_chunks(identity, kind, chunks).await
 }

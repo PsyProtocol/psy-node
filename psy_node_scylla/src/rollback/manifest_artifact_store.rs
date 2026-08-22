@@ -128,6 +128,7 @@ impl ManifestArtifactSlot {
 pub struct ManifestArtifactQueries {
     pub create_table: String,
     pub insert_chunk: String,
+    pub replace_chunk: String,
     pub read_chunk: String,
     pub read_all_chunks: String,
 }
@@ -148,6 +149,13 @@ impl ManifestArtifactQueries {
                 "INSERT INTO {table} (artifact_slot, chunk_index, revision, chunk) \
                  VALUES (?, ?, ?, ?) IF NOT EXISTS"
             ),
+            // Without `IF NOT EXISTS`, and that is the whole difference: this is
+            // for a slot whose previous occupant belonged to an attempt nothing
+            // ever observed, which the caller has to have established.
+            replace_chunk: format!(
+                "INSERT INTO {table} (artifact_slot, chunk_index, revision, chunk) \
+                 VALUES (?, ?, ?, ?)"
+            ),
             read_chunk: format!(
                 "SELECT revision, chunk FROM {table} \
                  WHERE artifact_slot = ? AND chunk_index = ?"
@@ -162,6 +170,7 @@ impl ManifestArtifactQueries {
 pub struct ScyllaManifestArtifactStore {
     session: Arc<Session>,
     insert_chunk: PreparedStatement,
+    replace_chunk: PreparedStatement,
     read_chunk: PreparedStatement,
     read_all_chunks: PreparedStatement,
 }
@@ -186,6 +195,8 @@ impl ScyllaManifestArtifactStore {
         let mut insert_chunk = session.prepare(queries.insert_chunk).await?;
         insert_chunk.set_consistency(Consistency::Quorum);
         insert_chunk.set_serial_consistency(Some(SerialConsistency::LocalSerial));
+        let mut replace_chunk = session.prepare(queries.replace_chunk).await?;
+        replace_chunk.set_consistency(Consistency::Quorum);
         let mut read_chunk = session.prepare(queries.read_chunk).await?;
         read_chunk.set_consistency(Consistency::Quorum);
         let mut read_all_chunks = session.prepare(queries.read_all_chunks).await?;
@@ -193,6 +204,7 @@ impl ScyllaManifestArtifactStore {
         Ok(Self {
             session,
             insert_chunk,
+            replace_chunk,
             read_chunk,
             read_all_chunks,
         })
@@ -236,6 +248,30 @@ impl ScyllaManifestArtifactStore {
         kind: ManifestArtifactKind,
         chunks: &[Vec<u8>],
     ) -> anyhow::Result<ManifestArtifactSlot> {
+        self.write_chunks_for(identity, kind, chunks, &self.insert_chunk).await
+    }
+
+    /// As above, but overwriting whatever is in the slot.
+    ///
+    /// The read-back is kept, because it is what makes the artifact set a fact
+    /// rather than a hope; only the write-once guard is dropped, and only for a
+    /// caller that has established the previous occupant was never observed.
+    async fn replace_chunks_for<Hash: Q256BitHash>(
+        &self,
+        identity: &AuthorityManifestIdentity<Hash>,
+        kind: ManifestArtifactKind,
+        chunks: &[Vec<u8>],
+    ) -> anyhow::Result<ManifestArtifactSlot> {
+        self.write_chunks_for(identity, kind, chunks, &self.replace_chunk).await
+    }
+
+    async fn write_chunks_for<Hash: Q256BitHash>(
+        &self,
+        identity: &AuthorityManifestIdentity<Hash>,
+        kind: ManifestArtifactKind,
+        chunks: &[Vec<u8>],
+        statement: &PreparedStatement,
+    ) -> anyhow::Result<ManifestArtifactSlot> {
         if chunks.is_empty() {
             return Err(ManifestArtifactStoreError::EmptyArtifact { kind }.into());
         }
@@ -244,7 +280,7 @@ impl ScyllaManifestArtifactStore {
             let chunk_index = chunk_index as u32;
             self.session
                 .execute_unpaged(
-                    &self.insert_chunk,
+                    statement,
                     (
                         slot.as_bytes().to_vec(),
                         chunk_index as i32,
@@ -457,6 +493,16 @@ impl<Hash: Q256BitHash> ManifestArtifactStore<Hash> for ScyllaManifestArtifactSt
         chunks: &[Vec<u8>],
     ) -> anyhow::Result<()> {
         self.persist_chunks_for(identity, kind, chunks).await?;
+        Ok(())
+    }
+
+    async fn replace_artifact_chunks(
+        &self,
+        identity: &AuthorityManifestIdentity<Hash>,
+        kind: ManifestArtifactKind,
+        chunks: &[Vec<u8>],
+    ) -> anyhow::Result<()> {
+        self.replace_chunks_for(identity, kind, chunks).await?;
         Ok(())
     }
 

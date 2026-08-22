@@ -218,14 +218,14 @@ pub async fn prepare_commit_recording<Hash: Q256BitHash>(
         &prepared_intent,
         planned.canonical_summary.clone(),
     )?;
-    recording
-        .manifest_artifact()
-        .persist_artifact_chunks(
-            record.identity(),
-            ManifestArtifactKind::Locator,
-            &planned.chunks,
-        )
-        .await?;
+    crate::store::manifest_store::persist_artifact_chunks_replacing_abandoned(
+        recording.manifest(),
+        recording.manifest_artifact(),
+        record.identity(),
+        ManifestArtifactKind::Locator,
+        &planned.chunks,
+    )
+    .await?;
     recording.manifest().append_prepared(&record).await?;
 
     // 6. Persist the commit source.  It goes after the manifest rather than
