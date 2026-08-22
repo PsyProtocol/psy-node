@@ -137,7 +137,32 @@ pub async fn load_global_contract_tree_append_only_pivot_from_db<
     }
     let mut tree = SimpleMemoryMerkleRecorderStore::new(tree_height);
     let real_required_previous_leaves = (required_previous_leaves as u64).min(current_key.index);
-    let start_required_contract_id = current_key.index - real_required_previous_leaves;
+    // Aligned down to the sub-tree the append will be proved over, not simply
+    // counted back from the frontier.
+    //
+    // `required_previous_leaves` is the number of leaves one batch sub-tree
+    // holds, so counting back that many covers *enough* leaves -- but starting
+    // part way into an older sub-tree leaves the leaves below the start absent,
+    // and absent is not a state this tree can express: `get_node_value` answers
+    // any node it does not hold with the zero hash for that level.
+    //
+    // What that costs is not a wasted read.  `find_next_append_index` looks for
+    // the first node whose value is the zero hash, so it walks into the hole and
+    // returns an index that is already taken.  The append then proves against
+    // the wrong sub-tree with fabricated empty old leaves, and the circuit --
+    // which joins the proof's record of the sub-tree root to the root it
+    // recomputes from those leaves, unconditionally -- dies during witness
+    // generation naming a wire and nothing else.
+    //
+    // Seen exactly once and it stopped the chain: 264 contracts, a window
+    // starting at 7, leaves 0..5 absent, and every deploy afterwards proved
+    // against sub-tree 0 while the next free slot was 264.
+    //
+    // Rounding down adds fewer than one sub-tree's worth of leaves, so the cost
+    // is bounded however large the tree gets.
+    let alignment = (required_previous_leaves as u64).max(1);
+    let start_required_contract_id =
+        ((current_key.index - real_required_previous_leaves) / alignment) * alignment;
     println!("start_required_contract_id: {}", start_required_contract_id);
     if start_required_contract_id > current_key.index {
         anyhow::bail!(
@@ -168,6 +193,45 @@ pub async fn load_global_contract_tree_append_only_pivot_from_db<
             128,
         )
         .await?;
+    }
+
+    // Every leaf up to the frontier must actually be here.
+    //
+    // The store answers a node it never loaded with the zero hash -- absence and
+    // emptiness are the same value in it -- so a partial load is not an error
+    // here, it is silently wrong data that surfaces much later as a circuit
+    // witness contradiction naming a wire and nothing else.  Measured rather
+    // than assumed, because the window this loader computes and the leaves an
+    // append proof will read are two different ranges.
+    {
+        // Over the window this load claims, not the whole tree: below the
+        // window the tree is deliberately absent, and demanding otherwise would
+        // refuse to start any chain with more contracts than one sub-tree holds.
+        //
+        // That the window is enough is a separate promise, kept by appending at
+        // an index the caller knows rather than at the first apparently-empty
+        // leaf -- see `append_leaves_spider_man_at`.  Without that, a hole
+        // anywhere in the tree is fatal and no bounded window can be checked.
+        let mut missing: Vec<u64> = Vec::new();
+        for index in start_required_contract_id..=current_key.index {
+            let in_memory = tree.get_leaf_value(index);
+            if in_memory == Hasher::get_zero_hash(0) {
+                missing.push(index);
+            }
+        }
+        if !missing.is_empty() {
+            let first = missing.first().copied().unwrap_or_default();
+            let last = missing.last().copied().unwrap_or_default();
+            anyhow::bail!(
+                "the contract tree loaded from checkpoint {checkpoint_id} is missing {} of the \
+                 leaves it meant to load, {start_required_contract_id} through {} (first {first}, \
+                 last {last}). A missing leaf reads as an empty one, so the append would be \
+                 proved against a sub-tree that is already occupied -- refusing to start rather \
+                 than producing a witness nothing can prove",
+                missing.len(),
+                current_key.index
+            );
+        }
     }
 
     let next_contract_id = current_key.index + 1;

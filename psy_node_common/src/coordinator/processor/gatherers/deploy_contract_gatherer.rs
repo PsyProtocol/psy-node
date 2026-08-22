@@ -551,8 +551,28 @@ impl<
         let deploy_contract_circuit_inputs = if self.new_global_contract_tree_leaves.len() == 0 {
             vec![]
         } else {
-            let spider_map_proofs =
-                tree.append_leaves_spider_man(N::BATCH_DEPLOY_CONTRACT_SUB_TREE_HEIGHT as u8, &self.new_global_contract_tree_leaves)?;
+            // Where these leaves go is known, not discovered: `next_contract_id`
+            // comes from the block state and has already been advanced past the
+            // ones being appended.  Letting the tree look for the first empty
+            // leaf instead is what put a deploy into sub-tree 0 while the next
+            // free slot was 264 -- a frontier-loaded tree answers the leaves it
+            // never loaded with the zero hash, and the search cannot tell that
+            // from an empty slot.
+            let append_index = self
+                .next_contract_id
+                .checked_sub(self.new_global_contract_tree_leaves.len() as u64)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "next contract id {} is below the {} leaves about to be appended",
+                        self.next_contract_id,
+                        self.new_global_contract_tree_leaves.len()
+                    )
+                })?;
+            let spider_map_proofs = tree.append_leaves_spider_man_at_index(
+                N::BATCH_DEPLOY_CONTRACT_SUB_TREE_HEIGHT as u8,
+                append_index,
+                &self.new_global_contract_tree_leaves,
+            )?;
             // NOTE: I made a change in the DeployContractCircuit so we don't have to
             // provide the old contract leaves in the append proof, can just make them
             // anything
@@ -560,13 +580,130 @@ impl<
 
             let mut inputs = Vec::with_capacity(spider_map_proofs.len());
             let mut contract_leaf_data_ind = 0;
-            for proof in spider_map_proofs {
+            for (proof_index, proof) in spider_map_proofs.into_iter().enumerate() {
                 let leaf_count = proof.get_modified_leaves_count();
+                // The circuit decides `is_added` per position -- `old[i] !=
+                // new[i]` -- while the vector built below assumes every
+                // differing position is contiguous and starts right after the
+                // leading run of equal ones.  Where those two disagree, a real
+                // leaf lands in a slot the circuit believes holds a different
+                // one, and witness generation dies on a copy constraint with
+                // nothing but a wire number to say why.
+                //
+                // So the two views are compared here, where the data still has
+                // names.  Silent when they agree, which is the ordinary case.
+                {
+                    let prepended =
+                        proof.get_existing_prepended_leaves_count_including_non_zero();
+                    let differing: Vec<usize> = proof
+                        .web_proof_old_leaves
+                        .iter()
+                        .zip(proof.web_proof_new_leaves.iter())
+                        .enumerate()
+                        .filter(|(_, (old, new))| old != new)
+                        .map(|(i, _)| i)
+                        .collect();
+                    let contiguous_from_prepended = differing
+                        .iter()
+                        .enumerate()
+                        .all(|(offset, position)| *position == prepended + offset);
+                    if !contiguous_from_prepended || differing.len() != leaf_count {
+                        tracing::error!(
+                            "[DEPLOY_BATCH] proof {proof_index}: the circuit and the witness \
+                             disagree about which leaves are new. prepended={prepended} \
+                             modified={leaf_count} differing_positions={differing:?} \
+                             non_zero={} old_len={} new_len={} available_leaves={}",
+                            proof.get_non_zero_leaves_count(),
+                            proof.web_proof_old_leaves.len(),
+                            proof.web_proof_new_leaves.len(),
+                            self.new_contract_leaves.len() - contract_leaf_data_ind,
+                        );
+                    }
+                }
                 let prepend_leaves = (0..proof.get_existing_prepended_leaves_count_including_non_zero())
                     .map(|_| dummy_leaf.clone())
                     .collect::<Vec<_>>();
                 let new_contract_leaves = self.new_contract_leaves[contract_leaf_data_ind..(contract_leaf_data_ind + leaf_count)].to_vec();
                 let contract_leaves = [prepend_leaves, new_contract_leaves].concat();
+                // The circuit joins the append proof's record of the subtree
+                // root to the root it recomputes from the leaves, with a plain
+                // `connect_hashes` on both the old and the new side.  Nothing
+                // conditional about it: if the tree's internal nodes and its
+                // leaves came from different branches, this is where it shows,
+                // and it shows as a wire number.
+                {
+                    let recomputed_old = merkle_root_from_leaves::<N::HasherBase, N::QHash>(
+                        &proof.web_proof_old_leaves,
+                    );
+                    let recomputed_new = merkle_root_from_leaves::<N::HasherBase, N::QHash>(
+                        &proof.web_proof_new_leaves,
+                    );
+                    // Which side is stale cannot be told from the roots alone:
+                    // the leaves in this proof come from the in-memory tree, so
+                    // a memory that drifted from the database looks exactly like
+                    // a database that is inconsistent with itself.  Printing a
+                    // couple of leaves settles it against a direct read.
+                    if recomputed_old != proof.top_line_proof.old_value {
+                        for probe in [0usize, 250] {
+                            if let Some(leaf) = proof.web_proof_old_leaves.get(probe) {
+                                tracing::error!(
+                                    "[DEPLOY_BATCH] proof {proof_index}: old leaf[{probe}] as the \
+                                     in-memory tree has it = {leaf:?}"
+                                );
+                            }
+                        }
+                    }
+                    if recomputed_old != proof.top_line_proof.old_value {
+                        tracing::error!(
+                            "[DEPLOY_BATCH] proof {proof_index}: the subtree's OLD leaves hash to \
+                             {recomputed_old:?} but the append proof records the subtree root as \
+                             {:?}; the tree's internal nodes and its leaves disagree",
+                            proof.top_line_proof.old_value
+                        );
+                    }
+                    if recomputed_new != proof.top_line_proof.new_value {
+                        tracing::error!(
+                            "[DEPLOY_BATCH] proof {proof_index}: the subtree's NEW leaves hash to \
+                             {recomputed_new:?} but the append proof records the subtree root as \
+                             {:?}",
+                            proof.top_line_proof.new_value
+                        );
+                    }
+                }
+                // The exact quantity the circuit constrains: at every position
+                // it considers added, the hash of the leaf data must equal the
+                // leaf hash the append proof carries.  When it does not, witness
+                // generation dies on a copy constraint that names a wire and
+                // nothing else -- so the comparison is made here, where the
+                // position and the leaf are still nameable.
+                for (i, (old_leaf, new_leaf)) in proof
+                    .web_proof_old_leaves
+                    .iter()
+                    .zip(proof.web_proof_new_leaves.iter())
+                    .enumerate()
+                {
+                    if old_leaf == new_leaf {
+                        continue;
+                    }
+                    let Some(leaf): Option<&PQEDContractLeaf<N::F, N::QHash>> =
+                        contract_leaves.get(i)
+                    else {
+                        tracing::error!(
+                            "[DEPLOY_BATCH] proof {proof_index}: position {i} is added but the \
+                             witness has only {} leaves for it",
+                            contract_leaves.len()
+                        );
+                        continue;
+                    };
+                    let hashed = leaf.qfhash::<N::HasherBase>();
+                    if &hashed != new_leaf {
+                        tracing::error!(
+                            "[DEPLOY_BATCH] proof {proof_index}: position {i} is added, but the \
+                             leaf hashes to {hashed:?} while the append proof says {new_leaf:?} \
+                             (old there was {old_leaf:?}); leaf = {leaf:?}"
+                        );
+                    }
+                }
                 contract_leaf_data_ind += leaf_count;
                 inputs.push(QCBatchDeployContractsCircuitInput {
                     deploy_contract_circuit_whitelist: self.config.deploy_contract_circuit_whitelist,
@@ -755,4 +892,25 @@ impl<F: Copy, Hash: Q256BitHash>
             right_proof_is_leaf: false,
         }
     }
+}
+
+/// The root of a full binary tree over `leaves`, folded pairwise the way the
+/// append gadget folds it.
+///
+/// Written out rather than borrowed from the tree store because the question is
+/// whether the store agrees with its own leaves, and an answer that came from
+/// the store could not tell.
+fn merkle_root_from_leaves<Hasher, Hash>(leaves: &[Hash]) -> Hash
+where
+    Hash: Copy,
+    Hasher: parth_core::crypto::hash::traits::MerkleHasher<Hash>,
+{
+    let mut level = leaves.to_vec();
+    while level.len() > 1 {
+        level = level
+            .chunks(2)
+            .map(|pair| Hasher::two_to_one(&pair[0], &pair[1]))
+            .collect();
+    }
+    level[0]
 }

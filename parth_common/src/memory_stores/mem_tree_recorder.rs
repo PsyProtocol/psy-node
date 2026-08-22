@@ -949,6 +949,24 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default + Debug>
         self.append_leaves_spider_man(sub_tree_height, leaves)
     }
 
+    /// Append at an index the caller knows, rather than one this tree infers.
+    ///
+    /// Prefer this to `append_leaves_spider_man` wherever the caller has the
+    /// index -- and the ones that matter do, it is the id they just assigned.
+    /// The inferring variant asks `find_next_append_index`, which finds the
+    /// first node whose value is the zero hash for its level, and this tree
+    /// answers any node it does not hold with exactly that.  A tree loaded from
+    /// its frontier, which is how a node starts because loading every leaf does
+    /// not scale, therefore has holes indistinguishable from empty slots, and
+    /// the search returns the first hole -- an index that is already occupied.
+    ///
+    /// What follows is not a wasted proof.  The append proves against the
+    /// sub-tree it landed in, fabricating empty old leaves for it, while the top
+    /// line still carries that sub-tree's real root; the circuit joins those two
+    /// unconditionally and dies in witness generation with a wire number for an
+    /// explanation.  It stopped a chain: 264 contracts, a load window beginning
+    /// at leaf 7, leaves 0..5 absent, and every deploy afterwards proved against
+    /// sub-tree 0 while the next free slot was 264.
     pub fn append_leaves_spider_man_at_index(
         &mut self,
         sub_tree_height: u8,
