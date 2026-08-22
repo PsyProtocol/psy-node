@@ -431,13 +431,38 @@ where
         self.reset_for_rollback_to(target).await
     }
 
+    /// Wind the sync cursor back to just below the target -- and only ever
+    /// back.
+    ///
+    /// A rollback target is where the chain now is, not where this Realm is.  A
+    /// Realm that was already further behind than the target has nothing above
+    /// it to give up, and moving its cursor *up* to `target - 1` would tell it
+    /// to resume fetching from the target while it never fetched the range
+    /// underneath: a hole it would never notice, because a cursor is the only
+    /// thing that says what it has.
+    ///
+    /// Reachable in the ordinary way: a Realm that has fallen behind, or one
+    /// that missed several rollbacks, is routinely below the target of the one
+    /// it is reconciling against.  realm-0 sat at 2753 while a later rollback
+    /// targeted 3273, and the reset it was about to run would have claimed 519
+    /// checkpoints it had never seen.
     pub async fn reset_for_rollback_to(&mut self, target: u64) -> anyhow::Result<()> {
-        let resync_from = target.saturating_sub(1);
+        let held = self
+            .checkpoint_tree_backup_manager
+            .get_current_checkpoint_id_head();
+        let resync_from = target.saturating_sub(1).min(held);
+        if resync_from < target.saturating_sub(1) {
+            tracing::warn!(
+                "[REALM_ROLLBACK] this Realm is at checkpoint {held}, below the rollback target \
+                 {target}; resuming from {resync_from} rather than the target, since the range \
+                 in between was never fetched"
+            );
+        }
         tracing::warn!(
             "[REALM_ROLLBACK] resetting Realm sync state to checkpoint {} so the next sync \
              re-fetches {} onward",
             resync_from,
-            target
+            resync_from + 1
         );
         self.checkpoint_tree_backup_manager
             .hard_reset_and_truncate(resync_from)
