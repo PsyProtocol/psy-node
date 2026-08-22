@@ -295,6 +295,14 @@ pub async fn setup_psy_scylla_database_store_from_connection_string<N: QNetworkD
     if connection_string.is_empty() {
         anyhow::bail!("Scylla Connection string is empty");
     }
+    // Introduce this driver's transient failures to the processors, which are
+    // written against `psy_node_core` and have no way to recognise a Scylla
+    // error on their own.  Done here because every node that has a Scylla store
+    // comes through this, and a node that never installs one simply parks on
+    // everything, as it always did.
+    psy_node_core::store::transient_failure::install_transient_classifier(
+        crate::rollback::is_database_briefly_unavailable,
+    );
     let addresses = connection_string.split(",").map(|s| s.to_string()).collect::<Vec<String>>();
 
     let scylla_db = ScyllaCoreStore::new(0, 0, keyspace.to_string(), &addresses).await?;
@@ -329,6 +337,11 @@ pub async fn setup_coordinator_psy_scylla_store_from_connection_string<N: QNetwo
     if connection_string.is_empty() {
         anyhow::bail!("Scylla Connection string is empty");
     }
+    // Same introduction as the store above: the Coordinator comes through here
+    // instead, and it is the one that parked for two hours on a busy database.
+    psy_node_core::store::transient_failure::install_transient_classifier(
+        crate::rollback::is_database_briefly_unavailable,
+    );
     let addresses = connection_string
         .split(',')
         .map(|s| s.to_string())

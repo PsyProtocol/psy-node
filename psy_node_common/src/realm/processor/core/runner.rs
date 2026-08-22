@@ -41,6 +41,11 @@ where
 {
     let realm_id = processor.db.state.realm_id_u64;
     let realm_sub_id = processor.db.state.realm_sub_id_u64;
+    // How long this process has been up, which is what separates a database
+    // that stumbled from one that is not there.  A transient failure earns a
+    // restart; a failure in the first minute after a restart means the last
+    // restart did not help, and parking is better than a loop that hides why.
+    let running_since = std::time::Instant::now();
     processor.db.status.mark_running();
     print_cf_log_indicator("PSY_REALM_PROCESSOR_STARTED", &format!("R{}_{}", realm_id, realm_sub_id));
 
@@ -404,6 +409,37 @@ where
                             "[REALM] the block at slot {} failed ({:#}) and a rollback has \
                              happened under this Realm since it last synced; restarting to \
                              reconcile rather than parking on a branch that is gone (exit {})",
+                            current_slot,
+                            e,
+                            psy_node_core::store::rollback_reload::EXIT_CODE_ROLLBACK_RELOAD
+                        );
+                        processor.db.status.begin_shutdown();
+                        sleep(std::time::Duration::from_millis(500)).await;
+                        std::process::exit(
+                            psy_node_core::store::rollback_reload::EXIT_CODE_ROLLBACK_RELOAD,
+                        );
+                    }
+                    // Not a fault in the chain: the database was briefly
+                    // unreachable or too busy to answer.  Parking on that left
+                    // the chain stopped for two hours with all three
+                    // participants in step at the same height and every
+                    // keyspace intact -- which is exactly what made it look
+                    // healthy -- over one `Unavailable` on a single-node
+                    // cluster that was merely busy.
+                    //
+                    // Restarting rather than retrying in place, because the
+                    // block failed part way through its commit and in-memory
+                    // state may no longer agree with the database; startup
+                    // rebuilds from the database, which is the same reason the
+                    // rollback path above restarts.
+                    Err(e)
+                        if running_since.elapsed() > std::time::Duration::from_secs(60)
+                            && psy_node_core::store::transient_failure::is_database_briefly_unavailable(&e) =>
+                    {
+                        tracing::warn!(
+                            "[REALM] block at slot {} failed because the database was briefly \
+                             unavailable ({:#}); restarting rather than parking, since nothing \
+                             about the chain is wrong (exit {})",
                             current_slot,
                             e,
                             psy_node_core::store::rollback_reload::EXIT_CODE_ROLLBACK_RELOAD

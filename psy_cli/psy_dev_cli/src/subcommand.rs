@@ -8,6 +8,7 @@ pub mod scylla_inspect;
 pub mod nats_inspect;
 pub mod chain_info;
 pub mod rollback;
+pub mod branches;
 
 use chain_info::ChainInfoArgs;
 use nats_inspect::NatsInspectArgs;
@@ -15,6 +16,7 @@ use read_checkpoint_backup::ReadCheckpointBackupArgs;
 use read_realm_backup::ReadRealmBackupArgs;
 use read_worker_backup::ReadWorkerBackupArgs;
 use redis_inspect::RedisInspectArgs;
+use branches::BranchesArgs;
 use rollback::RollbackArgs;
 use scylla_inspect::ScyllaInspectArgs;
 
@@ -42,4 +44,6 @@ pub enum Commands {
     ChainInfo(ChainInfoArgs),
     #[command(about = "Drive a rollback from outside the chain, over the database alone")]
     Rollback(RollbackArgs),
+    #[command(about = "The Redis namespaces and NATS streams past rollbacks left behind")]
+    Branches(BranchesArgs),
 }

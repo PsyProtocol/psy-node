@@ -17,6 +17,7 @@ pub mod manifest_store;
 pub mod realm_commit_recording;
 pub mod realm_recording_flow;
 pub mod rollback_control;
+pub mod transient_failure;
 pub mod rollback_coordination;
 pub mod realm_self_rollback;
 pub mod realm_sync_epoch;

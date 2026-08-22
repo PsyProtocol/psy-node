@@ -33,6 +33,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::Rollback(args) => {
             crate::subcommand::rollback::run(args).await?;
         }
+        Commands::Branches(args) => {
+            crate::subcommand::branches::run(args).await?;
+        }
         Commands::ChainInfo(args) => {
             subcommand::chain_info::run(args).await?;
         }
