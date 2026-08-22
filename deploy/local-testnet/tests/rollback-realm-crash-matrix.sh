@@ -286,17 +286,32 @@ for point in "${POINTS[@]}"; do
   run_rollback "$LOG-$point-resume.log"
   grep -aE "finishing the rollback|RollbackReport|G-W checked" "$LOG-$point-resume.log" || true
 
+  # The verdict is on the Coordinator and the Realm under test.  Requiring every
+  # Realm to agree made a bystander that was already broken before the round
+  # started fail every round after it -- the matrix reported "did not recover"
+  # about a Realm that had recovered perfectly, because a third one it never
+  # touched was stuck at a height from an hour earlier.
+  #
+  # Bystanders still matter, so they are held to the weaker thing that is
+  # actually this round's business: they must not have gone backwards.
+  OTHER=$([ "$REALM" = "0" ] && echo 1 || echo 0)
+  other_before=$(height "realm_$OTHER")
   waited=0
   while :; do
-    c=$(height "$KEYSPACE"); r0=$(height realm_0); r1=$(height realm_1)
-    if [ -n "$c" ] && [ "$c" = "$r0" ] && [ "$c" = "$r1" ] && [ "$c" -gt "$head_before" ]; then
-      echo "$point: recovered past $head_before, all three at $c"
+    c=$(height "$KEYSPACE"); r=$(height "realm_$REALM"); o=$(height "realm_$OTHER")
+    if [ -n "$c" ] && [ "$c" = "$r" ] && [ "$c" -gt "$head_before" ]; then
+      echo "$point: recovered past $head_before, coordinator and realm-$REALM at $c \
+(realm-$OTHER at ${o:-?})"
       break
     fi
     sleep 15; waited=$((waited + 15))
     [ "$waited" -lt "$RECOVER_LIMIT" ] || fail \
-      "$point: did not recover within ${RECOVER_LIMIT}s (coordinator=$c realm_0=$r0 realm_1=$r1, was $head_before)"
+      "$point: did not recover within ${RECOVER_LIMIT}s (coordinator=$c realm-$REALM=$r, was $head_before)"
   done
+  if [ -n "${o:-}" ] && [ -n "${other_before:-}" ] && [ "$o" -lt "$other_before" ] 2>/dev/null; then
+    fail "$point: realm-$OTHER went backwards, $other_before -> $o; this round broke a Realm it \
+was not testing"
+  fi
 done
 
 # Hand the Realm back to whatever supervises it normally.  `start_realm` runs
