@@ -130,7 +130,15 @@ stop_realm() {
 # An abort is not exit 75, so a Realm armed to die still dies for good, and the
 # wrapper goes with it. That is what the matrix wants: the crash is the event
 # under test, the restart afterwards is the test's own doing.
+# Idempotent, because it cannot know what else is running.  A Realm restarts
+# itself on exit 75 for reasons that have nothing to do with this script -- being
+# left behind by a rollback, a database that stumbled -- and its wrapper brings
+# it back while the script believes it stopped it.  Starting on top of that is
+# how two processors for one Realm end up running, which is the same hazard as
+# two Coordinators: both submit, one submission is stale, and the Realm parks on
+# an error that reads like a rollback defect.
 start_realm() {  # start_realm [crash-point]
+  stop_realm
   local point="${1:-}"
   local extra=()
   [ -n "$point" ] && extra=(env "PSY_ROLLBACK_REALM_CRASH_AT=$point")
