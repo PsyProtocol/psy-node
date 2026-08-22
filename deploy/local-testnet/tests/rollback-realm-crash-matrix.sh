@@ -197,6 +197,29 @@ run_rollback() {  # run_rollback <logfile> [target]
   fi
 }
 
+# A chain that is not producing fails every point below in a way that looks like
+# a rollback defect and is not.  It cost forty minutes once: the Coordinator had
+# parked two hours earlier on a transient database error, all three participants
+# sat in step at the same height with every keyspace intact -- which is what made
+# it look healthy -- and the matrix waited out its own limits against a dead
+# chain.
+#
+# Heights agreeing is not health.  Producing is.
+say_alive() {
+  local first second
+  first=$(height "$KEYSPACE")
+  [ -n "${first:-}" ] || fail "cannot read the Coordinator's head from $KEYSPACE"
+  sleep 45
+  second=$(height "$KEYSPACE")
+  [ -n "${second:-}" ] || fail "cannot read the Coordinator's head from $KEYSPACE"
+  if [ "$second" -le "$first" ]; then
+    fail "the chain is not producing: $KEYSPACE sat at $first for 45s. Check whether a \
+processor has parked -- three participants in step at one height look exactly like this."
+  fi
+  echo "the chain is producing ($first -> $second)"
+}
+say_alive
+
 echo "== realm-$REALM crash matrix: ${#POINTS[@]} points =="
 for point in "${POINTS[@]}"; do
   echo
