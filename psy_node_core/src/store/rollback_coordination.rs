@@ -359,6 +359,36 @@ impl std::fmt::Display for RealmRootMovedUnderUs {
 
 impl std::error::Error for RealmRootMovedUnderUs {}
 
+/// The Coordinator never took an update this Realm submitted.
+///
+/// After submitting, a Realm waits for the Coordinator's record of its root to
+/// become the one it just proved.  The wait was unbounded, and "not yet" and
+/// "never" read identically from inside it: the Coordinator keeps answering with
+/// the old root either way.
+///
+/// So a submission lost while the Coordinator was restarting left realm-1
+/// waiting for two and a half hours, syncing the whole time, logging INFO on
+/// every pass and no error at all.  It looked alive because it was alive; it
+/// was simply not in the loop that produces blocks, and nothing said so.
+/// Restarting it fixed it in one pass, which is the tell: the state was fine,
+/// only the waiting was wrong.
+///
+/// Treated the way `RealmRootMovedUnderUs` is -- abandon this block, do not die
+/// -- because the next iteration re-derives and submits again, and a resubmit is
+/// exactly what a lost submission needs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RealmUpdateNeverIncluded;
+
+impl std::fmt::Display for RealmUpdateNeverIncluded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the Coordinator did not include this Realm's update within the time allowed;              abandoning the block so the next one re-derives and submits again",
+        )
+    }
+}
+
+impl std::error::Error for RealmUpdateNeverIncluded {}
+
 /// Whether a failed commit failed *because* a rollback is running.
 ///
 /// A processor loop cannot check the phase and then commit atomically, so a

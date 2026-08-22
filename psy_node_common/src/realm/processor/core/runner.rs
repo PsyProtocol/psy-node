@@ -392,6 +392,24 @@ where
                             e
                         );
                     }
+                    Err(e)
+                        if e.downcast_ref::<
+                            psy_node_core::store::rollback_coordination::RealmUpdateNeverIncluded,
+                        >()
+                        .is_some() =>
+                    {
+                        // Not a fault: the Coordinator never took the update
+                        // this block submitted, and waiting longer was the old
+                        // behaviour -- for two and a half hours, in the one case
+                        // that produced this. The next block re-derives and
+                        // submits again, which is what a lost submission needs.
+                        tracing::warn!(
+                            "[REALM] block at slot {} was abandoned because the Coordinator did \
+                             not include its update ({:#}); the next one will submit again",
+                            current_slot,
+                            e
+                        );
+                    }
                     Err(e) if processor.db.chain_rolled_back_under_us().await => {
                         // Not a fault: the branch this block was being built on
                         // was discarded while it was being built.  The usual

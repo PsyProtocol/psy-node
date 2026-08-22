@@ -891,7 +891,39 @@ where
             new_realm_root, old_realm_root, start_wait_checkpoint
         );
 
+        // Bounded, because "not yet" and "never" read identically from in here:
+        // the Coordinator answers with the old root either way.  A submission
+        // lost while the Coordinator was restarting left realm-1 in this loop
+        // for two and a half hours -- syncing the whole time, logging INFO on
+        // every pass, no error anywhere -- and a restart fixed it in one pass,
+        // which is the tell that the state was fine and only the waiting was
+        // wrong.
+        //
+        // Generous against the chain's block time, so a Coordinator that is
+        // merely slow is never disturbed; the point is that a submission which
+        // is not coming back is eventually retried instead of waited on.
+        let wait_deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(
+                std::env::var("PSY_REALM_UPDATE_INCLUSION_WAIT_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(300),
+            );
         loop {
+            if std::time::Instant::now() > wait_deadline {
+                tracing::error!(
+                    "the Coordinator has not included this Realm's root {:?} since checkpoint \
+                     {}; it still reports {:?} at checkpoint {}. Abandoning this block so the \
+                     next one re-derives and submits again",
+                    new_realm_root,
+                    start_wait_checkpoint,
+                    old_realm_root,
+                    self.checkpoint_tree_backup_manager.get_current_checkpoint_id_head()
+                );
+                return Err(anyhow::Error::new(
+                    psy_node_core::store::rollback_coordination::RealmUpdateNeverIncluded,
+                ));
+            }
             // 1. Sync Checkpoint Tree to get latest proofs locally
             self.checkpoint_tree_backup_manager
                 .sync_from_coordinator_client::<CoordinatorClient, N::F>(&self.coordinator_client, 2000)
