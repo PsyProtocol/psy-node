@@ -27,13 +27,26 @@ use scylla::errors::{DbError, ExecutionError, RequestAttemptError};
 /// several times over and the typed cause is somewhere underneath.
 pub fn is_database_briefly_unavailable(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
-        cause
+        if cause
             .downcast_ref::<ExecutionError>()
             .is_some_and(execution_error_is_transient)
+        {
+            return true;
+        }
+        // Some stores answer with their own error and keep only the driver's
+        // message, because what they have to say -- "this write's outcome is
+        // unknown" -- is more than the driver said.  The type is gone by then,
+        // so they decide while they still have it and say so in the variant.
+        matches!(
+            cause.downcast_ref::<super::CanonicalHeadStoreError>(),
+            Some(super::CanonicalHeadStoreError::IndeterminateWriteDatabaseUnavailable { .. })
+        )
     })
 }
 
-fn execution_error_is_transient(error: &ExecutionError) -> bool {
+/// Public so a store can make the same judgement while the type is still in its
+/// hands, which is the only moment it can.
+pub fn execution_error_is_transient(error: &ExecutionError) -> bool {
     match error {
         // No connection to hand out this instant, or the request outlived the
         // client's patience.  Both are about reaching the database.
@@ -93,6 +106,32 @@ mod tests {
         // The distinction the whole module exists for: this one never gets
         // better, so retrying it would hide it behind a restart loop.
         let error = anyhow::Error::new(ExecutionError::EmptyPlan);
+        assert!(!is_database_briefly_unavailable(&error));
+    }
+
+    #[test]
+    fn a_store_that_kept_only_the_message_can_still_say_so() {
+        // The case that bit: a CAS write timed out, the canonical-head store
+        // turned it into its own error with only the driver's *message*, and a
+        // Realm parked on a database that had merely been slow.
+        let error = anyhow::Error::new(
+            super::super::CanonicalHeadStoreError::IndeterminateWriteDatabaseUnavailable {
+                operation: "advance",
+                execute_error: "Not enough nodes responded to the write request in time".into(),
+            },
+        )
+        .context("committing realm state");
+        assert!(is_database_briefly_unavailable(&error));
+    }
+
+    #[test]
+    fn an_indeterminate_write_the_database_did_answer_is_not() {
+        // Same shape, different cause, and it must still park: an outcome
+        // nobody can determine is a fault to look at, not a restart.
+        let error = anyhow::Error::new(super::super::CanonicalHeadStoreError::IndeterminateWrite {
+            operation: "advance",
+            execute_error: "something else".into(),
+        });
         assert!(!is_database_briefly_unavailable(&error));
     }
 

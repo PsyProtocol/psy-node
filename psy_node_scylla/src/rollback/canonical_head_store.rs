@@ -500,10 +500,19 @@ impl ScyllaCanonicalHeadStore {
                 Ok(CanonicalHeadReadState::Current(current)) if &current == candidate => {
                     Ok(CanonicalHeadWriteOutcome::Idempotent(current))
                 }
-                Ok(_) => Err(CanonicalHeadStoreError::IndeterminateWrite {
-                    operation,
-                    execute_error: error.to_string(),
-                }),
+                Ok(_) => Err(
+                    if crate::rollback::execution_error_is_transient(&error) {
+                        CanonicalHeadStoreError::IndeterminateWriteDatabaseUnavailable {
+                            operation,
+                            execute_error: error.to_string(),
+                        }
+                    } else {
+                        CanonicalHeadStoreError::IndeterminateWrite {
+                            operation,
+                            execute_error: error.to_string(),
+                        }
+                    },
+                ),
                 Err(read_error) => Err(CanonicalHeadStoreError::IndeterminateReadFailed {
                     operation,
                     execute_error: error.to_string(),
@@ -611,6 +620,17 @@ pub enum CanonicalHeadStoreError {
     MissingAppliedColumn,
     InvalidAppliedColumn,
     CurrentMissingAfterLwt { operation: &'static str, applied: bool },
+    /// The write's outcome is unknown *and* the database is the reason.
+    ///
+    /// Kept apart from `IndeterminateWrite` because the two want different
+    /// answers: an outcome nobody can determine is a fault to look at, and a
+    /// database that did not answer in time is a restart.  Telling them apart
+    /// needs the driver's typed error, which is gone by the time a processor
+    /// sees this, so it is decided here where the type still exists.
+    IndeterminateWriteDatabaseUnavailable {
+        operation: &'static str,
+        execute_error: String,
+    },
     IndeterminateWrite { operation: &'static str, execute_error: String },
     IndeterminateReadFailed {
         operation: &'static str,
@@ -651,6 +671,14 @@ impl fmt::Display for CanonicalHeadStoreError {
             Self::CurrentMissingAfterLwt { operation, applied } => write!(
                 formatter,
                 "canonical-head {operation} LWT returned applied={applied}, but the durable row is missing"
+            ),
+            Self::IndeterminateWriteDatabaseUnavailable {
+                operation,
+                execute_error,
+            } => write!(
+                formatter,
+                "canonical-head {operation} result is indeterminate because the database did not \
+                 answer in time; retry the same sealed intent: {execute_error}"
             ),
             Self::IndeterminateWrite {
                 operation,
