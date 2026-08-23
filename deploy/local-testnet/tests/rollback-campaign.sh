@@ -98,32 +98,40 @@ contract_count() {
 # right height, producing blocks -- and refusing every transaction submitted to
 # it with "Unique pending ids not found".  Nothing above would have noticed.
 transactions_still_work() {  # transactions_still_work <what-for> <ops-before> <contracts-before>
-  local what="$1" before="$2" contracts_before="$3" name b a bad=0
-  for name in registered simple_transfer; do
-    b=$(echo "$before" | awk -v k="$name" '$1==k {print $2}')
-    a=$(op_count "$name")
-    b="${b:-0}"; a="${a:-0}"
-    if [ "$a" -le "$b" ]; then
-      say "$what: no new $name since the rollback ($b -> $a)"
-      bad=1
-    else
-      say "$what: $name $b -> $a"
-    fi
-  done
+  local what="$1" before="$2" contracts_before="$3"
+  local reg_before tx_before waited=0 reg tx con
 
-  # Deploys are counted on the chain, not in the ledger.  The ledger's `deployed`
-  # counts submissions and it does not agree with what landed: eighteen
-  # submitted against eight it could name an id for, while the chain held
-  # twenty-six.  What the campaign wants to know is whether a contract reaches
-  # the chain, and the chain is the only thing that can say.
-  a=$(contract_count); a="${a:-0}"
-  if [ "$a" -le "${contracts_before:-0}" ]; then
-    say "$what: no contract reached the chain since the rollback (${contracts_before:-0} -> $a)"
-    bad=1
-  else
-    say "$what: contracts on chain ${contracts_before:-0} -> $a"
-  fi
-  return "$bad"
+  reg_before=$(echo "$before" | awk '$1=="registered" {print $2}');      reg_before="${reg_before:-0}"
+  tx_before=$(echo "$before" | awk '$1=="simple_transfer" {print $2}');  tx_before="${tx_before:-0}"
+  contracts_before="${contracts_before:-0}"
+
+  # Waited for, not sampled once.
+  #
+  # The three have very different latencies and a deploy is by far the slowest:
+  # a rollback discards the ones in flight, the deployer only submits every
+  # 150s, and what it submits then has to be gathered, proven and committed.
+  # Sampling once at the end of the settle window failed a round where deploys
+  # were working perfectly -- nineteen on the chain at the check, thirty-five
+  # four minutes later -- and blamed the rollback for it.
+  #
+  # So each is given time to arrive, and the round only fails if one never does.
+  while :; do
+    reg=$(op_count registered);        reg="${reg:-0}"
+    tx=$(op_count simple_transfer);    tx="${tx:-0}"
+    con=$(contract_count);             con="${con:-0}"
+    if [ "$reg" -gt "$reg_before" ] && [ "$tx" -gt "$tx_before" ] \
+       && [ "$con" -gt "$contracts_before" ]; then
+      say "$what: registered $reg_before -> $reg, transfers $tx_before -> $tx, \
+contracts on chain $contracts_before -> $con (after ${waited}s)"
+      return 0
+    fi
+    if [ "$waited" -ge "${PSY_CAMPAIGN_TX_WAIT:-900}" ]; then
+      say "$what: after ${waited}s -- registered $reg_before -> $reg, transfers \
+$tx_before -> $tx, contracts on chain $contracts_before -> $con"
+      return 1
+    fi
+    sleep 30; waited=$((waited + 30))
+  done
 }
 
 # What "no problems" means.  Used for the warm-up and after every rollback,
