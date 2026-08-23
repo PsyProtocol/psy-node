@@ -169,9 +169,21 @@ fi
 "$HERE/chain-up.sh" --reset || halt "the chain would not come up"
 
 step "2/4  a population to transact with"
-python3 "$WORK" users 40   || halt "could not register the initial users"
-python3 "$WORK" fund       || halt "could not fund the initial users"
-python3 "$WORK" deploy 8   || halt "could not deploy the initial contracts"
+python3 "$WORK" users 40 || halt "could not register the initial users"
+python3 "$WORK" fund     || halt "could not fund the initial users"
+
+# `fund` reports every failure and still exits 0, so the exit code above says
+# only that the command ran.  Thirty-six faucet calls were refused one round and
+# the campaign carried on to the next step before noticing.  What matters is
+# whether anybody actually has money.
+funded=$(python3 "$WORK" status 2>/dev/null | sed -n 's/^users .*(\([0-9]*\) funded.*/\1/p')
+[ -n "${funded:-}" ] && [ "$funded" -gt 0 ] \
+  || halt "the faucet funded nobody (${funded:-unreadable} funded users). \
+Check that it is listening on 9998 -- a chain that came up without it looks healthy \
+and cannot take a single transaction."
+say "$funded users funded"
+
+python3 "$WORK" deploy 8 || halt "could not deploy the initial contracts"
 python3 "$WORK" status || true
 
 step "3/4  ordinary traffic, and it has to be healthy before anything is rolled back"

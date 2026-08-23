@@ -79,6 +79,27 @@ say "starting the stack; full output in $UP_LOG"
 setsid nohup env "${RESET_ENV[@]}" bash stack/up.sh > "$UP_LOG" 2>&1 < /dev/null &
 stack_pid=$!
 
+# With --reset, wait for the old chain to *go* before waiting for a new one to
+# arrive.
+#
+# `up.sh` runs in the background and its reset happens some way into it, so the
+# previous stack is still holding these ports when the waits below start. They
+# are satisfied instantly by the chain that is about to be destroyed, this
+# script says "ready", and whatever runs next populates a chain that disappears
+# underneath it a minute later. That is exactly what happened: a campaign
+# registered thirty-six users against a chain at height 851, the wipe landed,
+# and every faucet call afterwards was refused by a service that no longer
+# existed. The chain was fine; the readiness was a lie.
+if [ -n "${say_reset:-}" ]; then
+  waited=0
+  while ss -ltn 2>/dev/null | grep -q ":1337 "; do
+    sleep 5; waited=$((waited + 5))
+    [ "$waited" -lt 600 ] || fail "the previous chain still holds 1337 after ${waited}s; \
+the reset cannot be observed and anything started now would be built on a chain about to be wiped"
+  done
+  say "the previous chain is down (after ${waited}s); waiting for the new one"
+fi
+
 # The edges come up long before the prover does, so waiting on them first gives
 # a useful failure when the stack dies early rather than a ten-minute silence.
 wait_for_port 1337 "coordinator edge" 1800
