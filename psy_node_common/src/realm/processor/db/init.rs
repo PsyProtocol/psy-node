@@ -720,7 +720,7 @@ where
         // A held lease blocks every commit, so it goes first.
         self.release_stale_commit_lease().await?;
         self.truncate_if_ahead_of_published_head().await?;
-        self.reconcile_missed_rollback_epochs().await?;
+        self.reconcile_missed_rollback_epochs_or_restart().await?;
 
         // 2. Recovery Check
         self.ensure_backup_restored_if_necessary(file_system, guta_gatherer_backup_directory, global_user_tree)

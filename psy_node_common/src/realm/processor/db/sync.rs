@@ -447,9 +447,20 @@ where
     /// targeted 3273, and the reset it was about to run would have claimed 519
     /// checkpoints it had never seen.
     pub async fn reset_for_rollback_to(&mut self, target: u64) -> anyhow::Result<()> {
+        // Where this Realm is, taken from the durable marker rather than the
+        // in-memory checkpoint tree.
+        //
+        // The tree's head is zero until the tree is loaded, and this runs during
+        // startup, before it is.  Clamping to it sent a Realm at checkpoint 142
+        // all the way back to genesis -- "this Realm is at checkpoint 0, below
+        // the rollback target 143" -- and it then re-synced the entire chain
+        // from nothing, committing to no epoch while it did.  The clamp is right
+        // and the number it clamped to was not.
         let held = self
-            .checkpoint_tree_backup_manager
-            .get_current_checkpoint_id_head();
+            .db
+            .get_latest_checkpoint_id()
+            .await?
+            .max(self.checkpoint_tree_backup_manager.get_current_checkpoint_id_head());
         let resync_from = target.saturating_sub(1).min(held);
         if resync_from < target.saturating_sub(1) {
             tracing::warn!(
@@ -747,6 +758,35 @@ where
             }
             _ => false,
         }
+    }
+
+    /// Reconcile, and restart if that adopted a new epoch.
+    ///
+    /// The restart is the point.  This node's Redis and NATS namespaces are
+    /// derived from the Realm's epoch before anything here runs -- they have to
+    /// be, the stores are built with them -- so a Realm that adopts a new epoch
+    /// during startup spends the rest of its life writing to the branch it just
+    /// left, while its Edge polls the epoch, sees the new one and moves. The
+    /// processor writes `realm_1_e0`, the Edge reads `realm_1_e1`, and every
+    /// transaction is refused with "Unique pending ids not found".
+    ///
+    /// In one place because there are two callers and the first one wins.
+    /// Putting the restart on the second was the same fix in the wrong spot: by
+    /// then `init` had already reconciled, so the epoch matched, nothing was
+    /// adopted, and the restart never fired. The campaign found it identically
+    /// broken the round after it was "fixed".
+    pub async fn reconcile_missed_rollback_epochs_or_restart(&mut self) -> anyhow::Result<()> {
+        if self.reconcile_missed_rollback_epochs().await? {
+            tracing::warn!(
+                "[REALM] reconciled to a new chain epoch; restarting so the queue and Redis \
+                 namespaces are derived from it rather than from the branch this Realm was on a \
+                 moment ago (exit {})",
+                psy_node_core::store::rollback_reload::EXIT_CODE_ROLLBACK_RELOAD
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            std::process::exit(psy_node_core::store::rollback_reload::EXIT_CODE_ROLLBACK_RELOAD);
+        }
+        Ok(())
     }
 
     /// Record the epoch the chain is in now, after a rollback this Realm
