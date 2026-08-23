@@ -80,6 +80,35 @@ realm_commit() {  # realm_commit <realm> <epoch>
 }
 proving_failures() { grep -ac "Proving failed" "$LOGS/coordinator-worker.log" 2>/dev/null || echo 0; }
 
+# How many of an operation the workload has completed, ever.
+op_count() {  # op_count <name>
+  python3 "$WORK" status 2>/dev/null | awk -v k="$1" '$1==k {print $2}' | head -1
+}
+
+# The three operations a chain exists to serve, checked by whether they are
+# still happening rather than by whether something that implies them is.
+#
+# "Both Realms are committing" was the old stand-in, and it is not the same
+# claim: a Realm commits when it has state of its own, which minting alone
+# produces.  A chain came back from a rollback committing on both Realms, at the
+# right height, producing blocks -- and refusing every transaction submitted to
+# it with "Unique pending ids not found".  Nothing above would have noticed.
+transactions_still_work() {  # transactions_still_work <what-for> <before-blob>
+  local what="$1" before="$2" name b a bad=0
+  for name in registered deployed simple_transfer; do
+    b=$(echo "$before" | awk -v k="$name" '$1==k {print $2}')
+    a=$(op_count "$name")
+    b="${b:-0}"; a="${a:-0}"
+    if [ "$a" -le "$b" ]; then
+      say "$what: no new $name since the rollback ($b -> $a)"
+      bad=1
+    else
+      say "$what: $name $b -> $a"
+    fi
+  done
+  return "$bad"
+}
+
 # What "no problems" means.  Used for the warm-up and after every rollback,
 # deliberately the same function: a bar that moves between the two would let a
 # rollback pass a test the chain never had to pass first.
@@ -200,6 +229,7 @@ for round in $(seq 1 "$ROUNDS"); do
   before=$(head_now)
   target=$((before - DEPTH))
   epoch_before=$(chain_epoch)
+  ops_before=$(python3 "$WORK" status 2>/dev/null)
   say "head $before, epoch $epoch_before; rolling back to $target"
 
   timeout 1800 "$CLI" rollback to "$target" 2>&1 | grep -aE "RollbackReport|going on without|^done|Error" \
@@ -210,6 +240,11 @@ for round in $(seq 1 "$ROUNDS"); do
 
   healthy "round $round" || halt "round $round: the chain did not come back. \
 It was healthy before this rollback ran, so this one is attributable."
+
+  transactions_still_work "round $round" "$ops_before" || halt "round $round: the chain is \
+producing and both Realms are committing, but it is not accepting the transactions it exists \
+to serve. A rollback that leaves the chain unable to register, deploy or transfer has not \
+succeeded, however healthy every other signal looks."
 
   epoch_after=$(chain_epoch)
   if [ "$epoch_after" = "$epoch_before" ]; then

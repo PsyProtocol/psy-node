@@ -148,12 +148,46 @@ def save(state):
 
 
 def merge_users(disk, memory):
-    """Union by user id, with this process's copy winning for users it touched.
+    """Union by user id, merging each user field by field.
 
-    Flags like `funded` and `minted_at` only ever move forward, so preferring
-    the in-memory entry loses nothing another process could have set."""
-    by_id = {u["user_id"]: u for u in disk}
-    by_id.update({u["user_id"]: u for u in memory})
+    The whole entry used to win if this process had one, on the reasoning that
+    flags only ever move forward so the in-memory copy could not be behind. That
+    is true of a process that just read the file and false of one holding a
+    snapshot: `run` loads once and keeps it for the whole invocation, so every
+    save put its *original* view of a user back over whatever the background
+    drivers had set in the meantime.
+
+    Transfers are what that cost. A sender may only transfer once its mint is
+    two minutes old, the transferrer sets `minted` and saves, and the next save
+    from anything else cleared it -- so the flag never survived long enough to
+    settle. The counters showed thirty-three successful mints against exactly
+    one user marked as minted, which is the shape of the bug: counters merge as
+    deltas and were right, users merged whole and were not.
+
+    So each field takes the value that is further along, and neither copy has to
+    be the fresh one.
+    """
+    by_id = {u["user_id"]: dict(u) for u in disk}
+    for user in memory:
+        existing = by_id.get(user["user_id"])
+        if existing is None:
+            by_id[user["user_id"]] = dict(user)
+            continue
+        merged = dict(existing)
+        for key, value in user.items():
+            was = existing.get(key)
+            if key in ("funded", "minted"):
+                merged[key] = bool(was) or bool(value)        # once true, true
+            elif key in ("funded_at", "minted_at"):
+                # "first credit of this kind", so the earliest non-zero wins --
+                # a later one would keep pushing the settle window away.
+                stamps = [s for s in (was, value) if s]
+                merged[key] = min(stamps) if stamps else 0
+            elif key == "sent_to":
+                merged[key] = sorted(set(was or []) | set(value or []))
+            elif value is not None:
+                merged[key] = value
+        by_id[user["user_id"]] = merged
     return sorted(by_id.values(), key=lambda u: u["user_id"])
 
 
