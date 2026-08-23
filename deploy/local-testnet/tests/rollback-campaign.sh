@@ -221,6 +221,25 @@ nohup python3 "$WORK" transferrer --every 20  >> "$LOGS/workload-transferrer.log
 nohup python3 "$WORK" deployer    --every 150 >> "$LOGS/workload-deployer.log"    2>&1 &
 say "workload started; letting it settle"
 sleep 120
+
+# A transfer has to have happened before anything is rolled back.
+#
+# It is the slowest operation to become possible -- a sender may only transfer
+# once its mint is two minutes old -- and it is the one the post-rollback check
+# leans on hardest. Without seeing one first, a rollback that broke transfers
+# and a chain where transfers never worked look identical afterwards, and the
+# rollback gets the blame either way.
+waited=0
+while :; do
+  seen=$(op_count simple_transfer); seen="${seen:-0}"
+  [ "$seen" -gt 0 ] 2>/dev/null && break
+  sleep 20; waited=$((waited + 20))
+  [ "$waited" -lt 900 ] || halt "no transfer completed in ${waited}s of ordinary traffic. \
+Nothing has been rolled back yet, so this is not a rollback defect -- but a campaign that \
+cannot transfer beforehand cannot tell you whether a rollback broke transferring."
+done
+say "transfers are working before any rollback ($(op_count simple_transfer) so far, after ${waited}s)"
+
 healthy "warm-up" || halt "the chain was not healthy before any rollback ran. \
 Whatever is wrong here is not a rollback defect, and rolling back would only hide it."
 
