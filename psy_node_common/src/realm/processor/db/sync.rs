@@ -303,6 +303,37 @@ where
         search_head_height: Option<u64>,
         plan_epochs: Option<std::ops::RangeInclusive<u64>>,
     ) -> anyhow::Result<()> {
+        // One rollback, one undo -- enforced here rather than trusted to the
+        // callers.
+        //
+        // Two paths undo: the one that watched the rollback happen and kept the
+        // target in memory, and the one that finds out afterwards from the
+        // epoch.  Both are needed, since a Realm may be up for a rollback or
+        // down for it, and neither knew whether the other had already run.  So a
+        // single Coordinator rollback could be undone by a Realm any number of
+        // times, and each undo after the first discards work the *new* branch
+        // did -- which is how realm-0 came to rebuild a checkpoint it had
+        // already sealed, and park.
+        //
+        // Both legitimate callers undo while the recorded epoch is still behind
+        // the published one: each writes the epoch afterwards, deliberately, so
+        // that a crash in between leaves the work looking undone, because it is.
+        // That makes the rule exact -- once the recorded epoch has caught up
+        // there is no rollback outstanding, and anything above the target
+        // belongs to the branch the chain is on now.
+        //
+        // Checked in the one place both paths funnel through, because the
+        // version of this that lived in a caller was added to one path and not
+        // the other, and the round after it shipped failed the same way.
+        if !matches!(self.epochs_behind_the_rollback_in_flight().await, Some(behind) if behind > 0)
+        {
+            tracing::info!(
+                "[REALM_ROLLBACK] refusing to undo above {target}: this Realm has already \
+                 reconciled to the chain's epoch, so nothing above the target belongs to a \
+                 discarded branch"
+            );
+            return Ok(());
+        }
         if let Some(driver) = self.recording.self_rollback() {
             let mut search_head = self.coordinator_chain_ref_last_synced();
             if search_head_height.is_some() || plan_epochs.is_some() {

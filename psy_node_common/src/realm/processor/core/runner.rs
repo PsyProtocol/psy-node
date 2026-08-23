@@ -107,37 +107,11 @@ where
                     // the Coordinator has finished and is publishing again, and
                     // the Realm still holds heights that no longer exist.
                     if let Some(target) = rollback_target.take() {
-                        // Only if this rollback is still outstanding.
-                        //
-                        // A Realm can reach this holding a target it has already
-                        // dealt with: it takes part, restarts, reconciles at
-                        // startup -- which undoes the range and records the new
-                        // epoch -- restarts again, and comes back to a phase that
-                        // re-arms the target from memory. Undoing a second time
-                        // then discards the work it did *after* reconciling,
-                        // which is the new branch's, and the rebuild that follows
-                        // collides with the manifest that work left behind.
-                        //
-                        // That is what parked realm-0 on the first three-round
-                        // campaign: undo on epoch 0, a legitimate commit at 202
-                        // under epoch 1 sixteen seconds later, undo again on
-                        // epoch 1, and then a rebuild of 202 refused because 202
-                        // was already sealed. Two undos for one rollback.
-                        //
-                        // The epoch is the record of whether it is done: the
-                        // reconcile writes it, and once it matches the published
-                        // one there is nothing of that rollback left to undo.
-                        let outstanding = matches!(
-                            processor.db.epochs_behind_the_rollback_in_flight().await,
-                            Some(behind) if behind > 0
-                        );
-                        if !outstanding {
-                            tracing::info!(
-                                "[REALM] the rollback to {target} was already reconciled at \
-                                 startup; keeping the work done since rather than undoing it a \
-                                 second time"
-                            );
-                        } else if rollback_aborted {
+                        // Whether this rollback is still outstanding is decided
+                        // inside `undo_everything_above`, which every path funnels
+                        // through -- a copy of that test here is exactly what drifted
+                        // apart last time.
+                        if rollback_aborted {
                             tracing::info!(
                                 "[REALM] the rollback to {target} was aborted; keeping the sync \
                                  state the Coordinator never discarded"
