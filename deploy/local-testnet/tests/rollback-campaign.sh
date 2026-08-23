@@ -84,6 +84,10 @@ proving_failures() { grep -ac "Proving failed" "$LOGS/coordinator-worker.log" 2>
 op_count() {  # op_count <name>
   python3 "$WORK" status 2>/dev/null | awk -v k="$1" '$1==k {print $2}' | head -1
 }
+contract_count() {
+  "${CQL[@]}" "SELECT COUNT(*) FROM $KEYSPACE.contract_leaf_table;" 2>/dev/null \
+    | sed -n '4p' | tr -d ' '
+}
 
 # The three operations a chain exists to serve, checked by whether they are
 # still happening rather than by whether something that implies them is.
@@ -93,9 +97,9 @@ op_count() {  # op_count <name>
 # produces.  A chain came back from a rollback committing on both Realms, at the
 # right height, producing blocks -- and refusing every transaction submitted to
 # it with "Unique pending ids not found".  Nothing above would have noticed.
-transactions_still_work() {  # transactions_still_work <what-for> <before-blob>
-  local what="$1" before="$2" name b a bad=0
-  for name in registered deployed simple_transfer; do
+transactions_still_work() {  # transactions_still_work <what-for> <ops-before> <contracts-before>
+  local what="$1" before="$2" contracts_before="$3" name b a bad=0
+  for name in registered simple_transfer; do
     b=$(echo "$before" | awk -v k="$name" '$1==k {print $2}')
     a=$(op_count "$name")
     b="${b:-0}"; a="${a:-0}"
@@ -106,6 +110,19 @@ transactions_still_work() {  # transactions_still_work <what-for> <before-blob>
       say "$what: $name $b -> $a"
     fi
   done
+
+  # Deploys are counted on the chain, not in the ledger.  The ledger's `deployed`
+  # counts submissions and it does not agree with what landed: eighteen
+  # submitted against eight it could name an id for, while the chain held
+  # twenty-six.  What the campaign wants to know is whether a contract reaches
+  # the chain, and the chain is the only thing that can say.
+  a=$(contract_count); a="${a:-0}"
+  if [ "$a" -le "${contracts_before:-0}" ]; then
+    say "$what: no contract reached the chain since the rollback (${contracts_before:-0} -> $a)"
+    bad=1
+  else
+    say "$what: contracts on chain ${contracts_before:-0} -> $a"
+  fi
   return "$bad"
 }
 
@@ -249,6 +266,7 @@ for round in $(seq 1 "$ROUNDS"); do
   target=$((before - DEPTH))
   epoch_before=$(chain_epoch)
   ops_before=$(python3 "$WORK" status 2>/dev/null)
+  contracts_before=$(contract_count)
   say "head $before, epoch $epoch_before; rolling back to $target"
 
   timeout 1800 "$CLI" rollback to "$target" 2>&1 | grep -aE "RollbackReport|going on without|^done|Error" \
@@ -260,7 +278,7 @@ for round in $(seq 1 "$ROUNDS"); do
   healthy "round $round" || halt "round $round: the chain did not come back. \
 It was healthy before this rollback ran, so this one is attributable."
 
-  transactions_still_work "round $round" "$ops_before" || halt "round $round: the chain is \
+  transactions_still_work "round $round" "$ops_before" "$contracts_before" || halt "round $round: the chain is \
 producing and both Realms are committing, but it is not accepting the transactions it exists \
 to serve. A rollback that leaves the chain unable to register, deploy or transfer has not \
 succeeded, however healthy every other signal looks."
