@@ -90,11 +90,23 @@ stack_pid=$!
 # registered thirty-six users against a chain at height 851, the wipe landed,
 # and every faucet call afterwards was refused by a service that no longer
 # existed. The chain was fine; the readiness was a lie.
+#
+# Every port, not just the first one. Waiting only on 1337 fixed the case that
+# was noticed and left the rest: the coordinator edge went down and came back
+# while the *faucet* was still the old process, so the wait below was satisfied
+# by it, funding ran, and the wipe reached the faucet a moment later. Thirty-six
+# refused connections, and a faucet that was up and healthy by the time anyone
+# looked.
 if [ -n "${say_reset:-}" ]; then
   waited=0
-  while ss -ltn 2>/dev/null | grep -q ":1337 "; do
+  while :; do
+    still_up=""
+    for port in 1337 13380 13390 9999 9998; do
+      ss -ltn 2>/dev/null | grep -q ":$port " && still_up="$still_up $port"
+    done
+    [ -z "$still_up" ] && break
     sleep 5; waited=$((waited + 5))
-    [ "$waited" -lt 600 ] || fail "the previous chain still holds 1337 after ${waited}s; \
+    [ "$waited" -lt 600 ] || fail "the previous chain still holds$still_up after ${waited}s; \
 the reset cannot be observed and anything started now would be built on a chain about to be wiped"
   done
   say "the previous chain is down (after ${waited}s); waiting for the new one"
