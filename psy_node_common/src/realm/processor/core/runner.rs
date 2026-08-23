@@ -64,12 +64,43 @@ where
     // before the Coordinator produced past the old head.  After that the
     // heights agree and only the contents differ, and the epoch is the only
     // thing left that can tell.
-    if let Err(e) = processor.db.reconcile_missed_rollback_epochs().await.map(|_| ()) {
-        tracing::error!(
-            "[REALM] could not reconcile against rollbacks that happened while this Realm was \
-             down ({e:#}); refusing to start on a cache whose provenance is unknown"
-        );
-        return Err(e);
+    match processor.db.reconcile_missed_rollback_epochs().await {
+        Err(e) => {
+            tracing::error!(
+                "[REALM] could not reconcile against rollbacks that happened while this Realm \
+                 was down ({e:#}); refusing to start on a cache whose provenance is unknown"
+            );
+            return Err(e);
+        }
+        // Adopting a new epoch here is too late to be useful to this process.
+        //
+        // The Redis and NATS namespaces this node uses are derived from the
+        // Realm's own epoch, and they were derived *before* this ran -- they
+        // have to be, since the stores are built with them.  So a Realm that
+        // reconciles at startup spends the rest of its life writing to the
+        // branch it just left, while its Edge polls the epoch, sees the new one
+        // and moves: the processor writes `realm_1_e0`, the Edge reads
+        // `realm_1_e1`, and every transaction is refused with "Unique pending
+        // ids not found" by a store nothing has ever written to.
+        //
+        // Observed on the first clean campaign: a rollback both Realms took part
+        // in, both back in step at the right height, both producing empty
+        // blocks, and not one transaction accepted afterwards.
+        //
+        // One more restart is the whole fix.  The next start reads the epoch
+        // this one recorded and builds its stores from that, which is the rule
+        // everywhere else -- a Realm whose branch changed restarts.
+        Ok(true) => {
+            tracing::warn!(
+                "[REALM] reconciled to a new chain epoch at startup; restarting so the queue and \
+                 Redis namespaces are derived from it rather than from the branch this Realm \
+                 was on a moment ago (exit {})",
+                psy_node_core::store::rollback_reload::EXIT_CODE_ROLLBACK_RELOAD
+            );
+            sleep(std::time::Duration::from_millis(500)).await;
+            std::process::exit(psy_node_core::store::rollback_reload::EXIT_CODE_ROLLBACK_RELOAD);
+        }
+        Ok(false) => {}
     }
 
     let mut last_slot: u128 = 0;
