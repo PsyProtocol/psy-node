@@ -59,7 +59,7 @@ pub async fn coordinator_chain_epoch(
         CANONICAL_CHAIN_REF_CODEC_VERSION, CANONICAL_CHAIN_REF_MAGIC,
     };
 
-    let rows = session
+    let query = session
         .query_unpaged(
             format!(
                 "SELECT canonical_ref FROM {no_tablet_keyspace}.\
@@ -68,8 +68,15 @@ pub async fn coordinator_chain_epoch(
             ),
             (network_chain_id,),
         )
-        .await?
-        .into_rows_result()?;
+        .await;
+    // A keyspace that is not there yet is genesis, not a failure.  This runs
+    // before the store that creates the schema -- it has to, the name it
+    // returns is what the store is built with -- so on a chain being started
+    // for the first time the table it reads does not exist.  Answering with an
+    // error there stops every fresh chain from ever starting.
+    let Some(rows) = row_or_genesis(query)? else {
+        return Ok(0);
+    };
     // No row is a chain that has not started, not a chain at a strange epoch:
     // genesis is epoch zero and that is the right name to come up on.
     let Some((Some(bytes),)) = rows.maybe_first_row::<(Option<Vec<u8>>,)>()? else {
@@ -108,7 +115,7 @@ pub async fn realm_chain_epoch(
     no_tablet_keyspace: &str,
     network_chain_id: i64,
 ) -> anyhow::Result<u64> {
-    let rows = session
+    let query = session
         .query_unpaged(
             format!(
                 "SELECT chain_epoch FROM {no_tablet_keyspace}.{} WHERE network_chain_id = ?",
@@ -116,9 +123,34 @@ pub async fn realm_chain_epoch(
             ),
             (network_chain_id,),
         )
-        .await?
-        .into_rows_result()?;
+        .await;
+    // As above: on a chain being started for the first time this table does not
+    // exist yet, and a Realm that has never synced is at genesis.
+    let Some(rows) = row_or_genesis(query)? else {
+        return Ok(0);
+    };
     Ok(rows.maybe_first_row::<(i64,)>()?.map(|row| row.0 as u64).unwrap_or(0))
+}
+
+/// `None` when the table is not there yet, the error when it is something else.
+///
+/// Only "this keyspace or table does not exist" is forgiven, and only because a
+/// node reads its branch *before* the store that creates the schema -- it has
+/// to, since the name this returns is what that store is built with.  Every
+/// other failure is still a failure: a node that cannot tell which branch it is
+/// on must not come up on a guess.
+fn row_or_genesis(
+    result: Result<scylla::response::query_result::QueryResult, scylla::errors::ExecutionError>,
+) -> anyhow::Result<Option<scylla::response::query_result::QueryRowsResult>> {
+    use scylla::errors::{DbError, ExecutionError, RequestAttemptError};
+    match result {
+        Ok(result) => Ok(Some(result.into_rows_result()?)),
+        Err(ExecutionError::LastAttemptError(RequestAttemptError::DbError(
+            DbError::Invalid,
+            _,
+        ))) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// The branch namespace a Coordinator node should come up on, and the epoch it

@@ -146,6 +146,26 @@ say "log: $CAMPAIGN_LOG"
 
 step "1/4  a chain with nothing behind it"
 stop_workload
+
+# The stack's own reset takes the database, Redis, NATS and the on-disk
+# checkpoint state -- it destroys the docker volumes and archives
+# `checkpoints/` -- but it does not know about the workload's ledger, and that
+# is chain-coupled state like any other.  It names users by the id the chain
+# assigned them, so carrying it into a new chain points every transfer at
+# somebody who does not exist: "user never got an id", "insufficient balance",
+# a background error rate that looks like the chain misbehaving and is not.
+#
+# Archived rather than deleted, the way `down.sh` archives the rest, because a
+# population that was in the middle of something is worth being able to read.
+LEDGER="$REPO_ROOT/.local-staging/workload/ledger.json"
+if [ -f "$LEDGER" ]; then
+  archive="$REPO_ROOT/.local-staging/reset-archives/$(date -u +%Y%m%dT%H%M%SZ)-workload"
+  mkdir -p "$archive"
+  mv "$LEDGER" "$archive/ledger.json"
+  rm -f "$REPO_ROOT/.local-staging/workload/ledger.lock"
+  say "archived the previous chain's workload ledger -> $archive"
+fi
+
 "$HERE/chain-up.sh" --reset || halt "the chain would not come up"
 
 step "2/4  a population to transact with"
