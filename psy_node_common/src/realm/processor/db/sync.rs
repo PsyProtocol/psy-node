@@ -264,10 +264,56 @@ where
     /// A Realm with no transactions in the range does nothing here beyond one
     /// manifest read, which is the ordinary case.
     pub async fn undo_everything_above(&mut self, target: u64) -> anyhow::Result<()> {
-        // No epoch override: a Realm following a rollback while running has not
-        // adopted the new one yet, so the epoch it is carrying is still the
-        // branch its own state was written on.
-        self.undo_everything_above_bounded(target, None, None).await
+        // Every epoch the rollback left behind, and never the one it arrived at.
+        //
+        // A Realm reaches here holding a target it watched being published. It
+        // may not have adopted the new epoch yet -- the ordinary case, and then
+        // its own state is stamped with the old one -- or it may already have
+        // reconciled and restarted, in which case anything above the target is
+        // work it has since done on the *new* branch and undoing it takes the
+        // new branch apart.
+        //
+        // Both are the same question asked of the data: which epoch is this
+        // stamped with?  Rows on the branch the chain is on now carry the
+        // published epoch, so excluding that epoch protects them, and excluding
+        // it costs nothing when the Realm has not reconciled, since then its own
+        // state is not stamped with it either.
+        //
+        // A Realm that has reconciled gets an empty range and undoes nothing --
+        // which is the "one rollback, one undo" rule, obtained from the rows
+        // rather than from a flag. The flag it replaces was written by the
+        // reconcile whether or not the reconcile actually undid anything, so it
+        // could report a debt paid that was still outstanding: realm-1 kept a
+        // root at checkpoint 206 through a rollback to 199 that way, and then
+        // failed `Realm Root mismatch` once a second for as long as it ran.
+        let epochs = match self.published_chain_epoch_for_undo().await {
+            // Nothing published to compare against: fall back to the Realm's own
+            // view, which is what this did before epochs entered it at all.
+            None => None,
+            Some(published) => {
+                let recorded = self.recorded_chain_epoch_for_undo().await.unwrap_or(published);
+                Some(recorded..=published.saturating_sub(1))
+            }
+        };
+        self.undo_everything_above_bounded(target, None, epochs).await
+    }
+
+    /// The epoch the Coordinator has published, if it can be read.
+    async fn published_chain_epoch_for_undo(&self) -> Option<u64> {
+        let seen = self.coordinator_chain_ref_last_synced();
+        match self.recording.observe_published_head(&seen).await {
+            std::result::Result::Ok(Some(published)) => Some(published.chain_epoch().get()),
+            _ => None,
+        }
+    }
+
+    /// The epoch this Realm last reconciled itself to, if it has one.
+    async fn recorded_chain_epoch_for_undo(&self) -> Option<u64> {
+        let store = self.recording.sync_epoch_store()?;
+        match store.read_synced_epoch().await {
+            std::result::Result::Ok(recorded) => recorded,
+            _ => None,
+        }
     }
 
     /// As above, with an explicit bound on how far the Realm's own manifest is
@@ -333,16 +379,17 @@ where
         // rollback landed.  Guarding it too left a Realm holding synced state
         // the chain no longer had -- "next_contract_id regressed (local=18,
         // remote=17)" -- and it refused to advance, correctly, forever.
-        let owes_an_undo =
-            matches!(self.epochs_behind_the_rollback_in_flight().await, Some(behind) if behind > 0);
-        if !owes_an_undo {
+        // An empty epoch range means there is nothing of a discarded branch to
+        // look for, which is how a Realm that has already reconciled undoes
+        // nothing without being told not to.
+        let nothing_to_search = plan_epochs.as_ref().is_some_and(|e| e.is_empty());
+        if nothing_to_search {
             tracing::info!(
-                "[REALM_ROLLBACK] not undoing this Realm's own state above {target}: it has \
-                 already reconciled to the chain's epoch, so anything up there belongs to the \
-                 branch the chain is on now. Still winding the sync cursor back."
+                "[REALM_ROLLBACK] no discarded epoch left below the chain's own above {target}; \
+                 winding the sync cursor back and leaving this Realm's state alone"
             );
         }
-        if let Some(driver) = self.recording.self_rollback().filter(|_| owes_an_undo) {
+        if let Some(driver) = self.recording.self_rollback().filter(|_| !nothing_to_search) {
             let mut search_head = self.coordinator_chain_ref_last_synced();
             if search_head_height.is_some() || plan_epochs.is_some() {
                 use psy_data::protocol::canonical_chain::{
