@@ -177,15 +177,39 @@ healthy() {  # healthy <what-for>
 
   # 3. Both Realms committing, not merely syncing.  A Realm can follow the chain
   #    perfectly and produce nothing at all, with no error anywhere.
+  #    Waited for, not sampled once. A Realm commits when it has transactions of
+  #    its own, so how soon it commits after a rollback depends on when traffic
+  #    next reaches it -- and after a crash injection, on how long its recovery
+  #    took. realm-1 was failed for having committed nothing while its first
+  #    commit of the new epoch was at checkpoint 233, forty-seven above the
+  #    target: it was slow, not broken, and the round blamed the rollback.
   epoch=$(chain_epoch)
-  for r in 0 1; do
-    local own; own=$(realm_commit "$r" "$epoch")
-    if [ -z "${own:-}" ] || [ "$own" = "null" ]; then
-      say "$what: realm-$r has committed nothing in epoch $epoch"
+  local waited=0 pending
+  while :; do
+    pending=""
+    for r in 0 1; do
+      local own; own=$(realm_commit "$r" "$epoch")
+      if [ -z "${own:-}" ] || [ "$own" = "null" ]; then pending="$pending realm-$r"; fi
+    done
+    [ -z "$pending" ] && break
+    if [ "$waited" -ge "${PSY_CAMPAIGN_COMMIT_WAIT:-600}" ]; then
+      say "$what:$pending committed nothing in epoch $epoch after ${waited}s"
       return 1
     fi
-    if [ "$own" -lt $((second - 60)) ]; then
-      say "$what: realm-$r last committed at $own while the chain is at $second"
+    sleep 30; waited=$((waited + 30))
+  done
+  [ "$waited" -gt 0 ] && say "$what: both Realms committing in epoch $epoch (after ${waited}s)"
+
+  #    And still committing, not committed once and stopped. The margin is wide
+  #    on purpose -- a Realm with no traffic of its own is quiet, and quiet is
+  #    not broken -- so this only catches one that has gone silent for longer
+  #    than any traffic pattern explains. realm-1 sat like that for two and a
+  #    half hours once, syncing perfectly, with no error anywhere.
+  local now; now=$(head_now)
+  for r in 0 1; do
+    local own; own=$(realm_commit "$r" "$epoch")
+    if [ -n "${own:-}" ] && [ "$own" != "null" ] && [ "$own" -lt $((now - 200)) ]; then
+      say "$what: realm-$r last committed at $own while the chain is at $now"
       return 1
     fi
   done
