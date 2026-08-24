@@ -325,16 +325,24 @@ where
         // Checked in the one place both paths funnel through, because the
         // version of this that lived in a caller was added to one path and not
         // the other, and the round after it shipped failed the same way.
-        if !matches!(self.epochs_behind_the_rollback_in_flight().await, Some(behind) if behind > 0)
-        {
+        //
+        // It covers the manifest-driven undo below and nothing else.  The sync
+        // reset at the end of this function is not an undo: it winds the cursor
+        // back so the Coordinator's view of the range is fetched again, it is
+        // idempotent, and it has to happen every time the Realm is told a
+        // rollback landed.  Guarding it too left a Realm holding synced state
+        // the chain no longer had -- "next_contract_id regressed (local=18,
+        // remote=17)" -- and it refused to advance, correctly, forever.
+        let owes_an_undo =
+            matches!(self.epochs_behind_the_rollback_in_flight().await, Some(behind) if behind > 0);
+        if !owes_an_undo {
             tracing::info!(
-                "[REALM_ROLLBACK] refusing to undo above {target}: this Realm has already \
-                 reconciled to the chain's epoch, so nothing above the target belongs to a \
-                 discarded branch"
+                "[REALM_ROLLBACK] not undoing this Realm's own state above {target}: it has \
+                 already reconciled to the chain's epoch, so anything up there belongs to the \
+                 branch the chain is on now. Still winding the sync cursor back."
             );
-            return Ok(());
         }
-        if let Some(driver) = self.recording.self_rollback() {
+        if let Some(driver) = self.recording.self_rollback().filter(|_| owes_an_undo) {
             let mut search_head = self.coordinator_chain_ref_last_synced();
             if search_head_height.is_some() || plan_epochs.is_some() {
                 use psy_data::protocol::canonical_chain::{
