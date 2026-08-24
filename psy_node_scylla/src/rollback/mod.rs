@@ -14,6 +14,7 @@
 
 mod authority_timestamp_store;
 mod branch_namespace;
+mod rollback_gate_watch;
 mod transient_database;
 mod canonical_head_store;
 mod commit_planner_scylla;
@@ -47,6 +48,7 @@ mod verification_journal;
 
 pub use authority_timestamp_store::*;
 pub use branch_namespace::*;
+pub use rollback_gate_watch::*;
 pub use transient_database::*;
 pub use canonical_head_store::*;
 pub use commit_planner_scylla::*;

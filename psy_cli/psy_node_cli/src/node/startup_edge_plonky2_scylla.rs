@@ -11,6 +11,7 @@ use psy_node_core::config::node_start_config::{CoordinatorEdgeStartConfig, Realm
 use psy_node_nats::psy_queue::setup_nats_psy_queue_from_connection_str;
 use psy_node_scylla::rollback::{
     coordinator_branch_namespace, realm_branch_namespace, watch_branch_and_reload,
+    watch_rollback_phase,
 };
 use psy_node_redis::store::{new_redis_async_pool, StandardRedisStore};
 use psy_node_scylla::psy_setup::setup_psy_scylla_database_store_from_connection_string;
@@ -54,6 +55,17 @@ pub async fn run_startup_plonky2_scylla_edge_node(config: &CoordinatorEdgeStartC
         config.network.get_chain_id() as i64,
         false,
         branch_epoch,
+    );
+    // While a rollback is running this Edge refuses to answer questions about
+    // the chain.  A rollback has intermediate states and an answer given during
+    // them describes a branch that is about to stop existing -- a Realm was told
+    // its root was at checkpoint 222 nine seconds after undoing its own share of
+    // one, caught up to 222, and failed `Realm Root mismatch` once a second
+    // afterwards for as long as it ran.
+    watch_rollback_phase(
+        config.scylla_db_url.clone(),
+        format!("{}_no_tablet", config.db_namespace),
+        config.network.get_chain_id() as i64,
     );
     let temp_store = StandardRedisStore::new(
         pool,

@@ -38,6 +38,33 @@ fn res<T>(data: anyhow::Result<T>) -> QRpcResult<T> {
     Ok(data.map_err(RpcError::Anyhow)?)
 }
 
+/// Answer a question about the chain, unless a rollback is running.
+///
+/// A rollback has intermediate states -- frozen, archiving, deleting, restoring,
+/// verifying -- and an answer given during them describes a branch that is about
+/// to stop existing.  A Realm asked where its root was nine seconds after
+/// undoing its own share of one, was told checkpoint 222, caught up to 222 and
+/// committed it again on the new epoch; 222 was on the branch being discarded,
+/// and it failed `Realm Root mismatch` once a second afterwards for as long as
+/// it ran.  The Realm knew a rollback had happened and believed the answer
+/// anyway, which is why the judgement has to live here rather than in callers.
+///
+/// A macro rather than a wrapper, so the check happens *before* the read.
+/// `answer!(self.db_reader.foo().await)` evaluates the read first, and a guard there
+/// would fetch a value from the middle of a rollback and only then decide not to
+/// use it -- correct by luck, and still a read of a table being rewritten.
+macro_rules! answer {
+    ($body:expr) => {{
+        if psy_node_core::store::rollback_gate::is_rolling_back() {
+            return Err(RpcError::Anyhow(anyhow::Error::new(
+                psy_node_core::store::rollback_gate::AnswerRefusedDuringRollback,
+            ))
+            .into());
+        }
+        res($body)
+    }};
+}
+
 const MAX_CHECKPOINT_ID: u64 = i64::MAX as u64;
 #[async_trait]
 impl<
@@ -71,7 +98,7 @@ impl<
     }
 
     async fn get_public_key_for_user_id(&self, user_id: u64) -> RpcResult<PZKPublicKeyInfo<N::QHash>> {
-        res(self.db_reader.get_zk_public_key(MAX_CHECKPOINT_ID, user_id).await)
+        answer!(self.db_reader.get_zk_public_key(MAX_CHECKPOINT_ID, user_id).await)
     }
 
     async fn submit_guta(
@@ -92,23 +119,23 @@ impl<
     }
 
     async fn get_contract_code_definition(&self, contract_id: u64) -> QRpcResult<ContractCodeDefinition> {
-        res(self.db_reader.get_contract_code_definition(MAX_CHECKPOINT_ID, contract_id).await)
+        answer!(self.db_reader.get_contract_code_definition(MAX_CHECKPOINT_ID, contract_id).await)
     }
     async fn get_latest_checkpoint_id(&self) -> QRpcResult<u64> {
-        res(self.get_latest_checkpoint_id_internal().await)
+        answer!(self.get_latest_checkpoint_id_internal().await)
     }
     async fn get_checkpoint_id_for_unique_pending_id(&self, unique_pending_id: u64) -> QRpcResult<Option<u64>> {
-        res(self.get_checkpoint_id_for_unique_pending_id_internal(unique_pending_id).await)
+        answer!(self.get_checkpoint_id_for_unique_pending_id_internal(unique_pending_id).await)
     }
     async fn get_unique_pending_id_for_checkpoint_id(&self, checkpoint_id: u64) -> QRpcResult<Option<(u64, u128)>> {
         res(PsyNodeCheckpointObjectDatabaseReader::get_unique_pending_id_for_checkpoint_id(&self.db_reader, checkpoint_id).await)
     }
     async fn get_contract_leaf_data(&self, contract_id: u64) -> QRpcResult<PQEDContractLeaf<N::F, N::QHash>> {
-        res(self.db_reader.get_contract_leaf(MAX_CHECKPOINT_ID, contract_id).await)
+        answer!(self.db_reader.get_contract_leaf(MAX_CHECKPOINT_ID, contract_id).await)
     }
 
     async fn get_checkpoint_leaf_data(&self, checkpoint_id: u64) -> QRpcResult<PQEDCheckpointLeaf<N::F, N::QHash>> {
-        res(self.db_reader.get_checkpoint_leaf_data(checkpoint_id).await)
+        answer!(self.db_reader.get_checkpoint_leaf_data(checkpoint_id).await)
     }
 
     async fn get_job_stats(&self, checkpoint_id: u64) -> QRpcResult<CheckpointJobStats> {
@@ -116,39 +143,39 @@ impl<
     }
 
     async fn get_latest_l2_block_state(&self) -> QRpcResult<QEDL2BlockState> {
-        res(self.db_reader.get_latest_l2_block_state().await)
+        answer!(self.db_reader.get_latest_l2_block_state().await)
     }
 
     async fn get_l2_block_state(&self, checkpoint_id: u64) -> QRpcResult<QEDL2BlockState> {
-        res(self.db_reader.get_l2_block_state(checkpoint_id).await)
+        answer!(self.db_reader.get_l2_block_state(checkpoint_id).await)
     }
 
     async fn get_latest_checkpoint_tree_root(&self) -> QRpcResult<N::QHash> {
-        res(self.db_reader.checkpoint_tree_get_root_hash(MAX_CHECKPOINT_ID).await)
+        answer!(self.db_reader.checkpoint_tree_get_root_hash(MAX_CHECKPOINT_ID).await)
     }
 
     async fn get_checkpoint_tree_root(&self, checkpoint_id: u64) -> QRpcResult<N::QHash> {
-        res(self.db_reader.checkpoint_tree_get_root_hash(checkpoint_id).await)
+        answer!(self.db_reader.checkpoint_tree_get_root_hash(checkpoint_id).await)
     }
 
     async fn get_checkpoint_tree_leaf_hash(&self, checkpoint_id: u64, leaf_checkpoint_id: u64) -> QRpcResult<N::QHash> {
-        res(self.db_reader.checkpoint_tree_get_leaf_hash(checkpoint_id, leaf_checkpoint_id).await)
+        answer!(self.db_reader.checkpoint_tree_get_leaf_hash(checkpoint_id, leaf_checkpoint_id).await)
     }
 
     async fn get_checkpoint_tree_merkle_proof(&self, checkpoint_id: u64, leaf_checkpoint_id: u64) -> QRpcResult<MerkleProofCore<N::QHash>> {
-        res(self.db_reader.checkpoint_tree_get_merkle_proof(checkpoint_id, leaf_checkpoint_id).await)
+        answer!(self.db_reader.checkpoint_tree_get_merkle_proof(checkpoint_id, leaf_checkpoint_id).await)
     }
 
     async fn get_checkpoint_global_state_roots(&self, checkpoint_id: u64) -> QRpcResult<PQEDCheckpointGlobalStateRoots<N::QHash>> {
-        res(self.db_reader.get_checkpoint_global_state_roots(checkpoint_id).await)
+        answer!(self.db_reader.get_checkpoint_global_state_roots(checkpoint_id).await)
     }
 
     async fn get_user_leaf_data(&self, checkpoint_id: u64, user_id: u64) -> QRpcResult<PQEDUserLeaf<N::F, N::QHash>> {
-        res(self.db_reader.get_user_leaf(checkpoint_id, user_id).await)
+        answer!(self.db_reader.get_user_leaf(checkpoint_id, user_id).await)
     }
 
     async fn get_user_tree_root(&self, checkpoint_id: u64) -> QRpcResult<N::QHash> {
-        res(self.db_reader.global_user_tree_get_root_hash(checkpoint_id).await)
+        answer!(self.db_reader.global_user_tree_get_root_hash(checkpoint_id).await)
     }
 
     async fn get_user_sub_tree_merkle_proof(
@@ -165,7 +192,7 @@ impl<
     }
 
     async fn get_user_tree_merkle_proof(&self, checkpoint_id: u64, user_id: u64) -> QRpcResult<MerkleProofCore<N::QHash>> {
-        res(self.db_reader.global_user_tree_get_merkle_proof(checkpoint_id, user_id).await)
+        answer!(self.db_reader.global_user_tree_get_merkle_proof(checkpoint_id, user_id).await)
     }
 
     async fn generate_batch_proof_miner_reward_proofs(
@@ -203,11 +230,11 @@ impl<
     }
 
     async fn get_contract_tree_root(&self, checkpoint_id: u64) -> QRpcResult<N::QHash> {
-        res(self.db_reader.global_contract_tree_get_root_hash(checkpoint_id).await)
+        answer!(self.db_reader.global_contract_tree_get_root_hash(checkpoint_id).await)
     }
 
     async fn get_contract_tree_leaf_hash(&self, checkpoint_id: u64, contract_id: u32) -> QRpcResult<N::QHash> {
-        res(self.db_reader.global_contract_tree_get_leaf_hash(checkpoint_id, contract_id as u64).await)
+        answer!(self.db_reader.global_contract_tree_get_leaf_hash(checkpoint_id, contract_id as u64).await)
     }
 
     async fn get_contract_tree_merkle_proof(&self, checkpoint_id: u64, contract_id: u32) -> QRpcResult<MerkleProofCore<N::QHash>> {
@@ -226,7 +253,7 @@ impl<
 
 
     async fn get_withdrawal_tree_root(&self, checkpoint_id: u64) -> QRpcResult<N::QHash> {
-        res(self.db_reader.get_checkpoint_global_state_roots(checkpoint_id).await.map(|roots| roots.withdrawal_tree_root))
+        answer!(self.db_reader.get_checkpoint_global_state_roots(checkpoint_id).await.map(|roots| roots.withdrawal_tree_root))
     }
 
     async fn get_user_top_tree_merkle_proof(&self, checkpoint_id: u64, leaf_level: u8, leaf_index: u64) -> QRpcResult<MerkleProofCore<N::QHash>> {
@@ -265,27 +292,27 @@ impl<
     }
 
     async fn get_user_registration_tree_root(&self, checkpoint_id: u64) -> QRpcResult<N::QHash> {
-        res(self.db_reader.user_registration_tree_get_root_hash(checkpoint_id).await)
+        answer!(self.db_reader.user_registration_tree_get_root_hash(checkpoint_id).await)
     }
 
     async fn get_user_registration_tree_leaf_hash(&self, checkpoint_id: u64, leaf_index: u64) -> QRpcResult<N::QHash> {
-        res(self.db_reader.user_registration_tree_get_leaf_hash(checkpoint_id, leaf_index).await)
+        answer!(self.db_reader.user_registration_tree_get_leaf_hash(checkpoint_id, leaf_index).await)
     }
         async fn get_user_registration_tree_leaf_hashes(&self, checkpoint_id: u64, indices: Vec<u64>) -> RpcResult<Vec<N::QHash>>{
-        res(self.db_reader.user_registration_tree_get_nodes(checkpoint_id, &SimpleMerkleNodeKey::from_inds_at_level(N::GLOBAL_USER_TREE_HEIGHT, &indices)).await)
+        answer!(self.db_reader.user_registration_tree_get_nodes(checkpoint_id, &SimpleMerkleNodeKey::from_inds_at_level(N::GLOBAL_USER_TREE_HEIGHT, &indices)).await)
         }
 
     async fn get_user_registration_tree_merkle_proof(&self, checkpoint_id: u64, leaf_index: u64) -> QRpcResult<MerkleProofCore<N::QHash>> {
-        res(self.db_reader.user_registration_tree_get_merkle_proof(checkpoint_id, leaf_index).await)
+        answer!(self.db_reader.user_registration_tree_get_merkle_proof(checkpoint_id, leaf_index).await)
     }
 
     async fn get_realm_sync_info(&self, checkpoint_id: u64, realm_id : u64) -> RpcResult<PsyRealmCoordinatorUpdate<N::F, N::QHash>> {
         
-        res(self.get_realm_sync_info_internal(realm_id, checkpoint_id).await)
+        answer!(self.get_realm_sync_info_internal(realm_id, checkpoint_id).await)
     }
     async fn get_checkpoint_leaves_batch_raw(&self, start_checkpoint_id: u64, count: u32) -> RpcResult<Vec<u8>>{
 
-        res(self.get_checkpoint_leaves_batch_raw_internal(start_checkpoint_id, count).await)
+        answer!(self.get_checkpoint_leaves_batch_raw_internal(start_checkpoint_id, count).await)
     }
 
     async fn get_realm_root_and_last_modified_checkpoint(
@@ -293,10 +320,10 @@ impl<
         checkpoint_id: u64,
         realm_id: u64,
     ) -> RpcResult<CheckpointedMerkleHash<N::QHash>> {
-        res(self.db_reader.global_user_tree_get_node_and_checkpoint_id_max_checkpoint(checkpoint_id, &SimpleMerkleNodeKey { level: N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT, index: realm_id }).await)
+        answer!(self.db_reader.global_user_tree_get_node_and_checkpoint_id_max_checkpoint(checkpoint_id, &SimpleMerkleNodeKey { level: N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT, index: realm_id }).await)
     }
     async fn get_contract_tree_state_heights(&self, checkpoint_id: u64, contract_ids: Vec<u64>) -> RpcResult<Vec<u8>> {
-        res(self.db_reader.get_contract_tree_heights(checkpoint_id, &contract_ids).await)
+        answer!(self.db_reader.get_contract_tree_heights(checkpoint_id, &contract_ids).await)
     }
 
     async fn get_checkpoint_state_transition_proof(&self, checkpoint_id: u64) -> QRpcResult<Vec<u8>> {

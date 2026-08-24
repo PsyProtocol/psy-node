@@ -385,6 +385,21 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
                     );
                     break;
                 }
+                // A refusal is not a failure to answer, it is an answer: the
+                // Coordinator is mid-rollback and will not describe a branch it
+                // is discarding.  That is definite and self-limiting, so it is
+                // waited out rather than counted against the budget -- and it
+                // has to be, since a Realm restarts *during* a rollback, right
+                // after taking part in one, and rollbacks outlast two minutes.
+                Err(e) if format!("{e}").contains("a rollback is running") => {
+                    if waited_from.elapsed().as_secs() % 30 < 2 {
+                        tracing::info!(
+                            "[REALM_STARTUP] the Coordinator is rolling back and is not \
+                             answering questions about the chain yet; waiting for it to finish"
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
                 Err(e) if waited_from.elapsed() < limit => {
                     tracing::warn!(
                         "[REALM_STARTUP] the Coordinator Edge at {} is not answering yet ({e}); \

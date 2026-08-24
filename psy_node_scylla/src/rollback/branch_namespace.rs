@@ -252,7 +252,7 @@ pub fn watch_branch_and_reload(
 /// Deliberately without the commit-window timestamp generator the node's own
 /// session carries: nothing here writes, and borrowing that machinery would
 /// tie the question "which branch am I on" to the clock a commit uses.
-async fn open_reader_session(scylla_url: &str) -> anyhow::Result<Session> {
+pub(crate) async fn open_reader_session(scylla_url: &str) -> anyhow::Result<Session> {
     use scylla::client::session_builder::SessionBuilder;
     Ok(SessionBuilder::new()
         .known_nodes(scylla_url.split(',').map(str::trim).collect::<Vec<_>>())
