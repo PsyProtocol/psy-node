@@ -41,13 +41,14 @@ fix:
 	@cd $(ROOT_DIR) && cargo fix --all-targets --allow-dirty --allow-staged
 
 build:
-	@RUSTFLAGS="-A warnings" $(CARGO) build --profile $(PROFILE) --bin psy_user_cli
+	@RUSTFLAGS="-A warnings" $(CARGO) build --profile $(PROFILE) --bin psy_user_cli --bin psy-mcp-server
 
 fmt:
 	@cd $(ROOT_DIR) && cargo fmt
 
 install:
 	@cd $(ROOT_DIR) && cargo install --path client_prover/psy_cli/psy_user_cli --locked
+	@cd $(ROOT_DIR) && cargo install --path client_prover/psy_mcp_server --locked
 
 clean:
 	@cd $(ROOT_DIR) && rm -rf target
@@ -78,7 +79,6 @@ LEAF_CHECKPOINT_ID       := ${CHECKPOINT_ID}
 USER_ID                  := 0
 CONTRACT_ID              := 0
 SLOT_ID                  := 0
-CONTRACT_STATE_HEIGHT    := 32
 REALM_ID                 := 0
 REGISTRATION_ID          := 1
 STRATEGY                 := 5
@@ -147,6 +147,11 @@ deploy-contract:
 	@echo "USER1 deploying token contract..."
 	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) deploy-contract --private-key=${USER1_PRIVATE_KEY} --contract-path ${PWD}/token.json --is-deploy
 
+update-contract:
+	@echo "Updating contracts..."
+	@echo "USER0 update token contract(no simple_mint)..."
+	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) update-contract --private-key=${USER0_PRIVATE_KEY} --contract-path ${PWD}/token.update.json --old-abi-path ${PWD}/token.json --is-update --contract-id 6
+
 get-deploy-contract-cmd:
 	@echo "Deploying contracts..."
 	@echo "USER0 deploying token contract..."
@@ -194,7 +199,7 @@ withdraw:
 
 # Unified RPC commands using psy_user_cli automatic routing
 get-slot-value:
-	@RUST_LOG=error $(USER_CLI) get-user-contract-state-tree-merkle-proof --checkpoint-id ${CHECKPOINT_ID} --user-id ${USER_ID} --contract-id ${CONTRACT_ID} --height ${CONTRACT_STATE_HEIGHT} --leaf-id ${SLOT_ID} | jq '.value' | tr -d '"'
+	@RUST_LOG=error $(USER_CLI) get-user-contract-state-tree-merkle-proof --checkpoint-id ${CHECKPOINT_ID} --user-id ${USER_ID} --contract-id ${CONTRACT_ID} --leaf-id ${SLOT_ID} | jq '.value' | tr -d '"'
 
 # Metadata RPC commands
 get-contract-leaf-data:
@@ -266,7 +271,7 @@ get-user-contract-tree-merkle-proof:
 	@$(USER_CLI) get-user-contract-tree-merkle-proof --checkpoint-id ${CHECKPOINT_ID} --user-id ${USER_ID} --contract-id ${CONTRACT_ID}
 
 get-user-contract-state-tree-merkle-proof:
-	@$(USER_CLI) get-user-contract-state-tree-merkle-proof --checkpoint-id ${CHECKPOINT_ID} --user-id ${USER_ID} --contract-id ${CONTRACT_ID} --height ${CONTRACT_STATE_HEIGHT} --leaf-id ${SLOT_ID}
+	@$(USER_CLI) get-user-contract-state-tree-merkle-proof --checkpoint-id ${CHECKPOINT_ID} --user-id ${USER_ID} --contract-id ${CONTRACT_ID} --leaf-id ${SLOT_ID}
 
 get-psy-sdc-fingerprint:
 	@$(USER_CLI) get-psy-sdc-fingerprint --sdc-path ${SDC_PATH}

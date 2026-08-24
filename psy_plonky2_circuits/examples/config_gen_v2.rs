@@ -206,7 +206,7 @@ fn run_gen_config<N: QNetworkCircuitConstants>() -> anyhow::Result<(String, Stri
 
     gcv.register_circuit_triplet(
         ProvingJobCircuitType::BatchDeployContracts,
-        coordinator_circuits.batch_deploy_contracts.get_verifier_triplet(),
+        coordinator_circuits.state_layout_circuits.batch_deploy_contracts.get_verifier_triplet(),
     );
     gcv.register_circuit_triplet(
         ProvingJobCircuitType::BatchDeployContractsAggregate,
@@ -214,6 +214,19 @@ fn run_gen_config<N: QNetworkCircuitConstants>() -> anyhow::Result<(String, Stri
     );
     gcv.register_circuit_triplet(
         ProvingJobCircuitType::DummyBatchDeployContractsAggregate,
+        coordinator_circuits.dummy_agg_state_transition.get_verifier_triplet(),
+    );
+
+    gcv.register_circuit_triplet(
+        ProvingJobCircuitType::BatchUpdateContracts,
+        coordinator_circuits.state_layout_circuits.batch_update_contracts.get_verifier_triplet(),
+    );
+    gcv.register_circuit_triplet(
+        ProvingJobCircuitType::BatchUpdateContractsAggregate,
+        coordinator_circuits.update_agg_state_transition.get_verifier_triplet(),
+    );
+    gcv.register_circuit_triplet(
+        ProvingJobCircuitType::DummyBatchUpdateContractsAggregate,
         coordinator_circuits.dummy_agg_state_transition.get_verifier_triplet(),
     );
 
@@ -321,6 +334,7 @@ fn generate_groth16_setup<N: QNetworkCircuitConstants>(
         N::CHECKPOINT_TREE_HEIGHT_USIZE,
         N::GLOBAL_USER_TREE_HEIGHT_USIZE,
         N::GLOBAL_CONTRACT_TREE_HEIGHT_USIZE,
+        N::MAX_CONTRACT_STATE_TREE_HEIGHT_USIZE,
         N::MAX_CONTRACT_STATE_TREE_HEIGHT_USIZE,
     );
 

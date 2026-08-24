@@ -9,7 +9,7 @@ use psy_data::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
             checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
-            contract::{ContractCodeDefinition, PQBCDeployContract, PQEDContractLeaf},
+            contract::{ContractCodeDefinition, PQBCDeployContractV2, PQBCUpdateContract, PQEDContractLeafV2},
             public_key::PZKPublicKeyInfo,
             user::PQEDUserLeaf,
         },
@@ -31,7 +31,10 @@ pub trait CoordinatorEdgeRpc<F, Hash, JobId, ZKProof>: NodeEdgeWorkerRpcServer<H
     async fn get_user_ids_for_public_key(&self, public_key: Hash, start_user_id: u64, count: u32) -> RpcResult<Vec<u64>>;
 
     #[method(name = "deploy_contract")]
-    async fn deploy_contract(&self, deploy_contract: PQBCDeployContract<Hash>) -> RpcResult<String>;
+    async fn deploy_contract(&self, deploy_contract: PQBCDeployContractV2<Hash>) -> RpcResult<String>;
+
+    #[method(name = "update_contract")]
+    async fn update_contract(&self, update_contract: PQBCUpdateContract<Hash>) -> RpcResult<String>;
 
     //#[method(name = "build_block")]
     //async fn build_block(&self) -> RpcResult<String>;
@@ -59,7 +62,7 @@ pub trait CoordinatorEdgeRpc<F, Hash, JobId, ZKProof>: NodeEdgeWorkerRpcServer<H
 
     // Contract methods
     #[method(name = "get_contract_leaf_data")]
-    async fn get_contract_leaf_data(&self, contract_id: u64) -> RpcResult<PQEDContractLeaf<F, Hash>>;
+    async fn get_contract_leaf_data(&self, contract_id: u64) -> RpcResult<PQEDContractLeafV2<F, Hash>>;
 
     #[method(name = "get_contract_code_definition")]
     async fn get_contract_code_definition(&self, contract_id: u64) -> RpcResult<ContractCodeDefinition>;

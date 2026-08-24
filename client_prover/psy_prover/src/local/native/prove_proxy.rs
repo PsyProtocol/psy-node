@@ -36,6 +36,10 @@ use psy_client_data::{
     },
 };
 use psy_common_circuit::circuits::traits::qstandard::QStandardCircuit;
+use psy_config::network_constants::{
+    DEPOSIT_TREE_CONTRACT_STATE_TREE_HEIGHT,
+    WITHDRAWAL_TREE_CONTRACT_STATE_TREE_HEIGHT,
+};
 use psy_core::{constants::chain_id::PsyChainNetworkType, job::job_id::ProvingJobCircuitType, network_config::PsyNetworkLocalDevnetConstants};
 use psy_crypto::{
     common::witnesses::qrecursion::{header::QRecursionAggStandardHeader, proof_data::QStandardBinaryTreeCircuitType},
@@ -706,7 +710,8 @@ impl ProveProxyServerProvider {
             32,
             PsyNetworkLocalDevnetConstants::GLOBAL_USER_TREE_HEIGHT_USIZE,
             PsyNetworkLocalDevnetConstants::GLOBAL_CONTRACT_TREE_HEIGHT_USIZE,
-            PsyNetworkLocalDevnetConstants::MAX_CONTRACT_STATE_TREE_HEIGHT_USIZE,
+            DEPOSIT_TREE_CONTRACT_STATE_TREE_HEIGHT as usize,
+            WITHDRAWAL_TREE_CONTRACT_STATE_TREE_HEIGHT as usize,
         );
         let bridge_agg_fingerprint = bridge_agg_template.get_fingerprint();
         let bridge_agg_common = bridge_agg_template.get_common_circuit_data_ref();
@@ -1180,7 +1185,8 @@ impl ProveProxyRpcServer for ProveProxyServerProvider {
                 32, // CHECKPOINT_TREE_HEIGHT
                 PsyNetworkLocalDevnetConstants::GLOBAL_USER_TREE_HEIGHT_USIZE,
                 PsyNetworkLocalDevnetConstants::GLOBAL_CONTRACT_TREE_HEIGHT_USIZE,
-                PsyNetworkLocalDevnetConstants::MAX_CONTRACT_STATE_TREE_HEIGHT_USIZE,
+                DEPOSIT_TREE_CONTRACT_STATE_TREE_HEIGHT as usize,
+                WITHDRAWAL_TREE_CONTRACT_STATE_TREE_HEIGHT as usize,
             )
             .map_err(|e| ErrorObjectOwned::owned(1, "bridge_agg prove_range failed", Some(e.to_string())))?;
 
@@ -1419,7 +1425,7 @@ impl ProveProxyRpcServer for ProveProxyServerProvider {
             .map_err(|join_err| {
                 ErrorObjectOwned::owned(
                     1,
-                    "prove_software_defined_sign: task schedule failed",
+                    "prove_contract_call: task schedule failed",
                     Some(format!("Thread pool task execution failed: {}", join_err)),
                 )
             })?

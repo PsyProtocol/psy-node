@@ -17,7 +17,7 @@ use psy_data::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
             checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
-            contract::{ContractCodeDefinition, PQBCDeployContract, PQEDContractLeaf},
+            contract::{ContractCodeDefinition, PQBCDeployContractV2, PQBCUpdateContract, PQEDContractLeafV2},
             public_key::PZKPublicKeyInfo,
             user::PQEDUserLeaf,
         },
@@ -66,8 +66,11 @@ impl<
     async fn register_user(&self, public_key: PZKPublicKeyInfo<N::QHash>) -> QRpcResult<String> {
         res(self.register_user_internal(public_key).await)
     }
-    async fn deploy_contract(&self, deploy_contract: PQBCDeployContract<N::QHash>) -> QRpcResult<String> {
+    async fn deploy_contract(&self, deploy_contract: PQBCDeployContractV2<N::QHash>) -> QRpcResult<String> {
         res(self.deploy_contract_internal(deploy_contract).await)
+    }
+    async fn update_contract(&self, update_contract: PQBCUpdateContract<N::QHash>) -> QRpcResult<String> {
+        res(self.update_contract_internal(update_contract).await)
     }
 
     async fn get_public_key_for_user_id(&self, user_id: u64) -> RpcResult<PZKPublicKeyInfo<N::QHash>> {
@@ -92,7 +95,11 @@ impl<
     }
 
     async fn get_contract_code_definition(&self, contract_id: u64) -> QRpcResult<ContractCodeDefinition> {
-        res(self.db_reader.get_contract_code_definition(MAX_CHECKPOINT_ID, contract_id).await)
+        let checkpoint_id = res(self.get_latest_checkpoint_id_internal().await)?;
+        res(self
+            .db_reader
+            .get_contract_code_definition(checkpoint_id, contract_id)
+            .await)
     }
     async fn get_latest_checkpoint_id(&self) -> QRpcResult<u64> {
         res(self.get_latest_checkpoint_id_internal().await)
@@ -103,8 +110,12 @@ impl<
     async fn get_unique_pending_id_for_checkpoint_id(&self, checkpoint_id: u64) -> QRpcResult<Option<(u64, u128)>> {
         res(PsyNodeCheckpointObjectDatabaseReader::get_unique_pending_id_for_checkpoint_id(&self.db_reader, checkpoint_id).await)
     }
-    async fn get_contract_leaf_data(&self, contract_id: u64) -> QRpcResult<PQEDContractLeaf<N::F, N::QHash>> {
-        res(self.db_reader.get_contract_leaf(MAX_CHECKPOINT_ID, contract_id).await)
+    async fn get_contract_leaf_data(&self, contract_id: u64) -> QRpcResult<PQEDContractLeafV2<N::F, N::QHash>> {
+        let checkpoint_id = res(self.get_latest_checkpoint_id_internal().await)?;
+        res(self
+            .db_reader
+            .get_contract_leaf(checkpoint_id, contract_id)
+            .await)
     }
 
     async fn get_checkpoint_leaf_data(&self, checkpoint_id: u64) -> QRpcResult<PQEDCheckpointLeaf<N::F, N::QHash>> {

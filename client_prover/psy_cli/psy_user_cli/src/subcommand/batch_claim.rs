@@ -12,7 +12,9 @@ use psy_client_common::{
 };
 use psy_client_data::config::store_config::{C, D, F};
 use psy_common_circuit::circuits::traits::qstandard::QStandardCircuit;
-use psy_config::network_constants::{GLOBAL_CONTRACT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT, MAX_CONTRACT_STATE_TREE_HEIGHT};
+use psy_config::network_constants::{
+    GLOBAL_CONTRACT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT, MAX_CONTRACT_STATE_TREE_HEIGHT, TOKEN_CONTRACT_STATE_TREE_HEIGHT,
+};
 use psy_crypto::shield_address::{derive_note_commitment, derive_nullifier_hash, derive_shield_address};
 use psy_dpn_circuit::circuits::privacy::{deposit_inclusion::DepositInclusionCircuit, private_note_inclusion::PrivateNoteInclusionCircuit};
 use psy_prover::{
@@ -209,7 +211,7 @@ pub(crate) async fn run_items(
     let note_circuit = PrivateNoteInclusionCircuit::<C, D>::new(
         GLOBAL_USER_TREE_HEIGHT as usize,
         GLOBAL_CONTRACT_TREE_HEIGHT as usize,
-        MAX_CONTRACT_STATE_TREE_HEIGHT as usize,
+        TOKEN_CONTRACT_STATE_TREE_HEIGHT as usize,
         NOTE_TREE_HEIGHT,
     );
 

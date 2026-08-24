@@ -17,9 +17,9 @@ use crate::{
         MerkleProofResult, ResultFileGuard, TreeRootResult, UserLeafResult,
     },
     subcommand::{
-        args::TxCommands, batch_claim, claim_amount, claim_deposit, claim_rewards, claim_withdrawal, compile, compile_deploy, deploy_contract,
-        deposit, export_private_key, generate_batch_proof_miner_reward_proofs, generate_tx_trace, get_checkpoint_id_for_unique_pending_id,
-        get_user_id, prove_tx_trace, register_user, simulate, submit_end_cap_proof, tx, wallet, withdraw, Cli, Commands,
+        args::TxCommands, batch_claim, claim_amount, claim_deposit, claim_rewards, claim_withdrawal, compile, compile_deploy, deploy_contract, deposit,
+        export_private_key, generate_batch_proof_miner_reward_proofs, generate_tx_trace, get_checkpoint_id_for_unique_pending_id, get_user_id,
+        prove_tx_trace, register_user, simulate, submit_end_cap_proof, tx, update_contract, wallet, withdraw, Cli, Commands,
     },
 };
 
@@ -167,7 +167,12 @@ fn command_paths(cli: &Cli) -> Vec<&str> {
             WalletCommands::Random { .. } | WalletCommands::SdKeyFingerprint { .. } => {}
         },
         Commands::RegisterUser(args) => push_wallet_paths(&mut paths, &args.wallet),
-        Commands::DeployContract(args) => { push_wallet_paths(&mut paths, &args.wallet); paths.extend([args.rpc_config.as_str(), args.contract_path.as_str()]); paths.extend(args.output_path.as_deref()); paths.extend(args.abi_path.as_deref()); }
+        Commands::DeployContract(args) => {
+            push_wallet_paths(&mut paths, &args.wallet);
+            paths.extend([args.rpc_config.as_str(), args.contract_path.as_str()]);
+            paths.extend(args.output_path.as_deref());
+        }
+        Commands::UpdateContract(args) => { paths.extend([args.rpc_config.as_str(), args.contract_path.as_str()]); paths.extend(args.old_abi_path.as_deref()); paths.extend(args.new_abi_path.as_deref()); paths.extend(args.output_path.as_deref()); }
         Commands::Call(args) => push_session_paths(&mut paths, args),
         Commands::GetUserId(args) => paths.push(&args.rpc_config),
         Commands::GetUserEventData(args) => paths.push(&args.rpc_config),
@@ -308,6 +313,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Wallet(args) => wallet::run(args)?,
         Commands::RegisterUser(args) => register_user::run(args).await?,
         Commands::DeployContract(args) => deploy_contract::run(args).await?,
+        Commands::UpdateContract(args) => update_contract::run(args).await?,
         Commands::Call(args) => submit_end_cap_proof::run(args).await?,
         Commands::GenerateTxTrace(args) => generate_tx_trace::run(args).await?,
         Commands::ProveTxTrace(args) => prove_tx_trace::run(args).await?,
@@ -394,7 +400,7 @@ async fn main() -> anyhow::Result<()> {
             use psy_provider::provider::RpcProvider;
             let provider = RpcProvider::new_with_config_path(&args.rpc_config)?;
             let hash = provider
-                .get_user_contract_state_tree_leaf_hash(args.checkpoint_id, args.user_id, args.contract_id, args.height, args.leaf_id)
+                .get_user_contract_state_tree_leaf_hash(args.checkpoint_id, args.user_id, args.contract_id, 0, args.leaf_id)
                 .await?;
             println!("{}", serde_json::to_string_pretty(&hash)?);
             CommandResult::LeafHash(LeafHashResult { leaf_hash: hash })
@@ -414,7 +420,10 @@ async fn main() -> anyhow::Result<()> {
             use psy_provider::provider::RpcProvider;
             let provider = RpcProvider::new_with_config_path(&args.rpc_config)?;
             let proof = provider
-                .get_user_contract_state_tree_merkle_proof(args.checkpoint_id, args.user_id, args.contract_id, args.height, args.leaf_id)
+                // The Realm resolves the deployed contract's state-tree height.
+                // The legacy local trait parameter is intentionally ignored by
+                // RpcProvider and can be removed in a follow-up API cleanup.
+                .get_user_contract_state_tree_merkle_proof(args.checkpoint_id, args.user_id, args.contract_id, 0, args.leaf_id)
                 .await?;
             println!("{}", serde_json::to_string_pretty(&proof)?);
             CommandResult::MerkleProof(MerkleProofResult { merkle_proof: proof })

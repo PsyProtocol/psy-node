@@ -86,7 +86,23 @@ pub const TOKEN_SIMPLE_BURN_METHOD_ID: u32 = 2923993647;
 pub const BATCH_USER_REGISTRAITION_SUB_TREE_HEIGHT: usize = 8;
 pub const BATCH_USER_REGISTRAITION_MAX_SUB_TREES: usize = 4;
 
-pub const BATCH_DEPLOY_CONTRACT_SUB_TREE_HEIGHT: usize = 8;
+pub const BATCH_DEPLOY_CONTRACT_SUB_TREE_HEIGHT: usize = 1;
+
+/// Height of each contract's append-only storage-layout tree.
+pub const STATE_LAYOUT_TREE_HEIGHT: usize = 7;
+/// Maximum number of top-level storage fields committed by the layout tree.
+pub const STATE_LAYOUT_MAX_FIELDS: usize = 1usize << STATE_LAYOUT_TREE_HEIGHT;
+/// Number of layout slots covered by one layout append proof is
+/// `2 ^ STATE_LAYOUT_APPEND_SUB_TREE_HEIGHT`.
+pub const STATE_LAYOUT_APPEND_SUB_TREE_HEIGHT: usize = 4;
+/// Maximum number of recursive layout-append aggregation levels.
+pub const STATE_LAYOUT_MAX_AGGREGATION_DEPTH: usize = 3;
+/// Maximum serialized canonical layout proof accepted by RPC, queues and
+/// proving witnesses. This is a transport/DoS bound, not a circuit parameter.
+pub const STATE_LAYOUT_MAX_PROOF_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum number of contract/layout proofs carried by one batch witness.
+pub const STATE_LAYOUT_MAX_BATCH_ITEMS: usize =
+    1usize << BATCH_DEPLOY_CONTRACT_SUB_TREE_HEIGHT;
 
 
 // start constant channels

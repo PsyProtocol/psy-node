@@ -10,7 +10,7 @@ use crate::dpn::ops::context_trait::{ContextFelt, ToFelts};
 // Constants for field sizes
 const PM_REWARD_COMMITMENT_SIZE: usize = 12; // 3 roots * 4 field elements each
 const DA_CHALLENGE_WINDOW: usize = 14; // Matching psy_config::network_constants::DA_CHALLENGE_WINDOW
-const CONTRACT_LEAF_FELT_SIZE: usize = 9;
+const CONTRACT_LEAF_FELT_SIZE: usize = 13;
 const GLOBAL_STATE_ROOTS_FELT_SIZE: usize = 20;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Hash, PartialOrd, Ord, Eq, Copy, TS)]
@@ -19,6 +19,78 @@ pub struct DPNStateCmdSetContractStateSlotHash<T> {
     pub condition: T,
     pub slot_index: T,
     pub value: [T; 4],
+}
+
+#[cfg(test)]
+mod dynamic_state_tree_height_tests {
+    use super::{
+        DPNStateCmd,
+        DPNStateCmdGetSelfUserExternalContractStateSlotHash,
+        DPNStateCmdGetSelfUserExternalIMTContractStateValue,
+    };
+    use crate::dpn::ops::{
+        context_trait::ToFelts,
+        state_cmd::types::DPNStateCmdCore,
+        sym_felt::SymFeltRef,
+    };
+
+    #[test]
+    fn external_state_command_resolves_height_as_runtime_input() {
+        let command = DPNStateCmd::GetSelfUserExternalContractStateSlotHash(
+            DPNStateCmdGetSelfUserExternalContractStateSlotHash::new(101u64, 202u64, 303u64),
+        );
+
+        assert_eq!(command.get_inputs(), vec![101, 202, 303]);
+
+        let resolved = command.convert_to_u64(&[7, 24, 11]);
+        let DPNStateCmd::GetSelfUserExternalContractStateSlotHash(resolved) = resolved else {
+            panic!("unexpected state command variant");
+        };
+        assert_eq!(resolved.contract_id, 7);
+        assert_eq!(resolved.contract_state_tree_height, 24);
+        assert_eq!(resolved.slot_index, 11);
+    }
+
+    #[test]
+    fn external_state_command_round_trip_preserves_large_height_wire_id() {
+        let command = DPNStateCmd::GetSelfUserExternalContractStateSlotHash(
+            DPNStateCmdGetSelfUserExternalContractStateSlotHash::new(101u64, 300u64, 303u64),
+        );
+        let felts: Vec<SymFeltRef> = command.to_felts();
+        let decoded = <DPNStateCmd<u64> as ToFelts<SymFeltRef>>::from_felts(&felts);
+
+        let DPNStateCmd::GetSelfUserExternalContractStateSlotHash(decoded) = decoded else {
+            panic!("unexpected state command variant");
+        };
+        assert_eq!(decoded.contract_state_tree_height, 300);
+    }
+
+    #[test]
+    fn external_imt_command_resolves_and_preserves_dynamic_height() {
+        let command = DPNStateCmd::GetSelfUserExternalIMTContractStateValue(
+            DPNStateCmdGetSelfUserExternalIMTContractStateValue::new(
+                101u64,
+                300u64,
+                400u64,
+                500u64,
+                [601u64, 602u64, 603u64, 604u64],
+            ),
+        );
+        assert_eq!(command.get_inputs(), vec![101, 300, 400, 500, 601, 602, 603, 604]);
+
+        let resolved = command.convert_to_u64(&[7, 24, 8, 9, 10, 11, 12, 13]);
+        let DPNStateCmd::GetSelfUserExternalIMTContractStateValue(resolved) = resolved else {
+            panic!("unexpected state command variant");
+        };
+        assert_eq!(resolved.contract_state_tree_height, 24);
+
+        let felts: Vec<SymFeltRef> = command.to_felts();
+        let decoded = <DPNStateCmd<u64> as ToFelts<SymFeltRef>>::from_felts(&felts);
+        let DPNStateCmd::GetSelfUserExternalIMTContractStateValue(decoded) = decoded else {
+            panic!("unexpected state command variant");
+        };
+        assert_eq!(decoded.contract_state_tree_height, 300);
+    }
 }
 
 impl<T: Copy + Clone + Hash + Ord> DPNStateCmdCore<T> for DPNStateCmdSetContractStateSlotHash<T> {
@@ -245,10 +317,10 @@ impl<T: Copy + Clone + Hash + Ord> DPNStateCmdCore<T> for DPNStateCmdGetSelfUser
 pub struct DPNStateCmdGetSelfUserExternalContractStateSlotHash<T> {
     pub contract_id: T,
     pub slot_index: T,
-    pub contract_state_tree_height: u8,
+    pub contract_state_tree_height: T,
 }
 impl<T> DPNStateCmdGetSelfUserExternalContractStateSlotHash<T> {
-    pub fn new(contract_id: T, contract_state_tree_height: u8, slot_index: T) -> Self {
+    pub fn new(contract_id: T, contract_state_tree_height: T, slot_index: T) -> Self {
         Self {
             contract_id,
             contract_state_tree_height,
@@ -258,7 +330,7 @@ impl<T> DPNStateCmdGetSelfUserExternalContractStateSlotHash<T> {
 }
 impl<T: Ord + Hash + Clone + Copy> DPNStateCmdCore<T> for DPNStateCmdGetSelfUserExternalContractStateSlotHash<T> {
     fn get_inputs(&self) -> Vec<T> {
-        vec![self.contract_id, self.slot_index]
+        vec![self.contract_id, self.contract_state_tree_height, self.slot_index]
     }
 
     fn get_state_command_type(&self) -> DPNStateCommandType {
@@ -275,10 +347,10 @@ impl<T: Ord + Hash + Clone + Copy> DPNStateCmdCore<T> for DPNStateCmdGetSelfUser
 pub struct DPNStateCmdGetSelfUserExternalContractStateSlotSingle<T> {
     pub contract_id: T,
     pub sub_slot_index: T,
-    pub contract_state_tree_height: u8,
+    pub contract_state_tree_height: T,
 }
 impl<T> DPNStateCmdGetSelfUserExternalContractStateSlotSingle<T> {
-    pub fn new(contract_id: T, contract_state_tree_height: u8, sub_slot_index: T) -> Self {
+    pub fn new(contract_id: T, contract_state_tree_height: T, sub_slot_index: T) -> Self {
         Self {
             contract_id,
             contract_state_tree_height,
@@ -288,7 +360,7 @@ impl<T> DPNStateCmdGetSelfUserExternalContractStateSlotSingle<T> {
 }
 impl<T: Ord + Hash + Clone + Copy> DPNStateCmdCore<T> for DPNStateCmdGetSelfUserExternalContractStateSlotSingle<T> {
     fn get_inputs(&self) -> Vec<T> {
-        vec![self.contract_id, self.sub_slot_index]
+        vec![self.contract_id, self.contract_state_tree_height, self.sub_slot_index]
     }
 
     fn get_state_command_type(&self) -> DPNStateCommandType {
@@ -306,10 +378,10 @@ pub struct DPNStateCmdGetSelfUserExternalContractStateSlotRange<T> {
     pub contract_id: T,
     pub sub_slot_index: T,
     pub length: u32,
-    pub contract_state_tree_height: u8,
+    pub contract_state_tree_height: T,
 }
 impl<T> DPNStateCmdGetSelfUserExternalContractStateSlotRange<T> {
-    pub fn new(contract_id: T, contract_state_tree_height: u8, sub_slot_index: T, length: u32) -> Self {
+    pub fn new(contract_id: T, contract_state_tree_height: T, sub_slot_index: T, length: u32) -> Self {
         Self {
             contract_id,
             contract_state_tree_height,
@@ -320,7 +392,7 @@ impl<T> DPNStateCmdGetSelfUserExternalContractStateSlotRange<T> {
 }
 impl<T: Ord + Hash + Clone + Copy> DPNStateCmdCore<T> for DPNStateCmdGetSelfUserExternalContractStateSlotRange<T> {
     fn get_inputs(&self) -> Vec<T> {
-        vec![self.contract_id, self.sub_slot_index]
+        vec![self.contract_id, self.contract_state_tree_height, self.sub_slot_index]
     }
 
     fn get_state_command_type(&self) -> DPNStateCommandType {
@@ -338,10 +410,10 @@ pub struct DPNStateCmdGetOtherUserContractStateSlotHash<T> {
     pub user_id: T,
     pub contract_id: T,
     pub slot_index: T,
-    pub contract_state_tree_height: u8,
+    pub contract_state_tree_height: T,
 }
 impl<T> DPNStateCmdGetOtherUserContractStateSlotHash<T> {
-    pub fn new(user_id: T, contract_id: T, contract_state_tree_height: u8, slot_index: T) -> Self {
+    pub fn new(user_id: T, contract_id: T, contract_state_tree_height: T, slot_index: T) -> Self {
         Self {
             user_id,
             contract_id,
@@ -352,7 +424,7 @@ impl<T> DPNStateCmdGetOtherUserContractStateSlotHash<T> {
 }
 impl<T: Ord + Hash + Clone + Copy> DPNStateCmdCore<T> for DPNStateCmdGetOtherUserContractStateSlotHash<T> {
     fn get_inputs(&self) -> Vec<T> {
-        vec![self.user_id, self.contract_id, self.slot_index]
+        vec![self.user_id, self.contract_id, self.contract_state_tree_height, self.slot_index]
     }
 
     fn get_state_command_type(&self) -> DPNStateCommandType {
@@ -370,10 +442,10 @@ pub struct DPNStateCmdGetOtherUserContractStateSlotSingle<T> {
     pub user_id: T,
     pub contract_id: T,
     pub sub_slot_index: T,
-    pub contract_state_tree_height: u8,
+    pub contract_state_tree_height: T,
 }
 impl<T> DPNStateCmdGetOtherUserContractStateSlotSingle<T> {
-    pub fn new(user_id: T, contract_id: T, contract_state_tree_height: u8, sub_slot_index: T) -> Self {
+    pub fn new(user_id: T, contract_id: T, contract_state_tree_height: T, sub_slot_index: T) -> Self {
         Self {
             user_id,
             contract_id,
@@ -384,7 +456,7 @@ impl<T> DPNStateCmdGetOtherUserContractStateSlotSingle<T> {
 }
 impl<T: Ord + Hash + Clone + Copy> DPNStateCmdCore<T> for DPNStateCmdGetOtherUserContractStateSlotSingle<T> {
     fn get_inputs(&self) -> Vec<T> {
-        vec![self.user_id, self.contract_id, self.sub_slot_index]
+        vec![self.user_id, self.contract_id, self.contract_state_tree_height, self.sub_slot_index]
     }
 
     fn get_state_command_type(&self) -> DPNStateCommandType {
@@ -403,10 +475,10 @@ pub struct DPNStateCmdGetOtherUserContractStateSlotRange<T> {
     pub contract_id: T,
     pub sub_slot_index: T,
     pub length: u32,
-    pub contract_state_tree_height: u8,
+    pub contract_state_tree_height: T,
 }
 impl<T> DPNStateCmdGetOtherUserContractStateSlotRange<T> {
-    pub fn new(user_id: T, contract_id: T, contract_state_tree_height: u8, sub_slot_index: T, length: u32) -> Self {
+    pub fn new(user_id: T, contract_id: T, contract_state_tree_height: T, sub_slot_index: T, length: u32) -> Self {
         Self {
             user_id,
             contract_id,
@@ -418,7 +490,7 @@ impl<T> DPNStateCmdGetOtherUserContractStateSlotRange<T> {
 }
 impl<T: Ord + Hash + Clone + Copy> DPNStateCmdCore<T> for DPNStateCmdGetOtherUserContractStateSlotRange<T> {
     fn get_inputs(&self) -> Vec<T> {
-        vec![self.user_id, self.contract_id, self.sub_slot_index]
+        vec![self.user_id, self.contract_id, self.contract_state_tree_height, self.sub_slot_index]
     }
 
     fn get_state_command_type(&self) -> DPNStateCommandType {
@@ -591,11 +663,11 @@ pub struct DPNStateCmdGetSelfUserExternalIMTContractStateValue<T> {
     pub base_offset: T,
     pub capacity: T,
     pub key: [T; 4],
-    pub contract_state_tree_height: u8,
+    pub contract_state_tree_height: T,
 }
 
 impl<T> DPNStateCmdGetSelfUserExternalIMTContractStateValue<T> {
-    pub fn new(contract_id: T, contract_state_tree_height: u8, base_offset: T, capacity: T, key: [T; 4]) -> Self {
+    pub fn new(contract_id: T, contract_state_tree_height: T, base_offset: T, capacity: T, key: [T; 4]) -> Self {
         Self {
             contract_id,
             contract_state_tree_height,
@@ -610,6 +682,7 @@ impl<T: Ord + Hash + Clone + Copy> DPNStateCmdCore<T> for DPNStateCmdGetSelfUser
     fn get_inputs(&self) -> Vec<T> {
         vec![
             self.contract_id,
+            self.contract_state_tree_height,
             self.base_offset,
             self.capacity,
             self.key[0],
@@ -637,11 +710,11 @@ pub struct DPNStateCmdGetOtherUserIMTContractStateValue<T> {
     pub base_offset: T,
     pub capacity: T,
     pub key: [T; 4],
-    pub contract_state_tree_height: u8,
+    pub contract_state_tree_height: T,
 }
 
 impl<T> DPNStateCmdGetOtherUserIMTContractStateValue<T> {
-    pub fn new(user_id: T, contract_id: T, contract_state_tree_height: u8, base_offset: T, capacity: T, key: [T; 4]) -> Self {
+    pub fn new(user_id: T, contract_id: T, contract_state_tree_height: T, base_offset: T, capacity: T, key: [T; 4]) -> Self {
         Self {
             user_id,
             contract_id,
@@ -658,6 +731,7 @@ impl<T: Ord + Hash + Clone + Copy> DPNStateCmdCore<T> for DPNStateCmdGetOtherUse
         vec![
             self.user_id,
             self.contract_id,
+            self.contract_state_tree_height,
             self.base_offset,
             self.capacity,
             self.key[0],
@@ -714,11 +788,11 @@ pub struct DPNStateCmdContainsOtherUserIMTContractStateValue<T> {
     pub base_offset: T,
     pub capacity: T,
     pub key: [T; 4],
-    pub contract_state_tree_height: u8,
+    pub contract_state_tree_height: T,
 }
 
 impl<T> DPNStateCmdContainsOtherUserIMTContractStateValue<T> {
-    pub fn new(user_id: T, contract_id: T, contract_state_tree_height: u8, base_offset: T, capacity: T, key: [T; 4]) -> Self {
+    pub fn new(user_id: T, contract_id: T, contract_state_tree_height: T, base_offset: T, capacity: T, key: [T; 4]) -> Self {
         Self {
             user_id,
             contract_id,
@@ -735,6 +809,7 @@ impl<T: Ord + Hash + Clone + Copy> DPNStateCmdCore<T> for DPNStateCmdContainsOth
         vec![
             self.user_id,
             self.contract_id,
+            self.contract_state_tree_height,
             self.base_offset,
             self.capacity,
             self.key[0],
@@ -832,21 +907,21 @@ impl<T> DPNStateCmd<T> {
     pub fn get_self_user_current_contract_state_slot_range(sub_slot_index: T, length: u32) -> Self {
         DPNStateCmd::GetSelfUserCurrentContractStateSlotRange(DPNStateCmdGetSelfUserCurrentContractStateSlotRange::<T>::new(sub_slot_index, length))
     }
-    pub fn get_self_user_external_contract_state_slot_hash(contract_id: T, contract_state_tree_height: u8, slot_index: T) -> Self {
+    pub fn get_self_user_external_contract_state_slot_hash(contract_id: T, contract_state_tree_height: T, slot_index: T) -> Self {
         DPNStateCmd::GetSelfUserExternalContractStateSlotHash(DPNStateCmdGetSelfUserExternalContractStateSlotHash::<T>::new(
             contract_id,
             contract_state_tree_height,
             slot_index,
         ))
     }
-    pub fn get_self_user_external_contract_state_slot_single(contract_id: T, contract_state_tree_height: u8, sub_slot_index: T) -> Self {
+    pub fn get_self_user_external_contract_state_slot_single(contract_id: T, contract_state_tree_height: T, sub_slot_index: T) -> Self {
         DPNStateCmd::GetSelfUserExternalContractStateSlotSingle(DPNStateCmdGetSelfUserExternalContractStateSlotSingle::<T>::new(
             contract_id,
             contract_state_tree_height,
             sub_slot_index,
         ))
     }
-    pub fn get_self_user_external_contract_state_slot_range(contract_id: T, contract_state_tree_height: u8, sub_slot_index: T, length: u32) -> Self {
+    pub fn get_self_user_external_contract_state_slot_range(contract_id: T, contract_state_tree_height: T, sub_slot_index: T, length: u32) -> Self {
         DPNStateCmd::GetSelfUserExternalContractStateSlotRange(DPNStateCmdGetSelfUserExternalContractStateSlotRange::<T>::new(
             contract_id,
             contract_state_tree_height,
@@ -854,7 +929,7 @@ impl<T> DPNStateCmd<T> {
             length,
         ))
     }
-    pub fn get_other_user_contract_state_slot_hash(user_id: T, contract_id: T, contract_state_tree_height: u8, slot_index: T) -> Self {
+    pub fn get_other_user_contract_state_slot_hash(user_id: T, contract_id: T, contract_state_tree_height: T, slot_index: T) -> Self {
         DPNStateCmd::GetOtherUserContractStateSlotHash(DPNStateCmdGetOtherUserContractStateSlotHash::<T>::new(
             user_id,
             contract_id,
@@ -862,7 +937,7 @@ impl<T> DPNStateCmd<T> {
             slot_index,
         ))
     }
-    pub fn get_other_user_contract_state_slot_single(user_id: T, contract_id: T, contract_state_tree_height: u8, sub_slot_index: T) -> Self {
+    pub fn get_other_user_contract_state_slot_single(user_id: T, contract_id: T, contract_state_tree_height: T, sub_slot_index: T) -> Self {
         DPNStateCmd::GetOtherUserContractStateSlotSingle(DPNStateCmdGetOtherUserContractStateSlotSingle::<T>::new(
             user_id,
             contract_id,
@@ -873,7 +948,7 @@ impl<T> DPNStateCmd<T> {
     pub fn get_other_user_contract_state_slot_range(
         user_id: T,
         contract_id: T,
-        contract_state_tree_height: u8,
+        contract_state_tree_height: T,
         sub_slot_index: T,
         length: u32,
     ) -> Self {
@@ -910,7 +985,7 @@ impl<T> DPNStateCmd<T> {
     }
     pub fn get_self_user_external_imt_contract_state_value(
         contract_id: T,
-        contract_state_tree_height: u8,
+        contract_state_tree_height: T,
         base_offset: T,
         capacity: T,
         key: [T; 4],
@@ -926,7 +1001,7 @@ impl<T> DPNStateCmd<T> {
     pub fn get_other_user_imt_contract_state_value(
         user_id: T,
         contract_id: T,
-        contract_state_tree_height: u8,
+        contract_state_tree_height: T,
         base_offset: T,
         capacity: T,
         key: [T; 4],
@@ -950,7 +1025,7 @@ impl<T> DPNStateCmd<T> {
     pub fn contains_other_user_imt_contract_state_value(
         user_id: T,
         contract_id: T,
-        contract_state_tree_height: u8,
+        contract_state_tree_height: T,
         base_offset: T,
         capacity: T,
         key: [T; 4],
@@ -1114,37 +1189,37 @@ impl<F: ContextFelt> ToFelts<F> for DPNStateCmd<u64> {
             DPNStateCmd::GetSelfUserExternalContractStateSlotHash(cmd) => {
                 out.push(F::cns(cmd.contract_id));
                 out.push(F::cns(cmd.slot_index));
-                out.push(F::cns(cmd.contract_state_tree_height as u64));
+                out.push(F::cns(cmd.contract_state_tree_height));
             }
             DPNStateCmd::GetSelfUserExternalContractStateSlotSingle(cmd) => {
                 out.push(F::cns(cmd.contract_id));
                 out.push(F::cns(cmd.sub_slot_index));
-                out.push(F::cns(cmd.contract_state_tree_height as u64));
+                out.push(F::cns(cmd.contract_state_tree_height));
             }
             DPNStateCmd::GetSelfUserExternalContractStateSlotRange(cmd) => {
                 out.push(F::cns(cmd.contract_id));
                 out.push(F::cns(cmd.sub_slot_index));
                 out.push(F::cns(cmd.length as u64));
-                out.push(F::cns(cmd.contract_state_tree_height as u64));
+                out.push(F::cns(cmd.contract_state_tree_height));
             }
             DPNStateCmd::GetOtherUserContractStateSlotHash(cmd) => {
                 out.push(F::cns(cmd.user_id));
                 out.push(F::cns(cmd.contract_id));
                 out.push(F::cns(cmd.slot_index));
-                out.push(F::cns(cmd.contract_state_tree_height as u64));
+                out.push(F::cns(cmd.contract_state_tree_height));
             }
             DPNStateCmd::GetOtherUserContractStateSlotSingle(cmd) => {
                 out.push(F::cns(cmd.user_id));
                 out.push(F::cns(cmd.contract_id));
                 out.push(F::cns(cmd.sub_slot_index));
-                out.push(F::cns(cmd.contract_state_tree_height as u64));
+                out.push(F::cns(cmd.contract_state_tree_height));
             }
             DPNStateCmd::GetOtherUserContractStateSlotRange(cmd) => {
                 out.push(F::cns(cmd.user_id));
                 out.push(F::cns(cmd.contract_id));
                 out.push(F::cns(cmd.sub_slot_index));
                 out.push(F::cns(cmd.length as u64));
-                out.push(F::cns(cmd.contract_state_tree_height as u64));
+                out.push(F::cns(cmd.contract_state_tree_height));
             }
             DPNStateCmd::GetCheckpointLeafStats(cmd) => {
                 out.push(F::cns(cmd.checkpoint_id));
@@ -1331,7 +1406,7 @@ impl<F: ContextFelt> ToFelts<F> for DPNStateCmd<u64> {
             DPNStateCommandType::GetSelfUserExternalContractStateSlotHash => {
                 let contract_id = take(felts, &mut idx);
                 let slot_index = take(felts, &mut idx);
-                let height = take(felts, &mut idx) as u8;
+                let height = take(felts, &mut idx);
                 DPNStateCmd::GetSelfUserExternalContractStateSlotHash(DPNStateCmdGetSelfUserExternalContractStateSlotHash::new(
                     contract_id,
                     height,
@@ -1341,7 +1416,7 @@ impl<F: ContextFelt> ToFelts<F> for DPNStateCmd<u64> {
             DPNStateCommandType::GetSelfUserExternalContractStateSlotSingle => {
                 let contract_id = take(felts, &mut idx);
                 let sub_slot_index = take(felts, &mut idx);
-                let height = take(felts, &mut idx) as u8;
+                let height = take(felts, &mut idx);
                 DPNStateCmd::GetSelfUserExternalContractStateSlotSingle(DPNStateCmdGetSelfUserExternalContractStateSlotSingle::new(
                     contract_id,
                     height,
@@ -1352,7 +1427,7 @@ impl<F: ContextFelt> ToFelts<F> for DPNStateCmd<u64> {
                 let contract_id = take(felts, &mut idx);
                 let sub_slot_index = take(felts, &mut idx);
                 let length = take(felts, &mut idx) as u32;
-                let height = take(felts, &mut idx) as u8;
+                let height = take(felts, &mut idx);
                 DPNStateCmd::GetSelfUserExternalContractStateSlotRange(DPNStateCmdGetSelfUserExternalContractStateSlotRange::new(
                     contract_id,
                     height,
@@ -1364,7 +1439,7 @@ impl<F: ContextFelt> ToFelts<F> for DPNStateCmd<u64> {
                 let user_id = take(felts, &mut idx);
                 let contract_id = take(felts, &mut idx);
                 let slot_index = take(felts, &mut idx);
-                let height = take(felts, &mut idx) as u8;
+                let height = take(felts, &mut idx);
                 DPNStateCmd::GetOtherUserContractStateSlotHash(DPNStateCmdGetOtherUserContractStateSlotHash::new(
                     user_id,
                     contract_id,
@@ -1376,7 +1451,7 @@ impl<F: ContextFelt> ToFelts<F> for DPNStateCmd<u64> {
                 let user_id = take(felts, &mut idx);
                 let contract_id = take(felts, &mut idx);
                 let sub_slot_index = take(felts, &mut idx);
-                let height = take(felts, &mut idx) as u8;
+                let height = take(felts, &mut idx);
                 DPNStateCmd::GetOtherUserContractStateSlotSingle(DPNStateCmdGetOtherUserContractStateSlotSingle::new(
                     user_id,
                     contract_id,
@@ -1389,7 +1464,7 @@ impl<F: ContextFelt> ToFelts<F> for DPNStateCmd<u64> {
                 let contract_id = take(felts, &mut idx);
                 let sub_slot_index = take(felts, &mut idx);
                 let length = take(felts, &mut idx) as u32;
-                let height = take(felts, &mut idx) as u8;
+                let height = take(felts, &mut idx);
                 DPNStateCmd::GetOtherUserContractStateSlotRange(DPNStateCmdGetOtherUserContractStateSlotRange::new(
                     user_id,
                     contract_id,
@@ -1451,7 +1526,7 @@ impl<F: ContextFelt> ToFelts<F> for DPNStateCmd<u64> {
                 for item in &mut key {
                     *item = take(felts, &mut idx);
                 }
-                let height = take(felts, &mut idx) as u8;
+                let height = take(felts, &mut idx);
                 DPNStateCmd::GetSelfUserExternalIMTContractStateValue(DPNStateCmdGetSelfUserExternalIMTContractStateValue::new(
                     contract_id,
                     height,
@@ -1469,7 +1544,7 @@ impl<F: ContextFelt> ToFelts<F> for DPNStateCmd<u64> {
                 for item in &mut key {
                     *item = take(felts, &mut idx);
                 }
-                let height = take(felts, &mut idx) as u8;
+                let height = take(felts, &mut idx);
                 DPNStateCmd::GetOtherUserIMTContractStateValue(DPNStateCmdGetOtherUserIMTContractStateValue::new(
                     user_id,
                     contract_id,
@@ -1501,7 +1576,7 @@ impl<F: ContextFelt> ToFelts<F> for DPNStateCmd<u64> {
                 for item in &mut key {
                     *item = take(felts, &mut idx);
                 }
-                let height = take(felts, &mut idx) as u8;
+                let height = take(felts, &mut idx);
                 DPNStateCmd::ContainsOtherUserIMTContractStateValue(DPNStateCmdContainsOtherUserIMTContractStateValue::new(
                     user_id,
                     contract_id,
@@ -1560,42 +1635,42 @@ impl<T: Copy + Clone + Hash + Ord> DPNStateCmd<T> {
             DPNStateCmd::GetSelfUserCurrentContractStateSlotRange(c) => DPNStateCmd::GetSelfUserCurrentContractStateSlotRange(
                 DPNStateCmdGetSelfUserCurrentContractStateSlotRange::<u64>::new(inputs_as_u64[0], c.length),
             ),
-            DPNStateCmd::GetSelfUserExternalContractStateSlotHash(c) => DPNStateCmd::GetSelfUserExternalContractStateSlotHash(
-                DPNStateCmdGetSelfUserExternalContractStateSlotHash::<u64>::new(inputs_as_u64[0], c.contract_state_tree_height, inputs_as_u64[1]),
+            DPNStateCmd::GetSelfUserExternalContractStateSlotHash(_c) => DPNStateCmd::GetSelfUserExternalContractStateSlotHash(
+                DPNStateCmdGetSelfUserExternalContractStateSlotHash::<u64>::new(inputs_as_u64[0], inputs_as_u64[1], inputs_as_u64[2]),
             ),
-            DPNStateCmd::GetSelfUserExternalContractStateSlotSingle(c) => DPNStateCmd::GetSelfUserExternalContractStateSlotSingle(
-                DPNStateCmdGetSelfUserExternalContractStateSlotSingle::<u64>::new(inputs_as_u64[0], c.contract_state_tree_height, inputs_as_u64[1]),
+            DPNStateCmd::GetSelfUserExternalContractStateSlotSingle(_c) => DPNStateCmd::GetSelfUserExternalContractStateSlotSingle(
+                DPNStateCmdGetSelfUserExternalContractStateSlotSingle::<u64>::new(inputs_as_u64[0], inputs_as_u64[1], inputs_as_u64[2]),
             ),
             DPNStateCmd::GetSelfUserExternalContractStateSlotRange(c) => {
                 DPNStateCmd::GetSelfUserExternalContractStateSlotRange(DPNStateCmdGetSelfUserExternalContractStateSlotRange::<u64>::new(
                     inputs_as_u64[0],
-                    c.contract_state_tree_height,
                     inputs_as_u64[1],
+                    inputs_as_u64[2],
                     c.length,
                 ))
             }
-            DPNStateCmd::GetOtherUserContractStateSlotHash(c) => {
+            DPNStateCmd::GetOtherUserContractStateSlotHash(_c) => {
                 DPNStateCmd::GetOtherUserContractStateSlotHash(DPNStateCmdGetOtherUserContractStateSlotHash::<u64>::new(
                     inputs_as_u64[0],
                     inputs_as_u64[1],
-                    c.contract_state_tree_height,
                     inputs_as_u64[2],
+                    inputs_as_u64[3],
                 ))
             }
-            DPNStateCmd::GetOtherUserContractStateSlotSingle(c) => {
+            DPNStateCmd::GetOtherUserContractStateSlotSingle(_c) => {
                 DPNStateCmd::GetOtherUserContractStateSlotSingle(DPNStateCmdGetOtherUserContractStateSlotSingle::<u64>::new(
                     inputs_as_u64[0],
                     inputs_as_u64[1],
-                    c.contract_state_tree_height,
                     inputs_as_u64[2],
+                    inputs_as_u64[3],
                 ))
             }
             DPNStateCmd::GetOtherUserContractStateSlotRange(c) => {
                 DPNStateCmd::GetOtherUserContractStateSlotRange(DPNStateCmdGetOtherUserContractStateSlotRange::<u64>::new(
                     inputs_as_u64[0],
                     inputs_as_u64[1],
-                    c.contract_state_tree_height,
                     inputs_as_u64[2],
+                    inputs_as_u64[3],
                     c.length,
                 ))
             }
@@ -1618,23 +1693,23 @@ impl<T: Copy + Clone + Hash + Ord> DPNStateCmd<T> {
                     [inputs_as_u64[2], inputs_as_u64[3], inputs_as_u64[4], inputs_as_u64[5]],
                 ))
             }
-            DPNStateCmd::GetSelfUserExternalIMTContractStateValue(c) => {
+            DPNStateCmd::GetSelfUserExternalIMTContractStateValue(_c) => {
                 DPNStateCmd::GetSelfUserExternalIMTContractStateValue(DPNStateCmdGetSelfUserExternalIMTContractStateValue::<u64>::new(
                     inputs_as_u64[0],
-                    c.contract_state_tree_height,
                     inputs_as_u64[1],
-                    inputs_as_u64[2],
-                    [inputs_as_u64[3], inputs_as_u64[4], inputs_as_u64[5], inputs_as_u64[6]],
-                ))
-            }
-            DPNStateCmd::GetOtherUserIMTContractStateValue(c) => {
-                DPNStateCmd::GetOtherUserIMTContractStateValue(DPNStateCmdGetOtherUserIMTContractStateValue::<u64>::new(
-                    inputs_as_u64[0],
-                    inputs_as_u64[1],
-                    c.contract_state_tree_height,
                     inputs_as_u64[2],
                     inputs_as_u64[3],
                     [inputs_as_u64[4], inputs_as_u64[5], inputs_as_u64[6], inputs_as_u64[7]],
+                ))
+            }
+            DPNStateCmd::GetOtherUserIMTContractStateValue(_c) => {
+                DPNStateCmd::GetOtherUserIMTContractStateValue(DPNStateCmdGetOtherUserIMTContractStateValue::<u64>::new(
+                    inputs_as_u64[0],
+                    inputs_as_u64[1],
+                    inputs_as_u64[2],
+                    inputs_as_u64[3],
+                    inputs_as_u64[4],
+                    [inputs_as_u64[5], inputs_as_u64[6], inputs_as_u64[7], inputs_as_u64[8]],
                 ))
             }
             DPNStateCmd::ContainsSelfUserCurrentIMTContractStateValue(_c) => {
@@ -1644,14 +1719,14 @@ impl<T: Copy + Clone + Hash + Ord> DPNStateCmd<T> {
                     [inputs_as_u64[2], inputs_as_u64[3], inputs_as_u64[4], inputs_as_u64[5]],
                 ))
             }
-            DPNStateCmd::ContainsOtherUserIMTContractStateValue(c) => {
+            DPNStateCmd::ContainsOtherUserIMTContractStateValue(_c) => {
                 DPNStateCmd::ContainsOtherUserIMTContractStateValue(DPNStateCmdContainsOtherUserIMTContractStateValue::<u64>::new(
                     inputs_as_u64[0],
                     inputs_as_u64[1],
-                    c.contract_state_tree_height,
                     inputs_as_u64[2],
                     inputs_as_u64[3],
-                    [inputs_as_u64[4], inputs_as_u64[5], inputs_as_u64[6], inputs_as_u64[7]],
+                    inputs_as_u64[4],
+                    [inputs_as_u64[5], inputs_as_u64[6], inputs_as_u64[7], inputs_as_u64[8]],
                 ))
             }
         }

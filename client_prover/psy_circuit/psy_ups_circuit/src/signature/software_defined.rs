@@ -140,7 +140,7 @@ impl DPNSoftwareDefinedSignatureGadget {
             .set_witness(&mut pw, &signature_input.cfc_input.tx_input_ctx)?;
         self.fn_builder_gadget
             .state_reader
-            .set_witness(&mut pw, &signature_input.cfc_input, &self.fn_def);
+            .set_witness(&mut pw, &signature_input.cfc_input, &self.fn_def)?;
 
         let inner_proof = circuit_data.prove(pw)?;
         let minified_proof = minifier_chain.prove(&inner_proof)?;

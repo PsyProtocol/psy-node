@@ -64,20 +64,19 @@ impl QTreeDataStoreReaderSync<F> for RpcProvider {
         }
     }
 
-    #[instrument(skip(self), fields(checkpoint_id, user_id, contract_id, height, leaf_id))]
+    #[instrument(skip(self), fields(checkpoint_id, user_id, contract_id, leaf_id))]
     async fn get_user_contract_state_tree_leaf_hash(
         &self,
         checkpoint_id: u64,
         user_id: u64,
         contract_id: u32,
-        height: u8,
+        _height: u8,
         leaf_id: u64,
     ) -> anyhow::Result<psy_client_common::data::qhashout::QHashOut<F>> {
         debug!(
             checkpoint_id = checkpoint_id,
             user_id = user_id,
             contract_id = contract_id,
-            height = height,
             leaf_id = leaf_id,
             "Fetching user contract state tree leaf hash"
         );
@@ -86,7 +85,6 @@ impl QTreeDataStoreReaderSync<F> for RpcProvider {
             checkpoint_id,
             user_id,
             contract_id,
-            height,
             leaf_id,
         };
         let response = psy_rpc_call_back!(self, rpc_url, RequestParams::<F>::GetUserContractStateTreeLeafHash(input), QHashOut<F>);
@@ -96,7 +94,6 @@ impl QTreeDataStoreReaderSync<F> for RpcProvider {
                     checkpoint_id = checkpoint_id,
                     user_id = user_id,
                     contract_id = contract_id,
-                    height = height,
                     leaf_id = leaf_id,
                     hash = %hash,
                     "Successfully fetched hash"
@@ -110,20 +107,19 @@ impl QTreeDataStoreReaderSync<F> for RpcProvider {
         }
     }
 
-    #[instrument(skip(self), fields(checkpoint_id, user_id, contract_id, height, leaf_id))]
+    #[instrument(skip(self), fields(checkpoint_id, user_id, contract_id, leaf_id))]
     async fn get_user_contract_state_tree_merkle_proof(
         &self,
         checkpoint_id: u64,
         user_id: u64,
         contract_id: u32,
-        height: u8,
+        expected_height: u8,
         leaf_id: u64,
     ) -> anyhow::Result<psy_crypto::hash::merkle::core::MerkleProofCore<psy_client_common::data::qhashout::QHashOut<F>>> {
         debug!(
             checkpoint_id = checkpoint_id,
             user_id = user_id,
             contract_id = contract_id,
-            height = height,
             leaf_id = leaf_id,
             "Fetching user contract state tree merkle proof"
         );
@@ -132,7 +128,6 @@ impl QTreeDataStoreReaderSync<F> for RpcProvider {
             checkpoint_id,
             user_id,
             contract_id,
-            height,
             leaf_id,
         };
         let response = psy_rpc_call_back!(
@@ -143,11 +138,25 @@ impl QTreeDataStoreReaderSync<F> for RpcProvider {
         );
         match response.result {
             ResponseResult::Success(merkle_proof) => {
+                // `expected_height == 0` is the "unknown / let the Realm
+                // decide" sentinel used by callers (e.g. the CLI) that do not
+                // know the deployed contract's state-tree height; skip the
+                // check in that case. Real state-tree heights are never 0.
+                if expected_height != 0 && merkle_proof.siblings.len() != expected_height as usize {
+                    anyhow::bail!(
+                        "user contract state proof height mismatch: checkpoint_id={} user_id={} contract_id={} leaf_id={} expected_height={} rpc_siblings_len={}",
+                        checkpoint_id,
+                        user_id,
+                        contract_id,
+                        leaf_id,
+                        expected_height,
+                        merkle_proof.siblings.len()
+                    );
+                }
                 debug!(
                     checkpoint_id = checkpoint_id,
                     user_id = user_id,
                     contract_id = contract_id,
-                    height = height,
                     leaf_id = leaf_id,
                     merkle_proof = %serde_json::to_string_pretty(&merkle_proof).unwrap(),
                     "Successfully fetched merkle proof"

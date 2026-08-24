@@ -1,0 +1,684 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Psy · Agent Control</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+PGNpcmNsZSBjeD0iMTYiIGN5PSIxNiIgcj0iMTYiIGZpbGw9IiM3M0U3RkYiLz48ZyB0cmFuc2Zvcm09InRyYW5zbGF0ZSg4LjcsIDUpIHNjYWxlKDAuMDgwNikiPjxwYXRoIGZpbGw9IiMwMDAwMDAiIGQ9Ik0xMTYuMjE0IDUuMzExNjFDMTE0LjU1OSAxOC4yOTU1IDExMy4wOTkgMzMuMzk0MyAxMTEuODM0IDUwLjYwNzhDMTEwLjU2OSA2Ny44MjE0IDEwOS41OTUgODUuODIxOCAxMDguOTE0IDEwNC42MDlDMTA4LjMzIDEyMy4yOTggMTA4LjAzOCAxNDEuNDQ2IDEwOC4wMzggMTU5LjA1M0MxMDguMDM4IDE3MS40NDcgMTA4LjI4MSAxODQuMzgyIDEwOC43NjggMTk3Ljg1N0MxMDkuMzUyIDIxMS4yMzUgMTEwLjA4MiAyMjMuNzc2IDExMC45NTggMjM1LjQ4MUMxMTEuODM0IDI0Ny4xODYgMTEyLjgwNyAyNTYuNTggMTEzLjg3OCAyNjMuNjYyQzExMC43NjMgMjY0Ljg0MyAxMDYuMzgzIDI2Ni4zNjcgMTAwLjczOCAyNjguMjM2Qzk1LjE5MDIgMjcwLjEwNSA5MC43MTI5IDI3MS43MjggODcuMzA2MyAyNzMuMTA1Qzg2LjIzNTcgMjcyLjUxNSA4NS4zMTEgMjcxLjg3NiA4NC41MzI0IDI3MS4xODdDODMuNzUzNyAyNzAuNDk5IDgyLjg3NzcgMjY5LjYxMyA4MS45MDQ0IDI2OC41MzFDODMuNjU2NCAyNTcuMjIgODUuMTY1IDI0My45OSA4Ni40MzAzIDIyOC44NDJDODcuNzkzIDIxMy42OTQgODguODE1IDE5Ny42MTEgODkuNDk2MyAxODAuNTk1QzkwLjI3NDkgMTYzLjU3OCA5MC42NjQzIDE0Ni41NjEgOTAuNjY0MyAxMjkuNTQ0QzkwLjY2NDMgMTE2LjA2OCA5MC4zNzIzIDEwMi4xMDEgODkuNzg4MyA4Ny42NDE1Qzg5LjMwMTYgNzMuMTgyMiA4OC41NzE2IDU5LjI2MzggODcuNTk4MyA0NS44ODY0Qzg2LjYyNSAzMi40MTA2IDg1LjUwNTcgMjAuNDU5NSA4NC4yNDA0IDEwLjAzM0M4OC45MTIzIDcuOTY3NDEgOTMuODc2MiA2LjA0OTMzIDk5LjEzMjEgNC4yNzg4QzEwNC4zODggMi41MDgyNiAxMDguNzE5IDEuMDgxOTkgMTEyLjEyNiAwQzExMi44MDcgMC41OTAxNzkgMTEzLjU4NiAxLjQ3NTQ1IDExNC40NjIgMi42NTU4QzExNS40MzUgMy44MzYxNiAxMTYuMDE5IDQuNzIxNDMgMTE2LjIxNCA1LjMxMTYxWk0xNzIuNzE1IDYyLjU1ODlDMTc1LjM0MyA2OC4xNjU2IDE3Ny4zMzggNzQuOTUyNyAxNzguNzAxIDgyLjkyMDFDMTgwLjE2MSA5MC44ODc1IDE4MC44OTEgOTguMzYzMSAxODAuODkxIDEwNS4zNDdDMTgwLjg5MSAxMTYuMjY1IDE3OS4yMzYgMTI3LjcyNCAxNzUuOTI3IDEzOS43MjVDMTcyLjYxNyAxNTEuNjI3IDE2Ny41NTYgMTYyLjc0MiAxNjAuNzQzIDE3My4wN0MxNTQuMDI3IDE4My4zOTggMTQ1LjQ2MiAxOTEuODA4IDEzNS4wNDcgMTk4LjNDMTI0LjYzMyAyMDQuNjk0IDExMi4zNjkgMjA3Ljg5IDk4LjI1NjEgMjA3Ljg5QzgzLjI2NzEgMjA3Ljg5IDcwLjgwODYgMjA1Ljg3NCA2MC44ODA4IDIwMS44NDFDNTAuOTUzIDE5Ny44MDggNDMuMDY5MiAxOTIuMzk4IDM3LjIyOTMgMTg1LjYxMUMzMS40ODY3IDE3OC44MjQgMjcuMzk4OCAxNzEuMjUgMjQuOTY1NSAxNjIuODg5QzIyLjYyOTYgMTU0LjUyOCAyMS40NjE2IDE0NS45NzEgMjEuNDYxNiAxMzcuMjE3QzIxLjQ2MTYgMTMwLjUyOCAyMS44MDIyIDEyMy4zOTcgMjIuNDgzNiAxMTUuODIzQzIzLjE2NDkgMTA4LjI0OSAyMy41MDU1IDEwMC45MjEgMjMuNTA1NSA5My44Mzg0QzIzLjUwNTUgODkuMjE1MyAyMi4wNDU2IDg1LjQ3NzUgMTkuMTI1NiA4Mi42MjVDMTYuMjA1NyA3OS42NzQxIDkuODMwNDggNzcuODU0NCAwIDc3LjE2NTlWNjkuNzg4NkM4Ljg1NzE2IDY4LjgwNSAxNi44ODcgNjcuNDc3MSAyNC4wODk1IDY1LjgwNDlDMzEuMjkyMSA2NC4xMzI3IDM3LjA4MzMgNjIuMjE0NyA0MS40NjMyIDYwLjA1MDdDNDMuNzk5MiA2MS4wMzQzIDQ1Ljc5NDUgNjIuOTUyNCA0Ny40NDkxIDY1LjgwNDlDNDkuMjAxMSA2OC42NTc0IDUwLjA3NyA3NC4yNjQxIDUwLjA3NyA4Mi42MjVDNTAuMDc3IDkwLjEwMDYgNDkuNjg3NyA5OC4xNjY0IDQ4LjkwOTEgMTA2LjgyMkM0OC4yMjc3IDExNS40NzggNDcuODg3MSAxMjMuMzk3IDQ3Ljg4NzEgMTMwLjU3N0M0Ny44ODcxIDE0MS43OSA0OS41NDE3IDE1MS45MjIgNTIuODUxIDE2MC45NzFDNTYuMTYwMyAxNjkuOTIyIDYxLjg1NDEgMTc3LjA1NCA2OS45MzI3IDE4Mi4zNjVDNzguMTA4NSAxODcuNTc4IDg5LjQ5NjMgMTkwLjE4NSAxMDQuMDk2IDE5MC4xODVDMTE0Ljk5NyAxOTAuMTg1IDEyNC4yOTIgMTg3LjAzNyAxMzEuOTgxIDE4MC43NDJDMTM5Ljc2OCAxNzQuNDQ3IDE0NS43MDUgMTY2LjA4NiAxNDkuNzkzIDE1NS42NkMxNTMuOTc4IDE0NS4yMzMgMTU2LjA3MSAxMzMuOTcxIDE1Ni4wNzEgMTIxLjg3MkMxNTYuMDcxIDExMy40MTMgMTU0LjY2IDEwNC43NTcgMTUxLjgzNyA5NS45MDRDMTQ5LjAxNCA4Ni45NTMgMTQ0Ljg3OCA4MC4yNjQzIDEzOS40MjcgNzUuODM4QzE0Mi45MzEgNzMuMzc4OSAxNDcuMzExIDcwLjU3NTUgMTUyLjU2NyA2Ny40Mjc5QzE1Ny45MiA2NC4yODAzIDE2Mi4zOTggNjEuNzIyOCAxNjUuOTk5IDU5Ljc1NTZDMTY3LjI2NCA2MC4zNDU4IDE2OC4zMzUgNjAuODM3NiAxNjkuMjExIDYxLjIzMUMxNzAuMTg0IDYxLjYyNDUgMTcxLjM1MiA2Mi4wNjcxIDE3Mi43MTUgNjIuNTU4OVoiLz48L2c+PC9zdmc+">
+<style>
+  :root{
+    --bg:#0a0a0d; --card:#131316; --elevated:#1c1c20; --inset:#0e0e11;
+    --line:#232328; --line2:#2a2a30; --line3:#3a3a42;
+    --tx:#fafafa; --tx2:#a3a3a8; --tx3:#71717a; --tx4:#52525b;
+    --blue:#0070F3; --blue-soft:rgba(0,112,243,.14);
+    --mint:#62FFCC; --mint-soft:rgba(98,255,204,.12);
+    --warn:#f59e0b; --warn-soft:rgba(245,158,11,.14);
+    --danger:#ef4444; --danger-soft:rgba(239,68,68,.14);
+    --r:16px; --r-sm:11px; --pill:9999px;
+    --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    --mono:"JetBrains Mono",ui-monospace,"SF Mono",Menlo,monospace;
+    --sh:0 1px 0 rgba(255,255,255,.02) inset,0 8px 30px rgba(0,0,0,.35);
+  }
+  :root[data-theme="light"]{
+    --bg:#f6f6f7; --card:#fff; --elevated:#fff; --inset:#f1f1f3;
+    --line:#e7e7ea; --line2:#dedee2; --line3:#cfcfd5;
+    --tx:#0b0b0f; --tx2:#52525b; --tx3:#71717a; --tx4:#a1a1aa;
+    --blue:#0060d8; --blue-soft:rgba(0,96,216,.1);
+    --mint:#0f9e73; --mint-soft:rgba(15,158,115,.12);
+    --warn:#b8770a; --warn-soft:rgba(184,119,10,.12);
+    --danger:#d13b3b; --danger-soft:rgba(209,59,59,.1);
+    --sh:0 1px 2px rgba(0,0,0,.04),0 10px 30px rgba(0,0,0,.06);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--tx);font-family:var(--sans);line-height:1.5;
+    letter-spacing:-.011em;min-height:100vh;
+    background-image:radial-gradient(720px 460px at 84% -8%,var(--mint-soft),transparent 60%),
+      radial-gradient(760px 520px at 10% 2%,var(--blue-soft),transparent 62%);background-attachment:fixed}
+  .mono{font-family:var(--mono);font-variant-numeric:tabular-nums;letter-spacing:0}
+  .wrap{max-width:1000px;margin:0 auto;padding:clamp(14px,3vw,32px) clamp(12px,3vw,32px) 90px}
+  /* top */
+  .top{display:flex;align-items:center;gap:12px;margin-bottom:20px;flex-wrap:wrap}
+  .brand{display:flex;align-items:center;gap:9px;font-weight:650;font-size:15px}
+  .brand .psi{width:22px;height:22px;display:grid;place-items:center;border-radius:7px;background:var(--tx);color:var(--bg);font-weight:800}
+  .brand .sep{color:var(--tx4)}.brand .ctx{color:var(--tx2);font-weight:550}
+  .top .sp{flex:1}
+  .themebtn{border:1px solid var(--line2);background:var(--elevated);color:var(--tx2);border-radius:var(--pill);
+    padding:6px 12px;font-size:12.5px;font-weight:600;cursor:pointer;font-family:var(--sans)}
+  /* tabs */
+  .tabs{display:flex;gap:4px;background:var(--card);border:1px solid var(--line);border-radius:var(--pill);
+    padding:4px;margin-bottom:22px;width:fit-content;max-width:100%;overflow:auto}
+  .tab{border:0;background:transparent;color:var(--tx2);font-family:var(--sans);font-size:13.5px;font-weight:600;
+    padding:8px 16px;border-radius:var(--pill);cursor:pointer;white-space:nowrap;transition:.12s}
+  .tab.on{background:var(--elevated);color:var(--tx);box-shadow:var(--sh)}
+  .tab:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
+  /* cards + bits */
+  .card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--sh);
+    padding:clamp(16px,2.4vw,24px);margin-bottom:14px}
+  h2.sec{font-size:13px;font-weight:640;margin-bottom:3px;display:flex;align-items:center;gap:8px}
+  .hint{font-size:12.5px;color:var(--tx3);margin-bottom:15px;line-height:1.45}
+  .pill{display:inline-flex;align-items:center;gap:7px;padding:6px 13px;border-radius:var(--pill);
+    font-size:12.5px;font-weight:650;border:1px solid var(--line2)}
+  .pill .dot{width:7px;height:7px;border-radius:50%}
+  .pill.ok{color:var(--mint);border-color:color-mix(in srgb,var(--mint) 42%,transparent);background:var(--mint-soft)}
+  .pill.ok .dot{background:var(--mint);box-shadow:0 0 10px var(--mint)}
+  .pill.paused{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 42%,transparent);background:var(--warn-soft)}
+  .pill.paused .dot{background:var(--warn)}
+  .pill.off{color:var(--tx3)}.pill.off .dot{background:var(--tx4)}
+  .btn{border:1px solid var(--line2);background:var(--elevated);color:var(--tx);padding:11px 16px;
+    border-radius:var(--pill);font-family:var(--sans);font-size:13.5px;font-weight:640;cursor:pointer;
+    display:inline-flex;align-items:center;justify-content:center;gap:8px;transition:.12s}
+  .btn:hover{transform:translateY(-1px)}.btn:disabled{opacity:.5;cursor:default;transform:none}
+  .btn:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
+  .btn.primary{background:var(--blue);border-color:var(--blue);color:#fff}
+  .btn.danger{border-color:color-mix(in srgb,var(--danger) 48%,transparent);color:var(--danger);background:var(--danger-soft)}
+  .btn.danger:hover{background:color-mix(in srgb,var(--danger) 22%,transparent)}
+  .btn.big{padding:14px 18px;font-size:14.5px;width:100%}
+  /* overview hero */
+  .hero{display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap}
+  .av{width:54px;height:54px;border-radius:15px;flex:0 0 auto;display:grid;place-items:center;font-size:25px;
+    background:linear-gradient(150deg,var(--blue-soft),var(--mint-soft));border:1px solid var(--line2)}
+  .hero .id{flex:1;min-width:200px}
+  .hero .id h1{font-size:22px;font-weight:720;letter-spacing:-.02em;line-height:1.15}
+  .hero .id .sub{color:var(--tx3);font-size:12.5px;margin-top:3px}
+  .lead{font-size:16px;line-height:1.5;margin:16px 0 4px;text-wrap:pretty}
+  .lead b{font-weight:680}
+  /* perms grid */
+  .perms{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:6px}
+  .perms .col{background:var(--inset);border:1px solid var(--line);border-radius:var(--r-sm);padding:14px 16px}
+  .perms h3{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--tx3);margin-bottom:10px}
+  .perms ul{list-style:none;display:flex;flex-direction:column;gap:9px}
+  .perms li{display:flex;gap:9px;font-size:13px;align-items:flex-start}
+  .perms .mk{flex:0 0 auto;width:18px;height:18px;border-radius:5px;display:grid;place-items:center;font-size:11px;margin-top:1px}
+  .can .mk{background:var(--mint-soft);color:var(--mint)}
+  .cant .mk{background:var(--danger-soft);color:var(--danger)}
+  /* meters */
+  .meters{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:4px}
+  .meter{background:var(--inset);border:1px solid var(--line);border-radius:var(--r-sm);padding:14px 15px}
+  .meter .lbl{font-size:12px;color:var(--tx2);font-weight:560}
+  .meter .v{font-size:21px;font-weight:720;letter-spacing:-.03em;margin-top:3px}
+  .meter .v .u{font-size:12px;color:var(--tx3);font-weight:600}
+  .track{height:6px;border-radius:6px;background:var(--bg);border:1px solid var(--line);margin-top:11px;overflow:hidden}
+  .fill{height:100%;border-radius:6px;background:var(--mint);transition:width .5s ease}
+  .fill.warn{background:var(--warn)} .fill.danger{background:var(--danger)}
+  .meter .ft{font-size:11px;color:var(--tx3);margin-top:8px}
+  /* forms */
+  .field{margin-bottom:16px}
+  .field label{display:block;font-size:13px;font-weight:600;margin-bottom:3px}
+  .field .fh{font-size:11.5px;color:var(--tx3);margin-bottom:8px}
+  .inp{display:flex;align-items:center;gap:8px;background:var(--inset);border:1px solid var(--line2);
+    border-radius:10px;padding:10px 13px;max-width:260px}
+  .inp input{background:transparent;border:0;color:var(--tx);font-family:var(--mono);font-size:15px;
+    width:100%;outline:none;font-variant-numeric:tabular-nums}
+  .inp .u{color:var(--tx3);font-size:13px;font-weight:600}
+  .inp:focus-within{border-color:var(--blue)}
+  .reciprow{display:flex;gap:8px;margin-bottom:8px;max-width:420px}
+  .reciprow input{flex:1;background:var(--inset);border:1px solid var(--line2);border-radius:9px;
+    padding:9px 12px;color:var(--tx);font-family:var(--mono);font-size:13px;outline:none}
+  .reciprow input:focus{border-color:var(--blue)}
+  .x{border:1px solid var(--line2);background:var(--elevated);color:var(--tx3);border-radius:9px;
+    width:38px;cursor:pointer;font-size:15px}
+  .toggles{display:flex;flex-wrap:wrap;gap:8px}
+  .tog{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border-radius:var(--pill);
+    background:var(--inset);border:1px solid var(--line2);font-size:12.5px;font-weight:560;cursor:pointer;user-select:none}
+  .tog.on{background:var(--blue-soft);border-color:color-mix(in srgb,var(--blue) 32%,transparent);color:var(--blue)}
+  .tog .sw{width:14px;height:14px;border-radius:4px;border:1.5px solid currentColor;display:grid;place-items:center;font-size:10px}
+  .savebar{display:flex;gap:10px;align-items:center;margin-top:8px;flex-wrap:wrap}
+  .saved{font-size:12.5px;color:var(--mint);font-weight:600}
+  /* activity */
+  .filters{display:flex;gap:6px;margin-bottom:6px}
+  .fbtn{border:1px solid var(--line2);background:transparent;color:var(--tx2);border-radius:var(--pill);
+    padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer;font-family:var(--sans)}
+  .fbtn.on{background:var(--elevated);color:var(--tx)}
+  .ev{display:flex;gap:13px;padding:14px 0;border-bottom:1px solid var(--line)}
+  .ev:last-child{border-bottom:none}
+  .ev .mk{width:34px;height:34px;border-radius:10px;flex:0 0 auto;display:grid;place-items:center;font-size:15px;border:1px solid var(--line2)}
+  .ev.pay .mk{background:var(--blue-soft);color:var(--blue)}
+  .ev.in .mk{background:var(--mint-soft);color:var(--mint)}
+  .ev.block .mk{background:var(--danger-soft);color:var(--danger)}
+  .ev .b{flex:1;min-width:0}
+  .ev .r1{display:flex;justify-content:space-between;gap:10px;align-items:baseline}
+  .ev .t{font-size:13.5px;font-weight:600}
+  .ev .amt{font-size:13.5px;font-weight:680;white-space:nowrap}
+  .ev.block .amt{color:var(--tx4);text-decoration:line-through;text-decoration-thickness:1px}
+  .ev .why{font-size:12px;margin-top:3px;color:var(--tx2);line-height:1.45}
+  .ev.block .why{color:var(--danger)}
+  .ev .meta{font-size:11px;color:var(--tx3);margin-top:5px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .ev .tag{font-size:10px;padding:2px 7px;border-radius:5px;font-weight:600}
+  .ev .tag.a{background:var(--mint-soft);color:var(--mint)}.ev .tag.d{background:var(--danger-soft);color:var(--danger)}
+  /* protections + empty/loading/error */
+  .prot{list-style:none;display:flex;flex-direction:column;gap:12px}
+  .prot li{display:flex;gap:11px;font-size:13px;align-items:flex-start}
+  .prot .ic{width:19px;height:19px;border-radius:6px;display:grid;place-items:center;font-size:11px;flex:0 0 auto;margin-top:1px}
+  .prot .ic.on{background:var(--mint-soft);color:var(--mint)}.prot .ic.off{background:var(--inset);color:var(--tx4)}
+  .prot b{font-weight:620}.prot span{color:var(--tx3);display:block;font-size:11.5px;margin-top:1px}
+  .empty{text-align:center;padding:34px 16px;color:var(--tx3);font-size:13px}
+  .empty .big{font-size:26px;margin-bottom:8px}
+  .skel{height:14px;border-radius:6px;background:linear-gradient(90deg,var(--inset),var(--elevated),var(--inset));
+    background-size:200% 100%;animation:sh 1.3s infinite}
+  @keyframes sh{0%{background-position:200% 0}100%{background-position:-200% 0}}
+  .banner{border-radius:var(--r-sm);padding:12px 15px;font-size:13px;display:flex;gap:10px;align-items:flex-start;margin-bottom:14px}
+  .banner.warn{background:var(--warn-soft);border:1px solid color-mix(in srgb,var(--warn) 32%,transparent);color:var(--warn)}
+  .banner.err{background:var(--danger-soft);border:1px solid color-mix(in srgb,var(--danger) 32%,transparent);color:var(--danger)}
+  .note{font-size:12px;color:var(--tx3);text-align:center;margin-top:18px;line-height:1.55;max-width:560px;margin-left:auto;margin-right:auto}
+  .note b{color:var(--tx2)}
+  .hidden{display:none!important}
+  .wsteps{display:flex;align-items:center;gap:8px;margin-bottom:22px}
+  .wstep{display:flex;align-items:center;gap:8px;font-size:12.5px;font-weight:600;color:var(--tx3)}
+  .wstep.on{color:var(--tx)} .wstep.done{color:var(--mint)}
+  .wstep .wn{width:22px;height:22px;border-radius:50%;display:grid;place-items:center;font-size:11px;
+    border:1.5px solid var(--line3);color:var(--tx3)}
+  .wstep.on .wn{border-color:var(--blue);color:var(--blue)}
+  .wstep.done .wn{border-color:var(--mint);background:var(--mint-soft);color:var(--mint)}
+  .wline{flex:1;height:1px;background:var(--line2);min-width:16px}
+  @media(max-width:720px){.perms{grid-template-columns:1fr}.meters{grid-template-columns:1fr}}
+  @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div class="brand"><img src="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNjYwIiBoZWlnaHQ9IjMwMCIgdmlld0JveD0iMCAwIDY2MCAzMDAiIGZpbGw9Im5vbmUiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+CjxwYXRoIGQ9Ik0xMTYuMjE0IDUuMzExNjFDMTE0LjU1OSAxOC4yOTU1IDExMy4wOTkgMzMuMzk0MyAxMTEuODM0IDUwLjYwNzhDMTEwLjU2OSA2Ny44MjE0IDEwOS41OTUgODUuODIxOCAxMDguOTE0IDEwNC42MDlDMTA4LjMzIDEyMy4yOTggMTA4LjAzOCAxNDEuNDQ2IDEwOC4wMzggMTU5LjA1M0MxMDguMDM4IDE3MS40NDcgMTA4LjI4MSAxODQuMzgyIDEwOC43NjggMTk3Ljg1N0MxMDkuMzUyIDIxMS4yMzUgMTEwLjA4MiAyMjMuNzc2IDExMC45NTggMjM1LjQ4MUMxMTEuODM0IDI0Ny4xODYgMTEyLjgwNyAyNTYuNTggMTEzLjg3OCAyNjMuNjYyQzExMC43NjMgMjY0Ljg0MyAxMDYuMzgzIDI2Ni4zNjcgMTAwLjczOCAyNjguMjM2Qzk1LjE5MDIgMjcwLjEwNSA5MC43MTI5IDI3MS43MjggODcuMzA2MyAyNzMuMTA1Qzg2LjIzNTcgMjcyLjUxNSA4NS4zMTEgMjcxLjg3NiA4NC41MzI0IDI3MS4xODdDODMuNzUzNyAyNzAuNDk5IDgyLjg3NzcgMjY5LjYxMyA4MS45MDQ0IDI2OC41MzFDODMuNjU2NCAyNTcuMjIgODUuMTY1IDI0My45OSA4Ni40MzAzIDIyOC44NDJDODcuNzkzIDIxMy42OTQgODguODE1IDE5Ny42MTEgODkuNDk2MyAxODAuNTk1QzkwLjI3NDkgMTYzLjU3OCA5MC42NjQzIDE0Ni41NjEgOTAuNjY0MyAxMjkuNTQ0QzkwLjY2NDMgMTE2LjA2OCA5MC4zNzIzIDEwMi4xMDEgODkuNzg4MyA4Ny42NDE1Qzg5LjMwMTYgNzMuMTgyMiA4OC41NzE2IDU5LjI2MzggODcuNTk4MyA0NS44ODY0Qzg2LjYyNSAzMi40MTA2IDg1LjUwNTcgMjAuNDU5NSA4NC4yNDA0IDEwLjAzM0M4OC45MTIzIDcuOTY3NDEgOTMuODc2MiA2LjA0OTMzIDk5LjEzMjEgNC4yNzg4QzEwNC4zODggMi41MDgyNiAxMDguNzE5IDEuMDgxOTkgMTEyLjEyNiAwQzExMi44MDcgMC41OTAxNzkgMTEzLjU4NiAxLjQ3NTQ1IDExNC40NjIgMi42NTU4QzExNS40MzUgMy44MzYxNiAxMTYuMDE5IDQuNzIxNDMgMTE2LjIxNCA1LjMxMTYxWk0xNzIuNzE1IDYyLjU1ODlDMTc1LjM0MyA2OC4xNjU2IDE3Ny4zMzggNzQuOTUyNyAxNzguNzAxIDgyLjkyMDFDMTgwLjE2MSA5MC44ODc1IDE4MC44OTEgOTguMzYzMSAxODAuODkxIDEwNS4zNDdDMTgwLjg5MSAxMTYuMjY1IDE3OS4yMzYgMTI3LjcyNCAxNzUuOTI3IDEzOS43MjVDMTcyLjYxNyAxNTEuNjI3IDE2Ny41NTYgMTYyLjc0MiAxNjAuNzQzIDE3My4wN0MxNTQuMDI3IDE4My4zOTggMTQ1LjQ2MiAxOTEuODA4IDEzNS4wNDcgMTk4LjNDMTI0LjYzMyAyMDQuNjk0IDExMi4zNjkgMjA3Ljg5IDk4LjI1NjEgMjA3Ljg5QzgzLjI2NzEgMjA3Ljg5IDcwLjgwODYgMjA1Ljg3NCA2MC44ODA4IDIwMS44NDFDNTAuOTUzIDE5Ny44MDggNDMuMDY5MiAxOTIuMzk4IDM3LjIyOTMgMTg1LjYxMUMzMS40ODY3IDE3OC44MjQgMjcuMzk4OCAxNzEuMjUgMjQuOTY1NSAxNjIuODg5QzIyLjYyOTYgMTU0LjUyOCAyMS40NjE2IDE0NS45NzEgMjEuNDYxNiAxMzcuMjE3QzIxLjQ2MTYgMTMwLjUyOCAyMS44MDIyIDEyMy4zOTcgMjIuNDgzNiAxMTUuODIzQzIzLjE2NDkgMTA4LjI0OSAyMy41MDU1IDEwMC45MjEgMjMuNTA1NSA5My44Mzg0QzIzLjUwNTUgODkuMjE1MyAyMi4wNDU2IDg1LjQ3NzUgMTkuMTI1NiA4Mi42MjVDMTYuMjA1NyA3OS42NzQxIDkuODMwNDggNzcuODU0NCAwIDc3LjE2NTlWNjkuNzg4NkM4Ljg1NzE2IDY4LjgwNSAxNi44ODcgNjcuNDc3MSAyNC4wODk1IDY1LjgwNDlDMzEuMjkyMSA2NC4xMzI3IDM3LjA4MzMgNjIuMjE0NyA0MS40NjMyIDYwLjA1MDdDNDMuNzk5MiA2MS4wMzQzIDQ1Ljc5NDUgNjIuOTUyNCA0Ny40NDkxIDY1LjgwNDlDNDkuMjAxMSA2OC42NTc0IDUwLjA3NyA3NC4yNjQxIDUwLjA3NyA4Mi42MjVDNTAuMDc3IDkwLjEwMDYgNDkuNjg3NyA5OC4xNjY0IDQ4LjkwOTEgMTA2LjgyMkM0OC4yMjc3IDExNS40NzggNDcuODg3MSAxMjMuMzk3IDQ3Ljg4NzEgMTMwLjU3N0M0Ny44ODcxIDE0MS43OSA0OS41NDE3IDE1MS45MjIgNTIuODUxIDE2MC45NzFDNTYuMTYwMyAxNjkuOTIyIDYxLjg1NDEgMTc3LjA1NCA2OS45MzI3IDE4Mi4zNjVDNzguMTA4NSAxODcuNTc4IDg5LjQ5NjMgMTkwLjE4NSAxMDQuMDk2IDE5MC4xODVDMTE0Ljk5NyAxOTAuMTg1IDEyNC4yOTIgMTg3LjAzNyAxMzEuOTgxIDE4MC43NDJDMTM5Ljc2OCAxNzQuNDQ3IDE0NS43MDUgMTY2LjA4NiAxNDkuNzkzIDE1NS42NkMxNTMuOTc4IDE0NS4yMzMgMTU2LjA3MSAxMzMuOTcxIDE1Ni4wNzEgMTIxLjg3MkMxNTYuMDcxIDExMy40MTMgMTU0LjY2IDEwNC43NTcgMTUxLjgzNyA5NS45MDRDMTQ5LjAxNCA4Ni45NTMgMTQ0Ljg3OCA4MC4yNjQzIDEzOS40MjcgNzUuODM4QzE0Mi45MzEgNzMuMzc4OSAxNDcuMzExIDcwLjU3NTUgMTUyLjU2NyA2Ny40Mjc5QzE1Ny45MiA2NC4yODAzIDE2Mi4zOTggNjEuNzIyOCAxNjUuOTk5IDU5Ljc1NTZDMTY3LjI2NCA2MC4zNDU4IDE2OC4zMzUgNjAuODM3NiAxNjkuMjExIDYxLjIzMUMxNzAuMTg0IDYxLjYyNDUgMTcxLjM1MiA2Mi4wNjcxIDE3Mi43MTUgNjIuNTU4OVoiIGZpbGw9IndoaXRlIi8+CjxwYXRoIGQ9Ik01ODIuODU3IDIyMC4yMjdMNTI5LjMzNiA3OC44MTA1SDU1Ny4xNDNMNTk2LjMxMiAxODkuMTAzTDYzMi4xOTMgNzguODEwNUg2NjBMNTgxLjM2MiAzMDBINTUzLjU1NUw1ODIuODU3IDIyMC4yMjdaIiBmaWxsPSJ3aGl0ZSIvPgo8cGF0aCBkPSJNNDc0LjgxMiAyMjkuODk2QzQ1Ny42NyAyMjkuODk2IDQ0Mi44MTkgMjI1Ljg2NyA0MzAuMjYxIDIxNy44MDlMNDMzLjU1IDE5MS4yMThDNDQ2LjMwOCAyMDEuMjkxIDQ1OS40NjQgMjA2LjMyNyA0NzMuMDE4IDIwNi4zMjdDNDgwLjE5NCAyMDYuMzI3IDQ4NS43NzYgMjA0LjgxNiA0ODkuNzYzIDIwMS43OTRDNDkzLjk0OSAxOTguNzczIDQ5Ni4wNDIgMTk0LjM0MSA0OTYuMDQyIDE4OC40OTlDNDk2LjA0MiAxODQuMDY3IDQ5NS4wNDUgMTgwLjQ0MSA0OTMuMDUyIDE3Ny42MjFDNDkxLjI1OCAxNzQuOCA0ODguMTY4IDE3Mi4wODEgNDgzLjc4MyAxNjkuNDYyQzQ3OS4zOTcgMTY2Ljg0MyA0NzIuNjIgMTYzLjQxOCA0NjMuNDUgMTU5LjE4OEM0NTIuNjg2IDE1NC4xNTIgNDQ0LjgxMyAxNDguNDExIDQzOS44MjkgMTQxLjk2NEM0MzQuODQ2IDEzNS41MTggNDMyLjM1NCAxMjcuMTU4IDQzMi4zNTQgMTE2Ljg4NEM0MzIuMzU0IDEwNC43OTcgNDM2LjU0IDk0LjkyNjMgNDQ0LjkxMiA4Ny4yNzEzQzQ1My4yODQgNzkuNjE2MyA0NjQuNTQ3IDc1Ljc4ODggNDc4LjY5OSA3NS43ODg4QzQ5My4wNTIgNzUuNzg4OCA1MDUuNjEgNzkuMDExOSA1MTYuMzc0IDg1LjQ1ODJMNTEzLjA4NSAxMDkuOTM0QzUwNy43MDMgMTA2LjMwOCA1MDIuNjIgMTAzLjY4OSA0OTcuODM2IDEwMi4wNzhDNDkzLjA1MiAxMDAuMjY1IDQ4Ny4zNzEgOTkuMzU4MSA0ODAuNzkyIDk5LjM1ODFDNDczLjgxNiA5OS4zNTgxIDQ2OC4zMzQgMTAwLjg2OSA0NjQuMzQ3IDEwMy44OTFDNDYwLjM2MSAxMDYuOTEyIDQ1OC4zNjcgMTExLjE0MyA0NTguMzY3IDExNi41ODJDNDU4LjM2NyAxMjIuMDIxIDQ2MC4wNjIgMTI2LjE1MSA0NjMuNDUgMTI4Ljk3MUM0NjcuMDM4IDEzMS43OTEgNDczLjkxNSAxMzUuNTE4IDQ4NC4wODIgMTQwLjE1MUM0OTguMjM0IDE0Ni41OTggNTA4LjIwMSAxNTMuMTQ1IDUxMy45ODIgMTU5Ljc5MkM1MTkuNzYyIDE2Ni4yMzkgNTIyLjY1MyAxNzQuOCA1MjIuNjUzIDE4NS40NzdDNTIyLjY1MyAxOTkuMzc3IDUxOC4zNjcgMjEwLjI1NSA1MDkuNzk2IDIxOC4xMTJDNTAxLjIyNCAyMjUuOTY4IDQ4OS41NjMgMjI5Ljg5NiA0NzQuODEyIDIyOS44OTZaIiBmaWxsPSJ3aGl0ZSIvPgo8cGF0aCBkPSJNMjkzLjAxOSAxNS4zNTQ1SDM0Ni44MzlDMzY4Ljc2NiAxNS4zNTQ1IDM4NS44MDkgMjEuMTk2NSAzOTcuOTY5IDMyLjg4MDVDNDEwLjMyOCA0NC41NjQ0IDQxNi41MDcgNjEuNTg2NyA0MTYuNTA3IDgzLjk0NzRDNDE2LjUwNyAxMDYuMzA4IDQxMC4zMjggMTIzLjQzMSAzOTcuOTY5IDEzNS4zMTdDMzg1LjgwOSAxNDcuMDAxIDM2OC43NjYgMTUyLjg0MyAzNDYuODM5IDE1Mi44NDNIMzIwLjUyN1YyMjYuODc1SDI5My4wMTlWMTUuMzU0NVpNMzQ0LjQ0NyAxMjcuNDZDMzczLjU1IDEyNy40NiAzODguMTAyIDExMi45NTYgMzg4LjEwMiA4My45NDc0QzM4OC4xMDIgNTQuOTM5IDM3My41NSA0MC40MzQ3IDM0NC40NDcgNDAuNDM0N0gzMjAuNTI3VjEyNy40NkgzNDQuNDQ3WiIgZmlsbD0id2hpdGUiLz4KPC9zdmc+Cg==" alt="Psy" style="height:20px;width:44px;display:block"> <span class="sep" style="opacity:0.4">/</span> <span class="ctx">Agent Control</span></div>
+    <div class="sp"></div>
+    <button class="themebtn" id="theme">◐ Theme</button>
+  </div>
+
+  <div class="tabs" role="tablist">
+    <button class="tab on" data-p="overview" role="tab">Overview</button>
+    <button class="tab" data-p="policy" role="tab">Permissions</button>
+    <button class="tab" data-p="activity" role="tab">Activity</button>
+    <button class="tab" data-p="security" role="tab">Security</button>
+  </div>
+
+  <div id="boot" class="card"><div class="skel" style="width:40%;margin-bottom:12px"></div><div class="skel" style="width:70%;margin-bottom:8px"></div><div class="skel" style="width:55%"></div></div>
+  <div id="app" class="hidden"></div>
+</div>
+
+<script>
+const NANO = 1e9;
+let S = null;                 // last /api/state
+let page = 'overview';
+// True once the owner touches the Permissions form. render() replaces the whole
+// panel, so an unguarded background refresh silently discarded a half-typed
+// daily budget or a newly added recipient — on the screen that controls how
+// much an AI can spend. Cleared on save and on leaving the page.
+let policyDirty = false;
+function markPolicyDirty(){ policyDirty = true; }
+let filter = 'all';
+
+// ── humanizers ────────────────────────────────────────────────────────
+const fmtPsy = n => {
+  const v = (Number(n)||0)/NANO;
+  if (v === 0) return '0';
+  if (Number.isInteger(v)) return v.toLocaleString();
+  return v.toLocaleString(undefined,{maximumFractionDigits:6});
+};
+const METHOD = {
+  simple_transfer:'Send a payment', private_transfer:'Send a private payment',
+  simple_claim:'Claim a received payment', private_claim:'Claim a private payment',
+  claim_deposit:'Claim a deposit', deposit:'Add funds from Ethereum',
+  withdraw:'Withdraw to Ethereum', x402_fetch:'Pay for an online resource',
+};
+const methodLabel = m => METHOD[m] || m.replace(/_/g,' ');
+const ago = s => { s=Number(s)||0;
+  if(s<60)return 'just now'; if(s<3600)return Math.floor(s/60)+' min ago';
+  if(s<86400)return Math.floor(s/3600)+' hr ago'; return Math.floor(s/86400)+' d ago'; };
+const isInbound = m => ['simple_claim','private_claim','claim_deposit','deposit'].includes(m);
+const recipLabel = r => (r==null||r==='self') ? 'your own wallet' : (/^\d+$/.test(String(r)) ? 'Psy-'+String(r).padStart(8,'0') : String(r));
+
+// ── data ──────────────────────────────────────────────────────────────
+async function load(){
+  try{ const r = await fetch('/api/state'); S = await r.json(); }
+  catch(e){ S = {ok:false,error:'Could not reach your agent’s control service. Is the dashboard bridge running?'}; }
+  render();
+}
+async function act(path, body){
+  const r = await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
+  const j = await r.json();
+  await load();
+  return j;
+}
+
+// ── status derivation (from real describe_policy) ─────────────────────
+function status(p){
+  if(!p) return {k:'off',t:'Not set up'};
+  if(p.active===false) return {k:'paused',t:'Paused'};
+  if((p.activeSessions||0)===0) return {k:'off',t:'Inactive · no active session'};
+  return {k:'ok',t:'Active'};
+}
+
+// ── render ────────────────────────────────────────────────────────────
+function render(){
+  document.getElementById('boot').classList.add('hidden');
+  const app = document.getElementById('app'); app.classList.remove('hidden');
+  const tabs = document.querySelector('.tabs');
+  if(!S || S.ok===false){
+    tabs.classList.add('hidden');
+    // The headline is a sentence a person can act on; the raw exception goes
+    // behind a disclosure. It used to BE the headline — a Python traceback
+    // string rendered in bold as the whole explanation — and it was
+    // interpolated unescaped despite esc() existing.
+    const emsg = esc((S&&S.error) || 'Something went wrong.');
+    const edet = (S&&S.errorDetail) ? `<details style="margin-top:8px"><summary style="cursor:pointer;color:var(--tx3);font-size:12.5px">Technical details</summary><div class="mono" style="margin-top:6px;font-size:12px;color:var(--tx3);word-break:break-word">${esc(S.errorDetail)}</div></details>` : '';
+    app.innerHTML = `<div class="card"><div class="banner err">⚠️ <div><b>${emsg}</b><div style="color:var(--tx3);margin-top:4px">Nothing is guessed — this page stays empty until it can read your agent. Your agent's rules and balance are unchanged.</div>${edet}</div></div></div>`;
+    return;
+  }
+  if(S.needsSetup){ tabs.classList.add('hidden'); initWiz(); app.innerHTML = Onboarding(); wireWizard(); return; }
+  tabs.classList.remove('hidden');
+  app.innerHTML = ({overview:Overview,policy:Policy,activity:Activity,security:Security})[page]();
+  wire();
+}
+
+// ── onboarding wizard ─────────────────────────────────────────────────
+let wiz=null;
+function initWiz(){
+  if(wiz) return;                       // keep in-progress input across refreshes
+  const p=S.policy||{};
+  wiz={step:0,
+    name:S.agentName||'My agent',
+    perpay:p.perTransaction!=null?(Number(p.perTransaction)/NANO):5,
+    perday:p.perDay!=null?(Number(p.perDay)/NANO):50,
+    permonth:p.perMonth!=null?(Number(p.perMonth)/NANO):'',
+    recips:[''],
+    methods:new Set((p.allowedMethods&&p.allowedMethods.length)?p.allowedMethods:['simple_transfer','private_transfer','simple_claim','private_claim','x402_fetch']),
+    working:false};
+}
+const WIZ_STEPS=['Limits','Access','Review'];
+function wizSentence(){
+  const parts=[`up to <b>${wiz.perpay||0} PSY</b> per payment`,`<b>${wiz.perday||0} PSY</b> per day`];
+  if(wiz.permonth!=='') parts.push(`<b>${wiz.permonth} PSY</b> per 30 days`);
+  const rec=wiz.recips.map(r=>r.trim()).filter(Boolean);
+  const who=rec.length?`your <b>${rec.length} approved ${rec.length===1?'recipient':'recipients'}</b>`:'<b>anyone</b> you haven’t restricted';
+  return `${esc(wiz.name)} will be able to spend ${parts.join(', ')}, and pay ${who}.`;
+}
+function Onboarding(){
+  const stepper=WIZ_STEPS.map((s,i)=>`<div class="wstep ${i===wiz.step?'on':''} ${i<wiz.step?'done':''}"><span class="wn">${i<wiz.step?'✓':i+1}</span>${s}</div>`).join('<div class="wline"></div>');
+  let body='';
+  if(wiz.step===0){
+    body=`
+    <h2 class="sec">Set your agent’s spending limits</h2>
+    <p class="hint">In PSY. These are hard caps enforced in the wallet — your agent can never exceed them.</p>
+    <div class="field"><label>What’s your agent called?</label>
+      <div class="inp" style="max-width:320px"><input id="w_name" type="text" value="${esc(wiz.name)}"></div></div>
+    <div class="field"><label>Maximum payment size</label><div class="fh">The most it can send in one payment.</div>
+      <div class="inp"><input id="w_perpay" type="number" min="0" step="0.01" value="${wiz.perpay}"><span class="u">PSY</span></div></div>
+    <div class="field"><label>Daily budget</label><div class="fh">The most it can spend in a day.</div>
+      <div class="inp"><input id="w_perday" type="number" min="0" step="0.1" value="${wiz.perday}"><span class="u">PSY</span></div></div>
+    <div class="field"><label>Monthly budget <span style="color:var(--tx4);font-weight:400">(optional)</span></label><div class="fh">A rolling 30-day cap. Leave blank for none.</div>
+      <div class="inp"><input id="w_permonth" type="number" min="0" step="1" value="${wiz.permonth}"><span class="u">PSY</span></div></div>`;
+  } else if(wiz.step===1){
+    const ALLM=['simple_transfer','private_transfer','simple_claim','private_claim','x402_fetch','deposit','claim_deposit','withdraw'];
+    body=`
+    <h2 class="sec">Who can it pay, and what can it do?</h2>
+    <p class="hint">Add the Psy IDs it’s allowed to pay. Leave empty to let it pay anyone. Then choose which kinds of actions it can take.</p>
+    <div class="field"><label>Approved recipients</label>
+      <div id="w_recips">${wiz.recips.map(recipRow).join('')}</div>
+      <button class="btn" id="w_addrecip" style="margin-top:6px">+ Add a recipient</button></div>
+    <div class="field"><label>Allowed actions</label>
+      <div class="toggles">${ALLM.map(m=>`<div class="tog ${wiz.methods.has(m)?'on':''}" data-m="${m}"><span class="sw">${wiz.methods.has(m)?'✓':''}</span>${esc(methodLabel(m))}</div>`).join('')}</div></div>`;
+  } else {
+    body=`
+    <h2 class="sec">Review &amp; authorize</h2>
+    <p class="hint">This is the permission you’re about to grant. You can change it anytime, and pause instantly.</p>
+    <div class="banner" style="background:var(--mint-soft);border:1px solid color-mix(in srgb,var(--mint) 30%,transparent);color:var(--tx)">🤖 <div style="line-height:1.5">${wizSentence()}</div></div>
+    <ul class="prot" style="margin-top:6px">
+      <li><span class="ic on">✓</span><div><b>Enforced below the AI</b><span>A prompt or jailbreak can’t raise a limit or add a payee.</span></div></li>
+      <li><span class="ic on">✓</span><div><b>You stay in control</b><span>Pause, revoke, or change these rules whenever you want.</span></div></li>
+    </ul>`;
+  }
+  const werr = wiz.error ? `
+    <div class="banner err" style="margin-top:14px">⚠️ <div>
+      <b>Your agent was not authorized and cannot spend.</b>
+      <div style="color:var(--tx3);margin-top:4px">Nothing was changed — your rules were not applied and no spending power was granted. You can try again.</div>
+      <details style="margin-top:8px"><summary style="cursor:pointer;color:var(--tx3);font-size:12.5px">Technical details</summary>
+        <div class="mono" style="margin-top:6px;font-size:12px;color:var(--tx3);word-break:break-word">${esc(wiz.error)}</div>
+      </details>
+    </div></div>` : '';
+  return `
+  <div class="card" style="border-color:var(--line2)">
+    <div class="wsteps">${stepper}</div>
+    ${body}
+    ${werr}
+    <div class="savebar" style="justify-content:space-between;margin-top:18px">
+      <button class="btn ${wiz.step===0?'hidden':''}" id="w_back">← Back</button>
+      <div style="flex:1"></div>
+      ${wiz.step<2
+        ? `<button class="btn primary" id="w_next">Continue →</button>`
+        : `<button class="btn primary" id="w_go" ${wiz.working?'disabled':''}>${wiz.working?'Authorizing…':'✓ Authorize agent'}</button>`}
+    </div>
+    <p class="note" style="margin-top:14px">Your agent is <span class="mono">${S.psyId||''}</span>. It cannot spend anything until you authorize it here.</p>
+  </div>`;
+}
+function saveWizInputs(){
+  const g=id=>{const e=document.getElementById(id);return e?e.value:undefined;};
+  if(wiz.step===0){
+    if(g('w_name')!==undefined) wiz.name=g('w_name');
+    if(g('w_perpay')!==undefined) wiz.perpay=g('w_perpay');
+    if(g('w_perday')!==undefined) wiz.perday=g('w_perday');
+    if(g('w_permonth')!==undefined) wiz.permonth=g('w_permonth');
+  }
+  if(wiz.step===1){
+    const rs=[...document.querySelectorAll('#w_recips input')].map(i=>i.value);
+    if(rs.length) wiz.recips=rs;
+  }
+}
+function wireWizard(){
+  document.querySelectorAll('#w_recips input').forEach(()=>{});
+  const back=document.getElementById('w_back'), next=document.getElementById('w_next'), go=document.getElementById('w_go');
+  const add=document.getElementById('w_addrecip');
+  if(back) back.onclick=()=>{saveWizInputs();wiz.step--;render();};
+  if(next) next.onclick=()=>{saveWizInputs();wiz.step++;render();};
+  if(add) add.onclick=()=>{saveWizInputs();wiz.recips.push('');render();};
+  document.querySelectorAll('.tog[data-m]').forEach(t=>t.onclick=()=>{const m=t.dataset.m;
+    if(wiz.methods.has(m))wiz.methods.delete(m);else wiz.methods.add(m);render();});
+  if(go) go.onclick=async()=>{
+    wiz.working=true; wiz.error=null; render();
+    const recips=wiz.recips.map(r=>r.trim()).filter(Boolean);
+    const body={perPaymentPsy:wiz.perpay,perDayPsy:wiz.perday,perMonthPsy:wiz.permonth,methods:[...wiz.methods]};
+    if(document.querySelectorAll('#w_recips input').length || recips.length) body.recipients=recips;
+    const r=await act('/api/create',body);
+    if(r&&r.error){
+      // A browser alert at the END of onboarding left the owner unable to tell
+      // whether their agent had just been given spending power. Say it.
+      wiz.working=false; wiz.error=r.error; render(); return;
+    }
+    wiz=null;                     // done — next render shows the live dashboard
+  };
+}
+
+function Overview(){
+  const p=S.policy, st=status(p), b=S.budget||{};
+  const methods=p.allowedMethods||[];
+  const allow=[];
+  allow.push(`Spend up to <b>${fmtPsy(p.perTransaction)} PSY</b> per payment`);
+  allow.push(`Spend up to <b>${fmtPsy(p.perDay)} PSY</b> per day`);
+  if(p.perMonth!=null) allow.push(`Spend up to <b>${fmtPsy(p.perMonth)} PSY</b> per 30 days`);
+  if(p.allowedRecipientCount==null) allow.push(`Pay <b>anyone</b> you haven’t restricted`);
+  else allow.push(`Pay only your <b>${p.allowedRecipientCount} approved ${p.allowedRecipientCount===1?'recipient':'recipients'}</b>`);
+  const spendMethods=methods.filter(m=>!isInbound(m));
+  spendMethods.slice(0,3).forEach(m=>allow.push(esc(methodLabel(m))));
+  const cant=[];
+  cant.push('Change its own permissions or limits');
+  cant.push(S.ownerTokenSet?'Un-pause itself once you pause it':'Raise a limit, approve a payee, or grant itself a new action');
+  if(p.allowedRecipientCount!=null) cant.push('Send to anyone outside your approved list');
+  ['withdraw','deposit'].forEach(m=>{ if(!methods.includes(m)) cant.push(esc(methodLabel(m).replace(/^./,c=>c.toUpperCase()))); });
+  const dayUsed=Number(p.spentToday||0), dayCap=Number(p.perDay||0);
+  const dPct=dayCap?Math.min(100,dayUsed/dayCap*100):0;
+  return `
+  <div class="card">
+    <div class="hero">
+      <div class="av">🤖</div>
+      <div class="id">
+        <h1>${esc(S.agentName)}</h1>
+        <div class="sub mono">${S.psyId||'—'}</div>
+      </div>
+      <span class="pill ${st.k}"><span class="dot"></span>${st.t}</span>
+    </div>
+    <p class="lead">${humanLead(p)}</p>
+    <div class="perms">
+      <div class="col can"><h3>✓ Allowed</h3><ul>${allow.map(a=>`<li><span class="mk">✓</span><span>${a}</span></li>`).join('')}</ul></div>
+      <div class="col cant"><h3>✕ Cannot</h3><ul>${cant.map(a=>`<li><span class="mk">✕</span><span>${a}</span></li>`).join('')}</ul></div>
+    </div>
+  </div>
+  <div class="card">
+    <h2 class="sec">Budget used</h2>
+    <p class="hint">How much of what you allowed the agent has spent.</p>
+    <div class="meters">
+      ${meter('Per payment', fmtPsy(p.perTransaction), 'PSY max', 100, 'mint', 'the ceiling on any one payment')}
+      ${meter('Today', fmtPsy(dayUsed)+' / '+fmtPsy(dayCap), 'PSY', dPct, dPct>90?'danger':dPct>66?'warn':'mint', fmtPsy(b.remainingDay!=null?b.remainingDay:(dayCap-dayUsed))+' PSY left today')}
+      ${p.perMonth!=null
+        ? meter('This month', fmtPsy(p.spentThisMonth)+' / '+fmtPsy(p.perMonth),'PSY',
+            p.perMonth?Math.min(100,Number(p.spentThisMonth)/Number(p.perMonth)*100):0,'mint',
+            fmtPsy((p.remainingMonth!=null)?p.remainingMonth:'')+' PSY left this period')
+        : meter('This month','No limit','',0,'mint','you didn’t set a 30-day cap')}
+    </div>
+  </div>
+  <div class="card">
+    <button class="btn ${p.active===false?'primary':'danger'} big" id="pausebtn">
+      ${p.active===false?'▶ Resume agent':'⏸ Pause agent — stop all spending now'}</button>
+    <p class="note" style="margin-top:12px">${p.active===false
+      ? 'Spending is frozen. Resume when you’re ready — nothing was lost.'
+      : 'One tap freezes every payment instantly. Your agent cannot undo this.'}</p>
+  </div>`;
+}
+
+// A human summary built from fields — never the server's raw method list.
+/** Report a failed policy save in place. An alert() gave the owner a raw
+ *  server string and no statement of what is now in force; the rules are
+ *  unchanged, and that is the part that matters. */
+function showPolicyError(detail){
+  const el=document.getElementById('saveerr');
+  if(!el){ return; }
+  el.textContent='Not saved — your existing rules are still in force.';
+  el.title=String(detail||'');
+  el.classList.remove('hidden');
+  setTimeout(()=>el.classList.add('hidden'), 8000);
+}
+function humanLead(p){
+  const parts=[`up to <b>${fmtPsy(p.perTransaction)} PSY</b> per payment`, `<b>${fmtPsy(p.perDay)} PSY</b> per day`];
+  if(p.perMonth!=null) parts.push(`<b>${fmtPsy(p.perMonth)} PSY</b> per 30 days`);
+  const who = p.allowedRecipientCount==null ? 'anyone you haven’t restricted'
+    : `your ${p.allowedRecipientCount} approved ${p.allowedRecipientCount===1?'recipient':'recipients'}`;
+  // The largest sentence on the page must agree with the status pill above it.
+  // It used to read "X can spend …" even when the pill said Paused or Inactive,
+  // so a worried owner who had just hit Pause was told their agent could still
+  // spend. State first, limits second.
+  if(p.active===false){
+    return `${esc(S.agentName)} is <b>paused</b>. It cannot spend anything until you resume it. `
+      + `Its limits are still ${parts.join(', ')}, and it may only pay ${who}.`;
+  }
+  if((p.activeSessions||0)===0){
+    return `${esc(S.agentName)} has <b>no active authorization</b> and cannot spend. `
+      + `When you authorize it again the limits are ${parts.join(', ')}, and it may only pay ${who}.`;
+  }
+  let s=`${esc(S.agentName)} can spend ${parts.join(', ')}, and only pay ${who}.`;
+  const sec=Number(p.sessionExpiresInSeconds||0);
+  if(sec>0){const h=Math.round(sec/3600); s+= h>=1?` Its access ends in about ${h} hour${h===1?'':'s'}.`:` Its access ends soon.`;}
+  s+=' <b>You can pause it anytime.</b>';
+  return s;
+}
+function meter(lbl,val,unit,pct,cls,ft){
+  return `<div class="meter"><div class="lbl">${lbl}</div>
+    <div class="v">${val}${unit?` <span class="u">${unit}</span>`:''}</div>
+    <div class="track"><div class="fill ${cls}" style="width:${pct}%"></div></div>
+    <div class="ft">${ft}</div></div>`;
+}
+
+function Policy(){
+  const p=S.policy;
+  const recips = (p.allowedRecipientCount==null) ? [] : (p._recips||[]); // list not exposed by server → editable additively
+  const ALLM=['simple_transfer','private_transfer','simple_claim','private_claim','x402_fetch','deposit','claim_deposit','withdraw'];
+  const on = new Set(p.allowedMethods||[]);
+  return `
+  <div class="card">
+    <h2 class="sec">💳 Spending limits</h2>
+    <p class="hint">In PSY. Tightening a limit takes effect immediately — you don’t need to restart the agent.</p>
+    <div class="field"><label>Maximum payment size</label><div class="fh">The most the agent can send in a single payment.</div>
+      <div class="inp"><input id="perpay" type="number" min="0" step="0.01" value="${(Number(p.perTransaction)/NANO)}"><span class="u">PSY</span></div></div>
+    <div class="field"><label>Daily budget</label><div class="fh">Total the agent can spend per day.</div>
+      <div class="inp"><input id="perday" type="number" min="0" step="0.1" value="${(Number(p.perDay)/NANO)}"><span class="u">PSY</span></div></div>
+    <div class="field"><label>Monthly budget <span style="color:var(--tx4);font-weight:400">(optional)</span></label><div class="fh">A rolling 30-day cap. Leave blank for none.</div>
+      <div class="inp"><input id="permonth" type="number" min="0" step="1" value="${p.perMonth!=null?(Number(p.perMonth)/NANO):''}"><span class="u">PSY</span></div></div>
+  </div>
+  <div class="card">
+    <h2 class="sec">👥 Who can this agent pay?</h2>
+    <p class="hint">Add the Psy IDs (or seller addresses) the agent is allowed to pay. Leave empty to let it pay anyone. The server keeps this list private from the agent — it only knows the count.</p>
+    <div id="recips">${recips.map(recipRow).join('')||''}</div>
+    <button class="btn" id="addrecip" style="margin-top:6px">+ Add a recipient</button>
+    <label class="tog" style="margin-top:12px" id="clearrec_l"><input type="checkbox" id="clearrec" style="margin:0"> Let this agent pay <b style="margin:0 3px">anyone</b> (remove the approved list)</label>
+    <p class="note" style="text-align:left;margin:12px 0 0 0">Your current list is kept private from the agent (it only sees the count), so it isn’t shown here. <b>Saving without entering anything leaves your list exactly as it is</b> — it is never cleared by accident. Enter recipients to replace it, or tick the box above to allow anyone.</p>
+  </div>
+  <div class="card">
+    <h2 class="sec">🧾 What kinds of actions?</h2>
+    <p class="hint">Turn capabilities on or off. Off means the agent cannot do it at all.</p>
+    <div class="toggles">${ALLM.map(m=>`
+      <div class="tog ${on.has(m)?'on':''}" data-m="${m}"><span class="sw">${on.has(m)?'✓':''}</span>${esc(methodLabel(m))}</div>`).join('')}</div>
+  </div>
+  <div class="card">
+    <div class="savebar">
+      <button class="btn primary" id="save">Save changes</button>
+      <span class="saved hidden" id="savedmsg">✓ Saved — the new rules are live</span>
+      <span class="hidden" id="saveerr" style="color:var(--danger);font-size:12.5px;font-weight:600"></span>
+    </div>
+    <p class="note" style="text-align:left;margin:12px 0 0 0">Every change here is an owner action, authorized by this control panel — the agent can never edit its own permissions.</p>
+  </div>`;
+}
+function recipRow(v){return `<div class="reciprow"><input type="text" value="${esc(v||'')}" placeholder="Psy-00000000 or a seller address"><button class="x" onclick="this.parentElement.remove()">✕</button></div>`;}
+
+function Activity(){
+  const pays=(S.activity||[]).map(e=>({...e,_k:'ok'}));
+  const blk=(S.blocked||[]).map(e=>({...e,_k:'block'}));
+  let all=[...pays,...blk].sort((a,b)=>(a.ageSeconds||0)-(b.ageSeconds||0));
+  if(filter==='allowed') all=all.filter(e=>e._k==='ok');
+  if(filter==='blocked') all=all.filter(e=>e._k==='block');
+  const rows = all.length ? all.map(evRow).join('') :
+    `<div class="empty"><div class="big">🕊️</div>${filter==='blocked'?'Nothing has been blocked yet — every attempt so far was within your rules.':'No activity yet. When your agent pays, claims, or gets blocked, it appears here.'}</div>`;
+  return `
+  <div class="card">
+    <h2 class="sec">🕑 Everything your agent did</h2>
+    <p class="hint">Payments it made, funds it received, and every attempt your rules blocked — with the reason. Read from your wallet’s own decision log, not the agent’s word for it.</p>
+    ${(S.activityDropped||S.blockedDropped)?`<p class="note">This log keeps the last 100 of each. ${(S.activityDropped||0)+(S.blockedDropped||0)} older row(s) have aged out — settled payments can still be found on chain, refused attempts cannot.</p>`:''}
+    <div class="filters">
+      ${['all','allowed','blocked'].map(f=>`<button class="fbtn ${filter===f?'on':''}" data-f="${f}">${f==='all'?'All':f==='allowed'?'Allowed':'Blocked'}</button>`).join('')}
+    </div>
+    ${rows}
+  </div>`;
+}
+function evRow(e){
+  if(e._k==='block'){
+    return `<div class="ev block"><div class="mk">⛔</div><div class="b">
+      <div class="r1"><span class="t">Tried: ${esc(methodLabel(e.method))} to ${esc(recipLabel(e.recipient))}</span><span class="amt">${fmtPsy(e.amount)} PSY</span></div>
+      <div class="why">Blocked — ${esc(humanReason(e.reason))} No money moved.</div>
+      <div class="meta"><span class="tag d">Blocked</span><span>· ${ago(e.ageSeconds)}</span></div></div></div>`;
+  }
+  const inbound=isInbound(e.method);
+  // A refunded row is an attempt that never moved money — the agent was allowed
+  // to go ahead and the payment then failed. It is kept (the owner should see
+  // it was tried) but must NOT read like a completed payment: rendering it the
+  // same way put a history of N payments next to a budget meter showing nothing
+  // spent, with no way to tell which was true.
+  if(e.refunded){
+    return `<div class="ev pay"><div class="mk">↩︎</div><div class="b">
+      <div class="r1"><span class="t">${esc(methodLabel(e.method))}${inbound?'':' to '+esc(recipLabel(e.recipient))}</span>
+        <span class="amt">${fmtPsy(e.amount)} PSY</span></div>
+      <div class="why">Didn't go through — the money never left, and your budget was given back.</div>
+      <div class="meta"><span class="tag d">Not sent</span><span>· ${ago(e.ageSeconds)}</span></div></div></div>`;
+  }
+  return `<div class="ev ${inbound?'in':'pay'}"><div class="mk">${inbound?'🎁':'💳'}</div><div class="b">
+    <div class="r1"><span class="t">${esc(methodLabel(e.method))}${inbound?'':' to '+esc(recipLabel(e.recipient))}</span>
+      <span class="amt">${inbound?'+':''}${fmtPsy(e.amount)} PSY</span></div>
+    <div class="why">${inbound?'Money received — no spending limit applies.':'Within your rules.'}</div>
+    <div class="meta"><span class="tag a">Allowed</span><span>· ${ago(e.ageSeconds)}</span></div></div></div>`;
+}
+// turn the engine's PSY-denominated reason into a friendly clause
+function humanReason(r){
+  r=String(r||'');
+  if(r.includes('per-transaction cap')){
+    const m=r.match(/of ([\d.,]+ PSY) is over the ([\d.,]+ PSY)/);
+    return m ? `it was ${m[1]}, over your ${m[2]} per-payment limit.` : 'it was over your per-payment limit.';
+  }
+  if(r.includes('allowlist')) return 'that recipient isn’t on your approved list.';
+  if(r.includes('daily cap')) return 'it would go over your daily budget.';
+  if(r.includes('30-day cap')) return 'it would go over your 30-day budget.';
+  if(r.includes('total budget')) return 'it would go over the agent’s lifetime budget.';
+  if(r.includes('paused')) return 'you had paused the agent.';
+  if(r.includes('not allowed')) return 'that kind of action is switched off.';
+  return r.endsWith('.') ? r : r+'.';
+}
+
+function Security(){
+  const p=S.policy;
+  const hasRecip=p.allowedRecipientCount!=null;
+  const paused=p.active===false;
+  const sess=(p.activeSessions||0)>0;
+  return `
+  ${S.ownerTokenSet?'':`<div class="banner warn">🔓 <div><b>Owner protection is partly off.</b> No owner passcode is set, so the agent's own server can un-pause a paused policy and mint itself a fresh session. It still cannot raise a limit, approve a payee, or grant itself a new action — those are refused outright without a passcode. Set <span class="mono">PSY_MCP_OWNER_TOKEN</span> on both this dashboard and the agent to close the rest.</div></div>`}
+  <div class="card">
+    <h2 class="sec">🛡️ Protections in place</h2>
+    <p class="hint">These guardrails are enforced in the wallet, below the AI. A prompt or a jailbreak cannot switch them off.</p>
+    <ul class="prot">
+      ${prot(true,'Payment size limit',`No single payment over ${fmtPsy(p.perTransaction)} PSY`)}
+      ${prot(true,'Daily & monthly budget',`Hard stop at ${fmtPsy(p.perDay)} PSY per day${p.perMonth!=null?`, ${fmtPsy(p.perMonth)} per 30 days`:''}`)}
+      ${prot(hasRecip,'Approved recipients only', hasRecip?`Refuses anyone outside your ${p.allowedRecipientCount}-recipient list`:'Off — the agent may pay anyone. Add recipients under Permissions.')}
+      ${prot(sess,'Session control', sess?'Access auto-expires; you can revoke it anytime':'No active session — the agent cannot spend right now')}
+      ${prot(true,'Emergency pause','You can freeze all spending in one tap')}
+    </ul>
+  </div>
+  <div class="card">
+    <h2 class="sec">🚨 Emergency controls</h2>
+    <p class="hint">If something looks wrong, act here. Each takes effect immediately.</p>
+    <div style="display:flex;flex-direction:column;gap:10px">
+      <button class="btn ${paused?'primary':'danger'} big" id="pausebtn">${paused?'▶ Resume agent':'⏸ Pause agent — freeze all spending'}</button>
+      <button class="btn big" id="revokebtn">🔑 Revoke access — end the agent’s spending session</button>
+    </div>
+    <p class="note" style="text-align:left;margin:14px 0 0 0"><b>Pause</b> keeps the setup but stops payments — reversible. <b>Revoke access</b> ends the session entirely; the agent must be re-authorized to spend again. This is your "rotate authorization".</p>
+  </div>`;
+}
+function prot(on,t,s){return `<li><span class="ic ${on?'on':'off'}">${on?'✓':'○'}</span><div><b>${t}</b><span>${s}</span></div></li>`;}
+
+// ── events ────────────────────────────────────────────────────────────
+function wire(){
+  document.querySelectorAll('[data-p]').forEach(b=>b.onclick=()=>{page=b.dataset.p;policyDirty=false;
+    document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('on',t===b));render();});
+  const pb=document.getElementById('pausebtn');
+  if(pb) pb.onclick=async()=>{pb.disabled=true;pb.textContent='Working…';
+    await act(S.policy.active===false?'/api/resume':'/api/pause');};
+  const rb=document.getElementById('revokebtn');
+  if(rb) rb.onclick=async()=>{if(!confirm('End the agent’s spending session? It will need to be re-authorized to spend again.'))return;
+    rb.disabled=true;rb.textContent='Working…';await act('/api/revoke');};
+  const add=document.getElementById('addrecip');
+  if(add) add.onclick=()=>{document.getElementById('recips').insertAdjacentHTML('beforeend',recipRow(''));markPolicyDirty();};
+  // Any edit at all pauses the background refresh — see policyDirty.
+  ['perpay','perday','permonth','clearrec'].forEach(id=>{
+    const el=document.getElementById(id);
+    if(el){ el.addEventListener('input',markPolicyDirty); el.addEventListener('change',markPolicyDirty); }
+  });
+  const recipsBox=document.getElementById('recips');
+  if(recipsBox) recipsBox.addEventListener('input',markPolicyDirty);
+  // Scope to `.tog[data-m]`. The "let this agent pay anyone" control also
+  // carries class `tog` but has no `.sw` child and no data-m, so the unscoped
+  // binding threw TypeError on `.sw` the moment it was clicked — AFTER already
+  // adding `.on`, which then put `undefined` into the methods list below and
+  // posted a malformed policy. On the screen that decides what an AI may spend.
+  document.querySelectorAll('.tog[data-m]').forEach(t=>t.onclick=()=>{t.classList.toggle('on');
+    const sw=t.querySelector('.sw'); if(sw) sw.textContent=t.classList.contains('on')?'✓':'';
+    markPolicyDirty();});
+  const save=document.getElementById('save');
+  if(save) save.onclick=async()=>{
+    const recips=[...document.querySelectorAll('#recips input')].map(i=>i.value.trim()).filter(Boolean);
+    const methods=[...document.querySelectorAll('.tog[data-m].on')].map(t=>t.dataset.m).filter(Boolean);
+    if(!methods.length){
+      alert('Leave at least one action switched on.\n\nTo stop the agent entirely, use Pause (reversible) or Revoke access on the Security tab — turning every action off here would not be applied.');
+      return;
+    }
+    const body={perPaymentPsy:val('perpay'),perDayPsy:val('perday'),perMonthPsy:val('permonth'),methods};
+    // Recipients are only touched on an EXPLICIT intent: entered names replace
+    // the list, the checkbox clears it. Otherwise the key is omitted and the
+    // server leaves the allow-list untouched — a budget edit never widens it.
+    const clear=document.getElementById('clearrec');
+    if(clear && clear.checked) body.clearRecipients=true;
+    else if(recips.length) body.recipients=recips;
+    save.disabled=true;save.textContent='Saving…';
+    const r=await act('/api/policy',body);
+    save.disabled=false;save.textContent='Save changes';
+    const m=document.getElementById('savedmsg');
+    if(r&&r.error){ showPolicyError(r.error); }
+    else {policyDirty=false; if(m){m.classList.remove('hidden');setTimeout(()=>m.classList.add('hidden'),3000);}}
+  };
+}
+const val=id=>{const e=document.getElementById(id);return e?e.value:'';};
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+// theme
+document.getElementById('theme').onclick=()=>{
+  const r=document.documentElement;r.dataset.theme=r.dataset.theme==='dark'?'light':'dark';};
+
+load();
+// Keep the panel live — but never mid-onboarding (it would clobber the form).
+setInterval(()=>{
+  if(S && S.needsSetup) return;                 // never clobber onboarding
+  if(page==='policy' && policyDirty) return;    // never clobber an in-progress edit
+  load();
+}, 8000);
+</script>
+</body>
+</html>

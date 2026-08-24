@@ -159,7 +159,6 @@ pub trait RealmEdgeRpc<F, Hash, JobId, ZKProof> {
         checkpoint_id: u64,
         user_id: u64,
         contract_id: u32,
-        height: u8,
         leaf_id: u64,
     ) -> RpcResult<Hash>;
 
@@ -183,7 +182,6 @@ pub trait RealmEdgeRpc<F, Hash, JobId, ZKProof> {
         checkpoint_id: u64,
         user_id: u64,
         contract_id: u32,
-        height: u8,
         leaf_id: u64,
     ) -> RpcResult<MerkleProofCore<Hash>>;
 

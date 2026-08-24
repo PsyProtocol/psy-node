@@ -19,6 +19,7 @@ pub fn compile_method(source: &str, method_name: &str) -> DPNFunctionCircuitDefi
     let output = compile(source).expect("compilation should succeed");
     let method = output
         .abi
+        .contract
         .methods
         .iter()
         .find(|m| m.name == method_name)

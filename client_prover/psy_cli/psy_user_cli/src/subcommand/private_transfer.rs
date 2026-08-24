@@ -41,6 +41,15 @@ use crate::subcommand::{
 };
 const NOTE_TREE_HEIGHT: usize = 20; // 2^20 = 1048576 notes
 
+async fn get_contract_state_tree_height(provider: &RpcProvider, contract_id: u64) -> anyhow::Result<u8> {
+    let height = provider
+        .get_contract_leaf_data(contract_id)
+        .await?
+        .state_tree_height
+        .to_canonical_u64();
+    u8::try_from(height).with_context(|| format!("invalid state tree height {} for contract {}", height, contract_id))
+}
+
 #[derive(Clone)]
 struct GenerateNoteProofInput {
     rpc_config: String,
@@ -234,6 +243,7 @@ async fn wait_checkpoint_with_note_root(
     expected_note_root: QHashOut<F>,
 ) -> anyhow::Result<u64> {
     let user_provider = provider.with_user_id_owned(sender_user_id);
+    let contract_state_tree_height = get_contract_state_tree_height(provider, contract_id).await?;
     let mut next_checkpoint_to_check = min_checkpoint_id;
 
     for _ in 0..120 {
@@ -250,7 +260,7 @@ async fn wait_checkpoint_with_note_root(
                     next_checkpoint_to_check,
                     sender_user_id,
                     contract_id as u32,
-                    psy_config::network_constants::MAX_CONTRACT_STATE_TREE_HEIGHT as u8,
+                    contract_state_tree_height,
                     note_root_slot,
                 )
                 .await
@@ -294,12 +304,13 @@ async fn wait_checkpoint_with_note_slots_change(
     checkpoint_before: u64,
 ) -> anyhow::Result<u64> {
     let user_provider = provider.with_user_id_owned(sender_user_id);
+    let contract_state_tree_height = get_contract_state_tree_height(provider, contract_id).await?;
     let baseline_count = user_provider
         .get_user_contract_state_tree_merkle_proof(
             checkpoint_before,
             sender_user_id,
             contract_id as u32,
-            psy_config::network_constants::MAX_CONTRACT_STATE_TREE_HEIGHT as u8,
+            contract_state_tree_height,
             note_count_slot,
         )
         .await?
@@ -309,7 +320,7 @@ async fn wait_checkpoint_with_note_slots_change(
             checkpoint_before,
             sender_user_id,
             contract_id as u32,
-            psy_config::network_constants::MAX_CONTRACT_STATE_TREE_HEIGHT as u8,
+            contract_state_tree_height,
             note_root_slot,
         )
         .await?
@@ -366,7 +377,7 @@ async fn wait_checkpoint_with_note_slots_change(
                 latest_observable,
                 sender_user_id,
                 contract_id as u32,
-                psy_config::network_constants::MAX_CONTRACT_STATE_TREE_HEIGHT as u8,
+                contract_state_tree_height,
                 note_count_slot,
             )
             .await
@@ -383,7 +394,7 @@ async fn wait_checkpoint_with_note_slots_change(
                 latest_observable,
                 sender_user_id,
                 contract_id as u32,
-                psy_config::network_constants::MAX_CONTRACT_STATE_TREE_HEIGHT as u8,
+                contract_state_tree_height,
                 note_root_slot,
             )
             .await
@@ -529,6 +540,7 @@ async fn build_membership_proof_from_previous_checkpoint(
     checkpoint_id: u64,
 ) -> anyhow::Result<MerkleProofCore<QHashOut<F>>> {
     let user_provider = provider.with_user_id_owned(sender_user_id);
+    let contract_state_tree_height = get_contract_state_tree_height(provider, contract_id).await?;
 
     let note_count_slot = note_root_slot.saturating_sub(1);
     let note_count_proof = user_provider
@@ -536,7 +548,7 @@ async fn build_membership_proof_from_previous_checkpoint(
             checkpoint_id,
             sender_user_id,
             contract_id as u32,
-            psy_config::network_constants::MAX_CONTRACT_STATE_TREE_HEIGHT as u8,
+            contract_state_tree_height,
             note_count_slot,
         )
         .await?;
@@ -558,7 +570,7 @@ async fn build_membership_proof_from_previous_checkpoint(
                 checkpoint_id,
                 sender_user_id,
                 contract_id as u32,
-                psy_config::network_constants::MAX_CONTRACT_STATE_TREE_HEIGHT as u8,
+                contract_state_tree_height,
                 slot,
             )
             .await?;
@@ -609,6 +621,7 @@ async fn run_note_proof_with_membership_proof(
     let sender_sk = QHashOut::<F>::from_str(&input.private_key).map_err(|e| anyhow::anyhow!("Invalid private key: {}", e))?;
 
     let provider = RpcProvider::new_with_config(&rpc_config)?;
+    let contract_state_tree_height = get_contract_state_tree_height(&provider, input.contract_id).await?;
     let checkpoint_id = if input.checkpoint_id == u64::MAX {
         provider.get_latest_block_state().await?.checkpoint_id
     } else {
@@ -640,7 +653,7 @@ async fn run_note_proof_with_membership_proof(
             checkpoint_id,
             sender_user_id,
             input.contract_id as u32,
-            psy_config::network_constants::MAX_CONTRACT_STATE_TREE_HEIGHT as u8,
+            contract_state_tree_height,
             input.note_root_slot,
         )
         .await
@@ -709,7 +722,7 @@ async fn run_note_proof_with_membership_proof(
     let circuit = PrivateNoteInclusionCircuit::<C, D>::new(
         psy_config::network_constants::GLOBAL_USER_TREE_HEIGHT as usize,
         psy_config::network_constants::GLOBAL_CONTRACT_TREE_HEIGHT as usize,
-        psy_config::network_constants::MAX_CONTRACT_STATE_TREE_HEIGHT as usize,
+        psy_config::network_constants::TOKEN_CONTRACT_STATE_TREE_HEIGHT as usize,
         NOTE_TREE_HEIGHT,
     );
     let fingerprint = circuit.get_fingerprint();

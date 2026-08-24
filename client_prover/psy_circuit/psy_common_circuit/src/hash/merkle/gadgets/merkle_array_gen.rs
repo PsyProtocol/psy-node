@@ -1,6 +1,6 @@
 use plonky2::{
     field::extension::Extendable,
-    hash::hash_types::RichField,
+    hash::hash_types::{HashOutTarget, RichField},
     iop::{
         generator::{GeneratedValues, SimpleGenerator},
         target::Target,
@@ -62,22 +62,31 @@ pub fn enforce_merkle_array_helper_new_values_2_bit<F: RichField + Extendable<D>
     values_count: usize,
     merkle_proofs: &[MerkleProofGadget],
 ) -> Vec<Target> {
+    let merkle_values = merkle_proofs.iter().map(|proof| proof.value).collect::<Vec<_>>();
+    enforce_merkle_array_values_2_bit(builder, offset_lower_2_bits, values_count, &merkle_values)
+}
+
+pub fn enforce_merkle_array_values_2_bit<F: RichField + Extendable<D>, const D: usize>(
+    builder: &mut CircuitBuilder<F, D>,
+    offset_lower_2_bits: Target,
+    values_count: usize,
+    merkle_proof_values: &[HashOutTarget],
+) -> Vec<Target> {
     // IMPORTANT SECURITY INFO: we assume you ALREADY range checked
     // offset_lower_2_bits to be less than 4
 
-    if values_count == merkle_proofs.len() * 4 {
+    if values_count == merkle_proof_values.len() * 4 {
         // only enough values if it is zero aligned
         builder.assert_zero(offset_lower_2_bits);
-        return merkle_array_helper_new_values(builder, offset_lower_2_bits, values_count, merkle_proofs);
     }
 
-    assert!(values_count <= merkle_proofs.len() * 4, "not enough merkle proofs to use an array helper");
+    assert!(values_count <= merkle_proof_values.len() * 4, "not enough merkle proofs to use an array helper");
 
     let values = builder.add_virtual_targets(values_count);
 
-    let mut merkle_values = Vec::with_capacity(merkle_proofs.len() * 4);
-    for p in merkle_proofs.iter() {
-        merkle_values.extend_from_slice(&p.value.elements);
+    let mut merkle_values = Vec::with_capacity(merkle_proof_values.len() * 4);
+    for value in merkle_proof_values {
+        merkle_values.extend_from_slice(&value.elements);
     }
 
     let offset_is_0 = builder.is_zero(offset_lower_2_bits);

@@ -56,6 +56,10 @@ pub struct QExecContext {
 
 impl QExecContext {
     pub fn new() -> Self {
+        Self::new_with_contract_state_tree_height(32)
+    }
+
+    pub fn new_with_contract_state_tree_height(contract_state_tree_height: u16) -> Self {
         QExecContext {
             state_cmd_store: DPNStateCommandStore::new(),
             store: SymFeltStore::new(),
@@ -65,7 +69,7 @@ impl QExecContext {
             condition_stack: vec![],
             current_condition: SymFeltRef::new_valueless(DPNOpType::ConstantTrue),
             external_function_call_count: 0,
-            contract_state_tree_height: 32,
+            contract_state_tree_height,
             set_state_command_count: 0,
             events: vec![],
         }
@@ -136,7 +140,7 @@ impl QExecContext {
 
     fn create_contract_state_get_ref(
         &mut self,
-        contract_state_tree_height: u16,
+        contract_state_tree_height: SymFeltRef,
         contract_id: SymFeltRef,
         user_id: SymFeltRef,
         sub_slot_index: SymFeltRef,
@@ -154,13 +158,13 @@ impl QExecContext {
             if length == 1 {
                 self.resolve_state_cmd_base(DPNStateCmd::get_self_user_external_contract_state_slot_single(
                     contract_id,
-                    contract_state_tree_height as u8,
+                    contract_state_tree_height,
                     sub_slot_index,
                 ))
             } else {
                 self.resolve_state_cmd_base(DPNStateCmd::get_self_user_external_contract_state_slot_range(
                     contract_id,
-                    contract_state_tree_height as u8,
+                    contract_state_tree_height,
                     sub_slot_index,
                     length,
                 ))
@@ -171,7 +175,7 @@ impl QExecContext {
                     DPNStateCmdGetOtherUserContractStateSlotSingle {
                         contract_id,
                         sub_slot_index,
-                        contract_state_tree_height: contract_state_tree_height as u8,
+                        contract_state_tree_height,
                         user_id,
                     },
                 ))
@@ -180,7 +184,7 @@ impl QExecContext {
                     DPNStateCmdGetOtherUserContractStateSlotRange {
                         contract_id,
                         sub_slot_index,
-                        contract_state_tree_height: contract_state_tree_height as u8,
+                        contract_state_tree_height,
                         user_id,
                         length,
                     },
@@ -842,6 +846,12 @@ impl DPNContext<SymFeltRef> for QExecContext {
         self.op_target_at_array::<4>(b)
     }
 
+    fn get_contract_state_tree_height(&mut self, contract_id: SymFeltRef) -> SymFeltRef {
+        let cmd = DPNStateCmd::GetContractLeaf(DPNStateCmdGetContractLeaf { contract_id });
+        let contract_leaf = self.resolve_state_cmd_base(cmd);
+        self.op_target_at(contract_leaf, 12)
+    }
+
     fn get_caller_contract_id(&mut self) -> SymFeltRef {
         SymFeltRef::new_valueless(DPNOpType::GetCallerContractId)
     }
@@ -964,13 +974,19 @@ impl DPNContext<SymFeltRef> for QExecContext {
         [roots[16].clone(), roots[17].clone(), roots[18].clone(), roots[19].clone()]
     }
 
-    fn op_get_state_felt(&mut self, contract_state_tree_height: u16, contract_id: SymFeltRef, user_id: SymFeltRef, index: SymFeltRef) -> SymFeltRef {
+    fn op_get_state_felt(
+        &mut self,
+        contract_state_tree_height: SymFeltRef,
+        contract_id: SymFeltRef,
+        user_id: SymFeltRef,
+        index: SymFeltRef,
+    ) -> SymFeltRef {
         self.create_contract_state_get_ref(contract_state_tree_height, contract_id, user_id, index, 1)
     }
 
     fn op_set_state_felt(&mut self, index: SymFeltRef, value: SymFeltRef) -> SymFeltRef {
         let core_ref = self.op_get_state_felt(
-            self.contract_state_tree_height,
+            SymFeltRef::new_constant(self.contract_state_tree_height as u64),
             SymFeltRef::new_valueless(DPNOpType::GetContractId),
             SymFeltRef::new_valueless(DPNOpType::GetUserId),
             index,
@@ -981,7 +997,7 @@ impl DPNContext<SymFeltRef> for QExecContext {
         let condition = self.get_current_condition();
         if condition.eq(&SymFeltRef::constant_false()) {
             self.op_get_state_felt(
-                self.contract_state_tree_height,
+                SymFeltRef::new_constant(self.contract_state_tree_height as u64),
                 SymFeltRef::new_valueless(DPNOpType::GetContractId),
                 SymFeltRef::new_valueless(DPNOpType::GetUserId),
                 index,
@@ -1114,17 +1130,17 @@ impl DPNContext<SymFeltRef> for QExecContext {
         contract_id: SymFeltRef,
         slot_index: SymFeltRef,
     ) -> [SymFeltRef; 4] {
-        let contract_state_tree_height_value = match contract_state_tree_height.get_op_type() {
-            DPNOpType::Constant => contract_state_tree_height.get_constant_value() as u8,
-            DPNOpType::GetContractId => self.contract_state_tree_height as u8,
-            _ => panic!("contract_state_tree_height must be a constant"),
+        let contract_state_tree_height = if contract_id.get_op_type() == DPNOpType::GetContractId {
+            SymFeltRef::new_constant(self.contract_state_tree_height as u64)
+        } else {
+            contract_state_tree_height
         };
 
         let b = self.resolve_state_cmd_base(DPNStateCmd::GetSelfUserExternalContractStateSlotHash(
             DPNStateCmdGetSelfUserExternalContractStateSlotHash {
                 slot_index,
                 contract_id,
-                contract_state_tree_height: contract_state_tree_height_value,
+                contract_state_tree_height,
             },
         ));
         [
@@ -1142,22 +1158,17 @@ impl DPNContext<SymFeltRef> for QExecContext {
         contract_id: SymFeltRef,
         slot_index: SymFeltRef,
     ) -> [SymFeltRef; 4] {
-        let contract_state_tree_height_value = if contract_id.get_op_type() == DPNOpType::GetContractId {
-            self.contract_state_tree_height as u8
+        let contract_state_tree_height = if contract_id.get_op_type() == DPNOpType::GetContractId {
+            SymFeltRef::new_constant(self.contract_state_tree_height as u64)
         } else {
-            assert_eq!(
-                contract_state_tree_height.get_op_type(),
-                DPNOpType::Constant,
-                "contract_state_tree_height must be a constant"
-            );
-            contract_state_tree_height.get_constant_value() as u8
+            contract_state_tree_height
         };
         let b = self.resolve_state_cmd_base(DPNStateCmd::GetOtherUserContractStateSlotHash(
             DPNStateCmdGetOtherUserContractStateSlotHash {
                 slot_index,
                 user_id,
                 contract_id,
-                contract_state_tree_height: contract_state_tree_height_value,
+                contract_state_tree_height,
             },
         ));
         [
@@ -1171,7 +1182,7 @@ impl DPNContext<SymFeltRef> for QExecContext {
     fn get_state_range_at(&mut self, sub_slot_index: SymFeltRef, length: SymFeltRef) -> Vec<SymFeltRef> {
         assert!(length.is_constant_type(), "range length must be constant");
         let b = self.create_contract_state_get_ref(
-            self.contract_state_tree_height,
+            SymFeltRef::new_constant(self.contract_state_tree_height as u64),
             SymFeltRef::new_valueless(DPNOpType::GetContractId),
             SymFeltRef::new_valueless(DPNOpType::GetUserId),
             sub_slot_index,
@@ -1188,19 +1199,14 @@ impl DPNContext<SymFeltRef> for QExecContext {
         sub_slot_index: SymFeltRef,
         length: SymFeltRef,
     ) -> Vec<SymFeltRef> {
-        let contract_state_tree_height_value = if contract_id.get_op_type() == DPNOpType::GetContractId {
-            self.contract_state_tree_height as u8
+        let contract_state_tree_height = if contract_id.get_op_type() == DPNOpType::GetContractId {
+            SymFeltRef::new_constant(self.contract_state_tree_height as u64)
         } else {
-            assert_eq!(
-                contract_state_tree_height.get_op_type(),
-                DPNOpType::Constant,
-                "contract_state_tree_height must be a constant"
-            );
-            contract_state_tree_height.get_constant_value() as u8
+            contract_state_tree_height
         };
         assert!(length.is_constant_type(), "range length must be constant");
         let b = self.create_contract_state_get_ref(
-            contract_state_tree_height_value as u16,
+            contract_state_tree_height,
             contract_id,
             user_id,
             sub_slot_index,
@@ -1244,20 +1250,15 @@ impl DPNContext<SymFeltRef> for QExecContext {
         base_offset: SymFeltRef,
         capacity: SymFeltRef,
     ) -> [SymFeltRef; 4] {
-        let contract_state_tree_height_value = if contract_id.get_op_type() == DPNOpType::GetContractId {
-            self.contract_state_tree_height as u8
+        let contract_state_tree_height = if contract_id.get_op_type() == DPNOpType::GetContractId {
+            SymFeltRef::new_constant(self.contract_state_tree_height as u64)
         } else {
-            assert_eq!(
-                contract_state_tree_height.get_op_type(),
-                DPNOpType::Constant,
-                "contract_state_tree_height must be a constant"
-            );
-            contract_state_tree_height.get_constant_value() as u8
+            contract_state_tree_height
         };
         let b = self.resolve_state_cmd_base(DPNStateCmd::get_other_user_imt_contract_state_value(
             user_id,
             contract_id,
-            contract_state_tree_height_value,
+            contract_state_tree_height,
             base_offset,
             capacity,
             key,
@@ -1279,20 +1280,15 @@ impl DPNContext<SymFeltRef> for QExecContext {
         base_offset: SymFeltRef,
         capacity: SymFeltRef,
     ) -> SymFeltRef {
-        let height_value = if contract_id.get_op_type() == DPNOpType::GetContractId {
-            self.contract_state_tree_height as u8
+        let contract_state_tree_height = if contract_id.get_op_type() == DPNOpType::GetContractId {
+            SymFeltRef::new_constant(self.contract_state_tree_height as u64)
         } else {
-            assert_eq!(
-                contract_state_tree_height.get_op_type(),
-                DPNOpType::Constant,
-                "contract_state_tree_height must be a constant"
-            );
-            contract_state_tree_height.get_constant_value() as u8
+            contract_state_tree_height
         };
         let b = self.resolve_state_cmd_base(DPNStateCmd::contains_other_user_imt_contract_state_value(
             user_id,
             contract_id,
-            height_value,
+            contract_state_tree_height,
             base_offset,
             capacity,
             key,

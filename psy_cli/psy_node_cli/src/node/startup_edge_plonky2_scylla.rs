@@ -47,7 +47,10 @@ pub async fn run_startup_plonky2_scylla_edge_node(config: &CoordinatorEdgeStartC
         realm_id: config.coordinator_id as u32,
         realm_sub_id: config.coordinator_sub_id,
     };
-    let proof_verifier = Arc::new(PsyPlonky2ZKVerifier::<C, D>::for_network(config.network)?);
+    // Edge only verifies proofs. Load the generated verifier/common-data cache
+    // instead of rebuilding every coordinator and state-layout circuit at
+    // startup (the latter includes all layout aggregation levels).
+    let proof_verifier = Arc::new(PsyPlonky2ZKVerifier::<C, D>::from_cached());
 /*
 
     pub fn new(
@@ -122,7 +125,10 @@ pub async fn run_startup_plonky2_scylla_realm_edge_node(config: &RealmEdgeStartC
         realm_id: config.realm_id as u32,
         realm_sub_id: config.realm_sub_id,
     };
-    let proof_verifier = Arc::new(PsyPlonky2ZKVerifier::<C, D>::for_network(config.network)?);
+    // Edge only verifies proofs. Load the generated verifier/common-data cache
+    // instead of rebuilding every coordinator and state-layout circuit at
+    // startup (the latter includes all layout aggregation levels).
+    let proof_verifier = Arc::new(PsyPlonky2ZKVerifier::<C, D>::from_cached());
     let chain_id = config.network.get_chain_id();
 /*
 

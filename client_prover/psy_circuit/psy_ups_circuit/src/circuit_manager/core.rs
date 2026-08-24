@@ -30,7 +30,7 @@ use psy_common_circuit::{
     },
 };
 use psy_config::network_constants::{
-    GLOBAL_CONTRACT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT, MAX_CONTRACT_STATE_TREE_HEIGHT, PRIVATE_NOTE_TREE_HEIGHT,
+    GLOBAL_CONTRACT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT, PRIVATE_NOTE_TREE_HEIGHT, TOKEN_CONTRACT_STATE_TREE_HEIGHT,
     UPS_CIRCUIT_WHITELIST_TREE_HEIGHT, UPS_SESSION_PROOF_TREE_HEIGHT,
 };
 use psy_crypto::{
@@ -187,7 +187,7 @@ where
             PrivateNoteInclusionCircuit::<C, D>::new(
                 GLOBAL_USER_TREE_HEIGHT as usize,
                 GLOBAL_CONTRACT_TREE_HEIGHT as usize,
-                MAX_CONTRACT_STATE_TREE_HEIGHT as usize,
+                TOKEN_CONTRACT_STATE_TREE_HEIGHT as usize,
                 PRIVATE_NOTE_TREE_HEIGHT,
             )
         })
@@ -234,26 +234,31 @@ where
     C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasherWithMarkedLeaf<HashOut<C::F>> + MerkleZeroHasherWithMarkedLeaf<QHashOut<C::F>>,
 {
     async fn register_contract_method_circuit(&self, contract_id: u64, contract_code: &ContractCodeDefinition, fn_id: u32) -> anyhow::Result<()> {
-        // Fast-path: already cached
-        if self.contract_circuits.get(&(contract_id, fn_id)).is_some() {
-            return Ok(());
-        }
-
-        // Prepare function definition (done outside get_with to avoid
-        // re-executing it for concurrent callers that lose the race)
         let func = contract_code
             .functions
             .get(fn_id as usize)
             .ok_or_else(|| anyhow::anyhow!("contract {} method {} is not found", contract_id, fn_id))?;
         let dapen_fc = cfc_code_definition_to_dapen_fc(func)?;
         let fn_name = dapen_fc.name.clone();
+        let state_tree_height = contract_code.state_tree_height as usize;
+
+        // Fast-path: already cached and still valid (function definition and
+        // state tree height are the inputs that determine the compiled circuit).
+        if let Some(cached_circuit) = self.contract_circuits.get(&(contract_id, fn_id)) {
+            if cached_circuit.fn_def == dapen_fc
+                && cached_circuit.fn_builder_gadget.state_reader.contract_state_tree_height == state_tree_height
+            {
+                return Ok(());
+            }
+            // Stale: function definition or state tree height changed.
+            self.contract_circuits.remove(&(contract_id, fn_id)); 
+        }
 
         tracing::info!("register contract {} function {}", contract_id, fn_name);
 
         // Use get_or_insert_with for atomic check-then-insert: only one thread
         // compiles per (contract_id, fn_id); all others block and receive the
         // cached Arc via the guard mechanism.
-        let state_tree_height = contract_code.state_tree_height as usize;
         self.contract_circuits
             .get_or_insert_with(&(contract_id, fn_id), || {
                 Ok::<Arc<DapenContractFunctionCircuit<C, D>>, std::convert::Infallible>(Arc::new(DapenContractFunctionCircuit::<C, D>::new(

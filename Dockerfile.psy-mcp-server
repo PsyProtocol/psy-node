@@ -1,0 +1,45 @@
+# Psy MCP Wallet — multi-stage build (Linux binary compiled INSIDE the builder;
+# the host binary is macOS Mach-O and cannot be copied into a Linux image).
+#
+# Build (from repo root — needs the FULL workspace, ~30-60 min cold, cached after):
+#   docker build -f client_prover/psy_mcp_server/Dockerfile -t psy-mcp-server:staging .
+#
+# Runtime needs ZERO local config / services — staging config baked in. Env:
+#   PSY_MCP_OWNER_TOKEN   owner gate (required for owner tools)
+#   PSY_MCP_KEY_FILE      optional key backup; omit to create a fresh wallet
+# Keystore at /app/keys (VOLUME) survives restarts; mount a host dir to keep
+# identities across `docker rm`.
+
+FROM rust:1.88.0-slim AS builder
+WORKDIR /build
+# The workspace declares the gnark deps over SSH (ssh://git@github.com/...),
+# which needs credentials the container does not have. The repo is publicly
+# readable over HTTPS, so rewrite SSH→HTTPS via git's insteadOf.
+# gnark-plonky2-verifier-ffi is a Rust+Go hybrid: build.rs compiles cmd/main.go
+# into a c-archive (needs golang) then bindgen generates bindings (needs libclang).
+RUN apt-get update -y && apt-get install -y --no-install-recommends git ca-certificates \
+    pkg-config libssl-dev protobuf-compiler libclang-dev curl \
+    && rm -rf /var/lib/apt/lists/* \
+# Debian bookworm ships golang 1.19, which rejects go.mod's `toolchain`
+# directive (a 1.21+ feature) — install upstream Go instead.
+RUN curl -fsSL https://golang.google.cn/dl/go1.24.5.linux-arm64.tar.gz | tar -C /usr/local -xz \
+    && ln -s /usr/local/go/bin/go /usr/local/bin/go \
+    && git config --global url."https://github.com/".insteadOf "ssh://git@github.com/" \
+    && git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+COPY . .
+RUN cargo build --release -p psy_mcp_server
+
+FROM debian:bookworm-slim
+RUN apt-get update -y && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=builder /build/target/release/psy-mcp-server /app/psy-mcp-server
+
+# Runtime config is supplied by the host so changing defaultNetwork does not
+# require rebuilding the image:
+#   -v "$HOME/.psy/config.json:/root/.psy/config.json:ro"
+ENV PSY_CONFIG=/root/.psy/config.json \
+    PSY_MCP_KEYSTORE_DIR=/app/keys
+VOLUME /app/keys
+ENTRYPOINT ["/app/psy-mcp-server"]

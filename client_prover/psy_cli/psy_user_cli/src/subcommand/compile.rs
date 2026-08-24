@@ -48,7 +48,7 @@ pub async fn run(args: CompileArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Full output: contract_code.bin, abi.json, circuit_defs.json
+    // Full output: contract_code.bin, abi.json, circuit_defs.json, compilation_artifact.json
     let code_bytes = output.to_bytes()?;
     let code_path = format!("{}/contract_code.bin", output_dir);
     fs::write(&code_path, &code_bytes).map_err(|error| anyhow::anyhow!("failed to write contract code {}: {}", code_path, error))?;
@@ -64,12 +64,18 @@ pub async fn run(args: CompileArgs) -> anyhow::Result<()> {
     fs::write(&defs_path, &defs_json).map_err(|error| anyhow::anyhow!("failed to write circuit definitions {}: {}", defs_path, error))?;
     tracing::info!("circuit definitions written to {}", defs_path);
 
+    let artifact_json = output.to_compilation_artifact_json()?;
+    let artifact_path = format!("{}/compilation_artifact.json", output_dir);
+    fs::write(&artifact_path, &artifact_json).map_err(|error| anyhow::anyhow!("failed to write compilation artifact {}: {}", artifact_path, error))?;
+    tracing::info!("compilation artifact written to {}", artifact_path);
+
     println!("Compilation successful:");
     println!("  Methods: {}", output.method_count());
     println!("  State tree height: {}", output.state_tree_height());
     println!("  Contract code: {}", code_path);
     println!("  ABI: {}", abi_path);
     println!("  Circuit definitions: {}", defs_path);
+    println!("  Compilation artifact: {}", artifact_path);
 
     Ok(())
 }

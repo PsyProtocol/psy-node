@@ -40,7 +40,7 @@ fn test_compile_and_execute_set_value() {
     let output = compile(source).expect("compilation should succeed");
     assert_eq!(output.method_count(), 1);
 
-    let method = output.abi.methods.iter().find(|m| m.name == "set_value").unwrap();
+    let method = output.abi.contract.methods.iter().find(|m| m.name == "set_value").unwrap();
     let circuit = output.circuit_definitions.iter().find(|d| d.method_id == method.method_id).unwrap();
 
     let state = InMemoryStateBackend::new();
@@ -73,7 +73,7 @@ fn test_compile_and_execute_with_require_pass() {
     "#;
 
     let output = compile(source).expect("compilation should succeed");
-    let method = output.abi.methods.iter().find(|m| m.name == "deposit").unwrap();
+    let method = output.abi.contract.methods.iter().find(|m| m.name == "deposit").unwrap();
     let circuit = output.circuit_definitions.iter().find(|d| d.method_id == method.method_id).unwrap();
 
     let state = InMemoryStateBackend::new();
@@ -105,7 +105,7 @@ fn test_compile_and_execute_with_require_fail() {
     "#;
 
     let output = compile(source).expect("compilation should succeed");
-    let method = output.abi.methods.iter().find(|m| m.name == "deposit").unwrap();
+    let method = output.abi.contract.methods.iter().find(|m| m.name == "deposit").unwrap();
     let circuit = output.circuit_definitions.iter().find(|d| d.method_id == method.method_id).unwrap();
 
     let state = InMemoryStateBackend::new();
@@ -141,7 +141,7 @@ fn test_compile_and_execute_if_else() {
     "#;
 
     let output = compile(source).expect("compilation should succeed");
-    let method = output.abi.methods.iter().find(|m| m.name == "conditional_set").unwrap();
+    let method = output.abi.contract.methods.iter().find(|m| m.name == "conditional_set").unwrap();
     let circuit = output.circuit_definitions.iter().find(|d| d.method_id == method.method_id).unwrap();
 
     let state = InMemoryStateBackend::new();
@@ -174,7 +174,7 @@ fn test_compile_and_execute_context_access() {
     "#;
 
     let output = compile(source).expect("compilation should succeed");
-    let method = output.abi.methods.iter().find(|m| m.name == "record_caller").unwrap();
+    let method = output.abi.contract.methods.iter().find(|m| m.name == "record_caller").unwrap();
     let circuit = output.circuit_definitions.iter().find(|d| d.method_id == method.method_id).unwrap();
 
     let mut ctx = default_context();
@@ -218,7 +218,7 @@ fn test_compile_and_execute_contract_state_array() {
     let output = compile(source).expect("compilation should succeed");
     assert_eq!(output.method_count(), 1);
 
-    let method = output.abi.methods.iter().find(|m| m.name == "mint").unwrap();
+    let method = output.abi.contract.methods.iter().find(|m| m.name == "mint").unwrap();
     let circuit = output.circuit_definitions.iter().find(|d| d.method_id == method.method_id).unwrap();
 
     let state = InMemoryStateBackend::new();
@@ -256,9 +256,9 @@ fn test_abi_method_resolution() {
 
     let output = compile(source).expect("compilation should succeed");
     assert_eq!(output.method_count(), 2);
-    assert_eq!(output.abi.methods.len(), 2);
+    assert_eq!(output.abi.contract.methods.len(), 2);
 
-    for method in &output.abi.methods {
+    for method in &output.abi.contract.methods {
         let circuit = output
             .circuit_definitions
             .iter()
@@ -302,7 +302,7 @@ fn test_op_counts_nonzero() {
     "#;
 
     let output = compile(source).expect("compilation should succeed");
-    let method = output.abi.methods.iter().find(|m| m.name == "compute").unwrap();
+    let method = output.abi.contract.methods.iter().find(|m| m.name == "compute").unwrap();
     let circuit = output.circuit_definitions.iter().find(|d| d.method_id == method.method_id).unwrap();
 
     let state = InMemoryStateBackend::new();
@@ -349,10 +349,10 @@ fn test_compilation_output_structure() {
     let output = compile(source).expect("compilation should succeed");
 
     // Verify ABI
-    assert_eq!(output.abi.contract_name, "MyContract");
-    assert!(output.abi.state_tree_height > 0, "state tree height should be > 0");
-    assert_eq!(output.abi.methods.len(), 2);
-    assert!(output.abi.state_layout.len() >= 2, "should have owner_id and users in layout");
+    assert_eq!(output.abi.contract.name, "MyContract");
+    assert!(output.abi.contract.state_tree_height > 0, "state tree height should be > 0");
+    assert_eq!(output.abi.contract.methods.len(), 2);
+    assert!(output.abi.contract.state.len() >= 2, "should have owner_id and users in layout");
 
     // Verify contract code
     assert_eq!(output.contract_code.functions.len(), 2);
@@ -362,7 +362,7 @@ fn test_compilation_output_structure() {
     assert_eq!(output.circuit_definitions.len(), 2);
 
     // Method IDs should be unique
-    let method_ids: Vec<u32> = output.abi.methods.iter().map(|m| m.method_id).collect();
+    let method_ids: Vec<u32> = output.abi.contract.methods.iter().map(|m| m.method_id).collect();
     assert_ne!(method_ids[0], method_ids[1], "method IDs should be unique");
 }
 
@@ -402,7 +402,7 @@ fn test_multifile_compile_from_sources() {
 
     let output = compile_crate_from_sources(&sources).expect("multi-file compilation should succeed");
     assert_eq!(output.method_count(), 1);
-    assert_eq!(output.abi.contract_name, "TestContract");
+    assert_eq!(output.abi.contract.name, "TestContract");
 }
 
 #[test]
@@ -431,7 +431,7 @@ fn test_nested_struct_field_compound_assign_produces_state_write() {
     "#;
 
     let output = compile(source).expect("compilation should succeed");
-    let method = output.abi.methods.iter().find(|m| m.name == "add_balance").unwrap();
+    let method = output.abi.contract.methods.iter().find(|m| m.name == "add_balance").unwrap();
     let circuit = output.circuit_definitions.iter().find(|d| d.method_id == method.method_id).unwrap();
 
     // Verify that the circuit has state commands (writes)
@@ -492,7 +492,7 @@ fn test_poseidon_hash_with_to_felts() {
     "#;
 
     let output = compile(source).expect("compilation should succeed");
-    let method = output.abi.methods.iter().find(|m| m.name == "mint").unwrap();
+    let method = output.abi.contract.methods.iter().find(|m| m.name == "mint").unwrap();
     let circuit = output.circuit_definitions.iter().find(|d| d.method_id == method.method_id).unwrap();
     println!("circuit: {}", serde_json::to_string_pretty(&circuit).unwrap());
     let state = InMemoryStateBackend::new();
@@ -528,7 +528,7 @@ fn test_poseidon_two_to_one_execution() {
     "#;
 
     let output = compile(source).expect("compilation should succeed");
-    let method = output.abi.methods.iter().find(|m| m.name == "hash_two").unwrap();
+    let method = output.abi.contract.methods.iter().find(|m| m.name == "hash_two").unwrap();
     let circuit = output.circuit_definitions.iter().find(|d| d.method_id == method.method_id).unwrap();
 
     let state = InMemoryStateBackend::new();
@@ -567,7 +567,7 @@ fn test_keccak_two_to_one_execution() {
     "#;
 
     let output = compile(source).expect("compilation should succeed");
-    let method = output.abi.methods.iter().find(|m| m.name == "hash_two").unwrap();
+    let method = output.abi.contract.methods.iter().find(|m| m.name == "hash_two").unwrap();
     let circuit = output.circuit_definitions.iter().find(|d| d.method_id == method.method_id).unwrap();
 
     let state = InMemoryStateBackend::new();
@@ -610,7 +610,7 @@ fn test_nested_struct_overlay_applied() {
     "#;
 
     let output = compile(source).expect("compilation should succeed");
-    let method = output.abi.methods.iter().find(|m| m.name == "add_balance").unwrap();
+    let method = output.abi.contract.methods.iter().find(|m| m.name == "add_balance").unwrap();
     let circuit = output.circuit_definitions.iter().find(|d| d.method_id == method.method_id).unwrap();
 
     let state = InMemoryStateBackend::new();
@@ -679,11 +679,11 @@ fn test_simple_token_contract_compiles() {
     "#;
 
     let output = compile(source).expect("SimpleTokenContract should compile");
-    assert_eq!(output.abi.contract_name, "SimpleTokenContract");
+    assert_eq!(output.abi.contract.name, "SimpleTokenContract");
     assert_eq!(output.method_count(), 3);
 
     // Verify all three methods exist
-    let method_names: Vec<&str> = output.abi.methods.iter().map(|m| m.name.as_str()).collect();
+    let method_names: Vec<&str> = output.abi.contract.methods.iter().map(|m| m.name.as_str()).collect();
     assert!(method_names.contains(&"transfer"), "should have transfer method");
     assert!(method_names.contains(&"mint"), "should have mint method");
     assert!(method_names.contains(&"claim"), "should have claim method");
@@ -744,7 +744,7 @@ fn test_simple_token_contract_mint_executes() {
     "#;
 
     let output = compile(source).expect("compilation should succeed");
-    let method = output.abi.methods.iter().find(|m| m.name == "mint").unwrap();
+    let method = output.abi.contract.methods.iter().find(|m| m.name == "mint").unwrap();
     let circuit = output.circuit_definitions.iter().find(|d| d.method_id == method.method_id).unwrap();
 
     let state = InMemoryStateBackend::new();
@@ -803,7 +803,7 @@ fn test_simple_token_contract_transfer_executes() {
     let output = compile(source).expect("compilation should succeed");
 
     // First mint some tokens
-    let mint_method = output.abi.methods.iter().find(|m| m.name == "mint").unwrap();
+    let mint_method = output.abi.contract.methods.iter().find(|m| m.name == "mint").unwrap();
     let mint_circuit = output.circuit_definitions.iter().find(|d| d.method_id == mint_method.method_id).unwrap();
 
     let state = InMemoryStateBackend::new();
@@ -815,7 +815,7 @@ fn test_simple_token_contract_transfer_executes() {
     assert!(mint_result.success, "mint should succeed: {:?}", mint_result.failure);
 
     // Now transfer
-    let transfer_method = output.abi.methods.iter().find(|m| m.name == "transfer").unwrap();
+    let transfer_method = output.abi.contract.methods.iter().find(|m| m.name == "transfer").unwrap();
     let transfer_circuit = output
         .circuit_definitions
         .iter()
@@ -873,7 +873,7 @@ fn test_trait_definition_and_implementation() {
     "#;
 
     let output = compile(source).expect("trait compilation should succeed");
-    assert_eq!(output.abi.contract_name, "TokenContract");
+    assert_eq!(output.abi.contract.name, "TokenContract");
     assert_eq!(output.method_count(), 1);
 }
 

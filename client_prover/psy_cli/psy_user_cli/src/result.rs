@@ -36,6 +36,21 @@ pub enum DeployStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateResult {
+    pub contract_id: u64,
+    pub update_content_hash: String,
+    pub network: String,
+    pub status: UpdateStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateStatus {
+    Submitted,
+    Confirmed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletCreateResult {
     pub keystore_path: Option<String>,
     pub public_key_hash: QHashOut<F>,
@@ -216,6 +231,7 @@ pub struct GenericResult {
 
 pub enum CommandResult {
     Deploy(DeployResult),
+    Update(UpdateResult),
     WalletCreate(WalletCreateResult),
     WalletInfo(WalletInfoResult),
     GetUserId(GetUserIdResult),
@@ -252,6 +268,7 @@ impl CommandResult {
     pub fn write_to_file(&self, path: &Path) -> Result<()> {
         match self {
             Self::Deploy(v) => write_json_atomically(path, v),
+            Self::Update(v) => write_json_atomically(path, v),
             Self::WalletCreate(v) => write_json_atomically(path, v),
             Self::WalletInfo(v) => write_json_atomically(path, v),
             Self::GetUserId(v) => write_json_atomically(path, v),

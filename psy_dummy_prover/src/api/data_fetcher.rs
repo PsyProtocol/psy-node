@@ -33,7 +33,7 @@ pub trait PsyUserContractDataFetcher<F, Hash> {
         checkpoint_id: u64,
         user_id: u64,
         contract_id: u64,
-        height: u8,
+        _height: u8,
         slot_id: u64,
     ) -> anyhow::Result<MerkleProofCore<Hash>>;
     async fn df_get_user_contract_tree_nodes(&self, checkpoint_id: u64, node_keys: Vec<QMerkleStoreSingleIdKey>) -> anyhow::Result<Vec<Hash>>;
@@ -213,7 +213,7 @@ impl<N: QNetworkTypesConfig + 'static, C: RealmEdgeRpcClient<N::F, N::QHash, N::
         slot_id: u64,
     ) -> anyhow::Result<MerkleProofCore<N::QHash>> {
         self.client
-            .get_user_contract_state_tree_merkle_proof(checkpoint_id, user_id, contract_id as u32, height, slot_id)
+            .get_user_contract_state_tree_merkle_proof(checkpoint_id, user_id, contract_id as u32, slot_id)
             .await
             .map_err(|e| anyhow::anyhow!("{:?}", e))
     }

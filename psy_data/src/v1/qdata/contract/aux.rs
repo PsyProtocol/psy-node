@@ -364,6 +364,55 @@ impl<Hash: QHashBase> PQBCDeployContract<Hash> {
     }
 }
 
+/// Server-side layout-aware deploy command. This is intentionally a distinct
+/// wire type from V1 so proof-bearing commands cannot be silently downgraded.
+#[pderive::serialize_clone_hash]
+pub struct PQBCDeployContractV2<Hash> {
+    pub deploy_contract: PQBCDeployContract<Hash>,
+    pub layout_protocol_version: u16,
+    pub state_layout_root: Hash,
+    pub state_layout_field_count: u64,
+    pub state_layout_slot_count: u64,
+    pub canonical_layout_verifier_fingerprint: Hash,
+    pub canonical_layout_proof: Vec<u8>,
+}
+
+impl<Hash: QHashBase> PQBCDeployContractV2<Hash> {
+    pub fn validate_shape(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.layout_protocol_version != 0,
+            "layout protocol version must be non-zero"
+        );
+        anyhow::ensure!(
+            !self.canonical_layout_proof.is_empty(),
+            "canonical layout proof is empty"
+        );
+        anyhow::ensure!(
+            self.canonical_layout_proof.len()
+                <= psy_core::constants::protocol::
+                    STATE_LAYOUT_MAX_PROOF_BYTES,
+            "canonical layout proof exceeds maximum size"
+        );
+        anyhow::ensure!(
+            self.state_layout_field_count
+                <= self.state_layout_slot_count,
+            "layout field count exceeds slot count"
+        );
+        let state_tree_height =
+            self.deploy_contract.code_definition.state_tree_height;
+        anyhow::ensure!(
+            state_tree_height < 64,
+            "contract state tree height is unsupported"
+        );
+        anyhow::ensure!(
+            self.state_layout_slot_count
+                <= (1u64 << state_tree_height) * 4,
+            "layout slot count exceeds contract state capacity"
+        );
+        Ok(())
+    }
+}
+
 #[pderive::serialize_clone_hash_ts]
 #[ts(export, concrete(Hash = parth_core::PHash), rename = "QBCDeployContractWithRoot")]
 pub struct PQBCDeployContractWithRoot<Hash> {
@@ -389,6 +438,106 @@ impl<Hash: QHashBase> PQBCDeployContractWithRoot<Hash> {
         let function_whitelist_root = t.get_root();
 
         Ok(Self {
+            deployer,
+            code_definition,
+            function_whitelist,
+            function_whitelist_root,
+            code_root,
+        })
+    }
+}
+
+#[pderive::serialize_clone_hash_ts]
+#[ts(export, concrete(Hash = parth_core::PHash), rename = "QBCUpdateContract")]
+pub struct PQBCUpdateContract<Hash> {
+    pub contract_id: u64,
+    pub deployer: Hash,
+    pub code_definition: ContractCodeDefinition,
+    pub function_whitelist: Vec<Hash>,
+    pub code_root: Hash,
+    pub layout_protocol_version: u16,
+    pub state_layout_root: Hash,
+    pub state_layout_field_count: u64,
+    pub state_layout_slot_count: u64,
+    pub canonical_layout_verifier_fingerprint: Hash,
+    pub canonical_layout_proof: Vec<u8>,
+}
+
+impl<Hash: QHashBase> PQBCUpdateContract<Hash> {
+    pub fn validate_shape(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.contract_id != 0,
+            "update contract id must be non-zero"
+        );
+        anyhow::ensure!(
+            self.layout_protocol_version != 0,
+            "layout protocol version must be non-zero"
+        );
+        anyhow::ensure!(
+            !self.canonical_layout_proof.is_empty(),
+            "canonical layout proof is empty"
+        );
+        anyhow::ensure!(
+            self.canonical_layout_proof.len()
+                <= psy_core::constants::protocol::
+                    STATE_LAYOUT_MAX_PROOF_BYTES,
+            "canonical layout proof exceeds maximum size"
+        );
+        anyhow::ensure!(
+            self.state_layout_field_count <= self.state_layout_slot_count,
+            "layout field count exceeds slot count"
+        );
+        anyhow::ensure!(
+            self.code_definition.state_tree_height < 64
+                && self.state_layout_slot_count
+                    <= (1u64 << self.code_definition.state_tree_height) * 4,
+            "layout slot count exceeds contract state capacity"
+        );
+        Ok(())
+    }
+    pub fn into_with_whitelist_root<H: MerkleZeroHasher<Hash>>(
+        self,
+        contract_function_tree_height: u8,
+    ) -> anyhow::Result<PQBCUpdateContractWithRoot<Hash>> {
+        PQBCUpdateContractWithRoot::<Hash>::new::<H>(
+            self.contract_id,
+            self.deployer,
+            self.code_definition,
+            self.function_whitelist,
+            contract_function_tree_height,
+            self.code_root,
+        )
+    }
+}
+
+#[pderive::serialize_clone_hash_ts]
+#[ts(export, concrete(Hash = parth_core::PHash), rename = "QBCUpdateContractWithRoot")]
+pub struct PQBCUpdateContractWithRoot<Hash> {
+    pub contract_id: u64,
+    pub deployer: Hash,
+    pub code_definition: ContractCodeDefinition,
+    pub function_whitelist: Vec<Hash>,
+    pub function_whitelist_root: Hash,
+    pub code_root: Hash,
+}
+
+impl<Hash: QHashBase> PQBCUpdateContractWithRoot<Hash> {
+    pub fn new<H: MerkleZeroHasher<Hash>>(
+        contract_id: u64,
+        deployer: Hash,
+        code_definition: ContractCodeDefinition,
+        function_whitelist: Vec<Hash>,
+        contract_function_tree_height: u8,
+        code_root: Hash,
+    ) -> anyhow::Result<Self> {
+        let mut t = SimpleMemoryMerkleStore::<H, Hash>::new(contract_function_tree_height);
+        for (i, l) in function_whitelist.iter().enumerate() {
+            t.set_leaf(i as u64, *l);
+        }
+        let function_whitelist_root = t.get_root();
+
+        Ok(Self {
+            contract_id,
             deployer,
             code_definition,
             function_whitelist,

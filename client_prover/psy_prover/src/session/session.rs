@@ -23,7 +23,7 @@ use psy_client_common::{
 use psy_client_data::{
     config::store_config::PsyHasher,
     guta::end_cap_input::SubmitUserEndCapNonProofInput,
-    qblock::cmds::deploy_contract::{get_code_root_by_code_hashes, QBCDeployContract},
+    qblock::cmds::deploy_contract::{get_code_root_by_code_hashes, QBCDeployContract, QBCUpdateContract},
     qdata::{
         checkpoint::{PsyCheckpointGlobalStateRoots, PsyCheckpointLeafCompactWithStateRoots},
         contract::ContractCodeDefinition,
@@ -67,7 +67,9 @@ use psy_dpn_circuit::circuits::cfc::DapenContractFunctionCircuit;
 pub use psy_provider::session::TxStatus;
 use psy_provider::{
     provider::{ProveProxyRpcProvider, QUserRpcProvider, RpcProvider},
-    request::{DPNSoftwareDefinedSignatureInput, QDeployContractRPCRequest, QRegisterUserRPCRequest, QSubmitEndCapRPCRequest},
+    request::{
+        DPNSoftwareDefinedSignatureInput, QDeployContractRPCRequest, QRegisterUserRPCRequest, QSubmitEndCapRPCRequest, QUpdateContractRPCRequest,
+    },
 };
 use psy_ups_circuit::{circuit_manager::core::PsyUPSStepCircuitManager, session::UserProvingSessionManager};
 use psy_vm::{
@@ -199,6 +201,57 @@ where
     Ok((circuits, deploy))
 }
 
+/// Mirrors `gen_contract_deploy_and_circuits_for_functions` but builds a
+/// `QBCUpdateContract` for updating the code of an existing contract. The
+/// whitelist leaves, function circuit fingerprints and code root are computed
+/// exactly like in the deploy path; `contract_state_tree_height` is the
+/// existing on-chain state tree height of the contract (it is immutable).
+pub fn gen_contract_update_and_circuits_for_functions<C: GenericConfig<D>, const D: usize>(
+    contract_id: u64,
+    deployer: QHashOut<C::F>,
+    contract_state_tree_height: u8,
+    defs: &[DPNFunctionCircuitDefinition],
+) -> anyhow::Result<(Vec<DapenContractFunctionCircuit<C, D>>, QBCUpdateContract<C::F>)>
+where
+    C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + MerkleZeroHasherWithMarkedLeaf<QHashOut<C::F>>,
+{
+    let code_defs = defs.iter().map(|x| dapen_fc_to_cfc_code_definition(x)).collect::<Vec<_>>();
+    let mut whitelist_leaves = Vec::with_capacity(defs.len() * 2);
+    let mut code_hashes = Vec::with_capacity(defs.len());
+    let circuits = defs
+        .iter()
+        .map(|x| {
+            let c = DapenContractFunctionCircuit::<C, D>::new(x, contract_state_tree_height as usize, UPS_SESSION_PROOF_TREE_HEIGHT as usize, false);
+            whitelist_leaves.push(c.get_fingerprint());
+
+            let inputs_outputs_combo = ((x.circuit_outputs.len() as u64) << 32u64) | (x.circuit_inputs.len() as u64);
+            whitelist_leaves.push(QHashOut::from_values(x.method_id as u64, inputs_outputs_combo, 0, 0));
+            let code_hash = hash_dpn_function::<C::F>(x);
+            code_hashes.push(code_hash);
+            c
+        })
+        .collect::<Vec<_>>();
+
+    let update = QBCUpdateContract {
+        contract_id,
+        deployer,
+        code_definition: ContractCodeDefinition {
+            state_tree_height: contract_state_tree_height as u16,
+            functions: code_defs,
+        },
+        function_whitelist: whitelist_leaves,
+        code_root: get_code_root_by_code_hashes::<C::F, C::Hasher>(&code_hashes, CONTRACT_FUNCTION_TREE_HEIGHT - 1),
+        layout_protocol_version: 0,
+        state_layout_root: QHashOut::ZERO,
+        state_layout_field_count: 0,
+        state_layout_slot_count: 0,
+        canonical_layout_verifier_fingerprint: QHashOut::ZERO,
+        canonical_layout_proof: Vec::new(),
+    };
+
+    Ok((circuits, update))
+}
+
 type C = PoseidonGoldilocksConfig;
 const D: usize = 2;
 type F = GoldilocksField;
@@ -327,7 +380,82 @@ fn ensure_private_transfer_contract_matches(contract_id: u64, token_contract_id:
 }
 
 impl PrivateTransferClaim {
+    fn expected_note_proof_public_inputs_hash(&self) -> QHashOut<F> {
+        let mut values = Vec::with_capacity(16);
+        values.extend(self.owner.iter().copied().map(F::from_noncanonical_u64));
+        values.push(F::from_noncanonical_u64(self.amount));
+        values.extend(self.user_tree_root.iter().copied().map(F::from_noncanonical_u64));
+        values.push(F::from_noncanonical_u64(self.checkpoint_id));
+        values.push(F::from_noncanonical_u64(self.note_root_slot));
+        values.push(F::from_noncanonical_u64(self.token_contract_id));
+        values.extend(self.nullifier.iter().copied().map(F::from_noncanonical_u64));
+        PsyHasher::q_hash_many(&values)
+    }
+
+    fn validate_note_proof_public_inputs(&self) -> anyhow::Result<QHashOut<F>> {
+        if self.note_proof.public_inputs.len() != 4 {
+            anyhow::bail!(
+                "private claim note proof must have 4 public inputs, got {}",
+                self.note_proof.public_inputs.len()
+            );
+        }
+        let actual = QHashOut(HashOut {
+            elements: [
+                self.note_proof.public_inputs[0],
+                self.note_proof.public_inputs[1],
+                self.note_proof.public_inputs[2],
+                self.note_proof.public_inputs[3],
+            ],
+        });
+        let expected = self.expected_note_proof_public_inputs_hash();
+        tracing::info!(
+            checkpoint_id = self.checkpoint_id,
+            note_root_slot = self.note_root_slot,
+            amount = self.amount,
+            fingerprint = %self.note_proof_fingerprint,
+            expected_public_inputs = %expected,
+            actual_public_inputs = %actual,
+            owner = ?self.owner,
+            user_tree_root = ?self.user_tree_root,
+            nullifier = ?self.nullifier,
+            "private claim note-proof public-input preflight"
+        );
+        if actual != expected {
+            anyhow::bail!(
+                "private claim payload does not match note proof public inputs: expected_from_payload={} actual_from_proof={} checkpoint_id={} contract_note_root_slot={} amount={}",
+                expected,
+                actual,
+                self.checkpoint_id,
+                self.note_root_slot,
+                self.amount
+            );
+        }
+        Ok(actual)
+    }
+
     pub fn to_contract_call_args(&self, contract_id: u64, proof_ref: &TraceExternalProofRef) -> anyhow::Result<ContractCallArgs> {
+        let public_inputs_hash = self.validate_note_proof_public_inputs()?;
+        let expected_leaf = PsyHasher::q_two_to_one(self.note_proof_fingerprint, public_inputs_hash);
+        tracing::info!(
+            proof_index = proof_ref.proof_index,
+            fingerprint = %self.note_proof_fingerprint,
+            public_inputs_hash = %public_inputs_hash,
+            expected_leaf = %expected_leaf,
+            actual_leaf = %proof_ref.leaf_proof.value,
+            leaf_path_root = %proof_ref.leaf_proof.root,
+            siblings_len = proof_ref.leaf_proof.siblings.len(),
+            first_sibling = ?proof_ref.leaf_proof.siblings.first(),
+            last_sibling = ?proof_ref.leaf_proof.siblings.last(),
+            "private claim proof-tree leaf preflight"
+        );
+        if proof_ref.leaf_proof.value != expected_leaf {
+            anyhow::bail!(
+                "private claim proof-tree leaf mismatch: expected_leaf={} actual_leaf={} proof_index={}",
+                expected_leaf,
+                proof_ref.leaf_proof.value,
+                proof_ref.proof_index
+            );
+        }
         ensure_private_transfer_contract_matches(contract_id, self.token_contract_id)?;
         Ok(ContractCallArgs {
             contract_id,
@@ -1612,11 +1740,25 @@ impl WalletSession {
             .get_mut(&public_key)
             .ok_or_else(|| anyhow::format_err!("user {} not found", public_key.to_string()))?;
 
+        let proof_tree_start_root = user_session_mgr.proof_tree_state.get_proof_tree_root().await;
+        let proof_public_inputs = proof.public_inputs.clone();
         let leaf_index = user_session_mgr.add_external_proof(fingerprint, proof, verifier_data).await;
         let proof_tree_root = user_session_mgr.proof_tree_state.get_proof_tree_root().await;
         user_session_mgr.require_lps_mut()?.set_proof_tree_root(proof_tree_root);
 
         let leaf_proof = user_session_mgr.proof_tree_state.get_leaf_merkle_proof(leaf_index).await;
+        tracing::info!(
+            proof_index = leaf_index,
+            fingerprint = %fingerprint,
+            proof_public_inputs = ?proof_public_inputs,
+            proof_tree_start_root = %proof_tree_start_root,
+            proof_tree_end_root = %proof_tree_root,
+            leaf_value = %leaf_proof.value,
+            leaf_path_root = %leaf_proof.root,
+            siblings_len = leaf_proof.siblings.len(),
+            siblings = ?leaf_proof.siblings,
+            "external proof inserted into trace proof tree"
+        );
         if leaf_proof.root != proof_tree_root {
             anyhow::bail!(
                 "external proof leaf_proof.root mismatch proof_tree_root: leaf={:?} tree={:?}",
@@ -1908,9 +2050,12 @@ impl WalletSession {
                         user_session_mgr.require_lps_mut()?.set_proof_tree_root(proof_tree_root);
                     }
                     ClaimBatchItem::PrivateTransfer { contract_id, claim } => {
+                        let public_inputs_hash = claim.validate_note_proof_public_inputs()?;
+                        let note_proof_fingerprint = claim.note_proof_fingerprint;
+                        let expected_leaf = PsyHasher::q_two_to_one(note_proof_fingerprint, public_inputs_hash);
                         let proof_index = user_session_mgr
                             .add_external_proof(
-                                claim.note_proof_fingerprint,
+                                note_proof_fingerprint,
                                 claim.note_proof,
                                 claim.note_verifier_data.to_verifier_data::<C, D>(),
                             )
@@ -1923,6 +2068,28 @@ impl WalletSession {
                                 "private_transfer leaf_proof.root mismatch proof_tree_root: leaf={:?} tree={:?}",
                                 leaf_proof.root,
                                 proof_tree_root
+                            );
+                        }
+                        tracing::info!(
+                            item_index,
+                            proof_index,
+                            fingerprint = %note_proof_fingerprint,
+                            public_inputs_hash = %public_inputs_hash,
+                            expected_leaf = %expected_leaf,
+                            actual_leaf = %leaf_proof.value,
+                            leaf_path_root = %leaf_proof.root,
+                            proof_tree_root = %proof_tree_root,
+                            siblings_len = leaf_proof.siblings.len(),
+                            first_sibling = ?leaf_proof.siblings.first(),
+                            last_sibling = ?leaf_proof.siblings.last(),
+                            "private claim proof-tree preflight inside claim batch"
+                        );
+                        if leaf_proof.value != expected_leaf {
+                            anyhow::bail!(
+                                "private claim proof-tree leaf mismatch inside claim batch: expected_leaf={} actual_leaf={} proof_index={}",
+                                expected_leaf,
+                                leaf_proof.value,
+                                proof_index
                             );
                         }
                         let inputs = Self::build_private_claim_inputs(
@@ -2431,14 +2598,79 @@ impl WalletSession {
         Ok(deploy_cmd)
     }
 
-    pub async fn deploy_contract(&self, deployer: QHashOut<F>, circuit_defs: Vec<DPNFunctionCircuitDefinition>) -> anyhow::Result<String> {
-        let deploy_cmd = self.get_deploy_contract_cmd(deployer, circuit_defs)?;
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn get_layout_aware_deploy_contract_cmd(
+        &self,
+        deployer: QHashOut<F>,
+        circuit_defs: Vec<DPNFunctionCircuitDefinition>,
+        abi: psy_compiler::abi::Abi,
+    ) -> anyhow::Result<psy_client_data::qblock::cmds::deploy_contract::QBCDeployContractV2<F>> {
+        let contract_state_tree_height =
+            u8::try_from(abi.contract.state_tree_height).map_err(|_| anyhow::anyhow!("contract state tree height does not fit in u8"))?;
+        let (_result_circuits, deploy_cmd) =
+            gen_contract_deploy_and_circuits_for_functions::<C, D>(deployer, contract_state_tree_height, &circuit_defs)?;
+        let contract_output = psy_compiler::output::serialize::ContractOutput {
+            contract_code: deploy_cmd.code_definition.clone(),
+            circuit_definitions: circuit_defs,
+            abi,
+        };
+        crate::session::compile_bridge::build_layout_aware_deploy_command(&contract_output, deploy_cmd)
+    }
 
-        let contract_uuid = self
-            .st_provider
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn deploy_contract_with_abi(
+        &self,
+        deployer: QHashOut<F>,
+        circuit_defs: Vec<DPNFunctionCircuitDefinition>,
+        abi: psy_compiler::abi::Abi,
+    ) -> anyhow::Result<String> {
+        let deploy_cmd = self.get_layout_aware_deploy_contract_cmd(deployer, circuit_defs, abi)?;
+        self.st_provider
             .deploy_contract::<F>(QDeployContractRPCRequest { deploy_contract: deploy_cmd })
+            .await
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub async fn deploy_contract_with_abi(
+        &self,
+        _deployer: QHashOut<F>,
+        _circuit_defs: Vec<DPNFunctionCircuitDefinition>,
+        _abi: psy_compiler::abi::Abi,
+    ) -> anyhow::Result<String> {
+        anyhow::bail!("deploy_contract_with_abi requires native layout proofs and is unavailable on wasm32")
+    }
+
+    pub async fn deploy_contract(&self, deployer: QHashOut<F>, circuit_defs: Vec<DPNFunctionCircuitDefinition>) -> anyhow::Result<String> {
+        let _ = (deployer, circuit_defs);
+        anyhow::bail!("deploy_contract requires ABI; use deploy_contract_with_abi")
+    }
+
+    pub fn get_update_contract_cmd(
+        &self,
+        contract_id: u64,
+        deployer: QHashOut<F>,
+        circuit_defs: Vec<DPNFunctionCircuitDefinition>,
+    ) -> anyhow::Result<QBCUpdateContract<F>> {
+        let contract_state_tree_height = derive_state_tree_height(&circuit_defs);
+
+        let (_result_circuits, update_cmd) =
+            gen_contract_update_and_circuits_for_functions::<C, D>(contract_id, deployer, contract_state_tree_height as u8, &circuit_defs)?;
+        Ok(update_cmd)
+    }
+
+    pub async fn update_contract(
+        &self,
+        contract_id: u64,
+        deployer: QHashOut<F>,
+        circuit_defs: Vec<DPNFunctionCircuitDefinition>,
+    ) -> anyhow::Result<String> {
+        let update_cmd = self.get_update_contract_cmd(contract_id, deployer, circuit_defs)?;
+
+        let update_content_hash = self
+            .st_provider
+            .update_contract::<F>(QUpdateContractRPCRequest { update_contract: update_cmd })
             .await?;
-        Ok(contract_uuid)
+        Ok(update_content_hash)
     }
 
     // pub async fn get_claim_rewards_call_args(&self, mut job_infos: Vec<JobInfo>)
@@ -2674,11 +2906,32 @@ impl WalletSession {
 
         let proof_tree_start_root = user_session_mgr.proof_tree_state.get_proof_tree_root().await;
         let proof_bytes = bincode::serialize(&proof)?;
+        let proof_public_inputs = proof.public_inputs.clone();
         let verifier_data_alt = AltVerifierOnlyCircuitData::from(&verifier_data);
         let leaf_index = user_session_mgr.add_external_proof(fingerprint, proof, verifier_data).await;
         let proof_tree_end_root = user_session_mgr.proof_tree_state.get_proof_tree_root().await;
         user_session_mgr.require_lps_mut()?.set_proof_tree_root(proof_tree_end_root);
         let leaf_proof = user_session_mgr.proof_tree_state.get_leaf_merkle_proof(leaf_index).await;
+        tracing::info!(
+            proof_index = leaf_index,
+            fingerprint = %fingerprint,
+            proof_public_inputs = ?proof_public_inputs,
+            proof_tree_start_root = %proof_tree_start_root,
+            proof_tree_end_root = %proof_tree_end_root,
+            leaf_value = %leaf_proof.value,
+            leaf_path_root = %leaf_proof.root,
+            siblings_len = leaf_proof.siblings.len(),
+            siblings = ?leaf_proof.siblings,
+            "external proof inserted into trace proof tree"
+        );
+        if leaf_proof.root != proof_tree_end_root {
+            anyhow::bail!(
+                "external proof leaf path root mismatch after insertion: proof_index={} leaf_root={} tree_root={}",
+                leaf_index,
+                leaf_proof.root,
+                proof_tree_end_root
+            );
+        }
         let siblings = leaf_proof
             .siblings
             .iter()
@@ -5350,7 +5603,7 @@ mod async_split_tests {
             let local = PrivateNoteInclusionCircuit::<C, D>::new(
                 psy_config::network_constants::GLOBAL_USER_TREE_HEIGHT as usize,
                 psy_config::network_constants::GLOBAL_CONTRACT_TREE_HEIGHT as usize,
-                psy_config::network_constants::MAX_CONTRACT_STATE_TREE_HEIGHT as usize,
+                psy_config::network_constants::TOKEN_CONTRACT_STATE_TREE_HEIGHT as usize,
                 20,
             );
             let local_fingerprint = local.get_fingerprint();
@@ -5864,8 +6117,8 @@ mod async_split_tests {
         };
 
         let simulated = wallet_session.simulate_contract_call(user0, call_data.clone()).await?;
-        let generated = &simulated.generated;
-        assert_eq!(simulated.metadata.tx_hash.to_string(), generated.tx_hash);
+        let generated = simulated.generated.as_ref().expect("simulation should include a generated tx trace");
+        assert_eq!(simulated.metadata.tx_hash.expect("simulation should include a tx hash").to_string(), generated.tx_hash);
         assert!(!generated.trace.payload.is_empty());
         assert_eq!(simulated.metadata.contract_call_data.contract_calls.len(), 1);
         assert_eq!(simulated.metadata.contract_call_data.contract_calls[0].contract_id, contract_id);

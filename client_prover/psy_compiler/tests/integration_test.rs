@@ -383,11 +383,12 @@ impl SingleMapContract {
 "#;
 
     let output = psy_compiler::compile(source).expect("compilation should succeed");
-    assert!(!output.abi.state_layout[0].is_imt_map);
-    assert!(output.abi.state_layout[1].is_imt_map);
-    assert_eq!(output.abi.state_layout[1].imt_capacity, Some(8));
-    assert!(!output.abi.state_layout[2].is_imt_map);
-    assert!(!output.abi.state_layout[3].is_imt_map);
+    use psy_compiler::abi::TypeRef;
+    let state = &output.abi.contract.state;
+    assert!(!matches!(&state[0].ty, TypeRef::Map { .. }));
+    assert!(matches!(&state[1].ty, TypeRef::Map { capacity, .. } if *capacity == 8));
+    assert!(!matches!(&state[2].ty, TypeRef::Map { .. }));
+    assert!(!matches!(&state[3].ty, TypeRef::Map { .. }));
 }
 
 #[test]
@@ -446,10 +447,10 @@ impl SimpleContract {
 
     assert_eq!(output.method_count(), 2);
     assert_eq!(output.state_tree_height(), 1); // ceil(log2(1)) = 1 (single felt)
-    assert_eq!(output.abi.contract_name, "SimpleContract");
-    assert_eq!(output.abi.methods.len(), 2);
-    assert_eq!(output.abi.methods[0].name, "set_value");
-    assert_eq!(output.abi.methods[1].name, "check_value");
+    assert_eq!(output.abi.contract.name, "SimpleContract");
+    assert_eq!(output.abi.contract.methods.len(), 2);
+    assert_eq!(output.abi.contract.methods[0].name, "set_value");
+    assert_eq!(output.abi.contract.methods[1].name, "check_value");
 
     // Circuit definitions should exist for both methods
     assert_eq!(output.circuit_definitions.len(), 2);
@@ -457,6 +458,50 @@ impl SimpleContract {
         assert!(!def.name.is_empty());
         assert!(def.method_id != 0);
     }
+}
+
+#[test]
+fn test_abi_mutability_is_derived_from_lowered_state_commands() {
+    use psy_compiler::abi::StateMutability;
+
+    let source = r#"
+#[contract]
+pub struct MutabilityContract {
+    pub value: Felt,
+}
+
+#[contract_implementation]
+impl MutabilityContract {
+    #[contract_method]
+    pub fn get_value(&mut self, ctx: &mut ChainContext) -> Felt {
+        return self.value;
+    }
+
+    #[contract_method]
+    pub fn set_value(&mut self, ctx: &mut ChainContext, value: Felt) {
+        self.value = value;
+    }
+}
+"#;
+
+    let output = psy_compiler::compile(source).expect("compilation should succeed");
+    let getter = output
+        .abi
+        .contract
+        .methods
+        .iter()
+        .find(|method| method.name == "get_value")
+        .expect("getter ABI entry");
+    let setter = output
+        .abi
+        .contract
+        .methods
+        .iter()
+        .find(|method| method.name == "set_value")
+        .expect("setter ABI entry");
+
+    assert_eq!(getter.state_mutability, StateMutability::View);
+    assert_eq!(setter.state_mutability, StateMutability::External);
 }
 
 #[test]
@@ -593,9 +638,10 @@ impl ArrayContract {
     assert_eq!(output.state_tree_height(), 12);
 
     // ABI should describe the array
-    assert!(output.abi.state_layout.len() == 2);
-    assert!(output.abi.state_layout[1].is_array);
-    assert_eq!(output.abi.state_layout[1].array_count, Some(1024));
+    use psy_compiler::abi::TypeRef;
+    let state = &output.abi.contract.state;
+    assert!(state.len() == 2);
+    assert!(matches!(&state[1].ty, TypeRef::Array { length, .. } if *length == 1024));
 }
 
 // ─── Bug fix tests ──────────────────────────────────────────────────────────
@@ -670,7 +716,7 @@ impl ExampleContract {
     let result = psy_compiler::compile(source);
     assert!(result.is_ok(), "Compilation failed: {:?}", result.err());
     let output = result.unwrap();
-    assert_eq!(output.abi.contract_name, "ExampleContract");
+    assert_eq!(output.abi.contract.name, "ExampleContract");
     assert_eq!(output.method_count(), 3);
 }
 
@@ -766,7 +812,7 @@ impl ExampleContract {
     let result = psy_compiler::compile(source);
     assert!(result.is_ok(), "Compilation failed: {:?}", result.err());
     let output = result.unwrap();
-    assert_eq!(output.abi.contract_name, "ExampleContract");
+    assert_eq!(output.abi.contract.name, "ExampleContract");
     assert_eq!(output.method_count(), 4);
 }
 

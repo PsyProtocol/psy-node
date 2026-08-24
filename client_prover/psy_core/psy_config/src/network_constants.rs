@@ -16,6 +16,13 @@ pub const CONTRACT_FUNCTION_TREE_HEIGHT: u8 = 16;
 pub const MAX_CONTRACT_STATE_TREE_HEIGHT: u8 = 32;
 pub const MINING_REWARDS_CONTRACT_ID: u64 = 1;
 pub const TOKEN_CONTRACT_ID: u32 = 0;
+/// Actual state-tree height of the native token contract. This must match
+/// contract 0 in genesis_contracts.json and all token-specific circuits.
+pub const TOKEN_CONTRACT_STATE_TREE_HEIGHT: u8 = 24;
+/// Actual state-tree height of the bridge deposit-tree contract (contract 2).
+pub const DEPOSIT_TREE_CONTRACT_STATE_TREE_HEIGHT: u8 = 21;
+/// Actual state-tree height of the bridge withdrawal-tree contract (contract 3).
+pub const WITHDRAWAL_TREE_CONTRACT_STATE_TREE_HEIGHT: u8 = 15;
 pub const TOKEN_SIMPLE_BURN_METHOD_ID: u32 = 2923993647;
 pub const USERS_PER_REALM: u64 = 1048576;
 
@@ -56,7 +63,7 @@ pub const DEFAULT_WORKER_PUBLIC_KEY_U64: [u64; 4] = [1, 1, 1, 1];
 pub const BATCH_USER_REGISTRAITION_SUB_TREE_HEIGHT: usize = 8;
 pub const BATCH_USER_REGISTRAITION_MAX_SUB_TREES: usize = 4;
 
-pub const BATCH_DEPLOY_CONTRACT_SUB_TREE_HEIGHT: usize = 8;
+pub const BATCH_DEPLOY_CONTRACT_SUB_TREE_HEIGHT: usize = 1;
 
 pub const COORD_API_REGISTER_USER_CHANNEL_ID: u64 = 0xCC524547555352;
 pub const COORD_API_DEPLOY_CONTRACT_CHANNEL_ID: u64 = 0xCC444550434F4E;

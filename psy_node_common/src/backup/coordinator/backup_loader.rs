@@ -15,6 +15,7 @@ use crate::{
         },
         deploy_contract_gatherer::{get_new_deploy_contract_gatherer_backup_file_path, read_deploy_contract_gatherer_backup_file_path},
         register_user_gatherer::{get_new_register_user_gatherer_backup_file_path, read_register_user_gatherer_backup_file_path},
+        update_contract_gatherer::{get_new_update_contract_gatherer_backup_file_path, read_update_contract_gatherer_backup_file_path},
     },
 };
 
@@ -24,6 +25,7 @@ pub async fn generate_coordinator_output_from_backups<
 >(
     file_system: &FileSystem,
     deploy_contract_gatherer_backup_directory: &str,
+    update_contract_gatherer_backup_directory: &str,
     register_user_gatherer_backup_directory: &str,
     guta_gatherer_backup_directory: &str,
     coordinator_ids: &CoordinatorProcessorIdState,
@@ -76,6 +78,20 @@ pub async fn generate_coordinator_output_from_backups<
     )
     .await?;
 
+    let update_contract_gatherer_backup_file_path = get_new_update_contract_gatherer_backup_file_path(
+        update_contract_gatherer_backup_directory,
+        coordinator_ids.realm_id_u64,
+        coordinator_ids.realm_sub_id_u64,
+        coordinator_ids.unique_pending_id,
+    );
+    let update_contract_gatherer_result = read_update_contract_gatherer_backup_file_path::<N::HasherBase, N::QHash, N::F, FileSystem>(
+        file_system,
+        &update_contract_gatherer_backup_file_path,
+        1 << N::CONTRACT_FUNCTION_TREE_HEIGHT,
+        global_contract_tree,
+    )
+    .await?;
+
     let block_time = register_user_gatherer_result.block_time;
 
     let final_output = CoordinatorOutputBuilder::<N>::get_output_for_backup(
@@ -85,6 +101,7 @@ pub async fn generate_coordinator_output_from_backups<
         guta_gatherer_result,
         register_user_gatherer_result,
         deploy_contract_gatherer_result,
+        update_contract_gatherer_result,
         append_checkpoint_tree_siblings,
         block_time,
     )?;

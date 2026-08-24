@@ -6,8 +6,8 @@ use parth_core::{QJobIdBase, crypto::hash::traits::FieldQHasher, felt::QFelt64, 
 use plonky2::{field::goldilocks_field::GoldilocksField, plonk::{config::PoseidonGoldilocksConfig, proof::ProofWithPublicInputs}};
 use psy_api_core::coordinator::standard_edge_rpc::CoordinatorEdgeRpcClient;
 use psy_core::job::job_id::QProvingJobDataID;
-use psy_data::v1::qdata::{contract::{ContractCodeDefinition, ContractFunctionCodeDefinition, PQBCDeployContract}, public_key::PZKPublicKeyInfo};
-pub fn gen_random_contract<Hash: QPGenRandom + QHashBase>(max_functions: usize) -> PQBCDeployContract<Hash> {
+use psy_data::v1::qdata::{contract::{ContractCodeDefinition, ContractFunctionCodeDefinition, PQBCDeployContractV2, PQBCDeployContract}, public_key::PZKPublicKeyInfo};
+pub fn gen_random_contract<Hash: QPGenRandom + QHashBase>(max_functions: usize) -> PQBCDeployContractV2<Hash> {
     let function_whitelist = Hash::qp_rand_gen_vec_in_range(1, max_functions);
     let code_root  = Hash::qp_rand_gen();
     let contract = PQBCDeployContract {
@@ -30,7 +30,15 @@ pub fn gen_random_contract<Hash: QPGenRandom + QHashBase>(max_functions: usize) 
         code_root, 
     };
 
-    contract
+    PQBCDeployContractV2 {
+        deploy_contract: contract,
+        layout_protocol_version: 1,
+        state_layout_root: Hash::get_zero_value(),
+        state_layout_field_count: 0,
+        state_layout_slot_count: 0,
+        canonical_layout_verifier_fingerprint: Hash::get_zero_value(),
+        canonical_layout_proof: vec![0],
+    }
 }
 
 struct PsyCoordinatorHTTPClient<F: QFelt64, Hash: QFHashBase<F> + QDBHashBase + QPGenRandom, Hasher: FieldQHasher<F, Hash> ,JobId: QJobIdBase + Send + Sync + 'static, ZKProof: Send + Sync + 'static, C: CoordinatorEdgeRpcClient<F, Hash, JobId, ZKProof>> {

@@ -131,12 +131,37 @@ fn count_imt_maps_in_type(ty: &ResolvedType, structs: &HashMap<String, StructLay
     }
 }
 
+fn contains_imt_map(ty: &ResolvedType, structs: &HashMap<String, StructLayout>) -> Result<bool> {
+    Ok(match ty {
+        ResolvedType::ContractHashMap { .. } => true,
+        ResolvedType::Array { element, .. } | ResolvedType::ContractStateArray { element, .. } => contains_imt_map(element, structs)?,
+        ResolvedType::Struct(name) => {
+            let layout = structs.get(name).ok_or_else(|| anyhow::anyhow!("Unknown struct: {}", name))?;
+            layout
+                .fields
+                .iter()
+                .map(|field| contains_imt_map(&field.ty, structs))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .any(|contains| contains)
+        }
+        _ => false,
+    })
+}
+
 /// Compute struct layout from its fields.
 pub fn compute_struct_layout(name: &str, fields: &[(String, ResolvedType)], structs: &HashMap<String, StructLayout>) -> Result<StructLayout> {
     let mut offset = 0;
     let mut field_layouts = Vec::new();
 
     for (fname, fty) in fields {
+        if contains_imt_map(fty, structs)? {
+            bail!(
+                "state-layout V1 forbids ContractHashMap inside struct '{}.{}'; aligned maps must be direct top-level contract fields",
+                name,
+                fname
+            );
+        }
         let size = fty.felt_size(structs)?;
         field_layouts.push(FieldLayout {
             name: fname.clone(),
@@ -162,6 +187,9 @@ pub fn compute_contract_layout(
 ) -> Result<ContractStateLayout> {
     let mut total_imt_maps = 0usize;
     for (_fname, fty) in fields {
+        if !matches!(fty, ResolvedType::ContractHashMap { .. }) && contains_imt_map(fty, structs)? {
+            bail!("state-layout V1 forbids ContractHashMap nested in arrays or structs; aligned maps must be direct top-level contract fields");
+        }
         total_imt_maps += count_imt_maps_in_type(fty, structs)?;
     }
     if total_imt_maps > 1 {

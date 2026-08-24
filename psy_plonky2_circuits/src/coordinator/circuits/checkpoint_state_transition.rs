@@ -10,7 +10,7 @@ use plonky2::{
     }
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
-use psy_data::{protocol::{checkpoint_transition_hash::{CheckpointStateHashTransition, CheckpointStateTransitionPublicInputs}, circuit_inputs::checkpoint_transition::QCQEDCheckpointStateTransitionInput}, v1::qdata::checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf}, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse};
+use psy_data::{agg::AggStateTransition, protocol::{checkpoint_transition_hash::{CheckpointStateHashTransition, CheckpointStateTransitionPublicInputs}, circuit_inputs::checkpoint_transition::QCQEDCheckpointStateTransitionInput}, v1::qdata::checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf}, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse};
 use psy_plonky2_basic_helpers::{
     builder::pad_circuit::CircuitBuilderQEDCommonGates, verifier::circuit_library::CircuitInfoLibrary,
 
@@ -207,7 +207,11 @@ where
         self.child_proofs_gadget.set_witness_params(
             &mut pw,
             &witness.partial.part_1_header.register_users_state_transition.get_agg_state_transition(),
-            &witness.partial.part_1_header.deploy_contracts_state_transition.get_agg_state_transition(),
+            // the combined contract tree transition chains deploy then update
+            &AggStateTransition {
+                state_transition_start: witness.partial.part_1_header.deploy_contracts_state_transition.state_transition_start,
+                state_transition_end: witness.partial.part_1_header.update_contracts_state_transition.state_transition_end,
+            },
             &witness.partial.part_1_header.guta_proof_header,
             witness.partial.pm_jobs_completed.deploy_contracts_completed,
             witness.partial.pm_jobs_completed.register_users_completed,

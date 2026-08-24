@@ -1,9 +1,9 @@
-use parth_core::{QJOB_ID_SERIALIZED_SIZE, QJobIdBase, crypto::hash::{tag_tree::hash_tag_tree_node, traits::{MerkleHasher, ZeroableHash}}, data::hash::merkle_node_key::SimpleMerkleNodeKey, protocol::core_types::Q256BitHash, utils::QPGenRandom};
+use parth_core::{QJOB_ID_SERIALIZED_SIZE, QJobIdBase, crypto::hash::{tag_tree::{hash_tag_tree_node, hash_tag_tree_node_four}, traits::{MerkleHasher, ZeroableHash}}, data::hash::merkle_node_key::SimpleMerkleNodeKey, protocol::core_types::Q256BitHash, utils::QPGenRandom};
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
-use crate::worker::{api_response::PROVING_JOB_NODE_TYPE_REALM, metadata::{PROOF_REWARD_TREE_HASH_MODE_3_CHILDREN_DOUBLE_REWARD, PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD, PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD, PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN}};
+use crate::worker::{api_response::PROVING_JOB_NODE_TYPE_REALM, metadata::{PROOF_REWARD_TREE_HASH_MODE_3_CHILDREN_DOUBLE_REWARD, PROOF_REWARD_TREE_HASH_MODE_4_CHILDREN, PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD, PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD, PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN}};
 
 
 #[pderive::serialize_copy_hash_job_id_ts]
@@ -67,6 +67,14 @@ impl<Hash: ZeroableHash + Copy, JobId> PsyProvingJobClaimMetadata<Hash, JobId> {
                 let right_value = hash_tag_tree_node::<Hash, Hasher>(&children[2], &zero, &tag);
                 let top_value = hash_tag_tree_node::<Hash, Hasher>(&left_value, &right_value, &tag);
                 top_value
+            }
+            PROOF_REWARD_TREE_HASH_MODE_4_CHILDREN => {
+                if children.len() != 4 {
+                    anyhow::bail!("Expected 4 children for 4-children reward hash mode, got {}", children.len());
+                }
+                // NOTE: uses the same nested layout as
+                // PsyProvingJobMetadata::get_new_rewards_tag_tree_value
+                hash_tag_tree_node_four::<Hash, Hasher>(&children[0], &children[1], &children[2], &children[3], &tag)
             }
             PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD => {
                 if children.len() == 0 {

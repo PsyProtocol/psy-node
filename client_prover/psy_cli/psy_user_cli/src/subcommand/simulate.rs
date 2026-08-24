@@ -1,6 +1,6 @@
 use std::{fs, path::Path};
 
-use psy_client_data::abi::Abi;
+use psy_compiler::{abi::Abi, output::serialize::CompilationArtifact};
 use psy_vm::dpn::{
     eval::executor::{ExecutionContext, ExecutionResult, InMemoryStateBackend, VmExecutor},
     vm::def::DPNFunctionCircuitDefinition,
@@ -81,41 +81,63 @@ fn load_contract(args: &SimulateArgs) -> anyhow::Result<(Vec<DPNFunctionCircuitD
         // Load pre-compiled circuit definitions + ABI
         let defs_source = fs::read_to_string(defs_path)
             .map_err(|error| anyhow::anyhow!("failed to read circuit definitions {}: {}", defs_path, error))?;
-        let defs: Vec<DPNFunctionCircuitDefinition> = serde_json::from_str(&defs_source)
-            .map_err(|error| anyhow::anyhow!("failed to parse circuit definitions {}: {}", defs_path, error))?;
 
-        let abi = if let Some(abi_path) = &args.abi_path {
-            let abi_source = fs::read_to_string(abi_path)
-                .map_err(|error| anyhow::anyhow!("failed to read ABI {}: {}", abi_path, error))?;
-            serde_json::from_str(&abi_source).map_err(|error| anyhow::anyhow!("failed to parse ABI {}: {}", abi_path, error))?
+        // Prefer the unified compilation artifact (state_tree_height + defs + ABI).
+        // Fall back to the legacy raw array of circuit definitions for backward
+        // compatibility.
+        let (defs, abi) = if let Ok(artifact) = serde_json::from_str::<CompilationArtifact>(&defs_source) {
+            (artifact.circuit_definitions, artifact.abi)
         } else {
-            // If no ABI path, create a minimal ABI from the circuit definitions
-            Abi {
-                schema_version: "2.0.0".to_string(),
-                contract: psy_client_data::abi::AbiContract {
-                    name: "Unknown".to_string(),
-                    state_tree_height: 0,
-                    state: vec![],
-                    methods: defs
-                        .iter()
-                        .map(|d| psy_client_data::abi::AbiMethod {
-                            name: d.name.clone(),
-                            method_id: d.method_id,
-                            state_mutability: if d.is_view_function() {
-                                psy_client_data::abi::StateMutability::View
-                            } else {
-                                psy_client_data::abi::StateMutability::External
+            let defs: Vec<DPNFunctionCircuitDefinition> = serde_json::from_str(&defs_source)
+                .map_err(|error| anyhow::anyhow!("failed to parse circuit definitions {}: {}", defs_path, error))?;
+
+            let abi = if let Some(abi_path) = &args.abi_path {
+                let abi_source = fs::read_to_string(abi_path)
+                    .map_err(|error| anyhow::anyhow!("failed to read ABI {}: {}", abi_path, error))?;
+                serde_json::from_str(&abi_source).map_err(|error| anyhow::anyhow!("failed to parse ABI {}: {}", abi_path, error))?
+            } else {
+                // If no ABI path, create a minimal ABI from the circuit definitions
+                Abi {
+                    schema_version: "2.0.0".to_string(),
+                    contract: psy_compiler::abi::AbiContract {
+                        name: "Unknown".to_string(),
+                        state_tree_height: 0,
+                        state: vec![],
+                        state_layout: psy_compiler::abi::AbiStateLayout {
+                            layout_version: 1,
+                            encoding_version: 1,
+                            field_count: 0,
+                            slot_count: 0,
+                            fields: vec![],
+                            type_proof_plan: psy_compiler::abi::AbiTypeProofPlan {
+                                protocol_version: 1,
+                                nodes: vec![],
+                                field_nodes: vec![],
                             },
-                            inputs: vec![],
-                            outputs: vec![],
-                            input_felt_count: 0,
-                            output_felt_count: 0,
-                            vm_type: None,
-                        })
-                        .collect(),
-                },
-                types: vec![],
-            }
+                        },
+                        methods: defs
+                            .iter()
+                            .map(|d| psy_compiler::abi::AbiMethod {
+                                name: d.name.clone(),
+                                method_id: d.method_id,
+                                state_mutability: if d.is_view_function() {
+                                    psy_compiler::abi::StateMutability::View
+                                } else {
+                                    psy_compiler::abi::StateMutability::External
+                                },
+                                inputs: vec![],
+                                outputs: vec![],
+                                input_felt_count: 0,
+                                output_felt_count: 0,
+                                vm_type: None,
+                            })
+                            .collect(),
+                    },
+                    types: vec![],
+                }
+            };
+
+            (defs, abi)
         };
 
         Ok((defs, abi))
@@ -235,7 +257,7 @@ fn format_result(result: &ExecutionResult, abi: &Abi, args: &SimulateArgs) -> an
 
 /// Try to resolve a slot index to a human-readable field name from the ABI
 fn resolve_field_name(abi: &Abi, slot_index: u64) -> Option<String> {
-    use psy_client_data::abi::TypeRef;
+    use psy_compiler::abi::TypeRef;
     for field in &abi.contract.state {
         let offset = field.offset as u64;
         let size = field.felt_size as u64;

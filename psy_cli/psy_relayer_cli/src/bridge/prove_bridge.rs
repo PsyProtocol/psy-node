@@ -67,7 +67,18 @@ const DEPOSIT_BATCH_TREE_HEIGHT: usize = 32;
 const NETWORK_TYPE: PsyChainNetworkType = PsyChainNetworkType::LocalDevnet;
 const GLOBAL_USER_TREE_HEIGHT: usize = PsyNetworkLocalDevnetConstants::GLOBAL_USER_TREE_HEIGHT_USIZE;
 const GLOBAL_CONTRACT_TREE_HEIGHT: usize = PsyNetworkLocalDevnetConstants::GLOBAL_CONTRACT_TREE_HEIGHT_USIZE;
-const CONTRACT_STATE_TREE_HEIGHT: usize = PsyNetworkLocalDevnetConstants::MAX_CONTRACT_STATE_TREE_HEIGHT_USIZE;
+const DEPOSIT_CONTRACT_STATE_TREE_HEIGHT: usize =
+    psy_config::network_constants::DEPOSIT_TREE_CONTRACT_STATE_TREE_HEIGHT as usize;
+const WITHDRAWAL_CONTRACT_STATE_TREE_HEIGHT: usize =
+    psy_config::network_constants::WITHDRAWAL_TREE_CONTRACT_STATE_TREE_HEIGHT as usize;
+
+fn bridge_contract_state_tree_height(contract_id: u32) -> anyhow::Result<u8> {
+    match contract_id {
+        DEPOSIT_TREE_CONTRACT_ID => Ok(DEPOSIT_CONTRACT_STATE_TREE_HEIGHT as u8),
+        WITHDRAWAL_TREE_CONTRACT_ID => Ok(WITHDRAWAL_CONTRACT_STATE_TREE_HEIGHT as u8),
+        _ => anyhow::bail!("unsupported bridge tree contract id: {}", contract_id),
+    }
+}
 
 pub(crate) fn cached_bridge_coordinator_circuits() -> anyhow::Result<&'static QEDCoordinatorCircuitManager<C, D>> {
     static CACHE: OnceLock<QEDCoordinatorCircuitManager<C, D>> = OnceLock::new();
@@ -196,11 +207,12 @@ async fn fetch_tree_root_witness(
     owner_user_id: u64,
     contract_id: u32,
 ) -> anyhow::Result<TreeRootInContractStateWitnessInput<F>> {
+    let contract_state_tree_height = bridge_contract_state_tree_height(contract_id)?;
     let slot0_proof = provider
-        .get_user_contract_state_tree_merkle_proof(checkpoint_id, owner_user_id, contract_id, CONTRACT_STATE_TREE_HEIGHT as u8, 0)
+        .get_user_contract_state_tree_merkle_proof(checkpoint_id, owner_user_id, contract_id, contract_state_tree_height, 0)
         .await?;
     let slot1_proof = provider
-        .get_user_contract_state_tree_merkle_proof(checkpoint_id, owner_user_id, contract_id, CONTRACT_STATE_TREE_HEIGHT as u8, 1)
+        .get_user_contract_state_tree_merkle_proof(checkpoint_id, owner_user_id, contract_id, contract_state_tree_height, 1)
         .await?;
     let contract_proof = provider
         .get_user_contract_tree_merkle_proof(checkpoint_id, owner_user_id, contract_id)
@@ -244,11 +256,12 @@ async fn fetch_slot_pair_as_b256(
     contract_id: u32,
     slot_lo: u64,
 ) -> anyhow::Result<B256> {
+    let contract_state_tree_height = bridge_contract_state_tree_height(contract_id)?;
     let slot0 = provider
-        .get_user_contract_state_tree_merkle_proof(checkpoint_id, owner_user_id, contract_id, CONTRACT_STATE_TREE_HEIGHT as u8, slot_lo)
+        .get_user_contract_state_tree_merkle_proof(checkpoint_id, owner_user_id, contract_id, contract_state_tree_height, slot_lo)
         .await?;
     let slot1 = provider
-        .get_user_contract_state_tree_merkle_proof(checkpoint_id, owner_user_id, contract_id, CONTRACT_STATE_TREE_HEIGHT as u8, slot_lo + 1)
+        .get_user_contract_state_tree_merkle_proof(checkpoint_id, owner_user_id, contract_id, contract_state_tree_height, slot_lo + 1)
         .await?;
     let lo = slot_value_to_u32x4(slot0.value);
     let hi = slot_value_to_u32x4(slot1.value);
@@ -832,7 +845,8 @@ pub async fn run_prove_bridge_agg_with_result(
         CHECKPOINT_TREE_HEIGHT,
         GLOBAL_USER_TREE_HEIGHT,
         GLOBAL_CONTRACT_TREE_HEIGHT,
-        CONTRACT_STATE_TREE_HEIGHT,
+        DEPOSIT_CONTRACT_STATE_TREE_HEIGHT,
+        WITHDRAWAL_CONTRACT_STATE_TREE_HEIGHT,
     )?;
     eprintln!(
         "Bridge aggregation proof generated successfully. step_count: {}",
@@ -1307,6 +1321,7 @@ pub async fn run_prove_bridge_agg_with_result_remote(
         uid: u64,
         contract_id: u32,
     ) -> anyhow::Result<BridgeAggSlotWitness> {
+        let contract_state_tree_height = bridge_contract_state_tree_height(contract_id)?;
         let qhash_to_hex = |h: parth_core::pgoldilocks::QHashOut<F>| -> String {
             format!("0x{:016x}{:016x}{:016x}{:016x}",
                 h.0.elements[3].to_canonical_u64(),
@@ -1316,10 +1331,10 @@ pub async fn run_prove_bridge_agg_with_result_remote(
         };
 
         let slot0_proof = provider
-            .get_user_contract_state_tree_merkle_proof(cp, uid, contract_id, CONTRACT_STATE_TREE_HEIGHT as u8, 0)
+            .get_user_contract_state_tree_merkle_proof(cp, uid, contract_id, contract_state_tree_height, 0)
             .await?;
         let slot1_proof = provider
-            .get_user_contract_state_tree_merkle_proof(cp, uid, contract_id, CONTRACT_STATE_TREE_HEIGHT as u8, 1)
+            .get_user_contract_state_tree_merkle_proof(cp, uid, contract_id, contract_state_tree_height, 1)
             .await?;
         let contract_proof = provider
             .get_user_contract_tree_merkle_proof(cp, uid, contract_id)

@@ -5,13 +5,13 @@ use parth_core::{
     QCoreProcCheckpointUniqueId, QProvingJobDataIDWithRewardPath, crypto::hash::{merkle_proof::MerkleProofCore, tag_tree::TagTreeMerkleProof, traits::QFieldHashable}, data::{hash::merkle_node_key::SimpleMerkleNodeKey, queue::queue_key::QPBaseQueueType}, felt::ToU64Value, node::realm_identifier::QRealmIdentifier, protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofVerifier}
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
-use psy_crypto::hash::tx_hash::{compute_deploy_contract_content_hash, hash_to_hex};
+use psy_crypto::hash::tx_hash::{compute_deploy_contract_content_hash, compute_update_contract_content_hash, hash_to_hex};
 use psy_api_core::CheckpointJobStats;
 use psy_data::{
     guta::header_extended::{GlobalUserTreeAggregatorHeaderWithTagValueAndJobID, GlobalUserTreeAggregatorHeaderWithTagValueAndJobType}, prepared_block::realm::PsyRealmCoordinatorUpdate, v1::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
-            checkpoint::PQEDCheckpointGlobalStateRoots, checkpoint_sync::PQEDCheckpointSyncInfoCompact, contract::{DashMapContractHeightCache, PQBCDeployContract, PsyDeployContractQueueItem}, public_key::PZKPublicKeyInfo
+            checkpoint::PQEDCheckpointGlobalStateRoots, checkpoint_sync::PQEDCheckpointSyncInfoCompact, contract::{DashMapContractHeightCache, PQBCDeployContractV2, PQBCUpdateContract, PsyDeployContractQueueItemV2, PsyUpdateContractQueueItem}, public_key::PZKPublicKeyInfo
         },
     }
 };
@@ -23,7 +23,8 @@ use psy_node_core::{
 };
 use psy_serialize::{PsyCanonicalDatabaseSerializeBaseMulti, PsyCanonicalDatabaseSerializeBaseSingle};
 
-use crate::coordinator::queue_key::{CoordinatorDeployContractQueueKey, CoordinatorRegisterUserPublicKeyQueueKey, CoordinatorSubmitRealmGUTAUpdateQueueKey};
+use crate::coordinator::queue_key::{CoordinatorDeployContractQueueKey, CoordinatorRegisterUserPublicKeyQueueKey, CoordinatorSubmitRealmGUTAUpdateQueueKey, CoordinatorUpdateContractQueueKey};
+
 
 // const END_CAP_PROOF_CIRCUIT_TYPE_U32: u32 = ProvingJobCircuitType::UserEndCap as u32;
 pub struct CoordinatorEdgeHandler<
@@ -44,7 +45,7 @@ pub struct CoordinatorEdgeHandler<
 
     pub guta_update_queue: Arc<GUTAUpdateQueue>,
     pub register_user_queue: Arc<RegisterUserQueue>,
-    pub deploy_contract_queue: Arc<DeployContractQueue>,
+    pub contract_queue: Arc<DeployContractQueue>,
     pub get_proof_work_queue: Arc<GetProofWorkQueue>,
 
     pub realm_identifier: QRealmIdentifier,
@@ -87,7 +88,7 @@ impl<
             proof_store: self.proof_store.clone(),
             guta_update_queue: self.guta_update_queue.clone(),
             register_user_queue: self.register_user_queue.clone(),
-            deploy_contract_queue: self.deploy_contract_queue.clone(),
+            contract_queue: self.contract_queue.clone(),
             get_proof_work_queue: self.get_proof_work_queue.clone(),
             realm_identifier: self.realm_identifier.clone(),
             realm_id_u64: self.realm_id_u64.clone(),
@@ -128,7 +129,7 @@ impl<
         proof_store: Arc<ProofStore>,
         guta_update_queue: Arc<GUTAUpdateQueue>,
         register_user_queue: Arc<RegisterUserQueue>,
-        deploy_contract_queue: Arc<DeployContractQueue>,
+        contract_queue: Arc<DeployContractQueue>,
         get_proof_work_queue: Arc<GetProofWorkQueue>,
         realm_identifier: QRealmIdentifier,
         proof_verifier: Arc<N::ZKVerifier>,
@@ -143,7 +144,7 @@ impl<
             proof_store,
             guta_update_queue,
             register_user_queue,
-            deploy_contract_queue,
+            contract_queue,
             get_proof_work_queue,
             realm_identifier,
             realm_id_u64,
@@ -361,6 +362,25 @@ impl<
         ))
     }
 
+    pub async fn get_update_contract_queue_key(
+        &self,
+    ) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId, CoordinatorUpdateContractQueueKey<N::F, N::QHash>)> {
+        let (unique_pending_id, unique_proc_checkpoint_id) = self.temp_db.get_gathering_unique_pending_ids(&self.realm_identifier).await?;
+
+        Ok((
+            unique_pending_id,
+            unique_proc_checkpoint_id,
+            CoordinatorUpdateContractQueueKey {
+                realm_id: self.realm_id_u64,
+                realm_sub_id: self.realm_sub_id_u64,
+                unique_id: unique_proc_checkpoint_id,
+                task_group: 0,
+                queue_type: QPBaseQueueType::StandardEphemeral,
+                _phantom_queue_item: std::marker::PhantomData,
+            },
+        ))
+    }
+
     pub async fn register_user_internal(&self, public_key: PZKPublicKeyInfo<N::QHash>) -> anyhow::Result<String>
     where
         N::ZKVerifier: 'static,
@@ -379,30 +399,63 @@ impl<
 
         Ok("ok".to_string())
     }
-    pub async fn deploy_contract_internal(&self, deploy_contract: PQBCDeployContract<N::QHash>) -> anyhow::Result<String> {
-        if deploy_contract.code_definition.functions.len() == 0 {
-            anyhow::bail!("contracts with no functions are not supported");
-        } else if deploy_contract.code_definition.functions.len() > (1usize << N::CONTRACT_FUNCTION_TREE_HEIGHT) {
-            anyhow::bail!("contract has too many functions defined");
-        }
+    pub async fn deploy_contract_internal(
+        &self,
+        deploy_contract: PQBCDeployContractV2<N::QHash>,
+    ) -> anyhow::Result<String> {
+        deploy_contract.validate_shape()?;
 
-        let (unique_pending_id, unique_proc_checkpoint_id, queue_key) = self.get_deploy_contract_queue_key().await?;
+        let function_count = deploy_contract
+            .deploy_contract
+            .code_definition
+            .functions
+            .len();
+        anyhow::ensure!(
+            function_count != 0,
+            "contracts with no functions are not supported"
+        );
+        anyhow::ensure!(
+            function_count <= (1usize << N::CONTRACT_FUNCTION_TREE_HEIGHT),
+            "contract has too many functions defined"
+        );
 
-        let (deployer, code_definition, function_leaves, code_root) = deploy_contract.split_into_tuple();
-        let queue_item = PsyDeployContractQueueItem::<N::F, N::QHash>::new_from_leaves_and_deployer::<N::HasherBase>(
-            deployer,
-            code_definition.state_tree_height,
-            function_leaves,
-            code_root,
-            N::CONTRACT_FUNCTION_TREE_HEIGHT_USIZE,
-        )?;
+        let PQBCDeployContractV2 {
+            deploy_contract,
+            layout_protocol_version,
+            state_layout_root,
+            state_layout_field_count,
+            state_layout_slot_count,
+            canonical_layout_verifier_fingerprint,
+            canonical_layout_proof,
+        } = deploy_contract;
+        let (deployer, code_definition, function_leaves, code_root) =
+            deploy_contract.split_into_tuple();
+        let queue_item =
+            PsyDeployContractQueueItemV2::<N::F, N::QHash>::
+                new_from_layout_endpoint::<N::HasherBase>(
+                    deployer,
+                    code_definition.state_tree_height,
+                    function_leaves,
+                    code_root,
+                    N::CONTRACT_FUNCTION_TREE_HEIGHT_USIZE,
+                    layout_protocol_version,
+                    state_layout_root,
+                    state_layout_field_count,
+                    state_layout_slot_count,
+                    canonical_layout_verifier_fingerprint,
+                    canonical_layout_proof,
+                )?;
+
+        let (unique_pending_id, unique_proc_checkpoint_id, queue_key) =
+            self.get_deploy_contract_queue_key().await?;
         let deploy_content_hash = compute_deploy_contract_content_hash(
             &queue_item.contract_leaf.deployer.into_owned_32bytes(),
-            &queue_item.contract_leaf.function_tree_root.into_owned_32bytes(),
+            &queue_item
+                .contract_leaf
+                .function_tree_root
+                .into_owned_32bytes(),
             code_definition.state_tree_height as u64,
         );
-        let deploy_content_hash_hex = hash_to_hex(&deploy_content_hash);
-
         self.temp_db
             .set_deploy_contract_code_definition_raw(
                 &self.realm_identifier,
@@ -411,9 +464,110 @@ impl<
                 code_definition.psy_ser_into_bytes_vec()?,
             )
             .await?;
-        tracing::info!("Stored deploy contract code definition raw in temp DB for pending id {} with rand key {:?}", unique_pending_id, &queue_item.rand_key_id);
+        self.contract_queue
+            .publish_ephemeral_queue_item_owned_bytes(
+                &queue_key,
+                self.realm_id_u64,
+                self.realm_sub_id_u64,
+                unique_proc_checkpoint_id,
+                0,
+                queue_item.psy_ser_into_bytes_vec()?,
+            )
+            .await?;
+        Ok(hash_to_hex(&deploy_content_hash))
+    }
 
-        self.deploy_contract_queue
+    pub async fn update_contract_internal(&self, update_contract: PQBCUpdateContract<N::QHash>) -> anyhow::Result<String> {
+        update_contract.validate_shape()?;
+        if update_contract.code_definition.functions.len() == 0 {
+            anyhow::bail!("contracts with no functions are not supported");
+        } else if update_contract.code_definition.functions.len() > (1usize << N::CONTRACT_FUNCTION_TREE_HEIGHT) {
+            anyhow::bail!("contract has too many functions defined");
+        }
+
+        if update_contract.contract_id == 0 {
+            anyhow::bail!("contract id 0 is reserved and cannot be updated");
+        }
+
+        // Auth check: the contract must already exist on chain and the caller must
+        // be the original deployer. NOTE: db_reader reflects the last committed
+        // checkpoint state; updates gathered in the current pending block are not
+        // visible here, so the gatherer must re-validate against its in-memory
+        // global contract tree (TODO in the update contract gatherer phase).
+        let latest_checkpoint_id =
+            self.get_latest_checkpoint_id_internal().await?;
+        let existing_leaf = self
+            .db_reader
+            .get_contract_leaf(
+                latest_checkpoint_id,
+                update_contract.contract_id,
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("contract with id {} does not exist", update_contract.contract_id))?;
+
+        if existing_leaf.deployer != update_contract.deployer {
+            anyhow::bail!(
+                "only the original deployer can update contract {}",
+                update_contract.contract_id
+            );
+        }
+        anyhow::ensure!(
+            existing_leaf.state_tree_height.to_u64_value()
+                == update_contract.code_definition.state_tree_height as u64,
+            "contract state tree height is immutable"
+        );
+
+        let (unique_pending_id, unique_proc_checkpoint_id, queue_key) = self.get_update_contract_queue_key().await?;
+
+        let PQBCUpdateContract {
+            contract_id,
+            deployer,
+            code_definition,
+            function_whitelist: function_leaves,
+            code_root,
+            layout_protocol_version,
+            state_layout_root,
+            state_layout_field_count,
+            state_layout_slot_count,
+            canonical_layout_verifier_fingerprint,
+            canonical_layout_proof,
+        } = update_contract;
+        let queue_item = PsyUpdateContractQueueItem::<N::F, N::QHash>::new_from_leaves_and_deployer::<N::HasherBase>(
+            contract_id,
+            deployer,
+            // state tree height is immutable: always reuse the on-chain value
+            existing_leaf.state_tree_height.to_u64_value() as u16,
+            state_layout_root,
+            state_layout_field_count,
+            state_layout_slot_count,
+            layout_protocol_version,
+            canonical_layout_verifier_fingerprint,
+            canonical_layout_proof,
+            function_leaves,
+            code_root,
+            N::CONTRACT_FUNCTION_TREE_HEIGHT_USIZE,
+        )?;
+        let update_content_hash = compute_update_contract_content_hash(
+            contract_id,
+            &queue_item.contract_leaf.deployer.into_owned_32bytes(),
+            &queue_item.contract_leaf.function_tree_root.into_owned_32bytes(),
+            queue_item.contract_leaf.state_tree_height.to_u64_value(),
+        );
+        let update_content_hash_hex = hash_to_hex(&update_content_hash);
+
+        // reuse the deploy contract code definition temp db storage (keyed by
+        // realm + unique_pending_id + rand_key_id) to keep changes minimal
+        self.temp_db
+            .set_deploy_contract_code_definition_raw(
+                &self.realm_identifier,
+                unique_pending_id,
+                &queue_item.rand_key_id,
+                code_definition.psy_ser_into_bytes_vec()?,
+            )
+            .await?;
+        tracing::info!("Stored update contract code definition raw in temp DB for pending id {} with rand key {:?}", unique_pending_id, &queue_item.rand_key_id);
+
+        self.contract_queue
             .publish_ephemeral_queue_item_owned_bytes(
                 &queue_key,
                 self.realm_id_u64,
@@ -424,7 +578,7 @@ impl<
             )
             .await?;
 
-        Ok(deploy_content_hash_hex)
+        Ok(update_content_hash_hex)
     }
 }
 

@@ -10,7 +10,12 @@ use plonky2::{
         config::AlgebraicHasher
     ,
 };
+use std::time::Instant;
 use psy_core::{
+    constants::protocol::{
+        STATE_LAYOUT_APPEND_SUB_TREE_HEIGHT, STATE_LAYOUT_MAX_AGGREGATION_DEPTH,
+        STATE_LAYOUT_TREE_HEIGHT,
+    },
     job::job_id::{ProvingJobCircuitType, QProvingJobDataID},
     worker::traits::QNextGenWorkerGenericInfo,
 };
@@ -20,7 +25,7 @@ use psy_worker_core::worker::prover_trait::{PsyWorkerGenericLibraryProver, PsyWo
 
 use super::circuits::{
     agg_user_registration_deploy_guta::VerifyAggUserRegistartionDeployContractsGUTACircuit,
-    batch_append_user_registration_tree::BatchAppendUserRegistrationTreeCircuit, batch_deploy_contract::BatchDeployContractsCircuit,
+    batch_append_user_registration_tree::BatchAppendUserRegistrationTreeCircuit,
     checkpoint_state_transition::QEDCheckpointStateTransitionCircuit,
 };
 use crate::{
@@ -41,10 +46,14 @@ where
 {
     pub append_user_registration_tree: BatchAppendUserRegistrationTreeCircuit<C, D>,
     pub append_register_users_circuit_whitelist: QHashOut<C::F>,
-    pub batch_deploy_contracts: BatchDeployContractsCircuit<C, D>,
+    pub state_layout_circuits:
+        super::state_layout_helper::StateLayoutCircuitManager<C, D>,
     pub batch_deploy_contracts_circuit_whitelist: QHashOut<C::F>,
+    pub batch_update_contracts_circuit_whitelist: QHashOut<C::F>,
 
     pub agg_state_transition: AggStateTransitionCircuitV2<C, D>,
+    pub deploy_agg_state_transition: AggStateTransitionCircuitV2<C, D>,
+    pub update_agg_state_transition: AggStateTransitionCircuitV2<C, D>,
     pub dummy_agg_state_transition: AggStateTransitionDummyCircuitV2<C, D>,
     pub agg_user_register_deploy_contracts_guta: VerifyAggUserRegistartionDeployContractsGUTACircuit<C, D>,
     pub guta_circuits: QEDGUTACircuitManager<C, D>,
@@ -118,15 +127,40 @@ where     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + Fi
             batch_user_registration_sub_tree_height,
             batch_user_registration_max_sub_trees,
         );
-        let batch_deploy_contracts = BatchDeployContractsCircuit::new(
-            global_contract_tree_height,
-            batch_deploy_contract_sub_tree_height,
-            max_contract_state_tree_height,
-        );
+
+        let state_layout_circuits =
+            super::state_layout_helper::StateLayoutCircuitManager::new(
+                STATE_LAYOUT_TREE_HEIGHT
+                    - STATE_LAYOUT_APPEND_SUB_TREE_HEIGHT,
+                STATE_LAYOUT_APPEND_SUB_TREE_HEIGHT,
+                global_contract_tree_height,
+                batch_deploy_contract_sub_tree_height,
+                STATE_LAYOUT_TREE_HEIGHT,
+                max_contract_state_tree_height,
+                STATE_LAYOUT_MAX_AGGREGATION_DEPTH,
+            );
+        let batch_deploy_contracts =
+            &state_layout_circuits.batch_deploy_contracts;
+        let batch_update_contracts =
+            &state_layout_circuits.batch_update_contracts;
 
         let agg_state_transition = AggStateTransitionCircuitV2::new(
             &append_user_registration_tree.get_common_circuit_data_ref(),
             append_user_registration_tree.get_verifier_config_ref().constants_sigmas_cap.height(),
+        );
+        let deploy_agg_state_transition = AggStateTransitionCircuitV2::new(
+            batch_deploy_contracts.get_common_circuit_data_ref(),
+            batch_deploy_contracts
+                .get_verifier_config_ref()
+                .constants_sigmas_cap
+                .height(),
+        );
+        let update_agg_state_transition = AggStateTransitionCircuitV2::new(
+            batch_update_contracts.get_common_circuit_data_ref(),
+            batch_update_contracts
+                .get_verifier_config_ref()
+                .constants_sigmas_cap
+                .height(),
         );
 
         let dummy_agg_state_transition = AggStateTransitionDummyCircuitV2::new();
@@ -135,7 +169,10 @@ where     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + Fi
             C::Hasher::two_to_one(&append_user_registration_tree.get_fingerprint(), &agg_state_transition.get_fingerprint());
 
         let batch_deploy_contracts_circuit_whitelist =
-            C::Hasher::two_to_one(&batch_deploy_contracts.get_fingerprint(), &agg_state_transition.get_fingerprint());
+            C::Hasher::two_to_one(&batch_deploy_contracts.get_fingerprint(), &deploy_agg_state_transition.get_fingerprint());
+
+        let batch_update_contracts_circuit_whitelist =
+            C::Hasher::two_to_one(&batch_update_contracts.get_fingerprint(), &update_agg_state_transition.get_fingerprint());
 
         let user_reg_transition_circuit_config = TPAltCircuitFingerprintConfig {
             leaf_fingerprint: append_user_registration_tree.get_fingerprint(),
@@ -145,15 +182,24 @@ where     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + Fi
         };
         let deploy_contracts_transition_circuit_config = TPAltCircuitFingerprintConfig {
             leaf_fingerprint: batch_deploy_contracts.get_fingerprint(),
-            aggregator_fingerprint: agg_state_transition.get_fingerprint(),
+            aggregator_fingerprint: deploy_agg_state_transition.get_fingerprint(),
             dummy_fingerprint: dummy_agg_state_transition.get_fingerprint(),
             verifier_data_cap_height: batch_deploy_contracts.get_verifier_config_ref().constants_sigmas_cap.height(),
         };
+        let update_contracts_transition_circuit_config = TPAltCircuitFingerprintConfig {
+            leaf_fingerprint: batch_update_contracts.get_fingerprint(),
+            aggregator_fingerprint: update_agg_state_transition.get_fingerprint(),
+            dummy_fingerprint: dummy_agg_state_transition.get_fingerprint(),
+            verifier_data_cap_height: batch_update_contracts.get_verifier_config_ref().constants_sigmas_cap.height(),
+        };
+        let started_at = Instant::now();
         let agg_user_register_deploy_contracts_guta = VerifyAggUserRegistartionDeployContractsGUTACircuit::<C, D>::new(
             append_user_registration_tree.get_common_circuit_data_ref(),
             &user_reg_transition_circuit_config,
             batch_deploy_contracts.get_common_circuit_data_ref(),
             &deploy_contracts_transition_circuit_config,
+            batch_update_contracts.get_common_circuit_data_ref(),
+            &update_contracts_transition_circuit_config,
             guta_circuits.verify_two_guta.get_common_circuit_data_ref(),
             guta_circuits.verify_two_guta.get_verifier_config_ref().constants_sigmas_cap.height(),
             guta_circuit_whitelist_tree_height,
@@ -177,8 +223,10 @@ where     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + Fi
 
         Self {
             append_user_registration_tree,
-            batch_deploy_contracts,
+            state_layout_circuits,
             agg_state_transition,
+            deploy_agg_state_transition,
+            update_agg_state_transition,
             dummy_agg_state_transition,
             guta_circuits,
             checkpoint_root_transition,
@@ -186,6 +234,7 @@ where     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + Fi
             agg_user_register_deploy_contracts_guta,
             append_register_users_circuit_whitelist,
             batch_deploy_contracts_circuit_whitelist,
+            batch_update_contracts_circuit_whitelist,
             public_key,
         }
     }
@@ -197,7 +246,7 @@ where     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + Fi
         );
         println!(
             "\n\n\n\n================================\n[batch_deploy_contracts.common]:\n{:?}",
-            self.batch_deploy_contracts.get_common_circuit_data_ref()
+            self.state_layout_circuits.batch_deploy_contracts.get_common_circuit_data_ref()
         );
         println!(
             "================================\n[agg_state_transition.common]:\n{:?}",
@@ -241,16 +290,32 @@ where     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + Fi
 
         library.register_circuit(
             ProvingJobCircuitType::BatchDeployContracts.into(),
-            self.batch_deploy_contracts.get_fingerprint(),
-            self.batch_deploy_contracts.get_verifier_config_ref().into(),
+            self.state_layout_circuits.batch_deploy_contracts.get_fingerprint(),
+            self.state_layout_circuits.batch_deploy_contracts.get_verifier_config_ref().into(),
         );
         library.register_circuit(
             ProvingJobCircuitType::BatchDeployContractsAggregate.into(),
-            self.agg_state_transition.get_fingerprint(),
-            self.agg_state_transition.get_verifier_config_ref().into(),
+            self.deploy_agg_state_transition.get_fingerprint(),
+            self.deploy_agg_state_transition.get_verifier_config_ref().into(),
         );
         library.register_circuit(
             ProvingJobCircuitType::DummyBatchDeployContractsAggregate.into(),
+            self.dummy_agg_state_transition.get_fingerprint(),
+            self.dummy_agg_state_transition.get_verifier_config_ref().into(),
+        );
+
+        library.register_circuit(
+            ProvingJobCircuitType::BatchUpdateContracts.into(),
+            self.state_layout_circuits.batch_update_contracts.get_fingerprint(),
+            self.state_layout_circuits.batch_update_contracts.get_verifier_config_ref().into(),
+        );
+        library.register_circuit(
+            ProvingJobCircuitType::BatchUpdateContractsAggregate.into(),
+            self.update_agg_state_transition.get_fingerprint(),
+            self.update_agg_state_transition.get_verifier_config_ref().into(),
+        );
+        library.register_circuit(
+            ProvingJobCircuitType::DummyBatchUpdateContractsAggregate.into(),
             self.dummy_agg_state_transition.get_fingerprint(),
             self.dummy_agg_state_transition.get_verifier_config_ref().into(),
         );
@@ -293,6 +358,9 @@ where
             ProvingJobCircuitType::BatchDeployContracts => true,
             ProvingJobCircuitType::BatchDeployContractsAggregate => true,
             ProvingJobCircuitType::DummyBatchDeployContractsAggregate => true,
+            ProvingJobCircuitType::BatchUpdateContracts => true,
+            ProvingJobCircuitType::BatchUpdateContractsAggregate => true,
+            ProvingJobCircuitType::DummyBatchUpdateContractsAggregate => true,
             ProvingJobCircuitType::AggUserRegisterDeployContractsGUTA => true,
             ProvingJobCircuitType::GenerateRollupStateTransitionProof => true,
             ProvingJobCircuitType::GenesisBlockCheckpointStateTransition => true,
@@ -340,14 +408,27 @@ where
             }
 
             ProvingJobCircuitType::BatchDeployContracts => {
-                self.batch_deploy_contracts
+                self.state_layout_circuits.batch_deploy_contracts
                     .prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag)
             }
             ProvingJobCircuitType::BatchDeployContractsAggregate => {
-                self.agg_state_transition
+                self.deploy_agg_state_transition
                     .prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag)
             }
             ProvingJobCircuitType::DummyBatchDeployContractsAggregate => {
+                self.dummy_agg_state_transition
+                    .prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag)
+            }
+
+            ProvingJobCircuitType::BatchUpdateContracts => {
+                self.state_layout_circuits.batch_update_contracts
+                    .prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag)
+            }
+            ProvingJobCircuitType::BatchUpdateContractsAggregate => {
+                self.update_agg_state_transition
+                    .prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag)
+            }
+            ProvingJobCircuitType::DummyBatchUpdateContractsAggregate => {
                 self.dummy_agg_state_transition
                     .prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag)
             }

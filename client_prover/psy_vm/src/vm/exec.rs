@@ -124,6 +124,18 @@ fn is_imt_predecessor_not_found_error(err: &anyhow::Error) -> bool {
     msg.contains("No predecessor found")
 }
 
+fn validate_contract_state_tree_height(height: u64) -> anyhow::Result<u8> {
+    const MAX_SUPPORTED_HEIGHT: u64 = 32;
+    if height == 0 || height > MAX_SUPPORTED_HEIGHT {
+        anyhow::bail!(
+            "contract_state_tree_height {} is outside supported range 1..={}",
+            height,
+            MAX_SUPPORTED_HEIGHT
+        );
+    }
+    Ok(height as u8)
+}
+
 fn validate_imt_slot_index(slot_index: u64, state_slot_base: u64, capacity: u64) -> anyhow::Result<u64> {
     let min_index = state_slot_base
         .checked_add(1)
@@ -860,7 +872,7 @@ impl<
                             checkpoint_id: self.get_current_start_checkpoint_id_u64(),
                             user_id: c.user_id,
                             contract_id: c.contract_id as u32,
-                            height: c.contract_state_tree_height,
+                            height: validate_contract_state_tree_height(c.contract_state_tree_height)?,
                             leaf_id: c.slot_index,
                         },
                     ))
@@ -897,7 +909,7 @@ impl<
                             checkpoint_id: self.get_current_start_checkpoint_id_u64(),
                             user_id: c.user_id,
                             contract_id: c.contract_id as u32,
-                            height: c.contract_state_tree_height,
+                            height: validate_contract_state_tree_height(c.contract_state_tree_height)?,
                             leaf_id: slot_index.to_canonical_u64(),
                         },
                     ))
@@ -936,7 +948,7 @@ impl<
                                 checkpoint_id: self.get_current_start_checkpoint_id_u64(),
                                 user_id: c.user_id,
                                 contract_id: c.contract_id as u32,
-                                height: c.contract_state_tree_height,
+                                height: validate_contract_state_tree_height(c.contract_state_tree_height)?,
                                 leaf_id: c.sub_slot_index / 4u64,
                             },
                         ))
@@ -961,7 +973,7 @@ impl<
                                 checkpoint_id: self.get_current_start_checkpoint_id_u64(),
                                 user_id: c.user_id,
                                 contract_id: c.contract_id as u32,
-                                height: c.contract_state_tree_height,
+                                height: validate_contract_state_tree_height(c.contract_state_tree_height)?,
                                 leaf_id: slot_index,
                             },
                         ))
@@ -972,7 +984,7 @@ impl<
                                 checkpoint_id: self.get_current_start_checkpoint_id_u64(),
                                 user_id: c.user_id,
                                 contract_id: c.contract_id as u32,
-                                height: c.contract_state_tree_height,
+                                height: validate_contract_state_tree_height(c.contract_state_tree_height)?,
                                 leaf_id: slot_index + 1,
                             },
                         ))
@@ -1007,7 +1019,7 @@ impl<
                                     checkpoint_id: self.get_current_start_checkpoint_id_u64(),
                                     user_id: c.user_id,
                                     contract_id: c.contract_id as u32,
-                                    height: c.contract_state_tree_height,
+                                    height: validate_contract_state_tree_height(c.contract_state_tree_height)?,
                                     leaf_id: start_slot + i,
                                 },
                             ))
@@ -1615,7 +1627,7 @@ impl<
                             checkpoint_id,
                             user_id: c.user_id,
                             contract_id: other_contract_id_u32,
-                            height: c.contract_state_tree_height,
+                            height: validate_contract_state_tree_height(c.contract_state_tree_height)?,
                             leaf_id: state_slot_index.to_canonical_u64(),
                         },
                     ))
@@ -1924,7 +1936,7 @@ impl<
                                         checkpoint_id,
                                         user_id: c.user_id,
                                         contract_id: other_contract_id_u32,
-                                        height: c.contract_state_tree_height,
+                                        height: validate_contract_state_tree_height(c.contract_state_tree_height)?,
                                         leaf_id: witness_slot_index,
                                     },
                                 ))
@@ -1948,7 +1960,7 @@ impl<
                                     checkpoint_id,
                                     user_id: c.user_id,
                                     contract_id: other_contract_id_u32,
-                                    height: c.contract_state_tree_height,
+                                    height: validate_contract_state_tree_height(c.contract_state_tree_height)?,
                                     leaf_id: leaf_index,
                                 },
                             ))
@@ -2010,7 +2022,7 @@ impl<
                                     checkpoint_id,
                                     user_id: c.user_id,
                                     contract_id: other_contract_id_u32,
-                                    height: c.contract_state_tree_height,
+                                    height: validate_contract_state_tree_height(c.contract_state_tree_height)?,
                                     leaf_id: witness_slot_index,
                                 },
                             ))

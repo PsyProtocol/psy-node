@@ -1,0 +1,36 @@
+# Git / version control
+.git
+.gitignore
+
+# Rust build artifacts — the image compiles its own
+/target
+**/target
+
+# Node modules (contract/indexer tooling, not needed for the Rust binary)
+**/node_modules
+
+# Large runtime / state files not needed for build
+/genesis.json
+/local_checkpoints
+/logs
+*.log
+
+# Documentation and marketing assets not needed for build
+/docs
+/client_prover/psy_mcp_server/dashboard
+/client_prover/psy_mcp_server/test-kit/landing
+/client_prover/psy_mcp_server/test-kit/*.md
+
+# Development / test scripts not required for the server binary
+/dev
+/e2e
+
+# OS / IDE
+.DS_Store
+.idea
+.vscode
+*.swp
+*.swo
+
+# Untracked / optional submodules that may be present locally
+/psy-dapp

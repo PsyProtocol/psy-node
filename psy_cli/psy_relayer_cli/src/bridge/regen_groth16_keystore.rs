@@ -9,7 +9,7 @@ use clap::Args;
 use parth_core::{
     crypto::hash::{
         merkle_proof::{compute_root_merkle_proof_generic, DeltaMerkleProofCore, MerkleProofCore},
-        tag_tree::{hash_tag_tree_node_single, hash_tag_tree_node_three},
+        tag_tree::{hash_tag_tree_node_four, hash_tag_tree_node_single},
         traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable},
     },
     pgoldilocks::QHashOut,
@@ -70,7 +70,10 @@ const WITHDRAWAL_TREE_HEIGHT: usize = 32;
 const CHECKPOINT_TREE_HEIGHT: usize = PsyNetworkLocalDevnetConstants::CHECKPOINT_TREE_HEIGHT_USIZE;
 const GLOBAL_USER_TREE_HEIGHT: usize = PsyNetworkLocalDevnetConstants::GLOBAL_USER_TREE_HEIGHT_USIZE;
 const GLOBAL_CONTRACT_TREE_HEIGHT: usize = PsyNetworkLocalDevnetConstants::GLOBAL_CONTRACT_TREE_HEIGHT_USIZE;
-const CONTRACT_STATE_TREE_HEIGHT: usize = PsyNetworkLocalDevnetConstants::MAX_CONTRACT_STATE_TREE_HEIGHT_USIZE;
+const DEPOSIT_CONTRACT_STATE_TREE_HEIGHT: usize =
+    psy_config::network_constants::DEPOSIT_TREE_CONTRACT_STATE_TREE_HEIGHT as usize;
+const WITHDRAWAL_CONTRACT_STATE_TREE_HEIGHT: usize =
+    psy_config::network_constants::WITHDRAWAL_TREE_CONTRACT_STATE_TREE_HEIGHT as usize;
 const GROTH16_FILES: [&str; 3] = ["circuit_groth16.bin", "pk_groth16.bin", "vk_groth16.bin"];
 
 #[derive(Debug, Clone, Args)]
@@ -138,12 +141,24 @@ fn regenerate_bridge_agg(keystore_dir: &Path) -> anyhow::Result<()> {
         coordinator_circuits.agg_state_transition.get_fingerprint(),
     );
     let deploy_contracts_whitelist = PoseidonHash::q_two_to_one(
-        coordinator_circuits.batch_deploy_contracts.get_fingerprint(),
+        coordinator_circuits
+            .state_layout_circuits
+            .batch_deploy_contracts
+            .get_fingerprint(),
+        coordinator_circuits.agg_state_transition.get_fingerprint(),
+    );
+    let update_contracts_whitelist = PoseidonHash::q_two_to_one(
+        coordinator_circuits
+            .state_layout_circuits
+            .batch_update_contracts
+            .get_fingerprint(),
         coordinator_circuits.agg_state_transition.get_fingerprint(),
     );
     let register_users_reward =
         hash_tag_tree_node_single::<QHashOut<F>, PoseidonHash>(&QHashOut::ZERO, &worker_rewards_tree_tag);
     let deploy_contracts_reward =
+        hash_tag_tree_node_single::<QHashOut<F>, PoseidonHash>(&QHashOut::ZERO, &worker_rewards_tree_tag);
+    let update_contracts_reward =
         hash_tag_tree_node_single::<QHashOut<F>, PoseidonHash>(&QHashOut::ZERO, &worker_rewards_tree_tag);
     let guta_reward =
         hash_tag_tree_node_single::<QHashOut<F>, PoseidonHash>(&QHashOut::ZERO, &worker_rewards_tree_tag);
@@ -158,6 +173,11 @@ fn regenerate_bridge_agg(keystore_dir: &Path) -> anyhow::Result<()> {
         deploy_contracts_state_root,
         worker_rewards_tree_tag,
     ).context("failed to generate dummy deploy-contracts aggregate proof")?;
+    let update_contracts_proof = coordinator_circuits.dummy_agg_state_transition.prove_base(
+        update_contracts_whitelist,
+        deploy_contracts_state_root,
+        worker_rewards_tree_tag,
+    ).context("failed to generate dummy update-contracts aggregate proof")?;
 
     let genesis_stats = PQEDCheckpointLeafStats::<F, QHashOut<F>>::new_empty();
     let genesis_roots = checkpoint_global_state_roots;
@@ -224,15 +244,23 @@ fn regenerate_bridge_agg(keystore_dir: &Path) -> anyhow::Result<()> {
         state_transition_end: deploy_contracts_state_root,
         total_proofs_generated: 1,
     };
+    // no-op update contracts transition (start == end == deploy end root)
+    let update_contracts_transition = AggStateTransitionWithStats {
+        state_transition_start: deploy_contracts_state_root,
+        state_transition_end: deploy_contracts_state_root,
+        total_proofs_generated: 1,
+    };
     let part_1_header = QCAggUserRegistartionDeployContractsGUTAInput {
         register_users_state_transition: register_users_transition,
         deploy_contracts_state_transition: deploy_contracts_transition,
+        update_contracts_state_transition: update_contracts_transition,
         guta_proof_header: guta_header,
     };
-    let part_1_reward = hash_tag_tree_node_three::<QHashOut<F>, PoseidonHash>(
+    let part_1_reward = hash_tag_tree_node_four::<QHashOut<F>, PoseidonHash>(
         &guta_reward,
         &register_users_reward,
         &deploy_contracts_reward,
+        &update_contracts_reward,
         &worker_rewards_tree_tag,
     );
     let part_1_proof = coordinator_circuits.agg_user_register_deploy_contracts_guta.prove_base(
@@ -246,6 +274,11 @@ fn regenerate_bridge_agg(keystore_dir: &Path) -> anyhow::Result<()> {
         &deploy_contracts_proof,
         coordinator_circuits.dummy_agg_state_transition.get_verifier_config_ref(),
         deploy_contracts_reward,
+        F::ONE,
+        &part_1_header.update_contracts_state_transition.get_agg_state_transition(),
+        &update_contracts_proof,
+        coordinator_circuits.dummy_agg_state_transition.get_verifier_config_ref(),
+        update_contracts_reward,
         F::ONE,
         &coordinator_circuits.guta_circuits.no_change_whitelist_proof,
         &part_1_header.guta_proof_header,
@@ -398,7 +431,8 @@ fn regenerate_bridge_agg(keystore_dir: &Path) -> anyhow::Result<()> {
         CHECKPOINT_TREE_HEIGHT,
         GLOBAL_USER_TREE_HEIGHT,
         GLOBAL_CONTRACT_TREE_HEIGHT,
-        CONTRACT_STATE_TREE_HEIGHT,
+        DEPOSIT_CONTRACT_STATE_TREE_HEIGHT,
+        WITHDRAWAL_CONTRACT_STATE_TREE_HEIGHT,
     ).context("failed to generate bridge aggregation final proof")?;
 
     println!(
@@ -698,16 +732,16 @@ fn bridge_state_witnesses() -> anyhow::Result<(
     let mut deposit_leaves = HashMap::new();
     deposit_leaves.insert(0, deposit_slot0);
     deposit_leaves.insert(1, deposit_slot1);
-    let deposit_slot0_proof = sparse_merkle_proof(&deposit_leaves, 0, CONTRACT_STATE_TREE_HEIGHT);
-    let deposit_slot1_proof = sparse_merkle_proof(&deposit_leaves, 1, CONTRACT_STATE_TREE_HEIGHT);
+    let deposit_slot0_proof = sparse_merkle_proof(&deposit_leaves, 0, DEPOSIT_CONTRACT_STATE_TREE_HEIGHT);
+    let deposit_slot1_proof = sparse_merkle_proof(&deposit_leaves, 1, DEPOSIT_CONTRACT_STATE_TREE_HEIGHT);
     let deposit_state_root = deposit_slot0_proof.root;
     anyhow::ensure!(deposit_slot1_proof.root == deposit_state_root, "deposit state roots mismatch");
 
     let mut withdrawal_leaves = HashMap::new();
     withdrawal_leaves.insert(0, withdrawal_slot0);
     withdrawal_leaves.insert(1, withdrawal_slot1);
-    let withdrawal_slot0_proof = sparse_merkle_proof(&withdrawal_leaves, 0, CONTRACT_STATE_TREE_HEIGHT);
-    let withdrawal_slot1_proof = sparse_merkle_proof(&withdrawal_leaves, 1, CONTRACT_STATE_TREE_HEIGHT);
+    let withdrawal_slot0_proof = sparse_merkle_proof(&withdrawal_leaves, 0, WITHDRAWAL_CONTRACT_STATE_TREE_HEIGHT);
+    let withdrawal_slot1_proof = sparse_merkle_proof(&withdrawal_leaves, 1, WITHDRAWAL_CONTRACT_STATE_TREE_HEIGHT);
     let withdrawal_state_root = withdrawal_slot0_proof.root;
     anyhow::ensure!(withdrawal_slot1_proof.root == withdrawal_state_root, "withdrawal state roots mismatch");
 

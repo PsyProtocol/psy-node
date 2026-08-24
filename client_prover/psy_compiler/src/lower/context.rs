@@ -9,7 +9,7 @@ use psy_vm::dpn::{
 };
 
 use crate::{
-    abi::{ContractABI, SpecCompliantAbi},
+    abi::Abi,
     output::serialize::ContractOutput,
     parse::ast::*,
     types::{checker::*, layout::*},
@@ -131,21 +131,31 @@ impl<'a> CompilerContext<'a> {
             functions: function_defs,
         };
 
-        let abi = ContractABI::from_checked_program(self.checked);
-        let spec_abi = SpecCompliantAbi::from_checked_program(self.checked);
+        let mut abi = Abi::from_checked_program(self.checked);
+        // Mutability is a property of the lowered program, not of the source
+        // receiver syntax. Derive it from the same state commands the VM will
+        // execute so getters and state-changing methods cannot be confused.
+        for method in &mut abi.contract.methods {
+            if let Some(def) = circuit_defs.iter().find(|def| def.method_id == method.method_id) {
+                method.state_mutability = if def.is_view_function() {
+                    crate::abi::StateMutability::View
+                } else {
+                    crate::abi::StateMutability::External
+                };
+            }
+        }
 
         Ok(ContractOutput {
             contract_code,
             circuit_definitions: circuit_defs,
             abi,
-            spec_abi,
         })
     }
 
     /// Compile a single contract method into a DPNFunctionCircuitDefinition.
     fn compile_method(&mut self, method: &CheckedMethod, helpers: &HashMap<String, &CheckedMethod>) -> Result<DPNFunctionCircuitDefinition> {
-        let mut exec = QExecContext::new();
         let layout = &self.checked.contract_layout;
+        let mut exec = QExecContext::new_with_contract_state_tree_height(layout.state_tree_height);
 
         // Register inputs for non-self, non-ctx parameters
         let mut locals: HashMap<String, SymValue> = HashMap::new();

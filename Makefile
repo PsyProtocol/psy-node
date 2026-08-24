@@ -20,7 +20,7 @@ PSY_SKIP_BUILD ?= 1
 all: build
 
 build:
-	PSY_CONFIG_PATH=$(PSY_CONFIG_PATH) cargo build --release --example realm_repl --example coordinator_repl --bin psy_worker_cli --bin psy_node_cli --bin psy_dev_cli --bin psy_relayer_cli --bin psy_user_cli
+	PSY_CONFIG_PATH=$(PSY_CONFIG_PATH) cargo build --release --example realm_repl --example coordinator_repl --bin psy_worker_cli --bin psy_node_cli --bin psy_dev_cli --bin psy_relayer_cli --bin psy_user_cli --bin psy-mcp-server
 
 clean:
 	cargo clean
@@ -57,7 +57,7 @@ query-chain-info:
 staging-server:
 	VITE_NETWORK=sepolia VITE_FORK=false bun run dev/locSetupV4.ts --psy-privacy-bridge --ide --explorer
 
-LOCSETUP_START_ARGS = --proving-backend ${PROVING_BACKEND} --db --coordinator --realms-count 2 --coordinator-workers 2 --realm-workers 1 --prove-proxy 1 --faucet-server --l1 --relayer --psy-privacy-bridge --ide --explorer --env RUST_LOG=${LOG_LEVEL}
+LOCSETUP_START_ARGS = --proving-backend ${PROVING_BACKEND} --db --coordinator --realms-count 2 --coordinator-workers 2 --realm-workers 1 --prove-proxy 1 --faucet-server --l1 --relayer --psy-privacy-bridge --ide --explorer --mode-a-web-wallet-bridge --env RUST_LOG=${LOG_LEVEL}
 
 
 run-all:
@@ -96,11 +96,12 @@ shutdown:
 clean-db:
 	rm -fr local_checkpoints logs || true
 	rm -fr psy-contracts/deployments/localhost || true
-	-docker stop -t 15 valkey-server nats-server scylla-server nostr-relay 2>/dev/null || true
-	-docker rm -f valkey-server nats-server scylla-server nostr-relay 2>/dev/null || true
-	# generated_db_data is handled by docker compose down -v in shutdown
+	-docker stop -t 15 valkey-server nats-server scylla-server nostr-relay generated-envio-postgres-1 generated-graphql-engine-1 2>/dev/null || true
+	-docker rm -f valkey-server nats-server scylla-server nostr-relay generated-envio-postgres-1 generated-graphql-engine-1 2>/dev/null || true
+	# Drop the envio postgres volume before wiping generated/ so the compose file still exists.
 	-docker compose -f psy_cli/psy_relayer_cli/indexer/envio/generated/docker-compose.yaml down -v 2>/dev/null || true
-	docker volume rm psy-devnet-redis psy-devnet-scylla psy-devnet-scylla-data psy-devnet-nats 2>/dev/null || true
+	rm -fr psy_cli/psy_relayer_cli/indexer/envio/generated || true
+	docker volume rm generated_db_data psy-devnet-redis psy-devnet-scylla psy-devnet-scylla-data psy-devnet-nats 2>/dev/null || true
 
 config_gen_v2:
 	cargo run --release --package psy_plonky2_circuits --example config_gen_v2
@@ -133,6 +134,8 @@ export-solidity-verifier-deposit:
 
 export-solidity-verifier-withdrawal:
 	${BIN_PREFIX}/psy_relayer_cli export-solidity-verifier ${keystore}/withdrawal_claim ./psy-contracts/src/WithdrawalClaimVerifier.sol
+
+export-all-solidity-verifier: export-solidity-verifier export-solidity-verifier-deposit export-solidity-verifier-withdrawal
 
 BRIDGE_TO_CHECKPOINT ?= 10
 BRIDGE_FROM_CHECKPOINT ?= 1

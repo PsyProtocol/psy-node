@@ -40,12 +40,14 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
     let temp_db = Arc::new(temp_store);
 
     let deploy_contract_gatherer_backup_directory = config.get_deploy_contracts_backup_path();
+    let update_contract_gatherer_backup_directory = config.get_update_contracts_backup_path();
     let register_user_gatherer_backup_directory = config.get_register_users_backup_path();
     let guta_gatherer_backup_directory = config.get_guta_updates_backup_path();
     let checkpoint_tree_root_backup_file_path = config.get_checkpoint_tree_backup_file_path();
     file_system
         .file_like_fs_create_dir_all(&deploy_contract_gatherer_backup_directory)
         .await?;
+    file_system.file_like_fs_create_dir_all(&update_contract_gatherer_backup_directory).await?;
     file_system.file_like_fs_create_dir_all(&register_user_gatherer_backup_directory).await?;
     file_system.file_like_fs_create_dir_all(&guta_gatherer_backup_directory).await?;
 
@@ -71,6 +73,7 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
                 circuit_fingerprint_config,
                 file_system,
                 deploy_contract_gatherer_backup_directory,
+                update_contract_gatherer_backup_directory,
                 register_user_gatherer_backup_directory,
                 guta_gatherer_backup_directory,
                 checkpoint_tree_root_backup_file_path,
@@ -100,6 +103,7 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
                 circuit_fingerprint_config,
                 file_system,
                 deploy_contract_gatherer_backup_directory,
+                update_contract_gatherer_backup_directory,
                 register_user_gatherer_backup_directory,
                 guta_gatherer_backup_directory,
                 checkpoint_tree_root_backup_file_path,
@@ -125,6 +129,7 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
                 circuit_fingerprint_config,
                 file_system,
                 deploy_contract_gatherer_backup_directory,
+                update_contract_gatherer_backup_directory,
                 register_user_gatherer_backup_directory,
                 guta_gatherer_backup_directory,
                 checkpoint_tree_root_backup_file_path,
@@ -150,6 +155,7 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
                 circuit_fingerprint_config,
                 file_system,
                 deploy_contract_gatherer_backup_directory,
+                update_contract_gatherer_backup_directory,
                 register_user_gatherer_backup_directory,
                 guta_gatherer_backup_directory,
                 checkpoint_tree_root_backup_file_path,
@@ -175,6 +181,7 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
                 circuit_fingerprint_config,
                 file_system,
                 deploy_contract_gatherer_backup_directory,
+                update_contract_gatherer_backup_directory,
                 register_user_gatherer_backup_directory,
                 guta_gatherer_backup_directory,
                 checkpoint_tree_root_backup_file_path,
@@ -200,6 +207,7 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
                 circuit_fingerprint_config,
                 file_system,
                 deploy_contract_gatherer_backup_directory,
+                update_contract_gatherer_backup_directory,
                 register_user_gatherer_backup_directory,
                 guta_gatherer_backup_directory,
                 checkpoint_tree_root_backup_file_path,
@@ -225,6 +233,7 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
                 circuit_fingerprint_config,
                 file_system,
                 deploy_contract_gatherer_backup_directory,
+                update_contract_gatherer_backup_directory,
                 register_user_gatherer_backup_directory,
                 guta_gatherer_backup_directory,
                 checkpoint_tree_root_backup_file_path,
@@ -250,6 +259,7 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
                 circuit_fingerprint_config,
                 file_system,
                 deploy_contract_gatherer_backup_directory,
+                update_contract_gatherer_backup_directory,
                 register_user_gatherer_backup_directory,
                 guta_gatherer_backup_directory,
                 checkpoint_tree_root_backup_file_path,
@@ -374,6 +384,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
                 circuit_fingerprint_config,
                 file_system,
                 deploy_contract_gatherer_backup_directory,
+                update_contract_gatherer_backup_directory,
                 register_user_gatherer_backup_directory,
                 guta_gatherer_backup_directory,
                 checkpoint_tree_root_backup_file_path,
@@ -399,6 +410,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
                 circuit_fingerprint_config,
                 file_system,
                 deploy_contract_gatherer_backup_directory,
+                update_contract_gatherer_backup_directory,
                 register_user_gatherer_backup_directory,
                 guta_gatherer_backup_directory,
                 checkpoint_tree_root_backup_file_path,
@@ -424,6 +436,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
                 circuit_fingerprint_config,
                 file_system,
                 deploy_contract_gatherer_backup_directory,
+                update_contract_gatherer_backup_directory,
                 register_user_gatherer_backup_directory,
                 guta_gatherer_backup_directory,
                 checkpoint_tree_root_backup_file_path,
@@ -449,6 +462,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
                 circuit_fingerprint_config,
                 file_system,
                 deploy_contract_gatherer_backup_directory,
+                update_contract_gatherer_backup_directory,
                 register_user_gatherer_backup_directory,
                 guta_gatherer_backup_directory,
                 checkpoint_tree_root_backup_file_path,
@@ -474,6 +488,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
                 circuit_fingerprint_config,
                 file_system,
                 deploy_contract_gatherer_backup_directory,
+                update_contract_gatherer_backup_directory,
                 register_user_gatherer_backup_directory,
                 guta_gatherer_backup_directory,
                 checkpoint_tree_root_backup_file_path,
@@ -499,6 +514,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
                 circuit_fingerprint_config,
                 file_system,
                 deploy_contract_gatherer_backup_directory,
+                update_contract_gatherer_backup_directory,
                 register_user_gatherer_backup_directory,
                 guta_gatherer_backup_directory,
                 checkpoint_tree_root_backup_file_path,
@@ -524,6 +540,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
                 circuit_fingerprint_config,
                 file_system,
                 deploy_contract_gatherer_backup_directory,
+                update_contract_gatherer_backup_directory,
                 register_user_gatherer_backup_directory,
                 guta_gatherer_backup_directory,
                 checkpoint_tree_root_backup_file_path,

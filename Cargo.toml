@@ -42,6 +42,7 @@ members = [
     "client_prover/psy_core/psy_crypto",
     "client_prover/psy_core/psy_data",
     "client_prover/psy_core/psy_config",
+    "client_prover/psy_compiler",
     "client_prover/psy_vm",
     "client_prover/psy_prover",
     "client_prover/psy_provider",
@@ -109,6 +110,7 @@ toml = "0.8"
 # ---- Error handling ----
 anyhow = "1.0.75"
 thiserror = "2.0"
+logos = "0.15"
 miette = { version = "7.2", features = ["fancy"] }
 color-eyre = "0.6"
 
@@ -351,6 +353,7 @@ psy_crypto = { path = "./client_prover/psy_core/psy_crypto" }
 psy_config = { path = "./client_prover/psy_core/psy_config" }
 kvq = { path = "./client_prover/psy_core/kvq" }
 psy_vm = { path = "./client_prover/psy_vm", default-features = false }
+psy_compiler = { path = "./client_prover/psy_compiler" }
 psy_prover = { path = "./client_prover/psy_prover", default-features = false }
 psy_provider = { path = "./client_prover/psy_provider" }
 psy_common_circuit = { path = "./client_prover/psy_circuit/psy_common_circuit", default-features = false }

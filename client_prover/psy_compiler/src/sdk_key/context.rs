@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{bail, Result};
-use psy_client_data::dpn::sdk_key::SDKKeyConfig;
+use psy_client_data::dpn::sd_key::SDKeyConfig;
 use psy_vm::dpn::{
     ops::{context_trait::DPNContext, exec_context::QExecContext, sym_felt::SymFeltRef},
     vm::{compile::PsyCompileResult, def::DPNFunctionCircuitDefinition},
@@ -19,7 +19,7 @@ pub struct SDKKeyCompileOutput {
     /// The compiled authorization circuit definition.
     pub circuit_def: DPNFunctionCircuitDefinition,
     /// The SDK key configuration derived from the contract.
-    pub config: SDKKeyConfig,
+    pub config: SDKeyConfig,
     /// The contract name (used as the key definition name).
     pub name: String,
 }
@@ -75,7 +75,7 @@ impl<'a> SDKKeyCompilerContext<'a> {
 
         let circuit_def = self.compile_authorize_method(auth_method, &helper_methods)?;
 
-        let config = SDKKeyConfig {
+        let config = SDKeyConfig {
             num_introspectable_transactions: self.num_introspected_transactions,
             can_read_state: self.state_reading_used,
             contract_state_tree_height: layout.state_tree_height as u8,
@@ -96,8 +96,8 @@ impl<'a> SDKKeyCompilerContext<'a> {
         method: &CheckedMethod,
         helpers: &HashMap<String, &CheckedMethod>,
     ) -> Result<DPNFunctionCircuitDefinition> {
-        let mut exec = QExecContext::new();
         let layout = &self.checked.contract_layout;
+        let mut exec = QExecContext::new_with_contract_state_tree_height(layout.state_tree_height);
 
         // Register inputs for non-self, non-ctx parameters
         let mut locals: HashMap<String, SymValue> = HashMap::new();

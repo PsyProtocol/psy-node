@@ -17,6 +17,9 @@ pub struct PsyContractLeafGadget {
     pub function_tree_root: HashOutTarget,
     pub code_root: HashOutTarget,
     pub state_tree_height: Target,
+    pub state_layout_root: HashOutTarget,
+    pub state_layout_field_count: Target,
+    pub state_layout_slot_count: Target,
 }
 
 impl PsyContractLeafGadget {
@@ -24,10 +27,15 @@ impl PsyContractLeafGadget {
         witness.set_hash_target(self.deployer, target.deployer.0)?;
         witness.set_hash_target(self.function_tree_root, target.function_tree_root.0)?;
         witness.set_hash_target(self.code_root, target.code_root.0)?;
-        witness.set_target(self.state_tree_height, target.state_tree_height)
+        witness.set_target(self.state_tree_height, target.state_tree_height)?;
+        witness.set_hash_target(self.state_layout_root, target.state_layout_root.0)?;
+        witness.set_target(self.state_layout_field_count, target.state_layout_field_count)?;
+        witness.set_target(self.state_layout_slot_count, target.state_layout_slot_count)
     }
     pub fn to_hash<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(&self, builder: &mut CircuitBuilder<F, D>) -> HashOutTarget {
-        builder.hash_n_to_hash_no_pad::<H>(self.to_targets())
+        let mut inputs = vec![builder.constant_u64(0x434c_5632)];
+        inputs.extend(self.to_targets());
+        builder.hash_n_to_hash_no_pad::<H>(inputs)
     }
 }
 impl AlgebraicHashableTarget for PsyContractLeafGadget {
@@ -44,6 +52,9 @@ impl CreatableTarget for PsyContractLeafGadget {
         let function_tree_root = builder.add_virtual_hash();
         let code_root = builder.add_virtual_hash();
         let state_tree_height = builder.add_virtual_target();
+        let state_layout_root = builder.add_virtual_hash();
+        let state_layout_field_count = builder.add_virtual_target();
+        let state_layout_slot_count = builder.add_virtual_target();
         let mut base = state_tree_height;
         let zero = builder.zero();
 
@@ -64,12 +75,15 @@ impl CreatableTarget for PsyContractLeafGadget {
             function_tree_root,
             code_root,
             state_tree_height,
+            state_layout_root,
+            state_layout_field_count,
+            state_layout_slot_count,
         }
     }
 }
 impl ToTargets for PsyContractLeafGadget {
     fn to_targets(&self) -> Vec<Target> {
-        vec![
+        let mut targets = vec![
             self.deployer.elements[0],
             self.deployer.elements[1],
             self.deployer.elements[2],
@@ -83,14 +97,18 @@ impl ToTargets for PsyContractLeafGadget {
             self.code_root.elements[2],
             self.code_root.elements[3],
             self.state_tree_height,
-        ]
+        ];
+        targets.extend(self.state_layout_root.elements);
+        targets.push(self.state_layout_field_count);
+        targets.push(self.state_layout_slot_count);
+        targets
     }
 }
 impl FromTargets for PsyContractLeafGadget {
     fn from_targets(targets: &[Target]) -> Self {
-        if targets.len() != 13 {
+        if targets.len() != 19 {
             panic!(
-                "tried to create PsyContractLeafGadget from an array of {} targets, but expected an array of 13 targets",
+                "tried to create PsyContractLeafGadget from an array of {} targets, but expected an array of 19 targets",
                 targets.len()
             );
         }
@@ -104,11 +122,19 @@ impl FromTargets for PsyContractLeafGadget {
             elements: [targets[8], targets[9], targets[10], targets[11]],
         };
         let state_tree_height = targets[12];
+        let state_layout_root = HashOutTarget {
+            elements: [targets[13], targets[14], targets[15], targets[16]],
+        };
+        let state_layout_field_count = targets[17];
+        let state_layout_slot_count = targets[18];
         Self {
             deployer,
             function_tree_root,
             code_root,
             state_tree_height,
+            state_layout_root,
+            state_layout_field_count,
+            state_layout_slot_count,
         }
     }
 }

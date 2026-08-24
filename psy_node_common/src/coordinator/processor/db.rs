@@ -1,5 +1,6 @@
 use std::{
-    sync::Arc,
+    collections::HashSet,
+    sync::{Arc, atomic::AtomicBool},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -8,9 +9,9 @@ use parth_core::{
     QCoreProcCheckpointUniqueId, crypto::hash::{
         merkle_proof::{DeltaMerkleProofCore, MerkleProofCore},
         traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable, ZeroableHash},
-    }, data::queue::queue_key::{QPBaseQueueType, QPStandardUniqueIdQueueKey}, generic_traits::psy_debug_printable::PsyDebugPrintable, node::realm_identifier::QRealmIdentifier, protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofPublicInputsHasherReader}
+    }, data::queue::queue_key::{QPBaseQueueType, QPStandardUniqueIdQueueKey}, felt::ToU64Value, generic_traits::psy_debug_printable::PsyDebugPrintable, node::realm_identifier::QRealmIdentifier, protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofPublicInputsHasherReader}
 };
-use crate::coordinator::queue_key::{CoordinatorSubmitRealmGUTAUpdateQueueKey, CoordinatorRegisterUserPublicKeyQueueKey, CoordinatorDeployContractQueueKey, CoordinatorProvingWorkQueueKey};
+use crate::coordinator::queue_key::{CoordinatorSubmitRealmGUTAUpdateQueueKey, CoordinatorRegisterUserPublicKeyQueueKey, CoordinatorDeployContractQueueKey, CoordinatorUpdateContractQueueKey, CoordinatorProvingWorkQueueKey};
 
 use psy_core::{
     constants::stale_checkpoint::STALE_CHECKPOINT_AGE_REALM_TO_COORDINATOR_PROOF,
@@ -26,7 +27,14 @@ use psy_data::{
         checkpoint_transition_hash::CheckpointStateHashTransition,
         verifiable_checkpoint_transition::{PsyVerifiableCheckpointTransition, PsyVerifiableCheckpointTransitionWithProof},
     },
-    v1::qdata::{checkpoint::QEDL2BlockState, contract::PsyDeployContractQueueItem, public_key::PZKPublicKeyInfo},
+    v1::qdata::{
+        checkpoint::QEDL2BlockState,
+        contract::{
+            CONTRACT_LEAF_SERIALIZED_SIZE, ContractCodeDefinitionWithContractId, PQEDContractLeafV2, PsyDeployContractQueueItemV2,
+            PsyUpdateContractQueueItem,
+        },
+        public_key::PZKPublicKeyInfo,
+    },
     worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId,
 };
 use psy_io::tokio::{TokioFileLike, TokioLikeFileSystem};
@@ -39,12 +47,13 @@ use psy_node_core::{
     queue::{ephemeral::QStandardEphemeralQueueSubscriber, worker_queue::QStandardWorkerQueuePublisher},
     store::traits::proof_store::QParthProofStore,
 };
+use psy_serialize::PsyIOReadWrite;
 
 use crate::{
     backup::{checkpoint_tree::CheckpointTreeBackupManager, coordinator::generate_coordinator_output_from_backups},
     constants::queue::{
         PQ_COORDINATOR_DEPLOY_CONTRACT_QUEUE_TOPIC_ID, PQ_COORDINATOR_REGISTER_USER_PUBLIC_KEY_QUEUE_TOPIC_ID,
-        PQ_COORDINATOR_SUBMIT_REALM_GUTA_UPDATE_QUEUE_TOPIC_ID,
+        PQ_COORDINATOR_SUBMIT_REALM_GUTA_UPDATE_QUEUE_TOPIC_ID, PQ_COORDINATOR_UPDATE_CONTRACT_QUEUE_TOPIC_ID,
     },
     coordinator::processor::processor_shared_status::{PsyCoordinatorProcessorSharedStatus, PsyCoordinatorProcessorSharedStatusWrapper},
     queue::gatherer::QueueKeyStatusManager,
@@ -150,7 +159,9 @@ pub struct PsyCoordinatorDatabaseProcessor<
     pub register_user_queue_key_status_manager:
         QueueKeyStatusManager<PQ_COORDINATOR_REGISTER_USER_PUBLIC_KEY_QUEUE_TOPIC_ID, PZKPublicKeyInfo<N::QHash>>,
     pub deploy_contract_queue_key_status_manager:
-        QueueKeyStatusManager<PQ_COORDINATOR_DEPLOY_CONTRACT_QUEUE_TOPIC_ID, PsyDeployContractQueueItem<N::F, N::QHash>>,
+        QueueKeyStatusManager<PQ_COORDINATOR_DEPLOY_CONTRACT_QUEUE_TOPIC_ID, PsyDeployContractQueueItemV2<N::F, N::QHash>>,
+    pub update_contract_queue_key_status_manager:
+        QueueKeyStatusManager<PQ_COORDINATOR_UPDATE_CONTRACT_QUEUE_TOPIC_ID, PsyUpdateContractQueueItem<N::F, N::QHash>>,
     pub shared_status: PsyCoordinatorProcessorSharedStatusWrapper<N::F, N::QHash>,
     pub needs_revert: bool,
 
@@ -333,12 +344,16 @@ impl<
         )
         .await?;
         tracing::info!("[COORD_INIT] checkpoint backup manager created");
-        if last_committed_checkpoint_id > 0 {
-            checkpoint_tree_backup_manager
-                .sync_from_database::<S>(&db, 1000, last_committed_checkpoint_id)
-                .await?;
-            tracing::info!("[COORD_INIT] checkpoint backup manager synced from db");
-        }
+        // Restore the checkpoint backup even when the latest committed ID is 0.
+        // A database may already contain the genesis checkpoint while the local
+        // backup file is empty (for example after a backup reset).  Skipping the
+        // sync in that case leaves the in-memory tree at its zero root, which is
+        // then incorrectly passed to the GUTA gatherer as the current checkpoint
+        // root.
+        checkpoint_tree_backup_manager
+            .sync_from_database::<S>(&db, 1000, last_committed_checkpoint_id)
+            .await?;
+        tracing::info!("[COORD_INIT] checkpoint backup manager synced from db");
 
         let shared_status = if last_committed_checkpoint_id == 0 {
             PsyCoordinatorProcessorSharedStatus {
@@ -456,15 +471,26 @@ impl<
             }, status.clone()),
             deploy_contract_queue_key_status_manager: QueueKeyStatusManager::<
                 PQ_COORDINATOR_DEPLOY_CONTRACT_QUEUE_TOPIC_ID,
-                PsyDeployContractQueueItem<N::F, N::QHash>,
-            >::new_with_status(QPStandardUniqueIdQueueKey {
+                PsyDeployContractQueueItemV2<N::F, N::QHash>,
+            >::new(QPStandardUniqueIdQueueKey {
                 realm_id: realm_id_u64,
                 realm_sub_id: realm_sub_id_u64,
                 unique_id: current_core_proc_unique_pending_id,
                 task_group: 0,
                 queue_type: QPBaseQueueType::StandardEphemeral,
                 _phantom_queue_item: std::marker::PhantomData,
-            }, status.clone()),
+            }),
+            update_contract_queue_key_status_manager: QueueKeyStatusManager::<
+                PQ_COORDINATOR_UPDATE_CONTRACT_QUEUE_TOPIC_ID,
+                PsyUpdateContractQueueItem<N::F, N::QHash>,
+            >::new(QPStandardUniqueIdQueueKey {
+                realm_id: realm_id_u64,
+                realm_sub_id: realm_sub_id_u64,
+                unique_id: current_core_proc_unique_pending_id,
+                task_group: 0,
+                queue_type: QPBaseQueueType::StandardEphemeral,
+                _phantom_queue_item: std::marker::PhantomData,
+            }),
             needs_revert: false,
             genesis_checkpoint_state_transition_hash,
             last_committed,
@@ -780,7 +806,11 @@ checkpoint_backup_copy_status={}
         };
         let deploy_key = CoordinatorDeployContractQueueKey {
             realm_id, realm_sub_id, unique_id, task_group: 0,
-            queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<PsyDeployContractQueueItem<N::F, N::QHash>>,
+            queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<PsyDeployContractQueueItemV2<N::F, N::QHash>>,
+        };
+        let update_key = CoordinatorUpdateContractQueueKey {
+            realm_id, realm_sub_id, unique_id, task_group: 0,
+            queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<PsyUpdateContractQueueItem<N::F, N::QHash>>,
         };
         let proof_key = CoordinatorProvingWorkQueueKey {
             realm_id, realm_sub_id, unique_id, task_group: 0,
@@ -791,6 +821,7 @@ checkpoint_backup_copy_status={}
         self.guta_update_queue.ensure_consumer(&guta_key, realm_id, realm_sub_id, unique_id, 0).await?;
         self.register_user_queue.ensure_consumer(&user_reg_key, realm_id, realm_sub_id, unique_id, 0).await?;
         self.deploy_contract_queue.ensure_consumer(&deploy_key, realm_id, realm_sub_id, unique_id, 0).await?;
+        self.deploy_contract_queue.ensure_consumer(&update_key, realm_id, realm_sub_id, unique_id, 0).await?;
         self.proof_work_queue.ensure_consumer(&proof_key, realm_id, realm_sub_id, unique_id, 0).await?;
 
         // Also create consumers for processing proc_id if it's 0 (genesis case)
@@ -805,7 +836,11 @@ checkpoint_backup_copy_status={}
             };
             let processing_deploy_key = CoordinatorDeployContractQueueKey {
                 realm_id, realm_sub_id, unique_id: gathering_proc_id, task_group: 0,
-                queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<PsyDeployContractQueueItem<N::F, N::QHash>>,
+                queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<PsyDeployContractQueueItemV2<N::F, N::QHash>>,
+            };
+            let processing_update_key = CoordinatorUpdateContractQueueKey {
+                realm_id, realm_sub_id, unique_id: gathering_proc_id, task_group: 0,
+                queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<PsyUpdateContractQueueItem<N::F, N::QHash>>,
             };
             let processing_proof_key = CoordinatorProvingWorkQueueKey {
                 realm_id, realm_sub_id, unique_id: gathering_proc_id, task_group: 0,
@@ -815,6 +850,7 @@ checkpoint_backup_copy_status={}
             self.guta_update_queue.ensure_consumer(&processing_guta_key, realm_id, realm_sub_id, gathering_proc_id, 0).await?;
             self.register_user_queue.ensure_consumer(&processing_user_reg_key, realm_id, realm_sub_id, gathering_proc_id, 0).await?;
             self.deploy_contract_queue.ensure_consumer(&processing_deploy_key, realm_id, realm_sub_id, gathering_proc_id, 0).await?;
+            self.deploy_contract_queue.ensure_consumer(&processing_update_key, realm_id, realm_sub_id, gathering_proc_id, 0).await?;
             self.proof_work_queue.ensure_consumer(&processing_proof_key, realm_id, realm_sub_id, gathering_proc_id, 0).await?;
         }
 
@@ -850,6 +886,162 @@ checkpoint_backup_copy_status={}
             _phantom_queue_item: std::marker::PhantomData,
         }
     }
+
+    async fn ensure_contract_updates_persisted(
+        &self,
+        checkpoint_id: u64,
+        expected_contract_tree_root: N::QHash,
+        contract_leaves_ffs: &[u8],
+        contract_code_definitions: &[ContractCodeDefinitionWithContractId],
+    ) -> anyhow::Result<()> {
+        const CONTRACT_RECORD_SIZE: usize = 8 + CONTRACT_LEAF_SERIALIZED_SIZE;
+
+        anyhow::ensure!(
+            contract_leaves_ffs.len() % CONTRACT_RECORD_SIZE == 0,
+            "contract commit validation failed at checkpoint {}: invalid leaf payload length {}, expected a multiple of {}",
+            checkpoint_id,
+            contract_leaves_ffs.len(),
+            CONTRACT_RECORD_SIZE,
+        );
+
+        let contract_count = contract_leaves_ffs.len() / CONTRACT_RECORD_SIZE;
+        anyhow::ensure!(
+            contract_count == contract_code_definitions.len(),
+            "contract commit validation failed at checkpoint {}: {} contract leaves but {} code definitions",
+            checkpoint_id,
+            contract_count,
+            contract_code_definitions.len(),
+        );
+
+        let persisted_contract_tree_root = self.db.global_contract_tree_get_root_hash(checkpoint_id).await?;
+        anyhow::ensure!(
+            persisted_contract_tree_root == expected_contract_tree_root,
+            "contract commit validation failed at checkpoint {}: persisted contract tree root {:?} does not match expected root {:?}",
+            checkpoint_id,
+            persisted_contract_tree_root,
+            expected_contract_tree_root,
+        );
+
+        let mut seen_contract_ids = HashSet::with_capacity(contract_count);
+        for record in contract_leaves_ffs.chunks_exact(CONTRACT_RECORD_SIZE) {
+            let contract_id = u64::from_le_bytes(record[..8].try_into()?);
+            anyhow::ensure!(
+                seen_contract_ids.insert(contract_id),
+                "contract commit validation failed at checkpoint {}: duplicate contract ID {} in leaf payload",
+                checkpoint_id,
+                contract_id,
+            );
+
+            let expected_leaf = PQEDContractLeafV2::<N::F, N::QHash>::pio_read_from_io(&mut &record[8..])?;
+            let expected_code_definition = contract_code_definitions
+                .iter()
+                .find(|definition| definition.contract_id == contract_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "contract commit validation failed at checkpoint {}: missing code definition for contract {}",
+                        checkpoint_id,
+                        contract_id,
+                    )
+                })?;
+
+            let persisted_leaf = self.db.get_contract_leaf(checkpoint_id, contract_id).await?;
+            anyhow::ensure!(
+                persisted_leaf == expected_leaf,
+                "contract commit validation failed at checkpoint {} for contract {}: persisted leaf does not match the prepared leaf",
+                checkpoint_id,
+                contract_id,
+            );
+
+            let persisted_code_definition = self.db.get_contract_code_definition(checkpoint_id, contract_id).await?;
+            anyhow::ensure!(
+                persisted_code_definition == expected_code_definition.code_definition,
+                "contract commit validation failed at checkpoint {} for contract {}: persisted code definition does not match the prepared code definition",
+                checkpoint_id,
+                contract_id,
+            );
+
+            anyhow::ensure!(
+                expected_leaf.state_tree_height.to_u64_value()
+                    == u64::from(expected_code_definition.code_definition.state_tree_height),
+                "contract commit validation failed at checkpoint {} for contract {}: prepared leaf state tree height {} does not match code definition height {}",
+                checkpoint_id,
+                contract_id,
+                expected_leaf.state_tree_height.to_u64_value(),
+                expected_code_definition.code_definition.state_tree_height,
+            );
+
+            let persisted_function_tree_root = self.db.contract_function_tree_get_root_hash(checkpoint_id, contract_id).await?;
+            anyhow::ensure!(
+                persisted_function_tree_root == expected_leaf.function_tree_root,
+                "contract commit validation failed at checkpoint {} for contract {}: persisted function tree root {:?} does not match leaf root {:?}",
+                checkpoint_id,
+                contract_id,
+                persisted_function_tree_root,
+                expected_leaf.function_tree_root,
+            );
+
+            let persisted_tree_heights = self.db.get_contract_tree_heights(checkpoint_id, &[contract_id]).await?;
+            let expected_tree_height = u8::try_from(expected_code_definition.code_definition.state_tree_height).map_err(|_| {
+                anyhow::anyhow!(
+                    "contract commit validation failed at checkpoint {} for contract {}: state tree height {} exceeds u8 storage range",
+                    checkpoint_id,
+                    contract_id,
+                    expected_code_definition.code_definition.state_tree_height,
+                )
+            })?;
+            anyhow::ensure!(
+                persisted_tree_heights.as_slice() == [expected_tree_height],
+                "contract commit validation failed at checkpoint {} for contract {}: persisted tree heights {:?} do not match expected height {}",
+                checkpoint_id,
+                contract_id,
+                persisted_tree_heights,
+                expected_tree_height,
+            );
+
+            let contract_tree_proof = self.db.global_contract_tree_get_merkle_proof(checkpoint_id, contract_id).await?;
+            anyhow::ensure!(
+                contract_tree_proof.verify::<N::HasherBase>(),
+                "contract commit validation failed at checkpoint {} for contract {}: persisted contract Merkle proof is invalid",
+                checkpoint_id,
+                contract_id,
+            );
+            let expected_leaf_hash = expected_leaf.qfhash::<N::HasherBase>();
+            anyhow::ensure!(
+                contract_tree_proof.value == expected_leaf_hash,
+                "contract commit validation failed at checkpoint {} for contract {}: proof value {:?} does not match expected leaf hash {:?}",
+                checkpoint_id,
+                contract_id,
+                contract_tree_proof.value,
+                expected_leaf_hash,
+            );
+            anyhow::ensure!(
+                contract_tree_proof.root == expected_contract_tree_root,
+                "contract commit validation failed at checkpoint {} for contract {}: proof root {:?} does not match expected checkpoint contract tree root {:?}",
+                checkpoint_id,
+                contract_id,
+                contract_tree_proof.root,
+                expected_contract_tree_root,
+            );
+        }
+
+        let code_definition_ids = contract_code_definitions
+            .iter()
+            .map(|definition| definition.contract_id)
+            .collect::<HashSet<_>>();
+        anyhow::ensure!(
+            code_definition_ids.len() == contract_code_definitions.len() && code_definition_ids == seen_contract_ids,
+            "contract commit validation failed at checkpoint {}: contract leaf IDs and code definition IDs differ",
+            checkpoint_id,
+        );
+
+        tracing::info!(
+            "Validated {} persisted contract update(s) for checkpoint ID: {}",
+            contract_count,
+            checkpoint_id,
+        );
+        Ok(())
+    }
+
     pub async fn commit_state(
         &mut self,
         coordinator_update: PsyPreparedCoordinatorBlockStateUpdates<N::F, N::QHash>,
@@ -955,10 +1147,9 @@ checkpoint_backup_copy_status={}
         let contract_tree_heights = coordinator_update
             .new_contract_code_definitions
             .iter()
-            .enumerate()
-            .map(|(ind, c)| {
+            .map(|c| {
                 (
-                    (coordinator_update.old_base.block_state.next_contract_id as u64 + ind as u64),
+                    c.contract_id,
                     c.code_definition.state_tree_height as u8,
                 )
             })
@@ -997,6 +1188,14 @@ checkpoint_backup_copy_status={}
                 .global_contract_tree_set_nodes_ffs(checkpoint_id, &coordinator_update.update_global_contract_tree_nodes_ffs)
                 .await?;
             tracing::info!("Committed global contract tree updates for checkpoint ID: {}", checkpoint_id);
+
+            self.ensure_contract_updates_persisted(
+                checkpoint_id,
+                coordinator_update.new_base.checkpoint_leaf.global_state_roots.contract_tree_root,
+                &coordinator_update.new_contract_leaves_ffs,
+                &coordinator_update.new_contract_code_definitions,
+            )
+            .await?;
         }
         tracing::info!("Committed contract state updates for checkpoint ID: {}", checkpoint_id);
         // start user registraion updates
@@ -1057,6 +1256,12 @@ checkpoint_backup_copy_status={}
         // from disk SO LONG AS THE checkpoint_id is not set!!!!
         let previous_checkpoint_id = self.ids.checkpoint_id;
         self.db.set_latest_checkpoint_id(checkpoint_id).await?;
+        if !coordinator_update.new_contract_leaves_ffs.is_empty() {
+            tracing::info!(
+                "Finalized contract updates in committed checkpoint ID: {} (latest checkpoint advanced)",
+                checkpoint_id,
+            );
+        }
         if checkpoint_id > 0 && previous_checkpoint_id < checkpoint_id {
             if let Some((previous_pending_id, _)) = self
                 .db
@@ -1253,6 +1458,7 @@ impl<
         &mut self,
         file_system: &FileSystem,
         deploy_contract_gatherer_backup_directory: &str,
+        update_contract_gatherer_backup_directory: &str,
         register_user_gatherer_backup_directory: &str,
         guta_gatherer_backup_directory: &str,
         global_user_tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
@@ -1302,6 +1508,7 @@ impl<
             let coordinator_update = generate_coordinator_output_from_backups::<N, FileSystem>(
                 file_system,
                 deploy_contract_gatherer_backup_directory,
+                update_contract_gatherer_backup_directory,
                 register_user_gatherer_backup_directory,
                 guta_gatherer_backup_directory,
                 &self.ids,
@@ -1358,6 +1565,7 @@ Checkpoint Root Hash: {}
         &mut self,
         file_system: &FileSystem,
         deploy_contract_gatherer_backup_directory: &str,
+        update_contract_gatherer_backup_directory: &str,
         register_user_gatherer_backup_directory: &str,
         guta_gatherer_backup_directory: &str,
         genesis_block_update: PsyPreparedCoordinatorBlockStateUpdates<N::F, N::QHash>,
@@ -1369,6 +1577,7 @@ Checkpoint Root Hash: {}
         self.ensure_backup_restored_if_necessary(
             file_system,
             deploy_contract_gatherer_backup_directory,
+            update_contract_gatherer_backup_directory,
             register_user_gatherer_backup_directory,
             guta_gatherer_backup_directory,
             global_user_tree,

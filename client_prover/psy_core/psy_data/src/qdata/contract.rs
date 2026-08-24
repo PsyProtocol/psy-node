@@ -16,6 +16,9 @@ pub struct PsyContractLeaf<F: RichField> {
     pub function_tree_root: QHashOut<F>,
     pub code_root: QHashOut<F>,
     pub state_tree_height: F,
+    pub state_layout_root: QHashOut<F>,
+    pub state_layout_field_count: F,
+    pub state_layout_slot_count: F,
 }
 
 impl<F: RichField> KVQSerializable for PsyContractLeaf<F> {
@@ -30,7 +33,7 @@ impl<F: RichField> KVQSerializable for PsyContractLeaf<F> {
 
 impl<F: RichField> QFeltSized for PsyContractLeaf<F> {
     fn q_felt_size() -> usize {
-        13
+        19
     }
 }
 impl<F: RichField> ToQFelts<F> for PsyContractLeaf<F> {
@@ -49,6 +52,12 @@ impl<F: RichField> ToQFelts<F> for PsyContractLeaf<F> {
             self.code_root.0.elements[2],
             self.code_root.0.elements[3],
             self.state_tree_height,
+            self.state_layout_root.0.elements[0],
+            self.state_layout_root.0.elements[1],
+            self.state_layout_root.0.elements[2],
+            self.state_layout_root.0.elements[3],
+            self.state_layout_field_count,
+            self.state_layout_slot_count,
         ]
     }
 
@@ -65,6 +74,9 @@ impl<F: RichField> ToQFelts<F> for PsyContractLeaf<F> {
             function_tree_root,
             code_root,
             state_tree_height,
+            state_layout_root: QHashOut::from_qfelts(&felts[13..17]),
+            state_layout_field_count: felts[17],
+            state_layout_slot_count: felts[18],
         }
     }
 }
@@ -72,6 +84,7 @@ impl<F: RichField> ToQFelts<F> for PsyContractLeaf<F> {
 impl<F: RichField> QFieldHashable<F> for PsyContractLeaf<F> {
     fn qfhash<H: FieldQHasher<F>>(&self) -> QHashOut<F> {
         H::q_hash_many(&[
+            F::from_canonical_u64(0x434c_5632),
             self.deployer.0.elements[0],
             self.deployer.0.elements[1],
             self.deployer.0.elements[2],
@@ -85,6 +98,12 @@ impl<F: RichField> QFieldHashable<F> for PsyContractLeaf<F> {
             self.code_root.0.elements[2],
             self.code_root.0.elements[3],
             self.state_tree_height,
+            self.state_layout_root.0.elements[0],
+            self.state_layout_root.0.elements[1],
+            self.state_layout_root.0.elements[2],
+            self.state_layout_root.0.elements[3],
+            self.state_layout_field_count,
+            self.state_layout_slot_count,
         ])
     }
 }

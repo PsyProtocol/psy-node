@@ -11,7 +11,7 @@ use psy_client_data::{
     api::reward::{PsyProoffMinerRewardProof, PsyProoffMinerRewardProofWithRewardPreimage, PsyProvingJobClaimMetadata},
     traits::qdatastore::{qmetadata::QMetaDataStoreReaderSync, qtreedata::QTreeDataStoreReaderSync},
 };
-use psy_config::network_constants::{MAX_CONTRACT_STATE_TREE_HEIGHT, MINING_REWARDS_CONTRACT_ID, TOKEN_CONTRACT_ID};
+use psy_config::network_constants::{MINING_REWARDS_CONTRACT_ID, TOKEN_CONTRACT_ID, TOKEN_CONTRACT_STATE_TREE_HEIGHT};
 use psy_crypto::hash::merkle::tag_tree::TagTreeMerkleProofWithRewardPreimage;
 use psy_prover::session::{build_claim_calls_for_multi_checkpoints_v2, ProofWithCheckpointV2, LAST_CLAIMED_CHECKPOINT_SLOT};
 use psy_provider::provider::RpcProvider;
@@ -354,7 +354,7 @@ async fn get_last_claimed_checkpoint_id(provider: &RpcProvider, user_id: u64, la
             latest_checkpoint_id,
             user_id,
             TOKEN_CONTRACT_ID,
-            MAX_CONTRACT_STATE_TREE_HEIGHT,
+            TOKEN_CONTRACT_STATE_TREE_HEIGHT,
             LAST_CLAIMED_CHECKPOINT_SLOT,
         )
         .await?;
