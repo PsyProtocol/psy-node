@@ -29,11 +29,21 @@ cd "$REPO_ROOT"
 ROUNDS=5
 DEPTH=20
 SETTLE=240
+CRASH_AT=""
+CRASH_REALM=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --rounds) ROUNDS="$2"; shift 2 ;;
     --depth)  DEPTH="$2";  shift 2 ;;
     --settle) SETTLE="$2"; shift 2 ;;
+    # Kill the Realm at a named moment inside the rollback, and then ask the
+    # same questions of the chain as an uneventful round does.
+    #
+    # The dangerous moments are the gaps between doing a thing and recording
+    # that it was done: a few milliseconds each, which ordinary running never
+    # lands in. Naming them is the only way to test them.
+    --crash-at)    CRASH_AT="$2";    shift 2 ;;
+    --crash-realm) CRASH_REALM="$2"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -195,6 +205,74 @@ healthy() {  # healthy <what-for>
 
 stop_workload() { pkill -f "workload.py (registrar|deployer|transferrer)" 2>/dev/null || true; }
 
+# --- arming a Realm to die inside the rollback -------------------------------
+
+realm_pids() {  # matched on the program, since `pgrep -f` also matches this script
+  pgrep -a psy_node_cli 2>/dev/null \
+    | grep "start-realm-processor --realm-id $CRASH_REALM " | awk '{print $1}'
+}
+
+# By process group, and confirmed by staying empty: between a child exiting and
+# its exit-75 wrapper starting the next one there is a gap with no processor, and
+# returning inside it leaves the wrapper alive to spawn a second one. Two
+# processors for one Realm both submit, one submission is stale, and the Realm
+# parks on an error that reads like a rollback defect.
+stop_realm() {
+  for p in $(realm_pids); do
+    pgid=$(ps -o pgid= -p "$p" 2>/dev/null | tr -d ' ')
+    [ -n "${pgid:-}" ] && kill -TERM -"$pgid" 2>/dev/null || true
+    kill "$p" 2>/dev/null || true
+  done
+  local settled=0
+  for _ in $(seq 1 60); do
+    if [ -z "$(realm_pids)" ]; then
+      settled=$((settled + 1)); [ "$settled" -ge 5 ] && return 0
+    else
+      settled=0
+    fi
+    sleep 1
+  done
+  halt "realm-$CRASH_REALM would not stop"
+}
+
+# Under the same exit-75 supervisor the stack uses, because the recovery this
+# tests ends in exit 75. Started bare it would do the right thing and stay dead.
+start_realm() {  # start_realm [crash-point]
+  stop_realm
+  local point="${1:-}" extra=()
+  [ -n "$point" ] && extra=(env "PSY_ROLLBACK_REALM_CRASH_AT=$point")
+  local runner='
+    while true; do
+      "$@"
+      code=$?
+      if [ "$code" -ne 75 ]; then exit "$code"; fi
+      echo "[campaign] realm asked to reload after a rollback; restarting"
+    done
+  '
+  setsid nohup "${extra[@]}" env \
+    PSY_ROLLBACK_VERIFICATION_JOURNAL=1 \
+    PSY_ROLLBACK_COORDINATOR_NO_TABLET_KEYSPACE=coordinator_no_tablet \
+    bash -c "$runner" _ \
+    "$REPO_ROOT/target/release/psy_node_cli" start-realm-processor \
+      --realm-id "$CRASH_REALM" --realm-sub-id 1 --network local-devnet \
+      --db-namespace "realm_$CRASH_REALM" --scylla-db-url 127.0.0.1:9042 \
+      --nats-jetstream-url nats://127.0.0.1:4222 --redis-url redis://127.0.0.1:6379 \
+      --genesis-data-path "$REPO_ROOT/genesis.json" \
+      --checkpoint-backup-path "$REPO_ROOT/.local-staging/checkpoints" \
+      --proving-backend plonky2-poseidon-goldilocks \
+      --coordinator-api-urls http://127.0.0.1:1337 --verbose \
+      >> "$LOGS/realm-$CRASH_REALM-processor.log" 2>&1 < /dev/null &
+  for _ in $(seq 1 40); do [ -n "$(realm_pids)" ] && break; sleep 1; done
+  [ -n "$(realm_pids)" ] || halt "realm-$CRASH_REALM would not start"
+  sleep 3
+  local n; n=$(realm_pids | wc -l)
+  [ "$n" -eq 1 ] || halt "realm-$CRASH_REALM has $n processors; exactly one was started"
+}
+
+crashes_so_far() {
+  grep -ac "fault injection" "$LOGS/realm-$CRASH_REALM-processor.log" 2>/dev/null || echo 0
+}
+
 exec > >(tee -a "$CAMPAIGN_LOG") 2>&1
 say "log: $CAMPAIGN_LOG"
 
@@ -277,8 +355,35 @@ for round in $(seq 1 "$ROUNDS"); do
   contracts_before=$(contract_count)
   say "head $before, epoch $epoch_before; rolling back to $target"
 
+  if [ -n "$CRASH_AT" ]; then
+    crashes_before=$(crashes_so_far)
+    say "arming realm-$CRASH_REALM to die at $CRASH_AT"
+    start_realm "$CRASH_AT"
+    # It has to be caught up to reach the point at all. A Realm still starting
+    # when FROZEN is published misses the join and takes the recovery path
+    # instead -- a different set of moments, reached silently.
+    waited=0
+    until [ "$(realm_commit "$CRASH_REALM" "$epoch_before")" != "null" ] || [ $waited -ge 300 ]; do
+      sleep 10; waited=$((waited + 10))
+    done
+    say "realm-$CRASH_REALM is armed and committing again"
+  fi
+
   timeout 1800 "$CLI" rollback to "$target" 2>&1 | grep -aE "RollbackReport|going on without|^done|Error" \
     || halt "round $round: the rollback command failed"
+
+  if [ -n "$CRASH_AT" ]; then
+    # Whether it actually died. Silence here would otherwise be read as the
+    # point passing, which is how a binary built without the feature reports a
+    # clean sweep of eleven crash points it never reached.
+    if [ "$(crashes_so_far)" -le "$crashes_before" ]; then
+      halt "round $round: realm-$CRASH_REALM never aborted at $CRASH_AT. Either it did not \
+reach that point -- it may not have been a participant -- or this binary was built without \
+--features rollback-fault-injection, in which case nothing above tested anything."
+    fi
+    say "realm-$CRASH_REALM aborted at $CRASH_AT; bringing it back to recover on its own"
+    start_realm
+  fi
 
   say "waiting ${SETTLE}s for the chain to carry on by itself"
   sleep "$SETTLE"
