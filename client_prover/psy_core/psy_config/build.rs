@@ -230,7 +230,7 @@ fn generate_precompile_constants_from_genesis_contracts() -> Result<String, Box<
     let mut constants = String::new();
     constants.push_str("\n");
 
-    // Generate contract ID constants
+    // Generate contract ID and state-tree-height constants
     for (index, contract) in contracts.iter().enumerate() {
         let name = contract
             .get("name")
@@ -238,6 +238,15 @@ fn generate_precompile_constants_from_genesis_contracts() -> Result<String, Box<
             .ok_or_else(|| format!("Contract at index {} is missing required 'name' field", index))?;
         let const_name = name.to_uppercase();
         constants.push_str(&format!("pub const {}_CONTRACT_ID: u32 = {};\n", const_name, index));
+        let state_tree_height = contract
+            .get("code_definition")
+            .and_then(|c| c.get("state_tree_height"))
+            .and_then(|h| h.as_u64())
+            .ok_or_else(|| format!("Contract '{}' missing code_definition.state_tree_height", name))?;
+        constants.push_str(&format!(
+            "pub const {}_CONTRACT_STATE_TREE_HEIGHT: u8 = {};\n",
+            const_name, state_tree_height as u8
+        ));
     }
     constants.push('\n');
 
