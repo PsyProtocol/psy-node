@@ -689,7 +689,7 @@ pub struct PrivateTransferArgs {
     pub amount: u64,
     #[clap(long, alias = "owner")]
     pub receiver: Option<String>,
-    #[clap(long, default_value = "8388609")]
+    #[clap(long, default_value = "2147483649")]
     pub note_root_slot: u64,
     #[clap(long, default_value_t = u64::MAX)]
     pub checkpoint_id: u64,

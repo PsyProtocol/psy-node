@@ -3052,7 +3052,7 @@ fn default_l1_token(token: &str) -> Option<String> {
 }
 
 /// Slot holding the note-tree root in the token contract's state.
-const NOTE_ROOT_SLOT: u64 = 8_388_609;
+const NOTE_ROOT_SLOT: u64 = 2_147_483_649;
 
 fn default_relay() -> String {
     std::env::var("PSY_MCP_NOSTR_RELAY")
