@@ -672,8 +672,15 @@ mod tests {
 
     #[test]
     fn test_private_note_inclusion_circuit_builds() {
-        // note_tree_height = 20 (2^20 notes)
-        let circuit = PrivateNoteInclusionCircuit::<C, D>::new(32, 24, 24, 20);
+        use psy_config::network_constants::{
+            GLOBAL_CONTRACT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT, PRIVATE_NOTE_TREE_HEIGHT, TOKEN_CONTRACT_STATE_TREE_HEIGHT,
+        };
+        let circuit = PrivateNoteInclusionCircuit::<C, D>::new(
+            GLOBAL_USER_TREE_HEIGHT as usize,
+            GLOBAL_CONTRACT_TREE_HEIGHT as usize,
+            TOKEN_CONTRACT_STATE_TREE_HEIGHT as usize,
+            PRIVATE_NOTE_TREE_HEIGHT,
+        );
 
         // Base circuit data
         let base_common = &circuit.circuit_data.common;
@@ -691,7 +698,7 @@ mod tests {
 
         let actual = circuit.get_fingerprint();
         println!("fingerprint: {:?}", actual);
-        let expected = QHashOut::from_values(1133983815954452530, 11643641005412181396, 4562608820308473451, 14673158639327927697);
+        let expected = QHashOut::from_values(2482434993266711942, 6028864160300535936, 2827549014984201026, 3018365102481798071);
         assert_eq!(actual, expected);
     }
 

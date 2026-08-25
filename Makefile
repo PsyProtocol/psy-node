@@ -109,6 +109,13 @@ config_gen_v2:
 generate-genesis-data:
 	cargo test --release --package psy_plonky2_circuits --lib -- node::config::networks::local_devnet::tests --nocapture
 
+# Regenerates client_prover/psy_prover/src/wallet/local_circuits.json (embedded
+# zk-sign + privacy base circuits). Needed whenever the circuit-defining
+# constants (e.g. TOKEN_CONTRACT_STATE_TREE_HEIGHT from genesis contracts)
+# change.
+generate-local-circuits:
+	cargo test --release -p psy_prover generate_local_circuits_json -- --ignored --nocapture
+
 data := ./psy_cli/psy_relayer_cli/data
 KEYSTORE_DIR ?= $(HOME)/.psy/keystore
 generate-groth16:
