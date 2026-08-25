@@ -11,7 +11,7 @@ use plonky2::plonk::{
     config::{AlgebraicHasher, GenericConfig},
     proof::ProofWithPublicInputs,
 };
-use std::time::Instant;
+use web_time::Instant;
 use psy_core::{
     constants::protocol::{
         STATE_LAYOUT_APPEND_SUB_TREE_HEIGHT,
@@ -73,8 +73,29 @@ pub struct StateLayoutCircuitManager<
         Vec<StateLayoutAppendAggregateCircuit<C, D>>,
     pub canonical_layout_append:
         CanonicalStateLayoutAppendWrapperCircuit<C, D>,
-    pub batch_deploy_contracts: BatchDeployContractsCircuit<C, D>,
-    pub batch_update_contracts: BatchUpdateContractsCircuit<C, D>,
+    pub batch_deploy_contracts: NativeOnlyCircuit<BatchDeployContractsCircuit<C, D>>,
+    pub batch_update_contracts: NativeOnlyCircuit<BatchUpdateContractsCircuit<C, D>>,
+}
+
+#[derive(Debug)]
+pub struct NativeOnlyCircuit<T>(Option<T>);
+
+impl<T> NativeOnlyCircuit<T> {
+    fn present(value: T) -> Self {
+        Self(Some(value))
+    }
+
+    fn absent() -> Self {
+        Self(None)
+    }
+}
+
+impl<T> std::ops::Deref for NativeOnlyCircuit<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("native-only state-layout circuit is unavailable")
+    }
 }
 
 impl<C: GenericConfig<D>, const D: usize>
@@ -93,10 +114,51 @@ where
         max_layout_aggregation_depth: usize,
     ) -> Self {
         let manager_started_at = Instant::now();
+        let mut manager = Self::new_layout_only(
+            layout_top_line_height,
+            layout_web_tree_height,
+            max_layout_aggregation_depth,
+        );
+        let started_at = Instant::now();
+        manager.batch_deploy_contracts = NativeOnlyCircuit::present(
+            BatchDeployContractsCircuit::new(
+                contract_tree_height,
+                contract_batch_sub_tree_height,
+                state_layout_tree_height,
+                max_contract_state_tree_height,
+                manager.canonical_layout_append.get_common_circuit_data_ref(),
+                manager.canonical_layout_append.get_verifier_config_ref(),
+            ),
+        );
+        println!("StateLayout batch_deploy_contracts completed in {:?}", started_at.elapsed());
+        let started_at = Instant::now();
+        manager.batch_update_contracts = NativeOnlyCircuit::present(
+            BatchUpdateContractsCircuit::new(
+                contract_tree_height,
+                contract_batch_sub_tree_height,
+                manager.canonical_layout_append.get_common_circuit_data_ref(),
+                manager.canonical_layout_append.get_verifier_config_ref(),
+            ),
+        );
+        println!("StateLayout batch_update_contracts completed in {:?}", started_at.elapsed());
+        println!("StateLayoutCircuitManager completed in {:?}", manager_started_at.elapsed());
+        manager
+    }
+
+    /// Builds only the circuits required to create canonical layout proofs.
+    ///
+    /// Browser provers must not construct the coordinator-scale batch deploy
+    /// and update circuits, which are not used by layout proof generation.
+    pub fn new_layout_only(
+        layout_top_line_height: usize,
+        layout_web_tree_height: usize,
+        max_layout_aggregation_depth: usize,
+    ) -> Self {
+        let manager_started_at = Instant::now();
         println!(
             "StateLayoutCircuitManager start (aggregation_depth: {}, tree_height: {}, append_subtree_height: {})",
             max_layout_aggregation_depth,
-            state_layout_tree_height,
+            layout_top_line_height + layout_web_tree_height,
             layout_web_tree_height,
         );
         let started_at = Instant::now();
@@ -176,25 +238,7 @@ where
         let canonical_layout_append =
             CanonicalStateLayoutAppendWrapperCircuit::new(&allowed);
         println!("StateLayout canonical_layout_append completed in {:?}", started_at.elapsed());
-        let started_at = Instant::now();
-        let batch_deploy_contracts = BatchDeployContractsCircuit::new(
-            contract_tree_height,
-            contract_batch_sub_tree_height,
-            state_layout_tree_height,
-            max_contract_state_tree_height,
-            canonical_layout_append.get_common_circuit_data_ref(),
-            canonical_layout_append.get_verifier_config_ref(),
-        );
-        println!("StateLayout batch_deploy_contracts completed in {:?}", started_at.elapsed());
-        let started_at = Instant::now();
-        let batch_update_contracts = BatchUpdateContractsCircuit::new(
-            contract_tree_height,
-            contract_batch_sub_tree_height,
-            canonical_layout_append.get_common_circuit_data_ref(),
-            canonical_layout_append.get_verifier_config_ref(),
-        );
-        println!("StateLayout batch_update_contracts completed in {:?}", started_at.elapsed());
-        println!("StateLayoutCircuitManager completed in {:?}", manager_started_at.elapsed());
+        println!("StateLayoutCircuitManager layout-only circuits completed in {:?}", manager_started_at.elapsed());
         Self {
             canonical_type_layout,
             primitive_type_layout,
@@ -203,8 +247,8 @@ where
             layout_append,
             layout_aggregation_levels,
             canonical_layout_append,
-            batch_deploy_contracts,
-            batch_update_contracts,
+            batch_deploy_contracts: NativeOnlyCircuit::absent(),
+            batch_update_contracts: NativeOnlyCircuit::absent(),
         }
     }
 
@@ -1005,6 +1049,7 @@ mod tests {
 
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;
+    type F = <C as GenericConfig<D>>::F;
 
     #[test]
     fn builds_all_base_circuits_from_one_layout_verifier() {
@@ -1040,5 +1085,49 @@ mod tests {
             19
         );
         assert_eq!(manager.canonical_layout_append.adapters.len(), 4);
+    }
+
+    #[test]
+    fn layout_only_constructor_matches_full_manager_fingerprints() {
+        use crate::proof_minifier::pm_core::get_circuit_fingerprint_generic_q;
+
+        let full = StateLayoutCircuitManager::<C, D>::new(2, 1, 4, 1, 1, 8, 3);
+        let layout_only = StateLayoutCircuitManager::<C, D>::new_layout_only(2, 1, 3);
+
+        assert_eq!(
+            get_circuit_fingerprint_generic_q::<D, F, C>(&full.canonical_type_layout.circuit_data.verifier_only),
+            get_circuit_fingerprint_generic_q::<D, F, C>(&layout_only.canonical_type_layout.circuit_data.verifier_only)
+        );
+        assert_eq!(
+            get_circuit_fingerprint_generic_q::<D, F, C>(&full.primitive_type_layout.circuit_data.verifier_only),
+            get_circuit_fingerprint_generic_q::<D, F, C>(&layout_only.primitive_type_layout.circuit_data.verifier_only)
+        );
+        assert_eq!(
+            get_circuit_fingerprint_generic_q::<D, F, C>(&full.fixed_array_primitive_type_layout.circuit_data.verifier_only),
+            get_circuit_fingerprint_generic_q::<D, F, C>(&layout_only.fixed_array_primitive_type_layout.circuit_data.verifier_only)
+        );
+        assert_eq!(
+            get_circuit_fingerprint_generic_q::<D, F, C>(&full.canonical_type_layout_wrapper.circuit_data.verifier_only),
+            get_circuit_fingerprint_generic_q::<D, F, C>(&layout_only.canonical_type_layout_wrapper.circuit_data.verifier_only)
+        );
+        assert_eq!(
+            get_circuit_fingerprint_generic_q::<D, F, C>(&full.layout_append.circuit_data.verifier_only),
+            get_circuit_fingerprint_generic_q::<D, F, C>(&layout_only.layout_append.circuit_data.verifier_only)
+        );
+        assert_eq!(
+            full.layout_aggregation_levels
+                .iter()
+                .map(QStandardCircuit::get_fingerprint)
+                .collect::<Vec<_>>(),
+            layout_only
+                .layout_aggregation_levels
+                .iter()
+                .map(QStandardCircuit::get_fingerprint)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            get_circuit_fingerprint_generic_q::<D, F, C>(&full.canonical_layout_append.circuit_data.verifier_only),
+            get_circuit_fingerprint_generic_q::<D, F, C>(&layout_only.canonical_layout_append.circuit_data.verifier_only)
+        );
     }
 }

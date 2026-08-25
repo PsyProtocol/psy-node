@@ -67,10 +67,10 @@ use psy_dpn_circuit::circuits::cfc::DapenContractFunctionCircuit;
 pub use psy_provider::session::TxStatus;
 use psy_provider::{
     provider::{ProveProxyRpcProvider, QUserRpcProvider, RpcProvider},
-    request::{
-        DPNSoftwareDefinedSignatureInput, QDeployContractRPCRequest, QRegisterUserRPCRequest, QSubmitEndCapRPCRequest, QUpdateContractRPCRequest,
-    },
+    request::{DPNSoftwareDefinedSignatureInput, QRegisterUserRPCRequest, QSubmitEndCapRPCRequest, QUpdateContractRPCRequest},
 };
+#[cfg(not(target_arch = "wasm32"))]
+use psy_provider::request::QDeployContractRPCRequest;
 use psy_ups_circuit::{circuit_manager::core::PsyUPSStepCircuitManager, session::UserProvingSessionManager};
 use psy_vm::{
     dpn::{
@@ -2598,7 +2598,6 @@ impl WalletSession {
         Ok(deploy_cmd)
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn get_layout_aware_deploy_contract_cmd(
         &self,
         deployer: QHashOut<F>,
@@ -2615,6 +2614,17 @@ impl WalletSession {
             abi,
         };
         crate::session::compile_bridge::build_layout_aware_deploy_command(&contract_output, deploy_cmd)
+    }
+
+    pub fn get_layout_aware_deploy_contract_cmd_from_json(
+        &self,
+        deployer: QHashOut<F>,
+        circuit_defs: Vec<DPNFunctionCircuitDefinition>,
+        abi_json: &str,
+    ) -> anyhow::Result<psy_client_data::qblock::cmds::deploy_contract::QBCDeployContractV2<F>> {
+        let abi: psy_compiler::abi::Abi = serde_json::from_str(abi_json)
+            .map_err(|error| anyhow::anyhow!("invalid contract ABI JSON: {error}"))?;
+        self.get_layout_aware_deploy_contract_cmd(deployer, circuit_defs, abi)
     }
 
     #[cfg(not(target_arch = "wasm32"))]

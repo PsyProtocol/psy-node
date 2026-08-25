@@ -25,40 +25,32 @@ use psy_vm::dpn::{
 };
 use serde::{Deserialize, Serialize};
 
+#[cfg(not(target_arch = "wasm32"))]
 use super::gen_contract_deploy_and_circuits_for_functions;
 
 type C = PoseidonGoldilocksConfig;
 const D: usize = 2;
 
-#[cfg(not(target_arch = "wasm32"))]
 fn local_state_layout_manager() -> &'static psy_plonky2_circuits::coordinator::state_layout_helper::StateLayoutCircuitManager<C, D> {
     static MANAGER: OnceLock<psy_plonky2_circuits::coordinator::state_layout_helper::StateLayoutCircuitManager<C, D>> = OnceLock::new();
     MANAGER.get_or_init(|| {
-        use psy_config::network_constants::{BATCH_DEPLOY_CONTRACT_SUB_TREE_HEIGHT, GLOBAL_CONTRACT_TREE_HEIGHT, MAX_CONTRACT_STATE_TREE_HEIGHT};
         use psy_core::constants::protocol::{STATE_LAYOUT_APPEND_SUB_TREE_HEIGHT, STATE_LAYOUT_MAX_AGGREGATION_DEPTH, STATE_LAYOUT_TREE_HEIGHT};
-        psy_plonky2_circuits::coordinator::state_layout_helper::StateLayoutCircuitManager::<C, D>::new(
+        psy_plonky2_circuits::coordinator::state_layout_helper::StateLayoutCircuitManager::<C, D>::new_layout_only(
             STATE_LAYOUT_TREE_HEIGHT - STATE_LAYOUT_APPEND_SUB_TREE_HEIGHT,
             STATE_LAYOUT_APPEND_SUB_TREE_HEIGHT,
-            usize::from(GLOBAL_CONTRACT_TREE_HEIGHT),
-            BATCH_DEPLOY_CONTRACT_SUB_TREE_HEIGHT,
-            STATE_LAYOUT_TREE_HEIGHT,
-            usize::from(MAX_CONTRACT_STATE_TREE_HEIGHT),
             STATE_LAYOUT_MAX_AGGREGATION_DEPTH,
         )
     })
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn local_layout_proof_cache() -> &'static Mutex<HashMap<String, psy_plonky2_circuits::coordinator::state_layout_helper::LocalInitialLayoutProof<F>>> {
     static CACHE: OnceLock<Mutex<HashMap<String, psy_plonky2_circuits::coordinator::state_layout_helper::LocalInitialLayoutProof<F>>>> =
         OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 const LOCAL_LAYOUT_PROOF_CACHE_MAX_ENTRIES: usize = 64;
 
-#[cfg(not(target_arch = "wasm32"))]
 fn layout_proof_cache_key<T: Serialize>(kind: &str, contract_id: Option<u64>, value: &T) -> anyhow::Result<String> {
     use psy_core::constants::protocol::{STATE_LAYOUT_APPEND_SUB_TREE_HEIGHT, STATE_LAYOUT_MAX_AGGREGATION_DEPTH, STATE_LAYOUT_TREE_HEIGHT};
     let manager = local_state_layout_manager();
@@ -75,7 +67,6 @@ fn layout_proof_cache_key<T: Serialize>(kind: &str, contract_id: Option<u64>, va
     ))?)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn cache_layout_proof(key: String, proof: psy_plonky2_circuits::coordinator::state_layout_helper::LocalInitialLayoutProof<F>) -> anyhow::Result<()> {
     let mut cache = local_layout_proof_cache()
         .lock()
@@ -173,7 +164,6 @@ fn build_deploy_artifacts(contract_output: ContractOutput, deployer: QHashOut<F>
 
 /// Generates the canonical layout proof and attaches it to an existing
 /// compiler deploy artifact.
-#[cfg(not(target_arch = "wasm32"))]
 pub fn build_layout_aware_deploy_command(
     contract_output: &ContractOutput,
     deploy_contract: QBCDeployContract<F>,
@@ -217,7 +207,6 @@ pub fn build_layout_aware_deploy_command(
     Ok(command)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 pub fn build_layout_aware_update_command(
     old_contract_output: &ContractOutput,
     new_contract_output: &ContractOutput,
@@ -396,6 +385,41 @@ mod tests {
         let sim = result.unwrap();
         assert!(sim.passed, "simulation should pass");
         assert_eq!(sim.method_name, "set_value");
+    }
+
+    #[test]
+    #[ignore = "builds state-layout circuits and generates a recursive deploy proof"]
+    fn proves_layout_aware_contract_deploy() -> anyhow::Result<()> {
+        let source = r#"
+            #[contract]
+            pub struct LayoutAwareDeployContract {
+                pub balance: Felt,
+                pub nonce: U32,
+            }
+
+            #[contract_implementation]
+            impl LayoutAwareDeployContract {
+                #[contract_method]
+                pub fn add_balance(&mut self, ctx: &mut ChainContext, amount: Felt) {
+                    self.balance += amount;
+                }
+            }
+        "#;
+        let contract_output = psy_compiler::compile(source)?;
+        let deployer = QHashOut::<F>::default();
+        let (_, base_deploy) = super::super::gen_contract_deploy_and_circuits_for_functions::<C, D>(
+            deployer,
+            u8::try_from(contract_output.abi.contract.state_tree_height)?,
+            &contract_output.circuit_definitions,
+        )?;
+        let deploy = build_layout_aware_deploy_command(&contract_output, base_deploy)?;
+
+        assert_eq!(deploy.deploy_contract.deployer, deployer);
+        assert_eq!(deploy.state_layout_field_count, 2);
+        assert_eq!(deploy.state_layout_slot_count, 2);
+        assert!(!deploy.canonical_layout_proof.is_empty());
+        deploy.validate_shape()?;
+        Ok(())
     }
 
     #[test]
