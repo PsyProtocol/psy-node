@@ -53,6 +53,7 @@ use crate::realm::{
     edge::{error::RpcError, utils::end_cap::validate_end_cap_and_generate_node_data_for_edge},
     queue_key::RealmUserUpdateQueueKey,
 };
+use crate::worker_whitelist::WhiteListCache;
 
 const END_CAP_PROOF_CIRCUIT_TYPE_U32: u32 = ProvingJobCircuitType::UserEndCap as u32;
 pub struct RealmEdgeHandler<
@@ -71,6 +72,8 @@ pub struct RealmEdgeHandler<
 
     pub user_update_queue: Arc<UserUpdateQueue>,
     pub get_proof_work_queue: Arc<GetProofWorkQueue>,
+    pub worker_whitelist: WhiteListCache,
+    pub worker_reputation_update_lock: Arc<tokio::sync::Mutex<()>>,
 
     pub realm_identifier: QRealmIdentifier,
     pub realm_id_u64: u64,
@@ -99,6 +102,8 @@ impl<
             proof_store: self.proof_store.clone(),
             user_update_queue: self.user_update_queue.clone(),
             get_proof_work_queue: self.get_proof_work_queue.clone(),
+            worker_whitelist: self.worker_whitelist.clone(),
+            worker_reputation_update_lock: self.worker_reputation_update_lock.clone(),
             realm_identifier: self.realm_identifier.clone(),
             realm_id_u64: self.realm_id_u64.clone(),
             realm_sub_id_u64: self.realm_sub_id_u64.clone(),
@@ -130,6 +135,7 @@ impl<
         chain_id: u32,
         node_id: u32,
         proof_verifier: Arc<N::ZKVerifier>,
+        worker_whitelist: WhiteListCache,
     ) -> Self {
         let realm_id_u64 = realm_identifier.realm_id as u64;
         let realm_sub_id_u64 = realm_identifier.realm_sub_id as u64;
@@ -140,6 +146,8 @@ impl<
             proof_store,
             user_update_queue,
             get_proof_work_queue,
+            worker_whitelist,
+            worker_reputation_update_lock: Arc::new(tokio::sync::Mutex::new(())),
             realm_identifier,
             realm_id_u64,
             realm_sub_id_u64,

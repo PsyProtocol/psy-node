@@ -65,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
             port,
             listen,
             proving_backend,
+            worker_whitelist_config,
         } => {
             let config = RealmEdgeCliConfig::get_start_config(
                 config,
@@ -78,6 +79,7 @@ async fn main() -> anyhow::Result<()> {
                 verbose,
                 port,
                 listen,
+                worker_whitelist_config,
             )
             .await?;
             start_realm_edge::run(config, get_proving_backend_from_input(proving_backend)).await?;
@@ -125,6 +127,7 @@ async fn main() -> anyhow::Result<()> {
             port,
             listen,
             proving_backend,
+            worker_whitelist_config,
         } => {
             let config = CoordinatorEdgeCliConfig::get_start_config(
                 config,
@@ -138,6 +141,7 @@ async fn main() -> anyhow::Result<()> {
                 verbose,
                 port,
                 listen,
+                worker_whitelist_config,
             )
             .await?;
             start_coordinator_edge::run(config, get_proving_backend_from_input(proving_backend)).await?;

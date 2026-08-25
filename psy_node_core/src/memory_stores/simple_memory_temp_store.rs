@@ -9,7 +9,7 @@ use parth_core::{
 };
 use std::{collections::HashMap, sync::{Arc, RwLock}};
 
-use crate::store::traits::{proof_store::{QParthProofStoreReader, QParthProofStoreWriter}, temp_db::{QTempDatabaseCounterReaderBase, QTempDatabaseCounterWriterBase, QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase}};
+use crate::store::traits::{proof_store::{QParthProofStoreReader, QParthProofStoreWriter}, temp_db::{QTempDatabaseCounterReaderBase, QTempDatabaseCounterWriterBase, QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase, QTempDatabaseRawWorkerReputationMutationBase}};
 
 #[derive(Debug, Clone)]
 pub struct SimpleMemoryTempStore {
@@ -236,6 +236,49 @@ impl QTempDatabaseRawKVWriterBase for SimpleMemoryTempStore {
         }
         Ok(())
 
+    }
+}
+
+#[async_trait]
+impl QTempDatabaseRawWorkerReputationMutationBase for SimpleMemoryTempStore {
+    async fn qtdb_raw_apply_worker_reputation_once(
+        &self,
+        claim_key: &[u8],
+        reputation_key: &[u8],
+        initial_reputation: u64,
+        on_time: bool,
+        reward: u64,
+        slash: u64,
+        maximum: u64,
+    ) -> anyhow::Result<bool> {
+        let mut kv_map = self.kv_map.write().map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let claim = kv_map
+            .get_mut(claim_key)
+            .ok_or_else(|| anyhow::anyhow!("stored claim disappeared during reputation update"))?;
+        if claim.len() < 66 {
+            anyhow::bail!("stored claim has invalid length {}", claim.len());
+        }
+        if claim.get(66).is_some_and(|flag| *flag != 0) {
+            return Ok(false);
+        }
+        if claim.len() == 66 {
+            claim.push(1);
+        } else {
+            claim[66] = 1;
+        }
+
+        let current = kv_map
+            .get(reputation_key)
+            .filter(|value| value.len() >= 8)
+            .map(|value| u64::from_le_bytes(value[0..8].try_into().unwrap()))
+            .unwrap_or(initial_reputation);
+        let next = if on_time {
+            current.saturating_add(reward).min(maximum)
+        } else {
+            current.saturating_sub(slash)
+        };
+        kv_map.insert(reputation_key.to_vec(), next.to_le_bytes().to_vec());
+        Ok(true)
     }
 }
 

@@ -93,6 +93,9 @@ pub enum Commands {
 
         #[arg(long = "proving-backend", help = "The proving backend to use (plonky2-poseidon-goldilocks, jtmb-poseidon-goldilocks, jtmb-sha256-u64, etc.)")]
         proving_backend: Option<PsyChainProvingBackendTypeInput>,
+
+        #[arg(long = "worker-whitelist-config", help = "Path to the worker whitelist genesis config file (default: psy-genesis/config.json)")]
+        worker_whitelist_config: Option<String>,
     },
     #[command(about = "Start a coordinator processor node")]
     StartCoordinatorProcessor {
@@ -169,5 +172,8 @@ pub enum Commands {
 
         #[arg(long = "proving-backend", help = "The proving backend to use (plonky2-poseidon-goldilocks, jtmb-poseidon-goldilocks, jtmb-sha256-u64, etc.)")]
         proving_backend: Option<PsyChainProvingBackendTypeInput>,
+
+        #[arg(long = "worker-whitelist-config", help = "Path to the worker whitelist genesis config file (default: psy-genesis/config.json)")]
+        worker_whitelist_config: Option<String>,
     },
 }

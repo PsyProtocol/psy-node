@@ -600,27 +600,28 @@ impl NatsJetStreamClient {
 
     pub async fn report_message_completed_dq(&self, subject: &str, report_id: &[u8]) -> anyhow::Result<bool> {
         let kv_key = format!("{}.{}", subject, hex::encode(report_id));
-        if let Some(reply_bytes) = self.kv.get(&kv_key).await? {
-            let reply = String::from_utf8(reply_bytes.to_vec())?;
-            println!(
-                "Reporting job completed for subject: {}, report_id: {}, reply: {}",
-                subject,
-                hex::encode(report_id),
-                reply
-            );
-            self.jetstream.publish(reply, Bytes::from_static(b"+ACK")).await?;
-            self.kv.delete(&kv_key).await?;
-            return Ok(true);
-        } else {
+        let Some(reply_bytes) = self.kv.get(&kv_key).await? else {
             tracing::info!(
-                "Unable to report job completed for subject: {}, report_id: {}, {}",
+                "Unable to report job completed for subject: {}, report_id: {}, not found in kv store",
                 subject,
                 hex::encode(report_id),
-                "not found in kv store"
             );
-
             return Ok(false);
+        };
+        if reply_bytes.is_empty() {
+            return Ok(true);
         }
+
+        let reply = String::from_utf8(reply_bytes.to_vec())?;
+        println!(
+            "Reporting job completed for subject: {}, report_id: {}, reply: {}",
+            subject,
+            hex::encode(report_id),
+            reply
+        );
+        self.jetstream.publish(reply, Bytes::from_static(b"+ACK")).await?;
+        self.kv.put(&kv_key, Bytes::new()).await?;
+        Ok(true)
     }
     /*
     pub async fn report_message_completed_dq(&self, subject: &str, report_id: &[u8]) -> anyhow::Result<bool> {

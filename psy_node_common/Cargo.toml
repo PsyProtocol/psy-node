@@ -26,6 +26,8 @@ serde_repr      = { workspace = true }
 serde_with      = { workspace = true }
 hex = { workspace = true }
 hex-literal = { workspace = true }
+k256 = { workspace = true }
+parking_lot = { workspace = true }
 bincode = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true, features = ["signal"] }
@@ -65,6 +67,7 @@ chrono = { workspace = true}
 
 [dev-dependencies]
 criterion = { workspace = true }
+tempfile = { workspace = true }
 
 
 

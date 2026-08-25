@@ -51,6 +51,20 @@ pub trait QTempDatabaseRawCounterWriterBase {
     async fn qtdb_raw_counter_set_value(&self, key: &[u8], value: i64) -> anyhow::Result<()>;
 }
 
+#[async_trait]
+pub trait QTempDatabaseRawWorkerReputationMutationBase {
+    async fn qtdb_raw_apply_worker_reputation_once(
+        &self,
+        claim_key: &[u8],
+        reputation_key: &[u8],
+        initial_reputation: u64,
+        on_time: bool,
+        reward: u64,
+        slash: u64,
+        maximum: u64,
+    ) -> anyhow::Result<bool>;
+}
+
 pub trait QTempDatabaseRawCounterStore: QTempDatabaseRawCounterReaderBase + QTempDatabaseRawCounterWriterBase {}
 impl<T: QTempDatabaseRawCounterReaderBase + QTempDatabaseRawCounterWriterBase> QTempDatabaseRawCounterStore for T {}
 pub trait QTempDatabaseRawKVStore: QTempDatabaseRawKVReaderBase + QTempDatabaseRawKVWriterBase {}

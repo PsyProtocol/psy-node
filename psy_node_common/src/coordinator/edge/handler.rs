@@ -24,6 +24,7 @@ use psy_node_core::{
 use psy_serialize::{PsyCanonicalDatabaseSerializeBaseMulti, PsyCanonicalDatabaseSerializeBaseSingle};
 
 use crate::coordinator::queue_key::{CoordinatorDeployContractQueueKey, CoordinatorRegisterUserPublicKeyQueueKey, CoordinatorSubmitRealmGUTAUpdateQueueKey};
+use crate::worker_whitelist::WhiteListCache;
 
 // const END_CAP_PROOF_CIRCUIT_TYPE_U32: u32 = ProvingJobCircuitType::UserEndCap as u32;
 pub struct CoordinatorEdgeHandler<
@@ -46,6 +47,8 @@ pub struct CoordinatorEdgeHandler<
     pub register_user_queue: Arc<RegisterUserQueue>,
     pub deploy_contract_queue: Arc<DeployContractQueue>,
     pub get_proof_work_queue: Arc<GetProofWorkQueue>,
+    pub worker_whitelist: WhiteListCache,
+    pub worker_reputation_update_lock: Arc<tokio::sync::Mutex<()>>,
 
     pub realm_identifier: QRealmIdentifier,
     pub realm_id_u64: u64,
@@ -89,6 +92,8 @@ impl<
             register_user_queue: self.register_user_queue.clone(),
             deploy_contract_queue: self.deploy_contract_queue.clone(),
             get_proof_work_queue: self.get_proof_work_queue.clone(),
+            worker_whitelist: self.worker_whitelist.clone(),
+            worker_reputation_update_lock: self.worker_reputation_update_lock.clone(),
             realm_identifier: self.realm_identifier.clone(),
             realm_id_u64: self.realm_id_u64.clone(),
             realm_sub_id_u64: self.realm_sub_id_u64.clone(),
@@ -133,6 +138,7 @@ impl<
         realm_identifier: QRealmIdentifier,
         proof_verifier: Arc<N::ZKVerifier>,
         checkpoint_state_transition_circuit_fingerprint: N::QHash,
+        worker_whitelist: WhiteListCache,
     ) -> Self {
         let realm_id_u64 = realm_identifier.realm_id as u64;
         let realm_sub_id_u64 = realm_identifier.realm_sub_id as u64;
@@ -145,6 +151,8 @@ impl<
             register_user_queue,
             deploy_contract_queue,
             get_proof_work_queue,
+            worker_whitelist,
+            worker_reputation_update_lock: Arc::new(tokio::sync::Mutex::new(())),
             realm_identifier,
             realm_id_u64,
             realm_sub_id_u64,

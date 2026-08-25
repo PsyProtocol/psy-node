@@ -24,6 +24,7 @@ use psy_node_core::{
         temp_db::{
             QTempDatabaseRawCounterReaderBase, QTempDatabaseRawCounterWriterBase,
             QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase,
+            QTempDatabaseRawWorkerReputationMutationBase,
         },
     },
 };
@@ -731,5 +732,60 @@ impl QTempDatabaseRawCounterWriterBase for StandardFredRedisStore {
         self.set_iu64_generic_internal(&self.kv_store_namespace, key, value).await
     }
 }
+
+#[async_trait]
+impl QTempDatabaseRawWorkerReputationMutationBase for StandardFredRedisStore {
+    async fn qtdb_raw_apply_worker_reputation_once(
+        &self,
+        claim_key: &[u8],
+        reputation_key: &[u8],
+        initial_reputation: u64,
+        on_time: bool,
+        reward: u64,
+        slash: u64,
+        maximum: u64,
+    ) -> anyhow::Result<bool> {
+        const SCRIPT: &str = r#"
+local claim = redis.call('HGET', KEYS[1], ARGV[1])
+if not claim then return redis.error_reply('stored claim disappeared during reputation update') end
+if string.len(claim) < 66 then return redis.error_reply('stored claim has invalid length') end
+if string.len(claim) >= 67 and string.byte(claim, 67) ~= 0 then return 0 end
+if string.len(claim) == 66 then
+  claim = claim .. string.char(1)
+else
+  claim = string.sub(claim, 1, 66) .. string.char(1) .. string.sub(claim, 68)
+end
+redis.call('HSET', KEYS[1], ARGV[1], claim)
+local current = redis.call('HGET', KEYS[1], ARGV[2])
+if current then current = tonumber(current) else current = tonumber(ARGV[3]) end
+local next
+if ARGV[4] == '1' then
+  next = math.min(current + tonumber(ARGV[5]), tonumber(ARGV[7]))
+else
+  next = math.max(current - tonumber(ARGV[6]), 0)
+end
+redis.call('HSET', KEYS[1], ARGV[2], string.format('%.0f', next))
+return 1
+"#;
+        let applied: i64 = self
+            .client
+            .eval(
+                SCRIPT,
+                vec![self.kv_store_namespace.as_str()],
+                vec![
+                    Value::from(claim_key),
+                    Value::from(reputation_key),
+                    Value::from(initial_reputation.to_string()),
+                    Value::from(if on_time { "1" } else { "0" }),
+                    Value::from(reward.to_string()),
+                    Value::from(slash.to_string()),
+                    Value::from(maximum.to_string()),
+                ],
+            )
+            .await?;
+        Ok(applied == 1)
+    }
+}
+
 
 impl QAutoImplementGeneric for StandardFredRedisStore {}

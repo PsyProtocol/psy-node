@@ -44,6 +44,7 @@ pub struct RealmEdgeStartConfig {
     pub verbose: bool,
     pub port: u16,
     pub listen: String,
+    pub worker_whitelist_config: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -99,4 +100,5 @@ pub struct CoordinatorEdgeStartConfig {
     pub verbose: bool,
     pub port: u16,
     pub listen: String,
+    pub worker_whitelist_config: String,
 }

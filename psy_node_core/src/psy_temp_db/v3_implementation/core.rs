@@ -10,12 +10,14 @@ const DEPLOY_CONTRACT_ZSTD_PREFIX: &[u8; 4] = b"PSZ1";
 use crate::{
     psy_temp_db::{
         tt_get_worker_reputation_key,
-        CheckpointJobStats, QTempDBDeployContractDataReader, QTempDBDeployContractDataWriter, QTempDBJobClaimInfoReader, QTempDBJobClaimInfoWriter, QTempDBJobStatsStore, QTempDBNodeProvingStateReader, QTempDBNodeProvingStateWriter, QTempDBPendingIdReader, QTempDBPendingIdWriter, QTempDBProofWitnessReader, QTempDBProofWitnessWriter, QTempDBProvingJobMetadataReader, QTempDBProvingJobMetadataWriter, QTempDBRewardsTreeReader, QTempDBRewardsTreeWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter, QTempDBUserContractUpdatesReader, QTempDBUserContractUpdatesWriter, QTempDBUserEndCapSlotUpdatesReader, QTempDBUserEndCapSlotUpdatesWriter, QTempDBWorkerReputationReader, QTempDBWorkerReputationWriter, tt_get_contract_updates_key, tt_get_deploy_contract_code_definition_key, tt_get_gathering_unique_pending_id_key, tt_get_job_claim_key_from_job, tt_get_job_stats_count_key, tt_get_job_stats_max_duration_key, tt_get_job_stats_min_duration_key, tt_get_job_stats_total_duration_key, tt_get_node_proving_state_key, tt_get_proof_claim_tag_key_from_job, tt_get_proof_witness_data_key_from_job, tt_get_proving_job_metadata_key_from_job, tt_get_rewards_tag_tree_value_key_from_job, tt_get_submit_status_key, tt_get_unique_pending_id_key, tt_get_user_end_cap_slot_updates_key
+        CheckpointJobStats, QTempDBDeployContractDataReader, QTempDBDeployContractDataWriter, QTempDBJobClaimInfoReader, QTempDBJobClaimInfoWriter, QTempDBJobStatsStore, QTempDBNodeProvingStateReader, QTempDBNodeProvingStateWriter, QTempDBPendingIdReader, QTempDBPendingIdWriter, QTempDBProofWitnessReader, QTempDBProofWitnessWriter, QTempDBProvingJobMetadataReader, QTempDBProvingJobMetadataWriter, QTempDBRewardsTreeReader, QTempDBRewardsTreeWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter, QTempDBUserContractUpdatesReader, QTempDBUserContractUpdatesWriter, QTempDBUserEndCapSlotUpdatesReader, QTempDBUserEndCapSlotUpdatesWriter, QTempDBWorkerReputationMutation, QTempDBWorkerReputationReader, QTempDBWorkerReputationWriter, tt_get_contract_updates_key, tt_get_deploy_contract_code_definition_key, tt_get_gathering_unique_pending_id_key, tt_get_job_claim_key_from_job, tt_get_job_stats_count_key, tt_get_job_stats_max_duration_key, tt_get_job_stats_min_duration_key, tt_get_job_stats_total_duration_key, tt_get_node_proving_state_key, tt_get_proof_claim_tag_key_from_job, tt_get_proof_witness_data_key_from_job, tt_get_proving_job_metadata_key_from_job, tt_get_rewards_tag_tree_value_key_from_job, tt_get_submit_status_key, tt_get_unique_pending_id_key, tt_get_user_end_cap_slot_updates_key,
     },
     store::traits::temp_db::{
         QTempDatabaseRawCounterReaderBase, QTempDatabaseRawCounterWriterBase, QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase,
+        QTempDatabaseRawWorkerReputationMutationBase,
     },
 };
+use crate::psy_temp_db::WorkerJobClaim;
 /*
 
 
@@ -688,15 +690,21 @@ impl<JobId: QJobIdBase + 'static, D: QTempDatabaseRawKVReaderBase + Sync> QTempD
         rid: &QRealmIdentifier,
         unique_pending_id: u64,
         job_id: JobId,
-    ) -> anyhow::Result<Option<([u8; 33], u64)>> {
+    ) -> anyhow::Result<Option<WorkerJobClaim>> {
         let key = tt_get_job_claim_key_from_job(rid.realm_id, rid.realm_sub_id, unique_pending_id, &job_id);
         let value_bytes = self.qtdb_raw_kv_get_value(&key).await?;
         match value_bytes {
-            Some(v) if v.len() >= 41 => {
+            Some(value) if value.len() >= 66 => {
                 let mut public_key = [0u8; 33];
-                public_key.copy_from_slice(&v[0..33]);
-                let claim_time_ms = u64::from_le_bytes(v[33..41].try_into().unwrap());
-                Ok(Some((public_key, claim_time_ms)))
+                public_key.copy_from_slice(&value[0..33]);
+                Ok(Some(WorkerJobClaim {
+                    public_key,
+                    claim_time_ms: u64::from_le_bytes(value[33..41].try_into().unwrap()),
+                    proc_checkpoint_unique_id: QCoreProcCheckpointUniqueId::from_le_bytes(value[41..57].try_into().unwrap()),
+                    reputation_at_claim: u64::from_le_bytes(value[57..65].try_into().unwrap()),
+                    is_finalized: value[65] != 0,
+                    has_reputation_update: value.get(66).is_some_and(|flag| *flag != 0),
+                }))
             }
             _ => Ok(None),
         }
@@ -710,13 +718,16 @@ impl<JobId: QJobIdBase + 'static, D: QTempDatabaseRawKVWriterBase + Sync> QTempD
         rid: &QRealmIdentifier,
         unique_pending_id: u64,
         job_id: JobId,
-        public_key: &[u8; 33],
-        claim_time_ms: u64,
+        claim: &WorkerJobClaim,
     ) -> anyhow::Result<()> {
         let key = tt_get_job_claim_key_from_job(rid.realm_id, rid.realm_sub_id, unique_pending_id, &job_id);
-        let mut value = [0u8; 41];
-        value[0..33].copy_from_slice(public_key);
-        value[33..41].copy_from_slice(&claim_time_ms.to_le_bytes());
+        let mut value = [0u8; 67];
+        value[0..33].copy_from_slice(&claim.public_key);
+        value[33..41].copy_from_slice(&claim.claim_time_ms.to_le_bytes());
+        value[41..57].copy_from_slice(&claim.proc_checkpoint_unique_id.to_le_bytes());
+        value[57..65].copy_from_slice(&claim.reputation_at_claim.to_le_bytes());
+        value[65] = u8::from(claim.is_finalized);
+        value[66] = u8::from(claim.has_reputation_update);
         self.qtdb_raw_kv_put_value(&key, &value).await
     }
 }
@@ -733,6 +744,39 @@ impl<D: QTempDatabaseRawKVReaderBase + Sync> QTempDBWorkerReputationReader for D
             Some(v) if v.len() >= 8 => Ok(u64::from_le_bytes(v[0..8].try_into().unwrap())),
             _ => Ok(INITIAL_WORKER_REPUTATION),
         }
+    }
+}
+
+#[async_trait]
+impl<D: QTempDatabaseRawWorkerReputationMutationBase + Sync> QTempDBWorkerReputationMutation for D {
+    async fn apply_worker_reputation_once(
+        &self,
+        rid: &QRealmIdentifier,
+        public_key: &[u8; 33],
+        unique_pending_id: u64,
+        job_id: &[u8; 24],
+        on_time: bool,
+        reward: u64,
+        slash: u64,
+        maximum: u64,
+    ) -> anyhow::Result<bool> {
+        let claim_key = crate::psy_temp_db::tt_get_job_claim_key_from_bytes(
+            rid.realm_id,
+            rid.realm_sub_id,
+            unique_pending_id,
+            job_id,
+        );
+        let reputation_key = tt_get_worker_reputation_key(rid.realm_id, rid.realm_sub_id, public_key);
+        self.qtdb_raw_apply_worker_reputation_once(
+            &claim_key,
+            &reputation_key,
+            INITIAL_WORKER_REPUTATION,
+            on_time,
+            reward,
+            slash,
+            maximum,
+        )
+        .await
     }
 }
 
@@ -760,9 +804,14 @@ mod tests {
     use psy_core::job::job_id::{
         QJobTopic, ProvingJobCircuitType, ProvingJobDataType, QProvingJobDataID,
     };
-
-    use crate::memory_stores::simple_memory_temp_store::SimpleMemoryTempStore;
-    use crate::psy_temp_db::{QTempDBRewardsTreeReader, QTempDBRewardsTreeWriter};
+    use crate::{
+        memory_stores::simple_memory_temp_store::SimpleMemoryTempStore,
+        psy_temp_db::{
+            tt_get_job_claim_key_from_job, QTempDBJobClaimInfoReader, QTempDBJobClaimInfoWriter,
+            QTempDBRewardsTreeReader, QTempDBRewardsTreeWriter, WorkerJobClaim,
+        },
+        store::traits::temp_db::QTempDatabaseRawKVWriterBase,
+    };
 
     // Defends the checkpoint-367 contract against the proof/reward namespace corruption:
     // for one realm/pending/job-id, a worker's proof claim-tag and the finalized
@@ -999,4 +1048,76 @@ mod tests {
             None
         );
     }
+
+    #[tokio::test]
+    async fn legacy_worker_job_claim_defaults_reputation_marker_to_false() {
+        let store = SimpleMemoryTempStore::new();
+        let rid = QRealmIdentifier::new(7, 11);
+        let unique_pending_id = 13;
+        let job_id = sample_job_id();
+        let key = tt_get_job_claim_key_from_job(rid.realm_id, rid.realm_sub_id, unique_pending_id, &job_id);
+        let mut value = [0u8; 66];
+        value[0..33].copy_from_slice(&[2; 33]);
+        value[33..41].copy_from_slice(&17u64.to_le_bytes());
+        value[41..57].copy_from_slice(&19u128.to_le_bytes());
+        value[57..65].copy_from_slice(&23u64.to_le_bytes());
+        value[65] = 1;
+        store.qtdb_raw_kv_put_value(&key, &value).await.unwrap();
+
+        assert_eq!(
+            store.get_job_claim(&rid, unique_pending_id, job_id).await.unwrap(),
+            Some(WorkerJobClaim {
+                public_key: [2; 33],
+                claim_time_ms: 17,
+                proc_checkpoint_unique_id: 19,
+                reputation_at_claim: 23,
+                is_finalized: true,
+                has_reputation_update: false,
+            })
+        );
+    }
+    #[tokio::test]
+    async fn worker_job_claim_roundtrip_preserves_queue_and_finalization_state() {
+        let store = SimpleMemoryTempStore::new();
+        let rid = QRealmIdentifier::new(7, 11);
+        let unique_pending_id = 13;
+        let job_id = sample_job_id();
+        let claim = WorkerJobClaim {
+            public_key: [2; 33],
+            claim_time_ms: 17,
+            proc_checkpoint_unique_id: 19,
+            reputation_at_claim: 23,
+            is_finalized: false,
+            has_reputation_update: true,
+        };
+
+        store
+            .set_job_claim(&rid, unique_pending_id, job_id, &claim)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_job_claim(&rid, unique_pending_id, job_id)
+                .await
+                .unwrap(),
+            Some(claim)
+        );
+
+        let finalized = WorkerJobClaim {
+            is_finalized: true,
+            ..claim
+        };
+        store
+            .set_job_claim(&rid, unique_pending_id, job_id, &finalized)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_job_claim(&rid, unique_pending_id, job_id)
+                .await
+                .unwrap(),
+            Some(finalized)
+        );
+    }
+
 }

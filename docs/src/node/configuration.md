@@ -147,18 +147,26 @@ Pre-deployed contracts and their initial state:
 
 #### Security Configuration
 
-**Whitelist (Optional):**
+**Worker Whitelist (Optional):**
+
+The edge node selects `networks.localhost` for devnets, `networks.sepolia` for testnet and pre-production networks, and `networks.ethereum` for mainnet.
+
 ```json
 {
-  "whitelist": {
-    "enabled": true,
-    "secp256k1": [
-      "public_key_1",
-      "public_key_2"
-    ]
+  "networks": {
+    "localhost": {
+      "whitelist": {
+        "enabled": true,
+        "secp256k1": [
+          "0x02c6047f9441ed7d6d3045406e95c07cd85a5d2eb37d3a21b2b1329f0e70d20b3b"
+        ]
+      }
+    }
   }
 }
 ```
+
+Each entry is a canonical, on-curve compressed secp256k1 SEC1 public key: exactly 33 bytes encoded as 66 hexadecimal characters, with an optional `0x` prefix. A missing `whitelist` object or missing `enabled` field disables membership enforcement. An enabled empty list denies every worker. The edge node reloads the file every 30 seconds, atomically installs valid policies, and retains the last good policy when reload validation fails.
 
 
 ## Network Environments

@@ -8,7 +8,7 @@ use parth_core::{
             traits::{MerkleHasher, MerkleZeroHasher, ZeroableHash}
         ,
         secp256k1::{QEDCompressedSecp256K1Signature, Secp256K1Verifier, SimpleTimedRequest},
-    }, data::queue::queue_key::QPBaseQueueType, felt::{FromPrimitiveValuesFelt, ZeroableFelt}, protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofVerifier}
+    }, data::queue::queue_key::QPBaseQueueType, felt::{FromPrimitiveValuesFelt, ZeroableFelt}, protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofPublicInputsHasherReader, QZKProofVerifier}
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{v1::qdata::user::PQEDUserLeaf,
@@ -21,21 +21,25 @@ use psy_data::{v1::qdata::user::PQEDUserLeaf,
     }}
 ;
 use psy_node_core::{
- psy_core_db::traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmEdgeAPIStoreReader}, psy_temp_db::StandardEdgeAPITempDBStoreBase, queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber}, store::traits::proof_store::QParthProofStore
+    psy_core_db::traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmEdgeAPIStoreReader},
+    psy_temp_db::{StandardEdgeAPITempDBStoreBase, WorkerJobClaim},
+    queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber},
+    store::traits::proof_store::QParthProofStore,
 };
 
-use parth_core::crypto::secp256k1::REQUEST_TYPE_SUBMIT_PROOF;
+use parth_core::crypto::secp256k1::{
+    get_current_time_ms, REQUEST_TYPE_REQUEST_PROOF_WORK, REQUEST_TYPE_SUBMIT_PROOF,
+};
 
 use crate::{
+    coordinator::edge::worker_handler::{
+        validate_positive_reputation, validate_submit_claimant, validate_submit_tags,
+        validate_whitelist_membership, validate_worker_request_boundary, verify_api_signature,
+    },
     reputation::WorkerReputationOps,
     realm::{edge::handler::RealmEdgeHandler, queue_key::RealmProvingWorkQueueKey},
 };
 
-use parth_core::protocol::core_types::QZKProofPublicInputsHasherReader;
-fn verify_api_signature(signature: &QEDCompressedSecp256K1Signature, request: &SimpleTimedRequest) -> bool {
-    request.get_sig_hash::<parth_crypto::hash::sha256::CoreSha256Hasher>() == signature.message
-        && parth_common::secp256k1::Secp256K1VerifierHelper::secp256k1_verify(signature).is_ok()
-}
 fn print_hash<H: Q256BitHash + std::fmt::Debug>(label: &str, hash: &H) {
     tracing::debug!("{}: {:?} ({})", label, hash, hex::encode(&hash.into_owned_32bytes()));
 }
@@ -56,7 +60,7 @@ impl<
         &self,
         current_unique_pending_id: u64,
         job_id: N::JobId,
-    ) -> anyhow::Result<(u64, Option<([u8; 33], u64)>)> {
+    ) -> anyhow::Result<(u64, WorkerJobClaim)> {
         for offset in 0..=SUBMIT_PROOF_PENDING_LOOKBACK {
             let candidate = current_unique_pending_id.saturating_sub(offset);
             if let Some(claim) = self
@@ -72,19 +76,14 @@ impl<
                         current_unique_pending_id
                     );
                 }
-                return Ok((candidate, Some(claim)));
+                return Ok((candidate, claim));
             }
             if candidate == 0 {
                 break;
             }
         }
 
-        tracing::warn!(
-            "submit_proof_raw found no claim record for job {:?} within lookback window; falling back to current unique_pending_id {}",
-            job_id,
-            current_unique_pending_id
-        );
-        Ok((current_unique_pending_id, None))
+        anyhow::bail!("no stored claim found for submitted job");
     }
 
     pub async fn get_current_unique_pending_id_internal(&self) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId)> {
@@ -110,15 +109,23 @@ impl<
         &self,
         signature: &QEDCompressedSecp256K1Signature,
         request: &SimpleTimedRequest,
-    ) -> anyhow::Result<()> {
-        if !verify_api_signature(&signature, &request) {
-            anyhow::bail!("invalid signature from miner");
-        }
-        let reputation = self.temp_db.get_worker_reputation(&self.realm_identifier, &signature.public_key).await?;
-        if reputation <= 0 {
-            anyhow::bail!("worker not eligible: reputation must be positive");
-        }
-        Ok(())
+        expected_request_type: u64,
+    ) -> anyhow::Result<u64> {
+        validate_worker_request_boundary(
+            verify_api_signature(signature, request),
+            request.valid_until,
+            get_current_time_ms(),
+            request.for_target,
+            request.request_type,
+            expected_request_type,
+        )?;
+        validate_whitelist_membership(self.worker_whitelist.is_allowed(&signature.public_key)?)?;
+        let reputation = self
+            .temp_db
+            .get_worker_reputation(&self.realm_identifier, &signature.public_key)
+            .await?;
+        validate_positive_reputation(reputation)?;
+        Ok(reputation)
     }
 
     pub async fn get_worker_reputation_internal(&self, public_key: &[u8; 33]) -> anyhow::Result<u64> {
@@ -182,7 +189,9 @@ impl<
         signature: QEDCompressedSecp256K1Signature,
         request: SimpleTimedRequest,
     ) -> anyhow::Result<PsyWorkerGetProvingWorkAPIResponse<N::QHash, N::JobId>> {
-        self.verify_miner_api_signature_and_check_reputation(&signature, &request).await?;
+        let reputation = self
+            .verify_miner_api_signature_and_check_reputation(&signature, &request, REQUEST_TYPE_REQUEST_PROOF_WORK)
+            .await?;
 
         let (unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;
 
@@ -238,6 +247,39 @@ impl<
             unique_pending_id,
             node_type: PROVING_JOB_NODE_TYPE_REALM,
         };
+        self.temp_db
+            .set_proving_job_metadata(
+                &self.realm_identifier,
+                unique_pending_id,
+                response.job.job_id.get_output_id(),
+                &response.job.metadata,
+            )
+            .await?;
+        self.temp_db
+            .set_proof_claim_tag(
+                &self.realm_identifier,
+                unique_pending_id,
+                response.job.job_id.get_input_witness_id(),
+                N::QHash::from_ref_32bytes(&request.tag),
+            )
+            .await?;
+        self.temp_db
+            .record_job_claim(
+                self.worker_reputation_update_lock.as_ref(),
+                &self.realm_identifier,
+                unique_pending_id,
+                response.job.job_id.get_output_id(),
+                WorkerJobClaim {
+                    public_key: signature.public_key,
+                    claim_time_ms: chrono::Utc::now().timestamp_millis() as u64,
+                    proc_checkpoint_unique_id: unique_proc_id,
+                    reputation_at_claim: reputation,
+                    is_finalized: false,
+                    has_reputation_update: false,
+                },
+            )
+            .await?;
+
         Ok(response)
     }
     pub async fn get_proving_work_with_child_proofs_internal(
@@ -247,7 +289,9 @@ impl<
     ) -> anyhow::Result<PsyWorkerGetProvingWorkWithChildProofsAPIResponse<N::QHash, N::JobId>> {
         let mut timer = DebugTimer::new("get_proving_work_with_child_proofs_internal");
         //tracing::debug!("get_proving_work_with_child_proofs_internal called");
-        self.verify_miner_api_signature_and_check_reputation(&signature, &request).await?;
+        let reputation = self
+            .verify_miner_api_signature_and_check_reputation(&signature, &request, REQUEST_TYPE_REQUEST_PROOF_WORK)
+            .await?;
         timer.lap_micros("verify_miner_api_signature_and_check_reputation");
 
 
@@ -346,11 +390,7 @@ impl<
 
         timer.lap_micros("set_proving_job_metadata");
 
-        // Store the worker's claim tag under the dedicated claim-tag key namespace
-        // (TEMP_TABLE_ID_PROOF_CLAIM_TAG), which is distinct from the finalized reward-tree
-        // value key (TEMP_TABLE_ID_TAG_TREE_VALUES). Input/output JobId alone does not
-        // guarantee separation, since a job's output id can equal another job's input
-        // witness id across the dependency graph; the distinct table-id prefix does.
+        // Claim tags use a distinct key namespace from finalized reward values.
         self.temp_db
             .set_proof_claim_tag(
                 &self.realm_identifier,
@@ -362,12 +402,19 @@ impl<
         timer.lap_micros("set_proof_claim_tag");
         let claim_time_ms = chrono::Utc::now().timestamp_millis() as u64;
         self.temp_db
-            .set_job_claim(
+            .record_job_claim(
+                self.worker_reputation_update_lock.as_ref(),
                 &self.realm_identifier,
                 unique_pending_id,
                 response.job.job_id.get_output_id(),
-                &signature.public_key,
-                claim_time_ms,
+                WorkerJobClaim {
+                    public_key: signature.public_key,
+                    claim_time_ms,
+                    proc_checkpoint_unique_id: unique_proc_id,
+                    reputation_at_claim: reputation,
+                    is_finalized: false,
+                    has_reputation_update: false,
+                },
             )
             .await?;
         timer.lap_micros("set_job_claim");
@@ -389,32 +436,29 @@ impl<
     where
         N::ZKVerifier: 'static,
     {
-        if !verify_api_signature(&signature, &request) || request.request_type != REQUEST_TYPE_SUBMIT_PROOF {
-            anyhow::bail!("invalid signature for submit_proof_raw");
-        }
-        job_id = job_id.get_output_id();
         let mut timer = DebugTimer::new("submit_proof_raw_internal");
-        let (current_unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;
-        let (unique_pending_id, job_claim) = self
+        self.verify_miner_api_signature_and_check_reputation(&signature, &request, REQUEST_TYPE_SUBMIT_PROOF).await?;
+        job_id = job_id.get_output_id();
+        let (current_unique_pending_id, _) = self.get_current_unique_pending_id_internal().await?;
+        let (unique_pending_id, mut claim) = self
             .resolve_unique_pending_id_for_submitted_job(current_unique_pending_id, job_id)
             .await?;
+        if claim.is_finalized {
+            anyhow::bail!("proof has already been submitted for this job");
+        }
+        validate_submit_claimant(&claim.public_key, &signature.public_key)?;
         timer.lap_micros("get_current_unique_pending_id_internal");
-        let proof_bytes = Arc::new(proof_bytes);
-
-        // HACK: check to make sure the tag matches. If not, job was completed by another worker (stolen) - slash submitter.
-        // The expected tag is read from the dedicated claim-tag key namespace, not the
-        // finalized reward-tree value key, so it can never observe a finalized reward value.
+        let rpc_tag = tag.into_owned_32bytes();
         let expected_tag = self
             .temp_db
             .get_proof_claim_tag(&self.realm_identifier, unique_pending_id, job_id.get_input_witness_id())
             .await?;
-        if expected_tag != tag {
-            self.temp_db
-                .apply_reputation_slash_on_tag_mismatch(&self.realm_identifier, &signature.public_key)
-                .await?;
-            anyhow::bail!("Submitted tag does not match expected tag for job id");
+        validate_submit_tags(&request.tag, &rpc_tag, &expected_tag.into_owned_32bytes())?;
+        if self.has_job_id_already_been_submitted(unique_pending_id, job_id).await? {
+            tracing::warn!(?job_id, unique_pending_id, "resuming an incomplete proof submission");
         }
         timer.lap_micros("get_proof_claim_tag");
+        let proof_bytes = Arc::new(proof_bytes);
 
         let metadata: PsyProvingJobMetadata<N::QHash, N::JobId> = self
             .temp_db
@@ -478,7 +522,6 @@ impl<
         }).await??;
         timer.lap_micros("verify_zk_proof_from_slice_check_public_inputs_hash");
 
-        // HACK: now set the correct reward tree value
         self.temp_db
             .set_proof_miner_rewards_tree_value(&self.realm_identifier, unique_pending_id, job_id, reward_tree_value)
             .await?;
@@ -498,18 +541,16 @@ impl<
             .put_proof_bytes_for_job_id(job_id.get_output_id(), unique_pending_id, &proof_bytes)
             .await?;
         timer.lap_micros("put_proof_bytes_for_job_id");
-
-        let job_duration_ms = job_claim.as_ref().map(|(_, claim_time_ms)| {
-            (chrono::Utc::now().timestamp_millis() as u64).saturating_sub(*claim_time_ms)
-        });
-        if let Some((public_key, claim_time_ms)) = job_claim.as_ref() {
-            self.temp_db
-                .apply_reputation_on_submit(&self.realm_identifier, public_key, *claim_time_ms)
-                .await?;
-            timer.lap_micros("update_worker_reputation");
-        } else {
-            tracing::debug!("submit_proof_raw: no job_claim record for job_id {:?}, skipping reputation update", job_id);
-        }
+        let job_duration_ms = (chrono::Utc::now().timestamp_millis() as u64).saturating_sub(claim.claim_time_ms);
+        self.temp_db
+            .apply_reputation_once(
+                &self.realm_identifier,
+                unique_pending_id,
+                job_id,
+                &mut claim,
+            )
+            .await?;
+        timer.lap_micros("update_worker_reputation");
 
         /*
         self.tag_tree_rewards_store
@@ -589,11 +630,10 @@ impl<
             }
         }
 
-        // ack the queue item as completed
         let queue_key = RealmProvingWorkQueueKey::<N::QHash, N::JobId> {
             realm_id: self.realm_id_u64,
             realm_sub_id: self.realm_sub_id_u64,
-            unique_id: unique_proc_id,
+            unique_id: claim.proc_checkpoint_unique_id,
             task_group: 0,
             queue_type: QPBaseQueueType::WorkerQueue,
             _phantom_queue_item: std::marker::PhantomData,
@@ -603,25 +643,30 @@ impl<
             job_id: job_id.get_output_id(),
             metadata,
         };
-        self.get_proof_work_queue
-            .worker_queue_report_job_completed(&queue_key, self.realm_id_u64, self.realm_sub_id_u64, unique_proc_id, 0, &item)
+        let was_acknowledged = self.get_proof_work_queue
+            .worker_queue_report_job_completed(&queue_key, self.realm_id_u64, self.realm_sub_id_u64, claim.proc_checkpoint_unique_id, 0, &item)
+            .await?;
+        if !was_acknowledged {
+            anyhow::bail!("worker queue acknowledgement token not found for completed proof job");
+        }
+        claim.is_finalized = true;
+        self.temp_db
+            .set_job_claim(&self.realm_identifier, unique_pending_id, job_id, &claim)
             .await?;
         timer.lap_micros("worker_queue_report_job_completed");
 
-        if let Some(duration_ms) = job_duration_ms {
-            if let Err(error) = self
-                .temp_db
-                .increment_job_stats(&self.realm_identifier, unique_pending_id, duration_ms)
-                .await
-            {
-                tracing::warn!(
-                    checkpoint_unique_pending_id = unique_pending_id,
-                    duration_ms,
-                    ?job_id,
-                    %error,
-                    "failed to record realm proof job statistics"
-                );
-            }
+        if let Err(error) = self
+            .temp_db
+            .increment_job_stats(&self.realm_identifier, unique_pending_id, job_duration_ms)
+            .await
+        {
+            tracing::warn!(
+                checkpoint_unique_pending_id = unique_pending_id,
+                duration_ms = job_duration_ms,
+                ?job_id,
+                %error,
+                "failed to record realm proof job statistics"
+            );
         }
 
         timer.lap_group("submit_proof_raw_internal");

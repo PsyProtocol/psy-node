@@ -138,6 +138,7 @@ pub struct RealmEdgeCliConfig {
     pub verbose: Option<bool>,
     pub port: Option<u16>,
     pub listen: Option<String>,
+    pub worker_whitelist_config: Option<String>,
 }
 
 impl RealmEdgeCliConfig {
@@ -153,6 +154,7 @@ impl RealmEdgeCliConfig {
             verbose: None,
             port: None,
             listen: None,
+            worker_whitelist_config: None,
         }
     }
     pub fn into_start_config_with_cli_args(
@@ -167,6 +169,7 @@ impl RealmEdgeCliConfig {
         verbose: bool,
         port: Option<u16>,
         listen: Option<String>,
+        worker_whitelist_config: Option<String>,
     ) -> anyhow::Result<RealmEdgeStartConfig> {
         Ok(RealmEdgeStartConfig {
             scylla_db_url: scylla_db_url.or(self.scylla_db_url).ok_or_else(|| anyhow::anyhow!("scylla_db_url is required"))?,
@@ -179,6 +182,7 @@ impl RealmEdgeCliConfig {
             verbose: verbose || self.verbose.unwrap_or(false),
             port: port.or(self.port).unwrap_or(8080),
             listen: listen.or(self.listen).unwrap_or_else(|| "0.0.0.0".to_string()),
+            worker_whitelist_config: worker_whitelist_config.or(self.worker_whitelist_config).unwrap_or_else(|| "psy-genesis/config.json".to_string()),
         })
     }
     pub async fn get_start_config(
@@ -193,6 +197,7 @@ impl RealmEdgeCliConfig {
         verbose: bool,
         port: Option<u16>,
         listen: Option<String>,
+        worker_whitelist_config: Option<String>,
     ) -> anyhow::Result<RealmEdgeStartConfig> {
         let cli_config = if let Some(config_path) = config {
             load_cli_config_from_file::<Self>(&config_path).await?
@@ -210,6 +215,7 @@ impl RealmEdgeCliConfig {
             verbose,
             port,
             listen,
+            worker_whitelist_config,
         )
     }
 }
@@ -311,6 +317,7 @@ pub struct CoordinatorEdgeCliConfig {
     pub verbose: Option<bool>,
     pub port: Option<u16>,
     pub listen: Option<String>,
+    pub worker_whitelist_config: Option<String>,
 }
 
 impl CoordinatorEdgeCliConfig {
@@ -326,6 +333,7 @@ impl CoordinatorEdgeCliConfig {
             verbose: None,
             port: None,
             listen: None,
+            worker_whitelist_config: None,
         }
     }
     pub fn into_start_config_with_cli_args(
@@ -340,6 +348,7 @@ impl CoordinatorEdgeCliConfig {
         verbose: bool,
         port: Option<u16>,
         listen: Option<String>,
+        worker_whitelist_config: Option<String>,
     ) -> anyhow::Result<CoordinatorEdgeStartConfig> {
         Ok(CoordinatorEdgeStartConfig {
             scylla_db_url: scylla_db_url.or(self.scylla_db_url).ok_or_else(|| anyhow::anyhow!("scylla_db_url is required"))?,
@@ -352,6 +361,7 @@ impl CoordinatorEdgeCliConfig {
             verbose: verbose || self.verbose.unwrap_or(false),
             port: port.or(self.port).unwrap_or(8080),
             listen: listen.or(self.listen).unwrap_or_else(|| "0.0.0.0".to_string()),
+            worker_whitelist_config: worker_whitelist_config.or(self.worker_whitelist_config).unwrap_or_else(|| "psy-genesis/config.json".to_string()),
         })
     }
     pub async fn get_start_config(
@@ -366,6 +376,7 @@ impl CoordinatorEdgeCliConfig {
         verbose: bool,
         port: Option<u16>,
         listen: Option<String>,
+        worker_whitelist_config: Option<String>,
     ) -> anyhow::Result<CoordinatorEdgeStartConfig> {
         let cli_config = if let Some(config_path) = config {
             load_cli_config_from_file::<Self>(&config_path).await?
@@ -383,6 +394,160 @@ impl CoordinatorEdgeCliConfig {
             verbose,
             port,
             listen,
+            worker_whitelist_config,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use psy_core::constants::chain_id::PsyNetworkTypeInput;
+
+    const DEFAULT_WHITELIST_PATH: &str = "psy-genesis/config.json";
+
+    fn realm_edge_config(whitelist: Option<String>) -> RealmEdgeCliConfig {
+        RealmEdgeCliConfig {
+            worker_whitelist_config: whitelist,
+            ..RealmEdgeCliConfig::get_default_empty()
+        }
+    }
+
+    fn coordinator_edge_config(whitelist: Option<String>) -> CoordinatorEdgeCliConfig {
+        CoordinatorEdgeCliConfig {
+            worker_whitelist_config: whitelist,
+            ..CoordinatorEdgeCliConfig::get_default_empty()
+        }
+    }
+
+    fn realm_edge_start(file: Option<String>, cli: Option<String>) -> RealmEdgeStartConfig {
+        realm_edge_config(file)
+            .into_start_config_with_cli_args(
+                Some("127.0.0.1:9042".to_string()),
+                Some("nats://127.0.0.1:4222".to_string()),
+                Some("redis://127.0.0.1:6379".to_string()),
+                Some("realm0".to_string()),
+                Some(0),
+                Some(1),
+                Some(PsyNetworkTypeInput::LocalDevnet),
+                false,
+                None,
+                None,
+                cli,
+            )
+            .unwrap()
+    }
+
+    fn coordinator_edge_start(file: Option<String>, cli: Option<String>) -> CoordinatorEdgeStartConfig {
+        coordinator_edge_config(file)
+            .into_start_config_with_cli_args(
+                Some("127.0.0.1:9042".to_string()),
+                Some("nats://127.0.0.1:4222".to_string()),
+                Some("redis://127.0.0.1:6379".to_string()),
+                Some("coordinator".to_string()),
+                Some(0),
+                Some(0),
+                Some(PsyNetworkTypeInput::LocalDevnet),
+                false,
+                None,
+                None,
+                cli,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn realm_edge_defaults_to_genesis_whitelist_path() {
+        let start = realm_edge_start(None, None);
+        assert_eq!(start.worker_whitelist_config, DEFAULT_WHITELIST_PATH);
+    }
+
+    #[test]
+    fn coordinator_edge_defaults_to_genesis_whitelist_path() {
+        let start = coordinator_edge_start(None, None);
+        assert_eq!(start.worker_whitelist_config, DEFAULT_WHITELIST_PATH);
+    }
+
+    #[test]
+    fn realm_edge_yaml_override_used_when_cli_absent() {
+        let start = realm_edge_start(Some("custom-whitelist.json".to_string()), None);
+        assert_eq!(start.worker_whitelist_config, "custom-whitelist.json");
+    }
+
+    #[test]
+    fn coordinator_edge_yaml_override_used_when_cli_absent() {
+        let start = coordinator_edge_start(Some("custom-whitelist.json".to_string()), None);
+        assert_eq!(start.worker_whitelist_config, "custom-whitelist.json");
+    }
+
+    #[test]
+    fn realm_edge_cli_arg_overrides_yaml() {
+        let start = realm_edge_start(
+            Some("file-whitelist.json".to_string()),
+            Some("cli-whitelist.json".to_string()),
+        );
+        assert_eq!(start.worker_whitelist_config, "cli-whitelist.json");
+    }
+
+    #[test]
+    fn coordinator_edge_cli_arg_overrides_yaml() {
+        let start = coordinator_edge_start(
+            Some("file-whitelist.json".to_string()),
+            Some("cli-whitelist.json".to_string()),
+        );
+        assert_eq!(start.worker_whitelist_config, "cli-whitelist.json");
+    }
+
+    #[test]
+    fn realm_edge_yaml_without_whitelist_field_stays_valid() {
+        let yaml = "\
+realm_id: 0
+realm_sub_id: 1
+network: local-devnet
+verbose: true
+db_namespace: realm0
+scylla_db_url: 127.0.0.1:9042
+nats_jetstream_url: nats://127.0.0.1:4222
+redis_url: redis://127.0.0.1:6379
+port: 1338
+listen: 0.0.0.0
+";
+        let config: RealmEdgeCliConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.worker_whitelist_config, None);
+    }
+
+    #[test]
+    fn coordinator_edge_yaml_without_whitelist_field_stays_valid() {
+        let yaml = "\
+coordinator_id: 0
+coordinator_sub_id: 0
+network: local-devnet
+verbose: true
+db_namespace: coordinator
+scylla_db_url: 127.0.0.1:9042
+nats_jetstream_url: nats://127.0.0.1:4222
+redis_url: redis://127.0.0.1:6379
+port: 1337
+listen: 0.0.0.0
+";
+        let config: CoordinatorEdgeCliConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.worker_whitelist_config, None);
+    }
+
+    #[test]
+    fn edge_configs_share_identical_default_whitelist_semantics() {
+        // coordinator/realm parity: identical (file, cli) inputs yield identical whitelist paths
+        assert_eq!(
+            realm_edge_start(None, None).worker_whitelist_config,
+            coordinator_edge_start(None, None).worker_whitelist_config
+        );
+        assert_eq!(
+            realm_edge_start(Some("shared.json".to_string()), None).worker_whitelist_config,
+            coordinator_edge_start(Some("shared.json".to_string()), None).worker_whitelist_config
+        );
+        assert_eq!(
+            realm_edge_start(Some("file.json".to_string()), Some("cli.json".to_string())).worker_whitelist_config,
+            coordinator_edge_start(Some("file.json".to_string()), Some("cli.json".to_string())).worker_whitelist_config
+        );
     }
 }

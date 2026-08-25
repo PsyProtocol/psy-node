@@ -6,7 +6,7 @@ use psy_core::{job::job_id::QProvingJobDataID, network_config::PsyNetworkLocalDe
 use psy_data::
     config::network_config::PsyNodeCircuitFingerprintConfigProvider
 ;
-use psy_node_common::{coordinator::edge::{handler::CoordinatorEdgeHandler, server::start_coordinator_edge_rpc_server}, realm::edge::{handler::RealmEdgeHandler, server::start_realm_edge_rpc_server}};
+use psy_node_common::{coordinator::edge::{handler::CoordinatorEdgeHandler, server::start_coordinator_edge_rpc_server}, realm::edge::{handler::RealmEdgeHandler, server::start_realm_edge_rpc_server}, worker_whitelist::WhiteListCache};
 use psy_node_core::config::node_start_config::{CoordinatorEdgeStartConfig, RealmEdgeStartConfig};
 use psy_node_nats::psy_queue::setup_nats_psy_queue_from_connection_str;
 use psy_node_redis::store::{new_redis_async_pool, StandardRedisStore};
@@ -48,6 +48,7 @@ pub async fn run_startup_plonky2_scylla_edge_node(config: &CoordinatorEdgeStartC
         realm_sub_id: config.coordinator_sub_id,
     };
     let proof_verifier = Arc::new(PsyPlonky2ZKVerifier::<C, D>::for_network(config.network)?);
+    let worker_whitelist = WhiteListCache::new(&config.worker_whitelist_config, config.network)?;
 /*
 
     pub fn new(
@@ -81,6 +82,7 @@ pub async fn run_startup_plonky2_scylla_edge_node(config: &CoordinatorEdgeStartC
                 realm_identifier,
                 proof_verifier,
                 checkpoint_state_transition_circuit_fingerprint,
+                worker_whitelist,
             );
             start_coordinator_edge_rpc_server::<N, _, _, _, _, _, _, _, _>(
                 handler,
@@ -124,6 +126,7 @@ pub async fn run_startup_plonky2_scylla_realm_edge_node(config: &RealmEdgeStartC
     };
     let proof_verifier = Arc::new(PsyPlonky2ZKVerifier::<C, D>::for_network(config.network)?);
     let chain_id = config.network.get_chain_id();
+    let worker_whitelist = WhiteListCache::new(&config.worker_whitelist_config, config.network)?;
 /*
 
     pub fn new(
@@ -157,6 +160,7 @@ pub async fn run_startup_plonky2_scylla_realm_edge_node(config: &RealmEdgeStartC
                 chain_id,
                 0,
                 proof_verifier,
+                worker_whitelist,
             );
             start_realm_edge_rpc_server::<N, _, _, _, _, _, _>(
                 handler,

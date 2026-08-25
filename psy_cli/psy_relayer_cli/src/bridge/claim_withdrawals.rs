@@ -1,9 +1,9 @@
-use std::{collections::HashMap, fs, path::{Path, PathBuf}, str::FromStr};
+use std::{collections::HashMap, fs, path::{Path, PathBuf}, str::FromStr, time::{SystemTime, UNIX_EPOCH}};
 
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_provider::Provider;
 use alloy_rpc_types_eth::TransactionRequest;
-use alloy_sol_types::{sol, SolCall};
+use alloy_sol_types::{sol, SolCall, SolValue};
 use anyhow::{Context, Result};
 use clap::Args;
 use parth_core::pgoldilocks::QHashOut;
@@ -43,7 +43,14 @@ sol! {
 
     function claimedNullifiers(bytes32 nullifier) view returns (bool);
 
-    function balanceOf(address account) view returns (uint256);
+    function pendingWithdrawals(bytes32 nonce) view returns (
+        address token,
+        address recipient,
+        uint256 amount,
+        uint64 claimableAt
+    );
+
+    function claimPendingWithdrawal(bytes32 nonce);
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,8 +74,12 @@ fn select_claim_proof_poll_result(
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BatchWithdrawalsReport {
     pub requested: usize,
+    /// Proof registrations confirmed by `batchClaimWithdrawal`. These remain
+    /// in the durable pending set until settlement succeeds.
     pub submitted_count: usize,
+    /// Withdrawals observed as fully settled on L1.
     pub already_claimed_count: usize,
+    /// Durable entries safe to delete because settlement completed.
     #[serde(default)]
     pub resolved_leaf_hashes: Vec<String>,
     #[serde(default)]
@@ -217,19 +228,104 @@ async fn withdrawal_already_claimed<P: Provider>(
     claimedNullifiersCall::abi_decode_returns(&raw).context("failed to decode claimedNullifiers return")
 }
 
+#[derive(Debug)]
+struct OnChainPendingWithdrawal {
+    amount: U256,
+    claimable_at: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PendingSettlement {
+    AlreadySettled,
+    Timelocked { claimable_at: u64, now: u64 },
+    Claimable,
+}
+
+fn classify_pending_settlement(amount: U256, claimable_at: u64, now: u64) -> PendingSettlement {
+    if amount == U256::ZERO {
+        return PendingSettlement::AlreadySettled;
+    }
+    if now < claimable_at {
+        return PendingSettlement::Timelocked { claimable_at, now };
+    }
+    PendingSettlement::Claimable
+}
+
+async fn read_pending_withdrawal<P: Provider>(
+    provider: &P,
+    bridge: Address,
+    nonce: B256,
+) -> Result<OnChainPendingWithdrawal> {
+    let call = pendingWithdrawalsCall { nonce };
+    let tx = TransactionRequest::default().to(bridge).input(call.abi_encode().into());
+    let raw = provider.call(tx).await.context("pendingWithdrawals eth_call failed")?;
+    let pending = pendingWithdrawalsCall::abi_decode_returns(&raw)
+        .context("failed to decode pendingWithdrawals return")?;
+    Ok(OnChainPendingWithdrawal {
+        amount: pending.amount,
+        claimable_at: pending.claimableAt,
+    })
+}
+
+async fn settle_registered_withdrawal<P: Provider>(
+    provider: &P,
+    bridge: Address,
+    withdrawal: &PendingWithdrawal,
+) -> Result<()> {
+    let nonce = withdrawal_nullifier_from_nonce(withdrawal.nonce);
+    let pending = read_pending_withdrawal(provider, bridge, nonce).await?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock before unix epoch")?
+        .as_secs();
+    match classify_pending_settlement(pending.amount, pending.claimable_at, now) {
+        PendingSettlement::AlreadySettled => return Ok(()),
+        PendingSettlement::Timelocked { claimable_at, now } => {
+            anyhow::bail!(
+                "pending withdrawal is timelocked until {} ({} seconds remaining)",
+                claimable_at,
+                claimable_at - now
+            );
+        }
+        PendingSettlement::Claimable => {}
+    }
+
+    let call = claimPendingWithdrawalCall { nonce };
+    let tx = TransactionRequest::default().to(bridge).input(call.abi_encode().into());
+    provider
+        .call(tx.clone())
+        .await
+        .context("claimPendingWithdrawal is not currently executable")?;
+    let pending_tx = timeout(
+        Duration::from_secs(L1_TX_SEND_TIMEOUT_SECS),
+        provider.send_transaction(tx),
+    )
+    .await
+    .context("claimPendingWithdrawal send timed out")?
+    .context("claimPendingWithdrawal send failed")?;
+    let receipt = timeout(
+        Duration::from_secs(L1_TX_RECEIPT_TIMEOUT_SECS),
+        pending_tx.get_receipt(),
+    )
+    .await
+    .context("claimPendingWithdrawal receipt timed out")?
+    .context("claimPendingWithdrawal receipt failed")?;
+    anyhow::ensure!(receipt.status(), "claimPendingWithdrawal reverted on-chain");
+
+    tracing::info!(
+        leaf_hash = %withdrawal.leaf_hash,
+        tx_hash = %receipt.transaction_hash,
+        "pending withdrawal settlement confirmed"
+    );
+    Ok(())
+}
+
 fn withdrawal_nullifier_from_nonce(nonce: [u32; 8]) -> B256 {
     let mut nonce_bytes = [0u8; 32];
     for (i, word) in nonce.iter().enumerate() {
         nonce_bytes[i * 4..(i + 1) * 4].copy_from_slice(&word.to_be_bytes());
     }
     B256::from(nonce_bytes)
-}
-
-async fn erc20_balance_of<P: Provider>(provider: &P, token: Address, owner: Address) -> Result<U256> {
-    let call = balanceOfCall { account: owner };
-    let tx = TransactionRequest::default().to(token).input(call.abi_encode().into());
-    let raw = provider.call(tx).await.context("ERC20 balanceOf eth_call failed")?;
-    balanceOfCall::abi_decode_returns(&raw).context("failed to decode ERC20 balanceOf return")
 }
 
 pub(crate) fn resolve_multicall3_address(
@@ -556,12 +652,13 @@ pub async fn submit_batch(
     let mut already_claimed_count = 0usize;
     let mut resolved_leaf_hashes = Vec::new();
     let mut failure_reasons = HashMap::new();
-    let mut bridge_erc20_liquidity_remaining: HashMap<Address, U256> = HashMap::new();
     if multicall3_address.is_some() || !deployments_network.is_empty() {
         let _ = (multicall3_address, deployments_network);
     }
 
-    // Phase 1: validate and fetch claim proofs.
+    // Phase 1: settle already-registered withdrawals and fetch proofs only for
+    // unregistered ones. A consumed nullifier means registration succeeded; it
+    // does not mean the recipient has received the full amount.
     let mut pending_proofs: Vec<PendingProof> = Vec::new();
     for (i, w) in withdrawals.iter().enumerate() {
         let recipient_addr = u32x8_to_address(w.recipient);
@@ -590,14 +687,24 @@ pub async fn submit_batch(
 
         match withdrawal_already_claimed(&provider, bridge, w).await {
             Ok(true) => {
-                tracing::info!(
-                    index = i,
-                    recipient = %recipient_addr,
-                    leaf_hash = %w.leaf_hash,
-                    "withdrawal already claimed on L1; counting as covered"
-                );
-                already_claimed_count += 1;
-                resolved_leaf_hashes.push(w.leaf_hash.clone());
+                match settle_registered_withdrawal(&provider, bridge, w).await {
+                    Ok(()) => {
+                        already_claimed_count += 1;
+                        resolved_leaf_hashes.push(w.leaf_hash.clone());
+                        tracing::info!(
+                            index = i,
+                            recipient = %recipient_addr,
+                            leaf_hash = %w.leaf_hash,
+                            "withdrawal is fully settled on L1"
+                        );
+                    }
+                    Err(err) => {
+                        failure_reasons.insert(
+                            w.leaf_hash.clone(),
+                            format!("pending withdrawal settlement deferred: {err}"),
+                        );
+                    }
+                }
                 continue;
             }
             Ok(false) => {}
@@ -628,42 +735,10 @@ pub async fn submit_batch(
         tracing::debug!(
             index = i,
             token_addr = %token_addr,
-            token_words = ?w.token_address,
+            amount = %amount,
             leaf_hash = %w.leaf_hash,
-            "claim liquidity check"
+            "preparing pending withdrawal registration proof"
         );
-        if token_addr != Address::ZERO {
-            if !bridge_erc20_liquidity_remaining.contains_key(&token_addr) {
-                let balance = erc20_balance_of(&provider, token_addr, bridge)
-                    .await
-                    .with_context(|| format!("failed to read bridge ERC20 liquidity for token {token_addr}"))?;
-                bridge_erc20_liquidity_remaining.insert(token_addr, balance);
-            }
-            let remaining = bridge_erc20_liquidity_remaining
-                .get_mut(&token_addr)
-                .expect("bridge liquidity inserted above");
-            if *remaining < amount {
-                let reason = format!(
-                    "bridge ERC20 liquidity insufficient for token {token_addr}: available={}, required={}",
-                    *remaining, amount
-                );
-                failure_reasons.insert(w.leaf_hash.clone(), reason);
-                tracing::warn!(
-                    index = i,
-                    recipient = %recipient_addr,
-                    token = %token_addr,
-                    available = %*remaining,
-                    required = %amount,
-                    leaf_hash = %w.leaf_hash,
-                    "bridge ERC20 liquidity insufficient; deferring withdrawal claim"
-                );
-                continue;
-            }
-            *remaining -= amount;
-            // NOTE: this deduction is not rolled back if the batch later fails
-            // (reverted/timed out). Per-chunk rollback would be more precise but
-            // the on-chain liquidity check provides the authoritative guard.
-        }
 
         let proof_result = {
             let mut last_err: Option<anyhow::Error> = None;
@@ -827,17 +902,14 @@ pub async fn submit_batch(
     struct WithdrawalChunkMeta {
         root_hex: String,
         chunk: Vec<PendingProof>,
-        leaf_hashes: Vec<String>,
     }
     let mut all_chunks: Vec<WithdrawalChunkMeta> = Vec::new();
     for (root_hex, mut group) in ordered_groups {
         group.sort_by_key(|p| p.leaf_index);
         for chunk in group.chunks(MAX_WITHDRAWAL_CLAIM_BATCH_SIZE) {
-            let leaf_hashes = chunk.iter().map(|p| p.withdrawal.leaf_hash.clone()).collect::<Vec<_>>();
             all_chunks.push(WithdrawalChunkMeta {
                 root_hex: root_hex.clone(),
                 chunk: chunk.to_vec(),
-                leaf_hashes,
             });
         }
     }
@@ -887,7 +959,6 @@ pub async fn submit_batch(
     // ── Phase 3: process results in order, submit L1 txs sequentially ──
     for (idx, meta) in all_chunks.iter().enumerate() {
         let root_hex = &meta.root_hex;
-        let leaf_hashes = &meta.leaf_hashes;
         let call_data = match chunk_proofs[idx].take()
             .ok_or_else(|| anyhow::anyhow!("missing proof result for chunk {}", idx))?
         {
@@ -952,13 +1023,12 @@ pub async fn submit_batch(
                     Ok(Ok(receipt)) => {
                         if receipt.status() {
                             submitted_count += meta.chunk.len();
-                            resolved_leaf_hashes.extend(leaf_hashes.iter().cloned());
                             tracing::info!(
                                 tx_hash = %receipt.transaction_hash,
                                 root = %root_hex,
                                 submitted_count,
                                 already_claimed_count,
-                                "batchClaimWithdrawal confirmed"
+                                "batchClaimWithdrawal registration confirmed; settlement remains pending"
                             );
                         } else {
                             for claim in &meta.chunk {
@@ -1105,6 +1175,48 @@ mod tests {
             format!("0x{}", hex::encode(withdrawal_nullifier_from_nonce(nonce))),
             "0x0102030411121314212223243132333441424344515253546162636471727374"
         );
+    }
+
+    #[test]
+    fn claim_pending_withdrawal_calldata_has_only_nonce_argument() {
+        let calldata = claimPendingWithdrawalCall { nonce: B256::repeat_byte(0x5a) }.abi_encode();
+        assert_eq!(calldata.len(), 4 + 32);
+        assert_eq!(&calldata[..4], &keccak256("claimPendingWithdrawal(bytes32)")[..4]);
+        assert_eq!(&calldata[4..], B256::repeat_byte(0x5a).as_slice());
+    }
+
+    #[test]
+    fn pending_settlement_classifies_completion_and_eta_boundaries() {
+        assert_eq!(
+            classify_pending_settlement(U256::ZERO, 100, 0),
+            PendingSettlement::AlreadySettled
+        );
+        assert_eq!(
+            classify_pending_settlement(U256::from(1), 100, 99),
+            PendingSettlement::Timelocked { claimable_at: 100, now: 99 }
+        );
+        assert_eq!(
+            classify_pending_settlement(U256::from(1), 100, 100),
+            PendingSettlement::Claimable
+        );
+        assert_eq!(
+            classify_pending_settlement(U256::from(1), 100, 101),
+            PendingSettlement::Claimable
+        );
+    }
+
+    #[test]
+    fn pending_withdrawal_return_decodes_one_shot_abi_shape() {
+        let token = Address::repeat_byte(0x11);
+        let recipient = Address::repeat_byte(0x22);
+        let amount = U256::from(123456u64);
+        let claimable_at = 987654u64;
+        let encoded = (token, recipient, amount, claimable_at).abi_encode();
+        let decoded = pendingWithdrawalsCall::abi_decode_returns(&encoded).unwrap();
+        assert_eq!(decoded.token, token);
+        assert_eq!(decoded.recipient, recipient);
+        assert_eq!(decoded.amount, amount);
+        assert_eq!(decoded.claimableAt, claimable_at);
     }
 
     #[test]

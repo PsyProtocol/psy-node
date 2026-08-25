@@ -1,271 +1,195 @@
-# Getting Started
+# Local Release Devnet
 
-This guide walks you through starting a complete Psy network locally for development and testing.
+> Status: Approved. Updated: 2026-08-24.
+
+## Abstract
+
+The supported local E2E lifecycle is `make shutdown` followed by `make run-all` from the `psy-node` repository root. The Makefile owns the complete release-devnet topology and delegates orchestration to `dev/locSetupV4.ts`; operators must not start or restart individual databases, nodes, workers, relayers, or frontends.
+
+## Motivation
+
+Manual component startup creates an invalid partial topology and bypasses the launcher's dependency ordering, schema creation, generated artifacts, process supervision, and cleanup. `make run-all` supplies the full component set at `Makefile:60-66`, while `make shutdown` performs teardown with purge at `Makefile:93-94`.
+
+## Table of Contents
+
+- [Canonical Flow](#canonical-flow)
+- [Prerequisites](#prerequisites)
+- [Clean Start](#clean-start)
+- [Readiness Checks](#readiness-checks)
+- [Operating Rules](#operating-rules)
+- [Shutdown](#shutdown)
+- [Failure Diagnosis](#failure-diagnosis)
+- [Security Considerations](#security-considerations)
+
+## Canonical Flow
+
+```mermaid
+sequenceDiagram
+    participant Operator
+    participant Make
+    participant Launcher as locSetupV4.ts
+    participant Infra as DB and queues
+    participant Runtime as nodes and workers
+    participant Apps as services and UIs
+
+    Operator->>Make: 1. make shutdown
+    Make->>Launcher: 2. --teardown --purge
+    Launcher->>Infra: 3. Stop containers and remove persisted state
+    Launcher->>Runtime: 4. Stop supervised processes
+    Operator->>Make: 5. make run-all
+    Make->>Launcher: 6. Full release-devnet component flags
+    Launcher->>Infra: 7. Start Valkey, NATS, and Scylla
+    Launcher->>Runtime: 8. Start coordinator, realms, and workers
+    Launcher->>Apps: 9. Start L1, relayer, services, and UIs
+    Launcher-->>Operator: 10. DevNet started
+```
+
+```text
+psy-node root
+  |
+  +-- make shutdown
+  |     `-- locSetupV4.ts --teardown --purge
+  |           `-- processes, deployments, logs, checkpoints, Docker volumes removed
+  |
+  `-- make run-all
+        `-- locSetupV4.ts
+              +-- infrastructure
+              +-- coordinator and two realms
+              +-- coordinator and realm workers
+              +-- prove proxy and faucet
+              +-- local L1 and bridge relayer
+              `-- Services, Bridge, IDE, and Explorer
+```
+
+The exact topology is defined by `LOCSETUP_START_ARGS` at `Makefile:60` and executed by the `run-all` target at `Makefile:63-66`.
 
 ## Prerequisites
 
-1. Complete installation as described in [Installation](./installation.md)
-2. Ensure `config.json` is properly configured
-3. Have Docker and Docker Compose installed
+Run every command from the `psy-node` repository root in Bash. The launcher checks Git, Cargo, curl, zstd, Node.js, npm, pnpm, Make, Bash, Bun, Docker Compose, and Anvil at `dev/locSetupV4.ts:2360-2388`.
 
-## Quick Start
+Required repository state:
 
-For convenience, you can use the automated script:
+1. Required submodules and sibling repositories are available. The launcher validates them before startup at `dev/locSetupV4.ts:2390-2400`.
+2. Local trust-setup files are complete when `PSY_SKIP_KEYSTORE=1`. The launcher rejects missing or empty files at `dev/locSetupV4.ts:2112-2135`.
+3. Release binaries exist when `PSY_SKIP_BUILD=1`:
+   - `target/release/psy_node_cli`
+   - `target/release/psy_worker_cli`
+   - `target/release/psy_relayer_cli`
+   - `target/release/psy_user_cli`
+   - sibling `psy-services` release binaries `psy-services` and `psy-indexer`
+
+The binary gate is implemented at `dev/locSetupV4.ts:1578-1609`.
+
+## Clean Start
+
+### Rebuild current source
+
+Use this after source changes, a branch switch, or whenever binary provenance is uncertain:
 
 ```bash
+make shutdown
+
+VITE_NETWORK=localhost \
+VITE_FORK=false \
+PSY_SKIP_BUILD=0 \
+PSY_SKIP_BRANCH_CHECK=1 \
+PSY_SKIP_KEYSTORE=1 \
 make run-all
 ```
 
-This handles initialization and starts all components automatically.
+With `PSY_SKIP_BUILD=0`, the launcher builds the required `psy-node` and sibling `psy-services` binaries with Cargo release mode and `--locked` at `dev/locSetupV4.ts:1612-1638`.
 
-## Required Components
+### Reuse verified release binaries
 
-A complete Psy network requires these core components:
-
-### 1. Infrastructure Services
-- **Redis**: Message queuing between edge and processor
-- **Database**: ScyllaDB/LMDBX/TiKV for state storage
-- **PostgreSQL**: For API services and data indexing
-
-### 2. Coordinator Services
-- **Coordinator Processor**: Manages global state and contract tree
-- **Coordinator Edge**: RPC endpoint for coordinator operations
-
-### 3. Realm Services
-- **Realm Processor**: Processes user transactions and state
-- **Realm Edge**: RPC endpoints for user interactions
-- **Multiple Realms**: Support for horizontal scaling (realm0, realm1, realm2, realm3)
-
-### 4. Supporting Services
-- **Workers**: Generate ZK proofs for submitted jobs
-- **API Services**: Block explorer and data APIs
-- **Watcher**: Monitors and indexes blockchain data
-- **Prove Proxy**: Assists users with local proof generation
-
-## Manual Service Startup
-
-### Step 1: Initialize Infrastructure
-
-Start required databases and create directories:
+Use this only when the required binaries were built from the current source:
 
 ```bash
-# Create data directories
-mkdir -p ./db/coordinator ./db/realm0 ./db/realm1 ./db/realm2 ./db/realm3
+make shutdown
 
-# Start Redis containers
-docker-compose -f ./scripts/docker-compose.db.yml up -d
-
-# Initialize PostgreSQL for API services
-cd ./psy_services
-export DATABASE_URL="postgres://postgres:password@localhost/postgres"
-cargo sqlx database create
-cargo sqlx migrate run
-cd ..
+VITE_NETWORK=localhost \
+VITE_FORK=false \
+PSY_SKIP_BUILD=1 \
+PSY_SKIP_BRANCH_CHECK=1 \
+PSY_SKIP_KEYSTORE=1 \
+make run-all
 ```
 
-### Step 2: Start Coordinator
+`PSY_SKIP_BUILD=1` checks that binaries exist but does not prove they match the current source. Rebuild after any relevant edit or branch change.
+
+Environment invariants:
+
+| Variable | Required value | Effect |
+|---|---:|---|
+| `VITE_NETWORK` | `localhost` | Selects local L1 and localhost network configuration. |
+| `VITE_FORK` | `false` | Starts a fresh local Anvil chain instead of an external fork. |
+| `PSY_SKIP_BRANCH_CHECK` | `1` | Preserves every current repository HEAD; no automatic fetch or checkout. |
+| `PSY_SKIP_KEYSTORE` | `1` | Preserves the local trust setup; no download or refresh. |
+| `PSY_SKIP_BUILD` | `0` or `1` | Builds current release binaries or reuses verified release binaries. |
+
+Keep `make run-all` in the foreground. For disconnect-safe operation, run it inside a tmux session; do not append `&`. The launcher prints `DevNet started. Press Ctrl+C to stop.` only after `setupProcesses` completes at `dev/locSetupV4.ts:4928-4936`.
+
+## Readiness Checks
+
+Do not run an E2E case before the startup terminal prints `DevNet started`.
+
+In a second shell, verify the active surfaces:
 
 ```bash
-# Start coordinator processor (manages global state)
-RUST_LOG=info psy_node_cli coordinator-processor \
-  --database lmdbx \
-  --lmdbx-path ./db/coordinator \
-  --queue-biz-key coordinator
+curl -fsS http://127.0.0.1:3000/health
+curl -fsS http://127.0.0.1:8080/healthz
+cast block-number --rpc-url http://127.0.0.1:8545
 
-# Start coordinator edge (RPC interface) 
-RUST_LOG=info psy_node_cli coordinator-edge \
-  --database lmdbx \
-  --lmdbx-path ./db/coordinator \
-  --queue-biz-key coordinator
+curl -fsS http://127.0.0.1:1337 \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","method":"psy_get_latest_checkpoint_id","params":[],"id":1}'
 ```
 
-### Step 3: Start Realms
+The localhost endpoints are defined at `psy-genesis/config.json:9-42,61-66`. Coordinator edge RPC methods require the `psy_` prefix; the canonical method is documented at `docs/src/rpc/CoordinatorRpc.md:440-459`.
+
+Deployment addresses are regenerated during startup. Read the current values from:
+
+```text
+psy-contracts/deployments/localhost/deployed-contracts.json
+```
+
+Never reuse addresses from an earlier devnet run.
+
+## Operating Rules
+
+1. Use only `make run-all` to start and `make shutdown` to stop or reset the complete stack.
+2. Never manually start or restart Scylla, Valkey, NATS, coordinator nodes, realm nodes, workers, Services, indexers, relayers, or frontends.
+3. Never use a non-purge restart to preserve an E2E state. Local L1 is ephemeral while Scylla and queue data are persisted; mixing a fresh L1 with old L2 state corrupts test attribution. The purge path removes checkpoints, logs, deployments, and devnet Docker volumes at `dev/locSetupV4.ts:3017-3033`.
+4. Run L2 operations for the same user serially. Different users may operate concurrently.
+5. Treat `logs/` as the per-run diagnostic source. Copy required evidence before shutdown because purge removes it.
+6. Child-process auto-restart is enabled by default at `dev/locSetupV4.ts:4931-4935`. Set `PSY_NO_AUTO_RESTART=1` before startup only for E2E cases that explicitly test process failure or restart boundaries.
+
+## Shutdown
+
+From the repository root:
 
 ```bash
-# Start realm0 processor
-RUST_LOG=info psy_node_cli realm-processor \
-  --redis-uri redis://127.0.0.1:6379 \
-  --database lmdbx \
-  --lmdbx-path ./db/realm0 \
-  --queue-biz-key realm0
-
-# Start realm0 edge (port 8546)
-RUST_LOG=info psy_node_cli realm-edge \
-  --redis-uri redis://127.0.0.1:6379 \
-  --database lmdbx \
-  --lmdbx-path ./db/realm0 \
-  --queue-biz-key realm0
-
-# Start realm1 processor
-RUST_LOG=info psy_node_cli realm-processor \
-  --redis-uri redis://127.0.0.1:6379 \
-  --database lmdbx \
-  --lmdbx-path ./db/realm1 \
-  --realm-id 1 \
-  --queue-biz-key realm1
-
-# Start realm1 edge (port 8547)
-RUST_LOG=info psy_node_cli realm-edge \
-  --listen-addr 0.0.0.0:8547 \
-  --redis-uri redis://127.0.0.1:6379 \
-  --database lmdbx \
-  --lmdbx-path ./db/realm1 \
-  --coordinator-addr http://127.0.0.1:8545 \
-  --realm-id 1 \
-  --queue-biz-key realm1
+make shutdown
 ```
 
-### Step 4: Start Workers and Services
+The target executes `bun run dev/locSetupV4.ts --teardown --purge` at `Makefile:93-94`. It stops supervised processes and containers, releases known ports, and removes local checkpoints, logs, generated localhost deployments, and devnet Docker volumes at `dev/locSetupV4.ts:3017-3033`.
 
-```bash
-# Start proof workers
-RUST_LOG=info psy_node_cli worker \
-  --config ./config.json \
-  --keystore-path .wallets/miner0.json \
-  --recipient 3145728
+Run `make shutdown` before every clean E2E start and after every completed or failed E2E session.
 
-RUST_LOG=info psy_node_cli worker \
-  --config ./config.json \
-  --keystore-path .wallets/miner1.json \
-  --recipient 1024
+## Failure Diagnosis
 
-# Start API services
-RUST_LOG=info psy_node_cli api-services
+| Symptom | Decision |
+|---|---|
+| Missing release binary with `PSY_SKIP_BUILD=1` | Restart with `PSY_SKIP_BUILD=0`; do not launch components manually. |
+| Behavior does not match current source | Purge, rebuild with `PSY_SKIP_BUILD=0`, and start again. |
+| Missing trust-setup file with `PSY_SKIP_KEYSTORE=1` | Stop and prepare the complete local trust setup before retrying. |
+| Startup fails before `DevNet started` | Read the terminal error and the generated file under `logs/`; then run `make shutdown`. |
+| A single child exits | Let the supervisor retry with exponential backoff capped at 30 seconds; a failed respawn is retried after at most 60 seconds. Do not replace the child manually. |
+| E2E state is inconsistent after restart | Run `make shutdown`, then perform a clean `make run-all`; never retain mixed L1 and L2 state. |
 
-# Start watchers
-RUST_LOG=info psy_node_cli watcher \
-  --node-id 0 \
-  --node-type coordinator \
-  --redis-uri redis://127.0.0.1:6379 \
-  --api-endpoint http://localhost:3000 \
-  --database lmdbx \
-  --lmdbx-path ./db/coordinator \
-  --queue-biz-key coordinator
+## Security Considerations
 
-RUST_LOG=info psy_node_cli watcher \
-  --node-id 0 \
-  --node-type realm \
-  --redis-uri redis://127.0.0.1:6379 \
-  --api-endpoint http://localhost:3000 \
-  --database lmdbx \
-  --lmdbx-path ./db/realm0 \
-  --queue-biz-key realm0
-
-# Start prove proxy
-RUST_LOG=info psy_user_cli prove-proxy
-```
-
-## Configuration Requirements
-
-### config.json Setup
-
-Ensure your `config.json` contains proper endpoint configurations:
-
-```json
-{
-  "networks": {
-    "localhost": {
-      "coordinator_configs": [
-        {"id": 0, "rpc_url": ["http://127.0.0.1:8545"]}
-      ],
-      "realm_configs": [
-        {"id": 0, "rpc_url": ["http://127.0.0.1:8546"]},
-        {"id": 1, "rpc_url": ["http://127.0.0.1:8547"]},
-        {"id": 2, "rpc_url": ["http://127.0.0.1:8548"]},
-        {"id": 3, "rpc_url": ["http://127.0.0.1:8549"]}
-      ],
-      "prove_proxy_url": ["http://127.0.0.1:9999"],
-      "api_services_url": ["http://127.0.0.1:3000"]
-    }
-  }
-}
-```
-
-## Service Dependencies
-
-Services must start in the correct order:
-
-1. **Infrastructure** (Redis, databases)
-2. **Coordinator** (processor, then edge)
-3. **Realms** (processors, then edges)
-4. **Workers** (depend on edges for job discovery)
-5. **API Services** (depend on watchers for data)
-6. **Watchers** (depend on edges for data access)
-
-## Verification
-
-Check that services are running:
-
-```bash
-# Check coordinator
-curl -X POST http://127.0.0.1:8545 \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"psy_latest_checkpoint","params":[],"id":1}'
-
-# Check realm0
-curl -X POST http://127.0.0.1:8546 \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"psy_latest_checkpoint","params":[],"id":1}'
-
-# Check API services
-curl http://127.0.0.1:3000/health
-```
-
-## Cleanup
-
-Stop all services and clean up:
-
-```bash
-# Stop Docker containers
-docker-compose -f ./scripts/docker-compose.db.yml down -v
-
-# Remove data directories
-rm -rf ./db logs
-```
-
-## Next Steps
-
-Once your network is running:
-
-1. Register users: See [User CLI documentation](../rpc/UserCli.md)
-2. Deploy contracts: Use `psy_user_cli deploy-contract`
-3. Submit transactions: Use `psy_user_cli call`
-4. Monitor activity: Check logs in `./logs/` directory
-
-## Storage Options
-
-The default setup uses LMDBX for storage. For other options:
-
-### TiKV Setup
-
-Replace `--database lmdbx` with:
-```bash
---database tikv \
---tikv-pd-endpoints 127.0.0.1:2379 \
---tikv-namespace coordinator  # or realm0, realm1, etc.
-```
-
-### ScyllaDB Setup
-
-Replace `--database lmdbx` with:
-```bash
---database scylla \
---scylla-endpoints 127.0.0.1:9042
-```
-
-## Troubleshooting
-
-**Services won't start**: Check that config.json is valid and all required ports are available.
-
-**Workers not processing jobs**: Ensure workers have valid keystore files in `.wallets/` directory.
-
-**Database connection errors**: Verify Docker containers are running with `docker ps`.
-
-## Future Features
-
-Several components are currently under development:
-
-- **P2P Networking**: Peer-to-peer communication between nodes (in development)
-- **Consensus Mechanism**: Byzantine fault tolerance for production networks (in development)
-- **Advanced Storage**: Enhanced storage backends and optimization (in development)
-- **Cross-chain Bridges**: Integration with other blockchain networks (planned)
+1. `PSY_SKIP_BRANCH_CHECK=1` prevents startup from changing repository revisions and protects uncommitted work.
+2. `PSY_SKIP_KEYSTORE=1` prevents unattended trust-setup replacement. Never print wallet passwords, private keys, or keystore contents in logs or commands.
+3. Local fixture identities are for localhost E2E only. Never reuse them on public networks.
+4. Do not expose local RPC, database, queue, or frontend ports beyond the development host.
+5. `make shutdown` is destructive to local devnet state by design. Capture required logs and artifacts before invoking it.

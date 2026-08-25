@@ -2834,15 +2834,15 @@ mod tests {
 
         let claim_report = claim_withdrawals::BatchWithdrawalsReport {
             requested: 1,
-            submitted_count: 1,
-            already_claimed_count: 0,
+            submitted_count: 0,
+            already_claimed_count: 1,
             resolved_leaf_hashes: vec![withdrawal.leaf_hash.clone()],
             failure_reasons: HashMap::new(),
         };
         apply_claim_report(&mut restarted.pending_claim_withdrawals, &claim_report);
         assert!(
             restarted.pending_claim_withdrawals.is_empty(),
-            "the restarted daemon must submit and resolve the landed withdrawal"
+            "the restarted daemon must observe full L1 settlement before resolving the landed withdrawal"
         );
 
         let _ = std::fs::remove_file(path);
@@ -3009,13 +3009,10 @@ mod tests {
     // ── claim reconciliation edge cases (double-claim defence) ─────────────
 
     #[test]
-    fn apply_claim_report_removes_resolved_and_already_claimed_keeps_failures() {
-        // resolved_leaf_hashes carries BOTH successfully submitted AND
-        // already-claimed withdrawals (claim_withdrawals.rs pushes the leaf
-        // hash in both cases). apply_claim_report must drop both from pending
-        // so already-claimed withdrawals are never retried (no double-claim).
-        let w1 = sample_withdrawal(1); // newly submitted
-        let w2 = sample_withdrawal(2); // already claimed on L1
+    fn apply_claim_report_removes_only_fully_settled_withdrawals_and_keeps_failures() {
+        // Proof registration alone must not put a leaf in resolved_leaf_hashes.
+        let w1 = sample_withdrawal(1); // fully settled after registration
+        let w2 = sample_withdrawal(2); // observed already fully settled on L1
         let w3 = sample_withdrawal(3); // failed, must retry next round
         let mut pending: HashMap<String, PendingWithdrawal> = [
             (w1.leaf_hash.clone(), w1.clone()),
@@ -3032,10 +3029,10 @@ mod tests {
             failure_reasons: HashMap::from([(w3.leaf_hash.clone(), "proof not ready".to_string())]),
         };
         apply_claim_report(&mut pending, &report);
-        assert!(!pending.contains_key(&w1.leaf_hash), "submitted withdrawal must be removed");
+        assert!(!pending.contains_key(&w1.leaf_hash), "fully settled withdrawal must be removed");
         assert!(
             !pending.contains_key(&w2.leaf_hash),
-            "already-claimed withdrawal must be removed to prevent double-claim"
+            "withdrawal already fully settled on-chain must be removed"
         );
         assert!(pending.contains_key(&w3.leaf_hash), "failed withdrawal must remain for retry");
         assert_eq!(pending.len(), 1);
@@ -3043,8 +3040,8 @@ mod tests {
 
     #[test]
     fn apply_claim_report_leaves_unreported_withdrawals_untouched() {
-        // Withdrawals absent from the report (e.g. claimed in a prior partial
-        // batch) must be retained so they are retried in a later round.
+        // Withdrawals absent from the report must be retained so they are
+        // retried in a later round.
         let w1 = sample_withdrawal(1);
         let w2 = sample_withdrawal(2);
         let mut pending: HashMap<String, PendingWithdrawal> = [
@@ -3063,6 +3060,27 @@ mod tests {
         apply_claim_report(&mut pending, &report);
         assert!(!pending.contains_key(&w1.leaf_hash));
         assert!(pending.contains_key(&w2.leaf_hash), "unreported withdrawal must be retained");
+    }
+
+    #[test]
+    fn apply_claim_report_keeps_successfully_registered_withdrawal_pending() {
+        let withdrawal = sample_withdrawal(1);
+        let mut pending: HashMap<String, PendingWithdrawal> =
+            [(withdrawal.leaf_hash.clone(), withdrawal.clone())].into_iter().collect();
+        let registration_report = claim_withdrawals::BatchWithdrawalsReport {
+            requested: 1,
+            submitted_count: 1,
+            already_claimed_count: 0,
+            resolved_leaf_hashes: Vec::new(),
+            failure_reasons: HashMap::new(),
+        };
+
+        apply_claim_report(&mut pending, &registration_report);
+
+        assert!(
+            pending.contains_key(&withdrawal.leaf_hash),
+            "proof registration consumes the nullifier but does not complete settlement"
+        );
     }
 
     #[test]
@@ -3705,20 +3723,20 @@ mod tests {
     // ── multi-round double-claim-prevention simulation ──────────────────────
 
     #[test]
-    fn multi_round_claim_cycle_prevents_double_claims_and_retains_failures() {
-        // Models the daemon-level crash-recovery flow across two rounds using
+    fn multi_round_claim_cycle_retries_registered_claims_until_fully_settled() {
+        // Models the daemon-level crash-recovery flow across three rounds using
         // only the public-ish helpers (merge via or_insert_with + apply_claim_report),
         // the same sequence run() drives. Defends the externally observable
         // contract that pending_claim_withdrawals is the single source of truth:
-        //   - a withdrawal submitted or already-claimed in round N is removed and
-        //     NEVER retried (no double-claim);
+        //   - proof registration remains pending;
+        //   - only successful settlement removes a withdrawal;
         //   - a failed withdrawal persists and is retried next round;
         //   - re-scanning an existing leaf never duplicates or overwrites it;
         //   - pending keys stay unique throughout.
-        let w1 = sample_withdrawal(1); // submitted round 1
-        let w2 = sample_withdrawal(2); // already-claimed on L1 round 1
-        let w3 = sample_withdrawal(3); // fails round 1, submitted round 2
-        let w4 = sample_withdrawal(4); // new in round 2, submitted
+        let w1 = sample_withdrawal(1); // registered round 1, not yet claimable round 2
+        let w2 = sample_withdrawal(2); // already fully settled on L1 round 1
+        let w3 = sample_withdrawal(3); // fails round 1, registered round 2
+        let w4 = sample_withdrawal(4); // new and registered in round 2
 
         let mut pending: HashMap<String, PendingWithdrawal> = HashMap::new();
 
@@ -3729,50 +3747,63 @@ mod tests {
                 .or_insert_with(|| w.clone());
         }
         assert_eq!(pending.len(), 3, "round 1 merge must add all three uniquely");
-        // Claim report: w1 submitted, w2 already-claimed (both resolved), w3 fails.
+        // Claim report: w1 is only registered, w2 is fully settled, w3 fails.
         let report1 = claim_withdrawals::BatchWithdrawalsReport {
             requested: 3,
             submitted_count: 1,
             already_claimed_count: 1,
-            resolved_leaf_hashes: vec![w1.leaf_hash.clone(), w2.leaf_hash.clone()],
+            resolved_leaf_hashes: vec![w2.leaf_hash.clone()],
             failure_reasons: HashMap::from([(w3.leaf_hash.clone(), "proof not ready".to_string())]),
         };
         apply_claim_report(&mut pending, &report1);
-        assert!(!pending.contains_key(&w1.leaf_hash), "submitted must leave pending");
+        assert!(pending.contains_key(&w1.leaf_hash), "registration must remain pending");
         assert!(
             !pending.contains_key(&w2.leaf_hash),
-            "already-claimed must leave pending (no double-claim)"
+            "fully settled withdrawal must leave pending"
         );
         assert!(pending.contains_key(&w3.leaf_hash), "failed must remain for retry");
-        assert_eq!(pending.len(), 1);
+        assert_eq!(pending.len(), 2);
 
-        // ── Round 2: re-scan reports w3 (retry) and w4 (new). ───────────────
+        // ── Round 2: re-scan reports w1/w3 (retry) and w4 (new). ────────────
         // w3 is already pending: or_insert_with must NOT overwrite the original
         // record (crash-recovery idempotence). w4 is new.
         let original_w3 = pending.get(&w3.leaf_hash).cloned().unwrap();
-        for w in [&w3, &w4] {
+        for w in [&w1, &w3, &w4] {
             pending
                 .entry(w.leaf_hash.clone())
                 .or_insert_with(|| w.clone());
         }
-        assert_eq!(pending.len(), 2, "round 2 merge must add only w4");
+        assert_eq!(pending.len(), 3, "round 2 merge must add only w4");
         // w3 record preserved exactly (not overwritten by the re-scan).
         assert_eq!(pending[&w3.leaf_hash].event_id, original_w3.event_id);
         // w4 was inserted fresh.
         assert!(pending.contains_key(&w4.leaf_hash));
 
-        // Claim report: both w3 and w4 submitted this round; no failures.
+        // w1 is not yet claimable; w3 and w4 are registered.
         let report2 = claim_withdrawals::BatchWithdrawalsReport {
-            requested: 2,
+            requested: 3,
             submitted_count: 2,
             already_claimed_count: 0,
-            resolved_leaf_hashes: vec![w3.leaf_hash.clone(), w4.leaf_hash.clone()],
-            failure_reasons: HashMap::new(),
+            resolved_leaf_hashes: Vec::new(),
+            failure_reasons: HashMap::from([(
+                w1.leaf_hash.clone(),
+                "pending withdrawal is timelocked".to_string(),
+            )]),
         };
         apply_claim_report(&mut pending, &report2);
+        assert_eq!(pending.len(), 3, "registration and deferred settlement must remain durable");
+
+        // ── Round 3: all remaining settlements succeed. ────────────────────
+        let report3 = claim_withdrawals::BatchWithdrawalsReport {
+            requested: 3,
+            submitted_count: 0,
+            already_claimed_count: 3,
+            resolved_leaf_hashes: vec![w1.leaf_hash.clone(), w3.leaf_hash.clone(), w4.leaf_hash.clone()],
+            failure_reasons: HashMap::new(),
+        };
+        apply_claim_report(&mut pending, &report3);
         assert!(pending.is_empty(), "all claims resolved → pending must be empty");
-        // Invariant: w2 (already-claimed in round 1) was never re-added even
-        // though it was not re-scanned — double-claim prevented.
+        // w2 was removed only after full settlement and was never re-added.
         assert!(!pending.contains_key(&w2.leaf_hash));
     }
     fn test_leaf(seed: u64) -> QHashOut<GoldilocksField> {

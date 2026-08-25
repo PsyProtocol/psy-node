@@ -14,6 +14,14 @@ This file governs `psy-node` and coordinated changes across the sibling PsyProto
 
 It supplements higher-level agent rules. The stricter rule wins.
 
+## Local Devnet Operations
+
+1. Before starting, restarting, testing, or troubleshooting the local release devnet, read and follow [`docs/src/node/getting_started.md`](docs/src/node/getting_started.md).
+2. The only supported complete-stack lifecycle commands are `make run-all` and `make shutdown` from the `psy-node` repository root.
+3. Never manually start or restart individual Docker services, databases, queues, nodes, workers, relayers, indexers, Services processes, or frontends.
+4. Every clean E2E run begins with `make shutdown`, which performs teardown and purge, and ends with `make shutdown`.
+5. Use `PSY_SKIP_BRANCH_CHECK=1` and `PSY_SKIP_KEYSTORE=1`. Select `PSY_SKIP_BUILD=0` after source or branch changes; use `PSY_SKIP_BUILD=1` only for release binaries verified against the current source.
+
 ## Release Safety
 
 1. Run the applicability gate before generation, deployment, publication, downstream version changes, or gitlink changes.

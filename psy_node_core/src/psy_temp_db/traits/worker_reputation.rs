@@ -16,5 +16,26 @@ pub trait QTempDBWorkerReputationWriter {
     ) -> anyhow::Result<()>;
 }
 
-pub trait QTempDBWorkerReputationStore: QTempDBWorkerReputationReader + QTempDBWorkerReputationWriter {}
-impl<T: QTempDBWorkerReputationReader + QTempDBWorkerReputationWriter> QTempDBWorkerReputationStore for T {}
+#[async_trait]
+pub trait QTempDBWorkerReputationMutation {
+    async fn apply_worker_reputation_once(
+        &self,
+        rid: &QRealmIdentifier,
+        public_key: &[u8; 33],
+        unique_pending_id: u64,
+        job_id: &[u8; 24],
+        on_time: bool,
+        reward: u64,
+        slash: u64,
+        maximum: u64,
+    ) -> anyhow::Result<bool>;
+}
+
+pub trait QTempDBWorkerReputationStore:
+    QTempDBWorkerReputationReader + QTempDBWorkerReputationWriter + QTempDBWorkerReputationMutation
+{
+}
+impl<T: QTempDBWorkerReputationReader + QTempDBWorkerReputationWriter + QTempDBWorkerReputationMutation>
+    QTempDBWorkerReputationStore for T
+{
+}

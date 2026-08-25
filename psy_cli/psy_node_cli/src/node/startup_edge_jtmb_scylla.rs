@@ -16,6 +16,7 @@ use psy_jtmb_testing_core::{
 use psy_node_common::{
     coordinator::edge::{handler::CoordinatorEdgeHandler, server::start_coordinator_edge_rpc_server},
     realm::edge::{handler::RealmEdgeHandler, server::start_realm_edge_rpc_server},
+    worker_whitelist::WhiteListCache,
 };
 use psy_node_core::config::node_start_config::{CoordinatorEdgeStartConfig, RealmEdgeStartConfig};
 use psy_node_nats::psy_queue::setup_nats_psy_queue_from_connection_str;
@@ -51,6 +52,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
         realm_sub_id: config.coordinator_sub_id,
     };
     let proof_verifier = Arc::new(PsyJTMBZKVerifier::new(verifier));
+    let worker_whitelist = WhiteListCache::new(&config.worker_whitelist_config, config.network)?;
     /*
 
     pub fn new(
@@ -84,6 +86,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
                 realm_identifier,
                 proof_verifier,
                 checkpoint_state_transition_circuit_fingerprint,
+                worker_whitelist,
             );
             start_coordinator_edge_rpc_server::<N, _, _, _, _, _, _, _, _>(handler, &config.listen, config.port).await?;
         },
@@ -104,6 +107,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
                 realm_identifier,
                 proof_verifier,
                 checkpoint_state_transition_circuit_fingerprint,
+                worker_whitelist,
             );
             start_coordinator_edge_rpc_server::<N, _, _, _, _, _, _, _, _>(handler, &config.listen, config.port).await?;
         }
@@ -137,6 +141,7 @@ where
     };
     let proof_verifier = Arc::new(PsyJTMBZKVerifier::<C>::new(verifier));
     let chain_id = config.network.get_chain_id();
+    let worker_whitelist = WhiteListCache::new(&config.worker_whitelist_config, config.network)?;
     let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, false).await?;
     let db = Arc::new(db);
     let tag_tree_rewards_store = db.clone();
@@ -152,6 +157,7 @@ where
         chain_id,
         0,
         proof_verifier,
+        worker_whitelist,
     );
     start_realm_edge_rpc_server::<N, _, _, _, _, _, _>(handler, &config.listen, config.port).await?;
     Ok(())

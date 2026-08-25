@@ -17,7 +17,7 @@ use psy_node_core::{
     },
     store::traits::{
         proof_store::{QParthProofStoreReader, QParthProofStoreWriter},
-        temp_db::{QTempDatabaseRawCounterReaderBase, QTempDatabaseRawCounterWriterBase, QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase},
+        temp_db::{QTempDatabaseRawCounterReaderBase, QTempDatabaseRawCounterWriterBase, QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase, QTempDatabaseRawWorkerReputationMutationBase},
     },
 };
 use tokio::sync::{Mutex, Notify};
@@ -502,6 +502,51 @@ impl QTempDatabaseRawCounterWriterBase for InMemoryTempStore {
     async fn qtdb_raw_counter_set_value(&self, key: &[u8], value: i64) -> anyhow::Result<()> {
         self.counter_store.insert(key.to_vec(), value);
         Ok(())
+    }
+}
+
+#[async_trait]
+impl QTempDatabaseRawWorkerReputationMutationBase for InMemoryTempStore {
+    async fn qtdb_raw_apply_worker_reputation_once(
+        &self,
+        claim_key: &[u8],
+        reputation_key: &[u8],
+        initial_reputation: u64,
+        on_time: bool,
+        reward: u64,
+        slash: u64,
+        maximum: u64,
+    ) -> anyhow::Result<bool> {
+        let mut claim = self
+            .kv_store
+            .get_mut(claim_key)
+            .ok_or_else(|| anyhow::anyhow!("stored claim disappeared during reputation update"))?;
+        if claim.len() < 66 {
+            anyhow::bail!("stored claim has invalid length {}", claim.len());
+        }
+        if claim.get(66).is_some_and(|flag| *flag != 0) {
+            return Ok(false);
+        }
+        if claim.len() == 66 {
+            claim.push(1);
+        } else {
+            claim[66] = 1;
+        }
+        drop(claim);
+
+        let current = self
+            .kv_store
+            .get(reputation_key)
+            .filter(|value| value.len() >= 8)
+            .map(|value| u64::from_le_bytes(value[0..8].try_into().unwrap()))
+            .unwrap_or(initial_reputation);
+        let next = if on_time {
+            current.saturating_add(reward).min(maximum)
+        } else {
+            current.saturating_sub(slash)
+        };
+        self.kv_store.insert(reputation_key.to_vec(), next.to_le_bytes().to_vec());
+        Ok(true)
     }
 }
 

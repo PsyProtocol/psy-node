@@ -50,7 +50,7 @@ pub const TEMP_TABLE_ID_DEPLOY_CONTRACT_KEY_SIZE: usize = 32; // 4 + 2 + 2 + 8 +
 pub const TEMP_TABLE_ID_JOB_CLAIM: u16 = 0x434A; // 'JC'
 pub const TEMP_TABLE_ID_JOB_CLAIM_BYTES: [u8; 2] = [0x4A, 0x43]; // 'JC'
 pub const TEMP_TABLE_JOB_CLAIM_KEY_SIZE: usize = 40; // 4 + 2 + 2 + 8 + 24
-pub const TEMP_TABLE_JOB_CLAIM_VALUE_SIZE: usize = 41; // public_key 33 + claim_time_ms u64
+pub const TEMP_TABLE_JOB_CLAIM_VALUE_SIZE: usize = 67; // public key 33 + claim time 8 + proc id 16 + reputation 8 + two flags
 
 pub const TEMP_TABLE_ID_JOB_STATS: u16 = 0x534A; // 'JS'
 pub const TEMP_TABLE_ID_JOB_STATS_BYTES: [u8; 2] = [0x4A, 0x53]; // 'JS'
