@@ -103,13 +103,20 @@ fn genesis_contracts() -> &'static Value {
     &GENESIS
 }
 
+fn genesis_contract(contract_name: &str) -> &'static Value {
+    genesis_contracts()
+        .as_array()
+        .and_then(|contracts| {
+            contracts
+                .iter()
+                .find(|contract| contract.get("name").and_then(Value::as_str) == Some(contract_name))
+        })
+        .unwrap_or_else(|| panic!("genesis_contracts.json has no {} entry", contract_name))
+}
+
 /// CBOR-decode every function body embedded in the named genesis contract.
 fn genesis_methods(contract_name: &str) -> Vec<Value> {
-    let contracts = genesis_contracts();
-    let contract = contracts
-        .as_array()
-        .and_then(|xs| xs.iter().find(|c| c.get("name").and_then(Value::as_str) == Some(contract_name)))
-        .unwrap_or_else(|| panic!("genesis_contracts.json has no {} entry", contract_name));
+    let contract = genesis_contract(contract_name);
     let functions = contract
         .pointer("/code_definition/functions")
         .and_then(Value::as_array)
@@ -417,16 +424,16 @@ fn generated_usdt_abi_private_claim_matches_genesis() {
     assert_abi_private_claim_shape(&usdt_abi_path(), "usdt_token");
 }
 
-fn assert_manifest_precompile(contract_id: u64, name: &str, abi_path: &str, contract_name: &str) {
+fn assert_manifest_precompile(contract_id: u64, name: &str, abi_path: &str, abi_contract_name: &str, genesis_contract_name: &str) {
     let manifest_path = abi_manifest_path();
     let manifest = read_json(&manifest_path);
     let precompile = manifest
         .get("precompiles")
         .and_then(Value::as_array)
         .and_then(|precompiles| {
-            precompiles.iter().find(|precompile| {
-                precompile.get("contract_id").and_then(Value::as_u64) == Some(contract_id)
-            })
+            precompiles
+                .iter()
+                .find(|precompile| precompile.get("contract_id").and_then(Value::as_u64) == Some(contract_id))
         })
         .unwrap_or_else(|| panic!("{} has no precompile contract_id {}", manifest_path.display(), contract_id));
     assert_eq!(precompile.get("name").and_then(Value::as_str), Some(name));
@@ -436,14 +443,51 @@ fn assert_manifest_precompile(contract_id: u64, name: &str, abi_path: &str, cont
     let referenced_abi = read_json(&referenced_abi_path);
     assert_eq!(
         referenced_abi.pointer("/contract/name").and_then(Value::as_str),
-        Some(contract_name),
+        Some(abi_contract_name),
         "{} routes contract_id {} to an ABI for the wrong contract",
-        manifest_path.display(), contract_id
+        manifest_path.display(),
+        contract_id
+    );
+
+    let manifest_height = precompile.get("state_tree_height").and_then(Value::as_u64);
+    let abi_height = referenced_abi.pointer("/contract/state_tree_height").and_then(Value::as_u64);
+    let genesis_height = genesis_contract(genesis_contract_name)
+        .pointer("/code_definition/state_tree_height")
+        .and_then(Value::as_u64);
+    assert_eq!(
+        manifest_height,
+        abi_height,
+        "{} state_tree_height disagrees with {}",
+        manifest_path.display(),
+        referenced_abi_path.display()
+    );
+    assert_eq!(
+        manifest_height,
+        genesis_height,
+        "{} state_tree_height for contract_id {} disagrees with genesis_contracts.json",
+        manifest_path.display(),
+        contract_id
     );
 }
 
 #[test]
-fn canonical_abi_manifest_routes_token_contracts() {
-    assert_manifest_precompile(0, "token", "PsyTokenContract.json", "PsyTokenContract");
-    assert_manifest_precompile(4, "usdt", "USDTTokenContract.json", "USDTTokenContract");
+fn canonical_abi_manifest_matches_genesis_contracts() {
+    assert_manifest_precompile(0, "token", "PsyTokenContract.json", "PsyTokenContract", "token");
+    assert_manifest_precompile(
+        1,
+        "mining_rewards",
+        "PsyPOWMiningRewardsClaimContract.json",
+        "PsyPOWMiningRewardsClaimContract",
+        "mining_rewards",
+    );
+    assert_manifest_precompile(2, "deposit_tree", "PsyDepositTreeContract.json", "PsyDepositTreeContract", "deposit_tree");
+    assert_manifest_precompile(
+        3,
+        "withdrawal_tree",
+        "PsyWithdrawalTreeContract.json",
+        "PsyWithdrawalTreeContract",
+        "withdrawal_tree",
+    );
+    assert_manifest_precompile(4, "usdt", "USDTTokenContract.json", "USDTTokenContract", "usdt_token");
+    assert_manifest_precompile(5, "faucet", "PsyFaucetContract.json", "PsyFaucetContract", "faucet");
 }
