@@ -16,7 +16,7 @@ local_staging_source_env_defaults() {
     name="${BASH_REMATCH[1]}"
     if [ -z "${!name+x}" ]; then
       eval "$assignment"
-      export "$name"
+      export "${name?}"
     fi
   done < "$env_file"
 }
@@ -33,13 +33,15 @@ local_staging_compose() {
   local script_dir="$1"
   shift
 
+  local compose_project="${LOCAL_STAGING_COMPOSE_PROJECT:-parth-local-staging}"
+
   if docker compose version >/dev/null 2>&1; then
-    docker compose -p parth-local-staging -f "$script_dir/docker-compose.yml" "$@"
+    docker compose -p "$compose_project" -f "$script_dir/docker-compose.yml" "$@"
     return $?
   fi
 
   if command -v docker-compose >/dev/null 2>&1; then
-    docker-compose -p parth-local-staging -f "$script_dir/docker-compose.yml" "$@"
+    docker-compose -p "$compose_project" -f "$script_dir/docker-compose.yml" "$@"
     return $?
   fi
 

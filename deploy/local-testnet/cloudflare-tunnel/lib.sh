@@ -13,6 +13,10 @@ local_staging_source_env_defaults "$LOCAL_CF_TOOLS_PARTH_DIR/deploy/local-testne
 local_staging_source_env_defaults "$LOCAL_CF_SCRIPT_DIR/local.env"
 
 : "${LOCAL_CF_STATE_DIR:=$LOCAL_CF_LIVE_PARTH_DIR/.local-staging-cf-tunnel}"
+: "${LOCAL_STAGING_STATE_DIR:=$PARTH_DIR/.local-staging}"
+: "${LOCAL_STAGING_L1_DEPLOYMENTS_NETWORK:=localhost}"
+: "${LOCAL_STAGING_CHAIN_CONFIG_NETWORK:=localhost}"
+: "${LOCAL_STAGING_FRONTEND_NETWORK:=$LOCAL_STAGING_CHAIN_CONFIG_NETWORK}"
 : "${LOCAL_CF_TUNNEL_NAME:=psy-local-staging}"
 : "${LOCAL_CF_TUNNEL_ID:=}"
 : "${LOCAL_CF_TUNNEL_CREDENTIALS_FILE:=}"
@@ -185,6 +189,7 @@ local_cf_render_chain_config() {
   mkdir -p "$(dirname "$LOCAL_CF_CHAIN_CONFIG_FILE")"
 
   jq \
+    --arg network "$LOCAL_STAGING_CHAIN_CONFIG_NETWORK" \
     --arg coordinator "$(local_cf_url "$LOCAL_CF_COORDINATOR_HOST")" \
     --arg realm0 "$(local_cf_url "$LOCAL_CF_REALM0_HOST")" \
     --arg realm1 "$(local_cf_url "$LOCAL_CF_REALM1_HOST")" \
@@ -197,19 +202,23 @@ local_cf_render_chain_config() {
     --arg nostr "$LOCAL_CF_NOSTR_RELAY_URL" \
     --argjson l1chain "${LOCAL_STAGING_L1_CHAIN_ID:-31338}" \
     '
-      .networks.localhost.coordinator_configs = [{id: 0, rpc_url: [$coordinator]}]
-      | .networks.localhost.realm_configs = [
+      if (.networks[$network] | type) != "object" then
+        error("missing network profile: " + $network)
+      else . end
+      | .defaultNetwork = $network
+      | .networks[$network].coordinator_configs = [{id: 0, rpc_url: [$coordinator]}]
+      | .networks[$network].realm_configs = [
           {id: 0, rpc_url: [$realm0]},
           {id: 1, rpc_url: [$realm1]}
         ]
-      | .networks.localhost.prove_proxy_url = [$prove]
-      | .networks.localhost.faucet_rpc_url = [$faucet]
-      | .networks.localhost.api_services_url = [$services]
-      | .networks.localhost.indexer_graphql_url = [$indexer]
-      | .networks.localhost.explorer_url = [$explorer]
-      | .networks.localhost.l1_rpc_urls = [$l1rpc]
-      | .networks.localhost.l1_chain_id = $l1chain
-      | .networks.localhost.nostr_relay_urls = [$nostr]
+      | .networks[$network].prove_proxy_url = [$prove]
+      | .networks[$network].faucet_rpc_url = [$faucet]
+      | .networks[$network].api_services_url = [$services]
+      | .networks[$network].indexer_graphql_url = [$indexer]
+      | .networks[$network].explorer_url = [$explorer]
+      | .networks[$network].l1_rpc_urls = [$l1rpc]
+      | .networks[$network].l1_chain_id = $l1chain
+      | .networks[$network].nostr_relay_url = $nostr
     ' "$LOCAL_CF_ORIGINAL_CHAIN_CONFIG" > "$LOCAL_CF_CHAIN_CONFIG_FILE"
 }
 

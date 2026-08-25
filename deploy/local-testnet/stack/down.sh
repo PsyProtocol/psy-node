@@ -2,7 +2,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PARTH_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+LOCAL_STAGING_TOOLS_PARTH_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+PARTH_DIR="${LOCAL_STAGING_SOURCE_PARTH_DIR:-$LOCAL_STAGING_TOOLS_PARTH_DIR}"
 
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
@@ -15,7 +16,8 @@ REMOVE_VOLUMES=0
 
 archive_local_runtime_state() {
   local archive_root="$LOCAL_STAGING_STATE_DIR/reset-archives"
-  local archive_dir="$archive_root/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  local archive_dir
+  archive_dir="$archive_root/$(date -u +%Y%m%dT%H%M%SZ)-$$"
   local name
   local moved=0
 

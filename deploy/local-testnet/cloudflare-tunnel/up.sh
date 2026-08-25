@@ -4,8 +4,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
-# shellcheck source=../local-staging/lib.sh
-source "$PARTH_DIR/deploy/local-testnet/stack/lib.sh"
 
 local_cf_render_all
 LOCAL_CF_FULL_RESET_REQUESTED="${LOCAL_STAGING_RESET:-0}"
@@ -21,14 +19,15 @@ build_relayer_if_requested() {
   [ "${LOCAL_STAGING_BUILD:-0}" = "1" ] || return 0
 
   echo "[local-cf-tunnel] building bridge relayer release binary"
-  cargo build --manifest-path "$PARTH_DIR/Cargo.toml" --release --bin psy_relayer_cli
+  CARGO_TARGET_DIR="${LOCAL_STAGING_TARGET_DIR:-$PARTH_DIR/target}" \
+    cargo build --manifest-path "$PARTH_DIR/Cargo.toml" --release --bin psy_relayer_cli
 }
 
 start_anvil_if_needed() {
   [ "${LOCAL_CF_START_ANVIL:-1}" = "1" ] || return 0
   local chain_id="${LOCAL_STAGING_L1_CHAIN_ID:-31338}"
   local block_time="${LOCAL_STAGING_L1_BLOCK_TIME:-1}"
-  local pid_file="$PARTH_DIR/.local-staging/pids/anvil.pid"
+  local pid_file="$LOCAL_STAGING_STATE_DIR/pids/anvil.pid"
   local existing_pid=""
 
   if timeout 2 bash -lc "</dev/tcp/127.0.0.1/$LOCAL_STAGING_L1_RPC_PORT" >/dev/null 2>&1; then
@@ -56,7 +55,7 @@ start_anvil_if_needed() {
     return 0
   fi
 
-  mkdir -p "$PARTH_DIR/.local-staging/logs" "$PARTH_DIR/.local-staging/pids"
+  mkdir -p "$LOCAL_STAGING_STATE_DIR/logs" "$LOCAL_STAGING_STATE_DIR/pids"
   local anvil_args=(--host 127.0.0.1 --port "$LOCAL_STAGING_L1_RPC_PORT" --chain-id "$chain_id")
   if [ -n "$block_time" ] && [ "$block_time" != "0" ]; then
     anvil_args+=(--block-time "$block_time")
@@ -65,10 +64,10 @@ start_anvil_if_needed() {
   echo "[local-cf-tunnel] starting anvil on 127.0.0.1:$LOCAL_STAGING_L1_RPC_PORT chain_id=$chain_id block_time=${block_time:-disabled}"
   if command -v setsid >/dev/null 2>&1; then
     setsid "$anvil_bin" "${anvil_args[@]}" \
-      > "$PARTH_DIR/.local-staging/logs/anvil.log" 2>&1 &
+      > "$LOCAL_STAGING_STATE_DIR/logs/anvil.log" 2>&1 &
   else
     nohup "$anvil_bin" "${anvil_args[@]}" \
-      > "$PARTH_DIR/.local-staging/logs/anvil.log" 2>&1 &
+      > "$LOCAL_STAGING_STATE_DIR/logs/anvil.log" 2>&1 &
   fi
   echo "$!" > "$pid_file"
 
@@ -81,7 +80,7 @@ start_anvil_if_needed() {
   done
 
   echo "[local-cf-tunnel] warning: timed out waiting for l1 rpc" >&2
-  tail -80 "$PARTH_DIR/.local-staging/logs/anvil.log" >&2 || true
+  tail -80 "$LOCAL_STAGING_STATE_DIR/logs/anvil.log" >&2 || true
 }
 
 snapshot_deployed_backend_abis() {
@@ -92,7 +91,7 @@ snapshot_deployed_backend_abis() {
 
   local snapshot_root="${LOCAL_CF_BACKEND_ABI_SNAPSHOT_ROOT:-$LOCAL_CF_LIVE_PARTH_DIR/.local-staging/backend-abi}"
   local releases_dir="$snapshot_root/releases"
-  local source_dir="$PARTH_DIR/psy-genesis/genesis_abi"
+  local source_dir="${LOCAL_STAGING_PSY_GENESIS_DIR:-$PARTH_DIR/psy-genesis}/genesis_abi"
   local release_id
   local release_dir
   local next_link="$snapshot_root/current.next.$$"
@@ -182,7 +181,7 @@ local_withdrawal_claim_keystore_dir() {
 }
 
 prepare_local_groth16_keystores() {
-  local relayer_bin="$PARTH_DIR/target/release/psy_relayer_cli"
+  local relayer_bin="${LOCAL_STAGING_TARGET_DIR:-$PARTH_DIR/target}/release/psy_relayer_cli"
   local keystore_root="${LOCAL_GROTH16_KEYSTORE_ROOT:-$HOME/.psy/keystore}"
   local regenerate="${LOCAL_CF_REGENERATE_GROTH16_KEYSTORE:-0}"
   local source_stamp="$keystore_root/.bridge-circuit-source.sha256"
@@ -228,7 +227,7 @@ export_local_l1_groth16_verifiers() {
   [ "${LOCAL_CF_EXPORT_GROTH16_VERIFIERS:-1}" = "1" ] || return 0
 
   local contracts_dir="$1"
-  local relayer_bin="$PARTH_DIR/target/release/psy_relayer_cli"
+  local relayer_bin="${LOCAL_STAGING_TARGET_DIR:-$PARTH_DIR/target}/release/psy_relayer_cli"
   local kind keystore output
 
   if [ ! -x "$relayer_bin" ]; then
@@ -264,7 +263,7 @@ export_local_l1_groth16_verifiers() {
 
 stop_bridge_relayer_if_running() {
   local reason="${1:-requested}"
-  local pid_file="$PARTH_DIR/.local-staging/pids/bridge-relayer.pid"
+  local pid_file="$LOCAL_STAGING_STATE_DIR/pids/bridge-relayer.pid"
   local pid
 
   [ -f "$pid_file" ] || return 0
@@ -305,29 +304,63 @@ install_l1_contract_dependencies() {
 deploy_l1_contracts() {
   local contracts_dir="$1"
   local l1_rpc_url="$2"
+  local deployments_network="$LOCAL_STAGING_L1_DEPLOYMENTS_NETWORK"
 
-  if [ -f "$contracts_dir/pnpm-lock.yaml" ]; then
-    (cd "$contracts_dir" && LOCALHOST_RPC_URL="$l1_rpc_url" LOCALHOST_L1_CHAIN_ID="${LOCAL_STAGING_L1_CHAIN_ID:-31338}" pnpm run deploy:localhost --reset)
-  else
-    (cd "$contracts_dir" && LOCALHOST_RPC_URL="$l1_rpc_url" LOCALHOST_L1_CHAIN_ID="${LOCAL_STAGING_L1_CHAIN_ID:-31338}" npm run deploy:localhost -- --reset)
-  fi
+  case "$deployments_network" in
+    localhost)
+      if [ -f "$contracts_dir/pnpm-lock.yaml" ]; then
+        (cd "$contracts_dir" && LOCALHOST_RPC_URL="$l1_rpc_url" LOCALHOST_L1_CHAIN_ID="${LOCAL_STAGING_L1_CHAIN_ID:-31338}" pnpm run deploy:localhost --reset)
+      else
+        (cd "$contracts_dir" && LOCALHOST_RPC_URL="$l1_rpc_url" LOCALHOST_L1_CHAIN_ID="${LOCAL_STAGING_L1_CHAIN_ID:-31338}" npm run deploy:localhost -- --reset)
+      fi
+      ;;
+    bsc-testnet)
+      if [ -f "$contracts_dir/pnpm-lock.yaml" ]; then
+        (cd "$contracts_dir" && BSC_TESTNET_RPC_URL="$l1_rpc_url" CHAIN_ID="${LOCAL_STAGING_L1_CHAIN_ID:-97}" PSY_INTERNAL_DEPLOY_FROM_KEYSTORE=1 PSY_INTERNAL_DEPLOY_PRIVATE_KEY="${LOCAL_STAGING_RELAYER_L1_PRIVATE_KEY:-ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}" pnpm exec hardhat deploy --network bsc-testnet --reset)
+      else
+        echo "[local-cf-tunnel] bsc-testnet deployment requires the psy-contracts pnpm lockfile" >&2
+        exit 1
+      fi
+      ;;
+    *)
+      echo "[local-cf-tunnel] unsupported local L1 deployments network: $deployments_network" >&2
+      exit 1
+      ;;
+  esac
 }
 
 deploy_l1_verifiers_only() {
   local contracts_dir="$1"
   local l1_rpc_url="$2"
+  local deployments_network="$LOCAL_STAGING_L1_DEPLOYMENTS_NETWORK"
 
-  if [ -f "$contracts_dir/pnpm-lock.yaml" ]; then
-    (cd "$contracts_dir" && \
-      LOCALHOST_RPC_URL="$l1_rpc_url" \
-      LOCALHOST_L1_CHAIN_ID="${LOCAL_STAGING_L1_CHAIN_ID:-31338}" \
-      pnpm exec hardhat deploy --network localhost --tags verifier)
-  else
-    (cd "$contracts_dir" && \
-      LOCALHOST_RPC_URL="$l1_rpc_url" \
-      LOCALHOST_L1_CHAIN_ID="${LOCAL_STAGING_L1_CHAIN_ID:-31338}" \
-      npx hardhat deploy --network localhost --tags verifier)
-  fi
+  case "$deployments_network" in
+    localhost)
+      if [ -f "$contracts_dir/pnpm-lock.yaml" ]; then
+        (cd "$contracts_dir" && \
+          LOCALHOST_RPC_URL="$l1_rpc_url" \
+          LOCALHOST_L1_CHAIN_ID="${LOCAL_STAGING_L1_CHAIN_ID:-31338}" \
+          pnpm exec hardhat deploy --network localhost --tags verifier)
+      else
+        (cd "$contracts_dir" && \
+          LOCALHOST_RPC_URL="$l1_rpc_url" \
+          LOCALHOST_L1_CHAIN_ID="${LOCAL_STAGING_L1_CHAIN_ID:-31338}" \
+          npx hardhat deploy --network localhost --tags verifier)
+      fi
+      ;;
+    bsc-testnet)
+      (cd "$contracts_dir" && \
+        BSC_TESTNET_RPC_URL="$l1_rpc_url" \
+        CHAIN_ID="${LOCAL_STAGING_L1_CHAIN_ID:-97}" \
+        PSY_INTERNAL_DEPLOY_FROM_KEYSTORE=1 \
+        PSY_INTERNAL_DEPLOY_PRIVATE_KEY="${LOCAL_STAGING_RELAYER_L1_PRIVATE_KEY:-ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}" \
+        pnpm exec hardhat deploy --network bsc-testnet --tags verifier)
+      ;;
+    *)
+      echo "[local-cf-tunnel] unsupported verifier deployment network: $deployments_network" >&2
+      exit 1
+      ;;
+  esac
 }
 
 rotate_local_withdrawal_claim_verifier() {
@@ -343,7 +376,7 @@ rotate_local_withdrawal_claim_verifier() {
   deploy_l1_verifiers_only "$contracts_dir" "$l1_rpc_url"
 
   bridge_address="$(jq -er '.core.Bridge // .contracts.Bridge' "$deployment_file")"
-  verifier_address="$(jq -er '.address' "$contracts_dir/deployments/localhost/WithdrawalClaimVerifier.json")"
+  verifier_address="$(jq -er '.address' "$contracts_dir/deployments/$LOCAL_STAGING_L1_DEPLOYMENTS_NETWORK/WithdrawalClaimVerifier.json")"
 
   echo "[local-cf-tunnel] rotating withdrawal verifier on existing Bridge: $verifier_address"
   cast send "$bridge_address" \
@@ -368,12 +401,12 @@ ensure_local_l1_contracts() (
   [ "${LOCAL_CF_DEPLOY_L1_CONTRACTS:-1}" = "1" ] || return 0
 
   local contracts_dir="${LOCAL_STAGING_CONTRACTS_DIR:-$PARTH_DIR/psy-contracts}"
-  local deployment_file="$contracts_dir/deployments/localhost/deployed-contracts.json"
+  local deployment_file="$contracts_dir/deployments/$LOCAL_STAGING_L1_DEPLOYMENTS_NETWORK/deployed-contracts.json"
   local l1_rpc_url="http://127.0.0.1:$LOCAL_STAGING_L1_RPC_PORT"
-  local verifier_stamp="$PARTH_DIR/.local-staging/l1-verifier-source.sha256"
-  local bridge_verifier_stamp="$PARTH_DIR/.local-staging/l1-bridge-verifier-source.sha256"
-  local deposit_verifier_stamp="$PARTH_DIR/.local-staging/l1-deposit-verifier-source.sha256"
-  local withdrawal_verifier_stamp="$PARTH_DIR/.local-staging/l1-withdrawal-verifier-source.sha256"
+  local verifier_stamp="$LOCAL_STAGING_STATE_DIR/l1-verifier-source.sha256"
+  local bridge_verifier_stamp="$LOCAL_STAGING_STATE_DIR/l1-bridge-verifier-source.sha256"
+  local deposit_verifier_stamp="$LOCAL_STAGING_STATE_DIR/l1-deposit-verifier-source.sha256"
+  local withdrawal_verifier_stamp="$LOCAL_STAGING_STATE_DIR/l1-withdrawal-verifier-source.sha256"
   local verifier_hash
   local bridge_verifier_hash
   local deposit_verifier_hash
@@ -418,16 +451,16 @@ ensure_local_l1_contracts() (
   if [ "$component_stamps_ready" = "1" ]; then
     if [ "$(cat "$bridge_verifier_stamp")" != "$bridge_verifier_hash" ] \
        || [ "$(cat "$deposit_verifier_stamp")" != "$deposit_verifier_hash" ]; then
-      echo "[local-cf-tunnel] bridge/deposit verifier source changed; forcing localhost L1 deploy"
+      echo "[local-cf-tunnel] bridge/deposit verifier source changed; forcing $LOCAL_STAGING_L1_DEPLOYMENTS_NETWORK L1 deploy"
       needs_deploy=1
     elif [ "$(cat "$withdrawal_verifier_stamp")" != "$withdrawal_verifier_hash" ]; then
       needs_withdrawal_verifier_rotation=1
     elif [ ! -f "$verifier_stamp" ] || [ "$(cat "$verifier_stamp")" != "$verifier_hash" ]; then
-      echo "[local-cf-tunnel] L1 verifier deployment logic changed; forcing localhost L1 deploy"
+      echo "[local-cf-tunnel] L1 verifier deployment logic changed; forcing $LOCAL_STAGING_L1_DEPLOYMENTS_NETWORK L1 deploy"
       needs_deploy=1
     fi
   elif [ ! -f "$verifier_stamp" ] || [ "$(cat "$verifier_stamp")" != "$verifier_hash" ]; then
-    echo "[local-cf-tunnel] L1 verifier source changed or not deployed yet; forcing localhost L1 deploy"
+    echo "[local-cf-tunnel] L1 verifier source changed or not deployed yet; forcing $LOCAL_STAGING_L1_DEPLOYMENTS_NETWORK L1 deploy"
     needs_deploy=1
   fi
 
@@ -459,12 +492,12 @@ ensure_local_l1_contracts() (
     printf '%s\n' "$bridge_verifier_hash" > "$bridge_verifier_stamp"
     printf '%s\n' "$deposit_verifier_hash" > "$deposit_verifier_stamp"
     printf '%s\n' "$withdrawal_verifier_hash" > "$withdrawal_verifier_stamp"
-    echo "[local-cf-tunnel] localhost L1 contracts are present"
+    echo "[local-cf-tunnel] $LOCAL_STAGING_L1_DEPLOYMENTS_NETWORK L1 contracts are present"
     return 0
   fi
 
-  echo "[local-cf-tunnel] deploying localhost L1 contracts"
-  stop_bridge_relayer_if_running "localhost L1 contracts are being redeployed"
+  echo "[local-cf-tunnel] deploying $LOCAL_STAGING_L1_DEPLOYMENTS_NETWORK L1 contracts"
+  stop_bridge_relayer_if_running "$LOCAL_STAGING_L1_DEPLOYMENTS_NETWORK L1 contracts are being redeployed"
   if [ ! -x "$contracts_dir/node_modules/.bin/hardhat" ]; then
     echo "[local-cf-tunnel] installing psy-contracts dependencies"
     install_l1_contract_dependencies "$contracts_dir"
@@ -490,16 +523,16 @@ start_eth_faucet_if_needed() {
     return 0
   fi
 
-  mkdir -p "$PARTH_DIR/.local-staging/logs" "$PARTH_DIR/.local-staging/pids"
+  mkdir -p "$LOCAL_STAGING_STATE_DIR/logs" "$LOCAL_STAGING_STATE_DIR/pids"
   echo "[local-cf-tunnel] starting eth faucet on 127.0.0.1:$LOCAL_CF_ETH_FAUCET_PORT"
   if command -v setsid >/dev/null 2>&1; then
     setsid bash "$SCRIPT_DIR/run-eth-faucet.sh" \
-      > "$PARTH_DIR/.local-staging/logs/eth-faucet.log" 2>&1 &
+      > "$LOCAL_STAGING_STATE_DIR/logs/eth-faucet.log" 2>&1 &
   else
     nohup bash "$SCRIPT_DIR/run-eth-faucet.sh" \
-      > "$PARTH_DIR/.local-staging/logs/eth-faucet.log" 2>&1 &
+      > "$LOCAL_STAGING_STATE_DIR/logs/eth-faucet.log" 2>&1 &
   fi
-  echo "$!" > "$PARTH_DIR/.local-staging/pids/eth-faucet.pid"
+  echo "$!" > "$LOCAL_STAGING_STATE_DIR/pids/eth-faucet.pid"
 
   for _ in $(seq 1 15); do
     if timeout 2 bash -lc "</dev/tcp/127.0.0.1/$LOCAL_CF_ETH_FAUCET_PORT" >/dev/null 2>&1; then
@@ -510,13 +543,13 @@ start_eth_faucet_if_needed() {
   done
 
   echo "[local-cf-tunnel] warning: timed out waiting for eth faucet" >&2
-  tail -80 "$PARTH_DIR/.local-staging/logs/eth-faucet.log" >&2 || true
+  tail -80 "$LOCAL_STAGING_STATE_DIR/logs/eth-faucet.log" >&2 || true
 }
 
 stop_envio_if_running() {
   local reason="${1:-requested}"
   local envio_dir="$PARTH_DIR/psy_cli/psy_relayer_cli/indexer/envio"
-  local pid_file="$PARTH_DIR/.local-staging/pids/envio.pid"
+  local pid_file="$LOCAL_STAGING_STATE_DIR/pids/envio.pid"
   local pid
   local worker_pid
   local worker_pids
@@ -573,7 +606,7 @@ write_envio_config() {
 
   local envio_dir="$PARTH_DIR/psy_cli/psy_relayer_cli/indexer/envio"
   local contracts_dir="${LOCAL_STAGING_CONTRACTS_DIR:-$PARTH_DIR/psy-contracts}"
-  local deployments_json="$contracts_dir/deployments/localhost/deployed-contracts.json"
+  local deployments_json="$contracts_dir/deployments/$LOCAL_STAGING_L1_DEPLOYMENTS_NETWORK/deployed-contracts.json"
   local bridge_address
   local state_manager_address
   local start_block="${LOCAL_CF_ENVIO_START_BLOCK:-1}"
@@ -654,7 +687,7 @@ start_envio_storage() {
     ENVIO_PG_PORT="$envio_pg_port" \
       HASURA_EXTERNAL_PORT="$LOCAL_STAGING_INDEXER_PORT" \
       HASURA_GRAPHQL_ADMIN_SECRET="$hasura_admin_secret" \
-      docker compose -f "$compose_file" up -d
+      docker compose -p "${LOCAL_CF_ENVIO_COMPOSE_PROJECT:-parth-local-envio}" -f "$compose_file" up -d
   )
 
   for _ in $(seq 1 60); do
@@ -686,17 +719,17 @@ start_envio_if_needed() {
   local envio_dir="$PARTH_DIR/psy_cli/psy_relayer_cli/indexer/envio"
   local compose_file="$envio_dir/generated/docker-compose.yaml"
   local generated_config_file="$envio_dir/generated/src/Generated.res"
-  local pid_file="$PARTH_DIR/.local-staging/pids/envio.pid"
-  local log_file="$PARTH_DIR/.local-staging/logs/envio.log"
-  local err_file="$PARTH_DIR/.local-staging/logs/envio.err.log"
+  local pid_file="$LOCAL_STAGING_STATE_DIR/pids/envio.pid"
+  local log_file="$LOCAL_STAGING_STATE_DIR/logs/envio.log"
+  local err_file="$LOCAL_STAGING_STATE_DIR/logs/envio.err.log"
   local envio_pg_port="${LOCAL_CF_ENVIO_PG_PORT:-5433}"
-  local relayer_restart_marker="$PARTH_DIR/.local-staging/pids/bridge-relayer.restart"
+  local relayer_restart_marker="$LOCAL_STAGING_STATE_DIR/pids/bridge-relayer.restart"
   local envio_codegen_bin="$envio_dir/generated/node_modules/.bin/envio"
   local hasura_admin_secret="${LOCAL_CF_ENVIO_HASURA_ADMIN_SECRET:-${LOCAL_STAGING_HASURA_ADMIN_SECRET:-testing}}"
   local pid
   local needs_codegen=0
   local contracts_dir="${LOCAL_STAGING_CONTRACTS_DIR:-$PARTH_DIR/psy-contracts}"
-  local deployments_json="$contracts_dir/deployments/localhost/deployed-contracts.json"
+  local deployments_json="$contracts_dir/deployments/$LOCAL_STAGING_L1_DEPLOYMENTS_NETWORK/deployed-contracts.json"
   local bridge_address=""
   local state_manager_address=""
 
@@ -762,7 +795,7 @@ start_envio_if_needed() {
       ENVIO_PG_PORT="$envio_pg_port" \
         HASURA_EXTERNAL_PORT="$LOCAL_STAGING_INDEXER_PORT" \
         HASURA_GRAPHQL_ADMIN_SECRET="$hasura_admin_secret" \
-        docker compose -f "$compose_file" down -v
+        docker compose -p "${LOCAL_CF_ENVIO_COMPOSE_PROJECT:-parth-local-envio}" -f "$compose_file" down -v
     )
     mkdir -p "$(dirname "$relayer_restart_marker")"
     printf '1\n' > "$relayer_restart_marker"
@@ -782,7 +815,7 @@ start_envio_if_needed() {
 
   start_envio_storage "$envio_dir" "$compose_file" "$envio_pg_port"
 
-  mkdir -p "$PARTH_DIR/.local-staging/logs" "$PARTH_DIR/.local-staging/pids"
+  mkdir -p "$LOCAL_STAGING_STATE_DIR/logs" "$LOCAL_STAGING_STATE_DIR/pids"
   echo "[local-cf-tunnel] initializing Envio generated indexer storage"
   (
     cd "$envio_dir/generated"
@@ -860,13 +893,13 @@ write_bridge_relayer_config() {
   [ "${LOCAL_CF_START_RELAYER:-1}" = "1" ] || return 0
 
   local contracts_dir="${LOCAL_STAGING_CONTRACTS_DIR:-$PARTH_DIR/psy-contracts}"
-  local deployments_json="$contracts_dir/deployments/localhost/deployed-contracts.json"
+  local deployments_json="$contracts_dir/deployments/$LOCAL_STAGING_L1_DEPLOYMENTS_NETWORK/deployed-contracts.json"
   local private_keys_path="${LOCAL_STAGING_PRIVATE_KEYS_PATH:-$PARTH_DIR/private_keys.json}"
-  local relayer_config="${LOCAL_STAGING_RELAYER_CONFIG:-$PARTH_DIR/.local-staging/bridge-relayer.toml}"
-  local restart_marker="$PARTH_DIR/.local-staging/pids/bridge-relayer.restart"
+  local relayer_config="${LOCAL_STAGING_RELAYER_CONFIG:-$LOCAL_STAGING_STATE_DIR/bridge-relayer.toml}"
+  local restart_marker="$LOCAL_STAGING_STATE_DIR/pids/bridge-relayer.restart"
   local tmp_config="${relayer_config}.tmp.$$"
-  local relayer_proof_dir="${LOCAL_STAGING_RELAYER_PROOF_DIR:-$PARTH_DIR/.local-staging/bridge-relayer}"
-  local relayer_rpc_config="${LOCAL_STAGING_RELAYER_RPC_CONFIG:-$PARTH_DIR/.local-staging/bridge-relayer-client_prover-config.json}"
+  local relayer_proof_dir="${LOCAL_STAGING_RELAYER_PROOF_DIR:-$LOCAL_STAGING_STATE_DIR/bridge-relayer}"
+  local relayer_rpc_config="${LOCAL_STAGING_RELAYER_RPC_CONFIG:-$LOCAL_STAGING_STATE_DIR/bridge-relayer-client_prover-config.json}"
   local relayer_key_index="${LOCAL_STAGING_RELAYER_L2_KEY_INDEX:-2}"
   local relayer_l2_key
   local bridge_address
@@ -897,7 +930,7 @@ write_bridge_relayer_config() {
     printf 'private_key = "%s"\n\n' "$(toml_escape "$relayer_l2_key")"
     printf '[finalize]\n'
     printf 'l1_rpc_url = "%s"\n' "$(toml_escape "http://127.0.0.1:${LOCAL_STAGING_L1_RPC_PORT}")"
-    printf 'deployments_network = "localhost"\n'
+    printf 'deployments_network = "%s"\n' "$(toml_escape "$LOCAL_STAGING_L1_DEPLOYMENTS_NETWORK")"
     printf 'private_key = "%s"\n' "$(toml_escape "${LOCAL_STAGING_RELAYER_L1_PRIVATE_KEY:-ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}")"
     printf 'bridge_address = "%s"\n' "$(toml_escape "$bridge_address")"
     printf 'state_manager = "%s"\n' "$(toml_escape "$state_manager_address")"
@@ -920,6 +953,7 @@ write_bridge_relayer_rpc_config() {
 
   mkdir -p "$(dirname "$output")" "$(dirname "$restart_marker")"
   jq \
+    --arg network "$LOCAL_STAGING_CHAIN_CONFIG_NETWORK" \
     --arg coordinator "http://127.0.0.1:${LOCAL_STAGING_COORDINATOR_EDGE_PORT}" \
     --arg realm0 "http://127.0.0.1:$(local_cf_realm_port 0)" \
     --arg realm1 "http://127.0.0.1:$(local_cf_realm_port 1)" \
@@ -930,18 +964,22 @@ write_bridge_relayer_rpc_config() {
     --arg l1rpc "http://127.0.0.1:${LOCAL_STAGING_L1_RPC_PORT}" \
     --argjson l1chain "${LOCAL_STAGING_L1_CHAIN_ID:-31338}" \
     '
-      .networks.localhost.coordinator_configs = [{id: 0, rpc_url: [$coordinator]}]
-      | .networks.localhost.realm_configs = [
+      if (.networks[$network] | type) != "object" then
+        error("missing network profile: " + $network)
+      else . end
+      | .defaultNetwork = $network
+      | .networks[$network].coordinator_configs = [{id: 0, rpc_url: [$coordinator]}]
+      | .networks[$network].realm_configs = [
           {id: 0, rpc_url: [$realm0]},
           {id: 1, rpc_url: [$realm1]}
         ]
-      | .networks.localhost.prove_proxy_url = [$prove]
-      | .networks.localhost.faucet_rpc_url = [$faucet]
-      | .networks.localhost.api_services_url = [$services]
-      | .networks.localhost.indexer_graphql_url = [$indexer]
-      | .networks.localhost.l1_rpc_urls = [$l1rpc]
-      | .networks.localhost.l1_chain_id = $l1chain
-    ' "$PARTH_DIR/psy-genesis/config.json" > "$tmp_output"
+      | .networks[$network].prove_proxy_url = [$prove]
+      | .networks[$network].faucet_rpc_url = [$faucet]
+      | .networks[$network].api_services_url = [$services]
+      | .networks[$network].indexer_graphql_url = [$indexer]
+      | .networks[$network].l1_rpc_urls = [$l1rpc]
+      | .networks[$network].l1_chain_id = $l1chain
+    ' "$LOCAL_CF_ORIGINAL_CHAIN_CONFIG" > "$tmp_output"
 
   if [ -f "$output" ] && ! cmp -s "$output" "$tmp_output"; then
     printf '1\n' > "$restart_marker"
@@ -954,12 +992,12 @@ write_bridge_relayer_rpc_config() {
 start_bridge_relayer_if_needed() {
   [ "${LOCAL_CF_START_RELAYER:-1}" = "1" ] || return 0
 
-  local relayer_bin="$PARTH_DIR/target/release/psy_relayer_cli"
-  local relayer_config="${LOCAL_STAGING_RELAYER_CONFIG:-$PARTH_DIR/.local-staging/bridge-relayer.toml}"
-  local pid_file="$PARTH_DIR/.local-staging/pids/bridge-relayer.pid"
-  local restart_marker="$PARTH_DIR/.local-staging/pids/bridge-relayer.restart"
-  local binary_stamp="$PARTH_DIR/.local-staging/pids/bridge-relayer.binary.sha256"
-  local log_file="$PARTH_DIR/.local-staging/logs/bridge-relayer.log"
+  local relayer_bin="${LOCAL_STAGING_TARGET_DIR:-$PARTH_DIR/target}/release/psy_relayer_cli"
+  local relayer_config="${LOCAL_STAGING_RELAYER_CONFIG:-$LOCAL_STAGING_STATE_DIR/bridge-relayer.toml}"
+  local pid_file="$LOCAL_STAGING_STATE_DIR/pids/bridge-relayer.pid"
+  local restart_marker="$LOCAL_STAGING_STATE_DIR/pids/bridge-relayer.restart"
+  local binary_stamp="$LOCAL_STAGING_STATE_DIR/pids/bridge-relayer.binary.sha256"
+  local log_file="$LOCAL_STAGING_STATE_DIR/logs/bridge-relayer.log"
   local pid relayer_sha256
 
   if [ ! -x "$relayer_bin" ]; then
@@ -987,23 +1025,27 @@ start_bridge_relayer_if_needed() {
     fi
   fi
 
-  mkdir -p "$PARTH_DIR/.local-staging/logs" "$PARTH_DIR/.local-staging/pids"
+  mkdir -p "$LOCAL_STAGING_STATE_DIR/logs" "$LOCAL_STAGING_STATE_DIR/pids"
   echo "[local-cf-tunnel] starting bridge relayer -> $log_file"
   if command -v setsid >/dev/null 2>&1; then
     env PARTH_HOME="$PARTH_DIR" \
-      BRIDGE_RELAYER_LOG_FILE="$PARTH_DIR/.local-staging/logs/bridge-relayer-inner.log" \
+      PARTH_TARGET_DIR="${LOCAL_STAGING_TARGET_DIR:-$PARTH_DIR/target}" \
+      PSY_SERVICES_TARGET_DIR="${LOCAL_STAGING_PSY_SERVICES_TARGET_DIR:-${PSY_SERVICES_HOME:-$PARTH_DIR/../psy-services}/target}" \
+      BRIDGE_RELAYER_LOG_FILE="$LOCAL_STAGING_STATE_DIR/logs/bridge-relayer-inner.log" \
       PSY_DEPLOYMENTS_DIR="${LOCAL_STAGING_CONTRACTS_DIR:-$PARTH_DIR/psy-contracts}/deployments" \
       RUST_LOG="${LOCAL_STAGING_RELAYER_RUST_LOG:-info}" \
       RELAYER_CONFIG="$relayer_config" \
-      setsid bash "$PARTH_DIR/deploy/bin/run-parth-service" relayer \
+      setsid bash "$LOCAL_CF_TOOLS_PARTH_DIR/deploy/bin/run-parth-service" relayer \
       > "$log_file" 2>&1 &
   else
     env PARTH_HOME="$PARTH_DIR" \
-      BRIDGE_RELAYER_LOG_FILE="$PARTH_DIR/.local-staging/logs/bridge-relayer-inner.log" \
+      PARTH_TARGET_DIR="${LOCAL_STAGING_TARGET_DIR:-$PARTH_DIR/target}" \
+      PSY_SERVICES_TARGET_DIR="${LOCAL_STAGING_PSY_SERVICES_TARGET_DIR:-${PSY_SERVICES_HOME:-$PARTH_DIR/../psy-services}/target}" \
+      BRIDGE_RELAYER_LOG_FILE="$LOCAL_STAGING_STATE_DIR/logs/bridge-relayer-inner.log" \
       PSY_DEPLOYMENTS_DIR="${LOCAL_STAGING_CONTRACTS_DIR:-$PARTH_DIR/psy-contracts}/deployments" \
       RUST_LOG="${LOCAL_STAGING_RELAYER_RUST_LOG:-info}" \
       RELAYER_CONFIG="$relayer_config" \
-      nohup bash "$PARTH_DIR/deploy/bin/run-parth-service" relayer \
+      nohup bash "$LOCAL_CF_TOOLS_PARTH_DIR/deploy/bin/run-parth-service" relayer \
       > "$log_file" 2>&1 &
   fi
   echo "$!" > "$pid_file"
@@ -1034,15 +1076,15 @@ start_cf_tunnel_if_needed() {
   local_cf_ensure_cloudflared
   local_cf_render_cloudflared_config
 
-  local pid_file="$PARTH_DIR/.local-staging/pids/cloudflared.pid"
-  local log_file="$PARTH_DIR/.local-staging/logs/cloudflared.log"
-  local config_stamp="$PARTH_DIR/.local-staging/cloudflared-config.sha256"
+  local pid_file="$LOCAL_STAGING_STATE_DIR/pids/cloudflared.pid"
+  local log_file="$LOCAL_STAGING_STATE_DIR/logs/cloudflared.log"
+  local config_stamp="$LOCAL_STAGING_STATE_DIR/cloudflared-config.sha256"
   local config_hash
   local pid
 
   config_hash="$(sha256sum "$LOCAL_CF_CONFIG_FILE" | awk '{print $1}')"
 
-  mkdir -p "$PARTH_DIR/.local-staging/logs" "$PARTH_DIR/.local-staging/pids"
+  mkdir -p "$LOCAL_STAGING_STATE_DIR/logs" "$LOCAL_STAGING_STATE_DIR/pids"
   if [ -f "$pid_file" ]; then
     pid="$(cat "$pid_file" 2>/dev/null || true)"
     if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
@@ -1099,24 +1141,45 @@ reset_local_staging_if_requested() {
   [ "${LOCAL_STAGING_RESET:-0}" = "1" ] || return 0
 
   echo "[local-cf-tunnel] resetting local staging runtime"
-  LOCAL_STAGING_RESET=0 bash "$PARTH_DIR/deploy/local-testnet/stack/down.sh" --volumes || true
+  LOCAL_STAGING_SOURCE_PARTH_DIR="$PARTH_DIR" \
+    LOCAL_STAGING_RESET=0 \
+    bash "$LOCAL_CF_TOOLS_PARTH_DIR/deploy/local-testnet/stack/down.sh" --volumes || true
   export LOCAL_STAGING_RESET=0
+}
+
+stop_after_stage() {
+  local stage="$1"
+  [ "${LOCAL_CF_STOP_AFTER:-}" = "$stage" ] || return 0
+  echo "[local-cf-tunnel] stopping after requested stage: $stage"
+  exit 0
 }
 
 reset_local_staging_if_requested
 build_relayer_if_requested
 start_anvil_if_needed
 ensure_local_l1_contracts
+stop_after_stage l1
 
 echo "[local-cf-tunnel] starting local staging"
 export LOCAL_STAGING_INDEXER_PORT
-LOCAL_STAGING_RESET=0 LOCAL_STAGING_PUBLISH_FRONTENDS=0 bash "$PARTH_DIR/deploy/local-testnet/stack/up.sh"
+LOCAL_STAGING_SOURCE_PARTH_DIR="$PARTH_DIR" \
+  LOCAL_STAGING_RESET=0 \
+  LOCAL_STAGING_PUBLISH_FRONTENDS="${LOCAL_CF_STACK_PUBLISH_FRONTENDS:-0}" \
+  bash "$LOCAL_CF_TOOLS_PARTH_DIR/deploy/local-testnet/stack/up.sh"
+stop_after_stage core
 
 start_eth_faucet_if_needed
 write_envio_config
 start_envio_if_needed
+stop_after_stage envio
 write_bridge_relayer_config
 start_bridge_relayer_if_needed
+
+if [ "${LOCAL_CF_STOP_AFTER:-}" = "relayer" ]; then
+  bash "$SCRIPT_DIR/wait-relayer-ready.sh"
+  snapshot_deployed_backend_abis
+  stop_after_stage relayer
+fi
 
 start_cf_tunnel_if_needed
 
@@ -1141,6 +1204,6 @@ snapshot_deployed_backend_abis
 echo
 echo "[local-cf-tunnel] local staging is ready for tunnel exposure"
 echo "tunnel log:"
-echo "  tail -f $PARTH_DIR/.local-staging/logs/cloudflared.log"
+echo "  tail -f $LOCAL_STAGING_STATE_DIR/logs/cloudflared.log"
 echo
 local_cf_print_urls

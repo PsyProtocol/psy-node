@@ -2,7 +2,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PARTH_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+LOCAL_STAGING_TOOLS_PARTH_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+PARTH_DIR="${LOCAL_STAGING_SOURCE_PARTH_DIR:-$LOCAL_STAGING_TOOLS_PARTH_DIR}"
 
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
@@ -59,6 +60,10 @@ local_staging_source_env_defaults "$SCRIPT_DIR/local.env"
 : "${LOCAL_STAGING_CONTRACTS_DIR:=$PARTH_DIR/psy-contracts}"
 : "${LOCAL_STAGING_PSY_GENESIS_DIR:=$PARTH_DIR/psy-genesis}"
 : "${LOCAL_STAGING_PSY_DAPP_DIR:=$PARTH_DIR/psy-dapp}"
+: "${LOCAL_STAGING_L1_DEPLOYMENTS_NETWORK:=localhost}"
+: "${LOCAL_STAGING_CONTAINER_PREFIX:=parth-local}"
+: "${LOCAL_STAGING_TARGET_DIR:=$PARTH_DIR/target}"
+: "${LOCAL_STAGING_PSY_SERVICES_TARGET_DIR:=$PSY_SERVICES_HOME/target}"
 
 LOG_DIR="$LOCAL_STAGING_STATE_DIR/logs"
 PID_DIR="$LOCAL_STAGING_STATE_DIR/pids"
@@ -68,14 +73,14 @@ NGINX_ROOT="${LOCAL_STAGING_NGINX_ROOT:-$LOCAL_STAGING_STATE_DIR/nginx/html}"
 GENESIS_PATH="${LOCAL_STAGING_GENESIS_PATH:-$PARTH_DIR/genesis.json}"
 PRIVATE_KEYS_PATH="${LOCAL_STAGING_PRIVATE_KEYS_PATH:-$PARTH_DIR/private_keys.json}"
 RPC_CONFIG="${LOCAL_STAGING_RPC_CONFIG:-$LOCAL_STAGING_PSY_GENESIS_DIR/config.json}"
-USER_CLI="$PARTH_DIR/target/release/psy_user_cli"
+USER_CLI="$LOCAL_STAGING_TARGET_DIR/release/psy_user_cli"
 PSY_FAUCET_OPERATORS_JSON_PATH="${LOCAL_STAGING_PSY_FAUCET_OPERATORS_JSON_PATH:-}"
 PSY_FAUCET_TEMPLATE_JSON_PATH="${LOCAL_STAGING_PSY_FAUCET_TEMPLATE_JSON_PATH:-$LOCAL_STAGING_PSY_DAPP_DIR/apps/bridge/src/config/faucetOperators.json}"
 PSY_FAUCET_GENERATED_OPERATORS_JSON_PATH="${LOCAL_STAGING_PSY_FAUCET_GENERATED_OPERATORS_JSON_PATH:-$LOCAL_STAGING_STATE_DIR/faucetOperators.json}"
 DATABASE_URL="${LOCAL_STAGING_DATABASE_URL:-postgres://$LOCAL_POSTGRES_USER:$LOCAL_POSTGRES_PASSWORD@127.0.0.1:$LOCAL_POSTGRES_PORT/$LOCAL_POSTGRES_DB}"
 PSY_JWT_SECRET="${LOCAL_STAGING_PSY_JWT_SECRET:-local-staging-secret}"
 L1_RPC_URL="${LOCAL_STAGING_L1_RPC_URL:-http://127.0.0.1:$LOCAL_STAGING_L1_RPC_PORT}"
-L1_DEPLOYMENTS_JSON="${LOCAL_STAGING_L1_DEPLOYMENTS_JSON:-$LOCAL_STAGING_CONTRACTS_DIR/deployments/localhost/deployed-contracts.json}"
+L1_DEPLOYMENTS_JSON="${LOCAL_STAGING_L1_DEPLOYMENTS_JSON:-$LOCAL_STAGING_CONTRACTS_DIR/deployments/$LOCAL_STAGING_L1_DEPLOYMENTS_NETWORK/deployed-contracts.json}"
 
 require_file() {
   local path="$1"
@@ -142,9 +147,20 @@ generate_local_genesis_data() {
     linker_env="CARGO_TARGET_$(printf '%s' "$rust_host" | tr '[:lower:]-' '[:upper:]_')_LINKER"
     rustflags="${rustflags:+$rustflags }-C link-arg=-fuse-ld=$lld_path"
     echo "[local-staging] linking genesis generator with LLD to limit peak memory"
-    env "$linker_env=clang" RUSTFLAGS="$rustflags" cargo "${cargo_args[@]}"
+    env \
+      CARGO_TARGET_DIR="$LOCAL_STAGING_TARGET_DIR" \
+      PSY_GENESIS_OUTPUT_PATH="$GENESIS_PATH" \
+      PSY_PRIVATE_KEYS_OUTPUT_PATH="$PRIVATE_KEYS_PATH" \
+      PSY_FAUCET_OPERATORS_OUTPUT_PATH="$PSY_FAUCET_TEMPLATE_JSON_PATH" \
+      "$linker_env=clang" \
+      RUSTFLAGS="$rustflags" \
+      cargo "${cargo_args[@]}"
   else
-    cargo "${cargo_args[@]}"
+    CARGO_TARGET_DIR="$LOCAL_STAGING_TARGET_DIR" \
+      PSY_GENESIS_OUTPUT_PATH="$GENESIS_PATH" \
+      PSY_PRIVATE_KEYS_OUTPUT_PATH="$PRIVATE_KEYS_PATH" \
+      PSY_FAUCET_OPERATORS_OUTPUT_PATH="$PSY_FAUCET_TEMPLATE_JSON_PATH" \
+      cargo "${cargo_args[@]}"
   fi
 }
 
@@ -425,7 +441,9 @@ start_process() {
   local log_file="$LOG_DIR/$label.log"
   local env_args=(
     "PARTH_HOME=$PARTH_DIR"
+    "PARTH_TARGET_DIR=$LOCAL_STAGING_TARGET_DIR"
     "PSY_SERVICES_HOME=$PSY_SERVICES_HOME"
+    "PSY_SERVICES_TARGET_DIR=$LOCAL_STAGING_PSY_SERVICES_TARGET_DIR"
     "NETWORK=$LOCAL_STAGING_NETWORK"
     "PROVING_BACKEND=$LOCAL_STAGING_PROVING_BACKEND"
     "SCYLLA_DB_URL=127.0.0.1:$LOCAL_SCYLLA_PORT"
@@ -450,9 +468,9 @@ start_process() {
   done
 
   if command -v setsid >/dev/null 2>&1; then
-    env "${env_args[@]}" setsid bash "$PARTH_DIR/deploy/bin/run-parth-service" "$service" >"$log_file" 2>&1 &
+    env "${env_args[@]}" setsid bash "$LOCAL_STAGING_TOOLS_PARTH_DIR/deploy/bin/run-parth-service" "$service" >"$log_file" 2>&1 &
   else
-    env "${env_args[@]}" nohup bash "$PARTH_DIR/deploy/bin/run-parth-service" "$service" >"$log_file" 2>&1 &
+    env "${env_args[@]}" nohup bash "$LOCAL_STAGING_TOOLS_PARTH_DIR/deploy/bin/run-parth-service" "$service" >"$log_file" 2>&1 &
   fi
 
   echo "$!" > "$pid_file"
@@ -745,9 +763,9 @@ main() {
         exit 1
       }
       echo "[local-staging] building psy_user_cli"
-      cargo build --manifest-path "$PARTH_DIR/Cargo.toml" --release --bin psy_user_cli
+      CARGO_TARGET_DIR="$LOCAL_STAGING_TARGET_DIR" cargo build --manifest-path "$PARTH_DIR/Cargo.toml" --release --bin psy_user_cli
     fi
-    require_file "$PARTH_DIR/deploy/bin/run-parth-service"
+    require_file "$LOCAL_STAGING_TOOLS_PARTH_DIR/deploy/bin/run-parth-service"
     require_file "$RPC_CONFIG"
     require_exec "$USER_CLI"
     start_faucet_split_components
@@ -762,23 +780,23 @@ main() {
 
   if [ "$LOCAL_STAGING_BUILD" = "1" ]; then
     echo "[local-staging] building parth release binaries"
-    cargo build --manifest-path "$PARTH_DIR/Cargo.toml" --release --bin psy_node_cli --bin psy_worker_cli --bin psy_user_cli
+    CARGO_TARGET_DIR="$LOCAL_STAGING_TARGET_DIR" cargo build --manifest-path "$PARTH_DIR/Cargo.toml" --release --bin psy_node_cli --bin psy_worker_cli --bin psy_user_cli
     if [ "$LOCAL_STAGING_START_PSY_SERVICES" = "1" ] || [ "$LOCAL_STAGING_START_INDEXERS" = "1" ]; then
       echo "[local-staging] building psy-services release binaries"
-      cargo build --manifest-path "$PSY_SERVICES_HOME/Cargo.toml" --release --bin psy-services --bin psy-indexer
+      CARGO_TARGET_DIR="$LOCAL_STAGING_PSY_SERVICES_TARGET_DIR" cargo build --manifest-path "$PSY_SERVICES_HOME/Cargo.toml" --release --bin psy-services --bin psy-indexer
     fi
   fi
 
-  require_file "$PARTH_DIR/deploy/bin/run-parth-service"
-  require_exec "$PARTH_DIR/target/release/psy_node_cli"
-  require_exec "$PARTH_DIR/target/release/psy_worker_cli"
+  require_file "$LOCAL_STAGING_TOOLS_PARTH_DIR/deploy/bin/run-parth-service"
+  require_exec "$LOCAL_STAGING_TARGET_DIR/release/psy_node_cli"
+  require_exec "$LOCAL_STAGING_TARGET_DIR/release/psy_worker_cli"
   require_exec "$USER_CLI"
 
   if [ "$LOCAL_STAGING_START_PSY_SERVICES" = "1" ] || [ "$LOCAL_STAGING_START_INDEXERS" = "1" ]; then
-    require_exec "$PSY_SERVICES_HOME/target/release/psy-services"
+    require_exec "$LOCAL_STAGING_PSY_SERVICES_TARGET_DIR/release/psy-services"
   fi
   if [ "$LOCAL_STAGING_START_INDEXERS" = "1" ]; then
-    require_exec "$PSY_SERVICES_HOME/target/release/psy-indexer"
+    require_exec "$LOCAL_STAGING_PSY_SERVICES_TARGET_DIR/release/psy-indexer"
   fi
 
   if [ "$LOCAL_STAGING_RESET" = "1" ]; then
@@ -805,11 +823,15 @@ main() {
   fi
 
   echo "[local-staging] starting Docker dependencies"
-  local_staging_compose "$SCRIPT_DIR" up -d
+  local compose_services=(valkey nats scylla postgres nostr)
+  if [ "$LOCAL_STAGING_START_NGINX" = "1" ]; then
+    compose_services+=(nginx)
+  fi
+  local_staging_compose "$SCRIPT_DIR" up -d "${compose_services[@]}"
   local_staging_wait_tcp 127.0.0.1 "$LOCAL_REDIS_PORT" "valkey"
   local_staging_wait_tcp 127.0.0.1 "$LOCAL_NATS_PORT" "nats"
   local_staging_wait_tcp 127.0.0.1 "$LOCAL_SCYLLA_PORT" "scylla"
-  local_staging_wait_scylla_ready parth-local-scylla
+  local_staging_wait_scylla_ready "${LOCAL_STAGING_CONTAINER_PREFIX}-scylla"
   local_staging_wait_tcp 127.0.0.1 "$LOCAL_NOSTR_PORT" "nostr relay"
   local_staging_wait_tcp 127.0.0.1 "$LOCAL_POSTGRES_PORT" "postgres"
   if [ "$LOCAL_STAGING_START_NGINX" = "1" ]; then
@@ -847,7 +869,7 @@ main() {
 
   if [ "$LOCAL_STAGING_START_PSY_SERVICES" = "1" ]; then
     local psy_services_binary_sha256
-    psy_services_binary_sha256="$(sha256sum "$PSY_SERVICES_HOME/target/release/psy-services" | awk '{print $1}')"
+    psy_services_binary_sha256="$(sha256sum "$LOCAL_STAGING_PSY_SERVICES_TARGET_DIR/release/psy-services" | awk '{print $1}')"
     local psy_services_env=(
       "PSY_SERVICES_BINARY_SHA256=$psy_services_binary_sha256" \
       "DATABASE_URL=$DATABASE_URL" \

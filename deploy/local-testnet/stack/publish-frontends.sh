@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PARTH_DIR="${LOCAL_CF_SOURCE_PARTH_DIR:-${PARTH_DIR:-$(cd "$SCRIPT_DIR/../../.." && pwd)}}"
+PARTH_DIR="${LOCAL_STAGING_SOURCE_PARTH_DIR:-${LOCAL_CF_SOURCE_PARTH_DIR:-${PARTH_DIR:-$(cd "$SCRIPT_DIR/../../.." && pwd)}}}"
 
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
@@ -21,6 +21,7 @@ local_staging_source_env_defaults "$SCRIPT_DIR/local.env"
 : "${PSY_WALLET_DIR:=$PARTH_DIR/../psy-wallet}"
 : "${LOCAL_STAGING_ALLOW_PUBLISH_WITH_CF:=0}"
 : "${LOCAL_STAGING_PSY_DAPP_DIR:=$PARTH_DIR/psy-dapp}"
+: "${LOCAL_STAGING_FRONTEND_NETWORK:=localhost}"
 
 NGINX_ROOT="${LOCAL_STAGING_NGINX_ROOT:-$LOCAL_STAGING_STATE_DIR/nginx/html}"
 APP_DIR="$LOCAL_STAGING_PSY_DAPP_DIR/apps/bridge"
@@ -39,7 +40,7 @@ guard_cf_tunnel_publish_profile() {
   if [ "$LOCAL_STAGING_ALLOW_PUBLISH_WITH_CF" = "1" ]; then
     return
   fi
-  local cloudflared_pid_file="$PARTH_DIR/.local-staging/pids/cloudflared.pid"
+  local cloudflared_pid_file="$LOCAL_STAGING_STATE_DIR/pids/cloudflared.pid"
   local cloudflared_pid=""
   if [ -f "$cloudflared_pid_file" ]; then
     cloudflared_pid="$(cat "$cloudflared_pid_file" 2>/dev/null || true)"
@@ -80,7 +81,7 @@ build_frontend() {
       exit 1
     fi
     echo "[local-staging] building $label"
-    (cd "$dir" && PSY_SKIP_CONFIG_SYNC=1 VITE_NETWORK=localhost pnpm run build)
+    (cd "$dir" && PSY_SKIP_CONFIG_SYNC=1 VITE_NETWORK="$LOCAL_STAGING_FRONTEND_NETWORK" pnpm run build)
   fi
 
   [ -d "$dir/dist" ] || {
@@ -113,7 +114,7 @@ publish_wallet_downloads() {
       exit 1
     fi
     echo "[local-staging] building wallet package ($LOCAL_STAGING_WALLET_BUILD_SCRIPT)"
-    (cd "$PSY_WALLET_DIR" && VITE_NETWORK=localhost pnpm "$LOCAL_STAGING_WALLET_BUILD_SCRIPT")
+    (cd "$PSY_WALLET_DIR" && VITE_NETWORK="$LOCAL_STAGING_FRONTEND_NETWORK" pnpm "$LOCAL_STAGING_WALLET_BUILD_SCRIPT")
   fi
 
   if [ -d "$PSY_WALLET_DIR/$LOCAL_STAGING_WALLET_RELEASE_DIR" ]; then

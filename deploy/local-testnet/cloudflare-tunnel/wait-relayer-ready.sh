@@ -7,9 +7,9 @@ source "$SCRIPT_DIR/lib.sh"
 
 [ "${LOCAL_CF_START_RELAYER:-1}" = "1" ] || exit 0
 
-pid_file="$PARTH_DIR/.local-staging/pids/bridge-relayer.pid"
-state_file="${LOCAL_STAGING_RELAYER_PROOF_DIR:-$PARTH_DIR/.local-staging/bridge-relayer}/daemon_state.toml"
-log_file="$PARTH_DIR/.local-staging/logs/bridge-relayer.log"
+pid_file="$LOCAL_STAGING_STATE_DIR/pids/bridge-relayer.pid"
+state_file="${LOCAL_STAGING_RELAYER_PROOF_DIR:-$LOCAL_STAGING_STATE_DIR/bridge-relayer}/daemon_state.toml"
+log_file="$LOCAL_STAGING_STATE_DIR/logs/bridge-relayer.log"
 timeout_secs="${LOCAL_STAGING_RELAYER_READY_TIMEOUT_SECS:-14400}"
 poll_secs="${LOCAL_STAGING_RELAYER_READY_POLL_SECS:-5}"
 max_checkpoint_batch="${LOCAL_STAGING_RELAYER_MAX_CHECKPOINT_BATCH:-32}"

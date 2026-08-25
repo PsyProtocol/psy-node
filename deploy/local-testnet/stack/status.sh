@@ -2,7 +2,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PARTH_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+LOCAL_STAGING_TOOLS_PARTH_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+PARTH_DIR="${LOCAL_STAGING_SOURCE_PARTH_DIR:-$LOCAL_STAGING_TOOLS_PARTH_DIR}"
 
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
@@ -21,6 +22,7 @@ local_staging_source_env_defaults "$SCRIPT_DIR/local.env"
 : "${LOCAL_STAGING_EXPLORER_PORT:=8089}"
 : "${LOCAL_STAGING_IDE_PORT:=8090}"
 : "${LOCAL_NOSTR_PORT:=8081}"
+: "${LOCAL_STAGING_START_NGINX:=1}"
 
 PID_DIR="$LOCAL_STAGING_STATE_DIR/pids"
 LOG_DIR="$LOCAL_STAGING_STATE_DIR/logs"
@@ -132,12 +134,16 @@ print_endpoint_status() {
     echo "failed"
   fi
 
-  printf '%-18s http://127.0.0.1:%s ' "app" "$LOCAL_STAGING_APP_PORT"
-  if curl -fsS --max-time 5 "http://127.0.0.1:$LOCAL_STAGING_APP_PORT/" >/dev/null 2>&1; then echo "ok"; else echo "failed"; fi
-  printf '%-18s http://127.0.0.1:%s ' "explorer" "$LOCAL_STAGING_EXPLORER_PORT"
-  if curl -fsS --max-time 5 "http://127.0.0.1:$LOCAL_STAGING_EXPLORER_PORT/" >/dev/null 2>&1; then echo "ok"; else echo "failed"; fi
-  printf '%-18s http://127.0.0.1:%s ' "ide" "$LOCAL_STAGING_IDE_PORT"
-  if curl -fsS --max-time 5 "http://127.0.0.1:$LOCAL_STAGING_IDE_PORT/" >/dev/null 2>&1; then echo "ok"; else echo "failed"; fi
+  if [ "$LOCAL_STAGING_START_NGINX" = "1" ]; then
+    printf '%-18s http://127.0.0.1:%s ' "app" "$LOCAL_STAGING_APP_PORT"
+    if curl -fsS --max-time 5 "http://127.0.0.1:$LOCAL_STAGING_APP_PORT/" >/dev/null 2>&1; then echo "ok"; else echo "failed"; fi
+    printf '%-18s http://127.0.0.1:%s ' "explorer" "$LOCAL_STAGING_EXPLORER_PORT"
+    if curl -fsS --max-time 5 "http://127.0.0.1:$LOCAL_STAGING_EXPLORER_PORT/" >/dev/null 2>&1; then echo "ok"; else echo "failed"; fi
+    printf '%-18s http://127.0.0.1:%s ' "ide" "$LOCAL_STAGING_IDE_PORT"
+    if curl -fsS --max-time 5 "http://127.0.0.1:$LOCAL_STAGING_IDE_PORT/" >/dev/null 2>&1; then echo "ok"; else echo "failed"; fi
+  else
+    echo "frontends          disabled"
+  fi
 }
 
 print_docker_status() {

@@ -12,14 +12,16 @@ service="${1:?service name is required}"
 : "${GENESIS_DATA_PATH:=$PARTH_HOME/genesis.json}"
 : "${CHECKPOINT_BACKUP_PATH:=/var/lib/parth/checkpoints}"
 : "${VERBOSE:=1}"
+: "${PARTH_TARGET_DIR:=$PARTH_HOME/target}"
 
-node_bin="$PARTH_HOME/target/release/psy_node_cli"
-worker_bin="$PARTH_HOME/target/release/psy_worker_cli"
-user_bin="$PARTH_HOME/target/release/psy_user_cli"
-relayer_bin="$PARTH_HOME/target/release/psy_relayer_cli"
+node_bin="$PARTH_TARGET_DIR/release/psy_node_cli"
+worker_bin="$PARTH_TARGET_DIR/release/psy_worker_cli"
+user_bin="$PARTH_TARGET_DIR/release/psy_user_cli"
+relayer_bin="$PARTH_TARGET_DIR/release/psy_relayer_cli"
 psy_services_home="${PSY_SERVICES_HOME:-$PARTH_HOME/../psy-services}"
-psy_services_bin="$psy_services_home/target/release/psy-services"
-psy_indexer_bin="$psy_services_home/target/release/psy-indexer"
+psy_services_target_dir="${PSY_SERVICES_TARGET_DIR:-$psy_services_home/target}"
+psy_services_bin="$psy_services_target_dir/release/psy-services"
+psy_indexer_bin="$psy_services_target_dir/release/psy-indexer"
 
 require_file() {
   if [ ! -f "$1" ]; then

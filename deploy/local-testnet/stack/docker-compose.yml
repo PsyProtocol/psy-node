@@ -1,7 +1,7 @@
 services:
   valkey:
     image: "${LOCAL_REDIS_IMAGE:-redis:7.4}"
-    container_name: parth-local-valkey
+    container_name: "${LOCAL_STAGING_CONTAINER_PREFIX:-parth-local}-valkey"
     command:
       - "${LOCAL_REDIS_SERVER_BIN:-redis-server}"
       - --dir
@@ -21,7 +21,7 @@ services:
 
   nats:
     image: nats:2.10
-    container_name: parth-local-nats
+    container_name: "${LOCAL_STAGING_CONTAINER_PREFIX:-parth-local}-nats"
     command:
       - -js
       - -sd
@@ -33,7 +33,7 @@ services:
 
   scylla:
     image: "scylladb/scylla:${LOCAL_SCYLLA_IMAGE_TAG:-latest}"
-    container_name: parth-local-scylla
+    container_name: "${LOCAL_STAGING_CONTAINER_PREFIX:-parth-local}-scylla"
     command:
       - --smp
       - "${LOCAL_SCYLLA_SMP:-2}"
@@ -53,7 +53,7 @@ services:
 
   postgres:
     image: postgres:16
-    container_name: parth-local-postgres
+    container_name: "${LOCAL_STAGING_CONTAINER_PREFIX:-parth-local}-postgres"
     environment:
       POSTGRES_USER: "${LOCAL_POSTGRES_USER:-postgres}"
       POSTGRES_PASSWORD: "${LOCAL_POSTGRES_PASSWORD:-postgres}"
@@ -72,7 +72,7 @@ services:
 
   nostr:
     image: "${LOCAL_NOSTR_IMAGE:-scsibug/nostr-rs-relay:latest}"
-    container_name: parth-local-nostr
+    container_name: "${LOCAL_STAGING_CONTAINER_PREFIX:-parth-local}-nostr"
     ports:
       - "127.0.0.1:${LOCAL_NOSTR_PORT:-8081}:8081"
     volumes:
@@ -81,7 +81,7 @@ services:
 
   nginx:
     image: nginx:1.27-alpine
-    container_name: parth-local-nginx
+    container_name: "${LOCAL_STAGING_CONTAINER_PREFIX:-parth-local}-nginx"
     depends_on:
       - valkey
       - nats
