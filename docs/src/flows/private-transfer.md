@@ -61,7 +61,7 @@ psy_user_cli private-transfer \
   --contract-id <token_contract_id> \
   --amount <amount> \
   --receiver <receiver_note_owner_hash> \
-  --note-root-slot 8388609 \
+  --note-root-slot 2147483649 \
   --output <output_file>
 ```
 
