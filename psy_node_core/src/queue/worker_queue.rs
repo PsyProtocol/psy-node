@@ -2,9 +2,12 @@ use async_trait::async_trait;
 use parth_core::{data::queue::queue_key::PCoreStandardQueueKeyForRealm, QCoreProcCheckpointUniqueId};
 use super::infrastructure::QStandardQueueBase;
 
+pub trait QStandardWorkerQueue: QStandardQueueBase {
+    type PublishBarrier: std::fmt::Debug + Send + Sync;
+}
 
 #[async_trait]
-pub trait QStandardWorkerQueuePublisher: QStandardQueueBase {
+pub trait QStandardWorkerQueuePublisher: QStandardWorkerQueue {
     async fn publish_worker_queue_item_ref<QK: PCoreStandardQueueKeyForRealm>(
         &self,
         queue_key: &QK,
@@ -13,7 +16,7 @@ pub trait QStandardWorkerQueuePublisher: QStandardQueueBase {
         unique_id: QCoreProcCheckpointUniqueId,
         task_group: u32,
         item: &QK::QueueItem,
-    ) -> anyhow::Result<()>;
+    ) -> anyhow::Result<Self::PublishBarrier>;
     async fn publish_many_worker_queue_items_ref<QK: PCoreStandardQueueKeyForRealm>(
         &self,
         queue_key: &QK,
@@ -22,7 +25,7 @@ pub trait QStandardWorkerQueuePublisher: QStandardQueueBase {
         unique_id: QCoreProcCheckpointUniqueId,
         task_group: u32,
         items: &[&QK::QueueItem],
-    ) -> anyhow::Result<()>;
+    ) -> anyhow::Result<Self::PublishBarrier>;
     async fn publish_worker_queue_item_owned<QK: PCoreStandardQueueKeyForRealm>(
         &self,
         queue_key: &QK,
@@ -31,7 +34,7 @@ pub trait QStandardWorkerQueuePublisher: QStandardQueueBase {
         unique_id: QCoreProcCheckpointUniqueId,
         task_group: u32,
         item: QK::QueueItem,
-    ) -> anyhow::Result<()>;
+    ) -> anyhow::Result<Self::PublishBarrier>;
     async fn publish_many_worker_queue_items_owned<QK: PCoreStandardQueueKeyForRealm>(
         &self,
         queue_key: &QK,
@@ -40,7 +43,7 @@ pub trait QStandardWorkerQueuePublisher: QStandardQueueBase {
         unique_id: QCoreProcCheckpointUniqueId,
         task_group: u32,
         items: Vec<QK::QueueItem>,
-    ) -> anyhow::Result<()>;
+    ) -> anyhow::Result<Self::PublishBarrier>;
     async fn publish_many_worker_queue_items<QK: PCoreStandardQueueKeyForRealm>(
         &self,
         queue_key: &QK,
@@ -49,11 +52,11 @@ pub trait QStandardWorkerQueuePublisher: QStandardQueueBase {
         unique_id: QCoreProcCheckpointUniqueId,
         task_group: u32,
         items: &[QK::QueueItem],
-    ) -> anyhow::Result<()>;
+    ) -> anyhow::Result<Self::PublishBarrier>;
 }
 
 #[async_trait]
-pub trait QStandardWorkerQueueSubscriber: QStandardQueueBase {
+pub trait QStandardWorkerQueueSubscriber: QStandardWorkerQueue {
     async fn wait_for_worker_queue_item<QK: PCoreStandardQueueKeyForRealm>(
         &self,
         queue_key: &QK,
@@ -87,6 +90,7 @@ pub trait QStandardWorkerQueueSubscriber: QStandardQueueBase {
         realm_sub_id: u64,
         unique_topic: u128,
         task_group: u32,
+        barrier: &Self::PublishBarrier,
         timeout_ms: u64,
     ) -> anyhow::Result<()>;
 

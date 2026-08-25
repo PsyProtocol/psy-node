@@ -34,6 +34,7 @@ where
 async fn publish_wait_for_queue_and_job_ready<
     Proof,
     Reward,
+    Barrier,
     Publish,
     PublishFuture,
     WaitForQueue,
@@ -52,16 +53,16 @@ async fn publish_wait_for_queue_and_job_ready<
 ) -> anyhow::Result<(Proof, Reward)>
 where
     Publish: FnOnce() -> PublishFuture,
-    PublishFuture: Future<Output = anyhow::Result<()>>,
-    WaitForQueue: FnOnce() -> WaitForQueueFuture,
+    PublishFuture: Future<Output = anyhow::Result<Barrier>>,
+    WaitForQueue: FnOnce(Barrier) -> WaitForQueueFuture,
     WaitForQueueFuture: Future<Output = anyhow::Result<()>>,
     FetchProof: FnMut() -> FetchProofFuture,
     FetchProofFuture: Future<Output = anyhow::Result<Option<Proof>>>,
     FetchReward: FnMut() -> FetchRewardFuture,
     FetchRewardFuture: Future<Output = anyhow::Result<Option<Reward>>>,
 {
-    publish().await?;
-    wait_for_queue().await?;
+    let barrier = publish().await?;
+    wait_for_queue(barrier).await?;
     wait_for_job_ready(
         max_wait_ms,
         timeout_message,
@@ -94,7 +95,7 @@ use psy_node_core::{
     psy_temp_db::StandardProcessorTempDBStoreBase,
     queue::{
         ephemeral::QStandardEphemeralQueueSubscriber,
-        worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
+        worker_queue::{QStandardWorkerQueue, QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
     },
     store::traits::proof_store::QParthProofStore,
 };
@@ -144,10 +145,22 @@ impl<
         queue_key: &CoordinatorProvingWorkQueueKey<N::QHash, N::JobId>,
         level: usize,
         jobs: &[Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>],
-    ) -> anyhow::Result<()> {
-        if level < jobs.len() {
-            println!("Publishing {} jobs at level {}", jobs[level].len(), level);
-            self.db
+    ) -> anyhow::Result<Option<<ProofWorkQueue as QStandardWorkerQueue>::PublishBarrier>> {
+        if level < jobs.len() && !jobs[level].is_empty() {
+            let expected_root_job_id = jobs.last().and_then(|level| level.first()).map(|job| job.job_id);
+            tracing::info!(
+                realm_id = self.db.ids.realm_id_u64,
+                realm_sub_id = self.db.ids.realm_sub_id_u64,
+                checkpoint_id = self.db.ids.next_checkpoint_id,
+                unique_pending_id = self.db.ids.unique_pending_id,
+                proc_checkpoint_unique_id = self.db.ids.proc_checkpoint_unique_id,
+                task_group = 0,
+                level,
+                job_count = jobs[level].len(),
+                root_job_id = ?expected_root_job_id,
+                "Publishing Coordinator worker jobs"
+            );
+            let barrier = self.db
                 .proof_work_queue
                 .publish_many_worker_queue_items(
                     queue_key,
@@ -158,8 +171,22 @@ impl<
                     &jobs[level],
                 )
                 .await?;
+            tracing::info!(
+                realm_id = self.db.ids.realm_id_u64,
+                realm_sub_id = self.db.ids.realm_sub_id_u64,
+                checkpoint_id = self.db.ids.next_checkpoint_id,
+                unique_pending_id = self.db.ids.unique_pending_id,
+                proc_checkpoint_unique_id = self.db.ids.proc_checkpoint_unique_id,
+                task_group = 0,
+                level,
+                job_count = jobs[level].len(),
+                root_job_id = ?expected_root_job_id,
+                publish_barrier = ?barrier,
+                "Coordinator worker publication acknowledged"
+            );
+            return Ok(Some(barrier));
         }
-        Ok(())
+        Ok(None)
     }
     pub fn get_root_job_ids(
         &self,
@@ -215,7 +242,7 @@ impl<
         min_level: Option<usize>,
         max_level: Option<usize>,
         wait_for_jobs_completion: bool,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<<ProofWorkQueue as QStandardWorkerQueue>::PublishBarrier>> {
         let queue_key = self.db.get_proof_worker_queue_key();
         let max_level = guta_jobs
             .len()
@@ -225,35 +252,31 @@ impl<
             .min(max_level.unwrap_or(usize::MAX));
         let min_level = min_level.unwrap_or(0).min(max_level);
 
+        let mut published_barriers = Vec::new();
         for i in min_level..max_level {
             proving_state.set_current_proving_level(i as u8);
             self.db.temp_db.set_psy_node_proving_state(&self.db.ids.realm_identifier, &proving_state).await?;
-            tokio::try_join!(
+            let (guta_barrier, register_user_barrier, deploy_contract_barrier, update_contract_barrier) = tokio::try_join!(
                 self.publish_worker_jobs_if_exists(&queue_key, i, guta_jobs),
                 self.publish_worker_jobs_if_exists(&queue_key, i, register_user_jobs),
                 self.publish_worker_jobs_if_exists(&queue_key, i, deploy_contract_jobs),
                 self.publish_worker_jobs_if_exists(&queue_key, i, update_contract_jobs),
             )?;
+            let level_barriers = [guta_barrier, register_user_barrier, deploy_contract_barrier, update_contract_barrier]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
             if wait_for_jobs_completion {
-                self.db
-                    .proof_work_queue
-                    .wait_until_all_jobs_complete_or_timeout_worker(
-                        &queue_key,
-                        self.db.ids.realm_id_u64,
-                        self.db.ids.realm_sub_id_u64,
-                        self.db.ids.proc_checkpoint_unique_id,
-                        0,
-                        self.proof_worker_queue_max_time_ms,
-                    )
-                    .await?;
+                self.wait_for_jobs_completion(&level_barriers).await?;
                 self.wait_for_level_proofs(
                     i,
                     [guta_jobs, register_user_jobs, deploy_contract_jobs, update_contract_jobs],
                 )
                 .await?;
             }
+            published_barriers.extend(level_barriers);
         }
-        Ok(())
+        Ok(published_barriers)
     }
 
     async fn wait_for_level_proofs(
@@ -303,19 +326,23 @@ impl<
         }
     }
 
-    pub async fn wait_for_jobs_completion(&self) -> anyhow::Result<()> {
+    pub async fn wait_for_jobs_completion(
+        &self,
+        barriers: &[<ProofWorkQueue as QStandardWorkerQueue>::PublishBarrier],
+    ) -> anyhow::Result<()> {
         let queue_key = self.db.get_proof_worker_queue_key();
-        self.db
-            .proof_work_queue
-            .wait_until_all_jobs_complete_or_timeout_worker(
+        for barrier in barriers {
+            self.db.proof_work_queue.wait_until_all_jobs_complete_or_timeout_worker(
                 &queue_key,
                 self.db.ids.realm_id_u64,
                 self.db.ids.realm_sub_id_u64,
                 self.db.ids.proc_checkpoint_unique_id,
                 0,
+                barrier,
                 self.proof_worker_queue_max_time_ms,
             )
             .await?;
+        }
         Ok(())
     }
     pub async fn publish_and_wait_for_job_ready(
@@ -328,32 +355,48 @@ impl<
         println!("self.db.ids.proc_checkpoint_unique_id: {:?}", self.db.ids.proc_checkpoint_unique_id);
         let output_job_id = job.job_id.get_output_id();
         let unique_pending_id = self.db.ids.unique_pending_id;
-        let (proof_bytes, reward_value) = publish_wait_for_queue_and_job_ready(
+        let barrier = self
+            .db
+            .proof_work_queue
+            .publish_worker_queue_item_ref(
+                &queue_key,
+                self.db.ids.realm_id_u64,
+                self.db.ids.realm_sub_id_u64,
+                self.db.ids.proc_checkpoint_unique_id,
+                0,
+                job,
+            )
+            .await?;
+        tracing::info!(
+            realm_id = self.db.ids.realm_id_u64,
+            realm_sub_id = self.db.ids.realm_sub_id_u64,
+            checkpoint_id = self.db.ids.next_checkpoint_id,
+            unique_pending_id,
+            proc_checkpoint_unique_id = self.db.ids.proc_checkpoint_unique_id,
+            task_group = 0,
+            root_job_id = ?job.job_id,
+            publish_barrier = ?barrier,
+            %job_context,
+            "Coordinator root worker publication acknowledged"
+        );
+        self.db
+            .proof_work_queue
+            .wait_until_all_jobs_complete_or_timeout_worker(
+                &queue_key,
+                self.db.ids.realm_id_u64,
+                self.db.ids.realm_sub_id_u64,
+                self.db.ids.proc_checkpoint_unique_id,
+                0,
+                &barrier,
+                self.proof_worker_queue_max_time_ms,
+            )
+            .await?;
+        let (proof_bytes, reward_value) = wait_for_job_ready(
             self.proof_worker_queue_max_time_ms,
             format!(
                 "Timed out waiting for persisted proof and reward tree value for {} {:?} at realm {:?}, unique_pending_id {}",
                 job_context, output_job_id, self.db.ids.realm_identifier, unique_pending_id,
             ),
-            || {
-                self.db.proof_work_queue.publish_worker_queue_item_ref(
-                    &queue_key,
-                    self.db.ids.realm_id_u64,
-                    self.db.ids.realm_sub_id_u64,
-                    self.db.ids.proc_checkpoint_unique_id,
-                    0,
-                    job,
-                )
-            },
-            || {
-                self.db.proof_work_queue.wait_until_all_jobs_complete_or_timeout_worker(
-                    &queue_key,
-                    self.db.ids.realm_id_u64,
-                    self.db.ids.realm_sub_id_u64,
-                    self.db.ids.proc_checkpoint_unique_id,
-                    0,
-                    self.proof_worker_queue_max_time_ms,
-                )
-            },
             || self.db.proof_store.get_proof_bytes_by_job_id(output_job_id, unique_pending_id),
             || {
                 self.db.temp_db.get_proof_miner_rewards_tree_value_or_none(
@@ -527,7 +570,9 @@ impl<
         tracing::info!("Finalized coordinator block state updates.");
         Ok((output, checkpoint_zk_proof))
     }
-    pub async fn plan_genesis_checkpoint_state_transition_proof(&self) -> anyhow::Result<()> {
+    pub async fn plan_genesis_checkpoint_state_transition_proof(
+        &self,
+    ) -> anyhow::Result<<ProofWorkQueue as QStandardWorkerQueue>::PublishBarrier> {
         let genesis_fingerprint = self.db.circuit_fingerprint_config.genesis_checkpoint_state_transition_fingerprint;
         let witness = PsyCheckpointStateTransitionGenesisCircuitInput::<N::QHash> {
             checkpoint_tree_root: self.db.last_committed.checkpoint_state_transition.new_checkpoint_tree_root,
@@ -552,7 +597,7 @@ impl<
             .temp_db
             .set_tdb_proof_witnesses_tuple_owned_raw(&self.db.ids.realm_identifier, self.db.ids.unique_pending_id, vec![(job_id, witness_data)])
             .await?;
-        self.db
+        let barrier = self.db
             .proof_work_queue
             .publish_worker_queue_item_ref(
                 &self.db.get_proof_worker_queue_key(),
@@ -564,7 +609,7 @@ impl<
             )
             .await?;
 
-        Ok(())
+        Ok(barrier)
     }
 
     pub async fn process_block(&mut self) -> anyhow::Result<()> {
@@ -588,7 +633,7 @@ impl<
 
 
         // publish the first level of jobs
-        self.publish_jobs(
+        let mut first_level_barriers = self.publish_jobs(
             &mut proving_state,
             &guta_jobs,
             &register_user_jobs,
@@ -601,7 +646,7 @@ impl<
         .await?;
         timer.lap("publish_jobs_first_level");
         if self.db.ids.checkpoint_id == 0 {
-            self.plan_genesis_checkpoint_state_transition_proof().await?;
+            first_level_barriers.push(self.plan_genesis_checkpoint_state_transition_proof().await?);
             timer.lap("plan_genesis_checkpoint_state_transition_proof");
         }
 
@@ -610,12 +655,17 @@ impl<
         timer.lap("plan_agg_guta_register_users_deploy_contracts_job");
         tracing::info!("Waiting for first level of jobs to complete...");
         // wait for the first level of jobs to finish
-        self.wait_for_jobs_completion().await?;
+        self.wait_for_jobs_completion(&first_level_barriers).await?;
+        self.wait_for_level_proofs(
+            0,
+            [&guta_jobs, &register_user_jobs, &deploy_contract_jobs, &update_contract_jobs],
+        )
+        .await?;
         timer.lap("wait_for_jobs_completion_first_level");
         tracing::info!("First level of jobs completed!");
 
         // publish the rest of the jobs and wait for them to finish
-        self.publish_jobs(
+        let _published_barriers = self.publish_jobs(
             &mut proving_state,
             &guta_jobs,
             &register_user_jobs,
@@ -727,9 +777,10 @@ mod tests {
             "job proof and reward were not persisted".to_string(),
             move || async move {
                 assert_eq!(publish_phase.swap(1, Ordering::SeqCst), 0);
-                Ok(())
+                Ok(17_u64)
             },
-            move || async move {
+            move |barrier| async move {
+                assert_eq!(barrier, 17);
                 assert_eq!(barrier_phase.swap(2, Ordering::SeqCst), 1);
                 Ok(())
             },

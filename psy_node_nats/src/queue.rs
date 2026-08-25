@@ -22,7 +22,7 @@ use parth_core::{
 use psy_node_core::queue::{
     infrastructure::QStandardQueueBase,
     ephemeral::{QStandardEphemeralQueuePublisher, QStandardEphemeralQueueSubscriber},
-    worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
+    worker_queue::{QStandardWorkerQueue, QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -30,6 +30,74 @@ pub enum JetStreamAckMode {
     AckEach = 0,
     NoAck = 1,
     AckBatchLast = 2,
+}
+
+fn worker_queue_completion_reached(
+    num_pending: u64,
+    num_ack_pending: usize,
+    delivered_stream_sequence: u64,
+    ack_floor_stream_sequence: u64,
+    required_ack_stream_sequence: u64,
+) -> bool {
+    num_pending == 0
+        && num_ack_pending == 0
+        && delivered_stream_sequence >= required_ack_stream_sequence
+        && ack_floor_stream_sequence >= required_ack_stream_sequence
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NatsWorkerQueuePublishBarrier {
+    min_stream_sequence: Option<u64>,
+    max_stream_sequence: Option<u64>,
+    message_count: usize,
+}
+
+impl NatsWorkerQueuePublishBarrier {
+    fn record_ack(&mut self, stream_sequence: u64) {
+        self.min_stream_sequence = Some(
+            self.min_stream_sequence
+                .map_or(stream_sequence, |current| current.min(stream_sequence)),
+        );
+        self.max_stream_sequence = Some(
+            self.max_stream_sequence
+                .map_or(stream_sequence, |current| current.max(stream_sequence)),
+        );
+        self.message_count += 1;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.message_count == 0
+    }
+
+    fn required_ack_stream_sequence(&self) -> Option<u64> {
+        self.max_stream_sequence
+    }
+
+    pub fn message_count(&self) -> usize {
+        self.message_count
+    }
+
+    pub fn max_stream_sequence(&self) -> Option<u64> {
+        self.max_stream_sequence
+    }
+}
+
+fn consumer_missing_with_barrier(
+    subject: &str,
+    durable_name: &str,
+    barrier: &NatsWorkerQueuePublishBarrier,
+) -> anyhow::Result<()> {
+    if barrier.is_empty() {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "Worker consumer missing before publication barrier completed: subject={}, durable_name={}, publish_max_stream_sequence={:?}, message_count={}",
+        subject,
+        durable_name,
+        barrier.max_stream_sequence,
+        barrier.message_count,
+    )
 }
 pub struct NatsJetStreamClient {
     pub base_namespace: String,
@@ -336,6 +404,38 @@ impl NatsJetStreamClient {
             .publish(subject.to_string(), Bytes::copy_from_slice(&data.encode_queue_item_vec()?))
             .await?;
         Ok(())
+    }
+
+    async fn publish_worker_payloads(
+        &self,
+        subject: &str,
+        payloads: Vec<Bytes>,
+    ) -> anyhow::Result<NatsWorkerQueuePublishBarrier> {
+        const BATCH_SIZE: usize = 1000;
+
+        let started_at = Instant::now();
+        let mut barrier = NatsWorkerQueuePublishBarrier::default();
+        for chunk in payloads.chunks(BATCH_SIZE) {
+            let publish_futures = chunk.iter().map(|payload| {
+                self.jetstream
+                    .publish(subject.to_string(), payload.clone())
+            });
+            let ack_futures = try_join_all(publish_futures).await?;
+            for ack_future in ack_futures {
+                let ack = ack_future.await?;
+                barrier.record_ack(ack.sequence);
+            }
+        }
+
+        tracing::info!(
+            subject,
+            job_count = barrier.message_count,
+            publish_min_stream_sequence = ?barrier.min_stream_sequence,
+            publish_max_stream_sequence = ?barrier.max_stream_sequence,
+            elapsed_ms = started_at.elapsed().as_millis(),
+            "Worker queue publication acknowledged"
+        );
+        Ok(barrier)
     }
     pub async fn dump_queue_dq_qi_batch<QK: PCoreStandardQueueKeyForRealm>(
         &self,
@@ -660,10 +760,26 @@ impl NatsJetStreamClient {
         &self,
         subject: &str,
         durable_name: &str,
-        queue_type: QPBaseQueueType,
+        _queue_type: QPBaseQueueType,
+        barrier: &NatsWorkerQueuePublishBarrier,
         timeout_ms: u64,
     ) -> anyhow::Result<()> {
-        println!("waiting until all jobs complete for subject: {}, durable_name: {}", subject, durable_name);
+        if barrier.is_empty() {
+            tracing::debug!(subject, durable_name, "Empty worker publication barrier completed immediately");
+            return Ok(());
+        }
+
+        let required_ack_stream_sequence = barrier
+            .required_ack_stream_sequence()
+            .expect("non-empty publication barrier must have a maximum stream sequence");
+        tracing::info!(
+            subject,
+            durable_name,
+            publish_min_stream_sequence = ?barrier.min_stream_sequence,
+            publish_max_stream_sequence = required_ack_stream_sequence,
+            job_count = barrier.message_count,
+            "Waiting for worker publication barrier"
+        );
         let start = Instant::now();
         let max_wait: Duration = Duration::from_millis(timeout_ms);
 
@@ -672,7 +788,7 @@ impl NatsJetStreamClient {
                 Ok(c) => c,
                 Err(e) if Self::is_consumer_not_found_error(&e) => {
                     self.invalidate_consumer_cache(durable_name).await;
-                    return Ok(());
+                    return consumer_missing_with_barrier(subject, durable_name, barrier);
                 }
                 Err(e) => {
                     tracing::error!("Failed to get consumer: {}", e);
@@ -683,15 +799,31 @@ impl NatsJetStreamClient {
                 Ok(i) => i,
                 Err(e) if Self::is_consumer_not_found_error(&e) => {
                     self.invalidate_consumer_cache(durable_name).await;
-                    return Ok(());
+                    return consumer_missing_with_barrier(subject, durable_name, barrier);
                 }
                 Err(e) => {
                     tracing::error!("Failed to get consumer info: {}", e);
                     anyhow::bail!("Failed to get consumer info for subject: {}, durable_name: {} {:?}", subject, durable_name,e );
                 }
             };
-            if info.num_pending == 0 && info.num_ack_pending == 0 && info.ack_floor.stream_sequence == info.delivered.stream_sequence {
-                println!("all jobs complete for subject: {}, durable_name: {}", subject, durable_name);
+            if worker_queue_completion_reached(
+                info.num_pending,
+                info.num_ack_pending,
+                info.delivered.stream_sequence,
+                info.ack_floor.stream_sequence,
+                required_ack_stream_sequence,
+            ) {
+                tracing::info!(
+                    subject,
+                    durable_name,
+                    publish_max_stream_sequence = required_ack_stream_sequence,
+                    consumer_delivered_stream_sequence = info.delivered.stream_sequence,
+                    consumer_ack_floor_stream_sequence = info.ack_floor.stream_sequence,
+                    num_pending = info.num_pending,
+                    num_ack_pending = info.num_ack_pending,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "Worker publication barrier completed"
+                );
                 return Ok(());
             }else{
                 tracing::trace!(
@@ -709,6 +841,56 @@ impl NatsJetStreamClient {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        consumer_missing_with_barrier, worker_queue_completion_reached,
+        NatsWorkerQueuePublishBarrier,
+    };
+
+    fn barrier_with_sequences(sequences: &[u64]) -> NatsWorkerQueuePublishBarrier {
+        let mut barrier = NatsWorkerQueuePublishBarrier::default();
+        for sequence in sequences {
+            barrier.record_ack(*sequence);
+        }
+        barrier
+    }
+
+    #[test]
+    fn previous_idle_consumer_does_not_complete_current_publication() {
+        assert!(!worker_queue_completion_reached(0, 0, 551, 551, 552));
+    }
+
+    #[test]
+    fn delivered_to_barrier_without_ack_does_not_complete() {
+        assert!(!worker_queue_completion_reached(0, 1, 552, 551, 552));
+    }
+
+    #[test]
+    fn ack_floor_at_barrier_completes_transport_wait() {
+        assert!(worker_queue_completion_reached(0, 0, 552, 552, 552));
+    }
+
+    #[test]
+    fn pending_messages_keep_barrier_open() {
+        assert!(!worker_queue_completion_reached(1, 0, 552, 552, 552));
+    }
+
+    #[test]
+    fn consumer_missing_with_valid_barrier_is_an_error() {
+        let barrier = barrier_with_sequences(&[552]);
+        assert!(consumer_missing_with_barrier("jobs", "worker", &barrier).is_err());
+    }
+
+    #[test]
+    fn publication_barrier_uses_maximum_publish_ack_sequence() {
+        let barrier = barrier_with_sequences(&[553, 552, 555, 554]);
+        assert_eq!(barrier.min_stream_sequence, Some(552));
+        assert_eq!(barrier.max_stream_sequence, Some(555));
+        assert_eq!(barrier.message_count, 4);
     }
 }
 
@@ -1128,6 +1310,10 @@ impl QStandardEphemeralQueueSubscriber for NatsJetStreamClient {
 
 }
 
+impl QStandardWorkerQueue for NatsJetStreamClient {
+    type PublishBarrier = NatsWorkerQueuePublishBarrier;
+}
+
 #[async_trait]
 impl QStandardWorkerQueuePublisher for NatsJetStreamClient {
     async fn publish_worker_queue_item_ref<QK: PCoreStandardQueueKeyForRealm>(
@@ -1138,10 +1324,11 @@ impl QStandardWorkerQueuePublisher for NatsJetStreamClient {
         unique_id: QCoreProcCheckpointUniqueId,
         task_group: u32,
         item: &QK::QueueItem,
-    ) -> anyhow::Result<()> {
-        self.push_message_dq_qi_ref(
-            &queue_key.get_queue_subject(&self.base_namespace, realm_id, realm_sub_id, unique_id, task_group),
-            item,
+    ) -> anyhow::Result<Self::PublishBarrier> {
+        let subject = queue_key.get_queue_subject(&self.base_namespace, realm_id, realm_sub_id, unique_id, task_group);
+        self.publish_worker_payloads(
+            &subject,
+            vec![Bytes::from(item.encode_queue_item_vec()?)],
         )
         .await
     }
@@ -1153,12 +1340,13 @@ impl QStandardWorkerQueuePublisher for NatsJetStreamClient {
         unique_id: QCoreProcCheckpointUniqueId,
         task_group: u32,
         items: &[&QK::QueueItem],
-    ) -> anyhow::Result<()> {
-        self.push_messages_dq_qi_ref(
-            &queue_key.get_queue_subject(&self.base_namespace, realm_id, realm_sub_id, unique_id, task_group),
-            items,
-        )
-        .await
+    ) -> anyhow::Result<Self::PublishBarrier> {
+        let subject = queue_key.get_queue_subject(&self.base_namespace, realm_id, realm_sub_id, unique_id, task_group);
+        let payloads = items
+            .iter()
+            .map(|item| item.encode_queue_item_vec().map(Bytes::from))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        self.publish_worker_payloads(&subject, payloads).await
     }
     async fn publish_worker_queue_item_owned<QK: PCoreStandardQueueKeyForRealm>(
         &self,
@@ -1168,10 +1356,11 @@ impl QStandardWorkerQueuePublisher for NatsJetStreamClient {
         unique_id: QCoreProcCheckpointUniqueId,
         task_group: u32,
         item: QK::QueueItem,
-    ) -> anyhow::Result<()> {
-        self.push_messages_dq_qi_owned(
-            &queue_key.get_queue_subject(&self.base_namespace, realm_id, realm_sub_id, unique_id, task_group),
-            item,
+    ) -> anyhow::Result<Self::PublishBarrier> {
+        let subject = queue_key.get_queue_subject(&self.base_namespace, realm_id, realm_sub_id, unique_id, task_group);
+        self.publish_worker_payloads(
+            &subject,
+            vec![Bytes::from(item.encode_queue_item_vec()?)],
         )
         .await
     }
@@ -1183,12 +1372,13 @@ impl QStandardWorkerQueuePublisher for NatsJetStreamClient {
         unique_id: QCoreProcCheckpointUniqueId,
         task_group: u32,
         items: Vec<QK::QueueItem>,
-    ) -> anyhow::Result<()> {
-        self.push_messages_dq_qi(
-            &queue_key.get_queue_subject(&self.base_namespace, realm_id, realm_sub_id, unique_id, task_group),
-            &items,
-        )
-        .await
+    ) -> anyhow::Result<Self::PublishBarrier> {
+        let subject = queue_key.get_queue_subject(&self.base_namespace, realm_id, realm_sub_id, unique_id, task_group);
+        let payloads = items
+            .iter()
+            .map(|item| item.encode_queue_item_vec().map(Bytes::from))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        self.publish_worker_payloads(&subject, payloads).await
     }
     async fn publish_many_worker_queue_items<QK: PCoreStandardQueueKeyForRealm>(
         &self,
@@ -1198,12 +1388,13 @@ impl QStandardWorkerQueuePublisher for NatsJetStreamClient {
         unique_id: QCoreProcCheckpointUniqueId,
         task_group: u32,
         items: &[QK::QueueItem],
-    ) -> anyhow::Result<()> {
-        self.push_messages_dq_qi(
-            &queue_key.get_queue_subject(&self.base_namespace, realm_id, realm_sub_id, unique_id, task_group),
-            items,
-        )
-        .await
+    ) -> anyhow::Result<Self::PublishBarrier> {
+        let subject = queue_key.get_queue_subject(&self.base_namespace, realm_id, realm_sub_id, unique_id, task_group);
+        let payloads = items
+            .iter()
+            .map(|item| item.encode_queue_item_vec().map(Bytes::from))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        self.publish_worker_payloads(&subject, payloads).await
     }
 
 }
@@ -1228,7 +1419,10 @@ impl QStandardWorkerQueueSubscriber for NatsJetStreamClient {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    if let Some(msg) = self.get_message_if_exists_dq_bytes_ephemeral_qi(&subject, &durable_name, JetStreamAckMode::AckEach).await? {
+                    if let Some(msg) = self
+                        .get_message_if_exists_dqi_worker(queue_key, &subject, &durable_name)
+                        .await?
+                    {
                         return Ok(Some(msg));
                     }
                     if start_time.elapsed() >= timeout_duration {
@@ -1333,11 +1527,12 @@ impl QStandardWorkerQueueSubscriber for NatsJetStreamClient {
         realm_sub_id: u64,
         unique_topic: u128,
         task_group: u32,
+        barrier: &Self::PublishBarrier,
         timeout_ms: u64,
     ) -> anyhow::Result<()> {
         let subject = queue_key.get_queue_subject(&self.base_namespace, realm_id, realm_sub_id, unique_topic, task_group);
         let durable_name = queue_key.get_durable_name(&self.base_namespace, realm_id, realm_sub_id, unique_topic, task_group);
-        self.wait_until_all_jobs_complete_or_timeout_dq(&subject, &durable_name, queue_key.get_queue_type(), timeout_ms)
+        self.wait_until_all_jobs_complete_or_timeout_dq(&subject, &durable_name, queue_key.get_queue_type(), barrier, timeout_ms)
             .await
     }
 

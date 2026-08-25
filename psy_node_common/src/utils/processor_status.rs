@@ -60,6 +60,10 @@ impl ProcessorStatus {
         self.state.store(ProcessorState::Error as u8, Ordering::Release);
     }
 
+    pub fn require_recovery(&self, error: impl Into<String>) {
+        self.set_error(error);
+    }
+
     pub fn begin_shutdown(&self) {
         if self.state() != ProcessorState::Error {
             self.state.store(ProcessorState::Stopping as u8, Ordering::Release);
@@ -95,5 +99,22 @@ mod tests {
         assert_eq!(status.state(), ProcessorState::Error);
         assert_eq!(status.error(), Some("commit failed"));
         assert!(!status.should_run());
+    }
+
+    #[test]
+    fn artifact_timeout_requires_recovery_and_prevents_next_pending() {
+        let status = ProcessorStatus::new();
+        status.mark_running();
+
+        status.require_recovery("root proof timed out");
+
+        let mut next_pending_processed = false;
+        if status.should_run() {
+            next_pending_processed = true;
+        }
+
+        assert_eq!(status.state(), ProcessorState::Error);
+        assert_eq!(status.error(), Some("root proof timed out"));
+        assert!(!next_pending_processed);
     }
 }
