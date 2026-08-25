@@ -1,0 +1,8 @@
+# Generated deployment bundle inputs and source snapshots.
+/artifacts/
+/config/
+/sources/
+/scripts/parth/
+
+# Environment-specific topology and credentials.
+/gcp/config.env
