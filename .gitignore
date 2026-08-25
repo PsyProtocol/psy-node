@@ -90,3 +90,6 @@ client_prover/psy-privacy-bridge/
 # holds private keys), and the genesis contracts psy-compiler regenerates.
 .local-staging/
 genesis_contracts.json
+
+# Python bytecode from the local-testnet workload driver.
+__pycache__/
