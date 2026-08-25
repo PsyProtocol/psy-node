@@ -72,6 +72,15 @@ bash deploy/local-testnet/stack/status.sh
 bash deploy/local-testnet/cloudflare-tunnel/status.sh
 ```
 
+## BSC Testnet
+
+The BSC Testnet deployment is intentionally staged behind local validation.
+Do not point the existing Sepolia environment at BSC or reuse its durable
+state. Follow [`bsc-testnet/PLAN.md`](bsc-testnet/PLAN.md) from phase 0; public
+BSC contracts and cloud services are blocked until the isolated local Chain ID
+97 E2E passes. The phase-2 local contract harness is documented in
+[`bsc-testnet/README.md`](bsc-testnet/README.md).
+
 ## Temporary Scripts
 
 Scripts under `temporary/` are manually invoked, non-authoritative helpers.
