@@ -12,10 +12,10 @@ git -C "$ROOT" merge-base --is-ancestor "$EXPECTED_PARTH_RUNTIME_COMMIT" "$runti
 }
 non_deploy_changes="$(
   git -C "$ROOT" diff --name-only "$EXPECTED_PARTH_RUNTIME_COMMIT" "$runtime_head" \
-    | awk '$0 !~ /^deploy\//'
+    | awk '$0 !~ /^deploy\// && $0 !~ /^(psy-genesis|psy-contracts|psy-dapp)$/'
 )"
 [ -z "$non_deploy_changes" ] || {
-  echo "deployment branch contains non-deploy changes:" >&2
+  echo "deployment branch contains unapproved product changes:" >&2
   printf '%s\n' "$non_deploy_changes" >&2
   exit 1
 }
@@ -40,6 +40,23 @@ assert_commit() {
 assert_commit psy-genesis "$ROOT/psy-genesis" "$EXPECTED_PSY_GENESIS_COMMIT"
 assert_commit psy-contracts "$ROOT/psy-contracts" "$EXPECTED_PSY_CONTRACTS_COMMIT"
 assert_commit psy-dapp "$ROOT/psy-dapp" "$EXPECTED_PSY_DAPP_COMMIT"
+
+assert_gitlink() {
+  local label="$1"
+  local path="$2"
+  local expected="$3"
+  local actual
+
+  actual="$(git -C "$ROOT" ls-tree "$runtime_head" -- "$path" | awk '$1 == "160000" {print $3}')"
+  [ "$actual" = "$expected" ] || {
+    echo "$label gitlink mismatch: expected $expected, got ${actual:-<missing or not a submodule>}" >&2
+    exit 1
+  }
+}
+
+assert_gitlink psy-genesis psy-genesis "$EXPECTED_PSY_GENESIS_COMMIT"
+assert_gitlink psy-contracts psy-contracts "$EXPECTED_PSY_CONTRACTS_COMMIT"
+assert_gitlink psy-dapp psy-dapp "$EXPECTED_PSY_DAPP_COMMIT"
 
 actual_contracts_sha="$(sha256sum "$ROOT/psy-genesis/genesis_contracts.json" | awk '{print $1}')"
 [ "$actual_contracts_sha" = "$EXPECTED_GENESIS_CONTRACTS_SHA256" ] || {
