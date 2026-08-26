@@ -83,7 +83,7 @@ pub async fn run(args: WithdrawArgs) -> anyhow::Result<CommandResult> {
         override_id
     } else {
         // Query Router.l1ToL2Token to auto-detect
-        let router_addr = resolve_router_address("localhost").unwrap_or_else(|_| "0x23D7517b23756C322AEE30d068c107301fFb3470".to_string());
+        let router_addr = resolve_router_address(psy_config.current_network_name())?;
         match query_l1_to_l2_token(&args.l1_rpc_url, &router_addr, &args.token_address).await {
             Ok(l2_token_bytes) if !l2_token_bytes.is_zero() => {
                 // The bytes32 is big-endian u64; the last 8 bytes encode the contract_id
