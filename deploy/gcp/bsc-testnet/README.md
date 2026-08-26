@@ -47,9 +47,43 @@ Edit the ignored `config.env` and set at least:
 - `ENVIO_API_TOKEN`: an Envio HyperSync token.
 - The inherited deployer/relayer keystore password and expected address.
 
+Alchemy supports BSC Testnet at:
+
+```text
+https://bnb-testnet.g.alchemy.com/v2/<API_KEY>
+```
+
+An existing Alchemy key can be reused after `BNB_TESTNET` is enabled for its
+Alchemy App. A key that has not enabled the network returns HTTP 403; preflight
+prints the provider error without printing the key.
+
 The deployer address must hold enough tBNB for contract deployment and relayer
-transactions. Verify all commits in `source-versions.env` are available from
-their remotes before deployment.
+transactions. Preflight defaults to a minimum balance of 0.1 tBNB through
+`BSC_MIN_DEPLOYER_BALANCE_WEI`; fund the account with the full 0.3 tBNB faucet
+grant when possible. Verify all commits in `source-versions.env` are available
+from their remotes before deployment.
+
+Build and dry-run the isolated BSC wallet publication before uploading it:
+
+```bash
+R2_SKIP_UPLOAD=1 \
+  bash deploy/gcp/bsc-testnet/publish-wallet-r2.sh
+```
+
+The command requires the clean wallet checkout pinned by
+`source-versions.env`, builds against published `@psy-protocol/psy-sdk@2.0.5`,
+and writes BSC metadata under `bsc-testnet/` in the existing wallet R2 bucket.
+To publish, load the existing Cloudflare credentials and run without
+`R2_SKIP_UPLOAD`:
+
+```bash
+CF_ENV_FILE="$WORKSPACE_HOME/cf_env" \
+  bash deploy/gcp/bsc-testnet/publish-wallet-r2.sh
+```
+
+After the public metadata and zip have been verified, set
+`BSC_REQUIRE_PUBLISHED_WALLET=1` in the ignored `config.env`. This turns the
+metadata commit check into a deployment gate for the App frontend.
 
 Create DNS records for these BSC-only hosts, pointing at the same ingress used
 by staging:
@@ -101,10 +135,10 @@ Step 10 verifies that the RPC reports chain ID 97 before sending a transaction,
 deploys new BSC contracts, records the pre-deployment block for Envio, and syncs
 the generated addresses back into the ignored BSC config. Anvil is skipped.
 
-## Remaining Release Gate
+## Remaining External Gates
 
-The node, contracts, genesis, dapp, local BSC bridge E2E, and GCP profile are
-prepared. The wallet's BSC network profile and its R2 publication flow still
-need explicit verification before advertising the wallet as BSC-ready. This
-does not block backend-only deployment, but it blocks a complete public wallet
-release.
+The code paths for node, contracts, genesis, dapp, wallet, R2 publication, local
+BSC bridge E2E, and GCP deployment are prepared. Before a real run, enable
+`BNB_TESTNET` for the Alchemy App, fund the deployer/relayer with tBNB, publish
+the pinned wallet, create the listed DNS/Pages projects, and rerun preflight
+without `BSC_PREFLIGHT_SKIP_RPC`.

@@ -24,6 +24,13 @@ fail() {
   exit 1
 }
 
+[ -f "$SOURCE_VERSIONS_FILE" ] || fail "missing BSC source versions: $SOURCE_VERSIONS_FILE"
+bash -n "$SOURCE_VERSIONS_FILE"
+set -a
+# shellcheck disable=SC1090
+source "$SOURCE_VERSIONS_FILE"
+set +a
+
 expect_equal() {
   local name="$1"
   local expected="$2"
@@ -43,6 +50,61 @@ expect_bsc_domain() {
 command -v jq >/dev/null 2>&1 || fail "jq is required"
 command -v curl >/dev/null 2>&1 || fail "curl is required"
 
+rpc_request() {
+  local method="$1"
+  local params="$2"
+  local response_file http_status curl_error rpc_error result
+
+  response_file="$(mktemp)"
+  if ! http_status="$(curl -sS --max-time 15 \
+    -o "$response_file" \
+    -w '%{http_code}' \
+    "$BSC_TESTNET_RPC_URL" \
+    -H 'content-type: application/json' \
+    --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$method\",\"params\":$params}" \
+    2>"$response_file.curl-error")"; then
+    curl_error="$(cat "$response_file.curl-error")"
+    rm -f "$response_file" "$response_file.curl-error"
+    fail "BSC RPC transport failed for $method: $curl_error"
+  fi
+  rm -f "$response_file.curl-error"
+
+  if ! jq -e . "$response_file" >/dev/null 2>&1; then
+    rm -f "$response_file"
+    fail "BSC RPC returned non-JSON response for $method (HTTP $http_status)"
+  fi
+
+  rpc_error="$(jq -r '.error.message // empty' "$response_file")"
+  if [ -n "$rpc_error" ]; then
+    rm -f "$response_file"
+    fail "BSC RPC rejected $method (HTTP $http_status): $rpc_error"
+  fi
+  case "$http_status" in
+    2??) ;;
+    *)
+      rm -f "$response_file"
+      fail "BSC RPC returned HTTP $http_status for $method"
+      ;;
+  esac
+
+  result="$(jq -er '.result' "$response_file")" || {
+    rm -f "$response_file"
+    fail "BSC RPC response is missing result for $method"
+  }
+  rm -f "$response_file"
+  printf '%s\n' "$result"
+}
+
+decimal_ge() {
+  local left="$1"
+  local right="$2"
+
+  while [ "${#left}" -gt 1 ] && [ "${left#0}" != "$left" ]; do left="${left#0}"; done
+  while [ "${#right}" -gt 1 ] && [ "${right#0}" != "$right" ]; do right="${right#0}"; done
+  [ "${#left}" -gt "${#right}" ] \
+    || { [ "${#left}" -eq "${#right}" ] && [[ "$left" > "$right" || "$left" = "$right" ]]; }
+}
+
 expect_equal L1_DEPLOYMENTS_NETWORK bsc-testnet
 expect_equal RELAYER_DEPLOYMENTS_NETWORK bsc-testnet
 expect_equal CHAIN_ID 97
@@ -55,6 +117,13 @@ expect_equal DEPLOY_CLOUD_REALM_WORKERS 1
 expect_equal CLOUD_REALM_WORKER_LAYOUT "0:0 1:0"
 expect_equal DEPLOY_OFFSITE_WORKERS 1
 expect_equal OFFSITE_WORKER_HOST arc99x4
+expect_equal WALLET_PACKAGE_MODE bsc-testnet
+expect_equal BSC_WALLET_PROFILE_VERIFIED 1
+expect_equal EXPECTED_PSY_SDK_NPM_VERSION 2.0.5
+
+expected_wallet_release_url="${BSC_WALLET_R2_PUBLIC_BASE_URL%/}/${BSC_WALLET_R2_METADATA_KEY}"
+[ "$VITE_WALLET_RELEASE_URL" = "$expected_wallet_release_url" ] \
+  || fail "VITE_WALLET_RELEASE_URL must use isolated BSC metadata: $expected_wallet_release_url"
 
 # Preserve the currently deployed machine topology. This profile changes the L1
 # and public namespace, not the number or size of machines.
@@ -116,17 +185,37 @@ grep -A8 "'bsc-testnet':" "$REPO_ROOT/psy-contracts/protocol-config/index.ts" \
 [ -n "${ENVIO_API_TOKEN:-}" ] || fail "ENVIO_API_TOKEN is required for BSC HyperSync"
 
 if [ "${BSC_PREFLIGHT_SKIP_RPC:-0}" != "1" ]; then
-  rpc_chain_hex="$(curl -fsS --max-time 15 "$BSC_TESTNET_RPC_URL" \
-    -H 'content-type: application/json' \
-    --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' \
-    | jq -er '.result')"
+  command -v cast >/dev/null 2>&1 || fail "cast is required for BSC balance validation"
+
+  rpc_chain_hex="$(rpc_request eth_chainId '[]')"
   rpc_chain_id="$((rpc_chain_hex))"
   [ "$rpc_chain_id" = "97" ] || fail "BSC RPC returned chain ID $rpc_chain_id"
   echo "[bsc-preflight] verified BSC Testnet RPC chain ID: $rpc_chain_id"
+
+  deployer_address="${L1_DEPLOYER_ADDRESS:-${RELAYER_FINALIZE_EXPECTED_ADDRESS:-}}"
+  [[ "$deployer_address" =~ ^0x[0-9a-fA-F]{40}$ ]] \
+    || fail "L1_DEPLOYER_ADDRESS must contain the BSC deployer/relayer address"
+  minimum_balance_wei="${BSC_MIN_DEPLOYER_BALANCE_WEI:-100000000000000000}"
+  [[ "$minimum_balance_wei" =~ ^[0-9]+$ ]] \
+    || fail "BSC_MIN_DEPLOYER_BALANCE_WEI must be an unsigned decimal integer"
+  balance_params="$(jq -cn --arg address "$deployer_address" '[$address, "latest"]')"
+  balance_hex="$(rpc_request eth_getBalance "$balance_params")"
+  balance_wei="$(cast to-dec "$balance_hex")"
+  decimal_ge "$balance_wei" "$minimum_balance_wei" \
+    || fail "BSC deployer $deployer_address has $balance_wei wei; minimum required is $minimum_balance_wei wei"
+  echo "[bsc-preflight] verified deployer/relayer tBNB balance: address=$deployer_address wei=$balance_wei"
 fi
 
-if [ "${BSC_WALLET_PROFILE_VERIFIED:-0}" != "1" ]; then
-  echo "[bsc-preflight] warning: wallet BSC profile is not yet marked verified; R2 wallet publication remains blocked"
+if [ "${BSC_REQUIRE_PUBLISHED_WALLET:-0}" = "1" ]; then
+  wallet_metadata="$(curl -fsSL --max-time 20 "$VITE_WALLET_RELEASE_URL")" \
+    || fail "published BSC wallet metadata is not reachable: $VITE_WALLET_RELEASE_URL"
+  [ "$(jq -r '.network // empty' <<<"$wallet_metadata")" = "bsc-testnet" ] \
+    || fail "published wallet metadata does not describe bsc-testnet"
+  [ "$(jq -r '.walletCommit // empty' <<<"$wallet_metadata")" = "$EXPECTED_PSY_WALLET_COMMIT" ] \
+    || fail "published wallet commit does not match source-versions.env"
+  echo "[bsc-preflight] verified published BSC wallet metadata"
+else
+  echo "[bsc-preflight] wallet profile verified; publish R2 metadata before public frontend deployment"
 fi
 
 echo "[bsc-preflight] machine topology unchanged"

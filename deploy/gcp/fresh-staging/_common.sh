@@ -199,6 +199,7 @@ export_public_frontend_env() {
   export VITE_PSY_PROVE_PROXY_URL="${VITE_PSY_PROVE_PROXY_URL:-$prove_proxy_url}"
   export VITE_PSY_INDEXER_API_URL="${VITE_PSY_INDEXER_API_URL:-$services_url}"
   export VITE_PSY_EXPLORER_URL="${VITE_PSY_EXPLORER_URL:-$explorer_url}"
+  export VITE_WALLET_RELEASE_URL="${VITE_WALLET_RELEASE_URL:-}"
   export VITE_COORDINATOR_URL="${VITE_COORDINATOR_URL:-$coordinator_url}"
   export VITE_PROVE_PROXY_URL="${VITE_PROVE_PROXY_URL:-$prove_proxy_url}"
 
