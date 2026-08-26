@@ -23,7 +23,7 @@ set -a
 source "$CONFIG_FILE"
 set +a
 
-SOURCE_VERSIONS_FILE="$REPO_ROOT/deploy/source-versions.env"
+SOURCE_VERSIONS_FILE="${DEPLOY_SOURCE_VERSIONS_FILE:-$REPO_ROOT/deploy/source-versions.env}"
 [ -f "$SOURCE_VERSIONS_FILE" ] || {
   echo "missing deployment source versions: $SOURCE_VERSIONS_FILE" >&2
   exit 1

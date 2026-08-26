@@ -31,6 +31,11 @@ normalize_eth_address() {
   printf '0x%s\n' "$(printf '%s' "$address" | tr '[:upper:]' '[:lower:]')"
 }
 
+is_local_finalize_network() {
+  [ "$RELAYER_DEPLOYMENTS_NETWORK" = "localhost" ] \
+    || [ "${CHAIN_ID:-31337}" = "31337" ]
+}
+
 validate_eth_address() {
   local name="$1"
   local address="${2#0x}"
@@ -67,15 +72,15 @@ if [ -n "${RELAYER_FINALIZE_PRIVATE_KEY:-}" ]; then
   FINALIZE_PRIVATE_KEY="$RELAYER_FINALIZE_PRIVATE_KEY"
 elif [ -n "${L1_DEPLOYER_PRIVATE_KEY:-}" ]; then
   FINALIZE_PRIVATE_KEY="$L1_DEPLOYER_PRIVATE_KEY"
-elif [ "${RELAYER_DEPLOYMENTS_NETWORK}" != "sepolia" ] \
+elif is_local_finalize_network \
   && { [ -z "${L1_DEPLOYER_ADDRESS:-}" ] || [ "$(normalize_eth_address "$L1_DEPLOYER_ADDRESS")" = "$DEFAULT_ANVIL_ADDRESS" ]; }; then
   FINALIZE_PRIVATE_KEY="$DEFAULT_ANVIL_PRIVATE_KEY"
 else
   FINALIZE_PRIVATE_KEY=""
 fi
 
-if [ "$RELAYER_DEPLOYMENTS_NETWORK" = "sepolia" ] && [ -z "$RELAYER_FINALIZE_EXPECTED_ADDRESS" ]; then
-  echo "RELAYER_FINALIZE_EXPECTED_ADDRESS or L1_DEPLOYER_ADDRESS is required for Sepolia" >&2
+if ! is_local_finalize_network && [ -z "$RELAYER_FINALIZE_EXPECTED_ADDRESS" ]; then
+  echo "RELAYER_FINALIZE_EXPECTED_ADDRESS or L1_DEPLOYER_ADDRESS is required for $RELAYER_DEPLOYMENTS_NETWORK" >&2
   exit 1
 fi
 
@@ -101,8 +106,8 @@ elif [ -n "$FINALIZE_PRIVATE_KEY" ]; then
   }
   FINALIZE_SIGNER_ADDRESS="$(cast wallet address "$FINALIZE_PRIVATE_KEY")"
   assert_finalize_address "$FINALIZE_SIGNER_ADDRESS"
-elif [ "$RELAYER_DEPLOYMENTS_NETWORK" = "sepolia" ]; then
-  echo "Sepolia relayer deployment requires a local RELAYER_FINALIZE_KEYSTORE_PATH or an explicit finalize private key" >&2
+elif ! is_local_finalize_network; then
+  echo "$RELAYER_DEPLOYMENTS_NETWORK relayer deployment requires a local RELAYER_FINALIZE_KEYSTORE_PATH or an explicit finalize private key" >&2
   echo "refusing to reuse or generate an unverified signer" >&2
   exit 1
 fi

@@ -21,7 +21,8 @@ actual_workspace="$(
 
 legacy_absolute="/home/peter/git/"bridge_zilong
 legacy_home='$HOME/git/'bridge_zilong
-if grep -R -n -F -e "$legacy_absolute" -e "$legacy_home" "$ROOT/deploy"; then
+if grep -R -n -F --binary-files=without-match --exclude-dir=target \
+  -e "$legacy_absolute" -e "$legacy_home" "$ROOT/deploy"; then
   echo "deployment files must derive paths from WORKSPACE_HOME" >&2
   exit 1
 fi

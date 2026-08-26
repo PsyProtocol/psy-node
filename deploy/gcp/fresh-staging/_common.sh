@@ -111,6 +111,7 @@ sync_remote_l1_env_to_config() {
   for key in \
     ETH_RPC_URL \
     CHAIN_ID \
+    START_BLOCK \
     L1_DEPLOYMENTS_NETWORK \
     L1_DEPLOYER_ADDRESS \
     ADDRESSES_PROVIDER_ADDRESS \
@@ -163,6 +164,11 @@ export_public_frontend_env() {
     default_l1_chain_name="Sepolia"
     default_l1_chain_short_name="Sepolia"
     default_l1_explorer_url="https://sepolia.etherscan.io"
+  elif [ "$l1_network" = "bsc-testnet" ]; then
+    default_l1_chain_id="${CHAIN_ID:-97}"
+    default_l1_chain_name="BSC Testnet"
+    default_l1_chain_short_name="BSC Testnet"
+    default_l1_explorer_url="https://testnet.bscscan.com"
   fi
 
   export VITE_PSY_NODE_URL="${VITE_PSY_NODE_URL:-$coordinator_url}"

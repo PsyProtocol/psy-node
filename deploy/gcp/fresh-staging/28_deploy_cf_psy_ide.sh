@@ -10,7 +10,7 @@ require_cloudflare_pages_env
 export_public_frontend_env
 
 FRONTEND_DIR="$PSY_DAPP_DIR/apps/ide"
-PROJECT_NAME="${CF_PAGES_PROJECT:-psy-ide-stg}"
+PROJECT_NAME="${CF_PAGES_IDE_PROJECT:-${CF_PAGES_PROJECT:-psy-ide-stg}}"
 BRANCH="${CF_PAGES_BRANCH:-staging}"
 PSY_SDK_DIR="${PSY_SDK_DIR:-$WORKSPACE_HOME/psy-sdk}"
 PSY_SDK_PACKAGE_DIR="${PSY_SDK_PACKAGE_DIR:-$PSY_SDK_DIR/psy-ts-sdk/packages/psy-sdk}"

@@ -18,11 +18,11 @@ L1_DEPLOYER_KEYSTORE_PATH="${L1_DEPLOYER_KEYSTORE_PATH:-${KEYSTORE_PATH:-}}"
 L1_DEPLOYER_KEYSTORE_REMOTE_PATH="${L1_DEPLOYER_KEYSTORE_REMOTE_PATH:-/var/lib/parth/.psy/keystore/bridge-relayer-dev}"
 L1_DEPLOYER_WALLET_PASSWORD="${L1_DEPLOYER_WALLET_PASSWORD:-${WALLET_PASSWORD:-}}"
 if [ -z "${CHAIN_ID:-}" ]; then
-  if [ "$L1_DEPLOYMENTS_NETWORK" = "sepolia" ]; then
-    CHAIN_ID="11155111"
-  else
-    CHAIN_ID="31337"
-  fi
+  case "$L1_DEPLOYMENTS_NETWORK" in
+    sepolia) CHAIN_ID="11155111" ;;
+    bsc-testnet) CHAIN_ID="97" ;;
+    *) CHAIN_ID="31337" ;;
+  esac
 fi
 
 [ -d "$CONTRACTS_SOURCE" ] || {

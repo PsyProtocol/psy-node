@@ -36,6 +36,11 @@ is_truthy() {
   esac
 }
 
+is_local_l1_deployment() {
+  [ "${L1_DEPLOYMENTS_NETWORK:-localhost}" = "localhost" ] \
+    || [ "${CHAIN_ID:-31337}" = "31337" ]
+}
+
 verify_clean_git_source() {
   local label="$1"
   local dir="$2"
@@ -116,7 +121,7 @@ if has_any_step 30 31; then
   require_cmd scp
 fi
 
-if has_step 16 && [ "${RELAYER_DEPLOYMENTS_NETWORK:-${L1_DEPLOYMENTS_NETWORK:-localhost}}" = "sepolia" ]; then
+if has_step 16 && ! is_local_l1_deployment; then
   require_cmd cast
 
   relayer_expected_address="${RELAYER_FINALIZE_EXPECTED_ADDRESS:-${L1_DEPLOYER_ADDRESS:-}}"
@@ -125,7 +130,7 @@ if has_step 16 && [ "${RELAYER_DEPLOYMENTS_NETWORK:-${L1_DEPLOYMENTS_NETWORK:-lo
   relayer_private_key="${RELAYER_FINALIZE_PRIVATE_KEY:-${L1_DEPLOYER_PRIVATE_KEY:-}}"
 
   [[ "$relayer_expected_address" =~ ^0x[0-9a-fA-F]{40}$ ]] || {
-    echo "RELAYER_FINALIZE_EXPECTED_ADDRESS or L1_DEPLOYER_ADDRESS must contain the stable Sepolia relayer address" >&2
+    echo "RELAYER_FINALIZE_EXPECTED_ADDRESS or L1_DEPLOYER_ADDRESS must contain the stable public-L1 relayer address" >&2
     exit 1
   }
 
@@ -142,7 +147,7 @@ if has_step 16 && [ "${RELAYER_DEPLOYMENTS_NETWORK:-${L1_DEPLOYMENTS_NETWORK:-lo
   elif [ -n "$relayer_private_key" ]; then
     relayer_actual_address="$(cast wallet address "$relayer_private_key")"
   else
-    echo "a local relayer finalize keystore or explicit private key is required before a destructive Sepolia deployment" >&2
+    echo "a local relayer finalize keystore or explicit private key is required before a destructive public-L1 deployment" >&2
     exit 1
   fi
 
@@ -153,7 +158,7 @@ if has_step 16 && [ "${RELAYER_DEPLOYMENTS_NETWORK:-${L1_DEPLOYMENTS_NETWORK:-lo
     echo "actual:   $relayer_actual_address" >&2
     exit 1
   fi
-  echo "[preflight] verified stable Sepolia relayer signer: $relayer_actual_address"
+  echo "[preflight] verified stable ${L1_DEPLOYMENTS_NETWORK} relayer signer: $relayer_actual_address"
 fi
 
 if has_step 21 \

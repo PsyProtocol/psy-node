@@ -37,11 +37,13 @@ else
 fi
 
 rpc_ready=0
+rpc_chain_id_hex=""
 for _ in $(seq 1 60); do
-  if curl -fsS --max-time 3 \
+  rpc_chain_id_hex="$(curl -fsS --max-time 3 \
     -H 'content-type: application/json' \
     --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' \
-    "$L1_RPC_URL" | jq -e '.result' >/dev/null 2>&1; then
+    "$L1_RPC_URL" | jq -er '.result' 2>/dev/null || true)"
+  if [ -n "$rpc_chain_id_hex" ]; then
     rpc_ready=1
     break
   fi
@@ -51,6 +53,18 @@ done
   echo "timed out waiting for L1 RPC: $L1_RPC_URL" >&2
   exit 1
 }
+actual_chain_id="$((rpc_chain_id_hex))"
+[ "$actual_chain_id" = "$CHAIN_ID" ] || {
+  echo "L1 RPC chain ID mismatch: expected $CHAIN_ID, got $actual_chain_id ($rpc_chain_id_hex)" >&2
+  exit 1
+}
+
+predeploy_block_hex="$(curl -fsS --max-time 5 \
+  -H 'content-type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' \
+  "$L1_RPC_URL" | jq -er '.result')"
+L1_DEPLOY_START_BLOCK="$((predeploy_block_hex + 1))"
+echo "verified L1 RPC chain_id=$actual_chain_id; deployment event scan starts at block $L1_DEPLOY_START_BLOCK"
 
 deployer_address=""
 deployer_private_key=""
@@ -126,6 +140,8 @@ if [ "$L1_DEPLOYMENTS_NETWORK" = "localhost" ]; then
   network_env_key="LOCALHOST_RPC_URL"
 elif [ "$L1_DEPLOYMENTS_NETWORK" = "sepolia" ]; then
   network_env_key="SEPOLIA_RPC_URL"
+elif [ "$L1_DEPLOYMENTS_NETWORK" = "bsc-testnet" ]; then
+  network_env_key="BSC_TESTNET_RPC_URL"
 fi
 
 if [ -n "$deployer_private_key" ]; then
@@ -208,6 +224,7 @@ install -d -m 0755 /etc/parth
 cat >/etc/parth/l1.env <<EOF
 ETH_RPC_URL=${L1_RPC_URL}
 CHAIN_ID=${CHAIN_ID}
+START_BLOCK=${L1_DEPLOY_START_BLOCK}
 L1_DEPLOYMENTS_NETWORK=${L1_DEPLOYMENTS_NETWORK}
 L1_DEPLOYER_ADDRESS=${deployer_address:-$config_admin}
 ADDRESSES_PROVIDER_ADDRESS=$(jq -r '.core.PsyAddressesProvider // .contracts.PsyAddressesProvider // empty' "$deployed")

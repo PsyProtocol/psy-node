@@ -1,5 +1,11 @@
 # GCP Staging SSH Deployment
 
+For the isolated BSC Testnet profile that reuses the current machine topology,
+see [`bsc-testnet/README.md`](bsc-testnet/README.md).
+
+For the isolated BSC Testnet profile that reuses the current machine topology,
+see [`bsc-testnet/README.md`](bsc-testnet/README.md).
+
 These scripts deploy onto pre-created staging machines reachable through local
 SSH config. They do not create VMs, networks, disks, or firewall rules.
 

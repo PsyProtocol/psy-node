@@ -70,6 +70,12 @@ if [ "$l1_network" = "sepolia" ]; then
   default_l1_chain_short_name="Sepolia"
   default_l1_rpc_url="${ETH_RPC_URL:-https://ethereum-sepolia-rpc.publicnode.com}"
   default_l1_explorer_url="${PUBLIC_L1_EXPLORER_URL:-https://sepolia.etherscan.io}"
+elif [ "$l1_network" = "bsc-testnet" ]; then
+  default_l1_chain_id="${CHAIN_ID:-97}"
+  default_l1_chain_name="BSC Testnet"
+  default_l1_chain_short_name="BSC Testnet"
+  default_l1_rpc_url="${ETH_RPC_URL:-https://data-seed-prebsc-1-s1.bnbchain.org:8545}"
+  default_l1_explorer_url="${PUBLIC_L1_EXPLORER_URL:-https://testnet.bscscan.com}"
 fi
 
 set_demo_env() {

@@ -51,13 +51,15 @@ export VITE_NETWORK="$explorer_network"
 export VITE_L1_NETWORK="$explorer_network"
 export VITE_FORK="$explorer_fork"
 export VITE_L1_FORK="$explorer_fork"
+export PSY_CONFIG_URL="${PSY_CONFIG_URL:-${PUBLIC_CONFIG_PAGE_URL%/}/config.json}"
 
 # Explorer reads token metadata through `@deployments`, not config.json.
 # Regenerate that snapshot from the freshly deployed L1 addresses before
 # validating or building the frontend.
 SYNC_SCRIPT="$PSY_DAPP_DIR/apps/bridge/scripts/sync-staging-config.mjs"
-if [ -f "$SYNC_SCRIPT" ] && [ "$VITE_NETWORK" = "sepolia" ]; then
-  echo "[cloudflare-pages] syncing sepolia deployed-contracts.json for explorer"
+if [ -f "$SYNC_SCRIPT" ] \
+  && { [ "$VITE_NETWORK" = "sepolia" ] || [ "$VITE_NETWORK" = "bsc-testnet" ]; }; then
+  echo "[cloudflare-pages] syncing $VITE_NETWORK deployed-contracts.json for explorer"
   node "$SYNC_SCRIPT"
 fi
 
@@ -66,6 +68,7 @@ echo "  VITE_NETWORK=$VITE_NETWORK"
 echo "  VITE_L1_NETWORK=$VITE_L1_NETWORK"
 echo "  VITE_FORK=$VITE_FORK"
 echo "  VITE_L1_FORK=$VITE_L1_FORK"
+echo "  PSY_CONFIG_URL=$PSY_CONFIG_URL"
 echo "  config=$PSY_DAPP_DIR/psy-genesis/config.json"
 
 if command -v jq >/dev/null 2>&1; then

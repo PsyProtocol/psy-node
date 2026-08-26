@@ -57,11 +57,17 @@ if [ "$l1_network" = "sepolia" ] || [ "$l1_chain_id" = "11155111" ]; then
   l1_chain_short_name="${VITE_L1_CHAIN_SHORT_NAME:-Sepolia}"
   l1_explorer_url="${l1_explorer_url:-https://sepolia.etherscan.io}"
   l1_rpc_url="${l1_rpc_url:-https://ethereum-sepolia-rpc.publicnode.com}"
+elif [ "$l1_network" = "bsc-testnet" ] || [ "$l1_chain_id" = "97" ]; then
+  l1_chain_name="${VITE_L1_CHAIN_NAME:-BSC Testnet}"
+  l1_chain_short_name="${VITE_L1_CHAIN_SHORT_NAME:-BSC Testnet}"
+  l1_explorer_url="${l1_explorer_url:-https://testnet.bscscan.com}"
+  l1_rpc_url="${l1_rpc_url:-https://data-seed-prebsc-1-s1.bnbchain.org:8545}"
 fi
 
 l1_rpc_url="${l1_rpc_url:-https://${PUBLIC_L1_RPC_DOMAIN}}"
 l1_explorer_url="${l1_explorer_url:-$l1_rpc_url}"
 generated_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+public_environment="${PUBLIC_CONFIG_ENVIRONMENT:-staging}"
 
 coordinator_url="https://${PUBLIC_COORDINATOR_DOMAIN}"
 realm0_url="https://${PUBLIC_REALM0_DOMAIN}"
@@ -95,7 +101,7 @@ done
 
 jq -n \
   --arg generated_at "$generated_at" \
-  --arg environment "staging" \
+  --arg environment "$public_environment" \
   --arg l1_network "$l1_network" \
   --argjson l1_chain_id "$l1_chain_id" \
   --arg l1_chain_name "$l1_chain_name" \

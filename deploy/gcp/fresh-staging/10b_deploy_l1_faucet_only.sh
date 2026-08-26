@@ -104,6 +104,8 @@ if [ "$l1_network" = "localhost" ]; then
   network_env_key="LOCALHOST_RPC_URL"
 elif [ "$l1_network" = "sepolia" ]; then
   network_env_key="SEPOLIA_RPC_URL"
+elif [ "$l1_network" = "bsc-testnet" ]; then
+  network_env_key="BSC_TESTNET_RPC_URL"
 fi
 
 remote_script="$(cat <<'REMOTE'
