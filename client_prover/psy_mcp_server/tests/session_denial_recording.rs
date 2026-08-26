@@ -22,7 +22,7 @@ fn engine() -> (PolicyEngine, String, String) {
         None,
         vec![],
     );
-    let (tok, _) = e.issue_session(&pid, 60).unwrap();
+    let (tok, _) = e.issue_session(&pid, 60, None).unwrap();
     (e, pid, tok)
 }
 
@@ -62,7 +62,7 @@ fn an_expired_session_records_its_refusal_and_says_what_to_do() {
     // ttl 0 sets expires_at == now, and the gate is `now > expires_at`, so it
     // is not yet lapsed. Wait past the second boundary rather than asserting on
     // an equality the gate deliberately does not treat as expired.
-    let (tok, _) = e.issue_session(&pid, 0).unwrap();
+    let (tok, _) = e.issue_session(&pid, 0, None).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(1_100));
     assert!(e.authorize(&tok, "9999", 5 * PSY, "simple_transfer").is_err());
 

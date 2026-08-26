@@ -38,6 +38,9 @@ use tokio::sync::Mutex;
 use policy::{Limits, PolicyEngine, SELF_RECIPIENT};
 use wallet::{WalletManager, CONTRACT_PSY, CONTRACT_USDT};
 
+/// Standard fee charged by a submitted transaction, denominated in Nano PSY.
+const TX_FEE_NANO: u64 = 1_000_000_000;
+
 /// Refuses unknown symbols instead of mapping them to PSY: a 402 challenge
 /// naming asset "USDC" with USDC-scaled figures must not get paid in PSY at
 /// that number. Same reason the x402 module refuses unknown SCHEMES.
@@ -47,6 +50,47 @@ fn contract_for(token: &str) -> Option<u64> {
         "USDT" | "USDT_P" => Some(CONTRACT_USDT),
         _ => None,
     }
+}
+
+/// Chain-read balance pre-flight for spend tools. Bug #6: an over-budget USDT
+/// transfer used to sail into proving and fail on the circuit's assertion
+/// ~45s (and one fee) later, while PSY failed fast in the wallet layer —
+/// same user mistake, two very different experiences, and the prove-stage
+/// message names an assertion instead of the balance. One check for every
+/// token, BEFORE any budget is charged. The PSY leg additionally needs the
+/// tx fee headroom; USDT fees are charged in PSY.
+async fn ensure_spendable_balance(
+    wallet: &crate::wallet::WalletManager,
+    contract: u64,
+    contract_psy: u64,
+    amount: u64,
+    token_label: &str,
+) -> Result<(), String> {
+    let bal = wallet.balance(contract).await.map_err(|e| format!("could not read the {token_label} balance: {e:#}"))?;
+    if bal < amount {
+        return Err(format!(
+            "insufficient {token_label} balance: {bal} available, {amount} needed — the transfer was NOT sent (no fee charged)"
+        ));
+    }
+    if contract == contract_psy {
+        let with_fee = amount.checked_add(TX_FEE_NANO).ok_or_else(|| {
+            "transfer amount plus the 1 PSY fee exceeds the supported amount range".to_string()
+        })?;
+        if bal < with_fee {
+            return Err(format!(
+                "insufficient PSY balance for transfer plus the 1 PSY fee: {bal} available, {with_fee} needed"
+            ));
+        }
+    } else {
+        let psy_bal = wallet.balance(contract_psy).await
+            .map_err(|e| format!("could not read the PSY balance needed for the transaction fee: {e:#}"))?;
+        if psy_bal < TX_FEE_NANO {
+            return Err(format!(
+                "insufficient PSY balance for the 1 PSY transaction fee: {psy_bal} available, {TX_FEE_NANO} needed"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// JSON result helpers — every tool returns one structured JSON blob.
@@ -232,6 +276,13 @@ struct IssueSessionArgs {
     policy_id: String,
     #[serde(default = "default_ttl")]
     ttl_minutes: u64,
+    /// Optional lifetime cap for THIS session token, in Nano. The session dies
+    /// for spending purposes once authorized spends reach it (the policy's own
+    /// per-day/per-month/total caps still apply throughout). Omit for an
+    /// uncapped session bounded only by the policy.
+    #[serde(default)]
+    #[serde(rename = "maxSessionTotal", alias = "max_session_total", alias = "max_session_total_nano")]
+    max_session_total_nano: Option<u64>,
     /// Required when the server was started with PSY_MCP_OWNER_TOKEN set.
     #[serde(default)]
     owner_token: Option<String>,
@@ -753,7 +804,7 @@ impl PsyWalletServer {
         if let Err(e) = owner_gate(a.owner_token.as_deref()) {
             return err_json(e, json!({ "gate": "owner" }));
         }
-        match self.policy.lock().unwrap().issue_session(&a.policy_id, a.ttl_minutes) {
+        match self.policy.lock().unwrap().issue_session(&a.policy_id, a.ttl_minutes, a.max_session_total_nano) {
             Ok((token, exp)) => ok_json(json!({ "token": token, "expiresAt": exp })),
             Err(e) => err_json(e, json!({})),
         }
@@ -1105,12 +1156,11 @@ impl PsyWalletServer {
         // Policy gate BELOW the model, same shape as transfer. The deploy fee
         // is charged as one 1 PSY spend so the daily/30-day caps bound how much
         // an agent can deploy, and the audit trail shows it like any spend.
-        const DEPLOY_FEE_NANO: u64 = 1_000_000_000; // 1 PSY, the standard tx fee
         let auth = match self
             .policy
             .lock()
             .unwrap()
-            .authorize(&a.session, SELF_RECIPIENT, DEPLOY_FEE_NANO, "deploy_contract")
+            .authorize(&a.session, SELF_RECIPIENT, TX_FEE_NANO, "deploy_contract")
         {
             Ok(auth) => auth,
             Err(e) => {
@@ -1120,25 +1170,25 @@ impl PsyWalletServer {
         let root = match psyup::contracts_root() {
             Ok(r) => r,
             Err(e) => {
-                self.policy.lock().unwrap().refund(&auth, DEPLOY_FEE_NANO);
+                self.policy.lock().unwrap().refund(&auth, TX_FEE_NANO);
                 return err_json(e, json!({}));
             }
         };
         let dir = match psyup::project_dir(&root, &a.project) {
             Ok(d) => d,
             Err(e) => {
-                self.policy.lock().unwrap().refund(&auth, DEPLOY_FEE_NANO);
+                self.policy.lock().unwrap().refund(&auth, TX_FEE_NANO);
                 return err_json(e, json!({}));
             }
         };
         if !dir.is_dir() {
-            self.policy.lock().unwrap().refund(&auth, DEPLOY_FEE_NANO);
+            self.policy.lock().unwrap().refund(&auth, TX_FEE_NANO);
             return err_json(format!("project `{}` does not exist — create it with psyup_new first", a.project), json!({}));
         }
         let cdir = match psyup::find_contract_dir(&dir) {
             Ok(c) => c,
             Err(e) => {
-                self.policy.lock().unwrap().refund(&auth, DEPLOY_FEE_NANO);
+                self.policy.lock().unwrap().refund(&auth, TX_FEE_NANO);
                 return err_json(e, json!({}));
             }
         };
@@ -1147,7 +1197,7 @@ impl PsyWalletServer {
             Some(u) => u.private_key.to_string(),
             None => {
                 drop(inner);
-                self.policy.lock().unwrap().refund(&auth, DEPLOY_FEE_NANO);
+                self.policy.lock().unwrap().refund(&auth, TX_FEE_NANO);
                 return err_json("no wallet loaded — deploy needs a wallet to pay the deploy fee", json!({}));
             }
         };
@@ -1156,11 +1206,11 @@ impl PsyWalletServer {
             Ok((true, out)) => ok_json(json!({ "ok": true, "project": a.project, "output": out })),
             Ok((false, out)) => {
                 // Nothing went on chain; give the fee back.
-                self.policy.lock().unwrap().refund(&auth, DEPLOY_FEE_NANO);
+                self.policy.lock().unwrap().refund(&auth, TX_FEE_NANO);
                 err_json(format!("deploy failed:\n{out}"), json!({ "output": out }))
             }
             Err(e) => {
-                self.policy.lock().unwrap().refund(&auth, DEPLOY_FEE_NANO);
+                self.policy.lock().unwrap().refund(&auth, TX_FEE_NANO);
                 err_json(e, json!({}))
             }
         }
@@ -1168,16 +1218,15 @@ impl PsyWalletServer {
 
     #[tool(description = "Call a deployed contract method on this wallet's behalf — the read/write side of psyup_deploy, which the toolset was missing: an agent could author and deploy a contract but had no way to invoke it. POLICY-GATED like any spend: needs a valid session, the policy must allow the `call_contract` method (owner adds it via update_policy), and the 1 PSY call fee is charged against the policy caps. Submits a REAL proof with this wallet's key and returns the end-user-leaf-hash; a method that fails in-circuit (wrong method name, wrong arity, an assertion) refunds the fee and reports the error. `inputs` is a JSON array of integers — pass `[]` for a zero-argument method like `main`.")]
     async fn call_contract(&self, Parameters(a): Parameters<CallContractArgs>) -> Result<CallToolResult, McpError> {
-        const CALL_FEE_NANO: u64 = 1_000_000_000; // 1 PSY, same as a deploy
         let mut inner = self.inner.lock().await;
         // Policy gate below the model, same shape as deploy: a call is a tx on
         // the user's chain identity and is charged against the owner's caps.
-        let auth = match self.policy.lock().unwrap().authorize(&a.session, SELF_RECIPIENT, CALL_FEE_NANO, "call_contract") {
+        let auth = match self.policy.lock().unwrap().authorize(&a.session, SELF_RECIPIENT, TX_FEE_NANO, "call_contract") {
             Ok(auth) => auth,
             Err(e) => return err_json(format!("policy denied: {e:#}"), json!({ "gate": "policy" })),
         };
         if inner.wallet.current_user().is_none() {
-            self.policy.lock().unwrap().refund(&auth, CALL_FEE_NANO);
+            self.policy.lock().unwrap().refund(&auth, TX_FEE_NANO);
             return err_json("no wallet loaded — a call needs a wallet to sign and pay the call fee", json!({ "gate": "wallet" }));
         }
         // exec_call already retries once on a stale-state rejection (stale nonce /
@@ -1189,7 +1238,7 @@ impl PsyWalletServer {
                 "note": "Call submitted with a real proof — watch the tx on the explorer.",
             })),
             Err(e) => {
-                self.policy.lock().unwrap().refund(&auth, CALL_FEE_NANO);
+                self.policy.lock().unwrap().refund(&auth, TX_FEE_NANO);
                 err_json(format!("call failed: {e:#}"), json!({ "gate": "execute" }))
             }
         }
@@ -1280,6 +1329,10 @@ impl PsyWalletServer {
             self.policy.lock().unwrap().refund(&auth, charge);
             return err_json(format!("unknown token {}", a.token), json!({ "gate": "args" }));
         };
+        if let Err(reason) = ensure_spendable_balance(&inner.wallet, contract, CONTRACT_PSY, a.amount_nano, &a.token).await {
+            self.policy.lock().unwrap().refund(&auth, charge);
+            return err_json(reason, json!({ "gate": "balance" }));
+        }
         match inner.wallet.transfer(a.to_user_id, a.amount_nano, contract).await {
             Ok(leaf) => ok_json(json!({ "submitted": true, "endUserLeafHash": leaf, "toUserId": a.to_user_id, "amount": a.amount_nano, "token": a.token })),
             Err(e) => {
@@ -1332,6 +1385,11 @@ impl PsyWalletServer {
             self.policy.lock().unwrap().refund(&auth, total_nano);
             return err_json(format!("unknown token {}", a.token), json!({ "gate": "args" }));
         };
+        let total_base: u64 = a.payments.iter().map(|p| p.amount_nano).fold(0u64, |x, y| x.saturating_add(y));
+        if let Err(reason) = ensure_spendable_balance(&inner.wallet, contract, CONTRACT_PSY, total_base, &a.token).await {
+            self.policy.lock().unwrap().refund(&auth, total_nano);
+            return err_json(reason, json!({ "gate": "balance", "sent": false }));
+        }
         // 2. Real proof + submit. One recursive proof carries every payment, so
         //    the batch settles together or not at all.
         let payments: Vec<(u64, u64)> = a.payments.iter().map(|p| (p.to_user_id, p.amount_nano)).collect();
@@ -2255,6 +2313,8 @@ impl PsyWalletServer {
                           base.trim_end_matches('/'), proof.payer_user_id);
         let wait_secs = a.settlement_wait_seconds.unwrap_or(90).min(600);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
+        let max_age = a.max_age_checkpoints.unwrap_or(240);
+        let mut latest_cp: Option<u64> = inner.wallet.latest_checkpoint().await.ok();
         let matched = loop {
             let body: serde_json::Value = match reqwest::Client::new().get(&url).send().await {
                 Ok(r) => match r.json().await { Ok(v) => v, Err(e) =>
@@ -2262,6 +2322,9 @@ impl PsyWalletServer {
                 Err(e) => return err_json(format!("indexer unreachable: {e}"), json!({ "gate": "indexer", "valid": false })),
             };
             let items = body.get("data").and_then(|d| d.get("items")).and_then(|i| i.as_array()).cloned().unwrap_or_default();
+            if latest_cp.is_none() {
+                latest_cp = inner.wallet.latest_checkpoint().await.ok();
+            }
             // The hash a payer holds is the end-user-leaf-hash its wallet
             // returned; the indexer records the endcap CONTENT hash — they
             // never match for a fresh payment. Exact hash match is accepted
@@ -2269,18 +2332,47 @@ impl PsyWalletServer {
             // settled transfer from this payer to this recipient covering the
             // amount. Newest first, so a fresh payment cannot be satisfied by
             // an ancient one at a different price by accident.
-            let matched = items.iter().find(|it| {
+            // Hash match is exact. The FIELD fallback exists because the payer
+            // holds the end-user-leaf hash while the indexer records the
+            // endcap content hash — they never match for a fresh payment — but
+            // within the indexer's ingestion lag window the fallback can hit an
+            // older settled payment with the same payer/recipient/amount and
+            // misjudge the fresh one as stale (bug #8). Track both matches so
+            // the stale gate below can distinguish them: an exact-hash match is
+            // authoritative immediately; a field match only becomes so once
+            // the fallback row's own age has been checked, and a stale field
+            // match keeps polling for the real row instead of failing.
+            let hash_hit = items.iter().find(|it| {
                 it.get("tx_hash").and_then(|h| h.as_str()) == Some(proof.tx_hash.as_str())
-            }).or_else(|| items.iter().find(|it| {
+            }).cloned();
+            let field_hit = items.iter().find(|it| {
                 it.get("recipient_user_id").and_then(|r| r.as_u64()) == Some(proof.recipient_user_id)
                     && it.get("sender_user_id").and_then(|r| r.as_u64()) == Some(proof.payer_user_id)
                     && it.get("amount").and_then(|a2| a2.as_str())
                         .and_then(|s2| s2.parse::<u64>().ok())
                         .map(|v| v >= proof.amount_nano)
                         .unwrap_or(false)
-            })).cloned();
-            if matched.is_some() || std::time::Instant::now() >= deadline {
-                break matched;
+            }).cloned();
+            if let Some(hit) = hash_hit {
+                break Some(hit);
+            }
+            if let Some(hit) = field_hit.as_ref() {
+                // Fresh enough to be payment-for-now? Use the row's own
+                // checkpoint, not the wall clock.
+                let row_age_ok = hit.get("checkpoint_id")
+                    .and_then(|c| c.as_u64())
+                    .and_then(|paid| latest_cp.map(|l| l.saturating_sub(paid) <= max_age))
+                    .unwrap_or(false);
+                if row_age_ok {
+                    break Some(hit.clone());
+                }
+                // Stale field hit: keep polling for the fresh row.
+            }
+            if std::time::Instant::now() >= deadline {
+                // Preserve the last field match for the common validation path
+                // below. That path still applies check_payment_age and fails
+                // closed; reaching the deadline never makes a stale row valid.
+                break field_hit;
             }
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         };
@@ -2300,7 +2392,7 @@ impl PsyWalletServer {
                 // An old settled payment is a receipt, not money offered now:
                 // bound how far back a claim may reach, so one historic payment
                 // cannot be replayed against future resources indefinitely.
-                let max_age = a.max_age_checkpoints.unwrap_or(240);
+
                 // FAIL CLOSED. This was `if let (Some(paid_at), Ok(latest))`
                 // with no else, so a row without a checkpoint_id, or an
                 // unreachable coordinator, silently SKIPPED the age gate — and
@@ -3091,31 +3183,48 @@ async fn main() -> anyhow::Result<()> {
     // never requires routing the private key through the model's context.
     if let Ok(key_file) = std::env::var(keystore::KEY_FILE_ENV) {
         if !key_file.trim().is_empty() {
-            let backup = keystore::load_key_file(&key_file)?;
-            // A failed restore must NOT kill the server. `mint_agent_account`
-            // tells the owner to restart with PSY_MCP_KEY_FILE=<path>, and a
-            // mandate-bound account cannot currently be reloaded (its identity
-            // is derived from the SD-key CIRCUIT fingerprint, and nothing
-            // re-registers that circuit on this path) — so following the tool's
-            // own instruction exited the process before it served anything.
-            // Boot without a wallet instead and say exactly what happened; the
-            // owner can still reach every read-only and setup tool.
-            match wallet.load_from_backup(&backup).await {
-                Ok(loaded) => tracing::info!(
-                    "wallet restored from {} — user id {} (Psy-{:08}); create a policy to let the agent spend",
-                    key_file,
-                    loaded.user_id,
-                    loaded.user_id
-                ),
-                Err(e) => tracing::error!(
-                    "could not restore the wallet from {key_file}: {e:#}. \
-                     Starting WITHOUT a loaded wallet — fund-moving tools will report no wallet \
-                     until one is loaded. If this key was created by mint_agent_account (backup \
-                     fingerprint {}), reloading a mandate-bound account is not supported yet: the \
-                     identity comes from its software-defined circuit, which this path does not \
-                     re-register. Use a create_wallet-generated key file, or re-mint.",
-                    backup.fingerprint
-                ),
+            // Same fail-open-boot rule as the load below: an unreadable or
+            // corrupt file must not kill the server before it serves anything.
+            // The auto-restore wrapper picks the newest wallet-*.json, so one
+            // truncated file would otherwise brick every startup until the
+            // owner finds and removes it by hand.
+            let backup = match keystore::load_key_file(&key_file) {
+                Ok(b) => Some(b),
+                Err(e) => {
+                    tracing::error!(
+                        "could not read the key file {key_file}: {e:#}. Starting WITHOUT a \
+                         loaded wallet — every tool stays reachable; fix or remove the file and \
+                         restart, or use create_wallet/load to bring a wallet up."
+                    );
+                    None
+                }
+            };
+            if let Some(backup) = backup {
+                // A failed restore must NOT kill the server. `mint_agent_account`
+                // tells the owner to restart with PSY_MCP_KEY_FILE=<path>, and a
+                // mandate-bound account cannot currently be reloaded (its identity
+                // is derived from the SD-key CIRCUIT fingerprint, and nothing
+                // re-registers that circuit on this path) — so following the tool's
+                // own instruction exited the process before it served anything.
+                // Boot without a wallet instead and say exactly what happened; the
+                // owner can still reach every read-only and setup tool.
+                match wallet.load_from_backup(&backup).await {
+                    Ok(loaded) => tracing::info!(
+                        "wallet restored from {} — user id {} (Psy-{:08}); create a policy to let the agent spend",
+                        key_file,
+                        loaded.user_id,
+                        loaded.user_id
+                    ),
+                    Err(e) => tracing::error!(
+                        "could not restore the wallet from {key_file}: {e:#}. \
+                         Starting WITHOUT a loaded wallet — fund-moving tools will report no wallet \
+                         until one is loaded. If this key was created by mint_agent_account (backup \
+                         fingerprint {}), reloading a mandate-bound account is not supported yet: the \
+                         identity comes from its software-defined circuit, which this path does not \
+                         re-register. Use a create_wallet-generated key file, or re-mint.",
+                        backup.fingerprint
+                    ),
+                }
             }
         }
     }

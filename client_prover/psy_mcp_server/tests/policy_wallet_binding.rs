@@ -24,7 +24,7 @@ fn a_policy_created_for_one_wallet_refuses_another() {
     let mut e = PolicyEngine::new();
     e.set_current_user(111);
     let pid = e.create_policy("agent", limits(), None, vec![]);
-    let (tok, _) = e.issue_session(&pid, 60).unwrap();
+    let (tok, _) = e.issue_session(&pid, 60, None).unwrap();
     assert!(e.authorize(&tok, "1", PSY, "simple_transfer").is_ok(), "its own wallet spends fine");
 
     // The process swaps identity underneath the policy.
@@ -45,7 +45,7 @@ fn the_refusal_is_recorded_as_a_blocked_attempt() {
     let mut e = PolicyEngine::new();
     e.set_current_user(111);
     let pid = e.create_policy("agent", limits(), None, vec![]);
-    let (tok, _) = e.issue_session(&pid, 60).unwrap();
+    let (tok, _) = e.issue_session(&pid, 60, None).unwrap();
     e.set_current_user(222);
     let _ = e.authorize(&tok, "9", 7 * PSY, "simple_transfer");
 
@@ -61,11 +61,37 @@ fn returning_to_the_right_wallet_works_again() {
     let mut e = PolicyEngine::new();
     e.set_current_user(111);
     let pid = e.create_policy("agent", limits(), None, vec![]);
-    let (tok, _) = e.issue_session(&pid, 60).unwrap();
+    let (tok, _) = e.issue_session(&pid, 60, None).unwrap();
     e.set_current_user(222);
     assert!(e.authorize(&tok, "1", PSY, "simple_transfer").is_err());
     e.set_current_user(111);
     assert!(e.authorize(&tok, "1", PSY, "simple_transfer").is_ok(), "back on its own wallet");
+}
+
+#[test]
+fn a_persisted_policy_names_the_wallet_mismatch_after_an_in_process_swap() {
+    let dir = std::env::temp_dir().join(format!(
+        "psy-policy-wallet-swap-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut e = PolicyEngine::load_or_new(&dir);
+    e.set_current_user(111);
+    let pid = e.create_policy("agent", limits(), None, vec![]);
+    let (tok, _) = e.issue_session(&pid, 60, None).unwrap();
+
+    e.set_current_user(222);
+    let msg = e.authorize(&tok, "1", PSY, "simple_transfer")
+        .expect_err("a persisted policy must remain visible to the binding gate")
+        .to_string();
+    assert!(msg.contains("Psy-00000111"), "{msg}");
+    assert!(msg.contains("Psy-00000222"), "{msg}");
+    assert!(!msg.contains("no longer exists"), "{msg}");
+
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -75,7 +101,7 @@ fn a_policy_written_before_this_binds_on_first_use_rather_than_locking_out() {
     // binding on first spend upgrades them safely.
     let mut e = PolicyEngine::new();
     let pid = e.create_policy("legacy", limits(), None, vec![]); // no current user yet
-    let (tok, _) = e.issue_session(&pid, 60).unwrap();
+    let (tok, _) = e.issue_session(&pid, 60, None).unwrap();
 
     e.set_current_user(555);
     assert!(e.authorize(&tok, "1", PSY, "simple_transfer").is_ok(), "first use binds, does not refuse");
@@ -91,7 +117,7 @@ fn with_no_wallet_loaded_the_gate_stays_out_of_the_way() {
     // "no wallet loaded" error with a confusing identity mismatch.
     let mut e = PolicyEngine::new();
     let pid = e.create_policy("agent", limits(), None, vec![]);
-    let (tok, _) = e.issue_session(&pid, 60).unwrap();
+    let (tok, _) = e.issue_session(&pid, 60, None).unwrap();
     assert!(e.authorize(&tok, "1", PSY, "simple_transfer").is_ok());
 }
 
@@ -100,7 +126,7 @@ fn the_batch_path_is_gated_too() {
     let mut e = PolicyEngine::new();
     e.set_current_user(111);
     let pid = e.create_policy("agent", limits(), None, vec![]);
-    let (tok, _) = e.issue_session(&pid, 60).unwrap();
+    let (tok, _) = e.issue_session(&pid, 60, None).unwrap();
     e.set_current_user(222);
     let legs: Vec<(&str, u64)> = vec![("1", PSY), ("2", PSY)];
     let err = e.authorize_batch(&tok, &legs, "simple_transfer").unwrap_err().to_string();
@@ -120,7 +146,7 @@ fn spent_counters_do_not_leak_between_wallets() {
         None,
         vec![],
     );
-    let (tok, _) = e.issue_session(&pid, 60).unwrap();
+    let (tok, _) = e.issue_session(&pid, 60, None).unwrap();
     assert!(e.authorize(&tok, "1", 9 * PSY, "simple_transfer").is_ok());
 
     // Wallet B must not be able to spend against A's remaining 1 PSY, nor be
