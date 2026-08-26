@@ -76,6 +76,20 @@ test "$LOCAL_CF_ORIGINAL_CHAIN_CONFIG" = "$BSC_PSY_GENESIS_DIR/config.json"
 test "$LOCAL_STAGING_PSY_FAUCET_TEMPLATE_JSON_PATH" = "$BSC_LOCAL_STATE_ROOT/faucetOperators.template.json"
 test "$LOCAL_STAGING_GENESIS_PATH" = "$BSC_LOCAL_STATE_ROOT/genesis.json"
 test "$LOCAL_STAGING_PRIVATE_KEYS_PATH" = "$BSC_LOCAL_STATE_ROOT/private_keys.json"
+test "$LOCAL_STAGING_PSY_SERVICES_GENESIS_PATH" = "$BSC_PSY_GENESIS_DIR/genesis_contracts.json"
+test "$BSC_LOCAL_HOME" = "$BSC_LOCAL_STATE_ROOT/home"
+test "$LOCAL_STAGING_PROVE_PROXY_HOME" = "$BSC_LOCAL_HOME"
+test "$LOCAL_GROTH16_KEYSTORE_ROOT" = "$BSC_LOCAL_HOME/.psy/keystore"
+test "$LOCAL_STAGING_REALM_INDEXER_START_CHECKPOINT" = "0"
+test "$LOCAL_CF_ENVIO_NETWORK_NAME" = "parth-bsc-envio-network"
+grep -q 'configure_envio_compose_network' \
+  "$PARTH_ROOT/deploy/local-testnet/cloudflare-tunnel/up.sh"
+expected_withdraw_method_id="$(
+  jq -er '.contract.methods[] | select(.name == "withdraw") | .method_id' \
+    "$BSC_LOCAL_TOKEN_CONTRACT_ABI"
+)"
+test "$BSC_LOCAL_RELAYER_WITHDRAW_METHOD_ID" = "$expected_withdraw_method_id"
+test "$LOCAL_STAGING_RELAYER_WITHDRAW_METHOD_ID" = "$expected_withdraw_method_id"
 
 runtime_runner_pattern='\$PARTH_DIR/deploy/bin/run-parth-service'
 if grep -q "$runtime_runner_pattern" \

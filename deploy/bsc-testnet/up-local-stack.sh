@@ -15,6 +15,7 @@ export BSC_LOCAL_PHASE="$phase"
 
 if [ "${BSC_LOCAL_RESET:-0}" = "1" ]; then
   echo "[bsc-testnet] resetting isolated BSC full stack"
+  export LOCAL_CF_REGENERATE_GROTH16_KEYSTORE="${LOCAL_CF_REGENERATE_GROTH16_KEYSTORE:-1}"
   BSC_LOCAL_REMOVE_VOLUMES=1 bash "$BSC_DEPLOY_DIR/down-local-stack.sh" || true
 fi
 

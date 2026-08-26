@@ -186,6 +186,7 @@ prepare_local_groth16_keystores() {
   local regenerate="${LOCAL_CF_REGENERATE_GROTH16_KEYSTORE:-0}"
   local source_stamp="$keystore_root/.bridge-circuit-source.sha256"
   local source_hash
+  local setup_complete=1
   local dir file
 
   source_hash="$(
@@ -205,14 +206,23 @@ prepare_local_groth16_keystores() {
     fi
   fi
 
-  if [ "$regenerate" != "1" ]; then
-    for dir in "$keystore_root" "$keystore_root/deposit_append" "$keystore_root/withdrawal_claim"; do
-      for file in circuit_groth16.bin pk_groth16.bin vk_groth16.bin; do
-        if [ ! -s "$dir/$file" ]; then
-          regenerate=1
-        fi
-      done
+  for dir in "$keystore_root" "$keystore_root/deposit_append" "$keystore_root/withdrawal_claim"; do
+    for file in circuit_groth16.bin pk_groth16.bin vk_groth16.bin; do
+      if [ ! -s "$dir/$file" ]; then
+        setup_complete=0
+      fi
     done
+  done
+
+  if [ "$setup_complete" != "1" ]; then
+    regenerate=1
+  elif [ ! -s "$source_stamp" ] || [ "$(cat "$source_stamp")" != "$source_hash" ]; then
+    if [ "$regenerate" != "1" ] && [ "$LOCAL_CF_FULL_RESET_REQUESTED" != "1" ]; then
+      echo "[local-cf-tunnel] Groth16 setup does not match the current bridge circuits: $keystore_root" >&2
+      echo "[local-cf-tunnel] reset/redeploy L1 with LOCAL_CF_REGENERATE_GROTH16_KEYSTORE=1" >&2
+      exit 1
+    fi
+    regenerate=1
   fi
 
   [ "$regenerate" = "1" ] || return 0
@@ -713,6 +723,27 @@ start_envio_storage() {
   exit 1
 }
 
+configure_envio_compose_network() {
+  local compose_file="$1"
+  local network_name="${LOCAL_CF_ENVIO_NETWORK_NAME:-local_test_network}"
+
+  node -e '
+const fs = require("fs");
+const path = process.argv[1];
+const networkName = process.argv[2];
+const source = fs.readFileSync(path, "utf8");
+const pattern = /(networks:\n  my-proxy-net:\n    name: )[^\n]+/;
+if (!pattern.test(source)) {
+  throw new Error(`could not find Envio my-proxy-net name in ${path}`);
+}
+const updated = source.replace(pattern, `$1${networkName}`);
+if (updated !== source) {
+  fs.writeFileSync(path, updated);
+  console.log(`[local-cf-tunnel] Envio compose network: ${networkName}`);
+}
+' "$compose_file" "$network_name"
+}
+
 start_envio_if_needed() {
   [ "${LOCAL_CF_START_ENVIO:-1}" = "1" ] || return 0
 
@@ -781,6 +812,7 @@ start_envio_if_needed() {
   fi
   local_cf_require_file "$compose_file"
   local_cf_require_file "$generated_config_file"
+  configure_envio_compose_network "$compose_file"
 
   # Envio is a derived L1 event index. Local Anvil is routinely restarted from
   # genesis with the same chain id and deterministic contract addresses, which

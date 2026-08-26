@@ -73,6 +73,7 @@ NGINX_ROOT="${LOCAL_STAGING_NGINX_ROOT:-$LOCAL_STAGING_STATE_DIR/nginx/html}"
 GENESIS_PATH="${LOCAL_STAGING_GENESIS_PATH:-$PARTH_DIR/genesis.json}"
 PRIVATE_KEYS_PATH="${LOCAL_STAGING_PRIVATE_KEYS_PATH:-$PARTH_DIR/private_keys.json}"
 RPC_CONFIG="${LOCAL_STAGING_RPC_CONFIG:-$LOCAL_STAGING_PSY_GENESIS_DIR/config.json}"
+PSY_SERVICES_GENESIS_PATH="${LOCAL_STAGING_PSY_SERVICES_GENESIS_PATH:-$LOCAL_STAGING_PSY_GENESIS_DIR/genesis_contracts.json}"
 USER_CLI="$LOCAL_STAGING_TARGET_DIR/release/psy_user_cli"
 PSY_FAUCET_OPERATORS_JSON_PATH="${LOCAL_STAGING_PSY_FAUCET_OPERATORS_JSON_PATH:-}"
 PSY_FAUCET_TEMPLATE_JSON_PATH="${LOCAL_STAGING_PSY_FAUCET_TEMPLATE_JSON_PATH:-$LOCAL_STAGING_PSY_DAPP_DIR/apps/bridge/src/config/faucetOperators.json}"
@@ -578,7 +579,7 @@ start_realm() {
   fi
 
   if [ "$LOCAL_STAGING_START_INDEXERS" = "1" ]; then
-    start_process "psy-indexer-realm-${realm_id}" "psy-indexer" \
+    local realm_indexer_env=(
       "PSY_INDEXER_MODE=realm" \
       "REALM_ID=$realm_id" \
       "REALM_SUB_ID=1" \
@@ -588,6 +589,12 @@ start_realm() {
       "PSY_BACKUP_DIR=$CHECKPOINT_DIR" \
       "PSY_POLL_INTERVAL_MS=${LOCAL_STAGING_INDEXER_POLL_INTERVAL_MS:-2000}" \
       "PSY_NETWORK_TYPE=$LOCAL_STAGING_NETWORK"
+    )
+    if [ -n "${LOCAL_STAGING_REALM_INDEXER_START_CHECKPOINT:-}" ]; then
+      realm_indexer_env+=("PSY_INDEXER_START_CHECKPOINT=$LOCAL_STAGING_REALM_INDEXER_START_CHECKPOINT")
+    fi
+    restart_process_if_env_changed "psy-indexer-realm-${realm_id}" "${realm_indexer_env[@]}"
+    start_process "psy-indexer-realm-${realm_id}" "psy-indexer" "${realm_indexer_env[@]}"
   fi
 }
 
@@ -694,6 +701,10 @@ start_faucet_split_components() {
       "PROVE_PROXY_LISTEN_ADDR=$LOCAL_STAGING_PROVE_PROXY_ADDR"
       "RPC_CONFIG=$RPC_CONFIG"
     )
+    if [ -n "${LOCAL_STAGING_PROVE_PROXY_HOME:-}" ]; then
+      mkdir -p "$LOCAL_STAGING_PROVE_PROXY_HOME"
+      prove_proxy_env+=("HOME=$LOCAL_STAGING_PROVE_PROXY_HOME")
+    fi
 
     restart_process_if_env_changed "prove-proxy" "${prove_proxy_env[@]}"
     start_process "prove-proxy" "prove-proxy" "${prove_proxy_env[@]}"
@@ -868,6 +879,7 @@ main() {
   fi
 
   if [ "$LOCAL_STAGING_START_PSY_SERVICES" = "1" ]; then
+    require_file "$PSY_SERVICES_GENESIS_PATH"
     local psy_services_binary_sha256
     psy_services_binary_sha256="$(sha256sum "$LOCAL_STAGING_PSY_SERVICES_TARGET_DIR/release/psy-services" | awk '{print $1}')"
     local psy_services_env=(
@@ -878,7 +890,7 @@ main() {
       "PSY_NETWORK_TYPE=$LOCAL_STAGING_NETWORK" \
       "PSY_SERVICES_RUN_MIGRATIONS=true" \
       "PSY_SERVICES_DISABLE_AUTH=1" \
-      "PSY_GENESIS_PATH=$GENESIS_PATH" \
+      "PSY_GENESIS_PATH=$PSY_SERVICES_GENESIS_PATH" \
       "PSY_NOSTR_ENABLED=true" \
       "PSY_NOSTR_RELAY_URLS=ws://127.0.0.1:$LOCAL_NOSTR_PORT" \
       "L1_RPC_URL=$L1_RPC_URL" \

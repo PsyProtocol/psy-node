@@ -53,12 +53,15 @@ bash deploy/bsc-testnet/static-check.sh
 # checks for the current phase pass.
 AUTHORIZED_BSC_LOCAL_TRANSACTIONS=1 BSC_LOCAL_RESET=1 \
   bash deploy/bsc-testnet/up-local-stack.sh l1
+bash deploy/bsc-testnet/check-local-stack.sh l1
 
 AUTHORIZED_BSC_LOCAL_TRANSACTIONS=1 \
   bash deploy/bsc-testnet/up-local-stack.sh core
+bash deploy/bsc-testnet/check-local-stack.sh core
 
 AUTHORIZED_BSC_LOCAL_TRANSACTIONS=1 \
   bash deploy/bsc-testnet/up-local-stack.sh bridge
+bash deploy/bsc-testnet/check-local-stack.sh bridge
 
 # `all` remains available for a clean, dedicated test host.
 AUTHORIZED_BSC_LOCAL_TRANSACTIONS=1 BSC_LOCAL_RESET=1 \
@@ -76,6 +79,20 @@ BSC_LOCAL_REMOVE_VOLUMES=1 bash deploy/bsc-testnet/down-local-stack.sh
 The first full-stack gate is CLI-only. Cloudflare Tunnel and frontend
 publication stay disabled so backend behavior can be validated before adding
 wallet distribution or public BSC domains.
+
+The BSC profile keeps Groth16 setup files under
+`.local-bsc-testnet/home/.psy/keystore`. It does not reuse the regular
+`~/.psy/keystore`. Missing setup files are generated before L1 deployment, and
+an existing setup whose circuit fingerprint is stale causes a hard failure
+until L1 is deliberately reset and redeployed with the matching verifiers.
+
+Fresh realm indexers resume after checkpoint `0`; genesis has no realm endcap
+backup to ingest. Override `BSC_LOCAL_REALM_INDEXER_START_CHECKPOINT` only for
+an intentional backfill or recovery run.
+
+The bridge relayer withdraw method ID is derived from the current BSC USDT ABI.
+This prevents a stale local-testnet default from silently ignoring BSC
+withdrawal events after ABI regeneration.
 
 The pinned Scylla `2026.1.5` image requires the host setting
 `fs.aio-max-nr >= 67590`. Preflight reports the current value and fails before
@@ -98,6 +115,6 @@ Default isolated ports:
 | realm 0 / realm 1 | `23380` / `23390` |
 | prove-proxy / faucet | `19999` / `19998` |
 | psy-services | `13000` |
-| Envio/Hasura | `18080` |
+| Envio/Hasura | `28080` |
 | Redis / NATS / Scylla | `16379` / `14222` / `19042` |
 | Nostr / psy-services Postgres | `18081` / `25432` |

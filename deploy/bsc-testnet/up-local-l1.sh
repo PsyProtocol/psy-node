@@ -21,15 +21,22 @@ if [ "${BSC_LOCAL_RESET:-0}" = "1" ]; then
   rm -f "$BSC_ANVIL_STATE_FILE"
 fi
 
-nohup anvil \
-  --host "$BSC_LOCAL_RPC_HOST" \
-  --port "$BSC_LOCAL_RPC_PORT" \
-  --chain-id "$BSC_LOCAL_CHAIN_ID" \
-  --block-time "$BSC_LOCAL_BLOCK_TIME" \
-  --state "$BSC_ANVIL_STATE_FILE" \
-  --silent \
-  </dev/null \
-  >"$BSC_ANVIL_LOG_FILE" 2>&1 &
+anvil_args=(
+  --host "$BSC_LOCAL_RPC_HOST"
+  --port "$BSC_LOCAL_RPC_PORT"
+  --chain-id "$BSC_LOCAL_CHAIN_ID"
+  --block-time "$BSC_LOCAL_BLOCK_TIME"
+  --state "$BSC_ANVIL_STATE_FILE"
+  --silent
+)
+
+if command -v setsid >/dev/null 2>&1; then
+  nohup setsid anvil "${anvil_args[@]}" \
+    </dev/null >"$BSC_ANVIL_LOG_FILE" 2>&1 &
+else
+  nohup anvil "${anvil_args[@]}" \
+    </dev/null >"$BSC_ANVIL_LOG_FILE" 2>&1 &
+fi
 pid=$!
 printf '%s\n' "$pid" > "$BSC_ANVIL_PID_FILE"
 
