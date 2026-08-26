@@ -71,3 +71,6 @@ tracing-subscriber = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
 schemars = "0.8"
+
+[dev-dependencies]
+tempfile = { workspace = true }

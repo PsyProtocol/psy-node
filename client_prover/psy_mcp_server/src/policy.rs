@@ -372,6 +372,9 @@ impl Default for Limits {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct Policy {
     agent_id: String,
+    /// Network containing `bound_user_id`. Old policies bind on first use.
+    #[serde(default)]
+    bound_network: Option<String>,
     /// The on-chain user id this policy governs.
     ///
     /// A policy is a budget for ONE wallet. Without this it was a budget for
@@ -423,6 +426,8 @@ pub struct Authorization {
     /// it, a spend that failed AFTER the gate (balance refusal, chain error)
     /// would permanently eat the session cap.
     pub session_token: String,
+    pub network: Option<String>,
+    pub user_id: Option<u64>,
     /// The spend-log rows this authorization created. `refund` uses these to
     /// mark exactly those rows, rather than guessing from an amount.
     pub spend_ids: Vec<u64>,
@@ -448,6 +453,7 @@ pub struct SpendRecord {
     pub age_seconds: u64,
     pub policy_id: String,
     pub agent_id: String,
+    pub network: Option<String>,
     pub method: String,
     /// As the tool passed it (not normalized), so it reads the way the owner
     /// would recognise it.
@@ -471,6 +477,7 @@ pub struct DeniedRecord {
     pub age_seconds: u64,
     pub policy_id: String,
     pub agent_id: String,
+    pub network: Option<String>,
     pub method: String,
     pub recipient: String,
     /// Nano-denominated amount; the wire name is plain `amount` — the unit is
@@ -603,6 +610,7 @@ pub struct PolicyEngine {
     /// Process-local and never persisted: it describes the running server, not
     /// the policy store. `None` before any wallet is loaded.
     current_user_id: Option<u64>,
+    current_network: Option<String>,
     /// Whether reloads should retain only policies belonging to the initial
     /// wallet. Disabled after an in-process wallet swap so bind_or_reject can
     /// report the identity mismatch instead of pretending the policy vanished.
@@ -647,6 +655,7 @@ impl PolicyEngine {
     pub fn new() -> Self {
         Self {
             current_user_id: None,
+            current_network: None,
             hide_foreign_on_reload: false,
             foreign_hidden: Vec::new(),
             spend_log_dropped: 0,
@@ -786,6 +795,16 @@ impl PolicyEngine {
         Ok(())
     }
 
+    /// Request-scoped capability check. The wallet identity and network are
+    /// installed while the caller still holds the PolicyEngine mutex, so no
+    /// concurrent request can substitute its environment between binding and
+    /// authorization.
+    pub fn check_can_act_for(&mut self, network: &str, user_id: Option<u64>, token: &str, method: &str) -> anyhow::Result<()> {
+        self.current_network = Some(network.to_string());
+        self.current_user_id = user_id;
+        self.check_can_act(token, method)
+    }
+
     /// Tell the engine which wallet this process now has loaded.
     ///
     /// Called after every successful load / register / mint. A policy is a
@@ -812,6 +831,11 @@ impl PolicyEngine {
             // can reach bind_or_reject and name the mismatched identities.
             self.reload_policies();
         }
+    }
+
+    pub fn set_current_wallet(&mut self, network: &str, user_id: u64) {
+        self.current_network = Some(network.to_string());
+        self.set_current_user(user_id);
     }
 
     /// Bug #4: containers sharing the keystore volume share one policies.json,
@@ -856,15 +880,30 @@ impl PolicyEngine {
             return None;
         };
         let Some(policy) = self.policies.get_mut(policy_id) else { return None };
+        if let (Some(bound), Some(current_network)) = (policy.bound_network.as_deref(), self.current_network.as_deref()) {
+            if bound != current_network {
+                return Some(format!(
+                    "this policy governs network `{bound}` but the server currently uses `{current_network}`"
+                ));
+            }
+        }
         match policy.bound_user_id {
             Some(bound) if bound != current => Some(format!(
                 "this policy governs Psy-{bound:08} but the server currently has Psy-{current:08} loaded — \
                  a policy is a budget for one wallet, and its limits and spent counters do not transfer. \
                  Load the wallet this policy was created for, or ask the owner for a policy for this one."
             )),
-            Some(_) => None,
+            Some(_) => {
+                if policy.bound_network.is_none() {
+                    policy.bound_network = self.current_network.clone();
+                }
+                None
+            }
             None => {
                 policy.bound_user_id = Some(current);
+                if policy.bound_network.is_none() {
+                    policy.bound_network = self.current_network.clone();
+                }
                 None
             }
         }
@@ -988,6 +1027,7 @@ impl PolicyEngine {
             id.clone(),
             Policy {
                 agent_id: agent_id.to_string(),
+                bound_network: self.current_network.clone(),
                 // Stamp the identity this policy is for at creation, when we
                 // know it. A policy created before a wallet is loaded binds on
                 // first spend instead.
@@ -1545,11 +1585,17 @@ impl PolicyEngine {
     }
 
     fn record_denial(&mut self, policy_id: &str, agent_id: &str, recipient: &str, amount: u64, method: &str, reason: &str) {
+        let network = self
+            .policies
+            .get(policy_id)
+            .and_then(|p| p.bound_network.clone())
+            .or_else(|| self.current_network.clone());
         self.denied_log.push_back(DeniedRecord {
             timestamp: now_secs(),
             age_seconds: 0,
             policy_id: policy_id.to_string(),
             agent_id: agent_id.to_string(),
+            network,
             method: method.to_string(),
             recipient: recipient.to_string(),
             amount_nano: amount,
@@ -1628,6 +1674,7 @@ impl PolicyEngine {
             age_seconds: 0,
             policy_id: auth.policy_id.clone(),
             agent_id: auth.agent_id.clone(),
+            network: auth.network.clone(),
             method: method.to_string(),
             recipient: recipient.to_string(),
             amount_nano: amount,
@@ -1642,18 +1689,39 @@ impl PolicyEngine {
         self.authorize_aliases(token, &[recipient], amount, method)
     }
 
-    /// Same gate, for a payee the caller knows by more than one identifier — the
-    /// x402 case, where one request yields both the seller's HOST and the user
-    /// id its 402 challenge demands payment to. Both names come from the same
-    /// response, so allowlisting either one is an owner approving that payee;
-    /// an attacker-controlled host still fails on the host AND on its own id.
-    pub fn authorize_aliases(
+    pub fn authorize_for(
         &mut self,
+        network: &str,
+        user_id: Option<u64>,
+        token: &str,
+        recipient: &str,
+        amount: u64,
+        method: &str,
+    ) -> anyhow::Result<Authorization> {
+        self.authorize_aliases_for(network, user_id, token, &[recipient], amount, method)
+    }
+
+    pub fn authorize_aliases_for(
+        &mut self,
+        network: &str,
+        user_id: Option<u64>,
         token: &str,
         recipients: &[&str],
         amount: u64,
         method: &str,
     ) -> anyhow::Result<Authorization> {
+        self.current_network = Some(network.to_string());
+        self.current_user_id = user_id;
+        self.authorize_aliases(token, recipients, amount, method)
+    }
+
+    /// Same gate, for a payee the caller knows by more than one identifier —
+    /// the x402 case, where one request yields both the seller's HOST and
+    /// the user id its 402 challenge demands payment to. Both names come
+    /// from the same response, so allowlisting either one is an owner
+    /// approving that payee; an attacker-controlled host still fails on the
+    /// host AND on its own id.
+    pub fn authorize_aliases(&mut self, token: &str, recipients: &[&str], amount: u64, method: &str) -> anyhow::Result<Authorization> {
         // Held until this function returns: the paused/limit CHECK below and the
         // counter COMMIT in record_spend must see, and write, the same state.
         let _guard = self.lock_and_reload();
@@ -1719,6 +1787,8 @@ impl PolicyEngine {
             policy_id: session.policy_id.clone(),
             agent_id: policy.agent_id.clone(),
             session_token: token.to_string(),
+            network: policy.bound_network.clone().or_else(|| self.current_network.clone()),
+            user_id: self.current_user_id,
             spend_ids: Vec::new(),
         };
         let id = self.record_spend(&auth, primary, amount, method);
@@ -1859,12 +1929,32 @@ impl PolicyEngine {
         if let Some(s) = self.sessions.get_mut(token) {
             s.session_spent = s.session_spent.saturating_add(batch_total);
         }
-        let mut auth = Authorization { policy_id: policy_id.clone(), agent_id, session_token: token.to_string(), spend_ids: Vec::new() };
+        let mut auth = Authorization {
+            policy_id: policy_id.clone(),
+            agent_id,
+            session_token: token.to_string(),
+            network: scratch.bound_network.clone().or_else(|| self.current_network.clone()),
+            user_id: self.current_user_id,
+            spend_ids: Vec::new(),
+        };
         for (recipient, amount) in legs {
             let id = self.record_spend(&auth, recipient, *amount, method);
             auth.spend_ids.push(id);
         }
         Ok(auth)
+    }
+
+    pub fn authorize_batch_for(
+        &mut self,
+        network: &str,
+        user_id: Option<u64>,
+        token: &str,
+        legs: &[(&str, u64)],
+        method: &str,
+    ) -> anyhow::Result<Authorization> {
+        self.current_network = Some(network.to_string());
+        self.current_user_id = user_id;
+        self.authorize_batch(token, legs, method)
     }
 }
 

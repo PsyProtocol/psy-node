@@ -58,6 +58,9 @@ pub struct NetworkConfig<F: RichField> {
     pub faucet_rpc_url: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_services_url: Option<Vec<String>>,
+    /// Nostr relay for private-note delivery. This is required per network;
+    /// clients must not silently fall back to another network's relay.
+    pub nostr_relay_url: String,
     pub native_currency: String,
     pub native_currency_decimal: u8,
     pub native_currency_name: String,

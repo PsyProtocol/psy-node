@@ -22,8 +22,11 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends git ca-certi
     && rm -rf /var/lib/apt/lists/* \
 # Debian bookworm ships golang 1.19, which rejects go.mod's `toolchain`
 # directive (a 1.21+ feature) — install upstream Go instead.
-RUN curl -fsSL https://golang.google.cn/dl/go1.24.5.linux-arm64.tar.gz | tar -C /usr/local -xz \
-    && ln -s /usr/local/go/bin/go /usr/local/bin/go \
+ARG TARGETARCH
+RUN curl -fsSL "https://golang.google.cn/dl/go1.24.5.linux-${TARGETARCH}.tar.gz" -o /tmp/go.tar.gz \
+    && tar -C /usr/local -xzf /tmp/go.tar.gz \
+    && rm /tmp/go.tar.gz \
+    && ln -sf /usr/local/go/bin/go /usr/local/bin/go \
     && git config --global url."https://github.com/".insteadOf "ssh://git@github.com/" \
     && git config --global --add url."https://github.com/".insteadOf "git@github.com:"
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true

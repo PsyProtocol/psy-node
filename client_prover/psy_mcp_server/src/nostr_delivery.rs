@@ -27,12 +27,69 @@ use tokio_tungstenite::tungstenite::Message;
 
 /// The tag the recipient wallets' Nostr drain filters private-transfer notes on.
 const TRANSFER_PROOF_TAG: &str = "psy_private_transfer_proof";
+const TRANSFER_SECRETS_TAG: &str = "psy_private_transfer_secrets";
 
 fn limb_tag(name: &'static str, limbs: &[u64; 4]) -> Tag {
     Tag::custom(
         TagKind::Custom(Cow::Borrowed(name)),
         limbs.iter().map(|v| v.to_string()),
     )
+}
+
+fn value_tag(name: &'static str, values: impl IntoIterator<Item = String>) -> Tag {
+    Tag::custom(TagKind::Custom(Cow::Borrowed(name)), values)
+}
+
+fn private_transfer_tags(
+    receiver_pk: PublicKey,
+    event_type: &'static str,
+    backup_id: &str,
+    shield_limbs: &[u64; 4],
+    nullifier_limbs: &[u64; 4],
+    contract_id: u64,
+) -> Vec<Tag> {
+    let nullifier_hex = format!(
+        "0x{}",
+        nullifier_limbs.iter().map(|word| format!("{word:016x}")).collect::<String>()
+    );
+    let contract_id = contract_id.to_string();
+    vec![
+        Tag::public_key(receiver_pk),
+        value_tag("t", [event_type.to_string()]),
+        value_tag("backup_id", [backup_id.to_string()]),
+        limb_tag("shield_address", shield_limbs),
+        limb_tag("nullifier", nullifier_limbs),
+        value_tag("nullifier_hex", [nullifier_hex]),
+        value_tag("token_contract_id", [contract_id.clone()]),
+        value_tag("contract_id", [contract_id]),
+    ]
+}
+
+fn stringify_json_numbers(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Number(number) => *value = serde_json::Value::String(number.to_string()),
+        serde_json::Value::Array(values) => values.iter_mut().for_each(stringify_json_numbers),
+        serde_json::Value::Object(values) => values.values_mut().for_each(stringify_json_numbers),
+        _ => {}
+    }
+}
+
+fn build_encrypted_wrap(recipient_pk: PublicKey, payload: &str, tags: Vec<Tag>) -> Result<String> {
+    let sender = Keys::generate();
+    let sealed = nip44::encrypt(sender.secret_key(), &recipient_pk, payload, Version::V2)
+        .context("seal nip44 encrypt failed")?;
+    let seal = EventBuilder::new(Kind::Seal, sealed)
+        .sign_with_keys(&sender)
+        .context("seal sign failed")?;
+
+    let wrapper = Keys::generate();
+    let wrapped = nip44::encrypt(wrapper.secret_key(), &recipient_pk, &seal.as_json(), Version::V2)
+        .context("wrap nip44 encrypt failed")?;
+    Ok(EventBuilder::new(Kind::GiftWrap, wrapped)
+        .tags(tags)
+        .sign_with_keys(&wrapper)
+        .context("wrap sign failed")?
+        .as_json())
 }
 
 /// Build the kind-1059 gift-wrap event JSON for a private-transfer note.
@@ -46,21 +103,6 @@ pub fn build_gift_wrap(
     let receiver_pk =
         PublicKey::parse(recipient_npub).context("invalid recipient npub / hex pubkey")?;
 
-    // 1. Seal (kind 13): NIP-44 encrypt the payload to the recipient, sign with
-    //    an ephemeral sender key. No tags on the seal (matches the web wallet).
-    let sender = Keys::generate();
-    let sealed = nip44::encrypt(sender.secret_key(), &receiver_pk, payload, Version::V2)
-        .context("seal nip44 encrypt failed")?;
-    let seal = EventBuilder::new(Kind::Seal, sealed)
-        .sign_with_keys(&sender)
-        .context("seal sign failed")?;
-
-    // 2. Wrap (kind 1059): NIP-44 encrypt the serialized seal to the recipient,
-    //    sign with a second ephemeral key, carry the drain tags.
-    let wrapper = Keys::generate();
-    let seal_json = seal.as_json();
-    let wrapped = nip44::encrypt(wrapper.secret_key(), &receiver_pk, &seal_json, Version::V2)
-        .context("wrap nip44 encrypt failed")?;
     let tags = vec![
         Tag::public_key(receiver_pk),
         Tag::custom(
@@ -70,12 +112,93 @@ pub fn build_gift_wrap(
         limb_tag("shield_address", shield_limbs),
         limb_tag("nullifier", nullifier_limbs),
     ];
-    let wrap = EventBuilder::new(Kind::GiftWrap, wrapped)
-        .tags(tags)
-        .sign_with_keys(&wrapper)
-        .context("wrap sign failed")?;
+    build_encrypted_wrap(receiver_pk, payload, tags)
+}
 
-    Ok(wrap.as_json())
+/// Build the exact proof/secrets event pair consumed by psy-services and the
+/// current wallet. The proof is public-but-signed metadata; only the raw note
+/// secrets are NIP-59/NIP-44 encrypted to the recipient.
+pub fn build_private_transfer_events(
+    recipient_npub: &str,
+    amount: u64,
+    contract_id: u64,
+    tx_hash: &str,
+    note_commitment: &[u64; 4],
+    note_proof_raw: &str,
+    nullifier_secret: &[u64; 4],
+    note_secret: &[u64; 4],
+    shield_limbs: &[u64; 4],
+    nullifier_limbs: &[u64; 4],
+) -> Result<Vec<String>> {
+    let receiver_pk = PublicKey::parse(recipient_npub).context("invalid recipient npub / hex pubkey")?;
+    let backup_id = note_commitment.iter().map(|word| format!("{word:016x}")).collect::<String>();
+    let contract = contract_id.to_string();
+    let amount = amount.to_string();
+    let shield = shield_limbs.iter().map(u64::to_string).collect::<Vec<_>>();
+    let nullifier = nullifier_limbs.iter().map(u64::to_string).collect::<Vec<_>>();
+    let mut note_proof: serde_json::Value = serde_json::from_str(note_proof_raw).context("note proof JSON is invalid")?;
+    // Match the wallet's parseJsonPreservingIntegers: proof limbs exceed
+    // JavaScript's safe integer range, so the published envelope must encode
+    // every integer as a decimal string.
+    stringify_json_numbers(&mut note_proof);
+    let proof_object = note_proof.as_object_mut().ok_or_else(|| anyhow!("note proof JSON must be an object"))?;
+    proof_object.insert("token_contract_id".into(), serde_json::Value::String(contract.clone()));
+    let augmented_note_proof_raw = serde_json::to_string(&note_proof)?;
+
+    let proof_content = serde_json::json!({
+        "type": TRANSFER_PROOF_TAG,
+        "backup_id": backup_id,
+        "amount": amount,
+        "token_contract_id": contract,
+        "contract_id": contract,
+        "tx_hash": tx_hash,
+        "note_commitment": backup_id,
+        "shield_address": shield,
+        "nullifier": nullifier,
+        "note_proof": note_proof,
+        "note_proof_raw": augmented_note_proof_raw,
+    })
+    .to_string();
+    let proof_signer = Keys::generate();
+    let proof_event = EventBuilder::new(Kind::GiftWrap, proof_content)
+        .tags(private_transfer_tags(
+            receiver_pk,
+            TRANSFER_PROOF_TAG,
+            &backup_id,
+            shield_limbs,
+            nullifier_limbs,
+            contract_id,
+        ))
+        .sign_with_keys(&proof_signer)
+        .context("proof event sign failed")?
+        .as_json();
+
+    let secrets_content = serde_json::json!({
+        "type": TRANSFER_SECRETS_TAG,
+        "backup_id": backup_id,
+        "note_commitment": backup_id,
+        "shield_address": shield,
+        "amount": amount,
+        "token_contract_id": contract,
+        "contract_id": contract,
+        "tx_hash": tx_hash,
+        "nullifier_secret": nullifier_secret.iter().map(u64::to_string).collect::<Vec<_>>(),
+        "note_secret": note_secret.iter().map(u64::to_string).collect::<Vec<_>>(),
+    })
+    .to_string();
+    let secrets_event = build_encrypted_wrap(
+        receiver_pk,
+        &secrets_content,
+        private_transfer_tags(
+            receiver_pk,
+            TRANSFER_SECRETS_TAG,
+            &backup_id,
+            shield_limbs,
+            nullifier_limbs,
+            contract_id,
+        ),
+    )?;
+    Ok(vec![proof_event, secrets_event])
 }
 
 /// Publish an already-built gift-wrap event JSON to a relay and await its OK.
@@ -302,6 +425,53 @@ mod tests {
     use super::*;
     use nostr::Event;
 
+    #[test]
+    fn private_transfer_pair_matches_wallet_contract_and_carries_secrets() {
+        let recipient = Keys::generate();
+        let commitment = [0x11, 0x22, 0x33, 0x44];
+        let shield = [1, 2, 3, 4];
+        let nullifier = [5, 6, 7, 8];
+        let nullifier_secret = [9, 10, 11, 12];
+        let note_secret = [13, 14, 15, 16];
+        let proof_raw = serde_json::json!({
+            "nullifier": nullifier.map(|word| word.to_string()),
+            "note_proof_bincode_b64": "proof"
+        })
+        .to_string();
+        let events = build_private_transfer_events(
+            &recipient.public_key().to_hex(),
+            4_000_000_000,
+            0,
+            "tx-hash",
+            &commitment,
+            &proof_raw,
+            &nullifier_secret,
+            &note_secret,
+            &shield,
+            &nullifier,
+        )
+        .unwrap();
+        assert_eq!(events.len(), 2, "wallet contract is one proof plus one secrets event");
+
+        let proof = Event::from_json(&events[0]).unwrap();
+        let proof_content: serde_json::Value = serde_json::from_str(&proof.content).unwrap();
+        let backup_id = "0000000000000011000000000000002200000000000000330000000000000044";
+        assert_eq!(proof_content["type"], TRANSFER_PROOF_TAG);
+        assert_eq!(proof_content["backup_id"], backup_id);
+        assert_eq!(proof_content["note_proof_raw"].as_str().map(|raw| serde_json::from_str::<serde_json::Value>(raw).unwrap()["token_contract_id"].clone()), Some(serde_json::json!("0")));
+
+        let secrets = Event::from_json(&events[1]).unwrap();
+        let opened = open_note(recipient.secret_key(), &secrets.as_json()).unwrap();
+        let secrets_content: serde_json::Value = serde_json::from_str(&opened).unwrap();
+        assert_eq!(secrets_content["type"], TRANSFER_SECRETS_TAG);
+        assert_eq!(secrets_content["backup_id"], backup_id);
+        assert_eq!(secrets_content["nullifier_secret"], serde_json::json!(["9", "10", "11", "12"]));
+        assert_eq!(secrets_content["note_secret"], serde_json::json!(["13", "14", "15", "16"]));
+        for required in ["backup_id", "shield_address", "nullifier", "nullifier_hex", "token_contract_id", "contract_id"] {
+            assert!(secrets.tags.iter().any(|tag| tag.as_slice().first().map(String::as_str) == Some(required)), "missing {required} tag");
+        }
+    }
+
 
     /// A payload past NIP-44's cap must survive chunk → wrap → open → reassemble
     /// byte-for-byte, or large notes (every real note proof) strand funds.
@@ -385,22 +555,42 @@ mod tests {
         assert_eq!(recovered, payload, "recovered payload must equal the original");
     }
 
-    /// Live: publish to the local relay and confirm it accepts the event.
+    /// Live: publish the wallet-compatible proof/secrets pair to the relay
+    /// configured for the selected network and confirm both are accepted.
     /// Ignored by default (needs the mesh); run with `--ignored`.
     #[tokio::test]
     #[ignore]
     async fn live_relay_accepts_the_wrap() {
+        let config_path = std::env::var("PSY_CONFIG").unwrap_or_else(|_| {
+            format!("{}/../../psy-genesis/config.json", env!("CARGO_MANIFEST_DIR"))
+        });
+        let config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read PSY_CONFIG")).expect("parse PSY_CONFIG");
+        let network = std::env::var("PSY_MCP_NETWORK")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| config.get("defaultNetwork").and_then(|value| value.as_str()).map(str::to_string))
+            .expect("PSY_CONFIG must select a network");
+        let relay = config["networks"][&network]["nostr_relay_url"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .expect("selected network must configure nostr_relay_url");
         let recipient = Keys::generate();
-        let id = deliver_private_note(
-            "wss://nostr-local.psy-protocol.xyz",
+        let events = build_private_transfer_events(
             &recipient.public_key().to_hex(),
-            r#"{"type":"psy_private_payment","amount":"1000"}"#,
+            1_000,
+            0,
+            "live-test-tx",
+            &[11, 12, 13, 14],
+            &serde_json::json!({ "nullifier": ["5", "6", "7", "8"], "note_proof_bincode_b64": "live-test" }).to_string(),
+            &[9, 10, 11, 12],
+            &[13, 14, 15, 16],
             &[1, 2, 3, 4],
             &[5, 6, 7, 8],
         )
-        .await
-        .expect("relay should accept the wrap");
-        assert_eq!(id.len(), 64, "returned event id should be a 32-byte hex");
+        .expect("build proof/secrets pair");
+        let ids = publish_events(relay, &events).await.expect("relay should accept both events");
+        assert_eq!(ids.len(), 2, "relay must accept proof and secrets");
+        assert!(ids.iter().all(|id| id.len() == 64), "event ids should be 32-byte hex");
     }
 }
 

@@ -69,7 +69,10 @@ fn an_ordinary_backup_serializes_without_a_mandate_key() {
         private_key: "0x1".into(),
         fingerprint: "f".into(),
         created_at: 1,
+        network: Some("testnet".into()),
         mandate: None,
+        default_shield_address: None,
+        nostr_pub: None,
     };
     let s = serde_json::to_string(&b).unwrap();
     assert!(!s.contains("mandate"), "an ordinary wallet's backup gains no new field: {s}");
