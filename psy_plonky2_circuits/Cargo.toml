@@ -16,7 +16,6 @@ gnark-wrap = ["dep:gnark-plonky2-wrapper", "dep:gnark-plonky2-verifier-ffi"]
 postcard = { workspace = true, optional = true }
 rkyv = { workspace = true, optional = true }
 speedy = { workspace = true, optional = true }
-zstd = { workspace = true }
 anyhow     = { workspace = true }
 async-trait      = { workspace = true }
 serde      = { workspace = true }
@@ -27,6 +26,7 @@ hex = { workspace = true }
 hex-literal = { workspace = true }
 bincode = { workspace = true }
 tracing = { workspace = true }
+web-time = { workspace = true }
 tokio = { workspace = true}
 rand = { workspace = true }
 auto_impl = { workspace = true }
@@ -34,11 +34,8 @@ strum = { workspace = true }
 strum_macros = { workspace = true }
 hashbrown = { workspace = true }
 plonky2 = { workspace = true }
-jsonrpsee = { workspace = true }
-home = { workspace = true }
 gnark-plonky2-wrapper = { workspace = true, optional = true }
 gnark-plonky2-verifier-ffi = { workspace = true, optional = true }
-plonky2x = { git = "https://github.com/logere/succinctx", rev = "eec027a324be98827b4b91b4054f4cac7044ced4" }
 tiny-keccak = { workspace = true }
 
 # start local packages
@@ -50,9 +47,15 @@ parth_common = { workspace = true }
 psy_core = { workspace = true }
 psy_data = { workspace = true }
 psy_serialize = { workspace = true }
-psy_worker_core = { workspace = true }
-psy_dummy_prover = { workspace = true }
 pser = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+jsonrpsee = { workspace = true }
+home = { workspace = true }
+plonky2x = { git = "https://github.com/logere/succinctx", rev = "eec027a324be98827b4b91b4054f4cac7044ced4" }
+psy_dummy_prover = { workspace = true }
+psy_worker_core = { workspace = true }
+zstd = { workspace = true }
 
 
 [dev-dependencies]

@@ -12,7 +12,9 @@ pub mod index;
 pub mod end_cap;
 pub mod generated;
 pub mod circuit_library;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod zk_verifier;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod protocol_types;
 pub mod guta_v2;
 pub mod node;

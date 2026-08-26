@@ -178,7 +178,7 @@ rand = "0.8.5"
 rand_core = "0.9"
 rand_pcg = "0.9"
 rand_chacha = "0.3"
-getrandom = { version = "0.3" }
+getrandom = { version = "0.3", features = ["wasm_js"] }
 
 # ---- Numeric ----
 num = { version = "0.4.0", default-features = false }
@@ -299,6 +299,7 @@ semver = "1.0"
 md5 = "0.7"
 walkdir = "2.5"
 home = { version = "0.5" }
+web-time = "1"
 cc = "1.2"
 bindgen = "0.71"
 shadow-rs = "0.27.1"

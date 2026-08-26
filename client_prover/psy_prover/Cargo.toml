@@ -29,6 +29,12 @@ psy_compiler = { workspace = true }
 psy_crypto = { workspace = true }
 psy_provider = { workspace = true }
 psy_ups_circuit = { workspace = true, default-features = false }
+psy_core = { workspace = true }
+psy_data = { workspace = true }
+psy_plonky2_common_circuits = { path = "../../psy_plonky2_common_circuits", default-features = false, features = ["std"] }
+psy_plonky2_circuits = { path = "../../psy_plonky2_circuits", default-features = false, features = ["std", "serialize_speedy"] }
+psy_plonky2_basic_helpers = { workspace = true }
+parth_core = { workspace = true }
 
 k256 = { workspace = true }
 rand = { workspace = true }
@@ -49,8 +55,6 @@ tower-http = { workspace = true }
 hyper = { workspace = true }
 jsonrpsee = { workspace = true }
 reqwest = { workspace = true }
-psy_core = { workspace = true }
-psy_data = { workspace = true }
 sodalite = { workspace = true }
 secp256k1 = { workspace = true }
 dirs = {workspace = true}
@@ -65,10 +69,6 @@ http = { workspace = true }
 clap = { workspace = true }
 dashmap = { workspace = true }
 quick_cache = { workspace = true }
-psy_plonky2_common_circuits = { workspace = true }
-psy_plonky2_circuits = { workspace = true }
-psy_plonky2_basic_helpers = { workspace = true }
-parth_core = { workspace = true }
 gnark-plonky2-verifier-ffi = { workspace = true, optional = true }
 
 # WASM-only dependencies
