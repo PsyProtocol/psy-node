@@ -94,4 +94,4 @@ grep -q 'CONFIRM_BSC_REPLACES_SEPOLIA=1' "$tmp_dir/deploy.err" || {
   exit 1
 }
 
-echo "[ok] BSC Testnet profile isolates network values and requires replacement confirmation"
+echo "[ok] BSC Testnet profile reuses staging entrypoints and requires replacement confirmation"

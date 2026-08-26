@@ -38,15 +38,6 @@ expect_equal() {
   [ "$actual" = "$expected" ] || fail "$name must be '$expected', got '${actual:-<empty>}'"
 }
 
-expect_bsc_domain() {
-  local name="$1"
-  local actual="${!name:-}"
-  case "$actual" in
-    *-bsc-testnet.psy-protocol.xyz) ;;
-    *) fail "$name is not isolated to the BSC Testnet namespace: ${actual:-<empty>}" ;;
-  esac
-}
-
 command -v jq >/dev/null 2>&1 || fail "jq is required"
 command -v curl >/dev/null 2>&1 || fail "curl is required"
 
@@ -120,6 +111,11 @@ expect_equal OFFSITE_WORKER_HOST arc99x4
 expect_equal WALLET_PACKAGE_MODE bsc-testnet
 expect_equal BSC_WALLET_PROFILE_VERIFIED 1
 expect_equal EXPECTED_PSY_SDK_NPM_VERSION 2.0.5
+expect_equal CF_PAGES_BRANCH staging
+expect_equal CF_PAGES_APP_PROJECT psy-privacy-bridge-demo-stg
+expect_equal CF_PAGES_EXPLORER_PROJECT psy-explorer-stg
+expect_equal CF_PAGES_IDE_PROJECT psy-ide-stg
+expect_equal CF_PAGES_CONFIG_PROJECT psy-config-stg
 
 expected_wallet_release_url="${BSC_WALLET_R2_PUBLIC_BASE_URL%/}/${BSC_WALLET_R2_METADATA_KEY}"
 [ "$VITE_WALLET_RELEASE_URL" = "$expected_wallet_release_url" ] \
@@ -138,18 +134,15 @@ expect_equal RELAYER_VM_NAME gcp-faucet
 expect_equal ENVIO_VM_NAME gcp-postgres
 expect_equal NOSTR_VM_NAME gcp-nostr
 
-for domain_var in \
-  NOSTR_DOMAIN \
-  PUBLIC_COORDINATOR_DOMAIN \
-  PUBLIC_REALM_DOMAIN \
-  PUBLIC_REALM1_DOMAIN \
-  PUBLIC_PROVE_PROXY_DOMAIN \
-  PUBLIC_FAUCET_DOMAIN \
-  PUBLIC_L1_RPC_DOMAIN \
-  PUBLIC_PSY_SERVICES_DOMAIN \
-  PUBLIC_INDEXER_DOMAIN; do
-  expect_bsc_domain "$domain_var"
-done
+expect_equal NOSTR_DOMAIN nostr-stg.psy-protocol.xyz
+expect_equal PUBLIC_COORDINATOR_DOMAIN coordinator-stg.psy-protocol.xyz
+expect_equal PUBLIC_REALM_DOMAIN realm0-stg.psy-protocol.xyz
+expect_equal PUBLIC_REALM1_DOMAIN realm1-stg.psy-protocol.xyz
+expect_equal PUBLIC_PROVE_PROXY_DOMAIN prove-stg.psy-protocol.xyz
+expect_equal PUBLIC_FAUCET_DOMAIN faucet-stg.psy-protocol.xyz
+expect_equal PUBLIC_L1_RPC_DOMAIN rpc-stg.psy-protocol.xyz
+expect_equal PUBLIC_PSY_SERVICES_DOMAIN services-stg.psy-protocol.xyz
+expect_equal PUBLIC_INDEXER_DOMAIN indexer-stg.psy-protocol.xyz
 
 for alias_var in \
   NOSTR_ALIAS_DOMAINS \
@@ -168,8 +161,9 @@ jq -e '
   .networks["bsc-testnet"]
   | .l1_chain_id == 97
     and .magic == "0x1337CF514544C269"
-    and (.coordinator_configs[0].rpc_url[0] | contains("-bsc-testnet."))
-    and all(.realm_configs[]; (.rpc_url[0] | contains("-bsc-testnet.")))
+    and .coordinator_configs[0].rpc_url[0] == "https://coordinator-stg.psy-protocol.xyz"
+    and .realm_configs[0].rpc_url[0] == "https://realm0-stg.psy-protocol.xyz"
+    and .realm_configs[1].rpc_url[0] == "https://realm1-stg.psy-protocol.xyz"
 ' "$REPO_ROOT/psy-genesis/config.json" >/dev/null \
   || fail "psy-genesis BSC Testnet profile is missing or inconsistent"
 

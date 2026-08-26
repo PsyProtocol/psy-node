@@ -45,8 +45,8 @@ jq -e '
   .networks["bsc-testnet"]
   | .l1_chain_id == 97
     and .magic == "0x1337CF514544C269"
-    and (.coordinator_configs[0].rpc_url[0] | contains("-bsc-testnet."))
-    and (.prove_proxy_url[0] | contains("-bsc-testnet."))
+    and .coordinator_configs[0].rpc_url[0] == "https://coordinator-stg.psy-protocol.xyz"
+    and .prove_proxy_url[0] == "https://prove-stg.psy-protocol.xyz"
 ' "$wallet_dir/config.json" >/dev/null || {
   echo "wallet BSC Testnet profile is missing or inconsistent" >&2
   exit 1

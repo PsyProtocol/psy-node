@@ -28,8 +28,10 @@ The scripts connect to existing SSH aliases; they do not provision machines.
 This is not a second side-by-side L2 on the same machines. The fresh deployment
 reuses `/var/lib/parth`, Scylla keyspaces, NATS, Redis, Postgres, and systemd
 unit names. A real run therefore replaces the current Sepolia-connected Psy
-testnet state. BSC uses separate public domains and Cloudflare Pages projects,
-so the frontend namespace cannot overwrite staging by accident.
+testnet state. It deliberately keeps the existing `*-stg.psy-protocol.xyz`
+domains and staging Cloudflare Pages projects. The confirmation gates protect
+this in-place replacement; a real deployment will switch those existing public
+entrypoints from Sepolia to BSC Testnet.
 
 ## Preparation
 
@@ -85,24 +87,10 @@ After the public metadata and zip have been verified, set
 `BSC_REQUIRE_PUBLISHED_WALLET=1` in the ignored `config.env`. This turns the
 metadata commit check into a deployment gate for the App frontend.
 
-Create DNS records for these BSC-only hosts, pointing at the same ingress used
-by staging:
-
-```text
-app-bsc-testnet.psy-protocol.xyz
-explorer-bsc-testnet.psy-protocol.xyz
-ide-bsc-testnet.psy-protocol.xyz
-config-bsc-testnet.psy-protocol.xyz
-coordinator-bsc-testnet.psy-protocol.xyz
-realm0-bsc-testnet.psy-protocol.xyz
-realm1-bsc-testnet.psy-protocol.xyz
-prove-bsc-testnet.psy-protocol.xyz
-faucet-bsc-testnet.psy-protocol.xyz
-rpc-bsc-testnet.psy-protocol.xyz
-services-bsc-testnet.psy-protocol.xyz
-indexer-bsc-testnet.psy-protocol.xyz
-nostr-bsc-testnet.psy-protocol.xyz
-```
+No new DNS records are required. The existing staging records continue to
+point at the same Caddy/Pages ingress. Keep the wallet R2 metadata under the
+separate `bsc-testnet/` key so it can be built and verified before the public
+staging App starts consuming it.
 
 ## Validation
 
@@ -140,5 +128,4 @@ the generated addresses back into the ignored BSC config. Anvil is skipped.
 The code paths for node, contracts, genesis, dapp, wallet, R2 publication, local
 BSC bridge E2E, and GCP deployment are prepared. Before a real run, enable
 `BNB_TESTNET` for the Alchemy App, fund the deployer/relayer with tBNB, publish
-the pinned wallet, create the listed DNS/Pages projects, and rerun preflight
-without `BSC_PREFLIGHT_SKIP_RPC`.
+the pinned wallet, and rerun preflight without `BSC_PREFLIGHT_SKIP_RPC`.
