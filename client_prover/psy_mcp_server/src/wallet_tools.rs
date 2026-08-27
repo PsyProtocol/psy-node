@@ -6,7 +6,7 @@ impl PsyWalletServer {
     // ── Owner / policy ────────────────────────────────────────────────
 
     #[tool(
-        description = "Create a wallet: generate a fresh Psy key and register it on-chain, or load an existing private key. Choose sign_type=zk|secp256k1|eth-personal-secp256k1, or pass an exact registered fingerprint (mutually exclusive); omitted defaults to zk. key_file restores its recorded fingerprint. Generated keys are durably backed up to the keystore (owner-readable file; the key itself is never returned). Also creates a spending policy the agent draws sessions from."
+        description = "Create a named wallet: generate a fresh Psy key and register it on-chain, or load an existing private key. Choose sign_type=zk|secp256k1|eth-personal-secp256k1, or pass an exact registered fingerprint (mutually exclusive); omitted defaults to zk. key_file restores its recorded fingerprint. Generated keys are durably backed up to the keystore (owner-readable file; the key itself is never returned). Also creates a spending policy the agent draws sessions from."
     )]
     async fn create_wallet(&self, Parameters(a): Parameters<CreateWalletArgs>) -> Result<CallToolResult, McpError> {
         if let Err(e) = owner_gate(a.owner_token.as_deref()) {
@@ -30,6 +30,9 @@ impl PsyWalletServer {
         }
         let state = &self.state;
         let network = wallet_network!(state.wallet, a.network.as_deref());
+        if a.name.trim().is_empty() || a.name.chars().count() > 64 || a.name.chars().any(char::is_control) {
+            return err_json("name must be 1 to 64 characters and contain no control characters".to_string(), json!({ "gate": "args" }));
+        }
         if a.sign_type.is_some() && a.fingerprint.is_some() {
             return err_json("pass sign_type or fingerprint, not both".to_string(), json!({ "gate": "args" }));
         }
@@ -57,7 +60,7 @@ impl PsyWalletServer {
                         format!("mode=load: the environment variable {env_name} is not set in the server's environment (the owner sets it; the agent only names it)"),
                         json!({ "gate": "args" })),
                 };
-                match state.wallet.load_selected(&network, &pk, a.sign_type.as_deref(), a.fingerprint.as_deref()).await {
+                match state.wallet.load_selected(&network, &pk, a.sign_type.as_deref(), a.fingerprint.as_deref(), &a.name).await {
                     Ok(l) => l,
                     Err(e) => return err_json(e, json!({})),
                 }
@@ -85,7 +88,7 @@ impl PsyWalletServer {
             // chain learns the identity. A crash after this write leaves a
             // harmless stray file; the reverse order could leave an on-chain
             // wallet whose key nobody has. See keystore.rs.
-            let backup_path = match keystore::persist_generated_key(&pk, &fp, network.as_str()) {
+            let backup_path = match keystore::persist_generated_key_named(&pk, &fp, network.as_str(), &a.name) {
                 Ok(p) => p,
                 Err(e) => {
                     return err_json(
@@ -94,7 +97,7 @@ impl PsyWalletServer {
                     )
                 }
             };
-            match state.wallet.register(&network, &pk, &fp).await {
+            match state.wallet.register(&network, &pk, &fp, &a.name).await {
                 Ok(l) => (l, Some(backup_path)),
                 Err(e) => {
                     tracing::info!(
@@ -135,6 +138,7 @@ impl PsyWalletServer {
             .create_policy(&a.agent_id, requested, a.allowed_recipients, vec![]);
         let mut result = json!({
             "network": network.as_str(),
+            "name": loaded.name,
             "userId": loaded.user_id,
             "psyId": format!("Psy-{:08}", loaded.user_id),
             "fingerprint": loaded.fingerprint.to_string(),
@@ -330,6 +334,7 @@ impl PsyWalletServer {
             .into_iter()
             .map(|u| {
                 json!({
+                    "name": u.name,
                     "userId": u.user_id,
                     "psyId": format!("Psy-{:08}", u.user_id),
                     "pkHash": u.pk_hash.to_string(),

@@ -318,6 +318,8 @@ const REGISTRATION_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// by policy.
 #[derive(Clone, Debug)]
 pub struct LoadedUser {
+    /// Local display name; never used for cryptographic identity.
+    pub name: String,
     pub pk_hash: QHashOut<F>,
     pub user_id: u64,
     /// Circuit fingerprint is part of the wallet identity and must survive reloads.
@@ -966,12 +968,13 @@ impl WalletManager {
     /// devnet whose checkpoints are near-instant. We poll until the id
     /// exists, mirroring what the shipped web wallet's sign-in sequence
     /// does.
-    pub async fn register(&self, network: &NetworkId, private_key_hex: &str, fingerprint_hex: &str) -> Result<LoadedUser> {
+    pub async fn register(&self, network: &NetworkId, private_key_hex: &str, fingerprint_hex: &str, name: &str) -> Result<LoadedUser> {
         let private_key = Self::parse_key(private_key_hex)?;
         let fingerprint = fingerprint_hex.trim().parse::<QHashOut<F>>().map_err(|_| anyhow!("invalid fingerprint (expected QHashOut hex)"))?;
         let pk_hash = self.state(network).await?.session.register_user(private_key, fingerprint).await?;
         let user_id = self.await_user_id(network, pk_hash, REGISTRATION_TIMEOUT).await?;
         let loaded = LoadedUser {
+            name: name.to_string(),
             pk_hash,
             user_id,
             fingerprint,
@@ -1080,6 +1083,7 @@ impl WalletManager {
             .with_context(|| format!("agent key is backed up (circuit {})", mandate.circuit_fingerprint))?;
 
         let user = LoadedUser {
+            name: "Agent account".to_string(),
             pk_hash,
             user_id,
             fingerprint,
@@ -1135,10 +1139,10 @@ impl WalletManager {
 
     /// Load an already-registered key (idempotent add). Returns the user id.
     pub async fn load(&self, network: &NetworkId, private_key_hex: &str) -> Result<LoadedUser> {
-        self.load_selected(network, private_key_hex, None, None).await
+        self.load_selected(network, private_key_hex, None, None, "Wallet").await
     }
 
-    pub async fn load_selected(&self, network: &NetworkId, private_key_hex: &str, sign_type: Option<&str>, fingerprint_hex: Option<&str>) -> Result<LoadedUser> {
+    pub async fn load_selected(&self, network: &NetworkId, private_key_hex: &str, sign_type: Option<&str>, fingerprint_hex: Option<&str>, name: &str) -> Result<LoadedUser> {
         let private_key = Self::parse_key(private_key_hex)?;
         let (pk_hash, fingerprint) = {
             let mut state = self.state(network).await?;
@@ -1147,7 +1151,7 @@ impl WalletManager {
             (pk_hash, fingerprint)
         };
         let user_id = self.resolve_user_id(network, pk_hash).await?;
-        let loaded = LoadedUser { pk_hash, user_id, fingerprint, mandate: None, private_key };
+        let loaded = LoadedUser { name: name.to_string(), pk_hash, user_id, fingerprint, mandate: None, private_key };
         self.activate_user(network, loaded.clone()).await?;
         Ok(loaded)
     }
@@ -1172,7 +1176,7 @@ impl WalletManager {
                 .map_err(|_| anyhow!("key backup has an invalid fingerprint"))?;
             let pk_hash = self.state(network).await?.session.add_user(private_key, fingerprint).await?;
             let user_id = self.resolve_user_id(network, pk_hash).await?;
-            let loaded = LoadedUser { pk_hash, user_id, fingerprint, mandate: None, private_key };
+            let loaded = LoadedUser { name: backup.name.clone(), pk_hash, user_id, fingerprint, mandate: None, private_key };
             self.activate_user(network, loaded.clone()).await?;
             return Ok(loaded);
         };
@@ -1198,6 +1202,7 @@ impl WalletManager {
         let pk_hash = self.state(network).await?.session.add_user(private_key, fingerprint).await?;
         let user_id = self.resolve_user_id(network, pk_hash).await?;
         let loaded = LoadedUser {
+            name: backup.name.clone(),
             pk_hash,
             user_id,
             fingerprint,

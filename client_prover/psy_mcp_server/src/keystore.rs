@@ -57,6 +57,8 @@ pub struct KeyBackup {
     pub private_key: String,
     /// Public fingerprint of the key (safe to display).
     pub fingerprint: String,
+    /// Owner-chosen local account name. Not part of the cryptographic identity.
+    pub name: String,
     /// Unix seconds when the backup was written.
     pub created_at: u64,
     /// Psy config network this key was created for. Missing only in v1 files.
@@ -141,7 +143,11 @@ fn restrict_permissions(path: &Path, mode: u32) -> Result<()> {
 /// fsync the directory so the rename itself is durable. The final file never
 /// exists in a partially-written state.
 pub fn persist_generated_key(private_key_hex: &str, fingerprint_hex: &str, network: &str) -> Result<PathBuf> {
-    persist_generated_key_with_mandate(private_key_hex, fingerprint_hex, network, None)
+    persist_generated_key_named(private_key_hex, fingerprint_hex, network, "Wallet")
+}
+
+pub fn persist_generated_key_named(private_key_hex: &str, fingerprint_hex: &str, network: &str, name: &str) -> Result<PathBuf> {
+    persist_generated_key_with_mandate_and_name(private_key_hex, fingerprint_hex, network, None, name)
 }
 
 /// As `persist_generated_key`, but also records the mandate for an agent
@@ -151,6 +157,16 @@ pub fn persist_generated_key_with_mandate(
     fingerprint_hex: &str,
     network: &str,
     mandate: Option<&crate::agent_account::Mandate>,
+) -> Result<PathBuf> {
+    persist_generated_key_with_mandate_and_name(private_key_hex, fingerprint_hex, network, mandate, "Agent account")
+}
+
+fn persist_generated_key_with_mandate_and_name(
+    private_key_hex: &str,
+    fingerprint_hex: &str,
+    network: &str,
+    mandate: Option<&crate::agent_account::Mandate>,
+    name: &str,
 ) -> Result<PathBuf> {
     let dir = keystore_dir();
     fs::create_dir_all(&dir).with_context(|| format!("failed to create keystore dir {}", dir.display()))?;
@@ -175,6 +191,7 @@ pub fn persist_generated_key_with_mandate(
         kind: KeyBackup::KIND.to_string(),
         private_key: private_key_hex.to_string(),
         fingerprint: fingerprint_hex.to_string(),
+        name: name.to_string(),
         created_at: now_secs(),
         network: Some(network.to_string()),
         mandate: mandate.cloned(),
@@ -384,6 +401,7 @@ mod tests {
             let loaded = load_key_file(path.to_str().unwrap()).unwrap();
             assert_eq!(loaded.private_key, "0xdeadbeef:1:2:3");
             assert_eq!(loaded.fingerprint, "fp0123456789abcdef");
+            assert_eq!(loaded.name, "Wallet");
             assert_eq!(loaded.kind, KeyBackup::KIND);
             assert_eq!(loaded.network.as_deref(), Some("testnet"));
             assert_eq!(loaded.default_shield_address, None);

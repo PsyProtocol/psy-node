@@ -227,6 +227,9 @@ struct CreateWalletArgs {
     /// Psy config network. Omit to use the server's --network default.
     #[serde(default)]
     network: Option<String>,
+    /// Local account name saved in the keystore; not part of the on-chain identity.
+    #[serde(default = "default_wallet_name")]
+    name: String,
     /// "generate" a fresh key and register it, or "load" an existing private key.
     #[serde(default = "default_generate")]
     mode: String,
@@ -274,6 +277,8 @@ struct CreateWalletArgs {
     #[serde(default, alias = "allowedRecipients")]
     allowed_recipients: Option<Vec<String>>,
 }
+fn default_wallet_name() -> String { "Wallet".to_string() }
+
 fn default_generate() -> String { "generate".into() }
 fn default_agent() -> String { "default-agent".into() }
 
