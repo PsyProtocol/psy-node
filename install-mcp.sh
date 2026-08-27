@@ -13,7 +13,7 @@
 #   Contract and token addresses are loaded from config.json's l1_config_url.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" && pwd)"
 CONFIG_FILE="${PSY_CONFIG:-$HOME/.psy/config.json}"
 INSTALL_DIR="${PSY_MCP_INSTALL_DIR:-$HOME/.psy/bin}"
 KEYSTORE_DIR="${PSY_MCP_KEYSTORE_DIR:-$HOME/.psy-mcp-keys}"
