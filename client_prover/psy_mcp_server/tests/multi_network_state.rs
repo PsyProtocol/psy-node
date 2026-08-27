@@ -38,6 +38,9 @@ fn identical_claim_ids_are_persisted_in_different_network_subtrees() {
         expected_deposit_index: 42,
         l1_tx_hash: None,
         claimed: false,
+        delivered: false,
+        deposit_proof_json: None,
+        nostr_event_ids: Vec::new(),
     };
 
     let a = make_deposit("network-a").persist(&root).unwrap();

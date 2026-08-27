@@ -201,7 +201,7 @@ fn shield_address_base58(value: QHashOut<F>) -> String {
 
 /// Parse a shield address in elements order: `0xL0:...:L3` canonical, a bare
 /// 64-hex blob, or limb-per-colon hex. Returns the limbs as elements.
-fn parse_shield_elements_hex(raw: &str) -> Result<[u64; 4]> {
+pub fn parse_shield_elements_hex_pub(raw: &str) -> Result<[u64; 4]> {
     let s = raw.trim();
     if s.contains(':') {
         let parts: Vec<&str> = s.split(':').collect();
@@ -453,7 +453,7 @@ impl NetworkWallet {
 
     fn prepare_private_transfer(&self, recipient_shielded_hex: &str, amount: u64, contract_id: u64) -> Result<PreparedPrivateTransfer> {
         self.require_user()?;
-        let owner = parse_shield_elements_hex(recipient_shielded_hex.trim().trim_start_matches("0x").trim_start_matches("0X"))?;
+        let owner = parse_shield_elements_hex_pub(recipient_shielded_hex.trim().trim_start_matches("0x").trim_start_matches("0X"))?;
         let mut rng = rand::thread_rng();
         let note_secret = [rng.next_u64(), rng.next_u64(), rng.next_u64(), rng.next_u64()];
         let nullifier_secret = [rng.next_u64(), rng.next_u64(), rng.next_u64(), rng.next_u64()];
@@ -491,6 +491,10 @@ struct McpNetworkConfig {
     #[serde(default)]
     l1_rpc_urls: Vec<String>,
     #[serde(default)]
+    bridge_url: Vec<String>,
+    #[serde(default)]
+    l1_config_url: Option<String>,
+    #[serde(default)]
     l1_bridge_address: Option<String>,
     #[serde(default)]
     l1_router_address: Option<String>,
@@ -498,6 +502,224 @@ struct McpNetworkConfig {
     l1_erc20_gateway_address: Option<String>,
     #[serde(default)]
     l1_token_addresses: HashMap<String, String>,
+}
+
+fn l1_config_endpoint(config: &McpNetworkConfig) -> Result<Option<reqwest::Url>> {
+    let Some(endpoint) = config.l1_config_url.as_deref() else {
+        return Ok(None);
+    };
+    if let Ok(url) = reqwest::Url::parse(endpoint) {
+        return Ok(Some(url));
+    }
+    let base = config
+        .bridge_url
+        .first()
+        .ok_or_else(|| anyhow!("relative l1_config_url `{endpoint}` requires bridge_url"))?;
+    let base = reqwest::Url::parse(base).with_context(|| format!("invalid bridge_url `{base}`"))?;
+    Ok(Some(
+        base.join(endpoint)
+            .with_context(|| format!("resolve l1_config_url `{endpoint}` against `{base}`"))?,
+    ))
+}
+
+fn required_l1_address(document: &serde_json::Value, key: &str) -> Result<String> {
+    let address = document
+        .pointer(&format!("/core/{key}"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            document.get("contracts")?.as_array()?.iter().find_map(|contract| {
+                (contract.get("name")?.as_str()? == key)
+                    .then(|| contract.get("address")?.as_str())
+                    .flatten()
+            })
+        })
+        .ok_or_else(|| anyhow!("L1 config is missing core.{key}"))?;
+    address
+        .parse::<alloy_primitives::Address>()
+        .with_context(|| format!("L1 config core.{key} is not an Ethereum address"))?;
+    Ok(address.to_string())
+}
+
+fn config_chain_id(document: &serde_json::Value) -> Result<u64> {
+    let value = document
+        .get("chainId")
+        .or_else(|| document.pointer("/l1/chain_id"))
+        .ok_or_else(|| anyhow!("L1 config is missing chainId/l1.chain_id"))?;
+    if let Some(number) = value.as_u64() {
+        return Ok(number);
+    }
+    let raw = value.as_str().ok_or_else(|| anyhow!("L1 config chain ID must be a number or string"))?;
+    if let Some(hex) = raw.strip_prefix("0x") {
+        return u64::from_str_radix(hex, 16).context("parse hexadecimal L1 config chain ID");
+    }
+    raw.parse::<u64>().context("parse decimal L1 config chain ID")
+}
+
+fn apply_l1_config_document(network: &NetworkId, config: &mut McpNetworkConfig, document: &serde_json::Value) -> Result<u64> {
+    if let Some(document_network) = document.get("network").and_then(serde_json::Value::as_str) {
+        anyhow::ensure!(
+            document_network == network.as_str(),
+            "L1 config network mismatch: requested `{network}`, received `{document_network}`"
+        );
+    }
+    let chain_id = config_chain_id(document)?;
+
+    config.l1_bridge_address = Some(required_l1_address(document, "Bridge")?);
+    config.l1_router_address = Some(required_l1_address(document, "Router")?);
+    config.l1_erc20_gateway_address = Some(required_l1_address(document, "ERC20Gateway")?);
+
+    let mut addresses = HashMap::new();
+    if let Some(tokens) = document.pointer("/protocol/tokens").and_then(serde_json::Value::as_object) {
+        for (name, token) in tokens {
+            let symbol = token.get("symbol").and_then(serde_json::Value::as_str).unwrap_or(name);
+            let address = token
+                .get("l1Address")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("L1 config token `{name}` is missing l1Address"))?;
+            address
+                .parse::<alloy_primitives::Address>()
+                .with_context(|| format!("L1 config token `{symbol}` has an invalid l1Address"))?;
+            addresses.insert(symbol.to_string(), address.to_string());
+        }
+    } else if let Some(tokens) = document.get("tokens").and_then(serde_json::Value::as_array) {
+        for token in tokens {
+            let symbol = token
+                .get("symbol")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("L1 config token is missing symbol"))?;
+            let address = token
+                .get("address")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("L1 config token `{symbol}` is missing address"))?;
+            address
+                .parse::<alloy_primitives::Address>()
+                .with_context(|| format!("L1 config token `{symbol}` has an invalid address"))?;
+            addresses.insert(symbol.to_string(), address.to_string());
+        }
+    }
+    anyhow::ensure!(!addresses.is_empty(), "L1 config has no token addresses");
+    config.l1_token_addresses = addresses;
+    Ok(chain_id)
+}
+
+async fn load_l1_config(network: &NetworkId, config: &mut McpNetworkConfig) -> Result<()> {
+    let Some(endpoint) = l1_config_endpoint(config)? else {
+        return Ok(());
+    };
+    let response = reqwest::Client::new()
+        .get(endpoint.clone())
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .with_context(|| format!("fetch L1 config from `{endpoint}`"))?
+        .error_for_status()
+        .with_context(|| format!("fetch L1 config from `{endpoint}`"))?;
+    let document = response
+        .json::<serde_json::Value>()
+        .await
+        .with_context(|| format!("parse L1 config from `{endpoint}`"))?;
+    let configured_chain_id =
+        apply_l1_config_document(network, config, &document).with_context(|| format!("validate L1 config from `{endpoint}`"))?;
+    let rpc_url = config
+        .l1_rpc_urls
+        .first()
+        .ok_or_else(|| anyhow!("network `{network}` has l1_config_url but no l1_rpc_urls"))?;
+    let rpc_chain_id = crate::l1::L1Client::read_only(rpc_url.clone())
+        .chain_id()
+        .await
+        .with_context(|| format!("read eth_chainId from `{rpc_url}`"))?;
+    anyhow::ensure!(
+        configured_chain_id == rpc_chain_id,
+        "L1 config/RPC chain mismatch for `{network}`: config `{endpoint}` says {configured_chain_id}, RPC `{rpc_url}` says {rpc_chain_id}"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod l1_config_tests {
+    use super::*;
+
+    #[test]
+    fn relative_l1_config_url_uses_bridge_origin() {
+        let config = McpNetworkConfig {
+            bridge_url: vec!["http://127.0.0.1:5177/some/path".into()],
+            l1_config_url: Some("/config.json".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            l1_config_endpoint(&config).unwrap().unwrap().as_str(),
+            "http://127.0.0.1:5177/config.json"
+        );
+    }
+
+    #[test]
+    fn runtime_document_replaces_contract_and_token_addresses() {
+        let network = NetworkId::new("localhost").unwrap();
+        let mut config = McpNetworkConfig::default();
+        let document = serde_json::json!({
+            "network": "localhost",
+            "chainId": "31337",
+            "core": {
+                "Bridge": "0x0000000000000000000000000000000000000001",
+                "Router": "0x0000000000000000000000000000000000000002",
+                "ERC20Gateway": "0x0000000000000000000000000000000000000003"
+            },
+            "protocol": {
+                "tokens": {
+                    "psy": {
+                        "symbol": "PSY",
+                        "l1Address": "0x0000000000000000000000000000000000000004"
+                    }
+                }
+            }
+        });
+
+        apply_l1_config_document(&network, &mut config, &document).unwrap();
+
+        assert_eq!(config.l1_router_address.as_deref(), Some("0x0000000000000000000000000000000000000002"));
+        assert_eq!(
+            config.l1_token_addresses.get("PSY").map(String::as_str),
+            Some("0x0000000000000000000000000000000000000004")
+        );
+    }
+
+    #[test]
+    fn runtime_document_rejects_wrong_network() {
+        let network = NetworkId::new("localhost").unwrap();
+        let mut config = McpNetworkConfig::default();
+        let error = apply_l1_config_document(&network, &mut config, &serde_json::json!({ "network": "sepolia", "chainId": 11155111 })).unwrap_err();
+        assert!(error.to_string().contains("network mismatch"));
+    }
+
+    #[test]
+    fn hosted_config_schema_is_supported() {
+        let network = NetworkId::new("sepolia").unwrap();
+        let mut config = McpNetworkConfig::default();
+        let document = serde_json::json!({
+            "environment": "staging",
+            "l1": { "network": "sepolia", "chain_id": 11155111 },
+            "contracts": [
+                { "name": "Bridge", "address": "0x0000000000000000000000000000000000000011" },
+                { "name": "Router", "address": "0x0000000000000000000000000000000000000012" },
+                { "name": "ERC20Gateway", "address": "0x0000000000000000000000000000000000000013" }
+            ],
+            "tokens": [
+                { "symbol": "PSY", "address": "0x0000000000000000000000000000000000000014" }
+            ]
+        });
+
+        apply_l1_config_document(&network, &mut config, &document).unwrap();
+
+        assert_eq!(config.l1_bridge_address.as_deref(), Some("0x0000000000000000000000000000000000000011"));
+        assert_eq!(config.l1_token_addresses.get("PSY").map(String::as_str), Some("0x0000000000000000000000000000000000000014"));
+    }
+
+    #[test]
+    fn config_chain_id_accepts_decimal_and_hex_strings() {
+        assert_eq!(config_chain_id(&serde_json::json!({ "chainId": "31337" })).unwrap(), 31_337);
+        assert_eq!(config_chain_id(&serde_json::json!({ "chainId": "0x7a69" })).unwrap(), 31_337);
+        assert_eq!(config_chain_id(&serde_json::json!({ "l1": { "chain_id": 11155111 } })).unwrap(), 11_155_111);
+    }
 }
 
 impl WalletManager {
@@ -509,7 +731,7 @@ impl WalletManager {
         let raw_config: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(config_path).with_context(|| format!("failed to read Psy config `{config_path}`"))?)
                 .with_context(|| format!("failed to parse Psy config `{config_path}`"))?;
-        let mcp_networks = raw_config
+        let mut mcp_networks: HashMap<NetworkId, McpNetworkConfig> = raw_config
             .get("networks")
             .and_then(|networks| networks.as_object())
             .map(|networks| {
@@ -526,6 +748,10 @@ impl WalletManager {
         let psy_config =
             psy_config::PsyConfigGoldilocks::from_file(config_path).with_context(|| format!("failed to read Psy config `{config_path}`"))?;
         let network = NetworkId::new(network.unwrap_or_else(|| psy_config.current_network_name()))?;
+        let mcp_network = mcp_networks
+            .get_mut(&network)
+            .with_context(|| format!("network `{network}` is not present in Psy config"))?;
+        load_l1_config(&network, mcp_network).await?;
         let rpc_config = psy_config
             .get_network(network.as_str())
             .with_context(|| format!("network `{network}` is not present in Psy config"))?
@@ -1473,9 +1699,10 @@ pub struct ReceiveIdentity {
 impl WalletManager {
     /// Derive this wallet's private receive identity.
     ///
-    /// Uses the web wallet's `psy-privacy-v0` HMAC-SHA256 derivation at index 0.
-    /// A lost r0/r1 makes every note sent to that address unclaimable, so they
-    /// must be reproducible from the key alone and byte-compatible everywhere.
+    /// Uses the web wallet's `psy-privacy-v0` HMAC-SHA256 derivation at index
+    /// 0. A lost r0/r1 makes every note sent to that address unclaimable,
+    /// so they must be reproducible from the key alone and byte-compatible
+    /// everywhere.
     pub async fn receive_identity(&self, network: &NetworkId) -> Result<ReceiveIdentity> {
         let user = self.require_user(network).await?;
         let (random0, random1, nostr_secret) = derive_receive_secrets(&user.private_key.to_string(), 0)?;
@@ -1784,6 +2011,12 @@ pub struct DepositNote {
     pub expected_deposit_index: u64,
     pub l1_tx_hash: Option<String>,
     pub claimed: bool,
+    #[serde(default)]
+    pub delivered: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deposit_proof_json: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nostr_event_ids: Vec<String>,
 }
 
 fn qhash_to_bytes32_be(h: QHashOut<F>) -> [u8; 32] {
@@ -1869,7 +2102,7 @@ impl DepositNote {
     pub fn l1_words(&self) -> Result<([u8; 32], [u8; 32])> {
         // shield_address_hex is ELEMENTS order (see receive_identity) — parse
         // with the elements parser, not the display-order one.
-        let limbs = parse_shield_elements_hex(&self.shield_address_hex)?;
+        let limbs = parse_shield_elements_hex_pub(&self.shield_address_hex)?;
         let shield = QHashOut::<F>::from_values(limbs[0], limbs[1], limbs[2], limbs[3]);
         let commitment = derive_note_commitment(self.nullifier_secret, self.note_secret);
         Ok((qhash_to_bytes32_be(shield), qhash_to_bytes32_be(commitment)))
@@ -1967,6 +2200,58 @@ impl PrivateNoteRecovery {
 }
 
 impl WalletManager {
+    pub async fn build_shield_deposit_delivery_proof(
+        &self,
+        network: &NetworkId,
+        note: &DepositNote,
+        service_proof: &serde_json::Value,
+    ) -> Result<String> {
+        let claim = self.build_shield_deposit_claim(network, note, service_proof).await?;
+        let local_index = service_proof
+            .get("chain_local_deposit_index")
+            .and_then(|value| value.as_u64())
+            .or_else(|| service_proof.get("deposit_index").and_then(|value| value.as_u64()))
+            .ok_or_else(|| anyhow!("proof has no deposit index"))?;
+        let deposit_leaf = bytes32_hex_to_qhash(
+            service_proof
+                .get("leaf_hash")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| anyhow!("proof has no leaf_hash"))?,
+        )?;
+        let proved_count = service_proof
+            .get("snapshot_deposit_count")
+            .or_else(|| service_proof.get("tree_count"))
+            .or_else(|| service_proof.get("proved_deposit_count"))
+            .or_else(|| service_proof.get("proved_count"))
+            .and_then(|value| value.as_u64())
+            .unwrap_or(note.expected_deposit_index.saturating_add(1));
+        let as_strings = |hash: QHashOut<F>| hash.0.elements.map(|value| value.to_canonical_u64().to_string());
+        let proof_bytes = bincode::serialize(&claim.proof).context("serialize deposit inclusion proof as bincode")?;
+        Ok(serde_json::json!({
+            "type": "deposit_inclusion_proof",
+            "version": 1,
+            "shield_address": as_strings(claim.shield_address),
+            "amount_u32x8": claim.amount.map(|value| value.to_string()),
+            "token_address_u32x8": claim.token_address.map(|value| value.to_string()),
+            "l2_token_contract_id": claim.l2_token_contract_id.map(|value| value.to_string()),
+            "source_chain_index": note.source_chain_index.to_string(),
+            "deposit_index": local_index.to_string(),
+            "deposit_root": as_strings(claim.deposit_root),
+            "nullifier": as_strings(claim.nullifier_hash),
+            "nullifier_hash": as_strings(claim.nullifier_hash),
+            "note_commitment": as_strings(claim.note_commitment),
+            "deposit_leaf": as_strings(deposit_leaf),
+            "proved_deposit_count": proved_count.to_string(),
+            "checkpoint_id": service_proof.get("checkpoint_id").and_then(|value| value.as_str().map(str::to_string).or_else(|| value.as_u64().map(|number| number.to_string()))),
+            "deposit_proof_fingerprint": as_strings(claim.proof_fingerprint),
+            "deposit_proof_bincode_b64": base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                proof_bytes,
+            ),
+        })
+        .to_string())
+    }
+
     /// Claim a proved deposit into this wallet's balance.
     ///
     /// `proof` is psy-services' deposit-claim-proof response (`data`). The
@@ -2015,7 +2300,7 @@ impl WalletManager {
         // we cannot distinguish them by shape; the note's claim uses the
         // envelope's owner (not this field) for correctness, and this parse only
         // feeds display/derivation paths that re-derive from (user, r0, r1).
-        let shield = parse_shield_elements_hex(&note.shield_address_hex)
+        let shield = parse_shield_elements_hex_pub(&note.shield_address_hex)
             .map(|l| QHashOut::<F>::from_values(l[0], l[1], l[2], l[3]))
             .or_else(|_| qhash_from_display_hex(&note.shield_address_hex))?;
         let token_words = {
@@ -2224,7 +2509,7 @@ mod qhash_encoding_tests {
             ("s3CRPC6gHCk7JoczUSfp2n9CEJS8ZM8KpFjjEdzQ8Lz1mSdKW9T", [u64::MAX; 4]),
         ];
         for (encoded, expected) in cases {
-            assert_eq!(parse_shield_elements_hex(encoded).unwrap(), expected);
+            assert_eq!(parse_shield_elements_hex_pub(encoded).unwrap(), expected);
         }
     }
 
@@ -2245,7 +2530,7 @@ mod qhash_encoding_tests {
         let mut encoded = b"s2E3o5NfMVQVjtq929rp47qomk8GjVhtRSCg7ZeT8WypXCfuTUT".to_vec();
         *encoded.last_mut().unwrap() = b'1';
         let encoded = String::from_utf8(encoded).unwrap();
-        assert!(parse_shield_elements_hex(&encoded).is_err());
+        assert!(parse_shield_elements_hex_pub(&encoded).is_err());
     }
 
     #[test]

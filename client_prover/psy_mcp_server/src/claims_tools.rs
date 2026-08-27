@@ -297,7 +297,7 @@ impl PsyWalletServer {
     }
 
     #[tool(
-        description = "Deposit tokens from Ethereum into this wallet's shielded address on Psy. Uses the owner-provisioned L1 key (PSY_MCP_L1_KEY env — the agent never sees it): saves the claim secrets to disk FIRST, then approves if needed and calls Router.deposit. Once the bridge relayer proves it, finish with claim_deposit. Policy-gated at the amount."
+        description = "Deposit tokens from Ethereum into this wallet's shielded address on Psy. Uses the owner-provisioned L1 key (PSY_MCP_L1_KEY env — the agent never sees it): saves the claim secrets to disk FIRST, then approves if needed and calls Router.deposit. After the bridge relayer proves it, publishes the wallet-compatible proof/secrets pair to the configured Nostr relay so psy-wallet can claim it. Policy-gated at the amount."
     )]
     async fn deposit(&self, Parameters(a): Parameters<DepositArgs>) -> Result<CallToolResult, McpError> {
         let state = &self.state;
@@ -409,6 +409,9 @@ impl PsyWalletServer {
             expected_deposit_index: expected_index,
             l1_tx_hash: None,
             claimed: false,
+            delivered: false,
+            deposit_proof_json: None,
+            nostr_event_ids: Vec::new(),
         };
         let dir = crate::keystore::keystore_dir();
         let backup = match note.persist(&dir) {
@@ -461,18 +464,204 @@ impl PsyWalletServer {
             Ok(tx) => {
                 note.l1_tx_hash = Some(tx.clone());
                 let _ = note.persist(&dir);
-                ok_json(json!({
-                    "status": "ok", "submitted": true, "l1TxHash": tx,
-                    "amountBaseUnits": a.amount_base_units, "token": a.token,
-                    "expectedDepositIndex": expected_index,
-                    "next": "The bridge relayer proves it onto Psy (minutes). Then call claim_deposit. (Claim secrets are persisted server-side; path in the server log.)",
-                }))
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+                let service_proof = loop {
+                    match load_claimable_deposit(&state.wallet, network.as_str(), Some(backup.to_string_lossy().to_string()), None, None).await {
+                        Ok(DepositMaterial::Ready { proof, .. }) => break proof,
+                        Ok(DepositMaterial::AlreadyClaimed { .. }) => {
+                            return err_json(
+                                "deposit settled but was already claimed before its wallet backup could be delivered".to_string(),
+                                json!({ "gate": "deliver", "submitted": true, "l1TxHash": tx, "depositIndex": expected_index }),
+                            );
+                        }
+                        Err((reason, extra)) if std::time::Instant::now() < deadline => {
+                            tracing::info!("waiting to deliver deposit {} to psy-wallet: {}", expected_index, reason);
+                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                            let _ = extra;
+                        }
+                        Err((reason, extra)) => {
+                            return err_json(
+                                format!("deposit settled on L1 but its wallet backup could not be delivered before timeout: {reason}"),
+                                json!({ "gate": "deliver", "submitted": true, "l1TxHash": tx, "depositIndex": expected_index,
+                                    "detail": extra, "note": "Do not deposit again. The recovery record is saved server-side; call retry_deposit_delivery after the relayer proof is ready." }),
+                            );
+                        }
+                    }
+                };
+                let deposit_proof_raw = match state.wallet.build_shield_deposit_delivery_proof(&network, &note, &service_proof).await {
+                    Ok(proof) => proof,
+                    Err(e) => {
+                        return err_json(
+                            format!("deposit settled on L1 but the wallet-compatible deposit proof could not be built: {e:#}"),
+                            json!({ "gate": "deliver", "submitted": true, "l1TxHash": tx, "depositIndex": expected_index,
+                            "note": "Do not deposit again. The recovery record is saved server-side." }),
+                        )
+                    }
+                };
+                note.deposit_proof_json = Some(deposit_proof_raw.clone());
+                let _ = note.persist(&dir);
+                let events = match crate::nostr_delivery::build_deposit_backup_events(&identity.npub, &note, &deposit_proof_raw) {
+                    Ok(events) => events,
+                    Err(e) => {
+                        return err_json(
+                            format!("deposit settled on L1 but its wallet backup could not be encoded: {e:#}"),
+                            json!({ "gate": "deliver", "submitted": true, "l1TxHash": tx, "depositIndex": expected_index }),
+                        )
+                    }
+                };
+                let relay = match state.wallet.nostr_relay(&network) {
+                    Some(relay) => relay,
+                    None => {
+                        return err_json(
+                            format!("deposit settled on L1 but network `{network}` has no nostr_relay_url"),
+                            json!({ "gate": "deliver", "submitted": true, "l1TxHash": tx, "depositIndex": expected_index }),
+                        )
+                    }
+                };
+                match crate::nostr_delivery::publish_events(&relay, &events).await {
+                    Ok(event_ids) => {
+                        note.delivered = true;
+                        note.nostr_event_ids = event_ids.clone();
+                        let _ = note.persist(&dir);
+                        ok_json(json!({
+                            "status": "ok", "submitted": true, "delivered": true, "l1TxHash": tx,
+                            "amountBaseUnits": a.amount_base_units, "token": a.token,
+                            "expectedDepositIndex": expected_index, "nostrEventIds": event_ids,
+                            "recipientNpub": identity.npub,
+                            "next": "The deposit proof and secrets were delivered to psy-wallet. Claim it from the wallet claim list.",
+                        }))
+                    }
+                    Err(e) => err_json(
+                        format!("deposit settled on L1 but Nostr backup delivery failed: {e:#}"),
+                        json!({ "gate": "deliver", "submitted": true, "l1TxHash": tx, "depositIndex": expected_index,
+                            "relay": relay, "note": "Do not deposit again. The recovery record and proof are saved server-side; call retry_deposit_delivery." }),
+                    ),
+                }
             }
             Err(e) => {
                 self.policy.lock().unwrap().refund(&auth, amount_nano_equivalent);
                 tracing::info!("deposit claim secrets remain at {} (owner-side)", backup.display());
                 err_json(format!("deposit failed on L1: {e:#}"), json!({ "gate": "l1" }))
             }
+        }
+    }
+
+    #[tool(
+        description = "Retry delivery of an already-submitted deposit to psy-wallet. Reads the persisted recovery record, reuses its saved proof when available (otherwise fetches it after the relayer proves the deposit), and republishes the proof/secrets pair to Nostr. It never submits another L1 deposit."
+    )]
+    async fn retry_deposit_delivery(&self, Parameters(a): Parameters<RetryDepositDeliveryArgs>) -> Result<CallToolResult, McpError> {
+        let state = &self.state;
+        let network = wallet_network!(state.wallet, a.network.as_deref());
+        if let Some(user) = state.wallet.current_user(&network).await {
+            self.policy.lock().unwrap().set_current_wallet(network.as_str(), user.user_id);
+        }
+        if let Err(e) = self
+            .authorize_wallet(&network, &a.session, SELF_RECIPIENT, 0, "retry_deposit_delivery")
+            .await
+        {
+            return err_json(format!("policy denied: {e:#}"), json!({ "gate": "policy" }));
+        }
+
+        let dir = crate::keystore::keystore_dir();
+        let path = match a.backup_path.as_deref() {
+            Some(path) => std::path::PathBuf::from(path),
+            None => match a.deposit_index {
+                Some(index) => match crate::wallet::DepositNote::path_in(&dir, network.as_str(), index) {
+                    Ok(path) => path,
+                    Err(e) => return err_json(format!("{e:#}"), json!({ "gate": "network" })),
+                },
+                None => {
+                    return err_json(
+                        "pass backup_path or deposit_index from the original deposit".to_string(),
+                        json!({ "gate": "args" }),
+                    )
+                }
+            },
+        };
+        let mut note = match crate::wallet::DepositNote::load(&path) {
+            Ok(note) => note,
+            Err(e) => return err_json(format!("{e:#}"), json!({ "gate": "load" })),
+        };
+        if let Some(saved_network) = note.network.as_deref() {
+            if saved_network != network.as_str() {
+                return err_json(
+                    format!("deposit backup belongs to network `{saved_network}`, not `{network}`"),
+                    json!({ "gate": "network", "backupNetwork": saved_network, "network": network.as_str() }),
+                );
+            }
+        } else {
+            note.network = Some(network.as_str().to_string());
+        }
+        if note.delivered {
+            return ok_json(json!({
+                "status": "ok", "alreadyDelivered": true,
+                "depositIndex": note.expected_deposit_index,
+                "nostrEventIds": note.nostr_event_ids,
+            }));
+        }
+
+        let deposit_proof_raw = if let Some(proof) = note.deposit_proof_json.clone() {
+            proof
+        } else {
+            let loaded = match load_claimable_deposit(
+                &state.wallet,
+                network.as_str(),
+                Some(path.to_string_lossy().to_string()),
+                None,
+                a.services_url.as_deref(),
+            )
+            .await
+            {
+                Ok(material) => material,
+                Err((reason, extra)) => return err_json(reason, extra),
+            };
+            let DepositMaterial::Ready { proof, .. } = loaded else {
+                return ok_json(json!({ "status": "ok", "alreadyClaimed": true, "depositIndex": note.expected_deposit_index }));
+            };
+            let proof = match state.wallet.build_shield_deposit_delivery_proof(&network, &note, &proof).await {
+                Ok(proof) => proof,
+                Err(e) => return err_json(format!("could not build wallet-compatible deposit proof: {e:#}"), json!({ "gate": "deliver" })),
+            };
+            note.deposit_proof_json = Some(proof.clone());
+            if let Err(e) = note.persist(&dir) {
+                return err_json(format!("could not persist deposit proof before delivery: {e:#}"), json!({ "gate": "persist" }));
+            }
+            proof
+        };
+
+        let identity = match state.wallet.receive_identity(&network).await {
+            Ok(identity) => identity,
+            Err(e) => return err_json(format!("{e:#}"), json!({ "gate": "wallet" })),
+        };
+        let events = match crate::nostr_delivery::build_deposit_backup_events(&identity.npub, &note, &deposit_proof_raw) {
+            Ok(events) => events,
+            Err(e) => return err_json(format!("deposit backup encoding failed: {e:#}"), json!({ "gate": "deliver" })),
+        };
+        let relay = match state.wallet.nostr_relay(&network) {
+            Some(relay) => relay,
+            None => return err_json(format!("network `{network}` has no nostr_relay_url"), json!({ "gate": "deliver" })),
+        };
+        match crate::nostr_delivery::publish_events(&relay, &events).await {
+            Ok(event_ids) => {
+                note.delivered = true;
+                note.nostr_event_ids = event_ids.clone();
+                if let Err(e) = note.persist(&dir) {
+                    return err_json(
+                        format!("delivery succeeded but its status could not be persisted: {e:#}"),
+                        json!({ "gate": "persist", "delivered": true, "nostrEventIds": event_ids }),
+                    );
+                }
+                ok_json(json!({
+                    "status": "ok", "delivered": true,
+                    "depositIndex": note.expected_deposit_index,
+                    "nostrEventIds": event_ids,
+                    "recipientNpub": identity.npub,
+                }))
+            }
+            Err(e) => err_json(
+                format!("Nostr backup delivery failed: {e:#}"),
+                json!({ "gate": "deliver", "relay": relay, "note": "The saved proof can be retried with retry_deposit_delivery." }),
+            ),
         }
     }
 

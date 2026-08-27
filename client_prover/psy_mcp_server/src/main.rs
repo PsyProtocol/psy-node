@@ -1015,6 +1015,20 @@ struct ClaimDepositArgs {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+struct RetryDepositDeliveryArgs {
+    #[serde(default)]
+    network: Option<String>,
+    session: String,
+    /// Recovery file written by `deposit`; or pass deposit_index instead.
+    #[serde(default)]
+    backup_path: Option<String>,
+    #[serde(default)]
+    deposit_index: Option<u64>,
+    #[serde(default)]
+    services_url: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 struct PublicClaimSpec {
     sender_user_id: u64,
     #[serde(default = "default_psy")]

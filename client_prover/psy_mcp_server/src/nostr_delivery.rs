@@ -189,14 +189,79 @@ pub fn build_private_transfer_events(
     let secrets_event = build_encrypted_wrap(
         receiver_pk,
         &secrets_content,
-        private_transfer_tags(
+        private_transfer_tags(receiver_pk, TRANSFER_SECRETS_TAG, &backup_id, shield_limbs, nullifier_limbs, contract_id),
+    )?;
+    Ok(vec![proof_event, secrets_event])
+}
+
+pub fn build_deposit_backup_events(recipient_npub: &str, note: &crate::wallet::DepositNote, deposit_proof_raw: &str) -> Result<Vec<String>> {
+    let receiver_pk = PublicKey::parse(recipient_npub).context("invalid recipient npub / hex pubkey")?;
+    let note_commitment = psy_crypto::shield_address::derive_note_commitment(note.nullifier_secret, note.note_secret);
+    let commitment_limbs = crate::wallet::qhash_to_u64x4_pub(note_commitment);
+    let backup_id = commitment_limbs.iter().map(|word| format!("{word:016x}")).collect::<String>();
+    let nullifier_hash = psy_crypto::shield_address::derive_nullifier_hash(note.nullifier_secret);
+    let nullifier_limbs = crate::wallet::qhash_to_u64x4_pub(nullifier_hash);
+    let shield_limbs = crate::wallet::parse_shield_elements_hex_pub(&note.shield_address_hex)?;
+    let mut deposit_proof: serde_json::Value = serde_json::from_str(deposit_proof_raw).context("deposit proof JSON is invalid")?;
+    stringify_json_numbers(&mut deposit_proof);
+    let local_index = deposit_proof
+        .get("deposit_index")
+        .and_then(|value| value.as_str())
+        .unwrap_or("0")
+        .to_string();
+    let proof_content = serde_json::json!({
+        "type": "psy_deposit_proof",
+        "version": 2,
+        "backup_id": backup_id,
+        "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis().to_string(),
+        "deposit_proof": deposit_proof,
+        "metadata": {
+            "note_commitment": backup_id,
+            "shield_address": shield_limbs.iter().map(u64::to_string).collect::<Vec<_>>().join(":"),
+            "token_address": note.l1_token_address,
+            "amount": note.amount_base_units.to_string(),
+            "source_chain_index": note.source_chain_index.to_string(),
+            "tx_hash": note.l1_tx_hash,
+            "global_deposit_index": note.expected_deposit_index.to_string(),
+            "chain_local_deposit_index": local_index,
+            "deposit_index": local_index,
+            "contract_id": note.l2_token_contract_id.to_string(),
+            "token_contract_id": note.l2_token_contract_id.to_string(),
+        }
+    })
+    .to_string();
+    let proof_tags = vec![
+        Tag::public_key(receiver_pk),
+        value_tag("t", ["psy_deposit_proof".to_string()]),
+        value_tag("backup_id", [backup_id.clone()]),
+        limb_tag("shield_address", &shield_limbs),
+        limb_tag("nullifier", &nullifier_limbs),
+        value_tag("deposit_index", [note.expected_deposit_index.to_string()]),
+        value_tag("global_deposit_index", [note.expected_deposit_index.to_string()]),
+        value_tag("chain_local_deposit_index", [local_index]),
+        value_tag("token_contract_id", [note.l2_token_contract_id.to_string()]),
+    ];
+    let proof_event = EventBuilder::new(Kind::GiftWrap, proof_content)
+        .tags(proof_tags)
+        .sign_with_keys(&Keys::generate())
+        .context("deposit proof event sign failed")?
+        .as_json();
+    let secrets_content = serde_json::json!({
+        "type": "psy_deposit_secrets",
+        "version": 2,
+        "backup_id": backup_id,
+        "nullifier_secret": note.nullifier_secret.iter().map(u64::to_string).collect::<Vec<_>>(),
+        "note_secret": note.note_secret.iter().map(u64::to_string).collect::<Vec<_>>(),
+    })
+    .to_string();
+    let secrets_event = build_encrypted_wrap(
             receiver_pk,
-            TRANSFER_SECRETS_TAG,
-            &backup_id,
-            shield_limbs,
-            nullifier_limbs,
-            contract_id,
-        ),
+        &secrets_content,
+        vec![
+            Tag::public_key(receiver_pk),
+            value_tag("t", ["psy_deposit_secrets".to_string()]),
+            value_tag("backup_id", [backup_id]),
+        ],
     )?;
     Ok(vec![proof_event, secrets_event])
 }
@@ -472,6 +537,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn deposit_pair_matches_wallet_contract_and_carries_secrets() {
+        let recipient = Keys::generate();
+        let note = crate::wallet::DepositNote {
+            network: Some("localhost".into()),
+            note_secret: [13, 14, 15, 16],
+            nullifier_secret: [9, 10, 11, 12],
+            shield_address_hex: "0000000000000001:0000000000000002:0000000000000003:0000000000000004".into(),
+            l1_token_address: "0x0000000000000000000000000000000000000001".into(),
+            l2_token_contract_id: 4,
+            amount_base_units: 4_000_000,
+            source_chain_index: 0,
+            expected_deposit_index: 7,
+            l1_tx_hash: Some("0xdeposit".into()),
+            claimed: false,
+            delivered: false,
+            deposit_proof_json: None,
+            nostr_event_ids: Vec::new(),
+        };
+        let proof_raw =
+            serde_json::json!({"type": "psy_shield_deposit_proof", "version": 1, "deposit_index": "7", "deposit_proof_bincode_b64": "AQID"})
+                .to_string();
+        let events = build_deposit_backup_events(&recipient.public_key().to_hex(), &note, &proof_raw).unwrap();
+        assert_eq!(events.len(), 2);
+        let proof = Event::from_json(&events[0]).unwrap();
+        assert_eq!(proof.kind, Kind::GiftWrap);
+        let proof_content: serde_json::Value = serde_json::from_str(&proof.content).unwrap();
+        assert_eq!(proof_content["type"], "psy_deposit_proof");
+        assert_eq!(proof_content["version"], 2);
+        assert_eq!(proof_content["deposit_proof"]["deposit_index"], "7");
+        let backup_id = proof_content["backup_id"].as_str().unwrap();
+        assert_eq!(backup_id.len(), 64);
+        let secrets = Event::from_json(&events[1]).unwrap();
+        let opened = open_note(recipient.secret_key(), &secrets.as_json()).unwrap();
+        let secrets_content: serde_json::Value = serde_json::from_str(&opened).unwrap();
+        assert_eq!(secrets_content["type"], "psy_deposit_secrets");
+        assert_eq!(secrets_content["backup_id"], backup_id);
+        assert_eq!(secrets_content["nullifier_secret"], serde_json::json!(["9", "10", "11", "12"]));
+        assert_eq!(secrets_content["note_secret"], serde_json::json!(["13", "14", "15", "16"]));
+    }
 
     /// A payload past NIP-44's cap must survive chunk → wrap → open → reassemble
     /// byte-for-byte, or large notes (every real note proof) strand funds.

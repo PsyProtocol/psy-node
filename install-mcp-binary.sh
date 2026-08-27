@@ -9,6 +9,8 @@
 #   PSY_CONFIG=/path/to/config.json
 #   PSY_MCP_INSTALL_DIR="$HOME/.psy/bin"
 #   PSY_MCP_KEYSTORE_DIR="$HOME/.psy-mcp-keys"
+#   PSY_MCP_L1_KEY=0x...              (required at MCP runtime for Bridge deposit/withdraw; never persisted)
+#   Contract and token addresses are loaded from config.json's l1_config_url.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,6 +39,10 @@ echo "========================================"
 command -v cargo >/dev/null 2>&1 || die "cargo not found; install Rust from https://rustup.rs/"
 command -v rustc >/dev/null 2>&1 || die "rustc not found; install Rust from https://rustup.rs/"
 
+if [ -n "${PSY_MCP_L1_KEY:-}" ]; then
+  echo "[Bridge] PSY_MCP_L1_KEY is set (value is not displayed or persisted)."
+fi
+
 if [ ! -f "$CONFIG_FILE" ]; then
   DEFAULT_CONFIG="$SCRIPT_DIR/psy-genesis/config.json"
   [ -f "$DEFAULT_CONFIG" ] || die "Psy config not found: $CONFIG_FILE"
@@ -55,7 +61,7 @@ echo "(2) Building release binary (this may take a while on a cold checkout)..."
 (cd "$SCRIPT_DIR" && cargo build --release -p psy_mcp_server)
 cp "$SCRIPT_DIR/target/release/$BINARY_NAME" "$BINARY_PATH"
 chmod 755 "$BINARY_PATH"
-echo "(2) Installed -> $BINARY_PATH"
+echo "    Installed -> $BINARY_PATH"
 
 case ":${PATH}:" in
   *":$INSTALL_DIR:"*) ;;
@@ -66,7 +72,6 @@ register_json() {
   local config_path="$1"
   python3 - "$config_path" "$BINARY_PATH" "$CONFIG_FILE" "$KEYSTORE_DIR" "$OWNER_TOKEN" <<'PY'
 import json
-import os
 import sys
 
 path, binary, config, keystore, token = sys.argv[1:]
@@ -76,14 +81,15 @@ try:
 except (FileNotFoundError, json.JSONDecodeError):
     data = {}
 
+env = {
+    "PSY_CONFIG": config,
+    "PSY_MCP_KEYSTORE_DIR": keystore,
+    "PSY_MCP_OWNER_TOKEN": token,
+}
 data.setdefault("mcpServers", {})["psy"] = {
     "command": binary,
     "args": ["--config", config],
-    "env": {
-        "PSY_CONFIG": config,
-        "PSY_MCP_KEYSTORE_DIR": keystore,
-        "PSY_MCP_OWNER_TOKEN": token,
-    },
+    "env": env,
 }
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(data, handle, indent=2)
@@ -102,11 +108,14 @@ case "$TARGET" in
   claude-code|claude-cli)
     if command -v claude >/dev/null 2>&1; then
       claude mcp remove -s user psy >/dev/null 2>&1 || true
-      claude mcp add -s user psy \
-        -e PSY_CONFIG="$CONFIG_FILE" \
-        -e PSY_MCP_KEYSTORE_DIR="$KEYSTORE_DIR" \
-        -e PSY_MCP_OWNER_TOKEN="$OWNER_TOKEN" \
-        -- "$BINARY_PATH" --config "$CONFIG_FILE"
+      CLAUDE_ARGS=(
+        mcp add -s user psy
+        -e "PSY_CONFIG=$CONFIG_FILE"
+        -e "PSY_MCP_KEYSTORE_DIR=$KEYSTORE_DIR"
+        -e "PSY_MCP_OWNER_TOKEN=$OWNER_TOKEN"
+      )
+      CLAUDE_ARGS+=(-- "$BINARY_PATH" --config "$CONFIG_FILE")
+      claude "${CLAUDE_ARGS[@]}"
       echo "(3) Registered with Claude Code"
     else
       register_json "$HOME/.claude.json"
@@ -154,6 +163,16 @@ case "$TARGET" in
     die "unknown PSY_INSTALL_TARGET=$TARGET (use claude-code, claude-desktop, codex, cursor, or workbuddy)"
     ;;
 esac
+
+if [ -z "${PSY_MCP_L1_KEY:-}" ]; then
+  echo "" >&2
+  echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
+  echo "!! WARNING: PSY_MCP_L1_KEY is not set.                        !!" >&2
+  echo "!! The MCP wallet will install, but Bridge deposit/withdraw   !!" >&2
+  echo "!! will be unavailable. Export PSY_MCP_L1_KEY before starting !!" >&2
+  echo "!! Claude Code / the MCP server to enable Bridge operations.  !!" >&2
+  echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
+fi
 
 echo ""
 echo "Done. Restart $TARGET and ask the client to list the Psy tools."
