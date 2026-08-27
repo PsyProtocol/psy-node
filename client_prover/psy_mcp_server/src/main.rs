@@ -230,6 +230,14 @@ struct CreateWalletArgs {
     /// "generate" a fresh key and register it, or "load" an existing private key.
     #[serde(default = "default_generate")]
     mode: String,
+    /// Signing circuit for generated keys or private_key_env loads. Defaults to `zk`.
+    /// Supported held-key values: `zk`, `secp256k1`, `eth-personal-secp256k1`.
+    #[serde(default)]
+    sign_type: Option<String>,
+    /// Exact registered signing-circuit fingerprint. Mutually exclusive with sign_type.
+    /// A key_file already records its fingerprint and does not accept an override.
+    #[serde(default)]
+    fingerprint: Option<String>,
     /// For mode="load": the NAME of an environment variable (set by the owner
     /// in the server's environment) holding the private key. The key itself is
     /// never a tool argument — an argument is model context, and a key that
@@ -1487,7 +1495,7 @@ mod router_tests {
             .into_iter()
             .map(|tool| tool.name.to_string())
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(names.len(), 40);
+        assert_eq!(names.len(), 41);
         for required in ["create_wallet", "get_balance", "private_transfer", "x402_fetch", "x402_verify"] {
             assert!(names.contains(required), "missing tool route {required}");
         }

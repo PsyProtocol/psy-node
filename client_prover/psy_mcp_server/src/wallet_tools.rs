@@ -6,7 +6,7 @@ impl PsyWalletServer {
     // ── Owner / policy ────────────────────────────────────────────────
 
     #[tool(
-        description = "Create a wallet: generate a fresh Psy key and register it on-chain, or load an existing private key. Generated keys are durably backed up to the keystore (owner-readable file; the key itself is never returned). Also creates a spending policy the agent draws sessions from."
+        description = "Create a wallet: generate a fresh Psy key and register it on-chain, or load an existing private key. Choose sign_type=zk|secp256k1|eth-personal-secp256k1, or pass an exact registered fingerprint (mutually exclusive); omitted defaults to zk. key_file restores its recorded fingerprint. Generated keys are durably backed up to the keystore (owner-readable file; the key itself is never returned). Also creates a spending policy the agent draws sessions from."
     )]
     async fn create_wallet(&self, Parameters(a): Parameters<CreateWalletArgs>) -> Result<CallToolResult, McpError> {
         if let Err(e) = owner_gate(a.owner_token.as_deref()) {
@@ -30,6 +30,12 @@ impl PsyWalletServer {
         }
         let state = &self.state;
         let network = wallet_network!(state.wallet, a.network.as_deref());
+        if a.sign_type.is_some() && a.fingerprint.is_some() {
+            return err_json("pass sign_type or fingerprint, not both".to_string(), json!({ "gate": "args" }));
+        }
+        if a.key_file.is_some() && (a.sign_type.is_some() || a.fingerprint.is_some()) {
+            return err_json("key_file already records its fingerprint; do not override sign_type or fingerprint".to_string(), json!({ "gate": "args" }));
+        }
         let (loaded, key_backup_path) = if a.mode == "load" {
             // Resolve the key OUTSIDE the transcript: from the owner's
             // environment or a server-side key file, named — not carried — by
@@ -51,7 +57,7 @@ impl PsyWalletServer {
                         format!("mode=load: the environment variable {env_name} is not set in the server's environment (the owner sets it; the agent only names it)"),
                         json!({ "gate": "args" })),
                 };
-                match state.wallet.load(&network, &pk).await {
+                match state.wallet.load_selected(&network, &pk, a.sign_type.as_deref(), a.fingerprint.as_deref()).await {
                     Ok(l) => l,
                     Err(e) => return err_json(e, json!({})),
                 }
@@ -71,7 +77,7 @@ impl PsyWalletServer {
             };
             (loaded, None)
         } else {
-            let (pk, fp) = match state.wallet.generate_keypair(&network).await {
+            let (pk, fp) = match state.wallet.generate_keypair(&network, a.sign_type.as_deref(), a.fingerprint.as_deref()).await {
                 Ok(kp) => kp,
                 Err(e) => return err_json(e, json!({})),
             };
@@ -88,7 +94,7 @@ impl PsyWalletServer {
                     )
                 }
             };
-            match state.wallet.register(&network, &pk).await {
+            match state.wallet.register(&network, &pk, &fp).await {
                 Ok(l) => (l, Some(backup_path)),
                 Err(e) => {
                     tracing::info!(
@@ -131,6 +137,7 @@ impl PsyWalletServer {
             "network": network.as_str(),
             "userId": loaded.user_id,
             "psyId": format!("Psy-{:08}", loaded.user_id),
+            "fingerprint": loaded.fingerprint.to_string(),
             "policyId": policy_id,
             "allowedRecipientCount": recipient_count,
             "note": "Key registered with REAL on-chain proving via WalletSession. Issue a session with issue_session to let the agent spend.",

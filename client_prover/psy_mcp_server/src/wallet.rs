@@ -320,6 +320,8 @@ const REGISTRATION_POLL_INTERVAL: Duration = Duration::from_secs(5);
 pub struct LoadedUser {
     pub pk_hash: QHashOut<F>,
     pub user_id: u64,
+    /// Circuit fingerprint is part of the wallet identity and must survive reloads.
+    pub fingerprint: QHashOut<F>,
     pub mandate: Option<Mandate>,
     /// Kept in memory (never serialized) so the wallet can re-derive its
     /// private receive identity — the shielded address' blinding factors
@@ -417,7 +419,7 @@ impl NetworkWallet {
         match first {
             Ok(leaf) => Ok(leaf.to_string()),
             Err(e) if is_stale_state_error(&e) => {
-                let fingerprint = self.session.get_zk_public_key(user.private_key).await?.fingerprint;
+                let fingerprint = user.fingerprint;
                 self.session.update_circuit_mgr(user.pk_hash).await.ok();
                 self.session
                     .add_user(user.private_key, fingerprint)
@@ -439,7 +441,7 @@ impl NetworkWallet {
         match first {
             Ok(leaf) => Ok(leaf.to_string()),
             Err(e) if is_stale_state_error(&e) => {
-                let fingerprint = self.session.get_zk_public_key(user.private_key).await?.fingerprint;
+                let fingerprint = user.fingerprint;
                 self.session.update_circuit_mgr(user.pk_hash).await.ok();
                 self.session
                     .add_user(user.private_key, fingerprint)
@@ -473,9 +475,24 @@ impl NetworkWallet {
         })
     }
 
-    async fn generate_keypair(&mut self) -> Result<(String, String)> {
-        let keypair = self.session.get_random_keypair().await?;
-        Ok((keypair.private_key.to_string(), keypair.public_key.fingerprint.to_string()))
+    async fn resolve_fingerprint(&mut self, private_key: QHashOut<F>, sign_type: Option<&str>, fingerprint_hex: Option<&str>) -> Result<QHashOut<F>> {
+        anyhow::ensure!(sign_type.is_none() || fingerprint_hex.is_none(), "pass sign_type or fingerprint, not both");
+        if let Some(raw) = fingerprint_hex {
+            return raw.trim().parse::<QHashOut<F>>().map_err(|_| anyhow!("invalid fingerprint (expected QHashOut hex)"));
+        }
+        match sign_type.unwrap_or("zk").trim().to_ascii_lowercase().as_str() {
+            "zk" => Ok(self.session.get_zk_public_key(private_key).await?.fingerprint),
+            "secp256k1" => Ok(self.session.get_secp_public_key(private_key).await?.fingerprint),
+            "eth-personal-secp256k1" => Ok(self.session.get_eth_personal_secp_public_key(private_key).await?.fingerprint),
+            "sd-key" => anyhow::bail!("sd-key accounts require mint_agent_account so their mandate can be backed up"),
+            other => anyhow::bail!("unsupported sign_type `{other}`; use zk, secp256k1, or eth-personal-secp256k1"),
+        }
+    }
+
+    async fn generate_keypair(&mut self, sign_type: Option<&str>, fingerprint_hex: Option<&str>) -> Result<(String, String)> {
+        let private_key = self.session.get_random_keypair().await?.private_key;
+        let fingerprint = self.resolve_fingerprint(private_key, sign_type, fingerprint_hex).await?;
+        Ok((private_key.to_string(), fingerprint.to_string()))
     }
 }
 
@@ -949,14 +966,15 @@ impl WalletManager {
     /// devnet whose checkpoints are near-instant. We poll until the id
     /// exists, mirroring what the shipped web wallet's sign-in sequence
     /// does.
-    pub async fn register(&self, network: &NetworkId, private_key_hex: &str) -> Result<LoadedUser> {
+    pub async fn register(&self, network: &NetworkId, private_key_hex: &str, fingerprint_hex: &str) -> Result<LoadedUser> {
         let private_key = Self::parse_key(private_key_hex)?;
-        let fingerprint = self.state(network).await?.session.get_zk_public_key(private_key).await?.fingerprint;
+        let fingerprint = fingerprint_hex.trim().parse::<QHashOut<F>>().map_err(|_| anyhow!("invalid fingerprint (expected QHashOut hex)"))?;
         let pk_hash = self.state(network).await?.session.register_user(private_key, fingerprint).await?;
         let user_id = self.await_user_id(network, pk_hash, REGISTRATION_TIMEOUT).await?;
         let loaded = LoadedUser {
             pk_hash,
             user_id,
+            fingerprint,
             mandate: None,
             private_key,
         };
@@ -1064,6 +1082,7 @@ impl WalletManager {
         let user = LoadedUser {
             pk_hash,
             user_id,
+            fingerprint,
             mandate: Some(mandate),
             private_key,
         };
@@ -1116,16 +1135,19 @@ impl WalletManager {
 
     /// Load an already-registered key (idempotent add). Returns the user id.
     pub async fn load(&self, network: &NetworkId, private_key_hex: &str) -> Result<LoadedUser> {
+        self.load_selected(network, private_key_hex, None, None).await
+    }
+
+    pub async fn load_selected(&self, network: &NetworkId, private_key_hex: &str, sign_type: Option<&str>, fingerprint_hex: Option<&str>) -> Result<LoadedUser> {
         let private_key = Self::parse_key(private_key_hex)?;
-        let fingerprint = self.state(network).await?.session.get_zk_public_key(private_key).await?.fingerprint;
-        let pk_hash = self.state(network).await?.session.add_user(private_key, fingerprint).await?;
-        let user_id = self.resolve_user_id(network, pk_hash).await?;
-        let loaded = LoadedUser {
-            pk_hash,
-            user_id,
-            mandate: None,
-            private_key,
+        let (pk_hash, fingerprint) = {
+            let mut state = self.state(network).await?;
+            let fingerprint = state.resolve_fingerprint(private_key, sign_type, fingerprint_hex).await?;
+            let pk_hash = state.session.add_user(private_key, fingerprint).await?;
+            (pk_hash, fingerprint)
         };
+        let user_id = self.resolve_user_id(network, pk_hash).await?;
+        let loaded = LoadedUser { pk_hash, user_id, fingerprint, mandate: None, private_key };
         self.activate_user(network, loaded.clone()).await?;
         Ok(loaded)
     }
@@ -1133,13 +1155,9 @@ impl WalletManager {
     /// Restore a wallet from a key backup, re-registering the agent's circuit
     /// first when the backup records a mandate.
     ///
-    /// `load()` derives the identity from the DEFAULT zk fingerprint, which is
-    /// correct for an ordinary wallet and wrong for a minted agent account:
-    /// that identity is `(private_key, circuit_fingerprint)`, so add_user
-    /// produced a different pk_hash and the user id never resolved. Following
-    /// mint_agent_account's own "restart with PSY_MCP_KEY_FILE" instruction
-    /// therefore could not work. Re-registering the circuit from the recorded
-    /// mandate reproduces the same fingerprint and the same identity.
+    /// The backup fingerprint is authoritative for ordinary wallets. Agent
+    /// accounts additionally rebuild their SDKey circuit from the recorded
+    /// mandate and verify that the rebuilt fingerprint is identical.
     pub async fn load_from_backup(&self, network: &NetworkId, backup: &crate::keystore::KeyBackup) -> Result<LoadedUser> {
         if let Some(backup_network) = backup.network.as_deref() {
             if backup_network != network.as_str() {
@@ -1149,7 +1167,14 @@ impl WalletManager {
             }
         }
         let Some(mandate) = backup.mandate.clone() else {
-            return self.load(network, &backup.private_key).await;
+            let private_key = Self::parse_key(&backup.private_key)?;
+            let fingerprint = backup.fingerprint.trim().parse::<QHashOut<F>>()
+                .map_err(|_| anyhow!("key backup has an invalid fingerprint"))?;
+            let pk_hash = self.state(network).await?.session.add_user(private_key, fingerprint).await?;
+            let user_id = self.resolve_user_id(network, pk_hash).await?;
+            let loaded = LoadedUser { pk_hash, user_id, fingerprint, mandate: None, private_key };
+            self.activate_user(network, loaded.clone()).await?;
+            return Ok(loaded);
         };
         let private_key = Self::parse_key(&backup.private_key)?;
         let (contract_ids, method_ids): (Vec<u64>, Vec<u32>) = mandate.capabilities.iter().map(|c| (c.contract_id, c.method_id)).unzip();
@@ -1175,6 +1200,7 @@ impl WalletManager {
         let loaded = LoadedUser {
             pk_hash,
             user_id,
+            fingerprint,
             mandate: Some(mandate),
             private_key,
         };
@@ -1389,8 +1415,8 @@ impl WalletManager {
 
     /// Generate a fresh keypair (private key hex + fingerprint hex) without
     /// touching the chain — the owner then registers it under a policy.
-    pub async fn generate_keypair(&self, network: &NetworkId) -> Result<(String, String)> {
-        self.state(network).await?.generate_keypair().await
+    pub async fn generate_keypair(&self, network: &NetworkId, sign_type: Option<&str>, fingerprint: Option<&str>) -> Result<(String, String)> {
+        self.state(network).await?.generate_keypair(sign_type, fingerprint).await
     }
 }
 

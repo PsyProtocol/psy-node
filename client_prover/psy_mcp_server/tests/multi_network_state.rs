@@ -8,6 +8,9 @@ mod agent_account;
 #[path = "../src/keystore.rs"]
 mod keystore;
 #[allow(dead_code, unused_imports)]
+#[path = "../src/l1.rs"]
+mod l1;
+#[allow(dead_code, unused_imports)]
 #[path = "../src/network.rs"]
 mod network;
 #[allow(dead_code, unused_imports)]
