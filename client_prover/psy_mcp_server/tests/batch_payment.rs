@@ -25,7 +25,7 @@ fn limits(per_tx: u64, per_day: u64) -> Limits {
 fn engine_with(l: Limits, recipients: Option<Vec<String>>) -> (PolicyEngine, String, String) {
     let mut e = PolicyEngine::new();
     let pid = e.create_policy("agent-1", l, recipients, vec![]);
-    let (token, _) = e.issue_session(&pid, 60).unwrap();
+    let (token, _) = e.issue_session(&pid, 60, None).unwrap();
     (e, pid, token)
 }
 
@@ -158,7 +158,7 @@ fn a_batch_needs_a_valid_live_session() {
 fn a_disallowed_method_refuses_the_batch() {
     let mut e = PolicyEngine::new();
     let pid = e.create_policy("agent-1", limits(100 * PSY, 1_000 * PSY), None, vec!["simple_claim".into()]);
-    let (tok, _) = e.issue_session(&pid, 60).unwrap();
+    let (tok, _) = e.issue_session(&pid, 60, None).unwrap();
     let before = spent(&mut e, &pid);
     let err = e
         .authorize_batch(&tok, &[("alice", 1 * PSY)], "simple_transfer")

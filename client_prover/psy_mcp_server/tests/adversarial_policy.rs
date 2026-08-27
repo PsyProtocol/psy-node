@@ -35,7 +35,7 @@ fn open_limits() -> Limits {
 fn engine_with(limits: Limits, recipients: Option<Vec<String>>) -> (PolicyEngine, String, String) {
     let mut e = PolicyEngine::new();
     let pid = e.create_policy("agent-1", limits, recipients, vec![]);
-    let (token, _) = e.issue_session(&pid, 60).unwrap();
+    let (token, _) = e.issue_session(&pid, 60, None).unwrap();
     (e, pid, token)
 }
 
@@ -190,8 +190,9 @@ fn documents_the_cross_day_refund_credit() {
     assert!(e.authorize(&t, "9999", 100, "simple_transfer").is_ok(), "second 100 on a 100/day cap");
 }
 
-/// FIXED: the cap comparisons use checked arithmetic, so an amount that
-/// would overflow u64 is denied — no panic, no wrap-around approval.
+/// Regression for the overflow attack: the cap comparisons now use
+/// `checked_add`, so an overflowing amount is DENIED at the daily gate
+/// instead of panicking (debug) or wrapping into an approval (release).
 #[test]
 fn attack_an_overflowing_amount_is_denied_by_the_authorize_gate() {
     let limits = Limits { per_transaction: u64::MAX, per_day: 1_000, per_month: None, total_budget: None };
@@ -199,16 +200,16 @@ fn attack_an_overflowing_amount_is_denied_by_the_authorize_gate() {
     // Land a small legitimate spend so spent_today > 0.
     e.authorize(&t, "9999", 500, "simple_transfer").unwrap();
     // amount <= per_transaction, so the per-tx gate passes; the daily gate then
-    // computes 500 + u64::MAX, which saturates and is denied.
+    // computes checked 500 + u64::MAX and must refuse.
     assert!(
         e.authorize(&t, "9999", u64::MAX, "simple_transfer").is_err(),
         "u64::MAX on a 1000/day policy must be refused"
     );
 }
 
-/// The same overflow reached through the monthly cap.
+/// The same overflow reached through the monthly and lifetime caps.
 #[test]
-fn attack_the_monthly_cap_overflow_is_denied() {
+fn attack_the_monthly_cap_overflow_is_denied_the_same_way() {
     let limits = Limits { per_transaction: u64::MAX, per_day: u64::MAX, per_month: Some(1_000), total_budget: None };
     let (mut e, _pid, t) = engine_with(limits, None);
     e.authorize(&t, "9999", 500, "simple_transfer").unwrap();
@@ -431,7 +432,7 @@ fn attack_an_empty_allowlist_blocks_outbound_but_not_inbound() {
 fn attack_a_method_off_the_allowlist_is_denied_even_to_an_approved_recipient() {
     let mut e = PolicyEngine::new();
     let pid = e.create_policy("agent-1", open_limits(), Some(vec!["1234".into()]), vec!["simple_claim".into()]);
-    let (t, _) = e.issue_session(&pid, 60).unwrap();
+    let (t, _) = e.issue_session(&pid, 60, None).unwrap();
     for m in ["simple_transfer", "private_transfer", "withdraw", "deposit", "x402_fetch", "claim_deposit", "private_claim"] {
         let err = e.authorize(&t, "1234", 1, m).unwrap_err().to_string();
         assert!(err.contains("not allowed"), "`{m}` must be off-limits: {err}");
@@ -445,7 +446,7 @@ fn attack_a_method_off_the_allowlist_is_denied_even_to_an_approved_recipient() {
 fn attack_method_names_are_matched_exactly() {
     let mut e = PolicyEngine::new();
     let pid = e.create_policy("agent-1", open_limits(), None, vec!["simple_claim".into()]);
-    let (t, _) = e.issue_session(&pid, 60).unwrap();
+    let (t, _) = e.issue_session(&pid, 60, None).unwrap();
     for near_miss in [
         "SIMPLE_CLAIM", "Simple_Claim", "simple_claim ", " simple_claim",
         "simple_claim\0", "simple_claims", "simple", "simple_transfer",
@@ -463,8 +464,8 @@ fn attack_x402_and_simple_transfer_are_not_interchangeable() {
     let mut e = PolicyEngine::new();
     let transfers_only = e.create_policy("a", open_limits(), None, vec!["simple_transfer".into()]);
     let x402_only = e.create_policy("b", open_limits(), None, vec!["x402_fetch".into()]);
-    let (t1, _) = e.issue_session(&transfers_only, 60).unwrap();
-    let (t2, _) = e.issue_session(&x402_only, 60).unwrap();
+    let (t1, _) = e.issue_session(&transfers_only, 60, None).unwrap();
+    let (t2, _) = e.issue_session(&x402_only, 60, None).unwrap();
 
     assert!(e.authorize(&t1, "1", 1, "simple_transfer").is_ok());
     assert!(e.authorize(&t1, "1", 1, "x402_fetch").is_err(), "paid fetches are separately approved");
@@ -560,7 +561,7 @@ fn attack_a_revoked_token_stays_dead() {
 fn attack_an_expired_token_is_dead_and_is_reaped() {
     let mut e = PolicyEngine::new();
     let pid = e.create_policy("a", open_limits(), None, vec![]);
-    let (t, _) = e.issue_session(&pid, 60).unwrap();
+    let (t, _) = e.issue_session(&pid, 60, None).unwrap();
     e.expire_session_for_test(&t);
     assert!(e.authorize(&t, "1", 1, "simple_transfer").unwrap_err().to_string().contains("expired"));
     assert!(e.policy_id_for_session(&t).is_none(), "expired tokens are dropped, not left to leak");
@@ -576,11 +577,11 @@ fn attack_an_absurd_ttl_is_clamped_to_twenty_four_hours() {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     for ttl in [u64::MAX, u64::MAX / 60, u64::MAX / 2, 525_600, 1_441, 100_000_000] {
-        let (_t, exp) = e.issue_session(&pid, ttl).unwrap();
+        let (_t, exp) = e.issue_session(&pid, ttl, None).unwrap();
         assert!(exp >= now, "ttl {ttl} must not wrap into the past");
         assert!(exp - now <= DAY + 2, "ttl {ttl} must clamp to 24h, got {} seconds", exp - now);
     }
-    let (_t, exp) = e.issue_session(&pid, 0).unwrap();
+    let (_t, exp) = e.issue_session(&pid, 0, None).unwrap();
     assert!(exp - now <= 2, "a zero TTL is an immediately-dead session");
 }
 
@@ -591,7 +592,7 @@ fn attack_session_tokens_are_unguessable_and_unique() {
     let pid = e.create_policy("a", open_limits(), None, vec![]);
     let mut seen = std::collections::HashSet::new();
     for _ in 0..2_000 {
-        let (t, _) = e.issue_session(&pid, 60).unwrap();
+        let (t, _) = e.issue_session(&pid, 60, None).unwrap();
         assert_eq!(t.len(), 64, "32 bytes of entropy, hex-encoded");
         assert!(t.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         assert!(seen.insert(t), "a repeated session token would be a catastrophic PRNG failure");
@@ -631,9 +632,9 @@ fn attack_a_session_cannot_be_minted_from_a_paused_policy() {
     let mut e = PolicyEngine::new();
     let pid = e.create_policy("a", open_limits(), None, vec![]);
     e.pause(&pid);
-    let err = e.issue_session(&pid, 60).unwrap_err().to_string();
+    let err = e.issue_session(&pid, 60, None).unwrap_err().to_string();
     assert!(err.contains("paused"), "{err}");
-    assert!(e.issue_session("no-such-policy", 60).is_err(), "and not from a policy that does not exist");
+    assert!(e.issue_session("no-such-policy", 60, None).is_err(), "and not from a policy that does not exist");
 }
 
 /// A session is bound to ONE policy; it cannot be pointed at a wealthier one.
@@ -642,7 +643,7 @@ fn attack_a_session_cannot_be_spent_against_another_policy() {
     let mut e = PolicyEngine::new();
     let poor = e.create_policy("a", Limits { per_transaction: 1, per_day: 1, ..open_limits() }, None, vec![]);
     let rich = e.create_policy("b", open_limits(), None, vec![]);
-    let (t, _) = e.issue_session(&poor, 60).unwrap();
+    let (t, _) = e.issue_session(&poor, 60, None).unwrap();
     assert_eq!(e.policy_id_for_session(&t).as_deref(), Some(poor.as_str()));
     assert!(e.authorize(&t, "1", 1_000, "simple_transfer").is_err(), "the poor policy's cap binds");
     assert_eq!(e.describe(&rich).unwrap().spent_total_nano, 0, "the rich policy was never touched");
@@ -677,7 +678,7 @@ fn attack_a_restart_does_not_re_grant_the_lifetime_budget() {
     let pid = {
         let mut e = PolicyEngine::load_or_new(&dir);
         let pid = e.create_policy("a", limits, None, vec![]);
-        let (t, _) = e.issue_session(&pid, 60).unwrap();
+        let (t, _) = e.issue_session(&pid, 60, None).unwrap();
         for _ in 0..3 {
             e.authorize(&t, "1", 100, "simple_transfer").unwrap();
         }
@@ -687,7 +688,7 @@ fn attack_a_restart_does_not_re_grant_the_lifetime_budget() {
     // Crash-loop the server ten times; each restart must find the budget spent.
     for i in 0..10 {
         let mut e = PolicyEngine::load_or_new(&dir);
-        let (t, _) = e.issue_session(&pid, 60).unwrap();
+        let (t, _) = e.issue_session(&pid, 60, None).unwrap();
         let err = e.authorize(&t, "1", 1, "simple_transfer").unwrap_err().to_string();
         assert!(err.contains("total budget"), "restart {i} re-granted the budget: {err}");
         assert_eq!(e.describe(&pid).unwrap().spent_total_nano, 300);
@@ -703,12 +704,12 @@ fn attack_a_restart_does_not_reset_the_daily_counter() {
     let pid = {
         let mut e = PolicyEngine::load_or_new(&dir);
         let pid = e.create_policy("a", limits, None, vec![]);
-        let (t, _) = e.issue_session(&pid, 60).unwrap();
+        let (t, _) = e.issue_session(&pid, 60, None).unwrap();
         e.authorize(&t, "1", 100, "simple_transfer").unwrap();
         pid
     };
     let mut e = PolicyEngine::load_or_new(&dir);
-    let (t, _) = e.issue_session(&pid, 60).unwrap();
+    let (t, _) = e.issue_session(&pid, 60, None).unwrap();
     let err = e.authorize(&t, "1", 1, "simple_transfer").unwrap_err().to_string();
     assert!(err.contains("daily cap"), "the daily window survived the restart: {err}");
     std::fs::remove_dir_all(&dir).ok();
@@ -727,7 +728,7 @@ fn attack_a_restart_does_not_unpause_a_policy() {
     };
     let mut e = PolicyEngine::load_or_new(&dir);
     assert!(!e.describe(&pid).unwrap().active, "the pause survived the restart");
-    assert!(e.issue_session(&pid, 60).is_err(), "and no session can be minted");
+    assert!(e.issue_session(&pid, 60, None).is_err(), "and no session can be minted");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -739,7 +740,7 @@ fn attack_sessions_do_not_survive_a_restart() {
     let (pid, token) = {
         let mut e = PolicyEngine::load_or_new(&dir);
         let pid = e.create_policy("a", open_limits(), None, vec![]);
-        let (t, _) = e.issue_session(&pid, 60).unwrap();
+        let (t, _) = e.issue_session(&pid, 60, None).unwrap();
         (pid, t)
     };
     let mut e = PolicyEngine::load_or_new(&dir);
@@ -759,7 +760,7 @@ fn attack_a_restart_does_not_widen_the_recipient_allowlist() {
         e.create_policy("a", open_limits(), Some(vec!["1234".into()]), vec!["simple_transfer".into()])
     };
     let mut e = PolicyEngine::load_or_new(&dir);
-    let (t, _) = e.issue_session(&pid, 60).unwrap();
+    let (t, _) = e.issue_session(&pid, 60, None).unwrap();
     assert_eq!(e.describe(&pid).unwrap().allowed_recipient_count, Some(1));
     assert!(e.authorize(&t, "9999", 1, "simple_transfer").is_err(), "still restricted after a restart");
     assert!(e.authorize(&t, "1234", 1, "simple_transfer").is_ok());
@@ -787,7 +788,7 @@ fn attack_a_corrupt_store_fails_closed_for_spending() {
         std::fs::write(dir.join("policies.json"), garbage).unwrap();
         let mut e = PolicyEngine::load_or_new(&dir);
         assert!(e.policy_ids().is_empty(), "a corrupt store must not yield a usable policy: {garbage:?}");
-        assert!(e.issue_session("anything", 60).is_err());
+        assert!(e.issue_session("anything", 60, None).is_err());
         assert!(e.authorize("anything", "1", 1, "simple_transfer").is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -893,7 +894,7 @@ fn attack_the_engine_surface_never_panics_on_hostile_arguments() {
     let limits = Limits { per_transaction: u64::MAX, per_day: u64::MAX, per_month: Some(u64::MAX), total_budget: Some(u64::MAX) };
     let mut e = PolicyEngine::new();
     let pid = e.create_policy(&"A".repeat(100_000), limits, Some(vec!["".into(), "\0".into(), "🙂".into()]), vec!["".into(), "\0".into()]);
-    let (t, _) = e.issue_session(&pid, 60).unwrap();
+    let (t, _) = e.issue_session(&pid, 60, None).unwrap();
 
     assert!(e.authorize(&t, &"z".repeat(100_000), 0, &"m".repeat(100_000)).is_err());
     assert!(e.authorize("", "", 0, "").is_err());

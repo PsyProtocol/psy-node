@@ -142,7 +142,10 @@ jobs:
             --target "${TARGET_TRIPLE}" \
             --bin psy_user_cli \
             --bin psy_node_cli \
-            --bin psy_worker_cli
+            --bin psy_worker_cli \
+            --bin psy_dev_cli \
+            --bin psy_relayer_cli \
+            --bin psy-mcp-server
 
       - name: Package and smoke test
         env:
@@ -161,17 +164,30 @@ jobs:
           cp "target/${TARGET_TRIPLE}/release/psy_user_cli" "$package/psy_user_cli"
           cp "target/${TARGET_TRIPLE}/release/psy_node_cli" "$package/psy_node_cli"
           cp "target/${TARGET_TRIPLE}/release/psy_worker_cli" "$package/psy_worker_cli"
+          cp "target/${TARGET_TRIPLE}/release/psy_dev_cli" "$package/psy_dev_cli"
+          cp "target/${TARGET_TRIPLE}/release/psy_relayer_cli" "$package/psy_relayer_cli"
+          cp "target/${TARGET_TRIPLE}/release/psy-mcp-server" "$package/psy-mcp-server"
           cp LICENSE "$package/LICENSE"
-          chmod 0755 "$package/psy_user_cli" "$package/psy_node_cli" "$package/psy_worker_cli"
+          chmod 0755 \
+            "$package/psy_user_cli" \
+            "$package/psy_node_cli" \
+            "$package/psy_worker_cli" \
+            "$package/psy_dev_cli" \
+            "$package/psy_relayer_cli" \
+            "$package/psy-mcp-server"
 
           tar -C "$package" -czf "dist/$asset" \
-            psy_user_cli psy_node_cli psy_worker_cli LICENSE
+            psy_user_cli psy_node_cli psy_worker_cli \
+            psy_dev_cli psy_relayer_cli psy-mcp-server LICENSE
 
           cat > "$RUNNER_TEMP/expected-inventory" <<'EOF'
           LICENSE
           psy_node_cli
           psy_user_cli
           psy_worker_cli
+          psy_dev_cli
+          psy_relayer_cli
+          psy-mcp-server
           EOF
           tar -tzf "dist/$asset" | sed 's#^\./##' | LC_ALL=C sort > "$RUNNER_TEMP/actual-inventory"
           LC_ALL=C sort "$RUNNER_TEMP/expected-inventory" -o "$RUNNER_TEMP/expected-inventory"
@@ -179,7 +195,7 @@ jobs:
 
           tar -xzf "dist/$asset" -C "$smoke"
           test -f "$smoke/LICENSE"
-          for name in psy_user_cli psy_node_cli psy_worker_cli; do
+          for name in psy_user_cli psy_node_cli psy_worker_cli psy_dev_cli psy_relayer_cli psy-mcp-server; do
             test -x "$smoke/$name"
             "$smoke/$name" --help >/dev/null
           done

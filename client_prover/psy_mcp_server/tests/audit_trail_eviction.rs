@@ -23,7 +23,7 @@ fn engine() -> (PolicyEngine, String, String) {
         None,
         vec![],
     );
-    let (t, _) = e.issue_session(&pid, 60).unwrap();
+    let (t, _) = e.issue_session(&pid, 60, None).unwrap();
     (e, pid, t)
 }
 
@@ -105,7 +105,7 @@ fn a_flood_evicts_the_earliest_refusal_and_SAYS_SO() {
         None,
         vec!["simple_transfer".into()],
     );
-    let (tok, _) = e.issue_session(&pid, 60).unwrap();
+    let (tok, _) = e.issue_session(&pid, 60, None).unwrap();
     let _ = e.authorize(&tok, "mallory", 99 * PSY, "simple_transfer");
     for _ in 0..300 {
         let _ = e.authorize(&tok, SELF_RECIPIENT, 0, "simple_claim");
@@ -147,7 +147,7 @@ fn tight_engine() -> (PolicyEngine, String) {
         None,
         vec![],
     );
-    let (t, _) = e.issue_session(&pid, 60).unwrap();
+    let (t, _) = e.issue_session(&pid, 60, None).unwrap();
     (e, t)
 }
 

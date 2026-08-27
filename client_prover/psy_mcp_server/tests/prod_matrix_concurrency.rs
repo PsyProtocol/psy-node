@@ -63,7 +63,7 @@ fn stress_01_a_daily_cap_holds_exactly_under_concurrent_authorize() {
     const CAP: u64 = 1_000;
     let mut engine = PolicyEngine::new();
     let pid = engine.create_policy("swarm", Limits { per_transaction: 1, per_day: CAP, per_month: None, total_budget: None }, None, vec![]);
-    let (token, _) = engine.issue_session(&pid, 60).unwrap();
+    let (token, _) = engine.issue_session(&pid, 60, None).unwrap();
     let shared: Shared = Arc::new(Mutex::new(engine));
 
     let granted = Arc::new(AtomicU64::new(0));
@@ -96,7 +96,7 @@ fn stress_01b_a_lifetime_budget_holds_under_mixed_amounts() {
         None,
         vec![],
     );
-    let (token, _) = engine.issue_session(&pid, 60).unwrap();
+    let (token, _) = engine.issue_session(&pid, 60, None).unwrap();
     let shared: Shared = Arc::new(Mutex::new(engine));
 
     let total = Arc::new(AtomicU64::new(0));
@@ -137,7 +137,7 @@ fn stress_02_concurrent_agents_cannot_spend_each_others_budgets() {
             None,
             vec![],
         );
-        let (token, _) = engine.issue_session(&pid, 60).unwrap();
+        let (token, _) = engine.issue_session(&pid, 60, None).unwrap();
         policies.push((pid, token));
     }
     let shared: Shared = Arc::new(Mutex::new(engine));
@@ -179,7 +179,7 @@ fn stress_02b_a_revoked_agent_stops_mid_swarm_without_disturbing_the_others() {
     let mut pids = Vec::new();
     for a in 0..4 {
         let pid = engine.create_policy(&format!("agent-{a}"), wide(), None, vec![]);
-        let (t, _) = engine.issue_session(&pid, 60).unwrap();
+        let (t, _) = engine.issue_session(&pid, 60, None).unwrap();
         tokens.push(t);
         pids.push(pid);
     }
@@ -232,7 +232,7 @@ fn stress_03_refunds_racing_authorizations_never_mint_or_lose_budget() {
         None,
         vec![],
     );
-    let (token, _) = engine.issue_session(&pid, 60).unwrap();
+    let (token, _) = engine.issue_session(&pid, 60, None).unwrap();
     let shared: Shared = Arc::new(Mutex::new(engine));
 
     let net = Arc::new(AtomicU64::new(0));
@@ -276,7 +276,7 @@ fn stress_03b_check_budget_is_advisory_but_authorize_is_still_exact() {
     const CAP: u64 = 2_000;
     let mut engine = PolicyEngine::new();
     let pid = engine.create_policy("swarm", Limits { per_transaction: 10, per_day: CAP, per_month: None, total_budget: None }, None, vec![]);
-    let (token, _) = engine.issue_session(&pid, 60).unwrap();
+    let (token, _) = engine.issue_session(&pid, 60, None).unwrap();
     let shared: Shared = Arc::new(Mutex::new(engine));
 
     let granted = Arc::new(AtomicU64::new(0));
@@ -320,7 +320,7 @@ fn stress_04_a_long_running_server_stays_bounded_and_exact() {
         None,
         vec![],
     );
-    let (token, _) = engine.issue_session(&pid, 60).unwrap();
+    let (token, _) = engine.issue_session(&pid, 60, None).unwrap();
 
     let mut expected = 0u64;
     for i in 0..ROUNDS {
@@ -357,7 +357,7 @@ fn stress_05_persisted_counters_match_memory_after_a_concurrent_run() {
         None,
         vec![],
     );
-    let (token, _) = engine.issue_session(&pid, 60).unwrap();
+    let (token, _) = engine.issue_session(&pid, 60, None).unwrap();
     let shared: Shared = Arc::new(Mutex::new(engine));
 
     {
@@ -375,7 +375,7 @@ fn stress_05_persisted_counters_match_memory_after_a_concurrent_run() {
     let d = restarted.describe(&pid).unwrap();
     assert_eq!(d.spent_total_nano, in_memory, "the persisted counter disagrees with memory — a restart would re-grant budget");
     assert_eq!(d.remaining_total_nano, Some(0));
-    let (t2, _) = restarted.issue_session(&pid, 60).unwrap();
+    let (t2, _) = restarted.issue_session(&pid, 60, None).unwrap();
     assert!(restarted.authorize(&t2, "204800", 1, "simple_transfer").is_err(), "and nothing is spendable after the restart");
     std::fs::remove_dir_all(&dir).ok();
 }

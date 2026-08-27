@@ -2805,6 +2805,10 @@ impl WalletSession {
         self.wallet.get_secp_pk_info(private_key).await
     }
 
+    pub async fn get_eth_personal_secp_public_key(&self, private_key: QHashOut<F>) -> anyhow::Result<ZKPublicKeyInfo<F>> {
+        self.wallet.get_eth_personal_secp_pk_info(private_key).await
+    }
+
     pub async fn get_random_keypair(&self) -> anyhow::Result<WalletKeyPair> {
         let private_key = QHashOut::<F>::rand();
         let pk_info = self.get_zk_public_key(private_key).await?;

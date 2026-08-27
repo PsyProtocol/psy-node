@@ -85,6 +85,10 @@ impl L1Client {
         self.signer.address()
     }
 
+    pub async fn chain_id(&self) -> Result<u64> {
+        hex_u64(&rpc(&self.rpc_url, "eth_chainId", serde_json::json!([])).await?)
+    }
+
     /// ERC20 `allowance(owner, spender)`.
     pub async fn erc20_allowance(&self, token: Address, spender: Address) -> Result<U256> {
         let mut data = keccak256(b"allowance(address,address)")[..4].to_vec();
@@ -151,7 +155,7 @@ impl L1Client {
     /// is an error — "it mined" is not "it worked".
     pub async fn send(&self, to: Address, data: Vec<u8>, value: U256) -> Result<String> {
         let from = format!("{}", self.address());
-        let chain_id = hex_u64(&rpc(&self.rpc_url, "eth_chainId", serde_json::json!([])).await?)?;
+        let chain_id = self.chain_id().await?;
         let nonce = hex_u64(
             &rpc(&self.rpc_url, "eth_getTransactionCount", serde_json::json!([from, "pending"])).await?,
         )?;

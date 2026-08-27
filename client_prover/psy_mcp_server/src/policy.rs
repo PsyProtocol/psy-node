@@ -372,6 +372,9 @@ impl Default for Limits {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct Policy {
     agent_id: String,
+    /// Network containing `bound_user_id`. Old policies bind on first use.
+    #[serde(default)]
+    bound_network: Option<String>,
     /// The on-chain user id this policy governs.
     ///
     /// A policy is a budget for ONE wallet. Without this it was a budget for
@@ -402,6 +405,13 @@ struct Policy {
 struct Session {
     policy_id: String,
     expires_at: u64,
+    /// Lifetime spend cap for THIS session token, in nano. `None` = uncapped
+    /// (still bound by the policy's per-day/per-month/total caps).
+    session_budget: Option<u64>,
+    /// Amount already authorized against this session. Checked and incremented
+    /// under the same lock as the policy counters, so concurrent spends from
+    /// one token cannot both pass on stale state.
+    session_spent: u64,
 }
 
 /// Returned on a successful `authorize()`. The fields identify the approving
@@ -411,6 +421,13 @@ struct Session {
 pub struct Authorization {
     pub policy_id: String,
     pub agent_id: String,
+    /// The session this spend was charged to. `refund` uses it to hand the
+    /// session-lifetime budget back alongside the policy counters — without
+    /// it, a spend that failed AFTER the gate (balance refusal, chain error)
+    /// would permanently eat the session cap.
+    pub session_token: String,
+    pub network: Option<String>,
+    pub user_id: Option<u64>,
     /// The spend-log rows this authorization created. `refund` uses these to
     /// mark exactly those rows, rather than guessing from an amount.
     pub spend_ids: Vec<u64>,
@@ -436,6 +453,7 @@ pub struct SpendRecord {
     pub age_seconds: u64,
     pub policy_id: String,
     pub agent_id: String,
+    pub network: Option<String>,
     pub method: String,
     /// As the tool passed it (not normalized), so it reads the way the owner
     /// would recognise it.
@@ -459,6 +477,7 @@ pub struct DeniedRecord {
     pub age_seconds: u64,
     pub policy_id: String,
     pub agent_id: String,
+    pub network: Option<String>,
     pub method: String,
     pub recipient: String,
     /// Nano-denominated amount; the wire name is plain `amount` — the unit is
@@ -591,6 +610,16 @@ pub struct PolicyEngine {
     /// Process-local and never persisted: it describes the running server, not
     /// the policy store. `None` before any wallet is loaded.
     current_user_id: Option<u64>,
+    current_network: Option<String>,
+    /// Whether reloads should retain only policies belonging to the initial
+    /// wallet. Disabled after an in-process wallet swap so bind_or_reject can
+    /// report the identity mismatch instead of pretending the policy vanished.
+    hide_foreign_on_reload: bool,
+    /// Policy ids bound to OTHER wallets, hidden from this process's view by
+    /// hide_foreign_policies. Tracked so the count can be surfaced to the
+    /// owner ("2 more policies belong to other wallets on this volume") when
+    /// the sole-policy fast path does not apply.
+    foreign_hidden: Vec<String>,
     /// Set when a policy file existed but could not be used. Without it, an
     /// empty policy set is ambiguous — and the creation gate's bootstrap
     /// exemption reads emptiness as "brand new server, nothing to compare
@@ -626,6 +655,9 @@ impl PolicyEngine {
     pub fn new() -> Self {
         Self {
             current_user_id: None,
+            current_network: None,
+            hide_foreign_on_reload: false,
+            foreign_hidden: Vec::new(),
             spend_log_dropped: 0,
             denied_log_dropped: 0,
             lost_policies: false, next_spend_id: 1, policies: HashMap::new(), sessions: HashMap::new(), spend_log: VecDeque::new(), denied_log: VecDeque::new(), persist_dir: None }
@@ -763,13 +795,70 @@ impl PolicyEngine {
         Ok(())
     }
 
+    /// Request-scoped capability check. The wallet identity and network are
+    /// installed while the caller still holds the PolicyEngine mutex, so no
+    /// concurrent request can substitute its environment between binding and
+    /// authorization.
+    pub fn check_can_act_for(&mut self, network: &str, user_id: Option<u64>, token: &str, method: &str) -> anyhow::Result<()> {
+        self.current_network = Some(network.to_string());
+        self.current_user_id = user_id;
+        self.check_can_act(token, method)
+    }
+
     /// Tell the engine which wallet this process now has loaded.
     ///
     /// Called after every successful load / register / mint. A policy is a
     /// budget for one identity, and this is the only thing that lets the engine
     /// notice when the identity underneath it has changed.
     pub fn set_current_user(&mut self, user_id: u64) {
+        let first_identity = self.current_user_id.is_none();
+        let identity_changed = self.current_user_id.is_some_and(|current| current != user_id);
         self.current_user_id = Some(user_id);
+        // Hide only on the FIRST identity of this process — the boot-time view
+        // of a shared keystore volume. A mid-process identity swap (load of
+        // another backup) keeps every policy visible on purpose: the swap may
+        // legitimately be the owner returning to another wallet, and the
+        // refusal for a mismatched policy must NAME both wallets
+        // (bind_or_reject), not make the policy vanish with a confusing
+        // "no longer exists".
+        if first_identity {
+            self.hide_foreign_on_reload = true;
+            self.hide_foreign_policies();
+        } else if identity_changed {
+            self.hide_foreign_on_reload = false;
+            // The boot-time view may already have removed this wallet's policy
+            // from memory. Restore the complete persisted map so authorization
+            // can reach bind_or_reject and name the mismatched identities.
+            self.reload_policies();
+        }
+    }
+
+    pub fn set_current_wallet(&mut self, network: &str, user_id: u64) {
+        self.current_network = Some(network.to_string());
+        self.set_current_user(user_id);
+    }
+
+    /// Bug #4: containers sharing the keystore volume share one policies.json,
+    /// so wallet B's boot sees wallet A's policies. Execution already refuses
+    /// them (bind_or_reject) but the owner-only no-id tools trip on
+    /// "several policies exist" and one wallet's budget caps are
+    /// metadata-visible to another. HIDE rather than move: the file is the
+    /// single source of truth, stays untouched (both containers keep saving
+    /// the whole map — the other wallet's counters never regress), and each
+    /// process simply cannot see what is not its own.
+    fn hide_foreign_policies(&mut self) {
+        let Some(current) = self.current_user_id else { return };
+        self.foreign_hidden = self
+            .policies
+            .iter()
+            .filter(|(_, p)| matches!(p.bound_user_id, Some(b) if b != current))
+            .map(|(id, _)| id.clone())
+            .collect();
+        if !self.foreign_hidden.is_empty() {
+            let n = self.foreign_hidden.len();
+            self.policies.retain(|_, p| !matches!(p.bound_user_id, Some(b) if b != current));
+            tracing::debug!("hiding {n} policies bound to other wallets; owner tools see only this wallet's policies");
+        }
     }
 
     /// Refuse a spend whose policy governs a DIFFERENT wallet than the one
@@ -791,15 +880,30 @@ impl PolicyEngine {
             return None;
         };
         let Some(policy) = self.policies.get_mut(policy_id) else { return None };
+        if let (Some(bound), Some(current_network)) = (policy.bound_network.as_deref(), self.current_network.as_deref()) {
+            if bound != current_network {
+                return Some(format!(
+                    "this policy governs network `{bound}` but the server currently uses `{current_network}`"
+                ));
+            }
+        }
         match policy.bound_user_id {
             Some(bound) if bound != current => Some(format!(
                 "this policy governs Psy-{bound:08} but the server currently has Psy-{current:08} loaded — \
                  a policy is a budget for one wallet, and its limits and spent counters do not transfer. \
                  Load the wallet this policy was created for, or ask the owner for a policy for this one."
             )),
-            Some(_) => None,
+            Some(_) => {
+                if policy.bound_network.is_none() {
+                    policy.bound_network = self.current_network.clone();
+                }
+                None
+            }
             None => {
                 policy.bound_user_id = Some(current);
+                if policy.bound_network.is_none() {
+                    policy.bound_network = self.current_network.clone();
+                }
                 None
             }
         }
@@ -835,6 +939,13 @@ impl PolicyEngine {
             Ok(bytes) => {
                 if let Ok(policies) = serde_json::from_slice::<HashMap<String, Policy>>(&bytes) {
                     self.policies = policies;
+                    // The disk holds EVERY wallet's policies (see save). Re-apply
+                    // the boot-time view so the reload cannot resurrect what the
+                    // owner's tools must not see — including a foreign policy
+                    // created AFTER boot, when nothing was hidden yet.
+                    if self.hide_foreign_on_reload {
+                        self.hide_foreign_policies();
+                    }
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -845,6 +956,23 @@ impl PolicyEngine {
     fn save(&self) {
         let Some(dir) = self.persist_dir.as_ref() else { return };
         let path = dir.join("policies.json");
+        // MERGE, not replace: containers sharing this volume each see only
+        // their own wallet's policies (hide_foreign_policies), so writing this
+        // process's map outright would DELETE every other wallet's budgets on
+        // disk. Read the full file, overlay this view's entries, keep the
+        // strangers'. Self-view always wins on conflict, so a counter update
+        // lands; a stranger's entry is passed through untouched.
+        let mut full: HashMap<String, Policy> = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        let mine = &self.policies;
+        // Always write the merged map: when the disk was empty `full` is
+        // exactly `mine` after the overlay above, so the common single-wallet
+        // case is unchanged; when it was not, strangers ride along.
+        for (id, p) in mine {
+            full.insert(id.clone(), p.clone());
+        }
         // A FIXED tmp name with truncate lets two servers sharing a keystore dir
         // interleave and rename a half-written file into place. The keystore
         // uses a random suffix + create_new for exactly this reason; match it.
@@ -864,7 +992,7 @@ impl PolicyEngine {
                     use std::os::unix::fs::PermissionsExt;
                     f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
                 }
-                f.write_all(serde_json::to_string_pretty(&self.policies)?.as_bytes())?;
+                f.write_all(serde_json::to_string_pretty(&full)?.as_bytes())?;
                 f.sync_all()?;
             }
             std::fs::rename(&tmp, &path)?;
@@ -899,6 +1027,7 @@ impl PolicyEngine {
             id.clone(),
             Policy {
                 agent_id: agent_id.to_string(),
+                bound_network: self.current_network.clone(),
                 // Stamp the identity this policy is for at creation, when we
                 // know it. A policy created before a wallet is loaded binds on
                 // first spend instead.
@@ -918,7 +1047,7 @@ impl PolicyEngine {
         id
     }
 
-    pub fn issue_session(&mut self, policy_id: &str, ttl_minutes: u64) -> anyhow::Result<(String, u64)> {
+    pub fn issue_session(&mut self, policy_id: &str, ttl_minutes: u64, max_session_total: Option<u64>) -> anyhow::Result<(String, u64)> {
         // Reload first: the paused check below is only meaningful against the
         // CURRENT state. Without this, a process holding stale memory would mint
         // a session for a policy the owner has already paused. The spend would
@@ -934,7 +1063,17 @@ impl PolicyEngine {
         // and unclamped math overflows on absurd inputs.
         let ttl_minutes = ttl_minutes.min(24 * 60);
         let expires_at = now_secs().saturating_add(ttl_minutes.saturating_mul(60));
-        self.sessions.insert(token.clone(), Session { policy_id: policy_id.to_string(), expires_at });
+        // The session cap can never exceed what the policy itself allows over
+        // the session's whole life; clamp it to the tightest of the owner's
+        // own ceilings so no session is broader than its policy.
+        let session_budget = max_session_total.map(|requested| {
+            let mut cap = requested;
+            if let Some(day) = policy.limits.per_day.checked_mul(ttl_minutes / 1440 + 1) { cap = cap.min(day); }
+            if let Some(month) = policy.limits.per_month.and_then(|m| m.checked_mul(ttl_minutes / (1440 * 30) + 1)) { cap = cap.min(month); }
+            if let Some(total) = policy.limits.total_budget { cap = cap.min(total.saturating_sub(policy.spent_total)); }
+            cap
+        });
+        self.sessions.insert(token.clone(), Session { policy_id: policy_id.to_string(), expires_at, session_budget, session_spent: 0 });
         Ok((token, expires_at))
     }
 
@@ -963,6 +1102,12 @@ impl PolicyEngine {
             if auth.spend_ids.contains(&record.id) {
                 record.refunded = true;
             }
+        }
+        // The session-lifetime budget moved with the policy counters when the
+        // spend was authorized; it must move back with them too, or one
+        // balance-refused transfer permanently eats the session cap.
+        if let Some(s) = self.sessions.get_mut(&auth.session_token) {
+            s.session_spent = s.session_spent.saturating_sub(amount);
         }
         if let Some(policy) = self.policies.get_mut(&auth.policy_id) {
             policy.spent_today = policy.spent_today.saturating_sub(amount);
@@ -1440,11 +1585,17 @@ impl PolicyEngine {
     }
 
     fn record_denial(&mut self, policy_id: &str, agent_id: &str, recipient: &str, amount: u64, method: &str, reason: &str) {
+        let network = self
+            .policies
+            .get(policy_id)
+            .and_then(|p| p.bound_network.clone())
+            .or_else(|| self.current_network.clone());
         self.denied_log.push_back(DeniedRecord {
             timestamp: now_secs(),
             age_seconds: 0,
             policy_id: policy_id.to_string(),
             agent_id: agent_id.to_string(),
+            network,
             method: method.to_string(),
             recipient: recipient.to_string(),
             amount_nano: amount,
@@ -1523,6 +1674,7 @@ impl PolicyEngine {
             age_seconds: 0,
             policy_id: auth.policy_id.clone(),
             agent_id: auth.agent_id.clone(),
+            network: auth.network.clone(),
             method: method.to_string(),
             recipient: recipient.to_string(),
             amount_nano: amount,
@@ -1537,18 +1689,39 @@ impl PolicyEngine {
         self.authorize_aliases(token, &[recipient], amount, method)
     }
 
-    /// Same gate, for a payee the caller knows by more than one identifier — the
-    /// x402 case, where one request yields both the seller's HOST and the user
-    /// id its 402 challenge demands payment to. Both names come from the same
-    /// response, so allowlisting either one is an owner approving that payee;
-    /// an attacker-controlled host still fails on the host AND on its own id.
-    pub fn authorize_aliases(
+    pub fn authorize_for(
         &mut self,
+        network: &str,
+        user_id: Option<u64>,
+        token: &str,
+        recipient: &str,
+        amount: u64,
+        method: &str,
+    ) -> anyhow::Result<Authorization> {
+        self.authorize_aliases_for(network, user_id, token, &[recipient], amount, method)
+    }
+
+    pub fn authorize_aliases_for(
+        &mut self,
+        network: &str,
+        user_id: Option<u64>,
         token: &str,
         recipients: &[&str],
         amount: u64,
         method: &str,
     ) -> anyhow::Result<Authorization> {
+        self.current_network = Some(network.to_string());
+        self.current_user_id = user_id;
+        self.authorize_aliases(token, recipients, amount, method)
+    }
+
+    /// Same gate, for a payee the caller knows by more than one identifier —
+    /// the x402 case, where one request yields both the seller's HOST and
+    /// the user id its 402 challenge demands payment to. Both names come
+    /// from the same response, so allowlisting either one is an owner
+    /// approving that payee; an attacker-controlled host still fails on the
+    /// host AND on its own id.
+    pub fn authorize_aliases(&mut self, token: &str, recipients: &[&str], amount: u64, method: &str) -> anyhow::Result<Authorization> {
         // Held until this function returns: the paused/limit CHECK below and the
         // counter COMMIT in record_spend must see, and write, the same state.
         let _guard = self.lock_and_reload();
@@ -1578,6 +1751,20 @@ impl PolicyEngine {
             self.record_denial(&policy_id, &agent_id, primary, amount, method, &reason);
             anyhow::bail!("{reason}");
         }
+        // Session-lifetime cap: judged on the SAME locked state as the policy
+        // counters, and committed below together with them — two spends racing
+        // through one token both see the post-first-commit total.
+        if let Some(budget) = session.session_budget {
+            let projected = session.session_spent.saturating_add(amount);
+            if projected > budget {
+                let reason = format!(
+                    "this payment of {} would exhaust the session: {} already authorized this session, the session cap is {} ({} left)",
+                    fmt_psy(amount), fmt_psy(session.session_spent), fmt_psy(budget), fmt_psy(budget.saturating_sub(session.session_spent))
+                );
+                self.record_denial(&policy_id, &agent_id, primary, amount, method, &reason);
+                anyhow::bail!("{reason}");
+            }
+        }
         let policy = self.policies.get_mut(&policy_id).expect("policy present after denial check");
         policy.spent_today = policy
             .spent_today
@@ -1591,9 +1778,17 @@ impl PolicyEngine {
             .spent_total
             .checked_add(amount)
             .ok_or_else(|| anyhow!("lifetime spend counter would overflow"))?;
+        // Commit the session-lifetime counter together with the policy ones —
+        // the cap above was judged on this same locked state.
+        if let Some(s) = self.sessions.get_mut(token) {
+            s.session_spent = s.session_spent.saturating_add(amount);
+        }
         let mut auth = Authorization {
             policy_id: session.policy_id.clone(),
             agent_id: policy.agent_id.clone(),
+            session_token: token.to_string(),
+            network: policy.bound_network.clone().or_else(|| self.current_network.clone()),
+            user_id: self.current_user_id,
             spend_ids: Vec::new(),
         };
         let id = self.record_spend(&auth, primary, amount, method);
@@ -1670,6 +1865,20 @@ impl PolicyEngine {
         let agent_id = policy.agent_id.clone();
 
         let mut scratch = policy;
+        // Session-lifetime cap applies to the batch as a whole — the same
+        // all-or-nothing rule as the policy caps: a batch that would exhaust the
+        // session is refused before any leg commits.
+        if let Some(budget) = session.session_budget {
+            let projected = session.session_spent.saturating_add(batch_total);
+            if projected > budget {
+                let reason = format!(
+                    "nothing was sent. this batch of {} would exhaust the session: {} already authorized this session, the session cap is {} ({} left)",
+                    fmt_psy(batch_total), fmt_psy(session.session_spent), fmt_psy(budget), fmt_psy(budget.saturating_sub(session.session_spent))
+                );
+                self.record_denial(&policy_id, &agent_id, batch_primary, batch_total, method, &reason);
+                anyhow::bail!("{reason}");
+            }
+        }
         let mut denials: Vec<(usize, String, u64, String)> = Vec::new();
         for (i, (recipient, amount)) in legs.iter().enumerate() {
             if let Some(reason) = denial_reason(&scratch, &[*recipient], *amount, method) {
@@ -1717,12 +1926,35 @@ impl PolicyEngine {
             policy.spent_this_month = committed.1;
             policy.spent_total = committed.2;
         }
-        let mut auth = Authorization { policy_id: policy_id.clone(), agent_id, spend_ids: Vec::new() };
+        if let Some(s) = self.sessions.get_mut(token) {
+            s.session_spent = s.session_spent.saturating_add(batch_total);
+        }
+        let mut auth = Authorization {
+            policy_id: policy_id.clone(),
+            agent_id,
+            session_token: token.to_string(),
+            network: scratch.bound_network.clone().or_else(|| self.current_network.clone()),
+            user_id: self.current_user_id,
+            spend_ids: Vec::new(),
+        };
         for (recipient, amount) in legs {
             let id = self.record_spend(&auth, recipient, *amount, method);
             auth.spend_ids.push(id);
         }
         Ok(auth)
+    }
+
+    pub fn authorize_batch_for(
+        &mut self,
+        network: &str,
+        user_id: Option<u64>,
+        token: &str,
+        legs: &[(&str, u64)],
+        method: &str,
+    ) -> anyhow::Result<Authorization> {
+        self.current_network = Some(network.to_string());
+        self.current_user_id = user_id;
+        self.authorize_batch(token, legs, method)
     }
 }
 
@@ -1775,7 +2007,7 @@ mod tests {
     fn engine_with(limits: Limits, recipients: Option<Vec<String>>) -> (PolicyEngine, String, String) {
         let mut e = PolicyEngine::new();
         let pid = e.create_policy("agent-1", limits, recipients, vec![]);
-        let (token, _) = e.issue_session(&pid, 60).unwrap();
+        let (token, _) = e.issue_session(&pid, 60, None).unwrap();
         (e, pid, token)
     }
 
@@ -2013,8 +2245,8 @@ mod tests {
         let mut e = PolicyEngine::new();
         let a = e.create_policy("agent-a", open_limits(), None, vec![]);
         let b = e.create_policy("agent-b", open_limits(), None, vec![]);
-        let (ta, _) = e.issue_session(&a, 60).unwrap();
-        let (tb, _) = e.issue_session(&b, 60).unwrap();
+        let (ta, _) = e.issue_session(&a, 60, None).unwrap();
+        let (tb, _) = e.issue_session(&b, 60, None).unwrap();
         e.authorize(&ta, "1", 1, "simple_transfer").unwrap();
         e.authorize(&tb, "1", 2, "simple_transfer").unwrap();
         e.authorize(&ta, "1", 3, "simple_transfer").unwrap();
@@ -2047,7 +2279,7 @@ mod tests {
     fn an_expired_session_is_denied_and_dropped() {
         let mut e = PolicyEngine::new();
         let pid = e.create_policy("agent-1", open_limits(), None, vec![]);
-        let (t, _) = e.issue_session(&pid, 60).unwrap();
+        let (t, _) = e.issue_session(&pid, 60, None).unwrap();
         e.sessions.get_mut(&t).unwrap().expires_at = now_secs() - 1;
         assert!(e.authorize(&t, "1", 1, "simple_transfer").unwrap_err().to_string().contains("expired"));
         assert!(e.policy_id_for_session(&t).is_none(), "an expired token is removed, not left to leak");
@@ -2059,12 +2291,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("psy-mcp-policy-test-{}", rand_hex(6)));
         let mut e = PolicyEngine::load_or_new(&dir);
         let pid = e.create_policy("a", Limits { per_transaction: 100, per_day: 1000, per_month: None, total_budget: Some(150) }, None, vec![]);
-        let (t, _) = e.issue_session(&pid, 10).unwrap();
+        let (t, _) = e.issue_session(&pid, 10, None).unwrap();
         e.authorize(&t, "9", 100, "simple_transfer").unwrap();
 
         // "Restart": a fresh engine over the same directory.
         let mut e2 = PolicyEngine::load_or_new(&dir);
-        let (t2, _) = e2.issue_session(&pid, 10).unwrap();
+        let (t2, _) = e2.issue_session(&pid, 10, None).unwrap();
         let err = e2.authorize(&t2, "9", 100, "simple_transfer").unwrap_err().to_string();
         assert!(err.contains("total budget"), "lifetime budget must survive the restart, got: {err}");
         assert!(e2.authorize(&t2, "9", 50, "simple_transfer").is_ok());
@@ -2078,7 +2310,7 @@ mod tests {
         let pid = e.create_policy("shopper",
             Limits { per_transaction: 10 * PSY, per_day: 100 * PSY, per_month: None, total_budget: None },
             None, vec![]);
-        let (t, _) = e.issue_session(&pid, 60).unwrap();
+        let (t, _) = e.issue_session(&pid, 60, None).unwrap();
         // Spend a little, then the owner tightens the per-payment cap.
         e.authorize(&t, "1908736", 3 * PSY, "simple_transfer").unwrap();
         e.update_policy(&pid, Some(2 * PSY), Some(100 * PSY), None, None,
@@ -2104,7 +2336,7 @@ mod tests {
         let pid = e.create_policy("shopper",
             Limits { per_transaction: 5 * PSY, per_day: 50 * PSY, per_month: None, total_budget: None },
             Some(vec!["1908736".into()]), vec![]);
-        let (t, _) = e.issue_session(&pid, 60).unwrap();
+        let (t, _) = e.issue_session(&pid, 60, None).unwrap();
 
         // Budget-only edit: recipients omitted (None).
         e.update_policy(&pid, Some(2 * PSY), Some(10 * PSY), None, None, None, vec![]).unwrap();
@@ -2124,7 +2356,7 @@ mod tests {
         let pid = e.create_policy("shopper",
             Limits { per_transaction: 5 * PSY, per_day: 50 * PSY, per_month: None, total_budget: None },
             Some(vec!["1908736".into()]), vec![]);
-        let (t, _) = e.issue_session(&pid, 60).unwrap();
+        let (t, _) = e.issue_session(&pid, 60, None).unwrap();
         // An over-cap attempt to an approved payee, and an approved-size attempt
         // to an UNapproved payee — both refused, both recorded.
         let over = e.authorize(&t, "1908736", 8 * PSY, "simple_transfer").unwrap_err().to_string();
@@ -2147,7 +2379,7 @@ mod tests {
     fn refund_restores_headroom_but_not_the_log() {
         let mut e = PolicyEngine::new();
         let pid = e.create_policy("a", Limits { per_transaction: 100, per_day: 100, per_month: Some(100), total_budget: Some(100) }, None, vec![]);
-        let (t, _) = e.issue_session(&pid, 10).unwrap();
+        let (t, _) = e.issue_session(&pid, 10, None).unwrap();
         let auth = e.authorize(&t, "9", 100, "simple_transfer").unwrap();
         assert!(e.authorize(&t, "9", 1, "simple_transfer").is_err(), "budget exhausted");
         e.refund(&auth, 100);
@@ -2473,7 +2705,7 @@ mod tests {
         let mut e = PolicyEngine::new();
         e.set_current_user(111);
         let default_id = e.create_policy("a", open_limits(), None, vec![]);
-        let (tok, _) = e.issue_session(&default_id, 60).unwrap();
+        let (tok, _) = e.issue_session(&default_id, 60, None).unwrap();
         let err = e
             .authorize(&tok, "", 1_000_000_000, "deploy_contract")
             .expect_err("deploy_contract must not be in the default method set");
@@ -2483,7 +2715,7 @@ mod tests {
         let mut e2 = PolicyEngine::new();
         e2.set_current_user(111);
         let id = e2.create_policy("a", open_limits(), None, vec!["deploy_contract".into()]);
-        let (tok, _) = e2.issue_session(&id, 60).unwrap();
+        let (tok, _) = e2.issue_session(&id, 60, None).unwrap();
         let _auth = e2
             .authorize(&tok, "", 1_000_000_000, "deploy_contract")
             .expect("allowed method + within caps must pass");
@@ -2500,4 +2732,97 @@ mod tests {
         assert_eq!(d.allowed_methods, default_methods(), "the two must not drift");
     }
 
+    #[test]
+    fn session_total_cap_binds_across_spends_and_batches() {
+        let mut e = PolicyEngine::new();
+        let pid = e.create_policy("capped", Limits { per_transaction: 1_000_000_000_000, per_day: 1_000_000_000_000, per_month: None, total_budget: None }, None, vec![]);
+        let (t, _) = e.issue_session(&pid, 60, Some(1_000_000_000)).unwrap();
+        // First spend fits.
+        e.authorize(&t, "1", 600_000_000, "simple_transfer").unwrap();
+        // Second would exceed the session total — refused even though the
+        // policy itself is open.
+        let err = e.authorize(&t, "1", 600_000_000, "simple_transfer").unwrap_err();
+        assert!(err.to_string().contains("exhaust the session"), "got: {err}");
+        // The refused spend did not consume the session: exactly the remaining
+        // 0.4 still passes.
+        e.authorize(&t, "1", 400_000_000, "simple_transfer").unwrap();
+        // And now the session is spent to the cap, one more nano is refused.
+        assert!(e.authorize(&t, "1", 1, "simple_transfer").is_err());
+
+        // A batch that would blow the remaining budget is refused whole.
+        let (t2, _) = e.issue_session(&pid, 60, Some(1_000_000_000)).unwrap();
+        let err = e
+            .authorize_batch(&t2, &[("1", 900_000_000), ("2", 200_000_000)], "simple_transfer")
+            .unwrap_err();
+        assert!(err.to_string().contains("exhaust the session"), "got: {err}");
+        // Nothing from the refused batch was charged.
+        e.authorize(&t2, "1", 1_000_000_000, "simple_transfer").unwrap();
+    }
+
+    #[test]
+    fn session_without_cap_is_bound_only_by_policy() {
+        let mut e = PolicyEngine::new();
+        let pid = e.create_policy("uncapped", Limits { per_transaction: 1_000_000_000_000, per_day: 1_000_000_000_000, per_month: None, total_budget: None }, None, vec![]);
+        let (t, _) = e.issue_session(&pid, 60, None).unwrap();
+        e.authorize(&t, "1", 5_000_000_000, "simple_transfer").unwrap();
+        e.authorize(&t, "1", 5_000_000_000, "simple_transfer").unwrap();
+    }
+
+    #[test]
+    fn refund_restores_the_session_budget_too() {
+        // The exact shape of the live incident: a batch passes the policy and
+        // session gates, then the balance pre-flight refuses it. refund() is
+        // called — and must hand the SESSION budget back, not just the policy
+        // counters, or every later in-cap spend is refused with "already
+        // authorized this session" for money that never moved.
+        let mut e = PolicyEngine::new();
+        let pid = e.create_policy("capped", Limits { per_transaction: 1_000_000_000_000, per_day: 1_000_000_000_000, per_month: None, total_budget: None }, None, vec![]);
+        let (t, _) = e.issue_session(&pid, 60, Some(900_000_000)).unwrap();
+
+        let auth = e
+            .authorize_batch(&t, &[("1", 450_000_000), ("2", 450_000_000)], "simple_transfer")
+            .unwrap();
+        e.refund(&auth, 900_000_000); // the balance gate refuses it after the policy gate
+
+        // The full session budget is available again.
+        e.authorize(&t, "1", 900_000_000, "simple_transfer").unwrap();
+        // ...and is now genuinely exhausted.
+        assert!(e.authorize(&t, "1", 1, "simple_transfer").is_err());
+
+        // Same for a single transfer that fails after the gate.
+        let (t2, _) = e.issue_session(&pid, 60, Some(1_000_000_000)).unwrap();
+        let auth2 = e.authorize(&t2, "1", 800_000_000, "simple_transfer").unwrap();
+        e.refund(&auth2, 800_000_000);
+        e.authorize(&t2, "1", 1_000_000_000, "simple_transfer").unwrap();
+    }
+
+    #[test]
+    fn foreign_policies_are_hidden_from_this_wallets_view() {
+        // One shared keystore volume, two wallets. Each container must see and
+        // no-id-resolve only its own policies; the file stays whole so the
+        // other wallet's counters are never touched.
+        let dir = std::env::temp_dir().join(format!("psy-pol-hide-{}", rand_hex(8)));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut e = PolicyEngine::load_or_new(&dir);
+        e.set_current_user(1);
+        let a_policy = e.create_policy("agent-a", Limits { per_transaction: 1, per_day: 1, per_month: None, total_budget: None }, None, vec![]);
+        let (ta, _) = e.issue_session(&a_policy, 60, None).unwrap();
+        e.authorize(&ta, "9", 1, "simple_transfer").unwrap();
+        drop(e);
+        // B boots on the same volume: sees NOTHING of A's, sole-policy works.
+        let mut b = PolicyEngine::load_or_new(&dir);
+        b.set_current_user(2);
+        assert!(b.policies.is_empty(), "A's policies must be hidden from B");
+        let b_policy = b.create_policy("agent-b", Limits { per_transaction: 1, per_day: 1, per_month: None, total_budget: None }, None, vec![]);
+        let (tb, _) = b.issue_session(&b_policy, 60, None).unwrap();
+        b.authorize(&tb, "9", 1, "simple_transfer").unwrap();
+        // B's save persists the WHOLE map (both wallets) — A's counters intact.
+        drop(b);
+        let mut a = PolicyEngine::load_or_new(&dir);
+        a.set_current_user(1);
+        let ids = a.policy_ids();
+        assert_eq!(ids.len(), 1, "A sees only its own; got {ids:?}");
+        assert!(ids.contains(&a_policy));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

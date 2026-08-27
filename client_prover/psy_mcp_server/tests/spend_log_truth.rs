@@ -22,7 +22,7 @@ fn engine() -> (PolicyEngine, String, String) {
         None,
         vec![],
     );
-    let (t, _) = e.issue_session(&pid, 60).unwrap();
+    let (t, _) = e.issue_session(&pid, 60, None).unwrap();
     (e, pid, t)
 }
 

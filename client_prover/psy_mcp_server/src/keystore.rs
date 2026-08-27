@@ -20,11 +20,15 @@
 //! server loads it during startup — the key never has to pass through the
 //! model's context to bring a wallet back after a restart.
 
-use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{anyhow, Context, Result};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 /// Env var: directory generated-key backups are written into.
@@ -33,6 +37,14 @@ pub const KEYSTORE_DIR_ENV: &str = "PSY_MCP_KEYSTORE_DIR";
 pub const KEY_FILE_ENV: &str = "PSY_MCP_KEY_FILE";
 
 const DEFAULT_DIR_NAME: &str = ".psy-mcp-keys";
+const ACTIVE_WALLETS_FILE: &str = "active-wallets.json";
+const ACTIVE_WALLETS_LOCK: &str = ".active-wallets.lock";
+
+#[derive(Default, Serialize, Deserialize)]
+struct ActiveWallets {
+    #[serde(default)]
+    active: HashMap<String, String>,
+}
 
 /// On-disk format of one key backup. `private_key` is the QHashOut hex string
 /// `WalletSession` parses; keep field names stable — files written by older
@@ -45,8 +57,13 @@ pub struct KeyBackup {
     pub private_key: String,
     /// Public fingerprint of the key (safe to display).
     pub fingerprint: String,
+    /// Owner-chosen local account name. Not part of the cryptographic identity.
+    pub name: String,
     /// Unix seconds when the backup was written.
     pub created_at: u64,
+    /// Psy config network this key was created for. Missing only in v1 files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
     /// The mandate this key was minted under, when it is an agent account.
     ///
     /// Without it a minted account can never be reloaded: its identity comes
@@ -56,10 +73,18 @@ pub struct KeyBackup {
     /// so every existing backup keeps loading unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mandate: Option<crate::agent_account::Mandate>,
+    /// First (`deriveIndex = 0`) wallet-compatible private receive address.
+    /// Public and reproducible; absent in backups written before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_shield_address: Option<String>,
+    /// Nostr public key paired with `default_shield_address`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nostr_pub: Option<String>,
 }
 
 impl KeyBackup {
-    pub const KIND: &'static str = "psy-wallet-key-v1";
+    pub const KIND: &'static str = "psy-wallet-key-v2";
+    pub const LEGACY_KIND: &'static str = "psy-wallet-key-v1";
 }
 
 /// Resolve the keystore directory: `$PSY_MCP_KEYSTORE_DIR`, else
@@ -76,6 +101,16 @@ pub fn keystore_dir() -> PathBuf {
         Ok(home) if !home.trim().is_empty() => Path::new(&home).join(DEFAULT_DIR_NAME),
         _ => PathBuf::from(DEFAULT_DIR_NAME),
     }
+}
+
+/// Owner-only subtree for state that is meaningful on exactly one Psy
+/// network. Network names come from PsyConfig, but sanitize again before using
+/// one as a path component so a malformed config cannot escape the keystore.
+pub fn network_dir(root: &Path, network: &str) -> Result<PathBuf> {
+    if network.is_empty() || !network.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err(anyhow!("network `{network}` cannot be used as a keystore path"));
+    }
+    Ok(root.join("networks").join(network))
 }
 
 fn now_secs() -> u64 {
@@ -107,8 +142,12 @@ fn restrict_permissions(path: &Path, mode: u32) -> Result<()> {
 /// filesystem) → restrict perms → write → fsync → rename to the final name →
 /// fsync the directory so the rename itself is durable. The final file never
 /// exists in a partially-written state.
-pub fn persist_generated_key(private_key_hex: &str, fingerprint_hex: &str) -> Result<PathBuf> {
-    persist_generated_key_with_mandate(private_key_hex, fingerprint_hex, None)
+pub fn persist_generated_key(private_key_hex: &str, fingerprint_hex: &str, network: &str) -> Result<PathBuf> {
+    persist_generated_key_named(private_key_hex, fingerprint_hex, network, "Wallet")
+}
+
+pub fn persist_generated_key_named(private_key_hex: &str, fingerprint_hex: &str, network: &str, name: &str) -> Result<PathBuf> {
+    persist_generated_key_with_mandate_and_name(private_key_hex, fingerprint_hex, network, None, name)
 }
 
 /// As `persist_generated_key`, but also records the mandate for an agent
@@ -116,17 +155,31 @@ pub fn persist_generated_key(private_key_hex: &str, fingerprint_hex: &str) -> Re
 pub fn persist_generated_key_with_mandate(
     private_key_hex: &str,
     fingerprint_hex: &str,
+    network: &str,
     mandate: Option<&crate::agent_account::Mandate>,
 ) -> Result<PathBuf> {
+    persist_generated_key_with_mandate_and_name(private_key_hex, fingerprint_hex, network, mandate, "Agent account")
+}
+
+fn persist_generated_key_with_mandate_and_name(
+    private_key_hex: &str,
+    fingerprint_hex: &str,
+    network: &str,
+    mandate: Option<&crate::agent_account::Mandate>,
+    name: &str,
+) -> Result<PathBuf> {
     let dir = keystore_dir();
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("failed to create keystore dir {}", dir.display()))?;
+    fs::create_dir_all(&dir).with_context(|| format!("failed to create keystore dir {}", dir.display()))?;
     restrict_permissions(&dir, 0o700).ok(); // dir perms are best-effort; file perms are enforced
 
     // Short fingerprint prefix + timestamp keeps names unique, meaningful, and
     // free of any secret material.
     let fp_short: String = fingerprint_hex.chars().filter(char::is_ascii_alphanumeric).take(12).collect();
-    let final_path = dir.join(format!("wallet-{}-{}.json", fp_short, now_secs()));
+    let network_file = network
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect::<String>();
+    let final_path = dir.join(format!("wallet-{}-{}-{}.json", network_file, fp_short, now_secs()));
     if final_path.exists() {
         // Same fingerprint + same second — astronomically unlikely, but never
         // overwrite something that could be guarding funds.
@@ -138,8 +191,12 @@ pub fn persist_generated_key_with_mandate(
         kind: KeyBackup::KIND.to_string(),
         private_key: private_key_hex.to_string(),
         fingerprint: fingerprint_hex.to_string(),
+        name: name.to_string(),
         created_at: now_secs(),
+        network: Some(network.to_string()),
         mandate: mandate.cloned(),
+        default_shield_address: None,
+        nostr_pub: None,
     };
     let json = serde_json::to_string_pretty(&backup).context("failed to serialize key backup")?;
 
@@ -173,6 +230,35 @@ pub fn persist_generated_key_with_mandate(
     Ok(final_path)
 }
 
+/// Add the public receive metadata after registration resolves the user id.
+/// The initial secret backup is deliberately written before registration; the
+/// shield address cannot be computed until the chain assigns that user id.
+pub fn persist_default_receive_address(path: &Path, shield_address: &str, nostr_pub: &str) -> Result<()> {
+    let path_text = path.to_string_lossy();
+    let mut backup = load_key_file(&path_text)?;
+    backup.default_shield_address = Some(shield_address.to_string());
+    backup.nostr_pub = Some(nostr_pub.to_string());
+    let json = serde_json::to_string_pretty(&backup).context("failed to serialize enriched key backup")?;
+    let dir = path.parent().ok_or_else(|| anyhow!("key backup has no parent directory"))?;
+    let tmp_path = dir.join(format!(".tmp-{}", rand_suffix()));
+    let result = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&tmp_path)?;
+        restrict_permissions(&tmp_path, 0o600)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp_path, path)?;
+        if let Ok(dir_handle) = fs::File::open(dir) {
+            let _ = dir_handle.sync_all();
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    result.with_context(|| format!("failed to add receive address to {}", path.display()))
+}
+
 fn rand_suffix() -> String {
     use rand::RngCore;
     let mut b = [0u8; 8];
@@ -180,18 +266,114 @@ fn rand_suffix() -> String {
     hex::encode(b)
 }
 
+/// Read the last explicitly selected wallet for every network. The file holds
+/// public pk hashes only; a missing file means no selections have been saved.
+pub fn load_active_wallets() -> Result<HashMap<String, String>> {
+    load_active_wallets_in(&keystore_dir())
+}
+
+pub fn load_active_wallets_in(dir: &Path) -> Result<HashMap<String, String>> {
+    let path = dir.join(ACTIVE_WALLETS_FILE);
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(e) => return Err(anyhow!(e)).with_context(|| format!("failed to read {}", path.display())),
+    };
+    let state: ActiveWallets = serde_json::from_str(&raw).with_context(|| format!("{} is not valid active-wallet state", path.display()))?;
+    Ok(state.active)
+}
+
+/// Atomically remember the active wallet for one network without losing the
+/// selections written for other networks or by another server process.
+pub fn persist_active_wallet(network: &str, pk_hash: &str) -> Result<()> {
+    persist_active_wallet_in(&keystore_dir(), network, pk_hash)
+}
+
+pub fn persist_active_wallet_in(dir: &Path, network: &str, pk_hash: &str) -> Result<()> {
+    network_dir(dir, network)?;
+    fs::create_dir_all(dir).with_context(|| format!("failed to create keystore dir {}", dir.display()))?;
+    restrict_permissions(dir, 0o700).ok();
+
+    let lock_path = dir.join(ACTIVE_WALLETS_LOCK);
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open {}", lock_path.display()))?;
+    restrict_permissions(&lock_path, 0o600)?;
+    lock.lock_exclusive().with_context(|| format!("failed to lock {}", lock_path.display()))?;
+
+    let mut state = ActiveWallets {
+        active: load_active_wallets_in(dir)?,
+    };
+    state.active.insert(network.to_string(), pk_hash.to_string());
+    let json = serde_json::to_string_pretty(&state).context("failed to serialize active-wallet state")?;
+    let final_path = dir.join(ACTIVE_WALLETS_FILE);
+    let tmp_path = dir.join(format!(".active-wallets-{}.tmp", rand_suffix()));
+    let result = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .with_context(|| format!("failed to create {}", tmp_path.display()))?;
+        restrict_permissions(&tmp_path, 0o600)?;
+        file.write_all(json.as_bytes()).context("failed to write active-wallet state")?;
+        file.sync_all().context("failed to fsync active-wallet state")?;
+        drop(file);
+        fs::rename(&tmp_path, &final_path).with_context(|| format!("failed to finalize {}", final_path.display()))?;
+        if let Ok(dir_handle) = fs::File::open(dir) {
+            let _ = dir_handle.sync_all();
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    let _ = FileExt::unlock(&lock);
+    result
+}
+
 /// Load a key backup file (the `PSY_MCP_KEY_FILE` startup path).
 pub fn load_key_file(path: &str) -> Result<KeyBackup> {
     let raw = fs::read_to_string(path).with_context(|| format!("failed to read key file {path}"))?;
-    let backup: KeyBackup =
-        serde_json::from_str(&raw).with_context(|| format!("key file {path} is not a valid backup"))?;
-    if backup.kind != KeyBackup::KIND {
+    let backup: KeyBackup = serde_json::from_str(&raw).with_context(|| format!("key file {path} is not a valid backup"))?;
+    if backup.kind != KeyBackup::KIND && backup.kind != KeyBackup::LEGACY_KIND {
         return Err(anyhow!("key file {path} has kind `{}` (expected `{}`)", backup.kind, KeyBackup::KIND));
     }
     if backup.private_key.trim().is_empty() {
         return Err(anyhow!("key file {path} has an empty private_key"));
     }
     Ok(backup)
+}
+
+/// Discover wallet key backups written by this server. Other JSON state in the
+/// keystore (policies, replay records) is deliberately ignored by filename;
+/// every candidate is still validated by `load_key_file` before use.
+pub fn discover_key_files() -> Result<Vec<PathBuf>> {
+    discover_key_files_in(&keystore_dir())
+}
+
+/// Directory-scoped form used by startup and tests.
+pub fn discover_key_files_in(dir: &Path) -> Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(anyhow!(e)).with_context(|| format!("failed to scan {}", dir.display())),
+    };
+    let mut paths = entries
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("wallet-") && n.ends_with(".json"))
+                    .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    Ok(paths)
 }
 
 #[cfg(test)]
@@ -214,18 +396,33 @@ mod tests {
     #[test]
     fn persist_then_load_round_trips_the_key() {
         with_temp_keystore(|| {
-            let path = persist_generated_key("0xdeadbeef:1:2:3", "fp0123456789abcdef").unwrap();
+            let path = persist_generated_key("0xdeadbeef:1:2:3", "fp0123456789abcdef", "testnet").unwrap();
             assert!(path.exists());
             let loaded = load_key_file(path.to_str().unwrap()).unwrap();
             assert_eq!(loaded.private_key, "0xdeadbeef:1:2:3");
             assert_eq!(loaded.fingerprint, "fp0123456789abcdef");
+            assert_eq!(loaded.name, "Wallet");
             assert_eq!(loaded.kind, KeyBackup::KIND);
+            assert_eq!(loaded.network.as_deref(), Some("testnet"));
+            assert_eq!(loaded.default_shield_address, None);
+            assert_eq!(loaded.nostr_pub, None);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
                 assert_eq!(mode, 0o600, "key file must be owner-only");
             }
+        })
+    }
+
+    #[test]
+    fn enriches_backup_with_public_receive_identity() {
+        with_temp_keystore(|| {
+            let path = persist_generated_key("0xdeadbeef", "fingerprint", "testnet").unwrap();
+            persist_default_receive_address(&path, "s1example", "npub1example").unwrap();
+            let loaded = load_key_file(path.to_str().unwrap()).unwrap();
+            assert_eq!(loaded.default_shield_address.as_deref(), Some("s1example"));
+            assert_eq!(loaded.nostr_pub.as_deref(), Some("npub1example"));
         })
     }
 
@@ -244,7 +441,7 @@ mod tests {
     fn no_secret_material_in_filename() {
         with_temp_keystore(|| {
             let secret = "aaaabbbbccccdddd:1:2:3";
-            let path = persist_generated_key(secret, "fpfingerprint").unwrap();
+            let path = persist_generated_key(secret, "fpfingerprint", "testnet").unwrap();
             let name = path.file_name().unwrap().to_string_lossy().to_string();
             assert!(!name.contains("aaaabbbb"), "filename must not embed key material");
         })
