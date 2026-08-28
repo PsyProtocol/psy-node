@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 VERSIONS_FILE="$ROOT/deploy/source-versions.env"
 CONFIG_EXAMPLE="$ROOT/deploy/gcp/config.example.env"
+BUNDLE_BUILDER="$ROOT/deploy/gcp/build-parth-bundle.sh"
 
 bash -n "$VERSIONS_FILE"
 # shellcheck disable=SC1090
@@ -51,5 +52,15 @@ if grep -Eq '^EXPECTED_(PARTH_RUNTIME|PSY_GENESIS|PSY_CONTRACTS|PSY_DAPP|PSY_SER
   echo "repository pins must not be duplicated in config.example.env" >&2
   exit 1
 fi
+
+grep -Fq 'PSY_SERVICES_REPOSITORY=$EXPECTED_PSY_SERVICES_REPOSITORY' "$BUNDLE_BUILDER" || {
+  echo "bundle manifest must record the psy-services repository" >&2
+  exit 1
+}
+
+grep -Fq 'PSY_SERVICES_COMMIT=$(source_commit "$psy_services_dir")' "$BUNDLE_BUILDER" || {
+  echo "bundle manifest must record the actual psy-services source commit" >&2
+  exit 1
+}
 
 echo "[ok] deployment repository pins have one authoritative source"
