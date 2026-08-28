@@ -168,8 +168,10 @@ docker run \
 
     chown -R "${HOST_UID}:${HOST_GID}" \
       /work/.cargo-bookworm \
-      "$PARTH_WORKDIR/target" \
       "$PSY_SERVICES_WORKDIR/target"
+    if [ "$BUILD_PARTH_BINARIES" = "1" ]; then
+      chown -R "${HOST_UID}:${HOST_GID}" "$PARTH_WORKDIR/target"
+    fi
   '
 
 echo "[bookworm-build] verifying maximum required GLIBC versions"
