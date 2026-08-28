@@ -266,6 +266,7 @@ case "$PARTH_SERVICE" in
     upsert_if_set "$service_env" PSY_JWT_SECRET PSY_JWT_SECRET
     upsert_if_set "$service_env" PSY_SERVICES_RUN_MIGRATIONS PSY_SERVICES_RUN_MIGRATIONS
     upsert_if_set "$service_env" PSY_NOSTR_ENABLED PSY_NOSTR_ENABLED
+    upsert_if_set "$service_env" PSY_NOSTR_RELAY_URL PSY_NOSTR_RELAY_URL
     upsert_if_set "$service_env" PSY_NOSTR_RELAY_URLS PSY_NOSTR_RELAY_URLS
     upsert_if_set "$service_env" PSY_NOSTR_LOOKBACK_SECONDS PSY_NOSTR_LOOKBACK_SECONDS
     upsert_if_set "$service_env" PSY_GENESIS_PATH PSY_GENESIS_PATH
