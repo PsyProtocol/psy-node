@@ -235,10 +235,13 @@ psy_services_dir="${PSY_SERVICES_DIR:-$WORKSPACE_HOME/psy-services}"
 : "${EXPECTED_PSY_CONTRACTS_COMMIT:?missing from deploy/source-versions.env}"
 : "${EXPECTED_PSY_DAPP_REPOSITORY:?missing from deploy/source-versions.env}"
 : "${EXPECTED_PSY_DAPP_COMMIT:?missing from deploy/source-versions.env}"
+: "${EXPECTED_PSY_SERVICES_REPOSITORY:?missing from deploy/source-versions.env}"
+: "${EXPECTED_PSY_SERVICES_COMMIT:?missing from deploy/source-versions.env}"
 cat >"$tmp/BUILD-MANIFEST.env" <<EOF
 BUILT_AT_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 PSY_NODE_DEPLOYMENT_COMMIT=$(source_commit "$PARTH_DIR")
 REQUIRED_PARTH_RUNTIME_COMMIT=$EXPECTED_PARTH_RUNTIME_COMMIT
+PSY_SERVICES_REPOSITORY=$EXPECTED_PSY_SERVICES_REPOSITORY
 PSY_SERVICES_COMMIT=$(source_commit "$psy_services_dir")
 PSY_GENESIS_REPOSITORY=$EXPECTED_PSY_GENESIS_REPOSITORY
 PSY_GENESIS_COMMIT=$(source_commit "$PSY_GENESIS_DIR")
