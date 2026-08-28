@@ -11,8 +11,20 @@ IMAGE="${BOOKWORM_BUILDER_IMAGE:-parth-bookworm-builder:latest}"
 GO_VERSION="${GO_VERSION:-1.22.3}"
 PACKAGE_ARTIFACTS="${PACKAGE_ARTIFACTS:-1}"
 BUILD_PARTH_BUNDLE="${BUILD_PARTH_BUNDLE:-1}"
+BUILD_PARTH_BINARIES="${BUILD_PARTH_BINARIES:-1}"
 PSY_SERVICES_DIR="${PSY_SERVICES_DIR:-$WORKSPACE_ROOT/psy-services}"
 bookworm_build_jobs="$(resolve_rust_build_jobs "${BOOKWORM_BUILD_JOBS:-}")"
+
+if [ "$BUILD_PARTH_BINARIES" != "1" ]; then
+  [ "$PACKAGE_ARTIFACTS" = "0" ] || {
+    echo "PACKAGE_ARTIFACTS must be 0 when BUILD_PARTH_BINARIES=0" >&2
+    exit 1
+  }
+  [ "$BUILD_PARTH_BUNDLE" = "0" ] || {
+    echo "BUILD_PARTH_BUNDLE must be 0 when BUILD_PARTH_BINARIES=0" >&2
+    exit 1
+  }
+fi
 
 WORKSPACE_ROOT="$(cd "$WORKSPACE_ROOT" && pwd -P)"
 PARTH_DIR="$(cd "$PARTH_DIR" && pwd -P)"
@@ -84,6 +96,7 @@ docker_run_args=(
   -e RUSTUP_HOME=/usr/local/rustup
   -e CARGO_NET_GIT_FETCH_WITH_CLI=true
   -e CARGO_BUILD_JOBS="$bookworm_build_jobs"
+  -e BUILD_PARTH_BINARIES="$BUILD_PARTH_BINARIES"
   -v "$WORKSPACE_ROOT:/work"
   -v "$PARTH_DIR:$PARTH_WORKDIR"
   -v "$PSY_SERVICES_DIR:$PSY_SERVICES_WORKDIR"
@@ -139,14 +152,16 @@ docker run \
     set -euo pipefail
     export PATH="/usr/local/go/bin:/usr/local/cargo/bin:${PATH}"
 
-    cd "$PARTH_WORKDIR"
-    PSY_CONFIG_PATH="$PARTH_WORKDIR/psy-genesis/config.json" \
-      cargo +nightly build --release \
-        --bin psy_node_cli \
-        --bin psy_worker_cli \
-        --bin psy_user_cli \
-        --bin psy_relayer_cli \
-        --bin psy_dev_cli
+    if [ "$BUILD_PARTH_BINARIES" = "1" ]; then
+      cd "$PARTH_WORKDIR"
+      PSY_CONFIG_PATH="$PARTH_WORKDIR/psy-genesis/config.json" \
+        cargo +nightly build --release \
+          --bin psy_node_cli \
+          --bin psy_worker_cli \
+          --bin psy_user_cli \
+          --bin psy_relayer_cli \
+          --bin psy_dev_cli
+    fi
 
     cd "$PSY_SERVICES_WORKDIR"
     cargo +nightly build --release --bin psy-services --bin psy-indexer
@@ -158,13 +173,19 @@ docker run \
   '
 
 echo "[bookworm-build] verifying maximum required GLIBC versions"
-for bin in \
-  "$PARTH_DIR/target/release/psy_node_cli" \
-  "$PARTH_DIR/target/release/psy_worker_cli" \
-  "$PARTH_DIR/target/release/psy_user_cli" \
-  "$PARTH_DIR/target/release/psy_relayer_cli" \
-  "$PSY_SERVICES_DIR/target/release/psy-services" \
-  "$PSY_SERVICES_DIR/target/release/psy-indexer"; do
+binaries=(
+  "$PSY_SERVICES_DIR/target/release/psy-services"
+  "$PSY_SERVICES_DIR/target/release/psy-indexer"
+)
+if [ "$BUILD_PARTH_BINARIES" = "1" ]; then
+  binaries+=(
+    "$PARTH_DIR/target/release/psy_node_cli"
+    "$PARTH_DIR/target/release/psy_worker_cli"
+    "$PARTH_DIR/target/release/psy_user_cli"
+    "$PARTH_DIR/target/release/psy_relayer_cli"
+  )
+fi
+for bin in "${binaries[@]}"; do
   max_glibc="$(objdump -T "$bin" 2>/dev/null | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1 || true)"
   echo "[bookworm-build] $(basename "$bin") max ${max_glibc:-unknown}"
 done
