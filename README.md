@@ -5,6 +5,18 @@
 - modern rust version
 - bun
 
+## Getting started
+
+This repo uses git submodules (`psy-genesis`, `psy-contracts`, `psy-dapp`).
+`psy-genesis` in particular is required at build time (`psy_config`'s
+`build.rs` reads `psy-genesis/config.json`), so `cargo build` will fail on a
+fresh clone unless submodules are initialized:
+
+```bash
+git clone https://github.com/PsyProtocol/psy-node.git
+cd psy-node
+git submodule update --init --recursive
+```
 
 ### Spinning up a local development cluster
 ```bash
