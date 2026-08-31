@@ -426,6 +426,10 @@ describe("compiler/genesis artifact stamps", () => {
         compilerSourcesHash: "sources",
         artifactSha256: "aa".repeat(32),
         artifactByteSize: 42,
+        tokenArtifactSha256: "bb".repeat(32),
+        tokenArtifactByteSize: 43,
+        tokenUpdateArtifactSha256: "cc".repeat(32),
+        tokenUpdateArtifactByteSize: 44,
     };
 
     it("matches only the exact compiler identity and artifact bytes", () => {
@@ -433,6 +437,8 @@ describe("compiler/genesis artifact stamps", () => {
         expect(evaluateCompilerArtifactStamp(null, expected)).toBe("missing");
         expect(evaluateCompilerArtifactStamp({ ...expected, artifactByteSize: 43 }, expected)).toBe("mismatch");
         expect(evaluateCompilerArtifactStamp({ ...expected, artifactSha256: "bb".repeat(32) }, expected)).toBe("mismatch");
+        expect(evaluateCompilerArtifactStamp({ ...expected, tokenArtifactSha256: "dd".repeat(32) }, expected)).toBe("mismatch");
+        expect(evaluateCompilerArtifactStamp({ ...expected, tokenUpdateArtifactByteSize: 45 }, expected)).toBe("mismatch");
     });
 
     it("strictly reads and atomically replaces complete stamps", async () => {

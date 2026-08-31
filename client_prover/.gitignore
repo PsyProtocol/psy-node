@@ -26,8 +26,6 @@ target/
 .specstory/.what-is-this.md
 /.vscode/
 
-book/
-
 *-key
 *-key.pub
 

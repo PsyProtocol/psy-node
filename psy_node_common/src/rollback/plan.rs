@@ -61,6 +61,7 @@ pub enum RollbackPhaseStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PostTargetGeneration {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint_id: Option<u64>,
@@ -68,18 +69,10 @@ pub struct PostTargetGeneration {
     pub proc_checkpoint_unique_id: u128,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RollbackL1Mode {
-    #[default]
-    Validated,
-    SkippedLocalDevnet,
-}
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-
-pub struct L1ContractsSnapshot {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_finalized_checkpoint_id: Option<u64>,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetContractState {
+    pub last_finalized_checkpoint_id: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_verified_checkpoint_root: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -97,12 +90,14 @@ pub struct L1ContractsSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RollbackVerificationSnapshot {
-    pub latest_info_bytes: String,
+#[serde(deny_unknown_fields)]
+pub struct RollbackSnapshot {
+    pub target_info: String,
     pub worker_reputation_fields: Vec<RollbackTempValueSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RollbackTempValueSnapshot {
     pub field: String,
     pub value: Option<String>,
@@ -111,6 +106,7 @@ pub struct RollbackTempValueSnapshot {
 
 // Empty keys is a proved no-op; the phase is still required and the executor still calls the API.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RollbackPhase {
     pub table: String,
     pub api: String,
@@ -119,6 +115,7 @@ pub struct RollbackPhase {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RollbackPlan {
     pub role: RollbackRole,
     pub realm_id: u64,
@@ -127,11 +124,9 @@ pub struct RollbackPlan {
     pub latest_checkpoint_id: u64,
     pub latest_pending_id: u64,
     pub post_target_generations: Vec<PostTargetGeneration>,
-    #[serde(default)]
-    pub l1_mode: RollbackL1Mode,
-    #[serde(default)]
-    pub l1_contracts: L1ContractsSnapshot,
-    pub verification: RollbackVerificationSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_contract_state: Option<TargetContractState>,
+    pub snapshot: RollbackSnapshot,
     pub phases: Vec<RollbackPhase>,
 }
 
@@ -235,15 +230,14 @@ mod tests {
                 PostTargetGeneration { checkpoint_id: Some(201), pending_id: 89, proc_checkpoint_unique_id: 10089 },
                 PostTargetGeneration { checkpoint_id: None, pending_id: 94, proc_checkpoint_unique_id: 10094 },
             ],
-            verification: RollbackVerificationSnapshot {
-                latest_info_bytes: "010203".into(),
+            snapshot: RollbackSnapshot {
+                target_info: "010203".into(),
                 worker_reputation_fields: vec![RollbackTempValueSnapshot {
                     field: "5752".into(),
                     value: Some("0908".into()),
                 }],
             },
-            l1_contracts: L1ContractsSnapshot::default(),
-            l1_mode: RollbackL1Mode::Validated,
+            target_contract_state: None,
             phases: vec![
                 RollbackPhase {
                     table: "checkpoint_leaf_table".into(),
@@ -270,15 +264,48 @@ mod tests {
     }
 
     #[test]
-    fn l1_skip_mode_roundtrips_without_ambiguity() {
+    fn optional_contract_state_and_new_snapshot_names_serialize_cleanly() {
         let mut plan = sample_plan();
-        plan.l1_mode = RollbackL1Mode::SkippedLocalDevnet;
-        plan.l1_contracts = Default::default();
-        let json = serde_json::to_string(&plan).unwrap();
-        assert!(json.contains("\"l1_mode\":\"skipped_local_devnet\""));
-        let back: RollbackPlan = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.l1_mode, RollbackL1Mode::SkippedLocalDevnet);
-        assert_eq!(back.l1_contracts, L1ContractsSnapshot::default());
+        let json = serde_json::to_value(&plan).unwrap();
+        assert!(json.get("target_contract_state").is_none());
+        assert_eq!(json["snapshot"]["target_info"], "010203");
+        assert!(json.get("verification").is_none());
+        assert!(json["snapshot"].get("latest_info_bytes").is_none());
+        assert!(json.get("l1_mode").is_none());
+        assert!(json.get("l1_contracts").is_none());
+
+        plan.target_contract_state = Some(TargetContractState {
+            last_finalized_checkpoint_id: plan.target_checkpoint_id,
+            last_verified_checkpoint_root: Some("abcd".into()),
+            last_verified_deposit_tree_root: None,
+            last_verified_withdrawal_tree_root: None,
+            withdrawal_subtree_root: None,
+            deposit_root: None,
+            proved_deposit_count: None,
+            pending_deposit_count: None,
+        });
+        let back: RollbackPlan = serde_json::from_value(serde_json::to_value(&plan).unwrap()).unwrap();
+        assert_eq!(back, plan);
+    }
+
+    #[test]
+    fn target_contract_state_requires_checkpoint_id() {
+        let error = serde_json::from_value::<TargetContractState>(serde_json::json!({
+            "last_verified_checkpoint_root": "abcd"
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("last_finalized_checkpoint_id"), "{error}");
+    }
+
+    #[test]
+    fn plan_rejects_removed_and_misspelled_fields() {
+        let mut json = serde_json::to_value(sample_plan()).unwrap();
+        json.as_object_mut().unwrap().insert("l1_mode".into(), serde_json::json!("validated"));
+        assert!(serde_json::from_value::<RollbackPlan>(json).is_err());
+
+        let mut json = serde_json::to_value(sample_plan()).unwrap();
+        json["snapshot"].as_object_mut().unwrap().insert("target_inf".into(), serde_json::json!("010203"));
+        assert!(serde_json::from_value::<RollbackPlan>(json).is_err());
     }
 
     #[test]

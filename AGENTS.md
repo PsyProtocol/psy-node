@@ -73,9 +73,9 @@ Changes to the bridge aggregation circuit, checkpoint recursive transition circu
 
 | Repository | Owns | Consumes |
 |---|---|---|
-| `psy-node` | Node runtime, circuits, CLIs, parent gitlinks, `client_prover/token.json`, `client_prover/token.abi.json` | `psy-genesis`, `psy-contracts`, `psy-dapp` gitlinks |
+| `psy-node` | Node runtime, circuits, CLIs, parent gitlinks | `psy-genesis`, `psy-contracts`, `psy-dapp` gitlinks |
 | `psy-compiler` | Psy compiler, precompiles, ABI and Genesis generation | Git-pinned `psy-node` crates in `../psy-compiler/Cargo.toml:31-41` |
-| `psy-genesis` | Canonical network config, compressed Genesis contracts, ABIs, compiler provenance | Generated from clean `psy-compiler` HEAD by `../psy-compiler/Makefile:205-250` |
+| `psy-genesis` | Canonical network config, compressed Genesis contracts, ABIs, token deploy/update artifacts, compiler provenance | Generated from clean `psy-compiler` HEAD by `../psy-compiler/Makefile:207-250` |
 | `psy-sdk` | Rust SDK, prover WASM, compiler WASM, TypeScript packages | Git-pinned `psy-node` crates, `psy-genesis` gitlink, sibling `psy-compiler` provenance |
 | `psy-services` | API, indexer, migrations, generated Genesis ABI metadata | Git-pinned `psy-node` crates and sibling `psy-compiler` targets; it has no `psy-genesis` gitlink |
 | `psy-contracts` | L1 contracts, Groth16 verifiers, deployments, protocol config | `export-solidity-verifier*` Makefile targets |
@@ -119,7 +119,7 @@ psy-node source revision R_node, committed and pushed first
 frozen R_node + clean R_compiler
   ├── psy-sdk builds prover/compiler WASM + provenance
   ├── psy-compiler generates psy-genesis artifacts → R_genesis
-  ├── psy-node receives token.json + token.abi.json, held for parent-last
+  ├── psy-genesis receives the compiled token.json; it stays the ABI and token artifact authority
   └── psy-services syncs compiler ABI targets when required
 
 pushed R_genesis + completed R_sdk_build
@@ -131,7 +131,7 @@ pushed R_contracts / R_genesis / R_dapp, as applicable
   └── psy-node generated artifacts and parent gitlinks, committed and pushed last
 ```
 
-`R_node` is the source pin. The final `psy-node` integration commit may contain regenerated `client_prover/token.json`, `client_prover/token.abi.json`, Genesis-dependent tracked outputs, and child gitlinks. Downstream Cargo manifests continue to pin `R_node` when the later integration commit changes no consumed Rust crate.
+`R_node` is the source pin. The final `psy-node` integration commit may contain Genesis-dependent tracked outputs and child gitlinks. Downstream Cargo manifests continue to pin `R_node` when the later integration commit changes no consumed Rust crate.
 
 ## Preflight for Every Repository
 
@@ -167,10 +167,10 @@ The Applicability Gate decides which repositories participate. Create one identi
 
 Create, review, commit, and remotely publish producers before consumers in this order, skipping repositories excluded by the gate:
 
-1. `psy-node` source first; record `R_node`. Do not include parent gitlinks or generated `client_prover/token.json` / `token.abi.json` yet.
+1. `psy-node` source first; record `R_node`. Do not include parent gitlinks yet.
 2. `psy-compiler` next; pin every active node dependency to pushed `R_node`, then publish `R_compiler`.
 3. `psy-sdk` next; pin every active node dependency to the same pushed `R_node` before building WASM.
-4. From clean `R_compiler` and the SDK node pin, build the SDK WASM artifacts and generate Genesis artifacts. Generation writes `psy-genesis` plus node `token.json` and `token.abi.json`; hold the node files for parent-last.
+4. From clean `R_compiler` and the SDK node pin, build the SDK WASM artifacts and generate Genesis artifacts. Generation writes `psy-genesis`, including the compiled `token.json`. Contract ABIs stay authoritative in `psy-genesis` and are not copied into `psy-node`.
 5. Publish `psy-genesis` as `R_genesis`, then complete the SDK provenance and Genesis gitlink and publish the tested build commit as `R_sdk_build`.
 6. For local matching-branch testing, wallet keeps its `file:../psy-sdk/psy-ts-sdk/packages/psy-sdk` dependency and DApp may use the matching local SDK. Publish npm only with explicit authorization; when using npm, confirm the exact version before updating DApp.
 7. Update every required `psy-genesis` / `psy-contracts` consumer gitlink only after the child SHA is reachable on its remote matching branch. `psy-services` is an optional insert after `R_node` / `R_compiler` when consumed crates or ABI metadata changed; it has no Genesis gitlink. `psy-contracts` is an optional insert before DApp and parent gitlink updates when L1 or verifier artifacts changed.
@@ -182,7 +182,7 @@ Gitlink SHAs are the pins; `.gitmodules branch` fields are tracking hints. Never
 
 ### 1. Freeze and Push the Node Source Revision
 
-1. Isolate only the node source changes required by the release. Exclude parent gitlink changes and compiler-generated `client_prover/token.json` and `client_prover/token.abi.json` until the final integration commit.
+1. Isolate only the node source changes required by the release. Exclude parent gitlink changes until the final integration commit.
 2. Run task-specific tests plus the relevant release checks. The repository build target is `make build` at `Makefile:22-23`.
 3. Review the staged diff with a different model.
 4. Commit and, only with exact authorization, push the source commit.
@@ -221,13 +221,13 @@ Then run from clean `R_compiler` in `../psy-compiler`:
 make gen-deploy-json
 ```
 
-This writes the Genesis artifacts and provenance and copies `client_prover/token.json` and `client_prover/token.abi.json` into `psy-node`. Verify both SDK and Genesis compiler stamps equal `R_compiler`, their source hashes match, the Genesis artifact hash/size match, and the canonical node regression passes:
+This writes the Genesis artifacts, provenance, and `psy-genesis/token.json`; contract ABIs remain authoritative in `psy-genesis`. Verify both SDK and Genesis compiler stamps equal `R_compiler`, their source hashes match, the Genesis artifact hash/size match, and the canonical node regression passes:
 
 ```bash
 cargo test --release -p psy_user_cli --test token_artifact_events
 ```
 
-Review and publish only the generated `psy-genesis` files as `R_genesis`; hold the node token files for parent-last. Advance the SDK `psy-genesis` gitlink to pushed `R_genesis` when Genesis changed, rerun affected SDK tests and `pnpm run publish:check`, then publish the tested SDK build commit as `R_sdk_build`. If packed outputs did not change, do not change versions or publish npm.
+Review and publish only the generated `psy-genesis` files, including the compiled `token.json`, as `R_genesis`. Advance the SDK `psy-genesis` gitlink to pushed `R_genesis` when Genesis changed, rerun affected SDK tests and `pnpm run publish:check`, then publish the tested SDK build commit as `R_sdk_build`. If packed outputs did not change, do not change versions or publish npm.
 
 ### 4. Fan Out to Services and Contracts When Applicable
 
@@ -352,10 +352,9 @@ Then, in the clean node integration worktree:
 1. Advance `psy-genesis` to `R_genesis`.
 2. Advance `psy-contracts` to `R_contracts` when contracts changed.
 3. Advance `psy-dapp` to `R_dapp` when DApp changed.
-4. Include the compiler-generated `client_prover/token.json` and `client_prover/token.abi.json` when they changed.
-5. Run `make generate-genesis-data` when Genesis-dependent node circuit data changed.
-6. Run the token artifact regression and all node tests covering the changed runtime, circuits, generated data, or CLIs.
-7. For an authorized runtime release, smoke-test the actual stack only through:
+4. Run `make generate-genesis-data` when Genesis-dependent node circuit data changed.
+5. Run the token artifact regression and all node tests covering the changed runtime, circuits, generated data, or CLIs.
+6. For an authorized runtime release, smoke-test the actual stack only through:
 
 ```bash
 make shutdown

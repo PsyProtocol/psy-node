@@ -251,7 +251,7 @@ async fn verify_complete<S: RollbackExecutionStore + ?Sized>(
     phases: &[ExecutableRollbackPhase],
     expected_marker: u64,
 ) -> anyhow::Result<()> {
-    require_marker(store, expected_marker, "during verification").await?;
+    require_marker(store, expected_marker, "during postcondition checks").await?;
     for phase in phases {
         if phase.is_marker() || phase.is_verify() {
             continue;
@@ -266,7 +266,7 @@ async fn verify_complete<S: RollbackExecutionStore + ?Sized>(
                 .await
                 .with_context(|| format!("postcondition failed for {} ({})", phase.table, phase.api))?,
         }
-        require_marker(store, expected_marker, "during verification").await?;
+        require_marker(store, expected_marker, "during postcondition checks").await?;
     }
     Ok(())
 }
@@ -565,8 +565,7 @@ mod tests {
     use super::*;
     use crate::rollback::generator::{api_for_table, EMPTY_SCHEMA_TABLES, FINAL_TABLES, STAGE1_TABLES, STAGE2_TABLES, STAGE3_TABLES};
     use crate::rollback::plan::{
-        rollback_nats_consumer_kinds, L1ContractsSnapshot, PostTargetGeneration, RollbackRole,
-        RollbackVerificationSnapshot,
+        rollback_nats_consumer_kinds, PostTargetGeneration, RollbackRole, RollbackSnapshot,
     };
     use std::collections::HashSet;
     use std::sync::Mutex;
@@ -975,13 +974,9 @@ mod tests {
             latest_checkpoint_id: latest,
             latest_pending_id,
             post_target_generations,
-            l1_contracts: L1ContractsSnapshot {
-                last_finalized_checkpoint_id: Some(target),
-                ..Default::default()
-            },
-            l1_mode: crate::rollback::plan::RollbackL1Mode::Validated,
-            verification: RollbackVerificationSnapshot {
-                latest_info_bytes: "00".into(),
+            target_contract_state: None,
+            snapshot: RollbackSnapshot {
+                target_info: "00".into(),
                 worker_reputation_fields: vec![RollbackTempValueSnapshot {
                     field: worker_reputation_field(realm_id as u32, realm_sub_id as u16),
                     value: Some("0100000000000000".into()),
@@ -1089,7 +1084,7 @@ mod tests {
         let mut plan = coordinator_plan();
         let store = FakeStore::new(plan.latest_checkpoint_id, plan.latest_pending_id);
         let progress = FakeProgressStore::new();
-        let l1_before = plan.l1_contracts.clone();
+        let contract_state_before = plan.target_contract_state.clone();
 
         let outcome = execute_rollback_plan(&store, &progress, &mut plan).await.unwrap();
         assert_eq!(outcome, RollbackOutcome::Completed);
@@ -1109,7 +1104,7 @@ mod tests {
         assert_eq!(store.marker(), plan.target_checkpoint_id);
         assert_eq!(store.marker_writes(), 1);
         assert_eq!(store.counter(), plan.latest_pending_id, "executor must not move the pending counter");
-        assert_eq!(plan.l1_contracts, l1_before, "L1 snapshot is passive and must not be mutated");
+        assert_eq!(plan.target_contract_state, contract_state_before, "target contract state is passive and must not be mutated");
         assert!(plan.phases.iter().all(|phase| phase.status == RollbackPhaseStatus::Completed));
 
         let snapshots = progress.snapshots();
@@ -1130,7 +1125,7 @@ mod tests {
         assert_eq!(plan.role, RollbackRole::Realm);
         assert_ne!(plan.realm_id, 0, "Realm RP must use a nonzero realm_id");
         let post_target_generations_before = plan.post_target_generations.clone();
-        let l1_before = plan.l1_contracts.clone();
+        let contract_state_before = plan.target_contract_state.clone();
         let store = FakeStore::new(plan.latest_checkpoint_id, plan.latest_pending_id);
         let progress = FakeProgressStore::new();
 
@@ -1140,7 +1135,7 @@ mod tests {
         assert_eq!(store.marker(), plan.target_checkpoint_id);
         assert_eq!(store.counter(), plan.latest_pending_id);
         assert_eq!(plan.post_target_generations, post_target_generations_before, "post_target_generations is frozen input and must not be mutated");
-        assert_eq!(plan.l1_contracts, l1_before);
+        assert_eq!(plan.target_contract_state, contract_state_before);
         assert!(plan.phases.iter().all(|phase| phase.status == RollbackPhaseStatus::Completed));
     }
 
@@ -1297,7 +1292,7 @@ mod tests {
         assert_eq!(store.marker(), plan.target_checkpoint_id);
         assert!(
             store.events().iter().all(|event| matches!(event, StoreEvent::Verify(_) | StoreEvent::DeleteBackups)),
-            "only leftover backup delete and read-only verification may run before the residual is detected"
+            "only leftover backup delete and read-only postcondition checks may run before the residual is detected"
         );
         let delete_pos = store.events().iter().position(|event| matches!(event, StoreEvent::DeleteBackups)).expect("residual reconciliation must still delete leftovers");
         let first_verify_pos = store.events().iter().position(|event| matches!(event, StoreEvent::Verify(_))).expect("residual reconciliation must verify");
@@ -1406,7 +1401,7 @@ mod tests {
             .all(|event| matches!(event, StoreEvent::Verify(_) | StoreEvent::DeleteBackups)), "second run may only delete leftovers and verify postconditions");
         let delete_pos = second_events.iter().position(|event| matches!(event, StoreEvent::DeleteBackups)).expect("second run must delete leftovers");
         let first_verify_pos = second_events.iter().position(|event| matches!(event, StoreEvent::Verify(_))).expect("second run must verify postconditions");
-        assert!(delete_pos < first_verify_pos, "reconciliation delete must precede verification");
+        assert!(delete_pos < first_verify_pos, "reconciliation delete must precede postcondition checks");
         assert_eq!(store.applied(), data_phase_tables(), "second run must not duplicate execution");
     }
 
@@ -1494,7 +1489,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_worker_reputation_snapshot_rejected_before_any_mutation() {
         let mut plan = coordinator_plan();
-        plan.verification.worker_reputation_fields.push(plan.verification.worker_reputation_fields[0].clone());
+        plan.snapshot.worker_reputation_fields.push(plan.snapshot.worker_reputation_fields[0].clone());
         let store = FakeStore::new(plan.latest_checkpoint_id, plan.latest_pending_id);
         let progress = FakeProgressStore::new();
 
@@ -1528,7 +1523,7 @@ mod tests {
         assert_eq!(progress.snapshots().len(), snapshots_after_first, "failed reconciliation must not persist");
         assert!(store.events()[events_after_first.len()..]
             .iter()
-            .all(|event| matches!(event, StoreEvent::Verify(_) | StoreEvent::DeleteBackups)), "failed reconciliation may only delete leftovers and run read-only verification");
+            .all(|event| matches!(event, StoreEvent::Verify(_) | StoreEvent::DeleteBackups)), "failed reconciliation may only delete leftovers and run read-only postcondition checks");
         assert!(plan.phases.iter().all(|phase| phase.status == RollbackPhaseStatus::Completed));
     }
 
@@ -1598,7 +1593,7 @@ mod tests {
         let events = store.events();
         let delete_pos = events.iter().position(|event| matches!(event, StoreEvent::DeleteBackups)).unwrap();
         let first_verify_pos = events.iter().position(|event| matches!(event, StoreEvent::Verify(_))).unwrap();
-        assert!(delete_pos < first_verify_pos, "delete event must precede marker-path verification");
+        assert!(delete_pos < first_verify_pos, "delete event must precede marker-path postcondition checks");
         assert!(plan.phases.iter().all(|phase| phase.status == RollbackPhaseStatus::Completed));
     }
 

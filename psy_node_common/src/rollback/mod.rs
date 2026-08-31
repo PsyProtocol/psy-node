@@ -25,9 +25,9 @@ pub use keys::{
     ImtLeafKey, MerkleNodeKey, SingleTreeMerkleKey, TempFieldKey, UserTransformParams,
 };
 pub use plan::{
-    read_rollback_plan, write_rollback_plan_atomic, L1ContractsSnapshot,
-    PostTargetGeneration, RollbackL1Mode, RollbackNatsConsumerKind,
-    RollbackNatsConsumerTarget, RollbackPhase, RollbackPhaseStatus, RollbackPlan,
-    RollbackRole, RollbackTempValueSnapshot, RollbackVerificationSnapshot,
+    read_rollback_plan, write_rollback_plan_atomic, PostTargetGeneration,
+    RollbackNatsConsumerKind, RollbackNatsConsumerTarget, RollbackPhase,
+    RollbackPhaseStatus, RollbackPlan, RollbackRole, RollbackSnapshot,
+    RollbackTempValueSnapshot, TargetContractState,
 };
 pub use validate::validate_rollback_plan;

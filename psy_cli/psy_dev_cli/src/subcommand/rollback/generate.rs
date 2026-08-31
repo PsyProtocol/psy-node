@@ -22,9 +22,9 @@ use psy_node_common::{
     },
     rollback::{
         CoordinatorBackupRequirements, RollbackBackupDirectories,
-        RollbackBackupRequirementReader, RollbackL1Mode, RollbackPlan,
-        RollbackPlanFromBackupPathsInput, RollbackStateReader, RollbackTempEnumerator,
-        RollbackVerificationSnapshot, UserTransformParams, generate_rollback_plan_from_backup_paths,
+        RollbackBackupRequirementReader, RollbackPlan, RollbackPlanFromBackupPathsInput,
+        RollbackSnapshot, RollbackStateReader, RollbackTempEnumerator, UserTransformParams,
+        generate_rollback_plan_from_backup_paths,
     },
 };
 use psy_node_core::psy_core_db::traits::full::{
@@ -304,11 +304,10 @@ pub async fn generate(
     args: &GenerateArgs,
     config: &ProcessorConfig,
 ) -> anyhow::Result<RollbackPlan> {
-    validate_l1_gate(args)?;
     let store = store_config(config);
     let (state_reader, temp_enumerator, latest_checkpoint_id, latest_pending_id) =
         open_rollback_stores(&store, args.common.role, args.common.target).await?;
-    let verification = derive_verification_snapshot(args.common.target, &state_reader.db).await?;
+    let snapshot = derive_snapshot(args.common.target, &state_reader.db).await?;
     let (mut global_user_tree, mut global_contract_tree, mut user_registration_tree) =
         derive_target_trees(args.common.role, store.realm_id, args.common.target, &state_reader.db)
             .await?
@@ -335,31 +334,12 @@ pub async fn generate(
             realm_global_user_tree_height: Network::REALM_GLOBAL_USER_TREE_HEIGHT,
             group_realm_height: Network::GROUP_REALM_HEIGHT,
         },
-        verification,
-        l1_mode: if args.skip_l1_state { RollbackL1Mode::SkippedLocalDevnet } else { RollbackL1Mode::Validated },
-        l1_contracts: args.l1_contracts.clone(),
+        snapshot,
+        target_contract_state: args.target_contract_state.clone(),
     };
     generate_rollback_plan_from_backup_paths(&mut input)
         .await
         .context("failed to generate rollback plan from authoritative Scylla, Redis, and backups")
-}
-
-fn validate_l1_gate(args: &GenerateArgs) -> anyhow::Result<()> {
-    if args.skip_l1_state {
-        ensure!(args.l1_contracts == Default::default(), "--skip-l1-state requires an empty L1 snapshot");
-        return Ok(());
-    }
-    let last_finalized = args
-        .l1_contracts
-        .last_finalized_checkpoint_id
-        .context("l1-contracts JSON requires last_finalized_checkpoint_id")?;
-    ensure!(
-        args.common.target <= last_finalized,
-        "target checkpoint {} exceeds L1 last_finalized_checkpoint_id {}",
-        args.common.target,
-        last_finalized
-    );
-    Ok(())
 }
 
 async fn open_rollback_stores(
@@ -406,10 +386,10 @@ async fn open_rollback_stores(
     ))
 }
 
-async fn derive_verification_snapshot(
+async fn derive_snapshot(
     target: u64,
     db: &ScyllaStore,
-) -> anyhow::Result<RollbackVerificationSnapshot> {
+) -> anyhow::Result<RollbackSnapshot> {
     let target_l2_state = db
         .get_l2_block_state(target)
         .await
@@ -420,8 +400,8 @@ async fn derive_verification_snapshot(
         target_l2_state.checkpoint_id,
         target
     );
-    Ok(RollbackVerificationSnapshot {
-        latest_info_bytes: hex::encode(PsyCanonicalDatabaseSerializeBaseSingle::psy_ser_to_bytes_vec(&target_l2_state)?),
+    Ok(RollbackSnapshot {
+        target_info: hex::encode(PsyCanonicalDatabaseSerializeBaseSingle::psy_ser_to_bytes_vec(&target_l2_state)?),
         worker_reputation_fields: Vec::new(),
     })
 }
@@ -546,21 +526,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn l1_gate_requires_finalized_target_unless_explicitly_skipped() {
-        let common = super::super::tests::common(ProcessorRole::Coordinator);
-        let mut args = GenerateArgs {
-            common,
+    fn target_contract_state_selection_is_deferred_to_plan_generation() {
+        let args = GenerateArgs {
+            common: super::super::tests::common(ProcessorRole::Coordinator),
             reward_realm_ids: vec![1],
-            l1_contracts: Default::default(),
-            skip_l1_state: false,
+            target_contract_state: None,
         };
-        assert!(validate_l1_gate(&args).is_err());
-        args.l1_contracts.last_finalized_checkpoint_id = Some(7);
-        assert!(validate_l1_gate(&args).is_ok());
-        args.skip_l1_state = true;
-        assert!(validate_l1_gate(&args).is_err());
-        args.l1_contracts = Default::default();
-        assert!(validate_l1_gate(&args).is_ok());
+        assert!(args.target_contract_state.is_none());
     }
     #[test]
     fn realm_checkpoint_delete_path_does_not_require_coordinator_transition() {

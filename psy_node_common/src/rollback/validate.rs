@@ -9,7 +9,7 @@ use psy_node_core::{
 };
 
 use crate::rollback::generator::{api_for_table, EMPTY_SCHEMA_TABLES, FINAL_TABLES, STAGE1_TABLES, STAGE2_TABLES, STAGE3_TABLES};
-use crate::rollback::plan::{rollback_nats_consumer_kinds, RollbackL1Mode, RollbackNatsConsumerKind, RollbackPhaseStatus, RollbackPlan, RollbackRole};
+use crate::rollback::plan::{rollback_nats_consumer_kinds, RollbackNatsConsumerKind, RollbackPhaseStatus, RollbackPlan, RollbackRole};
 
 const TEMP_TABLE_PI: [u8; 2] = [0x50, 0x49];
 const TEMP_TABLE_GP: [u8; 2] = [0x47, 0x50];
@@ -19,24 +19,13 @@ pub fn validate_rollback_plan(plan: &RollbackPlan) -> anyhow::Result<()> {
     if plan.target_checkpoint_id > plan.latest_checkpoint_id {
         anyhow::bail!("target_checkpoint_id {} > latest_checkpoint_id {}", plan.target_checkpoint_id, plan.latest_checkpoint_id);
     }
-    match plan.l1_mode {
-        RollbackL1Mode::Validated => {
-            let last_finalized = plan
-                .l1_contracts
-                .last_finalized_checkpoint_id
-                .ok_or_else(|| anyhow::anyhow!("l1_contracts.last_finalized_checkpoint_id is required unless l1_mode is skipped_local_devnet"))?;
-            if plan.target_checkpoint_id > last_finalized {
-                anyhow::bail!(
-                    "target_checkpoint_id {} exceeds L1 last_finalized_checkpoint_id {}; target must be an L1-finalized checkpoint",
-                    plan.target_checkpoint_id,
-                    last_finalized
-                );
-            }
-        }
-        RollbackL1Mode::SkippedLocalDevnet => {
-            if plan.l1_contracts != Default::default() {
-                anyhow::bail!("skipped_local_devnet L1 mode requires an explicitly empty l1_contracts snapshot");
-            }
+    if let Some(state) = &plan.target_contract_state {
+        if state.last_finalized_checkpoint_id != plan.target_checkpoint_id {
+            anyhow::bail!(
+                "target_contract_state.last_finalized_checkpoint_id {} must equal target_checkpoint_id {}",
+                state.last_finalized_checkpoint_id,
+                plan.target_checkpoint_id
+            );
         }
     }
     if plan.role == RollbackRole::Coordinator && (plan.realm_id != 0 || plan.realm_sub_id != 0) {
@@ -186,20 +175,20 @@ fn validate_semantic_keys(plan: &RollbackPlan) -> anyhow::Result<()> {
 }
 
 fn validate_worker_reputation_fields(plan: &RollbackPlan, realm_le: &[u8; 4], sub_le: &[u8; 2]) -> anyhow::Result<()> {
-    if decode_hex(&plan.verification.latest_info_bytes)?.is_empty() {
-        anyhow::bail!("verification.latest_info_bytes must not be empty");
+    if decode_hex(&plan.snapshot.target_info).map_err(|err| anyhow::anyhow!("snapshot.target_info: {err}"))?.is_empty() {
+        anyhow::bail!("snapshot.target_info must not be empty");
     }
     let mut seen_fields = HashSet::new();
-    for (index, reputation) in plan.verification.worker_reputation_fields.iter().enumerate() {
-        let field = decode_hex(&reputation.field).map_err(|err| anyhow::anyhow!("verification.worker_reputation_fields[{index}].field: {err}"))?;
+    for (index, reputation) in plan.snapshot.worker_reputation_fields.iter().enumerate() {
+        let field = decode_hex(&reputation.field).map_err(|err| anyhow::anyhow!("snapshot.worker_reputation_fields[{index}].field: {err}"))?;
         if field.len() != TEMP_TABLE_WORKER_REPUTATION_KEY_SIZE || field[0..4] != realm_le[..] || field[4..6] != sub_le[..] || field[6..8] != TEMP_TABLE_ID_WORKER_REPUTATION_BYTES {
-            anyhow::bail!("verification.worker_reputation_fields[{index}] is not an exact worker reputation field for this processor");
+            anyhow::bail!("snapshot.worker_reputation_fields[{index}] is not an exact worker reputation field for this processor");
         }
         if !seen_fields.insert(field) {
-            anyhow::bail!("verification.worker_reputation_fields[{index}] duplicates an earlier worker reputation field");
+            anyhow::bail!("snapshot.worker_reputation_fields[{index}] duplicates an earlier worker reputation field");
         }
         if let Some(value) = &reputation.value {
-            decode_hex(value).map_err(|err| anyhow::anyhow!("verification.worker_reputation_fields[{index}].value: {err}"))?;
+            decode_hex(value).map_err(|err| anyhow::anyhow!("snapshot.worker_reputation_fields[{index}].value: {err}"))?;
         }
     }
     Ok(())
@@ -565,8 +554,8 @@ fn decode_hex(value: &str) -> anyhow::Result<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::rollback::plan::{
-        L1ContractsSnapshot, PostTargetGeneration, RollbackPhase, RollbackPhaseStatus, RollbackPlan, RollbackRole,
-        RollbackTempValueSnapshot,
+        PostTargetGeneration, RollbackPhase, RollbackPhaseStatus, RollbackPlan, RollbackRole,
+        RollbackSnapshot, RollbackTempValueSnapshot, TargetContractState,
     };
 
     fn empty_coordinator_plan() -> RollbackPlan {
@@ -578,10 +567,9 @@ mod tests {
             latest_checkpoint_id: 199,
             latest_pending_id: 87,
             post_target_generations: vec![],
-            l1_mode: RollbackL1Mode::Validated,
-            l1_contracts: L1ContractsSnapshot { last_finalized_checkpoint_id: Some(199), ..Default::default() },
-            verification: crate::rollback::plan::RollbackVerificationSnapshot {
-                latest_info_bytes: "00".into(),
+            target_contract_state: None,
+            snapshot: RollbackSnapshot {
+                target_info: "00".into(),
                 worker_reputation_fields: Vec::new(),
             },
             phases: vec![],
@@ -597,36 +585,26 @@ mod tests {
     }
 
     #[test]
-    fn validator_enforces_target_within_l1_finalized() {
+    fn validator_accepts_absent_or_matching_contract_state_and_rejects_mismatch() {
         let mut plan = valid_plan();
-        plan.l1_contracts.last_finalized_checkpoint_id = None;
-        let err = validate_rollback_plan(&plan).unwrap_err();
-        assert!(err.to_string().contains("last_finalized_checkpoint_id is required"), "{err}");
-
-        let mut plan = valid_plan();
-        plan.l1_contracts.last_finalized_checkpoint_id = Some(198);
-        let err = validate_rollback_plan(&plan).unwrap_err();
-        assert!(err.to_string().contains("L1-finalized"), "{err}");
-
-        let mut plan = valid_plan();
-        plan.l1_contracts.last_finalized_checkpoint_id = Some(199);
+        plan.target_contract_state = None;
         validate_rollback_plan(&plan).unwrap();
 
-        let mut plan = valid_plan();
-        plan.l1_contracts.last_finalized_checkpoint_id = Some(500);
+        plan.target_contract_state = Some(TargetContractState {
+            last_finalized_checkpoint_id: plan.target_checkpoint_id,
+            last_verified_checkpoint_root: None,
+            last_verified_deposit_tree_root: None,
+            last_verified_withdrawal_tree_root: None,
+            withdrawal_subtree_root: None,
+            deposit_root: None,
+            proved_deposit_count: None,
+            pending_deposit_count: None,
+        });
         validate_rollback_plan(&plan).unwrap();
-    }
 
-    #[test]
-    fn validator_accepts_only_unambiguous_local_l1_skip() {
-        let mut plan = valid_plan();
-        plan.l1_mode = RollbackL1Mode::SkippedLocalDevnet;
-        plan.l1_contracts = Default::default();
-        validate_rollback_plan(&plan).unwrap();
-
-        plan.l1_contracts.last_finalized_checkpoint_id = Some(plan.target_checkpoint_id);
+        plan.target_contract_state.as_mut().unwrap().last_finalized_checkpoint_id += 1;
         let err = validate_rollback_plan(&plan).unwrap_err();
-        assert!(err.to_string().contains("explicitly empty"), "{err}");
+        assert!(err.to_string().contains("must equal target_checkpoint_id"), "{err}");
     }
 
     #[test]
@@ -788,10 +766,9 @@ mod tests {
             latest_checkpoint_id: 210,
             latest_pending_id: 104,
             post_target_generations,
-            l1_contracts: L1ContractsSnapshot { last_finalized_checkpoint_id: Some(500), ..Default::default() },
-            l1_mode: RollbackL1Mode::Validated,
-            verification: crate::rollback::plan::RollbackVerificationSnapshot {
-                latest_info_bytes: "00".into(),
+            target_contract_state: None,
+            snapshot: RollbackSnapshot {
+                target_info: "00".into(),
                 worker_reputation_fields: vec![RollbackTempValueSnapshot { field: worker_reputation_field(0, 0), value: Some("0100000000000000".into()) }],
             },
             phases: Vec::new(),
@@ -864,7 +841,7 @@ mod tests {
         plan.role = RollbackRole::Realm;
         plan.realm_id = 7;
         plan.realm_sub_id = 2;
-        plan.verification.worker_reputation_fields[0].field = worker_reputation_field(7, 2);
+        plan.snapshot.worker_reputation_fields[0].field = worker_reputation_field(7, 2);
         let realm_nats_targets = serde_json::Value::Array(
             plan.proc_ids()
                 .into_iter()
@@ -993,10 +970,10 @@ mod tests {
     #[test]
     fn validator_rejects_wrong_worker_reputation_realm_or_sub() {
         let mut plan = valid_plan();
-        plan.verification.worker_reputation_fields[0].field = worker_reputation_field(3, 0);
+        plan.snapshot.worker_reputation_fields[0].field = worker_reputation_field(3, 0);
         let err = validate_rollback_plan(&plan).unwrap_err();
         assert!(err.to_string().contains("exact worker reputation field"), "{err}");
-        plan.verification.worker_reputation_fields[0].field = worker_reputation_field(0, 9);
+        plan.snapshot.worker_reputation_fields[0].field = worker_reputation_field(0, 9);
         let err = validate_rollback_plan(&plan).unwrap_err();
         assert!(err.to_string().contains("exact worker reputation field"), "{err}");
     }
@@ -1004,7 +981,7 @@ mod tests {
     #[test]
     fn validator_rejects_noncanonical_worker_reputation_key_length() {
         let mut plan = valid_plan();
-        plan.verification.worker_reputation_fields[0].field = hex::encode([0u8; 8]);
+        plan.snapshot.worker_reputation_fields[0].field = hex::encode([0u8; 8]);
         let err = validate_rollback_plan(&plan).unwrap_err();
         assert!(err.to_string().contains("exact worker reputation field"), "{err}");
     }

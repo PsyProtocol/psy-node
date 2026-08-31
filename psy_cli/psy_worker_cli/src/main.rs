@@ -10,7 +10,6 @@ async fn main() -> anyhow::Result<()> {
     cf_utils::logging::setup_logging()?;
 
     let cli = Cli::parse();
-    //psy_common::setup_logging()?;
     match cli.command {
         Commands::Worker {
             config,

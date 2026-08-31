@@ -136,7 +136,7 @@ for p in 1337 13380 13390 3000 9999; do ! nc -z 127.0.0.1 "$p"; done
 for p in 8545 9042 6379 4222 8081 5433 8080; do nc -z 127.0.0.1 "$p"; done
 ```
 
-4. Generate and execute one rollback plan for the Coordinator and one for every Realm. Rollback validation uses only `plonky2-poseidon-goldilocks`; JTMB is test-only. `--skip-l1-state` is permitted only for an explicitly authorized local-devnet L2-only test; otherwise the target must be no greater than the L1 finalized checkpoint. Generate every RP before executing any RP, then require every phase in every RP to be `completed` before resume.
+4. Generate and execute one rollback plan for the Coordinator and one for every Realm. Rollback validation uses only `plonky2-poseidon-goldilocks`; JTMB is test-only. `--target-contract-state <json>` is optional: generation retains it only when `last_finalized_checkpoint_id` exactly equals the rollback target, and absence or mismatch never blocks local rollback. Generate every RP before executing any RP, then require every phase in every RP to be `completed` before resume. Any L1 force-state action is a separate operator task.
 5. Resume the saved application commands without deploying L1 or resetting Envio:
 
 ```bash
@@ -149,7 +149,7 @@ The supervisor removes the stop sentinel only after every saved application proc
 
 ## 7. Post-Restart and Post-Rollback Verification
 
-1. For a full-stack test, require the Anvil block number to be no lower than before the operation, `db/anvil/state.json` to parse as complete JSON, and StateManager, Bridge, and Router addresses to remain byte-identical. For an explicitly authorized `--skip-l1-state` L2-only test, record that L1 continuity was not verified.
+1. Require the Anvil block number to be no lower than before the operation, `db/anvil/state.json` to parse as complete JSON, and StateManager, Bridge, and Router addresses to remain byte-identical. If `target_contract_state` was omitted or ignored because its checkpoint differed, record that no matching target contract snapshot was attached to the local RP; verify any separate L1 recovery independently.
 2. Require Coordinator and every Realm readiness marker.
 3. Require every processor checkpoint head to advance above the rollback target, allow short Realm lag, then require all heads to converge.
 4. Verify the target checkpoint remains queryable and target application state was restored.

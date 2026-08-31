@@ -231,7 +231,7 @@ pub struct NestedMapArrayContract {
     );
 }
 
-/// The checked-in token.json predates the compiler emitting `state_layout`.
+/// The checked-in psy-genesis token.json predates the compiler emitting `state_layout`.
 /// Make sure it still deserializes and produces a computed layout that
 /// round-trips through the ABI serializer.
 #[test]
@@ -239,7 +239,7 @@ fn legacy_token_artifact_deserializes_with_computed_state_layout() {
     use psy_compiler::output::serialize::CompilationArtifact;
 
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let token_path = manifest_dir.join("../token.json");
+    let token_path = manifest_dir.join("../../psy-genesis/token.json");
     let raw = std::fs::read_to_string(&token_path)
         .unwrap_or_else(|e| panic!("failed to read {}: {}", token_path.display(), e));
     let artifact: CompilationArtifact = serde_json::from_str(&raw)

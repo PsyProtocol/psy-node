@@ -30,7 +30,7 @@ fn genesis_contracts_path() -> PathBuf {
 }
 
 fn token_artifact_path() -> PathBuf {
-    workspace_root().join("client_prover/token.json")
+    workspace_root().join("psy-genesis/token.json")
 }
 
 fn token_abi_path() -> PathBuf {
@@ -63,9 +63,14 @@ fn json_kind(value: &Value) -> &'static str {
 }
 
 fn read_methods(path: &Path) -> Vec<Value> {
-    match read_json(path) {
+    let artifact = read_json(path);
+    match artifact {
         Value::Array(methods) => methods,
-        other => panic!("{} is not a method array (found {})", path.display(), json_kind(&other)),
+        Value::Object(mut fields) => fields
+            .remove("circuit_definitions")
+            .and_then(|value| value.as_array().cloned())
+            .unwrap_or_else(|| panic!("{} has no circuit_definitions method array", path.display())),
+        other => panic!("{} is not a method array or artifact object (found {})", path.display(), json_kind(&other)),
     }
 }
 
@@ -251,15 +256,15 @@ fn deployed_token_artifact_exposes_claim_events_for_all_claim_paths() {
 
     assert!(
         event_len(&methods, "simple_claim") >= 1,
-        "client_prover/token.json simple_claim must expose ClaimEvent"
+        "psy-genesis/token.json simple_claim must expose ClaimEvent"
     );
     assert!(
         event_len(&methods, "private_claim") >= 1,
-        "client_prover/token.json private_claim must expose PrivateClaimEvent"
+        "psy-genesis/token.json private_claim must expose PrivateClaimEvent"
     );
     assert!(
         event_len(&methods, "claim_deposit") >= 1,
-        "client_prover/token.json claim_deposit must expose DepositClaimEvent"
+        "psy-genesis/token.json claim_deposit must expose DepositClaimEvent"
     );
 
     assert_eq!(
@@ -271,7 +276,7 @@ fn deployed_token_artifact_exposes_claim_events_for_all_claim_paths() {
             .and_then(Value::as_array)
             .map(Vec::len),
         Some(15),
-        "client_prover/token.json claim_deposit must expose the exact 15-felt DepositClaimEvent",
+        "psy-genesis/token.json claim_deposit must expose the exact 15-felt DepositClaimEvent",
     );
 }
 
@@ -295,9 +300,27 @@ fn genesis_contracts_provenance_stamp_matches_checked_out_compiler_and_artifact(
         .get("artifactByteSize")
         .and_then(Value::as_u64)
         .unwrap_or_else(|| panic!("{} is missing an integer artifactByteSize", stamp_path.display()));
+    let token_sha256 = stamp
+        .get("tokenArtifactSha256")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("{} is missing a string tokenArtifactSha256", stamp_path.display()));
+    let token_byte_size = stamp
+        .get("tokenArtifactByteSize")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("{} is missing an integer tokenArtifactByteSize", stamp_path.display()));
+    let token_update_sha256 = stamp
+        .get("tokenUpdateArtifactSha256")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("{} is missing a string tokenUpdateArtifactSha256", stamp_path.display()));
+    let token_update_byte_size = stamp
+        .get("tokenUpdateArtifactByteSize")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("{} is missing an integer tokenUpdateArtifactByteSize", stamp_path.display()));
     assert!(is_lower_hex(revision, 40) || is_lower_hex(revision, 64));
     assert!(is_lower_hex(sources_hash, 64));
     assert!(is_lower_hex(artifact_sha256, 64));
+    assert!(is_lower_hex(token_sha256, 64));
+    assert!(is_lower_hex(token_update_sha256, 64));
 
     let (current_revision, current_hash) = current_compiler_fingerprint();
     assert_eq!(
@@ -325,6 +348,15 @@ fn genesis_contracts_provenance_stamp_matches_checked_out_compiler_and_artifact(
         "{} is stale: artifactByteSize does not match genesis_contracts.json",
         stamp_path.display()
     );
+
+    for (label, path, expected_hash, expected_size) in [
+        ("token.json", token_artifact_path(), token_sha256, token_byte_size),
+        ("token.update.json", workspace_root().join("psy-genesis/token.update.json"), token_update_sha256, token_update_byte_size),
+    ] {
+        let bytes = fs::read(&path).unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e));
+        assert_eq!(expected_hash, hex::encode(Sha256::digest(&bytes)), "{} is stale: hash mismatch", label);
+        assert_eq!(expected_size, bytes.len() as u64, "{} is stale: byte-size mismatch", label);
+    }
 }
 
 #[test]
@@ -343,7 +375,7 @@ fn deployed_token_private_claim_matches_authoritative_genesis() {
     let embedded = genesis_private_claim("token");
     if deployed_private_claim != &embedded {
         panic!(
-            "client_prover/token.json is stale: its private_claim no longer matches the authoritative token entry embedded in genesis_contracts.json; regenerate via `make gen-deploy-json`"
+            "psy-genesis/token.json is stale: its private_claim no longer matches the authoritative token entry embedded in genesis_contracts.json; regenerate via `make gen-deploy-json`"
         );
     }
 }
@@ -358,7 +390,7 @@ fn deployed_token_artifact_matches_genesis_for_claim_event_presence() {
         assert_eq!(
             event_len(&deployed, name),
             event_len(&genesis_token, name),
-            "client_prover/token.json is stale: {} event emission no longer matches the authoritative genesis token entry",
+            "psy-genesis/token.json is stale: {} event emission no longer matches the authoritative genesis token entry",
             name
         );
         assert_eq!(

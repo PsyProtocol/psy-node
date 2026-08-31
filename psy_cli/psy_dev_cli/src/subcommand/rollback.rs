@@ -4,7 +4,7 @@ use anyhow::{Context, bail, ensure};
 use clap::{Args, ValueEnum};
 use psy_core::constants::{chain_id::PsyChainNetworkType, proving_backends::PsyChainProvingBackendTypeInput};
 use psy_node_common::rollback::{
-    L1ContractsSnapshot, RollbackRole, read_rollback_plan, validate_rollback_plan,
+    RollbackRole, TargetContractState, read_rollback_plan, validate_rollback_plan,
 };
 use psy_node_core::config::{
     node_cli_config::load_cli_config_from_file,
@@ -28,10 +28,8 @@ pub struct RollbackArgs {
     pub common: CommonArgs,
     #[arg(long = "reward-realm-id", requires = "generate", conflicts_with = "execute", help = "Coordinator realm IDs used to materialize reward cleanup keys. Realm generation uses its own realm id.")]
     pub reward_realm_ids: Vec<u64>,
-    #[arg(long = "l1-contracts", requires = "generate", conflicts_with_all = ["execute", "skip_l1_state"], required_unless_present_any = ["skip_l1_state", "execute"], help = "Passive L1 contracts JSON with last_finalized_checkpoint_id. Required unless --skip-l1-state is explicitly selected.")]
-    pub l1_contracts: Option<PathBuf>,
-    #[arg(long = "skip-l1-state", requires = "generate", conflicts_with_all = ["execute", "l1_contracts"], help = "Explicit local-devnet L2-only test mode. Skips the fail-closed L1 finalized-checkpoint gate.")]
-    pub skip_l1_state: bool,
+    #[arg(long = "target-contract-state", requires = "generate", conflicts_with = "execute", help = "Optional target contract-state JSON. Retained only when its last_finalized_checkpoint_id equals the rollback target.")]
+    pub target_contract_state: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -79,8 +77,7 @@ pub struct CommonArgs {
 pub struct GenerateArgs {
     pub common: CommonArgs,
     pub reward_realm_ids: Vec<u64>,
-    pub l1_contracts: L1ContractsSnapshot,
-    pub skip_l1_state: bool,
+    pub target_contract_state: Option<TargetContractState>,
 }
 
 #[derive(Debug)]
@@ -126,16 +123,14 @@ pub async fn run(args: RollbackArgs) -> anyhow::Result<()> {
 }
 
 async fn run_generate(args: RollbackArgs) -> anyhow::Result<()> {
-    let l1_contracts = match (&args.l1_contracts, args.skip_l1_state) {
-        (Some(path), false) => read_json::<L1ContractsSnapshot>(path).await?,
-        (None, true) => L1ContractsSnapshot::default(),
-        _ => bail!("specify exactly one of --l1-contracts or --skip-l1-state for --generate"),
+    let target_contract_state = match &args.target_contract_state {
+        Some(path) => Some(read_json::<TargetContractState>(path).await?),
+        None => None,
     };
     let generate = GenerateArgs {
         common: args.common.clone(),
         reward_realm_ids: args.reward_realm_ids,
-        l1_contracts,
-        skip_l1_state: args.skip_l1_state,
+        target_contract_state,
     };
     let config = prepare_offline_operation(&generate.common).await?;
     let plan = generate::generate(&generate, &config).await?;
@@ -355,50 +350,33 @@ mod tests {
     }
 
     #[test]
-    fn parses_generate_with_l1_and_without_external_snapshots() {
+    fn new_generate_contract_state_flag_is_optional() {
         let parsed = parse(&[
             "test", "--generate", "--role", "coordinator", "--processor-config", "coordinator.yaml",
             "--target", "42", "--rp-path", "rp.json", "--proving-backend", "plonky2-poseidon-goldilocks",
             "--stop-sentinel", "stopped", "--coordinator-endpoint", "http://127.0.0.1:1337",
-            "--l1-contracts", "l1.json",
         ]).unwrap();
         assert!(parsed.generate);
-        assert!(!parsed.execute);
-        assert!(!parsed.skip_l1_state);
-        assert_eq!(parsed.common.role, ProcessorRole::Coordinator);
-        assert_eq!(parsed.common.target, 42);
-        assert_eq!(parsed.l1_contracts.as_deref(), Some(Path::new("l1.json")));
-    }
+        assert!(parsed.target_contract_state.is_none());
 
-    #[test]
-    fn parses_explicit_l2_only_generate() {
         let parsed = parse(&[
             "test", "--generate", "--role", "coordinator", "--processor-config", "coordinator.yaml",
             "--target", "42", "--rp-path", "rp.json", "--proving-backend", "plonky2-poseidon-goldilocks",
             "--stop-sentinel", "stopped", "--coordinator-endpoint", "http://127.0.0.1:1337",
-            "--skip-l1-state",
+            "--target-contract-state", "target.json",
         ]).unwrap();
-        assert!(parsed.skip_l1_state);
-        assert!(parsed.l1_contracts.is_none());
+        assert_eq!(parsed.target_contract_state.as_deref(), Some(Path::new("target.json")));
     }
 
     #[test]
-    fn generate_requires_l1_or_explicit_skip() {
-        assert!(parse(&[
-            "test", "--generate", "--role", "coordinator", "--processor-config", "coordinator.yaml",
-            "--target", "42", "--rp-path", "rp.json", "--proving-backend", "plonky2-poseidon-goldilocks",
-            "--stop-sentinel", "stopped", "--coordinator-endpoint", "http://127.0.0.1:1337",
-        ]).is_err());
-    }
-
-    #[test]
-    fn generate_rejects_l1_and_skip_together() {
-        assert!(parse(&[
-            "test", "--generate", "--role", "coordinator", "--processor-config", "coordinator.yaml",
-            "--target", "42", "--rp-path", "rp.json", "--proving-backend", "plonky2-poseidon-goldilocks",
-            "--stop-sentinel", "stopped", "--coordinator-endpoint", "http://127.0.0.1:1337",
-            "--l1-contracts", "l1.json", "--skip-l1-state",
-        ]).is_err());
+    fn old_contract_state_flags_are_rejected() {
+        for flag in ["--l1-contracts", "--skip-l1-state"] {
+            assert!(parse(&[
+                "test", "--generate", "--role", "coordinator", "--processor-config", "coordinator.yaml",
+                "--target", "42", "--rp-path", "rp.json", "--proving-backend", "plonky2-poseidon-goldilocks",
+                "--stop-sentinel", "stopped", "--coordinator-endpoint", "http://127.0.0.1:1337", flag,
+            ]).is_err());
+        }
     }
 
     #[test]
@@ -427,7 +405,7 @@ mod tests {
             "test", "--generate", "--execute", "--role", "coordinator", "--processor-config", "coordinator.yaml",
             "--target", "42", "--rp-path", "rp.json", "--proving-backend", "plonky2-poseidon-goldilocks",
             "--stop-sentinel", "stopped", "--coordinator-endpoint", "http://127.0.0.1:1337",
-            "--l1-contracts", "l1.json",
+            "--target-contract-state", "target.json",
         ]).is_err());
     }
 
@@ -437,7 +415,7 @@ mod tests {
             "test", "--execute", "--role", "coordinator", "--processor-config", "coordinator.yaml",
             "--target", "42", "--rp-path", "rp.json", "--proving-backend", "plonky2-poseidon-goldilocks",
             "--stop-sentinel", "stopped", "--coordinator-endpoint", "http://127.0.0.1:1337",
-            "--l1-contracts", "l1.json",
+            "--target-contract-state", "target.json",
         ]).is_err());
     }
 

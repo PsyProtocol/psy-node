@@ -259,7 +259,7 @@ impl SimpleStoreEx {
 #[tokio::test]
 #[ignore = "database slow"]
 async fn simple_store_basic_test_1() -> anyhow::Result<()> {
-    let key_space = format!("psy_node_v3_scylla_test_ex1_{}", rand::random::<u64>());
+    let key_space = format!("psy_scylla_v3_store_test_{}", rand::random::<u64>());
     let scylla_db = ScyllaTestStore::new(0, 0, key_space, &["127.0.0.1:9042".to_string()]).await?;
     let simple_store = SimpleStoreEx::setup(Arc::new(scylla_db)).await?;
     println!("setup simple store");

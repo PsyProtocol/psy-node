@@ -393,7 +393,7 @@ impl RollbackExecutionStore for ExecutionStore {
                 backend.db_delete_many_pending_id_partitions(self.database.guta_reward_tag_tree_table.as_ref(), keys).await?;
             }
             RollbackOperation::RestoreLatestInfo => {
-                let bytes = decode_hex(&plan.verification.latest_info_bytes, "verification.latest_info_bytes")?;
+                let bytes = decode_hex(&plan.snapshot.target_info, "snapshot.target_info")?;
                 let latest_info = QEDL2BlockState::psy_ser_from_slice(&bytes)
                     .context("failed to decode frozen canonical latest_info bytes")?;
                 ensure!(
@@ -561,7 +561,7 @@ impl RollbackExecutionStore for ExecutionStore {
                 ensure!(residual.is_empty(), "guta reward tag tree retains pending partitions {:?}", residual);
             }
             RollbackOperation::RestoreLatestInfo => {
-                let expected = decode_hex(&plan.verification.latest_info_bytes, "verification.latest_info_bytes")?;
+                let expected = decode_hex(&plan.snapshot.target_info, "snapshot.target_info")?;
                 let actual: QEDL2BlockState = backend
                     .db_select_one_kiv_value(
                         self.database.latest_info_table.as_ref(),
@@ -754,10 +754,10 @@ async fn verify_worker_reputation_snapshot(
     }
 
     let mut expected = std::collections::BTreeMap::new();
-    for (index, snapshot) in plan.verification.worker_reputation_fields.iter().enumerate() {
-        let field = decode_hex(&snapshot.field, &format!("verification.worker_reputation_fields[{index}].field"))?;
-        let value = snapshot.value.as_deref().map(|value| decode_hex(value, &format!("verification.worker_reputation_fields[{index}].value"))).transpose()?;
-        ensure!(expected.insert(field, value).is_none(), "duplicate worker reputation field in rollback verification snapshot");
+    for (index, snapshot) in plan.snapshot.worker_reputation_fields.iter().enumerate() {
+        let field = decode_hex(&snapshot.field, &format!("snapshot.worker_reputation_fields[{index}].field"))?;
+        let value = snapshot.value.as_deref().map(|value| decode_hex(value, &format!("snapshot.worker_reputation_fields[{index}].value"))).transpose()?;
+        ensure!(expected.insert(field, value).is_none(), "duplicate worker reputation field in rollback snapshot");
     }
 
     let expected_fields: std::collections::BTreeSet<Vec<u8>> = expected.keys().cloned().collect();
@@ -808,7 +808,7 @@ mod tests {
     use super::*;
     use psy_node_core::config::node_start_config::CoordinatorProcessorStartConfig;
     use psy_node_common::rollback::{
-        L1ContractsSnapshot, PostTargetGeneration, RollbackRole, RollbackVerificationSnapshot,
+        PostTargetGeneration, RollbackRole, RollbackSnapshot,
     };
 
     #[tokio::test]
@@ -845,13 +845,9 @@ mod tests {
                 pending_id: 1,
                 proc_checkpoint_unique_id: 1001,
             }],
-            l1_mode: psy_node_common::rollback::RollbackL1Mode::Validated,
-            l1_contracts: L1ContractsSnapshot {
-                last_finalized_checkpoint_id: Some(0),
-                ..Default::default()
-            },
-            verification: RollbackVerificationSnapshot {
-                latest_info_bytes: String::new(),
+            target_contract_state: None,
+            snapshot: RollbackSnapshot {
+                target_info: String::new(),
                 worker_reputation_fields: Vec::new(),
             },
             phases: Vec::new(),

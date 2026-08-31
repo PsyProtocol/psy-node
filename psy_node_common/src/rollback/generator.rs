@@ -21,7 +21,7 @@ use crate::{
     realm::processor::gatherers::realm_end_cap_gatherer::{get_new_realm_end_cap_gatherer_backup_file_path, read_realm_end_cap_gatherer_backup_file},
     rollback::{
         keys::{self, MerkleNodeKey, TempFieldKey, UserTransformParams},
-        plan::{L1ContractsSnapshot, PostTargetGeneration, RollbackL1Mode, RollbackPhase, RollbackPhaseStatus, RollbackPlan, RollbackRole, RollbackTempValueSnapshot, RollbackVerificationSnapshot},
+        plan::{PostTargetGeneration, RollbackPhase, RollbackPhaseStatus, RollbackPlan, RollbackRole, RollbackSnapshot, RollbackTempValueSnapshot, TargetContractState},
     },
 };
 
@@ -161,9 +161,8 @@ pub struct RollbackPlanInput<'a> {
     pub reward_realm_ids: Vec<u64>,
     pub user_transform: UserTransformParams,
     pub imt_snapshot: ImtAppendIndexSnapshot,
-    pub verification: RollbackVerificationSnapshot,
-    pub l1_mode: RollbackL1Mode,
-    pub l1_contracts: L1ContractsSnapshot,
+    pub snapshot: RollbackSnapshot,
+    pub target_contract_state: Option<TargetContractState>,
 }
 
 #[derive(Debug, Clone)]
@@ -193,9 +192,8 @@ pub struct RollbackPlanFromBackupPathsInput<'a, N: QNetworkTypesConfig, FS: Toki
     pub user_registration_tree: &'a mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
     pub reward_realm_ids: Vec<u64>,
     pub user_transform: UserTransformParams,
-    pub verification: RollbackVerificationSnapshot,
-    pub l1_mode: RollbackL1Mode,
-    pub l1_contracts: L1ContractsSnapshot,
+    pub snapshot: RollbackSnapshot,
+    pub target_contract_state: Option<TargetContractState>,
 }
 
 pub async fn collect_post_target_generations(
@@ -842,8 +840,8 @@ pub async fn generate_rollback_plan(input: &RollbackPlanInput<'_>) -> anyhow::Re
         &pending_ids,
     )
     .await?;
-    let verification = RollbackVerificationSnapshot {
-        latest_info_bytes: input.verification.latest_info_bytes.clone(),
+    let snapshot = RollbackSnapshot {
+        target_info: input.snapshot.target_info.clone(),
         worker_reputation_fields,
     };
 
@@ -855,9 +853,8 @@ pub async fn generate_rollback_plan(input: &RollbackPlanInput<'_>) -> anyhow::Re
         latest_checkpoint_id: input.latest_checkpoint_id,
         latest_pending_id: input.latest_pending_id,
         post_target_generations,
-        l1_mode: input.l1_mode,
-        l1_contracts: input.l1_contracts.clone(),
-        verification,
+        target_contract_state: input.target_contract_state.clone().filter(|state| state.last_finalized_checkpoint_id == input.target_checkpoint_id),
+        snapshot,
         phases: Vec::new(),
     };
 
@@ -1103,9 +1100,8 @@ where
         reward_realm_ids: input.reward_realm_ids.clone(),
         user_transform: input.user_transform,
         imt_snapshot,
-        l1_mode: input.l1_mode,
-        verification: input.verification.clone(),
-        l1_contracts: input.l1_contracts.clone(),
+        snapshot: input.snapshot.clone(),
+        target_contract_state: input.target_contract_state.clone(),
     };
     generate_rollback_plan(&materialized).await
 }
@@ -1349,12 +1345,20 @@ mod tests {
             reward_realm_ids: Vec::new(),
             user_transform: UserTransformParams::default(),
             imt_snapshot: ImtAppendIndexSnapshot::default(),
-            verification: RollbackVerificationSnapshot {
-                latest_info_bytes: String::new(),
+            snapshot: RollbackSnapshot {
+                target_info: String::new(),
                 worker_reputation_fields: Vec::new(),
             },
-            l1_mode: RollbackL1Mode::Validated,
-            l1_contracts: L1ContractsSnapshot { last_finalized_checkpoint_id: Some(6), ..Default::default() },
+            target_contract_state: Some(TargetContractState {
+                last_finalized_checkpoint_id: 6,
+                last_verified_checkpoint_root: None,
+                last_verified_deposit_tree_root: None,
+                last_verified_withdrawal_tree_root: None,
+                withdrawal_subtree_root: None,
+                deposit_root: None,
+                proved_deposit_count: None,
+                pending_deposit_count: None,
+            }),
         };
 
         let error = generate_rollback_plan(&input).await.unwrap_err();
@@ -1379,12 +1383,11 @@ mod tests {
             reward_realm_ids: Vec::new(),
             user_transform: UserTransformParams::default(),
             imt_snapshot: ImtAppendIndexSnapshot::default(),
-            verification: RollbackVerificationSnapshot {
-                latest_info_bytes: "00".into(),
+            snapshot: RollbackSnapshot {
+                target_info: "00".into(),
                 worker_reputation_fields: Vec::new(),
             },
-            l1_mode: RollbackL1Mode::Validated,
-            l1_contracts: L1ContractsSnapshot { last_finalized_checkpoint_id: Some(0), ..Default::default() },
+            target_contract_state: None,
         };
 
         let plan = generate_rollback_plan(&input).await.unwrap();
@@ -1413,6 +1416,44 @@ mod tests {
             .collect();
         let actual_singletons: HashSet<String> = singleton_phase.keys.as_array().unwrap().iter().map(|key| key.as_str().unwrap().to_string()).collect();
         assert_eq!(actual_singletons, expected_singletons);
+    }
+
+    #[tokio::test]
+    async fn generation_retains_only_matching_target_contract_state() {
+        let reader = TestRollbackStateReader { leaves: HashSet::new(), checkpoint_delete_path_keys: HashMap::new() };
+        let temp_enumerator = EmptyTempEnumerator;
+        let backups = BackupKeySource::default();
+        let mut input = RollbackPlanInput {
+            role: RollbackRole::Coordinator,
+            realm_id: 0,
+            realm_sub_id: 0,
+            target_checkpoint_id: 0,
+            latest_checkpoint_id: 0,
+            latest_pending_id: 0,
+            state_reader: &reader,
+            temp_enumerator: &temp_enumerator,
+            backups: &backups,
+            reward_realm_ids: Vec::new(),
+            user_transform: UserTransformParams::default(),
+            imt_snapshot: ImtAppendIndexSnapshot::default(),
+            snapshot: RollbackSnapshot { target_info: "00".into(), worker_reputation_fields: Vec::new() },
+            target_contract_state: None,
+        };
+
+        assert!(generate_rollback_plan(&input).await.unwrap().target_contract_state.is_none());
+        input.target_contract_state = Some(TargetContractState {
+            last_finalized_checkpoint_id: 0,
+            last_verified_checkpoint_root: Some("matching".into()),
+            last_verified_deposit_tree_root: None,
+            last_verified_withdrawal_tree_root: None,
+            withdrawal_subtree_root: None,
+            deposit_root: None,
+            proved_deposit_count: None,
+            pending_deposit_count: None,
+        });
+        assert_eq!(generate_rollback_plan(&input).await.unwrap().target_contract_state, input.target_contract_state);
+        input.target_contract_state.as_mut().unwrap().last_finalized_checkpoint_id = 1;
+        assert!(generate_rollback_plan(&input).await.unwrap().target_contract_state.is_none());
     }
 
     #[tokio::test]

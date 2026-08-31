@@ -1885,6 +1885,10 @@ export type CompilerArtifactFingerprint = {
 export type GenesisContractsArtifactFingerprint = CompilerArtifactFingerprint & {
     artifactSha256: string;
     artifactByteSize: number;
+    tokenArtifactSha256: string;
+    tokenArtifactByteSize: number;
+    tokenUpdateArtifactSha256: string;
+    tokenUpdateArtifactByteSize: number;
 };
 
 export type CompilerArtifactStampMatch = "match" | "missing" | "mismatch";
@@ -1897,7 +1901,11 @@ export function evaluateCompilerArtifactStamp(
     if (actual.compilerRevision !== expected.compilerRevision
         || actual.compilerSourcesHash !== expected.compilerSourcesHash
         || actual.artifactSha256 !== expected.artifactSha256
-        || actual.artifactByteSize !== expected.artifactByteSize) {
+        || actual.artifactByteSize !== expected.artifactByteSize
+        || actual.tokenArtifactSha256 !== expected.tokenArtifactSha256
+        || actual.tokenArtifactByteSize !== expected.tokenArtifactByteSize
+        || actual.tokenUpdateArtifactSha256 !== expected.tokenUpdateArtifactSha256
+        || actual.tokenUpdateArtifactByteSize !== expected.tokenUpdateArtifactByteSize) {
         return "mismatch";
     }
     return "match";
@@ -1980,7 +1988,11 @@ export async function readGenesisContractsArtifactStamp(
         if (typeof parsed.compilerRevision !== "string"
             || typeof parsed.compilerSourcesHash !== "string"
             || typeof parsed.artifactSha256 !== "string"
-            || typeof parsed.artifactByteSize !== "number") {
+            || typeof parsed.artifactByteSize !== "number"
+            || typeof parsed.tokenArtifactSha256 !== "string"
+            || typeof parsed.tokenArtifactByteSize !== "number"
+            || typeof parsed.tokenUpdateArtifactSha256 !== "string"
+            || typeof parsed.tokenUpdateArtifactByteSize !== "number") {
             return null;
         }
         return {
@@ -1988,6 +2000,10 @@ export async function readGenesisContractsArtifactStamp(
             compilerSourcesHash: parsed.compilerSourcesHash,
             artifactSha256: parsed.artifactSha256,
             artifactByteSize: parsed.artifactByteSize,
+            tokenArtifactSha256: parsed.tokenArtifactSha256,
+            tokenArtifactByteSize: parsed.tokenArtifactByteSize,
+            tokenUpdateArtifactSha256: parsed.tokenUpdateArtifactSha256,
+            tokenUpdateArtifactByteSize: parsed.tokenUpdateArtifactByteSize,
         };
     } catch {
         return null;
@@ -2486,6 +2502,8 @@ async function ensureGenesisFiles(cwd: string): Promise<void> {
     const genesisPath = path.join(cwd, "genesis.json");
     const genesisContractsPath = path.join(cwd, "psy-genesis", "genesis_contracts.json");
     const genesisContractsStampPath = path.join(cwd, "psy-genesis", ".genesis_contracts.compiler-artifact.json");
+    const tokenArtifactPath = path.join(cwd, "psy-genesis", "token.json");
+    const tokenUpdateArtifactPath = path.join(cwd, "psy-genesis", "token.update.json");
 
     // The canonical zstd-compressed genesis contracts artifact is owned by
     // the psy-genesis submodule. Plain JSON and Git LFS pointers are invalid.
@@ -2507,11 +2525,17 @@ async function ensureGenesisFiles(cwd: string): Promise<void> {
             throw new Error("[AutoSetup] psy-genesis compiler artifact stamp is malformed or legacy");
         }
         const artifactDigest = await digestFile(genesisContractsPath);
+        const tokenDigest = await digestFile(tokenArtifactPath);
+        const tokenUpdateDigest = await digestFile(tokenUpdateArtifactPath);
         let expected: GenesisContractsArtifactFingerprint = {
             compilerRevision: stamp.compilerRevision,
             compilerSourcesHash: stamp.compilerSourcesHash,
             artifactSha256: artifactDigest.sha256,
             artifactByteSize: artifactDigest.size,
+            tokenArtifactSha256: tokenDigest.sha256,
+            tokenArtifactByteSize: tokenDigest.size,
+            tokenUpdateArtifactSha256: tokenUpdateDigest.sha256,
+            tokenUpdateArtifactByteSize: tokenUpdateDigest.size,
         };
         const compilerPath = path.resolve(resolveProjectsDir(), "psy-compiler");
         if (await exists(path.join(compilerPath, "Makefile"))) {
@@ -2519,6 +2543,10 @@ async function ensureGenesisFiles(cwd: string): Promise<void> {
                 ...(await resolveCompilerArtifactFingerprint(compilerPath)),
                 artifactSha256: artifactDigest.sha256,
                 artifactByteSize: artifactDigest.size,
+                tokenArtifactSha256: tokenDigest.sha256,
+                tokenArtifactByteSize: tokenDigest.size,
+                tokenUpdateArtifactSha256: tokenUpdateDigest.sha256,
+                tokenUpdateArtifactByteSize: tokenUpdateDigest.size,
             };
         }
         if (evaluateCompilerArtifactStamp(stamp, expected) !== "match") {
