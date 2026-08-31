@@ -221,6 +221,16 @@ async fn load_processor_config(args: &CommonArgs) -> anyhow::Result<ProcessorCon
                 None,
                 Vec::new(),
                 None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                None,
+                Vec::new(),
+                None,
+                Vec::new(),
+                None,
+                None,
             )
             .await
             .map(ProcessorConfig::Realm)
