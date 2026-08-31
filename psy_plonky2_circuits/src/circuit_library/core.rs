@@ -46,7 +46,7 @@ where     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + Fi
 
     gcv.register_circuit_triplet(ProvingJobCircuitType::UserEndCap, end_cap_verifier_triplet);
 
-    let guta_circuits = QEDGUTACircuitManager::<C, D>::new_with_config(
+    let guta_circuits = QEDGUTACircuitManager::<C, D>::new_with_config_and_chain_domain(
         &end_cap_common_data,
         end_cap_verifier_data.constants_sigmas_cap.height(),
         circuit_config.global_user_tree_realm_height,
@@ -59,6 +59,7 @@ where     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + Fi
         end_cap_fingerprint,
         default_user_state_tree_root,
         get_default_worker_rewards_tree_tag::<QHashOut<C::F>>(),
+        psy_data::guta::realm_finalize::realm_finalize_guta_chain_domain::<C::F, QHashOut<C::F>, C::Hasher>(network.get_chain_id()),
     );
 
     gcv.register_circuit_triplet(
@@ -102,6 +103,18 @@ where     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + Fi
         guta_circuits.verify_guta_left_linear_right_leaf_upgrade_checkpoint.get_verifier_triplet(),
     );
     gcv.register_circuit_triplet(ProvingJobCircuitType::GUTANoChange, guta_circuits.no_change.get_verifier_triplet());
+    gcv.register_circuit_triplet(
+        ProvingJobCircuitType::RealmFinalizeGUTA,
+        guta_circuits.realm_finalize_guta.get_verifier_triplet(),
+    );
+    gcv.register_circuit_triplet(
+        ProvingJobCircuitType::WrappedSignatureProof,
+        (
+            psy_common_circuit::circuits::traits::qstandard::QStandardCircuit::get_common_circuit_data_ref(&guta_circuits.zk_signature),
+            psy_common_circuit::circuits::traits::qstandard::QStandardCircuit::get_verifier_config_ref(&guta_circuits.zk_signature),
+            QHashOut(psy_common_circuit::circuits::traits::qstandard::QStandardCircuit::get_fingerprint(&guta_circuits.zk_signature).0),
+        ),
+    );
     let coordinator_circuits = QEDCoordinatorCircuitManager::<C, D>::new_with_guta(
         guta_circuits,
         circuit_config.global_user_tree_height,

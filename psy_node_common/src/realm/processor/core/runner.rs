@@ -1,6 +1,10 @@
 
 use cf_utils::log_indicator::print_cf_log_indicator;
-use parth_core::protocol::core_types::QNetworkTypesConfig;
+use parth_core::{
+    crypto::hash::traits::HashTo4Felts,
+    felt::ToU64Value,
+    protocol::core_types::QNetworkTypesConfig,
+};
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
@@ -11,7 +15,7 @@ use psy_node_core::{
 };
 use tokio::time::sleep;
 
-use crate::realm::processor::core::PsyRealmProcessor;
+use crate::{p2p::guta_submit::GutaSubmitError, realm::processor::core::PsyRealmProcessor};
 
 pub async fn run_realm_processor_loop<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
@@ -80,10 +84,26 @@ where
                         tracing::info!("Generated GUTA Realm update in {}ms at slot {}", duration_ms, current_slot);
                     }
                     Err(e) => {
-                        let error = format!("realm process_block failed at slot {}: {:#}", current_slot, e);
-                        processor.db.status.require_recovery(error.clone());
-                        tracing::error!("[REALM] Fatal error processing block: {:?}, took {}ms at slot {}; processor parked in Error state until manually restarted", e, duration_ms, current_slot);
-                        print_cf_log_indicator("PSY_REALM_PROCESSOR_ERROR", &format!("R{}_{}", realm_id, realm_sub_id));
+                        if e.downcast_ref::<GutaSubmitError>().is_some_and(|submit| submit.is_retryable()) {
+                            tracing::warn!(
+                                "[REALM] Retryable process_block rejection at slot {} after {}ms: {:#}",
+                                current_slot,
+                                duration_ms,
+                                e
+                            );
+                            if let Err(error) = processor.db.sync_to_coordinator_set_checkpoint_id().await {
+                                tracing::warn!(
+                                    "realm P2P retryable rejection metadata sync failed sub_id={} error={:#}",
+                                    processor.db.state.realm_sub_id_u64,
+                                    error
+                                );
+                            }
+                        } else {
+                            let error = format!("realm process_block failed at slot {}: {:#}", current_slot, e);
+                            processor.db.status.require_recovery(error.clone());
+                            tracing::error!("[REALM] Fatal error processing block: {:?}, took {}ms at slot {}; processor parked in Error state until manually restarted", e, duration_ms, current_slot);
+                            print_cf_log_indicator("PSY_REALM_PROCESSOR_ERROR", &format!("R{}_{}", realm_id, realm_sub_id));
+                        }
                     }
                 }
             } else {

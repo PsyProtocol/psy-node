@@ -662,6 +662,9 @@ impl QTempDatabaseRawKVWriterBase for StandardFredRedisStore {
     async fn qtdb_raw_kv_put_value(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
         self.set_bytes_generic_internal(&self.kv_store_namespace, key, value).await
     }
+    async fn qtdb_raw_kv_put_value_if_absent(&self, key: &[u8], value: &[u8]) -> anyhow::Result<bool> {
+        Ok(self.client.hsetnx(&self.kv_store_namespace, key, value).await?)
+    }
 
     async fn qtdb_raw_kv_delete_key(&self, key: &[u8]) -> anyhow::Result<()> {
         let _: () = self.client.hdel(&self.kv_store_namespace, key).await?;

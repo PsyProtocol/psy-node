@@ -75,6 +75,7 @@ pub fn get_genesis_block_setup_data_for_local_devnet_default() -> anyhow::Result
         },
         deposit_tree_root: PoseidonHasher::get_zero_hash(32),
         withdrawal_tree_root: PoseidonHasher::get_zero_hash(32),
+        validators: vec![],
     })
 }
 

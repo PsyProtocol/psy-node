@@ -909,6 +909,7 @@ mod tests {
             user_tree_root: user_tree_proof.root,
             withdrawal_tree_root: qhash(8_000),
             user_registration_tree_root: qhash(9_000),
+            validator_tree_root: qhash(10_000),
         };
         (deposit, withdrawal, global_roots)
     }

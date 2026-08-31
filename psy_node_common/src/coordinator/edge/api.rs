@@ -30,12 +30,21 @@ use psy_node_core::{
     store::traits::proof_store::QParthProofStore,
 };
 
-use crate::{coordinator::edge::handler::CoordinatorEdgeHandler, realm::edge::error::RpcError};
+use crate::{
+    coordinator::edge::handler::CoordinatorEdgeHandler,
+    p2p::guta_submit::GutaSubmitError,
+    realm::edge::error::RpcError,
+};
 
 type QRpcResult<T> = RpcResult<T>;
 
 fn res<T>(data: anyhow::Result<T>) -> QRpcResult<T> {
     Ok(data.map_err(RpcError::Anyhow)?)
+}
+
+fn res_guta(data: Result<(), GutaSubmitError>) -> QRpcResult<String> {
+    data.map_err(RpcError::GutaSubmit)?;
+    Ok("ok".to_string())
 }
 
 const MAX_CHECKPOINT_ID: u64 = i64::MAX as u64;
@@ -82,9 +91,10 @@ impl<
         input: GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
         proof: Vec<u8>,
         _realm_id: u64,
+        proposal: Option<Vec<u8>>,
+        certificate: Option<Vec<u8>>,
     ) -> QRpcResult<String> {
-        res(self.submit_guta_internal(input, proof).await)?;
-        Ok("ok".to_string())
+        res_guta(self.submit_guta_internal(input, proof, proposal, certificate).await.map_err(GutaSubmitError::from))
     }
 
     async fn get_user_ids_for_public_key(&self, public_key: N::QHash, start_user_id: u64, count: u32) -> QRpcResult<Vec<u64>> {

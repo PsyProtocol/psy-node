@@ -432,6 +432,15 @@ impl QTempDatabaseRawKVWriterBase for InMemoryTempStore {
         self.kv_store.insert(key.to_vec(), value.to_vec());
         Ok(())
     }
+    async fn qtdb_raw_kv_put_value_if_absent(&self, key: &[u8], value: &[u8]) -> anyhow::Result<bool> {
+        match self.kv_store.entry(key.to_vec()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => Ok(false),
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(value.to_vec());
+                Ok(true)
+            }
+        }
+    }
 
     async fn qtdb_raw_kv_delete_key(&self, key: &[u8]) -> anyhow::Result<()> {
         self.kv_store.remove(key);

@@ -7,6 +7,7 @@ pub mod dash_tree;
 pub mod traits;
 pub mod dash_tree_recorder;
 pub mod mem_tree_recorder;
+pub use mem_tree_recorder::SnapshotId;
 pub mod dash_tree_append_only;
 pub mod dash_tag_tree_store;
 pub mod dash_tree_append_only_recorder;

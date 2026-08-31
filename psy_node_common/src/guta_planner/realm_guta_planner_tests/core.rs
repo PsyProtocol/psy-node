@@ -150,6 +150,11 @@ pub async fn setup_rgp_test_db(store: Arc<InMemoryTestStore>) -> anyhow::Result<
         "user_registration_tree_table",
         PsyRGPNetworkConfig::GLOBAL_USER_TREE_HEIGHT,
     ));
+    let validator_tree_table = Arc::new(InMemoryTableIdentifier::new_treee_with_keyspace(
+        &keyspace,
+        "validator_tree_table",
+        psy_data::guta::realm_finalize::VALIDATOR_TREE_HEIGHT as u8,
+    ));
     let global_contract_tree_table = Arc::new(InMemoryTableIdentifier::new_treee_with_keyspace(
         &keyspace,
         "global_contract_tree_table",
@@ -197,6 +202,7 @@ pub async fn setup_rgp_test_db(store: Arc<InMemoryTestStore>) -> anyhow::Result<
         guta_reward_tag_tree_table,
         // added tables for completeness
         user_registration_tree_table,
+        validator_tree_table,
         global_contract_tree_table,
         contract_function_tree_table,
         contract_leaf_table,

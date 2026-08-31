@@ -1,17 +1,19 @@
 use kvq::traits::KVQSerializable;
 use plonky2::{
     field::goldilocks_field::GoldilocksField,
-    hash::hash_types::{HashOut, RichField},
+    hash::{hash_types::{HashOut, RichField}, poseidon::PoseidonHash},
 };
 use psy_client_common::{
     data::qhashout::QHashOut,
     traits::to_qfelts::{QFeltSized, ToQFelts},
 };
+use psy_crypto::hash::traits::{
+    hasher::{FieldQHasher, MerkleZeroHasher},
+    qhashable::QFieldHashable,
+};
 use psy_config::network_constants::DA_CHALLENGE_WINDOW;
-use psy_crypto::hash::traits::{hasher::FieldQHasher, qhashable::QFieldHashable};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
-
 use super::{pm_jobs_completed_stats::PMJobsCompletedStats, pm_reward_commitment::PMRewardCommitment};
 use crate::qsync::coordinator::PsyCheckpointSyncInfoCompact;
 
@@ -152,6 +154,16 @@ pub struct PsyCheckpointGlobalStateRoots<F: RichField> {
     pub user_tree_root: QHashOut<F>,
     pub withdrawal_tree_root: QHashOut<F>,
     pub user_registration_tree_root: QHashOut<F>,
+    pub validator_tree_root: QHashOut<F>,
+}
+
+/// Height of the checkpoint validator tree: coordinator user-tree height (12)
+/// plus 8 sub-id bits. Empty-tree root is `get_zero_hash(this)`, not `[0;32]`.
+pub const VALIDATOR_TREE_HEIGHT: usize = 20;
+
+/// Poseidon empty-tree root at [`VALIDATOR_TREE_HEIGHT`].
+pub fn empty_validator_tree_root() -> QHashOut<GoldilocksField> {
+    PoseidonHash::get_zero_hash(VALIDATOR_TREE_HEIGHT)
 }
 
 impl<F: RichField> KVQSerializable for PsyCheckpointGlobalStateRoots<F> {
@@ -166,7 +178,7 @@ impl<F: RichField> KVQSerializable for PsyCheckpointGlobalStateRoots<F> {
 
 impl<F: RichField> QFeltSized for PsyCheckpointGlobalStateRoots<F> {
     fn q_felt_size() -> usize {
-        20
+        24
     }
 }
 impl<F: RichField> ToQFelts<F> for PsyCheckpointGlobalStateRoots<F> {
@@ -177,7 +189,7 @@ impl<F: RichField> ToQFelts<F> for PsyCheckpointGlobalStateRoots<F> {
         result.extend_from_slice(&self.user_tree_root.0.elements);
         result.extend_from_slice(&self.withdrawal_tree_root.0.elements);
         result.extend_from_slice(&self.user_registration_tree_root.0.elements);
-
+        result.extend_from_slice(&self.validator_tree_root.0.elements);
         result
     }
 
@@ -200,12 +212,16 @@ impl<F: RichField> ToQFelts<F> for PsyCheckpointGlobalStateRoots<F> {
         let user_registration_tree_root = QHashOut(HashOut {
             elements: [felts[16], felts[17], felts[18], felts[19]],
         });
+        let validator_tree_root = QHashOut(HashOut {
+            elements: [felts[20], felts[21], felts[22], felts[23]],
+        });
         PsyCheckpointGlobalStateRoots {
             contract_tree_root,
             deposit_tree_root,
             user_tree_root,
             withdrawal_tree_root,
             user_registration_tree_root,
+            validator_tree_root,
         }
     }
 }
@@ -217,8 +233,8 @@ impl<F: RichField> QFieldHashable<F> for PsyCheckpointGlobalStateRoots<F> {
         let user_and_withdrawal = H::q_two_to_one(self.user_tree_root, self.withdrawal_tree_root);
 
         let base_combo = H::q_two_to_one(contract_and_deposit, user_and_withdrawal);
-
-        H::q_two_to_one(base_combo, self.user_registration_tree_root)
+        let reg_and_validator = H::q_two_to_one(self.user_registration_tree_root, self.validator_tree_root);
+        H::q_two_to_one(base_combo, reg_and_validator)
     }
 }
 
@@ -494,3 +510,20 @@ impl<F: RichField + Serialize + for<'de> Deserialize<'de>> KVQSerializable for C
 //         }
 //     }
 // }
+
+
+#[cfg(test)]
+mod tests {
+    use super::{empty_validator_tree_root, VALIDATOR_TREE_HEIGHT};
+    use plonky2::hash::poseidon::PoseidonHash;
+    use psy_client_common::data::qhashout::QHashOut;
+    use psy_crypto::hash::traits::hasher::MerkleZeroHasher;
+
+    #[test]
+    fn empty_validator_tree_root_is_poseidon_zero_hash_at_height_20() {
+        let root = empty_validator_tree_root();
+        assert_ne!(root, QHashOut::ZERO);
+        assert_eq!(root, PoseidonHash::get_zero_hash(VALIDATOR_TREE_HEIGHT));
+        assert_eq!(VALIDATOR_TREE_HEIGHT, 20);
+    }
+}

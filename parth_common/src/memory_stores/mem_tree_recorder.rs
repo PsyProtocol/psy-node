@@ -10,10 +10,27 @@ use parth_core::{
     utils::math::ceil_div_usize,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotId(usize);
+
+impl SnapshotId {
+    pub fn as_index(self) -> usize {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone)]
+struct JournalEntry<Hash> {
+    key: SimpleMerkleNodeKey,
+    old_value: Hash,
+    new_value: Hash,
+}
+
 #[derive(Debug, Clone)]
 pub struct SimpleMemoryMerkleRecorderStore<Hasher, Hash: Copy + PartialEq + Default + Debug> {
     nodes: HashMap<SimpleMerkleNodeKey, Hash>,
     updated_nodes: HashMap<SimpleMerkleNodeKey, Hash>,
+    journal: Vec<JournalEntry<Hash>>,
     height: u8,
     effective_height: u8,
     _hasher: PhantomData<Hasher>,
@@ -25,6 +42,7 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default + Debug>
         Self {
             nodes: HashMap::new(),
             updated_nodes: HashMap::new(),
+            journal: Vec::new(),
             height,
             effective_height: height,
             _hasher: PhantomData::default(),
@@ -86,7 +104,7 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default + Debug>
         let mut current_old_hash = dmp.old_value;
         let mut current_new_hash = dmp.new_value;
         self.nodes.insert(current_key, current_old_hash);
-        self.updated_nodes.insert(base_key, current_new_hash);
+        self.set_node_value(base_key, current_new_hash);
 
         for sibling_hash in &dmp.siblings {
             let sibling_key = current_key.sibling();
@@ -104,7 +122,7 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default + Debug>
             };
 
             self.nodes.insert(current_key, current_old_hash);
-            self.updated_nodes.insert(base_key, current_new_hash);
+            self.set_node_value(base_key, current_new_hash);
             current_key = current_key.parent();
         }
         Ok(())
@@ -113,6 +131,7 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default + Debug>
         Self {
             nodes,
             updated_nodes: HashMap::new(),
+            journal: Vec::new(),
             height,
             effective_height: height,
             _hasher: PhantomData::default(),
@@ -223,13 +242,61 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default + Debug>
         Ok(())
     }
     pub fn commit_changes(&mut self) {
-        for entry in self.updated_nodes.iter() {
-            self.nodes.insert(*entry.0, *entry.1);
+        for entry in &self.journal {
+            self.nodes.insert(entry.key, entry.new_value);
         }
         self.updated_nodes.clear();
+        self.journal.clear();
     }
     pub fn revert_changes(&mut self) {
-        self.updated_nodes.clear();
+        self.revert_to(SnapshotId(0));
+    }
+    pub fn snapshot(&self) -> SnapshotId {
+        SnapshotId(self.journal.len())
+    }
+    pub fn get_node_value_at(&self, snapshot: SnapshotId, key: SimpleMerkleNodeKey) -> Hash {
+        self.replay_node_at(snapshot.0, &key)
+    }
+    pub fn get_root_at(&self, snapshot: SnapshotId) -> Hash {
+        self.get_node_value_at(snapshot, SimpleMerkleNodeKey::new_root())
+    }
+    pub fn get_leaf_at(&self, snapshot: SnapshotId, index: u64) -> MerkleProofCore<Hash> {
+        let leaf_key = SimpleMerkleNodeKey::new(self.height, index);
+        let value = self.get_node_value_at(snapshot, leaf_key);
+        let mut current_sibling = leaf_key.sibling();
+        let mut siblings = Vec::with_capacity(self.height as usize);
+        while current_sibling.level > 0 {
+            siblings.push(self.get_node_value_at(snapshot, current_sibling));
+            current_sibling = current_sibling.parent().sibling();
+        }
+        MerkleProofCore {
+            index,
+            siblings,
+            root: self.get_root_at(snapshot),
+            value,
+        }
+    }
+    pub fn revert_to(&mut self, snapshot: SnapshotId) {
+        let start = snapshot.0.min(self.journal.len());
+        for entry in self.journal[start..].iter().rev() {
+            let zero = Hasher::get_zero_hash((self.height - entry.key.level) as usize);
+            if entry.old_value == zero && !self.nodes.contains_key(&entry.key) {
+                self.updated_nodes.remove(&entry.key);
+            } else {
+                self.updated_nodes.insert(entry.key, entry.old_value);
+            }
+        }
+        self.journal.truncate(start);
+        self.updated_nodes.retain(|key, value| self.nodes.get(key) != Some(value));
+    }
+    fn replay_node_at(&self, journal_len: usize, key: &SimpleMerkleNodeKey) -> Hash {
+        let bound = journal_len.min(self.journal.len());
+        for entry in self.journal[..bound].iter().rev() {
+            if &entry.key == key {
+                return entry.new_value;
+            }
+        }
+        self.get_last_commit_node(key)
     }
     pub fn get_height(&self) -> u8 {
         self.height
@@ -241,13 +308,23 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default + Debug>
         (1u64 << (self.height as u64)) - 1u64
     }
     pub fn set_node_value(&mut self, key: SimpleMerkleNodeKey, value: Hash) {
+        let old_value = self.get_node_value(&key);
+        if old_value == value {
+            return;
+        }
         self.updated_nodes.insert(key, value);
+        self.journal.push(JournalEntry {
+            key,
+            old_value,
+            new_value: value,
+        });
     }
     pub fn set_node_value_nodes_no_updated(&mut self, key: SimpleMerkleNodeKey, value: Hash) {
         self.nodes.insert(key, value);
     }
     pub fn clear_changes_remove_committed_leaves_and_rehash(&mut self, start_leaf_index: u64, end_leaf_index: u64) {
         self.updated_nodes.clear();
+        self.journal.clear();
         for i in start_leaf_index..end_leaf_index {
             self.nodes.remove(&SimpleMerkleNodeKey {
                 level: self.height,
@@ -1341,7 +1418,7 @@ mod tests {
 
     use cf_utils::timer::DebugTimer;
     use parth_core::{
-        crypto::hash::traits::MerkleHasher,
+        crypto::hash::traits::{MerkleHasher, MerkleZeroHasher},
         data::hash::{hash256::Hash256, merkle_node_key::SimpleMerkleNodeKey},
         pgoldilocks::PoseidonHasher,
         protocol::core_types::Q256BitHash,
@@ -1738,5 +1815,50 @@ mod tests {
             ensure_spiderman_compatability_comprehensive_b(i, 13);
             ensure_spiderman_compatability_comprehensive_b(i, 15);
         }
+    }
+
+    #[test]
+    fn snapshot_reads_and_revert_to_preserve_history() {
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(4);
+        let empty = tree.snapshot();
+        let empty_root = tree.get_root();
+        let leaf_a = Hash::rand();
+        let leaf_b = Hash::rand();
+        tree.set_leaf(1, leaf_a);
+        let after_a = tree.snapshot();
+        let root_a = tree.get_root();
+        let proof_a = tree.get_leaf(1);
+        tree.set_leaf(2, leaf_b);
+        let after_b = tree.snapshot();
+        let root_b = tree.get_root();
+        assert_ne!(root_a, root_b);
+        assert_eq!(tree.get_root_at(empty), empty_root);
+        assert_eq!(tree.get_root_at(after_a), root_a);
+        assert_eq!(tree.get_root_at(after_b), root_b);
+        assert_eq!(tree.get_node_value_at(after_a, SimpleMerkleNodeKey::new(4, 1)), leaf_a);
+        assert_eq!(tree.get_leaf_at(after_a, 1).value, proof_a.value);
+        assert_eq!(tree.get_leaf_at(after_a, 1).root, proof_a.root);
+        assert_eq!(tree.get_leaf_at(after_a, 1).siblings, proof_a.siblings);
+        tree.revert_to(after_a);
+        assert_eq!(tree.get_root(), root_a);
+        assert_eq!(tree.get_leaf(1).value, leaf_a);
+        assert_eq!(tree.get_leaf_value(2), Hasher::get_zero_hash(0));
+        tree.revert_to(empty);
+        assert_eq!(tree.get_root(), empty_root);
+    }
+
+    #[test]
+    fn commit_changes_moves_journal_into_nodes() {
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(4);
+        let leaf = Hash::rand();
+        tree.set_leaf(3, leaf);
+        let live_root = tree.get_root();
+        tree.commit_changes();
+        assert!(tree.get_changes().is_empty());
+        assert_eq!(tree.snapshot(), super::SnapshotId(0));
+        assert_eq!(tree.get_root(), live_root);
+        assert_eq!(tree.get_last_commit_root(), live_root);
+        tree.revert_changes();
+        assert_eq!(tree.get_root(), live_root);
     }
 }

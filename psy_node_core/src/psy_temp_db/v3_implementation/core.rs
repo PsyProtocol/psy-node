@@ -450,6 +450,16 @@ impl<T: QTempDatabaseRawKVWriterBase + Sync> QTempDBSubmitStatusWriter for T {
         let value = status.to_le_bytes();
         self.qtdb_raw_kv_put_value(&key, &value).await
     }
+    async fn put_submitted_status_if_absent(
+        &self,
+        rid: &QRealmIdentifier,
+        unique_pending_id: u64,
+        user_or_realm_id: u64,
+        status: u64,
+    ) -> anyhow::Result<bool> {
+        let key = tt_get_submit_status_key(rid.realm_id, rid.realm_sub_id, unique_pending_id, user_or_realm_id);
+        self.qtdb_raw_kv_put_value_if_absent(&key, &status.to_le_bytes()).await
+    }
 }
 
 #[async_trait]

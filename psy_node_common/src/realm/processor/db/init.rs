@@ -28,7 +28,7 @@ use psy_data::{
 use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
     genesis::genesis_db_data_builder::GenesisDatabaseDataBuilder,
-    p2p::traits::realm_coordinantor::RealmCoordinatorClient,
+    p2p::{traits::realm_coordinantor::RealmCoordinatorClient, validator_lookup::write_validator_tree_genesis},
     psy_core_db::traits::full::{
         PsyNodeCheckpointTreeDatabaseReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore,
     },
@@ -38,11 +38,18 @@ use psy_node_core::{
 };
 
 use crate::{
-    backup::{checkpoint_tree::CheckpointTreeBackupManager, realm::generate_realm_output_from_backups},
+    backup::{
+        checkpoint_tree::CheckpointTreeBackupManager,
+        realm::generate_realm_output_from_backups,
+    },
     constants::queue::PQ_REALM_SUBMIT_USER_UPDATE_QUEUE_TOPIC_ID,
     queue::gatherer::QueueKeyStatusManager,
-    realm::processor::db::{DatabaseCheckState, PsyRealmDatabaseProcessor},
-    realm::processor::gatherers::realm_end_cap_gatherer::{get_new_realm_end_cap_gatherer_backup_file_path, read_realm_backup_end_root},
+    realm::processor::{
+        db::{DatabaseCheckState, PsyRealmDatabaseProcessor},
+        gatherers::realm_end_cap_gatherer::{
+            get_new_realm_end_cap_gatherer_backup_file_path, read_realm_backup_end_root,
+        },
+    },
     utils::processor_status::ProcessorStatus,
 };
 
@@ -382,6 +389,12 @@ where
                 false,
             )
             .await?;
+            write_validator_tree_genesis(
+                &*self.db,
+                &genesis_block_update.update_validator_tree_nodes_ffs,
+                &genesis_block_update.new_validator_leaf_preimages,
+            )
+            .await?;
             tracing::info!("Genesis block setup data applied.");
         }
         Ok(())
@@ -391,14 +404,24 @@ where
         let database_check_state = self.get_database_check_state().await?;
         if database_check_state == DatabaseCheckState::NeedsGenesis {
             tracing::info!("Applying genesis block setup data to realm processor database...");
-            let genesis_block_update =
-                GenesisDatabaseDataBuilder::setup_for_realm::<N::HasherBase, N>(&genesis_data, self.state.realm_id_u64, self.state.realm_sub_id_u64)?;
+            let genesis_block_update = GenesisDatabaseDataBuilder::setup_for_realm::<N::HasherBase, N>(
+                &genesis_data,
+                self.state.chain_id,
+                self.state.realm_id_u64,
+                self.state.realm_sub_id_u64,
+            )?;
             self.commit_state(
                 &genesis_block_update.coordinator_update,
                 &genesis_block_update.prepared_updates,
                 ProvingJobCircuitType::GUTANoChange,
                 vec![],
                 false,
+            )
+            .await?;
+            write_validator_tree_genesis(
+                &*self.db,
+                &genesis_block_update.update_validator_tree_nodes_ffs,
+                &genesis_block_update.new_validator_leaf_preimages,
             )
             .await?;
             tracing::info!("Genesis block setup data applied.");

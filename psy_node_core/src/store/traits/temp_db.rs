@@ -36,6 +36,7 @@ pub trait QTempDatabaseRawKVReaderBase {
 #[auto_impl(&, Arc)]
 pub trait QTempDatabaseRawKVWriterBase {
     async fn qtdb_raw_kv_put_value(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()>;
+    async fn qtdb_raw_kv_put_value_if_absent(&self, key: &[u8], value: &[u8]) -> anyhow::Result<bool>;
     async fn qtdb_raw_kv_delete_key(&self, key: &[u8]) -> anyhow::Result<()>;
     async fn qtdb_raw_kv_put_many_values(&self, entries: &[QPDPair<Vec<u8>, Vec<u8>>]) -> anyhow::Result<()>;
     async fn qtdb_raw_kv_put_many_values_tuple(&self, entries: &[(Vec<u8>, Vec<u8>)]) -> anyhow::Result<()>;

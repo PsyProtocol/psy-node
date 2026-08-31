@@ -821,6 +821,7 @@ pub async fn run_prove_bridge_agg_with_result(
             user_tree_root: to_core_hash(roots.user_tree_root),
             withdrawal_tree_root: to_core_hash(roots.withdrawal_tree_root),
             user_registration_tree_root: to_core_hash(roots.user_registration_tree_root),
+            validator_tree_root: to_core_hash(roots.validator_tree_root),
         }
     };
 

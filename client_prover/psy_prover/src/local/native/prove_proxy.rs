@@ -1121,6 +1121,7 @@ impl ProveProxyRpcServer for ProveProxyServerProvider {
                     .map_err(|e| ErrorObjectOwned::owned(1, "parse withdrawal_tree_root", Some(e.to_string())))?,
                 user_registration_tree_root: parse_qhash(&input.final_checkpoint_global_state_roots.user_registration_tree_root)
                     .map_err(|e| ErrorObjectOwned::owned(1, "parse user_registration_tree_root", Some(e.to_string())))?,
+                validator_tree_root: Default::default(),
             };
 
             // Parse witnesses (slot witnesses are the full TreeRootInContractStateWitnessInput)

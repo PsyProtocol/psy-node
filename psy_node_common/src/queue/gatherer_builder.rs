@@ -23,7 +23,15 @@ pub trait QueueGathererItemBuilderWithTree<C, Tree>: Sized {
     async fn update_from_queue_item_with_tree(&mut self, tree: &mut Tree, item: Vec<u8>) -> anyhow::Result<()>;
     async fn update_from_many_queue_items_with_tree(&mut self, tree: &mut Tree, item: Vec<Vec<u8>>) -> anyhow::Result<()>;
     async fn finalize_with_tree(self, tree: &mut Tree) -> anyhow::Result<Self::Output>;
+    async fn apply_fast_forward_with_tree(
+        _tree: &mut Tree,
+        _config: &C,
+        _state_updates: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("this gatherer does not support FastForward")
+    }
 }
+
 
 
 #[async_trait]

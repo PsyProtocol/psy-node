@@ -52,6 +52,7 @@ parth_crypto = { workspace = true }
 parth_common = { workspace = true }
 psy_core = { workspace = true }
 psy_crypto = { workspace = true }
+psy_client_common = { workspace = true }
 psy_io = { workspace = true }
 psy_common = { workspace = true }
 psy_data = { workspace = true }
@@ -61,6 +62,9 @@ thiserror = { workspace = true }
 psy_node_store_memory = { workspace = true }
 ts-rs = { workspace = true }
 chrono = { workspace = true}
+libp2p = { workspace = true }
+libp2p-identity = { workspace = true }
+sha2 = { workspace = true }
 
 
 [dev-dependencies]

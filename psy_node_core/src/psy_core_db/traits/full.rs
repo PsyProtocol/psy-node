@@ -12,7 +12,7 @@ use parth_core::{
         }
     
 };
-use psy_data::{protocol::verifiable_checkpoint_transition::PsyVerifiableCheckpointTransitionWithProof, v1::qdata::{
+use psy_data::{p2p::ValidatorLeafPreimage, protocol::verifiable_checkpoint_transition::PsyVerifiableCheckpointTransitionWithProof, v1::qdata::{
     checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
     contract::{ContractCodeDefinition, ContractCodeDefinitionWithContractId, PQEDContractLeafV2},
     public_key::PZKPublicKeyInfo,
@@ -52,6 +52,26 @@ pub trait PsyNodeUserRegistrationTreeDatabaseWriter<Hash> {
     async fn user_registration_tree_set_leaf_hash(&self, checkpoint_id: u64, leaf_index: u64, value: Hash) -> anyhow::Result<DeltaMerkleProofCore<Hash>>;
     async fn user_registration_tree_set_nodes(&self, checkpoint_id: u64, nodes: &[SimpleMerkleNode<Hash>]) -> anyhow::Result<()>;
     async fn user_registration_tree_set_nodes_ffs(&self, checkpoint_id: u64, data: &[u8]) -> anyhow::Result<()>;
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait PsyNodeValidatorTreeDatabaseReader<Hash> {
+    async fn validator_tree_get_leaf_hash(&self, checkpoint_id: u64, leaf_index: u64) -> anyhow::Result<Hash>;
+    async fn validator_tree_get_root_hash(&self, checkpoint_id: u64) -> anyhow::Result<Hash>;
+    async fn validator_tree_get_merkle_proof(&self, checkpoint_id: u64, leaf_index: u64) -> anyhow::Result<MerkleProofCore<Hash>>;
+    async fn validator_tree_get_nodes(&self, checkpoint_id: u64, keys: &[SimpleMerkleNodeKey]) -> anyhow::Result<Vec<Hash>>;
+    async fn validator_tree_get_node(&self, checkpoint_id: u64, key: SimpleMerkleNodeKey) -> anyhow::Result<Hash>;
+    async fn validator_tree_get_leaf_preimage(&self, checkpoint_id: u64, leaf_index: u64) -> anyhow::Result<Option<ValidatorLeafPreimage>>;
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait PsyNodeValidatorTreeDatabaseWriter<Hash> {
+    async fn validator_tree_set_leaf_hash(&self, checkpoint_id: u64, leaf_index: u64, value: Hash) -> anyhow::Result<DeltaMerkleProofCore<Hash>>;
+    async fn validator_tree_set_nodes(&self, checkpoint_id: u64, nodes: &[SimpleMerkleNode<Hash>]) -> anyhow::Result<()>;
+    async fn validator_tree_set_nodes_ffs(&self, checkpoint_id: u64, data: &[u8]) -> anyhow::Result<()>;
+    async fn validator_tree_set_leaf_preimage(&self, checkpoint_id: u64, leaf_index: u64, preimage: &ValidatorLeafPreimage) -> anyhow::Result<()>;
 }
 
 #[async_trait]
@@ -251,7 +271,6 @@ pub trait PsyNodeContractFunctionTreeDatabaseWriter<Hash> {
     async fn contract_function_tree_set_nodes(&self, checkpoint_id: u64, nodes: &[QMerkleStoreSingleIdNode<Hash>]) -> anyhow::Result<()>;
     async fn contract_function_tree_set_nodes_ffs(&self, checkpoint_id: u64, data: &[u8]) -> anyhow::Result<()>;
 }
-
 #[async_trait]
 #[auto_impl(&, Arc)]
 pub trait PsyNodeCheckpointObjectDatabaseReader<F, Hash> {
@@ -494,6 +513,7 @@ pub trait PsyCoordinatorEdgeAPIStoreReader<F, Hash>:
     + PsyNodeContractFunctionTreeDatabaseReader<Hash>
     + PsyNodeGlobalContractTreeDatabaseReader<Hash>
     + PsyNodeUserRegistrationTreeDatabaseReader<Hash>
+    + PsyNodeValidatorTreeDatabaseReader<Hash>
     + PsyNodeCheckpointTransitionZKProofDatabaseReader<F, Hash>
     + PsyNodeCoordinatorSpecificDatabaseReader<F, Hash>
 {
@@ -510,6 +530,7 @@ impl<
             + PsyNodeContractFunctionTreeDatabaseReader<Hash>
             + PsyNodeGlobalContractTreeDatabaseReader<Hash>
             + PsyNodeUserRegistrationTreeDatabaseReader<Hash>
+            + PsyNodeValidatorTreeDatabaseReader<Hash>
         + PsyNodeCheckpointTransitionZKProofDatabaseReader<F, Hash>
         + PsyNodeCoordinatorSpecificDatabaseReader<F, Hash>,
         F,
@@ -524,7 +545,8 @@ pub trait PsyCoordinatorProcessorStore<F, Hash>:
     // 2. User Registration Tree (R/W)
     + PsyNodeUserRegistrationTreeDatabaseReader<Hash>
     + PsyNodeUserRegistrationTreeDatabaseWriter<Hash>
-    // 3. Global User Tree (R/W)
+    + PsyNodeValidatorTreeDatabaseReader<Hash>
+    + PsyNodeValidatorTreeDatabaseWriter<Hash>
     + PsyNodeGlobalUserTreeDatabaseReader<Hash>
     + PsyNodeGlobalUserTreeDatabaseWriter<Hash>
     // 4. Global Contract Tree (R/W)
@@ -561,7 +583,8 @@ impl<
             + PsyNodeCheckpointTreeDatabaseWriter<Hash>
             + PsyNodeUserRegistrationTreeDatabaseReader<Hash>
             + PsyNodeUserRegistrationTreeDatabaseWriter<Hash>
-            // All other traits needed for the processor
+            + PsyNodeValidatorTreeDatabaseReader<Hash>
+            + PsyNodeValidatorTreeDatabaseWriter<Hash>
             + PsyNodeGlobalUserTreeDatabaseReader<Hash>
             + PsyNodeGlobalUserTreeDatabaseWriter<Hash>
             + PsyNodeUserContractTreeDatabaseReader<Hash>
@@ -599,7 +622,8 @@ pub trait PsyRealmProcessorStore<F, Hash>:
 
     + PsyNodeGlobalUserTreeDatabaseReader<Hash>
     + PsyNodeGlobalUserTreeDatabaseWriter<Hash>
-
+    + PsyNodeValidatorTreeDatabaseReader<Hash>
+    + PsyNodeValidatorTreeDatabaseWriter<Hash>
     // 6. Rewards Tag Tree (R/W)
     + PsyNodeCoreRewardsTagTreeStoreReader<F, Hash>
     + PsyNodeCoreRewardsTagTreeStoreWriter<F, Hash>
@@ -628,7 +652,8 @@ impl<
 
         + PsyNodeGlobalUserTreeDatabaseReader<Hash>
         + PsyNodeGlobalUserTreeDatabaseWriter<Hash>
-
+        + PsyNodeValidatorTreeDatabaseReader<Hash>
+        + PsyNodeValidatorTreeDatabaseWriter<Hash>
         // 6. Rewards Tag Tree (R/W)
         + PsyNodeCoreRewardsTagTreeStoreReader<F, Hash>
         + PsyNodeCoreRewardsTagTreeStoreWriter<F, Hash>

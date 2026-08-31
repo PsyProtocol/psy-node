@@ -82,6 +82,7 @@ pub async fn setup_psy_scylla_database_store<N: QNetworkDatabaseTypes>(
     let guta_reward_tag_tree_table = store.init_std_table::<ExTagTreeTableIdentifier>("guta_reward_tag_tree_table", get_rk(23)).await?;
     // added tables for completeness
     let user_registration_tree_table = store.init_zero_id_merkle_table("user_registration_tree_table", get_rk(24), N::GLOBAL_USER_TREE_HEIGHT).await?;
+    let validator_tree_table = store.init_zero_id_merkle_table("validator_tree_table", get_rk(33), 20u8).await?;
     let global_contract_tree_table = store.init_zero_id_merkle_table("global_contract_tree_table", get_rk(25), N::GLOBAL_CONTRACT_TREE_HEIGHT).await?;
     let contract_function_tree_table = store.init_std_table::<ExSingleIdMerkleTableIdentifier>("contract_function_tree_table", get_rk(26)).await?;
     let contract_leaf_table = store.init_std_table::<ExSingleIdTableIdentifier>("contract_leaf_table", get_rk(27)).await?;
@@ -118,6 +119,7 @@ pub async fn setup_psy_scylla_database_store<N: QNetworkDatabaseTypes>(
         global_checkpoint_tree_table,
         guta_reward_tag_tree_table,
         user_registration_tree_table,
+        validator_tree_table,
         global_contract_tree_table,
         contract_function_tree_table,
         contract_leaf_table,
@@ -152,6 +154,7 @@ pub async fn setup_psy_scylla_database_store<N: QNetworkDatabaseTypes>(
         store.init_std_table::<ExTagTreeTableIdentifier>("guta_reward_tag_tree_table", get_rk(23)),
         // added tables for completeness
         store.init_zero_id_merkle_table("user_registration_tree_table", get_rk(24), N::GLOBAL_USER_TREE_HEIGHT),
+        store.init_zero_id_merkle_table("validator_tree_table", get_rk(33), psy_data::guta::realm_finalize::VALIDATOR_TREE_HEIGHT as u8),
         store.init_zero_id_merkle_table("global_contract_tree_table", get_rk(25), N::GLOBAL_CONTRACT_TREE_HEIGHT),
         store.init_std_table::<ExSingleIdMerkleTableIdentifier>("contract_function_tree_table", get_rk(26)),
         store.init_std_table::<ExSingleIdTableIdentifier>("contract_leaf_table", get_rk(27)),
@@ -189,6 +192,7 @@ pub async fn setup_psy_scylla_database_store<N: QNetworkDatabaseTypes>(
         Arc::new(guta_reward_tag_tree_table),
         // added tables for completeness
         Arc::new(user_registration_tree_table),
+        Arc::new(validator_tree_table),
         Arc::new(global_contract_tree_table),
         Arc::new(contract_function_tree_table),
         Arc::new(contract_leaf_table),
@@ -234,6 +238,7 @@ pub async fn prepare_psy_scylla_database_store<N: QNetworkDatabaseTypes>(
     let guta_reward_tag_tree_table = store.init_std_table_prepare_only::<ExTagTreeTableIdentifier>("guta_reward_tag_tree_table", get_rk(23)).await?;
     // added tables for completeness
     let user_registration_tree_table = store.init_zero_id_merkle_table_prepare_only("user_registration_tree_table", get_rk(24), N::GLOBAL_USER_TREE_HEIGHT).await?;
+    let validator_tree_table = store.init_zero_id_merkle_table_prepare_only("validator_tree_table", get_rk(33), 20u8).await?;
     let global_contract_tree_table = store.init_zero_id_merkle_table_prepare_only("global_contract_tree_table", get_rk(25), N::GLOBAL_CONTRACT_TREE_HEIGHT).await?;
     let contract_function_tree_table = store.init_std_table_prepare_only::<ExSingleIdMerkleTableIdentifier>("contract_function_tree_table", get_rk(26)).await?;
     let contract_leaf_table = store.init_std_table_prepare_only::<ExSingleIdTableIdentifier>("contract_leaf_table", get_rk(27)).await?;
@@ -274,6 +279,7 @@ pub async fn prepare_psy_scylla_database_store<N: QNetworkDatabaseTypes>(
         Arc::new(guta_reward_tag_tree_table),
         // added tables for completeness
         Arc::new(user_registration_tree_table),
+        Arc::new(validator_tree_table),
         Arc::new(global_contract_tree_table),
         Arc::new(contract_function_tree_table),
         Arc::new(contract_leaf_table),

@@ -40,6 +40,7 @@ use psy_data::{
 use psy_io::tokio::{TokioFileLike, TokioLikeFileSystem};
 use psy_node_core::{
     genesis::genesis_db_data_builder::GenesisDatabaseDataBuilder,
+    p2p::validator_lookup::write_validator_tree_genesis,
     psy_core_db::traits::full::{
         PsyCoordinatorProcessorStore, PsyNodeCheckpointTreeDatabaseReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter,
     },
@@ -513,18 +514,17 @@ impl<
         Ok(())
     }
 
-    pub async fn ensure_genesis_applied_from_setup_data(&mut self, genesis_data: &PsyGenesisBlockSetupData<N::F, N::QHash>) -> anyhow::Result<()> {
-        // Check if genesis has already been applied
+    pub async fn ensure_genesis_applied_from_setup_data(&mut self, chain_id: u32, genesis_data: &PsyGenesisBlockSetupData<N::F, N::QHash>) -> anyhow::Result<()> {
         let database_check_state = self.get_database_check_state().await?;
         if database_check_state == DatabaseCheckState::NeedsGenesis {
             tracing::info!("Applying genesis block setup data to coordinator processor database...");
             let (_, genesis_block_update) = GenesisDatabaseDataBuilder::setup_for_coordinator::<N::HasherBase, N>(
                 &genesis_data,
+                chain_id,
                 self.circuit_fingerprint_config.checkpoint_state_transition_circuit_fingerprint,
             )?;
             self.commit_state(genesis_block_update, ProvingJobCircuitType::GenesisBlockCheckpointStateTransition, vec![])
                 .await?;
-            tracing::info!("Genesis block setup data applied to coordinator processor database.");
         }
         Ok(())
     }
@@ -1233,6 +1233,14 @@ checkpoint_backup_copy_status={}
         self.db
             .set_checkpoint_global_state_roots(checkpoint_id, &coordinator_update.new_base.checkpoint_leaf.global_state_roots)
             .await?;
+        if checkpoint_id == 0 {
+            write_validator_tree_genesis(
+                &*self.db,
+                &coordinator_update.update_validator_tree_nodes_ffs,
+                &coordinator_update.new_validator_leaf_preimages,
+            )
+            .await?;
+        }
         self.db
             .set_l2_block_state(checkpoint_id, &coordinator_update.new_base.block_state)
             .await?;

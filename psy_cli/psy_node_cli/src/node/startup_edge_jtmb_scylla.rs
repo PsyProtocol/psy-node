@@ -72,7 +72,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
             let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, false).await?;
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
-            let handler = CoordinatorEdgeHandler::<N, _, _, _, _, _, _, _, _>::new(
+            let mut handler = CoordinatorEdgeHandler::<N, _, _, _, _, _, _, _, _>::new(
                 db,
                 tag_tree_rewards_store,
                 temp_db,
@@ -82,9 +82,16 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
                 deploy_contract_queue,
                 proof_work_queue,
                 realm_identifier,
+                config.network.get_chain_id(),
                 proof_verifier,
                 checkpoint_state_transition_circuit_fingerprint,
             );
+            if let Some((roster_path, checkpoints_per_epoch)) = config.p2p_validator_roster_config()? {
+                handler.set_validators(
+                    crate::node::realm_p2p::validator_registry_from_roster_path(roster_path)?,
+                    checkpoints_per_epoch,
+                )?;
+            }
             start_coordinator_edge_rpc_server::<N, _, _, _, _, _, _, _, _>(handler, &config.listen, config.port).await?;
         },
         psy_core::constants::chain_id::PsyChainNetworkType::InternalDevnet => {
@@ -92,7 +99,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
             let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, false).await?;
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
-            let handler = CoordinatorEdgeHandler::<N, _, _, _, _, _, _, _, _>::new(
+            let mut handler = CoordinatorEdgeHandler::<N, _, _, _, _, _, _, _, _>::new(
                 db,
                 tag_tree_rewards_store,
                 temp_db,
@@ -102,9 +109,16 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
                 deploy_contract_queue,
                 proof_work_queue,
                 realm_identifier,
+                config.network.get_chain_id(),
                 proof_verifier,
                 checkpoint_state_transition_circuit_fingerprint,
             );
+            if let Some((roster_path, checkpoints_per_epoch)) = config.p2p_validator_roster_config()? {
+                handler.set_validators(
+                    crate::node::realm_p2p::validator_registry_from_roster_path(roster_path)?,
+                    checkpoints_per_epoch,
+                )?;
+            }
             start_coordinator_edge_rpc_server::<N, _, _, _, _, _, _, _, _>(handler, &config.listen, config.port).await?;
         }
         _ => {
@@ -118,7 +132,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
 async fn start_realm_edge_rpc_server_jtmb_scylla_node<N, C>(config: &RealmEdgeStartConfig) -> anyhow::Result<()>
 where
     N: QNetworkTypesConfig<ZKVerifier = PsyJTMBZKVerifier<C>, JobId = QProvingJobDataID> + QNetworkZKTypes + 'static,
-    C: JTMBCircuitConfig,
+    C: JTMBCircuitConfig + 'static,
 {
     let (verifier, _) = get_jtmb_circuit_library_and_prover_for_network::<C>(config.network)?;
     let pool = new_redis_async_pool(&config.redis_url, 10).await?;
@@ -141,7 +155,7 @@ where
     let db = Arc::new(db);
     let tag_tree_rewards_store = db.clone();
 
-    let handler = RealmEdgeHandler::<N, _, _, _, _, _, _>::new(
+    let mut handler = RealmEdgeHandler::<N, _, _, _, _, _, _>::new(
         db,
         tag_tree_rewards_store,
         temp_db,
@@ -153,6 +167,12 @@ where
         0,
         proof_verifier,
     );
+    if let Some((built, proposer_node_ids, rotation)) =
+        crate::node::realm_p2p::maybe_build_edge_network(config, chain_id)?
+    {
+        handler.set_realm_p2p(built.handle.commands(), rotation, proposer_node_ids);
+        crate::node::realm_p2p::spawn_edge_realm_network(built, handler.clone());
+    }
     start_realm_edge_rpc_server::<N, _, _, _, _, _, _>(handler, &config.listen, config.port).await?;
     Ok(())
 }

@@ -173,6 +173,8 @@ pub enum ProvingJobCircuitType {
     GUTATwoGUTAWithCheckpointUpgrade = 55,
     GUTAVerifyToCapWithCheckpointUpgrade = 56,
 
+    RealmFinalizeGUTA = 63,
+
     WrappedSignatureProof = 64,
     Secp256K1SignatureProof = 65,
 
@@ -334,6 +336,9 @@ impl TryFrom<u8> for ProvingJobCircuitType {
             53 => Ok(ProvingJobCircuitType::DummyProcessWithdrawalAggregate),
             54 => Ok(ProvingJobCircuitType::DummyBatchDeployContractsAggregate),
             55 => Ok(ProvingJobCircuitType::GUTATwoGUTAWithCheckpointUpgrade),
+
+            63 => Ok(ProvingJobCircuitType::RealmFinalizeGUTA),
+
             56 => Ok(ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade),
 
             64 => Ok(ProvingJobCircuitType::WrappedSignatureProof),

@@ -24,7 +24,7 @@ use crate::{
 
 impl<
         N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
-        S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync,
+        S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync + 'static,
         STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync,
         GUTAUpdateQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
         ProofWorkQueue: QStandardWorkerQueuePublisher + Send + Sync,
@@ -64,35 +64,20 @@ where
         tracing::info!("[REALM_STARTUP] init_with_setup_and_genesis done");
         //db.set_new_unique_ids().await?;
         tracing::info!("intialized realm processor database, building gatherers...");
-
         let guta_create_builder_config = RealmGUTAEndCapGathererConfig::<N, TempDatabase, FileSystem> {
             realm_id_u64: db.state.realm_id_u64,
             realm_sub_id_u64: db.state.realm_sub_id_u64,
             status: db.shared_state.inner.clone(),
             temp_db: db.temp_db.clone(),
-            backup_file_directory: guta_gatherer_backup_directory,
+            backup_file_directory: guta_gatherer_backup_directory.clone(),
             coordinator_guta_updates_circuit_whitelist: db.circuit_fingerprint_config.guta_circuit_whitelist_root,
             checkpoint_tree: db.checkpoint_tree_backup_manager.checkpoint_tree.clone(),
             file_system: file_system.clone(),
             _phantom_n: std::marker::PhantomData,
             future_pending_end_cap_jobs: Arc::new(std::sync::RwLock::new(Vec::new())),
+            tree_store: db.db.clone(),
         };
-        /*
-        if db.last_committed.l2_state.next_contract_id as u64 != db_tree_next_contract_id {
-            return Err(anyhow::anyhow!(
-                "Inconsistent next contract id between db last committed l2 state {} and loaded tree next contract id {}",
-                db.last_committed.l2_state.next_contract_id,
-                db_tree_next_contract_id
-            ));
-        }
-        if db.last_committed.l2_state.next_user_id != db_tree_next_user_registration_id {
-            return Err(anyhow::anyhow!(
-                "Inconsistent next user registration id between db last committed l2 state {} and loaded tree next user registration id {}",
-                db.last_committed.l2_state.next_user_id,
-                db_tree_next_user_registration_id
-            ));
-        }
-        */
+
         let (guta_queue_gatherer, guta_join_handle) = EphemeralQueueGathererWithTree::new_with_status::<
             GUTAUpdateQueue,
             RealmGUTAEndCapGathererConfig<N, TempDatabase, FileSystem>,
@@ -112,10 +97,44 @@ where
                 db,
                 guta_queue_gatherer: guta_queue_gatherer,
                 proof_worker_queue_max_time_ms: u64::MAX,
+                guta_gatherer_backup_directory,
+                p2p: None,
+                rotation: None,
+                bls_secret: None,
+                p2p_validator_user_id: None,
+                p2p_bls_public_keys: None,
+                verified_state_updates: None,
+                held_state_updates: None,
             },
+
             guta_join_handle,
         ))
     }
+
+    /// Wire optional Realm P2P into the processor after construction.
+    ///
+    /// `commands` is a cloneable handle into the Realm network drive loop
+    /// (which must be started separately — the processor never starts the
+    /// Swarm or takes the event receiver). `rotation` gates the
+    /// scheduled-proposer check; `bls_secret` signs the processor's own Vote.
+    /// Until this is called the processor behaves exactly as today's
+    /// single-producer HTTP/NATS path.
+    pub fn set_realm_p2p(
+        &mut self,
+        commands: crate::realm::network::RealmNetworkCommands,
+        rotation: parth_common::realm_rotation::RealmRotationConfig,
+        bls_secret: psy_data::p2p::BlsSecretKey,
+        validator_user_id: u64,
+        bls_public_keys: std::collections::HashMap<u16, psy_data::p2p::BlsPublicKey>,
+    ) {
+        self.p2p = Some(commands);
+        self.rotation = Some(rotation);
+        self.bls_secret = Some(bls_secret);
+        self.p2p_validator_user_id = Some(validator_user_id);
+        self.p2p_bls_public_keys = Some(bls_public_keys);
+    }
+
+
     pub async fn get_latest_checkpoint_id_internal(&self) -> anyhow::Result<u64> {
         self.db.db.get_latest_checkpoint_id().await
     }

@@ -9,6 +9,13 @@ pub trait QTempDBSubmitStatusReader {
 #[async_trait]
 pub trait QTempDBSubmitStatusWriter {
     async fn set_submitted_status_for_pending(&self, rid: &QRealmIdentifier, unique_pending_id: u64, user_or_realm_id: u64, status: u64) -> anyhow::Result<()>;
+    async fn put_submitted_status_if_absent(
+        &self,
+        rid: &QRealmIdentifier,
+        unique_pending_id: u64,
+        user_or_realm_id: u64,
+        status: u64,
+    ) -> anyhow::Result<bool>;
 }
 
 pub trait QTempDBSubmitStatusStore: QTempDBSubmitStatusReader + QTempDBSubmitStatusWriter {}

@@ -7,7 +7,7 @@ use parth_common::{
 };
 use parth_core::{
     crypto::hash::{
-        merkle_proof::{DeltaMerkleProofCore, MerkleProofCore, compute_root_merkle_proof_generic}, tag_tree::TagTreeMerkleProof, traits::{FieldQHasher, QFieldHashable}
+        merkle_proof::{DeltaMerkleProofCore, MerkleProofCore, compute_root_merkle_proof_generic}, tag_tree::TagTreeMerkleProof, traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable}
     },
     data::{
         db::hash_id_u64::{PSY_OBJECT_FFS_SIZE_HASH_256_AND_U64, QHash256AndU64},
@@ -19,6 +19,7 @@ use parth_core::{
 use psy_core::user_id::get_user_id_from_user_registration_id;
 use psy_data::{
     genesis::genesis_block_setup::PsyGenesisBlockSetupData,
+    p2p::{build_validator_tree_genesis, ValidatorLeafPreimage},
     prepared_block::{common::PsyCoordinatorPendingCheckpointBase, coordinator::PsyPreparedCoordinatorBlockStateUpdates, realm::{PsyPreparedRealmBlockStateUpdates, PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate, PsyRealmCoordinatorUpdate}},
     protocol::{
         checkpoint_transition_hash::{CheckpointStateHashTransition, CheckpointStateTransitionPublicInputs},
@@ -41,12 +42,13 @@ pub struct GenesisDatabaseDataBuilder<F, Hash> {
     pub global_contract_tree_root: Hash,
     pub global_user_tree_root: Hash,
     pub user_registration_tree_root: Hash,
-
+    pub validator_tree_root: Hash,
     pub global_user_tree_nodes_ffs: Vec<u8>,
     pub user_contract_tree_nodes_ffs: Vec<u8>,
     pub contract_state_tree_nodes_ffs: Vec<u8>,
     pub user_registration_tree_nodes_ffs: Vec<u8>,
-
+    pub validator_tree_nodes_ffs: Vec<u8>,
+    pub validator_leaf_preimages: Vec<ValidatorLeafPreimage>,
     pub global_contract_tree_nodes_ffs: Vec<u8>,
     pub contract_function_tree_nodes_ffs: Vec<u8>,
 
@@ -69,11 +71,13 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
             global_contract_tree_root: Hash::default(),
             global_user_tree_root: Hash::default(),
             user_registration_tree_root: Hash::default(),
-
+            validator_tree_root: Hash::default(),
             global_user_tree_nodes_ffs: Vec::new(),
             user_contract_tree_nodes_ffs: Vec::new(),
-            user_registration_tree_nodes_ffs: Vec::new(),
             contract_state_tree_nodes_ffs: Vec::new(),
+            user_registration_tree_nodes_ffs: Vec::new(),
+            validator_tree_nodes_ffs: Vec::new(),
+            validator_leaf_preimages: Vec::new(),
             global_contract_tree_nodes_ffs: Vec::new(),
             contract_function_tree_nodes_ffs: Vec::new(),
 
@@ -314,13 +318,28 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
 
         Ok(merkle_proof_to_realm_root)
     }
-    pub fn get_checkpoint_state_roots(&self) -> PQEDCheckpointGlobalStateRoots<Hash> {
+    pub fn setup_validators<Hasher: FieldQHasher<F, Hash> + MerkleZeroHasher<Hash>>(
+        &mut self,
+        genesis_block: &PsyGenesisBlockSetupData<F, Hash>,
+        chain_id: u32,
+    ) -> anyhow::Result<()>
+    where
+        Hash: std::fmt::Debug,
+    {
+        let genesis = build_validator_tree_genesis::<Hasher, Hash>(chain_id, &genesis_block.validators)?;
+        self.validator_tree_root = genesis.root;
+        self.validator_tree_nodes_ffs = genesis.nodes_ffs;
+        self.validator_leaf_preimages = genesis.preimages;
+        Ok(())
+    }
+    pub fn get_checkpoint_state_roots<Hasher: FieldQHasher<F, Hash>>(&self) -> PQEDCheckpointGlobalStateRoots<Hash> {
         PQEDCheckpointGlobalStateRoots {
             deposit_tree_root: self.deposit_tree_root,
             withdrawal_tree_root: self.withdrawal_tree_root,
             contract_tree_root: self.global_contract_tree_root,
             user_tree_root: self.global_user_tree_root,
             user_registration_tree_root: self.user_registration_tree_root,
+            validator_tree_root: self.validator_tree_root,
         }
     }
 
@@ -338,13 +357,13 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
     }
     pub fn get_checkpoint_leaf<Hasher: FieldQHasher<F, Hash>>(&self) -> PQEDCheckpointLeaf<F, Hash> {
         PQEDCheckpointLeaf {
-            global_chain_root: self.get_checkpoint_state_roots().qfhash::<Hasher>(),
+            global_chain_root: self.get_checkpoint_state_roots::<Hasher>().qfhash::<Hasher>(),
             stats: self.checkpoint_stats.clone(),
         }
     }
-    pub fn get_populated_checkpoint_leaf(&self) -> PsyCheckpointLeafPopulated<F, Hash> {
+    pub fn get_populated_checkpoint_leaf<Hasher: FieldQHasher<F, Hash>>(&self) -> PsyCheckpointLeafPopulated<F, Hash> {
         PsyCheckpointLeafPopulated {
-            global_state_roots: self.get_checkpoint_state_roots(),
+            global_state_roots: self.get_checkpoint_state_roots::<Hasher>(),
             stats: self.checkpoint_stats.clone(),
         }
     }
@@ -355,7 +374,7 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
         let siblings = (0..(checkpoint_tree_height as usize))
             .map(|i| Hasher::get_zero_hash(i))
             .collect::<Vec<Hash>>();
-        let checkpoint_leaf = self.get_populated_checkpoint_leaf();
+        let checkpoint_leaf = self.get_populated_checkpoint_leaf::<Hasher>();
         let checkpoint_leaf_hash = checkpoint_leaf.qfhash::<Hasher>();
         let checkpoint_tree_root = compute_root_merkle_proof_generic::<Hash, Hasher>(checkpoint_leaf_hash, 0, &siblings);
 
@@ -374,7 +393,7 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
         let siblings = (0..(checkpoint_tree_height as usize))
             .map(|i| Hasher::get_zero_hash(i))
             .collect::<Vec<Hash>>();
-        let checkpoint_leaf = self.get_populated_checkpoint_leaf();
+        let checkpoint_leaf = self.get_populated_checkpoint_leaf::<Hasher>();
         let checkpoint_leaf_hash = checkpoint_leaf.qfhash::<Hasher>();
         let checkpoint_tree_root = compute_root_merkle_proof_generic::<Hash, Hasher>(checkpoint_leaf_hash, 0, &siblings);
 
@@ -408,8 +427,9 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
         self.get_genesis_state_transition::<Hasher>(checkpoint_tree_height).get_hash::<Hasher>()
     }
 
-    pub fn setup_for_realm<Hasher: FieldQHasher<F, Hash>, N: QNetworkConstants>(
+    pub fn setup_for_realm<Hasher: FieldQHasher<F, Hash> + MerkleZeroHasher<Hash>, N: QNetworkConstants>(
         genesis_block: &PsyGenesisBlockSetupData<F, Hash>,
+        chain_id: u32,
         realm_id: u64,
         realm_sub_id: u64,
     ) -> anyhow::Result<
@@ -427,10 +447,11 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
             false,
             true,
         )?.unwrap();
+        builder.setup_validators::<Hasher>(genesis_block, chain_id)?;
         let reward_tree_proof = TagTreeMerkleProof::new_empty();
-        let state_roots = builder.get_checkpoint_state_roots();
+        let state_roots = builder.get_checkpoint_state_roots::<Hasher>();
 
-        let checkpoint_leaf = builder.get_populated_checkpoint_leaf().to_checkpoint_leaf::<Hasher>();
+        let checkpoint_leaf = builder.get_populated_checkpoint_leaf::<Hasher>().to_checkpoint_leaf::<Hasher>();
 
         let checkpoint_leaf_hash = checkpoint_leaf.qfhash::<Hasher>();
         let siblings = (0..N::CHECKPOINT_TREE_HEIGHT_USIZE)
@@ -470,13 +491,16 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
         let prepared_updates_with_coordinator = PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate {
             prepared_updates,
             coordinator_update,
+            update_validator_tree_nodes_ffs: builder.validator_tree_nodes_ffs,
+            new_validator_leaf_preimages: builder.validator_leaf_preimages,
         };
 
         Ok(prepared_updates_with_coordinator)
     }
 
-    pub fn setup_for_coordinator<Hasher: FieldQHasher<F, Hash>, N: QNetworkConstants>(
+    pub fn setup_for_coordinator<Hasher: FieldQHasher<F, Hash> + MerkleZeroHasher<Hash>, N: QNetworkConstants>(
         genesis_block: &PsyGenesisBlockSetupData<F, Hash>,
+        chain_id: u32,
         checkpoint_state_transition_circuit_fingerprint: Hash,
     ) -> anyhow::Result<(
         PsyVerifiableCheckpointTransition<F, Hash>,
@@ -489,6 +513,7 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
         );
         builder.setup_contracts::<Hasher, N>(genesis_block, true)?;
         builder.setup_users::<Hasher, N>(genesis_block, None, true, false)?;
+        builder.setup_validators::<Hasher>(genesis_block, chain_id)?;
 
         let pending_checkpoint_base = builder.get_coordinator_pending_checkpoint_base::<Hasher>(N::CHECKPOINT_TREE_HEIGHT);
 
@@ -511,9 +536,9 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
                 genesis_checkpoint_state_transition_hash: builder.get_genesis_state_transition_hash::<Hasher>(N::CHECKPOINT_TREE_HEIGHT),
                 checkpoint_state_transition_circuit_fingerprint,
             },
-            checkpoint_leaf: builder.get_populated_checkpoint_leaf(),
+            checkpoint_leaf: builder.get_populated_checkpoint_leaf::<Hasher>(),
         };
-        println!("builder_state_roots: {:#?}", builder.get_checkpoint_state_roots());
+        println!("builder_state_roots: {:#?}", builder.get_checkpoint_state_roots::<Hasher>());
         Ok((
             verifiable_checkpoint_transition,
             PsyPreparedCoordinatorBlockStateUpdates {
@@ -530,6 +555,8 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
                 update_user_registration_tree_nodes_ffs: builder.user_registration_tree_nodes_ffs,
                 new_user_public_keys_ffs: builder.public_keys_ffs,
                 new_public_key_hash_to_user_id_rows_ffs: builder.public_key_hash_to_user_id_rows_ffs,
+                update_validator_tree_nodes_ffs: builder.validator_tree_nodes_ffs,
+                new_validator_leaf_preimages: builder.validator_leaf_preimages,
                 update_global_user_tree_nodes_ffs: builder.global_user_tree_nodes_ffs,
                 new_realm_guta_reward_tree_node_keys_ffs: vec![],
                 checkpoint_tree_update_proof: checkpoint_tree_update_proof,

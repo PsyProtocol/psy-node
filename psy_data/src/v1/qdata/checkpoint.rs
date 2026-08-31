@@ -323,6 +323,7 @@ pub struct PQEDCheckpointGlobalStateRoots<Hash> {
     pub user_tree_root: Hash,
     pub withdrawal_tree_root: Hash,
     pub user_registration_tree_root: Hash,
+    pub validator_tree_root: Hash,
 }
 impl_qpd_serialize_params!(
     PQEDCheckpointGlobalStateRoots,
@@ -340,6 +341,7 @@ impl<Hash: QPGenRandom> QPGenRandom for PQEDCheckpointGlobalStateRoots<Hash> {
             user_tree_root: Hash::qp_rand_gen(),
             withdrawal_tree_root: Hash::qp_rand_gen(),
             user_registration_tree_root: Hash::qp_rand_gen(),
+            validator_tree_root: Hash::qp_rand_gen(),
         }
     }
 }
@@ -347,25 +349,25 @@ pser::impl_bytemuck_pod_and_zeroable!(PQEDCheckpointGlobalStateRoots, Hash);
 pser::impl_bytemuck_ffs!(
     PQEDCheckpointGlobalStateRoots,
     { Hash: Q256BitHash },
-    160
+    192
 );
 
 pser::impl_bytemuck_ffs_tests!(
     PQEDCheckpointGlobalStateRoots,
     // Note the use of concrete types here
     { parth_core::PHash },
-    160
+    192
 );
 
 impl<Hash: Q256BitHash> PsyCanonicalSerializeMetadata for PQEDCheckpointGlobalStateRoots<Hash> {
     const IS_FIXED_SIZE: bool = true;
-    const FIXED_SIZE: usize = 32 * 5;
+    const FIXED_SIZE: usize = 32 * 6;
 }
-impl<Hash: Q256BitHash> AutoDatabaseSerializationUseFastFixedSerialize<160> for PQEDCheckpointGlobalStateRoots<Hash> {}
+impl<Hash: Q256BitHash> AutoDatabaseSerializationUseFastFixedSerialize<192> for PQEDCheckpointGlobalStateRoots<Hash> {}
 psy_serialize::impl_psy_canonical_serialize_for_fixed_type!(
     PQEDCheckpointGlobalStateRoots,
     { Hash: Q256BitHash } => { Hash },
-    160
+    192
 );
 // This function is never called, it is just to ensure at compile time
 //  PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF matches the FFS implementation
@@ -452,7 +454,7 @@ pser::impl_psy_ser_basic_tests!(
 
 impl<Hash: QHashBase> QFeltSized for PQEDCheckpointGlobalStateRoots<Hash> {
     fn q_felt_size() -> usize {
-        20
+        24
     }
 }
 impl<F: QFelt64, Hash: QFHashBase<F>> ToQFelts<F> for PQEDCheckpointGlobalStateRoots<Hash> {
@@ -463,6 +465,7 @@ impl<F: QFelt64, Hash: QFHashBase<F>> ToQFelts<F> for PQEDCheckpointGlobalStateR
         result.extend_from_slice(&self.user_tree_root.to_4_felts());
         result.extend_from_slice(&self.withdrawal_tree_root.to_4_felts());
         result.extend_from_slice(&self.user_registration_tree_root.to_4_felts());
+        result.extend_from_slice(&self.validator_tree_root.to_4_felts());
         result
     }
 
@@ -476,6 +479,7 @@ impl<F: QFelt64, Hash: QFHashBase<F>> ToQFelts<F> for PQEDCheckpointGlobalStateR
             user_tree_root: Hash::from_4_felts_slice(&felts[8..12]),
             withdrawal_tree_root: Hash::from_4_felts_slice(&felts[12..16]),
             user_registration_tree_root: Hash::from_4_felts_slice(&felts[16..20]),
+            validator_tree_root: Hash::from_4_felts_slice(&felts[20..24]),
         }
     }
 }
@@ -485,7 +489,8 @@ impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash> for PQEDCheckpoint
         let contract_and_deposit = H::q_two_to_one(self.contract_tree_root, self.deposit_tree_root);
         let user_and_withdrawal = H::q_two_to_one(self.user_tree_root, self.withdrawal_tree_root);
         let base_combo = H::q_two_to_one(contract_and_deposit, user_and_withdrawal);
-        H::q_two_to_one(base_combo, self.user_registration_tree_root)
+        let reg_and_validator = H::q_two_to_one(self.user_registration_tree_root, self.validator_tree_root);
+        H::q_two_to_one(base_combo, reg_and_validator)
     }
 }
 

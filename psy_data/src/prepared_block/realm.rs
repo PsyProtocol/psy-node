@@ -149,6 +149,10 @@ pser::impl_psy_ser_basic_tests_fallback!(
 pub struct PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate<F, Hash> {
     pub prepared_updates: PsyPreparedRealmBlockStateUpdates<Hash>,
     pub coordinator_update: PsyRealmCoordinatorUpdate<F, Hash>,
+    #[ts(skip)]
+    pub update_validator_tree_nodes_ffs: Vec<u8>,
+    #[ts(skip)]
+    pub new_validator_leaf_preimages: Vec<crate::p2p::ValidatorLeafPreimage>,
 }
 
 
@@ -164,6 +168,8 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for PsyPreparedRealmBlockSta
         Self {
             prepared_updates: PsyPreparedRealmBlockStateUpdates::qp_rand_gen(),
             coordinator_update: PsyRealmCoordinatorUpdate::qp_rand_gen(),
+            update_validator_tree_nodes_ffs: QPGenRandom::qp_rand_gen_vec(32),
+            new_validator_leaf_preimages: vec![crate::p2p::ValidatorLeafPreimage::qp_rand_gen()],
         }
     }
 }
@@ -176,22 +182,44 @@ impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for PsyPrepare
 impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate<F, Hash> {
     fn fallback_pio_serialized_size(&self) -> usize {
         self.prepared_updates.pio_serialized_size() +
-        self.coordinator_update.pio_serialized_size()
+        self.coordinator_update.pio_serialized_size() +
+        4 + self.update_validator_tree_nodes_ffs.len() +
+        4 + self.new_validator_leaf_preimages.iter().map(|preimage| preimage.pio_serialized_size()).sum::<usize>()
     }
 
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
         self.prepared_updates.pio_write_to_io(writer)?;
         self.coordinator_update.pio_write_to_io(writer)?;
+        writer.psy_write_bytes_vec(&self.update_validator_tree_nodes_ffs)?;
+        writer.psy_write_vec_length(self.new_validator_leaf_preimages.len())?;
+        for preimage in &self.new_validator_leaf_preimages {
+            preimage.pio_write_to_io(writer)?;
+        }
         Ok(())
     }
 
     fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
         let prepared_updates = PsyPreparedRealmBlockStateUpdates::<Hash>::pio_read_from_io(reader)?;
         let coordinator_update = PsyRealmCoordinatorUpdate::<F, Hash>::pio_read_from_io(reader)?;
+        let update_validator_tree_nodes_ffs = reader.psy_read_bytes_vec_with_max_length(
+            crate::p2p::validator_tree::MAX_VALIDATOR_TREE_NODES_FFS_BYTES,
+        )?;
+        let preimage_count = reader.psy_read_vec_length()?;
+        anyhow::ensure!(
+            preimage_count <= crate::p2p::validator_tree::MAX_VALIDATOR_TREE_PREIMAGES,
+            "validator leaf preimage count {preimage_count} exceeds {}",
+            crate::p2p::validator_tree::MAX_VALIDATOR_TREE_PREIMAGES
+        );
+        let mut new_validator_leaf_preimages = Vec::with_capacity(preimage_count);
+        for _ in 0..preimage_count {
+            new_validator_leaf_preimages.push(crate::p2p::ValidatorLeafPreimage::pio_read_from_io(reader)?);
+        }
 
         Ok(Self {
             prepared_updates,
             coordinator_update,
+            update_validator_tree_nodes_ffs,
+            new_validator_leaf_preimages,
         })
     }
 }

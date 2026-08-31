@@ -82,6 +82,7 @@ pub async fn setup_psy_memory_database_store<N: QNetworkDatabaseTypes>(
     let guta_reward_tag_tree_table = store.init_std_table::<ExTagTreeTableIdentifier>("guta_reward_tag_tree_table", get_rk(23)).await?;
     // added tables for completeness
     let user_registration_tree_table = store.init_zero_id_merkle_table::<ExZeroIdMerkleTableIdentifier>("user_registration_tree_table", get_rk(24), N::GLOBAL_USER_TREE_HEIGHT).await?;
+    let validator_tree_table = store.init_zero_id_merkle_table::<ExZeroIdMerkleTableIdentifier>("validator_tree_table", get_rk(33), 20u8).await?;
     let global_contract_tree_table = store.init_zero_id_merkle_table::<ExZeroIdMerkleTableIdentifier>("global_contract_tree_table", get_rk(25), N::GLOBAL_CONTRACT_TREE_HEIGHT).await?;
     let contract_function_tree_table = store.init_std_table::<ExSingleIdMerkleTableIdentifier>("contract_function_tree_table", get_rk(26)).await?;
     let contract_leaf_table = store.init_std_table::<ExSingleIdTableIdentifier>("contract_leaf_table", get_rk(27)).await?;
@@ -126,6 +127,7 @@ pub async fn setup_psy_memory_database_store<N: QNetworkDatabaseTypes>(
         Arc::new(guta_reward_tag_tree_table),
         // added tables for completeness
         Arc::new(user_registration_tree_table),
+        Arc::new(validator_tree_table),
         Arc::new(global_contract_tree_table),
         Arc::new(contract_function_tree_table),
         Arc::new(contract_leaf_table),

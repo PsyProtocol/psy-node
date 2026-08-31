@@ -212,7 +212,6 @@ impl<
     pub fn get_checkpoint_state(&self) -> PsyCheckpointLeafCompactWithStateRoots<F> {
         Self::checkpoint_state_from_parts(&self.current_checkpoint_leaf, &self.current_global_state_roots)
     }
-
     pub fn get_current_ups_header(&self) -> &UserProvingSessionHeader<F> {
         &self.current_ups_header
     }

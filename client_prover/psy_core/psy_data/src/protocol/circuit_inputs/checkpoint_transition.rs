@@ -4,7 +4,10 @@ use psy_client_common::data::qhashout::QHashOut;
 use psy_config::network_constants::DA_CHALLENGE_WINDOW;
 use psy_crypto::hash::{
     merkle::core::{DeltaMerkleProofCore, MerkleProofCore},
-    traits::{hasher::FieldQHasher, qhashable::QFieldHashable},
+    traits::{
+        hasher::{FieldQHasher, MerkleZeroHasher},
+        qhashable::QFieldHashable,
+    },
 };
 use serde::{Deserialize, Serialize};
 
@@ -44,7 +47,7 @@ impl<F: RichField> KVQSerializable for QCPsyCheckpointStateTransitionInput<F> {
 }
 
 impl<F: RichField> QCPsyCheckpointStateTransitionInputPartial<F> {
-    pub fn get_new_checkpoint_leaf<H: FieldQHasher<F>>(&self) -> PsyCheckpointLeaf<F> {
+    pub fn get_new_checkpoint_leaf<H: FieldQHasher<F> + MerkleZeroHasher<QHashOut<F>>>(&self) -> PsyCheckpointLeaf<F> {
         let new_state_roots = PsyCheckpointGlobalStateRoots {
             contract_tree_root: self.part_1_header.deploy_contracts_state_transition.state_transition_end,
             deposit_tree_root: QHashOut(HashOut {
@@ -65,6 +68,7 @@ impl<F: RichField> QCPsyCheckpointStateTransitionInputPartial<F> {
                 ],
             }),
             user_registration_tree_root: self.part_1_header.register_users_state_transition.state_transition_end,
+            validator_tree_root: H::get_zero_hash(crate::qdata::checkpoint::VALIDATOR_TREE_HEIGHT),
         };
         PsyCheckpointLeaf {
             global_chain_root: new_state_roots.qfhash::<H>(),
@@ -83,14 +87,14 @@ impl<F: RichField> QCPsyCheckpointStateTransitionInputPartial<F> {
         }
     }
 
-    pub fn get_old_checkpoint_leaf<H: FieldQHasher<F>>(&self) -> PsyCheckpointLeaf<F> {
+    pub fn get_old_checkpoint_leaf<H: FieldQHasher<F> + MerkleZeroHasher<QHashOut<F>>>(&self) -> PsyCheckpointLeaf<F> {
         PsyCheckpointLeaf {
             global_chain_root: self.get_old_state_roots::<H>().qfhash::<H>(),
             stats: self.old_stats,
         }
     }
 
-    pub fn get_old_state_roots<H: FieldQHasher<F>>(&self) -> PsyCheckpointGlobalStateRoots<F> {
+    pub fn get_old_state_roots<H: FieldQHasher<F> + MerkleZeroHasher<QHashOut<F>>>(&self) -> PsyCheckpointGlobalStateRoots<F> {
         let old_state_roots = PsyCheckpointGlobalStateRoots {
             contract_tree_root: self.part_1_header.deploy_contracts_state_transition.state_transition_start,
             deposit_tree_root: QHashOut(HashOut {
@@ -111,6 +115,7 @@ impl<F: RichField> QCPsyCheckpointStateTransitionInputPartial<F> {
                 ],
             }),
             user_registration_tree_root: self.part_1_header.register_users_state_transition.state_transition_start,
+            validator_tree_root: H::get_zero_hash(crate::qdata::checkpoint::VALIDATOR_TREE_HEIGHT),
         };
         old_state_roots
     }

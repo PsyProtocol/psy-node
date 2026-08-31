@@ -79,6 +79,9 @@ impl<C: JTMBCircuitConfig> QEDCheckpointStateTransitionCircuit<C> {
         let dummy_root = C::Hash::from_owned_32bytes(
             hex_literal::hex!("43fcc336bbb979e48ede0c3cc9dae4b172ba2743712a3329834e093a93f55ad6")
         );
+        let zero_validator_root = C::Hash::from_owned_32bytes(
+            hex_literal::hex!("0000000000000000000000000000000000000000000000000000000000000000")
+        );
 
         let old_state_roots = psy_data::v1::qdata::checkpoint::PQEDCheckpointGlobalStateRoots {
             contract_tree_root: input.partial.part_1_header.deploy_contracts_state_transition.state_transition_start,
@@ -86,6 +89,7 @@ impl<C: JTMBCircuitConfig> QEDCheckpointStateTransitionCircuit<C> {
             user_tree_root: input.partial.part_1_header.guta_proof_header.state_transition.old_node_value,
             withdrawal_tree_root: dummy_root,
             user_registration_tree_root: input.partial.part_1_header.register_users_state_transition.state_transition_start,
+            validator_tree_root: zero_validator_root,
         };
 
         let new_state_roots = psy_data::v1::qdata::checkpoint::PQEDCheckpointGlobalStateRoots {
@@ -94,6 +98,7 @@ impl<C: JTMBCircuitConfig> QEDCheckpointStateTransitionCircuit<C> {
             user_tree_root: input.partial.part_1_header.guta_proof_header.state_transition.new_node_value,
             withdrawal_tree_root: dummy_root,
             user_registration_tree_root: input.partial.part_1_header.register_users_state_transition.state_transition_end,
+            validator_tree_root: zero_validator_root,
         };
 
         let previous_transition = CheckpointStateHashTransition {
@@ -222,12 +227,16 @@ impl<L: PsyJTMBCircuitInfoLibrary<C::Hash>, C: JTMBCircuitConfig> QJTMBProofCirc
         let todo_add_withdrawals_root = C::Hash::from_owned_32bytes(
             hex_literal::hex!("43fcc336bbb979e48ede0c3cc9dae4b172ba2743712a3329834e093a93f55ad6"),
         );
+        let zero_validator_root = C::Hash::from_owned_32bytes(
+            hex_literal::hex!("0000000000000000000000000000000000000000000000000000000000000000")
+        );
         let old_state_roots = PQEDCheckpointGlobalStateRoots {
             contract_tree_root: witness.partial.part_1_header.deploy_contracts_state_transition.state_transition_start,
             deposit_tree_root: todo_add_deposits_root,
             user_tree_root: witness.partial.part_1_header.guta_proof_header.state_transition.old_node_value,
             withdrawal_tree_root: todo_add_withdrawals_root,
             user_registration_tree_root: witness.partial.part_1_header.register_users_state_transition.state_transition_start,
+            validator_tree_root: zero_validator_root,
         };
         /*let new_state_roots = PQEDCheckpointGlobalStateRoots {
             contract_tree_root: witness.partial.part_1_header.deploy_contracts_state_transition.state_transition_end,

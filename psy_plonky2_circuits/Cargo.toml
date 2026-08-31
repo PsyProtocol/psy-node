@@ -48,6 +48,8 @@ psy_core = { workspace = true }
 psy_data = { workspace = true }
 psy_serialize = { workspace = true }
 pser = { workspace = true }
+psy_common_circuit = { workspace = true }
+psy_crypto = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 jsonrpsee = { workspace = true }

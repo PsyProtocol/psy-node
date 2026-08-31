@@ -25,10 +25,11 @@ use parth_core::{
     QCoreProcCheckpointUniqueId,
 };
 use psy_data::{
+    p2p::ValidatorLeafPreimage,
     protocol::verifiable_checkpoint_transition::PsyVerifiableCheckpointTransitionWithProof, v1::qdata::{
         checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState}, checkpoint_sync::PQEDCheckpointSyncInfo, contract::{
             CONTRACT_LEAF_SERIALIZED_SIZE, ContractCodeDefinition, ContractCodeDefinitionWithContractId, IMT_LEAF_FFS_ENTRY_SIZE_V2, IMTContractStateLeaf, PQEDContractLeafV2, deserialize_imt_leaf_ffs_entry_v2, encode_imt_key_for_sorting, imt_key_bucket, imt_key_bucket_to_i16,
-        }, ffs_sizes::{PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF, PSY_OBJECT_FFS_SIZE_USER_LEAF, PSY_OBJECT_FFS_SIZE_ZK_PUBLIC_KEY}, public_key::PZKPublicKeyInfo, user::PQEDUserLeaf,
+        }, ffs_sizes::{PSY_OBJECT_FFS_SIZE_USER_LEAF, PSY_OBJECT_FFS_SIZE_ZK_PUBLIC_KEY}, public_key::PZKPublicKeyInfo, user::PQEDUserLeaf,
     },
 };
 
@@ -37,7 +38,9 @@ use crate::{
         core_implementation::constants::{
             CHECKPOINTED_OBJECT_TABLE_OBJ_ID_BRIDGE_DEPOSIT_LEAF_BASE,
             CHECKPOINTED_OBJECT_TABLE_OBJ_ID_REALM_ROOT_TO_GLOBAL_REWARDS_TAG_TREE_ROOT_PROOF,
-            CHECKPOINTED_OBJECT_TABLE_OBJ_ID_REALM_ROOT_TO_GLOBAL_USER_TREE_ROOT_MERKLE_PROOF, LATEST_INFO_TABLE_OBJ_ID_LATEST_L2_BLOCK_STATE,
+            CHECKPOINTED_OBJECT_TABLE_OBJ_ID_REALM_ROOT_TO_GLOBAL_USER_TREE_ROOT_MERKLE_PROOF,
+            CHECKPOINTED_OBJECT_TABLE_OBJ_ID_VALIDATOR_TREE_PREIMAGE_BASE,
+            LATEST_INFO_TABLE_OBJ_ID_LATEST_L2_BLOCK_STATE,
             U64_SINGLETON_TABLE_OBJ_ID_BRIDGE_DEPOSIT_NEXT_INDEX_BASE, U64_SINGLETON_TABLE_OBJ_ID_CHECKPOINT_ID, U64_SINGLETON_TABLE_OBJ_ID_PENDING_ID,
         },
         traits::full::*,
@@ -62,6 +65,14 @@ fn bridge_deposit_leaf_obj_id(chain_id: u64, deposit_index: u64) -> anyhow::Resu
         );
     }
     Ok(CHECKPOINTED_OBJECT_TABLE_OBJ_ID_BRIDGE_DEPOSIT_LEAF_BASE | (chain_id << 32) | deposit_index)
+}
+
+fn validator_tree_preimage_obj_id(leaf_index: u64) -> anyhow::Result<u64> {
+    anyhow::ensure!(
+        leaf_index < CHECKPOINTED_OBJECT_TABLE_OBJ_ID_VALIDATOR_TREE_PREIMAGE_BASE,
+        "validator tree leaf index {leaf_index} overflows preimage object id"
+    );
+    Ok(CHECKPOINTED_OBJECT_TABLE_OBJ_ID_VALIDATOR_TREE_PREIMAGE_BASE | leaf_index)
 }
 
 fn bridge_chain_tree_node_obj_id(chain_id: u64, level: u8, index: u64) -> anyhow::Result<u64> {
@@ -160,6 +171,7 @@ pub struct PsyUnifiedCoreDatabaseStore<
     pub guta_reward_tag_tree_table: Arc<TagTreeTableIdentifier>,
     // added tables for completeness
     pub user_registration_tree_table: Arc<ZeroIdMerkleTableIdentifier>,
+    pub validator_tree_table: Arc<ZeroIdMerkleTableIdentifier>,
     pub global_contract_tree_table: Arc<ZeroIdMerkleTableIdentifier>,
     pub contract_function_tree_table: Arc<SingleIdMerkleTableIdentifier>,
     pub contract_leaf_table: Arc<SingleIdTableIdentifier>,
@@ -265,6 +277,7 @@ impl<
         guta_reward_tag_tree_table: Arc<TagTreeTableIdentifier>,
         // added tables for completeness
         user_registration_tree_table: Arc<ZeroIdMerkleTableIdentifier>,
+        validator_tree_table: Arc<ZeroIdMerkleTableIdentifier>,
         global_contract_tree_table: Arc<ZeroIdMerkleTableIdentifier>,
         contract_function_tree_table: Arc<SingleIdMerkleTableIdentifier>,
         contract_leaf_table: Arc<SingleIdTableIdentifier>,
@@ -301,6 +314,7 @@ impl<
             global_checkpoint_tree_table,
             guta_reward_tag_tree_table,
             user_registration_tree_table,
+            validator_tree_table,
             global_contract_tree_table,
             contract_function_tree_table,
             contract_leaf_table,
@@ -770,6 +784,212 @@ impl<
     async fn user_registration_tree_set_nodes_ffs(&self, checkpoint_id: u64, data: &[u8]) -> anyhow::Result<()> {
         self.store
             .db_set_zero_id_merkle_nodes_from_fast_serialized(&self.user_registration_tree_table, checkpoint_id, data)
+            .await
+    }
+}
+
+#[async_trait]
+impl<
+        N: QNetworkDatabaseTypes,
+        BiDirectionalMappingTableIdentifier: Clone + Send + Sync,
+        BiDirectionalU64U128MappingTableIdentifier: Clone + Send + Sync,
+        U64TableIdentifier: Clone + Send + Sync,
+        U64CounterTableIdentifier: Clone + Send + Sync,
+        SingleIdTableIdentifier: Clone + Send + Sync,
+        DoubleIdTableIdentifier: Clone + Send + Sync,
+        KivTableIdentifier: Clone + Send + Sync,
+        SingleIdMerkleTableIdentifier: Clone + Send + Sync,
+        DoubleIdMerkleTableIdentifier: Clone + Send + Sync,
+        ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
+        TagTreeTableIdentifier: Clone + Send + Sync,
+        HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
+        S: CoreDatabaseStore<
+                N::QHash,
+                N::HasherBase,
+                BiDirectionalMappingTableIdentifier,
+                BiDirectionalU64U128MappingTableIdentifier,
+                U64TableIdentifier,
+                U64CounterTableIdentifier,
+                SingleIdTableIdentifier,
+                DoubleIdTableIdentifier,
+                KivTableIdentifier,
+                SingleIdMerkleTableIdentifier,
+                DoubleIdMerkleTableIdentifier,
+                ZeroIdMerkleTableIdentifier,
+                TagTreeTableIdentifier,
+                HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
+            > + Send
+            + Sync,
+    > PsyNodeValidatorTreeDatabaseReader<N::QHash>
+    for PsyUnifiedCoreDatabaseStore<
+        N,
+        BiDirectionalMappingTableIdentifier,
+        BiDirectionalU64U128MappingTableIdentifier,
+        U64TableIdentifier,
+        U64CounterTableIdentifier,
+        SingleIdTableIdentifier,
+        DoubleIdTableIdentifier,
+        KivTableIdentifier,
+        SingleIdMerkleTableIdentifier,
+        DoubleIdMerkleTableIdentifier,
+        ZeroIdMerkleTableIdentifier,
+        TagTreeTableIdentifier,
+        HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
+        S,
+    >
+{
+    async fn validator_tree_get_leaf_hash(&self, checkpoint_id: u64, leaf_index: u64) -> anyhow::Result<N::QHash> {
+        let key = SimpleMerkleNodeKey::new(psy_data::guta::realm_finalize::VALIDATOR_TREE_HEIGHT as u8, leaf_index);
+        self.store
+            .db_select_zero_id_merkle_node_max_checkpoint(&self.validator_tree_table, checkpoint_id, &key)
+            .await
+    }
+
+    async fn validator_tree_get_root_hash(&self, checkpoint_id: u64) -> anyhow::Result<N::QHash> {
+        let key = SimpleMerkleNodeKey::new_root();
+        self.store
+            .db_select_zero_id_merkle_node_max_checkpoint(&self.validator_tree_table, checkpoint_id, &key)
+            .await
+    }
+
+    async fn validator_tree_get_merkle_proof(&self, checkpoint_id: u64, leaf_index: u64) -> anyhow::Result<MerkleProofCore<N::QHash>> {
+        let key = SimpleMerkleNodeKey::new(psy_data::guta::realm_finalize::VALIDATOR_TREE_HEIGHT as u8, leaf_index);
+        self.db_select_zero_id_merkle_proof_max_checkpoint(&self.validator_tree_table, checkpoint_id, &key)
+            .await
+    }
+
+    async fn validator_tree_get_nodes(&self, checkpoint_id: u64, keys: &[SimpleMerkleNodeKey]) -> anyhow::Result<Vec<N::QHash>> {
+        self.store
+            .db_select_many_zero_id_merkle_nodes_max_checkpoint(&self.validator_tree_table, checkpoint_id, keys)
+            .await
+    }
+
+    async fn validator_tree_get_node(&self, checkpoint_id: u64, key: SimpleMerkleNodeKey) -> anyhow::Result<N::QHash> {
+        self.store
+            .db_select_zero_id_merkle_node_max_checkpoint(&self.validator_tree_table, checkpoint_id, &key)
+            .await
+    }
+
+    async fn validator_tree_get_leaf_preimage(&self, checkpoint_id: u64, leaf_index: u64) -> anyhow::Result<Option<ValidatorLeafPreimage>> {
+        self.store
+            .db_select_one_single_checkpointed_object_value::<ValidatorLeafPreimage>(
+                &self.checkpointed_object_table,
+                validator_tree_preimage_obj_id(leaf_index)?,
+                checkpoint_id,
+            )
+            .await
+    }
+}
+
+#[async_trait]
+impl<
+        N: QNetworkDatabaseTypes,
+        BiDirectionalMappingTableIdentifier: Clone + Send + Sync,
+        BiDirectionalU64U128MappingTableIdentifier: Clone + Send + Sync,
+        U64TableIdentifier: Clone + Send + Sync,
+        U64CounterTableIdentifier: Clone + Send + Sync,
+        SingleIdTableIdentifier: Clone + Send + Sync,
+        DoubleIdTableIdentifier: Clone + Send + Sync,
+        KivTableIdentifier: Clone + Send + Sync,
+        SingleIdMerkleTableIdentifier: Clone + Send + Sync,
+        DoubleIdMerkleTableIdentifier: Clone + Send + Sync,
+        ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
+        TagTreeTableIdentifier: Clone + Send + Sync,
+        HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
+        S: CoreDatabaseStore<
+                N::QHash,
+                N::HasherBase,
+                BiDirectionalMappingTableIdentifier,
+                BiDirectionalU64U128MappingTableIdentifier,
+                U64TableIdentifier,
+                U64CounterTableIdentifier,
+                SingleIdTableIdentifier,
+                DoubleIdTableIdentifier,
+                KivTableIdentifier,
+                SingleIdMerkleTableIdentifier,
+                DoubleIdMerkleTableIdentifier,
+                ZeroIdMerkleTableIdentifier,
+                TagTreeTableIdentifier,
+                HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
+            > + Send
+            + Sync,
+    > PsyNodeValidatorTreeDatabaseWriter<N::QHash>
+    for PsyUnifiedCoreDatabaseStore<
+        N,
+        BiDirectionalMappingTableIdentifier,
+        BiDirectionalU64U128MappingTableIdentifier,
+        U64TableIdentifier,
+        U64CounterTableIdentifier,
+        SingleIdTableIdentifier,
+        DoubleIdTableIdentifier,
+        KivTableIdentifier,
+        SingleIdMerkleTableIdentifier,
+        DoubleIdMerkleTableIdentifier,
+        ZeroIdMerkleTableIdentifier,
+        TagTreeTableIdentifier,
+        HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
+        S,
+    >
+{
+    async fn validator_tree_set_leaf_hash(
+        &self,
+        checkpoint_id: u64,
+        leaf_index: u64,
+        value: N::QHash,
+    ) -> anyhow::Result<DeltaMerkleProofCore<N::QHash>> {
+        let mut res = db_helper_zero_id_merkle_node_simple_set_leaves_fast_serialize::<N::QHash, N::HasherBase, _, _>(
+            &*self.store,
+            &self.validator_tree_table,
+            checkpoint_id,
+            0,
+            2 * psy_data::guta::realm_finalize::VALIDATOR_TREE_HEIGHT,
+            &[SimpleMerkleNode {
+                key: SimpleMerkleNodeKey::new(psy_data::guta::realm_finalize::VALIDATOR_TREE_HEIGHT as u8, leaf_index),
+                value,
+            }],
+        )
+        .await?;
+        Ok(res.pop().ok_or_else(|| anyhow::anyhow!("No delta merkle proof found"))?)
+    }
+
+    async fn validator_tree_set_nodes(&self, checkpoint_id: u64, nodes: &[SimpleMerkleNode<N::QHash>]) -> anyhow::Result<()> {
+        self.store
+            .db_set_zero_id_merkle_nodes_batch(&self.validator_tree_table, checkpoint_id, nodes)
+            .await
+    }
+
+    async fn validator_tree_set_nodes_ffs(&self, checkpoint_id: u64, data: &[u8]) -> anyhow::Result<()> {
+        self.store
+            .db_set_zero_id_merkle_nodes_from_fast_serialized(&self.validator_tree_table, checkpoint_id, data)
+            .await
+    }
+
+    async fn validator_tree_set_leaf_preimage(&self, checkpoint_id: u64, leaf_index: u64, preimage: &ValidatorLeafPreimage) -> anyhow::Result<()> {
+        self.store
+            .db_insert_one_single_checkpointed_object(
+                &self.checkpointed_object_table,
+                validator_tree_preimage_obj_id(leaf_index)?,
+                checkpoint_id,
+                preimage,
+            )
             .await
     }
 }
@@ -2116,6 +2336,7 @@ impl<
             latest_pending_id
         )
     }
+
 }
 
 #[async_trait]

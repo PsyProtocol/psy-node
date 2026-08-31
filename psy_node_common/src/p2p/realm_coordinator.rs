@@ -1,9 +1,12 @@
 use async_trait::async_trait;
+use jsonrpsee::core::client::Error as JsonRpseeClientError;
 use parth_core::{crypto::hash::merkle_proof::MerkleProofCore, data::hash::checkpointed_merkle_node::CheckpointedMerkleHash, protocol::core_types::QNetworkTypesConfig};
 use psy_api_core::coordinator::standard_edge_rpc::CoordinatorEdgeRpcClient;
 use psy_data::{guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobType, prepared_block::realm::PsyRealmCoordinatorUpdate};
 use psy_node_core::p2p::traits::realm_coordinantor::RealmCoordinatorClient;
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseMulti;
+
+use crate::p2p::guta_submit::GutaSubmitError;
 
 pub struct PsyRealmCoordinatorClientAPI<N: QNetworkTypesConfig + 'static, C: CoordinatorEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof>> {
     pub client: C,
@@ -72,11 +75,18 @@ impl<N: QNetworkTypesConfig + 'static, C: CoordinatorEdgeRpcClient<N::F, N::QHas
         input: GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
         proof: Vec<u8>,
         realm_id: u64,
+        proposal: Option<Vec<u8>>,
+        certificate: Option<Vec<u8>>,
     ) -> anyhow::Result<()> {
         self.client
-            .submit_guta(input, proof, realm_id)
+            .submit_guta(input, proof, realm_id, proposal, certificate)
             .await
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            .map_err(|error| match error {
+                JsonRpseeClientError::Call(object) => GutaSubmitError::from_error_object(&object)
+                    .map(anyhow::Error::from)
+                    .unwrap_or_else(|| anyhow::anyhow!("GUTA submit rejected: {}", object)),
+                other => anyhow::anyhow!("GUTA submit transport error: {other}"),
+            })?;
         Ok(())
     }
     async fn rc_get_contract_tree_state_heights(&self, checkpoint_id: u64, contract_ids: Vec<u64>) -> anyhow::Result<Vec<u8>> {
