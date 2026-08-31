@@ -422,7 +422,7 @@ impl<
 
         let checkpoint_tree_proof: MerkleProofCore<N::QHash> = self
             .db_reader
-            .checkpoint_tree_get_merkle_proof(u64::MAX-0xFFFF, end_cap_checkpoint_id)
+            .checkpoint_tree_get_merkle_proof(current_checkpoint_id, end_cap_checkpoint_id)
             .await?;
         timer.lap_micros("checkpoint_tree_get_merkle_proof");
 

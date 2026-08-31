@@ -7,6 +7,7 @@ pub mod redis_inspect;
 pub mod scylla_inspect;
 pub mod nats_inspect;
 pub mod chain_info;
+pub mod rollback;
 
 use chain_info::ChainInfoArgs;
 use nats_inspect::NatsInspectArgs;
@@ -15,6 +16,7 @@ use read_realm_backup::ReadRealmBackupArgs;
 use read_worker_backup::ReadWorkerBackupArgs;
 use redis_inspect::RedisInspectArgs;
 use scylla_inspect::ScyllaInspectArgs;
+use rollback::RollbackArgs;
 
 #[derive(Parser)]
 pub struct Cli {
@@ -38,4 +40,6 @@ pub enum Commands {
     NatsInspect(NatsInspectArgs),
     #[command(about = "Config-driven chain info query across coordinator and realms")]
     ChainInfo(ChainInfoArgs),
+    #[command(name = "rollback", about = "Generate or execute an offline role-local rollback plan")]
+    Rollback(RollbackArgs),
 }

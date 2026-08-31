@@ -1,5 +1,4 @@
 
-
 use std::{env, time::Duration};
 
 use async_nats::
@@ -9,6 +8,12 @@ use async_nats::
     }
 ;
 use crate::queue::NatsJetStreamClient;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NatsSetupMode {
+    CreateIfMissing,
+    ExistingOnly,
+}
 
 fn env_u64_ms(name: &str, default_value: u64) -> anyhow::Result<u64> {
     match env::var(name) {
@@ -28,16 +33,15 @@ fn env_u64_ms(name: &str, default_value: u64) -> anyhow::Result<u64> {
 pub async fn setup_nats_psy_queue_from_connection_str(
     connection_str: &str,
     base_namespace: &str,
+    mode: NatsSetupMode,
 ) -> anyhow::Result<NatsJetStreamClient> {
-
     if connection_str.is_empty() {
-        anyhow::bail!("Scylla Connection string is empty");
+        anyhow::bail!("NATS connection string is empty");
     }
-    let addresses = connection_str.split(",").map(|s| s.to_string()).collect::<Vec<String>>();
-
+    let addresses = connection_str.split(',').map(str::to_string).collect::<Vec<_>>();
     let ephemeral_timeout_ms = env_u64_ms("NATS_EPHEMERAL_ACK_WAIT_MS", 5000)?;
     let ephemeral_inactive_threshold_ms = env_u64_ms("NATS_EPHEMERAL_INACTIVE_THRESHOLD_MS", 600_000)?;
-    let standard_ephemeral_queue_pull_config: PullConfig = PullConfig {
+    let standard_ephemeral_queue_pull_config = PullConfig {
         ack_policy: jetstream::consumer::AckPolicy::All,
         ack_wait: Duration::from_millis(ephemeral_timeout_ms),
         inactive_threshold: Duration::from_millis(ephemeral_inactive_threshold_ms),
@@ -60,15 +64,26 @@ pub async fn setup_nats_psy_queue_from_connection_str(
         ..Default::default()
     };
     let standard_jet_stream_config = jetstream::stream::Config { ..Default::default() };
-    let client = NatsJetStreamClient::new_connection(
-        base_namespace.to_string(),
-        addresses,
-        standard_ephemeral_queue_pull_config,
-        worker_queue_pull_config,
-        standard_jet_stream_config,
-    )
-    .await?;
-
-    Ok(client)
-
+    match mode {
+        NatsSetupMode::CreateIfMissing => {
+            NatsJetStreamClient::new_connection(
+                base_namespace.to_string(),
+                addresses,
+                standard_ephemeral_queue_pull_config,
+                worker_queue_pull_config,
+                standard_jet_stream_config,
+            )
+            .await
+        }
+        NatsSetupMode::ExistingOnly => {
+            NatsJetStreamClient::connect_existing(
+                base_namespace.to_string(),
+                addresses,
+                standard_ephemeral_queue_pull_config,
+                worker_queue_pull_config,
+                standard_jet_stream_config,
+            )
+            .await
+        }
+    }
 }

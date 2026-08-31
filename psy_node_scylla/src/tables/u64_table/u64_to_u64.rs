@@ -17,6 +17,7 @@ use crate::{
 pub struct ScyllaU64ToU64TablePreparedStatements {
     pub insert_1_statement: Statement,
     pub insert_1_prepared: Arc<PreparedStatement>,
+    pub delete_1_prepared: Arc<PreparedStatement>,
 
     pub select_value_1_statement: Statement,
     pub select_value_1_prepared: Arc<PreparedStatement>,
@@ -41,6 +42,7 @@ impl ScyllaU64ToU64TablePreparedStatements {
     ) -> anyhow::Result<Self> {
         let insert_1_statement = Statement::new(format!("INSERT INTO {}.{} (obj_id, value) VALUES (?, ?)", keyspace, table_name));
         let insert_1_prepared = session.prepare(insert_1_statement.clone()).await?;
+        let delete_1_prepared = session.prepare(format!("DELETE FROM {}.{} WHERE obj_id = ?", keyspace, table_name)).await?;
 
         let select_value_1_statement = Statement::new(format!("SELECT value FROM {}.{} WHERE obj_id = ?", keyspace, table_name));
         let select_value_1_prepared = session.prepare(select_value_1_statement.clone()).await?;
@@ -57,6 +59,7 @@ impl ScyllaU64ToU64TablePreparedStatements {
         Ok(Self {
             insert_1_statement: insert_1_statement,
             insert_1_prepared: Arc::new(insert_1_prepared),
+            delete_1_prepared: Arc::new(delete_1_prepared),
             select_value_1_statement: select_value_1_statement,
             select_value_1_prepared: Arc::new(select_value_1_prepared),
             select_all_statement: select_all_statement,
@@ -117,6 +120,13 @@ impl ScyllaStandardPreparedTableStatements for ScyllaU64ToU64TablePreparedStatem
 }
 
 impl ScyllaU64ToU64TablePreparedStatements {
+    pub async fn delete_many_object_ids(&self, session: &Session, ids: &[u64]) -> anyhow::Result<()> {
+        for &id in ids {
+            session.execute_unpaged(&self.delete_1_prepared, (u64_to_i64_exact(id),)).await?;
+        }
+        Ok(())
+    }
+
     pub async fn select_one_single(&self, session: &Session, obj_id: u64) -> anyhow::Result<Option<u64>> {
         let res = session
             .execute_unpaged(&self.select_value_1_prepared, (u64_to_i64_exact(obj_id),))

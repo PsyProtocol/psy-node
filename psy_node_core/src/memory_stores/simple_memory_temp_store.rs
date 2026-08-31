@@ -9,7 +9,7 @@ use parth_core::{
 };
 use std::{collections::HashMap, sync::{Arc, RwLock}};
 
-use crate::store::traits::{proof_store::{QParthProofStoreReader, QParthProofStoreWriter}, temp_db::{QTempDatabaseCounterReaderBase, QTempDatabaseCounterWriterBase, QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase}};
+use crate::store::traits::{proof_store::{QParthProofBucketPresenceReader, QParthProofStoreReader, QParthProofStoreWriter}, temp_db::{QTempDatabaseCounterReaderBase, QTempDatabaseCounterWriterBase, QTempDatabaseRawKVEnumeratorBase, QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase, TempKvScanPage}};
 
 #[derive(Debug, Clone)]
 pub struct SimpleMemoryTempStore {
@@ -80,6 +80,14 @@ impl QParthProofStoreWriter for SimpleMemoryTempStore {
             .map_err(|e| anyhow::anyhow!(e.to_string()))?
             .remove(&unique_pending_id);
         Ok(())
+    }
+}
+
+#[async_trait]
+impl QParthProofBucketPresenceReader for SimpleMemoryTempStore {
+    async fn contains_proofs_for_pending_id(&self, unique_pending_id: u64) -> anyhow::Result<bool> {
+        let guard = self.proof_map.read().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        Ok(guard.get(&unique_pending_id).map(|b| !b.is_empty()).unwrap_or(false))
     }
 }
 
@@ -239,6 +247,28 @@ impl QTempDatabaseRawKVWriterBase for SimpleMemoryTempStore {
     }
 }
 
+#[async_trait]
+impl QTempDatabaseRawKVEnumeratorBase for SimpleMemoryTempStore {
+    async fn qtdb_raw_kv_scan_fields(&self, cursor: u64, count: u32) -> anyhow::Result<TempKvScanPage> {
+        // Sorted kv_map keys with a synthetic index cursor; nothing is invented.
+        let mut keys: Vec<Vec<u8>> = self
+            .kv_map
+            .read()
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        let total = keys.len();
+        let start = (cursor as usize).min(total);
+        let page = (count as usize).max(1);
+        let end = (start + page).min(total);
+        let fields = keys[start..end].to_vec();
+        let next_cursor = if end >= total { 0 } else { end as u64 };
+        Ok(TempKvScanPage { next_cursor, fields })
+    }
+}
+
 impl QAutoImplementGeneric for SimpleMemoryTempStore {}
 
 
@@ -290,6 +320,32 @@ mod tests {
         assert_eq!(8, store.get_temp_database_counter(&counter_table, &TableDefAInnerKey { a: 1, b: 2 }).await.unwrap());
         store.set_temp_database_counter(&counter_table, &TableDefAInnerKey { a: 1, b: 2 }, 42).await.unwrap();
         assert_eq!(42, store.get_temp_database_counter(&counter_table, &TableDefAInnerKey { a: 1, b: 2 }).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_proof_bucket_presence_empty_missing_false() {
+        use crate::store::traits::proof_store::{
+            QParthProofBucketPresenceReader, QParthProofStoreWriter,
+        };
+        use parth_core::utils::QPGenRandom;
+        use psy_core::job::job_id::QProvingJobDataID;
+
+        let store = SimpleMemoryTempStore::new();
+        let pending_id = 42u64;
+
+        assert!(!store.contains_proofs_for_pending_id(pending_id).await.unwrap());
+
+        let job_id = QProvingJobDataID::qp_rand_gen();
+        store
+            .put_proof_bytes_for_job_id(job_id, pending_id, b"proof")
+            .await
+            .unwrap();
+        assert!(store.contains_proofs_for_pending_id(pending_id).await.unwrap());
+
+        store.delete_all_proofs_for_pending_id(pending_id).await.unwrap();
+        assert!(!store.contains_proofs_for_pending_id(pending_id).await.unwrap());
+
+        assert!(!store.contains_proofs_for_pending_id(pending_id + 1).await.unwrap());
     }
 
 

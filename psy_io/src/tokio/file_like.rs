@@ -41,6 +41,7 @@ pub trait TokioLikeFileSystem: Send + Sync {
     async fn file_like_exists(&self, path: &str) -> tokio::io::Result<bool>;
     async fn file_like_remove_file(&self, path: &str) -> tokio::io::Result<()>;
     async fn file_like_rename(&self, old_path: &str, new_path: &str) -> tokio::io::Result<()>;
+    async fn file_like_fs_sync_parent_dir(&self, path: &str) -> tokio::io::Result<()>;
     async fn file_like_metadata(&self, path: &str) -> tokio::io::Result<FileLikeMetadata> {
         let mut file = self.file_like_fs_open(path).await?;
         file.file_like_metadata().await
@@ -76,6 +77,13 @@ impl TokioLikeFileSystem for TokioStdFileSystem {
     }
     async fn file_like_rename(&self, old_path: &str, new_path: &str) -> tokio::io::Result<()> {
         tokio::fs::rename(old_path, new_path).await
+    }
+    async fn file_like_fs_sync_parent_dir(&self, path: &str) -> tokio::io::Result<()> {
+        let parent = std::path::Path::new(path)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        tokio::fs::File::open(parent).await?.sync_all().await
     }
     async fn file_like_metadata(&self, path: &str) -> tokio::io::Result<FileLikeMetadata> {
         let metadata = tokio::fs::metadata(path).await?;

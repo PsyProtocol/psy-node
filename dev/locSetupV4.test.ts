@@ -5,19 +5,30 @@ import {
     REALM_PROCESSOR_READY_MARKER,
     isExactProcessorReadyLine,
     s3CurlArgs,
-} from "./locSetupDefaults";
+} from "./locSetupPolicy";
 import {
+    ANVIL_STATE_PATH,
+    ROLLBACK_STOP_SENTINEL_CONTENT,
+    ROLLBACK_STOP_SENTINEL_PATH,
+    applicationListenerPorts,
+    applicationStartOrder,
+    devnetControlSocketPath,
+    sendDevnetControlCommand,
     evaluateCompilerArtifactStamp,
     isUsableGenesisData,
     planPsyDappNestedSubmodulesFromDisk,
     readGenesisContractsArtifactStamp,
+    resolveLocalAnvilStatePlan,
     resolveProjectsDir,
     RunningProcess,
     runStreamingCaptureStderr,
     retryProcessorStartup,
+    splitDevnetProcesses,
     startAfterPrerequisite,
+    startDevnetControlServer,
     startRealmProcessorBatchSequentially,
     writeCompilerArtifactStamp,
+    writeRollbackStopSentinel,
 } from "./locSetupV4";
 import type { GenesisContractsArtifactFingerprint } from "./locSetupV4";
 
@@ -178,6 +189,157 @@ describe("startRealmProcessorBatchSequentially", () => {
         });
         await expect(startup).rejects.toThrow("realm 5 failed readiness");
         expect(started).toEqual([4, 5]);
+    });
+});
+
+function processTemplate(name: string, commands: string[]): RunningProcess {
+    const process = Object.create(RunningProcess.prototype) as RunningProcess;
+    process.name = name;
+    process.cmds = commands;
+    return process;
+}
+
+describe("devnet application lifecycle", () => {
+    it("keeps only the database launcher and Anvil alive", () => {
+        const processes = [
+            processTemplate("db", ["./dev/start_db.sh", "--persist"]),
+            processTemplate("l1_anvil", ["anvil", "--port", "8545"]),
+            processTemplate("coordinator_processor", ["psy_node_cli", "start-coordinator-processor"]),
+            processTemplate("bridge_relayer", ["psy_relayer_cli", "--config", "daemon.toml"]),
+        ];
+
+        const { persistent, applications } = splitDevnetProcesses(processes);
+        expect(persistent.map((process) => process.name)).toEqual(["db", "l1_anvil"]);
+        expect(applications.map((process) => process.name)).toEqual(["coordinator_processor", "bridge_relayer"]);
+    });
+
+    it("orders node core before services, indexers, and relayer", () => {
+        const processes = [
+            processTemplate("bridge_relayer", ["psy_relayer_cli"]),
+            processTemplate("psy_indexer_coordinator", ["psy-indexer"]),
+            processTemplate("psy_services", ["psy-services"]),
+            processTemplate("envio", ["pnpm", "start"]),
+            processTemplate("prove_proxy_0", ["psy_user_cli", "prove-proxy"]),
+            processTemplate("worker_0", ["psy_worker_cli", "worker"]),
+            processTemplate("realm_edge_0_0", ["psy_node_cli", "start-realm-edge"]),
+            processTemplate("realm_0_processor", ["psy_node_cli", "start-realm-processor"]),
+            processTemplate("coordinator_edge_0", ["psy_node_cli", "start-coordinator-edge"]),
+            processTemplate("coordinator_processor", ["psy_node_cli", "start-coordinator-processor"]),
+        ];
+
+        expect(applicationStartOrder(processes)).toEqual([
+            "coordinator_processor",
+            "coordinator_edge_0",
+            "realm_0_processor",
+            "realm_edge_0_0",
+            "worker_0",
+            "prove_proxy_0",
+            "envio",
+            "psy_services",
+            "psy_indexer_coordinator",
+            "bridge_relayer",
+        ]);
+    });
+
+    it("derives every application listener that must close before rollback", () => {
+        const processes = [
+            processTemplate("coordinator_edge_0", ["psy_node_cli", "start-coordinator-edge", "--port", "1337"]),
+            processTemplate("realm_edge_0_0", ["psy_node_cli", "start-realm-edge", "--port", "13380"]),
+            processTemplate("prove_proxy_0", ["psy_user_cli", "prove-proxy", "--listen-addr", "0.0.0.0:9999"]),
+            processTemplate("faucet_server", ["psy_user_cli", "faucet-server", "--listen-addr", "0.0.0.0:9998"]),
+            processTemplate("psy_services", ["psy-services"]),
+            processTemplate("envio", ["pnpm", "start"]),
+        ];
+
+        expect(applicationListenerPorts(processes)).toEqual([1337, 3000, 9898, 9998, 9999, 13380]);
+    });
+
+    it("uses a stable repo-specific control socket path", () => {
+        const first = devnetControlSocketPath("<workspace>/psy-node");
+        const second = devnetControlSocketPath("<workspace>/psy-node");
+        expect(first).toBe(second);
+        expect(first).toEndWith(".control.sock");
+        expect(first).not.toBe(devnetControlSocketPath("<workspace>/other-node"));
+    });
+
+
+    it("delivers serialized commands through the repo control socket", async () => {
+        const repoRoot = `${(await Bun.$`mktemp -d`.text()).trim()}/repo`;
+        await Bun.$`mkdir -p ${repoRoot}`.quiet();
+        const received: string[] = [];
+        const server = await startDevnetControlServer(repoRoot, async (command) => {
+            received.push(command);
+            return `${command} complete`;
+        });
+        try {
+            expect(await sendDevnetControlCommand(repoRoot, "restart")).toBe("restart complete");
+            expect(await sendDevnetControlCommand(repoRoot, "rollback-stop")).toBe("rollback-stop complete");
+            expect(await sendDevnetControlCommand(repoRoot, "rollback-resume")).toBe("rollback-resume complete");
+            expect(received).toEqual(["restart", "rollback-stop", "rollback-resume"]);
+        } finally {
+            await server.close();
+            await Bun.$`rm -rf ${path.dirname(repoRoot)}`.quiet();
+        }
+    });
+    it("writes the exact rollback attestation", async () => {
+        const dir = (await Bun.$`mktemp -d`.text()).trim();
+        try {
+            const sentinelPath = await writeRollbackStopSentinel(dir);
+            expect(sentinelPath).toBe(path.join(dir, ROLLBACK_STOP_SENTINEL_PATH));
+            expect((await Bun.file(sentinelPath).text()).trim()).toBe(ROLLBACK_STOP_SENTINEL_CONTENT);
+        } finally {
+            await Bun.$`rm -rf ${dir}`.quiet();
+        }
+    });
+});
+
+describe("local Anvil persistence", () => {
+    it("uses the ignored db/anvil state path for a new chain", async () => {
+        const dir = (await Bun.$`mktemp -d`.text()).trim();
+        try {
+            const plan = await resolveLocalAnvilStatePlan(dir);
+            expect(plan.statePath).toBe(path.join(dir, ANVIL_STATE_PATH));
+            expect(plan.hasState).toBe(false);
+            expect(plan.shouldResetEnvio).toBe(true);
+        } finally {
+            await Bun.$`rm -rf ${dir}`.quiet();
+        }
+    });
+
+    it("reuses Anvil and localhost deployments only when both exist", async () => {
+        const dir = (await Bun.$`mktemp -d`.text()).trim();
+        try {
+            await Bun.$`mkdir -p ${dir}/db/anvil ${dir}/psy-contracts/deployments/localhost`.quiet();
+            await Bun.write(`${dir}/db/anvil/state.json`, "{}");
+            await Bun.write(`${dir}/psy-contracts/deployments/localhost/deployed-contracts.json`, "{}");
+            const plan = await resolveLocalAnvilStatePlan(dir);
+            expect(plan.hasState).toBe(true);
+            expect(plan.shouldResetEnvio).toBe(false);
+        } finally {
+            await Bun.$`rm -rf ${dir}`.quiet();
+        }
+    });
+
+    it("rejects state and deployment drift", async () => {
+        const dir = (await Bun.$`mktemp -d`.text()).trim();
+        try {
+            await Bun.$`mkdir -p ${dir}/db/anvil`.quiet();
+            await Bun.write(`${dir}/db/anvil/state.json`, "{}");
+            await expect(resolveLocalAnvilStatePlan(dir)).rejects.toThrow("must exist together");
+        } finally {
+            await Bun.$`rm -rf ${dir}`.quiet();
+        }
+    });
+
+    it("rejects deployment without Anvil state", async () => {
+        const dir = (await Bun.$`mktemp -d`.text()).trim();
+        try {
+            await Bun.$`mkdir -p ${dir}/psy-contracts/deployments/localhost`.quiet();
+            await Bun.write(`${dir}/psy-contracts/deployments/localhost/deployed-contracts.json`, "{}");
+            await expect(resolveLocalAnvilStatePlan(dir)).rejects.toThrow("must exist together");
+        } finally {
+            await Bun.$`rm -rf ${dir}`.quiet();
+        }
     });
 });
 

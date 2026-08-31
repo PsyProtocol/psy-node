@@ -13,6 +13,7 @@ use crate::{constants::{INSERT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_
 pub struct ScyllaBlobToBlobTablePreparedStatements {
     pub insert_1_statement: Statement,
     pub insert_1_prepared: Arc<PreparedStatement>,
+    pub delete_1_prepared: Arc<PreparedStatement>,
 
     pub select_value_1_statement: Statement,
     pub select_value_1_prepared: Arc<PreparedStatement>,
@@ -36,6 +37,7 @@ impl ScyllaBlobToBlobTablePreparedStatements {
     ) -> anyhow::Result<Self> {
         let insert_1_statement = Statement::new(format!("INSERT INTO {}.{} (obj_id, value) VALUES (?, ?)", keyspace, table_name));
         let insert_1_prepared = session.prepare(insert_1_statement.clone()).await?;
+        let delete_1_prepared = session.prepare(format!("DELETE FROM {}.{} WHERE obj_id = ?", keyspace, table_name)).await?;
 
         let select_value_1_statement = Statement::new(format!("SELECT value FROM {}.{} WHERE obj_id = ? LIMIT 1", keyspace, table_name));
         let select_value_1_prepared = session.prepare(select_value_1_statement.clone()).await?;
@@ -49,6 +51,7 @@ impl ScyllaBlobToBlobTablePreparedStatements {
         Ok(Self {
             insert_1_statement: insert_1_statement,
             insert_1_prepared: Arc::new(insert_1_prepared),
+            delete_1_prepared: Arc::new(delete_1_prepared),
             select_value_1_statement: select_value_1_statement,
             select_value_1_prepared: Arc::new(select_value_1_prepared),
             select_key_value_1_statement: select_key_value_1_statement,
@@ -86,6 +89,18 @@ impl ScyllaBlobToBlobTablePreparedStatements {
     ) -> anyhow::Result<Self> {
         Self::create_table(session.clone(), keyspace, table_name, table_key).await?;
         Self::new_from_session(session, keyspace, table_name, table_key).await
+    }
+
+    pub async fn delete_many_keys(&self, session: &Session, keys: &[Vec<u8>]) -> anyhow::Result<()> {
+        for key in keys {
+            session.execute_unpaged(&self.delete_1_prepared, (key.as_slice(),)).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn contains_key(&self, session: &Session, key: &[u8]) -> anyhow::Result<bool> {
+        let result = session.execute_unpaged(&self.select_key_value_1_prepared, (key,)).await?;
+        Ok(result.into_rows_result()?.maybe_first_row::<(Vec<u8>, Vec<u8>)>()?.is_some())
     }
 
     pub async fn set_or_insert_one(&self, session: Arc<Session>, obj_id: &[u8], value: &[u8]) -> anyhow::Result<()> {
@@ -411,6 +426,16 @@ impl ScyllaBiDirectionalBlobToBlobTablePreparedStatements {
 }
 
 impl ScyllaBiDirectionalBlobToBlobTablePreparedStatements {
+    pub async fn delete_many_pairs(&self, session: &Session, keys: &[(Vec<u8>, Vec<u8>)]) -> anyhow::Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let k1s = keys.iter().map(|(k1, _)| k1.clone()).collect::<Vec<_>>();
+        let k2s = keys.iter().map(|(_, k2)| k2.clone()).collect::<Vec<_>>();
+        self.k1.delete_many_keys(session, &k1s).await?;
+        self.k2.delete_many_keys(session, &k2s).await
+    }
+
     pub async fn set_or_insert_many_qpk<K1: QDatabasePrimitiveKey, K2: QDatabasePrimitiveKey>(&self, session: Arc<Session>, entries: &[BiDirectionalMappingRow<K1, K2>]) -> anyhow::Result<()> {
         self.k1.set_or_insert_many_qpk(session.clone(), entries, false).await?;
         self.k2.set_or_insert_many_qpk(session.clone(), entries, true).await?;

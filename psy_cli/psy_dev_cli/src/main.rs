@@ -33,6 +33,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::ChainInfo(args) => {
             subcommand::chain_info::run(args).await?;
         }
+        Commands::Rollback(args) => {
+            subcommand::rollback::run(args).await?;
+        }
     }
     Ok(())
 }

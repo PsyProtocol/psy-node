@@ -10,7 +10,7 @@ use psy_data::{
 use psy_io::tokio::{TokioLikeFileSystem, TokioStdFileSystem};
 use psy_node_common::{coordinator::processor::create::create_coordinator_processor_and_run, p2p::realm_coordinator::PsyRealmCoordinatorClientAPI, realm::processor::create::create_realm_processor_and_run};
 use psy_node_core::config::node_start_config::{CoordinatorProcessorStartConfig, RealmProcessorStartConfig};
-use psy_node_nats::psy_queue::setup_nats_psy_queue_from_connection_str;
+use psy_node_nats::psy_queue::{setup_nats_psy_queue_from_connection_str, NatsSetupMode};
 use psy_node_redis::store::{new_redis_async_pool, StandardRedisStore};
 use psy_node_scylla::psy_setup::setup_psy_scylla_database_store_from_connection_string;
 use psy_plonky2_circuits::{
@@ -31,7 +31,7 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
         config.coordinator_id,
         config.coordinator_sub_id as u64,
     );
-    let nats_queue = setup_nats_psy_queue_from_connection_str(&config.nats_jetstream_url, &config.db_namespace).await?;
+    let nats_queue = setup_nats_psy_queue_from_connection_str(&config.nats_jetstream_url, &config.db_namespace, NatsSetupMode::CreateIfMissing).await?;
 
     let file_system = TokioStdFileSystem {};
 
@@ -294,7 +294,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
         config.realm_id as u64,
         config.realm_sub_id as u64,
     );
-    let nats_queue = setup_nats_psy_queue_from_connection_str(&config.nats_jetstream_url, &config.db_namespace).await?;
+    let nats_queue = setup_nats_psy_queue_from_connection_str(&config.nats_jetstream_url, &config.db_namespace, NatsSetupMode::CreateIfMissing).await?;
 
     let file_system = TokioStdFileSystem {};
 

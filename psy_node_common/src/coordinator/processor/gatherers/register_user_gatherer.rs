@@ -12,7 +12,7 @@ use parth_core::{
         hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey, PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE},
     },
     node::realm_identifier::QRealmIdentifier,
-    protocol::core_types::{Q256BitHash, QDBHashBase, QNetworkTypesConfig},
+    protocol::core_types::{Q256BitHash, QDBHashBase, QNetworkTreeConstants, QNetworkTypesConfig},
     QCoreProcCheckpointUniqueId,
 };
 use psy_core::{job::job_id::{ProvingJobCircuitType, QProvingJobDataID}, user_id::get_user_id_from_user_registration_id};
@@ -67,17 +67,42 @@ fn hash_two_from_slice<Hash: Q256BitHash, Hasher: MerkleZeroHasher<Hash>>(data: 
     let right = Hash::from_owned_32bytes(data[32..64].try_into().expect("Slice with incorrect length"));
     Hasher::two_to_one(&left, &right)
 }
+fn public_key_hash_to_user_id_row<N: QNetworkTreeConstants, Hash: Q256BitHash>(
+    hash: Hash,
+    registration_id: u64,
+) -> QHash256AndU64<Hash> {
+    QHash256AndU64 {
+        hash,
+        value_u64: get_user_id_from_user_registration_id(
+            registration_id,
+            N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+            N::REALM_GLOBAL_USER_TREE_HEIGHT,
+            N::GROUP_REALM_HEIGHT,
+        ),
+    }
+}
 
-pub async fn read_register_user_gatherer_backup_file_path<Hasher: MerkleZeroHasher<Hash>, Hash: QDBHashBase, FileSystem: TokioLikeFileSystem>(
+
+pub async fn read_register_user_gatherer_backup_file_path<
+    N: QNetworkTreeConstants,
+    Hasher: MerkleZeroHasher<Hash>,
+    Hash: QDBHashBase,
+    FileSystem: TokioLikeFileSystem,
+>(
     file_system: &FileSystem,
     file_path: &str,
     tree: &mut SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
 ) -> anyhow::Result<RegisterUserGathererOutputDatabase<Hash>> {
     tracing::info!("Reading register user gatherer backup file from path: {}", file_path);
     let file: FileSystem::File = file_system.file_like_fs_open(file_path).await?;
-    read_register_user_gatherer_backup_file::<Hasher, Hash, FileSystem::File>(file, tree).await
+    read_register_user_gatherer_backup_file::<N, Hasher, Hash, FileSystem::File>(file, tree).await
 }
-pub async fn read_register_user_gatherer_backup_file<Hasher: MerkleZeroHasher<Hash>, Hash: QDBHashBase, File: TokioFileLike>(
+pub async fn read_register_user_gatherer_backup_file<
+    N: QNetworkTreeConstants,
+    Hasher: MerkleZeroHasher<Hash>,
+    Hash: QDBHashBase,
+    File: TokioFileLike,
+>(
     mut file: File,
     tree: &mut SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
 ) -> anyhow::Result<RegisterUserGathererOutputDatabase<Hash>> {
@@ -136,10 +161,10 @@ pub async fn read_register_user_gatherer_backup_file<Hasher: MerkleZeroHasher<Ha
         new_user_public_keys_ffs.extend_from_slice(&(start_next_user_id + i).to_le_bytes());
         new_user_public_keys_ffs.extend_from_slice(&public_keys_no_id[offset..offset + 64]);
         let leaf_hash = hash_two_from_slice::<Hash, Hasher>(&public_keys_no_id[offset..offset + 64]);
-        new_public_key_hash_to_user_id_rows.push(QHash256AndU64 {
-            hash: leaf_hash,
-            value_u64: start_next_user_id + i,
-        });
+        new_public_key_hash_to_user_id_rows.push(public_key_hash_to_user_id_row::<N, Hash>(
+            leaf_hash,
+            start_next_user_id + i,
+        ));
         tree.set_leaf(start_next_user_id + i, leaf_hash);
         new_leaf_hashes.push(leaf_hash);
     }
@@ -357,15 +382,7 @@ impl<
             .extend_from_slice(self.next_user_id.to_le_bytes().as_slice());
         self.new_user_public_keys_ffs.extend_from_slice(&item);
         let hash = hash_two_from_slice::<N::QHash, N::HasherBase>(&item);
-        let u64_hash_mapping_row = QHash256AndU64 {
-            hash,
-            value_u64: get_user_id_from_user_registration_id(
-                self.next_user_id,
-                N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
-                N::REALM_GLOBAL_USER_TREE_HEIGHT,
-                N::GROUP_REALM_HEIGHT,
-            ),
-        };
+        let u64_hash_mapping_row = public_key_hash_to_user_id_row::<N, N::QHash>(hash, self.next_user_id);
         self.new_public_key_hash_to_user_id_rows_ffs
             .extend_from_slice(&u64_hash_mapping_row.ffs_to_bytes());
 
@@ -492,6 +509,10 @@ impl<
         self.config
             .file_system
             .file_like_fs_flush_file_with_path(&self.pending_file_path, &mut self.new_user_public_keys_file)
+            .await?;
+        self.config
+            .file_system
+            .file_like_fs_sync_file_with_path(&self.pending_file_path, &mut self.new_user_public_keys_file)
             .await?;
 
         let update_user_registration_tree_nodes_ffs = create_ffs_merkle_nodes_zero_id_from_hash_map::<N::QHash>(tree.get_changes());
@@ -1343,29 +1364,26 @@ mod tests2 {
 #[cfg(test)]
 mod tests_backup_v1 {
     use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
-    use parth_core::{pgoldilocks::PoseidonHasher, protocol::core_types::Q256BitHash, PHash};
+    use parth_core::{
+        data::db::hash_id_u64::QHash256AndU64,
+        pgoldilocks::PoseidonHasher,
+        protocol::core_types::{Q256BitHash, QNetworkTreeConstants},
+        PHash,
+    };
+    use psy_core::{network_config::PsyNetworkLocalDevnetConstants, user_id::get_user_id_from_user_registration_id};
     use psy_node_core::file::memory_fs::SimpleMockMemoryFileSystem;
+    use psy_serialize::FastFixedSerializable;
 
-    use super::read_register_user_gatherer_backup_file_path;
+    use super::{public_key_hash_to_user_id_row, read_register_user_gatherer_backup_file_path};
 
+    type N = PsyNetworkLocalDevnetConstants;
     type Hasher = PoseidonHasher;
     type Hash = PHash;
 
-    // Millisecond-only RUB2 magic. Rejected by the RUB1 seconds reader.
     const RUB2_MAGIC_U32: u32 = 0x32425552;
-
-    // A plausible Unix-second timestamp (year ~2023). Exact seconds semantics
-    // for the accepted RUB1 wire format.
     const PLAUSIBLE_BLOCK_TIME_SECONDS: u64 = 1_700_000_000;
-
-    // A plausible Unix-millisecond timestamp (year ~2023). Must never be accepted
-    // on the wire once RUB1 seconds is restored.
     const MILLISECOND_BLOCK_TIME: u64 = 1_700_000_000_000;
 
-    /// Builds the on-disk byte layout of a register-user gatherer backup for the
-    /// given magic, using the supplied tree's current root and start id. Mirrors
-    /// the writer's layout exactly (magic | start_next_user_id | start_root |
-    /// 64-byte public keys... | total_jobs | block_time).
     fn build_backup_bytes(
         magic_u32: u32,
         start_next_user_id: u64,
@@ -1378,8 +1396,8 @@ mod tests_backup_v1 {
         data.extend_from_slice(&magic_u32.to_le_bytes());
         data.extend_from_slice(&start_next_user_id.to_le_bytes());
         data.extend_from_slice(&start_root.clone().into_owned_32bytes());
-        for pk in public_keys {
-            data.extend_from_slice(pk.as_slice());
+        for public_key in public_keys {
+            data.extend_from_slice(public_key.as_slice());
         }
         data.extend_from_slice(&total_jobs.to_le_bytes());
         data.extend_from_slice(&block_time.to_le_bytes());
@@ -1392,55 +1410,28 @@ mod tests_backup_v1 {
         let tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
         let start_root = tree.get_root();
         let path = "register_user_gatherer_realm_0_sub_0_pending_1.backup";
-
-        // A RUB2 backup carrying a millisecond block_time footer.
-        let data = build_backup_bytes(
-            RUB2_MAGIC_U32,
-            0,
-            &start_root,
-            &[],
-            0,
-            MILLISECOND_BLOCK_TIME,
-        );
-        assert!(
-            data.len() >= 4 + 8 + 32 + 8 + 8,
-            "test fixture must clear the reader's minimum-size guard so the magic is actually read"
-        );
+        let data = build_backup_bytes(RUB2_MAGIC_U32, 0, &start_root, &[], 0, MILLISECOND_BLOCK_TIME);
+        assert!(data.len() >= 4 + 8 + 32 + 8 + 8);
         file_system.files.insert(path.to_string(), data);
 
         let mut read_tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
-        let result =
-            read_register_user_gatherer_backup_file_path::<Hasher, Hash, SimpleMockMemoryFileSystem>(
-                &file_system,
-                path,
-                &mut read_tree,
-            )
-            .await;
+        let result = read_register_user_gatherer_backup_file_path::<N, Hasher, Hash, SimpleMockMemoryFileSystem>(
+            &file_system,
+            path,
+            &mut read_tree,
+        )
+        .await;
 
-        let err = result.expect_err("RUB2 backup must be rejected by the RUB1-only reader");
-        let message = err.to_string();
-        assert!(
-            message.to_lowercase().contains("magic"),
-            "rejection must happen at the magic check, got: {message}"
-        );
-        assert!(
-            message.contains("RUB1"),
-            "error must name the expected RUB1 format, got: {message}"
-        );
-        // The millisecond footer must never be parsed into a checkpoint: the magic
-        // check returns before total_jobs / block_time are read, so no
-        // RegisterUserGathererOutputDatabase is constructed.
-        assert!(
-            !message.to_lowercase().contains("block_time"),
-            "rejection must precede any block_time handling, got: {message}"
-        );
-
+        let message = result.expect_err("RUB2 backup must be rejected by the RUB1-only reader").to_string();
+        assert!(message.to_lowercase().contains("magic"));
+        assert!(message.contains("RUB1"));
+        assert!(!message.to_lowercase().contains("block_time"));
         Ok(())
     }
 
     #[tokio::test]
     async fn rejects_rub1_block_time_outside_protocol_field_range() -> anyhow::Result<()> {
-        for block_time in [0, (1u64 << 60)] {
+        for block_time in [0, 1u64 << 60] {
             let file_system = SimpleMockMemoryFileSystem::new();
             let tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
             let start_root = tree.get_root();
@@ -1456,18 +1447,17 @@ mod tests_backup_v1 {
             file_system.files.insert(path.clone(), data);
 
             let mut read_tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
-            let error = read_register_user_gatherer_backup_file_path::<
-                Hasher,
-                Hash,
-                SimpleMockMemoryFileSystem,
-            >(&file_system, &path, &mut read_tree)
+            let error = read_register_user_gatherer_backup_file_path::<N, Hasher, Hash, SimpleMockMemoryFileSystem>(
+                &file_system,
+                &path,
+                &mut read_tree,
+            )
             .await
             .expect_err("invalid block_time must be rejected before checkpoint construction");
 
             assert!(error.to_string().contains("block_time"));
             assert_eq!(read_tree.get_root(), start_root);
         }
-
         Ok(())
     }
 
@@ -1477,9 +1467,6 @@ mod tests_backup_v1 {
         let tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
         let start_root = tree.get_root();
         let path = "register_user_gatherer_realm_0_sub_0_pending_2.backup";
-
-        // A valid RUB1 backup with zero new users and a plausible seconds
-        // block_time footer.
         let data = build_backup_bytes(
             super::REGISTER_USER_GATHERER_BACKUP_V1_MAGIC_U32,
             0,
@@ -1491,22 +1478,65 @@ mod tests_backup_v1 {
         file_system.files.insert(path.to_string(), data);
 
         let mut read_tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
-        let output =
-            read_register_user_gatherer_backup_file_path::<Hasher, Hash, SimpleMockMemoryFileSystem>(
-                &file_system,
-                path,
-                &mut read_tree,
-            )
-            .await?;
+        let output = read_register_user_gatherer_backup_file_path::<N, Hasher, Hash, SimpleMockMemoryFileSystem>(
+            &file_system,
+            path,
+            &mut read_tree,
+        )
+        .await?;
 
         assert_eq!(output.start_next_user_id, 0);
         assert_eq!(output.next_user_id, 0);
         assert_eq!(output.total_jobs, 0);
         assert_eq!(output.block_time, PLAUSIBLE_BLOCK_TIME_SECONDS);
         assert_eq!(output.start_user_registration_tree_hash, start_root);
-        // The reader must commit the (empty) tree changes and leave the root intact.
         assert_eq!(read_tree.get_root(), start_root);
+        Ok(())
+    }
 
+    #[tokio::test]
+    async fn backup_reader_matches_writer_user_id_mapping() -> anyhow::Result<()> {
+        let file_system = SimpleMockMemoryFileSystem::new();
+        let tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
+        let start_root = tree.get_root();
+        let path = "register_user_gatherer_user_id_mapping.backup";
+        let public_key = [7u8; 64];
+        let registration_id = 1;
+        let data = build_backup_bytes(
+            super::REGISTER_USER_GATHERER_BACKUP_V1_MAGIC_U32,
+            registration_id,
+            &start_root,
+            &[&public_key],
+            1,
+            PLAUSIBLE_BLOCK_TIME_SECONDS,
+        );
+        file_system.files.insert(path.to_string(), data);
+
+        let mut read_tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
+        let output = read_register_user_gatherer_backup_file_path::<N, Hasher, Hash, SimpleMockMemoryFileSystem>(
+            &file_system,
+            path,
+            &mut read_tree,
+        )
+        .await?;
+
+        let reader_row = QHash256AndU64::<Hash>::ffs_try_from_slice(&output.new_public_key_hash_to_user_id_rows_ffs)?;
+        let writer_row = public_key_hash_to_user_id_row::<N, Hash>(
+            super::hash_two_from_slice::<Hash, Hasher>(&public_key),
+            registration_id,
+        );
+
+        assert_eq!(reader_row, writer_row);
+        assert_eq!(
+            reader_row.value_u64,
+            get_user_id_from_user_registration_id(
+                registration_id,
+                N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+                N::REALM_GLOBAL_USER_TREE_HEIGHT,
+                N::GROUP_REALM_HEIGHT,
+            ),
+        );
+        assert_ne!(reader_row.value_u64, registration_id);
         Ok(())
     }
 }

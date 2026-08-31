@@ -18,6 +18,7 @@ use crate::{
 pub struct ScyllaU128ToU64TablePreparedStatements {
     pub insert_1_statement: Statement,
     pub insert_1_prepared: Arc<PreparedStatement>,
+    pub delete_1_prepared: Arc<PreparedStatement>,
 
     pub select_value_1_statement: Statement,
     pub select_value_1_prepared: Arc<PreparedStatement>,
@@ -39,6 +40,7 @@ impl ScyllaU128ToU64TablePreparedStatements {
     ) -> anyhow::Result<Self> {
         let insert_1_statement = Statement::new(format!("INSERT INTO {}.{} (obj_id, value) VALUES (?, ?)", keyspace, table_name));
         let insert_1_prepared = session.prepare(insert_1_statement.clone()).await?;
+        let delete_1_prepared = session.prepare(format!("DELETE FROM {}.{} WHERE obj_id = ?", keyspace, table_name)).await?;
 
         let select_value_1_statement = Statement::new(format!("SELECT value FROM {}.{} WHERE obj_id = ? LIMIT 1", keyspace, table_name));
         let select_value_1_prepared = session.prepare(select_value_1_statement.clone()).await?;
@@ -49,6 +51,7 @@ impl ScyllaU128ToU64TablePreparedStatements {
         Ok(Self {
             insert_1_statement: insert_1_statement,
             insert_1_prepared: Arc::new(insert_1_prepared),
+            delete_1_prepared: Arc::new(delete_1_prepared),
             select_value_1_statement: select_value_1_statement,
             select_value_1_prepared: Arc::new(select_value_1_prepared),
             select_all_statement: select_all_statement,
@@ -84,6 +87,13 @@ impl ScyllaU128ToU64TablePreparedStatements {
     ) -> anyhow::Result<Self> {
         Self::create_table(session.clone(), keyspace, table_name, table_key).await?;
         Self::new_from_session(session, keyspace, table_name, table_key).await
+    }
+
+    pub async fn delete_many(&self, session: &Session, keys: &[u128]) -> anyhow::Result<()> {
+        for &key in keys {
+            session.execute_unpaged(&self.delete_1_prepared, (Uuid::from_u128(key),)).await?;
+        }
+        Ok(())
     }
 
     pub async fn set_or_insert_one(&self, session: &Session, obj_id: u128, value: u64) -> anyhow::Result<()> {

@@ -41,8 +41,8 @@ import {
     planPsyDappNestedSubmoduleInit,
     isCompilerFingerprintSource,
     s3CurlArgs,
-} from "./locSetupDefaults";
-import type { PsyDappNestedInitPlan, PsyDappNestedSubmodule } from "./locSetupDefaults";
+} from "./locSetupPolicy";
+import type { PsyDappNestedInitPlan, PsyDappNestedSubmodule } from "./locSetupPolicy";
 
 /**
  * Retry processor creation only for the known transient Scylla schema family.
@@ -608,19 +608,24 @@ export class RunningProcess {
     }
 
     kill(): void {
-        this.intentionalStop = true;
-        if (this.isRunning()) {
-            this.proc.kill();
-        }
+        this.killWithSignal("SIGTERM");
     }
 
     isRunning(): boolean {
         return !this.hasExited && this.proc.killed === false;
     }
 
+    signalProcessGroup(signal: number | NodeJS.Signals): void {
+        try {
+            process.kill(-this.pid, signal);
+        } catch {
+            if (!this.hasExited) this.proc.kill(signal);
+        }
+    }
+
     killWithSignal(signal: number | NodeJS.Signals): void {
         this.intentionalStop = true;
-        this.proc.kill(signal);
+        this.signalProcessGroup(signal);
     }
 
     static async appendLogBanner(filePath: string | undefined, banner: string): Promise<void> {
@@ -659,7 +664,8 @@ export class RunningProcess {
             cwd: options.cwd || undefined,
             stdout: "pipe",
             stderr: "pipe",
-            env: options.env ? { ...process.env, ...options.env } : undefined
+            env: options.env ? { ...process.env, ...options.env } : undefined,
+            detached: true,
         });
 
         const runningProcess = new RunningProcess(proc, options.stdOutVisitor, options.stdErrVisitor, options.allOutputVisitor);
@@ -2544,11 +2550,37 @@ async function ensurePsyContractsDependencies(contractsDir: string) {
     }
 }
 
+export const ANVIL_STATE_PATH = path.join("db", "anvil", "state.json");
+
+export interface LocalAnvilStatePlan {
+    statePath: string;
+    hasState: boolean;
+    shouldResetEnvio: boolean;
+}
+
+export async function resolveLocalAnvilStatePlan(repoCwd: string): Promise<LocalAnvilStatePlan> {
+    const statePath = path.join(repoCwd, ANVIL_STATE_PATH);
+    const deploymentPath = path.join(repoCwd, "psy-contracts", "deployments", "localhost", "deployed-contracts.json");
+    const hasState = await exists(statePath);
+    const hasDeployment = await exists(deploymentPath);
+    if (hasState !== hasDeployment) {
+        throw new Error(
+            `[DevNet] Local Anvil state and localhost deployment must exist together: ` +
+            `${statePath}=${hasState}, ${deploymentPath}=${hasDeployment}. Run make restart-all.`,
+        );
+    }
+    return {
+        statePath,
+        hasState,
+        shouldResetEnvio: !hasState,
+    };
+}
+
 async function deployPsyContracts(
     repoCwd: string,
     l1RpcUrl: string,
     deploymentsNetwork: L1NetworkName,
-    opts?: { fundDevAccounts?: boolean; localAnvilRpcUrl?: string },
+    opts?: { fundDevAccounts?: boolean; localAnvilRpcUrl?: string; reuseLocalDeployment?: boolean },
 ) {
     const contractsDir = path.join(repoCwd, "psy-contracts");
     if (!(await exists(contractsDir))) {
@@ -2566,28 +2598,34 @@ async function deployPsyContracts(
         "deployed-contracts.json",
     );
     const forceRedeploy = shouldRedeployL1();
-    if (deploymentsNetwork !== "localhost") {
-        const hasExistingDeployment = await exists(deploymentSummaryPath);
-        if (!forceRedeploy) {
-            if (!hasExistingDeployment) {
-                throw new Error(
-                    `[DevNet] Missing ${deploymentsNetwork} deployment at ${deploymentSummaryPath}. ` +
-                    `Unset REDEPLOY_L1=false to deploy a fresh ${deploymentsNetwork} stack.`,
-                );
-            }
-            const missingTokens = await readRequiredDeploymentTokenGaps(deploymentSummaryPath);
-            if (missingTokens.length > 0) {
-                throw new Error(
-                    `[DevNet] Existing ${deploymentsNetwork} deployment is incomplete: missing tokens ${missingTokens.join(", ")}. ` +
-                    `Unset REDEPLOY_L1=false to redeploy.`,
-                );
-            }
-            console.log(
-                `[DevNet] Reusing existing ${deploymentsNetwork} deployment at ${deploymentSummaryPath} ` +
-                `(set REDEPLOY_L1=false to reuse intentionally)`,
-            );
-            return;
+    const hasExistingDeployment = await exists(deploymentSummaryPath);
+    if (deploymentsNetwork === "localhost" && opts?.reuseLocalDeployment) {
+        if (!hasExistingDeployment) {
+            throw new Error(`[DevNet] Missing localhost deployment at ${deploymentSummaryPath} for persisted Anvil state`);
         }
+        const missingTokens = await readRequiredDeploymentTokenGaps(deploymentSummaryPath);
+        if (missingTokens.length > 0) {
+            throw new Error(`[DevNet] Persisted localhost deployment is incomplete: missing tokens ${missingTokens.join(", ")}`);
+        }
+        console.log(`[DevNet] Reusing persisted localhost deployment at ${deploymentSummaryPath}`);
+        return;
+    }
+    if (deploymentsNetwork !== "localhost" && !forceRedeploy) {
+        if (!hasExistingDeployment) {
+            throw new Error(
+                `[DevNet] Missing ${deploymentsNetwork} deployment at ${deploymentSummaryPath}. ` +
+                `Unset REDEPLOY_L1=false to deploy a fresh ${deploymentsNetwork} stack.`,
+            );
+        }
+        const missingTokens = await readRequiredDeploymentTokenGaps(deploymentSummaryPath);
+        if (missingTokens.length > 0) {
+            throw new Error(
+                `[DevNet] Existing ${deploymentsNetwork} deployment is incomplete: missing tokens ${missingTokens.join(", ")}. ` +
+                `Unset REDEPLOY_L1=false to redeploy.`,
+            );
+        }
+        console.log(`[DevNet] Reusing existing ${deploymentsNetwork} deployment at ${deploymentSummaryPath}`);
+        return;
     }
     await ensurePsyContractsDependencies(contractsDir);
     const bridgeRelayerSigner = await loadBridgeRelayerSigner(repoCwd);
@@ -3037,8 +3075,9 @@ async function teardownDevnet(cwd: string = ".", purge: boolean = false): Promis
     await killGeneratedEnvioStack(cwd, purge);
     await killKnownPorts();
     if (purge) {
-        console.log("[DevNet] Purging local checkpoints, logs, deployments, and Docker volumes...");
+        console.log("[DevNet] Purging local checkpoints, Anvil state, logs, deployments, and Docker volumes...");
         await cleanCheckpoint("./local_checkpoints", cwd);
+        await cleanCheckpoint("./db/anvil", cwd);
         await cleanCheckpoint("./logs", cwd);
         await cleanCheckpoint("./psy-contracts/deployments/localhost", cwd);
         await cleanCheckpoint("./psy-contracts/deployments/sepolia", cwd);
@@ -3077,12 +3116,128 @@ interface ProcessOptions {
     daemonlize?: boolean;
     cleanState?: boolean;
 }
+export const ROLLBACK_STOP_SENTINEL_CONTENT =
+    "rollback offline: all processors and relayer stopped; Scylla Redis NATS and checkpoints retained";
+export const ROLLBACK_STOP_SENTINEL_PATH = path.join("local_checkpoints", "rollback-stop.sentinel");
 
+type ApplicationLifecycleState = "running" | "stopping" | "stopped" | "starting";
+
+export function splitDevnetProcesses(processes: RunningProcess[]): { persistent: RunningProcess[]; applications: RunningProcess[] } {
+    const persistent: RunningProcess[] = [];
+    const applications: RunningProcess[] = [];
+    for (const process of processes) {
+        if (process.name === "db" || process.name === "l1_anvil") persistent.push(process);
+        else applications.push(process);
+    }
+    return { persistent, applications };
+}
+function applicationStartRank(process: RunningProcess): number {
+    const command = process.cmds.join(" ");
+    if (command.includes("start-coordinator-processor")) return 0;
+    if (command.includes("start-coordinator-edge")) return 1;
+    if (command.includes("start-realm-processor")) return 2;
+    if (command.includes("start-realm-edge")) return 3;
+    if (command.includes("psy_worker_cli") || command.includes("dummy_prover")) return 4;
+    if (command.includes("prove-proxy")) return 5;
+    if (process.name.startsWith("envio")) return 6;
+    if (process.name === "psy_services") return 7;
+    if (process.name.startsWith("psy_indexer")) return 8;
+    if (command.includes("faucet-server")) return 9;
+    if (command.includes("psy_relayer_cli")) return 10;
+    return 11;
+}
+
+function sortedApplicationProcesses(processes: RunningProcess[]): RunningProcess[] {
+    return processes
+        .map((process, index) => ({ process, index }))
+        .sort((left, right) => applicationStartRank(left.process) - applicationStartRank(right.process) || left.index - right.index)
+        .map(({ process }) => process);
+}
+
+export function applicationStartOrder(processes: RunningProcess[]): string[] {
+    return sortedApplicationProcesses(processes).map((process) => process.name);
+}
+export function applicationListenerPorts(processes: RunningProcess[]): number[] {
+    const ports = new Set<number>();
+    for (const process of processes) {
+        const command = process.cmds;
+        for (let index = 0; index < command.length - 1; index += 1) {
+            if (command[index] === "--port") {
+                const port = Number(command[index + 1]);
+                if (Number.isInteger(port)) ports.add(port);
+            }
+            if (command[index] === "--listen-addr") {
+                const port = Number(command[index + 1].split(":").at(-1));
+                if (Number.isInteger(port)) ports.add(port);
+            }
+        }
+        if (process.name === "psy_services") ports.add(3000);
+        if (process.name.startsWith("envio")) ports.add(9898);
+    }
+    return [...ports].sort((left, right) => left - right);
+}
+
+async function waitForTcpPortsClosed(host: string, ports: number[], timeoutMs: number = 15_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    const openPorts = new Set(ports);
+    while (openPorts.size > 0 && Date.now() < deadline) {
+        for (const port of openPorts) {
+            const connected = Promise.withResolvers<boolean>();
+            const socket = net.createConnection({ host, port });
+            const timeout = setTimeout(() => {
+                socket.destroy();
+                connected.resolve(false);
+            }, 250);
+            socket.once("connect", () => {
+                clearTimeout(timeout);
+                socket.end();
+                connected.resolve(true);
+            });
+            socket.once("error", () => {
+                clearTimeout(timeout);
+                socket.destroy();
+                connected.resolve(false);
+            });
+            if (!(await connected.promise)) openPorts.delete(port);
+        }
+        if (openPorts.size > 0) await Bun.sleep(100);
+    }
+    if (openPorts.size > 0) {
+        throw new Error(`[DevNet][control] application ports remained open after stop: ${[...openPorts].join(", ")}`);
+    }
+}
+
+export async function writeRollbackStopSentinel(cwd: string): Promise<string> {
+    const sentinelPath = path.join(cwd, ROLLBACK_STOP_SENTINEL_PATH);
+    await mkdir(path.dirname(sentinelPath), { recursive: true });
+    await writeFile(sentinelPath, `${ROLLBACK_STOP_SENTINEL_CONTENT}\n`, "utf8");
+    return sentinelPath;
+}
+async function stopEnvioIndexerProcess(): Promise<void> {
+    await runIgnoreErrors([
+        "bash",
+        "-lc",
+        "if command -v lsof >/dev/null 2>&1; then lsof -tiTCP:9898 -sTCP:LISTEN 2>/dev/null | xargs -r kill -TERM; elif command -v fuser >/dev/null 2>&1; then fuser -k 9898/tcp >/dev/null 2>&1 || true; fi",
+    ]);
+}
+
+async function waitForProcessExit(process: RunningProcess, timeoutMs: number = 15_000): Promise<void> {
+    if (process.hasExited) return;
+    const timeoutGate = Promise.withResolvers<boolean>();
+    const timeout = setTimeout(() => timeoutGate.resolve(false), timeoutMs);
+    const exited = await Promise.race([process.proc.exited.then(() => true), timeoutGate.promise]);
+    clearTimeout(timeout);
+    if (exited || process.hasExited) return;
+    process.killWithSignal("SIGKILL");
+    await process.proc.exited;
+}
 class DevNetProcessManager {
     spawnedProcesses: RunningProcess[] = [];
     needsStartDb: boolean = false;
     /** When true, exited children must not be auto-restarted (teardown/Ctrl+C). */
     private stopping: boolean = false;
+    private applicationLifecycleState: ApplicationLifecycleState = "running";
+    private pausedApplicationProcesses: RunningProcess[] = [];
 
     // Shared Config Constants
     private readonly NETWORK = "local-devnet";
@@ -3130,9 +3285,7 @@ class DevNetProcessManager {
                 `[DevNet][supervisor] DB recovered; restarting dependent processor '${process.name}' ` +
                 `(pid=${process.pid}) to rebuild infrastructure connections`
             );
-            // Deliberately do not set intentionalStop: this is supervised
-            // dependency recovery, so handleSupervisedExit must respawn it.
-            process.proc.kill("SIGTERM");
+            process.signalProcessGroup("SIGTERM");
         }
     }
 
@@ -3181,14 +3334,6 @@ class DevNetProcessManager {
         };
     }
 
-    /**
-     * Processor binaries emit a fatal CFLI error marker but may keep running
-     * while producing empty blocks. Detect that marker in their output and
-     * terminate the process without marking the stop intentional, so the
-     * existing auto-restart path recreates it. `fatalRestartRequested` guards
-     * against repeated kills for duplicate log lines. DB-recovery restarts
-     * (dependencyRestartRequested) are independent and remain unchanged.
-     */
     private wireFatalProcessorSupervision(p: RunningProcess): void {
         if (!this.autoRestartEnabled() || !this.isProcessorProcess(p)) return;
         const originalVisitor = p.allOutputVisitor;
@@ -3199,10 +3344,8 @@ class DevNetProcessManager {
                     `[DevNet][supervisor] fatal processor error detected for '${process.name}' ` +
                     `(pid=${process.pid}); terminating for supervised restart`
                 );
-                // Deliberately do not set intentionalStop: handleSupervisedExit
-                // must respawn the processor after it exits.
                 try {
-                    process.proc.kill("SIGTERM");
+                    process.signalProcessGroup("SIGTERM");
                 } catch (err) {
                     console.warn(`[DevNet][supervisor] failed to signal fatal processor '${process.name}': ${err}`);
                 }
@@ -3237,8 +3380,8 @@ class DevNetProcessManager {
         );
 
         await new Promise((r) => setTimeout(r, delayMs));
-        if (this.stopping) {
-            console.log(`[DevNet][supervisor] process '${name}' restart aborted (teardown in progress)`);
+        if (this.stopping || previous.intentionalStop) {
+            console.log(`[DevNet][supervisor] process '${name}' restart aborted (intentional stop or teardown)`);
             return;
         }
 
@@ -3249,38 +3392,7 @@ class DevNetProcessManager {
             `===== cmd: ${cmdStr} =====\n`;
 
         try {
-            const opts = {
-                ...previous.spawnOptions,
-                appendLogs: true,
-                logBanner: banner,
-            };
-            let restarted: RunningProcess;
-            if (previous.useInitHint && previous.hintDetector) {
-                restarted = await RunningProcess.spawnWithInitializationHintWithRetry(
-                    previous.cmds,
-                    previous.hintDetector,
-                    {
-                        ...opts,
-                        maxRetries: previous.initMaxRetries,
-                        retryDelayMs: previous.initRetryDelayMs,
-                    },
-                );
-            } else {
-                restarted = await RunningProcess.spawn(previous.cmds, opts);
-            }
-
-            restarted.name = name;
-            restarted.restartCount = previous.restartCount;
-            restarted.cmds = previous.cmds.slice();
-            restarted.spawnOptions = {
-                ...previous.spawnOptions,
-                appendLogs: true,
-            };
-            restarted.hintDetector = previous.hintDetector;
-            restarted.useInitHint = previous.useInitHint;
-            restarted.initMaxRetries = previous.initMaxRetries;
-            restarted.initRetryDelayMs = previous.initRetryDelayMs;
-
+            const restarted = await this.spawnFromTemplate(previous, banner, false);
             const idx = this.spawnedProcesses.indexOf(previous);
             if (idx >= 0) this.spawnedProcesses[idx] = restarted;
             else this.spawnedProcesses.push(restarted);
@@ -3306,20 +3418,124 @@ class DevNetProcessManager {
             console.error(
                 `[DevNet][supervisor] process '${name}' restart #${attempt} FAILED: ${err}`
             );
-            if (!this.stopping) {
+            if (!this.stopping && !previous.intentionalStop) {
                 const retryDelay = Math.min(60_000, delayMs * 2);
                 console.warn(
                     `[DevNet][supervisor] will retry '${name}' again in ${retryDelay}ms (still counting as restart #${attempt})`
                 );
                 await new Promise((r) => setTimeout(r, retryDelay));
-                // Decrement so the next handleSupervisedExit increments back to the same attempt number + 1
-                // Actually we want attempt to keep growing: leave restartCount as-is and call again with synthetic exit.
                 previous.hasExited = true;
                 previous.intentionalStop = false;
-                // Call again — restartCount will go to attempt+1
                 void this.handleSupervisedExit(previous, code, signal);
             }
         }
+    }
+
+    private async spawnFromTemplate(
+        template: RunningProcess,
+        banner: string = `\n===== [DevNet supervisor] CONTROLLED START at ${new Date().toISOString()} =====\n`,
+        track: boolean = true,
+    ): Promise<RunningProcess> {
+        const options = { ...template.spawnOptions, appendLogs: true, logBanner: banner };
+        const process = template.useInitHint && template.hintDetector
+            ? await RunningProcess.spawnWithInitializationHintWithRetry(
+                template.cmds,
+                template.hintDetector,
+                { ...options, maxRetries: template.initMaxRetries, retryDelayMs: template.initRetryDelayMs },
+            )
+            : await RunningProcess.spawn(template.cmds, options);
+        process.name = template.name;
+        process.restartCount = template.restartCount;
+        process.hintDetector = template.hintDetector;
+        process.useInitHint = template.useInitHint;
+        process.initMaxRetries = template.initMaxRetries;
+        process.initRetryDelayMs = template.initRetryDelayMs;
+        return track ? this.track(process, template.name) : process;
+    }
+    private async waitForControlledStartDependency(process: RunningProcess): Promise<void> {
+        if (process.name.startsWith("prove_proxy")) {
+            const addressIndex = process.cmds.indexOf("--listen-addr");
+            const port = Number(process.cmds[addressIndex + 1]?.split(":").at(-1));
+            if (!Number.isInteger(port)) throw new Error(`[DevNet][control] ${process.name} has no valid listen port`);
+            await waitForTcpPort(this.host, port, { attempts: 600, delayMs: 1000, timeoutMs: 1500, name: process.name });
+        }
+        if (process.name === "psy_services") {
+            await waitForHttpUrl(`http://${this.host}:3000/health`, { attempts: 30, delayMs: 1000, timeoutMs: 1500, name: "psy-services health" });
+        }
+        if (process.name.startsWith("envio")) {
+            await waitForTcpPort(this.host, 9898, { attempts: 600, delayMs: 1000, timeoutMs: 1500, name: "Envio Indexer API" });
+        }
+    }
+
+
+    async stopApplications(cwd: string = ".", writeRollbackSentinel: boolean = false): Promise<void> {
+        if (this.applicationLifecycleState !== "running" && this.applicationLifecycleState !== "stopping") {
+            throw new Error(`[DevNet][control] cannot stop applications while state=${this.applicationLifecycleState}`);
+        }
+        const wasRunning = this.applicationLifecycleState === "running";
+        this.applicationLifecycleState = "stopping";
+        const { persistent, applications } = wasRunning
+            ? splitDevnetProcesses(this.spawnedProcesses)
+            : { persistent: this.spawnedProcesses, applications: this.pausedApplicationProcesses };
+        this.pausedApplicationProcesses = applications;
+        this.spawnedProcesses = persistent;
+        try {
+            if (wasRunning) {
+                for (const process of applications) {
+                    process.killWithSignal("SIGTERM");
+                }
+                await Promise.all(applications.map((process) => waitForProcessExit(process)));
+                for (const process of applications) {
+                    try {
+                        process.killWithSignal("SIGKILL");
+                    } catch {
+                    }
+                }
+            }
+            await waitForTcpPortsClosed(this.host, applicationListenerPorts(applications));
+            this.applicationLifecycleState = "stopped";
+        } catch (error) {
+            this.applicationLifecycleState = "stopping";
+            throw error;
+        }
+        if (writeRollbackSentinel) {
+            const sentinelPath = await writeRollbackStopSentinel(cwd);
+            console.log(`[DevNet][control] rollback stop sentinel written to ${sentinelPath}`);
+        }
+        console.log(`[DevNet][control] stopped ${applications.length} application processes; DB and Anvil retained`);
+    }
+
+    async startApplications(cwd: string = "."): Promise<void> {
+        if (this.applicationLifecycleState !== "stopped") {
+            throw new Error(`[DevNet][control] cannot start applications while state=${this.applicationLifecycleState}`);
+        }
+        this.applicationLifecycleState = "starting";
+        const templates = sortedApplicationProcesses(this.pausedApplicationProcesses);
+        const started: RunningProcess[] = [];
+        try {
+            for (const template of templates) {
+                const process = await this.spawnFromTemplate(template);
+                started.push(process);
+                await this.waitForControlledStartDependency(process);
+            }
+            this.pausedApplicationProcesses = [];
+            this.applicationLifecycleState = "running";
+            await rm(path.join(cwd, ROLLBACK_STOP_SENTINEL_PATH), { force: true });
+            console.log(`[DevNet][control] restarted ${templates.length} application processes; DB and Anvil unchanged`);
+        } catch (error) {
+            for (const process of started) {
+                process.killWithSignal("SIGTERM");
+            }
+            await Promise.all(started.map((process) => waitForProcessExit(process)));
+            this.spawnedProcesses = this.spawnedProcesses.filter((process) => !started.includes(process));
+            this.applicationLifecycleState = "stopped";
+            throw error;
+        }
+    }
+
+    async restartApplications(cwd: string = "."): Promise<void> {
+        await this.stopApplications(cwd, false);
+        await this.startApplications(cwd);
     }
 
     private getEnv(): { [key: string]: string } | undefined {
@@ -3328,17 +3544,12 @@ class DevNetProcessManager {
         }
         return undefined;
     }
-
     private getEnvWithRustLogDirective(directive: string): { [key: string]: string } {
         const env = this.getEnv() || { ...process.env } as { [key: string]: string };
         const current = env["RUST_LOG"]?.trim();
-        if (!current) {
-            return { ...env, RUST_LOG: directive };
-        }
-        const directives = current.split(",").map((s) => s.trim()).filter(Boolean);
-        if (directives.some((d) => d === directive || d.startsWith(`${directive.split("=")[0]}=`) || d === directive.split("=")[0])) {
-            return env;
-        }
+        if (!current) return { ...env, RUST_LOG: directive };
+        const directives = current.split(",").map((value) => value.trim()).filter(Boolean);
+        if (directives.some((value) => value === directive || value.startsWith(`${directive.split("=")[0]}=`) || value === directive.split("=")[0])) return env;
         return { ...env, RUST_LOG: `${current},${directive}` };
     }
 
@@ -3441,11 +3652,9 @@ class DevNetProcessManager {
         // 2. Start Database
         if (this.needsStartDb) {
             if (cleanState) {
-                console.log("[DevNet] Cleaning local checkpoints...");
-                await cleanCheckpoint('./local_checkpoints', cwd);
-                console.log("[DevNet] Removing persisted devnet Docker volumes...");
-                await runAndCapture(["docker", "volume", "rm", "-f", "psy-devnet-redis", "psy-devnet-scylla", "psy-devnet-scylla-data", "psy-devnet-nats"]);
+                throw new Error("[DevNet] --clean-state/--purge startup is disabled; use make restart-all so L1 and L2 are purged together");
             }
+
 
             console.log("[DevNet] Killing existing docker containers...");
             await killDocker();
@@ -3806,37 +4015,39 @@ class DevNetProcessManager {
         };
 
         // 10. L1 (Anvil)
+        let localAnvilState: LocalAnvilStatePlan | null = null;
         if (options.l1 || startAll) {
             if (l1Network === "localhost" || l1Fork) {
                 const chainMeta = protocolConfig.chains[l1Network];
                 if (!chainMeta) throw new Error(`[DevNet] protocolConfig.chains.${l1Network} missing`);
                 const effectiveL1ChainId = l1Fork ? protocolConfig.chains.localhost.l1ChainId : chainMeta.l1ChainId;
-                const l1ForkArgs = ['anvil', '--host', '0.0.0.0', '--port', String(l1Port), '--chain-id', String(effectiveL1ChainId), '--steps-tracing', '-vvvv'];
+                localAnvilState = await resolveLocalAnvilStatePlan(cwd);
+                await mkdir(path.dirname(localAnvilState.statePath), { recursive: true });
+                const l1ForkArgs = [
+                    "anvil", "--host", "0.0.0.0", "--port", String(l1Port), "--chain-id", String(effectiveL1ChainId),
+                    "--state", localAnvilState.statePath, "--state-interval", "1", "--steps-tracing", "-vvvv",
+                ];
                 if (l1Fork) {
                     const forkEnvKey = cfgEntry.anvilForkSourceUrlEnv;
                     if (!forkEnvKey) throw new Error(`[DevNet] cannot fork ${l1Network}: missing anvilForkSourceUrlEnv in config.json`);
                     const forkRpcUrl = process.env[forkEnvKey];
-                    if (!forkRpcUrl) {
-                        throw new Error(`[DevNet] VITE_FORK=true requires env ${forkEnvKey}`);
-                    }
-                    l1ForkArgs.push('--fork-url', forkRpcUrl);
+                    if (!forkRpcUrl) throw new Error(`[DevNet] VITE_FORK=true requires env ${forkEnvKey}`);
+                    l1ForkArgs.push("--fork-url", forkRpcUrl);
                     const forkBlock = process.env.VITE_FORK_BLOCK_NUMBER;
-                    if (forkBlock && forkBlock.trim().length > 0) {
-                        l1ForkArgs.push('--fork-block-number', forkBlock.trim());
-                    }
+                    if (forkBlock?.trim()) l1ForkArgs.push("--fork-block-number", forkBlock.trim());
                     console.log(`[DevNet] Starting L1 anvil in ${l1Network} fork mode`);
                 }
                 await this.track(await RunningProcess.spawnWithInitializationHintWithRetry(
                     l1ForkArgs,
                     l1StartedDetector,
-                    { cwd, ...getLogPaths('l1_anvil', false), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
+                    { cwd, ...getLogPaths("l1_anvil", false), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() },
                 ));
-                console.log(`[DevNet] L1 (anvil${l1Fork ? ` ${l1Network}-fork` : ''}) started on ${localL1RpcUrl}`);
+                console.log(`[DevNet] L1 (anvil${l1Fork ? ` ${l1Network}-fork` : ""}) started on ${localL1RpcUrl}`);
                 await waitForHttpUrl(localL1RpcUrl, {
                     attempts: 30,
                     delayMs: 500,
                     timeoutMs: 1500,
-                    name: "L1 RPC"
+                    name: "L1 RPC",
                 });
             } else {
                 console.log(`[DevNet] Using external L1 network ${l1Network} via ${l1RpcUrl}`);
@@ -3844,15 +4055,15 @@ class DevNetProcessManager {
                     attempts: 30,
                     delayMs: 1000,
                     timeoutMs: 3000,
-                    name: `${l1Network} RPC`
+                    name: `${l1Network} RPC`,
                 });
             }
             await deployPsyContracts(cwd, l1RpcUrl, deploymentsNetwork, {
-                fundDevAccounts: l1Network === "localhost" || l1Fork,
+                fundDevAccounts: (l1Network === "localhost" || l1Fork) && !localAnvilState?.hasState,
                 localAnvilRpcUrl: localL1RpcUrl,
+                reuseLocalDeployment: localAnvilState?.hasState,
             });
         }
-
         // 11. Bridge dependencies (Envio + psy-services)
         if (options.relayer || options.bridgeUi || startAll) {
             const relayerConfig = options.relayerConfig || './psy_cli/psy_relayer_cli/config/local.toml';
@@ -3873,7 +4084,7 @@ class DevNetProcessManager {
                 (l1Network === "localhost" || l1Fork) ? undefined : l1RpcUrl,
                 deploymentsNetwork,
                 this.getEnv(),
-                (options.l1 || startAll) && (l1Network === "localhost" || l1Fork),
+                localAnvilState?.shouldResetEnvio ?? false,
                 runtimeResources.runtimeCpuSet,
             );
             if (envioProc) {
@@ -4222,7 +4433,7 @@ class DevNetProcessManager {
             }
             await ensureUiDependencies(modeAWebWalletBridgeDir);
             await this.track(await RunningProcess.spawnWithInitializationHintWithRetry(
-                ['bun', 'run', 'dev', '--', '--host', '0.0.0.0', '--port', '5179', '--strictPort'],
+                ['node', 'node_modules/vite/bin/vite.js', '--host', '0.0.0.0', '--port', '5179', '--strictPort'],
                 uiStartedDetector,
                 {
                     cwd: modeAWebWalletBridgeDir,
@@ -4688,6 +4899,122 @@ async function acquireDevnetLock(repoRoot: string): Promise<DevnetLock> {
     }
     return new DevnetLock(holder);
 }
+export type DevnetControlCommand = "restart" | "rollback-stop" | "rollback-resume";
+
+interface DevnetControlResponse {
+    ok: boolean;
+    message: string;
+}
+
+interface DevnetControlServer {
+    close(): Promise<void>;
+}
+
+export function devnetControlSocketPath(repoRoot: string): string {
+    return devnetLockPath(repoRoot).replace(/\.lock$/, ".control.sock");
+}
+
+function parseDevnetControlCommand(value: string): DevnetControlCommand {
+    if (value === "restart" || value === "rollback-stop" || value === "rollback-resume") return value;
+    throw new Error(`[DevNet][control] unsupported command ${value}`);
+}
+
+export async function sendDevnetControlCommand(repoRoot: string, command: DevnetControlCommand): Promise<string> {
+    const socketPath = devnetControlSocketPath(repoRoot);
+    const response = Promise.withResolvers<string>();
+    const socket = net.createConnection(socketPath);
+    const timeout = setTimeout(() => {
+        socket.destroy();
+        response.reject(new Error(`[DevNet][control] timed out waiting for ${command}`));
+    }, 900_000);
+    let received = "";
+    socket.setEncoding("utf8");
+    socket.once("connect", () => socket.write(`${command}\n`));
+    socket.on("data", (chunk) => {
+        received += chunk;
+        const newline = received.indexOf("\n");
+        if (newline < 0) return;
+        socket.end();
+        try {
+            const result = JSON.parse(received.slice(0, newline)) as DevnetControlResponse;
+            if (result.ok) response.resolve(result.message);
+            else response.reject(new Error(result.message));
+        } catch (error) {
+            response.reject(new Error(`[DevNet][control] invalid supervisor response: ${error}`));
+        }
+    });
+    socket.once("error", (error) => response.reject(
+        new Error(`[DevNet][control] cannot reach the running supervisor at ${socketPath}: ${error.message}`),
+    ));
+    try {
+        return await response.promise;
+    } finally {
+        clearTimeout(timeout);
+        socket.destroy();
+    }
+}
+
+export async function startDevnetControlServer(
+    repoRoot: string,
+    handle: (command: DevnetControlCommand) => Promise<string>,
+): Promise<DevnetControlServer> {
+    const socketPath = devnetControlSocketPath(repoRoot);
+    try {
+        const stat = await fs.promises.stat(socketPath);
+        if (stat.isSocket()) {
+            const probe = net.createConnection(socketPath);
+            const connected = Promise.withResolvers<boolean>();
+            probe.once("connect", () => connected.resolve(true));
+            probe.once("error", () => connected.resolve(false));
+            const timeout = setTimeout(() => connected.resolve(false), 500);
+            const isLive = await connected.promise;
+            clearTimeout(timeout);
+            probe.destroy();
+            if (isLive) throw new Error(`[DevNet][control] supervisor socket already active at ${socketPath}`);
+        }
+        await rm(socketPath, { force: true });
+    } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT") throw error;
+    }
+    let commandQueue = Promise.resolve();
+    const server = net.createServer((socket) => {
+        socket.setEncoding("utf8");
+        let received = "";
+        socket.on("data", (chunk) => {
+            received += chunk;
+            const newline = received.indexOf("\n");
+            if (newline < 0) return;
+            socket.removeAllListeners("data");
+            commandQueue = commandQueue.then(async () => {
+                let response: DevnetControlResponse;
+                try {
+                    const command = parseDevnetControlCommand(received.slice(0, newline).trim());
+                    response = { ok: true, message: await handle(command) };
+                } catch (error) {
+                    response = { ok: false, message: error instanceof Error ? error.message : String(error) };
+                }
+                socket.end(`${JSON.stringify(response)}\n`);
+            });
+        });
+    });
+    const listening = Promise.withResolvers<void>();
+    const listeningError = (error: Error) => listening.reject(error);
+    server.once("error", listeningError);
+    server.listen(socketPath, listening.resolve);
+    await listening.promise;
+    server.off("error", listeningError);
+    server.on("error", (error) => console.error(`[DevNet][control] server error: ${error.message}`));
+    await fs.promises.chmod(socketPath, 0o600);
+    return {
+        async close(): Promise<void> {
+            const closed = Promise.withResolvers<void>();
+            server.close(closed.resolve);
+            await closed.promise;
+            await rm(socketPath, { force: true });
+        },
+    };
+}
 let globalManager: DevNetProcessManager | null = null;
 
 async function runMain() {
@@ -4723,6 +5050,7 @@ async function runMain() {
             "clean-state": { type: "boolean" }, // deprecated alias
             "teardown": { type: "boolean" },
             "purge": { type: "boolean" },
+            control: { type: "string" },
             env: { type: "string" },
             "help": { type: "boolean", short: "h" },
         },
@@ -4759,10 +5087,16 @@ async function runMain() {
     const daemonlize = !!values["daemonlize"];
     const teardown = !!values["teardown"];
     const purge = !!values["purge"];
+    const control = values["control"] as string | undefined;
     const cleanState = !!values["clean-state"] || purge;
     const provingBackend = values["proving-backend"];
     const envString = values["env"];
     const help = !!values["help"];
+    if (control) {
+        const command = parseDevnetControlCommand(control);
+        console.log(await sendDevnetControlCommand(REPO_ROOT, command));
+        process.exit(0);
+    }
     const l1Port = values["l1-port"] ? parseInt(values["l1-port"] as string, 10) : 8545;
     const { l1Network, l1Fork } = resolveL1Selection();
     const localL1RpcUrl = resolveLocalL1RpcUrl(l1Port);
@@ -4793,6 +5127,7 @@ Psy Network DevNet Setup Tool
 Usage: bun run dev/locSetupV4.ts [options]
 
  Options:
+    --control <command>             Send restart, rollback-stop, or rollback-resume to the running supervisor
     --host <ip>                     Target host IP (default: 127.0.0.1)
     --genesis-data-path <path>      Path to genesis data JSON file for processor nodes (default: genesis.json)
     --proving-backend <backend>     Proving backend to use (default: plonky2-poseidon-goldilocks)
@@ -4906,6 +5241,13 @@ Usage: bun run dev/locSetupV4.ts [options]
     });
 
     globalManager = DevNetProcessManager.create(host, envVars, provingBackend);
+    let controlServer: DevnetControlServer | null = null;
+    const closeControlServer = async () => {
+        if (!controlServer) return;
+        await controlServer.close();
+        controlServer = null;
+    };
+
 
     // SIGINT/SIGTERM: await teardown, then release the lock before exit. A
     // duplicate signal while already shutting down is ignored.
@@ -4917,6 +5259,7 @@ Usage: bun run dev/locSetupV4.ts [options]
         }
         shuttingDown = true;
         try {
+            await closeControlServer();
             if (globalManager) await globalManager.teardown(".", false);
         } catch (e) {
             console.error('[DevNet] error during teardown:', e);
@@ -4994,6 +5337,20 @@ Usage: bun run dev/locSetupV4.ts [options]
             process.exit(0);
         } else {
             await globalManager.setupProcesses(options);
+            controlServer = await startDevnetControlServer(REPO_ROOT, async (command) => {
+                if (!globalManager) throw new Error("[DevNet][control] process manager unavailable");
+                if (command === "restart") {
+                    await globalManager.restartApplications(REPO_ROOT);
+                    return "Devnet application processes restarted; DB and Anvil retained";
+                }
+                if (command === "rollback-stop") {
+                    await globalManager.stopApplications(REPO_ROOT, true);
+                    return `Devnet applications stopped; rollback sentinel: ${ROLLBACK_STOP_SENTINEL_PATH}`;
+                }
+                await globalManager.startApplications(REPO_ROOT);
+                return "Devnet applications resumed; DB and Anvil retained";
+            });
+            console.log(`[DevNet][control] listening at ${devnetControlSocketPath(REPO_ROOT)}`);
             console.log('DevNet started. Press Ctrl+C to stop.');
             if (process.env.PSY_NO_AUTO_RESTART === "1") {
                 console.log('[DevNet][supervisor] auto-restart DISABLED (PSY_NO_AUTO_RESTART=1)');
@@ -5005,6 +5362,7 @@ Usage: bun run dev/locSetupV4.ts [options]
     } catch (e) {
         console.error("Setup failed:", e);
         try {
+            await closeControlServer();
             if (globalManager) await globalManager.teardown(".", false);
         } catch (te) {
             console.error("[DevNet] error during teardown after setup failure:", te);

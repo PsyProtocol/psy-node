@@ -931,6 +931,207 @@ pub trait CoreDatabaseIMTNextAppendIndexWriter<TableIdentifier: Clone + Send + S
     ) -> anyhow::Result<()>;
 }
 
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait CoreDatabaseObjectIdDeleter<TableIdentifier: Clone + Send + Sync> {
+    async fn db_delete_many_object_ids(&self, table: &TableIdentifier, ids: &[u64]) -> anyhow::Result<()>;
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait CoreDatabaseObjectCheckpointDeleter<TableIdentifier: Clone + Send + Sync> {
+    async fn db_delete_many_object_checkpoint(&self, table: &TableIdentifier, keys: &[(u64, u64)]) -> anyhow::Result<()>;
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait CoreDatabaseMerkleDeleter<TableIdentifier: Clone + Send + Sync> {
+    async fn db_delete_many_merkle_nodes(&self, table: &TableIdentifier, keys: &[(u8, u64, u64)]) -> anyhow::Result<()>;
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait CoreDatabaseTreeMerkleDeleter<TableIdentifier: Clone + Send + Sync> {
+    async fn db_delete_many_tree_merkle_nodes(&self, table: &TableIdentifier, keys: &[(u64, u8, u64, u64)]) -> anyhow::Result<()>;
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait CoreDatabaseTreeSubtreeMerkleDeleter<TableIdentifier: Clone + Send + Sync> {
+    async fn db_delete_many_tree_subtree_merkle_nodes(
+        &self,
+        table: &TableIdentifier,
+        keys: &[(u64, u64, u8, u64, u64)],
+    ) -> anyhow::Result<()>;
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait CoreDatabaseImtLeafDeleter<TableIdentifier: Clone + Send + Sync> {
+    async fn db_delete_many_imt_leaves(&self, table: &TableIdentifier, keys: &[(i64, i64, i64, i64)]) -> anyhow::Result<()>;
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait CoreDatabaseImtKeyDeleter<TableIdentifier: Clone + Send + Sync> {
+    async fn db_delete_many_imt_keys(&self, table: &TableIdentifier, keys: &[(i64, i64, i16, Vec<u8>)]) -> anyhow::Result<()>;
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait CoreDatabaseImtNextAppendIndexDeleter<TableIdentifier: Clone + Send + Sync> {
+    async fn db_delete_many_imt_next_append_indexes(&self, table: &TableIdentifier, keys: &[(i64, i64)]) -> anyhow::Result<()>;
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait CoreDatabaseHashUserPairDeleter<TableIdentifier: Clone + Send + Sync, Hash: QHashBase + Send + Sync> {
+    async fn db_delete_many_hash_user_pairs(&self, table: &TableIdentifier, keys: &[(Hash, u64)]) -> anyhow::Result<()>;
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait CoreDatabaseBlobPairDeleter<TableIdentifier: Clone + Send + Sync> {
+    async fn db_delete_many_blob_pairs(&self, table: &TableIdentifier, keys: &[(Vec<u8>, Vec<u8>)]) -> anyhow::Result<()>;
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait CoreDatabaseU64U128PairDeleter<TableIdentifier: Clone + Send + Sync> {
+    async fn db_delete_many_u64_u128_pairs(&self, table: &TableIdentifier, keys: &[(u64, u128)]) -> anyhow::Result<()>;
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait CoreDatabasePendingIdPartitionDeleter<TableIdentifier: Clone + Send + Sync> {
+    async fn db_delete_many_pending_id_partitions(&self, table: &TableIdentifier, pending_ids: &[u64]) -> anyhow::Result<()>;
+}
+
+/// Presence of each physical direction for a frozen bidirectional mapping pair.
+/// A rollback phase is reconciled only when both flags are false.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreDatabaseBidirectionalPairPresence<K1, K2> {
+    pub key: (K1, K2),
+    pub forward_present: bool,
+    pub reverse_present: bool,
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait CoreDatabaseObjectIdVerifier<TableIdentifier: Clone + Send + Sync> {
+    async fn db_get_existing_object_ids(&self, table: &TableIdentifier, ids: &[u64]) -> anyhow::Result<Vec<u64>>;
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait CoreDatabaseObjectCheckpointVerifier<TableIdentifier: Clone + Send + Sync> {
+    async fn db_get_existing_object_checkpoints(
+        &self,
+        table: &TableIdentifier,
+        keys: &[(u64, u64)],
+    ) -> anyhow::Result<Vec<(u64, u64)>>;
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait CoreDatabaseMerkleVerifier<TableIdentifier: Clone + Send + Sync> {
+    async fn db_get_existing_merkle_nodes(
+        &self,
+        table: &TableIdentifier,
+        keys: &[(u8, u64, u64)],
+    ) -> anyhow::Result<Vec<(u8, u64, u64)>>;
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait CoreDatabaseTreeMerkleVerifier<TableIdentifier: Clone + Send + Sync> {
+    async fn db_get_existing_tree_merkle_nodes(
+        &self,
+        table: &TableIdentifier,
+        keys: &[(u64, u8, u64, u64)],
+    ) -> anyhow::Result<Vec<(u64, u8, u64, u64)>>;
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait CoreDatabaseTreeSubtreeMerkleVerifier<TableIdentifier: Clone + Send + Sync> {
+    async fn db_get_existing_tree_subtree_merkle_nodes(
+        &self,
+        table: &TableIdentifier,
+        keys: &[(u64, u64, u8, u64, u64)],
+    ) -> anyhow::Result<Vec<(u64, u64, u8, u64, u64)>>;
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait CoreDatabaseImtLeafVerifier<TableIdentifier: Clone + Send + Sync> {
+    async fn db_get_existing_imt_leaves(
+        &self,
+        table: &TableIdentifier,
+        keys: &[(i64, i64, i64, i64)],
+    ) -> anyhow::Result<Vec<(i64, i64, i64, i64)>>;
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait CoreDatabaseImtKeyVerifier<TableIdentifier: Clone + Send + Sync> {
+    async fn db_get_existing_imt_keys(
+        &self,
+        table: &TableIdentifier,
+        keys: &[(i64, i64, i16, Vec<u8>)],
+    ) -> anyhow::Result<Vec<(i64, i64, i16, Vec<u8>)>>;
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait CoreDatabaseImtNextAppendIndexVerifier<TableIdentifier: Clone + Send + Sync> {
+    async fn db_get_existing_imt_next_append_indexes(
+        &self,
+        table: &TableIdentifier,
+        keys: &[(i64, i64)],
+    ) -> anyhow::Result<Vec<(i64, i64)>>;
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait CoreDatabaseHashUserPairVerifier<TableIdentifier: Clone + Send + Sync, Hash: QHashBase + Send + Sync> {
+    async fn db_get_existing_hash_user_pairs(
+        &self,
+        table: &TableIdentifier,
+        keys: &[(Hash, u64)],
+    ) -> anyhow::Result<Vec<(Hash, u64)>>;
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait CoreDatabaseBlobPairVerifier<TableIdentifier: Clone + Send + Sync> {
+    async fn db_get_blob_pair_presence(
+        &self,
+        table: &TableIdentifier,
+        keys: &[(Vec<u8>, Vec<u8>)],
+    ) -> anyhow::Result<Vec<CoreDatabaseBidirectionalPairPresence<Vec<u8>, Vec<u8>>>>;
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait CoreDatabaseU64U128PairVerifier<TableIdentifier: Clone + Send + Sync> {
+    async fn db_get_u64_u128_pair_presence(
+        &self,
+        table: &TableIdentifier,
+        keys: &[(u64, u128)],
+    ) -> anyhow::Result<Vec<CoreDatabaseBidirectionalPairPresence<u64, u128>>>;
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait CoreDatabasePendingIdPartitionVerifier<TableIdentifier: Clone + Send + Sync> {
+    async fn db_get_existing_pending_id_partitions(
+        &self,
+        table: &TableIdentifier,
+        pending_ids: &[u64],
+    ) -> anyhow::Result<Vec<u64>>;
+}
+
 // full implementations
 
 pub trait CoreDatabaseReader<
@@ -1059,6 +1260,32 @@ pub trait CoreDatabaseWriter<
     + CoreDatabaseIMTLeafWriter<IMTLeafTableIdentifier>
     + CoreDatabaseIMTKeyIndexWriter<IMTKeyIndexTableIdentifier>
     + CoreDatabaseIMTNextAppendIndexWriter<IMTNextAppendIndexTableIdentifier>
+    + CoreDatabaseBlobPairDeleter<BiDirectionalMappingTableIdentifier>
+    + CoreDatabaseU64U128PairDeleter<BiDirectionalU64U128MappingTableIdentifier>
+    + CoreDatabaseObjectIdDeleter<U64TableIdentifier>
+    + CoreDatabaseObjectIdDeleter<KivTableIdentifier>
+    + CoreDatabaseObjectCheckpointDeleter<SingleIdTableIdentifier>
+    + CoreDatabaseTreeMerkleDeleter<SingleIdMerkleTableIdentifier>
+    + CoreDatabaseTreeSubtreeMerkleDeleter<DoubleIdMerkleTableIdentifier>
+    + CoreDatabaseMerkleDeleter<ZeroIdMerkleTableIdentifier>
+    + CoreDatabasePendingIdPartitionDeleter<TagTreeMerkleTableIdentifier>
+    + CoreDatabaseHashUserPairDeleter<HashToManyIdsTableIdentifier, Hash>
+    + CoreDatabaseImtLeafDeleter<IMTLeafTableIdentifier>
+    + CoreDatabaseImtKeyDeleter<IMTKeyIndexTableIdentifier>
+    + CoreDatabaseImtNextAppendIndexDeleter<IMTNextAppendIndexTableIdentifier>
+    + CoreDatabaseBlobPairVerifier<BiDirectionalMappingTableIdentifier>
+    + CoreDatabaseU64U128PairVerifier<BiDirectionalU64U128MappingTableIdentifier>
+    + CoreDatabaseObjectIdVerifier<U64TableIdentifier>
+    + CoreDatabaseObjectIdVerifier<KivTableIdentifier>
+    + CoreDatabaseObjectCheckpointVerifier<SingleIdTableIdentifier>
+    + CoreDatabaseTreeMerkleVerifier<SingleIdMerkleTableIdentifier>
+    + CoreDatabaseTreeSubtreeMerkleVerifier<DoubleIdMerkleTableIdentifier>
+    + CoreDatabaseMerkleVerifier<ZeroIdMerkleTableIdentifier>
+    + CoreDatabasePendingIdPartitionVerifier<TagTreeMerkleTableIdentifier>
+    + CoreDatabaseHashUserPairVerifier<HashToManyIdsTableIdentifier, Hash>
+    + CoreDatabaseImtLeafVerifier<IMTLeafTableIdentifier>
+    + CoreDatabaseImtKeyVerifier<IMTKeyIndexTableIdentifier>
+    + CoreDatabaseImtNextAppendIndexVerifier<IMTNextAppendIndexTableIdentifier>
 {
 }
 impl<
@@ -1093,7 +1320,33 @@ impl<
             + CoreDatabaseHashToManyIdsWriter<Hash, HashToManyIdsTableIdentifier>
             + CoreDatabaseIMTLeafWriter<IMTLeafTableIdentifier>
             + CoreDatabaseIMTKeyIndexWriter<IMTKeyIndexTableIdentifier>
-            + CoreDatabaseIMTNextAppendIndexWriter<IMTNextAppendIndexTableIdentifier>,
+            + CoreDatabaseIMTNextAppendIndexWriter<IMTNextAppendIndexTableIdentifier>
+            + CoreDatabaseBlobPairDeleter<BiDirectionalMappingTableIdentifier>
+            + CoreDatabaseU64U128PairDeleter<BiDirectionalU64U128MappingTableIdentifier>
+            + CoreDatabaseObjectIdDeleter<U64TableIdentifier>
+            + CoreDatabaseObjectIdDeleter<KivTableIdentifier>
+            + CoreDatabaseObjectCheckpointDeleter<SingleIdTableIdentifier>
+            + CoreDatabaseTreeMerkleDeleter<SingleIdMerkleTableIdentifier>
+            + CoreDatabaseTreeSubtreeMerkleDeleter<DoubleIdMerkleTableIdentifier>
+            + CoreDatabaseMerkleDeleter<ZeroIdMerkleTableIdentifier>
+            + CoreDatabasePendingIdPartitionDeleter<TagTreeMerkleTableIdentifier>
+            + CoreDatabaseHashUserPairDeleter<HashToManyIdsTableIdentifier, Hash>
+            + CoreDatabaseImtLeafDeleter<IMTLeafTableIdentifier>
+            + CoreDatabaseImtKeyDeleter<IMTKeyIndexTableIdentifier>
+            + CoreDatabaseImtNextAppendIndexDeleter<IMTNextAppendIndexTableIdentifier>
+            + CoreDatabaseBlobPairVerifier<BiDirectionalMappingTableIdentifier>
+            + CoreDatabaseU64U128PairVerifier<BiDirectionalU64U128MappingTableIdentifier>
+            + CoreDatabaseObjectIdVerifier<U64TableIdentifier>
+            + CoreDatabaseObjectIdVerifier<KivTableIdentifier>
+            + CoreDatabaseObjectCheckpointVerifier<SingleIdTableIdentifier>
+            + CoreDatabaseTreeMerkleVerifier<SingleIdMerkleTableIdentifier>
+            + CoreDatabaseTreeSubtreeMerkleVerifier<DoubleIdMerkleTableIdentifier>
+            + CoreDatabaseMerkleVerifier<ZeroIdMerkleTableIdentifier>
+            + CoreDatabasePendingIdPartitionVerifier<TagTreeMerkleTableIdentifier>
+            + CoreDatabaseHashUserPairVerifier<HashToManyIdsTableIdentifier, Hash>
+            + CoreDatabaseImtLeafVerifier<IMTLeafTableIdentifier>
+            + CoreDatabaseImtKeyVerifier<IMTKeyIndexTableIdentifier>
+            + CoreDatabaseImtNextAppendIndexVerifier<IMTNextAppendIndexTableIdentifier>,
     >
     CoreDatabaseWriter<
         Hash,

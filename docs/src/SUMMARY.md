@@ -67,7 +67,7 @@
 - [Installation](./node/installation.md)
 - [Configuration](./node/configuration.md)
 - [Getting Started](./node/getting_started.md)
-- [API Reference](./rpc/UserCli.md)
+- [Devnet Startup, Shutdown, Restart, and Rollback](./node/devnet_lifecycle.md)
 
 ---
 

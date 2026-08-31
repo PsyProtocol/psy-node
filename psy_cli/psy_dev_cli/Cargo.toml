@@ -54,6 +54,7 @@ redis = { workspace = true }
 async-nats = { workspace = true }
 scylla = { workspace = true }
 chrono = { workspace = true }
+url = { workspace = true }
 
 # start local packages
 pser = { workspace = true }
@@ -73,4 +74,7 @@ psy_node_common = { workspace = true }
 psy_config = { workspace = true }
 psy_plonky2_circuits = { workspace = true }
 psy_jtmb_testing_core = { workspace = true }
+psy_node_scylla = { workspace = true }
+psy_node_redis = { workspace = true }
+psy_node_nats = { workspace = true }
 

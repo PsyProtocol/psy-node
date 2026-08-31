@@ -1,7 +1,6 @@
 [book]
 authors = ["PsyProtocol"]
 language = "en"
-multilingual = false
 src = "src"
 title = "Psy Protocol Documentation"
 
@@ -19,9 +18,6 @@ additional-js = ["mermaid.min.js", "mermaid-init.js"]
 # [preprocessor.katex]
 # after = ["links"]
 
-[preprocessor.plantuml]
-plantuml-cmd = "plantuml"
-
 [preprocessor.toc]
 command  = "mdbook-toc"
 renderer = ["html"]
@@ -34,4 +30,5 @@ footer-template = "<p style='font-size:10px; margin-left: 48%'><span class='page
 
 [output.pdf-outline]
 like-wkhtmltopdf = false
+optional = true
 

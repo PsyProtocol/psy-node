@@ -9,6 +9,13 @@ use parth_core::{
     },
     utils::auto_implement::QAutoImplementGeneric,
 };
+use crate::psy_temp_db::{
+    TEMP_TABLE_ID_DEPLOY_CONTRACT_CODE_DEFINITION_BYTES, TEMP_TABLE_ID_JOB_CLAIM_BYTES,
+    TEMP_TABLE_ID_JOB_STATS_BYTES, TEMP_TABLE_ID_PROOF_CLAIM_TAG_BYTES,
+    TEMP_TABLE_ID_PROOF_WITNESS_DATA_BYTES, TEMP_TABLE_ID_SUBMIT_STATUS_BYTES,
+    TEMP_TABLE_ID_TAG_TREE_VALUES_BYTES, TEMP_TABLE_ID_USER_CONTRACT_TREE_UPDATES_BYTES,
+    TEMP_TABLE_ID_USER_END_CAP_SLOT_UPDATES_BYTES, TEMP_TABLE_ID_WORKER_PROOF_METADATA_BYTES,
+};
 
 
 
@@ -61,6 +68,78 @@ pub trait QTempDatabaseRawStoreWriter: QTempDatabaseRawKVWriterBase + QTempDatab
 impl<T: QTempDatabaseRawKVWriterBase + QTempDatabaseRawCounterWriterBase> QTempDatabaseRawStoreWriter for T {}
 pub trait QTempDatabaseRawStore: QTempDatabaseRawStoreReader + QTempDatabaseRawStoreWriter {}
 impl<T: QTempDatabaseRawStoreReader + QTempDatabaseRawStoreWriter> QTempDatabaseRawStore for T {}
+// Physical pending KV field: LE realm_id:u32 | realm_sub_id:u16 | table_id:u16 | pending_id:u64 | suffix (not BE TempTablePrefixIdentifierRealm).
+// Namespaces EP/PW/SS/CU/SU/TV/DC/JC/JS/CT; PI/GP/PS (no pending), WR (retained), SC (counter) excluded. CT table-id bytes spell TC.
+pub const PENDING_TEMP_KV_PREFIX_LEN: usize = 16;
+
+pub const PENDING_KEYED_TEMP_TABLE_ID_BYTES: &[[u8; 2]] = &[
+    TEMP_TABLE_ID_WORKER_PROOF_METADATA_BYTES,
+    TEMP_TABLE_ID_PROOF_WITNESS_DATA_BYTES,
+    TEMP_TABLE_ID_SUBMIT_STATUS_BYTES,
+    TEMP_TABLE_ID_USER_CONTRACT_TREE_UPDATES_BYTES,
+    TEMP_TABLE_ID_USER_END_CAP_SLOT_UPDATES_BYTES,
+    TEMP_TABLE_ID_TAG_TREE_VALUES_BYTES,
+    TEMP_TABLE_ID_DEPLOY_CONTRACT_CODE_DEFINITION_BYTES,
+    TEMP_TABLE_ID_JOB_CLAIM_BYTES,
+    TEMP_TABLE_ID_JOB_STATS_BYTES,
+    TEMP_TABLE_ID_PROOF_CLAIM_TAG_BYTES,
+];
+
+pub fn pending_temp_kv_prefix(
+    realm_id: u32,
+    realm_sub_id: u16,
+    table_id_bytes: [u8; 2],
+    pending_id: u64,
+) -> [u8; PENDING_TEMP_KV_PREFIX_LEN] {
+    let mut prefix = [0u8; PENDING_TEMP_KV_PREFIX_LEN];
+    prefix[0..4].copy_from_slice(&realm_id.to_le_bytes());
+    prefix[4..6].copy_from_slice(&realm_sub_id.to_le_bytes());
+    prefix[6..8].copy_from_slice(&table_id_bytes);
+    prefix[8..16].copy_from_slice(&pending_id.to_le_bytes());
+    prefix
+}
+
+pub fn filter_temp_kv_fields_by_pending(
+    fields: &[Vec<u8>],
+    realm_id: u32,
+    realm_sub_id: u16,
+    pending_id: u64,
+) -> Vec<Vec<u8>> {
+    let realm_le = realm_id.to_le_bytes();
+    let sub_le = realm_sub_id.to_le_bytes();
+    let pending_le = pending_id.to_le_bytes();
+    let mut matched = Vec::new();
+    for field in fields {
+        if field.len() < PENDING_TEMP_KV_PREFIX_LEN {
+            continue;
+        }
+        if field[0..4] != realm_le || field[4..6] != sub_le || field[8..16] != pending_le {
+            continue;
+        }
+        let table_id_bytes = [field[6], field[7]];
+        if PENDING_KEYED_TEMP_TABLE_ID_BYTES.contains(&table_id_bytes) {
+            matched.push(field.clone());
+        }
+    }
+    matched
+}
+
+#[derive(Debug, Clone)]
+pub struct TempKvScanPage {
+    pub next_cursor: u64,
+    pub fields: Vec<Vec<u8>>,
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait QTempDatabaseRawKVEnumeratorBase {
+    async fn qtdb_raw_kv_scan_fields(
+        &self,
+        cursor: u64,
+        count: u32,
+    ) -> anyhow::Result<TempKvScanPage>;
+}
+
 
 #[async_trait]
 pub trait QTempDatabaseKVReaderBase {
@@ -365,5 +444,183 @@ impl<DB: QTempDatabaseRawCounterWriterBase + QAutoImplementGeneric + Send + Sync
     ) -> anyhow::Result<()> {
         let key_bytes = table.get_key_prefix().ttp_get_full_key_vec(key);
         self.qtdb_raw_counter_set_value(&key_bytes, value).await
+    }
+}
+
+#[cfg(test)]
+mod rollback_enum_tests {
+    use super::{
+        filter_temp_kv_fields_by_pending, pending_temp_kv_prefix, PENDING_KEYED_TEMP_TABLE_ID_BYTES,
+        PENDING_TEMP_KV_PREFIX_LEN, QTempDatabaseRawKVEnumeratorBase, QTempDatabaseRawKVReaderBase,
+        QTempDatabaseRawKVWriterBase, TempKvScanPage,
+    };
+    use crate::memory_stores::simple_memory_temp_store::SimpleMemoryTempStore;
+    use crate::psy_temp_db::{
+        tt_get_job_claim_key_from_bytes, tt_get_job_stats_count_key, tt_get_proof_claim_tag_key,
+        tt_get_proving_job_metadata_key, tt_get_submit_status_key, tt_get_unique_pending_id_key,
+        tt_get_worker_reputation_key, TEMP_TABLE_ID_JOB_STATS_BYTES,
+        TEMP_TABLE_ID_PROOF_CLAIM_TAG_BYTES, TEMP_TABLE_ID_WORKER_PROOF_METADATA_BYTES,
+    };
+    use crate::psy_temp_db::{
+        tt_get_contract_updates_key, tt_get_deploy_contract_code_definition_key,
+        tt_get_proof_witness_data_key, tt_get_rewards_tag_tree_value_key,
+        tt_get_user_end_cap_slot_updates_key,
+    };
+    use parth_core::QJobIdSerialized;
+    use std::collections::HashSet;
+
+    const REALM: u32 = 3;
+    const SUB: u16 = 0;
+    const PENDING: u64 = 88;
+
+    fn job_id(seed: u8) -> QJobIdSerialized {
+        let mut j = [0u8; 24];
+        j[0] = seed;
+        j
+    }
+
+    async fn seed_store(store: &SimpleMemoryTempStore) -> Vec<Vec<u8>> {
+        let mut expected = Vec::new();
+
+        let pending_keys: Vec<Vec<u8>> = vec![
+            tt_get_proving_job_metadata_key(REALM, SUB, PENDING, &job_id(1)).to_vec(),
+            tt_get_proving_job_metadata_key(REALM, SUB, PENDING, &job_id(2)).to_vec(),
+            tt_get_proof_witness_data_key(REALM, SUB, PENDING, &job_id(3)).to_vec(),
+            tt_get_submit_status_key(REALM, SUB, PENDING, 777).to_vec(),
+            tt_get_contract_updates_key(REALM, SUB, PENDING, 11).to_vec(),
+            tt_get_user_end_cap_slot_updates_key(REALM, SUB, PENDING, 12).to_vec(),
+            tt_get_rewards_tag_tree_value_key(REALM, SUB, PENDING, &job_id(4)).to_vec(),
+            tt_get_deploy_contract_code_definition_key(REALM, SUB, PENDING, &[7u8; 16]).to_vec(),
+            tt_get_job_claim_key_from_bytes(REALM, SUB, PENDING, &job_id(5)).to_vec(),
+            tt_get_job_stats_count_key(REALM, SUB, PENDING).to_vec(),
+            tt_get_proof_claim_tag_key(REALM, SUB, PENDING, &job_id(6)).to_vec(),
+        ];
+        for k in &pending_keys {
+            store.qtdb_raw_kv_put_value(k, b"v").await.unwrap();
+        }
+        expected.extend(pending_keys);
+
+        let other_pending = tt_get_proving_job_metadata_key(REALM, SUB, PENDING + 1, &job_id(9)).to_vec();
+        store.qtdb_raw_kv_put_value(&other_pending, b"v").await.unwrap();
+
+        let other_realm = tt_get_submit_status_key(REALM + 1, SUB, PENDING, 1).to_vec();
+        store.qtdb_raw_kv_put_value(&other_realm, b"v").await.unwrap();
+
+        let other_sub = tt_get_submit_status_key(REALM, SUB + 1, PENDING, 1).to_vec();
+        store.qtdb_raw_kv_put_value(&other_sub, b"v").await.unwrap();
+
+        let pi = tt_get_unique_pending_id_key(REALM, SUB).to_vec();
+        store.qtdb_raw_kv_put_value(&pi, b"v").await.unwrap();
+
+        let mut pk = [0u8; 33];
+        pk[0] = 0x02;
+        let wr = tt_get_worker_reputation_key(REALM, SUB, &pk).to_vec();
+        store.qtdb_raw_kv_put_value(&wr, b"v").await.unwrap();
+
+        let mut short = vec![0u8; PENDING_TEMP_KV_PREFIX_LEN - 1];
+        short[0..4].copy_from_slice(&REALM.to_le_bytes());
+        short[4..6].copy_from_slice(&SUB.to_le_bytes());
+        short[6..8].copy_from_slice(&PENDING_KEYED_TEMP_TABLE_ID_BYTES[0]);
+        store.qtdb_raw_kv_put_value(&short, b"v").await.unwrap();
+
+        expected
+    }
+
+    async fn enumerate_all(store: &SimpleMemoryTempStore, count: u32) -> Vec<Vec<u8>> {
+        let mut all = Vec::new();
+        let mut cursor = 0u64;
+        loop {
+            let TempKvScanPage { next_cursor, fields } =
+                store.qtdb_raw_kv_scan_fields(cursor, count).await.unwrap();
+            all.extend(fields);
+            cursor = next_cursor;
+            if cursor == 0 {
+                break;
+            }
+        }
+        all
+    }
+
+    #[tokio::test]
+    async fn prefix_builder_is_little_endian() {
+        let prefix = pending_temp_kv_prefix(REALM, SUB, TEMP_TABLE_ID_WORKER_PROOF_METADATA_BYTES, PENDING);
+        let ep = tt_get_proving_job_metadata_key(REALM, SUB, PENDING, &job_id(1));
+        assert_eq!(prefix.as_slice(), &ep[0..PENDING_TEMP_KV_PREFIX_LEN]);
+        assert_eq!(&prefix[0..4], &REALM.to_le_bytes());
+        assert_eq!(&prefix[4..6], &SUB.to_le_bytes());
+        assert_eq!(&prefix[6..8], b"EP");
+        assert_eq!(&prefix[8..16], &PENDING.to_le_bytes());
+    }
+
+    #[tokio::test]
+    async fn exact_prefix_filter_includes_js_and_ct_rejects_decoys() {
+        let store = SimpleMemoryTempStore::new();
+        let expected = seed_store(&store).await;
+
+        let all = enumerate_all(&store, 64).await;
+        let matched = filter_temp_kv_fields_by_pending(&all, REALM, SUB, PENDING);
+
+        let matched_set: HashSet<Vec<u8>> = matched.iter().cloned().collect();
+        let expected_set: HashSet<Vec<u8>> = expected.iter().cloned().collect();
+        assert_eq!(matched_set, expected_set, "filter must keep exactly the pending-keyed fields");
+        assert!(matched.iter().any(|f| &f[6..8] == TEMP_TABLE_ID_JOB_STATS_BYTES), "JS must be included");
+        assert!(matched.iter().any(|f| &f[6..8] == TEMP_TABLE_ID_PROOF_CLAIM_TAG_BYTES), "CT (proof claim tag) must be included");
+
+        assert!(!matched.iter().any(|f| &f[6..8] == b"PI"), "PI singleton must not match");
+        assert!(!matched.iter().any(|f| &f[6..8] == b"WR"), "WR must not match");
+        assert!(matched.iter().all(|f| f.len() >= PENDING_TEMP_KV_PREFIX_LEN), "short fields rejected");
+        assert!(matched.iter().all(|f| &f[0..4] == &REALM.to_le_bytes() && &f[4..6] == &SUB.to_le_bytes() && &f[8..16] == &PENDING.to_le_bytes()));
+    }
+
+    #[tokio::test]
+    async fn pagination_collects_all_fields_without_duplicates() {
+        let store = SimpleMemoryTempStore::new();
+        seed_store(&store).await;
+
+        let collected = enumerate_all(&store, 2).await;
+
+        let set: HashSet<Vec<u8>> = collected.iter().cloned().collect();
+        assert_eq!(set.len(), collected.len(), "no duplicate fields across pages");
+
+        let big = enumerate_all(&store, 1024).await;
+        let big_set: HashSet<Vec<u8>> = big.iter().cloned().collect();
+        assert_eq!(set, big_set, "pagination must enumerate the same fields as a single page");
+    }
+
+    #[tokio::test]
+    async fn empty_store_enumerates_one_terminated_page() {
+        let store = SimpleMemoryTempStore::new();
+        let page = store.qtdb_raw_kv_scan_fields(0, 10).await.unwrap();
+        assert_eq!(page.next_cursor, 0);
+        assert!(page.fields.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hdel_filtered_fields_never_touches_other_rows_or_the_hash() {
+        let store = SimpleMemoryTempStore::new();
+        let expected = seed_store(&store).await;
+
+        let all = enumerate_all(&store, 64).await;
+        let matched = filter_temp_kv_fields_by_pending(&all, REALM, SUB, PENDING);
+
+        for field in &matched {
+            store.qtdb_raw_kv_delete_key(field).await.unwrap();
+        }
+
+        for field in &matched {
+            assert!(!store.qtdb_raw_kv_contains_key(field).await.unwrap(), "filtered field must be HDELed");
+        }
+
+        let pi = tt_get_unique_pending_id_key(REALM, SUB).to_vec();
+        let other_pending = tt_get_proving_job_metadata_key(REALM, SUB, PENDING + 1, &job_id(9)).to_vec();
+        let other_realm = tt_get_submit_status_key(REALM + 1, SUB, PENDING, 1).to_vec();
+        assert!(store.qtdb_raw_kv_contains_key(&pi).await.unwrap(), "PI singleton survives");
+        assert!(store.qtdb_raw_kv_contains_key(&other_pending).await.unwrap(), "other-pending row survives");
+        assert!(store.qtdb_raw_kv_contains_key(&other_realm).await.unwrap(), "other-realm row survives");
+
+        let remaining = enumerate_all(&store, 1024).await;
+        assert!(!remaining.is_empty(), "hash must still contain surviving rows");
+        assert_eq!(remaining.len(), 6, "exactly the 6 decoys remain");
+        let _ = expected;
     }
 }

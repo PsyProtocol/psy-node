@@ -681,6 +681,10 @@ impl<
             .file_system
             .file_like_fs_flush_file_with_path(&self.pending_file_path, &mut self.new_contracts_file)
             .await?;
+        self.config
+            .file_system
+            .file_like_fs_sync_file_with_path(&self.pending_file_path, &mut self.new_contracts_file)
+            .await?;
 
         let update_global_contract_tree_nodes_ffs = create_ffs_merkle_nodes_zero_id_from_hash_map::<N::QHash>(tree.get_changes());
         //tree.commit_changes();

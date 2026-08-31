@@ -37,6 +37,8 @@ impl<T: PsySerializeCanonicalAsyncSafe + Q256BitHash + Sized> DatabaseHashId for
 pub struct ScyllaHashToManyIdsTablePreparedStatements {
     pub insert_1_statement: Statement,
     pub insert_1_prepared: Arc<PreparedStatement>,
+    pub delete_1_prepared: Arc<PreparedStatement>,
+    pub select_exact_prepared: Arc<PreparedStatement>,
 
     pub select_values_statement: Statement,
     pub select_values_prepared: Arc<PreparedStatement>,
@@ -55,6 +57,12 @@ impl ScyllaHashToManyIdsTablePreparedStatements {
     ) -> anyhow::Result<Self> {
         let insert_1_statement = Statement::new(format!("INSERT INTO {}.{} (hash_id, value_u64) VALUES (?, ?)", keyspace, table_name));
         let insert_1_prepared = session.prepare(insert_1_statement.clone()).await?;
+        let delete_1_prepared = session
+            .prepare(format!("DELETE FROM {}.{} WHERE hash_id = ? AND value_u64 = ?", keyspace, table_name))
+            .await?;
+        let select_exact_prepared = session
+            .prepare(format!("SELECT value_u64 FROM {}.{} WHERE hash_id = ? AND value_u64 = ? LIMIT 1", keyspace, table_name))
+            .await?;
 
         // --- FIX IMPLEMENTED HERE: Using >= for robust pagination ---
         let select_values_statement = Statement::new(format!(
@@ -66,6 +74,8 @@ impl ScyllaHashToManyIdsTablePreparedStatements {
         Ok(Self {
             insert_1_statement: insert_1_statement,
             insert_1_prepared: Arc::new(insert_1_prepared),
+            delete_1_prepared: Arc::new(delete_1_prepared),
+            select_exact_prepared: Arc::new(select_exact_prepared),
             select_values_statement,
             select_values_prepared: Arc::new(select_values_prepared),
 
@@ -127,6 +137,24 @@ impl ScyllaStandardPreparedTableStatements for ScyllaHashToManyIdsTablePreparedS
 }
 
 impl ScyllaHashToManyIdsTablePreparedStatements {
+    pub async fn delete_many_hash_user_pairs<Hash: DatabaseHashId>(&self, session: &Session, keys: &[(Hash, u64)]) -> anyhow::Result<()> {
+        for (hash, user_id) in keys {
+            session.execute_unpaged(
+                &self.delete_1_prepared,
+                (hash.dhi_to_hash_bytes().to_vec(), u64_to_i64_exact(*user_id)),
+            ).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn contains_exact_hash_user_pair<Hash: DatabaseHashId>(&self, session: &Session, hash: &Hash, user_id: u64) -> anyhow::Result<bool> {
+        let result = session.execute_unpaged(
+            &self.select_exact_prepared,
+            (hash.dhi_to_hash_bytes().to_vec(), u64_to_i64_exact(user_id)),
+        ).await?;
+        Ok(result.into_rows_result()?.maybe_first_row::<(i64,)>()?.is_some())
+    }
+
     pub async fn insert_one_hash_to_u64<Hash: DatabaseHashId>(&self, session: &Session, hash_id: Hash, value: u64) -> anyhow::Result<()> {
         let hash_bytes = hash_id.dhi_to_hash_bytes().to_vec();
         session

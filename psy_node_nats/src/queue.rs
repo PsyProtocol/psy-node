@@ -120,10 +120,49 @@ impl NatsJetStreamClient {
         err_string.contains("consumer not found") || err_string.contains("error code 10014")
     }
 
+    // Absence is CONSUMER_NOT_FOUND only; other 404s stay errors.
+    fn is_exact_consumer_not_found_error(err: &jetstream::stream::ConsumerError) -> bool {
+        match err.kind() {
+            jetstream::stream::ConsumerErrorKind::JetStream(error) => {
+                error.error_code() == jetstream::ErrorCode::CONSUMER_NOT_FOUND
+            }
+            _ => false,
+        }
+    }
+
     async fn invalidate_consumer_cache(&self, durable_name: &str) {
         self.consumer_cache
             .invalidate(&self.consumer_cache_key(durable_name))
             .await;
+    }
+
+    pub async fn connect_existing<A: ToServerAddrs>(
+        base_namespace: String,
+        nats_urls: A,
+        standard_ephemeral_queue_pull_config: PullConfig,
+        worker_queue_pull_config: PullConfig,
+        standard_jet_stream_config: jetstream::stream::Config,
+    ) -> anyhow::Result<Self> {
+        let client = async_nats::connect(nats_urls).await?;
+        let jetstream = Arc::new(jetstream::new(client));
+        let stream_name = format!("{}_stream", base_namespace.replace('.', "_"));
+        jetstream.get_stream(&stream_name).await?;
+        let bucket = format!("{}_kv", base_namespace.replace('.', "_"));
+        let kv = jetstream.get_key_value(&bucket).await?;
+        let consumer_cache = Cache::builder()
+            .max_capacity(100)
+            .time_to_idle(Duration::from_secs(300))
+            .build();
+        Ok(Self {
+            base_namespace,
+            jetstream,
+            stream_name,
+            standard_ephemeral_queue_pull_config,
+            worker_queue_pull_config,
+            standard_jet_stream_config,
+            kv,
+            consumer_cache,
+        })
     }
 
     pub async fn new_connection<A: ToServerAddrs>(
@@ -206,6 +245,33 @@ impl NatsJetStreamClient {
         }
     }
 
+    pub async fn consumer_exists_for_queue<QK: PCoreStandardQueueKeyForRealm>(
+        &self,
+        queue_key: &QK,
+        realm_id: u64,
+        realm_sub_id: u64,
+        unique_id: QCoreProcCheckpointUniqueId,
+        task_group: u32,
+    ) -> anyhow::Result<bool> {
+        let durable_name = queue_key.get_durable_name(
+            &self.base_namespace,
+            realm_id,
+            realm_sub_id,
+            unique_id,
+            task_group,
+        );
+        self.invalidate_consumer_cache(&durable_name).await;
+        match self
+            .jetstream
+            .get_consumer_from_stream::<PullConfig, _, _>(&durable_name, &self.stream_name)
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(err) if Self::is_exact_consumer_not_found_error(&err) => Ok(false),
+            Err(err) => Err(err.into()),
+        }
+    }
+
     pub fn get_pull_config_for_queue_type(&self, queue_type: QPBaseQueueType) -> PullConfig {
         match queue_type {
             QPBaseQueueType::StandardEphemeral => self.standard_ephemeral_queue_pull_config.clone(),
@@ -256,13 +322,8 @@ impl NatsJetStreamClient {
             .await
         {
             Ok(_) => Ok(()),
-            Err(err) => {
-                if Self::is_consumer_not_found_error(&err) || err.to_string().to_lowercase().contains("not found") {
-                    Ok(())
-                } else {
-                    Err(err.into())
-                }
-            }
+            Err(err) if Self::is_exact_consumer_not_found_error(&err) => Ok(()),
+            Err(err) => Err(err.into()),
         }
     }
 
@@ -846,8 +907,10 @@ impl NatsJetStreamClient {
 
 #[cfg(test)]
 mod tests {
+    use async_nats::jetstream;
+
     use super::{
-        consumer_missing_with_barrier, worker_queue_completion_reached,
+        consumer_missing_with_barrier, worker_queue_completion_reached, NatsJetStreamClient,
         NatsWorkerQueuePublishBarrier,
     };
 
@@ -857,6 +920,28 @@ mod tests {
             barrier.record_ack(*sequence);
         }
         barrier
+    }
+
+    fn consumer_error(error_code: u64, description: &str) -> jetstream::stream::ConsumerError {
+        let error: jetstream::Error = serde_json::from_value(serde_json::json!({
+            "code": 404,
+            "err_code": error_code,
+            "description": description,
+        }))
+        .unwrap();
+        jetstream::stream::ConsumerError::new(
+            jetstream::stream::ConsumerErrorKind::JetStream(error),
+        )
+    }
+
+    #[test]
+    fn rollback_absence_accepts_only_consumer_not_found_code() {
+        assert!(NatsJetStreamClient::is_exact_consumer_not_found_error(
+            &consumer_error(10014, "consumer not found"),
+        ));
+        assert!(!NatsJetStreamClient::is_exact_consumer_not_found_error(
+            &consumer_error(10059, "consumer not found"),
+        ));
     }
 
     #[test]

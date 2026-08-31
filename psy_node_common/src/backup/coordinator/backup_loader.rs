@@ -57,7 +57,7 @@ pub async fn generate_coordinator_output_from_backups<
         coordinator_ids.unique_pending_id,
     );
 
-    let register_user_gatherer_result = read_register_user_gatherer_backup_file_path::<N::HasherBase, N::QHash, FileSystem>(
+    let register_user_gatherer_result = read_register_user_gatherer_backup_file_path::<N, N::HasherBase, N::QHash, FileSystem>(
         file_system,
         &register_users_gatherer_backup_file_path,
         user_registration_tree,

@@ -75,6 +75,9 @@ impl TokioLikeFileSystem for SimpleMockMemoryFileSystem {
             ))
         }
     }
+    async fn file_like_fs_sync_parent_dir(&self, _path: &str) -> tokio::io::Result<()> {
+        Ok(())
+    }
     async fn file_like_metadata(&self, path: &str) -> tokio::io::Result<FileLikeMetadata> {
         if let Some(data) = self.files.get(path) {
             Ok(FileLikeMetadata::new(data.len() as u64, true, false, false))

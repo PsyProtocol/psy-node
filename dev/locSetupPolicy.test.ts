@@ -37,7 +37,7 @@ import {
     resolveRealmWorkerCount,
     shouldFatalRestartProcessor,
     shouldSkipBranchSync,
-} from "./locSetupDefaults";
+} from "./locSetupPolicy";
 
 describe("resolveRealmWorkerCount", () => {
     it("starts two realm workers for a full devnet by default", () => {
