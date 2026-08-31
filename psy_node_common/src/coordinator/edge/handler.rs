@@ -39,6 +39,7 @@ use crate::{
         votes_meet_wait,
     },
 };
+use crate::worker_whitelist::WhiteListCache;
 
 // const END_CAP_PROOF_CIRCUIT_TYPE_U32: u32 = ProvingJobCircuitType::UserEndCap as u32;
 pub struct CoordinatorEdgeHandler<
@@ -61,6 +62,7 @@ pub struct CoordinatorEdgeHandler<
     pub register_user_queue: Arc<RegisterUserQueue>,
     pub contract_queue: Arc<DeployContractQueue>,
     pub get_proof_work_queue: Arc<GetProofWorkQueue>,
+    pub worker_whitelist: WhiteListCache,
 
     pub realm_identifier: QRealmIdentifier,
     pub realm_id_u64: u64,
@@ -106,6 +108,7 @@ impl<
             register_user_queue: self.register_user_queue.clone(),
             contract_queue: self.contract_queue.clone(),
             get_proof_work_queue: self.get_proof_work_queue.clone(),
+            worker_whitelist: self.worker_whitelist.clone(),
             realm_identifier: self.realm_identifier.clone(),
             realm_id_u64: self.realm_id_u64.clone(),
             realm_sub_id_u64: self.realm_sub_id_u64.clone(),
@@ -150,6 +153,7 @@ impl<
         contract_queue: Arc<DeployContractQueue>,
         get_proof_work_queue: Arc<GetProofWorkQueue>,
         realm_identifier: QRealmIdentifier,
+        worker_whitelist: WhiteListCache,
         chain_id: u32,
         proof_verifier: Arc<N::ZKVerifier>,
         checkpoint_state_transition_circuit_fingerprint: N::QHash,
@@ -165,6 +169,7 @@ impl<
             register_user_queue,
             contract_queue,
             get_proof_work_queue,
+            worker_whitelist,
             realm_identifier,
             realm_id_u64,
             realm_sub_id_u64,

@@ -6,7 +6,7 @@ use psy_core::{job::job_id::QProvingJobDataID, network_config::PsyNetworkLocalDe
 use psy_data::
     config::network_config::PsyNodeCircuitFingerprintConfigProvider
 ;
-use psy_node_common::{coordinator::edge::{handler::CoordinatorEdgeHandler, server::start_coordinator_edge_rpc_server}, realm::edge::{handler::RealmEdgeHandler, server::start_realm_edge_rpc_server}};
+use psy_node_common::{coordinator::edge::{handler::CoordinatorEdgeHandler, server::start_coordinator_edge_rpc_server}, realm::edge::{handler::RealmEdgeHandler, server::start_realm_edge_rpc_server}, worker_whitelist::WhiteListCache};
 use psy_node_core::config::node_start_config::{CoordinatorEdgeStartConfig, RealmEdgeStartConfig};
 use psy_node_nats::psy_queue::{setup_nats_psy_queue_from_connection_str, NatsSetupMode};
 use psy_node_redis::store::{new_redis_async_pool, StandardRedisStore};
@@ -24,6 +24,7 @@ pub async fn run_startup_plonky2_scylla_edge_node(config: &CoordinatorEdgeStartC
 
     let fingerprint_config = PsyPlonky2NodeConfigResolver::new().get_circuit_fingerprint_config_for_network(config.network)?;
     let checkpoint_state_transition_circuit_fingerprint =fingerprint_config.checkpoint_state_transition_circuit_fingerprint;
+    let worker_whitelist = WhiteListCache::new(&config.worker_whitelist_config, config.network)?;
 
     let pool = new_redis_async_pool(&config.redis_url, 2).await?;
 
@@ -82,6 +83,7 @@ pub async fn run_startup_plonky2_scylla_edge_node(config: &CoordinatorEdgeStartC
                 deploy_contract_queue,
                 proof_work_queue,
                 realm_identifier,
+                worker_whitelist,
                 config.network.get_chain_id(),
                 proof_verifier,
                 checkpoint_state_transition_circuit_fingerprint,
@@ -112,6 +114,7 @@ pub async fn run_startup_plonky2_scylla_edge_node(config: &CoordinatorEdgeStartC
 pub async fn run_startup_plonky2_scylla_realm_edge_node(config: &RealmEdgeStartConfig) -> anyhow::Result<()> {
 
 
+    let worker_whitelist = WhiteListCache::new(&config.worker_whitelist_config, config.network)?;
     let pool = new_redis_async_pool(&config.redis_url, 2).await?;
 
     let temp_store = StandardRedisStore::new(
@@ -167,6 +170,7 @@ pub async fn run_startup_plonky2_scylla_realm_edge_node(config: &RealmEdgeStartC
                 guta_update_queue,
                 proof_work_queue,
                 realm_identifier,
+                worker_whitelist,
                 chain_id,
                 0,
                 proof_verifier,

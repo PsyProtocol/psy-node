@@ -16,6 +16,7 @@ use psy_jtmb_testing_core::{
 use psy_node_common::{
     coordinator::edge::{handler::CoordinatorEdgeHandler, server::start_coordinator_edge_rpc_server},
     realm::edge::{handler::RealmEdgeHandler, server::start_realm_edge_rpc_server},
+    worker_whitelist::WhiteListCache,
 };
 use psy_node_core::config::node_start_config::{CoordinatorEdgeStartConfig, RealmEdgeStartConfig};
 use psy_node_nats::psy_queue::{setup_nats_psy_queue_from_connection_str, NatsSetupMode};
@@ -27,6 +28,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
 
     let fingerprint_config = PsyJTMBPoseidonGoldilocksNodeConfigResolver::new().get_circuit_fingerprint_config_for_network(config.network)?;
     let checkpoint_state_transition_circuit_fingerprint = fingerprint_config.checkpoint_state_transition_circuit_fingerprint;
+    let worker_whitelist = WhiteListCache::new(&config.worker_whitelist_config, config.network)?;
 
     let pool = new_redis_async_pool(&config.redis_url, 10).await?;
 
@@ -82,6 +84,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
                 deploy_contract_queue,
                 proof_work_queue,
                 realm_identifier,
+                worker_whitelist,
                 config.network.get_chain_id(),
                 proof_verifier,
                 checkpoint_state_transition_circuit_fingerprint,
@@ -109,6 +112,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
                 deploy_contract_queue,
                 proof_work_queue,
                 realm_identifier,
+                worker_whitelist,
                 config.network.get_chain_id(),
                 proof_verifier,
                 checkpoint_state_transition_circuit_fingerprint,
@@ -135,6 +139,7 @@ where
     C: JTMBCircuitConfig + 'static,
 {
     let (verifier, _) = get_jtmb_circuit_library_and_prover_for_network::<C>(config.network)?;
+    let worker_whitelist = WhiteListCache::new(&config.worker_whitelist_config, config.network)?;
     let pool = new_redis_async_pool(&config.redis_url, 10).await?;
     let temp_store = StandardRedisStore::new(pool, config.db_namespace.to_string(), config.realm_id, config.realm_sub_id as u64);
     let nats_queue = setup_nats_psy_queue_from_connection_str(&config.nats_jetstream_url, &config.db_namespace, NatsSetupMode::CreateIfMissing).await?;
@@ -163,6 +168,7 @@ where
         guta_update_queue,
         proof_work_queue,
         realm_identifier,
+        worker_whitelist,
         chain_id,
         0,
         proof_verifier,

@@ -114,6 +114,7 @@ impl<
         if !verify_api_signature(&signature, &request) {
             anyhow::bail!("invalid signature from miner");
         }
+        self.worker_whitelist.ensure_allowed(&signature.public_key)?;
         let reputation = self.temp_db.get_worker_reputation(&self.realm_identifier, &signature.public_key).await?;
         if reputation <= 0 {
             anyhow::bail!("worker not eligible: reputation must be positive");
@@ -392,6 +393,7 @@ impl<
         if !verify_api_signature(&signature, &request) || request.request_type != REQUEST_TYPE_SUBMIT_PROOF {
             anyhow::bail!("invalid signature for submit_proof_raw");
         }
+        self.worker_whitelist.ensure_allowed(&signature.public_key)?;
         job_id = job_id.get_output_id();
         let mut timer = DebugTimer::new("submit_proof_raw_internal");
         let (current_unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;

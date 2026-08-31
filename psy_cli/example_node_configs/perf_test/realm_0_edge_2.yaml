@@ -10,6 +10,7 @@ redis_url: redis://127.0.0.1:6379
 
 port: 13372
 listen: 0.0.0.0
+worker_whitelist_config: psy-genesis/config.json
 
 coordinator_api_urls:
   - http://127.0.0.1:1337

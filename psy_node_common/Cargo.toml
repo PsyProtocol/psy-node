@@ -25,6 +25,8 @@ serde_json      = { workspace = true }
 serde_repr      = { workspace = true }
 serde_with      = { workspace = true }
 hex = { workspace = true }
+k256 = { workspace = true }
+parking_lot = { workspace = true }
 hex-literal = { workspace = true }
 bincode = { workspace = true }
 tracing = { workspace = true }
@@ -69,6 +71,7 @@ sha2 = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+tempfile = { workspace = true }
 
 
 

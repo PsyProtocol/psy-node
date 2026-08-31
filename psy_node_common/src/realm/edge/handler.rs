@@ -59,6 +59,7 @@ use crate::realm::network::RealmNetworkCommands;
 use parth_common::realm_rotation::RealmRotationConfig;
 use psy_data::p2p::{compute_end_cap_id, sha256, EndCapForwardHeader, EndCapForwardResponse, NodeId};
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
+use crate::worker_whitelist::WhiteListCache;
 
 const END_CAP_PROOF_CIRCUIT_TYPE_U32: u32 = ProvingJobCircuitType::UserEndCap as u32;
 pub struct RealmEdgeHandler<
@@ -77,6 +78,7 @@ pub struct RealmEdgeHandler<
 
     pub user_update_queue: Arc<UserUpdateQueue>,
     pub get_proof_work_queue: Arc<GetProofWorkQueue>,
+    pub worker_whitelist: WhiteListCache,
 
     pub realm_identifier: QRealmIdentifier,
     pub realm_id_u64: u64,
@@ -109,6 +111,7 @@ impl<
             proof_store: self.proof_store.clone(),
             user_update_queue: self.user_update_queue.clone(),
             get_proof_work_queue: self.get_proof_work_queue.clone(),
+            worker_whitelist: self.worker_whitelist.clone(),
             realm_identifier: self.realm_identifier.clone(),
             realm_id_u64: self.realm_id_u64.clone(),
             realm_sub_id_u64: self.realm_sub_id_u64.clone(),
@@ -140,6 +143,7 @@ impl<
         user_update_queue: Arc<UserUpdateQueue>,
         get_proof_work_queue: Arc<GetProofWorkQueue>,
         realm_identifier: QRealmIdentifier,
+        worker_whitelist: WhiteListCache,
         chain_id: u32,
         node_id: u32,
         proof_verifier: Arc<N::ZKVerifier>,
@@ -153,6 +157,7 @@ impl<
             proof_store,
             user_update_queue,
             get_proof_work_queue,
+            worker_whitelist,
             realm_identifier,
             realm_id_u64,
             realm_sub_id_u64,

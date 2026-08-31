@@ -122,6 +122,9 @@ pub enum Commands {
         #[arg(long = "listen", help = "The listen address to run the edge server's HTTP API on (default: 0.0.0.0)")]
         listen: Option<String>,
 
+        #[arg(long = "worker-whitelist-config", help = "Path to the worker whitelist genesis config file")]
+        worker_whitelist_config: Option<String>,
+
         #[arg(long = "proving-backend", help = "The proving backend to use (plonky2-poseidon-goldilocks, jtmb-poseidon-goldilocks, jtmb-sha256-u64, etc.)")]
         proving_backend: Option<PsyChainProvingBackendTypeInput>,
 
@@ -224,6 +227,9 @@ pub enum Commands {
 
         #[arg(long = "listen", help = "The listen address to run the edge server's HTTP API on (default: 0.0.0.0)")]
         listen: Option<String>,
+
+        #[arg(long = "worker-whitelist-config", help = "Path to the worker whitelist genesis config file")]
+        worker_whitelist_config: Option<String>,
 
         #[arg(long = "proving-backend", help = "The proving backend to use (plonky2-poseidon-goldilocks, jtmb-poseidon-goldilocks, jtmb-sha256-u64, etc.)")]
         proving_backend: Option<PsyChainProvingBackendTypeInput>,

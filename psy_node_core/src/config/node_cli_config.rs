@@ -210,6 +210,7 @@ pub struct RealmEdgeCliConfig {
     pub verbose: Option<bool>,
     pub port: Option<u16>,
     pub listen: Option<String>,
+    pub worker_whitelist_config: Option<String>,
     #[serde(default)]
     pub p2p_identity_key_path: Option<String>,
     #[serde(default)]
@@ -243,6 +244,7 @@ impl RealmEdgeCliConfig {
             verbose: None,
             port: None,
             listen: None,
+            worker_whitelist_config: None,
             p2p_identity_key_path: None,
             p2p_bls_key_path: None,
             p2p_listen: None,
@@ -267,6 +269,7 @@ impl RealmEdgeCliConfig {
         verbose: bool,
         port: Option<u16>,
         listen: Option<String>,
+        worker_whitelist_config: Option<String>,
         p2p_identity_key_path: Option<String>,
         p2p_bls_key_path: Option<String>,
         p2p_listen: Option<String>,
@@ -288,6 +291,7 @@ impl RealmEdgeCliConfig {
             verbose: verbose || self.verbose.unwrap_or(false),
             port: port.or(self.port).unwrap_or(8080),
             listen: listen.or(self.listen).unwrap_or_else(|| "0.0.0.0".to_string()),
+            worker_whitelist_config: worker_whitelist_config.or(self.worker_whitelist_config).unwrap_or_else(|| "psy-genesis/config.json".to_string()),
             p2p_identity_key_path: p2p_identity_key_path.or(self.p2p_identity_key_path),
             p2p_bls_key_path: p2p_bls_key_path.or(self.p2p_bls_key_path),
             p2p_listen: p2p_listen.or(self.p2p_listen),
@@ -312,6 +316,7 @@ impl RealmEdgeCliConfig {
         verbose: bool,
         port: Option<u16>,
         listen: Option<String>,
+        worker_whitelist_config: Option<String>,
         p2p_identity_key_path: Option<String>,
         p2p_bls_key_path: Option<String>,
         p2p_listen: Option<String>,
@@ -338,6 +343,7 @@ impl RealmEdgeCliConfig {
             verbose,
             port,
             listen,
+            worker_whitelist_config,
             p2p_identity_key_path,
             p2p_bls_key_path,
             p2p_listen,
@@ -448,6 +454,7 @@ pub struct CoordinatorEdgeCliConfig {
     pub verbose: Option<bool>,
     pub port: Option<u16>,
     pub listen: Option<String>,
+    pub worker_whitelist_config: Option<String>,
     #[serde(default)]
     pub p2p_roster_path: Option<String>,
     #[serde(default)]
@@ -467,6 +474,7 @@ impl CoordinatorEdgeCliConfig {
             verbose: None,
             port: None,
             listen: None,
+            worker_whitelist_config: None,
             p2p_roster_path: None,
             p2p_checkpoints_per_epoch: None,
         }
@@ -483,6 +491,7 @@ impl CoordinatorEdgeCliConfig {
         verbose: bool,
         port: Option<u16>,
         listen: Option<String>,
+        worker_whitelist_config: Option<String>,
         p2p_roster_path: Option<String>,
         p2p_checkpoints_per_epoch: Option<u64>,
     ) -> anyhow::Result<CoordinatorEdgeStartConfig> {
@@ -497,6 +506,7 @@ impl CoordinatorEdgeCliConfig {
             verbose: verbose || self.verbose.unwrap_or(false),
             port: port.or(self.port).unwrap_or(8080),
             listen: listen.or(self.listen).unwrap_or_else(|| "0.0.0.0".to_string()),
+            worker_whitelist_config: worker_whitelist_config.or(self.worker_whitelist_config).unwrap_or_else(|| "psy-genesis/config.json".to_string()),
             p2p_roster_path: p2p_roster_path.or(self.p2p_roster_path),
             p2p_checkpoints_per_epoch: p2p_checkpoints_per_epoch.or(self.p2p_checkpoints_per_epoch),
         })
@@ -513,6 +523,7 @@ impl CoordinatorEdgeCliConfig {
         verbose: bool,
         port: Option<u16>,
         listen: Option<String>,
+        worker_whitelist_config: Option<String>,
         p2p_roster_path: Option<String>,
         p2p_checkpoints_per_epoch: Option<u64>,
     ) -> anyhow::Result<CoordinatorEdgeStartConfig> {
@@ -532,6 +543,7 @@ impl CoordinatorEdgeCliConfig {
             verbose,
             port,
             listen,
+            worker_whitelist_config,
             p2p_roster_path,
             p2p_checkpoints_per_epoch,
         )

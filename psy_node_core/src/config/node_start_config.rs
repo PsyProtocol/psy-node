@@ -2,6 +2,10 @@ use psy_core::constants::chain_id::PsyChainNetworkType;
 use serde::{Deserialize, Serialize};
 
 
+fn default_worker_whitelist_config() -> String {
+    "psy-genesis/config.json".to_string()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RealmProcessorStartConfig {
     pub scylla_db_url: String,
@@ -69,6 +73,8 @@ pub struct RealmEdgeStartConfig {
     pub verbose: bool,
     pub port: u16,
     pub listen: String,
+    #[serde(default = "default_worker_whitelist_config")]
+    pub worker_whitelist_config: String,
     #[serde(default)]
     pub p2p_identity_key_path: Option<String>,
     #[serde(default)]
@@ -154,6 +160,8 @@ pub struct CoordinatorEdgeStartConfig {
     pub verbose: bool,
     pub port: u16,
     pub listen: String,
+    #[serde(default = "default_worker_whitelist_config")]
+    pub worker_whitelist_config: String,
     #[serde(default)]
     pub p2p_roster_path: Option<String>,
     #[serde(default)]
