@@ -43,6 +43,7 @@ pub struct ScyllaIMTKeyIndexPreparedStatements {
     pub table_key: QDatabaseTableRoutingKey,
 
     pub insert_prepared: Arc<PreparedStatement>,
+    pub delete_prepared: Arc<PreparedStatement>,
     pub select_exact_prepared: Arc<PreparedStatement>,
     pub select_predecessor_prepared: Arc<PreparedStatement>,
     pub select_predecessor_full_bucket_prepared: Arc<PreparedStatement>,
@@ -117,6 +118,9 @@ impl ScyllaIMTKeyIndexPreparedStatements {
         tracing::info!("Preparing IMT key index statements: {}.{}", keyspace, table_name);
         let insert_prepared = session.prepare(insert_stmt).await?;
         let select_exact_prepared = session.prepare(select_exact_stmt).await?;
+        let delete_prepared = session.prepare(format!(
+            "DELETE FROM {keyspace}.{table_name} WHERE tree_id = ? AND tree_sub_id = ? AND key_bucket = ? AND encoded_key = ?"
+        )).await?;
         let select_predecessor_prepared = session.prepare(select_predecessor_stmt).await?;
         let select_predecessor_full_bucket_prepared = session.prepare(select_predecessor_full_bucket_stmt).await?;
         tracing::info!("Prepared IMT key index statements: {}.{}", keyspace, table_name);
@@ -126,6 +130,7 @@ impl ScyllaIMTKeyIndexPreparedStatements {
             table_name: table_name.to_string(),
             table_key,
             insert_prepared: Arc::new(insert_prepared),
+            delete_prepared: Arc::new(delete_prepared),
             select_exact_prepared: Arc::new(select_exact_prepared),
             select_predecessor_prepared: Arc::new(select_predecessor_prepared),
             select_predecessor_full_bucket_prepared: Arc::new(select_predecessor_full_bucket_prepared),
@@ -133,6 +138,16 @@ impl ScyllaIMTKeyIndexPreparedStatements {
     }
 
     /// Insert a key-to-leaf mapping.
+    pub async fn delete_many_keys(&self, session: &Session, keys: &[(i64, i64, i16, Vec<u8>)]) -> anyhow::Result<()> {
+        for (tree_id, tree_sub_id, key_bucket, encoded_key) in keys {
+            session.execute_unpaged(
+                &self.delete_prepared,
+                (*tree_id, *tree_sub_id, *key_bucket, encoded_key.as_slice()),
+            ).await?;
+        }
+        Ok(())
+    }
+
     pub async fn insert_key(
         &self,
         session: &Session,

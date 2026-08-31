@@ -19,7 +19,24 @@ use parth_core::{
     protocol::core_types::QDBHashBase,
 };
 use psy_node_core::store::traits::core_db::{
-    CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseBidirectionalU64U128MappingWriter, CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter, CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseHashToManyIdsReader, CoreDatabaseHashToManyIdsWriter, CoreDatabaseIMTKeyIndexReader, CoreDatabaseIMTKeyIndexWriter, CoreDatabaseIMTNextAppendIndexReader, CoreDatabaseIMTNextAppendIndexWriter, CoreDatabaseIMTLeafReader, CoreDatabaseIMTLeafWriter, CoreDatabaseKivReader, CoreDatabaseKivWriter, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter, CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseTagTreeReader, CoreDatabaseTagTreeWriter, CoreDatabaseU64CounterReader, CoreDatabaseU64CounterWriter, CoreDatabaseU64Reader, CoreDatabaseU64Writer, CoreDatabaseZeroIdMerkleDumpReader, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter, MerkleTreeDumpStrategy
+    CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalPairPresence,
+    CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseBidirectionalU64U128MappingWriter, CoreDatabaseBlobPairDeleter,
+    CoreDatabaseBlobPairVerifier, CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter,
+    CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseHashToManyIdsReader,
+    CoreDatabaseHashToManyIdsWriter, CoreDatabaseHashUserPairDeleter, CoreDatabaseHashUserPairVerifier,
+    CoreDatabaseIMTKeyIndexReader, CoreDatabaseIMTKeyIndexWriter, CoreDatabaseIMTLeafReader, CoreDatabaseIMTLeafWriter,
+    CoreDatabaseIMTNextAppendIndexReader, CoreDatabaseIMTNextAppendIndexWriter, CoreDatabaseImtKeyDeleter,
+    CoreDatabaseImtKeyVerifier, CoreDatabaseImtLeafDeleter, CoreDatabaseImtLeafVerifier,
+    CoreDatabaseImtNextAppendIndexDeleter, CoreDatabaseImtNextAppendIndexVerifier, CoreDatabaseKivReader,
+    CoreDatabaseKivWriter, CoreDatabaseMerkleDeleter, CoreDatabaseMerkleVerifier, CoreDatabaseObjectCheckpointDeleter,
+    CoreDatabaseObjectCheckpointVerifier, CoreDatabaseObjectIdDeleter, CoreDatabaseObjectIdVerifier,
+    CoreDatabasePendingIdPartitionDeleter, CoreDatabasePendingIdPartitionVerifier, CoreDatabaseSingleIdCheckpointedReader,
+    CoreDatabaseSingleIdCheckpointedWriter, CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter,
+    CoreDatabaseTagTreeReader, CoreDatabaseTagTreeWriter, CoreDatabaseTreeMerkleDeleter, CoreDatabaseTreeMerkleVerifier,
+    CoreDatabaseTreeSubtreeMerkleDeleter, CoreDatabaseTreeSubtreeMerkleVerifier, CoreDatabaseU64CounterReader,
+    CoreDatabaseU64CounterWriter, CoreDatabaseU64Reader, CoreDatabaseU64U128PairDeleter,
+    CoreDatabaseU64U128PairVerifier, CoreDatabaseU64Writer, CoreDatabaseZeroIdMerkleDumpReader,
+    CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter, MerkleTreeDumpStrategy,
 };
 use psy_serialize::PsySerializeCanonicalAsyncSafe;
 
@@ -1126,5 +1143,292 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
         next_append_index: i64,
     ) -> anyhow::Result<()> {
         table.insert(&self.session, tree_id, tree_sub_id, next_append_index).await
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseObjectIdDeleter<ScyllaGenericKeyIdValueTablePreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_delete_many_object_ids(&self, table: &ScyllaGenericKeyIdValueTablePreparedStatements, ids: &[u64]) -> anyhow::Result<()> {
+        table.delete_many_object_ids(&self.session, ids).await
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseObjectIdDeleter<ScyllaU64ToU64TablePreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_delete_many_object_ids(&self, table: &ScyllaU64ToU64TablePreparedStatements, ids: &[u64]) -> anyhow::Result<()> {
+        table.delete_many_object_ids(&self.session, ids).await
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseObjectCheckpointDeleter<ScyllaGenericObjectSingleIdTablePreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_delete_many_object_checkpoint(&self, table: &ScyllaGenericObjectSingleIdTablePreparedStatements, keys: &[(u64, u64)]) -> anyhow::Result<()> {
+        table.delete_many_object_checkpoint(&self.session, keys).await
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseMerkleDeleter<ScyllaMerkleNodesZeroPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_delete_many_merkle_nodes(&self, table: &ScyllaMerkleNodesZeroPreparedStatements, keys: &[(u8, u64, u64)]) -> anyhow::Result<()> {
+        table.delete_many_merkle_nodes(&self.session, keys).await
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseTreeMerkleDeleter<ScyllaMerkleNodesPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_delete_many_tree_merkle_nodes(&self, table: &ScyllaMerkleNodesPreparedStatements, keys: &[(u64, u8, u64, u64)]) -> anyhow::Result<()> {
+        table.delete_many_tree_merkle_nodes(&self.session, keys).await
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseTreeSubtreeMerkleDeleter<ScyllaDoubleMerkleNodesPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_delete_many_tree_subtree_merkle_nodes(&self, table: &ScyllaDoubleMerkleNodesPreparedStatements, keys: &[(u64, u64, u8, u64, u64)]) -> anyhow::Result<()> {
+        table.delete_many_tree_subtree_merkle_nodes(&self.session, keys).await
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseImtLeafDeleter<ScyllaIMTLeafPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_delete_many_imt_leaves(&self, table: &ScyllaIMTLeafPreparedStatements, keys: &[(i64, i64, i64, i64)]) -> anyhow::Result<()> {
+        table.delete_many_leaves(&self.session, keys).await
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseImtKeyDeleter<ScyllaIMTKeyIndexPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_delete_many_imt_keys(&self, table: &ScyllaIMTKeyIndexPreparedStatements, keys: &[(i64, i64, i16, Vec<u8>)]) -> anyhow::Result<()> {
+        table.delete_many_keys(&self.session, keys).await
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseImtNextAppendIndexDeleter<ScyllaIMTNextAppendIndexPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_delete_many_imt_next_append_indexes(&self, table: &ScyllaIMTNextAppendIndexPreparedStatements, keys: &[(i64, i64)]) -> anyhow::Result<()> {
+        table.delete_many(&self.session, keys).await
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseHashUserPairDeleter<ScyllaHashToManyIdsTablePreparedStatements, Hash> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_delete_many_hash_user_pairs(&self, table: &ScyllaHashToManyIdsTablePreparedStatements, keys: &[(Hash, u64)]) -> anyhow::Result<()> {
+        table.delete_many_hash_user_pairs(&self.session, keys).await
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseBlobPairDeleter<ScyllaBiDirectionalBlobToBlobTablePreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_delete_many_blob_pairs(&self, table: &ScyllaBiDirectionalBlobToBlobTablePreparedStatements, keys: &[(Vec<u8>, Vec<u8>)]) -> anyhow::Result<()> {
+        table.delete_many_pairs(&self.session, keys).await
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseU64U128PairDeleter<ScyllaBidirectionalU64U128MappingPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_delete_many_u64_u128_pairs(&self, table: &ScyllaBidirectionalU64U128MappingPreparedStatements, keys: &[(u64, u128)]) -> anyhow::Result<()> {
+        table.delete_u64_u128_mapping_pairs(&self.session, keys).await
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabasePendingIdPartitionDeleter<ScyllaTagTreeNodesPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_delete_many_pending_id_partitions(&self, table: &ScyllaTagTreeNodesPreparedStatements, pending_ids: &[u64]) -> anyhow::Result<()> {
+        table.delete_many_pending_id_partitions(&self.session, pending_ids).await
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseObjectIdVerifier<ScyllaGenericKeyIdValueTablePreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_get_existing_object_ids(&self, table: &ScyllaGenericKeyIdValueTablePreparedStatements, ids: &[u64]) -> anyhow::Result<Vec<u64>> {
+        let mut existing = Vec::new();
+        for &id in ids {
+            if table.contains_object_id(&self.session, id).await? {
+                existing.push(id);
+            }
+        }
+        Ok(existing)
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseObjectIdVerifier<ScyllaU64ToU64TablePreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_get_existing_object_ids(&self, table: &ScyllaU64ToU64TablePreparedStatements, ids: &[u64]) -> anyhow::Result<Vec<u64>> {
+        let mut existing = Vec::new();
+        for &id in ids {
+            if table.select_one_single(&self.session, id).await?.is_some() {
+                existing.push(id);
+            }
+        }
+        Ok(existing)
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseObjectCheckpointVerifier<ScyllaGenericObjectSingleIdTablePreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_get_existing_object_checkpoints(&self, table: &ScyllaGenericObjectSingleIdTablePreparedStatements, keys: &[(u64, u64)]) -> anyhow::Result<Vec<(u64, u64)>> {
+        let mut existing = Vec::new();
+        for &key in keys {
+            if table.contains_exact_object_checkpoint(&self.session, key.0, key.1).await? { existing.push(key); }
+        }
+        Ok(existing)
+    }
+}
+
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseMerkleVerifier<ScyllaMerkleNodesZeroPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_get_existing_merkle_nodes(&self, table: &ScyllaMerkleNodesZeroPreparedStatements, keys: &[(u8, u64, u64)]) -> anyhow::Result<Vec<(u8, u64, u64)>> {
+        let mut existing = Vec::new();
+        for &key in keys { if table.contains_exact_merkle_node(&self.session, key).await? { existing.push(key); } }
+        Ok(existing)
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseTreeMerkleVerifier<ScyllaMerkleNodesPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_get_existing_tree_merkle_nodes(&self, table: &ScyllaMerkleNodesPreparedStatements, keys: &[(u64, u8, u64, u64)]) -> anyhow::Result<Vec<(u64, u8, u64, u64)>> {
+        let mut existing = Vec::new();
+        for &key in keys { if table.contains_exact_tree_merkle_node(&self.session, key).await? { existing.push(key); } }
+        Ok(existing)
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseTreeSubtreeMerkleVerifier<ScyllaDoubleMerkleNodesPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_get_existing_tree_subtree_merkle_nodes(&self, table: &ScyllaDoubleMerkleNodesPreparedStatements, keys: &[(u64, u64, u8, u64, u64)]) -> anyhow::Result<Vec<(u64, u64, u8, u64, u64)>> {
+        let mut existing = Vec::new();
+        for &key in keys { if table.contains_exact_tree_subtree_merkle_node(&self.session, key).await? { existing.push(key); } }
+        Ok(existing)
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseImtLeafVerifier<ScyllaIMTLeafPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_get_existing_imt_leaves(&self, table: &ScyllaIMTLeafPreparedStatements, keys: &[(i64, i64, i64, i64)]) -> anyhow::Result<Vec<(i64, i64, i64, i64)>> {
+        let mut existing = Vec::new();
+        for &key in keys { if table.contains_exact_leaf(&self.session, key).await? { existing.push(key); } }
+        Ok(existing)
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseImtKeyVerifier<ScyllaIMTKeyIndexPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_get_existing_imt_keys(&self, table: &ScyllaIMTKeyIndexPreparedStatements, keys: &[(i64, i64, i16, Vec<u8>)]) -> anyhow::Result<Vec<(i64, i64, i16, Vec<u8>)>> {
+        let mut existing = Vec::new();
+        for key in keys {
+            if table.select_exact(&self.session, key.0, key.1, key.2, &key.3).await?.is_some() { existing.push(key.clone()); }
+        }
+        Ok(existing)
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseImtNextAppendIndexVerifier<ScyllaIMTNextAppendIndexPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_get_existing_imt_next_append_indexes(&self, table: &ScyllaIMTNextAppendIndexPreparedStatements, keys: &[(i64, i64)]) -> anyhow::Result<Vec<(i64, i64)>> {
+        let mut existing = Vec::new();
+        for &key in keys { if table.select(&self.session, key.0, key.1).await?.is_some() { existing.push(key); } }
+        Ok(existing)
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseHashUserPairVerifier<ScyllaHashToManyIdsTablePreparedStatements, Hash> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_get_existing_hash_user_pairs(&self, table: &ScyllaHashToManyIdsTablePreparedStatements, keys: &[(Hash, u64)]) -> anyhow::Result<Vec<(Hash, u64)>> {
+        let mut existing = Vec::new();
+        for (hash, user_id) in keys {
+            if table.contains_exact_hash_user_pair(&self.session, hash, *user_id).await? { existing.push((hash.clone(), *user_id)); }
+        }
+        Ok(existing)
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseBlobPairVerifier<ScyllaBiDirectionalBlobToBlobTablePreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_get_blob_pair_presence(&self, table: &ScyllaBiDirectionalBlobToBlobTablePreparedStatements, keys: &[(Vec<u8>, Vec<u8>)]) -> anyhow::Result<Vec<CoreDatabaseBidirectionalPairPresence<Vec<u8>, Vec<u8>>>> {
+        let mut remaining = Vec::new();
+        for (k1, k2) in keys {
+            let forward_present = table.k1.contains_key(&self.session, k1).await?;
+            let reverse_present = table.k2.contains_key(&self.session, k2).await?;
+            if forward_present || reverse_present {
+                remaining.push(CoreDatabaseBidirectionalPairPresence { key: (k1.clone(), k2.clone()), forward_present, reverse_present });
+            }
+        }
+        Ok(remaining)
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseU64U128PairVerifier<ScyllaBidirectionalU64U128MappingPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_get_u64_u128_pair_presence(&self, table: &ScyllaBidirectionalU64U128MappingPreparedStatements, keys: &[(u64, u128)]) -> anyhow::Result<Vec<CoreDatabaseBidirectionalPairPresence<u64, u128>>> {
+        let mut remaining = Vec::new();
+        for &(k1, k2) in keys {
+            let forward_present = table.get_k2_from_k1(&self.session, k1).await?.is_some();
+            let reverse_present = table.get_k1_from_k2(&self.session, k2).await?.is_some();
+            if forward_present || reverse_present {
+                remaining.push(CoreDatabaseBidirectionalPairPresence { key: (k1, k2), forward_present, reverse_present });
+            }
+        }
+        Ok(remaining)
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabasePendingIdPartitionVerifier<ScyllaTagTreeNodesPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_get_existing_pending_id_partitions(&self, table: &ScyllaTagTreeNodesPreparedStatements, pending_ids: &[u64]) -> anyhow::Result<Vec<u64>> {
+        let mut existing = Vec::new();
+        for &pending_id in pending_ids { if table.contains_pending_id_partition(&self.session, pending_id).await? { existing.push(pending_id); } }
+        Ok(existing)
     }
 }

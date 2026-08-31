@@ -8,7 +8,7 @@ use psy_node_core::queue::{
     worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
 };
 use psy_node_nats::{
-    psy_queue::setup_nats_psy_queue_from_connection_str,
+    psy_queue::{setup_nats_psy_queue_from_connection_str, NatsSetupMode},
     queue::{NatsJetStreamClient, NatsWorkerQueuePublishBarrier},
 };
 
@@ -104,7 +104,7 @@ async fn all_publish_forms_ack_and_completion_tracks_their_barrier() -> anyhow::
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_nanos();
     let namespace = format!("worker_barrier_test_{suffix}");
-    let client = setup_nats_psy_queue_from_connection_str(&nats_url, &namespace).await?;
+    let client = setup_nats_psy_queue_from_connection_str(&nats_url, &namespace, NatsSetupMode::CreateIfMissing).await?;
     client.ensure_stream().await?;
 
     let unique_id = suffix;

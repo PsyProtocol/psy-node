@@ -30,7 +30,9 @@ pub struct ScyllaIMTLeafPreparedStatements {
     pub table_key: QDatabaseTableRoutingKey,
 
     pub insert_prepared: Arc<PreparedStatement>,
+    pub delete_prepared: Arc<PreparedStatement>,
     pub select_prepared: Arc<PreparedStatement>,
+    pub select_exact_prepared: Arc<PreparedStatement>,
 }
 
 impl ScyllaIMTLeafPreparedStatements {
@@ -87,10 +89,17 @@ impl ScyllaIMTLeafPreparedStatements {
              WHERE tree_id = ? AND tree_sub_id = ? AND leaf_index = ? AND checkpoint_id <= ? \
              LIMIT 1"
         );
+        let select_exact_stmt = format!(
+            "SELECT checkpoint_id FROM {keyspace}.{table_name} WHERE tree_id = ? AND tree_sub_id = ? AND leaf_index = ? AND checkpoint_id = ? LIMIT 1"
+        );
 
         tracing::info!("Preparing IMT leaf statements: {}.{}", keyspace, table_name);
         let insert_prepared = session.prepare(insert_stmt).await?;
         let select_prepared = session.prepare(select_stmt).await?;
+        let select_exact_prepared = session.prepare(select_exact_stmt).await?;
+        let delete_prepared = session.prepare(format!(
+            "DELETE FROM {keyspace}.{table_name} WHERE tree_id = ? AND tree_sub_id = ? AND leaf_index = ? AND checkpoint_id = ?"
+        )).await?;
         tracing::info!("Prepared IMT leaf statements: {}.{}", keyspace, table_name);
 
         Ok(Self {
@@ -98,8 +107,22 @@ impl ScyllaIMTLeafPreparedStatements {
             table_name: table_name.to_string(),
             table_key,
             insert_prepared: Arc::new(insert_prepared),
+            delete_prepared: Arc::new(delete_prepared),
             select_prepared: Arc::new(select_prepared),
+            select_exact_prepared: Arc::new(select_exact_prepared),
         })
+    }
+
+    pub async fn delete_many_leaves(&self, session: &Session, keys: &[(i64, i64, i64, i64)]) -> anyhow::Result<()> {
+        for &key in keys {
+            session.execute_unpaged(&self.delete_prepared, key).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn contains_exact_leaf(&self, session: &Session, key: (i64, i64, i64, i64)) -> anyhow::Result<bool> {
+        let result = session.execute_unpaged(&self.select_exact_prepared, key).await?;
+        Ok(result.into_rows_result()?.maybe_first_row::<(i64,)>()?.is_some())
     }
 
     /// Insert a single IMT leaf preimage.

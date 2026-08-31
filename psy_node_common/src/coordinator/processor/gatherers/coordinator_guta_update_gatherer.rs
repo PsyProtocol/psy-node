@@ -484,6 +484,10 @@ impl<
             .file_system
             .file_like_fs_flush_file_with_path(&self.pending_file_path, &mut self.new_coordinator_guta_file)
             .await?;
+        self.config
+            .file_system
+            .file_like_fs_sync_file_with_path(&self.pending_file_path, &mut self.new_coordinator_guta_file)
+            .await?;
 
         let output_database = CoordinatorGUTAUpdateGathererOutputDatabase {
             update_global_user_tree_nodes_ffs,

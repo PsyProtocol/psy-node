@@ -16,6 +16,7 @@ use crate::{constants::{INSERT_KEY_ID_VALUE_CHECKPOINTED_OBJECT_BATCH_SIZE, SELE
 pub struct ScyllaGenericKeyIdValueTablePreparedStatements {
     pub insert_1_statement: Statement,
     pub insert_1_prepared: Arc<PreparedStatement>,
+    pub delete_1_prepared: Arc<PreparedStatement>,
     
     pub select_value_1_statement: Statement,
     pub select_value_1_prepared: Arc<PreparedStatement>,
@@ -35,6 +36,9 @@ impl ScyllaGenericKeyIdValueTablePreparedStatements {
     pub async fn new_from_session(session: Arc<Session>, keyspace: &str, table_name: &str, table_key: QDatabaseTableRoutingKey) -> anyhow::Result<Self> {
         let insert_1_statement = Statement::new(format!("INSERT INTO {}.{} (obj_id, value) VALUES (?, ?)", keyspace, table_name));
         let insert_1_prepared = session.prepare(insert_1_statement.clone()).await?;
+        let delete_1_prepared = session
+            .prepare(format!("DELETE FROM {}.{} WHERE obj_id = ?", keyspace, table_name))
+            .await?;
         
         let select_value_1_statement = Statement::new(format!("SELECT value FROM {}.{} WHERE obj_id = ? LIMIT 1", keyspace, table_name));
         let select_value_1_prepared = session.prepare(select_value_1_statement.clone()).await?;
@@ -48,6 +52,7 @@ impl ScyllaGenericKeyIdValueTablePreparedStatements {
         Ok(Self {
             insert_1_statement: insert_1_statement,
             insert_1_prepared: Arc::new(insert_1_prepared),
+            delete_1_prepared: Arc::new(delete_1_prepared),
             select_value_1_statement: select_value_1_statement,
             select_value_1_prepared: Arc::new(select_value_1_prepared),
             select_value_obj_id_1_statement: select_value_obj_id_1_statement,
@@ -96,6 +101,18 @@ impl ScyllaStandardPreparedTableStatements for ScyllaGenericKeyIdValueTablePrepa
 }
 
 impl ScyllaGenericKeyIdValueTablePreparedStatements {
+    pub async fn delete_many_object_ids(&self, session: &Session, ids: &[u64]) -> anyhow::Result<()> {
+        for &id in ids {
+            session.execute_unpaged(&self.delete_1_prepared, (u64_to_i64_exact(id),)).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn contains_object_id(&self, session: &Session, obj_id: u64) -> anyhow::Result<bool> {
+        let result = session.execute_unpaged(&self.select_value_obj_id_1_prepared, (u64_to_i64_exact(obj_id),)).await?;
+        Ok(result.into_rows_result()?.maybe_first_row::<(i64, Vec<u8>)>()?.is_some())
+    }
+
 
     pub async fn select_one_kiv_value<V: PsySerializeCanonicalAsyncSafe>(
         &self, 

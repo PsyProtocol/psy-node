@@ -4,6 +4,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use anyhow::Context as _;
 use async_trait::async_trait;
 use parth_common::memory_stores::{
     dash_tree_append_only::PsyDashMemoryAppendOnlyMerkleStore, mem_tree_recorder::SimpleMemoryMerkleRecorderStore, traits::PsyMemoryMerkleStoreImm,
@@ -32,6 +33,7 @@ use psy_io::tokio::{TokioFileLike, TokioLikeFileSystem};
 use psy_node_core::{
     psy_temp_db::StandardProcessorTempDBStoreBase,
     qblob::{
+        blob_type::{QBlobDataType, QBlobMerkleNodeTreeType},
         data_views::{
             double_merkle_node_batch::QBlobDoubleMerkleNodeBatchDataView, single_merkle_node_batch::QBlobSingleMerkleNodeBatchDataView,
             zero_merkle_node_batch::create_ffs_merkle_nodes_zero_id_from_hash_map_with_offset,
@@ -212,7 +214,9 @@ pub async fn read_realm_end_cap_gatherer_backup_file<
 
         let single_header_parsed = QBlobSingleMerkleNodeBatchDataView::try_read_single_node_blob_header(&merkle_header)?;
 
-        let user_contract_tree_nodes_size = single_header_parsed.total_size as usize - QBLOB_TREE_NODE_BATCH_HEADER_SIZE;
+        let single_blob_remaining = backup_cursor_remaining_bytes(&cursor)?;
+        let single_blob_total_size = bound_declared_qblob_allocation(single_header_parsed.total_size, single_blob_remaining, "User contract tree node")?;
+        let user_contract_tree_nodes_size = single_blob_total_size - QBLOB_TREE_NODE_BATCH_HEADER_SIZE;
         let mut user_contract_tree_nodes = vec![0u8; user_contract_tree_nodes_size];
         Read::read_exact(&mut cursor, &mut user_contract_tree_nodes)?;
 
@@ -221,30 +225,32 @@ pub async fn read_realm_end_cap_gatherer_backup_file<
 
         let double_header_parsed = QBlobDoubleMerkleNodeBatchDataView::try_read_double_node_blob_header(&merkle_header)?;
 
-        let contract_state_tree_nodes_size = double_header_parsed.total_size as usize - QBLOB_TREE_NODE_BATCH_HEADER_SIZE;
+        let double_blob_remaining = backup_cursor_remaining_bytes(&cursor)?;
+        let double_blob_total_size = bound_declared_qblob_allocation(double_header_parsed.total_size, double_blob_remaining, "Contract state tree node")?;
+        let contract_state_tree_nodes_size = double_blob_total_size - QBLOB_TREE_NODE_BATCH_HEADER_SIZE;
         let mut contract_state_tree_nodes = vec![0u8; contract_state_tree_nodes_size];
         Read::read_exact(&mut cursor, &mut contract_state_tree_nodes)?;
 
-        // 3. Optional IMT leaf blob. Older backups have two blobs; newer ones may include
-        // a third QBlob immediately before the footer.
-        let cursor_pos = cursor.position() as usize;
-        let data_ref = cursor.get_ref();
-        let footer_size = GlobalUserTreeAggregatorHeaderWithJobId::<F, Hash>::FIXED_SIZE;
-        if cursor_pos + QBLOB_TREE_NODE_BATCH_HEADER_SIZE + footer_size <= data_ref.len() {
-            let possible_header = &data_ref[cursor_pos..cursor_pos + QBLOB_TREE_NODE_BATCH_HEADER_SIZE];
-            if let Ok(imt_header_parsed) = QBlobMerkleTreeNodeBatchHeaderV1::try_read_header_from_slice(possible_header) {
-                let imt_blob_size = imt_header_parsed.total_size as usize;
-                if imt_blob_size >= QBLOB_TREE_NODE_BATCH_HEADER_SIZE && cursor_pos + imt_blob_size + footer_size <= data_ref.len() {
-                    cursor.set_position((cursor_pos + QBLOB_TREE_NODE_BATCH_HEADER_SIZE) as u64);
-                    let imt_leaf_size = imt_blob_size - QBLOB_TREE_NODE_BATCH_HEADER_SIZE;
-                    let mut imt_leaves = vec![0u8; imt_leaf_size];
-                    Read::read_exact(&mut cursor, &mut imt_leaves)?;
-                    update_contract_state_imt_leaves_ffs.extend_from_slice(&imt_leaves);
-                }
-            }
+        // 3. IMT leaf QBlob, mandatory third segment
+        Read::read_exact(&mut cursor, &mut merkle_header)?;
+        let imt_stream_header =
+            QBlobMerkleTreeNodeBatchHeaderV1::try_read_header_from_slice(&merkle_header).context("End cap backup is missing the mandatory IMT leaf QBlob header")?;
+        let imt_blob_remaining = backup_cursor_remaining_bytes(&cursor)?;
+        let imt_blob_size = bound_declared_qblob_allocation(imt_stream_header.total_size, imt_blob_remaining, "IMT leaf")?;
+        if imt_blob_size < QBLOB_TREE_NODE_BATCH_HEADER_SIZE {
+            anyhow::bail!("IMT leaf QBlob declared total_size {} is smaller than the header size", imt_blob_size);
         }
-
-        // C. Apply Logic
+        let mut imt_blob = vec![0u8; imt_blob_size];
+        imt_blob[..QBLOB_TREE_NODE_BATCH_HEADER_SIZE].copy_from_slice(&merkle_header);
+        Read::read_exact(&mut cursor, &mut imt_blob[QBLOB_TREE_NODE_BATCH_HEADER_SIZE..])
+            .context("Failed to read the mandatory IMT leaf QBlob payload")?;
+        let (_imt_blob_header, imt_leaves) = QBlobMerkleTreeNodeBatchHeaderV1::clip_header_get_payload_for_blob_type_and_tree(
+            imt_blob,
+            QBlobDataType::GenericIMTLeafBatch,
+            QBlobMerkleNodeTreeType::IMTContractStateLeaf,
+            true,
+        )?;
+        update_contract_state_imt_leaves_ffs.extend_from_slice(&imt_leaves);
         user_leaf_node.pio_write_to_io(&mut update_user_leaves_ffs)?;
         update_user_contract_tree_nodes_ffs.extend_from_slice(&user_contract_tree_nodes);
         update_contract_state_tree_nodes_ffs.extend_from_slice(&contract_state_tree_nodes);
@@ -304,6 +310,30 @@ pub async fn read_realm_end_cap_gatherer_backup_file<
         total_users_updated: actual_end_caps_processed as u64,
         guta_header,
     })
+}
+
+fn backup_cursor_remaining_bytes(cursor: &Cursor<Vec<u8>>) -> anyhow::Result<usize> {
+    let position = usize::try_from(cursor.position())
+        .map_err(|_| anyhow::anyhow!("Backup cursor position {} exceeds usize range", cursor.position()))?;
+    cursor
+        .get_ref()
+        .len()
+        .checked_sub(position)
+        .ok_or_else(|| anyhow::anyhow!("Backup cursor position {} exceeds buffer length {}", position, cursor.get_ref().len()))
+}
+
+fn bound_declared_qblob_allocation(declared_total_size: u64, remaining_bytes: usize, segment: &str) -> anyhow::Result<usize> {
+    let declared_size = usize::try_from(declared_total_size)
+        .map_err(|_| anyhow::anyhow!("{} QBlob declared total_size {} exceeds usize range", segment, declared_total_size))?;
+    if declared_size > remaining_bytes {
+        anyhow::bail!(
+            "{} QBlob header declared total_size {} bytes but only {} bytes remain in the backup payload",
+            segment,
+            declared_total_size,
+            remaining_bytes
+        );
+    }
+    Ok(declared_size)
 }
 
 fn write_guta_header_with_job_id_backup_bytes<F: QFelt64, Hash: Q256BitHash>(
@@ -851,9 +881,8 @@ mod backup_file_tests {
             offset += parse_qblob_total_size(body, offset)
                 .map_err(|e| anyhow::anyhow!("state blob parse failed for queue_item #{}: {}", actual_end_caps, e))?;
 
-            if offset + QBLOB_TREE_NODE_BATCH_HEADER_SIZE <= body.len() && parse_qblob_total_size(body, offset).is_ok() {
-                offset += parse_qblob_total_size(body, offset)?;
-            }
+            offset += parse_qblob_total_size(body, offset)
+                .map_err(|e| anyhow::anyhow!("IMT blob parse failed for queue_item #{}: {}", actual_end_caps, e))?;
         }
 
         if HEADER_SIZE + offset + FOOTER_SIZE > file_len {
@@ -933,5 +962,199 @@ mod backup_file_tests {
             .get(offset..offset + 4)
             .ok_or_else(|| anyhow::anyhow!("failed to read u32 at offset {}", offset))?;
         Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+    }
+
+    mod reader_tests {
+        use anyhow::Context as _;
+        use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
+        use parth_core::{
+            crypto::hash::traits::ZeroableHash,
+            felt::{QFelt64, ToU64Value, ZeroableFelt},
+            pgoldilocks::PoseidonHasher,
+            protocol::core_types::Q256BitHash,
+            QJobIdBase, PHash, PF,
+        };
+        use psy_core::job::job_id::QProvingJobDataID;
+        use psy_data::{
+            guta::{header::GlobalUserTreeAggregatorHeader, header_extended::GlobalUserTreeAggregatorHeaderWithJobId, stats::GUTAStats, sub_tree_transition::SubTreeNodeStateTransition},
+            v1::qdata::user::PQEDUserLeaf,
+        };
+        use psy_node_core::file::memory_fs::SimpleMockMemoryFileSystem;
+        use psy_serialize::PsyIOReadWrite;
+
+        use super::super::{
+            read_realm_end_cap_gatherer_backup_file, write_guta_header_with_job_id_backup_bytes, QBlobDataType, QBlobMerkleNodeTreeType,
+            QBlobMerkleTreeNodeBatchHeaderV1, QBLOB_TREE_NODE_BATCH_HEADER_SIZE, RealmGUTAEndCapGathererOutputDatabase,
+            REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32,
+        };
+        use super::{GUTA_STATS_SIZE, HASH_SIZE, JOB_ID_SIZE};
+
+        type ReaderHasher = PoseidonHasher;
+        type ReaderHash = PHash;
+        type ReaderF = PF;
+        const READER_REALM_GLOBAL_USER_TREE_HEIGHT: u8 = 4;
+        const READER_COORDINATOR_GLOBAL_USER_TREE_HEIGHT: u8 = 32;
+
+        async fn read_backup_with_records(records: &[Vec<u8>]) -> anyhow::Result<RealmGUTAEndCapGathererOutputDatabase<ReaderF, ReaderHash>> {
+            let file_system = SimpleMockMemoryFileSystem::new();
+            let path = "realm_end_cap_reader_test.backup";
+            let mut tree = SimpleMemoryMerkleRecorderStore::<ReaderHasher, ReaderHash>::new(READER_REALM_GLOBAL_USER_TREE_HEIGHT);
+            let start_root = tree.get_root();
+            let mut data = Vec::new();
+            data.extend_from_slice(&REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32.to_le_bytes());
+            data.extend_from_slice(&start_root.into_owned_32bytes());
+            data.extend_from_slice(&start_root.into_owned_32bytes());
+            data.extend_from_slice(&(records.len() as u64).to_le_bytes());
+            for record in records {
+                data.extend_from_slice(record);
+            }
+            let guta_header = GlobalUserTreeAggregatorHeaderWithJobId::<ReaderF, ReaderHash> {
+                job_id: QProvingJobDataID::new_invalid_job_id(),
+                header: GlobalUserTreeAggregatorHeader {
+                    guta_circuit_whitelist: ReaderHash::get_zero_value(),
+                    checkpoint_tree_root: ReaderHash::get_zero_value(),
+                    state_transition: SubTreeNodeStateTransition {
+                        old_node_value: ReaderHash::get_zero_value(),
+                        new_node_value: ReaderHash::get_zero_value(),
+                        node_index: ReaderF::ZERO_VALUE,
+                        node_level: ReaderF::ZERO_VALUE,
+                    },
+                    stats: GUTAStats::<ReaderF>::get_zero_value(),
+                    total_aggregation_proofs_generated: ReaderF::ZERO_VALUE,
+                },
+            };
+            data.extend_from_slice(&write_guta_header_with_job_id_backup_bytes::<ReaderF, ReaderHash>(&guta_header)?);
+            file_system.files.insert(path.to_string(), data);
+
+            read_realm_end_cap_gatherer_backup_file::<ReaderHasher, ReaderHash, ReaderF, SimpleMockMemoryFileSystem>(
+                &file_system,
+                path,
+                &mut tree,
+                0,
+                READER_REALM_GLOBAL_USER_TREE_HEIGHT,
+                READER_COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+                false,
+            )
+            .await
+        }
+
+        fn end_cap_record(imt_blob: Option<Vec<u8>>) -> anyhow::Result<Vec<u8>> {
+            let mut record = Vec::new();
+            record.extend_from_slice(&[0u8; JOB_ID_SIZE]);
+            record.extend_from_slice(&1u64.to_le_bytes());
+            record.extend_from_slice(&[3u8; HASH_SIZE]);
+            record.extend_from_slice(&[4u8; HASH_SIZE]);
+            PQEDUserLeaf::<ReaderF, ReaderHash>::new_user_default(
+                ReaderF::from_owned_u64(5),
+                ReaderHash::from_owned_32bytes([7u8; 32]),
+                ReaderHash::get_zero_value(),
+            )
+            .pio_write_to_io(&mut record)?;
+            record.extend_from_slice(&[0u8; GUTA_STATS_SIZE]);
+            record.extend_from_slice(&0u32.to_le_bytes());
+            record.extend_from_slice(&node_blob(32u32, QBlobDataType::GenericSingleIdMerkleNodeBatch, QBlobMerkleNodeTreeType::UserContractTree)?);
+            record.extend_from_slice(&node_blob(57u32, QBlobDataType::GenericDoubleIdMerkleNodeBatch, QBlobMerkleNodeTreeType::UserContractStateTree)?);
+            if let Some(imt_blob) = imt_blob {
+                record.extend_from_slice(&imt_blob);
+            }
+            Ok(record)
+        }
+        fn node_blob(item_size: u32, blob_type: QBlobDataType, tree_type: QBlobMerkleNodeTreeType) -> anyhow::Result<Vec<u8>> {
+            let mut header = match blob_type {
+                QBlobDataType::GenericSingleIdMerkleNodeBatch => QBlobMerkleTreeNodeBatchHeaderV1::new_single_id_header(tree_type, 0, 0, 0, 0, 1, 5),
+                QBlobDataType::GenericDoubleIdMerkleNodeBatch => QBlobMerkleTreeNodeBatchHeaderV1::new_double_id_header(tree_type, 0, 0, 0, 0, 1, 5),
+                QBlobDataType::GenericIMTLeafBatch => QBlobMerkleTreeNodeBatchHeaderV1::new_imt_leaf_header(tree_type, 0, 0, 0, 0, 1, 5),
+                _ => anyhow::bail!("unsupported blob type"),
+            };
+            header.modify_for_final_count_and_size(item_size, 1);
+            let mut blob = header.to_bytes_fixed_size_array().to_vec();
+            blob.resize(header.total_size as usize, 0xAB);
+            Ok(blob)
+        }
+
+        fn imt_blob(item_size: u32, item_count: u64, tree_type: QBlobMerkleNodeTreeType) -> anyhow::Result<Vec<u8>> {
+            let mut header = QBlobMerkleTreeNodeBatchHeaderV1::new_imt_leaf_header(tree_type, 0, 0, 0, 0, 1, 5);
+            header.modify_for_final_count_and_size(item_size, item_count);
+            let mut blob = header.to_bytes_fixed_size_array().to_vec();
+            blob.resize(header.total_size as usize, 0xAB);
+            Ok(blob)
+        }
+
+        fn empty_imt_blob() -> anyhow::Result<Vec<u8>> {
+            imt_blob(161, 0, QBlobMerkleNodeTreeType::IMTContractStateLeaf)
+        }
+
+        #[tokio::test]
+        async fn reader_parses_end_cap_with_empty_imt_segment_as_empty_ffs() -> anyhow::Result<()> {
+            let output = read_backup_with_records(&[end_cap_record(Some(empty_imt_blob()?))?]).await?;
+            assert_eq!(output.total_users_updated, 1);
+            assert!(output.update_contract_state_imt_leaves_ffs.is_empty());
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn reader_rejects_end_cap_missing_imt_segment() -> anyhow::Result<()> {
+            assert!(read_backup_with_records(&[end_cap_record(None)?]).await.is_err());
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn reader_rejects_imt_segment_with_wrong_blob_type() -> anyhow::Result<()> {
+            let record = end_cap_record(Some(node_blob(57u32, QBlobDataType::GenericDoubleIdMerkleNodeBatch, QBlobMerkleNodeTreeType::IMTContractStateLeaf)?))?;
+            assert!(read_backup_with_records(&[record]).await.is_err());
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn reader_rejects_imt_segment_with_wrong_tree_type() -> anyhow::Result<()> {
+            let record = end_cap_record(Some(imt_blob(161, 1, QBlobMerkleNodeTreeType::UserContractStateTree)?))?;
+            assert!(read_backup_with_records(&[record]).await.is_err());
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn reader_rejects_imt_segment_with_non_multiple_payload() -> anyhow::Result<()> {
+            let record = end_cap_record(Some(imt_blob(160, 1, QBlobMerkleNodeTreeType::IMTContractStateLeaf)?))?;
+            assert!(read_backup_with_records(&[record]).await.is_err());
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn reader_rejects_undersized_imt_segment() -> anyhow::Result<()> {
+            let mut header = QBlobMerkleTreeNodeBatchHeaderV1::new_imt_leaf_header(QBlobMerkleNodeTreeType::IMTContractStateLeaf, 0, 0, 0, 0, 1, 5);
+            header.modify_for_final_count_and_size(161, 0);
+            header.total_size = QBLOB_TREE_NODE_BATCH_HEADER_SIZE as u64 - 1;
+            let blob = header.to_bytes_fixed_size_array().to_vec();
+            let record = end_cap_record(Some(blob))?;
+            assert!(read_backup_with_records(&[record]).await.is_err());
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn reader_rejects_imt_segment_declaring_size_beyond_remaining_bytes() -> anyhow::Result<()> {
+            let mut header =
+                QBlobMerkleTreeNodeBatchHeaderV1::new_imt_leaf_header(QBlobMerkleNodeTreeType::IMTContractStateLeaf, 0, 0, 0, 0, 1, 5);
+            header.total_size = 1_000_000;
+            let blob = header.to_bytes_fixed_size_array().to_vec();
+            let record = end_cap_record(Some(blob))?;
+            let err = match read_backup_with_records(&[record]).await {
+                Ok(_) => anyhow::bail!("Reader accepted an IMT header declaring 1_000_000 bytes with far fewer remaining"),
+                Err(e) => e,
+            };
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("declared total_size 1000000") && message.contains("bytes remain"),
+                "Allocation bound error not surfaced, got: {message}"
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn reader_rejects_truncated_imt_segment() -> anyhow::Result<()> {
+            let mut record = end_cap_record(Some(imt_blob(161, 0, QBlobMerkleNodeTreeType::IMTContractStateLeaf)?))?;
+            record.truncate(record.len() - 1);
+            assert!(read_backup_with_records(&[record]).await.is_err());
+            Ok(())
+        }
     }
 }

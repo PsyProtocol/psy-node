@@ -33,7 +33,26 @@ use parth_core::{
     protocol::core_types::{QDBHashBase, QHashBase},
 };
 use psy_node_core::store::traits::core_db::{
-    CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseBidirectionalU64U128MappingWriter, CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter, CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseHashToManyIdsReader, CoreDatabaseHashToManyIdsWriter, CoreDatabaseIMTKeyIndexReader, CoreDatabaseIMTKeyIndexWriter, CoreDatabaseIMTNextAppendIndexReader, CoreDatabaseIMTNextAppendIndexWriter, CoreDatabaseIMTLeafReader, CoreDatabaseIMTLeafWriter, CoreDatabaseKivReader, CoreDatabaseKivWriter, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter, CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseTagTreeReader, CoreDatabaseTagTreeWriter, CoreDatabaseU64CounterReader, CoreDatabaseU64CounterStore, CoreDatabaseU64CounterWriter, CoreDatabaseU64Reader, CoreDatabaseU64Store, CoreDatabaseU64Writer, CoreDatabaseZeroIdMerkleDumpReader, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter, MerkleTreeDumpStrategy
+    CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalPairPresence,
+    CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseBidirectionalU64U128MappingWriter, CoreDatabaseBlobPairDeleter,
+    CoreDatabaseBlobPairVerifier, CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter,
+    CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseHashToManyIdsReader,
+    CoreDatabaseHashToManyIdsWriter, CoreDatabaseHashUserPairDeleter, CoreDatabaseHashUserPairVerifier,
+    CoreDatabaseIMTKeyIndexReader, CoreDatabaseIMTKeyIndexWriter, CoreDatabaseIMTLeafReader, CoreDatabaseIMTLeafWriter,
+    CoreDatabaseIMTNextAppendIndexReader, CoreDatabaseIMTNextAppendIndexWriter, CoreDatabaseImtKeyDeleter,
+    CoreDatabaseImtKeyVerifier, CoreDatabaseImtLeafDeleter, CoreDatabaseImtLeafVerifier,
+    CoreDatabaseImtNextAppendIndexDeleter, CoreDatabaseImtNextAppendIndexVerifier, CoreDatabaseKivReader,
+    CoreDatabaseKivWriter, CoreDatabaseMerkleDeleter, CoreDatabaseMerkleVerifier, CoreDatabaseObjectCheckpointDeleter,
+    CoreDatabaseObjectCheckpointVerifier, CoreDatabaseObjectIdDeleter, CoreDatabaseObjectIdVerifier,
+    CoreDatabasePendingIdPartitionDeleter, CoreDatabasePendingIdPartitionVerifier,
+    CoreDatabaseSingleIdCheckpointedReader,
+    CoreDatabaseSingleIdCheckpointedWriter, CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter,
+    CoreDatabaseTagTreeReader, CoreDatabaseTagTreeWriter, CoreDatabaseTreeMerkleDeleter, CoreDatabaseTreeMerkleVerifier,
+    CoreDatabaseTreeSubtreeMerkleDeleter, CoreDatabaseTreeSubtreeMerkleVerifier, CoreDatabaseU64CounterReader,
+    CoreDatabaseU64CounterStore, CoreDatabaseU64CounterWriter, CoreDatabaseU64Reader, CoreDatabaseU64Store,
+    CoreDatabaseU64U128PairDeleter, CoreDatabaseU64U128PairVerifier, CoreDatabaseU64Writer,
+    CoreDatabaseZeroIdMerkleDumpReader, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter,
+    MerkleTreeDumpStrategy,
 };
 use psy_serialize::{PsyCanonicalDatabaseSerializeBaseSingle, PsySerializeCanonicalAsyncSafe};
 use std::{
@@ -2083,5 +2102,369 @@ where
         
         db.insert(key, value);
         Ok(())
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseObjectIdDeleter<InMemoryTableIdentifier> for InMemoryCoreStore<Hash, Hasher>
+where
+    Hash: QDBHashBase,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn db_delete_many_object_ids(&self, table: &InMemoryTableIdentifier, ids: &[u64]) -> anyhow::Result<()> {
+        if let Some(db) = self.u64_tables.get(&table.to_string()) {
+            for id in ids {
+                db.remove(id);
+            }
+        }
+        if let Some(db) = self.tables.get(&table.to_string()) {
+            for id in ids {
+                db.remove(&id.to_be_bytes()[..]);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseObjectCheckpointDeleter<InMemoryTableIdentifier> for InMemoryCoreStore<Hash, Hasher>
+where
+    Hash: QDBHashBase,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn db_delete_many_object_checkpoint(&self, table: &InMemoryTableIdentifier, keys: &[(u64, u64)]) -> anyhow::Result<()> {
+        if let Some(db) = self.tables.get(&table.to_string()) {
+            for &(obj_id, checkpoint_id) in keys {
+                db.remove(&key_helpers::key_single_id_checkpointed(obj_id, checkpoint_id));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseMerkleDeleter<InMemoryTableIdentifier> for InMemoryCoreStore<Hash, Hasher>
+where
+    Hash: QDBHashBase,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn db_delete_many_merkle_nodes(&self, table: &InMemoryTableIdentifier, keys: &[(u8, u64, u64)]) -> anyhow::Result<()> {
+        if let Some(db) = self.tables.get(&table.to_string()) {
+            for &(level, node_index, checkpoint_id) in keys {
+                db.remove(&key_helpers::key_merkle_zero_id(&SimpleMerkleNodeKey { level, index: node_index }, checkpoint_id));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseTreeMerkleDeleter<InMemoryTableIdentifier> for InMemoryCoreStore<Hash, Hasher>
+where
+    Hash: QDBHashBase,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn db_delete_many_tree_merkle_nodes(&self, table: &InMemoryTableIdentifier, keys: &[(u64, u8, u64, u64)]) -> anyhow::Result<()> {
+        if let Some(db) = self.tables.get(&table.to_string()) {
+            for &(tree_id, level, node_index, checkpoint_id) in keys {
+                db.remove(&key_helpers::key_merkle_single_id(tree_id, &SimpleMerkleNodeKey { level, index: node_index }, checkpoint_id));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseTreeSubtreeMerkleDeleter<InMemoryTableIdentifier> for InMemoryCoreStore<Hash, Hasher>
+where
+    Hash: QDBHashBase,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn db_delete_many_tree_subtree_merkle_nodes(&self, table: &InMemoryTableIdentifier, keys: &[(u64, u64, u8, u64, u64)]) -> anyhow::Result<()> {
+        if let Some(db) = self.tables.get(&table.to_string()) {
+            for &(tree_id, tree_sub_id, level, node_index, checkpoint_id) in keys {
+                db.remove(&key_helpers::key_merkle_double_id(tree_id, tree_sub_id, &SimpleMerkleNodeKey { level, index: node_index }, checkpoint_id));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseImtLeafDeleter<InMemoryTableIdentifier> for InMemoryCoreStore<Hash, Hasher>
+where
+    Hash: QDBHashBase,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn db_delete_many_imt_leaves(&self, table: &InMemoryTableIdentifier, keys: &[(i64, i64, i64, i64)]) -> anyhow::Result<()> {
+        let table_name = format!("{}_imt_leaf_leaf", table.to_string());
+        if let Some(db) = self.tables.get(&table_name) {
+            for &(tree_id, tree_sub_id, leaf_index, checkpoint_id) in keys {
+                let mut key = Vec::with_capacity(32);
+                key.extend_from_slice(&tree_id.to_be_bytes());
+                key.extend_from_slice(&tree_sub_id.to_be_bytes());
+                key.extend_from_slice(&leaf_index.to_be_bytes());
+                key.extend_from_slice(&checkpoint_id.to_be_bytes());
+                db.remove(&key);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseImtKeyDeleter<InMemoryTableIdentifier> for InMemoryCoreStore<Hash, Hasher>
+where
+    Hash: QDBHashBase,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn db_delete_many_imt_keys(&self, table: &InMemoryTableIdentifier, keys: &[(i64, i64, i16, Vec<u8>)]) -> anyhow::Result<()> {
+        let table_name = format!("{}_imt_key_index_idx", table.to_string());
+        if let Some(db) = self.tables.get(&table_name) {
+            for (tree_id, tree_sub_id, key_bucket, encoded_key) in keys {
+                let mut key = Vec::with_capacity(18 + encoded_key.len());
+                key.extend_from_slice(&tree_id.to_be_bytes());
+                key.extend_from_slice(&tree_sub_id.to_be_bytes());
+                key.extend_from_slice(&key_bucket.to_be_bytes());
+                key.extend_from_slice(encoded_key);
+                db.remove(&key);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseImtNextAppendIndexDeleter<InMemoryTableIdentifier> for InMemoryCoreStore<Hash, Hasher>
+where
+    Hash: QDBHashBase,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn db_delete_many_imt_next_append_indexes(&self, table: &InMemoryTableIdentifier, keys: &[(i64, i64)]) -> anyhow::Result<()> {
+        let table_name = format!("{}_imt_next_append_index", table.to_string());
+        if let Some(db) = self.tables.get(&table_name) {
+            for &(tree_id, tree_sub_id) in keys {
+                let mut key = Vec::with_capacity(16);
+                key.extend_from_slice(&tree_id.to_be_bytes());
+                key.extend_from_slice(&tree_sub_id.to_be_bytes());
+                db.remove(&key);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseHashUserPairDeleter<InMemoryTableIdentifier, Hash> for InMemoryCoreStore<Hash, Hasher>
+where
+    Hash: QDBHashBase,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn db_delete_many_hash_user_pairs(&self, table: &InMemoryTableIdentifier, keys: &[(Hash, u64)]) -> anyhow::Result<()> {
+        if let Some(db) = self.tables.get(&table.to_string()) {
+            for (hash, user_id) in keys {
+                db.remove(&key_helpers::key_hash_to_u64(hash, *user_id)?);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseBlobPairDeleter<InMemoryTableIdentifier> for InMemoryCoreStore<Hash, Hasher>
+where
+    Hash: QDBHashBase,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn db_delete_many_blob_pairs(&self, table: &InMemoryTableIdentifier, keys: &[(Vec<u8>, Vec<u8>)]) -> anyhow::Result<()> {
+        let k1_name = format!("{}_k1", table.to_string());
+        let k2_name = format!("{}_k2", table.to_string());
+        if let Some(db) = self.tables.get(&k1_name) {
+            for (k1, _) in keys {
+                db.remove(k1);
+            }
+        }
+        if let Some(db) = self.tables.get(&k2_name) {
+            for (_, k2) in keys {
+                db.remove(k2);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseU64U128PairDeleter<InMemoryTableIdentifier> for InMemoryCoreStore<Hash, Hasher>
+where
+    Hash: QDBHashBase,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn db_delete_many_u64_u128_pairs(&self, table: &InMemoryTableIdentifier, keys: &[(u64, u128)]) -> anyhow::Result<()> {
+        let forward_name = format!("{}_u64_to_u128", table.to_string());
+        let reverse_name = format!("{}_u128_to_u64", table.to_string());
+        if let Some(db) = self.tables.get(&forward_name) {
+            for (pending_id, _) in keys {
+                db.remove(&pending_id.to_be_bytes()[..]);
+            }
+        }
+        if let Some(db) = self.tables.get(&reverse_name) {
+            for (_, proc_id) in keys {
+                db.remove(&proc_id.to_be_bytes()[..]);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoreDatabasePendingIdPartitionDeleter<InMemoryTableIdentifier> for InMemoryCoreStore<Hash, Hasher>
+where
+    Hash: QDBHashBase,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn db_delete_many_pending_id_partitions(&self, table: &InMemoryTableIdentifier, pending_ids: &[u64]) -> anyhow::Result<()> {
+        if let Some(db) = self.tables.get(&table.to_string()) {
+            for &pending_id in pending_ids {
+                let start = pending_id.to_be_bytes().to_vec();
+                let end = pending_id.checked_add(1).map(|id| id.to_be_bytes().to_vec());
+                let keys = match end {
+                    Some(end) => db.range(start..end).map(|entry| entry.key().clone()).collect::<Vec<_>>(),
+                    None => db.range(start..).map(|entry| entry.key().clone()).collect::<Vec<_>>(),
+                };
+                for key in keys {
+                    db.remove(&key);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseObjectIdVerifier<InMemoryTableIdentifier> for InMemoryCoreStore<Hash, Hasher>
+where Hash: QDBHashBase, Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn db_get_existing_object_ids(&self, table: &InMemoryTableIdentifier, ids: &[u64]) -> anyhow::Result<Vec<u64>> {
+        let u64_db = self.u64_tables.get(&table.to_string());
+        let bytes_db = self.tables.get(&table.to_string());
+        Ok(ids.iter().copied().filter(|id| u64_db.as_ref().is_some_and(|db| db.contains_key(id)) || bytes_db.as_ref().is_some_and(|db| db.contains_key(&id.to_be_bytes()[..]))).collect())
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseObjectCheckpointVerifier<InMemoryTableIdentifier> for InMemoryCoreStore<Hash, Hasher>
+where Hash: QDBHashBase, Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn db_get_existing_object_checkpoints(&self, table: &InMemoryTableIdentifier, keys: &[(u64, u64)]) -> anyhow::Result<Vec<(u64, u64)>> {
+        let db = self.tables.get(&table.to_string());
+        Ok(keys.iter().copied().filter(|&(obj_id, checkpoint_id)| db.as_ref().is_some_and(|db| db.contains_key(&key_helpers::key_single_id_checkpointed(obj_id, checkpoint_id)))).collect())
+    }
+}
+
+
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseMerkleVerifier<InMemoryTableIdentifier> for InMemoryCoreStore<Hash, Hasher>
+where Hash: QDBHashBase, Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn db_get_existing_merkle_nodes(&self, table: &InMemoryTableIdentifier, keys: &[(u8, u64, u64)]) -> anyhow::Result<Vec<(u8, u64, u64)>> {
+        let db = self.tables.get(&table.to_string());
+        Ok(keys.iter().copied().filter(|&(level, node_index, checkpoint_id)| db.as_ref().is_some_and(|db| db.contains_key(&key_helpers::key_merkle_zero_id(&SimpleMerkleNodeKey { level, index: node_index }, checkpoint_id)))).collect())
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseTreeMerkleVerifier<InMemoryTableIdentifier> for InMemoryCoreStore<Hash, Hasher>
+where Hash: QDBHashBase, Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn db_get_existing_tree_merkle_nodes(&self, table: &InMemoryTableIdentifier, keys: &[(u64, u8, u64, u64)]) -> anyhow::Result<Vec<(u64, u8, u64, u64)>> {
+        let db = self.tables.get(&table.to_string());
+        Ok(keys.iter().copied().filter(|&(tree_id, level, node_index, checkpoint_id)| db.as_ref().is_some_and(|db| db.contains_key(&key_helpers::key_merkle_single_id(tree_id, &SimpleMerkleNodeKey { level, index: node_index }, checkpoint_id)))).collect())
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseTreeSubtreeMerkleVerifier<InMemoryTableIdentifier> for InMemoryCoreStore<Hash, Hasher>
+where Hash: QDBHashBase, Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn db_get_existing_tree_subtree_merkle_nodes(&self, table: &InMemoryTableIdentifier, keys: &[(u64, u64, u8, u64, u64)]) -> anyhow::Result<Vec<(u64, u64, u8, u64, u64)>> {
+        let db = self.tables.get(&table.to_string());
+        Ok(keys.iter().copied().filter(|&(tree_id, tree_sub_id, level, node_index, checkpoint_id)| db.as_ref().is_some_and(|db| db.contains_key(&key_helpers::key_merkle_double_id(tree_id, tree_sub_id, &SimpleMerkleNodeKey { level, index: node_index }, checkpoint_id)))).collect())
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseImtLeafVerifier<InMemoryTableIdentifier> for InMemoryCoreStore<Hash, Hasher>
+where Hash: QDBHashBase, Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn db_get_existing_imt_leaves(&self, table: &InMemoryTableIdentifier, keys: &[(i64, i64, i64, i64)]) -> anyhow::Result<Vec<(i64, i64, i64, i64)>> {
+        let db = self.tables.get(&format!("{}_imt_leaf_leaf", table.to_string()));
+        Ok(keys.iter().copied().filter(|key| { let mut bytes = Vec::with_capacity(32); bytes.extend_from_slice(&key.0.to_be_bytes()); bytes.extend_from_slice(&key.1.to_be_bytes()); bytes.extend_from_slice(&key.2.to_be_bytes()); bytes.extend_from_slice(&key.3.to_be_bytes()); db.as_ref().is_some_and(|db| db.contains_key(&bytes)) }).collect())
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseImtKeyVerifier<InMemoryTableIdentifier> for InMemoryCoreStore<Hash, Hasher>
+where Hash: QDBHashBase, Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn db_get_existing_imt_keys(&self, table: &InMemoryTableIdentifier, keys: &[(i64, i64, i16, Vec<u8>)]) -> anyhow::Result<Vec<(i64, i64, i16, Vec<u8>)>> {
+        let db = self.tables.get(&format!("{}_imt_key_index_idx", table.to_string()));
+        Ok(keys.iter().filter(|key| { let mut bytes = Vec::with_capacity(18 + key.3.len()); bytes.extend_from_slice(&key.0.to_be_bytes()); bytes.extend_from_slice(&key.1.to_be_bytes()); bytes.extend_from_slice(&key.2.to_be_bytes()); bytes.extend_from_slice(&key.3); db.as_ref().is_some_and(|db| db.contains_key(&bytes)) }).cloned().collect())
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseImtNextAppendIndexVerifier<InMemoryTableIdentifier> for InMemoryCoreStore<Hash, Hasher>
+where Hash: QDBHashBase, Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn db_get_existing_imt_next_append_indexes(&self, table: &InMemoryTableIdentifier, keys: &[(i64, i64)]) -> anyhow::Result<Vec<(i64, i64)>> {
+        let db = self.tables.get(&format!("{}_imt_next_append_index", table.to_string()));
+        Ok(keys.iter().copied().filter(|key| { let mut bytes = Vec::with_capacity(16); bytes.extend_from_slice(&key.0.to_be_bytes()); bytes.extend_from_slice(&key.1.to_be_bytes()); db.as_ref().is_some_and(|db| db.contains_key(&bytes)) }).collect())
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseHashUserPairVerifier<InMemoryTableIdentifier, Hash> for InMemoryCoreStore<Hash, Hasher>
+where Hash: QDBHashBase, Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn db_get_existing_hash_user_pairs(&self, table: &InMemoryTableIdentifier, keys: &[(Hash, u64)]) -> anyhow::Result<Vec<(Hash, u64)>> {
+        let db = self.tables.get(&table.to_string());
+        let mut existing = Vec::new();
+        for (hash, user_id) in keys {
+            let key = key_helpers::key_hash_to_u64(hash, *user_id)?;
+            if db.as_ref().is_some_and(|db| db.contains_key(&key)) {
+                existing.push((hash.clone(), *user_id));
+            }
+        }
+        Ok(existing)
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseBlobPairVerifier<InMemoryTableIdentifier> for InMemoryCoreStore<Hash, Hasher>
+where Hash: QDBHashBase, Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn db_get_blob_pair_presence(&self, table: &InMemoryTableIdentifier, keys: &[(Vec<u8>, Vec<u8>)]) -> anyhow::Result<Vec<CoreDatabaseBidirectionalPairPresence<Vec<u8>, Vec<u8>>>> {
+        let forward = self.tables.get(&format!("{}_k1", table.to_string())); let reverse = self.tables.get(&format!("{}_k2", table.to_string()));
+        Ok(keys.iter().filter_map(|(k1, k2)| { let forward_present = forward.as_ref().is_some_and(|db| db.contains_key(k1)); let reverse_present = reverse.as_ref().is_some_and(|db| db.contains_key(k2)); (forward_present || reverse_present).then(|| CoreDatabaseBidirectionalPairPresence { key: (k1.clone(), k2.clone()), forward_present, reverse_present }) }).collect())
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseU64U128PairVerifier<InMemoryTableIdentifier> for InMemoryCoreStore<Hash, Hasher>
+where Hash: QDBHashBase, Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn db_get_u64_u128_pair_presence(&self, table: &InMemoryTableIdentifier, keys: &[(u64, u128)]) -> anyhow::Result<Vec<CoreDatabaseBidirectionalPairPresence<u64, u128>>> {
+        let forward = self.tables.get(&format!("{}_u64_to_u128", table.to_string())); let reverse = self.tables.get(&format!("{}_u128_to_u64", table.to_string()));
+        Ok(keys.iter().filter_map(|&(k1, k2)| { let forward_present = forward.as_ref().is_some_and(|db| db.contains_key(&k1.to_be_bytes()[..])); let reverse_present = reverse.as_ref().is_some_and(|db| db.contains_key(&k2.to_be_bytes()[..])); (forward_present || reverse_present).then(|| CoreDatabaseBidirectionalPairPresence { key: (k1, k2), forward_present, reverse_present }) }).collect())
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoreDatabasePendingIdPartitionVerifier<InMemoryTableIdentifier> for InMemoryCoreStore<Hash, Hasher>
+where Hash: QDBHashBase, Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn db_get_existing_pending_id_partitions(&self, table: &InMemoryTableIdentifier, pending_ids: &[u64]) -> anyhow::Result<Vec<u64>> {
+        let db = self.tables.get(&table.to_string());
+        Ok(pending_ids.iter().copied().filter(|pending_id| { let start = pending_id.to_be_bytes().to_vec(); let end = pending_id.checked_add(1).map(|id| id.to_be_bytes().to_vec()); db.as_ref().is_some_and(|db| match end { Some(ref end) => db.range(start..end.clone()).next().is_some(), None => db.range(start..).next().is_some() }) }).collect())
     }
 }

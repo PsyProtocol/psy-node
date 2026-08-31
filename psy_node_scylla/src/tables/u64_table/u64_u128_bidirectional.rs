@@ -118,6 +118,16 @@ impl ScyllaStandardPreparedTableStatements for ScyllaBidirectionalU64U128Mapping
 }
 
 impl ScyllaBidirectionalU64U128MappingPreparedStatements {
+    pub async fn delete_u64_u128_mapping_pairs(&self, session: &Session, keys: &[(u64, u128)]) -> anyhow::Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let forward_keys = keys.iter().map(|(k1, _)| *k1).collect::<Vec<_>>();
+        let reverse_keys = keys.iter().map(|(_, k2)| *k2).collect::<Vec<_>>();
+        self.u64_to_u128.delete_many(session, &forward_keys).await?;
+        self.u128_to_u64.delete_many(session, &reverse_keys).await
+    }
+
     pub async fn insert_u64_u128_mapping_pair(&self, session: &Session, k1: u64, k2: u128) -> anyhow::Result<()> {
         let fut1 = self.u64_to_u128.set_or_insert_one(session, k1, k2);
         let fut2 = self.u128_to_u64.set_or_insert_one(session, k2, k1);

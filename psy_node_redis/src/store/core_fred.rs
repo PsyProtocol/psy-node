@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use fred::{
     interfaces::*,
     prelude::*,
-    types::{Builder, Map, Value},
+    types::{Builder, ClusterHash, CustomCommand, FromValue, Map, Value},
 };
 use parth_core::{
     data::{
@@ -20,15 +20,15 @@ use psy_node_core::{
         infrastructure::QStandardQueueBase,
     },
     store::traits::{
-        proof_store::{QParthProofStoreReader, QParthProofStoreWriter},
+        proof_store::{QParthProofBucketPresenceReader, QParthProofStoreReader, QParthProofStoreWriter},
         temp_db::{
             QTempDatabaseRawCounterReaderBase, QTempDatabaseRawCounterWriterBase,
-            QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase,
+            QTempDatabaseRawKVEnumeratorBase, QTempDatabaseRawKVReaderBase,
+            QTempDatabaseRawKVWriterBase, TempKvScanPage,
         },
     },
 };
 
-// Fred Pool alias
 type RedisPool = Pool;
 
 pub const REDIS_TMP_PROOF_STORE_PREFIX: &str = "TMPPSV1";
@@ -55,7 +55,6 @@ fn get_tmp_proof_store_bucket_ns_key(
     )
 }
 
-/// Create a high-performance fred RedisPool
 pub async fn new_redis_async_pool(
     redis_url: &str,
     pool_size: usize,
@@ -64,26 +63,22 @@ pub async fn new_redis_async_pool(
 
     let policy = ReconnectPolicy::new_exponential(
         0,
-        100, // ms
-        10_000, // ms (10s)
+        100,
+        10_000,
         10,
     );
 
-    // FIX 1: Use the Builder to set connection config and policy separately
     let pool = Builder::from_config(config)
         .with_connection_config(|cc| {
-            // TCP settings go here in v10
             cc.tcp = TcpConfig {
                 nodelay: Some(true),
                 ..Default::default()
             };
             cc.connection_timeout = Duration::from_secs(5);
         })
-        // Policy is set on the builder, not the config struct
         .set_policy(policy) 
         .build_pool(pool_size)?;
 
-    // FIX 2: v10 uses init() to connect and wait
     pool.init().await?;
 
     tracing::info!("✅ Created fred RedisPool with size {}", pool_size);
@@ -119,13 +114,11 @@ impl StandardFredRedisStore {
     }
 
     pub async fn get_bytes_generic_internal(&self, ns_key: &str, key: &[u8]) -> anyhow::Result<Vec<u8>> {
-        // HGET returns Option<Value>. Convert None -> empty vec.
         let val: Option<Vec<u8>> = self.client.hget(ns_key, key).await?;
         Ok(val.unwrap_or_default())
     }
 
     pub async fn get_many_bytes_generic_internal(&self, ns_key: &str, keys: &[Vec<u8>]) -> anyhow::Result<Vec<Vec<u8>>> {
-        // Fred requires `hmget` for multiple fields, and keys need to be converted to `MultipleKeys` (Vec<Key>)
         let keys_converted: Vec<Key> = keys.iter().map(|k| Key::from(&k[..])).collect();
         let result: Vec<Option<Vec<u8>>> = self.client.hmget(ns_key, keys_converted).await?;
         Ok(result.into_iter().map(|opt| opt.unwrap_or_default()).collect())
@@ -152,7 +145,6 @@ impl StandardFredRedisStore {
     }
 
     pub async fn set_many_bytes_generic_internal(&self, ns_key: &str, items: Vec<QPDPair<Vec<u8>, Vec<u8>>>) -> anyhow::Result<()> {
-        // Convert to Map for HSET
         let map: Map = items.into_iter().map(|x| (Key::from(&x.key[..]), Value::from(&x.value[..]))).collect();
         let _: () = self.client.hset(ns_key, map).await?;
         Ok(())
@@ -181,7 +173,6 @@ impl StandardFredRedisStore {
     }
 
     pub async fn inc_iu64_generic_internal(&self, ns_key: &str, key: &[u8], amount: i64) -> anyhow::Result<u64> {
-        // HINCRBY returns the new value
         let val: i64 = self.client.hincrby(ns_key, key, amount).await?;
         Ok(val.max(0) as u64)
     }
@@ -220,8 +211,6 @@ impl StandardFredRedisStore {
     }
 
     pub async fn wait_for_generic_u64_queue_internal(&self, queue_key: &str) -> anyhow::Result<u64> {
-        // Optimization: Use BLPOP (0.0 means infinite block) instead of polling loop
-        // blpop returns (key, value)
         let (_key, val): (String, u64) = self.client.blpop(queue_key, 0.0).await?;
         Ok(val)
     }
@@ -232,32 +221,27 @@ impl StandardFredRedisStore {
     }
 
     pub async fn push_many_to_generic_bytes_queue_internal(&self, queue_key: &str, items: &[Vec<u8>]) -> anyhow::Result<()> {
-        // Convert &[Vec<u8>] to Vec<Value>
         let values: Vec<Value> = items.iter().map(|x| Value::from(&x[..])).collect();
         let _: () = self.client.rpush(queue_key, values).await?;
         Ok(())
     }
 
     pub async fn pop_from_generic_bytes_queue_or_none_internal(&self, queue_key: &str) -> anyhow::Result<Option<Vec<u8>>> {
-        // lpop with count returns Vec.
         let items: Vec<Vec<u8>> = self.client.lpop(queue_key, Some(1)).await?;
         Ok(items.into_iter().next())
     }
 
     pub async fn wait_for_generic_bytes_queue_internal(&self, queue_key: &str) -> anyhow::Result<Vec<u8>> {
-        // Optimization: BLPOP
         let (_key, val): (String, Vec<u8>) = self.client.blpop(queue_key, 0.0).await?;
         Ok(val)
     }
 
     pub async fn dump_ro_generic_bytes_queue_internal(&self, queue_key: &str) -> anyhow::Result<Vec<Vec<u8>>> {
-        // 0 and -1 must be i64
         Ok(self.client.lrange(queue_key, 0, -1).await?)
     }
 
     pub async fn dump_generic_bytes_queue_internal(&self, queue_key: &str) -> anyhow::Result<Vec<Vec<u8>>> {
         let items = self.dump_ro_generic_bytes_queue_internal(queue_key).await?;
-        // Fred 10 uses `del` which takes a Key or MultipleKeys.
         let _: () = self.client.del(queue_key).await?;
         Ok(items)
     }
@@ -344,7 +328,6 @@ impl QStandardEphemeralQueuePublisher for StandardFredRedisStore {
         items_bytes: &[&[u8]],
     ) -> anyhow::Result<()> {
         let subject = queue_key.get_queue_subject(&self.root_prefix, realm_id, realm_sub_id, unique_id, task_group);
-        // Explicit cast from slice of slices to Vec<Value>
         let args: Vec<Value> = items_bytes.iter().map(|x| Value::from(*x)).collect();
         let _: () = self.client.rpush(&subject, args).await?;
         Ok(())
@@ -374,7 +357,6 @@ impl QStandardEphemeralQueuePublisher for StandardFredRedisStore {
         items_bytes: Vec<Vec<u8>>,
     ) -> anyhow::Result<()> {
         let subject = queue_key.get_queue_subject(&self.root_prefix, realm_id, realm_sub_id, unique_id, task_group);
-        // Explicit cast
         let args: Vec<Value> = items_bytes.into_iter().map(|x| Value::from(&x[..])).collect();
         let _: () = self.client.rpush(&subject, args).await?;
         Ok(())
@@ -480,10 +462,9 @@ impl QStandardEphemeralQueueSubscriber for StandardFredRedisStore {
         let subject = queue_key.get_queue_subject(&self.root_prefix, realm_id, realm_sub_id, unique_id, task_group);
         let timeout_secs = timeout_ms as f64 / 1000.0;
         
-        // Use BLPOP
         match self.client.blpop::<Option<(String, Vec<u8>)>, _>(&subject, timeout_secs).await? {
             Some((_k, v)) => Ok(Some(v)),
-            None => Ok(None) // Timeout hit
+            None => Ok(None)
         }
     }
 
@@ -515,10 +496,8 @@ impl QStandardEphemeralQueueSubscriber for StandardFredRedisStore {
         max_items: usize,
     ) -> anyhow::Result<Vec<Vec<u8>>> {
         let subject = queue_key.get_queue_subject(&self.root_prefix, realm_id, realm_sub_id, unique_id, task_group);
-        // lrange requires i64
         let items: Vec<Vec<u8>> = self.client.lrange(&subject, 0, (max_items as i64) - 1).await?;
         if !items.is_empty() {
-            // ltrim requires i64
             let _: () = self.client.ltrim(&subject, items.len() as i64, -1).await?;
         }
         Ok(items)
@@ -578,7 +557,6 @@ impl QParthProofStoreReader for StandardFredRedisStore {
     async fn get_proof_bytes_by_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync>(&self, job_id: J, unique_pending_id: u64) -> anyhow::Result<Option<Vec<u8>>> {
         let job_id_bytes = job_id.into().to_vec();
         let bucket = get_tmp_proof_store_bucket_ns_key(&self.root_prefix, self.realm_id, self.realm_sub_id, unique_pending_id);
-        // hget returns Option<Value> or Value::Null -> maps to Option<Vec<u8>> with correct type hint
         let data: Option<Vec<u8>> = self.client.hget(&bucket, &job_id_bytes[..]).await?;
         Ok(data.filter(|d| !d.is_empty()))
     }
@@ -626,6 +604,25 @@ impl QParthProofStoreWriter for StandardFredRedisStore {
         let bucket = get_tmp_proof_store_bucket_ns_key(&self.root_prefix, self.realm_id, self.realm_sub_id, unique_pending_id);
         let _: i64 = self.client.del(&bucket).await?;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl QParthProofBucketPresenceReader for StandardFredRedisStore {
+    async fn contains_proofs_for_pending_id(&self, unique_pending_id: u64) -> anyhow::Result<bool> {
+        // Redis deletes empty hashes, so EXISTS==0 is both missing and emptied.
+        let bucket = get_tmp_proof_store_bucket_ns_key(
+            &self.root_prefix,
+            self.realm_id,
+            self.realm_sub_id,
+            unique_pending_id,
+        );
+        let count: i64 = self
+            .client
+            .exists(&bucket)
+            .await
+            .map_err(|e| anyhow::anyhow!("EXISTS on proof bucket failed: {e}"))?;
+        Ok(count > 0)
     }
 }
 
@@ -710,6 +707,126 @@ impl QTempDatabaseRawKVWriterBase for StandardFredRedisStore {
         
         let _: () = self.client.hset(&self.kv_store_namespace, map).await?;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl QTempDatabaseRawKVEnumeratorBase for StandardFredRedisStore {
+    async fn qtdb_raw_kv_scan_fields(&self, cursor: u64, count: u32) -> anyhow::Result<TempKvScanPage> {
+        // Hash name is this store's kv_store_namespace, never caller-supplied.
+        let cmd = CustomCommand::new("HSCAN", ClusterHash::FirstKey, false);
+        let args: Vec<Vec<u8>> = vec![
+            self.kv_store_namespace.as_bytes().to_vec(),
+            cursor.to_string().into_bytes(),
+            b"COUNT".to_vec(),
+            count.to_string().into_bytes(),
+        ];
+        let (next_cursor_str, page_values): (String, Vec<Value>) = self
+            .client
+            .custom(cmd, args)
+            .await
+            .map_err(|e| anyhow::anyhow!("HSCAN on temp KV hash failed: {e}"))?;
+        let (next_cursor, fields) = decode_hscan_page(next_cursor_str, page_values)?;
+        Ok(TempKvScanPage { next_cursor, fields })
+    }
+}
+
+// Fail-closed: even discarded HSCAN values must decode; null/odd-length is corruption.
+pub(crate) fn decode_hscan_page(
+    next_cursor_str: String,
+    page_values: Vec<Value>,
+) -> anyhow::Result<(u64, Vec<Vec<u8>>)> {
+    let next_cursor = next_cursor_str.parse::<u64>().map_err(|e| {
+        anyhow::anyhow!("HSCAN returned an undecodable cursor {next_cursor_str:?}: {e}")
+    })?;
+    if page_values.len() % 2 != 0 {
+        return Err(anyhow::anyhow!(
+            "HSCAN returned {} page values (odd count): incomplete field/value pair",
+            page_values.len()
+        ));
+    }
+    let mut fields = Vec::with_capacity(page_values.len() / 2);
+    let mut iter = page_values.into_iter();
+    while let Some(field) = iter.next() {
+        let value = iter.next().expect("even length checked above");
+        let field_bytes = Option::<Vec<u8>>::from_value(field)
+            .map_err(|e| anyhow::anyhow!("HSCAN field did not decode to raw bytes: {e}"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("HSCAN field was null/empty-array (not a valid hash field)")
+            })?;
+        let _value_bytes = Option::<Vec<u8>>::from_value(value)
+            .map_err(|e| anyhow::anyhow!("HSCAN value did not decode to raw bytes: {e}"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("HSCAN value was null/empty-array (not a valid hash value)")
+            })?;
+        fields.push(field_bytes);
+    }
+    Ok((next_cursor, fields))
+}
+
+#[cfg(test)]
+mod hscan_decode_tests {
+    use super::decode_hscan_page;
+    use fred::types::Value;
+
+    fn bytes_field(b: &[u8]) -> Value {
+        Value::from(b)
+    }
+
+    #[test]
+    fn decodes_valid_page_fields_only() {
+        let page = vec![
+            bytes_field(&[1, 2]),
+            bytes_field(b"v1"),
+            bytes_field(&[3, 4, 5]),
+            bytes_field(b"v2"),
+        ];
+        let (cursor, fields) = decode_hscan_page("168".to_string(), page).unwrap();
+        assert_eq!(cursor, 168);
+        assert_eq!(fields, vec![vec![1, 2], vec![3, 4, 5]]);
+    }
+
+    #[test]
+    fn decodes_empty_page_with_zero_cursor() {
+        let (cursor, fields) = decode_hscan_page("0".to_string(), Vec::new()).unwrap();
+        assert_eq!(cursor, 0);
+        assert!(fields.is_empty());
+    }
+
+    #[test]
+    fn string_typed_field_decodes_to_bytes() {
+        let page = vec![Value::from("abc"), bytes_field(b"v")];
+        let (cursor, fields) = decode_hscan_page("7".to_string(), page).unwrap();
+        assert_eq!(cursor, 7);
+        assert_eq!(fields, vec![b"abc".to_vec()]);
+    }
+
+    #[test]
+    fn undecodable_cursor_is_err() {
+        let page = vec![bytes_field(&[1]), bytes_field(b"v")];
+        let err = decode_hscan_page("not-a-cursor".to_string(), page).unwrap_err();
+        assert!(err.to_string().contains("undecodable cursor"), "{}", err);
+    }
+
+    #[test]
+    fn odd_page_count_is_err() {
+        let page = vec![bytes_field(&[1]), bytes_field(b"v"), bytes_field(&[2])];
+        let err = decode_hscan_page("0".to_string(), page).unwrap_err();
+        assert!(err.to_string().contains("incomplete field/value pair"), "{}", err);
+    }
+
+    #[test]
+    fn null_field_is_err_no_skip() {
+        let page = vec![Value::Null, bytes_field(b"v")];
+        let err = decode_hscan_page("0".to_string(), page).unwrap_err();
+        assert!(err.to_string().contains("not a valid hash field"), "{}", err);
+    }
+
+    #[test]
+    fn null_value_is_err_no_skip() {
+        let page = vec![bytes_field(&[1]), Value::Null];
+        let err = decode_hscan_page("0".to_string(), page).unwrap_err();
+        assert!(err.to_string().contains("not a valid hash value"), "{}", err);
     }
 }
 

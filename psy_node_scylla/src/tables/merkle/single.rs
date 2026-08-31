@@ -29,6 +29,8 @@ use crate::{
 pub struct ScyllaMerkleNodesPreparedStatements {
     pub insert_1_statement: Statement,
     pub insert_1_prepared: Arc<PreparedStatement>,
+    pub delete_1_prepared: Arc<PreparedStatement>,
+    pub select_exact_1_prepared: Arc<PreparedStatement>,
     pub select_1_statement: Statement,
     pub select_1_prepared: Arc<PreparedStatement>,
     //pub insert_batch_serialized_512_prepared: Arc<Batch>,
@@ -53,6 +55,12 @@ impl ScyllaMerkleNodesPreparedStatements {
             keyspace, table_name
         ));
         let insert_prepared = session.prepare(insert_1_statement.clone()).await?;
+        let delete_1_prepared = session
+            .prepare(format!("DELETE FROM {}.{} WHERE tree_id = ? AND level = ? AND node_index = ? AND checkpoint_id = ?", keyspace, table_name))
+            .await?;
+        let select_exact_1_prepared = session
+            .prepare(format!("SELECT checkpoint_id FROM {}.{} WHERE tree_id = ? AND level = ? AND node_index = ? AND checkpoint_id = ? LIMIT 1", keyspace, table_name))
+            .await?;
         let select_1_statement = Statement::new(&format!(
             "SELECT value FROM {}.{} WHERE tree_id = ? AND level = ? AND node_index = ? AND checkpoint_id <= ? LIMIT 1",
             keyspace, table_name
@@ -64,6 +72,8 @@ impl ScyllaMerkleNodesPreparedStatements {
             insert_batch_serialized_128_prepared: Arc::new(generate_batch_prepared_statement(&session, &insert_prepared, 128).await?),
             insert_batch_serialized_64_prepared: Arc::new(generate_batch_prepared_statement(&session, &insert_prepared, 64).await?),  
             insert_1_prepared: Arc::new(insert_prepared),
+            delete_1_prepared: Arc::new(delete_1_prepared),
+            select_exact_1_prepared: Arc::new(select_exact_1_prepared),
             select_1_prepared: Arc::new(select_1_prepared),        
             insert_1_statement: insert_1_statement,
             select_1_statement: select_1_statement,
@@ -126,6 +136,24 @@ impl ScyllaStandardPreparedTableStatements for ScyllaMerkleNodesPreparedStatemen
 
 
 impl ScyllaMerkleNodesPreparedStatements {
+    pub async fn delete_many_tree_merkle_nodes(&self, session: &Session, keys: &[(u64, u8, u64, u64)]) -> anyhow::Result<()> {
+        for &(tree_id, level, node_index, checkpoint_id) in keys {
+            session.execute_unpaged(
+                &self.delete_1_prepared,
+                (u64_to_i64_exact(tree_id), u8_to_i8_exact(level), u64_to_i64_exact(node_index), convert_checkpoint_id_to_i64(checkpoint_id)),
+            ).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn contains_exact_tree_merkle_node(&self, session: &Session, key: (u64, u8, u64, u64)) -> anyhow::Result<bool> {
+        let result = session.execute_unpaged(
+            &self.select_exact_1_prepared,
+            (u64_to_i64_exact(key.0), u8_to_i8_exact(key.1), u64_to_i64_exact(key.2), convert_checkpoint_id_to_i64(key.3)),
+        ).await?;
+        Ok(result.into_rows_result()?.maybe_first_row::<(i64,)>()?.is_some())
+    }
+
     pub async fn select_single_id_merkle_node_max_checkpoint_internal<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>(
         &self,
         session: &Session,

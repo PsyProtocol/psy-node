@@ -38,4 +38,13 @@ pub trait QParthProofStoreWriter {
 }
 
 pub trait QParthProofStore: QParthProofStoreReader + QParthProofStoreWriter {}
+
+/// Missing or empty proof bucket returns false.
+#[async_trait]
+pub trait QParthProofBucketPresenceReader {
+    async fn contains_proofs_for_pending_id(
+        &self,
+        unique_pending_id: u64,
+    ) -> anyhow::Result<bool>;
+}
 impl<T: QParthProofStoreReader + QParthProofStoreWriter> QParthProofStore for T {}

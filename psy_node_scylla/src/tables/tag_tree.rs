@@ -27,6 +27,8 @@ use crate::{
 pub struct ScyllaTagTreeNodesPreparedStatements {
     pub insert_1_statement: Statement,
     pub insert_1_prepared: Arc<PreparedStatement>,
+    pub delete_partition_prepared: Arc<PreparedStatement>,
+    pub select_partition_1_prepared: Arc<PreparedStatement>,
     pub select_1_value_statement: Statement,
     pub select_1_value_prepared: Arc<PreparedStatement>,
     pub select_1_tag_statement: Statement,
@@ -47,6 +49,12 @@ impl ScyllaTagTreeNodesPreparedStatements {
             keyspace, table_name
         ));
         let insert_prepared = session.prepare(insert_1_statement.clone()).await?;
+        let delete_partition_prepared = session
+            .prepare(format!("DELETE FROM {}.{} WHERE unique_pending_id = ?", keyspace, table_name))
+            .await?;
+        let select_partition_1_prepared = session
+            .prepare(format!("SELECT level FROM {}.{} WHERE unique_pending_id = ? LIMIT 1", keyspace, table_name))
+            .await?;
         let select_1_value_statement = Statement::new(&format!(
             "SELECT node_value FROM {}.{} WHERE unique_pending_id = ? AND level = ? AND node_index = ? LIMIT 1",
             keyspace, table_name
@@ -72,6 +80,8 @@ impl ScyllaTagTreeNodesPreparedStatements {
 
         Ok(Self {
             insert_1_prepared: Arc::new(insert_prepared),
+            delete_partition_prepared: Arc::new(delete_partition_prepared),
+            select_partition_1_prepared: Arc::new(select_partition_1_prepared),
             select_1_value_prepared: Arc::new(select_1_value_prepared),
             insert_1_statement: insert_1_statement,
             select_1_value_statement: select_1_value_statement,
@@ -139,6 +149,20 @@ impl ScyllaStandardPreparedTableStatements for ScyllaTagTreeNodesPreparedStateme
 }
 
 impl ScyllaTagTreeNodesPreparedStatements {
+    pub async fn delete_many_pending_id_partitions(&self, session: &Session, pending_ids: &[u64]) -> anyhow::Result<()> {
+        for &pending_id in pending_ids {
+            session.execute_unpaged(&self.delete_partition_prepared, (u64_to_i64_exact(pending_id),)).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn contains_pending_id_partition(&self, session: &Session, pending_id: u64) -> anyhow::Result<bool> {
+        let result = session
+            .execute_unpaged(&self.select_partition_1_prepared, (u64_to_i64_exact(pending_id),))
+            .await?;
+        Ok(result.into_rows_result()?.maybe_first_row::<(i8,)>()?.is_some())
+    }
+
     pub async fn set_or_insert_one(
         &self,
         session: &Session,

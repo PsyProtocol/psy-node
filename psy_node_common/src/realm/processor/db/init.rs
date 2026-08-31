@@ -1,7 +1,9 @@
+use std::future::Future;
 use std::sync::Arc;
 
 use parth_common::memory_stores::{mem_tree_recorder::SimpleMemoryMerkleRecorderStore, traits::PsyMemoryMerkleStoreImm};
 use parth_core::{
+    QCoreProcCheckpointUniqueId,
     crypto::hash::
         traits::MerkleZeroHasher
     ,
@@ -68,6 +70,90 @@ pub async fn create_new_checkpoint_backup_manager_from_file_path<
     .await
 }
 
+async fn find_latest_mapped_pending_at_or_before<F, Fut>(
+    target_checkpoint_id: u64,
+    mut query: F,
+) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId)>
+where
+    F: FnMut(u64) -> Fut,
+    Fut: Future<Output = anyhow::Result<Option<(u64, QCoreProcCheckpointUniqueId)>>>,
+{
+    let mut cp = target_checkpoint_id;
+    loop {
+        match query(cp).await? {
+            Some(res) => return Ok(res),
+            None if cp == 0 => {
+                if target_checkpoint_id == 0 {
+                    return Ok((0u64, 0u128));
+                } else {
+                    anyhow::bail!(
+                        "No checkpoint->pending mapping found for any checkpoint <= target {}. Cannot prove the latest mapped pending IDs; refusing startup to avoid pending/proc ID reuse or reapplying post-target backups.",
+                        target_checkpoint_id
+                    );
+                }
+            }
+            None => cp -= 1,
+        }
+    }
+}
+
+async fn resolve_current_and_last_committed_pending_ids<BoundaryF, BoundaryFut, LatestF, LatestFut, ReverseF, ReverseFut>(
+    target_checkpoint_id: u64,
+    boundary_query: BoundaryF,
+    latest_mapped_query: LatestF,
+    reverse_query: ReverseF,
+) -> anyhow::Result<(
+    (u64, QCoreProcCheckpointUniqueId),
+    (u64, QCoreProcCheckpointUniqueId),
+)>
+where
+    BoundaryF: FnMut(u64) -> BoundaryFut,
+    BoundaryFut: Future<Output = anyhow::Result<Option<(u64, QCoreProcCheckpointUniqueId)>>>,
+    LatestF: FnOnce() -> LatestFut,
+    LatestFut: Future<Output = anyhow::Result<(u64, QCoreProcCheckpointUniqueId)>>,
+    ReverseF: FnOnce(u64) -> ReverseFut,
+    ReverseFut: Future<Output = anyhow::Result<Option<u64>>>,
+{
+    let last_committed = find_latest_mapped_pending_at_or_before(target_checkpoint_id, boundary_query).await?;
+    let current = match latest_mapped_query().await {
+        Ok(ids) => ids,
+        Err(error) => {
+            tracing::warn!(
+                "No positive mapped pending generation could be resolved at startup; using proven checkpoint boundary {:?}: {:?}",
+                last_committed,
+                error
+            );
+            last_committed
+        }
+    };
+
+    let latest_pending_reverse_mapping = reverse_query(current.0).await?;
+    ensure_latest_pending_within_target(current.0, latest_pending_reverse_mapping, target_checkpoint_id)?;
+
+    Ok((current, last_committed))
+}
+
+// Post-T reverse mapping of the latest pending is a leftover generation; fail closed so startup cannot replay its backup.
+fn ensure_latest_pending_within_target(
+    current_unique_pending_id: u64,
+    latest_pending_reverse_mapping: Option<u64>,
+    target_checkpoint_id: u64,
+) -> anyhow::Result<()> {
+    if let Some(mapped_checkpoint_id) = latest_pending_reverse_mapping {
+        if mapped_checkpoint_id > target_checkpoint_id {
+            anyhow::bail!(
+                "Contradictory pending mapping: latest mapped unique pending ID {} maps to \
+                 checkpoint {}, beyond the target checkpoint {}. A leftover post-target \
+                 generation survived; refusing to start up to prevent reapplying its backup.",
+                current_unique_pending_id,
+                mapped_checkpoint_id,
+                target_checkpoint_id
+            );
+        }
+    }
+    Ok(())
+}
+
 impl<
         N: QNetworkTypesConfig,
         S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync,
@@ -84,30 +170,22 @@ where
 {
     pub async fn get_database_check_state(&self) -> anyhow::Result<DatabaseCheckState> {
         let local_latest_checkpoint_id: u64 = self.db.get_latest_checkpoint_id().await?;
-        
-        // 1. Check for Genesis requirement
+
         if local_latest_checkpoint_id == 0 {
-            // Check if we actually have genesis applied (unique IDs > 0 usually implies initialization)
             let (last_unique_pending_id, _) = match self.db.get_latest_mapped_unique_pending_id().await {
                 Ok(ids) => ids,
                 Err(_) => return Ok(DatabaseCheckState::NeedsGenesis),
             };
             if last_unique_pending_id == 0 {
-                // Completely empty
                 return Ok(DatabaseCheckState::NeedsGenesis);
             }
         }
 
-        // 2. Check Consistency against Coordinator
-        // We get the coordinator's view of *our* realm root.
-        // u64::MAX-0xffff is a convention for "latest checkpoint known to coordinator"
         let coordinator_realm_state: CheckpointedMerkleHash<N::QHash> = self
             .coordinator_client
             .rc_get_realm_root_and_last_modified_checkpoint(u64::MAX - 0xffff, self.state.realm_id_u64)
             .await?;
 
-        // Get our local root at the checkpoint the coordinator claims we are at.
-        // If we don't have this checkpoint locally, we are definitely behind/broken.
         if coordinator_realm_state.checkpoint_id > local_latest_checkpoint_id {
             tracing::info!(
                 "Coordinator indicates Realm updated at checkpoint {}, but local DB only at {}. Needs Recovery.",
@@ -117,7 +195,6 @@ where
             return Ok(DatabaseCheckState::NeedsRecovery);
         }
 
-        // We have the checkpoint ID locally. Let's compare roots.
         let local_realm_root = self
             .db
             .global_user_tree_get_node_and_checkpoint_id_max_checkpoint(coordinator_realm_state.checkpoint_id, &self.realm_root_node)
@@ -133,14 +210,20 @@ where
             return Ok(DatabaseCheckState::NeedsRecovery);
         }
 
-        // 3. Check internal DB consistency (Pending ID vs Checkpoint ID mapping)
-        let (last_unique_pending_id, _) = self.db.get_latest_mapped_unique_pending_id().await?;
+        let ((last_unique_pending_id, _), _) = resolve_current_and_last_committed_pending_ids(
+            local_latest_checkpoint_id,
+            |checkpoint_id| {
+                let db = self.db.clone();
+                async move { db.get_unique_pending_id_for_checkpoint_id(checkpoint_id).await }
+            },
+            || self.db.get_latest_mapped_unique_pending_id(),
+            |unique_pending_id| self.db.get_checkpoint_id_for_unique_pending_id(unique_pending_id),
+        )
+        .await?;
         let expected_checkpoint_id_opt = self.db.get_checkpoint_id_for_unique_pending_id(last_unique_pending_id).await?;
 
         if let Some(expected_checkpoint_id) = expected_checkpoint_id_opt {
             if expected_checkpoint_id != local_latest_checkpoint_id {
-                // If the mapping says we should be at X, but we are at Y.
-                // Assuming mapping is set on commit.
                 if expected_checkpoint_id > local_latest_checkpoint_id {
                      tracing::error!("DB Inconsistency: PendingID {} maps to Checkpoint {}, but latest is {}.", 
                         last_unique_pending_id, expected_checkpoint_id, local_latest_checkpoint_id);
@@ -176,56 +259,45 @@ where
         };
         tracing::info!("[REALM_INIT] new_init start");
 
-        // 1. Recover basic state from DB
-        let mut last_committed_checkpoint_id = db.get_latest_checkpoint_id().await?;
+        let last_committed_checkpoint_id = db.get_latest_checkpoint_id().await?;
         tracing::info!("[REALM_INIT] latest checkpoint id = {}", last_committed_checkpoint_id);
-        let (current_unique_pending_id, current_core_proc_unique_pending_id) = if last_committed_checkpoint_id == 0 {
-            (0, 0u128)
-        } else {
-            db.get_latest_mapped_unique_pending_id().await?
-        };
+        let ((current_unique_pending_id, current_core_proc_unique_pending_id), (last_committed_unique_pending_id, last_committed_proc_checkpoint_unique_id)) =
+            if last_committed_checkpoint_id == 0 {
+                let committed = match db.get_unique_pending_id_for_checkpoint_id(0).await {
+                    Ok(Some(res)) => res,
+                    _ => (0u64, 0u128),
+                };
+                ((0u64, 0u128), committed)
+            } else {
+                resolve_current_and_last_committed_pending_ids(
+                    last_committed_checkpoint_id,
+                    |checkpoint_id| {
+                        let db = db.clone();
+                        async move { db.get_unique_pending_id_for_checkpoint_id(checkpoint_id).await }
+                    },
+                    || {
+                        let db = db.clone();
+                        async move { db.get_latest_mapped_unique_pending_id().await }
+                    },
+                    |unique_pending_id| {
+                        let db = db.clone();
+                        async move { db.get_checkpoint_id_for_unique_pending_id(unique_pending_id).await }
+                    },
+                )
+                .await?
+            };
         tracing::info!(
             "[REALM_INIT] current unique ids = ({}, {})",
             current_unique_pending_id,
             current_core_proc_unique_pending_id
         );
 
-        // 2. Validate consistency of unique pending IDs
-        // Defensive: if a previous run fast-forwarded and set latest_checkpoint_id
-        // without writing the unique_pending_id mapping, roll back to the last
-        // checkpoint that actually has a mapping.
-        let (last_committed_unique_pending_id, last_committed_proc_checkpoint_unique_id) = loop {
-            match db.get_unique_pending_id_for_checkpoint_id(last_committed_checkpoint_id).await {
-                Ok(Some(res)) => break res,
-                Ok(None) if last_committed_checkpoint_id == 0 => break (0, 0u128),
-                Ok(None) => {
-                    tracing::warn!(
-                        "No unique pending ID for checkpoint {}. Rolling back to previous checkpoint.",
-                        last_committed_checkpoint_id
-                    );
-                    last_committed_checkpoint_id -= 1;
-                }
-                Err(e) => {
-                    if last_committed_checkpoint_id == 0 {
-                        break (0, 0u128);
-                    } else {
-                        return Err(e);
-                    }
-                }
-            }
-        };
-        if last_committed_checkpoint_id != db.get_latest_checkpoint_id().await? {
-            db.set_latest_checkpoint_id(last_committed_checkpoint_id).await?;
-        }
-
-        // 3. Get Checkpoint Root
         let last_committed_checkpoint_root = match db.checkpoint_tree_get_root_hash(last_committed_checkpoint_id).await {
             Ok(root) => root,
             Err(_) if last_committed_checkpoint_id == 0 => genesis_checkpoint_root,
             Err(e) => return Err(e),
         };
 
-        // 4. Get Realm Root
         let last_committed_realm_root = if last_committed_checkpoint_id == 0 {
             genesis_realm_root
         } else {
@@ -242,7 +314,6 @@ where
             last_committed_realm_root,
         );
 
-        // 5. Initialize Backup Manager
         let checkpoint_tree_backup_manager = create_new_checkpoint_backup_manager_from_file_path(
             file_system.clone(),
             STALE_CHECKPOINT_AGE_USER_END_CAP_TO_REALM_PROOF,
@@ -254,7 +325,6 @@ where
         .await?;
         tracing::info!("[REALM_INIT] checkpoint backup manager created");
 
-        // Initialize unique ID tracking in temp DB
         temp_db
             .set_unique_pending_ids(&realm_identifier, current_unique_pending_id, current_core_proc_unique_pending_id)
             .await?;
@@ -355,13 +425,11 @@ where
             .global_user_tree_get_node_and_checkpoint_id_max_checkpoint(coordinator_latest_checkpoint_id, &self.realm_root_node)
             .await?;
 
-        // If local latest checkpoint is older than what coordinator thinks we modified last
         if local_latest_checkpoint_id < coordinator_realm_root_state.checkpoint_id {
              anyhow::bail!("Local database is stale. Coordinator sees update at {}, local head is {}.", 
                 coordinator_realm_root_state.checkpoint_id, local_latest_checkpoint_id);
         }
 
-        // Compare roots
         if coordinator_realm_root_state.value != local_realm_root_state.value {
             anyhow::bail!("Realm Root mismatch. Coordinator: {:?}, Local: {:?}.",
                 coordinator_realm_root_state, local_realm_root_state);
@@ -395,23 +463,18 @@ where
         if database_check_state == DatabaseCheckState::NeedsRecovery {
             tracing::warn!("Inconsistent Realm Processor State detected. Initiating Recovery.");
 
-            // 1. Fetch correct state from Coordinator
             let coordinator_latest_checkpoint_id = self.coordinator_client.rc_get_latest_checkpoint_id().await?;
             
-            // Sync checkpoints first to ensure we have the proof data
             self.checkpoint_tree_backup_manager
                 .sync_from_coordinator_client::<CoordinatorClient, N::F>(&self.coordinator_client, 2000)
                 .await?;
 
-            // 2. Recover each missing checkpoint in order
             let mut checkpoint_id = self.state.last_committed_checkpoint_id + 1;
             while checkpoint_id <= coordinator_latest_checkpoint_id {
                 tracing::info!("Recovering checkpoint {}...", checkpoint_id);
 
-                // 3. Fetch Full Coordinator Update Data for this checkpoint
                 let coordinator_update = self.coordinator_client.rc_get_realm_sync_info(checkpoint_id, self.state.realm_id_u64).await?;
 
-                // 4. Fetch coordinator realm state for this checkpoint
                 let target_realm_state = self
                     .coordinator_client
                     .rc_get_realm_root_and_last_modified_checkpoint(checkpoint_id, self.state.realm_id_u64)
@@ -419,8 +482,6 @@ where
 
                 tracing::info!("Coordinator realm root at checkpoint {}: {:?}", checkpoint_id, target_realm_state.value);
 
-                // Fast-path: if the realm root did not change at this checkpoint,
-                // there is nothing to recover. Skip to the next one.
                 if target_realm_state.value == self.state.last_committed_realm_end_root {
                     tracing::debug!(
                         "Checkpoint {}: realm root unchanged ({:?}), skipping recovery.",
@@ -431,13 +492,9 @@ where
                     continue;
                 }
 
-                // Seed processing_* fields before any commit_state call.
-                // commit_processing() copies processing_* into last_committed_*,
-                // so these must reflect the checkpoint we are about to commit.
                 self.state.processing_checkpoint_id = checkpoint_id;
                 self.state.processing_checkpoint_root = coordinator_update.checkpoint_sync_info.checkpoint_tree_root;
 
-                // 5. Generate local updates
                 let prepared_updates = if checkpoint_id == 0 {
                     tracing::info!("Restore target is checkpoint 0 (genesis); using genesis path without backup file.");
                     self.state.processing_realm_start_root = target_realm_state.value;
@@ -463,9 +520,17 @@ where
                     let (realm_unique_pending_id, realm_proc_checkpoint_id) = match realm_pending_id {
                         Some(res) => res,
                         None => {
-                            // Coordinator has advanced past what realm committed locally.
-                            // Scan all candidate pending_ids to find a backup whose end_root matches.
-                            let (current_unique_pending_id, current_proc_checkpoint_id) = self.db.get_latest_mapped_unique_pending_id().await?;
+                            let ((current_unique_pending_id, current_proc_checkpoint_id), _) =
+                                resolve_current_and_last_committed_pending_ids(
+                                    self.state.last_committed_checkpoint_id,
+                                    |checkpoint_id| {
+                                        let db = self.db.clone();
+                                        async move { db.get_unique_pending_id_for_checkpoint_id(checkpoint_id).await }
+                                    },
+                                    || self.db.get_latest_mapped_unique_pending_id(),
+                                    |unique_pending_id| self.db.get_checkpoint_id_for_unique_pending_id(unique_pending_id),
+                                )
+                                .await?;
                             let last_committed_unique_pending_id = self.state.last_committed_unique_pending_id;
 
                             let mut recovered_from_backup = false;
@@ -595,10 +660,6 @@ where
                             }
 
                             if !recovered_from_backup {
-                                // Realm root changed but we have no local backup.
-                                // Fast-forwarding is NOT safe here because we would be missing
-                                // the sub-tree nodes needed to generate proofs. This is a
-                                // data-loss scenario.
                                 anyhow::bail!(
                                     "Checkpoint {}: realm root changed from {:?} to {:?} but no local backup found. \
                                      This indicates data loss — the sub-tree nodes required to generate proofs are missing.",
@@ -608,7 +669,6 @@ where
                                 );
                             }
 
-                            // After handling backup recovery, verify and continue to next checkpoint.
                             let latest_realm_root = self.get_realm_root_from_db().await?;
                             if latest_realm_root != target_realm_state.value {
                                 anyhow::bail!(
@@ -622,7 +682,6 @@ where
                             continue;
                         }
                     };
-                    // unique_pending_id 0: no backup file exists (first file is pending_1.backup after first commit)
                     if realm_unique_pending_id == 0 {
                         tracing::info!(
                             "Restore target checkpoint {} maps to unique_pending_id 0 (no backup file); using genesis-like path.",
@@ -659,18 +718,16 @@ where
                     }
                 };
 
-                // 6. Commit state to DB (for genesis, mapping, or backup recovery)
                 self.commit_state(
                     &coordinator_update,
                     &prepared_updates,
-                    ProvingJobCircuitType::GUTANoChange, // Dummy type for recovery
+                    ProvingJobCircuitType::GUTANoChange,
                     vec![],
                     true,
                 ).await?;
 
                 tracing::info!("Checkpoint {} recovered successfully.", checkpoint_id);
 
-                // 7. Verify Post-Recovery
                 let latest_realm_root = self.get_realm_root_from_db().await?;
                 if latest_realm_root != target_realm_state.value {
                     anyhow::bail!(
@@ -697,24 +754,19 @@ where
     ) -> anyhow::Result<()> {
         let genesis_checkpoint_root = genesis_block_update.coordinator_update.checkpoint_sync_info.checkpoint_tree_root;
 
-        // 1. Genesis Check
         self.ensure_genesis_applied(genesis_block_update).await?;
 
-        // 2. Recovery Check
         self.ensure_backup_restored_if_necessary(file_system, guta_gatherer_backup_directory, global_user_tree)
             .await?;
 
-        // 3. Hydrate Checkpoint Manager from Local DB (if we have data)
         if self.state.last_committed_checkpoint_id > 0 {
             self.checkpoint_tree_backup_manager
                 .sync_from_database::<S>(&self.db, 1000, self.state.last_committed_checkpoint_id)
                 .await?;
         }
 
-        // 4. Fast Forward / Sync with Coordinator
         self.sync_to_coordinator_set_checkpoint_id().await?;
 
-        // 5. Refresh Internal State
         let current_realm_root = self.db.global_user_tree_get_node(self.state.last_committed_checkpoint_id, self.realm_root_node).await?;
         
         self.state.last_committed_realm_end_root = current_realm_root;
@@ -723,7 +775,6 @@ where
         self.state.processing_realm_end_root = current_realm_root;
         self.state.gathering_realm_start_root = current_realm_root;
 
-        // 6. Final Sync of Checkpoint Manager (Tip Verification)
         self.checkpoint_tree_backup_manager
             .sync_from_coordinator_client::<CoordinatorClient, N::F>(&self.coordinator_client, 2000)
             .await?;
@@ -734,13 +785,11 @@ where
         self.state.coordinator_head_synced_checkpoint_id = head_checkpoint_id;
         self.state.coordinator_head_synced_checkpoint_root = head_checkpoint_root;
         
-        // Update processing pointers
         self.state.processing_checkpoint_root = head_checkpoint_root;
         self.state.gathering_checkpoint_root = head_checkpoint_root;
         self.state.processing_checkpoint_id = head_checkpoint_id;
         self.state.gathering_checkpoint_id = head_checkpoint_id;
 
-        // Get the root of the *last committed* checkpoint for historical consistency
         let last_committed_checkpoint_root = if self.state.last_committed_checkpoint_id == 0 {
             genesis_checkpoint_root 
         } else {
@@ -751,16 +800,11 @@ where
         };
         self.state.last_committed_checkpoint_root = last_committed_checkpoint_root;
 
-        // 7. Initialize Unique IDs for new work
         self.set_new_unique_ids(Some(current_realm_root)).await?;
 
-        // Sync gatherer queue key to the new gathering proc ID so the
-        // gatherer (created shortly after this, in startup.rs) polls the
-        // queue that end-cap submissions will write to.
         self.guta_queue_key_status_manager
             .set_unique_id(self.state.gathering_proc_checkpoint_unique_id)?;
         
-        // 8. Publish state to shared wrapper
         self.shared_state.update_from_core_state(&self.state).await?;
 
         tracing::info!(
@@ -771,5 +815,178 @@ where
         );
         self.print_coordinator_processor_state();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ensure_latest_pending_within_target, find_latest_mapped_pending_at_or_before, resolve_current_and_last_committed_pending_ids};
+
+    use std::collections::HashMap;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+
+    use parth_core::QCoreProcCheckpointUniqueId;
+
+    fn mapping_query(
+        mappings: HashMap<u64, (u64, QCoreProcCheckpointUniqueId)>,
+    ) -> impl FnMut(u64) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<(u64, QCoreProcCheckpointUniqueId)>>> + Send>> {
+        let mappings = Arc::new(mappings);
+        move |cp| {
+            let mappings = Arc::clone(&mappings);
+            Box::pin(async move { Ok(mappings.get(&cp).copied()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_mapping_walks_back_to_latest_mapping() {
+        let mappings = HashMap::from([(197u64, (87u64, 10087u128))]);
+        let resolved = find_latest_mapped_pending_at_or_before(199, mapping_query(mappings))
+            .await
+            .expect("the latest mapping below T must resolve, not (0, 0)");
+        assert_eq!(resolved, (87u64, 10087u128 as QCoreProcCheckpointUniqueId));
+    }
+
+    #[tokio::test]
+    async fn real_mapping_at_target_uses_it_unchanged() {
+        let mappings = HashMap::from([(199u64, (88u64, 10088u128))]);
+        let resolved = find_latest_mapped_pending_at_or_before(199, mapping_query(mappings))
+            .await
+            .expect("a mapping at T resolves on the first point read");
+        assert_eq!(resolved, (88u64, 10088u128 as QCoreProcCheckpointUniqueId));
+    }
+
+    #[tokio::test]
+    async fn genesis_empty_store_returns_zero() {
+        let resolved = find_latest_mapped_pending_at_or_before(0, mapping_query(HashMap::new()))
+            .await
+            .expect("genesis with no mapping is the valid empty-store startup state");
+        assert_eq!(resolved, (0u64, 0u128 as QCoreProcCheckpointUniqueId));
+    }
+
+    #[tokio::test]
+    async fn genesis_with_mapping_uses_mapping() {
+        let mappings = HashMap::from([(0u64, (5u64, 1005u128))]);
+        let resolved = find_latest_mapped_pending_at_or_before(0, mapping_query(mappings))
+            .await
+            .expect("a genesis mapping resolves to that pair");
+        assert_eq!(resolved, (5u64, 1005u128 as QCoreProcCheckpointUniqueId));
+    }
+
+    #[tokio::test]
+    async fn mapping_at_genesis_resolves_for_non_genesis_target() {
+        let mappings = HashMap::from([(0u64, (5u64, 1005u128))]);
+        let resolved = find_latest_mapped_pending_at_or_before(5, mapping_query(mappings))
+            .await
+            .expect("a genesis mapping is the latest mapping for this target");
+        assert_eq!(resolved, (5u64, 1005u128 as QCoreProcCheckpointUniqueId));
+    }
+
+    #[tokio::test]
+    async fn non_genesis_with_no_mapping_fails_closed() {
+        let err = find_latest_mapped_pending_at_or_before(5, mapping_query(HashMap::new()))
+            .await
+            .expect_err("a non-genesis target with no mapping must fail closed");
+        let msg = err.to_string();
+        assert!(msg.contains("No checkpoint->pending mapping"), "got: {msg}");
+        assert!(msg.contains("<= target 5"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn mapping_query_error_propagates_fail_closed() {
+        let err = find_latest_mapped_pending_at_or_before(5, |cp| {
+            Box::pin(async move {
+                Err::<Option<(u64, QCoreProcCheckpointUniqueId)>, _>(anyhow::anyhow!(
+                    "injected point-read failure at checkpoint {cp}"
+                ))
+            })
+        })
+        .await
+        .expect_err("an injected point-read error must propagate, never fall back to (0, 0)");
+        let msg = err.to_string();
+        assert!(msg.contains("injected point-read failure at checkpoint 5"), "got: {msg}");
+    }
+
+    #[test]
+    fn leftover_post_t_pending_fails_closed() {
+        let err = ensure_latest_pending_within_target(104, Some(210), 199)
+            .expect_err("a reverse mapping beyond T must fail closed");
+        let msg = err.to_string();
+        assert!(msg.contains("Contradictory pending mapping"), "got: {msg}");
+        assert!(msg.contains("unique pending ID 104"), "got: {msg}");
+        assert!(msg.contains("checkpoint 210"), "got: {msg}");
+        assert!(msg.contains("target checkpoint 199"), "got: {msg}");
+    }
+
+    #[test]
+    fn latest_pending_within_or_at_target_is_consistent() {
+        ensure_latest_pending_within_target(87, Some(197), 199)
+            .expect("a reverse mapping <= T is consistent");
+        ensure_latest_pending_within_target(88, Some(199), 199)
+            .expect("a reverse mapping == T is consistent (boundary is >, not >=)");
+    }
+
+    #[tokio::test]
+    async fn marker_63_with_only_sentinel_mapping_uses_proven_zero_pair() {
+        let mappings = HashMap::from([(0u64, (0u64, 0u128))]);
+        let resolved = resolve_current_and_last_committed_pending_ids(
+            63,
+            mapping_query(mappings),
+            || async { anyhow::bail!("No mapped unique pending ID found at or below pending counter 1100") },
+            |pending_id| async move { Ok((pending_id == 0).then_some(0)) },
+        )
+        .await
+        .expect("the sentinel checkpoint boundary proves the committed/current pair despite a high raw counter");
+
+        assert_eq!(resolved, ((0, 0), (0, 0)));
+    }
+
+    #[tokio::test]
+    async fn normal_positive_mapping_keeps_latest_and_boundary_pairs() {
+        let mappings = HashMap::from([(62u64, (87u64, 10087u128))]);
+        let resolved = resolve_current_and_last_committed_pending_ids(
+            63,
+            mapping_query(mappings),
+            || async { Ok((87u64, 10087u128)) },
+            |pending_id| async move { Ok((pending_id == 87).then_some(62)) },
+        )
+        .await
+        .expect("a normal positive mapping at/before the marker remains unchanged");
+
+        assert_eq!(resolved, ((87, 10087), (87, 10087)));
+    }
+
+    #[test]
+    fn latest_pending_inflight_no_reverse_is_allowed() {
+        ensure_latest_pending_within_target(94, None, 199)
+            .expect("an in-flight pending (no checkpoint mapping) is not a post-T leftover");
+    }
+
+    #[test]
+    fn recovery_candidate_range_excludes_post_t_backups_after_rollback() {
+        let boundary = 87u64;
+        let current = 87u64;
+        let candidate_range = (boundary + 1)..=current;
+
+        assert!(candidate_range.is_empty(), "candidate range must be empty after a correct rollback");
+        for post_target_pending in [88u64, 89, 94] {
+            assert!(
+                !candidate_range.contains(&post_target_pending),
+                "post-T post-target generation pending {} must not be in the recovery candidate range",
+                post_target_pending
+            );
+        }
+    }
+
+    #[test]
+    fn partial_rollback_leftover_bails_before_recovery_applies_backup() {
+        let boundary = 87u64;
+        let leftover_pending = 88u64;
+        let leftover_reverse = Some(200u64);
+        ensure_latest_pending_within_target(leftover_pending, leftover_reverse, 199)
+            .expect_err("a leftover post-T pending must bail before recovery runs");
+        let would_walk = (boundary + 1)..=leftover_pending;
+        assert!(would_walk.contains(&leftover_pending), "sanity: without the guard the leftover would be walked");
     }
 }

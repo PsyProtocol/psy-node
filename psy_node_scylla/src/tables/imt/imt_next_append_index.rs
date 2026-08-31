@@ -14,6 +14,7 @@ pub struct ScyllaIMTNextAppendIndexPreparedStatements {
     pub table_key: QDatabaseTableRoutingKey,
 
     pub insert_prepared: Arc<PreparedStatement>,
+    pub delete_prepared: Arc<PreparedStatement>,
     pub select_prepared: Arc<PreparedStatement>,
 }
 
@@ -57,6 +58,10 @@ impl ScyllaIMTNextAppendIndexPreparedStatements {
         tracing::info!("Preparing IMT next append index statements: {}.{}", keyspace, table_name);
         let insert_prepared = session.prepare(insert_cql).await?;
         let select_prepared = session.prepare(select_cql).await?;
+        let delete_prepared = session.prepare(format!(
+            r#"DELETE FROM {}.{} WHERE tree_id = ? AND tree_sub_id = ?"#,
+            keyspace, table_name
+        )).await?;
         tracing::info!("Prepared IMT next append index statements: {}.{}", keyspace, table_name);
 
         Ok(Self {
@@ -64,8 +69,16 @@ impl ScyllaIMTNextAppendIndexPreparedStatements {
             table_name: table_name.to_string(),
             table_key,
             insert_prepared: Arc::new(insert_prepared),
+            delete_prepared: Arc::new(delete_prepared),
             select_prepared: Arc::new(select_prepared),
         })
+    }
+
+    pub async fn delete_many(&self, session: &Session, keys: &[(i64, i64)]) -> anyhow::Result<()> {
+        for &key in keys {
+            session.execute_unpaged(&self.delete_prepared, key).await?;
+        }
+        Ok(())
     }
 
     pub async fn insert(

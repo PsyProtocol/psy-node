@@ -2,6 +2,8 @@
 
 This guide walks you through starting a complete Psy network locally for development and testing.
 
+For the current supported service lifecycle, read [Devnet Startup, Shutdown, Restart, and Rollback](./devnet_lifecycle.md) before running any command. The lifecycle guide supersedes the manual startup and cleanup examples below.
+
 ## Prerequisites
 
 1. Complete installation as described in [Installation](./installation.md)

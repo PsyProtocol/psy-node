@@ -348,18 +348,14 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                 self.realm_sub_id_u64,
             )?;
         tracing::debug!("Double header: {}", serde_json::to_string_pretty(&double_header)?);
-        
-        if !imt_full.is_empty() {
-            let (imt_header, imt_payload) = QBlobMerkleTreeNodeBatchHeaderV1::clip_header_get_payload_for_blob_type_and_tree_ref(
-                imt_full,
-                QBlobDataType::GenericIMTLeafBatch,
-                QBlobMerkleNodeTreeType::IMTContractStateLeaf,
-                true,
-            )?;
-            tracing::debug!("IMT header: {}", serde_json::to_string_pretty(&imt_header)?);
-            // Store IMT leaf preimage data for FFS database
-            self.contract_state_imt_leaves_ffs.extend_from_slice(imt_payload);
-        }
+        let (imt_header, imt_payload) = QBlobMerkleTreeNodeBatchHeaderV1::clip_header_get_payload_for_blob_type_and_tree_ref(
+            imt_full,
+            QBlobDataType::GenericIMTLeafBatch,
+            QBlobMerkleNodeTreeType::IMTContractStateLeaf,
+            true,
+        )?;
+        tracing::debug!("IMT header: {}", serde_json::to_string_pretty(&imt_header)?);
+        self.contract_state_imt_leaves_ffs.extend_from_slice(imt_payload);
 
         if single_header.checkpoint_id != queue_item.expected_fake_checkpoint_id {
             tracing::info!("Skipping end-cap job population due to fake checkpoint ID mismatch: expected {}, found {}. Likely got overwritten due to a race condition. Gracefully skipping.",
@@ -551,17 +547,14 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                 self.realm_sub_id_u64,
             )?;
         tracing::debug!("Double header: {}", serde_json::to_string_pretty(&double_header)?);
-        if !imt_full.is_empty() {
-            let (imt_header, imt_payload) = QBlobMerkleTreeNodeBatchHeaderV1::clip_header_get_payload_for_blob_type_and_tree_ref(
-                imt_full,
-                QBlobDataType::GenericIMTLeafBatch,
-                QBlobMerkleNodeTreeType::IMTContractStateLeaf,
-                true,
-            )?;
-            // Store IMT leaf preimage data for FFS database
-            tracing::debug!("IMT header: {}", serde_json::to_string_pretty(&imt_header)?);
-            self.contract_state_imt_leaves_ffs.extend_from_slice(imt_payload);
-        }
+        let (imt_header, imt_payload) = QBlobMerkleTreeNodeBatchHeaderV1::clip_header_get_payload_for_blob_type_and_tree_ref(
+            imt_full,
+            QBlobDataType::GenericIMTLeafBatch,
+            QBlobMerkleNodeTreeType::IMTContractStateLeaf,
+            true,
+        )?;
+        tracing::debug!("IMT header: {}", serde_json::to_string_pretty(&imt_header)?);
+        self.contract_state_imt_leaves_ffs.extend_from_slice(imt_payload);
         if single_header.checkpoint_id != queue_item.expected_fake_checkpoint_id {
             tracing::info!("Skipping end-cap job population due to fake checkpoint ID mismatch: expected {}, found {}. Likely got overwritten due to a race condition. Gracefully skipping.",
                 queue_item.expected_fake_checkpoint_id,

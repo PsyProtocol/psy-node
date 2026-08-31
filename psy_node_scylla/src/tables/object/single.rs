@@ -31,6 +31,8 @@ use crate::{
 pub struct ScyllaGenericObjectSingleIdTablePreparedStatements {
     pub insert_1_statement: Statement,
     pub insert_1_prepared: Arc<PreparedStatement>,
+    pub delete_1_prepared: Arc<PreparedStatement>,
+    pub select_exact_1_prepared: Arc<PreparedStatement>,
 
     pub select_value_1_statement: Statement,
     pub select_value_1_prepared: Arc<PreparedStatement>,
@@ -62,6 +64,12 @@ impl ScyllaGenericObjectSingleIdTablePreparedStatements {
             keyspace, table_name
         ));
         let insert_1_prepared = session.prepare(insert_1_statement.clone()).await?;
+        let delete_1_prepared = session
+            .prepare(format!("DELETE FROM {}.{} WHERE obj_id = ? AND checkpoint_id = ?", keyspace, table_name))
+            .await?;
+        let select_exact_1_prepared = session
+            .prepare(format!("SELECT checkpoint_id FROM {}.{} WHERE obj_id = ? AND checkpoint_id = ? LIMIT 1", keyspace, table_name))
+            .await?;
 
         let select_value_1_statement = Statement::new(format!(
             "SELECT value FROM {}.{} WHERE obj_id = ? AND checkpoint_id <= ? LIMIT 1",
@@ -84,6 +92,8 @@ impl ScyllaGenericObjectSingleIdTablePreparedStatements {
             insert_batch_serialized_64_prepared: Arc::new(generate_batch_prepared_statement(&session, &insert_1_prepared, 64).await?),
             insert_1_statement: insert_1_statement,
             insert_1_prepared: Arc::new(insert_1_prepared),
+            delete_1_prepared: Arc::new(delete_1_prepared),
+            select_exact_1_prepared: Arc::new(select_exact_1_prepared),
             select_value_1_statement: select_value_1_statement,
             select_value_1_prepared: Arc::new(select_value_1_prepared),
             select_value_checkpoint_id_obj_id_1_statement: select_value_checkpoint_id_obj_id_1_statement,
@@ -146,6 +156,28 @@ impl ScyllaStandardPreparedTableStatements for ScyllaGenericObjectSingleIdTableP
 }
 
 impl ScyllaGenericObjectSingleIdTablePreparedStatements {
+    pub async fn delete_many_object_checkpoint(&self, session: &Session, keys: &[(u64, u64)]) -> anyhow::Result<()> {
+        for &(obj_id, checkpoint_id) in keys {
+            session
+                .execute_unpaged(
+                    &self.delete_1_prepared,
+                    (u64_to_i64_exact(obj_id), convert_checkpoint_id_to_i64(checkpoint_id)),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn contains_exact_object_checkpoint(&self, session: &Session, obj_id: u64, checkpoint_id: u64) -> anyhow::Result<bool> {
+        let result = session
+            .execute_unpaged(
+                &self.select_exact_1_prepared,
+                (u64_to_i64_exact(obj_id), convert_checkpoint_id_to_i64(checkpoint_id)),
+            )
+            .await?;
+        Ok(result.into_rows_result()?.maybe_first_row::<(i64,)>()?.is_some())
+    }
+
     async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_start_internal(
         &self,
         session: &Session,
