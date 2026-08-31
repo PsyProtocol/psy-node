@@ -12,11 +12,11 @@ pub use executor::{
     RollbackOperation, RollbackOutcome, RollbackProgressStore,
 };
 pub use generator::{
-    collect_post_target_generations, generate_rollback_plan, generate_rollback_plan_from_backup_paths,
-    BackupKeySource, CoordinatorBackupRequirements, CoordinatorGutaBackup,
+    collect_ids, generate_rollback_plan, generate_rollback_plan_from_backup_paths,
+    BackupKeySource, CoordinatorCheckpointInfo, CoordinatorGutaBackup,
     DeployContractBackup, ImtAppendIndexEntry,
     ImtAppendIndexSnapshot, RegisterUserBackup, RealmEndCapBackup,
-    RollbackBackupDirectories, RollbackBackupRequirementReader,
+    RollbackBackupDirectories, RollbackCheckpointInfoReader,
     RollbackPlanFromBackupPathsInput, RollbackPlanInput, RollbackStateReader,
     RollbackTempEnumerator, UpdateContractBackup,
 };
@@ -25,7 +25,7 @@ pub use keys::{
     ImtLeafKey, MerkleNodeKey, SingleTreeMerkleKey, TempFieldKey, UserTransformParams,
 };
 pub use plan::{
-    read_rollback_plan, write_rollback_plan_atomic, PostTargetGeneration,
+    read_rollback_plan, write_rollback_plan_atomic, RollbackIds,
     RollbackNatsConsumerKind, RollbackNatsConsumerTarget, RollbackPhase,
     RollbackPhaseStatus, RollbackPlan, RollbackRole, RollbackSnapshot,
     RollbackTempValueSnapshot, TargetContractState,

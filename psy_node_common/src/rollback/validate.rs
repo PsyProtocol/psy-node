@@ -31,19 +31,19 @@ pub fn validate_rollback_plan(plan: &RollbackPlan) -> anyhow::Result<()> {
     if plan.role == RollbackRole::Coordinator && (plan.realm_id != 0 || plan.realm_sub_id != 0) {
         anyhow::bail!("Coordinator RP must use realm_id=0 and realm_sub_id=0");
     }
-    for (index, entry) in plan.post_target_generations.iter().enumerate() {
+    for (index, entry) in plan.ids.iter().enumerate() {
         if entry.pending_id == 0 {
-            anyhow::bail!("post_target_generations pending_id 0 is never a delete key");
+            anyhow::bail!("ids pending_id 0 is never a delete key");
         }
-        if index > 0 && plan.post_target_generations[index - 1].pending_id >= entry.pending_id {
-            anyhow::bail!("post_target_generations pending_ids must be strictly ascending");
+        if index > 0 && plan.ids[index - 1].pending_id >= entry.pending_id {
+            anyhow::bail!("ids pending_ids must be strictly ascending");
         }
         if entry.pending_id > plan.latest_pending_id {
-            anyhow::bail!("post_target_generations pending_id {} exceeds frozen high-water {}", entry.pending_id, plan.latest_pending_id);
+            anyhow::bail!("ids pending_id {} exceeds frozen high-water {}", entry.pending_id, plan.latest_pending_id);
         }
         if let Some(checkpoint_id) = entry.checkpoint_id {
             if checkpoint_id == 0 || checkpoint_id <= plan.target_checkpoint_id || checkpoint_id > plan.latest_checkpoint_id {
-                anyhow::bail!("post_target_generations checkpoint_id {} is outside (target, latest]", checkpoint_id);
+                anyhow::bail!("ids checkpoint_id {} is outside (target, latest]", checkpoint_id);
             }
         }
     }
@@ -98,11 +98,10 @@ pub fn validate_rollback_plan(plan: &RollbackPlan) -> anyhow::Result<()> {
 fn validate_semantic_keys(plan: &RollbackPlan) -> anyhow::Result<()> {
     let checkpoint_set: HashSet<u64> = plan.checkpoint_ids().into_iter().collect();
     let mapped_checkpoint_set: HashSet<u64> = plan.mapped_checkpoint_ids().into_iter().collect();
-    let pending_set: HashSet<u64> = plan.post_target_generations.iter().map(|entry| entry.pending_id).collect();
-    let proc_pairs: HashSet<(u64, u128)> = plan
-        .post_target_generations
+    let pending_set: HashSet<u64> = plan.ids.iter().map(|entry| entry.pending_id).collect();
+    let proc_pairs: HashSet<(u64, u128)> = plan.ids
         .iter()
-        .map(|entry| (entry.pending_id, entry.proc_checkpoint_unique_id))
+        .map(|entry| (entry.pending_id, entry.proc_id))
         .collect();
     let realm_le = u32::try_from(plan.realm_id).map_err(|_| anyhow::anyhow!("realm_id exceeds u32"))?.to_le_bytes();
     let sub_le = u16::try_from(plan.realm_sub_id).map_err(|_| anyhow::anyhow!("realm_sub_id exceeds u16"))?.to_le_bytes();
@@ -332,12 +331,12 @@ fn validate_pending_proc_pairs(keys: &Value, proc_pairs: &HashSet<(u64, u128)>) 
         let pending_id = as_u64("pending_id_to_pending_proc_id_table", index, &pair[0])?;
         let proc_id = as_u128("pending_id_to_pending_proc_id_table", index, &pair[1])?;
         if pending_id == 0 || !proc_pairs.contains(&(pending_id, proc_id)) {
-            anyhow::bail!("pending_id_to_pending_proc_id_table key {index} pair ({pending_id}, {proc_id}) is not a post_target_generations pair");
+            anyhow::bail!("pending_id_to_pending_proc_id_table key {index} pair ({pending_id}, {proc_id}) is not an ids pair");
         }
         actual.insert((pending_id, proc_id));
     }
     if actual != *proc_pairs {
-        anyhow::bail!("pending_id_to_pending_proc_id_table keys must equal frozen post_target_generations (pending, proc) pairs");
+        anyhow::bail!("pending_id_to_pending_proc_id_table keys must equal frozen ids (pending, proc) pairs");
     }
     Ok(())
 }
@@ -453,7 +452,7 @@ fn require_exact_u64_set(table: &str, keys: &Value, expected: &HashSet<u64>) -> 
         actual.insert(id);
     }
     if actual != *expected {
-        anyhow::bail!("{table} keys must equal the frozen post_target_generations set");
+        anyhow::bail!("{table} keys must equal the frozen ids set");
     }
     Ok(())
 }
@@ -534,7 +533,7 @@ fn validate_nats_targets(plan: &RollbackPlan, keys: &Value) -> anyhow::Result<()
         }
     }
     if actual != expected {
-        anyhow::bail!("nats consumer keys must equal the exact role-local post_target_generations consumer catalog");
+        anyhow::bail!("nats consumer keys must equal the exact role-local ids consumer catalog");
     }
     Ok(())
 }
@@ -554,7 +553,7 @@ fn decode_hex(value: &str) -> anyhow::Result<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::rollback::plan::{
-        PostTargetGeneration, RollbackPhase, RollbackPhaseStatus, RollbackPlan, RollbackRole,
+        RollbackIds, RollbackPhase, RollbackPhaseStatus, RollbackPlan, RollbackRole,
         RollbackSnapshot, RollbackTempValueSnapshot, TargetContractState,
     };
 
@@ -566,7 +565,7 @@ mod tests {
             target_checkpoint_id: 199,
             latest_checkpoint_id: 199,
             latest_pending_id: 87,
-            post_target_generations: vec![],
+            ids: vec![],
             target_contract_state: None,
             snapshot: RollbackSnapshot {
                 target_info: "00".into(),
@@ -608,11 +607,11 @@ mod tests {
     }
 
     #[test]
-    fn validator_rejects_nonascending_post_target_generations() {
+    fn validator_rejects_nonascending_ids() {
         let mut plan = empty_coordinator_plan();
-        plan.post_target_generations = vec![
-            PostTargetGeneration { checkpoint_id: Some(201), pending_id: 89, proc_checkpoint_unique_id: 10089 },
-            PostTargetGeneration { checkpoint_id: Some(200), pending_id: 88, proc_checkpoint_unique_id: 10088 },
+        plan.ids = vec![
+            RollbackIds { checkpoint_id: Some(201), pending_id: 89, proc_id: 10089 },
+            RollbackIds { checkpoint_id: Some(200), pending_id: 88, proc_id: 10088 },
         ];
         assert!(validate_rollback_plan(&plan).is_err());
     }
@@ -708,10 +707,10 @@ mod tests {
     }
 
     fn valid_plan() -> RollbackPlan {
-        let post_target_generations = vec![
-            PostTargetGeneration { checkpoint_id: Some(200), pending_id: 88, proc_checkpoint_unique_id: 10088 },
-            PostTargetGeneration { checkpoint_id: Some(201), pending_id: 89, proc_checkpoint_unique_id: 10089 },
-            PostTargetGeneration { checkpoint_id: None, pending_id: 94, proc_checkpoint_unique_id: 10094 },
+        let ids = vec![
+            RollbackIds { checkpoint_id: Some(200), pending_id: 88, proc_id: 10088 },
+            RollbackIds { checkpoint_id: Some(201), pending_id: 89, proc_id: 10089 },
+            RollbackIds { checkpoint_id: None, pending_id: 94, proc_id: 10094 },
         ];
         let checkpoint_ids: Vec<u64> = (200..=210).collect();
         let pending_ids = [88u64, 89, 94];
@@ -765,7 +764,7 @@ mod tests {
             target_checkpoint_id: 199,
             latest_checkpoint_id: 210,
             latest_pending_id: 104,
-            post_target_generations,
+            ids,
             target_contract_state: None,
             snapshot: RollbackSnapshot {
                 target_info: "00".into(),
@@ -918,15 +917,15 @@ mod tests {
     #[test]
     fn validator_rejects_wrong_pending_or_proc_pair() {
         let err = validate_rollback_plan(&tamper("TMPPSV1-proof-buckets", serde_json::json!([88, 89, 1]))).unwrap_err();
-        assert!(err.to_string().contains("frozen post_target_generations set"), "{err}");
+        assert!(err.to_string().contains("frozen ids set"), "{err}");
         let err = validate_rollback_plan(&tamper(
             "pending_id_to_pending_proc_id_table",
             serde_json::json!([[88, "99999"], [89, "10089"], [94, "10094"]]),
         ))
         .unwrap_err();
-        assert!(err.to_string().contains("not a post_target_generations pair"), "{err}");
+        assert!(err.to_string().contains("not an ids pair"), "{err}");
         let err = validate_rollback_plan(&tamper("guta_reward_tag_tree_table", serde_json::json!([88, 7]))).unwrap_err();
-        assert!(err.to_string().contains("frozen post_target_generations set"), "{err}");
+        assert!(err.to_string().contains("frozen ids set"), "{err}");
     }
 
     #[test]

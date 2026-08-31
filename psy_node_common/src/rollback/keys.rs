@@ -3,7 +3,7 @@
 use psy_core::user_id::get_user_id_from_user_registration_id;
 
 use crate::rollback::generator::BackupKeySource;
-use crate::rollback::plan::{PostTargetGeneration, RollbackRole};
+use crate::rollback::plan::{RollbackIds, RollbackRole};
 
 const FFS_SIMPLE_MERKLE_NODE: usize = 41;
 const FFS_USER_LEAF: usize = 104;
@@ -155,9 +155,9 @@ fn parse_user_leaf_ids(ffs: &[u8]) -> anyhow::Result<Vec<u64>> {
 pub fn user_leaf_and_pubkey_keys(
     backups: &BackupKeySource,
     role: RollbackRole,
-    post_target_generations: &[PostTargetGeneration],
+    ids: &[RollbackIds],
 ) -> anyhow::Result<(Vec<(u64, u64)>, Vec<(u64, u64)>)> {
-    let pid_to_cp: std::collections::HashMap<u64, u64> = post_target_generations
+    let pid_to_cp: std::collections::HashMap<u64, u64> = ids
         .iter()
         .filter_map(|entry| entry.checkpoint_id.map(|cp| (entry.pending_id, cp)))
         .collect();
@@ -189,12 +189,12 @@ pub fn user_leaf_and_pubkey_keys(
 pub fn contract_metadata_keys(
     backups: &BackupKeySource,
     role: RollbackRole,
-    post_target_generations: &[PostTargetGeneration],
+    ids: &[RollbackIds],
 ) -> anyhow::Result<Vec<(u64, u64)>> {
     if role != RollbackRole::Coordinator {
         return Ok(Vec::new());
     }
-    let pid_to_cp: std::collections::HashMap<u64, u64> = post_target_generations
+    let pid_to_cp: std::collections::HashMap<u64, u64> = ids
         .iter()
         .filter_map(|e| e.checkpoint_id.map(|cp| (e.pending_id, cp)))
         .collect();
@@ -260,9 +260,9 @@ pub fn imt_key_index_keys(
 pub fn global_user_tree_keys(
     backups: &BackupKeySource,
     role: RollbackRole,
-    post_target_generations: &[PostTargetGeneration],
+    ids: &[RollbackIds],
 ) -> anyhow::Result<Vec<MerkleNodeKey>> {
-    let pid_to_cp: std::collections::HashMap<u64, u64> = post_target_generations
+    let pid_to_cp: std::collections::HashMap<u64, u64> = ids
         .iter()
         .filter_map(|e| e.checkpoint_id.map(|cp| (e.pending_id, cp)))
         .collect();
@@ -310,12 +310,12 @@ pub fn global_checkpoint_tree_keys(
 pub fn user_registration_tree_keys(
     backups: &BackupKeySource,
     role: RollbackRole,
-    post_target_generations: &[PostTargetGeneration],
+    ids: &[RollbackIds],
 ) -> anyhow::Result<Vec<MerkleNodeKey>> {
     if role != RollbackRole::Coordinator {
         return Ok(Vec::new());
     }
-    let pid_to_cp: std::collections::HashMap<u64, u64> = post_target_generations.iter().filter_map(|e| e.checkpoint_id.map(|cp| (e.pending_id, cp))).collect();
+    let pid_to_cp: std::collections::HashMap<u64, u64> = ids.iter().filter_map(|e| e.checkpoint_id.map(|cp| (e.pending_id, cp))).collect();
     let mut out = Vec::new();
     for (pending_id, backup) in &backups.register_user {
         let Some(&checkpoint_id) = pid_to_cp.get(pending_id) else { continue };
@@ -330,12 +330,12 @@ pub fn user_registration_tree_keys(
 pub fn global_contract_tree_keys(
     backups: &BackupKeySource,
     role: RollbackRole,
-    post_target_generations: &[PostTargetGeneration],
+    ids: &[RollbackIds],
 ) -> anyhow::Result<Vec<MerkleNodeKey>> {
     if role != RollbackRole::Coordinator {
         return Ok(Vec::new());
     }
-    let pid_to_cp: std::collections::HashMap<u64, u64> = post_target_generations
+    let pid_to_cp: std::collections::HashMap<u64, u64> = ids
         .iter()
         .filter_map(|e| e.checkpoint_id.map(|cp| (e.pending_id, cp)))
         .collect();
@@ -358,12 +358,12 @@ pub fn global_contract_tree_keys(
 pub fn user_contract_tree_keys(
     backups: &BackupKeySource,
     role: RollbackRole,
-    post_target_generations: &[PostTargetGeneration],
+    ids: &[RollbackIds],
 ) -> anyhow::Result<Vec<SingleTreeMerkleKey>> {
     if role != RollbackRole::Realm {
         return Ok(Vec::new());
     }
-    let pid_to_cp: std::collections::HashMap<u64, u64> = post_target_generations
+    let pid_to_cp: std::collections::HashMap<u64, u64> = ids
         .iter()
         .filter_map(|e| e.checkpoint_id.map(|cp| (e.pending_id, cp)))
         .collect();
@@ -379,12 +379,12 @@ pub fn user_contract_tree_keys(
 pub fn contract_function_tree_keys(
     backups: &BackupKeySource,
     role: RollbackRole,
-    post_target_generations: &[PostTargetGeneration],
+    ids: &[RollbackIds],
 ) -> anyhow::Result<Vec<SingleTreeMerkleKey>> {
     if role != RollbackRole::Coordinator {
         return Ok(Vec::new());
     }
-    let pid_to_cp: std::collections::HashMap<u64, u64> = post_target_generations
+    let pid_to_cp: std::collections::HashMap<u64, u64> = ids
         .iter()
         .filter_map(|e| e.checkpoint_id.map(|cp| (e.pending_id, cp)))
         .collect();
@@ -405,12 +405,12 @@ pub fn contract_function_tree_keys(
 pub fn contract_state_tree_keys(
     backups: &BackupKeySource,
     role: RollbackRole,
-    post_target_generations: &[PostTargetGeneration],
+    ids: &[RollbackIds],
 ) -> anyhow::Result<Vec<DoubleTreeMerkleKey>> {
     if role != RollbackRole::Realm {
         return Ok(Vec::new());
     }
-    let pid_to_cp: std::collections::HashMap<u64, u64> = post_target_generations
+    let pid_to_cp: std::collections::HashMap<u64, u64> = ids
         .iter()
         .filter_map(|e| e.checkpoint_id.map(|cp| (e.pending_id, cp)))
         .collect();
@@ -426,12 +426,12 @@ pub fn contract_state_tree_keys(
 pub fn imt_leaf_keys(
     backups: &BackupKeySource,
     role: RollbackRole,
-    post_target_generations: &[PostTargetGeneration],
+    ids: &[RollbackIds],
 ) -> anyhow::Result<Vec<ImtLeafKey>> {
     if role != RollbackRole::Realm {
         return Ok(Vec::new());
     }
-    let pid_to_cp: std::collections::HashMap<u64, u64> = post_target_generations
+    let pid_to_cp: std::collections::HashMap<u64, u64> = ids
         .iter()
         .filter_map(|e| e.checkpoint_id.map(|cp| (e.pending_id, cp)))
         .collect();
@@ -467,7 +467,7 @@ pub fn processor_state_singleton_fields(realm_id: u64, realm_sub_id: u64) -> any
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rollback::collect_post_target_generations;
+    use crate::rollback::collect_ids;
     use crate::rollback::generator::{BackupKeySource, CoordinatorGutaBackup, RealmEndCapBackup, RegisterUserBackup, RollbackStateReader};
 
     #[test]
@@ -494,18 +494,18 @@ mod tests {
         let mut public_key_ffs = 77u64.to_le_bytes().to_vec(); public_key_ffs.extend_from_slice(&[3u8; 64]);
         let mut backups = BackupKeySource::default();
         backups.register_user.insert(88, RegisterUserBackup { start_next_user_id: 77, new_user_public_keys_ffs: public_key_ffs, new_public_key_hash_to_user_id_rows_ffs: vec![], update_user_registration_tree_nodes_ffs: vec![] });
-        let post_target_generations = vec![PostTargetGeneration { checkpoint_id: Some(200), pending_id: 88, proc_checkpoint_unique_id: 10088 }];
-        let (leaves, public_keys) = user_leaf_and_pubkey_keys(&backups, RollbackRole::Coordinator, &post_target_generations).unwrap(); assert!(leaves.is_empty()); assert_eq!(public_keys, vec![(77, 200)]);
+        let ids = vec![RollbackIds { checkpoint_id: Some(200), pending_id: 88, proc_id: 10088 }];
+        let (leaves, public_keys) = user_leaf_and_pubkey_keys(&backups, RollbackRole::Coordinator, &ids).unwrap(); assert!(leaves.is_empty()); assert_eq!(public_keys, vec![(77, 200)]);
         let mut leaf_ffs = vec![0u8; FFS_USER_LEAF]; leaf_ffs[96..104].copy_from_slice(&77u64.to_le_bytes()); backups.realm_end_cap.insert(88, realm_backup(leaf_ffs));
-        let (leaves, public_keys) = user_leaf_and_pubkey_keys(&backups, RollbackRole::Realm, &post_target_generations).unwrap(); assert_eq!(leaves, vec![(77, 200)]); assert!(public_keys.is_empty());
+        let (leaves, public_keys) = user_leaf_and_pubkey_keys(&backups, RollbackRole::Realm, &ids).unwrap(); assert_eq!(leaves, vec![(77, 200)]); assert!(public_keys.is_empty());
     }
 
     #[test]
     fn empty_imt_ffs_proves_no_updates() {
         let mut no_updates = BackupKeySource::default(); no_updates.realm_end_cap.insert(88, realm_backup(vec![]));
-        assert!(imt_leaf_keys(&no_updates, RollbackRole::Realm, &[PostTargetGeneration { checkpoint_id: Some(200), pending_id: 88, proc_checkpoint_unique_id: 10088 }]).unwrap().is_empty());
+        assert!(imt_leaf_keys(&no_updates, RollbackRole::Realm, &[RollbackIds { checkpoint_id: Some(200), pending_id: 88, proc_id: 10088 }]).unwrap().is_empty());
         let mut uncommitted = BackupKeySource::default(); uncommitted.realm_end_cap.insert(88, realm_backup(vec![]));
-        assert!(imt_leaf_keys(&uncommitted, RollbackRole::Realm, &[PostTargetGeneration { checkpoint_id: None, pending_id: 88, proc_checkpoint_unique_id: 10088 }]).unwrap().is_empty());
+        assert!(imt_leaf_keys(&uncommitted, RollbackRole::Realm, &[RollbackIds { checkpoint_id: None, pending_id: 88, proc_id: 10088 }]).unwrap().is_empty());
     }
 
     #[test]
@@ -518,7 +518,7 @@ mod tests {
     fn unmapped_pending_never_emits_checkpoint_zero_tree_key() {
         let mut ffs = vec![3u8]; ffs.extend_from_slice(&9u64.to_le_bytes()); ffs.extend_from_slice(&[1u8; 32]);
         let mut backups = BackupKeySource::default(); backups.coordinator_guta.insert(94, CoordinatorGutaBackup { update_global_user_tree_nodes_ffs: ffs });
-        assert!(global_user_tree_keys(&backups, RollbackRole::Coordinator, &[PostTargetGeneration { checkpoint_id: None, pending_id: 94, proc_checkpoint_unique_id: 10094 }]).unwrap().is_empty());
+        assert!(global_user_tree_keys(&backups, RollbackRole::Coordinator, &[RollbackIds { checkpoint_id: None, pending_id: 94, proc_id: 10094 }]).unwrap().is_empty());
     }
 
     struct MockRollbackStateReader { cp_to_pending: std::collections::HashMap<u64, u64>, pending_to_cp: std::collections::HashMap<u64, u64>, pending_to_proc: std::collections::HashMap<u64, u128> }
@@ -533,21 +533,21 @@ mod tests {
         async fn global_checkpoint_tree_delete_path_keys(&self, _checkpoint_id: u64) -> anyhow::Result<Vec<MerkleNodeKey>> { Ok(Vec::new()) }
     }
     #[tokio::test]
-    async fn post_target_generations_walk_to_counter_high_water() {
+    async fn collect_ids_walks_to_counter_high_water() {
         let reader = MockRollbackStateReader { cp_to_pending: [(197, 87)].into_iter().collect(), pending_to_cp: [(88, 200)].into_iter().collect(), pending_to_proc: [(88, 10088u128), (94, 10094)].into_iter().collect() };
-        let branch = collect_post_target_generations(&reader, 199, 104).await.unwrap(); assert_eq!(branch.iter().map(|entry| (entry.pending_id, entry.checkpoint_id)).collect::<Vec<_>>(), vec![(88, Some(200)), (94, None)]);
+        let branch = collect_ids(&reader, 199, 104).await.unwrap(); assert_eq!(branch.iter().map(|entry| (entry.pending_id, entry.checkpoint_id)).collect::<Vec<_>>(), vec![(88, Some(200)), (94, None)]);
     }
 
     #[tokio::test]
-    async fn post_target_generations_at_genesis_target_freeze_all_post_genesis_pendings() {
+    async fn collect_ids_at_genesis_target_freezes_all_post_genesis_pendings() {
         let reader = MockRollbackStateReader {
             cp_to_pending: std::collections::HashMap::new(),
             pending_to_cp: [(1, 1), (3, 3)].into_iter().collect(),
             pending_to_proc: [(1, 1001u128), (2, 1002), (3, 1003), (4, 1004)].into_iter().collect(),
         };
-        let branch = collect_post_target_generations(&reader, 0, 4).await.unwrap();
+        let branch = collect_ids(&reader, 0, 4).await.unwrap();
         assert_eq!(
-            branch.iter().map(|entry| (entry.pending_id, entry.checkpoint_id, entry.proc_checkpoint_unique_id)).collect::<Vec<_>>(),
+            branch.iter().map(|entry| (entry.pending_id, entry.checkpoint_id, entry.proc_id)).collect::<Vec<_>>(),
             vec![(1, Some(1), 1001), (2, None, 1002), (3, Some(3), 1003), (4, None, 1004)]
         );
     }

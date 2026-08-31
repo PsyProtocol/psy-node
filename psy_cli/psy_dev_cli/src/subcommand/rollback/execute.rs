@@ -209,7 +209,7 @@ pub(super) async fn execute(
 async fn remove_backup_paths(config: &ProcessorConfig, plan: &RollbackPlan) -> anyhow::Result<()> {
     match config {
         ProcessorConfig::Coordinator(c) => {
-            for entry in &plan.post_target_generations {
+            for entry in &plan.ids {
                 let pending_id = entry.pending_id;
                 let realm_id = c.coordinator_id;
                 let realm_sub_id = u64::from(c.coordinator_sub_id);
@@ -246,7 +246,7 @@ async fn remove_backup_paths(config: &ProcessorConfig, plan: &RollbackPlan) -> a
             }
         }
         ProcessorConfig::Realm(c) => {
-            for entry in &plan.post_target_generations {
+            for entry in &plan.ids {
                 let path = get_new_realm_end_cap_gatherer_backup_file_path(
                     &c.get_guta_updates_backup_path(),
                     c.realm_id,
@@ -808,7 +808,7 @@ mod tests {
     use super::*;
     use psy_node_core::config::node_start_config::CoordinatorProcessorStartConfig;
     use psy_node_common::rollback::{
-        PostTargetGeneration, RollbackRole, RollbackSnapshot,
+        RollbackIds, RollbackRole, RollbackSnapshot,
     };
 
     #[tokio::test]
@@ -840,10 +840,10 @@ mod tests {
             target_checkpoint_id: 0,
             latest_checkpoint_id: 0,
             latest_pending_id: 1,
-            post_target_generations: vec![PostTargetGeneration {
+            ids: vec![RollbackIds {
                 checkpoint_id: None,
                 pending_id: 1,
-                proc_checkpoint_unique_id: 1001,
+                proc_id: 1001,
             }],
             target_contract_state: None,
             snapshot: RollbackSnapshot {

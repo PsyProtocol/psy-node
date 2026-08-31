@@ -21,8 +21,8 @@ use psy_node_common::{
         realm::load_realm_memory_trees_from_db,
     },
     rollback::{
-        CoordinatorBackupRequirements, RollbackBackupDirectories,
-        RollbackBackupRequirementReader, RollbackPlan, RollbackPlanFromBackupPathsInput,
+        CoordinatorCheckpointInfo, RollbackBackupDirectories,
+        RollbackCheckpointInfoReader, RollbackPlan, RollbackPlanFromBackupPathsInput,
         RollbackSnapshot, RollbackStateReader, RollbackTempEnumerator, UserTransformParams,
         generate_rollback_plan_from_backup_paths,
     },
@@ -229,11 +229,11 @@ fn derive_checkpoint_tree_delete_path_keys(
 }
 
 #[async_trait]
-impl RollbackBackupRequirementReader for ScyllaRollbackStateReader {
-    async fn coordinator_backup_requirements(
+impl RollbackCheckpointInfoReader for ScyllaRollbackStateReader {
+    async fn coordinator_checkpoint_info(
         &self,
         checkpoint_id: u64,
-    ) -> anyhow::Result<CoordinatorBackupRequirements> {
+    ) -> anyhow::Result<CoordinatorCheckpointInfo> {
         let leaf = self
             .db
             .store
@@ -242,35 +242,33 @@ impl RollbackBackupRequirementReader for ScyllaRollbackStateReader {
                 Hash,
             >>(self.db.checkpoint_leaf_table.as_ref(), checkpoint_id)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("checkpoint leaf {checkpoint_id} is missing while deriving backup requirements"))?;
+            .ok_or_else(|| anyhow::anyhow!("checkpoint leaf {checkpoint_id} is missing while deriving checkpoint info"))?;
         let roots = self
             .db
             .store
             .db_select_one_kiv_value::<psy_data::v1::qdata::checkpoint::PQEDCheckpointGlobalStateRoots<Hash>>(
-                self.db.checkpoint_state_roots_table.as_ref(),
-                checkpoint_id,
+                self.db.checkpoint_state_roots_table.as_ref(), checkpoint_id,
             )
             .await?
-            .ok_or_else(|| anyhow::anyhow!("checkpoint state roots {checkpoint_id} are missing while deriving backup requirements"))?;
+            .ok_or_else(|| anyhow::anyhow!("checkpoint state roots {checkpoint_id} are missing while deriving checkpoint info"))?;
         let previous_roots = self
             .db
             .store
             .db_select_one_kiv_value::<psy_data::v1::qdata::checkpoint::PQEDCheckpointGlobalStateRoots<Hash>>(
-                self.db.checkpoint_state_roots_table.as_ref(),
-                checkpoint_id - 1,
+                self.db.checkpoint_state_roots_table.as_ref(), checkpoint_id - 1,
             )
             .await?
-            .ok_or_else(|| anyhow::anyhow!("previous checkpoint state roots {} are missing while deriving backup requirements", checkpoint_id - 1))?;
+            .ok_or_else(|| anyhow::anyhow!("previous checkpoint state roots {} are missing while deriving checkpoint info", checkpoint_id - 1))?;
         ensure!(
             roots.qfhash::<Hasher>() == leaf.global_chain_root,
             "checkpoint {checkpoint_id} state roots do not match checkpoint leaf"
         );
-        Ok(CoordinatorBackupRequirements {
-            register_user: leaf.stats.pm_jobs_completed.register_users_completed.to_u64_value() > 0,
-            deploy_contract: leaf.stats.pm_jobs_completed.deploy_contracts_completed.to_u64_value() > 0,
-            contract_changed: previous_roots.contract_tree_root != roots.contract_tree_root,
-            coordinator_guta: leaf.stats.pm_jobs_completed.gutas_completed.to_u64_value() > 0,
-            target_contract_root: roots.contract_tree_root.into_owned_32bytes(),
+        Ok(CoordinatorCheckpointInfo {
+            has_register_users: leaf.stats.pm_jobs_completed.register_users_completed.to_u64_value() > 0,
+            has_deploy_contracts: leaf.stats.pm_jobs_completed.deploy_contracts_completed.to_u64_value() > 0,
+            contract_root_changed: previous_roots.contract_tree_root != roots.contract_tree_root,
+            has_guta_updates: leaf.stats.pm_jobs_completed.gutas_completed.to_u64_value() > 0,
+            contract_root: roots.contract_tree_root.into_owned_32bytes(),
         })
     }
 }
@@ -322,7 +320,7 @@ pub async fn generate(
         latest_pending_id,
         state_reader: &state_reader,
         temp_enumerator: &temp_enumerator,
-        backup_requirement_reader: &state_reader,
+        checkpoint_info_reader: &state_reader,
         file_system: &file_system,
         backup_directories: &store.backups,
         global_user_tree: &mut global_user_tree,

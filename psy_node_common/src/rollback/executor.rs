@@ -565,7 +565,7 @@ mod tests {
     use super::*;
     use crate::rollback::generator::{api_for_table, EMPTY_SCHEMA_TABLES, FINAL_TABLES, STAGE1_TABLES, STAGE2_TABLES, STAGE3_TABLES};
     use crate::rollback::plan::{
-        rollback_nats_consumer_kinds, PostTargetGeneration, RollbackRole, RollbackSnapshot,
+        rollback_nats_consumer_kinds, RollbackIds, RollbackRole, RollbackSnapshot,
     };
     use std::collections::HashSet;
     use std::sync::Mutex;
@@ -899,7 +899,7 @@ mod tests {
         target: u64,
         latest: u64,
         latest_pending_id: u64,
-        post_target_generations: Vec<PostTargetGeneration>,
+        ids: Vec<RollbackIds>,
     ) -> RollbackPlan {
         let checkpoint_ids: Vec<u64> = if target >= latest {
             Vec::new()
@@ -907,9 +907,9 @@ mod tests {
             (target + 1..=latest).collect()
         };
         let checkpoint_set: HashSet<u64> = checkpoint_ids.iter().copied().collect();
-        let mapped_checkpoint_ids: Vec<u64> = post_target_generations.iter().filter_map(|entry| entry.checkpoint_id).collect();
+        let mapped_checkpoint_ids: Vec<u64> = ids.iter().filter_map(|entry| entry.checkpoint_id).collect();
         let mapped_set: HashSet<u64> = mapped_checkpoint_ids.iter().copied().collect();
-        let pending_ids: Vec<u64> = post_target_generations.iter().map(|entry| entry.pending_id).collect();
+        let pending_ids: Vec<u64> = ids.iter().map(|entry| entry.pending_id).collect();
         let pending_set: HashSet<u64> = pending_ids.iter().copied().collect();
         let realm_le = u32::try_from(realm_id).expect("fixture realm_id fits u32").to_le_bytes();
         let sub_le = u16::try_from(realm_sub_id).expect("fixture realm_sub_id fits u16").to_le_bytes();
@@ -921,10 +921,10 @@ mod tests {
         let pending_json = serde_json::json!(pending_ids);
         let checkpoint_json = serde_json::json!(checkpoint_ids);
         let mapped_json = serde_json::json!(mapped_checkpoint_ids);
-        let proc_json = serde_json::json!(post_target_generations
+        let proc_json = serde_json::json!(ids
             .iter()
             .map(|entry| {
-                serde_json::json!([entry.pending_id, entry.proc_checkpoint_unique_id.to_string()])
+                serde_json::json!([entry.pending_id, entry.proc_id.to_string()])
             })
             .collect::<Vec<_>>());
         let checkpointed = serde_json::json!(checkpoint_ids
@@ -973,7 +973,7 @@ mod tests {
             target_checkpoint_id: target,
             latest_checkpoint_id: latest,
             latest_pending_id,
-            post_target_generations,
+            ids,
             target_contract_state: None,
             snapshot: RollbackSnapshot {
                 target_info: "00".into(),
@@ -1055,9 +1055,9 @@ mod tests {
             210,
             104,
             vec![
-                PostTargetGeneration { checkpoint_id: Some(200), pending_id: 88, proc_checkpoint_unique_id: 10088 },
-                PostTargetGeneration { checkpoint_id: Some(201), pending_id: 89, proc_checkpoint_unique_id: 10089 },
-                PostTargetGeneration { checkpoint_id: None, pending_id: 94, proc_checkpoint_unique_id: 10094 },
+                RollbackIds { checkpoint_id: Some(200), pending_id: 88, proc_id: 10088 },
+                RollbackIds { checkpoint_id: Some(201), pending_id: 89, proc_id: 10089 },
+                RollbackIds { checkpoint_id: None, pending_id: 94, proc_id: 10094 },
             ],
         )
     }
@@ -1071,10 +1071,10 @@ mod tests {
             60,
             777,
             vec![
-                PostTargetGeneration { checkpoint_id: Some(52), pending_id: 500, proc_checkpoint_unique_id: 50500 },
-                PostTargetGeneration { checkpoint_id: Some(55), pending_id: 501, proc_checkpoint_unique_id: 50501 },
-                PostTargetGeneration { checkpoint_id: None, pending_id: 600, proc_checkpoint_unique_id: 50600 },
-                PostTargetGeneration { checkpoint_id: Some(60), pending_id: 601, proc_checkpoint_unique_id: 50601 },
+                RollbackIds { checkpoint_id: Some(52), pending_id: 500, proc_id: 50500 },
+                RollbackIds { checkpoint_id: Some(55), pending_id: 501, proc_id: 50501 },
+                RollbackIds { checkpoint_id: None, pending_id: 600, proc_id: 50600 },
+                RollbackIds { checkpoint_id: Some(60), pending_id: 601, proc_id: 50601 },
             ],
         )
     }
@@ -1120,11 +1120,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn realm_completes_with_independent_post_target_generations() {
+    async fn realm_completes_with_independent_ids() {
         let mut plan = realm_plan();
         assert_eq!(plan.role, RollbackRole::Realm);
         assert_ne!(plan.realm_id, 0, "Realm RP must use a nonzero realm_id");
-        let post_target_generations_before = plan.post_target_generations.clone();
+        let ids_before = plan.ids.clone();
         let contract_state_before = plan.target_contract_state.clone();
         let store = FakeStore::new(plan.latest_checkpoint_id, plan.latest_pending_id);
         let progress = FakeProgressStore::new();
@@ -1134,7 +1134,7 @@ mod tests {
         assert_eq!(store.applied(), data_phase_tables());
         assert_eq!(store.marker(), plan.target_checkpoint_id);
         assert_eq!(store.counter(), plan.latest_pending_id);
-        assert_eq!(plan.post_target_generations, post_target_generations_before, "post_target_generations is frozen input and must not be mutated");
+        assert_eq!(plan.ids, ids_before, "ids are frozen input and must not be mutated");
         assert_eq!(plan.target_contract_state, contract_state_before);
         assert!(plan.phases.iter().all(|phase| phase.status == RollbackPhaseStatus::Completed));
     }
@@ -1360,8 +1360,8 @@ mod tests {
             2,
             2,
             vec![
-                PostTargetGeneration { checkpoint_id: Some(1), pending_id: 1, proc_checkpoint_unique_id: 1001 },
-                PostTargetGeneration { checkpoint_id: Some(2), pending_id: 2, proc_checkpoint_unique_id: 1002 },
+                RollbackIds { checkpoint_id: Some(1), pending_id: 1, proc_id: 1001 },
+                RollbackIds { checkpoint_id: Some(2), pending_id: 2, proc_id: 1002 },
             ],
         );
         let store = FakeStore::new(plan.latest_checkpoint_id, plan.latest_pending_id);
@@ -1462,7 +1462,7 @@ mod tests {
         let err = execute_rollback_plan(&store, &progress, &mut plan).await.unwrap_err();
 
         assert!(err.to_string().contains("checkpoint_leaf_table"), "{err}");
-        assert!(err.to_string().contains("must equal the frozen post_target_generations set"), "{err}");
+        assert!(err.to_string().contains("must equal the frozen ids set"), "{err}");
         assert!(store.events().is_empty(), "validation must reject before executor I/O");
         assert_eq!(store.marker_writes(), 0);
         assert!(progress.snapshots().is_empty());

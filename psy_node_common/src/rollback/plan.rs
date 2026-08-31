@@ -62,11 +62,11 @@ pub enum RollbackPhaseStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PostTargetGeneration {
+pub struct RollbackIds {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint_id: Option<u64>,
     pub pending_id: u64,
-    pub proc_checkpoint_unique_id: u128,
+    pub proc_id: u128,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,7 +123,7 @@ pub struct RollbackPlan {
     pub target_checkpoint_id: u64,
     pub latest_checkpoint_id: u64,
     pub latest_pending_id: u64,
-    pub post_target_generations: Vec<PostTargetGeneration>,
+    pub ids: Vec<RollbackIds>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_contract_state: Option<TargetContractState>,
     pub snapshot: RollbackSnapshot,
@@ -139,17 +139,17 @@ impl RollbackPlan {
     }
 
     pub fn mapped_checkpoint_ids(&self) -> Vec<u64> {
-        self.post_target_generations.iter().filter_map(|entry| entry.checkpoint_id).collect()
+        self.ids.iter().filter_map(|entry| entry.checkpoint_id).collect()
     }
 
     pub fn pending_ids(&self) -> Vec<u64> {
-        self.post_target_generations.iter().map(|e| e.pending_id).collect()
+        self.ids.iter().map(|e| e.pending_id).collect()
     }
 
     pub fn proc_ids(&self) -> Vec<u128> {
-        self.post_target_generations
+        self.ids
             .iter()
-            .map(|e| e.proc_checkpoint_unique_id)
+            .map(|e| e.proc_id)
             .collect()
     }
 }
@@ -225,10 +225,10 @@ mod tests {
             target_checkpoint_id: 199,
             latest_checkpoint_id: 210,
             latest_pending_id: 104,
-            post_target_generations: vec![
-                PostTargetGeneration { checkpoint_id: Some(200), pending_id: 88, proc_checkpoint_unique_id: 10088 },
-                PostTargetGeneration { checkpoint_id: Some(201), pending_id: 89, proc_checkpoint_unique_id: 10089 },
-                PostTargetGeneration { checkpoint_id: None, pending_id: 94, proc_checkpoint_unique_id: 10094 },
+            ids: vec![
+                RollbackIds { checkpoint_id: Some(200), pending_id: 88, proc_id: 10088 },
+                RollbackIds { checkpoint_id: Some(201), pending_id: 89, proc_id: 10089 },
+                RollbackIds { checkpoint_id: None, pending_id: 94, proc_id: 10094 },
             ],
             snapshot: RollbackSnapshot {
                 target_info: "010203".into(),
@@ -309,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn post_target_generations_helpers() {
+    fn ids_helpers() {
         let plan = sample_plan();
         assert_eq!(plan.checkpoint_ids(), (200..=210).collect::<Vec<_>>());
         assert_eq!(plan.mapped_checkpoint_ids(), vec![200, 201]);
@@ -318,12 +318,24 @@ mod tests {
     }
 
     #[test]
-    fn null_checkpoint_serializes_as_null() {
-        let entry = PostTargetGeneration { checkpoint_id: None, pending_id: 7, proc_checkpoint_unique_id: 1007 };
+    fn json_surface_is_exact_and_old_keys_are_rejected() {
+        let plan_json = serde_json::to_value(sample_plan()).unwrap();
+        assert_eq!(plan_json["ids"][0], serde_json::json!({ "checkpoint_id": 200, "pending_id": 88, "proc_id": 10088 }));
+        let mut old_plan = plan_json.as_object().unwrap().clone();
+        old_plan.insert("post_target_generations".into(), serde_json::json!([]));
+        assert!(serde_json::from_value::<RollbackPlan>(serde_json::Value::Object(old_plan)).is_err());
+        let old_ids = serde_json::json!({ "pending_id": 88, "proc_id": 10088, "proc_checkpoint_unique_id": 10088 });
+        assert!(serde_json::from_value::<RollbackIds>(old_ids).is_err());
+    }
+
+    #[test]
+    fn absent_checkpoint_id_is_omitted() {
+        let entry = RollbackIds { checkpoint_id: None, pending_id: 7, proc_id: 1007 };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("\"pending_id\""));
+        assert!(json.contains("\"proc_id\""));
         assert!(!json.contains("\"checkpoint_id\""));
-        let back: PostTargetGeneration = serde_json::from_str(&json).unwrap();
+        let back: RollbackIds = serde_json::from_str(&json).unwrap();
         assert_eq!(entry, back);
     }
 

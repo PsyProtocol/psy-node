@@ -21,7 +21,7 @@ use crate::{
     realm::processor::gatherers::realm_end_cap_gatherer::{get_new_realm_end_cap_gatherer_backup_file_path, read_realm_end_cap_gatherer_backup_file},
     rollback::{
         keys::{self, MerkleNodeKey, TempFieldKey, UserTransformParams},
-        plan::{PostTargetGeneration, RollbackPhase, RollbackPhaseStatus, RollbackPlan, RollbackRole, RollbackSnapshot, RollbackTempValueSnapshot, TargetContractState},
+        plan::{RollbackIds, RollbackPhase, RollbackPhaseStatus, RollbackPlan, RollbackRole, RollbackSnapshot, RollbackTempValueSnapshot, TargetContractState},
     },
 };
 
@@ -56,25 +56,20 @@ pub trait RollbackTempEnumerator: Send + Sync {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct CoordinatorBackupRequirements {
-    pub register_user: bool,
-    pub deploy_contract: bool,
-    pub contract_changed: bool,
-    pub coordinator_guta: bool,
-    pub target_contract_root: [u8; 32],
+pub struct CoordinatorCheckpointInfo {
+    pub has_register_users: bool,
+    pub has_deploy_contracts: bool,
+    pub contract_root_changed: bool,
+    pub has_guta_updates: bool,
+    pub contract_root: [u8; 32],
 }
 
-fn coordinator_contract_backup_requirements(
-    requirements: &CoordinatorBackupRequirements,
-) -> (bool, bool) {
-    (requirements.deploy_contract, requirements.contract_changed)
-}
 #[async_trait::async_trait]
-pub trait RollbackBackupRequirementReader: Send + Sync {
-    async fn coordinator_backup_requirements(
+pub trait RollbackCheckpointInfoReader: Send + Sync {
+    async fn coordinator_checkpoint_info(
         &self,
         checkpoint_id: u64,
-    ) -> anyhow::Result<CoordinatorBackupRequirements>;
+    ) -> anyhow::Result<CoordinatorCheckpointInfo>;
 }
 
 #[derive(Default, Clone)]
@@ -184,7 +179,7 @@ pub struct RollbackPlanFromBackupPathsInput<'a, N: QNetworkTypesConfig, FS: Toki
     pub latest_pending_id: u64,
     pub state_reader: &'a (dyn RollbackStateReader + 'a),
     pub temp_enumerator: &'a (dyn RollbackTempEnumerator + 'a),
-    pub backup_requirement_reader: &'a (dyn RollbackBackupRequirementReader + 'a),
+    pub checkpoint_info_reader: &'a (dyn RollbackCheckpointInfoReader + 'a),
     pub file_system: &'a FS,
     pub backup_directories: &'a RollbackBackupDirectories,
     pub global_user_tree: &'a mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
@@ -196,16 +191,16 @@ pub struct RollbackPlanFromBackupPathsInput<'a, N: QNetworkTypesConfig, FS: Toki
     pub target_contract_state: Option<TargetContractState>,
 }
 
-pub async fn collect_post_target_generations(
+pub async fn collect_ids(
     reader: &dyn RollbackStateReader,
     target_checkpoint_id: u64,
     latest_pending_id: u64,
-) -> anyhow::Result<Vec<PostTargetGeneration>> {
+) -> anyhow::Result<Vec<RollbackIds>> {
     let boundary_pending = find_last_mapped_pending_at_or_before(reader, target_checkpoint_id).await?;
 
-    let mut entries = Vec::new();
+    let mut ids = Vec::new();
     if latest_pending_id == 0 {
-        return Ok(entries);
+        return Ok(ids);
     }
     let start = boundary_pending.saturating_add(1);
     for pending_id in start..=latest_pending_id {
@@ -213,13 +208,9 @@ pub async fn collect_post_target_generations(
             continue;
         };
         let checkpoint_id = reader.checkpoint_id_for_pending(pending_id).await?;
-        entries.push(PostTargetGeneration {
-            checkpoint_id,
-            pending_id,
-            proc_checkpoint_unique_id: proc_id,
-        });
+        ids.push(RollbackIds { checkpoint_id, pending_id, proc_id });
     }
-    Ok(entries)
+    Ok(ids)
 }
 
 async fn find_last_mapped_pending_at_or_before(
@@ -467,7 +458,7 @@ pub async fn build_phases(
         .collect();
     phases.push(pending_phase("checkpointed_object_table", serde_json::Value::Array(checkpointed_object_keys)));
 
-    let (user_leaf_keys, pubkey_keys) = keys::user_leaf_and_pubkey_keys(backups, role, &plan.post_target_generations)?;
+    let (user_leaf_keys, pubkey_keys) = keys::user_leaf_and_pubkey_keys(backups, role, &plan.ids)?;
     phases.push(pending_phase(
         "user_leaf_table",
         serde_json::Value::Array(user_leaf_keys.iter().map(|(user_id, checkpoint_id)| json!([user_id, checkpoint_id])).collect()),
@@ -477,7 +468,7 @@ pub async fn build_phases(
         serde_json::Value::Array(pubkey_keys.iter().map(|(user_id, checkpoint_id)| json!([user_id, checkpoint_id])).collect()),
     ));
 
-    let contract_keys = keys::contract_metadata_keys(backups, role, &plan.post_target_generations)?;
+    let contract_keys = keys::contract_metadata_keys(backups, role, &plan.ids)?;
     phases.push(pending_phase(
         "contract_state_tree_height_table",
         serde_json::Value::Array(contract_keys.iter().map(|(c, cp)| json!([c, cp])).collect()),
@@ -544,7 +535,7 @@ pub async fn build_phases(
         json!([]),
     ));
 
-    let gu = keys::global_user_tree_keys(backups, role, &plan.post_target_generations)?;
+    let gu = keys::global_user_tree_keys(backups, role, &plan.ids)?;
     phases.push(pending_phase(
         "global_user_tree_table",
         serde_json::Value::Array(gu.iter().map(|n| json!([n.level, n.index, n.checkpoint_id])).collect()),
@@ -554,27 +545,27 @@ pub async fn build_phases(
         "global_checkpoint_tree_table",
         serde_json::Value::Array(gck.iter().map(|n| json!([n.level, n.index, n.checkpoint_id])).collect()),
     ));
-    let ur = keys::user_registration_tree_keys(backups, role, &plan.post_target_generations)?;
+    let ur = keys::user_registration_tree_keys(backups, role, &plan.ids)?;
     phases.push(pending_phase(
         "user_registration_tree_table",
         serde_json::Value::Array(ur.iter().map(|n| json!([n.level, n.index, n.checkpoint_id])).collect()),
     ));
-    let gc = keys::global_contract_tree_keys(backups, role, &plan.post_target_generations)?;
+    let gc = keys::global_contract_tree_keys(backups, role, &plan.ids)?;
     phases.push(pending_phase(
         "global_contract_tree_table",
         serde_json::Value::Array(gc.iter().map(|n| json!([n.level, n.index, n.checkpoint_id])).collect()),
     ));
-    let uc = keys::user_contract_tree_keys(backups, role, &plan.post_target_generations)?;
+    let uc = keys::user_contract_tree_keys(backups, role, &plan.ids)?;
     phases.push(pending_phase(
         "user_contract_tree_table",
         serde_json::Value::Array(uc.iter().map(|n| json!([n.tree_id, n.level, n.index, n.checkpoint_id])).collect()),
     ));
-    let cf = keys::contract_function_tree_keys(backups, role, &plan.post_target_generations)?;
+    let cf = keys::contract_function_tree_keys(backups, role, &plan.ids)?;
     phases.push(pending_phase(
         "contract_function_tree_table",
         serde_json::Value::Array(cf.iter().map(|n| json!([n.tree_id, n.level, n.index, n.checkpoint_id])).collect()),
     ));
-    let cs = keys::contract_state_tree_keys(backups, role, &plan.post_target_generations)?;
+    let cs = keys::contract_state_tree_keys(backups, role, &plan.ids)?;
     phases.push(pending_phase(
         "contract_state_tree_table",
         serde_json::Value::Array(
@@ -583,7 +574,7 @@ pub async fn build_phases(
                 .collect(),
         ),
     ));
-    let iml = keys::imt_leaf_keys(backups, role, &plan.post_target_generations)?;
+    let iml = keys::imt_leaf_keys(backups, role, &plan.ids)?;
     phases.push(pending_phase(
         "imt_leaf_table",
         serde_json::Value::Array(
@@ -641,7 +632,7 @@ pub async fn build_phases(
 
 async fn derive_imt_append_index_snapshot(
     backups: &BackupKeySource,
-    post_target_generations: &[PostTargetGeneration],
+    ids: &[RollbackIds],
     target_checkpoint_id: u64,
     state_reader: &dyn RollbackStateReader,
 ) -> anyhow::Result<ImtAppendIndexSnapshot> {
@@ -653,14 +644,14 @@ async fn derive_imt_append_index_snapshot(
 
     let target_checkpoint_id = i64::try_from(target_checkpoint_id)
         .map_err(|_| anyhow::anyhow!("target checkpoint does not fit the IMT backend coordinate"))?;
-    let mut generations: Vec<_> = post_target_generations
+    let mut mapped_ids: Vec<_> = ids
         .iter()
-        .filter_map(|generation| generation.checkpoint_id.map(|checkpoint_id| (checkpoint_id, generation.pending_id)))
+        .filter_map(|id| id.checkpoint_id.map(|checkpoint_id| (checkpoint_id, id.pending_id)))
         .collect();
-    generations.sort_unstable();
+    mapped_ids.sort_unstable();
     let mut pairs = BTreeMap::<(i64, i64), PairState>::new();
 
-    for (checkpoint_id, pending_id) in generations {
+    for (checkpoint_id, pending_id) in mapped_ids {
         let backup = backups.realm_end_cap.get(&pending_id).ok_or_else(|| {
             anyhow::anyhow!("missing materialized Realm end-cap backup for committed pending {pending_id}")
         })?;
@@ -821,7 +812,7 @@ pub async fn generate_rollback_plan(input: &RollbackPlanInput<'_>) -> anyhow::Re
         );
     }
 
-    let post_target_generations = collect_post_target_generations(
+    let ids = collect_ids(
         input.state_reader,
         input.target_checkpoint_id,
         input.latest_pending_id,
@@ -832,7 +823,7 @@ pub async fn generate_rollback_plan(input: &RollbackPlanInput<'_>) -> anyhow::Re
         .map_err(|e| anyhow::anyhow!("realm_id {} does not fit u32: {}", input.realm_id, e))?;
     let realm_sub_u16 = u16::try_from(input.realm_sub_id)
         .map_err(|e| anyhow::anyhow!("realm_sub_id {} does not fit u16: {}", input.realm_sub_id, e))?;
-    let pending_ids: Vec<u64> = post_target_generations.iter().map(|e| e.pending_id).collect();
+    let pending_ids: Vec<u64> = ids.iter().map(|e| e.pending_id).collect();
     let (temp_fields, worker_reputation_fields) = materialize_temp_snapshot(
         input.temp_enumerator,
         realm_id_u32,
@@ -852,7 +843,7 @@ pub async fn generate_rollback_plan(input: &RollbackPlanInput<'_>) -> anyhow::Re
         target_checkpoint_id: input.target_checkpoint_id,
         latest_checkpoint_id: input.latest_checkpoint_id,
         latest_pending_id: input.latest_pending_id,
-        post_target_generations,
+        ids,
         target_contract_state: input.target_contract_state.clone().filter(|state| state.last_finalized_checkpoint_id == input.target_checkpoint_id),
         snapshot,
         phases: Vec::new(),
@@ -946,7 +937,7 @@ async fn collect_global_checkpoint_tree_delete_path_keys(
 
 async fn materialize_backups_from_paths<N, FS>(
     input: &mut RollbackPlanFromBackupPathsInput<'_, N, FS>,
-    post_target_generations: &[PostTargetGeneration],
+    ids: &[RollbackIds],
 ) -> anyhow::Result<BackupKeySource>
 where
     N: QNetworkTypesConfig,
@@ -961,27 +952,27 @@ where
         .await?,
         ..Default::default()
     };
-    for generation in post_target_generations {
-        let pending_id = generation.pending_id;
-        let is_committed = generation.checkpoint_id.is_some();
+    for id in ids {
+        let pending_id = id.pending_id;
+        let is_committed = id.checkpoint_id.is_some();
         if !is_committed {
             continue;
         }
-        let coordinator_requirements = if input.role == RollbackRole::Coordinator {
-            match generation.checkpoint_id {
+        let checkpoint_info = if input.role == RollbackRole::Coordinator {
+            match id.checkpoint_id {
                 Some(checkpoint_id) => input
-                    .backup_requirement_reader
-                    .coordinator_backup_requirements(checkpoint_id)
+                    .checkpoint_info_reader
+                    .coordinator_checkpoint_info(checkpoint_id)
                     .await?,
-                None => CoordinatorBackupRequirements::default(),
+                None => CoordinatorCheckpointInfo::default(),
             }
         } else {
-            CoordinatorBackupRequirements::default()
+            CoordinatorCheckpointInfo::default()
         };
         match input.role {
             RollbackRole::Coordinator => {
                 let register_path = get_new_register_user_gatherer_backup_file_path(&input.backup_directories.register_user, input.realm_id, input.realm_sub_id, pending_id);
-                if backup_file_available(input.file_system, &register_path, coordinator_requirements.register_user).await? {
+                if backup_file_available(input.file_system, &register_path, checkpoint_info.has_register_users).await? {
                     let register = read_register_user_gatherer_backup_file_path::<N, N::HasherBase, N::QHash, FS>(input.file_system, &register_path, input.user_registration_tree).await
                         .with_context(|| format!("failed to materialize register-user backup for pending {}", pending_id))?;
                     backups.register_user.insert(pending_id, RegisterUserBackup {
@@ -992,10 +983,8 @@ where
                     });
                 }
 
-                let (deploy_required, update_required) =
-                    coordinator_contract_backup_requirements(&coordinator_requirements);
                 let deploy_path = get_new_deploy_contract_gatherer_backup_file_path(&input.backup_directories.deploy_contract, input.realm_id, input.realm_sub_id, pending_id);
-                if backup_file_available(input.file_system, &deploy_path, deploy_required).await? {
+                if backup_file_available(input.file_system, &deploy_path, checkpoint_info.has_deploy_contracts).await? {
                     let deploy = read_deploy_contract_gatherer_backup_file_path::<N::HasherBase, N::QHash, N::F, FS>(
                         input.file_system, &deploy_path, 1usize << N::CONTRACT_FUNCTION_TREE_HEIGHT, input.global_contract_tree,
                     ).await.with_context(|| format!("failed to materialize deploy-contract backup for pending {}", pending_id))?;
@@ -1008,7 +997,7 @@ where
                 }
 
                 let update_path = get_new_update_contract_gatherer_backup_file_path(&input.backup_directories.update_contract, input.realm_id, input.realm_sub_id, pending_id);
-                if backup_file_available(input.file_system, &update_path, update_required).await? {
+                if backup_file_available(input.file_system, &update_path, checkpoint_info.contract_root_changed).await? {
                     let update = read_update_contract_gatherer_backup_file_path::<N::HasherBase, N::QHash, N::F, FS>(
                         input.file_system, &update_path, 1usize << N::CONTRACT_FUNCTION_TREE_HEIGHT, input.global_contract_tree,
                     ).await.with_context(|| format!("failed to materialize update-contract backup for pending {}", pending_id))?;
@@ -1018,21 +1007,21 @@ where
                         update_global_contract_tree_nodes_ffs: update.update_global_contract_tree_nodes_ffs,
                     });
                 }
-                if input.role == RollbackRole::Coordinator && coordinator_requirements.contract_changed {
+                if checkpoint_info.contract_root_changed {
                     let actual_root = input.global_contract_tree.get_root().into_owned_32bytes();
-                    if actual_root != coordinator_requirements.target_contract_root {
+                    if actual_root != checkpoint_info.contract_root {
                         anyhow::bail!(
                             "contract gatherer backups for pending {} reconstruct root {}, expected checkpoint root {}",
                             pending_id,
                             hex::encode(actual_root),
-                            hex::encode(coordinator_requirements.target_contract_root)
+                            hex::encode(checkpoint_info.contract_root)
                         );
                     }
                 }
 
                 let guta_path = get_new_coordinator_guta_update_gatherer_backup_file_path(&input.backup_directories.coordinator_guta, input.realm_id, input.realm_sub_id, pending_id);
                 let guta_path = guta_path.to_string_lossy();
-                if backup_file_available(input.file_system, &guta_path, coordinator_requirements.coordinator_guta).await? {
+                if backup_file_available(input.file_system, &guta_path, checkpoint_info.has_guta_updates).await? {
                     let guta = read_coordinator_guta_update_gatherer_backup_file::<N::HasherBase, N::QHash, N::F, FS>(input.file_system, &guta_path, input.global_user_tree).await
                         .with_context(|| format!("failed to materialize coordinator GUTA backup for pending {}", pending_id))?;
                     backups.coordinator_guta.insert(pending_id, CoordinatorGutaBackup { update_global_user_tree_nodes_ffs: guta.update_global_user_tree_nodes_ffs });
@@ -1074,12 +1063,12 @@ where
     N: QNetworkTypesConfig,
     FS: TokioLikeFileSystem + Send + Sync,
 {
-    let post_target_generations = collect_post_target_generations(input.state_reader, input.target_checkpoint_id, input.latest_pending_id).await?;
-    let backups = materialize_backups_from_paths(input, &post_target_generations).await?;
+    let ids = collect_ids(input.state_reader, input.target_checkpoint_id, input.latest_pending_id).await?;
+    let backups = materialize_backups_from_paths(input, &ids).await?;
     let imt_snapshot = if input.role == RollbackRole::Realm {
         derive_imt_append_index_snapshot(
             &backups,
-            &post_target_generations,
+            &ids,
             input.target_checkpoint_id,
             input.state_reader,
         )
@@ -1163,29 +1152,21 @@ mod tests {
     }
 
     #[test]
-    fn coordinator_contract_backup_policy_requires_both_when_deploy_and_root_change() {
-        let both = CoordinatorBackupRequirements {
-            deploy_contract: true,
-            contract_changed: true,
+    fn checkpoint_info_contract_flags_are_independent() {
+        let info = CoordinatorCheckpointInfo {
+            has_deploy_contracts: true,
+            contract_root_changed: true,
             ..Default::default()
         };
-        assert_eq!(coordinator_contract_backup_requirements(&both), (true, true));
+        assert!(info.has_deploy_contracts);
+        assert!(info.contract_root_changed);
 
-        let update_only = CoordinatorBackupRequirements { contract_changed: true, ..Default::default() };
-        assert_eq!(coordinator_contract_backup_requirements(&update_only), (false, true));
-
-        let unchanged = CoordinatorBackupRequirements::default();
-        assert_eq!(coordinator_contract_backup_requirements(&unchanged), (false, false));
-    }
-
-    #[test]
-    fn deploy_without_root_change_requires_only_deploy_backup() {
-        let deploy_only = CoordinatorBackupRequirements {
-            deploy_contract: true,
+        let deploy_only = CoordinatorCheckpointInfo {
+            has_deploy_contracts: true,
             ..Default::default()
         };
-
-        assert_eq!(coordinator_contract_backup_requirements(&deploy_only), (true, false));
+        assert!(deploy_only.has_deploy_contracts);
+        assert!(!deploy_only.contract_root_changed);
     }
     #[test]
     fn checkpoint_range_is_complete_despite_mapping_holes() {
@@ -1407,7 +1388,7 @@ mod tests {
         );
         assert_eq!(plan.phases[plan.phases.len() - 2].table, "all");
         assert_eq!(plan.phases.last().unwrap().table, "u64_singleton_table");
-        assert!(plan.post_target_generations.is_empty());
+        assert!(plan.ids.is_empty());
         let singleton_phase = plan.phases.iter().find(|phase| phase.table == "TKVSV1-singletons").unwrap();
         let expected_singletons: HashSet<String> = keys::processor_state_singleton_fields(0, 0)
             .unwrap()
@@ -1513,13 +1494,13 @@ mod tests {
         backups
     }
 
-    fn generations(checkpoints: &[(u64, u64)]) -> Vec<PostTargetGeneration> {
+    fn ids(checkpoints: &[(u64, u64)]) -> Vec<RollbackIds> {
         checkpoints
             .iter()
-            .map(|(checkpoint_id, pending_id)| PostTargetGeneration {
+            .map(|(checkpoint_id, pending_id)| RollbackIds {
                 checkpoint_id: Some(*checkpoint_id),
                 pending_id: *pending_id,
-                proc_checkpoint_unique_id: u128::from(*pending_id),
+                proc_id: u128::from(*pending_id),
             })
             .collect()
     }
@@ -1536,7 +1517,7 @@ mod tests {
         ffs.extend(imt_entry(7, 9, 14, one, one, true));
         let snapshot = derive_imt_append_index_snapshot(
             &imt_backups(&[(88, ffs)]),
-            &generations(&[(43, 88)]),
+            &ids(&[(43, 88)]),
             42,
             &reader,
         )
@@ -1548,7 +1529,7 @@ mod tests {
         gap.extend(imt_entry(7, 9, 15, one, one, true));
         let error = derive_imt_append_index_snapshot(
             &imt_backups(&[(88, gap)]),
-            &generations(&[(43, 88)]),
+            &ids(&[(43, 88)]),
             42,
             &reader,
         )
@@ -1567,7 +1548,7 @@ mod tests {
         ]);
         let error = derive_imt_append_index_snapshot(
             &backups,
-            &generations(&[(43, 88), (44, 89)]),
+            &ids(&[(43, 88), (44, 89)]),
             42,
             &reader,
         )
@@ -1582,7 +1563,7 @@ mod tests {
         let reader = TestRollbackStateReader { leaves: HashSet::new(), checkpoint_delete_path_keys: HashMap::new() };
         let snapshot = derive_imt_append_index_snapshot(
             &imt_backups(&[(88, imt_entry(7, 9, 4, one, one, false))]),
-            &generations(&[(43, 88)]),
+            &ids(&[(43, 88)]),
             42,
             &reader,
         )
@@ -1592,7 +1573,7 @@ mod tests {
 
         let error = derive_imt_append_index_snapshot(
             &imt_backups(&[(88, imt_entry(8, 10, 4, one, one, false))]),
-            &generations(&[(43, 88)]),
+            &ids(&[(43, 88)]),
             42,
             &reader,
         )
@@ -1608,20 +1589,20 @@ mod tests {
         let mut ffs = imt_entry(7, 9, 10, zero, zero, false);
         ffs.extend(imt_entry(7, 9, 11, one, one, true));
         let backups = imt_backups(&[(88, ffs)]);
-        let generations = generations(&[(43, 88)]);
+        let ids = ids(&[(43, 88)]);
 
         let absent = TestRollbackStateReader {
             leaves: HashSet::from([(7, 9, 0, 42)]),
             checkpoint_delete_path_keys: HashMap::new(),
         };
-        let snapshot = derive_imt_append_index_snapshot(&backups, &generations, 42, &absent).await.unwrap();
+        let snapshot = derive_imt_append_index_snapshot(&backups, &ids, 42, &absent).await.unwrap();
         assert_eq!(snapshot.entries[0].next_append_index, None, "leaf zero must not determine pair existence");
 
         let present = TestRollbackStateReader {
             leaves: HashSet::from([(7, 9, 10, 42)]),
             checkpoint_delete_path_keys: HashMap::new(),
         };
-        let snapshot = derive_imt_append_index_snapshot(&backups, &generations, 42, &present).await.unwrap();
+        let snapshot = derive_imt_append_index_snapshot(&backups, &ids, 42, &present).await.unwrap();
         assert_eq!(snapshot.entries[0].next_append_index, Some(11));
     }
 
@@ -1629,15 +1610,15 @@ mod tests {
     async fn imt_insert_without_sentinel_requires_target_predecessor() {
         let one = [1u8; 32];
         let backups = imt_backups(&[(88, imt_entry(7, 9, 13, one, one, true))]);
-        let generations = generations(&[(43, 88)]);
+        let ids = ids(&[(43, 88)]);
         let missing = TestRollbackStateReader { leaves: HashSet::new(), checkpoint_delete_path_keys: HashMap::new() };
-        assert!(derive_imt_append_index_snapshot(&backups, &generations, 42, &missing).await.is_err());
+        assert!(derive_imt_append_index_snapshot(&backups, &ids, 42, &missing).await.is_err());
 
         let present = TestRollbackStateReader {
             leaves: HashSet::from([(7, 9, 12, 42)]),
             checkpoint_delete_path_keys: HashMap::new(),
         };
-        let snapshot = derive_imt_append_index_snapshot(&backups, &generations, 42, &present).await.unwrap();
+        let snapshot = derive_imt_append_index_snapshot(&backups, &ids, 42, &present).await.unwrap();
         assert_eq!(snapshot.entries[0].next_append_index, Some(13));
     }
 }
