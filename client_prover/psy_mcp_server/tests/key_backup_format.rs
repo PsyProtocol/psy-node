@@ -1,6 +1,5 @@
-//! The key backup gained a `mandate` field so a minted agent account can be
-//! restored after a restart. Every backup written before that must keep
-//! loading, or the change strands the wallets it was meant to protect.
+//! Key backup format tests. Account names are required by the current format;
+//! backups written before that schema change are intentionally rejected.
 
 #[allow(dead_code, unused_imports)]
 #[path = "../src/agent_account.rs"]
@@ -12,7 +11,7 @@ mod keystore;
 use keystore::KeyBackup;
 
 #[test]
-fn a_pre_existing_backup_without_a_mandate_still_parses() {
+fn a_pre_existing_backup_without_a_name_is_rejected() {
     // Exactly the shape written before this change.
     let json = r#"{
         "kind": "psy-wallet-key-v1",
@@ -20,16 +19,15 @@ fn a_pre_existing_backup_without_a_mandate_still_parses() {
         "fingerprint": "deadbeef",
         "created_at": 1786029233
     }"#;
-    let b: KeyBackup = serde_json::from_str(json).expect("old backups must still load");
-    assert_eq!(b.private_key, "0xabc123");
-    assert!(b.mandate.is_none(), "absent means an ordinary wallet, not an agent account");
+    let error = serde_json::from_str::<KeyBackup>(json).err().expect("a backup without an account name must be rejected");
+    assert!(error.to_string().contains("name"));
 }
 
 #[test]
 fn a_null_mandate_is_treated_as_absent() {
     let json = r#"{
         "kind": "psy-wallet-key-v1", "private_key": "0x1", "fingerprint": "f",
-        "created_at": 1, "mandate": null
+        "name": "Wallet", "created_at": 1, "mandate": null
     }"#;
     let b: KeyBackup = serde_json::from_str(json).expect("null must not be a parse error");
     assert!(b.mandate.is_none());
@@ -41,7 +39,7 @@ fn a_mandate_round_trips_with_everything_a_reload_needs() {
     // is not enough to re-register it.
     let json = r#"{
         "kind": "psy-wallet-key-v1", "private_key": "0x1", "fingerprint": "f",
-        "created_at": 1,
+        "name": "Agent account", "created_at": 1,
         "mandate": {
             "capabilities": [{"contract_id": 0, "method_name": "simple_transfer", "method_id": 3}],
             "calls_per_transaction": 1,
@@ -63,13 +61,17 @@ fn a_mandate_round_trips_with_everything_a_reload_needs() {
 
 #[test]
 fn an_ordinary_backup_serializes_without_a_mandate_key() {
-    // skip_serializing_if keeps the old shape byte-identical for old wallets.
+    // Ordinary wallets omit only the optional mandate field.
     let b = KeyBackup {
         kind: KeyBackup::KIND.to_string(),
         private_key: "0x1".into(),
         fingerprint: "f".into(),
+        name: "Wallet".into(),
         created_at: 1,
+        network: Some("testnet".into()),
         mandate: None,
+        default_shield_address: None,
+        nostr_pub: None,
     };
     let s = serde_json::to_string(&b).unwrap();
     assert!(!s.contains("mandate"), "an ordinary wallet's backup gains no new field: {s}");

@@ -72,9 +72,6 @@ client_prover/contract_call.json
 /client_prover/psy_ide/frontend/playwright-report/
 /diagram-output/
 /output/
-/.local-bsc-testnet/
-/deploy/bsc-testnet/local.env
-/deploy/bsc-testnet/full-stack.env
 psy-contracts/test/deployments/
 BUG.md
 # Generated ts-rs bindings.

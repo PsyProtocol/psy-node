@@ -105,7 +105,7 @@ fn an_empty_edit_changes_nothing_at_all() {
 #[test]
 fn a_tightened_cap_still_binds_the_live_session_immediately() {
     let (mut e, pid) = engine();
-    let (t, _) = e.issue_session(&pid, 60).unwrap();
+    let (t, _) = e.issue_session(&pid, 60, None).unwrap();
     e.authorize(&t, "1908736", 3 * PSY, "simple_transfer").unwrap();
     e.update_policy(&pid, Some(1 * PSY), None, None, None, None, vec![]).unwrap();
     let err = e.authorize(&t, "1908736", 2 * PSY, "simple_transfer").unwrap_err().to_string();

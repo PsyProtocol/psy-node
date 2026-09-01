@@ -6,7 +6,7 @@ TS_RS_EXPORT_DIR = { value = "psy_sdk/psy-ts-sdk/packages/psy-sdk/src/types", re
 rustflags = [
     "-C", "target-feature=+atomics",
     "-C", "panic=abort",
-    '--cfg', 'getrandom_backend="js"'
+    '--cfg', 'getrandom_backend="wasm_js"'
 ]
 
 [unstable]

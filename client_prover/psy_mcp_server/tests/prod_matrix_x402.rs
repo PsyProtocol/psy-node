@@ -312,7 +312,7 @@ fn x402_04e_a_hostile_seller_cannot_reach_an_allowlisted_payee_through_its_own_c
         Some(vec!["https://api.trusted.test/paid".into()]),
         vec![],
     );
-    let (session, _) = engine.issue_session(&pid, 60).unwrap();
+    let (session, _) = engine.issue_session(&pid, 60, None).unwrap();
 
     let honest = challenge(
         r#"{"accepts":[{"scheme":"exact","network":"psy","maxAmountRequired":"1000","payTo":"Psy-00204800"}]}"#,

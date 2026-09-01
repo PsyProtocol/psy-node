@@ -904,8 +904,6 @@ async fn publish_deposit_backup(
 }
 
 pub async fn run(args: DepositArgs) -> anyhow::Result<CommandResult> {
-    let psy_config = psy_config::PsyConfigGoldilocks::from_file(&args.rpc_config)?;
-    let deployments_network = psy_config.current_network_name();
     let shield_address = resolve_shield_address(&args)?;
     let (note_commitment, backup) = resolve_note_commitment(&args)?;
     if let Some(recipient_npub) = backup.as_ref().and_then(|b| b.recipient_npub.as_deref()) {
@@ -914,7 +912,7 @@ pub async fn run(args: DepositArgs) -> anyhow::Result<CommandResult> {
     let router_addr = if !args.router_address.is_empty() && args.router_address != "auto" {
         args.router_address.clone()
     } else {
-        resolve_router_address(deployments_network)?
+        resolve_router_address("localhost")?
     };
     tracing::info!("Router address: {}", router_addr);
 
@@ -1077,8 +1075,9 @@ pub async fn run(args: DepositArgs) -> anyhow::Result<CommandResult> {
     if let Some(backup) = backup.as_ref().filter(|_| should_generate_deposit_proof) {
         let deposit_index = recorded_deposit_index
             .ok_or_else(|| anyhow::anyhow!("DepositRecorded event missing deposit_index; cannot generate deposit backup proof"))?;
+        let psy_config = psy_config::PsyConfigGoldilocks::from_file(&args.rpc_config)?;
         let services_url = resolve_services_url(&psy_config)?;
-        let bridge_address = resolve_bridge_address(deployments_network)?;
+        let bridge_address = resolve_bridge_address("localhost")?;
         let ready_proof = wait_for_deposit_proof(&args, &services_url, &bridge_address, deposit_index as u64).await?;
         let deposit_proof = build_deposit_inclusion_proof_payload(&args, backup, &shield_address, &note_commitment, ready_proof)?;
         if let Some(path) = args.deposit_proof_output.as_deref() {

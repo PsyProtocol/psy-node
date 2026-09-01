@@ -1,7 +1,7 @@
 pub mod bridge_agg;
 pub mod bridge_agg_chain;
 pub mod bridge_agg_final;
-#[cfg(feature = "gnark-wrap")]
+#[cfg(all(feature = "gnark-wrap", not(target_arch = "wasm32")))]
 pub mod bridge_wrap;
 
 pub use bridge_agg::BridgeAggProveResult;

@@ -33,6 +33,7 @@ type RedisPool = Pool;
 
 pub const REDIS_TMP_PROOF_STORE_PREFIX: &str = "TMPPSV1";
 pub const REDIS_TMP_KV_STORE_PREFIX: &str = "TKVSV1";
+const REDIS_TMP_PROOF_FIELD_TTL_SECONDS: i64 = 600;
 
 fn get_tmp_kv_store_ns_key(root_prefix: &str, realm_id: u64, realm_sub_id: u64) -> String {
     format!("{}-{}-{}-{}", REDIS_TMP_KV_STORE_PREFIX, root_prefix, realm_id, realm_sub_id)
@@ -138,6 +139,15 @@ impl StandardFredRedisStore {
 
     pub async fn set_bytes_generic_internal(&self, ns_key: &str, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
         let _: () = self.client.hset(ns_key, (key, value)).await?;
+        Ok(())
+    }
+
+    async fn set_proof_bytes_internal(&self, ns_key: &str, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
+        let _: () = self.client.hset(ns_key, (key, value)).await?;
+        let _: () = self
+            .client
+            .hexpire(ns_key, REDIS_TMP_PROOF_FIELD_TTL_SECONDS, None, key)
+            .await?;
         Ok(())
     }
 
@@ -597,11 +607,7 @@ impl QParthProofStoreWriter for StandardFredRedisStore {
     async fn put_proof_bytes_for_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync>(&self, job_id: J, unique_pending_id: u64, proof_bytes: &[u8]) -> anyhow::Result<()> {
         let job_id_bytes = job_id.into().to_vec();
         let bucket = get_tmp_proof_store_bucket_ns_key(&self.root_prefix, self.realm_id, self.realm_sub_id, unique_pending_id);
-        // A pending checkpoint may legitimately wait longer than a fixed TTL
-        // for a downstream proof. The processor deletes the entire pending-id
-        // bucket after checkpoint commit, so expiry here is both unnecessary
-        // and unsafe for the proving pipeline.
-        self.set_bytes_generic_internal(&bucket, &job_id_bytes, proof_bytes)
+        self.set_proof_bytes_internal(&bucket, &job_id_bytes, proof_bytes)
             .await
     }
     async fn put_proof_for_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync, P: QPDSerializable + Send + Sync>(
@@ -613,7 +619,7 @@ impl QParthProofStoreWriter for StandardFredRedisStore {
         let job_id_bytes = job_id.into().to_vec();
         let bucket = get_tmp_proof_store_bucket_ns_key(&self.root_prefix, self.realm_id, self.realm_sub_id, unique_pending_id);
         let proof_bytes = proof.to_bytes()?;
-        self.set_bytes_generic_internal(&bucket, &job_id_bytes, &proof_bytes)
+        self.set_proof_bytes_internal(&bucket, &job_id_bytes, &proof_bytes)
             .await
     }
     async fn delete_all_proofs_for_pending_id(&self, unique_pending_id: u64) -> anyhow::Result<()> {

@@ -94,6 +94,20 @@ PSY_CONFIG=/path/to/config.json cargo run -p psy_mcp_server
 #   { "command": "target/release/psy-mcp-server", "env": { "PSY_CONFIG": "…" } }
 ```
 
+### Native install (without Docker)
+
+From the repository root, build and register the release binary directly with
+the MCP client:
+
+```bash
+bash install-mcp-binary.sh
+```
+
+The script installs `psy-mcp-server` under `~/.psy/bin`, uses
+`~/.psy/config.json` (or `PSY_CONFIG`), stores keys under
+`~/.psy-mcp-keys` (or `PSY_MCP_KEYSTORE_DIR`), and supports
+`PSY_INSTALL_TARGET=claude-code|claude-desktop|codex|cursor|workbuddy`.
+
 ## Docker build & test
 
 The repository includes a `Dockerfile` that builds a self-contained Linux image.

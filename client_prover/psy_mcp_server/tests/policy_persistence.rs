@@ -28,7 +28,7 @@ fn spent_counters_survive_a_restart() {
             None,
             vec![],
         );
-        let (t, _) = e.issue_session(&pid, 60).unwrap();
+        let (t, _) = e.issue_session(&pid, 60, None).unwrap();
         e.authorize(&t, "alice", 7 * PSY, "simple_transfer").unwrap();
         pid
     };
@@ -51,7 +51,7 @@ fn a_corrupt_policy_file_is_quarantined_not_destroyed() {
             None,
             vec![],
         );
-        let (t, _) = e.issue_session(&pid, 60).unwrap();
+        let (t, _) = e.issue_session(&pid, 60, None).unwrap();
         e.authorize(&t, "alice", 9 * PSY, "simple_transfer").unwrap();
     }
     let path = dir.join("policies.json");
@@ -91,7 +91,7 @@ fn seed_with_a_spend(dir: &std::path::Path) {
         None,
         vec![],
     );
-    let (t, _) = e.issue_session(&pid, 60).unwrap();
+    let (t, _) = e.issue_session(&pid, 60, None).unwrap();
     e.authorize(&t, "alice", 9 * PSY, "simple_transfer").unwrap();
 }
 
@@ -230,7 +230,7 @@ fn a_pause_is_not_rewritten_by_the_other_process() {
     );
     // The agent's process — a SEPARATE engine that loaded at its own startup.
     let mut agent = PolicyEngine::load_or_new(&dir);
-    let (tok, _) = agent.issue_session(&pid, 60).unwrap();
+    let (tok, _) = agent.issue_session(&pid, 60, None).unwrap();
     assert!(agent.authorize(&tok, "1", PSY, "simple_transfer").is_ok(), "baseline spend works");
 
     // The owner hits Pause in the dashboard.
@@ -261,8 +261,8 @@ fn spend_counters_do_not_double_across_two_processes() {
         vec![],
     );
     let mut b = PolicyEngine::load_or_new(&dir);
-    let (ta, _) = a.issue_session(&pid, 60).unwrap();
-    let (tb, _) = b.issue_session(&pid, 60).unwrap();
+    let (ta, _) = a.issue_session(&pid, 60, None).unwrap();
+    let (tb, _) = b.issue_session(&pid, 60, None).unwrap();
 
     // Alternate spends between the two processes, 6 PSY each.
     assert!(a.authorize(&ta, "1", 6 * PSY, "simple_transfer").is_ok(), "first 6 PSY fits");
@@ -309,12 +309,12 @@ fn a_paused_policy_cannot_be_handed_a_fresh_session_by_the_other_process() {
         vec![],
     );
     let mut agent = PolicyEngine::load_or_new(&dir);
-    assert!(agent.issue_session(&pid, 30).is_ok(), "baseline: an active policy issues");
+    assert!(agent.issue_session(&pid, 30, None).is_ok(), "baseline: an active policy issues");
 
     dash.pause(&pid);
 
     let err = agent
-        .issue_session(&pid, 30)
+        .issue_session(&pid, 30, None)
         .expect_err("the other process must see the pause before minting a token");
     assert!(err.to_string().contains("paus"), "{err}");
     std::fs::remove_dir_all(&dir).ok();

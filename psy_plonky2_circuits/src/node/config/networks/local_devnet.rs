@@ -364,19 +364,12 @@ mod tests {
         };
 
         let project_dir = env!("CARGO_MANIFEST_DIR");
-        let genesis_output_path = std::env::var("PSY_GENESIS_OUTPUT_PATH")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::path::Path::new(project_dir).join("../genesis.json"));
-        let private_keys_output_path = std::env::var("PSY_PRIVATE_KEYS_OUTPUT_PATH")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::path::Path::new(project_dir).join("../private_keys.json"));
-        for output_path in [&genesis_output_path, &private_keys_output_path] {
-            if let Some(parent) = output_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-        std::fs::write(genesis_output_path, serde_json::to_string_pretty(&genesis_data)?)?;
-        std::fs::write(private_keys_output_path, serde_json::to_string_pretty(&private_keys)?)?;
+
+        std::fs::write(&format!("{}/../genesis.json", project_dir), serde_json::to_string_pretty(&genesis_data)?)?;
+        std::fs::write(
+            &format!("{}/../private_keys.json", project_dir),
+            serde_json::to_string_pretty(&private_keys)?,
+        )?;
 
         // Emit faucet operator config for psy-privacy-bridge. The 10 sd-key
         // users above (slots 4..14) are the faucet operators; their userId in
@@ -456,17 +449,11 @@ mod tests {
             operators,
         };
 
-        let faucet_operators_path = std::env::var("PSY_FAUCET_OPERATORS_OUTPUT_PATH")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| {
-                std::path::Path::new(project_dir)
-                    .join("../psy-dapp/apps/bridge/src/config/faucetOperators.json")
-            });
-        if let Some(parent) = faucet_operators_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         std::fs::write(
-            faucet_operators_path,
+            &format!(
+                "{}/../psy-dapp/apps/bridge/src/config/faucetOperators.json",
+                project_dir
+            ),
             serde_json::to_string_pretty(&faucet_operators)?,
         )?;
 

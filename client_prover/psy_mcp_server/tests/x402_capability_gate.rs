@@ -23,7 +23,7 @@ fn armed() -> (PolicyEngine, String, String) {
         None,
         vec![],
     );
-    let (t, _) = e.issue_session(&pid, 60).unwrap();
+    let (t, _) = e.issue_session(&pid, 60, None).unwrap();
     (e, pid, t)
 }
 
@@ -58,7 +58,7 @@ fn a_method_the_owner_did_not_allow_may_not_act() {
         None,
         vec!["simple_transfer".into()], // x402_fetch deliberately absent
     );
-    let (t, _) = e.issue_session(&pid, 60).unwrap();
+    let (t, _) = e.issue_session(&pid, 60, None).unwrap();
     let err = e.check_can_act(&t, "x402_fetch").unwrap_err().to_string();
     assert!(err.contains("x402_fetch"), "the refusal names the method: {err}");
 }
@@ -105,6 +105,6 @@ fn the_allowlist_is_NOT_applied_at_check_time() {
         Some(vec!["1234".into()]),
         vec![],
     );
-    let (t, _) = e.issue_session(&pid, 60).unwrap();
+    let (t, _) = e.issue_session(&pid, 60, None).unwrap();
     assert!(e.check_can_act(&t, "x402_fetch").is_ok(), "an allow-listed policy may still fetch");
 }
