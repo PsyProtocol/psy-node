@@ -120,7 +120,8 @@ verify_genesis_wallet_allocation "$PARTH_DIR/genesis.json" "local genesis.json"
 
 if [ "${SKIP_BINARY_BUILD:-0}" != "1" ]; then
   log_step "building Linux release artifacts, packaging deploy artifacts, and building bundle"
-  PACKAGE_ARTIFACTS=1 BUILD_PARTH_BUNDLE=1 \
+  PSY_SERVICES_DIR="${PSY_SERVICES_DIR:-$WORKSPACE_HOME/psy-services}" \
+    PACKAGE_ARTIFACTS=1 BUILD_PARTH_BUNDLE=1 \
     bash "$PARTH_DIR/deploy/scripts/build-linux-artifacts-bookworm.sh"
 else
   log_step "SKIP_BINARY_BUILD=1; refreshing deploy artifacts from existing release binaries"

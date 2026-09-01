@@ -6,6 +6,17 @@ live under this directory. Maintain both GCP and local-testnet deployment
 automation on this branch; do not copy deployment scripts back into the
 runtime branch.
 
+## Branch Policy
+
+- Treat `deploy-unified` as the long-lived operational branch for deployment
+  automation. Push reviewed deployment commits directly to this branch; do not
+  open a pull request from it into `mainnet-beta`.
+- Synchronize product code from `mainnet-beta` before a deployment and verify
+  that the resulting tree has no product-code drift outside `deploy/`.
+- Keep reusable deployment scripts, service units, environment examples,
+  runbooks, and deployment-specific tests under `deploy/`.
+- Never commit environment-specific secrets or generated `config.env` files.
+
 ## Layout
 
 - `gcp/`: remote GCP staging deployment and operational scripts.

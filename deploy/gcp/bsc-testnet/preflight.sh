@@ -106,6 +106,9 @@ expect_equal DEPLOY_OFFSITE_PROVE_PROXY 1
 expect_equal OFFSITE_PROVE_PROXY_HOST arc99x2
 expect_equal DEPLOY_CLOUD_REALM_WORKERS 1
 expect_equal CLOUD_REALM_WORKER_LAYOUT "0:0 1:0"
+expect_equal COORDINATOR_WORKER_LAYOUT "0"
+expect_equal COORDINATOR_WORKER_KEY_INDEXES "0"
+expect_equal REQUIRE_MIN_COORDINATOR_WORKERS 1
 expect_equal DEPLOY_OFFSITE_WORKERS 1
 expect_equal OFFSITE_WORKER_HOST arc99x4
 expect_equal WALLET_PACKAGE_MODE bsc-testnet
@@ -176,7 +179,9 @@ grep -A8 "'bsc-testnet':" "$REPO_ROOT/psy-contracts/protocol-config/index.ts" \
 
 [ -n "${BSC_TESTNET_RPC_URL:-}" ] || fail "BSC_TESTNET_RPC_URL is required"
 [ "$ETH_RPC_URL" = "$BSC_TESTNET_RPC_URL" ] || fail "ETH_RPC_URL must use BSC_TESTNET_RPC_URL"
-[ -n "${ENVIO_API_TOKEN:-}" ] || fail "ENVIO_API_TOKEN is required for BSC HyperSync"
+if [ "${ENVIO_USE_HYPERSYNC:-1}" = "1" ]; then
+  [ -n "${ENVIO_API_TOKEN:-}" ] || fail "ENVIO_API_TOKEN is required for BSC HyperSync"
+fi
 
 if [ "${BSC_PREFLIGHT_SKIP_RPC:-0}" != "1" ]; then
   command -v cast >/dev/null 2>&1 || fail "cast is required for BSC balance validation"

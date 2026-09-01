@@ -25,6 +25,31 @@ preflight_output="$(env "${common_env[@]}" bash "$PROFILE_DIR/preflight.sh")"
 grep -q 'machine topology unchanged' <<<"$preflight_output"
 grep -q 'network and public namespace checks passed' <<<"$preflight_output"
 
+profile_dump="$(env "${common_env[@]}" bash -c 'source "$GCP_DEPLOY_CONFIG"; printf "%s|%s|%s\n" "$COORDINATOR_WORKER_LAYOUT" "$CLOUD_REALM_WORKER_LAYOUT" "$REQUIRE_MIN_COORDINATOR_WORKERS"')"
+[ "$profile_dump" = "0|0:0 1:0|1" ] || {
+  echo "unexpected cloud worker layout: $profile_dump" >&2
+  exit 1
+}
+
+rpc_only_env=(
+  "WORKSPACE_HOME=$(cd "$ROOT/.." && pwd)"
+  "BSC_BASE_GCP_CONFIG=$base_config"
+  "BSC_TESTNET_RPC_URL=https://bsc-testnet.example.invalid"
+  "ENVIO_USE_HYPERSYNC=0"
+  "ENVIO_API_TOKEN="
+  "GCP_DEPLOY_CONFIG=$PROFILE_DIR/config.example.env"
+  "DEPLOY_SOURCE_VERSIONS_FILE=$PROFILE_DIR/source-versions.env"
+  "BSC_PREFLIGHT_SKIP_RPC=1"
+)
+env "${rpc_only_env[@]}" bash "$PROFILE_DIR/preflight.sh" >/dev/null
+
+if env "${common_env[@]}" ENVIO_API_TOKEN= bash "$PROFILE_DIR/preflight.sh" \
+  >"$tmp_dir/hypersync-token.out" 2>"$tmp_dir/hypersync-token.err"; then
+  echo "BSC preflight unexpectedly accepted HyperSync without an API token" >&2
+  exit 1
+fi
+grep -q 'ENVIO_API_TOKEN is required for BSC HyperSync' "$tmp_dir/hypersync-token.err"
+
 mock_bin="$tmp_dir/bin"
 mkdir -p "$mock_bin"
 cat >"$mock_bin/curl" <<'EOF'

@@ -209,8 +209,8 @@ cat <<EOF
 
 Next local deployment config after the VM is reachable:
   COORDINATOR_WORKER_VM_NAME="gcp-coordinator-worker"
-  COORDINATOR_WORKER_LAYOUT="0 1"
+  COORDINATOR_WORKER_LAYOUT="0"
 
-Then deploy the two online coordinator workers:
+Then deploy the online coordinator worker:
   bash deploy/gcp/fresh-staging/14_deploy_workers.sh
 EOF

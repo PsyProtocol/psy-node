@@ -41,6 +41,7 @@ scp -F "$SSH_CONFIG_FILE" "$PARTH_BUNDLE" \
   "$OFFSITE_WORKER_HOST:$remote_incoming/parth-node-bundle.tar.gz"
 scp -F "$SSH_CONFIG_FILE" \
   "$SCRIPT_DIR/arc99x4-install-staged.sh" \
+  "$SCRIPT_DIR/arc99x4-apply-staged.sh" \
   "$SCRIPT_DIR/parth-offsite-worker@.service" \
   "$OFFSITE_WORKER_HOST:$remote_root/deploy/offsite-worker/"
 
@@ -60,29 +61,8 @@ export RELEASE_ID=$(printf '%q' "$RELEASE_ID")
 export STAGED_ROOT=$(printf '%q' "$remote_root")
 export STAGED_RELEASE=$(printf '%q' "$remote_release")
 export STAGED_ETC=$(printf '%q' "$remote_root/staged-etc")
-bash $(printf '%q' "$remote_root/deploy/offsite-worker/arc99x4-install-staged.sh")
-"
-
-if [ "$RESET_OFFSITE_WORKER_STATE" = "1" ]; then
-  remote_command+="
-archive=/var/lib/parth/checkpoints/archive-$RELEASE_ID
-sudo install -d -o parth -g parth -m 0750 \"\$archive\"
-sudo find /var/lib/parth/checkpoints -maxdepth 1 -type f -name '*.backup' -exec mv -t \"\$archive\" {} +
-"
-fi
-
-remote_command+="
-sudo systemctl enable \\
-  parth-offsite-worker@coordinator.service \\
-  parth-offsite-worker@realm-0.service \\
-  parth-offsite-worker@realm-1.service
-sudo systemctl restart \\
-  parth-offsite-worker@coordinator.service \\
-  parth-offsite-worker@realm-0.service \\
-  parth-offsite-worker@realm-1.service
-for role in coordinator realm-0 realm-1; do
-  sudo systemctl is-active --quiet \"parth-offsite-worker@\$role.service\"
-done
+export RESET_OFFSITE_WORKER_STATE=$(printf '%q' "$RESET_OFFSITE_WORKER_STATE")
+bash $(printf '%q' "$remote_root/deploy/offsite-worker/arc99x4-apply-staged.sh")
 "
 
 ssh -tt -F "$SSH_CONFIG_FILE" "$OFFSITE_WORKER_HOST" "$remote_command"

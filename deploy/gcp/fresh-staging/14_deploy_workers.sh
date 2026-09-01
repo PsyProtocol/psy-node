@@ -3,10 +3,10 @@ set -euo pipefail
 
 source "$(dirname "$0")/_common.sh"
 
-read -r -a coordinator_workers <<< "${COORDINATOR_WORKER_LAYOUT:-0 1}"
+read -r -a coordinator_workers <<< "${COORDINATOR_WORKER_LAYOUT:-0}"
 coordinator_worker_count="${#coordinator_workers[@]}"
-if [ "${REQUIRE_MIN_COORDINATOR_WORKERS:-2}" -gt 0 ] && [ "$coordinator_worker_count" -lt "${REQUIRE_MIN_COORDINATOR_WORKERS:-2}" ]; then
-  echo "COORDINATOR_WORKER_LAYOUT must contain at least ${REQUIRE_MIN_COORDINATOR_WORKERS:-2} worker indexes; current: ${COORDINATOR_WORKER_LAYOUT:-0 1}" >&2
+if [ "${REQUIRE_MIN_COORDINATOR_WORKERS:-1}" -gt 0 ] && [ "$coordinator_worker_count" -lt "${REQUIRE_MIN_COORDINATOR_WORKERS:-1}" ]; then
+  echo "COORDINATOR_WORKER_LAYOUT must contain at least ${REQUIRE_MIN_COORDINATOR_WORKERS:-1} worker indexes; current: ${COORDINATOR_WORKER_LAYOUT:-0}" >&2
   exit 1
 fi
 

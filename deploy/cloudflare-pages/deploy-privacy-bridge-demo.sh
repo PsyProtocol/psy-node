@@ -181,6 +181,9 @@ set_demo_env VITE_PSY_INDEXER_API_URL "https://${PUBLIC_PSY_SERVICES_DOMAIN}"
 set_demo_env VITE_INDEXER_URL "https://${PUBLIC_INDEXER_DOMAIN}/v1/graphql"
 set_demo_env VITE_PSY_IDE_URL "$PUBLIC_PSY_IDE_URL"
 set_demo_env VITE_PSY_CONFIG_URL "$PUBLIC_CONFIG_PAGE_URL"
+# scripts/sync-staging-config.mjs runs before Vite and reads the unprefixed
+# variable. Keep its build-time snapshot source aligned with the runtime URL.
+set_demo_env PSY_CONFIG_URL "${PUBLIC_CONFIG_PAGE_URL%/}/config.json"
 set_demo_env VITE_PSY_FAUCET_SERVER_MODE "$PSY_FAUCET_SERVER_MODE"
 set_demo_env VITE_PSY_FAUCET_TURNSTILE_SITE_KEY "${PSY_FAUCET_TURNSTILE_SITE_KEY:-}"
 include_wallet_download

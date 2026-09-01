@@ -159,7 +159,7 @@ with the standalone Faucet Server. Realm edge ports are `1338` for realm0 and
 
 Genesis wallet allocation for the current staging topology:
 `private_keys.json[0]`, `[1]`, and `[3]` are reserved ZK wallets with zero PSY
-in genesis. Coordinator workers default to key indexes `0 1`; realm workers
+in genesis. The cloud coordinator worker defaults to key index `0`; realm workers
 default to key index `3`. The bridge relayer must use the key
 registered as `BRIDGE_USER_ID=524288`; with the current 2-realm genesis
 mapping, that is `private_keys.json[2]`, funded with `1,000,000 PSY`. Faucet
@@ -172,9 +172,9 @@ smoke test is disabled by default to preserve that parity; set
 `private_keys.json` and `genesis.json` are intentionally ignored by git.
 
 `deploy-cloud-workers.sh` deploys the required cloud baseline on
-`COORDINATOR_WORKER_VM_NAME`: two coordinator workers plus one worker for each
-realm by default. This cloud baseline remains enabled even when offsite workers
-are healthy.
+`COORDINATOR_WORKER_VM_NAME`: one coordinator worker plus one worker for each
+realm by default. This three-process cloud baseline fits the 16 GiB worker VM
+and remains enabled even when offsite workers are healthy.
 
 ```sh
 bash deploy/gcp/deploy-cloud-workers.sh

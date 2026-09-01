@@ -199,8 +199,8 @@ tunnels through `gcp-cp-ce` for Scylla, NATS, and Redis, then run two local
 `psy_worker_cli worker` processes against the staging coordinator edge.
 
 `14_deploy_workers.sh` deploys and verifies the cloud worker baseline on
-`COORDINATOR_WORKER_VM_NAME` (`gcp-coordinator-worker` by default): two
-coordinator workers plus one realm0 and one realm1 worker. The lightweight
+`COORDINATOR_WORKER_VM_NAME` (`gcp-coordinator-worker` by default): one
+coordinator worker plus one realm0 and one realm1 worker. The lightweight
 relayer/proposer runs on `RELAYER_VM_NAME` (`gcp-faucet` by default), sharing
 the VM with the standalone Faucet Server configured by `FAUCET_VM_NAME`.
 When `DEPLOY_CLOUD_PROVE_PROXY=1`, step `13` deploys the cloud prove-proxy
