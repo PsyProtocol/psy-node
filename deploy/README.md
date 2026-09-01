@@ -19,6 +19,10 @@ runtime branch.
 
 ## Layout
 
+- `ethereum-sepolia/`: canonical Sepolia configuration, source pins,
+  preflight, and deployment entrypoint.
+- `bsc-testnet/`: canonical BSC Testnet configuration plus the isolated local
+  BSC validation stack.
 - `gcp/`: remote GCP staging deployment and operational scripts.
 - `local-testnet/`: the complete local Psy testnet, Cloudflare Tunnel, and
   local relayer tooling.
@@ -30,22 +34,34 @@ Shared helpers used by the GCP stack remain in `bin/`, `cloudflare-pages/`,
 `offsite-worker/`, and `scripts/`. They are kept at their established paths
 so existing remote deployment automation remains compatible.
 
-## GCP
+## Network Profiles
 
-Start with:
+Each profile owns its network configuration and source-version manifest while
+reusing the shared implementation under `deploy/gcp/`. The deployment branch's
+superproject and Gitlinks continue to follow `mainnet-beta`; each profile's
+entrypoint checks out its pinned `psy-genesis`, `psy-contracts`, and `psy-dapp`
+working trees before preflight.
+
+Ethereum Sepolia:
 
 ```bash
-cp deploy/gcp/config.example.env deploy/gcp/config.env
-bash deploy/gcp/fresh-staging/preflight.sh
-CONFIRM_FULL_FRESH_DEPLOY=1 bash deploy/gcp/fresh-staging/deploy_all.sh
+cp deploy/ethereum-sepolia/gcp/config.example.env \
+  deploy/ethereum-sepolia/gcp/config.env
+DRY_RUN=1 bash deploy/ethereum-sepolia/gcp/deploy_all.sh
 ```
 
-For the current full deployment, review `deploy/source-versions.env`. It is the
-single authoritative list of repository origins, commits, and reproducible
-Genesis contract checksum. `deploy/gcp/config.env` contains environment-specific
-topology, credentials, and tuning only. Preflight rejects dirty source trees,
-wrong repositories, unexpected commits, and any product-code drift outside
-`deploy/` by default.
+BSC Testnet:
+
+```bash
+cp deploy/bsc-testnet/gcp/config.example.env \
+  deploy/bsc-testnet/gcp/config.env
+DRY_RUN=1 bash deploy/bsc-testnet/gcp/deploy_all.sh
+```
+
+Do not copy L1 RPC URLs, contract addresses, Envio cursors, or wallet settings
+between profiles. The historical `deploy/gcp/config.example.env`,
+`deploy/source-versions.env`, and `deploy/gcp/bsc-testnet/` paths remain only as
+compatibility loaders.
 
 Initialize the pinned source submodules after cloning this branch. The
 temporary override is required because upstream intentionally marks
@@ -61,8 +77,8 @@ from the pinned `psy-genesis` submodule. Browser frontends come from the pinned
 `psy-dapp` submodule. Deployment does not rebuild contract bytecode with a
 separate compiler checkout.
 
-See `deploy/gcp/README.md` and `deploy/gcp/fresh-staging/README.md` before
-running a state-changing deployment.
+See `deploy/ethereum-sepolia/README.md`, `deploy/bsc-testnet/gcp/README.md`, and
+`deploy/gcp/fresh-staging/README.md` before running a state-changing deployment.
 
 ## Local Testnet
 
@@ -83,14 +99,13 @@ bash deploy/local-testnet/stack/status.sh
 bash deploy/local-testnet/cloudflare-tunnel/status.sh
 ```
 
-## BSC Testnet
+## BSC Local Validation
 
 The BSC Testnet deployment is intentionally staged behind local validation.
 Do not point the existing Sepolia environment at BSC or reuse its durable
-state. Follow [`bsc-testnet/PLAN.md`](bsc-testnet/PLAN.md) from phase 0; public
-BSC contracts and cloud services are blocked until the isolated local Chain ID
-97 E2E passes. The phase-2 local contract harness is documented in
-[`bsc-testnet/README.md`](bsc-testnet/README.md).
+state. Follow [`bsc-testnet/PLAN.md`](bsc-testnet/PLAN.md) from phase 0. The
+local harness is documented in [`bsc-testnet/README.md`](bsc-testnet/README.md),
+while the cloud profile lives under `bsc-testnet/gcp/`.
 
 ## Temporary Scripts
 

@@ -152,7 +152,8 @@ Update this table as work proceeds.
 ### Work
 
 1. Record the pinned psy-node, psy-genesis, psy-contracts, psy-dapp,
-   psy-services, wallet, and SDK commits in `deploy/source-versions.env`.
+   psy-services, wallet, and SDK commits in
+   `deploy/bsc-testnet/gcp/source-versions.env`.
 2. Confirm the deployment worktree differs from its product baseline only
    under `deploy/`.
 3. Capture the current Sepolia staging health report and contract addresses.

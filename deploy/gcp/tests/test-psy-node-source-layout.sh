@@ -2,8 +2,14 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-# shellcheck source=../../source-versions.env
-source "$ROOT/deploy/source-versions.env"
+PROFILE="${DEPLOY_NETWORK_PROFILE:-ethereum-sepolia}"
+VERSIONS_FILE="$ROOT/deploy/$PROFILE/gcp/source-versions.env"
+[ -f "$VERSIONS_FILE" ] || {
+  echo "unknown deployment network profile: $PROFILE" >&2
+  exit 1
+}
+# shellcheck disable=SC1090
+source "$VERSIONS_FILE"
 
 runtime_head="$(git -C "$ROOT" rev-parse HEAD)"
 git -C "$ROOT" merge-base --is-ancestor "$EXPECTED_PARTH_RUNTIME_COMMIT" "$runtime_head" || {
@@ -12,7 +18,7 @@ git -C "$ROOT" merge-base --is-ancestor "$EXPECTED_PARTH_RUNTIME_COMMIT" "$runti
 }
 non_deploy_changes="$(
   git -C "$ROOT" diff --name-only "$EXPECTED_PARTH_RUNTIME_COMMIT" "$runtime_head" \
-    | awk '$0 !~ /^deploy\// && $0 !~ /^(psy-genesis|psy-contracts|psy-dapp)$/'
+    | awk '$0 !~ /^deploy\//'
 )"
 [ -z "$non_deploy_changes" ] || {
   echo "deployment branch contains unapproved product changes:" >&2
@@ -41,22 +47,21 @@ assert_commit psy-genesis "$ROOT/psy-genesis" "$EXPECTED_PSY_GENESIS_COMMIT"
 assert_commit psy-contracts "$ROOT/psy-contracts" "$EXPECTED_PSY_CONTRACTS_COMMIT"
 assert_commit psy-dapp "$ROOT/psy-dapp" "$EXPECTED_PSY_DAPP_COMMIT"
 
-assert_gitlink() {
-  local label="$1"
-  local path="$2"
-  local expected="$3"
-  local actual
+assert_runtime_gitlink() {
+  local path="$1"
+  local expected actual
 
+  expected="$(git -C "$ROOT" ls-tree "$EXPECTED_PARTH_RUNTIME_COMMIT" -- "$path" | awk '$1 == "160000" {print $3}')"
   actual="$(git -C "$ROOT" ls-tree "$runtime_head" -- "$path" | awk '$1 == "160000" {print $3}')"
   [ "$actual" = "$expected" ] || {
-    echo "$label gitlink mismatch: expected $expected, got ${actual:-<missing or not a submodule>}" >&2
+    echo "$path gitlink drifted from the pinned runtime: expected $expected, got ${actual:-<missing or not a submodule>}" >&2
     exit 1
   }
 }
 
-assert_gitlink psy-genesis psy-genesis "$EXPECTED_PSY_GENESIS_COMMIT"
-assert_gitlink psy-contracts psy-contracts "$EXPECTED_PSY_CONTRACTS_COMMIT"
-assert_gitlink psy-dapp psy-dapp "$EXPECTED_PSY_DAPP_COMMIT"
+assert_runtime_gitlink psy-genesis
+assert_runtime_gitlink psy-contracts
+assert_runtime_gitlink psy-dapp
 
 actual_contracts_sha="$(sha256sum "$ROOT/psy-genesis/genesis_contracts.json" | awk '{print $1}')"
 [ "$actual_contracts_sha" = "$EXPECTED_GENESIS_CONTRACTS_SHA256" ] || {

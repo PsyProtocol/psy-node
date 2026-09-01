@@ -2,9 +2,38 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-PROFILE_DIR="$ROOT/deploy/gcp/bsc-testnet"
+PROFILE_DIR="$ROOT/deploy/bsc-testnet/gcp"
 tmp_dir="$(mktemp -d)"
-trap 'rm -rf "$tmp_dir"' EXIT
+initial_genesis_commit="$(git -C "$ROOT/psy-genesis" rev-parse HEAD)"
+initial_contracts_commit="$(git -C "$ROOT/psy-contracts" rev-parse HEAD)"
+initial_dapp_commit="$(git -C "$ROOT/psy-dapp" rev-parse HEAD)"
+
+cleanup() {
+  git -C "$ROOT/psy-genesis" checkout --quiet --detach "$initial_genesis_commit" || true
+  git -C "$ROOT/psy-genesis" submodule update --init --recursive >/dev/null || true
+  git -C "$ROOT/psy-contracts" checkout --quiet --detach "$initial_contracts_commit" || true
+  git -C "$ROOT/psy-contracts" submodule update --init --recursive >/dev/null || true
+  git -C "$ROOT/psy-dapp" checkout --quiet --detach "$initial_dapp_commit" || true
+  git -C "$ROOT/psy-dapp" submodule update --init --recursive >/dev/null || true
+  rm -rf "$tmp_dir"
+}
+trap cleanup EXIT
+
+for source_dir in psy-genesis psy-contracts psy-dapp; do
+  [ -z "$(git -C "$ROOT/$source_dir" status --porcelain --untracked-files=normal)" ] || {
+    echo "$source_dir must be clean before the BSC profile test" >&2
+    exit 1
+  }
+done
+
+bash "$PROFILE_DIR/prepare-sources.sh" >/dev/null
+DEPLOY_NETWORK_PROFILE=bsc-testnet \
+  bash "$ROOT/deploy/gcp/tests/test-psy-node-source-layout.sh" >/dev/null
+
+if grep -q 'ethereum-sepolia' "$PROFILE_DIR/config.example.env"; then
+  echo "BSC config must not inherit the Sepolia profile" >&2
+  exit 1
+fi
 
 # The committed profile intentionally overlays the ignored production config.
 # An empty base proves all safety-critical BSC and topology values are explicit.

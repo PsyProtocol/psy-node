@@ -1,10 +1,9 @@
 # GCP Staging SSH Deployment
 
-For the isolated BSC Testnet profile that reuses the current machine topology,
-see [`bsc-testnet/README.md`](bsc-testnet/README.md).
-
-For the isolated BSC Testnet profile that reuses the current machine topology,
-see [`bsc-testnet/README.md`](bsc-testnet/README.md).
+Network-specific entrypoints live in
+[`deploy/ethereum-sepolia/gcp/`](../ethereum-sepolia/gcp/) and
+[`deploy/bsc-testnet/gcp/`](../bsc-testnet/gcp/). This directory contains the
+shared GCP deployment implementation.
 
 These scripts deploy onto pre-created staging machines reachable through local
 SSH config. They do not create VMs, networks, disks, or firewall rules.
@@ -14,8 +13,9 @@ SSH config. They do not create VMs, networks, disks, or firewall rules.
 Copy and edit the config:
 
 ```sh
-cp deploy/gcp/config.example.env deploy/gcp/config.env
-editor deploy/gcp/config.env
+cp deploy/ethereum-sepolia/gcp/config.example.env \
+  deploy/ethereum-sepolia/gcp/config.env
+editor deploy/ethereum-sepolia/gcp/config.env
 ```
 
 The default config uses these SSH aliases:

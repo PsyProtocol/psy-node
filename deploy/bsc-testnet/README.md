@@ -1,4 +1,15 @@
-# Local BSC Testnet Preparation
+# BSC Testnet Deployment Profile
+
+This directory owns all BSC Testnet-specific deployment configuration.
+
+- `gcp/`: public GCP configuration, source pins, preflight, wallet publication,
+  and full deployment entrypoint.
+- The scripts in this directory: isolated local BSC contract and backend
+  validation.
+
+For the cloud profile, start with [`gcp/README.md`](gcp/README.md).
+
+## Local Preparation
 
 This directory starts an isolated local EVM with BSC Testnet's chain ID and
 deploys the complete Psy L1 contract set to it. It is phase 2 of

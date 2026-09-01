@@ -46,7 +46,7 @@ verify_clean_git_source() {
   local dir="$2"
   local expected="$3"
   local match_mode="$4"
-  local actual dirty non_deploy_changes submodule_path expected_submodule_commit actual_submodule_commit
+  local actual dirty unexpected_dirty non_deploy_changes
 
   [ -e "$dir/.git" ] || {
     echo "$label is not a Git checkout: $dir" >&2
@@ -55,10 +55,32 @@ verify_clean_git_source() {
   actual="$(git -C "$dir" rev-parse HEAD)"
   dirty="$(git -C "$dir" status --porcelain --untracked-files=normal)"
   if [ -n "$dirty" ] && ! is_truthy "${ALLOW_DIRTY_DEPLOY_SOURCES:-0}"; then
-    echo "$label source tree is dirty: $dir" >&2
-    printf '%s\n' "$dirty" >&2
-    echo "commit/stash the changes or set ALLOW_DIRTY_DEPLOY_SOURCES=1 for deliberate debugging" >&2
-    exit 1
+    if [ "$match_mode" = "deploy-only" ]; then
+      # A network profile may detach these submodule worktrees at commits that
+      # differ from the superproject gitlinks. Their exact commits are checked
+      # independently below; every other dirty path remains a hard failure.
+      unexpected_dirty="$(
+        printf '%s\n' "$dirty" \
+          | awk '
+              {
+                status = substr($0, 1, 2)
+                path = substr($0, 4)
+                if (!(status == " M" && path ~ /^(psy-genesis|psy-contracts|psy-dapp)$/)) {
+                  print
+                }
+              }
+            '
+      )"
+    else
+      unexpected_dirty="$dirty"
+    fi
+
+    if [ -n "$unexpected_dirty" ]; then
+      echo "$label source tree is dirty: $dir" >&2
+      printf '%s\n' "$unexpected_dirty" >&2
+      echo "commit/stash the changes or set ALLOW_DIRTY_DEPLOY_SOURCES=1 for deliberate debugging" >&2
+      exit 1
+    fi
   fi
 
   if [ -n "$expected" ]; then
@@ -74,32 +96,14 @@ verify_clean_git_source() {
       }
       non_deploy_changes="$(
         git -C "$dir" diff --name-only "$expected" "$actual" \
-          | awk '$0 !~ /^deploy\// && $0 !~ /^(psy-genesis|psy-contracts|psy-dapp)$/'
+          | awk '$0 !~ /^deploy\//'
       )"
       if [ -n "$non_deploy_changes" ]; then
         echo "$label contains product changes after runtime commit $expected:" >&2
         printf '%s\n' "$non_deploy_changes" >&2
-        echo "only deploy/ and source-version-pinned product submodule gitlinks may differ on the deployment branch" >&2
+        echo "only deploy/ may differ on the deployment branch" >&2
         exit 1
       fi
-
-      for submodule_path in psy-genesis psy-contracts psy-dapp; do
-        git -C "$dir" diff --quiet "$expected" "$actual" -- "$submodule_path" && continue
-        case "$submodule_path" in
-          psy-genesis) expected_submodule_commit="${EXPECTED_PSY_GENESIS_COMMIT:-}" ;;
-          psy-contracts) expected_submodule_commit="${EXPECTED_PSY_CONTRACTS_COMMIT:-}" ;;
-          psy-dapp) expected_submodule_commit="${EXPECTED_PSY_DAPP_COMMIT:-}" ;;
-        esac
-        [ -n "$expected_submodule_commit" ] || {
-          echo "$label changes $submodule_path but its expected commit is not pinned" >&2
-          exit 1
-        }
-        actual_submodule_commit="$(git -C "$dir" ls-tree "$actual" -- "$submodule_path" | awk '$1 == "160000" {print $3}')"
-        [ "$actual_submodule_commit" = "$expected_submodule_commit" ] || {
-          echo "$label $submodule_path gitlink mismatch: expected $expected_submodule_commit, got ${actual_submodule_commit:-<missing or not a submodule>}" >&2
-          exit 1
-        }
-      done
     elif [ "$actual" != "$expected" ]; then
       echo "$label HEAD mismatch: expected $expected, got $actual" >&2
       exit 1

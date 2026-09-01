@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-CONFIG_EXAMPLE="$ROOT/deploy/gcp/config.example.env"
+CONFIG_EXAMPLE="$ROOT/deploy/ethereum-sepolia/gcp/config.example.env"
 EXPECTED_WORKSPACE="$(cd "$ROOT/.." && pwd)"
 
 actual_workspace="$(

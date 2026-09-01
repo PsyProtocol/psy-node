@@ -1,5 +1,15 @@
 # Fresh GCP Staging Deployment
 
+This directory is the shared deployment engine. Use one of the network-owned
+entrypoints instead of invoking it directly:
+
+- `deploy/ethereum-sepolia/gcp/deploy_all.sh`
+- `deploy/bsc-testnet/gcp/deploy_all.sh`
+
+Each entrypoint loads an independent configuration and source manifest, then
+prepares the three network-sensitive submodules before calling this engine.
+The compatibility defaults below resolve to Ethereum Sepolia only.
+
 To run the full fresh deployment through Cloudflare Pages:
 
 ```sh
@@ -10,10 +20,9 @@ CONFIRM_FULL_FRESH_DEPLOY=1 bash deploy/gcp/fresh-staging/deploy_all.sh
 `WORKSPACE_HOME` defaults to the parent directory of the deployment checkout
 and can be overridden in `deploy/gcp/config.env`.
 
-Before the destructive run, review
-[`deploy/source-versions.env`](../../source-versions.env). It is the single
-authoritative list of repositories, commits, and the verified Genesis contract
-artifact checksum used by both GCP and local deployment tooling.
+Before the destructive run, review the selected profile's
+`gcp/source-versions.env`. It is the authoritative list of repositories,
+commits, and the verified Genesis contract artifact checksum for that network.
 `deploy/gcp/config.env` contains only environment topology, credentials, and
 runtime tuning. Genesis contracts, ABI files, and the client config come from
 the pinned `psy-genesis` submodule.
