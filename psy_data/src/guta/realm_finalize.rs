@@ -16,7 +16,7 @@ use crate::{
         stats::GUTAStats,
         sub_tree_transition::SubTreeNodeStateTransition,
     },
-    p2p::{validate_goldilocks_limb, ProtocolReader, ProtocolResult, write_fixed, write_u16, write_u64},
+    p2p::{validate_goldilocks_limb, DOMAIN_VALIDATOR_LEAF_FELT, ProtocolReader, ProtocolResult, write_fixed, write_u16, write_u64},
     v1::qdata::{
         checkpoint::{PQEDCheckpointLeaf, PQEDCheckpointLeafCompactWithStateRoots},
         user::PQEDUserLeaf,
@@ -36,14 +36,30 @@ pub const REALM_ROTATION_VALIDATOR_SUB_IDS_PLACEHOLDER: [u16; 2] = [1, 2];
 // Validator Leaf Hash
 // =================================================================================
 
-/// V1 Validator Tree leaf: `H_many([validator_user_id])`.
-pub fn realm_validator_leaf_hash<F, Hash, H>(validator_user_id: u64) -> Hash
+/// Validator Tree leaf: `H_many([PSYVLF01, validator_user_id, node_sha_limbs, bls_sha_limbs])`,
+/// mirroring the host `ValidatorLeaf::leaf_hash`.
+pub fn realm_validator_leaf_hash<F, Hash, H>(
+    validator_user_id: u64,
+    node_id_hash_limbs: [u64; 4],
+    bls_hash_limbs: [u64; 4],
+) -> Hash
 where
     F: QFelt64,
     Hash: QFHashBase<F>,
     H: FieldQHasher<F, Hash>,
 {
-    H::q_hash_many(&[F::from_u64_value(validator_user_id)])
+    H::q_hash_many(&[
+        F::from_u64_value(DOMAIN_VALIDATOR_LEAF_FELT),
+        F::from_u64_value(validator_user_id),
+        F::from_u64_value(node_id_hash_limbs[0]),
+        F::from_u64_value(node_id_hash_limbs[1]),
+        F::from_u64_value(node_id_hash_limbs[2]),
+        F::from_u64_value(node_id_hash_limbs[3]),
+        F::from_u64_value(bls_hash_limbs[0]),
+        F::from_u64_value(bls_hash_limbs[1]),
+        F::from_u64_value(bls_hash_limbs[2]),
+        F::from_u64_value(bls_hash_limbs[3]),
+    ])
 }
 
 pub const VALIDATOR_SUB_ID_BITS: u8 = 8;
@@ -300,8 +316,9 @@ pub struct RealmFinalizeGUTAInput<F, Hash> {
     pub old_realm_root_proof: MerkleProofCore<Hash>,
 
     pub validator_user_id: F,
+    pub validator_node_id_hash_limbs: [u64; 4],
+    pub validator_bls_hash_limbs: [u64; 4],
     pub validator_tree_proof: MerkleProofCore<Hash>,
-
     pub validator_user_leaf: PQEDUserLeaf<F, Hash>,
     pub validator_user_tree_proof: MerkleProofCore<Hash>,
 
@@ -324,6 +341,8 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for RealmFinalizeGUTAInput<F
             checkpoint_leaf: PQEDCheckpointLeafCompactWithStateRoots::qp_rand_gen(),
             old_realm_root_proof: MerkleProofCore::qp_rand_gen(),
             validator_user_id: F::qp_rand_gen(),
+            validator_node_id_hash_limbs: rand::random(),
+            validator_bls_hash_limbs: rand::random(),
             validator_tree_proof: MerkleProofCore::qp_rand_gen(),
             validator_user_leaf: PQEDUserLeaf::qp_rand_gen(),
             validator_user_tree_proof: MerkleProofCore::qp_rand_gen(),
@@ -351,6 +370,7 @@ impl<F: QFelt64, Hash: Q256BitHash + PsyIOReadWrite> FallbackPsySerializeCanonic
             + self.checkpoint_leaf.pio_serialized_size()
             + self.old_realm_root_proof.pio_serialized_size()
             + 8 // validator_user_id
+            + 64 // validator digest limbs (2 x 4 x u64)
             + self.validator_tree_proof.pio_serialized_size()
             + self.validator_user_leaf.pio_serialized_size()
             + self.validator_user_tree_proof.pio_serialized_size()
@@ -370,6 +390,12 @@ impl<F: QFelt64, Hash: Q256BitHash + PsyIOReadWrite> FallbackPsySerializeCanonic
         self.checkpoint_leaf.pio_write_to_io(writer)?;
         self.old_realm_root_proof.pio_write_to_io(writer)?;
         writer.psy_write_u64(self.validator_user_id.to_u64_value())?;
+        for limb in self.validator_node_id_hash_limbs {
+            writer.psy_write_u64(limb)?;
+        }
+        for limb in self.validator_bls_hash_limbs {
+            writer.psy_write_u64(limb)?;
+        }
         self.validator_tree_proof.pio_write_to_io(writer)?;
         self.validator_user_leaf.pio_write_to_io(writer)?;
         self.validator_user_tree_proof.pio_write_to_io(writer)?;
@@ -390,6 +416,14 @@ impl<F: QFelt64, Hash: Q256BitHash + PsyIOReadWrite> FallbackPsySerializeCanonic
         let checkpoint_leaf = PQEDCheckpointLeafCompactWithStateRoots::<Hash>::pio_read_from_io(reader)?;
         let old_realm_root_proof = MerkleProofCore::<Hash>::pio_read_from_io(reader)?;
         let validator_user_id = F::from_owned_u64(reader.psy_read_u64()?);
+        let mut validator_node_id_hash_limbs = [0u64; 4];
+        for limb in &mut validator_node_id_hash_limbs {
+            *limb = reader.psy_read_u64()?;
+        }
+        let mut validator_bls_hash_limbs = [0u64; 4];
+        for limb in &mut validator_bls_hash_limbs {
+            *limb = reader.psy_read_u64()?;
+        }
         let validator_tree_proof = MerkleProofCore::<Hash>::pio_read_from_io(reader)?;
         let validator_user_leaf = PQEDUserLeaf::<F, Hash>::pio_read_from_io(reader)?;
         let validator_user_tree_proof = MerkleProofCore::<Hash>::pio_read_from_io(reader)?;
@@ -407,6 +441,8 @@ impl<F: QFelt64, Hash: Q256BitHash + PsyIOReadWrite> FallbackPsySerializeCanonic
             checkpoint_leaf,
             old_realm_root_proof,
             validator_user_id,
+            validator_node_id_hash_limbs,
+            validator_bls_hash_limbs,
             validator_tree_proof,
             validator_user_leaf,
             validator_user_tree_proof,

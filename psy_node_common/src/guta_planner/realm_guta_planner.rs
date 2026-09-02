@@ -75,6 +75,8 @@ pub struct PlannedFutureEndCapJob<F, Hash> {
 /// flow still works.
 pub struct RealmFinalizeGUTAIdentity<F, Hash> {
     pub validator_user_id: u64,
+    pub validator_node_id_hash_limbs: [u64; 4],
+    pub validator_bls_hash_limbs: [u64; 4],
     pub validator_user_leaf: PQEDUserLeaf<F, Hash>,
     pub validator_zk_private_key: Hash,
     pub validator_public_key_param: Hash,
@@ -124,9 +126,9 @@ pub struct RealmGUTAPlanner<F, Hash> {
     // GUTASingleEndCap / TwoGUTA root. When the validator identity is Some
     // (see `with_realm_finalize_identity` / `realm_finalize_enabled`),
     // `finalize_with_reward_ids` wraps the root GUTA with a RealmFinalizeGUTA
-    // job. `append_realm_finalize_guta` fail-closes if identity is configured
-    // but any required ZK key / leaf / tree proof is missing.
     pub realm_finalize_validator_user_id: Option<u64>,
+    pub realm_finalize_validator_node_id_hash_limbs: Option<[u64; 4]>,
+    pub realm_finalize_validator_bls_hash_limbs: Option<[u64; 4]>,
     pub realm_finalize_validator_user_leaf: Option<PQEDUserLeaf<F, Hash>>,
     pub realm_finalize_validator_zk_private_key: Option<Hash>,
     pub realm_finalize_validator_public_key_param: Option<Hash>,
@@ -185,6 +187,8 @@ impl<F, Hash> RealmGUTAPlanner<F, Hash> {
             total_jobs: 0,
             total_end_caps_processed: 0,
             realm_finalize_validator_user_id: None,
+            realm_finalize_validator_node_id_hash_limbs: None,
+            realm_finalize_validator_bls_hash_limbs: None,
             realm_finalize_validator_user_leaf: None,
             realm_finalize_validator_zk_private_key: None,
             realm_finalize_validator_public_key_param: None,
@@ -206,6 +210,8 @@ impl<F, Hash> RealmGUTAPlanner<F, Hash> {
     /// path so single-producer HTTP flow still works.
     pub fn with_realm_finalize_identity(mut self, identity: RealmFinalizeGUTAIdentity<F, Hash>) -> Self {
         self.realm_finalize_validator_user_id = Some(identity.validator_user_id);
+        self.realm_finalize_validator_node_id_hash_limbs = Some(identity.validator_node_id_hash_limbs);
+        self.realm_finalize_validator_bls_hash_limbs = Some(identity.validator_bls_hash_limbs);
         self.realm_finalize_validator_user_leaf = Some(identity.validator_user_leaf);
         self.realm_finalize_validator_zk_private_key = Some(identity.validator_zk_private_key);
         self.realm_finalize_validator_public_key_param = Some(identity.validator_public_key_param);
@@ -903,6 +909,12 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
         let validator_user_id_u64 = self
             .realm_finalize_validator_user_id
             .ok_or_else(|| anyhow::anyhow!("realm_finalize_validator_user_id is required to append RealmFinalizeGUTA"))?;
+        let validator_node_id_hash_limbs = self
+            .realm_finalize_validator_node_id_hash_limbs
+            .ok_or_else(|| anyhow::anyhow!("validator_node_id_hash_limbs is required to append RealmFinalizeGUTA"))?;
+        let validator_bls_hash_limbs = self
+            .realm_finalize_validator_bls_hash_limbs
+            .ok_or_else(|| anyhow::anyhow!("validator_bls_hash_limbs is required to append RealmFinalizeGUTA"))?;
         let private_key = self
             .realm_finalize_validator_zk_private_key
             .ok_or_else(|| anyhow::anyhow!("validator_zk_private_key is required to append RealmFinalizeGUTA"))?;
@@ -1116,6 +1128,8 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             checkpoint_leaf,
             old_realm_root_proof,
             validator_user_id: F::from_u64_value(validator_user_id_u64),
+            validator_node_id_hash_limbs,
+            validator_bls_hash_limbs,
             validator_tree_proof,
             validator_user_leaf,
             validator_user_tree_proof,

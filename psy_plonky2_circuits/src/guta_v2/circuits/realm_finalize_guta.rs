@@ -38,6 +38,7 @@ use psy_data::{
             SIGNATURE_TYPE_ZK,
         },
     },
+    p2p::DOMAIN_VALIDATOR_LEAF_FELT,
     worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse,
 };
 use psy_plonky2_basic_helpers::{
@@ -204,6 +205,8 @@ where
     pub checkpoint_leaf: QEDCheckpointLeafCompactWithStateRootsGadget,
     pub old_realm_root_proof: MerkleProofGadget,
     pub validator_user_id: Target,
+    pub validator_node_id_hash_limbs: [Target; 4],
+    pub validator_bls_hash_limbs: [Target; 4],
     pub validator_tree_proof: MerkleProofGadget,
     pub validator_user_leaf: QEDUserLeafGadget,
     pub validator_user_tree_proof: MerkleProofGadget,
@@ -543,9 +546,23 @@ where
         let validator_user_realm_id =
             builder.le_sum(validator_user_id_bits[realm_global_user_tree_height..].iter());
         builder.connect(validator_user_realm_id, realm_id);
-
-        let validator_leaf_hash =
-            builder.hash_n_to_hash_no_pad::<C::Hasher>(vec![validator_user_id]);
+        // Validator leaf mirrors the host `ValidatorLeaf::leaf_hash`; the SHA-256
+        // digest limbs arrive as witness values jointly bound by tree inclusion.
+        let validator_leaf_domain = builder.constant(C::F::from_canonical_u64(DOMAIN_VALIDATOR_LEAF_FELT));
+        let validator_node_id_hash_limbs = std::array::from_fn(|_| builder.add_virtual_target());
+        let validator_bls_hash_limbs = std::array::from_fn(|_| builder.add_virtual_target());
+        let validator_leaf_hash = builder.hash_n_to_hash_no_pad::<C::Hasher>(vec![
+            validator_leaf_domain,
+            validator_user_id,
+            validator_node_id_hash_limbs[0],
+            validator_node_id_hash_limbs[1],
+            validator_node_id_hash_limbs[2],
+            validator_node_id_hash_limbs[3],
+            validator_bls_hash_limbs[0],
+            validator_bls_hash_limbs[1],
+            validator_bls_hash_limbs[2],
+            validator_bls_hash_limbs[3],
+        ]);
         builder.ensure_hash_is_non_zero(validator_leaf_hash);
         let validator_tree_proof = MerkleProofGadget::add_virtual_to::<C::Hasher, C::F, D>(
             &mut builder,
@@ -747,6 +764,8 @@ where
             checkpoint_leaf,
             old_realm_root_proof,
             validator_user_id,
+            validator_node_id_hash_limbs,
+            validator_bls_hash_limbs,
             validator_tree_proof,
             validator_user_leaf,
             validator_user_tree_proof,
@@ -802,6 +821,20 @@ where
         self.old_realm_root_proof
             .set_witness_core_proof_q_generic(&mut witness, &input.old_realm_root_proof)?;
         witness.set_target(self.validator_user_id, input.validator_user_id)?;
+        for (target, limb) in self
+            .validator_node_id_hash_limbs
+            .iter()
+            .zip(input.validator_node_id_hash_limbs)
+        {
+            witness.set_target(*target, C::F::from_canonical_u64(limb))?;
+        }
+        for (target, limb) in self
+            .validator_bls_hash_limbs
+            .iter()
+            .zip(input.validator_bls_hash_limbs)
+        {
+            witness.set_target(*target, C::F::from_canonical_u64(limb))?;
+        }
         self.validator_tree_proof
             .set_witness_core_proof_q_generic(&mut witness, &input.validator_tree_proof)?;
         self.validator_user_leaf
@@ -969,10 +1002,11 @@ mod tests {
         utils::QPGenRandom,
     };
     use psy_data::v1::qdata::checkpoint::PQEDCheckpointLeaf;
+    use psy_data::p2p::DOMAIN_VALIDATOR_LEAF_FELT;
     use plonky2::{
-        field::goldilocks_field::GoldilocksField,
+        field::{goldilocks_field::GoldilocksField, types::Field},
         hash::{hash_types::HashOutTarget, poseidon::PoseidonHash},
-        iop::witness::{PartialWitness, WitnessWrite},
+        iop::{target::Target, witness::{PartialWitness, WitnessWrite}},
         plonk::{
             circuit_builder::CircuitBuilder,
             circuit_data::CircuitConfig,
@@ -988,6 +1022,8 @@ mod tests {
         stats::GUTAStats,
         sub_tree_transition::SubTreeNodeStateTransition,
     };
+    use parth_core::protocol::core_types::Q256BitHash;
+    use psy_data::p2p::{digest_to_field_limbs, sha256, BlsSecretKey, NodeId, ValidatorLeaf};
     use psy_plonky2_basic_helpers::builder::hash::core::CircuitBuilderHashCore;
 
     type C = PoseidonGoldilocksConfig;
@@ -1018,24 +1054,109 @@ mod tests {
     #[test]
     fn realm_finalize_validator_leaf_hash_matches_native() {
         let validator_user_id = 0x0102_0304_0506_0708;
-        let expected = realm_validator_leaf_hash::<F, Hash, Hasher>(validator_user_id);
+        let node_id_hash_limbs = [11u64, 22, 33, 44];
+        let bls_hash_limbs = [55u64, 66, 77, 88];
+        let expected = realm_validator_leaf_hash::<F, Hash, Hasher>(
+            validator_user_id,
+            node_id_hash_limbs,
+            bls_hash_limbs,
+        );
+        let domain = F::from_canonical_u64(DOMAIN_VALIDATOR_LEAF_FELT);
 
         let actual = prove_hash_target(
             |builder| {
-                let target = builder.add_virtual_target();
-                (
-                    builder.hash_n_to_hash_no_pad::<Hasher>(vec![target]),
-                    target,
-                )
+                let uid = builder.add_virtual_target();
+                let node_limbs: [Target; 4] = std::array::from_fn(|_| builder.add_virtual_target());
+                let bls_limbs: [Target; 4] = std::array::from_fn(|_| builder.add_virtual_target());
+                let domain_target = builder.constant(domain);
+                let output = builder.hash_n_to_hash_no_pad::<Hasher>(vec![
+                    domain_target,
+                    uid,
+                    node_limbs[0],
+                    node_limbs[1],
+                    node_limbs[2],
+                    node_limbs[3],
+                    bls_limbs[0],
+                    bls_limbs[1],
+                    bls_limbs[2],
+                    bls_limbs[3],
+                ]);
+                (output, (uid, node_limbs, bls_limbs))
             },
-            |witness, target| {
-                witness.set_target(target, F::from_u64_value(validator_user_id))
+            |witness, (uid, node_limbs, bls_limbs)| {
+                witness.set_target(uid, F::from_u64_value(validator_user_id))?;
+                for (target, limb) in node_limbs.iter().zip(node_id_hash_limbs) {
+                    witness.set_target(*target, F::from_canonical_u64(limb))?;
+                }
+                for (target, limb) in bls_limbs.iter().zip(bls_hash_limbs) {
+                    witness.set_target(*target, F::from_canonical_u64(limb))?;
+                }
+                Ok(())
             },
         );
 
         assert_eq!(actual, expected);
     }
 
+
+    #[test]
+    fn realm_finalize_validator_leaf_hash_matches_host_leaf() {
+        let validator_user_id = 0x0102_0304_0506_0708u64;
+        // Valid Ed25519 identity multihash: 0x00 0x24 || protobuf(0x08 0x01 0x12 0x20) || 32-byte key.
+        let mut node_raw = [0u8; 38];
+        node_raw[..6].copy_from_slice(&[0x00, 0x24, 0x08, 0x01, 0x12, 0x20]);
+        for (index, byte) in node_raw[6..].iter_mut().enumerate() {
+            *byte = (index as u8) * 7 + 3;
+        }
+        let node = NodeId::from_raw(node_raw).expect("structural identity multihash");
+        let bls = BlsSecretKey::key_gen(&[9u8; 32])
+            .expect("BLS keygen")
+            .public_key();
+        let leaf = ValidatorLeaf::new(validator_user_id, node, bls);
+        let host_hash = leaf.leaf_hash().expect("fixed sample digests are canonical");
+        let node_limbs = digest_to_field_limbs(&sha256(node.as_raw())).expect("canonical limbs");
+        let bls_limbs = digest_to_field_limbs(&sha256(bls.as_bytes())).expect("canonical limbs");
+        let expected = realm_validator_leaf_hash::<F, Hash, Hasher>(
+            validator_user_id,
+            node_limbs,
+            bls_limbs,
+        );
+        assert_eq!(expected, Hash::from_owned_32bytes(host_hash));
+
+        let domain = F::from_canonical_u64(DOMAIN_VALIDATOR_LEAF_FELT);
+        let actual = prove_hash_target(
+            |builder| {
+                let uid = builder.add_virtual_target();
+                let node_targets: [Target; 4] = std::array::from_fn(|_| builder.add_virtual_target());
+                let bls_targets: [Target; 4] = std::array::from_fn(|_| builder.add_virtual_target());
+                let domain_target = builder.constant(domain);
+                let output = builder.hash_n_to_hash_no_pad::<Hasher>(vec![
+                    domain_target,
+                    uid,
+                    node_targets[0],
+                    node_targets[1],
+                    node_targets[2],
+                    node_targets[3],
+                    bls_targets[0],
+                    bls_targets[1],
+                    bls_targets[2],
+                    bls_targets[3],
+                ]);
+                (output, (uid, node_targets, bls_targets))
+            },
+            |witness, (uid, node_targets, bls_targets)| {
+                witness.set_target(uid, F::from_u64_value(validator_user_id))?;
+                for (target, limb) in node_targets.iter().zip(node_limbs) {
+                    witness.set_target(*target, F::from_canonical_u64(limb))?;
+                }
+                for (target, limb) in bls_targets.iter().zip(bls_limbs) {
+                    witness.set_target(*target, F::from_canonical_u64(limb))?;
+                }
+                Ok(())
+            },
+        );
+        assert_eq!(actual, expected);
+    }
     #[test]
     fn realm_finalize_action_hash_matches_native() {
         let action = RealmFinalizeGUTAAction {
