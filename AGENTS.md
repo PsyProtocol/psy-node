@@ -662,6 +662,7 @@ Use these GitHub artifacts as the reference source. Do not substitute a machine-
 6. Coordinator edge RPC methods require the `psy_` prefix. The `psy_user_cli` binaries apply it automatically.
 7. Use release binaries for primary execution.
 8. Mint and withdraw operations for the same user are serial. Different users may run independently.
+9. Never wait with long unconditional sleeps. Wait on explicit readiness conditions: RPC responses, TCP ports, documented log markers, or file existence, with a short polling interval and a bounded maximum. State the expected condition and the timeout before waiting; treat timeout as a failure to investigate, not as success.
 
 ## Psy E2E Reference Registry
 

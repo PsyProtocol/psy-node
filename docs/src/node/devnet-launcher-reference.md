@@ -286,10 +286,9 @@ boundary (`dev/locSetupV4.ts:5338-5350`; `dev/locSetupV4.ts:5373`).
 | `--ide` | Boolean selector | Starts the IDE on 5176. | `dev/locSetupV4.ts:4592-4611` |
 | `--explorer` | Boolean selector | Starts Explorer on 5178. | `dev/locSetupV4.ts:4614-4638` |
 | `--mode-a-web-wallet-bridge` | Boolean selector | Starts the Mode A UI on 5179 only when every `link:` package resolves. | `dev/locSetupV4.ts:4640-4689` |
-| `--daemonlize` | Boolean modifier | Generates root `docker-compose.yml`, starts its limited service set, releases the lock, and exits. | `dev/locSetupV4.ts:4693-5069`; `dev/locSetupV4.ts:5609-5612` |
-| `--clean-state` | Boolean, deprecated | Sets startup `cleanState`; it is not a purge teardown flag. | `dev/locSetupV4.ts:5321,5362`; `dev/locSetupV4.ts:3866-3871` |
-| `--teardown` | Boolean | Skips auto-setup and startup lock, stops known processes/containers/ports, and exits. | `dev/locSetupV4.ts:5498-5507`; `dev/locSetupV4.ts:5550-5577` |
-| `--purge` | Boolean | Adds destructive deletion only to teardown; it also sets startup `cleanState`. | `dev/locSetupV4.ts:5360-5362`; `dev/locSetupV4.ts:3282-3300` |
+| `--daemonlize` | Boolean modifier | Generates root `docker-compose.yml`, starts its limited service set, releases the lock, and exits. | `dev/locSetupV4.ts:5609-5612` |
+| `--teardown` | Boolean | Skips auto-setup and startup lock, stops known processes/containers/ports, and exits. | `dev/locSetupV4.ts:5574-5577` |
+| `--purge` | Boolean | The single data-destroying switch. With `--teardown`, purges and exits; at startup, runs the same paired purge (checkpoints, `db/anvil/state.json`, logs, localhost deployments, devnet Docker volumes) before any process starts, then deploys contracts fresh. | `dev/locSetupV4.ts:5552-5558`; `dev/locSetupV4.ts:3282-3300` |
 | `--control COMMAND` | String | Sends exactly `restart`, `rollback-stop`, or `rollback-resume` to a live foreground supervisor. | `dev/locSetupV4.ts:5171-5189`; `dev/locSetupV4.ts:5368-5372` |
 | `--env ASSIGNMENTS` | String | Parses nonempty shell-style `KEY=VALUE` assignments; CLI values override inherited values for foreground children. | `dev/locSetupPolicy.ts:42-56`; `dev/locSetupV4.ts:3755-3767` |
 | `--help`, `-h` | Boolean | Prints embedded help after network and environment resolution, then exits. | `dev/locSetupV4.ts:5373-5396`; `dev/locSetupV4.ts:5396-5495` |
@@ -698,9 +697,9 @@ These are limitations of the current source, not supported command examples.
     families; treat daemonized P2P as a current-source limitation (`dev/locSetupV4.ts:4903-4954`).
 11. Teardown uses fixed process patterns and port ranges rather than the actual launch plan; Mode A port 5179 and a
     hypothetical custom Anvil port are absent from the fixed listener list (`dev/locSetupV4.ts:3234-3279`).
-12. `--clean-state` is not a supported purge recipe: full/DB startup rejects clean-state startup, and teardown purge
-    receives only `--purge` (`dev/locSetupV4.ts:3866-3871`; `dev/locSetupV4.ts:5574-5577`).
-
+12. Startup purge with `--purge` performs the full paired teardown (processes, containers, checkpoints, Anvil state,
+    deployments, volumes) before auto-setup; it is equivalent to `PURGE=1 make shutdown` followed by `make run-all`
+    (`dev/locSetupV4.ts:5552-5558`; `dev/locSetupV4.ts:3282-3300`).
 ## 18. Core Data Structures
 
 ### `ProcessOptions`
@@ -734,7 +733,6 @@ interface ProcessOptions {
     explorer?: boolean;
     modeAWebWalletBridge?: boolean;
     daemonlize?: boolean;
-    cleanState?: boolean;
     realmP2p?: boolean;
 }
 ```

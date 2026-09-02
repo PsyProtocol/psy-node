@@ -3327,7 +3327,6 @@ interface ProcessOptions {
     explorer?: boolean;
     modeAWebWalletBridge?: boolean;
     daemonlize?: boolean;
-    cleanState?: boolean;
     realmP2p?: boolean;
 }
 export const ROLLBACK_STOP_SENTINEL_CONTENT =
@@ -3780,7 +3779,6 @@ class DevNetProcessManager {
         const coordinatorEdgeCount = options.coordinatorEdgeCount;
         const coordinatorWorkersCount = options.coordinatorWorkersCount;
         this.genesisDataPath = options.genesisDataPath || "genesis.json";
-        const cleanState = !!options.cleanState;
         const skipBuild = skipBuildEnabled();
 
 
@@ -3865,11 +3863,6 @@ class DevNetProcessManager {
 
         // 2. Start Database
         if (this.needsStartDb) {
-            if (cleanState) {
-                throw new Error("[DevNet] --clean-state/--purge startup is disabled; use make restart-all so L1 and L2 are purged together");
-            }
-
-
             console.log("[DevNet] Killing existing docker containers...");
             await killDocker();
             const startDbCmd = ['./dev/start_db.sh', '--persist'];
@@ -5318,7 +5311,6 @@ async function runMain() {
             "explorer": { type: "boolean" },
             "mode-a-web-wallet-bridge": { type: "boolean" },
             "daemonlize": { type: "boolean" },
-            "clean-state": { type: "boolean" }, // deprecated alias
             "teardown": { type: "boolean" },
             "purge": { type: "boolean" },
             control: { type: "string" },
@@ -5359,7 +5351,6 @@ async function runMain() {
     const teardown = !!values["teardown"];
     const purge = !!values["purge"];
     const control = values["control"] as string | undefined;
-    const cleanState = !!values["clean-state"] || purge;
     const realmP2p = !!values["realm-p2p"];
 
     const provingBackend = values["proving-backend"];
@@ -5433,7 +5424,6 @@ Usage: bun run dev/locSetupV4.ts [options]
    --daemonlize                    Generate docker-compose.yml and start in background
    --teardown                      Stop local devnet processes/containers and exit
    --purge                         With --teardown (or startup), also remove local_checkpoints, logs, deployments, and devnet Docker volumes
-   --clean-state                   Deprecated alias for --purge during startup
    --help, -h                      Show this help message
 
   Examples:
@@ -5549,6 +5539,13 @@ Usage: bun run dev/locSetupV4.ts [options]
     try {
     // Auto-setup: clone repos, install deps, download keystore, build binaries
     // Skip for teardown so it works even on a partially configured machine
+    if (purge && !teardown) {
+        // Purge at startup is the single data-destroying switch: it wipes the
+        // same paired set as `PURGE=1 make shutdown` (checkpoints, Anvil state,
+        // logs, deployments, Docker volumes) before any process starts, so L1
+        // and L2 are purged together and contracts are redeployed fresh.
+        await teardownDevnet(".", purge);
+    }
     if (!teardown) {
         await ensureDevEnvironment(REPO_ROOT, {
             requireDocker: !hasOnlyOptions || db || relayer || bridgeProposerDaemon,
@@ -5602,7 +5599,6 @@ Usage: bun run dev/locSetupV4.ts [options]
             explorer,
             modeAWebWalletBridge,
             daemonlize: !!values.daemonlize,
-            cleanState,
             realmP2p,
         };
 

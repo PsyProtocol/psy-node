@@ -108,7 +108,13 @@ Anvil continuously saves the local L1 chain to `db/anvil/state.json`. A non-purg
 make restart-all
 ```
 
-`make restart-all` purges L1 and L2 together before starting a new chain.
+`make restart-all` purges L1 and L2 together before starting a new chain. The equivalent single-command form passes `--purge` to the launcher, which runs the same paired purge (checkpoints, `db/anvil/state.json`, logs, localhost deployments, devnet Docker volumes) before any process starts and then deploys contracts fresh:
+
+```bash
+make run-all LOCSETUP_START_ARGS="... --purge"
+```
+
+Purge and contract redeployment are paired by design: removing the persisted Anvil state and deployment summary makes the next startup deploy fresh contracts with `--reset`. There is no supported keep-data contract-swap path; a circuit or keystore change always requires a purge restart.
 
 ## 6. Offline Rollback Stop and Resume
 
