@@ -492,8 +492,9 @@ Violating any rule below requires an immediate fix before other work continues.
 2. Avoid vague names such as `tmp`, `data`, `result`, `obj`, and `foo` in long-lived or public interfaces.
 3. Use only universally understood abbreviations such as `ctx`, `id`, `cfg`, `db`, and `tx`.
 4. Use the same name for the same concept throughout the repository.
-5. Prefix booleans with `is_`, `has_`, `should_`, or `can_`.
-6. Do not embed task identifiers, phase numbers, or step numbers in code names, file names, comments, or commit messages.
+5. Do not rename an existing value when creating its target, constant, reference, witness, or borrowed form. Preserve the established concept name with a structural suffix only when the type requires distinction, for example `guta_circuit_whitelist_root` and `guta_circuit_whitelist_root_target`; subjective aliases such as `official_whitelist_root`, `canonical_root`, or `expected_root` for that same value are forbidden.
+6. Prefix booleans with `is_`, `has_`, `should_`, or `can_`.
+7. Do not embed task identifiers, phase numbers, or step numbers in code names, file names, comments, or commit messages.
 
 ## Module Boundaries and Imports
 

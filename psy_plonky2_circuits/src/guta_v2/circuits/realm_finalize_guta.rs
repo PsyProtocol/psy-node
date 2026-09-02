@@ -480,14 +480,11 @@ where
             root_guta_verifier_cap_height,
             guta_whitelist_tree_height,
         );
-        // Pin the root GUTA whitelist proof root to the protocol's official
-        // whitelist root. Without this, a malicious prover could supply an
-        // attacker-defined whitelist tree and recursively verify a forged
-        // GUTA header that was never produced by an approved circuit.
-        let official_whitelist_root = builder.constant_hash(guta_circuit_whitelist_root.into());
+        // Reject proofs whose whitelist root differs from the configured GUTA circuit whitelist.
+        let guta_circuit_whitelist_root_target = builder.constant_hash(guta_circuit_whitelist_root.into());
         builder.connect_hashes(
             root_guta.guta_whitelist_merkle_proof.root,
-            official_whitelist_root,
+            guta_circuit_whitelist_root_target,
         );
         let root_header = root_guta.guta_proof_header_gadget;
         let realm_id = root_header.state_transition.node_index;
