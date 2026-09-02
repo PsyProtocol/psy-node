@@ -36,6 +36,7 @@ type FinalizedBatch @entity {
 type DepositTreeMeta @entity {
   id: ID!                         # "{chain_index}"
   chain_index: Int!
+  chain_id: Int                   # owning EVM id; collision guard for one Envio / many L1s
   last_count: Int!                # current per-chain helper-tree count
   poseidon_deposit_tree_root: String!   # current per-chain Poseidon root
   deposit_tree_root: String!             # backwards-compatible alias

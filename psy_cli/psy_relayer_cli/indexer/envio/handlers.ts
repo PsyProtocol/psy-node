@@ -1,6 +1,7 @@
 // @ts-nocheck
 import generated from "./generated/index.js";
 import { hashNoPad } from 'poseidon-goldilocks-lite';
+import { assertChainIndexOwner } from "./chain_index_guard.mjs";
 
 const { Bridge, StateManager } = generated;
 
@@ -197,6 +198,7 @@ Bridge.DepositRecorded.handler(async ({ event, context }) => {
 
   const metaId = `${chainIndex}`;
   const existingMeta = await context.DepositTreeMeta.get(metaId);
+  assertChainIndexOwner(existingMeta, chainIndex, chainId);
   const nextTreeIndex = existingMeta != null ? Number(existingMeta.last_count || 0) : 0;
   context.Deposit.set({
     id: `${chainId}-${depositIndex}`,
@@ -234,6 +236,7 @@ Bridge.DepositRecorded.handler(async ({ event, context }) => {
   context.DepositTreeMeta.set({
     id: metaId,
     chain_index: chainIndex,
+    chain_id: chainId,
     last_count: nextTreeIndex + 1,
     poseidon_deposit_tree_root: poseidonRootHex,
     deposit_tree_root: poseidonRootHex,

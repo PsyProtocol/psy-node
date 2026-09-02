@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "envio dev --config ./config.yaml",
     "codegen": "envio codegen --config ./config.yaml",
-    "start": "envio start --config ./config.yaml"
+    "start": "envio start --config ./config.yaml",
+    "test": "node --test ./chain_index_guard.test.mjs"
   },
   "devDependencies": {
     "envio": "2.32.10",

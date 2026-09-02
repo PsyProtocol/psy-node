@@ -8,6 +8,7 @@
 export const Deposit = {
   chain_id: "Int",
   deposit_index: "Int",
+  chain_local_deposit_index: "Int",
   shield_address: "String",
   token: "String",
   l2_token_contract_id: "String",
@@ -30,6 +31,7 @@ export const FinalizedBatch = {
 
 export const DepositTreeMeta = {
   chain_index: "Int",
+  chain_id: "Int",
   last_count: "Int",
   poseidon_deposit_tree_root: "String",
   deposit_tree_root: "String",

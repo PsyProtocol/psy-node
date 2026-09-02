@@ -1,5 +1,6 @@
-# Envio config template for PSY relayer.
+# Envio config template for a single local L1.
 # Fill contract addresses and start blocks before running.
+# One Envio indexing many L1s: see config.multi-l1.template.yaml.
 
 name: psy-relayer-indexer
 field_selection:
