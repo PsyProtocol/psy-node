@@ -45,37 +45,37 @@ use psy_node_core::config::node_start_config::{RealmEdgeStartConfig, RealmProces
 use serde::Deserialize;
 
 #[derive(Clone, Deserialize)]
-struct RosterSubEntry {
+struct ValidatorSubEntry {
     processor_node_id_hex38: String,
     bls_public_hex: String,
 }
 
 #[derive(Deserialize)]
-struct RosterFile {
-    realms: HashMap<String, HashMap<String, RosterSubEntry>>,
+struct ValidatorsFile {
+    realms: HashMap<String, HashMap<String, ValidatorSubEntry>>,
 }
 
-/// Build a validator registry from `init-realm-p2p-keys` roster.json.
-pub fn validator_registry_from_roster_path(path: &str) -> anyhow::Result<ValidatorRegistry> {
+/// Build a validator registry from `init-realm-p2p-keys` validators.json.
+pub fn validator_registry_from_validators_path(path: &str) -> anyhow::Result<ValidatorRegistry> {
     let text = std::fs::read_to_string(path)
-        .map_err(|error| anyhow::anyhow!("failed to read P2P roster {path}: {error}"))?;
-    let roster: RosterFile = serde_json::from_str(&text)
-        .map_err(|error| anyhow::anyhow!("failed to parse P2P roster {path}: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("failed to read P2P validators file {path}: {error}"))?;
+    let validators: ValidatorsFile = serde_json::from_str(&text)
+        .map_err(|error| anyhow::anyhow!("failed to parse P2P validators file {path}: {error}"))?;
     let mut registry = ValidatorRegistry::new();
-    for (realm_key, subs) in roster.realms {
+    for (realm_key, subs) in validators.realms {
         let realm_id: u32 = realm_key
             .parse()
-            .map_err(|error| anyhow::anyhow!("invalid roster realm id {realm_key}: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("invalid validators realm id {realm_key}: {error}"))?;
         for (sub_key, entry) in subs {
             let realm_sub_id: u16 = sub_key
                 .parse()
-                .map_err(|error| anyhow::anyhow!("invalid roster sub id {sub_key}: {error}"))?;
+                .map_err(|error| anyhow::anyhow!("invalid validators sub id {sub_key}: {error}"))?;
             let bytes = hex::decode(&entry.bls_public_hex).map_err(|error| {
-                anyhow::anyhow!("invalid roster BLS hex for realm {realm_id} sub {realm_sub_id}: {error}")
+                anyhow::anyhow!("invalid validators BLS hex for realm {realm_id} sub {realm_sub_id}: {error}")
             })?;
             if bytes.len() != 48 {
                 anyhow::bail!(
-                    "roster BLS key for realm {realm_id} sub {realm_sub_id} must be 48 bytes, got {}",
+                    "validators BLS key for realm {realm_id} sub {realm_sub_id} must be 48 bytes, got {}",
                     bytes.len()
                 );
             }
@@ -95,52 +95,52 @@ pub fn validator_registry_from_roster_path(path: &str) -> anyhow::Result<Validat
                         },
                     )
                     .is_none(),
-                "duplicate roster validator for realm {realm_id} sub {realm_sub_id}"
+                "duplicate validators entry for realm {realm_id} sub {realm_sub_id}"
             );
         }
     }
     Ok(registry)
 }
 
-pub fn bls_keys_from_roster_path(
+pub fn bls_keys_from_validators_path(
     path: &str,
     realm_id: u32,
 ) -> anyhow::Result<HashMap<u16, BlsPublicKey>> {
     let text = std::fs::read_to_string(path)
-        .map_err(|error| anyhow::anyhow!("failed to read P2P roster {path}: {error}"))?;
-    let roster: RosterFile = serde_json::from_str(&text)
-        .map_err(|error| anyhow::anyhow!("failed to parse P2P roster {path}: {error}"))?;
-    let subs = roster
+        .map_err(|error| anyhow::anyhow!("failed to read P2P validators file {path}: {error}"))?;
+    let validators: ValidatorsFile = serde_json::from_str(&text)
+        .map_err(|error| anyhow::anyhow!("failed to parse P2P validators file {path}: {error}"))?;
+    let subs = validators
         .realms
         .get(&realm_id.to_string())
-        .ok_or_else(|| anyhow::anyhow!("P2P roster missing realm {realm_id}"))?;
+        .ok_or_else(|| anyhow::anyhow!("P2P validators missing realm {realm_id}"))?;
     let mut keys = HashMap::with_capacity(subs.len());
     for (sub, entry) in subs {
         let sub_id: u16 = sub
             .parse()
-            .map_err(|error| anyhow::anyhow!("invalid roster sub id {sub}: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("invalid validators sub id {sub}: {error}"))?;
         let bytes = hex::decode(&entry.bls_public_hex).map_err(|error| {
-            anyhow::anyhow!("invalid roster BLS hex for realm {realm_id} sub {sub_id}: {error}")
+            anyhow::anyhow!("invalid validators BLS hex for realm {realm_id} sub {sub_id}: {error}")
         })?;
         let key = BlsPublicKey::from_bytes(&bytes)
-            .map_err(|error| anyhow::anyhow!("invalid roster BLS key for realm {realm_id} sub {sub_id}: {error}"))?;
-        anyhow::ensure!(keys.insert(sub_id, key).is_none(), "duplicate roster sub_id {sub_id}");
+            .map_err(|error| anyhow::anyhow!("invalid validators BLS key for realm {realm_id} sub {sub_id}: {error}"))?;
+        anyhow::ensure!(keys.insert(sub_id, key).is_none(), "duplicate validators sub_id {sub_id}");
     }
     Ok(keys)
 }
 
-pub fn proposer_node_ids_from_roster_path(
+pub fn proposer_node_ids_from_validators_path(
     path: &str,
     realm_id: u32,
 ) -> anyhow::Result<HashMap<u16, NodeId>> {
     let text = std::fs::read_to_string(path)
-        .map_err(|error| anyhow::anyhow!("failed to read P2P roster {path}: {error}"))?;
-    let roster: RosterFile = serde_json::from_str(&text)
-        .map_err(|error| anyhow::anyhow!("failed to parse P2P roster {path}: {error}"))?;
-    let subs = roster
+        .map_err(|error| anyhow::anyhow!("failed to read P2P validators file {path}: {error}"))?;
+    let validators: ValidatorsFile = serde_json::from_str(&text)
+        .map_err(|error| anyhow::anyhow!("failed to parse P2P validators file {path}: {error}"))?;
+    let subs = validators
         .realms
         .get(&realm_id.to_string())
-        .ok_or_else(|| anyhow::anyhow!("P2P roster missing realm {realm_id}"))?;
+        .ok_or_else(|| anyhow::anyhow!("P2P validators missing realm {realm_id}"))?;
     let values = subs
         .iter()
         .map(|(sub, entry)| format!("{}:{}", sub, entry.processor_node_id_hex38))
@@ -156,10 +156,10 @@ pub fn maybe_build_processor_network(
     if !config.realm_p2p_enabled() {
         return Ok(None);
     }
-    let roster_path = config.p2p_roster_path.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("--p2p-roster-path is required when Realm P2P is enabled")
+    let validators_path = config.p2p_validators_path.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("--p2p-validators-path is required when Realm P2P is enabled")
     })?;
-    proposer_node_ids_from_roster_path(roster_path, config.realm_id as u32)?;
+    proposer_node_ids_from_validators_path(validators_path, config.realm_id as u32)?;
     let identity = config
         .p2p_identity_key_path
         .as_deref()
@@ -224,13 +224,13 @@ pub fn maybe_build_edge_network(
 fn proposer_node_ids_from_config(
     config: &RealmProcessorStartConfig,
 ) -> anyhow::Result<HashMap<u16, NodeId>> {
-    let roster_path = config.p2p_roster_path.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("--p2p-roster-path is required when Realm P2P is enabled")
+    let validators_path = config.p2p_validators_path.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("--p2p-validators-path is required when Realm P2P is enabled")
     })?;
-    let proposer_node_ids = proposer_node_ids_from_roster_path(roster_path, config.realm_id as u32)?;
+    let proposer_node_ids = proposer_node_ids_from_validators_path(validators_path, config.realm_id as u32)?;
     anyhow::ensure!(
         proposer_node_ids.len() == config.p2p_validator_sub_ids.len(),
-        "processor P2P roster must contain one proposer NodeId for every validator"
+        "processor P2P validators must contain one proposer NodeId for every validator"
     );
     Ok(proposer_node_ids)
 }
@@ -263,11 +263,11 @@ where
         .expect("processor Realm P2P proposer NodeId config was validated at startup");
 
 
-    let roster_path = config.p2p_roster_path.as_deref().expect(
-        "processor Realm P2P roster path was validated at startup",
+    let validators_path = config.p2p_validators_path.as_deref().expect(
+        "processor Realm P2P validators path was validated at startup",
     );
-    let validator_registry = validator_registry_from_roster_path(roster_path)
-        .expect("processor Realm P2P roster was validated at startup");
+    let validator_registry = validator_registry_from_validators_path(validators_path)
+        .expect("processor Realm P2P validators file was validated at startup");
     let proof_verifier = Arc::new(proof_verifier);
     let commands = handle.commands();
     let mut events = handle.into_parts().1;

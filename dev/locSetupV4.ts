@@ -969,7 +969,7 @@ type RealmP2pSubEntry = {
     bls_path: string;
 };
 
-type RealmP2pRoster = {
+type RealmP2pValidators = {
     coordinator: { peer_id: string; node_id_hex38: string; identity_path: string };
     realms: Record<string, Record<string, RealmP2pSubEntry>>;
 };
@@ -1003,24 +1003,24 @@ type GenesisValidatorEntry = {
 };
 
 /**
- * Inject the Realm P2P roster's processor identities into genesis.json so the
- * genesis validator tree matches the P2P key material. A null roster (non-P2P
+ * Inject the Realm P2P validators manifest's processor identities into genesis.json so the
+ * genesis validator tree matches the P2P key material. A null validators manifest (non-P2P
  * run) rewrites validators to an empty list, leaving no stale entries behind.
  */
 export async function injectGenesisValidators(
     genesisPath: string,
-    roster: RealmP2pRoster | null,
+    validators: RealmP2pValidators | null,
 ): Promise<void> {
     const genesis = JSON.parse(await fs.promises.readFile(genesisPath, "utf-8")) as {
         validators?: GenesisValidatorEntry[];
     };
-    const validators: GenesisValidatorEntry[] = [];
-    if (roster) {
-        for (const realmId of Object.keys(roster.realms).map(Number).sort((a, b) => a - b)) {
-            const subs = roster.realms[String(realmId)];
+    const entries: GenesisValidatorEntry[] = [];
+    if (validators) {
+        for (const realmId of Object.keys(validators.realms).map(Number).sort((a, b) => a - b)) {
+            const subs = validators.realms[String(realmId)];
             for (const subId of Object.keys(subs).map(Number).sort((a, b) => a - b)) {
                 const entry = subs[String(subId)];
-                validators.push({
+                entries.push({
                     realm_id: realmId,
                     realm_sub_id: subId,
                     validator_user_id: realmP2pValidatorUserId(realmId, subId),
@@ -1030,7 +1030,7 @@ export async function injectGenesisValidators(
             }
         }
     }
-    genesis.validators = validators;
+    genesis.validators = entries;
     await fs.promises.writeFile(genesisPath, JSON.stringify(genesis, null, 2), "utf-8");
 }
 
@@ -1043,19 +1043,19 @@ export function realmP2pHttpPort(realmId: number, subId: number, edgeIndex: numb
     return base + (subId - 1) * realmEdgeCount + edgeIndex;
 }
 
-async function ensureRealmP2pRoster(
+async function ensureRealmP2pValidators(
     nodeCli: string,
     cwd: string,
     realmIds: number[],
-): Promise<RealmP2pRoster> {
-    const rosterPath = path.join(cwd, "local_checkpoints", "realm_p2p", "roster.json");
-    if (await exists(rosterPath)) {
-        const existing = JSON.parse(await fs.promises.readFile(rosterPath, "utf-8")) as RealmP2pRoster;
+): Promise<RealmP2pValidators> {
+    const validatorsPath = path.join(cwd, "local_checkpoints", "realm_p2p", "validators.json");
+    if (await exists(validatorsPath)) {
+        const existing = JSON.parse(await fs.promises.readFile(validatorsPath, "utf-8")) as RealmP2pValidators;
         const complete = realmIds.every((realmId) =>
             REALM_P2P_SUB_IDS.every((subId) => existing.realms?.[String(realmId)]?.[String(subId)]),
         );
         if (complete) {
-            console.log(`[DevNet] Reusing Realm P2P roster at ${REALM_P2P_OUT_DIR}/roster.json`);
+            console.log(`[DevNet] Reusing Realm P2P validators at ${REALM_P2P_OUT_DIR}/validators.json`);
             return existing;
         }
     }
@@ -1072,31 +1072,31 @@ async function ensureRealmP2pRoster(
         const err = await new Response(proc.stderr).text();
         throw new Error(`init-realm-p2p-keys failed (${exit}): ${err}`);
     }
-    return JSON.parse(await fs.promises.readFile(rosterPath, "utf-8")) as RealmP2pRoster;
+    return JSON.parse(await fs.promises.readFile(validatorsPath, "utf-8")) as RealmP2pValidators;
 }
 
 function realmP2pProcessorExtraArgs(
     host: string,
     realmId: number,
     subId: number,
-    roster: RealmP2pRoster,
+    validators: RealmP2pValidators,
 ): string[] {
-    const self = roster.realms[String(realmId)][String(subId)];
+    const self = validators.realms[String(realmId)][String(subId)];
     const args = [
         "--p2p-identity-key", self.processor_identity_path,
         "--p2p-bls-key", self.bls_path,
         "--p2p-listen", realmP2pListen(host, realmP2pProcessorPort(realmId, subId)),
-        "--p2p-coordinator", realmP2pBootnode(host, 40999, roster.coordinator.peer_id),
+        "--p2p-coordinator", realmP2pBootnode(host, 40999, validators.coordinator.peer_id),
         "--p2p-validator-sub-ids", REALM_P2P_SUB_IDS.join(","),
         "--p2p-checkpoints-per-epoch", "10",
         "--p2p-validator-user-id", realmP2pValidatorUserId(realmId, subId).toString(),
-        "--p2p-roster-path", `${REALM_P2P_OUT_DIR}/roster.json`,
+        "--p2p-validators-path", `${REALM_P2P_OUT_DIR}/validators.json`,
     ];
     for (const otherSub of REALM_P2P_SUB_IDS) {
         if (otherSub === subId) {
             continue;
         }
-        const other = roster.realms[String(realmId)][String(otherSub)];
+        const other = validators.realms[String(realmId)][String(otherSub)];
         args.push(
             "--p2p-bootnode",
             realmP2pBootnode(host, realmP2pProcessorPort(realmId, otherSub), other.processor_peer_id),
@@ -1109,10 +1109,10 @@ function realmP2pEdgeExtraArgs(
     host: string,
     realmId: number,
     subId: number,
-    roster: RealmP2pRoster,
+    validators: RealmP2pValidators,
 ): string[] {
-    const self = roster.realms[String(realmId)][String(subId)];
-    const subs = roster.realms[String(realmId)];
+    const self = validators.realms[String(realmId)][String(subId)];
+    const subs = validators.realms[String(realmId)];
     const args = [
         "--p2p-identity-key", self.edge_identity_path,
         "--p2p-listen", realmP2pListen(host, realmP2pEdgePort(realmId, subId)),
@@ -3890,13 +3890,13 @@ class DevNetProcessManager {
         const workerCli = './target/release/psy_worker_cli';
         const realmP2p = !!options.realmP2p;
         const realmP2pSubIds: readonly number[] = realmP2p ? REALM_P2P_SUB_IDS : [1];
-        let realmP2pRoster: RealmP2pRoster | null = null;
+        let realmP2pValidators: RealmP2pValidators | null = null;
         if (realmP2p && (startCoordinatorProcessor || startRealmProcessor)) {
             const allRealmIds = Array.from({ length: realmsCount }, (_, i) => startRealmId + i);
-            realmP2pRoster = await ensureRealmP2pRoster(nodeCli, cwd, allRealmIds);
+            realmP2pValidators = await ensureRealmP2pValidators(nodeCli, cwd, allRealmIds);
         }
 
-        await injectGenesisValidators(path.join(cwd, this.genesisDataPath), realmP2pRoster);
+        await injectGenesisValidators(path.join(cwd, this.genesisDataPath), realmP2pValidators);
 
 
         // 3. Coordinator Processor
@@ -3951,7 +3951,7 @@ class DevNetProcessManager {
                         '--listen', '0.0.0.0',
                         '--proving-backend', backend,
                         '--verbose',
-                        ...(realmP2p ? ['--p2p-roster-path', `${REALM_P2P_OUT_DIR}/roster.json`, '--p2p-checkpoints-per-epoch', '10'] : []),
+                        ...(realmP2p ? ['--p2p-validators-path', `${REALM_P2P_OUT_DIR}/validators.json`, '--p2p-checkpoints-per-epoch', '10'] : []),
                     ],
                     coordinatorEdgeProcessorStartedDetector,
                     { cwd, ...getLogPaths(`coordinator_edge_${j}`, true), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
@@ -4011,8 +4011,8 @@ class DevNetProcessManager {
                                     ? `realm_${realmId}_processor`
                                     : `realm_${realmId}_sub_${subId}_processor`;
                                 const realmLogPaths = getLogPaths(logName, false);
-                                const extra = realmP2pRoster
-                                    ? realmP2pProcessorExtraArgs(this.host, realmId, subId, realmP2pRoster)
+                                const extra = realmP2pValidators
+                                    ? realmP2pProcessorExtraArgs(this.host, realmId, subId, realmP2pValidators)
                                     : [];
                                 const proc = await retryProcessorStartup(
                                     `realm ${realmId} sub ${subId} processor`,
@@ -4058,8 +4058,8 @@ class DevNetProcessManager {
                         for (const subId of realmP2pSubIds) {
                             for (let j = 0; j < realmEdgeCount; j++) {
                                 const port = realmP2pHttpPort(realmId, subId, j, realmEdgeCount);
-                                const extra = realmP2pRoster
-                                    ? realmP2pEdgeExtraArgs(this.host, realmId, subId, realmP2pRoster)
+                                const extra = realmP2pValidators
+                                    ? realmP2pEdgeExtraArgs(this.host, realmId, subId, realmP2pValidators)
                                     : [];
                                 const logName = subId === 1
                                     ? `realm_edge_${realmId}_${j}`
@@ -4715,13 +4715,13 @@ class DevNetProcessManager {
         const backend = this.provingBackend || (jtmb ? 'jtmb-poseidon-goldilocks' : 'plonky2-poseidon-goldilocks');
         const realmP2p = !!options.realmP2p;
         const realmP2pSubIds: readonly number[] = realmP2p ? REALM_P2P_SUB_IDS : [1];
-        let realmP2pRoster: RealmP2pRoster | null = null;
+        let realmP2pValidators: RealmP2pValidators | null = null;
         if (realmP2p && (startCoordinatorProcessor || startRealmProcessor)) {
             const allRealmIds = Array.from({ length: realmsCount }, (_, i) => startRealmId + i);
-            realmP2pRoster = await ensureRealmP2pRoster("./target/release/psy_node_cli", cwd, allRealmIds);
+            realmP2pValidators = await ensureRealmP2pValidators("./target/release/psy_node_cli", cwd, allRealmIds);
         }
 
-        await injectGenesisValidators(path.join(cwd, this.genesisDataPath), realmP2pRoster);
+        await injectGenesisValidators(path.join(cwd, this.genesisDataPath), realmP2pValidators);
 
 
         const services: any = {};
@@ -4875,7 +4875,7 @@ class DevNetProcessManager {
                         "--listen", "0.0.0.0",
                         "--proving-backend", backend,
                         "--verbose",
-                        ...(realmP2p ? ["--p2p-roster-path", `${REALM_P2P_OUT_DIR}/roster.json`, "--p2p-checkpoints-per-epoch", "10"] : []),
+                        ...(realmP2p ? ["--p2p-validators-path", `${REALM_P2P_OUT_DIR}/validators.json`, "--p2p-checkpoints-per-epoch", "10"] : []),
                     ]),
                     ports: [`${port}:${port}`]
                 };
@@ -4904,8 +4904,8 @@ class DevNetProcessManager {
             for (let i = 0; i < realmsCount; i++) {
                 const realmId = startRealmId + i;
                 for (const subId of realmP2pSubIds) {
-                    const extra = realmP2pRoster
-                        ? realmP2pProcessorExtraArgs("127.0.0.1", realmId, subId, realmP2pRoster)
+                    const extra = realmP2pValidators
+                        ? realmP2pProcessorExtraArgs("127.0.0.1", realmId, subId, realmP2pValidators)
                         : [];
                     const serviceName = subId === 1
                         ? `realm-${realmId}-processor`
@@ -4928,8 +4928,8 @@ class DevNetProcessManager {
                     ]);
                     for (let j = 0; j < realmEdgeCount; j++) {
                         const port = realmP2pHttpPort(realmId, subId, j, realmEdgeCount);
-                        const edgeExtra = realmP2pRoster
-                            ? realmP2pEdgeExtraArgs("127.0.0.1", realmId, subId, realmP2pRoster)
+                        const edgeExtra = realmP2pValidators
+                            ? realmP2pEdgeExtraArgs("127.0.0.1", realmId, subId, realmP2pValidators)
                             : [];
                         const edgeName = subId === 1
                             ? `realm-${realmId}-edge-${j}`

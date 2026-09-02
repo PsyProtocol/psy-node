@@ -187,6 +187,24 @@ pub struct BridgeAggGlobalStateRoots {
     pub user_tree_root: String,
     pub withdrawal_tree_root: String,
     pub user_registration_tree_root: String,
+    pub validator_tree_root: String,
+}
+
+fn parse_bridge_global_state_roots(
+    roots: &BridgeAggGlobalStateRoots,
+) -> Result<PQEDCheckpointGlobalStateRoots<parth_core::pgoldilocks::QHashOut<F>>, ErrorObjectOwned> {
+    let parse = |value: &str, name| {
+        parse_hex_qhashout_to_qhash(value)
+            .map_err(|error| ErrorObjectOwned::owned(1, format!("parse {name}"), Some(error.to_string())))
+    };
+    Ok(PQEDCheckpointGlobalStateRoots {
+        contract_tree_root: parse(&roots.contract_tree_root, "contract_tree_root")?,
+        deposit_tree_root: parse(&roots.deposit_tree_root, "deposit_tree_root")?,
+        user_tree_root: parse(&roots.user_tree_root, "user_tree_root")?,
+        withdrawal_tree_root: parse(&roots.withdrawal_tree_root, "withdrawal_tree_root")?,
+        user_registration_tree_root: parse(&roots.user_registration_tree_root, "user_registration_tree_root")?,
+        validator_tree_root: parse(&roots.validator_tree_root, "validator_tree_root")?,
+    })
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1106,23 +1124,9 @@ impl ProveProxyRpcServer for ProveProxyServerProvider {
                     .map_err(|e| ErrorObjectOwned::owned(1, "parse final leaf stats hash", Some(e.to_string())))?,
             };
 
-            // Parse global state roots (anchors the user_tree_root to the verified checkpoint)
-            let parse_qhash = |hex: &str| -> anyhow::Result<parth_core::pgoldilocks::QHashOut<F>> {
-                parse_hex_qhashout_to_qhash(hex)
-            };
-            let global_state_roots = PQEDCheckpointGlobalStateRoots {
-                contract_tree_root: parse_qhash(&input.final_checkpoint_global_state_roots.contract_tree_root)
-                    .map_err(|e| ErrorObjectOwned::owned(1, "parse contract_tree_root", Some(e.to_string())))?,
-                deposit_tree_root: parse_qhash(&input.final_checkpoint_global_state_roots.deposit_tree_root)
-                    .map_err(|e| ErrorObjectOwned::owned(1, "parse deposit_tree_root", Some(e.to_string())))?,
-                user_tree_root: parse_qhash(&input.final_checkpoint_global_state_roots.user_tree_root)
-                    .map_err(|e| ErrorObjectOwned::owned(1, "parse user_tree_root", Some(e.to_string())))?,
-                withdrawal_tree_root: parse_qhash(&input.final_checkpoint_global_state_roots.withdrawal_tree_root)
-                    .map_err(|e| ErrorObjectOwned::owned(1, "parse withdrawal_tree_root", Some(e.to_string())))?,
-                user_registration_tree_root: parse_qhash(&input.final_checkpoint_global_state_roots.user_registration_tree_root)
-                    .map_err(|e| ErrorObjectOwned::owned(1, "parse user_registration_tree_root", Some(e.to_string())))?,
-                validator_tree_root: Default::default(),
-            };
+            let global_state_roots = parse_bridge_global_state_roots(
+                &input.final_checkpoint_global_state_roots,
+            )?;
 
             // Parse witnesses (slot witnesses are the full TreeRootInContractStateWitnessInput)
             let parse_slot_witness = |w: &BridgeAggSlotWitness| -> anyhow::Result<TreeRootInContractStateWitnessInput<F>> {
@@ -1936,5 +1940,49 @@ impl ProveProxyRpcServer for ProveProxyServerProvider {
                 Some(format!("ZK proof generation failed: {}", prove_err)),
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod bridge_root_tests {
+    use super::{parse_bridge_global_state_roots, BridgeAggGlobalStateRoots};
+
+    fn roots(validator_tree_root: &str) -> BridgeAggGlobalStateRoots {
+        let root = "0x0000000000000001000000000000000200000000000000030000000000000004";
+        BridgeAggGlobalStateRoots {
+            contract_tree_root: root.into(),
+            deposit_tree_root: root.into(),
+            user_tree_root: root.into(),
+            withdrawal_tree_root: root.into(),
+            user_registration_tree_root: root.into(),
+            validator_tree_root: validator_tree_root.into(),
+        }
+    }
+
+    #[test]
+    fn validator_tree_root_is_parsed_into_bridge_state_roots() {
+        let parsed = parse_bridge_global_state_roots(&roots(
+            "0x0000000000000005000000000000000600000000000000070000000000000008",
+        ))
+        .unwrap();
+        assert_ne!(parsed.validator_tree_root, Default::default());
+    }
+
+    #[test]
+    fn missing_validator_tree_root_is_rejected() {
+        let json = serde_json::json!({
+            "contract_tree_root": "x",
+            "deposit_tree_root": "x",
+            "user_tree_root": "x",
+            "withdrawal_tree_root": "x",
+            "user_registration_tree_root": "x"
+        });
+        assert!(serde_json::from_value::<BridgeAggGlobalStateRoots>(json).is_err());
+    }
+
+    #[test]
+    fn malformed_validator_tree_root_returns_named_error() {
+        let error = parse_bridge_global_state_roots(&roots("invalid")).unwrap_err();
+        assert_eq!(error.message(), "parse validator_tree_root");
     }
 }

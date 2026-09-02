@@ -68,12 +68,15 @@
 - [Configuration](./node/configuration.md)
 - [Getting Started](./node/getting_started.md)
 - [Devnet Startup, Shutdown, Restart, and Rollback](./node/devnet_lifecycle.md)
+- [Devnet Launcher Reference](./node/devnet-launcher-reference.md)
+- [Circuit and Verifier Operations](./node/circuit-and-verifier-operations.md)
 
 ---
 
 
 # Bridge Flows
 - [Deposit and Withdrawal Flow](./flows/deposit-withdrawal.md)
+- [Bridge Common Operations](./flows/bridge-common-operations.md)
 - [Private Transfer Flow](./flows/private-transfer.md)
 
 ---

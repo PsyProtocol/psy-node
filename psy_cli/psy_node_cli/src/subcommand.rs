@@ -81,11 +81,11 @@ pub enum Commands {
         #[arg(long = "p2p-proposer-node-id", help = "Proposer NodeId hex (38-byte multihash hex). Repeatable. Edge-only: maps sub id to the proposer for EndCap forwarding.")]
         p2p_proposer_node_id: Vec<String>,
 
-        #[arg(long = "p2p-validator-user-id", help = "Genesis validator user id used in the 410-byte finalize output / certificate roster.")]
+        #[arg(long = "p2p-validator-user-id", help = "Genesis validator user id used in the 410-byte finalize output / certificate validator set.")]
         p2p_validator_user_id: Option<u64>,
 
-        #[arg(long = "p2p-roster-path", help = "Realm P2P roster.json used to verify Proposal votes.")]
-        p2p_roster_path: Option<String>,
+        #[arg(long = "p2p-validators-path", help = "Realm P2P validators.json used to verify Proposal votes.")]
+        p2p_validators_path: Option<String>,
     },
     #[command(about = "Start a realm edge node")]
     StartRealmEdge {
@@ -234,14 +234,14 @@ pub enum Commands {
         #[arg(long = "proving-backend", help = "The proving backend to use (plonky2-poseidon-goldilocks, jtmb-poseidon-goldilocks, jtmb-sha256-u64, etc.)")]
         proving_backend: Option<PsyChainProvingBackendTypeInput>,
 
-        #[arg(long = "p2p-roster-path", help = "Optional Realm P2P roster.json used to verify GUTA certificates.")]
-        p2p_roster_path: Option<String>,
+        #[arg(long = "p2p-validators-path", help = "Optional Realm P2P validators.json used to verify GUTA certificates.")]
+        p2p_validators_path: Option<String>,
         #[arg(long = "p2p-checkpoints-per-epoch", help = "Rotation period used to verify the scheduled Realm proposer.")]
         p2p_checkpoints_per_epoch: Option<u64>,
     },
-    #[command(about = "Generate Realm P2P identity/BLS key files and a roster.json for local E2E")]
+    #[command(about = "Generate Realm P2P identity/BLS key files and a validators.json for local E2E")]
     InitRealmP2pKeys {
-        #[arg(long = "out-dir", help = "Directory to write generated key files and roster.json into.")]
+        #[arg(long = "out-dir", help = "Directory to write generated key files and validators.json into.")]
         out_dir: String,
 
         #[arg(long = "realm-ids", value_delimiter = ',', help = "Comma-separated realm ids to generate keys for (e.g. 0,1,2).")]

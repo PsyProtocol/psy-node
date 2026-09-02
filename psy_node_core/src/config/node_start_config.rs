@@ -38,7 +38,7 @@ pub struct RealmProcessorStartConfig {
     #[serde(default)]
     pub p2p_validator_user_id: Option<u64>,
     #[serde(default)]
-    pub p2p_roster_path: Option<String>,
+    pub p2p_validators_path: Option<String>,
 }
 impl RealmProcessorStartConfig {
     /// True when the optional Realm P2P transport is wired. Empty fields
@@ -163,21 +163,21 @@ pub struct CoordinatorEdgeStartConfig {
     #[serde(default = "default_worker_whitelist_config")]
     pub worker_whitelist_config: String,
     #[serde(default)]
-    pub p2p_roster_path: Option<String>,
+    pub p2p_validators_path: Option<String>,
     #[serde(default)]
     pub p2p_checkpoints_per_epoch: Option<u64>,
 }
 
 impl CoordinatorEdgeStartConfig {
-    pub fn p2p_validator_roster_config(&self) -> anyhow::Result<Option<(&str, u64)>> {
-        match (self.p2p_roster_path.as_deref(), self.p2p_checkpoints_per_epoch) {
+    pub fn p2p_validator_config(&self) -> anyhow::Result<Option<(&str, u64)>> {
+        match (self.p2p_validators_path.as_deref(), self.p2p_checkpoints_per_epoch) {
             (None, None) => Ok(None),
-            (Some(roster_path), Some(checkpoints_per_epoch)) => {
+            (Some(validators_path), Some(checkpoints_per_epoch)) => {
                 anyhow::ensure!(checkpoints_per_epoch > 0, "P2P checkpoints_per_epoch must be greater than zero");
-                Ok(Some((roster_path, checkpoints_per_epoch)))
+                Ok(Some((validators_path, checkpoints_per_epoch)))
             }
-            (Some(_), None) => anyhow::bail!("--p2p-checkpoints-per-epoch is required with --p2p-roster-path"),
-            (None, Some(_)) => anyhow::bail!("--p2p-roster-path is required with --p2p-checkpoints-per-epoch"),
+            (Some(_), None) => anyhow::bail!("--p2p-checkpoints-per-epoch is required with --p2p-validators-path"),
+            (None, Some(_)) => anyhow::bail!("--p2p-validators-path is required with --p2p-checkpoints-per-epoch"),
         }
     }
 }

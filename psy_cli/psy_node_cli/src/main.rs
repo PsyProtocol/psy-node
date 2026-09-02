@@ -42,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
             p2p_checkpoints_per_epoch,
             p2p_proposer_node_id,
             p2p_validator_user_id,
-            p2p_roster_path,
+            p2p_validators_path,
         } => {
             let config = RealmProcessorCliConfig::get_start_config(
                 config,
@@ -66,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
                 p2p_checkpoints_per_epoch,
                 p2p_proposer_node_id,
                 p2p_validator_user_id,
-                p2p_roster_path,
+                p2p_validators_path,
             )
             .await?;
             start_realm_processor::run(config, get_proving_backend_from_input(proving_backend)).await?;
@@ -165,7 +165,7 @@ async fn main() -> anyhow::Result<()> {
             listen,
             worker_whitelist_config,
             proving_backend,
-            p2p_roster_path,
+            p2p_validators_path,
             p2p_checkpoints_per_epoch,
         } => {
             let config = CoordinatorEdgeCliConfig::get_start_config(
@@ -181,7 +181,7 @@ async fn main() -> anyhow::Result<()> {
                 port,
                 listen,
                 worker_whitelist_config,
-                p2p_roster_path,
+                p2p_validators_path,
                 p2p_checkpoints_per_epoch,
             )
             .await?;

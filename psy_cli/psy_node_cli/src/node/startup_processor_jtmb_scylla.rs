@@ -183,11 +183,11 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_processor_node(co
                 let validator_user_id = config.p2p_validator_user_id.ok_or_else(|| {
                     anyhow::anyhow!("--p2p-validator-user-id is required when Realm P2P is enabled")
                 })?;
-                let roster_path = config.p2p_roster_path.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("--p2p-roster-path is required when Realm P2P is enabled")
+                let validators_path = config.p2p_validators_path.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("--p2p-validators-path is required when Realm P2P is enabled")
                 })?;
-                let bls_public_keys = crate::node::realm_p2p::bls_keys_from_roster_path(
-                    roster_path,
+                let bls_public_keys = crate::node::realm_p2p::bls_keys_from_validators_path(
+                    validators_path,
                     config.realm_id as u32,
                 )?;
                 let bls_path = config.p2p_bls_key_path.as_deref().ok_or_else(|| {

@@ -16,13 +16,13 @@ It supplements higher-level agent rules. The stricter rule wins.
 
 ## Required Devnet Lifecycle Reading
 
-Before any devnet startup, shutdown, restart, rollback, or live E2E operation, every AI agent MUST read and follow `docs/src/node/devnet_lifecycle.md`. JTMB remains test-only and is not rollback-validation evidence. Rollback validation uses the Plonky2 path; all lifecycle stop/resume, artifact, and verification procedures remain authoritative.
+Before any devnet startup, shutdown, restart, rollback, or live E2E operation, every AI agent MUST read and follow `docs/src/node/devnet_lifecycle.md` and `docs/src/node/devnet-launcher-reference.md`. The lifecycle guide owns state-preserving operations; the launcher reference owns launcher flags, the startup DAG, ports, environment, Anvil persistence, and known current-source limitations. JTMB remains test-only and is not rollback-validation evidence. Rollback validation uses the Plonky2 path; all lifecycle stop/resume, artifact, and verification procedures remain authoritative.
 
 ## Local Devnet Startup Preflight
 
 Keep the cohort repositories as sibling directories under one parent whenever possible: `psy-node`, `psy-compiler`, `psy-sdk`, `psy-genesis`, `psy-services`, `psy-contracts`, `psy-dapp`, and `psy-wallet`. The build and generation scripts use these sibling paths; a different layout requires explicit path configuration rather than copied repositories or ad-hoc symlinks.
 
-Before `make run-all`, restart, rollback validation, or a live E2E:
+Before `make run-all`, restart, rollback validation, or a live E2E, read and follow both `docs/src/node/devnet_lifecycle.md` and `docs/src/node/devnet-launcher-reference.md`:
 
 1. Initialize all required submodules recursively and confirm no required submodule status begins with `-`, `+`, or `U`. The node parent, nested DApp, SDK, and wallet gitlinks must resolve to their recorded SHAs.
 2. Confirm `genesis.json` already exists. Generate it only under the Genesis Regeneration Boundary; absence is a blocker, not permission to regenerate after unrelated changes.
@@ -34,7 +34,7 @@ Before `make run-all`, restart, rollback validation, or a live E2E:
 
 ## Genesis Regeneration Boundary
 
-Regenerate `genesis.json` only after a change to `psy_vm`, `psy_compiler`, `psy_precompiles`, or the serialized `genesis.json` format. No other change class authorizes regeneration. This restriction governs the Genesis step of the Applicability Gate; a broader release class does not authorize Genesis regeneration unless one of these four inputs changed. When none changed, retain the existing verified `genesis.json`.
+Regenerate `genesis.json` only when `psy-genesis/genesis_contracts.json`, a Genesis construction input in `psy_plonky2_circuits/src/node/config/networks/local_devnet.rs`, the serialized `genesis.json` format, or an intentionally adopted `psy-genesis` gitlink changes the generated Genesis content. EndCap metadata, GUTA, cache, verifier, transport, DTO, logging, retry, and ordinary witness changes do not authorize regeneration. Follow `docs/src/node/circuit-and-verifier-operations.md` §6.1 and retain the existing verified `genesis.json` when no listed input changed.
 
 ## Proving Backend Boundary
 
@@ -42,11 +42,11 @@ The JTMB ("just trust me bro") proving backend is test-only. Production, devnet,
 
 ## End-Cap Verifier Artifact Boundary
 
-Changes to DPN circuits, UPS circuits, ZK-signature or secp256k1 circuits, or the user-ID strategy invalidate the user end-cap verifier artifact. Regenerate it by constructing the release `UPSStandardEndCapCircuit`, serializing its verifier-only data as `AltVerifierOnlyCircuitData`, and computing its fingerprint from that same verifier data. The current tree has no active checked-in regeneration command—the construction in `psy_plonky2_circuits/examples/config_gen_v2.rs:86-91` is commented out—so stop rather than reuse or hand-edit stale data until the release generator is restored. Once generated, replace `END_CAP_ALT_VERIFIER_DATA_SERIALIZED` in `psy_plonky2_circuits/src/circuit_library/end_cap_verifier_data.rs` and replace `END_CAP_CIRCUIT_FINGERPRINT_HASH_U64_X4` in every affected `psy_core/src/network_config/` file and circuit test configuration. The serialized verifier data and fingerprint are one atomic artifact set. After both are updated, run `RUST_MIN_STACK=134217728 make config_gen_v2` and require the fingerprint check to pass.
+Changes to DPN circuits, UPS circuits, ZK-signature or secp256k1 circuits, the user-ID strategy, or any input that changes `UPSStandardEndCapCircuit` invalidate the real user EndCap metadata. Before regeneration, read `docs/src/node/circuit-and-verifier-operations.md`. Current promotion is localhost-only: run the documented release `psy_user_cli get-user-end-cap-common-data` command with explicit `PSY_CONFIG_PATH` and `PSY_NETWORK=localhost`, require the printed network and numeric magic to match `psy-genesis/config.json`, and promote the complete `END_CAP_ALT_VERIFIER_DATA_SERIALIZED` JSON plus printed `END_CAP_CIRCUIT_FINGERPRINT_HASH_U64_X4` limbs atomically. Dummy verifier metadata and non-local promotion are forbidden.
 
 ## Network Circuit Artifact Boundary
 
-After any network-circuit change, register every new or changed circuit triplet and parent/child inclusion relationship in `psy_plonky2_circuits/examples/config_gen_v2.rs` and the owning circuit manager, then run `RUST_MIN_STACK=134217728 make config_gen_v2`. Commit both generated outputs, `psy_plonky2_circuits/src/generated/cached_circuit_library.rs` and `psy_plonky2_circuits/src/generated/cached_common_data.rs`. Accept the result only when the regenerated GUTA whitelist, verifier library, common-data library, end-cap fingerprint check, and affected circuit fingerprints are mutually consistent. Never regenerate or replace only one generated library file.
+After any network-circuit change, register every new or changed circuit triplet and parent/child inclusion relationship in `psy_plonky2_circuits/examples/config_gen_v2.rs` and the owning circuit manager. For cache-only generation, use only the exact `--no-default-features` command in `docs/src/node/circuit-and-verifier-operations.md`; `make config_gen_v2` is forbidden because default features include `gnark-wrap` and can mutate Bridge setup material. Commit both generated outputs, `psy_plonky2_circuits/src/generated/cached_circuit_library.rs` and `psy_plonky2_circuits/src/generated/cached_common_data.rs`, as one pair. Accept the result only when a second identical run reports both files up to date and all affected fingerprints and whitelist roots match.
 
 ## Groth16 Trusted-Setup Boundary
 
@@ -59,7 +59,7 @@ Changes to the bridge aggregation circuit, checkpoint recursive transition circu
 2. Treat every unowned staged, unstaged, untracked, or nested-submodule change as another contributor's work. Never overwrite, reformat, remove, stage, unstage, commit, or push it.
 3. Use a clean clone or dedicated clean worktree for coordinated releases. Never auto-stash a shared worktree.
 4. Stage only explicitly owned paths. Never use `git add .`, `git add -A`, `git commit -a`, or broad pathspecs.
-5. Push is disabled unless the user explicitly authorizes the exact repository, destination ref, and scope in the current task. Never force-push.
+5. Push only when the user explicitly authorizes the exact repository, destination ref, and scope in the current task. Never force-push.
 6. npm publication, deployment, and Git push are separate authorizations. Authorization for one does not authorize either of the others.
 7. Every staged delivery set must be reviewed by a different model before commit or push. The reviewer must read every staged diff line. Any post-review edit requires another staged-diff review.
 8. Freeze and remotely publish an upstream commit before placing its SHA in a downstream manifest or gitlink.

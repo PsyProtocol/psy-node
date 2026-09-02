@@ -89,9 +89,9 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
                 proof_verifier,
                 checkpoint_state_transition_circuit_fingerprint,
             );
-            if let Some((roster_path, checkpoints_per_epoch)) = config.p2p_validator_roster_config()? {
+            if let Some((validators_path, checkpoints_per_epoch)) = config.p2p_validator_config()? {
                 handler.set_validators(
-                    crate::node::realm_p2p::validator_registry_from_roster_path(roster_path)?,
+                    crate::node::realm_p2p::validator_registry_from_validators_path(validators_path)?,
                     checkpoints_per_epoch,
                 )?;
             }
@@ -117,9 +117,9 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
                 proof_verifier,
                 checkpoint_state_transition_circuit_fingerprint,
             );
-            if let Some((roster_path, checkpoints_per_epoch)) = config.p2p_validator_roster_config()? {
+            if let Some((validators_path, checkpoints_per_epoch)) = config.p2p_validator_config()? {
                 handler.set_validators(
-                    crate::node::realm_p2p::validator_registry_from_roster_path(roster_path)?,
+                    crate::node::realm_p2p::validator_registry_from_validators_path(validators_path)?,
                     checkpoints_per_epoch,
                 )?;
             }

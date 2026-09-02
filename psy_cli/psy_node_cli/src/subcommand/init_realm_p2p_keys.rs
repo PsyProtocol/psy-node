@@ -1,5 +1,5 @@
 //! `init-realm-p2p-keys`: materialize Realm P2P identity/BLS key files and a
-//! `roster.json` for local E2E.
+//! `validators.json` for local E2E.
 //!
 //! For each `(realm, sub)` pair this writes:
 //!   - `realm_{id}_sub_{sub}_processor_identity.key` (libp2p Ed25519 protobuf)
@@ -7,10 +7,10 @@
 //!   - `realm_{id}_sub_{sub}_bls.key`               (64 hex chars, no newline)
 //!
 //! plus a single `coordinator_identity.key` used as a dummy coordinator
-//! multiaddr target, and a `roster.json` describing the generated material.
+//! multiaddr target, and a `validators.json` describing the generated material.
 //!
-//! Only the roster path is printed. BLS secrets and identity seeds never
-//! reach stdout. Paths recorded in `roster.json` are repo-relative (the
+//! Only the validators path is printed. BLS secrets and identity seeds never
+//! reach stdout. Paths recorded in `validators.json` are repo-relative (the
 //! `--out-dir` value as given); no absolute `<workspace>/...` paths are emitted.
 
 use serde::Serialize;
@@ -42,7 +42,7 @@ struct CoordinatorEntry {
 }
 
 #[derive(Serialize)]
-struct Roster {
+struct RealmP2pValidators {
     coordinator: CoordinatorEntry,
     realms: BTreeMap<String, BTreeMap<String, SubEntry>>,
 }
@@ -111,14 +111,14 @@ pub async fn run(out_dir: String, realm_ids: Vec<u64>, sub_ids: Vec<u16>) -> any
         identity_path: coordinator_path,
     };
 
-    let roster = Roster { coordinator, realms };
-    let roster_path = join_path(&out_dir, "roster.json");
-    let json = serde_json::to_string_pretty(&roster)
-        .map_err(|e| anyhow::anyhow!("failed to serialize roster: {e}"))?;
-    std::fs::write(Path::new(&roster_path), json)
-        .map_err(|e| anyhow::anyhow!("failed to write {roster_path}: {e}"))?;
+    let validators = RealmP2pValidators { coordinator, realms };
+    let validators_path = join_path(&out_dir, "validators.json");
+    let json = serde_json::to_string_pretty(&validators)
+        .map_err(|e| anyhow::anyhow!("failed to serialize validators: {e}"))?;
+    std::fs::write(Path::new(&validators_path), json)
+        .map_err(|e| anyhow::anyhow!("failed to write {validators_path}: {e}"))?;
 
-    // Print only the roster path. No secrets reach stdout.
-    println!("{roster_path}");
+    // Print only the validators path. No secrets reach stdout.
+    println!("{validators_path}");
     Ok(())
 }

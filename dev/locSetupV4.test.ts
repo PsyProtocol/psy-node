@@ -603,7 +603,7 @@ describe("injectGenesisValidators", () => {
         }
     });
 
-    it("clears stale validators when no roster is present", async () => {
+    it("clears stale validators when no validators manifest is present", async () => {
         const dir = (await Bun.$`mktemp -d`.text()).trim();
         try {
             const genesisPath = `${dir}/genesis.json`;

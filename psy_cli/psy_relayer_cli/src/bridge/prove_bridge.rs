@@ -1389,6 +1389,7 @@ pub async fn run_prove_bridge_agg_with_result_remote(
         user_tree_root: qhash_to_hex(to_core_hash(state_roots.user_tree_root)),
         withdrawal_tree_root: qhash_to_hex(to_core_hash(state_roots.withdrawal_tree_root)),
         user_registration_tree_root: qhash_to_hex(to_core_hash(state_roots.user_registration_tree_root)),
+        validator_tree_root: qhash_to_hex(to_core_hash(state_roots.validator_tree_root)),
     };
 
     // Get checkpoint fingerprint from cached circuit library (avoids building

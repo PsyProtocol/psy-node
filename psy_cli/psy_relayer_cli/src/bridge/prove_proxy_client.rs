@@ -76,6 +76,7 @@ pub struct BridgeAggGlobalStateRoots {
     pub user_tree_root: String,
     pub withdrawal_tree_root: String,
     pub user_registration_tree_root: String,
+    pub validator_tree_root: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -278,5 +279,24 @@ impl ProveProxyClient {
         input: BridgeAggWitnessInput,
     ) -> anyhow::Result<BridgeAggGroth16Output> {
         self.call("psy_prove_bridge_agg_groth16", json!([deps_network, input])).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BridgeAggGlobalStateRoots;
+
+    #[test]
+    fn bridge_roots_json_includes_validator_tree_root() {
+        let roots = BridgeAggGlobalStateRoots {
+            contract_tree_root: "contract".into(),
+            deposit_tree_root: "deposit".into(),
+            user_tree_root: "user".into(),
+            withdrawal_tree_root: "withdrawal".into(),
+            user_registration_tree_root: "registration".into(),
+            validator_tree_root: "validator".into(),
+        };
+        let value = serde_json::to_value(roots).unwrap();
+        assert_eq!(value["validator_tree_root"], "validator");
     }
 }
