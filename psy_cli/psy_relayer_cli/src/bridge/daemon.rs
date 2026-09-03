@@ -10,7 +10,7 @@ use std::{
 
 use futures::stream::{FuturesUnordered, StreamExt};
 
-use alloy_primitives::{Address, Bytes, U256};
+use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::TransactionRequest;
 use alloy_sol_types::{SolCall, sol};
@@ -110,6 +110,123 @@ pub(crate) struct BridgeProposeDaemonConfig {
     /// Default=1 (sequential). Set >1 to enable concurrent batch dispatch.
     #[serde(default)]
     pub max_concurrent_l2_batches: Option<u64>,
+    /// L1 chains handled by this daemon. When omitted, `[finalize]` is
+    /// promoted to a single legacy EVM chain.
+    #[serde(default)]
+    pub chains: Vec<L1Config>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct L1Config {
+    #[serde(default = "default_evm_family")]
+    pub family: String,
+    pub chain_index: u8,
+    pub network_id: String,
+    pub rpc_urls: Vec<String>,
+    pub deployments_network: String,
+    #[serde(default)]
+    pub state_manager: Option<String>,
+    #[serde(default)]
+    pub bridge_address: Option<String>,
+    #[serde(default)]
+    pub private_key: Option<String>,
+    #[serde(default)]
+    pub keystore_path: Option<String>,
+    #[serde(default)]
+    pub password_env: Option<String>,
+}
+
+fn default_evm_family() -> String { "evm".to_string() }
+
+impl L1Config {
+    fn namespace(&self) -> String {
+        format!("evm_{}_{}", self.chain_index, self.network_id)
+    }
+
+    fn effective_config(
+        &self,
+        base: &BridgeProposeDaemonConfig,
+    ) -> anyhow::Result<BridgeProposeDaemonConfig> {
+        let mut config = base.clone();
+        config.chains.clear();
+        config.finalize.l1_rpc_url = Some(
+            self.rpc_urls
+                .first()
+                .cloned()
+                .context("EVM chain rpc_urls must not be empty")?,
+        );
+        config.finalize.l1_rpc_fallback_url = self.rpc_urls.get(1).cloned();
+        config.finalize.deployments_network = Some(self.deployments_network.clone());
+        config.finalize.state_manager = self.state_manager.clone();
+        config.finalize.bridge_address = self.bridge_address.clone();
+        config.finalize.private_key = self.private_key.clone();
+        config.finalize.keystore_path = self.keystore_path.clone();
+        config.finalize.password_env = self.password_env.clone();
+        Ok(config)
+    }
+}
+
+fn configured_chains(config: &BridgeProposeDaemonConfig) -> anyhow::Result<Vec<L1Config>> {
+    let mut chains = if config.chains.is_empty() {
+        let deployments_network = config
+            .finalize
+            .deployments_network
+            .clone()
+            .unwrap_or_else(|| DEFAULT_DEPLOYMENTS_NETWORK.to_string());
+        let deployed = crate::bridge::api_client::load_deployed_contracts(&deployments_network)?;
+        let chain_index = deployed
+            .protocol
+            .map(|protocol| protocol.chain.l1_chain_index)
+            .or_else(|| (deployments_network == "localhost").then_some(0))
+            .context("deployment is missing protocol.chain.l1ChainIndex")?;
+        let mut rpc_urls = vec![config
+            .finalize
+            .l1_rpc_url
+            .clone()
+            .unwrap_or_else(|| DEFAULT_L1_RPC_URL.to_string())];
+        if let Some(url) = config.finalize.l1_rpc_fallback_url.clone() {
+            if !url.trim().is_empty() && !rpc_urls.contains(&url) {
+                rpc_urls.push(url);
+            }
+        }
+        vec![L1Config {
+            family: default_evm_family(),
+            chain_index,
+            network_id: deployments_network.clone(),
+            rpc_urls,
+            deployments_network,
+            state_manager: config.finalize.state_manager.clone(),
+            bridge_address: config.finalize.bridge_address.clone(),
+            private_key: config.finalize.private_key.clone(),
+            keystore_path: config.finalize.keystore_path.clone(),
+            password_env: config.finalize.password_env.clone(),
+        }]
+    } else {
+        config.chains.clone()
+    };
+    ensure!(!chains.is_empty(), "bridge relayer requires at least one chain");
+    let mut seen = HashSet::with_capacity(chains.len());
+    for chain in &chains {
+        ensure!(chain.family.eq_ignore_ascii_case("evm"), "unsupported bridge chain family {}", chain.family);
+        ensure!(!chain.rpc_urls.is_empty(), "chain {} has no RPC URL", chain.network_id);
+        ensure!(
+            seen.insert(chain.chain_index),
+            "duplicate bridge chain_index {}",
+            chain.chain_index
+        );
+        let deployed = crate::bridge::api_client::load_deployed_contracts(&chain.deployments_network)?;
+        if let Some(protocol) = deployed.protocol {
+            ensure!(
+                protocol.chain.l1_chain_index == chain.chain_index,
+                "configured chain_index {} for {} does not match deployment index {}",
+                chain.chain_index,
+                chain.deployments_network,
+                protocol.chain.l1_chain_index
+            );
+        }
+    }
+    chains.sort_by_key(|chain| chain.chain_index);
+    Ok(chains)
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -135,6 +252,26 @@ pub(crate) struct DaemonState {
     /// successful claims remove entries, and all remaining entries are
     /// retried next round. The key is leaf_hash.
     #[serde(default, alias = "failed_claim_withdrawals")]
+    pending_claim_withdrawals: HashMap<String, propose_withdrawals::PendingWithdrawal>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct PendingFinalizationRange {
+    from_checkpoint: u64,
+    to_checkpoint: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct MultichainDaemonState {
+    #[serde(default)]
+    identity_namespace: String,
+    #[serde(default)]
+    last_finalized_checkpoint: u64,
+    #[serde(default)]
+    pending_finalization_range: Option<PendingFinalizationRange>,
+    #[serde(default)]
+    finalized_chains: HashSet<u8>,
+    #[serde(default)]
     pending_claim_withdrawals: HashMap<String, propose_withdrawals::PendingWithdrawal>,
 }
 
@@ -207,6 +344,28 @@ pub(crate) struct L2RoundResult {
     /// gates stay fail-closed under one authority.
     is_catchup_batch: bool,
     claim_withdrawals: Vec<propose_withdrawals::PendingWithdrawal>,
+}
+
+struct ChainRuntime {
+    chain_index: u8,
+    config: BridgeProposeDaemonConfig,
+    l1: L1Client,
+    bridge: Address,
+    state_manager: Address,
+}
+
+#[derive(Clone, Debug)]
+struct ChainRoundProgress {
+    chain_index: u8,
+    pending_deposit_count: u32,
+    proved_deposit_count: u32,
+    l2_deposit_count: u32,
+}
+
+#[derive(Debug)]
+struct MultichainL2CallPlan {
+    calls: Vec<ContractCallArgs>,
+    withdrawals: Vec<propose_withdrawals::PendingWithdrawal>,
 }
 
 #[derive(Debug)]
@@ -463,6 +622,58 @@ fn select_relayer_window(
     }
 }
 
+fn select_multichain_relayer_window(
+    finalized_checkpoints: &[u64],
+    latest_checkpoint: u64,
+    confirmation_lag_checkpoints: u64,
+    max_checkpoint_batch: u64,
+) -> anyhow::Result<(u64, RelayerWindow)> {
+    let minimum = finalized_checkpoints
+        .iter()
+        .copied()
+        .min()
+        .context("configured chain list unexpectedly empty")?;
+    let from_checkpoint = minimum
+        .checked_add(1)
+        .context("minimum finalized checkpoint cannot be incremented")?;
+    let mut window = select_relayer_window(
+        from_checkpoint,
+        latest_checkpoint,
+        confirmation_lag_checkpoints,
+        max_checkpoint_batch,
+    );
+    // Never leapfrog a chain that is ahead of the slowest chain. Catch the
+    // slowest cohort up to the next cursor first, then all chains can consume
+    // the following shared range together.
+    if let Some(next_cursor) = finalized_checkpoints
+        .iter()
+        .copied()
+        .filter(|checkpoint| *checkpoint > minimum)
+        .min()
+    {
+        window.to_checkpoint = window.to_checkpoint.min(next_cursor);
+    }
+    Ok((from_checkpoint, window))
+}
+
+fn chain_finalization_required(cursor: u64, range: PendingFinalizationRange) -> anyhow::Result<bool> {
+    let parent = range
+        .from_checkpoint
+        .checked_sub(1)
+        .context("finalization range cannot start at zero")?;
+    if cursor >= range.to_checkpoint {
+        return Ok(false);
+    }
+    ensure!(
+        cursor == parent,
+        "chain cursor {} is incompatible with proof range {}..={}",
+        cursor,
+        range.from_checkpoint,
+        range.to_checkpoint
+    );
+    Ok(true)
+}
+
 fn refresh_catchup_state(
     is_catchup_batch: bool,
     from_checkpoint: u64,
@@ -565,14 +776,223 @@ fn persist_finalized_state_then_cleanup_proof(
     Ok(())
 }
 
+async fn materialize_chain_proof(
+    shared_path: &Path,
+    chain_path: &Path,
+    provider: &RpcProvider,
+    checkpoint: u64,
+    chain_index: u8,
+) -> anyhow::Result<()> {
+    let raw = fs::read_to_string(shared_path)
+        .with_context(|| format!("read shared proof {}", shared_path.display()))?;
+    let mut json: serde_json::Value = serde_json::from_str(&raw)?;
+    let (deposit_subroot, deposit_path) = prove_bridge::fetch_tree_subroot_and_top_proof(
+        provider, checkpoint, BRIDGE_USER_ID_U64, DEPOSIT_TREE_CONTRACT_ID, chain_index,
+    ).await?;
+    let (withdrawal_subroot, withdrawal_path) = prove_bridge::fetch_tree_subroot_and_top_proof(
+        provider, checkpoint, BRIDGE_USER_ID_U64, WITHDRAWAL_TREE_CONTRACT_ID, chain_index,
+    ).await?;
+    let encode_path = |path: [B256; 9]| {
+        path.into_iter()
+            .map(|value| serde_json::Value::String(format!("{:#066x}", value)))
+            .collect::<Vec<_>>()
+    };
+    json["l1_chain_index"] = serde_json::Value::from(u64::from(chain_index));
+    json["deposit_subtree_root"] = serde_json::Value::String(format!("{:#066x}", deposit_subroot));
+    json["deposit_merkle_proof"] = serde_json::Value::Array(encode_path(deposit_path));
+    json["withdrawal_subtree_root"] = serde_json::Value::String(format!("{:#066x}", withdrawal_subroot));
+    json["withdrawal_merkle_proof"] = serde_json::Value::Array(encode_path(withdrawal_path));
+    let encoded = serde_json::to_vec_pretty(&json)?;
+    fs::write(chain_path, encoded)
+        .with_context(|| format!("write chain proof {}", chain_path.display()))
+}
+
 pub async fn run(args: RunDaemonArgs) -> anyhow::Result<()> {
-    let config = load_config(&args.config)?;
+    let loaded = load_config(&args.config)?;
+    let chain_configs = configured_chains(&loaded)?;
+    if chain_configs.len() == 1 {
+        return run_single_chain(chain_configs[0].effective_config(&loaded)?, &args.config).await;
+    }
+    run_multichain(loaded, chain_configs, &args.config).await
+}
+
+async fn run_multichain(
+    config: BridgeProposeDaemonConfig,
+    chain_configs: Vec<L1Config>,
+    config_path: &Path,
+) -> anyhow::Result<()> {
+    let proof_dir = config.proof_dir.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_PROOF_DIR));
+    fs::create_dir_all(&proof_dir)?;
+    let identity_namespace = chain_configs.iter().map(L1Config::namespace).collect::<Vec<_>>().join("__");
+    let mut chains = Vec::with_capacity(chain_configs.len());
+    for chain in chain_configs {
+        let effective = chain.effective_config(&config)?;
+        let bridge = resolve_bridge_address(&effective)?.parse::<Address>()?;
+        let state_manager = resolve_state_manager_address(&effective)?;
+        chains.push(ChainRuntime {
+            chain_index: chain.chain_index,
+            l1: L1Client::from_finalize_config(&effective.finalize),
+            config: effective,
+            bridge,
+            state_manager,
+        });
+    }
+    let provider = RpcProvider::new_with_config_path(&config.rpc_config)?;
+    let poll_interval = Duration::from_secs(config.poll_interval_secs.unwrap_or(30));
+    let lag = config.confirmation_lag_checkpoints.unwrap_or(3);
+    let max_batch = config.max_checkpoint_batch.unwrap_or(DEFAULT_MAX_CHECKPOINT_BATCH);
+    validate_max_checkpoint_batch(max_batch)?;
+    let state_path = proof_dir.join("daemon_state_multichain.toml");
+    let proxy = resolve_prove_proxy_url(&config);
+    if proxy.is_none() { warmup_bridge_resources()?; }
+    tracing::info!(config=%config_path.display(), chain_count=chains.len(), %identity_namespace, "multichain bridge relayer started");
+
+    loop {
+        let mut state = load_multichain_state(&state_path, &identity_namespace)?;
+        let mut cursors = HashMap::new();
+        let mut read_failed = false;
+        for chain in &chains {
+            match chain.l1.last_finalized_checkpoint(chain.state_manager).await {
+                Ok(cursor) => { cursors.insert(chain.chain_index, cursor); }
+                Err(error) => {
+                    read_failed = true;
+                    tracing::error!(chain_index=chain.chain_index, %error, "failed to read finalization cursor");
+                }
+            }
+        }
+        if read_failed { tokio::time::sleep(poll_interval).await; continue; }
+
+        if let Some(range) = state.pending_finalization_range {
+            for (&chain_index, &cursor) in &cursors {
+                if cursor >= range.to_checkpoint { state.finalized_chains.insert(chain_index); }
+            }
+        }
+
+        let latest = provider.get_coordinator_latest_block_state().await?.checkpoint_id;
+        let (from_checkpoint, window) = if let Some(range) = state.pending_finalization_range {
+            (range.from_checkpoint, RelayerWindow { to_checkpoint: range.to_checkpoint, confirmed_to_checkpoint: Some(range.to_checkpoint), is_catchup_batch: false })
+        } else {
+            select_multichain_relayer_window(&cursors.values().copied().collect::<Vec<_>>(), latest, lag, max_batch)?
+        };
+        if window.to_checkpoint < from_checkpoint { tokio::time::sleep(poll_interval).await; continue; }
+        let propose_args = ProposeWithdrawalsArgs {
+            rpc_config: config.rpc_config.clone(),
+            wallet: resolve_bridge_wallet_args(config.relayer_wallet.clone()),
+            services_url: Some(config.services_url.clone()),
+            withdraw_method_id: config.withdraw_method_id,
+            state_file: None,
+            notify_coordinator: true,
+            poll_timeout_secs: 0,
+            poll_interval_secs: 5,
+        };
+
+        let mut round_withdrawals = Vec::new();
+        let to_checkpoint = if state.pending_finalization_range.is_none() {
+            let (progress, plan) = match build_multichain_l2_plan(
+                &config, &provider, &chains, latest, from_checkpoint, window.to_checkpoint,
+                !window.is_catchup_batch, &propose_args,
+            ).await {
+                Ok(value) => value,
+                Err(error) => { tracing::error!(%error, "build multichain L2 plan failed"); tokio::time::sleep(poll_interval).await; continue; }
+            };
+            round_withdrawals = plan.withdrawals.clone();
+            let submitted_l2_work = !plan.calls.is_empty();
+            let landed = match submit_multichain_l2_plan(&config, &provider, &plan, lag).await {
+                Ok(value) => value,
+                Err(error) => { tracing::error!(%error, "multichain L2 multicall failed"); tokio::time::sleep(poll_interval).await; continue; }
+            };
+            if !window.has_confirmed_range() {
+                tracing::info!(submitted_l2_work, landed, "append-only multichain round retained until a confirmed proof window exists");
+                tokio::time::sleep(poll_interval).await;
+                continue;
+            }
+            let endpoint = if submitted_l2_work {
+                select_finalize_to_checkpoint(window.to_checkpoint, landed)
+            } else {
+                window.to_checkpoint
+            };
+            // Settle each chain's L1 deposit accumulator before finalization.
+            for item in progress {
+                let chain = chains.iter().find(|c| c.chain_index == item.chain_index).unwrap();
+                let target = fetch_deposit_tree_next_index(&provider, endpoint, u64::from(item.chain_index)).await?;
+                if target > u64::from(item.proved_deposit_count) {
+                    chain.l1.submit_deposit_batch_appends(&chain.config, u32::try_from(target)?).await?;
+                }
+            }
+            let range = PendingFinalizationRange { from_checkpoint, to_checkpoint: endpoint };
+            state.pending_finalization_range = Some(range);
+            for withdrawal in &round_withdrawals {
+                state.pending_claim_withdrawals.insert(withdrawal.leaf_hash.clone(), withdrawal.clone());
+            }
+            save_multichain_state(&state_path, &state)?;
+            endpoint
+        } else {
+            window.to_checkpoint
+        };
+
+        let range = PendingFinalizationRange { from_checkpoint, to_checkpoint };
+        let shared_path = proof_dir.join(format!("bridge_proof_{}.json", to_checkpoint));
+        let needs_finalize = chains.iter().any(|chain| cursors[&chain.chain_index] < to_checkpoint);
+        if needs_finalize && !shared_path.exists() {
+            if let Err(error) = chains[0].l1.load_or_build_proof(
+                &chains[0].config, &shared_path, from_checkpoint, to_checkpoint, proxy.as_deref(),
+            ).await {
+                tracing::error!(%error, "shared bridge proof generation failed");
+                tokio::time::sleep(poll_interval).await; continue;
+            }
+        }
+
+        for chain in &chains {
+            let cursor = cursors[&chain.chain_index];
+            if !chain_finalization_required(cursor, range)? { state.finalized_chains.insert(chain.chain_index); continue; }
+            let chain_path = proof_dir.join(format!("bridge_proof_{}_chain_{}.json", to_checkpoint, chain.chain_index));
+            if let Err(error) = materialize_chain_proof(&shared_path, &chain_path, &provider, to_checkpoint, chain.chain_index).await {
+                tracing::error!(chain_index=chain.chain_index, %error, "build per-chain witness failed"); continue;
+            }
+            let finalize_args = FinalizeBridgeAggArgs {
+                proof_json: chain_path.clone(), to_checkpoint, rpc_config: config.rpc_config.clone(),
+                l1_rpc_url: chain.config.finalize.l1_rpc_url.clone().unwrap(),
+                deployments_network: chain.config.finalize.deployments_network.clone().unwrap(),
+                state_manager: chain.config.finalize.state_manager.clone(),
+                bridge_address: Some(format!("{}", chain.bridge)), batch_append_proof_json: None,
+                private_key: chain.config.finalize.private_key.clone(),
+                keystore_path: chain.config.finalize.keystore_path.clone().map(PathBuf::from),
+                password_env: chain.config.finalize.password_env.clone().unwrap_or_else(|| "WALLET_PASSWORD".into()),
+            };
+            match chain.l1.finalize(finalize_args).await {
+                Ok(()) => { state.finalized_chains.insert(chain.chain_index); let _ = fs::remove_file(chain_path); }
+                Err(error) => tracing::error!(chain_index=chain.chain_index, %error, "chain finalize failed; shared proof retained"),
+            }
+        }
+        save_multichain_state(&state_path, &state)?;
+
+        if state.finalized_chains.len() == chains.len() {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            for chain in &chains {
+                let claims = state.pending_claim_withdrawals.values()
+                    .filter(|w| w.destination_chain_index == u64::from(chain.chain_index)).cloned().collect::<Vec<_>>();
+                if claims.is_empty() { continue; }
+                if let Ok(report) = chain.l1.claim_withdrawals(&claims, &chain.config, to_checkpoint).await {
+                    apply_claim_report(&mut state.pending_claim_withdrawals, &report);
+                }
+            }
+            state.last_finalized_checkpoint = to_checkpoint;
+            state.pending_finalization_range = None;
+            state.finalized_chains.clear();
+            save_multichain_state(&state_path, &state)?;
+            let _ = fs::remove_file(&shared_path);
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path) -> anyhow::Result<()> {
     let proof_dir = config
         .proof_dir
         .clone()
         .unwrap_or_else(|| PathBuf::from(DEFAULT_PROOF_DIR));
     fs::create_dir_all(&proof_dir).with_context(|| format!("failed to create proof dir {}", proof_dir.display()))?;
-    tracing::info!(config = %args.config.display(), proof_dir = %proof_dir.display(), "bridge relayer started");
+    tracing::info!(config = %config_path.display(), proof_dir = %proof_dir.display(), "bridge relayer started");
 
     // Phase 4.4: skip local circuit/Groth16 warmup when remote prove proxy is configured
     let proxy_url_at_startup = resolve_prove_proxy_url(&config);
@@ -1232,6 +1652,24 @@ fn load_state(path: &Path) -> anyhow::Result<DaemonState> {
     }
     let raw = fs::read_to_string(path).with_context(|| format!("failed to read daemon state {}", path.display()))?;
     toml::from_str(&raw).with_context(|| format!("failed to parse daemon state {}", path.display()))
+}
+
+fn load_multichain_state(path: &Path, namespace: &str) -> anyhow::Result<MultichainDaemonState> {
+    if !path.exists() {
+        return Ok(MultichainDaemonState { identity_namespace: namespace.to_string(), ..Default::default() });
+    }
+    let raw = fs::read_to_string(path)?;
+    let state: MultichainDaemonState = toml::from_str(&raw)?;
+    ensure!(state.identity_namespace == namespace, "multichain daemon state belongs to a different chain cohort");
+    Ok(state)
+}
+
+fn save_multichain_state(path: &Path, state: &MultichainDaemonState) -> anyhow::Result<()> {
+    let raw = toml::to_string(state)?;
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    fs::write(&tmp, raw)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 fn save_state(path: &Path, state: &DaemonState) -> anyhow::Result<()> {
@@ -1927,6 +2365,124 @@ async fn build_l2_call_plan(
         withdrawals,
         batch_calls: all_batch_calls,
     })
+}
+
+async fn build_multichain_l2_plan(
+    base: &BridgeProposeDaemonConfig,
+    provider: &RpcProvider,
+    chains: &[ChainRuntime],
+    checkpoint: u64,
+    from_checkpoint: u64,
+    to_checkpoint: u64,
+    append_business: bool,
+    propose_args: &ProposeWithdrawalsArgs,
+) -> anyhow::Result<(Vec<ChainRoundProgress>, MultichainL2CallPlan)> {
+    let http = crate::bridge::api_client::build_default_http_client()?;
+    let mut progress = Vec::with_capacity(chains.len());
+    let mut calls = Vec::new();
+
+    for chain in chains {
+        let (proved, pending) = chain
+            .l1
+            .with_retry("read_deposit_progress", 10, |url| {
+                let url = url.to_string();
+                async move {
+                    let l1_provider = crate::bridge::l1_provider::connect_l1_readonly(
+                        url.parse().with_context(|| format!("invalid L1 rpc url: {url}"))?,
+                    )?;
+                    Ok((
+                        fetch_proved_deposit_count(&l1_provider, chain.bridge).await?,
+                        fetch_pending_deposit_count(&l1_provider, chain.bridge).await?,
+                    ))
+                }
+            })
+            .await?;
+        ensure!(pending >= proved, "chain {} pending deposits regressed", chain.chain_index);
+        let l2_count = u32::try_from(fetch_deposit_tree_next_index(
+            provider,
+            checkpoint,
+            u64::from(chain.chain_index),
+        ).await?).context("L2 per-chain deposit count exceeds u32")?;
+        ensure!(l2_count <= pending, "chain {} L2 deposit count exceeds L1 pending count", chain.chain_index);
+
+        if append_business && pending > l2_count {
+            let snapshot = crate::bridge::api_client::fetch_services_deposit_tree_root(
+                &http,
+                &base.services_url,
+                u64::from(chain.chain_index),
+                u64::from(pending),
+            ).await?;
+            ensure!(snapshot.found, "missing exact deposit snapshot for chain {} count {}", chain.chain_index, pending);
+            let snapshot_count = snapshot.snapshot_deposit_count().context("deposit snapshot missing count")?;
+            ensure!(snapshot_count == u64::from(pending), "deposit snapshot count mismatch for chain {}", chain.chain_index);
+            calls.push(build_set_chain_root_call(
+                u64::from(chain.chain_index),
+                snapshot_count,
+                snapshot.deposit_root.as_deref().context("deposit snapshot missing root")?,
+            )?);
+        }
+        progress.push(ChainRoundProgress {
+            chain_index: chain.chain_index,
+            pending_deposit_count: pending,
+            proved_deposit_count: proved,
+            l2_deposit_count: l2_count,
+        });
+    }
+    calls.sort_by_key(|call| call.inputs.first().copied().unwrap_or(u64::MAX));
+
+    let withdrawals = if append_business {
+        let global_count = provider
+            .get_withdrawal_tree_global_count(checkpoint, BRIDGE_USER_ID_U64)
+            .await?;
+        propose_withdrawals::fetch_pending_bridge_withdrawals(
+            propose_args,
+            from_checkpoint.max(1),
+            to_checkpoint.saturating_add(1),
+            global_count,
+        ).await?
+    } else {
+        Vec::new()
+    };
+    calls.extend(build_withdrawal_batch_calls(&withdrawals));
+    Ok((progress, MultichainL2CallPlan { calls, withdrawals }))
+}
+
+async fn submit_multichain_l2_plan(
+    config: &BridgeProposeDaemonConfig,
+    provider: &RpcProvider,
+    plan: &MultichainL2CallPlan,
+    confirmation_lag_checkpoints: u64,
+) -> anyhow::Result<u64> {
+    if plan.calls.is_empty() {
+        return Ok(provider.get_coordinator_latest_block_state().await?.checkpoint_id);
+    }
+    let (mut wallet_session, user_pk_hash) = create_wallet_session(config).await?;
+    let relayer_user_id = provider
+        .get_user_ids_for_public_key(user_pk_hash).await?
+        .first().copied().context("No user id found for relayer public key")?;
+    ensure!(relayer_user_id == BRIDGE_USER_ID_U64, "relayer wallet user id mismatch");
+    let before = provider.get_coordinator_latest_block_state().await?.checkpoint_id;
+    // This is deliberately one PSY transaction: all per-chain root updates
+    // become visible at the same checkpoint.
+    let submission = wallet_session
+        .exec_contract_call(user_pk_hash, ContractCallData::new(plan.calls.clone()))
+        .await;
+    let leaf = resolve_l2_submission_leaf(provider, submission, relayer_user_id).await?;
+    let landed = provider.wait_for_endcap_inclusion(
+        relayer_user_id,
+        leaf,
+        before,
+        Some(REALM_CHECKPOINT_POLL_TIMEOUT_SECS),
+        REALM_CHECKPOINT_POLL_INTERVAL_SECS,
+    ).await?;
+    wait_until_checkpoint_confirmed(
+        provider,
+        landed,
+        confirmation_lag_checkpoints,
+        REALM_CHECKPOINT_POLL_TIMEOUT_SECS,
+        REALM_CHECKPOINT_POLL_INTERVAL_SECS,
+    ).await?;
+    Ok(landed)
 }
 
 
@@ -4717,5 +5273,67 @@ mod tests {
         let _submitted: bool = result.submitted_l2_work;
         let _sticky: bool = result.is_catchup_batch;
         let _claims: Vec<PendingWithdrawal> = result.claim_withdrawals;
+    }
+
+    #[test]
+    fn multichain_window_starts_at_slowest_chain_and_stops_at_next_cursor() {
+        let (from, window) = select_multichain_relayer_window(&[100, 50, 75], 200, 3, 64).unwrap();
+        assert_eq!(from, 51);
+        assert_eq!(window.to_checkpoint, 75);
+    }
+
+    #[test]
+    fn multichain_finalization_skips_completed_chain_and_rejects_leapfrog() {
+        let range = PendingFinalizationRange { from_checkpoint: 51, to_checkpoint: 75 };
+        assert!(chain_finalization_required(50, range).unwrap());
+        assert!(!chain_finalization_required(75, range).unwrap());
+        assert!(chain_finalization_required(49, range).is_err());
+        assert!(chain_finalization_required(60, range).is_err());
+    }
+
+    #[test]
+    fn set_chain_root_calls_are_sorted_and_use_absolute_counts() {
+        let mut calls = vec![
+            build_set_chain_root_call(2, 9, &format!("0x{}", "22".repeat(32))).unwrap(),
+            build_set_chain_root_call(0, 4, &format!("0x{}", "11".repeat(32))).unwrap(),
+            build_set_chain_root_call(1, 7, &format!("0x{}", "33".repeat(32))).unwrap(),
+        ];
+        calls.sort_by_key(|call| call.inputs[0]);
+        assert_eq!(calls.iter().map(|call| call.inputs[0]).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(calls.iter().map(|call| call.inputs[1]).collect::<Vec<_>>(), vec![4, 7, 9]);
+    }
+
+    #[test]
+    fn daemon_config_parses_three_evm_chains() {
+        let raw = r#"
+rpc_config = "config.json"
+services_url = "http://127.0.0.1:3000"
+withdraw_method_id = 1
+
+[[chains]]
+family = "evm"
+chain_index = 0
+network_id = "localhost"
+rpc_urls = ["http://127.0.0.1:8545"]
+deployments_network = "localhost"
+
+[[chains]]
+family = "evm"
+chain_index = 1
+network_id = "localhostBsc"
+rpc_urls = ["http://127.0.0.1:9545"]
+deployments_network = "localhostBsc"
+
+[[chains]]
+family = "evm"
+chain_index = 2
+network_id = "localhostBase"
+rpc_urls = ["http://127.0.0.1:10545"]
+deployments_network = "localhostBase"
+"#;
+        let config: BridgeProposeDaemonConfig = toml::from_str(raw).unwrap();
+        assert_eq!(config.chains.len(), 3);
+        assert_eq!(config.chains.iter().map(|chain| chain.chain_index).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert!(config.chains.iter().all(|chain| chain.family == "evm"));
     }
 }

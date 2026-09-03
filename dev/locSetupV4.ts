@@ -230,11 +230,11 @@ type L1SignerInfo = {
 };
 
 type L1NetworkName = "localhost" | "sepolia" | "ethereum";
+type L1DeploymentNetwork = L1NetworkName | "localhostBsc" | "localhostBase" | "bscTestnet" | "baseSepolia";
 type ConfigNetworkEntry = {
     l1_rpc_urls?: string[];
     anvilForkSourceUrlEnv?: string;
 };
-const LOCALHOST_CHAIN_ID = protocolConfig.chains.localhost.l1ChainId;
 const DEV_TEST_ADDRESSES = [
     "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
     "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
@@ -2547,7 +2547,7 @@ async function ensurePsyContractsDependencies(contractsDir: string) {
 async function deployPsyContracts(
     repoCwd: string,
     l1RpcUrl: string,
-    deploymentsNetwork: L1NetworkName,
+    deploymentsNetwork: L1DeploymentNetwork,
     opts?: { fundDevAccounts?: boolean; localAnvilRpcUrl?: string },
 ) {
     const contractsDir = path.join(repoCwd, "psy-contracts");
@@ -2591,16 +2591,23 @@ async function deployPsyContracts(
     }
     await ensurePsyContractsDependencies(contractsDir);
     const bridgeRelayerSigner = await loadBridgeRelayerSigner(repoCwd);
-    if (deploymentsNetwork === "localhost") {
+    if (deploymentsNetwork.startsWith("localhost")) {
         await setLocalAnvilBalance(l1RpcUrl, bridgeRelayerSigner.address);
         console.log(`[DevNet] funded bridge relayer deployer ${bridgeRelayerSigner.address} on local anvil`);
     }
     console.log(`[DevNet] Deploying psy-contracts to ${deploymentsNetwork}...`);
     const deploymentCfg = (allConfig as any)?.networks?.[deploymentsNetwork] as ConfigNetworkEntry | undefined;
-    const networkEnvKey = deploymentCfg?.anvilForkSourceUrlEnv ?? "LOCALHOST_RPC_URL";
+    const localRpcEnvKeys: Partial<Record<L1DeploymentNetwork, string>> = {
+        localhost: "LOCALHOST_RPC_URL",
+        localhostBsc: "LOCALHOST_BSC_RPC_URL",
+        localhostBase: "LOCALHOST_BASE_RPC_URL",
+    };
+    const networkEnvKey = localRpcEnvKeys[deploymentsNetwork]
+        ?? deploymentCfg?.anvilForkSourceUrlEnv
+        ?? "LOCALHOST_RPC_URL";
     const walletPassword = await resolveWalletPassword();
     const deployArgs = ["node", "scripts/deploy-with-keystore.mjs", "deploy", "--network", deploymentsNetwork];
-    if (deploymentsNetwork === "localhost" || forceRedeploy) {
+    if (deploymentsNetwork.startsWith("localhost") || forceRedeploy) {
         deployArgs.push("--reset");
     }
     const proc = Bun.spawn(deployArgs, {
@@ -2724,13 +2731,6 @@ function parseTomlScalar(raw: string, key: string): string | undefined {
     return m?.[1];
 }
 
-function parseTomlInt(raw: string, key: string): number | undefined {
-    const m = raw.match(new RegExp(`(?:^|\\n)\\s*${key}\\s*=\\s*(\\d+)`));
-    if (!m?.[1]) return undefined;
-    const n = Number(m[1]);
-    return Number.isFinite(n) ? n : undefined;
-}
-
 const ENVIO_NPM_VERSION = "2.32.10";
 const ENVIO_HASURA_IMAGE = "hasura/graphql-engine:v2.43.0";
 const ENVIO_POSTGRES_IMAGE = "postgres:17.5";
@@ -2771,43 +2771,32 @@ async function startEnvioIndexerForRelayer(
     const databaseUrl =
         parseTomlScalar(relayerRaw, "database_url") ||
         "postgres://postgres:testing@127.0.0.1:5433/envio-dev";
-    const rpcUrl =
+    const deploymentsNetwork =
+        deploymentsNetworkOverride || parseTomlScalar(relayerRaw, "deployments_network") || "localhost";
+    const primaryRpcUrl =
         l1RpcUrlOverride ||
         parseTomlScalar(relayerRaw, "rpc_url") ||
         parseTomlScalar(relayerRaw, "l1_rpc_url") ||
         "http://127.0.0.1:8545";
-    const configuredChainId = parseTomlInt(relayerRaw, "chain_id");
-    const deploymentsNetwork =
-        deploymentsNetworkOverride || parseTomlScalar(relayerRaw, "deployments_network") || "localhost";
+    const localCohort = deploymentsNetwork.startsWith("localhost");
+    const cohort = localCohort
+        ? [
+            { prefix: "ETH", network: "localhost", rpcUrl: primaryRpcUrl },
+            { prefix: "BSC", network: "localhostBsc", rpcUrl: process.env.LOCALHOST_BSC_RPC_URL || "http://127.0.0.1:9545" },
+            { prefix: "BASE", network: "localhostBase", rpcUrl: process.env.LOCALHOST_BASE_RPC_URL || "http://127.0.0.1:10545" },
+        ]
+        : [
+            { prefix: "ETH", network: "sepolia", rpcUrl: process.env.SEPOLIA_RPC_URL || protocolConfig.chains.sepolia.defaultRpcUrl || "" },
+            { prefix: "BSC", network: "bscTestnet", rpcUrl: process.env.BSC_TESTNET_RPC_URL || protocolConfig.chains.bscTestnet.defaultRpcUrl || "" },
+            { prefix: "BASE", network: "baseSepolia", rpcUrl: process.env.BASE_SEPOLIA_RPC_URL || protocolConfig.chains.baseSepolia.defaultRpcUrl || "" },
+        ];
 
-    const deployedPath = path.join(
-        repoCwd,
-        "psy-contracts",
-        "deployments",
-        deploymentsNetwork,
-        "deployed-contracts.json",
-    );
-    if (!(await exists(deployedPath))) {
-        throw new Error(`missing deployed contracts summary: ${deployedPath}`);
-    }
-    const deployedRaw = await Bun.file(deployedPath).text();
-    const deployed = JSON.parse(deployedRaw) as any;
-    const deployedChainId = Number(
-        deployed?.chainId ?? deployed?.protocol?.chain?.l1ChainId ?? configuredChainId ?? LOCALHOST_CHAIN_ID
-    );
-    const chainId = Number.isFinite(deployedChainId) ? deployedChainId : LOCALHOST_CHAIN_ID;
-    const bridge = deployed?.core?.Bridge || deployed?.contracts?.Bridge;
-    const stateManager = deployed?.core?.StateManager || deployed?.contracts?.StateManager;
-    if (!bridge || !stateManager) {
-        throw new Error(`missing Bridge/StateManager in ${deployedPath}`);
-    }
-
-    const readArtifactBlockNumber = async (artifactName: string): Promise<number | undefined> => {
+    const readArtifactBlockNumber = async (network: string, artifactName: string): Promise<number | undefined> => {
         const artifactPath = path.join(
             repoCwd,
             "psy-contracts",
             "deployments",
-            deploymentsNetwork,
+            network,
             `${artifactName}.json`,
         );
         if (!(await exists(artifactPath))) return undefined;
@@ -2824,12 +2813,26 @@ async function startEnvioIndexerForRelayer(
         }
         return undefined;
     };
-
-    const bridgeDeployBlock = await readArtifactBlockNumber("Bridge_Proxy");
-    const stateManagerDeployBlock = await readArtifactBlockNumber("StateManager_Proxy");
-    const startBlock = [bridgeDeployBlock, stateManagerDeployBlock]
-        .filter((v): v is number => Number.isFinite(v as number) && (v as number) > 0)
-        .reduce<number | undefined>((min, v) => (min === undefined ? v : Math.min(min, v)), undefined) ?? 1;
+    const targets = await Promise.all(cohort.map(async (target) => {
+        const deployedPath = path.join(repoCwd, "psy-contracts", "deployments", target.network, "deployed-contracts.json");
+        if (!(await exists(deployedPath))) throw new Error(`missing deployed contracts summary: ${deployedPath}`);
+        const deployed = JSON.parse(await Bun.file(deployedPath).text()) as any;
+        const chainId = Number(deployed?.chainId ?? deployed?.protocol?.chain?.l1ChainId);
+        const expected = (protocolConfig.chains as any)[target.network];
+        if (!Number.isFinite(chainId) || chainId !== expected?.l1ChainId) {
+            throw new Error(`invalid chainId in ${deployedPath}: expected ${expected?.l1ChainId}, got ${chainId}`);
+        }
+        const bridge = deployed?.core?.Bridge || deployed?.contracts?.Bridge;
+        const stateManager = deployed?.core?.StateManager || deployed?.contracts?.StateManager;
+        if (!bridge || !stateManager) throw new Error(`missing Bridge/StateManager in ${deployedPath}`);
+        const blocks = await Promise.all([
+            readArtifactBlockNumber(target.network, "Bridge_Proxy"),
+            readArtifactBlockNumber(target.network, "StateManager_Proxy"),
+        ]);
+        const startBlock = blocks.filter((v): v is number => v != null && v > 0)
+            .reduce<number | undefined>((min, value) => min == null ? value : Math.min(min, value), undefined) ?? 1;
+        return { ...target, chainId, bridge, stateManager, startBlock };
+    }));
 
     const envioDir = path.join(repoCwd, "psy_cli", "psy_relayer_cli", "indexer", "envio");
     const templatePath = path.join(envioDir, "config.template.yaml");
@@ -2839,19 +2842,28 @@ async function startEnvioIndexerForRelayer(
         throw new Error(`missing envio config template: ${templatePath}`);
     }
     const template = await Bun.file(templatePath).text();
-    const config = template
-        .replace("${ETH_RPC_URL}", rpcUrl)
-        .replace(`id: ${LOCALHOST_CHAIN_ID}`, `id: ${chainId}`)
-        .replace("start_block: 1", `start_block: ${startBlock}`)
-        .replace("${BRIDGE_ADDRESS}", bridge)
-        .replace("${STATE_MANAGER_ADDRESS}", stateManager);
+    let config = template;
+    for (const target of targets) {
+        const values: Record<string, string> = {
+            [`${target.prefix}_CHAIN_ID`]: String(target.chainId),
+            [`${target.prefix}_START_BLOCK`]: String(target.startBlock),
+            [`${target.prefix}_RPC_URL`]: target.rpcUrl,
+            [`${target.prefix}_BRIDGE_ADDRESS`]: target.bridge,
+            [`${target.prefix}_STATE_MANAGER_ADDRESS`]: target.stateManager,
+        };
+        for (const [key, value] of Object.entries(values)) config = config.replaceAll(`\${${key}}`, value);
+    }
+    if (/\$\{[A-Z0-9_]+\}/.test(config)) throw new Error("unresolved variable in generated Envio config");
     await Bun.write(configPath, config);
     await Bun.write(
         envPath,
         [
-            `ETH_RPC_URL=${rpcUrl}`,
-            `BRIDGE_ADDRESS=${bridge}`,
-            `STATE_MANAGER_ADDRESS=${stateManager}`,
+            ...targets.flatMap((target) => [
+                `${target.prefix}_CHAIN_ID=${target.chainId}`,
+                `${target.prefix}_RPC_URL=${target.rpcUrl}`,
+                `${target.prefix}_BRIDGE_ADDRESS=${target.bridge}`,
+                `${target.prefix}_STATE_MANAGER_ADDRESS=${target.stateManager}`,
+            ]),
             `DATABASE_URL=${databaseUrl}`,
             `LOG_LEVEL=info`,
         ].join("\n") + "\n",
@@ -2993,6 +3005,8 @@ async function killKnownProcesses(): Promise<void> {
         "cargo run --release --bin psy-services",
         "cargo run --release --bin psy-indexer",
         "anvil --port 8545",
+        "anvil --port 9545",
+        "anvil --port 10545",
         "hardhat node",
         "dummy_prover.sh prove_random",
         "client_prover/psy_bridge",
@@ -3015,7 +3029,7 @@ async function killKnownProcesses(): Promise<void> {
 }
 
 async function killKnownPorts(): Promise<void> {
-    const ports: number[] = [3000, 5433, 8080, 8081, 8545, 9898, 9998, 5174, 5175, 5176, 5177, 5178];
+    const ports: number[] = [3000, 5433, 8080, 8081, 8545, 9545, 10545, 9898, 9998, 5174, 5175, 5176, 5177, 5178];
     for (let p = 1337; p <= 1346; p++) ports.push(p);
     for (let p = 9999; p <= 10008; p++) ports.push(p);
     for (let p = 13380; p <= 14670; p += 10) ports.push(p);
@@ -3350,6 +3364,17 @@ class DevNetProcessManager {
         const deploymentsNetwork: L1NetworkName = l1Fork ? "localhost" : l1Network;
         const localL1RpcUrl = resolveLocalL1RpcUrl(l1Port);
         const l1RpcUrl = (l1Network === "localhost" || l1Fork) ? localL1RpcUrl : resolveExternalL1RpcUrl(l1Network);
+        const relayerChains = deploymentsNetwork.startsWith('localhost')
+            ? [
+                { chainIndex: 0, networkId: 'localhost', deploymentsNetwork: 'localhost', rpcUrl: l1RpcUrl },
+                { chainIndex: 1, networkId: 'localhostBsc', deploymentsNetwork: 'localhostBsc', rpcUrl: process.env.LOCALHOST_BSC_RPC_URL || 'http://127.0.0.1:9545' },
+                { chainIndex: 2, networkId: 'localhostBase', deploymentsNetwork: 'localhostBase', rpcUrl: process.env.LOCALHOST_BASE_RPC_URL || 'http://127.0.0.1:10545' },
+            ]
+            : [
+                { chainIndex: 0, networkId: 'sepolia', deploymentsNetwork: 'sepolia', rpcUrl: process.env.SEPOLIA_RPC_URL || protocolConfig.chains.sepolia.defaultRpcUrl },
+                { chainIndex: 1, networkId: 'bscTestnet', deploymentsNetwork: 'bscTestnet', rpcUrl: process.env.BSC_TESTNET_RPC_URL || protocolConfig.chains.bscTestnet.defaultRpcUrl },
+                { chainIndex: 2, networkId: 'baseSepolia', deploymentsNetwork: 'baseSepolia', rpcUrl: process.env.BASE_SEPOLIA_RPC_URL || protocolConfig.chains.baseSepolia.defaultRpcUrl },
+            ];
         const workerRealmCount = options.workerRealmCount;
         const realmEdgeCount = options.realmEdgeCount;
         const coordinatorEdgeCount = options.coordinatorEdgeCount;
@@ -3807,10 +3832,37 @@ class DevNetProcessManager {
 
         // 10. L1 (Anvil)
         if (options.l1 || startAll) {
-            if (l1Network === "localhost" || l1Fork) {
+            if (l1Network === "localhost" && !l1Fork) {
+                const localChains = [
+                    { network: "localhost" as const, port: l1Port, logName: "l1_anvil" },
+                    { network: "localhostBsc" as const, port: 9545, logName: "l1_anvil_bsc" },
+                    { network: "localhostBase" as const, port: 10545, logName: "l1_anvil_base" },
+                ];
+                for (const localChain of localChains) {
+                    const chainMeta = protocolConfig.chains[localChain.network];
+                    const rpcUrl = resolveLocalL1RpcUrl(localChain.port);
+                    const args = [
+                        'anvil', '--host', '0.0.0.0', '--port', String(localChain.port),
+                        '--chain-id', String(chainMeta.l1ChainId), '--steps-tracing', '-vvvv',
+                    ];
+                    await this.track(await RunningProcess.spawnWithInitializationHintWithRetry(
+                        args,
+                        l1StartedDetector,
+                        { cwd, ...getLogPaths(localChain.logName, false), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() },
+                    ));
+                    await waitForHttpUrl(rpcUrl, {
+                        attempts: 30, delayMs: 500, timeoutMs: 1500, name: `${chainMeta.name} RPC`,
+                    });
+                    await deployPsyContracts(cwd, rpcUrl, localChain.network, {
+                        fundDevAccounts: true,
+                        localAnvilRpcUrl: rpcUrl,
+                    });
+                    console.log(`[DevNet] ${chainMeta.name} started and deployed on ${rpcUrl}`);
+                }
+            } else if (l1Fork) {
                 const chainMeta = protocolConfig.chains[l1Network];
                 if (!chainMeta) throw new Error(`[DevNet] protocolConfig.chains.${l1Network} missing`);
-                const effectiveL1ChainId = l1Fork ? protocolConfig.chains.localhost.l1ChainId : chainMeta.l1ChainId;
+                const effectiveL1ChainId = protocolConfig.chains.localhost.l1ChainId;
                 const l1ForkArgs = ['anvil', '--host', '0.0.0.0', '--port', String(l1Port), '--chain-id', String(effectiveL1ChainId), '--steps-tracing', '-vvvv'];
                 if (l1Fork) {
                     const forkEnvKey = cfgEntry.anvilForkSourceUrlEnv;
@@ -3838,6 +3890,10 @@ class DevNetProcessManager {
                     timeoutMs: 1500,
                     name: "L1 RPC"
                 });
+                await deployPsyContracts(cwd, l1RpcUrl, deploymentsNetwork, {
+                    fundDevAccounts: true,
+                    localAnvilRpcUrl: localL1RpcUrl,
+                });
             } else {
                 console.log(`[DevNet] Using external L1 network ${l1Network} via ${l1RpcUrl}`);
                 await waitForHttpUrl(l1RpcUrl, {
@@ -3846,11 +3902,11 @@ class DevNetProcessManager {
                     timeoutMs: 3000,
                     name: `${l1Network} RPC`
                 });
+                await deployPsyContracts(cwd, l1RpcUrl, deploymentsNetwork, {
+                    fundDevAccounts: false,
+                    localAnvilRpcUrl: localL1RpcUrl,
+                });
             }
-            await deployPsyContracts(cwd, l1RpcUrl, deploymentsNetwork, {
-                fundDevAccounts: l1Network === "localhost" || l1Fork,
-                localAnvilRpcUrl: localL1RpcUrl,
-            });
         }
 
         // 11. Bridge dependencies (Envio + psy-services)
@@ -3937,6 +3993,19 @@ class DevNetProcessManager {
             if (!bridgeAddress) {
                 throw new Error(`[DevNet] Failed to resolve Bridge address from ${deploymentsNetwork} deployments`);
             }
+            const bridgeL1Chains = await Promise.all(relayerChains.map(async (chain) => {
+                const address = await readDeploymentAddress(cwd, chain.deploymentsNetwork, 'StateManager');
+                if (!address) {
+                    throw new Error(
+                        `[DevNet] Failed to resolve StateManager address from ${chain.deploymentsNetwork} deployments`,
+                    );
+                }
+                return {
+                    chain_index: chain.chainIndex,
+                    rpc_url: chain.rpcUrl,
+                    state_manager_address: address,
+                };
+            }));
 
             await Bun.spawn(['docker', 'exec', 'generated-envio-postgres-1', 'dropdb', '-U', 'postgres', '--if-exists', 'psy_services'], {
                 stdio: ['ignore', 'ignore', 'ignore'],
@@ -3959,6 +4028,7 @@ class DevNetProcessManager {
                         PSY_NOSTR_ENABLED: 'true',
                         PSY_NOSTR_RELAY_URL: 'ws://127.0.0.1:8081',
                         L1_RPC_URL: relayerL1RpcUrl,
+                        BRIDGE_L1_CHAINS_JSON: JSON.stringify(bridgeL1Chains),
                         BRIDGE_ADDRESS: bridgeAddress,
                         STATE_MANAGER_ADDRESS: stateManagerAddress,
                         API_LISTEN: '0.0.0.0:3000',
@@ -4087,6 +4157,17 @@ class DevNetProcessManager {
                 `keystore_path = "${resolveBridgeRelayerKeystorePath().replaceAll('\\', '\\\\')}"`,
                 `password_env = "WALLET_PASSWORD"`,
                 ``,
+                ...relayerChains.flatMap((chain) => [
+                    `[[chains]]`,
+                    `family = "evm"`,
+                    `chain_index = ${chain.chainIndex}`,
+                    `network_id = "${chain.networkId}"`,
+                    `rpc_urls = ["${chain.rpcUrl}"]`,
+                    `deployments_network = "${chain.deploymentsNetwork}"`,
+                    `keystore_path = "${resolveBridgeRelayerKeystorePath().replaceAll('\\', '\\\\')}"`,
+                    `password_env = "WALLET_PASSWORD"`,
+                    ``,
+                ]),
             ].join('\n');
             await writeFile(daemonConfigPath, daemonConfig, 'utf8');
 

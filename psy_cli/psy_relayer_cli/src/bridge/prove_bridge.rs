@@ -1,7 +1,7 @@
 use std::{array, fs, path::PathBuf, str::FromStr, sync::Arc, sync::OnceLock};
 
 use anyhow::Context;
-use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_primitives::{keccak256, Address, B256, Bytes, U256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::{BlockNumberOrTag, TransactionRequest};
 use alloy_sol_types::{sol, SolCall, SolEvent};
@@ -270,7 +270,7 @@ async fn fetch_slot_pair_as_b256(
     ])))
 }
 
-async fn fetch_tree_subroot_and_top_proof(
+pub(crate) async fn fetch_tree_subroot_and_top_proof(
     provider: &RpcProvider,
     checkpoint_id: u64,
     owner_user_id: u64,
@@ -294,16 +294,30 @@ async fn fetch_tree_subroot_and_top_proof(
 
     let mut proof = [B256::ZERO; 9];
     proof[0] = subtree_root;
+    let mut empty_subtree = B256::ZERO;
 
     let mut node = 256u64 + chain_index as u64;
     for level in 0..TOP_TREE_HEIGHT {
         let sibling = if (node & 1) == 0 { node + 1 } else { node - 1 };
-        proof[level + 1] =
+        let stored_sibling =
             fetch_slot_pair_as_b256(provider, checkpoint_id, owner_user_id, contract_id, agg_slot_base + sibling * 2).await?;
+        proof[level + 1] = canonical_empty_subtree(stored_sibling, empty_subtree);
+        empty_subtree = keccak_pair(empty_subtree, empty_subtree);
         node >>= 1;
     }
 
     Ok((subtree_root, proof))
+}
+
+fn canonical_empty_subtree(stored: B256, empty_subtree: B256) -> B256 {
+    if stored == B256::ZERO { empty_subtree } else { stored }
+}
+
+fn keccak_pair(left: B256, right: B256) -> B256 {
+    let mut input = [0u8; 64];
+    input[..32].copy_from_slice(left.as_slice());
+    input[32..].copy_from_slice(right.as_slice());
+    keccak256(input)
 }
 
 #[derive(Serialize)]
@@ -983,6 +997,52 @@ pub async fn run_prove_bridge_agg_with_result(
         deposit_tree_root: output.deposit_tree_root.clone(),
         withdrawal_tree_root: output.withdrawal_tree_root.clone(),
     })
+}
+
+#[cfg(test)]
+mod top_tree_tests {
+    use super::{canonical_empty_subtree, keccak_pair};
+    use alloy_primitives::{keccak256, B256};
+
+    #[test]
+    fn unwritten_slots_expand_to_level_specific_empty_subtrees() {
+        let mut empty = B256::ZERO;
+        for level in 0..8 {
+            assert_eq!(canonical_empty_subtree(B256::ZERO, empty), empty, "level {level}");
+            let non_empty = keccak256([level as u8]);
+            assert_eq!(canonical_empty_subtree(non_empty, empty), non_empty);
+            empty = keccak_pair(empty, empty);
+        }
+    }
+
+    #[test]
+    fn empty_chain_two_proof_matches_root_when_only_chain_one_is_non_empty() {
+        let chain_one = keccak256(b"chain-one-withdrawal-root");
+        let level_one_left = keccak_pair(B256::ZERO, chain_one);
+
+        let mut empty = keccak_pair(B256::ZERO, B256::ZERO);
+        let mut root_from_chain_one = level_one_left;
+        for _level in 1..8 {
+            root_from_chain_one = keccak_pair(root_from_chain_one, empty);
+            empty = keccak_pair(empty, empty);
+        }
+
+        let mut chain_two_value = B256::ZERO;
+        let mut chain_two_node = 258u16;
+        let mut empty = B256::ZERO;
+        for level in 0..8 {
+            let sibling = if level == 1 { level_one_left } else { empty };
+            chain_two_value = if chain_two_node & 1 == 0 {
+                keccak_pair(chain_two_value, sibling)
+            } else {
+                keccak_pair(sibling, chain_two_value)
+            };
+            chain_two_node >>= 1;
+            empty = keccak_pair(empty, empty);
+        }
+
+        assert_eq!(chain_two_value, root_from_chain_one);
+    }
 }
 
 /// Build deposit batchAppend calls using a remote Prove Proxy instead of local Plonky2+Groth16.

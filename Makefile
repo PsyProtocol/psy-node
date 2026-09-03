@@ -96,6 +96,8 @@ shutdown:
 clean-db:
 	rm -fr local_checkpoints logs || true
 	rm -fr psy-contracts/deployments/localhost || true
+	rm -fr psy-contracts/deployments/localhostBsc || true
+	rm -fr psy-contracts/deployments/localhostBase || true
 	-docker stop -t 15 valkey-server nats-server scylla-server nostr-relay generated-envio-postgres-1 generated-graphql-engine-1 2>/dev/null || true
 	-docker rm -f valkey-server nats-server scylla-server nostr-relay generated-envio-postgres-1 generated-graphql-engine-1 2>/dev/null || true
 	# Drop the envio postgres volume before wiping generated/ so the compose file still exists.
