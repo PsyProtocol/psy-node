@@ -1,6 +1,6 @@
 # Envio one-indexer multi-L1
 
-Date: 2026-09-02
+Date: 2026-09-02 (updated 2026-09-03 for three-chain pairing with `multi_chain`)
 Status: approved for implementation
 Repo: `PsyProtocol/psy-node` (`psy_cli/psy_relayer_cli/indexer/envio`)
 Pairs with: `psy-services` `feat/multi-chain-l1-registry`
@@ -23,11 +23,12 @@ psy-services talks to **one** GraphQL URL and isolates queries by protocol
 
 | Field | Meaning | Example |
 |-------|---------|---------|
-| `chain_id` | EVM id from Envio `event.chainId` | Sepolia `11155111`, BSC `97` |
-| `chain_index` | Protocol slot from `StateManager.l1ChainIndex` | Sepolia `0`, BSC `1`, ETH `2` |
+| `chain_id` | EVM id from Envio `event.chainId` | local `31337`/`31338`/`31339`; Sepolia `11155111`, BSC `97`, Base Sepolia `84532` |
+| `chain_index` | Protocol slot from `StateManager.l1ChainIndex` | ETH family `0`, BSC `1`, Base `2` |
 
 `chain_index` must be unique across every network this indexer watches.
-Never store EVM id `97` as `chain_index`.
+Never store EVM id `97` as `chain_index`. Target pairing with `psy-node`
+`multi_chain` / locSetupV4 is three networks: ETH, BSC, Base.
 
 Tree ids stay protocol-scoped so they match L2 `set_chain_root(chain_index, …)`
 and psy-services `DepositTreeNode` lookups:
@@ -44,9 +45,10 @@ FinalizedBatch.id  = "{chain_id}-{checkpointId}"
 
 `config.template.yaml` remains the local single-network template.
 
-`config.multi-l1.template.yaml` is the production shape: multiple
-`networks[]` entries, same `handlers.ts`, distinct Bridge/StateManager
-addresses and RPCs.
+`config.multi-l1.template.yaml` matches `origin/multi_chain`'s rendered
+indexer: three `networks` (ETH / BSC / Base), shared top-level contract
+ABI/handlers, distinct addresses and RPCs. locSetupV4 substitutes
+`${ETH_*}` / `${BSC_*}` / `${BASE_*}`.
 
 ## Collision guard
 
