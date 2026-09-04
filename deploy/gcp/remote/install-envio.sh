@@ -1,0 +1,372 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${ETH_RPC_URL:=}"
+: "${BRIDGE_ADDRESS:=}"
+: "${STATE_MANAGER_ADDRESS:=}"
+: "${ENVIO_CHAINS_JSON:=}"
+: "${ENVIO_DATABASE_URL:?ENVIO_DATABASE_URL is required}"
+: "${CHAIN_ID:=31337}"
+: "${START_BLOCK:=1}"
+: "${ENVIO_USE_HYPERSYNC:=auto}"
+: "${ENVIO_HYPERSYNC_URL:=}"
+: "${ENVIO_API_TOKEN:=}"
+: "${ENVIO_CONFIRMED_BLOCK_THRESHOLD:=8}"
+: "${ENVIO_RPC_INITIAL_BLOCK_INTERVAL:=50000}"
+: "${ENVIO_RPC_BACKOFF_MULTIPLICATIVE:=0.8}"
+: "${ENVIO_RPC_ACCELERATION_ADDITIVE:=10000}"
+: "${ENVIO_RPC_INTERVAL_CEILING:=100000}"
+: "${ENVIO_RPC_BACKOFF_MILLIS:=5000}"
+: "${ENVIO_RPC_QUERY_TIMEOUT_MILLIS:=20000}"
+: "${ENVIO_RPC_FALLBACK_STALL_TIMEOUT_MILLIS:=10000}"
+: "${ENVIO_RPC_METERING:=1}"
+: "${ENVIO_RPC_HEIGHT_LOG_EVERY:=300}"
+: "${ENVIO_RPC_GET_LOGS_LOG_EVERY:=100}"
+: "${HASURA_EXTERNAL_PORT:=18080}"
+: "${HASURA_INTERNAL_PORT:=8080}"
+: "${ENVIO_PG_HOST:?ENVIO_PG_HOST is required}"
+: "${ENVIO_PG_PORT:=5432}"
+: "${ENVIO_GENERATED_PG_PORT:=15432}"
+: "${ENVIO_PG_USER:=postgres}"
+: "${ENVIO_PG_PASSWORD:=testing}"
+: "${ENVIO_PG_DATABASE:=envio_bridge}"
+: "${ENVIO_PG_PUBLIC_SCHEMA:=envio}"
+: "${HASURA_GRAPHQL_ADMIN_SECRET:=testing}"
+: "${ENVIO_RESET_SCHEMA:=0}"
+
+# shellcheck source=../lib/envio-config.sh
+source /tmp/envio-config.sh
+
+ENVIO_HOME="/opt/parth/envio/current"
+
+if [ ! -d "$ENVIO_HOME" ]; then
+  echo "missing Envio home: $ENVIO_HOME" >&2
+  exit 1
+fi
+
+if [ -z "${ENVIO_RPC_POLLING_INTERVAL_MILLIS:-}" ]; then
+  if [ "$CHAIN_ID" = "31337" ]; then
+    ENVIO_RPC_POLLING_INTERVAL_MILLIS="1000"
+  else
+    ENVIO_RPC_POLLING_INTERVAL_MILLIS="12000"
+  fi
+fi
+
+if [ "$ENVIO_USE_HYPERSYNC" = "auto" ]; then
+  if [ "$CHAIN_ID" = "31337" ]; then
+    ENVIO_USE_HYPERSYNC="0"
+  else
+    ENVIO_USE_HYPERSYNC="1"
+  fi
+fi
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y ca-certificates curl docker.io jq nodejs npm postgresql-client python3
+systemctl enable --now docker
+
+if ! docker compose version >/dev/null 2>&1 && ! command -v docker-compose >/dev/null 2>&1; then
+  for compose_pkg in docker-compose-v2 docker-compose-plugin docker-compose; do
+    if apt-cache show "$compose_pkg" >/dev/null 2>&1; then
+      apt-get install -y "$compose_pkg"
+      break
+    fi
+  done
+fi
+
+compose() {
+  if docker compose version >/dev/null 2>&1; then
+    docker compose "$@"
+  elif command -v docker-compose >/dev/null 2>&1; then
+    docker-compose "$@"
+  else
+    echo "Docker Compose is not available from configured apt repositories" >&2
+    exit 1
+  fi
+}
+
+url_encode() {
+  local value="$1"
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$value"
+    return 0
+  fi
+
+  if command -v node >/dev/null 2>&1; then
+    node -e 'console.log(encodeURIComponent(process.argv[1]))' "$value"
+    return 0
+  fi
+
+  echo "python3 or node is required for URL encoding" >&2
+  exit 1
+}
+
+patch_generated_compose() {
+  [ -f generated/docker-compose.yaml ] || return 0
+
+  # Envio's generated compose builds Hasura's database URL from raw password
+  # parts. Staging passwords may contain URL-special characters such as `/`,
+  # so force Hasura to use the already URL-encoded shared Postgres URL.
+  sed -i -E \
+    -e 's|^([[:space:]]*)HASURA_GRAPHQL_DATABASE_URL:.*$|\1HASURA_GRAPHQL_DATABASE_URL: "${ENVIO_DATABASE_URL}"|' \
+    -e 's|"\$\{ENVIO_PG_PORT:-5433\}:5432"|"127.0.0.1:15432:5432"|g' \
+    -e 's|"\$\{ENVIO_PG_PORT:-5432\}:5432"|"127.0.0.1:15432:5432"|g' \
+    generated/docker-compose.yaml
+
+  cp .env generated/.env
+}
+
+build_envio_rescript_dependency() {
+  local rescript_bin="$ENVIO_HOME/generated/node_modules/.bin/rescript"
+  local envio_rescript_json=""
+  local envio_pkg_dir=""
+
+  [ -x "$rescript_bin" ] || return 0
+
+  envio_rescript_json="$(find "$ENVIO_HOME/generated/node_modules" -path '*/node_modules/envio/rescript.json' -print -quit 2>/dev/null || true)"
+  [ -n "$envio_rescript_json" ] || return 0
+
+  envio_pkg_dir="$(dirname "$envio_rescript_json")"
+  if [ ! -f "$envio_pkg_dir/src/Persistence.res.js" ]; then
+    echo "building Envio ReScript dependency: $envio_pkg_dir"
+    (cd "$envio_pkg_dir" && "$rescript_bin" build)
+  fi
+}
+
+build_generated_rescript() {
+  [ -x generated/node_modules/.bin/rescript ] || return 0
+
+  echo "building generated Envio ReScript project"
+  (cd generated && ./node_modules/.bin/rescript)
+
+  [ -f generated/src/db/Migrations.res.js ] || {
+    echo "generated Envio build did not produce src/db/Migrations.res.js" >&2
+    exit 1
+  }
+}
+
+patch_envio_rpc_source() {
+  local rpc_source_js="$ENVIO_HOME/node_modules/envio/src/sources/RpcSource.res.js"
+  [ -f "$rpc_source_js" ] || return 0
+
+  # Envio's RPC source polls eth_blockNumber every 1s by default. In staging,
+  # RPC is only a fallback behind HyperSync, so keep fallback polling modest.
+  python3 - "$rpc_source_js" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+
+text = text.replace(
+    "var maxSuggestedBlockIntervalKey = \"max\";\n\n",
+    """var maxSuggestedBlockIntervalKey = \"max\";
+
+function __psyRpcMeterEvery(method) {
+  if (method === \"eth_blockNumber\") {
+    return Number(process.env.ENVIO_RPC_HEIGHT_LOG_EVERY || \"300\");
+  }
+  if (method === \"eth_getLogs\") {
+    return Number(process.env.ENVIO_RPC_GET_LOGS_LOG_EVERY || \"100\");
+  }
+  return 100;
+}
+
+function __psyRpcMeter(method, details) {
+  if (process.env.ENVIO_RPC_METERING === \"0\") {
+    return;
+  }
+  var key = \"__psyEnvioRpcMeter_\" + method;
+  globalThis[key] = (globalThis[key] || 0) + 1;
+  var count = globalThis[key];
+  var every = __psyRpcMeterEvery(method);
+  if (every > 0 && count % every === 0) {
+    console.warn(\"[psy-rpc-meter] source=envio method=\" + method + \" count=\" + String(count) + \" \" + details);
+  }
+}
+
+""",
+)
+
+text = text.replace(
+    "  var latestFetchedBlockPromise = loadBlock(toBlock);\n"
+    "  var logsPromise = provider.getLogs(Ethers.CombinedFilter.toFilter({",
+    "  var latestFetchedBlockPromise = loadBlock(toBlock);\n"
+    "  __psyRpcMeter(\"eth_getLogs\", \"fromBlock=\" + String(fromBlock) + \" toBlock=\" + String(toBlock) + \" partition=\" + String(partitionId));\n"
+    "  var logsPromise = provider.getLogs(Ethers.CombinedFilter.toFilter({",
+)
+
+text = text.replace(
+    "          pollingInterval: 1000,\n",
+    "          pollingInterval: Number(process.env.ENVIO_RPC_POLLING_INTERVAL_MILLIS || \"1000\"),\n",
+)
+
+text = text.replace(
+    "          getHeightOrThrow: (function () {\n"
+    "              return Rest.$$fetch(Rpc.GetBlockHeight.route, undefined, client);\n"
+    "            }),\n",
+    "          getHeightOrThrow: (function () {\n"
+    "              __psyRpcMeter(\"eth_blockNumber\", \"host=\" + urlHost + \" pollingIntervalMs=\" + String(Number(process.env.ENVIO_RPC_POLLING_INTERVAL_MILLIS || \"1000\")));\n"
+    "              return Rest.$$fetch(Rpc.GetBlockHeight.route, undefined, client);\n"
+    "            }),\n",
+)
+
+required_markers = [
+    "function __psyRpcMeter(method, details)",
+    "__psyRpcMeter(\"eth_getLogs\"",
+    "ENVIO_RPC_POLLING_INTERVAL_MILLIS",
+    "__psyRpcMeter(\"eth_blockNumber\"",
+]
+missing = [marker for marker in required_markers if marker not in text]
+if missing:
+    raise SystemExit("failed to patch Envio RPC source; missing markers: " + ", ".join(missing))
+
+path.write_text(text)
+PY
+}
+
+bash /tmp/mount-data-disk.sh
+
+if ! command -v pnpm >/dev/null 2>&1; then
+  npm install -g pnpm
+fi
+
+cd "$ENVIO_HOME"
+ENVIO_POSTGRES_PASSWORD_ENCODED="$(url_encode "$ENVIO_PG_PASSWORD")"
+write_envio_config
+
+cat > .env <<EOF
+ETH_RPC_URL=${ETH_RPC_URL}
+BRIDGE_ADDRESS=${BRIDGE_ADDRESS}
+STATE_MANAGER_ADDRESS=${STATE_MANAGER_ADDRESS}
+ENVIO_USE_HYPERSYNC=${ENVIO_USE_HYPERSYNC}
+ENVIO_HYPERSYNC_URL=${ENVIO_HYPERSYNC_URL}
+ENVIO_API_TOKEN=${ENVIO_API_TOKEN}
+ENVIO_RPC_POLLING_INTERVAL_MILLIS=${ENVIO_RPC_POLLING_INTERVAL_MILLIS}
+ENVIO_RPC_INITIAL_BLOCK_INTERVAL=${ENVIO_RPC_INITIAL_BLOCK_INTERVAL}
+ENVIO_RPC_BACKOFF_MULTIPLICATIVE=${ENVIO_RPC_BACKOFF_MULTIPLICATIVE}
+ENVIO_RPC_ACCELERATION_ADDITIVE=${ENVIO_RPC_ACCELERATION_ADDITIVE}
+ENVIO_RPC_INTERVAL_CEILING=${ENVIO_RPC_INTERVAL_CEILING}
+ENVIO_RPC_BACKOFF_MILLIS=${ENVIO_RPC_BACKOFF_MILLIS}
+ENVIO_RPC_FALLBACK_STALL_TIMEOUT_MILLIS=${ENVIO_RPC_FALLBACK_STALL_TIMEOUT_MILLIS}
+ENVIO_RPC_QUERY_TIMEOUT_MILLIS=${ENVIO_RPC_QUERY_TIMEOUT_MILLIS}
+ENVIO_RPC_METERING=${ENVIO_RPC_METERING}
+ENVIO_RPC_HEIGHT_LOG_EVERY=${ENVIO_RPC_HEIGHT_LOG_EVERY}
+ENVIO_RPC_GET_LOGS_LOG_EVERY=${ENVIO_RPC_GET_LOGS_LOG_EVERY}
+DATABASE_URL=${ENVIO_DATABASE_URL}
+ENVIO_DATABASE_URL=${ENVIO_DATABASE_URL}
+ENVIO_SHARED_PG_HOST=${ENVIO_PG_HOST}
+ENVIO_SHARED_PG_PORT=${ENVIO_PG_PORT}
+ENVIO_PG_HOST=${ENVIO_PG_HOST}
+ENVIO_PG_PORT=${ENVIO_PG_PORT}
+ENVIO_GENERATED_PG_PORT=${ENVIO_GENERATED_PG_PORT}
+ENVIO_PG_USER=${ENVIO_PG_USER}
+ENVIO_PG_PASSWORD=${ENVIO_PG_PASSWORD}
+ENVIO_PG_DATABASE=${ENVIO_PG_DATABASE}
+ENVIO_PG_PUBLIC_SCHEMA=${ENVIO_PG_PUBLIC_SCHEMA}
+ENVIO_POSTGRES_PASSWORD=${ENVIO_POSTGRES_PASSWORD_ENCODED}
+HASURA_EXTERNAL_PORT=${HASURA_EXTERNAL_PORT}
+HASURA_INTERNAL_PORT=${HASURA_INTERNAL_PORT}
+HASURA_GRAPHQL_ENDPOINT=http://localhost:${HASURA_INTERNAL_PORT}/v1/metadata
+HASURA_GRAPHQL_ADMIN_SECRET=${HASURA_GRAPHQL_ADMIN_SECRET}
+HASURA_GRAPHQL_ENABLE_CONSOLE=false
+ENVIO_HASURA=true
+TS_NODE_COMPILER_OPTIONS={"module":"CommonJS","moduleResolution":"node","noImplicitAny":false}
+EOF
+
+export CI=true
+# Envio regenerates this workspace from config.yaml and schema.graphql. Remove
+# leftovers from an interrupted install so they cannot invalidate the root lock.
+rm -rf generated
+if [ -f pnpm-lock.yaml ]; then
+  pnpm install --frozen-lockfile
+else
+  pnpm install --no-frozen-lockfile
+fi
+patch_envio_rpc_source
+build_envio_rescript_dependency
+
+# The generated directory is tied to config.yaml and schema.graphql. Do not
+# reuse stale generated handlers after contract events change.
+pnpm exec envio codegen --config ./config.yaml
+build_generated_rescript
+
+patch_generated_compose
+
+if [ -f generated/docker-compose.yaml ]; then
+  compose -f generated/docker-compose.yaml down --remove-orphans >/dev/null 2>&1 || true
+fi
+
+cat > generated/docker-compose.hasura.yaml <<'EOF'
+version: "3.9"
+
+services:
+  graphql-engine:
+    image: hasura/graphql-engine:v2.43.0
+    ports:
+      # Envio CLI waits for localhost:8080 during `envio dev`; keep this
+      # internal host port stable even when the public/Caddy port is different.
+      - "127.0.0.1:${HASURA_INTERNAL_PORT:-8080}:8080"
+      - "${HASURA_EXTERNAL_PORT:-18080}:8080"
+    user: 1001:1001
+    restart: always
+    environment:
+      HASURA_GRAPHQL_DATABASE_URL: ${ENVIO_DATABASE_URL}
+      HASURA_GRAPHQL_ENABLE_CONSOLE: ${HASURA_GRAPHQL_ENABLE_CONSOLE:-false}
+      HASURA_GRAPHQL_ENABLED_LOG_TYPES: startup, http-log, webhook-log, websocket-log, query-log
+      HASURA_GRAPHQL_NO_OF_RETRIES: 10
+      HASURA_GRAPHQL_ADMIN_SECRET: ${HASURA_GRAPHQL_ADMIN_SECRET:-testing}
+      HASURA_GRAPHQL_STRINGIFY_NUMERIC_TYPES: "true"
+      PORT: 8080
+      HASURA_GRAPHQL_UNAUTHORIZED_ROLE: public
+    healthcheck:
+      test: timeout 1s bash -c ':> /dev/tcp/127.0.0.1/8080' || exit 1
+      interval: 5s
+      timeout: 2s
+      retries: 50
+      start_period: 5s
+EOF
+
+for _ in $(seq 1 60); do
+  if pg_isready -d "$ENVIO_DATABASE_URL" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 2
+done
+
+psql "$ENVIO_DATABASE_URL" -v ON_ERROR_STOP=1 -c "SELECT 1;" >/dev/null
+if [ "$ENVIO_RESET_SCHEMA" = "1" ]; then
+  psql "$ENVIO_DATABASE_URL" -v ON_ERROR_STOP=1 \
+    -c "DROP SCHEMA IF EXISTS ${ENVIO_PG_PUBLIC_SCHEMA} CASCADE; DROP SCHEMA IF EXISTS hdb_catalog CASCADE;" >/dev/null
+fi
+compose -f generated/docker-compose.hasura.yaml down --remove-orphans >/dev/null 2>&1 || true
+docker rm -f generated-graphql-engine-1 generated-envio-postgres-1 >/dev/null 2>&1 || true
+compose -f generated/docker-compose.hasura.yaml up -d
+
+cat >/etc/systemd/system/parth-envio.service <<'EOF'
+[Unit]
+Description=Parth Envio Bridge Indexer
+Wants=network-online.target docker.service
+After=network-online.target docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/parth/envio/current
+EnvironmentFile=/opt/parth/envio/current/.env
+ExecStart=/usr/local/bin/pnpm dev
+Restart=always
+RestartSec=5
+TimeoutStopSec=60
+KillSignal=SIGINT
+LimitNOFILE=1048576
+SyslogIdentifier=parth-envio
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now parth-envio.service
+systemctl restart parth-envio.service
+systemctl --no-pager --full status parth-envio.service || true

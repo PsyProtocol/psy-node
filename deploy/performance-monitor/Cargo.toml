@@ -1,0 +1,12 @@
+[package]
+name = "parth-performance-monitor"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+libc = "0.2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1"
+
+[workspace]

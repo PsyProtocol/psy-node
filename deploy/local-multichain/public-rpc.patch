@@ -1,0 +1,18 @@
+diff --git a/apps/bridge/src/bridge/lib/chains.ts b/apps/bridge/src/bridge/lib/chains.ts
+index 9276414..840fd2b 100755
+--- a/apps/bridge/src/bridge/lib/chains.ts
++++ b/apps/bridge/src/bridge/lib/chains.ts
+@@ -55,6 +55,13 @@ function tokenAddressByRole(
+ }
+ 
+ function localRpcUrl(network: ProtocolNetwork): string {
++  const publicUrl = network === 'localhostBsc'
++    ? import.meta.env.VITE_LOCALHOST_BSC_RPC_URL
++    : network === 'localhostBase'
++      ? import.meta.env.VITE_LOCALHOST_BASE_RPC_URL
++      : import.meta.env.VITE_LOCALHOST_ETH_RPC_URL
++  if (publicUrl) return String(publicUrl)
++
+   if (typeof window === 'undefined') {
+     if (network === 'localhostBsc') return 'http://127.0.0.1:9545'
+     if (network === 'localhostBase') return 'http://127.0.0.1:10545'

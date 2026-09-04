@@ -1,0 +1,104 @@
+services:
+  valkey:
+    image: "${LOCAL_REDIS_IMAGE:-redis:7.4}"
+    container_name: "${LOCAL_STAGING_CONTAINER_PREFIX:-parth-local}-valkey"
+    command:
+      - "${LOCAL_REDIS_SERVER_BIN:-redis-server}"
+      - --dir
+      - /data
+      - --dbfilename
+      - dump.rdb
+      - --appendonly
+      - "yes"
+      - --appendfilename
+      - appendonly.aof
+      - --appendfsync
+      - everysec
+    ports:
+      - "127.0.0.1:${LOCAL_REDIS_PORT:-6379}:6379"
+    volumes:
+      - valkey-data:/data
+
+  nats:
+    image: nats:2.10
+    container_name: "${LOCAL_STAGING_CONTAINER_PREFIX:-parth-local}-nats"
+    command:
+      - -js
+      - -sd
+      - /data
+    ports:
+      - "127.0.0.1:${LOCAL_NATS_PORT:-4222}:4222"
+    volumes:
+      - nats-data:/data
+
+  scylla:
+    image: "scylladb/scylla:${LOCAL_SCYLLA_IMAGE_TAG:-latest}"
+    container_name: "${LOCAL_STAGING_CONTAINER_PREFIX:-parth-local}-scylla"
+    command:
+      - --smp
+      - "${LOCAL_SCYLLA_SMP:-2}"
+      - --developer-mode
+      - "1"
+      - --overprovisioned
+      - "1"
+      - --experimental-features=lwt
+      - --commitlog-sync=batch
+      - --commitlog-sync-batch-window-in-ms=2
+      - --critical-disk-utilization-level
+      - "${LOCAL_SCYLLA_CRITICAL_DISK_UTILIZATION_LEVEL:-99.5}"
+    ports:
+      - "127.0.0.1:${LOCAL_SCYLLA_PORT:-9042}:9042"
+    volumes:
+      - scylla-data:/var/lib/scylla
+
+  postgres:
+    image: postgres:16
+    container_name: "${LOCAL_STAGING_CONTAINER_PREFIX:-parth-local}-postgres"
+    environment:
+      POSTGRES_USER: "${LOCAL_POSTGRES_USER:-postgres}"
+      POSTGRES_PASSWORD: "${LOCAL_POSTGRES_PASSWORD:-postgres}"
+      POSTGRES_DB: "${LOCAL_POSTGRES_DB:-psy_services}"
+    ports:
+      - "127.0.0.1:${LOCAL_POSTGRES_PORT:-15432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  nostr:
+    image: "${LOCAL_NOSTR_IMAGE:-scsibug/nostr-rs-relay:latest}"
+    container_name: "${LOCAL_STAGING_CONTAINER_PREFIX:-parth-local}-nostr"
+    ports:
+      - "127.0.0.1:${LOCAL_NOSTR_PORT:-8081}:8081"
+    volumes:
+      - nostr-data:/usr/src/app/db
+      - ./nostr-config.toml:/usr/src/app/config.toml:ro
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: "${LOCAL_STAGING_CONTAINER_PREFIX:-parth-local}-nginx"
+    depends_on:
+      - valkey
+      - nats
+      - scylla
+      - postgres
+      - nostr
+    ports:
+      - "127.0.0.1:${LOCAL_STAGING_APP_PORT:-8088}:8088"
+      - "127.0.0.1:${LOCAL_STAGING_EXPLORER_PORT:-8089}:8089"
+      - "127.0.0.1:${LOCAL_STAGING_IDE_PORT:-8090}:8090"
+    volumes:
+      - "${LOCAL_STAGING_NGINX_ROOT:-./www}:/usr/share/nginx/html:ro"
+      - "./nginx.conf:/etc/nginx/conf.d/default.conf:ro"
+
+volumes:
+  valkey-data:
+  nats-data:
+  scylla-data:
+  postgres-data:
+  nostr-data:

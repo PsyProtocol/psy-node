@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+service="${1:?service name is required}"
+
+: "${PARTH_HOME:=/opt/parth/current}"
+: "${NETWORK:=local-devnet}"
+: "${PROVING_BACKEND:=plonky2-poseidon-goldilocks}"
+: "${SCYLLA_DB_URL:=127.0.0.1:9042}"
+: "${NATS_JETSTREAM_URL:=nats://127.0.0.1:4222}"
+: "${REDIS_URL:=redis://127.0.0.1:6379}"
+: "${GENESIS_DATA_PATH:=$PARTH_HOME/genesis.json}"
+: "${CHECKPOINT_BACKUP_PATH:=/var/lib/parth/checkpoints}"
+: "${VERBOSE:=1}"
+: "${PARTH_TARGET_DIR:=$PARTH_HOME/target}"
+
+node_bin="$PARTH_TARGET_DIR/release/psy_node_cli"
+worker_bin="$PARTH_TARGET_DIR/release/psy_worker_cli"
+user_bin="$PARTH_TARGET_DIR/release/psy_user_cli"
+relayer_bin="$PARTH_TARGET_DIR/release/psy_relayer_cli"
+psy_services_home="${PSY_SERVICES_HOME:-$PARTH_HOME/../psy-services}"
+psy_services_target_dir="${PSY_SERVICES_TARGET_DIR:-$psy_services_home/target}"
+psy_services_bin="$psy_services_target_dir/release/psy-services"
+psy_indexer_bin="$psy_services_target_dir/release/psy-indexer"
+
+require_file() {
+  if [ ! -f "$1" ]; then
+    echo "required file does not exist: $1" >&2
+    exit 1
+  fi
+}
+
+require_env() {
+  local name="$1"
+  if [ -z "${!name:-}" ]; then
+    echo "required environment variable is empty: $name" >&2
+    exit 1
+  fi
+}
+
+trim() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+append_csv_args() {
+  local var_name="$1"
+  local flag="$2"
+  local raw="${!var_name:-}"
+  local old_ifs="$IFS"
+  local item
+
+  [ -z "$raw" ] && return 0
+
+  IFS=','
+  read -r -a items <<< "$raw"
+  IFS="$old_ifs"
+
+  for item in "${items[@]}"; do
+    item="$(trim "$item")"
+    if [ -n "$item" ]; then
+      args+=("$flag" "$item")
+    fi
+  done
+}
+
+append_csv_values_after_flag() {
+  local var_name="$1"
+  local flag="$2"
+  local raw="${!var_name:-}"
+  local old_ifs="$IFS"
+  local item
+  local values=()
+
+  [ -z "$raw" ] && return 0
+
+  IFS=','
+  read -r -a items <<< "$raw"
+  IFS="$old_ifs"
+
+  for item in "${items[@]}"; do
+    item="$(trim "$item")"
+    if [ -n "$item" ]; then
+      values+=("$item")
+    fi
+  done
+
+  if [ "${#values[@]}" -gt 0 ]; then
+    args+=("$flag")
+    args+=("${values[@]}")
+  fi
+}
+
+append_verbose() {
+  if [ "${VERBOSE}" = "1" ] || [ "${VERBOSE}" = "true" ]; then
+    args+=("--verbose")
+  fi
+}
+
+append_wallet_args() {
+  if [ -n "${PRIVATE_KEY:-}" ]; then
+    args+=("--private-key" "$PRIVATE_KEY")
+    return 0
+  fi
+
+  if [ -n "${KEYSTORE_PATH:-}" ]; then
+    args+=("--keystore-path" "$KEYSTORE_PATH")
+    if [ -n "${WALLET_PASSWORD:-}" ]; then
+      args+=("--wallet-password" "$WALLET_PASSWORD")
+    fi
+    return 0
+  fi
+
+  echo "worker requires PRIVATE_KEY or KEYSTORE_PATH" >&2
+  exit 1
+}
+
+cd "$PARTH_HOME"
+
+case "$service" in
+  coordinator-processor)
+    require_file "$node_bin"
+    args=(
+      "$node_bin" start-coordinator-processor
+      --coordinator-id "${COORDINATOR_ID:-0}"
+      --coordinator-sub-id "${COORDINATOR_SUB_ID:-0}"
+      --network "$NETWORK"
+      --db-namespace "${DB_NAMESPACE:-coordinator}"
+      --scylla-db-url "$SCYLLA_DB_URL"
+      --nats-jetstream-url "$NATS_JETSTREAM_URL"
+      --redis-url "$REDIS_URL"
+      --genesis-data-path "$GENESIS_DATA_PATH"
+      --checkpoint-backup-path "$CHECKPOINT_BACKUP_PATH"
+      --proving-backend "$PROVING_BACKEND"
+    )
+    append_verbose
+    exec "${args[@]}"
+    ;;
+
+  coordinator-edge)
+    require_file "$node_bin"
+    args=(
+      "$node_bin" start-coordinator-edge
+      --coordinator-id "${COORDINATOR_ID:-0}"
+      --coordinator-sub-id "${COORDINATOR_SUB_ID:-0}"
+      --network "$NETWORK"
+      --db-namespace "${DB_NAMESPACE:-coordinator}"
+      --scylla-db-url "$SCYLLA_DB_URL"
+      --nats-jetstream-url "$NATS_JETSTREAM_URL"
+      --redis-url "$REDIS_URL"
+      --port "${COORDINATOR_EDGE_PORT:-1337}"
+      --listen "${LISTEN_ADDR:-0.0.0.0}"
+      --proving-backend "$PROVING_BACKEND"
+    )
+    append_verbose
+    exec "${args[@]}"
+    ;;
+
+  realm-processor)
+    require_file "$node_bin"
+    require_env REALM_ID
+    args=(
+      "$node_bin" start-realm-processor
+      --realm-id "$REALM_ID"
+      --realm-sub-id "${REALM_SUB_ID:-1}"
+      --network "$NETWORK"
+      --db-namespace "${DB_NAMESPACE:-realm_$REALM_ID}"
+      --scylla-db-url "$SCYLLA_DB_URL"
+      --nats-jetstream-url "$NATS_JETSTREAM_URL"
+      --redis-url "$REDIS_URL"
+      --genesis-data-path "$GENESIS_DATA_PATH"
+      --checkpoint-backup-path "$CHECKPOINT_BACKUP_PATH"
+      --proving-backend "$PROVING_BACKEND"
+    )
+    append_csv_values_after_flag COORDINATOR_API_URLS --coordinator-api-urls
+    append_verbose
+    exec "${args[@]}"
+    ;;
+
+  realm-edge)
+    require_file "$node_bin"
+    require_env REALM_ID
+    args=(
+      "$node_bin" start-realm-edge
+      --realm-id "$REALM_ID"
+      --realm-sub-id "${REALM_SUB_ID:-1}"
+      --network "$NETWORK"
+      --db-namespace "${DB_NAMESPACE:-realm_$REALM_ID}"
+      --scylla-db-url "$SCYLLA_DB_URL"
+      --nats-jetstream-url "$NATS_JETSTREAM_URL"
+      --redis-url "$REDIS_URL"
+      --port "${REALM_EDGE_PORT:-1338}"
+      --listen "${LISTEN_ADDR:-0.0.0.0}"
+      --proving-backend "$PROVING_BACKEND"
+    )
+    append_verbose
+    exec "${args[@]}"
+    ;;
+
+  worker)
+    require_file "$worker_bin"
+    args=(
+      "$worker_bin" worker
+      --user "${WORKER_USER_ID:-0}"
+      --network "$NETWORK"
+      --proving-backend "$PROVING_BACKEND"
+      --completed-jobs-log-file "${COMPLETED_JOBS_LOG_FILE:-/var/lib/parth/checkpoints/worker.backup}"
+      --url-rotation-strategy "${URL_ROTATION_STRATEGY:-random}"
+      --batch-size "${BATCH_SIZE:-4}"
+    )
+    append_csv_args COORDINATOR_API_URLS --coordinator-api-url
+    append_csv_args REALM_API_URLS --realm-api-url
+    append_wallet_args
+    exec "${args[@]}"
+    ;;
+
+  prove-proxy)
+    require_file "$user_bin"
+    args=(
+      "$user_bin" prove-proxy
+      --listen-addr "${PROVE_PROXY_LISTEN_ADDR:-0.0.0.0:9999}"
+      --rpc-config "${RPC_CONFIG:-$PARTH_HOME/client_prover/config.json}"
+    )
+    exec "${args[@]}"
+    ;;
+
+  faucet-server)
+    require_file "$user_bin"
+    args=(
+      "$user_bin" faucet-server
+      --listen-addr "${PSY_FAUCET_LISTEN_ADDR:-0.0.0.0:9998}"
+      --rpc-config "${RPC_CONFIG:-$PARTH_HOME/client_prover/config.json}"
+    )
+    exec "${args[@]}"
+    ;;
+
+  relayer)
+    require_file "$relayer_bin"
+    args=(
+      "$relayer_bin"
+      --config "${RELAYER_CONFIG:-/etc/parth/bridge-relayer.toml}"
+    )
+    relayer_log_file="${BRIDGE_RELAYER_LOG_FILE:-$PARTH_HOME/logs/bridge_relayer_logs.txt}"
+    mkdir -p "$(dirname "$relayer_log_file")"
+    exec > >(tee -a "$relayer_log_file") 2>&1
+    exec "${args[@]}"
+    ;;
+
+  psy-services)
+    require_file "$psy_services_bin"
+    require_env DATABASE_URL
+    args=(
+      "$psy_services_bin"
+      --database-url "$DATABASE_URL"
+      --redis-url "${PSY_SERVICES_REDIS_URL:-$REDIS_URL}"
+      --api-listen "${API_LISTEN:-0.0.0.0:3000}"
+      --network-type "${PSY_NETWORK_TYPE:-$NETWORK}"
+      --migrations-path "${PSY_SERVICES_MIGRATIONS_PATH:-$psy_services_home/migrations}"
+    )
+    if [ "${PSY_SERVICES_RUN_MIGRATIONS:-true}" = "1" ] || [ "${PSY_SERVICES_RUN_MIGRATIONS:-true}" = "true" ]; then
+      args+=("--run-migrations")
+    fi
+    if [ "${PSY_SERVICES_DISABLE_AUTH:-0}" = "1" ] || [ "${PSY_SERVICES_DISABLE_AUTH:-0}" = "true" ]; then
+      args+=("--disable-auth")
+    else
+      require_env PSY_JWT_SECRET
+      args+=("--jwt-secret" "$PSY_JWT_SECRET")
+    fi
+    if [ -n "${PSY_GENESIS_PATH:-}" ]; then
+      args+=("--genesis-path" "$PSY_GENESIS_PATH")
+    fi
+    if [ -n "${PSY_GENESIS_USERS_PATH:-}" ]; then
+      args+=("--genesis-users-path" "$PSY_GENESIS_USERS_PATH")
+    fi
+    if [ "${VERBOSE}" = "1" ] || [ "${VERBOSE}" = "true" ]; then
+      args+=("--verbose")
+    fi
+    cd "$psy_services_home"
+    exec "${args[@]}"
+    ;;
+
+  psy-indexer)
+    require_file "$psy_indexer_bin"
+    require_env PSY_EDGE_RPC_URL
+    require_env PSY_SERVICES_URL
+    require_env PSY_JWT_SECRET
+    args=(
+      "$psy_indexer_bin"
+      --edge-url "$PSY_EDGE_RPC_URL"
+      --psy-services-url "$PSY_SERVICES_URL"
+      --jwt-secret "$PSY_JWT_SECRET"
+      --backup-dir "${PSY_BACKUP_DIR:-/var/lib/parth/indexer-backups}"
+      --poll-interval-ms "${PSY_POLL_INTERVAL_MS:-5000}"
+      --log-level "${PSY_LOG_LEVEL:-info}"
+      --network-type "${PSY_NETWORK_TYPE:-$NETWORK}"
+    )
+    if [ -n "${PSY_INDEXER_START_CHECKPOINT:-}" ]; then
+      if "$psy_indexer_bin" --help 2>&1 | grep -q -- "--start-checkpoint"; then
+        args+=("--start-checkpoint" "$PSY_INDEXER_START_CHECKPOINT")
+      else
+        echo "warning: ignoring PSY_INDEXER_START_CHECKPOINT=${PSY_INDEXER_START_CHECKPOINT}; psy-indexer does not support --start-checkpoint" >&2
+      fi
+    fi
+    case "${PSY_INDEXER_MODE:-coordinator}" in
+      coordinator)
+        args+=("coordinator")
+        ;;
+      realm)
+        require_env REALM_ID
+        args+=("realm" "--realm-id" "$REALM_ID" "--realm-sub-id" "${REALM_SUB_ID:-1}")
+        ;;
+      *)
+        echo "PSY_INDEXER_MODE must be coordinator or realm" >&2
+        exit 1
+        ;;
+    esac
+    cd "$psy_services_home"
+    exec "${args[@]}"
+    ;;
+
+  *)
+    echo "unknown service: $service" >&2
+    exit 1
+    ;;
+esac

@@ -1,0 +1,31 @@
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -28,16 +28,16 @@ resolver = "2"
+ [workspace.dependencies]
+ zstd = { version = "0.13", features = ["zstdmt"] }
+ # Remote psy-node deps (active for CI/publish)
+-psy_vm = { git = "ssh://git@github.com/PsyProtocol/psy-node.git", rev = "d9a4558a374c557cd410be28743b1af9367e028a", package = "psy_vm", default-features = false }
+-psy_crypto = { git = "ssh://git@github.com/PsyProtocol/psy-node.git", rev = "d9a4558a374c557cd410be28743b1af9367e028a", package = "psy_crypto" }
+-psy_data = { git = "ssh://git@github.com/PsyProtocol/psy-node.git", rev = "d9a4558a374c557cd410be28743b1af9367e028a", package = "psy_client_data", default-features = false }
+-psy_common_core = { git = "ssh://git@github.com/PsyProtocol/psy-node.git", rev = "d9a4558a374c557cd410be28743b1af9367e028a", package = "psy_client_common" }
+-psy_config = { git = "ssh://git@github.com/PsyProtocol/psy-node.git", rev = "d9a4558a374c557cd410be28743b1af9367e028a", package = "psy_config" }
+-psy_prover = { git = "ssh://git@github.com/PsyProtocol/psy-node.git", rev = "d9a4558a374c557cd410be28743b1af9367e028a", package = "psy_prover", default-features = false }
+-psy_common_circuit = { git = "ssh://git@github.com/PsyProtocol/psy-node.git", rev = "d9a4558a374c557cd410be28743b1af9367e028a", package = "psy_common_circuit", default-features = false }
+-psy_dpn_circuit = { git = "ssh://git@github.com/PsyProtocol/psy-node.git", rev = "d9a4558a374c557cd410be28743b1af9367e028a", package = "psy_dpn_circuit", default-features = false }
+-psy_ups_circuit = { git = "ssh://git@github.com/PsyProtocol/psy-node.git", rev = "d9a4558a374c557cd410be28743b1af9367e028a", package = "psy_ups_circuit", default-features = false }
+-psy_network_circuit = { git = "ssh://git@github.com/PsyProtocol/psy-node.git", rev = "d9a4558a374c557cd410be28743b1af9367e028a", package = "psy_network_circuit", default-features = false }
+-kvq = { git = "ssh://git@github.com/PsyProtocol/psy-node.git", rev = "d9a4558a374c557cd410be28743b1af9367e028a", package = "kvq" }
++psy_vm = { path = "../../../../../client_prover/psy_vm", default-features = false }
++psy_crypto = { path = "../../../../../client_prover/psy_core/psy_crypto" }
++psy_data = { package = "psy_client_data", path = "../../../../../client_prover/psy_core/psy_data", default-features = false }
++psy_common_core = { package = "psy_client_common", path = "../../../../../client_prover/psy_core/psy_common" }
++psy_config = { path = "../../../../../client_prover/psy_core/psy_config" }
++psy_prover = { path = "../../../../../client_prover/psy_prover", default-features = false }
++psy_common_circuit = { path = "../../../../../client_prover/psy_circuit/psy_common_circuit", default-features = false }
++psy_dpn_circuit = { path = "../../../../../client_prover/psy_circuit/psy_dpn_circuit", default-features = false }
++psy_ups_circuit = { path = "../../../../../client_prover/psy_circuit/psy_ups_circuit", default-features = false }
++psy_network_circuit = { path = "../../../../../client_prover/psy_circuit/psy_network_circuit", default-features = false }
++kvq = { path = "../../../../../client_prover/psy_core/kvq" }
+ 
+ # Local deps for development (uncomment to use):
