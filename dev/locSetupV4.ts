@@ -4000,9 +4000,7 @@ class DevNetProcessManager {
                         await startRealmProcessorBatchSequentially(
                             realmIds,
                             async (realmId) => {
-                                const logName = subId === 1
-                                    ? `realm_${realmId}_processor`
-                                    : `realm_${realmId}_sub_${subId}_processor`;
+                                const logName = `realm_${realmId}_sub_${subId}_processor`;
                                 const realmLogPaths = getLogPaths(logName, false);
                                 const extra = realmP2pValidators
                                     ? realmP2pProcessorExtraArgs(this.host, realmId, subId, realmP2pValidators)
@@ -4054,9 +4052,7 @@ class DevNetProcessManager {
                                 const extra = realmP2pValidators
                                     ? realmP2pEdgeExtraArgs(this.host, realmId, subId, realmP2pValidators)
                                     : [];
-                                const logName = subId === 1
-                                    ? `realm_edge_${realmId}_${j}`
-                                    : `realm_edge_${realmId}_sub_${subId}_${j}`;
+                                const logName = `realm_${realmId}_sub_${subId}_edge_${j}`;
                                 const edgePromise = RunningProcess.spawnWithInitializationHintWithRetry(
                                     [
                                         nodeCli, 'start-realm-edge',
@@ -4900,9 +4896,7 @@ class DevNetProcessManager {
                     const extra = realmP2pValidators
                         ? realmP2pProcessorExtraArgs("127.0.0.1", realmId, subId, realmP2pValidators)
                         : [];
-                    const serviceName = subId === 1
-                        ? `realm-${realmId}-processor`
-                        : `realm-${realmId}-sub-${subId}-processor`;
+                    const serviceName = `realm-${realmId}-sub-${subId}-processor`;
                     services[serviceName] = getRuntimeServiceEntry(serviceName, [
                         "/app/bin/psy_node_cli", "start-realm-processor",
                         "--realm-id", realmId.toString(),
@@ -4924,9 +4918,7 @@ class DevNetProcessManager {
                         const edgeExtra = realmP2pValidators
                             ? realmP2pEdgeExtraArgs("127.0.0.1", realmId, subId, realmP2pValidators)
                             : [];
-                        const edgeName = subId === 1
-                            ? `realm-${realmId}-edge-${j}`
-                            : `realm-${realmId}-sub-${subId}-edge-${j}`;
+                        const edgeName = `realm-${realmId}-sub-${subId}-edge-${j}`;
                         services[edgeName] = {
                             ...getRuntimeServiceEntry(edgeName, [
                                 "/app/bin/psy_node_cli", "start-realm-edge",
@@ -4967,9 +4959,7 @@ class DevNetProcessManager {
                     for (const subId of realmP2pSubIds) {
                         for (let j = 0; j < realmEdgeCount; j++) {
                             const port = realmP2pHttpPort(realmId, subId, j, realmEdgeCount);
-                            const edgeName = subId === 1
-                                ? `realm-${realmId}-edge-${j}`
-                                : `realm-${realmId}-sub-${subId}-edge-${j}`;
+                            const edgeName = `realm-${realmId}-sub-${subId}-edge-${j}`;
                             workerArgs.push("--realm-api-url", `http://${edgeName}:${port}`);
                         }
                     }

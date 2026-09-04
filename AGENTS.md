@@ -52,6 +52,9 @@ After any network-circuit change, register every new or changed circuit triplet 
 
 Changes to the bridge aggregation circuit, checkpoint recursive transition circuit, deposit batch-append circuit, or withdrawal batch-claim circuit invalidate the corresponding Groth16 wrapper setup. Regenerate the affected setup with the release `psy_relayer_cli regenerate-groth16-keystore` path, then export and replace the matching tracked verifier in `psy-contracts/src/`: `GnarkGroth16Verifier.sol` for bridge aggregation/checkpoint wrapping, `DepositBatchVerifier.sol` for deposit batch append, and `WithdrawalClaimVerifier.sol` for withdrawal batch claim. Treat the circuit, wrapper common/verifier data, `circuit_groth16.bin`, `pk_groth16.bin`, `vk_groth16.bin`, and Solidity verifier as one atomic artifact set. Never reuse a prior key or verifier after an input circuit changes. Verify an export to a temporary file is byte-identical to the tracked Solidity verifier, then rebuild and run the corresponding real bridge E2E against an authorized deployment. Redeploy the affected verifier and update deployment records only when the user separately authorizes that exact deployment and network.
 
+## Token Privacy Circuit Fingerprint Boundary
+
+Changes to `PrivateNoteInclusionCircuit` or `DepositInclusionCircuit` (protocol alias `ShieldDepositClaimCircuit` in `deposit_inclusion.rs`; uncompiled `privacy/shield_deposit_claim.rs` is not in the crate), the Merkle/minifier gadgets they share, or the heights baked into them (`GLOBAL_USER_TREE_HEIGHT`, `GLOBAL_CONTRACT_TREE_HEIGHT`, `TOKEN_CONTRACT_STATE_TREE_HEIGHT`, `PRIVATE_NOTE_TREE_HEIGHT`, `DEPOSIT_TREE_HEIGHT`) invalidate `private_note_inclusion_fingerprint` and/or `shield_claim_fingerprint` in `../psy-compiler/psy-precompiles/token/src/main.psy` and `../psy-compiler/psy-precompiles/usdt_token/src/main.psy`. Before editing those constants, read `docs/src/node/token-privacy-circuit-fingerprints.md`. Measure minifier fingerprints from the documented compiled `psy_dpn_circuit` tests on the intended `R_node`, copy the printed `[u64; 4]` limbs verbatim into both token contracts and the matching compiled test expected values, and keep the contract `hash([...])` PI preimage identical to the compiled circuit. `psy-services` has no hardcoded copy; pin it to the same `R_node`. EndCap metadata, coordinator cache generation, GUTA whitelist roots, and Groth16 regeneration do not update these constants.
 
 ## Release Safety
 
@@ -474,7 +477,7 @@ Violating any rule below requires an immediate fix before other work continues.
 6. Reuse shared logic when the same non-trivial behavior appears at least twice and will remain shared.
 7. Comments are exceptional. Use one short sentence only when an invariant or reason cannot be expressed in code.
 8. Do not weaken requirements, drop behavior, or special-case an input to hide the underlying defect.
-9. Maintain one optimal implementation. Migrate every caller and remove obsolete aliases, compatibility paths, and deprecated versions.
+9. Maintain one optimal implementation. Migrate every caller and remove obsolete aliases, compatibility paths, and deprecated versions. Storage-schema mirrors required by a proxy upgrade (for example `ImportedTokenFlowConfig` in `Bridge.sol`) are not compatibility debt: the mirror stays until every deployment has migrated past the old revision, and then one dedicated storage-layout revision removes it. Test fixtures that model a deployed predecessor are removed together with their migration test when that window closes.
 10. Solve only the current problem. Do not introduce speculative fields, stores, interfaces, retries, telemetry, or validation.
 11. Stay within scope. Modify only files directly required by the current goal and treat unrelated changes as user-owned work.
 12. Prefer existing repository patterns. A second convention beside an established one is prohibited.
@@ -495,6 +498,8 @@ Violating any rule below requires an immediate fix before other work continues.
 5. Do not rename an existing value when creating its target, constant, reference, witness, or borrowed form. Preserve the established concept name with a structural suffix only when the type requires distinction, for example `guta_circuit_whitelist_root` and `guta_circuit_whitelist_root_target`; subjective aliases such as `official_whitelist_root`, `canonical_root`, or `expected_root` for that same value are forbidden.
 6. Prefix booleans with `is_`, `has_`, `should_`, or `can_`.
 7. Do not embed task identifiers, phase numbers, or step numbers in code names, file names, comments, or commit messages.
+8. Version numbers belong to the runtime revision field and migration manifests, not to type names. If a migration window forces two schemas to coexist, name both by role and remove the older schema in the next storage-layout revision.
+9. Lifecycle and authority labels (`legacy`, `old`, `deprecated`, `retired`, `canonical`, `official`, `v1`, `v2`) never name code, files, or documentation. Keep exactly one optimal implementation. A proxy-upgrade storage mirror is named by what it holds (for example `ImportedTokenFlowConfig`) and is removed in the next storage-layout revision.
 
 ## Module Boundaries and Imports
 
@@ -530,6 +535,8 @@ Violating any rule below requires an immediate fix before other work continues.
 5. Bug fixes require reproduction before the change and confirmation that the same reproduction no longer fails.
 6. UI changes require browser execution. Runtime changes require launching and exercising the changed path.
 7. Coverage tools supplement test design but do not replace it.
+8. Test-only fixtures must not live in the production or deployable source set. Place Solidity fixtures outside `paths.sources` and extend the build configuration to compile the fixture directory; keep Rust fixture helpers under `#[cfg(test)]`.
+9. A test that re-derives a structural contract of shipped code (layer counts, storage order, wire layout) in a private helper must match the shipped implementation before merge. If the shipped behavior is wrong, fix it in the same commit; do not land a knowingly divergent test model. Recomputing ground truth on a fresh instance remains the preferred oracle.
 
 ## Performance and Concurrency
 
@@ -576,6 +583,7 @@ A change is rejected until any applicable item is corrected:
 15. Log-level abuse or critical paths with no existing observability integration.
 16. Tests that prove plumbing rather than the observable contract.
 17. Duplicated state under alias names: the same concept kept as multiple variables (live copy, snapshot, aligned copy, stale-detection mirror) that must be manually kept in sync. Model state as one cohesive data structure with a single explicit shared reference (e.g. Arc<RwLock<T>>); never replace it with copy-and-pass channels, copied-snapshot stale detection, or copy-then-replay machinery. When data is already authoritative and in-band (e.g. a Proposal body carries the backup and its hash is verified), consume it directly; never rediscover it by scanning directories or matching hashes.
+18. Test-only fixtures in the production or deployable source set, or documentation that references binaries, subcommands, flags, environment variables, or RPC methods that do not exist in the current source.
 
 ## Documentation Standards
 
@@ -585,6 +593,7 @@ A change is rejected until any applicable item is corrected:
 4. Acceptance criteria are executable commands or observable scenarios.
 5. Mark inferred research statements explicitly as `Inference:` and list unchecked areas.
 6. Separate `In Scope` and `Out of Scope` in every specification.
+7. Operational documents are command-verified before commit: binaries, subcommands, flags, environment variables, RPC method names, ports, and configuration keys must match the current clap, serde, and network-configuration definitions. A nonexistent binary, flag, or environment variable in a document is a defect, not a style issue.
 
 ## Git Commit Rules
 

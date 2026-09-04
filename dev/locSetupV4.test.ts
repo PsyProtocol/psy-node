@@ -225,8 +225,8 @@ describe("devnet application lifecycle", () => {
             processTemplate("envio", ["pnpm", "start"]),
             processTemplate("prove_proxy_0", ["psy_user_cli", "prove-proxy"]),
             processTemplate("worker_0", ["psy_worker_cli", "worker"]),
-            processTemplate("realm_edge_0_0", ["psy_node_cli", "start-realm-edge"]),
-            processTemplate("realm_0_processor", ["psy_node_cli", "start-realm-processor"]),
+            processTemplate("realm_0_sub_1_edge_0", ["psy_node_cli", "start-realm-edge"]),
+            processTemplate("realm_0_sub_1_processor", ["psy_node_cli", "start-realm-processor"]),
             processTemplate("coordinator_edge_0", ["psy_node_cli", "start-coordinator-edge"]),
             processTemplate("coordinator_processor", ["psy_node_cli", "start-coordinator-processor"]),
         ];
@@ -234,8 +234,8 @@ describe("devnet application lifecycle", () => {
         expect(applicationStartOrder(processes)).toEqual([
             "coordinator_processor",
             "coordinator_edge_0",
-            "realm_0_processor",
-            "realm_edge_0_0",
+            "realm_0_sub_1_processor",
+            "realm_0_sub_1_edge_0",
             "worker_0",
             "prove_proxy_0",
             "envio",
@@ -248,7 +248,7 @@ describe("devnet application lifecycle", () => {
     it("derives every application listener that must close before rollback", () => {
         const processes = [
             processTemplate("coordinator_edge_0", ["psy_node_cli", "start-coordinator-edge", "--port", "1337"]),
-            processTemplate("realm_edge_0_0", ["psy_node_cli", "start-realm-edge", "--port", "13380"]),
+            processTemplate("realm_0_sub_1_edge_0", ["psy_node_cli", "start-realm-edge", "--port", "13380"]),
             processTemplate("prove_proxy_0", ["psy_user_cli", "prove-proxy", "--listen-addr", "0.0.0.0:9999"]),
             processTemplate("faucet_server", ["psy_user_cli", "faucet-server", "--listen-addr", "0.0.0.0:9998"]),
             processTemplate("psy_services", ["psy-services"]),

@@ -104,7 +104,7 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default + Debug>
         let mut current_old_hash = dmp.old_value;
         let mut current_new_hash = dmp.new_value;
         self.nodes.insert(current_key, current_old_hash);
-        self.set_node_value(base_key, current_new_hash);
+        self.set_node_value(current_key, current_new_hash);
 
         for sibling_hash in &dmp.siblings {
             let sibling_key = current_key.sibling();
@@ -121,9 +121,9 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default + Debug>
                 Hasher::two_to_one(&current_new_hash, sibling_hash)
             };
 
-            self.nodes.insert(current_key, current_old_hash);
-            self.set_node_value(base_key, current_new_hash);
             current_key = current_key.parent();
+            self.nodes.insert(current_key, current_old_hash);
+            self.set_node_value(current_key, current_new_hash);
         }
         Ok(())
     }
@@ -1418,7 +1418,10 @@ mod tests {
 
     use cf_utils::timer::DebugTimer;
     use parth_core::{
-        crypto::hash::traits::{MerkleHasher, MerkleZeroHasher},
+        crypto::hash::{
+            merkle_proof::DeltaMerkleProofCore,
+            traits::{MerkleHasher, MerkleZeroHasher},
+        },
         data::hash::{hash256::Hash256, merkle_node_key::SimpleMerkleNodeKey},
         pgoldilocks::PoseidonHasher,
         protocol::core_types::Q256BitHash,
@@ -1427,7 +1430,7 @@ mod tests {
     };
     use parth_crypto::hash::sha256::CoreSha256Hasher;
 
-    use super::SimpleMemoryMerkleRecorderStore;
+    use super::{SimpleMemoryMerkleRecorderStore, SnapshotId};
 
     fn test_batch_set_leaves(tree_height: u8, count: u64) {
         let total_leaves = 1u64 << (tree_height as u64);
@@ -1848,6 +1851,105 @@ mod tests {
     }
 
     #[test]
+    fn journal_handles_repeated_updates_to_the_same_key() {
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(4);
+        let key = SimpleMerkleNodeKey::new(4, 1);
+        let first = Hash::from_u64_le_values(1, 0, 0, 0);
+        let second = Hash::from_u64_le_values(2, 0, 0, 0);
+        let third = Hash::from_u64_le_values(3, 0, 0, 0);
+
+        tree.set_node_value(key, first);
+        let after_first = tree.snapshot();
+        let first_root = tree.get_root();
+        tree.set_node_value(key, second);
+        let after_second = tree.snapshot();
+        let second_root = tree.get_root();
+        tree.set_node_value(key, third);
+
+        assert_eq!(tree.get_node_value_at(after_first, key), first);
+        assert_eq!(tree.get_node_value_at(after_second, key), second);
+        assert_eq!(tree.get_node_value(&key), third);
+        assert_eq!(tree.get_root_at(after_first), first_root);
+        assert_eq!(tree.get_root_at(after_second), second_root);
+
+        tree.revert_to(after_first);
+        assert_eq!(tree.get_node_value(&key), first);
+        assert_eq!(tree.get_root(), first_root);
+        assert_eq!(tree.snapshot().as_index(), after_first.as_index());
+
+        tree.revert_to(SnapshotId(0));
+        assert_eq!(tree.get_node_value(&key), Hasher::get_zero_hash(0));
+        assert!(tree.get_changes().is_empty());
+    }
+
+    #[test]
+    fn journal_supports_nested_snapshots_and_rewrite_after_revert() {
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(4);
+        let key_a = SimpleMerkleNodeKey::new(4, 1);
+        let key_b = SimpleMerkleNodeKey::new(4, 2);
+        let value_a = Hash::from_u64_le_values(10, 0, 0, 0);
+        let value_b = Hash::from_u64_le_values(11, 0, 0, 0);
+        let value_c = Hash::from_u64_le_values(12, 0, 0, 0);
+
+        tree.set_node_value(key_a, value_a);
+        let outer = tree.snapshot();
+        tree.set_node_value(key_b, value_b);
+        let inner = tree.snapshot();
+        tree.set_node_value(key_a, value_c);
+
+        tree.revert_to(inner);
+        assert_eq!(tree.get_node_value(&key_a), value_a);
+        assert_eq!(tree.get_node_value(&key_b), value_b);
+
+        tree.revert_to(outer);
+        assert_eq!(tree.get_node_value(&key_a), value_a);
+        assert_eq!(tree.get_node_value(&key_b), Hasher::get_zero_hash(0));
+
+        let replacement = Hash::from_u64_le_values(13, 0, 0, 0);
+        tree.set_node_value(key_a, replacement);
+        assert_eq!(tree.get_node_value(&key_a), replacement);
+        assert_eq!(tree.get_changes().get(&key_a), Some(&replacement));
+    }
+
+    #[test]
+    fn revert_to_committed_state_drops_pending_change_entries() {
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(4);
+        let key = SimpleMerkleNodeKey::new(4, 3);
+        let committed = Hash::from_u64_le_values(20, 0, 0, 0);
+        let pending = Hash::from_u64_le_values(21, 0, 0, 0);
+
+        tree.set_node_value(key, committed);
+        tree.commit_changes();
+        tree.set_node_value(key, pending);
+        assert_eq!(tree.get_node_value(&key), pending);
+
+        tree.revert_changes();
+        assert_eq!(tree.get_node_value(&key), committed);
+        assert!(tree.get_changes().is_empty());
+        assert_eq!(tree.snapshot().as_index(), 0);
+    }
+
+    #[test]
+    fn commit_clears_journal_but_preserves_committed_root() {
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(4);
+        let key = SimpleMerkleNodeKey::new(4, 5);
+        let value = Hash::from_u64_le_values(30, 0, 0, 0);
+
+        tree.set_node_value(key, value);
+        let root_before_commit = tree.get_root();
+        let snapshot_before_commit = tree.snapshot();
+        tree.commit_changes();
+
+        assert_eq!(tree.get_root(), root_before_commit);
+        assert_eq!(tree.get_last_commit_root(), root_before_commit);
+        assert!(tree.get_changes().is_empty());
+        assert_eq!(tree.snapshot().as_index(), 0);
+        tree.revert_to(snapshot_before_commit);
+        assert_eq!(tree.get_node_value(&key), value);
+        assert_eq!(tree.get_root(), root_before_commit);
+    }
+
+    #[test]
     fn commit_changes_moves_journal_into_nodes() {
         let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(4);
         let leaf = Hash::rand();
@@ -1860,5 +1962,205 @@ mod tests {
         assert_eq!(tree.get_last_commit_root(), live_root);
         tree.revert_changes();
         assert_eq!(tree.get_root(), live_root);
+    }
+
+    #[test]
+    fn journal_set_leaf_shared_ancestors_revert_restores_path() {
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(4);
+        let leaf_0 = Hash::from_u64_le_values(1, 0, 0, 0);
+        let leaf_1 = Hash::from_u64_le_values(2, 0, 0, 0);
+        let zero_leaf = Hasher::get_zero_hash(0);
+
+        tree.set_leaf(0, leaf_0);
+        let after_0 = tree.snapshot();
+        let root_0 = tree.get_root();
+        let proof_0 = tree.get_leaf(0);
+        tree.set_leaf(1, leaf_1);
+        let after_1 = tree.snapshot();
+
+        assert_ne!(tree.get_root(), root_0);
+        assert_eq!(tree.get_root_at(after_0), root_0);
+        assert_eq!(tree.get_leaf_at(after_0, 0).value, leaf_0);
+        assert_eq!(tree.get_leaf_at(after_0, 1).value, zero_leaf);
+        assert!(tree.get_leaf_at(after_0, 0).verify::<Hasher>());
+        assert!(tree.get_leaf_at(after_0, 1).verify::<Hasher>());
+        assert!(tree.get_leaf_at(after_1, 0).verify::<Hasher>());
+        assert!(tree.get_leaf_at(after_1, 1).verify::<Hasher>());
+        assert_eq!(tree.get_leaf_at(after_1, 1).value, leaf_1);
+
+        tree.revert_to(after_0);
+        assert_eq!(tree.get_root(), root_0);
+        assert_eq!(tree.get_leaf_value(0), leaf_0);
+        assert_eq!(tree.get_leaf_value(1), zero_leaf);
+        assert_eq!(tree.get_leaf(0).siblings, proof_0.siblings);
+        assert!(tree.get_leaf(0).verify::<Hasher>());
+        assert!(tree.get_changes().contains_key(&SimpleMerkleNodeKey::new(4, 0)));
+        assert!(!tree.get_changes().contains_key(&SimpleMerkleNodeKey::new(4, 1)));
+    }
+
+    #[test]
+    fn journal_identical_write_does_not_advance_snapshot() {
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(4);
+        let value = Hash::from_u64_le_values(7, 0, 0, 0);
+        tree.set_leaf(3, value);
+        let after_write = tree.snapshot();
+        let root = tree.get_root();
+        tree.set_leaf(3, value);
+        tree.set_node_value(SimpleMerkleNodeKey::new(4, 3), value);
+        assert_eq!(tree.snapshot().as_index(), after_write.as_index());
+        assert_eq!(tree.get_root(), root);
+    }
+
+    #[test]
+    fn journal_zeroing_a_committed_leaf_reverts_to_committed_value() {
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(4);
+        let committed = Hash::from_u64_le_values(8, 0, 0, 0);
+        let zero_leaf = Hasher::get_zero_hash(0);
+        tree.set_leaf(4, committed);
+        tree.commit_changes();
+        let committed_root = tree.get_last_commit_root();
+
+        tree.set_leaf(4, zero_leaf);
+        assert_eq!(tree.get_leaf_value(4), zero_leaf);
+        assert_ne!(tree.get_root(), committed_root);
+        assert_eq!(tree.get_old_root(), committed_root);
+
+        tree.revert_changes();
+        assert_eq!(tree.get_leaf_value(4), committed);
+        assert_eq!(tree.get_root(), committed_root);
+        assert!(tree.get_changes().is_empty());
+        assert_eq!(tree.snapshot().as_index(), 0);
+    }
+
+    #[test]
+    fn journal_revert_to_current_and_past_end_are_noops() {
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(4);
+        let value = Hash::from_u64_le_values(9, 0, 0, 0);
+        tree.set_leaf(2, value);
+        let now = tree.snapshot();
+        let root = tree.get_root();
+
+        tree.revert_to(now);
+        assert_eq!(tree.get_root(), root);
+        assert_eq!(tree.snapshot().as_index(), now.as_index());
+        assert_eq!(tree.get_leaf_value(2), value);
+
+        assert_eq!(tree.get_root_at(SnapshotId(now.as_index() + 64)), root);
+        tree.revert_to(SnapshotId(now.as_index() + 64));
+        assert_eq!(tree.get_root(), root);
+        assert_eq!(tree.snapshot().as_index(), now.as_index());
+    }
+
+    #[test]
+    fn journal_commit_mid_snapshot_revert_keeps_committed_prefix() {
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(4);
+        let leaf_a = Hash::from_u64_le_values(10, 0, 0, 0);
+        let leaf_b = Hash::from_u64_le_values(11, 0, 0, 0);
+        let leaf_c = Hash::from_u64_le_values(12, 0, 0, 0);
+        let replacement = Hash::from_u64_le_values(13, 0, 0, 0);
+        let zero_leaf = Hasher::get_zero_hash(0);
+
+        tree.set_leaf(0, leaf_a);
+        tree.commit_changes();
+        let committed_root = tree.get_last_commit_root();
+
+        tree.set_leaf(1, leaf_b);
+        let mid = tree.snapshot();
+        let mid_root = tree.get_root();
+        tree.set_leaf(8, leaf_c);
+
+        tree.revert_to(mid);
+        assert_eq!(tree.get_root(), mid_root);
+        assert_eq!(tree.get_last_commit_root(), committed_root);
+        assert_eq!(tree.get_leaf_value(0), leaf_a);
+        assert_eq!(tree.get_leaf_value(1), leaf_b);
+        assert_eq!(tree.get_leaf_value(8), zero_leaf);
+        assert!(tree.get_leaf(0).verify::<Hasher>());
+        assert!(tree.get_leaf(1).verify::<Hasher>());
+
+        tree.set_leaf(1, replacement);
+        assert_eq!(tree.get_leaf_value(1), replacement);
+        assert!(tree.get_leaf(1).verify::<Hasher>());
+
+        tree.revert_changes();
+        assert_eq!(tree.get_root(), committed_root);
+        assert_eq!(tree.get_leaf_value(0), leaf_a);
+        assert_eq!(tree.get_leaf_value(1), zero_leaf);
+        assert!(tree.get_changes().is_empty());
+    }
+
+    fn assert_injest_commit_delta_keeps_leaf_and_path(
+        tree: &SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
+        dmp: &DeltaMerkleProofCore<Hash>,
+    ) {
+        let leaf_key = SimpleMerkleNodeKey::new(tree.get_height(), dmp.index);
+        assert_eq!(tree.get_node_value(&leaf_key), dmp.new_value);
+        assert_eq!(tree.get_last_commit_node(&leaf_key), dmp.old_value);
+        assert_ne!(tree.get_node_value(&leaf_key), dmp.new_root);
+        assert_ne!(tree.get_last_commit_node(&leaf_key), dmp.old_root);
+        assert_eq!(tree.get_root(), dmp.new_root);
+        assert_eq!(tree.get_last_commit_root(), dmp.old_root);
+
+        let mut current_key = leaf_key;
+        for sibling in &dmp.siblings {
+            assert_eq!(tree.get_last_commit_node(&current_key.sibling()), *sibling);
+            current_key = current_key.parent();
+        }
+        assert_eq!(current_key, SimpleMerkleNodeKey::new_root());
+        assert!(tree.get_leaf(dmp.index).verify::<Hasher>());
+    }
+
+    #[test]
+    fn injest_commit_delta_writes_path_not_parent_hashes_onto_leaf() {
+        let mut source = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(4);
+        let left = Hash::from_u64_le_values(1, 0, 0, 0);
+        let right = Hash::from_u64_le_values(2, 0, 0, 0);
+        source.set_leaf(0, left);
+        source.commit_changes();
+        let dmp_left = source.set_leaf(1, right);
+        assert!(dmp_left.verify::<Hasher>());
+
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(4);
+        tree.injest_commit_delta_merkle_proof_old_nodes_new_update(&dmp_left)
+            .expect("valid height-4 delta proof");
+        assert_injest_commit_delta_keeps_leaf_and_path(&tree, &dmp_left);
+
+        tree.revert_changes();
+        assert_eq!(tree.get_root(), dmp_left.old_root);
+        assert_eq!(tree.get_leaf_value(1), dmp_left.old_value);
+
+        tree.injest_commit_delta_merkle_proof_old_nodes_new_update(&dmp_left)
+            .expect("valid height-4 delta proof");
+        tree.commit_changes();
+        assert_eq!(tree.get_root(), dmp_left.new_root);
+        assert_eq!(tree.get_last_commit_root(), dmp_left.new_root);
+        assert_eq!(tree.get_leaf_value(1), right);
+        assert!(tree.get_leaf(1).verify::<Hasher>());
+    }
+
+    #[test]
+    fn injest_commit_delta_even_leaf_keeps_new_value_off_the_root() {
+        let mut source = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(4);
+        let leaf = Hash::from_u64_le_values(4, 0, 0, 0);
+        let dmp = source.set_leaf(0, leaf);
+        assert!(dmp.verify::<Hasher>());
+
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(4);
+        tree.injest_commit_delta_merkle_proof_old_nodes_new_update(&dmp)
+            .expect("valid height-4 delta proof");
+        assert_injest_commit_delta_keeps_leaf_and_path(&tree, &dmp);
+    }
+
+    #[test]
+    fn injest_commit_delta_rejects_height_mismatch() {
+        let mut source = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(4);
+        let dmp = source.set_leaf(3, Hash::from_u64_le_values(9, 0, 0, 0));
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(8);
+        let err = tree
+            .injest_commit_delta_merkle_proof_old_nodes_new_update(&dmp)
+            .expect_err("height-8 tree must reject a height-4 proof");
+        assert!(err.to_string().contains("proof height does not match tree height"));
+        assert_eq!(tree.get_leaf_value(3), Hasher::get_zero_hash(0));
+        assert!(tree.get_changes().is_empty());
     }
 }
