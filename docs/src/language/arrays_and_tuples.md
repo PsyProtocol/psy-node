@@ -1,8 +1,13 @@
 # Arrays and Tuples
 
+> Updated: 2026-09-03.
+
+## Abstract
+
+
 This chapter covers arrays and tuples in Psy, two important data structures for grouping values together.
 
-## Arrays
+## 1. Arrays
 
 Arrays in Psy are fixed-size sequences of elements of the same type. They are defined with the syntax `[T; N]` where `T` is the element type and `N` is the compile-time known size.
 
@@ -146,7 +151,7 @@ fn main() {
 }
 ```
 
-## Tuples
+## 2. Tuples
 
 Tuples are fixed-size sequences that can contain elements of different types. They are defined with parentheses and comma-separated values.
 
@@ -282,7 +287,7 @@ fn process_complex(t: ([Felt; 3], Felt)) {
 }
 ```
 
-## Current Limitations
+## 3. Current Limitations
 
 ### Tuple Destructuring
 
@@ -301,7 +306,7 @@ fn main() {
 }
 ```
 
-## Arrays vs Tuples
+## 4. Arrays and Tuples Comparison
 
 | Feature | Arrays | Tuples |
 |---------|--------|--------|
@@ -313,7 +318,7 @@ fn main() {
 | **Destructuring** | Not supported | Not supported (yet) |
 | **Mutability** | Elements can be modified | Elements can be modified |
 
-## Complex Examples
+## 5. Complex Examples
 
 ### Game Inventory System
 
@@ -418,7 +423,7 @@ fn main() {
 }
 ```
 
-## Key Points
+## 6. Key Points
 
 1. **Arrays**: Fixed-size, same type, indexable with `[]`, support custom methods through generics
 2. **Tuples**: Fixed-size, mixed types, accessible with `.N`, elements can be modified

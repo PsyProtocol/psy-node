@@ -1,6 +1,19 @@
 # The Psy User Proving Session (UPS) Proof Tree: Efficient Recursive Verification
 
-## 1. Introduction: The Challenge of Recursive Verification Costs
+> Updated: 2026-09-03.
+
+## Abstract
+
+This document explains how the User Proving Session proof tree replaces repeated in-circuit proof verification with Merkle commitments, deferring full verification to the End Cap path.
+
+## Table of Contents
+
+- [1. Recursive Verification Costs](#1-recursive-verification-costs)
+- [2. UPS Proof Tree: Commit Before Verification](#2-ups-proof-tree-commit-before-verification)
+- [3. Assumption Discharge: End Cap and Beyond](#3-assumption-discharge-end-cap-and-beyond)
+- [4. Benefits](#4-benefits)
+
+## 1. Recursive Verification Costs
 
 The User Proving Session (UPS) relies on recursive ZK proofs, where each step cryptographically verifies the previous one. A naive approach might involve embedding the *entire* verification logic of the previous step's circuit *inside* the current step's circuit. However, this leads to several problems:
 
@@ -10,7 +23,7 @@ The User Proving Session (UPS) relies on recursive ZK proofs, where each step cr
 
 The **UPS Proof Tree** architecture elegantly solves these issues by **deferring the direct verification cost** and replacing it with **cheap cryptographic commitments and existence checks**.
 
-## 2. The UPS Proof Tree: Commit, Don't Verify (Yet)
+## 2. UPS Proof Tree: Commit Before Verification
 
 ### 2.1 Core Concept: A Merkle Tree of Proof Commitments
 
@@ -55,7 +68,7 @@ Consider UPS Step N verifying Step N-1:
 
 Crucially, the circuit for Step N has a **fixed, relatively low complexity**, dominated by the Merkle proof gadgets, regardless of the complexity of the circuit used for Step N-1. It only deals with *commitments* to proofs, not the proofs themselves.
 
-## 3. Discharging the Assumptions: The End Cap and Beyond
+## 3. Assumption Discharge: End Cap and Beyond
 
 Throughout the UPS, the core assumption accumulates: **"All ZK proofs committed to the tree are valid."**
 
@@ -69,7 +82,7 @@ Throughout the UPS, the core assumption accumulates: **"All ZK proofs committed 
     *   **Locally:** After witness generation but before End Cap proving.
     *   **Remotely/Parallel:** In a future design, the witness data and tree commitments could be sent to parallel provers. They generate proofs for each step and the final aggregation proof. The End Cap circuit then only needs to verify the *single* aggregation proof.
 
-## 4. Benefits Summary
+## 4. Benefits
 
 1.  **Constant Recursive Step Cost:** The cost of verifying the previous step inside the current step's circuit is fixed and low (Merkle checks), independent of the previous step's circuit complexity. This allows for efficient recursion with consistent circuit degrees.
 2.  **Deferral of Computation:** The heavy lifting of verifying the actual ZK proofs is pushed *out* of the main recursive path and consolidated into a single (optional but recommended) aggregation proof verified at the end.

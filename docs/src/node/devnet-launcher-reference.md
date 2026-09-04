@@ -1,6 +1,6 @@
 # Devnet Launcher Reference
 
-> Status: Approved. Date: 2026-09-02. Audience: developers and devnet operators.
+> Updated: 2026-09-02. Audience: developers and devnet operators.
 
 ## Abstract
 
@@ -29,7 +29,7 @@ current-source defects that must not be copied into commands (`Makefile:60-66`; 
 - [Terminology and Abbreviations](#terminology-and-abbreviations)
 - [1. Source-of-Truth Boundary](#1-source-of-truth-boundary)
 - [2. Startup Sequence](#2-startup-sequence)
-- [3. Authoritative Process DAG](#3-authoritative-process-dag)
+- [3. Process DAG](#3-process-dag)
 - [4. Startup Mode Selection](#4-startup-mode-selection)
   - [4.1 Bare Launcher Defaults](#41-bare-launcher-defaults)
   - [4.2 Make run-all](#42-make-run-all)
@@ -145,9 +145,9 @@ Steps 1-3 are implemented by CLI parsing, lock acquisition, and `ensureDevEnviro
 `setupProcesses()` resolves, so startup-time failures cannot be repaired through `make restart`
 (`dev/locSetupV4.ts:5613-5628`).
 
-## 3. Authoritative Process DAG
+## 3. Process DAG
 
-The following ASCII graph is authoritative for the foreground path; conditional nodes run only when selected by the
+The following ASCII graph is definitive for the foreground path; conditional nodes run only when selected by the
 mode logic in section 4 (`dev/locSetupV4.ts:3788-3805`).
 
 ```text
@@ -674,7 +674,7 @@ These are limitations of the current source, not supported command examples.
    `dev/locSetupV4.ts:5373`; `dev/locSetupV4.ts:5423-5424`).
 2. Embedded help advertises `--workers` and examples use `--realm`, but neither option is declared; do not use those
    examples (`dev/locSetupV4.ts:5293-5327`; `dev/locSetupV4.ts:5419`; `dev/locSetupV4.ts:5461-5462`).
-3. Help says bare startup uses Realms 0-127, while the parser default is one Realm; section 4.1 is authoritative
+3. Help says bare startup uses Realms 0-127, while the parser default is one Realm; section 4.1 is definitive
    (`dev/locSetupV4.ts:5302,5342`; `dev/locSetupV4.ts:5440-5441`).
 4. `--bridge-proposer-daemon` is counted as a top-level component selector but omitted from the manager's second
    selector expression; alone, it gives component-mode worker defaults while manager `startAll` becomes true

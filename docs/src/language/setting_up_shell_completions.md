@@ -1,11 +1,16 @@
 # Setting up Shell Completions
 
+> Updated: 2026-09-03.
+
+## Abstract
+
+
 Shell completions allow you to use the Tab key to autocomplete commands, options, and arguments when working with the
 Psy CLI tools. This makes development faster and more convenient.
 
 This guide will help you set up shell completions for the Dargo CLI.
 
-## Zsh Completions
+## 1. Zsh Completions
 
 You can add the completions script to your Zsh completions directory:
 
@@ -24,7 +29,7 @@ echo 'autoload -U compinit && compinit' >> ~/.zshrc
 source ~/.zshrc
 ```
 
-## Bash Completions
+## 2. Bash Completions
 
 You can add the completions script to your Bash environment in a few ways:
 
@@ -51,7 +56,7 @@ echo 'source ~/.bash_completions/dargo.bash' >> ~/.bashrc
 source ~/.bashrc
 ```
 
-## Fish Completions
+## 3. Fish Completions
 
 For Fish shell users, you can easily set up completions:
 
@@ -62,7 +67,7 @@ dargo complete fish > ~/.config/fish/completions/dargo.fish
 
 No additional steps are needed as Fish automatically loads completions from this directory.
 
-## Verifying Completions
+## 4. Verifying Completions
 
 To verify that completions are working correctly, type `dargo` followed by a space and press Tab. You should see a list
 of available commands.
@@ -75,7 +80,7 @@ dargo <TAB>
 
 You should see a list of commands like `new`, `build`, `compile`, etc.
 
-## Troubleshooting
+## 5. Troubleshooting
 
 If completions aren't working:
 

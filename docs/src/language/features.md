@@ -1,8 +1,13 @@
 # Language Features
 
+> Updated: 2026-09-03.
+
+## Abstract
+
+
 Psy Smart Contract Language provides a comprehensive set of features designed for zero-knowledge circuit development. This page outlines all major language features with examples and explanations.
 
-## Basic Types
+## 1. Basic Types
 
 Psy supports a range of primitive and composite types optimized for ZK circuit generation.
 
@@ -135,7 +140,7 @@ let data: Hash = [1, 2, 3, 4];
 let result: Hash = hash(data);
 ```
 
-## Functions
+## 2. Functions
 
 Functions are first-class citizens with support for parameters, return types, and inlining.
 
@@ -167,7 +172,7 @@ fn complex_calculation(a: Felt, b: Felt, c: Felt) -> Felt {
 }
 ```
 
-## Closures
+## 3. Closures
 
 Anonymous functions that can capture variables from their environment.
 
@@ -183,7 +188,7 @@ fn main() -> Felt {
 }
 ```
 
-## Constants
+## 4. Constants
 
 Compile-time constant values for improved optimization.
 
@@ -201,7 +206,7 @@ fn calculate_with_constant() -> Felt {
 }
 ```
 
-## Comptime
+## 5. Comptime
 
 Compile-time evaluation for constant folding and optimization.
 
@@ -215,7 +220,7 @@ fn use_constants() -> Felt {
 }
 ```
 
-## Control Flow
+## 6. Control Flow
 
 ### If Expressions
 
@@ -292,7 +297,7 @@ fn sum_range() -> Felt {
 }
 ```
 
-## Modules
+## 7. Modules
 
 Code organization and namespace management.
 
@@ -338,7 +343,7 @@ mod crypto {
 }
 ```
 
-## Traits
+## 8. Traits
 
 Interface definitions for shared behavior across types.
 
@@ -380,7 +385,7 @@ impl Arithmetic for Point {
 }
 ```
 
-## Generics
+## 9. Generics
 
 Type parameters for code reuse and type safety.
 
@@ -428,7 +433,7 @@ impl Convert<Felt> for u32 {
 }
 ```
 
-## Type System Features
+## 10. Type System Features
 
 ### Type Checking
 
@@ -469,7 +474,7 @@ fn display_value<T: Display + Clone>(value: T) -> Felt {
 }
 ```
 
-## Storage and Smart Contracts
+## 11. Storage and Smart Contracts
 
 Persistent state management for blockchain applications.
 
@@ -495,7 +500,7 @@ impl TokenContract {
 }
 ```
 
-## Built-in Functions
+## 12. Built-in Functions
 
 ZK-optimized cryptographic and system functions.
 
@@ -523,7 +528,7 @@ let checkpoint: Felt = get_checkpoint_id();
 let user_state: Hash = get_state_hash_at(user_id);
 ```
 
-## Development Tools
+## 13. Development Tools
 
 ### Dargo Package Manager
 
@@ -592,7 +597,7 @@ error[E0308]: mismatched types
   |            expected due to this type annotation
 ```
 
-## Testing Framework
+## 14. Testing Framework
 
 Built-in testing support with the `#[test]` attribute.
 
@@ -615,7 +620,7 @@ fn test_contract_mint() {
 }
 ```
 
-## Package System (Crates)
+## 15. Package System
 
 Modular code organization and dependency management.
 
@@ -652,7 +657,7 @@ my_project/
     └── integration_test.psy
 ```
 
-## Zero-Knowledge Optimizations
+## 16. Zero-Knowledge Optimizations
 
 All language features are designed with ZK circuit efficiency in mind:
 

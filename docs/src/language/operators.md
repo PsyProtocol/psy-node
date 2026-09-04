@@ -1,8 +1,13 @@
 # Operators
 
+> Updated: 2026-09-03.
+
+## Abstract
+
+
 This chapter covers all operators available in Psy, including arithmetic, logical, comparison, bitwise, and special operators.
 
-## Arithmetic Operators
+## 1. Arithmetic Operators
 
 ### Basic Arithmetic
 
@@ -63,7 +68,7 @@ fn main() {
 }
 ```
 
-## Comparison Operators
+## 2. Comparison Operators
 
 All comparison operators return `bool` values:
 
@@ -101,7 +106,7 @@ fn main() {
 }
 ```
 
-## Logical Operators
+## 3. Logical Operators
 
 ### Boolean Logic
 
@@ -140,7 +145,7 @@ fn main() {
 }
 ```
 
-## Bitwise Operators (u32 only)
+## 4. Bitwise Operators
 
 Bitwise operations are only available for `u32` type:
 
@@ -197,7 +202,7 @@ fn main() {
 }
 ```
 
-## Special Operators
+## 5. Special Operators
 
 ### Bit Manipulation Functions
 
@@ -238,7 +243,7 @@ fn main() {
 }
 ```
 
-## Type Casting
+## 6. Type Casting
 
 ### Casting Between Types
 
@@ -281,7 +286,7 @@ fn main() {
 }
 ```
 
-## Field Arithmetic (Felt)
+## 7. Field Arithmetic
 
 Psy operates over the Goldilocks field with prime `p = 18446744069414584321`:
 
@@ -323,7 +328,7 @@ fn main() {
 }
 ```
 
-## Operator Precedence
+## 8. Operator Precedence
 
 Operators follow standard mathematical precedence:
 
@@ -349,7 +354,7 @@ fn main() {
 }
 ```
 
-## Type Compatibility
+## 9. Type Compatibility
 
 ### Compatible Operations
 
@@ -381,7 +386,7 @@ fn main() {
 }
 ```
 
-## Performance Considerations
+## 10. Performance Considerations
 
 ### ZK-Circuit Friendly Operations
 
@@ -403,7 +408,7 @@ fn main() {
 }
 ```
 
-## Key Points
+## 11. Key Points
 
 1. **Arithmetic**: Standard `+`, `-`, `*`, `/`, `%`, `**` operators
 2. **Comparison**: All comparison operators return `bool`

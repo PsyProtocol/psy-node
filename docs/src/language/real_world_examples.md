@@ -1,8 +1,13 @@
 # Real-World Applications
 
+> Updated: 2026-09-03.
+
+## Abstract
+
+
 This chapter demonstrates practical applications of Psy language features through real-world smart contract examples. We'll examine actual contract implementations to show how the language concepts work together in production scenarios.
 
-## Token Contract - Complete Implementation
+## 1. Token Contract Implementation
 
 Let's examine a complete token contract that demonstrates storage, user interaction patterns, and the "read others, write self" security model.
 
@@ -184,7 +189,7 @@ fn main() {
 }
 ```
 
-## Advanced Patterns
+## 2. Advanced Patterns
 
 ### Multi-Token Contract with Modules
 
@@ -402,7 +407,7 @@ fn get_next_proposal_id() -> Felt {
 - **Constraint Power**: `V: Votable` ensures voting power can be calculated
 - **Extensibility**: New voting systems can be plugged in via traits
 
-## Design Patterns Summary
+## 3. Design Patterns
 
 ### 1. Storage Patterns
 

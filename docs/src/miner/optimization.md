@@ -1,73 +1,108 @@
 # Mining Performance Optimization
 
-Guidelines for optimizing mining performance in the Psy network.
+> Updated: 2026-09-03.
 
-## Hardware Requirements
+## Abstract
 
-### CPU Recommendations
+Mining throughput depends primarily on CPU capacity, memory, storage latency, network stability, and worker concurrency. Measure the active worker process before increasing process count or batch size.
 
-**For optimal performance, choose CPUs with:**
-- **High core count**: 8+ cores preferred
-- **AVX-512 instruction support**: Provides best performance for proof generation
-- **High clock speeds**: 3.5+ GHz base frequency
+## Table of Contents
 
-**Popular choices:**
-- Intel processors with AVX-512 support
-- AMD processors with high core counts
+- [1. Hardware](#1-hardware)
+- [2. Multiple Workers](#2-multiple-workers)
+- [3. Monitoring](#3-monitoring)
+- [4. Optimization Checklist](#4-optimization-checklist)
+- [5. Failure Handling](#5-failure-handling)
 
-**Check CPU features:**
+## 1. Hardware
+
+### 1.1 CPU
+
+For proof generation, prefer:
+
+- At least 8 CPU cores.
+- High sustained clock speed.
+- AVX-512 support when available.
+
+Inspect CPU features and available cores:
+
 ```bash
-# Verify AVX support
 lscpu | grep -E "(avx|sse)"
-
-# Check available cores
 nproc
 ```
 
-### Memory Requirements
+### 1.2 Memory
 
-- **Minimum**: 8GB RAM
-- **Recommended**: 16GB+ RAM
-- **High-performance setups**: 32GB+ RAM
+| Workload | Memory |
+|---|---:|
+| Minimum worker capacity | 8 GB |
+| Recommended worker capacity | 16 GB or more |
+| High-concurrency worker capacity | 32 GB or more |
 
-### Storage
+### 1.3 Storage
 
-- Fast SSD recommended for optimal I/O performance
-- Minimum 100GB free space
+- Use solid-state storage for proof data and job backups.
+- Keep at least 100 GB free for sustained operation.
+- Monitor write latency when several workers share one device.
 
-## Current Limitations
+### 1.4 GPU boundary
 
-**GPU Acceleration**: Currently under development. GPU support will be available in future releases to significantly improve proof generation performance.
+The worker performs proof generation on the supported CPU path. Do not plan worker capacity around GPU acceleration.
 
-**Performance Optimization**: The miner binary handles most performance optimizations automatically. Focus on providing adequate hardware resources.
+## 2. Multiple Workers
 
-## Running Multiple Miners
-
-You can run multiple miner instances with different wallets:
+Run separate worker processes with separate wallet identities:
 
 ```bash
-# Start multiple miners
-psy_node_cli worker --config config.json --keystore-path miner1.json &
-psy_node_cli worker --config config.json --keystore-path miner2.json &
-psy_node_cli worker --config config.json --keystore-path miner3.json &
+psy_worker_cli worker \
+  --config config.json \
+  --keystore-path miner1.json &
+
+psy_worker_cli worker \
+  --config config.json \
+  --keystore-path miner2.json &
+
+psy_worker_cli worker \
+  --config config.json \
+  --keystore-path miner3.json &
 ```
 
-## Monitoring Performance
+Increase worker count only while CPU, memory, and storage latency remain within operating limits. The worker also exposes `--batch-size` for concurrent job processing (`psy_cli/psy_worker_cli/src/subcommand.rs:55-56`).
 
-Monitor your miner's resource usage:
+## 3. Monitoring
+
+Monitor the actual worker binary and its logs:
 
 ```bash
 # CPU and memory usage
-htop -p $(pgrep psy_node_cli)
+htop -p $(pgrep psy_worker_cli)
 
-# Check logs for performance information
+# Redirected worker output
 tail -f miner.log
 ```
 
-## Performance Tips
+Track:
 
-1. **Use dedicated hardware** for mining operations
-2. **Ensure stable network connectivity** to mining endpoints
-3. **Monitor system resources** to avoid bottlenecks
-4. **Keep the system updated** for latest optimizations
-5. **Use AVX-512 capable CPUs** when available
+- CPU saturation and throttling.
+- Resident memory and swap activity.
+- Proof completion time.
+- Job failure rate.
+- Network disconnects.
+- Storage latency and free space.
+
+## 4. Optimization Checklist
+
+1. Use dedicated hardware for sustained proof generation.
+2. Keep worker endpoints on stable, low-latency network paths.
+3. Increase process count or `--batch-size` one step at a time.
+4. Stop increasing concurrency when proof latency or failure rate rises.
+5. Retain completed-job backups required for reward claims.
+6. Keep the operating system and CPU microcode updated.
+
+## 5. Failure Handling
+
+- **CPU saturation:** reduce worker count or `--batch-size`.
+- **Memory pressure:** reduce concurrency before the system begins swapping.
+- **Slow proof completion:** inspect thermal throttling and shared storage latency.
+- **Worker disconnects:** verify every configured coordinator and realm endpoint.
+- **Missing monitoring process:** confirm `psy_worker_cli` is running before invoking `htop`.

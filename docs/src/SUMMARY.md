@@ -67,9 +67,12 @@
 - [Installation](./node/installation.md)
 - [Configuration](./node/configuration.md)
 - [Getting Started](./node/getting_started.md)
+- [Genesis Generation](./node/genesis-generation.md)
 - [Devnet Startup, Shutdown, Restart, and Rollback](./node/devnet_lifecycle.md)
 - [Devnet Launcher Reference](./node/devnet-launcher-reference.md)
 - [Circuit and Verifier Operations](./node/circuit-and-verifier-operations.md)
+- [Token Privacy Circuit Fingerprints](./node/token-privacy-circuit-fingerprints.md)
+- [Realm P2P Validators](./node/realm-p2p-validators.md)
 
 ---
 

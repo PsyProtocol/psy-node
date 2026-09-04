@@ -1,344 +1,210 @@
 # TypeScript SDK
 
-The Psy TypeScript SDK provides JavaScript/TypeScript interfaces for interacting with contracts and the Psy network from web applications and Node.js environments.
+> Updated: 2026-09-04.
 
-## Installation
+## Abstract
 
-Follow the [Node Installation](../node/installation.md) guide to install the required components and build the TypeScript SDK.
+The TypeScript workspace contains `@psy-protocol/psy-sdk` for remote procedure call clients, wallets, local web proving, and local web compilation, plus `@psy-protocol/contract-sdk` for generated contract bindings. The examples below use interfaces verified in the current SDK checkout; values that depend on a deployment remain placeholders.
 
-### Setup Contract SDK
+## Table of Contents
 
-Generate TypeScript bindings for your contracts:
+- [1. Packages and Installation](#1-packages-and-installation)
+- [2. Network Configuration](#2-network-configuration)
+- [3. Wallet Provider](#3-wallet-provider)
+- [4. User Registration](#4-user-registration)
+- [5. Contract Calls](#5-contract-calls)
+- [6. Contract Binding Generation](#6-contract-binding-generation)
+- [7. Demo](#7-demo)
+- [8. Verification Boundary](#8-verification-boundary)
 
-1. Place your `contract.abi.json` in `psy_sdk/psy-ts-sdk/packages/contract-sdk/abi/`
-2. Run the generator:
+## 1. Packages and Installation
+
+The workspace package names are:
+
+```text
+@psy-protocol/psy-sdk
+@psy-protocol/contract-sdk
+```
+
+For repository development, install dependencies from the TypeScript workspace:
 
 ```bash
-cd psy_sdk/psy-ts-sdk/packages/contract-sdk
+cd <workspace>/psy-sdk/psy-ts-sdk
 pnpm install
-pnpm generate
 ```
 
-The generator creates TypeScript bindings based on your contract ABI, which are then used to create typed contract instances.
-
-## Core Components
-
-### RpcProvider
-
-The `RpcProvider` handles network communication with Psy nodes:
+Applications import the public package root:
 
 ```typescript
-import { RpcProvider } from "@psy/psy-sdk/rpc-provider/provider.js";
-
-// Initialize provider
-const rpcProvider = new RpcProvider(
-  coordinator_configs,
-  realm_configs,
-  users_per_realm
-);
-
-// Singleton pattern
-let rpcProvider: null | RpcProvider = null;
-
-export function getRpcProvider() {
-  if (!rpcProvider) {
-    rpcProvider = new RpcProvider(
-      rpcConfig.coordinator_configs,
-      rpcConfig.realm_configs,
-      rpcConfig.users_per_realm
-    );
-  }
-  return rpcProvider;
-}
+import {
+  ContractCallArgs,
+  PsyUserWallet,
+  SignType,
+  createMemoryWalletProvider,
+} from "@psy-protocol/psy-sdk";
 ```
 
-### Configuration
+## 2. Network Configuration
 
-Create configuration for network endpoints:
+`createMemoryWalletProvider` accepts a complete `PsyNetworkConfig`. Supply every required field from the target deployment configuration:
 
 ```typescript
-const rpcConfig = {
+import type { PsyNetworkConfig } from "@psy-protocol/psy-sdk";
+
+const networkConfig: PsyNetworkConfig = {
+  magic: "<network-magic>",
+  users_per_realm: 1_000_000,
+  global_user_tree_height: 32,
+  realm_user_tree_height: 20,
+  group_realm_height: 1,
   coordinator_configs: [
-    { id: 0, rpc_url: ["http://127.0.0.1:8545"] }
+    { id: 0, rpc_url: ["http://127.0.0.1:8545"] },
   ],
   realm_configs: [
     { id: 0, rpc_url: ["http://127.0.0.1:8546"] },
-    { id: 1, rpc_url: ["http://127.0.0.1:8547"] }
   ],
-  users_per_realm: 1000000
+  prove_proxy_url: ["http://127.0.0.1:9999"],
+  native_currency: "<symbol>",
+  native_currency_decimal: 18,
+  native_currency_name: "<name>",
+  fees: {
+    register_user_fee: 0,
+    deploy_contract_fee: 0,
+    guta_fee: 5_000_000_000,
+  },
 };
 ```
 
-### Memory Wallet Provider
+The constants in this configuration are illustrative. Use the values supplied by the target deployment.
 
-Create a provider for on-chain data and transactions:
+## 3. Wallet Provider
+
+Create the in-memory provider asynchronously:
 
 ```typescript
-import { createMemoryWalletProvider } from "@psy/psy-sdk";
-
-const walletProvider = createMemoryWalletProvider(privateKey);
+const provider = await createMemoryWalletProvider(networkConfig);
 ```
 
-## Contract Interaction
+The provider constructs coordinator and realm clients, a web prover, and an in-memory signer provider. The current implementation fixes its network identifier to `regtest`.
 
-### Basic Usage
+The `RpcProvider` class remains available for direct coordinator and realm routing:
 
 ```typescript
-import { getRpcProvider } from "./rpcProvider";
-// Import generated contract class based on your ABI
-import { YourContractSDK } from "./generated/contract-bindings";
+import { RpcProvider } from "@psy-protocol/psy-sdk";
 
-// Initialize contract with generated bindings
-const contract = new YourContractSDK({
-  rpcProvider: getRpcProvider(),
-  walletProvider,
-  contractId,
-  checkpointId,
-  userId
-});
-
-// Call contract method (typed based on ABI)
-const result = await contract.methodName(param1, param2);
+const rpcProvider = new RpcProvider(
+  networkConfig.coordinator_configs,
+  networkConfig.realm_configs,
+  networkConfig.users_per_realm,
+);
 ```
 
-### Contract Object Management
+## 4. User Registration
 
-The contract object automatically handles:
-- `checkpointId` association
-- `userId` mapping
-- `contractId` tracking
-
-## User Operations
-
-### User Registration
+Register a private key through the signer provider, then wait for the Coordinator to expose its user identifier before constructing a wallet:
 
 ```typescript
-import { 
-  PsyUserWalletProvider,
-  SignType,
-  createMemoryWalletProvider 
-} from "@psy/psy-sdk";
+const privateKey = "<private-key>";
+const signType = SignType.SECP256K1Sign;
 
-// Create wallet provider
-const provider = new PsyUserWalletProvider(networkConfig);
+const publicKey = await provider.signerProvider.registerUser(
+  privateKey,
+  signType,
+);
 
-// Register user with private key
-async function registerUser(privateKeyHex: string, signType: SignType) {
-  try {
-    await provider.signerProvider.registerUser(privateKeyHex, signType);
-    console.log("User registered successfully");
-  } catch (error) {
-    console.error("Error registering user:", error);
-  }
-}
-
-// Get user ID from public key
-async function getUserId(publicKeyHex: string): Promise<number> {
-  const userId = await provider.coordinatorEdgeRpcProvider.getUserId(publicKeyHex);
-  return userId;
-}
+const userId = await provider.coordinatorEdgeRpcProvider.getUserId(publicKey);
+const signer = await provider.signerProvider.importPrivateKey!(
+  privateKey,
+  signType,
+  "<zk-fingerprint-when-required>",
+);
+const realm = provider.realmEdgeRpcProvider.getRpcProviderByUserId(userId);
+const wallet = new PsyUserWallet(
+  provider.networkId,
+  signer,
+  provider.coordinatorEdgeRpcProvider,
+  realm,
+  userId,
+  publicKey,
+  true,
+);
 ```
 
-### Wallet Management
+Registration is asynchronous at the network level. A production caller must poll the Coordinator or react to deployment-specific confirmation before assuming `getUserId` will succeed.
+
+## 5. Contract Calls
+
+`PsyUserWallet.execContractCall` takes the wallet public-key hash followed by one `ContractCallArgs` value or an array of values:
 
 ```typescript
-import { 
-  PsyUserWallet,
-  PsyUserWalletProvider,
-  SignType 
-} from "@psy/psy-sdk";
-
-// Create wallet from private key
-async function createWallet(
-  provider: PsyUserWalletProvider,
-  privateKeyHex: string,
-  signType: SignType
-) {
-  // Import private key and get signer
-  const signer = await provider.signerProvider.importPrivateKey!(
-    privateKeyHex,
-    signType,
-    ""
-  );
-
-  // Get public key
-  const publicKeyHex = await signer.getPublicKeyHex();
-  
-  // Get user ID
-  const userId = await provider.coordinatorEdgeRpcProvider.getUserId(publicKeyHex);
-  
-  // Create wallet instance
-  const wallet = new PsyUserWallet(
-    provider.networkId,
-    signer,
-    provider.coordinatorEdgeRpcProvider,
-    provider.realmEdgeRpcProvider.getRpcProviderByUserId(userId),
-    userId,
-    publicKeyHex,
-    true
-  );
-
-  return wallet;
-}
-```
-
-### Data Fetching Operations
-
-```typescript
-import { 
-  Felt, 
-  PsyUserWalletProvider,
-  IRealmEdgeRpcProvider 
-} from "@psy/psy-sdk";
-
-// Fetch latest checkpoint/block number
-async function fetchBlockNumber(
-  walletProvider: PsyUserWalletProvider
-): Promise<number> {
-  const checkpointResponse = 
-    await walletProvider.coordinatorEdgeRpcProvider.getLatestCheckpoint();
-  
-  return checkpointResponse ? Number(checkpointResponse.checkpoint_id) : 0;
-}
-
-// Fetch user balance from contract state
-async function fetchUserBalance(
-  walletProvider: PsyUserWalletProvider,
-  checkpointId: Felt,
-  userId: Felt,
-  userContractId: Felt
-): Promise<number> {
-  const merkleProof = await walletProvider.realmEdgeRpcProvider
-    .getRpcProviderByUserId(userId)
-    .getUserContractStateTreeMerkleProof(
-      checkpointId,
-      userId,
-      userContractId,
-      32,
-      0
-    );
-
-  if (merkleProof && merkleProof.value.length === 64) {
-    return parseInt(merkleProof.value.substring(48, 64), 16);
-  }
-  
-  return 0;
-}
-
-// Get user ID from public key
-async function fetchUserId(
-  walletProvider: PsyUserWalletProvider,
-  publicKeyHex: string
-): Promise<number> {
-  return await walletProvider.coordinatorEdgeRpcProvider.getUserId(publicKeyHex);
-}
-```
-
-### Transaction Operations
-
-```typescript
-import { ContractCallArgs, Felt, PsyJSON } from "@psy/psy-sdk";
-
-// Execute contract call using wallet
-async function execContractCall(
-  wallet: PsyUserWallet,
-  address: string,
-  args: ContractCallArgs | ContractCallArgs[]
-) {
-  try {
-    const result = await wallet.execContractCall(address, args);
-    return result;
-  } catch (error) {
-    console.error("Contract call failed:", error);
-    throw error;
-  }
-}
-
-// Transfer tokens example
 async function transferTokens(
   wallet: PsyUserWallet,
-  walletAddress: string,
-  recipient: Felt,
-  amount: Felt
-) {
-  const contractCallArgs: ContractCallArgs = {
-    contract_id: "token-contract-id",
-    method_name: "transfer",
-    inputs: [recipient, amount]
+  recipientUserId: bigint,
+  amount: bigint,
+): Promise<string> {
+  const call: ContractCallArgs = {
+    contract_id: 0n,
+    method_name: "simple_transfer",
+    inputs: [recipientUserId, amount],
   };
-  
-  return await execContractCall(wallet, walletAddress, contractCallArgs);
-}
 
-// Claim rewards from another user
-async function claimTokens(
-  wallet: PsyUserWallet,
-  walletAddress: string,
-  senderUserId: Felt
-) {
-  const contractCallArgs: ContractCallArgs = {
-    contract_id: "token-contract-id",
-    method_name: "simple_claim",
-    inputs: [senderUserId]
-  };
-  
-  return await execContractCall(wallet, walletAddress, contractCallArgs);
+  return wallet.execContractCall(wallet.publicKeyHex, call);
 }
 ```
 
-## Examples
-
-### Complete Application Setup
+A claim uses the same verified call path and the `simple_claim` token method:
 
 ```typescript
-import { 
-  PsyUserWalletProvider,
-  SignType,
-  createMemoryWalletProvider 
-} from "@psy/psy-sdk";
+async function claimTokens(
+  wallet: PsyUserWallet,
+  senderUserId: bigint,
+): Promise<string> {
+  const call: ContractCallArgs = {
+    contract_id: 0n,
+    method_name: "simple_claim",
+    inputs: [senderUserId],
+  };
 
-// 1. Setup configuration
-const networkConfig = {
-  coordinator_configs: [
-    { id: 0, rpc_url: ["http://127.0.0.1:8545"] }
-  ],
-  realm_configs: [
-    { id: 0, rpc_url: ["http://127.0.0.1:8546"] }
-  ],
-  users_per_realm: 1000000
-};
-
-// 2. Initialize wallet provider
-const provider = new PsyUserWalletProvider(networkConfig);
-
-// 3. Register and create wallet
-const privateKey = "your-private-key";
-await provider.signerProvider.registerUser(privateKey, SignType.SECP256K1);
-
-const wallet = await createWallet(provider, privateKey, SignType.SECP256K1);
-
-// 4. Get user info
-const userInfo = await wallet.getUserInfo();
-console.log("User info:", userInfo);
-
-// 5. Execute transactions
-await transferTokens(wallet, recipientId, amount);
+  return wallet.execContractCall(wallet.publicKeyHex, call);
+}
 ```
 
-## Demo Examples
+The `claimTokens` function is an application helper, not an exported SDK method.
 
-Run the provided demo examples:
+## 6. Contract Binding Generation
+
+Place the contract Application Binary Interface file at the generator input path, then run the package script:
 
 ```bash
-cd psy_sdk/psy-ts-sdk/packages/contract-sdk/demo
+cd <workspace>/psy-sdk/psy-ts-sdk/packages/contract-sdk
+cp <workspace>/application/contract.abi.json ./abi/contract.abi.json
+pnpm generate
+pnpm build
+```
 
+`pnpm generate` invokes the generator with `./abi/contract.abi.json` and writes generated bindings under `./generated`.
+
+## 7. Demo
+
+Run the checked-in basic demo from its package:
+
+```bash
+cd <workspace>/psy-sdk/psy-ts-sdk/packages/contract-sdk/demo
 pnpm install
 pnpm example:basic
 ```
 
-## Important Notes
+The demo requires reachable network endpoints and deployment-specific configuration.
 
-1. Ensure `config.json` is correctly configured with network details
-2. The contract object handles `checkpointId`, `userId`, and `contractId` association automatically
-3. Use `createMemoryWalletProvider` for wallet operations
-4. Generated contract bindings provide type-safe interfaces for your contracts
+## 8. Verification Boundary
+
+Verified against the SDK checkout:
+
+1. Package imports use the `@psy-protocol` scope, not `@psy/psy-sdk`.
+2. `createMemoryWalletProvider` takes a complete `PsyNetworkConfig` and returns a promise.
+3. `PsyUserWalletProvider` is constructed internally from a network identifier, coordinator provider, realm provider, signer provider, and prover; it does not accept a single network configuration argument.
+4. `PsyUserWallet.execContractCall` requires the public-key hash as its first argument.
+5. `simple_transfer` and `simple_claim` exist in the checked-in token contract Application Binary Interface.
+6. The contract generator and basic demo scripts exist at the documented paths.
+
+The network constants and application helper functions in this guide are illustrative because their values and confirmation policy depend on the deployment.

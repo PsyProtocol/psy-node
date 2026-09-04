@@ -1,8 +1,13 @@
 # Conditional Statements
 
+> Updated: 2026-09-03.
+
+## Abstract
+
+
 This chapter covers conditional control flow in Psy: `if`, `else if`, `else`, and `match` expressions.
 
-## If Statements
+## 1. If Statements
 
 ### Basic If-Else
 
@@ -201,7 +206,7 @@ fn main() {
 }
 ```
 
-## Match Expressions
+## 2. Match Expressions
 
 Match expressions provide a powerful way to handle multiple possible values:
 
@@ -363,7 +368,7 @@ fn complex_match_example(input: Felt) -> Felt {
 ```
 
 
-## Current Limitations
+## 3. Current Limitations
 
 **Multiple Patterns**: Multiple patterns in match expressions (e.g., `0 | 1 => value`) are not currently supported. Use separate match arms for each pattern:
 
@@ -385,7 +390,7 @@ match value {
 }
 ```
 
-## Important Notes
+## 4. Important Notes
 
 ### No Early Returns in Conditionals
 
@@ -433,7 +438,7 @@ fn process_value(value: Felt) {
 }
 ```
 
-## Key Points
+## 5. Key Points
 
 1. **If statements** are expressions that return values
 2. **Else if** allows chaining multiple conditions

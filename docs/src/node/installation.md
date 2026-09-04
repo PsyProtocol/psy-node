@@ -1,104 +1,108 @@
 # Installation
 
-This guide walks you through installing and setting up Psy network nodes.
+> Updated: 2026-09-03.
 
-## Prerequisites
+## Abstract
 
-- Rust (latest stable version)
+This guide installs the Psy node command-line tools from source, summarizes their primary commands, and verifies that each binary is available.
+
+## Table of Contents
+
+- [1. Prerequisites](#1-prerequisites)
+- [2. Build](#2-build)
+- [3. Command-Line Tools](#3-command-line-tools)
+- [4. Verification](#4-verification)
+- [5. Next Steps](#5-next-steps)
+
+## 1. Prerequisites
+
+- Rust, using the latest stable toolchain
 - Git
 - Make
-- Sufficient system resources (recommended: 16GB+ RAM, 8+ CPU cores)
+- At least 16 GB of memory and 8 CPU cores are recommended
 
-## Installation Steps
+## 2. Build
 
-### 1. Clone the Repository
+### 2.1 Clone the repository
 
 ```bash
-git clone https://github.com/PsyProtocol/psy-v1
-cd psy-v1
+git clone https://github.com/PsyProtocol/psy-node.git
+cd psy-node
 ```
 
-### 2. Build the Project
+### 2.2 Build the project
 
 ```bash
 make build
 ```
 
-This command compiles all necessary components including node binaries and CLI tools.
+The `build` target compiles the node, worker, developer, relayer, and user command-line tools (`Makefile:22-23`).
 
-### 3. Install CLI Tools
+## 3. Command-Line Tools
+
+### 3.1 `psy_node_cli`
+
+`psy_node_cli` starts coordinator and realm nodes.
 
 ```bash
-make install
+# Start coordinator components
+psy_node_cli start-coordinator-edge
+psy_node_cli start-coordinator-processor
+
+# Start realm components
+psy_node_cli start-realm-edge
+psy_node_cli start-realm-processor
 ```
 
-This installs three main CLI tools to your system:
+The node command names are defined in `psy_cli/psy_node_cli/src/subcommand.rs:18-253`.
 
-## Installed CLI Tools
+### 3.2 `psy_worker_cli`
 
-### psy_node_cli
+`psy_worker_cli` starts proof workers.
 
-**Purpose**: Start and manage network nodes
-
-**Key Commands:**
 ```bash
-# Start coordinator
-psy_node_cli coordinator-edge
-psy_node_cli coordinator-processor
-
-# Start realm
-psy_node_cli realm-edge
-psy_node_cli realm-processor
-
-# Start supporting services
-psy_node_cli worker
-psy_node_cli api-services
+psy_worker_cli worker
 ```
 
-### psy_user_cli
+The worker command is defined in `psy_cli/psy_worker_cli/src/subcommand.rs:18-57`.
 
-**Purpose**: User interaction with the network
+API services are maintained in the separate `psy-services` repository.
 
-**Key Commands:**
+### 3.3 `psy_user_cli`
+
+`psy_user_cli` supports user registration, contract deployment, and contract calls.
+
 ```bash
-# Register user
 psy_user_cli register-user
-
-# Deploy contract
 psy_user_cli deploy-contract
-
-# Call contract function
 psy_user_cli call
 ```
 
-### psy_dev_cli
+### 3.4 `psy_dev_cli`
 
-**Purpose**: Development utilities
+`psy_dev_cli` provides development and inspection utilities.
 
-**Key Command:**
 ```bash
-# Hash utilities
-psy_dev_cli qhash
+psy_dev_cli chain-info
 ```
 
-## Verification
+The developer commands are defined in `psy_cli/psy_dev_cli/src/subcommand.rs:27-44`.
 
-After installation, verify that all tools are correctly installed:
+## 4. Verification
+
+Verify each built tool by opening its help output:
 
 ```bash
-# Check installations
-psy_node_cli --version
-psy_user_cli --version
-psy_dev_cli --version
-
-# View help for each tool
 psy_node_cli --help
+psy_worker_cli --help
 psy_user_cli --help
 psy_dev_cli --help
 ```
 
-## Next Steps
+A missing command indicates that the release binary directory is not on `PATH` or that `make build` did not complete successfully.
 
-- Configure your node: See [Configuration](./configuration.md)
-- Start your first node: See [Getting Started](./getting_started.md)
-- Explore the API: See [API Reference](../rpc/UserCli.md)
+## 5. Next Steps
+
+- Configure the network by following [Configuration](./configuration.md).
+- Start a local network by following [Getting Started](./getting_started.md).
+- Review the user commands in [User CLI](../rpc/UserCli.md).

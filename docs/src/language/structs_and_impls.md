@@ -1,8 +1,13 @@
 # Structs and Implementations
 
+> Updated: 2026-09-03.
+
+## Abstract
+
+
 Structs define custom data types that group related data together, and `impl` blocks add methods to operate on that data. This chapter covers struct definition, implementation patterns, and method types.
 
-## Defining Structs
+## 1. Defining Structs
 
 ### Basic Struct Definition
 
@@ -97,7 +102,7 @@ struct Matrix2x2 {
 }
 ```
 
-## Implementation Blocks
+## 2. Implementation Blocks
 
 ### Instance Methods
 
@@ -197,7 +202,7 @@ impl Rectangle {
 }
 ```
 
-## Complex Examples
+## 3. Complex Examples
 
 ### Vector3D Implementation
 
@@ -274,7 +279,7 @@ impl Matrix2x2 {
 }
 ```
 
-## Usage Examples
+## 4. Usage Examples
 
 ```rust
 #[test]
@@ -320,7 +325,7 @@ fn test_matrix_operations() {
 }
 ```
 
-## Method Call Syntax
+## 5. Method Call Syntax
 
 ```rust
 // Both syntaxes are equivalent

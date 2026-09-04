@@ -1,6 +1,12 @@
+# Psy Circuit Flow
+
+> Updated: 2026-09-03.
+
+## Abstract
+
 This document describes the end-to-end flow of circuits involved in processing user transactions and aggregating them into a final block proof within the Psy system. It highlights the assumptions made at each stage and how they are progressively verified, ultimately enabling horizontal scalability.
 
-### Phase 1: User Proving Session (UPS) - Local Execution
+## 1. User Proving Session: Local Execution
 
 This phase happens locally on the user's device (or via a delegated prover). The user builds a recursive chain of proofs for their transactions within a single block context.
 
@@ -77,7 +83,7 @@ This phase happens locally on the user's device (or via a delegated prover). The
 *   **Contribution to Horizontal Scalability:** Creates a single, verifiable proof representing *all* of a user's activity for the block. This proof can now be processed in parallel with proofs from other users by the GUTA layer.
 *   **High-Level Functionality:** Securely concludes a user's transaction batch, authorizes it, and packages it for network aggregation.
 
-### Phase 2: Global User Tree Aggregation (GUTA) - Parallel Network Execution
+## 2. Global User Tree Aggregation: Parallel Network Execution
 
 The Decentralized Proving Network (DPN) takes End Cap proofs (and potentially other GUTA proofs like user registrations) from many users and aggregates them in parallel. This involves specialized GUTA circuits.
 
@@ -146,7 +152,7 @@ The Decentralized Proving Network (DPN) takes End Cap proofs (and potentially ot
 *   **Contribution to Horizontal Scalability:** Allows the aggregation process to stay synchronized with the checkpoint tree even during periods of inactivity for certain state trees.
 *   **High-Level Functionality:** Advances the aggregated checkpoint state reference.
 
-### Phase 3: Final Block Proof
+## 3. Final Block Proof
 
 **9. Checkpoint Tree "Block" Circuit (Top-Level Aggregation)**
 

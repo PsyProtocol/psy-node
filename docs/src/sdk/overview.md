@@ -1,22 +1,26 @@
 # Psy SDK Overview
 
-The Psy SDK provides both Rust command-line tools and TypeScript libraries for interacting with the Psy network. This enables developers to build applications, deploy contracts, and interact with the blockchain from various environments.
+> Updated: 2026-09-04.
 
-## Available SDKs
+## Abstract
 
-- **[Rust CLI](rust.md)**: Command-line tools for contract deployment, user registration, and network interaction
-- **[TypeScript SDK](typescript.md)**: JavaScript/TypeScript package for web applications and Node.js environments
+The Psy SDK repository provides a Rust library and TypeScript packages for network access, wallet operations, local proving, contract binding generation, and contract interaction.
 
-## Common Use Cases
+## 1. Available SDKs
 
-- **User Management**: Register users and manage wallet operations
-- **Contract Development**: Deploy and interact with smart contracts
-- **Network Interaction**: Query blockchain state and submit transactions
-- **Proof Generation**: Generate ZK proofs for transactions and network operations
+- **[Rust SDK](rust.md)**: The `psy_rust_sdk` crate re-exports native provider, session, wallet, request, configuration, and cryptography modules.
+- **[TypeScript SDK](typescript.md)**: The `@psy-protocol/psy-sdk` package provides remote procedure call clients, wallet providers, local web proving, and local web compilation. The `@psy-protocol/contract-sdk` package generates and runs typed contract bindings.
 
-## Getting Started
+## 2. Common Use Cases
 
-1. Choose your preferred SDK based on your development environment
-2. Follow the installation instructions for your chosen SDK
-3. Configure network endpoints in your application
-4. Begin building with the provided APIs and examples
+- **User management**: Register users and operate wallets.
+- **Contract development**: Generate bindings and interact with contracts.
+- **Network interaction**: Query network state and submit transactions.
+- **Proof generation**: Use native or web proving providers.
+
+## 3. Getting Started
+
+1. Choose the [Rust SDK](rust.md) or [TypeScript SDK](typescript.md).
+2. Follow that SDK's installation and configuration instructions.
+3. Configure the target network endpoints.
+4. Use the documented provider and wallet interfaces.

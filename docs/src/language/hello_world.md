@@ -1,8 +1,13 @@
 # Hello, World!
 
+> Updated: 2026-09-03.
+
+## Abstract
+
+
 This chapter walks you through creating your first [Psy Smart Contract Language] program.
 
-## Creating a New Program
+## 1. Creating a New Program
 
 Create a new project:
 
@@ -28,7 +33,7 @@ This simple program:
 - Asserts that the difference is exactly 1
 - Returns the sum of `a` and `b`
 
-## Compiling
+## 2. Compiling
 
 Compile the program using the compiler:
 ```bash
@@ -37,7 +42,7 @@ dargo compile
 
 You will see a target directory created with the compiled output. The Psy compiler generates DPN opcodes and circuit data for each function.
 
-```
+```json
 [
     {
         "name": "main",
@@ -95,7 +100,7 @@ You will see a target directory created with the compiled output. The Psy compil
 ]
 ```
 
-## Running
+## 3. Running
 
 Execute the program with test inputs:
 

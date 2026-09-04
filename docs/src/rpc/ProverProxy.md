@@ -1,5 +1,9 @@
 # Prover Proxy RPC Documentation
 
+> Updated: 2026-09-04.
+
+## Abstract
+
 This document provides comprehensive documentation for the Psy Prover Proxy RPC methods, which handle local zero-knowledge proof generation for various circuit types.
 
 **RPC Namespace**: `psy`
@@ -10,20 +14,21 @@ This document provides comprehensive documentation for the Psy Prover Proxy RPC 
 
 ## Table of Contents
 
-1. [Overview](#overview)
-2. [UPS (Unified Proving System) Methods](#ups-unified-proving-system-methods)
-3. [Contract Management](#contract-management)
-4. [Signature Proving](#signature-proving)
-5. [Software-Defined Signatures](#software-defined-signatures)
-6. [Proof Tree Aggregation](#proof-tree-aggregation)
-7. [Circuit Management](#circuit-management)
-8. [Data Structures](#data-structures)
-9. [Configuration](#configuration)
-10. [Error Handling](#error-handling)
+- [1. Overview](#1-overview)
+- [2. UPS (Unified Proving System) Methods](#2-ups-unified-proving-system-methods)
+- [3. Contract Management](#3-contract-management)
+- [4. Signature Proving](#4-signature-proving)
+- [5. Software-Defined Signatures](#5-software-defined-signatures)
+- [6. Proof Tree Aggregation](#6-proof-tree-aggregation)
+- [7. Circuit Management](#7-circuit-management)
+- [8. Data Structures](#8-data-structures)
+- [9. Configuration](#9-configuration)
+- [10. Error Handling](#10-error-handling)
+- [11. Performance Considerations](#11-performance-considerations)
 
 ---
 
-## Overview
+## 1. Overview
 
 The Prover Proxy is a local proving service that generates zero-knowledge proofs for various circuit types in the Psy ecosystem. It acts as a computational backend for transaction signing, contract execution, and proof aggregation.
 
@@ -37,7 +42,7 @@ The Prover Proxy is a local proving service that generates zero-knowledge proofs
 
 ---
 
-## UPS (Unified Proving System) Methods
+## 2. UPS (Unified Proving System) Methods
 
 ### psy_prove_ups_start
 
@@ -153,7 +158,7 @@ Generate proof for UPS end cap step.
 
 ---
 
-## Contract Management
+## 3. Contract Management
 
 ### psy_get_circuits_data
 
@@ -339,7 +344,7 @@ Generate proof for contract function call.
 
 ---
 
-## Signature Proving
+## 4. Signature Proving
 
 ### psy_prove_zk_sign
 
@@ -431,7 +436,7 @@ Generate SECP256K1 signature proof.
 
 ---
 
-## Software-Defined Signatures
+## 5. Software-Defined Signatures
 
 ### psy_register_dpn_software_defined_circuit
 
@@ -531,7 +536,7 @@ Generate proof for Plonky2 software-defined signature.
 
 ---
 
-## Proof Tree Aggregation
+## 6. Proof Tree Aggregation
 
 The prover proxy supports hierarchical proof aggregation through various circuit types:
 
@@ -673,7 +678,7 @@ Aggregate an aggregation proof with a leaf proof (aggregation on left).
 
 ---
 
-## Circuit Management
+## 7. Circuit Management
 
 ### Circuit Information
 
@@ -694,7 +699,7 @@ Circuits are automatically registered during prover initialization:
 
 ---
 
-## Data Structures
+## 8. Data Structures
 
 ### Field Types
 
@@ -714,10 +719,10 @@ const D: usize = 2;
 
 ### Proof Types
 
-**ProofWithPublicInputs<F, C, D>**: Complete ZK proof with public inputs
-**QHashOut<F>**: Hash output in the field F
-**MerkleProofCore<QHashOut<F>>**: Merkle proof for hash verification
-**DeltaMerkleProofCore<QHashOut<F>>**: Delta merkle proof for tree updates
+`ProofWithPublicInputs<F, C, D>`: Complete ZK proof with public inputs
+`QHashOut<F>`: Hash output in the field F
+`MerkleProofCore<QHashOut<F>>`: Merkle proof for hash verification
+`DeltaMerkleProofCore<QHashOut<F>>`: Delta merkle proof for tree updates
 
 ### Circuit Data
 
@@ -728,7 +733,7 @@ const D: usize = 2;
 
 ---
 
-## Configuration
+## 9. Configuration
 
 ### Server Configuration
 
@@ -760,7 +765,7 @@ The prover proxy initializes with:
 
 ---
 
-## Error Handling
+## 10. Error Handling
 
 All RPC methods return `Result<T, ErrorObjectOwned>` with standardized error formats:
 
@@ -800,7 +805,7 @@ All RPC methods return `Result<T, ErrorObjectOwned>` with standardized error for
 
 ---
 
-## Performance Considerations
+## 11. Performance Considerations
 
 ### Asynchronous Proving
 
@@ -823,6 +828,6 @@ All proving operations use `tokio::task::spawn_blocking` to:
 
 ---
 
-**Document Version**: 1.0  
-**Last Updated**: 2024-12-16  
+**Document Version**: 1.0
+**Last Updated**: 2024-12-16
 **Total RPC Methods**: 25+

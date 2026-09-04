@@ -1,12 +1,27 @@
 # Virtual Machine Bytecode Operations
 
+> Updated: 2026-09-04.
+
+## Abstract
+
 The Psy VM uses a Data Processing Network (DPN) architecture that compiles high-level Psy language constructs into a series of low-level operations. The bytecode forms a tree-like dependency structure where inputs serve as unknown variables that get assigned values during execution, enabling computation of the entire tree to produce outputs.
 
-## Bytecode Architecture Overview
+## Table of Contents
+
+- [1. Bytecode Architecture Overview](#1-bytecode-architecture-overview)
+- [2. Tree-Based Execution Model](#2-tree-based-execution-model)
+- [3. Operation Categories](#3-operation-categories)
+- [4. Operation Properties](#4-operation-properties)
+- [5. Function-Specific Compilation](#5-function-specific-compilation)
+- [6. DPNIndexedVarDef: Operation Encoding and Symbol Evaluation](#6-dpnindexedvardef-operation-encoding-and-symbol-evaluation)
+- [7. Performance Considerations](#7-performance-considerations)
+- [8. Summary](#8-summary)
+
+## 1. Bytecode Architecture Overview
 
 The VM operates on a constraint-based system where each operation generates mathematical constraints that can be verified in zero-knowledge. Operations are encoded as `DPNOpType` enums with associated input parameters and output specifications.
 
-## Tree-Based Execution Model
+## 2. Tree-Based Execution Model
 
 The bytecode represents a computational tree structure:
 
@@ -27,7 +42,7 @@ All VM operations work with these fundamental data types:
 - **HashOut**: 4-element field arrays representing hash outputs
 - **Arrays**: Collections of the above types
 
-## Operation Categories
+## 3. Operation Categories
 
 ### 1. Arithmetic and Mathematical Operations
 
@@ -272,7 +287,7 @@ GetContractLeaf         // Get contract metadata from global tree
 ```
 
 
-## Operation Properties
+## 4. Operation Properties
 
 Each operation has several important properties:
 
@@ -293,7 +308,7 @@ The VM enforces the "read others, write self" security model:
 3. **Cross-Contract**: Can read from any contract, write only to current contract
 4. **Storage Slots**: Each contract has 2^32 available slots, each storing a Hash (4 Felts)
 
-## Function-Specific Compilation
+## 5. Function-Specific Compilation
 
 Psy opcodes are generated for each individual function during compilation. Each function compiles to a `DPNFunctionCircuitDefinition` that contains all necessary information to generate and execute the corresponding zero-knowledge circuit.
 
@@ -395,7 +410,7 @@ This compiles to a `DPNFunctionCircuitDefinition` containing:
 - **assertions**: `[DPNAssertEqInfoIndexed{left: overflow_check, right: true, message: "overflow"}]`
 - **definitions**: All intermediate operations (TokenContractRef::new, get, add, comparison, set)
 
-## DPNIndexedVarDef: Operation Encoding and Symbol Evaluation
+## 6. DPNIndexedVarDef: Operation Encoding and Symbol Evaluation
 
 The core of the VM's execution model is the `DPNIndexedVarDef` structure, which represents individual operations in a unified array format that enables efficient symbolic evaluation.
 
@@ -597,7 +612,7 @@ The VM enforces type consistency:
 This indexed variable definition system forms the foundation of Psy's symbolic execution model, enabling efficient zero-knowledge proof generation while maintaining clear semantics and strong type safety.
 
 
-## Performance Considerations
+## 7. Performance Considerations
 
 ### Operation Costs
 - **Field arithmetic**: Most efficient (native to ZK circuits)
@@ -612,7 +627,7 @@ This indexed variable definition system forms the foundation of Psy's symbolic e
 - **Storage batching**: Group storage operations to reduce tree traversals
 - **Selective operations**: Use specialized constant variants when applicable
 
-## Summary
+## 8. Summary
 
 The Psy VM bytecode provides a comprehensive instruction set that:
 

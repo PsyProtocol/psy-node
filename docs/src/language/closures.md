@@ -1,8 +1,13 @@
 # Functions and Closures
 
+> Updated: 2026-09-03.
+
+## Abstract
+
+
 This chapter covers closures in Psy. For basic function documentation, see the [Functions](./functions.md) chapter.
 
-## Closures
+## 1. Closures
 
 Closures in Psy are anonymous functions that can capture variables from their surrounding scope. They use the `|parameters| -> return_type { body }` syntax.
 
@@ -252,7 +257,7 @@ fn main() {
 }
 ```
 
-## Summary
+## 2. Summary
 
 Closures in Psy provide a way to create anonymous functions that can capture variables from their environment. They are useful for:
 

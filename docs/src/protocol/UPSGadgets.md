@@ -1,10 +1,27 @@
 # User Proving Session (UPS) Gadgets
 
-These gadgets are primarily used within the circuits executed locally by users (or their delegates) to prove their transaction sequences.
+> Updated: 2026-09-03.
 
----
+## Abstract
 
-### `CorrectUPSHeaderHashesGadget`
+This document describes the gadgets used by local User Proving Session circuits to initialize a session, verify contract function proofs, update user state, authorize the result, and construct the End Cap.
+
+## Table of Contents
+
+- [1. Correct Header Hashes Gadget](#1-correctupsheaderhashesgadget)
+- [2. Contract Function Call Verification Gadget](#2-upsverifycfcproofexistsandvalidgadget)
+- [3. Standard State Delta Gadget](#3-upscfcstandardstatedeltagadget)
+- [4. Standard Step Gadget](#4-upsverifycfcstandardstepgadget)
+- [5. Deferred Transaction Step Gadget](#5-upsverifypopdeferredtxstepgadget)
+- [6. Signature Data Gadget](#6-psyuserprovingsessionsignaturedatacompactgadget)
+- [7. End Cap Result Gadget](#7-upsendcapresultcompactgadget)
+- [8. End Cap Core Gadget](#8-upsendcapcoregadget)
+- [9. Previous Step Verification Gadget](#9-verifypreviousupsstepproofinprooftreegadget)
+- [10. Partial Previous Step Verification Gadget](#10-verifypreviousupsstepproofinprooftreepartialfromcurrentgadget)
+- [11. End Cap Proof Tree Gadget](#11-upsendcapfromprooftreegadget)
+- [12. Start Step Gadget](#12-upsstartstepgadget)
+
+## 1. `CorrectUPSHeaderHashesGadget`
 
 *   **File:** `correct_header_hashes_rs.txt`
 *   **Purpose:** A data structure gadget to hold potentially *modified* starting debt tree roots for a UPS step. Used when a transaction (like debt repayment) needs to alter the context *before* the main state delta logic of that same step runs.
@@ -17,10 +34,10 @@ These gadgets are primarily used within the circuits executed locally by users (
 
 ---
 
-### `UPSVerifyCFCProofExistsAndValidGadget`
+## 2. `UPSVerifyCFCProofExistsAndValidGadget`
 
 *   **File:** `ups_cfc_verify_inclusion_rs.txt`
-*   **Purpose:** Verifies two critical aspects of a Contract Function Call (CFC) within a UPS: (1) That the ZK proof for the CFC execution exists and is valid within the user's current UPS proof tree, and (2) That the specific function being called is officially registered within the contract's definition on the blockchain (via checkpoint context).
+*   **Purpose:** Verifies two critical aspects of a Contract Function Call (CFC) within a UPS: (1) That the ZK proof for the CFC execution exists and is valid within the user's current UPS proof tree, and (2) That the specific function being called is registered within the contract's definition on the blockchain (via checkpoint context).
 *   **Technical Function:** Combines proof attestation within the UPS tree with function inclusion verification against global contract state.
 *   **Inputs/Witness:**
     *   `checkpoint_state_gadget`: Witness for `PsyCheckpointLeafCompactWithStateRoots` providing context (global roots).
@@ -43,7 +60,7 @@ These gadgets are primarily used within the circuits executed locally by users (
 
 ---
 
-### `UPSCFCStandardStateDeltaGadget`
+## 3. `UPSCFCStandardStateDeltaGadget`
 
 *   **File:** `ups_standard_cfc_state_delta_rs.txt`
 *   **Purpose:** Calculates the precise changes to the user's state (`UserProvingSessionHeader`) resulting from a single, standard CFC transaction. It enforces the consistency between the transaction's claimed effects (witnessed context) and the cryptographic updates to the relevant Merkle trees.
@@ -78,7 +95,7 @@ These gadgets are primarily used within the circuits executed locally by users (
 
 ---
 
-### `UPSVerifyCFCStandardStepGadget`
+## 4. `UPSVerifyCFCStandardStepGadget`
 
 *   **File:** `ups_cfc_standard_rs.txt`
 *   **Purpose:** Encapsulates a complete, standard transaction processing step within UPS. It combines the verification of the CFC proof's existence and validity with the calculation and verification of the resulting state delta.
@@ -100,7 +117,7 @@ These gadgets are primarily used within the circuits executed locally by users (
 
 ---
 
-### `UPSVerifyPopDeferredTxStepGadget`
+## 5. `UPSVerifyPopDeferredTxStepGadget`
 
 *   **File:** `ups_cfc_standard_pop_deferred_tx_rs.txt`
 *   **Purpose:** Handles transactions specifically designed to settle a previously incurred deferred transaction debt. It verifies the debt removal and then processes the corresponding CFC execution.
@@ -122,7 +139,7 @@ These gadgets are primarily used within the circuits executed locally by users (
 
 ---
 
-### `PsyUserProvingSessionSignatureDataCompactGadget`
+## 6. `PsyUserProvingSessionSignatureDataCompactGadget`
 
 *   **File:** `ups_signature_data_rs.txt`
 *   **Purpose:** Defines the precise data structure that is cryptographically signed by the user to authorize the submission of their completed User Proving Session.
@@ -135,7 +152,7 @@ These gadgets are primarily used within the circuits executed locally by users (
 
 ---
 
-### `UPSEndCapResultCompactGadget`
+## 7. `UPSEndCapResultCompactGadget`
 
 *   **File:** `ups_end_cap_result_rs.txt`
 *   **Purpose:** Defines the minimal, verifiable summary of a completed UPS, intended for submission to the GUTA layer.
@@ -148,7 +165,7 @@ These gadgets are primarily used within the circuits executed locally by users (
 
 ---
 
-### `UPSEndCapCoreGadget`
+## 8. `UPSEndCapCoreGadget`
 
 *   **File:** `ups_end_cap_rs.txt`
 *   **Purpose:** Enforces the final set of critical constraints required to validly conclude a User Proving Session, linking the final state to the user's signature authorization.
@@ -173,7 +190,7 @@ These gadgets are primarily used within the circuits executed locally by users (
 
 ---
 
-### `VerifyPreviousUPSStepProofInProofTreeGadget`
+## 9. `VerifyPreviousUPSStepProofInProofTreeGadget`
 
 *   **File:** `verify_previous_ups_step_rs.txt`
 *   **Purpose:** Essential gadget for recursion within UPS. It verifies the ZK proof generated by the immediately preceding UPS step, ensuring the chain of proofs is unbroken and follows protocol rules.
@@ -194,7 +211,7 @@ These gadgets are primarily used within the circuits executed locally by users (
 
 ---
 
-### `VerifyPreviousUPSStepProofInProofTreePartialFromCurrentGadget`
+## 10. `VerifyPreviousUPSStepProofInProofTreePartialFromCurrentGadget`
 
 *   **File:** `verify_previous_ups_step_partial_from_current_rs.txt`
 *   **Purpose:** An optimized version of the previous gadget, used when the `session_start_context` is constant within the verifying circuit (like the End Cap circuit). Reduces witness size.
@@ -209,7 +226,7 @@ These gadgets are primarily used within the circuits executed locally by users (
 
 ---
 
-### `UPSEndCapFromProofTreeGadget`
+## 11. `UPSEndCapFromProofTreeGadget`
 
 *   **File:** `ups_end_cap_tree_rs.txt`
 *   **Purpose:** Top-level gadget within the `UPSStandardEndCapCircuit`. Orchestrates the verification of the final UPS step, verification of the ZK signature, and enforcement of final session constraints.
@@ -227,7 +244,7 @@ These gadgets are primarily used within the circuits executed locally by users (
 
 ---
 
-### `UPSStartStepGadget`
+## 12. `UPSStartStepGadget`
 
 *   **File:** `ups_start_rs.txt`
 *   **Purpose:** Core logic for the `UPSStartSessionCircuit`. Verifies the user's provided initial state against the last finalized block's checkpoint data and initializes the session header.

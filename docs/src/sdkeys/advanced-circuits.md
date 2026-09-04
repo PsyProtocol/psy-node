@@ -1,8 +1,25 @@
 # Advanced Software-Defined Signatures
 
-Beyond the built-in ZK and SECP256K1 signature schemes, Psy enables truly programmable authentication through custom zero-knowledge circuits. This allows developers to implement sophisticated signing logic with transaction introspection capabilities.
+> Updated: 2026-09-04.
 
-## Extended Software-Defined Keys
+## Abstract
+
+
+This guide presents illustrative software-defined signature patterns, including transaction constraints, state proofs, nested circuits, circuit storage, and development workflows.
+
+The Psy-language and command examples in this guide are illustrative design sketches; they are not verified CLI or compiler interfaces.
+
+## Table of Contents
+
+- [1. Extended Software-Defined Keys](#1-extended-software-defined-keys)
+- [2. Matching Bot](#2-matching-bot)
+- [3. Advanced Applications](#3-advanced-applications)
+- [4. Programmable Signatures](#4-programmable-signatures)
+- [5. Implementation Patterns](#5-implementation-patterns)
+- [6. Development Workflow](#6-development-workflow)
+- [7. Planned Directions](#7-planned-directions)
+
+## 1. Extended Software-Defined Keys
 
 ### Concept
 
@@ -38,7 +55,6 @@ pub fn basic_constraint_auth(
 ```rust
 // Deploy the circuit
 let call_data = DPNSoftwareDefinedCallData {
-    contract_id: 0,
     inputs: vec![amount, param1, param2],  // amount must be < 500
 };
 ```
@@ -48,7 +64,7 @@ let call_data = DPNSoftwareDefinedCallData {
 - **Transaction Constraints**: Circuits can constrain transaction parameters
 - **Public Authorization**: Can implement publicly verifiable authorization logic
 
-## Use Case: Matching Bot
+## 2. Matching Bot
 
 ### Automated Market Making
 
@@ -129,7 +145,6 @@ let fingerprint = circuit_manager
 
 // Anyone can now trigger optimal order matching
 let call_data = DPNSoftwareDefinedCallData {
-    contract_id: ORDER_BOOK_CONTRACT_ID,
     inputs: vec![buy_order_index, sell_order_index],
 };
 ```
@@ -140,7 +155,7 @@ let call_data = DPNSoftwareDefinedCallData {
 - **Trustless Automation**: No need to trust the bot operator
 - **Optimal Execution**: Prove optimal order matching on-chain
 
-## Advanced Applications
+## 3. Advanced Applications
 
 ### 1. Permissionless Bots
 
@@ -232,15 +247,15 @@ pub fn cross_chain_collateral_auth(
 }
 ```
 
-## Ultra-Programmable Signatures
+## 4. Programmable Signatures
 
 ### Nested Circuit Architecture
 
 The ultimate evolution enables arbitrary computation within signatures:
 
-**QED Software Defined Signature (Ultra):**
+**Software-defined signature sketch:**
 
-```
+```text
 public_key_params = hash(QEDProtocol)
 fingerprint = hash(verifier_data)
 public_key = hash(public_key_params, fingerprint)
@@ -283,7 +298,7 @@ fn advanced_authorization(
 - **Nested Proofs**: Compose multiple proof systems
 - **Code Reuse**: Share and reuse authorization components
 
-## Implementation Patterns
+## 5. Implementation Patterns
 
 ### 1. Account Types
 
@@ -300,7 +315,7 @@ fn advanced_authorization(
 ### 2. Circuit Management
 
 **Off-Chain Storage**:
-```bash
+```text
 # Circuits are managed off-chain by users
 .signatures/
 ├── matching_bot.circuit
@@ -327,7 +342,7 @@ let proof = generate_signature_proof(circuit, private_inputs)?;
 - Only fingerprint is public (on-chain)
 - Zero-knowledge proofs don't reveal circuit internals
 
-## Development Workflow
+## 6. Development Workflow
 
 ### 1. Circuit Development
 
@@ -364,7 +379,7 @@ psy_user_cli call \
   --method-name transfer
 ```
 
-## Future Directions
+## 7. Planned Directions
 
 ### 1. Circuit Marketplace
 

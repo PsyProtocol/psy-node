@@ -1,8 +1,13 @@
 # Loops
 
+> Updated: 2026-09-03.
+
+## Abstract
+
+
 This chapter covers loop constructs in Psy: `while` loops and `for` loops.
 
-## While Loops
+## 1. While Loops
 
 While loops execute a block of code repeatedly as long as a condition remains true.
 
@@ -95,7 +100,7 @@ fn process_data() -> Data {
 }
 ```
 
-## For Loops
+## 2. For Loops
 
 For loops provide a way to iterate over ranges with automatic index management.
 
@@ -221,7 +226,7 @@ fn calculate_factorials() -> [Felt; 10] {
 }
 ```
 
-## Loop Patterns
+## 3. Loop Patterns
 
 ### Counting Patterns
 
@@ -349,7 +354,7 @@ fn find_first_even(arr: [Felt; 10]) -> Felt {
 }
 ```
 
-## Loop Control Notes
+## 4. Loop Control Notes
 
 ### Range Syntax
 
@@ -405,7 +410,7 @@ fn main() {
 }
 ```
 
-## Important Considerations
+## 5. Important Considerations
 
 ### Psy vs Rust Syntax Differences
 
@@ -491,7 +496,7 @@ fn invalid_loop(n: Felt) {
 }
 ```
 
-## Key Points
+## 6. Key Points
 
 1. **While loops** execute while a condition is true
 2. **For loops** iterate over fixed ranges with u32 indices

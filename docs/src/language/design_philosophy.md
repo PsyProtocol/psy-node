@@ -1,8 +1,13 @@
 # Design Philosophy
 
+> Updated: 2026-09-03.
+
+## Abstract
+
+
 Psy Smart Contract Language embodies a unique design philosophy specifically crafted for zero-knowledge proof systems. While drawing inspiration from modern languages like Jakt, Noir, Sway, and Cairo, Psy takes a fundamentally different approach optimized for circuit generation.
 
-## Core Design Principles
+## 1. Core Design Principles
 
 ### ZK-Native Architecture
 
@@ -81,7 +86,7 @@ no_execution_weight = 1 - condition;
 // Both branches computed, weighted by condition
 ```
 
-## Architectural Differences from Traditional Languages
+## 2. Architectural Differences from Traditional Languages
 
 ### Control Flow Flattening
 
@@ -220,7 +225,7 @@ fn main_inlined() {
 - **Predictable circuit size** - function calls don't add dynamic overhead
 - **Simplified analysis** - all execution paths are statically visible
 
-## Circuit-First Design Benefits
+## 3. Circuit-First Design Benefits
 
 ### Predictable Circuit Size
 
@@ -287,7 +292,7 @@ fn authenticated_hash(input_data: Hash, pub_key: [u32; 16], msg: [u64; 4], sig: 
 }
 ```
 
-## Language Design Trade-offs
+## 4. Language Design Trade-offs
 
 ### What We Gain
 - **Minimal circuit overhead**
@@ -301,7 +306,7 @@ fn authenticated_hash(input_data: Hash, pub_key: [u32; 16], msg: [u64; 4], sig: 
 - **Limited recursion** (must be bounded and unrollable)
 - **Circuit-aware programming model**
 
-## Language Syntax Design
+## 5. Language Syntax Design
 
 Psy adopts a **Rust-like syntax** that provides familiarity for developers while being optimized for ZK circuit compilation:
 
@@ -336,7 +341,7 @@ fn conditional_min(a: Felt, b: Felt) -> Felt {
 
 This familiar syntax reduces the learning curve while the compiler performs ZK-specific optimizations behind the scenes.
 
-## The Psy Innovation
+## 6. Psy Innovation
 
 Psy's unique contribution is **ZK-optimized compilation** through symbolic execution. By treating smart contract functions as mathematical transformations and compiling to DPN opcodes, we achieve:
 
@@ -347,7 +352,7 @@ Psy's unique contribution is **ZK-optimized compilation** through symbolic execu
 
 This design philosophy makes Psy particularly suitable for applications where proof generation speed and circuit size are critical, such as high-frequency DeFi operations, privacy-preserving computations, and scalable rollup systems.
 
-## Looking Forward
+## 7. Outlook
 
 As the ZK ecosystem evolves, Psy's circuit-first design positions it to take advantage of new developments in:
 - **Advanced circuit optimizations**

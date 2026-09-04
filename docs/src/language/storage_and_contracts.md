@@ -1,8 +1,13 @@
 # Storage and Contracts
 
+> Updated: 2026-09-03.
+
+## Abstract
+
+
 This chapter covers Psy's storage system and contract development, including automatic storage generation, storage references, and contract architecture.
 
-## Storage Architecture Overview
+## 1. Storage Architecture Overview
 
 Psy provides a sophisticated storage system with the following characteristics:
 
@@ -12,7 +17,7 @@ Psy provides a sophisticated storage system with the following characteristics:
 - **No Dynamic Types**: No dynamic arrays or mappings - all storage is statically sized
 - **Automatic Code Generation**: Use `#[derive(Storage, StorageRef)]` for automated storage management
 
-## On-Chain Storage Architecture
+## 2. On-Chain Storage Architecture
 
 Psy's on-chain storage follows a hierarchical tree structure that enables scalable and isolated user state management:
 
@@ -340,7 +345,7 @@ const MAX_SLOTS: u32 = 2^32;
 type StorageSlot = Hash; // [Felt; 4]
 ```
 
-## Storage Layout
+## 3. Storage Layout
 
 Storage fields are arranged sequentially in the order they appear in the struct:
 
@@ -356,7 +361,7 @@ struct ExampleContract {
 // Total storage: 8 slots (0-7)
 ```
 
-## Manual Storage Operations
+## 4. Manual Storage Operations
 
 Developers can manually manage storage slots using low-level functions:
 
@@ -455,7 +460,7 @@ impl TokenContract {
 }
 ```
 
-## Automatic Storage Generation
+## 5. Automatic Storage Generation
 
 Use `#[derive(Storage, StorageRef)]` to automatically generate storage management code:
 
@@ -614,7 +619,7 @@ impl TokenContractRef {
 }
 ```
 
-## Cross-User Storage Access
+## 6. Cross-User Storage Access
 
 Storage references can access other users' storage:
 
@@ -649,7 +654,7 @@ pub fn claim_tokens(sender: Felt) {
 }
 ```
 
-## Creating Storage Pointers
+## 7. Creating Storage Pointers
 
 Storage references are virtual pointers that can be created without loading actual data:
 
@@ -677,7 +682,7 @@ fn storage_pointer_example() {
 }
 ```
 
-## Contract Definition
+## 8. Contract Definition
 
 ### Contract Attributes
 
@@ -734,7 +739,7 @@ impl MyContractRef {
 }
 ```
 
-## Nested Structures and References
+## 9. Nested Structures and References
 
 ### Nested Structure Access
 
@@ -813,7 +818,7 @@ impl MyContractRef {
 }
 ```
 
-## Storage Size Calculation
+## 10. Storage Size Calculation
 
 ```rust
 #[test]
@@ -836,7 +841,7 @@ fn test_storage_sizes() {
 }
 ```
 
-## Storage Best Practices
+## 11. Storage Best Practices
 
 ### Layout Organization
 
@@ -857,7 +862,7 @@ pub struct WellDesignedContract {
 **Use Manual Storage When:**
 - Need precise control over slot layout
 - Implementing complex storage patterns
-- Working with legacy storage layouts
+- Working with pre-existing storage layouts
 - Optimizing for specific access patterns
 
 ```rust
@@ -887,7 +892,7 @@ pub struct CleanTokenContract {
 }
 ```
 
-## Key Points
+## 12. Key Points
 
 1. **Hierarchical Storage**: Global User Tree → User Contract State Tree → Contract Storage (2^32 slots)
 2. **User Leaf Structure**: Each user has a leaf containing public key, contract state tree root, balance, nonce, etc.

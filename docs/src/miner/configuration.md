@@ -1,31 +1,54 @@
 # Mining Configuration
 
-Configuration options and optimization settings for Psy network miners.
+> Updated: 2026-09-03.
 
-## Basic Configuration
+## Abstract
 
-### Network Configuration
+A Psy worker requires a network configuration, a wallet identity, and logging through `RUST_LOG`. Endpoint lists can contain multiple URLs for rotation and fault tolerance.
 
-Miners require a `config.json` file specifying network endpoints:
+## Table of Contents
+
+- [1. Network Configuration](#1-network-configuration)
+- [2. Wallet Configuration](#2-wallet-configuration)
+- [3. Endpoint Rotation](#3-endpoint-rotation)
+- [4. Logging](#4-logging)
+- [5. Configuration Verification](#5-configuration-verification)
+- [6. Failure Handling](#6-failure-handling)
+
+## 1. Network Configuration
+
+A localhost worker configuration uses the coordinator, realm, and prove-proxy endpoints from `psy-genesis/config.json`:
 
 ```json
 {
   "networks": {
     "localhost": {
       "users_per_realm": 1048576,
-      "global_user_tree_height": 24,
+      "global_user_tree_height": 32,
       "realm_user_tree_height": 20,
-      "group_realm_height": 2,
+      "group_realm_height": 1,
       "coordinator_configs": [
-        {"id": 0, "rpc_url": ["http://127.0.0.1:8545"]}
+        {"id": 0, "rpc_url": ["http://127.0.0.1:1337"]}
       ],
       "realm_configs": [
-        {"id": 0, "rpc_url": ["http://127.0.0.1:8546"]},
-        {"id": 1, "rpc_url": ["http://127.0.0.1:8547"]}
+        {
+          "id": 0,
+          "rpc_url": [
+            "http://127.0.0.1:13380",
+            "http://127.0.0.1:13381"
+          ]
+        },
+        {
+          "id": 1,
+          "rpc_url": [
+            "http://127.0.0.1:13390",
+            "http://127.0.0.1:13391"
+          ]
+        }
       ],
       "prove_proxy_url": ["http://127.0.0.1:9999"],
       "fees": {
-        "guta_fee": 5000000000
+        "guta_fee": 1000000000
       }
     }
   },
@@ -33,81 +56,46 @@ Miners require a `config.json` file specifying network endpoints:
 }
 ```
 
-### Wallet Configuration
+The values are defined in `psy-genesis/config.json:3-60`. The public testing deployment is suspended; select localhost unless another active deployment is explicitly required.
 
-Miners require a keystore file for identity and reward collection:
+## 2. Wallet Configuration
+
+Create an encrypted wallet:
 
 ```bash
-# Create new wallet
-qed_user_cli wallet create --output miner_wallet
+psy_user_cli wallet create --output miner_wallet
+```
 
-# Or use existing private key
-psy_node_cli worker \
+Start a worker with the wallet keystore:
+
+```bash
+psy_worker_cli worker \
   --config ./config.json \
-  --private-key 0x1234567890abcdef... \
-  --recipient 3145728
+  --keystore-path ./miner_wallet.json \
+  --user 3145728
 ```
 
+A private key can be supplied directly:
 
-## Network-Specific Configuration
-
-### Local Development
-
-```json
-{
-  "networks": {
-    "localhost": {
-      "coordinator_configs": [{"id": 0, "rpc_url": ["http://127.0.0.1:8545"]}],
-      "realm_configs": [
-        {"id": 0, "rpc_url": ["http://127.0.0.1:8546"]},
-        {"id": 1, "rpc_url": ["http://127.0.0.1:8547"]}
-      ],
-      "prove_proxy_url": ["http://127.0.0.1:9999"]
-    }
-  }
-}
+```bash
+psy_worker_cli worker \
+  --config ./config.json \
+  --private-key YOUR_PRIVATE_KEY \
+  --user 3145728
 ```
 
-### Testnet Configuration
+## 3. Endpoint Rotation
 
-```json
-{
-  "network": {
-    "users_per_realm": 1048576,
-    "global_user_tree_height": 24,
-    "realm_user_tree_height": 20,
-    "group_realm_height": 1,
-    "coordinator_configs": [
-      {"id": 0, "rpc_url": ["https://regnet-coordinator.psy-protocol.xyz"]}
-    ],
-    "realm_configs": [
-      {"id": 0, "rpc_url": ["https://regnet-realm0.psy-protocol.xyz"]},
-      {"id": 1, "rpc_url": ["https://regnet-realm1.psy-protocol.xyz"]}
-    ],
-    "prove_proxy_url": ["https://regnet-prover.psy-protocol.xyz"],
-    "native_currency": "tPSY",
-    "fees": {
-      "guta_fee": 5000000000
-    }
-  }
-}
-```
-
-## Advanced Configuration
-
-### Load Balancing
-
-Configure multiple endpoints for fault tolerance:
+Each coordinator or realm configuration accepts multiple remote procedure call URLs. Keep every URL in one list on the same network:
 
 ```json
 {
   "coordinator_configs": [
     {
-      "id": 0, 
+      "id": 0,
       "rpc_url": [
-        "https://coordinator1.psy-protocol.xyz",
-        "https://coordinator2.psy-protocol.xyz",
-        "https://coordinator3.psy-protocol.xyz"
+        "https://coordinator-a.example",
+        "https://coordinator-b.example"
       ]
     }
   ],
@@ -115,90 +103,49 @@ Configure multiple endpoints for fault tolerance:
     {
       "id": 0,
       "rpc_url": [
-        "https://realm0-1.psy-protocol.xyz",
-        "https://realm0-2.psy-protocol.xyz"
+        "https://realm-0-a.example",
+        "https://realm-0-b.example"
       ]
     }
   ]
 }
 ```
 
+The worker also accepts repeated `--coordinator-api-url` and `--realm-api-url` inputs and a `--url-rotation-strategy` (`psy_cli/psy_worker_cli/src/subcommand.rs:46-56`).
 
+## 4. Logging
 
-## Monitoring Configuration
-
-### Logging Setup
-
-```bash
-# Structured logging
-export RUST_LOG=psy_node=info,psy_prover=debug,psy_worker=trace
-export PSY_LOG_FORMAT=json
-export PSY_LOG_FILE=./logs/miner.log
-```
-
-### Metrics Configuration
+Configure structured Rust logging through `RUST_LOG`:
 
 ```bash
-# Prometheus metrics
-export PSY_METRICS_ENABLED=true
-export PSY_METRICS_PORT=9090
-export PSY_METRICS_PATH=/metrics
-
-# Performance tracking
-export PSY_TRACK_PROOF_TIMES=true
-export PSY_TRACK_MEMORY_USAGE=true
-export PSY_TRACK_JOB_SUCCESS_RATE=true
+export RUST_LOG=psy_worker=info
 ```
 
+The current binaries do not define `PSY_METRICS_*`, `PSY_LOG_FORMAT`, `PSY_LOG_FILE`, or `PSY_TRACK_*` environment variables.
 
-### Docker Configuration
+Back up keystores and configuration regularly, keep configuration synchronized with network changes, monitor proof times and success rates, and use encrypted keystores with secure network connections.
 
-```yaml
-# docker-compose.yml for miners
-version: '3.8'
-services:
-  psy-miner:
-    image: psy-miner:latest
-    environment:
-      - RUST_LOG=info
-    volumes:
-      - ./config.json:/app/config.json
-      - ./wallets:/app/wallets
-    resources:
-      limits:
-        memory: 16G
-        cpus: '8'
-      reservations:
-        memory: 8G
-        cpus: '4'
-```
-
-## Configuration Validation
-
-### Validate Configuration
+## 5. Configuration Verification
 
 ```bash
 # Test network connectivity
-psy_user_cli get-latest-block-state
+psy_user_cli get-latest-block-state --rpc-config ./config.json
 
 # Test wallet access
 psy_user_cli wallet info --keystore-path ./miner_wallet.json
 ```
 
-### Common Configuration Issues
+Verify these invariants:
 
-**Invalid endpoints**: Ensure URLs are accessible and use correct protocols (http/https).
+1. `defaultNetwork` exists under `networks`.
+2. Coordinator and realm URLs belong to the same network.
+3. The wallet opens successfully before starting long-running work.
+4. The worker user identifier receives mining rewards for the intended identity.
+5. The completed-job backup path is writable when reward claims are required.
 
-**Keystore permissions**: Verify wallet files have appropriate read permissions.
+## 6. Failure Handling
 
-**Network mismatch**: Ensure all endpoints belong to the same network environment.
-
-**Resource constraints**: Monitor system resources to prevent memory/CPU exhaustion.
-
-## Best Practices
-
-1. **Separate configs per environment**: Use different config files for development, testnet, and mainnet
-2. **Regular backups**: Backup keystore files and configuration regularly
-3. **Monitor performance**: Track proof generation times and success rates
-4. **Update regularly**: Keep configuration in sync with network updates
-5. **Security first**: Use encrypted keystores and secure network connections
+- **Invalid endpoint:** confirm the URL scheme, host, port, and selected network.
+- **Keystore error:** confirm file permissions and supply the correct wallet password when required.
+- **Network mismatch:** replace the complete endpoint set rather than mixing deployments.
+- **Resource exhaustion:** reduce `--batch-size` or provide more memory and CPU capacity.

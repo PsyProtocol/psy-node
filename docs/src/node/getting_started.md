@@ -1,180 +1,188 @@
 # Getting Started
 
-This guide walks you through starting a complete Psy network locally for development and testing.
+> Updated: 2026-09-03.
 
-For the current supported service lifecycle, read [Devnet Startup, Shutdown, Restart, and Rollback](./devnet_lifecycle.md) before running any command. The lifecycle guide supersedes the manual startup and cleanup examples below.
+## Abstract
 
-## Prerequisites
+This guide starts a complete Psy network for local development. Use the automated lifecycle for normal operation; the manual commands describe the node components and their required runtime flags.
 
-1. Complete installation as described in [Installation](./installation.md)
-2. Ensure `config.json` is properly configured
-3. Have Docker and Docker Compose installed
+Before running any startup, shutdown, restart, or rollback command, read [Devnet Startup, Shutdown, Restart, and Rollback](./devnet_lifecycle.md) and [Devnet Launcher Reference](./devnet-launcher-reference.md).
 
-## Quick Start
+## Table of Contents
 
-For convenience, you can use the automated script:
+- [1. Prerequisites](#1-prerequisites)
+- [2. Automated Startup](#2-automated-startup)
+- [3. Required Components](#3-required-components)
+- [4. Manual Node Startup](#4-manual-node-startup)
+- [5. Endpoint Configuration](#5-endpoint-configuration)
+- [6. Startup Order](#6-startup-order)
+- [7. Verification](#7-verification)
+- [8. Shutdown](#8-shutdown)
+- [9. Implemented Network Capabilities](#9-implemented-network-capabilities)
+- [10. Operating Tasks](#10-operating-tasks)
+- [11. Failure Handling](#11-failure-handling)
+
+## 1. Prerequisites
+
+1. Complete [Installation](./installation.md).
+2. Confirm `psy-genesis/config.json` contains the intended localhost configuration.
+3. Install Docker and Docker Compose.
+4. Follow the lifecycle preflight before starting the network.
+
+## 2. Automated Startup
+
+Run the supported launcher from `<repo-root>`:
 
 ```bash
 make run-all
 ```
 
-This handles initialization and starts all components automatically.
+The launcher starts the configured database, coordinator, realms, workers, proving services, layer-one services, relayer, and selected application surfaces. The target is defined in `Makefile:60-66`.
 
-## Required Components
+## 3. Required Components
 
-A complete Psy network requires these core components:
+### 3.1 Infrastructure
 
-### 1. Infrastructure Services
-- **Redis**: Message queuing between edge and processor
-- **Database**: ScyllaDB/LMDBX/TiKV for state storage
-- **PostgreSQL**: For API services and data indexing
+- ScyllaDB stores persistent node state.
+- Redis carries temporary state and queue data.
+- NATS JetStream carries node messages.
+- PostgreSQL belongs to the external `psy-services` repository when that service is enabled.
 
-### 2. Coordinator Services
-- **Coordinator Processor**: Manages global state and contract tree
-- **Coordinator Edge**: RPC endpoint for coordinator operations
+### 3.2 Coordinator
 
-### 3. Realm Services
-- **Realm Processor**: Processes user transactions and state
-- **Realm Edge**: RPC endpoints for user interactions
-- **Multiple Realms**: Support for horizontal scaling (realm0, realm1, realm2, realm3)
+- The coordinator processor manages global state and contract data.
+- The coordinator edge exposes the coordinator remote procedure call endpoint.
 
-### 4. Supporting Services
-- **Workers**: Generate ZK proofs for submitted jobs
-- **API Services**: Block explorer and data APIs
-- **Watcher**: Monitors and indexes blockchain data
-- **Prove Proxy**: Assists users with local proof generation
+### 3.3 Realms
 
-## Manual Service Startup
+- Each realm processor handles realm state transitions.
+- Each realm edge exposes user-facing remote procedure calls.
+- Multiple realms provide horizontal scaling.
 
-### Step 1: Initialize Infrastructure
+### 3.4 Supporting services
 
-Start required databases and create directories:
+- Workers generate zero-knowledge proofs.
+- The prove proxy assists user proof generation.
+- API and indexer processes are supplied by the external `psy-services` repository.
+
+## 4. Manual Node Startup
+
+The lifecycle launcher is the supported supervisor. Use these component commands only when a targeted manual run is required.
+
+### 4.1 Start infrastructure
 
 ```bash
-# Create data directories
-mkdir -p ./db/coordinator ./db/realm0 ./db/realm1 ./db/realm2 ./db/realm3
-
-# Start Redis containers
-docker-compose -f ./scripts/docker-compose.db.yml up -d
-
-# Initialize PostgreSQL for API services
-cd ./psy_services
-export DATABASE_URL="postgres://postgres:password@localhost/postgres"
-cargo sqlx database create
-cargo sqlx migrate run
-cd ..
+bash dev/start_db.sh
 ```
 
-### Step 2: Start Coordinator
+The script starts Redis-compatible storage, NATS JetStream, and ScyllaDB. The launcher waits for ports 6379, 4222, and 9042 (`dev/locSetupV4.ts:3876-3878`).
+
+### 4.2 Start the coordinator
 
 ```bash
-# Start coordinator processor (manages global state)
-RUST_LOG=info psy_node_cli coordinator-processor \
-  --database lmdbx \
-  --lmdbx-path ./db/coordinator \
-  --queue-biz-key coordinator
+RUST_LOG=info psy_node_cli start-coordinator-processor \
+  --scylla-db-url 127.0.0.1:9042 \
+  --nats-jetstream-url nats://127.0.0.1:4222 \
+  --redis-url redis://127.0.0.1:6379 \
+  --db-namespace coordinator
 
-# Start coordinator edge (RPC interface) 
-RUST_LOG=info psy_node_cli coordinator-edge \
-  --database lmdbx \
-  --lmdbx-path ./db/coordinator \
-  --queue-biz-key coordinator
+RUST_LOG=info psy_node_cli start-coordinator-edge \
+  --scylla-db-url 127.0.0.1:9042 \
+  --nats-jetstream-url nats://127.0.0.1:4222 \
+  --redis-url redis://127.0.0.1:6379 \
+  --db-namespace coordinator \
+  --listen 0.0.0.0 \
+  --port 1337
 ```
 
-### Step 3: Start Realms
+The coordinator flags are defined in `psy_cli/psy_node_cli/src/subcommand.rs:158-240`.
+
+### 4.3 Start realm 0
 
 ```bash
-# Start realm0 processor
-RUST_LOG=info psy_node_cli realm-processor \
-  --redis-uri redis://127.0.0.1:6379 \
-  --database lmdbx \
-  --lmdbx-path ./db/realm0 \
-  --queue-biz-key realm0
+RUST_LOG=info psy_node_cli start-realm-processor \
+  --scylla-db-url 127.0.0.1:9042 \
+  --nats-jetstream-url nats://127.0.0.1:4222 \
+  --redis-url redis://127.0.0.1:6379 \
+  --db-namespace realm0 \
+  --realm-id 0 \
+  --coordinator-api-urls http://127.0.0.1:1337
 
-# Start realm0 edge (port 8546)
-RUST_LOG=info psy_node_cli realm-edge \
-  --redis-uri redis://127.0.0.1:6379 \
-  --database lmdbx \
-  --lmdbx-path ./db/realm0 \
-  --queue-biz-key realm0
+RUST_LOG=info psy_node_cli start-realm-edge \
+  --scylla-db-url 127.0.0.1:9042 \
+  --nats-jetstream-url nats://127.0.0.1:4222 \
+  --redis-url redis://127.0.0.1:6379 \
+  --db-namespace realm0 \
+  --realm-id 0 \
+  --listen 0.0.0.0 \
+  --port 13380
+```
 
-# Start realm1 processor
-RUST_LOG=info psy_node_cli realm-processor \
-  --redis-uri redis://127.0.0.1:6379 \
-  --database lmdbx \
-  --lmdbx-path ./db/realm1 \
+### 4.4 Start realm 1
+
+```bash
+RUST_LOG=info psy_node_cli start-realm-processor \
+  --scylla-db-url 127.0.0.1:9042 \
+  --nats-jetstream-url nats://127.0.0.1:4222 \
+  --redis-url redis://127.0.0.1:6379 \
+  --db-namespace realm1 \
   --realm-id 1 \
-  --queue-biz-key realm1
+  --coordinator-api-urls http://127.0.0.1:1337
 
-# Start realm1 edge (port 8547)
-RUST_LOG=info psy_node_cli realm-edge \
-  --listen-addr 0.0.0.0:8547 \
-  --redis-uri redis://127.0.0.1:6379 \
-  --database lmdbx \
-  --lmdbx-path ./db/realm1 \
-  --coordinator-addr http://127.0.0.1:8545 \
+RUST_LOG=info psy_node_cli start-realm-edge \
+  --scylla-db-url 127.0.0.1:9042 \
+  --nats-jetstream-url nats://127.0.0.1:4222 \
+  --redis-url redis://127.0.0.1:6379 \
+  --db-namespace realm1 \
   --realm-id 1 \
-  --queue-biz-key realm1
+  --listen 0.0.0.0 \
+  --port 13390
 ```
 
-### Step 4: Start Workers and Services
+Realm processor and edge flags are defined in `psy_cli/psy_node_cli/src/subcommand.rs:18-157`.
+
+### 4.5 Start workers and the prove proxy
 
 ```bash
-# Start proof workers
-RUST_LOG=info psy_node_cli worker \
+RUST_LOG=info psy_worker_cli worker \
   --config ./config.json \
   --keystore-path .wallets/miner0.json \
-  --recipient 3145728
+  --user 3145728
 
-RUST_LOG=info psy_node_cli worker \
+RUST_LOG=info psy_worker_cli worker \
   --config ./config.json \
   --keystore-path .wallets/miner1.json \
-  --recipient 1024
+  --user 1024
 
-# Start API services
-RUST_LOG=info psy_node_cli api-services
-
-# Start watchers
-RUST_LOG=info psy_node_cli watcher \
-  --node-id 0 \
-  --node-type coordinator \
-  --redis-uri redis://127.0.0.1:6379 \
-  --api-endpoint http://localhost:3000 \
-  --database lmdbx \
-  --lmdbx-path ./db/coordinator \
-  --queue-biz-key coordinator
-
-RUST_LOG=info psy_node_cli watcher \
-  --node-id 0 \
-  --node-type realm \
-  --redis-uri redis://127.0.0.1:6379 \
-  --api-endpoint http://localhost:3000 \
-  --database lmdbx \
-  --lmdbx-path ./db/realm0 \
-  --queue-biz-key realm0
-
-# Start prove proxy
 RUST_LOG=info psy_user_cli prove-proxy
 ```
 
-## Configuration Requirements
+## 5. Endpoint Configuration
 
-### config.json Setup
-
-Ensure your `config.json` contains proper endpoint configurations:
+The localhost endpoint configuration is:
 
 ```json
 {
   "networks": {
     "localhost": {
       "coordinator_configs": [
-        {"id": 0, "rpc_url": ["http://127.0.0.1:8545"]}
+        {"id": 0, "rpc_url": ["http://127.0.0.1:1337"]}
       ],
       "realm_configs": [
-        {"id": 0, "rpc_url": ["http://127.0.0.1:8546"]},
-        {"id": 1, "rpc_url": ["http://127.0.0.1:8547"]},
-        {"id": 2, "rpc_url": ["http://127.0.0.1:8548"]},
-        {"id": 3, "rpc_url": ["http://127.0.0.1:8549"]}
+        {
+          "id": 0,
+          "rpc_url": [
+            "http://127.0.0.1:13380",
+            "http://127.0.0.1:13381"
+          ]
+        },
+        {
+          "id": 1,
+          "rpc_url": [
+            "http://127.0.0.1:13390",
+            "http://127.0.0.1:13391"
+          ]
+        }
       ],
       "prove_proxy_url": ["http://127.0.0.1:9999"],
       "api_services_url": ["http://127.0.0.1:3000"]
@@ -183,91 +191,66 @@ Ensure your `config.json` contains proper endpoint configurations:
 }
 ```
 
-## Service Dependencies
+These endpoint values are defined in `psy-genesis/config.json:9-41`.
 
-Services must start in the correct order:
+## 6. Startup Order
 
-1. **Infrastructure** (Redis, databases)
-2. **Coordinator** (processor, then edge)
-3. **Realms** (processors, then edges)
-4. **Workers** (depend on edges for job discovery)
-5. **API Services** (depend on watchers for data)
-6. **Watchers** (depend on edges for data access)
+1. Start Redis, NATS JetStream, and ScyllaDB.
+2. Start the coordinator processor.
+3. Start the coordinator edge.
+4. Start realm processors.
+5. Start realm edges.
+6. Start workers and proving services.
+7. Start external API and indexer services when required.
 
-## Verification
-
-Check that services are running:
+## 7. Verification
 
 ```bash
-# Check coordinator
-curl -X POST http://127.0.0.1:8545 \
+# Query the coordinator
+curl -X POST http://127.0.0.1:1337 \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","method":"psy_latest_checkpoint","params":[],"id":1}'
 
-# Check realm0
-curl -X POST http://127.0.0.1:8546 \
+# Query realm 0
+curl -X POST http://127.0.0.1:13380 \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","method":"psy_latest_checkpoint","params":[],"id":1}'
 
-# Check API services
+# Query API services when enabled
 curl http://127.0.0.1:3000/health
 ```
 
-## Cleanup
+HTTP admission alone is not end-to-end acceptance. Follow the lifecycle guide for the required state-transition checks.
 
-Stop all services and clean up:
+## 8. Shutdown
+
+Stop the supervised stack without deleting state:
 
 ```bash
-# Stop Docker containers
-docker-compose -f ./scripts/docker-compose.db.yml down -v
-
-# Remove data directories
-rm -rf ./db logs
+make shutdown
 ```
 
-## Next Steps
+The shutdown target invokes the launcher teardown path (`Makefile:102-103`). Do not remove data directories manually.
 
-Once your network is running:
+## 9. Implemented Network Capabilities
 
-1. Register users: See [User CLI documentation](../rpc/UserCli.md)
-2. Deploy contracts: Use `psy_user_cli deploy-contract`
-3. Submit transactions: Use `psy_user_cli call`
-4. Monitor activity: Check logs in `./logs/` directory
+- Peer-to-peer realm proposal and validator communication are implemented through the node peer-to-peer flags.
+- Realm proposal voting and certification are implemented; see [Realm Peer-to-Peer Validators](./realm-p2p-validators.md).
+- Cross-chain bridge processing is implemented by the relayer and bridge components.
+- Runtime node storage uses ScyllaDB with Redis and NATS JetStream; the accepted flags are `--scylla-db-url`, `--redis-url`, and `--nats-jetstream-url` (`psy_cli/psy_node_cli/src/subcommand.rs:24-34,95-105,163-173,201-211`).
 
-## Storage Options
+## 10. Operating Tasks
 
-The default setup uses LMDBX for storage. For other options:
+- Register users with `psy_user_cli register-user`.
+- Deploy contracts with `psy_user_cli deploy-contract`.
+- Submit transactions with `psy_user_cli call`.
+- Monitor activity under `./logs/`.
+- Storage backend optimization continues without changing the accepted runtime flags listed in Section 9.
 
-### TiKV Setup
+## 11. Failure Handling
 
-Replace `--database lmdbx` with:
-```bash
---database tikv \
---tikv-pd-endpoints 127.0.0.1:2379 \
---tikv-namespace coordinator  # or realm0, realm1, etc.
-```
-
-### ScyllaDB Setup
-
-Replace `--database lmdbx` with:
-```bash
---database scylla \
---scylla-endpoints 127.0.0.1:9042
-```
-
-## Troubleshooting
-
-**Services won't start**: Check that config.json is valid and all required ports are available.
-
-**Workers not processing jobs**: Ensure workers have valid keystore files in `.wallets/` directory.
-
-**Database connection errors**: Verify Docker containers are running with `docker ps`.
-
-## Future Features
-
-Several components are currently under development:
-
-- **P2P Networking**: Peer-to-peer communication between nodes (in development)
-- **Consensus Mechanism**: Byzantine fault tolerance for production networks (in development)
-- **Advanced Storage**: Enhanced storage backends and optimization (in development)
-- **Cross-chain Bridges**: Integration with other blockchain networks (planned)
+- **A service does not start:** confirm the selected ports are free and inspect the supervised service log.
+- **A realm processor rejects startup:** provide at least one `--coordinator-api-urls` value.
+- **A worker receives no jobs:** confirm its keystore, user identifier, and configured coordinator and realm endpoints.
+- **A database connection fails:** confirm the infrastructure script is still running and ports 6379, 4222, and 9042 are reachable.
+- **A restart or rollback is required:** stop and resume only through the lifecycle procedures.

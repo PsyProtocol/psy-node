@@ -1,7 +1,22 @@
 # Coordinator Gadgets
 
-These gadgets are components used within circuits run by the Coordinator nodes.
-### `BatchAppendUserRegistrationTreeGadget`
+> Updated: 2026-09-03.
+
+## Abstract
+
+This document describes the gadgets used by Coordinator circuits to batch registration and deployment updates, combine aggregation proofs, and update the Checkpoint Tree.
+
+## Table of Contents
+
+- [1. Batch Append User Registration Tree Gadget](#1-batchappenduserregistrationtreegadget)
+- [2. Batch Deploy Contracts Gadget](#2-batchdeploycontractsgadget)
+- [3. Combined Header Gadget](#3-verifyagguserregistartiondeploycontractsgutaheadergadget)
+- [4. Combined Verification Gadget](#4-verifyagguserregistartiondeploycontractsgutagadget)
+- [5. State Delta Result Gadget](#5-psypart1statedeltaresultgadget)
+- [6. Child Proof Gadget](#6-checkpointstatetransitionchildproofsgadget)
+- [7. State Transition Core Gadget](#7-checkpointstatetransitioncoregadget)
+
+## 1. `BatchAppendUserRegistrationTreeGadget`
 
 *   **File:** `append_user_registration_tree.rs` (Gadget definition)
 *   **Purpose:** Aggregates multiple "Spiderman" append proofs sequentially for the User Registration Tree (`URT`). Handles padding for a fixed maximum number of sub-tree appends.
@@ -18,7 +33,7 @@ These gadgets are components used within circuits run by the Coordinator nodes.
 *   **Assumptions:** Assumes witness `SpidermanUpdateProof` array is valid initially (constraints verify internal consistency). Assumes `old_root` of the first gadget matches the tree state before this operation.
 *   **Role:** Allows efficient batching of user registration appends into a single ZK proof step for the Coordinator.
 
-### `BatchDeployContractsGadget`
+## 2. `BatchDeployContractsGadget`
 
 *   **File:** `deploy_contract.rs` (Gadget definition)
 *   **Purpose:** Handles the proof logic for appending a batch of new contracts to the Global Contract Tree (`GCON`). Verifies one Spiderman append proof and ensures the provided contract leaf data matches the appended hashes.
@@ -38,7 +53,7 @@ These gadgets are components used within circuits run by the Coordinator nodes.
 *   **Assumptions:** Assumes witness `SpidermanUpdateProof` and `PsyContractLeaf` array are valid initially. Assumes `old_root` of the Spiderman gadget matches the `GCON` state before this operation.
 *   **Role:** Securely proves the batch addition of new contracts to the global contract tree, verifying consistency between the state update and the provided contract metadata.
 
-### `VerifyAggUserRegistartionDeployContractsGUTAHeaderGadget`
+## 3. `VerifyAggUserRegistartionDeployContractsGUTAHeaderGadget`
 
 *   **File:** `verify_agg_user_registration_deploy_guta.rs`
 *   **Purpose:** Represents the combined state transitions resulting from aggregating User Registrations, Contract Deployments, and GUTA proofs. Acts as the core data structure within the Part 1 Aggregation circuit.
@@ -52,7 +67,7 @@ These gadgets are components used within circuits run by the Coordinator nodes.
 *   **Assumptions:** Assumes the input transition/header gadgets are correctly derived from verified proofs.
 *   **Role:** Standardizes the output structure of the Part 1 aggregation step, providing a single hash commitment for verification by the final block circuit.
 
-### `VerifyAggUserRegistartionDeployContractsGUTAGadget`
+## 4. `VerifyAggUserRegistartionDeployContractsGUTAGadget`
 
 *   **File:** `verify_agg_user_registration_deploy_guta.rs`
 *   **Purpose:** The core gadget within the Part 1 Aggregation circuit. Verifies the aggregated proofs for User Registrations, Contract Deployments, and GUTA, ensuring they are valid, used whitelisted circuits, and reference the same checkpoint state.
@@ -72,7 +87,7 @@ These gadgets are components used within circuits run by the Coordinator nodes.
 *   **Assumptions:** Assumes witness proofs, headers, and verifier data are valid initially. Assumes input configuration (common data, fingerprint configs, whitelist root) is correct.
 *   **Role:** Securely combines the results of the three major parallel state update processes (User Reg, Deploy Contract, GUTA) into a single verifiable unit, discharging assumptions about their individual validity and circuit usage.
 
-### `PsyPart1StateDeltaResultGadget`
+## 5. `PsyPart1StateDeltaResultGadget`
 
 *   **File:** `checkpoint_state_transition_proofs.rs`
 *   **Purpose:** Takes the verified combined header from the Part 1 aggregation (`VerifyAggUserRegistartionDeployContractsGUTAHeaderGadget`) and combines it with previous block stats and new block info (time, randomness) to calculate the *new* Checkpoint Leaf state.
@@ -94,7 +109,7 @@ These gadgets are components used within circuits run by the Coordinator nodes.
 *   **Assumptions:** Assumes `part_1_header` is correctly verified. Assumes `old_stats`, `block_time`, `final_random_seed_contribution` witnesses are correct.
 *   **Role:** Calculates the state transition specifically for the Checkpoint Leaf data based on the aggregated results from the rest of the block's activities.
 
-### `CheckpointStateTransitionChildProofsGadget`
+## 6. `CheckpointStateTransitionChildProofsGadget`
 
 *   **File:** `checkpoint_state_transition_proofs.rs`
 *   **Purpose:** Verifies the "Part 1" aggregation proof within the final block circuit and instantiates the gadget (`PsyPart1StateDeltaResultGadget`) that calculates the Checkpoint Leaf transition.
@@ -113,7 +128,7 @@ These gadgets are components used within circuits run by the Coordinator nodes.
 *   **Assumptions:** Assumes witness proofs, verifier data, and state delta inputs are correct initially. Assumes `known_part_1_fingerprint` constant is correct.
 *   **Role:** Securely incorporates the aggregated result of UserReg/Deploy/GUTA processing (the Part 1 proof) into the final block transition calculation.
 
-### `CheckpointStateTransitionCoreGadget`
+## 7. `CheckpointStateTransitionCoreGadget`
 
 *   **File:** `checkpoint_state_transition.rs`
 *   **Purpose:** Handles the core Merkle proof logic for updating the Checkpoint Tree (`CHKP`) itself. Verifies the append operation for the new checkpoint leaf and its consistency with the previous checkpoint leaf.

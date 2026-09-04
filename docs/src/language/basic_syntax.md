@@ -1,8 +1,13 @@
 # Basic Syntax
 
+> Updated: 2026-09-03.
+
+## Abstract
+
+
 [Psy Smart Contract Language] uses a syntax inspired by [Rust]. Here are the basics:
 
-## Variables
+## 1. Variables
 
 Variables are declared with `let` and can be mutable with `mut`:
 
@@ -89,7 +94,7 @@ container.data[0] = 99;
 container.coords.1 = 30;
 ```
 
-## Comments
+## 2. Comments
 
 Psy supports both single-line and multi-line comments:
 

@@ -1,8 +1,24 @@
 # Built-in Signature Schemes
 
-Psy provides two built-in signature schemes that serve different use cases and performance requirements.
+> Updated: 2026-09-04.
 
-## ZK Key Signature
+## Abstract
+
+
+This guide compares the ZK and SECP256K1 signature types, their authorization models, and the commands used to register wallets with each type.
+
+## Table of Contents
+
+- [1. ZK Key Signature](#1-zk-key-signature)
+- [2. SECP256K1 Signature](#2-secp256k1-signature)
+- [3. Comparison](#3-comparison)
+- [4. Choosing a Signature Type](#4-choosing-a-signature-type)
+- [5. Performance Benchmarks](#5-performance-benchmarks)
+- [6. Changing Signature Type](#6-changing-signature-type)
+- [7. Operational Guidance](#7-operational-guidance)
+- [8. Support Direction](#8-support-direction)
+
+## 1. ZK Key Signature
 
 The ZK signature scheme is Psy's optimized zero-knowledge signature system.
 
@@ -12,11 +28,11 @@ The ZK signature scheme is Psy's optimized zero-knowledge signature system.
 - **Proof Generation Time**: 2-5 seconds
 - **Circuit Optimization**: Highly optimized for fast proving
 - **Security Model**: Zero-knowledge proof of secret knowledge
-- **Quantum Resistance**: Designed with post-quantum considerations
+- **Security Basis**: Proof of knowledge of the registered secret; security depends on the underlying proving system assumptions
 
 ### When to Use ZK Keys
 
-✅ **Recommended for:**
+**Use for:**
 - General-purpose transaction signing
 - High-frequency trading applications  
 - Real-time user interactions
@@ -25,9 +41,9 @@ The ZK signature scheme is Psy's optimized zero-knowledge signature system.
 
 ### Technical Details
 
-**QED ZK Signature Scheme:**
+**ZK signature scheme:**
 
-```
+```text
 public_key_params = hash(private_key, private_key_constants)
 fingerprint = hash(verifier_data)
 public_key = hash(public_key_params, fingerprint)
@@ -41,10 +57,10 @@ private_inputs = private_key
 **Key Features:**
 - **Custom Signature Logic**: Supports transaction introspection and custom constraints
 - **ECDSA Compatibility**: Can integrate with existing ECDSA infrastructure
-- **Quantum Resistance**: Designed to be resistant to quantum computing attacks
+- **Well-Studied Curve**: secp256k1 semantics identical to Ethereum tooling
 - **Optimized Circuit**: Minimal constraint count for fast proving (~2-5 seconds)
 
-## SECP256K1 Signature
+## 2. SECP256K1 Signature
 
 The SECP256K1 scheme provides compatibility with existing elliptic curve tooling through zero-knowledge proofs.
 
@@ -58,9 +74,9 @@ The SECP256K1 scheme provides compatibility with existing elliptic curve tooling
 
 ### Technical Details
 
-**QED Software Defined Signature (SECP256K1):**
+**SECP256K1 signature scheme:**
 
-```
+```text
 public_key_hash = hash(secp256k1_public_key)
 public_key_params = public_key_hash
 fingerprint = hash(verifier_data)
@@ -79,14 +95,14 @@ private_inputs = secp256k1_public_key, secp256k1_signature, sig_action_hash_prei
 - **ECDSA Verification**: Implements SECP256K1 signature verification in ZK circuit
 - **Public Key Validation**: Proves knowledge of private key without revealing it  
 - **Higher Complexity**: More constraints result in longer proving times
-- **Backward Compatibility**: Enables migration from traditional ECDSA systems
+- **Tool Compatibility**: Enables use with ECDSA systems
 
 ### When to Use SECP256K1
 
-⚠️ **Use only when:**
+**Use when:**
 - Migrating from existing ECDSA-based systems
 - Requiring compatibility with external tools
-- Working with legacy applications
+- Working with ECDSA applications
 - Development and testing scenarios
 
 ### Performance Impact
@@ -97,21 +113,21 @@ The longer proof generation time of SECP256K1 makes it less suitable for:
 - Mobile applications with limited computational resources
 - Real-time trading platforms
 
-## Comparison Table
+## 3. Comparison
 
-| Feature | ZK Key | SECP256K1 |
-|---------|--------|-----------|
-| **Proof Time** | 2-5 seconds | 10-20 seconds |
-| **Performance** | ⭐⭐⭐⭐⭐ | ⭐⭐ |
-| **Security** | High (ZK-based) | Standard (EC-based) |
-| **Circuit Size** | Optimized | Complex |
-| **Quantum Resistance** | Better prepared | Vulnerable |
-| **Tool Compatibility** | Psy native | ECDSA compatible |
-| **Use Case** | 🎯 Primary | 🔧 Compatibility |
+| Feature                | ZK Key          | SECP256K1             |
+|------------------------|-----------------|-----------------------|
+| **Proof Time**         | 2-5 seconds     | 10-20 seconds         |
+| **Performance**        | Faster          | Slower                |
+| **Security**           | ZK-based        | Elliptic-curve-based  |
+| **Circuit Size**       | Optimized       | Complex               |
+| **Quantum Resistance** | Better prepared | Vulnerable            |
+| **Tool Compatibility** | Psy native      | ECDSA compatible      |
+| **Use Case**           | Primary         | Compatibility         |
 
-## Choosing the Right Scheme
+## 4. Choosing a Signature Type
 
-### Default Choice: ZK Key
+### ZK Key
 
 For most applications, **ZK key (`zk`)** is the recommended choice because:
 
@@ -132,7 +148,7 @@ Consider SECP256K1 only if you have specific requirements for:
 - Migration scenarios from traditional blockchain systems
 - Development environments requiring ECDSA tooling
 
-## Performance Benchmarks
+## 5. Performance Benchmarks
 
 ### Proof Generation Times
 
@@ -160,9 +176,9 @@ Based on standard hardware configurations:
 - CPU utilization: Intensive
 - Battery impact: Significant (mobile)
 
-## Migration Considerations
+## 6. Changing Signature Type
 
-### Upgrading from SECP256K1 to ZK
+### Changing from SECP256K1 to ZK
 
 If you're currently using SECP256K1 and want to upgrade:
 
@@ -178,7 +194,7 @@ Both signature schemes can coexist in the same application:
 - Applications can support both simultaneously
 - Gradual migration strategies are supported
 
-## Best Practices
+## 7. Operational Guidance
 
 ### For New Applications
 
@@ -196,29 +212,29 @@ psy_user_cli register-user --sign-type ${SIGN_TYPE}
 3. **User Experience**: Consider the impact of longer signing times
 4. **Migration Planning**: Plan for eventual upgrade to ZK keys
 
-### Development vs Production
+### Development and Deployment
 
 **Development:**
 ```bash
 # Fast iteration with ZK keys
-SIGN_TYPE=zk make register-user
+make register-users
 ```
 
-**Legacy Testing:**
+**ECDSA compatibility testing:**
 ```bash
-# When testing ECDSA compatibility
-SIGN_TYPE=secp256k1 make register-user
+# The Makefile target registers its configured users; it does not read SIGN_TYPE.
+make register-users
 ```
 
-## Future Considerations
+## 8. Support Direction
 
-### Roadmap
+### Planned Work
 
 - **Custom Circuits**: Support for user-defined signature circuits
 - **Aggregated Signatures**: Batch verification optimizations  
 - **Hardware Acceleration**: GPU and specialized hardware support
 - **Mobile Optimization**: Further optimizations for mobile devices
 
-### Deprecation Timeline
+### Signature-Type Focus
 
-While SECP256K1 support will continue, new features and optimizations will focus on ZK-based schemes. Plan migration to ZK keys for long-term compatibility.
+SECP256K1 support continues, while new features and optimizations focus on ZK-based schemes.

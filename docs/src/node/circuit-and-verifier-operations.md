@@ -1,6 +1,6 @@
 # Circuit and Verifier Operations
 
-> Status: Approved. Updated: 2026-09-02.
+> Updated: 2026-09-02.
 
 ## Abstract
 
@@ -16,6 +16,8 @@ Circuit metadata forms a dependency cascade, but not every circuit-related chang
 - [1. Authority and Operational Boundary](#1-authority-and-operational-boundary)
 - [2. Dependency Model](#2-dependency-model)
 - [3. Trigger Matrices](#3-trigger-matrices)
+- [3.2 Independent Bridge matrix](#32-independent-bridge-matrix)
+- [3.3 Token privacy circuit fingerprints](#33-token-privacy-circuit-fingerprints)
 - [4. Localhost EndCap Metadata](#4-localhost-endcap-metadata)
 - [5. Cache Generation](#5-cache-generation)
 - [6. Genesis and Embedded Circuit Boundaries](#6-genesis-and-embedded-circuit-boundaries)
@@ -52,7 +54,7 @@ Circuit metadata forms a dependency cascade, but not every circuit-related chang
 ## 1. Authority and Operational Boundary
 
 1. Run node commands from `<repo-root>`, sibling commands from `<workspace>/<repo>`, local keystore commands against `<home>/.psy/keystore`, and disposable operations under `<tmp>`. Repository documentation must not contain workstation paths.
-2. Current Audit source is authoritative. Relevant release policy and repository topology are at `AGENTS.md:72-90,92-134`.
+2. Current Audit source is the governing reference. Relevant release policy and repository topology are at `AGENTS.md:72-90,92-134`.
 3. The complete metadata generation and validation procedure exists only for `PSY_NETWORK=localhost`. The metadata CLI prints the compiled `CURRENT_NETWORK`, `PSY_NETWORK_MAGIC`, fingerprint, exact `[u64; 4]`, and verifier JSON (`client_prover/psy_cli/psy_user_cli/src/subcommand/get_user_endcap_common_data.rs:12-30`). The fingerprint constant is localhost-specific, but the checked-in real verifier JSON is shared by every network selector arm.
 4. Replacing `END_CAP_ALT_VERIFIER_DATA_SERIALIZED` changes runtime verifier input for all eight networks, even though current generation and cache validation cover only LocalDevnet. `config_gen_v2` explicitly loads `PsyChainNetworkType::LocalDevnet` and instantiates `PsyNetworkLocalDevnetConstants` (`psy_plonky2_circuits/examples/config_gen_v2.rs:93-102,441-442`), while the verifier selector maps every network enum arm to the same JSON constant (`psy_plonky2_circuits/src/circuit_library/end_cap_verifier_data.rs:29-40`). Block all non-local use of the changed blob until a reviewed implementation selects and validates distinct per-network verifier metadata throughout the CLI, cache generator, checked-in verifier data, and network constants.
 5. Generation, repository delivery, artifact upload, package publication, contract deployment, and Git push are separate actions. Authorization for one does not authorize another (`AGENTS.md:56-67`).
@@ -156,6 +158,10 @@ A transport-only or DTO-only field is a non-trigger only while constraints, orde
 | Witness values, roots, amounts, addresses, nonces, checkpoint numbers, transport, logging, timeout, retry, or Solidity caller logic with unchanged verifier key and ABI | No | No | No |
 
 Deposit append exposes its batch commitment as PI and owns its own frontier, leaf, batch, and tree targets (`psy_plonky2_common_circuits/src/bridge/deposit_batch_append_circuit.rs:242-259,267-374`). Withdrawal claim independently owns root, count, fixed slots, Merkle checks, padding, and batch commitment PI (`psy_plonky2_common_circuits/src/bridge/withdrawal_batch_claim_circuit.rs:59-69,78-175`).
+
+### 3.3 Token privacy circuit fingerprints
+
+`private_note_inclusion_fingerprint` and `shield_claim_fingerprint` are four-limb constants in the PSY and USDT token precompiles. They bind `private_claim` / `claim_deposit` to the minifier fingerprints of `PrivateNoteInclusionCircuit` and `DepositInclusionCircuit` (protocol alias `ShieldDepositClaimCircuit`). They are not EndCap metadata, coordinator-library fingerprints, or Groth16 keys. A change that updates the last row of §3.1 for those two embedded circuits also requires the token-precompile procedure in `docs/src/node/token-privacy-circuit-fingerprints.md`. Cache generation does not copy those limbs.
 
 ## 4. Localhost EndCap Metadata
 
@@ -273,7 +279,7 @@ Run the following only when an embedded bundle circuit source, bundle serializat
 make generate-local-circuits
 ```
 
-The target regenerates `client_prover/psy_prover/src/wallet/local_circuits.json` (`Makefile:113-118`). Runtime loads that embedded bundle, containing zk-sign plus the private-note-inclusion and shield-deposit-claim base circuits (`client_prover/psy_prover/src/wallet/memory_wallet.rs:336-339,426-451`). Ordinary EndCap, GUTA, cache, or verifier changes do not trigger it.
+The target regenerates `client_prover/psy_prover/src/wallet/local_circuits.json` (`Makefile:113-118`). Runtime loads that embedded bundle, containing zk-sign plus the private-note-inclusion and shield-deposit-claim base circuits (`client_prover/psy_prover/src/wallet/memory_wallet.rs:336-339,426-451`). Ordinary EndCap, GUTA, cache, or verifier changes do not trigger it. The same privacy-circuit change also invalidates the token-precompile fingerprint constants; follow `docs/src/node/token-privacy-circuit-fingerprints.md` and do not treat this wallet bundle as a substitute for those contract limbs.
 
 ## 7. Real Peer-to-Peer End-to-End Acceptance
 
@@ -661,6 +667,7 @@ Rollback units are: the globally shared verifier JSON plus localhost fingerprint
 | Secret local artifact; never package | `private_keys.json` | Section 6.1 trigger only |
 | Conditional generated DApp config | `psy-dapp/apps/bridge/src/config/faucetOperators.json` | Section 6.1 trigger only |
 | Conditional generated bundle | `client_prover/psy_prover/src/wallet/local_circuits.json` | Section 6.2 trigger only |
+| Manual replace (separate procedure) | `../psy-compiler/psy-precompiles/token/src/main.psy` and `usdt_token/src/main.psy` | Token privacy circuit fingerprints; see `docs/src/node/token-privacy-circuit-fingerprints.md` |
 | Selected verifier replace | `psy-contracts/src/GnarkGroth16Verifier.sol` | `bridge_agg` trigger |
 | Selected verifier replace | `psy-contracts/src/DepositBatchVerifier.sol` | `deposit_append` trigger |
 | Selected verifier replace | `psy-contracts/src/WithdrawalClaimVerifier.sol` | `withdrawal_claim` trigger |

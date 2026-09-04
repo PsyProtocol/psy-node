@@ -1,160 +1,123 @@
 # Rust SDK
 
-The Psy Rust SDK provides programmatic access to the Psy network through the `psy-rust-sdk` crate. It includes the `RpcProvider` for network communication and data types for blockchain interaction.
+> Updated: 2026-09-04.
 
-## Installation
+## Abstract
 
-Add to your `Cargo.toml`:
+The `psy_rust_sdk` crate provides programmatic access to Psy by re-exporting shared configuration, cryptography, request, provider, session, and wallet modules. The exact request payloads and data-type fields remain source-defined; examples below that omit constructors are explicitly illustrative.
+
+## Table of Contents
+
+- [1. Installation](#1-installation)
+- [2. Re-exports](#2-re-exports)
+- [3. Configuration](#3-configuration)
+- [4. RpcProvider](#4-rpcprovider)
+- [5. ProveProxyRpcProvider](#5-proveproxyrpcprovider)
+- [6. Data Types](#6-data-types)
+- [7. Verification Boundary](#7-verification-boundary)
+
+## 1. Installation
+
+Add the workspace crate to `Cargo.toml`:
 
 ```toml
 [dependencies]
-psy-rust-sdk = { path = "path/to/psy_sdk/psy-rust-sdk" }
+psy_rust_sdk = { path = "<workspace>/psy-sdk/psy-rust-sdk" }
 ```
 
-Or include the underlying components:
+The package name in the SDK repository is `psy_rust_sdk`. Cargo dependency keys can use that name directly.
 
-```toml
-[dependencies]
-psy_provider = { path = "path/to/psy_provider" }
-psy_data = { path = "path/to/psy_core/psy_data" }
-psy_common = { path = "path/to/psy_core/psy_common" }
-psy_config = { path = "path/to/psy_config" }
-```
+## 2. Re-exports
 
-## Core Components
-
-### Re-exports
-
-The `psy-rust-sdk` crate re-exports essential components:
+On native targets, the crate re-exports these modules:
 
 ```rust
 use psy_rust_sdk::{
+    network_constants,
+    provider,
     psy_common,
-    psy_config::network_constants,
     psy_crypto,
-    provider::{RpcProvider, ProveProxyRpcProvider},
     request,
     session,
     wallet,
 };
 ```
 
-## Configuration
+The native provider, session, and wallet re-exports are excluded on `wasm32`; the crate exposes its `wasm` module for that target.
 
-Create a `config.json` file with network endpoints:
+## 3. Configuration
 
-```json
-{
-  "networks": {
-    "localhost": {
-      "coordinator_configs": [
-        {"id": 0, "rpc_url": ["http://127.0.0.1:8545"]}
-      ],
-      "realm_configs": [
-        {"id": 0, "rpc_url": ["http://127.0.0.1:8546"]},
-        {"id": 1, "rpc_url": ["http://127.0.0.1:8547"]}
-      ],
-      "prove_proxy_url": ["http://127.0.0.1:9999"],
-      "fees": {
-        "guta_fee": 5000000000
-      }
-    }
-  }
-}
-```
-
-## RpcProvider
-
-The `RpcProvider` is the core component for programmatic interaction with the Psy network:
+`RpcProvider::new_with_config_path` loads the repository's network configuration format. Use the configuration supplied for the target deployment rather than deriving a partial configuration from this guide.
 
 ```rust
-#![allow(unused)]
-fn main() {
-use psy_provider::provider::RpcProvider;
+use psy_rust_sdk::provider::RpcProvider;
 
-// Create from config file
-let rpc_provider = RpcProvider::new_with_config_path("config.json")?;
+let rpc_provider = RpcProvider::new_with_config_path("<repo-root>/config.json")?;
+```
 
-// Or create from network config
+`RpcProvider::new_with_config` accepts a `psy_config::NetworkConfigGoldilocks` value:
+
+```rust
 let rpc_provider = RpcProvider::new_with_config(&network_config)?;
+```
 
-// Set user context
+## 4. RpcProvider
+
+The provider supports user registration, contract deployment, EndCap submission, and state queries. The request constructors in this sketch are omitted because their complete fields are defined by the source types:
+
+```rust
+use psy_rust_sdk::{provider::RpcProvider, request::*};
+
+let rpc_provider = RpcProvider::new_with_config_path("<repo-root>/config.json")?;
 rpc_provider.set_user_id(user_id);
 
-// Register user
-let register_request = QRegisterUserRPCRequest { /* ... */ };
-let user_uuid = rpc_provider.register_user(register_request).await?;
-
-// Deploy contract
-let deploy_request = QDeployContractRPCRequest { /* ... */ };
-let contract_uuid = rpc_provider.deploy_contract(deploy_request).await?;
-
-// Submit end cap (contract call result)
-let end_cap_request = QSubmitEndCapRPCRequest { /* ... */ };
-let end_cap_uuid = rpc_provider.submit_end_cap_proof(end_cap_request).await?;
-
-// Get block state
+// Illustrative: construct every source-defined field before calling the provider.
+let user_uuid = rpc_provider
+    .register_user(register_request)
+    .await?;
+let contract_uuid = rpc_provider
+    .deploy_contract(deploy_request)
+    .await?;
+let end_cap_uuid = rpc_provider
+    .submit_end_cap_proof(end_cap_request)
+    .await?;
 let block_state = rpc_provider.get_realm_latest_block_state().await?;
-}
 ```
 
-### ProveProxyRpcProvider
+## 5. ProveProxyRpcProvider
 
-For proof generation operations:
+`ProveProxyRpcProvider::new_with_config` accepts one proof-proxy URL as a `String` and returns the provider synchronously:
 
 ```rust
-use psy_provider::provider::ProveProxyRpcProvider;
+use psy_rust_sdk::provider::ProveProxyRpcProvider;
 
-let prove_provider = ProveProxyRpcProvider::new_with_config(proof_proxy_url).await?;
-
-// Register contract circuits
-prove_provider.register_contract_circuits(contract_id, &contract_code).await?;
-
-// Prove contract call
-let proof = prove_provider.prove_contract_call(contract_id, fn_id, &input).await?;
-
-// Prove UPS operations
-let ups_proof = prove_provider.prove_ups_start(&ups_input).await?;
+let prove_provider = ProveProxyRpcProvider::new_with_config(proof_proxy_url)?;
 ```
 
-## Data Types
+The earlier method examples for registering contract circuits and proving individual operations are not retained because those exact methods were not verified on the current SDK provider surface.
 
-Core data structures in `psy_data`:
+## 6. Data Types
+
+The crate depends on `psy_data`, but `psy_data` is not re-exported from `psy_rust_sdk`. Import data types from the `psy_data` dependency when an application needs them:
 
 ```rust
-use psy_rust_sdk::psy_data::qdata::{
+use psy_data::qdata::{
     checkpoint::PsyCheckpointLeaf,
-    contract::{PsyContractLeaf, ContractCodeDefinition},
+    contract::{ContractCodeDefinition, PsyContractLeaf},
     user::PsyUserLeaf,
     user_public_key::PsyUserPublicKeyRecord,
 };
 ```
 
-### PsyUserLeaf
-User account state in the merkle tree:
-- `public_key`: User's public key hash
-- `user_state_tree_root`: Root of user's state tree  
-- `balance`: User's token balance
-- `nonce`: Transaction sequence number
-- `user_id`: Unique user identifier
+The field summaries previously listed for these types are not repeated because they were not verified against the current SDK checkout. Treat the Rust definitions in `psy_data` as the interface source.
 
-### PsyContractLeaf  
-Contract state in the merkle tree:
-- `deployer`: Contract deployer's public key hash
-- `function_tree_root`: Root of contract function tree
-- `state_tree_height`: Height of contract state tree
+## 7. Verification Boundary
 
-### ContractCodeDefinition
-Contract bytecode and metadata:
-- `state_tree_height`: Contract state tree configuration
-- `functions`: Array of contract function definitions
+Verified against the SDK checkout:
 
-### PsyCheckpointLeaf
-Checkpoint state in the merkle tree:
-- `global_chain_root`: Root hash of the global chain state
-- `stats`: Checkpoint statistics and metadata
+1. The crate package name is `psy_rust_sdk`.
+2. Native builds re-export `psy_common`, `network_constants`, `psy_crypto`, `request`, `provider`, `session`, and `wallet`.
+3. `RpcProvider` exposes `new_with_config_path` and `new_with_config`.
+4. `ProveProxyRpcProvider::new_with_config` takes a `String` and is not asynchronous.
 
-### PsyUserPublicKeyRecord
-Public key information for users:
-- Maps user IDs to their public key data
-
+Unverified SDK claims are marked as illustrative or omitted rather than presented as callable interfaces.

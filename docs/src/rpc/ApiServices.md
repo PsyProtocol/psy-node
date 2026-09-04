@@ -1,5 +1,9 @@
 # API Services RPC Documentation
 
+> Updated: 2026-09-04.
+
+## Abstract
+
 This document provides comprehensive documentation for the Psy API Services, which offer HTTP REST endpoints for querying blockchain data, worker statistics, rewards, and telemetry.
 
 **Base URL**: `http://localhost:{port}`
@@ -10,23 +14,26 @@ This document provides comprehensive documentation for the Psy API Services, whi
 
 ## Table of Contents
 
-1. [Authentication](#authentication)
-2. [Health & User Management](#health--user-management)
-3. [Event Management](#event-management)
-4. [Statistics](#statistics)
-5. [Job Status](#job-status)
-6. [Legacy Rewards](#legacy-rewards)
-7. [Leaderboard](#leaderboard)
-8. [Checkpoint Operations](#checkpoint-operations)
-9. [Worker Rewards](#worker-rewards)
-10. [Admin Operations](#admin-operations)
-11. [Contract Management](#contract-management)
-12. [WebSocket Endpoints](#websocket-endpoints)
-13. [Data Structures](#data-structures)
+- [1. Authentication](#1-authentication)
+- [2. Health and User Management](#2-health-and-user-management)
+- [3. Event Management](#3-event-management)
+- [4. Statistics](#4-statistics)
+- [5. Job Status](#5-job-status)
+- [6. Reward Endpoints](#6-reward-endpoints)
+- [7. Leaderboard](#7-leaderboard)
+- [8. Checkpoint Operations](#8-checkpoint-operations)
+- [9. Worker Rewards](#9-worker-rewards)
+- [10. Admin Operations](#10-admin-operations)
+- [11. Contract Management](#11-contract-management)
+- [12. WebSocket Endpoints](#12-websocket-endpoints)
+- [13. Data Structures](#13-data-structures)
+- [14. Error Handling](#14-error-handling)
+- [15. Rate Limiting](#15-rate-limiting)
+- [16. Background Services](#16-background-services)
 
 ---
 
-## Authentication
+## 1. Authentication
 
 Some endpoints require JWT authentication with a secret token. Configure authentication using environment variables:
 
@@ -36,13 +43,13 @@ export JWT_EXPIRATION_HOURS="3"
 ```
 
 **Authentication Header**:
-```
+```text
 Authorization: Bearer <jwt_token>
 ```
 
 ---
 
-## Health & User Management
+## 2. Health and User Management
 
 ### GET /health
 
@@ -137,7 +144,7 @@ curl "http://localhost:3000/user_info?public_key=0x..."
 
 ---
 
-## Event Management
+## 3. Event Management
 
 ### GET /worker_events
 
@@ -270,7 +277,7 @@ Get aggregated user events statistics.
 
 ---
 
-## Statistics
+## 4. Statistics
 
 ### GET /stats
 
@@ -369,7 +376,7 @@ curl http://localhost:3000/stats/workers/0x...
 
 ---
 
-## Job Status
+## 5. Job Status
 
 ### GET /stats/jobs
 
@@ -449,7 +456,7 @@ Get simple job counts by status.
 
 ---
 
-## Legacy Rewards
+## 6. Reward Endpoints
 
 ### GET /rewards/{worker_public_key}
 
@@ -529,7 +536,7 @@ curl "http://localhost:3000/rewards_aggregations/0x...?bucket=1d&limit=30"
 
 ---
 
-## Leaderboard
+## 7. Leaderboard
 
 ### GET /leaderboard/workers
 
@@ -561,7 +568,7 @@ curl "http://localhost:3000/leaderboard/workers?limit=50"
 
 ---
 
-## Checkpoint Operations
+## 8. Checkpoint Operations
 
 ### GET /checkpoint/stats
 
@@ -694,7 +701,7 @@ curl http://localhost:3000/checkpoint/distributions/100
 
 ---
 
-## Worker Rewards
+## 9. Worker Rewards
 
 ### GET /checkpoint/rewards/{worker_public_key}
 
@@ -765,7 +772,7 @@ curl http://localhost:3000/checkpoint/rewards/0x.../stats
 
 ---
 
-## Admin Operations
+## 10. Admin Operations
 
 ### POST /checkpoint/calculate-rewards/{checkpoint_id}
 
@@ -807,7 +814,7 @@ curl http://localhost:3000/admin/checkpoint-processing-status
 
 ---
 
-## Contract Management
+## 11. Contract Management
 
 ### GET /contracts
 
@@ -867,7 +874,7 @@ curl http://localhost:3000/contracts/contract-uuid-123
 
 ---
 
-## WebSocket Endpoints
+## 12. WebSocket Endpoints
 
 ### WS /ws/tps
 
@@ -896,7 +903,7 @@ ws.onmessage = (event) => {
 
 ---
 
-## Data Structures
+## 13. Data Structures
 
 ### WorkerEventStatus
 
@@ -973,7 +980,7 @@ struct CheckpointProcessingStatus {
 
 ---
 
-## Error Handling
+## 14. Error Handling
 
 All endpoints return standard HTTP status codes:
 
@@ -993,7 +1000,7 @@ All endpoints return standard HTTP status codes:
 
 ---
 
-## Rate Limiting
+## 15. Rate Limiting
 
 Rate limiting may be applied to prevent abuse. Check response headers:
 
@@ -1005,17 +1012,17 @@ X-RateLimit-Reset: 1609459200
 
 ---
 
-## Background Services
+## 16. Background Services
 
 The API Services automatically run several background tasks:
 
 1. **Job Status Refresh**: Updates job status every 10 seconds
-2. **Checkpoint Reward Processing**: Processes rewards every 30 seconds  
+2. **Checkpoint Reward Processing**: Processes rewards every 30 seconds
 3. **Worker Event Processing**: Converts worker events to job events
 4. **TPS Broadcasting**: Broadcasts TPS data every 12 seconds via WebSocket
 
 ---
 
-**Document Version**: 1.0  
-**Last Updated**: 2024-12-16  
+**Document Version**: 1.0
+**Last Updated**: 2024-12-16
 **Total Endpoints**: 35+

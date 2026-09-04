@@ -1,8 +1,30 @@
 # Bridge Common Operations
 
-> Status: Approved. Updated: 2026-09-02.
+> Updated: 2026-09-02.
+
+## Abstract
 
 This guide is the executable local-devnet procedure for one L1 deposit, one L2 claim-deposit, one L2 withdrawal, and relayer settlement. Run every command from `<repo-root>`. Replace only angle-bracket values. Never place a real private key or wallet password in this document, a result file, or a shell history shared with other users.
+
+## Table of Contents
+
+- [Terminology](#terminology)
+- [1. State Flow](#1-state-flow)
+- [2. Start and Prove Readiness](#2-start-and-prove-readiness)
+- [3. Discover This Startup's Addresses](#3-discover-this-startups-addresses)
+- [4. Set One User and Small Amounts](#4-set-one-user-and-small-amounts)
+- [5. Register the User and Wait for the User ID](#5-register-the-user-and-wait-for-the-user-id)
+- [6. Fund L2 PSY Gas — Real EndCap](#6-fund-l2-psy-gas--real-endcap)
+- [7. Approve the Gateway and Submit the L1 Deposit — Not an EndCap](#7-approve-the-gateway-and-submit-the-l1-deposit--not-an-endcap)
+- [8. Observe Relayer Deposit Append and Finalize](#8-observe-relayer-deposit-append-and-finalize)
+- [9. Claim the Deposit on L2 — Real EndCap](#9-claim-the-deposit-on-l2--real-endcap)
+- [10. Withdraw on L2 — Real EndCap](#10-withdraw-on-l2--real-endcap)
+- [11. Register and Settle the L1 Withdrawal](#11-register-and-settle-the-l1-withdrawal)
+- [12. Observable-State Matrix](#12-observable-state-matrix)
+- [13. Exact Failure Responses](#13-exact-failure-responses)
+- [14. Serial Ordering Rule](#14-serial-ordering-rule)
+- [15. Cleanup](#15-cleanup)
+- [16. Source and Walkthrough References](#16-source-and-walkthrough-references)
 
 ## Terminology
 
@@ -12,7 +34,7 @@ This guide is the executable local-devnet procedure for one L1 deposit, one L2 c
 - **PSY**: the L2 fee token.
 - **RPC**: JSON remote procedure call.
 
-## State flow
+## 1. State Flow
 
 ```mermaid
 sequenceDiagram
@@ -52,7 +74,7 @@ L1 deposit recorded
 
 A plain `psy_user_cli deposit` is an L1 transaction and is **not** an EndCap. `claim-deposit` and `withdraw` each produce a real EndCap and wait up to 180 seconds for inclusion (`client_prover/psy_cli/psy_user_cli/src/subcommand/claim_deposit.rs:548-599`, `client_prover/psy_cli/psy_user_cli/src/subcommand/withdraw.rs:132-170`). The relayer runs the append, proof, finalize, and L1 batch-claim phases (`psy_cli/psy_relayer_cli/src/bridge/daemon.rs:619-998`).
 
-## 1. Start and prove readiness
+## 2. Start and Prove Readiness
 
 Use only the repository lifecycle targets. In a dedicated supervisor terminal:
 
@@ -87,7 +109,7 @@ The setup waits for services health and recognizes the stable relayer marker `br
 
 The lifecycle target owns that process. The command is shown to identify the active `psy_relayer_cli` surface; do not launch a second copy. The relayer does not support `--result-file`; its durable operational state is `local_checkpoints/bridge_proposer/daemon_state.toml`, its stdout log is `logs/bridge_relayer_logs.txt`, and tracing markers are in `logs/bridge_relayer_errs.txt` (`dev/locSetupV4.ts:3832-3837`, `psy_cli/psy_relayer_cli/src/main.rs:23-31`, `psy_cli/psy_relayer_cli/src/bridge/daemon.rs:568-599`).
 
-## 2. Discover this startup's addresses
+## 3. Discover This Startup's Addresses
 
 Local addresses change after deployment. Read the generated summary after every startup; never copy addresses from an earlier run. The deployment exporter writes this file and includes the core contracts and token metadata (`psy-contracts/deploy/008_export_deployed_contracts.ts:52-118`).
 
@@ -115,7 +137,7 @@ printf 'Bridge=%s\nStateManager=%s\nRouter=%s\nERC20Gateway=%s\nUSDT=%s\nUSDT L2
 
 Stop if any value is empty or `null`.
 
-## 3. Set one user and small amounts
+## 4. Set One User and Small Amounts
 
 Use a normal devnet user, not the relayer identity. Keep L2 operations for this user strictly serial. Choose fresh `R0`, `R1`, note-secret limbs, nullifier-secret limbs, and withdrawal nonce for every run.
 
@@ -139,11 +161,11 @@ print("export WITHDRAWAL_NONCE='0x" + secrets.token_hex(32) + "'")
 PY
 )"
 ```
-For local USDT, `2000` is `0.002` USDT and `1000` is `0.001` USDT. Small values reduce proof and liquidity surprises. `claim-deposit` and `withdraw` both consume L2 PSY fees; L1 token ownership does not pay L2 gas. The canonical Bridge campaign reference is [PsyProtocol/psy-memory Bridge E2E](https://github.com/PsyProtocol/psy-memory/blob/main/src/repositories/parth-generic-v1/e2e/bridge.md), especially its amount, L2 gas, and same-user serial-operation rules.
+For local USDT, `2000` is `0.002` USDT and `1000` is `0.001` USDT. Small values reduce proof and liquidity surprises. `claim-deposit` and `withdraw` both consume L2 PSY fees; L1 token ownership does not pay L2 gas. The referenced Bridge campaign is [PsyProtocol/psy-memory Bridge E2E](https://github.com/PsyProtocol/psy-memory/blob/main/src/repositories/parth-generic-v1/e2e/bridge.md), especially its amount, L2 gas, and same-user serial-operation rules.
 
 
 
-## 4. Register the user and wait for the user ID
+## 5. Register the User and Wait for the User ID
 
 `register-user` returns `pending` when it submits a new registration and `registered` when the key already exists. `get-user-id` returns a structured `not_registered` state rather than treating it as a transport failure (`client_prover/psy_cli/psy_user_cli/src/subcommand/register_user.rs:15-46`, `client_prover/psy_cli/psy_user_cli/src/subcommand/get_user_id.rs:9-30`).
 
@@ -189,7 +211,7 @@ export SHIELD_ADDRESS="$(jq -r '.note_owner' "$RESULT_DIR/note-owner.json")"
 
 The global `--result-file` is atomically published only on success and contains secret-free command results (`client_prover/psy_cli/psy_user_cli/src/subcommand/mod.rs:47-54`, `client_prover/psy_cli/psy_user_cli/src/result.rs:299-372`).
 
-## 5. Fund L2 PSY gas — real EndCap
+## 6. Fund L2 PSY Gas — Real EndCap
 
 This is the first same-user L2 state transition. Wait for confirmation before doing any later L2 operation.
 
@@ -210,7 +232,7 @@ jq -e '.status == "confirmed" and (.confirmed_checkpoint != null)' "$RESULT_DIR/
 
 Do not start `deposit`, `claim-deposit`, or `withdraw` in parallel with this command.
 
-## 6. Approve the gateway and submit the L1 deposit — not an EndCap
+## 7. Approve the Gateway and Submit the L1 Deposit — Not an EndCap
 
 Approve only the resolved ERC20Gateway, then submit exactly one deposit. Router dispatches the request, but ERC20Gateway is the token spender and calls `safeTransferFrom(depositor, bridge, amount)` (`psy-contracts/src/Router.sol:64-87`, `psy-contracts/src/ERC20Gateway.sol:62-82`). The CLI derives the shield address and note commitment from the user ID and fresh material (`client_prover/psy_cli/psy_user_cli/src/subcommand/deposit.rs:64-180`).
 
@@ -245,7 +267,7 @@ test "$DEPOSIT_INDEX" != 'null'
 
 `--deposit-proof-output` is optional at the deposit interface, but it is required for the file-based `claim-deposit` command used below. With this flag, the deposit command waits up to 600 seconds for relayer proof readiness and then writes the sender-generated inclusion proof (`client_prover/psy_cli/psy_user_cli/src/subcommand/deposit.rs:636-676`, `client_prover/psy_cli/psy_user_cli/src/subcommand/deposit.rs:1072-1107`). If the receiver uses Nostr recovery, also pass `--recipient-npub <receiver-npub>`; the CLI publishes separate proof and encrypted-secret events (`client_prover/psy_cli/psy_user_cli/src/subcommand/deposit.rs:802-904`). Never rerun `deposit` to retry proof generation: that records a new L1 deposit.
 
-## 7. Observe relayer deposit append and finalize
+## 8. Observe Relayer Deposit Append and Finalize
 
 The relayer first appends the deposit state on L2, advances L1 `provedDepositCount` through `batchAppend`, then finalizes a checkpoint range. The Bridge exposes the deposit counters and root (`psy-contracts/src/Bridge.sol:148-152`). Section 6 captured the finalized cursor before the deposit:
 
@@ -268,7 +290,7 @@ cast call "$BRIDGE" 'depositRoot()(bytes32)' --rpc-url "$L1_RPC_URL"
 
 The proof file, `provedDepositCount >= deposit_index + 1`, and a measured finalization advance prove that the deposit is in a usable finalized snapshot.
 
-## 8. Claim the deposit on L2 — real EndCap
+## 9. Claim the Deposit on L2 — Real EndCap
 
 Run only after the prior L2 mint EndCap has confirmed and the proof file exists. Raw secrets are optional validation inputs, but when supplied they must be supplied together. Do not pass a checkpoint ID; the command resolves current context.
 
@@ -319,9 +341,9 @@ This query requires the exact deposit identity—chain-local index, note commitm
 The command checks shield address, token, amount, chain index, deposit index, proof fingerprint, and public inputs before proving and submitting the EndCap (`client_prover/psy_cli/psy_user_cli/src/subcommand/claim_deposit.rs:401-527`).
 
 
-## 9. Withdraw on L2 — real EndCap
+## 10. Withdraw on L2 — Real EndCap
 
-Start only after claim-deposit returns confirmed. The canonical flag is `--destination-chain-index`; it is a Bridge chain index, not the EVM chain ID. Normal 20-byte token and recipient addresses are accepted and left-padded automatically. Omit `--contract-id`: the command queries `Router.l1ToL2Token(token)` and converts the bytes32 mapping to the required decimal `u64` contract ID (`client_prover/psy_cli/psy_user_cli/src/subcommand/args.rs:762-794`, `client_prover/psy_cli/psy_user_cli/src/subcommand/withdraw.rs:75-108`).
+Start only after claim-deposit returns confirmed. The command flag is `--destination-chain-index`; it is a Bridge chain index, not the EVM chain ID. Normal 20-byte token and recipient addresses are accepted and left-padded automatically. Omit `--contract-id`: the command queries `Router.l1ToL2Token(token)` and converts the bytes32 mapping to the required decimal `u64` contract ID (`client_prover/psy_cli/psy_user_cli/src/subcommand/args.rs:762-794`, `client_prover/psy_cli/psy_user_cli/src/subcommand/withdraw.rs:213-221,278-281`).
 
 ```bash
 export FINALIZED_BEFORE_WITHDRAW="$(cast call "$STATE_MANAGER" 'lastFinalizedCheckpointId()(uint64)' --rpc-url "$L1_RPC_URL" | awk '{print $1}')"
@@ -343,7 +365,7 @@ jq -e '.status == "confirmed" and (.confirmed_checkpoint != null)' "$RESULT_DIR/
 
 The withdrawal amount must be positive and no greater than the user's withdrawn-token balance. Independently, the user must retain sufficient PSY balance to pay the EndCap fee. Use a unique nonce for every destination chain.
 
-## 10. Register and settle the L1 withdrawal
+## 11. Register and Settle the L1 Withdrawal
 
 Section 9 captured the finalization cursor and recipient balance before the L2 withdrawal.
 
@@ -375,7 +397,7 @@ test "$(jq -r '.[2]' <<<"$CLEARED_JSON")" -eq 0
 
 `claimedNullifiers(nonce) == true` proves registration/idempotency. Recipient balance increase plus cleared `pendingWithdrawals[nonce]` prove settlement. `claimPendingWithdrawal` enforces `claimableAt`, deletes the pending entry, and then transfers tokens (`psy-contracts/src/Bridge.sol:825-859`).
 
-## Observable-state matrix
+## 12. Observable-State Matrix
 
 | Transition | Producer | Required observable result | Command or surface |
 |---|---|---|---|
@@ -393,7 +415,7 @@ test "$(jq -r '.[2]' <<<"$CLEARED_JSON")" -eq 0
 
 Services exposes the stable deposit, withdrawal, deposit-proof, and withdrawal-proof routes (`../psy-services/src/api/server.rs:135-153`, `../psy-services/src/api/server.rs:318-345`). Deposit `claimed` is matched per deposit identity, not inferred from counts (`../psy-services/src/api/handlers/bridge.rs:1331-1359`, `../psy-services/src/api/handlers/bridge.rs:1431-1451`). For direct RPC probes, use `psy_get_latest_checkpoint_id` and `psy_get_imt_leaf_index_for_key`; query the realm tip only, never a coordinator-derived stale checkpoint (`client_prover/psy_provider/src/request.rs:82-87`, `client_prover/psy_provider/src/request.rs:257-265`).
 
-## Exact failure responses
+## 13. Exact Failure Responses
 
 | Response | Meaning | Required action |
 |---|---|---|
@@ -422,7 +444,7 @@ Services exposes the stable deposit, withdrawal, deposit-proof, and withdrawal-p
 
 The deposit proof response reasons are stable machine-readable values (`../psy-services/src/api/handlers/bridge.rs:1555-1721`). StateManager exposes the exact finalize errors (`psy-contracts/src/StateManager.sol:63-76`, `psy-contracts/src/StateManager.sol:173-212`).
 
-## Serial ordering rule
+## 14. Serial Ordering Rule
 
 For one user, execute these L2 EndCaps in this exact order, with each command returning `confirmed` before the next begins:
 
@@ -430,9 +452,9 @@ For one user, execute these L2 EndCaps in this exact order, with each command re
 simple_mint -> claim-deposit -> withdraw
 ```
 
-Do not background these commands. Do not submit two withdrawals for the same user concurrently. The relayer defaults to one sequential L2 batch (`psy_cli/psy_relayer_cli/src/bridge/daemon.rs:103-112`). The same serial rule is part of the canonical [PsyProtocol/psy-memory Bridge E2E](https://github.com/PsyProtocol/psy-memory/blob/main/src/repositories/parth-generic-v1/e2e/bridge.md).
+Do not background these commands. Do not submit two withdrawals for the same user concurrently. The relayer defaults to one sequential L2 batch (`psy_cli/psy_relayer_cli/src/bridge/daemon.rs:103-112`). The same serial rule is part of the referenced [PsyProtocol/psy-memory Bridge E2E](https://github.com/PsyProtocol/psy-memory/blob/main/src/repositories/parth-generic-v1/e2e/bridge.md).
 
-## Cleanup
+## 15. Cleanup
 
 Preserve result and proof files until all observable checks pass. Then remove only this run's temporary output and stop the stack through the lifecycle target:
 
@@ -443,10 +465,10 @@ make shutdown
 
 Do not manually kill individual services. A non-purge restart can separate L1 and L2 state; the walkthrough sections “33.10 locSetupV4 auto-restart timing” and “33.11 Non-purge devnet restart tears L1/L2 state apart” explain why routine cleanup uses `make shutdown` before the next `make run-all`.
 
-## Source and walkthrough references
+## 16. Source and Walkthrough References
 
 - Current command registry and flags: `client_prover/psy_cli/psy_user_cli/src/subcommand/mod.rs:47-159`, `client_prover/psy_cli/psy_user_cli/src/subcommand/args.rs:705-877`.
 - Current executable reference flow: `e2e/bridge-e2e.sh:88-289`.
 - Current relayer command surface: `psy_cli/psy_relayer_cli/src/main.rs:23-62`, `psy_cli/psy_relayer_cli/src/main.rs:148-223`.
-- Authoritative memory walkthrough: *Bridge E2E Walkthrough — Deposit → Claim → Withdraw → Claim* in the external Psy memory repository, especially “服务健康检查”, “全局注意事项与操作纪律 (Gotchas)”, sections 4.0–4.6, “Bridge Relayer 主循环”, and lessons 33.3–33.11.
+- Referenced memory walkthrough: *Bridge E2E Walkthrough — Deposit → Claim → Withdraw → Claim* in the external Psy memory repository, especially “服务健康检查”, “全局注意事项与操作纪律 (Gotchas)”, sections 4.0–4.6, “Bridge Relayer 主循环”, and lessons 33.3–33.11.
 - Current source overrides any stale command or behavior in the walkthrough.

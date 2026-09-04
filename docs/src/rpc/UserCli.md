@@ -1,19 +1,32 @@
-# User Cli Interface
+# User CLI Interface
+
+> Updated: 2026-09-04.
+
+## Abstract
+
 This documentation organizes the three core data query interfaces implemented by `RpcProvider` (`QTreeDataStoreReaderSync<F>`, `QMetaDataStoreReaderSync<F>`, and `PsyComboDataStoreReaderSync<F>`). It includes interface functions, method details, parameter descriptions, and return value types, focusing on core data query capabilities for blockchain scenarios such as users, contracts, and checkpoints.
 
+## Table of Contents
 
-## Basic Information
+- [1. Basic Information](#1-basic-information)
+- [2. Core Structures](#2-core-structures)
+- [3. Merkle Tree Data Query](#3-merkle-tree-data-query)
+- [4. Metadata Query](#4-metadata-query)
+
+## 1. Basic Information
+
 - **Core Dependent Types**:
   - `F = GoldilocksField`: A prime field type based on Plonky2, used for blockchain data verification and hash calculation.
   - `QHashOut<F>`: Hash output result type, storing raw data after hash calculation.
   - `MerkleProofCore<QHashOut<F>>`: Core Merkle proof type, containing information such as the root, value, and sibling nodes required for proof.
 
-## Core Structures  
+## 2. Core Structures
 
-### `RpcProvider`  
-The foundational component for RPC communication, responsible for interacting with **Realm nodes** (user-specific data) and **Coordinator nodes** (global public data, e.g., contracts, checkpoints). It supports cross-environment use (non-WASM like servers, WASM like browser extensions).  
+### `RpcProvider`
 
-#### Structure Definition  
+The foundational component for RPC communication, responsible for interacting with **Realm nodes** (user-specific data) and **Coordinator nodes** (global public data, e.g., contracts, checkpoints). It supports cross-environment use (non-WASM like servers, WASM like browser extensions).
+
+#### Structure Definition
 ```rust
 #[derive(Debug, Clone)]
 pub struct RpcProvider {
@@ -25,8 +38,9 @@ pub struct RpcProvider {
 }
 ```
 
-#### Key Methods  
-`RpcProvider` provides methods for node routing, user/contract/data queries, and transaction submission. Core methods are categorized below:  
+#### Key Methods
+
+`RpcProvider` provides methods for node routing, user/contract/data queries, and transaction submission. Core methods are categorized below:
 
 | Category | Method Name | Parameters | Return Value | Function Description |
 |----------|-------------|------------|--------------|-----------------------|
@@ -41,9 +55,12 @@ pub struct RpcProvider {
 | | `check_tx_is_confirmed` | `checkpoint_id: u64`, `user_id: u64`, `tx_hash: QHashOut<GoldilocksField>` | `anyhow::Result<bool>` | Verify if a transaction is confirmed by comparing the user leaf hash with the transaction hash. |
 | **Batch Proof Query** | `get_job_proofs` | `job_infos: Vec<JobInfo>` | `anyhow::Result<Vec<(QProvingJobDataID, VariableHeightRewardMerkleProof)>>` | Batch query reward Merkle proofs for multiple jobs (routes to Realm/Coordinator based on job location). |
 
-### Auxiliary Structures  
-#### `RpcConfig` & `NetworkConfig`  
-Configuration structures for node networks and proxy services, loaded from external config files:  
+### Auxiliary Structures
+
+#### `RpcConfig` & `NetworkConfig`
+
+Configuration structures for node networks and proxy services, loaded from external config files:
+
 ```rust
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RpcConfig {
@@ -69,7 +86,7 @@ pub struct NetworkConfig {  // Extended config for blockchain network
 ```
 
 
-## Merkle Tree Data Query
+## 3. Merkle Tree Data Query
 This interface focuses on querying roots, leaf hashes, and Merkle proofs of various Merkle trees in the blockchain, covering core scenarios such as users, contracts, checkpoints, deposits, and withdrawals.
 
 ### 1. User-Related Merkle Tree Queries
@@ -139,7 +156,7 @@ This interface focuses on querying roots, leaf hashes, and Merkle proofs of vari
 | `get_checkpoint_tree_merkle_proof` | Same parameters as above | `MerkleProofCore<QHashOut<F>>` | Queries the Merkle proof of a leaf node in the checkpoint tree | Coordinator Node |
 
 
-## Metadata Query
+## 4. Metadata Query
 This interface focuses on querying core blockchain metadata, including complete leaf data for users, contracts, and checkpoints, as well as L2 block states.
 
 

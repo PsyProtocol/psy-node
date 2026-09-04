@@ -1,8 +1,13 @@
 # Dargo - Psy Language Package Manager and Build Tool
 
-Dargo is the official package manager and build system for the Psy Smart Contract Language. It handles project creation, dependency management, compilation, testing, and execution of Psy smart contracts.
+> Updated: 2026-09-03.
 
-## Project Management
+## Abstract
+
+
+Dargo is the package manager and build system for the Psy Smart Contract Language. It handles project creation, dependency management, compilation, testing, and execution of Psy smart contracts.
+
+## 1. Project Management
 
 ### `dargo new`
 
@@ -13,7 +18,7 @@ dargo new my_project
 ```
 
 This creates:
-```
+```text
 my_project/
 ├── Dargo.toml          # Project configuration
 ├── src/
@@ -39,7 +44,7 @@ dargo init
 
 Use this when you want to add Psy project structure to an existing directory.
 
-## Compilation
+## 2. Compilation
 
 ### `dargo compile`
 
@@ -107,7 +112,7 @@ The compile command generates:
 - **Circuit Files**: ZK circuit representations in `target/` directory
 - **Constraint System**: Mathematical constraints for zero-knowledge proofs
 
-## Execution and Testing
+## 3. Execution and Testing
 
 ### `dargo execute`
 
@@ -209,7 +214,7 @@ fn main() {
 }
 ```
 
-## ABI Generation
+## 4. ABI Generation
 
 ### `dargo generate-abi`
 
@@ -357,7 +362,7 @@ cd psy_sdk/psy-ts-sdk/packages/contract-sdk
 pnpm generate
 ```
 
-## Code Formatting
+## 5. Code Formatting
 
 ### `dargo fmt`
 
@@ -389,7 +394,7 @@ fn messy_function(a: Felt, b: Felt) -> Felt {
 }
 ```
 
-## Advanced Usage
+## 6. Advanced Usage
 
 ### Contract-Specific Compilation
 
@@ -465,7 +470,7 @@ export DARGO_OPTIMIZATION=release
 dargo compile
 ```
 
-## Project Configuration
+## 7. Project Configuration
 
 ### Dargo.toml
 
@@ -484,7 +489,7 @@ authors = ["Your Name <email@example.com>"]
 # Future: build configuration
 ```
 
-## Common Workflows
+## 8. Common Workflows
 
 ### Development Workflow
 
@@ -553,7 +558,7 @@ dargo compile -c MyContract -m target_method
 # Check target/ directory for output files
 ```
 
-## Error Handling
+## 9. Error Handling
 
 ### Common Errors and Solutions
 
@@ -582,7 +587,7 @@ dargo execute -c Token -m transfer -p 123 50  # Correct: 2 parameters
 - Check for syntax errors in the formatted version
 - Verify all imports and dependencies are available
 
-## Performance Tips
+## 10. Performance Tips
 
 1. **Incremental Compilation:**
    - Dargo compiles only changed files when possible
@@ -596,7 +601,7 @@ dargo execute -c Token -m transfer -p 123 50  # Correct: 2 parameters
    - Simpler methods generate more efficient circuits
    - Avoid complex control flow when possible
 
-## Best Practices
+## 11. Best Practices
 
 1. **Project Organization:**
    ```
@@ -619,7 +624,7 @@ dargo execute -c Token -m transfer -p 123 50  # Correct: 2 parameters
    - Test methods individually before integration
    - Format code regularly with `dargo fmt`
 
-## Future Features
+## 12. Future Features
 
 Planned features for future Dargo versions:
 
@@ -629,7 +634,7 @@ Planned features for future Dargo versions:
 - **IDE Integration**: Enhanced editor support
 - **Profiling Tools**: Circuit complexity analysis
 
-## Summary
+## 13. Summary
 
 Dargo provides a complete development environment for Psy smart contracts:
 

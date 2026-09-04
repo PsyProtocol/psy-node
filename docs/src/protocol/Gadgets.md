@@ -1,6 +1,12 @@
+# Psy Circuit Gadgets
+
+> Updated: 2026-09-03.
+
+## Abstract
+
 This document details the various gadgets used within the Psy ZK circuits, primarily focusing on the User Proving Session (UPS) and Global User Tree Aggregation (GUTA) systems. Gadgets are reusable circuit components that enforce specific constraints and logic.
 
-### UPS Gadgets (User Proving Session)
+## 1. User Proving Session Gadgets
 
 These gadgets are components used within the circuits that users run locally to prove their sequence of transactions.
 
@@ -284,7 +290,7 @@ These gadgets are components used within the circuits that users run locally to 
 
 ---
 
-### GUTA Gadgets (Global User Tree Aggregation)
+## 2. Global User Tree Aggregation Gadgets
 
 These gadgets are components used within the circuits run by the decentralized proving network to aggregate proofs from multiple users into a single block proof.
 
@@ -318,7 +324,7 @@ These gadgets are components used within the circuits run by the decentralized p
 *   **Purpose:** Verifies a user's End Cap proof within the GUTA aggregation process. It checks the proof's validity, ensures it used the correct End Cap circuit, verifies the user's claimed checkpoint root is historical, and extracts the state transition and stats.
 *   **Key Inputs/Witness:**
     *   `proof_common_data`, `verifier_data_cap_height`: Parameters for proof verification.
-    *   `known_end_cap_fingerprint_hash`: Constant representing the hash of the official End Cap circuit's verifier data.
+    *   `known_end_cap_fingerprint_hash`: Constant representing the hash of the designated End Cap circuit's verifier data.
     *   `UPSEndCapResultCompact`: Witness for the result claimed by the End Cap proof.
     *   `GUTAStats`: Witness for the stats claimed by the End Cap proof.
     *   `MerkleProofCore`: Witness for the historical checkpoint root proof.
@@ -623,7 +629,7 @@ These files define complete ZK circuits, orchestrating various gadgets to perfor
 ---
 ---
 
-## `Circuits.md`
+## 3. Circuit Flow
 
 This document describes the end-to-end flow of circuits involved in processing user transactions and aggregating them into a final block proof within the Psy system. It highlights the assumptions made at each stage and how they are progressively verified, ultimately enabling horizontal scalability.
 

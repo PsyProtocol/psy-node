@@ -1,10 +1,15 @@
 # Psy LSP Developer Tutorial
 
+> Updated: 2026-09-03.
+
+## Abstract
+
+
 Psy is a custom language with a dedicated Language Server Protocol (LSP) service, providing basic features such as `hover`, `goto definition`, `find references`, and `formatting`.
 
 This document introduces how to use the Psy language server `psy-lsp-server` for a better development experience in **VSCode**, **Neovim**, and **RustRover**.
 
-## 🛠️ Preparation
+## 1. Preparation
 
 1. Clone repository:
 
@@ -22,7 +27,7 @@ This document introduces how to use the Psy language server `psy-lsp-server` for
 > ⚠️ **Note**: Regardless of which IDE you are using, the `psy-lsp-server` binary is required for the language features to work properly.  
 > Please make sure you have built it and **remember its path**.
 
-## 💻 VSCode Usage Tutorial
+## 2. Visual Studio Code Usage
 Developer debugging mode (recommended for developers)
 1. Start VSCode:
 ```bash
@@ -49,7 +54,7 @@ This assumes you've built the LSP server in the `psy-compiler` directory. If you
   npm run build
 ```
 
-## 🧑‍💻 Neovim Configuration for Psy
+## 3. Neovim Configuration
 
 This guide shows how to configure Neovim for Psy development using the Language Server Protocol.
 
@@ -57,7 +62,7 @@ This guide shows how to configure Neovim for Psy development using the Language 
 
 ---
 
-### 1️⃣ File Type Detection
+### 3.1 File Type Detection
 
 Add this to your Neovim configuration to recognize `.psy` and `.qed` files:
 
@@ -82,7 +87,7 @@ vim.api.nvim_create_autocmd({ "BufNewFile", "BufReadPost" }, {
 })
 ```
 
-### 2️⃣ LSP Configuration
+### 3.2 Language Server Configuration
 
 Configure the Psy language server:
 
@@ -99,7 +104,7 @@ vim.lsp.config('psy_lsp', {
 vim.lsp.enable('psy_lsp')
 ```
 
-### 3️⃣ Syntax Highlighting
+### 3.3 Syntax Highlighting
 
 Configure Tree-sitter to use Rust highlighting for Psy files:
 
@@ -109,7 +114,7 @@ vim.treesitter.language.register("rust", "psy")
 vim.treesitter.language.register("rust", "qed")
 ```
 
-### 4️⃣ LSP Key Mappings
+### 3.4 Language Server Key Mappings
 
 Set up key bindings for LSP functionality:
 
@@ -137,7 +142,7 @@ vim.api.nvim_create_autocmd("LspAttach", {
 })
 ```
 
-### 5️⃣ Comment Support
+### 3.5 Comment Support
 
 Configure comment strings for Psy files:
 
@@ -151,7 +156,7 @@ vim.api.nvim_create_autocmd("FileType", {
 })
 ```
 
-### 6️⃣ Complete Configuration Example
+### 3.6 Complete Configuration Example
 
 Here's a complete minimal configuration for Psy development:
 
@@ -214,7 +219,7 @@ vim.api.nvim_create_autocmd("LspAttach", {
 })
 ```
 
-### 📚 Key Bindings Summary
+### 3.7 Key Bindings
 
 | Key Binding | Function |
 |-------------|----------|
@@ -227,9 +232,9 @@ vim.api.nvim_create_autocmd("LspAttach", {
 | `<leader>ca` | Code actions |
 
 
-## 🔧 Additional IDE Support
+## 4. Additional IDE Support
 
-While VSCode and Neovim have official configuration guides, other IDEs may be supported through generic LSP clients. If you're using a different IDE that supports LSP, you can configure it to use `psy-lsp-server` as the language server for `.psy` files.
+While Visual Studio Code and Neovim have configuration guides, other IDEs can use generic Language Server Protocol clients. Configure another compatible IDE to use `psy-lsp-server` as the language server for `.psy` files.
 
 **General LSP Configuration:**
 - **Server Command**: `psy-lsp-server`

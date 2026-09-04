@@ -1,8 +1,13 @@
 # Functions
 
+> Updated: 2026-09-03.
+
+## Abstract
+
+
 Functions are the building blocks of Psy programs. This chapter covers how to define functions and call them with various parameter types.
 
-## Function Definition
+## 1. Function Definition
 
 Functions are defined using the `fn` keyword:
 
@@ -29,7 +34,7 @@ fn calculate(x: Felt, y: Felt, flag: bool, count: u32) -> Felt {
 }
 ```
 
-## Function Calls
+## 2. Function Calls
 
 ### Parameter Passing
 
@@ -263,7 +268,7 @@ fn test_struct_parameters() {
 }
 ```
 
-## Nested Function Calls
+## 3. Nested Function Calls
 
 Functions can call other functions, creating nested calls:
 
@@ -292,7 +297,7 @@ fn test_nested_calls() {
 }
 ```
 
-## Function Inlining
+## 4. Function Inlining
 
 **Important:** In Psy, functions are inlined by default during compilation. This means:
 

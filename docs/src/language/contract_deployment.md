@@ -1,15 +1,20 @@
 # Contract Deployment Architecture
 
+> Updated: 2026-09-03.
+
+## Abstract
+
+
 This document explains how Psy smart contract functions are compiled, deployed, and organized in the blockchain's state trees.
 
-## Function Compilation Pipeline
+## 1. Function Compilation Pipeline
 
 When a Psy smart contract is compiled, each function goes through the following process:
 
 1. **Source Code** → **DPN Opcodes** → **ZK Circuit** → **Verifier Data**
 2. The resulting verifier data and function metadata are stored on-chain in a hierarchical tree structure
 
-## Contract Function Tree
+## 2. Contract Function Tree
 
 Each deployed contract maintains a **Contract Function Tree** that stores information about all its public functions.
 
@@ -36,7 +41,7 @@ let verifier_hash: QHashOut<F> = hash(circuit_verifier_data);
 
 ### Function Tree Organization
 
-```
+```text
 Contract Function Tree
 ├── Function 0
 │   ├── Leaf 0: Function Signature
@@ -50,7 +55,7 @@ Contract Function Tree
 └── ...
 ```
 
-## Contract Tree Structure
+## 3. Contract Tree Structure
 
 The Contract Function Tree root is then stored as part of a **Contract Leaf** in the higher-level **Contract Tree**.
 
@@ -90,9 +95,9 @@ pub struct PsyContractLeaf<F: RichField> {
   - Memory allocation for contract state
   - Gas/resource calculation for state operations
 
-## Complete Storage Hierarchy
+## 4. Complete Storage Hierarchy
 
-```
+```text
 Global Contract Tree
 ├── Contract 0
 │   ├── deployer: QHashOut<F>
@@ -119,7 +124,7 @@ Global Contract Tree
     └── ...
 ```
 
-## Function Call Verification Process
+## 5. Function Call Verification Process
 
 When a function is called on-chain:
 
@@ -129,7 +134,7 @@ When a function is called on-chain:
 4. **Validate Circuit**: Confirm the function's compiled circuit corresponds to the verifier data hash stored in the Contract Function Tree
 5. **Execute**: Verify witness satisfies circuit constraints and process the function call (handled by Psy zkVM)
 
-## Example: Token Contract Storage
+## 6. Token Contract Storage Example
 
 ```rust
 // Example token contract with 3 functions
@@ -141,7 +146,7 @@ contract Token {
 ```
 
 **Compiled Storage Structure:**
-```
+```text
 Contract Leaf:
 ├── deployer: deployer_public_key
 ├── function_tree_root: merkle_root([

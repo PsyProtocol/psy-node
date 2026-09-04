@@ -1,8 +1,13 @@
 # Built-in Functions and Standard Library
 
+> Updated: 2026-09-03.
+
+## Abstract
+
+
 This chapter covers Psy's built-in functions and standard library, including context functions, storage operations, memory utilities, and low-level operations.
 
-## Standard Library Overview
+## 1. Standard Library Overview
 
 Psy provides a comprehensive standard library (`psy-std`) that includes:
 
@@ -13,7 +18,7 @@ Psy provides a comprehensive standard library (`psy-std`) that includes:
 
 All standard library functions are automatically available in every module - the prelude is automatically imported without requiring manual import statements.
 
-## Context Functions
+## 2. Context Functions
 
 Context functions provide access to execution environment information, including user data, contract metadata, and checkpoint information.
 
@@ -126,7 +131,7 @@ fn user_isolation_example() {
 }
 ```
 
-## Storage Operations
+## 3. Storage Operations
 
 The storage system provides persistent data storage for contracts with built-in serialization for primitive types and arrays.
 
@@ -313,7 +318,7 @@ fn metadata_example() {
 }
 ```
 
-## Memory Utilities
+## 4. Memory Utilities
 
 Low-level memory and type utilities for advanced operations.
 
@@ -343,7 +348,7 @@ fn size_example() {
 }
 ```
 
-## Cross-Contract Invocation
+## 5. Cross-Contract Invocation
 
 ### Deferred Calls
 
@@ -366,7 +371,7 @@ fn deferred_call_example() {
 
 **Note**: Synchronous calls (`invoke_sync`) are not currently supported.
 
-## Default Trait
+## 6. Default Trait
 
 Provides default values for primitive types:
 
@@ -382,7 +387,7 @@ fn default_example() {
 }
 ```
 
-## Low-Level Built-in Functions
+## 7. Low-Level Built-in Functions
 
 These functions are prefixed with `__` and provide direct access to ZK circuit operations:
 
@@ -438,7 +443,7 @@ fn internal_memory() {
 }
 ```
 
-## Utility Functions
+## 8. Utility Functions
 
 ### State Management
 
@@ -451,7 +456,7 @@ fn state_management() {
 }
 ```
 
-## Type Aliases
+## 9. Type Aliases
 
 Common type aliases used throughout the standard library:
 
@@ -477,7 +482,7 @@ fn slot_example() {
 }
 ```
 
-## Important Notes
+## 10. Important Notes
 
 ### Storage Considerations
 
@@ -503,7 +508,7 @@ fn slot_example() {
 3. **Transmute Safety**: Type transmutation bypasses type safety - use only when necessary
 4. **Clear Operations**: `clear_entire_tree()` is irreversible
 
-## Key Points
+## 11. Key Points
 
 1. **Standard Library**: Comprehensive built-in functions for blockchain operations
 2. **Context Access**: Rich execution environment information available

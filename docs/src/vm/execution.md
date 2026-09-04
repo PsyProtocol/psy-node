@@ -1,8 +1,21 @@
 # VM Execution
 
+> Updated: 2026-09-04.
+
+## Abstract
+
 VM execution takes a `DPNFunctionCircuitDefinition` and generates witness data for zero-knowledge proof construction.
 
-## SimpleDPNExecutor
+## Table of Contents
+
+- [1. SimpleDPNExecutor](#1-simpledpnexecutor)
+- [2. Input](#2-input)
+- [3. Execution Process](#3-execution-process)
+- [4. Output](#4-output)
+- [5. Key Functions](#5-key-functions)
+- [6. Execution Result](#6-execution-result)
+
+## 1. SimpleDPNExecutor
 
 The executor maintains type-specific storage arrays:
 
@@ -26,14 +39,14 @@ pub struct SimpleDPNExecutor<F: RichField> {
 }
 ```
 
-## Input
+## 2. Input
 
 - **DPNFunctionCircuitDefinition**: Compiled bytecode with operations and state commands
 - **Function Parameters**: Concrete values for function inputs
 - **Blockchain Context**: User ID, contract ID, block height, nonce
 - **External State**: Storage values from blockchain state tree
 
-## Execution Process
+## 3. Execution Process
 
 1. Initialize executor with function inputs and blockchain context
 2. Process each `DPNIndexedVarDef` operation in sequence
@@ -41,7 +54,7 @@ pub struct SimpleDPNExecutor<F: RichField> {
 4. Execute operation and store result in appropriate type array
 5. Generate complete witness for proof construction
 
-## Output
+## 4. Output
 
 - **Witness Arrays**: Computed values in type-specific storage (targets, bools, u32s, etc.)
 - **State Command Witness**: Results from blockchain state operations
@@ -49,7 +62,7 @@ pub struct SimpleDPNExecutor<F: RichField> {
 - **State Changes**: Modified storage slots and new values
 - **Events**: Emitted contract events with parameters
 
-## Key Functions
+## 5. Key Functions
 
 ```rust
 pub fn resolve_target(&self, id: u64) -> F {
@@ -77,6 +90,6 @@ pub fn process_var_def(&mut self, op: &DPNIndexedVarDef) {
 }
 ```
 
-## Output
+## 6. Execution Result
 
 Execution produces witness data containing computed values in type-specific arrays, which are used for zero-knowledge proof generation.

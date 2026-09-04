@@ -1,108 +1,133 @@
 # Configuration
 
-The Psy network uses JSON-based configuration files to manage network parameters, node settings, and deployment configurations.
+> Updated: 2026-09-03.
 
-## Configuration Files
+## Abstract
 
-### config.json - Network Configuration
+The Psy network uses JSON configuration to define network identity, tree capacity, fees, service endpoints, Genesis data, and access restrictions. The checked-in configuration contains `localhost`, `sepolia`, and `ethereum` networks.
 
-The main configuration file defines network-wide parameters and multiple network environments.
+## Table of Contents
 
-#### Multi-Network Configuration
+- [1. Configuration File](#1-configuration-file)
+- [2. Core Network Parameters](#2-core-network-parameters)
+- [3. Service Endpoints](#3-service-endpoints)
+- [4. Genesis and Security](#4-genesis-and-security)
+- [5. Network Environments](#5-network-environments)
+- [6. Configuration Verification](#6-configuration-verification)
 
-The configuration file supports multiple networks with a default network setting:
+## 1. Configuration File
+
+The main `config.json` file supports multiple networks and selects one through `defaultNetwork`:
 
 ```json
 {
   "networks": {
     "localhost": {
       "magic": "0x1337CF514544CF69",
-      "users_per_realm": 1048576,
-      // ... other localhost config
+      "users_per_realm": 1048576
     },
-    "testnet": {
-      "magic": "0x2337CF514544CF69", 
-      "users_per_realm": 1048576,
-      // ... other testnet config
+    "sepolia": {
+      "magic": "0x1337CF514544C169",
+      "users_per_realm": 1048576
     },
-    "mainnet": {
-      "magic": "0x3337CF514544CF69",
-      "users_per_realm": 1048576,
-      // ... other mainnet config
+    "ethereum": {
+      "magic": "0x1337CF514544C069",
+      "users_per_realm": 1048576
     }
   },
   "defaultNetwork": "localhost"
 }
 ```
 
-Applications will use the `defaultNetwork` configuration unless explicitly switched to another network.
+Applications use `defaultNetwork` unless a network is selected explicitly. The network names and magic values are defined in `psy-genesis/config.json:3-4,71-72,139-140`.
 
-#### Core Network Parameters
+## 2. Core Network Parameters
 
-**Tree Height Configuration:**
+### 2.1 Tree capacity
+
 ```json
 {
-  "global_user_tree_height": 24,     // Total user tree height (supports 2^24 users)
-  "realm_user_tree_height": 20,     // Realm-level user tree height
-  "group_realm_height": 2,          // Each group has 2^2 = 4 realms
-  "users_per_realm": 1048576         // Users per realm (2^20)
+  "global_user_tree_height": 32,
+  "realm_user_tree_height": 20,
+  "group_realm_height": 1,
+  "users_per_realm": 1048576
 }
 ```
 
-**Tree Height Calculation:**
-- Total realms: 2^(24-20) = 2^4 = 16 realms
-- Realms per group: 2^2 = 4 realms
-- Number of groups: 16/4 = 4 groups
+The resulting capacity is:
 
-**Fee Structure:**
+- Total realms: $2^{32-20} = 4096$.
+- Realms per group: $2^1 = 2$.
+- Number of groups: $4096 / 2 = 2048$.
+- Users per realm: $2^{20} = 1{,}048{,}576$.
+
+These values are defined for each configured network in `psy-genesis/config.json:5-8,73-76,141-144`.
+
+### 2.2 Fees
+
 ```json
 {
   "fees": {
-    "guta_fee": 5000000000           // GUTA processing fee
+    "guta_fee": 1000000000
   }
 }
 ```
 
-**Currency Configuration:**
+The localhost fee is defined in `psy-genesis/config.json:57-61`.
+
+### 2.3 Currency
+
 ```json
 {
-  "native_currency": "PSY",           // Currency symbol
-  "native_currency_decimal": 9,       // Decimal places
-  "native_currency_name": "PSY Token" // Full currency name
+  "native_currency": "0",
+  "native_currency_decimal": 9,
+  "native_currency_name": "Psy",
+  "native_currency_symbol": "PSY"
 }
 ```
 
-#### Node Endpoints
+The localhost currency fields are defined in `psy-genesis/config.json:53-56`.
 
-**Coordinator Configuration:**
+## 3. Service Endpoints
+
+### 3.1 Coordinator
+
 ```json
 {
   "coordinator_configs": [
     {
       "id": 0,
-      "rpc_url": ["http://127.0.0.1:8545"]
+      "rpc_url": ["http://127.0.0.1:1337"]
     }
   ]
 }
 ```
 
-**Realm Configuration:**
+### 3.2 Realms
+
 ```json
 {
   "realm_configs": [
     {
       "id": 0,
-      "rpc_url": ["http://127.0.0.1:8546"]
+      "rpc_url": [
+        "http://127.0.0.1:13380",
+        "http://127.0.0.1:13381"
+      ]
     },
     {
-      "id": 1, 
-      "rpc_url": ["http://127.0.0.1:8547"]
+      "id": 1,
+      "rpc_url": [
+        "http://127.0.0.1:13390",
+        "http://127.0.0.1:13391"
+      ]
     }
   ]
 }
 ```
 
-**Supporting Services:**
+### 3.3 Supporting services
+
 ```json
 {
   "prove_proxy_url": ["http://127.0.0.1:9999"],
@@ -110,26 +135,30 @@ Applications will use the `defaultNetwork` configuration unless explicitly switc
 }
 ```
 
-#### Genesis Configuration
+The complete localhost endpoint set is defined in `psy-genesis/config.json:9-43`.
 
-**Genesis Users:**
-Genesis users are pre-registered users with known public keys:
+## 4. Genesis and Security
+
+### 4.1 Genesis users
+
+Genesis users are pre-registered with public-key parameters and fingerprints:
 
 ```json
 {
   "genesis": {
     "users": [
       {
-        "public_key_param": [/* field elements */],
-        "fingerprint": [/* field elements */]
+        "public_key_param": ["<field-element>"],
+        "fingerprint": ["<field-element>"]
       }
     ]
   }
 }
 ```
 
-**Genesis Contracts:**
-Pre-deployed contracts and their initial state:
+### 4.2 Genesis contracts
+
+Genesis contracts contain pre-deployed bytecode and initial state:
 
 ```json
 {
@@ -137,17 +166,18 @@ Pre-deployed contracts and their initial state:
     "precompiles": [
       {
         "name": "system_contract",
-        "deployer": [/* hash elements */],
-        "bytecode": [/* contract bytecode */]
+        "deployer": ["<hash-element>"],
+        "bytecode": ["<contract-bytecode>"]
       }
     ]
   }
 }
 ```
 
-#### Security Configuration
+### 4.3 Whitelist
 
-**Whitelist (Optional):**
+A network configuration can restrict accepted secp256k1 public keys:
+
 ```json
 {
   "whitelist": {
@@ -160,39 +190,20 @@ Pre-deployed contracts and their initial state:
 }
 ```
 
+## 5. Network Environments
 
-## Network Environments
+| Network | Purpose | Endpoint source |
+|---|---|---|
+| `localhost` | Local development and testing | Loopback addresses in `psy-genesis/config.json:9-69` |
+| `sepolia` | Ethereum Sepolia-backed deployment configuration | `psy-genesis/config.json:71-137` |
+| `ethereum` | Ethereum-backed deployment configuration | `psy-genesis/config.json:139-204` |
 
-### localhost
-- **Purpose**: Local development and testing
-- **User Registration Fee**: 0
-- **Contract Deployment Fee**: 0
-- **Endpoints**: Local addresses (127.0.0.1)
+The public testing deployment is suspended. The configured network selectors remain `localhost`, `sepolia`, and `ethereum`.
 
-### testnet
-- **Purpose**: Public testing environment
-- **Endpoints**: Public testnet URLs
+## 6. Configuration Verification
 
-### mainnet
-- **Purpose**: Production network
-- **Endpoints**: Production URLs
-
-## Key Configuration Parameters
-
-### Tree Heights
-- **Global User Tree**: 24 levels (supports 2^24 = 16.7M users)
-- **Realm User Tree**: 20 levels (2^20 = 1M users per realm)
-- **Total Realms**: 2^(24-20) = 16 realms
-- **Group Realm Height**: 2 levels (2^2 = 4 realms per group)
-- **Number of Groups**: 16/4 = 4 groups
-
-### Performance Tuning
-- **GUTA Fee**: Controls transaction batching economics
-- **Realm Count**: Horizontal scaling through multiple realms
-- **Worker Instances**: Parallel proof generation capacity
-
-### Security Settings
-- **Magic Number**: Network identifier for message signing
-- **Whitelist**: Optional public key restrictions
-- **Fee Structure**: Economic security parameters
-
+1. Confirm `defaultNetwork` names an entry under `networks`.
+2. Confirm every endpoint for the selected network uses the intended deployment.
+3. Confirm the magic value matches the selected network.
+4. Confirm tree heights and fees match the deployment configuration.
+5. Reject mixed endpoint sets that combine different networks.

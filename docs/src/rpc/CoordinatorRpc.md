@@ -1,5 +1,9 @@
 # Coordinator Edge RPC Documentation
 
+> Updated: 2026-09-04.
+
+## Abstract
+
 This document provides comprehensive documentation for all Coordinator Edge RPC methods defined in the `CoordinatorEdgeRpc` trait.
 
 **RPC Namespace**: `psy`
@@ -8,27 +12,31 @@ This document provides comprehensive documentation for all Coordinator Edge RPC 
 
 ## Table of Contents
 
-1. [User Management](#user-management)
-2. [Contract Management](#contract-management)
-3. [Block Operations](#block-operations)
-4. [GUTA Submission](#guta-submission)
-5. [Checkpoint Operations](#checkpoint-operations)
-6. [Checkpoint Sync](#checkpoint-sync)
-7. [L2 Block State Operations](#l2-block-state-operations)
-8. [User Registration Tree Operations](#user-registration-tree-operations)
-9. [User Tree Operations](#user-tree-operations)
-10. [Contract Function Tree Operations](#contract-function-tree-operations)
-11. [Contract Tree Operations](#contract-tree-operations)
-12. [Deposit Tree Operations](#deposit-tree-operations)
-13. [Withdrawal Tree Operations](#withdrawal-tree-operations)
-14. [Checkpoint Tree Operations](#checkpoint-tree-operations)
-15. [Reward Proofs Generation](#reward-proofs-generation)
-16. [Realm Status Operations](#realm-status-operations)
-17. [Data Structures](#data-structures)
+- [1. User Management](#1-user-management)
+- [2. Contract Management](#2-contract-management)
+- [3. Block Operations](#3-block-operations)
+- [4. GUTA Submission](#4-guta-submission)
+- [5. Checkpoint Operations](#5-checkpoint-operations)
+- [6. Checkpoint Sync](#6-checkpoint-sync)
+- [7. L2 Block State Operations](#7-l2-block-state-operations)
+- [8. User Registration Tree Operations](#8-user-registration-tree-operations)
+- [9. User Tree Operations](#9-user-tree-operations)
+- [10. Contract Function Tree Operations](#10-contract-function-tree-operations)
+- [11. Contract Tree Operations](#11-contract-tree-operations)
+- [12. Deposit Tree Operations](#12-deposit-tree-operations)
+- [13. Withdrawal Tree Operations](#13-withdrawal-tree-operations)
+- [14. Checkpoint Tree Operations](#14-checkpoint-tree-operations)
+- [15. Reward Proofs Generation](#15-reward-proofs-generation)
+- [16. Realm Status Operations](#16-realm-status-operations)
+- [17. Data Structures](#17-data-structures)
+- [18. Field Type Notes](#18-field-type-notes)
+- [19. Error Handling](#19-error-handling)
+- [20. Usage Examples](#20-usage-examples)
+- [21. Method Summary](#21-method-summary)
 
 ---
 
-## User Management
+## 1. User Management
 
 ### 1. register_user
 
@@ -120,7 +128,7 @@ curl -X POST http://localhost:8545 \
 
 ---
 
-## Contract Management
+## 2. Contract Management
 
 ### 3. deploy_contract
 
@@ -255,7 +263,7 @@ Get contract code definition by contract ID (Field parameter).
 
 ---
 
-## Block Operations
+## 3. Block Operations
 
 ### 8. build_block
 
@@ -286,7 +294,7 @@ curl -X POST http://localhost:8545 \
 
 ---
 
-## GUTA Submission
+## 4. GUTA Submission
 
 ### 9. submit_guta
 
@@ -327,7 +335,7 @@ Submit GUTA (Global User Tree Aggregator) result with proof.
 
 ### 10. submit_guta_v1
 
-Submit GUTA result with serialized proof (v1 format).
+Submit GUTA result with the serialized proof format accepted by `psy_submit_guta_v1`.
 
 **Method Name**: `psy_submit_guta_v1`
 
@@ -391,7 +399,7 @@ Submit realm processing result to coordinator.
 
 ---
 
-## Checkpoint Operations
+## 5. Checkpoint Operations
 
 ### 12. get_latest_checkpoint
 
@@ -525,7 +533,7 @@ Get global state roots at a specific checkpoint.
 
 ---
 
-## Checkpoint Sync
+## 6. Checkpoint Sync
 
 ### 18. get_checkpoint_sync_info
 
@@ -571,7 +579,7 @@ Get compact checkpoint sync information.
 
 ---
 
-## L2 Block State Operations
+## 7. L2 Block State Operations
 
 ### 20. get_latest_block_state
 
@@ -643,7 +651,7 @@ Get L2 block state at a specific checkpoint (Field parameter).
 
 ---
 
-## User Registration Tree Operations
+## 8. User Registration Tree Operations
 
 ### 23. get_user_registration_tree_root
 
@@ -779,7 +787,7 @@ Get Merkle proof for user registration tree (Field parameters).
 
 ---
 
-## User Tree Operations
+## 9. User Tree Operations
 
 ### 29. get_user_tree_root
 
@@ -992,7 +1000,7 @@ Get Merkle proof for user tree (Field parameters).
 
 ---
 
-## Contract Function Tree Operations
+## 10. Contract Function Tree Operations
 
 ### 38. get_contract_function_tree_root
 
@@ -1140,7 +1148,7 @@ Get Merkle proof for contract function tree (Field parameters).
 
 ---
 
-## Contract Tree Operations
+## 11. Contract Tree Operations
 
 ### 44. get_contract_tree_root
 
@@ -1276,7 +1284,7 @@ Get Merkle proof for contract tree (Field parameters).
 
 ---
 
-## Deposit Tree Operations
+## 12. Deposit Tree Operations
 
 ### 50. get_deposit_tree_root
 
@@ -1412,7 +1420,7 @@ Get Merkle proof for deposit tree (Field parameters).
 
 ---
 
-## Withdrawal Tree Operations
+## 13. Withdrawal Tree Operations
 
 ### 56. get_withdrawal_tree_root
 
@@ -1548,7 +1556,7 @@ Get Merkle proof for withdrawal tree (Field parameters).
 
 ---
 
-## Checkpoint Tree Operations
+## 14. Checkpoint Tree Operations
 
 ### 62. get_latest_checkpoint_tree_root
 
@@ -1696,7 +1704,7 @@ Get Merkle proof for checkpoint tree (Field parameters).
 
 ---
 
-## Reward Proofs Generation
+## 15. Reward Proofs Generation
 
 ### 69. generate_batch_variable_height_reward_proofs
 
@@ -1799,7 +1807,7 @@ curl -X POST http://localhost:8545 \
 
 ---
 
-## Realm Status Operations
+## 16. Realm Status Operations
 
 ### 71. get_current_realm_status_on_coordinator
 
@@ -1916,7 +1924,7 @@ Wait until coordinator completes a specific checkpoint for a realm.
 
 ---
 
-## Data Structures
+## 17. Data Structures
 
 ### QHashOut
 
@@ -2524,7 +2532,7 @@ pub struct RealmDataForCoordinatorHeader<F: RichField> {
 
 ---
 
-## Field Type Notes
+## 18. Field Type Notes
 
 Throughout this API, `F` represents a field element type (typically `GoldilocksField`).
 
@@ -2541,7 +2549,7 @@ Throughout this API, `F` represents a field element type (typically `GoldilocksF
 
 ---
 
-## Error Handling
+## 19. Error Handling
 
 All RPC methods return `RpcResult<T>` which can contain errors in the following format:
 
@@ -2564,7 +2572,7 @@ All RPC methods return `RpcResult<T>` which can contain errors in the following 
 
 ---
 
-## Usage Examples
+## 20. Usage Examples
 
 ### Complete User Registration Workflow
 
@@ -2680,7 +2688,7 @@ curl -X POST http://localhost:8545 \
 
 ---
 
-## Method Summary
+## 21. Method Summary
 
 | # | Method Name | Parameters | Returns | Description |
 |---|------------|------------|---------|-------------|
@@ -2712,6 +2720,6 @@ curl -X POST http://localhost:8545 \
 
 ---
 
-**Document Version**: 1.0  
-**Last Updated**: 2025-10-24  
+**Document Version**: 1.0
+**Last Updated**: 2025-10-24
 **Total RPC Methods**: 74

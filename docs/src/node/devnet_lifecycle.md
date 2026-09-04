@@ -1,10 +1,17 @@
 # Devnet Startup, Shutdown, Restart, and Rollback Lifecycle
 
-> Status: Approved. This is the required operating procedure for local Psy devnet work.
+> Updated: 2026-09-03.
+
+## Abstract
+
+`devnet_lifecycle.md` is the required operating procedure for local Psy devnet work: startup, shutdown,
+restart, and offline rollback keep the persisted Anvil chain, Scylla state, checkpoint files, and
+supervised processes aligned. Supported entry points are `make run-all`, `make restart`, `make
+rollback-stop`, `make rollback-resume`, `make shutdown`, and `make restart-all`.
 
 ## Purpose
 
-Use only the lifecycle below for local devnet startup, shutdown, restart, and offline rollback. It keeps the persisted Anvil chain, Scylla state, checkpoint files, and supervised processes aligned. Supported entry points are `make run-all`, `make restart`, `make rollback-stop`, `make rollback-resume`, `make shutdown`, and `make restart-all`.
+Use only this lifecycle for local devnet operations; it supersedes ad-hoc per-service startup and manual state repair.
 
 ## 1. Environment
 

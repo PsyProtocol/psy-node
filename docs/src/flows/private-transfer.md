@@ -1,17 +1,31 @@
 # Private Transfer Flow
 
+> Updated: 2026-09-04.
+
+## Abstract
+
 This document describes the private transfer and private claim flow on the Psy protocol. It is intended for auditors and integrators who need to verify the correctness of shielded transfers between users.
 
-## Overview
+## Table of Contents
+
+- [1. Overview](#1-overview)
+- [2. Architecture](#2-architecture)
+- [3. Private Transfer Flow](#3-private-transfer-flow)
+- [4. Key Invariants](#4-key-invariants)
+- [5. Error Cases](#5-error-cases)
+- [6. Verification](#6-verification)
+- [7. Nostr Delivery Security](#7-nostr-delivery-security)
+
+## 1. Overview
 
 A private transfer allows a sender to move tokens to a receiver without revealing the amount or recipient on the public L2 state. The flow uses a shielded note system:
 
 1. The **sender** creates a private note, generates a ZK proof, and publishes it via Nostr.
 2. The **receiver** discovers the note, verifies the proof, and submits a `private_claim` to credit the amount to their L2 balance.
 
-The key cryptographic primitive is the `PrivateNoteInclusionCircuit`, which proves that a note exists in the note tree and that the sender is authorized to spend it.
+The key cryptographic primitive is the `PrivateNoteInclusionCircuit`, which proves that a note exists in the note tree and that the sender is authorized to spend it. The L2 `private_claim` method does not re-verify that proof; it binds the UPS session proof tree to the circuit's minifier fingerprint `private_note_inclusion_fingerprint`. Updating that constant is a separate compiler/Genesis procedure: `docs/src/node/token-privacy-circuit-fingerprints.md`.
 
-## Architecture
+## 2. Architecture
 
 ### Roles
 
@@ -31,7 +45,7 @@ The key cryptographic primitive is the `PrivateNoteInclusionCircuit`, which prov
 | Nullifier Hash | `PoseidonHash(nullifier_secret)` — public nullifier used for spend tracking |
 | PrivateNoteInclusionCircuit | ZK circuit proving the note exists in the note tree and the sender is authorized to spend it |
 
-## Private Transfer Flow
+## 3. Private Transfer Flow
 
 ### Preconditions
 
@@ -44,7 +58,7 @@ The key cryptographic primitive is the `PrivateNoteInclusionCircuit`, which prov
 
 The receiver derives a shielded note owner using their private key and two random values (`r0`, `r1`):
 
-```
+```text
 note_owner = PoseidonHash(user_id, 1337, r0, r1)
 ```
 
@@ -54,7 +68,7 @@ The receiver must remember `r0` and `r1` — they are required to claim the note
 
 The sender calls `private-transfer` with the receiver's note owner:
 
-```
+```bash
 psy_user_cli private-transfer \
   --rpc-config <config> \
   -p <sender_private_key> \
@@ -113,7 +127,7 @@ The two-event design separates the public proof (verifiable by anyone) from the 
 
 The receiver discovers claimable private transfers via the psy-services API:
 
-```
+```text
 POST /api/v1/wallet/private-claimable
 {
   "nostr_pubkeys": [<receiver_npub>],
@@ -133,7 +147,7 @@ Items already flagged as `claimed` by the indexer are excluded.
 
 The receiver claims the note by submitting a `private_claim` contract call:
 
-```
+```bash
 psy_user_cli private-claim \
   --rpc-config <config> \
   -p <receiver_private_key> \
@@ -160,7 +174,7 @@ psy_user_cli private-claim \
 
 **Output:** A 9-felt `PrivateClaimEvent` is emitted on L2, and `psy-services` records the claim in `nullifier_claims`.
 
-## Key Invariants
+## 4. Key Invariants
 
 ### 1. Proof is Sender-Generated, Receiver-Submitted
 
@@ -170,7 +184,7 @@ The `PrivateNoteInclusionCircuit` proof is generated entirely by the sender. The
 
 Each private note has a unique `nullifier_hash = PoseidonHash(nullifier_secret)`. Once claimed, the nullifier is recorded in the L2 claim nullifier tree. A second claim attempt using the same proof is rejected:
 
-```
+```text
 assertion failed: nullifier already claimed
 ```
 
@@ -178,7 +192,7 @@ assertion failed: nullifier already claimed
 
 The `owner` field in the `NoteProofOutput` is the receiver's note owner hash (`PoseidonHash(user_id, 1337, r0, r1)`). The claiming user must match this owner. Using a different private key or different `r0`/`r1` values results in:
 
-```
+```text
 receiver does not match claiming user
 ```
 
@@ -190,7 +204,7 @@ The receiver must have sufficient L2 PSY balance to pay the claim transaction fe
 
 In the proving session, the external proof (note inclusion) must be inserted **before** the `private_claim` contract call step. The proof tree root changes after external proof insertion, and the claim inputs reference the new root. This ordering is enforced by `claim_batch()`.
 
-## Error Cases
+## 5. Error Cases
 
 | Error | Cause | Resolution |
 |-------|-------|------------|
@@ -199,8 +213,9 @@ In the proving session, the external proof (note inclusion) must be inserted **b
 | `insufficient balance for fee` | Receiver has no L2 PSY for gas | Fund receiver with `simple_mint` first |
 | `note proof deserialization failed` | Corrupted or wrong format proof file | Regenerate the proof file |
 | `stale trace anchor` | Checkpoint advanced during proving | Regenerate trace with fresh anchor |
+| `proof tree root mismatch` | `private_note_inclusion_fingerprint` or the PI `hash([...])` list does not match the circuit that produced the session leaf | Follow `docs/src/node/token-privacy-circuit-fingerprints.md` |
 
-## Verification
+## 6. Verification
 
 ### Verifying the Transfer Succeeded
 
@@ -215,7 +230,7 @@ In the proving session, the external proof (note inclusion) must be inserted **b
 3. Check `psy-services` `nullifier_claims` table for a record with `claim_type=transfer`.
 4. Attempting the same claim again should fail with `nullifier already claimed`.
 
-## Nostr Delivery Security
+## 7. Nostr Delivery Security
 
 - Event 1 (proof metadata) is published in plaintext. It contains the ZK proof and public inputs, which are safe to share — the proof reveals nothing about the private inputs.
 - Event 2 (claim material) is encrypted via NIP-59 gift wrap to the receiver's Nostr public key. Only the receiver can decrypt it.

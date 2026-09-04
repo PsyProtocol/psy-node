@@ -1,8 +1,13 @@
 # Modules and Visibility
 
+> Updated: 2026-09-03.
+
+## Abstract
+
+
 Modules in Psy organize code into logical units and control visibility of functions, structs, and other items. They help create clean, maintainable codebases for smart contracts.
 
-## Module Basics
+## 1. Module Basics
 
 ### Defining Modules
 
@@ -80,7 +85,7 @@ fn main() {
 }
 ```
 
-## Visibility Control
+## 2. Visibility Control
 
 ### Public vs Private Items
 
@@ -192,7 +197,7 @@ fn main() {
 }
 ```
 
-## Nested Modules
+## 3. Nested Modules
 
 ```rust
 mod contracts {
@@ -246,7 +251,7 @@ fn main() {
 }
 ```
 
-## Module Organization Patterns
+## 4. Module Organization Patterns
 
 ### Separation by Functionality
 
@@ -356,7 +361,7 @@ mod governance_contract {
 }
 ```
 
-## Module Constants and Types
+## 5. Module Constants and Types
 
 ```rust
 mod constants {
@@ -419,7 +424,7 @@ fn main() {
 }
 ```
 
-## Module Re-exports
+## 6. Module Re-exports
 
 ```rust
 mod internal {
@@ -475,7 +480,7 @@ fn main() {
 }
 ```
 
-## Best Practices
+## 7. Best Practices
 
 ### 1. Organize by Domain
 
@@ -540,7 +545,7 @@ mod api {
 }
 ```
 
-## Module Limitations
+## 8. Module Limitations
 
 Current limitations in Psy modules:
 
@@ -562,7 +567,7 @@ mod simple_module {
 // }
 ```
 
-## Summary
+## 9. Summary
 
 Modules in Psy provide:
 

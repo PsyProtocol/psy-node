@@ -1,5 +1,9 @@
 # Realm Edge RPC Documentation
 
+> Updated: 2026-09-04.
+
+## Abstract
+
 This document provides comprehensive documentation for all Realm Edge RPC methods defined in the `RealmEdgeRpc` trait.
 
 **RPC Namespace**: `psy`
@@ -8,23 +12,27 @@ This document provides comprehensive documentation for all Realm Edge RPC method
 
 ## Table of Contents
 
-1. [User Management](#user-management)
-2. [User End Cap Submission](#user-end-cap-submission)
-3. [Checkpoint Data Operations](#checkpoint-data-operations)
-4. [L2 Block State Operations](#l2-block-state-operations)
-5. [User Registration Tree Operations](#user-registration-tree-operations)
-6. [Checkpoint Tree Operations](#checkpoint-tree-operations)
-7. [User Leaf Data Operations](#user-leaf-data-operations)
-8. [User Contract State Tree Operations](#user-contract-state-tree-operations)
-9. [User Contract Tree Operations](#user-contract-tree-operations)
-10. [User Tree Operations](#user-tree-operations)
-11. [Batch Proof Generation](#batch-proof-generation)
-12. [GraphViz Export](#graphviz-export)
-13. [Data Structures](#data-structures)
+- [1. User Management](#1-user-management)
+- [2. User End Cap Submission](#2-user-end-cap-submission)
+- [3. Checkpoint Data Operations](#3-checkpoint-data-operations)
+- [4. L2 Block State Operations](#4-l2-block-state-operations)
+- [5. User Registration Tree Operations](#5-user-registration-tree-operations)
+- [6. Checkpoint Tree Operations](#6-checkpoint-tree-operations)
+- [7. User Leaf Data Operations](#7-user-leaf-data-operations)
+- [8. User Contract State Tree Operations](#8-user-contract-state-tree-operations)
+- [9. User Contract Tree Operations](#9-user-contract-tree-operations)
+- [10. User Tree Operations](#10-user-tree-operations)
+- [11. Batch Proof Generation](#11-batch-proof-generation)
+- [12. GraphViz Export](#12-graphviz-export)
+- [13. Data Structures](#13-data-structures)
+- [14. Field Type Notes](#14-field-type-notes)
+- [15. Error Handling](#15-error-handling)
+- [16. Usage Examples](#16-usage-examples)
+- [17. Method Summary](#17-method-summary)
 
 ---
 
-## User Management
+## 1. User Management
 
 ### 1. check_user_id_in_realm
 
@@ -68,7 +76,7 @@ curl -X POST http://localhost:8545 \
 
 ---
 
-## User End Cap Submission
+## 2. User End Cap Submission
 
 ### 2. submit_user_end_cap
 
@@ -94,7 +102,7 @@ Submit a user end cap proof for processing.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `user_ec_input` | `SubmitUserEndCapNonProofInput<F>` | End cap input data (see [Data Structures](#submitUserEndCapNonProofInput)) |
+| `user_ec_input` | `SubmitUserEndCapNonProofInput<F>` | End cap input data (see [Data Structures](#submituserendcapnonproofinput)) |
 | `proof` | `ProofWithPublicInputs<F, C, D>` | Zero-knowledge proof |
 
 **Response**:
@@ -110,7 +118,7 @@ Submit a user end cap proof for processing.
 
 ---
 
-## Checkpoint Data Operations
+## 3. Checkpoint Data Operations
 
 ### 3. get_checkpoint_leaf_data
 
@@ -166,7 +174,7 @@ Get checkpoint leaf data by checkpoint ID (Field parameter).
 
 ---
 
-## L2 Block State Operations
+## 4. L2 Block State Operations
 
 ### 5. get_latest_block_state
 
@@ -250,7 +258,7 @@ Get L2 block state at a specific checkpoint (Field parameter).
 
 ---
 
-## User Registration Tree Operations
+## 5. User Registration Tree Operations
 
 ### 8. get_user_registration_tree_root
 
@@ -280,7 +288,7 @@ Get the user registration tree root at a specific checkpoint.
 
 ---
 
-## Checkpoint Tree Operations
+## 6. Checkpoint Tree Operations
 
 ### 9. get_latest_checkpoint_tree_root
 
@@ -462,7 +470,7 @@ Get global state roots at a specific checkpoint.
 
 ---
 
-## User Leaf Data Operations
+## 7. User Leaf Data Operations
 
 ### 17. get_user_leaf_data
 
@@ -522,7 +530,7 @@ Get user leaf data at a specific checkpoint (Field parameters).
 
 ---
 
-## User Contract State Tree Operations
+## 8. User Contract State Tree Operations
 
 ### 19. get_user_contract_state_tree_root
 
@@ -682,7 +690,7 @@ Get Merkle proof for user contract state tree (Field parameters).
 
 ---
 
-## User Contract Tree Operations
+## 9. User Contract Tree Operations
 
 ### 25. get_user_contract_tree_root
 
@@ -830,7 +838,7 @@ Get Merkle proof for user contract tree (Field parameters).
 
 ---
 
-## User Tree Operations
+## 10. User Tree Operations
 
 ### 31. get_user_tree_root
 
@@ -1084,7 +1092,7 @@ Get Merkle proof for user tree (Field parameters).
 
 ---
 
-## Batch Proof Generation
+## 11. Batch Proof Generation
 
 ### 41. generate_batch_variable_height_reward_proofs
 
@@ -1157,7 +1165,7 @@ curl -X POST http://localhost:8545 \
 
 ---
 
-## GraphViz Export
+## 12. GraphViz Export
 
 ### 42. get_graphviz
 
@@ -1201,7 +1209,7 @@ curl -X POST http://localhost:8545 \
 
 ---
 
-## Data Structures
+## 13. Data Structures
 
 ### QHashOut
 
@@ -1585,7 +1593,7 @@ pub struct VariableHeightProofSibling {
 
 ---
 
-## Field Type Notes
+## 14. Field Type Notes
 
 Throughout this API, `F` represents a field element type (typically `GoldilocksField`).
 
@@ -1602,7 +1610,7 @@ Throughout this API, `F` represents a field element type (typically `GoldilocksF
 
 ---
 
-## Error Handling
+## 15. Error Handling
 
 All RPC methods return `RpcResult<T>` which can contain errors in the following format:
 
@@ -1624,7 +1632,7 @@ All RPC methods return `RpcResult<T>` which can contain errors in the following 
 
 ---
 
-## Usage Examples
+## 16. Usage Examples
 
 ### Complete Workflow Example
 
@@ -1672,7 +1680,7 @@ curl -X POST http://localhost:8545 \
 
 ---
 
-## Method Summary
+## 17. Method Summary
 
 | # | Method Name | Parameters | Returns | Description |
 |---|------------|------------|---------|-------------|
@@ -1693,6 +1701,6 @@ curl -X POST http://localhost:8545 \
 
 ---
 
-**Document Version**: 1.0  
-**Last Updated**: 2025-10-24  
+**Document Version**: 1.0
+**Last Updated**: 2025-10-24
 **Total RPC Methods**: 42

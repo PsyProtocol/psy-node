@@ -1,10 +1,25 @@
 # Psy Architecture: Horizontally Scalable Blockchain via PARTH and ZK Proofs
 
-## 1. Introduction: Beyond Sequential Limits
+> Updated: 2026-09-03.
+
+## Abstract
+
+This document describes how the PARTH state hierarchy, recursive zero-knowledge proof system, and node storage components combine to support horizontally scalable transaction processing.
+
+## Table of Contents
+
+- [1. Beyond Sequential Limits](#1-beyond-sequential-limits)
+- [2. PARTH Architecture](#2-parth-architecture)
+- [3. End-to-End Zero-Knowledge Proof System](#3-end-to-end-zero-knowledge-proof-system)
+- [4. Node State Architecture](#4-node-state-architecture-redis-and-kvq-backend)
+- [5. Security Guarantees](#5-security-guarantees)
+- [6. Conclusion](#6-conclusion)
+
+## 1. Beyond Sequential Limits
 
 The evolution of blockchain technology has been marked by a persistent challenge: **scalability**. Traditional designs, processing transactions sequentially within a monolithic state machine, hit a throughput ceiling that cannot be overcome simply by adding more network nodes. Psy represents a fundamental leap forward, tackling this bottleneck through a revolutionary state architecture known as **PARTH** and a meticulously designed, end-to-end **Zero-Knowledge Proof (ZKP)** system. This architecture unlocks true horizontal scalability, enabling unprecedented transaction processing capacity while maintaining rigorous cryptographic security.
 
-## 2. The PARTH Architecture: A Foundation for Parallelism
+## 2. PARTH Architecture
 
 PARTH (Parallelizable Account-based Recursive Transaction History) dismantles the concept of a single, conflict-prone global state. Instead, it establishes a granular, hierarchical structure where state modifications are naturally isolated, paving the way for massive parallel processing.
 
@@ -95,7 +110,7 @@ These rules eliminate the core bottleneck of traditional blockchains:
 *   **No Read-Write Conflicts:** Reading only the previous, immutable block state prevents race conditions where one transaction's read is invalidated by another's concurrent write.
 *   **Massively Parallel Execution & Proving:** The PARTH architecture guarantees that the execution of transactions (CFCs) and the generation of their initial proofs (UPS) for different users are independent processes that can run entirely in parallel without requiring locks or complex synchronization.
 
-## 3. End-to-End ZK Proof System: Securing Parallelism
+## 3. End-to-End Zero-Knowledge Proof System
 
 Psy employs a multi-layered, recursive ZK proof system to cryptographically guarantee the integrity of every state transition, even those occurring concurrently.
 
@@ -150,12 +165,12 @@ The network takes potentially millions of End Cap proofs and efficiently aggrega
 
 ### 3.4 Final Block Proof Generation
 
-*   **Role:** Creates the single, authoritative ZK proof for the entire block.
+*   **Role:** Creates the single, consolidated ZK proof for the entire block.
 *   **Circuit:** `PsyCheckpointStateTransitionCircuit`.
 *   **Function:** Takes the final aggregated state transition proofs from the Coordinator layer (representing net changes to `GUSR`, `GCON`, `URT`, etc.). Verifies these proofs. Computes the new global state roots and combines them with aggregated block statistics (`PsyCheckpointLeafStats`) to form the new `PsyCheckpointLeaf`. Proves the correct update of the `CHKP` tree by appending this new leaf hash. **Critically, it verifies that the entire process correctly transitioned from the state defined by the *previous block's finalized `CHKP` root* (provided as a public input).**
 *   **Output:** A highly succinct ZK proof whose public inputs are the previous `CHKP` root and the new `CHKP` root.
 
-## 4. Node State Architecture: Redis & KVQ Backend
+## 4. Node State Architecture: Redis and KVQ Backend
 
 Supporting this massive parallelism requires a high-performance, shared backend infrastructure.
 
@@ -163,7 +178,7 @@ Supporting this massive parallelism requires a high-performance, shared backend 
 *   **Abstraction Layer (KVQ):** A custom Rust library providing traits and adapters (`KVQSerializable`, `KVQStandardAdapter`, model types like `KVQFixedConfigMerkleTreeModel`) for structured, type-safe interaction with Redis. It simplifies key generation, serialization, and potentially caching.
 *   **Logical Components:**
     *   **Proof Store (`ProofStoreFred`, implements `QProofStore...` traits):** Stores ZK proofs and input witnesses, keyed by `QProvingJobDataID`. Uses Redis Hashes (`HSET`, `HGET`) and potentially atomic counters (`HINCRBY`) for managing job dependencies.
-    *   **State Store (Models implementing `PsyCoordinatorStore...`, `PsyRealmStore...` traits):** Stores the canonical blockchain state, primarily Merkle tree nodes (`KVQMerkleNodeKey`) and leaf data (`UserLeaf`, `ContractLeaf`, etc.). Uses standard Redis keys managed via KVQ models.
+    *   **State Store (Models implementing `PsyCoordinatorStore...`, `PsyRealmStore...` traits):** Stores the blockchain state used by the node, primarily Merkle tree nodes (`KVQMerkleNodeKey`) and leaf data (`UserLeaf`, `ContractLeaf`, etc.). Uses standard Redis keys managed by KVQ models.
     *   **Queues (`CheckpointDrainQueue`, `CheckpointHistoryQueue`, `WorkerEventQueue` traits):** Implement messaging between components. Uses Redis Lists (`LPUSH`, `LPOP`/`BLPOP`, `LRANGE`) for job queues and potentially Pub/Sub or simple keys/sorted sets for history tracking and notifications. `ProofStoreFred` often implements these queue interaction traits.
     *   **Local Caching (`PsyCmdStoreWithCache`, used within `PsyLocalProvingSessionStore`):** Provides an in-memory cache layer for frequently accessed state data (e.g., contract definitions, user leaves from the previous block) during local UPS execution or within Realm/Coordinator nodes, reducing load on the central Redis cluster.
 *   **Scalability:**
@@ -293,7 +308,7 @@ Psy's security rests on multiple pillars:
 3.  **Recursive Verification:** Each layer of aggregation cryptographically verifies the proofs from the layer below.
 4.  **Checkpoint Anchoring:** The final block circuit explicitly links the new state to the previous block's verified `CHKP` root, creating an unbroken chain of state validity.
 
-## 6. Conclusion: A New Era of Blockchain Scalability
+## 6. Conclusion
 
 Psy's architecture is a fundamental departure from sequential blockchain designs. By leveraging the **PARTH state model** for conflict-free parallel execution and securing it with an **end-to-end recursive ZKP system**, Psy achieves true horizontal scalability. The intricate dance between local user proving (UPS/CFC), distributed network aggregation (Realms/Coordinators/GUTA), and a scalable backend (Redis/KVQ) allows the network's throughput to grow with the addition of computational resources (Proving Workers), paving the way for decentralized applications demanding high performance and robust security.
 

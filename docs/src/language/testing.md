@@ -1,8 +1,13 @@
 # Testing
 
+> Updated: 2026-09-03.
+
+## Abstract
+
+
 Testing is an essential part of developing reliable smart contracts. Psy provides built-in support for writing and running tests using the `#[test]` attribute.
 
-## Writing Tests
+## 1. Writing Tests
 
 Tests in Psy are functions marked with the `#[test]` attribute. Create a test file (e.g., `test_math.psy`):
 
@@ -34,7 +39,7 @@ fn test_zero_multiplication() {
 }
 ```
 
-## Running Tests
+## 2. Running Tests
 
 To run tests, use the `dargo test` command:
 
@@ -44,7 +49,7 @@ dargo test --file test_math.psy
 
 This will execute all functions marked with `#[test]` and report the results.
 
-## Test Assertions
+## 3. Test Assertions
 
 Psy provides several assertion functions for testing:
 
@@ -66,7 +71,7 @@ fn test_assertions() {
 }
 ```
 
-## Current Limitations
+## 4. Current Limitations
 
 **Important:** `dargo test` currently has the following limitations:
 
@@ -76,7 +81,7 @@ fn test_assertions() {
 
 These limitations are being addressed in future releases.
 
-## Best Practices
+## 5. Best Practices
 
 1. **Separate test files**: Keep tests in dedicated `.psy` files separate from your main code
 2. **Descriptive names**: Use clear, descriptive names for test functions

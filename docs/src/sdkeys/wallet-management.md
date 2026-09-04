@@ -1,25 +1,41 @@
 # Wallet Management
 
-This guide covers wallet creation, management, and usage with Psy's SDKeys signature schemes.
+> Updated: 2026-09-04.
 
-## Creating Wallets
+## Abstract
 
-### Method 1: Create New Wallet
+
+This guide covers wallet creation, keystore management, user registration, transaction signing, mining-wallet use, and failure handling for Psy signature types.
+
+## Table of Contents
+
+- [1. Creating Wallets](#1-creating-wallets)
+- [2. Wallet Information](#2-wallet-information)
+- [3. User Registration](#3-user-registration)
+- [4. Signing Transactions](#4-signing-transactions)
+- [5. Keystore Management](#5-keystore-management)
+- [6. Multi-User Scenarios](#6-multi-user-scenarios)
+- [7. Mining Wallets](#7-mining-wallets)
+- [8. Security Practices](#8-security-practices)
+- [9. Troubleshooting](#9-troubleshooting)
+
+## 1. Creating Wallets
+
+### 1.1 Create a Wallet
 
 Generate a completely new wallet with random private key:
 
 ```bash
-# Create a new wallet (interactive)
+# Display a new wallet without writing a keystore file
 psy_user_cli wallet create
+
+# Write an encrypted keystore to an explicit path
+psy_user_cli wallet create --output <home>/.psy/keystore/miner0.json
 ```
 
-This command will:
-1. Generate a new private key
-2. Create an encrypted keystore file  
-3. Display the wallet information
-4. Save the wallet to `.wallets/` directory
+Without `--output`, the command displays the Ethereum address and public key but does not write a file. With `--output`, it prompts for a password unless `--password` is supplied, then writes the encrypted keystore to that path.
 
-### Method 2: Generate Random Wallet
+### 1.2 Generate Random Wallet Data
 
 Generate a random wallet with specified signature type:
 
@@ -31,18 +47,18 @@ psy_user_cli wallet random --sign-type zk
 psy_user_cli wallet random --sign-type secp256k1
 ```
 
-### Method 3: Import Existing Private Key
+### 1.3 Inspect an Existing Private Key
 
-If you have an existing private key, you can import it:
+Inspect an existing private key:
 
 ```bash
 # Get wallet info from private key
 psy_user_cli wallet info --private-key <your_private_key> --sign-type zk
 ```
 
-## Wallet Information
+## 2. Wallet Information
 
-### View Wallet Details
+### 2.1 View Wallet Details
 
 Display information about a wallet:
 
@@ -51,7 +67,7 @@ Display information about a wallet:
 psy_user_cli wallet info --private-key <private_key> --sign-type zk
 
 # View wallet info using keystore
-psy_user_cli wallet info --keystore-path .wallets/your_wallet.json
+psy_user_cli wallet info --keystore-path <home>/.psy/keystore/your_wallet.json
 ```
 
 Output includes:
@@ -60,45 +76,49 @@ Output includes:
 - Signature type
 - Key derivation information
 
-## User Registration
+## 3. User Registration
 
 Before using a wallet for transactions, you must register the user with the Psy network.
 
-### Register with ZK Signature (Recommended)
+### 3.1 Register with ZK Signature
 
 ```bash
 # Register user with ZK signature scheme
 psy_user_cli register-user --private-key <private_key> --sign-type zk
 
 # Register using keystore file
-psy_user_cli register-user --keystore-path .wallets/wallet.json --sign-type zk
+psy_user_cli register-user --keystore-path <home>/.psy/keystore/wallet.json --sign-type zk
 ```
 
-### Register with SECP256K1 Signature
+### 3.2 Register with SECP256K1 Signature
 
 ```bash
 # Register user with SECP256K1 signature scheme
 psy_user_cli register-user --private-key <private_key> --sign-type secp256k1
 
 # Register using keystore file  
-psy_user_cli register-user --keystore-path .wallets/wallet.json --sign-type secp256k1
+psy_user_cli register-user --keystore-path <home>/.psy/keystore/wallet.json --sign-type secp256k1
 ```
 
-### Registration Response
+### 3.3 Registration Output
 
-Successful registration returns:
-```json
+For a new registration, the command prints:
+
+```text
+registered user uuid: <uuid>
 {
-  "user_id": 12345,
-  "public_key": "0x...",
-  "transaction_hash": "0x...",
-  "checkpoint_id": 67890
+  "private_key": "<generated-private-key-if-created>",
+  "public_key_hash": "<public-key-hash>",
+  "fingerprint": "<fingerprint>",
+  "public_key_param": "<public-key-parameter>"
 }
 ```
 
-## Signing Transactions
+The `private_key` field appears only when the command generated the key. If the public key is already registered, the command prints the existing user identifiers and the same key information instead of submitting another registration.
 
-### Contract Calls
+## 4. Signing Transactions
+
+### 4.1 Contract Calls
 
 Execute contract methods using your wallet:
 
@@ -113,19 +133,19 @@ psy_user_cli call \
 
 # Call contract method with keystore
 psy_user_cli call \
-  --keystore-path .wallets/wallet.json \
+  --keystore-path <home>/.psy/keystore/wallet.json \
   --contract-id <contract_id> \
   --method-name <method_name> \
   --inputs "[param1, param2, ...]" \
   --sign-type zk
 ```
 
-### Example: Token Operations
+### 4.2 Token Operations
 
 ```bash
 # Mint tokens
 psy_user_cli call \
-  --keystore-path .wallets/treasury.json \
+  --keystore-path <home>/.psy/keystore/treasury.json \
   --contract-id 0 \
   --method-name simple_mint \
   --inputs "[1000000000000]" \
@@ -148,51 +168,48 @@ psy_user_cli call \
   --sign-type zk
 ```
 
-## Keystore Management
+## 5. Keystore Management
 
-### Keystore File Format
+### 5.1 Keystore Paths
 
-Psy uses encrypted keystore files for secure key storage:
+`wallet create` writes a keystore only when `--output` names the destination. `wallet list` uses `<home>/.psy/keystore` when `--keystore-dir` is omitted. For example:
 
-```bash
-# Keystore files are stored in .wallets/ directory
-.wallets/
+```text
+<home>/.psy/keystore/
 ├── miner0.json
 ├── miner1.json
 ├── treasury.json
 └── user_wallet.json
 ```
 
-### Creating Keystore from Private Key
+### 5.2 Create a Keystore
 
 ```bash
-# Create wallet and save as keystore
-psy_user_cli wallet create
-
-# This automatically creates an encrypted keystore file
-# Password protection is applied during creation
+psy_user_cli wallet create --output <home>/.psy/keystore/miner0.json
 ```
 
-### Using Keystore Files
+The command prompts for a password and writes the encrypted keystore to the explicit output path. Supply `--password` only through an appropriately protected invocation environment.
+
+### 5.3 Use Keystore Files
 
 ```bash
 # Register user using keystore
 psy_user_cli register-user \
-  --keystore-path .wallets/miner0.json \
+  --keystore-path <home>/.psy/keystore/miner0.json \
   --sign-type zk
 
 # Execute transactions using keystore
 psy_user_cli call \
-  --keystore-path .wallets/miner0.json \
+  --keystore-path <home>/.psy/keystore/miner0.json \
   --contract-id 0 \
   --method-name simple_mint \
   --inputs "[1000]" \
   --sign-type zk
 ```
 
-## Multi-User Scenarios
+## 6. Multi-User Scenarios
 
-### Multiple Wallets for Testing
+### 6.1 Multiple Wallets for Testing
 
 Create and register multiple users for testing:
 
@@ -205,15 +222,15 @@ sleep 0.5
 psy_user_cli register-user --private-key 73ae514d6f69510ad778a05128d980951d9d8c097beb022471b2f50f19c41268 --sign-type zk
 ```
 
-### Cross-User Transactions
+### 6.2 Cross-User Transactions
 
 ```bash
 # User 0 transfers to User 1
 psy_user_cli call \
   --private-key 17c975c2668ebe0ca7c87f67c6414ebb7fd664f46370a0af2a3b204c8824ac5a \
   --contract-id 0 \
-  --method-name batch_simple_transfer \
-  --inputs "[1, 0, 0, 0, 0, 250000000000, 0, 0, 0, 0]" \
+  --method-name simple_transfer \
+  --inputs "[1, 250000000000]" \
   --sign-type zk
 
 # User 1 claims the transfer
@@ -225,43 +242,43 @@ psy_user_cli call \
   --sign-type zk
 ```
 
-## Mining Wallets
+## 7. Mining Wallets
 
-### Create Mining Wallets
+### 7.1 Create Mining Wallets
 
 For mining operations, create dedicated wallets:
 
 ```bash
-# Create mining wallets
-psy_user_cli wallet create  # Creates .wallets/miner0.json
-psy_user_cli wallet create  # Creates .wallets/miner1.json
+# Create mining wallets at explicit paths
+psy_user_cli wallet create --output <home>/.psy/keystore/miner0.json
+psy_user_cli wallet create --output <home>/.psy/keystore/miner1.json
 
 # Register mining wallets
-psy_user_cli register-user --keystore-path .wallets/miner0.json --sign-type zk
-psy_user_cli register-user --keystore-path .wallets/miner1.json --sign-type zk
+psy_user_cli register-user --keystore-path <home>/.psy/keystore/miner0.json
+psy_user_cli register-user --keystore-path <home>/.psy/keystore/miner1.json
 ```
 
-### Use Mining Wallets
+### 7.2 Use Mining Wallets
 
 ```bash
 # Start mining with keystore
-psy_node_cli worker \
+psy_worker_cli worker \
   --config ./config.json \
-  --keystore-path .wallets/miner0.json \
-  --recipient 3145728
+  --keystore-path <home>/.psy/keystore/miner0.json \
+  --user 3145728 \
+  --completed-jobs-log-file worker.backup
 
 # Claim mining rewards
 psy_user_cli claim-rewards \
-  --keystore-path .wallets/miner0.json \
-  --sign-type zk \
-  --limit 10000
+  --keystore-path <home>/.psy/keystore/miner0.json \
+  --jobs-file worker.backup
 ```
 
-## Security Best Practices
+## 8. Security Practices
 
 ### Key Storage
 
-1. **Backup Keystore Files**: Keep secure copies of `.wallets/` directory
+1. **Backup Keystore Files**: Keep secure copies of `<home>/.psy/keystore`.
 2. **Strong Passwords**: Use strong passwords for keystore encryption
 3. **Access Control**: Limit file system access to keystore files
 4. **Hardware Security**: Consider hardware wallets for high-value operations
@@ -284,14 +301,14 @@ unset PRIVATE_KEY
 3. **Monitoring**: Monitor wallet activity and unusual transactions
 4. **Backup Strategy**: Maintain secure, distributed backups
 
-## Troubleshooting
+## 9. Troubleshooting
 
 ### Common Issues
 
 **Keystore file not found:**
 ```bash
 # Verify keystore path
-ls -la .wallets/
+psy_user_cli wallet list --keystore-dir <home>/.psy/keystore
 # Ensure file exists and has correct permissions
 ```
 
@@ -314,29 +331,3 @@ psy_user_cli register-user --private-key <key> --sign-type zk
 2. **Hardware considerations**: Ensure adequate CPU and memory
 3. **Network latency**: Use reliable network connections
 4. **Batch operations**: Group multiple transactions when possible
-
-## Advanced Usage
-
-### Custom Circuit Integration
-
-Future versions will support custom signature circuits:
-
-```bash
-# Placeholder for future custom circuit support
-psy_user_cli register-user \
-  --circuit-path ./my_custom_circuit.json \
-  --private-key <private_key> \
-  --sign-type custom
-```
-
-### Integration with Hardware Wallets
-
-Planning for hardware wallet integration:
-
-```bash
-# Future hardware wallet support
-psy_user_cli register-user \
-  --hardware-wallet ledger \
-  --derivation-path "m/44'/60'/0'/0/0" \
-  --sign-type zk
-```

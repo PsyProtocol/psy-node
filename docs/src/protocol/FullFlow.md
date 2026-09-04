@@ -1,6 +1,23 @@
 # Psy Protocol Wiki: Achieving Scalability with PARTH and ZK Proofs
 
-## 1. Introduction: The Scalability Challenge and Psy's Solution
+> Updated: 2026-09-03.
+
+## Abstract
+
+This document traces Psy transaction processing from user proving through parallel aggregation to final block proof generation, including the assumptions carried and discharged by each circuit stage.
+
+## Table of Contents
+
+- [1. Scalability Challenge and Psy Approach](#1-scalability-challenge-and-psy-approach)
+- [2. PARTH Architecture](#2-parth-architecture)
+- [3. End-to-End Zero-Knowledge Proof Flow](#3-end-to-end-zero-knowledge-proof-flow)
+- [4. User Proving Session Circuits](#4-user-proving-session-circuits)
+- [5. Global User Tree Aggregation Circuits](#5-global-user-tree-aggregation-circuits)
+- [6. Final Block Proof Generation](#6-final-block-proof-generation)
+- [7. Assumption Reduction](#7-assumption-reduction)
+- [8. Conclusion](#8-conclusion)
+
+## 1. Scalability Challenge and Psy Approach
 
 Traditional blockchains often face a **serial execution bottleneck**. Transactions are typically processed one after another within a single state machine context. Adding more validator nodes doesn't necessarily increase the overall transaction processing capacity (TPS), as they all work on the same sequential task list. Attempts at parallel execution often introduce complexity, race conditions, and potential state inconsistencies.
 
@@ -11,7 +28,7 @@ Psy (Quantum Entangled Data) tackles this fundamental limitation through two cor
 
 This wiki page details the journey of a transaction from user initiation to final block inclusion, focusing on the ZK circuits involved, the assumptions they make, what they prove, and how these assumptions are systematically verified and discharged throughout the process.
 
-## 2. The PARTH Architecture: Foundation for Parallelism
+## 2. PARTH Architecture
 
 PARTH reorganizes blockchain state into a hierarchy of Merkle trees, enabling fine-grained state access and modification control:
 
@@ -29,7 +46,7 @@ PARTH reorganizes blockchain state into a hierarchy of Merkle trees, enabling fi
 
 Because write operations are isolated and reads access immutable past state, transactions from *different users* within the *same block* operate independently and cannot conflict. This architectural design is the cornerstone of Psy's horizontal scalability.
 
-## 3. The Big Picture: End-to-End ZK Proof Flow
+## 3. End-to-End Zero-Knowledge Proof Flow
 
 The process of validating transactions and building a block involves three main phases, each relying on specific ZK circuits:
 
@@ -37,7 +54,7 @@ The process of validating transactions and building a block involves three main 
 2.  **Phase 2: Global User Tree Aggregation (GUTA) - Parallel Network Execution:** The Psy network's Decentralized Proving Network (DPN) takes End Cap proofs (and other GUTA-related proofs like registrations) from many users and aggregates them in parallel using specialized GUTA circuits.
 3.  **Phase 3: Final Block Proof Generation:** A final aggregation step combines the top-level GUTA proof (representing all user state changes) with proofs for other global state changes (like contract deployments) into a single block proof anchored to the previous block's state.
 
-## 4. Phase 1: User Proving Session (UPS) Circuits
+## 4. User Proving Session Circuits
 
 This phase occurs locally, building a user-specific proof chain.
 
@@ -129,7 +146,7 @@ This phase occurs locally, building a user-specific proof chain.
 *   **Contribution to Horizontal Scalability:** Packages the user's entire block activity into a single, efficiently verifiable proof. This proof can be submitted to the network and processed by the GUTA layer in parallel with End Cap proofs from countless other users.
 *   **High-Level Functionality:** Securely concludes and authorizes a user's transaction batch, preparing it for network-level aggregation.
 
-## 5. Phase 2: Global User Tree Aggregation (GUTA) Circuits
+## 5. Global User Tree Aggregation Circuits
 
 The DPN receives End Cap proofs and potentially other state change proofs (like user registrations) and aggregates them in parallel using GUTA circuits. These circuits operate on `GlobalUserTreeAggregatorHeader` structures, which track state transitions within the Global User Tree (`GUSR`).
 
@@ -226,7 +243,7 @@ The DPN receives End Cap proofs and potentially other state change proofs (like 
 *   **Contribution to Horizontal Scalability:** Ensures the GUTA aggregation process can produce valid proofs even for periods of inactivity in user state changes, keeping the aggregation synchronized with the progressing checkpoint tree.
 *   **High-Level Functionality:** Allows the GUTA layer to represent a "no-op" state transition correctly anchored to an updated checkpoint.
 
-## 6. Phase 3: Final Block Proof Generation
+## 6. Final Block Proof Generation
 
 ### 6.1. Checkpoint Tree "Block" Circuit (Top-Level Aggregation)
 
@@ -247,7 +264,7 @@ The DPN receives End Cap proofs and potentially other state change proofs (like 
 *   **Contribution to Horizontal Scalability:** This final step takes the output of the massively parallel GUTA aggregation and produces a single, constant-size ZK proof for the entire block's validity. Verifying this proof is extremely fast, regardless of how many transactions were processed in parallel.
 *   **High-Level Functionality:** Creates the final, succinct, and efficiently verifiable proof for the entire block, cryptographically linking it to the previous block and enabling trustless verification of the entire chain's state transition.
 
-## 7. Assumption Reduction Summary: The Journey to Trustlessness
+## 7. Assumption Reduction
 
 The Psy circuit flow demonstrates a progressive reduction and discharge of assumptions:
 
@@ -260,7 +277,7 @@ The Psy circuit flow demonstrates a progressive reduction and discharge of assum
 
 This journey transforms broad initial assumptions about state correctness into a single, verifiable dependency on the previously accepted state, underpinned by the mathematical certainty of ZK proofs.
 
-## 8. Conclusion: Scalability Through Parallelism and Proofs
+## 8. Conclusion
 
 Psy achieves true horizontal scalability by combining:
 

@@ -1,15 +1,28 @@
 # Deposit and Withdrawal Flow
 
+> Updated: 2026-09-04.
+
+## Abstract
+
 This document describes the end-to-end bridge flow for L1→L2 deposits and L2→L1 withdrawals on the Psy protocol. It is intended for auditors and integrators who need to verify the correctness of the full bridge lifecycle.
 
-## Overview
+## Table of Contents
+
+- [1. Overview](#1-overview)
+- [2. Architecture](#2-architecture)
+- [3. Deposit Flow (L1→L2)](#3-deposit-flow-l1l2)
+- [4. Withdrawal Flow (L2→L1)](#4-withdrawal-flow-l2l1)
+- [5. Full Round-Trip Verification](#5-full-round-trip-verification)
+- [6. Key Invariants](#6-key-invariants)
+
+## 1. Overview
 
 The bridge connects an EVM L1 (e.g. Ethereum, Anvil) to the Psy L2. Two assets flow across it:
 
 - **Deposits** (L1→L2): A user locks ERC-20 tokens on L1 via the Router contract. A relayer proves the deposit on L2, after which the user claims the deposited amount on L2.
 - **Withdrawals** (L2→L1): A user burns L2 tokens via a `withdraw` contract call. A relayer aggregates withdrawals and submits a Groth16 proof to L1, releasing the tokens to the original recipient.
 
-## Architecture
+## 2. Architecture
 
 ### Roles
 
@@ -37,7 +50,9 @@ The bridge connects an EVM L1 (e.g. Ethereum, Anvil) to the Psy L2. Two assets f
 | `withdrawal_tree` contract | Stores L2 withdrawal leaves |
 | Token contracts (e.g. PSY=0, USDT=4) | User balances and claim nullifier tracking |
 
-## Deposit Flow (L1→L2)
+L2 `claim_deposit` binds the UPS session proof tree to `shield_claim_fingerprint` (the minifier fingerprint of `DepositInclusionCircuit`, protocol alias `ShieldDepositClaimCircuit`). Updating that constant follows `docs/src/node/token-privacy-circuit-fingerprints.md`.
+
+## 3. Deposit Flow (L1→L2)
 
 ### Preconditions
 
@@ -73,7 +88,7 @@ The depositor calls `Router.deposit(token, amount, shieldAddress, noteCommitment
 
 **Deposit leaf encoding:**
 
-```
+```solidity
 leaf = keccak256(abi.encodePacked(
     shieldAddress,       // bytes32
     tokenBytes32,        // bytes32 (left-padded EVM address)
@@ -98,7 +113,7 @@ The bridge relayer daemon performs the following in a loop:
 Once the relayer has proven the deposit, the sender-side backup generator can
 fetch a Merkle inclusion proof from psy-services:
 
-```
+```text
 GET /api/v1/bridge/deposit-claim-proof
     ?deposit_index=<index>
     &source_chain_index=<chain_index>
@@ -141,7 +156,7 @@ The receiver claims the deposit by submitting a `claim_deposit` contract call on
 
 **Verification of claim status:**
 
-```
+```text
 nullifier_hash = PoseidonHash(nullifier_secret)
 claimKey = PoseidonHash(SHIELD_CLAIM_NAMESPACE, nullifier_hash)
 isClaimed = query L2 IMT for claimKey in token contract
@@ -157,7 +172,7 @@ isClaimed = query L2 IMT for claimKey in token contract
 | `nullifier already claimed` | Deposit was already claimed | Check `isDepositClaimed()` before attempting |
 | `stale trace anchor` | Checkpoint advanced during proving | Regenerate trace with fresh anchor |
 
-## Withdrawal Flow (L2→L1)
+## 4. Withdrawal Flow (L2→L1)
 
 ### Preconditions
 
@@ -169,7 +184,7 @@ isClaimed = query L2 IMT for claimKey in token contract
 
 The user calls the `withdraw` method on the appropriate L2 token contract:
 
-```
+```text
 inputs: [dest_chain_id, token_address_u32x8, amount_u32x8, recipient_u32x8, nonce]
 ```
 
@@ -182,7 +197,7 @@ inputs: [dest_chain_id, token_address_u32x8, amount_u32x8, recipient_u32x8, nonc
 The relayer daemon:
 1. Scans pending withdrawals from psy-services.
 2. Computes withdrawal leaf hashes using Poseidon (not keccak):
-   ```
+   ```text
    leaf = PoseidonHash(sender_user_id_u32 ++ recipient_u32x8 ++ token_address_u32x8 ++ amount_u32x8 ++ nonce_u32x8 ++ dest_chain_index_u32)
    ```
 3. Submits L2 `append_withdrawal` / `batch_append_withdrawals` contract calls.
@@ -192,7 +207,7 @@ The relayer daemon:
 
 Once the withdrawal is finalized, psy-services provides a claim proof:
 
-```
+```text
 GET /api/v1/bridge/withdrawal-claim-proof
 ```
 
@@ -220,7 +235,7 @@ The relayer (or manual CLI) calls `Bridge.batchClaimWithdrawal()` on L1:
 
 **Idempotency check:**
 
-```
+```solidity
 isClaimed = Bridge.claimedNullifiers(raw_nonce_bytes32)
 ```
 
@@ -229,11 +244,11 @@ isClaimed = Bridge.claimedNullifiers(raw_nonce_bytes32)
 | Error | Cause | Resolution |
 |-------|-------|------------|
 | `NullifierAlreadyClaimed()` | Relayer already claimed this withdrawal | Check `claimedNullifiers` before manual claims |
-| `withdrawal-claim-proof not found` | Withdrawal not yet finalized | Wait for relayer to append and finalize |
+| `withdrawal claim proof not ready yet; will retry` | Withdrawal not yet finalized | Wait for relayer to append and finalize |
 | `bridge ERC20 liquidity insufficient` | Bridge contract lacks token balance | Deposit tokens to bridge first |
 | `destination chain index out of range` | Used EVM chainId instead of bridge chain index | Use bridge chain index (0 for local) |
 
-## Full Round-Trip Verification
+## 5. Full Round-Trip Verification
 
 A complete deposit→claim→withdraw→claim cycle:
 
@@ -245,7 +260,7 @@ A complete deposit→claim→withdraw→claim cycle:
    - `Bridge.claimedNullifiers(withdrawal_nonce) == true`
    - L2 IMT shows deposit nullifier as claimed
 
-## Key Invariants
+## 6. Key Invariants
 
 1. **Deposit leaf binding**: `note_commitment = PoseidonHash(nullifier_secret || note_secret)` — the commitment cryptographically binds the nullifier to the note, preventing unauthorized claims.
 2. **Nullifier uniqueness**: Each deposit and withdrawal has a unique nullifier. Double-claims are rejected by the L2 contract (deposits) or L1 contract (withdrawals).

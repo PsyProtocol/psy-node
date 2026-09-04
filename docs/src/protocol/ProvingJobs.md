@@ -1,10 +1,27 @@
 # Proving Jobs Architecture
 
-## Overview
+> Updated: 2026-09-03.
+
+
+## Abstract
 
 This document describes the proving jobs architecture for both Realm and Coordinator processors, including the tree structure of different proof types and their public inputs layout.
 
-## Public Inputs Layout Standard
+## Table of Contents
+
+- [1. Public Input Layouts](#1-public-input-layouts)
+- [2. Realm Proving Jobs](#2-realm-proving-jobs)
+- [3. Coordinator Proving Jobs](#3-coordinator-proving-jobs)
+- [4. Global User Tree Aggregator Circuit Variants](#4-global-user-tree-aggregator-circuit-variants)
+- [5. State Part 1](#5-state-part-1)
+- [6. Checkpoint State Transition](#6-checkpoint-state-transition)
+- [7. Job Dependencies and Task Graph](#7-job-dependencies-and-task-graph)
+- [8. Commitment Calculation Rules](#8-commitment-calculation-rules)
+- [9. Core Proving Circuits](#9-core-proving-circuits)
+- [10. Proof Miner Job Statistics](#10-proof-miner-job-statistics)
+- [11. Design Principles](#11-design-principles)
+
+## 1. Public Input Layouts
 
 **IMPORTANT**: Different circuit types have different public inputs layouts!
 
@@ -28,7 +45,7 @@ This document describes the proving jobs architecture for both Realm and Coordin
 - **[12..16]**: hash(guta_commitment, guta_worker_pk)
 - **[16..19]**: additional data
 
-## Realm Proving Jobs
+## 2. Realm Proving Jobs
 
 ### User Operations Tree
 
@@ -66,7 +83,7 @@ graph TB
 | AggregateUserOps | Intermediate | [0..4]: commitment<br/>[4..8]: worker_public_key<br/>[8..11]: pm_jobs_completed_stats<br/>[11..15]: agg_hash | commitment = hash(hash(left.commitment, right.commitment), worker_public_key) |
 | RealmStateTransition | Root | [0..4]: commitment<br/>[4..8]: worker_public_key<br/>[8..11]: pm_jobs_completed_stats<br/>[11..15]: state_transition_hash | commitment = hash(hash(children), worker_public_key) |
 
-## Coordinator Proving Jobs
+## 3. Coordinator Proving Jobs
 
 ### Three Main Trees + Final Aggregation
 
@@ -143,7 +160,7 @@ graph TB
     STATE_PART_1 --> CHECKPOINT
 ```
 
-## GUTA Circuit Variants
+## 4. Global User Tree Aggregator Circuit Variants
 
 The GUTA (Global User Tree Aggregator) has multiple circuit variants to handle different scenarios:
 
@@ -183,7 +200,7 @@ graph LR
 
 All follow the same commitment calculation rules based on their dependency count.
 
-## State Part 1 (AggUserRegistrationDeployContractsGUTA)
+## 5. State Part 1
 
 This circuit aggregates the three main trees:
 
@@ -220,7 +237,7 @@ PMRewardCommitment {
 }
 ```
 
-## Checkpoint State Transition
+## 6. Checkpoint State Transition
 
 The final circuit that creates the checkpoint proof:
 
@@ -237,7 +254,7 @@ The final circuit that creates the checkpoint proof:
 - **[11..15]**: old_checkpoint_tree_root
 - **[15..19]**: new_checkpoint_tree_root
 
-## Job Dependencies and Task Graph
+## 7. Job Dependencies and Task Graph
 
 ```mermaid
 graph LR
@@ -266,7 +283,7 @@ The dependency graph shows how PM stats flow through the system:
 3. **Checkpoint**: Preserves the combined PM stats for final reward calculation
 4. **Block Completion**: Uses PM stats to calculate and distribute rewards
 
-## Commitment Calculation Rules
+## 8. Commitment Calculation Rules
 
 The commitment calculation follows a consistent pattern across all circuits:
 
@@ -304,7 +321,7 @@ Examples: GUTATwoGUTA, GUTATwoGUTAWithCheckpointUpgrade, GUTATwoEndCap, GUTALeft
    - **AggUserRegistration**: Unique layout combining all three trees
    - **Checkpoint**: Final proof creating the rollup state transition
 
-## Core Proving Circuits
+## 9. Core Proving Circuits
 
 ### Coordinator Main Circuits (19 inputs)
 
@@ -346,7 +363,7 @@ Examples: GUTATwoGUTA, GUTATwoGUTAWithCheckpointUpgrade, GUTATwoEndCap, GUTALeft
 | **VerifyAggUserRegistrationDeployContractsGUTA** | 3 proofs (user_reg + deploy + guta) | **UNIQUE LAYOUT**: `[0..4]` = state_transition_hash (NOT commitment!) |
 | **PsyCheckpointStateTransition** | 1 proof (state_part_1) | Standard 19-input layout |
 
-## PM Jobs Completed Stats Tracking
+## 10. Proof Miner Job Statistics
 
 The PM (Proof Miner) jobs completed stats track the number of different types of jobs completed throughout the circuit hierarchy. These stats flow upward through the trees and are combined at aggregation points.
 
@@ -396,7 +413,7 @@ final_pm_stats = register_users_proof.pm_stats +
 
 This provides a complete count of all work performed in the current checkpoint.
 
-## Key Design Principles
+## 11. Design Principles
 
 1. **Consistent Public Inputs**: All circuits follow the same [commitment, worker_public_key, pm_jobs_completed_stats, data_hash] layout
 2. **Tree Aggregation**: Each category (GUTA, Register Users, Deploy Contracts) forms its own tree

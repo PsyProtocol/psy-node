@@ -1,8 +1,21 @@
 # SDKeys Overview
 
-Software-Defined Keys (SDKeys) is Psy's innovative signature system that allows users to define custom cryptographic circuits as their signing scheme. Unlike traditional fixed signature schemes, SDKeys enables programmable cryptography where users can implement their own zero-knowledge proof circuits for authentication.
+> Updated: 2026-09-04.
 
-## Key Concepts
+## Abstract
+
+
+Software-Defined Keys (SDKeys) allow users to define custom cryptographic circuits as their signing scheme. Instead of relying only on fixed signature schemes, an SDKey can express programmable authorization logic as a circuit.
+
+## Table of Contents
+
+- [1. Key Concepts](#1-key-concepts)
+- [2. Signature Types](#2-signature-types)
+- [3. Use Cases](#3-use-cases)
+- [4. Getting Started](#4-getting-started)
+- [5. Security Considerations](#5-security-considerations)
+
+## 1. Key Concepts
 
 ### Software-Defined Signatures
 
@@ -19,7 +32,7 @@ In traditional blockchain systems, signature schemes are hardcoded (e.g., ECDSA,
 3. **Verification**: The network verifies proofs against the circuit's public parameters
 4. **Authentication**: Valid proofs authorize transactions without requiring traditional private keys
 
-### Revolutionary Features
+### Programmable Features
 
 **Beyond Private Keys**: SDKeys enable a new paradigm of public, constraint-based accounts:
 
@@ -28,7 +41,7 @@ In traditional blockchain systems, signature schemes are hardcoded (e.g., ECDSA,
 - **Constraint-Based Authorization**: The circuit defines what calls are allowed, not who can make them
 - **Programmable Logic**: Complex business logic encoded directly in the authorization layer
 
-**Key Innovation**: 
+**Authorization model:**
 - **From Identity to Logic**: Authentication shifts from "who you are" (private key) to "what you can prove" (circuit satisfaction)
 - **Public Smart Accounts**: Create accounts that anyone can use but with built-in constraints on how they operate
 - **Decentralized Services**: Deploy autonomous services that operate according to mathematical rules rather than trust
@@ -37,28 +50,31 @@ In traditional blockchain systems, signature schemes are hardcoded (e.g., ECDSA,
 
 - **Programmable Authorization**: Define complex authorization logic in circuits
 - **Trustless Automation**: Bots and agents without trusted operators
-- **Quantum Resistance**: ZK-based authentication immune to quantum attacks
+- **Constraint-Based Authorization**: Authorization logic enforced as circuit constraints, not operator policy
 - **Privacy Enhancement**: Hide authorization logic while proving compliance
 - **Flexible Security Models**: Choose between private keys, public constraints, or hybrid approaches
 
-## Built-in Signature Schemes
+## 2. Signature Types
 
-Psy provides two built-in signature schemes for immediate use, plus support for custom circuits:
+`SignType` provides six signature types:
 
-- **ZK Key**: Optimized zero-knowledge signature scheme (recommended)
-- **SECP256K1**: ECDSA-compatible scheme for legacy integration
-- **Custom Circuits**: User-defined authorization logic for advanced use cases
+- **ZK**: `zk`
+- **SECP256K1**: `secp256k1`
+- **Ethereum personal-sign SECP256K1**: `eth-personal-secp256k1`
+- **Software-defined DPN**: `software-defined-dpn`
+- **Software-defined Plonky2**: `software-defined-plonky2`
+- **SDKey**: `sd-key`
 
 For detailed technical specifications and performance comparisons, see [Signature Schemes](signature-schemes.md).
 
-## Use Cases
+## 3. Use Cases
 
 ### Traditional Use Cases (With Private Keys)
 - **Personal Wallets**: Fast ZK-based transaction signing
 - **Enhanced Privacy**: Hide transaction patterns and amounts
 - **Multi-Factor Auth**: Combine multiple secrets or conditions
 
-### Revolutionary Use Cases (Public Circuit Deployment)
+### Public Circuit Deployment
 
 #### Deployable Public Services
 
@@ -66,8 +82,8 @@ For detailed technical specifications and performance comparisons, see [Signatur
 
 ```psy
 // Example: Public Liquidation Service
-#[software_defined_signature]
-pub fn liquidation_bot_auth(
+// Illustrative `authorize` method inside a software-defined key contract.
+pub fn authorize(
     contract_id: Felt,
     inputs: &[Felt],
     position_health: PositionHealthProof,
@@ -92,8 +108,8 @@ pub fn liquidation_bot_auth(
 }
 
 // Example: Public Treasury Management  
-#[software_defined_signature]
-pub fn treasury_bot_auth(
+// Illustrative `authorize` method inside a separate software-defined key contract.
+pub fn authorize(
     contract_id: Felt,
     method_name: &str,
     inputs: &[Felt],
@@ -128,8 +144,8 @@ pub fn treasury_bot_auth(
 **Using Psy Language (DPN Software Defined):**
 ```psy
 // Define a software-defined signature circuit in Psy language
-#[software_defined_signature]
-pub fn trading_bot_auth(
+// Illustrative `authorize` method inside a software-defined key contract.
+pub fn authorize(
     contract_id: Felt,
     method_name: &str, 
     inputs: &[Felt],
@@ -167,18 +183,19 @@ let fingerprint = circuit_manager
 
 // Deploy DPNSoftwareDefinedCallData
 let call_data = DPNSoftwareDefinedCallData {
-    contract_id: TRADING_CONTRACT_ID,
     inputs: vec![amount, price, slippage_limit, market_condition],
 };
 ```
 
-**After deployment, anyone can trigger trades:**
+**After deployment, callers provide the software-defined inputs with the matching signature type:**
+
 ```bash
-# Anyone can call this software-defined account
 psy_user_cli call \
-  --software-defined-call \
+  --sign-type software-defined-dpn \
+  --sign-inputs "[1000, 95000, 500, 1]" \
   --contract-id 0 \
-  --inputs "[1000, 95000, 500, 1]" \
+  --method-name main \
+  --inputs "[]" \
   --fingerprint <trading_bot_fingerprint>
 ```
 
@@ -197,16 +214,16 @@ psy_user_cli call \
 - **DAO Automation**: Governance decisions executed automatically when conditions are met
 - **Multi-Party Computation**: Complex operations requiring multiple participants
 
-## Getting Started
+## 4. Getting Started
 
 1. **[Choose a Signature Scheme](signature-schemes.md)**: Select between built-in options
 2. **[Create a Wallet](wallet-management.md)**: Generate keys using your chosen scheme
-3. **[Register User](wallet-management.md#user-registration)**: Register your public key with the network
-4. **[Sign Transactions](wallet-management.md#signing-transactions)**: Use your keys to authenticate operations
+3. **[Register User](wallet-management.md#3-user-registration)**: Register your public key with the network
+4. **[Sign Transactions](wallet-management.md#4-signing-transactions)**: Use your keys to authenticate operations
 
-## Security Considerations
+## 5. Security Considerations
 
 - **Key Storage**: Securely store private keys and circuit parameters
 - **Circuit Auditing**: Ensure custom circuits are properly audited
 - **Backup Strategy**: Maintain secure backups of key material
-- **Upgrade Planning**: Plan for signature scheme upgrades when needed
+- **Change Planning**: Plan signature-type changes when needed

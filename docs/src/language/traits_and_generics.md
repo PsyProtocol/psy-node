@@ -1,8 +1,13 @@
 # Traits and Generics
 
+> Updated: 2026-09-03.
+
+## Abstract
+
+
 This chapter covers traits (defining shared behavior) and generics (type flexibility) in Psy, including generic constraints and advanced patterns.
 
-## Traits
+## 1. Traits
 
 Traits define shared behavior that can be implemented by different types. They are similar to interfaces in other languages.
 
@@ -109,7 +114,7 @@ fn main() {
 }
 ```
 
-## Generics
+## 2. Generics
 
 Generics allow you to write code that works with multiple types while maintaining type safety.
 
@@ -190,7 +195,7 @@ fn main() {
 }
 ```
 
-## Generic Constraints (Trait Bounds)
+## 3. Generic Constraints
 
 Generic constraints allow you to specify that generic types must implement certain traits.
 
@@ -370,7 +375,7 @@ fn main() {
 }
 ```
 
-## Advanced Generic Patterns
+## 4. Advanced Generic Patterns
 
 ### Associated Types in Traits
 
@@ -497,7 +502,7 @@ fn main() {
 }
 ```
 
-## Best Practices
+## 5. Best Practices
 
 ### 1. Use Descriptive Trait Names
 
@@ -570,7 +575,7 @@ pub trait Iterator2<Item> {
 }
 ```
 
-## Limitations
+## 6. Limitations
 
 Current limitations of traits and generics in Psy:
 
@@ -596,7 +601,7 @@ fn simple_generic<T: SomeTrait>(value: T) -> T {
 // }
 ```
 
-## Summary
+## 7. Summary
 
 Traits and generics in Psy provide:
 
