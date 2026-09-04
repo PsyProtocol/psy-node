@@ -354,10 +354,11 @@ export CLOUDFLARE_API_TOKEN="..."
 They read public endpoints and fresh L1 contract addresses from
 `deploy/gcp/config.env`. `21_deploy_cf_privacy_bridge_demo.sh` also packages
 `psy-wallet` and serves it from the app `/wallet` route. The Psy faucet defaults
-to server-side operator signing on the dedicated `FAUCET_VM_NAME`: set
+to server-side operator signing on the dedicated `FAUCET_VM_NAME`. Turnstile is
+disabled by default for staging. Set
+`PSY_FAUCET_REQUIRE_TURNSTILE=1` and provide both
 `PSY_FAUCET_TURNSTILE_SECRET` for Faucet Server and
-`PSY_FAUCET_TURNSTILE_SITE_KEY` for the Cloudflare Pages bundle when
-`PSY_FAUCET_REQUIRE_TURNSTILE=1`.
+`PSY_FAUCET_TURNSTILE_SITE_KEY` for the Cloudflare Pages bundle to enable it.
 `21`, `26`, and `28` build the pinned `psy-dapp` apps at `apps/bridge`,
 `apps/explorer`, and `apps/ide`. Set
 `PSY_EXPLORER_DIR` only if you intentionally build a different checkout.

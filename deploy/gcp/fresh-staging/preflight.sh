@@ -202,7 +202,7 @@ fi
 
 if has_step 13 \
   && is_truthy "${PSY_FAUCET_SERVER_MODE:-1}" \
-  && is_truthy "${PSY_FAUCET_REQUIRE_TURNSTILE:-1}"; then
+  && is_truthy "${PSY_FAUCET_REQUIRE_TURNSTILE:-0}"; then
   [ -n "${PSY_FAUCET_TURNSTILE_SECRET:-}" ] || {
     echo "PSY_FAUCET_TURNSTILE_SECRET is required when PSY_FAUCET_REQUIRE_TURNSTILE=1" >&2
     exit 1
@@ -236,7 +236,7 @@ fi
 
 if has_step 21 \
   && is_truthy "${PSY_FAUCET_SERVER_MODE:-1}" \
-  && is_truthy "${PSY_FAUCET_REQUIRE_TURNSTILE:-1}"; then
+  && is_truthy "${PSY_FAUCET_REQUIRE_TURNSTILE:-0}"; then
   [ -n "${PSY_FAUCET_TURNSTILE_SITE_KEY:-}" ] || {
     echo "PSY_FAUCET_TURNSTILE_SITE_KEY is required when PSY_FAUCET_REQUIRE_TURNSTILE=1" >&2
     exit 1
