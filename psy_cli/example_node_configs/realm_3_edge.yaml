@@ -1,5 +1,4 @@
 realm_id: 3
-realm_sub_id: 1
 network: local-devnet
 verbose: true
 
@@ -11,7 +10,8 @@ redis_url: redis://127.0.0.1:6379
 port: 1341
 listen: 0.0.0.0
 worker_whitelist_config: psy-genesis/config.json
+p2p_identity_key_path: ./local_checkpoints/realm_p2p/realm_3_sub_1_edge_identity.key
+p2p_listen: /ip4/0.0.0.0/tcp/41161
 
 coordinator_api_urls:
   - http://127.0.0.1:1337
-

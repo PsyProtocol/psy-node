@@ -89,12 +89,9 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
                 proof_verifier,
                 checkpoint_state_transition_circuit_fingerprint,
             );
-            if let Some((validators_path, checkpoints_per_epoch)) = config.p2p_validator_config()? {
-                handler.set_validators(
-                    crate::node::realm_p2p::validator_registry_from_validators_path(validators_path)?,
-                    checkpoints_per_epoch,
-                )?;
-            }
+            let (validator_registry, checkpoints_per_epoch) =
+                crate::node::realm_p2p::validator_registry_from_network_config(config.network)?;
+            handler.set_validators(validator_registry, checkpoints_per_epoch)?;
             start_coordinator_edge_rpc_server::<N, _, _, _, _, _, _, _, _>(handler, &config.listen, config.port).await?;
         },
         psy_core::constants::chain_id::PsyChainNetworkType::InternalDevnet => {
@@ -102,7 +99,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
             let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, false).await?;
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
-            let mut handler = CoordinatorEdgeHandler::<N, _, _, _, _, _, _, _, _>::new(
+            let handler = CoordinatorEdgeHandler::<N, _, _, _, _, _, _, _, _>::new(
                 db,
                 tag_tree_rewards_store,
                 temp_db,
@@ -117,12 +114,6 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
                 proof_verifier,
                 checkpoint_state_transition_circuit_fingerprint,
             );
-            if let Some((validators_path, checkpoints_per_epoch)) = config.p2p_validator_config()? {
-                handler.set_validators(
-                    crate::node::realm_p2p::validator_registry_from_validators_path(validators_path)?,
-                    checkpoints_per_epoch,
-                )?;
-            }
             start_coordinator_edge_rpc_server::<N, _, _, _, _, _, _, _, _>(handler, &config.listen, config.port).await?;
         }
         _ => {
@@ -138,10 +129,17 @@ where
     N: QNetworkTypesConfig<ZKVerifier = PsyJTMBZKVerifier<C>, JobId = QProvingJobDataID> + QNetworkZKTypes + 'static,
     C: JTMBCircuitConfig + 'static,
 {
+    let realm_sub_id = crate::node::realm_p2p::resolve_edge_sub_id(config)?;
+    let config = &config.clone().with_derived_realm_sub_id(realm_sub_id);
     let (verifier, _) = get_jtmb_circuit_library_and_prover_for_network::<C>(config.network)?;
     let worker_whitelist = WhiteListCache::new(&config.worker_whitelist_config, config.network)?;
     let pool = new_redis_async_pool(&config.redis_url, 10).await?;
-    let temp_store = StandardRedisStore::new(pool, config.db_namespace.to_string(), config.realm_id, config.realm_sub_id as u64);
+    let temp_store = StandardRedisStore::new(
+        pool,
+        config.db_namespace.to_string(),
+        config.realm_id,
+        realm_sub_id as u64,
+    );
     let nats_queue = setup_nats_psy_queue_from_connection_str(&config.nats_jetstream_url, &config.db_namespace, NatsSetupMode::CreateIfMissing).await?;
 
     let nats_queue = Arc::new(nats_queue);
@@ -152,7 +150,7 @@ where
 
     let realm_identifier = QRealmIdentifier {
         realm_id: config.realm_id as u32,
-        realm_sub_id: config.realm_sub_id,
+        realm_sub_id,
     };
     let proof_verifier = Arc::new(PsyJTMBZKVerifier::<C>::new(verifier));
     let chain_id = config.network.get_chain_id();
@@ -173,12 +171,15 @@ where
         0,
         proof_verifier,
     );
-    if let Some((built, proposer_node_ids, rotation)) =
-        crate::node::realm_p2p::maybe_build_edge_network(config, chain_id)?
-    {
-        handler.set_realm_p2p(built.handle.commands(), rotation, proposer_node_ids);
-        crate::node::realm_p2p::spawn_edge_realm_network(built, handler.clone());
-    }
+    let (built, proposer_edge_node_ids, realm_edge_node_ids, rotation) =
+        crate::node::realm_p2p::maybe_build_edge_network(config, chain_id)?;
+    handler.set_realm_p2p(
+        built.handle.commands(),
+        rotation,
+        proposer_edge_node_ids,
+        realm_edge_node_ids,
+    );
+    crate::node::realm_p2p::spawn_edge_realm_network(built, handler.clone());
     start_realm_edge_rpc_server::<N, _, _, _, _, _, _>(handler, &config.listen, config.port).await?;
     Ok(())
 }

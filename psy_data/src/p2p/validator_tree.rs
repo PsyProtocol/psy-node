@@ -19,7 +19,7 @@ use parth_core::{
 use serde_with::serde_as;
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 
-use crate::genesis::genesis_block_setup::ValidatorGenesisEntry;
+use crate::genesis::genesis_block_setup::GenesisValidator;
 use crate::guta::realm_finalize::{validator_tree_index, VALIDATOR_TREE_HEIGHT};
 
 use super::bls::BlsPublicKey;
@@ -106,33 +106,37 @@ impl parth_core::utils::QPGenRandom for ValidatorLeafPreimage {
 }
 
 impl ValidatorLeafPreimage {
-    pub fn from_genesis_entry(chain_id: u32, entry: &ValidatorGenesisEntry) -> anyhow::Result<Self> {
-        if entry.realm_sub_id > u8::MAX as u16 {
+    pub fn from_genesis_validator(
+        chain_id: u32,
+        realm_sub_id: u16,
+        validator: &GenesisValidator,
+    ) -> anyhow::Result<Self> {
+        if realm_sub_id > u8::MAX as u16 {
             anyhow::bail!(
                 "validator leaf realm {} sub_id {} exceeds 8-bit tree slot",
-                entry.realm_id,
-                entry.realm_sub_id
+                validator.realm_id,
+                realm_sub_id
             );
         }
-        let node_id = NodeId::from_raw(entry.node_id).map_err(|error| {
+        let node_id = NodeId::from_raw(validator.node_id).map_err(|error| {
             anyhow::anyhow!(
                 "invalid validator NodeId for realm {} sub {}: {error}",
-                entry.realm_id,
-                entry.realm_sub_id
+                validator.realm_id,
+                realm_sub_id
             )
         })?;
-        let bls_public_key = BlsPublicKey::from_bytes(&entry.bls_public_key).map_err(|error| {
+        let bls_public_key = BlsPublicKey::from_bytes(&validator.bls_public_key).map_err(|error| {
             anyhow::anyhow!(
                 "invalid validator BLS key for realm {} sub {}: {error}",
-                entry.realm_id,
-                entry.realm_sub_id
+                validator.realm_id,
+                realm_sub_id
             )
         })?;
         Ok(Self {
             chain_id,
-            realm_id: entry.realm_id,
-            realm_sub_id: entry.realm_sub_id,
-            validator_user_id: entry.validator_user_id,
+            realm_id: validator.realm_id,
+            realm_sub_id,
+            validator_user_id: validator.validator_user_id,
             node_id: *node_id.as_raw(),
             bls_public_key: bls_public_key.to_bytes(),
         })
@@ -171,6 +175,27 @@ impl ValidatorLeafPreimage {
     }
 }
 
+pub fn ensure_validator_user_id_in_realm(
+    realm_id: u32,
+    validator_user_id: u64,
+    realm_user_tree_height: u8,
+) -> anyhow::Result<()> {
+    let users_per_realm = 1u64
+        .checked_shl(realm_user_tree_height as u32)
+        .ok_or_else(|| anyhow::anyhow!("realm user tree height {realm_user_tree_height} exceeds u64"))?;
+    let realm_start = (realm_id as u64)
+        .checked_mul(users_per_realm)
+        .ok_or_else(|| anyhow::anyhow!("realm {realm_id} user range overflows u64"))?;
+    let realm_end = realm_start
+        .checked_add(users_per_realm)
+        .ok_or_else(|| anyhow::anyhow!("realm {realm_id} user range overflows u64"))?;
+    anyhow::ensure!(
+        (realm_start..realm_end).contains(&validator_user_id),
+        "validator_user_id {validator_user_id} is outside realm {realm_id} user range {realm_start}..{realm_end}"
+    );
+    Ok(())
+}
+
 /// Genesis material for the single validator tree: root, URT-style node FFS,
 /// and checkpointed preimages keyed by leaf index.
 pub struct ValidatorTreeGenesis<Hash> {
@@ -182,12 +207,17 @@ pub struct ValidatorTreeGenesis<Hash> {
 /// Build the single height-20 tree and its preimages from genesis entries.
 pub fn build_validator_tree_genesis<Hasher, Hash>(
     chain_id: u32,
-    validators: &[ValidatorGenesisEntry],
+    validators: &[GenesisValidator],
+    realm_user_tree_height: u8,
 ) -> anyhow::Result<ValidatorTreeGenesis<Hash>>
 where
     Hasher: MerkleZeroHasher<Hash>,
     Hash: Copy + PartialEq + Default + std::fmt::Debug + Q256BitHash,
 {
+    anyhow::ensure!(
+        validators.len() >= MIN_VALIDATORS_PER_REALM,
+        "Genesis must contain at least {MIN_VALIDATORS_PER_REALM} validator"
+    );
     let mut preimages = Vec::with_capacity(validators.len());
     let mut leaves = Vec::with_capacity(validators.len());
     let mut indexes = HashSet::new();
@@ -196,8 +226,25 @@ where
     let mut bls_keys = HashSet::new();
     let mut per_realm: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
 
-    for entry in validators {
-        let preimage = ValidatorLeafPreimage::from_genesis_entry(chain_id, entry)?;
+    for validator in validators {
+        let realm_count = per_realm.entry(validator.realm_id).or_insert(0);
+        *realm_count += 1;
+        anyhow::ensure!(
+            *realm_count <= MAX_VALIDATORS_PER_REALM,
+            "realm {} has more than {MAX_VALIDATORS_PER_REALM} ordered validators",
+            validator.realm_id
+        );
+        let realm_sub_id = *realm_count as u16;
+        ensure_validator_user_id_in_realm(
+            validator.realm_id,
+            validator.validator_user_id,
+            realm_user_tree_height,
+        )?;
+        let preimage = ValidatorLeafPreimage::from_genesis_validator(
+            chain_id,
+            realm_sub_id,
+            validator,
+        )?;
         let index = preimage.tree_index()?;
         let hash = preimage.leaf_hash()?;
         anyhow::ensure!(
@@ -226,13 +273,6 @@ where
             preimage.realm_id,
             preimage.realm_sub_id
         );
-        let realm_count = per_realm.entry(preimage.realm_id).or_insert(0);
-        *realm_count += 1;
-        anyhow::ensure!(
-            *realm_count <= MAX_VALIDATORS_PER_REALM,
-            "realm {} has more than {MAX_VALIDATORS_PER_REALM} validator leaves",
-            preimage.realm_id
-        );
         leaves.push(MerkleLeafNode {
             index,
             value: Hash::from_owned_32bytes(hash),
@@ -240,13 +280,7 @@ where
         preimages.push(preimage);
     }
 
-    if leaves.is_empty() {
-        return Ok(ValidatorTreeGenesis {
-            root: empty_validator_tree_root::<Hasher, Hash>(),
-            nodes_ffs: Vec::new(),
-            preimages,
-        });
-    }
+    debug_assert!(!leaves.is_empty());
 
     let (root, nodes) = zero_id_merkle_tree_nodes_hash_map_from_leaves::<Hasher, Hash>(
         VALIDATOR_TREE_HEIGHT as u8,
@@ -271,13 +305,14 @@ where
 /// Compute the checkpoint sixth root from genesis validator leaves.
 pub fn validator_tree_root_from_genesis<Hasher, Hash>(
     chain_id: u32,
-    validators: &[ValidatorGenesisEntry],
+    validators: &[GenesisValidator],
+    realm_user_tree_height: u8,
 ) -> anyhow::Result<Hash>
 where
     Hasher: MerkleZeroHasher<Hash>,
     Hash: Copy + PartialEq + Default + std::fmt::Debug + Q256BitHash,
 {
-    Ok(build_validator_tree_genesis::<Hasher, Hash>(chain_id, validators)?.root)
+    Ok(build_validator_tree_genesis::<Hasher, Hash>(chain_id, validators, realm_user_tree_height)?.root)
 }
 
 /// Known indexes of one realm's 256-slot subtree.
@@ -318,7 +353,7 @@ mod tests {
 
     use crate::p2p::bls::BlsSecretKey;
 
-    fn sample_entry(realm_id: u32, realm_sub_id: u16, seed: u8) -> ValidatorGenesisEntry {
+    fn sample_validator(realm_id: u32, position: u16, seed: u8) -> GenesisValidator {
         for i in 0u8..32 {
             let mut bls_seed = [seed; 32];
             bls_seed[1] = i;
@@ -326,36 +361,36 @@ mod tests {
             let mut secret = [seed; 32];
             secret[2] = i;
             let node = NodeId::from_keypair(&Keypair::ed25519_from_bytes(&mut secret).unwrap()).unwrap();
-            let entry = ValidatorGenesisEntry {
+            let validator = GenesisValidator {
                 realm_id,
-                realm_sub_id,
-                validator_user_id: ((realm_id as u64) << 20) | realm_sub_id as u64,
+                validator_user_id: ((realm_id as u64) << 20) | position as u64,
                 node_id: *node.as_raw(),
                 bls_public_key: bls.to_bytes(),
             };
-            if ValidatorLeafPreimage::from_genesis_entry(1, &entry).is_ok() {
-                return entry;
+            if ValidatorLeafPreimage::from_genesis_validator(1, position, &validator).is_ok() {
+                return validator;
             }
         }
-        panic!("failed to sample validator genesis entry");
+        panic!("failed to sample Genesis validator");
     }
 
     #[test]
-    fn empty_genesis_is_empty_tree_root() {
-        let built = build_validator_tree_genesis::<PoseidonHasher, PHash>(1, &[]).unwrap();
-        assert_eq!(built.root, PoseidonHasher::get_zero_hash(VALIDATOR_TREE_HEIGHT));
-        assert!(built.nodes_ffs.is_empty());
-        assert!(built.preimages.is_empty());
+    fn empty_genesis_is_rejected() {
+        let error = match build_validator_tree_genesis::<PoseidonHasher, PHash>(1, &[], 20) {
+            Ok(_) => panic!("empty Genesis validators must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("at least 1 validator"));
     }
 
     #[test]
     fn one_tree_two_layers_indexes_by_realm() {
-        let entries = vec![
-            sample_entry(0, 1, 11),
-            sample_entry(0, 2, 12),
-            sample_entry(1, 1, 21),
+        let validators = vec![
+            sample_validator(0, 1, 11),
+            sample_validator(0, 2, 12),
+            sample_validator(1, 1, 21),
         ];
-        let built = build_validator_tree_genesis::<PoseidonHasher, PHash>(1, &entries).unwrap();
+        let built = build_validator_tree_genesis::<PoseidonHasher, PHash>(1, &validators, 20).unwrap();
         assert!(!built.nodes_ffs.is_empty());
         assert_eq!(built.preimages.len(), 3);
         assert_eq!(built.preimages[0].tree_index().unwrap(), (0u64 << 8) | 1);
@@ -373,18 +408,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_sub_id_over_255() {
-        let err = ValidatorLeafPreimage::from_genesis_entry(
-            1,
-            &ValidatorGenesisEntry {
-                realm_id: 0,
-                realm_sub_id: 256,
-                validator_user_id: 1,
-                node_id: [0u8; 38],
-                bls_public_key: [0u8; 48],
-            },
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("exceeds 8-bit"));
+    fn rejects_more_than_64_ordered_validators() {
+        let mut validators = (1..=MAX_VALIDATORS_PER_REALM)
+            .map(|position| sample_validator(0, position as u16, position as u8))
+            .collect::<Vec<_>>();
+        validators.push(sample_validator(0, 65, 65));
+        let error = match build_validator_tree_genesis::<PoseidonHasher, PHash>(1, &validators, 20) {
+            Ok(_) => panic!("65 validators must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("more than 64"));
     }
 }

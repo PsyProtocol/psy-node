@@ -34,12 +34,12 @@ pub use messages::{
     bitmap_get, bitmap_set, compute_end_cap_id, compute_proposal_id, encode_proposal_body,
     proposal_from_parts, vote_message, Certificate, DirectBodyRequest, DirectBodyResponse,
     EndCapForwardHeader, EndCapForwardResponse, Proposal, ProposalPart, RealmFinalizeOutputBytes,
-    RealmFinalizeSubmitCode, RealmFinalizeSubmitRequest, RealmFinalizeSubmitResponse, Vote,
+    RealmFinalizeSubmitCode, Vote,
 };
 pub use node_id::NodeId;
 pub use validator_leaf::ValidatorLeaf;
 pub use validator_tree::{
     authenticate_validator_preimage, build_validator_tree_genesis, empty_validator_tree_root,
-    realm_validator_indexes, require_realm_validator_count, validator_tree_root_from_genesis,
-    ValidatorLeafPreimage, ValidatorTreeGenesis,
+    ensure_validator_user_id_in_realm, realm_validator_indexes, require_realm_validator_count,
+    validator_tree_root_from_genesis, ValidatorLeafPreimage, ValidatorTreeGenesis,
 };

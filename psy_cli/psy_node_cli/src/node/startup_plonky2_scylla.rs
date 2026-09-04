@@ -292,6 +292,9 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
     let resolver = PsyPlonky2NodeConfigResolver {};
     let circuit_fingerprint_config = resolver.get_circuit_fingerprint_config_for_network(config.network)?;
     let genesis_data = resolver.get_genesis_block_setup_data_for_network(config.network, config.genesis_data_path.clone())?;
+    let (realm_sub_id, validator_user_id, bls_public_keys) =
+        crate::node::realm_p2p::processor_validator_data(config, &genesis_data)?;
+    let config = &config.clone().with_derived_realm_sub_id(realm_sub_id);
 
     let pool = new_redis_async_pool(&config.redis_url, 2).await?;
 
@@ -299,7 +302,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
         pool,
         config.db_namespace.to_string(),
         config.realm_id as u64,
-        config.realm_sub_id as u64,
+        realm_sub_id as u64,
     );
     let nats_queue = setup_nats_psy_queue_from_connection_str(&config.nats_jetstream_url, &config.db_namespace, NatsSetupMode::CreateIfMissing).await?;
 
@@ -319,7 +322,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
 
     let realm_identifier = QRealmIdentifier {
         realm_id: config.realm_id as u32,
-        realm_sub_id: config.realm_sub_id,
+        realm_sub_id,
     };
     let chain_id = config.network.get_chain_id();
     if config.coordinator_api_urls.is_empty() {
@@ -373,30 +376,19 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
                 Arc::new(coordinator_client),
             )
             .await?;
-            if let Some(built) = crate::node::realm_p2p::maybe_build_processor_network(config, chain_id)? {
-                let validator_user_id = config.p2p_validator_user_id.ok_or_else(|| {
-                    anyhow::anyhow!("--p2p-validator-user-id is required when Realm P2P is enabled")
-                })?;
-                let validators_path = config.p2p_validators_path.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("--p2p-validators-path is required when Realm P2P is enabled")
-                })?;
-                let bls_public_keys = crate::node::realm_p2p::bls_keys_from_validators_path(
-                    validators_path,
-                    config.realm_id as u32,
-                )?;
-                let bls_path = config.p2p_bls_key_path.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("processor P2P requires --p2p-bls-key")
-                })?;
-                let bls_secret = load_bls_secret_key(bls_path)
-                    .map_err(|error| anyhow::anyhow!("failed to load processor BLS key: {error}"))?;
-                let commands = built.handle.commands();
-                let rotation = built.rotation.clone();
-                processor.set_realm_p2p(commands, rotation, bls_secret, validator_user_id, bls_public_keys);
+            let built = crate::node::realm_p2p::maybe_build_processor_network(config, chain_id)?;
+            let bls_secret = load_bls_secret_key(config.p2p_bls_key_path.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("processor P2P requires --p2p-bls-key")
+            })?)?;
+            let commands = built.handle.commands();
+            let rotation = built.rotation.clone();
+            processor.set_realm_p2p(commands, rotation, bls_secret, validator_user_id, bls_public_keys);
                 let (state_updates_tx, state_updates_rx) = tokio::sync::mpsc::channel(4);
                 processor.verified_state_updates = Some(state_updates_rx);
                 crate::node::realm_p2p::spawn_processor_realm_network::<N>(
                     built,
                     config,
+                    realm_sub_id,
                     PsyPlonky2ZKVerifier::<C, D>::for_network(config.network)?,
                     state_updates_tx,
                 );
@@ -404,7 +396,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
 
 
 
-            }
+
             run_realm_processor(processor, guta_gatherer_join_handle).await?;
         }
         _ => {

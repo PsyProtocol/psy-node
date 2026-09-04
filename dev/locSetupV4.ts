@@ -958,183 +958,219 @@ function l1StartedDetector(line: string): boolean {
 const REALM_P2P_OUT_DIR = "./local_checkpoints/realm_p2p";
 export const REALM_P2P_SUB_IDS = [1, 2] as const;
 
-type RealmP2pSubEntry = {
-    processor_node_id_hex38: string;
-    processor_peer_id: string;
-    edge_node_id_hex38: string;
-    edge_peer_id: string;
-    bls_public_hex: string;
-    processor_identity_path: string;
-    edge_identity_path: string;
-    bls_path: string;
-};
-
-type RealmP2pValidators = {
-    coordinator: { peer_id: string; node_id_hex38: string; identity_path: string };
-    realms: Record<string, Record<string, RealmP2pSubEntry>>;
-};
-
-function realmP2pProcessorPort(realmId: number, subId: number): number {
-    return 41000 + realmId * 20 + subId;
-}
-
-function realmP2pEdgePort(realmId: number, subId: number): number {
-    return 41100 + realmId * 20 + subId;
-}
-
-function realmP2pListen(host: string, port: number): string {
-    return `/ip4/${host}/tcp/${port}`;
-}
-
-function realmP2pBootnode(host: string, port: number, peerId: string): string {
-    return `/ip4/${host}/tcp/${port}/p2p/${peerId}`;
-}
-
-function realmP2pValidatorUserId(realmId: number, subId: number): number {
-    return (realmId * (1 << 20)) + subId;
-}
-
-type GenesisValidatorEntry = {
-    realm_id: number;
-    realm_sub_id: number;
+type PublicNode = { node_id: string; addresses: string[] };
+type GenesisValidator = {
     validator_user_id: number;
-    node_id: string;
+    processor_node_id: string;
     bls_public_key: string;
+    processor_addresses: string[];
+    edge_nodes: PublicNode[];
 };
+type RealmNetworkConfig = { id: number; rpc_url: string[]; validators: GenesisValidator[] };
+type NetworkConfigEntry = {
+    realm_configs: RealmNetworkConfig[];
+    p2p: { checkpoints_per_epoch: number };
+    realm_user_tree_height?: number;
+    [key: string]: unknown;
+};
+type FullNetworkConfig = { defaultNetwork: string; networks: Record<string, NetworkConfigEntry> };
 
-/**
- * Inject the Realm P2P validators manifest's processor identities into genesis.json so the
- * genesis validator tree matches the P2P key material. A null validators manifest (non-P2P
- * run) rewrites validators to an empty list, leaving no stale entries behind.
- */
-export async function injectGenesisValidators(
-    genesisPath: string,
-    validators: RealmP2pValidators | null,
-): Promise<void> {
-    const genesis = JSON.parse(await fs.promises.readFile(genesisPath, "utf-8")) as {
-        validators?: GenesisValidatorEntry[];
-    };
-    const entries: GenesisValidatorEntry[] = [];
-    if (validators) {
-        for (const realmId of Object.keys(validators.realms).map(Number).sort((a, b) => a - b)) {
-            const subs = validators.realms[String(realmId)];
-            for (const subId of Object.keys(subs).map(Number).sort((a, b) => a - b)) {
-                const entry = subs[String(subId)];
-                entries.push({
-                    realm_id: realmId,
-                    realm_sub_id: subId,
-                    validator_user_id: realmP2pValidatorUserId(realmId, subId),
-                    node_id: entry.processor_node_id_hex38,
-                    bls_public_key: entry.bls_public_hex,
-                });
-            }
-        }
-    }
-    genesis.validators = entries;
-    await fs.promises.writeFile(genesisPath, JSON.stringify(genesis, null, 2), "utf-8");
+export function realmP2pProcessorPort(realmId: number, subId: number): number { return 41000 + realmId * 20 + subId; }
+export function realmP2pEdgePort(realmId: number, subId: number, edgeIndex: number, edgeCount: number): number {
+    const realmStride = Math.max(20, REALM_P2P_SUB_IDS.length * edgeCount);
+    return 41100 + realmId * realmStride + (subId - 1) * edgeCount + edgeIndex + 1;
 }
-
 function realmDbNamespace(realmId: number, subId: number): string {
     return `realm_${realmId}_${subId}`;
 }
-
+function multiaddrHost(host: string): string {
+    return net.isIPv4(host) ? `ip4/${host}` : net.isIPv6(host) ? `ip6/${host}` : `dns4/${host}`;
+}
+function realmP2pListen(host: string, port: number): string { return `/${multiaddrHost(host)}/tcp/${port}`; }
 export function realmP2pHttpPort(realmId: number, subId: number, edgeIndex: number, realmEdgeCount: number): number {
-    const base = 13380 + realmId * 10;
-    return base + (subId - 1) * realmEdgeCount + edgeIndex;
+    const realmStride = Math.max(10, REALM_P2P_SUB_IDS.length * realmEdgeCount);
+    return 13380 + realmId * realmStride + (subId - 1) * realmEdgeCount + edgeIndex;
+}
+type RealmPortRequest = { family: "processor P2P" | "edge P2P" | "Realm HTTP"; realmId: number; subId: number; edgeIndex?: number; port: number };
+
+export function requestedRealmPorts(startRealmId: number, realmsCount: number, edgeCount: number): RealmPortRequest[] {
+    const ports: RealmPortRequest[] = [];
+    for (let realmId = startRealmId; realmId < startRealmId + realmsCount; realmId++) {
+        for (const subId of REALM_P2P_SUB_IDS) {
+            ports.push({ family: "processor P2P", realmId, subId, port: realmP2pProcessorPort(realmId, subId) });
+            for (let edgeIndex = 0; edgeIndex < edgeCount; edgeIndex++) {
+                ports.push({ family: "edge P2P", realmId, subId, edgeIndex, port: realmP2pEdgePort(realmId, subId, edgeIndex, edgeCount) });
+                ports.push({ family: "Realm HTTP", realmId, subId, edgeIndex, port: realmP2pHttpPort(realmId, subId, edgeIndex, edgeCount) });
+            }
+        }
+    }
+    return ports;
 }
 
-async function ensureRealmP2pValidators(
+function describeRealmPort(request: RealmPortRequest): string {
+    const edge = request.edgeIndex === undefined ? "" : ` edge ${request.edgeIndex}`;
+    return `${request.family} Realm ${request.realmId} validator ${request.subId}${edge}`;
+}
+
+export function validateRealmP2pPorts(startRealmId: number, realmsCount: number, edgeCount: number): void {
+    if (!Number.isInteger(startRealmId) || startRealmId < 0) throw new Error("--start-realm-id must be a non-negative integer");
+    if (!Number.isInteger(realmsCount) || realmsCount < 1) throw new Error("--realms-count must be a positive integer");
+    if (!Number.isInteger(edgeCount) || edgeCount < 1 || edgeCount > 255) throw new Error("--realm-edge-nodes must be in 1..=255");
+    const ownerByPort = new Map<number, RealmPortRequest>();
+    for (const request of requestedRealmPorts(startRealmId, realmsCount, edgeCount)) {
+        if (!Number.isSafeInteger(request.port) || request.port > 65535) throw new Error("Requested Realm P2P topology exceeds TCP port 65535");
+        const previous = ownerByPort.get(request.port);
+        if (previous) {
+            throw new Error(`Requested Realm topology assigns TCP port ${request.port} to both ${describeRealmPort(previous)} and ${describeRealmPort(request)}`);
+        }
+        ownerByPort.set(request.port, request);
+    }
+}
+
+export function shouldPrepareRealmP2p(startCoordinatorProcessor: boolean, startRealmProcessor: boolean): boolean {
+    return startCoordinatorProcessor || startRealmProcessor;
+}
+function realmP2pEdgeIdentityPath(realmId: number, subId: number, edgeIndex: number): string {
+    const suffix = edgeIndex === 0 ? "edge_identity.key" : `edge_${edgeIndex}_identity.key`;
+    return `${REALM_P2P_OUT_DIR}/realm_${realmId}_sub_${subId}_${suffix}`;
+}
+
+export function selectedRuntimeConfigKey(nodeNetwork: string): string {
+    return nodeNetwork === "local-devnet" ? "localhost" : nodeNetwork;
+}
+
+export function realmValidatorUserId(realmId: number, oneBasedPosition: number, realmUserTreeHeight: number): number {
+    const usersPerRealm = 2 ** realmUserTreeHeight;
+    const userId = realmId * usersPerRealm + oneBasedPosition;
+    if (!Number.isSafeInteger(userId)) throw new Error("Realm validator user id exceeds JavaScript safe integer range");
+    return userId;
+}
+export type RealmP2pConfigPlan = { reuse: boolean; args: string[]; env: Record<string, string> };
+
+export function realmP2pSecretPaths(realmIds: readonly number[], edgeCount: number): string[] {
+    return realmIds.flatMap((realmId) => REALM_P2P_SUB_IDS.flatMap((subId) => [
+        `${REALM_P2P_OUT_DIR}/realm_${realmId}_sub_${subId}_processor_identity.key`,
+        `${REALM_P2P_OUT_DIR}/realm_${realmId}_sub_${subId}_bls.key`,
+        ...Array.from({ length: edgeCount }, (_, edgeIndex) => realmP2pEdgeIdentityPath(realmId, subId, edgeIndex)),
+    ]));
+}
+
+export function planRealmP2pConfig(
+    config: FullNetworkConfig | null,
+    realmIds: readonly number[],
+    edgeCount: number,
+    publicHost: string,
+    nodeNetwork: string = "local-devnet",
+): RealmP2pConfigPlan {
+    const configKey = selectedRuntimeConfigKey(nodeNetwork);
+    const networkConfig = config?.networks[configKey];
+    const activeRealmIds = new Set(realmIds);
+    const reusable = networkConfig?.p2p?.checkpoints_per_epoch === 10
+        && Array.isArray(networkConfig.realm_configs)
+        && realmIds.every((realmId) => {
+            const matches = networkConfig.realm_configs.filter((value) => value.id === realmId);
+            if (matches.length !== 1) return false;
+            const realm = matches[0];
+            return Array.isArray(realm.validators)
+                && realm.validators.length === REALM_P2P_SUB_IDS.length
+                && realm.validators.every((validator, validatorIndex) => {
+                    const subId = validatorIndex + 1;
+                    return typeof validator.processor_node_id === "string" && validator.processor_node_id.length > 0
+                        && typeof validator.bls_public_key === "string" && validator.bls_public_key.length > 0
+                        && Array.isArray(validator.processor_addresses)
+                        && validator.processor_addresses.some((address) => address.startsWith(`${realmP2pListen(publicHost, realmP2pProcessorPort(realmId, subId))}/p2p/`))
+                        && Array.isArray(validator.edge_nodes)
+                        && validator.edge_nodes.length === edgeCount
+                        && validator.edge_nodes.every((edge, edgeIndex) => typeof edge.node_id === "string" && edge.node_id.length > 0
+                            && Array.isArray(edge.addresses)
+                            && edge.addresses.some((address) => address.startsWith(`${realmP2pListen(publicHost, realmP2pEdgePort(realmId, subId, edgeIndex, edgeCount))}/p2p/`)));
+                });
+        })
+        && networkConfig.realm_configs.every((realm) => activeRealmIds.has(realm.id)
+            || Array.isArray(realm.validators) && realm.validators.length === 0);
+    return {
+        reuse: reusable,
+        args: ["--out-dir", REALM_P2P_OUT_DIR, "--realm-ids", realmIds.join(","), "--validators-per-realm", REALM_P2P_SUB_IDS.length.toString(), "--edges-per-validator", edgeCount.toString()],
+        env: { PSY_CONFIG_PATH: "psy-genesis/config.json", PSY_NETWORK: configKey, PSY_REALM_P2P_PUBLIC_HOST: publicHost },
+    };
+}
+
+export function daemonRealmP2pConfig(config: FullNetworkConfig, realmIds: readonly number[], edgeCount: number): FullNetworkConfig {
+    const copy = structuredClone(config);
+    const networkConfig = copy.networks[copy.defaultNetwork];
+    for (const realmId of realmIds) {
+        const realm = networkConfig.realm_configs.find((value) => value.id === realmId);
+        if (!realm) throw new Error(`Runtime network config has no Realm ${realmId}`);
+        realm.validators.forEach((validator, validatorIndex) => {
+            const subId = validatorIndex + 1;
+            const processorPeerId = validator.processor_addresses[0]?.split("/p2p/")[1];
+            if (!processorPeerId) throw new Error(`Realm ${realmId} validator ${subId} has no processor peer id`);
+            const processorName = `realm-${realmId}-sub-${subId}-processor`;
+            validator.processor_addresses = [`${realmP2pListen(processorName, realmP2pProcessorPort(realmId, subId))}/p2p/${processorPeerId}`];
+            validator.edge_nodes.forEach((edge, edgeIndex) => {
+                const edgePeerId = edge.addresses[0]?.split("/p2p/")[1];
+                if (!edgePeerId) throw new Error(`Realm ${realmId} validator ${subId} edge ${edgeIndex} has no peer id`);
+                const edgeName = `realm-${realmId}-sub-${subId}-edge-${edgeIndex}`;
+                edge.addresses = [`${realmP2pListen(edgeName, realmP2pEdgePort(realmId, subId, edgeIndex, edgeCount))}/p2p/${edgePeerId}`];
+            });
+        });
+    }
+    return copy;
+}
+
+export async function injectGenesisValidators(genesisPath: string, config: FullNetworkConfig): Promise<void> {
+    const genesis = JSON.parse(await fs.promises.readFile(genesisPath, "utf-8")) as { validators?: Array<{ realm_id: number; validator_user_id: number; node_id: string; bls_public_key: string }> };
+    const network = config.networks[config.defaultNetwork];
+    genesis.validators = network.realm_configs.flatMap((realm) => realm.validators.map((validator) => ({
+        realm_id: realm.id,
+        validator_user_id: validator.validator_user_id,
+        node_id: validator.processor_node_id,
+        bls_public_key: validator.bls_public_key,
+    })));
+    await fs.promises.writeFile(genesisPath, JSON.stringify(genesis, null, 2), "utf-8");
+}
+
+async function ensureRealmP2pConfig(
     nodeCli: string,
     cwd: string,
     realmIds: number[],
-): Promise<RealmP2pValidators> {
-    const validatorsPath = path.join(cwd, "local_checkpoints", "realm_p2p", "validators.json");
-    if (await exists(validatorsPath)) {
-        const existing = JSON.parse(await fs.promises.readFile(validatorsPath, "utf-8")) as RealmP2pValidators;
-        const complete = realmIds.every((realmId) =>
-            REALM_P2P_SUB_IDS.every((subId) => existing.realms?.[String(realmId)]?.[String(subId)]),
-        );
-        if (complete) {
-            console.log(`[DevNet] Reusing Realm P2P validators at ${REALM_P2P_OUT_DIR}/validators.json`);
-            return existing;
-        }
+    edgeCount: number,
+    publicHost: string,
+): Promise<FullNetworkConfig> {
+    const configPath = path.join(cwd, REALM_P2P_OUT_DIR, "config.json");
+    let config: FullNetworkConfig | null = null;
+    if (await exists(configPath)) {
+        config = JSON.parse(await fs.promises.readFile(configPath, "utf-8")) as FullNetworkConfig;
     }
-    const args = [
-        nodeCli, "init-realm-p2p-keys",
-        "--out-dir", REALM_P2P_OUT_DIR,
-        "--realm-ids", realmIds.join(","),
-        "--sub-ids", REALM_P2P_SUB_IDS.join(","),
-    ];
-    console.log(`[DevNet] Generating Realm P2P keys: ${args.join(" ")}`);
-    const proc = Bun.spawn(args, { cwd, stdout: "pipe", stderr: "pipe" });
-    const exit = await proc.exited;
-    if (exit !== 0) {
-        const err = await new Response(proc.stderr).text();
-        throw new Error(`init-realm-p2p-keys failed (${exit}): ${err}`);
+    const secretsExist = (await Promise.all(realmP2pSecretPaths(realmIds, edgeCount)
+        .map((secretPath) => exists(path.join(cwd, secretPath))))).every(Boolean);
+    const plan = planRealmP2pConfig(secretsExist ? config : null, realmIds, edgeCount, publicHost);
+    if (!plan.reuse) {
+        const proc = Bun.spawn([nodeCli, "init-realm-p2p-keys", ...plan.args], {
+            cwd,
+            stdout: "pipe",
+            stderr: "pipe",
+            env: { ...process.env, ...plan.env },
+        });
+        const exit = await proc.exited;
+        if (exit !== 0) throw new Error(`init-realm-p2p-keys failed (${exit}): ${await new Response(proc.stderr).text()}`);
+        config = JSON.parse(await fs.promises.readFile(configPath, "utf-8")) as FullNetworkConfig;
     }
-    return JSON.parse(await fs.promises.readFile(validatorsPath, "utf-8")) as RealmP2pValidators;
+    if (!config) throw new Error("Realm P2P config generation did not produce a config");
+    config.defaultNetwork = selectedRuntimeConfigKey("local-devnet");
+    return config;
 }
 
-function realmP2pProcessorExtraArgs(
-    host: string,
-    realmId: number,
-    subId: number,
-    validators: RealmP2pValidators,
-): string[] {
-    const self = validators.realms[String(realmId)][String(subId)];
-    const args = [
-        "--p2p-identity-key", self.processor_identity_path,
-        "--p2p-bls-key", self.bls_path,
-        "--p2p-listen", realmP2pListen(host, realmP2pProcessorPort(realmId, subId)),
-        "--p2p-coordinator", realmP2pBootnode(host, 40999, validators.coordinator.peer_id),
-        "--p2p-validator-sub-ids", REALM_P2P_SUB_IDS.join(","),
-        "--p2p-checkpoints-per-epoch", "10",
-        "--p2p-validator-user-id", realmP2pValidatorUserId(realmId, subId).toString(),
-        "--p2p-validators-path", `${REALM_P2P_OUT_DIR}/validators.json`,
-    ];
-    for (const otherSub of REALM_P2P_SUB_IDS) {
-        if (otherSub === subId) {
-            continue;
-        }
-        const other = validators.realms[String(realmId)][String(otherSub)];
-        args.push(
-            "--p2p-bootnode",
-            realmP2pBootnode(host, realmP2pProcessorPort(realmId, otherSub), other.processor_peer_id),
-        );
-    }
-    return args;
+function selectedRealm(config: FullNetworkConfig, realmId: number): RealmNetworkConfig {
+    const realm = config.networks[config.defaultNetwork].realm_configs.find((value) => value.id === realmId);
+    if (!realm) throw new Error(`Runtime network config has no Realm ${realmId}`);
+    return realm;
 }
-
-function realmP2pEdgeExtraArgs(
-    host: string,
-    realmId: number,
-    subId: number,
-    validators: RealmP2pValidators,
-): string[] {
-    const self = validators.realms[String(realmId)][String(subId)];
-    const subs = validators.realms[String(realmId)];
-    const args = [
-        "--p2p-identity-key", self.edge_identity_path,
-        "--p2p-listen", realmP2pListen(host, realmP2pEdgePort(realmId, subId)),
-        "--p2p-validator-sub-ids", REALM_P2P_SUB_IDS.join(","),
-        "--p2p-checkpoints-per-epoch", "10",
-    ];
-    for (const [otherSub, other] of Object.entries(subs)) {
-        const otherSubId = Number(otherSub);
-        args.push(
-            "--p2p-bootnode",
-            realmP2pBootnode(host, realmP2pProcessorPort(realmId, otherSubId), other.processor_peer_id),
-            "--p2p-proposer-node-id",
-            `${otherSub}:${other.edge_node_id_hex38}`,
-        );
-        if (otherSubId !== subId) {
-            args.push(
-                "--p2p-bootnode",
-                realmP2pBootnode(host, realmP2pEdgePort(realmId, otherSubId), other.edge_peer_id),
-            );
-        }
-    }
-    return args;
+export function realmP2pProcessorExtraArgs(host: string, realmId: number, subId: number): string[] {
+    return ["--p2p-identity-key", `${REALM_P2P_OUT_DIR}/realm_${realmId}_sub_${subId}_processor_identity.key`, "--p2p-bls-key", `${REALM_P2P_OUT_DIR}/realm_${realmId}_sub_${subId}_bls.key`, "--p2p-listen", realmP2pListen(host, realmP2pProcessorPort(realmId, subId))];
+}
+export function realmP2pEdgeExtraArgs(host: string, realmId: number, subId: number, edgeIndex: number, edgeCount: number): string[] {
+    return ["--p2p-identity-key", realmP2pEdgeIdentityPath(realmId, subId, edgeIndex), "--p2p-listen", realmP2pListen(host, realmP2pEdgePort(realmId, subId, edgeIndex, edgeCount))];
 }
 function relayerStartedDetector(line: string): boolean {
     return line.includes("connected to indexer postgres")
@@ -3327,7 +3363,6 @@ interface ProcessOptions {
     explorer?: boolean;
     modeAWebWalletBridge?: boolean;
     daemonlize?: boolean;
-    realmP2p?: boolean;
 }
 export const ROLLBACK_STOP_SENTINEL_CONTENT =
     "rollback offline: all processors and relayer stopped; Scylla Redis NATS and checkpoints retained";
@@ -3751,11 +3786,8 @@ class DevNetProcessManager {
         await this.startApplications(cwd);
     }
 
-    private getEnv(): { [key: string]: string } | undefined {
-        if (this.envVars) {
-            return { ...process.env, ...this.envVars };
-        }
-        return undefined;
+    private getEnv(): { [key: string]: string } {
+        return { ...process.env, ...this.envVars, PSY_NETWORK: selectedRuntimeConfigKey(this.NETWORK) } as { [key: string]: string };
     }
     private getEnvWithRustLogDirective(directive: string): { [key: string]: string } {
         const env = this.getEnv() || { ...process.env } as { [key: string]: string };
@@ -3796,6 +3828,8 @@ class DevNetProcessManager {
         const needsStartDb = !hasOnlyOptions || !!options.db;
         const startRealmId = options.startRealmId || 0;
         const realmsCount = options.realmsCount !== undefined ? options.realmsCount : (startAll ? 1 : 1);
+        const prepareRealmP2p = shouldPrepareRealmP2p(startCoordinatorProcessor, startRealmProcessor);
+        if (prepareRealmP2p) validateRealmP2pPorts(startRealmId, realmsCount, realmEdgeCount);
         const endRealmId = startRealmId + realmsCount - 1;
         const provingProcessCount = coordinatorWorkersCount
             + workerRealmCount
@@ -3881,15 +3915,14 @@ class DevNetProcessManager {
 
         const nodeCli = './target/release/psy_node_cli';
         const workerCli = './target/release/psy_worker_cli';
-        const realmP2p = !!options.realmP2p;
-        const realmP2pSubIds: readonly number[] = realmP2p ? REALM_P2P_SUB_IDS : [1];
-        let realmP2pValidators: RealmP2pValidators | null = null;
-        if (realmP2p && (startCoordinatorProcessor || startRealmProcessor)) {
+        const realmP2pSubIds: readonly number[] = REALM_P2P_SUB_IDS;
+        let realmP2pConfig: FullNetworkConfig | null = null;
+        if (prepareRealmP2p) {
             const allRealmIds = Array.from({ length: realmsCount }, (_, i) => startRealmId + i);
-            realmP2pValidators = await ensureRealmP2pValidators(nodeCli, cwd, allRealmIds);
+            realmP2pConfig = await ensureRealmP2pConfig(nodeCli, cwd, allRealmIds, realmEdgeCount, this.host);
+            this.envVars = { ...this.envVars, PSY_CONFIG_PATH: `${REALM_P2P_OUT_DIR}/config.json`, PSY_NETWORK: realmP2pConfig.defaultNetwork };
+            await injectGenesisValidators(path.join(cwd, this.genesisDataPath), realmP2pConfig);
         }
-
-        await injectGenesisValidators(path.join(cwd, this.genesisDataPath), realmP2pValidators);
 
 
         // 3. Coordinator Processor
@@ -3944,7 +3977,6 @@ class DevNetProcessManager {
                         '--listen', '0.0.0.0',
                         '--proving-backend', backend,
                         '--verbose',
-                        ...(realmP2p ? ['--p2p-validators-path', `${REALM_P2P_OUT_DIR}/validators.json`, '--p2p-checkpoints-per-epoch', '10'] : []),
                     ],
                     coordinatorEdgeProcessorStartedDetector,
                     { cwd, ...getLogPaths(`coordinator_edge_${j}`, true), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
@@ -3986,9 +4018,10 @@ class DevNetProcessManager {
         let processorReadiness: Promise<void> = Promise.resolve();
 
         if (startRealmProcessor) {
+            const activeRealmP2pConfig = realmP2pConfig;
+            if (!activeRealmP2pConfig) throw new Error("Realm P2P config was not prepared for Realm startup");
             processorReadiness = (async () => {
-                const subLabel = realmP2p ? ` (subs ${REALM_P2P_SUB_IDS.join(", ")})` : "";
-                console.log(`[DevNet] Starting ${realmsCount} realm processors and edges sequentially${subLabel}...`);
+                console.log(`[DevNet] Starting ${realmsCount} realms with two validators each...`);
                 for (let b = 0; b < realmsCount; b += 4) {
                     const batchSize = Math.min(4, realmsCount - b);
                     const realmIds = Array.from(
@@ -4002,16 +4035,14 @@ class DevNetProcessManager {
                             async (realmId) => {
                                 const logName = `realm_${realmId}_sub_${subId}_processor`;
                                 const realmLogPaths = getLogPaths(logName, false);
-                                const extra = realmP2pValidators
-                                    ? realmP2pProcessorExtraArgs(this.host, realmId, subId, realmP2pValidators)
-                                    : [];
+                                selectedRealm(activeRealmP2pConfig, realmId).validators[subId - 1];
+                                const extra = realmP2pProcessorExtraArgs(this.host, realmId, subId);
                                 const proc = await retryProcessorStartup(
                                     `realm ${realmId} sub ${subId} processor`,
                                     (attempt, totalAttempts) => RunningProcess.spawnWithInitializationHint(
                                         [
                                             nodeCli, 'start-realm-processor',
                                             '--realm-id', realmId.toString(),
-                                            '--realm-sub-id', subId.toString(),
                                             '--network', this.NETWORK,
                                             '--db-namespace', realmDbNamespace(realmId, subId),
                                             '--scylla-db-url', this.SCYLLA_URL,
@@ -4049,15 +4080,13 @@ class DevNetProcessManager {
                         for (const subId of realmP2pSubIds) {
                             for (let j = 0; j < realmEdgeCount; j++) {
                                 const port = realmP2pHttpPort(realmId, subId, j, realmEdgeCount);
-                                const extra = realmP2pValidators
-                                    ? realmP2pEdgeExtraArgs(this.host, realmId, subId, realmP2pValidators)
-                                    : [];
+                                selectedRealm(activeRealmP2pConfig, realmId).validators[subId - 1];
+                                const extra = realmP2pEdgeExtraArgs(this.host, realmId, subId, j, realmEdgeCount);
                                 const logName = `realm_${realmId}_sub_${subId}_edge_${j}`;
                                 const edgePromise = RunningProcess.spawnWithInitializationHintWithRetry(
                                     [
                                         nodeCli, 'start-realm-edge',
                                         '--realm-id', realmId.toString(),
-                                        '--realm-sub-id', subId.toString(),
                                         '--network', this.NETWORK,
                                         '--db-namespace', realmDbNamespace(realmId, subId),
                                         '--scylla-db-url', this.SCYLLA_URL,
@@ -4699,18 +4728,20 @@ class DevNetProcessManager {
         const needsStartDb = !hasOnlyOptions || !!options.db;
         const startRealmId = options.startRealmId || 0;
         const realmsCount = options.realmsCount !== undefined ? options.realmsCount : (startAll ? 1 : 1);
-        const endRealmId = startRealmId + realmsCount - 1;
+        const prepareRealmP2p = shouldPrepareRealmP2p(startCoordinatorProcessor, startRealmProcessor);
+        if (prepareRealmP2p) validateRealmP2pPorts(startRealmId, realmsCount, realmEdgeCount);
 
         const backend = this.provingBackend || (jtmb ? 'jtmb-poseidon-goldilocks' : 'plonky2-poseidon-goldilocks');
-        const realmP2p = !!options.realmP2p;
-        const realmP2pSubIds: readonly number[] = realmP2p ? REALM_P2P_SUB_IDS : [1];
-        let realmP2pValidators: RealmP2pValidators | null = null;
-        if (realmP2p && (startCoordinatorProcessor || startRealmProcessor)) {
+        const realmP2pSubIds: readonly number[] = REALM_P2P_SUB_IDS;
+        let realmP2pConfig: FullNetworkConfig | null = null;
+        if (prepareRealmP2p) {
             const allRealmIds = Array.from({ length: realmsCount }, (_, i) => startRealmId + i);
-            realmP2pValidators = await ensureRealmP2pValidators("./target/release/psy_node_cli", cwd, allRealmIds);
+            const foregroundP2pConfig = await ensureRealmP2pConfig("./target/release/psy_node_cli", cwd, allRealmIds, realmEdgeCount, this.host);
+            realmP2pConfig = daemonRealmP2pConfig(foregroundP2pConfig, allRealmIds, realmEdgeCount);
+            const daemonConfigPath = path.join(cwd, REALM_P2P_OUT_DIR, "daemon-config.json");
+            await fs.promises.writeFile(daemonConfigPath, JSON.stringify(realmP2pConfig, null, 2), "utf-8");
+            await injectGenesisValidators(path.join(cwd, this.genesisDataPath), realmP2pConfig);
         }
-
-        await injectGenesisValidators(path.join(cwd, this.genesisDataPath), realmP2pValidators);
 
 
         const services: any = {};
@@ -4750,6 +4781,10 @@ class DevNetProcessManager {
             "RAYON_NUM_THREADS": runtimeResources.env.RAYON_NUM_THREADS,
             "PSY_WORKER_BATCH_SIZE": runtimeResources.env.PSY_WORKER_BATCH_SIZE,
         };
+        if (realmP2pConfig) {
+            filteredEnv["PSY_CONFIG_PATH"] = `${REALM_P2P_OUT_DIR}/daemon-config.json`;
+            filteredEnv["PSY_NETWORK"] = realmP2pConfig.defaultNetwork;
+        }
         Object.assign(filteredEnv, selectNonEmptyEnv(env, FAUCET_ENV_KEYS));
         const envList = Object.entries(filteredEnv).map(([k, v]) => `${k}=${v}`);
 
@@ -4864,7 +4899,6 @@ class DevNetProcessManager {
                         "--listen", "0.0.0.0",
                         "--proving-backend", backend,
                         "--verbose",
-                        ...(realmP2p ? ["--p2p-validators-path", `${REALM_P2P_OUT_DIR}/validators.json`, "--p2p-checkpoints-per-epoch", "10"] : []),
                     ]),
                     ports: [`${port}:${port}`]
                 };
@@ -4890,17 +4924,17 @@ class DevNetProcessManager {
         }
 
         if (startRealmProcessor) {
+            const activeRealmP2pConfig = realmP2pConfig;
+            if (!activeRealmP2pConfig) throw new Error("Realm P2P config was not prepared for Realm startup");
             for (let i = 0; i < realmsCount; i++) {
                 const realmId = startRealmId + i;
                 for (const subId of realmP2pSubIds) {
-                    const extra = realmP2pValidators
-                        ? realmP2pProcessorExtraArgs("127.0.0.1", realmId, subId, realmP2pValidators)
-                        : [];
+                    selectedRealm(activeRealmP2pConfig, realmId).validators[subId - 1];
+                    const extra = realmP2pProcessorExtraArgs("0.0.0.0", realmId, subId);
                     const serviceName = `realm-${realmId}-sub-${subId}-processor`;
                     services[serviceName] = getRuntimeServiceEntry(serviceName, [
                         "/app/bin/psy_node_cli", "start-realm-processor",
                         "--realm-id", realmId.toString(),
-                        "--realm-sub-id", subId.toString(),
                         "--network", this.NETWORK,
                         "--db-namespace", realmDbNamespace(realmId, subId),
                         "--scylla-db-url", "scylla-server:9042",
@@ -4915,15 +4949,12 @@ class DevNetProcessManager {
                     ]);
                     for (let j = 0; j < realmEdgeCount; j++) {
                         const port = realmP2pHttpPort(realmId, subId, j, realmEdgeCount);
-                        const edgeExtra = realmP2pValidators
-                            ? realmP2pEdgeExtraArgs("127.0.0.1", realmId, subId, realmP2pValidators)
-                            : [];
+                        const edgeExtra = realmP2pEdgeExtraArgs("0.0.0.0", realmId, subId, j, realmEdgeCount);
                         const edgeName = `realm-${realmId}-sub-${subId}-edge-${j}`;
                         services[edgeName] = {
                             ...getRuntimeServiceEntry(edgeName, [
                                 "/app/bin/psy_node_cli", "start-realm-edge",
                                 "--realm-id", realmId.toString(),
-                                "--realm-sub-id", subId.toString(),
                                 "--network", this.NETWORK,
                                 "--db-namespace", realmDbNamespace(realmId, subId),
                                 "--scylla-db-url", "scylla-server:9042",
@@ -5284,7 +5315,6 @@ async function runMain() {
             "start-realm-id": { type: "string", default: "0" },
             "realms-count": { type: "string", default: "1" },
             "host": { type: "string", default: "127.0.0.1" },
-            "realm-p2p": { type: "boolean" },
 
             "genesis-data-path": { type: "string", default: "genesis.json" },
             "coordinator": { type: "boolean" },
@@ -5322,6 +5352,7 @@ async function runMain() {
     const coordinatorWorkersCount = values["coordinator-workers"] ? parseInt(values["coordinator-workers"], 10) : (!hasOnlyOptions ? 1 : 0);
     const startRealmId = parseInt(values["start-realm-id"] || "0", 10);
     const realmsCount = parseInt(values["realms-count"] || "1", 10);
+    if (!hasOnlyOptions || !!values["coordinator"]) validateRealmP2pPorts(startRealmId, realmsCount, realmEdgeCount);
     const host = values["host"] || "127.0.0.1";
     const genesisDataPath = values["genesis-data-path"] || "genesis.json";
     const coordinator = !!values["coordinator"];
@@ -5341,7 +5372,6 @@ async function runMain() {
     const teardown = !!values["teardown"];
     const purge = !!values["purge"];
     const control = values["control"] as string | undefined;
-    const realmP2p = !!values["realm-p2p"];
 
     const provingBackend = values["proving-backend"];
     const envString = values["env"];
@@ -5394,7 +5424,6 @@ Usage: bun run dev/locSetupV4.ts [options]
    --coordinator-workers <count>   Number of coordinator workers (default: 1 when starting coordinator, 0 in only modes)
    --start-realm-id <id>           Starting realm ID (default: 0)
    --realms-count <n>              Number of realms to start (default: 1)
-   --realm-p2p                     Enable 2-sub-id Realm P2P (keys + rotation). Default off so make run-all stays HTTP.
    --coordinator                   Start coordinator + realm processors and edges (requires database to be running)
    --db                            Start only database services
    --workers                       Start only workers (requires database to be running)
@@ -5589,7 +5618,6 @@ Usage: bun run dev/locSetupV4.ts [options]
             explorer,
             modeAWebWalletBridge,
             daemonlize: !!values.daemonlize,
-            realmP2p,
         };
 
         if (daemonlize) {

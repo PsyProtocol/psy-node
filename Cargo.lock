@@ -7673,6 +7673,7 @@ dependencies = [
  "psy_data",
  "psy_io",
  "psy_jtmb_testing_core",
+ "psy_node_cli",
  "psy_node_common",
  "psy_node_core",
  "psy_node_nats",

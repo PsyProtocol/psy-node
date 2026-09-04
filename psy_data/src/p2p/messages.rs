@@ -20,8 +20,7 @@ use super::limits::{
     END_CAP_FORWARD_HEADER_WIRE_BYTES, END_CAP_FORWARD_RESPONSE_WIRE_BYTES, MAX_BACKUP_BYTES,
     MAX_FINALIZER_OUTPUT_BYTES, MAX_FINALIZER_PROOF_BYTES, MAX_PROPOSAL_BODY_BYTES,
     MAX_PROPOSAL_CHUNK_BYTES, MAX_PROPOSAL_PARTS, PROPOSAL_WIRE_BYTES,
-    REALM_FINALIZE_SUBMIT_MAX_REQUEST_BYTES, REALM_FINALIZE_SUBMIT_MIN_REQUEST_BYTES,
-    REALM_FINALIZE_SUBMIT_RESPONSE_WIRE_BYTES, VOTE_WIRE_BYTES,
+    VOTE_WIRE_BYTES,
 };
 
 /// Canonical fixed-size Realm finalizer public output (exactly 410 bytes).
@@ -520,127 +519,6 @@ impl ProtocolEncode for Certificate {
     }
 }
 
-/// Validator-to-coordinator Realm finalize submission:
-/// `output[410] || Proposal[210] || Certificate[200] || proof_len:u32 || proof`.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RealmFinalizeSubmitRequest {
-    output: RealmFinalizeOutputBytes,
-    proposal: Proposal,
-    certificate: Certificate,
-    proof: Vec<u8>,
-}
-
-impl RealmFinalizeSubmitRequest {
-    /// Build a submission; the proof must be `1..=MAX_FINALIZER_PROOF_BYTES`.
-    pub fn new(
-        output: RealmFinalizeOutputBytes,
-        proposal: Proposal,
-        certificate: Certificate,
-        proof: Vec<u8>,
-    ) -> ProtocolResult<Self> {
-        validate_realm_finalize_proof_len(proof.len())?;
-        Ok(Self {
-            output,
-            proposal,
-            certificate,
-            proof,
-        })
-    }
-
-    #[inline]
-    pub fn output(&self) -> &RealmFinalizeOutputBytes {
-        &self.output
-    }
-
-    #[inline]
-    pub fn proposal(&self) -> &Proposal {
-        &self.proposal
-    }
-
-    #[inline]
-    pub fn certificate(&self) -> &Certificate {
-        &self.certificate
-    }
-
-    #[inline]
-    pub fn proof(&self) -> &[u8] {
-        &self.proof
-    }
-
-    #[inline]
-    pub fn proof_len(&self) -> usize {
-        self.proof.len()
-    }
-
-    #[inline]
-    pub fn encoded_len(&self) -> usize {
-        REALM_FINALIZE_SUBMIT_MIN_REQUEST_BYTES - 4 - 1 + 4 + self.proof.len()
-    }
-
-    pub fn into_parts(
-        self,
-    ) -> (
-        RealmFinalizeOutputBytes,
-        Proposal,
-        Certificate,
-        Vec<u8>,
-    ) {
-        (self.output, self.proposal, self.certificate, self.proof)
-    }
-
-    pub fn protocol_decode(reader: &mut ProtocolReader<'_>) -> ProtocolResult<Self> {
-        let output = RealmFinalizeOutputBytes::protocol_decode(reader)?;
-        let proposal = Proposal::protocol_decode(reader)?;
-        let certificate = Certificate::protocol_decode(reader)?;
-        let proof =
-            reader.read_bytes_u32("RealmFinalizeSubmitRequest.proof", MAX_FINALIZER_PROOF_BYTES as u32)?;
-        validate_realm_finalize_proof_len(proof.len())?;
-        Ok(Self {
-            output,
-            proposal,
-            certificate,
-            proof,
-        })
-    }
-
-    pub fn decode_exact(bytes: &[u8]) -> ProtocolResult<Self> {
-        if bytes.len() < REALM_FINALIZE_SUBMIT_MIN_REQUEST_BYTES {
-            return Err(ProtocolError::Message(
-                "Realm finalize-submit request is truncated or has an empty proof",
-            ));
-        }
-        if bytes.len() > REALM_FINALIZE_SUBMIT_MAX_REQUEST_BYTES {
-            return Err(ProtocolError::LengthLimit {
-                what: "RealmFinalizeSubmitRequest",
-                got: bytes.len() as u64,
-                max: REALM_FINALIZE_SUBMIT_MAX_REQUEST_BYTES as u64,
-            });
-        }
-        decode_exact(bytes, Self::protocol_decode)
-    }
-}
-
-impl ProtocolEncode for RealmFinalizeSubmitRequest {
-    fn protocol_encode(&self, out: &mut Vec<u8>) {
-        self.output.protocol_encode(out);
-        self.proposal.protocol_encode(out);
-        self.certificate.protocol_encode(out);
-        debug_assert!(self.proof.len() <= MAX_FINALIZER_PROOF_BYTES);
-        write_u32(out, self.proof.len() as u32);
-        write_fixed(out, &self.proof);
-    }
-}
-
-fn validate_realm_finalize_proof_len(proof_len: usize) -> ProtocolResult<()> {
-    if proof_len == 0 || proof_len > MAX_FINALIZER_PROOF_BYTES {
-        return Err(ProtocolError::LengthLimit {
-            what: "RealmFinalizeSubmitRequest.proof",
-            got: proof_len as u64,
-            max: MAX_FINALIZER_PROOF_BYTES as u64,
-        });
-    }
-    Ok(())
-}
 
 /// Stable one-byte Realm finalize submission result code (`Accepted = 0` ..
 /// `Internal = 10`).
@@ -700,38 +578,6 @@ impl RealmFinalizeSubmitCode {
     }
 }
 
-/// Exact one-byte Realm finalize submission response.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub struct RealmFinalizeSubmitResponse {
-    code: RealmFinalizeSubmitCode,
-}
-
-impl RealmFinalizeSubmitResponse {
-    /// Exact wire length (1 byte).
-    pub const WIRE_BYTES: usize = REALM_FINALIZE_SUBMIT_RESPONSE_WIRE_BYTES;
-
-    pub const fn new(code: RealmFinalizeSubmitCode) -> Self {
-        Self { code }
-    }
-
-    pub const fn code(self) -> RealmFinalizeSubmitCode {
-        self.code
-    }
-
-    pub fn protocol_decode(reader: &mut ProtocolReader<'_>) -> ProtocolResult<Self> {
-        Ok(Self::new(RealmFinalizeSubmitCode::from_u8(reader.read_u8()?)?))
-    }
-
-    pub fn decode_exact(bytes: &[u8]) -> ProtocolResult<Self> {
-        decode_exact(bytes, Self::protocol_decode)
-    }
-}
-
-impl ProtocolEncode for RealmFinalizeSubmitResponse {
-    fn protocol_encode(&self, out: &mut Vec<u8>) {
-        write_u8(out, self.code as u8);
-    }
-}
 
 #[inline]
 pub fn bitmap_get(bitmap: &[u8; 32], sub_id: u16) -> bool {
@@ -949,8 +795,7 @@ mod tests {
         CERTIFICATE_WIRE_BYTES, DIRECT_BODY_REQUEST_WIRE_BYTES, DIRECT_REQUEST_MAX_BYTES,
         END_CAP_FORWARD_HEADER_WIRE_BYTES, MAX_BACKUP_BYTES, MAX_FINALIZER_OUTPUT_BYTES,
         MAX_FINALIZER_PROOF_BYTES, MAX_PROPOSAL_BODY_BYTES, MAX_PROPOSAL_CHUNK_BYTES,
-        MAX_PROPOSAL_PARTS, PROPOSAL_WIRE_BYTES, REALM_FINALIZE_SUBMIT_PREFIX_WIRE_BYTES,
-        VOTE_WIRE_BYTES,
+        MAX_PROPOSAL_PARTS, PROPOSAL_WIRE_BYTES, VOTE_WIRE_BYTES,
     };
 
     fn sample_proposal() -> Proposal {
@@ -1192,7 +1037,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_body_and_finalize_submit_roundtrip() {
+    fn direct_body_roundtrip() {
         let p = sample_proposal();
         let req = DirectBodyRequest {
             proposal_id: p.proposal_id,
@@ -1227,57 +1072,6 @@ mod tests {
         assert_eq!(renc.len(), 53 + 32);
         assert_eq!(DirectBodyResponse::decode_exact(&renc).unwrap(), resp);
 
-        // Realm finalize-submit: output || proposal || certificate || proof_len || proof.
-        let sk = BlsSecretKey::key_gen(&[3u8; 32]).unwrap();
-        let msg = vote_message(1, 2, &p.validator_tree_root, &p.proposal_id);
-        let mut bitmap = [0u8; 32];
-        bitmap_set(&mut bitmap, 3);
-        let cert = Certificate {
-            chain_id: 1,
-            realm_id: 2,
-            validator_tree_root: p.validator_tree_root,
-            proposal_id: p.proposal_id,
-            signer_bitmap: bitmap,
-            aggregated_signature: sk.sign_vote(&msg),
-        };
-        let output = RealmFinalizeOutputBytes::new([0x5A; MAX_FINALIZER_OUTPUT_BYTES]);
-        let proof = vec![0x6B; 42];
-        let submit =
-            RealmFinalizeSubmitRequest::new(output.clone(), p.clone(), cert.clone(), proof.clone())
-                .unwrap();
-        assert_eq!(submit.proof(), proof.as_slice());
-        assert_eq!(submit.proof_len(), 42);
-        assert_eq!(submit.encoded_len(), REALM_FINALIZE_SUBMIT_PREFIX_WIRE_BYTES + 4 + 42);
-        let senc = submit.protocol_encode_to_vec();
-        assert_eq!(senc.len(), REALM_FINALIZE_SUBMIT_PREFIX_WIRE_BYTES + 4 + 42);
-        let dec = RealmFinalizeSubmitRequest::decode_exact(&senc).unwrap();
-        assert_eq!(dec, submit);
-        let (out2, p2, c2, proof2) = submit.into_parts();
-        assert_eq!(out2, output);
-        assert_eq!(p2, p);
-        assert_eq!(c2, cert);
-        assert_eq!(proof2, proof);
-
-        assert!(RealmFinalizeSubmitRequest::new(output.clone(), p.clone(), cert.clone(), vec![]).is_err());
-        assert!(RealmFinalizeSubmitRequest::new(
-            output.clone(),
-            p.clone(),
-            cert.clone(),
-            vec![0u8; MAX_FINALIZER_PROOF_BYTES + 1],
-        )
-        .is_err());
-        let mut trailing = senc.clone();
-        trailing.push(0);
-        assert!(RealmFinalizeSubmitRequest::decode_exact(&trailing).is_err());
-        assert!(RealmFinalizeSubmitRequest::decode_exact(&senc[..senc.len() - 1]).is_err());
-
-        // Response codes 0..=10 round-trip; unknown tags and trailing bytes fail.
-        for code in 0u8..=10 {
-            let response = RealmFinalizeSubmitResponse::decode_exact(&[code]).unwrap();
-            assert_eq!(response.protocol_encode_to_vec(), vec![code]);
-        }
-        assert!(RealmFinalizeSubmitResponse::decode_exact(&[11]).is_err());
-        assert!(RealmFinalizeSubmitResponse::decode_exact(&[0, 0]).is_err());
     }
 
     #[test]

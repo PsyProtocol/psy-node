@@ -10,8 +10,7 @@ use crate::realm::network::{
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId};
 use parth_common::realm_rotation::RealmRotationConfig;
-use psy_data::p2p::{BlsSecretKey, NodeId, NODE_ID_RAW_LEN};
-use std::collections::HashMap;
+use psy_data::p2p::{BlsSecretKey, NodeId};
 use std::str::FromStr;
 
 /// Parsed optional Realm network plus the rotation/BLS material the
@@ -41,44 +40,12 @@ pub fn parse_bootnode(value: &str) -> Result<(PeerId, Multiaddr), NetworkError> 
     Ok((peer, addr))
 }
 
-/// Parse an edge proposer mapping `SUB:HEX38` into `(realm_sub_id, NodeId)`.
-pub fn parse_proposer_node_id(value: &str) -> anyhow::Result<(u16, NodeId)> {
-    let (sub, hex_id) = value.split_once(':').ok_or_else(|| {
-        anyhow::anyhow!("p2p proposer node id must be SUB:HEX38, got {value}")
-    })?;
-    let sub_id: u16 = sub.parse().map_err(|error| {
-        anyhow::anyhow!("invalid proposer sub_id in {value}: {error}")
-    })?;
-    let bytes = hex::decode(hex_id)
-        .map_err(|error| anyhow::anyhow!("invalid NodeId hex in {value}: {error}"))?;
-    if bytes.len() != NODE_ID_RAW_LEN {
-        anyhow::bail!(
-            "NodeId hex for sub {sub_id} must be {NODE_ID_RAW_LEN} bytes, got {}",
-            bytes.len()
-        );
-    }
-    let mut raw = [0u8; NODE_ID_RAW_LEN];
-    raw.copy_from_slice(&bytes);
-    Ok((sub_id, NodeId::from_raw(raw)?))
-}
-
-/// Parse a list of `SUB:HEX38` mappings into the edge forward table.
-pub fn parse_proposer_node_ids(values: &[String]) -> anyhow::Result<HashMap<u16, NodeId>> {
-    let mut map = HashMap::with_capacity(values.len());
-    for value in values {
-        let (sub_id, node_id) = parse_proposer_node_id(value)?;
-        if map.insert(sub_id, node_id).is_some() {
-            anyhow::bail!("duplicate p2p proposer NodeId for sub_id {sub_id}");
-        }
-    }
-    Ok(map)
-}
 
 /// Build a Realm network when P2P identity + listen are configured.
 ///
-/// Validators (`is_edge = false`) require a BLS key and a coordinator
-/// multiaddr. Edges leave BLS unset. Rotation is fail-closed: empty validators
-/// or zero period is a configuration error, not a silent disable.
+/// Validators (`is_edge = false`) require a BLS key. Edges leave BLS unset.
+/// Rotation is fail-closed: empty validators or zero period is a
+/// configuration error, not a silent disable.
 pub fn build_optional_realm_network(
     chain_id: u32,
     realm_id: u32,
@@ -87,7 +54,6 @@ pub fn build_optional_realm_network(
     bls_key_path: Option<&str>,
     listen: &str,
     bootnodes: &[String],
-    coordinator: Option<&str>,
     validator_sub_ids: &[u16],
     checkpoints_per_epoch: u64,
 ) -> Result<OptionalRealmNetwork, NetworkError> {
@@ -103,20 +69,6 @@ pub fn build_optional_realm_network(
     let mut bootnode_addresses = Vec::with_capacity(bootnodes.len());
     for bootnode in bootnodes {
         bootnode_addresses.push(parse_bootnode(bootnode)?);
-    }
-    let mut coordinator_addresses = Vec::new();
-    if let Some(coordinator_addr) = coordinator {
-        let addr = Multiaddr::from_str(coordinator_addr).map_err(|error| {
-            NetworkError::Configuration(format!(
-                "invalid p2p coordinator {coordinator_addr}: {error}"
-            ))
-        })?;
-        coordinator_addresses.push(addr);
-    }
-    if !is_edge && coordinator_addresses.is_empty() {
-        return Err(NetworkError::Configuration(
-            "validator requires p2p coordinator address".into(),
-        ));
     }
     if !is_edge && bls_key_path.is_none() {
         return Err(NetworkError::Configuration(
@@ -135,7 +87,6 @@ pub fn build_optional_realm_network(
         listen_addresses: vec![listen_addr],
         external_addresses: vec![],
         bootnode_addresses,
-        coordinator_addresses,
         serve_as_bootnode: false,
         is_edge,
         px_enabled: false,

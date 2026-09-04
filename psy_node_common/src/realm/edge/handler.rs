@@ -53,7 +53,7 @@ use crate::realm::{
     edge::{error::RpcError, utils::end_cap::validate_end_cap_and_generate_node_data_for_edge},
     queue_key::RealmUserUpdateQueueKey,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::realm::network::RealmNetworkCommands;
 use parth_common::realm_rotation::RealmRotationConfig;
@@ -91,7 +91,8 @@ pub struct RealmEdgeHandler<
 
     pub p2p: Option<RealmNetworkCommands>,
     pub rotation: Option<RealmRotationConfig>,
-    pub proposer_node_ids: Option<HashMap<u16, NodeId>>,
+    pub proposer_edge_node_ids: Option<HashMap<u16, NodeId>>,
+    pub realm_edge_node_ids: Option<HashSet<NodeId>>,
 }
 impl<
         N: QNetworkTypesConfig,
@@ -121,7 +122,8 @@ impl<
             contract_state_tree_height_cache: self.contract_state_tree_height_cache.clone(),
             p2p: self.p2p.clone(),
             rotation: self.rotation.clone(),
-            proposer_node_ids: self.proposer_node_ids.clone(),
+            proposer_edge_node_ids: self.proposer_edge_node_ids.clone(),
+            realm_edge_node_ids: self.realm_edge_node_ids.clone(),
         }
     }
 }
@@ -167,18 +169,21 @@ impl<
             contract_state_tree_height_cache: Arc::new(DashMapContractHeightCache::new()),
             p2p: None,
             rotation: None,
-            proposer_node_ids: None,
+            proposer_edge_node_ids: None,
+            realm_edge_node_ids: None,
         }
     }
     pub fn set_realm_p2p(
         &mut self,
         commands: RealmNetworkCommands,
         rotation: RealmRotationConfig,
-        proposer_node_ids: HashMap<u16, NodeId>,
+        proposer_edge_node_ids: HashMap<u16, NodeId>,
+        realm_edge_node_ids: HashSet<NodeId>,
     ) {
         self.p2p = Some(commands);
         self.rotation = Some(rotation);
-        self.proposer_node_ids = Some(proposer_node_ids);
+        self.proposer_edge_node_ids = Some(proposer_edge_node_ids);
+        self.realm_edge_node_ids = Some(realm_edge_node_ids);
     }
     pub async fn handle_p2p_end_cap_received(
         &self,
@@ -219,6 +224,14 @@ impl<
         if !rotation.is_enabled() {
             return Ok(());
         }
+        let commands = self
+            .p2p
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Realm edge P2P commands are missing"))?;
+        let proposer_edge_node_ids = self
+            .proposer_edge_node_ids
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Realm edge proposer identities are missing"))?;
         let latest_checkpoint_id = self.get_latest_checkpoint_id().await?;
         let admissible_target = latest_checkpoint_id
             .checked_add(1)
@@ -241,10 +254,11 @@ impl<
         ];
         ensure_local_is_scheduled_end_cap_receiver(
             self.realm_id_u64 as u32,
-            self.realm_sub_id_u64 as u16,
+            commands.local_node_id(),
             admissible_target,
             seed,
             rotation,
+            proposer_edge_node_ids,
         )
     }
     async fn accept_forwarded_end_cap(
@@ -258,10 +272,10 @@ impl<
         N::ZKVerifier: 'static,
         N::ZKProof: 'static,
     {
-        let proposer_node_ids = self
-            .proposer_node_ids
+        let realm_edge_node_ids = self
+            .realm_edge_node_ids
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("forwarded EndCap Realm edge validator identities are missing"))?;
+            .ok_or_else(|| anyhow::anyhow!("forwarded EndCap Realm edge identities are missing"))?;
         validate_forwarded_end_cap(
             source,
             &header,
@@ -269,7 +283,7 @@ impl<
             &proof,
             self.chain_id,
             self.realm_id_u64 as u32,
-            proposer_node_ids,
+            realm_edge_node_ids,
         )?;
         self.ensure_local_is_scheduled_end_cap_receiver(header.checkpoint_id)
             .await?;
@@ -385,11 +399,11 @@ fn validate_forwarded_end_cap(
     proof: &[u8],
     local_chain_id: u32,
     local_realm_id: u32,
-    proposer_node_ids: &HashMap<u16, NodeId>,
+    realm_edge_node_ids: &HashSet<NodeId>,
 ) -> anyhow::Result<[u8; 32]> {
     anyhow::ensure!(
-        proposer_node_ids.values().any(|node_id| node_id == &source),
-        "forwarded EndCap source NodeId {source} is not a Realm validator identity"
+        realm_edge_node_ids.contains(&source),
+        "forwarded EndCap source NodeId {source} is not a Realm edge identity"
     );
     if header.chain_id != local_chain_id {
         anyhow::bail!(
@@ -455,17 +469,15 @@ fn ensure_start_user_leaf_hash<QHash: PartialEq + std::fmt::Debug>(
     Ok(())
 }
 
-/// Pure Realm P2P EndCap forward routing for a target checkpoint: returns
-/// `Some((proposer_sub_id, dest NodeId))` when the local instance is NOT the
-/// scheduled proposer, `None` when rotation is disabled or the local instance
-/// IS the scheduled proposer (local intake).
+/// Pure Realm P2P EndCap forward routing for a target checkpoint. Intake stays
+/// local only on the scheduled validator's primary edge.
 fn resolve_end_cap_forward_dest(
     realm_id: u32,
-    local_sub_id: u16,
+    local_edge_node_id: NodeId,
     target_checkpoint_id: u64,
     anchor_seed: parth_common::realm_rotation::RotationAnchorSeed,
     rotation: &RealmRotationConfig,
-    proposer_node_ids: &HashMap<u16, NodeId>,
+    proposer_edge_node_ids: &HashMap<u16, NodeId>,
 ) -> anyhow::Result<Option<(u16, NodeId)>> {
     if !rotation.is_enabled() {
         return Ok(None);
@@ -477,22 +489,23 @@ fn resolve_end_cap_forward_dest(
             realm_id,
             target_checkpoint_id,
         ))?;
-    if proposer == local_sub_id {
-        return Ok(None);
-    }
-    let dest = proposer_node_ids
+    let dest = proposer_edge_node_ids
         .get(&proposer)
         .copied()
-        .ok_or_else(|| anyhow::anyhow!("no NodeId for scheduled proposer sub_id {proposer}"))?;
+        .ok_or_else(|| anyhow::anyhow!("no edge NodeId for scheduled proposer sub_id {proposer}"))?;
+    if dest == local_edge_node_id {
+        return Ok(None);
+    }
     Ok(Some((proposer, dest)))
 }
 
 fn ensure_local_is_scheduled_end_cap_receiver(
     realm_id: u32,
-    local_sub_id: u16,
+    local_edge_node_id: NodeId,
     target_checkpoint_id: u64,
     anchor_seed: parth_common::realm_rotation::RotationAnchorSeed,
     rotation: &RealmRotationConfig,
+    proposer_edge_node_ids: &HashMap<u16, NodeId>,
 ) -> anyhow::Result<()> {
     if !rotation.is_enabled() {
         return Ok(());
@@ -504,9 +517,13 @@ fn ensure_local_is_scheduled_end_cap_receiver(
             realm_id,
             target_checkpoint_id,
         ))?;
+    let primary_edge = proposer_edge_node_ids
+        .get(&proposer)
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("no edge NodeId for scheduled proposer sub_id {proposer}"))?;
     anyhow::ensure!(
-        proposer == local_sub_id,
-        "forwarded EndCap rejected: local sub_id {local_sub_id} is not scheduled proposer {proposer} for target {target_checkpoint_id}"
+        primary_edge == local_edge_node_id,
+        "forwarded EndCap rejected: local edge is not primary for scheduled proposer {proposer} at target {target_checkpoint_id}"
     );
     Ok(())
 }
@@ -766,7 +783,9 @@ impl<
         user_end_cap_input: &SubmitUserEndCapNonProofInput<N::F, N::QHash>,
         proof_bytes: Vec<u8>,
     ) -> anyhow::Result<bool> {
-        let (Some(cmds), Some(rotation), Some(node_ids)) = (&self.p2p, &self.rotation, &self.proposer_node_ids) else {
+        let (Some(cmds), Some(rotation), Some(proposer_edge_node_ids)) =
+            (&self.p2p, &self.rotation, &self.proposer_edge_node_ids)
+        else {
             return Ok(false);
         };
         if !rotation.is_enabled() {
@@ -788,11 +807,11 @@ impl<
         ];
         let Some((proposer, dest)) = resolve_end_cap_forward_dest(
             self.realm_id_u64 as u32,
-            self.realm_sub_id_u64 as u16,
+            cmds.local_node_id(),
             target,
             seed,
             rotation,
-            node_ids,
+            proposer_edge_node_ids,
         )?
         else {
             return Ok(false);
@@ -1527,6 +1546,12 @@ mod tests {
             .collect()
     }
 
+    fn build_edge_identities(sub_ids: &[u16]) -> (HashMap<u16, NodeId>, HashSet<NodeId>) {
+        let by_sub_id = build_validators(sub_ids);
+        let all = by_sub_id.values().copied().collect();
+        (by_sub_id, all)
+    }
+
     fn end_cap_header(
         chain_id: u32,
         realm_id: u32,
@@ -1552,7 +1577,7 @@ mod tests {
 
     #[test]
     fn validate_forwarded_end_cap_accepts_validator_source_with_matching_header() {
-        let validators = build_validators(&[1, 2, 3]);
+        let (validators, realm_edge_node_ids) = build_edge_identities(&[1, 2, 3]);
         let (input, proof) = sample_input_and_proof();
         let header = end_cap_header(TEST_CHAIN_ID, TEST_REALM_ID, 25, &input, &proof);
         let validated = validate_forwarded_end_cap(
@@ -1562,7 +1587,7 @@ mod tests {
             &proof,
             TEST_CHAIN_ID,
             TEST_REALM_ID,
-            &validators,
+            &realm_edge_node_ids,
         )
         .expect("validator source with matching header is accepted");
         assert_eq!(validated, header.end_cap_id);
@@ -1570,7 +1595,7 @@ mod tests {
 
     #[test]
     fn validate_forwarded_end_cap_rejects_source_outside_validators() {
-        let validators = build_validators(&[1, 2, 3]);
+        let (_, realm_edge_node_ids) = build_edge_identities(&[1, 2, 3]);
         let (input, proof) = sample_input_and_proof();
         let header = end_cap_header(TEST_CHAIN_ID, TEST_REALM_ID, 25, &input, &proof);
         let forged = test_node(99);
@@ -1581,18 +1606,18 @@ mod tests {
             &proof,
             TEST_CHAIN_ID,
             TEST_REALM_ID,
-            &validators,
+            &realm_edge_node_ids,
         )
         .unwrap_err();
         assert_eq!(
             err.to_string(),
-            format!("forwarded EndCap source NodeId {forged} is not a Realm validator identity")
+            format!("forwarded EndCap source NodeId {forged} is not a Realm edge identity")
         );
     }
 
     #[test]
     fn validate_forwarded_end_cap_rejects_chain_id_mismatch() {
-        let validators = build_validators(&[1, 2, 3]);
+        let (validators, realm_edge_node_ids) = build_edge_identities(&[1, 2, 3]);
         let (input, proof) = sample_input_and_proof();
         // Keep the header internally consistent (end_cap_id over chain 8) so
         // only the chain_id check can fail.
@@ -1604,7 +1629,7 @@ mod tests {
             &proof,
             TEST_CHAIN_ID,
             TEST_REALM_ID,
-            &validators,
+            &realm_edge_node_ids,
         )
         .unwrap_err();
         assert_eq!(
@@ -1619,7 +1644,7 @@ mod tests {
 
     #[test]
     fn validate_forwarded_end_cap_rejects_realm_id_mismatch() {
-        let validators = build_validators(&[1, 2, 3]);
+        let (validators, realm_edge_node_ids) = build_edge_identities(&[1, 2, 3]);
         let (input, proof) = sample_input_and_proof();
         let header = end_cap_header(TEST_CHAIN_ID, TEST_REALM_ID + 1, 25, &input, &proof);
         let err = validate_forwarded_end_cap(
@@ -1629,7 +1654,7 @@ mod tests {
             &proof,
             TEST_CHAIN_ID,
             TEST_REALM_ID,
-            &validators,
+            &realm_edge_node_ids,
         )
         .unwrap_err();
         assert_eq!(
@@ -1644,7 +1669,7 @@ mod tests {
 
     #[test]
     fn validate_forwarded_end_cap_rejects_input_length_mismatch() {
-        let validators = build_validators(&[1, 2, 3]);
+        let (validators, realm_edge_node_ids) = build_edge_identities(&[1, 2, 3]);
         let (input, proof) = sample_input_and_proof();
         let header = end_cap_header(TEST_CHAIN_ID, TEST_REALM_ID, 25, &input, &proof);
         let mut padded = input.clone();
@@ -1656,7 +1681,7 @@ mod tests {
             &proof,
             TEST_CHAIN_ID,
             TEST_REALM_ID,
-            &validators,
+            &realm_edge_node_ids,
         )
         .unwrap_err();
         assert_eq!(
@@ -1671,7 +1696,7 @@ mod tests {
 
     #[test]
     fn validate_forwarded_end_cap_rejects_proof_length_mismatch() {
-        let validators = build_validators(&[1, 2, 3]);
+        let (validators, realm_edge_node_ids) = build_edge_identities(&[1, 2, 3]);
         let (input, proof) = sample_input_and_proof();
         let header = end_cap_header(TEST_CHAIN_ID, TEST_REALM_ID, 25, &input, &proof);
         let truncated = proof[..proof.len() - 1].to_vec();
@@ -1682,7 +1707,7 @@ mod tests {
             &truncated,
             TEST_CHAIN_ID,
             TEST_REALM_ID,
-            &validators,
+            &realm_edge_node_ids,
         )
         .unwrap_err();
         assert_eq!(
@@ -1697,7 +1722,7 @@ mod tests {
 
     #[test]
     fn validate_forwarded_end_cap_rejects_end_cap_id_mismatch() {
-        let validators = build_validators(&[1, 2, 3]);
+        let (validators, realm_edge_node_ids) = build_edge_identities(&[1, 2, 3]);
         let (input, proof) = sample_input_and_proof();
         let mut header = end_cap_header(TEST_CHAIN_ID, TEST_REALM_ID, 25, &input, &proof);
         header.end_cap_id = [0xFF; 32];
@@ -1708,7 +1733,7 @@ mod tests {
             &proof,
             TEST_CHAIN_ID,
             TEST_REALM_ID,
-            &validators,
+            &realm_edge_node_ids,
         )
         .unwrap_err();
         assert_eq!(
@@ -1758,7 +1783,7 @@ mod tests {
         let proposer = scheduled_proposer(&rotation, 25);
         let dest = resolve_end_cap_forward_dest(
             TEST_REALM_ID,
-            proposer,
+            validators[&proposer],
             25,
             [1, 2, 3, 4],
             &rotation,
@@ -1784,7 +1809,7 @@ mod tests {
             .expect("at least one other validator sub id");
         let dest = resolve_end_cap_forward_dest(
             TEST_REALM_ID,
-            local_sub_id,
+            validators[&local_sub_id],
             25,
             [1, 2, 3, 4],
             &rotation,
@@ -1807,7 +1832,7 @@ mod tests {
         let validators = build_validators(&other_sub_ids);
         let err = resolve_end_cap_forward_dest(
             TEST_REALM_ID,
-            other_sub_ids[0],
+            validators[&other_sub_ids[0]],
             25,
             [1, 2, 3, 4],
             &rotation,
@@ -1816,7 +1841,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err.to_string(),
-            format!("no NodeId for scheduled proposer sub_id {proposer}")
+            format!("no edge NodeId for scheduled proposer sub_id {proposer}")
         );
     }
 
@@ -1829,7 +1854,7 @@ mod tests {
         let validators = build_validators(&[1, 2, 3]);
         let dest = resolve_end_cap_forward_dest(
             TEST_REALM_ID,
-            1,
+            validators[&1],
             25,
             [1, 2, 3, 4],
             &rotation,
@@ -1843,11 +1868,37 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_receiver_accepts_local_proposer() {
+    fn scheduled_receiver_accepts_primary_edge() {
         let rotation = rotation_config();
+        let proposer_edge_node_ids = build_validators(&[1, 2, 3]);
         let proposer = scheduled_proposer(&rotation, 25);
-        ensure_local_is_scheduled_end_cap_receiver(TEST_REALM_ID, proposer, 25, [1, 2, 3, 4], &rotation)
-            .expect("scheduled proposer may receive");
+        ensure_local_is_scheduled_end_cap_receiver(
+            TEST_REALM_ID,
+            proposer_edge_node_ids[&proposer],
+            25,
+            [1, 2, 3, 4],
+            &rotation,
+            &proposer_edge_node_ids,
+        )
+        .expect("scheduled primary edge may receive");
+    }
+
+    #[test]
+    fn scheduled_validator_secondary_edge_routes_to_primary() {
+        let rotation = rotation_config();
+        let proposer_edge_node_ids = build_validators(&[1, 2, 3]);
+        let proposer = scheduled_proposer(&rotation, 25);
+        let secondary_edge = test_node(99);
+        let dest = resolve_end_cap_forward_dest(
+            TEST_REALM_ID,
+            secondary_edge,
+            25,
+            [1, 2, 3, 4],
+            &rotation,
+            &proposer_edge_node_ids,
+        )
+        .expect("secondary edge routing");
+        assert_eq!(dest, Some((proposer, proposer_edge_node_ids[&proposer])));
     }
 
     #[test]
@@ -1863,7 +1914,7 @@ mod tests {
             .expect("other validator");
         let forwarded = resolve_end_cap_forward_dest(
             TEST_REALM_ID,
-            other,
+            validators[&other],
             25,
             [1, 2, 3, 4],
             &rotation,
@@ -1873,7 +1924,7 @@ mod tests {
         assert!(forwarded.is_some(), "non-proposer must forward and skip store/NATS");
         let local = resolve_end_cap_forward_dest(
             TEST_REALM_ID,
-            proposer,
+            validators[&proposer],
             25,
             [1, 2, 3, 4],
             &rotation,
@@ -1886,6 +1937,7 @@ mod tests {
     #[test]
     fn scheduled_receiver_rejects_non_proposer() {
         let rotation = rotation_config();
+        let validators = build_validators(&[1, 2, 3]);
         let proposer = scheduled_proposer(&rotation, 25);
         let local_sub_id = rotation
             .validator_sub_ids
@@ -1895,16 +1947,17 @@ mod tests {
             .expect("other validator");
         let err = ensure_local_is_scheduled_end_cap_receiver(
             TEST_REALM_ID,
-            local_sub_id,
+            validators[&local_sub_id],
             25,
             [1, 2, 3, 4],
             &rotation,
+            &validators,
         )
         .unwrap_err();
         assert_eq!(
             err.to_string(),
             format!(
-                "forwarded EndCap rejected: local sub_id {local_sub_id} is not scheduled proposer {proposer} for target 25"
+                "forwarded EndCap rejected: local edge is not primary for scheduled proposer {proposer} at target 25"
             )
         );
     }

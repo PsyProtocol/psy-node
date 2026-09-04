@@ -3,8 +3,7 @@
 //! Protocols wired:
 //! - Gossipsub: `/psy/realm/{id}/proposals` and `/psy/realm/{id}/votes`
 //!   (validator-only subscriptions).
-//! - request-response: direct proposal-body ranges, EndCap forward,
-//!   Realm finalize-submit.
+//! - request-response: direct proposal-body ranges, EndCap forward.
 //! - Identify, relay v2 (client always; server toggle for bootnodes),
 //!   DCUtR, AutoNAT.
 //!
@@ -12,8 +11,7 @@
 //! does not include `kad` or `upnp`, and the slim port does not require them.
 
 use crate::realm::network::codec::{
-    DirectBodyCodec, EndCapForwardCodec, RealmFinalizeSubmitCodec, DIRECT_BODY_PROTOCOL_ID,
-    END_CAP_FORWARD_PROTOCOL_ID, REALM_FINALIZE_SUBMIT_PROTOCOL_ID,
+    DirectBodyCodec, EndCapForwardCodec, DIRECT_BODY_PROTOCOL_ID, END_CAP_FORWARD_PROTOCOL_ID,
 };
 use crate::realm::network::config::RealmNetworkConfig;
 use libp2p::autonat;
@@ -24,7 +22,7 @@ use libp2p::relay;
 use libp2p::request_response;
 use libp2p::swarm::{behaviour::toggle::Toggle, NetworkBehaviour, StreamProtocol};
 use libp2p::{identity, PeerId};
-use psy_data::p2p::{GOSSIPSUB_MAX_TRANSMIT_SIZE, MAX_CONCURRENT_DIRECT_EXCHANGES, MAX_CONCURRENT_REALM_FINALIZE_SUBMITS};
+use psy_data::p2p::{GOSSIPSUB_MAX_TRANSMIT_SIZE, MAX_CONCURRENT_DIRECT_EXCHANGES};
 use std::time::Duration;
 
 pub const IDENTIFY_PROTOCOL_ID: &str = "/psy/realm/1";
@@ -45,7 +43,6 @@ pub struct RealmBehaviour {
     pub identify: identify::Behaviour,
     pub direct_body: request_response::Behaviour<DirectBodyCodec>,
     pub end_cap_forward: request_response::Behaviour<EndCapForwardCodec>,
-    pub realm_finalize_submit: request_response::Behaviour<RealmFinalizeSubmitCodec>,
     pub relay_client: relay::client::Behaviour,
     pub relay_server: Toggle<relay::Behaviour>,
     pub dcutr: dcutr::Behaviour,
@@ -101,11 +98,6 @@ impl RealmBehaviour {
         let end_cap_config = request_response::Config::default()
             .with_request_timeout(Duration::from_secs(psy_data::p2p::END_CAP_FORWARD_TIMEOUT_SECS))
             .with_max_concurrent_streams(MAX_CONCURRENT_DIRECT_EXCHANGES);
-        let realm_finalize_config = request_response::Config::default()
-            .with_request_timeout(Duration::from_secs(
-                psy_data::p2p::REALM_FINALIZE_SUBMIT_TIMEOUT_SECS,
-            ))
-            .with_max_concurrent_streams(MAX_CONCURRENT_REALM_FINALIZE_SUBMITS);
 
         // DirectBody is validator-only. EndCap forward is Edge-only: validators
         // and bootnodes neither advertise nor accept the forwarding protocol.
@@ -127,27 +119,12 @@ impl RealmBehaviour {
             } else {
                 &[]
             };
-        // Validators submit finalization outbound to the Coordinator only;
-        // they never accept inbound submissions. Bootnodes/edges hold none.
-        let realm_finalize_protocols: &[(StreamProtocol, request_response::ProtocolSupport)] =
-            if is_bootnode || is_edge {
-                &[]
-            } else {
-                &[(
-                    StreamProtocol::new(REALM_FINALIZE_SUBMIT_PROTOCOL_ID),
-                    request_response::ProtocolSupport::Outbound,
-                )]
-            };
 
         let direct_body =
             request_response::Behaviour::new(direct_body_protocols.iter().cloned(), direct_body_config);
         let end_cap_forward = request_response::Behaviour::new(
             end_cap_protocols.iter().cloned(),
             end_cap_config,
-        );
-        let realm_finalize_submit = request_response::Behaviour::new(
-            realm_finalize_protocols.iter().cloned(),
-            realm_finalize_config,
         );
 
         let relay_server = config
@@ -163,7 +140,6 @@ impl RealmBehaviour {
             identify,
             direct_body,
             end_cap_forward,
-            realm_finalize_submit,
             relay_client,
             relay_server,
             dcutr,

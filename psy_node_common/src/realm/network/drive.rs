@@ -17,7 +17,7 @@ use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId};
 use psy_data::p2p::{
     DirectBodyRequest, DirectBodyResponse, EndCapForwardResponse, NodeId, Proposal, ProposalPart,
-    ProtocolEncode, RealmFinalizeSubmitCode, RealmFinalizeSubmitResponse, Vote,
+    ProtocolEncode, Vote,
     DIRECT_REQUEST_MAX_BYTES, MAINTENANCE_TICK_SECS, MAX_PROPOSAL_CHUNK_BYTES,
     RANGE_REQUEST_RETRY_INTERVAL_SECS,
 };
@@ -41,10 +41,6 @@ struct DriveState {
         OutboundRequestId,
         oneshot::Sender<Result<EndCapForwardResponse, NetworkError>>,
     >,
-    pending_finalize: HashMap<
-        OutboundRequestId,
-        oneshot::Sender<Result<RealmFinalizeSubmitResponse, NetworkError>>,
-    >,
     inbound_body: HashMap<InboundRequestId, ResponseChannel<DirectBodyResponse>>,
     pending_direct: HashMap<OutboundRequestId, [u8; 32]>,
     vote_backlog: HashMap<[u8; 32], Vec<Vote>>,
@@ -60,7 +56,6 @@ impl DriveState {
             published_bodies: HashMap::new(),
             proposal_source: HashMap::new(),
             pending_end_cap: HashMap::new(),
-            pending_finalize: HashMap::new(),
             inbound_body: HashMap::new(),
             pending_direct: HashMap::new(),
             vote_backlog: HashMap::new(),
@@ -185,24 +180,6 @@ impl RealmNetwork {
                 }
                 let _ = response.send(result);
             }
-            RealmNetworkCommand::SubmitFinalize { request, response } => {
-                match first_coordinator_peer(&self.config.coordinator_addresses) {
-                    Ok(peer) => {
-                        if let Some(address) = self.config.coordinator_addresses.first() {
-                            let _ = self.swarm.dial(address.clone());
-                        }
-                        let request_id = self
-                            .swarm
-                            .behaviour_mut()
-                            .realm_finalize_submit
-                            .send_request(&peer, request);
-                        state.pending_finalize.insert(request_id, response);
-                    }
-                    Err(error) => {
-                        let _ = response.send(Err(error));
-                    }
-                }
-            }
             RealmNetworkCommand::ServeBody {
                 request_id,
                 response_body,
@@ -300,9 +277,6 @@ impl RealmNetwork {
             }
             SwarmEvent::Behaviour(RealmBehaviourEvent::DirectBody(event)) => {
                 self.handle_direct_body_event(event, state);
-            }
-            SwarmEvent::Behaviour(RealmBehaviourEvent::RealmFinalizeSubmit(event)) => {
-                self.handle_finalize_event(event, state);
             }
             SwarmEvent::Behaviour(_) => {}
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
@@ -544,41 +518,6 @@ impl RealmNetwork {
         }
     }
 
-    fn handle_finalize_event(
-        &mut self,
-        event: request_response::Event<
-            psy_data::p2p::RealmFinalizeSubmitRequest,
-            RealmFinalizeSubmitResponse,
-        >,
-        state: &mut DriveState,
-    ) {
-        match event {
-            request_response::Event::Message { message, .. } => match message {
-                request_response::Message::Request { channel, .. } => {
-                    let _ = self.swarm.behaviour_mut().realm_finalize_submit.send_response(
-                        channel,
-                        RealmFinalizeSubmitResponse::new(RealmFinalizeSubmitCode::Internal),
-                    );
-                }
-                request_response::Message::Response {
-                    request_id,
-                    response,
-                } => {
-                    if let Some(tx) = state.pending_finalize.remove(&request_id) {
-                        let _ = tx.send(Ok(response));
-                    }
-                }
-            },
-            request_response::Event::OutboundFailure {
-                request_id, error, ..
-            } => {
-                if let Some(tx) = state.pending_finalize.remove(&request_id) {
-                    let _ = tx.send(Err(NetworkError::DirectRequest(error.to_string())));
-                }
-            }
-            _ => {}
-        }
-    }
 
     fn maintain(&mut self, state: &mut DriveState) {
         let now = Instant::now();
@@ -732,19 +671,6 @@ fn feed_vote_waiters(state: &mut DriveState, vote: &Vote) {
     }
 }
 
-fn first_coordinator_peer(addresses: &[Multiaddr]) -> Result<PeerId, NetworkError> {
-    addresses
-        .iter()
-        .find_map(|address| {
-            address.iter().find_map(|protocol| match protocol {
-                Protocol::P2p(peer) => Some(peer),
-                _ => None,
-            })
-        })
-        .ok_or_else(|| {
-            NetworkError::Configuration("coordinator address has no /p2p PeerId".into())
-        })
-}
 
 /// Fail-closed `wait_votes` configuration check: a zero threshold would
 /// complete immediately with whatever votes are already known, so it is

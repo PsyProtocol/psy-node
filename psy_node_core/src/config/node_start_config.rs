@@ -1,7 +1,6 @@
 use psy_core::constants::chain_id::PsyChainNetworkType;
 use serde::{Deserialize, Serialize};
 
-
 fn default_worker_whitelist_config() -> String {
     "psy-genesis/config.json".to_string()
 }
@@ -13,6 +12,7 @@ pub struct RealmProcessorStartConfig {
     pub redis_url: String,
     pub db_namespace: String,
     pub realm_id: u64,
+    /// Derived from the local P2P identity during Realm processor startup.
     pub realm_sub_id: u16,
     pub network: PsyChainNetworkType,
     pub verbose: bool,
@@ -25,26 +25,12 @@ pub struct RealmProcessorStartConfig {
     pub p2p_bls_key_path: Option<String>,
     #[serde(default)]
     pub p2p_listen: Option<String>,
-    #[serde(default)]
-    pub p2p_bootnodes: Vec<String>,
-    #[serde(default)]
-    pub p2p_coordinator: Option<String>,
-    #[serde(default)]
-    pub p2p_validator_sub_ids: Vec<u16>,
-    #[serde(default)]
-    pub p2p_checkpoints_per_epoch: Option<u64>,
-    #[serde(default)]
-    pub p2p_proposer_node_ids: Vec<String>,
-    #[serde(default)]
-    pub p2p_validator_user_id: Option<u64>,
-    #[serde(default)]
-    pub p2p_validators_path: Option<String>,
 }
+
 impl RealmProcessorStartConfig {
-    /// True when the optional Realm P2P transport is wired. Empty fields
-    /// (the default) leave the node on today's HTTP/NATS path.
-    pub fn realm_p2p_enabled(&self) -> bool {
-        self.p2p_identity_key_path.is_some() && self.p2p_listen.is_some()
+    pub fn with_derived_realm_sub_id(mut self, realm_sub_id: u16) -> Self {
+        self.realm_sub_id = realm_sub_id;
+        self
     }
     pub fn get_checkpoint_tree_backup_file_path(&self) -> String {
         format!(
@@ -60,7 +46,6 @@ impl RealmProcessorStartConfig {
     }
 }
 
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RealmEdgeStartConfig {
     pub scylla_db_url: String,
@@ -68,6 +53,7 @@ pub struct RealmEdgeStartConfig {
     pub redis_url: String,
     pub db_namespace: String,
     pub realm_id: u64,
+    /// Derived from the local P2P identity during Realm edge startup.
     pub realm_sub_id: u16,
     pub network: PsyChainNetworkType,
     pub verbose: bool,
@@ -78,29 +64,16 @@ pub struct RealmEdgeStartConfig {
     #[serde(default)]
     pub p2p_identity_key_path: Option<String>,
     #[serde(default)]
-    pub p2p_bls_key_path: Option<String>,
-    #[serde(default)]
     pub p2p_listen: Option<String>,
-    #[serde(default)]
-    pub p2p_bootnodes: Vec<String>,
-    #[serde(default)]
-    pub p2p_coordinator: Option<String>,
-    #[serde(default)]
-    pub p2p_validator_sub_ids: Vec<u16>,
-    #[serde(default)]
-    pub p2p_checkpoints_per_epoch: Option<u64>,
-    #[serde(default)]
-    pub p2p_proposer_node_ids: Vec<String>,
-    #[serde(default)]
-    pub p2p_validator_user_id: Option<u64>,
 }
+
 impl RealmEdgeStartConfig {
-    /// True when the optional Realm P2P transport is wired. Empty fields
-    /// (the default) leave the node on today's HTTP/NATS path.
-    pub fn realm_p2p_enabled(&self) -> bool {
-        self.p2p_identity_key_path.is_some() && self.p2p_listen.is_some()
+    pub fn with_derived_realm_sub_id(mut self, realm_sub_id: u16) -> Self {
+        self.realm_sub_id = realm_sub_id;
+        self
     }
 }
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CoordinatorProcessorStartConfig {
     pub scylla_db_url: String,
@@ -162,22 +135,4 @@ pub struct CoordinatorEdgeStartConfig {
     pub listen: String,
     #[serde(default = "default_worker_whitelist_config")]
     pub worker_whitelist_config: String,
-    #[serde(default)]
-    pub p2p_validators_path: Option<String>,
-    #[serde(default)]
-    pub p2p_checkpoints_per_epoch: Option<u64>,
-}
-
-impl CoordinatorEdgeStartConfig {
-    pub fn p2p_validator_config(&self) -> anyhow::Result<Option<(&str, u64)>> {
-        match (self.p2p_validators_path.as_deref(), self.p2p_checkpoints_per_epoch) {
-            (None, None) => Ok(None),
-            (Some(validators_path), Some(checkpoints_per_epoch)) => {
-                anyhow::ensure!(checkpoints_per_epoch > 0, "P2P checkpoints_per_epoch must be greater than zero");
-                Ok(Some((validators_path, checkpoints_per_epoch)))
-            }
-            (Some(_), None) => anyhow::bail!("--p2p-checkpoints-per-epoch is required with --p2p-validators-path"),
-            (None, Some(_)) => anyhow::bail!("--p2p-validators-path is required with --p2p-checkpoints-per-epoch"),
-        }
-    }
 }

@@ -322,11 +322,16 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
         &mut self,
         genesis_block: &PsyGenesisBlockSetupData<F, Hash>,
         chain_id: u32,
+        realm_user_tree_height: u8,
     ) -> anyhow::Result<()>
     where
         Hash: std::fmt::Debug,
     {
-        let genesis = build_validator_tree_genesis::<Hasher, Hash>(chain_id, &genesis_block.validators)?;
+        let genesis = build_validator_tree_genesis::<Hasher, Hash>(
+            chain_id,
+            &genesis_block.validators,
+            realm_user_tree_height,
+        )?;
         self.validator_tree_root = genesis.root;
         self.validator_tree_nodes_ffs = genesis.nodes_ffs;
         self.validator_leaf_preimages = genesis.preimages;
@@ -447,7 +452,7 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
             false,
             true,
         )?.unwrap();
-        builder.setup_validators::<Hasher>(genesis_block, chain_id)?;
+        builder.setup_validators::<Hasher>(genesis_block, chain_id, N::REALM_GLOBAL_USER_TREE_HEIGHT)?;
         let reward_tree_proof = TagTreeMerkleProof::new_empty();
         let state_roots = builder.get_checkpoint_state_roots::<Hasher>();
 
@@ -513,7 +518,7 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
         );
         builder.setup_contracts::<Hasher, N>(genesis_block, true)?;
         builder.setup_users::<Hasher, N>(genesis_block, None, true, false)?;
-        builder.setup_validators::<Hasher>(genesis_block, chain_id)?;
+        builder.setup_validators::<Hasher>(genesis_block, chain_id, N::REALM_GLOBAL_USER_TREE_HEIGHT)?;
 
         let pending_checkpoint_base = builder.get_coordinator_pending_checkpoint_base::<Hasher>(N::CHECKPOINT_TREE_HEIGHT);
 

@@ -53,6 +53,7 @@ pub struct NetworkConfig<F: RichField> {
     pub realm_user_tree_height: u8,
     pub group_realm_height: u8,
     pub realm_configs: Vec<RealmConfig>,
+    pub p2p: P2pConfig,
     pub coordinator_configs: Vec<CoordinatorConfig>,
     pub prove_proxy_url: Vec<String>,
     pub faucet_rpc_url: Vec<String>,
@@ -77,6 +78,28 @@ pub struct NetworkConfig<F: RichField> {
 pub struct RealmConfig {
     pub id: u64,
     pub rpc_url: Vec<String>,
+    #[serde(default)]
+    pub validators: Vec<GenesisValidator>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct P2pConfig {
+    pub checkpoints_per_epoch: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenesisValidator {
+    pub validator_user_id: u64,
+    pub processor_node_id: String,
+    pub bls_public_key: String,
+    pub processor_addresses: Vec<String>,
+    pub edge_nodes: Vec<PublicNode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicNode {
+    pub node_id: String,
+    pub addresses: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

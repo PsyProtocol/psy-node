@@ -88,12 +88,9 @@ pub async fn run_startup_plonky2_scylla_edge_node(config: &CoordinatorEdgeStartC
                 proof_verifier,
                 checkpoint_state_transition_circuit_fingerprint,
             );
-            if let Some((validators_path, checkpoints_per_epoch)) = config.p2p_validator_config()? {
-                handler.set_validators(
-                    crate::node::realm_p2p::validator_registry_from_validators_path(validators_path)?,
-                    checkpoints_per_epoch,
-                )?;
-            }
+            let (validator_registry, checkpoints_per_epoch) =
+                crate::node::realm_p2p::validator_registry_from_network_config(config.network)?;
+            handler.set_validators(validator_registry, checkpoints_per_epoch)?;
             start_coordinator_edge_rpc_server::<N, _, _, _, _, _, _, _, _>(
                 handler,
                 &config.listen,
@@ -112,6 +109,8 @@ pub async fn run_startup_plonky2_scylla_edge_node(config: &CoordinatorEdgeStartC
 
 
 pub async fn run_startup_plonky2_scylla_realm_edge_node(config: &RealmEdgeStartConfig) -> anyhow::Result<()> {
+    let realm_sub_id = crate::node::realm_p2p::resolve_edge_sub_id(config)?;
+    let config = &config.clone().with_derived_realm_sub_id(realm_sub_id);
 
 
     let worker_whitelist = WhiteListCache::new(&config.worker_whitelist_config, config.network)?;
@@ -121,7 +120,7 @@ pub async fn run_startup_plonky2_scylla_realm_edge_node(config: &RealmEdgeStartC
         pool,
         config.db_namespace.to_string(),
         config.realm_id,
-        config.realm_sub_id as u64,
+        realm_sub_id as u64,
     );
     let nats_queue = setup_nats_psy_queue_from_connection_str(&config.nats_jetstream_url, &config.db_namespace, NatsSetupMode::CreateIfMissing).await?;
 
@@ -133,7 +132,7 @@ pub async fn run_startup_plonky2_scylla_realm_edge_node(config: &RealmEdgeStartC
 
     let realm_identifier = QRealmIdentifier {
         realm_id: config.realm_id as u32,
-        realm_sub_id: config.realm_sub_id,
+        realm_sub_id,
     };
     // Edge only verifies proofs. Load the generated verifier/common-data cache
     // instead of rebuilding every coordinator and state-layout circuit at
@@ -175,12 +174,15 @@ pub async fn run_startup_plonky2_scylla_realm_edge_node(config: &RealmEdgeStartC
                 0,
                 proof_verifier,
             );
-            if let Some((built, proposer_node_ids, rotation)) =
-                crate::node::realm_p2p::maybe_build_edge_network(config, chain_id)?
-            {
-                handler.set_realm_p2p(built.handle.commands(), rotation, proposer_node_ids);
-                crate::node::realm_p2p::spawn_edge_realm_network(built, handler.clone());
-            }
+            let (built, proposer_edge_node_ids, realm_edge_node_ids, rotation) =
+                crate::node::realm_p2p::maybe_build_edge_network(config, chain_id)?;
+            handler.set_realm_p2p(
+                built.handle.commands(),
+                rotation,
+                proposer_edge_node_ids,
+                realm_edge_node_ids,
+            );
+            crate::node::realm_p2p::spawn_edge_realm_network(built, handler.clone());
             start_realm_edge_rpc_server::<N, _, _, _, _, _, _>(
                 handler,
                 &config.listen,

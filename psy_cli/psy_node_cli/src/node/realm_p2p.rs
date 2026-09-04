@@ -1,24 +1,18 @@
-//! Optional Realm P2P wiring for processor and edge start paths.
-//!
-//! Empty start-config fields keep today's HTTP/NATS path. When P2P is
-//! enabled this module builds the Swarm, starts the drive loop, and
-//! consumes network events (non-proposer votes on processors, inbound
-//! EndCap forwards on edges).
+//! Realm P2P startup backed by the selected public network configuration.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
-
-
 
 use parth_common::realm_rotation::RealmRotationConfig;
 use parth_core::{
     crypto::hash::traits::QFieldHashable,
-    protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofVerifier},
+    protocol::core_types::{QNetworkTypesConfig, QZKProofVerifier},
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
+use psy_core::constants::chain_id::PsyChainNetworkType;
 use psy_data::{
-    genesis::genesis_block_setup::ValidatorGenesisEntry,
+    genesis::genesis_block_setup::{GenesisValidator, PsyGenesisBlockSetupData},
     guta::{
         header_extended::{
             GlobalUserTreeAggregatorHeaderWithTagValue,
@@ -26,181 +20,389 @@ use psy_data::{
         },
         realm_finalize::protocol_decode_finalize_output,
     },
-    p2p::{BlsPublicKey, EndCapForwardHeader, EndCapForwardResponse, NodeId},
+    p2p::{
+        BlsPublicKey, EndCapForwardHeader, EndCapForwardResponse, NodeId,
+        MAX_VALIDATORS_PER_REALM, MIN_VALIDATORS_PER_REALM,
+    },
 };
-use psy_node_common::coordinator::validator_registry::ValidatorRegistry;
-use psy_node_common::realm::network::{
-    build_optional_realm_network, parse_proposer_node_ids, run_realm_network, OptionalRealmNetwork,
-    RealmNetworkEvent,
+use psy_node_common::{
+    coordinator::validator_registry::{build_validator_registry_from_genesis, ValidatorRegistry},
+    realm::{
+        network::{
+            build_optional_realm_network, load_bls_secret_key, load_ed25519_identity_key,
+            parse_bootnode, run_realm_network, OptionalRealmNetwork, RealmNetworkEvent,
+        },
+        processor::consensus::{sign_vote, verify_proposal_submission},
+    },
 };
-use psy_node_common::realm::processor::consensus::{sign_vote, verify_proposal_submission};
-
-
-
-
-
-
-
 use psy_node_core::config::node_start_config::{RealmEdgeStartConfig, RealmProcessorStartConfig};
 use serde::Deserialize;
 
 #[derive(Clone, Deserialize)]
-struct ValidatorSubEntry {
-    processor_node_id_hex38: String,
-    bls_public_hex: String,
+struct PublicNode {
+    node_id: String,
+    addresses: Vec<String>,
+}
+
+#[derive(Clone, Deserialize)]
+struct PublicValidator {
+    validator_user_id: u64,
+    processor_node_id: String,
+    bls_public_key: String,
+    processor_addresses: Vec<String>,
+    edge_nodes: Vec<PublicNode>,
 }
 
 #[derive(Deserialize)]
-struct ValidatorsFile {
-    realms: HashMap<String, HashMap<String, ValidatorSubEntry>>,
+struct PublicRealmConfig {
+    id: u32,
+    validators: Vec<PublicValidator>,
 }
 
-/// Build a validator registry from `init-realm-p2p-keys` validators.json.
-pub fn validator_registry_from_validators_path(path: &str) -> anyhow::Result<ValidatorRegistry> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|error| anyhow::anyhow!("failed to read P2P validators file {path}: {error}"))?;
-    let validators: ValidatorsFile = serde_json::from_str(&text)
-        .map_err(|error| anyhow::anyhow!("failed to parse P2P validators file {path}: {error}"))?;
-    let mut registry = ValidatorRegistry::new();
-    for (realm_key, subs) in validators.realms {
-        let realm_id: u32 = realm_key
-            .parse()
-            .map_err(|error| anyhow::anyhow!("invalid validators realm id {realm_key}: {error}"))?;
-        for (sub_key, entry) in subs {
-            let realm_sub_id: u16 = sub_key
-                .parse()
-                .map_err(|error| anyhow::anyhow!("invalid validators sub id {sub_key}: {error}"))?;
-            let bytes = hex::decode(&entry.bls_public_hex).map_err(|error| {
-                anyhow::anyhow!("invalid validators BLS hex for realm {realm_id} sub {realm_sub_id}: {error}")
-            })?;
-            if bytes.len() != 48 {
-                anyhow::bail!(
-                    "validators BLS key for realm {realm_id} sub {realm_sub_id} must be 48 bytes, got {}",
-                    bytes.len()
-                );
-            }
-            let mut bls_public_key = [0u8; 48];
-            bls_public_key.copy_from_slice(&bytes);
-            let key = (realm_id, realm_sub_id);
+#[derive(Deserialize)]
+struct PublicP2pConfig {
+    checkpoints_per_epoch: u64,
+}
+
+#[derive(Deserialize)]
+struct PublicNetworkConfig {
+    realm_user_tree_height: u8,
+    p2p: PublicP2pConfig,
+    realm_configs: Vec<PublicRealmConfig>,
+}
+
+#[derive(Deserialize)]
+struct PublicConfig {
+    networks: HashMap<String, PublicNetworkConfig>,
+}
+
+struct RealmPublicData {
+    validator_sub_ids: Vec<u16>,
+    validator_user_ids: HashMap<u16, u64>,
+    bls_public_keys: HashMap<u16, BlsPublicKey>,
+    validator_processor_node_ids: HashMap<u16, NodeId>,
+    proposer_edge_node_ids: HashMap<u16, NodeId>,
+    realm_edge_node_ids: HashSet<NodeId>,
+    bootnodes: Vec<String>,
+    realm_user_tree_height: u8,
+    checkpoints_per_epoch: u64,
+}
+
+fn public_network_key(network: PsyChainNetworkType) -> anyhow::Result<&'static str> {
+    match network {
+        PsyChainNetworkType::LocalDevnet => Ok("localhost"),
+        PsyChainNetworkType::PsyPublicTestnet => Ok("sepolia"),
+        PsyChainNetworkType::PsyMainnet => Ok("ethereum"),
+        _ => anyhow::bail!("Realm P2P has no public config mapping for network {network:?}"),
+    }
+}
+
+fn validate_realm_validator_count(realm_id: u32, count: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        (MIN_VALIDATORS_PER_REALM..=MAX_VALIDATORS_PER_REALM).contains(&count),
+        "Realm {realm_id} validator count {count} is outside {MIN_VALIDATORS_PER_REALM}..={MAX_VALIDATORS_PER_REALM}"
+    );
+    Ok(())
+}
+
+fn validate_node_addresses(
+    addresses: &[String],
+    node_id: NodeId,
+    description: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(!addresses.is_empty(), "{description} has no addresses");
+    let expected_peer_id = node_id.to_peer_id();
+    for address in addresses {
+        let (peer_id, _) = parse_bootnode(address)?;
+        anyhow::ensure!(
+            peer_id == expected_peer_id,
+            "{description} address PeerId {peer_id} does not match NodeId PeerId {expected_peer_id}"
+        );
+    }
+    Ok(())
+}
+
+fn validate_public_network(network: &PublicNetworkConfig) -> anyhow::Result<()> {
+    for realm in &network.realm_configs {
+        if realm.validators.is_empty() {
+            continue;
+        }
+        validate_realm_validator_count(realm.id, realm.validators.len())?;
+        for (index, validator) in realm.validators.iter().enumerate() {
+            let sub_id = index + 1;
+            let description = format!("Realm {} validator sub {sub_id}", realm.id);
+            let processor_node_id = parse_node_id(&validator.processor_node_id, &description)?;
+            validate_node_addresses(
+                &validator.processor_addresses,
+                processor_node_id,
+                &format!("{description} processor"),
+            )?;
             anyhow::ensure!(
-                registry
-                    .insert(
-                        key,
-                        ValidatorGenesisEntry {
-                            realm_id,
-                            realm_sub_id,
-                            validator_user_id: (realm_id as u64) << 20 | realm_sub_id as u64,
-                            node_id: [0u8; 38],
-                            bls_public_key,
-                        },
-                    )
-                    .is_none(),
-                "duplicate validators entry for realm {realm_id} sub {realm_sub_id}"
+                !validator.edge_nodes.is_empty(),
+                "{description} has no edge nodes"
+            );
+            for edge in &validator.edge_nodes {
+                let edge_description = format!("{description} edge");
+                let edge_node_id = parse_node_id(&edge.node_id, &edge_description)?;
+                validate_node_addresses(&edge.addresses, edge_node_id, &edge_description)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn load_selected_network(network: PsyChainNetworkType) -> anyhow::Result<PublicNetworkConfig> {
+    let selected_name = public_network_key(network)?;
+    if let Ok(environment_name) = std::env::var("PSY_NETWORK") {
+        anyhow::ensure!(
+            environment_name == selected_name,
+            "PSY_NETWORK {environment_name} does not match node network {network:?} ({selected_name})"
+        );
+    }
+    let path = std::env::var("PSY_CONFIG_PATH")
+        .unwrap_or_else(|_| "psy-genesis/config.json".to_string());
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| anyhow::anyhow!("failed to read network config {path}: {error}"))?;
+    let config: PublicConfig = serde_json::from_str(&text)
+        .map_err(|error| anyhow::anyhow!("failed to parse network config {path}: {error}"))?;
+    let network = config
+        .networks
+        .into_iter()
+        .find_map(|(name, public)| (name == selected_name).then_some(public))
+        .ok_or_else(|| anyhow::anyhow!("network config has no network named {selected_name}"))?;
+    validate_public_network(&network)?;
+    Ok(network)
+}
+
+fn selected_realm(
+    network: &PublicNetworkConfig,
+    realm_id: u32,
+) -> anyhow::Result<&PublicRealmConfig> {
+    let mut matches = network
+        .realm_configs
+        .iter()
+        .filter(|realm| realm.id == realm_id);
+    let realm = matches
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("network config has no Realm {realm_id}"))?;
+    anyhow::ensure!(
+        matches.next().is_none(),
+        "network config contains duplicate Realm {realm_id}"
+    );
+    validate_realm_validator_count(realm_id, realm.validators.len())?;
+    Ok(realm)
+}
+
+fn validator_sub_id(index: usize) -> anyhow::Result<u16> {
+    let position = index + 1;
+    anyhow::ensure!(
+        position <= MAX_VALIDATORS_PER_REALM,
+        "Realm has more than {MAX_VALIDATORS_PER_REALM} validators"
+    );
+    Ok(position as u16)
+}
+
+fn parse_node_id(value: &str, description: &str) -> anyhow::Result<NodeId> {
+    let bytes = hex::decode(value)
+        .map_err(|error| anyhow::anyhow!("invalid {description} NodeId hex: {error}"))?;
+    anyhow::ensure!(
+        bytes.len() == 38,
+        "{description} NodeId must be 38 bytes, got {}",
+        bytes.len()
+    );
+    let mut raw = [0u8; 38];
+    raw.copy_from_slice(&bytes);
+    NodeId::from_raw(raw).map_err(|error| anyhow::anyhow!("invalid {description} NodeId: {error}"))
+}
+
+fn parse_bls_key(value: &str, description: &str) -> anyhow::Result<BlsPublicKey> {
+    let bytes = hex::decode(value)
+        .map_err(|error| anyhow::anyhow!("invalid {description} BLS public key hex: {error}"))?;
+    BlsPublicKey::from_bytes(&bytes)
+        .map_err(|error| anyhow::anyhow!("invalid {description} BLS public key: {error}"))
+}
+
+fn realm_public_data(
+    network_type: PsyChainNetworkType,
+    realm_id: u32,
+) -> anyhow::Result<RealmPublicData> {
+    let network = load_selected_network(network_type)?;
+    anyhow::ensure!(
+        network.p2p.checkpoints_per_epoch > 0,
+        "p2p.checkpoints_per_epoch must be greater than zero"
+    );
+    let realm = selected_realm(&network, realm_id)?;
+
+    let mut validator_sub_ids = Vec::with_capacity(realm.validators.len());
+    let mut validator_user_ids = HashMap::with_capacity(realm.validators.len());
+    let mut bls_public_keys = HashMap::with_capacity(realm.validators.len());
+    let mut validator_processor_node_ids = HashMap::with_capacity(realm.validators.len());
+    let mut proposer_edge_node_ids = HashMap::with_capacity(realm.validators.len());
+    let mut realm_edge_node_ids = HashSet::new();
+    let mut bootnodes = Vec::new();
+    for (index, validator) in realm.validators.iter().enumerate() {
+        let sub_id = validator_sub_id(index)?;
+        let description = format!("Realm {realm_id} validator sub {sub_id}");
+        let node_id = parse_node_id(&validator.processor_node_id, &description)?;
+        let bls_public_key = parse_bls_key(&validator.bls_public_key, &description)?;
+        validator_sub_ids.push(sub_id);
+        anyhow::ensure!(
+            validator_user_ids
+                .insert(sub_id, validator.validator_user_id)
+                .is_none(),
+            "duplicate validator sub_id {sub_id}"
+        );
+        anyhow::ensure!(
+            validator_processor_node_ids.insert(sub_id, node_id).is_none(),
+            "duplicate validator sub_id {sub_id}"
+        );
+        anyhow::ensure!(
+            bls_public_keys.insert(sub_id, bls_public_key).is_none(),
+            "duplicate validator sub_id {sub_id}"
+        );
+        bootnodes.extend(validator.processor_addresses.iter().cloned());
+        for (edge_index, edge) in validator.edge_nodes.iter().enumerate() {
+            let edge_node_id = parse_node_id(&edge.node_id, &format!("{description} edge"))?;
+            anyhow::ensure!(
+                realm_edge_node_ids.insert(edge_node_id),
+                "duplicate Realm edge NodeId"
+            );
+            if edge_index == 0 {
+                proposer_edge_node_ids.insert(sub_id, edge_node_id);
+            }
+            bootnodes.extend(edge.addresses.iter().cloned());
+        }
+    }
+    bootnodes.sort_unstable();
+    bootnodes.dedup();
+
+    Ok(RealmPublicData {
+        validator_user_ids,
+        validator_sub_ids,
+        bls_public_keys,
+        validator_processor_node_ids,
+        proposer_edge_node_ids,
+        realm_edge_node_ids,
+        realm_user_tree_height: network.realm_user_tree_height,
+        bootnodes,
+        checkpoints_per_epoch: network.p2p.checkpoints_per_epoch,
+    })
+}
+fn bootnodes_without_local_peer(
+    bootnodes: &[String],
+    local_node_id: NodeId,
+) -> anyhow::Result<Vec<String>> {
+    let local_peer_id = local_node_id.to_peer_id();
+    bootnodes
+        .iter()
+        .filter_map(|address| match parse_bootnode(address) {
+            Ok((peer_id, _)) if peer_id == local_peer_id => None,
+            Ok(_) => Some(Ok(address.clone())),
+            Err(error) => Some(Err(error.into())),
+        })
+        .collect()
+}
+
+
+/// Build the coordinator-facing validator registry from public network values.
+pub fn validator_registry_from_network_config(
+    network_type: PsyChainNetworkType,
+) -> anyhow::Result<(ValidatorRegistry, u64)> {
+    let network = load_selected_network(network_type)?;
+    anyhow::ensure!(
+        network.p2p.checkpoints_per_epoch > 0,
+        "p2p.checkpoints_per_epoch must be greater than zero"
+    );
+    let mut registry = ValidatorRegistry::new();
+    let mut user_ids = HashSet::new();
+    let mut node_ids = HashSet::new();
+    let mut bls_keys = HashSet::new();
+
+    for realm in &network.realm_configs {
+        if realm.validators.is_empty() {
+            continue;
+        }
+        validate_realm_validator_count(realm.id, realm.validators.len())?;
+        for (index, validator) in realm.validators.iter().enumerate() {
+            let sub_id = validator_sub_id(index)?;
+            let description = format!("Realm {} validator sub {sub_id}", realm.id);
+            let node_id = parse_node_id(&validator.processor_node_id, &description)?;
+            let bls_public_key = parse_bls_key(&validator.bls_public_key, &description)?;
+            anyhow::ensure!(
+                user_ids.insert(validator.validator_user_id),
+                "duplicate validator_user_id {}",
+                validator.validator_user_id
+            );
+            anyhow::ensure!(node_ids.insert(*node_id.as_raw()), "duplicate public NodeId");
+            anyhow::ensure!(
+                bls_keys.insert(bls_public_key.to_bytes()),
+                "duplicate validator BLS public key"
+            );
+            for edge in &validator.edge_nodes {
+                let edge_id = parse_node_id(&edge.node_id, &format!("{description} edge"))?;
+                anyhow::ensure!(node_ids.insert(*edge_id.as_raw()), "duplicate public NodeId");
+            }
+            let genesis_validator = GenesisValidator {
+                realm_id: realm.id,
+                validator_user_id: validator.validator_user_id,
+                node_id: *node_id.as_raw(),
+                bls_public_key: bls_public_key.to_bytes(),
+            };
+            anyhow::ensure!(
+                registry.insert((realm.id, sub_id), genesis_validator).is_none(),
+                "duplicate validator slot for Realm {} sub {sub_id}",
+                realm.id
             );
         }
     }
-    Ok(registry)
+    Ok((registry, network.p2p.checkpoints_per_epoch))
 }
 
-pub fn bls_keys_from_validators_path(
-    path: &str,
-    realm_id: u32,
-) -> anyhow::Result<HashMap<u16, BlsPublicKey>> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|error| anyhow::anyhow!("failed to read P2P validators file {path}: {error}"))?;
-    let validators: ValidatorsFile = serde_json::from_str(&text)
-        .map_err(|error| anyhow::anyhow!("failed to parse P2P validators file {path}: {error}"))?;
-    let subs = validators
-        .realms
-        .get(&realm_id.to_string())
-        .ok_or_else(|| anyhow::anyhow!("P2P validators missing realm {realm_id}"))?;
-    let mut keys = HashMap::with_capacity(subs.len());
-    for (sub, entry) in subs {
-        let sub_id: u16 = sub
-            .parse()
-            .map_err(|error| anyhow::anyhow!("invalid validators sub id {sub}: {error}"))?;
-        let bytes = hex::decode(&entry.bls_public_hex).map_err(|error| {
-            anyhow::anyhow!("invalid validators BLS hex for realm {realm_id} sub {sub_id}: {error}")
-        })?;
-        let key = BlsPublicKey::from_bytes(&bytes)
-            .map_err(|error| anyhow::anyhow!("invalid validators BLS key for realm {realm_id} sub {sub_id}: {error}"))?;
-        anyhow::ensure!(keys.insert(sub_id, key).is_none(), "duplicate validators sub_id {sub_id}");
-    }
-    Ok(keys)
-}
-
-pub fn proposer_node_ids_from_validators_path(
-    path: &str,
-    realm_id: u32,
-) -> anyhow::Result<HashMap<u16, NodeId>> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|error| anyhow::anyhow!("failed to read P2P validators file {path}: {error}"))?;
-    let validators: ValidatorsFile = serde_json::from_str(&text)
-        .map_err(|error| anyhow::anyhow!("failed to parse P2P validators file {path}: {error}"))?;
-    let subs = validators
-        .realms
-        .get(&realm_id.to_string())
-        .ok_or_else(|| anyhow::anyhow!("P2P validators missing realm {realm_id}"))?;
-    let values = subs
-        .iter()
-        .map(|(sub, entry)| format!("{}:{}", sub, entry.processor_node_id_hex38))
-        .collect::<Vec<_>>();
-    parse_proposer_node_ids(&values)
-}
-
-/// Construct a processor Realm network when P2P start-config fields are set.
+/// Construct a processor Realm network from local keys/listen and public membership.
 pub fn maybe_build_processor_network(
     config: &RealmProcessorStartConfig,
     chain_id: u32,
-) -> anyhow::Result<Option<OptionalRealmNetwork>> {
-    if !config.realm_p2p_enabled() {
-        return Ok(None);
-    }
-    let validators_path = config.p2p_validators_path.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("--p2p-validators-path is required when Realm P2P is enabled")
-    })?;
-    proposer_node_ids_from_validators_path(validators_path, config.realm_id as u32)?;
+) -> anyhow::Result<OptionalRealmNetwork> {
     let identity = config
         .p2p_identity_key_path
         .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("p2p identity key required when P2P is enabled"))?;
+        .ok_or_else(|| anyhow::anyhow!("p2p identity key is required"))?;
     let listen = config
         .p2p_listen
         .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("p2p listen required when P2P is enabled"))?;
-    let bls = config.p2p_bls_key_path.as_deref();
-    let period = config.p2p_checkpoints_per_epoch.unwrap_or(10);
-    Ok(Some(build_optional_realm_network(
+        .ok_or_else(|| anyhow::anyhow!("p2p listen is required"))?;
+    let public = realm_public_data(config.network, config.realm_id as u32)?;
+    let local_node_id = NodeId::from_keypair(&load_ed25519_identity_key(identity)?)?;
+    let bootnodes = bootnodes_without_local_peer(&public.bootnodes, local_node_id)?;
+    Ok(build_optional_realm_network(
         chain_id,
         config.realm_id as u32,
         false,
         identity,
-        bls,
+        config.p2p_bls_key_path.as_deref(),
         listen,
-        &config.p2p_bootnodes,
-        config.p2p_coordinator.as_deref(),
-        &config.p2p_validator_sub_ids,
-        period,
-    )?))
+        &bootnodes,
+        &public.validator_sub_ids,
+        public.checkpoints_per_epoch,
+    )?)
 }
 
-/// Construct an edge Realm network when P2P start-config fields are set.
+/// Construct an edge Realm network from local identity/listen and public membership.
 pub fn maybe_build_edge_network(
     config: &RealmEdgeStartConfig,
     chain_id: u32,
-) -> anyhow::Result<Option<(OptionalRealmNetwork, HashMap<u16, NodeId>, RealmRotationConfig)>> {
-    if !config.realm_p2p_enabled() {
-        return Ok(None);
-    }
+) -> anyhow::Result<(OptionalRealmNetwork, HashMap<u16, NodeId>, HashSet<NodeId>, RealmRotationConfig)> {
     let identity = config
         .p2p_identity_key_path
         .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("p2p identity key required when P2P is enabled"))?;
+        .ok_or_else(|| anyhow::anyhow!("p2p identity key is required"))?;
     let listen = config
         .p2p_listen
         .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("p2p listen required when P2P is enabled"))?;
-    let period = config.p2p_checkpoints_per_epoch.unwrap_or(10);
+        .ok_or_else(|| anyhow::anyhow!("p2p listen is required"))?;
+    let public = realm_public_data(config.network, config.realm_id as u32)?;
+    let local_node_id = NodeId::from_keypair(&load_ed25519_identity_key(identity)?)?;
+    let bootnodes = bootnodes_without_local_peer(&public.bootnodes, local_node_id)?;
     let built = build_optional_realm_network(
         chain_id,
         config.realm_id as u32,
@@ -208,45 +410,167 @@ pub fn maybe_build_edge_network(
         identity,
         None,
         listen,
-        &config.p2p_bootnodes,
-        config.p2p_coordinator.as_deref(),
-        &config.p2p_validator_sub_ids,
-        period,
+        &bootnodes,
+        &public.validator_sub_ids,
+        public.checkpoints_per_epoch,
     )?;
-    let proposer_node_ids = parse_proposer_node_ids(&config.p2p_proposer_node_ids)?;
-    if proposer_node_ids.is_empty() {
-        anyhow::bail!("edge P2P requires at least one --p2p-proposer-node-id SUB:HEX38");
-    }
     let rotation = built.rotation.clone();
-    Ok(Some((built, proposer_node_ids, rotation)))
+    Ok((built, public.proposer_edge_node_ids, public.realm_edge_node_ids, rotation))
 }
 
-fn proposer_node_ids_from_config(
-    config: &RealmProcessorStartConfig,
-) -> anyhow::Result<HashMap<u16, NodeId>> {
-    let validators_path = config.p2p_validators_path.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("--p2p-validators-path is required when Realm P2P is enabled")
-    })?;
-    let proposer_node_ids = proposer_node_ids_from_validators_path(validators_path, config.realm_id as u32)?;
+/// Resolve the processor's one-based validator position from its local Ed25519 identity.
+pub fn resolve_processor_sub_id(config: &RealmProcessorStartConfig) -> anyhow::Result<u16> {
+    let identity_path = config
+        .p2p_identity_key_path
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("p2p identity key is required"))?;
+    let local_node_id = NodeId::from_keypair(&load_ed25519_identity_key(identity_path)?)?;
+    let network = load_selected_network(config.network)?;
+    let realm = selected_realm(&network, config.realm_id as u32)?;
+    let mut matches = Vec::new();
+    for (index, validator) in realm.validators.iter().enumerate() {
+        let description = format!("Realm {} validator processor", config.realm_id);
+        let node_id = parse_node_id(&validator.processor_node_id, &description)?;
+        if node_id == local_node_id {
+            matches.push(validator_sub_id(index)?);
+        }
+    }
     anyhow::ensure!(
-        proposer_node_ids.len() == config.p2p_validator_sub_ids.len(),
-        "processor P2P validators must contain one proposer NodeId for every validator"
+        matches.len() == 1,
+        "Realm {} public validators must contain exactly one processor for the local NodeId, found {}",
+        config.realm_id,
+        matches.len()
     );
-    Ok(proposer_node_ids)
+    Ok(matches[0])
 }
 
-/// Drive loop + processor event consumer. Non-proposers validate and vote.
+/// Resolve the edge's one-based validator position from its local Ed25519 identity.
+pub fn resolve_edge_sub_id(config: &RealmEdgeStartConfig) -> anyhow::Result<u16> {
+    let identity_path = config
+        .p2p_identity_key_path
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("p2p identity key is required"))?;
+    let local_node_id = NodeId::from_keypair(&load_ed25519_identity_key(identity_path)?)?;
+    let network = load_selected_network(config.network)?;
+    let realm = selected_realm(&network, config.realm_id as u32)?;
+    let mut matches = Vec::new();
+    for (index, validator) in realm.validators.iter().enumerate() {
+        for edge in &validator.edge_nodes {
+            let node_id = parse_node_id(&edge.node_id, "edge")?;
+            if node_id == local_node_id {
+                matches.push(validator_sub_id(index)?);
+            }
+        }
+    }
+    anyhow::ensure!(
+        matches.len() == 1,
+        "Realm {} public validators must contain exactly one edge for the local NodeId, found {}",
+        config.realm_id,
+        matches.len()
+    );
+    Ok(matches[0])
+}
+
+/// Validate the local processor identity and BLS key against public config and Genesis.
+pub fn processor_validator_data<F, Hash>(
+    config: &RealmProcessorStartConfig,
+    genesis: &PsyGenesisBlockSetupData<F, Hash>,
+) -> anyhow::Result<(u16, u64, HashMap<u16, BlsPublicKey>)> {
+    let derived_sub_id = resolve_processor_sub_id(config)?;
+    let identity_path = config
+        .p2p_identity_key_path
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("p2p identity key is required"))?;
+    let local_node_id = NodeId::from_keypair(&load_ed25519_identity_key(identity_path)?)?;
+    let registry = build_validator_registry_from_genesis(genesis)?;
+    let genesis_matches = registry
+        .iter()
+        .filter(|((realm_id, _), validator)| {
+            *realm_id == config.realm_id as u32 && validator.node_id == *local_node_id.as_raw()
+        })
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        genesis_matches.len() == 1,
+        "Realm {} Genesis validators must contain exactly one validator for the local NodeId, found {}",
+        config.realm_id,
+        genesis_matches.len()
+    );
+    let (&(_, genesis_sub_id), genesis_validator) = genesis_matches[0];
+    anyhow::ensure!(
+        genesis_sub_id == derived_sub_id,
+        "public network validator position {derived_sub_id} does not match Genesis position {genesis_sub_id}"
+    );
+    anyhow::ensure!(
+        genesis_validator.node_id == *local_node_id.as_raw(),
+        "Genesis processor NodeId does not match local identity for sub {derived_sub_id}"
+    );
+
+    let public = realm_public_data(config.network, config.realm_id as u32)?;
+    let users_per_realm = 1u64
+        .checked_shl(u32::from(public.realm_user_tree_height))
+        .ok_or_else(|| anyhow::anyhow!("realm_user_tree_height is too large"))?;
+    let realm_start = config
+        .realm_id
+        .checked_mul(users_per_realm)
+        .ok_or_else(|| anyhow::anyhow!("Realm user range overflow"))?;
+    let realm_end = realm_start
+        .checked_add(users_per_realm)
+        .ok_or_else(|| anyhow::anyhow!("Realm user range overflow"))?;
+    anyhow::ensure!(
+        (realm_start..realm_end).contains(&genesis_validator.validator_user_id),
+        "validator_user_id {} is outside Realm {} user range",
+        genesis_validator.validator_user_id,
+        config.realm_id
+    );
+    let configured_user_id = public
+        .validator_user_ids
+        .get(&derived_sub_id)
+        .ok_or_else(|| anyhow::anyhow!("public network config is missing validator sub {derived_sub_id}"))?;
+    anyhow::ensure!(
+        *configured_user_id == genesis_validator.validator_user_id,
+        "public network validator_user_id does not match Genesis for sub {derived_sub_id}"
+    );
+    let configured_node_id = public
+        .validator_processor_node_ids
+        .get(&derived_sub_id)
+        .ok_or_else(|| anyhow::anyhow!("public network config is missing validator sub {derived_sub_id}"))?;
+    anyhow::ensure!(
+        configured_node_id == &local_node_id,
+        "local processor NodeId does not match public network config for sub {derived_sub_id}"
+    );
+    let configured_bls = public
+        .bls_public_keys
+        .get(&derived_sub_id)
+        .ok_or_else(|| anyhow::anyhow!("public network config is missing BLS key for sub {derived_sub_id}"))?;
+    anyhow::ensure!(
+        genesis_validator.bls_public_key == configured_bls.to_bytes(),
+        "public network BLS key does not match Genesis for sub {derived_sub_id}"
+    );
+    let secret_path = config
+        .p2p_bls_key_path
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("p2p BLS key is required"))?;
+    let local_bls = load_bls_secret_key(secret_path)?.public_key();
+    anyhow::ensure!(
+        local_bls == *configured_bls,
+        "local BLS secret public key does not match public config and Genesis for sub {derived_sub_id}"
+    );
+
+    Ok((
+        derived_sub_id,
+        genesis_validator.validator_user_id,
+        public.bls_public_keys,
+    ))
+}
+
+/// Drive loop plus processor event consumer. Non-proposers validate and vote.
 pub fn spawn_processor_realm_network<N>(
     built: OptionalRealmNetwork,
     config: &RealmProcessorStartConfig,
+    local_sub_id: u16,
     proof_verifier: N::ZKVerifier,
     verified_state_updates: tokio::sync::mpsc::Sender<Vec<u8>>,
-)
-
-
-
-
-where
+) where
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
     N::ZKVerifier: 'static,
 {
@@ -256,18 +580,12 @@ where
         bls_secret,
         ..
     } = built;
-    let local_sub_id = config.realm_sub_id;
     let realm_id = config.realm_id as u32;
     let chain_id = config.network.get_chain_id();
-    let proposer_node_ids = proposer_node_ids_from_config(config)
-        .expect("processor Realm P2P proposer NodeId config was validated at startup");
-
-
-    let validators_path = config.p2p_validators_path.as_deref().expect(
-        "processor Realm P2P validators path was validated at startup",
-    );
-    let validator_registry = validator_registry_from_validators_path(validators_path)
-        .expect("processor Realm P2P validators file was validated at startup");
+    let public = realm_public_data(config.network, realm_id)
+        .expect("processor Realm P2P public config was validated at startup");
+    let (validator_registry, _) = validator_registry_from_network_config(config.network)
+        .expect("network validator config was validated at startup");
     let proof_verifier = Arc::new(proof_verifier);
     let commands = handle.commands();
     let mut events = handle.into_parts().1;
@@ -291,14 +609,13 @@ where
                             "Proposal proposal_id mismatch"
                         );
                         anyhow::ensure!(
-                            proposer_node_ids.get(&proposal.proposer_sub_id) == Some(&source),
+                            public.validator_processor_node_ids.get(&proposal.proposer_sub_id) == Some(&source),
                             "Proposal source NodeId does not match configured proposer"
                         );
                         let decoded = psy_node_common::realm::processor::consensus::decode_proposal_body(
                             &proposal,
                             body.as_bytes(),
-                        )
-                        .map_err(|error| anyhow::anyhow!("invalid Proposal body: {error}"))?;
+                        ).map_err(|error| anyhow::anyhow!("invalid Proposal body: {error}"))?;
                         let output = protocol_decode_finalize_output::<N::F, N::QHash>(&decoded.output)
                             .map_err(|error| anyhow::anyhow!("invalid Realm finalize output: {error}"))?;
                         let mut submission = GlobalUserTreeAggregatorHeaderWithTagValueAndJobType {
@@ -315,12 +632,10 @@ where
                         )?;
                         let proposer = validator_registry
                             .get(&(proposal.realm_id, proposal.proposer_sub_id))
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "GUTA proposer sub_id {} has no genesis validator",
-                                    proposal.proposer_sub_id
-                                )
-                            })?;
+                            .ok_or_else(|| anyhow::anyhow!(
+                                "GUTA proposer sub_id {} has no genesis validator",
+                                proposal.proposer_sub_id
+                            ))?;
                         let decoded = verify_proposal_submission::<N>(
                             &proposal,
                             body.as_bytes(),
@@ -333,8 +648,7 @@ where
                             .await
                             .map_err(|_| anyhow::anyhow!("verified state_updates receiver dropped"))?;
                         Ok::<(), anyhow::Error>(())
-                    }
-                    .await;
+                    }.await;
                     if let Err(error) = validation {
                         tracing::warn!(
                             "realm P2P non-proposer rejected Proposal proposal={} error={:#}",
@@ -361,10 +675,9 @@ where
                     );
                 }
                 RealmNetworkEvent::EndCapReceived { reply, .. } => {
-                    let _ = reply.send(psy_data::p2p::EndCapForwardResponse::new(false));
+                    let _ = reply.send(EndCapForwardResponse::new(false));
                 }
-                RealmNetworkEvent::VoteReceived { .. }
-                | RealmNetworkEvent::FinalizeResult { .. } => {}
+                RealmNetworkEvent::VoteReceived { .. } => {}
             }
         }
     });
@@ -395,7 +708,11 @@ where
         ProvingJobCircuitType::GUTAVerifyLeftLeafRightLinearUpgradeCheckpoint,
     ] {
         if proof_verifier
-            .verify_zk_proof_from_slice_check_public_inputs_hash(circuit_type as u32, proof, expected)
+            .verify_zk_proof_from_slice_check_public_inputs_hash(
+                circuit_type as u32,
+                proof,
+                expected,
+            )
             .is_ok()
         {
             return Ok(circuit_type as u32);
@@ -404,8 +721,7 @@ where
     anyhow::bail!("Proposal proof is not a valid ordinary GUTA root proof")
 }
 
-
-/// Drive loop + edge event consumer. Inbound EndCaps are accepted locally.
+/// Drive loop plus edge event consumer. Inbound EndCaps are accepted locally.
 pub fn spawn_edge_realm_network<H>(built: OptionalRealmNetwork, handler: H)
 where
     H: EdgeEndCapReceiver + Clone + Send + Sync + 'static,
@@ -434,8 +750,7 @@ where
                     let _ = reply.send(response);
                 }
                 RealmNetworkEvent::ProposalReady { .. }
-                | RealmNetworkEvent::VoteReceived { .. }
-                | RealmNetworkEvent::FinalizeResult { .. } => {}
+                | RealmNetworkEvent::VoteReceived { .. } => {}
             }
         }
     });
@@ -452,17 +767,32 @@ pub trait EdgeEndCapReceiver {
 }
 
 impl<
-        N: parth_core::protocol::core_types::QNetworkTypesConfig<JobId = psy_core::job::job_id::QProvingJobDataID> + 'static,
-        S: psy_node_core::psy_core_db::traits::full::PsyRealmEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync + 'static,
+        N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
+        S: psy_node_core::psy_core_db::traits::full::PsyRealmEdgeAPIStoreReader<N::F, N::QHash>
+            + Send
+            + Sync
+            + 'static,
         STagTreeRewards: psy_node_core::psy_core_db::traits::full::PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash>
             + psy_node_core::psy_core_db::traits::full::PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash>
             + Send
             + Sync
             + 'static,
-        UserUpdateQueue: psy_node_core::queue::ephemeral::QStandardEphemeralQueuePublisher + Send + Sync + 'static,
-        GetProofWorkQueue: psy_node_core::queue::worker_queue::QStandardWorkerQueueSubscriber + Send + Sync + 'static,
-        TempDatabase: psy_node_core::psy_temp_db::StandardEdgeAPITempDBStoreBase<N::JobId, N::QHash> + Send + Sync + 'static,
-        ProofStore: psy_node_core::store::traits::proof_store::QParthProofStore + Send + Sync + 'static,
+        UserUpdateQueue: psy_node_core::queue::ephemeral::QStandardEphemeralQueuePublisher
+            + Send
+            + Sync
+            + 'static,
+        GetProofWorkQueue: psy_node_core::queue::worker_queue::QStandardWorkerQueueSubscriber
+            + Send
+            + Sync
+            + 'static,
+        TempDatabase: psy_node_core::psy_temp_db::StandardEdgeAPITempDBStoreBase<N::JobId, N::QHash>
+            + Send
+            + Sync
+            + 'static,
+        ProofStore: psy_node_core::store::traits::proof_store::QParthProofStore
+            + Send
+            + Sync
+            + 'static,
     > EdgeEndCapReceiver
     for psy_node_common::realm::edge::handler::RealmEdgeHandler<
         N,
@@ -487,5 +817,159 @@ where
         psy_node_common::realm::edge::handler::RealmEdgeHandler::handle_p2p_end_cap_received(
             self, source, header, input, proof,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node_id(seed: u8) -> NodeId {
+        let mut raw = [0u8; 38];
+        raw[..6].copy_from_slice(&[0x00, 0x24, 0x08, 0x01, 0x12, 0x20]);
+        raw[6..].fill(seed);
+        NodeId::from_raw(raw).unwrap()
+    }
+
+    fn address(port: u16, node_id: NodeId) -> String {
+        format!("/ip4/127.0.0.1/tcp/{port}/p2p/{}", node_id.to_peer_id())
+    }
+
+    #[test]
+    fn public_network_keys_are_explicit_and_fail_closed() {
+        assert_eq!(public_network_key(PsyChainNetworkType::LocalDevnet).unwrap(), "localhost");
+        assert_eq!(public_network_key(PsyChainNetworkType::PsyPublicTestnet).unwrap(), "sepolia");
+        assert_eq!(public_network_key(PsyChainNetworkType::PsyMainnet).unwrap(), "ethereum");
+        assert!(public_network_key(PsyChainNetworkType::InternalDevnet).is_err());
+    }
+
+    #[test]
+    fn bootnodes_exclude_only_the_local_peer() {
+        let local = node_id(1);
+        let remote = node_id(2);
+        let local_address = address(41001, local);
+        let remote_processor = address(41002, remote);
+        let remote_edge = address(41102, remote);
+        let bootnodes = vec![
+            local_address,
+            remote_processor.clone(),
+            remote_edge.clone(),
+        ];
+
+        assert_eq!(
+            bootnodes_without_local_peer(&bootnodes, local).unwrap(),
+            vec![remote_processor, remote_edge]
+        );
+    }
+
+    #[test]
+    fn bootnode_filter_rejects_invalid_addresses() {
+        assert!(bootnodes_without_local_peer(&["/ip4/127.0.0.1/tcp/41001".into()], node_id(1)).is_err());
+    }
+
+    #[test]
+    fn public_realm_validator_count_rejects_65() {
+        assert!(validate_realm_validator_count(7, 65).is_err());
+    }
+
+    #[test]
+    fn processor_address_peer_id_matches_declared_node_id() {
+        let processor = node_id(3);
+        validate_node_addresses(
+            &[address(41003, processor)],
+            processor,
+            "processor",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn processor_address_peer_id_must_match_declared_node_id() {
+        let error = validate_node_addresses(
+            &[address(41003, node_id(4))],
+            node_id(3),
+            "processor",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not match NodeId PeerId"));
+    }
+
+    #[test]
+    fn edge_address_peer_id_matches_declared_node_id() {
+        let edge = node_id(5);
+        validate_node_addresses(&[address(41105, edge)], edge, "edge").unwrap();
+    }
+
+    #[test]
+    fn edge_address_peer_id_must_match_declared_node_id() {
+        let error = validate_node_addresses(
+            &[address(41105, node_id(6))],
+            node_id(5),
+            "edge",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not match NodeId PeerId"));
+    }
+
+    #[test]
+    fn public_network_accepts_active_and_inactive_realms() {
+        let processor = node_id(7);
+        let edge = node_id(8);
+        let network = PublicNetworkConfig {
+            realm_user_tree_height: 20,
+            p2p: PublicP2pConfig { checkpoints_per_epoch: 10 },
+            realm_configs: vec![
+                PublicRealmConfig {
+                    id: 0,
+                    validators: vec![PublicValidator {
+                        validator_user_id: 1,
+                        processor_node_id: hex::encode(processor.as_raw()),
+                        bls_public_key: String::new(),
+                        processor_addresses: vec![address(41001, processor)],
+                        edge_nodes: vec![PublicNode {
+                            node_id: hex::encode(edge.as_raw()),
+                            addresses: vec![address(41101, edge)],
+                        }],
+                    }],
+                },
+                PublicRealmConfig { id: 1, validators: Vec::new() },
+            ],
+        };
+
+        validate_public_network(&network).unwrap();
+        selected_realm(&network, 0).unwrap();
+    }
+
+    #[test]
+    fn selected_inactive_realm_is_rejected() {
+        let network = PublicNetworkConfig {
+            realm_user_tree_height: 20,
+            p2p: PublicP2pConfig { checkpoints_per_epoch: 10 },
+            realm_configs: vec![PublicRealmConfig { id: 1, validators: Vec::new() }],
+        };
+
+        let error = selected_realm(&network, 1).err().expect("empty selected Realm must fail");
+        assert!(error.to_string().contains("validator count 0"));
+    }
+
+    #[test]
+    fn validator_without_edge_is_rejected() {
+        let processor = node_id(7);
+        let network = PublicNetworkConfig {
+            realm_user_tree_height: 20,
+            p2p: PublicP2pConfig { checkpoints_per_epoch: 10 },
+            realm_configs: vec![PublicRealmConfig {
+                id: 0,
+                validators: vec![PublicValidator {
+                    validator_user_id: 1,
+                    processor_node_id: hex::encode(processor.as_raw()),
+                    bls_public_key: String::new(),
+                    processor_addresses: vec![address(41001, processor)],
+                    edge_nodes: Vec::new(),
+                }],
+            }],
+        };
+        let error = validate_public_network(&network).unwrap_err();
+        assert!(error.to_string().contains("has no edge nodes"));
     }
 }

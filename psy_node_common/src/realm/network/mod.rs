@@ -28,10 +28,7 @@ pub use behaviour::{
     add_bootnode_address, add_known_address, proposal_topic, vote_topic, RealmBehaviour,
     IDENTIFY_PROTOCOL_ID,
 };
-pub use codec::{
-    DirectBodyCodec, EndCapForwardCodec, EndCapForwardRequest, RealmFinalizeSubmitCodec,
-    DIRECT_BODY_PROTOCOL_ID, END_CAP_FORWARD_PROTOCOL_ID, REALM_FINALIZE_SUBMIT_PROTOCOL_ID,
-};
+pub use codec::{DirectBodyCodec, EndCapForwardCodec, EndCapForwardRequest, DIRECT_BODY_PROTOCOL_ID, END_CAP_FORWARD_PROTOCOL_ID};
 pub use config::{
     generate_bls_secret_file, generate_ed25519_identity_file, load_bls_secret_key,
     load_ed25519_identity_key, RealmNetworkConfig, BOOTNODE_MIN_CIRCUIT_BYTES,
@@ -42,17 +39,13 @@ pub use reassembly::{
     StartOutcome, VerifiedProposalBody,
 };
 pub use drive::run_realm_network;
-pub use startup::{
-    build_optional_realm_network, parse_bootnode, parse_proposer_node_id, parse_proposer_node_ids,
-    OptionalRealmNetwork,
-};
+pub use startup::{build_optional_realm_network, parse_bootnode, OptionalRealmNetwork};
 
 
 use libp2p::request_response;
 use libp2p::{identity, noise, tcp, yamux, Swarm, SwarmBuilder};
 use psy_data::p2p::{
-    DirectBodyResponse, EndCapForwardHeader, EndCapForwardResponse, NodeId, Proposal,
-    RealmFinalizeSubmitCode, RealmFinalizeSubmitRequest, RealmFinalizeSubmitResponse, Vote,
+    DirectBodyResponse, EndCapForwardHeader, EndCapForwardResponse, NodeId, Proposal, Vote,
 };
 use std::time::Duration;
 use thiserror::Error;
@@ -83,8 +76,6 @@ pub enum NetworkError {
     DirectRequest(String),
     #[error("request was rejected: {0}")]
     Rejected(String),
-    #[error("Realm finalize submission rejected: {0}")]
-    RealmFinalizeRejected(RealmFinalizeSubmitCode),
     #[error("timed out: {0}")]
     Timeout(String),
 }
@@ -112,11 +103,6 @@ pub enum RealmNetworkCommand {
     PublishVote {
         vote: Vote,
         response: oneshot::Sender<Result<(), NetworkError>>,
-    },
-    /// Submit a finalize request to the Coordinator and await its response.
-    SubmitFinalize {
-        request: RealmFinalizeSubmitRequest,
-        response: oneshot::Sender<Result<RealmFinalizeSubmitResponse, NetworkError>>,
     },
     /// Respond to an inbound direct-body range request.
     ServeBody {
@@ -159,14 +145,6 @@ pub enum RealmNetworkEvent {
     VoteReceived {
         source: NodeId,
         vote: Vote,
-    },
-    /// A finalize-submit request was received by the Coordinator. The
-    /// application validates and replies with the admission response.
-    FinalizeResult {
-        request_id: request_response::InboundRequestId,
-        source: NodeId,
-        request: RealmFinalizeSubmitRequest,
-        reply: oneshot::Sender<RealmFinalizeSubmitResponse>,
     },
 }
 
@@ -223,15 +201,7 @@ impl RealmNetworkCommands {
 
     pub async fn publish_vote(&self, vote: Vote) -> Result<(), NetworkError> {
         self.request(|response| RealmNetworkCommand::PublishVote { vote, response })
-            .await?
-    }
-
-    pub async fn submit_finalize(
-        &self,
-        request: RealmFinalizeSubmitRequest,
-    ) -> Result<RealmFinalizeSubmitResponse, NetworkError> {
-        self.request(|response| RealmNetworkCommand::SubmitFinalize { request, response })
-            .await?
+        .await?
     }
 
     pub async fn serve_body(
@@ -329,13 +299,6 @@ impl RealmNetworkHandle {
 
     pub async fn publish_vote(&self, vote: Vote) -> Result<(), NetworkError> {
         self.commands.publish_vote(vote).await
-    }
-
-    pub async fn submit_finalize(
-        &self,
-        request: RealmFinalizeSubmitRequest,
-    ) -> Result<RealmFinalizeSubmitResponse, NetworkError> {
-        self.commands.submit_finalize(request).await
     }
 
     pub async fn serve_body(

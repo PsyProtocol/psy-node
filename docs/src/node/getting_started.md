@@ -99,13 +99,20 @@ The coordinator flags are defined in `psy_cli/psy_node_cli/src/subcommand.rs:158
 
 ### 4.3 Start realm 0
 
+Direct Realm startup requires a public runtime network config matching the local keys. Set `PSY_CONFIG_PATH` to that config before starting Realm processes; the standard devnet launcher generates the config and keys automatically.
+
 ```bash
+export PSY_CONFIG_PATH=./local_checkpoints/realm_p2p/config.json
+
 RUST_LOG=info psy_node_cli start-realm-processor \
   --scylla-db-url 127.0.0.1:9042 \
   --nats-jetstream-url nats://127.0.0.1:4222 \
   --redis-url redis://127.0.0.1:6379 \
   --db-namespace realm0 \
   --realm-id 0 \
+  --p2p-identity-key ./local_checkpoints/realm_p2p/realm_0_sub_1_processor_identity.key \
+  --p2p-bls-key ./local_checkpoints/realm_p2p/realm_0_sub_1_bls.key \
+  --p2p-listen /ip4/0.0.0.0/tcp/41001 \
   --coordinator-api-urls http://127.0.0.1:1337
 
 RUST_LOG=info psy_node_cli start-realm-edge \
@@ -115,7 +122,9 @@ RUST_LOG=info psy_node_cli start-realm-edge \
   --db-namespace realm0 \
   --realm-id 0 \
   --listen 0.0.0.0 \
-  --port 13380
+  --port 13380 \
+  --p2p-identity-key ./local_checkpoints/realm_p2p/realm_0_sub_1_edge_identity.key \
+  --p2p-listen /ip4/0.0.0.0/tcp/41101
 ```
 
 ### 4.4 Start realm 1
@@ -127,6 +136,9 @@ RUST_LOG=info psy_node_cli start-realm-processor \
   --redis-url redis://127.0.0.1:6379 \
   --db-namespace realm1 \
   --realm-id 1 \
+  --p2p-identity-key ./local_checkpoints/realm_p2p/realm_1_sub_1_processor_identity.key \
+  --p2p-bls-key ./local_checkpoints/realm_p2p/realm_1_sub_1_bls.key \
+  --p2p-listen /ip4/0.0.0.0/tcp/41021 \
   --coordinator-api-urls http://127.0.0.1:1337
 
 RUST_LOG=info psy_node_cli start-realm-edge \
@@ -136,7 +148,9 @@ RUST_LOG=info psy_node_cli start-realm-edge \
   --db-namespace realm1 \
   --realm-id 1 \
   --listen 0.0.0.0 \
-  --port 13390
+  --port 13390 \
+  --p2p-identity-key ./local_checkpoints/realm_p2p/realm_1_sub_1_edge_identity.key \
+  --p2p-listen /ip4/0.0.0.0/tcp/41121
 ```
 
 Realm processor and edge flags are defined in `psy_cli/psy_node_cli/src/subcommand.rs:18-157`.

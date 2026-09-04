@@ -163,6 +163,7 @@ async fn run_execute(args: RollbackArgs) -> anyhow::Result<()> {
 async fn prepare_offline_operation(args: &CommonArgs) -> anyhow::Result<ProcessorConfig> {
     validate_static_args(args)?;
     let config = load_processor_config(args).await?;
+    let config = resolve_realm_identity(config)?;
     validate_config(args, &config)?;
     require_shutdown_sentinel(&args.stop_sentinel).await?;
     reject_reachable_processors(args).await?;
@@ -211,19 +212,17 @@ async fn load_processor_config(args: &CommonArgs) -> anyhow::Result<ProcessorCon
         ProcessorRole::Realm => {
             psy_node_core::config::node_cli_config::RealmProcessorCliConfig::get_start_config(
                 Some(path),
-                None, None, None, None, None, None, None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
                 false,
                 None,
                 Vec::new(),
                 None,
                 None,
-                None,
-                None,
-                Vec::new(),
-                None,
-                Vec::new(),
-                None,
-                Vec::new(),
                 None,
                 None,
             )
@@ -232,6 +231,17 @@ async fn load_processor_config(args: &CommonArgs) -> anyhow::Result<ProcessorCon
         }
     }
     .with_context(|| format!("failed to load {:?} processor config at {}", args.role, args.processor_config.display()))
+}
+
+fn resolve_realm_identity(config: ProcessorConfig) -> anyhow::Result<ProcessorConfig> {
+    match config {
+        ProcessorConfig::Coordinator(config) => Ok(ProcessorConfig::Coordinator(config)),
+        ProcessorConfig::Realm(config) => {
+            let sub_id = psy_node_cli::node::realm_p2p::resolve_processor_sub_id(&config)
+                .context("failed to derive Realm processor sub-id from PSY_CONFIG_PATH and the local P2P identity key")?;
+            Ok(ProcessorConfig::Realm(config.with_derived_realm_sub_id(sub_id)))
+        }
+    }
 }
 
 fn validate_config(args: &CommonArgs, config: &ProcessorConfig) -> anyhow::Result<()> {

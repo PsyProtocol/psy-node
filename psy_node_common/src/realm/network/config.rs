@@ -34,8 +34,6 @@ pub struct RealmNetworkConfig {
     pub listen_addresses: Vec<Multiaddr>,
     pub external_addresses: Vec<Multiaddr>,
     pub bootnode_addresses: Vec<(PeerId, Multiaddr)>,
-    /// Direct coordinator endpoints (validators submit finalize here).
-    pub coordinator_addresses: Vec<Multiaddr>,
     /// Bootnode runtime: provides relay/Identify/AutoNAT only and never joins
     /// the Realm application protocols.
     pub serve_as_bootnode: bool,
@@ -108,11 +106,6 @@ impl RealmNetworkConfig {
         if self.reassembly_chunk_bytes == 0 || self.reassembly_expiry_secs == 0 {
             return Err(NetworkError::Configuration(
                 "reassembly chunk/expiry bounds must be non-zero".into(),
-            ));
-        }
-        if !self.serve_as_bootnode && !self.is_edge && self.coordinator_addresses.is_empty() {
-            return Err(NetworkError::Configuration(
-                "validator requires at least one coordinator address".into(),
             ));
         }
         if self.serve_as_bootnode {
@@ -194,7 +187,7 @@ pub fn load_bls_secret_key(path: impl AsRef<Path>) -> Result<BlsSecretKey, Netwo
 /// Generate a fresh libp2p Ed25519 identity keypair from 32 random bytes,
 /// write its protobuf encoding to `path`, and return the derived [`NodeId`].
 ///
-/// Used by the `init-realm-p2p-keys` CLI to materialize identity files for
+/// Used by the `init-realm-p2p-keys` CLI to write identity files for
 /// local E2E. The file format matches [`load_ed25519_identity_key`].
 pub fn generate_ed25519_identity_file(path: impl AsRef<Path>) -> Result<NodeId, NetworkError> {
     let path = path.as_ref();

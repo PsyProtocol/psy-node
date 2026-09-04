@@ -91,7 +91,7 @@ current-source defects that must not be copied into commands (`Makefile:60-66`; 
 | LWT | Lightweight transaction; the launcher configures Scylla contention and write timeouts. | `dev/locSetupV4.ts:4737-4753`; `dev/start_db.sh:123-171` |
 | NATS | The NATS JetStream messaging service in persistent infrastructure. | `dev/start_db.sh:109-120` |
 | Nostr | The local Nostr relay in persistent infrastructure. | `dev/start_db.sh:184-227` |
-| P2P | Peer-to-peer Realm transport enabled by `--realm-p2p`. | `dev/locSetupV4.ts:958-1138`; `dev/locSetupV4.ts:5304` |
+| P2P | Peer-to-peer Realm transport started by default for every Realm validator. | `dev/locSetupV4.ts` |
 | RPC | Remote procedure call endpoint exposed by Layer 1, Coordinator edges, and Realm edges. | `dev/locSetupV4.ts:3937-3957`; `dev/locSetupV4.ts:4063-4084` |
 | SMP | Symmetric multiprocessing shard count supplied to Scylla. | `dev/locSetupV4.ts:203-221`; `dev/start_db.sh:132-171` |
 | TCP | Transmission Control Protocol, used by launcher port readiness gates. | `dev/locSetupV4.ts:3866-3886`; `dev/locSetupV4.ts:4234-4246` |
@@ -247,9 +247,7 @@ relayer stack, and all four UI flags (`Makefile:60-66`). It also defaults `PSY_S
 The component selectors are `--db`, `--coordinator`, `--prove-proxy`, `--faucet-server`, `--dummy-provers`, `--l1`,
 `--relayer`, `--bridge-proposer-daemon`, `--psy-privacy-bridge`, `--ide`, `--explorer`, and
 `--mode-a-web-wallet-bridge` (`dev/locSetupV4.ts:5333`). Any selector disables top-level full-mode worker defaults;
-explicit worker counts then control worker startup (`dev/locSetupV4.ts:5333-5340`). Modifiers such as
-`--realm-workers`, `--realm-p2p`, `--realms-count`, `--host`, `--env`, and `--daemonlize` are not selectors, so using
-one alone modifies a full launch (`dev/locSetupV4.ts:5297-5326`; `dev/locSetupV4.ts:5333`). Selectors do not pull all
+Explicit worker counts control worker startup. Realm P2P is not a selector or modifier: every Realm launch uses it.
 runtime dependencies: for example, `--coordinator` does not select `--db`, `--relayer` does not select Layer 1 or the
 core, and `--psy-privacy-bridge` does not select Nostr (`dev/locSetupV4.ts:3788-3805`;
 `dev/locSetupV4.ts:4304-4554`; `dev/locSetupV4.ts:4556-4568`).
@@ -265,14 +263,14 @@ boundary (`dev/locSetupV4.ts:5338-5350`; `dev/locSetupV4.ts:5373`).
 | `--proving-backend VALUE` | String, Plonky2 fallback | Supplies processor, worker, dummy-prover, and daemonized backend arguments. | `dev/locSetupV4.ts:3461-3475`; `dev/locSetupV4.ts:3840-4204` |
 | `--disable-worker-edge-logs` | Boolean, false | Omits launcher log files for workers and edges in foreground mode. | `dev/locSetupV4.ts:3829-3837` |
 | `--realm-workers COUNT` | 2 full / 0 component | Starts shared Realm workers; a positive value also counts toward Rayon sizing. | `dev/locSetupPolicy.ts:303-315`; `dev/locSetupV4.ts:3802-3811`; `dev/locSetupV4.ts:4100-4191` |
-| `--realm-edge-nodes COUNT` | String, `1` | Sets edge count per Realm/sub-ID and changes HTTP port stride. | `dev/locSetupV4.ts:5298,5338`; `dev/locSetupV4.ts:1041-1044` |
-| `--coordinator-edge-nodes COUNT` | String, `1` | Starts Coordinator edges on `1337 + index`. | `dev/locSetupV4.ts:5299,5339`; `dev/locSetupV4.ts:3937-3957` |
-| `--coordinator-workers COUNT` | 1 full / 0 component | Starts Coordinator workers after Realm readiness. | `dev/locSetupV4.ts:5340`; `dev/locSetupV4.ts:3963-4004` |
-| `--start-realm-id ID` | String, `0` | Sets the inclusive first Realm ID. | `dev/locSetupV4.ts:5301,5341`; `dev/locSetupV4.ts:3799-3801` |
-| `--realms-count COUNT` | String, `1` | Sets the number of consecutive Realm IDs. | `dev/locSetupV4.ts:5302,5342`; `dev/locSetupV4.ts:3799-3801` |
-| `--host HOST` | String, `127.0.0.1` | Builds core DB, NATS, Redis, Coordinator, worker, and P2P addresses; it is not the Anvil host setting. | `dev/locSetupV4.ts:5303,5343`; `dev/locSetupV4.ts:3461-3472`; `dev/locSetupV4.ts:490-493` |
-| `--realm-p2p` | Boolean, false | Uses sub-IDs 1 and 2, generates/reuses validator keys, injects genesis validators, and adds P2P arguments. | `dev/locSetupV4.ts:5304,5363`; `dev/locSetupV4.ts:958-1138`; `dev/locSetupV4.ts:3888-3900` |
-| `--genesis-data-path PATH` | String, `genesis.json` | Supplies processor genesis and is rewritten with P2P validators or an empty validator list. | `dev/locSetupV4.ts:5306,5344`; `dev/locSetupV4.ts:1008-1041` |
+| `--realm-edge-nodes COUNT` | String, `1` | Sets the number of distinct standard-P2P edge identities per Realm validator. Each edge receives its own secret key, public address, P2P listen port, and HTTP port. | `dev/locSetupV4.ts` |
+| `--coordinator-edge-nodes COUNT` | String, `1` | Starts Coordinator edges on `1337 + index`. | `dev/locSetupV4.ts` |
+| `--coordinator-workers COUNT` | 1 full / 0 component | Starts Coordinator workers after Realm readiness. | `dev/locSetupV4.ts` |
+| `--start-realm-id ID` | String, `0` | Sets the inclusive first Realm ID. | `dev/locSetupV4.ts` |
+| `--realms-count COUNT` | String, `1` | Sets the number of consecutive Realm IDs. | `dev/locSetupV4.ts` |
+| `--host HOST` | String, `127.0.0.1` | Builds foreground DB, NATS, Redis, Coordinator, worker, and routable Realm P2P public addresses; it is not the Anvil host setting. | `dev/locSetupV4.ts` |
+| Realm P2P | Core-only runtime setup | Coordinator/Realm core startup uses the standard Realm P2P protocol, generates or reuses two ordered validators per Realm, injects public validator identities into Genesis, and exports a public-only runtime config. DB-, worker-, service-, and UI-only selections do not create secrets/config or rewrite Genesis. Daemon core mode writes a separate config using Compose DNS public addresses and wildcard listen addresses. |
+| `--genesis-data-path PATH` | String, `genesis.json` | Supplies processor Genesis and receives public validator identities only when Coordinator/Realm core is selected. |
 | `--coordinator` | Boolean selector | Starts Coordinator processor/edges and Realm processors/edges; it does not select DB. | `dev/locSetupV4.ts:3788-3801`; `dev/locSetupV4.ts:3902-4098` |
 | `--db` | Boolean selector | Starts `dev/start_db.sh --persist`: Redis/Valkey, NATS, Scylla, and Nostr. | `dev/locSetupV4.ts:3866-3886`; `dev/start_db.sh:83-227` |
 | `--dummy-provers COUNT` | String, `0` | Starts dummy prover scripts for the selected Realm range; daemon mode emits none. | `dev/locSetupV4.ts:4193-4210`; `dev/locSetupV4.ts:4693-5069` |
@@ -396,21 +394,23 @@ follow-on timeout after such a failure are retried (`dev/locSetupV4.ts:47-96`).
 
 ## 8. Ports and P2P Formulas
 
-For Realm ID `R`, sub-ID `S`, edge index `E`, and configured Realm edge count `C`:
+For Realm ID `R`, one-based validator position `S`, zero-based edge index `E`, configured Realm edge count `C`,
+P2P Realm stride `P = max(20, 2C)`, and HTTP Realm stride `H = max(10, 2C)`:
 
 ```text
 Coordinator edge HTTP/RPC = 1337 + edgeIndex
-Realm edge HTTP/RPC       = 13380 + 10R + (S - 1)C + E
+Realm edge HTTP/RPC       = 13380 + RH + (S - 1)C + E
 Realm processor P2P TCP   = 41000 + 20R + S
-Realm edge P2P TCP        = 41100 + 20R + S
+Realm edge P2P TCP        = 41100 + RP + (S - 1)C + E + 1
 Validator user ID         = R * 2^20 + S
 Coordinator P2P bootnode  = 40999
 Prove proxy               = 9999 + proxyIndex
 ```
 
-The formulas are implemented at `dev/locSetupV4.ts:977-994`, `dev/locSetupV4.ts:1041-1044`, and
-`dev/locSetupV4.ts:3937-3954`. P2P addresses are rendered as `/ip4/HOST/tcp/PORT` and bootnodes append
-`/p2p/PEER_ID` (`dev/locSetupV4.ts:985-991`).
+Every requested processor P2P, edge P2P, and Realm HTTP port is enumerated before startup. A topology is rejected
+before secret/config/Genesis mutation or process startup if any port exceeds 65535 or if any two requested endpoints,
+including endpoints from different port families, resolve to the same number. Multiple edges for one validator use
+their edge index and therefore receive unique P2P and HTTP ports.
 
 | Surface | Port | Evidence |
 |---|---:|---|
@@ -606,7 +606,6 @@ bun run dev/locSetupV4.ts \
 bun run dev/locSetupV4.ts \
   --db \
   --coordinator \
-  --realm-p2p \
   --start-realm-id 0 \
   --realms-count 2 \
   --realm-edge-nodes 2 \
@@ -614,9 +613,10 @@ bun run dev/locSetupV4.ts \
   --realm-workers 2
 ```
 
-This selects sub-IDs 1 and 2, creates four Realm processors and eight Realm edges, and injects generated validators
-into the selected genesis file (`dev/locSetupV4.ts:958-1138`; `dev/locSetupV4.ts:3888-3900`;
-`dev/locSetupV4.ts:3993-4098`).
+This selects validator positions 1 and 2, creates four Realm processors and eight distinct Realm edges, and injects
+their public standard-P2P identities and routable addresses into the selected genesis/runtime configuration. Every
+edge has a unique secret filename, P2P listen port, and HTTP port; the launcher rejects any requested cross-family or
+same-family port collision before mutation or startup.
 
 ### Proxy-only component
 
@@ -682,22 +682,17 @@ These are limitations of the current source, not supported command examples.
 5. Numeric CLI values use `parseInt` without range validation; zero, negative, malformed-suffix, and nonnumeric values
    can produce empty loops, invalid arithmetic, or silent suppression instead of a clear parser error
    (`dev/locSetupV4.ts:5338-5350`; `dev/locSetupV4.ts:4145-4148`).
-6. Realm HTTP port sets overlap adjacent Realms when `subIdCount * realmEdgeCount > 10`; P2P processor and edge port
-   families also collide between Realm IDs separated by five (`dev/locSetupV4.ts:977-983`;
-   `dev/locSetupV4.ts:1041-1044`).
-7. Multiple Realm edges for the same Realm/sub-ID receive the same P2P listen port because the P2P formula has no edge
-   index (`dev/locSetupV4.ts:981-983`; `dev/locSetupV4.ts:4063-4082`).
-8. `--host` is not a complete topology relocation: Layer 1 uses `L1_RPC_HOST`, while bridge services contain literal
+6. `--host` is not a complete topology relocation: Layer 1 uses `L1_RPC_HOST`, while bridge services contain literal
    loopback endpoints (`dev/locSetupV4.ts:490-493`; `dev/locSetupV4.ts:4332`;
    `dev/locSetupV4.ts:4400-4416`).
-9. Daemonized selectors for Layer 1, relayer, dummy provers, and UIs can suppress daemon full mode without generating
+7. Daemonized selectors for Layer 1, relayer, dummy provers, and UIs can suppress daemon full mode without generating
    the requested service because those implementations are absent (`dev/locSetupV4.ts:4702-4710`;
    `dev/locSetupV4.ts:4767-5014`).
-10. Daemonized P2P constructs loopback multiaddresses inside separate containers and does not publish P2P port
-    families; treat daemonized P2P as a current-source limitation (`dev/locSetupV4.ts:4903-4954`).
-11. Teardown uses fixed process patterns and port ranges rather than the actual launch plan; Mode A port 5179 and a
-    hypothetical custom Anvil port are absent from the fixed listener list (`dev/locSetupV4.ts:3234-3279`).
-12. Startup purge with `--purge` performs the full paired teardown (processes, containers, checkpoints, Anvil state,
+8. Daemonized Realm P2P uses a separate public-only runtime config: processor and edge public multiaddresses name the
+   corresponding Compose DNS services, while each container listens on `/ip4/0.0.0.0/tcp/...`.
+9. Teardown uses fixed process patterns and port ranges rather than the actual launch plan; Mode A port 5179 and a
+   hypothetical custom Anvil port are absent from the fixed listener list (`dev/locSetupV4.ts:3234-3279`).
+10. Startup purge with `--purge` performs the full paired teardown (processes, containers, checkpoints, Anvil state,
     deployments, volumes) before auto-setup; it is equivalent to `PURGE=1 make shutdown` followed by `make run-all`
     (`dev/locSetupV4.ts:5552-5558`; `dev/locSetupV4.ts:3282-3300`).
 ## 18. Core Data Structures
@@ -733,7 +728,6 @@ interface ProcessOptions {
     explorer?: boolean;
     modeAWebWalletBridge?: boolean;
     daemonlize?: boolean;
-    realmP2p?: boolean;
 }
 ```
 
@@ -965,5 +959,6 @@ Commands execute serially and the loop remains available until the server is clo
 7. Purge is intentionally destructive across both Layer 1 and Layer 2 state. Review the exact deletion set before
    running `PURGE=1 make shutdown` or `make restart-all` (`Makefile:77-79`; `Makefile:102-106`;
    `dev/locSetupV4.ts:3290-3298`).
-8. `--genesis-data-path` is input and output: startup rewrites validators. Use a disposable copy when preserving an
-   existing validator list matters (`dev/locSetupV4.ts:1008-1041`; `dev/locSetupV4.ts:3888-3900`).
+8. With Coordinator/Realm core selected, `--genesis-data-path` is input and output: startup rewrites validators. Use a
+   disposable copy when preserving an existing validator list matters. Component-only modes without core processors do
+   not rewrite it (`dev/locSetupV4.ts:1117-1127`; `dev/locSetupV4.ts:3914-3921`).

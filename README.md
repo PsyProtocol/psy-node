@@ -8,14 +8,11 @@
 
 ### Spinning up a local development cluster
 ```bash
-cargo build --release
-bun run ./dev/locSetupV3.ts --realm-workers 32 --realm-edges 8
-# or for JTMB (dev only) mode
-bun run ./dev/locSetupV3.ts --jtmb --realm-workers 32 --realm-edges 8
+make build
+PSY_SKIP_BRANCH_CHECK=1 PSY_SKIP_KEYSTORE=1 make run-all
 ```
 
-You now have realm edges listening on ports 13370 -> realm_edges + 13370
-You will find the logs for the workers/edges/processors in the ./logs directory
+The launcher runs in the foreground and starts Realm P2P with generated local keys and a public runtime config. Stop the stack with `make shutdown`. Logs are written under `./logs`.
 
 To run some example transactions first run:
 ```bash

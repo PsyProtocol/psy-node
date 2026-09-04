@@ -8,9 +8,8 @@ use crate::user::complete_user_record::PsyCompactUserDefinition;
 
 #[serde_as]
 #[pderive::serialize_copy]
-pub struct ValidatorGenesisEntry {
+pub struct GenesisValidator {
     pub realm_id: u32,
-    pub realm_sub_id: u16,
     pub validator_user_id: u64,
     #[serde(default = "default_zero_node_id")]
     #[serde_as(as = "serde_with::hex::Hex")]
@@ -38,7 +37,7 @@ pub struct PsyGenesisBlockSetupData<F, Hash> {
     pub withdrawal_tree_root: Hash,
     #[serde(default)]
     #[ts(skip)]
-    pub validators: Vec<ValidatorGenesisEntry>,
+    pub validators: Vec<GenesisValidator>,
 }
 
 

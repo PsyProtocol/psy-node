@@ -330,6 +330,7 @@ psy_core = { path = "./psy_core" }
 psy_data = { path = "./psy_data" }
 psy_node_core = { path = "./psy_node_core" }
 psy_node_common = { path = "./psy_node_common" }
+psy_node_cli = { path = "./psy_cli/psy_node_cli" }
 psy_worker_core = { path = "./psy_worker_core" }
 psy_api_core = { path = "./psy_api_core" }
 psy_dummy_prover = { path = "./psy_dummy_prover" }

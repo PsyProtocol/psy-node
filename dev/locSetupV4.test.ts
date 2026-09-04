@@ -31,6 +31,18 @@ import {
     writeCompilerArtifactStamp,
     writeRollbackStopSentinel,
     realmP2pHttpPort,
+    realmP2pEdgePort,
+    realmP2pSecretPaths,
+    realmP2pEdgeExtraArgs,
+    realmP2pProcessorExtraArgs,
+    realmValidatorUserId,
+    planRealmP2pConfig,
+    daemonRealmP2pConfig,
+    realmP2pProcessorPort,
+    requestedRealmPorts,
+    shouldPrepareRealmP2p,
+    validateRealmP2pPorts,
+    selectedRuntimeConfigKey,
     REALM_P2P_SUB_IDS,
 } from "./locSetupV4";
 import allConfig from "../psy-genesis/config.json";
@@ -521,98 +533,152 @@ describe("realm P2P HTTP ports", () => {
             expect(realm.rpc_url).toEqual(expected);
         }
     });
+
+    it("keeps large multi-edge Realm HTTP ranges disjoint", () => {
+        const realmZeroLast = realmP2pHttpPort(0, 2, 5, 6);
+        const realmOneFirst = realmP2pHttpPort(1, 1, 0, 6);
+        expect(realmZeroLast).toBeLessThan(realmOneFirst);
+    });
+    it("rejects topologies whose HTTP or P2P ports exceed u16", () => {
+        expect(() => validateRealmP2pPorts(0, 1, 1)).not.toThrow();
+        expect(() => validateRealmP2pPorts(127, 1, 255)).toThrow("TCP port 65535");
+    });
+
+    it("accepts the normal Realm 0..1 topology", () => {
+        expect(() => validateRealmP2pPorts(0, 2, 1)).not.toThrow();
+    });
+
+    it("rejects the Realm 0..5 processor-to-edge collision", () => {
+        expect(() => validateRealmP2pPorts(0, 6, 1)).toThrow("TCP port 41101");
+    });
+
+    it("detects duplicates across processor, edge, and HTTP families", () => {
+        const ports = requestedRealmPorts(0, 2, 3);
+        expect(new Set(ports.map(({ port }) => port)).size).toBe(ports.length);
+        expect(ports.some(({ family }) => family === "processor P2P")).toBe(true);
+        expect(ports.some(({ family }) => family === "edge P2P")).toBe(true);
+        expect(ports.some(({ family }) => family === "Realm HTTP")).toBe(true);
+        expect(realmP2pProcessorPort(5, 1)).toBe(realmP2pEdgePort(0, 1, 0, 1));
+    });
+});
+
+describe("Realm P2P component selection", () => {
+    it("plans no P2P config or Genesis mutation for DB/UI-only modes", () => {
+        expect(shouldPrepareRealmP2p(false, false)).toBe(false);
+    });
+
+    it("plans P2P mutation whenever Coordinator or Realm core starts", () => {
+        expect(shouldPrepareRealmP2p(true, false)).toBe(true);
+        expect(shouldPrepareRealmP2p(false, true)).toBe(true);
+    });
+});
+
+describe("realm P2P launch planning", () => {
+    const validator = (subId: number, edges: number) => ({
+        validator_user_id: subId,
+        processor_node_id: `processor-${subId}`,
+        bls_public_key: `bls-${subId}`,
+        processor_addresses: [`/ip4/192.0.2.8/tcp/${41000 + subId}/p2p/processor-peer-${subId}`],
+        edge_nodes: Array.from({ length: edges }, (_, edgeIndex) => ({
+            node_id: `edge-${subId}-${edgeIndex}`,
+            addresses: [`/ip4/192.0.2.8/tcp/${realmP2pEdgePort(0, subId, edgeIndex, edges)}/p2p/edge-peer-${subId}-${edgeIndex}`],
+        })),
+    });
+    const config = (edges: number) => ({
+        defaultNetwork: "localhost",
+        networks: { localhost: { realm_user_tree_height: 20, p2p: { checkpoints_per_epoch: 10 }, realm_configs: [{ id: 0, rpc_url: [], validators: [validator(1, edges), validator(2, edges)] }] } },
+    });
+
+    it("reuses only a complete config for the selected host and edge count", () => {
+        expect(planRealmP2pConfig(config(2), [0], 2, "192.0.2.8").reuse).toBe(true);
+        expect(planRealmP2pConfig(config(1), [0], 2, "192.0.2.8").reuse).toBe(false);
+        expect(planRealmP2pConfig(config(2), [0], 2, "192.0.2.9").reuse).toBe(false);
+    });
+
+    it("regenerates when an unselected Realm still has validators", () => {
+        const stale = config(1);
+        stale.networks.localhost.realm_configs.push({ id: 1, rpc_url: [], validators: [validator(1, 1), validator(2, 1)] });
+        expect(planRealmP2pConfig(stale, [0], 1, "192.0.2.8").reuse).toBe(false);
+        stale.networks.localhost.realm_configs[1].validators = [];
+        expect(planRealmP2pConfig(stale, [0], 1, "192.0.2.8").reuse).toBe(true);
+    });
+
+    it("pins generator network selection and edge count", () => {
+        const plan = planRealmP2pConfig(null, [3, 4], 3, "devnet.example");
+        expect(plan.env).toEqual({ PSY_CONFIG_PATH: "psy-genesis/config.json", PSY_NETWORK: "localhost", PSY_REALM_P2P_PUBLIC_HOST: "devnet.example" });
+        expect(plan.args).toContain("--edges-per-validator");
+        expect(plan.args.at(-1)).toBe("3");
+        expect(selectedRuntimeConfigKey("local-devnet")).toBe("localhost");
+        expect(realmP2pSecretPaths([0], 2)).toEqual([
+            "./local_checkpoints/realm_p2p/realm_0_sub_1_processor_identity.key",
+            "./local_checkpoints/realm_p2p/realm_0_sub_1_bls.key",
+            "./local_checkpoints/realm_p2p/realm_0_sub_1_edge_identity.key",
+            "./local_checkpoints/realm_p2p/realm_0_sub_1_edge_1_identity.key",
+            "./local_checkpoints/realm_p2p/realm_0_sub_2_processor_identity.key",
+            "./local_checkpoints/realm_p2p/realm_0_sub_2_bls.key",
+            "./local_checkpoints/realm_p2p/realm_0_sub_2_edge_identity.key",
+            "./local_checkpoints/realm_p2p/realm_0_sub_2_edge_1_identity.key",
+        ]);
+    });
+
+    it("assigns every foreground edge a distinct key and P2P listen port", () => {
+        const launches = [0, 1, 2].map((edgeIndex) => realmP2pEdgeExtraArgs("192.0.2.8", 2, 1, edgeIndex, 3));
+        expect(new Set(launches.map((args) => args[1])).size).toBe(3);
+        expect(new Set(launches.map((args) => args[3])).size).toBe(3);
+        expect(launches[0][1]).toEndWith("edge_identity.key");
+        expect(realmP2pProcessorExtraArgs("devnet.example", 2, 1)[5]).toBe("/dns4/devnet.example/tcp/41041");
+    });
+
+    it("rewrites daemon public addresses to Compose DNS while listeners stay wildcard", () => {
+        const daemon = daemonRealmP2pConfig(config(2), [0], 2);
+        const first = daemon.networks.localhost.realm_configs[0].validators[0];
+        expect(first.processor_addresses[0]).toBe("/dns4/realm-0-sub-1-processor/tcp/41001/p2p/processor-peer-1");
+        expect(first.edge_nodes[1].addresses[0]).toBe("/dns4/realm-0-sub-1-edge-1/tcp/41102/p2p/edge-peer-1-1");
+        expect(realmP2pProcessorExtraArgs("0.0.0.0", 0, 1)[5]).toBe("/ip4/0.0.0.0/tcp/41001");
+        expect(realmP2pEdgeExtraArgs("0.0.0.0", 0, 1, 1, 2)[3]).toBe("/ip4/0.0.0.0/tcp/41102");
+    });
+
+    it("keeps validator ids inside the selected Realm user range", () => {
+        const height = 17;
+        const userId = realmValidatorUserId(9, 2, height);
+        expect(userId).toBe(9 * (2 ** height) + 2);
+        expect(userId).toBeGreaterThanOrEqual(9 * (2 ** height));
+        expect(userId).toBeLessThan(10 * (2 ** height));
+    });
 });
 
 describe("injectGenesisValidators", () => {
-    it("writes the two-layer realm/sub validator ids without inventing fields", async () => {
+    it("writes ordered network validators without storing sub ids", async () => {
         const dir = (await Bun.$`mktemp -d`.text()).trim();
         try {
             const genesisPath = `${dir}/genesis.json`;
             await Bun.write(genesisPath, JSON.stringify({ checkpoint_stats: { block_time: 1764248609 } }));
+            const validator = (validator_user_id: number, processor_node_id: string, bls_public_key: string) => ({
+                validator_user_id,
+                processor_node_id,
+                bls_public_key,
+                processor_addresses: [],
+                edge_nodes: [],
+            });
             await injectGenesisValidators(genesisPath, {
-                coordinator: { peer_id: "coordinator-peer", node_id_hex38: "ff".repeat(38), identity_path: "coordinator-identity" },
-                realms: {
-                    "0": {
-                        "1": {
-                            processor_node_id_hex38: "aa".repeat(38),
-                            processor_peer_id: "processor-peer-0-1",
-                            edge_node_id_hex38: "aa".repeat(38),
-                            edge_peer_id: "edge-peer-0-1",
-                            bls_public_hex: "11".repeat(48),
-                            processor_identity_path: "identity-0-1",
-                            edge_identity_path: "edge-identity-0-1",
-                            bls_path: "bls-0-1",
-                        },
-                        "2": {
-                            processor_node_id_hex38: "bb".repeat(38),
-                            processor_peer_id: "processor-peer-0-2",
-                            edge_node_id_hex38: "bb".repeat(38),
-                            edge_peer_id: "edge-peer-0-2",
-                            bls_public_hex: "22".repeat(48),
-                            processor_identity_path: "identity-0-2",
-                            edge_identity_path: "edge-identity-0-2",
-                            bls_path: "bls-0-2",
-                        },
-                    },
-                    "1": {
-                        "1": {
-                            processor_node_id_hex38: "cc".repeat(38),
-                            processor_peer_id: "processor-peer-1-1",
-                            edge_node_id_hex38: "cc".repeat(38),
-                            edge_peer_id: "edge-peer-1-1",
-                            bls_public_hex: "33".repeat(48),
-                            processor_identity_path: "identity-1-1",
-                            edge_identity_path: "edge-identity-1-1",
-                            bls_path: "bls-1-1",
-                        },
+                defaultNetwork: "localhost",
+                networks: {
+                    localhost: {
+                        p2p: { checkpoints_per_epoch: 10 },
+                        realm_configs: [
+                            { id: 0, rpc_url: [], validators: [validator(1, "aa".repeat(38), "11".repeat(48)), validator(2, "bb".repeat(38), "22".repeat(48))] },
+                            { id: 1, rpc_url: [], validators: [validator((1 << 20) + 1, "cc".repeat(38), "33".repeat(48))] },
+                        ],
                     },
                 },
             });
             const written = JSON.parse(await Bun.file(genesisPath).text());
             expect(written.checkpoint_stats).toEqual({ block_time: 1764248609 });
             expect(written.validators).toEqual([
-                {
-                    realm_id: 0,
-                    realm_sub_id: 1,
-                    validator_user_id: 1,
-                    node_id: "aa".repeat(38),
-                    bls_public_key: "11".repeat(48),
-                },
-                {
-                    realm_id: 0,
-                    realm_sub_id: 2,
-                    validator_user_id: 2,
-                    node_id: "bb".repeat(38),
-                    bls_public_key: "22".repeat(48),
-                },
-                {
-                    realm_id: 1,
-                    realm_sub_id: 1,
-                    validator_user_id: (1 << 20) + 1,
-                    node_id: "cc".repeat(38),
-                    bls_public_key: "33".repeat(48),
-                },
+                { realm_id: 0, validator_user_id: 1, node_id: "aa".repeat(38), bls_public_key: "11".repeat(48) },
+                { realm_id: 0, validator_user_id: 2, node_id: "bb".repeat(38), bls_public_key: "22".repeat(48) },
+                { realm_id: 1, validator_user_id: (1 << 20) + 1, node_id: "cc".repeat(38), bls_public_key: "33".repeat(48) },
             ]);
-            for (const entry of written.validators) {
-                expect(Object.keys(entry).sort()).toEqual(
-                    ["bls_public_key", "node_id", "realm_id", "realm_sub_id", "validator_user_id"],
-                );
-            }
-        } finally {
-            await Bun.$`rm -rf ${dir}`.quiet();
-        }
-    });
-
-    it("clears stale validators when no validators manifest is present", async () => {
-        const dir = (await Bun.$`mktemp -d`.text()).trim();
-        try {
-            const genesisPath = `${dir}/genesis.json`;
-            await Bun.write(genesisPath, JSON.stringify({
-                validators: [{ realm_id: 0, realm_sub_id: 1, validator_user_id: 1, node_id: "aa".repeat(38), bls_public_key: "11".repeat(48) }],
-            }));
-            await injectGenesisValidators(genesisPath, null);
-            const written = JSON.parse(await Bun.file(genesisPath).text());
-            expect(written.validators).toEqual([]);
         } finally {
             await Bun.$`rm -rf ${dir}`.quiet();
         }

@@ -49,9 +49,9 @@ The `build` target compiles the node, worker, developer, relayer, and user comma
 psy_node_cli start-coordinator-edge
 psy_node_cli start-coordinator-processor
 
-# Start realm components
-psy_node_cli start-realm-edge
-psy_node_cli start-realm-processor
+# Start realm components with generated runtime config and local P2P keys
+# (recommended)
+bun dev/locSetupV4.ts
 ```
 
 The node command names are defined in `psy_cli/psy_node_cli/src/subcommand.rs:18-253`.

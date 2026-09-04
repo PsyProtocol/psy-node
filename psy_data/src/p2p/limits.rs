@@ -39,24 +39,6 @@ pub const VOTE_WIRE_BYTES: usize = 130;
 /// Fixed Certificate wire length.
 pub const CERTIFICATE_WIRE_BYTES: usize = 200;
 
-/// Fixed Realm finalize-submit prefix before the variable proof section:
-/// `output[410] || Proposal[210] || Certificate[200]`.
-pub const REALM_FINALIZE_SUBMIT_PREFIX_WIRE_BYTES: usize =
-    MAX_FINALIZER_OUTPUT_BYTES + PROPOSAL_WIRE_BYTES + CERTIFICATE_WIRE_BYTES;
-
-/// Minimum Realm finalize-submit request length:
-/// prefix + `proof_len(4) + 1 proof byte`.
-pub const REALM_FINALIZE_SUBMIT_MIN_REQUEST_BYTES: usize =
-    REALM_FINALIZE_SUBMIT_PREFIX_WIRE_BYTES + 4 + 1;
-
-/// Maximum Realm finalize-submit request length:
-/// prefix + `proof_len(4) + MAX_FINALIZER_PROOF_BYTES`.
-pub const REALM_FINALIZE_SUBMIT_MAX_REQUEST_BYTES: usize =
-    REALM_FINALIZE_SUBMIT_PREFIX_WIRE_BYTES + 4 + MAX_FINALIZER_PROOF_BYTES;
-
-/// Exact Realm finalize-submit response length.
-pub const REALM_FINALIZE_SUBMIT_RESPONSE_WIRE_BYTES: usize = 1;
-
 /// Fixed DirectBodyRequest wire length.
 pub const DIRECT_BODY_REQUEST_WIRE_BYTES: usize = 44;
 
@@ -113,11 +95,6 @@ pub const RANGE_REQUEST_RETRY_INTERVAL_SECS: u64 = 5;
 /// EndCap forward timeout (seconds).
 pub const END_CAP_FORWARD_TIMEOUT_SECS: u64 = 1_800;
 
-/// Realm finalize submission timeout (seconds).
-pub const REALM_FINALIZE_SUBMIT_TIMEOUT_SECS: u64 = 120;
-
-/// Maximum concurrent Realm finalize submissions.
-pub const MAX_CONCURRENT_REALM_FINALIZE_SUBMITS: usize = 8;
 
 /// Replication threshold: `ceil(n / 2)`.
 #[inline]
@@ -137,7 +114,6 @@ mod tests {
         assert_eq!(VOTE_WIRE_BYTES, 130);
         assert_eq!(CERTIFICATE_WIRE_BYTES, 200);
         assert_eq!(END_CAP_FORWARD_HEADER_WIRE_BYTES, 56);
-        assert_eq!(REALM_FINALIZE_SUBMIT_PREFIX_WIRE_BYTES, 820);
         assert_eq!(replication_threshold(1), 1);
         assert_eq!(replication_threshold(2), 1);
         assert_eq!(replication_threshold(3), 2);

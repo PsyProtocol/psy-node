@@ -1,12 +1,10 @@
 //! libp2p `request_response::Codec` implementations for the slim Realm P2P
 //! protocols.
 //!
-//! Three request/response protocols are wired:
+//! Two request/response protocols are wired:
 //! - `/psy/realm/proposal-body/1` — bounded proposal body range exchange.
 //! - `/psy/realm/end-cap-forward/1` — EndCap forward stream (56-byte header
 //!   followed by `end_cap_input_len` input bytes and `proof_len` proof bytes).
-//! - `/psy/realm/finalize-submit/1` — validator-to-coordinator finalize
-//!   submission (`output[410] || Proposal[218] || Certificate[208] || proof`).
 //!
 //! All codecs are memory-backed and use only `futures` AsyncRead/AsyncWrite
 //! (no tempfile / tokio-fs backing) so the slim port stays free of the heavy
@@ -17,112 +15,18 @@ use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::request_response::Codec;
 use libp2p::swarm::StreamProtocol;
 use psy_data::p2p::{
-    Certificate, DirectBodyRequest, DirectBodyResponse, EndCapForwardHeader,
-    EndCapForwardResponse, Proposal, ProtocolEncode, RealmFinalizeOutputBytes,
-    RealmFinalizeSubmitRequest, RealmFinalizeSubmitResponse, CERTIFICATE_WIRE_BYTES,
-    DIRECT_BODY_REQUEST_WIRE_BYTES, DIRECT_REQUEST_MAX_BYTES, END_CAP_FORWARD_HEADER_WIRE_BYTES,
-    END_CAP_FORWARD_RESPONSE_WIRE_BYTES, MAX_END_CAP_FORWARD_BYTES, MAX_FINALIZER_OUTPUT_BYTES,
-    MAX_FINALIZER_PROOF_BYTES, PROPOSAL_WIRE_BYTES, REALM_FINALIZE_SUBMIT_PREFIX_WIRE_BYTES,
-    REALM_FINALIZE_SUBMIT_RESPONSE_WIRE_BYTES,
+    DirectBodyRequest, DirectBodyResponse, EndCapForwardHeader, EndCapForwardResponse,
+    ProtocolEncode, DIRECT_BODY_REQUEST_WIRE_BYTES, DIRECT_REQUEST_MAX_BYTES,
+    END_CAP_FORWARD_HEADER_WIRE_BYTES, END_CAP_FORWARD_RESPONSE_WIRE_BYTES,
+    MAX_END_CAP_FORWARD_BYTES,
 };
 use std::{fmt, io};
 
 pub const DIRECT_BODY_PROTOCOL_ID: &str = "/psy/realm/proposal-body/1";
 pub const END_CAP_FORWARD_PROTOCOL_ID: &str = "/psy/realm/end-cap-forward/1";
-pub const REALM_FINALIZE_SUBMIT_PROTOCOL_ID: &str = "/psy/realm/finalize-submit/1";
 
 const DIRECT_BODY_RESPONSE_OVERHEAD: usize = 53;
 
-// ---------------------------------------------------------------------------
-// Realm finalize-submit
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Default)]
-pub struct RealmFinalizeSubmitCodec;
-
-#[async_trait]
-impl Codec for RealmFinalizeSubmitCodec {
-    type Protocol = StreamProtocol;
-    type Request = RealmFinalizeSubmitRequest;
-    type Response = RealmFinalizeSubmitResponse;
-
-    async fn read_request<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Request>
-    where
-        T: AsyncRead + Unpin + Send,
-    {
-        let mut prefix = [0u8; REALM_FINALIZE_SUBMIT_PREFIX_WIRE_BYTES];
-        io.read_exact(&mut prefix).await?;
-        let output_end = MAX_FINALIZER_OUTPUT_BYTES;
-        let proposal_end = output_end + PROPOSAL_WIRE_BYTES;
-        let output =
-            RealmFinalizeOutputBytes::decode_exact(&prefix[..output_end]).map_err(invalid_data)?;
-        let proposal = Proposal::decode_exact(&prefix[output_end..proposal_end])
-            .map_err(invalid_data)?;
-        let certificate = Certificate::decode_exact(&prefix[proposal_end..])
-            .map_err(invalid_data)?;
-        let proof_len = read_u32_len(io, MAX_FINALIZER_PROOF_BYTES, "Realm finalize proof").await?;
-        if proof_len == 0 {
-            return Err(invalid_data("Realm finalize proof is empty"));
-        }
-        let proof = read_exact_alloc(io, proof_len, "Realm finalize proof").await?;
-        let mut trailing = [0u8; 1];
-        if io.read(&mut trailing).await? != 0 {
-            return Err(invalid_data("trailing bytes after Realm finalize-submit request"));
-        }
-        RealmFinalizeSubmitRequest::new(output, proposal, certificate, proof).map_err(invalid_data)
-    }
-
-    async fn read_response<T>(
-        &mut self,
-        _: &Self::Protocol,
-        io: &mut T,
-    ) -> io::Result<Self::Response>
-    where
-        T: AsyncRead + Unpin + Send,
-    {
-        let bytes = read_to_end_bounded(io, REALM_FINALIZE_SUBMIT_RESPONSE_WIRE_BYTES).await?;
-        RealmFinalizeSubmitResponse::decode_exact(&bytes).map_err(invalid_data)
-    }
-
-    async fn write_request<T>(
-        &mut self,
-        _: &Self::Protocol,
-        io: &mut T,
-        request: Self::Request,
-    ) -> io::Result<()>
-    where
-        T: AsyncWrite + Unpin + Send,
-    {
-        let (output, proposal, certificate, proof) = request.into_parts();
-        let mut prefix = Vec::with_capacity(REALM_FINALIZE_SUBMIT_PREFIX_WIRE_BYTES);
-        output.protocol_encode(&mut prefix);
-        proposal.protocol_encode(&mut prefix);
-        certificate.protocol_encode(&mut prefix);
-        if prefix.len() != REALM_FINALIZE_SUBMIT_PREFIX_WIRE_BYTES {
-            return Err(invalid_data("invalid Realm finalize-submit prefix length"));
-        }
-        io.write_all(&prefix).await?;
-        io.write_all(&(proof.len() as u32).to_le_bytes()).await?;
-        io.write_all(&proof).await?;
-        io.close().await
-    }
-
-    async fn write_response<T>(
-        &mut self,
-        _: &Self::Protocol,
-        io: &mut T,
-        response: Self::Response,
-    ) -> io::Result<()>
-    where
-        T: AsyncWrite + Unpin + Send,
-    {
-        let bytes = response.protocol_encode_to_vec();
-        if bytes.len() != REALM_FINALIZE_SUBMIT_RESPONSE_WIRE_BYTES {
-            return Err(invalid_data("invalid Realm finalize-submit response length"));
-        }
-        write_all_and_close(io, &bytes).await
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Direct proposal-body range

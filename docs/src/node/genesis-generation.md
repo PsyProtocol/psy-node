@@ -79,15 +79,11 @@ Preconditions and the full DAG position are in `AGENTS.md` (`Ordered Release Sta
 If `genesis_contracts.json` content changed, the node-side root `genesis.json` (§1) is affected through `genesis_contracts.json` as a construction input — regenerate it and check the `TOKEN_CONTRACT_STATE_TREE_HEIGHT` consequence per `docs/src/node/token-privacy-circuit-fingerprints.md`.
 
 ## 3. P2P Validator Injection into `genesis.json`
+Devnet startup always rewrites the `validators` list of the file passed as `--genesis-data-path` from the selected public-only runtime network config. Each Realm's ordered validator array is flattened into Genesis with `realm_id`, `validator_user_id`, `node_id`, and `bls_public_key`; sub-id is derived later as the one-based array position. The launcher pins `PSY_NETWORK` to the same config key selected by the node (`localhost` for `local-devnet`) and exports the generated config as `PSY_CONFIG_PATH`.
 
-Devnet startup with `--realm-p2p` rewrites the `validators` list of the file passed as `--genesis-data-path`:
+The key generator assigns validator user IDs from the selected network's `realm_user_tree_height`, and creates one distinct edge identity and public address for every requested edge index. Foreground public addresses use the requested host. Daemon startup writes a separate runtime config whose public addresses use Compose DNS service names; container listeners remain wildcard addresses. All of these addresses use the standard Realm P2P transport.
 
-| Start mode | `validators` behavior |
-|---|---|
-| P2P | Injects one entry per `(realm_id, sub_id)` with `validator_user_id`, `node_id`, and `bls_public_key` from the `validators.json` manifest (`dev/locSetupV4.ts:1010-1035`). |
-| Non-P2P | Rewrites `validators` to an empty list so no stale entries survive (`dev/locSetupV4.ts:1005-1009`). |
-
-`--genesis-data-path` is therefore input and output: use a disposable copy when preserving a hand-maintained validator list matters (`docs/src/node/devnet-launcher-reference.md:968-969`).
+Genesis construction fails closed when a Realm has more than 255 validators, a NodeId, BLS key, or validator user ID is duplicated, a public identity is invalid, or `validator_user_id` is outside the owning Realm's half-open user range. Processor startup also requires its local Ed25519 NodeId and BLS secret to match the configured public values exactly.
 
 ## 4. Excluded Generation Tasks
 

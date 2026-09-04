@@ -1,5 +1,4 @@
 realm_id: 2
-realm_sub_id: 1
 network: local-devnet
 verbose: true
 
@@ -10,6 +9,9 @@ redis_url: redis://127.0.0.1:6379
 
 checkpoint_backup_path: ./local_checkpoints
 genesis_data_path: ./genesis.json
+p2p_identity_key_path: ./local_checkpoints/realm_p2p/realm_2_sub_1_processor_identity.key
+p2p_bls_key_path: ./local_checkpoints/realm_p2p/realm_2_sub_1_bls.key
+p2p_listen: /ip4/0.0.0.0/tcp/41041
 
 coordinator_api_urls:
   - http://127.0.0.1:1337
