@@ -21,7 +21,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-while IFS= read -r chain; do
+mapfile -t chains < <(multichain_specs_json | jq -c 'sort_by(.chain_index)[]')
+
+for chain in "${chains[@]}"; do
   name="$(jq -r '.name' <<<"$chain")"
   network="$(jq -r '.network' <<<"$chain")"
   chain_id="$(jq -r '.chain_id' <<<"$chain")"
@@ -83,7 +85,7 @@ while IFS= read -r chain; do
   jq --argjson entry "$runtime_entry" '.chains += [$entry]' "$runtime_tmp" >"${runtime_tmp}.next"
   mv "${runtime_tmp}.next" "$runtime_tmp"
   rm -f "$remote_env"
-done < <(multichain_specs_json | jq -c 'sort_by(.chain_index)[]')
+done
 
 jq -e '
   (.chains | length) >= 2

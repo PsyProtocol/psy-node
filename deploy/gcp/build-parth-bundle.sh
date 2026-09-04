@@ -255,6 +255,6 @@ EOF
 
 mkdir -p "$OUT_DIR"
 tar -C "$tmp" -czf "$OUT_FILE" .
-echo "bundle build manifest:"
-cat "$tmp/BUILD-MANIFEST.env"
+echo "bundle build manifest:" >&2
+cat "$tmp/BUILD-MANIFEST.env" >&2
 echo "$OUT_FILE"

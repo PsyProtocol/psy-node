@@ -21,9 +21,35 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y ca-certificates curl jq nodejs npm
 
+preserved_network_deployments=""
+cleanup_preserved_network_deployments() {
+  if [ -n "$preserved_network_deployments" ]; then
+    rm -rf "$preserved_network_deployments"
+  fi
+}
+trap cleanup_preserved_network_deployments EXIT
+
+# The uploaded source intentionally excludes deployments. Preserve the current
+# network's Hardhat metadata when resuming so a transient RPC failure does not
+# cause already-mined contracts to be deployed again.
+if [ "$L1_DEPLOY_RESET" != "1" ] && [ "$L1_DEPLOY_RESET" != "true" ] \
+  && [ -d "$L1_CONTRACTS_HOME/deployments/$L1_DEPLOYMENTS_NETWORK" ]; then
+  preserved_network_deployments="$(mktemp -d)"
+  cp -a \
+    "$L1_CONTRACTS_HOME/deployments/$L1_DEPLOYMENTS_NETWORK" \
+    "$preserved_network_deployments/"
+fi
+
 rm -rf "$L1_CONTRACTS_HOME"
 install -d -m 0755 "$(dirname "$L1_CONTRACTS_HOME")"
 cp -a "$L1_CONTRACTS_UPLOAD" "$L1_CONTRACTS_HOME"
+
+if [ -n "$preserved_network_deployments" ]; then
+  install -d -m 0755 "$L1_CONTRACTS_HOME/deployments"
+  cp -a \
+    "$preserved_network_deployments/$L1_DEPLOYMENTS_NETWORK" \
+    "$L1_CONTRACTS_HOME/deployments/"
+fi
 
 cd "$L1_CONTRACTS_HOME"
 
@@ -131,8 +157,9 @@ if [ -n "$deployer_private_key" ]; then
 fi
 
 args=(npx hardhat deploy --network "$L1_DEPLOYMENTS_NETWORK")
+first_args=("${args[@]}")
 if [ "$L1_DEPLOY_RESET" = "1" ] || [ "$L1_DEPLOY_RESET" = "true" ]; then
-  args+=(--reset)
+  first_args+=(--reset)
 fi
 
 network_env_key="ETH_RPC_URL"
@@ -146,14 +173,43 @@ elif [ "$L1_DEPLOYMENTS_NETWORK" = "base-sepolia" ] || [ "$L1_DEPLOYMENTS_NETWOR
   network_env_key="BASE_SEPOLIA_RPC_URL"
 fi
 
-if [ -n "$deployer_private_key" ]; then
-  env "$network_env_key=$L1_RPC_URL" CHAIN_ID="$CHAIN_ID" \
-    PSY_INTERNAL_DEPLOY_FROM_KEYSTORE=1 \
-    PSY_INTERNAL_DEPLOY_PRIVATE_KEY="$deployer_private_key" \
-    "${args[@]}"
-else
-  env "$network_env_key=$L1_RPC_URL" CHAIN_ID="$CHAIN_ID" "${args[@]}"
-fi
+run_hardhat_deploy() {
+  if [ -n "$deployer_private_key" ]; then
+    env "$network_env_key=$L1_RPC_URL" CHAIN_ID="$CHAIN_ID" \
+      PSY_INTERNAL_DEPLOY_FROM_KEYSTORE=1 \
+      PSY_INTERNAL_DEPLOY_PRIVATE_KEY="$deployer_private_key" \
+      "$@"
+  else
+    env "$network_env_key=$L1_RPC_URL" CHAIN_ID="$CHAIN_ID" "$@"
+  fi
+}
+
+deploy_succeeded=0
+for attempt in 1 2 3; do
+  if [ "$attempt" = "1" ]; then
+    deploy_command=("${first_args[@]}")
+  else
+    # Never repeat --reset after a partial deployment. Hardhat can resume from
+    # the metadata written by the previous attempt once the RPC sees the tx.
+    deploy_command=("${args[@]}")
+  fi
+
+  if run_hardhat_deploy "${deploy_command[@]}"; then
+    deploy_succeeded=1
+    break
+  fi
+  if [ "$attempt" = "3" ]; then
+    break
+  fi
+  retry_delay="$((attempt * 15))"
+  echo "L1 deployment attempt $attempt failed; retrying without --reset in ${retry_delay}s" >&2
+  sleep "$retry_delay"
+done
+
+[ "$deploy_succeeded" = "1" ] || {
+  echo "L1 deployment failed after 3 attempts" >&2
+  exit 1
+}
 
 deployer_private_key=""
 

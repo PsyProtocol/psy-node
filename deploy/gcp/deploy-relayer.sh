@@ -223,9 +223,11 @@ upload_l1_deployment_artifacts() {
 upload_l1_deployments_artifacts() {
   local network
   if multichain_enabled; then
-    while IFS= read -r network; do
+    local -a networks=()
+    mapfile -t networks < <(jq -r '.[].deployments_network' <<<"$RELAYER_CHAINS_JSON")
+    for network in "${networks[@]}"; do
       upload_l1_deployment_artifacts "$network"
-    done < <(jq -r '.[].deployments_network' <<<"$RELAYER_CHAINS_JSON")
+    done
   else
     upload_l1_deployment_artifacts "$RELAYER_DEPLOYMENTS_NETWORK"
   fi

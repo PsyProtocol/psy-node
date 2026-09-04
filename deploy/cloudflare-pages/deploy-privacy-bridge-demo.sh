@@ -100,6 +100,8 @@ if multichain_enabled; then
   while IFS= read -r network; do
     source_deployment="$ROOT/psy-contracts/deployments/$network/deployed-contracts.json"
     target_deployment="$ROOT/psy-dapp/psy-contracts/deployments/$network/deployed-contracts.json"
+    public_rpc_url="$(multichain_runtime_json | jq -er --arg network "$network" \
+      '.chains[] | select(.network == $network) | "https://" + .public_rpc_domain')"
     [ -s "$source_deployment" ] || {
       echo "missing multichain deployment metadata: $source_deployment" >&2
       exit 1
@@ -110,6 +112,10 @@ if multichain_enabled; then
       touch "$multichain_deployment_backup_dir/$network/existed"
     fi
     cp "$source_deployment" "$target_deployment"
+    jq --arg rpc_url "$public_rpc_url" \
+      '.protocol.chain.defaultRpcUrl = $rpc_url' \
+      "$target_deployment" >"${target_deployment}.tmp"
+    mv "${target_deployment}.tmp" "$target_deployment"
   done < <(multichain_runtime_json | jq -r '.chains[].network')
 
   protocol_config_file="$ROOT/psy-dapp/psy-contracts/protocol-config/index.ts"
@@ -262,6 +268,10 @@ set_demo_env VITE_PSY_FAUCET_SERVER_MODE "$PSY_FAUCET_SERVER_MODE"
 set_demo_env VITE_PSY_FAUCET_TURNSTILE_SITE_KEY "${PSY_FAUCET_TURNSTILE_SITE_KEY:-}"
 if multichain_enabled; then
   multichain_export_frontend_rpc_urls
+  # config.env is loaded with `set -a`, so deployment-only values would
+  # otherwise be visible to the frontend build. Keep only the public per-chain
+  # RPC variables exported above and remove private upstream containers.
+  unset ETH_RPC_URL L1_RPC_URL MULTICHAIN_L1_CHAINS_JSON
 fi
 include_wallet_download
 

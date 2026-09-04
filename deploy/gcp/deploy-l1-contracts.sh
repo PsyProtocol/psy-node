@@ -105,6 +105,7 @@ command -v rsync >/dev/null 2>&1 || {
 run_remote_command "$NAME" "command -v rsync >/dev/null 2>&1 || sudo env DEBIAN_FRONTEND=noninteractive sh -lc 'apt-get update && apt-get install -y rsync'" >/dev/null
 run_remote_command "$NAME" "rm -rf '$REMOTE_CONTRACTS_UPLOAD'"
 rsync -az --checksum --human-readable --progress \
+  --exclude .git \
   --exclude node_modules \
   --exclude cache \
   --exclude artifacts \
