@@ -1,0 +1,22 @@
+[package]
+name = "psy_cli_full_e2e"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "psy-cli-full-e2e"
+path = "src/main.rs"
+
+[dependencies]
+alloy-signer = { workspace = true }
+alloy-signer-local = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+hex = { workspace = true }
+libc = "0.2"
+rand = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }

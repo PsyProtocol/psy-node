@@ -52,6 +52,7 @@ members = [
     "client_prover/psy_circuit/psy_ups_circuit",
     "client_prover/psy_circuit/psy_dpn_circuit",
     "client_prover/psy_cli/psy_user_cli",
+    "e2e/cli-full-e2e",
 ]
 resolver = "2"
 

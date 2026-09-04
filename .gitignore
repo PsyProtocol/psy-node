@@ -72,6 +72,7 @@ client_prover/contract_call.json
 /client_prover/psy_ide/frontend/playwright-report/
 /diagram-output/
 /output/
+/.private/
 psy-contracts/test/deployments/
 BUG.md
 # Generated ts-rs bindings.
