@@ -77,7 +77,7 @@ RUN curl -fsSL "https://go.dev/dl/go\${GO_VERSION}.linux-amd64.tar.gz" \\
   | tar -C /usr/local -xz
 
 ENV PATH="/usr/local/go/bin:/usr/local/cargo/bin:\${PATH}"
-RUN rustup toolchain install nightly --profile minimal
+RUN rustup toolchain install nightly --profile minimal --component rust-src
 
 WORKDIR /work
 EOF
