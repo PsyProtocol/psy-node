@@ -168,4 +168,16 @@ MULTICHAIN_L1_ENABLED=1 PUBLIC_L1_RPC_DOMAIN="" PUBLIC_RPC_DOMAIN="" \
   bash -c 'source "$1"; set_public_domain_defaults; [ -z "$PUBLIC_L1_RPC_DOMAIN" ] && [ -z "$PUBLIC_RPC_DOMAIN" ]' \
   _ "$REPO_ROOT/deploy/gcp/lib/public-domains.sh"
 
+if sed -n '/for name in SEPOLIA_RPC_URL/,/done/p' \
+  "$REPO_ROOT/deploy/multi-chain/gcp/preflight.sh" \
+  | grep -q 'ENVIO_API_TOKEN'; then
+  echo "multichain preflight must not require an Envio token for direct RPC mode" >&2
+  exit 1
+fi
+grep -q 'any(.\[\]; .use_hypersync == true)' \
+  "$REPO_ROOT/deploy/multi-chain/gcp/preflight.sh" || {
+  echo "multichain preflight lost its conditional HyperSync token check" >&2
+  exit 1
+}
+
 echo "[ok] multichain runtime drives Envio, psy-services, relayer, public config, and Caddy"

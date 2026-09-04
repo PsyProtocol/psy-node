@@ -49,7 +49,7 @@ expected_chain_matrix='[["sepolia",11155111,0],["bscTestnet",97,1],["baseSepolia
   || fail "chain registry must be sepolia=0, bscTestnet=1, baseSepolia=2; got $actual_chain_matrix"
 
 for name in SEPOLIA_RPC_URL BSC_TESTNET_RPC_URL BASE_SEPOLIA_RPC_URL \
-  ENVIO_API_TOKEN L1_DEPLOYER_ADDRESS L1_DEPLOYER_KEYSTORE_PATH \
+  L1_DEPLOYER_ADDRESS L1_DEPLOYER_KEYSTORE_PATH \
   L1_DEPLOYER_WALLET_PASSWORD POSTGRES_PASSWORD HASURA_GRAPHQL_ADMIN_SECRET \
   PSY_JWT_SECRET CLIENT_PROVE_PROXY_URL PUBLIC_PROVE_PROXY_UPSTREAM; do
   [ -n "${!name:-}" ] || fail "$name is required"
