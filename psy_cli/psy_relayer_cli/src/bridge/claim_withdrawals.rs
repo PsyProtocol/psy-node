@@ -634,9 +634,24 @@ pub async fn submit_batch(
         );
         if token_addr != Address::ZERO {
             if !bridge_erc20_liquidity_remaining.contains_key(&token_addr) {
-                let balance = erc20_balance_of(&provider, token_addr, bridge)
-                    .await
-                    .with_context(|| format!("failed to read bridge ERC20 liquidity for token {token_addr}"))?;
+                let balance = match erc20_balance_of(&provider, token_addr, bridge).await {
+                    Ok(balance) => balance,
+                    Err(err) => {
+                        let reason = format!(
+                            "failed to read bridge ERC20 liquidity for token {token_addr}: {err}"
+                        );
+                        failure_reasons.insert(w.leaf_hash.clone(), reason);
+                        tracing::error!(
+                            index = i,
+                            recipient = %recipient_addr,
+                            token = %token_addr,
+                            leaf_hash = %w.leaf_hash,
+                            error = %err,
+                            "failed to read bridge ERC20 liquidity; deferring only this withdrawal"
+                        );
+                        continue;
+                    }
+                };
                 bridge_erc20_liquidity_remaining.insert(token_addr, balance);
             }
             let remaining = bridge_erc20_liquidity_remaining

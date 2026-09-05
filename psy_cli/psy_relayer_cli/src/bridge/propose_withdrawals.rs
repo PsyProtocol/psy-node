@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::{collections::BTreeMap, time::{Duration, Instant}};
 
 use clap::Args;
 use parth_core::pgoldilocks::QHashOut;
@@ -265,15 +265,50 @@ async fn fetch_bridge_withdrawals(
     http: &reqwest::Client,
     base_url: &str,
     initial_event_offset: u64,
+    destination_chain_indexes: &[u64],
 ) -> anyhow::Result<Vec<BridgeWithdrawalEntry>> {
-    let mut all_withdrawals: Vec<BridgeWithdrawalEntry> = Vec::new();
-    let limit: u32 = 10_000;
+    let chain_filters = if destination_chain_indexes.is_empty() {
+        vec![None]
+    } else {
+        destination_chain_indexes.iter().copied().map(Some).collect()
+    };
+    let mut withdrawals_by_event = BTreeMap::new();
+
+    for destination_chain_index in chain_filters {
+        for withdrawal in fetch_bridge_withdrawals_for_chain(
+            http,
+            base_url,
+            initial_event_offset,
+            destination_chain_index,
+        )
+        .await?
+        {
+            withdrawals_by_event.insert(withdrawal.event_id, withdrawal);
+        }
+    }
+
+    Ok(withdrawals_by_event.into_values().collect())
+}
+
+async fn fetch_bridge_withdrawals_for_chain(
+    http: &reqwest::Client,
+    base_url: &str,
+    initial_event_offset: u64,
+    destination_chain_index: Option<u64>,
+) -> anyhow::Result<Vec<BridgeWithdrawalEntry>> {
+    let mut all_withdrawals = Vec::new();
+    // psy-services caps this endpoint at 1,000 rows even if a larger limit is
+    // requested. Advance by that server-side page size so a busy withdrawal
+    // stream cannot be truncated silently.
+    let limit: u32 = 1_000;
     let mut offset: u64 = initial_event_offset;
 
     loop {
-        let url = format!(
-            "{}/api/v1/bridge/withdrawals?limit={}&offset={}",
-            base_url, limit, offset,
+        let url = bridge_withdrawals_url(
+            base_url,
+            limit,
+            offset,
+            destination_chain_index,
         );
         tracing::debug!(url = %url, "fetching bridge withdrawals page");
 
@@ -308,16 +343,33 @@ async fn fetch_bridge_withdrawals(
         }
 
         let data = resp.data.ok_or_else(|| anyhow::anyhow!("psy-services returned success but no data"))?;
-        let page_len = data.withdrawals.len() as u64;
         all_withdrawals.extend(data.withdrawals);
 
-        if page_len < limit as u64 || all_withdrawals.len() as i64 >= data.total {
+        let total = u64::try_from(data.total.max(0)).unwrap_or(u64::MAX);
+        let next_offset = offset.saturating_add(u64::from(limit));
+        if next_offset >= total {
             break;
         }
-        offset += page_len;
+        offset = next_offset;
     }
 
     Ok(all_withdrawals)
+}
+
+fn bridge_withdrawals_url(
+    base_url: &str,
+    limit: u32,
+    offset: u64,
+    destination_chain_index: Option<u64>,
+) -> String {
+    let mut url = format!(
+        "{}/api/v1/bridge/withdrawals?limit={}&offset={}",
+        base_url, limit, offset,
+    );
+    if let Some(chain_index) = destination_chain_index {
+        url.push_str(&format!("&destination_chain_index={chain_index}"));
+    }
+    url
 }
 
 async fn fetch_services_latest_checkpoint(http: &reqwest::Client, base_url: &str) -> anyhow::Result<u64> {
@@ -449,12 +501,34 @@ pub async fn fetch_pending_bridge_withdrawals(
     _to_checkpoint_exclusive: u64,
     initial_event_offset: u64,
 ) -> anyhow::Result<Vec<PendingWithdrawal>> {
+    fetch_pending_bridge_withdrawals_for_chains(
+        args,
+        _from_checkpoint,
+        _to_checkpoint_exclusive,
+        initial_event_offset,
+        &[],
+    )
+    .await
+}
+
+pub async fn fetch_pending_bridge_withdrawals_for_chains(
+    args: &ProposeWithdrawalsArgs,
+    _from_checkpoint: u64,
+    _to_checkpoint_exclusive: u64,
+    initial_event_offset: u64,
+    destination_chain_indexes: &[u64],
+) -> anyhow::Result<Vec<PendingWithdrawal>> {
     let psy_config = psy_config::PsyConfigGoldilocks::from_file(&args.rpc_config)?;
     let http = build_default_http_client()?;
     let services_url = resolve_services_url(&args.services_url, &psy_config)?;
 
-    let mut service_withdrawals =
-        fetch_bridge_withdrawals(&http, &services_url, initial_event_offset).await?;
+    let mut service_withdrawals = fetch_bridge_withdrawals(
+        &http,
+        &services_url,
+        initial_event_offset,
+        destination_chain_indexes,
+    )
+    .await?;
     service_withdrawals.sort_by_key(|w| w.event_id);
     tracing::info!(
         bridge_withdrawals = service_withdrawals.len(),
@@ -796,5 +870,17 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn multichain_withdrawal_query_selects_destination_chain() {
+        assert_eq!(
+            bridge_withdrawals_url("https://services.example", 1_000, 42, Some(2)),
+            "https://services.example/api/v1/bridge/withdrawals?limit=1000&offset=42&destination_chain_index=2"
+        );
+        assert_eq!(
+            bridge_withdrawals_url("https://services.example", 1_000, 42, None),
+            "https://services.example/api/v1/bridge/withdrawals?limit=1000&offset=42"
+        );
     }
 }
