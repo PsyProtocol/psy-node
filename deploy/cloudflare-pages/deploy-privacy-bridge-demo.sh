@@ -43,7 +43,7 @@ if ! is_truthy "$PSY_FAUCET_SERVER_MODE" \
 fi
 
 l1_network="${L1_DEPLOYMENTS_NETWORK:-sepolia}"
-deployment_file="$ROOT/psy-dapp/psy-contracts/deployments/$l1_network/deployed-contracts.json"
+deployment_file="$PSY_DAPP_DIR/psy-contracts/deployments/$l1_network/deployed-contracts.json"
 deployment_backup="$(mktemp)"
 deployment_existed=0
 multichain_deployment_backup_dir=""
@@ -78,7 +78,7 @@ cleanup_frontend_source() {
   fi
   if [ -n "$multichain_deployment_backup_dir" ]; then
     while IFS= read -r network; do
-      target_deployment="$ROOT/psy-dapp/psy-contracts/deployments/$network/deployed-contracts.json"
+      target_deployment="$PSY_DAPP_DIR/psy-contracts/deployments/$network/deployed-contracts.json"
       if [ -f "$multichain_deployment_backup_dir/$network/existed" ]; then
         cp "$multichain_deployment_backup_dir/$network/deployed-contracts.json" "$target_deployment"
       else
@@ -99,7 +99,7 @@ if multichain_enabled; then
   multichain_deployment_backup_dir="$(mktemp -d)"
   while IFS= read -r network; do
     source_deployment="$ROOT/psy-contracts/deployments/$network/deployed-contracts.json"
-    target_deployment="$ROOT/psy-dapp/psy-contracts/deployments/$network/deployed-contracts.json"
+    target_deployment="$PSY_DAPP_DIR/psy-contracts/deployments/$network/deployed-contracts.json"
     public_rpc_url="$(multichain_runtime_json | jq -er --arg network "$network" \
       '.chains[] | select(.network == $network) | "https://" + .public_rpc_domain')"
     [ -s "$source_deployment" ] || {
@@ -118,7 +118,7 @@ if multichain_enabled; then
     mv "${target_deployment}.tmp" "$target_deployment"
   done < <(multichain_runtime_json | jq -r '.chains[].network')
 
-  protocol_config_file="$ROOT/psy-dapp/psy-contracts/protocol-config/index.ts"
+  protocol_config_file="$PSY_DAPP_DIR/psy-contracts/protocol-config/index.ts"
   [ -s "$protocol_config_file" ] || {
     echo "missing frontend protocol config: $protocol_config_file" >&2
     exit 1
