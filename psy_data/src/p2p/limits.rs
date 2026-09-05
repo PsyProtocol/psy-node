@@ -71,9 +71,6 @@ pub const MAX_VALIDATORS_PER_REALM: usize = 64;
 /// Minimum occupied validators per Realm.
 pub const MIN_VALIDATORS_PER_REALM: usize = 1;
 
-/// Maximum in-flight proposals retained per Realm.
-pub const MAX_IN_FLIGHT_PROPOSALS: usize = 2;
-
 /// Maximum checkpoints between a proposal's proof base and coordinator inclusion.
 pub const MAX_INCLUSION_LAG_CHECKPOINTS: u64 = 16;
 
@@ -82,9 +79,6 @@ pub const MAX_CONCURRENT_DIRECT_EXCHANGES: usize = 64;
 
 /// Direct request exchange timeout (seconds).
 pub const DIRECT_REQUEST_TIMEOUT_SECS: u64 = 30;
-
-/// Proposal reassembly timeout (seconds).
-pub const PROPOSAL_REASSEMBLY_TIMEOUT_SECS: u64 = 1_800;
 
 /// Maintenance tick interval (seconds).
 pub const MAINTENANCE_TICK_SECS: u64 = 5;
