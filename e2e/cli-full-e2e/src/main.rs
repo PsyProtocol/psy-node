@@ -1679,8 +1679,9 @@ impl Runner {
 
     fn poll_withdrawal(&self, user_id: u64, nonce: &str, token: &Token) -> Result<Value> {
         let url = format!(
-            "{}/api/v1/get/bridge/withdrawals?user_id={user_id}&limit=50",
-            self.network.services.trim_end_matches('/')
+            "{}/api/v1/get/bridge/withdrawals?user_id={user_id}&destination_chain_index={}&limit=50",
+            self.network.services.trim_end_matches('/'),
+            self.l1_chain_index,
         );
         let normalized_nonce = nonce.to_ascii_lowercase();
         let normalized_token = normalize_address(&token.l1_address);
