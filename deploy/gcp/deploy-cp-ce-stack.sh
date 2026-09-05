@@ -5,6 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/lib/common.sh"
 # shellcheck source=lib/psy-services-nostr.sh
 source "$SCRIPT_DIR/lib/psy-services-nostr.sh"
+# shellcheck source=lib/multichain.sh
+source "$SCRIPT_DIR/lib/multichain.sh"
 
 if [ -z "${PARTH_BUNDLE:-}" ]; then
   PARTH_BUNDLE="$(bash "$SCRIPT_DIR/build-parth-bundle.sh")"
@@ -25,6 +27,11 @@ ENVIO_HOST="${ENVIO_HOST:-$(instance_internal_dns "${ENVIO_VM_NAME:-${POSTGRES_V
 PSY_SERVICES_DATABASE_URL="${PSY_SERVICES_DATABASE_URL:-$(postgres_url "$POSTGRES_HOST" 5432 "${PSY_SERVICES_DATABASE_NAME:-psy_services}")}"
 PSY_SERVICES_URL="${PSY_SERVICES_URL:-http://${NODE_HOST}:${PSY_SERVICES_PORT}}"
 COORDINATOR_EDGE_URL="${COORDINATOR_API_URLS:-http://${NODE_HOST}:${COORDINATOR_EDGE_PORT}}"
+INDEXER_GRAPHQL_URL="${INDEXER_GRAPHQL_URL:-http://${ENVIO_HOST}:${HASURA_EXTERNAL_PORT:-18080}/v1/graphql}"
+PSY_L1_CHAINS="${PSY_L1_CHAINS:-}"
+if multichain_enabled; then
+  PSY_L1_CHAINS="$(multichain_services_l1_json)"
+fi
 
 resolve_psy_services_nostr_config
 
@@ -152,11 +159,12 @@ deploy_parth_service "$NAME" "psy-services" "deploy-psy-services" "parth-psy-ser
   "PSY_NOSTR_LOOKBACK_SECONDS=$PSY_NOSTR_LOOKBACK_SECONDS" \
   "PSY_GENESIS_PATH=${PSY_GENESIS_PATH:-}" \
   "PSY_GENESIS_USERS_PATH=${PSY_GENESIS_USERS_PATH:-}" \
-  "INDEXER_GRAPHQL_URL=${INDEXER_GRAPHQL_URL:-http://${ENVIO_HOST}:${HASURA_EXTERNAL_PORT:-18080}/v1/graphql}" \
+  "INDEXER_GRAPHQL_URL=$INDEXER_GRAPHQL_URL" \
   "HASURA_GRAPHQL_ADMIN_SECRET=${HASURA_GRAPHQL_ADMIN_SECRET:-testing}" \
   "PSY_NODE_URL=${PSY_NODE_URL:-http://${NODE_HOST}:${COORDINATOR_EDGE_PORT}}" \
   "L1_RPC_URL=${L1_RPC_URL:-${ETH_RPC_URL:-}}" \
-  "STATE_MANAGER_ADDRESS=${STATE_MANAGER_ADDRESS:-}"
+  "STATE_MANAGER_ADDRESS=${STATE_MANAGER_ADDRESS:-}" \
+  "PSY_L1_CHAINS=$PSY_L1_CHAINS"
 run_health_check "$NAME" "ports" \
   "HEALTHCHECK_PORTS=${PSY_SERVICES_HEALTHCHECK_PORTS:-$PSY_SERVICES_PORT}" \
   "HEALTHCHECK_HTTP_URLS=${PSY_SERVICES_HEALTHCHECK_HTTP_URLS:-http://127.0.0.1:${PSY_SERVICES_PORT}/health}" \

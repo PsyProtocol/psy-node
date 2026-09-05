@@ -72,6 +72,15 @@ jq -e '.chains | map(.chain_index) == [0,1,2] and map(.start_block) == [100,200,
   <<<"$envio_json" >/dev/null
 jq -e 'map(.chain_index) == [0,1,2] and all(.[]; .graphql_url == "http://10.0.0.3:18080/v1/graphql")' \
   <<<"$services_json" >/dev/null
+
+cp_ce_script="$REPO_ROOT/deploy/gcp/deploy-cp-ce-stack.sh"
+grep -Fq 'source "$SCRIPT_DIR/lib/multichain.sh"' "$cp_ce_script" \
+  || { echo "cp-ce stack does not load the multichain helpers" >&2; exit 1; }
+grep -Fq 'PSY_L1_CHAINS="$(multichain_services_l1_json)"' "$cp_ce_script" \
+  || { echo "cp-ce stack does not render the psy-services L1 registry" >&2; exit 1; }
+grep -Fq '"PSY_L1_CHAINS=$PSY_L1_CHAINS"' "$cp_ce_script" \
+  || { echo "cp-ce stack does not pass the L1 registry to psy-services" >&2; exit 1; }
+
 jq -e 'map(.chain_index) == [0,1,2] and all(.[]; (.rpc_urls | length) == 1)' \
   <<<"$relayer_json" >/dev/null
 jq -e 'map(.rpc_url) == ["https://rpc-eth-stg.example.test","https://rpc-bsc-stg.example.test","https://rpc-base-stg.example.test"]' \
