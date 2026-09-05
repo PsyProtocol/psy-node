@@ -2434,11 +2434,16 @@ async fn build_multichain_l2_plan(
         let global_count = provider
             .get_withdrawal_tree_global_count(checkpoint, BRIDGE_USER_ID_U64)
             .await?;
-        propose_withdrawals::fetch_pending_bridge_withdrawals(
+        let destination_chain_indexes = chains
+            .iter()
+            .map(|chain| u64::from(chain.chain_index))
+            .collect::<Vec<_>>();
+        propose_withdrawals::fetch_pending_bridge_withdrawals_for_chains(
             propose_args,
             from_checkpoint.max(1),
             to_checkpoint.saturating_add(1),
             global_count,
+            &destination_chain_indexes,
         ).await?
     } else {
         Vec::new()
