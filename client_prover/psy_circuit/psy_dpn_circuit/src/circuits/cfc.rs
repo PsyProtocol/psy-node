@@ -164,3 +164,137 @@ where
         self.prove_standard(input)
     }
 }
+
+#[cfg(test)]
+mod ucon_leaf_prove_tests {
+    use super::*;
+    use plonky2::{
+        field::goldilocks_field::GoldilocksField,
+        field::types::Field,
+        hash::poseidon::PoseidonHash,
+        plonk::config::PoseidonGoldilocksConfig,
+    };
+    use psy_client_common::data::qhashout::QHashOut;
+    use psy_client_data::dpn::{
+        cfc_context_input::{
+            DapenCFCProvingSessionStartContext, DapenCFCUserTransactionCallStartContext, DapenCFCUserTransactionEndContext,
+            DapenCFCUserTransactionInputContext,
+        },
+        proving_session::DPNProvingSessionCompactMethodCall,
+    };
+    use psy_client_data::qdata::{
+        checkpoint::{PsyCheckpointGlobalStateRoots, PsyCheckpointLeaf},
+        user::PsyUserLeaf,
+    };
+    use psy_config::network_constants::{DEFERRED_TRANSACTION_TREE_HEIGHT, GLOBAL_CONTRACT_TREE_HEIGHT, UPS_SESSION_PROOF_TREE_HEIGHT};
+    use psy_crypto::hash::{
+        merkle::core::MerkleProofCore,
+        traits::hasher::{FieldQHasher, MerkleZeroHasher},
+        traits::qhashable::QFieldHashable,
+        utils::safe_hash_fixed_length,
+    };
+
+    const D: usize = 2;
+
+    type F = GoldilocksField;
+    type C = PoseidonGoldilocksConfig;
+    type Hasher = <C as GenericConfig<D>>::Hasher;
+
+    const CONTRACT_STATE_TREE_HEIGHT: usize = 31;
+    const UCON_LEAF_INDEX: u64 = 5;
+
+    /// UCON proof for an untouched leaf in an otherwise empty user contract tree:
+    /// every sibling is the level's zero hash, so the root folds from `value` alone.
+    fn ucon_proof(value: QHashOut<F>) -> MerkleProofCore<QHashOut<F>> {
+        let siblings: Vec<QHashOut<F>> = (0..GLOBAL_CONTRACT_TREE_HEIGHT as usize).map(|i| PoseidonHash::get_zero_hash(i)).collect();
+        MerkleProofCore::new_from_params::<PoseidonHash>(UCON_LEAF_INDEX, value, siblings)
+    }
+
+    /// Full fn_circuit input for a first-ever call on contract 5 with no state commands.
+    /// `start_contract_state_root` mirrors get_call_start_data: the empty-tree root of the
+    /// contract's height when the UCON leaf is still ZERO (proving_session.rs ZERO branch).
+    fn prove_input(uct_leaf_value: QHashOut<F>, start_contract_state_root: QHashOut<F>) -> DapenContractFunctionCircuitInput<F> {
+        let state_roots = PsyCheckpointGlobalStateRoots::default();
+        let mut checkpoint_leaf = PsyCheckpointLeaf::default();
+        checkpoint_leaf.global_chain_root = state_roots.qfhash::<PoseidonHash>();
+        let empty_data_hash = safe_hash_fixed_length::<PoseidonHash, F>(&[]);
+        let empty_debt_root = PoseidonHash::get_zero_hash(DEFERRED_TRANSACTION_TREE_HEIGHT as usize);
+
+        DapenContractFunctionCircuitInput {
+            inputs: vec![],
+            outputs: vec![],
+            events: vec![],
+            cmd_witnesses: vec![],
+            session_proof_tree_root: QHashOut::ZERO,
+            current_contract_proof: ucon_proof(uct_leaf_value),
+            tx_input_ctx: DapenCFCUserTransactionInputContext {
+                proving_session_start_ctx: DapenCFCProvingSessionStartContext {
+                    checkpoint_id: F::ZERO,
+                    checkpoint_tree_root: QHashOut::ZERO,
+                    checkpoint_leaf,
+                    state_roots,
+                    start_session_user_leaf: PsyUserLeaf::default(),
+                },
+                transaction_call_start_ctx: DapenCFCUserTransactionCallStartContext {
+                    start_user_contract_tree_root: ucon_proof(uct_leaf_value).root,
+                    start_contract_state_tree_root: start_contract_state_root,
+                    call_data: DPNProvingSessionCompactMethodCall {
+                        caller_contract_id: F::ZERO,
+                        contract_id: F::from_canonical_u64(UCON_LEAF_INDEX),
+                        method_id: F::from_canonical_u64(3375543263),
+                        inputs_length: F::ZERO,
+                        inputs_hash: empty_data_hash,
+                    },
+                    start_deferred_tx_debt_tree_root: empty_debt_root,
+                    start_user_balance: F::ZERO,
+                    start_user_event_index: F::ZERO,
+                },
+                transaction_end_ctx: DapenCFCUserTransactionEndContext {
+                    end_contract_state_tree_root: start_contract_state_root,
+                    end_deferred_tx_debt_tree_root: empty_debt_root,
+                    outputs_hash: empty_data_hash,
+                    outputs_length: F::ZERO,
+                    total_events_emitted: F::ZERO,
+                    total_balance_spent: F::ZERO,
+                },
+            },
+        }
+    }
+
+    fn empty_fn_def() -> DPNFunctionCircuitDefinition {
+        DPNFunctionCircuitDefinition {
+            name: "ucon_leaf_probe".to_string(),
+            method_id: 3375543263,
+            circuit_inputs: Vec::new(),
+            circuit_outputs: Vec::new(),
+            state_commands: Vec::new(),
+            state_command_resolution_indices: Vec::new(),
+            assertions: Vec::new(),
+            definitions: Vec::new(),
+            events: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn uninitialized_ucon_leaf_fn_circuit_proves() {
+        let fn_def = empty_fn_def();
+        let circuit = DapenContractFunctionCircuit::<C, D>::new(&fn_def, CONTRACT_STATE_TREE_HEIGHT, UPS_SESSION_PROOF_TREE_HEIGHT as usize, false);
+        let start_root = PoseidonHash::get_zero_hash(CONTRACT_STATE_TREE_HEIGHT);
+        // UCON leaf ZERO (never-initialized contract): the start root is the default
+        // empty-tree root, exactly the combination that failed with "set twice" before
+        // the is-zero switch (zero_hash(31)[0] == 8603459983426387388).
+        let input = prove_input(QHashOut::ZERO, start_root);
+        circuit.prove_base(&input).expect("empty-UCON-leaf fn_circuit must prove");
+    }
+
+    #[test]
+    fn initialized_ucon_leaf_fn_circuit_proves() {
+        let fn_def = empty_fn_def();
+        let circuit = DapenContractFunctionCircuit::<C, D>::new(&fn_def, CONTRACT_STATE_TREE_HEIGHT, UPS_SESSION_PROOF_TREE_HEIGHT as usize, false);
+        let start_root = PoseidonHash::get_zero_hash(CONTRACT_STATE_TREE_HEIGHT);
+        // Initialized contract: the UCON leaf value IS the start contract state root.
+        let input = prove_input(start_root, start_root);
+        circuit.prove_base(&input).expect("initialized-UCON-leaf fn_circuit must prove");
+    }
+
+}

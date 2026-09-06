@@ -1,9 +1,9 @@
 use std::fmt::Debug;
 
 use plonky2::{
-    field::extension::Extendable,
+    field::{extension::Extendable, goldilocks_field::GoldilocksField, types::PrimeField64},
     hash::{
-        hash_types::{HashOutTarget, RichField},
+        hash_types::{HashOut, HashOutTarget, RichField},
         poseidon::PoseidonHash,
     },
     iop::{
@@ -12,9 +12,13 @@ use plonky2::{
     },
     plonk::circuit_builder::CircuitBuilder,
 };
+use psy_common_circuit::builder::{
+    comparison::CircuitBuilderComparison, connect::CircuitBuilderConnectHelpers, hash::core::CircuitBuilderHashCore,
+};
 use psy_common_circuit::hash::merkle::gadgets::merkle_proof::MerkleProofGadget;
 use psy_common_circuit::traits::CreatableTarget;
 use psy_config::network_constants::{GLOBAL_CONTRACT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT};
+use psy_crypto::hash::traits::hasher::MerkleZeroHasher;
 use psy_network_circuit::gadgets::qdata::{user::PsyUserLeafGadget, user_contract_state::UserContractStateGadget};
 use psy_network_circuit::gadgets::qdata::{checkpoint::PsyCheckpointLeafGadget, checkpoint_state_roots::PsyCheckpointGlobalStateRootsGadget};
 use psy_vm::dpn::ops::state_cmd::data::{
@@ -99,7 +103,24 @@ impl<F: RichField + Extendable<D>, const D: usize> StateReaderGadget<F, D> {
         let contract_proof = MerkleProofGadget::add_virtual_to::<PoseidonHash, F, D>(builder, GLOBAL_CONTRACT_TREE_HEIGHT as usize);
         builder.connect_hashes(contract_proof.root, self.state.user_leaf.user_state_tree_root);
         builder.connect(contract_proof.index, self.state.contract_id);
-        builder.connect_hashes(contract_proof.value, self.state.start_contract_state_root);
+        // Uninitialized UCON leaf (ZERO): start root is empty-tree root at CST height, not the leaf.
+        let default_zh =
+            <PoseidonHash as MerkleZeroHasher<HashOut<GoldilocksField>>>::get_zero_hash(self.contract_state_tree_height as usize);
+        let default_contract_state_root = builder.constant_hash(HashOut {
+            elements: [
+                F::from_canonical_u64(default_zh.elements[0].to_canonical_u64()),
+                F::from_canonical_u64(default_zh.elements[1].to_canonical_u64()),
+                F::from_canonical_u64(default_zh.elements[2].to_canonical_u64()),
+                F::from_canonical_u64(default_zh.elements[3].to_canonical_u64()),
+            ],
+        });
+        let is_first_cst_update = builder.is_zero_hash(contract_proof.value);
+        builder.connect_hashes_switch(
+            is_first_cst_update,
+            self.state.start_contract_state_root,
+            default_contract_state_root,
+            contract_proof.value,
+        );
         self.merkel_proofs.push(contract_proof);
         let merkle_proof_gadget = MerkleProofGadget::add_virtual_to::<PoseidonHash, F, D>(builder, self.contract_state_tree_height as usize);
         builder.connect_hashes(merkle_proof_gadget.root, self.state.start_contract_state_root);
@@ -213,7 +234,24 @@ impl<F: RichField + Extendable<D>, const D: usize> StateReaderGadget<F, D> {
         builder.connect(uct_proof.index, expected_contract_id);
 
         let slot_proof = MerkleProofGadget::add_virtual_to::<PoseidonHash, F, D>(builder, contract_state_tree_height as usize);
-        builder.connect_hashes(slot_proof.root, uct_proof.value);
+        // Uninitialized UCON leaf (ZERO): CST proofs root at empty-tree hash, not the leaf.
+        let default_zh =
+            <PoseidonHash as MerkleZeroHasher<HashOut<GoldilocksField>>>::get_zero_hash(contract_state_tree_height as usize);
+        let default_contract_state_root = builder.constant_hash(HashOut {
+            elements: [
+                F::from_canonical_u64(default_zh.elements[0].to_canonical_u64()),
+                F::from_canonical_u64(default_zh.elements[1].to_canonical_u64()),
+                F::from_canonical_u64(default_zh.elements[2].to_canonical_u64()),
+                F::from_canonical_u64(default_zh.elements[3].to_canonical_u64()),
+            ],
+        });
+        let is_first_cst_update = builder.is_zero_hash(uct_proof.value);
+        builder.connect_hashes_switch(
+            is_first_cst_update,
+            slot_proof.root,
+            default_contract_state_root,
+            uct_proof.value,
+        );
         let expected_slot_index = builder.constant(slot_index);
         builder.connect(slot_proof.index, expected_slot_index);
 
@@ -361,7 +399,24 @@ impl<F: RichField + Extendable<D>, const D: usize> StateReaderGadget<F, D> {
         builder.connect(uct_proof.index, expected_contract_id);
 
         let slot_proof = MerkleProofGadget::add_virtual_to::<PoseidonHash, F, D>(builder, contract_state_tree_height as usize);
-        builder.connect_hashes(slot_proof.root, uct_proof.value);
+        // Uninitialized UCON leaf (ZERO): CST proofs root at empty-tree hash, not the leaf.
+        let default_zh =
+            <PoseidonHash as MerkleZeroHasher<HashOut<GoldilocksField>>>::get_zero_hash(contract_state_tree_height as usize);
+        let default_contract_state_root = builder.constant_hash(HashOut {
+            elements: [
+                F::from_canonical_u64(default_zh.elements[0].to_canonical_u64()),
+                F::from_canonical_u64(default_zh.elements[1].to_canonical_u64()),
+                F::from_canonical_u64(default_zh.elements[2].to_canonical_u64()),
+                F::from_canonical_u64(default_zh.elements[3].to_canonical_u64()),
+            ],
+        });
+        let is_first_cst_update = builder.is_zero_hash(uct_proof.value);
+        builder.connect_hashes_switch(
+            is_first_cst_update,
+            slot_proof.root,
+            default_contract_state_root,
+            uct_proof.value,
+        );
         builder.connect(slot_proof.index, expected_slot_index);
 
         let value = slot_proof.value.clone();

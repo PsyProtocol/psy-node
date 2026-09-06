@@ -5,7 +5,10 @@ use plonky2::{
     plonk::{circuit_builder::CircuitBuilder, config::AlgebraicHasher},
 };
 use psy_common_circuit::{
-    builder::{core::CircuitBuilderHelpersCore, hash::core::CircuitBuilderHashCore},
+    builder::{
+        comparison::CircuitBuilderComparison, connect::CircuitBuilderConnectHelpers, core::CircuitBuilderHelpersCore,
+        hash::core::CircuitBuilderHashCore,
+    },
     u32::multiple_comparison::list_lte_circuit,
 };
 use psy_network_circuit::gadgets::qdata::cfc_context_input::DapenCFCUserTransactionInputContextGadget;
@@ -64,9 +67,19 @@ impl PsyContractFunctionBuilderGadget {
         let contract_proof = MerkleProofGadget::add_virtual_to::<H, F, D>(builder, GLOBAL_CONTRACT_TREE_HEIGHT as usize);
         builder.connect_hashes(contract_proof.root, tx_ctx_header.transaction_call_start_ctx.start_user_contract_tree_root);
         builder.connect(contract_proof.index, tx_ctx_header.transaction_call_start_ctx.call_data.contract_id);
-        builder.connect_hashes(contract_proof.value, state_reader.start_contract_state_root);
+        // An uninitialized UCON leaf (value ZERO) means the contract state tree was never
+        // touched: the start root is the empty-tree root of the contract's height, not the
+        // leaf value. Mirror the UPS-layer switch (ups_standard_cfc_state_delta.rs) so
+        // first-touch CFCs (e.g. faucet claims) don't fail PartitionWitness "set twice".
+        let default_contract_state_root = builder.constant_hash(H::get_zero_hash(contract_state_tree_height));
+        let is_first_cst_update = builder.is_zero_hash(contract_proof.value);
+        builder.connect_hashes_switch(
+            is_first_cst_update,
+            state_reader.start_contract_state_root,
+            default_contract_state_root,
+            contract_proof.value,
+        );
         state_reader.current_contract_proof = Some(contract_proof);
-
         let mut g = Self {
             cmd_results: Vec::new(),
             state_reader,
