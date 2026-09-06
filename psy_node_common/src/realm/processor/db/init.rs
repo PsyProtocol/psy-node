@@ -798,10 +798,6 @@ where
         self.state.processing_realm_end_root = current_realm_root;
         self.state.gathering_realm_start_root = current_realm_root;
 
-        self.checkpoint_tree_backup_manager
-            .sync_from_coordinator_client::<CoordinatorClient, N::F>(&self.coordinator_client, 2000)
-            .await?;
-
         let head_checkpoint_id = self.checkpoint_tree_backup_manager.get_current_checkpoint_id_head();
         let head_checkpoint_root = self.checkpoint_tree_backup_manager.get_current_checkpoint_tree_root_head();
 

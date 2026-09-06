@@ -150,6 +150,19 @@ where
         self.checkpoint_tree_backup_manager
             .sync_from_coordinator_client::<CoordinatorClient, N::F>(&self.coordinator_client, 2000)
             .await?;
+
+        let latest_synced_checkpoint_id = self.checkpoint_tree_backup_manager.get_current_checkpoint_id_head();
+        let latest_db_checkpoint_id = self.db.get_latest_checkpoint_id().await?;
+        let (latest_complete_checkpoint_id, _) = self.get_latest_available_l2_block_state(latest_db_checkpoint_id).await?;
+        // Metadata must precede the gathering base; realm roots and committed markers remain owned by recovery/commit.
+        if latest_complete_checkpoint_id < latest_synced_checkpoint_id {
+            self.persist_checkpoint_metadata_range(
+                latest_complete_checkpoint_id + 1,
+                latest_synced_checkpoint_id,
+                latest_complete_checkpoint_id,
+            )
+            .await?;
+        }
             
         self.state.coordinator_head_synced_checkpoint_id = self.checkpoint_tree_backup_manager.get_current_checkpoint_id_head();
         self.state.coordinator_head_synced_checkpoint_root = self.checkpoint_tree_backup_manager.get_current_checkpoint_tree_root_head();
