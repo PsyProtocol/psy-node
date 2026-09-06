@@ -1,6 +1,6 @@
 # Devnet Launcher Reference
 
-> Updated: 2026-09-02. Audience: developers and devnet operators.
+> Updated: 2026-09-06. Audience: developers and devnet operators.
 
 ## Abstract
 
@@ -402,10 +402,14 @@ Coordinator edge HTTP/RPC = 1337 + edgeIndex
 Realm edge HTTP/RPC       = 13380 + RH + (S - 1)C + E
 Realm processor P2P TCP   = 41000 + 20R + S
 Realm edge P2P TCP        = 41100 + RP + (S - 1)C + E + 1
-Validator user ID         = R * 2^20 + S
 Coordinator P2P bootnode  = 40999
 Prove proxy               = 9999 + proxyIndex
 ```
+
+Local-devnet `validator_user_id` values are **not** `R * 2^20 + S`. The launcher binds each `(realm_id, sub_id)` to
+dedicated Strategy5 registrations (`0`, `1`, `3`, `4` for realms `0..1`), keeping registration `2` as the bridge
+relayer (`user_id` `524288`). See `docs/src/node/realm-p2p-validators.md` and `dev/locSetupV4.ts`
+(`reservedValidatorRegistrationId` / `reservedValidatorUserId`).
 
 Every requested processor P2P, edge P2P, and Realm HTTP port is enumerated before startup. A topology is rejected
 before secret/config/Genesis mutation or process startup if any port exceeds 65535 or if any two requested endpoints,

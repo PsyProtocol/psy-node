@@ -36,6 +36,11 @@ import {
     realmP2pEdgeExtraArgs,
     realmP2pProcessorExtraArgs,
     realmValidatorUserId,
+    reservedValidatorRegistrationId,
+    reservedValidatorUserId,
+    strategy5UserIdFromRegistrationId,
+    LOCAL_DEVNET_RELAYER_REGISTRATION_ID,
+    LOCAL_DEVNET_RELAYER_USER_ID,
     planRealmP2pConfig,
     daemonRealmP2pConfig,
     realmP2pProcessorPort,
@@ -574,8 +579,8 @@ describe("Realm P2P component selection", () => {
 });
 
 describe("realm P2P launch planning", () => {
-    const validator = (subId: number, edges: number) => ({
-        validator_user_id: subId,
+    const validator = (userId: number, subId: number, edges: number) => ({
+        validator_user_id: userId,
         processor_node_id: `processor-${subId}`,
         bls_public_key: `bls-${subId}`,
         processor_addresses: [`/ip4/192.0.2.8/tcp/${41000 + subId}/p2p/processor-peer-${subId}`],
@@ -584,27 +589,49 @@ describe("realm P2P launch planning", () => {
             addresses: [`/ip4/192.0.2.8/tcp/${realmP2pEdgePort(0, subId, edgeIndex, edges)}/p2p/edge-peer-${subId}-${edgeIndex}`],
         })),
     });
+    const realm0ValidatorIds = [reservedValidatorUserId(0, 1), reservedValidatorUserId(0, 2)];
     const config = (edges: number) => ({
         defaultNetwork: "localhost",
-        networks: { localhost: { realm_user_tree_height: 20, p2p: { checkpoints_per_epoch: 10 }, realm_configs: [{ id: 0, rpc_url: [], validators: [validator(1, edges), validator(2, edges)] }] } },
+        networks: {
+            localhost: {
+                realm_user_tree_height: 20,
+                p2p: { checkpoints_per_epoch: 10 },
+                realm_configs: [{
+                    id: 0,
+                    rpc_url: [],
+                    validators: [
+                        validator(realm0ValidatorIds[0], 1, edges),
+                        validator(realm0ValidatorIds[1], 2, edges),
+                    ],
+                }],
+            },
+        },
     });
 
     it("reuses only a complete config for the selected host and edge count", () => {
-        expect(planRealmP2pConfig(config(2), [0], 2, "192.0.2.8").reuse).toBe(true);
-        expect(planRealmP2pConfig(config(1), [0], 2, "192.0.2.8").reuse).toBe(false);
-        expect(planRealmP2pConfig(config(2), [0], 2, "192.0.2.9").reuse).toBe(false);
+        expect(planRealmP2pConfig(config(2), [0], 2, "192.0.2.8", realm0ValidatorIds).reuse).toBe(true);
+        expect(planRealmP2pConfig(config(1), [0], 2, "192.0.2.8", realm0ValidatorIds).reuse).toBe(false);
+        expect(planRealmP2pConfig(config(2), [0], 2, "192.0.2.9", realm0ValidatorIds).reuse).toBe(false);
     });
 
     it("regenerates when an unselected Realm still has validators", () => {
         const stale = config(1);
-        stale.networks.localhost.realm_configs.push({ id: 1, rpc_url: [], validators: [validator(1, 1), validator(2, 1)] });
-        expect(planRealmP2pConfig(stale, [0], 1, "192.0.2.8").reuse).toBe(false);
+        stale.networks.localhost.realm_configs.push({
+            id: 1,
+            rpc_url: [],
+            validators: [
+                validator(reservedValidatorUserId(1, 1), 1, 1),
+                validator(reservedValidatorUserId(1, 2), 2, 1),
+            ],
+        });
+        expect(planRealmP2pConfig(stale, [0], 1, "192.0.2.8", realm0ValidatorIds).reuse).toBe(false);
         stale.networks.localhost.realm_configs[1].validators = [];
-        expect(planRealmP2pConfig(stale, [0], 1, "192.0.2.8").reuse).toBe(true);
+        expect(planRealmP2pConfig(stale, [0], 1, "192.0.2.8", realm0ValidatorIds).reuse).toBe(true);
     });
 
     it("pins generator network selection and edge count", () => {
-        const plan = planRealmP2pConfig(null, [3, 4], 3, "devnet.example");
+        const placeholderIds = [3 * (1 << 20), 3 * (1 << 20) + 1, 4 * (1 << 20), 4 * (1 << 20) + 1];
+        const plan = planRealmP2pConfig(null, [3, 4], 3, "devnet.example", placeholderIds);
         expect(plan.env).toEqual({ PSY_CONFIG_PATH: "psy-genesis/config.json", PSY_NETWORK: "localhost", PSY_REALM_P2P_PUBLIC_HOST: "devnet.example" });
         expect(plan.args).toContain("--edges-per-validator");
         expect(plan.args.at(-1)).toBe("3");
@@ -612,10 +639,12 @@ describe("realm P2P launch planning", () => {
         expect(realmP2pSecretPaths([0], 2)).toEqual([
             "./local_checkpoints/realm_p2p/realm_0_sub_1_processor_identity.key",
             "./local_checkpoints/realm_p2p/realm_0_sub_1_bls.key",
+            "./local_checkpoints/realm_p2p/realm_0_sub_1_zk.key",
             "./local_checkpoints/realm_p2p/realm_0_sub_1_edge_identity.key",
             "./local_checkpoints/realm_p2p/realm_0_sub_1_edge_1_identity.key",
             "./local_checkpoints/realm_p2p/realm_0_sub_2_processor_identity.key",
             "./local_checkpoints/realm_p2p/realm_0_sub_2_bls.key",
+            "./local_checkpoints/realm_p2p/realm_0_sub_2_zk.key",
             "./local_checkpoints/realm_p2p/realm_0_sub_2_edge_identity.key",
             "./local_checkpoints/realm_p2p/realm_0_sub_2_edge_1_identity.key",
         ]);
@@ -626,7 +655,7 @@ describe("realm P2P launch planning", () => {
         expect(new Set(launches.map((args) => args[1])).size).toBe(3);
         expect(new Set(launches.map((args) => args[3])).size).toBe(3);
         expect(launches[0][1]).toEndWith("edge_identity.key");
-        expect(realmP2pProcessorExtraArgs("devnet.example", 2, 1)[5]).toBe("/dns4/devnet.example/tcp/41041");
+        expect(realmP2pProcessorExtraArgs("devnet.example", 2, 1)[7]).toBe("/dns4/devnet.example/tcp/41041");
     });
 
     it("rewrites daemon public addresses to Compose DNS while listeners stay wildcard", () => {
@@ -634,16 +663,30 @@ describe("realm P2P launch planning", () => {
         const first = daemon.networks.localhost.realm_configs[0].validators[0];
         expect(first.processor_addresses[0]).toBe("/dns4/realm-0-sub-1-processor/tcp/41001/p2p/processor-peer-1");
         expect(first.edge_nodes[1].addresses[0]).toBe("/dns4/realm-0-sub-1-edge-1/tcp/41102/p2p/edge-peer-1-1");
-        expect(realmP2pProcessorExtraArgs("0.0.0.0", 0, 1)[5]).toBe("/ip4/0.0.0.0/tcp/41001");
+        expect(realmP2pProcessorExtraArgs("0.0.0.0", 0, 1)[7]).toBe("/ip4/0.0.0.0/tcp/41001");
         expect(realmP2pEdgeExtraArgs("0.0.0.0", 0, 1, 1, 2)[3]).toBe("/ip4/0.0.0.0/tcp/41102");
     });
 
     it("keeps validator ids inside the selected Realm user range", () => {
         const height = 17;
         const userId = realmValidatorUserId(9, 2, height);
-        expect(userId).toBe(9 * (2 ** height) + 2);
+        expect(userId).toBe(9 * (2 ** height) + 1);
         expect(userId).toBeGreaterThanOrEqual(9 * (2 ** height));
         expect(userId).toBeLessThan(10 * (2 ** height));
+    });
+
+    it("uses reserved Strategy5 registrations for local-devnet validators", () => {
+        expect(reservedValidatorRegistrationId(0, 1)).toBe(0);
+        expect(reservedValidatorRegistrationId(1, 1)).toBe(1);
+        expect(reservedValidatorRegistrationId(0, 2)).toBe(4);
+        expect(reservedValidatorRegistrationId(1, 2)).toBe(3);
+        expect(reservedValidatorUserId(0, 1)).toBe(0);
+        expect(reservedValidatorUserId(1, 1)).toBe(1 << 20);
+        expect(reservedValidatorUserId(0, 2)).toBe(1 << 18);
+        expect(reservedValidatorUserId(1, 2)).toBe((1 << 20) + (1 << 19));
+        expect(LOCAL_DEVNET_RELAYER_REGISTRATION_ID).toBe(2);
+        expect(strategy5UserIdFromRegistrationId(LOCAL_DEVNET_RELAYER_REGISTRATION_ID)).toBe(LOCAL_DEVNET_RELAYER_USER_ID);
+        expect(() => reservedValidatorRegistrationId(2, 1)).toThrow(/realms 0\.\.1/);
     });
 });
 

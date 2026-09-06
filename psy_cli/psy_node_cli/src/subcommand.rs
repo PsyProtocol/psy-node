@@ -60,6 +60,9 @@ pub enum Commands {
         #[arg(long = "p2p-bls-key", help = "Path to a BLS12-381 secret key file (64 hex chars). Validators only.")]
         p2p_bls_key: Option<String>,
 
+        #[arg(long = "p2p-zk-key", help = "Path to a validator ZK private key file (64 hex chars).")]
+        p2p_zk_key: Option<String>,
+
         #[arg(long = "p2p-listen", help = "libp2p listen multiaddr for the Realm P2P transport (e.g. /ip4/0.0.0.0/tcp/41000).")]
         p2p_listen: Option<String>,
 
@@ -202,5 +205,8 @@ pub enum Commands {
 
         #[arg(long = "edges-per-validator", default_value_t = 1, help = "Number of distinct public edge identities to generate for each validator.")]
         edges_per_validator: u16,
+
+        #[arg(long = "validator-user-ids", required = true, value_delimiter = ',', help = "Comma-separated validator user ids in Realm/validator order.")]
+        validator_user_ids: Vec<u64>,
     },
 }

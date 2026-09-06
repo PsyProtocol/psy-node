@@ -24,6 +24,8 @@ pub struct RealmProcessorStartConfig {
     #[serde(default)]
     pub p2p_bls_key_path: Option<String>,
     #[serde(default)]
+    pub p2p_zk_key_path: Option<String>,
+    #[serde(default)]
     pub p2p_listen: Option<String>,
 }
 

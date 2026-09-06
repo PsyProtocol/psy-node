@@ -12,7 +12,7 @@ Each network contains:
   "realm_configs": [{
     "id": 0,
     "validators": [{
-      "validator_user_id": 1,
+      "validator_user_id": 0,
       "processor_node_id": "<38-byte NodeId hex>",
       "bls_public_key": "<48-byte BLS public key hex>",
       "processor_addresses": ["/ip4/127.0.0.1/tcp/41001/p2p/<peer>"],
@@ -20,12 +20,23 @@ Each network contains:
         "node_id": "<38-byte NodeId hex>",
         "addresses": ["/ip4/127.0.0.1/tcp/41101/p2p/<peer>"]
       }]
+    }, {
+      "validator_user_id": 262144,
+      "processor_node_id": "<38-byte NodeId hex>",
+      "bls_public_key": "<48-byte BLS public key hex>",
+      "processor_addresses": ["/ip4/127.0.0.1/tcp/41002/p2p/<peer>"],
+      "edge_nodes": [{
+        "node_id": "<38-byte NodeId hex>",
+        "addresses": ["/ip4/127.0.0.1/tcp/41102/p2p/<peer>"]
+      }]
     }]
   }]
 }
 ```
 
-The validator sub-id is not stored. It is the validator's one-based array position. This preserves existing port and database namespaces. `validator_user_id` is independent data and must lie in the owning Realm's half-open user range.
+Local-devnet example above uses reserved Strategy5 user ids for Realm 0 subs `1`/`2` (`0` and `262144`); Realm 1 uses `1048576` and `1572864`.
+
+The validator sub-id is not stored. It is the validator's one-based array position. This preserves existing port and database namespaces (`realm_{id}_{sub}`). `validator_user_id` must lie in the owning Realm's half-open user range. Local-devnet genesis pre-places dedicated ZK validator accounts at registrations `0`, `1`, `3`, `4` for realms `0..1` (Strategy5 GROUP=1), keeps registration `2` as the bridge relayer (`user_id` `524288`), and has the launcher bind `(realm_id, sub_id)` to those reserved validator accounts rather than picking ordinary faucet users. Realm 0 sub 1 is intentionally registration `0` / `user_id` `0`.
 
 ## Fail-closed startup
 
@@ -39,4 +50,4 @@ Realm rollback loads the same processor config and resolves the one-based sub-id
 
 ## Launcher behavior
 
-The standard launcher always creates or loads two ordered validators per Realm, writes the runtime network config, injects the same ordered public identities into `genesis.json`, exports `PSY_CONFIG_PATH` to child nodes, and starts processor and edge P2P listeners. Array positions 1 and 2 retain the established ports and DB namespaces. User 0 behavior is unchanged.
+The standard launcher always creates or loads two ordered validators per Realm, writes the runtime network config, injects the same ordered public identities into `genesis.json`, exports `PSY_CONFIG_PATH` to child nodes, and starts processor and edge P2P listeners. Array positions 1 and 2 retain the established ports and DB namespaces.

@@ -11,6 +11,7 @@ checkpoint_backup_path: ./local_checkpoints
 genesis_data_path: ./genesis.json
 p2p_identity_key_path: ./local_checkpoints/realm_p2p/realm_1_sub_1_processor_identity.key
 p2p_bls_key_path: ./local_checkpoints/realm_p2p/realm_1_sub_1_bls.key
+p2p_zk_key_path: ./local_checkpoints/realm_p2p/realm_1_sub_1_zk.key
 p2p_listen: /ip4/0.0.0.0/tcp/41021
 
 coordinator_api_urls:

@@ -957,6 +957,102 @@ function l1StartedDetector(line: string): boolean {
 
 const REALM_P2P_OUT_DIR = "./local_checkpoints/realm_p2p";
 export const REALM_P2P_SUB_IDS = [1, 2] as const;
+/** Local-devnet genesis pre-places ZK validators only for realms `[0, count)`. */
+export const LOCAL_DEVNET_VALIDATOR_REALM_COUNT = 2;
+export const LOCAL_DEVNET_VALIDATORS_PER_REALM = REALM_P2P_SUB_IDS.length;
+/** Local-devnet ZK fingerprint from `local_devnet.rs` genesis generator. */
+export const LOCAL_DEVNET_ZK_FINGERPRINT = "65e0169bfffd55f1c0ea9f76c111a5b15e652322ee253c1a9604a10d59066b50";
+
+/** Local-devnet bridge relayer stays at registration 2 (Strategy5 user_id 524288). */
+export const LOCAL_DEVNET_RELAYER_REGISTRATION_ID = 2;
+export const LOCAL_DEVNET_RELAYER_USER_ID = 524288;
+
+/** Canonical reserved leaf: `realm_id * 2^h + (sub_id - 1)`. */
+export function realmValidatorUserId(realmId: number, subId: number, height: number = 20): number {
+    if (!Number.isInteger(realmId) || realmId < 0) throw new Error(`Invalid realm id ${realmId}`);
+    if (!Number.isInteger(subId) || subId < 1) throw new Error(`Invalid validator sub id ${subId}`);
+    if (!Number.isInteger(height) || height < 1 || height >= 53) throw new Error(`Invalid realm user tree height ${height}`);
+    return realmId * (2 ** height) + (subId - 1);
+}
+
+/**
+ * Dense Strategy5 registration reserved for a local-devnet validator.
+ * Registration 2 is reserved for the bridge relayer (user_id 524288), so
+ * validators use: (0,1)->0, (1,1)->1, (1,2)->3, (0,2)->4.
+ */
+export function reservedValidatorRegistrationId(realmId: number, subId: number): number {
+    if (!Number.isInteger(realmId) || realmId < 0 || realmId >= LOCAL_DEVNET_VALIDATOR_REALM_COUNT) {
+        throw new Error(
+            `Local-devnet genesis only pre-places validators for realms 0..${LOCAL_DEVNET_VALIDATOR_REALM_COUNT - 1}, got ${realmId}`,
+        );
+    }
+    if (!Number.isInteger(subId) || subId < 1 || subId > LOCAL_DEVNET_VALIDATORS_PER_REALM) {
+        throw new Error(`Validator sub id must be in 1..${LOCAL_DEVNET_VALIDATORS_PER_REALM}, got ${subId}`);
+    }
+    if (subId === 1) return realmId;
+    return 4 - realmId;
+}
+
+/** Strategy5 user id for a local-devnet registration id. */
+export function strategy5UserIdFromRegistrationId(registrationId: number): number {
+    if (!Number.isInteger(registrationId) || registrationId < 0 || registrationId >= 2 ** 32) {
+        throw new Error(`Invalid genesis registration id ${registrationId}`);
+    }
+    const usersPerRealm = 2 ** 20;
+    const realmId = Math.floor(registrationId / (2 * usersPerRealm)) * 2 + registrationId % 2;
+    let userIndex = Math.floor(registrationId / 2) % usersPerRealm;
+    let leafIndex = 0;
+    for (let bit = 0; bit < 20; bit++) {
+        leafIndex = leafIndex * 2 + userIndex % 2;
+        userIndex = Math.floor(userIndex / 2);
+    }
+    return realmId * usersPerRealm + leafIndex;
+}
+
+export function reservedValidatorUserId(realmId: number, subId: number): number {
+    return strategy5UserIdFromRegistrationId(reservedValidatorRegistrationId(realmId, subId));
+}
+
+export async function genesisValidatorUserIds(
+    cwd: string,
+    realmIds: readonly number[],
+    validatorsPerRealm: number = REALM_P2P_SUB_IDS.length,
+): Promise<number[]> {
+    if (!Number.isInteger(validatorsPerRealm) || validatorsPerRealm !== LOCAL_DEVNET_VALIDATORS_PER_REALM) {
+        throw new Error(`Local-devnet reserved validators require exactly ${LOCAL_DEVNET_VALIDATORS_PER_REALM} per realm`);
+    }
+    const genesis = JSON.parse(await fs.promises.readFile(path.join(cwd, "genesis.json"), "utf-8")) as {
+        users: Array<{ public_key_info: { fingerprint: string } }>;
+    };
+    const config = JSON.parse(await fs.promises.readFile(path.join(cwd, "psy-genesis/config.json"), "utf-8")) as FullNetworkConfig;
+    const network = config.networks.localhost;
+    if (network?.global_user_tree_height !== 32 || network.realm_user_tree_height !== 20 || network.group_realm_height !== 1) {
+        throw new Error("Genesis validator mapping requires Strategy5 COORD=12, REALM=20, GROUP=1");
+    }
+    return realmIds.flatMap((realmId) => {
+        if (!Number.isInteger(realmId) || realmId < 0 || realmId >= 2 ** 12) throw new Error(`Invalid genesis Realm ${realmId}`);
+        return Array.from({ length: validatorsPerRealm }, (_, index) => {
+            const subId = index + 1;
+            const registrationId = reservedValidatorRegistrationId(realmId, subId);
+            if (registrationId >= genesis.users.length) {
+                throw new Error(`Genesis missing reserved validator registration ${registrationId} for realm ${realmId} sub ${subId}`);
+            }
+            if (registrationId === LOCAL_DEVNET_RELAYER_REGISTRATION_ID) {
+                throw new Error(`Genesis registration ${registrationId} is reserved for the bridge relayer`);
+            }
+            if (genesis.users[registrationId].public_key_info.fingerprint !== LOCAL_DEVNET_ZK_FINGERPRINT) {
+                throw new Error(`Genesis registration ${registrationId} is not a reserved ZK validator account`);
+            }
+            const userId = reservedValidatorUserId(realmId, subId);
+            const realmStart = realmId * 2 ** 20;
+            const realmEnd = (realmId + 1) * 2 ** 20;
+            if (userId < realmStart || userId >= realmEnd) {
+                throw new Error(`Reserved validator user id ${userId} is outside Realm ${realmId} range`);
+            }
+            return userId;
+        });
+    });
+}
 
 type PublicNode = { node_id: string; addresses: string[] };
 type GenesisValidator = {
@@ -1039,18 +1135,13 @@ export function selectedRuntimeConfigKey(nodeNetwork: string): string {
     return nodeNetwork === "local-devnet" ? "localhost" : nodeNetwork;
 }
 
-export function realmValidatorUserId(realmId: number, oneBasedPosition: number, realmUserTreeHeight: number): number {
-    const usersPerRealm = 2 ** realmUserTreeHeight;
-    const userId = realmId * usersPerRealm + oneBasedPosition;
-    if (!Number.isSafeInteger(userId)) throw new Error("Realm validator user id exceeds JavaScript safe integer range");
-    return userId;
-}
 export type RealmP2pConfigPlan = { reuse: boolean; args: string[]; env: Record<string, string> };
 
 export function realmP2pSecretPaths(realmIds: readonly number[], edgeCount: number): string[] {
     return realmIds.flatMap((realmId) => REALM_P2P_SUB_IDS.flatMap((subId) => [
         `${REALM_P2P_OUT_DIR}/realm_${realmId}_sub_${subId}_processor_identity.key`,
         `${REALM_P2P_OUT_DIR}/realm_${realmId}_sub_${subId}_bls.key`,
+        `${REALM_P2P_OUT_DIR}/realm_${realmId}_sub_${subId}_zk.key`,
         ...Array.from({ length: edgeCount }, (_, edgeIndex) => realmP2pEdgeIdentityPath(realmId, subId, edgeIndex)),
     ]));
 }
@@ -1060,14 +1151,22 @@ export function planRealmP2pConfig(
     realmIds: readonly number[],
     edgeCount: number,
     publicHost: string,
+    validatorUserIds: readonly number[],
     nodeNetwork: string = "local-devnet",
 ): RealmP2pConfigPlan {
+    if (validatorUserIds.length !== realmIds.length * REALM_P2P_SUB_IDS.length) throw new Error("Expected one genesis user id per validator");
+    validatorUserIds.forEach((userId, index) => {
+        const realmId = realmIds[Math.floor(index / REALM_P2P_SUB_IDS.length)];
+        if (!Number.isSafeInteger(userId) || userId < realmId * 2 ** 20 || userId >= (realmId + 1) * 2 ** 20) {
+            throw new Error(`Validator user id ${userId} is outside Realm ${realmId} user range`);
+        }
+    });
     const configKey = selectedRuntimeConfigKey(nodeNetwork);
     const networkConfig = config?.networks[configKey];
     const activeRealmIds = new Set(realmIds);
     const reusable = networkConfig?.p2p?.checkpoints_per_epoch === 10
         && Array.isArray(networkConfig.realm_configs)
-        && realmIds.every((realmId) => {
+        && realmIds.every((realmId, realmIndex) => {
             const matches = networkConfig.realm_configs.filter((value) => value.id === realmId);
             if (matches.length !== 1) return false;
             const realm = matches[0];
@@ -1076,6 +1175,7 @@ export function planRealmP2pConfig(
                 && realm.validators.every((validator, validatorIndex) => {
                     const subId = validatorIndex + 1;
                     return typeof validator.processor_node_id === "string" && validator.processor_node_id.length > 0
+                        && validator.validator_user_id === validatorUserIds[realmIndex * REALM_P2P_SUB_IDS.length + validatorIndex]
                         && typeof validator.bls_public_key === "string" && validator.bls_public_key.length > 0
                         && Array.isArray(validator.processor_addresses)
                         && validator.processor_addresses.some((address) => address.startsWith(`${realmP2pListen(publicHost, realmP2pProcessorPort(realmId, subId))}/p2p/`))
@@ -1090,7 +1190,7 @@ export function planRealmP2pConfig(
             || Array.isArray(realm.validators) && realm.validators.length === 0);
     return {
         reuse: reusable,
-        args: ["--out-dir", REALM_P2P_OUT_DIR, "--realm-ids", realmIds.join(","), "--validators-per-realm", REALM_P2P_SUB_IDS.length.toString(), "--edges-per-validator", edgeCount.toString()],
+        args: ["--out-dir", REALM_P2P_OUT_DIR, "--realm-ids", realmIds.join(","), "--validators-per-realm", REALM_P2P_SUB_IDS.length.toString(), "--validator-user-ids", validatorUserIds.join(","), "--edges-per-validator", edgeCount.toString()],
         env: { PSY_CONFIG_PATH: "psy-genesis/config.json", PSY_NETWORK: configKey, PSY_REALM_P2P_PUBLIC_HOST: publicHost },
     };
 }
@@ -1144,7 +1244,21 @@ async function ensureRealmP2pConfig(
     }
     const secretsExist = (await Promise.all(realmP2pSecretPaths(realmIds, edgeCount)
         .map((secretPath) => exists(path.join(cwd, secretPath))))).every(Boolean);
-    const plan = planRealmP2pConfig(secretsExist ? config : null, realmIds, edgeCount, publicHost);
+    const validatorUserIds = await genesisValidatorUserIds(cwd, realmIds);
+    const plan = planRealmP2pConfig(secretsExist ? config : null, realmIds, edgeCount, publicHost, validatorUserIds);
+    const privateKeys = JSON.parse(await fs.promises.readFile(path.join(cwd, "private_keys.json"), "utf-8")) as string[];
+    const validatorKeys = validatorUserIds.map((userId, index) => {
+        const realmId = realmIds[Math.floor(index / REALM_P2P_SUB_IDS.length)];
+        const subId = (index % REALM_P2P_SUB_IDS.length) + 1;
+        const registrationId = reservedValidatorRegistrationId(realmId, subId);
+        const expectedUserId = reservedValidatorUserId(realmId, subId);
+        if (userId !== expectedUserId) {
+            throw new Error(`Validator user id ${userId} does not match reserved id ${expectedUserId} for realm ${realmId} sub ${subId}`);
+        }
+        const key = privateKeys[registrationId];
+        if (typeof key !== "string" || !/^[0-9a-fA-F]{64}$/.test(key)) throw new Error(`Missing or invalid genesis private key for validator user ${userId}`);
+        return key;
+    });
     if (!plan.reuse) {
         const proc = Bun.spawn([nodeCli, "init-realm-p2p-keys", ...plan.args], {
             cwd,
@@ -1157,6 +1271,12 @@ async function ensureRealmP2pConfig(
         config = JSON.parse(await fs.promises.readFile(configPath, "utf-8")) as FullNetworkConfig;
     }
     if (!config) throw new Error("Realm P2P config generation did not produce a config");
+    for (let index = 0; index < validatorKeys.length; index++) {
+        const realmId = realmIds[Math.floor(index / REALM_P2P_SUB_IDS.length)];
+        const subId = index % REALM_P2P_SUB_IDS.length + 1;
+        const keyPath = path.join(cwd, REALM_P2P_OUT_DIR, `realm_${realmId}_sub_${subId}_zk.key`);
+        await fs.promises.writeFile(keyPath, validatorKeys[index], { encoding: "utf-8", mode: 0o600 });
+    }
     config.defaultNetwork = selectedRuntimeConfigKey("local-devnet");
     return config;
 }
@@ -1167,7 +1287,12 @@ function selectedRealm(config: FullNetworkConfig, realmId: number): RealmNetwork
     return realm;
 }
 export function realmP2pProcessorExtraArgs(host: string, realmId: number, subId: number): string[] {
-    return ["--p2p-identity-key", `${REALM_P2P_OUT_DIR}/realm_${realmId}_sub_${subId}_processor_identity.key`, "--p2p-bls-key", `${REALM_P2P_OUT_DIR}/realm_${realmId}_sub_${subId}_bls.key`, "--p2p-listen", realmP2pListen(host, realmP2pProcessorPort(realmId, subId))];
+    return [
+        "--p2p-identity-key", `${REALM_P2P_OUT_DIR}/realm_${realmId}_sub_${subId}_processor_identity.key`,
+        "--p2p-bls-key", `${REALM_P2P_OUT_DIR}/realm_${realmId}_sub_${subId}_bls.key`,
+        "--p2p-zk-key", `${REALM_P2P_OUT_DIR}/realm_${realmId}_sub_${subId}_zk.key`,
+        "--p2p-listen", realmP2pListen(host, realmP2pProcessorPort(realmId, subId)),
+    ];
 }
 export function realmP2pEdgeExtraArgs(host: string, realmId: number, subId: number, edgeIndex: number, edgeCount: number): string[] {
     return ["--p2p-identity-key", realmP2pEdgeIdentityPath(realmId, subId, edgeIndex), "--p2p-listen", realmP2pListen(host, realmP2pEdgePort(realmId, subId, edgeIndex, edgeCount))];

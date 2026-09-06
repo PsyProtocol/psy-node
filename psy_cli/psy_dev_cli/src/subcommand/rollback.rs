@@ -225,6 +225,7 @@ async fn load_processor_config(args: &CommonArgs) -> anyhow::Result<ProcessorCon
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .map(ProcessorConfig::Realm)

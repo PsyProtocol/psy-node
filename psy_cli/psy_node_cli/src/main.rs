@@ -34,6 +34,7 @@ async fn main() -> anyhow::Result<()> {
             proving_backend,
             p2p_identity_key,
             p2p_bls_key,
+            p2p_zk_key,
             p2p_listen,
         } => {
             let config = RealmProcessorCliConfig::get_start_config(
@@ -50,6 +51,7 @@ async fn main() -> anyhow::Result<()> {
                 genesis_data_path,
                 p2p_identity_key,
                 p2p_bls_key,
+                p2p_zk_key,
                 p2p_listen,
             )
             .await?;
@@ -156,8 +158,9 @@ async fn main() -> anyhow::Result<()> {
             realm_ids,
             validators_per_realm,
             edges_per_validator,
+            validator_user_ids,
         } => {
-            init_realm_p2p_keys::run(out_dir, realm_ids, validators_per_realm, edges_per_validator).await?;
+            init_realm_p2p_keys::run(out_dir, realm_ids, validators_per_realm, edges_per_validator, validator_user_ids).await?;
         }
     };
     Ok::<_, anyhow::Error>(())

@@ -63,11 +63,13 @@ fn clear_inactive_realms(realms: &mut [Value], active_realm_ids: &HashSet<u64>) 
 
 
 
-pub async fn run(out_dir: String, realm_ids: Vec<u64>, validators_per_realm: u16, edges_per_validator: u16) -> anyhow::Result<()> {
+pub async fn run(out_dir: String, realm_ids: Vec<u64>, validators_per_realm: u16, edges_per_validator: u16, validator_user_ids: Vec<u64>) -> anyhow::Result<()> {
     anyhow::ensure!(!realm_ids.is_empty(), "--realm-ids must list at least one realm id");
     let active_realm_ids: HashSet<u64> = realm_ids.iter().copied().collect();
     anyhow::ensure!(active_realm_ids.len() == realm_ids.len(), "--realm-ids contains a duplicate Realm id");
     preflight_validator_count(validators_per_realm)?;
+    anyhow::ensure!(validator_user_ids.len() == realm_ids.len() * usize::from(validators_per_realm), "--validator-user-ids must provide one user id per validator, in --realm-ids order");
+    anyhow::ensure!(validator_user_ids.iter().copied().collect::<HashSet<_>>().len() == validator_user_ids.len(), "--validator-user-ids contains a duplicate user id");
     anyhow::ensure!((1..=u8::MAX as u16).contains(&edges_per_validator), "--edges-per-validator must be in 1..=255");
     preflight_public_ports(&realm_ids, validators_per_realm, edges_per_validator)?;
 
@@ -94,21 +96,26 @@ pub async fn run(out_dir: String, realm_ids: Vec<u64>, validators_per_realm: u16
     anyhow::ensure!(realm_user_tree_height < u64::BITS as u64, "network {network_name} realm_user_tree_height must be less than {}", u64::BITS);
     let users_per_realm = 1_u64.checked_shl(realm_user_tree_height as u32)
         .ok_or_else(|| anyhow::anyhow!("network {network_name} realm user range overflows u64"))?;
-    anyhow::ensure!(u64::from(validators_per_realm) < users_per_realm, "--validators-per-realm exceeds network {network_name} Realm user range");
+    anyhow::ensure!(u64::from(validators_per_realm) <= users_per_realm, "--validators-per-realm exceeds network {network_name} Realm user range");
     let realm_stride = u64::from(20_u16.max(validators_per_realm * edges_per_validator));
     let configured_realms = network.get("realm_configs").and_then(Value::as_array)
         .ok_or_else(|| anyhow::anyhow!("network {network_name} has no realm_configs array"))?;
-    for &realm_id in &realm_ids {
+    for (realm_index, &realm_id) in realm_ids.iter().enumerate() {
         anyhow::ensure!(configured_realms.iter().any(|realm| realm.get("id").and_then(Value::as_u64) == Some(realm_id)), "network {network_name} has no Realm {realm_id}");
+        let realm_start = realm_id.checked_mul(users_per_realm)
+            .ok_or_else(|| anyhow::anyhow!("Realm {realm_id} user range overflows u64"))?;
+        let realm_end = realm_start.checked_add(users_per_realm)
+            .ok_or_else(|| anyhow::anyhow!("Realm {realm_id} user range overflows u64"))?;
+        let offset = realm_index * usize::from(validators_per_realm);
+        for &user_id in &validator_user_ids[offset..offset + usize::from(validators_per_realm)] {
+            anyhow::ensure!((realm_start..realm_end).contains(&user_id), "validator user id {user_id} is outside Realm {realm_id} range [{realm_start}, {realm_end})");
+        }
         for position in 1..=validators_per_realm {
             let processor_port = 41000_u64
                 .checked_add(realm_id.checked_mul(20).ok_or_else(|| anyhow::anyhow!("Realm {realm_id} P2P port overflows"))?)
                 .and_then(|port| port.checked_add(u64::from(position)))
                 .ok_or_else(|| anyhow::anyhow!("Realm {realm_id} processor P2P port overflows"))?;
             anyhow::ensure!(processor_port <= u16::MAX.into(), "Realm {realm_id} processor P2P port exceeds {}", u16::MAX);
-            realm_id.checked_mul(users_per_realm)
-                .and_then(|start| start.checked_add(u64::from(position)))
-                .ok_or_else(|| anyhow::anyhow!("Realm {realm_id} validator user id overflows u64"))?;
             for edge_index in 0..edges_per_validator {
                 let edge_port = 41100_u64
                     .checked_add(realm_id.checked_mul(realm_stride).ok_or_else(|| anyhow::anyhow!("Realm {realm_id} P2P port overflows"))?)
@@ -126,7 +133,7 @@ pub async fn run(out_dir: String, realm_ids: Vec<u64>, validators_per_realm: u16
         .ok_or_else(|| anyhow::anyhow!("network {network_name} has no realm_configs array"))?;
     clear_inactive_realms(realms, &active_realm_ids);
 
-    for realm_id in realm_ids {
+    for (realm_index, realm_id) in realm_ids.into_iter().enumerate() {
         let realm = realms.iter_mut().find(|realm| realm.get("id").and_then(Value::as_u64) == Some(realm_id))
             .ok_or_else(|| anyhow::anyhow!("network {network_name} has no Realm {realm_id}"))?;
         let mut validators = Vec::with_capacity(validators_per_realm as usize);
@@ -160,9 +167,7 @@ pub async fn run(out_dir: String, realm_ids: Vec<u64>, validators_per_realm: u16
                 .and_then(|port| port.checked_add(u64::from(position)))
                 .ok_or_else(|| anyhow::anyhow!("Realm {realm_id} processor P2P port overflows"))?;
             anyhow::ensure!(processor_port <= u16::MAX.into(), "Realm {realm_id} processor P2P port exceeds {}", u16::MAX);
-            let validator_user_id = realm_id.checked_mul(users_per_realm)
-                .and_then(|start| start.checked_add(u64::from(position)))
-                .ok_or_else(|| anyhow::anyhow!("Realm {realm_id} validator user id overflows u64"))?;
+            let validator_user_id = validator_user_ids[realm_index * usize::from(validators_per_realm) + usize::from(index)];
             validators.push(json!({
                 "validator_user_id": validator_user_id,
                 "processor_node_id": hex::encode(processor_node_id.to_raw()),

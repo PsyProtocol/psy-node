@@ -47,6 +47,7 @@ pub struct RealmProcessorCliConfig {
     pub genesis_data_path: Option<String>,
     pub p2p_identity_key_path: Option<String>,
     pub p2p_bls_key_path: Option<String>,
+    pub p2p_zk_key_path: Option<String>,
     pub p2p_listen: Option<String>,
 }
 
@@ -66,6 +67,7 @@ impl RealmProcessorCliConfig {
         genesis_data_path: Option<String>,
         p2p_identity_key_path: Option<String>,
         p2p_bls_key_path: Option<String>,
+        p2p_zk_key_path: Option<String>,
         p2p_listen: Option<String>,
     ) -> anyhow::Result<RealmProcessorStartConfig> {
         let base = if let Some(path) = config {
@@ -107,6 +109,7 @@ impl RealmProcessorCliConfig {
             genesis_data_path: genesis_data_path.or(base.genesis_data_path),
             p2p_identity_key_path: p2p_identity_key_path.or(base.p2p_identity_key_path),
             p2p_bls_key_path: p2p_bls_key_path.or(base.p2p_bls_key_path),
+            p2p_zk_key_path: p2p_zk_key_path.or(base.p2p_zk_key_path),
             p2p_listen: p2p_listen.or(base.p2p_listen),
         })
     }

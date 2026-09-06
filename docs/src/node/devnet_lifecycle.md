@@ -1,6 +1,6 @@
 # Devnet Startup, Shutdown, Restart, and Rollback Lifecycle
 
-> Updated: 2026-09-03.
+> Updated: 2026-09-06.
 
 ## Abstract
 
@@ -73,7 +73,9 @@ Startup is ready only after all of these checks pass:
 nc -z 127.0.0.1 9042
 nc -z 127.0.0.1 1337
 nc -z 127.0.0.1 13380
+nc -z 127.0.0.1 13381
 nc -z 127.0.0.1 13390
+nc -z 127.0.0.1 13391
 curl -fsS http://127.0.0.1:3000/health
 curl -fsS http://127.0.0.1:9999/health
 ```
@@ -95,7 +97,7 @@ curl -s -X POST http://127.0.0.1:1337 \
   --data '{"jsonrpc":"2.0","id":1,"method":"psy_get_latest_checkpoint_id","params":[]}'
 ```
 
-Realm edge ports are `13380` for Realm 0 and `13390` for Realm 1. Realm processor sub-ID is `1`.
+With the default `make run-all` topology (`--realms-count 2`, `--realm-edge-nodes 1`, two validators per Realm), Realm edge HTTP ports are `13380`/`13381` for Realm 0 subs `1`/`2` and `13390`/`13391` for Realm 1. Each Realm starts processors for both sub-IDs. `start-realm-processor` does not take a sub-id flag; the process derives sub-id from its Ed25519 identity match in `PSY_CONFIG_PATH`. Rollback plans still require explicit `--realm-id` / `--realm-sub-id` and must match that derived identity.
 
 ## 5. State-Preserving Restart
 
@@ -145,11 +147,11 @@ Pass that path to rollback generation and execution with `--stop-sentinel local_
 3. Confirm processor endpoints are down and retained infrastructure is up:
 
 ```bash
-for p in 1337 13380 13390 3000 9999; do ! nc -z 127.0.0.1 "$p"; done
+for p in 1337 13380 13381 13390 13391 3000 9999; do ! nc -z 127.0.0.1 "$p"; done
 for p in 8545 9042 6379 4222 8081 5433 8080; do nc -z 127.0.0.1 "$p"; done
 ```
 
-4. Generate and execute one rollback plan for the Coordinator and one for every Realm. Rollback validation uses only `plonky2-poseidon-goldilocks`; JTMB is test-only. `--target-contract-state <json>` is optional: generation retains it only when `last_finalized_checkpoint_id` exactly equals the rollback target, and absence or mismatch never blocks local rollback. Generate every RP before executing any RP, then require every phase in every RP to be `completed` before resume. Any L1 force-state action is a separate operator task.
+4. Generate and execute one rollback plan for the Coordinator and one for every Realm processor identity `(realm_id, realm_sub_id)` (default `make run-all`: four Realm plans for realms `0`/`1` × subs `1`/`2`). Realm plans require `--realm-id` and `--realm-sub-id` matching the processor derived from its identity key. Rollback validation uses only `plonky2-poseidon-goldilocks`; JTMB is test-only. `--target-contract-state <json>` is optional: generation retains it only when `last_finalized_checkpoint_id` exactly equals the rollback target, and absence or mismatch never blocks local rollback. Generate every RP before executing any RP, then require every phase in every RP to be `completed` before resume. Any L1 force-state action is a separate operator task.
 5. Resume the saved application commands without deploying L1 or resetting Envio:
 
 ```bash
@@ -163,7 +165,7 @@ The supervisor removes the stop sentinel only after every saved application proc
 ## 7. Post-Restart and Post-Rollback Verification
 
 1. Require the Anvil block number to be no lower than before the operation, `db/anvil/state.json` to parse as complete JSON, and StateManager, Bridge, and Router addresses to remain byte-identical. If `target_contract_state` was omitted or ignored because its checkpoint differed, record that no matching target contract snapshot was attached to the local RP; verify any separate L1 recovery independently.
-2. Require Coordinator and every Realm readiness marker.
+2. Require Coordinator and every Realm processor readiness marker.
 3. Require every processor checkpoint head to advance above the rollback target, allow short Realm lag, then require all heads to converge.
 4. Verify the target checkpoint remains queryable and target application state was restored.
 5. Submit a real state-changing transaction that covers the rolled-back state. Repeating the exact pre-rollback spend is stronger than registering a new user because it proves the consumed balance/state can be used again.

@@ -88,9 +88,9 @@ pub async fn run_startup_plonky2_scylla_edge_node(config: &CoordinatorEdgeStartC
                 proof_verifier,
                 checkpoint_state_transition_circuit_fingerprint,
             );
-            let (validator_registry, checkpoints_per_epoch) =
-                crate::node::realm_p2p::validator_registry_from_network_config(config.network)?;
-            handler.set_validators(validator_registry, checkpoints_per_epoch)?;
+            let (validator_index, checkpoints_per_epoch) =
+                crate::node::realm_p2p::genesis_validator_index_from_network_config(config.network)?;
+            handler.set_validators(validator_index, checkpoints_per_epoch)?;
             start_coordinator_edge_rpc_server::<N, _, _, _, _, _, _, _, _>(
                 handler,
                 &config.listen,

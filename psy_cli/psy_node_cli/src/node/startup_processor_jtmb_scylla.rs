@@ -19,6 +19,7 @@ use psy_node_core::config::node_start_config::{CoordinatorProcessorStartConfig, 
 use psy_node_nats::psy_queue::{setup_nats_psy_queue_from_connection_str, NatsSetupMode};
 use psy_node_redis::store::{new_redis_async_pool, StandardRedisStore};
 use psy_node_scylla::psy_setup::setup_psy_scylla_database_store_from_connection_string;
+use psy_common_circuit::circuits::traits::qstandard::QStandardCircuit as CommonQStandardCircuit;
 
 pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_coordinator_processor_node(config: &CoordinatorProcessorStartConfig) -> anyhow::Result<()> {
     let resolver = PsyJTMBPoseidonGoldilocksNodeConfigResolver {};
@@ -106,13 +107,29 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_coordinator_processor_n
 }
 
 pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_processor_node(config: &RealmProcessorStartConfig) -> anyhow::Result<()> {
-    //let (verifier, _) = get_jtmb_circuit_library_and_prover_for_network::<JTMBPoseidonGoldilocksConfig>(config.network)?;
+    let (verifier, _) = get_jtmb_circuit_library_and_prover_for_network::<JTMBPoseidonGoldilocksConfig>(config.network)?;
     let resolver = PsyJTMBPoseidonGoldilocksNodeConfigResolver {};
     let circuit_fingerprint_config = resolver.get_circuit_fingerprint_config_for_network(config.network)?;
     let genesis_data = resolver.get_genesis_block_setup_data_for_network(config.network, config.genesis_data_path.clone())?;
     let (realm_sub_id, validator_user_id, bls_public_keys) =
         crate::node::realm_p2p::processor_validator_data(config, &genesis_data)?;
     let config = &config.clone().with_derived_realm_sub_id(realm_sub_id);
+    let zk_key_path = config.p2p_zk_key_path.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("realm finalization requires --p2p-zk-key")
+    })?;
+    let zk_key_text = std::fs::read_to_string(zk_key_path)
+        .map_err(|error| anyhow::anyhow!("failed to read ZK key {zk_key_path}: {error}"))?;
+    anyhow::ensure!(
+        zk_key_text.len() == 64 && zk_key_text.as_bytes().iter().all(u8::is_ascii_hexdigit),
+        "ZK key must contain exactly 64 hexadecimal characters with no whitespace"
+    );
+    let validator_zk_private_key = zk_key_text.parse::<parth_core::pgoldilocks::GoldilocksHashOut>()?;
+    let rotation = psy_data::config::network_config::load_realm_rotation_config(config.network)?;
+    let signature_circuit = psy_common_circuit::circuits::zk_signature3::core::PsyBasicZKSignatureCircuit::<plonky2::plonk::config::PoseidonGoldilocksConfig, 2>::new();
+    let signature_fingerprint = parth_core::pgoldilocks::QHashOut(
+        CommonQStandardCircuit::get_fingerprint(&signature_circuit).0,
+    );
+    drop(signature_circuit);
 
     let pool = new_redis_async_pool(&config.redis_url, 2).await?;
 
@@ -175,6 +192,9 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_processor_node(co
                 realm_identifier,
                 circuit_fingerprint_config,
                 Arc::new(coordinator_client),
+                validator_zk_private_key,
+                signature_fingerprint,
+                rotation.checkpoints_per_epoch,
             )
             .await?;
             let built = crate::node::realm_p2p::maybe_build_processor_network(config, chain_id)?;
@@ -184,7 +204,6 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_processor_node(co
             let commands = built.handle.commands();
             let rotation = built.rotation.clone();
             processor.set_realm_p2p(commands, rotation, bls_secret, validator_user_id, bls_public_keys);
-                let (verifier, _) = get_jtmb_circuit_library_and_prover_for_network::<JTMBPoseidonGoldilocksConfig>(config.network)?;
                 let (state_updates_tx, state_updates_rx) = tokio::sync::mpsc::channel(4);
                 processor.verified_state_updates = Some(state_updates_rx);
                 crate::node::realm_p2p::spawn_processor_realm_network::<N>(

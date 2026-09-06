@@ -26,7 +26,7 @@ use psy_data::{
     },
 };
 use psy_node_common::{
-    coordinator::validator_registry::{build_validator_registry_from_genesis, ValidatorRegistry},
+    coordinator::genesis_validators::{index_from_genesis, GenesisValidatorIndex},
     realm::{
         network::{
             build_optional_realm_network, load_bls_secret_key, load_ed25519_identity_key,
@@ -153,6 +153,7 @@ fn validate_public_network(network: &PublicNetworkConfig) -> anyhow::Result<()> 
 
 fn load_selected_network(network: PsyChainNetworkType) -> anyhow::Result<PublicNetworkConfig> {
     let selected_name = public_network_key(network)?;
+    let network_type = network;
     if let Ok(environment_name) = std::env::var("PSY_NETWORK") {
         anyhow::ensure!(
             environment_name == selected_name,
@@ -171,6 +172,7 @@ fn load_selected_network(network: PsyChainNetworkType) -> anyhow::Result<PublicN
         .find_map(|(name, public)| (name == selected_name).then_some(public))
         .ok_or_else(|| anyhow::anyhow!("network config has no network named {selected_name}"))?;
     validate_public_network(&network)?;
+    psy_data::config::network_config::load_realm_rotation_config(network_type)?;
     Ok(network)
 }
 
@@ -304,16 +306,16 @@ fn bootnodes_without_local_peer(
 }
 
 
-/// Build the coordinator-facing validator registry from public network values.
-pub fn validator_registry_from_network_config(
+/// Build the coordinator-facing genesis validator index from public network values.
+pub fn genesis_validator_index_from_network_config(
     network_type: PsyChainNetworkType,
-) -> anyhow::Result<(ValidatorRegistry, u64)> {
+) -> anyhow::Result<(GenesisValidatorIndex, u64)> {
     let network = load_selected_network(network_type)?;
     anyhow::ensure!(
         network.p2p.checkpoints_per_epoch > 0,
         "p2p.checkpoints_per_epoch must be greater than zero"
     );
-    let mut registry = ValidatorRegistry::new();
+    let mut index = GenesisValidatorIndex::new();
     let mut user_ids = HashSet::new();
     let mut node_ids = HashSet::new();
     let mut bls_keys = HashSet::new();
@@ -323,8 +325,8 @@ pub fn validator_registry_from_network_config(
             continue;
         }
         validate_realm_validator_count(realm.id, realm.validators.len())?;
-        for (index, validator) in realm.validators.iter().enumerate() {
-            let sub_id = validator_sub_id(index)?;
+        for (position, validator) in realm.validators.iter().enumerate() {
+            let sub_id = validator_sub_id(position)?;
             let description = format!("Realm {} validator sub {sub_id}", realm.id);
             let node_id = parse_node_id(&validator.processor_node_id, &description)?;
             let bls_public_key = parse_bls_key(&validator.bls_public_key, &description)?;
@@ -349,13 +351,13 @@ pub fn validator_registry_from_network_config(
                 bls_public_key: bls_public_key.to_bytes(),
             };
             anyhow::ensure!(
-                registry.insert((realm.id, sub_id), genesis_validator).is_none(),
+                index.insert((realm.id, sub_id), genesis_validator).is_none(),
                 "duplicate validator slot for Realm {} sub {sub_id}",
                 realm.id
             );
         }
     }
-    Ok((registry, network.p2p.checkpoints_per_epoch))
+    Ok((index, network.p2p.checkpoints_per_epoch))
 }
 
 /// Construct a processor Realm network from local keys/listen and public membership.
@@ -482,8 +484,8 @@ pub fn processor_validator_data<F, Hash>(
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("p2p identity key is required"))?;
     let local_node_id = NodeId::from_keypair(&load_ed25519_identity_key(identity_path)?)?;
-    let registry = build_validator_registry_from_genesis(genesis)?;
-    let genesis_matches = registry
+    let index = index_from_genesis(genesis)?;
+    let genesis_matches = index
         .iter()
         .filter(|((realm_id, _), validator)| {
             *realm_id == config.realm_id as u32 && validator.node_id == *local_node_id.as_raw()
@@ -584,7 +586,7 @@ pub fn spawn_processor_realm_network<N>(
     let chain_id = config.network.get_chain_id();
     let public = realm_public_data(config.network, realm_id)
         .expect("processor Realm P2P public config was validated at startup");
-    let (validator_registry, _) = validator_registry_from_network_config(config.network)
+    let (validator_index, _) = genesis_validator_index_from_network_config(config.network)
         .expect("network validator config was validated at startup");
     let proof_verifier = Arc::new(proof_verifier);
     let commands = handle.commands();
@@ -630,7 +632,7 @@ pub fn spawn_processor_realm_network<N>(
                             &submission,
                             &decoded.proof,
                         )?;
-                        let proposer = validator_registry
+                        let proposer = validator_index
                             .get(&(proposal.realm_id, proposal.proposer_sub_id))
                             .ok_or_else(|| anyhow::anyhow!(
                                 "GUTA proposer sub_id {} has no genesis validator",
