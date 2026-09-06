@@ -6,10 +6,13 @@ use plonky2::{field::extension::Extendable, hash::hash_types::RichField};
 use psy_client_common::data::qhashout::QHashOut;
 use psy_client_data::{
     models::user::contract_state_tree::UserContractStateTreeId,
-    qdata::user_contract_state::UserContractState,
+    qdata::{user::PsyUserLeaf, user_contract_state::UserContractState},
     qstore::imm::{
         cache::PsyCmdStoreWithCache,
-        cmd::{QSRCmdGetContractLeafData, QSRMerkleCmd, QSRMerkleCmdGetUserContractStateTreeMerkleProof},
+        cmd::{
+            QSRCmdGetContractLeafData, QSRCmdGetUserLeafData, QSRMerkleCmd, QSRMerkleCmdGetUserContractStateTreeMerkleProof,
+            QSRMerkleCmdGetUserContractTreeMerkleProof, QSRMerkleCmdGetUserTreeMerkleProof,
+        },
         cmd_processor::{PsyReadCommandProcessorSync, PsyReadCommandProcessorSyncMut},
     },
     traits::qdatastore::qmetadata::QMetaDataStoreReaderSync,
@@ -26,6 +29,9 @@ use crate::dpn::ops::state_cmd::data::{
 #[serde(bound = "F: Serialize + serde::de::DeserializeOwned")]
 pub struct StateReaderResults<F: RichField> {
     pub state: UserContractState<F>,
+    pub user_tree_root: QHashOut<F>,
+    #[serde(default)]
+    pub aux_user_leaves: Vec<PsyUserLeaf<F>>,
     pub state_cmds: Vec<DPNStateCmd<F>>,
     pub merkel_proofs: Vec<MerkleProofCore<QHashOut<F>>>,
 }
@@ -37,9 +43,11 @@ pub struct StateReader<
     R: PsyReadCommandProcessorSync<F> + psy_client_data::qstore::imm::cmd_processor::QUserIdManager + QMetaDataStoreReaderSync<F> + Send + Sync,
 > {
     pub state: UserContractState<F>,
+    pub user_tree_root: QHashOut<F>,
     pub cmd_store: PsyCmdStoreWithCache<F, R>,
     pub state_tree_store: KVQSimpleMemoryBackingStore,
     pub merkel_proofs: Vec<MerkleProofCore<QHashOut<F>>>,
+    pub aux_user_leaves: Vec<PsyUserLeaf<F>>,
     pub state_cmds: Vec<DPNStateCmd<F>>,
 }
 
@@ -54,9 +62,11 @@ impl<
     pub async fn new(state: UserContractState<F>, cmd_store: PsyCmdStoreWithCache<F, R>, state_tree_store: KVQSimpleMemoryBackingStore) -> Self {
         Self {
             state,
+            user_tree_root: QHashOut::default(),
             cmd_store,
             state_tree_store,
             merkel_proofs: Vec::new(),
+            aux_user_leaves: Vec::new(),
             state_cmds: Vec::new(),
         }
     }
@@ -64,6 +74,8 @@ impl<
     pub fn to_results(&self) -> StateReaderResults<F> {
         StateReaderResults {
             state: self.state.clone(),
+            user_tree_root: self.user_tree_root,
+            aux_user_leaves: self.aux_user_leaves.clone(),
             state_cmds: self.state_cmds.clone(),
             merkel_proofs: self.merkel_proofs.clone(),
         }
@@ -198,15 +210,28 @@ impl<
     }
 
     pub async fn get_self_user_external_contract_state_slot_hash(&mut self, contract_id: F, slot_index: F) -> anyhow::Result<QHashOut<F>> {
-        let merkle_proof = self
+        let checkpoint_id = self.state.checkpoint_id.to_canonical_u64();
+        let user_id = self.state.user_leaf.user_id.to_canonical_u64();
+        let contract_id_u64 = contract_id.to_canonical_u64();
+
+        let uct_proof = self
+            .cmd_store
+            .resolve_get_merkle_proof_mut(&QSRMerkleCmd::GetUserContractTreeMerkleProof(QSRMerkleCmdGetUserContractTreeMerkleProof {
+                checkpoint_id,
+                user_id,
+                contract_id: contract_id_u64 as u32,
+            }))
+            .await?;
+
+        let slot_proof = self
             .get_user_contract_state_tree_merkle_proof(self.state.checkpoint_id, self.state.user_leaf.user_id, contract_id, slot_index)
             .await?;
 
-        let value = merkle_proof.value.clone();
+        let value = slot_proof.value.clone();
+        let state_tree_height = slot_proof.siblings.len() as u8;
 
-        let state_tree_height = merkle_proof.siblings.len() as u8;
-
-        self.merkel_proofs.push(merkle_proof);
+        self.merkel_proofs.push(uct_proof);
+        self.merkel_proofs.push(slot_proof);
         self.state_cmds.push(DPNStateCmd::GetSelfUserExternalContractStateSlotHash(
             DPNStateCmdGetSelfUserExternalContractStateSlotHash {
                 contract_id,
@@ -300,14 +325,46 @@ impl<
     }
 
     pub async fn get_other_user_contract_state_slot_hash(&mut self, user_id: F, contract_id: F, slot_index: F) -> anyhow::Result<QHashOut<F>> {
-        let merkle_proof = self
+        let checkpoint_id = self.state.checkpoint_id.to_canonical_u64();
+        let user_id_u64 = user_id.to_canonical_u64();
+        let contract_id_u64 = contract_id.to_canonical_u64();
+
+        let user_tree_proof = self
+            .cmd_store
+            .resolve_get_merkle_proof_mut(&QSRMerkleCmd::GetUserTreeMerkleProof(QSRMerkleCmdGetUserTreeMerkleProof {
+                checkpoint_id,
+                user_id: user_id_u64,
+            }))
+            .await?;
+        self.user_tree_root = user_tree_proof.root;
+
+        let other_user_leaf = self
+            .cmd_store
+            .resolve_get_user_leaf_mut(&QSRCmdGetUserLeafData {
+                checkpoint_id,
+                user_id: user_id_u64,
+            })
+            .await?;
+
+        let uct_proof = self
+            .cmd_store
+            .resolve_get_merkle_proof_mut(&QSRMerkleCmd::GetUserContractTreeMerkleProof(QSRMerkleCmdGetUserContractTreeMerkleProof {
+                checkpoint_id,
+                user_id: user_id_u64,
+                contract_id: contract_id_u64 as u32,
+            }))
+            .await?;
+
+        let slot_proof = self
             .get_user_contract_state_tree_merkle_proof(self.state.checkpoint_id, user_id, contract_id, slot_index)
             .await?;
-        let state_tree_height = merkle_proof.siblings.len() as u8;
+        let state_tree_height = slot_proof.siblings.len() as u8;
+        let value = slot_proof.value.clone();
 
-        let value = merkle_proof.value.clone();
-
-        self.merkel_proofs.push(merkle_proof);
+        self.aux_user_leaves.push(other_user_leaf);
+        self.merkel_proofs.push(user_tree_proof);
+        self.merkel_proofs.push(uct_proof);
+        self.merkel_proofs.push(slot_proof);
         self.state_cmds.push(DPNStateCmd::GetOtherUserContractStateSlotHash(
             DPNStateCmdGetOtherUserContractStateSlotHash {
                 user_id,

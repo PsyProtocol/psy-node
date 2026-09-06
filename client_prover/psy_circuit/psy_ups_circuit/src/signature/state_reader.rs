@@ -6,11 +6,16 @@ use plonky2::{
         hash_types::{HashOutTarget, RichField},
         poseidon::PoseidonHash,
     },
-    iop::{target::Target, witness::PartialWitness},
+    iop::{
+        target::Target,
+        witness::{PartialWitness, WitnessWrite},
+    },
     plonk::circuit_builder::CircuitBuilder,
 };
 use psy_common_circuit::hash::merkle::gadgets::merkle_proof::MerkleProofGadget;
-use psy_network_circuit::gadgets::qdata::user_contract_state::UserContractStateGadget;
+use psy_common_circuit::traits::CreatableTarget;
+use psy_config::network_constants::{GLOBAL_CONTRACT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT};
+use psy_network_circuit::gadgets::qdata::{user::PsyUserLeafGadget, user_contract_state::UserContractStateGadget};
 use psy_vm::dpn::ops::state_cmd::data::{
     DPNStateCmd, DPNStateCmdGetOtherUserContractStateSlotHash, DPNStateCmdGetSelfUserCurrentContractStateSlotHash,
     DPNStateCmdGetSelfUserExternalContractStateSlotHash,
@@ -19,25 +24,31 @@ use psy_vm::dpn::ops::state_cmd::data::{
 #[derive(Debug)]
 pub struct StateReaderGadget<F: RichField + Extendable<D>, const D: usize> {
     pub state: UserContractStateGadget,
+    /// Checkpoint-authenticated global user tree root (witness).
+    pub user_tree_root: HashOutTarget,
     pub contract_state_tree_height: u8,
     pub merkel_proofs: Vec<MerkleProofGadget>,
+    pub aux_user_leaves: Vec<PsyUserLeafGadget>,
     pub state_cmds: Vec<DPNStateCmd<F>>,
-    // pub current_state_cmd_index: usize,
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> StateReaderGadget<F, D> {
     pub fn new(builder: &mut CircuitBuilder<F, D>, contract_state_tree_height: u8) -> Self {
         let state = UserContractStateGadget::add_virtual_to(builder);
+        let user_tree_root = builder.add_virtual_hash();
         Self {
             state,
+            user_tree_root,
             contract_state_tree_height,
             merkel_proofs: Vec::new(),
+            aux_user_leaves: Vec::new(),
             state_cmds: Vec::new(),
-            // current_state_cmd_index: 0,
         }
     }
+
     pub fn set_witness(&self, pw: &mut PartialWitness<F>, results: &psy_vm::ups::state_reader::StateReaderResults<F>) -> anyhow::Result<()> {
         self.state.set_witness(pw, &results.state)?;
+        pw.set_hash_target(self.user_tree_root, results.user_tree_root.0)?;
 
         self.state_cmds
             .iter()
@@ -46,12 +57,29 @@ impl<F: RichField + Extendable<D>, const D: usize> StateReaderGadget<F, D> {
                 assert_eq!(state_cmd, state_cmd_reader);
             });
 
+        anyhow::ensure!(
+            self.aux_user_leaves.len() == results.aux_user_leaves.len(),
+            "aux user leaf count mismatch: circuit {} vs witness {}",
+            self.aux_user_leaves.len(),
+            results.aux_user_leaves.len()
+        );
+        for (gadget, leaf) in self.aux_user_leaves.iter().zip(results.aux_user_leaves.iter()) {
+            gadget.set_witness(pw, leaf)?;
+        }
+
+        anyhow::ensure!(
+            self.merkel_proofs.len() == results.merkel_proofs.len(),
+            "merkle proof count mismatch: circuit {} vs witness {}",
+            self.merkel_proofs.len(),
+            results.merkel_proofs.len()
+        );
         self.merkel_proofs
             .iter()
             .zip(results.merkel_proofs.iter())
             .try_for_each(|(merkle_proof_gadget, merkle_proof)| merkle_proof_gadget.set_witness_core_proof_q_generic(pw, merkle_proof))?;
         Ok(())
     }
+
     pub fn get_self_user_current_contract_state_slot_hash(
         &mut self,
         builder: &mut CircuitBuilder<F, D>,
@@ -94,11 +122,9 @@ impl<F: RichField + Extendable<D>, const D: usize> StateReaderGadget<F, D> {
         let slot_index = F::from_canonical_u64(sub_slot_index / 4u64);
         let n = (sub_slot_index & 0b11) as usize;
         if length == 1 {
-            // one merkle proof
             let cur = self.get_self_user_current_contract_state_slot_hash(builder, slot_index)?;
             Ok(vec![cur.elements[n]])
         } else if length < 6 {
-            // two merkle proofs
             let value_0 = self.get_self_user_current_contract_state_slot_hash(builder, slot_index)?;
             let value_1 = self.get_self_user_current_contract_state_slot_hash(builder, slot_index + F::ONE)?;
 
@@ -153,6 +179,11 @@ impl<F: RichField + Extendable<D>, const D: usize> StateReaderGadget<F, D> {
         }
     }
 
+    /// Read a slot under another of the session user's contracts.
+    ///
+    /// Binds `contract_id` through the user-contract tree under
+    /// `user_leaf.user_state_tree_root`, then proves the slot against that
+    /// derived contract-state root (not an unbound witness root).
     pub fn get_self_user_external_contract_state_slot_hash(
         &mut self,
         builder: &mut CircuitBuilder<F, D>,
@@ -160,17 +191,19 @@ impl<F: RichField + Extendable<D>, const D: usize> StateReaderGadget<F, D> {
         slot_index: F,
         contract_state_tree_height: u8,
     ) -> anyhow::Result<HashOutTarget> {
-        let merkle_proof_gadget = MerkleProofGadget::add_virtual_to::<PoseidonHash, F, D>(builder, contract_state_tree_height as usize);
+        let uct_proof = MerkleProofGadget::add_virtual_to::<PoseidonHash, F, D>(builder, GLOBAL_CONTRACT_TREE_HEIGHT as usize);
+        builder.connect_hashes(uct_proof.root, self.state.user_leaf.user_state_tree_root);
+        let expected_contract_id = builder.constant(contract_id);
+        builder.connect(uct_proof.index, expected_contract_id);
 
-        builder.connect_hashes(merkle_proof_gadget.root, self.state.start_contract_state_root);
-        tracing::info!("merkle_proof_gadget.root: {:?}", merkle_proof_gadget.root);
-        tracing::info!("self.state.start_contract_state_root: {:?}", self.state.start_contract_state_root);
-        let expected_slot_index_target = builder.constant(slot_index);
-        builder.connect(merkle_proof_gadget.index, expected_slot_index_target);
+        let slot_proof = MerkleProofGadget::add_virtual_to::<PoseidonHash, F, D>(builder, contract_state_tree_height as usize);
+        builder.connect_hashes(slot_proof.root, uct_proof.value);
+        let expected_slot_index = builder.constant(slot_index);
+        builder.connect(slot_proof.index, expected_slot_index);
 
-        let value = merkle_proof_gadget.value.clone();
-
-        self.merkel_proofs.push(merkle_proof_gadget);
+        let value = slot_proof.value.clone();
+        self.merkel_proofs.push(uct_proof);
+        self.merkel_proofs.push(slot_proof);
         self.state_cmds.push(DPNStateCmd::GetSelfUserExternalContractStateSlotHash(
             DPNStateCmdGetSelfUserExternalContractStateSlotHash {
                 contract_id,
@@ -208,11 +241,9 @@ impl<F: RichField + Extendable<D>, const D: usize> StateReaderGadget<F, D> {
         let slot_index = F::from_canonical_u64(sub_slot_index / 4u64);
         let n = (sub_slot_index & 0b11) as usize;
         if length == 1 {
-            // one merkle proof
             let cur = self.get_self_user_external_contract_state_slot_hash(builder, contract_id, slot_index, contract_state_tree_height)?;
             Ok(vec![cur.elements[n]])
         } else if length < 6 {
-            // two merkle proofs
             let value_0 = self.get_self_user_external_contract_state_slot_hash(builder, contract_id, slot_index, contract_state_tree_height)?;
             let value_1 =
                 self.get_self_user_external_contract_state_slot_hash(builder, contract_id, slot_index + F::ONE, contract_state_tree_height)?;
@@ -273,6 +304,11 @@ impl<F: RichField + Extendable<D>, const D: usize> StateReaderGadget<F, D> {
         }
     }
 
+    /// Read a slot under `(user_id, contract_id)`.
+    ///
+    /// Proves the full inclusion path:
+    /// global user tree → user leaf → user-contract tree → contract-state slot.
+    /// Requested identities are constrained as Merkle indices; command metadata is not evidence.
     pub fn get_other_user_contract_state_slot_hash(
         &mut self,
         builder: &mut CircuitBuilder<F, D>,
@@ -281,14 +317,32 @@ impl<F: RichField + Extendable<D>, const D: usize> StateReaderGadget<F, D> {
         slot_index: F,
         contract_state_tree_height: u8,
     ) -> anyhow::Result<HashOutTarget> {
-        let merkle_proof_gadget = MerkleProofGadget::add_virtual_to::<PoseidonHash, F, D>(builder, contract_state_tree_height as usize);
-        builder.connect_hashes(merkle_proof_gadget.root, self.state.start_contract_state_root);
+        let expected_user_id = builder.constant(user_id);
+        let expected_contract_id = builder.constant(contract_id);
         let expected_slot_index = builder.constant(slot_index);
-        builder.connect(merkle_proof_gadget.index, expected_slot_index);
 
-        let value = merkle_proof_gadget.value.clone();
+        let other_user_leaf = PsyUserLeafGadget::create_virtual(builder);
+        builder.connect(other_user_leaf.user_id, expected_user_id);
+        let other_user_leaf_hash = other_user_leaf.to_hash::<PoseidonHash, F, D>(builder);
 
-        self.merkel_proofs.push(merkle_proof_gadget);
+        let user_tree_proof = MerkleProofGadget::add_virtual_to::<PoseidonHash, F, D>(builder, GLOBAL_USER_TREE_HEIGHT as usize);
+        builder.connect_hashes(user_tree_proof.root, self.user_tree_root);
+        builder.connect(user_tree_proof.index, expected_user_id);
+        builder.connect_hashes(user_tree_proof.value, other_user_leaf_hash);
+
+        let uct_proof = MerkleProofGadget::add_virtual_to::<PoseidonHash, F, D>(builder, GLOBAL_CONTRACT_TREE_HEIGHT as usize);
+        builder.connect_hashes(uct_proof.root, other_user_leaf.user_state_tree_root);
+        builder.connect(uct_proof.index, expected_contract_id);
+
+        let slot_proof = MerkleProofGadget::add_virtual_to::<PoseidonHash, F, D>(builder, contract_state_tree_height as usize);
+        builder.connect_hashes(slot_proof.root, uct_proof.value);
+        builder.connect(slot_proof.index, expected_slot_index);
+
+        let value = slot_proof.value.clone();
+        self.aux_user_leaves.push(other_user_leaf);
+        self.merkel_proofs.push(user_tree_proof);
+        self.merkel_proofs.push(uct_proof);
+        self.merkel_proofs.push(slot_proof);
         self.state_cmds.push(DPNStateCmd::GetOtherUserContractStateSlotHash(
             DPNStateCmdGetOtherUserContractStateSlotHash {
                 user_id,
@@ -330,11 +384,9 @@ impl<F: RichField + Extendable<D>, const D: usize> StateReaderGadget<F, D> {
         let slot_index = F::from_canonical_u64(sub_slot_index / 4u64);
         let n = (sub_slot_index & 0b11) as usize;
         if length == 1 {
-            // one merkle proof
             let cur = self.get_other_user_contract_state_slot_hash(builder, user_id, contract_id, slot_index, contract_state_tree_height)?;
             Ok(vec![cur.elements[n]])
         } else if length < 6 {
-            // two merkle proofs
             let value_0 = self.get_other_user_contract_state_slot_hash(builder, user_id, contract_id, slot_index, contract_state_tree_height)?;
             let value_1 =
                 self.get_other_user_contract_state_slot_hash(builder, user_id, contract_id, slot_index + F::ONE, contract_state_tree_height)?;
@@ -394,5 +446,50 @@ impl<F: RichField + Extendable<D>, const D: usize> StateReaderGadget<F, D> {
             }
             Ok(result)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use plonky2::{
+        field::{goldilocks_field::GoldilocksField, types::Field},
+        plonk::{circuit_builder::CircuitBuilder, circuit_data::CircuitConfig},
+    };
+
+    use super::StateReaderGadget;
+
+    type F = GoldilocksField;
+    const D: usize = 2;
+
+    #[test]
+    fn external_contract_read_binds_contract_via_user_contract_tree() {
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let mut reader = StateReaderGadget::new(&mut builder, 1);
+        reader
+            .get_self_user_external_contract_state_slot_hash(&mut builder, F::from_canonical_u64(7), F::from_canonical_u64(3), 1)
+            .expect("external read");
+        assert_eq!(reader.merkel_proofs.len(), 2, "UCT proof + slot proof");
+        assert!(reader.aux_user_leaves.is_empty());
+        assert_eq!(reader.state_cmds.len(), 1);
+    }
+
+    #[test]
+    fn other_user_read_binds_user_and_contract_via_inclusion_path() {
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let mut reader = StateReaderGadget::new(&mut builder, 1);
+        reader
+            .get_other_user_contract_state_slot_hash(
+                &mut builder,
+                F::from_canonical_u64(10),
+                F::from_canonical_u64(20),
+                F::from_canonical_u64(0),
+                1,
+            )
+            .expect("other-user read");
+        assert_eq!(reader.merkel_proofs.len(), 3, "user-tree + UCT + slot proofs");
+        assert_eq!(reader.aux_user_leaves.len(), 1, "other-user leaf gadget");
+        assert_eq!(reader.state_cmds.len(), 1);
     }
 }
