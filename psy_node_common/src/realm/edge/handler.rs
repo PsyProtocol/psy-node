@@ -1,4 +1,5 @@
 use std::{sync::Arc, u64};
+use std::future::Future;
 use tokio::task;
 use futures::stream::{self, StreamExt};
 
@@ -63,6 +64,35 @@ use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 use crate::worker_whitelist::WhiteListCache;
 
 const END_CAP_PROOF_CIRCUIT_TYPE_U32: u32 = ProvingJobCircuitType::UserEndCap as u32;
+
+fn ensure_end_cap_generation_unchanged(
+    stored: (u64, parth_core::QCoreProcCheckpointUniqueId),
+    gathering: (u64, parth_core::QCoreProcCheckpointUniqueId),
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        stored == gathering,
+        "EndCap gathering generation changed during storage/delivery: stored {:?}, current {:?}; delivery is not confirmed",
+        stored,
+        gathering,
+    );
+    Ok(())
+}
+
+async fn with_end_cap_gathering_generation<Read, ReadFuture, Submit, SubmitFuture>(
+    mut read_generation: Read,
+    submit: Submit,
+) -> anyhow::Result<()>
+where
+    Read: FnMut() -> ReadFuture,
+    ReadFuture: Future<Output = anyhow::Result<(u64, parth_core::QCoreProcCheckpointUniqueId)>>,
+    Submit: FnOnce((u64, parth_core::QCoreProcCheckpointUniqueId)) -> SubmitFuture,
+    SubmitFuture: Future<Output = anyhow::Result<()>>,
+{
+    let generation = read_generation().await?;
+    submit(generation).await?;
+    // A stale ephemeral publish may succeed after its gatherer has retired.
+    ensure_end_cap_generation_unchanged(generation, read_generation().await?)
+}
 
 /// Sparse subtree reads are only safe inside the realm half of the user tree.
 /// Requests with `root_level` above the authenticated spine would otherwise
@@ -744,8 +774,6 @@ impl<
             .await?;
         timer.lap_micros("checkpoint_tree_get_merkle_proof");
 
-        let job_id =
-            QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(user_id, N::GLOBAL_USER_TREE_HEIGHT, unique_pending_id)?;
         let historical_root = checkpoint_tree_proof.get_append_root::<N::HasherBase>();
         if historical_root != user_end_cap_input.core.state_transition.checkpoint_tree_root_hash {
             anyhow::bail!(
@@ -801,8 +829,6 @@ impl<
             user_end_cap_input,
             proof_bytes,
             user_id,
-            unique_pending_id,
-            job_id,
             old_leaf_hash,
         )
         .await
@@ -886,10 +912,16 @@ impl<
         user_end_cap_input: SubmitUserEndCapNonProofInput<N::F, N::QHash>,
         proof_bytes: Vec<u8>,
         user_id: u64,
-        unique_pending_id: u64,
-        job_id: QProvingJobDataID,
         old_leaf_hash: N::QHash,
     ) -> anyhow::Result<()> {
+        // Verification may span rotations. Bind every write and the queue subject
+        // to one post-verification gathering generation, never a refreshed half-pair.
+        with_end_cap_gathering_generation(
+            || self.temp_db.get_gathering_unique_pending_ids(&self.realm_identifier),
+            |(unique_pending_id, proc_checkpoint_id)| async move {
+        let job_id = QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(
+            user_id, N::GLOBAL_USER_TREE_HEIGHT, unique_pending_id,
+        )?;
         let rand_status = rand::random::<u64>();
 
 
@@ -1003,23 +1035,16 @@ impl<
         }
         timer.lap_micros("set_user_end_cap_slot_updates");
 
-        // Re-read gathering proc ID right before publish to avoid a race with
-        // process_block.set_new_unique_ids, which may have advanced the ID
-        // during the async proof verification / storage calls above. Publishing
-        // to a stale (already-drained) queue silently drops the endcap.
-        let (_, live_proc_id) = self.temp_db.get_gathering_unique_pending_ids(&self.realm_identifier).await?;
-
         let queue_key = RealmUserUpdateQueueKey {
             realm_id: self.realm_id_u64,
             realm_sub_id: self.realm_sub_id_u64,
-            unique_id: live_proc_id,
+            unique_id: proc_checkpoint_id,
             task_group: 0,
             queue_type: QPBaseQueueType::StandardEphemeral,
             _phantom_queue_item: std::marker::PhantomData,
         };
         let new_user_leaf = user_end_cap_input.core.new_user_leaf.clone();
         let new_user_leaf_hash = new_user_leaf.qfhash::<N::HasherBase>();
-        // Keep original job_id (proof stored under it). Only refresh queue key.
 
         let queue_item = PsyRealmUserUpdateQueueItem {
             job_id: job_id,
@@ -1031,35 +1056,28 @@ impl<
             events: user_end_cap_input.events,
         };
 
-        // Ensure the consumer for live_proc_id exists BEFORE publishing. If
-        // the processor has already drained and deleted the consumer for this
-        // generation, publishing to an ephemeral queue with no consumer silently
-        // drops the message. By ensuring the consumer here, we guarantee the
-        // message will be buffered and picked up by the gatherer on its next
-        // drain cycle — even if the processor has already rotated past this ID.
-        // The consumer we create is idempotent: if it already exists this is a
-        // no-op; if it was deleted, it is recreated with DeliverPolicy::All so
-        // all pending messages are replayed.
-        if let Err(e) = self.user_update_queue.ensure_consumer(
+        self.user_update_queue.ensure_consumer(
             &queue_key,
             self.realm_id_u64,
             self.realm_sub_id_u64,
-            live_proc_id,
+            proc_checkpoint_id,
             0,
-        ).await {
-            tracing::warn!(
-                "Failed to ensure consumer for live_proc_id {} before publish (continuing): {}",
-                live_proc_id, e
-            );
-        }
+        ).await?;
+
+        ensure_end_cap_generation_unchanged(
+            (unique_pending_id, proc_checkpoint_id),
+            self.temp_db.get_gathering_unique_pending_ids(&self.realm_identifier).await?,
+        )?;
 
         self.user_update_queue
-            .publish_ephemeral_queue_item_owned(&queue_key, self.realm_id_u64, self.realm_sub_id_u64, live_proc_id, 0, queue_item)
+            .publish_ephemeral_queue_item_owned(&queue_key, self.realm_id_u64, self.realm_sub_id_u64, proc_checkpoint_id, 0, queue_item)
             .await?;
         timer.lap_micros("publish_ephemeral_queue_item_owned");
         timer.lap_group("handle_user_end_cap_proof_submission total");
 
         Ok(())
+            },
+        ).await
     }
 
 }
@@ -1586,6 +1604,91 @@ mod tests {
 
     const TEST_CHAIN_ID: u32 = 7;
     const TEST_REALM_ID: u32 = 3;
+
+    #[tokio::test]
+    async fn end_cap_rotation_between_verification_and_store_keeps_payload_deliverable() {
+        use std::cell::{Cell, RefCell};
+        let snapshot = (42, parth_core::QCoreProcCheckpointUniqueId::from(97u128));
+        let gathering = Cell::new(snapshot);
+        let proofs = RefCell::new(HashMap::new());
+        let updates = RefCell::new(HashMap::new());
+        let queue = RefCell::new(Vec::new());
+        let verified_proof = vec![1, 2, 3];
+        let user_id = 7;
+        // Verification yields while the processor rotates away from the snapshot.
+        tokio::task::yield_now().await;
+        let current = (43, parth_core::QCoreProcCheckpointUniqueId::from(103u128));
+        gathering.set(current);
+        with_end_cap_gathering_generation(
+            || std::future::ready(Ok(gathering.get())),
+            |(pending, proc_id)| {
+                let (proofs, updates, queue, verified_proof) = (&proofs, &updates, &queue, &verified_proof);
+                async move {
+                let job_id = QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(
+                    user_id, 32, pending,
+                )?;
+                proofs.borrow_mut().insert((pending, job_id), verified_proof.clone());
+                tokio::task::yield_now().await;
+                updates.borrow_mut().insert((pending, user_id), 123);
+                queue.borrow_mut().push((proc_id, job_id));
+                Ok(())
+                }
+            },
+        ).await.unwrap();
+        let (subject, job_id) = queue.borrow_mut().pop().expect("EndCap delivered");
+        assert_eq!(subject, current.1);
+        assert_eq!(job_id.goal_id, current.0);
+        assert_eq!(updates.borrow().get(&(current.0, user_id)), Some(&123));
+        assert_eq!(proofs.borrow().get(&(current.0, job_id)), Some(&verified_proof));
+        assert!(!updates.borrow().contains_key(&(snapshot.0, user_id)));
+    }
+
+    #[tokio::test]
+    async fn end_cap_rotation_inside_store_publish_never_acknowledges_delivery() {
+        use std::cell::Cell;
+        let gathering = Cell::new((42, parth_core::QCoreProcCheckpointUniqueId::from(97u128)));
+        let err = with_end_cap_gathering_generation(
+            || std::future::ready(Ok(gathering.get())),
+            |_| async {
+                tokio::task::yield_now().await;
+                gathering.set((43, parth_core::QCoreProcCheckpointUniqueId::from(103u128)));
+                Ok(())
+            },
+        ).await.unwrap_err();
+        assert!(err.to_string().contains("delivery is not confirmed"));
+    }
+
+    #[tokio::test]
+    async fn end_cap_store_publish_failure_is_not_acknowledged() {
+        let err = with_end_cap_gathering_generation(
+            || std::future::ready(Ok((42, parth_core::QCoreProcCheckpointUniqueId::from(97u128)))),
+            |_| async { anyhow::bail!("consumer unavailable") },
+        ).await.unwrap_err();
+        assert_eq!(err.to_string(), "consumer unavailable");
+    }
+
+    #[test]
+    fn end_cap_generation_accepts_unchanged_storage_delivery_pair() {
+        let generation = (42, parth_core::QCoreProcCheckpointUniqueId::from(97u128));
+        ensure_end_cap_generation_unchanged(generation, generation).unwrap();
+    }
+
+    #[test]
+    fn end_cap_generation_rejects_rotation_during_storage_or_publish() {
+        let stored = (42, parth_core::QCoreProcCheckpointUniqueId::from(97u128));
+        let rotated = (43, parth_core::QCoreProcCheckpointUniqueId::from(103u128));
+        let err = ensure_end_cap_generation_unchanged(stored, rotated).unwrap_err();
+        assert!(err.to_string().contains("delivery is not confirmed"));
+    }
+
+    #[test]
+    fn end_cap_generation_rejects_refreshing_only_half_the_pair() {
+        let stored = (42, parth_core::QCoreProcCheckpointUniqueId::from(97u128));
+        assert!(ensure_end_cap_generation_unchanged(stored, (43, stored.1)).is_err());
+        assert!(ensure_end_cap_generation_unchanged(
+            stored, (stored.0, parth_core::QCoreProcCheckpointUniqueId::from(103u128)),
+        ).is_err());
+    }
 
     /// Deterministic Ed25519 NodeId per seed byte.
     fn test_node(seed: u8) -> NodeId {
