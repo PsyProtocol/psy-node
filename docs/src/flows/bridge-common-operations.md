@@ -470,5 +470,5 @@ Do not manually kill individual services. A non-purge restart can separate L1 an
 - Current command registry and flags: `client_prover/psy_cli/psy_user_cli/src/subcommand/mod.rs:47-159`, `client_prover/psy_cli/psy_user_cli/src/subcommand/args.rs:705-877`.
 - Current executable reference flow: `e2e/bridge-e2e.sh:88-289`.
 - Current relayer command surface: `psy_cli/psy_relayer_cli/src/main.rs:23-62`, `psy_cli/psy_relayer_cli/src/main.rs:148-223`.
-- Referenced memory walkthrough: *Bridge E2E Walkthrough — Deposit → Claim → Withdraw → Claim* in the external Psy memory repository, especially “服务健康检查”, “全局注意事项与操作纪律 (Gotchas)”, sections 4.0–4.6, “Bridge Relayer 主循环”, and lessons 33.3–33.11.
+- Referenced memory walkthrough: *Bridge E2E Walkthrough — Deposit → Claim → Withdraw → Claim* in the external Psy memory repository, especially the service-health-check section, the operational-discipline (Gotchas) section, sections 4.0-4.6, the Bridge Relayer main-loop section, and lessons 33.3-33.11.
 - Current source overrides any stale command or behavior in the walkthrough.
