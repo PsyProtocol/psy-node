@@ -1,0 +1,208 @@
+name: Deploy Multichain Psy Dapp
+
+on:
+  push:
+    branches:
+      - deploy/multi-chain-gcp
+  workflow_dispatch:
+    inputs:
+      deploy_app:
+        description: Deploy the bridge app
+        required: false
+        type: boolean
+        default: true
+      deploy_explorer:
+        description: Deploy the explorer
+        required: false
+        type: boolean
+        default: true
+      pages_branch:
+        description: Cloudflare Pages branch label
+        required: false
+        default: staging
+
+permissions:
+  contents: read
+
+concurrency:
+  group: multichain-psy-dapp-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CI: true
+  HUSKY: 0
+  NODE_OPTIONS: --max-old-space-size=4096
+  CF_PAGES_BRANCH: ${{ inputs.pages_branch || 'staging' }}
+  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+  MULTICHAIN_L1_ENABLED: '1'
+  MULTICHAIN_L1_RUNTIME_FILE: deploy/multi-chain/gcp/runtime/l1-deployments.json
+
+jobs:
+  validate_source:
+    name: Require the deployment branch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reject non-deployment refs
+        shell: bash
+        run: |
+          if [ "$GITHUB_REF_NAME" != "deploy/multi-chain-gcp" ]; then
+            echo "This workflow may run only from deploy/multi-chain-gcp; got $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+
+      - name: Require frontend deployment secrets
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          DAPP_READ_TOKEN: ${{ secrets.PSY_DAPP_READ_TOKEN }}
+        shell: bash
+        run: |
+          missing=()
+          [ -n "$CF_ACCOUNT_ID" ] || missing+=(CLOUDFLARE_ACCOUNT_ID)
+          [ -n "$CF_API_TOKEN" ] || missing+=(CLOUDFLARE_API_TOKEN)
+          [ -n "$DAPP_READ_TOKEN" ] || missing+=(PSY_DAPP_READ_TOKEN)
+          if [ "${#missing[@]}" -ne 0 ]; then
+            printf 'Missing required repository secrets: %s\n' "${missing[*]}" >&2
+            exit 1
+          fi
+
+  deploy_app:
+    name: Deploy bridge app from deployment branch
+    needs: validate_source
+    if: github.event_name == 'push' || inputs.deploy_app
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out deployment source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Prepare pinned Psy dapp sources
+        env:
+          PSY_DAPP_READ_TOKEN: ${{ secrets.PSY_DAPP_READ_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="url.https://x-access-token:${PSY_DAPP_READ_TOKEN}@github.com/.insteadOf"
+          export GIT_CONFIG_VALUE_0="git@github.com:"
+          git submodule update --init psy-genesis psy-contracts
+          bash deploy/multi-chain/gcp/prepare-sources.sh
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Deploy bridge app to Cloudflare Pages
+        env:
+          CF_PAGES_PROJECT: psy-privacy-bridge-demo-stg
+          GCP_DEPLOY_CONFIG: deploy/multi-chain/gcp/config.example.env
+          INCLUDE_WALLET_DOWNLOAD: 0
+          PSY_FAUCET_SERVER_MODE: 1
+          WORKSPACE_HOME: ${{ github.workspace }}
+        run: bash deploy/cloudflare-pages/deploy-privacy-bridge-demo.sh
+
+      - name: Install browser validation dependencies
+        working-directory: deploy/multi-chain/gcp/e2e/browser
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Validate the published multichain app
+        working-directory: deploy/multi-chain/gcp/e2e/browser
+        env:
+          APP_URL: https://app-stg.psy-protocol.xyz
+        run: npm test
+
+      - name: Upload browser validation evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: multichain-app-browser-validation
+          path: |
+            deploy/multi-chain/gcp/e2e/browser/playwright-report
+            deploy/multi-chain/gcp/e2e/browser/test-results
+          if-no-files-found: ignore
+
+      - name: Write app deployment summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Multichain bridge app deployment"
+            echo
+            echo "- Source ref: \`${GITHUB_REF_NAME}\`"
+            echo "- Source commit: \`${GITHUB_SHA}\`"
+            echo "- Project: \`psy-privacy-bridge-demo-stg\`"
+            echo "- URL: https://app-stg.psy-protocol.xyz/"
+            echo "- Backend deployment: not performed"
+            echo "- Repository branch writes: none"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy_explorer:
+    name: Deploy explorer from deployment branch
+    needs: validate_source
+    if: github.event_name == 'push' || inputs.deploy_explorer
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out deployment source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Prepare pinned Psy dapp sources
+        env:
+          PSY_DAPP_READ_TOKEN: ${{ secrets.PSY_DAPP_READ_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="url.https://x-access-token:${PSY_DAPP_READ_TOKEN}@github.com/.insteadOf"
+          export GIT_CONFIG_VALUE_0="git@github.com:"
+          git submodule update --init psy-genesis psy-contracts
+          bash deploy/multi-chain/gcp/prepare-sources.sh
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Deploy explorer to Cloudflare Pages
+        env:
+          CF_PAGES_PROJECT: psy-explorer-stg
+          GCP_DEPLOY_CONFIG: deploy/multi-chain/gcp/config.example.env
+          WORKSPACE_HOME: ${{ github.workspace }}
+        run: bash deploy/cloudflare-pages/deploy-psy-explorer.sh
+
+      - name: Write explorer deployment summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Multichain explorer deployment"
+            echo
+            echo "- Source ref: \`${GITHUB_REF_NAME}\`"
+            echo "- Source commit: \`${GITHUB_SHA}\`"
+            echo "- Project: \`psy-explorer-stg\`"
+            echo "- URL: https://explorer-stg.psy-protocol.xyz/"
+            echo "- Backend deployment: not performed"
+            echo "- Repository branch writes: none"
+          } >> "$GITHUB_STEP_SUMMARY"

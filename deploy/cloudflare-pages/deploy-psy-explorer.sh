@@ -4,6 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=deploy/cloudflare-pages/lib-direct-upload.sh
 source "$SCRIPT_DIR/lib-direct-upload.sh"
+# shellcheck source=deploy/gcp/lib/multichain.sh
+source "$ROOT/deploy/gcp/lib/multichain.sh"
 
 PROJECT_NAME="${CF_PAGES_PROJECT:-psy-explorer-stg}"
 BRANCH="${CF_PAGES_BRANCH:-staging}"
@@ -28,7 +30,11 @@ set_public_domain_defaults
   exit 1
 }
 
-explorer_network="${PSY_EXPLORER_NETWORK:-${L1_DEPLOYMENTS_NETWORK:-sepolia}}"
+if multichain_enabled; then
+  explorer_network="${PSY_EXPLORER_NETWORK:-${MULTICHAIN_PRIMARY_NETWORK:-sepolia}}"
+else
+  explorer_network="${PSY_EXPLORER_NETWORK:-${L1_DEPLOYMENTS_NETWORK:-sepolia}}"
+fi
 explorer_fork="${PSY_EXPLORER_L1_FORK:-false}"
 deployment_path="$PSY_DAPP_DIR/psy-contracts/deployments/$explorer_network/deployed-contracts.json"
 deployment_backup="$(mktemp)"
@@ -47,6 +53,10 @@ cleanup_explorer_source() {
 }
 trap cleanup_explorer_source EXIT
 
+if multichain_enabled; then
+  multichain_write_frontend_deployment "$explorer_network" "$deployment_path"
+fi
+
 export VITE_NETWORK="$explorer_network"
 export VITE_L1_NETWORK="$explorer_network"
 export VITE_FORK="$explorer_fork"
@@ -57,7 +67,8 @@ export PSY_CONFIG_URL="${PSY_CONFIG_URL:-${PUBLIC_CONFIG_PAGE_URL%/}/config.json
 # Regenerate that snapshot from the freshly deployed L1 addresses before
 # validating or building the frontend.
 SYNC_SCRIPT="$PSY_DAPP_DIR/apps/bridge/scripts/sync-staging-config.mjs"
-if [ -f "$SYNC_SCRIPT" ] \
+if ! multichain_enabled \
+  && [ -f "$SYNC_SCRIPT" ] \
   && { [ "$VITE_NETWORK" = "sepolia" ] || [ "$VITE_NETWORK" = "bsc-testnet" ]; }; then
   echo "[cloudflare-pages] syncing $VITE_NETWORK deployed-contracts.json for explorer"
   node "$SYNC_SCRIPT"
@@ -92,9 +103,21 @@ if command -v jq >/dev/null 2>&1; then
     echo "missing explorer deployment metadata: $deployment_path" >&2
     exit 1
   }
+  expected_psy="${PSY_TOKEN_ADDRESS:-}"
+  expected_usdt="${USDT_TOKEN_ADDRESS:-}"
+  expected_bridge="${BRIDGE_ADDRESS:-}"
+  if multichain_enabled; then
+    expected_psy="$(multichain_runtime_json | jq -er --arg network "$explorer_network" \
+      '.chains[] | select(.network == $network) | .protocol.tokens.PSY.l1Address')"
+    expected_usdt="$(multichain_runtime_json | jq -er --arg network "$explorer_network" \
+      '.chains[] | select(.network == $network) | .protocol.tokens.USDT.l1Address')"
+    expected_bridge="$(multichain_runtime_json | jq -er --arg network "$explorer_network" \
+      '.chains[] | select(.network == $network) | .contracts.Bridge')"
+  fi
   jq -e \
-    --arg psy "${PSY_TOKEN_ADDRESS:-}" \
-    --arg usdt "${USDT_TOKEN_ADDRESS:-}" '
+    --arg psy "$expected_psy" \
+    --arg usdt "$expected_usdt" \
+    --arg bridge "$expected_bridge" '
       def lower_or_empty($v): ($v // "" | ascii_downcase);
       .protocol.tokens as $tokens
       | (($tokens.PSY.l1Address // "") | test("^0x[0-9a-fA-F]{40}$"))
@@ -103,10 +126,11 @@ if command -v jq >/dev/null 2>&1; then
         and (($tokens.USDT.decimals // -1) >= 0)
         and (($psy == "") or (lower_or_empty($tokens.PSY.l1Address) == lower_or_empty($psy)))
         and (($usdt == "") or (lower_or_empty($tokens.USDT.l1Address) == lower_or_empty($usdt)))
+        and (($bridge == "") or (lower_or_empty(.contracts.Bridge) == lower_or_empty($bridge)))
     ' "$deployment_path" >/dev/null || {
-      echo "explorer deployment token metadata does not match deploy/gcp/config.env" >&2
-      exit 1
-    }
+    echo "explorer deployment metadata does not match the selected runtime" >&2
+    exit 1
+  }
 fi
 
 echo "[cloudflare-pages] building psy explorer in ${EXPLORER_DIR}"

@@ -10,6 +10,7 @@ source "$ROOT/deploy/gcp/lib/multichain.sh"
 PROJECT_NAME="${CF_PAGES_PROJECT:-psy-privacy-bridge-demo-stg}"
 BRANCH="${CF_PAGES_BRANCH:-staging}"
 FRONTEND_DIR="${PSY_PRIVACY_BRIDGE_DEMO_DIR:-$ROOT/psy-dapp/apps/bridge}"
+PSY_DAPP_DIR="${PSY_DAPP_DIR:-$(cd "$FRONTEND_DIR/../.." && pwd)}"
 CONFIG_FILE="${GCP_DEPLOY_CONFIG:-$ROOT/deploy/gcp/config.env}"
 if [ -f "$CONFIG_FILE" ]; then
   set -a
@@ -98,24 +99,13 @@ trap cleanup_frontend_source EXIT
 if multichain_enabled; then
   multichain_deployment_backup_dir="$(mktemp -d)"
   while IFS= read -r network; do
-    source_deployment="$ROOT/psy-contracts/deployments/$network/deployed-contracts.json"
     target_deployment="$PSY_DAPP_DIR/psy-contracts/deployments/$network/deployed-contracts.json"
-    public_rpc_url="$(multichain_runtime_json | jq -er --arg network "$network" \
-      '.chains[] | select(.network == $network) | "https://" + .public_rpc_domain')"
-    [ -s "$source_deployment" ] || {
-      echo "missing multichain deployment metadata: $source_deployment" >&2
-      exit 1
-    }
     mkdir -p "$multichain_deployment_backup_dir/$network" "$(dirname "$target_deployment")"
     if [ -f "$target_deployment" ]; then
       cp "$target_deployment" "$multichain_deployment_backup_dir/$network/deployed-contracts.json"
       touch "$multichain_deployment_backup_dir/$network/existed"
     fi
-    cp "$source_deployment" "$target_deployment"
-    jq --arg rpc_url "$public_rpc_url" \
-      '.protocol.chain.defaultRpcUrl = $rpc_url' \
-      "$target_deployment" >"${target_deployment}.tmp"
-    mv "${target_deployment}.tmp" "$target_deployment"
+    multichain_write_frontend_deployment "$network" "$target_deployment"
   done < <(multichain_runtime_json | jq -r '.chains[].network')
 
   protocol_config_file="$PSY_DAPP_DIR/psy-contracts/protocol-config/index.ts"
@@ -319,6 +309,19 @@ if multichain_enabled; then
       exit 1
     fi
   done < <(multichain_runtime_json | jq -r '.chains[].rpc_url')
+
+  while IFS=$'\t' read -r network bridge_address public_rpc_domain; do
+    if ! grep -RFiq -- "$bridge_address" "$FRONTEND_DIR/dist"; then
+      echo "refusing frontend publish: ${network} Bridge address is missing from dist" >&2
+      exit 1
+    fi
+    if ! grep -RFq -- "https://${public_rpc_domain}" "$FRONTEND_DIR/dist"; then
+      echo "refusing frontend publish: ${network} public RPC URL is missing from dist" >&2
+      exit 1
+    fi
+  done < <(
+    multichain_runtime_json | jq -r '.chains[] | [.network, .contracts.Bridge, .public_rpc_domain] | @tsv'
+  )
 fi
 
 for token_icon in tokens/psy.svg tokens/usdt.svg; do

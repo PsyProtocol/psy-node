@@ -90,6 +90,28 @@ if grep -q 'private.example' <<<"$public_json"; then
   exit 1
 fi
 
+for network in sepolia bscTestnet baseSepolia; do
+  frontend_deployment="$TMP_DIR/frontend/$network/deployed-contracts.json"
+  multichain_write_frontend_deployment "$network" "$frontend_deployment"
+  jq -e \
+    --arg network "$network" '
+      .network == $network
+      and (.chainId | type == "string")
+      and (.contracts == .core)
+      and (.contracts.Bridge | test("^0x[0-9a-fA-F]{40}$"))
+      and (.protocol.tokens.PSY.l1Address | test("^0x[0-9a-fA-F]{40}$"))
+      and (.protocol.tokens.USDT.l1Address | test("^0x[0-9a-fA-F]{40}$"))
+      and (.protocol.chain.defaultRpcUrl | test("^https://rpc-[a-z]+-stg\\.example\\.test$"))
+    ' "$frontend_deployment" >/dev/null || {
+    echo "invalid frontend deployment generated for $network" >&2
+    exit 1
+  }
+  if grep -q 'private.example' "$frontend_deployment"; then
+    echo "frontend deployment leaked a private upstream RPC for $network" >&2
+    exit 1
+  fi
+done
+
 export ENVIO_CONFIG_FILE="$TMP_DIR/envio-config.yaml"
 export ENVIO_CHAINS_JSON="$envio_json"
 export ENVIO_CONFIRMED_BLOCK_THRESHOLD=8

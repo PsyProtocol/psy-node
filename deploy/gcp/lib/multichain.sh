@@ -178,3 +178,40 @@ multichain_export_frontend_rpc_urls() {
   BASE_SEPOLIA_RPC_URL="$(jq -er '.chains[] | select(.network == "baseSepolia") | "https://" + .public_rpc_domain' "$runtime_file")"
   export SEPOLIA_RPC_URL BSC_TESTNET_RPC_URL BASE_SEPOLIA_RPC_URL
 }
+
+multichain_write_frontend_deployment() {
+  local network="$1"
+  local output_file="$2"
+  local output_dir public_rpc_domain
+
+  output_dir="$(dirname "$output_file")"
+  public_rpc_domain="$(
+    multichain_runtime_json | jq -er --arg network "$network" \
+      '.chains[] | select(.network == $network) | .public_rpc_domain'
+  )"
+  mkdir -p "$output_dir"
+
+  multichain_runtime_json | jq -e \
+    --arg network "$network" \
+    --arg public_rpc_domain "$public_rpc_domain" '
+    .generated_at as $generated_at
+    | .chains[]
+    | select(.network == $network)
+    | {
+        chainId: (.chain_id | tostring),
+        contracts: .contracts,
+        core: .contracts,
+        generatedAt: $generated_at,
+        implementations: {},
+        network: .network,
+        protocol: (
+          .protocol
+          | .chain.defaultRpcUrl = ("https://" + $public_rpc_domain)
+        ),
+        proxies: {},
+        verify: {}
+      }
+  ' >"${output_file}.tmp"
+
+  mv "${output_file}.tmp" "$output_file"
+}
