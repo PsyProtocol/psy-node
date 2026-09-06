@@ -1,14 +1,14 @@
 # Token Privacy Circuit Fingerprints
 
-> **Internal developer documentation** — repository-only. Not part of the published mdBook (`SUMMARY.md`). Do not mix into public Node docs.
+> Internal developer documentation — repository-only. Not part of the published mdBook (SUMMARY.md).
 
-> Updated: 2026-09-03.
+> Updated: 2026-09-07. Status: Review.
 
-## Abstract
+## Overview
 
 `private_claim` and `claim_deposit` on the PSY token and USDT token contracts do not verify a Plonky2 proof. They reconstruct one UPS session-proof-tree leaf as `hash_two_to_one(circuit_fingerprint, public_inputs_hash)` and walk 16 Poseidon levels to `get_session_proof_tree_root()`. The four-limb constants `private_note_inclusion_fingerprint` and `shield_claim_fingerprint` are the **minifier** fingerprints of `PrivateNoteInclusionCircuit` and `DepositInclusionCircuit`. `DepositInclusionCircuit` is the compiled circuit; `ShieldDepositClaimCircuit` is a type alias for it (`client_prover/psy_circuit/psy_dpn_circuit/src/circuits/privacy/deposit_inclusion.rs:332`). Changing those circuits, the gadgets they share, their minifier chain, or the heights baked into them requires copying new limbs into both precompile contracts and matching compiled tests, then regenerating compiler/Genesis outputs only where their separate triggers apply.
 
-## Motivation
+## Background
 
 The contracts cannot embed a full Plonky2 verifier. The UPS session proof tree already commits to `(circuit_fingerprint, public_inputs_hash)` when the wallet inserts the external proof. The contract therefore only needs the same fingerprint the minifier advertises. A stale constant produces `proof tree root mismatch` on an otherwise valid claim. `psy-services` does not store a second copy of the limbs: it constructs the same circuits from its pinned `psy-node` revision. The compiler pin, Genesis bytecode, wallet `local_circuits.json`, and services pin must still refer to one `R_node`.
 
@@ -52,9 +52,25 @@ The contracts cannot embed a full Plonky2 verifier. The UPS session proof tree a
 3. These two constants live in `psy-compiler` source. They are not in `cached_circuit_library.rs`, EndCap verifier JSON, or any Groth16 keystore file.
 4. Copy limbs from a successful measurement of the **compiled** circuits on current `psy-node` source. Do not copy historical values from this document, a previous commit message, or the uncompiled `shield_deposit_claim.rs`.
 5. `token/src/main.psy` and `usdt_token/src/main.psy` must remain identical for both constants. Updating one file and leaving the other is invalid.
-6. `psy-services` has no hardcoded copy of either constant (`<workspace>/psy-services/src/indexer/nostr/proof_verifier.rs:617-628`). Pinning services to a different `R_node` than the contracts is invalid even when the `.psy` files were updated.
+6. `psy-services` derives both expected fingerprints from the compiled circuits (`<workspace>/psy-services/src/indexer/nostr/proof_verifier.rs:130-135,224-234`), rather than keeping a second hardcoded array. Pinning services to a different `R_node` than the contracts is invalid even when the `.psy` files were updated.
 
 ## 2. Binding Model
+
+```mermaid
+sequenceDiagram
+    participant Developer
+    participant Circuit
+    participant Compiler
+    participant Wallet
+    participant Contract
+    Developer->>Circuit: 1. Measure compiled minifier fingerprints
+    Circuit-->>Developer: 2. Four ordered limbs per circuit
+    Developer->>Compiler: 3. Promote matching token constants
+    Compiler-->>Contract: 4. Generate bytecode for authorized deployment
+    Wallet->>Circuit: 5. Prove and minify claim inputs
+    Wallet->>Contract: 6. Execute claim with session proof-tree path
+    Contract->>Contract: 7. Reconstruct leaf and require matching session root
+```
 
 ```text
 PrivateNoteInclusionCircuit / DepositInclusionCircuit
@@ -107,7 +123,7 @@ changes shape. Current construction is `client_prover/psy_circuit/psy_dpn_circui
 | `slot_value_in_contract_state.rs` (user / contract / contract-state Merkle gadgets used by the note circuit) | Yes |
 | `MerkleProofGadget` used by the note circuit | Yes |
 | `GLOBAL_USER_TREE_HEIGHT` (32), `GLOBAL_CONTRACT_TREE_HEIGHT` (24), `PRIVATE_NOTE_TREE_HEIGHT` (20) | Yes |
-| `TOKEN_CONTRACT_STATE_TREE_HEIGHT` generated from `psy-genesis/genesis_contracts.json` token `code_definition.state_tree_height` (`client_prover/psy_core/psy_config/build.rs:206-249`) | Yes |
+| `TOKEN_CONTRACT_STATE_TREE_HEIGHT` generated from `psy-genesis/genesis_contracts.json` token `code_definition.state_tree_height` (`client_prover/psy_core/psy_config/build.rs:219-262`) | Yes |
 | Minifier implementation `PsyProofMinifierChain`, `ComparisonGate(32, 16)`, `CircuitConfig::standard_recursion_config`, Poseidon hasher, or `add_psy_type_b_common_gates` | Yes |
 | `PrivateNoteInclusionInnerCircuit` base-only wiring that the minifier wraps (must stay byte-identical to the minifier base) | Yes; also regenerate `local_circuits.json` |
 
@@ -136,7 +152,7 @@ A change to `MerkleProofGadget`, `PsyProofMinifierChain`, `ComparisonGate`, `pad
 
 | Change | Fingerprint action |
 |---|---|
-| EndCap verifier JSON, localhost EndCap `[u64; 4]`, or `cached_circuit_library.rs` / `cached_common_data.rs` | None. Follow `docs/src/dev/circuit-and-verifier-operations.md` instead. |
+| EndCap verifier JSON, localhost EndCap `[u64; 4]`, or `cached_circuit_library.rs` / `cached_common_data.rs` | None. Follow [circuit-and-verifier-operations.md](circuit-and-verifier-operations.md) instead. |
 | GUTA whitelist root or coordinator circuit registration | None |
 | Bridge aggregation / deposit-append / withdrawal-claim Groth16 | None |
 | `function_whitelist_root` / `scripts/update_genesis_whitelist_roots.sh` | None. That is the contract function-tree root, not these circuit fingerprints. |
@@ -152,7 +168,7 @@ These are not the two fingerprint constants. They must still stay in lockstep wi
    - Shield claim: circuit at `client_prover/psy_circuit/psy_dpn_circuit/src/circuits/privacy/deposit_inclusion.rs:121-164`; contract at `<workspace>/psy-compiler/psy-precompiles/token/src/main.psy:344-357`. Fields: shield_address (4), amount words (8), token_address words (8), l2_token_contract_id words (8), source_chain_index, deposit_root (4), nullifier (4), note_commitment (4), deposit_index. Copy from `client_prover/psy_circuit/psy_dpn_circuit/src/circuits/privacy/deposit_inclusion.rs`, not from uncompiled `client_prover/psy_circuit/psy_dpn_circuit/src/circuits/privacy/shield_deposit_claim.rs`.
 2. **Proof-tree height.** The `for i in 0u32..16u32` loops must equal `UPS_SESSION_PROOF_TREE_HEIGHT`. Changing that height is a contract-source change in both methods of both files, independent of the fingerprint limbs.
 3. **`note_root_slot`.** `private_claim` currently requires `2147483649` (`<workspace>/psy-compiler/psy-precompiles/token/src/main.psy:652`). That is a slot-id check, not a fingerprint.
-4. **Wallet bundle.** Source, serialization version, or circuit-defining height changes to these privacy circuits trigger `make generate-local-circuits` (`docs/src/dev/circuit-and-verifier-operations.md` §6.2).
+4. **Wallet bundle.** Source, serialization version, or circuit-defining height changes to these privacy circuits trigger `make generate-local-circuits` ([circuit-and-verifier-operations.md](circuit-and-verifier-operations.md) §6.2).
 5. **`psy-services` `NOTE_TREE_HEIGHT`.** `<workspace>/psy-services/src/indexer/nostr/proof_verifier.rs:36` is a local `20` that must equal `PRIVATE_NOTE_TREE_HEIGHT`. Services constructs `PrivateNoteInclusionCircuit` at `<workspace>/psy-services/src/indexer/nostr/proof_verifier.rs:224-228`. After a height change, pin services to the same `R_node` and keep that local constant equal.
 
 ## 5. Measure
@@ -191,7 +207,7 @@ Treat this as one atomic set. A partial update is invalid.
    - `client_prover/psy_circuit/psy_dpn_circuit/src/circuits/privacy/deposit_inclusion.rs` (`deposit_inclusion_circuit_builds`; add `assert_eq` if missing)
 3. If §4 item 1 applies, replace the `hash([...])` argument lists in both token files from the compiled circuit preimage.
 4. If §4 item 2 applies, replace both `0u32..16u32` loops to the new height in both token files.
-5. If §6.2 of `docs/src/dev/circuit-and-verifier-operations.md` triggers, run `make generate-local-circuits` and commit `client_prover/psy_prover/src/wallet/local_circuits.json` with the circuit source.
+5. If §6.2 of [circuit-and-verifier-operations.md](circuit-and-verifier-operations.md) triggers, run `make generate-local-circuits` and commit `client_prover/psy_prover/src/wallet/local_circuits.json` with the circuit source.
 6. Re-run both measurement tests. Require pass.
 7. Freeze and push `R_node` before compiler or services pins move (`AGENTS.md` release DAG).
 
@@ -211,7 +227,7 @@ That target compiles both token variants, copies `token.json` and `token.update.
 
 Then:
 
-1. If `psy-genesis/genesis_contracts.json` content changed, run Genesis generation per `docs/src/dev/circuit-and-verifier-operations.md` §6.1.
+1. If `psy-genesis/genesis_contracts.json` content changed, run Genesis generation per [circuit-and-verifier-operations.md](circuit-and-verifier-operations.md) §6.1.
 2. Pin `psy-services` to the same pushed `R_node`. Do not add a hardcoded fingerprint there.
 3. For a new local chain, the next authorized purge restart loads the new Genesis bytecode. Fingerprint-only source edits do not take effect on an already-deployed token until `update_contract` with `token.update.json` (or an equivalent authorized redeploy).
 4. `claim_deposit` and `private_claim` on a live chain with previously deployed bytecode keep the previously deployed fingerprints. Mixing new wallet proofs with that bytecode fails closed at `proof tree root mismatch`.
@@ -254,3 +270,16 @@ Compilation of the `.psy` files or HTTP admission of an EndCap without the match
 | Cached library or EndCap JSON edited "to match" | Discard those unrelated edits; this procedure does not own them |
 
 The rollback unit is: both `.psy` fingerprint (and PI) edits, both compiled test expected values, `local_circuits.json` when triggered, compiler-generated Genesis token artifacts from one `gen-deploy-json` run, and the compiler/services pins to one `R_node`. Partial rollback is forbidden.
+
+## Security Considerations
+
+Preserve matching source revisions, configuration, and generated artifact cohorts. Never publish root `private_keys.json` or validator/faucet secrets. Generation does not authorize deployment or publication. Treat fingerprint, provenance, and membership mismatches as failures rather than bypassing verification.
+
+## Related Documents
+
+- [Circuit and verifier operations](circuit-and-verifier-operations.md)
+- [Devnet launcher reference](devnet-launcher-reference.md)
+- [Devnet lifecycle](devnet_lifecycle.md)
+- [Fn circuit fingerprint playbook](fn-circuit-fingerprint-playbook.md)
+- [Genesis generation](genesis-generation.md)
+- [Realm p2p validators](realm-p2p-validators.md)

@@ -1,19 +1,53 @@
 # Devnet Startup, Shutdown, Restart, and Rollback Lifecycle
 
-> **Internal developer documentation** — repository-only. Not part of the published mdBook (`SUMMARY.md`). Do not mix into public Node docs.
+> Internal developer documentation — repository-only. Not part of the published mdBook (SUMMARY.md).
 
-> Updated: 2026-09-06.
+> Updated: 2026-09-07. Status: Review.
 
-## Abstract
+## Overview
 
 `devnet_lifecycle.md` is the required operating procedure for local Psy devnet work: startup, shutdown,
 restart, and offline rollback keep the persisted Anvil chain, Scylla state, checkpoint files, and
 supervised processes aligned. Supported entry points are `make run-all`, `make restart`, `make
 rollback-stop`, `make rollback-resume`, `make shutdown`, and `make restart-all`.
 
-## Purpose
+## Background
 
-Use only this lifecycle for local devnet operations; it supersedes ad-hoc per-service startup and manual state repair.
+Use only this lifecycle for local devnet operations; it supersedes ad-hoc per-service startup and manual state repair. The supervisor distinguishes persistent infrastructure from application processes, allowing offline rollback without replacing the L1 chain. A purge instead removes the paired L1/L2 state. These are distinct operations, not interchangeable restart shortcuts (`dev/locSetupV4.ts:3450-3468,3505-3512,3851-3919`).
+
+## Table of Contents
+
+- [1. Environment](#1-environment)
+- [2. Artifact Gate](#2-artifact-gate)
+- [3. Fresh Start](#3-fresh-start)
+- [4. Readiness](#4-readiness)
+- [5. State-Preserving Restart](#5-state-preserving-restart)
+- [6. Offline Rollback Stop and Resume](#6-offline-rollback-stop-and-resume)
+- [7. Post-Restart and Post-Rollback Verification](#7-post-restart-and-post-rollback-verification)
+- [8. Failure Rules](#8-failure-rules)
+- [9. Forbidden Operations](#9-forbidden-operations)
+- [Related Documents](#related-documents)
+
+```mermaid
+sequenceDiagram
+    participant Operator
+    participant Supervisor
+    participant Applications
+    participant Infrastructure
+    Operator->>Supervisor: 1. rollback-stop
+    Supervisor->>Applications: 2. Stop and verify closed ports
+    Supervisor->>Supervisor: 3. Write stop sentinel
+    Note over Infrastructure: Anvil and database infrastructure remain available
+    Operator->>Infrastructure: 4. Execute validated offline rollback plans
+    Operator->>Supervisor: 5. rollback-resume
+    Supervisor->>Applications: 6. Replay commands and require readiness
+    Supervisor-->>Operator: 7. Remove sentinel after successful resume
+```
+
+```text
+artifact gate -> infrastructure -> validator injection -> processors/edges -> workers
+  -> proxy -> L1 deployment/reuse -> services/indexers -> faucet/relayer -> interfaces -> supervisor
+```
 
 ## 1. Environment
 
@@ -48,7 +82,7 @@ CARGO_NET_GIT_FETCH_WITH_CLI=true pnpm --dir ../psy-sdk/psy-ts-sdk/packages/psy-
 make build
 ```
 
-Do not weaken the provenance check. Do not add Cargo `[patch]` or `[replace]` overrides for pinned Psy node revisions. `dev/locSetupV4.ts:2294-2337` verifies the Genesis payload and stamp before process startup. Regenerate root `genesis.json` with `make generate-genesis-data` after regenerating compiler/Genesis contract artifacts; the root file embeds the contract circuit definitions consumed by processors and the prove proxy.
+Do not weaken the provenance check. Do not add Cargo `[patch]` or `[replace]` overrides for pinned Psy node revisions. `dev/locSetupV4.ts:2669-2725` verifies the Genesis payload and stamp before process startup. Regenerate root `genesis.json` with `make generate-genesis-data` after regenerating compiler/Genesis contract artifacts; the root file embeds the contract circuit definitions consumed by processors and the prove proxy.
 
 ## 3. Fresh Start
 
@@ -208,3 +242,12 @@ The earlier checkpoint-289-to-0 run proved L2 rollback, convergence, and transac
 - Do not regenerate a rollback plan after destructive phases have started; resume the frozen RP.
 - Do not restart processors until all Coordinator and Realm rollback plans and external recovery have completed.
 - Do not run formatters.
+
+## Related Documents
+
+- [Circuit and verifier operations](circuit-and-verifier-operations.md)
+- [Devnet launcher reference](devnet-launcher-reference.md)
+- [Fn circuit fingerprint playbook](fn-circuit-fingerprint-playbook.md)
+- [Genesis generation](genesis-generation.md)
+- [Realm p2p validators](realm-p2p-validators.md)
+- [Token privacy circuit fingerprints](token-privacy-circuit-fingerprints.md)

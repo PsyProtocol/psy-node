@@ -1,14 +1,14 @@
 # Circuit and Verifier Operations
 
-> **Internal developer documentation** — repository-only. Not part of the published mdBook (`SUMMARY.md`). Do not mix into public Node docs.
+> Internal developer documentation — repository-only. Not part of the published mdBook (SUMMARY.md).
 
-> Updated: 2026-09-02.
+> Updated: 2026-09-07. Status: Review.
 
-## Abstract
+## Overview
 
 This runbook is the release procedure for EndCap verifier metadata generated and completely validated only with `PSY_NETWORK=localhost`, Plonky2 caches, real peer-to-peer transaction acceptance, cross-repository delivery, and the three independent Bridge Groth16 cohorts. `config_gen_v2` is hardcoded to local-devnet constants, while every network enum arm currently reads one shared verifier JSON. Replacing that JSON is therefore a global runtime verifier mutation generated and validated only against localhost; non-local operation must fail closed until source implements and validates distinct per-network verifier metadata selection. Bridge publication is a separate, explicitly authorized operation: package offline, hash the nine uncompressed files in a version-1 manifest, upload objects first, read them back and validate them, then upload the manifest last.
 
-## Motivation
+## Background
 
 Circuit metadata forms a dependency cascade, but not every circuit-related change triggers every generator. EndCap verifier JSON and its four-limb fingerprint must come from one real circuit construction. Cache generation must not enter the Groth16 path. Genesis data and the embedded wallet circuit bundle have narrower independent triggers. Bridge aggregation, deposit append, and withdrawal claim each own a separate trusted-setup cohort. Finally, compilation success or HTTP admission alone does not prove the real peer-to-peer path: acceptance requires one real `psy_user_cli call`, a forwarded EndCap through one pinned edge, proposal voting and certification, Coordinator admission, proposer commit, non-proposer fast-forward synchronization, and equal roots.
 
@@ -56,10 +56,10 @@ Circuit metadata forms a dependency cascade, but not every circuit-related chang
 ## 1. Authority and Operational Boundary
 
 1. Run node commands from `<repo-root>`, sibling commands from `<workspace>/<repo>`, local keystore commands against `<home>/.psy/keystore`, and disposable operations under `<tmp>`. Repository documentation must not contain workstation paths.
-2. Current Audit source is the governing reference. Relevant release policy and repository topology are at `AGENTS.md:72-90,92-134`.
+2. Current Audit source is the governing reference. Relevant release policy and repository topology are at `AGENTS.md:75-93,95-137`.
 3. The complete metadata generation and validation procedure exists only for `PSY_NETWORK=localhost`. The metadata CLI prints the compiled `CURRENT_NETWORK`, `PSY_NETWORK_MAGIC`, fingerprint, exact `[u64; 4]`, and verifier JSON (`client_prover/psy_cli/psy_user_cli/src/subcommand/get_user_endcap_common_data.rs:12-30`). The fingerprint constant is localhost-specific, but the checked-in real verifier JSON is shared by every network selector arm.
-4. Replacing `END_CAP_ALT_VERIFIER_DATA_SERIALIZED` changes runtime verifier input for all eight networks, even though current generation and cache validation cover only LocalDevnet. `config_gen_v2` explicitly loads `PsyChainNetworkType::LocalDevnet` and instantiates `PsyNetworkLocalDevnetConstants` (`psy_plonky2_circuits/examples/config_gen_v2.rs:93-102,441-442`), while the verifier selector maps every network enum arm to the same JSON constant (`psy_plonky2_circuits/src/circuit_library/end_cap_verifier_data.rs:29-40`). Block all non-local use of the changed blob until a reviewed implementation selects and validates distinct per-network verifier metadata throughout the CLI, cache generator, checked-in verifier data, and network constants.
-5. Generation, repository delivery, artifact upload, package publication, contract deployment, and Git push are separate actions. Authorization for one does not authorize another (`AGENTS.md:56-67`).
+4. Replacing `END_CAP_ALT_VERIFIER_DATA_SERIALIZED` changes runtime verifier input for all eight networks, even though current generation and cache validation cover only LocalDevnet. `config_gen_v2` explicitly loads `PsyChainNetworkType::LocalDevnet` and instantiates `PsyNetworkLocalDevnetConstants` (`psy_plonky2_circuits/examples/config_gen_v2.rs:93-102,448-449`), while the verifier selector maps every network enum arm to the same JSON constant (`psy_plonky2_circuits/src/circuit_library/end_cap_verifier_data.rs:29-40`). Block all non-local use of the changed blob until a reviewed implementation selects and validates distinct per-network verifier metadata throughout the CLI, cache generator, checked-in verifier data, and network constants.
+5. Generation, repository delivery, artifact upload, package publication, contract deployment, and Git push are separate actions. Authorization for one does not authorize another (`AGENTS.md:59-70`).
 
 ## 2. Dependency Model
 
@@ -135,9 +135,10 @@ The CLI enables deposit append and withdrawal claim unless explicitly skipped, a
 
 | Changed input | EndCap metadata | Cache pair | Genesis outputs | `local_circuits.json` |
 |---|---:|---:|---:|---:|
-| UPS or EndCap constraints, gates, ordered PI, whitelist inputs, minifier, verifier shape, or network magic used by the circuit | Yes | Yes | No | No unless an embedded bundle circuit also changed |
+| UPS or EndCap constraints, gates, ordered PI, whitelist inputs, minifier, verifier shape, or `PSY_NETWORK_MAGIC` supplied to the EndCap constructor | Yes | Yes | No | No unless an embedded bundle circuit also changed |
 | EndCap verifier JSON or fingerprint correction | Re-derive and promote as one set | Yes | No | No |
 | GUTA or coordinator constraints, verifier shape, ordered PI, registered circuit triplet, common data, or library composition | No unless EndCap changed | Yes | No | No |
+| P2P/storage `chain_id` migration that changes RealmFinalizeGUTA `H(chain_id)` while the EndCap constructor magic stays unchanged | No | Yes; also regenerate `bridge_agg` under §3.2 | No | No |
 | Cache encoding or serialization with identical reconstructed circuits | No | Yes | No | No |
 | Ordinary EndCap, GUTA, cache, verifier, transport, witness, logging, retry, or storage change | No extra action | As rows above | No | No |
 | `psy-genesis/genesis_contracts.json` content changes | Apply separate Genesis trigger | Only if circuit inputs changed | Yes | Yes only if embedded bundle circuit sources/version/heights changed |
@@ -147,6 +148,12 @@ The CLI enables deposit append and withdrawal claim unless explicitly skipped, a
 | Embedded zk-sign, private-note-inclusion, or shield-deposit-claim circuit source, serialization version, or circuit-defining height changes | No unless EndCap input changed | Only if network library changed | No | Yes |
 
 A transport-only or DTO-only field is a non-trigger only while constraints, ordered PI count and meaning, verifier data, fingerprints, common data, cap heights, and tree heights remain identical.
+
+The PSY chain-identity migration replaces former `u32` chain IDs with the per-network `u64` magic from `psy-genesis/config.json` (`PSY_CONFIG_PATH` selects the same build-time override as client_prover). `PsyChainNetworkType` remains a selector: LocalDevnet maps to localhost, PsyPublicTestnet to sepolia, and PsyMainnet to ethereum; other selectors fail closed. Localhost magic is `1384803358401154921`.
+
+This is a breaking source cutover: Proposal is 214 bytes, Certificate 204 bytes, EndCapForwardHeader 60 bytes, stored ValidatorLeafPreimage 108 bytes, and the QBlob tree-node batch header 84 bytes. Existing validator preimages, blob headers, persisted processor state, proposals, certificates, and forwarded EndCaps are not a compatible storage/wire cohort. Do not mix old and rebuilt nodes or resume old state with rebuilt binaries; the owner must authorize a purge/reinitialization under the lifecycle guide before adopting this source.
+
+The finalizer's `H(chain_id)` circuit constant changes, cascading through the GUTA whitelist and coordinator to `bridge_agg`; proposal and EndCap IDs also change. The finalizer derives that domain from `network.get_chain_id()` (`psy_plonky2_circuits/src/circuit_library/core.rs:63`; `psy_data/src/guta/realm_finalize.rs:78-85`). This is distinct from the EndCap constructor's `psy_config::PSY_NETWORK_MAGIC` input (`client_prover/psy_cli/psy_user_cli/src/subcommand/get_user_endcap_common_data.rs:13-14`), which this migration leaves unchanged. On an owner-authorized rebuild, regenerate the cache pair with `config_gen_v2`, then the matching `bridge_agg` Groth16 cohort and Solidity verifier. This migration alone does **not** authorize root `genesis.json` regeneration, token privacy fingerprint changes, EndCap metadata promotion, or deposit/withdrawal cohort regeneration: user sighashes and EndCap ZK signatures already use `PSY_NETWORK_MAGIC`, and the validator Merkle leaf hash still excludes chain identity. Source-only edits leave the running stack untouched; no rebuild, purge, restart, or artifact regeneration is implicit.
 
 ### 3.2 Independent Bridge matrix
 
@@ -163,14 +170,14 @@ Deposit append exposes its batch commitment as PI and owns its own frontier, lea
 
 ### 3.3 Token privacy circuit fingerprints
 
-`private_note_inclusion_fingerprint` and `shield_claim_fingerprint` are four-limb constants in the PSY and USDT token precompiles. They bind `private_claim` / `claim_deposit` to the minifier fingerprints of `PrivateNoteInclusionCircuit` and `DepositInclusionCircuit` (protocol alias `ShieldDepositClaimCircuit`). They are not EndCap metadata, coordinator-library fingerprints, or Groth16 keys. A change that updates the last row of §3.1 for those two embedded circuits also requires the token-precompile procedure in `docs/src/dev/token-privacy-circuit-fingerprints.md`. Cache generation does not copy those limbs.
+`private_note_inclusion_fingerprint` and `shield_claim_fingerprint` are four-limb constants in the PSY and USDT token precompiles. They bind `private_claim` / `claim_deposit` to the minifier fingerprints of `PrivateNoteInclusionCircuit` and `DepositInclusionCircuit` (protocol alias `ShieldDepositClaimCircuit`). They are not EndCap metadata, coordinator-library fingerprints, or Groth16 keys. A change that updates the last row of §3.1 for those two embedded circuits also requires the token-precompile procedure in [token-privacy-circuit-fingerprints.md](token-privacy-circuit-fingerprints.md). Cache generation does not copy those limbs.
 
 ## 4. Localhost EndCap Metadata
 
 ### 4.1 Preconditions
 
 1. Use the exact source revision intended for the release.
-2. Require `<repo-root>/psy-genesis/config.json` to contain the intended localhost configuration. The current localhost magic and realm-0 edge list are at `psy-genesis/config.json:3-15`.
+2. Require `<repo-root>/psy-genesis/config.json` to contain the intended localhost configuration. The current localhost magic and realm-0 edge list are at `psy-genesis/config.json:3-19`.
 3. Preserve the previous shared verifier JSON, localhost fingerprint constant, and both caches as one rollback unit. Inventory every deployment built from the shared JSON because replacing it is not isolated to localhost in current source.
 4. Do not run this section for a non-local target and do not treat localhost validation as evidence for another network.
 
@@ -226,7 +233,7 @@ psy_plonky2_circuits/src/generated/cached_circuit_library.rs
 psy_plonky2_circuits/src/generated/cached_common_data.rs
 ```
 
-The writer compares and replaces only those paths (`psy_plonky2_circuits/examples/config_gen_v2.rs:441-467`).
+The writer compares and replaces only those paths (`psy_plonky2_circuits/examples/config_gen_v2.rs:448-474`).
 
 ### 5.2 Forbidden cache command
 
@@ -237,7 +244,7 @@ make config_gen_v2
 cargo run --release --package psy_plonky2_circuits --example config_gen_v2
 ```
 
-The crate default features include `gnark-wrap`, while the required command explicitly disables defaults. The generator conditionally enters Groth16 setup under that feature (`psy_plonky2_circuits/Cargo.toml:7-13`; `psy_plonky2_circuits/examples/config_gen_v2.rs:249-252,346-438`). Cache generation must not delete, generate, or export Bridge setup material.
+The crate default features include `gnark-wrap`, while the required command explicitly disables defaults. The generator conditionally enters Groth16 setup under that feature (`psy_plonky2_circuits/Cargo.toml:7-13`; `psy_plonky2_circuits/examples/config_gen_v2.rs:256-259,353-445`). Cache generation must not delete, generate, or export Bridge setup material.
 
 ### 5.3 Stability loop
 
@@ -271,7 +278,7 @@ When triggered, the current target is:
 make generate-genesis-data
 ```
 
-It runs the local-devnet Genesis test (`Makefile:110-111`). The generator writes root `genesis.json`, root `private_keys.json`, and `psy-dapp/apps/bridge/src/config/faucetOperators.json` (`psy_plonky2_circuits/src/node/config/networks/local_devnet.rs:368-374,376-460`). Root `genesis.json` and `private_keys.json` are local operational artifacts. Never package or publish `private_keys.json`; never include generated private keys in a release artifact.
+It runs the local-devnet Genesis test (`Makefile:110-111`). The generator writes root `genesis.json`, root `private_keys.json`, and `psy-dapp/apps/bridge/src/config/faucetOperators.json` (`psy_plonky2_circuits/src/node/config/networks/local_devnet.rs:434-440,442-521`). Root `genesis.json` and `private_keys.json` are local operational artifacts. Never package or publish `private_keys.json`; never include generated private keys in a release artifact.
 
 ### 6.2 Embedded wallet circuit trigger
 
@@ -281,7 +288,7 @@ Run the following only when an embedded bundle circuit source, bundle serializat
 make generate-local-circuits
 ```
 
-The target regenerates `client_prover/psy_prover/src/wallet/local_circuits.json` (`Makefile:113-118`). Runtime loads that embedded bundle, containing zk-sign plus the private-note-inclusion and shield-deposit-claim base circuits (`client_prover/psy_prover/src/wallet/memory_wallet.rs:336-339,426-451`). Ordinary EndCap, GUTA, cache, or verifier changes do not trigger it. The same privacy-circuit change also invalidates the token-precompile fingerprint constants; follow `docs/src/dev/token-privacy-circuit-fingerprints.md` and do not treat this wallet bundle as a substitute for those contract limbs.
+The target regenerates `client_prover/psy_prover/src/wallet/local_circuits.json` (`Makefile:113-118`). Runtime loads that embedded bundle, containing zk-sign plus the private-note-inclusion and shield-deposit-claim base circuits (`client_prover/psy_prover/src/wallet/memory_wallet.rs:336-339,426-451`). Ordinary EndCap, GUTA, cache, or verifier changes do not trigger it. The same privacy-circuit change also invalidates the token-precompile fingerprint constants; follow [token-privacy-circuit-fingerprints.md](token-privacy-circuit-fingerprints.md) and do not treat this wallet bundle as a substitute for those contract limbs.
 
 ## 7. Real Peer-to-Peer End-to-End Acceptance
 
@@ -308,7 +315,7 @@ sequenceDiagram
 
 ### 7.2 Single pinned edge configuration
 
-Create `<tmp>/p2p-e2e.json` by copying `<repo-root>/psy-genesis/config.json`, then change only `networks.localhost.realm_configs` entry `id: 0` so `rpc_url` contains exactly one edge URL. Determine the scheduled proposer from the `realm P2P scheduled proposer` log. If sub-1 is the non-proposer, retain only `http://127.0.0.1:13380`; if sub-2 is the non-proposer, retain only `http://127.0.0.1:13381`. Leave every other value unchanged. The source configuration defines these two realm-0 edges (`psy-genesis/config.json:9-15`).
+Create `<tmp>/p2p-e2e.json` by copying `<repo-root>/psy-genesis/config.json`, then change only `networks.localhost.realm_configs` entry `id: 0` so `rpc_url` contains exactly one edge URL. Determine the scheduled proposer from the `realm P2P scheduled proposer` log. If sub-1 is the non-proposer, retain only `http://127.0.0.1:13380`; if sub-2 is the non-proposer, retain only `http://127.0.0.1:13381`. Leave every other value unchanged. The source configuration defines these two realm-0 edges (`psy-genesis/config.json:12-19`).
 
 The resulting fragment must be exactly one of:
 
@@ -374,7 +381,7 @@ A dummy prover, lookalike circuit, direct fabricated submission, HTTP admission 
 | Bridge circuit/verifier/deployment input | `psy-contracts`, affected DApp, applicable gitlinks, and authorized artifact storage | SDK and Genesis unless their own inputs changed |
 | DTO-only or transport-only change with unchanged circuit and public contract | Changed source repository and affected runtime consumers only | Circuit generation, Bridge cohorts, Genesis, SDK packages |
 
-The repository ownership and consumer table is at `AGENTS.md:72-90`; the applicability rules are at `AGENTS.md:92-108`.
+The repository ownership and consumer table is at `AGENTS.md:75-93`; the applicability rules are at `AGENTS.md:95-111`.
 
 ### 8.2 Release DAG
 
@@ -400,7 +407,7 @@ published Genesis / contracts / authorized package versions
 commit parent psy-node generated outputs and child gitlinks last
 ```
 
-The producer-before-consumer order and immutable node pin are defined at `AGENTS.md:110-134,164-179`. SDK pins must use the frozen node revision before WASM generation (`AGENTS.md:207-230`). Package publication is permitted only when packed bytes or a public contract changed and the exact package and version are authorized; registry confirmation precedes DApp or Wallet updates (`AGENTS.md:262-300`). Do not bump or publish unchanged packages. Do not advance a Genesis gitlink when Genesis did not change.
+The producer-before-consumer order and immutable node pin are defined at `AGENTS.md:113-137,167-182`. SDK pins must use the frozen node revision before WASM generation (`AGENTS.md:210-233`). Package publication is permitted only when packed bytes or a public contract changed and the exact package and version are authorized; registry confirmation precedes DApp or Wallet updates (`AGENTS.md:265-303`). Do not bump or publish unchanged packages. Do not advance a Genesis gitlink when Genesis did not change.
 
 ## 9. Bridge Cohort Generation
 
@@ -451,7 +458,7 @@ withdrawal_claim.tar.zst
 sha256sums.json
 ```
 
-The three root files are compressed separately. Each child archive contains its top-level directory and exactly three files. This matches the current downloader groups (`dev/locSetupV4.ts:2387-2411`).
+The three root files are compressed separately. Each child archive contains its top-level directory and exactly three files. This matches the current downloader groups (`dev/locSetupV4.ts:2555-2579`).
 
 ### 10.2 Offline packaging command
 
@@ -516,7 +523,7 @@ out.write_text(json.dumps({"version": 1, "files": files}, indent=2) + "\n")
 PY
 ```
 
-The consumer schema is `{version, files[path] = {sha256, size}}`; version must equal `1` (`dev/locSetupV4.ts:2222-2266,2377-2382`).
+The consumer schema is `{version, files[path] = {sha256, size}}`; version must equal `1` (`dev/locSetupV4.ts:2390-2434,2545-2550`).
 
 ### 10.4 Offline validation
 
@@ -557,7 +564,7 @@ PY
 
 ### 11.1 Authorization and storage class
 
-Artifact upload requires separate exact authorization naming the target storage location and object prefix. Generation, packaging, source push, or contract deployment does not authorize upload. The public bucket configured in current source is a devnet-only default (`dev/locSetupV4.ts:1489-1492`). Custody-restricted networks must use access-controlled artifact storage; do not place their setup material in the devnet public bucket.
+Artifact upload requires separate exact authorization naming the target storage location and object prefix. Generation, packaging, source push, or contract deployment does not authorize upload. The public bucket configured in current source is a devnet-only default (`dev/locSetupV4.ts:1657-1660`). Custody-restricted networks must use access-controlled artifact storage; do not place their setup material in the devnet public bucket.
 
 Do not put credential values, access keys, secret keys, session tokens, or profile names in commands, documentation, logs, or release records.
 
@@ -612,7 +619,7 @@ The manifest is the publication commit point. Never replace it before all five o
 
 ### 11.5 Clean consumer download proof
 
-Consumer verification must use an empty `<home>/.psy/keystore`, must run without `PSY_SKIP_KEYSTORE`, and must successfully fetch and parse the manifest before accepting downloaded files. The current startup path skips all download and hash verification when `PSY_SKIP_KEYSTORE=1` (`dev/locSetupV4.ts:2317-2355`). It also contains an offline existence-only fallback when manifest fetch fails (`dev/locSetupV4.ts:2268-2283,2371-2385`). Neither path is publication proof.
+Consumer verification must use an empty `<home>/.psy/keystore`, must run without `PSY_SKIP_KEYSTORE`, and must successfully fetch and parse the manifest before accepting downloaded files. The current startup path skips all download and hash verification when `PSY_SKIP_KEYSTORE=1` (`dev/locSetupV4.ts:2485-2523`). It also contains an offline existence-only fallback when manifest fetch fails (`dev/locSetupV4.ts:2436-2451,2539-2553`). Neither path is publication proof.
 
 For release evidence:
 
@@ -620,7 +627,7 @@ For release evidence:
 2. Ensure `PSY_SKIP_KEYSTORE` is unset.
 3. Point `PSY_KEYSTORE_S3_BASE_URL` at the authorized object prefix when it differs from the devnet default.
 4. Launch the normal consumer startup path.
-5. Require a successful `sha256sums.json` fetch and `verified OK` for every downloaded group (`dev/locSetupV4.ts:2371-2451`).
+5. Require a successful `sha256sums.json` fetch and `verified OK` for every downloaded group (`dev/locSetupV4.ts:2539-2619`).
 6. Reject existence-only fallback, retained local files, or `PSY_SKIP_KEYSTORE=1` as proof.
 
 ## 12. Verification and Failure Handling
@@ -630,7 +637,7 @@ For release evidence:
 1. Rerun Section 4.2 with identical environment. Require identical network, magic, `fingerprint_u64x4`, and verifier JSON.
 2. Rerun Section 5.1. Require both cache files to report up to date.
 3. Complete Section 7 through dual-sub root equality.
-4. For each triggered Bridge cohort, require three nonempty files, export the matching Solidity verifier, generate a proof through the matching wrapper, and verify it with that newly exported verifier before deployment. Runtime constructs separate withdrawal, deposit, and Bridge aggregation wrappers (`client_prover/psy_prover/src/local/native/prove_proxy.rs:645-730`).
+4. For each triggered Bridge cohort, require three nonempty files, export the matching Solidity verifier, generate a proof through the matching wrapper, and verify it with that newly exported verifier before deployment. Runtime constructs separate withdrawal, deposit, and Bridge aggregation wrappers (`client_prover/psy_prover/src/local/native/prove_proxy.rs:660-748`).
 5. Complete Section 10.4 before upload and Sections 11.3-11.5 after authorized upload.
 6. Require the final change scope to contain only triggered metadata, both caches, selected Solidity verifiers, applicable downstream pins or generated outputs, and the source changes that caused them. Genesis, embedded wallet circuits, unrelated Bridge cohorts, gitlinks, and packages remain unchanged unless their matrix row triggers.
 
@@ -669,7 +676,7 @@ Rollback units are: the globally shared verifier JSON plus localhost fingerprint
 | Secret local artifact; never package | `private_keys.json` | Section 6.1 trigger only |
 | Conditional generated DApp config | `psy-dapp/apps/bridge/src/config/faucetOperators.json` | Section 6.1 trigger only |
 | Conditional generated bundle | `client_prover/psy_prover/src/wallet/local_circuits.json` | Section 6.2 trigger only |
-| Manual replace (separate procedure) | `../psy-compiler/psy-precompiles/token/src/main.psy` and `usdt_token/src/main.psy` | Token privacy circuit fingerprints; see `docs/src/dev/token-privacy-circuit-fingerprints.md` |
+| Manual replace (separate procedure) | `../psy-compiler/psy-precompiles/token/src/main.psy` and `usdt_token/src/main.psy` | Token privacy circuit fingerprints; see [token-privacy-circuit-fingerprints.md](token-privacy-circuit-fingerprints.md) |
 | Selected verifier replace | `psy-contracts/src/GnarkGroth16Verifier.sol` | `bridge_agg` trigger |
 | Selected verifier replace | `psy-contracts/src/DepositBatchVerifier.sol` | `deposit_append` trigger |
 | Selected verifier replace | `psy-contracts/src/WithdrawalClaimVerifier.sol` | `withdrawal_claim` trigger |
@@ -741,3 +748,12 @@ Rollback units are: the globally shared verifier JSON plus localhost fingerprint
 8. **Least deletion:** remove only selected cohort files and disposable verification directories. Never recursively delete the active keystore root.
 9. **Objects before manifest:** upload, read back, decompress, and validate every data object before publishing the version-1 manifest.
 10. **Immutable provenance:** record exact source revisions, selected network and magic, commands, manifest, object URI, and package versions without recording secrets or relying on branch names.
+
+## Related Documents
+
+- [Devnet launcher reference](devnet-launcher-reference.md)
+- [Devnet lifecycle](devnet_lifecycle.md)
+- [Fn circuit fingerprint playbook](fn-circuit-fingerprint-playbook.md)
+- [Genesis generation](genesis-generation.md)
+- [Realm p2p validators](realm-p2p-validators.md)
+- [Token privacy circuit fingerprints](token-privacy-circuit-fingerprints.md)
