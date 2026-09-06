@@ -201,6 +201,11 @@ impl<
         tracing::debug!("Resolving state command: {:#?}", state_cmd);
         let current_contract_id = self.get_current_contract_id();
         match state_cmd {
+            DPNStateCmd::BurnStakedBalance(_) => Ok(PsyCmdWithInputAndWitness {
+                state_cmd: state_cmd.clone(),
+                result: Vec::new(),
+                witness: DPNStateCmdWitness::TargetArray(Vec::new()),
+            }),
             DPNStateCmd::SetContractStateSlotHash(c) => {
                 if c.condition == 0 {
                     let mp = self
@@ -2281,6 +2286,17 @@ impl<F: RichField + PrimeField64> PsyEvalSessionResult<F> {
                 anyhow::bail!("assertion failed: {} (left: {}, right: {})", assertion.message, left, right);
             }
         }
+        let total_balance_spent = self.cmd_witnesses.iter().try_fold(0u64, |spent, witness| {
+            match &witness.state_cmd {
+                DPNStateCmd::BurnStakedBalance(cmd) => spent.checked_add(cmd.amount)
+                    .ok_or_else(|| anyhow::anyhow!("staked balance spend overflow")),
+                _ => Ok(spent),
+            }
+        })?;
+        anyhow::ensure!(
+            call_data_ctx.start_user_balance.to_canonical_u64() >= total_balance_spent,
+            "insufficient staked balance"
+        );
 
         let mut events = Vec::new();
         let start_event_index = sesh.get_event_index();
@@ -2320,7 +2336,7 @@ impl<F: RichField + PrimeField64> PsyEvalSessionResult<F> {
             outputs_hash: safe_hash_fixed_length::<<S as PsyReadLocalProvingSessionStoreMut<F>>::Hasher, F>(&outputs),
             outputs_length: F::from_noncanonical_u64(outputs.len() as u64),
             total_events_emitted,
-            total_balance_spent: F::from_noncanonical_u64(0),
+            total_balance_spent: F::from_canonical_u64(total_balance_spent),
         };
 
         // Root-consistency fix for deferred commands:

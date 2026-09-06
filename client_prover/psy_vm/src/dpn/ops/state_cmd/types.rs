@@ -47,6 +47,7 @@ pub enum DPNStateCommandType {
     ContainsSelfUserCurrentIMTContractStateValue = 59,
     // contains IMT key by 256-bit key (other user, external contract)
     ContainsOtherUserIMTContractStateValue = 60,
+    BurnStakedBalance = 61,
 }
 
 impl From<u8> for DPNStateCommandType {
@@ -82,6 +83,7 @@ impl From<u8> for DPNStateCommandType {
             58 => DPNStateCommandType::GetOtherUserIMTContractStateValue,
             59 => DPNStateCommandType::ContainsSelfUserCurrentIMTContractStateValue,
             60 => DPNStateCommandType::ContainsOtherUserIMTContractStateValue,
+            61 => DPNStateCommandType::BurnStakedBalance,
             _ => panic!("Unknown DPNStateCommandType: {}", value),
         }
     }
@@ -97,6 +99,7 @@ impl DPNStateCommandType {
             DPNStateCommandType::SetContractStateSlotSingle => DPNBuiltInDataType::TargetArray,
             DPNStateCommandType::SetContractStateSlotRange => DPNBuiltInDataType::TargetArray,
             DPNStateCommandType::ClearEntireTree => DPNBuiltInDataType::TargetArray,
+            DPNStateCommandType::BurnStakedBalance => DPNBuiltInDataType::TargetArray,
 
             DPNStateCommandType::InvokeExternalContractFunctionSync => DPNBuiltInDataType::TargetArray,
             DPNStateCommandType::InvokeExternalContractFunctionDeferred => DPNBuiltInDataType::HashOut,
@@ -129,6 +132,7 @@ impl DPNStateCommandType {
             DPNStateCommandType::SetContractStateSlotSingle => false,
             DPNStateCommandType::SetContractStateSlotRange => false,
             DPNStateCommandType::ClearEntireTree => false,
+            DPNStateCommandType::BurnStakedBalance => false,
             DPNStateCommandType::InvokeExternalContractFunctionSync => false,
             DPNStateCommandType::InvokeExternalContractFunctionDeferred => false,
             DPNStateCommandType::GetSelfUserCurrentContractStateSlotHash => true,
@@ -161,6 +165,7 @@ impl DPNStateCommandType {
             DPNStateCommandType::SetContractStateSlotSingle => true,
             DPNStateCommandType::SetContractStateSlotRange => true,
             DPNStateCommandType::ClearEntireTree => true,
+            DPNStateCommandType::BurnStakedBalance => true,
             DPNStateCommandType::InvokeExternalContractFunctionSync => true,
             DPNStateCommandType::InvokeExternalContractFunctionDeferred => true,
             DPNStateCommandType::GetSelfUserCurrentContractStateSlotHash => true,
@@ -190,6 +195,7 @@ impl DPNStateCommandType {
             DPNStateCommandType::SetContractStateSlotSingle => true,
             DPNStateCommandType::SetContractStateSlotRange => true,
             DPNStateCommandType::ClearEntireTree => true,
+            DPNStateCommandType::BurnStakedBalance => true,
             DPNStateCommandType::InvokeExternalContractFunctionSync => true,
             DPNStateCommandType::InvokeExternalContractFunctionDeferred => false,
             DPNStateCommandType::GetSelfUserCurrentContractStateSlotHash => true,
@@ -226,6 +232,7 @@ impl DPNStateCommandType {
             DPNStateCommandType::SetContractStateSlotSingle => true,
             DPNStateCommandType::SetContractStateSlotRange => true,
             DPNStateCommandType::ClearEntireTree => true,
+            DPNStateCommandType::BurnStakedBalance => true,
             DPNStateCommandType::SetIMTContractStateValue => true,
             _ => false,
         }
@@ -242,6 +249,7 @@ impl std::fmt::Display for DPNStateCommandType {
             DPNStateCommandType::SetContractStateSlotSingle => "SetContractStateSlotSingle",
             DPNStateCommandType::SetContractStateSlotRange => "SetContractStateSlotRange",
             DPNStateCommandType::ClearEntireTree => "ClearEntireTree",
+            DPNStateCommandType::BurnStakedBalance => "BurnStakedBalance",
             DPNStateCommandType::InvokeExternalContractFunctionSync => "InvokeExternalContractFunctionSync",
             DPNStateCommandType::InvokeExternalContractFunctionDeferred => "InvokeExternalContractFunctionDeferred",
             DPNStateCommandType::GetSelfUserCurrentContractStateSlotHash => "GetSelfUserCurrentContractStateSlotHash",

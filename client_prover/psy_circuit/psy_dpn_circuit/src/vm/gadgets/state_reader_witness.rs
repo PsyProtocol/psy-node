@@ -640,6 +640,7 @@ impl StateReaderGadget {
                     v => anyhow::bail!("IMT contains other-user expects IMTContainsOtherUser key type, but got {:?}", v),
                 }
             }
+            DPNStateCmd::BurnStakedBalance(_) => {}
         };
         Ok(())
     }

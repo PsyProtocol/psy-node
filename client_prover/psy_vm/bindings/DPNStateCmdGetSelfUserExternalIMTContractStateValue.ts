@@ -4,4 +4,4 @@
  * Get an IMT contract state value by 256-bit key (self user, external
  * contract).
  */
-export type DPNStateCmdGetSelfUserExternalIMTContractStateValue = { contract_id: bigint, base_offset: bigint, capacity: bigint, key: [bigint, bigint, bigint, bigint], contract_state_tree_height: number, };
+export type DPNStateCmdGetSelfUserExternalIMTContractStateValue = { contract_id: bigint, base_offset: bigint, capacity: bigint, key: [bigint, bigint, bigint, bigint], contract_state_tree_height: bigint, };

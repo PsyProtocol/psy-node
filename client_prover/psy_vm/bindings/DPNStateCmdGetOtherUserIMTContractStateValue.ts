@@ -3,4 +3,4 @@
 /**
  * Get an IMT contract state value by 256-bit key (other user).
  */
-export type DPNStateCmdGetOtherUserIMTContractStateValue = { user_id: bigint, contract_id: bigint, base_offset: bigint, capacity: bigint, key: [bigint, bigint, bigint, bigint], contract_state_tree_height: number, };
+export type DPNStateCmdGetOtherUserIMTContractStateValue = { user_id: bigint, contract_id: bigint, base_offset: bigint, capacity: bigint, key: [bigint, bigint, bigint, bigint], contract_state_tree_height: bigint, };

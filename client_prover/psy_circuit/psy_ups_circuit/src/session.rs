@@ -712,15 +712,15 @@ impl<
         &self,
         state_delta_input: &UPSCFCStandardStateDeltaInput<F>,
         tx_log_item_hash: QHashOut<F>,
-    ) -> UserProvingSessionCurrentState<F> {
+    ) -> anyhow::Result<UserProvingSessionCurrentState<F>> {
         let cu = &self.current_ups_header.current_state;
+        let spent = state_delta_input.cfc_transaction_input_context.transaction_end_ctx.total_balance_spent.to_canonical_u64();
+        let balance = cu.user_leaf.balance.to_canonical_u64().checked_sub(spent)
+            .ok_or_else(|| anyhow::anyhow!("insufficient staked balance"))?;
         let new_step_user_leaf = PsyUserLeaf {
             public_key: cu.user_leaf.public_key,
             user_state_tree_root: state_delta_input.user_contract_tree_update_proof.new_root,
-            balance: state_delta_input
-                .cfc_transaction_input_context
-                .transaction_call_start_ctx
-                .start_user_balance,
+            balance: F::from_canonical_u64(balance),
             event_index: state_delta_input
                 .cfc_transaction_input_context
                 .transaction_call_start_ctx
@@ -732,7 +732,7 @@ impl<
         };
         let new_step_tx_hash_stack = H::q_two_to_one(cu.tx_hash_stack, tx_log_item_hash);
         let new_step_tx_count = cu.tx_count + F::ONE;
-        UserProvingSessionCurrentState {
+        Ok(UserProvingSessionCurrentState {
             user_leaf: new_step_user_leaf,
             deferred_tx_debt_tree_root: state_delta_input
                 .cfc_transaction_input_context
@@ -741,7 +741,7 @@ impl<
             inline_tx_debt_tree_root: state_delta_input.inline_tx_debt_pivot_proof.root,
             tx_hash_stack: new_step_tx_hash_stack,
             tx_count: new_step_tx_count,
-        }
+        })
     }
 
     /// Execute a standard CFC call without generating any proofs.
@@ -785,7 +785,7 @@ impl<
         };
 
         let tx_log_item_hash = tx_log_item.qfhash::<H>();
-        let new_step_current_state = self.build_next_current_state(&state_delta, tx_log_item_hash);
+        let new_step_current_state = self.build_next_current_state(&state_delta, tx_log_item_hash)?;
         let new_ups_header = UserProvingSessionHeader {
             ups_step_circuit_whitelist_root: self.current_ups_header.ups_step_circuit_whitelist_root,
             session_start_context: self.current_ups_header.session_start_context.clone(),
@@ -931,13 +931,13 @@ impl<
             deferred_tx_debt_pivot_proof,
             inline_tx_debt_pivot_proof,
         };
+        let spent = process_cfc_state_delta_input.cfc_transaction_input_context.transaction_end_ctx.total_balance_spent.to_canonical_u64();
+        let balance = self.current_ups_header.current_state.user_leaf.balance.to_canonical_u64().checked_sub(spent)
+            .ok_or_else(|| anyhow::anyhow!("insufficient staked balance"))?;
         let new_step_user_leaf = PsyUserLeaf {
             public_key: self.current_ups_header.current_state.user_leaf.public_key,
             user_state_tree_root: process_cfc_state_delta_input.user_contract_tree_update_proof.new_root,
-            balance: process_cfc_state_delta_input
-                .cfc_transaction_input_context
-                .transaction_call_start_ctx
-                .start_user_balance,
+            balance: F::from_canonical_u64(balance),
             event_index: process_cfc_state_delta_input
                 .cfc_transaction_input_context
                 .transaction_call_start_ctx
@@ -1587,7 +1587,9 @@ impl<
         inputs: Vec<F>,
     ) -> anyhow::Result<DapenContractFunctionCircuitInput<F>> {
         let proof_tree_root = self.proof_tree_state.get_proof_tree_root().await;
+        let user_balance = self.current_ups_header.current_state.user_leaf.balance;
         let lps = self.require_lps_mut()?;
+        lps.user_balance = Some(user_balance);
         lps.set_proof_tree_root(proof_tree_root);
         PsyEvalSessionResult::new()
             .exec_deferred_contract_call(lps, contract_id, caller_contract_id, fn_circuit_def, inputs)
@@ -1601,7 +1603,9 @@ impl<
         inputs: Vec<F>,
     ) -> anyhow::Result<DapenContractFunctionCircuitInput<F>> {
         let proof_tree_root = self.proof_tree_state.get_proof_tree_root().await;
+        let user_balance = self.current_ups_header.current_state.user_leaf.balance;
         let lps = self.require_lps_mut()?;
+        lps.user_balance = Some(user_balance);
         lps.set_proof_tree_root(proof_tree_root);
         PsyEvalSessionResult::new()
             .exec_deferred_contract_call_local(lps, caller_contract_id, fn_circuit_def, inputs)
@@ -1731,13 +1735,13 @@ impl<
         };
         let ups_proof = circuit_mgr.prove_ups_cfc_deferred_tx(&deferred_input).await?;
         self.last_ups_step_proof_info.circuit_id = LocalCircuitType::UPSCFCDeferred.into();
+        let spent = process_cfc_state_delta_input.cfc_transaction_input_context.transaction_end_ctx.total_balance_spent.to_canonical_u64();
+        let balance = self.current_ups_header.current_state.user_leaf.balance.to_canonical_u64().checked_sub(spent)
+            .ok_or_else(|| anyhow::anyhow!("insufficient staked balance"))?;
         let new_step_user_leaf = PsyUserLeaf {
             public_key: self.current_ups_header.current_state.user_leaf.public_key,
             user_state_tree_root: process_cfc_state_delta_input.user_contract_tree_update_proof.new_root,
-            balance: process_cfc_state_delta_input
-                .cfc_transaction_input_context
-                .transaction_call_start_ctx
-                .start_user_balance,
+            balance: F::from_canonical_u64(balance),
             event_index: process_cfc_state_delta_input
                 .cfc_transaction_input_context
                 .transaction_call_start_ctx
@@ -1853,7 +1857,7 @@ impl<
         };
 
         let tx_log_item_hash = tx_log_item.qfhash::<H>();
-        let new_step_current_state = self.build_next_current_state(&state_delta, tx_log_item_hash);
+        let new_step_current_state = self.build_next_current_state(&state_delta, tx_log_item_hash)?;
         let new_ups_header = UserProvingSessionHeader {
             ups_step_circuit_whitelist_root: self.current_ups_header.ups_step_circuit_whitelist_root,
             session_start_context: self.current_ups_header.session_start_context.clone(),

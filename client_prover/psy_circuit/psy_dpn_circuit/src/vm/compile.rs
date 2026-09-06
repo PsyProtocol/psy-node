@@ -4,7 +4,10 @@ use plonky2::{
     iop::target::Target,
     plonk::{circuit_builder::CircuitBuilder, config::AlgebraicHasher},
 };
-use psy_common_circuit::builder::{core::CircuitBuilderHelpersCore, hash::core::CircuitBuilderHashCore};
+use psy_common_circuit::{
+    builder::{core::CircuitBuilderHelpersCore, hash::core::CircuitBuilderHashCore},
+    u32::multiple_comparison::list_lte_circuit,
+};
 use psy_network_circuit::gadgets::qdata::cfc_context_input::DapenCFCUserTransactionInputContextGadget;
 use psy_vm::dpn::{
     ops::{op_types::DPNOpType, state_cmd::data::DPNStateCmd},
@@ -115,6 +118,12 @@ impl PsyContractFunctionBuilderGadget {
         } else {
             fn_def.state_command_resolution_indices[0]
         };
+        let mut total_balance_spent = builder.zero();
+        let mut spent_limbs = (total_balance_spent, total_balance_spent);
+        let max_balance_limbs = (
+            builder.constant_u64((F::ORDER - 1) & u32::MAX as u64),
+            builder.constant_u64((F::ORDER - 1) >> 32),
+        );
         for (i, def) in fn_def.definitions.iter().enumerate() {
             if def.op_type.eq(&DPNOpType::GetStateCommandResultSingle) {
                 let ind = def.inputs[0] as usize;
@@ -140,6 +149,28 @@ impl PsyContractFunctionBuilderGadget {
                 executor.process_var_def(builder, &def);
             }
             while (i + 1) >= next_state_cmd_index {
+                if let DPNStateCmd::BurnStakedBalance(cmd) = &fn_def.state_commands[next_state_cmd_id] {
+                    let amount = executor.resolve_target(cmd.amount);
+                    let next_spent = builder.add(total_balance_spent, amount);
+                    let next_limbs = builder.split_low_high(next_spent, 32, 64);
+                    // Canonical limbs and monotonicity reject field-modulus wraparound.
+                    let canonical = list_lte_circuit(
+                        builder,
+                        vec![next_limbs.0, next_limbs.1],
+                        vec![max_balance_limbs.0, max_balance_limbs.1],
+                        32,
+                    );
+                    builder.assert_one(canonical.target);
+                    let no_overflow = list_lte_circuit(
+                        builder,
+                        vec![spent_limbs.0, spent_limbs.1],
+                        vec![next_limbs.0, next_limbs.1],
+                        32,
+                    );
+                    builder.assert_one(no_overflow.target);
+                    total_balance_spent = next_spent;
+                    spent_limbs = next_limbs;
+                }
                 self.process_state_cmd::<H, F, D>(builder, &executor, &fn_def.state_commands[next_state_cmd_id]);
                 next_state_cmd_id += 1;
                 if next_state_cmd_id >= state_cmd_len {
@@ -149,6 +180,7 @@ impl PsyContractFunctionBuilderGadget {
                 }
             }
         }
+        builder.connect(total_balance_spent, self.tx_ctx_header.transaction_end_ctx.total_balance_spent);
         for assertion in fn_def.assertions.iter() {
             let left = executor.resolve_target(assertion.left);
             let right = executor.resolve_target(assertion.right);

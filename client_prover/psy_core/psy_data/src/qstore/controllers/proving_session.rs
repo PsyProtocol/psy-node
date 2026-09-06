@@ -144,6 +144,7 @@ pub struct PsyLocalProvingSessionStore<
     user_id: F,
     user_id_u64: u64,
     nonce: F,
+    pub user_balance: Option<F>,
     session_proof_tree_root: QHashOut<F>,
 
     session_proof_tree_height: usize,
@@ -444,6 +445,7 @@ impl<
             write_checkpoint_u64: start_checkpoint.to_canonical_u64() + 1,
             user_id_u64: user_id.to_canonical_u64(),
             nonce,
+            user_balance: None,
             session_proof_tree_height: q_recursion_tree_height,
             session_proof_tree_root: QHashOut::ZERO,
             is_new_user: false,
@@ -650,7 +652,10 @@ impl<
         };
         tracing::debug!("get_call_start_data.call_data: {}", serde_json::to_string_pretty(&call_data).unwrap());
         let start_deferred_tx_debt_tree_root = self.get_latest_deferred_tx_leaf()?.root;
-        let start_user_balance = F::ZERO;
+        let start_user_balance = match self.user_balance {
+            Some(balance) => balance,
+            None => self.get_fresh_start_ctx_for_user(self.user_id).await?.start_session_user_leaf.balance,
+        };
         let start_user_event_index = self.get_event_index();
         tracing::debug!(
             "get_call_start_data.start_deferred_tx_debt_tree_root: {}",

@@ -117,6 +117,7 @@ pub struct ExecutionEvent {
     pub data: Vec<u64>,
 }
 
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OpCounts {
     pub total_operations: usize,
@@ -177,6 +178,12 @@ pub trait StateBackend {
 
     /// Write a 256-bit value to the IMT state by key (upsert semantics)
     fn set_imt_value(&mut self, user_id: u64, contract_id: u64, key: &[u64; 4], value: &[u64; 4]);
+    fn get_user_balance(&self, user_id: u64) -> anyhow::Result<u64> {
+        anyhow::bail!("user balance unavailable for user {}", user_id)
+    }
+    fn set_user_balance(&mut self, user_id: u64, _balance: u64) -> anyhow::Result<()> {
+        anyhow::bail!("user balance unavailable for user {}", user_id)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -199,6 +206,7 @@ pub struct InMemoryStateBackend {
     /// IMT (Indexed Merkle Tree) state keyed by (user_id, contract_id, key[4])
     /// -> value[4]
     imt_store: HashMap<(u64, u64, [u64; 4]), [u64; 4]>,
+    user_balances: HashMap<u64, u64>,
 }
 
 impl InMemoryStateBackend {
@@ -269,6 +277,13 @@ impl InMemoryStateBackend {
 }
 
 impl StateBackend for InMemoryStateBackend {
+    fn get_user_balance(&self, user_id: u64) -> anyhow::Result<u64> {
+        self.user_balances.get(&user_id).copied().ok_or_else(|| anyhow::anyhow!("user balance unavailable for user {}", user_id))
+    }
+    fn set_user_balance(&mut self, user_id: u64, balance: u64) -> anyhow::Result<()> {
+        self.user_balances.insert(user_id, balance);
+        Ok(())
+    }
     fn get_contract_slot(&self, user_id: u64, contract_id: u64, slot_index: u64) -> anyhow::Result<u64> {
         Ok(*self.slots.get(&(user_id, contract_id, slot_index)).unwrap_or(&0))
     }
@@ -406,6 +421,7 @@ impl<S: StateBackend> VmExecutor<S> {
         let mut registers = Registers::new();
         let mut state_reads = Vec::new();
         let mut state_writes = Vec::new();
+        let mut user_balance = None;
         let mut op_counts = OpCounts::default();
 
         // Bind inputs
@@ -436,6 +452,7 @@ impl<S: StateBackend> VmExecutor<S> {
                                           registers: &Registers,
                                           state_reads: &mut Vec<StateRead>,
                                           state_writes: &mut Vec<StateWrite>,
+                                          user_balance: &mut Option<u64>,
                                           op_counts: &mut OpCounts,
                                           state_cmd_results: &mut HashMap<usize, Vec<u64>>|
          -> anyhow::Result<()> {
@@ -449,6 +466,7 @@ impl<S: StateBackend> VmExecutor<S> {
                             registers,
                             state_reads,
                             state_writes,
+                            user_balance,
                             op_counts,
                         )?;
                         if let Some(r) = result {
@@ -470,6 +488,7 @@ impl<S: StateBackend> VmExecutor<S> {
                 &registers,
                 &mut state_reads,
                 &mut state_writes,
+                &mut user_balance,
                 &mut op_counts,
                 &mut state_cmd_results,
             )?;
@@ -522,6 +541,7 @@ impl<S: StateBackend> VmExecutor<S> {
             &registers,
             &mut state_reads,
             &mut state_writes,
+            &mut user_balance,
             &mut op_counts,
             &mut state_cmd_results,
         )?;
@@ -539,6 +559,11 @@ impl<S: StateBackend> VmExecutor<S> {
                     right_value: right,
                 });
                 break;
+            }
+        }
+        if failure.is_none() {
+            if let Some(balance) = user_balance {
+                self.state.set_user_balance(context.user_id, balance)?;
             }
         }
 
@@ -905,11 +930,22 @@ impl<S: StateBackend> VmExecutor<S> {
         registers: &Registers,
         state_reads: &mut Vec<StateRead>,
         state_writes: &mut Vec<StateWrite>,
+        user_balance: &mut Option<u64>,
         op_counts: &mut OpCounts,
     ) -> anyhow::Result<Option<Vec<u64>>> {
         let resolve = |id: u64| -> u64 { registers.get_by_encoded_id(id) };
 
         match cmd {
+            DPNStateCmd::BurnStakedBalance(c) => {
+                op_counts.state_write_ops += 1;
+                let balance = match *user_balance {
+                    Some(balance) => balance,
+                    None => self.state.get_user_balance(context.user_id)?,
+                };
+                *user_balance = Some(balance.checked_sub(resolve(c.amount))
+                    .ok_or_else(|| anyhow::anyhow!("insufficient staked balance for user {}", context.user_id))?);
+                return Ok(None);
+            }
             // Write commands
             DPNStateCmd::SetContractStateSlotSingle(c) => {
                 op_counts.state_write_ops += 1;
@@ -1320,6 +1356,7 @@ impl<S: StateBackend> VmExecutor<S> {
         let resolve = |id: u64| -> u64 { registers.get_by_encoded_id(id) };
 
         match cmd {
+            DPNStateCmd::BurnStakedBalance(_) => Ok(Vec::new()),
             // Read results
             DPNStateCmd::GetSelfUserCurrentContractStateSlotSingle(c) => {
                 let slot = resolve(c.sub_slot_index);
@@ -1650,5 +1687,58 @@ impl Registers {
             }
             _ => vec![self.get(data_type, index)],
         }
+    }
+}
+
+#[cfg(test)]
+mod burn_staked_balance_tests {
+    use super::*;
+    use crate::dpn::ops::op_types::{encode_indexed_op_id, DPNAssertEqInfoIndexed};
+
+    #[test]
+    fn burn_updates_calling_user_balance_and_rolls_back_failed_calls() {
+        let amount_id = encode_indexed_op_id(DPNBuiltInDataType::Target, 0);
+        let other_id = encode_indexed_op_id(DPNBuiltInDataType::Target, 1);
+        let mut circuit = DPNFunctionCircuitDefinition {
+            name: "burn".to_string(),
+            method_id: 1,
+            circuit_inputs: vec![amount_id, other_id],
+            circuit_outputs: Vec::new(),
+            state_commands: vec![DPNStateCmd::burn_staked_balance(amount_id); 2],
+            state_command_resolution_indices: vec![0, 0],
+            assertions: Vec::new(),
+            definitions: Vec::new(),
+            events: Vec::new(),
+        };
+        let context = ExecutionContext {
+            user_id: 42,
+            contract_id: 7,
+            caller_contract_id: 9,
+            checkpoint_id: 12,
+            nonce: 0,
+            user_public_key_hash: [0; 4],
+        };
+        let mut executor = VmExecutor::new(InMemoryStateBackend::new());
+        for amount in [0, 1, (1u64 << 60) - 1] {
+            executor.state.set_user_balance(42, amount * 2).unwrap();
+            let result = executor.execute(&circuit, &context, &[amount, 0]).unwrap();
+            assert!(result.success);
+            assert_eq!(executor.state.get_user_balance(42).unwrap(), 0);
+            assert!(result.events.is_empty());
+            assert!(result.state_writes.is_empty());
+            assert!(result.outputs.is_empty());
+            assert_eq!(result.op_counts.state_write_ops, 2);
+        }
+        circuit.assertions.push(DPNAssertEqInfoIndexed {
+            message: "reject burn".to_string(),
+            left: amount_id,
+            right: other_id,
+        });
+        executor.state.set_user_balance(42, 10).unwrap();
+        let failed = executor.execute(&circuit, &context, &[1, 0]).unwrap();
+        assert!(!failed.success);
+        assert_eq!(executor.state.get_user_balance(42).unwrap(), 10);
+        assert!(executor.execute(&circuit, &context, &[6, 0]).is_err());
+        assert_eq!(executor.state.get_user_balance(42).unwrap(), 10);
     }
 }

@@ -7930,6 +7930,7 @@ dependencies = [
  "postcard",
  "pser",
  "psy_api_core",
+ "psy_common_circuit",
  "psy_core",
  "psy_data",
  "psy_io",

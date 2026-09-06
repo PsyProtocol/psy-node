@@ -2331,6 +2331,7 @@ impl StateReaderGadget {
                     result
                 }
             }
+            DPNStateCmd::BurnStakedBalance(_) => Vec::new(),
         };
         value
     }

@@ -182,6 +182,26 @@ impl<T: Copy + Clone + Hash + Ord> DPNStateCmdCore<T> for DPNStateCmdClearEntire
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Hash, PartialOrd, Ord, Eq, Copy, TS)]
+#[ts(export, concrete(T = GoldilocksField))]
+pub struct DPNStateCmdBurnStakedBalance<T> {
+    pub amount: T,
+}
+
+impl<T: Copy + Clone + Hash + Ord> DPNStateCmdCore<T> for DPNStateCmdBurnStakedBalance<T> {
+    fn get_inputs(&self) -> Vec<T> {
+        vec![self.amount]
+    }
+
+    fn get_state_command_type(&self) -> DPNStateCommandType {
+        DPNStateCommandType::BurnStakedBalance
+    }
+
+    fn get_output_felt_size(&self) -> usize {
+        0
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Hash, PartialOrd, Ord, Eq, TS)]
 #[ts(export, concrete(T = GoldilocksField))]
 pub struct DPNStateCmdInvokeExternalContractFunctionSync<T> {
@@ -858,8 +878,12 @@ pub enum DPNStateCmd<T> {
     GetOtherUserIMTContractStateValue(DPNStateCmdGetOtherUserIMTContractStateValue<T>),
     ContainsSelfUserCurrentIMTContractStateValue(DPNStateCmdContainsSelfUserCurrentIMTContractStateValue<T>),
     ContainsOtherUserIMTContractStateValue(DPNStateCmdContainsOtherUserIMTContractStateValue<T>),
+    BurnStakedBalance(DPNStateCmdBurnStakedBalance<T>),
 }
 impl<T> DPNStateCmd<T> {
+    pub fn burn_staked_balance(amount: T) -> Self {
+        DPNStateCmd::BurnStakedBalance(DPNStateCmdBurnStakedBalance { amount })
+    }
     pub fn set_contract_state_slot_hash(condition: T, slot_index: T, value: [T; 4]) -> Self {
         DPNStateCmd::SetContractStateSlotHash(DPNStateCmdSetContractStateSlotHash {
             condition,
@@ -1047,6 +1071,7 @@ impl<T: Copy + Clone + Hash + Ord> DPNStateCmdCore<T> for DPNStateCmd<T> {
             DPNStateCmd::SetContractStateSlotSingle(c) => c.get_inputs(),
             DPNStateCmd::SetContractStateSlotRange(c) => c.get_inputs(),
             DPNStateCmd::ClearEntireTree(c) => c.get_inputs(),
+            DPNStateCmd::BurnStakedBalance(c) => c.get_inputs(),
             DPNStateCmd::InvokeExternalContractFunctionSync(c) => c.get_inputs(),
             DPNStateCmd::InvokeExternalContractFunctionDeferred(c) => c.get_inputs(),
             DPNStateCmd::GetSelfUserCurrentContractStateSlotHash(c) => c.get_inputs(),
@@ -1076,6 +1101,7 @@ impl<T: Copy + Clone + Hash + Ord> DPNStateCmdCore<T> for DPNStateCmd<T> {
             DPNStateCmd::SetContractStateSlotSingle(c) => c.get_state_command_type(),
             DPNStateCmd::SetContractStateSlotRange(c) => c.get_state_command_type(),
             DPNStateCmd::ClearEntireTree(c) => c.get_state_command_type(),
+            DPNStateCmd::BurnStakedBalance(c) => c.get_state_command_type(),
             DPNStateCmd::InvokeExternalContractFunctionSync(c) => c.get_state_command_type(),
             DPNStateCmd::InvokeExternalContractFunctionDeferred(_c) => DPNStateCommandType::InvokeExternalContractFunctionDeferred,
             DPNStateCmd::GetSelfUserCurrentContractStateSlotHash(c) => c.get_state_command_type(),
@@ -1105,6 +1131,7 @@ impl<T: Copy + Clone + Hash + Ord> DPNStateCmdCore<T> for DPNStateCmd<T> {
             DPNStateCmd::SetContractStateSlotSingle(c) => c.get_output_felt_size(),
             DPNStateCmd::SetContractStateSlotRange(c) => c.get_output_felt_size(),
             DPNStateCmd::ClearEntireTree(c) => c.get_output_felt_size(),
+            DPNStateCmd::BurnStakedBalance(c) => c.get_output_felt_size(),
             DPNStateCmd::InvokeExternalContractFunctionSync(c) => c.get_output_felt_size(),
             DPNStateCmd::InvokeExternalContractFunctionDeferred(c) => c.get_output_felt_size(),
             DPNStateCmd::GetSelfUserCurrentContractStateSlotHash(c) => c.get_output_felt_size(),
@@ -1156,6 +1183,9 @@ impl<F: ContextFelt> ToFelts<F> for DPNStateCmd<u64> {
             }
             DPNStateCmd::ClearEntireTree(cmd) => {
                 out.push(F::cns(cmd.condition));
+            }
+            DPNStateCmd::BurnStakedBalance(cmd) => {
+                out.push(F::cns(cmd.amount));
             }
             DPNStateCmd::InvokeExternalContractFunctionSync(cmd) => {
                 out.push(F::cns(cmd.condition));
@@ -1303,6 +1333,9 @@ impl<F: ContextFelt> ToFelts<F> for DPNStateCmd<u64> {
         };
         let variant = take(felts, &mut idx) as u8;
         match DPNStateCommandType::from(variant) {
+            DPNStateCommandType::BurnStakedBalance => {
+                DPNStateCmd::burn_staked_balance(take(felts, &mut idx))
+            }
             DPNStateCommandType::SetContractStateSlotHash => {
                 let condition = take(felts, &mut idx);
                 let slot_index = take(felts, &mut idx);
@@ -1609,6 +1642,7 @@ impl<T: Copy + Clone + Hash + Ord> DPNStateCmd<T> {
                 value: inputs_as_u64[2..].to_vec(),
             }),
             DPNStateCmd::ClearEntireTree(_c) => DPNStateCmd::ClearEntireTree(DPNStateCmdClearEntireTree { condition: inputs_as_u64[0] }),
+            DPNStateCmd::BurnStakedBalance(_) => DPNStateCmd::burn_staked_balance(inputs_as_u64[0]),
             DPNStateCmd::InvokeExternalContractFunctionSync(c) => {
                 DPNStateCmd::InvokeExternalContractFunctionSync(DPNStateCmdInvokeExternalContractFunctionSync {
                     condition: inputs_as_u64[0],

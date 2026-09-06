@@ -12,6 +12,7 @@ use psy_common_circuit::{
         merkle::gadgets::{delta_merkle_proof::DeltaMerkleProofGadget, historical_root_merkle_proof::HistoricalRootMerkleProofGadget},
     },
     traits::WitnessValueFor,
+    u32::multiple_comparison::list_lte_circuit,
 };
 use psy_config::network_constants::{
     DEFERRED_TRANSACTION_TREE_HEIGHT, GLOBAL_CONTRACT_TREE_HEIGHT, INLINE_TRANSACTION_TREE_HEIGHT, MAX_CONTRACT_STATE_TREE_HEIGHT,
@@ -238,12 +239,27 @@ impl UPSCFCStandardStateDeltaGadget {
         // step
         builder.connect(tx_in_start_event_index, previous_step_user_event_index);
 
-        // User leaf balance is not mutated by current token slot operations.
-        // Keep the old protocol behavior until a dedicated native-balance delta is
-        // specified.
-        let zero_target = builder.zero();
-        builder.connect(tx_in_total_balance_spent, zero_target);
-        let new_step_user_balance = tx_in_start_user_balance;
+        let start_limbs = builder.split_low_high(tx_in_start_user_balance, 32, 64);
+        let spent_limbs = builder.split_low_high(tx_in_total_balance_spent, 32, 64);
+        let max_balance_low = builder.constant(F::from_canonical_u64((F::ORDER - 1) & u32::MAX as u64));
+        let max_balance_high = builder.constant(F::from_canonical_u64((F::ORDER - 1) >> 32));
+        // A noncanonical start decomposition could otherwise hide an underflow.
+        let canonical_start = list_lte_circuit(
+            builder,
+            vec![start_limbs.0, start_limbs.1],
+            vec![max_balance_low, max_balance_high],
+            32,
+        );
+        builder.assert_one(canonical_start.target);
+        let sufficient_balance = list_lte_circuit(
+            builder,
+            vec![spent_limbs.0, spent_limbs.1],
+            vec![start_limbs.0, start_limbs.1],
+            32,
+        );
+        builder.assert_one(sufficient_balance.target);
+        let new_step_user_balance = builder.sub(tx_in_start_user_balance, tx_in_total_balance_spent);
+        builder.range_check(new_step_user_balance, 64);
         let new_step_event_index = builder.add(tx_in_start_event_index, tx_in_total_events_emitted);
 
         // ensure that the transaction inputs and previous step agree on the previous

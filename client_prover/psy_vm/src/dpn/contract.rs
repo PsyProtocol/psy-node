@@ -51,6 +51,9 @@ fn encode_state_cmd(buffer: &mut Vec<u64>, cmd: &DPNStateCmd<u64>) {
         DPNStateCmd::ClearEntireTree(c) => {
             buffer.push(c.condition);
         }
+        DPNStateCmd::BurnStakedBalance(c) => {
+            buffer.push(c.amount);
+        }
         DPNStateCmd::InvokeExternalContractFunctionSync(c) => {
             buffer.push(c.condition);
             buffer.push(c.contract_id);
@@ -229,5 +232,45 @@ pub fn cfc_code_definition_to_dapen_fc(cfc_def: &ContractFunctionCodeDefinition)
     match res {
         Ok(r) => Ok(r),
         Err(e) => anyhow::bail!("error deserializing dapen function definition {:?}", e),
+    }
+}
+
+#[cfg(test)]
+mod burn_staked_balance_tests {
+    use super::*;
+    use crate::dpn::ops::{context_trait::{ContextFelt, ToFelts}, sym_felt::SymFeltRef};
+
+    #[test]
+    fn burn_staked_balance_round_trip() {
+        for amount in [0, 1, (1u64 << 60) - 1] {
+            let command = DPNStateCmd::burn_staked_balance(amount);
+            let mut words = Vec::new();
+            encode_state_cmd(&mut words, &command);
+            assert_eq!(words, vec![61, amount]);
+            let felts: Vec<SymFeltRef> = command.to_felts();
+            assert_eq!(<DPNStateCmd<u64> as ToFelts<SymFeltRef>>::from_felts(&felts), command);
+            let definition = DPNFunctionCircuitDefinition {
+                name: "burn".to_string(),
+                method_id: 7,
+                circuit_inputs: Vec::new(),
+                circuit_outputs: Vec::new(),
+                state_commands: vec![command.clone()],
+                state_command_resolution_indices: vec![0],
+                assertions: Vec::new(),
+                definitions: Vec::new(),
+                events: Vec::new(),
+            };
+            let encoded = dapen_fc_to_cfc_code_definition(&definition);
+            let decoded = cfc_code_definition_to_dapen_fc(&encoded).unwrap();
+            assert_eq!(decoded.state_commands, vec![command]);
+            assert_eq!(dpn_function_words(&decoded), dpn_function_words(&definition));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "DPNStateCmd decoding overflow")]
+    fn burn_staked_balance_rejects_missing_amount() {
+        let felts = [SymFeltRef::cns(61)];
+        let _ = <DPNStateCmd<u64> as ToFelts<SymFeltRef>>::from_felts(&felts);
     }
 }

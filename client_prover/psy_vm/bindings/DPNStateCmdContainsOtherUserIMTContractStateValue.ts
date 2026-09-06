@@ -3,4 +3,4 @@
 /**
  * Check if an IMT key exists (other user, external contract).
  */
-export type DPNStateCmdContainsOtherUserIMTContractStateValue = { user_id: bigint, contract_id: bigint, base_offset: bigint, capacity: bigint, key: [bigint, bigint, bigint, bigint], contract_state_tree_height: number, };
+export type DPNStateCmdContainsOtherUserIMTContractStateValue = { user_id: bigint, contract_id: bigint, base_offset: bigint, capacity: bigint, key: [bigint, bigint, bigint, bigint], contract_state_tree_height: bigint, };

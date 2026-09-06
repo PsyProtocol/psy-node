@@ -220,6 +220,30 @@ impl PsyCompileResult {
     }
 }
 
+#[cfg(test)]
+mod burn_staked_balance_tests {
+    use super::*;
+    use crate::dpn::ops::context_trait::ContextFelt;
+
+    #[test]
+    fn burn_compilation_resolves_amount_and_preserves_repeated_writes() {
+        let store = SymFeltStore::new();
+        let amount = SymFeltRef::cns(17);
+        let command = DPNStateCmd::burn_staked_balance(amount);
+        assert_eq!(command.get_inputs(), vec![amount]);
+        assert!(!command.is_read_only());
+        assert!(command.is_set_state_cmd());
+        assert_eq!(command.get_output_felt_size(), 0);
+        let mut compiled = PsyCompileResult::new();
+        compiled.injest_state_cmd(&store, command.clone());
+        compiled.injest_state_cmd(&store, command);
+        let amount_id = compiled.indexed_map[&amount];
+        assert_eq!(compiled.state_commands, vec![DPNStateCmd::burn_staked_balance(amount_id); 2]);
+        assert_eq!(compiled.state_command_resolution_indices, vec![compiled.definitions.len(); 2]);
+        assert!(compiled.circuit_outputs.is_empty());
+    }
+}
+
 /*
 
 QExecContext*/
