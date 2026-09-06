@@ -1,6 +1,6 @@
 use std::{
     sync::{Arc, RwLock},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
@@ -25,39 +25,6 @@ pub enum GathererTreeCommand<Output> {
         reply: oneshot::Sender<Output>,
     },
 }
-
-#[cfg(test)]
-const PENDING_HANDOFF_WAIT: Duration = Duration::from_millis(150);
-#[cfg(not(test))]
-const PENDING_HANDOFF_WAIT: Duration = Duration::from_secs(60);
-
-const PENDING_HANDOFF_CREATE_RETRY_BOUND: u32 = 12;
-
-#[cfg(test)]
-const CREATE_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(50);
-#[cfg(not(test))]
-const CREATE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
-
-#[cfg(test)]
-const CREATE_RETRY_SLEEP: Duration = Duration::from_millis(10);
-#[cfg(not(test))]
-const CREATE_RETRY_SLEEP: Duration = Duration::from_secs(5);
-
-/// Drop a retained Finalize/Stop when wall-clock or retry budget is exhausted.
-pub(crate) fn pending_handoff_should_drop(
-    retained_at: Option<Instant>,
-    now: Instant,
-    wait: Duration,
-    create_retries: u32,
-    retry_bound: u32,
-) -> bool {
-    if create_retries >= retry_bound {
-        return true;
-    }
-    retained_at.is_some_and(|since| now.duration_since(since) >= wait)
-}
-
-
 
 #[derive(Clone)]
 pub struct GathererValue<T> {
@@ -450,8 +417,6 @@ pub async fn gatherer_runner_for_tree<
 ) -> anyhow::Result<()> {
     let mut pending_cycle_items: Vec<Vec<u8>> = Vec::new();
     let mut pending_handoff: Option<GathererTreeCommand<Builder::Output>> = None;
-    let mut pending_handoff_retained_at: Option<Instant> = None;
-    let mut create_retries_while_handoff: u32 = 0;
     loop {
         if !queue_key_helper.should_run() {
             tracing::error!("GATHERER_{QUEUE_TOPIC_ID}: Processor entered {:?}; stopping gatherer", queue_key_helper.status.state());
@@ -461,21 +426,6 @@ pub async fn gatherer_runner_for_tree<
             if !queue_key_helper.should_run() {
                 tracing::error!("GATHERER_{QUEUE_TOPIC_ID}: Processor entered {:?}; stopping gatherer", queue_key_helper.status.state());
                 return Ok(());
-            }
-            if pending_handoff_should_drop(
-                pending_handoff_retained_at,
-                Instant::now(),
-                PENDING_HANDOFF_WAIT,
-                create_retries_while_handoff,
-                PENDING_HANDOFF_CREATE_RETRY_BOUND,
-            ) {
-                if pending_handoff.take().is_some() {
-                    tracing::error!(
-                        "GATHERER_{QUEUE_TOPIC_ID}: dropping pending handoff after wait/retry budget exhaustion"
-                    );
-                }
-                pending_handoff_retained_at = None;
-                create_retries_while_handoff = 0;
             }
             while let Ok(command) = trigger_rx.try_recv() {
                 match command {
@@ -494,44 +444,21 @@ pub async fn gatherer_runner_for_tree<
                     }
                     handoff @ (GathererTreeCommand::Finalize { .. } | GathererTreeCommand::Stop { .. }) => {
                         pending_handoff = Some(handoff);
-                        pending_handoff_retained_at = Some(Instant::now());
-                        create_retries_while_handoff = 0;
                     }
                 }
             }
-            let create_result = tokio::time::timeout(CREATE_ATTEMPT_TIMEOUT, async {
+            let create_result = {
                 let mut tree = tree.write().await;
                 Builder::create_new_with_tree(&mut *tree, queue_key.unique_id, create_builder_config.clone()).await
-            })
-            .await;
+            };
             match create_result {
-                Ok(Ok(builder)) => {
-                    create_retries_while_handoff = 0;
-                    // Create succeeded; wall-clock budget for the create-wait phase is done.
-                    // Retained handoff (if any) is processed after leaving this loop.
-                    pending_handoff_retained_at = None;
-                    break builder;
-                }
-                Ok(Err(err)) => {
+                Ok(builder) => break builder,
+                Err(err) => {
                     tracing::error!(
-                        "GATHERER_{QUEUE_TOPIC_ID}: Error creating new builder: {:?}, retrying in {:?}",
-                        err,
-                        CREATE_RETRY_SLEEP
+                        "GATHERER_{QUEUE_TOPIC_ID}: Error creating new builder: {:?}, retrying in 5s",
+                        err
                     );
-                    if pending_handoff.is_some() {
-                        create_retries_while_handoff = create_retries_while_handoff.saturating_add(1);
-                    }
-                    tokio::time::sleep(CREATE_RETRY_SLEEP).await;
-                }
-                Err(_elapsed) => {
-                    tracing::error!(
-                        "GATHERER_{QUEUE_TOPIC_ID}: create_new_with_tree timed out after {:?}, retrying",
-                        CREATE_ATTEMPT_TIMEOUT
-                    );
-                    if pending_handoff.is_some() {
-                        create_retries_while_handoff = create_retries_while_handoff.saturating_add(1);
-                    }
-                    tokio::time::sleep(CREATE_RETRY_SLEEP).await;
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }
         };
@@ -828,83 +755,5 @@ pub async fn gatherer_runner_for_tree<
             }
         }
         tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Handoff complete. Cycle restarting.");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    #[test]
-    fn pending_handoff_drops_after_wall_clock() {
-        let start = Instant::now();
-        assert!(!pending_handoff_should_drop(
-            Some(start),
-            start + Duration::from_millis(149),
-            Duration::from_millis(150),
-            0,
-            12,
-        ));
-        assert!(pending_handoff_should_drop(
-            Some(start),
-            start + Duration::from_millis(150),
-            Duration::from_millis(150),
-            0,
-            12,
-        ));
-    }
-
-    #[test]
-    fn pending_handoff_drops_after_retry_bound() {
-        let start = Instant::now();
-        assert!(!pending_handoff_should_drop(Some(start), start, Duration::from_secs(60), 11, 12));
-        assert!(pending_handoff_should_drop(Some(start), start, Duration::from_secs(60), 12, 12));
-    }
-
-    #[test]
-    fn pending_handoff_without_retention_never_wall_clock_drops() {
-        assert!(!pending_handoff_should_drop(
-            None,
-            Instant::now() + Duration::from_secs(3600),
-            Duration::from_millis(1),
-            0,
-            12,
-        ));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn pending_handoff_exhaustion_cancels_and_skips_later_finalize() {
-        let finalize_calls = Arc::new(AtomicUsize::new(0));
-        let (reply_tx, reply_rx) = oneshot::channel::<u64>();
-        let mut pending_handoff = Some(GathererTreeCommand::Finalize { reply: reply_tx });
-        let mut retained_at = Some(Instant::now());
-        let create_retries = 0u32;
-
-        tokio::time::sleep(PENDING_HANDOFF_WAIT).await;
-        if pending_handoff_should_drop(
-            retained_at,
-            Instant::now(),
-            PENDING_HANDOFF_WAIT,
-            create_retries,
-            PENDING_HANDOFF_CREATE_RETRY_BOUND,
-        ) {
-            let _dropped = pending_handoff.take();
-            retained_at = None;
-        }
-
-        assert!(
-            reply_rx.await.is_err(),
-            "exhausted handoff must cancel the Finalize waiter"
-        );
-        assert!(pending_handoff.is_none());
-        assert!(retained_at.is_none());
-
-        // Successful create later must not finalize a command already dropped by exhaustion.
-        if let Some(GathererTreeCommand::Finalize { reply }) = pending_handoff.take() {
-            finalize_calls.fetch_add(1, Ordering::SeqCst);
-            let _ = reply.send(1);
-        }
-        assert_eq!(finalize_calls.load(Ordering::SeqCst), 0);
     }
 }
