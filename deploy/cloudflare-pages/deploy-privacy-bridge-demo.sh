@@ -108,6 +108,11 @@ if multichain_enabled; then
     multichain_write_frontend_deployment "$network" "$target_deployment"
   done < <(multichain_runtime_json | jq -r '.chains[].network')
 
+  # Vite resolves @deployments from this directory. Pin it explicitly to the
+  # three runtime-generated files above instead of relying on the dapp's
+  # default path or an inherited PSY_DEPLOYMENTS_DIR from the caller.
+  export PSY_DEPLOYMENTS_DIR="$PSY_DAPP_DIR/psy-contracts/deployments"
+
   protocol_config_file="$PSY_DAPP_DIR/psy-contracts/protocol-config/index.ts"
   [ -s "$protocol_config_file" ] || {
     echo "missing frontend protocol config: $protocol_config_file" >&2
