@@ -16,13 +16,13 @@ use psy_client_common::data::{
     qhashout::QHashOut as ClientQHashOut,
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, ProvingJobDataType, QJobTopic, QProvingJobDataID};
-use psy_crypto::common::witnesses::zk_signature::PsyZKSignatureCircuitInput;
+use psy_common_circuit::circuits::zk_signature3::core::PsyBasicZKSignatureCircuit;
 use psy_data::{
     guta::{
         header::GlobalUserTreeAggregatorHeader,
         header_extended::GlobalUserTreeAggregatorHeaderWithJobId,
         realm_finalize::{
-            realm_finalize_guta_chain_domain, RealmFinalizeGUTAAction, RealmFinalizeGUTAInput, RealmFinalizeGUTAPublicOutput, SIGNATURE_TYPE_ZK,
+            realm_finalize_guta_chain_domain, RealmFinalizeGUTAAction, RealmFinalizeGUTAInput, SIGNATURE_TYPE_ZK,
         },
     },
     proof_input::guta::{
@@ -59,25 +59,23 @@ use crate::realm::processor::gatherers::realm_end_cap_gatherer::{RealmGUTAEndCap
 
 const MAX_REALM_PROVING_LEVELS: usize = 32;
 
+type ValidatorSignatureCircuit = PsyBasicZKSignatureCircuit<plonky2::plonk::config::PoseidonGoldilocksConfig, 2>;
+static VALIDATOR_SIGNATURE_CIRCUIT: std::sync::LazyLock<ValidatorSignatureCircuit> = std::sync::LazyLock::new(ValidatorSignatureCircuit::new);
+
 #[derive(Clone)]
 pub struct PlannedFutureEndCapJob<F, Hash> {
     pub queue_item: PsyRealmUserUpdateQueueItem<F, Hash>,
     pub contract_updates: Vec<u8>,
 }
 
-/// Genesis validator identity + ZK signing + checkpoint/proof material needed
-/// to wrap a realm's root GUTA with a RealmFinalizeGUTA job (circuit type 63).
-///
-/// Built by the processor from `validator_registry` (genesis.validators lookup
-/// for this `(realm_id, realm_sub_id)`) plus the validator's ZK private key,
-/// user leaf, and the anchor/checkpoint Merkle proofs. When absent, the planner
-/// keeps today's GUTASingleEndCap / TwoGUTA root path so single-producer HTTP
-/// flow still works.
+/// Checkpoint-bound validator identity and authorization witness for finalization.
 pub struct RealmFinalizeGUTAIdentity<F, Hash> {
     pub validator_user_id: u64,
     pub validator_node_id_hash_limbs: [u64; 4],
     pub validator_bls_hash_limbs: [u64; 4],
     pub validator_user_leaf: PQEDUserLeaf<F, Hash>,
+    pub current_validator_user_leaf: PQEDUserLeaf<F, Hash>,
+    pub current_validator_user_tree_proof: MerkleProofCore<Hash>,
     pub validator_zk_private_key: Hash,
     pub validator_public_key_param: Hash,
     pub anchor_checkpoint_leaf: PQEDCheckpointLeaf<F, Hash>,
@@ -121,15 +119,11 @@ pub struct RealmGUTAPlanner<F, Hash> {
     pub total_jobs: usize,
     pub total_end_caps_processed: usize,
 
-    // --- RealmFinalizeGUTA material (circuit type 63) ---
-    // All None by default: the single-producer HTTP path keeps today's
-    // GUTASingleEndCap / TwoGUTA root. When the validator identity is Some
-    // (see `with_realm_finalize_identity` / `realm_finalize_enabled`),
-    // `finalize_with_reward_ids` wraps the root GUTA with a RealmFinalizeGUTA
     pub realm_finalize_validator_user_id: Option<u64>,
     pub realm_finalize_validator_node_id_hash_limbs: Option<[u64; 4]>,
     pub realm_finalize_validator_bls_hash_limbs: Option<[u64; 4]>,
     pub realm_finalize_validator_user_leaf: Option<PQEDUserLeaf<F, Hash>>,
+    pub realm_finalize_current_validator_user_leaf: Option<PQEDUserLeaf<F, Hash>>,
     pub realm_finalize_validator_zk_private_key: Option<Hash>,
     pub realm_finalize_validator_public_key_param: Option<Hash>,
     pub realm_finalize_anchor_checkpoint_leaf: Option<PQEDCheckpointLeaf<F, Hash>>,
@@ -139,8 +133,6 @@ pub struct RealmGUTAPlanner<F, Hash> {
     pub realm_finalize_old_realm_root_proof: Option<MerkleProofCore<Hash>>,
     pub realm_finalize_validator_tree_proof: Option<MerkleProofCore<Hash>>,
     pub realm_finalize_validator_user_tree_proof: Option<MerkleProofCore<Hash>>,
-    /// Cached finalizer public output once `append_realm_finalize_guta` runs.
-    pub finalizer_public_output: Option<RealmFinalizeGUTAPublicOutput<F, Hash>>,
 }
 
 impl<F, Hash> RealmGUTAPlanner<F, Hash> {
@@ -190,6 +182,7 @@ impl<F, Hash> RealmGUTAPlanner<F, Hash> {
             realm_finalize_validator_node_id_hash_limbs: None,
             realm_finalize_validator_bls_hash_limbs: None,
             realm_finalize_validator_user_leaf: None,
+            realm_finalize_current_validator_user_leaf: None,
             realm_finalize_validator_zk_private_key: None,
             realm_finalize_validator_public_key_param: None,
             realm_finalize_anchor_checkpoint_leaf: None,
@@ -199,20 +192,16 @@ impl<F, Hash> RealmGUTAPlanner<F, Hash> {
             realm_finalize_old_realm_root_proof: None,
             realm_finalize_validator_tree_proof: None,
             realm_finalize_validator_user_tree_proof: None,
-            finalizer_public_output: None,
         }
     }
 
-    /// Configure this planner with the genesis validator identity + ZK signing
-    /// material for its realm. When set, `finalize_with_reward_ids` wraps the
-    /// root GUTA with a RealmFinalizeGUTA job (circuit type 63). When unset
-    /// (the default), the planner keeps today's GUTASingleEndCap / TwoGUTA root
-    /// path so single-producer HTTP flow still works.
+    /// Bind the required validator identity to this gathering checkpoint.
     pub fn with_realm_finalize_identity(mut self, identity: RealmFinalizeGUTAIdentity<F, Hash>) -> Self {
         self.realm_finalize_validator_user_id = Some(identity.validator_user_id);
         self.realm_finalize_validator_node_id_hash_limbs = Some(identity.validator_node_id_hash_limbs);
         self.realm_finalize_validator_bls_hash_limbs = Some(identity.validator_bls_hash_limbs);
         self.realm_finalize_validator_user_leaf = Some(identity.validator_user_leaf);
+        self.realm_finalize_current_validator_user_leaf = Some(identity.current_validator_user_leaf);
         self.realm_finalize_validator_zk_private_key = Some(identity.validator_zk_private_key);
         self.realm_finalize_validator_public_key_param = Some(identity.validator_public_key_param);
         self.realm_finalize_anchor_checkpoint_leaf = Some(identity.anchor_checkpoint_leaf);
@@ -470,6 +459,9 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
         self.contract_state_tree_updates_ffs.extend_from_slice(&double_payload);
         self.user_leaf_updates_ffs
             .extend_from_slice(&queue_item.new_user_leaf.psy_ser_to_bytes_vec()?);
+        if self.realm_finalize_validator_user_id == Some(user_id) {
+            self.realm_finalize_current_validator_user_leaf = Some(queue_item.new_user_leaf.clone());
+        }
 
         if self.end_cap_straggler.is_some() {
             let left = self.end_cap_straggler.take().unwrap();
@@ -668,6 +660,9 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
         self.contract_state_tree_updates_ffs.extend_from_slice(&double_payload);
         self.user_leaf_updates_ffs
             .extend_from_slice(&queue_item.new_user_leaf.psy_ser_to_bytes_vec()?);
+        if self.realm_finalize_validator_user_id == Some(user_id) {
+            self.realm_finalize_current_validator_user_leaf = Some(queue_item.new_user_leaf.clone());
+        }
 
         if self.end_cap_straggler.is_some() {
             let left = self.end_cap_straggler.take().unwrap();
@@ -876,12 +871,6 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                 .await?;
         }
     }
-    /// Returns true when this planner has been configured with a genesis validator
-    /// identity for its realm, in which case `finalize_with_reward_ids` wraps
-    /// the root GUTA with a RealmFinalizeGUTA job (circuit type 63).
-    pub fn realm_finalize_enabled(&self) -> bool {
-        self.realm_finalize_validator_user_id.is_some()
-    }
 
     /// Wrap the realm's root GUTA header with a RealmFinalizeGUTA job.
     ///
@@ -893,10 +882,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
     /// jobs depend on the root GUTA job (and each other) so level-by-level
     /// worker dispatch respects the dependency order.
     ///
-    /// Fail-closed: identity is considered configured when
-    /// `realm_finalize_validator_user_id` is `Some`; if any other required ZK
-    /// key / leaf / tree proof material is `None` this returns an error rather
-    /// than silently producing an invalid witness.
+    /// Missing checkpoint-bound identity material fails closed.
     pub(crate) async fn append_realm_finalize_guta<
         Hasher: FieldQHasher<F, Hash>,
         TempStore: StandardProcessorTempDBStoreBase<QProvingJobDataID, Hash>,
@@ -925,6 +911,12 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             .realm_finalize_validator_user_leaf
             .clone()
             .ok_or_else(|| anyhow::anyhow!("validator_user_leaf is required to append RealmFinalizeGUTA"))?;
+        let current_validator_user_leaf = self
+            .realm_finalize_current_validator_user_leaf
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("current validator leaf is required to append RealmFinalizeGUTA"))?;
+        anyhow::ensure!(current_validator_user_leaf.user_id.to_u64_value() == validator_user_id_u64,
+            "Current validator leaf belongs to another user");
         let anchor_checkpoint_leaf = self
             .realm_finalize_anchor_checkpoint_leaf
             .clone()
@@ -973,13 +965,13 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
 
         let effective_validator_index = validator_user_id_u64 - self.realm_user_min_id;
         let old_leaf_proof = global_user_tree.get_leaf(effective_validator_index);
-        let old_leaf_hash = validator_user_leaf.qfhash::<Hasher>();
+        let old_leaf_hash = current_validator_user_leaf.qfhash::<Hasher>();
         let current_tree_leaf = old_leaf_proof.value;
         let is_new_user_zero_leaf = current_tree_leaf == Hash::get_zero_value()
-            && validator_user_leaf.balance == F::ZERO_VALUE
-            && validator_user_leaf.nonce == F::ZERO_VALUE
-            && validator_user_leaf.last_checkpoint_id == F::ZERO_VALUE
-            && validator_user_leaf.event_index == F::ZERO_VALUE;
+            && current_validator_user_leaf.balance == F::ZERO_VALUE
+            && current_validator_user_leaf.nonce == F::ZERO_VALUE
+            && current_validator_user_leaf.last_checkpoint_id == F::ZERO_VALUE
+            && current_validator_user_leaf.event_index == F::ZERO_VALUE;
         if old_leaf_hash != current_tree_leaf && !is_new_user_zero_leaf {
             anyhow::bail!(
                 "Cannot finalize fees for validator user {}: leaf hash {:?} does not match tree leaf {:?}.",
@@ -990,7 +982,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
         }
 
         let da_fees_collected = root_header.header.stats.da_fees_collected;
-        let old_balance = validator_user_leaf.balance.to_u64_value();
+        let old_balance = current_validator_user_leaf.balance.to_u64_value();
         let fee = da_fees_collected.to_u64_value();
         let new_balance = old_balance
             .checked_add(fee)
@@ -1005,18 +997,18 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             })?;
 
         let new_last_checkpoint_id = if fee == 0 {
-            validator_user_leaf.last_checkpoint_id
+            current_validator_user_leaf.last_checkpoint_id
         } else {
             F::from_u64_value(self.current_checkpoint_id)
         };
         let new_user_leaf = PQEDUserLeaf {
-            public_key: validator_user_leaf.public_key,
-            user_state_tree_root: validator_user_leaf.user_state_tree_root,
+            public_key: current_validator_user_leaf.public_key,
+            user_state_tree_root: current_validator_user_leaf.user_state_tree_root,
             balance: F::from_u64_value(new_balance),
-            nonce: validator_user_leaf.nonce,
+            nonce: current_validator_user_leaf.nonce,
             last_checkpoint_id: new_last_checkpoint_id,
-            event_index: validator_user_leaf.event_index,
-            user_id: validator_user_leaf.user_id,
+            event_index: current_validator_user_leaf.event_index,
+            user_id: current_validator_user_leaf.user_id,
         };
 
         let new_leaf_hash = new_user_leaf.qfhash::<Hasher>();
@@ -1033,7 +1025,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             old_root,
             new_root,
             index: effective_validator_index,
-            siblings: old_leaf_proof.siblings,
+            siblings: old_leaf_proof.siblings.clone(),
         };
 
         // Root header's new_node_value must match the fee-delta old_root (circuit binding).
@@ -1063,15 +1055,19 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             ProvingJobDataType::StandardProof,
             0,
         );
-        // Worker deserializes client-side PsyZKSignatureCircuitInput via bincode.
-        // Use concrete Goldilocks field (network field is Goldilocks) so planner F
-        // need not be RichField. Bridge the generic planner Hash to the client
-        // QHashOut via the 32-byte canonical encoding.
-        let signature_input = PsyZKSignatureCircuitInput::<parth_core::PF> {
-            private_key: ClientQHashOut::from_hash256_le(ClientHash256(private_key.into_owned_32bytes())),
-            sig_hash: ClientQHashOut::from_hash256_le(ClientHash256(action_hash.into_owned_32bytes())),
-        };
+        // Only this proof crosses the worker boundary; signing witnesses stay local.
+        let private_key_bytes = private_key.into_owned_32bytes();
+        let action_hash_bytes = action_hash.into_owned_32bytes();
+        let signature_proof = tokio::task::spawn_blocking(move || {
+            VALIDATOR_SIGNATURE_CIRCUIT.prove_base(
+                ClientQHashOut::from_hash256_le(ClientHash256(private_key_bytes)),
+                ClientQHashOut::from_hash256_le(ClientHash256(action_hash_bytes)),
+            )
+        }).await??;
         let signature_expected_pi = Hasher::q_two_to_one(action_hash, public_key_param);
+        let proof_pi = ClientQHashOut::from_hash256_le(ClientHash256(signature_expected_pi.into_owned_32bytes()));
+        anyhow::ensure!(signature_proof.public_inputs.as_slice() == proof_pi.0.elements.as_slice(),
+            "Local validator signature public inputs do not match the configured key");
         let signature_job = PsyProvingJobMetadataWithJobId {
             job_id: signature_job_id,
             metadata: PsyProvingJobMetadata {
@@ -1089,25 +1085,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
         final_guta_header.total_aggregation_proofs_generated =
             F::from_u64_value(final_guta_header.total_aggregation_proofs_generated.to_u64_value() + 1);
 
-        // Placeholder reward tag. Worker prove path binds the real child tag;
-        // metadata PI is rewritten in finalize_with_reward_ids after reward-tree
-        // assignment, and process_block rebuilds the public output for
-        // coordinator submission from the proved root child tag.
-        let root_guta_reward_tag = Hash::get_zero_value();
-        let public_output = RealmFinalizeGUTAPublicOutput {
-            chain_domain,
-            checkpoint_id: F::from_u64_value(self.current_checkpoint_id),
-            realm_id: F::from_u64_value(self.realm_id_u64),
-            realm_sub_id: self.realm_sub_id_u64 as u16,
-            checkpoint_tree_root: root_header.header.checkpoint_tree_root,
-            validator_tree_root: checkpoint_leaf.global_state_roots.validator_tree_root,
-            validator_user_id: F::from_u64_value(validator_user_id_u64),
-            root_guta_header_hash,
-            root_guta_reward_tag,
-            action_hash,
-            final_guta_header: final_guta_header,
-        };
-        let finalizer_expected_pi = public_output.public_output_hash::<Hasher>();
+        let finalizer_expected_pi = final_guta_header.qfhash::<Hasher>();
 
         let finalizer_job_id = QProvingJobDataID::realm_finalize_guta(self.current_checkpoint_id, self.realm_id_u64 as u32);
         // root_guta_whitelist_proof is ignored by the circuit prove path (library fills it).
@@ -1133,6 +1111,8 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             validator_tree_proof,
             validator_user_leaf,
             validator_user_tree_proof,
+            current_validator_user_leaf,
+            current_validator_user_tree_proof: old_leaf_proof,
             validator_public_key_param: public_key_param,
             signature_proof_type: F::from_u64_value(SIGNATURE_TYPE_ZK as u64),
             validator_fee_delta_proof: fee_delta_proof,
@@ -1168,8 +1148,8 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             );
         }
 
-        let signature_bytes = bincode::serialize(&signature_input)
-            .map_err(|e| anyhow::anyhow!("serialize signature witness: {e}"))?;
+        let signature_bytes = bincode::serialize(&signature_proof)
+            .map_err(|e| anyhow::anyhow!("serialize signature proof: {e}"))?;
         let finalizer_bytes = finalizer_input.psy_ser_into_bytes_vec()?;
         let new_user_leaf_bytes = new_user_leaf.psy_ser_to_bytes_vec()?;
         let new_total_jobs = self
@@ -1201,8 +1181,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
 
         self.total_jobs = new_total_jobs;
         self.user_leaf_updates_ffs.extend_from_slice(&new_user_leaf_bytes);
-        self.realm_finalize_validator_user_leaf = Some(new_user_leaf);
-        self.finalizer_public_output = Some(public_output);
+        self.realm_finalize_current_validator_user_leaf = Some(new_user_leaf);
 
         let final_header = GlobalUserTreeAggregatorHeaderWithJobId {
             header: final_guta_header,
@@ -1219,6 +1198,22 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
         reward_tree_root_level: u8,
         reward_tree_root_index: u64,
     ) -> anyhow::Result<Option<RealmGUTAEndCapGathererOutput<F, Hash, QProvingJobDataID>>> {
+        anyhow::ensure!(
+            self.realm_finalize_validator_user_id.is_some()
+                && self.realm_finalize_validator_node_id_hash_limbs.is_some()
+                && self.realm_finalize_validator_bls_hash_limbs.is_some()
+                && self.realm_finalize_validator_user_leaf.is_some()
+                && self.realm_finalize_validator_zk_private_key.is_some()
+                && self.realm_finalize_validator_public_key_param.is_some()
+                && self.realm_finalize_anchor_checkpoint_leaf.is_some()
+                && self.realm_finalize_anchor_checkpoint_tree_proof.is_some()
+                && self.realm_finalize_checkpoint_leaf.is_some()
+                && self.realm_finalize_checkpoint_tree_proof.is_some()
+                && self.realm_finalize_old_realm_root_proof.is_some()
+                && self.realm_finalize_validator_tree_proof.is_some()
+                && self.realm_finalize_validator_user_tree_proof.is_some(),
+            "RealmFinalizeGUTA requires complete checkpoint-bound validator identity",
+        );
         if self.total_jobs == 0 && self.end_cap_straggler.is_none() {
             // No jobs were added.
             tracing::info!("No jobs were added during GUTA planning. Nothing to finalize.");
@@ -1288,14 +1283,13 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                     )
                     .await?;
                 self.total_jobs += 1;
-                let mut root_header = new_guta_header;
-                if self.realm_finalize_enabled() {
-                    root_header = self
-                        .append_realm_finalize_guta::<Hasher, TempStore>(global_user_tree, temp_store.clone(), root_header)
-                        .await?
-                        .0;
-                    self.update_reward_tree_config(&root_header.job_id, reward_tree_root_level, reward_tree_root_index)?;
-                }
+                self.job_level_map.insert(job_id, (0, self.planned_jobs[0].len()));
+                self.planned_jobs[0].push(job);
+                let root_header = self
+                    .append_realm_finalize_guta::<Hasher, TempStore>(global_user_tree, temp_store.clone(), new_guta_header)
+                    .await?
+                    .0;
+                self.update_reward_tree_config(&root_header.job_id, reward_tree_root_level, reward_tree_root_index)?;
                 return Ok(Some(RealmGUTAEndCapGathererOutput {
                     db_output: RealmGUTAEndCapGathererOutputDatabase {
                         total_users_updated: self.total_end_caps_processed as u64,
@@ -1312,7 +1306,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                         update_user_leaves_ffs: self.user_leaf_updates_ffs,
                         guta_header: root_header,
                     },
-                    job_ids: vec![vec![job]],
+                    job_ids: self.planned_jobs.into_iter().filter(|jobs| !jobs.is_empty()).collect(),
                 }));
             }
         }
@@ -1320,13 +1314,10 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
         if let Some(level) = result {
             // this is the root
             let straggler = self.job_stragglers[level].take().unwrap();
-            let mut root_header = straggler;
-            if self.realm_finalize_enabled() {
-                root_header = self
-                    .append_realm_finalize_guta::<Hasher, TempStore>(global_user_tree, temp_store.clone(), root_header)
-                    .await?
-                    .0;
-            }
+            let root_header = self
+                .append_realm_finalize_guta::<Hasher, TempStore>(global_user_tree, temp_store.clone(), straggler)
+                .await?
+                .0;
             self.update_reward_tree_config(&root_header.job_id, reward_tree_root_level, reward_tree_root_index)?;
 
             Ok(Some(RealmGUTAEndCapGathererOutput {

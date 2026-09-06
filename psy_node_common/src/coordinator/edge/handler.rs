@@ -73,7 +73,7 @@ pub struct CoordinatorEdgeHandler<
 
     pub checkpoint_state_transition_circuit_fingerprint: N::QHash,
     pub chain_id: u32,
-    pub validators: Option<(crate::coordinator::validator_registry::ValidatorRegistry, u64)>,
+    pub validators: Option<(crate::coordinator::genesis_validators::GenesisValidatorIndex, u64)>,
 }
 impl<
         N: QNetworkTypesConfig,
@@ -182,12 +182,12 @@ impl<
     }
     pub fn set_validators(
         &mut self,
-        registry: crate::coordinator::validator_registry::ValidatorRegistry,
+        index: crate::coordinator::genesis_validators::GenesisValidatorIndex,
         checkpoints_per_epoch: u64,
     ) -> anyhow::Result<()> {
-        anyhow::ensure!(!registry.is_empty(), "P2P validators must not be empty");
+        anyhow::ensure!(!index.is_empty(), "P2P validators must not be empty");
         anyhow::ensure!(checkpoints_per_epoch > 0, "P2P checkpoints_per_epoch must be greater than zero");
-        self.validators = Some((registry, checkpoints_per_epoch));
+        self.validators = Some((index, checkpoints_per_epoch));
         Ok(())
     }
 
@@ -788,7 +788,7 @@ impl<
         proposal_bytes: Option<&[u8]>,
         certificate_bytes: Option<&[u8]>,
     ) -> anyhow::Result<()> {
-        let Some((_registry, checkpoints_per_epoch)) = self.validators.as_ref() else {
+        let Some((_index, checkpoints_per_epoch)) = self.validators.as_ref() else {
             anyhow::ensure!(
                 proposal_bytes.is_none() && certificate_bytes.is_none(),
                 "GUTA Proposal/Certificate supplied but coordinator has no validators"

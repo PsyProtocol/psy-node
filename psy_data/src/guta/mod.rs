@@ -5,3 +5,6 @@ pub mod sub_tree_transition;
 pub mod header_extended;
 pub mod header_job_prep;
 pub mod realm_finalize;
+
+#[cfg(test)]
+mod realm_finalize_tests;

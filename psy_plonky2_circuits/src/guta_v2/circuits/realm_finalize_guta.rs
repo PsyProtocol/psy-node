@@ -70,7 +70,6 @@ use crate::{
         guta_header::GlobalUserTreeAggregatorHeaderGadget,
         verify_guta_proof::VerifyGUTAProofGadget,
     },
-    proof_minifier::pm_core::get_circuit_fingerprint_generic,
     qstandard::{
         QPsyNetworkCircuitWithType, QStandardCircuit,
         QStandardCircuitProvableWithRawProofsAndRefLibrary,
@@ -191,6 +190,17 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
     }
 }
 
+struct FinalizerGUTACommonData;
+
+impl<F: plonky2::hash::hash_types::RichField + plonky2::field::extension::Extendable<D>, const D: usize>
+    crate::proof_minifier::pm_custom::PMCircuitCustomizer<F, D> for FinalizerGUTACommonData
+{
+    fn augment_circuit(&self, builder: &mut CircuitBuilder<F, D>) {
+        builder.add_qed_type_c_common_gates();
+        pad_circuit_degree(builder, 12);
+    }
+}
+
 #[derive(Debug)]
 pub struct RealmFinalizeGUTACircuit<C: GenericConfig<D> + 'static, const D: usize>
 where
@@ -210,6 +220,8 @@ where
     pub validator_tree_proof: MerkleProofGadget,
     pub validator_user_leaf: QEDUserLeafGadget,
     pub validator_user_tree_proof: MerkleProofGadget,
+    pub current_validator_user_leaf: QEDUserLeafGadget,
+    pub current_validator_user_tree_proof: MerkleProofGadget,
     pub validator_public_key_param: HashOutTarget,
     pub signature_proof_type: Target,
     pub signature_proof: ProofWithPublicInputsTarget<D>,
@@ -217,9 +229,11 @@ where
     pub validator_fee_delta_proof: DeltaMerkleProofGadget,
     pub action_hash: HashOutTarget,
     pub final_guta_header: GlobalUserTreeAggregatorHeaderGadget,
-    pub public_output_hash: HashOutTarget,
+    pub signature_reward_value: HashOutTarget,
+    pub worker_reward_tag: HashOutTarget,
     pub chain_domain: QHashOut<C::F>,
     pub circuit_data: CircuitData<C::F, C, D>,
+    pub minifier: crate::proof_minifier::pm_core::QEDProofMinifier<D, C::F, C>,
     pub fingerprint: QHashOut<C::F>,
 }
 
@@ -314,12 +328,12 @@ where
         assert!(validator_sub_ids.len() <= 256, "rotation validators exceed 8-bit sub-ID space");
         assert!(validator_sub_ids.iter().all(|&id| id <= u8::MAX as u16));
 
-        // `checkpoint_id` is the target checkpoint `T`. Epoch/anchor still use
-        // the quotient; the remainder/slot is unused so one proposer is fixed
-        // for the whole epoch.
+        let one = builder.one();
+        let target_checkpoint_id = builder.add(checkpoint_id, one);
+        builder.range_check(target_checkpoint_id, checkpoint_tree_height);
         let (epoch, _slot) = Self::strict_div_rem_const(
             builder,
-            checkpoint_id,
+            target_checkpoint_id,
             checkpoint_tree_height,
             rotation_period_checkpoints,
         );
@@ -452,10 +466,10 @@ where
         root_guta_common_data: &CommonCircuitData<C::F, D>,
         root_guta_verifier_cap_height: usize,
         guta_whitelist_tree_height: u8,
-        guta_circuit_whitelist_root: QHashOut<C::F>,
         signature_common_data: &CommonCircuitData<C::F, D>,
         signature_verifier_cap_height: usize,
         zk_signature_fingerprint: QHashOut<C::F>,
+        signature_wrapper_fingerprint: QHashOut<C::F>,
         checkpoint_tree_height: usize,
         coordinator_global_user_tree_height: usize,
         validator_tree_height: usize,
@@ -483,8 +497,7 @@ where
             root_guta_verifier_cap_height,
             guta_whitelist_tree_height,
         );
-        // Reject proofs whose whitelist root differs from the configured GUTA circuit whitelist.
-        let guta_circuit_whitelist_root_target = builder.constant_hash(guta_circuit_whitelist_root.into());
+        let guta_circuit_whitelist_root_target = builder.add_virtual_hash();
         builder.connect_hashes(
             root_guta.guta_whitelist_merkle_proof.root,
             guta_circuit_whitelist_root_target,
@@ -588,6 +601,18 @@ where
         builder.connect_hashes(validator_user_tree_proof.value, validator_user_leaf_hash);
         builder.connect_hashes(validator_user_tree_proof.root, checkpoint_user_tree_root);
 
+        let current_validator_user_leaf = QEDUserLeafGadget::create_virtual(&mut builder);
+        builder.connect(current_validator_user_leaf.user_id, validator_user_leaf.user_id);
+        let current_validator_user_leaf_hash =
+            current_validator_user_leaf.to_hash::<C::Hasher, C::F, D>(&mut builder);
+        let current_validator_user_tree_proof = MerkleProofGadget::add_virtual_to::<C::Hasher, C::F, D>(
+            &mut builder,
+            realm_global_user_tree_height,
+        );
+        builder.connect(current_validator_user_tree_proof.index, local_user_index);
+        builder.connect_hashes(current_validator_user_tree_proof.value, current_validator_user_leaf_hash);
+        builder.connect_hashes(current_validator_user_tree_proof.root, root_header.state_transition.new_node_value);
+
         let root_guta_header_hash = root_header.to_hash::<C::Hasher, C::F, D>(&mut builder);
         let checkpoint_roots_hash = builder.hash_two_to_one::<C::Hasher>(
             root_header.checkpoint_tree_root,
@@ -628,7 +653,7 @@ where
         );
         let actual_signature_fingerprint =
             builder.get_circuit_fingerprint::<C::Hasher>(&signature_verifier_data);
-        let expected_signature_fingerprint = builder.constant_qhash(zk_signature_fingerprint);
+        let expected_signature_fingerprint = builder.constant_qhash(signature_wrapper_fingerprint);
         builder.connect_hashes(
             actual_signature_fingerprint,
             expected_signature_fingerprint,
@@ -642,34 +667,40 @@ where
             action_hash,
             validator_public_key_param,
         );
+        let signature_reward_value = builder.add_virtual_hash();
+        let expected_signature_public_inputs = builder.hash_two_to_one::<C::Hasher>(
+            expected_signature_public_inputs,
+            signature_reward_value,
+        );
         builder.connect_hashes(signature_public_inputs, expected_signature_public_inputs);
 
+        let raw_signature_fingerprint = builder.constant_qhash(zk_signature_fingerprint);
         let expected_validator_public_key = builder.hash_two_to_one::<C::Hasher>(
-            expected_signature_fingerprint,
+            raw_signature_fingerprint,
             validator_public_key_param,
         );
         builder.connect_hashes(validator_user_leaf.public_key, expected_validator_public_key);
         builder.ensure_hash_is_non_zero(validator_user_leaf.public_key);
 
         let fee = root_header.stats.da_fees_collected;
-        builder.range_check(validator_user_leaf.balance, AMOUNT_BITS);
+        builder.range_check(current_validator_user_leaf.balance, AMOUNT_BITS);
         builder.range_check(fee, AMOUNT_BITS);
-        let new_balance = builder.add(validator_user_leaf.balance, fee);
+        let new_balance = builder.add(current_validator_user_leaf.balance, fee);
         builder.range_check(new_balance, AMOUNT_BITS);
         let has_fee = builder.is_not_zero(fee);
         let new_last_checkpoint_id = builder.select(
             has_fee,
             checkpoint_id,
-            validator_user_leaf.last_checkpoint_id,
+            current_validator_user_leaf.last_checkpoint_id,
         );
         let new_validator_user_leaf = QEDUserLeafGadget {
-            public_key: validator_user_leaf.public_key,
-            user_state_tree_root: validator_user_leaf.user_state_tree_root,
+            public_key: current_validator_user_leaf.public_key,
+            user_state_tree_root: current_validator_user_leaf.user_state_tree_root,
             balance: new_balance,
-            nonce: validator_user_leaf.nonce,
+            nonce: current_validator_user_leaf.nonce,
             last_checkpoint_id: new_last_checkpoint_id,
-            event_index: validator_user_leaf.event_index,
-            user_id: validator_user_leaf.user_id,
+            event_index: current_validator_user_leaf.event_index,
+            user_id: current_validator_user_leaf.user_id,
         };
         let new_validator_user_leaf_hash =
             new_validator_user_leaf.to_hash::<C::Hasher, C::F, D>(&mut builder);
@@ -680,7 +711,7 @@ where
                 realm_global_user_tree_height,
             );
         builder.connect(validator_fee_delta_proof.index, local_user_index);
-        builder.connect_hashes(validator_fee_delta_proof.old_value, validator_user_leaf_hash);
+        builder.connect_hashes(validator_fee_delta_proof.old_value, current_validator_user_leaf_hash);
         builder.connect_hashes(
             validator_fee_delta_proof.new_value,
             new_validator_user_leaf_hash,
@@ -708,51 +739,33 @@ where
         let final_guta_header_hash =
             final_guta_header.to_hash::<C::Hasher, C::F, D>(&mut builder);
 
-        // RealmFinalizeGUTA is verified independently at the coordinator edge.
-        // Its four-felt public-output hash commits to the full authorization
-        // sidecar; only after verification does the coordinator enqueue the
-        // committed final header into standard GUTA aggregation.
-        let domain_checkpoint_binding = builder.hash_two_to_one::<C::Hasher>(
-            chain_domain_target,
-            root_header.checkpoint_tree_root,
-        );
-        let checkpoint_binding = builder.hash_two_to_one::<C::Hasher>(
-            domain_checkpoint_binding,
-            checkpoint_validator_tree_root,
-        );
-        let root_guta_binding = builder.hash_two_to_one::<C::Hasher>(
-            root_guta_header_hash,
+        let worker_reward_tag = builder.add_virtual_hash();
+        let child_rewards = builder.hash_two_to_one::<C::Hasher>(
             root_guta.rewards_tree_value,
+            signature_reward_value,
         );
-        let authorization_binding = builder.hash_two_to_one::<C::Hasher>(
-            root_guta_binding,
-            action_hash,
+        let rewards_tree_value = builder.hash_two_to_one::<C::Hasher>(
+            child_rewards,
+            worker_reward_tag,
         );
-        let authorization_fields = builder.hash_two_to_one::<C::Hasher>(
-            checkpoint_binding,
-            authorization_binding,
-        );
-        let committed_fields = builder.hash_two_to_one::<C::Hasher>(
-            authorization_fields,
+        let public_inputs = builder.hash_two_to_one::<C::Hasher>(
             final_guta_header_hash,
+            rewards_tree_value,
         );
-        let public_output_hash = builder.hash_n_to_hash_no_pad::<C::Hasher>(vec![
-            committed_fields.elements[0],
-            committed_fields.elements[1],
-            committed_fields.elements[2],
-            committed_fields.elements[3],
-            checkpoint_id,
-            realm_id,
-            validator_user_id,
-            realm_sub_id,
-        ]);
-        builder.register_public_inputs(&public_output_hash.elements);
+        builder.register_public_inputs(&public_inputs.elements);
 
         builder.add_qed_type_c_common_gates();
-        eprintln!("pre-pad gates: {}", builder.num_gates());
-        pad_circuit_degree(&mut builder, 14);
         let circuit_data = builder.build::<C>();
-        let fingerprint = QHashOut(get_circuit_fingerprint_generic(&circuit_data.verifier_only));
+        let minifier = crate::proof_minifier::pm_core::QEDProofMinifier::new_with_cfg_customizer(
+            CircuitConfig::standard_recursion_config(),
+            &circuit_data.verifier_only,
+            &circuit_data.common,
+            None,
+            Some(&FinalizerGUTACommonData),
+        );
+        assert_eq!(&minifier.circuit_data.common, root_guta_common_data,
+            "finalizer must export the recursive GUTA common data");
+        let fingerprint = QHashOut(minifier.circuit_fingerprint);
 
         Self {
             root_guta,
@@ -769,6 +782,8 @@ where
             validator_tree_proof,
             validator_user_leaf,
             validator_user_tree_proof,
+            current_validator_user_leaf,
+            current_validator_user_tree_proof,
             validator_public_key_param,
             signature_proof_type,
             signature_proof,
@@ -776,9 +791,11 @@ where
             validator_fee_delta_proof,
             action_hash,
             final_guta_header,
-            public_output_hash,
+            signature_reward_value,
+            worker_reward_tag,
             chain_domain,
             circuit_data,
+            minifier,
             fingerprint,
         }
     }
@@ -793,8 +810,12 @@ where
         root_guta_reward_tag: QHashOut<C::F>,
         signature_proof: &ProofWithPublicInputs<C::F, C, D>,
         signature_verifier_data: &VerifierOnlyCircuitData<C, D>,
+        signature_reward_value: QHashOut<C::F>,
+        worker_reward_tag: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         let mut witness = PartialWitness::<C::F>::new();
+        witness.set_hash_target(self.signature_reward_value, signature_reward_value.0)?;
+        witness.set_hash_target(self.worker_reward_tag, worker_reward_tag.0)?;
         self.root_guta.set_witness(
             &mut witness,
             root_guta_whitelist_proof,
@@ -843,6 +864,12 @@ where
             &mut witness,
             &input.validator_user_tree_proof,
         )?;
+        self.current_validator_user_leaf
+            .set_witness(&mut witness, &input.current_validator_user_leaf)?;
+        self.current_validator_user_tree_proof.set_witness_core_proof_q_generic(
+            &mut witness,
+            &input.current_validator_user_tree_proof,
+        )?;
         witness.set_hash_target(
             self.validator_public_key_param,
             input.validator_public_key_param.0,
@@ -855,7 +882,8 @@ where
         )?;
         self.validator_fee_delta_proof
             .set_witness_core_proof_q(&mut witness, &input.validator_fee_delta_proof)?;
-        self.circuit_data.prove(witness)
+        let proof = self.circuit_data.prove(witness)?;
+        self.minifier.prove(&proof)
     }
 
     pub fn expected_public_output(
@@ -921,11 +949,11 @@ where
     }
 
     fn get_verifier_config_ref(&self) -> &VerifierOnlyCircuitData<C, D> {
-        &self.circuit_data.verifier_only
+        &self.minifier.circuit_data.verifier_only
     }
 
     fn get_common_circuit_data_ref(&self) -> &CommonCircuitData<C::F, D> {
-        &self.circuit_data.common
+        &self.minifier.circuit_data.common
     }
 }
 
@@ -946,12 +974,13 @@ where
             QHashOut<C::F>,
             QProvingJobDataID,
         >,
-        _worker_reward_tag: QHashOut<C::F>,
+        worker_reward_tag: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         input.ensure_expected_child_proof_count(2)?;
-        if input.base.child_proof_tag_values.is_empty() {
-            anyhow::bail!("RealmFinalizeGUTA requires the root GUTA child reward tag at index 0");
-        }
+        anyhow::ensure!(
+            input.base.child_proof_tag_values.len() == 2,
+            "RealmFinalizeGUTA requires exactly two child reward values",
+        );
 
         let witness = RealmFinalizeGUTAInput::<C::F, QHashOut<C::F>>::psy_ser_from_slice(
             &input.base.witness,
@@ -985,6 +1014,8 @@ where
             input.base.child_proof_tag_values[0],
             &signature_proof,
             &signature_verifier_data,
+            input.base.child_proof_tag_values[1],
+            worker_reward_tag,
         )
     }
 }
@@ -1273,7 +1304,7 @@ mod tests {
         const CHECKPOINT_TREE_HEIGHT: usize = 8;
         let mut checkpoint_tree =
             SimpleMerkleTree::<Hasher, Hash>::new(CHECKPOINT_TREE_HEIGHT as u8);
-        let epoch = parth_common::realm_rotation::epoch(checkpoint_id, rotation_period_checkpoints);
+        let epoch = parth_common::realm_rotation::epoch(checkpoint_id + 1, rotation_period_checkpoints);
         let anchor_checkpoint_id = parth_common::realm_rotation::anchor_checkpoint_id(
             epoch,
             rotation_period_checkpoints,
@@ -1333,9 +1364,9 @@ mod tests {
             validator_sub_ids: validator_sub_ids.to_vec(),
         };
         let seed = leaf.stats.random_seed.to_u64x4();
-        for checkpoint_id in [0, 9, 10, 17, 20] {
+        for checkpoint_id in [0, 9, 10, 17, 19, 20] {
             let expected = native
-                .proposer_sub_id(42, checkpoint_id, seed)?
+                .proposer_sub_id(42, checkpoint_id + 1, seed)?
                 .expect("rotation enabled");
             prove_rotation(checkpoint_id, 42, &leaf, expected, 10, &validator_sub_ids)?;
             let wrong = if expected == 1 { 2 } else { 1 };
@@ -1354,10 +1385,10 @@ mod tests {
             validator_sub_ids: validator_sub_ids.to_vec(),
         };
         let first_expected = native
-            .proposer_sub_id(42, 17, first.stats.random_seed.to_u64x4())?
+            .proposer_sub_id(42, 18, first.stats.random_seed.to_u64x4())?
             .unwrap();
         let second_expected = native
-            .proposer_sub_id(42, 17, second.stats.random_seed.to_u64x4())?
+            .proposer_sub_id(42, 18, second.stats.random_seed.to_u64x4())?
             .unwrap();
         prove_rotation(17, 42, &first, first_expected, 10, &validator_sub_ids)?;
         prove_rotation(17, 42, &second, second_expected, 10, &validator_sub_ids)?;

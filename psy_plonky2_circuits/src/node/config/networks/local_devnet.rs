@@ -287,12 +287,31 @@ mod tests {
 
         let relayer_private_key = resolve_bridge_relayer_private_key()?;
 
-        for i in 0..1 << 2 {
-            let private_key = if i == 2 {
-                relayer_private_key.unwrap_or_else(|| deterministic_private_key(i as u64))
-            } else {
-                deterministic_private_key(i as u64)
-            };
+        // Dense Strategy5 GROUP=1 layout (registration index == users[] index):
+        //   reg 0: validator realm 0 sub 1
+        //   reg 1: validator realm 1 sub 1
+        //   reg 2: bridge relayer (pinned; Strategy5 user_id = 524288)
+        //   reg 3: validator realm 1 sub 2
+        //   reg 4: validator realm 0 sub 2
+        //   reg 5..14: faucet sd-key operators
+        const LOCAL_DEVNET_RELAYER_REGISTRATION_ID: u64 = 2;
+        const LOCAL_DEVNET_RELAYER_USER_ID: u64 = 524_288;
+        const LOCAL_DEVNET_COORDINATOR_GLOBAL_USER_TREE_HEIGHT: u8 = 12;
+        const LOCAL_DEVNET_REALM_GLOBAL_USER_TREE_HEIGHT: u8 = 20;
+        const LOCAL_DEVNET_GROUP_REALM_HEIGHT: u8 = 1;
+        // (realm_id, sub_id, registration_id)
+        const LOCAL_DEVNET_VALIDATOR_SLOTS: [(u64, u64, u64); 4] = [
+            (0, 1, 0),
+            (1, 1, 1),
+            (1, 2, 3),
+            (0, 2, 4),
+        ];
+        const LOCAL_DEVNET_SPECIAL_ZK_USER_COUNT: usize = 5; // validators + relayer
+        const FAUCET_OPERATOR_COUNT: usize = 10;
+
+        let push_zk_user = |users: &mut Vec<PsyCompactUserDefinition<Hash>>,
+                            private_keys: &mut Vec<QHashOut<F>>,
+                            private_key: QHashOut<F>| {
             private_keys.push(private_key);
             let public_key_param = get_public_key_param::<F, PoseidonHash>(private_key);
             users.push(PsyCompactUserDefinition {
@@ -312,10 +331,57 @@ mod tests {
                     }],
                 }],
             });
-        }
+        };
 
-        for i in 0..10 {
-            let private_key = deterministic_private_key(((1 << 2) + i) as u64);
+        let mut next_registration: u64 = 0;
+        let mut validator_iter = LOCAL_DEVNET_VALIDATOR_SLOTS.iter().peekable();
+        while next_registration < LOCAL_DEVNET_SPECIAL_ZK_USER_COUNT as u64 {
+            if next_registration == LOCAL_DEVNET_RELAYER_REGISTRATION_ID {
+                let relayer_key = relayer_private_key
+                    .unwrap_or_else(|| deterministic_private_key(LOCAL_DEVNET_RELAYER_REGISTRATION_ID));
+                push_zk_user(&mut users, &mut private_keys, relayer_key);
+                let user_id = UserIdBitsStrategy5::get_user_id_from_user_registration_id(
+                    LOCAL_DEVNET_RELAYER_REGISTRATION_ID,
+                    LOCAL_DEVNET_COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+                    LOCAL_DEVNET_REALM_GLOBAL_USER_TREE_HEIGHT,
+                    LOCAL_DEVNET_GROUP_REALM_HEIGHT,
+                );
+                anyhow::ensure!(
+                    user_id == LOCAL_DEVNET_RELAYER_USER_ID,
+                    "bridge relayer registration {LOCAL_DEVNET_RELAYER_REGISTRATION_ID} must map to user_id {LOCAL_DEVNET_RELAYER_USER_ID}, got {user_id}"
+                );
+                next_registration += 1;
+                continue;
+            }
+
+            let &(realm_id, _sub_id, registration_id) = validator_iter
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing reserved validator slot for registration {next_registration}"))?;
+            anyhow::ensure!(
+                registration_id == next_registration,
+                "validator slot registration {registration_id} does not match dense cursor {next_registration}"
+            );
+            let private_key = deterministic_private_key(registration_id);
+            push_zk_user(&mut users, &mut private_keys, private_key);
+            let user_id = UserIdBitsStrategy5::get_user_id_from_user_registration_id(
+                registration_id,
+                LOCAL_DEVNET_COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+                LOCAL_DEVNET_REALM_GLOBAL_USER_TREE_HEIGHT,
+                LOCAL_DEVNET_GROUP_REALM_HEIGHT,
+            );
+            let realm_start = realm_id << LOCAL_DEVNET_REALM_GLOBAL_USER_TREE_HEIGHT;
+            let realm_end = (realm_id + 1) << LOCAL_DEVNET_REALM_GLOBAL_USER_TREE_HEIGHT;
+            anyhow::ensure!(
+                (realm_start..realm_end).contains(&user_id),
+                "reserved validator registration {registration_id} maps to user_id {user_id} outside realm {realm_id}"
+            );
+            next_registration += 1;
+        }
+        anyhow::ensure!(validator_iter.next().is_none(), "unused reserved validator slots remain");
+
+        for i in 0..FAUCET_OPERATOR_COUNT {
+            let slot = LOCAL_DEVNET_SPECIAL_ZK_USER_COUNT + i;
+            let private_key = deterministic_private_key(slot as u64);
             private_keys.push(private_key);
             let public_key_param = get_public_key_param::<F, PoseidonHash>(private_key);
             users.push(PsyCompactUserDefinition {
@@ -374,9 +440,8 @@ mod tests {
         )?;
 
         // Emit faucet operator config for psy-privacy-bridge. The 10 sd-key
-        // users above (slots 4..14) are the faucet operators; their userId in
-        // the indexer is the Strategy5-mapped registration id, and `address`
-        // is the same Poseidon public key param the genesis user record uses.
+        // users above (slots 5..14) are the faucet operators; slots 0/1/3/4 are
+        // reserved ZK validators and slot 2 is the bridge relayer (user_id 524288).
         #[derive(serde::Serialize)]
         struct FaucetOperatorJson {
             #[serde(rename = "userId")]
@@ -408,11 +473,7 @@ mod tests {
             operators: Vec<FaucetOperatorJson>,
         }
 
-        const LOCAL_DEVNET_COORDINATOR_GLOBAL_USER_TREE_HEIGHT: u8 = 12;
-        const LOCAL_DEVNET_REALM_GLOBAL_USER_TREE_HEIGHT: u8 = 20;
-        const LOCAL_DEVNET_GROUP_REALM_HEIGHT: u8 = 1;
-        const FAUCET_OPERATOR_SLOT_START: usize = 4;
-        const FAUCET_OPERATOR_COUNT: usize = 10;
+        const FAUCET_OPERATOR_SLOT_START: usize = LOCAL_DEVNET_SPECIAL_ZK_USER_COUNT;
 
         let operators: Vec<FaucetOperatorJson> = (0..FAUCET_OPERATOR_COUNT)
             .map(|i| {

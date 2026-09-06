@@ -40,6 +40,9 @@ pub async fn create_realm_processor<
     realm_identifier: QRealmIdentifier,
     circuit_fingerprint_config: PsyNodeCircuitFingerprintConfig<N::QHash>,
     coordinator_client: Arc<CoordinatorClient>,
+    validator_zk_private_key: N::QHash,
+    signature_fingerprint: N::QHash,
+    checkpoints_per_epoch: u64,
 ) -> anyhow::Result<(
     PsyRealmProcessor<
         N,
@@ -57,6 +60,8 @@ pub async fn create_realm_processor<
 where
     FileSystem::File: Send + Sync,
 {
+    let index = crate::coordinator::genesis_validators::index_from_genesis(genesis_data)?;
+    let validator = *crate::coordinator::genesis_validators::get_genesis_validator(&realm_identifier, &index)?;
     tracing::info!("[REALM_CREATE] setup_for_realm start");
     let genesis =
         GenesisDatabaseDataBuilder::<N::F, N::QHash>::setup_for_realm::<N::HasherBase, N>(
@@ -163,6 +168,10 @@ where
         genesis,
         file_system,
         guta_gatherer_backup_directory,
+        validator,
+        validator_zk_private_key,
+        signature_fingerprint,
+        checkpoints_per_epoch,
     )
     .await?;
     tracing::info!("[REALM_CREATE] processor new done");
@@ -197,6 +206,9 @@ pub async fn create_realm_processor_and_run<
     realm_identifier: QRealmIdentifier,
     circuit_fingerprint_config: PsyNodeCircuitFingerprintConfig<N::QHash>,
     coordinator_client: Arc<CoordinatorClient>,
+    validator_zk_private_key: N::QHash,
+    signature_fingerprint: N::QHash,
+    checkpoints_per_epoch: u64,
 ) -> anyhow::Result<()>
 where
     FileSystem::File: Send + Sync,
@@ -217,6 +229,9 @@ where
         realm_identifier,
         circuit_fingerprint_config,
         coordinator_client,
+        validator_zk_private_key,
+        signature_fingerprint,
+        checkpoints_per_epoch,
     )
     .await?;
 

@@ -10,7 +10,7 @@ use parth_common::memory_stores::{
     dash_tree_append_only::PsyDashMemoryAppendOnlyMerkleStore, mem_tree_recorder::SimpleMemoryMerkleRecorderStore, traits::PsyMemoryMerkleStoreImm,
 };
 use parth_core::{
-    crypto::hash::traits::{MerkleZeroHasher, ZeroableHash},
+    crypto::hash::traits::{FieldQHasher, QFieldHashable, MerkleZeroHasher, ZeroableHash},
     data::hash::{
         fast_node_serializer::{QMerkleStoreFastZeroNodeSerializer, QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE},
         merkle_node_key::SimpleMerkleNodeKey,
@@ -36,7 +36,7 @@ use psy_data::{
 };
 use psy_io::tokio::{TokioFileLike, TokioLikeFileSystem};
 use psy_node_core::{
-    psy_core_db::traits::full::PsyNodeGlobalUserTreeDatabaseReader,
+    psy_core_db::traits::full::{PsyNodeGlobalUserTreeDatabaseReader, PsyRealmProcessorStore},
     psy_temp_db::StandardProcessorTempDBStoreBase,
     qblob::{
         blob_type::{QBlobDataType, QBlobMerkleNodeTreeType},
@@ -52,7 +52,7 @@ use psy_serialize::{PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSeriali
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::{
-    guta_planner::realm_guta_planner::{PlannedFutureEndCapJob, RealmGUTAPlanner},
+    guta_planner::realm_guta_planner::{PlannedFutureEndCapJob, RealmGUTAPlanner, RealmFinalizeGUTAIdentity},
     queue::gatherer_builder::QueueGathererItemBuilderWithTree,
 };
 pub const REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_BYTES: [u8; 4] = [0x52, 0x47, 0x45, 0x31]; // 'RGE1' in ASCII
@@ -425,7 +425,11 @@ pub struct RealmGUTAEndCapGathererConfig<
     pub coordinator_guta_updates_circuit_whitelist: N::QHash,
     pub checkpoint_tree: Arc<PsyDashMemoryAppendOnlyMerkleStore<N::HasherBase, N::QHash>>,
     pub future_pending_end_cap_jobs: Arc<RwLock<Vec<PlannedFutureEndCapJob<N::F, N::QHash>>>>,
-    pub tree_store: Arc<dyn PsyNodeGlobalUserTreeDatabaseReader<N::QHash> + Send + Sync>,
+    pub tree_store: Arc<dyn PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync>,
+    pub validator: psy_data::genesis::genesis_block_setup::GenesisValidator,
+    pub validator_zk_private_key: N::QHash,
+    pub signature_fingerprint: N::QHash,
+    pub checkpoints_per_epoch: u64,
     pub _phantom_n: std::marker::PhantomData<N>,
 
 
@@ -445,8 +449,86 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
             checkpoint_tree: self.checkpoint_tree.clone(),
             future_pending_end_cap_jobs: self.future_pending_end_cap_jobs.clone(),
             tree_store: self.tree_store.clone(),
+            validator: self.validator,
+            validator_zk_private_key: self.validator_zk_private_key,
+            signature_fingerprint: self.signature_fingerprint,
+            checkpoints_per_epoch: self.checkpoints_per_epoch,
             _phantom_n: std::marker::PhantomData,
         }
+    }
+}
+
+impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>, FileSystem: TokioLikeFileSystem>
+    RealmGUTAEndCapGathererConfig<N, TempDatabase, FileSystem>
+{
+    pub(crate) async fn finalizer_identity(&self, status: &RealmProcessorCoreState<N::QHash>) -> anyhow::Result<RealmFinalizeGUTAIdentity<N::F, N::QHash>> {
+        anyhow::ensure!(self.checkpoints_per_epoch > 0, "Realm finalization requires rotation");
+        let checkpoint_id = status.gathering_checkpoint_id;
+        let target = checkpoint_id.checked_add(1).ok_or_else(|| anyhow::anyhow!("Checkpoint overflow"))?;
+        let epoch = parth_common::realm_rotation::epoch(target, self.checkpoints_per_epoch);
+        let anchor_id = parth_common::realm_rotation::anchor_checkpoint_id(epoch, self.checkpoints_per_epoch);
+        let user_id = self.validator.validator_user_id;
+        let min_user_id = self.realm_id_u64 << N::REALM_GLOBAL_USER_TREE_HEIGHT;
+        let max_user_id = (self.realm_id_u64 + 1) << N::REALM_GLOBAL_USER_TREE_HEIGHT;
+        anyhow::ensure!(user_id >= min_user_id && user_id < max_user_id, "Validator user is outside its realm");
+        let leaf = self.tree_store.get_user_leaf(checkpoint_id, user_id).await?;
+        let key = psy_crypto::signature::zk::wallet::SimplePsyPrivateKey::new(
+            psy_client_common::data::qhashout::QHashOut::<parth_core::PF>::from_hash256_le(
+                psy_client_common::data::base_types::hash256::Hash256(self.validator_zk_private_key.into_owned_32bytes())));
+        let param = key.get_public_key_param::<psy_crypto::hash::merkle::treeprover::PsyStateTrackingHash>();
+        let public_key_param = N::QHash::from_owned_32bytes(param.to_le_bytes());
+        anyhow::ensure!(leaf.public_key == N::HasherBase::q_two_to_one(self.signature_fingerprint, public_key_param),
+            "Validator ZK key does not match authenticated user public key");
+        let checkpoint_leaf = self.tree_store.get_checkpoint_leaf_data(checkpoint_id).await?;
+        let roots = self.tree_store.get_checkpoint_global_state_roots(checkpoint_id).await?;
+        let checkpoint_tree_proof = self.tree_store.checkpoint_tree_get_merkle_proof(checkpoint_id, checkpoint_id).await?;
+        let anchor_checkpoint_leaf = self.tree_store.get_checkpoint_leaf_data(anchor_id).await?;
+        let anchor_checkpoint_tree_proof = self.tree_store.checkpoint_tree_get_merkle_proof(checkpoint_id, anchor_id).await?;
+        let validator_user_tree_proof = self.tree_store.global_user_tree_get_merkle_proof(checkpoint_id, user_id).await?;
+        let old_realm_root_proof = self.tree_store.global_user_tree_get_merkle_proof_sub_tree(
+            checkpoint_id, 0, N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT, self.realm_id_u64).await?;
+        let validator_index = psy_data::guta::realm_finalize::validator_tree_index(self.realm_id_u64 as u32, self.realm_sub_id_u64 as u16);
+        let validator_tree_proof = self.tree_store.validator_tree_get_merkle_proof(checkpoint_id, validator_index).await?;
+        let node_limbs = psy_data::p2p::digest_to_field_limbs(&psy_data::p2p::sha256(&self.validator.node_id))?;
+        let bls_limbs = psy_data::p2p::digest_to_field_limbs(&psy_data::p2p::sha256(&self.validator.bls_public_key))?;
+        anyhow::ensure!(checkpoint_tree_proof.root == status.gathering_checkpoint_root
+            && checkpoint_tree_proof.value == checkpoint_leaf.qfhash::<N::HasherBase>()
+            && checkpoint_tree_proof.verify::<N::HasherBase>()
+            && anchor_checkpoint_tree_proof.root == status.gathering_checkpoint_root
+            && anchor_checkpoint_tree_proof.value == anchor_checkpoint_leaf.qfhash::<N::HasherBase>()
+            && anchor_checkpoint_tree_proof.verify::<N::HasherBase>(), "Finalizer checkpoint proofs do not match gathering snapshot");
+        anyhow::ensure!(validator_user_tree_proof.root == roots.user_tree_root
+            && validator_user_tree_proof.value == leaf.qfhash::<N::HasherBase>()
+            && validator_user_tree_proof.verify::<N::HasherBase>()
+            && old_realm_root_proof.root == roots.user_tree_root
+            && old_realm_root_proof.value == status.gathering_realm_start_root
+            && old_realm_root_proof.verify::<N::HasherBase>(), "Finalizer user proofs do not match gathering snapshot");
+        anyhow::ensure!(validator_tree_proof.root == roots.validator_tree_root
+            && validator_tree_proof.value == psy_data::guta::realm_finalize::realm_validator_leaf_hash::<N::F, N::QHash, N::HasherBase>(user_id, node_limbs, bls_limbs)
+            && validator_tree_proof.verify::<N::HasherBase>(), "Finalizer validator proof does not match gathering snapshot");
+        let mut current_validator_user_tree_proof = validator_user_tree_proof.clone();
+        current_validator_user_tree_proof.index = user_id - min_user_id;
+        current_validator_user_tree_proof.siblings.truncate(N::REALM_GLOBAL_USER_TREE_HEIGHT as usize);
+        current_validator_user_tree_proof.root = status.gathering_realm_start_root;
+        Ok(RealmFinalizeGUTAIdentity {
+            validator_user_id: user_id,
+            validator_node_id_hash_limbs: node_limbs,
+            validator_bls_hash_limbs: bls_limbs,
+            current_validator_user_leaf: leaf.clone(),
+            current_validator_user_tree_proof,
+            validator_user_leaf: leaf,
+            validator_zk_private_key: self.validator_zk_private_key,
+            validator_public_key_param: public_key_param,
+            anchor_checkpoint_leaf,
+            anchor_checkpoint_tree_proof,
+            checkpoint_leaf: psy_data::v1::qdata::checkpoint::PQEDCheckpointLeafCompactWithStateRoots {
+                checkpoint_leaf: checkpoint_leaf.to_compact::<N::HasherBase>(), global_state_roots: roots,
+            },
+            checkpoint_tree_proof,
+            old_realm_root_proof,
+            validator_tree_proof,
+            validator_user_tree_proof,
+        })
     }
 }
 
@@ -688,6 +770,7 @@ impl<
         config: RealmGUTAEndCapGathererConfig<N, TempDatabase, FileSystem>,
     ) -> anyhow::Result<Self> {
         let status = config.status.read().unwrap().clone();
+        let identity = config.finalizer_identity(&status).await?;
 
 
         let live_root = tree.get_root();
@@ -738,7 +821,7 @@ impl<
             N::REALM_GLOBAL_USER_TREE_HEIGHT,
             N::GLOBAL_USER_TREE_HEIGHT,
             config.coordinator_guta_updates_circuit_whitelist,
-        );
+        ).with_realm_finalize_identity(identity);
         let future_end_cap_jobs: Vec<PlannedFutureEndCapJob<N::F, N::QHash>> = {
             std::mem::take(
                 &mut *config

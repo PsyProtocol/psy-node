@@ -28,9 +28,6 @@ use crate::{
 // =================================================================================
 
 pub const SIGNATURE_TYPE_ZK: u8 = 0;
-/// Temporary baked rotation configuration until network config propagation lands.
-pub const REALM_ROTATION_PERIOD_CHECKPOINTS_PLACEHOLDER: u64 = 10;
-pub const REALM_ROTATION_VALIDATOR_SUB_IDS_PLACEHOLDER: [u16; 2] = [1, 2];
 
 // =================================================================================
 // Validator Leaf Hash
@@ -321,6 +318,8 @@ pub struct RealmFinalizeGUTAInput<F, Hash> {
     pub validator_tree_proof: MerkleProofCore<Hash>,
     pub validator_user_leaf: PQEDUserLeaf<F, Hash>,
     pub validator_user_tree_proof: MerkleProofCore<Hash>,
+    pub current_validator_user_leaf: PQEDUserLeaf<F, Hash>,
+    pub current_validator_user_tree_proof: MerkleProofCore<Hash>,
 
     pub validator_public_key_param: Hash,
     pub signature_proof_type: F,
@@ -346,6 +345,8 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for RealmFinalizeGUTAInput<F
             validator_tree_proof: MerkleProofCore::qp_rand_gen(),
             validator_user_leaf: PQEDUserLeaf::qp_rand_gen(),
             validator_user_tree_proof: MerkleProofCore::qp_rand_gen(),
+            current_validator_user_leaf: PQEDUserLeaf::qp_rand_gen(),
+            current_validator_user_tree_proof: MerkleProofCore::qp_rand_gen(),
             validator_public_key_param: Hash::qp_rand_gen(),
             signature_proof_type: F::qp_rand_gen(),
             validator_fee_delta_proof: DeltaMerkleProofCore::qp_rand_gen(),
@@ -374,6 +375,8 @@ impl<F: QFelt64, Hash: Q256BitHash + PsyIOReadWrite> FallbackPsySerializeCanonic
             + self.validator_tree_proof.pio_serialized_size()
             + self.validator_user_leaf.pio_serialized_size()
             + self.validator_user_tree_proof.pio_serialized_size()
+            + self.current_validator_user_leaf.pio_serialized_size()
+            + self.current_validator_user_tree_proof.pio_serialized_size()
             + 32 // validator_public_key_param
             + 8 // signature_proof_type
             + self.validator_fee_delta_proof.pio_serialized_size()
@@ -399,6 +402,8 @@ impl<F: QFelt64, Hash: Q256BitHash + PsyIOReadWrite> FallbackPsySerializeCanonic
         self.validator_tree_proof.pio_write_to_io(writer)?;
         self.validator_user_leaf.pio_write_to_io(writer)?;
         self.validator_user_tree_proof.pio_write_to_io(writer)?;
+        self.current_validator_user_leaf.pio_write_to_io(writer)?;
+        self.current_validator_user_tree_proof.pio_write_to_io(writer)?;
         self.validator_public_key_param.pio_write_to_io(writer)?;
         writer.psy_write_u64(self.signature_proof_type.to_u64_value())?;
         self.validator_fee_delta_proof.pio_write_to_io(writer)?;
@@ -427,6 +432,8 @@ impl<F: QFelt64, Hash: Q256BitHash + PsyIOReadWrite> FallbackPsySerializeCanonic
         let validator_tree_proof = MerkleProofCore::<Hash>::pio_read_from_io(reader)?;
         let validator_user_leaf = PQEDUserLeaf::<F, Hash>::pio_read_from_io(reader)?;
         let validator_user_tree_proof = MerkleProofCore::<Hash>::pio_read_from_io(reader)?;
+        let current_validator_user_leaf = PQEDUserLeaf::<F, Hash>::pio_read_from_io(reader)?;
+        let current_validator_user_tree_proof = MerkleProofCore::<Hash>::pio_read_from_io(reader)?;
         let validator_public_key_param = Hash::pio_read_from_io(reader)?;
         let signature_proof_type = F::from_owned_u64(reader.psy_read_u64()?);
         let validator_fee_delta_proof = DeltaMerkleProofCore::<Hash>::pio_read_from_io(reader)?;
@@ -446,6 +453,8 @@ impl<F: QFelt64, Hash: Q256BitHash + PsyIOReadWrite> FallbackPsySerializeCanonic
             validator_tree_proof,
             validator_user_leaf,
             validator_user_tree_proof,
+            current_validator_user_leaf,
+            current_validator_user_tree_proof,
             validator_public_key_param,
             signature_proof_type,
             validator_fee_delta_proof,

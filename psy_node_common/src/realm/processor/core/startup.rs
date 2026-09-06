@@ -51,6 +51,10 @@ where
         genesis_block_update: PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate<N::F, N::QHash>,
         file_system: Arc<FileSystem>,
         guta_gatherer_backup_directory: String,
+        validator: psy_data::genesis::genesis_block_setup::GenesisValidator,
+        validator_zk_private_key: N::QHash,
+        signature_fingerprint: N::QHash,
+        checkpoints_per_epoch: u64,
     ) -> anyhow::Result<(Self, tokio::task::JoinHandle<Result<(), anyhow::Error>>)> {
         tracing::info!("[REALM_STARTUP] processor new start");
         db.ensure_genesis_applied(genesis_block_update.clone()).await?;
@@ -76,7 +80,12 @@ where
             _phantom_n: std::marker::PhantomData,
             future_pending_end_cap_jobs: Arc::new(std::sync::RwLock::new(Vec::new())),
             tree_store: db.db.clone(),
+            validator,
+            validator_zk_private_key,
+            signature_fingerprint,
+            checkpoints_per_epoch,
         };
+        guta_create_builder_config.finalizer_identity(&db.state).await?;
 
         let (guta_queue_gatherer, guta_join_handle) = EphemeralQueueGathererWithTree::new_with_status::<
             GUTAUpdateQueue,

@@ -6,6 +6,12 @@ use parth_core::{
         hash::merkle_store_key::{QMerkleStoreDoubleIdKeyWithHeight, QMerkleStoreSingleIdKey}, felt::{FromPrimitiveValuesFelt, ToU64Value, ZeroableFelt}, node::realm_identifier::QRealmIdentifier, protocol::core_types::{QNetworkTreeCircuitSpecificConstants, QNetworkTreeConstants}, utils::{QPGenRandom, math::log2_ceil}
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
+use parth_core::crypto::hash::traits::FieldQHasher;
+use psy_data::guta::realm_finalize::{realm_validator_leaf_hash, RealmFinalizeGUTAInput, VALIDATOR_TREE_HEIGHT};
+use psy_data::v1::qdata::checkpoint::{PQEDCheckpointLeaf, PQEDCheckpointLeafStats, PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeafCompactWithStateRoots};
+use psy_crypto::signature::zk::wallet::SimplePsyPrivateKey;
+use psy_client_common::data::qhashout::QHashOut as ClientHash;
+use crate::guta_planner::realm_guta_planner::RealmFinalizeGUTAIdentity;
 use psy_data::{
     guta::{header::GlobalUserTreeAggregatorHeader, stats::GUTAStats},
     proof_input::guta::{
@@ -179,6 +185,11 @@ pub struct RGPTestChainState {
     pub next_contract_id: u32,
     pub guta_circuit_whitelist: Hash,
     pub first_realm_global_user_tree: RecTree,
+    pub finalizer_user: RGPUser,
+    pub finalizer_checkpoint_leaf: PQEDCheckpointLeaf<F, Hash>,
+    pub finalizer_state_roots: PQEDCheckpointGlobalStateRoots<Hash>,
+    pub finalizer_checkpoint_leaves: Vec<PQEDCheckpointLeaf<F, Hash>>,
+    pub checkpoints_per_epoch: u64,
 }
 
 impl RGPTestChainState {
@@ -191,8 +202,12 @@ impl RGPTestChainState {
         let checkpoint_tree = PsyDashMemoryAppendOnlyMerkleStore::new(N::CHECKPOINT_TREE_HEIGHT);
         let mut coordinator_global_user_tree = RecTree::new(N::GLOBAL_USER_TREE_HEIGHT);
         coordinator_global_user_tree.set_effective_height(N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT);
-        checkpoint_tree.append_leaf(0, Hash::qp_rand_gen()).unwrap();
-        Self {
+        let private_key = Hash::from_u64x4([11, 22, 33, 44]);
+        let key = SimplePsyPrivateKey::new(ClientHash(private_key.0));
+        let param = parth_core::pgoldilocks::QHashOut(key.get_public_key_param::<psy_crypto::hash::merkle::treeprover::PsyStateTrackingHash>().0);
+        let finalizer_user = RGPUser::new(((realm_id_u64 + 1) << N::REALM_GLOBAL_USER_TREE_HEIGHT) - 1,
+            Hasher::q_two_to_one(Hash::from_u64x4([101, 102, 103, 104]), param));
+        let mut state = Self {
             db,
             chain_id: 0,
             node_id: 0,
@@ -213,7 +228,67 @@ impl RGPTestChainState {
             realm_identifier,
             next_contract_id: 0,
             next_user_registration_id: 0,
-        }
+            finalizer_user,
+            finalizer_checkpoint_leaves: Vec::new(),
+            checkpoints_per_epoch: 10,
+            finalizer_checkpoint_leaf: PQEDCheckpointLeaf { global_chain_root: Hash::get_zero_value(), stats: PQEDCheckpointLeafStats::get_empty_stats() },
+            finalizer_state_roots: PQEDCheckpointGlobalStateRoots {
+                contract_tree_root: Hash::get_zero_value(), deposit_tree_root: Hash::get_zero_value(),
+                user_tree_root: Hash::get_zero_value(), withdrawal_tree_root: Hash::get_zero_value(),
+                user_registration_tree_root: Hash::get_zero_value(), validator_tree_root: Hash::get_zero_value(),
+            },
+        };
+        state.first_realm_global_user_tree.set_leaf(N::MAX_USERS_PER_REALM as u64 - 1, state.finalizer_user.user_leaf.qfhash::<Hasher>());
+        state.append_finalizer_checkpoint().unwrap();
+        state
+    }
+    fn validator_tree(&self) -> RecTree {
+        let mut tree = RecTree::new(VALIDATOR_TREE_HEIGHT as u8);
+        tree.set_leaf((self.realm_id_u64 << 8) | self.realm_sub_id_u64, realm_validator_leaf_hash::<F, Hash, Hasher>(
+            self.finalizer_user.user_id, [21, 22, 23, 24], [31, 32, 33, 34]));
+        tree
+    }
+
+    fn append_finalizer_checkpoint(&mut self) -> anyhow::Result<()> {
+        self.coordinator_global_user_tree.set_e_leaf(self.realm_id_u64, self.first_realm_global_user_tree.get_root());
+        self.finalizer_state_roots.user_tree_root = self.coordinator_global_user_tree.get_root();
+        self.finalizer_state_roots.validator_tree_root = self.validator_tree().get_root();
+        self.finalizer_checkpoint_leaf = PQEDCheckpointLeaf {
+            global_chain_root: self.finalizer_state_roots.qfhash::<Hasher>(),
+            stats: PQEDCheckpointLeafStats::get_empty_stats(),
+        };
+        self.checkpoint_tree_root = self.checkpoint_tree.append_leaf(self.checkpoint_id, self.finalizer_checkpoint_leaf.qfhash::<Hasher>())?.new_root;
+        self.finalizer_checkpoint_leaves.push(self.finalizer_checkpoint_leaf);
+        Ok(())
+    }
+
+    pub fn configure_finalizer_identity(&self, planner: RealmGUTAPlanner<F, Hash>) -> RealmGUTAPlanner<F, Hash> {
+        let private_key = Hash::from_u64x4([11, 22, 33, 44]);
+        let key = SimplePsyPrivateKey::new(ClientHash(private_key.0));
+        let param = parth_core::pgoldilocks::QHashOut(key.get_public_key_param::<psy_crypto::hash::merkle::treeprover::PsyStateTrackingHash>().0);
+        let old_realm_root_proof = self.coordinator_global_user_tree.get_e_leaf(self.realm_id_u64);
+        let mut validator_user_tree_proof = self.first_realm_global_user_tree.get_leaf(N::MAX_USERS_PER_REALM as u64 - 1);
+        validator_user_tree_proof.index = self.finalizer_user.user_id;
+        validator_user_tree_proof.siblings.extend_from_slice(&old_realm_root_proof.siblings);
+        validator_user_tree_proof.root = old_realm_root_proof.root;
+        let checkpoint_tree_proof = self.checkpoint_tree.get_leaf(self.checkpoint_id);
+        let epoch = (self.checkpoint_id + 1) / self.checkpoints_per_epoch;
+        let anchor_id = (epoch * self.checkpoints_per_epoch).saturating_sub(1);
+        planner.with_realm_finalize_identity(RealmFinalizeGUTAIdentity {
+            validator_user_id: self.finalizer_user.user_id,
+            validator_node_id_hash_limbs: [21, 22, 23, 24], validator_bls_hash_limbs: [31, 32, 33, 34],
+            validator_user_leaf: self.finalizer_user.user_leaf.clone(), validator_zk_private_key: private_key,
+            current_validator_user_leaf: self.finalizer_user.user_leaf.clone(),
+            current_validator_user_tree_proof: self.first_realm_global_user_tree.get_leaf(N::MAX_USERS_PER_REALM as u64 - 1),
+            validator_public_key_param: param,
+            anchor_checkpoint_leaf: self.finalizer_checkpoint_leaves[anchor_id as usize],
+            anchor_checkpoint_tree_proof: self.checkpoint_tree.get_leaf(anchor_id),
+            checkpoint_leaf: PQEDCheckpointLeafCompactWithStateRoots {
+                checkpoint_leaf: self.finalizer_checkpoint_leaf.to_compact::<Hasher>(), global_state_roots: self.finalizer_state_roots,
+            },
+            checkpoint_tree_proof, old_realm_root_proof,
+            validator_tree_proof: self.validator_tree().get_leaf((self.realm_id_u64 << 8) | self.realm_sub_id_u64), validator_user_tree_proof,
+        })
     }
     pub fn gen_rand_contract_updates_for_ups(&self, max_num_txs: usize, max_leaves_per_tx: usize) -> anyhow::Result<Vec<RGPContractUpdate>> {
         if max_leaves_per_tx == 0 || max_num_txs == 0 {
@@ -441,6 +516,7 @@ impl RGPTestChainState {
             N::GLOBAL_USER_TREE_HEIGHT,
             self.guta_circuit_whitelist,
         );
+        realm_planner = self.configure_finalizer_identity(realm_planner);
 
         for (user_id, ups) in user_ups_list.iter() {
             let queue_item = self.run_ups_for_user(*user_id, ups).await?;
@@ -469,7 +545,14 @@ impl RGPTestChainState {
 
         self.checkpoint_id += 1;
         self.unique_cord_proc_id = QCoreProcCheckpointUniqueId::qp_rand_gen();
-        self.checkpoint_tree_root = self.checkpoint_tree.append_leaf(self.checkpoint_id, Hash::qp_rand_gen())?.new_root;
+        if let Some(output) = &result {
+            let fee = output.db_output.guta_header.header.stats.da_fees_collected;
+            self.finalizer_user.user_leaf.balance += fee;
+            if fee != F::ZERO_VALUE {
+                self.finalizer_user.user_leaf.last_checkpoint_id = F::from_u64_value(checkpoint_id);
+            }
+        }
+        self.append_finalizer_checkpoint()?;
         if result.is_none() {
             return Ok(None);
         }
@@ -603,34 +686,17 @@ impl RGPTestChainState {
 }
 
 pub fn basic_validate_job_results_singlet_case(end_cap_job_ids: &[QProvingJobDataID], results: &[Vec<PsyProvingJobMetadataWithJobId<Hash, QProvingJobDataID>>]) -> anyhow::Result<()> {
-    if end_cap_job_ids.len() == 0 {
-        anyhow::bail!("end_cap_job_ids cannot be empty");
-    }else if end_cap_job_ids.len() == 1 {
-        if results.len() != 1 {
-            anyhow::bail!("Expected 1 level of results for 1 end cap job id, but got {}", results.len());
-        }else if results[0].len() != 1 {
-            anyhow::bail!("Expected 1 job result for 1 end cap job id, but got {}", results[0].len());
-        }
-        let single_result = &results[0][0];
-        if single_result.job_id.circuit_type != ProvingJobCircuitType::GUTASingleEndCap {
-            anyhow::bail!("Expected GUTASingleEndCap job for 1 end cap job id, but got {:?}", single_result.job_id.circuit_type);
-        }
-        if single_result.metadata.dependencies.len() != 1 || single_result.metadata.dependencies[0] != end_cap_job_ids[0] {
-            anyhow::bail!("Expected dependency to be the end cap job id for 1 end cap job id, but got {:?}", single_result.metadata.dependencies);
-        }
-    }else if end_cap_job_ids.len() == 2 {
-        if results.len() != 1 {
-            anyhow::bail!("Expected 1 level of results for 2 end cap job ids, but got {}", results.len());
-        }else if results[0].len() != 1 {
-            anyhow::bail!("Expected 1 job result for 2 end cap job ids, but got {}", results[0].len());
-        }
-        let single_result = &results[0][0];
-        if single_result.job_id.circuit_type != ProvingJobCircuitType::GUTATwoEndCap {
-            anyhow::bail!("Expected GUTATwoEndCap job for 2 end cap job ids, but got {:?}", single_result.job_id.circuit_type);
-        }
-        if &end_cap_job_ids != &single_result.metadata.dependencies {
-            anyhow::bail!("Expected dependencies to be the end cap job ids for 2 end cap job ids, but got {:?}", single_result.metadata.dependencies);
-        }
+    anyhow::ensure!(!end_cap_job_ids.is_empty(), "end_cap_job_ids cannot be empty");
+    let jobs = results.iter().flatten().collect::<Vec<_>>();
+    let finalizer = jobs.iter().find(|j| j.job_id.circuit_type == ProvingJobCircuitType::RealmFinalizeGUTA).ok_or_else(|| anyhow::anyhow!("missing finalizer dispatch"))?;
+    let signature = jobs.iter().find(|j| j.job_id.circuit_type == ProvingJobCircuitType::WrappedSignatureProof).ok_or_else(|| anyhow::anyhow!("missing signature dispatch"))?;
+    anyhow::ensure!(signature.metadata.dependencies.is_empty(), "signature must be independent");
+    anyhow::ensure!(finalizer.metadata.dependencies.len() == 2 && finalizer.metadata.dependencies[1] == signature.job_id, "finalizer signature dependency mismatch");
+    if end_cap_job_ids.len() <= 2 {
+        anyhow::ensure!(jobs.len() == 3, "expected root, signature, finalizer");
+        let root = jobs.iter().find(|j| j.job_id == finalizer.metadata.dependencies[0]).ok_or_else(|| anyhow::anyhow!("missing root dispatch"))?;
+        let expected_type = if end_cap_job_ids.len() == 1 { ProvingJobCircuitType::GUTASingleEndCap } else { ProvingJobCircuitType::GUTATwoEndCap };
+        anyhow::ensure!(root.job_id.circuit_type == expected_type && root.metadata.dependencies == end_cap_job_ids, "root end cap dependency mismatch");
     }
     Ok(())
 }
@@ -640,6 +706,8 @@ pub enum RGPJobWitness {
     TwoEndCap(GUTAVerifyTwoEndCapCircuitInputV2<F, Hash>),
     LeftGUTARightEndCap(GUTAVerifyLeftGUTARightEndCapCircuitInputV2<F, Hash>),
     SingleEndCap(VerifySingleEndCapInputV2<F, Hash>),
+    Finalizer(RealmFinalizeGUTAInput<F, Hash>),
+    Signature(plonky2::plonk::proof::ProofWithPublicInputs<F, plonky2::plonk::config::PoseidonGoldilocksConfig, 2>),
 }
 impl RGPJobWitness {
     pub fn from_witness_bytes_for_circuit_type(
@@ -647,6 +715,8 @@ impl RGPJobWitness {
         witness_bytes: &[u8],
     ) -> anyhow::Result<Self> {
         match circuit_type {
+            ProvingJobCircuitType::RealmFinalizeGUTA => Ok(Self::Finalizer(RealmFinalizeGUTAInput::psy_ser_from_slice(witness_bytes)?)),
+            ProvingJobCircuitType::WrappedSignatureProof => Ok(Self::Signature(bincode::deserialize(witness_bytes)?)),
             ProvingJobCircuitType::GUTATwoGUTALinear => {
                 Ok(RGPJobWitness::TwoLinear(GUTAVerifyTwoGUTALinearCircuitInput::psy_ser_from_slice(witness_bytes)?))
             }
@@ -666,6 +736,13 @@ impl RGPJobWitness {
     }
     pub fn get_guta_header(&self, guta_circuit_whitelist: Hash) -> GlobalUserTreeAggregatorHeader<F, Hash> {
         match self {
+            RGPJobWitness::Finalizer(w) => {
+                let mut header = w.root_guta_header;
+                header.state_transition.new_node_value = w.validator_fee_delta_proof.new_root;
+                header.total_aggregation_proofs_generated += F::from_u64_value(1);
+                header
+            }
+            RGPJobWitness::Signature(_) => panic!("signature has no GUTA header"),
             RGPJobWitness::TwoLinear(witness) => witness.get_new_guta_header(),
             RGPJobWitness::TwoEndCap(witness) => witness.get_new_guta_header(N::GLOBAL_USER_TREE_HEIGHT_USIZE, guta_circuit_whitelist),
             RGPJobWitness::LeftGUTARightEndCap(witness) => witness.get_new_guta_header(),
@@ -674,6 +751,8 @@ impl RGPJobWitness {
     }
     pub fn get_left_child_guta_header(&self, guta_circuit_whitelist: Hash) -> GlobalUserTreeAggregatorHeader<F, Hash> {
         match self {
+            RGPJobWitness::Finalizer(w) => w.root_guta_header,
+            RGPJobWitness::Signature(_) => panic!("signature has no GUTA child"),
             RGPJobWitness::TwoLinear(witness) => witness.get_guta_header_a(),
             RGPJobWitness::LeftGUTARightEndCap(witness) => witness.get_guta_header_a(),
             RGPJobWitness::SingleEndCap(witness) => witness.get_guta_header_a(N::GLOBAL_USER_TREE_HEIGHT),
@@ -682,6 +761,7 @@ impl RGPJobWitness {
     }
     pub fn get_right_child_guta_header(&self, guta_circuit_whitelist: Hash) -> anyhow::Result<GlobalUserTreeAggregatorHeader<F, Hash>> {
         Ok(match self {
+            RGPJobWitness::Finalizer(_) | RGPJobWitness::Signature(_) => anyhow::bail!("no right GUTA child"),
             RGPJobWitness::TwoLinear(witness) => witness.get_guta_header_b(),
             RGPJobWitness::LeftGUTARightEndCap(witness) => witness.get_guta_header_b(N::GLOBAL_USER_TREE_HEIGHT_USIZE),
             RGPJobWitness::TwoEndCap(witness) => witness.get_guta_header_b(N::GLOBAL_USER_TREE_HEIGHT_USIZE, guta_circuit_whitelist),
@@ -716,6 +796,21 @@ impl RGPJobInfo {
         })
     }
     pub fn test_basic_continuity_check(&self) -> anyhow::Result<()> {
+        if let RGPJobWitness::Signature(_) = &self.witness {
+            anyhow::ensure!(self.metadata.dependencies.is_empty(), "signature dependencies must be empty");
+            return Ok(());
+        }
+        if let RGPJobWitness::Finalizer(w) = &self.witness {
+            anyhow::ensure!(w.validator_fee_delta_proof.verify::<Hasher>(), "invalid finalizer fee delta");
+            anyhow::ensure!(w.validator_fee_delta_proof.old_root == w.root_guta_header.state_transition.new_node_value, "finalizer root discontinuity");
+            anyhow::ensure!(w.validator_user_tree_proof.verify::<Hasher>() && w.validator_tree_proof.verify::<Hasher>() && w.checkpoint_tree_proof.verify::<Hasher>() && w.old_realm_root_proof.verify::<Hasher>(), "invalid identity membership proof");
+            anyhow::ensure!(w.anchor_checkpoint_tree_proof.verify::<Hasher>() && w.anchor_checkpoint_tree_proof.value == w.anchor_checkpoint_leaf.qfhash::<Hasher>() && w.anchor_checkpoint_tree_proof.root == w.root_guta_header.checkpoint_tree_root, "invalid epoch anchor proof");
+            anyhow::ensure!(w.checkpoint_tree_proof.index == w.checkpoint_id.to_u64_value() && w.checkpoint_tree_proof.value == w.checkpoint_leaf.qfhash::<Hasher>() && w.checkpoint_tree_proof.root == w.root_guta_header.checkpoint_tree_root, "checkpoint snapshot mismatch");
+            anyhow::ensure!(w.validator_tree_proof.value == realm_validator_leaf_hash::<F, Hash, Hasher>(w.validator_user_id.to_u64_value(), w.validator_node_id_hash_limbs, w.validator_bls_hash_limbs) && w.validator_tree_proof.root == w.checkpoint_leaf.global_state_roots.validator_tree_root, "validator tree mismatch");
+            anyhow::ensure!(w.validator_user_tree_proof.value == w.validator_user_leaf.qfhash::<Hasher>() && w.validator_user_tree_proof.root == w.checkpoint_leaf.global_state_roots.user_tree_root, "validator user snapshot mismatch");
+            anyhow::ensure!(self.metadata.expected_public_inputs_hash == self.witness.get_guta_header(w.root_guta_header.guta_circuit_whitelist).qfhash::<Hasher>(), "finalizer metadata must commit only the header");
+            return Ok(());
+        }
 
         if self.metadata.dependencies.len() == 1 {
             let w = match &self.witness {
@@ -803,6 +898,10 @@ impl RGPJobInfo {
     }
 
     pub fn basic_dependency_type_verify(&self) -> anyhow::Result<()> {
+        if self.job_id.circuit_type == ProvingJobCircuitType::WrappedSignatureProof {
+            anyhow::ensure!(self.metadata.dependencies.is_empty(), "signature dependencies must be empty");
+            return Ok(());
+        }
         let dependency_types = self.metadata.dependencies.iter().map(|d| d.circuit_type).collect::<Vec<_>>();
         let left_child_type = dependency_types[0];
         let right_child_type = if dependency_types.len() > 1 {
@@ -811,6 +910,10 @@ impl RGPJobInfo {
             ProvingJobCircuitType::Invalid 
         };
         match self.job_id.circuit_type {
+            ProvingJobCircuitType::RealmFinalizeGUTA => {
+                anyhow::ensure!(dependency_types.len() == 2 && right_child_type == ProvingJobCircuitType::WrappedSignatureProof, "invalid finalizer dependencies");
+                anyhow::ensure!(matches!(left_child_type, ProvingJobCircuitType::GUTASingleEndCap | ProvingJobCircuitType::GUTATwoEndCap | ProvingJobCircuitType::GUTATwoGUTALinear | ProvingJobCircuitType::GUTALeftGUTARightEndCap), "invalid root GUTA dependency");
+            }
             ProvingJobCircuitType::GUTATwoGUTALinear => {
                 if !matches!(left_child_type, ProvingJobCircuitType::GUTATwoGUTALinear | ProvingJobCircuitType::GUTALeftGUTARightEndCap | ProvingJobCircuitType::GUTATwoEndCap) {
                     anyhow::bail!("Invalid left dependency type for GUTATwoGUTALinear: {:?}", left_child_type);
@@ -890,7 +993,7 @@ impl RGPTestResultValidator {
                         anyhow::bail!("Job {:?} dependency {:?} already has a parent assigned", job_info.job_id, job_info.metadata.dependencies[0]);
                     }
                     child_to_parent_map.insert(job_info.metadata.dependencies[0].clone(), job_info.job_id.clone());
-                }else{
+                }else if job_info.job_id.circuit_type != ProvingJobCircuitType::WrappedSignatureProof {
                     anyhow::bail!("Job {:?} has invalid number of dependencies: {}", job_info.job_id, job_info.metadata.dependencies.len());
                 }
             }
@@ -1076,7 +1179,7 @@ impl RGPTestResultValidator {
                     if right_guta_header.qfhash::<Hasher>() != expected_right_guta_header.qfhash::<Hasher>() {
                         anyhow::bail!("Right GUTA header mismatch for job {:?}: expected {:?}, got {:?}", j, expected_right_guta_header, right_guta_header);
                     }
-                } else if job_info.metadata.dependencies.len() == 1 || job_info.job_id.circuit_type == ProvingJobCircuitType::GUTALeftGUTARightEndCap {
+                } else if matches!(job_info.job_id.circuit_type, ProvingJobCircuitType::GUTALeftGUTARightEndCap | ProvingJobCircuitType::RealmFinalizeGUTA) {
                     let child_id = &job_info.metadata.dependencies[0];
                     let child_info = self.job_map.get(child_id).ok_or_else(|| anyhow::anyhow!("Child job {:?} not found in job map", child_id))?;
                     let child_guta_header = child_info.witness.get_guta_header(self.guta_circuit_whitelist);
@@ -1085,12 +1188,17 @@ impl RGPTestResultValidator {
                         anyhow::bail!("Child GUTA header mismatch for job {:?}: expected {:?}, got {:?}", j, expected_child_guta_header, child_guta_header);
                     }
                 }
+                if let RGPJobWitness::Finalizer(w) = &job_info.witness {
+                    let signature = &self.job_map[&job_info.metadata.dependencies[1]];
+                    let RGPJobWitness::Signature(proof) = &signature.witness else { anyhow::bail!("missing signature witness") };
+                    anyhow::ensure!(!proof.public_inputs.is_empty(), "signature proof has no public inputs");
+                    anyhow::ensure!(signature.metadata.expected_public_inputs_hash != parth_core::pgoldilocks::QHashOut::default(), "signature metadata PI is zero");
+                }
             }
         }
 
-        if self.job_levels.len() != log2_ceil(self.end_cap_job_ids.len()) {
-            anyhow::bail!("job levels length {} should be equal to log2_ceil of end cap job ids length {}", self.job_levels.len(), log2_ceil(self.end_cap_job_ids.len()));
-        }
+        let expected_levels = log2_ceil(self.end_cap_job_ids.len()).max(1) + 2;
+        anyhow::ensure!(self.job_levels.len() == expected_levels, "expected {expected_levels} dispatch levels, got {}", self.job_levels.len());
         Ok(())
     }
 }
@@ -1151,5 +1259,34 @@ async fn test_guta_planner_print_graphviz() -> anyhow::Result<()> {
     }
     
     println!("{}", validation_results.generate_graph_viz());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_finalizer_single_endcap_dispatch_and_fee_credit() -> anyhow::Result<()> {
+    let mut state = RGPTestChainState::create_for_tests().await?;
+    for _ in 0..2 {
+        let old_balance = state.finalizer_user.user_leaf.balance;
+        let (output, jobs, end_caps) = state.run_random_test_checkpoint_get_dbg_info(1, 1, 1, 1).await?;
+        assert_eq!(output.guta_header.job_id.circuit_type, ProvingJobCircuitType::RealmFinalizeGUTA);
+        assert_eq!(jobs.iter().map(Vec::len).sum::<usize>(), 3);
+        assert_eq!(state.finalizer_user.user_leaf.balance, old_balance + output.guta_header.header.stats.da_fees_collected);
+        assert_eq!(state.db.get_user_leaf(state.checkpoint_id, state.finalizer_user.user_id).await?, state.finalizer_user.user_leaf);
+        RGPTestResultValidator::new(state.guta_circuit_whitelist, output, jobs, end_caps)?.run_full_tests()?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_finalizer_missing_identity_fails_closed() -> anyhow::Result<()> {
+    let mut state = RGPTestChainState::create_for_tests().await?;
+    let planner = RealmGUTAPlanner::new(0, state.realm_identifier, state.checkpoint_tree_root,
+        state.checkpoint_id, state.unique_pending_id, state.first_realm_global_user_tree.get_root(),
+        N::REALM_GLOBAL_USER_TREE_HEIGHT, N::GLOBAL_USER_TREE_HEIGHT, state.guta_circuit_whitelist);
+    let error = match planner.finalize_with_reward_ids(&state.checkpoint_tree, &mut state.first_realm_global_user_tree, state.temp_db.clone(), 0, 0).await {
+        Err(error) => error,
+        Ok(_) => panic!("finalization without identity must fail even for an empty batch"),
+    };
+    assert!(error.to_string().contains("requires complete checkpoint-bound validator identity"), "{error}");
     Ok(())
 }
