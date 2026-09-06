@@ -884,6 +884,7 @@ async fn run_multichain(
             notify_coordinator: true,
             poll_timeout_secs: 0,
             poll_interval_secs: 5,
+            destination_chain_indices: chains.iter().map(|chain| u64::from(chain.chain_index)).collect(),
         };
 
         let mut round_withdrawals = Vec::new();
@@ -1066,6 +1067,7 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path)
             notify_coordinator: true,
             poll_timeout_secs: 120,
             poll_interval_secs: 5,
+            destination_chain_indices: Vec::new(),
         };
 
         let round_mode = if !window.has_confirmed_range() {
@@ -2335,7 +2337,7 @@ async fn build_l2_call_plan(
             propose_args,
             withdrawal_from_checkpoint,
             to_checkpoint.saturating_add(1),
-            l2_withdrawal_global_count,
+            &[(source_chain_index, l2_withdrawal_next_index)],
         )
         .await?
     } else {
@@ -2380,6 +2382,7 @@ async fn build_multichain_l2_plan(
     let http = crate::bridge::api_client::build_default_http_client()?;
     let mut progress = Vec::with_capacity(chains.len());
     let mut calls = Vec::new();
+    let mut withdrawal_chain_offsets: Vec<(u64, u64)> = Vec::with_capacity(chains.len());
 
     for chain in chains {
         let (proved, pending) = chain
@@ -2404,6 +2407,17 @@ async fn build_multichain_l2_plan(
             u64::from(chain.chain_index),
         ).await?).context("L2 per-chain deposit count exceeds u32")?;
         ensure!(l2_count <= pending, "chain {} L2 deposit count exceeds L1 pending count", chain.chain_index);
+
+        if append_business {
+            // Per-chain L2 withdrawal-tree cursor: psy-services requires a
+            // destination_chain_index filter per query once multiple L1 chains
+            // are indexed, and each filtered stream is offset by the number of
+            // that chain's withdrawals already appended on L2.
+            let withdrawal_next_index = provider
+                .get_withdrawal_tree_next_index(checkpoint, BRIDGE_USER_ID_U64, u64::from(chain.chain_index))
+                .await?;
+            withdrawal_chain_offsets.push((u64::from(chain.chain_index), withdrawal_next_index));
+        }
 
         if append_business && pending > l2_count {
             let snapshot = crate::bridge::api_client::fetch_services_deposit_tree_root(
@@ -2431,14 +2445,11 @@ async fn build_multichain_l2_plan(
     calls.sort_by_key(|call| call.inputs.first().copied().unwrap_or(u64::MAX));
 
     let withdrawals = if append_business {
-        let global_count = provider
-            .get_withdrawal_tree_global_count(checkpoint, BRIDGE_USER_ID_U64)
-            .await?;
         propose_withdrawals::fetch_pending_bridge_withdrawals(
             propose_args,
             from_checkpoint.max(1),
             to_checkpoint.saturating_add(1),
-            global_count,
+            &withdrawal_chain_offsets,
         ).await?
     } else {
         Vec::new()
