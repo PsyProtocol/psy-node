@@ -40,7 +40,7 @@ pub const MAX_VALIDATOR_TREE_NODES_FFS_BYTES: usize = 1 << 22;
 #[serde_as]
 #[pderive::serialize_copy]
 pub struct ValidatorLeafPreimage {
-    pub chain_id: u32,
+    pub chain_id: u64,
     pub realm_id: u32,
     pub realm_sub_id: u16,
     pub validator_user_id: u64,
@@ -52,16 +52,16 @@ pub struct ValidatorLeafPreimage {
 
 impl psy_serialize::PsyCanonicalSerializeMetadata for ValidatorLeafPreimage {
     const IS_FIXED_SIZE: bool = true;
-    const FIXED_SIZE: usize = 104;
+    const FIXED_SIZE: usize = 108;
 }
 
 impl psy_serialize::FallbackPsySerializeCanonical for ValidatorLeafPreimage {
     fn fallback_pio_serialized_size(&self) -> usize {
-        104
+        108
     }
 
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
-        writer.psy_write_u32(self.chain_id)?;
+        writer.psy_write_u64(self.chain_id)?;
         writer.psy_write_u32(self.realm_id)?;
         writer.psy_write_u16(self.realm_sub_id)?;
         writer.psy_write_u64(self.validator_user_id)?;
@@ -72,7 +72,7 @@ impl psy_serialize::FallbackPsySerializeCanonical for ValidatorLeafPreimage {
 
     fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
         Ok(Self {
-            chain_id: reader.psy_read_u32()?,
+            chain_id: reader.psy_read_u64()?,
             realm_id: reader.psy_read_u32()?,
             realm_sub_id: reader.psy_read_u16()?,
             validator_user_id: reader.psy_read_u64()?,
@@ -95,7 +95,7 @@ impl parth_core::utils::QPGenRandom for ValidatorLeafPreimage {
         Self: Sized,
     {
         Self {
-            chain_id: u32::qp_rand_gen(),
+            chain_id: u64::qp_rand_gen(),
             realm_id: u32::qp_rand_gen(),
             realm_sub_id: (u16::qp_rand_gen()) & 0xff,
             validator_user_id: u64::qp_rand_gen(),
@@ -107,7 +107,7 @@ impl parth_core::utils::QPGenRandom for ValidatorLeafPreimage {
 
 impl ValidatorLeafPreimage {
     pub fn from_genesis_validator(
-        chain_id: u32,
+        chain_id: u64,
         realm_sub_id: u16,
         validator: &GenesisValidator,
     ) -> anyhow::Result<Self> {
@@ -206,7 +206,7 @@ pub struct ValidatorTreeGenesis<Hash> {
 
 /// Build the single height-20 tree and its preimages from genesis entries.
 pub fn build_validator_tree_genesis<Hasher, Hash>(
-    chain_id: u32,
+    chain_id: u64,
     validators: &[GenesisValidator],
     realm_user_tree_height: u8,
 ) -> anyhow::Result<ValidatorTreeGenesis<Hash>>
@@ -304,7 +304,7 @@ where
 
 /// Compute the checkpoint sixth root from genesis validator leaves.
 pub fn validator_tree_root_from_genesis<Hasher, Hash>(
-    chain_id: u32,
+    chain_id: u64,
     validators: &[GenesisValidator],
     realm_user_tree_height: u8,
 ) -> anyhow::Result<Hash>
@@ -350,6 +350,7 @@ mod tests {
     use super::*;
     use libp2p_identity::Keypair;
     use parth_core::{PHash, pgoldilocks::PoseidonHasher};
+    use psy_core::constants::chain_id::PSY_CHAIN_ID_LOCAL_DEVNET;
 
     use crate::p2p::bls::BlsSecretKey;
 
@@ -367,7 +368,7 @@ mod tests {
                 node_id: *node.as_raw(),
                 bls_public_key: bls.to_bytes(),
             };
-            if ValidatorLeafPreimage::from_genesis_validator(1, position, &validator).is_ok() {
+            if ValidatorLeafPreimage::from_genesis_validator(PSY_CHAIN_ID_LOCAL_DEVNET, position, &validator).is_ok() {
                 return validator;
             }
         }
@@ -375,8 +376,35 @@ mod tests {
     }
 
     #[test]
+    fn stored_preimage_u64_magic_roundtrip_and_fixed_size() {
+        use psy_serialize::{
+            FallbackPsySerializeCanonical, PsyCanonicalDatabaseSerializeBaseSingle,
+            PsyCanonicalSerializeMetadata,
+        };
+
+        let magic = PSY_CHAIN_ID_LOCAL_DEVNET;
+        let validator = sample_validator(2, 1, 11);
+        let preimage = ValidatorLeafPreimage::from_genesis_validator(magic, 1, &validator).unwrap();
+        let encoded = preimage.psy_ser_to_bytes_vec().unwrap();
+        let fallback = preimage.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(ValidatorLeafPreimage::FIXED_SIZE, 108);
+        assert_eq!(preimage.fallback_pio_serialized_size(), 108);
+        assert_eq!(encoded.len(), 108);
+        assert_eq!(encoded, fallback);
+        assert_eq!(&encoded[..8], &magic.to_le_bytes());
+        assert_eq!(&encoded[8..12], &2u32.to_le_bytes());
+        assert_eq!(&encoded[12..14], &1u16.to_le_bytes());
+        assert_eq!(ValidatorLeafPreimage::psy_ser_from_slice(&encoded).unwrap(), preimage);
+        assert_eq!(ValidatorLeafPreimage::fallback_psy_ser_from_slice(&encoded).unwrap(), preimage);
+        for len in [104, 107] {
+            assert!(ValidatorLeafPreimage::psy_ser_from_slice(&encoded[..len]).is_err());
+            assert!(ValidatorLeafPreimage::fallback_psy_ser_from_slice(&encoded[..len]).is_err());
+        }
+    }
+
+    #[test]
     fn empty_genesis_is_rejected() {
-        let error = match build_validator_tree_genesis::<PoseidonHasher, PHash>(1, &[], 20) {
+        let error = match build_validator_tree_genesis::<PoseidonHasher, PHash>(PSY_CHAIN_ID_LOCAL_DEVNET, &[], 20) {
             Ok(_) => panic!("empty Genesis validators must be rejected"),
             Err(error) => error,
         };
@@ -390,7 +418,7 @@ mod tests {
             sample_validator(0, 2, 12),
             sample_validator(1, 1, 21),
         ];
-        let built = build_validator_tree_genesis::<PoseidonHasher, PHash>(1, &validators, 20).unwrap();
+        let built = build_validator_tree_genesis::<PoseidonHasher, PHash>(PSY_CHAIN_ID_LOCAL_DEVNET, &validators, 20).unwrap();
         assert!(!built.nodes_ffs.is_empty());
         assert_eq!(built.preimages.len(), 3);
         assert_eq!(built.preimages[0].tree_index().unwrap(), (0u64 << 8) | 1);
@@ -413,7 +441,7 @@ mod tests {
             .map(|position| sample_validator(0, position as u16, position as u8))
             .collect::<Vec<_>>();
         validators.push(sample_validator(0, 65, 65));
-        let error = match build_validator_tree_genesis::<PoseidonHasher, PHash>(1, &validators, 20) {
+        let error = match build_validator_tree_genesis::<PoseidonHasher, PHash>(PSY_CHAIN_ID_LOCAL_DEVNET, &validators, 20) {
             Ok(_) => panic!("65 validators must be rejected"),
             Err(error) => error,
         };

@@ -25,7 +25,7 @@ pub const BOOTNODE_MIN_CIRCUITS: u32 = 64;
 /// this slim module.
 #[derive(Clone, Debug)]
 pub struct RealmNetworkConfig {
-    pub chain_id: u32,
+    pub chain_id: u64,
     pub realm_id: u32,
     pub identity_key_path: String,
     /// Optional BLS secret key file (validators only). Edge/bootnode runtimes

@@ -30,22 +30,22 @@ pub const DIRECT_REQUEST_MAX_BYTES: u32 = 61_440;
 /// Maximum EndCap forward stream total (header + input + proof).
 pub const MAX_END_CAP_FORWARD_BYTES: usize = 536_870_912;
 
-/// Fixed Proposal metadata wire length (210 bytes).
-pub const PROPOSAL_WIRE_BYTES: usize = 210;
+/// Fixed Proposal metadata wire length (214 bytes).
+pub const PROPOSAL_WIRE_BYTES: usize = 214;
 
 /// Fixed Vote wire length.
 pub const VOTE_WIRE_BYTES: usize = 130;
 
 /// Fixed Certificate wire length.
-pub const CERTIFICATE_WIRE_BYTES: usize = 200;
+pub const CERTIFICATE_WIRE_BYTES: usize = 204;
 
 /// Fixed DirectBodyRequest wire length.
 pub const DIRECT_BODY_REQUEST_WIRE_BYTES: usize = 44;
 
-/// EndCapForwardHeader wire length (56 bytes):
-/// `chain_id(4) + realm_id(4) + checkpoint_id(8) + end_cap_id(32)
+/// EndCapForwardHeader wire length (60 bytes):
+/// `chain_id(8) + realm_id(4) + checkpoint_id(8) + end_cap_id(32)
 /// + end_cap_input_len(4) + proof_len(4)`.
-pub const END_CAP_FORWARD_HEADER_WIRE_BYTES: usize = 56;
+pub const END_CAP_FORWARD_HEADER_WIRE_BYTES: usize = 60;
 
 /// Exact one-byte EndCapForwardResponse status length.
 pub const END_CAP_FORWARD_RESPONSE_WIRE_BYTES: usize = 1;
@@ -104,10 +104,10 @@ mod tests {
     fn proposal_body_and_parts_match_spec() {
         assert_eq!(MAX_PROPOSAL_BODY_BYTES, 105_120_166);
         assert_eq!(MAX_PROPOSAL_PARTS, 1_711);
-        assert_eq!(PROPOSAL_WIRE_BYTES, 210);
+        assert_eq!(PROPOSAL_WIRE_BYTES, 214);
         assert_eq!(VOTE_WIRE_BYTES, 130);
-        assert_eq!(CERTIFICATE_WIRE_BYTES, 200);
-        assert_eq!(END_CAP_FORWARD_HEADER_WIRE_BYTES, 56);
+        assert_eq!(CERTIFICATE_WIRE_BYTES, 204);
+        assert_eq!(END_CAP_FORWARD_HEADER_WIRE_BYTES, 60);
         assert_eq!(replication_threshold(1), 1);
         assert_eq!(replication_threshold(2), 1);
         assert_eq!(replication_threshold(3), 2);

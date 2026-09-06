@@ -32,7 +32,7 @@ impl QBlobSingleMerkleNodeBatchDataView {
     }
     pub fn validate_single_tree_nodes_batch_header_for_realm_context(
         header: &QBlobMerkleTreeNodeBatchHeaderV1,
-        chain_id: u32,
+        chain_id: u64,
         realm_id: u64,
         realm_sub_id: u64,
         unique_pending_id: u64,
@@ -42,7 +42,7 @@ impl QBlobSingleMerkleNodeBatchDataView {
     }
     pub fn validate_single_tree_nodes_batch_header_for_realm_context_get_clipped(
         data: Vec<u8>,
-        chain_id: u32,
+        chain_id: u64,
         realm_id: u64,
         realm_sub_id: u64,
         unique_pending_id: u64,
@@ -66,7 +66,7 @@ impl QBlobSingleMerkleNodeBatchDataView {
     }
     pub fn validate_single_tree_nodes_batch_header_for_realm_context_get_clipped_any_unique_pending_id(
         data: Vec<u8>,
-        chain_id: u32,
+        chain_id: u64,
         realm_id: u64,
         realm_sub_id: u64,
         tree_type: QBlobMerkleNodeTreeType,
@@ -88,7 +88,7 @@ impl QBlobSingleMerkleNodeBatchDataView {
     }
     pub fn validate_single_tree_nodes_batch_header_for_realm_context_get_clipped_ref(
         data: &[u8],
-        chain_id: u32,
+        chain_id: u64,
         realm_id: u64,
         realm_sub_id: u64,
         unique_pending_id: u64,
@@ -112,7 +112,7 @@ impl QBlobSingleMerkleNodeBatchDataView {
     }
     pub fn validate_single_tree_nodes_batch_header_for_realm_context_get_clipped_ref_no_exact_size(
         data: &[u8],
-        chain_id: u32,
+        chain_id: u64,
         realm_id: u64,
         realm_sub_id: u64,
         unique_pending_id: u64,
@@ -137,7 +137,7 @@ impl QBlobSingleMerkleNodeBatchDataView {
     }
     pub fn validate_single_tree_nodes_batch_header_for_realm_context_get_clipped_ref_no_exact_size_any_unique_pending_id(
         data: &[u8],
-        chain_id: u32,
+        chain_id: u64,
         realm_id: u64,
         realm_sub_id: u64,
         tree_type: QBlobMerkleNodeTreeType,
@@ -997,7 +997,7 @@ mod tests {
         fuzz_merkle_hash_recorder_with_sibling_values_helper::<PHash, PoseidonHasher>(16, 142, None, QBlobMerkleNodeTreeType::ContractFunctionTree)
             .unwrap();
 
-        let context = QBlobWriterContextMetadataHeader::new_at_now(1337, 124, 99, 10, 18247124124, 100101201, 114881);
+        let context = QBlobWriterContextMetadataHeader::new_at_now(psy_core::constants::chain_id::PSY_CHAIN_ID_LOCAL_DEVNET, 124, 99, 10, 18247124124, 100101201, 114881);
 
         for i in 0..16 {
             fuzz_merkle_hash_recorder_with_sibling_values_helper_proof::<Hash256, CoreSha256Hasher>(
@@ -1143,7 +1143,7 @@ mod tests {
         let count = 10_000;
         let tree_type = QBlobMerkleNodeTreeType::UserContractTree;
         println!("Generating {} random single ID nodes...", count);
-        let context = QBlobWriterContextMetadataHeader::new_at_now(1, 42, 1001, 1, 2, 3, 4);
+        let context = QBlobWriterContextMetadataHeader::new_at_now(psy_core::constants::chain_id::PSY_CHAIN_ID_LOCAL_DEVNET, 42, 1001, 1, 2, 3, 4);
         let nodes: Vec<QMerkleStoreSingleIdNode<Hash>> = (0..count).map(|_| QPGenRandom::qp_rand_gen()).collect();
         let start_time = std::time::Instant::now();
         let serialized_blob = QBlobSingleMerkleNodeBatchDataView::generate_single_merkle_node_batch_blob_data_from_ref(context, tree_type, &nodes);
@@ -1189,7 +1189,7 @@ mod tests {
         let number_of_batches = 2_000;
         let nodes_per_batch = 200;
         let tree_type = QBlobMerkleNodeTreeType::UserContractTree;
-        let context = QBlobWriterContextMetadataHeader::new_at_now(1, 42, 1001, 1, 2, 3, 4);
+        let context = QBlobWriterContextMetadataHeader::new_at_now(psy_core::constants::chain_id::PSY_CHAIN_ID_LOCAL_DEVNET, 42, 1001, 1, 2, 3, 4);
 
         let batch_nodes: Vec<Vec<QMerkleStoreSingleIdNode<Hash>>> = (0..number_of_batches)
             .map(|_| (0..nodes_per_batch).map(|_| QPGenRandom::qp_rand_gen()).collect())

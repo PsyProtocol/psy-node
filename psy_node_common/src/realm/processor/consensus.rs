@@ -146,7 +146,7 @@ pub fn decode_proposal_state_updates<Hash: Q256BitHash>(
 
 /// Build the canonical unbound 410-byte finalize output for an ordinary GUTA submit.
 pub fn build_bound_finalize_output<N>(
-    chain_id: u32,
+    chain_id: u64,
     realm_id: u32,
     proposer_sub_id: u16,
     validator_user_id: u64,
@@ -444,11 +444,16 @@ mod tests {
     use super::*;
     use psy_data::p2p::{encode_proposal_body, proposal_from_parts};
 
+    /// The localhost network magic, sourced from the network config via the
+    /// psy_core build-time constants. A full u64 that does not fit in u32, so
+    /// any u32 truncation would break these tests.
+    const TEST_CHAIN_ID: u64 = psy_core::constants::chain_id::PSY_CHAIN_ID_LOCAL_DEVNET;
+
     /// Build a `Proposal` whose body/hashes are consistent with the given
     /// sections, reusing the canonical `psy_data` encoders.
     #[allow(clippy::too_many_arguments)]
     fn proposal_with_body(
-        chain_id: u32,
+        chain_id: u64,
         realm_id: u32,
         base_checkpoint_id: u64,
         proposer_sub_id: u16,
@@ -494,7 +499,7 @@ mod tests {
     fn decode_proposal_body_roundtrips_canonical_body() {
         let (output, proof, state_updates) = sample_body_sections();
         let (proposal, body) =
-            proposal_with_body(7, 3, 99, 1, [0u8; 32], &output, &proof, &state_updates);
+            proposal_with_body(TEST_CHAIN_ID, 3, 99, 1, [0u8; 32], &output, &proof, &state_updates);
         let decoded = decode_proposal_body(&proposal, &body).expect("decode");
         assert_eq!(decoded.output, output);
         assert_eq!(decoded.proof, proof);
@@ -502,10 +507,28 @@ mod tests {
     }
 
     #[test]
+    fn compute_proposal_id_round_trips_u64_chain_magic() {
+        // A full u64 that does not fit in u32, so any u32 truncation would
+        // break this test.
+        assert!(TEST_CHAIN_ID > u32::MAX as u64);
+        let (output, proof, state_updates) = sample_body_sections();
+        let (proposal, _) = proposal_with_body(
+            TEST_CHAIN_ID, 3, 99, 1, [1u8; 32], &output, &proof, &state_updates,
+        );
+        assert_eq!(proposal.compute_proposal_id(), proposal.proposal_id);
+        // proposal_id must depend on the full u64: the magic truncated to u32
+        // yields a different canonical proposal.
+        let (truncated, _) = proposal_with_body(
+            TEST_CHAIN_ID as u32 as u64, 3, 99, 1, [1u8; 32], &output, &proof, &state_updates,
+        );
+        assert_ne!(proposal.proposal_id, truncated.proposal_id);
+    }
+
+    #[test]
     fn decode_proposal_body_rejects_trailing_bytes() {
         let (output, proof, state_updates) = sample_body_sections();
         let (mut proposal, mut body) =
-            proposal_with_body(7, 3, 99, 1, [0u8; 32], &output, &proof, &state_updates);
+            proposal_with_body(TEST_CHAIN_ID, 3, 99, 1, [0u8; 32], &output, &proof, &state_updates);
         // Recompute body_hash over the tampered body so the only failure is
         // the trailing-bytes check, not the hash check.
         body.push(0);
@@ -519,7 +542,7 @@ mod tests {
         // Hand-roll a body whose output length prefix is not exactly 410.
         let (output, proof, state_updates) = sample_body_sections();
         let (proposal, _) =
-            proposal_with_body(7, 3, 99, 1, [0u8; 32], &output, &proof, &state_updates);
+            proposal_with_body(TEST_CHAIN_ID, 3, 99, 1, [0u8; 32], &output, &proof, &state_updates);
         let mut body = Vec::new();
         body.extend_from_slice(&409u32.to_le_bytes());
         body.extend_from_slice(&output[..409]);
@@ -535,7 +558,7 @@ mod tests {
     fn decode_proposal_body_rejects_hash_mismatch() {
         let (output, proof, state_updates) = sample_body_sections();
         let (mut proposal, body) =
-            proposal_with_body(7, 3, 99, 1, [0u8; 32], &output, &proof, &state_updates);
+            proposal_with_body(TEST_CHAIN_ID, 3, 99, 1, [0u8; 32], &output, &proof, &state_updates);
         proposal.body_hash = [0xFF; 32];
         let err = decode_proposal_body(&proposal, &body).unwrap_err();
         assert_eq!(err, ProtocolError::Message("body_hash mismatch"));
@@ -574,7 +597,7 @@ mod tests {
         let (secrets, keys) = build_validators(&validator_sub_ids);
         let (output, proof, backup) = sample_body_sections();
         let (proposal, _body) =
-            proposal_with_body(7, 3, 99, 1, [1u8; 32], &output, &proof, &backup);
+            proposal_with_body(TEST_CHAIN_ID, 3, 99, 1, [1u8; 32], &output, &proof, &backup);
 
         // Two signers meets the threshold.
         let votes = signed_votes(&secrets[..2], &validator_sub_ids[..2], &proposal);
@@ -597,7 +620,7 @@ mod tests {
         let (secrets, keys) = build_validators(&validator_sub_ids);
         let (output, proof, backup) = sample_body_sections();
         let (proposal, _body) =
-            proposal_with_body(7, 3, 99, 1, [1u8; 32], &output, &proof, &backup);
+            proposal_with_body(TEST_CHAIN_ID, 3, 99, 1, [1u8; 32], &output, &proof, &backup);
 
         // Forge a vote from a sub-id that is not one of the validators and
         // aggregate it with the two honest votes.
@@ -623,7 +646,7 @@ mod tests {
         let (secrets, keys) = build_validators(&validator_sub_ids);
         let (output, proof, backup) = sample_body_sections();
         let (proposal, _body) =
-            proposal_with_body(7, 3, 99, 1, [1u8; 32], &output, &proof, &backup);
+            proposal_with_body(TEST_CHAIN_ID, 3, 99, 1, [1u8; 32], &output, &proof, &backup);
 
         // Build a structurally valid aggregate (real G2 point) that signs the
         // same vote_message with three OUTSIDER keys, so it is a legitimate
@@ -653,13 +676,13 @@ mod tests {
         let (secrets, keys) = build_validators(&validator_sub_ids);
         let (output, proof, backup) = sample_body_sections();
         let (proposal, _body) =
-            proposal_with_body(7, 3, 99, 1, [1u8; 32], &output, &proof, &backup);
+            proposal_with_body(TEST_CHAIN_ID, 3, 99, 1, [1u8; 32], &output, &proof, &backup);
 
         let votes = signed_votes(&secrets, &validator_sub_ids, &proposal);
         let cert = form_certificate(&proposal, &votes).expect("form");
 
         // A different proposal with the same body but a different proof-base checkpoint.
-        let (other, _) = proposal_with_body(7, 3, 200, 1, [1u8; 32], &output, &proof, &backup);
+        let (other, _) = proposal_with_body(TEST_CHAIN_ID, 3, 200, 1, [1u8; 32], &output, &proof, &backup);
         let err = validate_certificate(&other, &cert, &validator_sub_ids, &keys).unwrap_err();
         assert_eq!(
             err,
@@ -673,7 +696,7 @@ mod tests {
         let (secrets, _keys) = build_validators(&validator_sub_ids);
         let (output, proof, backup) = sample_body_sections();
         let (proposal, _body) =
-            proposal_with_body(7, 3, 99, 1, [1u8; 32], &output, &proof, &backup);
+            proposal_with_body(TEST_CHAIN_ID, 3, 99, 1, [1u8; 32], &output, &proof, &backup);
 
         let v1 = sign_vote(&secrets[0], 1, &proposal);
         let dup = sign_vote(&secrets[1], 1, &proposal);
@@ -731,7 +754,7 @@ mod tests {
         let (secrets, _keys) = build_validators(&validator_sub_ids);
         let (output, proof, backup) = sample_body_sections();
         let (proposal, _body) =
-            proposal_with_body(7, 3, 99, 1, [1u8; 32], &output, &proof, &backup);
+            proposal_with_body(TEST_CHAIN_ID, 3, 99, 1, [1u8; 32], &output, &proof, &backup);
 
         // Votes from sub-ids 2 and 3 only: the proposer (sub-id 1) is absent.
         let votes = signed_votes(&secrets[1..], &validator_sub_ids[1..], &proposal);

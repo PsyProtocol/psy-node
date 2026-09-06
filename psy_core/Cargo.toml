@@ -40,3 +40,6 @@ parth_core = { workspace = true }
 pser = { workspace = true }
 pderive = { workspace = true }
 cf_utils = { workspace = true }
+
+[build-dependencies]
+serde_json = { workspace = true }

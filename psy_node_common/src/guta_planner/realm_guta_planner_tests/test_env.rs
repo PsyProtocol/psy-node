@@ -172,7 +172,7 @@ pub struct RGPTestChainState {
     pub checkpoint_tree: PsyDashMemoryAppendOnlyMerkleStore<Hasher, Hash>,
     pub users: HashMap<u64, RGPUser>,
     pub contract_height_cache: DashMapContractHeightCache<Hash>,
-    pub chain_id: u32,
+    pub chain_id: u64,
     pub node_id: u32,
     pub checkpoint_id: u64,
     pub unique_pending_id: u64,
@@ -209,7 +209,7 @@ impl RGPTestChainState {
             Hasher::q_two_to_one(Hash::from_u64x4([101, 102, 103, 104]), param));
         let mut state = Self {
             db,
-            chain_id: 0,
+            chain_id: psy_core::constants::chain_id::PSY_CHAIN_ID_LOCAL_DEVNET,
             node_id: 0,
             checkpoint_tree_root: checkpoint_tree.get_root(),
             temp_db: Arc::new(TempStore::new("rgp_test".to_string(), realm_id_u64, realm_sub_id_u64)),
@@ -506,7 +506,7 @@ impl RGPTestChainState {
         let mut backup_file = self.backup_file_system.file_like_fs_create(&backup_file_path).await?;
 
         let mut realm_planner = RealmGUTAPlanner::<F, Hash>::new(
-            0,
+            self.chain_id,
             self.realm_identifier,
             old_checkpoint_root,
             checkpoint_id,
@@ -1280,7 +1280,7 @@ async fn test_finalizer_single_endcap_dispatch_and_fee_credit() -> anyhow::Resul
 #[tokio::test]
 async fn test_finalizer_missing_identity_fails_closed() -> anyhow::Result<()> {
     let mut state = RGPTestChainState::create_for_tests().await?;
-    let planner = RealmGUTAPlanner::new(0, state.realm_identifier, state.checkpoint_tree_root,
+    let planner = RealmGUTAPlanner::new(state.chain_id, state.realm_identifier, state.checkpoint_tree_root,
         state.checkpoint_id, state.unique_pending_id, state.first_realm_global_user_tree.get_root(),
         N::REALM_GLOBAL_USER_TREE_HEIGHT, N::GLOBAL_USER_TREE_HEIGHT, state.guta_circuit_whitelist);
     let error = match planner.finalize_with_reward_ids(&state.checkpoint_tree, &mut state.first_realm_global_user_tree, state.temp_db.clone(), 0, 0).await {

@@ -26,7 +26,7 @@ pub async fn create_realm_processor<
     FileSystem: TokioLikeFileSystem + Send + Sync + 'static,
     CoordinatorClient: RealmCoordinatorClient<N::F, N::QHash> + Send + Sync + 'static,
 >(
-    chain_id: u32,
+    chain_id: u64,
     genesis_data: &PsyGenesisBlockSetupData<N::F, N::QHash>,
     file_system: Arc<FileSystem>,
     guta_gatherer_backup_directory: String,
@@ -82,7 +82,7 @@ where
         guta_update_queue: Arc<GUTAUpdateQueue>,
         proof_work_queue: Arc<ProofWorkQueue>,
         coordinator_client: Arc<CoordinatorClient>,
-        chain_id: u32,
+        chain_id: u64,
         realm_identifier: QRealmIdentifier,
         circuit_fingerprint_config: PsyNodeCircuitFingerprintConfig<N::QHash>,
         file_system: Arc<FileSystem>,
@@ -192,7 +192,7 @@ pub async fn create_realm_processor_and_run<
     FileSystem: TokioLikeFileSystem + Send + Sync + 'static,
     CoordinatorClient: RealmCoordinatorClient<N::F, N::QHash> + Send + Sync + 'static,
 >(
-    chain_id: u32,
+    chain_id: u64,
     genesis_data: &PsyGenesisBlockSetupData<N::F, N::QHash>,
     file_system: Arc<FileSystem>,
     guta_gatherer_backup_directory: String,

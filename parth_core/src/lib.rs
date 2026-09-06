@@ -4,7 +4,6 @@ mod ptypes;
 //mod canonical_serialize;
 //pub use canonical_serialize::*;
 pub use ptypes::*;
-pub mod constants;
 pub mod felt;
 pub mod crypto;
 pub mod data;

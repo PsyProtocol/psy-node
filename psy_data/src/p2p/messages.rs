@@ -83,10 +83,10 @@ impl ProtocolEncode for RealmFinalizeOutputBytes {
     }
 }
 
-/// Pre-commit Proposal metadata (exactly 210 wire bytes).
+/// Pre-commit Proposal metadata (exactly 214 wire bytes).
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct Proposal {
-    pub chain_id: u32,
+    pub chain_id: u64,
     pub realm_id: u32,
     pub base_checkpoint_id: u64,
     pub proposer_sub_id: u16,
@@ -99,12 +99,12 @@ pub struct Proposal {
 }
 
 impl Proposal {
-    /// Exact wire length (210 bytes).
+    /// Exact wire length (214 bytes).
     pub const WIRE_BYTES: usize = PROPOSAL_WIRE_BYTES;
 
     pub fn protocol_decode(reader: &mut ProtocolReader<'_>) -> ProtocolResult<Self> {
         Ok(Self {
-            chain_id: reader.read_u32()?,
+            chain_id: reader.read_u64()?,
             realm_id: reader.read_u32()?,
             base_checkpoint_id: reader.read_u64()?,
             proposer_sub_id: reader.read_u16()?,
@@ -139,7 +139,7 @@ impl Proposal {
 
 impl ProtocolEncode for Proposal {
     fn protocol_encode(&self, out: &mut Vec<u8>) {
-        write_u32(out, self.chain_id);
+        write_u64(out, self.chain_id);
         write_u32(out, self.realm_id);
         write_u64(out, self.base_checkpoint_id);
         write_u16(out, self.proposer_sub_id);
@@ -156,7 +156,7 @@ impl ProtocolEncode for Proposal {
 ///     base_checkpoint_id, proposer_sub_id, validator_tree_root,
 ///     public_output_hash, finalizer_proof_hash, backup_hash, body_hash))`.
 pub fn compute_proposal_id(
-    chain_id: u32,
+    chain_id: u64,
     realm_id: u32,
     base_checkpoint_id: u64,
     proposer_sub_id: u16,
@@ -166,9 +166,9 @@ pub fn compute_proposal_id(
     backup_hash: &[u8; 32],
     body_hash: &[u8; 32],
 ) -> [u8; 32] {
-    let mut buf = Vec::with_capacity(8 + 4 + 4 + 8 + 2 + 5 * 32);
+    let mut buf = Vec::with_capacity(8 + 8 + 4 + 8 + 2 + 5 * 32);
     write_fixed(&mut buf, &DOMAIN_PROPOSAL);
-    write_u32(&mut buf, chain_id);
+    write_u64(&mut buf, chain_id);
     write_u32(&mut buf, realm_id);
     write_u64(&mut buf, base_checkpoint_id);
     write_u16(&mut buf, proposer_sub_id);
@@ -182,7 +182,7 @@ pub fn compute_proposal_id(
 
 /// Construct a `Proposal` with its canonical `proposal_id` computed.
 pub fn proposal_from_parts(
-    chain_id: u32,
+    chain_id: u64,
     realm_id: u32,
     base_checkpoint_id: u64,
     proposer_sub_id: u16,
@@ -433,24 +433,24 @@ impl ProtocolEncode for Vote {
 /// `vote_message = protocol_encode(DOMAIN_VOTE, chain_id, realm_id,
 ///     validator_tree_root, proposal_id)`.
 pub fn vote_message(
-    chain_id: u32,
+    chain_id: u64,
     realm_id: u32,
     validator_tree_root: &[u8; 32],
     proposal_id: &[u8; 32],
 ) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(8 + 4 + 4 + 32 + 32);
+    let mut buf = Vec::with_capacity(8 + 8 + 4 + 32 + 32);
     write_fixed(&mut buf, &DOMAIN_VOTE);
-    write_u32(&mut buf, chain_id);
+    write_u64(&mut buf, chain_id);
     write_u32(&mut buf, realm_id);
     write_fixed(&mut buf, validator_tree_root);
     write_fixed(&mut buf, proposal_id);
     buf
 }
 
-/// Certificate wire object (exactly 200 bytes).
+/// Certificate wire object (exactly 204 bytes).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Certificate {
-    pub chain_id: u32,
+    pub chain_id: u64,
     pub realm_id: u32,
     pub validator_tree_root: [u8; 32],
     pub proposal_id: [u8; 32],
@@ -460,7 +460,7 @@ pub struct Certificate {
 }
 
 impl Certificate {
-    /// Exact wire length (200 bytes).
+    /// Exact wire length (204 bytes).
     pub const WIRE_BYTES: usize = CERTIFICATE_WIRE_BYTES;
 
     /// Number of set signer bits.
@@ -494,7 +494,7 @@ impl Certificate {
 
     pub fn protocol_decode(reader: &mut ProtocolReader<'_>) -> ProtocolResult<Self> {
         Ok(Self {
-            chain_id: reader.read_u32()?,
+            chain_id: reader.read_u64()?,
             realm_id: reader.read_u32()?,
             validator_tree_root: reader.read_bytes_32()?,
             proposal_id: reader.read_bytes_32()?,
@@ -510,7 +510,7 @@ impl Certificate {
 
 impl ProtocolEncode for Certificate {
     fn protocol_encode(&self, out: &mut Vec<u8>) {
-        write_u32(out, self.chain_id);
+        write_u64(out, self.chain_id);
         write_u32(out, self.realm_id);
         write_fixed(out, &self.validator_tree_root);
         write_fixed(out, &self.proposal_id);
@@ -688,12 +688,12 @@ impl ProtocolEncode for DirectBodyResponse {
     }
 }
 
-/// EndCap forward stream header (exactly 56 bytes):
-/// `chain_id(4) + realm_id(4) + checkpoint_id(8) + end_cap_id(32)
+/// EndCap forward stream header (exactly 60 bytes):
+/// `chain_id(8) + realm_id(4) + checkpoint_id(8) + end_cap_id(32)
 /// + end_cap_input_len(4) + proof_len(4)`.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct EndCapForwardHeader {
-    pub chain_id: u32,
+    pub chain_id: u64,
     pub realm_id: u32,
     pub checkpoint_id: u64,
     pub end_cap_id: [u8; 32],
@@ -702,12 +702,12 @@ pub struct EndCapForwardHeader {
 }
 
 impl EndCapForwardHeader {
-    /// Exact wire length (56 bytes).
+    /// Exact wire length (60 bytes).
     pub const WIRE_BYTES: usize = END_CAP_FORWARD_HEADER_WIRE_BYTES;
 
     pub fn protocol_decode(reader: &mut ProtocolReader<'_>) -> ProtocolResult<Self> {
         Ok(Self {
-            chain_id: reader.read_u32()?,
+            chain_id: reader.read_u64()?,
             realm_id: reader.read_u32()?,
             checkpoint_id: reader.read_u64()?,
             end_cap_id: reader.read_bytes_32()?,
@@ -723,7 +723,7 @@ impl EndCapForwardHeader {
 
 impl ProtocolEncode for EndCapForwardHeader {
     fn protocol_encode(&self, out: &mut Vec<u8>) {
-        write_u32(out, self.chain_id);
+        write_u64(out, self.chain_id);
         write_u32(out, self.realm_id);
         write_u64(out, self.checkpoint_id);
         write_fixed(out, &self.end_cap_id);
@@ -735,15 +735,15 @@ impl ProtocolEncode for EndCapForwardHeader {
 /// `end_cap_id = SHA-256(protocol_encode(DOMAIN_END_CAP_FORWARD, chain_id,
 ///     realm_id, checkpoint_id, sha256(input), sha256(proof)))`.
 pub fn compute_end_cap_id(
-    chain_id: u32,
+    chain_id: u64,
     realm_id: u32,
     checkpoint_id: u64,
     end_cap_input_hash: &[u8; 32],
     end_cap_proof_hash: &[u8; 32],
 ) -> [u8; 32] {
-    let mut buf = Vec::with_capacity(8 + 4 + 4 + 8 + 32 + 32);
+    let mut buf = Vec::with_capacity(8 + 8 + 4 + 8 + 32 + 32);
     write_fixed(&mut buf, &DOMAIN_END_CAP_FORWARD);
-    write_u32(&mut buf, chain_id);
+    write_u64(&mut buf, chain_id);
     write_u32(&mut buf, realm_id);
     write_u64(&mut buf, checkpoint_id);
     write_fixed(&mut buf, end_cap_input_hash);
@@ -798,9 +798,11 @@ mod tests {
         MAX_PROPOSAL_PARTS, PROPOSAL_WIRE_BYTES, VOTE_WIRE_BYTES,
     };
 
+    use psy_core::constants::chain_id::PSY_CHAIN_ID_LOCAL_DEVNET as NETWORK_MAGIC;
+
     fn sample_proposal() -> Proposal {
         proposal_from_parts(
-            1,
+            NETWORK_MAGIC,
             2,
             99,
             3,
@@ -817,14 +819,16 @@ mod tests {
         let p = sample_proposal();
         let enc = p.protocol_encode_to_vec();
         assert_eq!(enc.len(), PROPOSAL_WIRE_BYTES);
-        assert_eq!(enc.len(), 210);
+        assert_eq!(enc.len(), 214);
+        assert_eq!(&enc[..8], &NETWORK_MAGIC.to_le_bytes());
+        assert!(Proposal::decode_exact(&enc[..210]).is_err());
         assert_eq!(p.proposal_id, p.compute_proposal_id());
         assert_eq!(Proposal::decode_exact(&enc).unwrap(), p);
 
         // proposal_id is the domain-prefixed SHA-256 of the fields sans proposal_id.
         let mut expected = Vec::new();
         write_fixed(&mut expected, &DOMAIN_PROPOSAL);
-        write_u32(&mut expected, 1);
+        write_u64(&mut expected, NETWORK_MAGIC);
         write_u32(&mut expected, 2);
         write_u64(&mut expected, 99);
         write_u16(&mut expected, 3);
@@ -834,9 +838,14 @@ mod tests {
         write_fixed(&mut expected, &[0x44; 32]);
         write_fixed(&mut expected, &[0x55; 32]);
         assert_eq!(p.proposal_id, sha256(&expected));
+        let legacy = [&expected[..8], &0u32.to_le_bytes(), &expected[16..]].concat();
+        assert_ne!(p.proposal_id, sha256(&legacy));
 
         let mut other = p.clone();
         other.backup_hash = [0x66; 32];
+        assert_ne!(other.compute_proposal_id(), p.proposal_id);
+        other = p.clone();
+        other.chain_id ^= 1u64 << 32;
         assert_ne!(other.compute_proposal_id(), p.proposal_id);
 
         let mut trailing = enc;
@@ -848,7 +857,7 @@ mod tests {
     #[test]
     fn end_cap_forward_header_wire_size() {
         let hdr = EndCapForwardHeader {
-            chain_id: 1,
+            chain_id: NETWORK_MAGIC,
             realm_id: 2,
             checkpoint_id: 3,
             end_cap_id: [7; 32],
@@ -857,7 +866,9 @@ mod tests {
         };
         let enc = hdr.protocol_encode_to_vec();
         assert_eq!(enc.len(), END_CAP_FORWARD_HEADER_WIRE_BYTES);
-        assert_eq!(enc.len(), 56);
+        assert_eq!(enc.len(), 60);
+        assert_eq!(&enc[..8], &NETWORK_MAGIC.to_le_bytes());
+        assert!(EndCapForwardHeader::decode_exact(&enc[..56]).is_err());
         assert_eq!(EndCapForwardHeader::decode_exact(&enc).unwrap(), hdr);
         let mut trailing = enc;
         trailing.push(0);
@@ -918,9 +929,10 @@ mod tests {
     #[test]
     fn vote_and_certificate_wire_sizes() {
         let p = sample_proposal();
-        let msg = vote_message(1, 2, &p.validator_tree_root, &p.proposal_id);
+        let msg = vote_message(NETWORK_MAGIC, 2, &p.validator_tree_root, &p.proposal_id);
         assert_eq!(&msg[..8], b"PSYVOT01");
-        assert_eq!(msg.len(), 8 + 4 + 4 + 32 + 32);
+        assert_eq!(msg.len(), 8 + 8 + 4 + 32 + 32);
+        assert_eq!(&msg[8..16], &NETWORK_MAGIC.to_le_bytes());
 
         let sks: Vec<_> = (1u8..=3)
             .map(|s| BlsSecretKey::key_gen(&[s; 32]).unwrap())
@@ -945,7 +957,7 @@ mod tests {
         bitmap_set(&mut bitmap, 2);
         bitmap_set(&mut bitmap, 4);
         let cert = Certificate {
-            chain_id: 1,
+            chain_id: NETWORK_MAGIC,
             realm_id: 2,
             validator_tree_root: p.validator_tree_root,
             proposal_id: p.proposal_id,
@@ -954,11 +966,20 @@ mod tests {
         };
         let cenc = cert.protocol_encode_to_vec();
         assert_eq!(cenc.len(), CERTIFICATE_WIRE_BYTES);
-        assert_eq!(cenc.len(), 200);
+        assert_eq!(cenc.len(), 204);
+        assert_eq!(&cenc[..8], &NETWORK_MAGIC.to_le_bytes());
+        assert!(Certificate::decode_exact(&cenc[..200]).is_err());
+        let mut trailing = cenc.clone();
+        trailing.push(0);
+        assert!(Certificate::decode_exact(&trailing).is_err());
         let dec = Certificate::decode_exact(&cenc).unwrap();
+        assert_eq!(dec, cert);
         assert_eq!(dec.popcount(), 3);
         assert_eq!(dec.signer_sub_ids(), vec![1, 2, 4]);
         assert_eq!(dec.vote_message(), msg);
+        let mut other = dec;
+        other.chain_id ^= 1u64 << 32;
+        assert!(other.aggregated_signature.fast_aggregate_verify(&other.vote_message(), &pks).is_err());
     }
 
     #[test]
@@ -1080,16 +1101,19 @@ mod tests {
         let proof = b"proof bytes";
         let input_hash = sha256(input);
         let proof_hash = sha256(proof);
-        let id = compute_end_cap_id(1, 2, 3, &input_hash, &proof_hash);
+        let id = compute_end_cap_id(NETWORK_MAGIC, 2, 3, &input_hash, &proof_hash);
         let mut expected = Vec::new();
         write_fixed(&mut expected, &DOMAIN_END_CAP_FORWARD);
-        write_u32(&mut expected, 1);
+        write_u64(&mut expected, NETWORK_MAGIC);
         write_u32(&mut expected, 2);
         write_u64(&mut expected, 3);
         write_fixed(&mut expected, &input_hash);
         write_fixed(&mut expected, &proof_hash);
         assert_eq!(id, sha256(&expected));
-        assert_ne!(id, compute_end_cap_id(1, 2, 4, &input_hash, &proof_hash));
-        assert_ne!(id, compute_end_cap_id(1, 2, 3, &proof_hash, &input_hash));
+        let legacy = [&expected[..8], &0u32.to_le_bytes(), &expected[16..]].concat();
+        assert_ne!(id, sha256(&legacy));
+        assert_ne!(id, compute_end_cap_id(NETWORK_MAGIC, 2, 4, &input_hash, &proof_hash));
+        assert_ne!(id, compute_end_cap_id(NETWORK_MAGIC, 2, 3, &proof_hash, &input_hash));
+        assert_ne!(id, compute_end_cap_id(NETWORK_MAGIC ^ (1u64 << 32), 2, 3, &input_hash, &proof_hash));
     }
 }

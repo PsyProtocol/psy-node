@@ -514,7 +514,7 @@ impl<
         Ok(())
     }
 
-    pub async fn ensure_genesis_applied_from_setup_data(&mut self, chain_id: u32, genesis_data: &PsyGenesisBlockSetupData<N::F, N::QHash>) -> anyhow::Result<()> {
+    pub async fn ensure_genesis_applied_from_setup_data(&mut self, chain_id: u64, genesis_data: &PsyGenesisBlockSetupData<N::F, N::QHash>) -> anyhow::Result<()> {
         let database_check_state = self.get_database_check_state().await?;
         if database_check_state == DatabaseCheckState::NeedsGenesis {
             tracing::info!("Applying genesis block setup data to coordinator processor database...");

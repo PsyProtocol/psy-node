@@ -75,13 +75,13 @@ pub fn validator_tree_index(realm_id: u32, realm_sub_id: u16) -> u64 {
 }
 
 /// Fixed chain-domain felt for RealmFinalizeGUTA actions.
-pub fn realm_finalize_guta_chain_domain<F, Hash, H>(chain_id: u32) -> Hash
+pub fn realm_finalize_guta_chain_domain<F, Hash, H>(chain_id: u64) -> Hash
 where
     F: QFelt64,
     Hash: QFHashBase<F>,
     H: FieldQHasher<F, Hash>,
 {
-    H::q_hash_many(&[F::from_u64_value(chain_id as u64)])
+    H::q_hash_many(&[F::from_u64_value(chain_id)])
 }
 
 // =================================================================================
@@ -476,3 +476,30 @@ pser::impl_psy_ser_basic_tests_fallback!(
     { parth_core::PF, parth_core::PHash },
     realm_finalize_guta_input_tests
 );
+
+#[cfg(test)]
+mod chain_domain_tests {
+    use super::*;
+    use parth_core::felt::FromPrimitiveValuesFelt;
+    use parth_core::pgoldilocks::{PGoldilocksFelt, PGoldilocksHash, PoseidonHasher};
+
+    #[test]
+    fn configured_identity_matches_client_prover() {
+        let network = match psy_config::CURRENT_NETWORK {
+            "localhost" => psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet,
+            "sepolia" => psy_core::constants::chain_id::PsyChainNetworkType::PsyPublicTestnet,
+            "ethereum" => psy_core::constants::chain_id::PsyChainNetworkType::PsyMainnet,
+            other => panic!("Unsupported configured network: {other}"),
+        };
+        assert_eq!(network.get_chain_id(), psy_config::PSY_NETWORK_MAGIC);
+    }
+
+    #[test]
+    fn network_magic_changes_finalizer_domain() {
+        let magic = psy_core::constants::chain_id::PSY_CHAIN_ID_LOCAL_DEVNET;
+        let domain = realm_finalize_guta_chain_domain::<PGoldilocksFelt, PGoldilocksHash, PoseidonHasher>(magic);
+        let old_domain = realm_finalize_guta_chain_domain::<PGoldilocksFelt, PGoldilocksHash, PoseidonHasher>(0);
+        assert_ne!(domain, old_domain);
+        assert_eq!(domain, PoseidonHasher::q_hash_many(&[PGoldilocksFelt::from_u64_value(magic)]));
+    }
+}

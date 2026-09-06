@@ -3,14 +3,14 @@ use parth_core::data::hash::fast_node_serializer::{QMS_FAST_SERIALIZER_DOUBLE_ID
 
 use crate::qblob::{blob_type::{get_item_size_for_data_type, is_valid_qblob_merkle_node_batch_type, QBlobDataType, QBlobMerkleNodeTreeType, QBLOB_IMT_LEAF_ENTRY_SIZE, QBLOB_STANDARD_V1_MAGIC_U32}, traits::common::QBlobStructHeaderBase};
 
-pub const QBLOB_TREE_NODE_BATCH_HEADER_SIZE: usize = 80;
+pub const QBLOB_TREE_NODE_BATCH_HEADER_SIZE: usize = 84;
 
 #[pderive::serialize_copy]
 pub struct QBlobMerkleTreeNodeBatchHeaderV1 {
     // MUST always be QBV1 (QBLOB_STANDARD_V1_MAGIC_U32)
     pub blob_magic: u32, 
     // the chain ID this batch is for
-    pub chain_id: u32, 
+    pub chain_id: u64,
 
     // total size of the payload in bytes (including the header)
     pub total_size: u64, 
@@ -60,7 +60,7 @@ pub struct QBlobMerkleTreeNodeBatchHeaderV1 {
 }
 
 impl QBlobMerkleTreeNodeBatchHeaderV1 {
-    pub fn new_double_id_header(tree_type: QBlobMerkleNodeTreeType, chain_id: u32, node_id: u32, realm_id: u64, realm_sub_id: u64, unique_pending_id: u64, for_target_id: u64) -> Self {
+    pub fn new_double_id_header(tree_type: QBlobMerkleNodeTreeType, chain_id: u64, node_id: u32, realm_id: u64, realm_sub_id: u64, unique_pending_id: u64, for_target_id: u64) -> Self {
         Self {
             blob_magic: QBLOB_STANDARD_V1_MAGIC_U32,
             chain_id,
@@ -78,7 +78,7 @@ impl QBlobMerkleTreeNodeBatchHeaderV1 {
             item_size: QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE as u32,
         }
     }
-    pub fn new_single_id_header(tree_type: QBlobMerkleNodeTreeType, chain_id: u32, node_id: u32, realm_id: u64, realm_sub_id: u64, unique_pending_id: u64, for_target_id: u64) -> Self {
+    pub fn new_single_id_header(tree_type: QBlobMerkleNodeTreeType, chain_id: u64, node_id: u32, realm_id: u64, realm_sub_id: u64, unique_pending_id: u64, for_target_id: u64) -> Self {
         Self {
             blob_magic: QBLOB_STANDARD_V1_MAGIC_U32,
             chain_id,
@@ -96,7 +96,7 @@ impl QBlobMerkleTreeNodeBatchHeaderV1 {
             item_size: QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE as u32,
         }
     }
-    pub fn new_zero_id_header(tree_type: QBlobMerkleNodeTreeType, chain_id: u32, node_id: u32, realm_id: u64, realm_sub_id: u64, unique_pending_id: u64, for_target_id: u64) -> Self {
+    pub fn new_zero_id_header(tree_type: QBlobMerkleNodeTreeType, chain_id: u64, node_id: u32, realm_id: u64, realm_sub_id: u64, unique_pending_id: u64, for_target_id: u64) -> Self {
         Self {
             blob_magic: QBLOB_STANDARD_V1_MAGIC_U32,
             chain_id,
@@ -123,7 +123,7 @@ impl QBlobMerkleTreeNodeBatchHeaderV1 {
     /// Create a new header for IMT leaf batch
     pub fn new_imt_leaf_header(
         tree_type: QBlobMerkleNodeTreeType,
-        chain_id: u32,
+        chain_id: u64,
         node_id: u32,
         realm_id: u64,
         realm_sub_id: u64,
@@ -151,7 +151,7 @@ impl QBlobMerkleTreeNodeBatchHeaderV1 {
         }
     }
 
-    pub fn is_valid_for_realm_context(&self, chain_id: u32, realm_id: u64, realm_sub_id: u64, unique_pending_id: u64) -> bool {
+    pub fn is_valid_for_realm_context(&self, chain_id: u64, realm_id: u64, realm_sub_id: u64, unique_pending_id: u64) -> bool {
         self.is_header_valid() && 
         self.chain_id == chain_id &&
         self.realm_id == realm_id &&
@@ -161,19 +161,19 @@ impl QBlobMerkleTreeNodeBatchHeaderV1 {
     pub fn to_bytes_fixed_size_array(&self) -> [u8; QBLOB_TREE_NODE_BATCH_HEADER_SIZE] {
         let mut buf = [0u8; QBLOB_TREE_NODE_BATCH_HEADER_SIZE];
         buf[0..4].copy_from_slice(&self.blob_magic.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.chain_id.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.total_size.to_le_bytes());
-        buf[16..20].copy_from_slice(&self.created_by_node_id.to_le_bytes());
-        buf[20..24].copy_from_slice(&self.created_at_seconds.to_le_bytes());
-        buf[24..26].copy_from_slice(&(self.blob_type as u16).to_le_bytes());
-        buf[26..28].copy_from_slice(&(self.tree_type as u16).to_le_bytes());
-        buf[28..36].copy_from_slice(&self.realm_id.to_le_bytes());
-        buf[36..44].copy_from_slice(&self.realm_sub_id.to_le_bytes());
-        buf[44..52].copy_from_slice(&self.unique_pending_id.to_le_bytes());
-        buf[52..60].copy_from_slice(&self.checkpoint_id.to_le_bytes());
-        buf[60..68].copy_from_slice(&self.for_target_id.to_le_bytes());
-        buf[68..76].copy_from_slice(&self.item_count.to_le_bytes());
-        buf[76..80].copy_from_slice(&self.item_size.to_le_bytes());
+        buf[4..12].copy_from_slice(&self.chain_id.to_le_bytes());
+        buf[12..20].copy_from_slice(&self.total_size.to_le_bytes());
+        buf[20..24].copy_from_slice(&self.created_by_node_id.to_le_bytes());
+        buf[24..28].copy_from_slice(&self.created_at_seconds.to_le_bytes());
+        buf[28..30].copy_from_slice(&(self.blob_type as u16).to_le_bytes());
+        buf[30..32].copy_from_slice(&(self.tree_type as u16).to_le_bytes());
+        buf[32..40].copy_from_slice(&self.realm_id.to_le_bytes());
+        buf[40..48].copy_from_slice(&self.realm_sub_id.to_le_bytes());
+        buf[48..56].copy_from_slice(&self.unique_pending_id.to_le_bytes());
+        buf[56..64].copy_from_slice(&self.checkpoint_id.to_le_bytes());
+        buf[64..72].copy_from_slice(&self.for_target_id.to_le_bytes());
+        buf[72..80].copy_from_slice(&self.item_count.to_le_bytes());
+        buf[80..84].copy_from_slice(&self.item_size.to_le_bytes());
         buf
     }
     pub fn clip_header_get_payload_for_blob_type_and_tree(full_data: Vec<u8>, expected_blob_type: QBlobDataType, expected_tree_type: QBlobMerkleNodeTreeType, exact_size: bool) -> anyhow::Result<(Self, Vec<u8>)> {
@@ -403,28 +403,28 @@ impl QBlobStructHeaderBase for QBlobMerkleTreeNodeBatchHeaderV1 {
         // The `.try_into().unwrap()` calls are safe because the total slice length is verified above,
         // and the hardcoded sub-slice lengths match the target array types.
         let blob_magic = u32::from_le_bytes(data[0..4].try_into().unwrap());
-        let chain_id = u32::from_le_bytes(data[4..8].try_into().unwrap());
-        let total_size = u64::from_le_bytes(data[8..16].try_into().unwrap());
-        let created_by_node_id = u32::from_le_bytes(data[16..20].try_into().unwrap());
-        let created_at_seconds = u32::from_le_bytes(data[20..24].try_into().unwrap());
+        let chain_id = u64::from_le_bytes(data[4..12].try_into().unwrap());
+        let total_size = u64::from_le_bytes(data[12..20].try_into().unwrap());
+        let created_by_node_id = u32::from_le_bytes(data[20..24].try_into().unwrap());
+        let created_at_seconds = u32::from_le_bytes(data[24..28].try_into().unwrap());
 
-        let blob_type_u16 = u16::from_le_bytes(data[24..26].try_into().unwrap());
+        let blob_type_u16 = u16::from_le_bytes(data[28..30].try_into().unwrap());
         let blob_type = QBlobDataType::from_repr(blob_type_u16).with_context(|| {
             format!("Invalid QBlobDataType value: {}", blob_type_u16)
         })?;
 
-        let tree_type_u16 = u16::from_le_bytes(data[26..28].try_into().unwrap());
+        let tree_type_u16 = u16::from_le_bytes(data[30..32].try_into().unwrap());
         let tree_type = QBlobMerkleNodeTreeType::from_repr(tree_type_u16).with_context(|| {
             format!("Invalid QBlobMerkleNodeTreeType value: {}", tree_type_u16)
         })?;
 
-        let realm_id = u64::from_le_bytes(data[28..36].try_into().unwrap());
-        let realm_sub_id = u64::from_le_bytes(data[36..44].try_into().unwrap());
-        let unique_pending_id = u64::from_le_bytes(data[44..52].try_into().unwrap());
-        let checkpoint_id = u64::from_le_bytes(data[52..60].try_into().unwrap());
-        let for_target_id = u64::from_le_bytes(data[60..68].try_into().unwrap());
-        let item_count = u64::from_le_bytes(data[68..76].try_into().unwrap());
-        let item_size = u32::from_le_bytes(data[76..80].try_into().unwrap());
+        let realm_id = u64::from_le_bytes(data[32..40].try_into().unwrap());
+        let realm_sub_id = u64::from_le_bytes(data[40..48].try_into().unwrap());
+        let unique_pending_id = u64::from_le_bytes(data[48..56].try_into().unwrap());
+        let checkpoint_id = u64::from_le_bytes(data[56..64].try_into().unwrap());
+        let for_target_id = u64::from_le_bytes(data[64..72].try_into().unwrap());
+        let item_count = u64::from_le_bytes(data[72..80].try_into().unwrap());
+        let item_size = u32::from_le_bytes(data[80..84].try_into().unwrap());
 
         Ok(Self {
             blob_magic,
@@ -454,5 +454,29 @@ impl QBlobStructHeaderBase for QBlobMerkleTreeNodeBatchHeaderV1 {
         // self.item_count > 0 && // allow empty batches
         self.item_size > 0 &&
         self.total_size as usize == QBLOB_TREE_NODE_BATCH_HEADER_SIZE + (self.item_count as usize * self.item_size as usize)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_magic_header_roundtrip() {
+        let magic = psy_core::constants::chain_id::PSY_CHAIN_ID_LOCAL_DEVNET;
+        let mut header = QBlobMerkleTreeNodeBatchHeaderV1::new_double_id_header(
+            QBlobMerkleNodeTreeType::UserContractStateTree, magic, 7, 8, 9, 10, 11,
+        );
+        header.created_at_seconds = 12;
+        header.checkpoint_id = 13;
+        header.modify_for_final_count_and_size(QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE as u32, 2);
+        let bytes = header.to_bytes_fixed_size_array();
+        assert_eq!(bytes.len(), 84);
+        assert_eq!(&bytes[4..12], &magic.to_le_bytes());
+        let decoded = QBlobMerkleTreeNodeBatchHeaderV1::try_read_header_from_slice(&bytes).unwrap();
+        assert_eq!(decoded.to_bytes_fixed_size_array(), bytes);
+        assert!(decoded.is_valid_for_realm_context(magic, 8, 9, 10));
+        assert!(!decoded.is_valid_for_realm_context(magic ^ (1 << 40), 8, 9, 10));
+        assert!(QBlobMerkleTreeNodeBatchHeaderV1::try_read_header_from_slice(&bytes[..80]).is_err());
     }
 }

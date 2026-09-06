@@ -22,7 +22,7 @@ impl QBlobDoubleMerkleNodeBatchDataView {
     }
     pub fn validate_uct_nodes_batch_header_for_realm_context(
         header: &QBlobMerkleTreeNodeBatchHeaderV1,
-        chain_id: u32,
+        chain_id: u64,
         realm_id: u64,
         realm_sub_id: u64,
         unique_pending_id: u64,
@@ -32,7 +32,7 @@ impl QBlobDoubleMerkleNodeBatchDataView {
     }
     pub fn validate_uct_nodes_batch_header_for_realm_context_get_clipped(
         data: Vec<u8>,
-        chain_id: u32,
+        chain_id: u64,
         realm_id: u64,
         realm_sub_id: u64,
         unique_pending_id: u64,
@@ -54,7 +54,7 @@ impl QBlobDoubleMerkleNodeBatchDataView {
     }
     pub fn validate_cst_nodes_batch_header_for_realm_context_get_clipped_any_unique_pending_id(
         data: Vec<u8>,
-        chain_id: u32,
+        chain_id: u64,
         realm_id: u64,
         realm_sub_id: u64,
     ) -> anyhow::Result<(QBlobMerkleTreeNodeBatchHeaderV1, Vec<u8>)> {
@@ -74,7 +74,7 @@ impl QBlobDoubleMerkleNodeBatchDataView {
     }
     pub fn validate_uct_nodes_batch_header_for_realm_context_get_clipped_ref(
         data: &[u8],
-        chain_id: u32,
+        chain_id: u64,
         realm_id: u64,
         realm_sub_id: u64,
         unique_pending_id: u64,
@@ -96,7 +96,7 @@ impl QBlobDoubleMerkleNodeBatchDataView {
     }
     pub fn validate_cst_nodes_batch_header_for_realm_context_get_clipped_ref_any_unique_pending_id(
         data: &[u8],
-        chain_id: u32,
+        chain_id: u64,
         realm_id: u64,
         realm_sub_id: u64,
     ) -> anyhow::Result<(QBlobMerkleTreeNodeBatchHeaderV1, &[u8])> {
@@ -118,7 +118,7 @@ impl QBlobDoubleMerkleNodeBatchDataView {
     /// The remaining bytes contain the IMT leaf data for IMT-based contract state trees
     pub fn validate_cst_nodes_batch_header_for_realm_context_get_clipped_ref_any_unique_pending_id_with_remaining(
         data: &[u8],
-        chain_id: u32,
+        chain_id: u64,
         realm_id: u64,
         realm_sub_id: u64,
     ) -> anyhow::Result<(QBlobMerkleTreeNodeBatchHeaderV1, &[u8], &[u8])> {
@@ -140,7 +140,7 @@ impl QBlobDoubleMerkleNodeBatchDataView {
     pub fn generate_double_merkle_node_batch_blob_data_from_ref_default_context<Hash: Q256BitHash>(
         nodes: &[QMerkleStoreDoubleIdNode<Hash>],
     ) -> Vec<u8> {
-        let context = QBlobWriterContextMetadataHeader::new_at_now(0, 0, 0, 0, 0, 0, 0);
+        let context = QBlobWriterContextMetadataHeader::new_at_now(psy_core::constants::chain_id::PSY_CHAIN_ID_LOCAL_DEVNET, 0, 0, 0, 0, 0, 0);
         Self::generate_double_merkle_node_batch_blob_data_from_ref(context, nodes)
     }
     pub fn generate_double_merkle_node_batch_blob_data_from_ref<Hash: Q256BitHash>(
@@ -773,7 +773,7 @@ mod tests {
         fuzz_merkle_hash_recorder_with_sibling_values_helper::<PHash, PoseidonHasher>(16, 142, None).unwrap();
 
 
-        let context = QBlobWriterContextMetadataHeader::new_at_now(1337, 124, 99, 10, 18247124124, 100101201, 114881);
+        let context = QBlobWriterContextMetadataHeader::new_at_now(psy_core::constants::chain_id::PSY_CHAIN_ID_LOCAL_DEVNET, 124, 99, 10, 18247124124, 100101201, 114881);
 
         for i in 0..16 {
             fuzz_merkle_hash_recorder_with_sibling_values_helper::<Hash256, CoreSha256Hasher>(3, i, Some(context)).unwrap();
@@ -843,7 +843,7 @@ mod tests {
         fuzz_merkle_hash_recorder_with_sibling_values_helper_proof::<PHash, PoseidonHasher>(16, 142, None).unwrap();
 
 
-        let context = QBlobWriterContextMetadataHeader::new_at_now(1337, 124, 99, 10, 18247124124, 100101201, 114881);
+        let context = QBlobWriterContextMetadataHeader::new_at_now(psy_core::constants::chain_id::PSY_CHAIN_ID_LOCAL_DEVNET, 124, 99, 10, 18247124124, 100101201, 114881);
 
         for i in 0..16 {
             fuzz_merkle_hash_recorder_with_sibling_values_helper_proof::<Hash256, CoreSha256Hasher>(3, i, Some(context)).unwrap();
@@ -882,7 +882,7 @@ mod tests {
         type Hash = Hash256;
         let count = 10_000;
         println!("Generating {} random double ID nodes...", count);
-        let context = QBlobWriterContextMetadataHeader::new_at_now(1, 42, 1001, 1, 2, 3, 4);
+        let context = QBlobWriterContextMetadataHeader::new_at_now(psy_core::constants::chain_id::PSY_CHAIN_ID_LOCAL_DEVNET, 42, 1001, 1, 2, 3, 4);
         let nodes: Vec<QMerkleStoreDoubleIdNode<Hash>> = (0..count).map(|_| QPGenRandom::qp_rand_gen()).collect();
         let start_time = std::time::Instant::now();
         let serialized_blob = QBlobDoubleMerkleNodeBatchDataView::generate_double_merkle_node_batch_blob_data_from_ref(context, &nodes);
@@ -916,7 +916,7 @@ mod tests {
         type Hash = Hash256;
         let number_of_batches = 20_000;
         let nodes_per_batch = 200;
-        let context = QBlobWriterContextMetadataHeader::new_at_now(1, 42, 1001, 1, 2, 3, 4);
+        let context = QBlobWriterContextMetadataHeader::new_at_now(psy_core::constants::chain_id::PSY_CHAIN_ID_LOCAL_DEVNET, 42, 1001, 1, 2, 3, 4);
 
         let batch_nodes: Vec<Vec<QMerkleStoreDoubleIdNode<Hash>>> = (0..number_of_batches)
             .map(|_| (0..nodes_per_batch).map(|_| QPGenRandom::qp_rand_gen()).collect())

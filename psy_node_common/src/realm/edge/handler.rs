@@ -137,7 +137,7 @@ pub struct RealmEdgeHandler<
     pub realm_identifier: QRealmIdentifier,
     pub realm_id_u64: u64,
     pub realm_sub_id_u64: u64,
-    pub chain_id: u32,
+    pub chain_id: u64,
     pub node_id: u32,
 
     pub proof_verifier: Arc<N::ZKVerifier>,
@@ -200,7 +200,7 @@ impl<
         get_proof_work_queue: Arc<GetProofWorkQueue>,
         realm_identifier: QRealmIdentifier,
         worker_whitelist: WhiteListCache,
-        chain_id: u32,
+        chain_id: u64,
         node_id: u32,
         proof_verifier: Arc<N::ZKVerifier>,
     ) -> Self {
@@ -457,7 +457,7 @@ fn validate_forwarded_end_cap(
     header: &EndCapForwardHeader,
     input: &[u8],
     proof: &[u8],
-    local_chain_id: u32,
+    local_chain_id: u64,
     local_realm_id: u32,
     realm_edge_node_ids: &HashSet<NodeId>,
 ) -> anyhow::Result<[u8; 32]> {
@@ -1602,7 +1602,10 @@ mod tests {
     use libp2p_identity::Keypair;
     use parth_core::PHash;
 
-    const TEST_CHAIN_ID: u32 = 7;
+    /// The localhost network magic, sourced from the network config via the
+    /// psy_core build-time constants. A full u64 that does not fit in u32, so
+    /// any u32 truncation would break these tests.
+    const TEST_CHAIN_ID: u64 = psy_core::constants::chain_id::PSY_CHAIN_ID_LOCAL_DEVNET;
     const TEST_REALM_ID: u32 = 3;
 
     #[tokio::test]
@@ -1714,7 +1717,7 @@ mod tests {
     }
 
     fn end_cap_header(
-        chain_id: u32,
+        chain_id: u64,
         realm_id: u32,
         checkpoint_id: u64,
         input: &[u8],
@@ -1752,6 +1755,40 @@ mod tests {
         )
         .expect("validator source with matching header is accepted");
         assert_eq!(validated, header.end_cap_id);
+    }
+
+    #[test]
+    fn compute_end_cap_id_round_trips_u64_chain_magic() {
+        let (validators, realm_edge_node_ids) = build_edge_identities(&[1, 2, 3]);
+        let (input, proof) = sample_input_and_proof();
+        assert!(
+            TEST_CHAIN_ID > u32::MAX as u64,
+            "test magic must exercise the full u64 range"
+        );
+        // Round-trip: an EndCap id computed from the full u64 magic validates
+        // against the same magic.
+        let header = end_cap_header(TEST_CHAIN_ID, TEST_REALM_ID, 25, &input, &proof);
+        let validated = validate_forwarded_end_cap(
+            validators[&1],
+            &header,
+            &input,
+            &proof,
+            TEST_CHAIN_ID,
+            TEST_REALM_ID,
+            &realm_edge_node_ids,
+        )
+        .expect("u64 chain magic round-trips through compute_end_cap_id");
+        assert_eq!(validated, header.end_cap_id);
+        // The id must depend on the full u64: the magic truncated to u32
+        // yields a different canonical hash.
+        let truncated = compute_end_cap_id(
+            TEST_CHAIN_ID as u32 as u64,
+            TEST_REALM_ID,
+            25,
+            &sha256(&input),
+            &sha256(&proof),
+        );
+        assert_ne!(header.end_cap_id, truncated);
     }
 
     #[test]

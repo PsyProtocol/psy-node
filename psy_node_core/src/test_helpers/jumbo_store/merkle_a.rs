@@ -1,7 +1,7 @@
 
 use std::collections::HashSet;
+use psy_core::constants::chain_id::PSY_CHAIN_ID_LOCAL_DEVNET;
 use parth_core::{
-    constants::chain_id::PSY_CHAIN_ID_LOCAL_DEVNET,
     crypto::hash::merkle_proof::DeltaMerkleProofCore,
     data::{
         db::{

@@ -321,7 +321,7 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
     pub fn setup_validators<Hasher: FieldQHasher<F, Hash> + MerkleZeroHasher<Hash>>(
         &mut self,
         genesis_block: &PsyGenesisBlockSetupData<F, Hash>,
-        chain_id: u32,
+        chain_id: u64,
         realm_user_tree_height: u8,
     ) -> anyhow::Result<()>
     where
@@ -434,7 +434,7 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
 
     pub fn setup_for_realm<Hasher: FieldQHasher<F, Hash> + MerkleZeroHasher<Hash>, N: QNetworkConstants>(
         genesis_block: &PsyGenesisBlockSetupData<F, Hash>,
-        chain_id: u32,
+        chain_id: u64,
         realm_id: u64,
         realm_sub_id: u64,
     ) -> anyhow::Result<
@@ -505,7 +505,7 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
 
     pub fn setup_for_coordinator<Hasher: FieldQHasher<F, Hash> + MerkleZeroHasher<Hash>, N: QNetworkConstants>(
         genesis_block: &PsyGenesisBlockSetupData<F, Hash>,
-        chain_id: u32,
+        chain_id: u64,
         checkpoint_state_transition_circuit_fingerprint: Hash,
     ) -> anyhow::Result<(
         PsyVerifiableCheckpointTransition<F, Hash>,

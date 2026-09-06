@@ -352,7 +352,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
     /*
     
     
-    chain_id: u32,
+    chain_id: u64,
     genesis_data: &PsyGenesisBlockSetupData<N::F, N::QHash>,
     file_system: Arc<FileSystem>,
     guta_gatherer_backup_directory: String,

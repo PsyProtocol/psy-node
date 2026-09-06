@@ -90,7 +90,7 @@ pub struct RealmFinalizeGUTAIdentity<F, Hash> {
 pub struct RealmGUTAPlanner<F, Hash> {
     pub realm_id_u64: u64,
     pub realm_sub_id_u64: u64,
-    pub chain_id: u32,
+    pub chain_id: u64,
     pub unique_pending_id: u64,
     pub realm_identifier: QRealmIdentifier,
     pub job_level_map: HashMap<QProvingJobDataID, (usize, usize)>,
@@ -137,7 +137,7 @@ pub struct RealmGUTAPlanner<F, Hash> {
 
 impl<F, Hash> RealmGUTAPlanner<F, Hash> {
     pub fn new(
-        chain_id: u32,
+        chain_id: u64,
         realm_identifier: QRealmIdentifier,
         current_checkpoint_root: Hash,
         current_checkpoint_id: u64,
@@ -217,7 +217,7 @@ impl<F, Hash> RealmGUTAPlanner<F, Hash> {
 
 impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
     pub async fn populate_future_end_cap_job<TempStore: StandardProcessorTempDBStoreBase<QProvingJobDataID, Hash>>(
-        _chain_id: u32,
+        _chain_id: u64,
         realm_identifier: &QRealmIdentifier,
         unique_pending_id: u64,
         temp_store: Arc<TempStore>,

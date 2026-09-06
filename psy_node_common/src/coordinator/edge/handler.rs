@@ -72,7 +72,7 @@ pub struct CoordinatorEdgeHandler<
     pub contract_state_tree_height_cache: Arc<DashMapContractHeightCache<N::QHash>>,
 
     pub checkpoint_state_transition_circuit_fingerprint: N::QHash,
-    pub chain_id: u32,
+    pub chain_id: u64,
     pub validators: Option<(crate::coordinator::genesis_validators::GenesisValidatorIndex, u64)>,
 }
 impl<
@@ -154,7 +154,7 @@ impl<
         get_proof_work_queue: Arc<GetProofWorkQueue>,
         realm_identifier: QRealmIdentifier,
         worker_whitelist: WhiteListCache,
-        chain_id: u32,
+        chain_id: u64,
         proof_verifier: Arc<N::ZKVerifier>,
         checkpoint_state_transition_circuit_fingerprint: N::QHash,
     ) -> Self {

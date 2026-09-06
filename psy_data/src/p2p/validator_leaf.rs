@@ -46,10 +46,10 @@ impl ValidatorLeaf {
 
     /// `protocol_encode(DOMAIN_VALIDATOR_LEAF, chain_id, realm_id, realm_sub_id,
     ///                  validator_user_id, node_id, bls_public_key)`.
-    pub fn construction_bytes(&self, chain_id: u32, realm_id: u32, realm_sub_id: u16) -> Vec<u8> {
+    pub fn construction_bytes(&self, chain_id: u64, realm_id: u32, realm_sub_id: u16) -> Vec<u8> {
         let mut out = Vec::new();
         write_fixed(&mut out, &DOMAIN_VALIDATOR_LEAF);
-        write_u32(&mut out, chain_id);
+        write_u64(&mut out, chain_id);
         write_u32(&mut out, realm_id);
         write_u16(&mut out, realm_sub_id);
         write_u64(&mut out, self.validator_user_id);
@@ -145,7 +145,13 @@ mod tests {
     #[test]
     fn construction_bytes_domain_prefix() {
         let leaf = sample_leaf();
-        assert_eq!(&leaf.construction_bytes(1, 2, 3)[..8], b"PSYVLF01");
+        let magic = psy_core::constants::chain_id::PSY_CHAIN_ID_LOCAL_DEVNET;
+        let bytes = leaf.construction_bytes(magic, 2, 3);
+        assert_eq!(&bytes[..8], b"PSYVLF01");
+        assert_eq!(&bytes[8..16], &magic.to_le_bytes());
+        assert_eq!(&bytes[16..20], &2u32.to_le_bytes());
+        assert_eq!(&bytes[20..22], &3u16.to_le_bytes());
+        assert_eq!(&bytes[22..], leaf.protocol_encode_to_vec());
     }
 
     #[test]

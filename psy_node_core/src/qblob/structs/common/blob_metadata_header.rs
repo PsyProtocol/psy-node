@@ -1,7 +1,7 @@
 #[pderive::serialize_copy]
 pub struct QBlobWriterContextMetadataHeader {
     // the chain ID this batch is for
-    pub chain_id: u32, 
+    pub chain_id: u64,
     
     // a unique ID for the node that created this batch 
     pub created_by_node_id: u32, 
@@ -35,7 +35,7 @@ pub struct QBlobWriterContextMetadataHeader {
 
 
 impl QBlobWriterContextMetadataHeader {
-    pub fn new(chain_id: u32, created_by_node_id: u32, created_at_seconds: u32, realm_id: u64, realm_sub_id: u64, unique_pending_id: u64, checkpoint_id: u64, for_target_id: u64) -> Self {
+    pub fn new(chain_id: u64, created_by_node_id: u32, created_at_seconds: u32, realm_id: u64, realm_sub_id: u64, unique_pending_id: u64, checkpoint_id: u64, for_target_id: u64) -> Self {
         Self {
             chain_id,
             created_by_node_id,
@@ -47,7 +47,7 @@ impl QBlobWriterContextMetadataHeader {
             for_target_id,
         }
     }
-    pub fn new_at_now(chain_id: u32, created_by_node_id: u32, realm_id: u64, realm_sub_id: u64, unique_pending_id: u64, checkpoint_id: u64, for_target_id: u64) -> Self {
+    pub fn new_at_now(chain_id: u64, created_by_node_id: u32, realm_id: u64, realm_sub_id: u64, unique_pending_id: u64, checkpoint_id: u64, for_target_id: u64) -> Self {
         Self {
             chain_id,
             created_by_node_id,

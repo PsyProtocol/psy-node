@@ -170,7 +170,7 @@ pub struct TestMerkleNodes<Hash> {
     pub double_id_nodes: Vec<QMerkleStoreDoubleIdNode<Hash>>,
 }
 fn deserialize_data_from_edge(
-    chain_id: u32,
+    chain_id: u64,
     realm_id: u64,
     realm_sub_id: u64,
     unique_pending_id: u64,
@@ -202,7 +202,7 @@ fn deserialize_data_from_edge(
 
 
 fn deserialize_data_from_edge_and_nodes<Hash: Q256BitHash>(
-    chain_id: u32,
+    chain_id: u64,
     realm_id: u64,
     realm_sub_id: u64,
     unique_pending_id: u64,

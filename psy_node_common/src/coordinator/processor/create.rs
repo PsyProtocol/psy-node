@@ -31,7 +31,7 @@ pub async fn create_coordinator_processor<
     ProofStore: QParthProofStore + Send + Sync + 'static,
     FileSystem: TokioLikeFileSystem + Send + Sync + 'static,
 >(
-    chain_id: u32,
+    chain_id: u64,
     genesis_data: &PsyGenesisBlockSetupData<N::F, N::QHash>,
     file_system: Arc<FileSystem>,
     deploy_contract_gatherer_backup_directory: String,
@@ -189,7 +189,7 @@ pub async fn create_coordinator_processor_and_run<
     ProofStore: QParthProofStore + Send + Sync + 'static,
     FileSystem: TokioLikeFileSystem + Send + Sync + 'static,
 >(
-    chain_id: u32,
+    chain_id: u64,
     genesis_data: &PsyGenesisBlockSetupData<N::F, N::QHash>,
     circuit_fingerprint_config: PsyNodeCircuitFingerprintConfig<N::QHash>,
     file_system: Arc<FileSystem>,

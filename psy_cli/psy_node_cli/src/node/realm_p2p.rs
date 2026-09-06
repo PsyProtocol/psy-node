@@ -348,7 +348,7 @@ pub fn genesis_validator_index_from_network_config(
 /// Construct a processor Realm network from local keys/listen and public membership.
 pub fn maybe_build_processor_network(
     config: &RealmProcessorStartConfig,
-    chain_id: u32,
+    chain_id: u64,
 ) -> anyhow::Result<OptionalRealmNetwork> {
     let identity = config
         .p2p_identity_key_path
@@ -377,7 +377,7 @@ pub fn maybe_build_processor_network(
 /// Construct an edge Realm network from local identity/listen and public membership.
 pub fn maybe_build_edge_network(
     config: &RealmEdgeStartConfig,
-    chain_id: u32,
+    chain_id: u64,
 ) -> anyhow::Result<(OptionalRealmNetwork, HashMap<u16, NodeId>, HashSet<NodeId>, RealmRotationConfig)> {
     let identity = config
         .p2p_identity_key_path

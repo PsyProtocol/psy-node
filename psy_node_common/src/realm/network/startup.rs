@@ -47,7 +47,7 @@ pub fn parse_bootnode(value: &str) -> Result<(PeerId, Multiaddr), NetworkError> 
 /// Rotation is fail-closed: empty validators or zero period is a
 /// configuration error, not a silent disable.
 pub fn build_optional_realm_network(
-    chain_id: u32,
+    chain_id: u64,
     realm_id: u32,
     is_edge: bool,
     identity_key_path: &str,

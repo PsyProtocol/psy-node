@@ -10,7 +10,7 @@ use parth_core::{
 
 #[pderive::serialize_copy_hash]
 pub struct RealmProcessorCoreState<Hash> {
-    pub chain_id: u32,
+    pub chain_id: u64,
     pub realm_identifier: QRealmIdentifier,
     pub realm_id_u64: u64,
     pub realm_sub_id_u64: u64,
@@ -72,7 +72,7 @@ impl<Hash: Copy> RealmProcessorCoreState<Hash> {
         self.should_revert_processing_changes = source.should_revert_processing_changes;
     }
     pub fn new_basic(
-        chain_id: u32,
+        chain_id: u64,
         realm_identifier: QRealmIdentifier,
         last_committed_checkpoint_id: u64,
         last_committed_unique_pending_id: u64,

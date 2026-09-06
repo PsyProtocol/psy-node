@@ -250,7 +250,7 @@ where
         guta_update_queue: Arc<GUTAUpdateQueue>,
         proof_work_queue: Arc<ProofWorkQueue>,
         coordinator_client: Arc<CoordinatorClient>,
-        chain_id: u32,
+        chain_id: u64,
         realm_identifier: QRealmIdentifier,
         circuit_fingerprint_config: PsyNodeCircuitFingerprintConfig<N::QHash>,
         file_system: Arc<FileSystem>,

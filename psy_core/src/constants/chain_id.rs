@@ -1,41 +1,7 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-pub const PSY_CHAIN_ID_LOCAL_DEVNET: u32 = 0;
-pub const PSY_CHAIN_ID_PSY_TEAM_DEVNET: u32 = 1;
-pub const PSY_CHAIN_ID_INTERNAL_DEVNET: u32 = 2;
-pub const PSY_CHAIN_ID_INTERNAL_TESTNET: u32 = 3;
-pub const PSY_CHAIN_ID_INTERNAL_PRE_PRODUCTION: u32 = 4;
-pub const PSY_CHAIN_ID_PSY_PUBLIC_CANARY: u32 = 0xCFCFCFCF; // CF for Carter Feldman
-pub const PSY_CHAIN_ID_PSY_PUBLIC_TESTNET: u32 = 1337;
-pub const PSY_CHAIN_ID_PSY_MAINNET: u32 = 0x69797350; // [0x50, 0x73, 0x79, 0x69] -> 0x69797350 in little-endian -> "Psyi"
-
-/*
-
-
-    let derive_serde: Attribute = syn::parse_quote!(
-        #[derive(
-            Debug,
-            Copy,
-            Clone,
-            PartialEq,
-            Eq,
-            Hash,
-            PartialOrd,
-            Ord,
-            serde_repr::Serialize_repr,
-            serde_repr::Deserialize_repr,
-            strum_macros::FromRepr, 
-            strum_macros::Display,
-        )]
-    );
-    let derive_rkyv: Attribute = syn::parse_quote!(
-        #[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
-    );
-    let derive_speedy: Attribute = syn::parse_quote!(
-        #[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
-    );
-*/
+include!(concat!(env!("OUT_DIR"), "/chain_id.rs"));
 
 #[derive(TS)]
 #[ts(export)]
@@ -56,29 +22,20 @@ impl PsyChainNetworkType {
     pub fn to_u8(&self) -> u8 {
         *self as u8
     }
-    pub fn get_chain_id(&self) -> u32 {
+    pub fn get_chain_id(&self) -> u64 {
         match self {
             PsyChainNetworkType::LocalDevnet => PSY_CHAIN_ID_LOCAL_DEVNET,
-            PsyChainNetworkType::PsyTeamDevnet => PSY_CHAIN_ID_PSY_TEAM_DEVNET,
-            PsyChainNetworkType::InternalDevnet => PSY_CHAIN_ID_INTERNAL_DEVNET,
-            PsyChainNetworkType::InternalTestnet => PSY_CHAIN_ID_INTERNAL_TESTNET,
-            PsyChainNetworkType::InternalPreProduction => PSY_CHAIN_ID_INTERNAL_PRE_PRODUCTION,
-            PsyChainNetworkType::PsyPublicCanary => PSY_CHAIN_ID_PSY_PUBLIC_CANARY,
             PsyChainNetworkType::PsyPublicTestnet => PSY_CHAIN_ID_PSY_PUBLIC_TESTNET,
             PsyChainNetworkType::PsyMainnet => PSY_CHAIN_ID_PSY_MAINNET,
+            _ => panic!("Unsupported network selector: {:?}", self),
         }
     }
-    pub fn try_from_chain_id(chain_id: u32) -> anyhow::Result<Self> {
+    pub fn try_from_chain_id(chain_id: u64) -> anyhow::Result<Self> {
         match chain_id {
             PSY_CHAIN_ID_LOCAL_DEVNET => Ok(PsyChainNetworkType::LocalDevnet),
-            PSY_CHAIN_ID_PSY_TEAM_DEVNET => Ok(PsyChainNetworkType::PsyTeamDevnet),
-            PSY_CHAIN_ID_INTERNAL_DEVNET => Ok(PsyChainNetworkType::InternalDevnet),
-            PSY_CHAIN_ID_INTERNAL_TESTNET => Ok(PsyChainNetworkType::InternalTestnet),
-            PSY_CHAIN_ID_INTERNAL_PRE_PRODUCTION => Ok(PsyChainNetworkType::InternalPreProduction),
-            PSY_CHAIN_ID_PSY_PUBLIC_CANARY => Ok(PsyChainNetworkType::PsyPublicCanary),
             PSY_CHAIN_ID_PSY_PUBLIC_TESTNET => Ok(PsyChainNetworkType::PsyPublicTestnet),
             PSY_CHAIN_ID_PSY_MAINNET => Ok(PsyChainNetworkType::PsyMainnet),
-            _ => anyhow::bail!("Invalid chain ID: {}", chain_id),
+            _ => anyhow::bail!("Invalid network magic: {}", chain_id),
         }
     }
 }
@@ -191,65 +148,21 @@ impl From<PsyChainNetworkType> for PsyNetworkTypeInput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn ensure_chain_id_equals_constant_roundtrip(chain_type: PsyChainNetworkType, expected_chain_id: u32) {
-        let chain_id = chain_type.get_chain_id();
-        let chain_type_u8 = chain_type.to_u8();
-        let converted_chain_type = PsyChainNetworkType::try_from(chain_type_u8).unwrap();
-        assert_eq!(chain_type, converted_chain_type);
-        assert_eq!(chain_id, expected_chain_id);
-        assert_eq!(
-            PsyChainNetworkType::try_from_chain_id(chain_id).unwrap(),
-            chain_type
-        );
-    }
+
     #[test]
-    fn test_chain_id_conversion() {
-        let chain_types = vec![
-            PsyChainNetworkType::LocalDevnet,
-            PsyChainNetworkType::PsyTeamDevnet,
-            PsyChainNetworkType::InternalDevnet,
-            PsyChainNetworkType::InternalTestnet,
-            PsyChainNetworkType::InternalPreProduction,
-            PsyChainNetworkType::PsyPublicCanary,
-            PsyChainNetworkType::PsyPublicTestnet,
-            PsyChainNetworkType::PsyMainnet,
-        ];
-        for chain_type in chain_types {
-            let chain_id = chain_type.get_chain_id();
-            let converted_chain_type = PsyChainNetworkType::try_from_chain_id(chain_id).unwrap();
-            assert_eq!(chain_type, converted_chain_type);
+    fn configured_network_identities_roundtrip() {
+        for network in [PsyChainNetworkType::LocalDevnet, PsyChainNetworkType::PsyPublicTestnet, PsyChainNetworkType::PsyMainnet] {
+            assert_eq!(PsyChainNetworkType::try_from_chain_id(network.get_chain_id()).unwrap(), network);
+            assert_eq!(PsyChainNetworkType::try_from(network.to_u8()).unwrap(), network);
         }
-        ensure_chain_id_equals_constant_roundtrip(
-            PsyChainNetworkType::LocalDevnet,
-            PSY_CHAIN_ID_LOCAL_DEVNET,
-        );
-        ensure_chain_id_equals_constant_roundtrip(
-            PsyChainNetworkType::PsyTeamDevnet,
-            PSY_CHAIN_ID_PSY_TEAM_DEVNET,
-        );
-        ensure_chain_id_equals_constant_roundtrip(
-            PsyChainNetworkType::InternalDevnet,
-            PSY_CHAIN_ID_INTERNAL_DEVNET,
-        );
-        ensure_chain_id_equals_constant_roundtrip(
-            PsyChainNetworkType::InternalTestnet,
-            PSY_CHAIN_ID_INTERNAL_TESTNET,
-        );
-        ensure_chain_id_equals_constant_roundtrip(
-            PsyChainNetworkType::InternalPreProduction,
-            PSY_CHAIN_ID_INTERNAL_PRE_PRODUCTION,
-        );
-        ensure_chain_id_equals_constant_roundtrip(
-            PsyChainNetworkType::PsyPublicCanary,
-            PSY_CHAIN_ID_PSY_PUBLIC_CANARY,
-        );
-        ensure_chain_id_equals_constant_roundtrip(
-            PsyChainNetworkType::PsyPublicTestnet,
-            PSY_CHAIN_ID_PSY_PUBLIC_TESTNET,
-        );
-        ensure_chain_id_equals_constant_roundtrip(
-            PsyChainNetworkType::PsyMainnet,
-            PSY_CHAIN_ID_PSY_MAINNET,
-        );
+        assert_eq!(PSY_CHAIN_ID_LOCAL_DEVNET, 1384803358401154921);
+        assert!(PsyChainNetworkType::try_from_chain_id(0).is_err());
+    }
+
+    #[test]
+    fn unsupported_networks_fail_closed() {
+        for network in [PsyChainNetworkType::PsyTeamDevnet, PsyChainNetworkType::InternalDevnet, PsyChainNetworkType::InternalTestnet, PsyChainNetworkType::InternalPreProduction, PsyChainNetworkType::PsyPublicCanary] {
+            assert!(std::panic::catch_unwind(|| network.get_chain_id()).is_err());
+        }
     }
 }

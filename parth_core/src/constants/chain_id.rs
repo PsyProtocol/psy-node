@@ -1,8 +1,0 @@
-pub const PSY_CHAIN_ID_LOCAL_DEVNET: u32 = 0;
-pub const PSY_CHAIN_ID_PSY_TEAM_DEVNET: u32 = 1;
-pub const PSY_CHAIN_ID_INTERNAL_DEVNET: u32 = 2;
-pub const PSY_CHAIN_ID_INTERNAL_TESTNET: u32 = 3;
-pub const PSY_CHAIN_ID_INTERNAL_PRE_PRODUCTION: u32 = 4;
-pub const PSY_CHAIN_ID_PSY_PUBLIC_CANARY: u32 = 0xCFCFCFCF; // CF for Carter Feldman
-pub const PSY_CHAIN_ID_PSY_PUBLIC_TESTNET: u32 = 1337;
-pub const PSY_CHAIN_ID_PSY_MAINNET: u32 = 0x69797350; // [0x50, 0x73, 0x79, 0x69] -> 0x69797350 in little-endian -> "Psyi"
