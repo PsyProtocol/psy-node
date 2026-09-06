@@ -308,12 +308,20 @@ else
 fi
 
 if multichain_enabled; then
-  while IFS= read -r private_rpc_url; do
-    if grep -RFl -- "$private_rpc_url" "$FRONTEND_DIR/dist" >/dev/null; then
-      echo "refusing frontend publish: a private L1 RPC URL was embedded in dist" >&2
+  public_rpc_allowlist="$FRONTEND_DIR/src/services/chainConfig.ts"
+  while IFS=$'\t' read -r network runtime_rpc_url; do
+    # A runtime upstream can itself be one of the source-reviewed, credentialless
+    # public fallbacks. Those URLs are intentionally bundled; every other
+    # runtime upstream (Alchemy keys, internal relays, and unknown endpoints)
+    # must remain server-side only.
+    if grep -Fq -- "$runtime_rpc_url" "$public_rpc_allowlist"; then
+      continue
+    fi
+    if grep -RFl -- "$runtime_rpc_url" "$FRONTEND_DIR/dist" >/dev/null; then
+      echo "refusing frontend publish: ${network} runtime L1 RPC URL was embedded in dist" >&2
       exit 1
     fi
-  done < <(multichain_runtime_json | jq -r '.chains[].rpc_url')
+  done < <(multichain_runtime_json | jq -r '.chains[] | [.network, .rpc_url] | @tsv')
 
   while IFS=$'\t' read -r network bridge_address public_rpc_domain; do
     if ! grep -RFiq -- "$bridge_address" "$FRONTEND_DIR/dist"; then
