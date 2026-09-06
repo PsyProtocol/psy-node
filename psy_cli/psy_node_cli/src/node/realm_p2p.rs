@@ -9,6 +9,7 @@ use parth_core::{
     crypto::hash::traits::QFieldHashable,
     protocol::core_types::{QNetworkTypesConfig, QZKProofVerifier},
 };
+use psy_config::CHECKPOINTS_PER_EPOCH;
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_core::constants::chain_id::PsyChainNetworkType;
 use psy_data::{
@@ -60,14 +61,8 @@ struct PublicRealmConfig {
 }
 
 #[derive(Deserialize)]
-struct PublicP2pConfig {
-    checkpoints_per_epoch: u64,
-}
-
-#[derive(Deserialize)]
 struct PublicNetworkConfig {
     realm_user_tree_height: u8,
-    p2p: PublicP2pConfig,
     realm_configs: Vec<PublicRealmConfig>,
 }
 
@@ -85,7 +80,6 @@ struct RealmPublicData {
     realm_edge_node_ids: HashSet<NodeId>,
     bootnodes: Vec<String>,
     realm_user_tree_height: u8,
-    checkpoints_per_epoch: u64,
 }
 
 fn public_network_key(network: PsyChainNetworkType) -> anyhow::Result<&'static str> {
@@ -229,10 +223,6 @@ fn realm_public_data(
     realm_id: u32,
 ) -> anyhow::Result<RealmPublicData> {
     let network = load_selected_network(network_type)?;
-    anyhow::ensure!(
-        network.p2p.checkpoints_per_epoch > 0,
-        "p2p.checkpoints_per_epoch must be greater than zero"
-    );
     let realm = selected_realm(&network, realm_id)?;
 
     let mut validator_sub_ids = Vec::with_capacity(realm.validators.len());
@@ -287,7 +277,6 @@ fn realm_public_data(
         realm_edge_node_ids,
         realm_user_tree_height: network.realm_user_tree_height,
         bootnodes,
-        checkpoints_per_epoch: network.p2p.checkpoints_per_epoch,
     })
 }
 fn bootnodes_without_local_peer(
@@ -311,10 +300,6 @@ pub fn genesis_validator_index_from_network_config(
     network_type: PsyChainNetworkType,
 ) -> anyhow::Result<(GenesisValidatorIndex, u64)> {
     let network = load_selected_network(network_type)?;
-    anyhow::ensure!(
-        network.p2p.checkpoints_per_epoch > 0,
-        "p2p.checkpoints_per_epoch must be greater than zero"
-    );
     let mut index = GenesisValidatorIndex::new();
     let mut user_ids = HashSet::new();
     let mut node_ids = HashSet::new();
@@ -357,7 +342,7 @@ pub fn genesis_validator_index_from_network_config(
             );
         }
     }
-    Ok((index, network.p2p.checkpoints_per_epoch))
+    Ok((index, CHECKPOINTS_PER_EPOCH))
 }
 
 /// Construct a processor Realm network from local keys/listen and public membership.
@@ -385,7 +370,7 @@ pub fn maybe_build_processor_network(
         listen,
         &bootnodes,
         &public.validator_sub_ids,
-        public.checkpoints_per_epoch,
+        CHECKPOINTS_PER_EPOCH,
     )?)
 }
 
@@ -414,7 +399,7 @@ pub fn maybe_build_edge_network(
         listen,
         &bootnodes,
         &public.validator_sub_ids,
-        public.checkpoints_per_epoch,
+        CHECKPOINTS_PER_EPOCH,
     )?;
     let rotation = built.rotation.clone();
     Ok((built, public.proposer_edge_node_ids, public.realm_edge_node_ids, rotation))
@@ -1015,7 +1000,6 @@ mod tests {
         let edge = node_id(8);
         let network = PublicNetworkConfig {
             realm_user_tree_height: 20,
-            p2p: PublicP2pConfig { checkpoints_per_epoch: 10 },
             realm_configs: vec![
                 PublicRealmConfig {
                     id: 0,
@@ -1042,7 +1026,6 @@ mod tests {
     fn selected_inactive_realm_is_rejected() {
         let network = PublicNetworkConfig {
             realm_user_tree_height: 20,
-            p2p: PublicP2pConfig { checkpoints_per_epoch: 10 },
             realm_configs: vec![PublicRealmConfig { id: 1, validators: Vec::new() }],
         };
 
@@ -1055,7 +1038,6 @@ mod tests {
         let processor = node_id(7);
         let network = PublicNetworkConfig {
             realm_user_tree_height: 20,
-            p2p: PublicP2pConfig { checkpoints_per_epoch: 10 },
             realm_configs: vec![PublicRealmConfig {
                 id: 0,
                 validators: vec![PublicValidator {

@@ -802,6 +802,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn checkpoints_per_epoch_matches_genesis_network() {
+        let genesis: serde_json::Value = serde_json::from_str(include_str!("../../../../psy-genesis/config.json")).unwrap();
+        assert_eq!(
+            Some(CHECKPOINTS_PER_EPOCH),
+            genesis["networks"][CURRENT_NETWORK]["p2p"]["checkpoints_per_epoch"].as_u64(),
+        );
+        let constants: serde_json::Value = serde_json::from_str(include_str!(concat!(env!("OUT_DIR"), "/constants.json"))).unwrap();
+        assert_eq!(constants["CHECKPOINTS_PER_EPOCH"].as_u64(), Some(CHECKPOINTS_PER_EPOCH));
+        assert!(CHECKPOINTS_PER_EPOCH > 0);
+    }
+
+    #[test]
     fn test_config_loading() {
         let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config.json");
         let config = PsyConfigGoldilocks::from_file(config_path.to_str().unwrap()).unwrap();

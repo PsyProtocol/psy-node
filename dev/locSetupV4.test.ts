@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import path from "node:path";
+import allConfig from "../psy-genesis/config.json";
 import {
     COORDINATOR_PROCESSOR_READY_MARKER,
     REALM_PROCESSOR_READY_MARKER,
@@ -595,7 +596,7 @@ describe("realm P2P launch planning", () => {
         networks: {
             localhost: {
                 realm_user_tree_height: 20,
-                p2p: { checkpoints_per_epoch: 10 },
+                p2p: { checkpoints_per_epoch: allConfig.networks.localhost.p2p.checkpoints_per_epoch },
                 realm_configs: [{
                     id: 0,
                     rpc_url: [],
@@ -612,6 +613,12 @@ describe("realm P2P launch planning", () => {
         expect(planRealmP2pConfig(config(2), [0], 2, "192.0.2.8", realm0ValidatorIds).reuse).toBe(true);
         expect(planRealmP2pConfig(config(1), [0], 2, "192.0.2.8", realm0ValidatorIds).reuse).toBe(false);
         expect(planRealmP2pConfig(config(2), [0], 2, "192.0.2.9", realm0ValidatorIds).reuse).toBe(false);
+    });
+
+    it("regenerates when the cached checkpoint period differs from genesis", () => {
+        const stale = config(2);
+        stale.networks.localhost.p2p.checkpoints_per_epoch += 1;
+        expect(planRealmP2pConfig(stale, [0], 2, "192.0.2.8", realm0ValidatorIds).reuse).toBe(false);
     });
 
     it("regenerates when an unselected Realm still has validators", () => {

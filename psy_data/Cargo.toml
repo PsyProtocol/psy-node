@@ -50,6 +50,7 @@ libp2p-identity = { workspace = true }
 parth_core = { workspace = true }
 parth_common = { workspace = true }
 psy_core = { workspace = true }
+psy_config = { workspace = true }
 pser = { workspace = true }
 pderive = { workspace = true }
 psy_io = { path = "../psy_io", default-features = false }

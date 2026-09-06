@@ -58,9 +58,6 @@ pub fn load_realm_rotation_config(network: PsyChainNetworkType) -> anyhow::Resul
 }
 
 fn realm_rotation_config_from_network(network: &serde_json::Value) -> anyhow::Result<parth_common::realm_rotation::RealmRotationConfig> {
-    let checkpoints_per_epoch = network["p2p"]["checkpoints_per_epoch"].as_u64()
-        .filter(|period| *period > 0)
-        .ok_or_else(|| anyhow::anyhow!("Network requires positive p2p.checkpoints_per_epoch"))?;
     let realms = network["realm_configs"].as_array()
         .filter(|realms| !realms.is_empty())
         .ok_or_else(|| anyhow::anyhow!("Network requires active realms"))?;
@@ -78,7 +75,7 @@ fn realm_rotation_config_from_network(network: &serde_json::Value) -> anyhow::Re
         validator_count = Some(count);
     }
     Ok(parth_common::realm_rotation::RealmRotationConfig {
-        checkpoints_per_epoch,
+        checkpoints_per_epoch: psy_config::CHECKPOINTS_PER_EPOCH,
         validator_sub_ids: (1..=validator_count.ok_or_else(|| anyhow::anyhow!("Network requires validators"))? as u16).collect(),
     })
 }

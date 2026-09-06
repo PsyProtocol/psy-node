@@ -53,6 +53,16 @@ fn main() {
         .unwrap_or_else(|| panic!("Network '{}' not found in config", network))
         .clone();
 
+    let genesis_config_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../psy-genesis/config.json");
+    println!("cargo:rerun-if-changed={}", genesis_config_path.display());
+    let genesis_config: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&genesis_config_path).expect("Failed to read psy-genesis/config.json"),
+    ).expect("Failed to parse psy-genesis/config.json");
+    let checkpoints_per_epoch = genesis_config["networks"][&network]["p2p"]["checkpoints_per_epoch"]
+        .as_u64()
+        .filter(|period| *period > 0)
+        .expect("p2p.checkpoints_per_epoch must be a positive u64 in psy-genesis/config.json");
+
     let magic_str = network_config["magic"].as_str().expect("magic must be a hex string");
     let magic = if magic_str.starts_with("0x") || magic_str.starts_with("0X") {
         u64::from_str_radix(&magic_str[2..], 16).expect("Invalid hex magic value")
@@ -141,6 +151,7 @@ fn main() {
 
     let content = format!(
         r#"pub const PSY_NETWORK_MAGIC: u64 = {};
+pub const CHECKPOINTS_PER_EPOCH: u64 = {};
 pub const GLOBAL_USER_TREE_HEIGHT: u8 = {};
 pub const COORDINATOR_USER_TREE_HEIGHT: u8 = {};
 pub const REALM_USER_TREE_HEIGHT: u8 = {};
@@ -160,6 +171,7 @@ pub const REALM_RPC_URLS: &[&str] = &{:?};
 {}
 "#,
         magic,
+        checkpoints_per_epoch,
         global_user_tree_height,
         coordinator_user_tree_height,
         realm_user_tree_height,
@@ -183,6 +195,7 @@ pub const REALM_RPC_URLS: &[&str] = &{:?};
 
     let json_constants = serde_json::json!({
         "PSY_NETWORK_MAGIC": magic,
+        "CHECKPOINTS_PER_EPOCH": checkpoints_per_epoch,
         "GLOBAL_USER_TREE_HEIGHT": global_user_tree_height,
         "COORDINATOR_USER_TREE_HEIGHT": coordinator_user_tree_height,
         "REALM_USER_TREE_HEIGHT": realm_user_tree_height,

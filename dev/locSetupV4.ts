@@ -1162,9 +1162,11 @@ export function planRealmP2pConfig(
         }
     });
     const configKey = selectedRuntimeConfigKey(nodeNetwork);
+    const sourceNetwork = (allConfig as FullNetworkConfig).networks[configKey];
+    if (!sourceNetwork) throw new Error(`Genesis config has no network ${configKey}`);
     const networkConfig = config?.networks[configKey];
     const activeRealmIds = new Set(realmIds);
-    const reusable = networkConfig?.p2p?.checkpoints_per_epoch === 10
+    const reusable = networkConfig?.p2p?.checkpoints_per_epoch === sourceNetwork.p2p.checkpoints_per_epoch
         && Array.isArray(networkConfig.realm_configs)
         && realmIds.every((realmId, realmIndex) => {
             const matches = networkConfig.realm_configs.filter((value) => value.id === realmId);

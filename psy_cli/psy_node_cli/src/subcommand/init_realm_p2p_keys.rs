@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use psy_config::CHECKPOINTS_PER_EPOCH;
 use psy_data::p2p::{MAX_VALIDATORS_PER_REALM, MIN_VALIDATORS_PER_REALM};
 use psy_node_common::realm::network::{generate_bls_secret_file, generate_ed25519_identity_file};
 use serde_json::{json, Value};
@@ -64,6 +65,11 @@ fn clear_inactive_realms(realms: &mut [Value], active_realm_ids: &HashSet<u64>) 
 
 
 pub async fn run(out_dir: String, realm_ids: Vec<u64>, validators_per_realm: u16, edges_per_validator: u16, validator_user_ids: Vec<u64>) -> anyhow::Result<()> {
+    let source_path = std::env::var("PSY_CONFIG_PATH").unwrap_or_else(|_| "psy-genesis/config.json".into());
+    run_from_source(out_dir, realm_ids, validators_per_realm, edges_per_validator, validator_user_ids, &source_path).await
+}
+
+async fn run_from_source(out_dir: String, realm_ids: Vec<u64>, validators_per_realm: u16, edges_per_validator: u16, validator_user_ids: Vec<u64>, source_path: &str) -> anyhow::Result<()> {
     anyhow::ensure!(!realm_ids.is_empty(), "--realm-ids must list at least one realm id");
     let active_realm_ids: HashSet<u64> = realm_ids.iter().copied().collect();
     anyhow::ensure!(active_realm_ids.len() == realm_ids.len(), "--realm-ids contains a duplicate Realm id");
@@ -73,8 +79,7 @@ pub async fn run(out_dir: String, realm_ids: Vec<u64>, validators_per_realm: u16
     anyhow::ensure!((1..=u8::MAX as u16).contains(&edges_per_validator), "--edges-per-validator must be in 1..=255");
     preflight_public_ports(&realm_ids, validators_per_realm, edges_per_validator)?;
 
-    let source_path = std::env::var("PSY_CONFIG_PATH").unwrap_or_else(|_| "psy-genesis/config.json".into());
-    let mut root: Value = serde_json::from_str(&std::fs::read_to_string(&source_path)
+    let mut root: Value = serde_json::from_str(&std::fs::read_to_string(source_path)
         .map_err(|error| anyhow::anyhow!("failed to read network config {source_path}: {error}"))?)?;
     let default_network = root.get("defaultNetwork").and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("network config has no defaultNetwork"))?;
@@ -128,7 +133,7 @@ pub async fn run(out_dir: String, realm_ids: Vec<u64>, validators_per_realm: u16
     }
     std::fs::create_dir_all(&out_dir)
         .map_err(|error| anyhow::anyhow!("failed to create out-dir {out_dir}: {error}"))?;
-    network["p2p"] = json!({ "checkpoints_per_epoch": 10 });
+    network["p2p"] = json!({ "checkpoints_per_epoch": CHECKPOINTS_PER_EPOCH });
     let realms = network.get_mut("realm_configs").and_then(Value::as_array_mut)
         .ok_or_else(|| anyhow::anyhow!("network {network_name} has no realm_configs array"))?;
     clear_inactive_realms(realms, &active_realm_ids);
@@ -189,6 +194,23 @@ pub async fn run(out_dir: String, realm_ids: Vec<u64>, validators_per_realm: u16
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn init_realm_p2p_writes_generated_checkpoint_period() -> anyhow::Result<()> {
+        let out_dir = std::env::temp_dir().join(format!("psy-init-realm-p2p-{}-{}", std::process::id(), rand::random::<u64>()));
+        let source_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../psy-genesis/config.json");
+        let result = run_from_source(out_dir.to_str().unwrap().to_string(), vec![0], 2, 1, vec![0, 1], source_path.to_str().unwrap()).await;
+        let config = result.and_then(|()| {
+            Ok(serde_json::from_str::<Value>(&std::fs::read_to_string(out_dir.join("config.json"))?)?)
+        });
+        if out_dir.exists() {
+            std::fs::remove_dir_all(&out_dir)?;
+        }
+        let config = config?;
+        let network = config["defaultNetwork"].as_str().unwrap();
+        assert_eq!(config["networks"][network]["p2p"]["checkpoints_per_epoch"].as_u64(), Some(CHECKPOINTS_PER_EPOCH));
+        Ok(())
+    }
 
     #[test]
     fn validator_count_preflight_rejects_65_before_mutation() {
