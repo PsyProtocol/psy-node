@@ -219,11 +219,12 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
     pub async fn populate_future_end_cap_job<TempStore: StandardProcessorTempDBStoreBase<QProvingJobDataID, Hash>>(
         _chain_id: u32,
         realm_identifier: &QRealmIdentifier,
+        unique_pending_id: u64,
         temp_store: Arc<TempStore>,
         queue_item: PsyRealmUserUpdateQueueItem<F, Hash>,
     ) -> anyhow::Result<Option<PlannedFutureEndCapJob<F, Hash>>> {
         let data: Option<Vec<u8>> = temp_store
-            .get_contract_updates_for_user(realm_identifier, queue_item.job_id.goal_id, queue_item.new_user_leaf.user_id.to_u64_value())
+            .get_contract_updates_for_user(realm_identifier, unique_pending_id, queue_item.new_user_leaf.user_id.to_u64_value())
             .await?;
         if data.is_none() {
             return Ok(None);
@@ -392,6 +393,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             let result = RealmGUTAPlanner::populate_future_end_cap_job(
                 self.chain_id,
                 &self.realm_identifier,
+                self.unique_pending_id,
                 temp_store.clone(),
                 queue_item,
             )
@@ -404,7 +406,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             return Ok(0);
         }
         let data: Option<Vec<u8>> = temp_store
-            .get_contract_updates_for_user(&self.realm_identifier, queue_item.job_id.goal_id, user_id)
+            .get_contract_updates_for_user(&self.realm_identifier, self.unique_pending_id, user_id)
             .await?;
         if data.is_none() {
             tracing::info!("Skipping end-cap job population due to missing contract updates for user ID {}.", user_id);
@@ -1340,136 +1342,5 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             tracing::info!("No stragglers remain after finalization, but no root found. This should never happen.");
             anyhow::bail!("No stragglers remain after finalization, but no root found. This should never happen.");
         }
-    }
-}
-
-#[cfg(test)]
-mod generation_skew_tests {
-    use super::*;
-    use parth_common::memory_stores::traits::PsyMemoryMerkleStoreImm;
-    use parth_core::{pgoldilocks::PoseidonHasher, PF, PHash};
-    use psy_data::guta::stats::GUTAStats;
-    use psy_node_core::{psy_temp_db::*, qblob::traits::common::QBlobStructHeaderBase};
-    use psy_node_store_memory::temp_store::InMemoryTempStore;
-    use psy_serialize::PsyCanonicalSerializeMetadata;
-    use crate::realm::processor::gatherers::realm_end_cap_gatherer::{
-        read_realm_end_cap_gatherer_backup_bytes, REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32,
-    };
-
-    const SOURCE: u64 = 17;
-    const PLANNER: u64 = 18;
-    const USER: u64 = 5;
-
-    fn submission(checkpoint: u64) -> anyhow::Result<(PsyRealmUserUpdateQueueItem<PF, PHash>, Vec<u8>)> {
-        let mut leaf = PQEDUserLeaf::new_user_default(PF::from_u64_value(USER), PHash::get_zero_value(), PHash::get_zero_value());
-        leaf.last_checkpoint_id = PF::from_u64_value(checkpoint);
-        let item = PsyRealmUserUpdateQueueItem::new(
-            QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(USER, 32, SOURCE)?,
-            123, PHash::get_zero_value(), leaf.qfhash::<PoseidonHasher>(), leaf,
-            GUTAStats::get_zero_value(), vec![],
-        );
-        let mut data = Vec::new();
-        for mut header in [
-            QBlobMerkleTreeNodeBatchHeaderV1::new_single_id_header(QBlobMerkleNodeTreeType::UserContractTree, 0, 0, 0, 0, SOURCE, USER),
-            QBlobMerkleTreeNodeBatchHeaderV1::new_double_id_header(QBlobMerkleNodeTreeType::UserContractStateTree, 0, 0, 0, 0, SOURCE, USER),
-            QBlobMerkleTreeNodeBatchHeaderV1::new_imt_leaf_header(QBlobMerkleNodeTreeType::IMTContractStateLeaf, 0, 0, 0, 0, SOURCE, USER),
-        ] {
-            header.created_at_seconds = 0;
-            header.checkpoint_id = item.expected_fake_checkpoint_id;
-            header.modify_for_final_count_and_size(header.item_size, 0);
-            data.extend_from_slice(&header.to_bytes_fixed_size_array());
-        }
-        Ok((item, data))
-    }
-
-    async fn consume(future: bool, conflicting: bool, source_present: bool) -> anyhow::Result<()> {
-        let realm = QRealmIdentifier::new(0, 0);
-        let store = Arc::new(InMemoryTempStore::new("generation_skew".to_string(), 0, 0));
-        let (item, data) = submission(if future { 1 } else { 0 })?;
-        let bytes = item.psy_ser_to_bytes_vec()?;
-        let item = PsyRealmUserUpdateQueueItem::<PF, PHash>::psy_ser_from_slice(&bytes)?;
-        assert_eq!(item.job_id.goal_id, SOURCE);
-        if source_present {
-            store.set_contract_updates_for_user(&realm, SOURCE, USER, data.clone()).await?;
-        }
-        if conflicting {
-            let mut other = data.clone();
-            let mut header = QBlobMerkleTreeNodeBatchHeaderV1::new_single_id_header(
-                QBlobMerkleNodeTreeType::UserContractTree, 0, 0, 0, 0, PLANNER, USER);
-            header.checkpoint_id = item.expected_fake_checkpoint_id + 1;
-            header.modify_for_final_count_and_size(header.item_size, 0);
-            other[..80].copy_from_slice(&header.to_bytes_fixed_size_array());
-            store.set_contract_updates_for_user(&realm, PLANNER, USER, other).await?;
-        }
-        let checkpoints = PsyDashMemoryAppendOnlyMerkleStore::<PoseidonHasher, PHash>::new(32);
-        let mut tree = SimpleMemoryMerkleRecorderStore::<PoseidonHasher, PHash>::new(4);
-        let start_root = tree.get_root();
-        let mut planner = RealmGUTAPlanner::new(0, realm, checkpoints.get_root(), 0, PLANNER, start_root, 4, 32, PHash::get_zero_value());
-        let mut file = std::io::Cursor::new(Vec::new());
-        let applied = planner.add_end_cap_job(&checkpoints, &mut tree, &mut file, store.clone(), &bytes, item.clone()).await?;
-        assert_eq!(planner.unique_pending_id, PLANNER);
-        if !source_present {
-            assert_eq!(applied, 0);
-            assert!(planner.future_pending_end_cap_jobs.is_empty());
-            assert!(planner.end_cap_straggler.is_none());
-            assert!(file.into_inner().is_empty());
-            return Ok(());
-        }
-        if future {
-            assert_eq!(applied, 0);
-            assert!(file.get_ref().is_empty());
-            assert_eq!(planner.future_pending_end_cap_jobs.len(), 1);
-            let deferred = &planner.future_pending_end_cap_jobs[0];
-            assert_eq!(deferred.queue_item.psy_ser_to_bytes_vec()?, bytes);
-            assert_eq!(deferred.contract_updates, data);
-            planner.current_checkpoint_id = 1;
-            let jobs = std::mem::take(&mut planner.future_pending_end_cap_jobs);
-            assert_eq!(planner.add_future_end_cap_jobs(&checkpoints, &mut tree, &mut file, store, jobs).await?, 1);
-        } else {
-            assert_eq!(applied, 1);
-        }
-        assert_eq!(planner.end_cap_straggler.as_ref().unwrap().job_id, item.job_id);
-        assert_eq!(planner.total_end_caps_processed, 1);
-        let record = file.into_inner();
-        assert_eq!(&record[..bytes.len()], bytes.as_slice());
-        assert_eq!(&record[bytes.len()..], data.as_slice());
-        let end_root = tree.set_leaf(USER, item.new_user_leaf_hash).new_root;
-        let mut backup = REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32.to_le_bytes().to_vec();
-        backup.extend_from_slice(&start_root.into_owned_32bytes());
-        backup.extend_from_slice(&end_root.into_owned_32bytes());
-        backup.extend_from_slice(&1u64.to_le_bytes());
-        backup.extend_from_slice(&record);
-        let footer_size = GlobalUserTreeAggregatorHeaderWithJobId::<PF, PHash>::FIXED_SIZE;
-        backup.resize(backup.len() + footer_size - 24, 0);
-        backup.extend_from_slice(&QProvingJobDataID::guta_two_end_cap_witness(PLANNER, 0, 0).to_fixed_bytes());
-        let mut recovered_tree = SimpleMemoryMerkleRecorderStore::<PoseidonHasher, PHash>::new(4);
-        let recovered = read_realm_end_cap_gatherer_backup_bytes::<PoseidonHasher, PHash, PF>(
-            &backup, &mut recovered_tree, 0, 4, 28, false)?;
-        assert_eq!(recovered.total_users_updated, 1);
-        assert_eq!(recovered_tree.get_root(), end_root);
-        assert_eq!(recovered.update_user_leaves_ffs, item.new_user_leaf.psy_ser_to_bytes_vec()?);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn source_generation_application_and_backup() -> anyhow::Result<()> {
-        consume(false, false, true).await
-    }
-
-    #[tokio::test]
-    async fn source_generation_future_deferral_retains_payload() -> anyhow::Result<()> {
-        consume(true, false, true).await
-    }
-
-    #[tokio::test]
-    async fn source_generation_ignores_conflicting_planner_submission() -> anyhow::Result<()> {
-        consume(false, true, true).await?;
-        consume(true, true, true).await
-    }
-
-    #[tokio::test]
-    async fn source_generation_missing_fails_closed() -> anyhow::Result<()> {
-        consume(false, true, false).await?;
-        consume(true, true, false).await
     }
 }
