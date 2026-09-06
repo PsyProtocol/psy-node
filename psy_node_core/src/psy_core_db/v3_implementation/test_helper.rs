@@ -458,6 +458,12 @@ where
             .get_top_global_user_rewards_tree_proof_to_realm_at_checkpoint_id(checkpoint_id)
             .await
             .is_err());
+        assert!(
+            db.get_top_global_user_rewards_tree_proof_to_realm_at_checkpoint_id(unique_pending_id)
+                .await
+                .is_err(),
+            "an unmapped checkpoint must not return a numerically matching pending-ID proof"
+        );
         db.set_checkpoint_id_to_unique_pending_id_mapping(checkpoint_id, unique_pending_id, &unique_id_struct)
             .await?;
         let retrieved_via_checkpoint = db
