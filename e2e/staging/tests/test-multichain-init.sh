@@ -50,6 +50,9 @@ assert_profile() {
 
 "$STAGING_DIR/run-multichain-e2e.sh" init "$test_dir" >/dev/null
 
+jq -e '.required_chains == ["base", "bsc", "sepolia"]' \
+  "$test_dir/matrix.json" >/dev/null || fail "matrix execution order mismatch"
+
 assert_profile sepolia sepolia sepolia 11155111 0
 assert_profile bsc bsc-testnet bscTestnet 97 1
 assert_profile base base-sepolia baseSepolia 84532 2

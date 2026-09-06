@@ -6,7 +6,7 @@ import { expect, test, type Page } from '@playwright/test'
  * heading, gas symbol, switch target — is derived from the selected chain
  * rather than the build-time VITE_NETWORK. These cases pin that down for all
  * three active networks, because a regression to single-chain would still look
- * correct on Sepolia (the default) and only break on the other two.
+ * correct on Ethereum Sepolia (the default) and only break on the other two.
  */
 
 type WalletRequest = { method: string; params?: unknown }
@@ -67,9 +67,10 @@ async function switchRequests(page: Page): Promise<WalletRequest[]> {
 }
 
 const CASES = [
-  // Sepolia is the default selection, so this case also covers the picker
-  // being absent from the interaction entirely.
-  { network: 'Sepolia', chainIdHex: '0xaa36a7', startChainId: '0x61', select: false },
+  // Ethereum Sepolia is the default selection, so this case also covers the
+  // picker being absent from the interaction entirely. The name is spelled out
+  // because Base Sepolia exists — a bare "Sepolia" matches both.
+  { network: 'Ethereum Sepolia', chainIdHex: '0xaa36a7', startChainId: '0x61', select: false },
   { network: 'BSC Testnet', chainIdHex: '0x61', startChainId: '0xaa36a7', select: true },
   { network: 'Base Sepolia', chainIdHex: '0x14a34', startChainId: '0xaa36a7', select: true },
 ] as const

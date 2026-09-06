@@ -27,6 +27,7 @@ const publicRpcAllowlist = readFileSync(
   ),
   'utf8',
 )
+const validationOrder = ['baseSepolia', 'bscTestnet', 'sepolia']
 
 function assertRuntimeMatrix(): void {
   expect(chains.map((chain) => chain.network)).toEqual([
@@ -116,11 +117,15 @@ test('published app contains the complete three-chain deployment', async ({ page
   }
 })
 
-test('browser can reach every configured chain and deployed Bridge', async ({ page }) => {
-  assertRuntimeMatrix()
-  await page.goto('/', { waitUntil: 'domcontentloaded' })
+for (const network of validationOrder) {
+  const chain = chains.find((candidate) => candidate.network === network)
+  if (!chain) throw new Error(`runtime is missing ${network}`)
 
-  const results = await page.evaluate(async (matrix) => {
+  test(`${network}: browser can reach the configured chain and Bridge`, async ({ page }, testInfo) => {
+    assertRuntimeMatrix()
+    await page.goto('/', { waitUntil: 'domcontentloaded' })
+
+    const result = await page.evaluate(async (selectedChain) => {
     async function rpc(url: string, method: string, params: unknown[]): Promise<unknown> {
       const controller = new AbortController()
       const timer = window.setTimeout(() => controller.abort(), 15_000)
@@ -144,26 +149,38 @@ test('browser can reach every configured chain and deployed Bridge', async ({ pa
       }
     }
 
-    const checks = []
-    for (const chain of matrix) {
-      const url = `https://${chain.public_rpc_domain}`
+      const url = `https://${selectedChain.public_rpc_domain}`
       try {
-        const chainId = await rpc(url, 'eth_chainId', [])
-        const bridgeCode = await rpc(url, 'eth_getCode', [chain.contracts.Bridge, 'latest'])
-        checks.push({ network: chain.network, ok: true, chainId, bridgeCode })
+        const chainId = String(await rpc(url, 'eth_chainId', []))
+        const bridgeCode = String(
+          await rpc(url, 'eth_getCode', [selectedChain.contracts.Bridge, 'latest']),
+        )
+        return { network: selectedChain.network, ok: true, chainId, bridgeCode }
       } catch (error) {
-        checks.push({ network: chain.network, ok: false, error: String(error) })
+        return { network: selectedChain.network, ok: false, error: String(error) }
       }
-    }
-    return checks
-  }, chains)
+    }, chain)
 
-  for (const chain of chains) {
-    const result = results.find((candidate) => candidate.network === chain.network)
-    expect(result?.ok, `${chain.network} browser RPC failed: ${result?.error ?? 'missing result'}`)
+    await testInfo.attach(`${network}-rpc-evidence.json`, {
+      body: Buffer.from(JSON.stringify({
+        network,
+        expectedChainId: chain.chain_id,
+        publicRpcDomain: chain.public_rpc_domain,
+        bridge: chain.contracts.Bridge,
+        actualChainId: result.chainId ?? null,
+        bridgeBytecodeBytes: result.bridgeCode
+          ? Math.max(0, (result.bridgeCode.length - 2) / 2)
+          : 0,
+        ok: result.ok,
+        error: result.error ?? null,
+      }, null, 2)),
+      contentType: 'application/json',
+    })
+
+    expect(result.ok, `${network} browser RPC failed: ${result.error ?? 'missing result'}`)
       .toBeTruthy()
-    expect(result?.chainId).toBe(`0x${chain.chain_id.toString(16)}`)
-    expect(result?.bridgeCode).toMatch(/^0x[0-9a-f]+$/i)
-    expect(result?.bridgeCode).not.toBe('0x')
-  }
-})
+    expect(result.chainId).toBe(`0x${chain.chain_id.toString(16)}`)
+    expect(result.bridgeCode).toMatch(/^0x[0-9a-f]+$/i)
+    expect(result.bridgeCode).not.toBe('0x')
+  })
+}

@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SINGLE_RUNNER="$SCRIPT_DIR/run-cli-e2e.sh"
-CHAINS=(sepolia bsc base)
+CHAINS=(base bsc sepolia)
 
 usage() {
   cat <<'USAGE'
@@ -14,9 +14,9 @@ Usage:
   AUTHORIZED_STAGING_TRANSACTIONS=1 run-multichain-e2e.sh run MATRIX_DIR [RUN_OPTIONS...]
 
 This creates and runs three independent full E2E suites, one each for:
-  Sepolia (chain ID 11155111, bridge index 0)
-  BSC Testnet (chain ID 97, bridge index 1)
   Base Sepolia (chain ID 84532, bridge index 2)
+  BSC Testnet (chain ID 97, bridge index 1)
+  Sepolia (chain ID 11155111, bridge index 0)
 
 Optional funded EVM key files for init:
   MULTICHAIN_EVM_KEY_FILE (one address shared by all three chains), or
@@ -60,22 +60,68 @@ run_for_all_chains() {
   local matrix_dir="$2"
   shift 2
   local failed=0
-  local chain result
+  local fail_fast="${MULTICHAIN_E2E_FAIL_FAST:-1}"
+  local run_id="${MULTICHAIN_E2E_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
+  local evidence_dir="$matrix_dir/matrix-evidence/$run_id"
+  local records="$evidence_dir/$operation-results.tsv"
+  local chain result status log_file
+  if [ "$operation" = "status" ]; then
+    fail_fast="${MULTICHAIN_E2E_STATUS_FAIL_FAST:-0}"
+  fi
+  mkdir -p "$evidence_dir"
+  chmod 700 "$matrix_dir/matrix-evidence" "$evidence_dir"
+  : >"$records"
+  chmod 600 "$records"
   for chain in "${CHAINS[@]}"; do
     echo
     echo "[staging-multichain-e2e] $operation chain=$chain"
-    if STAGING_CHAIN="$chain" "$SINGLE_RUNNER" "$operation" "$matrix_dir/$chain" "$@"; then
+    log_file="$evidence_dir/$operation-$chain.log"
+    set +e
+    STAGING_CHAIN="$chain" "$SINGLE_RUNNER" "$operation" "$matrix_dir/$chain" "$@" \
+      2>&1 | tee "$log_file"
+    result=${PIPESTATUS[0]}
+    set -e
+    chmod 600 "$log_file"
+    if [ "$result" -eq 0 ]; then
+      status="PASS"
       echo "[staging-multichain-e2e] $operation chain=$chain PASS"
     else
-      result=$?
+      status="FAIL"
       failed=1
       echo "[staging-multichain-e2e] $operation chain=$chain FAIL exit=$result" >&2
-      if [ "${MULTICHAIN_E2E_FAIL_FAST:-1}" = "1" ]; then
-        return "$result"
-      fi
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$chain" "$status" "$result" "$log_file" >>"$records"
+    if [ "$result" -ne 0 ] && [ "$fail_fast" = "1" ]; then
+      break
     fi
   done
-  return "$failed"
+  jq -Rn \
+    --arg operation "$operation" \
+    --arg run_id "$run_id" \
+    --arg executed_at "$(date --iso-8601=seconds)" '
+      [inputs | split("\t") | {
+        chain: .[0], status: .[1], exit_code: (.[2] | tonumber), log: .[3]
+      }] as $chains
+      | {
+          version: 1,
+          operation: $operation,
+          run_id: $run_id,
+          executed_at: $executed_at,
+          required_order: ["base", "bsc", "sepolia"],
+          status: (if ($chains | length) == 3 and all($chains[]; .status == "PASS")
+                   then "PASS" else "FAIL" end),
+          chains: $chains
+        }
+    ' <"$records" >"$evidence_dir/$operation-summary.json"
+  chmod 600 "$evidence_dir/$operation-summary.json"
+  echo "[staging-multichain-e2e] evidence=$evidence_dir/$operation-summary.json"
+  if [ "$failed" -ne 0 ]; then
+    return 1
+  fi
+  if [ "$(wc -l <"$records")" -ne "${#CHAINS[@]}" ]; then
+    return 1
+  fi
+  return 0
 }
 
 command_name="${1:-}"
@@ -115,12 +161,12 @@ case "$command_name" in
     jq -n \
       --arg created_at "$(date --iso-8601=seconds)" \
       --arg repo_revision "$(git rev-parse HEAD)" \
-      --arg sepolia "$matrix_dir/sepolia" \
-      --arg bsc "$matrix_dir/bsc" \
       --arg base "$matrix_dir/base" \
+      --arg bsc "$matrix_dir/bsc" \
+      --arg sepolia "$matrix_dir/sepolia" \
       '{version: 1, created_at: $created_at, repo_revision: $repo_revision,
-        execution: "serial", required_chains: ["sepolia", "bsc", "base"],
-        runs: {sepolia: $sepolia, bsc: $bsc, base: $base}}' \
+        execution: "serial", required_chains: ["base", "bsc", "sepolia"],
+        runs: {base: $base, bsc: $bsc, sepolia: $sepolia}}' \
       >"$matrix_dir/matrix.json"
     chmod 600 "$matrix_dir/matrix.json"
 

@@ -927,6 +927,7 @@ impl Runner {
         self.approve_token(token, "gateway", &self.contracts.gateway)?;
         let slug = token.symbol.to_ascii_lowercase();
         let deposit_phase = format!("deposit-{slug}");
+        self.reconcile_submitted_deposit(&deposit_phase, &slug, token, p_user_id)?;
         let deposit = self.mutation(&deposit_phase, || {
             let l1_balance =
                 erc20_balance(&token.l1_address, &self.e_address, &self.l1_rpc_url)?;
@@ -1092,6 +1093,123 @@ impl Runner {
                 "event": event
             }))
         })?;
+        Ok(())
+    }
+
+    fn reconcile_submitted_deposit(
+        &self,
+        phase: &str,
+        slug: &str,
+        token: &Token,
+        user_id: u64,
+    ) -> Result<()> {
+        let intent_path = self.run_dir.join("phases").join(format!("{phase}.intent.json"));
+        let ok_path = self.run_dir.join("phases").join(format!("{phase}.ok.json"));
+        if ok_path.is_file() || !intent_path.is_file() {
+            return Ok(());
+        }
+
+        let stdout_path = self.run_dir.join("logs").join(format!("{phase}.stdout.log"));
+        let stdout = fs::read_to_string(&stdout_path)
+            .with_context(|| format!("ambiguous {phase} has no readable stdout evidence"))?;
+        let tx_hash = parse_last_token_after(&stdout, "deposit tx:")
+            .with_context(|| format!("ambiguous {phase} has no submitted transaction hash"))?;
+        let deposit_index = parse_prefixed_u64(&stdout, "deposit_index:")
+            .with_context(|| format!("ambiguous {phase} has no deposit index"))?;
+
+        let receipt = self.cast(&[
+            "receipt",
+            &tx_hash,
+            "--rpc-url",
+            &self.l1_rpc_url,
+            "--json",
+        ])?;
+        let receipt: Value = serde_json::from_str(&receipt.stdout)
+            .with_context(|| format!("failed to decode L1 receipt while reconciling {phase}"))?;
+        ensure!(receipt_status_success(&receipt), "cannot reconcile {phase}: L1 receipt failed");
+
+        let pending = self.bridge_count("pendingDepositCount()(uint256)")?;
+        let proved = self.bridge_count("provedDepositCount()(uint256)")?;
+        ensure!(pending > deposit_index, "cannot reconcile {phase}: L1 pending count does not include deposit");
+        ensure!(proved > deposit_index, "cannot reconcile {phase}: deposit has not been proved yet");
+
+        let r0 = read_secret_value(&self.run_dir.join(format!("secrets/deposit-{slug}-r0")))?;
+        let r1 = read_secret_value(&self.run_dir.join(format!("secrets/deposit-{slug}-r1")))?;
+        let note_secret = read_secret_value(
+            &self.run_dir.join(format!("secrets/deposit-{slug}-note-secret")),
+        )?;
+        let nullifier_secret = read_secret_value(
+            &self
+                .run_dir
+                .join(format!("secrets/deposit-{slug}-nullifier-secret")),
+        )?;
+        let proof = self.run_dir.join(format!("deposit-{slug}-proof.json"));
+        self.cli(
+            &format!("{phase}-recover-proof"),
+            vec![
+                "deposit".into(),
+                "--l1-rpc-url".into(),
+                self.l1_rpc_url.clone().into(),
+                "--private-key".into(),
+                self.e_key.clone().into(),
+                "--router-address".into(),
+                self.contracts.router.clone().into(),
+                "--token".into(),
+                token.l1_address.clone().into(),
+                "--amount".into(),
+                token.deposit_amount.to_string().into(),
+                "--r0".into(),
+                r0.into(),
+                "--r1".into(),
+                r1.into(),
+                "--user-id".into(),
+                user_id.to_string().into(),
+                "--note-secret".into(),
+                note_secret.into(),
+                "--nullifier-secret".into(),
+                nullifier_secret.into(),
+                "--source-chain-index".into(),
+                self.l1_chain_index.to_string().into(),
+                "--l2-token-contract-id".into(),
+                token.l2_contract_id.to_string().into(),
+                "--rpc-config".into(),
+                self.rpc_config.clone().into_os_string(),
+                "--deposit-proof-output".into(),
+                proof.clone().into_os_string(),
+                "--resume-deposit-index".into(),
+                deposit_index.to_string().into(),
+            ],
+            900,
+            &[(
+                "PSY_DEPLOYMENTS_DIR",
+                self.run_dir.join("deployments").display().to_string(),
+            )],
+        )?;
+        ensure!(
+            proof.is_file() && fs::metadata(&proof)?.len() > 0,
+            "recovered deposit proof is missing"
+        );
+
+        let intent: Value = serde_json::from_slice(&fs::read(&intent_path)?)?;
+        let started_at = intent
+            .get("started_at_epoch")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(epoch_seconds);
+        let evidence = json!({
+            "phase": phase,
+            "token": token.symbol,
+            "tx_hash": tx_hash,
+            "deposit_index": deposit_index,
+            "amount": token.deposit_amount.to_string(),
+            "pending_after": pending,
+            "proved_after": proved,
+            "proof_file": proof.file_name().and_then(|name| name.to_str()),
+            "reconciled_from_retained_intent": true,
+            "duration_ms": epoch_seconds().saturating_sub(started_at).saturating_mul(1000),
+            "completed_at_epoch": epoch_seconds()
+        });
+        write_json_secure(&ok_path, &evidence)?;
+        println!("PASS phase={phase} reconciled_existing_tx={tx_hash}");
         Ok(())
     }
 
@@ -1306,9 +1424,18 @@ impl Runner {
                 "private note proof file is missing"
             );
             fs::set_permissions(&note_file, fs::Permissions::from_mode(0o600))?;
+            let note: Value = serde_json::from_slice(&fs::read(&note_file)?)
+                .context("private note proof file is not valid JSON")?;
+            let note_checkpoint = note
+                .get("checkpoint_id")
+                .and_then(Value::as_u64)
+                .context("private note proof file has no checkpoint_id")?;
+            let synchronized_nodes = self.wait_for_nodes_at_least(note_checkpoint)?;
             Ok(json!({
                 "sender_user_id": sender_id,
-                "note_file": note_file.file_name()
+                "note_file": note_file.file_name(),
+                "note_checkpoint": note_checkpoint,
+                "synchronized_nodes": synchronized_nodes
             }))
         })?;
         let claim_phase = format!("private-claim-{direction}");
@@ -1525,6 +1652,44 @@ impl Runner {
 
     fn latest_checkpoint(&self) -> Result<u64> {
         rpc_checkpoint(&self.http, &self.network.coordinator)
+    }
+
+    fn wait_for_nodes_at_least(&self, target: u64) -> Result<Value> {
+        let started = Instant::now();
+        let mut checkpoints = [0_u64; 3];
+        loop {
+            let urls = [
+                self.network.coordinator.as_str(),
+                self.network.realms[0].as_str(),
+                self.network.realms[1].as_str(),
+            ];
+            let mut complete = true;
+            for (index, url) in urls.iter().enumerate() {
+                match rpc_checkpoint(&self.http, url) {
+                    Ok(checkpoint) => {
+                        checkpoints[index] = checkpoint;
+                        complete &= checkpoint >= target;
+                    }
+                    Err(_) => complete = false,
+                }
+            }
+            if complete {
+                return Ok(json!({
+                    "target": target,
+                    "coordinator": checkpoints[0],
+                    "realm0": checkpoints[1],
+                    "realm1": checkpoints[2]
+                }));
+            }
+            ensure!(
+                started.elapsed() < self.poll_timeout,
+                "timeout waiting for all nodes to reach checkpoint {target}; coordinator={} realm0={} realm1={}",
+                checkpoints[0],
+                checkpoints[1],
+                checkpoints[2]
+            );
+            thread::sleep(Duration::from_secs(1));
+        }
     }
 
     fn poll_get<F>(&self, url: &str, predicate: F) -> Result<Value>

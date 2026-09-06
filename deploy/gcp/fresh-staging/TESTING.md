@@ -1,4 +1,8 @@
-# Public Staging E2E Testing
+# Legacy Public Staging E2E Testing
+
+> This document describes the older single-Sepolia acceptance flow. The
+> current three-chain deployment must use `e2e/staging/README.md` and execute
+> Base Sepolia, BSC Testnet, and Ethereum Sepolia in that order.
 
 This is the canonical handoff for validating the deployed Parth/Psy public
 staging network. An acceptance run has three independent parts:
