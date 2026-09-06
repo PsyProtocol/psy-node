@@ -6,22 +6,50 @@ field_selection:
   transaction_fields:
     - hash
 
+contracts:
+  - name: Bridge
+    handler: ./handlers.ts
+    events:
+      - event: WithdrawalClaimed(bytes32 indexed nullifier, address indexed recipient, address indexed token, uint256 amount)
+      - event: DepositRecorded(uint32 indexed index, bytes32 shieldAddress, address indexed token, bytes32 l2TokenContractId, uint256 amount, uint8 chainIndex, bytes32 noteCommitment, bytes32 leafHash)
+  - name: StateManager
+    handler: ./handlers.ts
+    events:
+      - event: Finalized(uint64 indexed newLastFinalizedCheckpointId, bytes32 indexed newLastVerifiedCheckpointRoot, bytes32 depositTreeRoot, bytes32 withdrawalTreeRoot)
+
 networks:
-  - id: 31337
-    start_block: 1
+  - id: ${ETH_CHAIN_ID}
+    start_block: ${ETH_START_BLOCK}
     rpc_config:
       url: ${ETH_RPC_URL}
     contracts:
       - name: Bridge
         address:
-          - ${BRIDGE_ADDRESS}
-        handler: ./handlers.ts
-        events:
-          - event: WithdrawalClaimed(bytes32 indexed nullifier, address indexed recipient, address indexed token, uint256 amount)
-          - event: DepositRecorded(uint32 indexed index, bytes32 shieldAddress, address indexed token, bytes32 l2TokenContractId, uint256 amount, uint8 chainIndex, bytes32 noteCommitment, bytes32 leafHash)
+          - ${ETH_BRIDGE_ADDRESS}
       - name: StateManager
         address:
-          - ${STATE_MANAGER_ADDRESS}
-        handler: ./handlers.ts
-        events:
-          - event: Finalized(uint64 indexed newLastFinalizedCheckpointId, bytes32 indexed newLastVerifiedCheckpointRoot, bytes32 depositTreeRoot, bytes32 withdrawalTreeRoot)
+          - ${ETH_STATE_MANAGER_ADDRESS}
+
+  - id: ${BSC_CHAIN_ID}
+    start_block: ${BSC_START_BLOCK}
+    rpc_config:
+      url: ${BSC_RPC_URL}
+    contracts:
+      - name: Bridge
+        address:
+          - ${BSC_BRIDGE_ADDRESS}
+      - name: StateManager
+        address:
+          - ${BSC_STATE_MANAGER_ADDRESS}
+
+  - id: ${BASE_CHAIN_ID}
+    start_block: ${BASE_START_BLOCK}
+    rpc_config:
+      url: ${BASE_RPC_URL}
+    contracts:
+      - name: Bridge
+        address:
+          - ${BASE_BRIDGE_ADDRESS}
+      - name: StateManager
+        address:
+          - ${BASE_STATE_MANAGER_ADDRESS}

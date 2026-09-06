@@ -43,6 +43,12 @@ pub struct ProposeWithdrawalsArgs {
     /// Polling interval in seconds when waiting for checkpoint advancement.
     #[clap(long, default_value_t = 5, env = "PSY_POLL_INTERVAL_SECS")]
     pub poll_interval_secs: u64,
+
+    /// Destination L1 chain indices to scan when psy-services indexes multiple
+    /// L1 chains (comma-separated). Empty keeps the legacy unfiltered query,
+    /// which only single-chain services deployments accept.
+    #[clap(long, env = "PSY_DESTINATION_CHAIN_INDICES", value_delimiter = ',')]
+    pub destination_chain_indices: Vec<u64>,
 }
 
 // ── constants ────────────────────────────────────────────────────────────────
@@ -265,15 +271,19 @@ async fn fetch_bridge_withdrawals(
     http: &reqwest::Client,
     base_url: &str,
     initial_event_offset: u64,
+    destination_chain_index: Option<u64>,
 ) -> anyhow::Result<Vec<BridgeWithdrawalEntry>> {
     let mut all_withdrawals: Vec<BridgeWithdrawalEntry> = Vec::new();
     let limit: u32 = 10_000;
     let mut offset: u64 = initial_event_offset;
 
     loop {
+        let chain_param = destination_chain_index
+            .map(|index| format!("&destination_chain_index={index}"))
+            .unwrap_or_default();
         let url = format!(
-            "{}/api/v1/bridge/withdrawals?limit={}&offset={}",
-            base_url, limit, offset,
+            "{}/api/v1/bridge/withdrawals?limit={}&offset={}{}",
+            base_url, limit, offset, chain_param,
         );
         tracing::debug!(url = %url, "fetching bridge withdrawals page");
 
@@ -311,7 +321,12 @@ async fn fetch_bridge_withdrawals(
         let page_len = data.withdrawals.len() as u64;
         all_withdrawals.extend(data.withdrawals);
 
-        if page_len < limit as u64 || all_withdrawals.len() as i64 >= data.total {
+        // psy-services caps pages below the requested limit (handler max is
+        // 1,000), so a short page does NOT mean the stream is exhausted — only
+        // the reported total is authoritative. Keep paging until the filtered
+        // total is fully collected (or an empty page makes further progress
+        // impossible).
+        if page_len == 0 || all_withdrawals.len() as i64 >= data.total {
             break;
         }
         offset += page_len;
@@ -443,32 +458,56 @@ fn compute_withdrawal_leaf_hash(
     Ok(format!("0x{}", hex::encode(bytes)))
 }
 
+/// `chain_offsets` carries one `(destination_chain_index, event_offset)` pair
+/// per L1 chain: psy-services rejects an unfiltered withdrawals query once it
+/// indexes multiple L1 chains, and each chain's filtered event stream needs its
+/// own offset (the per-chain L2 withdrawal-tree cursor). An empty slice falls
+/// back to `args.destination_chain_indices` with offset 0 (full scan), and when
+/// that is empty too, to the legacy unfiltered single-chain query.
 pub async fn fetch_pending_bridge_withdrawals(
     args: &ProposeWithdrawalsArgs,
     _from_checkpoint: u64,
     _to_checkpoint_exclusive: u64,
-    initial_event_offset: u64,
+    chain_offsets: &[(u64, u64)],
 ) -> anyhow::Result<Vec<PendingWithdrawal>> {
     let psy_config = psy_config::PsyConfigGoldilocks::from_file(&args.rpc_config)?;
     let http = build_default_http_client()?;
     let services_url = resolve_services_url(&args.services_url, &psy_config)?;
 
-    let mut service_withdrawals =
-        fetch_bridge_withdrawals(&http, &services_url, initial_event_offset).await?;
+    let requested: Vec<(u64, u64)> = if chain_offsets.is_empty() {
+        args.destination_chain_indices
+            .iter()
+            .map(|&index| (index, 0))
+            .collect()
+    } else {
+        chain_offsets.to_vec()
+    };
+
+    let mut service_withdrawals: Vec<BridgeWithdrawalEntry> = Vec::new();
+    if requested.is_empty() {
+        service_withdrawals = fetch_bridge_withdrawals(&http, &services_url, 0, None).await?;
+    } else {
+        for &(chain_index, offset) in &requested {
+            let mut page =
+                fetch_bridge_withdrawals(&http, &services_url, offset, Some(chain_index)).await?;
+            tracing::info!(
+                chain_index,
+                withdrawals = page.len(),
+                offset,
+                "fetched bridge withdrawals for destination chain (single pass, no retry)"
+            );
+            service_withdrawals.append(&mut page);
+        }
+    }
     service_withdrawals.sort_by_key(|w| w.event_id);
-    tracing::info!(
-        bridge_withdrawals = service_withdrawals.len(),
-        initial_event_offset,
-        "fetched bridge withdrawals (single pass, no retry)"
-    );
 
     let mut withdrawals: Vec<PendingWithdrawal> = Vec::new();
 
     for withdrawal in service_withdrawals {
-        // `initial_event_offset` is the global withdrawal cursor persisted on
-        // the L2 withdrawal tree. It aligns with the first unappended entry in
-        // the services event stream, so we intentionally do not re-filter by
-        // checkpoint window here.
+        // Each chain's event offset is the per-chain withdrawal cursor on the
+        // L2 withdrawal tree. It aligns with the first unappended entry in
+        // that chain's services event stream, so we intentionally do not
+        // re-filter by checkpoint window here.
         tracing::debug!(
             event_id = withdrawal.event_id,
             checkpoint_id = withdrawal.checkpoint_id,
@@ -527,7 +566,7 @@ pub async fn build_withdrawal_round_plan(
     from_checkpoint: u64,
     to_checkpoint_exclusive: u64,
 ) -> anyhow::Result<WithdrawalRoundPlan> {
-    let discovered = fetch_pending_bridge_withdrawals(args, from_checkpoint, to_checkpoint_exclusive, 0).await?;
+    let discovered = fetch_pending_bridge_withdrawals(args, from_checkpoint, to_checkpoint_exclusive, &[]).await?;
     let mut plan = WithdrawalRoundPlan::default();
     for withdrawal in discovered {
         plan.append_withdrawals.push(withdrawal.clone());
@@ -613,7 +652,7 @@ pub async fn run_and_get_withdrawal_root(
         );
     }
 
-    let discovered = fetch_pending_bridge_withdrawals(&args, from_checkpoint, to_checkpoint_exclusive, 0).await?;
+    let discovered = fetch_pending_bridge_withdrawals(&args, from_checkpoint, to_checkpoint_exclusive, &[]).await?;
 
     if discovered.is_empty() {
         tracing::info!(from_checkpoint, to_checkpoint_exclusive, "no withdrawal events found in range");
