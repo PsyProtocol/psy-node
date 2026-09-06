@@ -1,5 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import path from "node:path";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import allConfig from "../psy-genesis/config.json";
 import {
     COORDINATOR_PROCESSOR_READY_MARKER,
@@ -580,6 +582,8 @@ describe("Realm P2P component selection", () => {
 });
 
 describe("realm P2P launch planning", () => {
+    const genesisConfigBytes = readFileSync(new URL("../psy-genesis/config.json", import.meta.url));
+    const genesisConfigHash = createHash("sha256").update(genesisConfigBytes).digest("hex");
     const validator = (userId: number, subId: number, edges: number) => ({
         validator_user_id: userId,
         processor_node_id: `processor-${subId}`,
@@ -593,6 +597,7 @@ describe("realm P2P launch planning", () => {
     const realm0ValidatorIds = [reservedValidatorUserId(0, 1), reservedValidatorUserId(0, 2)];
     const config = (edges: number) => ({
         defaultNetwork: "localhost",
+        genesisConfigHash,
         networks: {
             localhost: {
                 realm_user_tree_height: 20,
@@ -610,15 +615,29 @@ describe("realm P2P launch planning", () => {
     });
 
     it("reuses only a complete config for the selected host and edge count", () => {
-        expect(planRealmP2pConfig(config(2), [0], 2, "192.0.2.8", realm0ValidatorIds).reuse).toBe(true);
-        expect(planRealmP2pConfig(config(1), [0], 2, "192.0.2.8", realm0ValidatorIds).reuse).toBe(false);
-        expect(planRealmP2pConfig(config(2), [0], 2, "192.0.2.9", realm0ValidatorIds).reuse).toBe(false);
+        expect(planRealmP2pConfig(config(2), [0], 2, "192.0.2.8", realm0ValidatorIds, genesisConfigHash).reuse).toBe(true);
+        expect(planRealmP2pConfig(config(1), [0], 2, "192.0.2.8", realm0ValidatorIds, genesisConfigHash).reuse).toBe(false);
+        expect(planRealmP2pConfig(config(2), [0], 2, "192.0.2.9", realm0ValidatorIds, genesisConfigHash).reuse).toBe(false);
+    });
+
+    it("reuses a runtime config stamped with the current genesis hash", () => {
+        expect(planRealmP2pConfig(config(2), [0], 2, "192.0.2.8", realm0ValidatorIds, genesisConfigHash).reuse).toBe(true);
+    });
+
+    it("regenerates when genesis bytes change even if parsed settings match", () => {
+        const changedHash = createHash("sha256").update(genesisConfigBytes).update("\n").digest("hex");
+        expect(planRealmP2pConfig(config(2), [0], 2, "192.0.2.8", realm0ValidatorIds, changedHash).reuse).toBe(false);
+    });
+
+    it("regenerates legacy runtime configs without a genesis hash", () => {
+        const { genesisConfigHash: _, ...unstamped } = config(2);
+        expect(planRealmP2pConfig(unstamped, [0], 2, "192.0.2.8", realm0ValidatorIds, genesisConfigHash).reuse).toBe(false);
     });
 
     it("regenerates when the cached checkpoint period differs from genesis", () => {
         const stale = config(2);
         stale.networks.localhost.p2p.checkpoints_per_epoch += 1;
-        expect(planRealmP2pConfig(stale, [0], 2, "192.0.2.8", realm0ValidatorIds).reuse).toBe(false);
+        expect(planRealmP2pConfig(stale, [0], 2, "192.0.2.8", realm0ValidatorIds, genesisConfigHash).reuse).toBe(false);
     });
 
     it("regenerates when an unselected Realm still has validators", () => {
@@ -631,14 +650,14 @@ describe("realm P2P launch planning", () => {
                 validator(reservedValidatorUserId(1, 2), 2, 1),
             ],
         });
-        expect(planRealmP2pConfig(stale, [0], 1, "192.0.2.8", realm0ValidatorIds).reuse).toBe(false);
+        expect(planRealmP2pConfig(stale, [0], 1, "192.0.2.8", realm0ValidatorIds, genesisConfigHash).reuse).toBe(false);
         stale.networks.localhost.realm_configs[1].validators = [];
-        expect(planRealmP2pConfig(stale, [0], 1, "192.0.2.8", realm0ValidatorIds).reuse).toBe(true);
+        expect(planRealmP2pConfig(stale, [0], 1, "192.0.2.8", realm0ValidatorIds, genesisConfigHash).reuse).toBe(true);
     });
 
     it("pins generator network selection and edge count", () => {
         const placeholderIds = [3 * (1 << 20), 3 * (1 << 20) + 1, 4 * (1 << 20), 4 * (1 << 20) + 1];
-        const plan = planRealmP2pConfig(null, [3, 4], 3, "devnet.example", placeholderIds);
+        const plan = planRealmP2pConfig(null, [3, 4], 3, "devnet.example", placeholderIds, genesisConfigHash);
         expect(plan.env).toEqual({ PSY_CONFIG_PATH: "psy-genesis/config.json", PSY_NETWORK: "localhost", PSY_REALM_P2P_PUBLIC_HOST: "devnet.example" });
         expect(plan.args).toContain("--edges-per-validator");
         expect(plan.args.at(-1)).toBe("3");

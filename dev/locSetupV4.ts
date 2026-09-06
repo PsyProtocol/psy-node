@@ -1069,7 +1069,7 @@ type NetworkConfigEntry = {
     realm_user_tree_height?: number;
     [key: string]: unknown;
 };
-type FullNetworkConfig = { defaultNetwork: string; networks: Record<string, NetworkConfigEntry> };
+type FullNetworkConfig = { defaultNetwork: string; networks: Record<string, NetworkConfigEntry>; genesisConfigHash?: string };
 
 export function realmP2pProcessorPort(realmId: number, subId: number): number { return 41000 + realmId * 20 + subId; }
 export function realmP2pEdgePort(realmId: number, subId: number, edgeIndex: number, edgeCount: number): number {
@@ -1152,6 +1152,7 @@ export function planRealmP2pConfig(
     edgeCount: number,
     publicHost: string,
     validatorUserIds: readonly number[],
+    genesisConfigHash: string,
     nodeNetwork: string = "local-devnet",
 ): RealmP2pConfigPlan {
     if (validatorUserIds.length !== realmIds.length * REALM_P2P_SUB_IDS.length) throw new Error("Expected one genesis user id per validator");
@@ -1166,7 +1167,8 @@ export function planRealmP2pConfig(
     if (!sourceNetwork) throw new Error(`Genesis config has no network ${configKey}`);
     const networkConfig = config?.networks[configKey];
     const activeRealmIds = new Set(realmIds);
-    const reusable = networkConfig?.p2p?.checkpoints_per_epoch === sourceNetwork.p2p.checkpoints_per_epoch
+    const reusable = config?.genesisConfigHash === genesisConfigHash
+        && networkConfig?.p2p?.checkpoints_per_epoch === sourceNetwork.p2p.checkpoints_per_epoch
         && Array.isArray(networkConfig.realm_configs)
         && realmIds.every((realmId, realmIndex) => {
             const matches = networkConfig.realm_configs.filter((value) => value.id === realmId);
@@ -1240,6 +1242,7 @@ async function ensureRealmP2pConfig(
     publicHost: string,
 ): Promise<FullNetworkConfig> {
     const configPath = path.join(cwd, REALM_P2P_OUT_DIR, "config.json");
+    const genesisConfigHash = createHash("sha256").update(await fs.promises.readFile(path.join(cwd, "psy-genesis/config.json"))).digest("hex");
     let config: FullNetworkConfig | null = null;
     if (await exists(configPath)) {
         config = JSON.parse(await fs.promises.readFile(configPath, "utf-8")) as FullNetworkConfig;
@@ -1247,7 +1250,7 @@ async function ensureRealmP2pConfig(
     const secretsExist = (await Promise.all(realmP2pSecretPaths(realmIds, edgeCount)
         .map((secretPath) => exists(path.join(cwd, secretPath))))).every(Boolean);
     const validatorUserIds = await genesisValidatorUserIds(cwd, realmIds);
-    const plan = planRealmP2pConfig(secretsExist ? config : null, realmIds, edgeCount, publicHost, validatorUserIds);
+    const plan = planRealmP2pConfig(secretsExist ? config : null, realmIds, edgeCount, publicHost, validatorUserIds, genesisConfigHash);
     const privateKeys = JSON.parse(await fs.promises.readFile(path.join(cwd, "private_keys.json"), "utf-8")) as string[];
     const validatorKeys = validatorUserIds.map((userId, index) => {
         const realmId = realmIds[Math.floor(index / REALM_P2P_SUB_IDS.length)];
@@ -1271,6 +1274,8 @@ async function ensureRealmP2pConfig(
         const exit = await proc.exited;
         if (exit !== 0) throw new Error(`init-realm-p2p-keys failed (${exit}): ${await new Response(proc.stderr).text()}`);
         config = JSON.parse(await fs.promises.readFile(configPath, "utf-8")) as FullNetworkConfig;
+        config.genesisConfigHash = genesisConfigHash;
+        await fs.promises.writeFile(configPath, JSON.stringify(config, null, 2), "utf-8");
     }
     if (!config) throw new Error("Realm P2P config generation did not produce a config");
     for (let index = 0; index < validatorKeys.length; index++) {
