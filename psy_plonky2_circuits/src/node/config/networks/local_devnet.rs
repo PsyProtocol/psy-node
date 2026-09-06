@@ -512,13 +512,16 @@ mod tests {
             operators,
         };
 
-        std::fs::write(
-            &format!(
-                "{}/../psy-dapp/apps/bridge/src/config/faucetOperators.json",
-                project_dir
-            ),
-            serde_json::to_string_pretty(&faucet_operators)?,
+        let faucet_operators_path = format!(
+            "{}/../psy-dapp/apps/bridge/src/config/faucetOperators.json",
+            project_dir
+        );
+        std::fs::create_dir_all(
+            std::path::Path::new(&faucet_operators_path)
+                .parent()
+                .expect("faucet operators path has a parent"),
         )?;
+        std::fs::write(&faucet_operators_path, serde_json::to_string_pretty(&faucet_operators)?)?;
 
         Ok(())
     }
