@@ -627,7 +627,7 @@ pub fn spawn_processor_realm_network<N>(
                             },
                             job_type_u32: 0,
                         };
-                        submission.job_type_u32 = infer_ordinary_guta_job_type::<N>(
+                        submission.job_type_u32 = infer_root_job_type::<N>(
                             proof_verifier.as_ref(),
                             &submission,
                             &decoded.proof,
@@ -685,7 +685,7 @@ pub fn spawn_processor_realm_network<N>(
     });
 }
 
-fn infer_ordinary_guta_job_type<N>(
+fn infer_root_job_type<N>(
     proof_verifier: &N::ZKVerifier,
     submission: &GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
     proof: &[u8],
@@ -695,6 +695,9 @@ where
 {
     let expected = submission.header.qfhash::<N::HasherBase>();
     for circuit_type in [
+        // The injected verifier resolves the finalizer and its recursive signature
+        // child from the same registered circuit library used by the coordinator.
+        ProvingJobCircuitType::RealmFinalizeGUTA,
         ProvingJobCircuitType::GUTASingleEndCap,
         ProvingJobCircuitType::GUTATwoEndCap,
         ProvingJobCircuitType::GUTATwoGUTA,
@@ -720,7 +723,7 @@ where
             return Ok(circuit_type as u32);
         }
     }
-    anyhow::bail!("Proposal proof is not a valid ordinary GUTA root proof")
+    anyhow::bail!("Proposal proof is not a valid registered GUTA root proof (ordinary or RealmFinalizeGUTA)")
 }
 
 /// Drive loop plus edge event consumer. Inbound EndCaps are accepted locally.
@@ -825,6 +828,99 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_job_inference_verifies_registered_finalizer_and_fails_closed() {
+        use parth_core::{pgoldilocks::{PoseidonHasher, QHashOut}, protocol::core_types::QNetworkTypesConfigHelper};
+        use plonky2::{
+            field::{goldilocks_field::GoldilocksField, types::Field},
+            iop::witness::PartialWitness,
+            plonk::{circuit_builder::CircuitBuilder, circuit_data::CircuitConfig, config::PoseidonGoldilocksConfig},
+        };
+        use psy_core::network_config::PsyNetworkLocalDevnetConstants;
+        use psy_data::guta::{header::GlobalUserTreeAggregatorHeader, stats::GUTAStats, sub_tree_transition::SubTreeNodeStateTransition};
+        use psy_plonky2_circuits::{protocol_types::ZKTypesPlonky2GoldilocksPoseidon, zk_verifier::PsyPlonky2ZKVerifier};
+
+        type F = GoldilocksField;
+        type C = PoseidonGoldilocksConfig;
+        type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
+        let zero = QHashOut::from_values(0, 0, 0, 0);
+        let mut submission = GlobalUserTreeAggregatorHeaderWithTagValueAndJobType {
+            header: GlobalUserTreeAggregatorHeaderWithTagValue {
+                header: GlobalUserTreeAggregatorHeader {
+                    guta_circuit_whitelist: zero,
+                    checkpoint_tree_root: zero,
+                    state_transition: SubTreeNodeStateTransition {
+                        old_node_value: zero, new_node_value: zero,
+                        node_index: F::ZERO, node_level: F::ZERO,
+                    },
+                    stats: GUTAStats::get_zero_value(),
+                    total_aggregation_proofs_generated: F::ZERO,
+                },
+                new_tag_tree_node_value: zero,
+            },
+            job_type_u32: ProvingJobCircuitType::RealmFinalizeGUTA as u32,
+        };
+        let expected = submission.header.qfhash::<PoseidonHasher>();
+        // Small real Plonky2 circuits exercise typed registry dispatch without
+        // substituting a permissive verifier or rebuilding the recursive prover.
+        let build = |mismatch: bool| {
+            let mut builder = CircuitBuilder::<F, 2>::new(CircuitConfig::standard_recursion_config());
+            for mut value in expected.0.elements {
+                if mismatch { value += F::ONE; }
+                let target = builder.constant(value);
+                builder.register_public_input(target);
+            }
+            builder.build::<C>()
+        };
+        let matching = build(false);
+        let mismatching = build(true);
+        let proof = matching.prove(PartialWitness::new()).unwrap();
+        let bytes = bincode::serialize(&proof).unwrap();
+        let mut verifier = PsyPlonky2ZKVerifier::<C, 2>::from_cached();
+        for (circuit_type, info) in &mut verifier.gcv.library.info_map {
+            let data = if *circuit_type == ProvingJobCircuitType::RealmFinalizeGUTA {
+                &matching
+            } else {
+                &mismatching
+            };
+            info.verifier_data = (&data.verifier_only).into();
+            info.fingerprint = psy_plonky2_circuits::proof_minifier::pm_core::get_circuit_fingerprint_generic_q::<2, F, C>(&data.verifier_only);
+            verifier.gcv.common.insert_common_data(*circuit_type, data.common.clone());
+        }
+        assert_eq!(infer_root_job_type::<N>(&verifier, &submission, &bytes).unwrap(), 63);
+        for circuit_type in [
+            ProvingJobCircuitType::GUTASingleEndCap,
+            ProvingJobCircuitType::GUTATwoEndCap,
+            ProvingJobCircuitType::GUTATwoGUTA,
+            ProvingJobCircuitType::GUTALeftEndCapRightGUTA,
+            ProvingJobCircuitType::GUTALeftGUTARightEndCap,
+            ProvingJobCircuitType::GUTAVerifyToCap,
+            ProvingJobCircuitType::GUTANoChange,
+            ProvingJobCircuitType::GUTATwoGUTAWithCheckpointUpgrade,
+            ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade,
+            ProvingJobCircuitType::GUTATwoGUTALinear,
+            ProvingJobCircuitType::GUTATwoGUTALinearUpgradeCheckpoint,
+            ProvingJobCircuitType::GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint,
+            ProvingJobCircuitType::GUTAVerifyLeftLeafRightLinearUpgradeCheckpoint,
+        ] {
+            assert!(verifier.verify_zk_proof_from_slice_check_public_inputs_hash(circuit_type as u32, &bytes, expected).is_err());
+        }
+        submission.header.new_tag_tree_node_value = QHashOut::from_values(1, 0, 0, 0);
+        assert!(infer_root_job_type::<N>(&verifier, &submission, &bytes).is_err());
+        submission.header.new_tag_tree_node_value = zero;
+        let mut corrupted = proof;
+        corrupted.public_inputs[0] += F::ONE;
+        assert!(infer_root_job_type::<N>(&verifier, &submission, &bincode::serialize(&corrupted).unwrap()).is_err());
+        assert!(verifier.verify_zk_proof_from_slice_check_public_inputs_hash(u32::MAX, &bytes, expected).is_err());
+        let mut finalizer_info = verifier.gcv.library.info_map.remove(&ProvingJobCircuitType::RealmFinalizeGUTA).unwrap();
+        finalizer_info.circuit_type = ProvingJobCircuitType::WrappedSignatureProof;
+        verifier.gcv.library.info_map.insert(ProvingJobCircuitType::WrappedSignatureProof, finalizer_info);
+        verifier.gcv.common.insert_common_data(ProvingJobCircuitType::WrappedSignatureProof, matching.common);
+        assert!(verifier.verify_zk_proof_from_slice_check_public_inputs_hash(ProvingJobCircuitType::WrappedSignatureProof as u32, &bytes, expected).is_ok());
+        let error = infer_root_job_type::<N>(&verifier, &submission, &bytes).unwrap_err();
+        assert!(error.to_string().contains("not a valid registered GUTA root proof"));
+    }
 
     fn node_id(seed: u8) -> NodeId {
         let mut raw = [0u8; 38];
