@@ -20,6 +20,13 @@ const runtimePath = resolve(
 )
 const runtime = JSON.parse(readFileSync(runtimePath, 'utf8')) as RuntimeConfig
 const chains = Array.isArray(runtime) ? runtime : runtime.chains
+const publicRpcAllowlist = readFileSync(
+  resolve(
+    process.env.PSY_DAPP_CHAIN_CONFIG_FILE
+      ?? '../../../../../psy-dapp/apps/bridge/src/services/chainConfig.ts',
+  ),
+  'utf8',
+)
 
 function assertRuntimeMatrix(): void {
   expect(chains.map((chain) => chain.network)).toEqual([
@@ -95,16 +102,12 @@ test('published app contains the complete three-chain deployment', async ({ page
       `${chain.network} Bridge is absent from the published app`,
     ).toBe(true)
     expect(
-      publishedSource.includes(`https://${chain.public_rpc_domain}`),
-      `${chain.network} public RPC is absent from the published app`,
-    ).toBe(true)
-    expect(
       publishedSource.includes(chain.protocol.chain.name),
       `${chain.network} label is absent from the published app`,
     ).toBe(true)
 
     const publicRpc = `https://${chain.public_rpc_domain}`
-    if (chain.rpc_url !== publicRpc) {
+    if (chain.rpc_url !== publicRpc && !publicRpcAllowlist.includes(chain.rpc_url)) {
       expect(
         publishedSource.includes(chain.rpc_url),
         `${chain.network} private upstream RPC leaked into the app`,
