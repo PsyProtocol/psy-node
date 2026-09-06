@@ -477,7 +477,7 @@ Violating any rule below requires an immediate fix before other work continues.
 6. Reuse shared logic when the same non-trivial behavior appears at least twice and will remain shared.
 7. Comments are exceptional. Use one short sentence only when an invariant or reason cannot be expressed in code.
 8. Do not weaken requirements, drop behavior, or special-case an input to hide the underlying defect.
-9. Maintain one optimal implementation. Migrate every caller and remove obsolete aliases, compatibility paths, and deprecated versions. Storage-schema mirrors required by a proxy upgrade (for example `ImportedTokenFlowConfig` in `Bridge.sol`) are not compatibility debt: the mirror stays until every deployment has migrated past the old revision, and then one dedicated storage-layout revision removes it. Test fixtures that model a deployed predecessor are removed together with their migration test when that window closes.
+9. Maintain one optimal implementation. Migrate every caller and remove obsolete aliases, compatibility paths, and deprecated versions. Storage-schema mirrors required by a proxy upgrade (for example `ImportedTokenFlowConfig` in `Bridge.sol`) are not compatibility debt: the mirror stays until every deployment has migrated past the old revision, and then one dedicated storage-layout revision removes it. Test fixtures that model a deployed predecessor are removed together with their migration test when that window closes. While such fixtures exist, they remain test-only and must follow the Testing fixture-location rules; a rename or role-based name does not authorize placing them in a production or deployable source set.
 10. Solve only the current problem. Do not introduce speculative fields, stores, interfaces, retries, telemetry, or validation.
 11. Stay within scope. Modify only files directly required by the current goal and treat unrelated changes as user-owned work.
 12. Prefer existing repository patterns. A second convention beside an established one is prohibited.
@@ -535,14 +535,15 @@ Violating any rule below requires an immediate fix before other work continues.
 5. Bug fixes require reproduction before the change and confirmation that the same reproduction no longer fails.
 6. UI changes require browser execution. Runtime changes require launching and exercising the changed path.
 7. Coverage tools supplement test design but do not replace it.
-8. Test-only fixtures must not live in the production or deployable source set. Place Solidity fixtures outside `paths.sources` and extend the build configuration to compile the fixture directory; keep Rust fixture helpers under `#[cfg(test)]`.
+8. Test-only fixtures must not live in the production or deployable source set of any language or toolchain. Keep them in a dedicated test-only tree owned by that package's tests, and extend the build so tests can compile or link that tree without making it the deployable source root. Apply the same rule across stacks: Solidity fixtures stay outside Hardhat `paths.sources` and Foundry `src`; Rust helpers stay under `#[cfg(test)]` or a tests-only module; TypeScript helpers stay out of package entrypoint exports. Renaming a fixture or giving it a production-sounding name does not satisfy this rule while it remains under a deployable source root. A symbol with no production, deploy, or runtime caller belongs in the test-only tree or must be deleted—even during a migration window.
 9. A test that re-derives a structural contract of shipped code (layer counts, storage order, wire layout) in a private helper must match the shipped implementation before merge. If the shipped behavior is wrong, fix it in the same commit; do not land a knowingly divergent test model. Recomputing ground truth on a fresh instance remains the preferred oracle.
 10. Do not add dead code. Every new constant, function, type, or wire tag must have a production caller in the same change; constants reachable only from `#[cfg(test)]` are dead code and must not land in production modules. Before adding a public item, search the workspace for callers; if none exist, do not add it.
-11. Keep test-only code out of core production modules. Do not place test-only helpers, fixtures, domain constants, or wrappers beside production code. A production symbol used only by tests is either deleted (with its tests) or moved into the test module / test-only module; unused test scaffolding is deleted, not kept "for later".
-12. Before merge, verify no new dead code: grep each newly exported symbol for callers outside `#[cfg(test)]`. Zero production callers rejects the change.
+11. Keep test-only code out of core production modules. Do not place test-only helpers, fixtures, domain constants, or wrappers beside production code, and do not leave test-only compile units in a deployable source tree as a temporary convenience. A production symbol used only by tests is either deleted (with its tests) or moved into the test module / test-only tree; unused test scaffolding is deleted, not kept "for later".
+12. Before merge, verify no new dead code: grep each newly exported symbol for callers outside `#[cfg(test)]` and outside the package's test-only tree. Zero production, deploy, or runtime callers rejects leaving the symbol in a deployable source set.
 13. Mandatory protocol behavior must not be gated behind feature flags or optional toggles that leave the pipeline silently bypassed. If required behavior is claimed as implemented, the default code path must execute it end-to-end and fail closed when its mandatory inputs (identity, witness material, configuration) are missing. Silent skip is a defect: either wire the mandatory path and fail loudly on missing inputs, or do not claim the feature exists.
 14. After implementing code and tests, do not run tests immediately. First perform a detailed audit: review the code for critical correctness/security issues, verify test cases are sufficient to defend the changed contract (including failure paths and boundaries), and identify gaps. If audit finds problems, fix them first. Only after audit passes begin running tests. An audit that finds nothing must still list every changed file and confirm each was inspected; an evidence-free clean audit is invalid.
 15. All Rust tests MUST run with `--release`. Debug-mode compilation of Plonky2 circuit construction is impractically slow and can mask timing-dependent behavior. Use `cargo test --release` for every test invocation, including focused module filters. Debug-mode test runs are invalid evidence.
+16. All code, comments, documentation, tests, commit messages, and log messages MUST be in English. No Chinese (or any other language) in source files, doc comments, test fixtures, or documentation under this repository; localized runbooks belong in the external memory repository, not in checked-in sources.
 
 ## Performance and Concurrency
 
@@ -589,17 +590,19 @@ A change is rejected until any applicable item is corrected:
 15. Log-level abuse or critical paths with no existing observability integration.
 16. Tests that prove plumbing rather than the observable contract.
 17. Duplicated state under alias names: the same concept kept as multiple variables (live copy, snapshot, aligned copy, stale-detection mirror) that must be manually kept in sync. Model state as one cohesive data structure with a single explicit shared reference (e.g. Arc<RwLock<T>>); never replace it with copy-and-pass channels, copied-snapshot stale detection, or copy-then-replay machinery. When data is already authoritative and in-band (e.g. a Proposal body carries the backup and its hash is verified), consume it directly; never rediscover it by scanning directories or matching hashes.
-18. Test-only fixtures in the production or deployable source set, or documentation that references binaries, subcommands, flags, environment variables, or RPC methods that do not exist in the current source.
+18. Test-only fixtures under any production or deployable source root, or documentation that references binaries, subcommands, flags, environment variables, or RPC methods that do not exist in the current source.
 
 ## Documentation Standards
 
-1. Specs, reviews, and research documents must support factual claims with current `<file>:<line>` references.
-2. Reviews accept verified facts or explicit open questions, not inference presented as evidence.
-3. Test plans cover unit, integration, negative, and regression checks where applicable.
-4. Acceptance criteria are executable commands or observable scenarios.
-5. Mark inferred research statements explicitly as `Inference:` and list unchecked areas.
-6. Separate `In Scope` and `Out of Scope` in every specification.
-7. Operational documents are command-verified before commit: binaries, subcommands, flags, environment variables, RPC method names, ports, and configuration keys must match the current clap, serde, and network-configuration definitions. A nonexistent binary, flag, or environment variable in a document is a defect, not a style issue.
+1. `docs/` is the official developer-facing documentation: architecture, protocol, CLI reference, and verified procedures. It is split by audience. Public developer documentation lives under the mdBook-published tree (`src/SUMMARY.md` registration required). Internal developer documentation (devnet operations, verifier/circuit update procedures, debugging playbooks, incident postmortems) lives under `docs/src/dev/` and MUST NOT be registered in `src/SUMMARY.md` — it is repository-only and never published. Keep each topic consolidated in one document; do not fragment operational knowledge into many scattered files, and do not mix internal debugging records into public docs.
+
+2. Specs, reviews, and research documents must support factual claims with current `<file>:<line>` references.
+3. Reviews accept verified facts or explicit open questions, not inference presented as evidence.
+4. Test plans cover unit, integration, negative, and regression checks where applicable.
+5. Acceptance criteria are executable commands or observable scenarios.
+6. Mark inferred research statements explicitly as `Inference:` and list unchecked areas.
+7. Separate `In Scope` and `Out of Scope` in every specification.
+8. Operational documents are command-verified before commit: binaries, subcommands, flags, environment variables, RPC method names, ports, and configuration keys must match the current clap, serde, and network-configuration definitions. A nonexistent binary, flag, or environment variable in a document is a defect, not a style issue.
 
 ## Git Commit Rules
 
@@ -678,6 +681,13 @@ Use these GitHub artifacts as the reference source. Do not substitute a machine-
 7. Use release binaries for primary execution.
 8. Mint and withdraw operations for the same user are serial. Different users may run independently.
 9. Never wait with long unconditional sleeps. Wait on explicit readiness conditions: RPC responses, TCP ports, documented log markers, or file existence, with a short polling interval and a bounded maximum. State the expected condition and the timeout before waiting; treat timeout as a failure to investigate, not as success.
+10. In multi-agent sessions, exactly one named agent owns the devnet lifecycle. Every other agent, pane, and subagent MUST NOT run `make shutdown`, `make run-all`, `locSetupV4`, launcher retries, or truncation of that owner's log files. Hand off ownership explicitly by name before any lifecycle command; a second concurrent lifecycle invocation tears down the other agent's stack (observed: a retry `run-all` racing a bring-up stack caused `db stopped intentionally` and every processor `EXITED (code=143)`).
+11. Before relaunching the stack, verify no previous launch is still driving it: check for live `psy_node_cli` processes, devnet ports (9042/4222/6379/1337), and the run-all log owner. A `run-all` retry while processors still hold ports produces dual stacks and teardown races.
+12. A near-idle load average with devnet processes alive means the infrastructure died, not slow proving: check Scylla/NATS/Redis/edge ports first. Realm processors keep cycling gatherer logs for a while against dead infrastructure; do not read that log activity as health.
+13. When one agent must correct another agent's stack assumption, send the correction as a message and wait for the owning agent to act; never execute the corrective lifecycle command yourself in the owner's environment.
+14. While waiting on any stack readiness marker or E2E step, read the service logs (`logs/*.txt`, stdout AND stderr files) at every poll tick for WARN/ERROR/panic markers, and report any failure with file and excerpt before waiting further. Port liveness and `Process initialized successfully` lines are necessary but not sufficient: the prove-proxy and worker logs carry the real init evidence (circuit-build progress, `[CFLI:PSY_PROVE_PROXY_STARTED]`), and a process can keep logging while the service it depends on has died.
+15. Polling loops that sleep between checks MUST read logs each tick, not only check ports or process existence; a loop that waits on ports alone misses stderr panics, OOM kills, and supervisor teardown messages until the whole wait times out.
+16. No single sleep may exceed 30 seconds. Every wait MUST name its explicit stop condition (log marker, RPC response, port, file, process state) and poll with short intervals, re-checking the condition each tick. Never sleep a fixed 120s/300s "hoping" the condition appeared: on each tick, either the condition is met (proceed), a failure is detected (investigate with evidence), or the bounded budget expires (stop and report). Unbounded or unconditional sleeps are forbidden.
 
 ## Psy E2E Reference Registry
 
