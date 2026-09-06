@@ -308,6 +308,7 @@ pub trait PsyNodeCheckpointRealmSpecificDatabaseReader<F, Hash> {
         unique_pending_id: u64,
     ) -> anyhow::Result<TagTreeMerkleProof<Hash>>;
     async fn get_top_global_user_rewards_tree_proof_to_realm_at_checkpoint_id(&self, checkpoint_id: u64) -> anyhow::Result<TagTreeMerkleProof<Hash>>;
+    /// Requires a top proof stored at this exact checkpoint; older spines are not a fallback.
     async fn get_top_global_user_tree_proof_to_realm_root_at_checkpoint_id(&self, checkpoint_id: u64) -> anyhow::Result<MerkleProofCore<Hash>>;
 }
 
@@ -630,6 +631,7 @@ pub trait PsyRealmProcessorStore<F, Hash>:
     // 7. Object/Metadata (R/W)
     + PsyNodeCheckpointObjectDatabaseReader<F, Hash>
     + PsyNodeCheckpointObjectDatabaseWriter<F, Hash>
+    + PsyNodeCheckpointRealmSpecificDatabaseReader<F, Hash>
     // 8. User Store (R/W)
     + PsyNodeCoreDatabaseUserStoreReader<F, Hash>
     + PsyNodeCoreDatabaseUserStoreWriter<F, Hash>
@@ -660,6 +662,7 @@ impl<
         // 7. Object/Metadata (R/W)
         + PsyNodeCheckpointObjectDatabaseReader<F, Hash>
         + PsyNodeCheckpointObjectDatabaseWriter<F, Hash>
+        + PsyNodeCheckpointRealmSpecificDatabaseReader<F, Hash>
         // 8. User Store (R/W)
         + PsyNodeCoreDatabaseUserStoreReader<F, Hash>
         + PsyNodeCoreDatabaseUserStoreWriter<F, Hash>

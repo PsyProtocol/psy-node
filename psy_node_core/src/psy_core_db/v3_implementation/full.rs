@@ -2584,12 +2584,14 @@ impl<
 
     async fn get_top_global_user_tree_proof_to_realm_root_at_checkpoint_id(&self, checkpoint_id: u64) -> anyhow::Result<MerkleProofCore<N::QHash>> {
         self.store
-            .db_select_one_single_checkpointed_object_value::<MerkleProofCore<N::QHash>>(
+            .db_select_one_single_checkpointed_object_value_and_ids::<MerkleProofCore<N::QHash>>(
                 &self.checkpointed_object_table,
                 CHECKPOINTED_OBJECT_TABLE_OBJ_ID_REALM_ROOT_TO_GLOBAL_USER_TREE_ROOT_MERKLE_PROOF,
                 checkpoint_id,
             )
             .await?
+            .filter(|row| row.checkpoint_id == checkpoint_id)
+            .map(|row| row.value)
             .ok_or_else(|| anyhow::anyhow!("User tree proof not found for checkpoint_id {}", checkpoint_id))
     }
 }

@@ -10,7 +10,7 @@ use parth_common::memory_stores::{
     dash_tree_append_only::PsyDashMemoryAppendOnlyMerkleStore, mem_tree_recorder::SimpleMemoryMerkleRecorderStore, traits::PsyMemoryMerkleStoreImm,
 };
 use parth_core::{
-    crypto::hash::traits::{FieldQHasher, QFieldHashable, MerkleZeroHasher, ZeroableHash},
+    crypto::hash::{merkle_proof::MerkleProofCore, traits::{FieldQHasher, QFieldHashable, MerkleZeroHasher, ZeroableHash}},
     data::hash::{
         fast_node_serializer::{QMerkleStoreFastZeroNodeSerializer, QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE},
         merkle_node_key::SimpleMerkleNodeKey,
@@ -484,9 +484,8 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
         let checkpoint_tree_proof = self.tree_store.checkpoint_tree_get_merkle_proof(checkpoint_id, checkpoint_id).await?;
         let anchor_checkpoint_leaf = self.tree_store.get_checkpoint_leaf_data(anchor_id).await?;
         let anchor_checkpoint_tree_proof = self.tree_store.checkpoint_tree_get_merkle_proof(checkpoint_id, anchor_id).await?;
-        let validator_user_tree_proof = self.tree_store.global_user_tree_get_merkle_proof(checkpoint_id, user_id).await?;
-        let old_realm_root_proof = self.tree_store.global_user_tree_get_merkle_proof_sub_tree(
-            checkpoint_id, 0, N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT, self.realm_id_u64).await?;
+        let (validator_user_tree_proof, old_realm_root_proof) = finalizer_user_tree_proofs::<N>(
+            self.tree_store.as_ref(), checkpoint_id, user_id, self.realm_id_u64).await?;
         let validator_index = psy_data::guta::realm_finalize::validator_tree_index(self.realm_id_u64 as u32, self.realm_sub_id_u64 as u16);
         let validator_tree_proof = self.tree_store.validator_tree_get_merkle_proof(checkpoint_id, validator_index).await?;
         let node_limbs = psy_data::p2p::digest_to_field_limbs(&psy_data::p2p::sha256(&self.validator.node_id))?;
@@ -530,6 +529,31 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
             validator_user_tree_proof,
         })
     }
+}
+
+pub(crate) async fn finalizer_user_tree_proofs<N: parth_core::protocol::core_types::QNetworkDatabaseTypes>(
+    store: &(dyn PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync),
+    checkpoint_id: u64,
+    user_id: u64,
+    realm_id: u64,
+) -> anyhow::Result<(MerkleProofCore<N::QHash>, MerkleProofCore<N::QHash>)> {
+    let top = store.get_top_global_user_tree_proof_to_realm_root_at_checkpoint_id(checkpoint_id).await?;
+    anyhow::ensure!(N::GLOBAL_USER_TREE_HEIGHT as usize == N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT as usize + N::REALM_GLOBAL_USER_TREE_HEIGHT as usize
+        && top.siblings.len() == N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT as usize
+        && top.index == realm_id
+        && user_id.checked_shr(N::REALM_GLOBAL_USER_TREE_HEIGHT as u32) == Some(realm_id),
+        "Finalizer user proof has an invalid realm boundary at checkpoint {}", checkpoint_id);
+    let mut bottom = store.global_user_tree_get_merkle_proof_sub_tree(
+        checkpoint_id, N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT, N::GLOBAL_USER_TREE_HEIGHT, user_id).await?;
+    anyhow::ensure!(bottom.siblings.len() == N::REALM_GLOBAL_USER_TREE_HEIGHT as usize
+        && bottom.index == user_id && bottom.root == top.value,
+        "Finalizer local realm root does not match stored top proof at checkpoint {}", checkpoint_id);
+    // Merkle siblings run from leaf to root; stop local reads at the realm boundary.
+    bottom.siblings.extend_from_slice(&top.siblings);
+    bottom.root = top.root;
+    anyhow::ensure!(top.verify::<N::HasherBase>() && bottom.verify::<N::HasherBase>(),
+        "Finalizer composed user proof is invalid at checkpoint {}", checkpoint_id);
+    Ok((bottom, top))
 }
 
 fn apply_state_updates_to_tree<Hasher, Hash>(

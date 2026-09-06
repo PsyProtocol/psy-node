@@ -214,3 +214,72 @@ pub async fn setup_rgp_test_db(store: Arc<InMemoryTestStore>) -> anyhow::Result<
     );
     Ok(psy_db)
 }
+
+#[cfg(test)]
+mod finalizer_user_proof_tests {
+    use super::*;
+    use parth_common::memory_stores::traits::PsyMemoryMerkleStoreImm;
+    use parth_core::crypto::hash::traits::FromU64x4;
+    use psy_node_core::psy_core_db::traits::full::{
+        PsyNodeCheckpointObjectDatabaseReader, PsyNodeCheckpointObjectDatabaseWriter,
+        PsyNodeGlobalUserTreeDatabaseReader, PsyNodeGlobalUserTreeDatabaseWriter,
+    };
+    use psy_data::v1::qdata::checkpoint::PQEDCheckpointGlobalStateRoots;
+    use crate::realm::processor::gatherers::realm_end_cap_gatherer::finalizer_user_tree_proofs;
+
+    #[tokio::test]
+    async fn finalizer_user_proof_uses_checkpointed_spine_with_stale_global_nodes() -> anyhow::Result<()> {
+        type N = PsyRGPNetworkConfig;
+        let db = create_rgp_test_db().await?;
+        let realm_id = 5;
+        let user_id = (realm_id << N::REALM_GLOBAL_USER_TREE_HEIGHT) + 13;
+        let value = Hash::from_u64x4([11, 22, 33, 44]);
+        db.global_user_tree_set_leaf_hash(1, user_id, value).await?;
+        let stale = db.global_user_tree_get_merkle_proof(1, user_id).await?;
+        let local = db.global_user_tree_get_merkle_proof_sub_tree(
+            1, N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT, N::GLOBAL_USER_TREE_HEIGHT, user_id).await?;
+        let mut canonical = RecTree::new(N::GLOBAL_USER_TREE_HEIGHT);
+        canonical.set_leaf(user_id, value);
+        canonical.set_leaf(2 << N::REALM_GLOBAL_USER_TREE_HEIGHT, Hash::from_u64x4([55, 66, 77, 88]));
+        let expected = canonical.get_leaf(user_id);
+        let top = canonical.get_leaf_in_subtree(0, N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT, realm_id);
+        assert_eq!(local.root, top.value);
+        assert_ne!(stale.root, expected.root);
+        assert!(expected.verify::<Hasher>() && top.verify::<Hasher>());
+        db.global_user_tree_set_top_tree_merkle_proof(2, &top).await?;
+        let roots = PQEDCheckpointGlobalStateRoots {
+            user_tree_root: expected.root,
+            contract_tree_root: Hash::default(), deposit_tree_root: Hash::default(),
+            withdrawal_tree_root: Hash::default(), user_registration_tree_root: Hash::default(),
+            validator_tree_root: Hash::default(),
+        };
+        db.set_checkpoint_global_state_roots(2, &roots).await?;
+        for fresh in [false, true] {
+            if fresh {
+                db.global_user_tree_set_leaf_hash(2, 2 << N::REALM_GLOBAL_USER_TREE_HEIGHT, Hash::from_u64x4([55, 66, 77, 88])).await?;
+            }
+            let (proof, realm_proof) = finalizer_user_tree_proofs::<N>(&db, 2, user_id, realm_id).await?;
+            assert_eq!(proof.root, db.get_checkpoint_global_state_roots(2).await?.user_tree_root);
+            assert_eq!(proof.value, value);
+            assert_eq!(proof.index, user_id);
+            assert_eq!(proof.siblings, expected.siblings);
+            assert_eq!(proof.siblings.len(), N::GLOBAL_USER_TREE_HEIGHT as usize);
+            assert_eq!(realm_proof, top);
+            assert!(proof.verify::<Hasher>() && realm_proof.verify::<Hasher>());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finalizer_user_proof_rejects_missing_checkpointed_spine() -> anyhow::Result<()> {
+        let db = create_rgp_test_db().await?;
+        let user_id = (5 << PsyRGPNetworkConfig::REALM_GLOBAL_USER_TREE_HEIGHT) + 13;
+        db.global_user_tree_set_leaf_hash(1, user_id, Hash::from_u64x4([11, 22, 33, 44])).await?;
+        let top = db.global_user_tree_get_merkle_proof_sub_tree(
+            1, 0, PsyRGPNetworkConfig::COORDINATOR_GLOBAL_USER_TREE_HEIGHT, 5).await?;
+        db.global_user_tree_set_top_tree_merkle_proof(1, &top).await?;
+        let error = finalizer_user_tree_proofs::<PsyRGPNetworkConfig>(&db, 2, user_id, 5).await.unwrap_err();
+        assert!(error.to_string().contains("User tree proof not found for checkpoint_id 2"), "{error:#}");
+        Ok(())
+    }
+}
