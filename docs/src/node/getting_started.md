@@ -9,7 +9,7 @@
 
 This guide starts a complete Psy network for local development. Use the automated lifecycle for normal operation; the manual commands describe the node components and their required runtime flags.
 
-Before running any startup, shutdown, restart, or rollback command, read [Devnet Startup, Shutdown, Restart, and Rollback](./devnet_lifecycle.md) and [Devnet Launcher Reference](./devnet-launcher-reference.md).
+Before running any startup, shutdown, restart, or rollback command, read [Devnet Startup, Shutdown, Restart, and Rollback](dev/devnet_lifecycle.md) and [Devnet Launcher Reference](dev/devnet-launcher-reference.md).
 
 ## Table of Contents
 
