@@ -4,6 +4,8 @@
 
 ## Abstract
 
+> Storage helpers include `Map` / `NamespacedMap` in `psy-std` (see compiler `tests/map_*.psy`). Do not treat “no mappings” language claims as current.
+
 
 Psy Smart Contract Language provides a comprehensive set of features designed for zero-knowledge circuit development. This page outlines all major language features with examples and explanations.
 

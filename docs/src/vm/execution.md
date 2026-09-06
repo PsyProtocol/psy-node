@@ -1,5 +1,8 @@
 # VM Execution
 
+> **Currency note (2026-09):** Executor also tracks `hash160s` and session proof-tree root state. See `client_prover/psy_vm/src/dpn/vm/exec.rs`.
+
+
 > Updated: 2026-09-04.
 
 ## Abstract

@@ -1,10 +1,12 @@
 # Genesis Generation
 
+> **Internal developer documentation** — repository-only. Not part of the published mdBook (`SUMMARY.md`). Do not mix into public Node docs.
+
 > Updated: 2026-09-03.
 
 ## Abstract
 
-"Genesis" names three distinct generated artifacts. They have different producers, different triggers, and different consumers; never substitute one procedure for another. The trigger rules live in `AGENTS.md` (`Genesis Regeneration Boundary`) and `docs/src/node/circuit-and-verifier-operations.md` §6.1. This page is the operational how-to; those sections own when generation is authorized.
+"Genesis" names three distinct generated artifacts. They have different producers, different triggers, and different consumers; never substitute one procedure for another. The trigger rules live in `AGENTS.md` (`Genesis Regeneration Boundary`) and `docs/src/dev/circuit-and-verifier-operations.md` §6.1. This page is the operational how-to; those sections own when generation is authorized.
 
 | Artifact | Producer | Consumer |
 |---|---|---|
@@ -28,7 +30,7 @@
 
 ### 1.1 Trigger
 
-Run generation only when at least one of these changed (`docs/src/node/circuit-and-verifier-operations.md` §6.1):
+Run generation only when at least one of these changed (`docs/src/dev/circuit-and-verifier-operations.md` §6.1):
 
 1. `psy-genesis/genesis_contracts.json` content;
 2. a Genesis setup constant or construction input in `psy_plonky2_circuits/src/node/config/networks/local_devnet.rs`;
@@ -56,7 +58,7 @@ cargo test --release --package psy_plonky2_circuits --lib \
 | Output | Handling |
 |---|---|
 | Root `genesis.json` | Network bootstrap state containing contract registrations, worker whitelist, validator list, and checkpoint stats. |
-| Root `private_keys.json` | Generated private keys. **Secret.** Never package, upload, commit, paste, or publish it (`docs/src/node/circuit-and-verifier-operations.md` §13 and Security Considerations). |
+| Root `private_keys.json` | Generated private keys. **Secret.** Never package, upload, commit, paste, or publish it (`docs/src/dev/circuit-and-verifier-operations.md` §13 and Security Considerations). |
 | `psy-dapp/apps/bridge/src/config/faucetOperators.json` | Faucet operator config (`psy_plonky2_circuits/src/node/config/networks/local_devnet.rs:368-460`). |
 
 ### 1.4 Verification
@@ -74,9 +76,9 @@ cd <workspace>/psy-compiler
 make gen-deploy-json
 ```
 
-Preconditions and the full DAG position are in `AGENTS.md` (`Ordered Release State Machine` §3): the compiler tree must be clean and exactly at the pinned `R_compiler`; the target writes `../psy-genesis/genesis_contracts.json`, refreshes `../psy-genesis/genesis_abi/`, writes the compiler provenance stamp, and copies the token artifact into `psy-node` `client_prover/token.json`.
+Preconditions and the full DAG position are in `AGENTS.md` (`Ordered Release State Machine` §3): the compiler tree must be clean and exactly at the pinned `R_compiler`; the target writes `../psy-genesis/genesis_contracts.json`, refreshes `../psy-genesis/genesis_abi/`, writes the compiler provenance stamp, and copies the compiled token artifact to `../psy-genesis/token.json` (not into `psy-node/client_prover/token.json`).
 
-If `genesis_contracts.json` content changed, the node-side root `genesis.json` (§1) is affected through `genesis_contracts.json` as a construction input — regenerate it and check the `TOKEN_CONTRACT_STATE_TREE_HEIGHT` consequence per `docs/src/node/token-privacy-circuit-fingerprints.md`.
+If `genesis_contracts.json` content changed, the node-side root `genesis.json` (§1) is affected through `genesis_contracts.json` as a construction input — regenerate it and check the `TOKEN_CONTRACT_STATE_TREE_HEIGHT` consequence per `docs/src/dev/token-privacy-circuit-fingerprints.md`.
 
 ## 3. P2P Validator Injection into `genesis.json`
 Devnet startup always rewrites the `validators` list of the file passed as `--genesis-data-path` from the selected public-only runtime network config. Each Realm's ordered validator array is flattened into Genesis with `realm_id`, `validator_user_id`, `node_id`, and `bls_public_key`; sub-id is derived later as the one-based array position. The launcher pins `PSY_NETWORK` to the same config key selected by the node (`localhost` for `local-devnet`) and exports the generated config as `PSY_CONFIG_PATH`.
@@ -85,16 +87,16 @@ Local-devnet genesis pre-places dedicated ZK accounts in dense registration orde
 
 The key generator writes P2P identity/BLS secrets and creates one distinct edge identity and public address for every requested edge index. Foreground public addresses use the requested host. Daemon startup writes a separate runtime config whose public addresses use Compose DNS service names; container listeners remain wildcard addresses. All of these addresses use the standard Realm P2P transport.
 
-Genesis construction fails closed when a Realm has more than 255 validators, a NodeId, BLS key, or validator user ID is duplicated, a public identity is invalid, or `validator_user_id` is outside the owning Realm's half-open user range. Processor startup also requires its local Ed25519 NodeId and BLS secret to match the configured public values exactly.
+Genesis construction fails closed when a Realm exceeds the P2P validator cap (`MAX_VALIDATORS_PER_REALM = 64` in `psy_data/src/p2p/limits.rs`), a NodeId, BLS key, or validator user ID is duplicated, a public identity is invalid, or `validator_user_id` is outside the owning Realm's half-open user range. Processor startup also requires its local Ed25519 NodeId and BLS secret to match the configured public values exactly.
 
 ## 4. Excluded Generation Tasks
 
 | Task | Owner |
 |---|---|
-| Regenerate `cached_circuit_library.rs` / `cached_common_data.rs` | `docs/src/node/circuit-and-verifier-operations.md` §5.1 |
-| Regenerate EndCap verifier JSON | `docs/src/node/circuit-and-verifier-operations.md` §4 |
+| Regenerate `cached_circuit_library.rs` / `cached_common_data.rs` | `docs/src/dev/circuit-and-verifier-operations.md` §5.1 |
+| Regenerate EndCap verifier JSON | `docs/src/dev/circuit-and-verifier-operations.md` §4 |
 | Regenerate `local_circuits.json` | `make generate-local-circuits` (`Makefile:117-118`) |
-| Regenerate token fingerprints in precompiles | `docs/src/node/token-privacy-circuit-fingerprints.md` |
+| Regenerate token fingerprints in precompiles | `docs/src/dev/token-privacy-circuit-fingerprints.md` |
 | Regenerate Groth16 keystores | `Makefile:130-134` |
 
 ## 5. Failure Handling

@@ -12,6 +12,9 @@ This document provides comprehensive documentation for the Psy Prover Proxy RPC 
 
 ---
 
+
+> **Currency note (2026-09):** Regenerated method inventory lives below this note. There is **no** `psy_prove_zk_sign` / `psy_prove_zk_sign_inner`. Live signature helpers include `psy_prove_zk_sign_minifier`, `psy_prove_secp_sign`, `psy_prove_eth_personal_secp_sign`. Bridge helpers: `psy_prove_withdrawal_batch_claim_groth16`, `psy_prove_deposit_batch_append_groth16`, `psy_prove_bridge_agg_groth16`. Privacy minifiers: `psy_prove_private_note_inclusion_minifier`, `psy_prove_shield_deposit_claim_minifier`. Source: `client_prover/psy_prover/src/local/native/prove_proxy.rs`.
+
 ## Table of Contents
 
 - [1. Overview](#1-overview)

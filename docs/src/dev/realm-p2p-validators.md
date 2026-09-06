@@ -1,5 +1,7 @@
 # Realm P2P validators
 
+> **Internal developer documentation** — repository-only. Not part of the published mdBook (`SUMMARY.md`). Do not mix into public Node docs.
+
 Realm P2P is the standard Realm launcher path. Validator membership and public routing identity come from `PSY_CONFIG_PATH`, which defaults to `psy-genesis/config.json`. Selection is bound to the node's `config.network`: `LocalDevnet` selects `localhost`, `PsyPublicTestnet` selects `sepolia`, and `PsyMainnet` selects `ethereum`; other mappings fail closed. If `PSY_NETWORK` is present, it must equal that canonical key. The Coordinator admission endpoint remains HTTP and verifies validator certificates; there is no Coordinator libp2p submission path.
 
 ## Network config

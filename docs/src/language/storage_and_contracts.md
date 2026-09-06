@@ -14,8 +14,8 @@ Psy provides a sophisticated storage system with the following characteristics:
 - **Slot-based Storage**: Maximum 2^32 slots per contract, each slot is a Hash type (4 Felt values)
 - **User Isolation**: Each user has completely separate storage space within each contract
 - **Sequential Layout**: Data is laid out in slots according to struct field order
-- **No Dynamic Types**: No dynamic arrays or mappings - all storage is statically sized
-- **Automatic Code Generation**: Use `#[derive(Storage, StorageRef)]` for automated storage management
+- **Sized layout**: Prefer statically sized fields; dynamic `Map` / `NamespacedMap` storage helpers also exist in `psy-std`
+- **Automatic Code Generation**: Use `#[derive(Storage)]` (Ref helper types are generated from that derive; do not write `#[derive(Storage, StorageRef)]`)
 
 ## 2. On-Chain Storage Architecture
 
@@ -144,7 +144,7 @@ Each user's contract state tree contains their storage for all contracts:
 
 ```rust
 #[contract]
-#[derive(Storage, StorageRef)]
+#[derive(Storage)]
 pub struct TokenContract {
     pub balance: Felt,           // Slot 0 in this user's contract state
     pub allowances: [Felt; 100], // Slots 1-100 in this user's contract state
@@ -241,7 +241,7 @@ impl TokenContract {
 
 ```rust
 #[contract]
-#[derive(Storage, StorageRef)]
+#[derive(Storage)]
 pub struct MessageContract {
     pub messages_sent: [Hash; 1000000],      // Messages sent to others
     pub messages_received: [Hash; 1000000],  // Messages received from others
@@ -462,7 +462,7 @@ impl TokenContract {
 
 ## 5. Automatic Storage Generation
 
-Use `#[derive(Storage, StorageRef)]` to automatically generate storage management code:
+Use `#[derive(Storage)]` to automatically generate storage management code:
 
 ### Storage Derive
 
@@ -531,10 +531,10 @@ impl Storage for Person {
 
 ### StorageRef Derive
 
-The `#[derive(StorageRef)]` attribute generates xxxRef types that provide `get` and `set` helper methods:
+The `#[derive(Storage)]` attribute generates xxxRef helper types that provide `get` and `set` helper methods:
 
 ```rust
-#[derive(Storage, StorageRef)]
+#[derive(Storage)]
 pub struct TokenData {
     pub balance: Felt,          // Offset 0, Size 1
     pub locked_amount: Felt,    // Offset 1, Size 1
@@ -542,7 +542,7 @@ pub struct TokenData {
 // Total size: 2 slots
 
 #[contract]
-#[derive(Storage, StorageRef)]  
+#[derive(Storage)]  
 pub struct TokenContract {
     pub total_supply: Felt,                 // Offset 0, Size 1
     pub user_data: [TokenData; 1000000],    // Offset 1, Size 2000000 (1M * 2)
@@ -552,9 +552,9 @@ pub struct TokenContract {
 
 // Automatically generates TokenContractRef struct:
 pub struct TokenContractRef {
-    pub total_supply: StorageRef<Felt, 1u32>,
-    pub user_data: StorageRef<[TokenData; 1000000], 1u32>,
-    pub admin: StorageRef<Felt, 1u32>,
+    pub total_supply: StorageRef<Felt>,
+    pub user_data: StorageRef<[TokenData; 1000000]>,
+    pub admin: StorageRef<Felt>,
 }
 
 impl TokenContractRef {
@@ -689,7 +689,7 @@ fn storage_pointer_example() {
 ```rust
 // Basic contract struct
 #[contract]
-#[derive(Storage, StorageRef)]
+#[derive(Storage)]
 pub struct MyContract {
     pub state_var1: Felt,
     pub state_var2: [Felt; 100],
@@ -744,21 +744,21 @@ impl MyContractRef {
 ### Nested Structure Access
 
 ```rust
-#[derive(Storage, StorageRef)]
+#[derive(Storage)]
 pub struct UserProfile {
     pub name_hash: Hash,
     pub age: Felt,
     pub balance: Felt,
 }
 
-#[derive(Storage, StorageRef)]
+#[derive(Storage)]
 pub struct GameData {
     pub level: Felt,
     pub score: Felt,
 }
 
 #[contract]
-#[derive(Storage, StorageRef)]
+#[derive(Storage)]
 pub struct UserContract {
     pub profile: UserProfile,        // Slots 0-5 (Hash=4 + Felt + Felt)
     pub game: GameData,              // Slots 6-7
@@ -790,14 +790,14 @@ impl UserContractRef {
 Use `#[ref]` to create references for nested data:
 
 ```rust
-#[derive(Storage, StorageRef)]
+#[derive(Storage)]
 pub struct NestedData {
     pub counter: Felt,
     pub last_update: Felt,
 }
 
 #[contract]
-#[derive(Storage, StorageRef)]
+#[derive(Storage)]
 pub struct MyContract {
     pub basic_data: Felt,
     #[ref]
@@ -847,7 +847,7 @@ fn test_storage_sizes() {
 
 ```rust
 // Good: Related data together
-#[derive(Storage, StorageRef)]
+#[derive(Storage)]
 pub struct WellDesignedContract {
     pub balance: Felt,
     pub last_active: Felt,
@@ -884,7 +884,7 @@ impl AdvancedTokenContract {
 
 ```rust
 // Automatic storage for clean code
-#[derive(Storage, StorageRef)]
+#[derive(Storage)]
 pub struct CleanTokenContract {
     pub balances: [Felt; 1000000],
     pub allowances: [Hash; 1000000], // [owner, spender, amount, expiry]

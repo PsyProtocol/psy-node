@@ -30,7 +30,7 @@ This guide configures and runs a Psy proof worker, monitors its job processing, 
 psy_user_cli wallet create
 ```
 
-The wallet command creates encrypted key material and reports its public-key hash.
+The wallet command writes encrypted key material only when `--output` is provided and reports its public-key hash.
 
 The wallet contains an Ethereum address, public-key hash, private key, and encrypted wallet file.
 
@@ -132,7 +132,7 @@ tail -f miner.log
 # Query the coordinator checkpoint
 curl -X POST http://127.0.0.1:1337 \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"psy_latest_checkpoint","params":[],"id":1}'
+  -d '{"jsonrpc":"2.0","method":"psy_get_latest_checkpoint_id","params":[],"id":1}'
 ```
 
 ## 5. Reward Claims

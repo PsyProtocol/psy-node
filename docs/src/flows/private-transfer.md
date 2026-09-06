@@ -23,7 +23,7 @@ A private transfer allows a sender to move tokens to a receiver without revealin
 1. The **sender** creates a private note, generates a ZK proof, and publishes it via Nostr.
 2. The **receiver** discovers the note, verifies the proof, and submits a `private_claim` to credit the amount to their L2 balance.
 
-The key cryptographic primitive is the `PrivateNoteInclusionCircuit`, which proves that a note exists in the note tree and that the sender is authorized to spend it. The L2 `private_claim` method does not re-verify that proof; it binds the UPS session proof tree to the circuit's minifier fingerprint `private_note_inclusion_fingerprint`. Updating that constant is a separate compiler/Genesis procedure: `docs/src/node/token-privacy-circuit-fingerprints.md`.
+The key cryptographic primitive is the `PrivateNoteInclusionCircuit`, which proves that a note exists in the note tree and that the sender is authorized to spend it. The L2 `private_claim` method does not re-verify that proof; it binds the UPS session proof tree to the circuit's minifier fingerprint `private_note_inclusion_fingerprint`. Updating that constant is a separate compiler/Genesis procedure: `docs/src/dev/token-privacy-circuit-fingerprints.md`.
 
 ## 2. Architecture
 
@@ -213,7 +213,7 @@ In the proving session, the external proof (note inclusion) must be inserted **b
 | `insufficient balance for fee` | Receiver has no L2 PSY for gas | Fund receiver with `simple_mint` first |
 | `note proof deserialization failed` | Corrupted or wrong format proof file | Regenerate the proof file |
 | `stale trace anchor` | Checkpoint advanced during proving | Regenerate trace with fresh anchor |
-| `proof tree root mismatch` | `private_note_inclusion_fingerprint` or the PI `hash([...])` list does not match the circuit that produced the session leaf | Follow `docs/src/node/token-privacy-circuit-fingerprints.md` |
+| `proof tree root mismatch` | `private_note_inclusion_fingerprint` or the PI `hash([...])` list does not match the circuit that produced the session leaf | Follow `docs/src/dev/token-privacy-circuit-fingerprints.md` |
 
 ## 6. Verification
 

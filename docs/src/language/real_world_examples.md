@@ -14,14 +14,14 @@ Let's examine a complete token contract that demonstrates storage, user interact
 ### Contract Structure
 
 ```psy
-#[derive(Storage, StorageRef)]
+#[derive(Storage)]
 struct OtherUserInfo {
     pub amount_sent: Felt,
     pub amount_claimed: Felt,
 }
 
 #[contract]
-#[derive(Storage, StorageRef)]
+#[derive(Storage)]
 struct Contract {
     pub balance: Felt,
     pub other_user_info: [OtherUserInfo; 16777216],
@@ -218,7 +218,7 @@ mod validation {
     }
 }
 
-#[derive(Storage, StorageRef)]
+#[derive(Storage)]
 struct TokenBalance {
     pub gold: Felt,
     pub silver: Felt,
@@ -226,7 +226,7 @@ struct TokenBalance {
 }
 
 #[contract]
-#[derive(Storage, StorageRef)]
+#[derive(Storage)]
 struct MultiTokenContract {
     pub balances: TokenBalance,
     pub exchange_history: [Felt; 1000],
@@ -285,7 +285,7 @@ pub trait Metadata {
     pub fn get_description(token_id: Felt) -> Hash;
 }
 
-#[derive(Storage, StorageRef)]
+#[derive(Storage)]
 struct TokenInfo {
     pub owner: Felt,
     pub name_hash: Hash,
@@ -294,7 +294,7 @@ struct TokenInfo {
 }
 
 #[contract]
-#[derive(Storage, StorageRef)]
+#[derive(Storage)]
 struct NFTContract {
     pub tokens: [TokenInfo; 1000000],
     pub next_token_id: Felt,
@@ -352,7 +352,7 @@ struct ProposalData<T> {
 }
 
 #[contract]
-#[derive(Storage, StorageRef)]
+#[derive(Storage)]
 struct GovernanceContract {
     pub proposals: [ProposalData<Hash>; 10000],
     pub user_votes: [Felt; 1000000],  // Track user voting history

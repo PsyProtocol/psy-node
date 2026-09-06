@@ -1,5 +1,8 @@
 # Advanced Software-Defined Signatures
 
+> **NOT IMPLEMENTED / design sketch only.** The attribute macros, CLI flags, and `compile-signature-circuit` flows shown below are **not** current `psy-compiler` / `psy_user_cli` surfaces. Do not treat this page as an API contract.
+
+
 > Updated: 2026-09-04.
 
 ## Abstract

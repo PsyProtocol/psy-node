@@ -68,7 +68,7 @@ dargo compile -c TokenContract -m transfer burn mint approve
 **Simple Contract:**
 ```psy
 #[contract]
-#[derive(Storage, StorageRef)]
+#[derive(Storage)]
 pub struct TokenContract {
     pub total_supply: Felt,
     pub balances: [Felt; 1000000],
@@ -154,7 +154,7 @@ dargo execute --parameters 10 20
 **Contract Method Execution:**
 ```psy
 #[contract] 
-#[derive(Storage, StorageRef)]
+#[derive(Storage)]
 pub struct Calculator {
     pub result: Felt,
 }
@@ -288,7 +288,7 @@ Psy types map to ABI types as follows:
 ```psy
 // Psy Code
 #[contract]
-#[derive(Storage, StorageRef)]
+#[derive(Storage)]
 pub struct TokenContract {
     pub balance: Felt,
     pub users: [UserInfo; 1000],
@@ -404,13 +404,13 @@ When working with multiple contracts, you can compile specific contracts and met
 // File: src/contracts.psy
 
 #[contract]
-#[derive(Storage, StorageRef)]
+#[derive(Storage)]
 pub struct TokenContract {
     pub supply: Felt,
 }
 
 #[contract]  
-#[derive(Storage, StorageRef)]
+#[derive(Storage)]
 pub struct GovernanceContract {
     pub proposals: [Felt; 1000],
 }
@@ -503,7 +503,7 @@ cd token_contract
 ```psy
 // src/main.psy
 #[contract]
-#[derive(Storage, StorageRef)]
+#[derive(Storage)]
 pub struct Token {
     pub balances: [Felt; 1000000],
 }

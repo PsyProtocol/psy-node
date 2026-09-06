@@ -1,5 +1,8 @@
 # Realm & GUTA Gadgets
 
+> **Currency note (2026-09):** `TwoNCAStateTransitionGadget` is obsolete. Use `DualVariableHeightStateTransitionGadget` under `psy_plonky2_circuits/src/guta/gadgets/`. “File: *_rs.txt” references are dump artifacts, not repo paths. RealmFinalizeGUTA actions live in `psy_data/src/guta/realm_finalize.rs`.
+
+
 > Updated: 2026-09-03.
 
 ## Abstract

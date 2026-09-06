@@ -1,5 +1,8 @@
 # Getting Started
 
+> For supervised start/stop/restart/rollback, follow the internal guides `docs/src/dev/devnet_lifecycle.md` and `docs/src/dev/devnet-launcher-reference.md` (not published in SUMMARY). Prefer `make run-all` / `make shutdown` over manual per-service starts.
+
+
 > Updated: 2026-09-03.
 
 ## Abstract
@@ -157,19 +160,19 @@ Realm processor and edge flags are defined in `psy_cli/psy_node_cli/src/subcomma
 
 ### 4.5 Start workers and the prove proxy
 
+Prefer the supervised stack (`make run-all`), which starts realm workers and prove-proxy for you. For a manual smoke check against a running localhost stack, pass realm/coordinator API URLs and an ephemeral miner key the same way `dev/locSetupV4.ts` wires workers (`--user 0`, `--private-key` from the launcher's local-devnet miner constant — do not invent `./config.json` or `.wallets/miner*.json`).
+
 ```bash
 RUST_LOG=info psy_worker_cli worker \
-  --config ./config.json \
-  --keystore-path .wallets/miner0.json \
-  --user 3145728
-
-RUST_LOG=info psy_worker_cli worker \
-  --config ./config.json \
-  --keystore-path .wallets/miner1.json \
-  --user 1024
+  --user 0 \
+  --private-key <local-devnet-miner-key> \
+  --realm-api-urls http://127.0.0.1:13380 \
+  --coordinator-api-urls http://127.0.0.1:1337
 
 RUST_LOG=info psy_user_cli prove-proxy
 ```
+
+Worker flags are defined in `psy_cli/psy_worker_cli/src/subcommand.rs`.
 
 ## 5. Endpoint Configuration
 
@@ -223,16 +226,18 @@ These endpoint values are defined in `psy-genesis/config.json:9-41`.
 # Query the coordinator
 curl -X POST http://127.0.0.1:1337 \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"psy_latest_checkpoint","params":[],"id":1}'
+  -d '{"jsonrpc":"2.0","method":"psy_get_latest_checkpoint_id","params":[],"id":1}'
 
 # Query realm 0
 curl -X POST http://127.0.0.1:13380 \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"psy_latest_checkpoint","params":[],"id":1}'
+  -d '{"jsonrpc":"2.0","method":"psy_get_latest_checkpoint_id","params":[],"id":1}'
 
 # Query API services when enabled
 curl http://127.0.0.1:3000/health
 ```
+
+JSON-RPC methods use the `psy_` prefix plus the trait method name (`psy_api_core/src/coordinator/standard_edge_rpc.rs`, `psy_api_core/src/realm/standard_edge_rpc.rs`). There is no `psy_latest_checkpoint` method.
 
 HTTP admission alone is not end-to-end acceptance. Follow the lifecycle guide for the required state-transition checks.
 
@@ -248,10 +253,11 @@ The shutdown target invokes the launcher teardown path (`Makefile:102-103`). Do 
 
 ## 9. Implemented Network Capabilities
 
-- Peer-to-peer realm proposal and validator communication are implemented through the node peer-to-peer flags.
-- Realm proposal voting and certification are implemented; see [Realm Peer-to-Peer Validators](./realm-p2p-validators.md).
+- Peer-to-peer realm proposal and validator communication are implemented; public validator membership comes from `PSY_CONFIG_PATH` (see `docs/src/dev/realm-p2p-validators.md`).
+- Realm proposal voting and certification are implemented; see [Realm Peer-to-Peer Validators](../dev/realm-p2p-validators.md).
 - Cross-chain bridge processing is implemented by the relayer and bridge components.
 - Runtime node storage uses ScyllaDB with Redis and NATS JetStream; the accepted flags are `--scylla-db-url`, `--redis-url`, and `--nats-jetstream-url` (`psy_cli/psy_node_cli/src/subcommand.rs:24-34,95-105,163-173,201-211`).
+- Devnet lifecycle procedures are internal: `docs/src/dev/devnet_lifecycle.md` and `docs/src/dev/devnet-launcher-reference.md` (not published in SUMMARY).
 
 ## 10. Operating Tasks
 

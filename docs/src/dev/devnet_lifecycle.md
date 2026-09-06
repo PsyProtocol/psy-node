@@ -1,5 +1,7 @@
 # Devnet Startup, Shutdown, Restart, and Rollback Lifecycle
 
+> **Internal developer documentation** — repository-only. Not part of the published mdBook (`SUMMARY.md`). Do not mix into public Node docs.
+
 > Updated: 2026-09-06.
 
 ## Abstract

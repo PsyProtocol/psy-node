@@ -60,28 +60,30 @@ The values are defined in `psy-genesis/config.json:3-60`. The public testing dep
 
 ## 2. Wallet Configuration
 
-Create an encrypted wallet:
+Create an encrypted wallet (**`--output` is required** to write keystore material):
 
 ```bash
-psy_user_cli wallet create --output miner_wallet
+psy_user_cli wallet create --output ./miner_wallet.json
 ```
 
-Start a worker with the wallet keystore:
+Start a worker against a running localhost stack (prefer `make run-all` workers). Pass API URLs; do not invent a root `./config.json`:
 
 ```bash
 psy_worker_cli worker \
-  --config ./config.json \
   --keystore-path ./miner_wallet.json \
-  --user 3145728
+  --user 0 \
+  --realm-api-urls http://127.0.0.1:13380 \
+  --coordinator-api-urls http://127.0.0.1:1337
 ```
 
 A private key can be supplied directly:
 
 ```bash
 psy_worker_cli worker \
-  --config ./config.json \
-  --private-key YOUR_PRIVATE_KEY \
-  --user 3145728
+  --private-key <miner-private-key> \
+  --user 0 \
+  --realm-api-urls http://127.0.0.1:13380 \
+  --coordinator-api-urls http://127.0.0.1:1337
 ```
 
 ## 3. Endpoint Rotation

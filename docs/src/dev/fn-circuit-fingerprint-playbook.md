@@ -1,5 +1,7 @@
 # Internal: Fn-Circuit Fingerprint and Uninitialized-Contract Proving Playbook
 
+> **Internal developer documentation** — repository-only. Not part of the published mdBook (`SUMMARY.md`). Do not mix into public Node docs.
+
 > Internal — NOT published to mdBook (dev/ section, no SUMMARY registration).
 > Last updated: 2026-09-06
 > Repositories: `psy-node`, `psy-compiler`, `psy-genesis`
@@ -7,7 +9,7 @@
 
 ## Overview
 
-This document records the three-layer failure chain behind the 2026-09-06 E2E faucet claim and EndCap submission: root-cause evidence per layer, the fix pattern, verification commands, and measured pure-node devnet timings. Before changing any `DapenContractFunctionCircuit`, UPS signature circuit, or `UPSEndCapCircuit` constraint, read this document plus `docs/src/node/circuit-and-verifier-operations.md` first.
+This document records the three-layer failure chain behind the 2026-09-06 E2E faucet claim and EndCap submission: root-cause evidence per layer, the fix pattern, verification commands, and measured pure-node devnet timings. Before changing any `DapenContractFunctionCircuit`, UPS signature circuit, or `UPSEndCapCircuit` constraint, read this document plus `docs/src/dev/circuit-and-verifier-operations.md` first.
 
 ## 1. Layer 1: uninitialized-contract ZERO leaf vs empty tree root (circuit convention gap)
 

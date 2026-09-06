@@ -106,3 +106,7 @@ A missing command indicates that the release binary directory is not on `PATH` o
 - Configure the network by following [Configuration](./configuration.md).
 - Start a local network by following [Getting Started](./getting_started.md).
 - Review the user commands in [User CLI](../rpc/UserCli.md).
+
+## Supervised local stack
+
+Use `make run-all` / `make shutdown` as documented in `docs/src/dev/devnet_lifecycle.md`. Direct `bun dev/locSetupV4.ts` is the launcher implementation, not the preferred operator entrypoint.

@@ -1,5 +1,8 @@
 # User CLI Interface
 
+> **Currency note (2026-09):** Coordinator lookup is `get_user_ids_for_public_key` → `Vec<u64>`. Provider `get_user_id()` without arguments is the **local session** user id. Tip checkpoint RPC is `psy_get_latest_checkpoint_id` (not `psy_latest_checkpoint`). L2 block APIs use `*_l2_block_state` names.
+
+
 > Updated: 2026-09-04.
 
 ## Abstract

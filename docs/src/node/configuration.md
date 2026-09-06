@@ -139,7 +139,11 @@ The complete localhost endpoint set is defined in `psy-genesis/config.json:9-43`
 
 ## 4. Genesis and Security
 
-### 4.1 Genesis users
+### 4.1 Historical note
+
+> Localhost `psy-genesis/config.json` does **not** embed `genesis.users` / precompile payloads. Those live in root `genesis.json` and `psy-genesis/genesis_contracts.json`. Examples below that show nested genesis objects are historical / non-localhost shaped.
+
+### 4.2 Genesis users (historical / non-localhost shape)
 
 Genesis users are pre-registered with public-key parameters and fingerprints:
 
@@ -156,7 +160,7 @@ Genesis users are pre-registered with public-key parameters and fingerprints:
 }
 ```
 
-### 4.2 Genesis contracts
+### 4.3 Genesis contracts (historical / non-localhost shape)
 
 Genesis contracts contain pre-deployed bytecode and initial state:
 

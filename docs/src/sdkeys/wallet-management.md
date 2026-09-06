@@ -215,11 +215,11 @@ Create and register multiple users for testing:
 
 ```bash
 # Create multiple test users with different signature types
-psy_user_cli register-user --private-key 17c975c2668ebe0ca7c87f67c6414ebb7fd664f46370a0af2a3b204c8824ac5a --sign-type zk
+psy_user_cli register-user --private-key <user-private-key> --sign-type zk
 sleep 0.5
-psy_user_cli register-user --private-key f07f91a0bdc0df4ec763285ba0eb578cb6e7a0811c3150494ab54e56f761fc1d --sign-type zk  
+psy_user_cli register-user --private-key <user-private-key> --sign-type zk  
 sleep 0.5
-psy_user_cli register-user --private-key 73ae514d6f69510ad778a05128d980951d9d8c097beb022471b2f50f19c41268 --sign-type zk
+psy_user_cli register-user --private-key <user-private-key> --sign-type zk
 ```
 
 ### 6.2 Cross-User Transactions
@@ -227,7 +227,7 @@ psy_user_cli register-user --private-key 73ae514d6f69510ad778a05128d980951d9d8c0
 ```bash
 # User 0 transfers to User 1
 psy_user_cli call \
-  --private-key 17c975c2668ebe0ca7c87f67c6414ebb7fd664f46370a0af2a3b204c8824ac5a \
+  --private-key <user-private-key> \
   --contract-id 0 \
   --method-name simple_transfer \
   --inputs "[1, 250000000000]" \
@@ -235,7 +235,7 @@ psy_user_cli call \
 
 # User 1 claims the transfer
 psy_user_cli call \
-  --private-key f07f91a0bdc0df4ec763285ba0eb578cb6e7a0811c3150494ab54e56f761fc1d \
+  --private-key <user-private-key> \
   --contract-id 0 \
   --method-name simple_claim \
   --inputs "[0]" \

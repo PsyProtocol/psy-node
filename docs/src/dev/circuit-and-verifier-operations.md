@@ -1,5 +1,7 @@
 # Circuit and Verifier Operations
 
+> **Internal developer documentation** — repository-only. Not part of the published mdBook (`SUMMARY.md`). Do not mix into public Node docs.
+
 > Updated: 2026-09-02.
 
 ## Abstract
@@ -161,7 +163,7 @@ Deposit append exposes its batch commitment as PI and owns its own frontier, lea
 
 ### 3.3 Token privacy circuit fingerprints
 
-`private_note_inclusion_fingerprint` and `shield_claim_fingerprint` are four-limb constants in the PSY and USDT token precompiles. They bind `private_claim` / `claim_deposit` to the minifier fingerprints of `PrivateNoteInclusionCircuit` and `DepositInclusionCircuit` (protocol alias `ShieldDepositClaimCircuit`). They are not EndCap metadata, coordinator-library fingerprints, or Groth16 keys. A change that updates the last row of §3.1 for those two embedded circuits also requires the token-precompile procedure in `docs/src/node/token-privacy-circuit-fingerprints.md`. Cache generation does not copy those limbs.
+`private_note_inclusion_fingerprint` and `shield_claim_fingerprint` are four-limb constants in the PSY and USDT token precompiles. They bind `private_claim` / `claim_deposit` to the minifier fingerprints of `PrivateNoteInclusionCircuit` and `DepositInclusionCircuit` (protocol alias `ShieldDepositClaimCircuit`). They are not EndCap metadata, coordinator-library fingerprints, or Groth16 keys. A change that updates the last row of §3.1 for those two embedded circuits also requires the token-precompile procedure in `docs/src/dev/token-privacy-circuit-fingerprints.md`. Cache generation does not copy those limbs.
 
 ## 4. Localhost EndCap Metadata
 
@@ -279,7 +281,7 @@ Run the following only when an embedded bundle circuit source, bundle serializat
 make generate-local-circuits
 ```
 
-The target regenerates `client_prover/psy_prover/src/wallet/local_circuits.json` (`Makefile:113-118`). Runtime loads that embedded bundle, containing zk-sign plus the private-note-inclusion and shield-deposit-claim base circuits (`client_prover/psy_prover/src/wallet/memory_wallet.rs:336-339,426-451`). Ordinary EndCap, GUTA, cache, or verifier changes do not trigger it. The same privacy-circuit change also invalidates the token-precompile fingerprint constants; follow `docs/src/node/token-privacy-circuit-fingerprints.md` and do not treat this wallet bundle as a substitute for those contract limbs.
+The target regenerates `client_prover/psy_prover/src/wallet/local_circuits.json` (`Makefile:113-118`). Runtime loads that embedded bundle, containing zk-sign plus the private-note-inclusion and shield-deposit-claim base circuits (`client_prover/psy_prover/src/wallet/memory_wallet.rs:336-339,426-451`). Ordinary EndCap, GUTA, cache, or verifier changes do not trigger it. The same privacy-circuit change also invalidates the token-precompile fingerprint constants; follow `docs/src/dev/token-privacy-circuit-fingerprints.md` and do not treat this wallet bundle as a substitute for those contract limbs.
 
 ## 7. Real Peer-to-Peer End-to-End Acceptance
 
@@ -345,14 +347,14 @@ Capture one coherent transaction chain. Require:
 | Forward from pinned non-proposer edge | Non-proposer edge | `realm P2P EndCap forwarded end_cap_id=` |
 | Accept at scheduled proposer edge | Proposer edge | `realm P2P EndCap accepted end_cap_id=` |
 | Proposal | Proposer processor | `realm P2P proposal published proposal=` |
-| Non-proposer vote | Non-proposer processor | `realm P2P non-proposer vote published proposal=` |
+| Non-proposer vote | Non-proposer processor | `realm P2P vote published proposal=` |
 | Certificate | Proposer processor | `realm P2P certificate formed` |
 | HTTP submit | Proposer processor | `Submitting GUTA proof to Coordinator proposal=` |
 | Coordinator admission | Coordinator edge | `realm P2P certificate admitted realm=0` |
 | Proposer commit | Proposer processor | `Committed new realm block with checkpoint_id` |
 | Non-proposer FFS | Non-proposer processor | `Applied Realm proposal FFS` |
 
-Require the same 64-hex `end_cap_id` in forward and accept. Require the same 64-hex `proposal` identifier in proposal, vote, certificate, submit, and admission. Then correlate proposer commit and non-proposer FFS by the admitted inclusion checkpoint and resulting realm root; those two logs do not contain the proposal identifier. Require the certificate to show both validator signers or equivalent evidence with at least two verified votes. Source ownership for these needles is `psy_node_common/src/realm/edge/handler.rs:197-201,825-829`, `psy_node_common/src/realm/processor/core/process_block.rs:280-284,537-541,581-584,697-704,772-776`, `psy_cli/psy_node_cli/src/node/realm_p2p.rs:355-359`, and `psy_node_common/src/coordinator/edge/handler.rs:931-935`.
+Require the same 64-hex `end_cap_id` in forward and accept. Require the same 64-hex `proposal` identifier in proposal, vote, certificate, submit, and admission. Then correlate proposer commit and non-proposer FFS by the admitted inclusion checkpoint and resulting realm root; those two logs do not contain the proposal identifier. Require the certificate to show both validator signers or equivalent evidence with at least two verified votes. Source ownership for these needles includes `psy_node_common/src/realm/network/drive.rs` (`realm P2P vote published proposal=`), `psy_node_common/src/realm/edge/handler.rs` (EndCap forward/accept), `psy_node_common/src/realm/processor/core/process_block.rs` (proposal/certificate/commit), `psy_cli/psy_node_cli/src/node/realm_p2p.rs`, and `psy_node_common/src/coordinator/edge/handler.rs` (certificate admission).
 
 After inclusion, query `psy_get_checkpoint_global_state_roots` for the included checkpoint from Coordinator RPC and both realm-0 edge RPC endpoints. Require identical complete results across all three endpoints. Also require equal latest checkpoint identifiers on both realm edges. The RPC surfaces are defined in `psy_api_core/src/coordinator/standard_edge_rpc.rs:46-50,78-79` and `psy_api_core/src/realm/standard_edge_rpc.rs:78-82,128-133`.
 
@@ -667,7 +669,7 @@ Rollback units are: the globally shared verifier JSON plus localhost fingerprint
 | Secret local artifact; never package | `private_keys.json` | Section 6.1 trigger only |
 | Conditional generated DApp config | `psy-dapp/apps/bridge/src/config/faucetOperators.json` | Section 6.1 trigger only |
 | Conditional generated bundle | `client_prover/psy_prover/src/wallet/local_circuits.json` | Section 6.2 trigger only |
-| Manual replace (separate procedure) | `../psy-compiler/psy-precompiles/token/src/main.psy` and `usdt_token/src/main.psy` | Token privacy circuit fingerprints; see `docs/src/node/token-privacy-circuit-fingerprints.md` |
+| Manual replace (separate procedure) | `../psy-compiler/psy-precompiles/token/src/main.psy` and `usdt_token/src/main.psy` | Token privacy circuit fingerprints; see `docs/src/dev/token-privacy-circuit-fingerprints.md` |
 | Selected verifier replace | `psy-contracts/src/GnarkGroth16Verifier.sol` | `bridge_agg` trigger |
 | Selected verifier replace | `psy-contracts/src/DepositBatchVerifier.sol` | `deposit_append` trigger |
 | Selected verifier replace | `psy-contracts/src/WithdrawalClaimVerifier.sol` | `withdrawal_claim` trigger |

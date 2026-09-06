@@ -1,5 +1,7 @@
 # Devnet Launcher Reference
 
+> **Internal developer documentation** — repository-only. Not part of the published mdBook (`SUMMARY.md`). Do not mix into public Node docs.
+
 > Updated: 2026-09-06. Audience: developers and devnet operators.
 
 ## Abstract
@@ -8,8 +10,8 @@
 process construction, readiness, supervision, control commands, ports, persistent Anvil recovery, and teardown.
 Use the Make targets for the repository-supported operating lifecycle, and use direct launcher commands only when
 selecting a documented component set or diagnosing launcher behavior. The lifecycle procedure remains owned by
-`docs/src/node/devnet_lifecycle.md`; this reference explains how the launcher implements that procedure
-(`docs/src/node/devnet_lifecycle.md:5-7`; `Makefile:60-79`; `dev/locSetupV4.ts:5289-5648`).
+`docs/src/dev/devnet_lifecycle.md`; this reference explains how the launcher implements that procedure
+(`docs/src/dev/devnet_lifecycle.md:5-7`; `Makefile:60-79`; `dev/locSetupV4.ts:5289-5648`).
 
 ## Motivation
 
@@ -103,10 +105,10 @@ This document owns `dev/locSetupV4.ts` internals: parser behavior, startup selec
 ports, Anvil persistence, supervision, control commands, daemonized behavior, and current-source limitations
 (`dev/locSetupV4.ts:123-225`; `dev/locSetupV4.ts:3337-3753`; `dev/locSetupV4.ts:3788-5285`).
 
-`docs/src/node/devnet_lifecycle.md` remains the authority for fresh-start, restart, rollback, and verification
+`docs/src/dev/devnet_lifecycle.md` remains the authority for fresh-start, restart, rollback, and verification
 procedure; it explicitly names the supported Make entry points and defines their required operating order
-(`docs/src/node/devnet_lifecycle.md:5-7`; `docs/src/node/devnet_lifecycle.md:44-59`;
-`docs/src/node/devnet_lifecycle.md:93-146`). When this reference describes a direct launcher command, it describes
+(`docs/src/dev/devnet_lifecycle.md:5-7`; `docs/src/dev/devnet_lifecycle.md:44-59`;
+`docs/src/dev/devnet_lifecycle.md:93-146`). When this reference describes a direct launcher command, it describes
 source behavior, not a replacement lifecycle procedure.
 
 Persistent infrastructure means **Anvil, Scylla, Redis/Valkey, NATS, Nostr, and Envio backing services**. Applications
@@ -402,13 +404,13 @@ Coordinator edge HTTP/RPC = 1337 + edgeIndex
 Realm edge HTTP/RPC       = 13380 + RH + (S - 1)C + E
 Realm processor P2P TCP   = 41000 + 20R + S
 Realm edge P2P TCP        = 41100 + RP + (S - 1)C + E + 1
-Coordinator P2P bootnode  = 40999
+Coordinator P2P bootnode  = N/A
 Prove proxy               = 9999 + proxyIndex
 ```
 
 Local-devnet `validator_user_id` values are **not** `R * 2^20 + S`. The launcher binds each `(realm_id, sub_id)` to
 dedicated Strategy5 registrations (`0`, `1`, `3`, `4` for realms `0..1`), keeping registration `2` as the bridge
-relayer (`user_id` `524288`). See `docs/src/node/realm-p2p-validators.md` and `dev/locSetupV4.ts`
+relayer (`user_id` `524288`). See `docs/src/dev/realm-p2p-validators.md` and `dev/locSetupV4.ts`
 (`reservedValidatorRegistrationId` / `reservedValidatorUserId`).
 
 Every requested processor P2P, edge P2P, and Realm HTTP port is enumerated before startup. A topology is rejected
@@ -577,7 +579,7 @@ PURGE=1 make shutdown
 make restart-all
 ```
 
-These are the repository-supported lifecycle entry points (`docs/src/node/devnet_lifecycle.md:5-7`;
+These are the repository-supported lifecycle entry points (`docs/src/dev/devnet_lifecycle.md:5-7`;
 `Makefile:63-79`; `Makefile:99-106`). `make restart` requires the original foreground supervisor; it is not a new
 launcher startup (`Makefile:68-75`; `dev/locSetupV4.ts:5191-5223`).
 
@@ -927,7 +929,7 @@ Commands execute serially and the loop remains available until the server is clo
 
 - **Make for lifecycle, direct CLI for mechanics:** Make fixes the repository-supported full-stack counts and control
   entry points, while direct CLI exposes lower-level component selection (`Makefile:60-79`;
-  `docs/src/node/devnet_lifecycle.md:5-7`).
+  `docs/src/dev/devnet_lifecycle.md:5-7`).
 - **Paired Anvil state and deployment:** restoring chain storage without matching addresses, or addresses without the
   chain, would describe different Layer 1 histories; the launcher therefore fails closed on mismatch
   (`dev/locSetupV4.ts:2774-2783`).
@@ -957,7 +959,7 @@ Commands execute serially and the loop remains available until the server is clo
 5. `PSY_SKIP_KEYSTORE=1` replaces remote manifest/hash refresh with local existence checks, and `PSY_SKIP_BUILD=1`
    trusts current artifacts instead of rebuilding them; use both only under the lifecycle artifact gate
    (`dev/locSetupV4.ts:2319-2353`; `dev/locSetupV4.ts:1765-1800`;
-   `docs/src/node/devnet_lifecycle.md:24-42`).
+   `docs/src/dev/devnet_lifecycle.md:24-42`).
 6. The control socket is local and permissioned `0600`, but any process running as the same account can attempt its
    three lifecycle commands (`dev/locSetupV4.ts:5171-5189`; `dev/locSetupV4.ts:5270-5278`).
 7. Purge is intentionally destructive across both Layer 1 and Layer 2 state. Review the exact deletion set before

@@ -47,11 +47,10 @@
 - [Rust SDK](./sdk/rust.md)
 - [TypeScript SDK](./sdk/typescript.md)
 
-# SDKeys Documentation  
+# SDKeys Documentation
 - [SDKeys Overview](./sdkeys/overview.md)
 - [Signature Schemes](./sdkeys/signature-schemes.md)
 - [Wallet Management](./sdkeys/wallet-management.md)
-- [Advanced Circuits](./sdkeys/advanced-circuits.md)
 
 ---
 
@@ -67,12 +66,9 @@
 - [Installation](./node/installation.md)
 - [Configuration](./node/configuration.md)
 - [Getting Started](./node/getting_started.md)
-- [Genesis Generation](./node/genesis-generation.md)
-- [Devnet Startup, Shutdown, Restart, and Rollback](./node/devnet_lifecycle.md)
-- [Devnet Launcher Reference](./node/devnet-launcher-reference.md)
-- [Circuit and Verifier Operations](./node/circuit-and-verifier-operations.md)
-- [Token Privacy Circuit Fingerprints](./node/token-privacy-circuit-fingerprints.md)
-- [Realm P2P Validators](./node/realm-p2p-validators.md)
+
+<!-- Internal developer docs live under docs/src/dev/ and are intentionally
+     omitted from this SUMMARY (repository-only; never published). -->
 
 ---
 

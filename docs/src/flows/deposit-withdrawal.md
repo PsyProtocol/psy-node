@@ -40,7 +40,7 @@ The bridge connects an EVM L1 (e.g. Ethereum, Anvil) to the Psy L2. Two assets f
 |----------|---------|
 | `Router` | Entry point for deposits; delegates to `Gateway` |
 | `ERC20Gateway` | Handles ERC-20 token deposits; calls `Bridge.recordDepositFromGateway()` |
-| `Bridge` | Records deposit leaves, proves deposits via `batchAppend()`, releases withdrawals via `batchClaimWithdrawal()` |
+| `Bridge` | Records deposit leaves, proves deposits via `batchAppend()`, registers withdrawals via `batchClaimWithdrawal()` then settles via `claimPendingWithdrawal()` |
 
 ### L2 Components
 
@@ -50,7 +50,7 @@ The bridge connects an EVM L1 (e.g. Ethereum, Anvil) to the Psy L2. Two assets f
 | `withdrawal_tree` contract | Stores L2 withdrawal leaves |
 | Token contracts (e.g. PSY=0, USDT=4) | User balances and claim nullifier tracking |
 
-L2 `claim_deposit` binds the UPS session proof tree to `shield_claim_fingerprint` (the minifier fingerprint of `DepositInclusionCircuit`, protocol alias `ShieldDepositClaimCircuit`). Updating that constant follows `docs/src/node/token-privacy-circuit-fingerprints.md`.
+L2 `claim_deposit` binds the UPS session proof tree to `shield_claim_fingerprint` (the minifier fingerprint of `DepositInclusionCircuit`, protocol alias `ShieldDepositClaimCircuit`). Updating that constant follows `docs/src/dev/token-privacy-circuit-fingerprints.md`.
 
 ## 3. Deposit Flow (L1→L2)
 
@@ -225,13 +225,19 @@ The prove-proxy generates a Groth16 proof from the withdrawal claim proof:
 - Input: `subtree_proof` + `withdrawal` payload
 - Output: `solidity_proof[8]`, `public_inputs[18]`, `slot_data[1088]`
 
-### Step 5: Submit L1 Claim
+### Step 5: Submit L1 Claim (two-step)
 
-The relayer (or manual CLI) calls `Bridge.batchClaimWithdrawal()` on L1:
+The relayer (or manual CLI) first calls `Bridge.batchClaimWithdrawal()` on L1:
 
 - Submits the Groth16 proof and public inputs.
-- The Bridge verifies the proof, checks `claimedNullifiers[nonce]` is not already set, and releases the tokens.
+- The Bridge verifies the proof, checks `claimedNullifiers[nonce]` is not already set, and **registers a pending withdrawal** (`WithdrawalPendingCreated`). It does **not** transfer tokens in this call (`psy-contracts` `Bridge.sol` `batchClaimWithdrawal` → pending path).
+
+After `claimableAt`, the recipient (or authorized claimer) calls `Bridge.claimPendingWithdrawal()`:
+
+- Settles the pending withdrawal and transfers tokens (`_settlePendingWithdrawal`).
 - Emits `WithdrawalClaimed(nonce, recipient, token, amount)`.
+
+See `docs/src/flows/bridge-common-operations.md` for the authoritative pending-then-claim sequence.
 
 **Idempotency check:**
 
@@ -253,7 +259,7 @@ isClaimed = Bridge.claimedNullifiers(raw_nonce_bytes32)
 A complete deposit→claim→withdraw→claim cycle:
 
 1. **Deposit**: Lock tokens on L1 → relayer proves → L2 claim succeeds.
-2. **Withdraw**: Burn tokens on L2 → relayer appends → L1 claim releases tokens.
+2. **Withdraw**: Burn tokens on L2 → relayer appends → L1 `batchClaimWithdrawal` creates pending → `claimPendingWithdrawal` releases tokens.
 3. **Balance verification**:
    - L1 token balance: `initial - deposit_amount + withdrawal_amount`
    - L2 token balance: `0 + deposit_amount - withdrawal_amount`

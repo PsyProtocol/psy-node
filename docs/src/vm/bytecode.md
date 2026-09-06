@@ -639,3 +639,12 @@ The Psy VM bytecode provides a comprehensive instruction set that:
 - **Performance**: Optimized for zero-knowledge proof generation
 
 This bytecode abstraction allows high-level Psy contracts to compile down to efficient zero-knowledge circuits while maintaining the security properties required for decentralized applications.
+
+## 9. Additional opcodes (current `DPNOpType`)
+
+| Code | Name | Notes |
+|---:|---|---|
+| 80 | `GetSessionProofTreeRoot` | Session proof-tree root builtin |
+| 81 | `Keccak256` | Keccak digest builtin |
+
+Source: `client_prover/psy_vm/src/dpn/ops/op_types.rs`.

@@ -1,5 +1,9 @@
 # Psy Architecture: Horizontally Scalable Blockchain via PARTH and ZK Proofs
 
+> **STALE STORAGE NOTE (2026-09):** Runtime processors use **ScyllaDB** as the primary committed state backend (`startup_*_scylla`). Redis/Valkey and NATS remain supporting infra. Sections that describe Redis/KVQ as the primary Merkle/state store are historical.
+> **Missing current realm root path:** RealmFinalizeGUTA (63) + P2P Proposal/Certificate admission is documented in `docs/src/protocol/ProvingJobs.md` §2 and `docs/src/dev/realm-p2p-validators.md`.
+
+
 > Updated: 2026-09-03.
 
 ## Abstract

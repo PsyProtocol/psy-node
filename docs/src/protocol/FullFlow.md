@@ -1,5 +1,8 @@
 # Psy Protocol Wiki: Achieving Scalability with PARTH and ZK Proofs
 
+> **Currency note (2026-09):** Realm root proving uses `RealmFinalizeGUTA` (circuit type 63) plus a locally proved `WrappedSignatureProof` (64), then P2P Proposal/Certificate before Coordinator `psy_submit_guta`. See `docs/src/protocol/ProvingJobs.md` §2. Gadget names ending in `V2` are the current Plonky2 implementations.
+
+
 > Updated: 2026-09-03.
 
 ## Abstract

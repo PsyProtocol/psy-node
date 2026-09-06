@@ -76,7 +76,7 @@ Coordinator and realm processors:
 
 ### 2.3 Peer-to-peer validators
 
-Realm peer-to-peer validators exchange proposals, votes, and certificates. The current node command exposes identity, BLS key, listen address, bootnode, coordinator, validator-set, and epoch-rotation inputs (`psy_cli/psy_node_cli/src/subcommand.rs:60-88`).
+Realm peer-to-peer validators exchange proposals, votes, and certificates. The node CLI exposes local identity material (`--p2p-bls-key`, `--p2p-zk-key`, `--p2p-listen`, and related identity-key flags in `psy_cli/psy_node_cli/src/subcommand.rs`). Bootnodes, validator membership, and epoch rotation come from the selected network entry in `PSY_CONFIG_PATH` (`psy-genesis/config.json`), not from separate CLI validator-set flags. See `docs/src/dev/realm-p2p-validators.md`.
 
 ## 3. Proof Generation
 

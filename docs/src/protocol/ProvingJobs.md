@@ -47,41 +47,38 @@ This document describes the proving jobs architecture for both Realm and Coordin
 
 ## 2. Realm Proving Jobs
 
-### User Operations Tree
+> **Current source (2026-09):** Realm does **not** use circuits named `ProcessUserOp`, `AggregateUserOps`, or `RealmStateTransition`. Those names are obsolete. Authoritative circuit types live in `psy_core/src/job/job_id.rs` (`ProvingJobCircuitType`).
 
-```mermaid
-graph TB
-    subgraph "User Operations Leaves"
-        UO1[UserOp 1<br/>Circuit: ProcessUserOp]
-        UO2[UserOp 2<br/>Circuit: ProcessUserOp]
-        UO3[UserOp 3<br/>Circuit: ProcessUserOp]
-        UON[UserOp N<br/>Circuit: ProcessUserOp]
-    end
+### EndCap → GUTA → RealmFinalize
 
-    subgraph "Aggregation Layer"
-        AGG1[Aggregate UserOps<br/>Circuit: AggregateUserOps]
-        AGG2[Aggregate UserOps<br/>Circuit: AggregateUserOps]
-    end
-
-    subgraph "Root"
-        ROOT[Realm State Transition<br/>Circuit: RealmStateTransition]
-    end
-
-    UO1 --> AGG1
-    UO2 --> AGG1
-    UO3 --> AGG2
-    UON --> AGG2
-    AGG1 --> ROOT
-    AGG2 --> ROOT
+```text
+User EndCap proofs (submitted to realm edge)
+        |
+        v
+Realm GUTA aggregation tree
+  (GUTAVerifySingleEndCap / TwoEndCap / TwoGUTA / linear+upgrade variants)
+        |
+        +--> WrappedSignatureProof (64)  -- proved LOCALLY on the realm processor
+        |                                 (validator ZK private key never leaves the processor)
+        v
+RealmFinalizeGUTA (63)  -- proved by psy_worker_cli; depends on root GUTA + WrappedSignatureProof
+        |
+        v
+P2P Proposal / Votes / Certificate --> Coordinator psy_submit_guta(..., proposal, certificate)
 ```
 
-### Realm Circuit Details
+### Realm root circuit details
 
-| Circuit | Type | Public Inputs | Commitment Calculation |
-|---------|------|---------------|------------------------|
-| ProcessUserOp | Leaf | [0..4]: commitment<br/>[4..8]: worker_public_key<br/>[8..11]: pm_jobs_completed_stats<br/>[11..15]: user_op_hash | commitment = worker_public_key |
-| AggregateUserOps | Intermediate | [0..4]: commitment<br/>[4..8]: worker_public_key<br/>[8..11]: pm_jobs_completed_stats<br/>[11..15]: agg_hash | commitment = hash(hash(left.commitment, right.commitment), worker_public_key) |
-| RealmStateTransition | Root | [0..4]: commitment<br/>[4..8]: worker_public_key<br/>[8..11]: pm_jobs_completed_stats<br/>[11..15]: state_transition_hash | commitment = hash(hash(children), worker_public_key) |
+| Circuit | Type u32 | Who proves | Role |
+|---------|----------|------------|------|
+| User EndCap family | see job_id.rs | user / prove-proxy | Leaf transitions into realm GUTA |
+| GUTA aggregation variants | 8–13, 55–60, … | `psy_worker_cli` | Aggregate EndCaps / GUTAs |
+| WrappedSignatureProof | 64 | **Realm processor (local)** | Signs RealmFinalize action; private key stays local |
+| RealmFinalizeGUTA | 63 | `psy_worker_cli` | Realm root submitted with P2P Proposal+Certificate |
+
+Witness construction for finalization is `RealmGUTAPlanner::append_realm_finalize_guta` (`psy_node_common/src/guta_planner/realm_guta_planner.rs`). Circuit implementation: `psy_plonky2_circuits/src/guta_v2/circuits/realm_finalize_guta.rs`.
+
+Ordinary GUTA public-input layout (15 inputs) in §1 still applies to aggregation GUTA jobs. RealmFinalizeGUTA carries the finalized GUTA header hash as its expected public inputs commitment; do not use the obsolete ProcessUserOp table below historically.
 
 ## 3. Coordinator Proving Jobs
 

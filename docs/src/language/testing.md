@@ -55,7 +55,9 @@ Psy provides several assertion functions for testing:
 
 - `assert(condition, "message")` - Assert that a condition is true
 - `assert_eq(left, right, "message")` - Assert that two values are equal
-- `assert_ne(left, right, "message")` - Assert that two values are not equal
+- `assert(condition, "message")` - Assert that a condition is true
+- `assert_eq(left, right, "message")` - Assert that two values are equal
+- There is **no** `assert_ne` token in the Psy lexer; express inequality with `assert(!(a == b), ...)` or an equivalent `assert` form.
 
 Example:
 
@@ -67,7 +69,7 @@ fn test_assertions() {
     
     assert(x > y, "x should be greater than y");
     assert_eq(x - y, 5, "difference should be 5");
-    assert_ne(x, y, "x and y should not be equal");
+    assert(!(x == y), "x and y should not be equal");
 }
 ```
 
