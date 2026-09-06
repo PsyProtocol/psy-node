@@ -2253,13 +2253,13 @@ impl<
             .is_some();
         let has_global_user_proof = self
             .store
-            .db_select_one_single_checkpointed_object_value::<MerkleProofCore<N::QHash>>(
+            .db_select_one_single_checkpointed_object_value_and_ids::<MerkleProofCore<N::QHash>>(
                 &self.checkpointed_object_table,
                 CHECKPOINTED_OBJECT_TABLE_OBJ_ID_REALM_ROOT_TO_GLOBAL_USER_TREE_ROOT_MERKLE_PROOF,
                 checkpoint_id,
             )
             .await?
-            .is_some();
+            .is_some_and(|row| row.checkpoint_id == checkpoint_id);
         if has_state_roots && has_checkpoint_leaf && has_root_mapping && has_global_user_proof {
             Ok(Some(block_state))
         } else {
@@ -2559,12 +2559,14 @@ impl<
         unique_pending_id: u64,
     ) -> anyhow::Result<TagTreeMerkleProof<N::QHash>> {
         self.store
-            .db_select_one_single_checkpointed_object_value::<TagTreeMerkleProof<N::QHash>>(
+            .db_select_one_single_checkpointed_object_value_and_ids::<TagTreeMerkleProof<N::QHash>>(
                 &self.checkpointed_object_table,
                 CHECKPOINTED_OBJECT_TABLE_OBJ_ID_REALM_ROOT_TO_GLOBAL_REWARDS_TAG_TREE_ROOT_PROOF,
                 unique_pending_id,
             )
             .await?
+            .filter(|row| row.checkpoint_id == unique_pending_id)
+            .map(|row| row.value)
             .ok_or_else(|| anyhow::anyhow!("Rewards tree proof not found for unique_pending_id {}", unique_pending_id))
     }
 
@@ -2572,14 +2574,27 @@ impl<
         &self,
         checkpoint_id: u64,
     ) -> anyhow::Result<TagTreeMerkleProof<N::QHash>> {
-        self.store
-            .db_select_one_single_checkpointed_object_value::<TagTreeMerkleProof<N::QHash>>(
-                &self.checkpointed_object_table,
-                CHECKPOINTED_OBJECT_TABLE_OBJ_ID_REALM_ROOT_TO_GLOBAL_REWARDS_TAG_TREE_ROOT_PROOF,
-                checkpoint_id,
-            )
+        // Production writes rewards tops under pending IDs only. Resolve the exact
+        // checkpoint→pending mapping, then require the exact pending-ID row.
+        let (unique_pending_id, _) = self
+            .get_unique_pending_id_for_checkpoint_id(checkpoint_id)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("Rewards tree proof not found for checkpoint_id {}", checkpoint_id))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Rewards tree proof unavailable: no pending mapping for checkpoint_id {}",
+                    checkpoint_id
+                )
+            })?;
+        self.get_top_global_user_rewards_tree_proof_to_realm_at_unique_pending_id(unique_pending_id)
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "Rewards tree proof not found for checkpoint_id {} (pending_id {}): {}",
+                    checkpoint_id,
+                    unique_pending_id,
+                    err
+                )
+            })
     }
 
     async fn get_top_global_user_tree_proof_to_realm_root_at_checkpoint_id(&self, checkpoint_id: u64) -> anyhow::Result<MerkleProofCore<N::QHash>> {
@@ -2727,21 +2742,6 @@ impl<
                 &self.checkpointed_object_table,
                 CHECKPOINTED_OBJECT_TABLE_OBJ_ID_REALM_ROOT_TO_GLOBAL_REWARDS_TAG_TREE_ROOT_PROOF,
                 unique_pending_id,
-                merkle_proof,
-            )
-            .await
-    }
-
-    async fn set_realm_rewards_tag_tree_top_proof_at_checkpoint_id(
-        &self,
-        checkpoint_id: u64,
-        merkle_proof: &TagTreeMerkleProof<N::QHash>,
-    ) -> anyhow::Result<()> {
-        self.store
-            .db_insert_one_single_checkpointed_object(
-                &self.checkpointed_object_table,
-                CHECKPOINTED_OBJECT_TABLE_OBJ_ID_REALM_ROOT_TO_GLOBAL_REWARDS_TAG_TREE_ROOT_PROOF,
-                checkpoint_id,
                 merkle_proof,
             )
             .await

@@ -51,6 +51,7 @@ use psy_node_core::{
 
 use crate::realm::{
     edge::{error::RpcError, utils::end_cap::validate_end_cap_and_generate_node_data_for_edge},
+    processor::gatherers::realm_end_cap_gatherer::finalizer_user_tree_proofs,
     queue_key::RealmUserUpdateQueueKey,
 };
 use std::collections::{HashMap, HashSet};
@@ -62,6 +63,29 @@ use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 use crate::worker_whitelist::WhiteListCache;
 
 const END_CAP_PROOF_CIRCUIT_TYPE_U32: u32 = ProvingJobCircuitType::UserEndCap as u32;
+
+/// Sparse subtree reads are only safe inside the realm half of the user tree.
+/// Requests with `root_level` above the authenticated spine would otherwise
+/// return max-vintage stale siblings for coordinator levels.
+pub(crate) fn ensure_user_subtree_request_within_realm(
+    root_level: u8,
+    leaf_level: u8,
+    coordinator_global_user_tree_height: u8,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        root_level >= coordinator_global_user_tree_height,
+        "user-tree subtree root_level {} crosses authenticated spine boundary {}",
+        root_level,
+        coordinator_global_user_tree_height
+    );
+    anyhow::ensure!(
+        leaf_level >= root_level,
+        "user-tree subtree leaf_level {} is above root_level {}",
+        leaf_level,
+        root_level
+    );
+    Ok(())
+}
 pub struct RealmEdgeHandler<
     N: QNetworkTypesConfig,
     S: PsyRealmEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync,
@@ -328,6 +352,7 @@ impl<
     }
 
     pub async fn get_top_global_user_rewards_tree_proof_to_realm_at_checkpoint_id_internal(&self, checkpoint_id: u64) -> anyhow::Result<TagTreeMerkleProof<N::QHash>> {
+        // Checkpoint and pending-ID namespaces share one numeric column; resolve mapping first.
         self.db_reader.get_top_global_user_rewards_tree_proof_to_realm_at_checkpoint_id(checkpoint_id).await
     }
     pub async fn ensure_user_has_not_submitted(&self, user_id: u64, unique_pending_id: u64) -> anyhow::Result<()> {
@@ -369,6 +394,11 @@ impl<
             .get_top_global_user_rewards_tree_proof_to_realm_at_unique_pending_id(unique_pending_id)
             .await?;
         for proof in &mut tag_proofs {
+            anyhow::ensure!(
+                proof.root == top_proof.leaf.get_node_hash::<N::HasherBase>(),
+                "Realm rewards local root does not match top proof leaf at unique_pending_id {}",
+                unique_pending_id
+            );
             let local_proof_height = proof.siblings.len();
             proof.siblings.extend(top_proof.siblings.clone());
             proof.root = top_proof.root;
@@ -1278,7 +1308,15 @@ impl<
     }
 
     async fn get_user_tree_root(&self, checkpoint_id: u64) -> QRpcResult<N::QHash> {
-        res(self.db_reader.global_user_tree_get_root_hash(checkpoint_id).await)
+        // Exact checkpoint spine / metadata root — never sparse global_user_tree max-lookup.
+        res(async {
+            let top = self
+                .db_reader
+                .get_top_global_user_tree_proof_to_realm_root_at_checkpoint_id(checkpoint_id)
+                .await?;
+            Ok(top.root)
+        }
+        .await)
     }
 
     async fn get_user_tree_leaf_hash(&self, checkpoint_id: u64, user_id: u64) -> QRpcResult<N::QHash> {
@@ -1286,10 +1324,17 @@ impl<
     }
 
     async fn get_user_bottom_tree_merkle_proof(&self, root_level: u8, checkpoint_id: u64, user_id: u64) -> QRpcResult<MerkleProofCore<N::QHash>> {
-        res(self
-            .db_reader
-            .global_user_tree_get_merkle_proof_sub_tree(checkpoint_id, root_level, N::GLOBAL_USER_TREE_HEIGHT, user_id)
-            .await)
+        res(async {
+            ensure_user_subtree_request_within_realm(
+                root_level,
+                N::GLOBAL_USER_TREE_HEIGHT,
+                N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+            )?;
+            self.db_reader
+                .global_user_tree_get_merkle_proof_sub_tree(checkpoint_id, root_level, N::GLOBAL_USER_TREE_HEIGHT, user_id)
+                .await
+        }
+        .await)
     }
 
     async fn get_user_sub_tree_merkle_proof(
@@ -1299,14 +1344,27 @@ impl<
         leaf_level: u8,
         leaf_index: u64,
     ) -> QRpcResult<MerkleProofCore<N::QHash>> {
-        res(self
-            .db_reader
-            .global_user_tree_get_merkle_proof_sub_tree(checkpoint_id, root_level, leaf_level, leaf_index)
-            .await)
+        res(async {
+            ensure_user_subtree_request_within_realm(
+                root_level,
+                leaf_level,
+                N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+            )?;
+            self.db_reader
+                .global_user_tree_get_merkle_proof_sub_tree(checkpoint_id, root_level, leaf_level, leaf_index)
+                .await
+        }
+        .await)
     }
 
     async fn get_user_tree_merkle_proof(&self, checkpoint_id: u64, user_id: u64) -> QRpcResult<MerkleProofCore<N::QHash>> {
-        res(self.db_reader.global_user_tree_get_merkle_proof(checkpoint_id, user_id).await)
+        // Compose local sparse subtree + exact authenticated top spine (aaed92d6 pattern).
+        res(async {
+            let (proof, _) =
+                finalizer_user_tree_proofs::<N, _>(self.db_reader.as_ref(), checkpoint_id, user_id, self.realm_id_u64).await?;
+            Ok(proof)
+        }
+        .await)
     }
 
     async fn generate_batch_proof_miner_reward_proofs(
@@ -1959,6 +2017,38 @@ mod tests {
             format!(
                 "forwarded EndCap rejected: local edge is not primary for scheduled proposer {proposer} at target 25"
             )
+        );
+    }
+
+    #[test]
+    fn user_subtree_request_rejects_spine_crossing_root_level_zero() {
+        const COORDINATOR_HEIGHT: u8 = 12;
+        const GLOBAL_HEIGHT: u8 = 32;
+        let err = ensure_user_subtree_request_within_realm(0, GLOBAL_HEIGHT, COORDINATOR_HEIGHT).unwrap_err();
+        assert!(
+            err.to_string().contains("crosses authenticated spine"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn user_subtree_request_accepts_realm_boundary_root_level() {
+        const COORDINATOR_HEIGHT: u8 = 12;
+        const GLOBAL_HEIGHT: u8 = 32;
+        ensure_user_subtree_request_within_realm(COORDINATOR_HEIGHT, GLOBAL_HEIGHT, COORDINATOR_HEIGHT)
+            .expect("realm-boundary subtree request must be allowed");
+        ensure_user_subtree_request_within_realm(COORDINATOR_HEIGHT, COORDINATOR_HEIGHT, COORDINATOR_HEIGHT)
+            .expect("zero-height realm-boundary request must be allowed");
+    }
+
+    #[test]
+    fn user_subtree_request_rejects_leaf_above_root() {
+        const COORDINATOR_HEIGHT: u8 = 12;
+        let err = ensure_user_subtree_request_within_realm(COORDINATOR_HEIGHT + 1, COORDINATOR_HEIGHT, COORDINATOR_HEIGHT)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("leaf_level"),
+            "unexpected error: {err}"
         );
     }
 }

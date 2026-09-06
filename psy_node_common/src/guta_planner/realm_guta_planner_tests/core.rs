@@ -258,7 +258,7 @@ mod finalizer_user_proof_tests {
             if fresh {
                 db.global_user_tree_set_leaf_hash(2, 2 << N::REALM_GLOBAL_USER_TREE_HEIGHT, Hash::from_u64x4([55, 66, 77, 88])).await?;
             }
-            let (proof, realm_proof) = finalizer_user_tree_proofs::<N>(&db, 2, user_id, realm_id).await?;
+            let (proof, realm_proof) = finalizer_user_tree_proofs::<N, _>(&db, 2, user_id, realm_id).await?;
             assert_eq!(proof.root, db.get_checkpoint_global_state_roots(2).await?.user_tree_root);
             assert_eq!(proof.value, value);
             assert_eq!(proof.index, user_id);
@@ -278,7 +278,7 @@ mod finalizer_user_proof_tests {
         let top = db.global_user_tree_get_merkle_proof_sub_tree(
             1, 0, PsyRGPNetworkConfig::COORDINATOR_GLOBAL_USER_TREE_HEIGHT, 5).await?;
         db.global_user_tree_set_top_tree_merkle_proof(1, &top).await?;
-        let error = finalizer_user_tree_proofs::<PsyRGPNetworkConfig>(&db, 2, user_id, 5).await.unwrap_err();
+        let error = finalizer_user_tree_proofs::<PsyRGPNetworkConfig, _>(&db, 2, user_id, 5).await.unwrap_err();
         assert!(error.to_string().contains("User tree proof not found for checkpoint_id 2"), "{error:#}");
         Ok(())
     }

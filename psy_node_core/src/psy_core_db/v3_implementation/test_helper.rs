@@ -5,6 +5,7 @@ use parth_core::{
     felt::ToU64Value,
     protocol::core_types::QNetworkDatabaseTypes,
     utils::QPGenRandom,
+    QCoreProcCheckpointUniqueId,
 };
 use psy_data::v1::qdata::{
     checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
@@ -245,6 +246,7 @@ where
         self.test_checkpoint_leaf_and_roots().await?;
         self.test_pending_ids().await?;
         self.test_realm_specific_proofs().await?;
+        self.test_exact_global_user_proof_completeness().await?;
         self.test_user_objects().await?;
         self.test_contract_objects().await?;
         self.test_contract_tree_heights().await?;
@@ -420,33 +422,58 @@ where
         Ok(())
     }
 
-    async fn test_realm_specific_proofs(&self) -> anyhow::Result<()> {
+    pub async fn test_realm_specific_proofs(&self) -> anyhow::Result<()> {
         let db = &self.db;
         let checkpoint_id = 42;
         let unique_pending_id = 7;
+        let unique_id_struct: QCoreProcCheckpointUniqueId = 1;
 
-        // Test Rewards Tag Tree Proof
+        // Test Rewards Tag Tree Proof — production keys by pending ID only.
         let tag_proof = TagTreeMerkleProof::<N::QHash>::qp_rand_gen();
-
-        assert!(db
-            .get_top_global_user_rewards_tree_proof_to_realm_at_checkpoint_id(checkpoint_id)
-            .await
-            .is_err());
-        db.set_realm_rewards_tag_tree_top_proof_at_checkpoint_id(checkpoint_id, &tag_proof)
-            .await?;
-        let retrieved_tag_proof = db.get_top_global_user_rewards_tree_proof_to_realm_at_checkpoint_id(checkpoint_id).await?;
-        assert_eq!(tag_proof, retrieved_tag_proof);
 
         assert!(db
             .get_top_global_user_rewards_tree_proof_to_realm_at_unique_pending_id(unique_pending_id)
             .await
             .is_err());
+        assert!(db
+            .get_top_global_user_rewards_tree_proof_to_realm_at_checkpoint_id(checkpoint_id)
+            .await
+            .is_err());
+
         db.set_realm_rewards_tag_tree_top_proof_at_unique_pending_id(unique_pending_id, &tag_proof)
             .await?;
         let retrieved_tag_proof_pending = db
             .get_top_global_user_rewards_tree_proof_to_realm_at_unique_pending_id(unique_pending_id)
             .await?;
         assert_eq!(tag_proof, retrieved_tag_proof_pending);
+        assert!(
+            db.get_top_global_user_rewards_tree_proof_to_realm_at_unique_pending_id(8)
+                .await
+                .is_err(),
+            "pending 8 must not see pending 7 proof"
+        );
+
+        // Checkpoint lookup requires an exact checkpoint→pending mapping; no numeric fallback.
+        assert!(db
+            .get_top_global_user_rewards_tree_proof_to_realm_at_checkpoint_id(checkpoint_id)
+            .await
+            .is_err());
+        db.set_checkpoint_id_to_unique_pending_id_mapping(checkpoint_id, unique_pending_id, &unique_id_struct)
+            .await?;
+        let retrieved_via_checkpoint = db
+            .get_top_global_user_rewards_tree_proof_to_realm_at_checkpoint_id(checkpoint_id)
+            .await?;
+        assert_eq!(tag_proof, retrieved_via_checkpoint);
+
+        // Mapping checkpoint→pending 8 (no proof written there) must fail closed.
+        db.set_checkpoint_id_to_unique_pending_id_mapping(checkpoint_id, 8, &unique_id_struct)
+            .await?;
+        assert!(
+            db.get_top_global_user_rewards_tree_proof_to_realm_at_checkpoint_id(checkpoint_id)
+                .await
+                .is_err(),
+            "checkpoint mapped to pending 8 must not return pending 7 proof"
+        );
 
         // Test Global User Tree Proof
         let user_tree_proof = MerkleProofCore::<N::QHash>::qp_rand_gen();
@@ -460,6 +487,36 @@ where
         let retrieved_user_proof = db.get_top_global_user_tree_proof_to_realm_root_at_checkpoint_id(checkpoint_id).await?;
         assert_eq!(user_tree_proof, retrieved_user_proof);
 
+        Ok(())
+    }
+
+    /// P1-C regression: an older top spine must not satisfy completeness for checkpoint C.
+    pub async fn test_exact_global_user_proof_completeness(&self) -> anyhow::Result<()> {
+        let db = &self.db;
+        let c = 900u64;
+        let c_prev = 899u64;
+
+        let block = QEDL2BlockState::qp_rand_gen();
+        let leaf = PQEDCheckpointLeaf::<N::F, N::QHash>::qp_rand_gen();
+        let roots = PQEDCheckpointGlobalStateRoots::<N::QHash>::qp_rand_gen();
+        let root_hash = N::QHash::qp_rand_gen();
+        let top_prev = MerkleProofCore::<N::QHash>::qp_rand_gen();
+        let top_exact = MerkleProofCore::<N::QHash>::qp_rand_gen();
+
+        db.set_l2_block_state(c, &block).await?;
+        db.set_checkpoint_leaf_data(c, &leaf).await?;
+        db.set_checkpoint_global_state_roots(c, &roots).await?;
+        db.set_checkpoint_root_hash_to_id_mapping(root_hash, c).await?;
+        // Top only at C-1 — max-lookup would falsely treat C as complete.
+        db.global_user_tree_set_top_tree_merkle_proof(c_prev, &top_prev).await?;
+        assert!(
+            db.try_get_complete_l2_block_state(c).await?.is_none(),
+            "completeness must require an exact top at C, not C-1"
+        );
+
+        db.global_user_tree_set_top_tree_merkle_proof(c, &top_exact).await?;
+        let complete = db.try_get_complete_l2_block_state(c).await?;
+        assert_eq!(complete, Some(block));
         Ok(())
     }
 

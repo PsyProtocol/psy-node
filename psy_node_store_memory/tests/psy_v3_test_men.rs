@@ -227,3 +227,12 @@ async fn torn_pending_allocation_falls_back_then_skips_abandoned_id() -> anyhow:
     let simple_store = SimpleStoreEx::setup(db).await?;
     simple_store.store.test_pending_ids().await
 }
+
+#[tokio::test]
+async fn exact_vintage_rewards_and_completeness_regressions() -> anyhow::Result<()> {
+    let db = Arc::new(InMemoryTestStore::new());
+    let simple_store = SimpleStoreEx::setup(db).await?;
+    simple_store.store.test_realm_specific_proofs().await?;
+    simple_store.store.test_exact_global_user_proof_completeness().await?;
+    Ok(())
+}

@@ -36,7 +36,9 @@ use psy_data::{
 };
 use psy_io::tokio::{TokioFileLike, TokioLikeFileSystem};
 use psy_node_core::{
-    psy_core_db::traits::full::{PsyNodeGlobalUserTreeDatabaseReader, PsyRealmProcessorStore},
+    psy_core_db::traits::full::{
+        PsyNodeCheckpointRealmSpecificDatabaseReader, PsyNodeGlobalUserTreeDatabaseReader, PsyRealmProcessorStore,
+    },
     psy_temp_db::StandardProcessorTempDBStoreBase,
     qblob::{
         blob_type::{QBlobDataType, QBlobMerkleNodeTreeType},
@@ -484,7 +486,7 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
         let checkpoint_tree_proof = self.tree_store.checkpoint_tree_get_merkle_proof(checkpoint_id, checkpoint_id).await?;
         let anchor_checkpoint_leaf = self.tree_store.get_checkpoint_leaf_data(anchor_id).await?;
         let anchor_checkpoint_tree_proof = self.tree_store.checkpoint_tree_get_merkle_proof(checkpoint_id, anchor_id).await?;
-        let (validator_user_tree_proof, old_realm_root_proof) = finalizer_user_tree_proofs::<N>(
+        let (validator_user_tree_proof, old_realm_root_proof) = finalizer_user_tree_proofs::<N, _>(
             self.tree_store.as_ref(), checkpoint_id, user_id, self.realm_id_u64).await?;
         let validator_index = psy_data::guta::realm_finalize::validator_tree_index(self.realm_id_u64 as u32, self.realm_sub_id_u64 as u16);
         let validator_tree_proof = self.tree_store.validator_tree_get_merkle_proof(checkpoint_id, validator_index).await?;
@@ -531,12 +533,20 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
     }
 }
 
-pub(crate) async fn finalizer_user_tree_proofs<N: parth_core::protocol::core_types::QNetworkDatabaseTypes>(
-    store: &(dyn PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync),
+pub(crate) async fn finalizer_user_tree_proofs<N, S>(
+    store: &S,
     checkpoint_id: u64,
     user_id: u64,
     realm_id: u64,
-) -> anyhow::Result<(MerkleProofCore<N::QHash>, MerkleProofCore<N::QHash>)> {
+) -> anyhow::Result<(MerkleProofCore<N::QHash>, MerkleProofCore<N::QHash>)>
+where
+    N: parth_core::protocol::core_types::QNetworkDatabaseTypes,
+    S: PsyNodeCheckpointRealmSpecificDatabaseReader<N::F, N::QHash>
+        + PsyNodeGlobalUserTreeDatabaseReader<N::QHash>
+        + Send
+        + Sync
+        + ?Sized,
+{
     let top = store.get_top_global_user_tree_proof_to_realm_root_at_checkpoint_id(checkpoint_id).await?;
     anyhow::ensure!(N::GLOBAL_USER_TREE_HEIGHT as usize == N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT as usize + N::REALM_GLOBAL_USER_TREE_HEIGHT as usize
         && top.siblings.len() == N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT as usize

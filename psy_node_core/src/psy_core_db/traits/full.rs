@@ -362,11 +362,6 @@ pub trait PsyNodeCheckpointObjectDatabaseWriter<F, Hash> {
         unique_pending_id: u64,
         merkle_proof: &TagTreeMerkleProof<Hash>,
     ) -> anyhow::Result<()>;
-    async fn set_realm_rewards_tag_tree_top_proof_at_checkpoint_id(
-        &self,
-        checkpoint_id: u64,
-        merkle_proof: &TagTreeMerkleProof<Hash>,
-    ) -> anyhow::Result<()>;
 }
 
 #[async_trait]
