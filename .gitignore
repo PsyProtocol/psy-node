@@ -73,6 +73,7 @@ psy-contracts/test/deployments/
 BUG.md
 # Generated ts-rs bindings.
 psy_node_common/bindings/
+client_prover/psy_vm/bindings/
 
 AGENTS.md
 .pi
