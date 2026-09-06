@@ -2398,7 +2398,16 @@ impl WalletSession {
             .exec_deferred_contract_call_local(F::from_canonical_u64(DEFAULT_CALLER_CONTRACT_ID_U64), &sdc.fn_def, cfc_call_inputs)
             .await?;
 
-        let signature_input = DPNSoftwareDefinedSignatureInput { cfc_input: cfc_proof_input };
+        let nonce = user_session_mgr.require_lps()?.get_nonce();
+        let session_sig = psy_vm::ups::signature::SoftwareDefinedSessionSigBinding::from_header_poseidon(
+            &user_session_mgr.get_current_ups_header(),
+            nonce,
+        );
+
+        let signature_input = DPNSoftwareDefinedSignatureInput {
+            cfc_input: cfc_proof_input,
+            session_sig,
+        };
 
         let current_header = user_session_mgr.get_current_ups_header();
         let current_checkpoint_id = current_header.session_start_context.checkpoint_id.to_canonical_u64();
@@ -2424,7 +2433,7 @@ impl WalletSession {
         let current_header = user_session_mgr.get_current_ups_header();
         let user_id = current_header.session_start_context.start_session_user_leaf.user_id.to_canonical_u64();
         let checkpoint_id = current_header.session_start_context.checkpoint_id.to_canonical_u64();
-        let user_leaf = current_header.session_start_context.start_session_user_leaf.clone();
+        let user_leaf = current_header.current_state.user_leaf.clone();
         let checkpoint_tree_root = current_header.session_start_context.checkpoint_tree_root;
 
         let transaction_record = user_session_mgr.require_lps()?.last_transaction_record();
@@ -2446,9 +2455,14 @@ impl WalletSession {
         )
         .await;
 
+        let nonce = user_session_mgr.require_lps()?.get_nonce();
+        let session_sig =
+            psy_vm::ups::signature::SoftwareDefinedSessionSigBinding::from_header_poseidon(&current_header, nonce);
+
         let plonky2_input = Plonky2SoftwareDefinedSignatureInput {
             state_reader_results: state_reader.to_results(),
             circuit_inputs,
+            session_sig,
         };
 
         Ok(SignContext::new(fingerprint)
