@@ -166,6 +166,7 @@ fn imt_leaf_matches_key<F: RichField>(leaf: &psy_client_data::qdata::imt_contrac
 #[cfg_attr(target_arch = "wasm32", maybe_async::maybe_async(?Send))]
 pub trait PsyCmdInputWitnessResolver<F: RichField + PrimeField64, H: MerkleZeroHasherWithMarkedLeaf<QHashOut<F>> + FieldQHasher<F> + Send> {
     async fn resolve_vec(&mut self, state_cmd: &DPNStateCmd<u64>) -> anyhow::Result<PsyCmdWithInputAndWitness<F>>;
+    async fn current_contract_proof(&mut self) -> anyhow::Result<MerkleProofCore<QHashOut<F>>>;
 }
 //(sub_slot_length-2)%4
 /*
@@ -197,6 +198,10 @@ impl<
         R: PsyReadCommandProcessorSync<F> + psy_client_data::qstore::imm::cmd_processor::QUserIdManager + QMetaDataStoreReaderSync<F> + Send + Sync,
     > PsyCmdInputWitnessResolver<F, H> for PsyLocalProvingSessionStore<F, R, H>
 {
+    async fn current_contract_proof(&mut self) -> anyhow::Result<MerkleProofCore<QHashOut<F>>> {
+        self.get_self_user_contract_tree_leaf(self.get_current_contract_id()).await
+    }
+
     async fn resolve_vec(&mut self, state_cmd: &DPNStateCmd<u64>) -> anyhow::Result<PsyCmdWithInputAndWitness<F>> {
         tracing::debug!("Resolving state command: {:#?}", state_cmd);
         let current_contract_id = self.get_current_contract_id();
@@ -2064,11 +2069,12 @@ pub struct PsyCmdWithInputAndWitness<F: RichField> {
 #[serde(bound = "for<'de2> F: Deserialize<'de2>")]
 pub struct PsyEvalSessionResult<F: RichField> {
     pub cmd_witnesses: Vec<PsyCmdWithInputAndWitness<F>>,
+    pub signature_nonce: Option<F>,
 }
 
 impl<F: RichField> PsyEvalSessionResult<F> {
     pub fn new() -> Self {
-        Self { cmd_witnesses: Vec::new() }
+        Self { cmd_witnesses: Vec::new(), signature_nonce: None }
     }
 }
 
@@ -2169,7 +2175,7 @@ impl<F: RichField + PrimeField64> PsyEvalSessionResult<F> {
     }
 
     pub async fn exec_deferred_contract_call_local<S>(
-        self,
+        mut self,
         sesh: &mut S,
         caller_contract_id: F,
         fn_def: &DPNFunctionCircuitDefinition,
@@ -2181,6 +2187,7 @@ impl<F: RichField + PrimeField64> PsyEvalSessionResult<F> {
             + PsyReadLocalProvingSessionStoreMut<F>
             + PsyCmdInputWitnessResolver<F, <S as PsyReadLocalProvingSessionStoreMut<F>>::Hasher>,
     {
+        self.signature_nonce = Some(sesh.get_nonce());
         self.exec_deferred_contract_call(
             sesh,
             F::from_canonical_u64(DEFAULT_CALLER_CONTRACT_ID_U64),
@@ -2224,6 +2231,7 @@ impl<F: RichField + PrimeField64> PsyEvalSessionResult<F> {
         let mut call_data_ctx = sesh
             .get_call_start_data(sesh.get_current_contract_id(), F::from_canonical_u32(fn_def.method_id), &inputs)
             .await?;
+        let current_contract_proof = sesh.current_contract_proof().await?;
 
         let inputs_clone = inputs.clone();
         let mut executor = SimpleDPNExecutor::<F>::new_with_contract_ctx(
@@ -2232,7 +2240,7 @@ impl<F: RichField + PrimeField64> PsyEvalSessionResult<F> {
             sesh.get_current_contract_id(),
             sesh.get_current_caller_contract_id(),
             sesh.get_current_start_checkpoint_id(),
-            sesh.get_nonce(),
+            self.signature_nonce.unwrap_or(start_session_ctx.start_session_user_leaf.nonce),
             start_session_ctx.start_session_user_leaf.public_key.0.elements,
             sesh.get_q_recursion_proof_tree_root().0.elements,
         );
@@ -2383,6 +2391,7 @@ impl<F: RichField + PrimeField64> PsyEvalSessionResult<F> {
             events,
             cmd_witnesses: self.cmd_witnesses,
             session_proof_tree_root: sesh.get_q_recursion_proof_tree_root(),
+            current_contract_proof,
             tx_input_ctx: input_ctx,
         })
     }

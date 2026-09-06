@@ -18,6 +18,10 @@ use psy_client_data::{
     traits::qdatastore::qmetadata::QMetaDataStoreReaderSync,
 };
 use psy_crypto::hash::merkle::core::MerkleProofCore;
+use psy_client_data::qdata::checkpoint::{PsyCheckpointLeaf, PsyCheckpointGlobalStateRoots};
+use psy_client_data::qstore::imm::cmd::QSRCmdGetCheckpointLeafData;
+use psy_client_data::config::store_config::{UserContractTreeStore, PsyFelt};
+use psy_client_data::models::kvq_merkle::model::{KVQSemiFixedConfigMerkleTreeModelCore, KVQSemiFixedConfigMerkleTreeModelReaderCore};
 use serde::{Deserialize, Serialize};
 
 use crate::dpn::ops::state_cmd::data::{
@@ -30,6 +34,7 @@ use crate::dpn::ops::state_cmd::data::{
 pub struct StateReaderResults<F: RichField> {
     pub state: UserContractState<F>,
     pub user_tree_root: QHashOut<F>,
+    pub checkpoint: Option<(PsyCheckpointLeaf<F>, PsyCheckpointGlobalStateRoots<F>)>,
     #[serde(default)]
     pub aux_user_leaves: Vec<PsyUserLeaf<F>>,
     pub state_cmds: Vec<DPNStateCmd<F>>,
@@ -44,6 +49,7 @@ pub struct StateReader<
 > {
     pub state: UserContractState<F>,
     pub user_tree_root: QHashOut<F>,
+    pub checkpoint: Option<(PsyCheckpointLeaf<F>, PsyCheckpointGlobalStateRoots<F>)>,
     pub cmd_store: PsyCmdStoreWithCache<F, R>,
     pub state_tree_store: KVQSimpleMemoryBackingStore,
     pub merkel_proofs: Vec<MerkleProofCore<QHashOut<F>>>,
@@ -63,6 +69,7 @@ impl<
         Self {
             state,
             user_tree_root: QHashOut::default(),
+            checkpoint: None,
             cmd_store,
             state_tree_store,
             merkel_proofs: Vec::new(),
@@ -75,6 +82,7 @@ impl<
         StateReaderResults {
             state: self.state.clone(),
             user_tree_root: self.user_tree_root,
+            checkpoint: self.checkpoint.clone(),
             aux_user_leaves: self.aux_user_leaves.clone(),
             state_cmds: self.state_cmds.clone(),
             merkel_proofs: self.merkel_proofs.clone(),
@@ -120,13 +128,32 @@ impl<
         Ok(merkel_proof_f)
     }
     pub async fn get_self_user_current_contract_state_slot_hash(&mut self, slot_index: F) -> anyhow::Result<QHashOut<F>> {
+        let contract_proof = self
+            .cmd_store
+            .resolve_get_merkle_proof_mut(&QSRMerkleCmd::GetUserContractTreeMerkleProof(QSRMerkleCmdGetUserContractTreeMerkleProof {
+                checkpoint_id: self.state.checkpoint_id.to_canonical_u64(),
+                user_id: self.state.user_leaf.user_id.to_canonical_u64(),
+                contract_id: self.state.contract_id.to_canonical_u64() as u32,
+            }))
+            .await?;
+        let checkpoint_id = self.state.checkpoint_id.to_canonical_u64();
+        let user_id = self.state.user_leaf.user_id.to_canonical_u64();
+        let contract_id = self.state.contract_id.to_canonical_u64();
+        let base_contract_proof = serde_json::from_str::<MerkleProofCore<QHashOut<PsyFelt>>>(&serde_json::to_string(&contract_proof)?)?;
+        UserContractTreeStore::<KVQSimpleMemoryBackingStore>::injest_merkle_proof_sfc(&mut self.state_tree_store, user_id, checkpoint_id, &base_contract_proof)?;
+        let local_contract_proof = UserContractTreeStore::<KVQSimpleMemoryBackingStore>::get_leaf_sfc(&self.state_tree_store, checkpoint_id + 1, user_id, contract_id)?;
+        let contract_proof = serde_json::from_str::<MerkleProofCore<QHashOut<F>>>(&serde_json::to_string(&local_contract_proof)?)?;
         let merkle_proof = self
             .get_user_contract_state_tree_merkle_proof(self.state.checkpoint_id, self.state.user_leaf.user_id, self.state.contract_id, slot_index)
             .await?;
+        let id = UserContractStateTreeId::<KVQSimpleMemoryBackingStore>::new(user_id, contract_id as u32, merkle_proof.siblings.len() as u8);
+        let local_slot_proof = id.get_leaf_ucs(&self.state_tree_store, checkpoint_id + 1, slot_index.to_canonical_u64())?;
+        let merkle_proof = serde_json::from_str::<MerkleProofCore<QHashOut<F>>>(&serde_json::to_string(&local_slot_proof)?)?;
         tracing::info!("merkle_proof: {}", serde_json::to_string_pretty(&merkle_proof)?);
 
         let value = merkle_proof.value.clone();
 
+        self.merkel_proofs.push(contract_proof);
         self.merkel_proofs.push(merkle_proof);
         self.state_cmds.push(DPNStateCmd::GetSelfUserCurrentContractStateSlotHash(
             DPNStateCmdGetSelfUserCurrentContractStateSlotHash { slot_index },
@@ -326,6 +353,11 @@ impl<
 
     pub async fn get_other_user_contract_state_slot_hash(&mut self, user_id: F, contract_id: F, slot_index: F) -> anyhow::Result<QHashOut<F>> {
         let checkpoint_id = self.state.checkpoint_id.to_canonical_u64();
+        if self.checkpoint.is_none() {
+            let leaf = self.cmd_store.resolve_get_checkpoint_leaf_mut(&QSRCmdGetCheckpointLeafData { checkpoint_id }).await?;
+            let roots = self.cmd_store.read_store.get_checkpoint_global_state_roots(checkpoint_id).await?;
+            self.checkpoint = Some((leaf, roots));
+        }
         let user_id_u64 = user_id.to_canonical_u64();
         let contract_id_u64 = contract_id.to_canonical_u64();
 

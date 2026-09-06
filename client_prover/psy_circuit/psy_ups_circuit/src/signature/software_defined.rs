@@ -38,9 +38,7 @@ use psy_network_circuit::gadgets::qdata::{
 use psy_network_circuit::ups::gadgets::ups_signature_data::PsyUserProvingSessionSignatureDataCompactGadget;
 use psy_vm::{
     dpn::vm::def::DPNFunctionCircuitDefinition,
-    ups::signature::{
-        DPNSoftwareDefinedSignatureInput, Plonky2SoftwareDefinedSignatureInput, SoftwareDefinedSessionSigBinding,
-    },
+    ups::signature::{DPNSoftwareDefinedSignatureInput, Plonky2SoftwareDefinedSignatureInput},
 };
 
 use crate::signature::state_reader::StateReaderGadget;
@@ -49,41 +47,40 @@ type C = PoseidonGoldilocksConfig;
 type GF = GoldilocksField;
 const D: usize = 2;
 
-fn set_session_sig_witness(
+fn set_sig_hash_witness(
     pw: &mut PartialWitness<GF>,
     sig_data: &PsyUserProvingSessionSignatureDataCompactGadget,
     sign_context: &SignContextGadget,
     nonce: Target,
     start_user_leaf: &PsyUserLeafGadget,
-    binding: &SoftwareDefinedSessionSigBinding,
-    start_leaf: &psy_client_data::qdata::user::PsyUserLeaf<GF>,
+    host_sig_data: &psy_client_data::qdata::ups_signature::PsyUserProvingSessionSignatureDataCompact<GF>,
+    host_sign_context: &psy_client_data::qdata::user_contract_state::SignContext<GF>,
+    host_nonce: GF,
+    host_start_leaf: &psy_client_data::qdata::user::PsyUserLeaf<GF>,
 ) -> anyhow::Result<()> {
-    sig_data.set_witness(pw, &binding.sig_data)?;
-    pw.set_hash_target(sign_context.checkpoint_tree_root, binding.sign_context.checkpoint_tree_root.0)?;
-    sign_context.user_leaf.set_witness(pw, &binding.sign_context.user_leaf)?;
-    pw.set_target(nonce, binding.nonce)?;
-    start_user_leaf.set_witness(pw, start_leaf)?;
+    sig_data.set_witness(pw, host_sig_data)?;
+    pw.set_hash_target(sign_context.checkpoint_tree_root, host_sign_context.checkpoint_tree_root.0)?;
+    sign_context.user_leaf.set_witness(pw, &host_sign_context.user_leaf)?;
+    pw.set_target(nonce, host_nonce)?;
+    start_user_leaf.set_witness(pw, host_start_leaf)?;
     Ok(())
 }
 
-/// Bind EndCap-equivalent sighash: compute `sig_hash` from session fields and pin policy anchors.
-fn enforce_session_sighash_binding(
+/// Circuit equivalent of `compute_sighash_from_header` / `get_sig_action_for_user` → `sig_hash`.
+fn compute_sig_hash(
     builder: &mut CircuitBuilder<GF, D>,
     sig_data: &PsyUserProvingSessionSignatureDataCompactGadget,
     sign_context: &SignContextGadget,
     start_user_leaf: &PsyUserLeafGadget,
     nonce: Target,
 ) -> HashOutTarget {
-    // start leaf hash must match the leaf we witness
     let start_hash = start_user_leaf.to_hash::<PoseidonHash, GF, D>(builder);
     builder.connect_hashes(start_hash, sig_data.start_user_leaf_hash);
 
-    // EndCap: current.nonce == start.nonce before bump; same user_id / public_key
     builder.connect(start_user_leaf.nonce, sign_context.user_leaf.nonce);
     builder.connect(start_user_leaf.user_id, sign_context.user_leaf.user_id);
     builder.connect_hashes(start_user_leaf.public_key, sign_context.user_leaf.public_key);
 
-    // end_user_leaf_hash = hash(current leaf with nonce := final nonce)
     let mut end_user_leaf = sign_context.user_leaf;
     end_user_leaf.nonce = nonce;
     let end_hash = end_user_leaf.to_hash::<PoseidonHash, GF, D>(builder);
@@ -130,6 +127,7 @@ impl DPNSoftwareDefinedSignatureGadget {
     ) -> Self {
         let private_key = builder.add_virtual_hash();
         let circuit_inputs = builder.add_virtual_targets(fn_def.circuit_inputs.len());
+        let nonce = builder.add_virtual_target();
 
         let fn_builder_gadget = PsyContractFunctionBuilderGadget::add_virtual_to::<PoseidonHash, GF, D>(
             builder,
@@ -138,6 +136,7 @@ impl DPNSoftwareDefinedSignatureGadget {
             session_proof_tree_height as usize,
             circuit_inputs.clone(),
             force_four_align,
+            Some(nonce),
         );
 
         let start_contract_state_tree_root = fn_builder_gadget.tx_ctx_header.transaction_call_start_ctx.start_contract_state_tree_root;
@@ -147,7 +146,6 @@ impl DPNSoftwareDefinedSignatureGadget {
         let sig_data = PsyUserProvingSessionSignatureDataCompactGadget::add_virtual_to(builder);
         let sign_context = SignContextGadget::add_virtual_to(builder);
         let start_user_leaf = PsyUserLeafGadget::create_virtual(builder);
-        let nonce = builder.add_virtual_target();
 
         let session_start = &fn_builder_gadget.tx_ctx_header.proving_session_start_ctx;
         let call_start = &fn_builder_gadget.tx_ctx_header.transaction_call_start_ctx;
@@ -164,7 +162,7 @@ impl DPNSoftwareDefinedSignatureGadget {
         builder.connect(call_start.start_user_event_index, sign_context.user_leaf.event_index);
         builder.connect(session_start.checkpoint_id, sign_context.user_leaf.last_checkpoint_id);
 
-        let sig_hash = enforce_session_sighash_binding(builder, &sig_data, &sign_context, &start_user_leaf, nonce);
+        let sig_hash = compute_sig_hash(builder, &sig_data, &sign_context, &start_user_leaf, nonce);
 
         let public_key_param = get_zk_public_key_param::<C, D>(builder, &private_key);
         let public_inputs_hash = builder.hash_two_to_one::<PoseidonHash>(sig_hash, public_key_param);
@@ -217,18 +215,17 @@ impl DPNSoftwareDefinedSignatureGadget {
             .ok_or_else(|| anyhow::anyhow!("Minifier chain not initialized"))?;
 
         let expected = signature_input
-            .session_sig
             .sig_data
             .get_sig_action_for_user::<PoseidonHash>(
                 PSY_NETWORK_MAGIC,
-                signature_input.session_sig.sign_context.user_leaf.user_id,
-                signature_input.session_sig.nonce,
-                signature_input.session_sig.sign_context.clone(),
+                signature_input.sign_context.user_leaf.user_id,
+                signature_input.nonce,
+                signature_input.sign_context.clone(),
             )
             .get_qhash::<PoseidonHash>();
         anyhow::ensure!(
             expected == sig_hash,
-            "SD prove sighash mismatch: host {} vs session binding {}",
+            "SD prove sighash mismatch: host {} vs sig_hash {}",
             sig_hash,
             expected
         );
@@ -236,14 +233,16 @@ impl DPNSoftwareDefinedSignatureGadget {
         let mut pw = PartialWitness::<GF>::new();
         pw.set_hash_target(self.private_key, private_key.0)?;
         pw.set_target_arr(&self.circuit_inputs, &signature_input.cfc_input.inputs)?;
-        set_session_sig_witness(
+        set_sig_hash_witness(
             &mut pw,
             &self.sig_data,
             &self.sign_context,
             self.nonce,
             &self.start_user_leaf,
-            &signature_input.session_sig,
-            &signature_input.session_sig.start_session_user_leaf,
+            &signature_input.sig_data,
+            &signature_input.sign_context,
+            signature_input.nonce,
+            &signature_input.start_session_user_leaf,
         )?;
 
         pw.set_hash_target(
@@ -297,6 +296,7 @@ impl Plonky2SoftwareDefinedSignatureGadget {
         let state_reader_gadget = StateReaderGadget::new(builder, contract_state_tree_height);
 
         let sig_data = PsyUserProvingSessionSignatureDataCompactGadget::add_virtual_to(builder);
+        builder.connect_hashes(state_reader_gadget.checkpoint_leaf_hash, sig_data.checkpoint_leaf_hash);
         let start_user_leaf = PsyUserLeafGadget::create_virtual(builder);
         let nonce = builder.add_virtual_target();
 
@@ -306,7 +306,7 @@ impl Plonky2SoftwareDefinedSignatureGadget {
             user_leaf: state_reader_gadget.state.user_leaf,
         };
 
-        let sig_hash = enforce_session_sighash_binding(builder, &sig_data, &sign_context, &start_user_leaf, nonce);
+        let sig_hash = compute_sig_hash(builder, &sig_data, &sign_context, &start_user_leaf, nonce);
 
         let public_key_param = get_zk_public_key_param::<C, D>(builder, &private_key);
         let public_inputs_hash = builder.hash_two_to_one::<PoseidonHash>(sig_hash, public_key_param);
@@ -363,28 +363,27 @@ impl Plonky2SoftwareDefinedSignatureGadget {
             .ok_or_else(|| anyhow::anyhow!("Minifier chain not initialized"))?;
 
         let expected = input
-            .session_sig
             .sig_data
             .get_sig_action_for_user::<PoseidonHash>(
                 PSY_NETWORK_MAGIC,
-                input.session_sig.sign_context.user_leaf.user_id,
-                input.session_sig.nonce,
-                input.session_sig.sign_context.clone(),
+                input.sign_context.user_leaf.user_id,
+                input.nonce,
+                input.sign_context.clone(),
             )
             .get_qhash::<PoseidonHash>();
         anyhow::ensure!(
             expected == sig_hash,
-            "SD prove sighash mismatch: host {} vs session binding {}",
+            "SD prove sighash mismatch: host {} vs sig_hash {}",
             sig_hash,
             expected
         );
 
         anyhow::ensure!(
-            input.state_reader_results.state.user_leaf == input.session_sig.sign_context.user_leaf,
+            input.state_reader_results.state.user_leaf == input.sign_context.user_leaf,
             "Plonky2 SD StateReader user_leaf must equal signed SignContext user_leaf"
         );
         anyhow::ensure!(
-            input.state_reader_results.state.checkpoint_tree_root == input.session_sig.sign_context.checkpoint_tree_root,
+            input.state_reader_results.state.checkpoint_tree_root == input.sign_context.checkpoint_tree_root,
             "Plonky2 SD StateReader checkpoint_tree_root must equal signed SignContext"
         );
 
@@ -392,14 +391,16 @@ impl Plonky2SoftwareDefinedSignatureGadget {
         pw.set_hash_target(self.private_key, private_key.0)?;
         pw.set_target_arr(&self.circuit_inputs, &input.circuit_inputs)?;
         self.state_reader_gadget.set_witness(&mut pw, &input.state_reader_results)?;
-        set_session_sig_witness(
+        set_sig_hash_witness(
             &mut pw,
             &self.sig_data,
             &self.sign_context,
             self.nonce,
             &self.start_user_leaf,
-            &input.session_sig,
-            &input.session_sig.start_session_user_leaf,
+            &input.sig_data,
+            &input.sign_context,
+            input.nonce,
+            &input.start_session_user_leaf,
         )?;
 
         let inner_proof = circuit_data.prove(pw)?;
@@ -506,7 +507,7 @@ mod tests {
     };
     use psy_config::network_constants::PSY_NETWORK_MAGIC;
     use psy_crypto::hash::traits::qhashable::QFieldHashable;
-    use psy_vm::ups::signature::{Plonky2SoftwareDefinedSignatureInput, SoftwareDefinedSessionSigBinding};
+    use psy_vm::ups::signature::Plonky2SoftwareDefinedSignatureInput;
     use psy_vm::ups::state_reader::StateReaderResults;
 
     use super::Plonky2SoftwareDefinedSignatureGadget;
@@ -537,10 +538,18 @@ mod tests {
         }
     }
 
-    fn sample_binding(user_id: u64, nonce: u64) -> SoftwareDefinedSessionSigBinding {
+    fn sample_sig_hash_fields(
+        user_id: u64,
+        nonce: u64,
+    ) -> (
+        PsyUserProvingSessionSignatureDataCompact<F>,
+        SignContext<F>,
+        PsyUserLeaf<F>,
+        F,
+    ) {
         let start = sample_leaf(user_id, nonce);
-        let current = start;
-        let mut end = current;
+        let current = sample_leaf(user_id, nonce);
+        let mut end = sample_leaf(user_id, nonce);
         let final_nonce = F::from_canonical_u64(nonce + 1);
         end.nonce = final_nonce;
 
@@ -555,16 +564,11 @@ mod tests {
             checkpoint_tree_root: qh(13, 14, 15, 16),
             user_leaf: current,
         };
-        SoftwareDefinedSessionSigBinding {
-            sig_data,
-            sign_context,
-            start_session_user_leaf: start,
-            nonce: final_nonce,
-        }
+        (sig_data, sign_context, start, final_nonce)
     }
 
     #[test]
-    fn plonky2_sd_wires_session_sighash_not_free_hash() {
+    fn plonky2_sd_wires_sig_hash_not_free_hash() {
         let config = CircuitConfig::standard_recursion_config();
         let mut builder = CircuitBuilder::<F, D>::new(config);
         let gadget = Plonky2SoftwareDefinedSignatureGadget::add_virtual_to(&mut builder, 1, 0);
@@ -579,15 +583,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plonky2_sd_prove_rejects_policy_session_mismatch() {
+    async fn plonky2_sd_prove_rejects_policy_sig_hash_mismatch() {
         let config = CircuitConfig::standard_recursion_config();
         let mut builder = CircuitBuilder::<F, D>::new(config);
         let mut gadget = Plonky2SoftwareDefinedSignatureGadget::add_virtual_to(&mut builder, 1, 0);
         gadget.build_circuit(builder).expect("build");
 
-        let binding = sample_binding(7, 0);
+        let (sig_data, sign_context, start_session_user_leaf, nonce) = sample_sig_hash_fields(7, 0);
         let mismatched_state = UserContractState::new(
-            binding.sign_context.checkpoint_tree_root,
+            sign_context.checkpoint_tree_root,
             sample_leaf(99, 0),
             QHashOut::ZERO,
             F::from_canonical_u64(0),
@@ -598,21 +602,24 @@ mod tests {
             state_reader_results: StateReaderResults {
                 state: mismatched_state,
                 user_tree_root: QHashOut::ZERO,
+                checkpoint: None,
                 aux_user_leaves: vec![],
                 state_cmds: vec![],
                 merkel_proofs: vec![],
             },
             circuit_inputs: vec![],
-            session_sig: binding.clone(),
+            sig_data: sig_data.clone(),
+            sign_context: sign_context.clone(),
+            start_session_user_leaf,
+            nonce,
         };
 
-        let sighash = binding
-            .sig_data
+        let sighash = sig_data
             .get_sig_action_for_user::<PoseidonHash>(
                 PSY_NETWORK_MAGIC,
-                binding.sign_context.user_leaf.user_id,
-                binding.nonce,
-                binding.sign_context,
+                sign_context.user_leaf.user_id,
+                nonce,
+                sign_context,
             )
             .get_qhash::<PoseidonHash>();
 

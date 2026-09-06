@@ -2,6 +2,7 @@ use kvq::traits::KVQSerializable;
 use plonky2::{field::goldilocks_field::GoldilocksField, hash::hash_types::RichField};
 use psy_client_common::data::qhashout::QHashOut;
 use psy_client_data::dpn::{cfc_context_input::DapenCFCUserTransactionInputContext, event::PsyUserEventRecord};
+use psy_crypto::hash::merkle::core::MerkleProofCore;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
@@ -16,6 +17,7 @@ pub struct DapenContractFunctionCircuitInput<F: RichField> {
     pub events: Vec<PsyUserEventRecord<F>>,
     pub cmd_witnesses: Vec<PsyCmdWithInputAndWitness<F>>,
     pub session_proof_tree_root: QHashOut<F>,
+    pub current_contract_proof: MerkleProofCore<QHashOut<F>>,
     pub tx_input_ctx: DapenCFCUserTransactionInputContext<F>,
 }
 

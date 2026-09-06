@@ -79,6 +79,7 @@ where
             session_proof_tree_height,
             inputs.clone(),
             force_four_align,
+            None,
         );
 
         let inner_public_inputs_hash = fn_builder_gadget.tx_ctx_header.to_hash::<C::Hasher, C::F, D>(&mut builder);

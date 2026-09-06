@@ -16,6 +16,7 @@ use psy_common_circuit::hash::merkle::gadgets::merkle_proof::MerkleProofGadget;
 use psy_common_circuit::traits::CreatableTarget;
 use psy_config::network_constants::{GLOBAL_CONTRACT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT};
 use psy_network_circuit::gadgets::qdata::{user::PsyUserLeafGadget, user_contract_state::UserContractStateGadget};
+use psy_network_circuit::gadgets::qdata::{checkpoint::PsyCheckpointLeafGadget, checkpoint_state_roots::PsyCheckpointGlobalStateRootsGadget};
 use psy_vm::dpn::ops::state_cmd::data::{
     DPNStateCmd, DPNStateCmdGetOtherUserContractStateSlotHash, DPNStateCmdGetSelfUserCurrentContractStateSlotHash,
     DPNStateCmdGetSelfUserExternalContractStateSlotHash,
@@ -26,6 +27,8 @@ pub struct StateReaderGadget<F: RichField + Extendable<D>, const D: usize> {
     pub state: UserContractStateGadget,
     /// Checkpoint-authenticated global user tree root (witness).
     pub user_tree_root: HashOutTarget,
+    pub checkpoint_leaf_hash: HashOutTarget,
+    pub checkpoint: Option<(PsyCheckpointLeafGadget, PsyCheckpointGlobalStateRootsGadget)>,
     pub contract_state_tree_height: u8,
     pub merkel_proofs: Vec<MerkleProofGadget>,
     pub aux_user_leaves: Vec<PsyUserLeafGadget>,
@@ -36,9 +39,12 @@ impl<F: RichField + Extendable<D>, const D: usize> StateReaderGadget<F, D> {
     pub fn new(builder: &mut CircuitBuilder<F, D>, contract_state_tree_height: u8) -> Self {
         let state = UserContractStateGadget::add_virtual_to(builder);
         let user_tree_root = builder.add_virtual_hash();
+        let checkpoint_leaf_hash = builder.add_virtual_hash();
         Self {
             state,
             user_tree_root,
+            checkpoint_leaf_hash,
+            checkpoint: None,
             contract_state_tree_height,
             merkel_proofs: Vec::new(),
             aux_user_leaves: Vec::new(),
@@ -49,6 +55,11 @@ impl<F: RichField + Extendable<D>, const D: usize> StateReaderGadget<F, D> {
     pub fn set_witness(&self, pw: &mut PartialWitness<F>, results: &psy_vm::ups::state_reader::StateReaderResults<F>) -> anyhow::Result<()> {
         self.state.set_witness(pw, &results.state)?;
         pw.set_hash_target(self.user_tree_root, results.user_tree_root.0)?;
+        if let Some((leaf, roots)) = &self.checkpoint {
+            let (leaf_value, roots_value) = results.checkpoint.as_ref().ok_or_else(|| anyhow::anyhow!("missing checkpoint authentication witness"))?;
+            leaf.set_witness(pw, leaf_value)?;
+            roots.set_witness(pw, roots_value)?;
+        }
 
         self.state_cmds
             .iter()
@@ -85,6 +96,11 @@ impl<F: RichField + Extendable<D>, const D: usize> StateReaderGadget<F, D> {
         builder: &mut CircuitBuilder<F, D>,
         slot_index: F,
     ) -> anyhow::Result<HashOutTarget> {
+        let contract_proof = MerkleProofGadget::add_virtual_to::<PoseidonHash, F, D>(builder, GLOBAL_CONTRACT_TREE_HEIGHT as usize);
+        builder.connect_hashes(contract_proof.root, self.state.user_leaf.user_state_tree_root);
+        builder.connect(contract_proof.index, self.state.contract_id);
+        builder.connect_hashes(contract_proof.value, self.state.start_contract_state_root);
+        self.merkel_proofs.push(contract_proof);
         let merkle_proof_gadget = MerkleProofGadget::add_virtual_to::<PoseidonHash, F, D>(builder, self.contract_state_tree_height as usize);
         builder.connect_hashes(merkle_proof_gadget.root, self.state.start_contract_state_root);
         let expected_slot_index_target = builder.constant(slot_index);
@@ -317,6 +333,16 @@ impl<F: RichField + Extendable<D>, const D: usize> StateReaderGadget<F, D> {
         slot_index: F,
         contract_state_tree_height: u8,
     ) -> anyhow::Result<HashOutTarget> {
+        if self.checkpoint.is_none() {
+            let leaf = PsyCheckpointLeafGadget::create_virtual(builder);
+            let roots = PsyCheckpointGlobalStateRootsGadget::create_virtual(builder);
+            let roots_hash = roots.to_hash::<PoseidonHash, F, D>(builder);
+            let leaf_hash = leaf.to_hash::<PoseidonHash, F, D>(builder);
+            builder.connect_hashes(roots_hash, leaf.global_chain_root);
+            builder.connect_hashes(leaf_hash, self.checkpoint_leaf_hash);
+            builder.connect_hashes(roots.user_tree_root, self.user_tree_root);
+            self.checkpoint = Some((leaf, roots));
+        }
         let expected_user_id = builder.constant(user_id);
         let expected_contract_id = builder.constant(contract_id);
         let expected_slot_index = builder.constant(slot_index);

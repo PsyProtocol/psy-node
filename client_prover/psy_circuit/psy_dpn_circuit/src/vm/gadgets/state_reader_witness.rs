@@ -650,6 +650,9 @@ impl StateReaderGadget {
         input: &DapenContractFunctionCircuitInput<F>,
         fn_def: &DPNFunctionCircuitDefinition,
     ) -> anyhow::Result<()> {
+        if let Some(proof) = &self.current_contract_proof {
+            proof.set_witness_generic::<W, F>(witness, F::from_noncanonical_u64(input.current_contract_proof.index), input.current_contract_proof.value, &input.current_contract_proof.siblings)?;
+        }
         anyhow::ensure!(
             fn_def.state_commands.len() == input.cmd_witnesses.len(),
             "state command/witness count mismatch: commands={} witnesses={}",

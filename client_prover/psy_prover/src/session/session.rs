@@ -2399,14 +2399,18 @@ impl WalletSession {
             .await?;
 
         let nonce = user_session_mgr.require_lps()?.get_nonce();
-        let session_sig = psy_vm::ups::signature::SoftwareDefinedSessionSigBinding::from_header_poseidon(
-            &user_session_mgr.get_current_ups_header(),
-            nonce,
-        );
+        let (sig_data, sig_sign_context, start_session_user_leaf) =
+            psy_vm::ups::signature::sig_hash_fields_from_header_poseidon(
+                &user_session_mgr.get_current_ups_header(),
+                nonce,
+            );
 
         let signature_input = DPNSoftwareDefinedSignatureInput {
             cfc_input: cfc_proof_input,
-            session_sig,
+            sig_data,
+            sign_context: sig_sign_context,
+            start_session_user_leaf,
+            nonce,
         };
 
         let current_header = user_session_mgr.get_current_ups_header();
@@ -2456,13 +2460,16 @@ impl WalletSession {
         .await;
 
         let nonce = user_session_mgr.require_lps()?.get_nonce();
-        let session_sig =
-            psy_vm::ups::signature::SoftwareDefinedSessionSigBinding::from_header_poseidon(&current_header, nonce);
+        let (sig_data, sig_sign_context, start_session_user_leaf) =
+            psy_vm::ups::signature::sig_hash_fields_from_header_poseidon(&current_header, nonce);
 
         let plonky2_input = Plonky2SoftwareDefinedSignatureInput {
             state_reader_results: state_reader.to_results(),
             circuit_inputs,
-            session_sig,
+            sig_data,
+            sign_context: sig_sign_context,
+            start_session_user_leaf,
+            nonce,
         };
 
         Ok(SignContext::new(fingerprint)

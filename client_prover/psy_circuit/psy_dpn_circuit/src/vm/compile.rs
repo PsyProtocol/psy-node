@@ -9,6 +9,8 @@ use psy_common_circuit::{
     u32::multiple_comparison::list_lte_circuit,
 };
 use psy_network_circuit::gadgets::qdata::cfc_context_input::DapenCFCUserTransactionInputContextGadget;
+use psy_common_circuit::hash::merkle::gadgets::merkle_proof::MerkleProofGadget;
+use psy_config::network_constants::GLOBAL_CONTRACT_TREE_HEIGHT;
 use psy_vm::dpn::{
     ops::{op_types::DPNOpType, state_cmd::data::DPNStateCmd},
     vm::def::DPNFunctionCircuitDefinition,
@@ -42,11 +44,12 @@ impl PsyContractFunctionBuilderGadget {
         session_proof_tree_height: usize,
         inputs: Vec<Target>,
         force_four_align: bool,
+        signature_nonce: Option<Target>,
     ) -> Self {
         let tx_ctx_header = DapenCFCUserTransactionInputContextGadget::add_virtual_to::<H, F, D>(builder);
         let session_proof_tree_root = builder.add_virtual_hash();
 
-        let state_reader = StateReaderGadget::new(
+        let mut state_reader = StateReaderGadget::new(
             tx_ctx_header.proving_session_start_ctx.state_roots.clone(),
             tx_ctx_header.transaction_call_start_ctx.start_user_contract_tree_root,
             tx_ctx_header.transaction_call_start_ctx.start_deferred_tx_debt_tree_root,
@@ -58,6 +61,11 @@ impl PsyContractFunctionBuilderGadget {
             tx_ctx_header.proving_session_start_ctx.checkpoint_leaf.stats.clone(),
             tx_ctx_header.proving_session_start_ctx.checkpoint_tree_root,
         );
+        let contract_proof = MerkleProofGadget::add_virtual_to::<H, F, D>(builder, GLOBAL_CONTRACT_TREE_HEIGHT as usize);
+        builder.connect_hashes(contract_proof.root, tx_ctx_header.transaction_call_start_ctx.start_user_contract_tree_root);
+        builder.connect(contract_proof.index, tx_ctx_header.transaction_call_start_ctx.call_data.contract_id);
+        builder.connect_hashes(contract_proof.value, state_reader.start_contract_state_root);
+        state_reader.current_contract_proof = Some(contract_proof);
 
         let mut g = Self {
             cmd_results: Vec::new(),
@@ -67,7 +75,8 @@ impl PsyContractFunctionBuilderGadget {
             outputs: Vec::new(),
         };
 
-        let new_outputs = g.eval_session::<H, F, D>(builder, fn_def, inputs);
+        let nonce = signature_nonce.unwrap_or(g.tx_ctx_header.proving_session_start_ctx.start_session_user_leaf.nonce);
+        let new_outputs = g.eval_session::<H, F, D>(builder, fn_def, inputs, nonce);
         g.outputs = new_outputs;
         g
     }
@@ -97,6 +106,7 @@ impl PsyContractFunctionBuilderGadget {
         builder: &mut CircuitBuilder<F, D>,
         fn_def: &DPNFunctionCircuitDefinition,
         inputs: Vec<Target>,
+        nonce: Target,
     ) -> Vec<Target> {
         let inputs_length_target = builder.constant_u64(inputs.len() as u64);
         let inputs_hash = builder.safe_hash_fixed_length::<H>(&inputs);
@@ -107,7 +117,7 @@ impl PsyContractFunctionBuilderGadget {
             self.tx_ctx_header.transaction_call_start_ctx.call_data.contract_id,
             self.tx_ctx_header.transaction_call_start_ctx.call_data.caller_contract_id,
             self.tx_ctx_header.proving_session_start_ctx.checkpoint_id,
-            self.tx_ctx_header.proving_session_start_ctx.start_session_user_leaf.nonce,
+            nonce,
             self.tx_ctx_header.proving_session_start_ctx.start_session_user_leaf.public_key,
             self.session_proof_tree_root,
         );
