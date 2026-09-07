@@ -9,6 +9,50 @@ This directory owns all BSC Testnet-specific deployment configuration.
 
 For the cloud profile, start with [`gcp/README.md`](gcp/README.md).
 
+## Current ownership and frontend sources
+
+These historical single-chain scripts already belong to the node deployment
+branch (`deploy/multi-chain-gcp`); they do not live in the DApp product
+worktree. Current three-chain deployments use
+[`../multi-chain/gcp/README.md`](../multi-chain/gcp/README.md) for GCP and
+[`../local-multichain/README.md`](../local-multichain/README.md) for local
+testing. Do not copy old single-chain frontend defaults over those profiles.
+
+The local BSC profile no longer requires a dedicated sibling DApp worktree.
+It resolves the frontend source in this order:
+
+1. `BSC_PSY_DAPP_DIR`, including an explicit override in `full-stack.env`.
+2. The shared `PSY_DAPP_DIR` override.
+3. This deployment checkout's `psy-dapp` submodule (`$PARTH_ROOT/psy-dapp`).
+
+Existing ignored `full-stack.env` files are not rewritten. Before reusing
+one, remove its retired frontend path or set `BSC_PSY_DAPP_DIR` to an
+available, compatible checkout. Do not regenerate Genesis, replace a gitlink,
+or change a deployed network to tidy a source path.
+
+This is a source-path migration, not a claim that the current multichain DApp
+supports every legacy `bsc-testnet` config schema. Frontend publication remains
+disabled by default in this historical profile. For historical frontend
+reproduction, explicitly select a matching DApp revision; use the current
+multichain profiles for normal frontend work.
+
+The retired DApp branches remain on `PsyProtocol/psy-dapp`:
+
+- `feat/add-zalalena-bsc-faucet` at
+  `745d85920789a43ce1297e22a80df573d3819d35`.
+- `feat/bsc-testnet-network-support` at
+  `bf09fa7604922c3adf9293d54755443d547497e8`.
+
+The local cleanup archive also preserves their Git histories and worktree
+files. No part of the cleanup merges their old frontend code into product.
+
+Run the source-path regression tests without Docker, network requests, or
+starting any services:
+
+```bash
+node --test deploy/bsc-testnet/test-source-paths.mjs
+```
+
 ## Local Preparation
 
 This directory starts an isolated local EVM with BSC Testnet's chain ID and

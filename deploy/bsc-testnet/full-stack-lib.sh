@@ -12,7 +12,8 @@ fi
 : "${BSC_RUNTIME_PARTH_DIR:=$WORKSPACE_HOME/psy-node-bsc-testnet}"
 : "${BSC_PSY_CONTRACTS_DIR:=$WORKSPACE_HOME/psy-contracts-bsc-testnet}"
 : "${BSC_PSY_GENESIS_DIR:=$WORKSPACE_HOME/psy-genesis-bsc-testnet}"
-: "${BSC_PSY_DAPP_DIR:=$WORKSPACE_HOME/psy-dapp-bsc-testnet}"
+# Reuse the deployment cohort; historical frontend checkouts are optional.
+: "${BSC_PSY_DAPP_DIR:=${PSY_DAPP_DIR:-$PARTH_ROOT/psy-dapp}}"
 : "${PSY_SERVICES_HOME:=$WORKSPACE_HOME/psy-services-cloud-deploy}"
 : "${BSC_LOCAL_BUILD:=0}"
 : "${BSC_LOCAL_GENESIS_USE_LLD:=0}"
