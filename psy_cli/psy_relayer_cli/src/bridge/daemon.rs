@@ -35,6 +35,7 @@ use serde::{Deserialize, Serialize};
 
 use psy_cli_common::key_utils::load_wallet_key_info;
 use crate::bridge::{
+    claim_backoff,
     claim_withdrawals,
     constants::{
         BRIDGE_USER_ID_U64, DEFAULT_DEPLOYMENTS_NETWORK, DEFAULT_L1_RPC_URL, DEPOSIT_TREE_CONTRACT_ID, WITHDRAWAL_TREE_CONTRACT_ID,
@@ -253,6 +254,14 @@ pub(crate) struct DaemonState {
     /// retried next round. The key is leaf_hash.
     #[serde(default, alias = "failed_claim_withdrawals")]
     pending_claim_withdrawals: HashMap<String, propose_withdrawals::PendingWithdrawal>,
+    /// Backoff bookkeeping for the entries above, keyed by leaf_hash.
+    #[serde(default)]
+    claim_retry: HashMap<String, claim_backoff::ClaimRetryState>,
+    /// Withdrawals that ran out of attempts. Nothing retries these; they are
+    /// kept so the stuck funds stay traceable and can be re-armed by hand.
+    #[serde(default)]
+    retired_claim_withdrawals:
+        HashMap<String, claim_backoff::RetiredClaim<propose_withdrawals::PendingWithdrawal>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -273,6 +282,11 @@ struct MultichainDaemonState {
     finalized_chains: HashSet<u8>,
     #[serde(default)]
     pending_claim_withdrawals: HashMap<String, propose_withdrawals::PendingWithdrawal>,
+    #[serde(default)]
+    claim_retry: HashMap<String, claim_backoff::ClaimRetryState>,
+    #[serde(default)]
+    retired_claim_withdrawals:
+        HashMap<String, claim_backoff::RetiredClaim<propose_withdrawals::PendingWithdrawal>>,
 }
 
 async fn create_wallet_session(
@@ -731,6 +745,8 @@ where
     DispatchFuture: Future<Output = T>,
 {
     let mut pending_claim_withdrawals = state.pending_claim_withdrawals.clone();
+    let mut claim_retry = state.claim_retry.clone();
+    let mut retired_claim_withdrawals = state.retired_claim_withdrawals.clone();
     for withdrawal in current_round_withdrawals {
         pending_claim_withdrawals
             .entry(withdrawal.leaf_hash.clone())
@@ -743,6 +759,8 @@ where
             &DaemonState {
                 last_finalized_checkpoint: state.last_finalized_checkpoint,
                 pending_claim_withdrawals,
+                claim_retry,
+                retired_claim_withdrawals,
             },
         )?;
         return Ok(PostL2Orchestration::Deferred);
@@ -969,11 +987,22 @@ async fn run_multichain(
         if state.finalized_chains.len() == chains.len() {
             tokio::time::sleep(Duration::from_secs(2)).await;
             for chain in &chains {
-                let claims = state.pending_claim_withdrawals.values()
-                    .filter(|w| w.destination_chain_index == u64::from(chain.chain_index)).cloned().collect::<Vec<_>>();
+                let now_unix = claim_backoff::now_unix();
+                let claims = claims_due_now(&state.pending_claim_withdrawals, &state.claim_retry, now_unix)
+                    .into_iter()
+                    .filter(|w| w.destination_chain_index == u64::from(chain.chain_index))
+                    .collect::<Vec<_>>();
                 if claims.is_empty() { continue; }
                 if let Ok(report) = chain.l1.claim_withdrawals(&claims, &chain.config, to_checkpoint).await {
                     apply_claim_report(&mut state.pending_claim_withdrawals, &report);
+                    record_claim_outcome(
+                        &claims,
+                        &report,
+                        &mut state.pending_claim_withdrawals,
+                        &mut state.claim_retry,
+                        &mut state.retired_claim_withdrawals,
+                        now_unix,
+                    );
                 }
             }
             state.last_finalized_checkpoint = to_checkpoint;
@@ -1157,6 +1186,9 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path)
                     continue;
                 }
             };
+        // Backoff bookkeeping travels with the pending set through the round.
+        let mut claim_retry = state.claim_retry.clone();
+        let mut retired_claim_withdrawals = state.retired_claim_withdrawals.clone();
 
         // Append-only / no-confirmed-range rounds still retry durable pending
         // claims after safe L2 handling. No new finalize range is required.
@@ -1168,6 +1200,8 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path)
                     &provider,
                     &config,
                     &mut pending_claim_withdrawals,
+                    &mut claim_retry,
+                    &mut retired_claim_withdrawals,
                     from_checkpoint,
                     state.last_finalized_checkpoint,
                     is_catchup_batch,
@@ -1181,6 +1215,8 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path)
                 &DaemonState {
                     last_finalized_checkpoint: state.last_finalized_checkpoint,
                     pending_claim_withdrawals,
+                    claim_retry,
+                    retired_claim_withdrawals,
                 },
             ) {
                 tracing::error!(
@@ -1213,6 +1249,8 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path)
                     &provider,
                     &config,
                     &mut pending_claim_withdrawals,
+                    &mut claim_retry,
+                    &mut retired_claim_withdrawals,
                     from_checkpoint,
                     state.last_finalized_checkpoint,
                     is_catchup_batch,
@@ -1226,6 +1264,8 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path)
                 &DaemonState {
                     last_finalized_checkpoint: state.last_finalized_checkpoint,
                     pending_claim_withdrawals,
+                    claim_retry,
+                    retired_claim_withdrawals,
                 },
             ) {
                 tracing::error!(
@@ -1334,6 +1374,8 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path)
             &DaemonState {
                 last_finalized_checkpoint: state.last_finalized_checkpoint,
                 pending_claim_withdrawals: pending_claim_withdrawals.clone(),
+                claim_retry: claim_retry.clone(),
+                retired_claim_withdrawals: retired_claim_withdrawals.clone(),
             },
         ) {
             tracing::error!(error = %e, "failed to persist pending claims before finalize");
@@ -1351,6 +1393,8 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path)
                         &provider,
                         &config,
                         &mut pending_claim_withdrawals,
+                        &mut claim_retry,
+                        &mut retired_claim_withdrawals,
                         from_checkpoint,
                         to_checkpoint,
                         is_catchup_batch,
@@ -1363,6 +1407,8 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path)
                 let finalized_state = DaemonState {
                     last_finalized_checkpoint: to_checkpoint,
                     pending_claim_withdrawals,
+                    claim_retry,
+                    retired_claim_withdrawals,
                 };
                 match persist_finalized_state_then_cleanup_proof(
                     &state_path,
@@ -2035,6 +2081,93 @@ pub(crate) async fn run_l2_bridge_round_with_l1_provider(
     .await
 }
 
+/// The pending claims that are due for another attempt right now.
+///
+/// A claim that has failed is held back until its backoff expires, and one that
+/// has exhausted its attempts is never returned. Everything a round does for a
+/// withdrawal — the claim-proof fetch from psy-services, and the Groth16 batch
+/// proof from prove-proxy — hangs off this list, so filtering here is what
+/// actually stops the work.
+fn claims_due_now(
+    pending: &HashMap<String, propose_withdrawals::PendingWithdrawal>,
+    retry: &HashMap<String, claim_backoff::ClaimRetryState>,
+    now_unix: u64,
+) -> Vec<propose_withdrawals::PendingWithdrawal> {
+    pending
+        .values()
+        .filter(|w| claim_backoff::is_due(retry.get(&w.leaf_hash), now_unix))
+        .cloned()
+        .collect()
+}
+
+/// Book one round's outcome against the durable retry state.
+///
+/// A claim is counted as failed when it was attempted and did not resolve —
+/// not merely when it appears in `failure_reasons`. A withdrawal that falls out
+/// of a round without being named anywhere is precisely the case that used to
+/// retry forever in silence.
+fn record_claim_outcome(
+    attempted: &[propose_withdrawals::PendingWithdrawal],
+    report: &claim_withdrawals::BatchWithdrawalsReport,
+    pending: &mut HashMap<String, propose_withdrawals::PendingWithdrawal>,
+    retry: &mut HashMap<String, claim_backoff::ClaimRetryState>,
+    retired: &mut HashMap<
+        String,
+        claim_backoff::RetiredClaim<propose_withdrawals::PendingWithdrawal>,
+    >,
+    now_unix: u64,
+) {
+    let resolved: HashSet<&str> = report.resolved_leaf_hashes.iter().map(String::as_str).collect();
+
+    for withdrawal in attempted {
+        let leaf_hash = withdrawal.leaf_hash.as_str();
+        if resolved.contains(leaf_hash) {
+            claim_backoff::clear(retry, leaf_hash);
+            continue;
+        }
+
+        let reason = report
+            .failure_reasons
+            .get(leaf_hash)
+            .cloned()
+            .unwrap_or_else(|| "claim did not resolve and reported no reason".to_string());
+        let state = claim_backoff::record_failure(retry, leaf_hash, &reason, now_unix);
+
+        if claim_backoff::is_exhausted(&state) {
+            // Stop paying for proofs, keep the record. The funds are stuck and
+            // this needs a person, so it is an error, not a warning.
+            tracing::error!(
+                leaf_hash,
+                attempts = state.attempts,
+                reason = %state.last_reason,
+                destination_chain_index = withdrawal.destination_chain_index,
+                "withdrawal claim retired after exhausting its attempts; no further proofs will be requested for it"
+            );
+            if let Some(w) = pending.remove(leaf_hash) {
+                retired.insert(
+                    leaf_hash.to_string(),
+                    claim_backoff::RetiredClaim {
+                        withdrawal: w,
+                        attempts: state.attempts,
+                        last_reason: state.last_reason.clone(),
+                        retired_at_unix: now_unix,
+                    },
+                );
+            }
+            claim_backoff::clear(retry, leaf_hash);
+        } else {
+            tracing::warn!(
+                leaf_hash,
+                attempts = state.attempts,
+                max_attempts = claim_backoff::CLAIM_RETRY_MAX_ATTEMPTS,
+                retry_in_secs = claim_backoff::retry_delay_secs(state.attempts),
+                reason = %state.last_reason,
+                "withdrawal claim failed; backing off before the next attempt"
+            );
+        }
+    }
+}
+
 fn apply_claim_report(
     pending_claim_withdrawals: &mut HashMap<String, propose_withdrawals::PendingWithdrawal>,
     report: &claim_withdrawals::BatchWithdrawalsReport,
@@ -2060,18 +2193,27 @@ async fn settle_pending_claim_withdrawals(
     provider: &RpcProvider,
     config: &BridgeProposeDaemonConfig,
     pending_claim_withdrawals: &mut HashMap<String, propose_withdrawals::PendingWithdrawal>,
+    claim_retry: &mut HashMap<String, claim_backoff::ClaimRetryState>,
+    retired_claim_withdrawals: &mut HashMap<
+        String,
+        claim_backoff::RetiredClaim<propose_withdrawals::PendingWithdrawal>,
+    >,
     from_checkpoint: u64,
     claim_cursor_checkpoint: u64,
     mut is_catchup_batch: bool,
     confirmation_lag_checkpoints: u64,
     max_checkpoint_batch: u64,
 ) -> bool {
-    let to_claim: Vec<propose_withdrawals::PendingWithdrawal> =
-        pending_claim_withdrawals.values().cloned().collect();
+    let now_unix = claim_backoff::now_unix();
+    let to_claim = claims_due_now(pending_claim_withdrawals, claim_retry, now_unix);
     if to_claim.is_empty() {
+        // Not the same as "nothing pending": entries can all be inside their
+        // backoff window, which is the point of the backoff.
         tracing::info!(
             claim_cursor_checkpoint,
-            "no withdrawals pending claim; durable claim set is empty"
+            pending_claims = pending_claim_withdrawals.len(),
+            retired_claims = retired_claim_withdrawals.len(),
+            "no withdrawal claims due this round"
         );
         return is_catchup_batch;
     }
@@ -2113,6 +2255,14 @@ async fn settle_pending_claim_withdrawals(
     {
         Ok(report) => {
             apply_claim_report(pending_claim_withdrawals, &report);
+            record_claim_outcome(
+                &to_claim,
+                &report,
+                pending_claim_withdrawals,
+                claim_retry,
+                retired_claim_withdrawals,
+                now_unix,
+            );
             if report.failure_reasons.is_empty() {
                 tracing::info!(
                     claim_cursor_checkpoint,
@@ -3097,7 +3247,8 @@ mod tests {
                 withdrawal.leaf_hash.clone(),
                 withdrawal.clone(),
             )]),
-        };
+                        ..Default::default()
+                    };
 
         let reconciled = reconcile_state_with_l1_finalized_checkpoint(state, &path, 64).unwrap();
 
@@ -3118,7 +3269,8 @@ mod tests {
         let state = DaemonState {
             last_finalized_checkpoint: 10,
             pending_claim_withdrawals: HashMap::new(),
-        };
+                        ..Default::default()
+                    };
 
         let reconciled = reconcile_state_with_l1_finalized_checkpoint(state, &path, 12).unwrap();
 
@@ -3133,7 +3285,8 @@ mod tests {
         let state = DaemonState {
             last_finalized_checkpoint: 20,
             pending_claim_withdrawals: HashMap::new(),
-        };
+                        ..Default::default()
+                    };
 
         let reconciled = reconcile_state_with_l1_finalized_checkpoint(state, &path, 18).unwrap();
 
@@ -3355,7 +3508,8 @@ mod tests {
                 (w1.leaf_hash.clone(), w1.clone()),
                 (w2.leaf_hash.clone(), w2.clone()),
             ]),
-        };
+                        ..Default::default()
+                    };
         save_state(&path, &state).unwrap();
         let loaded = load_state(&path).unwrap();
         assert_eq!(loaded.last_finalized_checkpoint, 42);
@@ -3372,7 +3526,8 @@ mod tests {
         let state = DaemonState {
             last_finalized_checkpoint: 42,
             pending_claim_withdrawals: HashMap::new(),
-        };
+                        ..Default::default()
+                    };
         save_state(&path, &state).unwrap();
 
         persist_claim_withdrawals_before_l2_submit(&path, std::slice::from_ref(&withdrawal))
@@ -3413,7 +3568,8 @@ mod tests {
         let state = DaemonState {
             last_finalized_checkpoint: 15,
             pending_claim_withdrawals: HashMap::new(),
-        };
+                        ..Default::default()
+                    };
         let reconciled = reconcile_state_with_l1_finalized_checkpoint(state, &path, 15).unwrap();
         assert_eq!(reconciled.last_finalized_checkpoint, 15);
         assert!(!path.exists(), "no-op reconcile must not create a state file");
@@ -3429,7 +3585,8 @@ mod tests {
         let state = DaemonState {
             last_finalized_checkpoint: 30,
             pending_claim_withdrawals: HashMap::from([(w.leaf_hash.clone(), w.clone())]),
-        };
+                        ..Default::default()
+                    };
         let reconciled = reconcile_state_with_l1_finalized_checkpoint(state, &path, 18).unwrap();
         assert_eq!(reconciled.last_finalized_checkpoint, 18);
         // Pending claim survives the clamp.
@@ -3563,6 +3720,151 @@ mod tests {
     }
 
     // ── claim reconciliation edge cases (double-claim defence) ─────────────
+
+    // ── claim backoff wiring ───────────────────────────────────────────────
+    //
+    // The unit tests for the pacing itself live in claim_backoff. These pin the
+    // part that made the incident expensive: which withdrawals a round actually
+    // hands to the claim path, and what happens to one that never succeeds.
+
+    fn backoff_withdrawal(leaf: &str) -> propose_withdrawals::PendingWithdrawal {
+        propose_withdrawals::PendingWithdrawal {
+            event_id: 1,
+            checkpoint_id: 1,
+            user_id: 1,
+            sender_user_id: 1,
+            contract_id: 0,
+            destination_chain_index: 0,
+            token_address: [0; 8],
+            amount: [0, 0, 0, 0, 0, 0, 0, 1],
+            recipient: [0; 8],
+            nonce: [0; 8],
+            leaf_hash: leaf.to_string(),
+        }
+    }
+
+    fn empty_report() -> claim_withdrawals::BatchWithdrawalsReport {
+        claim_withdrawals::BatchWithdrawalsReport {
+            requested: 0,
+            submitted_count: 0,
+            already_claimed_count: 0,
+            resolved_leaf_hashes: vec![],
+            failure_reasons: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn a_withdrawal_that_has_never_been_tried_is_due() {
+        let mut pending = HashMap::new();
+        pending.insert("a".to_string(), backoff_withdrawal("a"));
+        let due = claims_due_now(&pending, &HashMap::new(), 0);
+        assert_eq!(due.len(), 1);
+    }
+
+    #[test]
+    fn a_failed_withdrawal_is_withheld_until_its_backoff_expires() {
+        let mut pending = HashMap::new();
+        pending.insert("a".to_string(), backoff_withdrawal("a"));
+        let mut retry = HashMap::new();
+        let mut retired = HashMap::new();
+        let attempted = vec![backoff_withdrawal("a")];
+
+        record_claim_outcome(&attempted, &empty_report(), &mut pending, &mut retry, &mut retired, 1_000);
+
+        // Withheld now, offered again once the delay has passed. This is the
+        // whole point: the claim-proof fetch and the Groth16 batch proof both
+        // hang off this list.
+        assert!(claims_due_now(&pending, &retry, 1_000).is_empty());
+        let later = 1_000 + claim_backoff::CLAIM_RETRY_BASE_DELAY_SECS;
+        assert_eq!(claims_due_now(&pending, &retry, later).len(), 1);
+    }
+
+    #[test]
+    fn a_resolved_withdrawal_forgets_its_earlier_failures() {
+        let mut pending = HashMap::new();
+        pending.insert("a".to_string(), backoff_withdrawal("a"));
+        let mut retry = HashMap::new();
+        let mut retired = HashMap::new();
+        let attempted = vec![backoff_withdrawal("a")];
+
+        record_claim_outcome(&attempted, &empty_report(), &mut pending, &mut retry, &mut retired, 0);
+        assert!(retry.contains_key("a"));
+
+        let mut resolved = empty_report();
+        resolved.resolved_leaf_hashes = vec!["a".to_string()];
+        record_claim_outcome(&attempted, &resolved, &mut pending, &mut retry, &mut retired, 0);
+        assert!(!retry.contains_key("a"), "a success must clear the history");
+    }
+
+    #[test]
+    fn a_withdrawal_that_never_succeeds_is_retired_rather_than_retried_forever() {
+        let mut pending = HashMap::new();
+        pending.insert("a".to_string(), backoff_withdrawal("a"));
+        let mut retry = HashMap::new();
+        let mut retired = HashMap::new();
+        let attempted = vec![backoff_withdrawal("a")];
+
+        let mut now = 0u64;
+        let mut attempts = 0u32;
+        // A year of a 30-second round. Before this change every one of those
+        // rounds asked prove-proxy for a Groth16 proof.
+        for _ in 0..(365 * 24 * 60 * 2) {
+            now += 30;
+            if claims_due_now(&pending, &retry, now).is_empty() {
+                continue;
+            }
+            attempts += 1;
+            record_claim_outcome(&attempted, &empty_report(), &mut pending, &mut retry, &mut retired, now);
+        }
+
+        assert_eq!(attempts, claim_backoff::CLAIM_RETRY_MAX_ATTEMPTS);
+        assert!(pending.is_empty(), "retired withdrawals leave the pending set");
+        // Retired, not discarded: the funds are stuck and someone has to look.
+        let entry = retired.get("a").expect("retired record kept");
+        assert_eq!(entry.attempts, claim_backoff::CLAIM_RETRY_MAX_ATTEMPTS);
+        assert!(!entry.last_reason.is_empty());
+        assert_eq!(entry.withdrawal.leaf_hash, "a");
+    }
+
+    #[test]
+    fn a_withdrawal_missing_from_the_report_still_counts_as_a_failed_attempt() {
+        // The silent case. A withdrawal that falls out of a round without being
+        // named in failure_reasons used to be retried forever with no trace.
+        let mut pending = HashMap::new();
+        pending.insert("a".to_string(), backoff_withdrawal("a"));
+        let mut retry = HashMap::new();
+        let mut retired = HashMap::new();
+
+        record_claim_outcome(
+            &[backoff_withdrawal("a")],
+            &empty_report(),
+            &mut pending,
+            &mut retry,
+            &mut retired,
+            0,
+        );
+        assert_eq!(retry["a"].attempts, 1);
+    }
+
+    #[test]
+    fn withdrawals_that_were_not_attempted_are_left_alone() {
+        let mut pending = HashMap::new();
+        pending.insert("a".to_string(), backoff_withdrawal("a"));
+        pending.insert("b".to_string(), backoff_withdrawal("b"));
+        let mut retry = HashMap::new();
+        let mut retired = HashMap::new();
+
+        record_claim_outcome(
+            &[backoff_withdrawal("a")],
+            &empty_report(),
+            &mut pending,
+            &mut retry,
+            &mut retired,
+            0,
+        );
+        assert!(retry.contains_key("a"));
+        assert!(!retry.contains_key("b"), "b was never tried this round");
+    }
 
     #[test]
     fn apply_claim_report_removes_resolved_and_already_claimed_keeps_failures() {
@@ -4076,7 +4378,8 @@ mod tests {
                 "leaf-keep".to_string(),
                 sample_withdrawal(1),
             )]),
-        };
+                        ..Default::default()
+                    };
         let reconciled =
             reconcile_state_with_l1_finalized_checkpoint(state, &unwritable, 25).unwrap();
         assert_eq!(reconciled.last_finalized_checkpoint, 25, "checkpoint must advance");
@@ -4095,7 +4398,8 @@ mod tests {
         let state = DaemonState {
             last_finalized_checkpoint: 20,
             pending_claim_withdrawals: HashMap::from([(w.leaf_hash.clone(), w.clone())]),
-        };
+                        ..Default::default()
+                    };
         let reconciled = reconcile_state_with_l1_finalized_checkpoint(state, &path, 0).unwrap();
         assert_eq!(reconciled.last_finalized_checkpoint, 0);
         assert_eq!(reconciled.pending_claim_withdrawals.len(), 1);
@@ -4114,7 +4418,8 @@ mod tests {
         let state = DaemonState {
             last_finalized_checkpoint: 15,
             pending_claim_withdrawals: HashMap::from([(w.leaf_hash.clone(), w.clone())]),
-        };
+                        ..Default::default()
+                    };
         let reconciled = reconcile_state_with_l1_finalized_checkpoint(state, &path, 15).unwrap();
         assert_eq!(reconciled.last_finalized_checkpoint, 15);
         assert_eq!(reconciled.pending_claim_withdrawals.len(), 1);
@@ -4188,7 +4493,8 @@ mod tests {
         let state = DaemonState {
             last_finalized_checkpoint: i64::MAX as u64,
             pending_claim_withdrawals: pending,
-        };
+                        ..Default::default()
+                    };
         save_state(&path, &state).unwrap();
         let loaded = load_state(&path).unwrap();
         assert_eq!(loaded.last_finalized_checkpoint, i64::MAX as u64);
@@ -4605,7 +4911,8 @@ mod tests {
         let state = DaemonState {
             last_finalized_checkpoint: 17,
             pending_claim_withdrawals: pending,
-        };
+                        ..Default::default()
+                    };
         let reconciled = reconcile_state_with_l1_finalized_checkpoint(state, &path, 77).unwrap();
         assert_eq!(reconciled.last_finalized_checkpoint, 77);
         assert_eq!(reconciled.pending_claim_withdrawals.len(), 2);
@@ -5008,7 +5315,8 @@ mod tests {
                 durable.leaf_hash.clone(),
                 durable.clone(),
             )]),
-        };
+                        ..Default::default()
+                    };
         save_state(&state_path, &state).unwrap();
 
         let deposit_calls = Arc::new(AtomicUsize::new(0));
@@ -5150,7 +5458,8 @@ mod tests {
         let prior = DaemonState {
             last_finalized_checkpoint: 11,
             pending_claim_withdrawals: HashMap::from([(prior_w.leaf_hash.clone(), prior_w.clone())]),
-        };
+                        ..Default::default()
+                    };
         save_state(&path, &prior).unwrap();
         let prior_bytes = std::fs::read(&path).expect("prior ledger bytes");
 
@@ -5161,7 +5470,8 @@ mod tests {
                 (prior_w.leaf_hash.clone(), prior_w.clone()),
                 (next_w.leaf_hash.clone(), next_w.clone()),
             ]),
-        };
+                       ..Default::default()
+                   };
         save_state(&path, &next).unwrap();
 
         let loaded = load_state(&path).unwrap();
@@ -5215,7 +5525,8 @@ mod tests {
         let prior = DaemonState {
             last_finalized_checkpoint: 7,
             pending_claim_withdrawals: HashMap::new(),
-        };
+                        ..Default::default()
+                    };
         save_state(&path, &prior).unwrap();
         let prior_bytes = std::fs::read(&path).unwrap();
 
@@ -5228,7 +5539,8 @@ mod tests {
         let advanced = DaemonState {
             last_finalized_checkpoint: 99,
             pending_claim_withdrawals: HashMap::new(),
-        };
+                           ..Default::default()
+                       };
         let err = persist_finalized_state_then_cleanup_proof(
             &missing_state_path,
             &advanced,

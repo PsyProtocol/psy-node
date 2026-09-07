@@ -1,4 +1,5 @@
 pub mod api_client;
+pub mod claim_backoff;
 pub mod claim_withdrawals;
 pub mod compute_deposit_leaf;
 pub mod constants;
