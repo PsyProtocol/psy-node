@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 
 use psy_cli_common::key_utils::load_wallet_key_info;
 use crate::bridge::{
-    claim_backoff,
+    claim_attempts,
     claim_withdrawals,
     constants::{
         BRIDGE_USER_ID_U64, DEFAULT_DEPLOYMENTS_NETWORK, DEFAULT_L1_RPC_URL, DEPOSIT_TREE_CONTRACT_ID, WITHDRAWAL_TREE_CONTRACT_ID,
@@ -256,12 +256,12 @@ pub(crate) struct DaemonState {
     pending_claim_withdrawals: HashMap<String, propose_withdrawals::PendingWithdrawal>,
     /// Backoff bookkeeping for the entries above, keyed by leaf_hash.
     #[serde(default)]
-    claim_retry: HashMap<String, claim_backoff::ClaimRetryState>,
+    claim_retry: HashMap<String, claim_attempts::ClaimAttempts>,
     /// Withdrawals that ran out of attempts. Nothing retries these; they are
     /// kept so the stuck funds stay traceable and can be re-armed by hand.
     #[serde(default)]
     retired_claim_withdrawals:
-        HashMap<String, claim_backoff::RetiredClaim<propose_withdrawals::PendingWithdrawal>>,
+        HashMap<String, claim_attempts::RetiredClaim<propose_withdrawals::PendingWithdrawal>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -283,10 +283,10 @@ struct MultichainDaemonState {
     #[serde(default)]
     pending_claim_withdrawals: HashMap<String, propose_withdrawals::PendingWithdrawal>,
     #[serde(default)]
-    claim_retry: HashMap<String, claim_backoff::ClaimRetryState>,
+    claim_retry: HashMap<String, claim_attempts::ClaimAttempts>,
     #[serde(default)]
     retired_claim_withdrawals:
-        HashMap<String, claim_backoff::RetiredClaim<propose_withdrawals::PendingWithdrawal>>,
+        HashMap<String, claim_attempts::RetiredClaim<propose_withdrawals::PendingWithdrawal>>,
 }
 
 async fn create_wallet_session(
@@ -987,8 +987,8 @@ async fn run_multichain(
         if state.finalized_chains.len() == chains.len() {
             tokio::time::sleep(Duration::from_secs(2)).await;
             for chain in &chains {
-                let now_unix = claim_backoff::now_unix();
-                let claims = claims_due_now(&state.pending_claim_withdrawals, &state.claim_retry, now_unix)
+                let now_unix = claim_attempts::now_unix();
+                let claims = claims_to_attempt(&state.pending_claim_withdrawals, &state.claim_retry)
                     .into_iter()
                     .filter(|w| w.destination_chain_index == u64::from(chain.chain_index))
                     .collect::<Vec<_>>();
@@ -2081,39 +2081,40 @@ pub(crate) async fn run_l2_bridge_round_with_l1_provider(
     .await
 }
 
-/// The pending claims that are due for another attempt right now.
+/// The pending claims still worth attempting.
 ///
-/// A claim that has failed is held back until its backoff expires, and one that
-/// has exhausted its attempts is never returned. Everything a round does for a
-/// withdrawal — the claim-proof fetch from psy-services, and the Groth16 batch
-/// proof from prove-proxy — hangs off this list, so filtering here is what
-/// actually stops the work.
-fn claims_due_now(
+/// Everything a round does for a withdrawal — the claim-proof fetch from
+/// psy-services, and the Groth16 batch proof from prove-proxy — hangs off this
+/// list, so dropping a retired claim here is what actually stops the work.
+fn claims_to_attempt(
     pending: &HashMap<String, propose_withdrawals::PendingWithdrawal>,
-    retry: &HashMap<String, claim_backoff::ClaimRetryState>,
-    now_unix: u64,
+    attempts: &HashMap<String, claim_attempts::ClaimAttempts>,
 ) -> Vec<propose_withdrawals::PendingWithdrawal> {
     pending
         .values()
-        .filter(|w| claim_backoff::is_due(retry.get(&w.leaf_hash), now_unix))
+        .filter(|w| claim_attempts::is_retriable(attempts.get(&w.leaf_hash)))
         .cloned()
         .collect()
 }
 
-/// Book one round's outcome against the durable retry state.
+/// Book one round's outcome against the durable attempt count.
 ///
-/// A claim is counted as failed when it was attempted and did not resolve —
-/// not merely when it appears in `failure_reasons`. A withdrawal that falls out
-/// of a round without being named anywhere is precisely the case that used to
-/// retry forever in silence.
+/// A claim counts as failed when it was attempted and did not resolve — not
+/// merely when it appears in `failure_reasons`. A withdrawal that falls out of
+/// a round named nowhere is precisely the case that used to retry forever in
+/// silence.
+///
+/// Deferrals are the exception. Waiting for bridge liquidity resolves on its
+/// own and says nothing about whether the claim is valid, so it must not spend
+/// one of the three attempts.
 fn record_claim_outcome(
     attempted: &[propose_withdrawals::PendingWithdrawal],
     report: &claim_withdrawals::BatchWithdrawalsReport,
     pending: &mut HashMap<String, propose_withdrawals::PendingWithdrawal>,
-    retry: &mut HashMap<String, claim_backoff::ClaimRetryState>,
+    retry: &mut HashMap<String, claim_attempts::ClaimAttempts>,
     retired: &mut HashMap<
         String,
-        claim_backoff::RetiredClaim<propose_withdrawals::PendingWithdrawal>,
+        claim_attempts::RetiredClaim<propose_withdrawals::PendingWithdrawal>,
     >,
     now_unix: u64,
 ) {
@@ -2122,7 +2123,11 @@ fn record_claim_outcome(
     for withdrawal in attempted {
         let leaf_hash = withdrawal.leaf_hash.as_str();
         if resolved.contains(leaf_hash) {
-            claim_backoff::clear(retry, leaf_hash);
+            claim_attempts::clear(retry, leaf_hash);
+            continue;
+        }
+        if let Some(reason) = report.deferrals.get(leaf_hash) {
+            tracing::info!(leaf_hash, reason, "withdrawal claim deferred; attempt not spent");
             continue;
         }
 
@@ -2131,9 +2136,9 @@ fn record_claim_outcome(
             .get(leaf_hash)
             .cloned()
             .unwrap_or_else(|| "claim did not resolve and reported no reason".to_string());
-        let state = claim_backoff::record_failure(retry, leaf_hash, &reason, now_unix);
+        let state = claim_attempts::record_failure(retry, leaf_hash, &reason);
 
-        if claim_backoff::is_exhausted(&state) {
+        if claim_attempts::is_exhausted(&state) {
             // Stop paying for proofs, keep the record. The funds are stuck and
             // this needs a person, so it is an error, not a warning.
             tracing::error!(
@@ -2141,12 +2146,12 @@ fn record_claim_outcome(
                 attempts = state.attempts,
                 reason = %state.last_reason,
                 destination_chain_index = withdrawal.destination_chain_index,
-                "withdrawal claim retired after exhausting its attempts; no further proofs will be requested for it"
+                "withdrawal claim given up on after its attempts were used; no further proofs will be requested for it"
             );
             if let Some(w) = pending.remove(leaf_hash) {
                 retired.insert(
                     leaf_hash.to_string(),
-                    claim_backoff::RetiredClaim {
+                    claim_attempts::RetiredClaim {
                         withdrawal: w,
                         attempts: state.attempts,
                         last_reason: state.last_reason.clone(),
@@ -2154,15 +2159,14 @@ fn record_claim_outcome(
                     },
                 );
             }
-            claim_backoff::clear(retry, leaf_hash);
+            claim_attempts::clear(retry, leaf_hash);
         } else {
             tracing::warn!(
                 leaf_hash,
                 attempts = state.attempts,
-                max_attempts = claim_backoff::CLAIM_RETRY_MAX_ATTEMPTS,
-                retry_in_secs = claim_backoff::retry_delay_secs(state.attempts),
+                max_attempts = claim_attempts::CLAIM_MAX_ATTEMPTS,
                 reason = %state.last_reason,
-                "withdrawal claim failed; backing off before the next attempt"
+                "withdrawal claim failed; will retry next round"
             );
         }
     }
@@ -2193,10 +2197,10 @@ async fn settle_pending_claim_withdrawals(
     provider: &RpcProvider,
     config: &BridgeProposeDaemonConfig,
     pending_claim_withdrawals: &mut HashMap<String, propose_withdrawals::PendingWithdrawal>,
-    claim_retry: &mut HashMap<String, claim_backoff::ClaimRetryState>,
+    claim_retry: &mut HashMap<String, claim_attempts::ClaimAttempts>,
     retired_claim_withdrawals: &mut HashMap<
         String,
-        claim_backoff::RetiredClaim<propose_withdrawals::PendingWithdrawal>,
+        claim_attempts::RetiredClaim<propose_withdrawals::PendingWithdrawal>,
     >,
     from_checkpoint: u64,
     claim_cursor_checkpoint: u64,
@@ -2204,16 +2208,16 @@ async fn settle_pending_claim_withdrawals(
     confirmation_lag_checkpoints: u64,
     max_checkpoint_batch: u64,
 ) -> bool {
-    let now_unix = claim_backoff::now_unix();
-    let to_claim = claims_due_now(pending_claim_withdrawals, claim_retry, now_unix);
+    let now_unix = claim_attempts::now_unix();
+    let to_claim = claims_to_attempt(pending_claim_withdrawals, claim_retry);
     if to_claim.is_empty() {
-        // Not the same as "nothing pending": entries can all be inside their
-        // backoff window, which is the point of the backoff.
+        // Not the same as "nothing pending": every remaining entry can have
+        // used up its attempts, which is the point of the ceiling.
         tracing::info!(
             claim_cursor_checkpoint,
             pending_claims = pending_claim_withdrawals.len(),
             retired_claims = retired_claim_withdrawals.len(),
-            "no withdrawal claims due this round"
+            "no withdrawal claims left to attempt this round"
         );
         return is_catchup_batch;
     }
@@ -3549,6 +3553,7 @@ mod tests {
             already_claimed_count: 0,
             resolved_leaf_hashes: vec![withdrawal.leaf_hash.clone()],
             failure_reasons: HashMap::new(),
+            deferrals: HashMap::new(),
         };
         apply_claim_report(&mut restarted.pending_claim_withdrawals, &claim_report);
         assert!(
@@ -3750,6 +3755,7 @@ mod tests {
             already_claimed_count: 0,
             resolved_leaf_hashes: vec![],
             failure_reasons: HashMap::new(),
+            deferrals: HashMap::new(),
         }
     }
 
@@ -3757,27 +3763,10 @@ mod tests {
     fn a_withdrawal_that_has_never_been_tried_is_due() {
         let mut pending = HashMap::new();
         pending.insert("a".to_string(), backoff_withdrawal("a"));
-        let due = claims_due_now(&pending, &HashMap::new(), 0);
+        let due = claims_to_attempt(&pending, &HashMap::new());
         assert_eq!(due.len(), 1);
     }
 
-    #[test]
-    fn a_failed_withdrawal_is_withheld_until_its_backoff_expires() {
-        let mut pending = HashMap::new();
-        pending.insert("a".to_string(), backoff_withdrawal("a"));
-        let mut retry = HashMap::new();
-        let mut retired = HashMap::new();
-        let attempted = vec![backoff_withdrawal("a")];
-
-        record_claim_outcome(&attempted, &empty_report(), &mut pending, &mut retry, &mut retired, 1_000);
-
-        // Withheld now, offered again once the delay has passed. This is the
-        // whole point: the claim-proof fetch and the Groth16 batch proof both
-        // hang off this list.
-        assert!(claims_due_now(&pending, &retry, 1_000).is_empty());
-        let later = 1_000 + claim_backoff::CLAIM_RETRY_BASE_DELAY_SECS;
-        assert_eq!(claims_due_now(&pending, &retry, later).len(), 1);
-    }
 
     #[test]
     fn a_resolved_withdrawal_forgets_its_earlier_failures() {
@@ -3797,7 +3786,46 @@ mod tests {
     }
 
     #[test]
-    fn a_withdrawal_that_never_succeeds_is_retired_rather_than_retried_forever() {
+    fn waiting_for_bridge_liquidity_does_not_spend_an_attempt() {
+        // With only three attempts this matters: a valid withdrawal parked
+        // behind an empty bridge would otherwise be given up on in three
+        // rounds, roughly ninety seconds, and need a human to re-arm it.
+        let mut pending = HashMap::new();
+        pending.insert("a".to_string(), backoff_withdrawal("a"));
+        let mut retry = HashMap::new();
+        let mut retired = HashMap::new();
+        let attempted = vec![backoff_withdrawal("a")];
+
+        let mut report = empty_report();
+        report.deferrals.insert("a".to_string(), "bridge ERC20 liquidity insufficient".to_string());
+
+        for _ in 0..50 {
+            record_claim_outcome(&attempted, &report, &mut pending, &mut retry, &mut retired, 0);
+        }
+
+        assert!(retry.get("a").is_none(), "a deferral must not count as an attempt");
+        assert!(retired.is_empty(), "a deferred withdrawal must not be given up on");
+        assert_eq!(claims_to_attempt(&pending, &retry).len(), 1);
+    }
+
+    #[test]
+    fn a_deferral_does_not_erase_earlier_real_failures() {
+        let mut pending = HashMap::new();
+        pending.insert("a".to_string(), backoff_withdrawal("a"));
+        let mut retry = HashMap::new();
+        let mut retired = HashMap::new();
+        let attempted = vec![backoff_withdrawal("a")];
+
+        record_claim_outcome(&attempted, &empty_report(), &mut pending, &mut retry, &mut retired, 0);
+        let mut deferred = empty_report();
+        deferred.deferrals.insert("a".to_string(), "waiting".to_string());
+        record_claim_outcome(&attempted, &deferred, &mut pending, &mut retry, &mut retired, 0);
+
+        assert_eq!(retry["a"].attempts, 1, "the earlier failure still counts");
+    }
+
+    #[test]
+    fn a_withdrawal_that_never_succeeds_is_given_up_on_rather_than_retried_forever() {
         let mut pending = HashMap::new();
         pending.insert("a".to_string(), backoff_withdrawal("a"));
         let mut retry = HashMap::new();
@@ -3810,18 +3838,18 @@ mod tests {
         // rounds asked prove-proxy for a Groth16 proof.
         for _ in 0..(365 * 24 * 60 * 2) {
             now += 30;
-            if claims_due_now(&pending, &retry, now).is_empty() {
+            if claims_to_attempt(&pending, &retry).is_empty() {
                 continue;
             }
             attempts += 1;
             record_claim_outcome(&attempted, &empty_report(), &mut pending, &mut retry, &mut retired, now);
         }
 
-        assert_eq!(attempts, claim_backoff::CLAIM_RETRY_MAX_ATTEMPTS);
+        assert_eq!(attempts, claim_attempts::CLAIM_MAX_ATTEMPTS);
         assert!(pending.is_empty(), "retired withdrawals leave the pending set");
         // Retired, not discarded: the funds are stuck and someone has to look.
         let entry = retired.get("a").expect("retired record kept");
-        assert_eq!(entry.attempts, claim_backoff::CLAIM_RETRY_MAX_ATTEMPTS);
+        assert_eq!(entry.attempts, claim_attempts::CLAIM_MAX_ATTEMPTS);
         assert!(!entry.last_reason.is_empty());
         assert_eq!(entry.withdrawal.leaf_hash, "a");
     }
@@ -3888,6 +3916,7 @@ mod tests {
             already_claimed_count: 1,
             resolved_leaf_hashes: vec![w1.leaf_hash.clone(), w2.leaf_hash.clone()],
             failure_reasons: HashMap::from([(w3.leaf_hash.clone(), "proof not ready".to_string())]),
+            deferrals: HashMap::new(),
         };
         apply_claim_report(&mut pending, &report);
         assert!(!pending.contains_key(&w1.leaf_hash), "submitted withdrawal must be removed");
@@ -3917,6 +3946,7 @@ mod tests {
             already_claimed_count: 0,
             resolved_leaf_hashes: vec![w1.leaf_hash.clone()],
             failure_reasons: HashMap::new(),
+            deferrals: HashMap::new(),
         };
         apply_claim_report(&mut pending, &report);
         assert!(!pending.contains_key(&w1.leaf_hash));
@@ -4252,6 +4282,7 @@ mod tests {
             already_claimed_count: 0,
             resolved_leaf_hashes: Vec::new(),
             failure_reasons: HashMap::new(),
+            deferrals: HashMap::new(),
         };
         apply_claim_report(&mut pending, &report);
         assert_eq!(pending.len(), 1);
@@ -4271,6 +4302,7 @@ mod tests {
             already_claimed_count: 0,
             resolved_leaf_hashes: vec!["never-pending-leaf".to_string()],
             failure_reasons: HashMap::new(),
+            deferrals: HashMap::new(),
         };
         apply_claim_report(&mut pending, &report);
         assert_eq!(pending.len(), 1, "unknown resolved leaf must not evict w1");
@@ -4295,6 +4327,7 @@ mod tests {
             already_claimed_count: 0,
             resolved_leaf_hashes: vec![w1.leaf_hash.clone(), w2.leaf_hash.clone()],
             failure_reasons: HashMap::new(),
+            deferrals: HashMap::new(),
         };
         apply_claim_report(&mut pending, &report);
         assert!(pending.is_empty(), "all-resolved report must clear pending");
@@ -4312,6 +4345,7 @@ mod tests {
             already_claimed_count: 0,
             resolved_leaf_hashes: Vec::new(),
             failure_reasons: HashMap::from([("never-pending-leaf".to_string(), "x".to_string())]),
+            deferrals: HashMap::new(),
         };
         apply_claim_report(&mut pending, &report);
         assert_eq!(pending.len(), 1, "failure reason must not insert into pending");
@@ -4598,6 +4632,7 @@ mod tests {
             already_claimed_count: 1,
             resolved_leaf_hashes: vec![w1.leaf_hash.clone(), w2.leaf_hash.clone()],
             failure_reasons: HashMap::from([(w3.leaf_hash.clone(), "proof not ready".to_string())]),
+            deferrals: HashMap::new(),
         };
         apply_claim_report(&mut pending, &report1);
         assert!(!pending.contains_key(&w1.leaf_hash), "submitted must leave pending");
@@ -4630,6 +4665,7 @@ mod tests {
             already_claimed_count: 0,
             resolved_leaf_hashes: vec![w3.leaf_hash.clone(), w4.leaf_hash.clone()],
             failure_reasons: HashMap::new(),
+            deferrals: HashMap::new(),
         };
         apply_claim_report(&mut pending, &report2);
         assert!(pending.is_empty(), "all claims resolved → pending must be empty");
