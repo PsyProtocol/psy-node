@@ -42,6 +42,11 @@ fn print_hash<H: Q256BitHash + std::fmt::Debug>(label: &str, hash: &H) {
 
 const SUBMIT_PROOF_PENDING_LOOKBACK: u64 = 256;
 
+use psy_data::guta::realm_finalize::{
+    finalize_output_from_witness, realm_finalize_guta_chain_domain, RealmFinalizeGUTAInput,
+};
+use parth_core::crypto::hash::traits::{FieldQHasher, QFieldHashable};
+
 impl<
         N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
         S: PsyRealmEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync,
@@ -51,7 +56,40 @@ impl<
         TempDatabase: StandardEdgeAPITempDBStoreBase<N::JobId, N::QHash> + Send + Sync,
         ProofStore: QParthProofStore,
     > RealmEdgeHandler<N, S, STagTreeRewards, UserUpdateQueue, GetProofWorkQueue, TempDatabase, ProofStore>
-{
+    {
+    /// Output commitment `A` for the RealmFinalizeGUTA one-child reward mode,
+    /// recomputed from the stored finalizer witness so the worker cannot forge
+    /// the reward root. A wrong commitment fails proof-PI verification.
+    async fn finalize_output_commitment_a(
+        &self,
+        job_id: QProvingJobDataID,
+        unique_pending_id: u64,
+        children_reward_tree_values: &[N::QHash],
+    ) -> anyhow::Result<N::QHash> {
+        if job_id.circuit_type != ProvingJobCircuitType::RealmFinalizeGUTA {
+            return Ok(N::QHash::get_zero_value());
+        }
+        anyhow::ensure!(
+            !children_reward_tree_values.is_empty(),
+            "RealmFinalizeGUTA requires the root GUTA child reward value"
+        );
+        let witness = self
+            .temp_db
+            .get_tdb_proof_witness::<RealmFinalizeGUTAInput<N::F, N::QHash>>(
+                &self.realm_identifier,
+                unique_pending_id,
+                job_id.get_input_witness_id(),
+            )
+            .await?;
+        let chain_domain =
+            realm_finalize_guta_chain_domain::<N::F, N::QHash, N::HasherBase>(self.chain_id);
+        let output = finalize_output_from_witness::<N::F, N::QHash, N::HasherBase>(
+            &witness,
+            chain_domain,
+            children_reward_tree_values[0],
+        );
+        Ok(output.public_output_hash::<N::HasherBase>())
+    }
     async fn resolve_unique_pending_id_for_submitted_job(
         &self,
         current_unique_pending_id: u64,
@@ -443,8 +481,19 @@ impl<
             }
         };
         timer.lap_micros("children_reward_tree_values");
-
-        let reward_tree_value = metadata.get_new_rewards_tag_tree_value::<N::HasherBase>(tag, &children_reward_tree_values)?;
+        // Proof-associated child values stay exactly the dependency list
+        // (length 1 for RealmFinalizeGUTA). The reward tree adds the actual
+        // finalizer output commitment A as a value-only right sibling at the
+        // hashing seam only: reward_values = [c0, A].
+        let output_commitment_a = self
+            .finalize_output_commitment_a(job_id, unique_pending_id, &children_reward_tree_values)
+            .await?;
+        let mut reward_values = children_reward_tree_values.clone();
+        if job_id.circuit_type == ProvingJobCircuitType::RealmFinalizeGUTA {
+            reward_values.push(output_commitment_a);
+        }
+        let reward_tree_value =
+            metadata.get_new_rewards_tag_tree_value::<N::HasherBase>(tag, &reward_values)?;
 
         //print_hash("reward_tree_value", &reward_tree_value);
         let full_expected_public_inputs_hash =
@@ -560,7 +609,7 @@ impl<
 
         {
             let expected_updates =
-                metadata.get_new_rewards_tag_tree_updates::<N::HasherBase>(tag, &children_reward_tree_values, reward_tree_value)?;
+                metadata.get_new_rewards_tag_tree_updates::<N::HasherBase>(tag, &reward_values, reward_tree_value)?;
 
             for (key, node) in expected_updates {
                 self.tag_tree_rewards_store
@@ -573,19 +622,19 @@ impl<
                 let node_key = metadata.get_reward_tree_node_key();
                 let left_key = node_key.left_child();
                 let right_key = node_key.right_child();
-                if children_reward_tree_values.len() == 1 {
+                if reward_values.len() == 1 {
                     self.tag_tree_rewards_store
-                        .rewards_tag_tree_set_node_value_only(unique_pending_id, left_key, children_reward_tree_values[0])
+                        .rewards_tag_tree_set_node_value_only(unique_pending_id, left_key, reward_values[0])
                         .await?;
-                } else if children_reward_tree_values.len() == 2 {
+                } else if reward_values.len() == 2 {
                     self.tag_tree_rewards_store
-                        .rewards_tag_tree_set_node_value_only(unique_pending_id, left_key, children_reward_tree_values[0])
+                        .rewards_tag_tree_set_node_value_only(unique_pending_id, left_key, reward_values[0])
                         .await?;
                     self.tag_tree_rewards_store
-                        .rewards_tag_tree_set_node_value_only(unique_pending_id, right_key, children_reward_tree_values[1])
+                        .rewards_tag_tree_set_node_value_only(unique_pending_id, right_key, reward_values[1])
                         .await?;
-                } else if children_reward_tree_values.len() != 0 {
-                    anyhow::bail!("Invalid number of children for saving tag tree values to database, this should never happen");
+                } else if reward_values.len() != 0 {
+                    anyhow::bail!("Invalid number of reward values for saving tag tree values to database, this should never happen");
                 }
                 timer.lap_micros("rewards_tag_tree_set_node_tag for child values");
             }
@@ -630,321 +679,4 @@ impl<
 
         Ok(())
     }
-    /*
-    pub async fn get_proving_work_internal(
-        &self,
-        signature: QEDCompressedSecp256K1Signature,
-        request: SimpleTimedRequest,
-    ) -> anyhow::Result<PsyWorkerGetProvingWorkAPIResponse<N::QHash, N::JobId>> {
-        self.verify_miner_api_signature_and_check_reputation(&signature, &request).await?;
-
-        let (unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;
-
-        let queue_key = CoordinatorProvingWorkQueueKey::<N::QHash, N::JobId> {
-            realm_id: self.realm_id_u64,
-            realm_sub_id: self.realm_sub_id_u64,
-            unique_id: unique_proc_id,
-            task_group: 0,
-            queue_type: QPBaseQueueType::WorkerQueue,
-            _phantom_queue_item: std::marker::PhantomData,
-        };
-        let work_item: Option<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>> = self
-            .get_proof_work_queue
-            .get_next_worker_queue_item_or_none(&queue_key, self.realm_id_u64, self.realm_sub_id_u64, unique_proc_id, 0)
-            .await?;
-
-        if work_item.is_none() {
-            anyhow::bail!("no proving work available");
-        }
-        let work_item = work_item.unwrap();
-
-        let witness_bytes: Vec<u8> = self
-            .temp_db
-            .get_tdb_proof_witness_bytes(&self.realm_identifier, unique_pending_id, work_item.job_id)
-            .await?;
-
-        let children_reward_tree_values = {
-            if work_item.metadata.dependencies.len() == 0 || work_item.metadata.reward_tree_hash_mode == PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN {
-                vec![]
-            } else {
-                let mut values = Vec::with_capacity(work_item.metadata.dependencies.len());
-                for dependency in work_item.metadata.dependencies.iter() {
-                    let value: N::QHash = self
-                        .temp_db
-                        .get_proof_miner_rewards_tree_value(&self.realm_identifier, unique_pending_id, *dependency)
-                        .await?;
-                    values.push(value);
-                }
-                values
-            }
-        };
-        let response = PsyWorkerGetProvingWorkAPIResponse {
-            job: work_item,
-            child_proof_tag_values: children_reward_tree_values,
-            witness: witness_bytes,
-            realm_id: self.realm_id_u64,
-            realm_sub_id: self.realm_sub_id_u64,
-            unique_pending_id,
-            node_type: PROVING_JOB_NODE_TYPE_REALM,
-        };
-        self.temp_db
-            .set_proving_job_metadata(&self.realm_identifier, unique_pending_id, response.job.job_id, &response.job.metadata)
-            .await?;
-
-        // HACK: in the future we should create a new table for the expected proving
-        // tag, but for now this ok i guess, but a HACK HACK: for now we set
-        // self.temp_db.set_proof_miner_rewards_tree_value( with the expected proving
-        // tag and then update it later to the actual value once the proof is submitted
-        // this ensures the right person submits the proof AND the proof can only be
-        // submitted once
-        self.temp_db
-            .set_proof_miner_rewards_tree_value(
-                &self.realm_identifier,
-                unique_pending_id,
-                response.job.job_id,
-                N::QHash::from_ref_32bytes(&request.tag),
-            )
-            .await?;
-        Ok(response)
-    }
-    pub async fn get_proving_work_with_child_proofs_internal(
-        &self,
-        signature: QEDCompressedSecp256K1Signature,
-        request: SimpleTimedRequest,
-    ) -> anyhow::Result<PsyWorkerGetProvingWorkWithChildProofsAPIResponse<N::QHash, N::JobId>> {
-        self.verify_miner_api_signature_and_check_reputation(&signature, &request).await?;
-
-        let (unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;
-
-        let queue_key = CoordinatorProvingWorkQueueKey::<N::QHash, N::JobId> {
-            realm_id: self.realm_id_u64,
-            realm_sub_id: self.realm_sub_id_u64,
-            unique_id: unique_proc_id,
-            task_group: 0,
-            queue_type: QPBaseQueueType::WorkerQueue,
-            _phantom_queue_item: std::marker::PhantomData,
-        };
-        let work_item: Option<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>> = self
-            .get_proof_work_queue
-            .get_next_worker_queue_item_or_none(&queue_key, self.realm_id_u64, self.realm_sub_id_u64, unique_proc_id, 0)
-            .await?;
-
-        if work_item.is_none() {
-            anyhow::bail!("no proving work available");
-        }
-        let work_item = work_item.unwrap();
-
-        let child_proofs = work_item
-            .metadata
-            .dependencies
-            .iter()
-            .map(|id| self.proof_store.get_proof_bytes_by_job_id(*id, unique_pending_id))
-            .collect::<Vec<_>>()
-            .into_iter();
-        let res: Vec<Option<Vec<u8>>> = try_join_all(child_proofs).await?;
-        let mut final_child_proofs: Vec<Vec<u8>> = Vec::with_capacity(res.len());
-
-        for item in res {
-            if let Some(proof) = item {
-                final_child_proofs.push(proof);
-            } else {
-                anyhow::bail!("missing child proof for job id");
-            }
-        }
-
-        let witness_bytes: Vec<u8> = self
-            .temp_db
-            .get_tdb_proof_witness_bytes(&self.realm_identifier, unique_pending_id, work_item.job_id)
-            .await?;
-
-        let children_reward_tree_values = {
-            if work_item.metadata.dependencies.len() == 0 || work_item.metadata.reward_tree_hash_mode == PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN {
-                vec![]
-            } else {
-                let mut values = Vec::with_capacity(work_item.metadata.dependencies.len());
-                for dependency in work_item.metadata.dependencies.iter() {
-                    let value: N::QHash = self
-                        .temp_db
-                        .get_proof_miner_rewards_tree_value(&self.realm_identifier, unique_pending_id, *dependency)
-                        .await?;
-                    values.push(value);
-                }
-                values
-            }
-        };
-        let response = PsyWorkerGetProvingWorkAPIResponse {
-            job: work_item,
-            child_proof_tag_values: children_reward_tree_values,
-            witness: witness_bytes,
-            realm_id: self.realm_id_u64,
-            realm_sub_id: self.realm_sub_id_u64,
-            unique_pending_id,
-            node_type: PROVING_JOB_NODE_TYPE_REALM,
-        };
-        self.temp_db
-            .set_proving_job_metadata(&self.realm_identifier, unique_pending_id, response.job.job_id, &response.job.metadata)
-            .await?;
-
-        // HACK: in the future we should create a new table for the expected proving
-        // tag, but for now this ok i guess, but a HACK HACK: for now we set
-        // self.temp_db.set_proof_miner_rewards_tree_value( with the expected proving
-        // tag and then update it later to the actual value once the proof is submitted
-        // this ensures the right person submits the proof AND the proof can only be
-        // submitted once
-        self.temp_db
-            .set_proof_miner_rewards_tree_value(
-                &self.realm_identifier,
-                unique_pending_id,
-                response.job.job_id,
-                N::QHash::from_ref_32bytes(&request.tag),
-            )
-            .await?;
-
-        Ok(PsyWorkerGetProvingWorkWithChildProofsAPIResponse {
-            base: response,
-            input_proofs: final_child_proofs,
-        })
-    }
-    pub async fn submit_proof_raw_internal(
-        &self,
-        job_id: N::JobId,
-        tag: N::QHash,
-        proof_bytes: Vec<u8>,
-    ) -> anyhow::Result<()> {
-        let (unique_pending_id, unique_proc_id) = self.get_current_gathering_unique_pending_id_internal().await?;
-
-        //HACK: check to make sure the tag matches
-        if self
-            .temp_db
-            .get_proof_miner_rewards_tree_value(&self.realm_identifier, unique_pending_id, job_id)
-            .await?
-            != tag
-        {
-            anyhow::bail!("Submitted tag does not match expected tag for job id");
-        }
-
-        let metadata: PsyProvingJobMetadata<N::QHash, N::JobId> = self
-            .temp_db
-            .get_proving_job_metadata(&self.realm_identifier, unique_pending_id, job_id)
-            .await?;
-
-        let children_reward_tree_values = {
-            if metadata.dependencies.len() == 0 || metadata.reward_tree_hash_mode == PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN {
-                vec![]
-            } else {
-                let mut values = Vec::with_capacity(metadata.dependencies.len());
-                for dependency in metadata.dependencies.iter() {
-                    let value: N::QHash = self
-                        .temp_db
-                        .get_proof_miner_rewards_tree_value(&self.realm_identifier, unique_pending_id, *dependency)
-                        .await?;
-                    values.push(value);
-                }
-                values
-            }
-        };
-
-        let reward_tree_value = metadata.get_new_rewards_tag_tree_value::<N::HasherBase>(tag, &children_reward_tree_values)?;
-
-        let full_expected_public_inputs_hash = N::HasherBase::two_to_one(&metadata.expected_public_inputs_hash, &reward_tree_value);
-
-        self.proof_verifier.verify_zk_proof_from_slice_check_public_inputs_hash(
-            job_id.circuit_type.to_u8() as u32,
-            &proof_bytes,
-            full_expected_public_inputs_hash,
-        )?;
-
-        // HACK: now set the correct reward tree value
-        self.temp_db
-            .set_proof_miner_rewards_tree_value(&self.realm_identifier, unique_pending_id, job_id, reward_tree_value)
-            .await?;
-        if self
-            .temp_db
-            .get_proof_miner_rewards_tree_value(&self.realm_identifier, unique_pending_id, job_id)
-            .await?
-            != reward_tree_value
-        {
-            anyhow::bail!("Failed to set rewards tree value for job id");
-        }
-
-        self.proof_store
-            .put_proof_bytes_for_job_id(job_id, unique_pending_id, &proof_bytes)
-            .await?;
-
-
-        /*
-        self.tag_tree_rewards_store
-            .rewards_tag_tree_set_node_tag(unique_pending_id, metadata.get_reward_tree_node_key(), tag, reward_tree_value)
-            .await?;
-
-        // now update the tag tree
-
-        if metadata.reward_tree_hash_mode == PROOF_REWARD_TREE_HASH_MODE_3_CHILDREN_DOUBLE_REWARD {
-            // special case for 3 children
-            if metadata.dependencies.len() != 3 || children_reward_tree_values.len() != 3 {
-                anyhow::bail!(
-                    "Expected 3 children for 3-children double reward hash mode, got {}",
-                    metadata.dependencies.len()
-                );
-            }
-            let zero = N::QHash::get_zero_value();
-
-            let left_value = hash_tag_tree_node::<N::QHash, N::HasherBase>(&children_reward_tree_values[0], &children_reward_tree_values[1], &tag);
-            let right_value = hash_tag_tree_node::<N::QHash, N::HasherBase>(&children_reward_tree_values[2], &zero, &tag);
-            let top_value = hash_tag_tree_node::<N::QHash, N::HasherBase>(&left_value, &right_value, &tag);
-            if top_value != reward_tree_value {
-                anyhow::bail!("Computed top value does not match reward tree value for 3-children double reward hash mode");
-            }
-            let self_key = metadata.get_reward_tree_node_key();
-            let left_key = self_key.left_child();
-            let right_key = self_key.right_child();
-            self.tag_tree_rewards_store
-                .rewards_tag_tree_set_node_tag(unique_pending_id, left_key, tag, left_value)
-                .await?;
-            self.tag_tree_rewards_store
-                .rewards_tag_tree_set_node_tag(unique_pending_id, right_key, tag, right_value)
-                .await?;
-            self.tag_tree_rewards_store
-                .rewards_tag_tree_set_node_tag(unique_pending_id, self_key, tag, top_value)
-                .await?;
-        } else if metadata.reward_tree_hash_mode == PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD {
-            // do nothing
-        } else {
-            let self_key = metadata.get_reward_tree_node_key();
-            self.tag_tree_rewards_store
-                .rewards_tag_tree_set_node_tag(unique_pending_id, self_key, tag, reward_tree_value)
-                .await?;
-        }
-        */
-        {
-            let expected_updates = metadata.get_new_rewards_tag_tree_updates::<N::HasherBase>(tag, &children_reward_tree_values, reward_tree_value)?;
-
-            for (key, node) in expected_updates {
-                self.tag_tree_rewards_store
-                    .rewards_tag_tree_set_node_tag(unique_pending_id, key, node.tag, node.value)
-                    .await?;
-            }
-        }
-
-        // ack the queue item as completed
-        let queue_key = RealmProvingWorkQueueKey::<N::QHash, N::JobId> {
-            realm_id: self.realm_id_u64,
-            realm_sub_id: self.realm_sub_id_u64,
-            unique_id: unique_proc_id,
-            task_group: 0,
-            queue_type: QPBaseQueueType::WorkerQueue,
-            _phantom_queue_item: std::marker::PhantomData,
-        };
-
-        let item = PsyProvingJobMetadataWithJobId {
-            job_id: job_id,
-            metadata,
-        };
-        self.get_proof_work_queue
-            .worker_queue_report_job_completed(&queue_key, self.realm_id_u64, self.realm_sub_id_u64, unique_proc_id, 0, &item)
-            .await?;
-
-        Ok(())
-    }
-    */
 }

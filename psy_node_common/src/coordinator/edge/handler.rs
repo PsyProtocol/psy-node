@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tokio::task;
 use parth_core::{
-    QCoreProcCheckpointUniqueId, QProvingJobDataIDWithRewardPath, crypto::hash::{merkle_proof::MerkleProofCore, tag_tree::TagTreeMerkleProof, traits::{HashTo4Felts, MerkleZeroHasher, QFieldHashable}}, data::{hash::merkle_node_key::SimpleMerkleNodeKey, queue::queue_key::QPBaseQueueType}, felt::ToU64Value, node::realm_identifier::QRealmIdentifier, protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofVerifier}
+    QCoreProcCheckpointUniqueId, QProvingJobDataIDWithRewardPath, crypto::hash::{merkle_proof::MerkleProofCore, tag_tree::TagTreeMerkleProof, traits::{HashTo4Felts, MerkleZeroHasher, QFieldHashable}}, data::{hash::merkle_node_key::SimpleMerkleNodeKey, queue::queue_key::QPBaseQueueType}, felt::{FromPrimitiveValuesFelt, ToU64Value}, node::realm_identifier::QRealmIdentifier, protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofVerifier}
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_crypto::hash::tx_hash::{compute_deploy_contract_content_hash, compute_update_contract_content_hash, hash_to_hex};
@@ -10,7 +10,10 @@ use psy_api_core::CheckpointJobStats;
 use psy_data::{
     guta::{
         header_extended::{GlobalUserTreeAggregatorHeaderWithTagValueAndJobID, GlobalUserTreeAggregatorHeaderWithTagValueAndJobType},
-        realm_finalize::protocol_encode_finalize_output,
+        realm_finalize::{
+            finalize_reward_root63, protocol_decode_finalize_output,
+            realm_finalize_guta_chain_domain, RealmFinalizeGUTAPublicOutput,
+        },
     },
     p2p::{sha256, Certificate, Proposal, RealmFinalizeSubmitCode},
     prepared_block::realm::PsyRealmCoordinatorUpdate,
@@ -34,7 +37,7 @@ use crate::{
     coordinator::queue_key::{CoordinatorDeployContractQueueKey, CoordinatorRegisterUserPublicKeyQueueKey, CoordinatorSubmitRealmGUTAUpdateQueueKey, CoordinatorUpdateContractQueueKey},
     p2p::guta_submit::GutaSubmitError,
     realm::processor::consensus::{
-        build_bound_finalize_output, certificate_includes_proposer, inclusion_lag_within_limit,
+        certificate_includes_proposer, inclusion_lag_within_limit,
         require_nonzero_validator_tree_root, validate_certificate, validator_tree_root_matches_proof_base,
         votes_meet_wait,
     },
@@ -648,6 +651,7 @@ impl<
         proof_bytes: Vec<u8>,
         proposal_bytes: Option<Vec<u8>>,
         certificate_bytes: Option<Vec<u8>>,
+        finalize_binding: Vec<u8>,
     ) -> anyhow::Result<()>
     where
         N::ZKVerifier: 'static,
@@ -688,12 +692,13 @@ impl<
             unique_pending_id,
             proving_circuit_type,
         )?;
-        self.verify_optional_guta_certificate(
+        self.verify_guta_certificate(
             realm_id,
             &input,
             &proof_bytes,
             proposal_bytes.as_deref(),
             certificate_bytes.as_deref(),
+            &finalize_binding,
         )
         .await?;
         let expected_public_inputs_hash = input.qfhash::<N::HasherBase>();
@@ -780,18 +785,39 @@ impl<
         Ok(())
     }
 
-    async fn verify_optional_guta_certificate(
+    /// Mandatory Realm-finalize admission gate.
+    ///
+    /// Reuses the existing tree lookup, scheduled-proposer calculation and BLS
+    /// FastAggregateVerify, and additionally verifies the actual finalizer
+    /// output carried by `finalize_binding` (442 bytes: 410-byte O + 32-byte
+    /// worker tag). The scheduled proposer's certificate vote over the
+    /// proposal identity D is the off-circuit BLS authorization; the
+    /// proof-bound fee user must equal that proposer's validator-leaf user ID.
+    async fn verify_guta_certificate(
         &self,
         realm_id: u32,
         input: &GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
         proof_bytes: &[u8],
         proposal_bytes: Option<&[u8]>,
         certificate_bytes: Option<&[u8]>,
+        finalize_binding: &[u8],
     ) -> anyhow::Result<()> {
+        let is_realm_finalize = input.job_type_u32 == ProvingJobCircuitType::RealmFinalizeGUTA as u32;
+        if is_realm_finalize {
+            anyhow::ensure!(
+                !finalize_binding.is_empty(),
+                "realm finalize submission requires a finalize binding"
+            );
+        } else {
+            anyhow::ensure!(
+                finalize_binding.is_empty(),
+                "finalize binding supplied for a non-realm-finalize GUTA submission"
+            );
+        }
         let Some((_index, checkpoints_per_epoch)) = self.validators.as_ref() else {
             anyhow::ensure!(
-                proposal_bytes.is_none() && certificate_bytes.is_none(),
-                "GUTA Proposal/Certificate supplied but coordinator has no validators"
+                !is_realm_finalize && proposal_bytes.is_none() && certificate_bytes.is_none(),
+                "realm finalize GUTA supplied but coordinator has no validators"
             );
             return Ok(());
         };
@@ -808,6 +834,35 @@ impl<
         anyhow::ensure!(proposal.realm_id == realm_id, "GUTA Proposal realm mismatch");
         anyhow::ensure!(proposal.finalizer_proof_hash == sha256(proof_bytes), "GUTA Proposal proof hash mismatch");
 
+        // 1. Realm-finalize only: strictly decode the binding and the actual
+        // output; bind them to the submitted header/tag and the circuit
+        // public input. Non-63 GUTA submissions carry no binding.
+        let output = if is_realm_finalize {
+            let binding = psy_data::guta::realm_finalize::RealmFinalizeBinding::protocol_decode(finalize_binding)
+                .map_err(|error| anyhow::anyhow!("invalid finalize binding: {error}"))?;
+            let output: RealmFinalizeGUTAPublicOutput<N::F, N::QHash> =
+                protocol_decode_finalize_output(&binding.output)
+                    .map_err(|error| anyhow::anyhow!("invalid Realm finalize output: {error}"))?;
+            anyhow::ensure!(
+                output.final_guta_header == input.header.header,
+                "finalize output final header does not match the submitted header"
+            );
+            let worker_tag = N::QHash::from_owned_32bytes(binding.finalizer_worker_reward_tag);
+            let reward_root63 = finalize_reward_root63::<N::F, N::QHash, N::HasherBase>(&output, &worker_tag);
+            anyhow::ensure!(
+                reward_root63 == input.header.new_tag_tree_node_value,
+                "finalize output does not bind the submitted reward tag (A/R63 mismatch)"
+            );
+            anyhow::ensure!(
+                proposal.public_output_hash == sha256(&binding.output),
+                "GUTA Proposal public output hash mismatch"
+            );
+            Some(output)
+        } else {
+            None
+        };
+
+        // 2. Canonical proof base, chain domain and field consistency.
         let canonical_base_checkpoint_id = self
             .db_reader
             .get_checkpoint_id_for_checkpoint_root_hash(input.header.header.checkpoint_tree_root)
@@ -817,12 +872,44 @@ impl<
             proposal.base_checkpoint_id == canonical_base_checkpoint_id,
             "GUTA Proposal proof-base checkpoint does not match submitted checkpoint tree root"
         );
+        if let Some(output) = &output {
+            anyhow::ensure!(
+                output.checkpoint_id == N::F::from_u64_value(canonical_base_checkpoint_id),
+                "finalize output checkpoint_id does not match the canonical proof base"
+            );
+            let expected_chain_domain =
+                realm_finalize_guta_chain_domain::<N::F, N::QHash, N::HasherBase>(self.chain_id);
+            anyhow::ensure!(
+                output.chain_domain == expected_chain_domain,
+                "finalize output chain domain mismatch"
+            );
+            anyhow::ensure!(
+                output.realm_id == N::F::from_u64_value(realm_id as u64),
+                "finalize output realm mismatch"
+            );
+            anyhow::ensure!(
+                output.validator_tree_root.into_owned_32bytes() == proposal.validator_tree_root,
+                "finalize output validator_tree_root mismatch"
+            );
+        }
         let proof_base_roots = self
             .db_reader
             .get_checkpoint_global_state_roots(proposal.base_checkpoint_id)
             .await?;
+        if let Some(output) = &output {
+            anyhow::ensure!(
+                output.validator_tree_root.into_owned_32bytes()
+                    == proof_base_roots.validator_tree_root.into_owned_32bytes(),
+                "finalize output validator tree root does not match the proof-base checkpoint"
+            );
+        }
+
+        // 3. Load checkpoint-authenticated validators; preimage chain ID must
+        // equal the configured chain ID (defense in depth beyond the circuit
+        // validator-tree proof).
         let (validator_sub_ids, keys, user_ids) = load_realm_validators_from_tree::<N::HasherBase, N::QHash, _>(
             &*self.db_reader,
+            self.chain_id,
             proposal.base_checkpoint_id,
             realm_id,
             &proof_base_roots.validator_tree_root,
@@ -845,6 +932,10 @@ impl<
             ),
             "GUTA Proposal validator_tree_root does not match proof-base checkpoint"
         );
+
+        // 4./5. Scheduled proposer for T = P + 1 and the fee-claim glue: the
+        // proof-bound output fee user must be the scheduled proposer's
+        // authenticated validator-leaf user ID.
         let inclusion_checkpoint_id = self
             .get_latest_checkpoint_id_internal()
             .await?
@@ -898,21 +989,25 @@ impl<
                 ),
             ).into());
         }
-        let proposer_user_id = user_ids
-            .iter()
-            .find(|(sub_id, _)| *sub_id == proposal.proposer_sub_id)
-            .map(|(_, user_id)| *user_id)
-            .ok_or_else(|| anyhow::anyhow!("GUTA proposer sub_id {} is not a validator", proposal.proposer_sub_id))?;
-        let output = build_bound_finalize_output::<N>(
-            proposal.chain_id,
-            proposal.realm_id,
-            proposal.proposer_sub_id,
-            proposer_user_id,
-            proof_base_roots.validator_tree_root,
-            input,
-        );
-        let output_bytes = protocol_encode_finalize_output(&output)?;
-        anyhow::ensure!(proposal.public_output_hash == sha256(&output_bytes), "GUTA Proposal public output hash mismatch");
+        if let Some(output) = &output {
+            anyhow::ensure!(
+                output.realm_sub_id == scheduled_proposer,
+                "finalize output sub_id is not the scheduled proposer"
+            );
+            let proposer_user_id = user_ids
+                .iter()
+                .find(|(sub_id, _)| *sub_id == proposal.proposer_sub_id)
+                .map(|(_, user_id)| *user_id)
+                .ok_or_else(|| anyhow::anyhow!("GUTA proposer sub_id {} is not a validator", proposal.proposer_sub_id))?;
+            anyhow::ensure!(
+                output.validator_user_id == N::F::from_u64_value(proposer_user_id),
+                "finalize output fee user is not the scheduled proposer's validator leaf user"
+            );
+        }
+
+        // 6. Certificate: checkpoint-tree keys, replication wait and mandatory
+        // scheduled-proposer inclusion. Its aggregate BLS signature over the
+        // proposal identity D is the finalizer authorization.
         validate_certificate(&proposal, &certificate, &validator_sub_ids, &keys).map_err(|error| {
             GutaSubmitError::illegal(
                 RealmFinalizeSubmitCode::InvalidCertificate,

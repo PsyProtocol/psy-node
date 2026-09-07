@@ -605,18 +605,6 @@ pub fn spawn_processor_realm_network<N>(
                         ).map_err(|error| anyhow::anyhow!("invalid Proposal body: {error}"))?;
                         let output = protocol_decode_finalize_output::<N::F, N::QHash>(&decoded.output)
                             .map_err(|error| anyhow::anyhow!("invalid Realm finalize output: {error}"))?;
-                        let mut submission = GlobalUserTreeAggregatorHeaderWithTagValueAndJobType {
-                            header: GlobalUserTreeAggregatorHeaderWithTagValue {
-                                header: output.final_guta_header,
-                                new_tag_tree_node_value: output.root_guta_reward_tag,
-                            },
-                            job_type_u32: 0,
-                        };
-                        submission.job_type_u32 = infer_root_job_type::<N>(
-                            proof_verifier.as_ref(),
-                            &submission,
-                            &decoded.proof,
-                        )?;
                         let proposer = validator_index
                             .get(&(proposal.realm_id, proposal.proposer_sub_id))
                             .ok_or_else(|| anyhow::anyhow!(
@@ -626,7 +614,6 @@ pub fn spawn_processor_realm_network<N>(
                         let decoded = verify_proposal_submission::<N>(
                             &proposal,
                             body.as_bytes(),
-                            &submission,
                             proposer.validator_user_id,
                             proof_verifier.as_ref(),
                         )?;

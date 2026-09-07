@@ -110,10 +110,6 @@ where     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + Fi
         ProvingJobCircuitType::RealmFinalizeGUTA,
         guta_circuits.realm_finalize_guta.get_verifier_triplet(),
     );
-    gcv.register_circuit_triplet(
-        ProvingJobCircuitType::WrappedSignatureProof,
-        guta_circuits.reward_signature.get_verifier_triplet(),
-    );
     let coordinator_circuits = QEDCoordinatorCircuitManager::<C, D>::new_with_guta(
         guta_circuits,
         circuit_config.global_user_tree_height,

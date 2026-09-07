@@ -21,8 +21,7 @@ use plonky2::{
     plonk::{
         circuit_builder::CircuitBuilder,
         circuit_data::{
-            CircuitConfig, CircuitData, CommonCircuitData, VerifierCircuitTarget,
-            VerifierOnlyCircuitData,
+            CircuitConfig, CircuitData, CommonCircuitData, VerifierOnlyCircuitData,
         },
         config::{AlgebraicHasher, GenericConfig},
         proof::{ProofWithPublicInputs, ProofWithPublicInputsTarget},
@@ -35,7 +34,6 @@ use psy_data::{
         header::GlobalUserTreeAggregatorHeader,
         realm_finalize::{
             RealmFinalizeGUTAAction, RealmFinalizeGUTAInput, RealmFinalizeGUTAPublicOutput,
-            SIGNATURE_TYPE_ZK,
         },
     },
     p2p::DOMAIN_VALIDATOR_LEAF_FELT,
@@ -222,14 +220,9 @@ where
     pub validator_user_tree_proof: MerkleProofGadget,
     pub current_validator_user_leaf: QEDUserLeafGadget,
     pub current_validator_user_tree_proof: MerkleProofGadget,
-    pub validator_public_key_param: HashOutTarget,
-    pub signature_proof_type: Target,
-    pub signature_proof: ProofWithPublicInputsTarget<D>,
-    pub signature_verifier_data: VerifierCircuitTarget,
     pub validator_fee_delta_proof: DeltaMerkleProofGadget,
     pub action_hash: HashOutTarget,
     pub final_guta_header: GlobalUserTreeAggregatorHeaderGadget,
-    pub signature_reward_value: HashOutTarget,
     pub worker_reward_tag: HashOutTarget,
     pub chain_domain: QHashOut<C::F>,
     pub circuit_data: CircuitData<C::F, C, D>,
@@ -466,10 +459,6 @@ where
         root_guta_common_data: &CommonCircuitData<C::F, D>,
         root_guta_verifier_cap_height: usize,
         guta_whitelist_tree_height: u8,
-        signature_common_data: &CommonCircuitData<C::F, D>,
-        signature_verifier_cap_height: usize,
-        zk_signature_fingerprint: QHashOut<C::F>,
-        signature_wrapper_fingerprint: QHashOut<C::F>,
         checkpoint_tree_height: usize,
         coordinator_global_user_tree_height: usize,
         validator_tree_height: usize,
@@ -634,52 +623,11 @@ where
             realm_id,
         ]);
 
-        let validator_public_key_param = builder.add_virtual_hash();
-        builder.ensure_hash_is_non_zero(validator_public_key_param);
-        let signature_proof_type = builder.add_virtual_target();
-        let expected_signature_type = builder.constant(C::F::from_canonical_u64(
-            SIGNATURE_TYPE_ZK as u64,
-        ));
-        builder.connect(signature_proof_type, expected_signature_type);
         let one = builder.one();
 
-        let signature_proof = builder.add_virtual_proof_with_pis(signature_common_data);
-        let signature_verifier_data =
-            builder.add_virtual_verifier_data(signature_verifier_cap_height);
-        builder.verify_proof::<C>(
-            &signature_proof,
-            &signature_verifier_data,
-            signature_common_data,
-        );
-        let actual_signature_fingerprint =
-            builder.get_circuit_fingerprint::<C::Hasher>(&signature_verifier_data);
-        let expected_signature_fingerprint = builder.constant_qhash(signature_wrapper_fingerprint);
-        builder.connect_hashes(
-            actual_signature_fingerprint,
-            expected_signature_fingerprint,
-        );
-
-        assert_eq!(signature_proof.public_inputs.len(), 4);
-        let signature_public_inputs = HashOutTarget {
-            elements: signature_proof.public_inputs[..4].try_into().unwrap(),
-        };
-        let expected_signature_public_inputs = builder.hash_two_to_one::<C::Hasher>(
-            action_hash,
-            validator_public_key_param,
-        );
-        let signature_reward_value = builder.add_virtual_hash();
-        let expected_signature_public_inputs = builder.hash_two_to_one::<C::Hasher>(
-            expected_signature_public_inputs,
-            signature_reward_value,
-        );
-        builder.connect_hashes(signature_public_inputs, expected_signature_public_inputs);
-
-        let raw_signature_fingerprint = builder.constant_qhash(zk_signature_fingerprint);
-        let expected_validator_public_key = builder.hash_two_to_one::<C::Hasher>(
-            raw_signature_fingerprint,
-            validator_public_key_param,
-        );
-        builder.connect_hashes(validator_user_leaf.public_key, expected_validator_public_key);
+        // The account's public-key field stays in its leaf hash and is preserved
+        // by the fee math below; its enforced derivation from a wallet-signature
+        // fingerprint/parameter was removed with the BLS auth cutover.
         builder.ensure_hash_is_non_zero(validator_user_leaf.public_key);
 
         let fee = root_header.stats.da_fees_collected;
@@ -740,14 +688,52 @@ where
             final_guta_header.to_hash::<C::Hasher, C::F, D>(&mut builder);
 
         let worker_reward_tag = builder.add_virtual_hash();
-        let child_rewards = builder.hash_two_to_one::<C::Hasher>(
+        // A = public_output_hash(O) over constrained targets, mirroring
+        // `RealmFinalizeGUTAPublicOutput::qfhash` exactly. A binds the full
+        // actual output to the reward tag and the circuit public input.
+        let chain_checkpoint_binding = builder.hash_two_to_one::<C::Hasher>(
+            chain_domain_target,
+            root_header.checkpoint_tree_root,
+        );
+        let checkpoint_binding = builder.hash_two_to_one::<C::Hasher>(
+            chain_checkpoint_binding,
+            checkpoint_validator_tree_root,
+        );
+        let reward_header_binding = builder.hash_two_to_one::<C::Hasher>(
+            root_guta_header_hash,
             root_guta.rewards_tree_value,
-            signature_reward_value,
         );
-        let rewards_tree_value = builder.hash_two_to_one::<C::Hasher>(
-            child_rewards,
-            worker_reward_tag,
+        let authorization_binding = builder.hash_two_to_one::<C::Hasher>(
+            reward_header_binding,
+            action_hash,
         );
+        let checkpoint_authorization_binding = builder.hash_two_to_one::<C::Hasher>(
+            checkpoint_binding,
+            authorization_binding,
+        );
+        let committed_fields = builder.hash_two_to_one::<C::Hasher>(
+            checkpoint_authorization_binding,
+            final_guta_header_hash,
+        );
+        let output_commitment = builder.hash_n_to_hash_no_pad::<C::Hasher>(vec![
+            committed_fields.elements[0],
+            committed_fields.elements[1],
+            committed_fields.elements[2],
+            committed_fields.elements[3],
+            checkpoint_id,
+            realm_id,
+            validator_user_id,
+            realm_sub_id,
+        ]);
+        // Standard tagged reward node: the root GUTA child's reward value on
+        // the left, the actual finalizer output commitment A on the right as a
+        // value-only boundary, and the finalizer worker's claim tag:
+        let reward_subtree_hash = builder.hash_two_to_one::<C::Hasher>(
+            root_guta.rewards_tree_value,
+            output_commitment,
+        );
+        let rewards_tree_value =
+            builder.hash_two_to_one::<C::Hasher>(reward_subtree_hash, worker_reward_tag);
         let public_inputs = builder.hash_two_to_one::<C::Hasher>(
             final_guta_header_hash,
             rewards_tree_value,
@@ -784,14 +770,9 @@ where
             validator_user_tree_proof,
             current_validator_user_leaf,
             current_validator_user_tree_proof,
-            validator_public_key_param,
-            signature_proof_type,
-            signature_proof,
-            signature_verifier_data,
             validator_fee_delta_proof,
             action_hash,
             final_guta_header,
-            signature_reward_value,
             worker_reward_tag,
             chain_domain,
             circuit_data,
@@ -800,7 +781,6 @@ where
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn prove_base(
         &self,
         input: &RealmFinalizeGUTAInput<C::F, QHashOut<C::F>>,
@@ -808,13 +788,9 @@ where
         root_guta_proof: &ProofWithPublicInputs<C::F, C, D>,
         root_guta_verifier_data: &VerifierOnlyCircuitData<C, D>,
         root_guta_reward_tag: QHashOut<C::F>,
-        signature_proof: &ProofWithPublicInputs<C::F, C, D>,
-        signature_verifier_data: &VerifierOnlyCircuitData<C, D>,
-        signature_reward_value: QHashOut<C::F>,
         worker_reward_tag: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         let mut witness = PartialWitness::<C::F>::new();
-        witness.set_hash_target(self.signature_reward_value, signature_reward_value.0)?;
         witness.set_hash_target(self.worker_reward_tag, worker_reward_tag.0)?;
         self.root_guta.set_witness(
             &mut witness,
@@ -869,16 +845,6 @@ where
         self.current_validator_user_tree_proof.set_witness_core_proof_q_generic(
             &mut witness,
             &input.current_validator_user_tree_proof,
-        )?;
-        witness.set_hash_target(
-            self.validator_public_key_param,
-            input.validator_public_key_param.0,
-        )?;
-        witness.set_target(self.signature_proof_type, input.signature_proof_type)?;
-        witness.set_proof_with_pis_target(&self.signature_proof, signature_proof)?;
-        witness.set_verifier_data_target(
-            &self.signature_verifier_data,
-            signature_verifier_data,
         )?;
         self.validator_fee_delta_proof
             .set_witness_core_proof_q(&mut witness, &input.validator_fee_delta_proof)?;
@@ -976,35 +942,23 @@ where
         >,
         worker_reward_tag: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
-        input.ensure_expected_child_proof_count(2)?;
+        input.ensure_expected_child_proof_count(1)?;
         anyhow::ensure!(
-            input.base.child_proof_tag_values.len() == 2,
-            "RealmFinalizeGUTA requires exactly two child reward values",
+            input.base.child_proof_tag_values.len() == 1,
+            "RealmFinalizeGUTA requires exactly one child reward value",
         );
 
         let witness = RealmFinalizeGUTAInput::<C::F, QHashOut<C::F>>::psy_ser_from_slice(
             &input.base.witness,
         )?;
         let root_guta_type = input.get_child_proof_circuit_type(0)?;
-        let signature_type = input.get_child_proof_circuit_type(1)?;
-        if witness.signature_proof_type.to_u64_value() != SIGNATURE_TYPE_ZK as u64 {
-            anyhow::bail!("RealmFinalizeGUTA requires a wrapped ZK signature proof");
-        }
-        if signature_type != ProvingJobCircuitType::WrappedSignatureProof {
-            anyhow::bail!(
-                "RealmFinalizeGUTA requires WrappedSignatureProof, got {:?}",
-                signature_type
-            );
-        }
 
         let root_guta_whitelist_proof = library.get_group_inclusion_proof(
             ProvingJobCircuitType::RealmFinalizeGUTA,
             root_guta_type,
         )?;
         let root_guta_proof = deserialize_plonky2_proof::<C, D>(&input.input_proofs[0])?;
-        let signature_proof = deserialize_plonky2_proof::<C, D>(&input.input_proofs[1])?;
         let root_guta_verifier_data = library.get_verifier_data(root_guta_type)?;
-        let signature_verifier_data = library.get_verifier_data(signature_type)?;
 
         self.prove_base(
             &witness,
@@ -1012,9 +966,6 @@ where
             &root_guta_proof,
             &root_guta_verifier_data,
             input.base.child_proof_tag_values[0],
-            &signature_proof,
-            &signature_verifier_data,
-            input.base.child_proof_tag_values[1],
             worker_reward_tag,
         )
     }

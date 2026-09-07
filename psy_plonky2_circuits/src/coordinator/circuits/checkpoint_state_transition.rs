@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use parth_core::{crypto::hash::{merkle_proof::compute_root_merkle_proof_generic, tag_tree::hash_tag_tree_node_single, traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable}}, felt::QFelt64, pgoldilocks::{QGenericConfig, QHashOut}, protocol::core_types::{Q256BitHash, QFHashBase, QHashBase}};
 use plonky2::{
-    hash::hash_types::{HashOut, HashOutTarget}, iop::
-        witness::{PartialWitness, WitnessWrite}, plonk::{
+    hash::hash_types::{HashOut, HashOutTarget}, iop::target::Target, iop::witness::{
+        PartialWitness, WitnessWrite}, plonk::{
         circuit_builder::CircuitBuilder,
         circuit_data::{CircuitConfig, CircuitData, CommonCircuitData, VerifierOnlyCircuitData},
         config::{AlgebraicHasher, GenericConfig},
@@ -510,3 +510,4 @@ where
         Ok(proof)
     }
 }
+

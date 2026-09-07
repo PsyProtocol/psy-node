@@ -93,8 +93,9 @@ impl<
         _realm_id: u64,
         proposal: Option<Vec<u8>>,
         certificate: Option<Vec<u8>>,
+        finalize_binding: Vec<u8>,
     ) -> QRpcResult<String> {
-        res_guta(self.submit_guta_internal(input, proof, proposal, certificate).await.map_err(GutaSubmitError::from))
+        res_guta(self.submit_guta_internal(input, proof, proposal, certificate, finalize_binding).await.map_err(GutaSubmitError::from))
     }
 
     async fn get_user_ids_for_public_key(&self, public_key: N::QHash, start_user_id: u64, count: u32) -> QRpcResult<Vec<u64>> {

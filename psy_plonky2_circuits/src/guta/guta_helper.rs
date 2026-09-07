@@ -7,10 +7,6 @@ use plonky2::{
         config::{AlgebraicHasher, GenericConfig},
     },
 };
-use psy_common_circuit::circuits::{
-    traits::qstandard::QStandardCircuit as CommonQStandardCircuit,
-    zk_signature3::core::PsyBasicZKSignatureCircuit,
-};
 use psy_core::{job::job_id::{ProvingJobCircuitType, QProvingJobDataID}, worker::traits::QNextGenWorkerGenericInfo};
 use psy_data::{
     worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse,
@@ -20,48 +16,6 @@ use psy_worker_core::worker::prover_trait::{PsyWorkerGenericLibraryProver, PsyWo
 use plonky2::{iop::witness::{PartialWitness, WitnessWrite}, hash::hash_types::HashOutTarget, plonk::{circuit_builder::CircuitBuilder, circuit_data::{CircuitConfig, CircuitData, VerifierOnlyCircuitData}, proof::{ProofWithPublicInputs, ProofWithPublicInputsTarget}}};
 use psy_plonky2_basic_helpers::builder::hash::core::CircuitBuilderHashCore;
 
-#[derive(Debug)]
-pub struct RewardSignatureCircuit<C: GenericConfig<D>, const D: usize> {
-    proof: ProofWithPublicInputsTarget<D>,
-    worker_reward_tag: HashOutTarget,
-    pub circuit_data: CircuitData<C::F, C, D>,
-    fingerprint: QHashOut<C::F>,
-}
-
-impl<C: GenericConfig<D>, const D: usize> RewardSignatureCircuit<C, D>
-where C::Hasher: AlgebraicHasher<C::F> {
-    fn new(signature: &PsyBasicZKSignatureCircuit<C, D>) -> Self {
-        let mut builder = CircuitBuilder::<C::F, D>::new(CircuitConfig::standard_recursion_config());
-        let common = CommonQStandardCircuit::get_common_circuit_data_ref(signature);
-        let proof = builder.add_virtual_proof_with_pis(common);
-        let verifier = builder.constant_verifier_data(CommonQStandardCircuit::get_verifier_config_ref(signature));
-        builder.verify_proof::<C>(&proof, &verifier, common);
-        let worker_reward_tag = builder.add_virtual_hash();
-        let zero = HashOutTarget { elements: [builder.zero(); 4] };
-        let children = builder.hash_two_to_one::<C::Hasher>(zero, zero);
-        let reward = builder.hash_two_to_one::<C::Hasher>(children, worker_reward_tag);
-        let header = HashOutTarget { elements: proof.public_inputs.as_slice().try_into().unwrap() };
-        let public_inputs = builder.hash_two_to_one::<C::Hasher>(header, reward);
-        builder.register_public_inputs(&public_inputs.elements);
-        let circuit_data = builder.build::<C>();
-        let fingerprint = QHashOut(crate::proof_minifier::pm_core::get_circuit_fingerprint_generic(&circuit_data.verifier_only));
-        Self { proof, worker_reward_tag, circuit_data, fingerprint }
-    }
-
-    pub fn prove(&self, signature: &ProofWithPublicInputs<C::F, C, D>, tag: QHashOut<C::F>) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
-        let mut witness = PartialWitness::new();
-        witness.set_proof_with_pis_target(&self.proof, signature)?;
-        witness.set_hash_target(self.worker_reward_tag, tag.0)?;
-        self.circuit_data.prove(witness)
-    }
-}
-
-impl<C: GenericConfig<D>, const D: usize> QStandardCircuit<C, D> for RewardSignatureCircuit<C, D>
-where C::Hasher: AlgebraicHasher<C::F> {
-    fn get_fingerprint(&self) -> QHashOut<C::F> { self.fingerprint }
-    fn get_verifier_config_ref(&self) -> &VerifierOnlyCircuitData<C, D> { &self.circuit_data.verifier_only }
-    fn get_common_circuit_data_ref(&self) -> &CommonCircuitData<C::F, D> { &self.circuit_data.common }
-}
 
 use super::circuits::{
     guta_no_change::GUTANoChangeCircuit, verify_guta_to_cap::GUTAVerifyGUTAToCapCircuit,
@@ -88,8 +42,6 @@ where
     pub verify_guta_left_linear_right_leaf_upgrade_checkpoint: GUTAVerifyLeftLinearRightLeafUpgradeCheckpointCircuit<C, D>,
     pub no_change: GUTANoChangeCircuit<C, D>,
     pub realm_finalize_guta: RealmFinalizeGUTACircuit<C, D>,
-    pub zk_signature: PsyBasicZKSignatureCircuit<C, D>,
-    pub reward_signature: RewardSignatureCircuit<C, D>,
 
     pub verify_two_guta_upgrade_checkpoint: GUTAVerifyTwoGUTAUpgradeCheckpointCircuitV2<C, D>,
     pub verify_guta_to_cap_upgrade_checkpoint: GUTAVerifyGUTAToCapUpgradeCheckpointCircuit<C, D>,
@@ -277,16 +229,10 @@ where
             GUTAVerifyGUTAToCapUpgradeCheckpointCircuit::<C, D>::new(guta_proof_common_data, guta_proof_verifier_data_cap_height, coordinator_global_user_tree_height, global_user_tree_height, guta_circuit_whitelist_tree_height, checkpoint_tree_height);
 
         let no_change = GUTANoChangeCircuit::<C, D>::new(checkpoint_tree_height);
-        let zk_signature = PsyBasicZKSignatureCircuit::<C, D>::new();
-        let reward_signature = RewardSignatureCircuit::new(&zk_signature);
         let realm_finalize_guta = RealmFinalizeGUTACircuit::<C, D>::new(
             guta_proof_common_data,
             guta_proof_verifier_data_cap_height,
             guta_circuit_whitelist_tree_height,
-            reward_signature.get_common_circuit_data_ref(),
-            reward_signature.get_verifier_config_ref().constants_sigmas_cap.height(),
-            QHashOut(CommonQStandardCircuit::get_fingerprint(&zk_signature).0),
-            reward_signature.get_fingerprint(),
             checkpoint_tree_height,
             coordinator_global_user_tree_height,
             coordinator_global_user_tree_height + 8,
@@ -342,13 +288,10 @@ where
             verify_guta_to_cap,
             no_change,
             realm_finalize_guta,
-            zk_signature,
-            reward_signature,
+            guta_circuit_whitelist_root: verify_two_guta_whitelist_proof.root,
             realm_finalize_guta_whitelist_proof,
             verify_two_guta_upgrade_checkpoint,
             verify_guta_to_cap_upgrade_checkpoint,
-
-            guta_circuit_whitelist_root: verify_two_guta_whitelist_proof.root,
             worker_reward_tag,
             verify_single_end_cap_whitelist_proof,
             verify_two_end_cap_whitelist_proof,
@@ -473,12 +416,6 @@ where
             self.realm_finalize_guta.get_fingerprint(),
             self.realm_finalize_guta.get_verifier_config_ref().into(),
         );
-        library.register_circuit(
-            ProvingJobCircuitType::WrappedSignatureProof.into(),
-            self.reward_signature.get_fingerprint(),
-            self.reward_signature.get_verifier_config_ref().into(),
-        );
-
         let all_group = [
             ProvingJobCircuitType::GUTASingleEndCap,
             ProvingJobCircuitType::GUTATwoEndCap,
@@ -577,7 +514,6 @@ where
             ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade => true,
             ProvingJobCircuitType::GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint => true,
             ProvingJobCircuitType::RealmFinalizeGUTA => true,
-            ProvingJobCircuitType::WrappedSignatureProof => true,
             _ => false,
         }
     }
@@ -650,13 +586,6 @@ where
             ProvingJobCircuitType::RealmFinalizeGUTA => self
                 .realm_finalize_guta
                 .prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag),
-            ProvingJobCircuitType::WrappedSignatureProof => {
-                input.ensure_expected_child_proof_count(0)?;
-                let signature = crate::utils::proof_serialization::deserialize_plonky2_proof::<C, D>(
-                    &input.base.witness,
-                )?;
-                self.reward_signature.prove(&signature, worker_reward_tag)
-            }
             _ => anyhow::bail!("unsupported circuit: {:?}", input.base.job.job_id.circuit_type),
         }?;
         serialize_plonky2_proof::<C, D>(&proof)

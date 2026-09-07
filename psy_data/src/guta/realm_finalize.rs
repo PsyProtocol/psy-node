@@ -16,18 +16,12 @@ use crate::{
         stats::GUTAStats,
         sub_tree_transition::SubTreeNodeStateTransition,
     },
-    p2p::{validate_goldilocks_limb, DOMAIN_VALIDATOR_LEAF_FELT, ProtocolReader, ProtocolResult, write_fixed, write_u16, write_u64},
+    p2p::{validate_goldilocks_limb, validate_hash32_canonical, DOMAIN_VALIDATOR_LEAF_FELT, ProtocolError, ProtocolReader, ProtocolResult, write_fixed, write_u16, write_u64},
     v1::qdata::{
         checkpoint::{PQEDCheckpointLeaf, PQEDCheckpointLeafCompactWithStateRoots},
         user::PQEDUserLeaf,
     },
 };
-
-// =================================================================================
-// Signature Proof Type
-// =================================================================================
-
-pub const SIGNATURE_TYPE_ZK: u8 = 0;
 
 // =================================================================================
 // Validator Leaf Hash
@@ -290,14 +284,151 @@ where
 }
 
 // =================================================================================
+// Finalizer Binding (off-circuit BLS authorization material)
+// =================================================================================
+
+/// Exact wire length of [`RealmFinalizeBinding`]: 410-byte output + 32-byte tag.
+pub const REALM_FINALIZE_BINDING_WIRE_BYTES: usize = 410 + 32;
+
+/// Public binding payload required by the `psy_submit_guta` Realm admission gate.
+///
+/// It carries the actual canonical circuit output plus the finalizer worker
+/// reward tag needed to recompute the circuit reward root. It contains no
+/// signature and no secret: authorization is the Coordinator-verified BLS
+/// certificate over the proposal identity derived from this output.
+///
+/// Wire encoding is direct concatenation in declaration order, exactly
+/// [`REALM_FINALIZE_BINDING_WIRE_BYTES`]; decoders reject trailing bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RealmFinalizeBinding {
+    /// Actual canonical finalizer output; required, no default.
+    pub output: [u8; 410],
+    /// Canonical field-hash bytes of the finalizer worker reward tag.
+    pub finalizer_worker_reward_tag: [u8; 32],
+}
+
+impl RealmFinalizeBinding {
+    pub fn protocol_encode_to_vec(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(REALM_FINALIZE_BINDING_WIRE_BYTES);
+        write_fixed(&mut out, &self.output);
+        write_fixed(&mut out, &self.finalizer_worker_reward_tag);
+        out
+    }
+
+    /// Strictly decode a 442-byte binding; rejects wrong length and
+    /// noncanonical worker-tag field limbs.
+    pub fn protocol_decode(bytes: &[u8]) -> ProtocolResult<Self> {
+        if bytes.len() != REALM_FINALIZE_BINDING_WIRE_BYTES {
+            return Err(ProtocolError::InvalidLength {
+                what: "RealmFinalizeBinding",
+                got: bytes.len(),
+                expected: REALM_FINALIZE_BINDING_WIRE_BYTES,
+            });
+        }
+        let mut output = [0u8; 410];
+        output.copy_from_slice(&bytes[..410]);
+        let mut tag = [0u8; 32];
+        tag.copy_from_slice(&bytes[410..]);
+        validate_hash32_canonical(&tag)?;
+        Ok(Self {
+            output,
+            finalizer_worker_reward_tag: tag,
+        })
+    }
+}
+
+/// Reconstruct the actual finalizer output from the exact planner witness
+/// artifacts and the root GUTA reward tag.
+///
+/// This mirrors the circuit's constrained output construction bit-for-bit and
+/// must stay in lockstep with `RealmFinalizeGUTACircuit::expected_public_output`.
+pub fn finalize_output_from_witness<F, Hash, H>(
+    input: &RealmFinalizeGUTAInput<F, Hash>,
+    chain_domain: Hash,
+    root_guta_reward_tag: Hash,
+) -> RealmFinalizeGUTAPublicOutput<F, Hash>
+where
+    F: QFelt64,
+    Hash: Q256BitHash + QFHashBase<F>,
+    H: FieldQHasher<F, Hash>,
+{
+    let root_guta_header_hash = input.root_guta_header.qfhash::<H>();
+    let action = RealmFinalizeGUTAAction {
+        chain_domain,
+        checkpoint_id: input.checkpoint_id,
+        realm_id: input.root_guta_header.state_transition.node_index,
+        checkpoint_tree_root: input.root_guta_header.checkpoint_tree_root,
+        validator_tree_root: input.checkpoint_leaf.global_state_roots.validator_tree_root,
+        root_guta_header_hash,
+    };
+    let mut final_guta_header = input.root_guta_header.clone();
+    final_guta_header.state_transition.new_node_value = input.validator_fee_delta_proof.new_root;
+    final_guta_header.total_aggregation_proofs_generated =
+        F::from_u64_value(final_guta_header.total_aggregation_proofs_generated.to_u64_value() + 1);
+    RealmFinalizeGUTAPublicOutput {
+        chain_domain,
+        checkpoint_id: input.checkpoint_id,
+        realm_id: input.root_guta_header.state_transition.node_index,
+        realm_sub_id: input.realm_sub_id,
+        checkpoint_tree_root: input.root_guta_header.checkpoint_tree_root,
+        validator_tree_root: input.checkpoint_leaf.global_state_roots.validator_tree_root,
+        validator_user_id: input.validator_user_id,
+        root_guta_header_hash,
+        root_guta_reward_tag,
+        action_hash: action.action_hash::<H>(),
+        final_guta_header,
+    }
+}
+
+
+/// Finalizer reward root as the standard tagged tag-tree node:
+/// `R63 = H(H(O.root_guta_reward_tag, A), worker_tag)` where
+/// `A = output.public_output_hash::<H>()` is the output commitment stored as a
+/// value-only right sibling and `O.root_guta_reward_tag` is the root GUTA
+/// child's reward value on the left.
+pub fn finalize_reward_root63<F, Hash, H>(
+    output: &RealmFinalizeGUTAPublicOutput<F, Hash>,
+    finalizer_worker_reward_tag: &Hash,
+) -> Hash
+where
+    F: QFelt64,
+    Hash: Q256BitHash + QFHashBase<F>,
+    H: FieldQHasher<F, Hash>,
+{
+    let output_commitment = output.public_output_hash::<H>();
+    H::q_two_to_one(
+        H::q_two_to_one(output.root_guta_reward_tag, output_commitment),
+        *finalizer_worker_reward_tag,
+    )
+}
+
+/// Expected circuit-63 public input:
+/// `PI63 = H(output.final_guta_header_hash(), R63)`.
+pub fn finalize_public_input_hash<F, Hash, H>(
+    output: &RealmFinalizeGUTAPublicOutput<F, Hash>,
+    finalizer_worker_reward_tag: &Hash,
+) -> Hash
+where
+    F: QFelt64,
+    Hash: Q256BitHash + QFHashBase<F>,
+    H: FieldQHasher<F, Hash>,
+{
+    let reward_root63 = finalize_reward_root63::<F, Hash, H>(output, finalizer_worker_reward_tag);
+    H::q_two_to_one(output.final_guta_header_hash::<H>(), reward_root63)
+}
+
+// =================================================================================
 // Witness Input (private)
 // =================================================================================
 
 /// Private witness for the RealmFinalizeGUTA circuit.
 ///
-/// Proofs arrive as fixed-order worker child dependencies:
+/// The realm finalizer has exactly one worker child dependency:
 ///   - input_proofs[0] = root GUTA proof
-///   - input_proofs[1] = wrapped recursive ZK signature proof
+///
+/// BLS authorization happens off-circuit at the processor/Coordinator
+/// boundary; no wallet key, public-key parameter or signature witness enters
+/// this struct.
 #[pderive::serialize_clone_f_hash]
 pub struct RealmFinalizeGUTAInput<F, Hash> {
     pub root_guta_header: GlobalUserTreeAggregatorHeader<F, Hash>,
@@ -320,9 +451,6 @@ pub struct RealmFinalizeGUTAInput<F, Hash> {
     pub validator_user_tree_proof: MerkleProofCore<Hash>,
     pub current_validator_user_leaf: PQEDUserLeaf<F, Hash>,
     pub current_validator_user_tree_proof: MerkleProofCore<Hash>,
-
-    pub validator_public_key_param: Hash,
-    pub signature_proof_type: F,
 
     pub validator_fee_delta_proof: DeltaMerkleProofCore<Hash>,
 }
@@ -347,8 +475,6 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for RealmFinalizeGUTAInput<F
             validator_user_tree_proof: MerkleProofCore::qp_rand_gen(),
             current_validator_user_leaf: PQEDUserLeaf::qp_rand_gen(),
             current_validator_user_tree_proof: MerkleProofCore::qp_rand_gen(),
-            validator_public_key_param: Hash::qp_rand_gen(),
-            signature_proof_type: F::qp_rand_gen(),
             validator_fee_delta_proof: DeltaMerkleProofCore::qp_rand_gen(),
         }
     }
@@ -377,8 +503,6 @@ impl<F: QFelt64, Hash: Q256BitHash + PsyIOReadWrite> FallbackPsySerializeCanonic
             + self.validator_user_tree_proof.pio_serialized_size()
             + self.current_validator_user_leaf.pio_serialized_size()
             + self.current_validator_user_tree_proof.pio_serialized_size()
-            + 32 // validator_public_key_param
-            + 8 // signature_proof_type
             + self.validator_fee_delta_proof.pio_serialized_size()
     }
 
@@ -404,8 +528,6 @@ impl<F: QFelt64, Hash: Q256BitHash + PsyIOReadWrite> FallbackPsySerializeCanonic
         self.validator_user_tree_proof.pio_write_to_io(writer)?;
         self.current_validator_user_leaf.pio_write_to_io(writer)?;
         self.current_validator_user_tree_proof.pio_write_to_io(writer)?;
-        self.validator_public_key_param.pio_write_to_io(writer)?;
-        writer.psy_write_u64(self.signature_proof_type.to_u64_value())?;
         self.validator_fee_delta_proof.pio_write_to_io(writer)?;
         Ok(())
     }
@@ -434,8 +556,6 @@ impl<F: QFelt64, Hash: Q256BitHash + PsyIOReadWrite> FallbackPsySerializeCanonic
         let validator_user_tree_proof = MerkleProofCore::<Hash>::pio_read_from_io(reader)?;
         let current_validator_user_leaf = PQEDUserLeaf::<F, Hash>::pio_read_from_io(reader)?;
         let current_validator_user_tree_proof = MerkleProofCore::<Hash>::pio_read_from_io(reader)?;
-        let validator_public_key_param = Hash::pio_read_from_io(reader)?;
-        let signature_proof_type = F::from_owned_u64(reader.psy_read_u64()?);
         let validator_fee_delta_proof = DeltaMerkleProofCore::<Hash>::pio_read_from_io(reader)?;
         Ok(Self {
             root_guta_header,
@@ -455,8 +575,6 @@ impl<F: QFelt64, Hash: Q256BitHash + PsyIOReadWrite> FallbackPsySerializeCanonic
             validator_user_tree_proof,
             current_validator_user_leaf,
             current_validator_user_tree_proof,
-            validator_public_key_param,
-            signature_proof_type,
             validator_fee_delta_proof,
         })
     }
@@ -501,5 +619,207 @@ mod chain_domain_tests {
         let old_domain = realm_finalize_guta_chain_domain::<PGoldilocksFelt, PGoldilocksHash, PoseidonHasher>(0);
         assert_ne!(domain, old_domain);
         assert_eq!(domain, PoseidonHasher::q_hash_many(&[PGoldilocksFelt::from_u64_value(magic)]));
+    }
+}
+
+#[cfg(test)]
+mod finalize_binding_tests {
+    use super::*;
+    use crate::p2p::{GOLDILOCKS_MODULUS, ProtocolError};
+
+    #[test]
+    fn binding_roundtrip_accepts_largest_canonical_tag() {
+        let mut tag = [0u8; 32];
+        tag[24..32].copy_from_slice(&(GOLDILOCKS_MODULUS - 1).to_le_bytes());
+        let binding = RealmFinalizeBinding {
+            output: [0x11; 410],
+            finalizer_worker_reward_tag: tag,
+        };
+        let encoded = binding.protocol_encode_to_vec();
+        assert_eq!(encoded.len(), REALM_FINALIZE_BINDING_WIRE_BYTES);
+        assert_eq!(RealmFinalizeBinding::protocol_decode(&encoded).unwrap(), binding);
+    }
+
+    #[test]
+    fn binding_decode_rejects_noncanonical_tag_and_wrong_length() {
+        let mut tag = [0u8; 32];
+        tag[24..32].copy_from_slice(&GOLDILOCKS_MODULUS.to_le_bytes());
+        let binding = RealmFinalizeBinding {
+            output: [0x22; 410],
+            finalizer_worker_reward_tag: tag,
+        };
+        let encoded = binding.protocol_encode_to_vec();
+        assert!(matches!(
+            RealmFinalizeBinding::protocol_decode(&encoded),
+            Err(ProtocolError::NonCanonicalField { .. })
+        ));
+
+        let ok_tag = [0u8; 32];
+        let mut truncated = RealmFinalizeBinding {
+            output: [0x22; 410],
+            finalizer_worker_reward_tag: ok_tag,
+        }
+        .protocol_encode_to_vec();
+        truncated.pop();
+        assert!(matches!(
+            RealmFinalizeBinding::protocol_decode(&truncated),
+            Err(ProtocolError::InvalidLength { .. })
+        ));
+        let mut trailing = RealmFinalizeBinding {
+            output: [0x22; 410],
+            finalizer_worker_reward_tag: ok_tag,
+        }
+        .protocol_encode_to_vec();
+        trailing.push(0);
+        assert!(matches!(
+            RealmFinalizeBinding::protocol_decode(&truncated),
+            Err(ProtocolError::InvalidLength { .. })
+        ));
+    }
+}
+
+#[cfg(test)]
+mod finalize_reward_root63_tests {
+    use super::*;
+    use parth_core::crypto::hash::tag_tree::{
+        compute_tag_tree_root_for_proof, hash_tag_tree_node, TagTreeNodePreimage, TagTreeProofNode,
+    };
+    use parth_core::felt::FromPrimitiveValuesFelt;
+    use parth_core::pgoldilocks::{PGoldilocksFelt, PoseidonHasher};
+
+    type F = parth_core::PF;
+    type Hash = parth_core::PHash;
+
+    use parth_core::crypto::hash::traits::ZeroableHash;
+
+    fn sample_output(root_guta_reward_tag: Hash) -> RealmFinalizeGUTAPublicOutput<F, Hash> {
+        RealmFinalizeGUTAPublicOutput {
+            chain_domain: realm_finalize_guta_chain_domain::<F, Hash, PoseidonHasher>(17),
+            checkpoint_id: F::from_u64_value(3),
+            realm_id: F::from_u64_value(1),
+            realm_sub_id: 1,
+            checkpoint_tree_root: Hash::get_zero_value(),
+            validator_tree_root: Hash::get_zero_value(),
+            validator_user_id: F::from_u64_value(1048576),
+            root_guta_header_hash: Hash::get_zero_value(),
+            root_guta_reward_tag,
+            action_hash: Hash::get_zero_value(),
+            final_guta_header: GlobalUserTreeAggregatorHeader {
+                guta_circuit_whitelist: Hash::get_zero_value(),
+                checkpoint_tree_root: Hash::get_zero_value(),
+                state_transition: SubTreeNodeStateTransition {
+                    old_node_value: Hash::get_zero_value(),
+                    new_node_value: Hash::get_zero_value(),
+                    node_index: F::from_u64_value(1),
+                    node_level: F::from_u64_value(12),
+                },
+                stats: GUTAStats::get_zero_value(),
+                total_aggregation_proofs_generated: F::from_u64_value(0),
+            },
+        }
+    }
+
+    #[test]
+    fn finalizer_leaf_preimage_and_child_sibling_path_derive_same_root() {
+        let t_root = PoseidonHasher::q_hash_many(&[PGoldilocksFelt::from_u64_value(13)]);
+        let tag = PoseidonHasher::q_hash_many(&[PGoldilocksFelt::from_u64_value(12)]);
+        let zero = Hash::get_zero_value();
+
+        // The root GUTA child's reward value derives from its own mode-0 leaf.
+        let child_leaf = TagTreeNodePreimage {
+            left: zero,
+            right: zero,
+            tag: t_root,
+        };
+        let v_c0 = compute_tag_tree_root_for_proof::<Hash, PoseidonHasher>(0, &child_leaf, &[]);
+
+        // A commits the full output including the child's reward value, so
+        // the host output tag and the stored tree left value agree by
+        // construction.
+        let output = sample_output(v_c0);
+        let a = output.public_output_hash::<PoseidonHasher>();
+        let root = hash_tag_tree_node::<Hash, PoseidonHasher>(&v_c0, &a, &tag);
+
+        // Finalizer worker claim at f: preimage {left: child reward, right: A,
+        // tag: worker tag} derives exactly the persisted reward root.
+        let finalizer_leaf = TagTreeNodePreimage { left: v_c0, right: a, tag };
+        assert_eq!(
+            compute_tag_tree_root_for_proof::<Hash, PoseidonHasher>(0, &finalizer_leaf, &[]),
+            root
+        );
+        assert_eq!(
+            finalize_reward_root63::<F, Hash, PoseidonHasher>(&output, &tag),
+            root
+        );
+
+        // Root-GUTA child worker claim at c=left(f): its own leaf derives
+        // V_c0, then one up-step over the stored sibling A with the parent
+        // tag lands on the identical root.
+        assert_eq!(
+            compute_tag_tree_root_for_proof::<Hash, PoseidonHasher>(
+                0, // left child: sibling goes on the right of the up-step
+                &child_leaf,
+                &[TagTreeProofNode { sibling: a, parent_tag: tag }],
+            ),
+            root
+        );
+        assert_eq!(hash_tag_tree_node::<Hash, PoseidonHasher>(&v_c0, &a, &tag), root);
+    }
+
+    #[test]
+    fn reward_root_rejects_tampered_a_tag_and_child_value() {
+        let tag = PoseidonHasher::q_hash_many(&[PGoldilocksFelt::from_u64_value(22)]);
+        let t_root = PoseidonHasher::q_hash_many(&[PGoldilocksFelt::from_u64_value(23)]);
+        let wrong = PoseidonHasher::q_hash_many(&[PGoldilocksFelt::from_u64_value(99)]);
+        let zero = Hash::get_zero_value();
+        let child_leaf = TagTreeNodePreimage { left: zero, right: zero, tag: t_root };
+        let c0 = compute_tag_tree_root_for_proof::<Hash, PoseidonHasher>(0, &child_leaf, &[]);
+
+        let output = sample_output(c0);
+        let a = output.public_output_hash::<PoseidonHasher>();
+        let true_root = hash_tag_tree_node::<Hash, PoseidonHasher>(&c0, &a, &tag);
+        assert_eq!(
+            compute_tag_tree_root_for_proof::<Hash, PoseidonHasher>(
+                0, &child_leaf, &[TagTreeProofNode { sibling: a, parent_tag: tag }],
+            ),
+            true_root
+        );
+
+        // Tampered A in the finalizer preimage.
+        let tampered_a_leaf = TagTreeNodePreimage { left: c0, right: wrong, tag };
+        assert_ne!(
+            compute_tag_tree_root_for_proof::<Hash, PoseidonHasher>(0, &tampered_a_leaf, &[]),
+            true_root
+        );
+        // Tampered worker tag in the finalizer preimage.
+        let tampered_tag_leaf = TagTreeNodePreimage { left: c0, right: a, tag: wrong };
+        assert_ne!(
+            compute_tag_tree_root_for_proof::<Hash, PoseidonHasher>(0, &tampered_tag_leaf, &[]),
+            true_root
+        );
+        // Tampered child reward value on the left.
+        let tampered_c0_leaf = TagTreeNodePreimage { left: wrong, right: a, tag };
+        assert_ne!(
+            compute_tag_tree_root_for_proof::<Hash, PoseidonHasher>(0, &tampered_c0_leaf, &[]),
+            true_root
+        );
+        // Tampered sibling on the child worker's up-step.
+        assert_ne!(
+            compute_tag_tree_root_for_proof::<Hash, PoseidonHasher>(
+                0,
+                &child_leaf,
+                &[TagTreeProofNode { sibling: wrong, parent_tag: tag }],
+            ),
+            true_root
+        );
+        // Tampered parent tag on the child worker's up-step.
+        assert_ne!(
+            compute_tag_tree_root_for_proof::<Hash, PoseidonHasher>(
+                0,
+                &child_leaf,
+                &[TagTreeProofNode { sibling: a, parent_tag: wrong }],
+            ),
+            true_root
+        );
     }
 }

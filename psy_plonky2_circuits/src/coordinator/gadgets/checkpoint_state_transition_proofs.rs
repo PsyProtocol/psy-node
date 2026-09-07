@@ -115,7 +115,6 @@ impl QEDPart1StateDeltaResultGadget {
             global_chain_root: new_state_roots_hash,
         };
 
-        // ensure new block time is after old block
         builder.ensure_is_greater_than(60, block_time, old_stats.block_time);
 
         Self {

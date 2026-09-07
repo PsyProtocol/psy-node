@@ -80,6 +80,7 @@ impl<Hash: ZeroableHash + Copy, JobId> PsyProvingJobMetadata<Hash, JobId> {
         };
         Ok(res)
     }
+
     pub fn compute_reward_tagged_expected_public_inputs<Hasher: MerkleHasher<Hash>>(&self, tag: Hash, children_reward_tree_values: &[Hash]) -> anyhow::Result<Hash> {
         let reward_tree_value = self.get_new_rewards_tag_tree_value::<Hasher>(tag, children_reward_tree_values)?;
         Ok(Hasher::two_to_one(&self.expected_public_inputs_hash, &reward_tree_value))
@@ -174,6 +175,7 @@ impl<Hash: ZeroableHash + Copy + PartialEq, JobId> PsyProvingJobMetadata<Hash, J
 
         Ok(updates)
     }
+
 }
 impl<Hash: QPGenRandom, JobId: QPGenRandom> QPGenRandom for PsyProvingJobMetadata<Hash, JobId> {
     fn qp_rand_gen() -> Self

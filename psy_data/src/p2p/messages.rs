@@ -10,8 +10,8 @@
 
 use super::bls::BlsSignature;
 use super::codec::{
-    decode_exact, sha256, write_bool, write_bytes_u32, write_fixed, write_u16, write_u32,
-    write_u64, write_u8, ProtocolEncode, ProtocolReader,
+    decode_exact, sha256, validate_hash32_canonical, write_bool, write_bytes_u32, write_fixed,
+    write_u16, write_u32, write_u64, write_u8, ProtocolEncode, ProtocolReader,
 };
 use super::domains::{DOMAIN_END_CAP_FORWARD, DOMAIN_PROPOSAL, DOMAIN_VOTE};
 use super::error::{ProtocolError, ProtocolResult};
@@ -218,15 +218,18 @@ pub fn proposal_from_parts(
 }
 
 /// Encode the proposal body: `u32_le(410) || output || u32_le(proof) || proof
-/// || u32_le(state_updates) || state_updates`.
+/// || u32_le(state_updates) || state_updates || worker_tag[32]`.
 ///
 /// `finalizer_output` must be exactly 410 bytes; `finalizer_proof` and
 /// `state_updates` must not exceed their frozen maxima. `state_updates` is
-/// the canonical encoding of `PsyPreparedRealmBlockStateUpdates`.
+/// the canonical encoding of `PsyPreparedRealmBlockStateUpdates`. The trailing
+/// 32-byte finalizer worker reward tag lets every validator recompute the
+/// circuit reward root R63 from the actual output before voting.
 pub fn encode_proposal_body(
     finalizer_output: &[u8],
     finalizer_proof: &[u8],
     state_updates: &[u8],
+    finalizer_worker_tag: &[u8; 32],
 ) -> ProtocolResult<Vec<u8>> {
     if finalizer_output.len() != MAX_FINALIZER_OUTPUT_BYTES {
         return Err(ProtocolError::InvalidLength {
@@ -250,17 +253,18 @@ pub fn encode_proposal_body(
         });
     }
     let mut body = Vec::with_capacity(
-        3 * 4 + finalizer_output.len() + finalizer_proof.len() + state_updates.len(),
+        3 * 4 + 32 + finalizer_output.len() + finalizer_proof.len() + state_updates.len(),
     );
     write_bytes_u32(&mut body, finalizer_output)?;
     write_bytes_u32(&mut body, finalizer_proof)?;
     write_bytes_u32(&mut body, state_updates)?;
+    body.extend_from_slice(finalizer_worker_tag);
     Ok(body)
 }
 
-/// Strictly decode a proposal body into `(output, proof, state_updates)`
-/// with exact component limits and no trailing bytes.
-pub fn decode_proposal_body(body: &[u8]) -> ProtocolResult<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+/// Strictly decode a proposal body into `(output, proof, state_updates,
+/// worker_tag)` with exact component limits and no trailing bytes.
+pub fn decode_proposal_body(body: &[u8]) -> ProtocolResult<(Vec<u8>, Vec<u8>, Vec<u8>, [u8; 32])> {
     decode_exact(body, |reader| {
         let output = reader.read_bytes_u32("finalizer output", MAX_FINALIZER_OUTPUT_BYTES as u32)?;
         if output.len() != MAX_FINALIZER_OUTPUT_BYTES {
@@ -272,9 +276,12 @@ pub fn decode_proposal_body(body: &[u8]) -> ProtocolResult<(Vec<u8>, Vec<u8>, Ve
         }
         let proof = reader.read_bytes_u32("finalizer proof", MAX_FINALIZER_PROOF_BYTES as u32)?;
         let state_updates = reader.read_bytes_u32("state updates", MAX_BACKUP_BYTES as u32)?;
-        Ok((output, proof, state_updates))
+        let worker_tag = reader.read_fixed::<32>()?;
+        validate_hash32_canonical(&worker_tag)?;
+        Ok((output, proof, state_updates, worker_tag))
     })
 }
+
 
 /// Chunked Proposal gossip frame.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -788,9 +795,8 @@ impl ProtocolEncode for EndCapForwardResponse {
 mod tests {
     use super::*;
     use super::super::bls::{aggregate_signatures, BlsSecretKey};
-    use super::super::codec::{sha256, write_fixed, write_u16, write_u32, write_u64};
     use super::super::domains::{DOMAIN_END_CAP_FORWARD, DOMAIN_PROPOSAL};
-    use super::super::error::ProtocolError;
+    use super::super::codec::{sha256, validate_hash32_canonical, write_fixed, write_u16, write_u32, write_u64, GOLDILOCKS_MODULUS};
     use super::super::limits::{
         CERTIFICATE_WIRE_BYTES, DIRECT_BODY_REQUEST_WIRE_BYTES, DIRECT_REQUEST_MAX_BYTES,
         END_CAP_FORWARD_HEADER_WIRE_BYTES, MAX_BACKUP_BYTES, MAX_FINALIZER_OUTPUT_BYTES,
@@ -883,30 +889,70 @@ mod tests {
     }
 
     #[test]
-    fn proposal_body_three_sections() {
+    fn proposal_body_sections_with_worker_tag() {
         let output = vec![0xAA; MAX_FINALIZER_OUTPUT_BYTES];
         let proof = vec![0xBB; 100];
         let state_updates = vec![0xCC; 200];
-        let body = encode_proposal_body(&output, &proof, &state_updates).unwrap();
-        assert_eq!(body.len(), 12 + MAX_FINALIZER_OUTPUT_BYTES + 100 + 200);
+        let worker_tag = [0x42u8; 32];
+        let body = encode_proposal_body(&output, &proof, &state_updates, &worker_tag).unwrap();
+        assert_eq!(body.len(), 12 + 32 + MAX_FINALIZER_OUTPUT_BYTES + 100 + 200);
         assert_eq!(&body[0..4], &(MAX_FINALIZER_OUTPUT_BYTES as u32).to_le_bytes());
         assert_eq!(&body[4..4 + MAX_FINALIZER_OUTPUT_BYTES], output.as_slice());
         assert_eq!(&body[414..418], &100u32.to_le_bytes());
         assert_eq!(&body[418..518], proof.as_slice());
         assert_eq!(&body[518..522], &200u32.to_le_bytes());
-        assert_eq!(&body[522..], state_updates.as_slice());
+        assert_eq!(&body[522..722], state_updates.as_slice());
+        assert_eq!(&body[722..], &worker_tag);
 
-        let (out2, proof2, state_updates2) = decode_proposal_body(&body).unwrap();
+        let (out2, proof2, state_updates2, tag2) = decode_proposal_body(&body).unwrap();
         assert_eq!(out2, output);
         assert_eq!(proof2, proof);
         assert_eq!(state_updates2, state_updates);
+        assert_eq!(tag2, worker_tag);
 
-        assert!(encode_proposal_body(&output[..MAX_FINALIZER_OUTPUT_BYTES - 1], &proof, &state_updates).is_err());
-        assert!(encode_proposal_body(&output, &vec![0u8; MAX_FINALIZER_PROOF_BYTES + 1], &state_updates).is_err());
-        assert!(encode_proposal_body(&output, &proof, &vec![0u8; MAX_BACKUP_BYTES + 1]).is_err());
+        assert!(encode_proposal_body(&output[..MAX_FINALIZER_OUTPUT_BYTES - 1], &proof, &state_updates, &worker_tag).is_err());
+        assert!(encode_proposal_body(&output, &vec![0u8; MAX_FINALIZER_PROOF_BYTES + 1], &state_updates, &worker_tag).is_err());
+        assert!(encode_proposal_body(&output, &proof, &vec![0u8; MAX_BACKUP_BYTES + 1], &worker_tag).is_err());
         let mut trailing = body;
         trailing.push(0);
         assert!(decode_proposal_body(&trailing).is_err());
+    }
+
+    #[test]
+    fn decode_proposal_body_rejects_noncanonical_worker_tag() {
+        let output = vec![0xAA; MAX_FINALIZER_OUTPUT_BYTES];
+        let proof = vec![0xBB; 8];
+        let state_updates = vec![0xCC; 8];
+        // Largest allowed canonical limb is one below the Goldilocks modulus.
+        let mut max_limb_tag = [0u8; 32];
+        max_limb_tag[24..32].copy_from_slice(&(GOLDILOCKS_MODULUS - 1).to_le_bytes());
+        validate_hash32_canonical(&max_limb_tag).expect("modulus - 1 limb is canonical");
+        let body = encode_proposal_body(&output, &proof, &state_updates, &max_limb_tag).unwrap();
+        let (_, _, _, tag) = decode_proposal_body(&body).unwrap();
+        assert_eq!(tag, max_limb_tag);
+
+        let mut noncanonical_tag = max_limb_tag;
+        noncanonical_tag[24..32].copy_from_slice(&GOLDILOCKS_MODULUS.to_le_bytes());
+        let bad_body = encode_proposal_body(&output, &proof, &state_updates, &noncanonical_tag).unwrap();
+        assert!(matches!(
+            decode_proposal_body(&bad_body),
+            Err(ProtocolError::NonCanonicalField { .. })
+        ));
+    }
+
+    #[test]
+    fn proposal_body_maximum_includes_worker_tag() {
+        let output = vec![0xAA; MAX_FINALIZER_OUTPUT_BYTES];
+        let proof = vec![0xBB; MAX_FINALIZER_PROOF_BYTES];
+        let state_updates = vec![0xCC; MAX_BACKUP_BYTES];
+        let worker_tag = [0x42u8; 32];
+        let body = encode_proposal_body(&output, &proof, &state_updates, &worker_tag).unwrap();
+        assert_eq!(body.len(), MAX_PROPOSAL_BODY_BYTES);
+        let (out2, proof2, state_updates2, tag2) = decode_proposal_body(&body).unwrap();
+        assert_eq!(out2.len(), MAX_FINALIZER_OUTPUT_BYTES);
+        assert_eq!(proof2.len(), MAX_FINALIZER_PROOF_BYTES);
+        assert_eq!(state_updates2.len(), MAX_BACKUP_BYTES);
+        assert_eq!(tag2, worker_tag);
     }
 
     #[test]

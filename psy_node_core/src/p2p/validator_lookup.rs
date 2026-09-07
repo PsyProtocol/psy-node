@@ -13,6 +13,7 @@ use crate::psy_core_db::traits::full::{
 
 pub async fn load_realm_validators_from_tree<Hasher, Hash, Store>(
     store: &Store,
+    chain_id: u64,
     checkpoint_id: u64,
     realm_id: u32,
     expected_root: &Hash,
@@ -47,6 +48,11 @@ where
                     "validator leaf preimage missing at realm {realm_id} sub {sub_id} checkpoint {checkpoint_id}"
                 )
             })?;
+        anyhow::ensure!(
+            preimage.chain_id == chain_id,
+            "validator preimage chain_id {} does not match configured chain {chain_id} at realm {realm_id} sub {sub_id}",
+            preimage.chain_id
+        );
         anyhow::ensure!(
             preimage.realm_id == realm_id && preimage.realm_sub_id == sub_id,
             "validator preimage slot mismatch at realm {realm_id} sub {sub_id}"

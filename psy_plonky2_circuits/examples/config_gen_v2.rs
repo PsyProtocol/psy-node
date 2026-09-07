@@ -140,7 +140,6 @@ fn run_gen_config<N: QNetworkCircuitConstants>() -> anyhow::Result<(String, Stri
         rotation.validator_sub_ids,
     );
     gcv.register_circuit_triplet(ProvingJobCircuitType::RealmFinalizeGUTA, guta_circuits.realm_finalize_guta.get_verifier_triplet());
-    gcv.register_circuit_triplet(ProvingJobCircuitType::WrappedSignatureProof, guta_circuits.reward_signature.get_verifier_triplet());
 
     gcv.register_circuit_triplet(
         ProvingJobCircuitType::GUTASingleEndCap,

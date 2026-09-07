@@ -165,9 +165,9 @@ impl MerkleProofGadget {
             .map(|_| builder.add_virtual_hash())
             .collect::<Vec<_>>();
         let height = siblings.len();
+
         builder.range_check(index, height);
         let index_bits = builder.split_le(index, height);
-
         let root = Self::compute_root_bits::<H, F, D>(builder, &index_bits, value, &siblings);
         let gadget = Self {
             root,

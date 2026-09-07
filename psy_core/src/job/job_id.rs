@@ -226,9 +226,10 @@ impl ProvingJobCircuitType {
             | ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade
             | ProvingJobCircuitType::GUTATwoGUTAWithCheckpointUpgrade
             | ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade
-            | ProvingJobCircuitType::GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint
-            | ProvingJobCircuitType::GUTALeftGUTARightEndCap
-            | ProvingJobCircuitType::GUTAVerifyLeftLeafRightLinearUpgradeCheckpoint => true,
+            | ProvingJobCircuitType::GUTAVerifyLeftLeafRightLinearUpgradeCheckpoint
+            // Persist the root GUTA child reward (left) and the output
+            // commitment A (right) for the standard tagged reward node.
+            | ProvingJobCircuitType::RealmFinalizeGUTA => true,
             _ => false,
         }
     }

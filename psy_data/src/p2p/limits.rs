@@ -16,9 +16,10 @@ pub const MAX_FINALIZER_PROOF_BYTES: usize = 262_144;
 pub const MAX_BACKUP_BYTES: usize = 104_857_600;
 
 /// Maximum proposal body size:
-/// three u32 length prefixes plus output, proof, and backup maxima.
+/// three u32 length prefixes plus output, proof, and backup maxima plus the
+/// trailing 32-byte finalizer worker reward tag.
 pub const MAX_PROPOSAL_BODY_BYTES: usize =
-    3 * 4 + MAX_FINALIZER_OUTPUT_BYTES + MAX_FINALIZER_PROOF_BYTES + MAX_BACKUP_BYTES;
+    3 * 4 + MAX_FINALIZER_OUTPUT_BYTES + MAX_FINALIZER_PROOF_BYTES + MAX_BACKUP_BYTES + 32;
 
 /// `ceil(MAX_PROPOSAL_BODY_BYTES / MAX_PROPOSAL_CHUNK_BYTES)`.
 pub const MAX_PROPOSAL_PARTS: u32 =
@@ -102,7 +103,7 @@ mod tests {
 
     #[test]
     fn proposal_body_and_parts_match_spec() {
-        assert_eq!(MAX_PROPOSAL_BODY_BYTES, 105_120_166);
+        assert_eq!(MAX_PROPOSAL_BODY_BYTES, 105_120_198);
         assert_eq!(MAX_PROPOSAL_PARTS, 1_711);
         assert_eq!(PROPOSAL_WIRE_BYTES, 214);
         assert_eq!(VOTE_WIRE_BYTES, 130);
