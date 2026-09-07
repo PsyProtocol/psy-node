@@ -61,7 +61,38 @@ JSON
 
 # shellcheck source=../lib/multichain.sh
 source "$REPO_ROOT/deploy/gcp/lib/multichain.sh"
+export MULTICHAIN_L1_CHAINS_JSON
+MULTICHAIN_L1_CHAINS_JSON="$(jq -c '.chains' "$MULTICHAIN_L1_RUNTIME_FILE")"
 multichain_require_runtime
+
+cp "$MULTICHAIN_L1_RUNTIME_FILE" "$TMP_DIR/complete-runtime.json"
+touch "${MULTICHAIN_L1_RUNTIME_FILE}.pending"
+if multichain_require_runtime >/dev/null 2>&1; then
+  echo 'accepted stale L1 manifest during an unfinished deployment' >&2
+  exit 1
+fi
+for consumer in multichain_runtime_json multichain_primary_chain \
+  multichain_envio_chains_json multichain_relayer_chains_json \
+  multichain_services_l1_json multichain_public_rpc_routes_json \
+  multichain_public_l1_config_json multichain_export_frontend_rpc_urls; do
+  # These helpers run inside command substitutions in the real deploy scripts,
+  # where Bash does not reliably propagate errexit from a validation failure.
+  if output="$("$consumer" 2>/dev/null)"; then
+    echo "consumer read a stale manifest: $consumer" >&2
+    exit 1
+  fi
+  [ -z "$output" ] || { echo "consumer leaked stale data: $consumer" >&2; exit 1; }
+done
+rm "${MULTICHAIN_L1_RUNTIME_FILE}.pending"
+for mutation in '.chains |= .[:2]' '.chains[2].chain_index = 1' \
+  '.chains[2].chain_id = 1' '.chains[2].contracts.Bridge = "0x0000000000000000000000000000000000000000"'; do
+  jq "$mutation" "$TMP_DIR/complete-runtime.json" > "$MULTICHAIN_L1_RUNTIME_FILE"
+  if multichain_require_runtime >/dev/null 2>&1; then
+    echo "accepted incomplete or incorrect L1 manifest: $mutation" >&2
+    exit 1
+  fi
+done
+cp "$TMP_DIR/complete-runtime.json" "$MULTICHAIN_L1_RUNTIME_FILE"
 
 envio_json="$(multichain_envio_chains_json)"
 services_json="$(multichain_services_l1_json)"
@@ -74,10 +105,13 @@ jq -e 'map(.chain_index) == [0,1,2] and all(.[]; .graphql_url == "http://10.0.0.
   <<<"$services_json" >/dev/null
 
 cp_ce_script="$REPO_ROOT/deploy/gcp/deploy-cp-ce-stack.sh"
+# shellcheck disable=SC2016
 grep -Fq 'source "$SCRIPT_DIR/lib/multichain.sh"' "$cp_ce_script" \
   || { echo "cp-ce stack does not load the multichain helpers" >&2; exit 1; }
+# shellcheck disable=SC2016
 grep -Fq 'PSY_L1_CHAINS="$(multichain_services_l1_json)"' "$cp_ce_script" \
   || { echo "cp-ce stack does not render the psy-services L1 registry" >&2; exit 1; }
+# shellcheck disable=SC2016
 grep -Fq '"PSY_L1_CHAINS=$PSY_L1_CHAINS"' "$cp_ce_script" \
   || { echo "cp-ce stack does not pass the L1 registry to psy-services" >&2; exit 1; }
 

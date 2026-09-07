@@ -63,9 +63,23 @@ done
 [ -f "$L1_DEPLOYER_KEYSTORE_PATH" ] \
   || fail "missing L1 deployer keystore: $L1_DEPLOYER_KEYSTORE_PATH"
 
-for host in \
-  gcp-scylla gcp-nats gcp-redis gcp-postgres gcp-cp-ce \
-  gcp-coordinator-worker gcp-faucet gcp-nostr arc99x2 arc99x4; do
+hosts=(
+  "${SCYLLA_VM_NAME:-gcp-scylla}" "${NATS_VM_NAME:-gcp-nats}"
+  "${REDIS_VM_NAME:-gcp-redis}" "${POSTGRES_VM_NAME:-gcp-postgres}"
+  "${NODE_VM_NAME:-gcp-cp-ce}" "${COORDINATOR_WORKER_VM_NAME:-gcp-coordinator-worker}"
+  "${FAUCET_VM_NAME:-gcp-faucet}" "${RELAYER_VM_NAME:-gcp-faucet}"
+  "${NOSTR_VM_NAME:-gcp-nostr}" "${ENVIO_VM_NAME:-gcp-postgres}"
+)
+if [ "${DEPLOY_OFFSITE_PROVE_PROXY:-0}" = "1" ]; then
+  hosts+=("${OFFSITE_PROVE_PROXY_HOST:?OFFSITE_PROVE_PROXY_HOST is required}")
+fi
+if [ "${DEPLOY_OFFSITE_WORKERS:-0}" = "1" ]; then
+  hosts+=("${OFFSITE_WORKER_HOST:?OFFSITE_WORKER_HOST is required}")
+fi
+if [ "${DEPLOY_CLOUD_PROVE_PROXY:-0}" = "1" ]; then
+  hosts+=("${PROVE_PROXY_VM_NAME:?PROVE_PROXY_VM_NAME is required}")
+fi
+for host in "${hosts[@]}"; do
   ssh -F "${SSH_CONFIG_FILE:-$HOME/.ssh/config}" -G "$host" >/dev/null 2>&1 \
     || fail "SSH host alias is missing: $host"
 done

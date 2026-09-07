@@ -1,11 +1,12 @@
 # Legacy Public Staging E2E Testing
 
 > This document describes the older single-Sepolia acceptance flow. The
-> current three-chain deployment must use `e2e/staging/README.md` and execute
+> current three-chain deployment must use `deploy/e2e/staging/README.md` and execute
 > Base Sepolia, BSC Testnet, and Ethereum Sepolia in that order.
 
-This is the canonical handoff for validating the deployed Parth/Psy public
-staging network. An acceptance run has three independent parts:
+This historical handoff described the deployed Parth/Psy public staging
+network. The current handoff is the three-chain guide linked above.
+An acceptance run has three independent parts:
 
 1. **Read-only node audit** proves that the deployed services and infrastructure
    are healthy enough to test.
@@ -106,14 +107,15 @@ worktree must already contain a matching release `psy_user_cli`:
 
 ```bash
 cd "$PSY_NODE_HOME"
-cargo build --release -p psy_user_cli -p psy_cli_full_e2e
+cargo build --locked --release --manifest-path deploy/e2e/cli-full-e2e/Cargo.toml
+cargo build --locked --release -p psy_user_cli
 ```
 
 ### Initialize a disposable run
 
 ```bash
 cd "$PSY_NODE_HOME"
-e2e/staging/run-cli-e2e.sh init
+deploy/e2e/staging/run-cli-e2e.sh init
 ```
 
 The command creates a mode-700 directory under `.private/e2e-runs/` and prints
@@ -123,7 +125,7 @@ only the public disposable Sepolia address. Fund that address with at least
 An existing disposable funded key may be imported by file without printing it:
 
 ```bash
-e2e/staging/run-cli-e2e.sh init \
+deploy/e2e/staging/run-cli-e2e.sh init \
   /absolute/private/run-directory \
   /secure/path/disposable-sepolia.key
 ```
@@ -133,7 +135,7 @@ Never use a genesis, faucet operator, relayer, worker, deployer, or treasury key
 ### Check readiness
 
 ```bash
-e2e/staging/run-cli-e2e.sh status \
+deploy/e2e/staging/run-cli-e2e.sh status \
   /absolute/path/to/.private/e2e-runs/psy-cli-full-e2e.PID.EPOCH
 ```
 
@@ -144,7 +146,7 @@ Sepolia funding, chain heights, token balances, and completed phase files.
 
 ```bash
 AUTHORIZED_STAGING_TRANSACTIONS=1 \
-  e2e/staging/run-cli-e2e.sh run \
+  deploy/e2e/staging/run-cli-e2e.sh run \
   /absolute/path/to/.private/e2e-runs/psy-cli-full-e2e.PID.EPOCH
 ```
 
@@ -181,6 +183,11 @@ secrets, and private receive packets.
 
 ## Part B: Playwright E2E
 
+This section is historical. Its IDE/Lenovo wallet-state runner is not shipped
+in the current deployment checkout. Use `deploy/e2e/staging/run-browser-e2e.sh`
+and `deploy/multi-chain/gcp/e2e/browser/README.md` for the current Bridge and
+Explorer suite. That suite does not claim the old IDE/wallet-state coverage.
+
 ### One-time preparation
 
 ```bash
@@ -196,7 +203,8 @@ If Chromium is absent, run `npx playwright install chromium`. SSH alias
 
 ```bash
 cd "$PSY_NODE_HOME"
-e2e/staging/run-playwright-e2e.sh
+# Historical entrypoint, not available in the current checkout:
+# e2e/staging/run-playwright-e2e.sh
 ```
 
 The default run is non-transactional:
@@ -228,10 +236,11 @@ account-specific Explorer navigation, lock behavior, and restoration of the
 original account. It requires two existing disposable accounts:
 
 ```bash
-RUN_IDE=0 RUN_APP=0 RUN_WALLET_STATE=1 \
-PSY_EXPLORER_FIRST_ACCOUNT=<existing-account-name> \
-PSY_EXPLORER_SECOND_ACCOUNT=<second-disposable-account-name> \
-  e2e/staging/run-playwright-e2e.sh
+# Historical runner options, not supported by run-browser-e2e.sh:
+# RUN_IDE=0 RUN_APP=0 RUN_WALLET_STATE=1 \
+# PSY_EXPLORER_FIRST_ACCOUNT=<existing-account-name> \
+# PSY_EXPLORER_SECOND_ACCOUNT=<second-disposable-account-name> \
+#   e2e/staging/run-playwright-e2e.sh
 ```
 
 Do not put the wallet password in this document or shell history.

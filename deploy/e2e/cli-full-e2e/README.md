@@ -25,14 +25,15 @@ artifact set. It does not alter repository deployment files.
 ## Build
 
 ```bash
-cargo build --release -p psy_cli_full_e2e -p psy_user_cli
+cargo build --locked --release --manifest-path deploy/e2e/cli-full-e2e/Cargo.toml
+cargo build --locked --release -p psy_user_cli
 ```
 
 Validate all profile mappings and private run-directory construction without
 accessing the network or submitting transactions:
 
 ```bash
-e2e/staging/tests/test-multichain-init.sh
+deploy/e2e/staging/tests/test-multichain-init.sh
 ```
 
 ## Single-chain run
@@ -41,12 +42,12 @@ Use a single profile while debugging or resuming one chain. BSC is the default
 when `STAGING_CHAIN` is omitted.
 
 ```bash
-STAGING_CHAIN=base e2e/staging/run-cli-e2e.sh init /tmp/psy-base-e2e
-STAGING_CHAIN=base e2e/staging/run-cli-e2e.sh status /tmp/psy-base-e2e
+STAGING_CHAIN=base deploy/e2e/staging/run-cli-e2e.sh init /tmp/psy-base-e2e
+STAGING_CHAIN=base deploy/e2e/staging/run-cli-e2e.sh status /tmp/psy-base-e2e
 
 AUTHORIZED_STAGING_TRANSACTIONS=1 \
 STAGING_CHAIN=base \
-  e2e/staging/run-cli-e2e.sh run /tmp/psy-base-e2e
+  deploy/e2e/staging/run-cli-e2e.sh run /tmp/psy-base-e2e
 ```
 
 `init` writes mode-600 disposable keys and prints only the public L1 address.
@@ -63,11 +64,11 @@ The release-level entry creates an independent run and disposable account for
 each supported L1:
 
 ```bash
-e2e/staging/run-multichain-e2e.sh init /tmp/psy-multichain-e2e
-e2e/staging/run-multichain-e2e.sh status /tmp/psy-multichain-e2e
+deploy/e2e/staging/run-multichain-e2e.sh init /tmp/psy-multichain-e2e
+deploy/e2e/staging/run-multichain-e2e.sh status /tmp/psy-multichain-e2e
 
 AUTHORIZED_STAGING_TRANSACTIONS=1 \
-  e2e/staging/run-multichain-e2e.sh run /tmp/psy-multichain-e2e
+  deploy/e2e/staging/run-multichain-e2e.sh run /tmp/psy-multichain-e2e
 ```
 
 Fund all three printed addresses with Sepolia ETH, tBNB, and Base Sepolia ETH
@@ -90,7 +91,7 @@ automatic resubmission. After a timeout, inspect the saved CLI log, L1 receipt,
 psy-services response, and chain state before deciding whether to resume.
 
 The default test contract is the deterministic small artifact at
-`e2e/staging/fixtures/e2e-contract.json`; it avoids coupling the E2E to the
+`deploy/e2e/staging/fixtures/e2e-contract.json`; it avoids coupling the E2E to the
 genesis token artifact format.
 
 Run directories contain private keys and note material. Do not share or archive

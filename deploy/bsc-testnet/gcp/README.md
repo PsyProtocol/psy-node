@@ -117,14 +117,14 @@ The dry-run executes all preflight checks but performs no remote deployment.
 Run the complete transaction E2E after deployment:
 
 ```bash
-e2e/staging/run-cli-e2e.sh init
+deploy/e2e/staging/run-cli-e2e.sh init
 
 STAGING_L1_RPC_URL="$BSC_TESTNET_RPC_URL" \
-  e2e/staging/run-cli-e2e.sh status RUN_DIR
+  deploy/e2e/staging/run-cli-e2e.sh status RUN_DIR
 
 AUTHORIZED_STAGING_TRANSACTIONS=1 \
 STAGING_L1_RPC_URL="$BSC_TESTNET_RPC_URL" \
-  e2e/staging/run-cli-e2e.sh run RUN_DIR
+  deploy/e2e/staging/run-cli-e2e.sh run RUN_DIR
 ```
 
 The E2E manifest pins network `bsc-testnet`, EVM chain ID `97`, and bridge

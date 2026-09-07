@@ -2,8 +2,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-E2E_BIN="$REPO_DIR/target/release/psy-cli-full-e2e"
+REPO_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+E2E_MANIFEST="$REPO_DIR/deploy/e2e/cli-full-e2e/Cargo.toml"
+E2E_BIN="$REPO_DIR/deploy/e2e/cli-full-e2e/target/release/psy-cli-full-e2e"
 USER_CLI="$REPO_DIR/target/release/psy_user_cli"
 BASE_CONFIG="$REPO_DIR/psy-genesis/config.json"
 STAGING_CHAIN="${STAGING_CHAIN:-${STAGING_NETWORK:-bsc}}"
@@ -75,7 +76,7 @@ select_profile() {
 ensure_e2e_binary() {
   if [ ! -x "$E2E_BIN" ]; then
     echo "[staging-cli-e2e] building psy_cli_full_e2e"
-    cargo build --release -p psy_cli_full_e2e
+    cargo build --locked --release --manifest-path "$E2E_MANIFEST"
   fi
   [ -x "$E2E_BIN" ] || fail "missing E2E executable: $E2E_BIN"
 }

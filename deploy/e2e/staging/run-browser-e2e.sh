@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 SUITE_DIR="$REPO_DIR/deploy/multi-chain/gcp/e2e/browser"
 RUNTIME_FILE="${MULTICHAIN_RUNTIME_FILE:-$REPO_DIR/deploy/multi-chain/gcp/runtime/l1-deployments.json}"
 APP_URL="${APP_URL:-https://app-stg.psy-protocol.xyz}"

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 SINGLE_RUNNER="$SCRIPT_DIR/run-cli-e2e.sh"
 CHAINS=(base bsc sepolia)
 

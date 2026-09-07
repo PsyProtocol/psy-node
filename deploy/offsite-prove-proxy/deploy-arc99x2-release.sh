@@ -77,7 +77,7 @@ test -s $(printf '%q' "$remote_release/client_prover/config.json")
 
 echo
 echo "Staged release $RELEASE_ID on $OFFSITE_PROVE_PROXY_HOST."
-echo "After the WireGuard peer is installed on the GCP gateway, run on arc99x2:"
+echo "After the WireGuard peer is installed on the GCP gateway, run on $OFFSITE_PROVE_PROXY_HOST:"
 echo
 printf '  RELEASE_ID=%q bash %q\n' \
   "$RELEASE_ID" "$remote_scripts/arc99x2-apply-staged.sh"
@@ -87,7 +87,7 @@ case "$OFFSITE_PROVE_PROXY_APPLY_STAGED" in
     [ -t 0 ] || {
       cat >&2 <<EOF
 OFFSITE_PROVE_PROXY_APPLY_STAGED requires an interactive terminal because
-arc99x2 may prompt for sudo. Re-run this deployment from a terminal.
+$OFFSITE_PROVE_PROXY_HOST may prompt for sudo. Re-run this deployment from a terminal.
 EOF
       exit 1
     }

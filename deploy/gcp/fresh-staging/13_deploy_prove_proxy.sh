@@ -16,7 +16,7 @@ else
   }
   case "${DEPLOY_OFFSITE_PROVE_PROXY:-0}" in
     1|true|TRUE|yes|YES|on|ON)
-      log_step "cloud prove-proxy disabled; deploying arc99x2 through ${PUBLIC_PROVE_PROXY_UPSTREAM}"
+      log_step "cloud prove-proxy disabled; deploying ${OFFSITE_PROVE_PROXY_HOST:-arc99x2} through ${PUBLIC_PROVE_PROXY_UPSTREAM}"
       OFFSITE_PROVE_PROXY_HOST="${OFFSITE_PROVE_PROXY_HOST:-arc99x2}" \
       OFFSITE_PROVE_PROXY_APPLY_STAGED="${OFFSITE_PROVE_PROXY_APPLY_STAGED:-1}" \
         bash "$REPO_ROOT/deploy/offsite-prove-proxy/deploy-arc99x2-release.sh"
@@ -24,7 +24,7 @@ else
     *)
       cat >&2 <<EOF
 DEPLOY_CLOUD_PROVE_PROXY is disabled, but DEPLOY_OFFSITE_PROVE_PROXY is not
-enabled. A fresh deployment must install its new bundle on arc99x2 before
+enabled. A fresh deployment must install its new bundle on the offsite host before
 workers, relayer, and public checks start.
 EOF
       exit 1

@@ -13,26 +13,26 @@ profile drives prove-proxy at a time.
    bash deploy/gcp/tests/test-source-versions.sh
    bash deploy/gcp/tests/test-multichain-profile.sh
    bash deploy/gcp/tests/test-frontend-workflow-safety.sh
-   bash e2e/staging/tests/test-multichain-init.sh
+   bash deploy/e2e/staging/tests/test-multichain-init.sh
    ```
 
 2. Per-network read-only readiness:
 
    ```bash
-   e2e/staging/run-multichain-e2e.sh status /absolute/private/matrix-dir
+   deploy/e2e/staging/run-multichain-e2e.sh status /absolute/private/matrix-dir
    ```
 
 3. Full CLI protocol E2E after explicit transaction authorization:
 
    ```bash
    AUTHORIZED_STAGING_TRANSACTIONS=1 \
-     e2e/staging/run-multichain-e2e.sh run /absolute/private/matrix-dir
+     deploy/e2e/staging/run-multichain-e2e.sh run /absolute/private/matrix-dir
    ```
 
 4. Read-only published frontend E2E:
 
    ```bash
-   e2e/staging/run-browser-e2e.sh
+   deploy/e2e/staging/run-browser-e2e.sh
    ```
 
 Initialize a matrix with three independent Psy identities and either one
@@ -40,7 +40,7 @@ shared funded EVM key or per-network keys:
 
 ```bash
 MULTICHAIN_EVM_KEY_FILE=/secure/path/e.key \
-  e2e/staging/run-multichain-e2e.sh init \
+  deploy/e2e/staging/run-multichain-e2e.sh init \
   "$PWD/.private/e2e-runs/release-$(date -u +%Y%m%dT%H%M%SZ)"
 ```
 
@@ -76,7 +76,7 @@ skipped, an unresolved intent remains, or prove-proxy restarted/OOMed.
 
 ## Other test assets
 
-- `e2e/cli-full-e2e/` is the Rust implementation used by the wrappers, not a
+- `deploy/e2e/cli-full-e2e/` is the Rust implementation used by the wrappers, not a
   separate release entrypoint.
 - `e2e/ide-explorer/` is the specialized local IDE/Explorer suite; its
   transactional IDE project is not part of the public multichain gate.

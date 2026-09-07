@@ -1,0 +1,22 @@
+# ID|Script relative to deploy/gcp/fresh-staging|Action and completion check
+01	01_stop_parth_services.sh	Stop the existing cloud services and offsite workers
+02	02_clear_parth_state.sh	Clear previous node files and checkpoint state
+03	03_clear_database_state.sh	Clear previous Scylla, Redis, NATS and PostgreSQL chain state
+04	04_prepare_local_bundle.sh	Build Bookworm binaries; generate and verify Genesis, keys and bundle
+05	05_deploy_scylla.sh	Start Scylla and check CQL read/write
+06	06_deploy_redis.sh	Start Redis/Valkey and check read/write
+07	07_deploy_nats.sh	Start NATS JetStream and check messaging
+08	08_deploy_postgres.sh	Start PostgreSQL and check database access
+10	10_deploy_l1_contracts.sh	Upload Groth16 setup; deploy Sepolia, BSC, Base; write all-chain manifest
+11	11_deploy_envio.sh	Configure all three L1s in Envio; check Hasura health and GraphQL schema
+12	12_deploy_cp_ce_stack.sh	Start coordinator, two realms, psy-services and three L2 indexers
+13	13_deploy_prove_proxy.sh	Install offsite prove-proxy and standalone faucet; wait for readiness
+14	14_deploy_workers.sh	Start cloud baseline: one coordinator worker and two realm workers
+16	16_deploy_relayer.sh	Start the relayer with three chains from the same L1 manifest
+17	17_deploy_caddy_entrypoints.sh	Install backend domains and three separate public L1 RPC routes
+29	29_publish_public_trust_setup.sh	Publish matching Groth16 setup artifacts
+18	18_check_public_entrypoints.sh	Check public endpoints and each L1 RPC chain ID
+27	27_deploy_cf_staging_config.sh	Publish public config using the new three-chain deployments
+30	30_deploy_cf_sdk_frontends.sh	Publish Bridge, Explorer and IDE using the same deployments
+23	23_smoke_test_simple_mint.sh	Run the basic protocol transaction smoke test
+31	31_deploy_offsite_workers.sh	Add the three offsite workers after the cloud baseline passes

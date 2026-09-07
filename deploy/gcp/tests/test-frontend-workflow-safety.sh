@@ -4,7 +4,6 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 MOVED_WORKFLOW="$ROOT/.github/workflows/deploy-multichain-psy-dapp.yml"
 LEGACY_WORKFLOW="$ROOT/.github/workflows/deploy-shield-frontends.yml"
-DAPP_CODE_WORKFLOW="$ROOT/psy-dapp/.github/workflows/deploy-multichain-staging.yml"
 APP_DEPLOY="$ROOT/deploy/cloudflare-pages/deploy-privacy-bridge-demo.sh"
 EXPLORER_DEPLOY="$ROOT/deploy/cloudflare-pages/deploy-psy-explorer.sh"
 
@@ -18,10 +17,8 @@ EXPLORER_DEPLOY="$ROOT/deploy/cloudflare-pages/deploy-psy-explorer.sh"
   exit 1
 }
 
-[ ! -e "$DAPP_CODE_WORKFLOW" ] || {
-  echo "the psy-dapp code branch must not contain the deployment-branch workflow: $DAPP_CODE_WORKFLOW" >&2
-  exit 1
-}
+# The selected DApp deployment branch can own its frontend workflow. This
+# repository only guards against competing psy-node-owned publishers.
 
 grep -Fq 'refusing frontend publish:' "$APP_DEPLOY" || {
   echo "app deployment lost its fail-closed pre-publish guard" >&2

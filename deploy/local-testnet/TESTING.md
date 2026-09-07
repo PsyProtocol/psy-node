@@ -95,7 +95,7 @@ the deposit- or withdrawal-debug skill for the failed phase.
 
 ### Similar scripts that are not this local acceptance test
 
-- `e2e/cli-full-e2e/` is the larger Rust orchestrator for public staging and
+- `deploy/e2e/cli-full-e2e/` is the larger Rust orchestrator for public staging and
   Sepolia. It requires funded disposable Sepolia credentials.
 - `e2e/bridge-e2e.sh` is an older standalone local script. Do not use it as the
   canonical acceptance entrypoint; its recovery/evidence behavior is weaker

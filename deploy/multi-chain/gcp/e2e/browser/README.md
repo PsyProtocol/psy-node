@@ -27,7 +27,7 @@ The canonical runner uses system Chromium when available and stores durable
 evidence outside this ignored package directory:
 
 ```bash
-e2e/staging/run-browser-e2e.sh
+deploy/e2e/staging/run-browser-e2e.sh
 ```
 
 Override `APP_URL` or `MULTICHAIN_RUNTIME_FILE` to test another deployment.

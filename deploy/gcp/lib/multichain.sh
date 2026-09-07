@@ -44,8 +44,13 @@ multichain_validate_specs() {
 }
 
 multichain_require_runtime() {
-  local runtime_file
+  local runtime_file expected_registry actual_registry
   runtime_file="$(multichain_runtime_file)"
+  [ ! -e "${runtime_file}.pending" ] || {
+    echo "multichain L1 deployment is incomplete: ${runtime_file}.pending" >&2
+    echo "reconcile the recorded L1 transactions before using the previous runtime manifest" >&2
+    return 1
+  }
   [ -s "$runtime_file" ] || {
     echo "missing multichain L1 runtime manifest: $runtime_file" >&2
     echo "run fresh-staging step 10 before deploying Envio, psy-services, relayer, Caddy, or frontends" >&2
@@ -54,23 +59,38 @@ multichain_require_runtime() {
   jq -e '
     .schema_version == 1
     and (.chains | type == "array" and length >= 2)
+    and ([.chains[].network] | length == (unique | length))
+    and ([.chains[].chain_id] | length == (unique | length))
+    and ([.chains[].chain_index] | length == (unique | length))
     and all(.chains[];
       (.network | type == "string" and length > 0)
-      and (.chain_id | type == "number")
-      and (.chain_index | type == "number")
-      and (.start_block | type == "number")
-      and (.rpc_url | type == "string" and length > 0)
-      and (.contracts.Bridge | type == "string" and length == 42)
-      and (.contracts.StateManager | type == "string" and length == 42)
+      and (.chain_id | type == "number" and floor == . and . > 0)
+      and (.chain_index | type == "number" and floor == . and . >= 0 and . <= 255)
+      and (.start_block | type == "number" and floor == . and . >= 0)
+      and (.rpc_url | type == "string" and test("^https?://"))
+      and (.contracts.Bridge | type == "string" and test("^0x[0-9a-fA-F]{40}$") and . != "0x0000000000000000000000000000000000000000")
+      and (.contracts.StateManager | type == "string" and test("^0x[0-9a-fA-F]{40}$") and . != "0x0000000000000000000000000000000000000000")
     )
   ' "$runtime_file" >/dev/null || {
     echo "invalid multichain L1 runtime manifest: $runtime_file" >&2
     return 1
   }
+
+  if [ -n "${MULTICHAIN_L1_CHAINS_JSON:-}" ]; then
+    multichain_validate_specs || return 1
+    expected_registry="$(multichain_specs_json | jq -c 'sort_by(.chain_index) | map([.network, .chain_id, .chain_index])')"
+    actual_registry="$(jq -c '.chains | sort_by(.chain_index) | map([.network, .chain_id, .chain_index])' "$runtime_file")"
+    [ "$actual_registry" = "$expected_registry" ] || {
+      echo "multichain L1 manifest does not match the configured registry" >&2
+      echo "expected: $expected_registry" >&2
+      echo "actual:   $actual_registry" >&2
+      return 1
+    }
+  fi
 }
 
 multichain_runtime_json() {
-  multichain_require_runtime
+  multichain_require_runtime || return
   cat "$(multichain_runtime_file)"
 }
 
@@ -78,7 +98,7 @@ multichain_primary_chain() {
   local runtime_file primary_network
   runtime_file="$(multichain_runtime_file)"
   primary_network="${MULTICHAIN_PRIMARY_NETWORK:-sepolia}"
-  multichain_require_runtime
+  multichain_require_runtime || return
   jq -ec --arg network "$primary_network" '
     .chains[] | select(.network == $network)
   ' "$runtime_file" | head -n 1
@@ -87,7 +107,7 @@ multichain_primary_chain() {
 multichain_envio_chains_json() {
   local runtime_file
   runtime_file="$(multichain_runtime_file)"
-  multichain_require_runtime
+  multichain_require_runtime || return
   jq -c '{chains: [.chains[] | {
     name,
     chain_id,
@@ -104,7 +124,7 @@ multichain_envio_chains_json() {
 multichain_relayer_chains_json() {
   local runtime_file
   runtime_file="$(multichain_runtime_file)"
-  multichain_require_runtime
+  multichain_require_runtime || return
   jq -c '[.chains[] | {
     family: "evm",
     chain_index,
@@ -120,7 +140,7 @@ multichain_services_l1_json() {
   local runtime_file graphql_url
   runtime_file="$(multichain_runtime_file)"
   graphql_url="${INDEXER_GRAPHQL_URL:?INDEXER_GRAPHQL_URL is required}"
-  multichain_require_runtime
+  multichain_require_runtime || return
   jq -c --arg graphql_url "$graphql_url" '[.chains[] | {
     name,
     chain_index,
@@ -134,7 +154,7 @@ multichain_services_l1_json() {
 multichain_public_rpc_routes_json() {
   local runtime_file
   runtime_file="$(multichain_runtime_file)"
-  multichain_require_runtime
+  multichain_require_runtime || return
   jq -c '[.chains[] | {
     name,
     domain: .public_rpc_domain,
@@ -146,7 +166,7 @@ multichain_public_rpc_routes_json() {
 multichain_public_l1_config_json() {
   local runtime_file
   runtime_file="$(multichain_runtime_file)"
-  multichain_require_runtime
+  multichain_require_runtime || return
   jq -c '[.chains[] | {
     network,
     bridge_chain: .protocol.chain.bridgeChain,
@@ -171,7 +191,7 @@ multichain_public_l1_config_json() {
 multichain_export_frontend_rpc_urls() {
   local runtime_file
   runtime_file="$(multichain_runtime_file)"
-  multichain_require_runtime
+  multichain_require_runtime || return
 
   SEPOLIA_RPC_URL="$(jq -er '.chains[] | select(.network == "sepolia") | "https://" + .public_rpc_domain' "$runtime_file")"
   BSC_TESTNET_RPC_URL="$(jq -er '.chains[] | select(.network == "bscTestnet") | "https://" + .public_rpc_domain' "$runtime_file")"
@@ -184,6 +204,7 @@ multichain_write_frontend_deployment() {
   local output_file="$2"
   local output_dir public_rpc_domain
 
+  multichain_require_runtime || return
   output_dir="$(dirname "$output_file")"
   public_rpc_domain="$(
     multichain_runtime_json | jq -er --arg network "$network" \

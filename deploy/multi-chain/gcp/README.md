@@ -9,7 +9,7 @@ This profile deploys one Psy L2 connected to three EVM testnets:
 | 2 | `baseSepolia` | 84532 | `rpc-base-stg.psy-protocol.xyz` |
 
 It reuses the current GCP machine topology, offsite workers on `arc99x4`, and
-offsite prove-proxy on `arc99x2`. It replaces the current staging L2 and
+offsite prove-proxy on `arc99x3`. It replaces the current staging L2 and
 database state; it does not create a parallel environment.
 
 ## Safety model
@@ -24,6 +24,12 @@ database state; it does not create a parallel environment.
   `CONFIRM_FULL_FRESH_DEPLOY=1`.
 - Preflight checks all three RPC chain IDs, the shared signer address and
   balance, source pins, chain indexes, SSH aliases, and public DNS.
+- The node runtime must match the selected source commit. Deployment tools
+  live under `deploy/`; only pinned submodule references, the private-key
+  ignore rule, and deletion of the obsolete frontend workflow are exempt
+  metadata. Arbitrary Rust or root Cargo changes are rejected.
+- Wallet releases and DApp workflow pushes are separate from this runner.
+  Never substitute an unpublished candidate SHA in `source-versions.env`.
 
 ## Prerequisites
 
@@ -37,13 +43,22 @@ database state; it does not create a parallel environment.
    pinned in `source-versions.env`.
 
 ```bash
-cd "$WORKSPACE_HOME/psy-node-multi-chain-gcp-deploy"
+# Run from your dedicated deployment checkout.
 cp deploy/multi-chain/gcp/config.example.env deploy/multi-chain/gcp/config.env
+chmod 600 deploy/multi-chain/gcp/config.env
 ```
 
 ## Validation
 
-First prepare exact source revisions and run checks without changing GCP:
+First inspect the offline plan. It does not prepare sources, contact nodes,
+send transactions, or run deployment steps:
+
+```bash
+bash deploy/multi-chain/gcp/deploy_all.sh --plan
+```
+
+Then prepare exact source revisions and run checks without changing GCP.
+Source preparation can fetch and detach clean local child repositories:
 
 ```bash
 export WORKSPACE_HOME="$(cd .. && pwd)"
@@ -65,13 +80,14 @@ them for the final production-like preflight.
 
 ## Deployment order
 
-The shared fresh-deployment runner performs these relevant phases:
+The entrypoint executes the shared step scripts in `steps.tsv` order. The
+plan displays every step ID, description, and script path:
 
 1. Stop services and clear L2/database state.
 2. Build and distribute the pinned Psy node/genesis bundle.
 3. Deploy L1 contracts in index order: Sepolia, BSC Testnet, Base Sepolia.
-4. Write ignored `runtime/l1-deployments.json` with verified addresses and
-   start blocks from all three networks.
+4. Write ignored `runtime/l1-deployments.json` only after all three networks
+   complete. A `.pending` marker blocks downstream consumers until then.
 5. Start one Envio indexer configured with all three network sections.
 6. Start Psy nodes, cloud baseline workers, faucet, and prove-proxy routing.
 7. Start one relayer with three `[[chains]]` entries and all deployment JSONs.
@@ -96,6 +112,50 @@ GCP_DEPLOY_CONFIG="$PWD/deploy/multi-chain/gcp/config.env" \
 After deployment, run the staging node audit and a transaction E2E for each
 source/destination chain. A single primary-chain smoke test is not sufficient
 evidence for a multichain release.
+
+## Failure and resume
+
+Each invocation saves private `runtime/runs/<run-id>/<step>.log` files and a
+`status.tsv`. The first failed step stops execution; no step is retried
+automatically. These logs may include credentials from downstream tools and
+must not be committed or posted publicly.
+
+Review a resume plan before executing it, using execution order, not numeric
+order (for example, step 29 precedes step 18):
+
+```bash
+bash deploy/multi-chain/gcp/deploy_all.sh --plan --from 16 --until 18
+bash deploy/multi-chain/gcp/deploy_all.sh --plan --only 30
+```
+
+Real resume invocations need both confirmations above. They retain existing
+local sources/artifacts instead of automatically switching checkouts. Full
+runs prepare sources first. Neither plan output nor skipped RPC/DNS checks
+constitutes a successful release preflight.
+
+If step 10 fails, inspect `runtime/l1-deployments.json.pending`, each chain's
+receipts, and deployment artifacts before deciding how to recover. The
+marker deliberately prevents blind redeployment and use of a stale manifest.
+Do not delete it simply to bypass the guard: partial L1 transactions may
+already exist. Clearing L2 state without step 10 in the selected plan is
+rejected because the existing L1 roots would no longer match.
+
+## Offline script checks
+
+These fixture tests never contact production or submit transactions:
+
+```bash
+bash deploy/gcp/tests/test-multichain-deploy-runner.sh
+bash deploy/gcp/tests/test-multichain-l1-deployment.sh
+bash deploy/gcp/tests/test-multichain-profile.sh
+bash deploy/gcp/tests/test-runtime-source.sh
+bash deploy/gcp/tests/test-multichain-source-preparation.sh
+bash deploy/gcp/tests/test-frontend-workflow-safety.sh
+cargo test --locked --release --manifest-path deploy/e2e/cli-full-e2e/Cargo.toml
+```
+
+CLI E2E now has a standalone Cargo workspace under `deploy/e2e/`; it does not
+alter the node runtime workspace. See [the E2E guide](../../e2e/staging/README.md).
 
 ## Psy-services-only update
 

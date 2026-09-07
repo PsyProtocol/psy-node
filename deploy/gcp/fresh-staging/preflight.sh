@@ -4,6 +4,8 @@ set -euo pipefail
 source "$(dirname "$0")/_common.sh"
 # shellcheck source=../lib/multichain.sh
 source "$REPO_ROOT/deploy/gcp/lib/multichain.sh"
+# shellcheck source=../lib/runtime-source.sh
+source "$REPO_ROOT/deploy/gcp/lib/runtime-source.sh"
 
 log_step "running staging deployment preflight checks"
 
@@ -48,7 +50,7 @@ verify_clean_git_source() {
   local dir="$2"
   local expected="$3"
   local match_mode="$4"
-  local actual dirty unexpected_dirty non_deploy_changes
+  local actual dirty unexpected_dirty
 
   [ -e "$dir/.git" ] || {
     echo "$label is not a Git checkout: $dir" >&2
@@ -96,16 +98,7 @@ verify_clean_git_source() {
         echo "$label HEAD $actual does not contain required runtime commit $expected" >&2
         exit 1
       }
-      non_deploy_changes="$(
-        git -C "$dir" diff --name-only "$expected" "$actual" \
-          | awk '$0 !~ /^deploy\//'
-      )"
-      if [ -n "$non_deploy_changes" ]; then
-        echo "$label contains product changes after runtime commit $expected:" >&2
-        printf '%s\n' "$non_deploy_changes" >&2
-        echo "only deploy/ may differ on the deployment branch" >&2
-        exit 1
-      fi
+      verify_deployment_runtime_tree "$dir" "$expected" || exit 1
     elif [ "$actual" != "$expected" ]; then
       echo "$label HEAD mismatch: expected $expected, got $actual" >&2
       exit 1

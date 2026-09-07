@@ -419,7 +419,7 @@ impl Runner {
         );
         let contract_artifact = args
             .contract_artifact
-            .unwrap_or_else(|| root.join("e2e/staging/fixtures/e2e-contract.json"));
+            .unwrap_or_else(|| root.join("deploy/e2e/staging/fixtures/e2e-contract.json"));
         ensure!(
             contract_artifact.is_file(),
             "missing contract artifact {}",
