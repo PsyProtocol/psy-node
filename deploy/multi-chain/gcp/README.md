@@ -96,3 +96,48 @@ GCP_DEPLOY_CONFIG="$PWD/deploy/multi-chain/gcp/config.env" \
 After deployment, run the staging node audit and a transaction E2E for each
 source/destination chain. A single primary-chain smoke test is not sufficient
 evidence for a multichain release.
+
+## Psy-services-only update
+
+Do not use the fresh-deployment runner or
+`deploy_services_keep_state.sh` for a psy-services application update. The
+profile has a narrow entrypoint that builds only `psy-services` and
+`psy-indexer`, installs them under `/opt/parth/psy-services/releases`, and
+restarts only psy-services plus the coordinator/realm indexers. It never
+changes `/opt/parth/current`, genesis, node processes, workers, prove-proxy,
+faucet, relayer, Caddy, or frontends.
+
+Review the exact actions first:
+
+```bash
+GCP_DEPLOY_CONFIG="$PWD/deploy/multi-chain/gcp/config.env" \
+  DRY_RUN=1 \
+  bash deploy/multi-chain/gcp/deploy-psy-services-update.sh
+```
+
+Deploy the commit pinned in `source-versions.env`:
+
+```bash
+GCP_DEPLOY_CONFIG="$PWD/deploy/multi-chain/gcp/config.env" \
+  CONFIRM_PSY_SERVICES_UPDATE=1 \
+  bash deploy/multi-chain/gcp/deploy-psy-services-update.sh
+```
+
+The entrypoint verifies the GitHub organization/repository, branch ancestry,
+exact commit, clean checkout, archive checksum, remote manifest, process
+executable paths, public health endpoint, and Explorer bridge activity route.
+It stops the three indexers before restarting psy-services, then brings the
+indexers back one at a time. Database state is preserved and migrations run
+before the new service becomes healthy.
+
+Binary rollback is available if the new process cannot run:
+
+```bash
+GCP_DEPLOY_CONFIG="$PWD/deploy/multi-chain/gcp/config.env" \
+  CONFIRM_PSY_SERVICES_ROLLBACK=1 \
+  bash deploy/multi-chain/gcp/rollback-psy-services-update.sh
+```
+
+Rollback switches the service binaries only. It does not reverse PostgreSQL
+migrations, so migration compatibility must be reviewed before using it. The
+update from `46f8463` to `9122e5d` contains no migration changes.

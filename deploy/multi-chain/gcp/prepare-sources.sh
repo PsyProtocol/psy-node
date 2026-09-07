@@ -10,5 +10,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 git -C "$REPO_ROOT" -c submodule.psy-dapp.update=checkout \
   submodule update --init psy-dapp
 
-exec bash "$SCRIPT_DIR/../../scripts/prepare-profile-sources.sh" \
+bash "$SCRIPT_DIR/../../scripts/prepare-profile-sources.sh" \
   "$SCRIPT_DIR/source-versions.env"
+
+bash "$SCRIPT_DIR/prepare-psy-services-source.sh"

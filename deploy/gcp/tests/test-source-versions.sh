@@ -30,6 +30,13 @@ validate_profile() {
     }
   done
 
+  if [ -n "${EXPECTED_PSY_SERVICES_BRANCH:-}" ]; then
+    [[ "$EXPECTED_PSY_SERVICES_BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]] || {
+      echo "invalid $profile psy-services branch: $EXPECTED_PSY_SERVICES_BRANCH" >&2
+      exit 1
+    }
+  fi
+
   for variable in \
     EXPECTED_PARTH_RUNTIME_COMMIT \
     EXPECTED_PSY_GENESIS_COMMIT \

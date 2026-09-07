@@ -12,6 +12,7 @@ GO_VERSION="${GO_VERSION:-1.22.3}"
 PACKAGE_ARTIFACTS="${PACKAGE_ARTIFACTS:-1}"
 BUILD_PARTH_BUNDLE="${BUILD_PARTH_BUNDLE:-1}"
 BUILD_PARTH_BINARIES="${BUILD_PARTH_BINARIES:-1}"
+VERIFY_PARTH_GENESIS="${VERIFY_PARTH_GENESIS:-$BUILD_PARTH_BINARIES}"
 PSY_SERVICES_DIR="${PSY_SERVICES_DIR:-$WORKSPACE_ROOT/psy-services}"
 bookworm_build_jobs="$(resolve_rust_build_jobs "${BOOKWORM_BUILD_JOBS:-}")"
 
@@ -41,9 +42,12 @@ command -v docker >/dev/null 2>&1 || {
   exit 1
 }
 
-# psy_config embeds contract IDs and method IDs at compile time. Validate the
-# canonical psy-genesis submodule before entering the build container.
-bash "$PARTH_DIR/deploy/scripts/ensure-genesis-contracts.sh"
+# Node binaries embed contract IDs and method IDs at compile time. A
+# psy-services-only build resolves its pinned psy-node Git dependencies and
+# must not depend on the deployment worktree's generated genesis artifacts.
+if [ "$VERIFY_PARTH_GENESIS" = "1" ]; then
+  bash "$PARTH_DIR/deploy/scripts/ensure-genesis-contracts.sh"
+fi
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT

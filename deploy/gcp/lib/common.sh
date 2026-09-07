@@ -398,6 +398,10 @@ upload_bundle_if_configured() {
   local distribution_mode="${PARTH_BUNDLE_DISTRIBUTION_MODE:-cache-host}"
   local cache_url
 
+  if [ "${SKIP_PARTH_BUNDLE_UPLOAD:-0}" = "1" ]; then
+    echo "skipping Parth bundle upload for service-only deployment"
+    return 0
+  fi
   [ -z "$bundle" ] && return 0
   [ -f "$bundle" ] || {
     echo "PARTH_BUNDLE does not exist: $bundle" >&2
@@ -480,7 +484,9 @@ ensure_parth_vm() {
   upload_bundle_if_configured "$name"
 
   local bundle_expected=0
-  [ -n "${PARTH_BUNDLE:-}" ] && bundle_expected=1
+  if [ "${SKIP_PARTH_BUNDLE_UPLOAD:-0}" != "1" ] && [ -n "${PARTH_BUNDLE:-}" ]; then
+    bundle_expected=1
+  fi
   run_health_check "$name" "parth-host" "PARTH_BUNDLE_EXPECTED=$bundle_expected"
 }
 
