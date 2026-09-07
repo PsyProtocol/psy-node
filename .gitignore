@@ -71,11 +71,17 @@ genesis.json
 /output/
 psy-contracts/test/deployments/
 BUG.md
+AGENTS.md
+ISSUES.md
+TASKS.md
+MEMORY.md
 # Generated ts-rs bindings.
+parth_core/bindings/
+psy_core/bindings/
+psy_data/bindings/
 psy_node_common/bindings/
 client_prover/psy_vm/bindings/
 
-AGENTS.md
 .pi
 .grok
 .claude
