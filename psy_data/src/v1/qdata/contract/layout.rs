@@ -2557,7 +2557,7 @@ mod tests {
         let error = contract_state_layout::<PoseidonHasher, PF, QHashOut<PF>>(
             &[huge],
             1,
-            3,
+            1,
         )
         .unwrap_err();
         assert!(error.to_string().contains("state tree capacity"));
@@ -2706,9 +2706,9 @@ mod tests {
             &transition,
         )?;
 
-        new_leaf.state_layout_slot_count = PF::from_u64_value(9);
+        new_leaf.state_layout_slot_count = PF::from_u64_value(33);
         let mut oversized = transition;
-        oversized.new_layout_slot_count = 9;
+        oversized.new_layout_slot_count = 33;
         assert!(
             validate_contract_layout_transition(
                 11, &old_leaf, &new_leaf, &oversized,
