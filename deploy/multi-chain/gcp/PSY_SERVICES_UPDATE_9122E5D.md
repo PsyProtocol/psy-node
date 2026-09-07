@@ -57,7 +57,8 @@ topology assumptions, not failures in this psy-services deployment.
 Do not run this update unattended. First review:
 
 ```bash
-cd /home/peter/git/bridge_zilong/psy-node-multi-chain-gcp-deploy
+# Run from the selected deployment checkout's root.
+export WORKSPACE_HOME="$(cd .. && pwd)"
 
 GCP_DEPLOY_CONFIG="$PWD/deploy/multi-chain/gcp/config.env" \
   DRY_RUN=1 \

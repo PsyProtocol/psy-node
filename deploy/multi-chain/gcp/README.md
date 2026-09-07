@@ -94,6 +94,8 @@ plan displays every step ID, description, and script path:
 8. Install Caddy routes and verify each public RPC's exact `eth_chainId`.
 9. Publish config/App/Explorer/IDE frontends and run the smoke check.
 10. Add offsite workers only after the cloud baseline is healthy.
+11. Deploy Psy Notifier last (step 32), then verify all eleven collectors and
+    the Controller's three-chain probes. See [monitoring deployment](MONITORING.md).
 
 The Envio YAML renderer and Caddy path handling are covered by
 `deploy/gcp/tests/test-multichain-profile.sh`. Authenticated RPC URLs with a

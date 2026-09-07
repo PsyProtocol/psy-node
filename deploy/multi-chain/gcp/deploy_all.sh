@@ -90,6 +90,15 @@ if [ "${DEPLOY_OFFSITE_WORKERS:-0}" != "1" ]; then
   [ "$only_step" != "31" ] || fail "step 31 requires DEPLOY_OFFSITE_WORKERS=1 in config"
   skipped[31]=1
 fi
+case "${DEPLOY_MONITORING:-1}" in
+  1) ;;
+  0)
+    [ "$only_step" != "32" ] || fail "step 32 requires DEPLOY_MONITORING=1"
+    skipped[32]=1
+    echo "[multichain-deploy] monitoring explicitly disabled; this run cannot accept monitoring coverage"
+    ;;
+  *) fail "DEPLOY_MONITORING must be 0 or 1" ;;
+esac
 
 selecting=0
 [ -n "$from_step" ] || selecting=1
@@ -139,6 +148,11 @@ fi
 has_step() { [[ " ${selected[*]} " == *" $1 "* ]]; }
 if { has_step 02 || has_step 03; } && ! has_step 10; then
   fail "clearing L2 state requires step 10 in the same plan to replace all L1 roots"
+fi
+
+# Detect missing or unreviewed monitoring sources before stopping the network.
+if has_step 32; then
+  bash "$SCRIPT_DIR/deploy-monitoring.sh" --check
 fi
 
 # Only a full run prepares checkouts. Resuming must retain generated files and

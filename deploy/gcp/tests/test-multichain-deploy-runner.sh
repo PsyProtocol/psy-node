@@ -29,6 +29,10 @@ cat > "$profile/preflight.sh" <<'SH'
 echo preflight >> "$TEST_CALLS"
 exit "${TEST_PREFLIGHT_EXIT:-0}"
 SH
+cat > "$profile/deploy-monitoring.sh" <<'SH'
+echo "monitoring-$1" >> "$TEST_CALLS"
+exit "${TEST_MONITORING_CHECK_EXIT:-0}"
+SH
 cat > "$fresh/preflight.sh" <<'SH'
 echo "selected=$DEPLOY_ALL_SELECTED_STEPS" >> "$TEST_CALLS"
 SH
@@ -56,7 +60,8 @@ bash "$runner" --plan > "$tmp/plan"
 [ ! -e "$TEST_CALLS" ]
 [ ! -d "$profile/runtime" ]
 grep -q 'prove host: arc99x3' "$tmp/plan"
-[ "$(grep -cE '^[0-9]{2}  ' "$tmp/plan")" = 21 ]
+[ "$(grep -cE '^[0-9]{2}  ' "$tmp/plan")" = 22 ]
+[ "$(awk '/^[0-9][0-9]  / {id=$1} END {print id}' "$tmp/plan")" = 32 ]
 DRY_RUN=1 bash "$runner" > "$tmp/dry-run"
 cmp "$tmp/plan" "$tmp/dry-run"
 
@@ -108,8 +113,20 @@ if grep -q '^prepare$' "$TEST_CALLS"; then exit 1; fi
 : > "$TEST_CALLS"
 bash "$runner" > "$tmp/full"
 grep -q '^prepare$' "$TEST_CALLS"
-[ "$(grep -Ec '^[0-9]{2}$' "$TEST_CALLS")" = 21 ]
-[ "$(tail -n 1 "$TEST_CALLS")" = 31 ]
+[ "$(grep -Ec '^[0-9]{2}$' "$TEST_CALLS")" = 22 ]
+[ "$(tail -n 1 "$TEST_CALLS")" = 32 ]
+
+: > "$TEST_CALLS"
+if TEST_MONITORING_CHECK_EXIT=6 bash "$runner" > /dev/null 2>&1; then exit 1; fi
+[ "$(cat "$TEST_CALLS")" = 'monitoring---check' ]
+: > "$TEST_CALLS"
+if TEST_FAIL_STEP=32 bash "$runner" --from 31 > "$tmp/monitor-failure" 2>&1; then exit 1; fi
+grep -q 'FAILED 32' "$tmp/monitor-failure"
+[ "$(grep -E '^[0-9]{2}$' "$TEST_CALLS" | paste -sd, -)" = '31,32' ]
+DEPLOY_MONITORING=0 bash "$runner" --plan > "$tmp/no-monitor"
+if grep -q '^32  ' "$tmp/no-monitor"; then exit 1; fi
+grep -q 'monitoring explicitly disabled' "$tmp/no-monitor"
+if DEPLOY_MONITORING=0 bash "$runner" --only 32 --plan > /dev/null 2>&1; then exit 1; fi
 
 : > "$TEST_CALLS"
 if TEST_PREFLIGHT_EXIT=5 bash "$runner" --only 11 > /dev/null 2>&1; then exit 1; fi

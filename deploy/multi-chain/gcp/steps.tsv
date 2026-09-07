@@ -20,3 +20,4 @@
 30	30_deploy_cf_sdk_frontends.sh	Publish Bridge, Explorer and IDE using the same deployments
 23	23_smoke_test_simple_mint.sh	Run the basic protocol transaction smoke test
 31	31_deploy_offsite_workers.sh	Add the three offsite workers after the cloud baseline passes
+32	32_deploy_monitoring.sh	Deploy Psy Notifier last; verify Controller, 11 collectors and three-chain probes
