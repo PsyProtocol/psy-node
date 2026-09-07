@@ -756,4 +756,5 @@ Rollback units are: the globally shared verifier JSON plus localhost fingerprint
 - [Fn circuit fingerprint playbook](fn-circuit-fingerprint-playbook.md)
 - [Genesis generation](genesis-generation.md)
 - [Realm p2p validators](realm-p2p-validators.md)
+- [Reward tree circuit layouts](reward-tree-circuits.md)
 - [Token privacy circuit fingerprints](token-privacy-circuit-fingerprints.md)

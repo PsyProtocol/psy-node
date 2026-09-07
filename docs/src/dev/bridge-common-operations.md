@@ -1,10 +1,12 @@
 # Bridge Common Operations
 
-> Updated: 2026-09-02.
+> Repository-only bridge runbook. Generic wallet, registration, and PSY funding procedures are owned by `docs/src/dev/common-operations.md`.
 
 ## Abstract
 
 This guide is the executable local-devnet procedure for one L1 deposit, one L2 claim-deposit, one L2 withdrawal, and relayer settlement. Run every command from `<repo-root>`. Replace only angle-bracket values. Never place a real private key or wallet password in this document, a result file, or a shell history shared with other users.
+
+Related: `docs/src/dev/devnet_lifecycle.md` for startup and shutdown; `docs/src/dev/deposit-withdrawal.md` for bridge architecture.
 
 ## Table of Contents
 
@@ -13,8 +15,8 @@ This guide is the executable local-devnet procedure for one L1 deposit, one L2 c
 - [2. Start and Prove Readiness](#2-start-and-prove-readiness)
 - [3. Discover This Startup's Addresses](#3-discover-this-startups-addresses)
 - [4. Set One User and Small Amounts](#4-set-one-user-and-small-amounts)
-- [5. Register the User and Wait for the User ID](#5-register-the-user-and-wait-for-the-user-id)
-- [6. Fund L2 PSY Gas — Real EndCap](#6-fund-l2-psy-gas--real-endcap)
+- [5. Register the User and Derive the Shield Address](#5-register-the-user-and-derive-the-shield-address)
+- [6. Fund PSY Through the Faucet](#6-fund-psy-through-the-faucet)
 - [7. Approve the Gateway and Submit the L1 Deposit — Not an EndCap](#7-approve-the-gateway-and-submit-the-l1-deposit--not-an-endcap)
 - [8. Observe Relayer Deposit Append and Finalize](#8-observe-relayer-deposit-append-and-finalize)
 - [9. Claim the Deposit on L2 — Real EndCap](#9-claim-the-deposit-on-l2--real-endcap)
@@ -146,7 +148,6 @@ export USER_PRIVATE_KEY='<user-l1-private-key>'
 export USER_L1_ADDRESS="$(cast wallet address "$USER_PRIVATE_KEY")"
 export DEPOSIT_AMOUNT='2000'
 export WITHDRAW_AMOUNT='1000'
-export PSY_GAS_AMOUNT='10000000000'
 export SOURCE_CHAIN_INDEX='0'
 
 eval "$(python3 - <<'PY'
@@ -163,38 +164,11 @@ PY
 ```
 For local USDT, `2000` is `0.002` USDT and `1000` is `0.001` USDT. Small values reduce proof and liquidity surprises. `claim-deposit` and `withdraw` both consume L2 PSY fees; L1 token ownership does not pay L2 gas. The referenced Bridge campaign is [PsyProtocol/psy-memory Bridge E2E](https://github.com/PsyProtocol/psy-memory/blob/main/src/repositories/parth-generic-v1/e2e/bridge.md), especially its amount, L2 gas, and same-user serial-operation rules.
 
+## 5. Register the User and Derive the Shield Address
 
+Follow `docs/src/dev/common-operations.md` Sections 2–4 with this run's `USER_PRIVATE_KEY`, `RPC_CONFIG`, and `RESULT_DIR`. Continue only when registration is indexed. Export `USER_PUBLIC_KEY` from `register-user.json.public_key_hash` and `USER_ID` from `get-user-id.json.user_id`; reject an empty or null user ID. Registration and identity semantics are defined in `client_prover/psy_cli/psy_user_cli/src/subcommand/register_user.rs:15-46` and `client_prover/psy_cli/psy_user_cli/src/subcommand/get_user_id.rs:9-30`.
 
-## 5. Register the User and Wait for the User ID
-
-`register-user` returns `pending` when it submits a new registration and `registered` when the key already exists. `get-user-id` returns a structured `not_registered` state rather than treating it as a transport failure (`client_prover/psy_cli/psy_user_cli/src/subcommand/register_user.rs:15-46`, `client_prover/psy_cli/psy_user_cli/src/subcommand/get_user_id.rs:9-30`).
-
-```bash
-./target/release/psy_user_cli \
-  --result-file "$RESULT_DIR/register-user.json" \
-  register-user \
-  --sign-type zk \
-  --private-key "$USER_PRIVATE_KEY" \
-  --rpc-config "$RPC_CONFIG"
-
-export USER_PUBLIC_KEY="$(jq -r '.public_key_hash' "$RESULT_DIR/register-user.json")"
-
-for attempt in $(seq 1 60); do
-  ./target/release/psy_user_cli \
-    --result-file "$RESULT_DIR/get-user-id.json" \
-    get-user-id \
-    --pub-key "$USER_PUBLIC_KEY" \
-    --rpc-config "$RPC_CONFIG"
-  USER_ID="$(jq -r '.user_id // empty' "$RESULT_DIR/get-user-id.json")"
-  test -n "$USER_ID" && break
-
-  sleep 2
-done
-
-test -n "${USER_ID:-}"
-export USER_ID
-jq -e '.status == "registered" and (.user_id != null)' "$RESULT_DIR/get-user-id.json"
-```
+Derive the bridge-specific shield address using the same user and this run's fresh randomness:
 
 ```bash
 ./target/release/psy_user_cli \
@@ -211,26 +185,9 @@ export SHIELD_ADDRESS="$(jq -r '.note_owner' "$RESULT_DIR/note-owner.json")"
 
 The global `--result-file` is atomically published only on success and contains secret-free command results (`client_prover/psy_cli/psy_user_cli/src/subcommand/mod.rs:47-54`, `client_prover/psy_cli/psy_user_cli/src/result.rs:299-372`).
 
-## 6. Fund L2 PSY Gas — Real EndCap
+## 6. Fund PSY Through the Faucet
 
-This is the first same-user L2 state transition. Wait for confirmation before doing any later L2 operation.
-
-```bash
-./target/release/psy_user_cli \
-  --result-file "$RESULT_DIR/mint-psy.json" \
-  call \
-  --sign-type zk \
-  --private-key "$USER_PRIVATE_KEY" \
-  --rpc-config "$RPC_CONFIG" \
-  --contract-id 0 \
-  --method-name simple_mint \
-  --inputs "[$PSY_GAS_AMOUNT]" \
-  --wait-until-confirmation
-
-jq -e '.status == "confirmed" and (.confirmed_checkpoint != null)' "$RESULT_DIR/mint-psy.json"
-```
-
-Do not start `deposit`, `claim-deposit`, or `withdraw` in parallel with this command.
+Follow `docs/src/dev/common-operations.md` Section 5.1 using the registered user from Section 5. Save the confirmed recipient call result as `claim-psy.json` in `RESULT_DIR`. The local genesis deployer is not a devnet wallet: `simple_mint` is not a funding path. Do not start `deposit`, `claim-deposit`, or `withdraw` until the faucet transfer is included and the recipient's `simple_claim` returns `confirmed`. Keep every same-user L2 operation serial.
 
 ## 7. Approve the Gateway and Submit the L1 Deposit — Not an EndCap
 
@@ -265,11 +222,17 @@ export DEPOSIT_INDEX="$(jq -r '.deposit_index' "$RESULT_DIR/deposit-proof.json")
 test "$DEPOSIT_INDEX" != 'null'
 ```
 
-`--deposit-proof-output` is optional at the deposit interface, but it is required for the file-based `claim-deposit` command used below. With this flag, the deposit command waits up to 600 seconds for relayer proof readiness and then writes the sender-generated inclusion proof (`client_prover/psy_cli/psy_user_cli/src/subcommand/deposit.rs:636-676`, `client_prover/psy_cli/psy_user_cli/src/subcommand/deposit.rs:1072-1107`). If the receiver uses Nostr recovery, also pass `--recipient-npub <receiver-npub>`; the CLI publishes separate proof and encrypted-secret events (`client_prover/psy_cli/psy_user_cli/src/subcommand/deposit.rs:802-904`). Never rerun `deposit` to retry proof generation: that records a new L1 deposit.
+`--deposit-proof-output` is optional at the deposit interface, but it is required for the file-based `claim-deposit` command used below. With this flag, the deposit command waits up to 600 seconds for relayer proof readiness and then writes the sender-generated inclusion proof (`client_prover/psy_cli/psy_user_cli/src/subcommand/deposit.rs:636-676`, `client_prover/psy_cli/psy_user_cli/src/subcommand/deposit.rs:1072-1107`). Never rerun `deposit` to retry proof generation: that records a new L1 deposit.
+
+### Nostr Receiver Recovery
+
+When the receiver uses Nostr recovery, add `--recipient-npub <npub>` to the **same deposit command above**, retaining both `--note-secret` and `--nullifier-secret`. This publishes two separate events linked by `backup_id = note_commitment`: plaintext `psy_deposit_proof` metadata and proof, and encrypted `psy_deposit_secrets` claim material (`client_prover/psy_cli/psy_user_cli/src/subcommand/deposit.rs:802-904`).
+
+Omitting `--recipient-npub` for a Nostr receiver breaks claim retrieval: the L1 deposit can succeed without publishing either recovery event. The local proof file does not replace Nostr delivery to that receiver. Require both events for the same backup identifier before treating Nostr recovery as ready. If delivery is missing, preserve the existing deposit proof and secrets and restore delivery for that deposit; do not submit a second L1 deposit.
 
 ## 8. Observe Relayer Deposit Append and Finalize
 
-The relayer first appends the deposit state on L2, advances L1 `provedDepositCount` through `batchAppend`, then finalizes a checkpoint range. The Bridge exposes the deposit counters and root (`psy-contracts/src/Bridge.sol:148-152`). Section 6 captured the finalized cursor before the deposit:
+The relayer first appends the deposit state on L2, advances L1 `provedDepositCount` through `batchAppend`, then finalizes a checkpoint range. The Bridge exposes the deposit counters and root (`psy-contracts/src/Bridge.sol:148-152`). Section 7 captured the finalized cursor before the deposit:
 
 ```bash
 export PROVED_TARGET="$((DEPOSIT_INDEX + 1))"
@@ -292,7 +255,7 @@ The proof file, `provedDepositCount >= deposit_index + 1`, and a measured finali
 
 ## 9. Claim the Deposit on L2 — Real EndCap
 
-Run only after the prior L2 mint EndCap has confirmed and the proof file exists. Raw secrets are optional validation inputs, but when supplied they must be supplied together. Do not pass a checkpoint ID; the command resolves current context.
+Run only after the recipient's PSY funding call has confirmed and the proof file exists. Raw secrets are optional validation inputs, but when supplied they must be supplied together. Do not pass a checkpoint ID; the command resolves current context.
 
 ```bash
 ./target/release/psy_user_cli \
@@ -353,6 +316,7 @@ export L1_BALANCE_BEFORE="$(cast call "$USDT" 'balanceOf(address)(uint256)' "$US
   withdraw \
   --sign-type zk \
   --private-key "$USER_PRIVATE_KEY" \
+  --rpc-config "$RPC_CONFIG" \
   --l1-rpc-url "$L1_RPC_URL" \
   --destination-chain-index 0 \
   --token-address "$USDT" \
@@ -367,7 +331,7 @@ The withdrawal amount must be positive and no greater than the user's withdrawn-
 
 ## 11. Register and Settle the L1 Withdrawal
 
-Section 9 captured the finalization cursor and recipient balance before the L2 withdrawal.
+Section 10 captured the finalization cursor and recipient balance before the L2 withdrawal.
 
 After the withdrawal EndCap, the relayer scans the event, submits an L2 `append_withdrawal` EndCap, proves and finalizes the checkpoint range on L1, then calls `Bridge.batchClaimWithdrawal`. That call registers `pendingWithdrawals[nonce]` and sets `claimedNullifiers[nonce]`; it does not transfer tokens (`psy-contracts/src/Bridge.sol:807-830`, `psy_cli/psy_relayer_cli/src/bridge/claim_withdrawals.rs:588-604`).
 
@@ -403,8 +367,9 @@ test "$(jq -r '.[2]' <<<"$CLEARED_JSON")" -eq 0
 |---|---|---|---|
 | User registration submitted | coordinator | `register-user.json.status` is `pending` or `registered` | `psy_user_cli --result-file … register-user` |
 | User ID assigned | coordinator | `get-user-id.json.status == "registered"`; `user_id` is non-null | `psy_user_cli --result-file … get-user-id` |
-| L2 PSY funded | user EndCap | `mint-psy.json.status == "confirmed"` | `psy_user_cli call --wait-until-confirmation` |
+| L2 PSY funded | faucet operator transfer, then recipient EndCap | `claim-psy.json.status == "confirmed"`; contract-0 token balance funded | `common-operations.md` Section 5.1 |
 | L1 deposit recorded, not EndCap | user L1 transaction | `deposit.json.status == "confirmed"`; `pendingDepositCount` includes the index | result file; `Bridge.pendingDepositCount()` |
+| Nostr recovery ready, when selected | deposit sender | both proof and encrypted-secret events share the deposit's backup identifier | `deposit --recipient-npub <npub>`; Nostr events |
 | Relayer deposit append | relayer L2 EndCap and L1 batch append | `provedDepositCount >= deposit_index + 1`; proof JSON exists | `Bridge.provedDepositCount()`; deposit proof file |
 | Relayer finalize after deposit | relayer L1 transaction | finalization cursor increases from the captured pre-deposit value | `StateManager.lastFinalizedCheckpointId()` |
 | L2 deposit claim | user EndCap | `claim-deposit.json.status == "confirmed"` | result file |
@@ -422,6 +387,7 @@ Services exposes the stable deposit, withdrawal, deposit-proof, and withdrawal-p
 | result file absent after nonzero exit | Command failed; stale success was removed fail-closed | Read stderr, correct the cause, rerun that command only |
 | `status: "not_registered"` and `user_id: null` | Registration has not been indexed | Continue the bounded user-ID poll; do not submit L2 calls |
 | `ERC20InsufficientAllowance` | ERC20Gateway allowance is insufficient | Approve the resolved gateway for at least `DEPOSIT_AMOUNT`, then submit one deposit |
+| Nostr receiver cannot retrieve the deposit claim | `--recipient-npub` omitted or one recovery event missing | Restore both events for the existing deposit using the retained proof and secrets; do not rerun deposit |
 | `timeout waiting for deposit claim proof … (elapsed=600s)` | Deposit exists but the relayer/services proof did not become ready in ten minutes | Inspect `provedDepositCount`, services health, and relayer log; do **not** rerun deposit |
 | proof response `found:false, reason:"no_proved_deposits"` | No deposit snapshot has been proved | Wait for relayer deposit append |
 | `deposit_not_indexed` | Envio has not indexed this deposit | Wait for indexer; keep the same deposit index |
@@ -449,7 +415,7 @@ The deposit proof response reasons are stable machine-readable values (`../psy-s
 For one user, execute these L2 EndCaps in this exact order, with each command returning `confirmed` before the next begins:
 
 ```text
-simple_mint -> claim-deposit -> withdraw
+simple_claim (faucet funding) -> claim-deposit -> withdraw
 ```
 
 Do not background these commands. Do not submit two withdrawals for the same user concurrently. The relayer defaults to one sequential L2 batch (`psy_cli/psy_relayer_cli/src/bridge/daemon.rs:103-112`). The same serial rule is part of the referenced [PsyProtocol/psy-memory Bridge E2E](https://github.com/PsyProtocol/psy-memory/blob/main/src/repositories/parth-generic-v1/e2e/bridge.md).

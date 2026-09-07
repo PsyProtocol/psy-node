@@ -6,6 +6,8 @@
 
 This document describes the private transfer and private claim flow on the Psy protocol. It is intended for auditors and integrators who need to verify the correctness of shielded transfers between users.
 
+Related: `docs/src/dev/devnet_lifecycle.md` for startup and shutdown; `docs/src/dev/common-operations.md` for wallet, registration, and PSY funding.
+
 ## Table of Contents
 
 - [1. Overview](#1-overview)
@@ -62,20 +64,21 @@ The receiver derives a shielded note owner using their private key and two rando
 note_owner = PoseidonHash(user_id, 1337, r0, r1)
 ```
 
-The receiver must remember `r0` and `r1` — they are required to claim the note later. The `derive-note-owner` CLI command outputs the note owner hash and optionally a Nostr npub for delivery.
+The receiver must remember `r0` and `r1` — they are required to claim the note. The `derive-note-owner` command outputs the note owner hash; obtain the receiver's Nostr public key separately (`client_prover/psy_cli/psy_user_cli/src/subcommand/args.rs:797-807`).
 
 ### Step 2: Execute Private Transfer
 
 The sender calls `private-transfer` with the receiver's note owner:
 
 ```bash
-psy_user_cli private-transfer \
+./target/release/psy_user_cli private-transfer \
   --rpc-config <config> \
   -p <sender_private_key> \
   --contract-id <token_contract_id> \
   --amount <amount> \
   --receiver <receiver_note_owner_hash> \
   --note-root-slot 2147483649 \
+  --nostr-recipient-pubkey '<receiver-npub>' \
   --output <output_file>
 ```
 
@@ -148,7 +151,7 @@ Items already flagged as `claimed` by the indexer are excluded.
 The receiver claims the note by submitting a `private_claim` contract call:
 
 ```bash
-psy_user_cli private-claim \
+./target/release/psy_user_cli private-claim \
   --rpc-config <config> \
   -p <receiver_private_key> \
   --contract-id <token_contract_id> \
@@ -210,7 +213,7 @@ In the proving session, the external proof (note inclusion) must be inserted **b
 |-------|-------|------------|
 | `receiver does not match claiming user` | Wrong private key or wrong `r0`/`r1` | Ensure the receiver key and randoms match the note owner |
 | `nullifier already claimed` | Note was already claimed by someone | Check claim status before attempting |
-| `insufficient balance for fee` | Receiver has no L2 PSY for gas | Fund receiver with `simple_mint` first |
+| `insufficient balance for fee` | Receiver has no L2 PSY for gas | Fund the receiver through `docs/src/dev/common-operations.md` Section 5.1; genesis `simple_mint` is not available to devnet wallets |
 | `note proof deserialization failed` | Corrupted or wrong format proof file | Regenerate the proof file |
 | `stale trace anchor` | Checkpoint advanced during proving | Regenerate trace with fresh anchor |
 | `proof tree root mismatch` | `private_note_inclusion_fingerprint` or the PI `hash([...])` list does not match the circuit that produced the session leaf | Follow `docs/src/dev/token-privacy-circuit-fingerprints.md` |

@@ -973,6 +973,8 @@ Commands execute serially and the loop remains available until the server is clo
 
 - [Circuit and verifier operations](circuit-and-verifier-operations.md)
 - [Devnet lifecycle](devnet_lifecycle.md)
+- [Common account and contract operations](common-operations.md)
+- [Bridge common operations](bridge-common-operations.md)
 - [Fn circuit fingerprint playbook](fn-circuit-fingerprint-playbook.md)
 - [Genesis generation](genesis-generation.md)
 - [Realm p2p validators](realm-p2p-validators.md)

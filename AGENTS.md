@@ -48,6 +48,10 @@ Changes to DPN circuits, UPS circuits, ZK-signature or secp256k1 circuits, the u
 
 After any network-circuit change, register every new or changed circuit triplet and parent/child inclusion relationship in `psy_plonky2_circuits/examples/config_gen_v2.rs` and the owning circuit manager. For cache-only generation, use only the exact `--no-default-features` command in `docs/src/dev/circuit-and-verifier-operations.md`; `make config_gen_v2` is forbidden because default features include `gnark-wrap` and can mutate Bridge setup material. Commit both generated outputs, `psy_plonky2_circuits/src/generated/cached_circuit_library.rs` and `psy_plonky2_circuits/src/generated/cached_common_data.rs`, as one pair. Accept the result only when a second identical run reports both files up to date and all affected fingerprints and whitelist roots match.
 
+Before adding or changing a GUTA-related network circuit (EndCap, GUTA aggregator, RealmFinalizeGUTA, coordinator GUTA lift, AggUserRegisterDeployContractsGUTA, checkpoint state transition, or a new sibling under that tree), read `docs/src/dev/reward-tree-circuits.md` and the authoritative ASCII layout in `psy_data/src/rewards_tree/offsets.rs`. The new circuit must declare a `reward_tree_hash_mode` that matches its child arity and occupy a unique offset under that tree. Do not invent a second reward-tree layout, swap modes 0 and 1, or reuse `N(3, 3)` as the deploy-contract root.
+
+Before editing a gatherer, planner, or processor pipeline (queue finalize, unique-id rotation, `process_block`, `commit_state`, N/N+1 seam, or P2P submit/admit), read `docs/src/dev/gatherers.md` and `docs/src/dev/processors.md`. Those documents own the current lifecycle, the official-versus-N+1 finalize seam, and commit-marker order.
+
 ## Groth16 Trusted-Setup Boundary
 
 Changes to the bridge aggregation circuit, checkpoint recursive transition circuit, deposit batch-append circuit, or withdrawal batch-claim circuit invalidate the corresponding Groth16 wrapper setup. Regenerate the affected setup with the release `psy_relayer_cli regenerate-groth16-keystore` path, then export and replace the matching tracked verifier in `psy-contracts/src/`: `GnarkGroth16Verifier.sol` for bridge aggregation/checkpoint wrapping, `DepositBatchVerifier.sol` for deposit batch append, and `WithdrawalClaimVerifier.sol` for withdrawal batch claim. Treat the circuit, wrapper common/verifier data, `circuit_groth16.bin`, `pk_groth16.bin`, `vk_groth16.bin`, and Solidity verifier as one atomic artifact set. Never reuse a prior key or verifier after an input circuit changes. Verify an export to a temporary file is byte-identical to the tracked Solidity verifier, then rebuild and run the corresponding real bridge E2E against an authorized deployment. Redeploy the affected verifier and update deployment records only when the user separately authorizes that exact deployment and network.
@@ -405,7 +409,7 @@ test "$(git ls-remote origin "refs/heads/$destination_ref" | cut -f1)" = "$head_
 
 Push only the named repository and exact authorized destination ref. Never push tags or additional refs unless separately authorized. Never force-push to repair ordering or publication mistakes.
 
-`AGENTS.md` is intentionally ignored by the repository's current `.gitignore`. When this policy file is the explicitly authorized delivery, stage exactly it with `git add -f AGENTS.md`; force-adding any other ignored path is forbidden.
+`AGENTS.md` is intentionally ignored by the repository's current `.gitignore`. When this policy file is the explicitly authorized delivery, stage exactly it with `git add -f AGENTS.md`. `ISSUES.md`, `TASKS.md`, and `MEMORY.md` are local working state and must never be staged or force-added. Force-adding any other ignored path is forbidden.
 
 ## Failure and Recovery Rules
 
@@ -465,7 +469,8 @@ Violating any rule below requires an immediate fix before other work continues.
 7. **Never print secrets or environment values.** Do not read or display secret files, credentials, keys, tokens, or environment-variable contents.
 8. **Never access home-directory cloud credentials.** Do not read, list, or access cloud-provider credential directories in the user's home directory.
 9. **Use structured web tooling.** Prefer repository readers or browser tooling over raw page dumps when those tools are available.
-10. **Realm pipeline overlap is non-negotiable.** Candidate A proving, P2P consensus, and Coordinator inclusion must overlap with builder B accepting and speculatively aggregating real EndCaps on A's end root. Never replace this with a serial seal, inclusion wait, and resume barrier. Never keep B paused during A proving, consensus, or inclusion. A short seal and exact-root publication before A proving may seed B. Keep speculative intake separate from checkpoint-bound authoritative witness generation. Bind or rebuild B's authoritative graph only after a real checkpoint authenticates B's start root. Checkpoint proof guards remain fail-closed, and proof values must never be mutated.
+10. **Select the remote shell explicitly for SSH commands.** Never rely on the remote account's login shell to parse automation commands. Invoke the intended interpreter explicitly: use `ssh <host> /usr/bin/bash -s` for Bash scripts or `ssh <host> /usr/bin/bash -lc '<command>'` for a single command. This prevents quoting, expansion, startup-file, and syntax differences in the remote environment from changing command behavior.
+11. **Realm pipeline overlap is non-negotiable.** Candidate A proving, P2P consensus, and Coordinator inclusion must overlap with builder B accepting and speculatively aggregating real EndCaps on A's end root. Never replace this with a serial seal, inclusion wait, and resume barrier. Never keep B paused during A proving, consensus, or inclusion. A short seal and exact-root publication before A proving may seed B. Keep speculative intake separate from checkpoint-bound authoritative witness generation. Bind or rebuild B's authoritative graph only after a real checkpoint authenticates B's start root. Checkpoint proof guards remain fail-closed, and proof values must never be mutated. The current gatherer and processor contracts are `docs/src/dev/gatherers.md` and `docs/src/dev/processors.md`.
 
 ## Core Engineering Principles
 
@@ -475,17 +480,94 @@ Violating any rule below requires an immediate fix before other work continues.
 4. Keep control flow flat. Prefer `match`, `switch`, and early returns. Do not exceed three levels of nesting.
 5. Return errors immediately with context. Prefer `ok_or`, `ok_or_else`, `?`, or an explicit early-return match.
 6. Reuse shared logic when the same non-trivial behavior appears at least twice and will remain shared.
-7. Comments are exceptional. Use one short sentence only when an invariant or reason cannot be expressed in code.
+7. Comments are exceptional. Use one short sentence only when an invariant, non-obvious reason, external-spec citation, or known correctness hazard cannot be expressed in code. Across each changed file, new or modified comment lines must stay at or below 5 per 1,000 changed code lines; a change below 1,000 code lines gets at most 5 comment lines total. Only an irreducible safety invariant or external-spec citation may exceed this, and only when a shorter name, type, or assertion cannot carry the same information.
 8. Do not weaken requirements, drop behavior, or special-case an input to hide the underlying defect.
 9. Maintain one optimal implementation. Migrate every caller and remove obsolete aliases, compatibility paths, and deprecated versions. Storage-schema mirrors required by a proxy upgrade (for example `ImportedTokenFlowConfig` in `Bridge.sol`) are not compatibility debt: the mirror stays until every deployment has migrated past the old revision, and then one dedicated storage-layout revision removes it. Test fixtures that model a deployed predecessor are removed together with their migration test when that window closes. While such fixtures exist, they remain test-only and must follow the Testing fixture-location rules; a rename or role-based name does not authorize placing them in a production or deployable source set.
 10. Solve only the current problem. Do not introduce speculative fields, stores, interfaces, retries, telemetry, or validation.
 11. Stay within scope. Modify only files directly required by the current goal and treat unrelated changes as user-owned work.
 12. Prefer existing repository patterns. A second convention beside an established one is prohibited.
+13. **Strong types over string matching.** New or modified business logic models states, commands, error categories, lifecycle phases, identities, wire variants, and protocol actions with enums, tagged unions, newtypes, or structured fields; exhaustive `match`/`switch` owns branching. Do not parse, compare, prefix-test, regex-test, or substring-match human-readable messages, labels, titles, or error prose. At an external untyped boundary, one centralized parser may convert raw strings into a closed typed value; all downstream code consumes only that type. When touching an existing prose-matched branch, migrate that branch and every directly coupled caller in the same change.
+14. **Requirements remain cumulative.** Every user-requested task and acceptance criterion remains required until executable evidence proves completion or the user explicitly cancels or changes it. Record them in repository-root `TASKS.md` before implementation, and re-read that file after each completed item. Append or merge new requests without silently deleting, weakening, rewriting, marking complete, or displacing earlier requests; if requirements conflict, ask the user instead of choosing.
+15. **Fixes before features; features before improvements.** Any user-requested or verified in-scope fix has higher priority than starting or resuming new feature work. Finish its implementation, focused verification, required different-model review, and narrow commit before feature work continues. Defects outside the active scope are reported and deferred unless the user explicitly brings them into scope.
+16. **Evidence-first bug fixing.** Every bug fix follows this order; skipping a stage is a rejected fix: (1) reproduce the user-visible failure on the real affected surface and capture the artifact (log, RPC, fixture, or runtime trace); (2) write a failing test that encodes that reproduction; (3) fix the defect at the responsible boundary with root-cause evidence (`<file>:<line>`); (4) obtain different-model review of the staged diff with zero unresolved findings; (5) re-reproduce on the original surface and confirm the failing test now passes. Hypotheses and source inspection guide investigation but are never root-cause proof. Three failed speculative fixes without a captured artifact require stopping and capturing evidence before writing another line.
+17. **Exact scope and stopping rule.** Complete every cumulative user instruction and named acceptance criterion, including directly required correctness work, but do not add adjacent improvements, recursive cleanup, speculative hardening, or optional redesign. Once requested behavior has executable evidence and every requested verification, review, documentation, and required cleanup item is complete, stop.
+
+## Multi-Agent Ownership
+
+1. Before editing, each agent must declare the exact files or modules it owns. Two agents must never edit the same file or implement competing versions of the same feature concurrently.
+2. A delegated implementation task owns one observable contract, one interface boundary, and normally one to three source files. Decompose theme-level requests before dispatch. Freeze a shared protocol, persistence format, or state-machine contract before assigning disjoint implementers.
+3. Every delegated task must name owned and forbidden files, observable acceptance, and this evidence contract: unexecuted tests, builds, browser journeys, and screenshots are `PENDING`; an executed failing check is `FAILED`; authored assertions, screenshot filenames, and a completion message are not execution evidence. The coordinating agent reviews the diff and raw command output, not the subagent's claim.
+4. Do not run final verification, broad tests, or review-as-approval while any active agent is still editing a participating file. Obtain an explicit stopped-editing handoff first.
+5. When an agent discovers adjacent work, append it to `ISSUES.md` and report it rather than expanding the assigned task. Public API, protocol, persistence-format, or architecture changes outside the assigned acceptance criteria require user approval before implementation. Do not promote an issue into `TASKS.md` without explicit user agreement.
+
+### Subagent Context and Investigation Boundaries
+
+1. Before dispatch or reassignment, provide one concise current-state brief: user contract and exclusions; exact owned files and entry symbols; settled design and rejected alternatives; verified failure sequence; applied changes; remaining defects; executed checks and uncovered acceptance; the next concrete action. Link longer reports as supporting evidence, never as a substitute for this brief.
+2. Label inherited findings as current, fixed, superseded, or unverified, with source locations and the inspected revision or working-tree snapshot. The coordinator resolves contradictory reports before handoff. A worker rechecks affected current code, not the entire historical investigation.
+3. Separate implementation-ready work from unresolved research. Start independent ready work immediately; a difficult call chain must not block unrelated known fixes. Share common prerequisite research once, and assign each unresolved question to one owner rather than having several agents rediscover it.
+4. After the first focused read, the worker reports the chosen change and starts editing within scope, or names the exact missing fact, the inspected evidence, and the lookup needed to resolve it. Reading is not a progress metric. Never impose a time limit that encourages guessing or skipping correctness checks.
+5. The coordinator checks concrete tool activity at progress checkpoints. Repeated reads without a new finding trigger a narrower question and an updated current-state brief, not another broad investigation. On reassignment, obtain a stopped-editing handoff and pass exact changed paths, open failures, fixture entry points, and pending checks to the new owner.
+6. Pipeline independent design, implementation, read-only audit, and ablation preparation; record each dependency as same-file, data-flow, or environment setup. Preliminary audit findings may feed active implementation, but final approval requires a frozen snapshot. One executor runs centralized changed-contract regression, then actual ablation negative controls; agents prepare cases without competing builds or test runs.
+
+## Local Working Memorandum
+
+`ISSUES.md`, `TASKS.md`, and `MEMORY.md` live only at the repository root. They are local working state: listed in `.gitignore`, never staged, never committed, and never force-added. Do not create copies under other directories. Write them in English. Never put secrets, credentials, tokens, environment values, or machine-local absolute paths in them.
+
+These files do not replace psy-memory specifications, Cursor in-session Todos, or user conversation. Current repository files and command output win if a memorandum note disagrees with them.
+
+### TASKS.md
+
+The cumulative contract of user-requested work.
+
+1. Before implementation, record every user-requested task and its acceptance criterion.
+2. Re-read the file after completing each item so remaining requirements are not lost or silently displaced.
+3. Append or merge new user requests. Do not delete, weaken, rewrite as complete, deprioritize, or displace an earlier open item unless the user explicitly cancels or changes it.
+4. In-session Todo lists must mirror `TASKS.md`. Never create, append, split, replace, reorder, or expand Todo items without the user's explicit agreement. A newly discovered defect belongs in `ISSUES.md` unless it is directly required for an already agreed task's acceptance.
+5. Status updates may only mark agreed items `pending`, `in_progress`, `done`, or `dropped` according to current evidence. They must not silently change scope.
+
+Required fields per item:
+
+- `id`: stable local identifier, not a code name
+- `title`: one-line user request
+- `acceptance`: executable check or observable scenario
+- `status`: `pending` | `in_progress` | `done` | `dropped`
+- `evidence`: command, log, or artifact that proves the current status, or `PENDING`
+
+### ISSUES.md
+
+The parking lot for findings that are not yet authorized work.
+
+1. Append a newly discovered defect, adjacent cleanup, or speculative improvement here and report it to the user. Do not start implementing it.
+2. Promote an issue into `TASKS.md` only after the user explicitly agrees. Record the promotion by marking the issue `promoted` and adding the matching task; do not delete the issue.
+3. If a finding is directly required to complete an already agreed `TASKS.md` item, handle it inside that task and note the link. Do not invent a second task.
+4. Close an issue as `dropped` only when the user declines it or current evidence shows it is not a defect.
+
+Required fields per item:
+
+- `id`: stable local identifier
+- `title`: one-line finding
+- `evidence`: `<file>:<line>`, log excerpt, or command output
+- `status`: `open` | `promoted` | `dropped`
+- `task`: `TASKS.md` id after promotion, otherwise empty
+
+### MEMORY.md
+
+Advisory local notes for later agents in this worktree.
+
+1. After a completed task, a failed focused check, or a 30-minute inspection, append a durable note: pitfall, routing trick, invariant, or grounded understanding with `<file>:<line>`.
+2. Treat every note as advisory. Prefer current source and command output over an older note.
+3. Skip one-off noise. Do not copy secrets, full user input, or local absolute paths. Do not use `MEMORY.md` as a specification, review, or release record.
+
+Required fields per note:
+
+- `date`: ISO date
+- `topic`: short noun phrase
+- `note`: one or two sentences plus `<file>:<line>` when a claim is about source
 
 ## Error Handling
 
 1. Fail fast with readable context including relevant identifiers and parameters.
-2. Never swallow errors, use empty catches, unwrap production failures, or discard context during conversion.
+2. Never swallow errors, use empty catches, unwrap production failures, or discard context during conversion. Explicitly forbidden: `Err(_) => Ok(None)`, `.ok()?` around a user or protocol action, empty or broad `catch`, signaling success after a partial durable update, and dropping cleanup or rollback errors. Catching broadly is allowed only when every unexpected error is rethrown with context. Suppression is allowed only for one exact documented non-fatal category while preserving authoritative last-good state, with a negative test proving other errors propagate.
 3. Never delete failure paths to make verification pass. Handle the failure or reject it explicitly.
 4. Model retry, rollback, and idempotency behavior explicitly.
 
@@ -532,7 +614,7 @@ Violating any rule below requires an immediate fix before other work continues.
 2. Use standalone integration tests only for cross-module contracts or framework requirements.
 3. Tests must defend observable behavior, boundaries, invariants, transitions, precedence, and real errors.
 4. Do not use tautological assertions, status-only checks, or mocks that bypass the contract under test.
-5. Bug fixes require reproduction before the change and confirmation that the same reproduction no longer fails.
+5. Bug fixes follow the evidence-first pipeline in Core Engineering Principles: reproduce and capture the failure, write a failing test, fix at the responsible boundary with `<file>:<line>` evidence, obtain different-model review, then re-reproduce and confirm the test passes. Speculative fixes without a captured artifact are forbidden.
 6. UI changes require browser execution. Runtime changes require launching and exercising the changed path.
 7. Coverage tools supplement test design but do not replace it.
 8. Test-only fixtures must not live in the production or deployable source set of any language or toolchain. Keep them in a dedicated test-only tree owned by that package's tests, and extend the build so tests can compile or link that tree without making it the deployable source root. Apply the same rule across stacks: Solidity fixtures stay outside Hardhat `paths.sources` and Foundry `src`; Rust helpers stay under `#[cfg(test)]` or a tests-only module; TypeScript helpers stay out of package entrypoint exports. Renaming a fixture or giving it a production-sounding name does not satisfy this rule while it remains under a deployable source root. A symbol with no production, deploy, or runtime caller belongs in the test-only tree or must be deleted—even during a migration window.
@@ -591,10 +673,12 @@ A change is rejected until any applicable item is corrected:
 16. Tests that prove plumbing rather than the observable contract.
 17. Duplicated state under alias names: the same concept kept as multiple variables (live copy, snapshot, aligned copy, stale-detection mirror) that must be manually kept in sync. Model state as one cohesive data structure with a single explicit shared reference (e.g. Arc<RwLock<T>>); never replace it with copy-and-pass channels, copied-snapshot stale detection, or copy-then-replay machinery. When data is already authoritative and in-band (e.g. a Proposal body carries the backup and its hash is verified), consume it directly; never rediscover it by scanning directories or matching hashes.
 18. Test-only fixtures under any production or deployable source root, or documentation that references binaries, subcommands, flags, environment variables, or RPC methods that do not exist in the current source.
+19. Dual implementations of the same contract (`legacy` / `compat` / `fallback` / `v1`+`v2` adapters, or old and new parsers kept together). Delete the superseded path; fail closed or retry the same typed contract. A proxy-upgrade storage mirror named by what it holds is the only temporary exception and is removed in the next storage-layout revision.
+20. False evidence and self-certification: status-only checks, mocks that accept both old and new protocols, assertions that cannot distinguish the reported bug, unexecuted or skipped checks reported as passed, and a completion message used as acceptance. Unexecuted checks remain `PENDING`; executed failing checks are `FAILED`. Neither may be summarized as passed.
 
 ## Documentation Standards
 
-1. `docs/` is the official developer-facing documentation: architecture, protocol, CLI reference, and verified procedures. It is split by audience. Public developer documentation lives under the mdBook-published tree (`src/SUMMARY.md` registration required). Internal developer documentation (devnet operations, verifier/circuit update procedures, debugging playbooks, incident postmortems) lives under `docs/src/dev/` and MUST NOT be registered in `src/SUMMARY.md` — it is repository-only and never published. Keep each topic consolidated in one document; do not fragment operational knowledge into many scattered files, and do not mix internal debugging records into public docs.
+1. `docs/` is the official developer-facing documentation: architecture, protocol, CLI reference, and verified procedures. It is split by audience. Public developer documentation lives under the mdBook-published tree (`src/SUMMARY.md` registration required). Internal developer documentation (devnet operations, verifier/circuit update procedures, debugging playbooks, incident postmortems) lives under `docs/src/dev/` and MUST NOT be registered in `src/SUMMARY.md` — it is repository-only and never published. Keep each topic consolidated in one document; do not fragment operational knowledge into many scattered files, and do not mix internal debugging records into public docs. Current GUTA pipeline internals: `docs/src/dev/reward-tree-circuits.md` (circuit reward layout and ASCII tree), `docs/src/dev/gatherers.md`, `docs/src/dev/processors.md`.
 
 2. Specs, reviews, and research documents must support factual claims with current `<file>:<line>` references.
 3. Reviews accept verified facts or explicit open questions, not inference presented as evidence.
@@ -603,6 +687,8 @@ A change is rejected until any applicable item is corrected:
 6. Mark inferred research statements explicitly as `Inference:` and list unchecked areas.
 7. Separate `In Scope` and `Out of Scope` in every specification.
 8. Operational documents are command-verified before commit: binaries, subcommands, flags, environment variables, RPC method names, ports, and configuration keys must match the current clap, serde, and network-configuration definitions. A nonexistent binary, flag, or environment variable in a document is a defect, not a style issue.
+9. When explaining code to users, default to concise pseudocode plus the core function and parameter names. Show real implementation excerpts or full data structures only when needed to resolve ambiguity, prove a claim, or enable a concrete action.
+10. Keep ordinary technical replies centered on the decision, observable behavior, material risk, and verification.
 
 ## Git Commit Rules
 
@@ -611,7 +697,7 @@ A change is rejected until any applicable item is corrected:
 3. Do not use vague summaries such as `update`, `misc`, or `changes`.
 4. Do not mix unrelated work in one commit.
 5. Do not add collaboration footers unless explicitly required.
-6. Before committing, inspect every staged file and remove secrets, generated artifacts, binaries, logs, runtime data, backups, and machine-local configuration.
+6. Before committing, inspect every staged file and remove secrets, generated artifacts, binaries, logs, runtime data, backups, and machine-local configuration. Never stage `ISSUES.md`, `TASKS.md`, or `MEMORY.md`.
 
 ## Specification Workflow
 
@@ -620,6 +706,7 @@ A change is rejected until any applicable item is corrected:
 3. Every specification defines the goal, in-scope and out-of-scope work, repository relationships, exact starting branch and commit, phases, and executable acceptance checks.
 4. Maintain specification lifecycle state through the workflow documented in psy-memory. Do not hand-edit generated indexes or invent repository-local lifecycle conventions.
 5. Reference psy-memory artifacts with canonical `https://github.com/PsyProtocol/psy-memory` URLs, never with machine-local checkout paths.
+6. Local `ISSUES.md`, `TASKS.md`, and `MEMORY.md` are session working state, not a substitute for psy-memory specifications, indexes, or published runbooks.
 
 ## Review Requirements
 
@@ -644,7 +731,7 @@ Every review must satisfy all items below.
 A complete review answers:
 
 1. Which files, functions, and types changed, and whether each was inspected.
-2. Which changes affect external API, RPC, on-chain, proof, encoding, or FFI consumers.
+2. Which changes affect external API, RPC, on-chain, proof, encoding, or FFI consumers, and whether any superseded path was removed rather than kept as a parallel contract.
 3. Whether state machines, protocols, hashes, encodings, events, and error codes remain consistent.
 4. Whether failure paths, retries, duplicate input, and state conflicts are handled.
 5. Whether verification proves real behavior rather than a narrowed pass.

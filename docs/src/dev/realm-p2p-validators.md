@@ -110,5 +110,8 @@ Keep Ed25519, BLS, and validator ZK keys private. Public routing configuration i
 - [Devnet launcher reference](devnet-launcher-reference.md)
 - [Devnet lifecycle](devnet_lifecycle.md)
 - [Fn circuit fingerprint playbook](fn-circuit-fingerprint-playbook.md)
+- [Gatherers](gatherers.md)
 - [Genesis generation](genesis-generation.md)
+- [Processors](processors.md)
+- [Reward tree circuit layouts](reward-tree-circuits.md)
 - [Token privacy circuit fingerprints](token-privacy-circuit-fingerprints.md)

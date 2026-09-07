@@ -6,6 +6,8 @@
 
 This document describes the end-to-end bridge flow for L1→L2 deposits and L2→L1 withdrawals on the Psy protocol. It is intended for auditors and integrators who need to verify the correctness of the full bridge lifecycle.
 
+Related: `docs/src/dev/devnet_lifecycle.md` for startup and shutdown; `docs/src/dev/common-operations.md` for wallet, registration, and PSY funding; `docs/src/dev/bridge-common-operations.md` for executable bridge operations.
+
 ## Table of Contents
 
 - [1. Overview](#1-overview)
@@ -237,7 +239,7 @@ After `claimableAt`, the recipient (or authorized claimer) calls `Bridge.claimPe
 - Settles the pending withdrawal and transfers tokens (`_settlePendingWithdrawal`).
 - Emits `WithdrawalClaimed(nonce, recipient, token, amount)`.
 
-See `docs/src/flows/bridge-common-operations.md` for the authoritative pending-then-claim sequence.
+See `docs/src/dev/bridge-common-operations.md` for the authoritative pending-then-claim sequence.
 
 **Idempotency check:**
 

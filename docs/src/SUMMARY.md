@@ -73,13 +73,6 @@
 ---
 
 
-# Bridge Flows
-- [Deposit and Withdrawal Flow](./flows/deposit-withdrawal.md)
-- [Bridge Common Operations](./flows/bridge-common-operations.md)
-- [Private Transfer Flow](./flows/private-transfer.md)
-
----
-
 # VM Documentation
 - [Bytecode Operations](./vm/bytecode.md)
 - [Execution Model](./vm/execution.md)

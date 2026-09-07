@@ -247,6 +247,8 @@ The earlier checkpoint-289-to-0 run proved L2 rollback, convergence, and transac
 
 - [Circuit and verifier operations](circuit-and-verifier-operations.md)
 - [Devnet launcher reference](devnet-launcher-reference.md)
+- [Common account and contract operations](common-operations.md)
+- [Bridge common operations](bridge-common-operations.md)
 - [Fn circuit fingerprint playbook](fn-circuit-fingerprint-playbook.md)
 - [Genesis generation](genesis-generation.md)
 - [Realm p2p validators](realm-p2p-validators.md)
