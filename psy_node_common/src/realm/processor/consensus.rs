@@ -5,9 +5,9 @@
 //! [`psy_data::p2p`] types:
 //!
 //! - [`decode_proposal_body`]: strict decode of the three length-prefixed body
-//!   sections (finalizer output, finalizer proof, state updates) with hash
-//!   verification against the [`Proposal`] metadata. There are exactly three
-//!   `u32` length prefixes and no other sections.
+//!   sections (finalizer output, finalizer proof, state updates) plus the
+//!   trailing 32-byte finalizer worker reward tag, with hash verification
+//!   against the [`Proposal`] metadata.
 //! - [`sign_vote`]: produce a BLS [`Vote`] over the canonical `vote_message`.
 //! - [`form_certificate`]: aggregate validator votes into a [`Certificate`].
 //! - [`validate_certificate`]: enforce the `ceil(n/2)` replication threshold,
@@ -23,13 +23,12 @@ use parth_core::{
     felt::{FromPrimitiveValuesFelt, ToU64Value},
     protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofVerifier},
 };
+use psy_core::job::job_id::ProvingJobCircuitType;
+
 use psy_data::{
-    guta::{
-        header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobType,
-        realm_finalize::{
-            protocol_decode_finalize_output, realm_finalize_guta_chain_domain,
-            RealmFinalizeGUTAAction, RealmFinalizeGUTAPublicOutput,
-        },
+    guta::realm_finalize::{
+        finalize_public_input_hash, protocol_decode_finalize_output,
+        realm_finalize_guta_chain_domain, RealmFinalizeGUTAPublicOutput,
     },
     p2p::{
         aggregate_signatures, bitmap_get, bitmap_set, sha256, vote_message, BlsPublicKey,
@@ -56,13 +55,16 @@ pub struct DecodedProposalBody {
     pub proof: Vec<u8>,
     /// Canonical `PsyPreparedRealmBlockStateUpdates` bytes (`<= MAX_BACKUP_BYTES`).
     pub state_updates: Vec<u8>,
+    /// Finalizer worker reward tag (field-hash bytes) needed to recompute R63.
+    pub worker_tag: [u8; 32],
 }
 
-/// Decode a proposal body into its three length-prefixed sections.
+/// Decode a proposal body into its three length-prefixed sections plus the
+/// trailing 32-byte finalizer worker reward tag.
 ///
 /// The wire layout is exactly `u32_le(output_len) || output ||
-/// u32_le(proof_len) || proof || u32_le(state_updates_len) || state_updates`,
-/// with no trailing bytes. `output_len` must equal
+/// u32_le(proof_len) || proof || u32_le(state_updates_len) || state_updates ||
+/// worker_tag[32]`, with no trailing bytes. `output_len` must equal
 /// [`MAX_FINALIZER_OUTPUT_BYTES`]; `proof_len` and `state_updates_len` must
 /// not exceed their frozen maxima. The decoded sections and the full body
 /// are then checked against the matching hashes carried by `proposal`.
@@ -89,6 +91,7 @@ pub fn decode_proposal_body(
     }
     let proof = reader.read_bytes_u32("finalizer proof", MAX_FINALIZER_PROOF_BYTES as u32)?;
     let state_updates = reader.read_bytes_u32("state updates", MAX_BACKUP_BYTES as u32)?;
+    let worker_tag = reader.read_fixed::<32>()?;
     reader.finish()?;
 
     if sha256(body) != proposal.body_hash {
@@ -104,7 +107,7 @@ pub fn decode_proposal_body(
         return Err(ProtocolError::Message("backup_hash mismatch"));
     }
 
-    Ok(DecodedProposalBody { output, proof, state_updates })
+    Ok(DecodedProposalBody { output, proof, state_updates, worker_tag })
 }
 
 /// Verify the in-band FFS roots against the decoded GUTA output.
@@ -144,51 +147,20 @@ pub fn decode_proposal_state_updates<Hash: Q256BitHash>(
 
 
 
-/// Build the canonical unbound 410-byte finalize output for an ordinary GUTA submit.
-pub fn build_bound_finalize_output<N>(
-    chain_id: u64,
-    realm_id: u32,
-    proposer_sub_id: u16,
-    validator_user_id: u64,
-    validator_tree_root: N::QHash,
-    submission: &GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
-) -> RealmFinalizeGUTAPublicOutput<N::F, N::QHash>
-where
-    N: QNetworkTypesConfig,
-{
-    let chain_domain =
-        realm_finalize_guta_chain_domain::<N::F, N::QHash, N::HasherBase>(chain_id);
-    let checkpoint_id = N::F::from_u64_value(0);
-    let realm_id_felt = N::F::from_u64_value(realm_id as u64);
-    let root_guta_header_hash = submission.header.header.qfhash::<N::HasherBase>();
-    let action = RealmFinalizeGUTAAction {
-        chain_domain,
-        checkpoint_id,
-        realm_id: realm_id_felt,
-        checkpoint_tree_root: submission.header.header.checkpoint_tree_root,
-        validator_tree_root,
-        root_guta_header_hash,
-    };
-    RealmFinalizeGUTAPublicOutput {
-        chain_domain,
-        checkpoint_id,
-        realm_id: realm_id_felt,
-        realm_sub_id: proposer_sub_id,
-        checkpoint_tree_root: submission.header.header.checkpoint_tree_root,
-        validator_tree_root,
-        validator_user_id: N::F::from_u64_value(validator_user_id),
-        root_guta_header_hash,
-        root_guta_reward_tag: submission.header.new_tag_tree_node_value,
-        action_hash: action.action_hash::<N::HasherBase>(),
-        final_guta_header: submission.header.header,
-    }
-}
-
-/// Verify a decoded Proposal against the ordinary submitted GUTA header/proof.
+/// Verify a decoded Realm-finalize Proposal against the actual circuit output.
+///
+/// The proposal body carries the actual finalizer output `O`, the circuit-63
+/// proof, the in-band FFS state updates and the finalizer worker reward tag.
+/// Validation requires every output field to agree with the canonical
+/// proposal identity (real proof-base checkpoint `P`, scheduled proposer
+/// sub-id, fee user = the proposer's authenticated validator-leaf user ID),
+/// recomputes the output commitment `A`, the reward root
+/// `R63 = H(A, H(O.root_guta_reward_tag, worker_tag))` and the expected
+/// circuit public input `H(O.final_guta_header_hash(), R63)`, then verifies
+/// the registered circuit-63 proof against it.
 pub fn verify_proposal_submission<N>(
     proposal: &Proposal,
     body: &[u8],
-    submission: &GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
     validator_user_id: u64,
     proof_verifier: &N::ZKVerifier,
 ) -> anyhow::Result<DecodedProposalBody>
@@ -207,27 +179,39 @@ where
     let output: RealmFinalizeGUTAPublicOutput<N::F, N::QHash> =
         protocol_decode_finalize_output(&decoded.output)
             .map_err(|error| anyhow::anyhow!("invalid Realm finalize output: {error}"))?;
-    let expected_output = build_bound_finalize_output::<N>(
-        proposal.chain_id,
-        proposal.realm_id,
-        proposal.proposer_sub_id,
-        validator_user_id,
-        N::QHash::from_owned_32bytes(proposal.validator_tree_root),
-        submission,
+    let chain_domain =
+        realm_finalize_guta_chain_domain::<N::F, N::QHash, N::HasherBase>(proposal.chain_id);
+    anyhow::ensure!(
+        output.chain_domain == chain_domain,
+        "Realm finalize output chain domain mismatch"
     );
     anyhow::ensure!(
-        output == expected_output,
-        "Realm finalize output does not match the canonical submitted GUTA binding"
+        output.checkpoint_id == N::F::from_u64_value(proposal.base_checkpoint_id),
+        "Realm finalize output checkpoint_id does not match the proposal proof base"
+    );
+    anyhow::ensure!(
+        output.realm_id == N::F::from_u64_value(proposal.realm_id as u64),
+        "Realm finalize output realm mismatch"
+    );
+    anyhow::ensure!(
+        output.realm_sub_id == proposal.proposer_sub_id,
+        "Realm finalize output sub_id does not match the proposal proposer"
     );
     anyhow::ensure!(
         output.validator_tree_root.into_owned_32bytes() == proposal.validator_tree_root,
         "Realm finalize output validator_tree_root mismatch"
     );
+    anyhow::ensure!(
+        output.validator_user_id == N::F::from_u64_value(validator_user_id),
+        "Realm finalize output fee user is not the scheduled proposer's validator leaf user"
+    );
     let state_updates = decode_proposal_state_updates::<N::QHash>(&decoded.state_updates)?;
     verify_state_updates_match_guta_output(&state_updates, &output)?;
-    let expected_public_inputs_hash = submission.qfhash::<N::HasherBase>();
+    let worker_tag = N::QHash::from_owned_32bytes(decoded.worker_tag);
+    let expected_public_inputs_hash =
+        finalize_public_input_hash::<N::F, N::QHash, N::HasherBase>(&output, &worker_tag);
     proof_verifier.verify_zk_proof_from_slice_check_public_inputs_hash(
-        submission.job_type_u32,
+        ProvingJobCircuitType::RealmFinalizeGUTA as u32,
         &decoded.proof,
         expected_public_inputs_hash,
     )?;
@@ -462,7 +446,8 @@ mod tests {
         proof: &[u8],
         state_updates: &[u8],
     ) -> (Proposal, Vec<u8>) {
-        let body = encode_proposal_body(output, proof, state_updates).expect("encode body");
+        let worker_tag = [0x77u8; 32];
+        let body = encode_proposal_body(output, proof, state_updates, &worker_tag).expect("encode body");
         let public_output_hash = sha256(output);
         let finalizer_proof_hash = sha256(proof);
         let backup_hash = sha256(state_updates);
@@ -493,6 +478,7 @@ mod tests {
         let state_updates = vec![0xCDu8; 256];
         (output, proof, state_updates)
     }
+
 
 
     #[test]
@@ -550,6 +536,7 @@ mod tests {
         body.extend_from_slice(&proof);
         body.extend_from_slice(&(state_updates.len() as u32).to_le_bytes());
         body.extend_from_slice(&state_updates);
+        body.extend_from_slice(&[0u8; 32]);
         let err = decode_proposal_body(&proposal, &body).unwrap_err();
         assert!(matches!(err, ProtocolError::InvalidLength { .. }));
     }

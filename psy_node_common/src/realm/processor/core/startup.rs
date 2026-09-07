@@ -52,8 +52,6 @@ where
         file_system: Arc<FileSystem>,
         guta_gatherer_backup_directory: String,
         validator: psy_data::genesis::genesis_block_setup::GenesisValidator,
-        validator_zk_private_key: N::QHash,
-        signature_fingerprint: N::QHash,
         checkpoints_per_epoch: u64,
     ) -> anyhow::Result<(Self, tokio::task::JoinHandle<Result<(), anyhow::Error>>)> {
         tracing::info!("[REALM_STARTUP] processor new start");
@@ -79,10 +77,10 @@ where
             file_system: file_system.clone(),
             _phantom_n: std::marker::PhantomData,
             future_pending_end_cap_jobs: Arc::new(std::sync::RwLock::new(Vec::new())),
+            current_fee_validator_leaf: Arc::new(std::sync::RwLock::new(None)),
+            committed_fee_validator_leaf: Arc::new(std::sync::RwLock::new(None)),
             tree_store: db.db.clone(),
             validator,
-            validator_zk_private_key,
-            signature_fingerprint,
             checkpoints_per_epoch,
         };
         guta_create_builder_config.finalizer_identity(&db.state).await?;

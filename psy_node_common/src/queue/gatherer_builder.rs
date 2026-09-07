@@ -20,6 +20,10 @@ pub trait QueueGathererItemBuilder<C>: Sized {
 pub trait QueueGathererItemBuilderWithTree<C, Tree>: Sized {
     type Output: Sized + Send + Sync;
     async fn create_new_with_tree(tree: &mut Tree, unique_id: u128, config: C) -> anyhow::Result<Self>;
+    async fn create_with_fast_forward(tree: &mut Tree, unique_id: u128, config: C, _state_updates: &[u8]) -> anyhow::Result<Self>
+    where C: Send + 'static, Tree: Send {
+        Self::create_new_with_tree(tree, unique_id, config).await
+    }
     async fn update_from_queue_item_with_tree(&mut self, tree: &mut Tree, item: Vec<u8>) -> anyhow::Result<()>;
     async fn update_from_many_queue_items_with_tree(&mut self, tree: &mut Tree, item: Vec<Vec<u8>>) -> anyhow::Result<()>;
     async fn finalize_with_tree(self, tree: &mut Tree) -> anyhow::Result<Self::Output>;
@@ -31,6 +35,7 @@ pub trait QueueGathererItemBuilderWithTree<C, Tree>: Sized {
         anyhow::bail!("this gatherer does not support FastForward")
     }
 }
+
 
 
 

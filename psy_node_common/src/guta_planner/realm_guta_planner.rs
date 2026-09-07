@@ -9,20 +9,15 @@ use parth_core::{
     data::hash::merkle_node_key::SimpleMerkleNodeKey,
     felt::{FromPrimitiveValuesFelt, QFelt64, ToU64Value, ZeroableFelt},
     node::realm_identifier::QRealmIdentifier,
-    protocol::core_types::{Q256BitHash, QFHashBase},
+    protocol::core_types::{Q256BitHash, QDBHashBase, QFHashBase},
 };
-use psy_client_common::data::{
-    base_types::hash256::Hash256 as ClientHash256,
-    qhashout::QHashOut as ClientQHashOut,
-};
-use psy_core::job::job_id::{ProvingJobCircuitType, ProvingJobDataType, QJobTopic, QProvingJobDataID};
-use psy_common_circuit::circuits::zk_signature3::core::PsyBasicZKSignatureCircuit;
+use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
     guta::{
         header::GlobalUserTreeAggregatorHeader,
         header_extended::GlobalUserTreeAggregatorHeaderWithJobId,
         realm_finalize::{
-            realm_finalize_guta_chain_domain, RealmFinalizeGUTAAction, RealmFinalizeGUTAInput, SIGNATURE_TYPE_ZK,
+            realm_finalize_guta_chain_domain, RealmFinalizeGUTAAction, RealmFinalizeGUTAInput,
         },
     },
     proof_input::guta::{
@@ -36,7 +31,8 @@ use psy_data::{
     },
     worker::{
         metadata::{
-            PsyProvingJobMetadata, PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD, PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN,
+            PsyProvingJobMetadata, PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD,
+            PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN,
         },
         metadata_with_job_id::PsyProvingJobMetadataWithJobId,
     },
@@ -59,8 +55,6 @@ use crate::realm::processor::gatherers::realm_end_cap_gatherer::{RealmGUTAEndCap
 
 const MAX_REALM_PROVING_LEVELS: usize = 32;
 
-type ValidatorSignatureCircuit = PsyBasicZKSignatureCircuit<plonky2::plonk::config::PoseidonGoldilocksConfig, 2>;
-static VALIDATOR_SIGNATURE_CIRCUIT: std::sync::LazyLock<ValidatorSignatureCircuit> = std::sync::LazyLock::new(ValidatorSignatureCircuit::new);
 
 #[derive(Clone)]
 pub struct PlannedFutureEndCapJob<F, Hash> {
@@ -76,8 +70,6 @@ pub struct RealmFinalizeGUTAIdentity<F, Hash> {
     pub validator_user_leaf: PQEDUserLeaf<F, Hash>,
     pub current_validator_user_leaf: PQEDUserLeaf<F, Hash>,
     pub current_validator_user_tree_proof: MerkleProofCore<Hash>,
-    pub validator_zk_private_key: Hash,
-    pub validator_public_key_param: Hash,
     pub anchor_checkpoint_leaf: PQEDCheckpointLeaf<F, Hash>,
     pub anchor_checkpoint_tree_proof: MerkleProofCore<Hash>,
     pub checkpoint_leaf: PQEDCheckpointLeafCompactWithStateRoots<Hash>,
@@ -95,6 +87,7 @@ pub struct RealmGUTAPlanner<F, Hash> {
     pub realm_identifier: QRealmIdentifier,
     pub job_level_map: HashMap<QProvingJobDataID, (usize, usize)>,
     pub future_pending_end_cap_jobs: Vec<PlannedFutureEndCapJob<F, Hash>>,
+    pub accepted_end_cap_jobs: Vec<PlannedFutureEndCapJob<F, Hash>>,
     pub planned_jobs: [Vec<PsyProvingJobMetadataWithJobId<Hash, QProvingJobDataID>>; MAX_REALM_PROVING_LEVELS],
     pub job_stragglers: [Option<GlobalUserTreeAggregatorHeaderWithJobId<F, Hash>>; MAX_REALM_PROVING_LEVELS],
     pub job_level_counts: [u64; MAX_REALM_PROVING_LEVELS],
@@ -124,8 +117,6 @@ pub struct RealmGUTAPlanner<F, Hash> {
     pub realm_finalize_validator_bls_hash_limbs: Option<[u64; 4]>,
     pub realm_finalize_validator_user_leaf: Option<PQEDUserLeaf<F, Hash>>,
     pub realm_finalize_current_validator_user_leaf: Option<PQEDUserLeaf<F, Hash>>,
-    pub realm_finalize_validator_zk_private_key: Option<Hash>,
-    pub realm_finalize_validator_public_key_param: Option<Hash>,
     pub realm_finalize_anchor_checkpoint_leaf: Option<PQEDCheckpointLeaf<F, Hash>>,
     pub realm_finalize_anchor_checkpoint_tree_proof: Option<MerkleProofCore<Hash>>,
     pub realm_finalize_checkpoint_leaf: Option<PQEDCheckpointLeafCompactWithStateRoots<Hash>>,
@@ -156,6 +147,7 @@ impl<F, Hash> RealmGUTAPlanner<F, Hash> {
             job_level_counts: [0u64; MAX_REALM_PROVING_LEVELS],
             job_level_map: HashMap::new(),
             future_pending_end_cap_jobs: Vec::new(),
+            accepted_end_cap_jobs: Vec::new(),
             planned_jobs: Default::default(),
             job_stragglers: Default::default(),
             end_cap_straggler: None,
@@ -183,8 +175,6 @@ impl<F, Hash> RealmGUTAPlanner<F, Hash> {
             realm_finalize_validator_bls_hash_limbs: None,
             realm_finalize_validator_user_leaf: None,
             realm_finalize_current_validator_user_leaf: None,
-            realm_finalize_validator_zk_private_key: None,
-            realm_finalize_validator_public_key_param: None,
             realm_finalize_anchor_checkpoint_leaf: None,
             realm_finalize_anchor_checkpoint_tree_proof: None,
             realm_finalize_checkpoint_leaf: None,
@@ -197,13 +187,18 @@ impl<F, Hash> RealmGUTAPlanner<F, Hash> {
 
     /// Bind the required validator identity to this gathering checkpoint.
     pub fn with_realm_finalize_identity(mut self, identity: RealmFinalizeGUTAIdentity<F, Hash>) -> Self {
+        self.refresh_realm_finalize_identity(identity);
+        self
+    }
+
+    pub fn refresh_realm_finalize_identity(&mut self, identity: RealmFinalizeGUTAIdentity<F, Hash>) {
         self.realm_finalize_validator_user_id = Some(identity.validator_user_id);
         self.realm_finalize_validator_node_id_hash_limbs = Some(identity.validator_node_id_hash_limbs);
         self.realm_finalize_validator_bls_hash_limbs = Some(identity.validator_bls_hash_limbs);
         self.realm_finalize_validator_user_leaf = Some(identity.validator_user_leaf);
-        self.realm_finalize_current_validator_user_leaf = Some(identity.current_validator_user_leaf);
-        self.realm_finalize_validator_zk_private_key = Some(identity.validator_zk_private_key);
-        self.realm_finalize_validator_public_key_param = Some(identity.validator_public_key_param);
+        if self.realm_finalize_current_validator_user_leaf.is_none() {
+            self.realm_finalize_current_validator_user_leaf = Some(identity.current_validator_user_leaf);
+        }
         self.realm_finalize_anchor_checkpoint_leaf = Some(identity.anchor_checkpoint_leaf);
         self.realm_finalize_anchor_checkpoint_tree_proof = Some(identity.anchor_checkpoint_tree_proof);
         self.realm_finalize_checkpoint_leaf = Some(identity.checkpoint_leaf);
@@ -211,9 +206,28 @@ impl<F, Hash> RealmGUTAPlanner<F, Hash> {
         self.realm_finalize_old_realm_root_proof = Some(identity.old_realm_root_proof);
         self.realm_finalize_validator_tree_proof = Some(identity.validator_tree_proof);
         self.realm_finalize_validator_user_tree_proof = Some(identity.validator_user_tree_proof);
-        self
     }
+
+    pub fn restart_cycle(&mut self, unique_pending_id: u64, start_realm_root: Hash) {
+        self.unique_pending_id = unique_pending_id;
+        self.start_realm_root = start_realm_root;
+        self.job_level_map.clear();
+        self.planned_jobs = Default::default();
+        self.accepted_end_cap_jobs.clear();
+        self.job_stragglers = Default::default();
+        self.job_level_counts.fill(0);
+        self.end_cap_straggler = None;
+        self.user_contract_tree_updates_ffs.clear();
+        self.contract_state_tree_updates_ffs.clear();
+        self.user_leaf_updates_ffs.clear();
+        self.contract_state_imt_leaves_ffs.clear();
+        self.has_committed_reward_ids = false;
+        self.total_jobs = 0;
+        self.total_end_caps_processed = 0;
+    }
+
 }
+
 
 impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
     pub async fn populate_future_end_cap_job<TempStore: StandardProcessorTempDBStoreBase<QProvingJobDataID, Hash>>(
@@ -354,6 +368,8 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
     ) -> anyhow::Result<usize> {
         let user_last_checkpoint_id = queue_item.new_user_leaf.last_checkpoint_id.to_u64_value();
         let user_id = queue_item.new_user_leaf.user_id.to_u64_value();
+        anyhow::ensure!(queue_item.new_user_leaf.qfhash::<Hasher>() == queue_item.new_user_leaf_hash,
+            "EndCap new user preimage hash mismatch");
         if user_id < self.realm_user_min_id || user_id > self.realm_user_max_id {
             //anyhow::bail!("User ID {} is out of bounds for realm ID {}.", user_id,
             // self.realm_identifier.realm_id);
@@ -414,9 +430,6 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
         }
         tracing::info!("Populating end-cap job for user ID {} at checkpoint ID {}.", user_id, user_last_checkpoint_id);
         let data = data.unwrap();
-        file.write_all(&queue_item_bytes).await?;
-        file.write_all(&data).await?;
-        self.total_end_caps_processed += 1;
 
         tracing::debug!("End-cap job populated data len {}.", data.len());
 
@@ -430,6 +443,13 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             )?;
 
         tracing::debug!("Single header: {}", serde_json::to_string_pretty(&single_header)?);
+        if single_header.checkpoint_id != queue_item.expected_fake_checkpoint_id {
+            tracing::info!("Skipping end-cap job population due to fake checkpoint ID mismatch: expected {}, found {}. Likely got overwritten due to a race condition. Gracefully skipping.",
+                queue_item.expected_fake_checkpoint_id,
+                single_header.checkpoint_id
+            );
+            return Ok(0);
+        }
         let (double_header, double_payload, imt_full) =
             QBlobDoubleMerkleNodeBatchDataView::validate_cst_nodes_batch_header_for_realm_context_get_clipped_ref_any_unique_pending_id_with_remaining(
                 &double_full,
@@ -447,13 +467,6 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
         tracing::debug!("IMT header: {}", serde_json::to_string_pretty(&imt_header)?);
         self.contract_state_imt_leaves_ffs.extend_from_slice(imt_payload);
 
-        if single_header.checkpoint_id != queue_item.expected_fake_checkpoint_id {
-            tracing::info!("Skipping end-cap job population due to fake checkpoint ID mismatch: expected {}, found {}. Likely got overwritten due to a race condition. Gracefully skipping.",
-                queue_item.expected_fake_checkpoint_id,
-                single_header.checkpoint_id
-            );
-            return Ok(0);
-        }
 
         self.user_contract_tree_updates_ffs.extend_from_slice(&single_payload);
         self.contract_state_tree_updates_ffs.extend_from_slice(&double_payload);
@@ -463,6 +476,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             self.realm_finalize_current_validator_user_leaf = Some(queue_item.new_user_leaf.clone());
         }
 
+        let accepted_queue_item = queue_item.clone();
         if self.end_cap_straggler.is_some() {
             let left = self.end_cap_straggler.take().unwrap();
             let right = queue_item;
@@ -548,6 +562,14 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             self.end_cap_straggler = Some(queue_item);
         }
 
+        file.write_all(&queue_item_bytes).await?;
+        file.write_all(&data).await?;
+        self.total_end_caps_processed += 1;
+
+        self.accepted_end_cap_jobs.push(PlannedFutureEndCapJob {
+            queue_item: accepted_queue_item,
+            contract_updates: data,
+        });
         Ok(1)
     }
 
@@ -592,6 +614,8 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
         let queue_item = future_end_cap_job.queue_item.clone();
         let user_last_checkpoint_id = queue_item.new_user_leaf.last_checkpoint_id.to_u64_value();
         let user_id = queue_item.new_user_leaf.user_id.to_u64_value();
+        anyhow::ensure!(queue_item.new_user_leaf.qfhash::<Hasher>() == queue_item.new_user_leaf_hash,
+            "Deferred EndCap new user preimage hash mismatch");
         if user_id < self.realm_user_min_id || user_id > self.realm_user_max_id {
             //anyhow::bail!("User ID {} is out of bounds for realm ID {}.", user_id,
             // self.realm_identifier.realm_id);
@@ -611,6 +635,15 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             self.future_pending_end_cap_jobs.push(future_end_cap_job);
             return Ok(0);
         }
+        let logical_old_leaf = self.end_cap_straggler.as_ref()
+            .filter(|item| item.new_user_leaf.user_id.to_u64_value() == user_id)
+            .map(|item| item.new_user_leaf_hash)
+            .unwrap_or_else(|| global_user_tree.get_leaf_value(user_id - self.realm_user_min_id));
+        if logical_old_leaf != queue_item.old_user_leaf_hash {
+            tracing::info!("Rejecting stale deferred EndCap for user {}: authoritative leaf {:?}, declared old leaf {:?}",
+                user_id, logical_old_leaf, queue_item.old_user_leaf_hash);
+            return Ok(0);
+        }
 
         tracing::info!(
             "Populating deferred end-cap job for user ID {} at checkpoint ID {}.",
@@ -618,9 +651,6 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             user_last_checkpoint_id
         );
         
-        file.write_all(&queue_item.psy_ser_to_bytes_vec()?).await?;
-        file.write_all(&future_end_cap_job.contract_updates).await?;
-        self.total_end_caps_processed += 1;
 
         let (single_header, single_payload, double_full) =
             QBlobSingleMerkleNodeBatchDataView::validate_single_tree_nodes_batch_header_for_realm_context_get_clipped_ref_no_exact_size_any_unique_pending_id(
@@ -631,6 +661,14 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                 QBlobMerkleNodeTreeType::UserContractTree,
             )?;
         tracing::debug!("Single header: {}", serde_json::to_string_pretty(&single_header)?);
+        if single_header.checkpoint_id != queue_item.expected_fake_checkpoint_id {
+            tracing::info!("Skipping end-cap job population due to fake checkpoint ID mismatch: expected {}, found {}. Likely got overwritten due to a race condition. Gracefully skipping.",
+                queue_item.expected_fake_checkpoint_id,
+                single_header.checkpoint_id
+            );
+            return Ok(0);
+        }
+        let queue_item_bytes = queue_item.psy_ser_to_bytes_vec()?;
         // For IMT: validate CST nodes and extract IMT leaf data (3 parts: single, double, imt)
         let (double_header, double_payload, imt_full) =
             QBlobDoubleMerkleNodeBatchDataView::validate_cst_nodes_batch_header_for_realm_context_get_clipped_ref_any_unique_pending_id_with_remaining(
@@ -648,13 +686,6 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
         )?;
         tracing::debug!("IMT header: {}", serde_json::to_string_pretty(&imt_header)?);
         self.contract_state_imt_leaves_ffs.extend_from_slice(imt_payload);
-        if single_header.checkpoint_id != queue_item.expected_fake_checkpoint_id {
-            tracing::info!("Skipping end-cap job population due to fake checkpoint ID mismatch: expected {}, found {}. Likely got overwritten due to a race condition. Gracefully skipping.",
-                queue_item.expected_fake_checkpoint_id,
-                single_header.checkpoint_id
-            );
-            return Ok(0);
-        }
 
         self.user_contract_tree_updates_ffs.extend_from_slice(&single_payload);
         self.contract_state_tree_updates_ffs.extend_from_slice(&double_payload);
@@ -728,6 +759,11 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             self.end_cap_straggler = Some(queue_item);
         }
 
+        file.write_all(&queue_item_bytes).await?;
+        file.write_all(&future_end_cap_job.contract_updates).await?;
+        self.total_end_caps_processed += 1;
+
+        self.accepted_end_cap_jobs.push(future_end_cap_job);
         Ok(1)
     }
     fn update_reward_tree_config(&mut self, job_id: &QProvingJobDataID, level: u8, index: u64) -> anyhow::Result<()> {
@@ -876,11 +912,10 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
     ///
     /// Mirrors the x5 `feat/realm-rotation` port: derives the validator fee
     /// delta (balance += root GUTA `da_fees_collected`), builds the
-    /// `RealmFinalizeGUTAAction` + signed `WrappedSignatureProof` child, and
-    /// publishes a `RealmFinalizeGUTA` finalizer job (circuit type 63) on a
-    /// fresh level above the existing planned jobs. The signature and finalizer
-    /// jobs depend on the root GUTA job (and each other) so level-by-level
-    /// worker dispatch respects the dependency order.
+    /// `RealmFinalizeGUTAAction` and publishes a `RealmFinalizeGUTA` finalizer
+    /// job (circuit type 63) with the root GUTA job as its single child
+    /// dependency on a fresh level above the existing planned jobs, so
+    /// level-by-level worker dispatch respects the dependency order.
     ///
     /// Missing checkpoint-bound identity material fails closed.
     pub(crate) async fn append_realm_finalize_guta<
@@ -901,12 +936,6 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
         let validator_bls_hash_limbs = self
             .realm_finalize_validator_bls_hash_limbs
             .ok_or_else(|| anyhow::anyhow!("validator_bls_hash_limbs is required to append RealmFinalizeGUTA"))?;
-        let private_key = self
-            .realm_finalize_validator_zk_private_key
-            .ok_or_else(|| anyhow::anyhow!("validator_zk_private_key is required to append RealmFinalizeGUTA"))?;
-        let public_key_param = self
-            .realm_finalize_validator_public_key_param
-            .ok_or_else(|| anyhow::anyhow!("validator_public_key_param is required to append RealmFinalizeGUTA"))?;
         let validator_user_leaf = self
             .realm_finalize_validator_user_leaf
             .clone()
@@ -967,12 +996,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
         let old_leaf_proof = global_user_tree.get_leaf(effective_validator_index);
         let old_leaf_hash = current_validator_user_leaf.qfhash::<Hasher>();
         let current_tree_leaf = old_leaf_proof.value;
-        let is_new_user_zero_leaf = current_tree_leaf == Hash::get_zero_value()
-            && current_validator_user_leaf.balance == F::ZERO_VALUE
-            && current_validator_user_leaf.nonce == F::ZERO_VALUE
-            && current_validator_user_leaf.last_checkpoint_id == F::ZERO_VALUE
-            && current_validator_user_leaf.event_index == F::ZERO_VALUE;
-        if old_leaf_hash != current_tree_leaf && !is_new_user_zero_leaf {
+        if old_leaf_hash != current_tree_leaf {
             anyhow::bail!(
                 "Cannot finalize fees for validator user {}: leaf hash {:?} does not match tree leaf {:?}.",
                 validator_user_id_u64,
@@ -1045,40 +1069,10 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
         };
         let action_hash = action.action_hash::<Hasher>();
 
-        let signature_job_id = QProvingJobDataID::new(
-            QJobTopic::GenerateStandardProof,
-            self.unique_pending_id,
-            self.realm_id_u64 as u32,
-            0,
-            0,
-            ProvingJobCircuitType::WrappedSignatureProof,
-            ProvingJobDataType::StandardProof,
-            0,
-        );
-        // Only this proof crosses the worker boundary; signing witnesses stay local.
-        let private_key_bytes = private_key.into_owned_32bytes();
-        let action_hash_bytes = action_hash.into_owned_32bytes();
-        let signature_proof = tokio::task::spawn_blocking(move || {
-            VALIDATOR_SIGNATURE_CIRCUIT.prove_base(
-                ClientQHashOut::from_hash256_le(ClientHash256(private_key_bytes)),
-                ClientQHashOut::from_hash256_le(ClientHash256(action_hash_bytes)),
-            )
-        }).await??;
-        let signature_expected_pi = Hasher::q_two_to_one(action_hash, public_key_param);
-        let proof_pi = ClientQHashOut::from_hash256_le(ClientHash256(signature_expected_pi.into_owned_32bytes()));
-        anyhow::ensure!(signature_proof.public_inputs.as_slice() == proof_pi.0.elements.as_slice(),
-            "Local validator signature public inputs do not match the configured key");
-        let signature_job = PsyProvingJobMetadataWithJobId {
-            job_id: signature_job_id,
-            metadata: PsyProvingJobMetadata {
-                expected_public_inputs_hash: signature_expected_pi,
-                reward_tree_node_index: 0,
-                reward_tree_node_level: 0,
-                reward_tree_hash_mode: PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN,
-                reward_tree_node_children: 0,
-                dependencies: vec![],
-            },
-        };
+
+        // No wallet-signature child: finalizer authorization is the scheduled
+        // processor's existing BLS vote over the proposal identity (certificate
+        // verified off-circuit at the Coordinator gate).
 
         let mut final_guta_header = root_header.header;
         final_guta_header.state_transition.new_node_value = fee_delta_proof.new_root;
@@ -1113,8 +1107,6 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             validator_user_tree_proof,
             current_validator_user_leaf,
             current_validator_user_tree_proof: old_leaf_proof,
-            validator_public_key_param: public_key_param,
-            signature_proof_type: F::from_u64_value(SIGNATURE_TYPE_ZK as u64),
             validator_fee_delta_proof: fee_delta_proof,
         };
 
@@ -1126,21 +1118,20 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                 reward_tree_node_level: 0,
                 reward_tree_hash_mode: PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD,
                 reward_tree_node_children: 2,
-                dependencies: vec![root_header.job_id, signature_job_id],
+                dependencies: vec![root_header.job_id],
             },
         };
 
-        // Signature must complete before the finalizer claim. Publish signature
-        // on base_level, finalizer on base_level+1 so level-by-level worker
-        // dispatch respects deps.
+        // One child dependency (the root GUTA job): publish the finalizer on a
+        // fresh level above the planned aggregation jobs so level-by-level
+        // worker dispatch respects the dependency order.
         let base_level = self
             .planned_jobs
             .iter()
             .rposition(|jobs| !jobs.is_empty())
             .map(|level| level + 1)
             .unwrap_or(0);
-        let signature_level = base_level;
-        let finalizer_level = base_level + 1;
+        let finalizer_level = base_level;
         if finalizer_level >= MAX_REALM_PROVING_LEVELS {
             anyhow::bail!(
                 "Cannot append RealmFinalizeGUTA: level {} exceeds planner capacity.",
@@ -1148,32 +1139,22 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             );
         }
 
-        let signature_bytes = bincode::serialize(&signature_proof)
-            .map_err(|e| anyhow::anyhow!("serialize signature proof: {e}"))?;
         let finalizer_bytes = finalizer_input.psy_ser_into_bytes_vec()?;
         let new_user_leaf_bytes = new_user_leaf.psy_ser_to_bytes_vec()?;
         let new_total_jobs = self
             .total_jobs
-            .checked_add(2)
+            .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("RealmFinalizeGUTA would overflow planner total_jobs"))?;
 
         temp_store
             .set_tdb_proof_witnesses_tuple_owned_raw(
                 &self.realm_identifier,
                 self.unique_pending_id,
-                vec![
-                    (signature_job_id, signature_bytes),
-                    (finalizer_job_id, finalizer_bytes),
-                ],
+                vec![(finalizer_job_id, finalizer_bytes)],
             )
             .await?;
 
         global_user_tree.set_leaf(effective_validator_index, new_leaf_hash);
-        let signature_position = self.planned_jobs[signature_level].len();
-        self.job_level_map
-            .insert(signature_job_id, (signature_level, signature_position));
-        self.planned_jobs[signature_level].push(signature_job);
-
         let finalizer_position = self.planned_jobs[finalizer_level].len();
         self.job_level_map
             .insert(finalizer_job_id, (finalizer_level, finalizer_position));
@@ -1191,7 +1172,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
     }
 
     pub async fn finalize_with_reward_ids<Hasher: FieldQHasher<F, Hash>, TempStore: StandardProcessorTempDBStoreBase<QProvingJobDataID, Hash>>(
-        mut self,
+        &mut self,
         checkpoint_tree: &PsyDashMemoryAppendOnlyMerkleStore<Hasher, Hash>,
         global_user_tree: &mut SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
         temp_store: Arc<TempStore>,
@@ -1203,8 +1184,6 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                 && self.realm_finalize_validator_node_id_hash_limbs.is_some()
                 && self.realm_finalize_validator_bls_hash_limbs.is_some()
                 && self.realm_finalize_validator_user_leaf.is_some()
-                && self.realm_finalize_validator_zk_private_key.is_some()
-                && self.realm_finalize_validator_public_key_param.is_some()
                 && self.realm_finalize_anchor_checkpoint_leaf.is_some()
                 && self.realm_finalize_anchor_checkpoint_tree_proof.is_some()
                 && self.realm_finalize_checkpoint_leaf.is_some()
@@ -1274,7 +1253,6 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                     header: witness.get_new_guta_header(self.global_user_tree_height),
                     job_id: job_id.clone(),
                 };
-                println!("new_guta_header: {:?}", new_guta_header);
                 temp_store
                     .set_tdb_proof_witnesses_tuple_owned_raw(
                         &self.realm_identifier,
@@ -1300,13 +1278,13 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                             global_user_tree.get_changes(),
                             self.realm_root_key,
                         ),
-                        update_user_contract_tree_nodes_ffs: self.user_contract_tree_updates_ffs,
-                        update_contract_state_tree_nodes_ffs: self.contract_state_tree_updates_ffs,
-                        update_contract_state_imt_leaves_ffs: self.contract_state_imt_leaves_ffs,
-                        update_user_leaves_ffs: self.user_leaf_updates_ffs,
+                        update_user_contract_tree_nodes_ffs: std::mem::take(&mut self.user_contract_tree_updates_ffs),
+                        update_contract_state_tree_nodes_ffs: std::mem::take(&mut self.contract_state_tree_updates_ffs),
+                        update_contract_state_imt_leaves_ffs: std::mem::take(&mut self.contract_state_imt_leaves_ffs),
+                        update_user_leaves_ffs: std::mem::take(&mut self.user_leaf_updates_ffs),
                         guta_header: root_header,
                     },
-                    job_ids: self.planned_jobs.into_iter().filter(|jobs| !jobs.is_empty()).collect(),
+                    job_ids: std::mem::take(&mut self.planned_jobs).into_iter().filter(|jobs| !jobs.is_empty()).collect(),
                 }));
             }
         }
@@ -1330,13 +1308,13 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                         self.realm_root_key,
                     ),
                     total_proofs_generated: self.total_jobs as u64,
-                    update_user_contract_tree_nodes_ffs: self.user_contract_tree_updates_ffs,
-                    update_contract_state_tree_nodes_ffs: self.contract_state_tree_updates_ffs,
-                    update_contract_state_imt_leaves_ffs: self.contract_state_imt_leaves_ffs,
-                    update_user_leaves_ffs: self.user_leaf_updates_ffs,
+                    update_user_contract_tree_nodes_ffs: std::mem::take(&mut self.user_contract_tree_updates_ffs),
+                    update_contract_state_tree_nodes_ffs: std::mem::take(&mut self.contract_state_tree_updates_ffs),
+                    update_contract_state_imt_leaves_ffs: std::mem::take(&mut self.contract_state_imt_leaves_ffs),
+                    update_user_leaves_ffs: std::mem::take(&mut self.user_leaf_updates_ffs),
                     guta_header: root_header,
                 },
-                job_ids: self.planned_jobs.into_iter().filter(|x| !x.is_empty()).collect(),
+                job_ids: std::mem::take(&mut self.planned_jobs).into_iter().filter(|x| !x.is_empty()).collect(),
             }))
         } else {
             tracing::info!("No stragglers remain after finalization, but no root found. This should never happen.");

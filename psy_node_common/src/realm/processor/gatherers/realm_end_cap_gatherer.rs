@@ -15,7 +15,7 @@ use parth_core::{
         fast_node_serializer::{QMerkleStoreFastZeroNodeSerializer, QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE},
         merkle_node_key::SimpleMerkleNodeKey,
     },
-    felt::{QFelt64, ZeroableFelt},
+    felt::{QFelt64, ToU64Value, ZeroableFelt},
     protocol::core_types::{Q256BitHash, QDBHashBase, QFHashBase, QNetworkTypesConfig},
     QCoreProcCheckpointUniqueId, QJobIdBase,
 };
@@ -427,10 +427,17 @@ pub struct RealmGUTAEndCapGathererConfig<
     pub coordinator_guta_updates_circuit_whitelist: N::QHash,
     pub checkpoint_tree: Arc<PsyDashMemoryAppendOnlyMerkleStore<N::HasherBase, N::QHash>>,
     pub future_pending_end_cap_jobs: Arc<RwLock<Vec<PlannedFutureEndCapJob<N::F, N::QHash>>>>,
+    /// Process-lifetime fee-leaf slot: the single authority for the validator
+    /// leaf's balance/nonce across builder recreates. Fed by EndCaps, finalize
+    /// fee credits and follower FFS user-leaf preimages; never read back from
+    /// the DB gathering checkpoint.
+    pub current_fee_validator_leaf: Arc<RwLock<Option<PQEDUserLeaf<N::F, N::QHash>>>>,
+    /// Last fee leaf whose hash matched the tree at a commit point. FF uses
+    /// it to discard speculative slot overlays that a reverted recorder left
+    /// behind, restoring the committed preimage before FFS last-wins.
+    pub committed_fee_validator_leaf: Arc<RwLock<Option<PQEDUserLeaf<N::F, N::QHash>>>>,
     pub tree_store: Arc<dyn PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync>,
     pub validator: psy_data::genesis::genesis_block_setup::GenesisValidator,
-    pub validator_zk_private_key: N::QHash,
-    pub signature_fingerprint: N::QHash,
     pub checkpoints_per_epoch: u64,
     pub _phantom_n: std::marker::PhantomData<N>,
 
@@ -450,10 +457,10 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
             coordinator_guta_updates_circuit_whitelist: self.coordinator_guta_updates_circuit_whitelist,
             checkpoint_tree: self.checkpoint_tree.clone(),
             future_pending_end_cap_jobs: self.future_pending_end_cap_jobs.clone(),
+            current_fee_validator_leaf: self.current_fee_validator_leaf.clone(),
+            committed_fee_validator_leaf: self.committed_fee_validator_leaf.clone(),
             tree_store: self.tree_store.clone(),
             validator: self.validator,
-            validator_zk_private_key: self.validator_zk_private_key,
-            signature_fingerprint: self.signature_fingerprint,
             checkpoints_per_epoch: self.checkpoints_per_epoch,
             _phantom_n: std::marker::PhantomData,
         }
@@ -474,13 +481,8 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
         let max_user_id = (self.realm_id_u64 + 1) << N::REALM_GLOBAL_USER_TREE_HEIGHT;
         anyhow::ensure!(user_id >= min_user_id && user_id < max_user_id, "Validator user is outside its realm");
         let leaf = self.tree_store.get_user_leaf(checkpoint_id, user_id).await?;
-        let key = psy_crypto::signature::zk::wallet::SimplePsyPrivateKey::new(
-            psy_client_common::data::qhashout::QHashOut::<parth_core::PF>::from_hash256_le(
-                psy_client_common::data::base_types::hash256::Hash256(self.validator_zk_private_key.into_owned_32bytes())));
-        let param = key.get_public_key_param::<psy_crypto::hash::merkle::treeprover::PsyStateTrackingHash>();
-        let public_key_param = N::QHash::from_owned_32bytes(param.to_le_bytes());
-        anyhow::ensure!(leaf.public_key == N::HasherBase::q_two_to_one(self.signature_fingerprint, public_key_param),
-            "Validator ZK key does not match authenticated user public key");
+        // No wallet key material: BLS authorization stays with the processor's
+        // own P2P key; the identity is public validator-tree/leaf evidence only.
         let checkpoint_leaf = self.tree_store.get_checkpoint_leaf_data(checkpoint_id).await?;
         let roots = self.tree_store.get_checkpoint_global_state_roots(checkpoint_id).await?;
         let checkpoint_tree_proof = self.tree_store.checkpoint_tree_get_merkle_proof(checkpoint_id, checkpoint_id).await?;
@@ -498,12 +500,22 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
             && anchor_checkpoint_tree_proof.root == status.gathering_checkpoint_root
             && anchor_checkpoint_tree_proof.value == anchor_checkpoint_leaf.qfhash::<N::HasherBase>()
             && anchor_checkpoint_tree_proof.verify::<N::HasherBase>(), "Finalizer checkpoint proofs do not match gathering snapshot");
-        anyhow::ensure!(validator_user_tree_proof.root == roots.user_tree_root
-            && validator_user_tree_proof.value == leaf.qfhash::<N::HasherBase>()
-            && validator_user_tree_proof.verify::<N::HasherBase>()
-            && old_realm_root_proof.root == roots.user_tree_root
-            && old_realm_root_proof.value == status.gathering_realm_start_root
-            && old_realm_root_proof.verify::<N::HasherBase>(), "Finalizer user proofs do not match gathering snapshot");
+        anyhow::ensure!(validator_user_tree_proof.root == roots.user_tree_root,
+            "Finalizer user proof root {:?} does not match stored user tree root {:?}",
+            validator_user_tree_proof.root, roots.user_tree_root);
+        anyhow::ensure!(validator_user_tree_proof.value == leaf.qfhash::<N::HasherBase>(),
+            "Finalizer user proof value {:?} does not match validator leaf hash",
+            validator_user_tree_proof.value);
+        anyhow::ensure!(validator_user_tree_proof.verify::<N::HasherBase>(),
+            "Finalizer user proof fails verification");
+        anyhow::ensure!(old_realm_root_proof.root == roots.user_tree_root,
+            "Finalizer old realm root proof root {:?} does not match stored user tree root {:?}",
+            old_realm_root_proof.root, roots.user_tree_root);
+        anyhow::ensure!(old_realm_root_proof.value == status.gathering_realm_start_root,
+            "Finalizer old realm root proof value {:?} does not match gathering_realm_start_root {:?}",
+            old_realm_root_proof.value, status.gathering_realm_start_root);
+        anyhow::ensure!(old_realm_root_proof.verify::<N::HasherBase>(),
+            "Finalizer old realm root proof fails verification");
         anyhow::ensure!(validator_tree_proof.root == roots.validator_tree_root
             && validator_tree_proof.value == psy_data::guta::realm_finalize::realm_validator_leaf_hash::<N::F, N::QHash, N::HasherBase>(user_id, node_limbs, bls_limbs)
             && validator_tree_proof.verify::<N::HasherBase>(), "Finalizer validator proof does not match gathering snapshot");
@@ -518,8 +530,6 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
             current_validator_user_leaf: leaf.clone(),
             current_validator_user_tree_proof,
             validator_user_leaf: leaf,
-            validator_zk_private_key: self.validator_zk_private_key,
-            validator_public_key_param: public_key_param,
             anchor_checkpoint_leaf,
             anchor_checkpoint_tree_proof,
             checkpoint_leaf: psy_data::v1::qdata::checkpoint::PQEDCheckpointLeafCompactWithStateRoots {
@@ -682,6 +692,7 @@ fn realm_local_key_from_offset_ffs_key(
     })
 }
 
+
 pub struct RealmGUTAEndCapGatherer<
     N: QNetworkTypesConfig,
     TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>,
@@ -690,6 +701,7 @@ pub struct RealmGUTAEndCapGatherer<
     pub config: RealmGUTAEndCapGathererConfig<N, TempDatabase, FileSystem>,
     pub last_committed_checkpoint_root: N::QHash,
     pub guta_planner: RealmGUTAPlanner<N::F, N::QHash>,
+    committed_validator_user_leaf: PQEDUserLeaf<N::F, N::QHash>,
     pub status: RealmProcessorCoreState<N::QHash>,
     pub start_global_user_tree_root: N::QHash,
     pub total_users_updated: u64,
@@ -787,8 +799,8 @@ pub struct RealmGUTAEndCapGathererOutput<F, Hash, JobId> {
 }
 #[async_trait]
 impl<
-        FileSystem: TokioLikeFileSystem,
-        N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
+        FileSystem: TokioLikeFileSystem + 'static,
+        N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
         TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + Send + Sync + 'static,
     >
     QueueGathererItemBuilderWithTree<
@@ -800,110 +812,112 @@ impl<
 
     async fn create_new_with_tree(
         tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
-        _unique_id: QCoreProcCheckpointUniqueId,
+        unique_id: QCoreProcCheckpointUniqueId,
         config: RealmGUTAEndCapGathererConfig<N, TempDatabase, FileSystem>,
     ) -> anyhow::Result<Self> {
-        let status = config.status.read().unwrap().clone();
-        let identity = config.finalizer_identity(&status).await?;
+        Self::create_with_fast_forward(tree, unique_id, config, &[]).await
+    }
 
-
+    async fn create_with_fast_forward(
+        tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
+        _unique_id: QCoreProcCheckpointUniqueId,
+        config: RealmGUTAEndCapGathererConfig<N, TempDatabase, FileSystem>,
+        state_updates: &[u8],
+    ) -> anyhow::Result<Self> {
+        if !state_updates.is_empty() {
+            Self::apply_fast_forward_with_tree(tree, &config, state_updates.to_vec()).await?;
+        }
+        let status = config.status.read()
+            .map_err(|_| anyhow::anyhow!("error reading gathering snapshot"))?.clone();
+        let user_id = config.validator.validator_user_id;
+        let min_user_id = config.realm_id_u64 << N::REALM_GLOBAL_USER_TREE_HEIGHT;
+        anyhow::ensure!(user_id >= min_user_id && user_id - min_user_id < (1u64 << N::REALM_GLOBAL_USER_TREE_HEIGHT),
+            "bootstrap validator is outside realm");
+        // The process-lifetime fee-leaf slot is the balance/nonce authority:
+        // seed the planner from it and never read the fee preimage back from
+        // the DB gathering checkpoint while the slot is populated.
+        let in_memory_leaf = config.current_fee_validator_leaf.read()
+            .map_err(|_| anyhow::anyhow!("error reading fee leaf slot"))?.clone();
+        let identity = if in_memory_leaf.is_none() { Some(config.finalizer_identity(&status).await?) } else { None };
+        let current_leaf = match in_memory_leaf
+            .or_else(|| identity.as_ref().map(|identity| identity.current_validator_user_leaf.clone())) {
+            Some(leaf) => leaf,
+            None => anyhow::bail!("no in-memory fee leaf and no persisted identity"),
+        };
+        anyhow::ensure!(current_leaf.user_id.to_u64_value() == user_id, "fee leaf belongs to another user");
+        anyhow::ensure!(tree.get_leaf(user_id - min_user_id).value == current_leaf.qfhash::<N::HasherBase>(),
+            "fee leaf preimage does not match live tree");
         let live_root = tree.get_root();
-        let snapshot_root = status.gathering_realm_start_root;
-        if live_root == snapshot_root || live_root == status.processing_realm_end_root {
-            tracing::info!(
-                "Keeping RealmGUTAEndCapGatherer processing tree root {:?} at processing checkpoint {}",
-                live_root,
-                status.processing_checkpoint_id
-            );
-        } else {
-            anyhow::bail!(
-                "live recorder root {:?} matches neither gathering_realm_start_root {:?} nor processing_realm_end_root {:?}",
-                live_root,
-                snapshot_root,
-                status.processing_realm_end_root
-            );
-        }
+        anyhow::ensure!(live_root == status.gathering_realm_start_root || live_root == status.processing_realm_end_root,
+            "live recorder root {:?} matches neither gathering_realm_start_root {:?} nor processing_realm_end_root {:?}",
+            live_root, status.gathering_realm_start_root, status.processing_realm_end_root);
         let new_realm_end_cap_gatherer_file_path = get_new_realm_end_cap_gatherer_backup_file_path(
-            &config.backup_file_directory,
-            config.realm_id_u64,
-            config.realm_sub_id_u64,
-            status.gathering_unique_pending_id,
-        );
+            &config.backup_file_directory, config.realm_id_u64, config.realm_sub_id_u64,
+            status.gathering_unique_pending_id);
         let backup_path = new_realm_end_cap_gatherer_file_path.to_string_lossy().to_string();
-        if config.file_system.file_like_exists(&backup_path).await? {
-            config.file_system.file_like_remove_file(&backup_path).await?;
-        }
+        // file_like_fs_create does not truncate: leftover tail bytes from a
+        // prior cycle at the same pending id are cut here.
         let mut new_realm_end_cap_gatherer_file = config.file_system.file_like_fs_create(&backup_path).await?;
-        new_realm_end_cap_gatherer_file
-            .write_u32_le(REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32)
-            .await?;
-        new_realm_end_cap_gatherer_file.write_all(&tree.get_root().into_owned_32bytes()).await?;
-        new_realm_end_cap_gatherer_file.write_all(&tree.get_root().into_owned_32bytes()).await?;
+        new_realm_end_cap_gatherer_file.file_like_set_len(0).await?;
+        new_realm_end_cap_gatherer_file.write_u32_le(REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32).await?;
+        new_realm_end_cap_gatherer_file.write_all(&live_root.into_owned_32bytes()).await?;
+        new_realm_end_cap_gatherer_file.write_all(&live_root.into_owned_32bytes()).await?;
         new_realm_end_cap_gatherer_file.write_u64_le(0).await?;
         config
             .file_system
             .file_like_fs_flush_file_with_path(&backup_path, &mut new_realm_end_cap_gatherer_file)
             .await?;
-
         let mut guta_planner = RealmGUTAPlanner::<N::F, N::QHash>::new(
             status.chain_id,
             status.realm_identifier,
             status.gathering_checkpoint_root,
             status.gathering_checkpoint_id,
             status.gathering_unique_pending_id,
-            tree.get_root(),
+            live_root,
             N::REALM_GLOBAL_USER_TREE_HEIGHT,
             N::GLOBAL_USER_TREE_HEIGHT,
             config.coordinator_guta_updates_circuit_whitelist,
-        ).with_realm_finalize_identity(identity);
+        );
+        guta_planner.realm_finalize_validator_user_id = Some(user_id);
+        guta_planner.realm_finalize_current_validator_user_leaf = Some(current_leaf);
+        if let Some(identity) = identity { guta_planner.refresh_realm_finalize_identity(identity); }
         let future_end_cap_jobs: Vec<PlannedFutureEndCapJob<N::F, N::QHash>> = {
-            std::mem::take(
-                &mut *config
-                    .future_pending_end_cap_jobs
-                    .write()
-                    .map_err(|_| anyhow::anyhow!("error writing to future pending end cap jobs"))?,
-            )
+            std::mem::take(&mut *config.future_pending_end_cap_jobs.write()
+                .map_err(|_| anyhow::anyhow!("error writing to future pending end cap jobs"))?)
         };
-
+        let committed_validator_user_leaf = guta_planner.realm_finalize_current_validator_user_leaf.clone()
+            .context("missing initial validator leaf")?;
         let restore_future_jobs = future_end_cap_jobs.clone();
         let end_cap_jobs_added = match guta_planner
-            .add_future_end_cap_jobs(
-                &config.checkpoint_tree,
-                tree,
-                &mut new_realm_end_cap_gatherer_file,
-                config.temp_db.clone(),
-                future_end_cap_jobs,
-            )
+            .add_future_end_cap_jobs(&config.checkpoint_tree, tree, &mut new_realm_end_cap_gatherer_file,
+                config.temp_db.clone(), future_end_cap_jobs)
             .await
         {
             Ok(count) => count,
             Err(error) => {
                 if let Ok(mut pending) = config.future_pending_end_cap_jobs.write() {
                     pending.extend(restore_future_jobs);
-                    pending.extend(std::mem::take(&mut guta_planner.future_pending_end_cap_jobs));
+                } else {
+                    tracing::error!("Failed to restore future pending end cap jobs after failed gatherer construction");
                 }
                 return Err(error);
             }
         };
-
         config
             .file_system
-            .file_like_fs_flush_file_with_path(
-                &new_realm_end_cap_gatherer_file_path.to_string_lossy(),
-                &mut new_realm_end_cap_gatherer_file,
-            )
+            .file_like_fs_flush_file_with_path(&backup_path, &mut new_realm_end_cap_gatherer_file)
             .await?;
         let last_committed_checkpoint_root = config.checkpoint_tree.get_root();
         Ok(Self {
             config,
             status,
+            committed_validator_user_leaf,
             guta_planner,
             last_committed_checkpoint_root,
-            total_users_updated:end_cap_jobs_added as u64,
+            total_users_updated: end_cap_jobs_added as u64,
             new_realm_end_cap_gatherer_file,
-            start_global_user_tree_root: tree.get_root(),
-            pending_file_path: new_realm_end_cap_gatherer_file_path.to_string_lossy().to_string(),
-
+            start_global_user_tree_root: live_root,
+            pending_file_path: backup_path,
         })
     }
     async fn update_from_queue_item_with_tree(
@@ -940,6 +954,20 @@ impl<
             .file_like_fs_flush_file_with_path(&self.pending_file_path, &mut self.new_realm_end_cap_gatherer_file)
             .await?;
         tracing::info!("RealmGUTAEndCapGatherer flushed changes to disk for pending file path {}", self.pending_file_path);
+        // EndCap overlay: the slot is only advanced when the tree leaf moved
+        // in the same operation. A lone (straggler) EndCap stages the planner
+        // leaf without touching the tree, so publishing it here would break
+        let tree_leaf_value = self.guta_planner.realm_finalize_validator_user_id
+            .map(|user_id| tree.get_leaf(user_id - self.guta_planner.realm_user_min_id).value);
+        let matches_tree = match (&tree_leaf_value, self.guta_planner.realm_finalize_current_validator_user_leaf.as_ref()) {
+            (Some(tree_value), Some(leaf)) => leaf.qfhash::<N::HasherBase>() == *tree_value,
+            _ => false,
+        };
+        if matches_tree {
+            if let Ok(mut slot) = self.config.current_fee_validator_leaf.write() {
+                *slot = self.guta_planner.realm_finalize_current_validator_user_leaf.clone();
+            }
+        }
         Ok(())
     }
     async fn update_from_many_queue_items_with_tree(
@@ -958,8 +986,6 @@ impl<
             self.status.gathering_unique_pending_id,
             tree.get_root()
         );
-
-
         let needs_revert = {
             self.config
                 .status
@@ -969,7 +995,6 @@ impl<
         };
         let initial_total_end_caps_processed = self.guta_planner.total_end_caps_processed;
 
-
         if needs_revert {
             tracing::info!(
                 "Reverting GUTA updates gatherer changes for pending id {}, abandoning root {:?}",
@@ -977,6 +1002,10 @@ impl<
                 tree.get_root()
             );
             tree.revert_changes();
+            self.guta_planner.realm_finalize_current_validator_user_leaf = Some(self.committed_validator_user_leaf.clone());
+            if let Ok(mut slot) = self.config.current_fee_validator_leaf.write() {
+                *slot = self.guta_planner.realm_finalize_current_validator_user_leaf.clone();
+            }
             {
                 let mut shared = self
                     .config
@@ -996,70 +1025,116 @@ impl<
                 db_output: RealmGUTAEndCapGathererOutputDatabase::<N::F, N::QHash>::get_empty(reverted_root),
                 job_ids: vec![],
             });
-        } else {
-            tracing::info!(
-                "Committing GUTA updates gatherer changes for pending id {}, finalizing root {:?}",
-                self.status.gathering_unique_pending_id,
-                tree.get_root()
+        }
+
+        let authenticated = self.config.status.read()
+            .map_err(|_| anyhow::anyhow!("error reading finalization checkpoint"))?.clone();
+        if authenticated.gathering_realm_start_root != self.start_global_user_tree_root {
+            // Fail closed: an unauthenticated cycle must not return empty
+            // success, which would discard owned accepted/deferred inputs
+            // (consuming finalize + runner clears cycle_items). The original
+            // cause reaches the processor through the halted owner.
+            anyhow::bail!(
+                "gathering snapshot root {:?} does not authenticate cycle start {:?}; \
+                 owned accepted/deferred inputs are retained by the halted owner",
+                authenticated.gathering_realm_start_root,
+                self.start_global_user_tree_root
             );
+        }
+        // Formal identity is loaded here, at the official finalize, only.
+        let identity = self.config.finalizer_identity(&authenticated).await?;
+        if authenticated.gathering_checkpoint_id != self.guta_planner.current_checkpoint_id
+            || authenticated.gathering_checkpoint_root != self.guta_planner.current_checkpoint_root {
+            // Checkpoint-advance rebase: rebuild the planner bound to the
+            // authentic checkpoint, replay the owned inputs, and truncate-
+            // replace the pending backup in place. Identity is bound and the
+            // fee leaf is preserved; no .replay staging exists.
+            let accepted = self.guta_planner.accepted_end_cap_jobs.clone();
+            let pending = self.guta_planner.future_pending_end_cap_jobs.clone();
+            let mut rebuilt_tree = tree.clone();
+            rebuilt_tree.revert_changes();
+            anyhow::ensure!(rebuilt_tree.get_root() == self.start_global_user_tree_root,
+                "authoritative rebase does not match cycle start");
+            let mut rebuilt = RealmGUTAPlanner::<N::F, N::QHash>::new(
+                self.guta_planner.chain_id, self.guta_planner.realm_identifier,
+                authenticated.gathering_checkpoint_root, authenticated.gathering_checkpoint_id,
+                self.status.gathering_unique_pending_id, self.start_global_user_tree_root,
+                N::REALM_GLOBAL_USER_TREE_HEIGHT, N::GLOBAL_USER_TREE_HEIGHT,
+                self.config.coordinator_guta_updates_circuit_whitelist);
+            // Leaf preservation: the retained fee leaf seeds the rebuilt planner.
+            rebuilt.realm_finalize_current_validator_user_leaf = Some(self.committed_validator_user_leaf.clone());
+            rebuilt.refresh_realm_finalize_identity(identity);
+            self.new_realm_end_cap_gatherer_file.seek(tokio::io::SeekFrom::Start(4 + 32 + 32 + 8)).await?;
+            rebuilt.add_future_end_cap_jobs(&self.config.checkpoint_tree, &mut rebuilt_tree,
+                &mut self.new_realm_end_cap_gatherer_file, self.config.temp_db.clone(), accepted).await?;
+            rebuilt.add_future_end_cap_jobs(&self.config.checkpoint_tree, &mut rebuilt_tree,
+                &mut self.new_realm_end_cap_gatherer_file, self.config.temp_db.clone(), pending).await?;
+            let replay_end = self.new_realm_end_cap_gatherer_file.stream_position().await?;
+            self.new_realm_end_cap_gatherer_file.file_like_set_len(replay_end).await?;
             self.config
                 .file_system
                 .file_like_fs_flush_file_with_path(&self.pending_file_path, &mut self.new_realm_end_cap_gatherer_file)
                 .await?;
+            self.config
+                .file_system
+                .file_like_fs_sync_file_with_path(&self.pending_file_path, &mut self.new_realm_end_cap_gatherer_file)
+                .await?;
+            *tree = rebuilt_tree;
+            self.guta_planner = rebuilt;
+        } else {
+            self.guta_planner.refresh_realm_finalize_identity(identity);
+        }
+        tracing::info!(
+            "Committing GUTA updates gatherer changes for pending id {}, finalizing root {:?}",
+            self.status.gathering_unique_pending_id,
+            tree.get_root()
+        );
+        self.config
+            .file_system
+            .file_like_fs_flush_file_with_path(&self.pending_file_path, &mut self.new_realm_end_cap_gatherer_file)
+            .await?;
+        let total_end_caps_processed = self.guta_planner.total_end_caps_processed;
+        let result = self
+            .guta_planner
+            .finalize_with_reward_ids(&self.config.checkpoint_tree, tree, self.config.temp_db.clone(), 0, 0)
+            .await
+            .context("GUTA updates gatherer planner finalize failed")?;
+        if let Some(result) = result {
+            self.new_realm_end_cap_gatherer_file
+                .write_all(&result.db_output.guta_header.psy_ser_to_bytes_vec()?)
+                .await?;
+            self.config
+                .file_system
+                .file_like_fs_flush_file_with_path(&self.pending_file_path, &mut self.new_realm_end_cap_gatherer_file)
+                .await?;
+            self.new_realm_end_cap_gatherer_file.seek(tokio::io::SeekFrom::Start(4 + 32)).await?;
+            self.new_realm_end_cap_gatherer_file
+                .write_all(&tree.get_root().into_owned_32bytes())
+                .await?;
+            self.new_realm_end_cap_gatherer_file.write_u64_le(total_end_caps_processed as u64).await?;
+            self.config
+                .file_system
+                .file_like_fs_flush_file_with_path(&self.pending_file_path, &mut self.new_realm_end_cap_gatherer_file)
+                .await?;
+            self.config
+                .file_system
+                .file_like_fs_sync_file_with_path(&self.pending_file_path, &mut self.new_realm_end_cap_gatherer_file)
+                .await?;
             tracing::info!(
-                "GUTA updates gatherer for pending id {} flushed to disk before finalize.",
+                "GUTA updates gatherer for pending id {} finalized with changes.",
                 self.status.gathering_unique_pending_id
             );
-            let total_end_caps_processed = self.guta_planner.total_end_caps_processed;
-            let result = self
-                .guta_planner
-                .finalize_with_reward_ids(&self.config.checkpoint_tree, tree, self.config.temp_db.clone(), 0, 0)
-                .await;
-            if result.is_err() {
-                tracing::error!(
-                    "GUTA updates gatherer for pending id {} finalize failed: {:?}",
-                    self.status.gathering_unique_pending_id,
-                    result.err()
-                );
-                anyhow::bail!("GUTA updates gatherer finalize failed");
+            tree.commit_changes();
+            // Publish the committed root so the immediate recreate bootstrap
+            // accepts the finalize-committed live root (recreate race fix).
+            publish_gathering_snapshot_if_current(&self.config.status, &self.status, tree.get_root());
+            if let Ok(mut slot) = self.config.current_fee_validator_leaf.write() {
+                *slot = self.guta_planner.realm_finalize_current_validator_user_leaf.clone();
             }
-            let result = result?;
-            tracing::info!(
-                "GUTA updates gatherer for pending id {} finalized planner.",
-                self.status.gathering_unique_pending_id
-            );
-            if result.is_some() {
-                let result = result.unwrap();
-                self.new_realm_end_cap_gatherer_file
-                    .write_all(&result.db_output.guta_header.psy_ser_to_bytes_vec()?)
-                    .await?;
-                self.config
-                    .file_system
-                    .file_like_fs_flush_file_with_path(&self.pending_file_path, &mut self.new_realm_end_cap_gatherer_file)
-                    .await?;
-
-                self.new_realm_end_cap_gatherer_file.seek(tokio::io::SeekFrom::Start(4 + 32)).await?;
-                self.new_realm_end_cap_gatherer_file
-                    .write_all(&tree.get_root().into_owned_32bytes())
-                    .await?;
-                self.new_realm_end_cap_gatherer_file.write_u64_le(total_end_caps_processed as u64).await?;
-                self.config
-                    .file_system
-                    .file_like_fs_flush_file_with_path(&self.pending_file_path, &mut self.new_realm_end_cap_gatherer_file)
-                    .await?;
-                self.config
-                    .file_system
-                    .file_like_fs_sync_file_with_path(&self.pending_file_path, &mut self.new_realm_end_cap_gatherer_file)
-                    .await?;
-
-                tracing::info!(
-                    "GUTA updates gatherer for pending id {} finalized with changes.",
-                    self.status.gathering_unique_pending_id
-                );
-                tree.commit_changes();
-                publish_gathering_snapshot_if_current(&self.config.status, &self.status, tree.get_root());
-                return Ok(result);
+            if let Ok(mut committed) = self.config.committed_fee_validator_leaf.write() {
+                *committed = self.guta_planner.realm_finalize_current_validator_user_leaf.clone();
             }
+            return Ok(result);
         }
 
         let total_end_caps_processed = initial_total_end_caps_processed;
@@ -1085,7 +1160,6 @@ impl<
             .file_system
             .file_like_fs_flush_file_with_path(&self.pending_file_path, &mut self.new_realm_end_cap_gatherer_file)
             .await?;
-
         self.new_realm_end_cap_gatherer_file.seek(tokio::io::SeekFrom::Start(4 + 32)).await?;
         self.new_realm_end_cap_gatherer_file
             .write_all(&tree.get_root().into_owned_32bytes())
@@ -1099,7 +1173,15 @@ impl<
             .file_system
             .file_like_fs_sync_file_with_path(&self.pending_file_path, &mut self.new_realm_end_cap_gatherer_file)
             .await?;
+        // Publish even for a no-op finalize so the recreate bootstrap accepts
+        // the current live root.
         publish_gathering_snapshot_if_current(&self.config.status, &self.status, tree.get_root());
+        if let Ok(mut slot) = self.config.current_fee_validator_leaf.write() {
+            *slot = self.guta_planner.realm_finalize_current_validator_user_leaf.clone();
+        }
+        if let Ok(mut committed) = self.config.committed_fee_validator_leaf.write() {
+            *committed = self.guta_planner.realm_finalize_current_validator_user_leaf.clone();
+        }
         Ok(RealmGUTAEndCapGathererOutput {
             db_output: RealmGUTAEndCapGathererOutputDatabase::<N::F, N::QHash>::get_empty(tree.get_root()),
             job_ids: vec![],
@@ -1112,6 +1194,31 @@ impl<
         state_updates: Vec<u8>,
     ) -> anyhow::Result<()> {
         let updates = PsyPreparedRealmBlockStateUpdates::<N::QHash>::psy_ser_from_slice(&state_updates)?;
+        anyhow::ensure!(updates.realm_id == config.realm_id_u64,
+            "FFS belongs to another realm");
+        anyhow::ensure!(updates.update_user_leaves_ffs.len() % PSY_OBJECT_FFS_SIZE_USER_LEAF == 0,
+            "invalid FFS user leaf length");
+        let user_id = config.validator.validator_user_id;
+        let min_user_id = config.realm_id_u64 << N::REALM_GLOBAL_USER_TREE_HEIGHT;
+        // Trust the speculative slot only while its hash still matches the
+        // committed preimage; a reverted recorder otherwise invalidated it.
+        // The committed preimage is the FF base, then FFS last-wins overlays.
+        let committed_leaf = config.committed_fee_validator_leaf.read()
+            .map_err(|_| anyhow::anyhow!("error reading committed fee leaf slot"))?.clone();
+        let speculative_leaf = config.current_fee_validator_leaf.read()
+            .map_err(|_| anyhow::anyhow!("error reading fee leaf slot"))?.clone();
+        let mut current_leaf = match (&speculative_leaf, &committed_leaf) {
+            (Some(speculative), Some(committed)) if speculative.qfhash::<N::HasherBase>() == committed.qfhash::<N::HasherBase>() => Some(speculative.clone()),
+            (Some(speculative), None) => Some(speculative.clone()),
+            (_, Some(committed)) => Some(committed.clone()),
+            (None, None) => None,
+        };
+        for bytes in updates.update_user_leaves_ffs.chunks_exact(PSY_OBJECT_FFS_SIZE_USER_LEAF) {
+            let leaf = PQEDUserLeaf::<N::F, N::QHash>::psy_ser_from_slice(bytes)?;
+            if leaf.user_id.to_u64_value() == user_id {
+                current_leaf = Some(leaf);
+            }
+        }
         apply_state_updates_to_tree(
             tree,
             updates.old_realm_root,
@@ -1120,6 +1227,14 @@ impl<
             N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
             config.realm_id_u64,
         )?;
+        if let Some(leaf) = current_leaf {
+            anyhow::ensure!(leaf.user_id.to_u64_value() == user_id, "FFS validator leaf belongs to another user");
+            anyhow::ensure!(tree.get_leaf(user_id - min_user_id).value == leaf.qfhash::<N::HasherBase>(),
+                "FFS validator preimage does not match updated tree");
+            if let Ok(mut slot) = config.current_fee_validator_leaf.write() {
+                *slot = Some(leaf);
+            }
+        }
         tracing::info!(
             "Applied Realm gatherer FastForward old_root={:?} new_root={:?}",
             updates.old_realm_root,
@@ -1495,7 +1610,7 @@ mod backup_file_tests {
             };
             let message = format!("{err:#}");
             assert!(
-                message.contains("declared total_size 1000000") && message.contains("bytes remain"),
+                message.contains("declared 1000000 bytes") && message.contains("bytes remain"),
                 "Allocation bound error not surfaced, got: {message}"
             );
             Ok(())

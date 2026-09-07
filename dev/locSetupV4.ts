@@ -4171,6 +4171,7 @@ class DevNetProcessManager {
                 ));
             }
         };
+        await startCoordinatorWorkerProcesses();
 
         let processorReadiness: Promise<void> = Promise.resolve();
 
@@ -4270,7 +4271,7 @@ class DevNetProcessManager {
             })();
         }
 
-        await startAfterPrerequisite(processorReadiness, startCoordinatorWorkerProcesses);
+        await processorReadiness;
 
         if (startRealmWorkers) {
             const workerPromises: Promise<RunningProcess>[] = [];

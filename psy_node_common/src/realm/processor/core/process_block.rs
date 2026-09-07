@@ -12,7 +12,10 @@ use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
     guta::{
         header_extended::{GlobalUserTreeAggregatorHeaderWithTagValue, GlobalUserTreeAggregatorHeaderWithTagValueAndJobType},
-        realm_finalize::protocol_encode_finalize_output,
+        realm_finalize::{
+            finalize_output_from_witness, finalize_reward_root63, realm_finalize_guta_chain_domain,
+            protocol_encode_finalize_output, RealmFinalizeBinding, RealmFinalizeGUTAInput,
+        },
     },
     node::node_proving_state::PsyNodeProvingState,
     p2p::{
@@ -39,7 +42,7 @@ use crate::{
     p2p::guta_submit::GutaSubmitError,
     realm::{
         processor::{
-            consensus::{build_bound_finalize_output, form_certificate, require_nonzero_validator_tree_root, sign_vote, validate_certificate, votes_meet_wait},
+            consensus::{certificate_includes_proposer, form_certificate, require_nonzero_validator_tree_root, sign_vote, validate_certificate, votes_meet_wait},
             core::PsyRealmProcessor,
             gatherers::realm_end_cap_gatherer::RealmGUTAEndCapGathererOutput,
         },
@@ -275,22 +278,6 @@ where
             .update_from_core_state(&self.db.state)
             .await?;
 
-        if updates.realm_sub_id != self.db.state.realm_sub_id_u64 {
-            self.guta_queue_gatherer.fast_forward(updates_bytes).await?;
-            tracing::info!(
-                "Applied Realm proposal FFS end_root={:?} checkpoint_id={}",
-                updates.new_realm_root,
-                included_checkpoint_id
-            );
-        }
-        self.held_state_updates = None;
-        self.db.state.gathering_realm_start_root = coordinator_realm_state.value;
-        self.db
-            .shared_state
-            .update_from_core_state(&self.db.state)
-            .await?;
-
-
         if !db_matches {
             anyhow::ensure!(
                 updates.old_realm_root == self.db.state.last_committed_realm_end_root,
@@ -323,6 +310,22 @@ where
                 included_checkpoint_id
             );
         }
+
+        self.db.state.gathering_realm_start_root = coordinator_realm_state.value;
+        self.db
+            .shared_state
+            .update_from_core_state(&self.db.state)
+            .await?;
+
+        if updates.realm_sub_id != self.db.state.realm_sub_id_u64 {
+            self.guta_queue_gatherer.fast_forward(updates_bytes).await?;
+            tracing::info!(
+                "Applied Realm proposal FFS end_root={:?} checkpoint_id={}",
+                updates.new_realm_root,
+                included_checkpoint_id
+            );
+        }
+        self.held_state_updates = None;
 
         self.db.sync_to_coordinator_set_checkpoint_id().await
     }
@@ -525,38 +528,83 @@ where
             update_global_user_tree_nodes_ffs: guta_update.update_global_user_tree_nodes_ffs,
             update_contract_state_imt_leaves_ffs: guta_update.update_contract_state_imt_leaves_ffs,
         };
-
         let mut p2p_submission = None;
         if self.p2p.is_some() && self.rotation.as_ref().is_some_and(|rotation| rotation.is_enabled()) {
             p2p_submission = self
-                .publish_realm_p2p_proposal(&submission_header, &root_job_proof, &db_output)
+                .publish_realm_p2p_proposal(&root_job_id, &root_job_proof, rewards_root, &db_output)
                 .await?;
         }
 
-        if let Some((proposal, _)) = p2p_submission.as_ref() {
+        // Submit-gate BLS verification: mirror the Coordinator admission gate
+        // locally before the HTTP submit. The certificate must verify over the
+        // proposal identity D with checkpoint-authenticated keys, meet the
+        // replication wait, and include the scheduled proposer's vote.
+        if let Some((proposal, certificate, output_bytes, worker_tag)) = p2p_submission.as_ref() {
+            let base_checkpoint_id = proposal.base_checkpoint_id;
+            let tree_rotation = self.rotation_from_validator_tree(base_checkpoint_id).await?;
+            let validator_sub_ids = tree_rotation.validator_sub_ids.as_slice();
+            let bls_public_keys = self.p2p_bls_public_keys.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "realm P2P enabled for realm {} but no BLS public keys were wired via set_realm_p2p",
+                    self.db.state.realm_id_u64
+                )
+            })?;
+            let leaf_bls_keys = validator_sub_ids
+                .iter()
+                .map(|sub_id| {
+                    bls_public_keys
+                        .get(sub_id)
+                        .copied()
+                        .map(|key| (*sub_id, key))
+                        .ok_or_else(|| anyhow::anyhow!("missing BLS key for validator Realm sub_id {sub_id}"))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            validate_certificate(proposal, certificate, validator_sub_ids, &leaf_bls_keys)
+                .map_err(|error| anyhow::anyhow!("submit gate rejected certificate: {error}"))?;
+            anyhow::ensure!(
+                votes_meet_wait(validator_sub_ids.len(), proposal.proposer_sub_id, &certificate.signer_sub_ids()),
+                "submit gate rejected certificate: below replication wait"
+            );
+            anyhow::ensure!(
+                certificate_includes_proposer(certificate, proposal.proposer_sub_id),
+                "submit gate rejected certificate: missing scheduled proposer vote"
+            );
+            let finalize_binding = RealmFinalizeBinding {
+                output: *output_bytes,
+                finalizer_worker_reward_tag: *worker_tag,
+            };
             tracing::info!(
                 "Submitting GUTA proof to Coordinator proposal={} realm={} sub_id={}",
                 hex::encode(proposal.proposal_id),
                 self.db.state.realm_id_u64,
                 self.db.state.realm_sub_id_u64
             );
+            self.db
+                .coordinator_client
+                .rc_submit_guta_proof(
+                    submission_header,
+                    root_job_proof.clone(),
+                    self.db.state.realm_id_u64,
+                    Some(proposal.protocol_encode_to_vec()),
+                    Some(certificate.protocol_encode_to_vec()),
+                    finalize_binding.protocol_encode_to_vec(),
+                )
+                .await?;
         } else {
             tracing::info!("Submitting GUTA proof to Coordinator...");
+            self.db
+                .coordinator_client
+                .rc_submit_guta_proof(
+                    submission_header,
+                    root_job_proof.clone(),
+                    self.db.state.realm_id_u64,
+                    None,
+                    None,
+                    Vec::new(),
+                )
+                .await?;
         }
-        self.db
-            .coordinator_client
-            .rc_submit_guta_proof(
-                submission_header,
-                root_job_proof.clone(),
-                self.db.state.realm_id_u64,
-                p2p_submission
-                    .as_ref()
-                    .map(|(proposal, _)| proposal.protocol_encode_to_vec()),
-                p2p_submission
-                    .as_ref()
-                    .map(|(_, certificate)| certificate.protocol_encode_to_vec()),
-            )
-            .await?;
+
         timer.lap("submit_guta_proof");
 
         // 8. Wait for Coordinator Commit
@@ -616,31 +664,28 @@ where
     /// Certificate (without submitting it to the coordinator).
     ///
     /// This runs the Slice C sequence: epoch-of-target scheduled-proposer
-    /// check, in-band FFS encode, 410-byte finalizer-output encode, proposal
-    /// publish, own-vote sign + publish, blocking `wait_votes` until
-    /// `ceil(n/2)` replication, and `form_certificate`. The certificate is
-    /// retained and never sent over P2P; GUTA admission stays on the HTTP
-    /// path in `process_block`. Every missing input bails fail-closed.
+    /// check, in-band FFS encode, 410-byte actual finalizer-output encode,
+    /// proposal publish, own-vote sign + publish, blocking `wait_votes` until
+    /// `ceil(n/2)` replication, and `form_certificate`.
     async fn publish_realm_p2p_proposal(
         &mut self,
-        submission_header: &GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
+        root_job_id: &QProvingJobDataID,
         root_job_proof: &[u8],
+        rewards_root: N::QHash,
         state_updates: &PsyPreparedRealmBlockStateUpdates<N::QHash>,
-    ) -> anyhow::Result<Option<(Proposal, Certificate)>> {
+    ) -> anyhow::Result<Option<(Proposal, Certificate, [u8; 410], [u8; 32])>> {
         let (cmds, rotation) = (
             self.p2p.as_ref().expect("p2p handle checked by caller"),
             self.rotation.as_ref().expect("rotation checked by caller"),
         );
-
         let bls_secret = self.bls_secret.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "realm P2P enabled for realm {} but no BLS secret key was wired via set_realm_p2p",
                 self.db.state.realm_id_u64
             )
         })?;
-
-        let (output_bytes, base_checkpoint_id, validator_tree_root) = self
-            .build_p2p_finalize_output(submission_header)
+        let (output_bytes, base_checkpoint_id, validator_tree_root, worker_tag) = self
+            .build_p2p_finalize_output(root_job_id, rewards_root)
             .await?;
         let target = base_checkpoint_id
             .checked_add(1)
@@ -668,7 +713,7 @@ where
         );
 
         let state_updates_bytes = state_updates.psy_ser_to_bytes_vec()?;
-        let body = encode_proposal_body(&output_bytes, root_job_proof, &state_updates_bytes)?;
+        let body = encode_proposal_body(&output_bytes, root_job_proof, &state_updates_bytes, &worker_tag)?;
         let body_hash = sha256(&body);
         let public_output_hash = sha256(&output_bytes);
         let finalizer_proof_hash = sha256(root_job_proof);
@@ -778,7 +823,7 @@ where
             signer_ids,
             all_votes.len()
         );
-        Ok(Some((proposal, certificate)))
+        Ok(Some((proposal, certificate, output_bytes, worker_tag)))
     }
 
     async fn rotation_from_validator_tree(
@@ -796,6 +841,7 @@ where
         let roots = self.db.db.get_checkpoint_global_state_roots(checkpoint_id).await?;
         let (validator_sub_ids, _, _) = load_realm_validators_from_tree::<N::HasherBase, N::QHash, _>(
             &*self.db.db,
+            self.db.state.chain_id,
             checkpoint_id,
             self.db.state.realm_id_u64 as u32,
             &roots.validator_tree_root,
@@ -840,40 +886,74 @@ where
         Ok(scheduled_proposer == self.db.state.realm_sub_id_u64 as u16)
     }
 
-    /// Build the canonical unbound 410-byte output using the validator tree
-    /// authenticated at the Proposal's proof-base checkpoint.
+    /// Build the actual canonical 410-byte finalizer output plus the worker
+    /// reward tag from the exact planner witness artifacts, and verify the
+    /// reward-root binding R63 = H(A, H(root_reward, worker_tag)) against the
+    /// persisted finalizer reward root before anything is signed or submitted.
     async fn build_p2p_finalize_output(
         &self,
-        submission_header: &GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
-    ) -> anyhow::Result<([u8; 410], u64, [u8; 32])> {
-        let validator_user_id = self.p2p_validator_user_id.ok_or_else(|| {
-            anyhow::anyhow!(
-                "realm P2P enabled for realm {} but no validator_user_id was wired via set_realm_p2p",
-                self.db.state.realm_id_u64
-            )
-        })?;
-        let base_checkpoint_id = self
+        root_job_id: &QProvingJobDataID,
+        rewards_root: N::QHash,
+    ) -> anyhow::Result<([u8; 410], u64, [u8; 32], [u8; 32])> {
+        let unique_pending_id = self.db.state.processing_unique_pending_id;
+        let metadata = self
             .db
-            .db
-            .get_checkpoint_id_for_checkpoint_root_hash(submission_header.header.header.checkpoint_tree_root)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("GUTA checkpoint tree root has no canonical checkpoint ID"))?;
-        let proof_base_roots = self.db.db.get_checkpoint_global_state_roots(base_checkpoint_id).await?;
-        let validator_tree_root = proof_base_roots.validator_tree_root;
-        require_nonzero_validator_tree_root(&validator_tree_root.into_owned_32bytes())
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
-        let output = build_bound_finalize_output::<N>(
-            self.db.state.chain_id,
-            self.db.state.realm_id_u64 as u32,
-            self.db.state.realm_sub_id_u64 as u16,
-            validator_user_id,
-            validator_tree_root,
-            submission_header,
+            .temp_db
+            .get_proving_job_metadata(&self.db.state.realm_identifier, unique_pending_id, root_job_id.get_output_id())
+            .await?;
+        anyhow::ensure!(
+            metadata.dependencies.len() == 1,
+            "RealmFinalizeGUTA must have exactly the root GUTA child dependency"
         );
+        let root_guta_job_id = metadata.dependencies[0].clone();
+        let witness = self
+            .db
+            .temp_db
+            .get_tdb_proof_witness::<RealmFinalizeGUTAInput<N::F, N::QHash>>(
+                &self.db.state.realm_identifier,
+                unique_pending_id,
+                root_job_id.get_input_witness_id(),
+            )
+            .await?;
+        let root_guta_reward_tag = self
+            .db
+            .temp_db
+            .get_proof_miner_rewards_tree_value(
+                &self.db.state.realm_identifier,
+                unique_pending_id,
+                root_guta_job_id.get_output_id(),
+            )
+            .await?;
+        let worker_tag = self
+            .db
+            .temp_db
+            .get_proof_claim_tag(
+                &self.db.state.realm_identifier,
+                unique_pending_id,
+                root_job_id.get_input_witness_id(),
+            )
+            .await?;
+        let chain_domain =
+            realm_finalize_guta_chain_domain::<N::F, N::QHash, N::HasherBase>(self.db.state.chain_id);
+        let output = finalize_output_from_witness::<N::F, N::QHash, N::HasherBase>(
+            &witness,
+            chain_domain,
+            root_guta_reward_tag,
+        );
+        let reward_root63 = finalize_reward_root63::<N::F, N::QHash, N::HasherBase>(&output, &worker_tag);
+        anyhow::ensure!(
+            reward_root63 == rewards_root,
+            "Actual finalizer output does not bind the persisted reward root (A/R63 mismatch)"
+        );
+        let base_checkpoint_id = output.checkpoint_id.to_u64_value();
+        let validator_tree_root = output.validator_tree_root.into_owned_32bytes();
+        require_nonzero_validator_tree_root(&validator_tree_root)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
         Ok((
             protocol_encode_finalize_output(&output)?,
             base_checkpoint_id,
-            validator_tree_root.into_owned_32bytes(),
+            validator_tree_root,
+            worker_tag.into_owned_32bytes(),
         ))
     }
 }

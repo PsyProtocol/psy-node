@@ -1074,6 +1074,7 @@ mod tests2 {
         pgoldilocks::PoseidonHasher,
         utils::QPGenRandom,
     };
+    use std::collections::{HashMap, HashSet};
     use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
     use psy_data::{
         agg::
@@ -1108,145 +1109,104 @@ mod tests2 {
     }
 
     // Helper function to validate the tree structure programmatically
-    fn validate_tree_structure(layers: &[Vec<PsyProvingJobMetadataWithJobId<Hash, JobId>>], max_level: u8, num_leaves: usize) -> Result<()> {
-        // layers[0] is the leaves (highest level), layers[last] is the root (level 0)
-        if layers.len() != (max_level as usize) + 1 {
-            return Err(anyhow!("Incorrect number of layers: expected {}, got {}", max_level + 1, layers.len()));
-        }
+    fn validate_tree_structure(
+        layers: &[Vec<PsyProvingJobMetadataWithJobId<Hash, JobId>>],
+        expected_num_leaves: usize,
+        unique_id: u64,
+    ) -> Result<()> {
+        let mut key_to_info: HashMap<SimpleMerkleNodeKey, (JobId, u8, u16, Vec<JobId>)> = HashMap::new();
+        let mut leaf_count = 0;
 
-        // Check leaf layer
-        let leaf_layer = &layers[0];
-        if leaf_layer.len() != num_leaves {
-            return Err(anyhow!("Incorrect number of leaves: expected {}, got {}", num_leaves, leaf_layer.len()));
-        }
-        for (i, job) in leaf_layer.iter().enumerate() {
-            let _expected_key = SimpleMerkleNodeKey {
-                level: max_level,
-                index: i as u64,
-            };
-            if job.metadata.reward_tree_node_level != max_level {
-                return Err(anyhow!(
-                    "Leaf level mismatch: expected {}, got {}",
-                    max_level,
-                    job.metadata.reward_tree_node_level
-                ));
-            }
-            if job.metadata.reward_tree_node_index != i as u64 {
-                return Err(anyhow!(
-                    "Leaf index mismatch: expected {}, got {}",
-                    i,
-                    job.metadata.reward_tree_node_index
-                ));
-            }
-            if job.metadata.reward_tree_hash_mode != PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN {
-                return Err(anyhow!("Leaf hash mode incorrect"));
-            }
-            if !job.metadata.dependencies.is_empty() {
-                return Err(anyhow!("Leaf should have no dependencies"));
-            }
-            // Check job_id is leaf type
-            if job.job_id.circuit_type != ProvingJobCircuitType::AppendUserRegistrationTree {
-                return Err(anyhow!("Incorrect circuit type for leaf"));
-            }
-            if job.job_id.group_id != max_level as u32 {
-                return Err(anyhow!("Job level mismatch for leaf"));
-            }
-            if job.job_id.task_index != i as u32 {
-                return Err(anyhow!("Job index mismatch for leaf"));
-            }
-        }
-
-        // Check intermediate layers up to root
-        for layer_idx in 1..layers.len() {
-            let current_level = (max_level as usize - layer_idx) as u8;
-            let current_layer = &layers[layer_idx];
-            let child_layer = &layers[layer_idx - 1];
-
-            // Expected number of nodes: ceil(child_layer.len() / 2)
-            let expected_nodes = (child_layer.len() + 1) / 2;
-            if current_layer.len() != expected_nodes {
-                return Err(anyhow!(
-                    "Incorrect number of nodes at level {}: expected {}, got {}",
-                    current_level,
-                    expected_nodes,
-                    current_layer.len()
-                ));
-            }
-
-            for (i, job) in current_layer.iter().enumerate() {
-                let _expected_key = SimpleMerkleNodeKey {
-                    level: current_level,
-                    index: i as u64,
+        for layer in layers {
+            for item in layer {
+                let key = SimpleMerkleNodeKey {
+                    level: item.metadata.reward_tree_node_level,
+                    index: item.metadata.reward_tree_node_index,
                 };
-                if job.metadata.reward_tree_node_level != current_level {
-                    return Err(anyhow!(
-                        "Level mismatch: expected {}, got {}",
-                        current_level,
-                        job.metadata.reward_tree_node_level
-                    ));
-                }
-                if job.metadata.reward_tree_node_index != i as u64 {
-                    return Err(anyhow!("Index mismatch: expected {}, got {}", i, job.metadata.reward_tree_node_index));
-                }
-                if job.metadata.reward_tree_hash_mode != PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD {
-                    return Err(anyhow!("Agg hash mode incorrect"));
-                }
+                let hash_mode = item.metadata.reward_tree_hash_mode;
+                let num_children = item.metadata.reward_tree_node_children;
+                let deps = item.metadata.dependencies.clone();
+                key_to_info.insert(key, (item.job_id, hash_mode, num_children, deps));
 
-                // Check dependencies: should be 1 or 2 children
-                let left_child_idx = 2 * i;
-                let right_child_idx = left_child_idx + 1;
-                if left_child_idx >= child_layer.len() {
-                    return Err(anyhow!("Missing left child for node at level {}, index {}", current_level, i));
-                }
-                let left_child = &child_layer[left_child_idx];
-                let has_right = right_child_idx < child_layer.len();
-                if has_right {
-                    let right_child = &child_layer[right_child_idx];
-                    if job.metadata.dependencies != vec![left_child.job_id, right_child.job_id] {
-                        return Err(anyhow!("Dependency mismatch for node at level {}, index {}", current_level, i));
-                    }
-                    if job.metadata.reward_tree_node_children != 2 {
-                        return Err(anyhow!(
-                            "Num children mismatch: expected 2, got {}",
-                            job.metadata.reward_tree_node_children
-                        ));
-                    }
-                } else {
-                    if job.metadata.dependencies != vec![left_child.job_id] {
-                        return Err(anyhow!("Dependency mismatch for unbalanced node at level {}, index {}", current_level, i));
-                    }
-                    if job.metadata.reward_tree_node_children != 1 {
-                        return Err(anyhow!(
-                            "Num children mismatch: expected 1, got {}",
-                            job.metadata.reward_tree_node_children
-                        ));
-                    }
-                }
-
-                // Check job_id is agg type
-                if job.job_id.circuit_type != ProvingJobCircuitType::AppendUserRegistrationTreeAggregate {
-                    return Err(anyhow!("Incorrect circuit type for agg"));
-                }
-                if job.job_id.group_id != current_level as u32 {
-                    return Err(anyhow!("Job level mismatch for agg"));
-                }
-                if job.job_id.task_index != i as u32 {
-                    return Err(anyhow!("Job index mismatch for agg"));
+                if hash_mode == PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN {
+                    leaf_count += 1;
                 }
             }
         }
 
-        // Root should be at last layer, single node
-        let root_layer = &layers[layers.len() - 1];
-        if root_layer.len() != 1 {
-            return Err(anyhow!("Root layer should have exactly 1 node"));
+        assert_eq!(leaf_count, expected_num_leaves);
+
+        let root_key = SimpleMerkleNodeKey { level: 0, index: 0 };
+        let mut visited: HashSet<SimpleMerkleNodeKey> = HashSet::new();
+
+        fn recurse(
+            key: SimpleMerkleNodeKey,
+            key_to_info: &HashMap<SimpleMerkleNodeKey, (JobId, u8, u16, Vec<JobId>)>,
+            visited: &mut HashSet<SimpleMerkleNodeKey>,
+            unique_id: u64,
+        ) -> Result<()> {
+            if !visited.insert(key) {
+                return Err(anyhow!("Duplicate visit to key {:?}", key));
+            }
+
+            let Some(&(job_id, hash_mode, num_children, ref deps)) = key_to_info.get(&key) else {
+                return Err(anyhow!("Missing key {:?}", key));
+            };
+
+            if hash_mode == PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN {
+                assert_eq!(num_children, 0);
+                assert_eq!(deps.len(), 0);
+                assert_eq!(
+                    job_id,
+                    <AggRegisterUserHelper as BasicTreePlannerHelper<
+                        JobId,
+                        Hash,
+                        LeafWitness,
+                        AggStateTransitionInputV2<Hash>,
+                        DummyAggStateTransition<Hash>,
+                    >>::get_leaf_job_id(unique_id, key)
+                );
+            } else if hash_mode == PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD {
+                assert_eq!(num_children, 2);
+                assert_eq!(deps.len(), 2);
+                assert_eq!(
+                    job_id,
+                    <AggRegisterUserHelper as BasicTreePlannerHelper<
+                        JobId,
+                        Hash,
+                        LeafWitness,
+                        AggStateTransitionInputV2<Hash>,
+                        DummyAggStateTransition<Hash>,
+                    >>::get_agg_job_id(unique_id, key)
+                );
+
+                let left_key = SimpleMerkleNodeKey {
+                    level: key.level + 1,
+                    index: key.index * 2,
+                };
+                let right_key = SimpleMerkleNodeKey {
+                    level: key.level + 1,
+                    index: key.index * 2 + 1,
+                };
+
+                let left_info = key_to_info.get(&left_key).ok_or(anyhow!("Missing left child {:?}", left_key))?;
+                let right_info = key_to_info.get(&right_key).ok_or(anyhow!("Missing right child {:?}", right_key))?;
+
+                assert_eq!(deps[0], left_info.0);
+                assert_eq!(deps[1], right_info.0);
+
+                recurse(left_key, key_to_info, visited, unique_id)?;
+                recurse(right_key, key_to_info, visited, unique_id)?;
+            } else {
+                return Err(anyhow!("Unknown hash_mode {} for key {:?}", hash_mode, key));
+            }
+
+            Ok(())
         }
-        if root_layer[0].metadata.reward_tree_node_level != 0 {
-            return Err(anyhow!("Root level should be 0"));
-        }
-        if root_layer[0].metadata.reward_tree_node_index != 0 {
-            return Err(anyhow!("Root index should be 0"));
-        }
+
+        recurse(root_key, &key_to_info, &mut visited, unique_id)?;
+
+        assert_eq!(visited.len(), key_to_info.len(), "Not all nodes were visited");
 
         Ok(())
     }
@@ -1274,7 +1234,7 @@ mod tests2 {
         }
 
         // Programmatic validation
-        validate_tree_structure(&layers, max_level, num_leaves)?;
+        validate_tree_structure(&layers, num_leaves, unique_id)?;
 
         Ok(())
     }

@@ -50,14 +50,6 @@ where
     N::HasherBase: 'static + Send + Sync,
 {
     pub async fn set_new_unique_ids(&mut self, gathering_realm_end_root: Option<N::QHash>) -> anyhow::Result<()> {
-        println!(
-            "old_unique_pending_id: {}, old_proc_checkpoint_unique_id: {}",
-            self.state.processing_unique_pending_id, self.state.processing_proc_checkpoint_unique_id
-        );
-        println!(
-            "old_gathering_unique_pending_id: {}, old_gathering_proc_checkpoint_unique_id: {}",
-            self.state.gathering_unique_pending_id, self.state.gathering_proc_checkpoint_unique_id
-        );
         let (new_gathering_unique_pending_id, new_gathering_proc_checkpoint_unique_id) = self.db.inc_unique_pending_id(1).await?;
 
         // Ensure streams exist first
@@ -101,8 +93,8 @@ where
 
         self.state.finish_gathering(
             gathering_realm_end_root.unwrap_or(self.state.last_committed_realm_end_root),
-            self.checkpoint_tree_backup_manager.get_current_checkpoint_id_head(),
-            self.checkpoint_tree_backup_manager.get_current_checkpoint_tree_root_head(),
+            self.state.gathering_checkpoint_id,
+            self.state.gathering_checkpoint_root,
             new_gathering_unique_pending_id,
             new_gathering_proc_checkpoint_unique_id,
         )?;
@@ -123,14 +115,6 @@ where
             )
             .await?;
 
-        println!(
-            "new_unique_pending_id: {}, new_proc_checkpoint_unique_id: {}",
-            self.state.processing_unique_pending_id, self.state.processing_proc_checkpoint_unique_id
-        );
-        println!(
-            "new_gathering_unique_pending_id: {}, new_gathering_proc_checkpoint_unique_id: {}",
-            self.state.gathering_unique_pending_id, self.state.gathering_proc_checkpoint_unique_id
-        );
 
         Ok(())
     }

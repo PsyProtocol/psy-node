@@ -19,7 +19,6 @@ use psy_plonky2_circuits::{
     zk_verifier::PsyPlonky2ZKVerifier,
 };
 use plonky2::plonk::config::PoseidonGoldilocksConfig;
-use psy_common_circuit::circuits::traits::qstandard::QStandardCircuit as CommonQStandardCircuit;
 
 type C = PoseidonGoldilocksConfig;
 const D: usize = 2;
@@ -296,21 +295,8 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
     let (realm_sub_id, validator_user_id, bls_public_keys) =
         crate::node::realm_p2p::processor_validator_data(config, &genesis_data)?;
     let config = &config.clone().with_derived_realm_sub_id(realm_sub_id);
-    let zk_key_path = config.p2p_zk_key_path.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("realm finalization requires --p2p-zk-key")
-    })?;
-    let zk_key_text = std::fs::read_to_string(zk_key_path)
-        .map_err(|error| anyhow::anyhow!("failed to read ZK key {zk_key_path}: {error}"))?;
-    anyhow::ensure!(
-        zk_key_text.len() == 64 && zk_key_text.as_bytes().iter().all(u8::is_ascii_hexdigit),
-        "ZK key must contain exactly 64 hexadecimal characters with no whitespace"
-    );
-    let validator_zk_private_key = zk_key_text.parse::<parth_core::pgoldilocks::GoldilocksHashOut>()?;
     let rotation = psy_data::config::network_config::load_realm_rotation_config(config.network)?;
     let (circuit_library, circuit_manager) = psy_plonky2_circuits::circuit_library::get_plonky2_circuit_library_and_prover_for_network::<C, D>(config.network)?;
-    let signature_fingerprint = parth_core::pgoldilocks::QHashOut(
-        CommonQStandardCircuit::get_fingerprint(&circuit_manager.guta_circuits.zk_signature).0,
-    );
     drop(circuit_manager);
     let verifier = PsyPlonky2ZKVerifier::<C, D>::new(circuit_library);
 
@@ -392,8 +378,6 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
                 realm_identifier,
                 circuit_fingerprint_config,
                 Arc::new(coordinator_client),
-                validator_zk_private_key,
-                signature_fingerprint,
                 rotation.checkpoints_per_epoch,
             )
             .await?;
