@@ -411,6 +411,7 @@ async fn claim_withdrawal_chunks(
         already_claimed_count: 0,
         resolved_leaf_hashes: Vec::new(),
         failure_reasons: HashMap::new(),
+        deferrals: HashMap::new(),
     };
     let deployments_network = config
         .finalize
@@ -443,6 +444,7 @@ async fn claim_withdrawal_chunks(
     total.already_claimed_count += report.already_claimed_count;
     total.resolved_leaf_hashes.extend(report.resolved_leaf_hashes);
     total.failure_reasons.extend(report.failure_reasons);
+    total.deferrals.extend(report.deferrals);
 
     Ok(total)
 }

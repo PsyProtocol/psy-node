@@ -73,6 +73,12 @@ pub struct BatchWithdrawalsReport {
     pub resolved_leaf_hashes: Vec<String>,
     #[serde(default)]
     pub failure_reasons: HashMap<String, String>,
+    /// Withdrawals held back for a reason that resolves on its own, and that
+    /// therefore must not spend one of the claim's limited attempts. Today
+    /// that means waiting for bridge liquidity: the claim is correct, the
+    /// bridge simply cannot pay it yet.
+    #[serde(default)]
+    pub deferrals: HashMap<String, String>,
 }
 
 #[derive(Clone, Args)]
@@ -532,6 +538,7 @@ pub async fn submit_batch(
             already_claimed_count: 0,
             resolved_leaf_hashes: Vec::new(),
             failure_reasons: HashMap::new(),
+            deferrals: HashMap::new(),
         });
     }
 
@@ -556,6 +563,7 @@ pub async fn submit_batch(
     let mut already_claimed_count = 0usize;
     let mut resolved_leaf_hashes = Vec::new();
     let mut failure_reasons = HashMap::new();
+    let mut deferrals: HashMap<String, String> = HashMap::new();
     let mut bridge_erc20_liquidity_remaining: HashMap<Address, U256> = HashMap::new();
     if multicall3_address.is_some() || !deployments_network.is_empty() {
         let _ = (multicall3_address, deployments_network);
@@ -647,7 +655,7 @@ pub async fn submit_batch(
                     "bridge ERC20 liquidity insufficient for token {token_addr}: available={}, required={}",
                     *remaining, amount
                 );
-                failure_reasons.insert(w.leaf_hash.clone(), reason);
+                deferrals.insert(w.leaf_hash.clone(), reason);
                 tracing::warn!(
                     index = i,
                     recipient = %recipient_addr,
@@ -1012,6 +1020,7 @@ pub async fn submit_batch(
         already_claimed_count,
         resolved_leaf_hashes,
         failure_reasons,
+        deferrals,
     })
 }
 
