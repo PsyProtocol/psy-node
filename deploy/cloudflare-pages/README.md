@@ -17,7 +17,44 @@ Create one Pages project per deployed frontend:
 | `psy-privacy-bridge-demo-stg` | `psy-dapp/apps/bridge` | `pnpm run build` | `dist` |
 | `psy-explorer-stg` | `psy-dapp/apps/explorer` | `pnpm run build` | `dist` |
 | `psy-ide-stg` | `psy-dapp/apps/ide` | `pnpm run build` | `dist` |
-| `psy-config-stg` | generated locally from `deploy/gcp/config.env` | none | `dist/staging-config` |
+| `psy-config-stg` | Direct Upload; assembled locally, see below | none | `dist/staging-config` |
+
+### The staging config page
+
+The page's source is `psy-dapp/apps/config` — plain `index.html` + `styles.css`
++ `main.js`, no build step, versioned with the rest of the frontend. It used to
+be a heredoc inside `deploy-staging-config.sh`, and that is exactly how it was
+missed when the deployment went multi-chain: the script started writing an
+`l1_chains` array into `config.json` while the embedded copy of the page went
+on reading the single-chain `l1`/`contracts`/`tokens` fields, so `config-stg`
+kept showing only Sepolia long after BSC and Base were live.
+
+`deploy-staging-config.sh` now owns only data. It copies the page out of
+`psy-dapp/apps/config`, then writes the files that are specific to *this*
+deployment on top of it:
+
+| File | Owner | Why |
+| --- | --- | --- |
+| `index.html`, `styles.css`, `main.js`, icons | `psy-dapp/apps/config` | frontend, changes with the frontend |
+| `config.json` | deploy script | contract addresses and endpoints of the actual deployment |
+| `install-groth16-trust-setup.sh` | deploy script | embeds the published archive URL and its sha256 |
+| `_headers`, `robots.txt` | deploy script | hosting concerns |
+
+The page reads `config.json` at runtime, so what it shows is what was deployed
+rather than what the repo believes was deployed. It renders every entry in
+`l1_chains` behind a chain switcher, and falls back to the flat single-chain
+fields when `l1_chains` is absent.
+
+Point `PSY_CONFIG_PAGE_SRC` somewhere else to assemble from a different
+checkout of the page.
+
+This project is Direct Upload, not Git integration: a Pages project cannot be
+switched between the two after creation. Moving it to Git integration (so a
+push to psy-dapp redeploys the page the way it does for bridge/explorer) means
+creating a new Pages project with root directory `psy-dapp/apps/config`, no
+build command and output directory `.`, then moving the custom domain — and
+publishing `config.json` from the deploy script to a URL the page can reach,
+since a Git build cannot produce it.
 
 Dashboard flow:
 
