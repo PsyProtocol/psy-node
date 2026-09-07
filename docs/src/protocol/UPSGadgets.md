@@ -1,6 +1,6 @@
 # User Proving Session (UPS) Gadgets
 
-> Updated: 2026-09-03.
+> Updated: 2026-09-08. File paths and core LOC from local worktree (comments/tests excluded).
 
 ## Abstract
 
@@ -20,10 +20,11 @@ This document describes the gadgets used by local User Proving Session circuits 
 - [10. Partial Previous Step Verification Gadget](#10-verifypreviousupsstepproofinprooftreepartialfromcurrentgadget)
 - [11. End Cap Proof Tree Gadget](#11-upsendcapfromprooftreegadget)
 - [12. Start Step Gadget](#12-upsstartstepgadget)
+- [13. Start Step Register-User Gadget](#13-upsstartstepregisterusergadget)
 
 ## 1. `CorrectUPSHeaderHashesGadget`
 
-*   **File:** `correct_header_hashes_rs.txt`
+*   **File:** `client_prover/psy_circuit/psy_network_circuit/src/ups/gadgets/correct_header_hashes.rs:1-20` (core lines: 17)
 *   **Purpose:** A data structure gadget to hold potentially *modified* starting debt tree roots for a UPS step. Used when a transaction (like debt repayment) needs to alter the context *before* the main state delta logic of that same step runs.
 *   **Technical Function:** Stores `previous_step_deferred_tx_debt_tree_root` and `previous_step_inline_tx_debt_tree_root`. These values can override the corresponding roots from the actual previous step's header when passed into gadgets like `UPSCFCStandardStateDeltaGadget`.
 *   **Inputs/Witness:** Takes a reference to the previous step's `UserProvingSessionHeaderGadget`.
@@ -36,7 +37,7 @@ This document describes the gadgets used by local User Proving Session circuits 
 
 ## 2. `UPSVerifyCFCProofExistsAndValidGadget`
 
-*   **File:** `ups_cfc_verify_inclusion_rs.txt`
+*   **File:** `client_prover/psy_circuit/psy_network_circuit/src/ups/gadgets/ups_cfc_verify_inclusion.rs:1-142` (core lines: 101)
 *   **Purpose:** Verifies two critical aspects of a Contract Function Call (CFC) within a UPS: (1) That the ZK proof for the CFC execution exists and is valid within the user's current UPS proof tree, and (2) That the specific function being called is registered within the contract's definition on the blockchain (via checkpoint context).
 *   **Technical Function:** Combines proof attestation within the UPS tree with function inclusion verification against global contract state.
 *   **Inputs/Witness:**
@@ -62,7 +63,7 @@ This document describes the gadgets used by local User Proving Session circuits 
 
 ## 3. `UPSCFCStandardStateDeltaGadget`
 
-*   **File:** `ups_standard_cfc_state_delta_rs.txt`
+*   **File:** `client_prover/psy_circuit/psy_network_circuit/src/ups/gadgets/ups_standard_cfc_state_delta.rs:1-425` (core lines: 295)
 *   **Purpose:** Calculates the precise changes to the user's state (`UserProvingSessionHeader`) resulting from a single, standard CFC transaction. It enforces the consistency between the transaction's claimed effects (witnessed context) and the cryptographic updates to the relevant Merkle trees.
 *   **Technical Function:** Verifies delta/pivot proofs for state updates and computes the next header state.
 *   **Inputs/Witness:**
@@ -97,7 +98,7 @@ This document describes the gadgets used by local User Proving Session circuits 
 
 ## 4. `UPSVerifyCFCStandardStepGadget`
 
-*   **File:** `ups_cfc_standard_rs.txt`
+*   **File:** `client_prover/psy_circuit/psy_network_circuit/src/ups/gadgets/ups_cfc_standard.rs:1-145` (core lines: 114)
 *   **Purpose:** Encapsulates a complete, standard transaction processing step within UPS. It combines the verification of the CFC proof's existence and validity with the calculation and verification of the resulting state delta.
 *   **Technical Function:** Orchestrates `UPSVerifyCFCProofExistsAndValidGadget` and `UPSCFCStandardStateDeltaGadget`, connecting their inputs and outputs to ensure consistency.
 *   **Inputs/Witness:**
@@ -119,7 +120,7 @@ This document describes the gadgets used by local User Proving Session circuits 
 
 ## 5. `UPSVerifyPopDeferredTxStepGadget`
 
-*   **File:** `ups_cfc_standard_pop_deferred_tx_rs.txt`
+*   **File:** `client_prover/psy_circuit/psy_network_circuit/src/ups/gadgets/ups_cfc_standard_pop_deferred_tx.rs:1-139` (core lines: 112)
 *   **Purpose:** Handles transactions specifically designed to settle a previously incurred deferred transaction debt. It verifies the debt removal and then processes the corresponding CFC execution.
 *   **Technical Function:** Verifies a delta proof for removing an item from the deferred debt tree, checks its consistency with the CFC being executed, and then uses `UPSVerifyCFCStandardStepGadget` with a corrected starting context.
 *   **Inputs/Witness:**
@@ -141,7 +142,7 @@ This document describes the gadgets used by local User Proving Session circuits 
 
 ## 6. `PsyUserProvingSessionSignatureDataCompactGadget`
 
-*   **File:** `ups_signature_data_rs.txt`
+*   **File:** `client_prover/psy_circuit/psy_network_circuit/src/ups/gadgets/ups_signature_data.rs:1-132` (core lines: 120)
 *   **Purpose:** Defines the precise data structure that is cryptographically signed by the user to authorize the submission of their completed User Proving Session.
 *   **Technical Function:** Aggregates key state identifiers from the start and end of the UPS into a single, hashable structure, then combines it with context (network, user, nonce) for signing.
 *   **Inputs/Witness:** `start_user_leaf_hash`, `end_user_leaf_hash`, `checkpoint_leaf_hash`, `tx_stack_hash`, `tx_count`.
@@ -154,7 +155,7 @@ This document describes the gadgets used by local User Proving Session circuits 
 
 ## 7. `UPSEndCapResultCompactGadget`
 
-*   **File:** `ups_end_cap_result_rs.txt`
+*   **File:** `client_prover/psy_circuit/psy_network_circuit/src/ups/gadgets/ups_end_cap_result.rs:1-95` (core lines: 87)
 *   **Purpose:** Defines the minimal, verifiable summary of a completed UPS, intended for submission to the GUTA layer.
 *   **Technical Function:** A data structure containing the essential start/end state identifiers needed for aggregation.
 *   **Inputs/Witness:** `start_user_leaf_hash`, `end_user_leaf_hash`, `checkpoint_tree_root_hash`, `user_id`.
@@ -167,7 +168,7 @@ This document describes the gadgets used by local User Proving Session circuits 
 
 ## 8. `UPSEndCapCoreGadget`
 
-*   **File:** `ups_end_cap_rs.txt`
+*   **File:** `client_prover/psy_circuit/psy_network_circuit/src/ups/gadgets/ups_end_cap.rs:1-263` (core lines: 226)
 *   **Purpose:** Enforces the final set of critical constraints required to validly conclude a User Proving Session, linking the final state to the user's signature authorization.
 *   **Technical Function:** Verifies nonce progression, public key consistency, signature data correctness, checkpoint progression, empty debt trees, and computes final outputs (Result and Stats).
 *   **Inputs/Witness:**
@@ -192,7 +193,7 @@ This document describes the gadgets used by local User Proving Session circuits 
 
 ## 9. `VerifyPreviousUPSStepProofInProofTreeGadget`
 
-*   **File:** `verify_previous_ups_step_rs.txt`
+*   **File:** `client_prover/psy_circuit/psy_network_circuit/src/ups/gadgets/verify_previous_ups_step.rs:1-95` (core lines: 73)
 *   **Purpose:** Essential gadget for recursion within UPS. It verifies the ZK proof generated by the immediately preceding UPS step, ensuring the chain of proofs is unbroken and follows protocol rules.
 *   **Technical Function:** Verifies a proof (`AttestTreeAwareProofInTreeGadget`), checks its circuit fingerprint against a whitelist (`MerkleProofGadget`), and confirms its public inputs match the expected previous header state hash.
 *   **Inputs/Witness:**
@@ -213,7 +214,7 @@ This document describes the gadgets used by local User Proving Session circuits 
 
 ## 10. `VerifyPreviousUPSStepProofInProofTreePartialFromCurrentGadget`
 
-*   **File:** `verify_previous_ups_step_partial_from_current_rs.txt`
+*   **File:** `client_prover/psy_circuit/psy_network_circuit/src/ups/gadgets/verify_previous_ups_step_partial_from_current.rs:1-107` (core lines: 85)
 *   **Purpose:** An optimized version of the previous gadget, used when the `session_start_context` is constant within the verifying circuit (like the End Cap circuit). Reduces witness size.
 *   **Technical Function:** Similar to the full gadget, but reconstructs the `previous_step_header_gadget` internally using the known `session_start_context` (from `current_header` input) and only requiring the `previous_step_state` portion as witness.
 *   **Inputs/Witness:**
@@ -228,7 +229,7 @@ This document describes the gadgets used by local User Proving Session circuits 
 
 ## 11. `UPSEndCapFromProofTreeGadget`
 
-*   **File:** `ups_end_cap_tree_rs.txt`
+*   **File:** `client_prover/psy_circuit/psy_network_circuit/src/ups/gadgets/ups_end_cap_tree.rs:1-160` (core lines: 139)
 *   **Purpose:** Top-level gadget within the `UPSStandardEndCapCircuit`. Orchestrates the verification of the final UPS step, verification of the ZK signature, and enforcement of final session constraints.
 *   **Technical Function:** Instantiates and connects `VerifyPreviousUPSStepProofInProofTreeGadget` (often partial), `AttestProofInTreeGadget` (for signature), and `UPSEndCapCoreGadget`.
 *   **Inputs/Witness:**
@@ -246,7 +247,7 @@ This document describes the gadgets used by local User Proving Session circuits 
 
 ## 12. `UPSStartStepGadget`
 
-*   **File:** `ups_start_rs.txt`
+*   **File:** `client_prover/psy_circuit/psy_network_circuit/src/ups/gadgets/ups_start.rs:1-224` (core lines: 139)
 *   **Purpose:** Core logic for the `UPSStartSessionCircuit`. Verifies the user's provided initial state against the last finalized block's checkpoint data and initializes the session header.
 *   **Technical Function:** Verifies Merkle proofs linking the checkpoint leaf to the checkpoint root and the user leaf to the user tree root within that checkpoint. Ensures header consistency and correct initialization of session state (debt trees, counters).
 *   **Inputs/Witness:** `UPSStartStepInput` (header witness, checkpoint leaf/roots witness, checkpoint proof, user proof).
@@ -260,4 +261,23 @@ This document describes the gadgets used by local User Proving Session circuits 
     *   Verifies `current_state` initialization (updated `last_checkpoint_id`, empty debts, zero counts/stack).
 *   **Assumptions:** Assumes witness data is valid initially. Assumes empty tree root constants are correct.
 *   **Role:** Securely bootstraps the UPS, ensuring it starts from a globally valid and consistent state anchor.
+
+---
+
+## 13. `UPSStartStepRegisterUserGadget`
+
+*   **File:** `client_prover/psy_circuit/psy_network_circuit/src/ups/gadgets/ups_start_register_user.rs:1-284` (core lines: 175); circuit wrapper `ups/circuits/ups_start_register_user.rs` (core ~113)
+*   **Purpose:** Same bootstrap as `UPSStartStepGadget`, but for a **new** user: prove registration-tree membership, empty GUSR leaf, default user leaf fields.
+*   **Public Inputs:** Tree-aware hash of starting header over empty proof-tree root (separate UPS whitelist fingerprint from registered-user start).
+*   **Private Inputs / Witness:** As start, plus `user_registration_tree_proof`.
+*   **Constraints (pseudocode):**
+    ```
+    registration_proof.root == state_roots.user_registration_tree_root
+    registration_proof.value != ZERO
+    start_user_leaf uses DEFAULT_USER_STATE_TREE_ROOT; balance/nonce/… == 0
+    public_key == registration_proof.value
+    user_tree_proof.value == ZERO; index == user_id
+    // current_state empty debt/tx init as start
+    ```
+*   **Role:** Alternate start circuit for first-session register-user flows; EndCap may special-case start leaf hash when the session began via register-user.
 

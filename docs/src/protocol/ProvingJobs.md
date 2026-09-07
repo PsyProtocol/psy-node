@@ -58,22 +58,21 @@ User EndCap proofs (submitted to realm edge)
 Realm GUTA aggregation tree
   (GUTAVerifySingleEndCap / TwoEndCap / TwoGUTA / linear+upgrade variants)
         |
-        +--> WrappedSignatureProof (64)  -- proved LOCALLY on the realm processor
-        |                                 (validator ZK private key never leaves the processor)
         v
-RealmFinalizeGUTA (63)  -- proved by psy_worker_cli; depends on root GUTA + WrappedSignatureProof
+RealmFinalizeGUTA (63)  -- proved by psy_worker_cli; root GUTA + validator-tree/fee constraints
         |
         v
 P2P Proposal / Votes / Certificate --> Coordinator psy_submit_guta(..., proposal, certificate)
 ```
+
+> **Currency (2026-09-08, local):** Circuit 63 no longer verifies a child `WrappedSignatureProof` (64). Wallet-signature fingerprint derivation was removed with the BLS auth cutover (`realm_finalize_guta.rs` comment at the fee/public-key section). Authorization for submission is the realm processor BLS vote + Coordinator certificate verification off-circuit; validator-tree membership and fee math remain in-circuit. Type 64 is absent from `cached_circuit_library` in this worktree. Older docs that still say “63 depends on 64” are stale.
 
 ### Realm root circuit details
 
 | Circuit | Type u32 | Who proves | Role |
 |---------|----------|------------|------|
 | User EndCap family | see job_id.rs | user / prove-proxy | Leaf transitions into realm GUTA |
-| GUTA aggregation variants | 8–13, 55–60, … | `psy_worker_cli` | Aggregate EndCaps / GUTAs |
-| WrappedSignatureProof | 64 | **Realm processor (local)** | Signs RealmFinalize action; private key stays local |
+| GUTA aggregation variants | live cache: 7,8,10,11,13,15,55–59 (not 9/12/14/60/64) | `psy_worker_cli` | Aggregate EndCaps / GUTAs |
 | RealmFinalizeGUTA | 63 | `psy_worker_cli` | Realm root submitted with P2P Proposal+Certificate |
 
 Witness construction for finalization is `RealmGUTAPlanner::append_realm_finalize_guta` (`psy_node_common/src/guta_planner/realm_guta_planner.rs`). Circuit implementation: `psy_plonky2_circuits/src/guta_v2/circuits/realm_finalize_guta.rs`.
@@ -159,7 +158,9 @@ graph TB
 
 ## 4. Global User Tree Aggregator Circuit Variants
 
-The GUTA (Global User Tree Aggregator) has multiple circuit variants to handle different scenarios:
+The GUTA (Global User Tree Aggregator) has multiple circuit variants to handle different scenarios.
+
+> **Live set (2026-09-08, `cached_circuit_library`):** `GUTATwoEndCap`(7), `GUTATwoGUTA`(8), `GUTALeftGUTARightEndCap`(10), `GUTASingleEndCap`(11), `GUTAVerifyToCap`(13), `GUTANoChange`(15), checkpoint/linear/LLRV upgrades (55–59), `RealmFinalizeGUTA`(63). **Absent from cache / not constructed by `QEDGUTACircuitManager`:** `GUTALeftEndCapRightGUTA`(9), `GUTARegisterUsers`(12), `GUTAOnlyRegisterUsers`(14), `GUTAVerifyLeftLeafRightLinearUpgradeCheckpoint`(60), `WrappedSignatureProof`(64). User registration is coordinator `BatchAppendUserRegistrationTree`, not a GUTA register circuit.
 
 ### GUTA Circuit Types and Usage
 
@@ -167,35 +168,34 @@ The GUTA (Global User Tree Aggregator) has multiple circuit variants to handle d
 graph LR
     subgraph "Leaf Circuits (No Child Proofs)"
         GNC[GUTANoChange<br/>No state changes]
-        GSE[GUTASingleEndCap<br/>Single realm update]
-        GOR[GUTAOnlyRegisterUsers<br/>Only user registrations]
-        GRU[GUTARegisterUsers<br/>With user ops]
+        GSE[GUTASingleEndCap<br/>Single EndCap]
     end
 
     subgraph "Two Children Aggregation"
         GTG[GUTATwoGUTA<br/>Two GUTA proofs]
         GTE[GUTATwoEndCap<br/>Two EndCap proofs]
         GLR[GUTALeftGUTARightEndCap<br/>GUTA + EndCap]
-        GLE[GUTALeftEndCapRightGUTA<br/>EndCap + GUTA]
     end
 
     subgraph "Special Purpose"
         GVC[GUTAVerifyToCap<br/>Verify to tree cap]
+        GLIN[GUTATwoGUTALinear<br/>+ upgrade / LLRV variants]
+        GRF[RealmFinalizeGUTA<br/>type 63]
     end
 ```
 
-### GUTA Circuit Details
-
 ### Additional GUTA Circuits
 
-**Other GUTA circuits** (also 15 inputs, same layout):
+**Other live GUTA circuits** (also 15 inputs / rewards-header PI form — see [GUTAV2Circuits.md](./GUTAV2Circuits.md)):
 - `GUTANoChange`: No state changes
 - `GUTATwoEndCap`: Aggregate two EndCap proofs
 - `GUTAVerifyToCap`: Verify GUTA to tree cap
-- `GUTATwoGUTAWithCheckpointUpgrade`: Two GUTA with checkpoint upgrade
-- `GUTAVerifyToCapWithCheckpointUpgrade`: Verify to cap with checkpoint upgrade
+- `GUTATwoGUTALinear` / `GUTATwoGUTALinearUpgradeCheckpoint`
+- `GUTATwoGUTAWithCheckpointUpgrade` / `GUTAVerifyToCapWithCheckpointUpgrade`
+- `GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint`
+- `RealmFinalizeGUTA`: Realm root (type 63)
 
-All follow the same commitment calculation rules based on their dependency count.
+All follow the same commitment / rewards-tag calculation rules based on their dependency count (see §1 and reward-tree docs).
 
 ## 5. State Part 1
 
@@ -288,13 +288,13 @@ The commitment calculation follows a consistent pattern across all circuits:
 ```rust
 commitment = worker_public_key
 ```
-Examples: GUTANoChange, GUTAOnlyRegisterUsers, BatchDeployContracts, AppendUserRegistrationTree
+Examples: GUTANoChange, BatchDeployContracts, AppendUserRegistrationTree
 
 ### 2. Single Dependency Circuits (One Child Proof)
 ```rust
 commitment = hash(child.commitment, worker_public_key)
 ```
-Examples: GUTASingleEndCap, GUTARegisterUsers, GUTAVerifyToCap, GUTAVerifyToCapWithCheckpointUpgrade
+Examples: GUTASingleEndCap, GUTAVerifyToCap, GUTAVerifyToCapWithCheckpointUpgrade
 
 ### 3. Two Dependencies Circuits (Two Child Proofs)
 ```rust
@@ -338,14 +338,15 @@ Examples: GUTATwoGUTA, GUTATwoGUTAWithCheckpointUpgrade, GUTATwoEndCap, GUTALeft
 
 ### GUTA Core Circuits (15 inputs)
 
+Live rows only (enum leftovers 9/12/14 omitted — see §4 currency note).
+
 | Circuit | Type | Dependencies | Commitment Calculation |
 |---------|------|----------|------------------------|
-| **GUTAOnlyRegisterUsers** | Leaf | None | `commitment = hash(0, 0)` |
 | **GUTASingleEndCap** | Leaf | 1 EndCap | `commitment = hash(0, 0)` |
-| **GUTARegisterUsers** | Leaf | 1 GUTA | `commitment = hash(0, 0)` |
+| **GUTANoChange** | Leaf | None | `commitment = hash(0, 0)` |
 | **GUTATwoGUTA** | Aggregation | 2 GUTA | `commitment = hash(hash(left.commit, left.worker), hash(right.commit, right.worker))` |
+| **GUTATwoEndCap** | Aggregation | 2 EndCap | `commitment = hash(hash(left.commit, left.worker), hash(right.commit, right.worker))` |
 | **GUTALeftGUTARightEndCap** | Mixed | 1 GUTA + 1 EndCap | `commitment = hash(hash(left.commit, left.worker), hash(right.commit, right.worker))` |
-| **GUTALeftEndCapRightGUTA** | Mixed | 1 EndCap + 1 GUTA | `commitment = hash(hash(left.commit, left.worker), hash(right.commit, right.worker))` |
 
 **Public Inputs Layout (15 total)**:
 - `[0..4]`: commitment

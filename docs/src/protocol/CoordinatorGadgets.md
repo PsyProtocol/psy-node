@@ -1,6 +1,6 @@
 # Coordinator Gadgets
 
-> Updated: 2026-09-03.
+> Updated: 2026-09-08. File paths and core LOC from local worktree.
 
 ## Abstract
 
@@ -15,10 +15,11 @@ This document describes the gadgets used by Coordinator circuits to batch regist
 - [5. State Delta Result Gadget](#5-psypart1statedeltaresultgadget)
 - [6. Child Proof Gadget](#6-checkpointstatetransitionchildproofsgadget)
 - [7. State Transition Core Gadget](#7-checkpointstatetransitioncoregadget)
+- [8. Batch Update Contracts Gadget](#8-batchupdatecontractsgadget)
 
 ## 1. `BatchAppendUserRegistrationTreeGadget`
 
-*   **File:** `append_user_registration_tree.rs` (Gadget definition)
+*   **File:** `psy_plonky2_circuits/src/coordinator/gadgets/append_user_registration_tree.rs:18-94` (core lines: 80)
 *   **Purpose:** Aggregates multiple "Spiderman" append proofs sequentially for the User Registration Tree (`URT`). Handles padding for a fixed maximum number of sub-tree appends.
 *   **Key Inputs/Witness:**
     *   `user_registration_tree_height`, `batch_sub_tree_height`, `max_sub_trees`: Parameters.
@@ -35,7 +36,7 @@ This document describes the gadgets used by Coordinator circuits to batch regist
 
 ## 2. `BatchDeployContractsGadget`
 
-*   **File:** `deploy_contract.rs` (Gadget definition)
+*   **File:** `psy_plonky2_circuits/src/coordinator/gadgets/deploy_contract.rs:17-71` (core lines: 57). V2 typed path: `deploy_contract_v2.rs` (core ~402).
 *   **Purpose:** Handles the proof logic for appending a batch of new contracts to the Global Contract Tree (`GCON`). Verifies one Spiderman append proof and ensures the provided contract leaf data matches the appended hashes.
 *   **Key Inputs/Witness:**
     *   `contract_tree_height`, `batch_sub_tree_height`: Parameters.
@@ -55,7 +56,7 @@ This document describes the gadgets used by Coordinator circuits to batch regist
 
 ## 3. `VerifyAggUserRegistartionDeployContractsGUTAHeaderGadget`
 
-*   **File:** `verify_agg_user_registration_deploy_guta.rs`
+*   **File:** `psy_plonky2_circuits/src/coordinator/gadgets/verify_agg_user_registration_deploy_guta.rs` (header ~26-167; verify gadget ~172-261; core ~309). Part-1 also verifies update-contracts and chains deploy→update on GCON.
 *   **Purpose:** Represents the combined state transitions resulting from aggregating User Registrations, Contract Deployments, and GUTA proofs. Acts as the core data structure within the Part 1 Aggregation circuit.
 *   **Key Inputs/Witness:** (Typically derived from verified sub-proofs)
     *   `user_registration_tree_delta`: `AggStateTransitionGadget` for `URT`.
@@ -69,7 +70,7 @@ This document describes the gadgets used by Coordinator circuits to batch regist
 
 ## 4. `VerifyAggUserRegistartionDeployContractsGUTAGadget`
 
-*   **File:** `verify_agg_user_registration_deploy_guta.rs`
+*   **File:** `psy_plonky2_circuits/src/coordinator/gadgets/verify_agg_user_registration_deploy_guta.rs:172-261` (core included in ~309)
 *   **Purpose:** The core gadget within the Part 1 Aggregation circuit. Verifies the aggregated proofs for User Registrations, Contract Deployments, and GUTA, ensuring they are valid, used whitelisted circuits, and reference the same checkpoint state.
 *   **Key Inputs/Witness:**
     *   Parameters and configuration for verifying each of the three input proofs (common data, whitelist/fingerprint configs, GUTA params).
@@ -89,7 +90,7 @@ This document describes the gadgets used by Coordinator circuits to batch regist
 
 ## 5. `PsyPart1StateDeltaResultGadget`
 
-*   **File:** `checkpoint_state_transition_proofs.rs`
+*   **File:** `psy_plonky2_circuits/src/coordinator/gadgets/checkpoint_state_transition_proofs.rs` (`QEDPart1StateDeltaResultGadget` ~35-155; child proofs ~160-212; core ~221). Docs name `PsyPart1…` maps to source `QEDPart1…`.
 *   **Purpose:** Takes the verified combined header from the Part 1 aggregation (`VerifyAggUserRegistartionDeployContractsGUTAHeaderGadget`) and combines it with previous block stats and new block info (time, randomness) to calculate the *new* Checkpoint Leaf state.
 *   **Key Inputs/Witness:**
     *   `part_1_header`: Output from the Part 1 aggregation gadget.
@@ -111,7 +112,7 @@ This document describes the gadgets used by Coordinator circuits to batch regist
 
 ## 6. `CheckpointStateTransitionChildProofsGadget`
 
-*   **File:** `checkpoint_state_transition_proofs.rs`
+*   **File:** `psy_plonky2_circuits/src/coordinator/gadgets/checkpoint_state_transition_proofs.rs:160-212`
 *   **Purpose:** Verifies the "Part 1" aggregation proof within the final block circuit and instantiates the gadget (`PsyPart1StateDeltaResultGadget`) that calculates the Checkpoint Leaf transition.
 *   **Key Inputs/Witness:**
     *   Parameters for verifying the Part 1 proof (common data, cap height, known fingerprint).
@@ -130,7 +131,7 @@ This document describes the gadgets used by Coordinator circuits to batch regist
 
 ## 7. `CheckpointStateTransitionCoreGadget`
 
-*   **File:** `checkpoint_state_transition.rs`
+*   **File:** `psy_plonky2_circuits/src/coordinator/gadgets/checkpoint_state_transition.rs:197-255` (core ~234 file)
 *   **Purpose:** Handles the core Merkle proof logic for updating the Checkpoint Tree (`CHKP`) itself. Verifies the append operation for the new checkpoint leaf and its consistency with the previous checkpoint leaf.
 *   **Key Inputs/Witness:**
     *   `checkpoint_tree_height`: Parameter.
@@ -146,3 +147,20 @@ This document describes the gadgets used by Coordinator circuits to batch regist
     *   Asserts `append_checkpoint_tree_proof.index` == `previous_checkpoint_proof.index + 1`.
 *   **Assumptions:** Assumes witness Merkle proofs are valid initially.
 *   **Role:** Enforces the append-only nature and sequential integrity of the main Checkpoint Tree, linking the current block's update directly to the previous block's verified state.
+
+---
+
+## 8. `BatchUpdateContractsGadget`
+
+*   **File:** `psy_plonky2_circuits/src/coordinator/gadgets/update_contract.rs` (core lines: ~263); circuit `.../circuits/batch_update_contract.rs` (core ~219)
+*   **Purpose:** Layout-aware contract code/layout updates via Spiderman overwrite + per-slot verified layout-append proofs. Included in Part-1 aggregation (deploy.end must equal update.start).
+*   **Public Inputs (circuit):** `compute_agg_state_trackable_final_public_inputs_leaf(whitelist, H2(old_root,new_root), worker_reward_tag)` → 4 felts
+*   **Private Inputs / Witness:** Spiderman overwrite proof; old/new V2 leaves; layout proofs; contract IDs; whitelist; worker tag
+*   **Constraints (pseudocode):**
+    ```
+    for each window slot if updated:
+      Poseidon(old/new leaf) == spiderman old/new leaves
+      verify layout proof; bind layout roots/counts to V2 leaf fields
+    else contract_id = 0
+    ```
+*   **Role:** Contract update batch leaf in the coordinator proving DAG; feeds Part-1 GCON end root.

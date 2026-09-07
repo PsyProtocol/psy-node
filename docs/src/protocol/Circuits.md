@@ -1,9 +1,9 @@
 # Psy Circuit Flow
 
-> **Currency note (2026-09):** Realm root proving uses `RealmFinalizeGUTA` (circuit type 63) plus a locally proved `WrappedSignatureProof` (64), then P2P Proposal/Certificate before Coordinator `psy_submit_guta`. See `docs/src/protocol/ProvingJobs.md` §2. Gadget names ending in `V2` are the current Plonky2 implementations.
+> **Currency note (2026-09-08):** Realm root proving uses `RealmFinalizeGUTA` (63), then P2P Proposal/Certificate before Coordinator `psy_submit_guta`. **No** in-circuit `WrappedSignatureProof` (64) after the BLS auth cutover — see [ProvingJobs.md](./ProvingJobs.md) §2 and [GUTAV2Circuits.md](./GUTAV2Circuits.md). Bridge and privacy: [BridgeCircuits.md](./BridgeCircuits.md), [PrivacyCircuits.md](./PrivacyCircuits.md). V2 gadget names are current.
 
 
-> Updated: 2026-09-03.
+> Updated: 2026-09-08.
 
 ## Abstract
 
@@ -88,86 +88,51 @@ This phase happens locally on the user's device (or via a delegated prover). The
 
 ## 2. Global User Tree Aggregation: Parallel Network Execution
 
-The Decentralized Proving Network (DPN) takes End Cap proofs (and potentially other GUTA proofs like user registrations) from many users and aggregates them in parallel. This involves specialized GUTA circuits.
+The realm and coordinator proving network take End Cap proofs from many users and aggregate them. Live circuit names and types are in [ProvingJobs.md](./ProvingJobs.md) and [GUTAV2Circuits.md](./GUTAV2Circuits.md). The following are **not** hypothetical.
 
-*(Note: The provided files focus heavily on UPS and GUTA *gadgets*. The exact structure of the GUTA circuits using these gadgets is inferred but follows standard recursive proof aggregation patterns.)*
+**5. `GUTAVerifySingleEndCapCircuitV2` / `GUTAVerifyTwoEndCapCircuitV2`**
 
-**Example GUTA Circuits (Inferred):**
+*   **Purpose:** Ingest one or two verified End Cap proofs into the GUTA hierarchy (SVH / DVH).
+*   **Core Logic:** `VerifyEndCapProofGadget` + `SingleVariableHeightStateTransitionGadget` or `DualVariableHeightStateTransitionGadget`.
+*   **What it Proves:** End Cap validity + fingerprint; historical checkpoint; combined GUSR leaf transition(s) and stats under a shared whitelist.
+*   **Public Inputs:** `H2(header_hash, rewards_tree_value)` (4 felts).
+*   **Contribution to Horizontal Scalability:** Independent End Cap admission and parallel leaf aggregation.
 
-**5. `GUTAProcessEndCapCircuit` (Hypothetical)**
+**6. User registration (live)**
 
-*   **Purpose:** To take a user's validated `UPSStandardEndCapCircuit` proof and integrate its state change into the GUTA proof hierarchy.
-*   **Core Logic:** Uses `VerifyEndCapProofGadget`.
-*   **What it Proves:**
-    *   The End Cap proof is valid and used the correct circuit (`known_end_cap_fingerprint_hash`).
-    *   The `checkpoint_tree_root` claimed by the user in the End Cap result existed historically.
-    *   Outputs a standard `GlobalUserTreeAggregatorHeader` representing the user's `GUSR` tree state transition (start leaf hash -> end leaf hash at the user's ID index) and stats.
-*   **Assumptions:**
-    *   Witness (End Cap proof, result, stats, historical proof) is correct initially.
-    *   The `known_end_cap_fingerprint_hash` constant is correct.
-    *   A `default_guta_circuit_whitelist` root is provided or known.
-*   **How Assumptions are Discharged:** Verifies the End Cap proof and historical checkpoint proof. Packages the result into a standard GUTA header. The assumption about the `default_guta_circuit_whitelist` is passed upwards. The assumption about the *current* `checkpoint_tree_root` (from the historical proof) is passed upwards.
-*   **Contribution to Horizontal Scalability:** Allows individual user session results to be verified independently and prepared for parallel aggregation.
-*   **High-Level Functionality:** Validates and incorporates user end-of-session proofs into the global aggregation process.
+*   **Live circuit:** `BatchAppendUserRegistrationTree` (coordinator), not a GUTA-named `GUTARegisterUserCircuit`.
+*   **Core Logic:** `BatchAppendUserRegistrationTreeGadget` / Spiderman appends on URT.
+*   See [CoordinatorGadgets.md](./CoordinatorGadgets.md).
 
-**6. `GUTARegisterUserCircuit` (Hypothetical)**
+**7. `GUTAVerifyTwoGUTACircuitV2` and siblings**
 
-*   **Purpose:** To process the registration of one or more new users.
-*   **Core Logic:** Uses `GUTAOnlyRegisterUsersGadget` (which uses `GUTARegisterUsersGadget`, `GUTARegisterUserFullGadget`, `GUTARegisterUserCoreGadget`).
-*   **What it Proves:**
-    *   For each registered user, their `public_key` was correctly inserted at their `user_id` index in the `GUSR` tree (transitioning from zero hash to the new user leaf hash).
-    *   The `public_key` used matches an entry in the `user_registration_tree_root`.
-    *   Outputs a `GlobalUserTreeAggregatorHeader` representing the aggregate `GUSR` state transition for all registered users, with zero stats.
-*   **Assumptions:**
-    *   Witness (registration proofs, user count) is correct initially.
-    *   `guta_circuit_whitelist` and `checkpoint_tree_root` inputs are correct for this context.
-    *   `default_user_state_tree_root` constant is correct.
-*   **How Assumptions are Discharged:** Verifies delta proofs for `GUSR` insertion and Merkle proofs against the registration tree. Outputs a standard GUTA header, passing assumptions about whitelist/checkpoint upwards.
-*   **Contribution to Horizontal Scalability:** User registration can be batched and potentially processed in parallel branches of the GUTA tree.
-*   **High-Level Functionality:** Securely adds new users to the system state.
+*   **Purpose:** Combine lower-level GUTA proofs (TwoGUTA, Linear, LeftGUTA+RightEndCap, checkpoint-upgrade variants).
+*   **Core Logic:** `VerifyGUTAProofGadget` + DVH / Linear / LLRV transitions.
+*   **What it Proves:** Child proofs valid and whitelisted; combined state transition and stats under one checkpoint/whitelist.
+*   **Role:** Parallel MapReduce-style aggregation across realms.
 
-**7. `GUTAAggregationCircuit` (Hypothetical - Multiple Variants)**
+**8. `GUTANoChangeCircuit` / `GUTANoChangeGadget`**
 
-*   **Purpose:** To combine the results (headers) from two or more lower-level GUTA proofs (which could be End Cap results, registrations, or previous aggregations).
-*   **Core Logic:**
-    *   Verifies each input GUTA proof using `VerifyGUTAProofGadget`.
-    *   Ensures all input proofs used circuits from the same `guta_circuit_whitelist` and reference the same `checkpoint_tree_root`.
-    *   Combines the `state_transition`s from the input proofs:
-        *   If transitions are on different branches, uses `TwoNCAStateTransitionGadget` with an NCA proof.
-        *   If transitions are on the same branch (e.g., one input is a line proof output), connects them directly (`old_root` of current matches `new_root` of previous).
-        *   If only one input, uses `GUTAHeaderLineProofGadget` to propagate upwards.
-    *   Combines the `stats` from input proofs using `GUTAStatsGadget.combine_with`.
-    *   Outputs a single `GlobalUserTreeAggregatorHeader` representing the combined state transition and stats.
-*   **What it Proves:** That given valid input GUTA proofs operating under the same whitelist and checkpoint context, the combined state transition and stats represented by the output header are correct.
-*   **Assumptions:**
-    *   Witness (input proofs, headers, NCA/sibling proofs) is correct initially.
-*   **How Assumptions are Discharged:** Verifies input proofs and their headers. Verifies the logic of combining state transitions (NCA/Line/Direct). Passes the common whitelist/checkpoint root assumptions upwards.
-*   **Contribution to Horizontal Scalability:** This is the core of parallel aggregation. Multiple instances of this circuit run concurrently across the DPN, merging proof branches in a tree structure (like MapReduce).
-*   **High-Level Functionality:** Securely and recursively combines verified state changes from multiple sources into larger, aggregated proofs.
+*   **Purpose:** Advance checkpoint context with a no-op GUSR transition.
+*   **Core Logic:** [RealmGUTAGadgets.md](./RealmGUTAGadgets.md) §8.
 
-**8. `GUTANoChangeCircuit` (Hypothetical)**
+**8b. `RealmFinalizeGUTACircuit` (type 63)**
 
-*   **Purpose:** To handle cases where no user state changed but the checkpoint advanced.
-*   **Core Logic:** Uses `GUTANoChangeGadget`.
-*   **What it Proves:** That given a new `checkpoint_leaf` verified to be in the `checkpoint_tree_proof`, the `GUSR` tree root remains unchanged, and stats are zero. Outputs a GUTA header reflecting this.
-*   **Assumptions:** Witness (checkpoint proof, leaf) is correct initially. Input `guta_circuit_whitelist` is correct.
-*   **How Assumptions are Discharged:** Verifies checkpoint proof. Outputs a standard GUTA header passing assumptions upward.
-*   **Contribution to Horizontal Scalability:** Allows the aggregation process to stay synchronized with the checkpoint tree even during periods of inactivity for certain state trees.
-*   **High-Level Functionality:** Advances the aggregated checkpoint state reference.
+*   **Purpose:** Finalize realm root GUTA with rotation/validator/fee constraints; submit with P2P cert.
+*   **Details:** [GUTAV2Circuits.md](./GUTAV2Circuits.md) §5.
 
 ## 3. Final Block Proof
 
-**9. Checkpoint Tree "Block" Circuit (Top-Level Aggregation)**
+**9. `CheckpointStateTransition` (type 32) + Part-1 `AggUserRegisterDeployContractsGUTA` (type 40)**
 
-*   **Purpose:** The final aggregation circuit that combines proofs from the roots of all major state trees (like `GUSR` via the top-level GUTA proof, `GCON`, etc.) for the block.
-*   **Core Logic:**
-    *   Verifies the top-level GUTA proof (and proofs for other top-level trees if applicable).
-    *   Takes the *previous block's* finalized `CHKP` root as a public input.
-    *   Constructs the new `CHKP` leaf based on the newly computed roots of `GUSR`, `GCON`, etc., and other block metadata.
-    *   Computes the new `CHKP` root.
-    *   The *only* external assumption verified here is that the input `previous_block_chkp_root` matches the actual finalized root of the last block.
-*   **What it Proves:** That the entire state transition for the block, represented by the change from the `previous_block_chkp_root` to the `new_chkp_root`, is valid, having recursively verified all constituent user transactions and aggregations according to protocol rules and circuit whitelists.
-*   **Assumptions:** The *only* remaining input assumption is the hash of the previous block's `CHKP` root.
-*   **How Assumptions are Discharged:** All assumptions from lower levels (circuit whitelists, internal state consistencies) have been verified recursively. The final link to the previous block state is checked against the public input.
-*   **Contribution to Horizontal Scalability:** Represents the culmination of the massively parallel aggregation process, producing a single, succinct proof for the entire block's validity.
-*   **High-Level Functionality:** Creates the final, verifiable proof of state transition for the entire block, linking it cryptographically to the previous block. This proof can be efficiently verified by any node or light client.
+*   **Purpose:** Combine register / deploy / update / GUTA roots into a new checkpoint leaf and append to CHKP.
+*   **Core Logic:** [CoordinatorGadgets.md](./CoordinatorGadgets.md); job graph in [ProvingJobs.md](./ProvingJobs.md).
+*   **What it Proves:** Contiguous checkpoint append; Part-1 child proofs; previous CHKP continuity.
+*   **Assumptions remaining:** Previous checkpoint root (consensus / bridge).
+*   **High-Level Functionality:** Final verifiable block state transition.
+
+## 4. Bridge and privacy (client / relayer)
+
+* Deposit append / withdrawal claim / BridgeAgg Chain→Final→Wrap: [BridgeCircuits.md](./BridgeCircuits.md)
+* Shield deposit claim / private note inclusion: [PrivacyCircuits.md](./PrivacyCircuits.md)
+* Shared Merkle primitives: [CommonMerkleGadgets.md](./CommonMerkleGadgets.md)

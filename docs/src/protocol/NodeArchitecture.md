@@ -145,7 +145,7 @@ The network takes potentially millions of End Cap proofs and efficiently aggrega
     *   **Function:**
         1.  Receive End Cap proofs from users within their range.
         2.  Verify these proofs using circuits like `GUTAVerifySingleEndCapCircuit` (for individual proofs) or `GUTAVerifyTwoEndCapCircuit` (for pairs). These circuits use the `VerifyEndCapProofGadget` internally to check the End Cap proof validity, fingerprint, and historical checkpoint link, outputting a standardized `GlobalUserTreeAggregatorHeader`.
-        3.  Recursively aggregate the resulting GUTA headers using circuits like `GUTAVerifyTwoGUTACircuit`, `GUTAVerifyLeftGUTARightEndCapCircuit`, or `GUTAVerifyLeftEndCapRightGUTACircuit`. These employ `VerifyGUTAProofGadget` to check sub-proofs and `TwoNCAStateTransitionGadget` (or line proof logic) to combine state transitions.
+> **Currency note (2026-09-08):** Prefer live circuit names in [ProvingJobs.md](./ProvingJobs.md) / [GUTAV2Circuits.md](./GUTAV2Circuits.md). Aggregation merge gadget is `DualVariableHeightStateTransitionGadget` (not `TwoNCAStateTransitionGadget`).
         4.  If necessary, use `GUTAVerifyGUTAToCapCircuit` (which uses `VerifyGUTAProofToLineGadget`) to bring a proof up to the Realm's root level.
         5.  Handle periods of inactivity using `GUTANoChangeCircuit`.
         6.  Submit the final aggregated GUTA proof for their user segment (representing the net change at the Realm's root node in `GUSR`) to the Coordinator layer.

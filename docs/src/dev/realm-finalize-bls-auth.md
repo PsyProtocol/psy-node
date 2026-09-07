@@ -2,7 +2,9 @@
 
 > Internal developer documentation — repository-only. Not part of the published mdBook (SUMMARY.md).
 
-> Draft: 2026-09-07. Status: Draft.
+> Draft: 2026-09-07. Status: Draft (design).
+> **Currency (2026-09-08, local circuit):** Circuit 63 source already removed wallet-signature fingerprint derivation (`realm_finalize_guta.rs` fee/public-key section). Type 64 is absent from `cached_circuit_library` in this worktree. Treat narrative below that says “currently requires WrappedSignatureProof” as **pre-cutover**; prefer live `realm_finalize_guta.rs` + [ProvingJobs.md](../protocol/ProvingJobs.md) §2 for what ships today. Remaining draft items (PI commitment / AlreadyClaimed) still need independent verification against processors.
+
 > Author: GPT-6 Astra. Reviewed-by: orchestrator, approved with conditions incorporated below.
 
 ## Abstract

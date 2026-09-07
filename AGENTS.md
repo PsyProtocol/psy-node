@@ -541,14 +541,25 @@ The parking lot for findings that are not yet authorized work.
 2. Promote an issue into `TASKS.md` only after the user explicitly agrees. Record the promotion by marking the issue `promoted` and adding the matching task; do not delete the issue.
 3. If a finding is directly required to complete an already agreed `TASKS.md` item, handle it inside that task and note the link. Do not invent a second task.
 4. Close an issue as `dropped` only when the user declines it or current evidence shows it is not a defect.
+5. When a promoted issue's matching task completes the fix, mark the issue `fixed` and record the executable evidence (test or command output) that proves the fix. Keep the issue entry; do not delete it.
+6. When current evidence invalidates a finding (the defect no longer exists), close it as `fixed` with the disproving evidence instead of leaving it open.
 
 Required fields per item:
 
 - `id`: stable local identifier
 - `title`: one-line finding
 - `evidence`: `<file>:<line>`, log excerpt, or command output
-- `status`: `open` | `promoted` | `dropped`
+- `status`: `open` | `promoted` | `fixed` | `dropped`
 - `task`: `TASKS.md` id after promotion, otherwise empty
+
+### PLAN.md
+
+Advisory planning artifact for multi-phase work in this worktree.
+
+1. Treat the plan as advisory working state. Current repository files, `TASKS.md`, and command output win whenever a PLAN note disagrees with them.
+2. When the execution path changes materially (steps added, removed, reordered, or abandoned), rewrite the affected plan sections in the same turn instead of leaving stale steps for later agents.
+3. Mark completed plan phases with their evidence; drop cancelled phases with the reason. Keep the historical record; do not delete finished entries.
+4. Never put secrets, credentials, tokens, environment values, or machine-local absolute paths in the plan.
 
 ### MEMORY.md
 
