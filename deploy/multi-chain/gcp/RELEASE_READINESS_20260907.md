@@ -23,17 +23,17 @@ remain compatible. Existing deployed token contracts are not renamed in place.
 Wallet 0.4.26 was published separately from the multichain wallet branch. This
 deployment-tool change does not regenerate its SDK or trigger another release.
 
-## Pending DApp publication
+## DApp publication
 
-DApp candidate `212aac031f206c53f26c79b56b0dcedb86fee19d` has been prepared and
-tested separately. It must be explicitly authorized and published to
-`PsyProtocol/psy-dapp:deploy/multi-chain-staging` before this profile pins it.
-That push automatically publishes the App, Explorer, and Config frontends.
+DApp `212aac031f206c53f26c79b56b0dcedb86fee19d` was pushed with operator
+authorization to `PsyProtocol/psy-dapp:deploy/multi-chain-staging` on September 7.
+Remote reachability was verified before advancing this profile's pin.
+The App, Explorer, and Config frontend workflow completed successfully for
+this exact SHA (GitHub Actions run `34117641844`). Git push and workflow
+success were checked separately.
 
-Until then, `source-versions.env` retains the previously published DApp pin,
-`dddf10677b91894cb626b3e717702fc33feeb77f`. **This preparation is not the final
-go-ahead for a fresh release.** Do not treat the old pin as the intended new
-frontend candidate or change it to an unpublished SHA.
+The selected source is now pinned in `source-versions.env`. **This source
+update alone is not a successful fresh deployment or full E2E acceptance.**
 
 ## Tooling verification
 
@@ -56,8 +56,8 @@ deployment, current service health, or transaction settlement.
 
 ## Before authorizing a fresh deployment
 
-1. Publish the approved DApp source; verify the frontend workflow result and
-   then update the profile pin in a reviewed follow-up commit.
+1. Verify the published DApp SHA and successful workflow against the profile
+   pin. Publication and workflow verification are complete as recorded above.
 2. Prepare pinned submodules in a clean dedicated checkout. Preserve private
    config, signer files, and current deployment artifacts outside Git.
 3. Run both profile and shared preflight without dirty-source, RPC, or DNS
@@ -78,18 +78,20 @@ offsite services were active, including exactly three cloud workers. Public
 service/frontend endpoints responded successfully. These spot checks are not
 a full log audit or transaction E2E run and do not establish release readiness.
 
-Remaining release blockers:
+Audit issues and their current status:
 
-- Deposit recovery in `deploy/e2e/cli-full-e2e/src/main.rs` calls
+- Open, transaction-test recovery: `deploy/e2e/cli-full-e2e/src/main.rs` calls
   `--resume-deposit-index`, but the selected Node `ae7be034` CLI does not expose
   it. The implementation exists only in an older shared checkout's local
   patches. Resolve the CLI/tool interface through committed, reviewed source
   before accepting timeout recovery; do not blindly resubmit an L1 deposit.
-- The deployer/Relayer address `0x490f8192725255c2c3de0cbce66312335ca019ad`
+- Resolved, funding gate: the deployer/Relayer address `0x490f8192725255c2c3de0cbce66312335ca019ad`
   had approximately 0.0953605 ETH on Base Sepolia, below the current default
-  preflight minimum of 0.1 ETH. Recheck and fund before deployment; this is a
-  time-specific observation, not a permanent balance or gas-budget guarantee.
-- DApp publication and downstream pin update above remain pending.
+  preflight minimum of 0.1 ETH. The operator subsequently funded 0.02 ETH;
+  the real profile preflight passed with approximately 0.11534 ETH on Base.
+  These are time-specific observations, not a permanent gas-budget guarantee.
+- Resolved, DApp: publication, the downstream pin update and frontend workflow run
+  `34117641844` have since been completed successfully.
 
 The fixed E2E wallet already exists at the ignored workspace path
 `.private/test-wallets/staging-multichain/wallet.json`; its address is
