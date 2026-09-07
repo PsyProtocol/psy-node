@@ -381,7 +381,7 @@ nonempty faucet values plus the fixed runtime allowlist (`dev/locSetupV4.ts:3921
 | Realm workers | `psy_worker_cli worker` | Worker-start marker; all selected worker promises are awaited. | `dev/locSetupV4.ts:4250-4342` |
 | Dummy provers | `dev/dummy_prover.sh` | Dummy-prover marker; start in parallel after Realm workers. | `dev/locSetupV4.ts:4343-4360` |
 | Prove proxy | `psy_user_cli prove-proxy` | Log marker starts background warm-up; TCP `9999 + index` has up to 600 one-second attempts. | `dev/locSetupV4.ts:4362-4402` |
-| Anvil | `anvil ... --state db/anvil/state.json --state-interval 1` | `Listening on`, then HTTP Layer 1 probe. | `dev/locSetupV4.ts:4404-4439` |
+| Anvil | `anvil ... --state db/anvil/state.json --state-interval <ANVIL_STATE_INTERVAL\|\|60>` | `Listening on`, then HTTP Layer 1 probe. | `dev/locSetupV4.ts:4448-4462` |
 | Envio backing services | Generated Docker Compose | Postgres TCP 5433, SQL `select 1`, Hasura `/healthz`. | `dev/locSetupV4.ts:3338-3364` |
 | Envio indexer | `pnpm start` | Outer setup requires TCP 9898. | `dev/locSetupV4.ts:3363-3376`; `dev/locSetupV4.ts:4478-4492` |
 | psy-services | `psy-services --disable-auth` | Start marker, then `http://127.0.0.1:3000/health`. | `dev/locSetupV4.ts:4545-4575` |
@@ -463,8 +463,20 @@ Redis/Valkey, NATS, and Nostr and the Scylla set to Scylla (`dev/locSetupV4.ts:6
 
 ## 10. Anvil Persistence and Restart Recovery
 
-Anvil state is exactly `db/anvil/state.json`; Anvil receives `--state` with that path and `--state-interval 1`, so it
-loads an existing snapshot and writes updates every second (`dev/locSetupV4.ts:2934`; `dev/locSetupV4.ts:4408-4426`).
+Anvil state is exactly `db/anvil/state.json`; Anvil receives `--state` with that path and
+`--state-interval ${ANVIL_STATE_INTERVAL:-60}`, so it loads an existing snapshot and writes
+updates every `ANVIL_STATE_INTERVAL` seconds, default 60 (anvil's own default;
+`dev/locSetupV4.ts:2954`; `dev/locSetupV4.ts:4448-4460`). Earlier launches hardcoded 1s; with a
+multi-GB accumulated state each dump outruns the interval, the write loop saturates the disk,
+and the RPC event loop starves (observed: 10.7GB state at ~4500 blocks). Raise
+`ANVIL_STATE_INTERVAL` on long-lived devnets if RPC latency grows.
+Do NOT pass `--steps-tracing`: it records full execution traces per block into the state dump
+(~21MB/block; 20GB within ~1000 blocks on a fresh chain) until the periodic write starves the
+RPC loop (`dev/locSetupV4.ts:4451-4454`). Without it, the best-effort
+`debug_traceTransaction` revert diagnostics in `deposit.rs:1033-1044` and
+`claim_withdrawal.rs:529-537` degrade gracefully; the success path is unaffected.
+
+
 Do not describe all Anvil-related data as living under `db/`: the required localhost deployment summary is the paired
 file `psy-contracts/deployments/localhost/deployed-contracts.json`, outside `db/`
 (`dev/locSetupV4.ts:2942-2951`).

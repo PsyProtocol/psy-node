@@ -4448,7 +4448,10 @@ class DevNetProcessManager {
                     const args = [
                         "anvil", "--host", "0.0.0.0", "--port", String(port),
                         "--chain-id", String(chainMeta.l1ChainId),
-                        "--state", statePlan.statePath, "--state-interval", "1", "--steps-tracing", "-vvvv",
+                        "--state", statePlan.statePath, "--state-interval", process.env.ANVIL_STATE_INTERVAL || "60", "-vvvv",
+                        // --steps-tracing is omitted: it records full execution traces
+                        // for every block into the state dump (~21MB/block, 20GB in
+                        // ~1000 blocks) until the periodic write starves the RPC loop.
                     ];
                     if (l1Fork) {
                         const forkEnvKey = cfgEntry.anvilForkSourceUrlEnv;

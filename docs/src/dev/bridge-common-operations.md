@@ -199,6 +199,8 @@ export FINALIZED_BEFORE_DEPOSIT="$(cast call "$STATE_MANAGER" 'lastFinalizedChec
 cast send "$USDT" 'approve(address,uint256)' "$ERC20_GATEWAY" "$DEPOSIT_AMOUNT" \
   --rpc-url "$L1_RPC_URL" --private-key "$USER_PRIVATE_KEY"
 
+export RECIPIENT_NPUB="<receiver-npub>"    # npub1... of the receiver; same wallet or the claimer
+export NOSTR_RELAY_URL="ws://127.0.0.1:8081"   # devnet relay; use a public relay only on shared networks
 ./target/release/psy_user_cli \
   --result-file "$RESULT_DIR/deposit.json" \
   deposit \
@@ -215,18 +217,66 @@ cast send "$USDT" 'approve(address,uint256)' "$ERC20_GATEWAY" "$DEPOSIT_AMOUNT" 
   --r1 "$R1" \
   --note-secret "$NOTE_SECRET" \
   --nullifier-secret "$NULLIFIER_SECRET" \
-  --deposit-proof-output "$RESULT_DIR/deposit-proof.json"
+  --deposit-proof-output "$RESULT_DIR/deposit-proof.json" \
+  --recipient-npub "$RECIPIENT_NPUB" \
+  --nostr-relay "$NOSTR_RELAY_URL"
 
 jq -e '.status == "confirmed" and (.transaction_hash != null)' "$RESULT_DIR/deposit.json"
 export DEPOSIT_INDEX="$(jq -r '.deposit_index' "$RESULT_DIR/deposit-proof.json")"
 test "$DEPOSIT_INDEX" != 'null'
 ```
 
-`--deposit-proof-output` is optional at the deposit interface, but it is required for the file-based `claim-deposit` command used below. With this flag, the deposit command waits up to 600 seconds for relayer proof readiness and then writes the sender-generated inclusion proof (`client_prover/psy_cli/psy_user_cli/src/subcommand/deposit.rs:636-676`, `client_prover/psy_cli/psy_user_cli/src/subcommand/deposit.rs:1072-1107`). Never rerun `deposit` to retry proof generation: that records a new L1 deposit.
+`--deposit-proof-output` is optional at the deposit interface, but it is required for the file-based `claim-deposit` command used below. With this flag, the deposit command waits up to 600 seconds for relayer proof readiness and then writes the sender-generated inclusion proof (`client_prover/psy_cli/psy_user_cli/src/subcommand/deposit.rs:636-676`, `client_prover/psy_cli/psy_user_cli/src/subcommand/deposit.rs:1072-1107`). Never rerun `deposit` to retry proof generation: that records a new L1 deposit. `--nostr-relay` defaults to a public relay; on local devnet always pass `ws://127.0.0.1:8081` (the devnet nostr-relay container) or the events never reach the receiver.
+### Persist Deposit Claim Material — Mandatory
+
+Write the secret-bearing note BEFORE the approve/deposit step (the deposit
+CLI may spend minutes waiting for proof readiness and Nostr delivery after
+broadcasting the L1 transaction; a crash in that window otherwise leaves the
+funds locked with the secrets lost — ISSUE-OPS-2). Build the JSON with
+python/jq so shell expansion cannot corrupt it:
+
+```bash
+cat > "$RESULT_DIR/deposit-note.json" <<EOF
+{
+  "user_id": "$USER_ID",
+  "r0": "$R0",
+  "r1": "$R1",
+  "note_secret": "$NOTE_SECRET",
+  "nullifier_secret": "$NULLIFIER_SECRET",
+  "recipient_npub": "$RECIPIENT_NPUB"
+}
+EOF
+chmod 600 "$RESULT_DIR/deposit-note.json"
+test -s "$RESULT_DIR/deposit-note.json"
+```
+
+After the deposit result and proof file exist, update the same file with the
+claim-relevant identifiers (use a JSON-aware tool so the array-shaped
+`note_commitment` stays valid JSON):
+
+```bash
+jq --arg tx "$(jq -r '.transaction_hash' "$RESULT_DIR/deposit.json")" \
+   --arg idx "$(jq -r '.deposit_index' "$RESULT_DIR/deposit-proof.json")" \
+   --argjson nc "$(jq -c '.note_commitment' "$RESULT_DIR/deposit-proof.json")" \
+   --arg proof "$RESULT_DIR/deposit-proof.json" \
+   '.tx_hash = $tx | .deposit_index = $idx | .note_commitment = $nc | .deposit_proof = $proof' \
+   "$RESULT_DIR/deposit-note.json" > "$RESULT_DIR/deposit-note.json.tmp" \
+  && mv "$RESULT_DIR/deposit-note.json.tmp" "$RESULT_DIR/deposit-note.json" \
+  && chmod 600 "$RESULT_DIR/deposit-note.json"
+jq -e '.tx_hash != null and .note_commitment != null' "$RESULT_DIR/deposit-note.json"
+```
+
+Treat this file as the single claim credential: back it up before stack
+restarts, and never regenerate the secrets in a later session.
+
 
 ### Nostr Receiver Recovery
 
-When the receiver uses Nostr recovery, add `--recipient-npub <npub>` to the **same deposit command above**, retaining both `--note-secret` and `--nullifier-secret`. This publishes two separate events linked by `backup_id = note_commitment`: plaintext `psy_deposit_proof` metadata and proof, and encrypted `psy_deposit_secrets` claim material (`client_prover/psy_cli/psy_user_cli/src/subcommand/deposit.rs:802-904`).
+The deposit command above already carries `--recipient-npub`; this section
+describes the two-event backup protocol only. Both events are linked by
+`backup_id = note_commitment`: plaintext `psy_deposit_proof` metadata and
+proof, and encrypted `psy_deposit_secrets` claim material
+(`client_prover/psy_cli/psy_user_cli/src/subcommand/deposit.rs:802-904`).
 
 Omitting `--recipient-npub` for a Nostr receiver breaks claim retrieval: the L1 deposit can succeed without publishing either recovery event. The local proof file does not replace Nostr delivery to that receiver. Require both events for the same backup identifier before treating Nostr recovery as ready. If delivery is missing, preserve the existing deposit proof and secrets and restore delivery for that deposit; do not submit a second L1 deposit.
 
