@@ -124,9 +124,11 @@ jq -e '
 
 run_remote_command "$host" "
   set -e
-  test \"\$(readlink -f /opt/parth/psy-services/current)\" != \"\$(readlink -f /opt/parth/current)\"
-  grep -Fxq 'PSY_SERVICES_REPOSITORY=$EXPECTED_PSY_SERVICES_REPOSITORY' /opt/parth/psy-services/current/BUILD-MANIFEST.env
-  grep -Fxq 'PSY_SERVICES_COMMIT=$EXPECTED_PSY_SERVICES_COMMIT' /opt/parth/psy-services/current/BUILD-MANIFEST.env
+  current=\$(sudo readlink -f /opt/parth/psy-services/current)
+  parth_current=\$(sudo readlink -f /opt/parth/current)
+  test \"\$current\" != \"\$parth_current\"
+  sudo grep -Fxq 'PSY_SERVICES_REPOSITORY=$EXPECTED_PSY_SERVICES_REPOSITORY' \"\$current/BUILD-MANIFEST.env\"
+  sudo grep -Fxq 'PSY_SERVICES_COMMIT=$EXPECTED_PSY_SERVICES_COMMIT' \"\$current/BUILD-MANIFEST.env\"
   for unit in parth-psy-services.service parth-psy-indexer@coordinator.service parth-psy-indexer@realm-0.service parth-psy-indexer@realm-1.service; do
     sudo systemctl is-active --quiet \"\$unit\"
     pid=\$(sudo systemctl show -p MainPID --value \"\$unit\")
