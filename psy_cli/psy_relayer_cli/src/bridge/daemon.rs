@@ -982,6 +982,16 @@ async fn run_multichain(
                 Err(error) => tracing::error!(chain_index=chain.chain_index, %error, "chain finalize failed; shared proof retained"),
             }
         }
+        // Every round, and deliberately outside the finalization gate below: a
+        // round that never finishes finalizing still must not let unroutable
+        // withdrawals pile up unnoticed.
+        record_unroutable_claims(
+            &chains.iter().map(|chain| chain.chain_index).collect::<HashSet<u8>>(),
+            &mut state.pending_claim_withdrawals,
+            &mut state.claim_retry,
+            &mut state.retired_claim_withdrawals,
+            claim_attempts::now_unix(),
+        );
         save_multichain_state(&state_path, &state)?;
 
         if state.finalized_chains.len() == chains.len() {
@@ -2136,39 +2146,108 @@ fn record_claim_outcome(
             .get(leaf_hash)
             .cloned()
             .unwrap_or_else(|| "claim did not resolve and reported no reason".to_string());
-        let state = claim_attempts::record_failure(retry, leaf_hash, &reason);
+        record_claim_failure(withdrawal, &reason, pending, retry, retired, now_unix);
+    }
+}
 
-        if claim_attempts::is_exhausted(&state) {
-            // Stop paying for proofs, keep the record. The funds are stuck and
-            // this needs a person, so it is an error, not a warning.
-            tracing::error!(
-                leaf_hash,
-                attempts = state.attempts,
-                reason = %state.last_reason,
-                destination_chain_index = withdrawal.destination_chain_index,
-                "withdrawal claim given up on after its attempts were used; no further proofs will be requested for it"
-            );
-            if let Some(w) = pending.remove(leaf_hash) {
-                retired.insert(
-                    leaf_hash.to_string(),
-                    claim_attempts::RetiredClaim {
-                        withdrawal: w,
-                        attempts: state.attempts,
-                        last_reason: state.last_reason.clone(),
-                        retired_at_unix: now_unix,
-                    },
-                );
-            }
-            claim_attempts::clear(retry, leaf_hash);
-        } else {
-            tracing::warn!(
-                leaf_hash,
-                attempts = state.attempts,
-                max_attempts = claim_attempts::CLAIM_MAX_ATTEMPTS,
-                reason = %state.last_reason,
-                "withdrawal claim failed; will retry next round"
+/// Count one failed attempt, and give up on the withdrawal if that was its last.
+fn record_claim_failure(
+    withdrawal: &propose_withdrawals::PendingWithdrawal,
+    reason: &str,
+    pending: &mut HashMap<String, propose_withdrawals::PendingWithdrawal>,
+    retry: &mut HashMap<String, claim_attempts::ClaimAttempts>,
+    retired: &mut HashMap<
+        String,
+        claim_attempts::RetiredClaim<propose_withdrawals::PendingWithdrawal>,
+    >,
+    now_unix: u64,
+) {
+    let leaf_hash = withdrawal.leaf_hash.as_str();
+    let state = claim_attempts::record_failure(retry, leaf_hash, reason);
+
+    if claim_attempts::is_exhausted(&state) {
+        // Stop paying for proofs, keep the record. The funds are stuck and this
+        // needs a person, so it is an error, not a warning.
+        tracing::error!(
+            leaf_hash,
+            attempts = state.attempts,
+            reason = %state.last_reason,
+            destination_chain_index = withdrawal.destination_chain_index,
+            "withdrawal claim given up on after its attempts were used; no further proofs will be requested for it"
+        );
+        if let Some(w) = pending.remove(leaf_hash) {
+            retired.insert(
+                leaf_hash.to_string(),
+                claim_attempts::RetiredClaim {
+                    withdrawal: w,
+                    attempts: state.attempts,
+                    last_reason: state.last_reason.clone(),
+                    retired_at_unix: now_unix,
+                },
             );
         }
+        claim_attempts::clear(retry, leaf_hash);
+    } else {
+        tracing::warn!(
+            leaf_hash,
+            attempts = state.attempts,
+            max_attempts = claim_attempts::CLAIM_MAX_ATTEMPTS,
+            reason = %state.last_reason,
+            "withdrawal claim failed; will retry next round"
+        );
+    }
+}
+
+/// Account for pending withdrawals bound for a chain this relayer does not serve.
+///
+/// The multichain round dispatches claims per chain, filtering pending
+/// withdrawals by destination_chain_index. One that matches no configured chain
+/// therefore reaches no chain's claim path: it is never attempted, so it never
+/// fails, so it never reaches the attempt ceiling. It simply accumulates in the
+/// durable pending set, silently and forever — the relayer's half of the same
+/// production incident, where the destination chain index was not ours.
+///
+/// The chain set is built before the round loop and does not change while the
+/// process runs, so this is not a transient condition. It still goes through
+/// the ordinary "try, retry twice, give up" counter rather than being retired
+/// on sight: one rule is easier to reason about than two, and the three rounds
+/// cost nothing here because no proof is requested for these.
+fn record_unroutable_claims(
+    served_chain_indices: &HashSet<u8>,
+    pending: &mut HashMap<String, propose_withdrawals::PendingWithdrawal>,
+    retry: &mut HashMap<String, claim_attempts::ClaimAttempts>,
+    retired: &mut HashMap<
+        String,
+        claim_attempts::RetiredClaim<propose_withdrawals::PendingWithdrawal>,
+    >,
+    now_unix: u64,
+) {
+    let unroutable: Vec<propose_withdrawals::PendingWithdrawal> = pending
+        .values()
+        .filter(|w| {
+            u8::try_from(w.destination_chain_index)
+                .map(|index| !served_chain_indices.contains(&index))
+                .unwrap_or(true)
+        })
+        .filter(|w| claim_attempts::is_retriable(retry.get(&w.leaf_hash)))
+        .cloned()
+        .collect();
+
+    for withdrawal in &unroutable {
+        let served = {
+            let mut indices: Vec<u8> = served_chain_indices.iter().copied().collect();
+            indices.sort_unstable();
+            indices
+                .iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let reason = format!(
+            "no configured chain serves destination chain index {} (this relayer serves {served})",
+            withdrawal.destination_chain_index
+        );
+        record_claim_failure(withdrawal, &reason, pending, retry, retired, now_unix);
     }
 }
 
@@ -3783,6 +3862,85 @@ mod tests {
         resolved.resolved_leaf_hashes = vec!["a".to_string()];
         record_claim_outcome(&attempted, &resolved, &mut pending, &mut retry, &mut retired, 0);
         assert!(!retry.contains_key("a"), "a success must clear the history");
+    }
+
+    fn withdrawal_for_chain(leaf: &str, chain_index: u64) -> propose_withdrawals::PendingWithdrawal {
+        let mut w = backoff_withdrawal(leaf);
+        w.destination_chain_index = chain_index;
+        w
+    }
+
+    fn served(indices: &[u8]) -> HashSet<u8> {
+        indices.iter().copied().collect()
+    }
+
+    #[test]
+    fn a_withdrawal_for_a_chain_we_do_not_serve_is_eventually_given_up_on() {
+        // The multichain round filters pending withdrawals by
+        // destination_chain_index, so index 7 reaches no chain's claim path: it
+        // was never attempted, never failed, and never reached the ceiling. It
+        // just sat in the durable set forever.
+        let mut pending = HashMap::new();
+        pending.insert("orphan".to_string(), withdrawal_for_chain("orphan", 7));
+        let mut retry = HashMap::new();
+        let mut retired = HashMap::new();
+
+        for _ in 0..claim_attempts::CLAIM_MAX_ATTEMPTS {
+            record_unroutable_claims(&served(&[0, 1, 2]), &mut pending, &mut retry, &mut retired, 0);
+        }
+
+        assert!(pending.is_empty(), "the orphan must not stay pending forever");
+        let entry = retired.get("orphan").expect("kept for whoever has to look");
+        assert!(entry.last_reason.contains("no configured chain serves destination chain index 7"));
+        assert!(entry.last_reason.contains("0, 1, 2"), "say what we do serve");
+    }
+
+    #[test]
+    fn withdrawals_for_chains_we_do_serve_are_left_for_the_claim_path() {
+        let mut pending = HashMap::new();
+        for (leaf, index) in [("a", 0u64), ("b", 1), ("c", 2)] {
+            pending.insert(leaf.to_string(), withdrawal_for_chain(leaf, index));
+        }
+        let mut retry = HashMap::new();
+        let mut retired = HashMap::new();
+
+        for _ in 0..10 {
+            record_unroutable_claims(&served(&[0, 1, 2]), &mut pending, &mut retry, &mut retired, 0);
+        }
+
+        assert_eq!(pending.len(), 3, "routable withdrawals are none of this sweep's business");
+        assert!(retry.is_empty());
+        assert!(retired.is_empty());
+    }
+
+    #[test]
+    fn a_chain_index_too_large_for_a_chain_id_is_unroutable_too() {
+        // destination_chain_index is u64 on the withdrawal and u8 on the chain,
+        // so a value that cannot even be a chain index must not slip through the
+        // conversion as "no opinion".
+        let mut pending = HashMap::new();
+        pending.insert("big".to_string(), withdrawal_for_chain("big", 9_999));
+        let mut retry = HashMap::new();
+        let mut retired = HashMap::new();
+
+        for _ in 0..claim_attempts::CLAIM_MAX_ATTEMPTS {
+            record_unroutable_claims(&served(&[0, 1, 2]), &mut pending, &mut retry, &mut retired, 0);
+        }
+        assert!(retired.contains_key("big"));
+    }
+
+    #[test]
+    fn the_sweep_does_not_re_retire_what_it_already_gave_up_on() {
+        let mut pending = HashMap::new();
+        pending.insert("orphan".to_string(), withdrawal_for_chain("orphan", 7));
+        let mut retry = HashMap::new();
+        let mut retired = HashMap::new();
+
+        for _ in 0..200 {
+            record_unroutable_claims(&served(&[0, 1, 2]), &mut pending, &mut retry, &mut retired, 0);
+        }
+        assert_eq!(retired["orphan"].attempts, claim_attempts::CLAIM_MAX_ATTEMPTS);
+        assert!(retry.is_empty(), "no bookkeeping left behind for a retired claim");
     }
 
     #[test]
