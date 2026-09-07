@@ -60,6 +60,7 @@ use psy_plonky2_circuits::{
     },
     circuit_library::get_plonky2_circuit_library_and_prover_for_network,
     coordinator::coordinator_helper::QEDCoordinatorCircuitManager,
+    proof_minifier::pm_chain::QEDProofMinifierChain,
 };
 use psy_plonky2_common_circuits::bridge::{
     deposit_batch_append_circuit::{
@@ -524,6 +525,10 @@ pub struct ProveProxyServerProvider {
     pub deposit_batch_groth16_wrapper: Arc<SharedGroth16Wrapper>,
     pub withdrawal_claim_groth16_wrapper: Arc<SharedGroth16Wrapper>,
     pub bridge_groth16_wrapper: Arc<SharedGroth16Wrapper>,
+    /// Warmup-built base circuits reused verbatim by prove requests.
+    pub deposit_append_circuit: Arc<DepositBatchAppendCircuit<C, D>>,
+    pub deposit_batch_minifier: Arc<QEDProofMinifierChain<D, F, C>>,
+    pub withdrawal_claim_circuit: Arc<WithdrawalBatchClaimCircuit<C, D>>,
 }
 
 impl ProveProxyServerProvider {
@@ -661,12 +666,12 @@ impl ProveProxyServerProvider {
         // builder.build).
 
         tracing::info!("Pre-building DepositBatchWrapCircuit...");
-        let deposit_template = DepositBatchAppendCircuit::<C, D>::build(MAX_DEPOSIT_BATCH_SIZE, 32);
-        let deposit_minifier = psy_plonky2_circuits::proof_minifier::pm_chain::QEDProofMinifierChain::<D, F, C>::new(
+        let deposit_template = Arc::new(DepositBatchAppendCircuit::<C, D>::build(MAX_DEPOSIT_BATCH_SIZE, 32));
+        let deposit_minifier = Arc::new(QEDProofMinifierChain::<D, F, C>::new(
             &deposit_template.circuit_data.verifier_only,
             &deposit_template.circuit_data.common,
             2,
-        );
+        ));
         let deposit_fp = ParthQHashOut(deposit_minifier.get_fingerprint());
         let deposit_batch_wrap_circuit = Arc::new(DepositBatchWrapCircuit::new(
             deposit_minifier.get_common_data(),
@@ -683,7 +688,7 @@ impl ProveProxyServerProvider {
         );
 
         tracing::info!("Pre-building WithdrawalClaimWrapCircuit...");
-        let withdrawal_template = WithdrawalBatchClaimCircuit::<C, D>::build(32);
+        let withdrawal_template = Arc::new(WithdrawalBatchClaimCircuit::<C, D>::build(32));
         let withdrawal_fp = ParthQHashOut(psy_plonky2_circuits::proof_minifier::pm_core::get_circuit_fingerprint_generic(
             &withdrawal_template.circuit_data.verifier_only,
         ));
@@ -787,6 +792,9 @@ impl ProveProxyServerProvider {
             deposit_batch_groth16_wrapper,
             withdrawal_claim_groth16_wrapper,
             bridge_groth16_wrapper,
+            deposit_append_circuit: deposit_template,
+            deposit_batch_minifier: deposit_minifier,
+            withdrawal_claim_circuit: withdrawal_template,
         })
     }
 
@@ -854,6 +862,7 @@ impl ProveProxyRpcServer for ProveProxyServerProvider {
 
         let wrap_circuit = self.withdrawal_claim_wrap_circuit.clone();
         let groth16_wrapper = self.withdrawal_claim_groth16_wrapper.clone();
+        let circuit = self.withdrawal_claim_circuit.clone();
         tokio::task::spawn_blocking(move || {
             anyhow::ensure!(
                 input.withdrawals.len() <= MAX_WITHDRAWAL_CLAIM_BATCH_SIZE,
@@ -911,7 +920,6 @@ impl ProveProxyRpcServer for ProveProxyServerProvider {
                 });
             }
 
-            let circuit = WithdrawalBatchClaimCircuit::<C, D>::build(32);
             let proof = circuit.generate_proof(&WithdrawalBatchClaimInputs::<F> {
                 withdrawal_root: root.expect("non-empty batch ensured above"),
                 bridge_user_id: input.bridge_user_id,
@@ -961,6 +969,8 @@ impl ProveProxyRpcServer for ProveProxyServerProvider {
 
         let wrap_circuit = self.deposit_batch_wrap_circuit.clone();
         let groth16_wrapper = self.deposit_batch_groth16_wrapper.clone();
+        let circuit = self.deposit_append_circuit.clone();
+        let minifier = self.deposit_batch_minifier.clone();
         tokio::task::spawn_blocking(move || {
             anyhow::ensure!(
                 input.old_frontier.len() == 32,
@@ -996,17 +1006,8 @@ impl ProveProxyRpcServer for ProveProxyServerProvider {
                 bridge_user_id: input.bridge_user_id,
             };
 
-            let circuit = DepositBatchAppendCircuit::<C, D>::build(
-                psy_plonky2_common_circuits::bridge::deposit_batch_append_circuit::MAX_DEPOSIT_BATCH_SIZE,
-                32,
-            );
             let proof = circuit.generate_proof(&batch_inputs)?;
             let preimage = compute_batch_append_preimage(&batch_inputs);
-            let minifier = psy_plonky2_circuits::proof_minifier::pm_chain::QEDProofMinifierChain::<D, F, C>::new(
-                &circuit.circuit_data.verifier_only,
-                &circuit.circuit_data.common,
-                2,
-            );
             let minified_proof = minifier.prove(&proof)?;
             let groth16 = wrap_circuit.prove_groth16_with_shared_wrapper(&groth16_wrapper, minifier.get_verifier_data(), &minified_proof)?;
 
