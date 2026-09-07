@@ -27,6 +27,8 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/stage/target/release" "$tmp/stage/migrations"
 mkdir -p "$tmp/legacy/target/release" "$tmp/legacy/migrations"
+mkdir -p "$tmp/install/releases/stale"
+ln -s "$tmp/install/releases/stale" "$tmp/install/current"
 printf '#!/usr/bin/env bash\n' >"$tmp/stage/target/release/psy-services"
 printf '#!/usr/bin/env bash\n' >"$tmp/stage/target/release/psy-indexer"
 chmod 0755 "$tmp/stage/target/release/psy-services" "$tmp/stage/target/release/psy-indexer"
@@ -42,6 +44,7 @@ archive_sha="$(sha256sum "$tmp/release.tar.gz" | awk '{print $1}')"
 
 PSY_SERVICES_RELEASE_ARCHIVE="$tmp/release.tar.gz" \
 PSY_SERVICES_RELEASE_ROOT="$tmp/install" \
+PSY_SERVICES_ACTIVE_HOME="$tmp/legacy" \
 PSY_SERVICES_LEGACY_HOME="$tmp/legacy" \
 PSY_SERVICES_RELEASE_SHA256="$archive_sha" \
 EXPECTED_PSY_SERVICES_REPOSITORY="$EXPECTED_PSY_SERVICES_REPOSITORY" \
@@ -50,6 +53,7 @@ EXPECTED_PSY_SERVICES_COMMIT="$EXPECTED_PSY_SERVICES_COMMIT" \
 
 [ -x "$tmp/install/current/target/release/psy-services" ]
 [ -x "$tmp/install/current/target/release/psy-indexer" ]
+# The live process path must win over a stale independent current symlink.
 [ "$(readlink -f "$tmp/install/previous")" = "$(readlink -f "$tmp/legacy")" ]
 grep -Fxq "PSY_SERVICES_COMMIT=$EXPECTED_PSY_SERVICES_COMMIT" \
   "$tmp/install/current/BUILD-MANIFEST.env"

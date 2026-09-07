@@ -54,9 +54,11 @@ export DEPLOY_PSY_SERVICES_HOME="/opt/parth/psy-services/current"
 export SKIP_PARTH_BUNDLE_UPLOAD=1
 
 ensure_parth_vm "$host"
+# Resolve the rollback target from the running process instead of trusting an
+# independent release symlink that may have been left by an older deployment.
 # The single-quoted command is intentionally expanded by the remote shell.
 # shellcheck disable=SC2016
-run_remote_command "$host" '
+active_services_home="$(run_remote_command "$host" '
   set -e
   for unit in parth-psy-services.service parth-psy-indexer@coordinator.service parth-psy-indexer@realm-0.service parth-psy-indexer@realm-1.service; do
     sudo systemctl is-active --quiet "$unit" || {
@@ -64,15 +66,23 @@ run_remote_command "$host" '
       exit 1
     }
   done
-  test -x /opt/parth/current/psy-services/target/release/psy-services
-  test -x /opt/parth/current/psy-services/target/release/psy-indexer
-  test -d /opt/parth/current/psy-services/migrations
-'
+  pid=$(sudo systemctl show -p MainPID --value parth-psy-services.service)
+  test "$pid" -gt 0
+  exe=$(sudo readlink -f "/proc/$pid/exe")
+  active_home=$(dirname "$(dirname "$(dirname "$exe")")")
+  case "$active_home" in /opt/parth/*) ;; *) echo "unexpected active psy-services home: $active_home" >&2; exit 1 ;; esac
+  sudo test -x "$active_home/target/release/psy-services"
+  sudo test -x "$active_home/target/release/psy-indexer"
+  sudo test -d "$active_home/migrations"
+  printf "%s\n" "$active_home"
+')"
+echo "[psy-services-update] active rollback target=$active_services_home"
 curl -fsS --max-time 15 "https://${PUBLIC_PSY_SERVICES_DOMAIN}/health" >/dev/null
 
 rsync_to_remote "$host" "$archive" "$remote_archive"
 run_remote_script "$host" "$REPO_ROOT/deploy/gcp/remote/install-psy-services-release.sh" \
   "PSY_SERVICES_RELEASE_ARCHIVE=$remote_archive" \
+  "PSY_SERVICES_ACTIVE_HOME=$active_services_home" \
   "PSY_SERVICES_LEGACY_HOME=${PSY_SERVICES_LEGACY_HOME:-/opt/parth/current/psy-services}" \
   "PSY_SERVICES_RELEASE_SHA256=$archive_sha" \
   "EXPECTED_PSY_SERVICES_REPOSITORY=$EXPECTED_PSY_SERVICES_REPOSITORY" \
