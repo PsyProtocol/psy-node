@@ -4,6 +4,10 @@ source "$(dirname "$0")/lib/common.sh"
 # shellcheck source=lib/multichain.sh
 source "$(dirname "$0")/lib/multichain.sh"
 
+if multichain_enabled; then
+  bash "$GCP_DIR/verify-relayer-source.sh" "$PARTH_DIR"
+fi
+
 NAME="${RELAYER_VM_NAME:-${NODE_VM_NAME:-parth-node-1}}"
 NODE_NAME="${NODE_VM_NAME:-gcp-cp-ce}"
 NODE_HOST="$(instance_internal_dns "$NODE_NAME")"

@@ -254,7 +254,7 @@ pub(crate) struct DaemonState {
     /// retried next round. The key is leaf_hash.
     #[serde(default, alias = "failed_claim_withdrawals")]
     pending_claim_withdrawals: HashMap<String, propose_withdrawals::PendingWithdrawal>,
-    /// Backoff bookkeeping for the entries above, keyed by leaf_hash.
+    /// Failure counts for the entries above, keyed by leaf_hash.
     #[serde(default)]
     claim_retry: HashMap<String, claim_attempts::ClaimAttempts>,
     /// Withdrawals that ran out of attempts. Nothing retries these; they are
@@ -745,13 +745,9 @@ where
     DispatchFuture: Future<Output = T>,
 {
     let mut pending_claim_withdrawals = state.pending_claim_withdrawals.clone();
-    let mut claim_retry = state.claim_retry.clone();
-    let mut retired_claim_withdrawals = state.retired_claim_withdrawals.clone();
-    for withdrawal in current_round_withdrawals {
-        pending_claim_withdrawals
-            .entry(withdrawal.leaf_hash.clone())
-            .or_insert_with(|| withdrawal.clone());
-    }
+    let claim_retry = state.claim_retry.clone();
+    let retired_claim_withdrawals = state.retired_claim_withdrawals.clone();
+    insert_pending_claims(current_round_withdrawals, &mut pending_claim_withdrawals, &retired_claim_withdrawals);
 
     if !pre_round_is_catchup_batch && post_l2_is_catchup_batch {
         save_state(
@@ -902,6 +898,7 @@ async fn run_multichain(
             notify_coordinator: true,
             poll_timeout_secs: 0,
             poll_interval_secs: 5,
+            destination_chain_indices: chains.iter().map(|chain| u64::from(chain.chain_index)).collect(),
         };
 
         let mut round_withdrawals = Vec::new();
@@ -939,9 +936,7 @@ async fn run_multichain(
             }
             let range = PendingFinalizationRange { from_checkpoint, to_checkpoint: endpoint };
             state.pending_finalization_range = Some(range);
-            for withdrawal in &round_withdrawals {
-                state.pending_claim_withdrawals.insert(withdrawal.leaf_hash.clone(), withdrawal.clone());
-            }
+            insert_pending_claims(&round_withdrawals, &mut state.pending_claim_withdrawals, &state.retired_claim_withdrawals);
             save_multichain_state(&state_path, &state)?;
             endpoint
         } else {
@@ -1003,17 +998,16 @@ async fn run_multichain(
                     .filter(|w| w.destination_chain_index == u64::from(chain.chain_index))
                     .collect::<Vec<_>>();
                 if claims.is_empty() { continue; }
-                if let Ok(report) = chain.l1.claim_withdrawals(&claims, &chain.config, to_checkpoint).await {
-                    apply_claim_report(&mut state.pending_claim_withdrawals, &report);
-                    record_claim_outcome(
-                        &claims,
-                        &report,
-                        &mut state.pending_claim_withdrawals,
-                        &mut state.claim_retry,
-                        &mut state.retired_claim_withdrawals,
-                        now_unix,
-                    );
-                }
+                let result = chain.l1.claim_withdrawals(&claims, &chain.config, to_checkpoint).await;
+                record_claim_result(
+                    &claims,
+                    &result,
+                    &mut state.pending_claim_withdrawals,
+                    &mut state.claim_retry,
+                    &mut state.retired_claim_withdrawals,
+                    now_unix,
+                );
+                save_multichain_state(&state_path, &state)?;
             }
             state.last_finalized_checkpoint = to_checkpoint;
             state.pending_finalization_range = None;
@@ -1105,6 +1099,7 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path)
             notify_coordinator: true,
             poll_timeout_secs: 120,
             poll_interval_secs: 5,
+            destination_chain_indices: Vec::new(),
         };
 
         let round_mode = if !window.has_confirmed_range() {
@@ -2107,6 +2102,48 @@ fn claims_to_attempt(
         .collect()
 }
 
+/// Replayed events must not automatically re-arm claims retired by the operator policy.
+fn insert_pending_claims(
+    withdrawals: &[propose_withdrawals::PendingWithdrawal],
+    pending: &mut HashMap<String, propose_withdrawals::PendingWithdrawal>,
+    retired: &HashMap<String, claim_attempts::RetiredClaim<propose_withdrawals::PendingWithdrawal>>,
+) -> bool {
+    let mut changed = false;
+    for withdrawal in withdrawals {
+        if retired.contains_key(&withdrawal.leaf_hash) {
+            continue;
+        }
+        if let std::collections::hash_map::Entry::Vacant(entry) = pending.entry(withdrawal.leaf_hash.clone()) {
+            entry.insert(withdrawal.clone());
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Count both per-leaf failures and errors that abort the entire claim batch.
+fn record_claim_result(
+    attempted: &[propose_withdrawals::PendingWithdrawal],
+    result: &anyhow::Result<claim_withdrawals::BatchWithdrawalsReport>,
+    pending: &mut HashMap<String, propose_withdrawals::PendingWithdrawal>,
+    retry: &mut HashMap<String, claim_attempts::ClaimAttempts>,
+    retired: &mut HashMap<String, claim_attempts::RetiredClaim<propose_withdrawals::PendingWithdrawal>>,
+    now_unix: u64,
+) {
+    match result {
+        Ok(report) => {
+            apply_claim_report(pending, report);
+            record_claim_outcome(attempted, report, pending, retry, retired, now_unix);
+        }
+        Err(error) => {
+            let reason = format!("claim batch failed: {error:#}");
+            for withdrawal in attempted {
+                record_claim_failure(withdrawal, &reason, pending, retry, retired, now_unix);
+            }
+        }
+    }
+}
+
 /// Book one round's outcome against the durable attempt count.
 ///
 /// A claim counts as failed when it was attempted and did not resolve — not
@@ -2332,20 +2369,19 @@ async fn settle_pending_claim_withdrawals(
         return is_catchup_batch;
     }
 
-    match l1
+    let result = l1
         .claim_withdrawals(&to_claim, config, claim_cursor_checkpoint)
-        .await
-    {
+        .await;
+    record_claim_result(
+        &to_claim,
+        &result,
+        pending_claim_withdrawals,
+        claim_retry,
+        retired_claim_withdrawals,
+        now_unix,
+    );
+    match result {
         Ok(report) => {
-            apply_claim_report(pending_claim_withdrawals, &report);
-            record_claim_outcome(
-                &to_claim,
-                &report,
-                pending_claim_withdrawals,
-                claim_retry,
-                retired_claim_withdrawals,
-                now_unix,
-            );
             if report.failure_reasons.is_empty() {
                 tracing::info!(
                     claim_cursor_checkpoint,
@@ -2375,7 +2411,7 @@ async fn settle_pending_claim_withdrawals(
                 claim_cursor_checkpoint,
                 error = %err,
                 pending_claims = pending_claim_withdrawals.len(),
-                "withdrawal claims failed; keeping pending set for retry"
+                "withdrawal claim batch failed; retry limits applied"
             );
         }
     }
@@ -2392,16 +2428,7 @@ fn persist_claim_withdrawals_before_l2_submit(
     }
 
     let mut persisted = load_state(state_path)?;
-    let mut changed = false;
-    for withdrawal in withdrawals {
-        if let std::collections::hash_map::Entry::Vacant(entry) = persisted
-            .pending_claim_withdrawals
-            .entry(withdrawal.leaf_hash.clone())
-        {
-            entry.insert(withdrawal.clone());
-            changed = true;
-        }
-    }
+    let changed = insert_pending_claims(withdrawals, &mut persisted.pending_claim_withdrawals, &persisted.retired_claim_withdrawals);
     if changed {
         save_state(state_path, &persisted).context("failed to persist pending claims before L2 submission")?;
     }
@@ -2568,7 +2595,7 @@ async fn build_l2_call_plan(
             propose_args,
             withdrawal_from_checkpoint,
             to_checkpoint.saturating_add(1),
-            l2_withdrawal_global_count,
+            &[(source_chain_index, l2_withdrawal_next_index)],
         )
         .await?
     } else {
@@ -2613,6 +2640,7 @@ async fn build_multichain_l2_plan(
     let http = crate::bridge::api_client::build_default_http_client()?;
     let mut progress = Vec::with_capacity(chains.len());
     let mut calls = Vec::new();
+    let mut withdrawal_chain_offsets: Vec<(u64, u64)> = Vec::with_capacity(chains.len());
 
     for chain in chains {
         let (proved, pending) = chain
@@ -2637,6 +2665,17 @@ async fn build_multichain_l2_plan(
             u64::from(chain.chain_index),
         ).await?).context("L2 per-chain deposit count exceeds u32")?;
         ensure!(l2_count <= pending, "chain {} L2 deposit count exceeds L1 pending count", chain.chain_index);
+
+        if append_business {
+            // Per-chain L2 withdrawal-tree cursor: psy-services requires a
+            // destination_chain_index filter per query once multiple L1 chains
+            // are indexed, and each filtered stream is offset by the number of
+            // that chain's withdrawals already appended on L2.
+            let withdrawal_next_index = provider
+                .get_withdrawal_tree_next_index(checkpoint, BRIDGE_USER_ID_U64, u64::from(chain.chain_index))
+                .await?;
+            withdrawal_chain_offsets.push((u64::from(chain.chain_index), withdrawal_next_index));
+        }
 
         if append_business && pending > l2_count {
             let snapshot = crate::bridge::api_client::fetch_services_deposit_tree_root(
@@ -2664,14 +2703,11 @@ async fn build_multichain_l2_plan(
     calls.sort_by_key(|call| call.inputs.first().copied().unwrap_or(u64::MAX));
 
     let withdrawals = if append_business {
-        let global_count = provider
-            .get_withdrawal_tree_global_count(checkpoint, BRIDGE_USER_ID_U64)
-            .await?;
         propose_withdrawals::fetch_pending_bridge_withdrawals(
             propose_args,
             from_checkpoint.max(1),
             to_checkpoint.saturating_add(1),
-            global_count,
+            &withdrawal_chain_offsets,
         ).await?
     } else {
         Vec::new()
@@ -3807,7 +3843,7 @@ mod tests {
 
     // ── claim backoff wiring ───────────────────────────────────────────────
     //
-    // The unit tests for the pacing itself live in claim_backoff. These pin the
+    // The unit tests for the counter itself live in claim_attempts. These pin the
     // part that made the incident expensive: which withdrawals a round actually
     // hands to the claim path, and what happens to one that never succeeds.
 
@@ -4050,6 +4086,131 @@ mod tests {
         );
         assert!(retry.contains_key("a"));
         assert!(!retry.contains_key("b"), "b was never tried this round");
+    }
+
+    #[test]
+    fn whole_batch_errors_exhaust_budget_across_single_chain_restarts() {
+        let path = temp_state_path("batch-error-restarts");
+        let failed = withdrawal_for_chain("failed", 0);
+        let untouched = withdrawal_for_chain("untouched", 1);
+        let mut state = DaemonState::default();
+        insert_pending_claims(&[failed.clone(), untouched], &mut state.pending_claim_withdrawals, &state.retired_claim_withdrawals);
+
+        for attempt in 1..=claim_attempts::CLAIM_MAX_ATTEMPTS {
+            record_claim_result(
+                &[failed.clone()],
+                &Err(anyhow::anyhow!("RPC unavailable")),
+                &mut state.pending_claim_withdrawals,
+                &mut state.claim_retry,
+                &mut state.retired_claim_withdrawals,
+                u64::from(attempt),
+            );
+            save_state(&path, &state).unwrap();
+            state = load_state(&path).unwrap();
+            if attempt < claim_attempts::CLAIM_MAX_ATTEMPTS {
+                assert_eq!(state.claim_retry["failed"].attempts, attempt);
+            }
+        }
+
+        assert!(!state.pending_claim_withdrawals.contains_key("failed"));
+        assert!(state.pending_claim_withdrawals.contains_key("untouched"));
+        assert!(state.claim_retry.is_empty());
+        let retired = &state.retired_claim_withdrawals["failed"];
+        assert_eq!(retired.attempts, claim_attempts::CLAIM_MAX_ATTEMPTS);
+        assert_eq!(retired.withdrawal.leaf_hash, "failed");
+        assert_eq!(retired.last_reason, "claim batch failed: RPC unavailable");
+        assert_eq!(retired.retired_at_unix, 3);
+
+        persist_claim_withdrawals_before_l2_submit(&path, &[failed]).unwrap();
+        assert!(!load_state(&path).unwrap().pending_claim_withdrawals.contains_key("failed"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn multichain_retirement_survives_restart_and_replayed_scans() {
+        let path = temp_state_path("multichain-retirement");
+        let failed = withdrawal_for_chain("failed", 0);
+        let healthy = withdrawal_for_chain("healthy", 2);
+        let range = PendingFinalizationRange { from_checkpoint: 10, to_checkpoint: 20 };
+        let mut state = MultichainDaemonState {
+            identity_namespace: "three-chains".to_string(),
+            last_finalized_checkpoint: 9,
+            pending_finalization_range: Some(range),
+            finalized_chains: served(&[0, 1]),
+            ..Default::default()
+        };
+        insert_pending_claims(&[failed.clone(), healthy.clone()], &mut state.pending_claim_withdrawals, &state.retired_claim_withdrawals);
+        for attempt in 1..=claim_attempts::CLAIM_MAX_ATTEMPTS {
+            let mut report = empty_report();
+            report.failure_reasons.insert("failed".to_string(), "invalid proof".to_string());
+            record_claim_result(
+                &[failed.clone()], &Ok(report), &mut state.pending_claim_withdrawals,
+                &mut state.claim_retry, &mut state.retired_claim_withdrawals, u64::from(attempt),
+            );
+            save_multichain_state(&path, &state).unwrap();
+            state = load_multichain_state(&path, "three-chains").unwrap();
+        }
+
+        assert_eq!(state.last_finalized_checkpoint, 9);
+        assert_eq!(state.pending_finalization_range, Some(range));
+        assert_eq!(state.finalized_chains, served(&[0, 1]));
+        assert_eq!(state.retired_claim_withdrawals["failed"].attempts, 3);
+        for _ in 0..10 {
+            assert!(!insert_pending_claims(
+                &[failed.clone(), healthy.clone()], &mut state.pending_claim_withdrawals, &state.retired_claim_withdrawals,
+            ));
+            let due = claims_to_attempt(&state.pending_claim_withdrawals, &state.claim_retry);
+            assert_eq!(due.len(), 1);
+            assert_eq!(due[0].leaf_hash, "healthy");
+        }
+
+        let mut resolved = empty_report();
+        resolved.resolved_leaf_hashes.push("healthy".to_string());
+        record_claim_result(
+            &[healthy], &Ok(resolved), &mut state.pending_claim_withdrawals,
+            &mut state.claim_retry, &mut state.retired_claim_withdrawals, 4,
+        );
+        assert!(state.pending_claim_withdrawals.is_empty());
+        assert_eq!(state.retired_claim_withdrawals.len(), 1);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn post_l2_replay_does_not_rearm_retired_claims() {
+        let retired = withdrawal_for_chain("retired", 0);
+        let fresh = withdrawal_for_chain("fresh", 1);
+        let mut state = DaemonState::default();
+        state.retired_claim_withdrawals.insert("retired".to_string(), claim_attempts::RetiredClaim {
+            withdrawal: retired.clone(), attempts: 3, last_reason: "invalid proof".to_string(), retired_at_unix: 1,
+        });
+        for is_catchup in [false, true] {
+            let path = temp_state_path("post-l2-retired");
+            let result = orchestrate_post_l2_round(
+                &path, &state, &[retired.clone(), fresh.clone()], false, is_catchup,
+                |_, pending| async move { pending },
+            ).await.unwrap();
+            let pending = match result {
+                PostL2Orchestration::Deferred => {
+                    let loaded = load_state(&path).unwrap();
+                    assert_eq!(loaded.retired_claim_withdrawals.len(), 1);
+                    fs::remove_file(path).unwrap();
+                    loaded.pending_claim_withdrawals
+                }
+                PostL2Orchestration::Dispatch(pending) => pending,
+            };
+            assert_eq!(pending.len(), 1);
+            assert!(pending.contains_key("fresh"));
+        }
+    }
+
+    #[test]
+    fn old_multichain_state_without_retry_fields_remains_readable() {
+        let state: MultichainDaemonState = toml::from_str(
+            "identity_namespace = 'three-chains'\nlast_finalized_checkpoint = 42\n",
+        ).unwrap();
+        assert_eq!(state.last_finalized_checkpoint, 42);
+        assert!(state.claim_retry.is_empty());
+        assert!(state.retired_claim_withdrawals.is_empty());
     }
 
     #[test]

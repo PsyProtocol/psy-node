@@ -27,6 +27,8 @@ source "$CONFIG_FILE"
 source "$SOURCE_VERSIONS_FILE"
 set +a
 
+bash "$REPO_ROOT/deploy/gcp/verify-relayer-source.sh" "$REPO_ROOT"
+
 # shellcheck source=../../gcp/lib/multichain.sh
 source "$REPO_ROOT/deploy/gcp/lib/multichain.sh"
 multichain_enabled || fail "MULTICHAIN_L1_ENABLED must be 1"
