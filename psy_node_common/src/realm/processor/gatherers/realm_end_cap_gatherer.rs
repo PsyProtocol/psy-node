@@ -489,6 +489,7 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
 pub(crate) async fn load_checkpoint_validator<N, S>(
     tree_store: &S,
     status: &RealmProcessorCoreState<N::QHash>,
+    checkpoint_id: u64,
 ) -> anyhow::Result<(
     psy_data::p2p::ValidatorLeafPreimage,
     MerkleProofCore<N::QHash>,
@@ -498,7 +499,6 @@ where
     N: QNetworkTypesConfig,
     S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync + ?Sized,
 {
-    let checkpoint_id = status.gathering_checkpoint_id;
     let realm_id = status.realm_identifier.realm_id as u32;
     let realm_sub_id = status.realm_identifier.realm_sub_id;
     let validator_index = psy_data::guta::realm_finalize::validator_tree_index(realm_id, realm_sub_id);
@@ -523,13 +523,18 @@ where
 impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>, FileSystem: TokioLikeFileSystem>
     RealmGUTAEndCapGathererConfig<N, TempDatabase, FileSystem>
 {
-    pub(crate) async fn load_realm_guta_validator_proofs(&self, status: &RealmProcessorCoreState<N::QHash>) -> anyhow::Result<RealmGUTAValidatorProofs<N::F, N::QHash>> {
+    pub(crate) async fn load_realm_guta_validator_proofs(
+        &self,
+        status: &RealmProcessorCoreState<N::QHash>,
+        checkpoint_id: u64,
+    ) -> anyhow::Result<RealmGUTAValidatorProofs<N::F, N::QHash>> {
         anyhow::ensure!(psy_config::CHECKPOINTS_PER_EPOCH > 0, "Realm finalization requires rotation");
-        let checkpoint_id = status.gathering_checkpoint_id;
+        let checkpoint_root = self.tree_store.checkpoint_tree_get_root_hash(checkpoint_id).await?;
         let target = checkpoint_id.checked_add(1).ok_or_else(|| anyhow::anyhow!("Checkpoint overflow"))?;
         let epoch = parth_common::realm_rotation::epoch(target, psy_config::CHECKPOINTS_PER_EPOCH);
         let anchor_id = parth_common::realm_rotation::anchor_checkpoint_id(epoch, psy_config::CHECKPOINTS_PER_EPOCH);
-        let (preimage, validator_tree_proof, roots) = load_checkpoint_validator::<N, _>(self.tree_store.as_ref(), status).await?;
+        let (preimage, validator_tree_proof, roots) =
+            load_checkpoint_validator::<N, _>(self.tree_store.as_ref(), status, checkpoint_id).await?;
         let user_id = preimage.validator_user_id;
         let min_user_id = self.realm_id_u64 << N::REALM_GLOBAL_USER_TREE_HEIGHT;
         let max_user_id = (self.realm_id_u64 + 1) << N::REALM_GLOBAL_USER_TREE_HEIGHT;
@@ -543,12 +548,12 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
         let anchor_checkpoint_tree_proof = self.tree_store.checkpoint_tree_get_merkle_proof(checkpoint_id, anchor_id).await?;
         let (validator_user_tree_proof, old_realm_root_proof) = validator_user_tree_proofs::<N, _>(
             self.tree_store.as_ref(), checkpoint_id, user_id, self.realm_id_u64).await?;
-        anyhow::ensure!(checkpoint_tree_proof.root == status.gathering_checkpoint_root
+        anyhow::ensure!(checkpoint_tree_proof.root == checkpoint_root
             && checkpoint_tree_proof.value == checkpoint_leaf.qfhash::<N::HasherBase>()
             && checkpoint_tree_proof.verify::<N::HasherBase>()
-            && anchor_checkpoint_tree_proof.root == status.gathering_checkpoint_root
+            && anchor_checkpoint_tree_proof.root == checkpoint_root
             && anchor_checkpoint_tree_proof.value == anchor_checkpoint_leaf.qfhash::<N::HasherBase>()
-            && anchor_checkpoint_tree_proof.verify::<N::HasherBase>(), "Checkpoint proofs do not match gathering state");
+            && anchor_checkpoint_tree_proof.verify::<N::HasherBase>(), "Checkpoint proofs do not match proof base");
         anyhow::ensure!(validator_user_tree_proof.root == roots.user_tree_root,
             "Validator user proof root {:?} does not match stored user tree root {:?}",
             validator_user_tree_proof.root, roots.user_tree_root);
@@ -887,7 +892,8 @@ impl<
             .map_err(|_| anyhow::anyhow!("error reading gathering snapshot"))?.clone();
         // The validator is checkpoint-bound: authenticated from the persisted
         // validator tree at the gathering checkpoint, never from Genesis.
-        let (validator_preimage, _, _) = load_checkpoint_validator::<N, _>(config.tree_store.as_ref(), &status).await?;
+        let (validator_preimage, _, _) = load_checkpoint_validator::<N, _>(
+            config.tree_store.as_ref(), &status, status.gathering_checkpoint_id).await?;
         let user_id = validator_preimage.validator_user_id;
         let min_user_id = config.realm_id_u64 << N::REALM_GLOBAL_USER_TREE_HEIGHT;
         anyhow::ensure!(user_id >= min_user_id && user_id - min_user_id < (1u64 << N::REALM_GLOBAL_USER_TREE_HEIGHT),
@@ -1093,49 +1099,43 @@ impl<
                 self.start_global_user_tree_root
             );
         }
-        // Validator proofs are loaded at finalize.
-        let proofs = self.config.load_realm_guta_validator_proofs(&authenticated).await?;
-        if authenticated.gathering_checkpoint_id != self.guta_planner.current_checkpoint_id
-            || authenticated.gathering_checkpoint_root != self.guta_planner.current_checkpoint_root {
-            // Checkpoint-advance rebase: rebuild the planner bound to the
-            // authentic checkpoint, replay the owned inputs, and truncate-
-            // replace the pending backup in place. Witness is bound and the
-            // account leaf is preserved; no .replay staging exists.
-            let accepted = self.guta_planner.accepted_end_cap_jobs.clone();
-            let pending = self.guta_planner.future_pending_end_cap_jobs.clone();
-            let mut rebuilt_tree = tree.clone();
-            rebuilt_tree.revert_changes();
-            anyhow::ensure!(rebuilt_tree.get_root() == self.start_global_user_tree_root,
-                "authoritative rebase does not match cycle start");
-            let mut rebuilt = RealmGUTAPlanner::<N::F, N::QHash>::new(
-                self.guta_planner.chain_id, self.guta_planner.realm_identifier,
-                authenticated.gathering_checkpoint_root, authenticated.gathering_checkpoint_id,
-                self.status.gathering_unique_pending_id, self.start_global_user_tree_root,
-                N::REALM_GLOBAL_USER_TREE_HEIGHT, N::GLOBAL_USER_TREE_HEIGHT,
-                self.config.coordinator_guta_updates_circuit_whitelist);
-            // Leaf preservation: the retained account leaf seeds the rebuilt planner.
-            rebuilt.current_validator_user_leaf = Some(self.gathering_start_validator_user_leaf.clone());
-            rebuilt.set_validator_proofs(proofs)?;
-            self.new_realm_end_cap_gatherer_file.seek(tokio::io::SeekFrom::Start(4 + 32 + 32 + 8)).await?;
-            rebuilt.add_future_end_cap_jobs(&self.config.checkpoint_tree, &mut rebuilt_tree,
-                &mut self.new_realm_end_cap_gatherer_file, self.config.temp_db.clone(), accepted).await?;
-            rebuilt.add_future_end_cap_jobs(&self.config.checkpoint_tree, &mut rebuilt_tree,
-                &mut self.new_realm_end_cap_gatherer_file, self.config.temp_db.clone(), pending).await?;
-            let replay_end = self.new_realm_end_cap_gatherer_file.stream_position().await?;
-            self.new_realm_end_cap_gatherer_file.file_like_set_len(replay_end).await?;
-            self.config
-                .file_system
-                .file_like_fs_flush_file_with_path(&self.pending_file_path, &mut self.new_realm_end_cap_gatherer_file)
-                .await?;
-            self.config
-                .file_system
-                .file_like_fs_sync_file_with_path(&self.pending_file_path, &mut self.new_realm_end_cap_gatherer_file)
-                .await?;
-            *tree = rebuilt_tree;
-            self.guta_planner = rebuilt;
-        } else {
-            self.guta_planner.set_validator_proofs(proofs)?;
+        let planner_checkpoint_id = self.guta_planner.current_checkpoint_id;
+        let (_, planner_realm_root_proof) = validator_user_tree_proofs::<N, _>(
+            self.config.tree_store.as_ref(),
+            planner_checkpoint_id,
+            self.gathering_start_validator_user_leaf.user_id.to_u64_value(),
+            self.config.realm_id_u64,
+        )
+        .await?;
+        if planner_realm_root_proof.value != self.start_global_user_tree_root {
+            tracing::warn!(
+                "Discarding EndCap generation whose proof base {} does not authenticate cycle start {:?}",
+                planner_checkpoint_id,
+                self.start_global_user_tree_root
+            );
+            tree.revert_changes();
+            self.guta_planner.current_validator_user_leaf = Some(self.gathering_start_validator_user_leaf.clone());
+            *self.config.current_validator_user_leaf.lock()
+                .map_err(|_| anyhow::anyhow!("error writing current validator leaf"))? =
+                self.gathering_start_validator_user_leaf.clone();
+            let reverted_root = tree.get_root();
+            publish_gathering_snapshot_if_current(&self.config.status, &self.status, reverted_root);
+            return Ok(RealmGUTAEndCapGathererOutput {
+                db_output: RealmGUTAEndCapGathererOutputDatabase::<N::F, N::QHash>::get_empty(reverted_root),
+                job_ids: vec![],
+            });
         }
+        let proof_checkpoint_root = self
+            .config
+            .tree_store
+            .checkpoint_tree_get_root_hash(planner_checkpoint_id)
+            .await?;
+        let proofs = self
+            .config
+            .load_realm_guta_validator_proofs(&authenticated, planner_checkpoint_id)
+            .await?;
+        self.guta_planner.current_checkpoint_root = proof_checkpoint_root;
+        self.guta_planner.set_validator_proofs(proofs)?;
         tracing::info!(
             "Committing GUTA updates gatherer changes for pending id {}, finalizing root {:?}",
             self.status.gathering_unique_pending_id,
@@ -1248,7 +1248,8 @@ impl<
             "invalid FFS user leaf length");
         let status = config.status.read()
             .map_err(|_| anyhow::anyhow!("error reading gathering snapshot"))?.clone();
-        let (preimage, _, _) = load_checkpoint_validator::<N, _>(config.tree_store.as_ref(), &status).await?;
+        let (preimage, _, _) = load_checkpoint_validator::<N, _>(
+            config.tree_store.as_ref(), &status, status.gathering_checkpoint_id).await?;
         let user_id = preimage.validator_user_id;
         apply_state_updates_to_tree(
             tree,

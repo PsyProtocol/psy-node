@@ -390,32 +390,13 @@ where
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("GUTA checkpoint tree root has no canonical checkpoint ID"))?;
             if !self.is_scheduled_proposer_for_base(base_checkpoint_id).await? {
-                tracing::warn!(
-                    "realm P2P nonempty gather is not scheduled at T=base+1 realm={} sub={} base={} end_caps={}; skipping prove/submit/commit so the next gatherer cycle rebases",
+                anyhow::bail!(
+                    "realm P2P nonempty gather is not scheduled at T=base+1 realm={} sub={} base={} end_caps={}; refusing to sync after gatherer tree commit",
                     self.db.state.realm_id_u64,
                     self.db.state.realm_sub_id_u64,
                     base_checkpoint_id,
                     guta_update.total_users_updated
                 );
-                self.db.sync_to_coordinator_set_checkpoint_id().await?;
-                if let Err(err) = self
-                    .db
-                    .proof_work_queue
-                    .delete_worker_queue_consumer(
-                        &worker_queue_key_for_cleanup,
-                        self.db.state.realm_id_u64,
-                        self.db.state.realm_sub_id_u64,
-                        worker_unique_id_for_cleanup,
-                        0,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        "Failed to delete realm worker queue consumer after unscheduled nonempty gather: {}",
-                        err
-                    );
-                }
-                return Ok(());
             }
         }
 

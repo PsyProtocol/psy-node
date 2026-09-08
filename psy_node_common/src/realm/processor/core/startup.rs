@@ -67,7 +67,8 @@ where
         tracing::info!("intialized realm processor database, building gatherers...");
         // Fail closed: the shared validator account leaf is loaded from the
         // checkpoint-bound validator preimage before any builder is created.
-        let (validator_preimage, _, _) = load_checkpoint_validator::<N, _>(&db.db, &db.state).await?;
+        let (validator_preimage, _, _) = load_checkpoint_validator::<N, _>(
+            &db.db, &db.state, db.state.gathering_checkpoint_id).await?;
         let validator_leaf = db.db
             .get_user_leaf(db.state.gathering_checkpoint_id, validator_preimage.validator_user_id).await?;
         anyhow::ensure!(validator_leaf.user_id.to_u64_value() == validator_preimage.validator_user_id,
