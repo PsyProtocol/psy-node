@@ -81,6 +81,7 @@ psy_core/bindings/
 psy_data/bindings/
 psy_node_common/bindings/
 client_prover/psy_vm/bindings/
+client_prover/psy_provider/bindings/
 
 .pi
 .grok

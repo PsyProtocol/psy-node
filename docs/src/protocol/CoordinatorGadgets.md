@@ -229,7 +229,7 @@ Leaf / Part-1 / CST wrappers. Shared leaf PI helper: `compute_agg_state_trackabl
 
 -   **File:** `…/circuits/agg_user_registration_deploy_guta.rs` (core ~382)
 -   **Gadgets:** `VerifyAggUserRegistartionDeployContractsGUTAGadget` (+ header)
--   **PI:** Special Part-1 layout (state_transition_hash in `[0..4)`, not commitment) — [ProvingJobs.md](./ProvingJobs.md) §5 / `AUDIT_SCOPE` §1.7 C.
+-   **PI:** Special Part-1 layout (state_transition_hash in `[0..4)`, not commitment) — [ProvingJobs.md](./ProvingJobs.md) §5.
 
 ### `QEDCheckpointStateTransitionCircuit` (type 32)
 
