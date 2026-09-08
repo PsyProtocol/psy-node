@@ -11,13 +11,25 @@ INSTALLER="$ROOT/deploy/gcp/remote/install-psy-services-release.sh"
 source "$VERSIONS"
 [ "$EXPECTED_PSY_SERVICES_REPOSITORY" = "PsyProtocol/psy-services" ]
 [ "$EXPECTED_PSY_SERVICES_BRANCH" = "multi_chain" ]
-[ "$EXPECTED_PSY_SERVICES_COMMIT" = "9122e5de2d33ea6aba6d7bef101e742198879836" ]
+[ "$EXPECTED_PSY_SERVICES_COMMIT" = "d387102497405d6034a97c617164cc9ed9dc32ba" ]
 
 dry_run="$(DRY_RUN=1 bash "$DEPLOY")"
 grep -Fq 'build psy-services and psy-indexer only' <<<"$dry_run"
 grep -Fq 'untouched: /opt/parth/current' <<<"$dry_run"
 
 grep -Fq 'SKIP_PARTH_BUNDLE_UPLOAD=1' "$DEPLOY"
+ROLLBACK="$PROFILE/rollback-psy-services-update.sh"
+grep -Fq 'PSY_SERVICES_RUN_MIGRATIONS=false' "$ROLLBACK"
+grep -Fq 'EnvironmentFile=/etc/parth/psy-services-rollback.env' "$ROLLBACK"
+grep -Fq 'systemctl disable --now parth-psy-indexer@coordinator.service' "$ROLLBACK"
+if grep -Eq 'systemctl restart parth-psy-indexer@' "$ROLLBACK"; then
+  echo "rollback must not resume old registration writers" >&2
+  exit 1
+fi
+grep -Fq 'sudo rm -f /etc/systemd/system/parth-psy-services.service.d/90-rollback-migrations.conf /etc/parth/psy-services-rollback.env' "$DEPLOY"
+# Forward deployment delegates boot enablement to the shared service installer.
+grep -Fq 'deploy-psy-indexer.sh' "$DEPLOY"
+grep -Fq 'systemctl enable "$PARTH_SYSTEMD_UNIT"' "$ROOT/deploy/gcp/remote/deploy-parth-service.sh"
 if grep -Eq 'deploy_all\.sh|deploy-cp-ce-stack\.sh|deploy-relayer\.sh|deploy-prove-proxy\.sh|deploy-cf-' "$DEPLOY"; then
   echo "psy-services-only update references a broad deployment entrypoint" >&2
   exit 1

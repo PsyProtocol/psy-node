@@ -28,19 +28,24 @@ run_remote_command "$host" '
   [ -n "$previous" ] || { echo "no previous psy-services release" >&2; exit 1; }
   [ -n "$current" ] || { echo "no current psy-services release" >&2; exit 1; }
   [ "$previous" != "$current" ] || { echo "previous and current releases are identical" >&2; exit 1; }
+  # Migration 051 is a data repair. Old writers can undo it, and SQLx in an
+  # older release rejects migration versions absent from its directory.
+  sudo systemctl disable --now parth-psy-indexer@coordinator.service parth-psy-indexer@realm-0.service parth-psy-indexer@realm-1.service
+  sudo systemctl stop parth-psy-services.service
+  sudo install -d -m 0755 /etc/systemd/system/parth-psy-services.service.d
+  printf "%s\n" "PSY_SERVICES_RUN_MIGRATIONS=false" | sudo tee /etc/parth/psy-services-rollback.env >/dev/null
+  printf "%s\n" "[Service]" "EnvironmentFile=/etc/parth/psy-services-rollback.env" |
+    sudo tee /etc/systemd/system/parth-psy-services.service.d/90-rollback-migrations.conf >/dev/null
+  sudo systemctl daemon-reload
   sudo ln -s "$current" "$root/rollback-from.next.$$"
   sudo mv -Tf "$root/rollback-from.next.$$" "$root/previous"
   sudo ln -s "$previous" "$root/current.next.$$"
   sudo mv -Tf "$root/current.next.$$" "$root/current"
   sudo systemctl restart parth-psy-services.service
-  sudo systemctl restart parth-psy-indexer@coordinator.service
-  sudo systemctl restart parth-psy-indexer@realm-0.service
-  sudo systemctl restart parth-psy-indexer@realm-1.service
-  for unit in parth-psy-services.service parth-psy-indexer@coordinator.service parth-psy-indexer@realm-0.service parth-psy-indexer@realm-1.service; do
-    sudo systemctl is-active --quiet "$unit"
-  done
+  sudo systemctl is-active --quiet parth-psy-services.service
   echo "rolled back psy-services binaries to $previous"
+  echo "indexers intentionally remain stopped; old registration writers are unsafe after migration 051"
 '
 
 curl -fsS --max-time 15 "https://${PUBLIC_PSY_SERVICES_DOMAIN}/health" >/dev/null
-echo "[psy-services-rollback] health check passed"
+echo "[psy-services-rollback] API health passed; indexing is paused until a forward fix"

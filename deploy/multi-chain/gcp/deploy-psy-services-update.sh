@@ -61,6 +61,9 @@ ensure_parth_vm "$host"
 active_services_home="$(run_remote_command "$host" '
   set -e
   for unit in parth-psy-services.service parth-psy-indexer@coordinator.service parth-psy-indexer@realm-0.service parth-psy-indexer@realm-1.service; do
+    if [ "$unit" != parth-psy-services.service ] && sudo test -f /etc/parth/psy-services-rollback.env; then
+      continue
+    fi
     sudo systemctl is-active --quiet "$unit" || {
       echo "pre-deployment service is not active: $unit" >&2
       exit 1
@@ -96,6 +99,12 @@ indexer_units=(
 )
 quoted_units="$(printf ' %q' "${indexer_units[@]}")"
 run_remote_command "$host" "sudo systemctl stop$quoted_units"
+
+# Remove only our rollback override; the new release must apply migrations.
+run_remote_command "$host" '
+  sudo rm -f /etc/systemd/system/parth-psy-services.service.d/90-rollback-migrations.conf /etc/parth/psy-services-rollback.env
+  sudo systemctl daemon-reload
+'
 
 PSY_SERVICES_RUN_MIGRATIONS=true \
   bash "$REPO_ROOT/deploy/gcp/deploy-psy-services.sh"
