@@ -105,15 +105,14 @@ Part-1 and CST reward layouts are in [Reward Tree Circuit Layouts](reward-tree-c
 Entry: `realm/processor/core/process_block.rs:338`.
 
 1. Sanity check, then `get_results_from_gatherers` (`:169`): `set_new_unique_ids`, finalize the EndCap gatherer.
-2. If there is no root job: `sync_to_coordinator_set_checkpoint_id` and return. Do not write `processing_realm_end_root` (`:355-380`).
-3. If P2P rotation is enabled and this node is not the scheduled proposer for `T = base + 1`, sync and skip prove/submit/commit so the next gatherer cycle can rebase (`:385-417`).
-4. Record `processing_realm_end_root`, publish GUTA jobs, retrieve the root proof.
-5. Submit via `rc_submit_guta_proof` (circuit 63 + binding + certificate; see [RealmFinalizeGUTA BLS Authentication](realm-finalize-bls-auth.md)).
-6. `wait_for_realm_update_sync_with_coordinator(new_realm_root)`: confirm the coordinator tip carries that root, or bail on divergence.
-7. `commit_state` from the returned sync info.
-8. Fast-forward any coordinator checkpoints produced while waiting; delete the worker-queue consumer.
+2. If there is no root job, `sync_to_coordinator_set_checkpoint_id` and return without mutating `processing_realm_end_root`.
+3. If P2P rotation is enabled and the finalized proof base does not schedule this sub-ID for `T = base + 1`, fail closed without syncing after the gatherer tree commit.
+4. Record `processing_realm_end_root`, publish GUTA jobs, and retrieve the root proof.
+5. Submit circuit 63, the finalizer binding, Proposal, and Certificate through `rc_submit_guta_proof`.
+6. Wait until the Coordinator checkpoint carries the new Realm root, then commit the included state.
+7. Fast-forward any additional Coordinator checkpoints and delete the processing worker-queue consumer.
 
-Candidate A proving, P2P consensus, and Coordinator inclusion must overlap with builder B accepting EndCaps on A's end root. Do not insert a serial seal/wait/resume barrier that pauses B for the whole of A's prove and inclusion. A short seal that publishes the exact root before A proving may seed B; authoritative witness generation stays checkpoint-bound.
+Candidate A proving, P2P consensus, and Coordinator inclusion overlap with builder B accepting EndCaps on A's end root. B keeps its planner checkpoint when that checkpoint authenticates its cycle start. Otherwise B reverts and discards that generation before tree commit; it does not rebase or replay accepted EndCaps.
 
 ## 5. Commit ordering
 

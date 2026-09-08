@@ -92,11 +92,12 @@ Official block N is the processor's job. The gatherer may already hold EndCaps w
 
 Current contract (`realm_end_cap_gatherer.rs`):
 
-1. If `authenticated.gathering_realm_start_root != self.start_global_user_tree_root`, **fail closed** with `bail!` (do **not** return empty `Ok`); owned accepted/deferred inputs stay with the halted owner (`:1032-1042`).
-2. On official success with tree changes, after `commit_changes` the gatherer **does** call `publish_gathering_snapshot_if_current` with the committed live root (`:1128-1130`) so recreate bootstrap accepts the finalize-committed root.
-3. Revert publishes the reverted root via the same helper (`:1023`) because that path restores the committed start, not a speculative live end.
+1. If the shared gathering start does not match the cycle start, finalize fails closed without consuming the cycle.
+2. Validator and checkpoint proofs use the planner's fixed checkpoint rather than the advancing Coordinator head.
+3. If that checkpoint no longer authenticates the cycle start, finalize reverts the journal and returns an empty batch; accepted EndCaps from that generation are discarded by design.
+4. A successful finalize commits the tree and publishes the committed root so the next gathering generation can start while the processor proves and submits the completed generation.
 
-Official identity runs only when the gathering snapshot start equals this cycle start.
+FastForward remains the follower path for applying an included proposal; it is separate from generation discard.
 
 ## 4. Coordinator gatherers
 
