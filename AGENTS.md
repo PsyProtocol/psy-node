@@ -621,7 +621,7 @@ Required fields per note:
 
 ## Testing and Verification
 
-1. Put Rust unit tests in the source file and TypeScript tests adjacent to the implementation when practical.
+1. Rust unit tests go inline: `#[cfg(test)] mod tests { ... }` inside the source file that owns the code, whenever the block stays proportionate to that file. When the test volume no longer fits the source file, move it to the crate's `tests/` tree as an integration test instead — never create same-directory `*_tests.rs` / `#[path]` sibling files (the Go-style pattern of a sibling test file next to the source). TypeScript tests adjacent to the implementation when practical.
 2. Use standalone integration tests only for cross-module contracts or framework requirements.
 3. Tests must defend observable behavior, boundaries, invariants, transitions, precedence, and real errors.
 4. Do not use tautological assertions, status-only checks, or mocks that bypass the contract under test.
