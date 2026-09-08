@@ -20,6 +20,10 @@ Reusable Merkle / historical-root / Spiderman / variable-height gadgets that UPS
 - [6. DualVariableHeightDeltaMerkleProofGadget](#6-dualvariableheightdeltamerkleproofgadget)
 - [7. FrontierAppendGadget](#7-frontierappendgadget)
 - [8. FullMerkleTreeAppendGadget](#8-fullmerkletreeappendgadget)
+- [9. Client VariableHeightMerkleProofGadget](#9-client-variableheightmerkleproofgadget)
+- [10. Client VariableHeightDeltaMerkleProof family](#10-client-variableheightdeltamerkleproof-family)
+- [11. Client DPN/IMT helpers](#11-client-dpnimt-helpers)
+- [12. Out of scope / parallel variants](#12-out-of-scope--parallel-variants)
 
 ## 1. `MerkleProofGadget`
 
@@ -153,3 +157,97 @@ Reusable Merkle / historical-root / Spiderman / variable-height gadgets that UPS
 -   **Role:** Alternate append primitive; prefer frontier form for deposit batching.
 
 *(Bit helpers `merkle_proof_bits.rs` / `bits.rs` / `variable_height_delta_merkle_proof_index.rs` are support modules — covered via the gadgets above.)*
+
+
+---
+
+## 9. Client `VariableHeightMerkleProofGadget`
+
+*   **File:** `client_prover/psy_circuit/psy_common_circuit/src/hash/merkle/gadgets/variable_height_merkle_proof.rs` (core ~219)
+*   **Stack:** **Client only** (UPS/DPN). Node GUTA uses `QVariableHeightDeltaMerkleProofGadget` / `DualVariableHeightDelta…` instead (§5–§6).
+*   **Purpose:** Inclusion proof with effective height `h` where `1 ≤ h ≤ max_height`; levels at/above `h` are skipped (state unchanged).
+*   **Private / Witness:** `index`, `value`, `siblings[max_height]`, `height` (or constant height target).
+*   **Constraints (pseudocode):**
+```text
+    assert 1 <= height <= max_height; range_check(index, max_height)
+    bits = split_le(index, max_height)
+    state = value
+    for i in 0..max_height:
+      hashed = two_to_one_swapped(state, sib[i], bits[i])
+      state = select(i >= height, state, hashed)   // skip above effective height
+    root = state
+    // optional: expose subtree-root index / path direction for IMT / NCA callers
+    ```
+*   **Role:** DPN VM `StateReaderGadget` — `IMTExternalRead` / `IMTOtherUserRead` / `IMTContainsOtherUser` and generic `VariableHeightMerkleProof` state cmds bind contract-state slots under a variable-height path (`state_readers.rs`).
+
+---
+
+## 10. Client VariableHeightDeltaMerkleProof family
+
+### `VariableHeightDeltaMerkleProofGadget`
+
+*   **File:** `…/variable_height_delta_merkle_proof.rs` (core ~183)
+*   **Purpose:** Same-sibling old→new leaf with variable effective height (`VariableHeightBitInfo`: `is_bit_not_within_height`, `is_first_bit_outside_height`).
+*   **Constraints (pseudocode):**
+```text
+    bit_info from index bits + height
+    old_root = fold_vh(old_value, siblings, bit_info)
+    new_root = fold_vh(new_value, siblings, bit_info)
+    ```
+*   **Role:** Base client VH-delta; subtree helpers may expose parent index / right-child flags.
+
+### `VariableHeightDeltaMerkleProofOptGadget`
+
+*   **File:** `…/variable_height_delta_merkle_proof_opt.rs` (core ~386)
+*   **Purpose:** Optimized VH-delta used by client treeprover / NCA merge (`sub_tree_top_line.rs`, `UpdateNearestCommonAncestorProofOptGadget` in `sub_tree_update_proof_opt.rs`).
+*   **Role:** Client-side nearest-common-ancestor style merges (historical GUTA-adjacent helpers). Live **node** GUTA aggregation uses node `DualVariableHeightDeltaMerkleProofGadget` instead.
+
+### `VariableHeightDeltaMerkleProofOptV2Gadget`
+
+*   **File:** `…/variable_height_delta_merkle_proof_opt_v2.rs` (core ~212)
+*   **Purpose:** Second opt revision of the same VH-delta API (tests + opt NCA path). Prefer Opt or V2 consistently with the importing caller; do not mix bit-info layouts across a single proof.
+
+### Relation to node stack
+
+| Client | Node (GUTA/Bridge/Coord) |
+|---|---|
+| `VariableHeightMerkleProofGadget` (inclusion) | Fixed `MerkleProofGadget` or VH via delta gadgets |
+| `VariableHeightDeltaMerkleProofGadget` / Opt / OptV2 | `QVariableHeightDeltaMerkleProofGadget`, `DualVariableHeightDeltaMerkleProofGadget` |
+
+---
+
+## 11. Client DPN/IMT helpers
+
+Used heavily by DPN `StateReaderGadget` (see [PrivacyCircuits.md](./PrivacyCircuits.md) §5).
+
+### `SubSlotMerkleProofBatchGadget` / `SubSlotDeltaMerkleProofBatchGadget`
+
+*   **Files:** `sub_slot_merkle_proof_batch.rs` (core ~84); `sub_slot_delta_merkle_proof_batch.rs` (core ~260)
+*   **Purpose:** Batch fixed-width sub-slot inclusion / delta updates under a contract-state packing layout.
+*   **Role:** DPN state cmds that touch packed sub-slots inside a user-contract tree.
+
+### `IMTUpdateGadget` / `IMTInsertGadget` (`imt_contract_state_update.rs`)
+
+*   **File:** `imt_contract_state_update.rs` (core ~228)
+*   **Purpose:** Indexed Merkle Tree leaf update (1 delta) or insert (predecessor + new-leaf deltas) with ordered-leaf constraints (`is_qhashout_lt`).
+*   **Role:** DPN IMT set/read paths composed in `state_readers.rs` (`IMTSetGadget`, `IMTReadGadget`, …).
+
+### `UpdateNearestCommonAncestorProofGadget` / `…OptGadget`
+
+*   **Files:** `sub_tree_update_proof.rs` (core ~124); `sub_tree_update_proof_opt.rs` (wraps Opt VH-delta)
+*   **Purpose:** Merge two VH-deltas that share an NCA into one parent transition (client NCA gadget; **not** the live node `DualVariableHeightStateTransitionGadget`).
+*   **Role:** Client treeprover / historical GUTA proof-input tooling.
+
+---
+
+## 12. Out of scope / parallel variants
+
+Documented for inventory; **not** required reading for the live Plonky2 node+bridge audit path unless a caller is in scope:
+
+| Path | Note |
+|---|---|
+| `…/sha256/` / `sha256_truncated/` / `generic/` merkle+delta | Alternate hash stacks |
+| `old_historical_merkle_proof.rs` | Superseded by `HistoricalRootMerkleProofGadget` |
+| `append_many_merkle_proof.rs` | Empty / non-core in this worktree |
+| `merkle_array_gen.rs` | Helper for 2-bit array Merkle enforcement (DPN) |
+| Client vs node `SpidermanAppendProofGadget` | Both covered in §4; node has `allow_existing` / `allow_overwrite` |

@@ -2,13 +2,13 @@
 
 This protocol reference covers client-side shield deposit claim and private note inclusion circuits, alongside the [circuit index](Circuits.md) and [gadget index](Gadgets.md).
 
-> Updated: 2026-09-08. Source of truth: `client_prover/psy_circuit/psy_dpn_circuit/src/circuits/privacy/`.
+> Updated: 2026-09-08. Source of truth: `client_prover/psy_circuit/psy_dpn_circuit/src/circuits/privacy/` and `…/vm/`.
 > Core line counts exclude blank lines, `//` comments, block comments, and `#[cfg(test)]` modules.
 > Token precompile fingerprints (`private_note_inclusion_fingerprint`, `shield_claim_fingerprint`) must match these circuits; see [`docs/src/dev/token-privacy-circuit-fingerprints.md`](../dev/token-privacy-circuit-fingerprints.md).
 
 ## Abstract
 
-Client-side privacy circuits used by shield deposit claim and private note inclusion. Protocol alias: `DepositInclusionCircuit` ≡ `ShieldDepositClaimCircuit`.
+Client-side privacy circuits (shield deposit / private note) plus the DPN VM gadgets behind `DapenContractFunctionCircuit`. Protocol alias: `DepositInclusionCircuit` ≡ `ShieldDepositClaimCircuit`.
 
 ## Table of Contents
 
@@ -16,6 +16,7 @@ Client-side privacy circuits used by shield deposit claim and private note inclu
 - [2. PrivateNoteInclusionCircuit](#2-privatenoteinclusioncircuit)
 - [3. SlotValueInContractStateGadget (DPN)](#3-slotvalueincontractstategadget-dpn)
 - [4. DapenContractFunctionCircuit (CFC)](#4-dapencontractfunctioncircuit-cfc)
+- [5. DPN VM gadgets (CFC body)](#5-dpn-vm-gadgets-cfc-body)
 
 ## 1. `DepositInclusionCircuit` (`ShieldDepositClaimCircuit`)
 
@@ -88,6 +89,53 @@ Client-side privacy circuits used by shield deposit claim and private note inclu
     ```
 
 -   **Role:** Per-method CFC proofs verified inside `UPSVerifyCFCProofExistsAndValidGadget`. Not a privacy-nullifier circuit; listed here because it shares the `psy_dpn_circuit` crate with privacy circuits.
+
+
+---
+
+## 5. DPN VM gadgets (CFC body)
+
+These gadgets implement contract-method execution witnesses consumed by `DapenContractFunctionCircuit` (§4). Merkle primitives are client-stack gadgets in [CommonMerkleGadgets.md](./CommonMerkleGadgets.md) §9–§11.
+
+### `PsyContractFunctionBuilderGadget`
+
+*   **File:** `client_prover/psy_circuit/psy_dpn_circuit/src/vm/compile.rs` (core ~227)
+*   **Purpose:** Lower a `DPNFunctionCircuitDefinition` into circuit wires: allocate inputs, run opcode/state-cmd sequence via `SimpleDPNBuilder`, bind `StateReaderGadget`, emit tx context + outputs.
+*   **Private / Witness:** Method inputs; per-cmd state-reader witnesses; session proof-tree root; CFC user tx input context.
+*   **Constraints (pseudocode):**
+    ```text
+    state_reader = StateReaderGadget(heights…)
+    for each opcode/state_cmd in fn_def:
+      results = dispatch(cmd, state_reader, inputs)
+    tx_ctx_header binds contract inclusion / call metadata
+    outputs = declared circuit outputs
+    ```
+*   **Role:** Sole builder inside `DapenContractFunctionCircuit::new`.
+
+### `StateReaderGadget`
+
+*   **File:** `client_prover/psy_circuit/psy_dpn_circuit/src/vm/gadgets/state_readers.rs` (core ~1930; large dispatch table)
+*   **Purpose:** Typed portfolio of state-access gadgets selected by `StateReaderReferenceKeyType` (Merkle / Delta / Historical / VH Merkle / SubSlot / IMT / ClearTree / …).
+*   **Key composed gadgets (pseudocode roles):**
+    ```
+    MerkleProofGadget              — fixed-height inclusion (UCON / GCON / user leaf)
+    DeltaMerkleProofGadget         — slot / tree updates
+    HistoricalRootMerkleProofGadget— debt / checkpoint pivots
+    VariableHeightMerkleProofGadget— variable-height slot proofs (other-user / external IMT reads)
+    SubSlot*BatchGadget            — packed sub-slot read/update batches
+    IMTSet/Read/External/OtherUser — IMT leaf ops via imt_contract_state_update + VH proofs
+    ClearEntireTreeGadget          — force empty root at a height
+    ```
+*   **Role:** Every CFC method that touches contract or cross-user state.
+
+### `DPNContractFunctionExecutionGadget`
+
+*   **File:** `…/vm/gadgets/dapen_contract_function.rs` (core ~8; thin re-export / alias)
+*   **Role:** Naming shim around execution wiring; prefer `PsyContractFunctionBuilderGadget` + `StateReaderGadget` as the audit surface.
+
+### Non-live
+
+*   `circuits/privacy/shield_deposit_claim.rs` — historical / uncompiled path; live claim circuit is `deposit_inclusion.rs` (§1).
 
 ## Related
 
