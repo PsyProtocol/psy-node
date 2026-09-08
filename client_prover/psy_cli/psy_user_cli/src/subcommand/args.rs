@@ -812,8 +812,8 @@ pub struct DepositArgs {
     #[clap(long, env, default_value = "http://127.0.0.1:8545")]
     pub l1_rpc_url: String,
     /// L1 private key for signing the deposit tx
-    #[clap(long, short = 'p')]
-    pub private_key: String,
+    #[clap(long, short = 'p', required_unless_present = "resume_deposit_index")]
+    pub private_key: Option<String>,
     /// Router contract address (0x-prefixed hex)
     #[clap(long, env)]
     pub router_address: String,
@@ -875,6 +875,17 @@ pub struct DepositArgs {
     /// that claim_deposit later consumes with --deposit-proof.
     #[clap(long = "deposit-proof-output", env = "DEPOSIT_PROOF_OUTPUT")]
     pub deposit_proof_output: Option<String>,
+    /// Regenerate proof material for an existing deposit; never broadcasts a
+    /// transaction.
+    #[clap(long, requires_all = ["resume_tx_hash", "resume_chain_id", "deposit_proof_output", "note_secret", "nullifier_secret"], conflicts_with = "recipient_npub")]
+    pub resume_deposit_index: Option<u64>,
+    /// Original successful L1 deposit transaction, required in recovery mode.
+    #[clap(long, requires = "resume_deposit_index")]
+    pub resume_tx_hash: Option<String>,
+    /// Expected L1 chain ID, checked before looking up the original
+    /// transaction.
+    #[clap(long, requires = "resume_deposit_index")]
+    pub resume_chain_id: Option<u64>,
 }
 
 #[derive(Clone, Args)]

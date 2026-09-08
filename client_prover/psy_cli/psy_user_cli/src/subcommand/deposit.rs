@@ -413,6 +413,120 @@ fn parse_evm_addr_or_bytes32_to_u32x8(hex_str: &str) -> anyhow::Result<[u32; 8]>
 mod tests {
     use super::*;
 
+    #[derive(clap::Parser)]
+    struct DepositCommand {
+        #[command(flatten)]
+        args: DepositArgs,
+    }
+
+    fn recovery_args() -> Vec<&'static str> {
+        vec![
+            "deposit",
+            "--router-address",
+            "auto",
+            "--token",
+            "0x0",
+            "--amount",
+            "1",
+            "--resume-deposit-index",
+            "0",
+            "--resume-tx-hash",
+            "0x01",
+            "--resume-chain-id",
+            "84532",
+            "--deposit-proof-output",
+            "proof.json",
+            "--note-secret",
+            "1,2,3,4",
+            "--nullifier-secret",
+            "5,6,7,8",
+        ]
+    }
+
+    #[test]
+    fn recovery_requires_identity_and_secrets_but_not_signer() {
+        use clap::Parser;
+        let parsed = DepositCommand::try_parse_from(recovery_args()).unwrap();
+        assert!(parsed.args.private_key.is_none());
+        assert_eq!(parsed.args.resume_deposit_index, Some(0));
+        for flag in [
+            "--resume-tx-hash",
+            "--resume-chain-id",
+            "--deposit-proof-output",
+            "--note-secret",
+            "--nullifier-secret",
+        ] {
+            let mut args = recovery_args();
+            let index = args.iter().position(|arg| *arg == flag).unwrap();
+            args.drain(index..index + 2);
+            assert!(DepositCommand::try_parse_from(args).is_err(), "missing {flag}");
+        }
+        let mut args = recovery_args();
+        args.extend(["--recipient-npub", "unused"]);
+        assert!(DepositCommand::try_parse_from(args).is_err());
+        assert!(DepositCommand::try_parse_from(["deposit", "--router-address", "auto", "--token", "0x0", "--amount", "1"]).is_err());
+    }
+
+    #[test]
+    fn recovery_matches_original_successful_deposit_only() {
+        let hash = B256::repeat_byte(1);
+        let block = B256::repeat_byte(2);
+        let router = Address::repeat_byte(3);
+        let bridge = Address::repeat_byte(4);
+        let leaf = B256::repeat_byte(5);
+        let mut data = vec![0u8; 192];
+        data[160..].copy_from_slice(leaf.as_slice());
+        let tx = serde_json::json!({"hash": hash, "blockHash": block, "to": router, "input": "0xaabb"});
+        let receipt = serde_json::json!({"transactionHash": hash, "blockHash": block, "blockNumber": "0x10", "status": "0x1", "logs": [{
+            "address": bridge, "topics": ["0xc6a707652dc6aea1d40642451dfaa5afbdf8ab6a176ebacd33dee14dc3ace472", format!("{:#066x}", 7), B256::ZERO], "data": format!("0x{}", hex::encode(data)), "removed": false
+        }]});
+        let validate =
+            |tx: &serde_json::Value, receipt: &serde_json::Value| validate_recovery_receipt(tx, receipt, hash, router, bridge, &[0xaa, 0xbb], 7);
+        assert_eq!(validate(&tx, &receipt).unwrap(), leaf);
+        for (field, value) in [
+            ("status", serde_json::json!("0x0")),
+            ("transactionHash", serde_json::json!(block)),
+            ("blockHash", serde_json::json!(hash)),
+            ("logs", serde_json::json!([])),
+        ] {
+            let mut bad = receipt.clone();
+            bad[field] = value;
+            assert!(validate(&tx, &bad).is_err(), "accepted {field}");
+        }
+        for (field, value) in [("to", serde_json::json!(bridge)), ("input", serde_json::json!("0xaabc"))] {
+            let mut bad = tx.clone();
+            bad[field] = value;
+            assert!(validate(&bad, &receipt).is_err());
+        }
+        let mut bad = receipt.clone();
+        bad["logs"][0]["removed"] = true.into();
+        assert!(validate(&tx, &bad).is_err());
+        assert!(validate_recovery_receipt(&tx, &receipt, hash, router, bridge, &[0xaa, 0xbb], 8).is_err());
+    }
+
+    #[test]
+    fn recovery_selects_deployment_by_actual_chain() {
+        assert_eq!(recovery_network(84532, "sepolia"), "baseSepolia");
+        assert_eq!(recovery_network(97, "sepolia"), "bscTestnet");
+        assert_eq!(recovery_network(11155111, "baseSepolia"), "sepolia");
+        assert_eq!(recovery_network(31337, "localhost"), "localhost");
+    }
+
+    #[test]
+    fn recovered_proof_is_private_and_atomic() {
+        let dir = std::env::temp_dir().join(format!("deposit-recovery-test-{}", rand::random::<u64>()));
+        let path = dir.join("proof.json");
+        write_recovered_proof(&path, &serde_json::json!({"version": 1})).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        assert!(write_recovered_proof(&dir, &serde_json::json!({})).is_err());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn parses_decimal_contract_id_as_uint256_words() {
         assert_eq!(parse_evm_addr_or_bytes32_to_u32x8("4").unwrap(), [0, 0, 0, 0, 0, 0, 0, 4],);
@@ -429,10 +543,7 @@ mod tests {
     #[test]
     fn deposit_backup_shield_metadata_uses_decimal_limbs() {
         assert_eq!(
-            canonical_shield_address_metadata(
-                "0x112233445566778899aabbccddeeff00123456789abcdef0fedcba9876543210",
-            )
-            .unwrap(),
+            canonical_shield_address_metadata("0x112233445566778899aabbccddeeff00123456789abcdef0fedcba9876543210",).unwrap(),
             "1234605616436508552:11072869122414935808:1311768467463790320:18364758544493064720",
         );
     }
@@ -903,11 +1014,187 @@ async fn publish_deposit_backup(
     })
 }
 
+fn recovery_network(chain_id: u64, configured: &str) -> &str {
+    match chain_id {
+        11155111 => "sepolia",
+        97 => "bscTestnet",
+        84532 => "baseSepolia",
+        _ => configured,
+    }
+}
+
+fn validate_recovery_receipt(
+    tx: &serde_json::Value,
+    receipt: &serde_json::Value,
+    tx_hash: B256,
+    router: Address,
+    bridge: Address,
+    expected_call: &[u8],
+    deposit_index: u64,
+) -> anyhow::Result<B256> {
+    let parse_hash =
+        |v: &serde_json::Value| -> anyhow::Result<B256> { Ok(v.as_str().ok_or_else(|| anyhow::anyhow!("missing transaction hash"))?.parse()?) };
+    anyhow::ensure!(
+        parse_hash(&tx["hash"])? == tx_hash && parse_hash(&receipt["transactionHash"])? == tx_hash,
+        "recovery transaction hash mismatch"
+    );
+    anyhow::ensure!(receipt["status"] == "0x1", "original deposit is not a successful mined transaction");
+    anyhow::ensure!(
+        !receipt["blockNumber"].is_null() && parse_hash(&tx["blockHash"])? == parse_hash(&receipt["blockHash"])?,
+        "recovery receipt block mismatch"
+    );
+    let to: Address = tx["to"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("deposit transaction has no destination"))?
+        .parse()?;
+    anyhow::ensure!(to == router, "original transaction targets another Router");
+    let input = hex::decode(
+        tx["input"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("deposit transaction missing input"))?
+            .trim_start_matches("0x"),
+    )?;
+    anyhow::ensure!(
+        input == expected_call,
+        "original deposit calldata does not match token, amount, shield or note commitment"
+    );
+    let topic = "0xc6a707652dc6aea1d40642451dfaa5afbdf8ab6a176ebacd33dee14dc3ace472";
+    let mut matched = Vec::new();
+    for log in receipt["logs"].as_array().ok_or_else(|| anyhow::anyhow!("receipt missing logs"))? {
+        if log["address"].as_str().and_then(|v| v.parse::<Address>().ok()) != Some(bridge) || log["topics"][0].as_str() != Some(topic) {
+            continue;
+        }
+        anyhow::ensure!(log["removed"] != true, "original deposit log was removed");
+        let index = U256::from_str(log["topics"][1].as_str().ok_or_else(|| anyhow::anyhow!("deposit log missing index"))?)?;
+        anyhow::ensure!(index == U256::from(deposit_index), "original deposit index mismatch");
+        let data = hex::decode(
+            log["data"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("deposit log missing data"))?
+                .trim_start_matches("0x"),
+        )?;
+        anyhow::ensure!(
+            data.len() == 192 && log["topics"].as_array().map(Vec::len) == Some(3),
+            "invalid DepositRecorded event"
+        );
+        matched.push(B256::from_slice(&data[160..192]));
+    }
+    anyhow::ensure!(matched.len() == 1, "expected exactly one original Bridge deposit log");
+    Ok(matched[0])
+}
+
+fn write_recovered_proof(path: &std::path::Path, payload: &serde_json::Value) -> anyhow::Result<()> {
+    use std::io::Write;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(".deposit-recovery-{}-{}.tmp", std::process::id(), rand::random::<u64>()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    let result = (|| -> anyhow::Result<()> {
+        serde_json::to_writer_pretty(&mut file, payload)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        let _ = std::fs::File::open(parent).and_then(|directory| directory.sync_all());
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+async fn recover_deposit_proof(
+    args: &DepositArgs,
+    deposit_index: u64,
+    shield_address: &str,
+    note_commitment: &str,
+    backup: Option<&DepositBackupInput>,
+) -> anyhow::Result<CommandResult> {
+    anyhow::ensure!(args.recipient_npub.is_none(), "recovery does not publish Nostr events");
+    let backup = backup.ok_or_else(|| anyhow::anyhow!("recovery requires note and nullifier secrets"))?;
+    let output = args
+        .deposit_proof_output
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("recovery requires a proof output path"))?;
+    let tx_hash: B256 = args
+        .resume_tx_hash
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("recovery requires original tx hash"))?
+        .parse()?;
+    let expected_chain = args
+        .resume_chain_id
+        .ok_or_else(|| anyhow::anyhow!("recovery requires expected chain ID"))?;
+    let chain_hex = rpc_call(&args.l1_rpc_url, "eth_chainId", serde_json::json!([])).await?;
+    let chain_id = u64::from_str_radix(
+        chain_hex
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("invalid chain ID"))?
+            .trim_start_matches("0x"),
+        16,
+    )?;
+    anyhow::ensure!(chain_id == expected_chain, "recovery L1 chain ID mismatch");
+    let config = psy_config::PsyConfigGoldilocks::from_file(&args.rpc_config)?;
+    let network = recovery_network(chain_id, config.current_network_name());
+    let bridge_address = resolve_bridge_address(network)?;
+    let router = if args.router_address == "auto" || args.router_address.is_empty() {
+        resolve_router_address(network)?
+    } else {
+        args.router_address.clone()
+    };
+    let tx = rpc_call(&args.l1_rpc_url, "eth_getTransactionByHash", serde_json::json!([tx_hash])).await?;
+    let receipt = rpc_call(&args.l1_rpc_url, "eth_getTransactionReceipt", serde_json::json!([tx_hash])).await?;
+    let leaf = validate_recovery_receipt(
+        &tx,
+        &receipt,
+        tx_hash,
+        router.parse()?,
+        bridge_address.parse()?,
+        &encode_deposit_call(&args.token, &args.amount, shield_address, note_commitment)?,
+        deposit_index,
+    )?;
+    let block = rpc_call(
+        &args.l1_rpc_url,
+        "eth_getBlockByNumber",
+        serde_json::json!([receipt["blockNumber"], false]),
+    )
+    .await?;
+    anyhow::ensure!(block["hash"] == receipt["blockHash"], "original deposit receipt is no longer canonical");
+    let services_url = resolve_services_url(&config)?;
+    let ready = wait_for_deposit_proof(args, &services_url, &bridge_address, deposit_index).await?;
+    anyhow::ensure!(
+        B256::from(shield_address_to_bytes32(ready.deposit_proof.value)) == leaf,
+        "service proof does not match original deposit leaf"
+    );
+    let payload = build_deposit_inclusion_proof_payload(args, backup, shield_address, note_commitment, ready)?;
+    let path = std::path::Path::new(output);
+    write_recovered_proof(path, &payload)?;
+    println!("deposit_index: {}", deposit_index);
+    println!("deposit_proof_file: {}", output);
+    Ok(CommandResult::L1Transaction(L1TransactionResult {
+        transaction_hash: None,
+        status: L1TransactionStatus::ProofOnly,
+        chain_id: Some(chain_id),
+    }))
+}
+
 pub async fn run(args: DepositArgs) -> anyhow::Result<CommandResult> {
     let shield_address = resolve_shield_address(&args)?;
     let (note_commitment, backup) = resolve_note_commitment(&args)?;
     if let Some(recipient_npub) = backup.as_ref().and_then(|b| b.recipient_npub.as_deref()) {
         PublicKey::parse(recipient_npub).map_err(|e| anyhow::anyhow!("invalid --recipient-npub: {}", e))?;
+    }
+    if let Some(deposit_index) = args.resume_deposit_index {
+        return recover_deposit_proof(&args, deposit_index, &shield_address, &note_commitment, backup.as_ref()).await;
     }
     let router_addr = if !args.router_address.is_empty() && args.router_address != "auto" {
         args.router_address.clone()
@@ -916,7 +1203,11 @@ pub async fn run(args: DepositArgs) -> anyhow::Result<CommandResult> {
     };
     tracing::info!("Router address: {}", router_addr);
 
-    let signer: PrivateKeySigner = args.private_key.parse()?;
+    let signer: PrivateKeySigner = args
+        .private_key
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--private-key is required to submit a deposit"))?
+        .parse()?;
     let from_addr = signer.address();
     let router: Address = router_addr.parse()?;
     let data = encode_deposit_call(&args.token, &args.amount, &shield_address, &note_commitment)?;
