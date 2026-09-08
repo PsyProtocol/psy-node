@@ -30,18 +30,19 @@ mod network;
 mod claims_tools;
 mod private_tools;
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc, time::{Duration, Instant}};
 
 use std::future::Future;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::Parameters;
-use rmcp::model::{CallToolResult, Content, ErrorData as McpError, Implementation, ServerCapabilities, ServerInfo};
-use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
+use rmcp::model::{CallToolRequestParam, CallToolResult, Content, ErrorData as McpError, Implementation, ListToolsResult, ServerCapabilities, ServerInfo, Tool};
+use rmcp::service::RequestContext;
+use rmcp::{tool, tool_router, RoleServer, ServerHandler, ServiceExt};
+use rand::RngCore;
 use serde::Deserialize;
 use token_units::nano_equivalent;
 use serde_json::json;
-use tokio::sync::Mutex;
 
 use network::NetworkId;
 use policy::{Limits, PolicyEngine, SELF_RECIPIENT};
@@ -149,6 +150,14 @@ struct ServerState {
     wallet: WalletManager,
 }
 
+const TRANSACTION_CONFIRMATION_TTL: Duration = Duration::from_secs(5 * 60);
+
+struct PendingTransaction {
+    operation: String,
+    arguments: rmcp::model::JsonObject,
+    expires_at: Instant,
+}
+
 #[derive(Clone)]
 pub struct PsyWalletServer {
     /// `WalletManager` owns one async lock per network. Tool handlers never
@@ -166,6 +175,10 @@ pub struct PsyWalletServer {
     /// Lock rule: policy guards finish before any `.await`; wallet and replay
     /// locks are never acquired while a policy guard is live.
     policy: Arc<std::sync::Mutex<PolicyEngine>>,
+    /// Prepared transaction arguments live only in this process. Execute calls
+    /// receive a one-time opaque token, never a second editable copy of the
+    /// recipient/amount payload.
+    pending_transactions: Arc<std::sync::Mutex<HashMap<String, PendingTransaction>>>,
     tool_router: ToolRouter<PsyWalletServer>,
 }
 
@@ -489,6 +502,151 @@ fn owner_gate(supplied: Option<&str>) -> Result<(), String> {
     }
 }
 
+/// Transaction execution is never allowed to fall back to development mode:
+/// the second phase is meaningful only when the caller can prove it is the
+/// owner, rather than merely echo a token that the model received itself.
+fn transaction_owner_gate(supplied: Option<&str>) -> Result<(), String> {
+    match std::env::var("PSY_MCP_OWNER_TOKEN") {
+        Ok(value) if !value.trim().is_empty() => owner_gate(supplied).map_err(|_| {
+            "transaction execution requires the matching PSY_MCP_OWNER_TOKEN".to_string()
+        }),
+        _ => Err(
+            "transaction execution is disabled: restart psy-mcp-server with PSY_MCP_OWNER_TOKEN set"
+                .to_string(),
+        ),
+    }
+}
+
+/// Every routed operation in this list can cause an on-chain write, an L1
+/// write, or a payment made on the caller's behalf. Keeping the classification
+/// in one place makes the router test able to prove that raw execution routes
+/// are not advertised.
+fn is_transaction_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "create_wallet"
+            | "mint_agent_account"
+            | "psyup_deploy"
+            | "call_contract"
+            | "transfer"
+            | "transfer_batch"
+            | "claim_all"
+            | "deposit"
+            | "retry_deposit_delivery"
+            | "claim_deposit"
+            | "private_claim"
+            | "claim_batch"
+            | "withdraw"
+            | "claim_faucet"
+            | "private_transfer"
+            | "x402_fetch"
+    )
+}
+
+fn execute_schema() -> Arc<rmcp::model::JsonObject> {
+    Arc::new(
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "confirmation_token": {
+                    "type": "string",
+                    "description": "One-time token returned by the matching prepare_* tool."
+                },
+                "owner_token": {
+                    "type": "string",
+                    "description": "Must match PSY_MCP_OWNER_TOKEN configured in the server process."
+                }
+            },
+            "required": ["confirmation_token", "owner_token"]
+        })
+        .as_object()
+        .expect("execute schema is an object")
+        .clone(),
+    )
+}
+
+fn prepare_schema(tool: &Tool) -> Arc<rmcp::model::JsonObject> {
+    let mut schema = (*tool.input_schema).clone();
+    if let Some(properties) = schema.get_mut("properties").and_then(serde_json::Value::as_object_mut) {
+        properties.remove("owner_token");
+    }
+    if let Some(required) = schema.get_mut("required").and_then(serde_json::Value::as_array_mut) {
+        required.retain(|value| value.as_str() != Some("owner_token"));
+    }
+    Arc::new(schema)
+}
+
+fn redacted_transaction_summary(arguments: &rmcp::model::JsonObject) -> serde_json::Value {
+    fn redact(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, value) in map {
+                    if matches!(key.as_str(), "session" | "owner_token" | "private_key" | "private_key_env") {
+                        *value = serde_json::Value::String("[redacted]".to_string());
+                    } else {
+                        redact(value);
+                    }
+                }
+            }
+            serde_json::Value::Array(values) => values.iter_mut().for_each(redact),
+            _ => {}
+        }
+    }
+
+    let mut summary = serde_json::Value::Object(arguments.clone());
+    redact(&mut summary);
+    summary
+}
+
+fn confirmation_wrapped_tools(router: &ToolRouter<PsyWalletServer>) -> Vec<Tool> {
+    let mut tools = Vec::new();
+    for tool in router.list_all() {
+        if !is_transaction_tool(tool.name.as_ref()) {
+            tools.push(tool);
+            continue;
+        }
+
+        let original_name = tool.name.to_string();
+        let original_description = tool.description.as_deref().unwrap_or("Submit a transaction");
+        tools.push(Tool {
+            name: format!("prepare_{original_name}").into(),
+            description: Some(
+                format!(
+                    "PREPARE ONLY — does not authorize, spend budget, or submit anything. Stores the exact arguments for `{original_name}` for five minutes and returns a one-time confirmation token plus the full transaction summary. {original_description}"
+                )
+                .into(),
+            ),
+            input_schema: prepare_schema(&tool),
+            annotations: Some(rmcp::model::ToolAnnotations {
+                title: Some(format!("Prepare {original_name}")),
+                read_only_hint: Some(true),
+                destructive_hint: Some(false),
+                idempotent_hint: Some(true),
+                open_world_hint: Some(false),
+            }),
+        });
+        tools.push(Tool {
+            name: format!("execute_{original_name}").into(),
+            description: Some(
+                format!(
+                    "IRREVERSIBLE EXECUTION — consumes a matching prepare_{original_name} token and requires the human owner's PSY_MCP_OWNER_TOKEN. The transaction arguments cannot be changed during execution."
+                )
+                .into(),
+            ),
+            input_schema: execute_schema(),
+            annotations: Some(rmcp::model::ToolAnnotations {
+                title: Some(format!("Execute {original_name}")),
+                read_only_hint: Some(false),
+                destructive_hint: Some(true),
+                idempotent_hint: Some(false),
+                open_world_hint: Some(true),
+            }),
+        });
+    }
+    tools
+}
+
 /// The gate for an edit that GRANTS MORE than the policy grants today.
 ///
 /// `owner_gate` deliberately runs in single-operator dev mode when
@@ -611,6 +769,7 @@ impl PsyWalletServer {
             // engine that forgets its counters re-grants them on every crash
             // loop.
             policy: Arc::new(std::sync::Mutex::new(engine)),
+            pending_transactions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             tool_router: Self::tool_router()
                 + Self::wallet_tools_router()
                 + Self::claims_tools_router()
@@ -1453,7 +1612,6 @@ fn network_l1_token(wallet: &WalletManager, network: &NetworkId, chain_index: u3
 /// Slot holding the note-tree root in the token contract's state.
 const NOTE_ROOT_SLOT: u64 = 2_147_483_649;
 
-#[tool_handler]
 impl ServerHandler for PsyWalletServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
@@ -1464,12 +1622,147 @@ impl ServerHandler for PsyWalletServer {
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             instructions: Some(
                 "Psy wallet over MCP. Real client-side ZK proving via WalletSession. \
-                 Create/load a wallet, issue a session, then spend under policy caps. \
+                 Every state-changing operation requires prepare_* followed by execute_*; \
+                 execute_* requires the human owner's PSY_MCP_OWNER_TOKEN. Create/load a \
+                 wallet, issue a session, then spend under policy caps. \
                  Amounts are in Nano (1 PSY = 1e9 Nano)."
                     .into(),
             ),
             ..Default::default()
         }
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParam>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        Ok(ListToolsResult::with_all_items(confirmation_wrapped_tools(&self.tool_router)))
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParam,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let requested_name = request.name.to_string();
+
+        if let Some(operation) = requested_name.strip_prefix("prepare_") {
+            if !is_transaction_tool(operation) || !self.tool_router.has_route(operation) {
+                return err_json("unknown transaction preparation tool", json!({ "tool": requested_name }));
+            }
+            if let Err(error) = transaction_owner_gate(None) {
+                // A valid owner token is intentionally not accepted by prepare:
+                // it must never enter the stored transaction arguments or the
+                // model-visible summary. This call only checks configuration.
+                if error.contains("disabled") {
+                    return err_json(error, json!({ "gate": "owner-config", "submitted": false }));
+                }
+            }
+            let mut arguments = request.arguments.unwrap_or_default();
+            // Never let a model smuggle or persist an owner credential during
+            // prepare. The human supplies it only to the execute call.
+            arguments.remove("owner_token");
+            let mut random = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut random);
+            let token = hex::encode(random);
+            let expires_at = Instant::now() + TRANSACTION_CONFIRMATION_TTL;
+            let summary = redacted_transaction_summary(&arguments);
+            let mut pending = self.pending_transactions.lock().unwrap();
+            let now = Instant::now();
+            pending.retain(|_, item| item.expires_at > now);
+            pending.insert(
+                token.clone(),
+                PendingTransaction {
+                    operation: operation.to_string(),
+                    arguments,
+                    expires_at,
+                },
+            );
+            drop(pending);
+            return ok_json(json!({
+                "status": "prepared",
+                "submitted": false,
+                "operation": operation,
+                "confirmation_token": token,
+                "expiresInSeconds": TRANSACTION_CONFIRMATION_TTL.as_secs(),
+                "transaction": summary,
+                "next": format!("After the owner verifies every full value above, call execute_{operation} with this confirmation token and the owner token."),
+            }));
+        }
+
+        if let Some(operation) = requested_name.strip_prefix("execute_") {
+            if !is_transaction_tool(operation) || !self.tool_router.has_route(operation) {
+                return err_json("unknown transaction execution tool", json!({ "tool": requested_name }));
+            }
+            let mut arguments = request.arguments.unwrap_or_default();
+            let confirmation_token = arguments
+                .remove("confirmation_token")
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_default();
+            let supplied_owner_token = arguments
+                .remove("owner_token")
+                .and_then(|value| value.as_str().map(str::to_owned));
+            if !arguments.is_empty() {
+                return err_json(
+                    "execute tools accept only confirmation_token and owner_token; transaction fields are fixed by prepare",
+                    json!({ "gate": "confirmation", "submitted": false }),
+                );
+            }
+            if let Err(error) = transaction_owner_gate(supplied_owner_token.as_deref()) {
+                return err_json(error, json!({ "gate": "owner", "submitted": false }));
+            }
+
+            let pending = {
+                let mut pending_transactions = self.pending_transactions.lock().unwrap();
+                let Some(candidate) = pending_transactions.get(&confirmation_token) else {
+                    return err_json(
+                        "unknown or already-consumed confirmation token",
+                        json!({ "gate": "confirmation", "submitted": false }),
+                    );
+                };
+                if candidate.operation != operation {
+                    return err_json(
+                        format!("confirmation token is for {}, not {operation}", candidate.operation),
+                        json!({ "gate": "confirmation", "submitted": false }),
+                    );
+                }
+                if candidate.expires_at <= Instant::now() {
+                    pending_transactions.remove(&confirmation_token);
+                    return err_json(
+                        "confirmation token expired; prepare the transaction again",
+                        json!({ "gate": "confirmation", "submitted": false }),
+                    );
+                }
+                pending_transactions
+                    .remove(&confirmation_token)
+                    .expect("pending transaction existed while locked")
+            };
+
+            let mut original_arguments = pending.arguments;
+            if matches!(operation, "create_wallet" | "mint_agent_account") {
+                original_arguments.insert(
+                    "owner_token".to_string(),
+                    serde_json::Value::String(supplied_owner_token.expect("owner gate accepted a supplied token")),
+                );
+            }
+            let original_request = CallToolRequestParam {
+                name: pending.operation.into(),
+                arguments: Some(original_arguments),
+            };
+            let tool_context = rmcp::handler::server::tool::ToolCallContext::new(self, original_request, context);
+            return self.tool_router.call(tool_context).await;
+        }
+
+        if is_transaction_tool(&requested_name) {
+            return err_json(
+                format!("direct `{requested_name}` execution is disabled; call prepare_{requested_name} first"),
+                json!({ "gate": "confirmation", "submitted": false }),
+            );
+        }
+
+        let tool_context = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(tool_context).await
     }
 }
 
@@ -1485,7 +1778,11 @@ async fn main() -> anyhow::Result<()> {
             "--config" => config_path = args.next().ok_or_else(|| anyhow::anyhow!("--config requires a path"))?,
             "--network" => network = Some(args.next().ok_or_else(|| anyhow::anyhow!("--network requires a name"))?),
             "-h" | "--help" => {
-                eprintln!("Usage: psy-mcp-server [--config <path>] [--network <name>]\n\nEnvironment: PSY_CONFIG, PSY_MCP_NETWORK");
+                eprintln!(
+                    "Usage: psy-mcp-server [--config <path>] [--network <name>]\n\n\
+                     Environment: PSY_CONFIG, PSY_MCP_NETWORK, PSY_MCP_OWNER_TOKEN \
+                     (required by every execute_* transaction tool)"
+                );
                 return Ok(());
             }
             other => anyhow::bail!("unknown argument `{other}` (use --help)"),
@@ -1498,13 +1795,10 @@ async fn main() -> anyhow::Result<()> {
     startup::restore_wallets(&wallet).await?;
     if std::env::var("PSY_MCP_OWNER_TOKEN").map(|v| v.trim().is_empty()).unwrap_or(true) {
         tracing::warn!(
-            "PSY_MCP_OWNER_TOKEN is not set: owner tools (issue_session, resume_policy, \
-             create_wallet, mint_agent_account) are callable by the agent, so a paused \
-             policy can be un-paused and a revoked session re-minted by the party they \
-             were meant to stop. Widening a policy (raising a cap, dropping a ceiling, \
-             clearing an allow-list) is REFUSED outright in this mode, because there is \
-             no way to tell the owner from the agent. Fine for local development; set it \
-             in production."
+            "PSY_MCP_OWNER_TOKEN is not set: every execute_* transaction tool is DISABLED. \
+             Read-only tools and prepare_* remain available, but no prepared transaction \
+             can be submitted until the server is restarted with an owner token. Policy \
+             widening is also refused because there is no way to authenticate the owner."
         );
     }
     tracing::info!("WalletSession ready — serving MCP over stdio");
@@ -1516,7 +1810,7 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod router_tests {
-    use super::PsyWalletServer;
+    use super::{confirmation_wrapped_tools, is_transaction_tool, redacted_transaction_summary, PsyWalletServer};
 
     #[test]
     fn every_domain_router_is_merged() {
@@ -1534,6 +1828,50 @@ mod router_tests {
         for required in ["create_wallet", "get_balance", "private_transfer", "x402_fetch", "x402_verify"] {
             assert!(names.contains(required), "missing tool route {required}");
         }
+    }
+
+    #[test]
+    fn every_transaction_route_is_replaced_by_prepare_and_execute() {
+        let router = PsyWalletServer::tool_router()
+            + PsyWalletServer::wallet_tools_router()
+            + PsyWalletServer::claims_tools_router()
+            + PsyWalletServer::private_tools_router()
+            + PsyWalletServer::x402_tools_router();
+        let raw_transaction_names = router
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .filter(|name| is_transaction_tool(name))
+            .collect::<Vec<_>>();
+        assert_eq!(raw_transaction_names.len(), 16, "update the confirmation classification when transaction tools change");
+
+        let exposed = confirmation_wrapped_tools(&router)
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<std::collections::HashSet<_>>();
+        for name in raw_transaction_names {
+            assert!(!exposed.contains(&name), "raw transaction route leaked: {name}");
+            assert!(exposed.contains(&format!("prepare_{name}")));
+            assert!(exposed.contains(&format!("execute_{name}")));
+        }
+    }
+
+    #[test]
+    fn prepared_summary_keeps_full_recipient_but_redacts_credentials() {
+        let arguments = serde_json::json!({
+            "session": "agent-secret",
+            "owner_token": "owner-secret",
+            "l1_recipient": "0x92e0920000000000000000000000000000001234",
+            "amount": 50_000_000_000u64
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let summary = redacted_transaction_summary(&arguments);
+        assert_eq!(summary["session"], "[redacted]");
+        assert_eq!(summary["owner_token"], "[redacted]");
+        assert_eq!(summary["l1_recipient"], "0x92e0920000000000000000000000000000001234");
+        assert_eq!(summary["amount"], 50_000_000_000u64);
     }
 }
 
