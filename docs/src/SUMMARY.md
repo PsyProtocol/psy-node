@@ -1,6 +1,7 @@
 # Summary
 
 # Protocol Design
+
 - [ZK Circuit Journey](./protocol/ZKCircuitJourney.md)
 - [Horizontal Scalability](./protocol/HORIZONTAL_SCALABILITY.md)
 - [UPS Proof Tree](./protocol/UPSProofTree.md)
@@ -20,6 +21,7 @@
 ---
 
 # Language Documentation
+
 - [Introduction](./language/introduction.md)
 - [Design Philosophy](./language/design_philosophy.md)
 - [Language Features](./language/features.md)
@@ -47,11 +49,13 @@
 ---
 
 # SDK Documentation
+
 - [SDK Overview](./sdk/overview.md)
 - [Rust SDK](./sdk/rust.md)
 - [TypeScript SDK](./sdk/typescript.md)
 
 # SDKeys Documentation
+
 - [SDKeys Overview](./sdkeys/overview.md)
 - [Signature Schemes](./sdkeys/signature-schemes.md)
 - [Wallet Management](./sdkeys/wallet-management.md)
@@ -59,6 +63,7 @@
 ---
 
 # Mining Documentation  
+
 - [Miner Setup](./miner/setup.md)
 - [Mining Configuration](./miner/configuration.md)
 - [Performance Optimization](./miner/optimization.md)
@@ -66,6 +71,7 @@
 ---
 
 # Node Documentation
+
 - [Node Architecture](./node/architecture.md)
 - [Installation](./node/installation.md)
 - [Configuration](./node/configuration.md)
@@ -76,8 +82,8 @@
 
 ---
 
-
 # VM Documentation
+
 - [Bytecode Operations](./vm/bytecode.md)
 - [Execution Model](./vm/execution.md)
 <!-- - [VM Architecture](./vm/architecture.md) -->
@@ -86,6 +92,7 @@
 ---
 
 # RPC Documentation
+
 - [User CLI RPC Methods](./rpc/UserCli.md)
 - [Realm Edge RPC Methods](./rpc/RealmRpc.md)
 - [Coordinator Edge RPC Methods](./rpc/CoordinatorRpc.md)
@@ -95,6 +102,7 @@
 ---
 
 # Appendices
+
 - [Glossary](./language/appendix_a_glossary.md)
 - [Reserved Keywords](./language/appendix_b_reserved_keywords.md)
 - [Publications](./language/appendix_c_publications.md)

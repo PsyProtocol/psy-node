@@ -1,12 +1,14 @@
 # Bridge Common Operations
 
-> Repository-only bridge runbook. Generic wallet, registration, and PSY funding procedures are owned by `docs/src/dev/common-operations.md`.
+This repository-only developer runbook covers local-devnet deposit, claim, withdrawal, and relayer settlement alongside [common operations](common-operations.md).
+
+> Repository-only bridge runbook. Generic wallet, registration, and PSY funding procedures are owned by [`docs/src/dev/common-operations.md`](common-operations.md).
 
 ## Abstract
 
 This guide is the executable local-devnet procedure for one L1 deposit, one L2 claim-deposit, one L2 withdrawal, and relayer settlement. Run every command from `<repo-root>`. Replace only angle-bracket values. Never place a real private key or wallet password in this document, a result file, or a shell history shared with other users.
 
-Related: `docs/src/dev/devnet_lifecycle.md` for startup and shutdown; `docs/src/dev/deposit-withdrawal.md` for bridge architecture.
+Related: [`docs/src/dev/devnet_lifecycle.md`](devnet_lifecycle.md) for startup and shutdown; [`docs/src/dev/deposit-withdrawal.md`](deposit-withdrawal.md) for bridge architecture.
 
 ## Table of Contents
 
@@ -18,6 +20,8 @@ Related: `docs/src/dev/devnet_lifecycle.md` for startup and shutdown; `docs/src/
 - [5. Register the User and Derive the Shield Address](#5-register-the-user-and-derive-the-shield-address)
 - [6. Fund PSY Through the Faucet](#6-fund-psy-through-the-faucet)
 - [7. Approve the Gateway and Submit the L1 Deposit — Not an EndCap](#7-approve-the-gateway-and-submit-the-l1-deposit--not-an-endcap)
+  - [Persist Deposit Claim Material — Mandatory](#persist-deposit-claim-material--mandatory)
+  - [Nostr Receiver Recovery](#nostr-receiver-recovery)
 - [8. Observe Relayer Deposit Append and Finalize](#8-observe-relayer-deposit-append-and-finalize)
 - [9. Claim the Deposit on L2 — Real EndCap](#9-claim-the-deposit-on-l2--real-endcap)
 - [10. Withdraw on L2 — Real EndCap](#10-withdraw-on-l2--real-endcap)
@@ -104,6 +108,7 @@ grep -a 'bridge relayer started' logs/bridge_relayer_errs.txt
 The setup waits for services health and recognizes the stable relayer marker `bridge relayer started` (`dev/locSetupV4.ts:1141-1144,3676-3677,4418-4424`). Coordinator and realm RPC methods use the `psy_` prefix (`client_prover/psy_provider/src/request.rs:68-100`).
 
 `make run-all` generates `local_checkpoints/bridge_proposer/daemon.toml` and starts the current relayer daemon through this CLI surface (`dev/locSetupV4.ts:4519-4551`):
+
 ```bash
 ./target/release/psy_relayer_cli \
   --config local_checkpoints/bridge_proposer/daemon.toml
@@ -162,11 +167,12 @@ print("export WITHDRAWAL_NONCE='0x" + secrets.token_hex(32) + "'")
 PY
 )"
 ```
+
 For local USDT, `2000` is `0.002` USDT and `1000` is `0.001` USDT. Small values reduce proof and liquidity surprises. `claim-deposit` and `withdraw` both consume L2 PSY fees; L1 token ownership does not pay L2 gas. The referenced Bridge campaign is [PsyProtocol/psy-memory Bridge E2E](https://github.com/PsyProtocol/psy-memory/blob/main/src/repositories/parth-generic-v1/e2e/bridge.md), especially its amount, L2 gas, and same-user serial-operation rules.
 
 ## 5. Register the User and Derive the Shield Address
 
-Follow `docs/src/dev/common-operations.md` Sections 2–4 with this run's `USER_PRIVATE_KEY`, `RPC_CONFIG`, and `RESULT_DIR`. Continue only when registration is indexed. Export `USER_PUBLIC_KEY` from `register-user.json.public_key_hash` and `USER_ID` from `get-user-id.json.user_id`; reject an empty or null user ID. Registration and identity semantics are defined in `client_prover/psy_cli/psy_user_cli/src/subcommand/register_user.rs:15-46` and `client_prover/psy_cli/psy_user_cli/src/subcommand/get_user_id.rs:9-30`.
+Follow [`docs/src/dev/common-operations.md`](common-operations.md) Sections 2–4 with this run's `USER_PRIVATE_KEY`, `RPC_CONFIG`, and `RESULT_DIR`. Continue only when registration is indexed. Export `USER_PUBLIC_KEY` from `register-user.json.public_key_hash` and `USER_ID` from `get-user-id.json.user_id`; reject an empty or null user ID. Registration and identity semantics are defined in `client_prover/psy_cli/psy_user_cli/src/subcommand/register_user.rs:15-46` and `client_prover/psy_cli/psy_user_cli/src/subcommand/get_user_id.rs:9-30`.
 
 Derive the bridge-specific shield address using the same user and this run's fresh randomness:
 
@@ -187,7 +193,7 @@ The global `--result-file` is atomically published only on success and contains 
 
 ## 6. Fund PSY Through the Faucet
 
-Follow `docs/src/dev/common-operations.md` Section 5.1 using the registered user from Section 5. Save the confirmed recipient call result as `claim-psy.json` in `RESULT_DIR`. The local genesis deployer is not a devnet wallet: `simple_mint` is not a funding path. Do not start `deposit`, `claim-deposit`, or `withdraw` until the faucet transfer is included and the recipient's `simple_claim` returns `confirmed`. Keep every same-user L2 operation serial.
+Follow [`docs/src/dev/common-operations.md`](common-operations.md) Section 5.1 using the registered user from Section 5. Save the confirmed recipient call result as `claim-psy.json` in `RESULT_DIR`. The local genesis deployer is not a devnet wallet: `simple_mint` is not a funding path. Do not start `deposit`, `claim-deposit`, or `withdraw` until the faucet transfer is included and the recipient's `simple_claim` returns `confirmed`. Keep every same-user L2 operation serial.
 
 ## 7. Approve the Gateway and Submit the L1 Deposit — Not an EndCap
 
@@ -227,6 +233,7 @@ test "$DEPOSIT_INDEX" != 'null'
 ```
 
 `--deposit-proof-output` is optional at the deposit interface, but it is required for the file-based `claim-deposit` command used below. With this flag, the deposit command waits up to 600 seconds for relayer proof readiness and then writes the sender-generated inclusion proof (`client_prover/psy_cli/psy_user_cli/src/subcommand/deposit.rs:636-676`, `client_prover/psy_cli/psy_user_cli/src/subcommand/deposit.rs:1072-1107`). Never rerun `deposit` to retry proof generation: that records a new L1 deposit. `--nostr-relay` defaults to a public relay; on local devnet always pass `ws://127.0.0.1:8081` (the devnet nostr-relay container) or the events never reach the receiver.
+
 ### Persist Deposit Claim Material — Mandatory
 
 Write the secret-bearing note BEFORE the approve/deposit step (the deposit
@@ -268,7 +275,6 @@ jq -e '.tx_hash != null and .note_commitment != null' "$RESULT_DIR/deposit-note.
 
 Treat this file as the single claim credential: back it up before stack
 restarts, and never regenerate the secrets in a later session.
-
 
 ### Nostr Receiver Recovery
 
@@ -328,6 +334,7 @@ Run only after the recipient's PSY funding call has confirmed and the proof file
 
 jq -e '.status == "confirmed" and (.confirmed_checkpoint != null)' "$RESULT_DIR/claim-deposit.json"
 ```
+
 ```bash
 curl -fsS --get "$SERVICES_URL/api/v1/get/bridge/deposits" \
   --data-urlencode "shield_address=$SHIELD_ADDRESS" \
@@ -350,9 +357,7 @@ jq -e --argjson index "$DEPOSIT_INDEX" --arg note "${NOTE_COMMITMENT#0x}" --arg 
 
 This query requires the exact deposit identity—chain-local index, note commitment, L2 token contract, and shield address—to report `claimed: true`; counts alone are not sufficient (`../psy-services/src/api/handlers/bridge.rs:1331-1359,1431-1451`).
 
-
 The command checks shield address, token, amount, chain index, deposit index, proof fingerprint, and public inputs before proving and submitting the EndCap (`client_prover/psy_cli/psy_user_cli/src/subcommand/claim_deposit.rs:401-527`).
-
 
 ## 10. Withdraw on L2 — Real EndCap
 
@@ -413,50 +418,50 @@ test "$(jq -r '.[2]' <<<"$CLEARED_JSON")" -eq 0
 
 ## 12. Observable-State Matrix
 
-| Transition | Producer | Required observable result | Command or surface |
-|---|---|---|---|
-| User registration submitted | coordinator | `register-user.json.status` is `pending` or `registered` | `psy_user_cli --result-file … register-user` |
-| User ID assigned | coordinator | `get-user-id.json.status == "registered"`; `user_id` is non-null | `psy_user_cli --result-file … get-user-id` |
-| L2 PSY funded | faucet operator transfer, then recipient EndCap | `claim-psy.json.status == "confirmed"`; contract-0 token balance funded | `common-operations.md` Section 5.1 |
-| L1 deposit recorded, not EndCap | user L1 transaction | `deposit.json.status == "confirmed"`; `pendingDepositCount` includes the index | result file; `Bridge.pendingDepositCount()` |
-| Nostr recovery ready, when selected | deposit sender | both proof and encrypted-secret events share the deposit's backup identifier | `deposit --recipient-npub <npub>`; Nostr events |
-| Relayer deposit append | relayer L2 EndCap and L1 batch append | `provedDepositCount >= deposit_index + 1`; proof JSON exists | `Bridge.provedDepositCount()`; deposit proof file |
-| Relayer finalize after deposit | relayer L1 transaction | finalization cursor increases from the captured pre-deposit value | `StateManager.lastFinalizedCheckpointId()` |
-| L2 deposit claim | user EndCap | `claim-deposit.json.status == "confirmed"` | result file |
-| Deposit indexed as claimed | services | matching item has `claimed: true` | `GET /api/v1/get/bridge/deposits?shield_address=<bytes32>` |
-| L2 withdrawal | user EndCap | `withdraw.json.status == "confirmed"` | result file |
-| Relayer withdrawal registration | relayer L2 EndCap and L1 transaction | finalization cursor increases; `claimedNullifiers(nonce) == true`; pending amount is nonzero | StateManager and Bridge views |
-| User L1 settlement | user L1 transaction | recipient balance rises; pending amount becomes zero | `claimPendingWithdrawal`, Bridge and token views |
+| Transition                          | Producer                                        | Required observable result                                                                   | Command or surface                                         |
+| ----------------------------------- | ----------------------------------------------- | -------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| User registration submitted         | coordinator                                     | `register-user.json.status` is `pending` or `registered`                                     | `psy_user_cli --result-file … register-user`               |
+| User ID assigned                    | coordinator                                     | `get-user-id.json.status == "registered"`; `user_id` is non-null                             | `psy_user_cli --result-file … get-user-id`                 |
+| L2 PSY funded                       | faucet operator transfer, then recipient EndCap | `claim-psy.json.status == "confirmed"`; contract-0 token balance funded                      | `common-operations.md` Section 5.1                         |
+| L1 deposit recorded, not EndCap     | user L1 transaction                             | `deposit.json.status == "confirmed"`; `pendingDepositCount` includes the index               | result file; `Bridge.pendingDepositCount()`                |
+| Nostr recovery ready, when selected | deposit sender                                  | both proof and encrypted-secret events share the deposit's backup identifier                 | `deposit --recipient-npub <npub>`; Nostr events            |
+| Relayer deposit append              | relayer L2 EndCap and L1 batch append           | `provedDepositCount >= deposit_index + 1`; proof JSON exists                                 | `Bridge.provedDepositCount()`; deposit proof file          |
+| Relayer finalize after deposit      | relayer L1 transaction                          | finalization cursor increases from the captured pre-deposit value                            | `StateManager.lastFinalizedCheckpointId()`                 |
+| L2 deposit claim                    | user EndCap                                     | `claim-deposit.json.status == "confirmed"`                                                   | result file                                                |
+| Deposit indexed as claimed          | services                                        | matching item has `claimed: true`                                                            | `GET /api/v1/get/bridge/deposits?shield_address=<bytes32>` |
+| L2 withdrawal                       | user EndCap                                     | `withdraw.json.status == "confirmed"`                                                        | result file                                                |
+| Relayer withdrawal registration     | relayer L2 EndCap and L1 transaction            | finalization cursor increases; `claimedNullifiers(nonce) == true`; pending amount is nonzero | StateManager and Bridge views                              |
+| User L1 settlement                  | user L1 transaction                             | recipient balance rises; pending amount becomes zero                                         | `claimPendingWithdrawal`, Bridge and token views           |
 
 Services exposes the stable deposit, withdrawal, deposit-proof, and withdrawal-proof routes (`../psy-services/src/api/server.rs:135-153`, `../psy-services/src/api/server.rs:318-345`). Deposit `claimed` is matched per deposit identity, not inferred from counts (`../psy-services/src/api/handlers/bridge.rs:1331-1359`, `../psy-services/src/api/handlers/bridge.rs:1431-1451`). For direct RPC probes, use `psy_get_latest_checkpoint_id` and `psy_get_imt_leaf_index_for_key`; query the realm tip only, never a coordinator-derived stale checkpoint (`client_prover/psy_provider/src/request.rs:82-87`, `client_prover/psy_provider/src/request.rs:257-265`).
 
 ## 13. Exact Failure Responses
 
-| Response | Meaning | Required action |
-|---|---|---|
-| result file absent after nonzero exit | Command failed; stale success was removed fail-closed | Read stderr, correct the cause, rerun that command only |
-| `status: "not_registered"` and `user_id: null` | Registration has not been indexed | Continue the bounded user-ID poll; do not submit L2 calls |
-| `ERC20InsufficientAllowance` | ERC20Gateway allowance is insufficient | Approve the resolved gateway for at least `DEPOSIT_AMOUNT`, then submit one deposit |
-| Nostr receiver cannot retrieve the deposit claim | `--recipient-npub` omitted or one recovery event missing | Restore both events for the existing deposit using the retained proof and secrets; do not rerun deposit |
-| `timeout waiting for deposit claim proof … (elapsed=600s)` | Deposit exists but the relayer/services proof did not become ready in ten minutes | Inspect `provedDepositCount`, services health, and relayer log; do **not** rerun deposit |
-| proof response `found:false, reason:"no_proved_deposits"` | No deposit snapshot has been proved | Wait for relayer deposit append |
-| `deposit_not_indexed` | Envio has not indexed this deposit | Wait for indexer; keep the same deposit index |
-| `deposit_not_in_snapshot` | Requested snapshot does not include this deposit | Wait for a later proved count |
-| `indexer_not_ready` | Indexed tree count trails the requested snapshot | Wait for indexer catch-up |
-| `indexer_node_missing` | Snapshot data is incomplete | Stop this claim attempt and inspect services/indexer consistency |
-| `deposit_leaf_mismatch` | Indexed payload and computed leaf disagree | Stop; do not claim or create another deposit |
-| `multi_source_snapshot_not_supported` | A global prefix spans multiple source chains | Query with the chain-local snapshot count |
-| `shield address mismatch vs deposit proof` | User ID, `R0`, or `R1` differs from the deposit | Restore the original values; never alter the proof |
-| `token address mismatch vs deposit proof`, `amount mismatch vs deposit proof`, `source_chain_index mismatch vs deposit proof`, or `deposit_index mismatch vs deposit proof` | Claim arguments differ from the proof | Use the exact deposit values |
-| `--note-secret and --nullifier-secret must be passed together` | Only one raw secret was supplied | Supply both or omit both from claim-deposit |
-| `No user id found for sender public key` | Withdrawal wallet is unregistered | Use the registered wallet and wait for its user ID |
-| `hash hex must be 40 or 64 hex chars` | Token, recipient, or nonce has invalid width | Use a 20-byte address or a 32-byte hex value; nonce must be 32 bytes |
-| EndCap inclusion timeout after 180 seconds | The L2 transition was submitted but not observed in time | Check its structured transaction hash and current realm state before retrying; never run another same-user L2 operation concurrently |
-| `InvalidBatchRange()` | Relayer attempted a non-contiguous or invalid deposit append | Stop manual relayer commands; let the daemon reconcile its proved cursor |
-| `InvalidProvenChainIndex()` | Finalize proof targets the wrong Bridge chain index | Correct the relayer deployment/network configuration |
-| `InvalidCheckpointContinuity()` | Finalize proof does not continue from L1 finalized state | Discard the stale proof and let the daemon rebuild from `lastFinalizedCheckpointId + 1` |
-| `NullifierAlreadyClaimed()` or relayer `already_claimed_count > 0` | Withdrawal registration already happened | Require `claimedNullifiers(nonce) == true`, then inspect/settle the pending withdrawal |
-| Recipient balance does not rise after a successful pending claim | Settlement transfer failed or token balance is insufficient | Inspect the pending entry, receipt, and Bridge token balance; do not label it proof-not-ready |
+| Response                                                                                                                                                                    | Meaning                                                                           | Required action                                                                                                                      |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| result file absent after nonzero exit                                                                                                                                       | Command failed; stale success was removed fail-closed                             | Read stderr, correct the cause, rerun that command only                                                                              |
+| `status: "not_registered"` and `user_id: null`                                                                                                                              | Registration has not been indexed                                                 | Continue the bounded user-ID poll; do not submit L2 calls                                                                            |
+| `ERC20InsufficientAllowance`                                                                                                                                                | ERC20Gateway allowance is insufficient                                            | Approve the resolved gateway for at least `DEPOSIT_AMOUNT`, then submit one deposit                                                  |
+| Nostr receiver cannot retrieve the deposit claim                                                                                                                            | `--recipient-npub` omitted or one recovery event missing                          | Restore both events for the existing deposit using the retained proof and secrets; do not rerun deposit                              |
+| `timeout waiting for deposit claim proof … (elapsed=600s)`                                                                                                                  | Deposit exists but the relayer/services proof did not become ready in ten minutes | Inspect `provedDepositCount`, services health, and relayer log; do **not** rerun deposit                                             |
+| proof response `found:false, reason:"no_proved_deposits"`                                                                                                                   | No deposit snapshot has been proved                                               | Wait for relayer deposit append                                                                                                      |
+| `deposit_not_indexed`                                                                                                                                                       | Envio has not indexed this deposit                                                | Wait for indexer; keep the same deposit index                                                                                        |
+| `deposit_not_in_snapshot`                                                                                                                                                   | Requested snapshot does not include this deposit                                  | Wait for a later proved count                                                                                                        |
+| `indexer_not_ready`                                                                                                                                                         | Indexed tree count trails the requested snapshot                                  | Wait for indexer catch-up                                                                                                            |
+| `indexer_node_missing`                                                                                                                                                      | Snapshot data is incomplete                                                       | Stop this claim attempt and inspect services/indexer consistency                                                                     |
+| `deposit_leaf_mismatch`                                                                                                                                                     | Indexed payload and computed leaf disagree                                        | Stop; do not claim or create another deposit                                                                                         |
+| `multi_source_snapshot_not_supported`                                                                                                                                       | A global prefix spans multiple source chains                                      | Query with the chain-local snapshot count                                                                                            |
+| `shield address mismatch vs deposit proof`                                                                                                                                  | User ID, `R0`, or `R1` differs from the deposit                                   | Restore the original values; never alter the proof                                                                                   |
+| `token address mismatch vs deposit proof`, `amount mismatch vs deposit proof`, `source_chain_index mismatch vs deposit proof`, or `deposit_index mismatch vs deposit proof` | Claim arguments differ from the proof                                             | Use the exact deposit values                                                                                                         |
+| `--note-secret and --nullifier-secret must be passed together`                                                                                                              | Only one raw secret was supplied                                                  | Supply both or omit both from claim-deposit                                                                                          |
+| `No user id found for sender public key`                                                                                                                                    | Withdrawal wallet is unregistered                                                 | Use the registered wallet and wait for its user ID                                                                                   |
+| `hash hex must be 40 or 64 hex chars`                                                                                                                                       | Token, recipient, or nonce has invalid width                                      | Use a 20-byte address or a 32-byte hex value; nonce must be 32 bytes                                                                 |
+| EndCap inclusion timeout after 180 seconds                                                                                                                                  | The L2 transition was submitted but not observed in time                          | Check its structured transaction hash and current realm state before retrying; never run another same-user L2 operation concurrently |
+| `InvalidBatchRange()`                                                                                                                                                       | Relayer attempted a non-contiguous or invalid deposit append                      | Stop manual relayer commands; let the daemon reconcile its proved cursor                                                             |
+| `InvalidProvenChainIndex()`                                                                                                                                                 | Finalize proof targets the wrong Bridge chain index                               | Correct the relayer deployment/network configuration                                                                                 |
+| `InvalidCheckpointContinuity()`                                                                                                                                             | Finalize proof does not continue from L1 finalized state                          | Discard the stale proof and let the daemon rebuild from `lastFinalizedCheckpointId + 1`                                              |
+| `NullifierAlreadyClaimed()` or relayer `already_claimed_count > 0`                                                                                                          | Withdrawal registration already happened                                          | Require `claimedNullifiers(nonce) == true`, then inspect/settle the pending withdrawal                                               |
+| Recipient balance does not rise after a successful pending claim                                                                                                            | Settlement transfer failed or token balance is insufficient                       | Inspect the pending entry, receipt, and Bridge token balance; do not label it proof-not-ready                                        |
 
 The deposit proof response reasons are stable machine-readable values (`../psy-services/src/api/handlers/bridge.rs:1555-1721`). StateManager exposes the exact finalize errors (`psy-contracts/src/StateManager.sol:63-76`, `psy-contracts/src/StateManager.sol:173-212`).
 

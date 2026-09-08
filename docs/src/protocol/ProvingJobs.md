@@ -1,7 +1,8 @@
 # Proving Jobs Architecture
 
-> Updated: 2026-09-03.
+This protocol reference covers realm and coordinator proving-job dependencies and public input layouts alongside the [circuit index](Circuits.md).
 
+> Updated: 2026-09-03.
 
 ## Abstract
 
@@ -26,6 +27,7 @@ This document describes the proving jobs architecture for both Realm and Coordin
 **IMPORTANT**: Different circuit types have different public inputs layouts!
 
 ### Coordinator Main Circuits (19 inputs)
+
 - **[0..4]**: commitment
 - **[4..8]**: worker_public_key
 - **[8..11]**: pm_jobs_completed_stats (deploy_contracts_completed, register_users_completed, gutas_completed)
@@ -33,12 +35,14 @@ This document describes the proving jobs architecture for both Realm and Coordin
 - **[15..19]**: state_transition_hash
 
 ### GUTA Circuits (15 inputs)
+
 - **[0..4]**: commitment
 - **[4..8]**: worker_public_key
 - **[8..11]**: pm_jobs_completed_stats
 - **[11..15]**: guta_header_hash
 
 ### Special: AggUserRegistrationDeployContractsGUTA (19 inputs)
+
 - **[0..4]**: state_transition_hash (NOT commitment!)
 - **[4..8]**: hash(user_registration_commitment, user_registration_worker_pk)
 - **[8..12]**: hash(deploy_contracts_commitment, deploy_contracts_worker_pk)
@@ -69,11 +73,11 @@ P2P Proposal / Votes / Certificate --> Coordinator psy_submit_guta(..., proposal
 
 ### Realm root circuit details
 
-| Circuit | Type u32 | Who proves | Role |
-|---------|----------|------------|------|
-| User EndCap family | see job_id.rs | user / prove-proxy | Leaf transitions into realm GUTA |
-| GUTA aggregation variants | live cache: 7,8,10,11,13,15,55–59 (not 9/12/14/60/64) | `psy_worker_cli` | Aggregate EndCaps / GUTAs |
-| RealmFinalizeGUTA | 63 | `psy_worker_cli` | Realm root submitted with P2P Proposal+Certificate |
+| Circuit                   | Type u32                                              | Who proves         | Role                                               |
+| ------------------------- | ----------------------------------------------------- | ------------------ | -------------------------------------------------- |
+| User EndCap family        | see job_id.rs                                         | user / prove-proxy | Leaf transitions into realm GUTA                   |
+| GUTA aggregation variants | live cache: 7,8,10,11,13,15,55–59 (not 9/12/14/60/64) | `psy_worker_cli`   | Aggregate EndCaps / GUTAs                          |
+| RealmFinalizeGUTA         | 63                                                    | `psy_worker_cli`   | Realm root submitted with P2P Proposal+Certificate |
 
 Witness construction for finalization is `RealmGUTAPlanner::append_realm_finalize_guta` (`psy_node_common/src/guta_planner/realm_guta_planner.rs`). Circuit implementation: `psy_plonky2_circuits/src/guta_v2/circuits/realm_finalize_guta.rs`.
 
@@ -202,11 +206,13 @@ All follow the same commitment / rewards-tag calculation rules based on their de
 This circuit aggregates the three main trees:
 
 ### Inputs
+
 - Register Users proof (from aggregation root)
 - Deploy Contracts proof (from aggregation root)
 - GUTA proof (from aggregation root or GUTAVerifyToCap)
 
 ### Public Inputs Layout (19 total) - SPECIAL LAYOUT!
+
 **WARNING**: This circuit has a unique layout different from other circuits!
 - **[0..4]**: state_transition_hash (NOT commitment!)
 - **[4..8]**: hash(register_users_commitment, register_users_worker_pk)
@@ -215,6 +221,7 @@ This circuit aggregates the three main trees:
 - **[16..19]**: additional data
 
 ### How Child Proofs Are Processed
+
 ```rust
 // Extract from each child proof:
 let user_registration_commitment = child_proof.public_inputs[0..4];
@@ -225,7 +232,9 @@ let user_registration_final = hash(commitment, worker_pk);
 ```
 
 ### PM Rewards Commitment
+
 The PM (Prover/Miner) Rewards Commitment is calculated from these three roots:
+
 ```rust
 PMRewardCommitment {
     register_users_root,
@@ -239,12 +248,14 @@ PMRewardCommitment {
 The final circuit that creates the checkpoint proof:
 
 ### Inputs
+
 - State Part 1 proof
 - Previous checkpoint proof
 - Checkpoint tree merkle proof
 - Various metadata (block time, random seed, etc.)
 
 ### Public Inputs Layout (19 inputs total)
+
 - **[0..4]**: commitment
 - **[4..8]**: worker_public_key
 - **[8..11]**: pm_jobs_completed_stats (from State Part 1 proof)
@@ -285,21 +296,27 @@ The dependency graph shows how PM stats flow through the system:
 The commitment calculation follows a consistent pattern across all circuits:
 
 ### 1. Leaf Circuits (No Dependencies)
+
 ```rust
 commitment = worker_public_key
 ```
+
 Examples: GUTANoChange, BatchDeployContracts, AppendUserRegistrationTree
 
 ### 2. Single Dependency Circuits (One Child Proof)
+
 ```rust
 commitment = hash(child.commitment, worker_public_key)
 ```
+
 Examples: GUTASingleEndCap, GUTAVerifyToCap, GUTAVerifyToCapWithCheckpointUpgrade
 
 ### 3. Two Dependencies Circuits (Two Child Proofs)
+
 ```rust
 commitment = hash(hash(left.commitment, right.commitment), worker_public_key)
 ```
+
 Examples: GUTATwoGUTA, GUTATwoGUTAWithCheckpointUpgrade, GUTATwoEndCap, GUTALeftGUTARightEndCap, AggStateTransition
 
 ### Core Design Principles
@@ -322,12 +339,12 @@ Examples: GUTATwoGUTA, GUTATwoGUTAWithCheckpointUpgrade, GUTATwoEndCap, GUTALeft
 
 ### Coordinator Main Circuits (19 inputs)
 
-| Circuit | Type | Dependencies | Commitment Calculation |
-|---------|------|----------|------------------------|
-| **BatchAppendUserRegistrationTree** | Leaf | None | `commitment = hash(0, 0)` |
-| **BatchDeployContracts** | Leaf | None | `commitment = hash(0, 0)` |
-| **AggStateTransition** | Aggregation | 2 proofs | `commitment = hash(hash(left.commit, left.worker), hash(right.commit, right.worker))` |
-| **DummyAggStateTransition** | Dummy | None | `commitment = hash(0, 0)` |
+| Circuit                             | Type        | Dependencies | Commitment Calculation                                                                |
+| ----------------------------------- | ----------- | ------------ | ------------------------------------------------------------------------------------- |
+| **BatchAppendUserRegistrationTree** | Leaf        | None         | `commitment = hash(0, 0)`                                                             |
+| **BatchDeployContracts**            | Leaf        | None         | `commitment = hash(0, 0)`                                                             |
+| **AggStateTransition**              | Aggregation | 2 proofs     | `commitment = hash(hash(left.commit, left.worker), hash(right.commit, right.worker))` |
+| **DummyAggStateTransition**         | Dummy       | None         | `commitment = hash(0, 0)`                                                             |
 
 **Public Inputs Layout (19 total)**:
 - `[0..4]`: commitment
@@ -340,13 +357,13 @@ Examples: GUTATwoGUTA, GUTATwoGUTAWithCheckpointUpgrade, GUTATwoEndCap, GUTALeft
 
 Live rows only (enum leftovers 9/12/14 omitted — see §4 currency note).
 
-| Circuit | Type | Dependencies | Commitment Calculation |
-|---------|------|----------|------------------------|
-| **GUTASingleEndCap** | Leaf | 1 EndCap | `commitment = hash(0, 0)` |
-| **GUTANoChange** | Leaf | None | `commitment = hash(0, 0)` |
-| **GUTATwoGUTA** | Aggregation | 2 GUTA | `commitment = hash(hash(left.commit, left.worker), hash(right.commit, right.worker))` |
-| **GUTATwoEndCap** | Aggregation | 2 EndCap | `commitment = hash(hash(left.commit, left.worker), hash(right.commit, right.worker))` |
-| **GUTALeftGUTARightEndCap** | Mixed | 1 GUTA + 1 EndCap | `commitment = hash(hash(left.commit, left.worker), hash(right.commit, right.worker))` |
+| Circuit                     | Type        | Dependencies      | Commitment Calculation                                                                |
+| --------------------------- | ----------- | ----------------- | ------------------------------------------------------------------------------------- |
+| **GUTASingleEndCap**        | Leaf        | 1 EndCap          | `commitment = hash(0, 0)`                                                             |
+| **GUTANoChange**            | Leaf        | None              | `commitment = hash(0, 0)`                                                             |
+| **GUTATwoGUTA**             | Aggregation | 2 GUTA            | `commitment = hash(hash(left.commit, left.worker), hash(right.commit, right.worker))` |
+| **GUTATwoEndCap**           | Aggregation | 2 EndCap          | `commitment = hash(hash(left.commit, left.worker), hash(right.commit, right.worker))` |
+| **GUTALeftGUTARightEndCap** | Mixed       | 1 GUTA + 1 EndCap | `commitment = hash(hash(left.commit, left.worker), hash(right.commit, right.worker))` |
 
 **Public Inputs Layout (15 total)**:
 - `[0..4]`: commitment
@@ -356,16 +373,17 @@ Live rows only (enum leftovers 9/12/14 omitted — see §4 currency note).
 
 ### Final Aggregation Circuits
 
-| Circuit | Dependencies | Special Notes |
-|---------|----------|---------------|
+| Circuit                                          | Dependencies                        | Special Notes                                                         |
+| ------------------------------------------------ | ----------------------------------- | --------------------------------------------------------------------- |
 | **VerifyAggUserRegistrationDeployContractsGUTA** | 3 proofs (user_reg + deploy + guta) | **UNIQUE LAYOUT**: `[0..4]` = state_transition_hash (NOT commitment!) |
-| **PsyCheckpointStateTransition** | 1 proof (state_part_1) | Standard 19-input layout |
+| **PsyCheckpointStateTransition**                 | 1 proof (state_part_1)              | Standard 19-input layout                                              |
 
 ## 10. Proof Miner Job Statistics
 
 The PM (Proof Miner) jobs completed stats track the number of different types of jobs completed throughout the circuit hierarchy. These stats flow upward through the trees and are combined at aggregation points.
 
 ### PM Stats Components
+
 - **deploy_contracts_completed**: Number of deploy contract jobs completed in this subtree
 - **register_users_completed**: Number of user registration jobs completed in this subtree
 - **gutas_completed**: Number of GUTA jobs completed in this subtree
@@ -373,6 +391,7 @@ The PM (Proof Miner) jobs completed stats track the number of different types of
 ### How Stats Flow Through the Hierarchy
 
 #### Leaf Circuits
+
 Leaf circuits initialize their PM stats based on the work they perform:
 - **Deploy Contract leaves** (BatchDeployContracts): `pm_stats = (batch_size, 0, 0)`
 - **Register Users leaves** (AppendUserRegistrationTree): `pm_stats = (0, batch_size, 0)`
@@ -380,7 +399,9 @@ Leaf circuits initialize their PM stats based on the work they perform:
 - **Dummy circuits** (AggStateTransitionDummy): `pm_stats = (0, 0, 0)` (all zeros)
 
 #### Aggregation Circuits
+
 Aggregation circuits combine PM stats from their children:
+
 ```rust
 // Two children aggregation (AggStateTransition, GUTATwoGUTA)
 final_pm_stats = PMJobsCompletedStats {
@@ -391,7 +412,9 @@ final_pm_stats = PMJobsCompletedStats {
 ```
 
 #### GUTA Circuits Special Handling
+
 GUTA circuits add 1 to their gutas_completed count:
+
 ```rust
 // Single child GUTA aggregation (GUTAVerifyToCap)
 final_pm_stats = PMJobsCompletedStats {
@@ -402,7 +425,9 @@ final_pm_stats = PMJobsCompletedStats {
 ```
 
 ### Final Aggregation
+
 At the State Part 1 level (AggUserRegistrationDeployContractsGUTA), the PM stats from all three trees are combined:
+
 ```rust
 final_pm_stats = register_users_proof.pm_stats +
                  deploy_contracts_proof.pm_stats +
