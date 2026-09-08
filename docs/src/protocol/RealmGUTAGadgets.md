@@ -172,6 +172,8 @@ Job graph and PI layouts: [ProvingJobs.md](./ProvingJobs.md).
 
 ## 10. Legacy user-registration gadget sketches
 
+> **Currency:** The `guta_register_user_*.rs` / `guta_only_register_users_gadget.rs` paths named below are **absent** from `psy_plonky2_circuits/src/guta/gadgets/` in this worktree. Types 12/14 are not in `cached_circuit_library`. Treat §10 as historical sketch only; live registration is coordinator `BatchAppendUserRegistrationTree`.
+
 These are **legacy gadget sketches**, not live proving-job circuits (cache lacks types 9/12/14; registration is coordinator `BatchAppendUserRegistrationTree`).
 
 ### `GUTARegisterUserCoreGadget`

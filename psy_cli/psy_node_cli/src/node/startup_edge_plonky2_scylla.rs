@@ -73,7 +73,7 @@ pub async fn run_startup_plonky2_scylla_edge_node(config: &CoordinatorEdgeStartC
             let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, false).await?;
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
-            let mut handler = CoordinatorEdgeHandler::<N, _, _, _, _, _, _, _, _>::new(
+            let handler = CoordinatorEdgeHandler::<N, _, _, _, _, _, _, _, _>::new(
                 db,
                 tag_tree_rewards_store,
                 temp_db,
@@ -88,9 +88,6 @@ pub async fn run_startup_plonky2_scylla_edge_node(config: &CoordinatorEdgeStartC
                 proof_verifier,
                 checkpoint_state_transition_circuit_fingerprint,
             );
-            let (validator_index, checkpoints_per_epoch) =
-                crate::node::realm_p2p::genesis_validator_index_from_network_config(config.network)?;
-            handler.set_validators(validator_index, checkpoints_per_epoch)?;
             start_coordinator_edge_rpc_server::<N, _, _, _, _, _, _, _, _>(
                 handler,
                 &config.listen,
@@ -174,11 +171,10 @@ pub async fn run_startup_plonky2_scylla_realm_edge_node(config: &RealmEdgeStartC
                 0,
                 proof_verifier,
             );
-            let (built, proposer_edge_node_ids, realm_edge_node_ids, rotation) =
+            let (built, proposer_edge_node_ids, realm_edge_node_ids) =
                 crate::node::realm_p2p::maybe_build_edge_network(config, chain_id)?;
             handler.set_realm_p2p(
                 built.handle.commands(),
-                rotation,
                 proposer_edge_node_ids,
                 realm_edge_node_ids,
             );

@@ -4,6 +4,7 @@ use tokio::task;
 use parth_core::{
     QCoreProcCheckpointUniqueId, QProvingJobDataIDWithRewardPath, crypto::hash::{merkle_proof::MerkleProofCore, tag_tree::TagTreeMerkleProof, traits::{HashTo4Felts, MerkleZeroHasher, QFieldHashable}}, data::{hash::merkle_node_key::SimpleMerkleNodeKey, queue::queue_key::QPBaseQueueType}, felt::{FromPrimitiveValuesFelt, ToU64Value}, node::realm_identifier::QRealmIdentifier, protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofVerifier}
 };
+use psy_config::CHECKPOINTS_PER_EPOCH;
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_crypto::hash::tx_hash::{compute_deploy_contract_content_hash, compute_update_contract_content_hash, hash_to_hex};
 use psy_api_core::CheckpointJobStats;
@@ -76,7 +77,6 @@ pub struct CoordinatorEdgeHandler<
 
     pub checkpoint_state_transition_circuit_fingerprint: N::QHash,
     pub chain_id: u64,
-    pub validators: Option<(crate::coordinator::genesis_validators::GenesisValidatorIndex, u64)>,
 }
 impl<
         N: QNetworkTypesConfig,
@@ -119,7 +119,6 @@ impl<
             contract_state_tree_height_cache: self.contract_state_tree_height_cache.clone(),
             checkpoint_state_transition_circuit_fingerprint: self.checkpoint_state_transition_circuit_fingerprint.clone(),
             chain_id: self.chain_id,
-            validators: self.validators.clone(),
         }
     }
 }
@@ -180,18 +179,7 @@ impl<
             contract_state_tree_height_cache: Arc::new(DashMapContractHeightCache::new()),
             checkpoint_state_transition_circuit_fingerprint,
             chain_id,
-            validators: None,
         }
-    }
-    pub fn set_validators(
-        &mut self,
-        index: crate::coordinator::genesis_validators::GenesisValidatorIndex,
-        checkpoints_per_epoch: u64,
-    ) -> anyhow::Result<()> {
-        anyhow::ensure!(!index.is_empty(), "P2P validators must not be empty");
-        anyhow::ensure!(checkpoints_per_epoch > 0, "P2P checkpoints_per_epoch must be greater than zero");
-        self.validators = Some((index, checkpoints_per_epoch));
-        Ok(())
     }
 
     pub async fn get_checkpoint_leaves_batch_raw_internal(&self, start_checkpoint_id: u64, count: u32) -> anyhow::Result<Vec<u8>>{
@@ -289,9 +277,6 @@ impl<
     pub async fn get_current_unique_pending_id_internal(&self) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId)> {
         self.temp_db.get_unique_pending_ids(&self.realm_identifier).await
     }
-    pub async fn get_current_gathering_unique_pending_id_internal(&self) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId)> {
-        self.temp_db.get_gathering_unique_pending_ids(&self.realm_identifier).await
-    }
     pub async fn ensure_realm_has_not_submitted(&self, realm_id: u64, unique_pending_id: u64) -> anyhow::Result<()> {
         let submitted_status = self
             .temp_db
@@ -366,8 +351,7 @@ impl<
     pub async fn get_register_user_queue_key(
         &self,
     ) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId, CoordinatorRegisterUserPublicKeyQueueKey<N::QHash>)> {
-        let (unique_pending_id, unique_proc_checkpoint_id) = self.temp_db.get_gathering_unique_pending_ids(&self.realm_identifier).await?;
-        println!("got gathering unique pending id {} and gathering proc checkpoint id {}", unique_pending_id, unique_proc_checkpoint_id);
+        let psy_node_core::psy_temp_db::GatheringGeneration { unique_pending_id, proc_checkpoint_unique_id: unique_proc_checkpoint_id, .. } = self.temp_db.get_gathering_generation(&self.realm_identifier).await?;
 
         Ok((
             unique_pending_id,
@@ -385,9 +369,8 @@ impl<
     pub async fn get_deploy_contract_queue_key(
         &self,
     ) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId, CoordinatorDeployContractQueueKey<N::F, N::QHash>)> {
-        let (unique_pending_id, unique_proc_checkpoint_id) = self.temp_db.get_gathering_unique_pending_ids(&self.realm_identifier).await?;
+        let psy_node_core::psy_temp_db::GatheringGeneration { unique_pending_id, proc_checkpoint_unique_id: unique_proc_checkpoint_id, .. } = self.temp_db.get_gathering_generation(&self.realm_identifier).await?;
 
-        println!("got gathering unique pending id {} and gathering proc checkpoint id {}", unique_pending_id, unique_proc_checkpoint_id);
         Ok((
             unique_pending_id,
             unique_proc_checkpoint_id,
@@ -405,7 +388,7 @@ impl<
     pub async fn get_update_contract_queue_key(
         &self,
     ) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId, CoordinatorUpdateContractQueueKey<N::F, N::QHash>)> {
-        let (unique_pending_id, unique_proc_checkpoint_id) = self.temp_db.get_gathering_unique_pending_ids(&self.realm_identifier).await?;
+        let psy_node_core::psy_temp_db::GatheringGeneration { unique_pending_id, proc_checkpoint_unique_id: unique_proc_checkpoint_id, .. } = self.temp_db.get_gathering_generation(&self.realm_identifier).await?;
 
         Ok((
             unique_pending_id,
@@ -622,6 +605,22 @@ impl<
     }
 }
 
+/// realm-finalize-bls-auth.md §5 admission shape: an external Realm GUTA
+/// submission must be circuit 63 (`RealmFinalizeGUTA`) and carry a non-empty
+/// finalize binding. Any other job type — with or without a binding — is
+/// explicitly rejected instead of being silently admitted.
+fn validate_external_guta_admission(job_type_u32: u32, finalize_binding: &[u8]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        job_type_u32 == ProvingJobCircuitType::RealmFinalizeGUTA as u32,
+        "external Realm GUTA admission requires job type 63 (RealmFinalizeGUTA), got {job_type_u32}"
+    );
+    anyhow::ensure!(
+        !finalize_binding.is_empty(),
+        "realm finalize submission requires a finalize binding"
+    );
+    Ok(())
+}
+
 impl<
         N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
         S: PsyCoordinatorEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync,
@@ -657,7 +656,6 @@ impl<
         N::ZKVerifier: 'static,
     {
         let realm_id_u64 = input.header.header.state_transition.node_index.to_u64_value();
-        println!("Submitting GUTA for realm_id {}\n{:?}", realm_id_u64, input);
 
         let realm_level_u64 = input.header.header.state_transition.node_level.to_u64_value();
         if realm_level_u64 != N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT as u64 {
@@ -683,7 +681,7 @@ impl<
         let proving_circuit_type = ProvingJobCircuitType::try_from_u32(input.job_type_u32)?;
         let proof_bytes = Arc::new(proof_bytes);
 
-        let (unique_pending_id, proc_checkpoint_id) = self.get_current_gathering_unique_pending_id_internal().await?;
+        let psy_node_core::psy_temp_db::GatheringGeneration { unique_pending_id, proc_checkpoint_unique_id: proc_checkpoint_id, .. } = self.temp_db.get_gathering_generation(&self.realm_identifier).await?;
         self.ensure_guta_matches_current_coordinator_state(realm_id_u64, &input).await?;
 
         let output_proof_job_id = QProvingJobDataID::try_get_coordinator_edge_proof_store_output_proof_id_for_realm_submit(
@@ -802,25 +800,10 @@ impl<
         certificate_bytes: Option<&[u8]>,
         finalize_binding: &[u8],
     ) -> anyhow::Result<()> {
-        let is_realm_finalize = input.job_type_u32 == ProvingJobCircuitType::RealmFinalizeGUTA as u32;
-        if is_realm_finalize {
-            anyhow::ensure!(
-                !finalize_binding.is_empty(),
-                "realm finalize submission requires a finalize binding"
-            );
-        } else {
-            anyhow::ensure!(
-                finalize_binding.is_empty(),
-                "finalize binding supplied for a non-realm-finalize GUTA submission"
-            );
-        }
-        let Some((_index, checkpoints_per_epoch)) = self.validators.as_ref() else {
-            anyhow::ensure!(
-                !is_realm_finalize && proposal_bytes.is_none() && certificate_bytes.is_none(),
-                "realm finalize GUTA supplied but coordinator has no validators"
-            );
-            return Ok(());
-        };
+        // realm-finalize-bls-auth.md §5: external Realm admission requires job
+        // type 63 with a non-empty finalize binding. Ordinary GUTA aggregation
+        // never crosses this edge, and no legacy non-63 path is permitted.
+        validate_external_guta_admission(input.job_type_u32, finalize_binding)?;
         let proposal = Proposal::decode_exact(proposal_bytes.ok_or_else(|| {
             anyhow::anyhow!("rotation enabled but GUTA Proposal missing for realm {realm_id}")
         })?)
@@ -834,10 +817,10 @@ impl<
         anyhow::ensure!(proposal.realm_id == realm_id, "GUTA Proposal realm mismatch");
         anyhow::ensure!(proposal.finalizer_proof_hash == sha256(proof_bytes), "GUTA Proposal proof hash mismatch");
 
-        // 1. Realm-finalize only: strictly decode the binding and the actual
-        // output; bind them to the submitted header/tag and the circuit
-        // public input. Non-63 GUTA submissions carry no binding.
-        let output = if is_realm_finalize {
+        // 1. Admission guarantees circuit 63: strictly decode the binding and
+        // the actual output; bind them to the submitted header/tag and the
+        // circuit public input.
+        let output = {
             let binding = psy_data::guta::realm_finalize::RealmFinalizeBinding::protocol_decode(finalize_binding)
                 .map_err(|error| anyhow::anyhow!("invalid finalize binding: {error}"))?;
             let output: RealmFinalizeGUTAPublicOutput<N::F, N::QHash> =
@@ -858,8 +841,6 @@ impl<
                 "GUTA Proposal public output hash mismatch"
             );
             Some(output)
-        } else {
-            None
         };
 
         // 2. Canonical proof base, chain domain and field consistency.
@@ -962,11 +943,11 @@ impl<
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("GUTA Proposal proof-base checkpoint overflow"))?;
         let rotation = parth_common::realm_rotation::RealmRotationConfig {
-            checkpoints_per_epoch: *checkpoints_per_epoch,
+            checkpoints_per_epoch: CHECKPOINTS_PER_EPOCH,
             validator_sub_ids: validator_sub_ids.clone(),
         };
-        let epoch = parth_common::realm_rotation::epoch(target_checkpoint_id, *checkpoints_per_epoch);
-        let anchor_checkpoint_id = parth_common::realm_rotation::anchor_checkpoint_id(epoch, *checkpoints_per_epoch);
+        let epoch = parth_common::realm_rotation::epoch(target_checkpoint_id, CHECKPOINTS_PER_EPOCH);
+        let anchor_checkpoint_id = parth_common::realm_rotation::anchor_checkpoint_id(epoch, CHECKPOINTS_PER_EPOCH);
         let anchor_leaf = self.db_reader.get_checkpoint_leaf_data(anchor_checkpoint_id).await?;
         let anchor_felts = anchor_leaf.stats.random_seed.to_4_felts();
         let anchor_seed = [
@@ -1035,4 +1016,51 @@ impl<
         Ok(())
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// §5: external Realm admission is type 63 only. A non-63 submission with
+    /// an empty binding must be rejected, not silently admitted (this is the
+    /// path that previously returned Ok without any checks at all).
+    #[test]
+    fn admission_rejects_non_finalize_type_with_empty_binding() {
+        let error = validate_external_guta_admission(
+            ProvingJobCircuitType::GUTATwoGUTALinear as u32,
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("requires job type 63"));
+    }
+
+    /// A non-63 submission cannot launder itself by supplying a binding: the
+    /// type check fires first.
+    #[test]
+    fn admission_rejects_non_finalize_type_even_with_binding() {
+        let error = validate_external_guta_admission(
+            ProvingJobCircuitType::GUTATwoGUTALinear as u32,
+            &[0u8; 442],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("requires job type 63"));
+    }
+
+    /// Type 63 without a binding is the flagged empty-binding admission hole.
+    #[test]
+    fn admission_rejects_finalize_type_with_empty_binding() {
+        let error =
+            validate_external_guta_admission(ProvingJobCircuitType::RealmFinalizeGUTA as u32, &[])
+                .unwrap_err();
+        assert!(error.to_string().contains("requires a finalize binding"));
+    }
+
+    /// The legitimate shape passes the shape check and proceeds to the
+    /// certificate/binding verification stages.
+    #[test]
+    fn admission_accepts_finalize_type_with_binding() {
+        validate_external_guta_admission(ProvingJobCircuitType::RealmFinalizeGUTA as u32, &[0u8; 442])
+            .expect("type 63 with binding is admissible");
+    }
 }

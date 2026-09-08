@@ -51,7 +51,7 @@ Psy uses a sophisticated system of ZK circuits and recursive proofs to verify al
 *   **Recursion:** If the user performs multiple actions, recursive proofs compress them into a single proof representing the net state change for that user within the block.
 
 **Step 2: Parallel Proof Aggregation (Decentralized Proving Network + Realms)**
-*   **Submission:** Users submit their final proofs and delta merkle proofs (representing their state transitions for the block) to their corresponding realm node on the Psy network. (see handle_recv_end_cap_from_user)
+*   **Submission:** Users submit their final proofs and delta merkle proofs (representing their state transitions for the block) to their corresponding realm node on the Psy network. (live path: realm edge `submit_end_cap_proof` / EndCap admission handlers — not `handle_recv_end_cap_from_user`)
 *   **Parallel Processing:** Thanks to the PARTH architecture ensuring user-transaction independence, the **Decentralized Proving Network** can take proofs from *thousands or millions* of users and begin verifying and aggregating them **in parallel**. Realms are in charge of sending the proofs to the queue to be aggregated by the proof workers
 * Once all the update proofs are aggregated in a realm into a single proof, the realm sends that proof off to the block coordinator to be aggregated into a single proof of all realm updates at the end of the block.
 *   **Hierarchical Aggregation:** Specialized **Aggregation Circuits** (e.g., for aggregating user contract trees, or global user trees) recursively verify batches of proofs from the layer below within the PARTH structure.

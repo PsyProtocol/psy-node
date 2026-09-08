@@ -147,7 +147,7 @@ child R values ──► tagged node R ──► PI = H(header, R)
 | Two GUTA | 8 `GUTATwoGUTA` | `verify_two_guta.rs:113-121` |
 | Linear GUTA | 57 `GUTATwoGUTALinear` | `verify_guta_linear_transition.rs:98-106` |
 | Left GUTA / right EndCap | 13 `GUTAVerifyToCap` | `verify_left_guta_right_end_cap.rs:114-118` |
-| Checkpoint-upgrade twins | 55, 56, 58, 59, 60 | `verify_two_guta_upgrade_checkpoint.rs` and siblings |
+| Checkpoint-upgrade twins | 55, 56, 58, 59 (type **60** absent from `cached_circuit_library`) | `verify_two_guta_upgrade_checkpoint.rs` and siblings |
 
 Each reads `left_R` / `right_R` from the verified child gadgets and calls `get_public_inputs_hash_two_children`. Left-GUTA / right-EndCap zeros the EndCap child's reward (`guta_header.rs:171-178`).
 

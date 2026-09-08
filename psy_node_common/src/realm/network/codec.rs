@@ -3,8 +3,9 @@
 //!
 //! Two request/response protocols are wired:
 //! - `/psy/realm/proposal-body/1` — bounded proposal body range exchange.
-//! - `/psy/realm/end-cap-forward/1` — EndCap forward stream (56-byte header
-//!   followed by `end_cap_input_len` input bytes and `proof_len` proof bytes).
+//! - `/psy/realm/end-cap-forward/2` — EndCap forward stream (56-byte header
+//!   followed by `end_cap_input_len` input bytes and `proof_len` proof bytes);
+//!   version 2 carries the 18-byte typed rejection response.
 //!
 //! All codecs are memory-backed and use only `futures` AsyncRead/AsyncWrite
 //! (no tempfile / tokio-fs backing) so the slim port stays free of the heavy
@@ -23,7 +24,10 @@ use psy_data::p2p::{
 use std::{fmt, io};
 
 pub const DIRECT_BODY_PROTOCOL_ID: &str = "/psy/realm/proposal-body/1";
-pub const END_CAP_FORWARD_PROTOCOL_ID: &str = "/psy/realm/end-cap-forward/1";
+/// Bumped from `.../end-cap-forward/1` when the response grew from a bare
+/// 1-byte bool to the typed 18-byte rejection, so mixed-version peers never
+/// misread each other's responses.
+pub const END_CAP_FORWARD_PROTOCOL_ID: &str = "/psy/realm/end-cap-forward/2";
 
 const DIRECT_BODY_RESPONSE_OVERHEAD: usize = 53;
 

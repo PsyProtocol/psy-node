@@ -549,8 +549,8 @@ dargo compile --contract-name MyContract --method-names deploy transfer
 # Execute with parameters  
 dargo execute --contract-name MyContract --method-names mint --parameters 100
 
-# Run tests
-dargo test
+# Run tests ( --file / -f required unless FILE env is set)
+dargo test --file src/main.psy
 
 # Format code
 dargo fmt src/main.psy

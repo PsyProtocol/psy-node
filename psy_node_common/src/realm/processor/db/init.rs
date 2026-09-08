@@ -338,7 +338,11 @@ where
         tracing::info!("[REALM_INIT] temp db unique ids set");
 
         temp_db
-            .set_gathering_unique_pending_ids(&realm_identifier, current_unique_pending_id, current_core_proc_unique_pending_id)
+            .set_gathering_generation(&realm_identifier, psy_node_core::psy_temp_db::GatheringGeneration {
+                checkpoint_id: state.gathering_checkpoint_id,
+                unique_pending_id: state.gathering_unique_pending_id,
+                proc_checkpoint_unique_id: state.gathering_proc_checkpoint_unique_id,
+            })
             .await?;
         tracing::info!("[REALM_INIT] temp db gathering unique ids set");
 
@@ -567,37 +571,15 @@ where
                                     );
                                     match read_realm_backup_end_root::<FileSystem, N::QHash>(file_system, &path.to_string_lossy()).await {
                                         Ok(end_root) if end_root == target_realm_state.value => {
-                                            let candidate_proc_checkpoint_id = if candidate == current_unique_pending_id {
-                                                current_proc_checkpoint_id
-                                            } else if let Some(mapped_checkpoint_id) =
-                                                self.db.get_checkpoint_id_for_unique_pending_id(candidate).await?
-                                            {
-                                                match self.db.get_unique_pending_id_for_checkpoint_id(mapped_checkpoint_id).await? {
-                                                    Some((mapped_pending_id, mapped_proc_checkpoint_id))
-                                                        if mapped_pending_id == candidate =>
-                                                    {
-                                                        mapped_proc_checkpoint_id
-                                                    }
-                                                    _ => {
-                                                        tracing::warn!(
-                                                            "Backup pending_id {} matches checkpoint {} end_root, but its stored proc_checkpoint_unique_id could not be verified via mapped checkpoint {}. Using current proc_checkpoint_unique_id {}.",
-                                                            candidate,
-                                                            checkpoint_id,
-                                                            mapped_checkpoint_id,
-                                                            current_proc_checkpoint_id
-                                                        );
-                                                        current_proc_checkpoint_id
-                                                    }
-                                                }
-                                            } else {
+                                            let Some(candidate_proc_checkpoint_id) =
+                                                self.db.get_proc_checkpoint_unique_id_for_pending_id(candidate).await?
+                                            else {
                                                 tracing::warn!(
-                                                    "Backup pending_id {} matches checkpoint {} end_root, but it has no checkpoint mapping to recover proc_checkpoint_unique_id. Current pending_id is {}; using current proc_checkpoint_unique_id {}.",
+                                                    "Backup pending_id {} matches checkpoint {} end_root but has no durable pending->proc record; skipping instead of borrowing another generation's proc ID.",
                                                     candidate,
-                                                    checkpoint_id,
-                                                    current_unique_pending_id,
-                                                    current_proc_checkpoint_id
+                                                    checkpoint_id
                                                 );
-                                                current_proc_checkpoint_id
+                                                continue;
                                             };
                                             let mut recovery_state = self.state.clone();
                                             recovery_state.processing_unique_pending_id = candidate;
@@ -609,6 +591,7 @@ where
                                                 checkpoint_id,
                                                 candidate
                                             );
+                                            let journal_snapshot = global_user_tree.snapshot();
                                             match generate_realm_output_from_backups::<N, FileSystem>(
                                                 file_system,
                                                 guta_gatherer_backup_directory,
@@ -616,7 +599,7 @@ where
                                                 Some(candidate),
                                                 global_user_tree,
                                             ).await {
-                                                Ok(updates) if updates.new_realm_root == target_realm_state.value => {
+                                                Ok(updates) if updates.new_realm_root == target_realm_state.value && global_user_tree.get_root() == target_realm_state.value => {
                                                     tracing::info!(
                                                         "Backup recovery successful for pending_id {}: end_root matches coordinator target {:?}.",
                                                         candidate,
@@ -645,6 +628,7 @@ where
                                                     break;
                                                 }
                                                 Ok(updates) => {
+                                                    global_user_tree.revert_to(journal_snapshot);
                                                     tracing::warn!(
                                                         "Backup end_root {:?} does not match coordinator target {:?} for pending_id {}. Trying next candidate.",
                                                         updates.new_realm_root,
@@ -653,6 +637,7 @@ where
                                                     );
                                                 }
                                                 Err(e) => {
+                                                    global_user_tree.revert_to(journal_snapshot);
                                                     tracing::warn!(
                                                         "Backup pending_id {} end_root matches but full load failed: {:?}. Trying next candidate.",
                                                         candidate,
@@ -730,14 +715,22 @@ where
                         self.state.processing_proc_checkpoint_unique_id = realm_proc_checkpoint_id;
                         self.state.processing_realm_start_root = self.state.last_committed_realm_end_root;
                         self.state.processing_realm_end_root = target_realm_state.value;
-                        generate_realm_output_from_backups::<N, FileSystem>(
+                        let prepared = generate_realm_output_from_backups::<N, FileSystem>(
                             file_system,
                             guta_gatherer_backup_directory,
                             &self.state,
                             Some(realm_unique_pending_id),
                             global_user_tree,
                         )
-                        .await?
+                        .await?;
+                        anyhow::ensure!(
+                            global_user_tree.get_root() == target_realm_state.value,
+                            "Checkpoint {}: replayed tree root {:?} does not match coordinator target {:?}.",
+                            checkpoint_id,
+                            global_user_tree.get_root(),
+                            target_realm_state.value
+                        );
+                        prepared
                     }
                 };
 

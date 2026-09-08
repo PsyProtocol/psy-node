@@ -70,11 +70,12 @@ psy_user_cli wallet info --private-key <private_key> --sign-type zk
 psy_user_cli wallet info --keystore-path <home>/.psy/keystore/your_wallet.json
 ```
 
-Output includes:
-- Public key
-- Address representation
-- Signature type
-- Key derivation information
+Output includes (see `wallet info` in `psy_user_cli`):
+- `sign_type`
+- `fingerprint`
+- `public_key_param`
+- `public_key` (public-key hash)
+- `private_key`
 
 ## 3. User Registration
 

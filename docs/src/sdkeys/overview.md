@@ -192,12 +192,14 @@ let call_data = DPNSoftwareDefinedCallData {
 ```bash
 psy_user_cli call \
   --sign-type software-defined-dpn \
-  --sign-inputs "[1000, 95000, 500, 1]" \
+  --sign-inputs 1000 95000 500 1 \
   --contract-id 0 \
   --method-name main \
   --inputs "[]" \
   --fingerprint <trading_bot_fingerprint>
 ```
+
+`--inputs` is JSON (`Vec<String>` then `serde_json`). `--sign-inputs` is a clap `Vec<u64>` of bare integers (not a JSON array string).
 
 #### AI Agents and Autonomous Systems
 - **Portfolio Rebalancing**: Deploy rebalancing logic that anyone can trigger when portfolios drift from targets

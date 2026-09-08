@@ -72,8 +72,8 @@ Start a worker against a running localhost stack (prefer `make run-all` workers)
 psy_worker_cli worker \
   --keystore-path ./miner_wallet.json \
   --user 0 \
-  --realm-api-urls http://127.0.0.1:13380 \
-  --coordinator-api-urls http://127.0.0.1:1337
+  --realm-api-url http://127.0.0.1:13380 \
+  --coordinator-api-url http://127.0.0.1:1337
 ```
 
 A private key can be supplied directly:
@@ -82,8 +82,8 @@ A private key can be supplied directly:
 psy_worker_cli worker \
   --private-key <miner-private-key> \
   --user 0 \
-  --realm-api-urls http://127.0.0.1:13380 \
-  --coordinator-api-urls http://127.0.0.1:1337
+  --realm-api-url http://127.0.0.1:13380 \
+  --coordinator-api-url http://127.0.0.1:1337
 ```
 
 ## 3. Endpoint Rotation

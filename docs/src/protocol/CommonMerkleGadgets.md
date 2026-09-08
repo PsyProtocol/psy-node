@@ -248,6 +248,6 @@ Documented for inventory; **not** required reading for the live Plonky2 node+bri
 |---|---|
 | `…/sha256/` / `sha256_truncated/` / `generic/` merkle+delta | Alternate hash stacks |
 | `old_historical_merkle_proof.rs` | Superseded by `HistoricalRootMerkleProofGadget` |
-| `append_many_merkle_proof.rs` | Empty / non-core in this worktree |
+| `append_many_merkle_proof.rs` | **Absent** from this worktree (do not cite as empty file) |
 | `merkle_array_gen.rs` | Helper for 2-bit array Merkle enforcement (DPN) |
 | Client vs node `SpidermanAppendProofGadget` | Both covered in §4; node has `allow_existing` / `allow_overwrite` |

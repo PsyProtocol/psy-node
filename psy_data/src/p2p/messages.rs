@@ -758,26 +758,115 @@ pub fn compute_end_cap_id(
     sha256(&buf)
 }
 
-/// Exact one-byte EndCap forward response: `accepted:bool`.
+/// Typed EndCap forward rejection reasons carried on the wire.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum EndCapRejectReason {
+    /// Accepted; no rejection.
+    None = 0,
+    /// The scheduled proposer already persisted this (user_id, unique_pending_id).
+    AlreadySubmitted = 1,
+    /// The submission failed validation.
+    Invalid = 2,
+    /// The receiving node could not process the submission now.
+    Busy = 3,
+}
+
+impl EndCapRejectReason {
+    pub const fn from_u8(value: u8) -> ProtocolResult<Self> {
+        match value {
+            0 => Ok(Self::None),
+            1 => Ok(Self::AlreadySubmitted),
+            2 => Ok(Self::Invalid),
+            3 => Ok(Self::Busy),
+            value => Err(ProtocolError::UnknownTag {
+                ty: "EndCapRejectReason",
+                tag: value,
+            }),
+        }
+    }
+}
+
+/// Exact 18-byte EndCap forward response:
+/// `accepted:bool + reject_reason:u8 + user_id:u64 + unique_pending_id:u64`.
+/// `accepted=true` requires `reason=None` and a zeroed identity; a rejection
+/// requires a non-`None` reason, and only `AlreadySubmitted` echoes the
+/// proposer's `(user_id, unique_pending_id)` identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct EndCapForwardResponse {
     accepted: bool,
+    reject_reason: EndCapRejectReason,
+    user_id: u64,
+    unique_pending_id: u64,
 }
 
 impl EndCapForwardResponse {
-    /// Exact wire length (1 byte).
+    /// Exact wire length (18 bytes).
     pub const WIRE_BYTES: usize = END_CAP_FORWARD_RESPONSE_WIRE_BYTES;
 
-    pub const fn new(accepted: bool) -> Self {
-        Self { accepted }
+    pub const fn accepted() -> Self {
+        Self {
+            accepted: true,
+            reject_reason: EndCapRejectReason::None,
+            user_id: 0,
+            unique_pending_id: 0,
+        }
+    }
+
+    pub const fn rejected(reject_reason: EndCapRejectReason) -> Self {
+        Self {
+            accepted: false,
+            reject_reason,
+            user_id: 0,
+            unique_pending_id: 0,
+        }
+    }
+
+    /// Rejection that echoes the already-submitted endcap identity so the
+    /// requester can run duplicate recovery against the exact records.
+    pub const fn already_submitted(user_id: u64, unique_pending_id: u64) -> Self {
+        Self {
+            accepted: false,
+            reject_reason: EndCapRejectReason::AlreadySubmitted,
+            user_id,
+            unique_pending_id,
+        }
     }
 
     pub const fn is_accepted(&self) -> bool {
         self.accepted
     }
 
+    pub const fn reject_reason(&self) -> EndCapRejectReason {
+        self.reject_reason
+    }
+
+    /// Echoed `(user_id, unique_pending_id)`; zeroed unless `AlreadySubmitted`.
+    pub const fn identity(&self) -> (u64, u64) {
+        (self.user_id, self.unique_pending_id)
+    }
+
     pub fn protocol_decode(reader: &mut ProtocolReader<'_>) -> ProtocolResult<Self> {
-        Ok(Self::new(reader.read_bool()?))
+        let accepted = reader.read_bool()?;
+        let reject_reason = EndCapRejectReason::from_u8(reader.read_u8()?)?;
+        let user_id = reader.read_u64()?;
+        let unique_pending_id = reader.read_u64()?;
+        if accepted {
+            if reject_reason != EndCapRejectReason::None || user_id != 0 || unique_pending_id != 0 {
+                return Err(ProtocolError::Message(
+                    "canonical accepted EndCap response carries no reason or identity",
+                ));
+            }
+        } else if reject_reason == EndCapRejectReason::None {
+            return Err(ProtocolError::Message(
+                "canonical rejected EndCap response carries a rejection reason",
+            ));
+        }
+        Ok(Self {
+            accepted,
+            reject_reason,
+            user_id,
+            unique_pending_id,
+        })
     }
 
     pub fn decode_exact(bytes: &[u8]) -> ProtocolResult<Self> {
@@ -788,6 +877,9 @@ impl EndCapForwardResponse {
 impl ProtocolEncode for EndCapForwardResponse {
     fn protocol_encode(&self, out: &mut Vec<u8>) {
         write_bool(out, self.accepted);
+        write_u8(out, self.reject_reason as u8);
+        write_u64(out, self.user_id);
+        write_u64(out, self.unique_pending_id);
     }
 }
 
@@ -879,13 +971,47 @@ mod tests {
         let mut trailing = enc;
         trailing.push(0);
         assert!(EndCapForwardHeader::decode_exact(&trailing).is_err());
+        let ok = EndCapForwardResponse::accepted();
+        assert_eq!(ok.protocol_encode_to_vec().len(), END_CAP_FORWARD_RESPONSE_WIRE_BYTES);
+        assert_eq!(ok.protocol_encode_to_vec().len(), 18);
+        assert_eq!(EndCapForwardResponse::decode_exact(&ok.protocol_encode_to_vec()).unwrap(), ok);
+        assert!(ok.is_accepted());
 
-        assert_eq!(EndCapForwardResponse::new(true).protocol_encode_to_vec(), vec![0x01]);
-        assert_eq!(EndCapForwardResponse::new(false).protocol_encode_to_vec(), vec![0x00]);
-        assert!(EndCapForwardResponse::new(true).is_accepted());
-        assert!(!EndCapForwardResponse::new(false).is_accepted());
-        assert!(EndCapForwardResponse::decode_exact(&[0x02]).is_err());
-        assert!(EndCapForwardResponse::decode_exact(&[0x01, 0x00]).is_err());
+        let busy = EndCapForwardResponse::rejected(EndCapRejectReason::Busy);
+        assert_eq!(busy.protocol_encode_to_vec(), {
+            let mut bytes = vec![0x00, 0x03];
+            bytes.extend_from_slice(&0u64.to_le_bytes());
+            bytes.extend_from_slice(&0u64.to_le_bytes());
+            bytes
+        });
+        assert_eq!(EndCapForwardResponse::decode_exact(&busy.protocol_encode_to_vec()).unwrap(), busy);
+        assert!(!busy.is_accepted());
+        assert_eq!(busy.reject_reason(), EndCapRejectReason::Busy);
+
+        let duplicate = EndCapForwardResponse::already_submitted(0x1234, 675);
+        assert_eq!(duplicate.reject_reason(), EndCapRejectReason::AlreadySubmitted);
+        assert_eq!(duplicate.identity(), (0x1234, 675));
+        assert_eq!(EndCapForwardResponse::decode_exact(&duplicate.protocol_encode_to_vec()).unwrap(), duplicate);
+
+        // Wrong size, unknown reason tag, and non-canonical shapes are rejected.
+        let full = duplicate.protocol_encode_to_vec();
+        assert!(EndCapForwardResponse::decode_exact(&full[..17]).is_err());
+        let mut trailing = full.clone();
+        trailing.push(0);
+        assert!(EndCapForwardResponse::decode_exact(&trailing).is_err());
+        let mut bad_reason = full.clone();
+        bad_reason[1] = 4;
+        assert!(EndCapForwardResponse::decode_exact(&bad_reason).is_err());
+        let mut accepted_with_identity = full;
+        accepted_with_identity[0] = 0x01;
+        assert!(EndCapForwardResponse::decode_exact(&accepted_with_identity).is_err());
+        let rejected_without_reason = EndCapForwardResponse {
+            accepted: false,
+            reject_reason: EndCapRejectReason::None,
+            user_id: 0,
+            unique_pending_id: 0,
+        };
+        assert!(EndCapForwardResponse::decode_exact(&rejected_without_reason.protocol_encode_to_vec()).is_err());
     }
 
     #[test]

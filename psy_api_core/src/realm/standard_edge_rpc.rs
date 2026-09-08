@@ -34,6 +34,12 @@ pub struct RealmEndCapSlotUpdates {
     pub unique_pending_id: u64,
     pub user_id: u64,
     pub contracts: Vec<RealmContractSlotUpdates>,
+    /// Four reduced Goldilocks limbs of the accepted endcap's new user leaf
+    /// hash, persisted by the scheduled proposer. Optional for rolling
+    /// restarts: older nodes do not record it, and consumers must fall back
+    /// to the pre-identity behavior when absent.
+    #[serde(default)]
+    pub accepted_user_leaf_hash: Option<[u64; 4]>,
 }
 
 #[rpc(server, client, namespace = "psy")]

@@ -40,6 +40,7 @@ All VM operations work with these fundamental data types:
 - **Bool**: Boolean values (0 or 1)
 - **U32Target**: 32-bit unsigned integers
 - **HashOut**: 4-element field arrays representing hash outputs
+- **HashOut160**: 5×`u32` hash160-style values (`DPNBuiltInDataType::HashOut160 = 4`)
 - **Arrays**: Collections of the above types
 
 ## 3. Operation Categories
@@ -598,6 +599,7 @@ pub enum DPNBuiltInDataType {
     Bool = 1,          // Boolean
     U32Target = 2,     // 32-bit integer
     HashOut = 3,       // 4-element hash
+    HashOut160 = 4,    // 5×u32 hash160-style value
     TargetArray = 5,   // Array of field elements
     BoolArray = 6,     // Array of booleans
     U32TargetArray = 7,// Array of 32-bit integers

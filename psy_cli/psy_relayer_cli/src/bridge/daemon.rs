@@ -847,6 +847,19 @@ async fn run_multichain(
     if proxy.is_none() { warmup_bridge_resources()?; }
     tracing::info!(config=%config_path.display(), chain_count=chains.len(), %identity_namespace, "multichain bridge relayer started");
 
+    // Coordinator stall guard: if the head does not advance for
+    // COORDINATOR_STALL_POLLS consecutive rounds while the previous round
+    // minted L2 work, stop building/submitting new EndCaps against the frozen
+    // coordinator. 72 rounds ≈ 2 × REALM_CHECKPOINT_POLL_TIMEOUT_SECS /
+    // REALM_CHECKPOINT_POLL_INTERVAL_SECS of inclusion attempts.
+    const COORDINATOR_STALL_POLLS: u64 = 72;
+    const RELAYER_MIN_RETRY_BACKOFF_SECS: u64 = 5;
+    const RELAYER_MAX_RETRY_BACKOFF_SECS: u64 = 60;
+    let mut last_coordinator_head: Option<u64> = None;
+    let mut stalled_rounds: u64 = 0;
+    let mut last_round_submitted_l2_work = false;
+    let mut l2_retry_backoff = Duration::from_secs(RELAYER_MIN_RETRY_BACKOFF_SECS);
+
     loop {
         let mut state = load_multichain_state(&state_path, &identity_namespace)?;
         let mut cursors = HashMap::new();
@@ -869,6 +882,12 @@ async fn run_multichain(
         }
 
         let latest = provider.get_coordinator_latest_block_state().await?.checkpoint_id;
+        if last_coordinator_head == Some(latest) {
+            stalled_rounds += 1;
+        } else {
+            last_coordinator_head = Some(latest);
+            stalled_rounds = 0;
+        }
         let (from_checkpoint, window) = if let Some(range) = state.pending_finalization_range {
             (range.from_checkpoint, RelayerWindow { to_checkpoint: range.to_checkpoint, confirmed_to_checkpoint: Some(range.to_checkpoint), is_catchup_batch: false })
         } else {
@@ -886,22 +905,42 @@ async fn run_multichain(
             poll_interval_secs: 5,
             destination_chain_indices: chains.iter().map(|chain| u64::from(chain.chain_index)).collect(),
         };
-
         let mut round_withdrawals = Vec::new();
         let to_checkpoint = if state.pending_finalization_range.is_none() {
+            if stalled_rounds >= COORDINATOR_STALL_POLLS && last_round_submitted_l2_work {
+                tracing::warn!(
+                    head = latest,
+                    stalled_rounds,
+                    "coordinator head has not advanced while the previous round submitted L2 work; skipping L2 build/submit this round"
+                );
+                tokio::time::sleep(poll_interval).await;
+                continue;
+            }
             let (progress, plan) = match build_multichain_l2_plan(
                 &config, &provider, &chains, latest, from_checkpoint, window.to_checkpoint,
                 !window.is_catchup_batch, &propose_args,
             ).await {
                 Ok(value) => value,
-                Err(error) => { tracing::error!(%error, "build multichain L2 plan failed"); tokio::time::sleep(poll_interval).await; continue; }
+                Err(error) => {
+                    tracing::error!(%error, backoff_secs = l2_retry_backoff.as_secs(), "build multichain L2 plan failed");
+                    tokio::time::sleep(l2_retry_backoff).await;
+                    l2_retry_backoff = (l2_retry_backoff * 2).min(Duration::from_secs(RELAYER_MAX_RETRY_BACKOFF_SECS));
+                    continue;
+                }
             };
             round_withdrawals = plan.withdrawals.clone();
             let submitted_l2_work = !plan.calls.is_empty();
+            last_round_submitted_l2_work = submitted_l2_work;
             let landed = match submit_multichain_l2_plan(&config, &provider, &plan, lag).await {
                 Ok(value) => value,
-                Err(error) => { tracing::error!(%error, "multichain L2 multicall failed"); tokio::time::sleep(poll_interval).await; continue; }
+                Err(error) => {
+                    tracing::error!(%error, backoff_secs = l2_retry_backoff.as_secs(), "multichain L2 multicall failed");
+                    tokio::time::sleep(l2_retry_backoff).await;
+                    l2_retry_backoff = (l2_retry_backoff * 2).min(Duration::from_secs(RELAYER_MAX_RETRY_BACKOFF_SECS));
+                    continue;
+                }
             };
+            l2_retry_backoff = Duration::from_secs(RELAYER_MIN_RETRY_BACKOFF_SECS);
             if !window.has_confirmed_range() {
                 tracing::info!(submitted_l2_work, landed, "append-only multichain round retained until a confirmed proof window exists");
                 tokio::time::sleep(poll_interval).await;
@@ -2644,6 +2683,24 @@ where
             first_accepted_only
         );
     }
+
+    // Pin the accepted endcap's identity: a fresh proof built against a
+    // different start leaf yields a different end leaf while slot updates
+    // coincide. Returning it unchecked would wait forever on a leaf that can
+    // never land (livelock), so fail closed with full diagnostics instead.
+    if let Some(accepted_felts) = accepted.accepted_user_leaf_hash {
+        let fresh_felts: [u64; 4] = std::array::from_fn(|i| {
+            submission.end_user_leaf_hash.0.elements[i].to_canonical_u64()
+        });
+        ensure!(
+            accepted_felts == fresh_felts,
+            "duplicate endcap accepted leaf mismatch: accepted_user_leaf={:?} fresh_proof_leaf={:?} user_id={} unique_pending_id={} — this proof does not re-derive the accepted endcap",
+            accepted_felts,
+            fresh_felts,
+            duplicate.user_id,
+            duplicate.unique_pending_id
+        );
+    }
     Ok(submission.end_user_leaf_hash)
 }
 
@@ -2747,6 +2804,23 @@ async fn submit_l2_call_plan(
             "L2 batch call landed"
         );
 
+        // Coordinator stall guard: any landed batch guarantees the head
+        // advanced past `checkpoint_before`, so an unchanged head here means
+        // the coordinator is frozen — do not mint further EndCaps against it.
+        let head_now = provider
+            .get_coordinator_latest_block_state()
+            .await?
+            .checkpoint_id;
+        if head_now <= checkpoint_before {
+            tracing::warn!(
+                head_now,
+                checkpoint_before,
+                submitted,
+                batch_count,
+                "coordinator head stalled during L2 batch drain; skipping remaining batches"
+            );
+            break;
+        }
         if submitted < batch_count {
             let call = plan.batch_calls[submitted].clone();
             tracing::info!(
@@ -4365,7 +4439,11 @@ mod tests {
         ]
     }
 
-    fn accepted_slot_updates(user_id: u64, unique_pending_id: u64) -> RealmEndCapSlotUpdates {
+    fn accepted_slot_updates(
+        user_id: u64,
+        unique_pending_id: u64,
+        accepted_user_leaf_hash: Option<[u64; 4]>,
+    ) -> RealmEndCapSlotUpdates {
         RealmEndCapSlotUpdates {
             realm_id: 0,
             realm_sub_id: 0,
@@ -4389,7 +4467,12 @@ mod tests {
                     }],
                 },
             ],
+            accepted_user_leaf_hash,
         }
+    }
+
+    fn leaf_felts(leaf: &QHashOut<GoldilocksField>) -> [u64; 4] {
+        std::array::from_fn(|i| leaf.0.elements[i].to_canonical_u64())
     }
 
     fn duplicate_submission_error(
@@ -4423,7 +4506,11 @@ mod tests {
             duplicate_submission_error(first_submission, BRIDGE_USER_ID_U64, 675),
             BRIDGE_USER_ID_U64,
             |user_id, unique_pending_id| async move {
-                Ok(Some(accepted_slot_updates(user_id, unique_pending_id)))
+                Ok(Some(accepted_slot_updates(
+                    user_id,
+                    unique_pending_id,
+                    Some(leaf_felts(&accepted_leaf)),
+                )))
             },
         )
         .await
@@ -4434,11 +4521,16 @@ mod tests {
     #[tokio::test]
     async fn exact_duplicate_accepts_server_update_superset() {
         let leaf = test_leaf(150);
+        let pinned_leaf = leaf;
         let recovered = recover_duplicate_endcap_leaf_with(
             duplicate_submission_error(leaf, BRIDGE_USER_ID_U64, 675),
             BRIDGE_USER_ID_U64,
             |user_id, unique_pending_id| async move {
-                let mut accepted = accepted_slot_updates(user_id, unique_pending_id);
+                let mut accepted = accepted_slot_updates(
+                    user_id,
+                    unique_pending_id,
+                    Some(leaf_felts(&pinned_leaf)),
+                );
                 accepted.contracts[1].slot_updates.push(psy_provider::request::RealmSlotUpdate {
                     slot: 65801,
                     old_value: 30,
@@ -4459,7 +4551,11 @@ mod tests {
             duplicate_submission_error(accepted_leaf, BRIDGE_USER_ID_U64, 675),
             BRIDGE_USER_ID_U64,
             |user_id, unique_pending_id| async move {
-                Ok(Some(accepted_slot_updates(user_id, unique_pending_id)))
+                Ok(Some(accepted_slot_updates(
+                    user_id,
+                    unique_pending_id,
+                    Some(leaf_felts(&accepted_leaf)),
+                )))
             },
         )
         .await
@@ -4499,13 +4595,58 @@ mod tests {
 
         let wrong_identity = duplicate_submission_error(leaf, BRIDGE_USER_ID_U64, 675);
         let error = recover_duplicate_endcap_leaf_with(wrong_identity, BRIDGE_USER_ID_U64, |user_id, unique_pending_id| async move {
-            let mut accepted = accepted_slot_updates(user_id, unique_pending_id);
+            let mut accepted = accepted_slot_updates(user_id, unique_pending_id, Some(leaf_felts(&leaf)));
             accepted.contracts[1].slot_updates[0].new_value = 12;
             Ok(Some(accepted))
         })
         .await
         .unwrap_err();
         assert!(error.to_string().contains("contract update identity mismatch"));
+    }
+
+    #[tokio::test]
+    async fn accepted_leaf_identity_mismatch_fails_closed() {
+        // The fresh proof re-derives a different end leaf than the accepted
+        // endcap: slot updates coincide, so without the pinned leaf identity
+        // this recovered onto a leaf that could never land (livelock).
+        let fresh_leaf = test_leaf(400);
+        let accepted_leaf = test_leaf(401);
+        let error = recover_duplicate_endcap_leaf_with(
+            duplicate_submission_error(fresh_leaf, BRIDGE_USER_ID_U64, 675),
+            BRIDGE_USER_ID_U64,
+            |user_id, unique_pending_id| async move {
+                Ok(Some(accepted_slot_updates(
+                    user_id,
+                    unique_pending_id,
+                    Some(leaf_felts(&accepted_leaf)),
+                )))
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("duplicate endcap accepted leaf mismatch"));
+        assert!(error.to_string().contains("does not re-derive the accepted endcap"));
+    }
+
+    #[tokio::test]
+    async fn absent_accepted_leaf_falls_back_to_fresh_proof_leaf() {
+        // Rolling-restart compatibility: nodes that predate identity
+        // persistence keep the previous recovery behavior.
+        let fresh_leaf = test_leaf(500);
+        let recovered = recover_duplicate_endcap_leaf_with(
+            duplicate_submission_error(fresh_leaf, BRIDGE_USER_ID_U64, 675),
+            BRIDGE_USER_ID_U64,
+            |user_id, unique_pending_id| async move {
+                Ok(Some(accepted_slot_updates(
+                    user_id,
+                    unique_pending_id,
+                    None,
+                )))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered, fresh_leaf);
     }
 
     // ── claim-scheduling fix (commit 7522ca93): claim gating + finalize target ─

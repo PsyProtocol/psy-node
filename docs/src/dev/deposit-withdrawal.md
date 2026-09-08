@@ -32,7 +32,7 @@ The bridge connects an EVM L1 (e.g. Ethereum, Anvil) to the Psy L2. Two assets f
 |------|-----------|----------------|
 | Depositor | L1 wallet / CLI | Calls `Router.deposit()`, generates deposit inclusion proof |
 | Bridge Relayer | `psy_relayer_cli` daemon | Proves deposits on L2, appends to L1 `Bridge.batchAppend()`, finalizes, claims withdrawals on L1 |
-| Prove Proxy | `psy_prove_proxy` | Generates Groth16 proofs for withdrawal claims |
+| Prove Proxy | `psy_user_cli prove-proxy` | Generates Groth16 proofs for withdrawal claims |
 | Psy Services | `psy-services` | Indexes deposits/withdrawals, provides claim-proof API |
 | L2 User | CLI / Wallet | Claims deposits on L2, initiates withdrawals |
 

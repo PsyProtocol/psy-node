@@ -32,10 +32,9 @@ use psy_data::{
     },
     p2p::{
         aggregate_signatures, bitmap_get, bitmap_set, sha256, vote_message, BlsPublicKey,
-        BlsSecretKey, BlsSignature, Certificate, ProtocolError, ProtocolReader, ProtocolResult,
-        Proposal, Vote, MAX_BACKUP_BYTES, MAX_FINALIZER_OUTPUT_BYTES, MAX_FINALIZER_PROOF_BYTES,
-        MAX_INCLUSION_LAG_CHECKPOINTS, MAX_PROPOSAL_BODY_BYTES, MAX_VALIDATORS_PER_REALM,
-        MIN_VALIDATORS_PER_REALM, replication_threshold,
+        BlsSecretKey, BlsSignature, Certificate, ProtocolError, ProtocolResult, Proposal, Vote,
+        MAX_INCLUSION_LAG_CHECKPOINTS, MAX_VALIDATORS_PER_REALM, MIN_VALIDATORS_PER_REALM,
+        replication_threshold,
     },
     prepared_block::realm::PsyPreparedRealmBlockStateUpdates,
 };
@@ -72,28 +71,8 @@ pub fn decode_proposal_body(
     proposal: &Proposal,
     body: &[u8],
 ) -> ProtocolResult<DecodedProposalBody> {
-    if body.len() > MAX_PROPOSAL_BODY_BYTES {
-        return Err(ProtocolError::LengthLimit {
-            what: "proposal body",
-            got: body.len() as u64,
-            max: MAX_PROPOSAL_BODY_BYTES as u64,
-        });
-    }
-
-    let mut reader = ProtocolReader::new(body);
-    let output = reader.read_bytes_u32("finalizer output", MAX_FINALIZER_OUTPUT_BYTES as u32)?;
-    if output.len() != MAX_FINALIZER_OUTPUT_BYTES {
-        return Err(ProtocolError::InvalidLength {
-            what: "finalizer output",
-            got: output.len(),
-            expected: MAX_FINALIZER_OUTPUT_BYTES,
-        });
-    }
-    let proof = reader.read_bytes_u32("finalizer proof", MAX_FINALIZER_PROOF_BYTES as u32)?;
-    let state_updates = reader.read_bytes_u32("state updates", MAX_BACKUP_BYTES as u32)?;
-    let worker_tag = reader.read_fixed::<32>()?;
-    reader.finish()?;
-
+    let (output, proof, state_updates, worker_tag) =
+        psy_data::p2p::messages::decode_proposal_body(body)?;
     if sha256(body) != proposal.body_hash {
         return Err(ProtocolError::Message("body_hash mismatch"));
     }
@@ -426,7 +405,10 @@ pub fn votes_meet_wait(n: usize, proposer_sub_id: u16, signer_sub_ids: &[u16]) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use psy_data::p2p::{encode_proposal_body, proposal_from_parts};
+    use psy_data::p2p::{
+        encode_proposal_body, proposal_from_parts, validate_hash32_canonical,
+        GOLDILOCKS_MODULUS, MAX_FINALIZER_OUTPUT_BYTES,
+    };
 
     /// The localhost network magic, sourced from the network config via the
     /// psy_core build-time constants. A full u64 that does not fit in u32, so
@@ -549,6 +531,36 @@ mod tests {
         proposal.body_hash = [0xFF; 32];
         let err = decode_proposal_body(&proposal, &body).unwrap_err();
         assert_eq!(err, ProtocolError::Message("body_hash mismatch"));
+    }
+
+    #[test]
+    fn decode_proposal_body_rejects_noncanonical_worker_tag() {
+        let (output, proof, state_updates) = sample_body_sections();
+        // Largest allowed canonical limb is one below the Goldilocks modulus.
+        let mut max_limb_tag = [0u8; 32];
+        max_limb_tag[24..32].copy_from_slice(&(GOLDILOCKS_MODULUS - 1).to_le_bytes());
+        validate_hash32_canonical(&max_limb_tag).expect("modulus - 1 limb is canonical");
+        let (base_proposal, _) = proposal_with_body(
+            TEST_CHAIN_ID, 3, 99, 1, [0u8; 32], &output, &proof, &state_updates,
+        );
+        // Rebuild the same proposal over a body carrying the max-limb tag so
+        // the only failure mode is canonicality, not any hash check.
+        let canonical_body = encode_proposal_body(&output, &proof, &state_updates, &max_limb_tag)
+            .expect("encode body");
+        let mut canonical_proposal = base_proposal.clone();
+        canonical_proposal.body_hash = sha256(&canonical_body);
+        let decoded =
+            decode_proposal_body(&canonical_proposal, &canonical_body).expect("canonical tag");
+        assert_eq!(decoded.worker_tag, max_limb_tag);
+
+        let mut noncanonical_tag = max_limb_tag;
+        noncanonical_tag[24..32].copy_from_slice(&GOLDILOCKS_MODULUS.to_le_bytes());
+        let bad_body = encode_proposal_body(&output, &proof, &state_updates, &noncanonical_tag)
+            .expect("encode body");
+        let mut bad_proposal = base_proposal;
+        bad_proposal.body_hash = sha256(&bad_body);
+        let err = decode_proposal_body(&bad_proposal, &bad_body).unwrap_err();
+        assert!(matches!(err, ProtocolError::NonCanonicalField { .. }));
     }
 
     fn build_validators(sub_ids: &[u16]) -> (Vec<BlsSecretKey>, Vec<(u16, BlsPublicKey)>) {

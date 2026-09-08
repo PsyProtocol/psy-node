@@ -129,10 +129,6 @@ impl<
         self.temp_db.get_unique_pending_ids(&self.realm_identifier).await
     }
 
-    pub async fn get_current_gathering_unique_pending_id_internal(&self) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId)> {
-        self.temp_db.get_gathering_unique_pending_ids(&self.realm_identifier).await
-    }
-
 
     pub async fn has_job_id_already_been_submitted(&self, unique_pending_id: u64, job_id: N::JobId) -> anyhow::Result<bool> {
         Ok(self

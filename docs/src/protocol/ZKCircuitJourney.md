@@ -146,8 +146,8 @@ This document provides a detailed walkthrough of the Zero-Knowledge proof lifecy
 ### Step 4: Process End Cap Proof(s) (GUTA Entry - Realm)
 
 -   **Circuit(s):**
-    -   `GUTAVerifySingleEndCapCircuit` (Handles a single End Cap, e.g., an odd leaf in aggregation)
-    -   `GUTAVerifyTwoEndCapCircuit` (Handles pairs of End Cap proofs, typical base case)
+    -   `GUTAVerifySingleEndCapCircuitV2` (Handles a single End Cap, e.g., an odd leaf in aggregation)
+    -   `GUTAVerifyTwoEndCapCircuitV2` (Handles pairs of End Cap proofs, typical base case)
 -   **High-Level Purpose:** To securely ingest user End Cap proofs into the GUTA process, verify their validity against the protocol and historical state, and translate them into the standard `GlobalUserTreeAggregatorHeader` format needed for recursive aggregation.
 -   **Proves:**
     -   Input End Cap proof(s) (`proof_target`, `child_a/b_proof`) are valid ZK proofs.
@@ -158,8 +158,8 @@ This document provides a detailed walkthrough of the Zero-Knowledge proof lifecy
     -   Outputs a `GlobalUserTreeAggregatorHeader` representing the state transition for the node processed (either a single user leaf or the DVH parent) and the combined stats.
 -   **How:**
     -   `VerifyEndCapProofGadget`: Used internally (once or twice) to perform core End Cap proof verification, fingerprint check, public input matching, and historical checkpoint validation.
-    -   `DualVariableHeightStateTransitionGadget` (in `GUTAVerifyTwoEndCapCircuit`): Combines the two `GUSR` leaf transitions (derived from End Cap results) using a dual variable-height delta Merkle proof.
-    -   `GUTAStatsGadget.combine_with`: Sums stats (in `GUTAVerifyTwoEndCapCircuit`).
+    -   `DualVariableHeightStateTransitionGadget` (in `GUTAVerifyTwoEndCapCircuitV2`): Combines the two `GUSR` leaf transitions (derived from End Cap results) using a dual variable-height delta Merkle proof.
+    -   `GUTAStatsGadget.combine_with`: Sums stats (in `GUTAVerifyTwoEndCapCircuitV2`).
     -   Constructs the output `GlobalUserTreeAggregatorHeader`.
 -   **Assumes:**
     -   `[A4.1]` Witness data (End Cap proof(s), results, stats, historical proofs, DVH delta proof if applicable) is correct initially.
@@ -269,7 +269,7 @@ This document provides a detailed walkthrough of the Zero-Knowledge proof lifecy
 -   **Discharges:** Internal append/leaf consistency.
 -   **Remaining:** `[R7.2]` (Whitelist), `[R7.3]` (Input `GCON` root correctness).
 
-### Step 8: Aggregate Part 1 (Combine UserReg + Deploy + GUTA)
+### Step 8: Aggregate Part 1 (Combine UserReg + Deploy + Update + GUTA)
 
 -   **Circuit:** `VerifyAggUserRegistartionDeployContractsGUTACircuit`
 -   **Proves:** Input proofs (Agg UserReg, Agg Deploy, Agg GUTA) valid & used respective whitelisted circuits (`[R6.2]`, `[R7.2]`, `[R_GUTA.3]` discharged). All inputs based on same `CHKP` root (`[R_GUTA.1]` verified across inputs). Output header correctly combines state transitions.
@@ -293,7 +293,7 @@ This document provides a detailed walkthrough of the Zero-Knowledge proof lifecy
 
 ### Step 9: Final Block Transition
 
--   **Circuit:** `PsyCheckpointStateTransitionCircuit`
+-   **Circuit:** `QEDCheckpointStateTransitionCircuit`
 -   **High-Level Purpose:** To generate the definitive proof for the block, verifying all aggregated work and cryptographically linking the block to its predecessor, thereby discharging all temporary assumptions made during parallel processing.
 -   **Proves:**
     -   Part 1 Agg proof (Step 8) valid & used correct circuit.

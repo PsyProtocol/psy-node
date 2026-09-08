@@ -26,7 +26,8 @@ The executor maintains type-specific storage arrays:
 pub struct SimpleDPNExecutor<F: RichField> {
     pub targets: Vec<F>,           // Field elements
     pub target_arrays: Vec<Vec<F>>, 
-    pub hashes: Vec<[F; 4]>,       
+    pub hashes: Vec<[F; 4]>,
+    pub hash160s: Vec<[u32; 5]>,   // Keccak/hash160-style limbs
     pub bools: Vec<bool>,          
     pub bool_arrays: Vec<Vec<bool>>, 
     pub u32s: Vec<u32>,            
@@ -36,7 +37,8 @@ pub struct SimpleDPNExecutor<F: RichField> {
     pub contract_id: F,            
     pub caller_contract_id: F,     
     pub checkpoint_id: F,          
-    pub user_public_key: [F; 4],   
+    pub user_public_key: [F; 4],
+    pub session_proof_tree_root: [F; 4],
     pub nonce: F,                  
     pub inputs: Vec<F>,            
 }

@@ -13,7 +13,7 @@ T-REALM-FINALIZE-BLS removes circuit 63's wallet-signature verification and the 
 
 ## Motivation
 
-The planner currently requires a validator wallet private key and public-key parameter, proves a signature locally, and schedules WrappedSignatureProof before circuit 63. Existing processor BLS keys already sign the certificate's proposal commitment. Reusing that authorization removes the extra signature proof without replacing the proof's validator-tree or fee-recipient constraints.
+**(Pre-cutover narrative — not live.)** The planner previously required a validator wallet private key and public-key parameter, proves a signature locally, and schedules WrappedSignatureProof before circuit 63. Existing processor BLS keys already sign the certificate's proposal commitment. Reusing that authorization removes the extra signature proof without replacing the proof's validator-tree or fee-recipient constraints.
 
 Two verified gaps must not be obscured by this simplification: the existing public inputs commit only the final header and reward tag, not the full finalizer output; and `AlreadyClaimed` is pending-generation first-writer exclusion, not durable checkpoint anti-equivocation. Both receive explicit treatment below.
 

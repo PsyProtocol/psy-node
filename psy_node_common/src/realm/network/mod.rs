@@ -45,7 +45,8 @@ pub use startup::{build_optional_realm_network, parse_bootnode, OptionalRealmNet
 use libp2p::request_response;
 use libp2p::{identity, noise, tcp, yamux, Swarm, SwarmBuilder};
 use psy_data::p2p::{
-    DirectBodyResponse, EndCapForwardHeader, EndCapForwardResponse, NodeId, Proposal, Vote,
+    BlsPublicKey, DirectBodyResponse, EndCapForwardHeader, EndCapForwardResponse, NodeId,
+    Proposal, Vote,
 };
 use std::time::Duration;
 use thiserror::Error;
@@ -97,6 +98,7 @@ pub enum RealmNetworkCommand {
     PublishProposal {
         proposal: Proposal,
         body: Vec<u8>,
+        leaf_bls_keys: Vec<(u16, BlsPublicKey)>,
         response: oneshot::Sender<Result<(), NetworkError>>,
     },
     /// Publish a vote on the Realm vote gossipsub topic.
@@ -190,10 +192,12 @@ impl RealmNetworkCommands {
         &self,
         proposal: Proposal,
         body: Vec<u8>,
+        leaf_bls_keys: Vec<(u16, BlsPublicKey)>,
     ) -> Result<(), NetworkError> {
         self.request(|response| RealmNetworkCommand::PublishProposal {
             proposal,
             body,
+            leaf_bls_keys,
             response,
         })
         .await?
@@ -293,8 +297,11 @@ impl RealmNetworkHandle {
         &self,
         proposal: Proposal,
         body: Vec<u8>,
+        leaf_bls_keys: Vec<(u16, BlsPublicKey)>,
     ) -> Result<(), NetworkError> {
-        self.commands.publish_proposal(proposal, body).await
+        self.commands
+            .publish_proposal(proposal, body, leaf_bls_keys)
+            .await
     }
 
     pub async fn publish_vote(&self, vote: Vote) -> Result<(), NetworkError> {

@@ -13,7 +13,7 @@ use psy_node_core::{
     }, store::traits::proof_store::QParthProofStore
 };
 
-use crate::realm::processor::{core::{PsyRealmProcessor, runner::run_realm_processor}, db::PsyRealmDatabaseProcessor};
+use crate::realm::processor::{core::PsyRealmProcessor, db::PsyRealmDatabaseProcessor};
 
 pub async fn create_realm_processor<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
@@ -40,7 +40,6 @@ pub async fn create_realm_processor<
     realm_identifier: QRealmIdentifier,
     circuit_fingerprint_config: PsyNodeCircuitFingerprintConfig<N::QHash>,
     coordinator_client: Arc<CoordinatorClient>,
-    checkpoints_per_epoch: u64,
 ) -> anyhow::Result<(
     PsyRealmProcessor<
         N,
@@ -58,8 +57,6 @@ pub async fn create_realm_processor<
 where
     FileSystem::File: Send + Sync,
 {
-    let index = crate::coordinator::genesis_validators::index_from_genesis(genesis_data)?;
-    let validator = *crate::coordinator::genesis_validators::get_genesis_validator(&realm_identifier, &index)?;
     tracing::info!("[REALM_CREATE] setup_for_realm start");
     let genesis =
         GenesisDatabaseDataBuilder::<N::F, N::QHash>::setup_for_realm::<N::HasherBase, N>(
@@ -69,26 +66,6 @@ where
             realm_identifier.realm_sub_id as u64,
         )?;
     tracing::info!("[REALM_CREATE] setup_for_realm done");
-
-        /*
-        
-        
-        db: Arc<S>,
-        tag_tree_rewards_store: Arc<STagTreeRewards>,
-        temp_db: Arc<TempDatabase>,
-        proof_store: Arc<ProofStore>,
-        guta_update_queue: Arc<GUTAUpdateQueue>,
-        proof_work_queue: Arc<ProofWorkQueue>,
-        coordinator_client: Arc<CoordinatorClient>,
-        chain_id: u64,
-        realm_identifier: QRealmIdentifier,
-        circuit_fingerprint_config: PsyNodeCircuitFingerprintConfig<N::QHash>,
-        file_system: Arc<FileSystem>,
-        checkpoint_tree_root_backup_file_path: String,
-        genesis_realm_root: N::QHash,
-        genesis_checkpoint_root: N::QHash,
-        
-         */
     let db = PsyRealmDatabaseProcessor::<N, _, _, _, _, _, _, FileSystem, CoordinatorClient>::new_init(
         db,
         tag_tree_rewards_store,
@@ -107,47 +84,6 @@ where
     )
     .await?;
     tracing::info!("[REALM_CREATE] db new_init done");
-    /*
-    pub async fn new(
-        mut db: PsyCoordinatorDatabaseProcessor<
-            N,
-            S,
-            STagTreeRewards,
-            GUTAUpdateQueue,
-            RegisterUserQueue,
-            DeployContractQueue,
-            ProofWorkQueue,
-            TempDatabase,
-            ProofStore,
-            FileSystem,
-        >,
-        genesis_block_update: PsyPreparedCoordinatorBlockStateUpdates<N::F, N::QHash>,
-        file_system: Arc<FileSystem>,
-        deploy_contract_gatherer_backup_directory: String,
-        register_user_gatherer_backup_directory: String,
-        guta_gatherer_backup_directory: String,
-    ) -> anyhow::Result<(
-        Self,
-        tokio::task::JoinHandle<Result<(), anyhow::Error>>,
-        tokio::task::JoinHandle<Result<(), anyhow::Error>>,
-        tokio::task::JoinHandle<Result<(), anyhow::Error>>,
-    )> {
-
-        mut db: PsyRealmDatabaseProcessor<
-            N,
-            S,
-            STagTreeRewards,
-            GUTAUpdateQueue,
-            ProofWorkQueue,
-            TempDatabase,
-            ProofStore,
-            FileSystem,
-            CoordinatorClient,
-        >,
-        genesis_block_update: PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate<N::F, N::QHash>,
-        file_system: Arc<FileSystem>,
-        guta_gatherer_backup_directory: String,
-     */
     let processor_result: (
         PsyRealmProcessor<
             N,
@@ -166,69 +102,9 @@ where
         genesis,
         file_system,
         guta_gatherer_backup_directory,
-        validator,
-        checkpoints_per_epoch,
     )
     .await?;
     tracing::info!("[REALM_CREATE] processor new done");
 
     Ok(processor_result)
-}
-
-
-
-pub async fn create_realm_processor_and_run<
-    N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
-    S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync + 'static,
-    STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync + 'static,
-    GUTAUpdateQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
-    ProofWorkQueue: QStandardWorkerQueuePublisher + QStandardWorkerQueueSubscriber + Send + Sync + 'static,
-    TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + Send + Sync + 'static,
-    ProofStore: QParthProofStore + Send + Sync + 'static,
-    FileSystem: TokioLikeFileSystem + Send + Sync + 'static,
-    CoordinatorClient: RealmCoordinatorClient<N::F, N::QHash> + Send + Sync + 'static,
->(
-    chain_id: u64,
-    genesis_data: &PsyGenesisBlockSetupData<N::F, N::QHash>,
-    file_system: Arc<FileSystem>,
-    guta_gatherer_backup_directory: String,
-    checkpoint_tree_root_backup_file_path: String,
-    db: Arc<S>,
-    tag_tree_rewards_store: Arc<STagTreeRewards>,
-    temp_db: Arc<TempDatabase>,
-    proof_store: Arc<ProofStore>,
-    guta_update_queue: Arc<GUTAUpdateQueue>,
-    proof_work_queue: Arc<ProofWorkQueue>,
-    realm_identifier: QRealmIdentifier,
-    circuit_fingerprint_config: PsyNodeCircuitFingerprintConfig<N::QHash>,
-    coordinator_client: Arc<CoordinatorClient>,
-    checkpoints_per_epoch: u64,
-) -> anyhow::Result<()>
-where
-    FileSystem::File: Send + Sync,
-{
-    tracing::info!("[REALM_CREATE] create_and_run start");
-    let (processor, guta_gatherer_join_handle) = create_realm_processor::<N, S, STagTreeRewards, GUTAUpdateQueue, ProofWorkQueue, TempDatabase, ProofStore, FileSystem, CoordinatorClient>(
-        chain_id,
-        genesis_data,
-        file_system,
-        guta_gatherer_backup_directory,
-        checkpoint_tree_root_backup_file_path,
-        db,
-        tag_tree_rewards_store,
-        temp_db,
-        proof_store,
-        guta_update_queue,
-        proof_work_queue,
-        realm_identifier,
-        circuit_fingerprint_config,
-        coordinator_client,
-        checkpoints_per_epoch,
-    )
-    .await?;
-
-    tracing::info!("Starting realm processor...");
-    run_realm_processor(processor, guta_gatherer_join_handle).await?;
-
-    Ok(())
 }

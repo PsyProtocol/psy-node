@@ -48,8 +48,9 @@ pub const DIRECT_BODY_REQUEST_WIRE_BYTES: usize = 44;
 /// + end_cap_input_len(4) + proof_len(4)`.
 pub const END_CAP_FORWARD_HEADER_WIRE_BYTES: usize = 60;
 
-/// Exact one-byte EndCapForwardResponse status length.
-pub const END_CAP_FORWARD_RESPONSE_WIRE_BYTES: usize = 1;
+/// Exact 18-byte EndCap forward response length:
+/// `accepted:bool + reject_reason:u8 + user_id:u64 + unique_pending_id:u64`.
+pub const END_CAP_FORWARD_RESPONSE_WIRE_BYTES: usize = 18;
 
 /// NodeId raw multihash value length (Ed25519 identity multihash).
 pub const NODE_ID_RAW_LEN: usize = 38;

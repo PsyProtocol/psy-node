@@ -110,10 +110,9 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_processor_node(co
     let resolver = PsyJTMBPoseidonGoldilocksNodeConfigResolver {};
     let circuit_fingerprint_config = resolver.get_circuit_fingerprint_config_for_network(config.network)?;
     let genesis_data = resolver.get_genesis_block_setup_data_for_network(config.network, config.genesis_data_path.clone())?;
-    let (realm_sub_id, validator_user_id, bls_public_keys) =
-        crate::node::realm_p2p::processor_validator_data(config, &genesis_data)?;
+    let realm_sub_id =
+        crate::node::realm_p2p::validate_processor_identity(config, &genesis_data)?;
     let config = &config.clone().with_derived_realm_sub_id(realm_sub_id);
-    let rotation = psy_data::config::network_config::load_realm_rotation_config(config.network)?;
 
     let pool = new_redis_async_pool(&config.redis_url, 2).await?;
 
@@ -157,6 +156,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_processor_node(co
             tracing::info!("[REALM_BOOT] scylla store ready");
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
+            let validator_store = db.clone();
             let coordinator_client = PsyRealmCoordinatorClientAPI::<N, _>::new(
                 http_client,
             );
@@ -176,22 +176,22 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_processor_node(co
                 realm_identifier,
                 circuit_fingerprint_config,
                 Arc::new(coordinator_client),
-                rotation.checkpoints_per_epoch,
             )
             .await?;
-            let built = crate::node::realm_p2p::maybe_build_processor_network(config, chain_id)?;
+            let built = crate::node::realm_p2p::build_processor_network(config, chain_id)?;
             let bls_secret = load_bls_secret_key(config.p2p_bls_key_path.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("processor P2P requires --p2p-bls-key")
             })?)?;
             let commands = built.handle.commands();
             let rotation = built.rotation.clone();
-            processor.set_realm_p2p(commands, rotation, bls_secret, validator_user_id, bls_public_keys);
+            processor.set_realm_p2p(commands, rotation, bls_secret);
                 let (state_updates_tx, state_updates_rx) = tokio::sync::mpsc::channel(4);
                 processor.verified_state_updates = Some(state_updates_rx);
-                crate::node::realm_p2p::spawn_processor_realm_network::<N>(
+                crate::node::realm_p2p::spawn_processor_realm_network::<N, _>(
                     built,
                     config,
                     realm_sub_id,
+                    validator_store,
                     PsyJTMBZKVerifier::new(verifier),
                     state_updates_tx,
                 );

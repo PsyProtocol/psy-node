@@ -928,18 +928,20 @@ impl RpcProvider {
     pub fn get_realm_url(&self, user_id: u64) -> anyhow::Result<&String> {
         let realm_id = self.get_realm_id(user_id);
         tracing::trace!("get realm url for user id {}, realm id {}", user_id, realm_id);
+        let realm_urls = self.get_realm_urls(realm_id)?;
 
-        self.get_realm_url_by_realm_id(realm_id)
+        Ok(&realm_urls[(user_id % realm_urls.len() as u64) as usize])
     }
 
     pub fn get_realm_url_by_realm_id(&self, realm_id: u64) -> anyhow::Result<&String> {
-        let realm_urls = self
-            .realm_configs
-            .get(&realm_id)
-            .ok_or(anyhow::format_err!("realm id `{}` not found, please check the config", realm_id))?;
-        let random_index = rand::thread_rng().gen_range(0..realm_urls.len());
+        Ok(&self.get_realm_urls(realm_id)?[0])
+    }
 
-        Ok(&realm_urls[random_index])
+    fn get_realm_urls(&self, realm_id: u64) -> anyhow::Result<&Vec<String>> {
+        self.realm_configs
+            .get(&realm_id)
+            .filter(|realm_urls| !realm_urls.is_empty())
+            .ok_or_else(|| anyhow::format_err!("realm id `{}` has no RPC URLs, please check the config", realm_id))
     }
 
     pub fn get_realm_url_by_edge_id(&self, user_id: u64, edge_id: u64) -> anyhow::Result<&String> {
@@ -966,17 +968,49 @@ impl RpcProvider {
         Ok(url)
     }
 
+    /// Slot updates for an accepted endcap live only in the scheduled
+    /// proposer's temp_db, so a single randomly chosen edge usually answers
+    /// None. Fan out across every configured edge of the user's realm and
+    /// return the first `Some`; `None` wins only if at least one edge
+    /// answered, otherwise the last RPC error propagates.
     pub async fn get_realm_user_end_cap_slot_updates(&self, user_id: u64, unique_pending_id: u64) -> anyhow::Result<Option<RealmEndCapSlotUpdates>> {
-        let rpc_url = self.get_realm_url(user_id)?;
-        let response = psy_rpc_call_back!(
-            self,
-            rpc_url,
-            RequestParams::<F>::GetUserEndCapSlotUpdates(QGetUserEndCapSlotUpdatesRPCRequest { unique_pending_id, user_id }),
-            Option<RealmEndCapSlotUpdates>
-        );
-        match response.result {
-            ResponseResult::Success(updates) => Ok(updates),
-            ResponseResult::Error(error) => Err(anyhow::format_err!("rpc call failed `{:?}`", error)),
+        let realm_id = self.get_realm_id(user_id);
+        let realm_urls = self
+            .realm_configs
+            .get(&realm_id)
+            .ok_or(anyhow::format_err!("realm id `{}` not found, please check the config", realm_id))?;
+        if realm_urls.is_empty() {
+            anyhow::bail!("realm id `{}` has no configured edges", realm_id);
+        }
+        let mut saw_success = false;
+        let mut last_error: Option<anyhow::Error> = None;
+        for rpc_url in realm_urls {
+            let response = psy_rpc_call_back!(
+                self,
+                rpc_url,
+                RequestParams::<F>::GetUserEndCapSlotUpdates(QGetUserEndCapSlotUpdatesRPCRequest { unique_pending_id, user_id }),
+                Option<RealmEndCapSlotUpdates>
+            );
+            match response.result {
+                ResponseResult::Success(Some(updates)) => return Ok(Some(updates)),
+                ResponseResult::Success(None) => saw_success = true,
+                ResponseResult::Error(error) => {
+                    tracing::warn!(
+                        realm_id,
+                        user_id,
+                        unique_pending_id,
+                        rpc_url = %rpc_url,
+                        error = ?error,
+                        "end-cap slot updates edge query failed"
+                    );
+                    last_error = Some(anyhow::format_err!("rpc call failed `{:?}`", error));
+                }
+            }
+        }
+        if saw_success {
+            Ok(None)
+        } else {
+            Err(last_error.unwrap_or_else(|| anyhow::format_err!("realm id `{}` has no configured edges", realm_id)))
         }
     }
 
@@ -2205,5 +2239,23 @@ mod tests {
         let found = find_endcap_inclusion_in_range(701, 700, |_| async move { Ok(true) }).await.unwrap();
 
         assert_eq!(found, None);
+    }
+
+    #[test]
+    fn realm_requests_for_one_user_keep_one_edge() {
+        let realm_urls = vec!["http://edge-0".to_string(), "http://edge-1".to_string()];
+        let provider = RpcProvider {
+            client: Arc::new(Client::new()),
+            realm_configs: HashMap::from([(1, realm_urls.clone())]),
+            coordinator_configs: HashMap::from([(0, vec!["http://coordinator".to_string()])]),
+            users_per_realm: 1_048_576,
+            current_user_id: 0,
+        };
+        let user_id = 1_966_080;
+        let expected = &realm_urls[(user_id % realm_urls.len() as u64) as usize];
+
+        for _ in 0..128 {
+            assert_eq!(provider.get_realm_url(user_id).unwrap(), expected);
+        }
     }
 }

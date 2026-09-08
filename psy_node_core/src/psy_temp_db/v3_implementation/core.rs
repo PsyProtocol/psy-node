@@ -5,6 +5,7 @@ use parth_core::{
 use psy_data::{node::node_proving_state::PsyNodeProvingState, worker::metadata::PsyProvingJobMetadata};
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
+use crate::psy_temp_db::GatheringGeneration;
 const DEPLOY_CONTRACT_ZSTD_PREFIX: &[u8; 4] = b"PSZ1";
 
 use crate::{
@@ -234,34 +235,6 @@ where
 
 #[async_trait]
 impl<T: QTempDatabaseRawKVReaderBase + Sync> QTempDBPendingIdReader for T {
-    async fn get_unique_pending_id(&self, rid: &QRealmIdentifier) -> anyhow::Result<u64> {
-        let key = tt_get_unique_pending_id_key(rid.realm_id, rid.realm_sub_id);
-        let value_bytes = self.qtdb_raw_kv_get_value(&key).await?;
-        if value_bytes.is_some() {
-            let value_bytes = value_bytes.unwrap();
-            if value_bytes.len() != 24 {
-                return Err(anyhow::anyhow!("Invalid value length for unique pending id"));
-            }
-            let unique_pending_id = u64::from_le_bytes(value_bytes[0..8].try_into().unwrap());
-            Ok(unique_pending_id)
-        } else {
-            anyhow::bail!("Unique pending id not found");
-        }
-    }
-    async fn get_proc_checkpoint_unique_id(&self, rid: &QRealmIdentifier) -> anyhow::Result<QCoreProcCheckpointUniqueId> {
-        let key = tt_get_unique_pending_id_key(rid.realm_id, rid.realm_sub_id);
-        let value_bytes = self.qtdb_raw_kv_get_value(&key).await?;
-        if value_bytes.is_some() {
-            let value_bytes = value_bytes.unwrap();
-            if value_bytes.len() != 24 {
-                return Err(anyhow::anyhow!("Invalid value length for proc checkpoint unique id"));
-            }
-            let proc_checkpoint_unique_id = QCoreProcCheckpointUniqueId::from_le_bytes(value_bytes[8..24].try_into().unwrap());
-            Ok(proc_checkpoint_unique_id)
-        } else {
-            anyhow::bail!("Proc checkpoint unique id not found");
-        }
-    }
     async fn get_unique_pending_ids(&self, rid: &QRealmIdentifier) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId)> {
         let key = tt_get_unique_pending_id_key(rid.realm_id, rid.realm_sub_id);
         let value_bytes = self.qtdb_raw_kv_get_value(&key).await?;
@@ -277,20 +250,16 @@ impl<T: QTempDatabaseRawKVReaderBase + Sync> QTempDBPendingIdReader for T {
             anyhow::bail!("Unique pending ids not found");
         }
     }
-    async fn get_gathering_unique_pending_ids(&self, rid: &QRealmIdentifier) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId)> {
+    async fn get_gathering_generation(&self, rid: &QRealmIdentifier) -> anyhow::Result<GatheringGeneration> {
         let key = tt_get_gathering_unique_pending_id_key(rid.realm_id, rid.realm_sub_id);
-        let value_bytes = self.qtdb_raw_kv_get_value(&key).await?;
-        if value_bytes.is_some() {
-            let value_bytes = value_bytes.unwrap();
-            if value_bytes.len() != 24 {
-                return Err(anyhow::anyhow!("Invalid value length for unique pending ids"));
-            }
-            let unique_pending_id = u64::from_le_bytes(value_bytes[0..8].try_into().unwrap());
-            let proc_checkpoint_unique_id = QCoreProcCheckpointUniqueId::from_le_bytes(value_bytes[8..24].try_into().unwrap());
-            Ok((unique_pending_id, proc_checkpoint_unique_id))
-        } else {
-            anyhow::bail!("Unique pending ids not found");
-        }
+        let value_bytes = self.qtdb_raw_kv_get_value(&key).await?
+            .ok_or_else(|| anyhow::anyhow!("Gathering generation not found"))?;
+        anyhow::ensure!(value_bytes.len() == 32, "Invalid value length for gathering generation");
+        Ok(GatheringGeneration {
+            unique_pending_id: u64::from_le_bytes(value_bytes[0..8].try_into().unwrap()),
+            proc_checkpoint_unique_id: QCoreProcCheckpointUniqueId::from_le_bytes(value_bytes[8..24].try_into().unwrap()),
+            checkpoint_id: u64::from_le_bytes(value_bytes[24..32].try_into().unwrap()),
+        })
     }
 }
 
@@ -308,11 +277,12 @@ impl<T: QTempDatabaseRawKVWriterBase + Sync> QTempDBPendingIdWriter for T {
         data[8..24].copy_from_slice(&proc_checkpoint_unique_id.to_le_bytes());
         self.qtdb_raw_kv_put_value(&key, &data).await
     }
-    async fn set_gathering_unique_pending_ids(&self, rid: &QRealmIdentifier, unique_pending_id: u64, proc_checkpoint_unique_id: QCoreProcCheckpointUniqueId) -> anyhow::Result<()> {
+    async fn set_gathering_generation(&self, rid: &QRealmIdentifier, generation: GatheringGeneration) -> anyhow::Result<()> {
         let key = tt_get_gathering_unique_pending_id_key(rid.realm_id, rid.realm_sub_id);
-        let mut data = [0u8; 24];
-        data[0..8].copy_from_slice(&unique_pending_id.to_le_bytes());
-        data[8..24].copy_from_slice(&proc_checkpoint_unique_id.to_le_bytes());
+        let mut data = [0u8; 32];
+        data[0..8].copy_from_slice(&generation.unique_pending_id.to_le_bytes());
+        data[8..24].copy_from_slice(&generation.proc_checkpoint_unique_id.to_le_bytes());
+        data[24..32].copy_from_slice(&generation.checkpoint_id.to_le_bytes());
         self.qtdb_raw_kv_put_value(&key, &data).await
     }
 }

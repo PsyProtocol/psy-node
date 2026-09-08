@@ -23,7 +23,7 @@ This is a formal English rewrite of the gatherer deep dive in the external memor
 
 ## Background
 
-Four gatherers exist. Three run on the coordinator; one runs on each realm. All share `EphemeralQueueGathererWithTree` (`psy_node_common/src/queue/gatherer.rs`) and the same `ProcessorStatus` as their processor.
+Five gatherer roles exist. **Four** run on the coordinator (register user, deploy contract, **update contract**, GUTA); one EndCap gatherer runs on each realm. All share `EphemeralQueueGathererWithTree` (`psy_node_common/src/queue/gatherer.rs`) and the same `ProcessorStatus` as their processor.
 
 ## Table of Contents
 
@@ -88,15 +88,15 @@ Input is `PsyRealmUserUpdateQueueItem`: job id, expected checkpoint, old/new use
 
 ### 3.1 N / N+1 finalize seam
 
-Official block N is the processor's job. The gatherer may already hold EndCaps whose cycle start is the live end root of N (the start of N+1). `finalize_cycle` (`realm_end_cap_gatherer.rs:1187`) must not pretend those items are an official identity for N.
+Official block N is the processor's job. The gatherer may already hold EndCaps whose cycle start is the live end root of N (the start of N+1). Finalize must not treat an unauthenticated cycle as official identity for N.
 
-Current contract (`realm_end_cap_gatherer.rs:1233-1244`):
+Current contract (`realm_end_cap_gatherer.rs`):
 
-1. Official and trailing-empty success paths do not call `publish_gathering_snapshot_if_current`. The shared `gathering_realm_start_root` stays the checkpoint-authenticated start (R0), not the live end (R1).
-2. If `authenticated.gathering_realm_start_root != self.start_global_user_tree_root`, return `Ok` empty with no `finalizer_identity` and leave the builder alive. The gatherer keeps receiving EndCaps for N+1.
-3. Official identity runs only when the gathering snapshot start equals this cycle start.
+1. If `authenticated.gathering_realm_start_root != self.start_global_user_tree_root`, **fail closed** with `bail!` (do **not** return empty `Ok`); owned accepted/deferred inputs stay with the halted owner (`:1032-1042`).
+2. On official success with tree changes, after `commit_changes` the gatherer **does** call `publish_gathering_snapshot_if_current` with the committed live root (`:1128-1130`) so recreate bootstrap accepts the finalize-committed root.
+3. Revert publishes the reverted root via the same helper (`:1023`) because that path restores the committed start, not a speculative live end.
 
-Revert still publishes the reverted root (`realm_end_cap_gatherer.rs:1227`) because that path restores the committed start, not a speculative live end.
+Official identity runs only when the gathering snapshot start equals this cycle start.
 
 ## 4. Coordinator gatherers
 
@@ -104,9 +104,11 @@ Revert still publishes the reverted root (`realm_end_cap_gatherer.rs:1227`) beca
 
 **Deploy contract.** Build the function tree from the whitelist, set the next `global_contract_tree` leaf, append leaf / function / code-definition bytes, increment `next_contract_id`.
 
+**Update contract.** Apply layout-aware contract updates into `global_contract_tree` (see `update_contract_gatherer.rs`); finalize emits update ST jobs that Part-1 chains after deploy.
+
 **GUTA update.** Deserialize `GlobalUserTreeAggregatorHeaderWithTagValueAndJobID`, feed `CoordinatorGUTAPlanner`, update the global user tree at the realm position, and store the incoming tag-tree value in temp DB. Finalize emits FFS user-tree nodes, reward-tree node keys, and the multi-level GUTA job tree.
 
-Coordinator trees are owned by these three gatherers after startup hydrates them from durable storage. The processor reads finalized snapshots only.
+Coordinator trees are owned by these **four** gatherers after startup hydrates them from durable storage. The processor reads finalized snapshots only.
 
 ## 5. Unique-id rotation
 

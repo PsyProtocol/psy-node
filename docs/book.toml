@@ -12,7 +12,8 @@ command = "mdbook-mermaid"
 [output]
 
 [output.html]
-additional-js = ["mermaid.min.js", "mermaid-init.js"]
+additional-css = ["src/custom.css"]
+additional-js = ["mermaid.min.js", "mermaid-init.js", "src/sidebar-fold.js"]
 
 
 # [preprocessor.katex]
@@ -31,4 +32,3 @@ footer-template = "<p style='font-size:10px; margin-left: 48%'><span class='page
 [output.pdf-outline]
 like-wkhtmltopdf = false
 optional = true
-

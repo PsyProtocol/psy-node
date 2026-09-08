@@ -75,7 +75,7 @@ This document describes the gadgets used by Coordinator circuits to batch regist
 ## 4. `VerifyAggUserRegistartionDeployContractsGUTAGadget`
 
 -   **File:** `psy_plonky2_circuits/src/coordinator/gadgets/verify_agg_user_registration_deploy_guta.rs:172-261` (core included in ~309)
--   **Purpose:** The core gadget within the Part 1 Aggregation circuit. Verifies the aggregated proofs for User Registrations, Contract Deployments, and GUTA, ensuring they are valid, used whitelisted circuits, and reference the same checkpoint state.
+-   **Purpose:** The core gadget within the Part 1 Aggregation circuit. Verifies **four** child proofs — User Registrations, Contract Deployments, **Contract Updates**, and GUTA — ensuring they are valid, used whitelisted circuits, and reference the same checkpoint state (deploy.end == update.start on GCON).
 -   **Key Inputs/Witness:**
     -   Parameters and configuration for verifying each of the three input proofs (common data, whitelist/fingerprint configs, GUTA params).
     -   Proof objects and verifier data for each of the three input proofs.
@@ -90,7 +90,7 @@ This document describes the gadgets used by Coordinator circuits to batch regist
     -   Connects the `checkpoint_tree_root` from the GUTA header to ensure consistency (implicitly assumes UserReg/Deploy proofs are for the same checkpoint, which should be enforced by job planning). *Correction: This gadget doesn't directly connect checkpoint roots; that consistency is usually handled by the job system ensuring proofs for the same checkpoint are aggregated.*
     -   Constructs the output `header` from the verified transition gadgets.
 -   **Assumptions:** Assumes witness proofs, headers, and verifier data are valid initially. Assumes input configuration (common data, fingerprint configs, whitelist root) is correct.
--   **Role:** Securely combines the results of the three major parallel state update processes (User Reg, Deploy Contract, GUTA) into a single verifiable unit, discharging assumptions about their individual validity and circuit usage.
+-   **Role:** Securely combines the results of the four major parallel state update processes (User Reg, Deploy, Update, GUTA) into a single verifiable unit.
 
 ## 5. `PsyPart1StateDeltaResultGadget`
 

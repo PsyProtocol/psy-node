@@ -144,11 +144,12 @@ The network takes potentially millions of End Cap proofs and efficiently aggrega
     *   **Role:** Distributed ingestion and initial aggregation points for user state changes (`GUSR`), sharded by user ID ranges.
     *   **Function:**
         1.  Receive End Cap proofs from users within their range.
-        2.  Verify these proofs using circuits like `GUTAVerifySingleEndCapCircuit` (for individual proofs) or `GUTAVerifyTwoEndCapCircuit` (for pairs). These circuits use the `VerifyEndCapProofGadget` internally to check the End Cap proof validity, fingerprint, and historical checkpoint link, outputting a standardized `GlobalUserTreeAggregatorHeader`.
+        2.  Verify these proofs using circuits like `GUTAVerifySingleEndCapCircuitV2` (for individual proofs) or `GUTAVerifyTwoEndCapCircuitV2` (for pairs). These circuits use the `VerifyEndCapProofGadget` internally to check the End Cap proof validity, fingerprint, and historical checkpoint link, outputting a standardized `GlobalUserTreeAggregatorHeader`.
 > **Currency note (2026-09-08):** Prefer live circuit names in [ProvingJobs.md](./ProvingJobs.md) / [GUTAV2Circuits.md](./GUTAV2Circuits.md). Aggregation merge gadget is `DualVariableHeightStateTransitionGadget` (not `TwoNCAStateTransitionGadget`).
         4.  If necessary, use `GUTAVerifyGUTAToCapCircuit` (which uses `VerifyGUTAProofToLineGadget`) to bring a proof up to the Realm's root level.
         5.  Handle periods of inactivity using `GUTANoChangeCircuit`.
-        6.  Submit the final aggregated GUTA proof for their user segment (representing the net change at the Realm's root node in `GUSR`) to the Coordinator layer.
+        6.  Prove `RealmFinalizeGUTA` (type 63): validator-tree / fee math / root GUTA binding (no child type 64).
+        7.  Form P2P Proposal + Certificate; submit to Coordinator `psy_submit_guta` with the finalized realm root proof.
     *   **Scalability Impact:** Distributes the initial proof verification and `GUSR` aggregation load.
 
 *   **Coordinators:**
@@ -170,26 +171,23 @@ The network takes potentially millions of End Cap proofs and efficiently aggrega
 ### 3.4 Final Block Proof Generation
 
 *   **Role:** Creates the single, consolidated ZK proof for the entire block.
-*   **Circuit:** `PsyCheckpointStateTransitionCircuit`.
+*   **Circuit:** `QEDCheckpointStateTransitionCircuit` (type 32).
 *   **Function:** Takes the final aggregated state transition proofs from the Coordinator layer (representing net changes to `GUSR`, `GCON`, `URT`, etc.). Verifies these proofs. Computes the new global state roots and combines them with aggregated block statistics (`PsyCheckpointLeafStats`) to form the new `PsyCheckpointLeaf`. Proves the correct update of the `CHKP` tree by appending this new leaf hash. **Critically, it verifies that the entire process correctly transitioned from the state defined by the *previous block's finalized `CHKP` root* (provided as a public input).**
 *   **Output:** A highly succinct ZK proof whose public inputs are the previous `CHKP` root and the new `CHKP` root.
 
-## 4. Node State Architecture: Redis and KVQ Backend
+## 4. Node State Architecture: Scylla primary (local currency)
 
 Supporting this massive parallelism requires a high-performance, shared backend infrastructure.
 
-*   **Core Technology:** Psy leverages **Redis**, a distributed in-memory key-value store known for its speed and scalability, as the primary backend. Redis Clusters allow horizontal scaling of storage and throughput.
-*   **Abstraction Layer (KVQ):** A custom Rust library providing traits and adapters (`KVQSerializable`, `KVQStandardAdapter`, model types like `KVQFixedConfigMerkleTreeModel`) for structured, type-safe interaction with Redis. It simplifies key generation, serialization, and potentially caching.
+*   **Core Technology (live local/devnet):** Durable node state and proof/job persistence use **ScyllaDB** startup paths (`startup_*_scylla`). Prefer `docs/src/node/architecture.md` for current ownership diagrams.
+*   **Supporting services:** **Redis** and **NATS** remain in the stack for queues, caches, and messaging — they are **not** the sole primary Merkle/proof store in current Scylla startups.
+*   **Abstraction Layer (KVQ / store traits):** Type-safe keying and Merkle models (`KVQSerializable`, store traits) still describe logical layout; concrete backends follow the active network configuration.
 *   **Logical Components:**
-    *   **Proof Store (`ProofStoreFred`, implements `QProofStore...` traits):** Stores ZK proofs and input witnesses, keyed by `QProvingJobDataID`. Uses Redis Hashes (`HSET`, `HGET`) and potentially atomic counters (`HINCRBY`) for managing job dependencies.
-    *   **State Store (Models implementing `PsyCoordinatorStore...`, `PsyRealmStore...` traits):** Stores the blockchain state used by the node, primarily Merkle tree nodes (`KVQMerkleNodeKey`) and leaf data (`UserLeaf`, `ContractLeaf`, etc.). Uses standard Redis keys managed by KVQ models.
-    *   **Queues (`CheckpointDrainQueue`, `CheckpointHistoryQueue`, `WorkerEventQueue` traits):** Implement messaging between components. Uses Redis Lists (`LPUSH`, `LPOP`/`BLPOP`, `LRANGE`) for job queues and potentially Pub/Sub or simple keys/sorted sets for history tracking and notifications. `ProofStoreFred` often implements these queue interaction traits.
-    *   **Local Caching (`PsyCmdStoreWithCache`, used within `PsyLocalProvingSessionStore`):** Provides an in-memory cache layer for frequently accessed state data (e.g., contract definitions, user leaves from the previous block) during local UPS execution or within Realm/Coordinator nodes, reducing load on the central Redis cluster.
-*   **Scalability:**
-    *   **Redis Performance:** Provides low-latency access required for coordinating many workers.
-    *   **Horizontal Scaling:** Redis clusters can scale to handle increased load.
-    *   **Concurrency:** Redis handles concurrent connections from numerous DPN nodes.
-    *   **Decoupling:** Proving computation (Workers) is separated from state storage and coordination (Redis + Control Nodes), allowing independent scaling.
+    *   **Proof / job store:** Proofs and witnesses keyed by `QProvingJobDataID` (Scylla-backed in current startups; older `ProofStoreFred`/Redis narratives are historical).
+    *   **State store:** Coordinator/realm Merkle nodes and leaves via `PsyCoordinatorStore…` / `PsyRealmStore…` traits.
+    *   **Queues:** Ephemeral gatherer queues (NATS) plus processor drain/history queues.
+    *   **Local caching:** In-process caches during UPS / realm / coordinator cycles reduce round-trips to durable storage.
+*   **Scalability:** Workers stay compute-scaled and mostly stateless; control nodes + Scylla/NATS/Redis scale independently.
 
 ```mermaid
 graph TB

@@ -29,4 +29,4 @@ This protocol index links reusable circuit components to their specialized gadge
 - [ZK circuit journey](ZKCircuitJourney.md): proofs and assumptions at each stage.
 - [Full-flow reading guide](FullFlow.md): architecture and end-to-end navigation.
 
-Constraint pseudocode and core LOC: `AUDIT_SCOPE.md` §1.7.
+Constraint pseudocode and core LOC: `docs/src/audit/scope.md` §1.7.

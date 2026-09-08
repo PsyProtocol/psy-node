@@ -1,7 +1,7 @@
 use std::{
     io::{Cursor, Read},
     path::PathBuf,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
 };
 
 use anyhow::Context as _;
@@ -10,7 +10,7 @@ use parth_common::memory_stores::{
     dash_tree_append_only::PsyDashMemoryAppendOnlyMerkleStore, mem_tree_recorder::SimpleMemoryMerkleRecorderStore, traits::PsyMemoryMerkleStoreImm,
 };
 use parth_core::{
-    crypto::hash::{merkle_proof::MerkleProofCore, traits::{FieldQHasher, QFieldHashable, MerkleZeroHasher, ZeroableHash}},
+    crypto::hash::{merkle_proof::MerkleProofCore, traits::{FieldQHasher, HashTo4Felts, QFieldHashable, MerkleZeroHasher, ZeroableHash}},
     data::hash::{
         fast_node_serializer::{QMerkleStoreFastZeroNodeSerializer, QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE},
         merkle_node_key::SimpleMerkleNodeKey,
@@ -36,6 +36,7 @@ use psy_data::{
 };
 use psy_io::tokio::{TokioFileLike, TokioLikeFileSystem};
 use psy_node_core::{
+    p2p::validator_lookup::load_realm_validators_from_tree,
     psy_core_db::traits::full::{
         PsyNodeCheckpointRealmSpecificDatabaseReader, PsyNodeGlobalUserTreeDatabaseReader, PsyRealmProcessorStore,
     },
@@ -54,12 +55,34 @@ use psy_serialize::{PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSeriali
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::{
-    guta_planner::realm_guta_planner::{PlannedFutureEndCapJob, RealmGUTAPlanner, RealmFinalizeGUTAIdentity},
+    guta_planner::realm_guta_planner::{PlannedFutureEndCapJob, RealmGUTAPlanner, RealmGUTAValidatorProofs},
     queue::gatherer_builder::QueueGathererItemBuilderWithTree,
 };
 pub const REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_BYTES: [u8; 4] = [0x52, 0x47, 0x45, 0x31]; // 'RGE1' in ASCII
 pub const REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32: u32 = 0x31_45_47_52; // 'RGE1' in little-endian u32
 
+
+/// Typed failure raised when a realm end-cap backup's declared start global
+/// user tree root does not match `tree.get_root()`. The check runs
+/// before any tree mutation, so the backup is left completely unapplied and
+/// recovery can rebuild a certified start tree and replay the same candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RealmBackupStartRootMismatch<Hash> {
+    pub backup_start_root: Hash,
+    pub tree_root: Hash,
+}
+
+impl<Hash: std::fmt::Debug> std::fmt::Display for RealmBackupStartRootMismatch<Hash> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Realm proposal backup start global user tree root {:?} does not match tree root {:?}",
+            self.backup_start_root, self.tree_root
+        )
+    }
+}
+
+impl<Hash: std::fmt::Debug> std::error::Error for RealmBackupStartRootMismatch<Hash> {}
 
 pub fn get_new_realm_end_cap_gatherer_backup_file_path(
     backup_file_directory: &str,
@@ -126,12 +149,13 @@ pub fn read_realm_end_cap_gatherer_backup_bytes<
         magic_u32
     );
     let start_global_user_tree_root = Hash::from_owned_32bytes(backup[4..36].try_into().expect("start root"));
-    anyhow::ensure!(
-        start_global_user_tree_root == tree.get_root(),
-        "Realm proposal backup start global user tree root {:?} does not match tree root {:?}",
-        start_global_user_tree_root,
-        tree.get_root()
-    );
+    let current_tree_root = tree.get_root();
+    if start_global_user_tree_root != current_tree_root {
+        return Err(anyhow::Error::new(RealmBackupStartRootMismatch::<Hash> {
+            backup_start_root: start_global_user_tree_root,
+            tree_root: current_tree_root,
+        }));
+    }
     let expected_end_global_user_tree_root = Hash::from_owned_32bytes(backup[36..68].try_into().expect("end root"));
     let expected_end_caps_processed = u64::from_le_bytes(backup[68..76].try_into().expect("end-cap count"));
     let mut cursor = Cursor::new(&backup[HEADER_LEN..]);
@@ -178,14 +202,15 @@ pub fn read_realm_end_cap_gatherer_backup_bytes<
             let event_data_size = data_len
                 .checked_mul(8)
                 .ok_or_else(|| anyhow::anyhow!("End cap event data length {} overflows usize", data_len))?;
-            let mut event_data = vec![0u8; bound_backup_allocation(event_data_size, cursor_remaining_bytes(&cursor)?, "End cap event data")?];
+            check_backup_segment_size(event_data_size, remaining_backup_bytes(&cursor)?, "End cap event data")?;
+            let mut event_data = vec![0u8; event_data_size];
             Read::read_exact(&mut cursor, &mut event_data)?;
         }
         Read::read_exact(&mut cursor, &mut merkle_header)?;
         let single_header_parsed = QBlobSingleMerkleNodeBatchDataView::try_read_single_node_blob_header(&merkle_header)?;
-        let single_blob_total_size = bound_declared_qblob_allocation(
+        let single_blob_total_size = check_qblob_size(
             single_header_parsed.total_size,
-            cursor_remaining_bytes(&cursor)?,
+            remaining_backup_bytes(&cursor)?,
             "User contract tree node",
         )?;
         let user_contract_tree_nodes_size = single_blob_total_size - QBLOB_TREE_NODE_BATCH_HEADER_SIZE;
@@ -194,9 +219,9 @@ pub fn read_realm_end_cap_gatherer_backup_bytes<
 
         Read::read_exact(&mut cursor, &mut merkle_header)?;
         let double_header_parsed = QBlobDoubleMerkleNodeBatchDataView::try_read_double_node_blob_header(&merkle_header)?;
-        let double_blob_total_size = bound_declared_qblob_allocation(
+        let double_blob_total_size = check_qblob_size(
             double_header_parsed.total_size,
-            cursor_remaining_bytes(&cursor)?,
+            remaining_backup_bytes(&cursor)?,
             "Contract state tree node",
         )?;
         let contract_state_tree_nodes_size = double_blob_total_size - QBLOB_TREE_NODE_BATCH_HEADER_SIZE;
@@ -207,9 +232,9 @@ pub fn read_realm_end_cap_gatherer_backup_bytes<
             .context("End cap backup is missing the mandatory IMT leaf QBlob header")?;
         let imt_header = QBlobMerkleTreeNodeBatchHeaderV1::try_read_header_from_slice(&merkle_header)
             .context("End cap backup has an invalid mandatory IMT leaf QBlob header")?;
-        let imt_blob_size = bound_declared_qblob_allocation(
+        let imt_blob_size = check_qblob_size(
             imt_header.total_size,
-            cursor_remaining_bytes(&cursor)?,
+            remaining_backup_bytes(&cursor)?,
             "IMT leaf",
         )?;
         let mut imt_blob = vec![0u8; imt_blob_size];
@@ -241,12 +266,12 @@ pub fn read_realm_end_cap_gatherer_backup_bytes<
         );
     }
     let footer_size = GlobalUserTreeAggregatorHeaderWithJobId::<F, Hash>::FIXED_SIZE;
-    let remaining = cursor_remaining_bytes(&cursor)?;
+    let remaining_backup_bytes = remaining_backup_bytes(&cursor)?;
     anyhow::ensure!(
-        remaining == footer_size,
+        remaining_backup_bytes == footer_size,
         "Realm proposal backup footer size mismatch: expected {}, got {}",
         footer_size,
-        remaining
+        remaining_backup_bytes
     );
     let mut header_bytes = vec![0u8; footer_size];
     Read::read_exact(&mut cursor, &mut header_bytes)?;
@@ -272,41 +297,42 @@ pub fn read_realm_end_cap_gatherer_backup_bytes<
     })
 }
 
-fn cursor_remaining_bytes(cursor: &Cursor<&[u8]>) -> anyhow::Result<usize> {
+fn remaining_backup_bytes(cursor: &Cursor<&[u8]>) -> anyhow::Result<usize> {
     let position = usize::try_from(cursor.position())
-        .map_err(|_| anyhow::anyhow!("Backup cursor position {} exceeds usize range", cursor.position()))?;
+        .map_err(|_| anyhow::anyhow!("Backup position {} exceeds usize range", cursor.position()))?;
     cursor
         .get_ref()
         .len()
         .checked_sub(position)
-        .ok_or_else(|| anyhow::anyhow!("Backup cursor position {} exceeds buffer length {}", position, cursor.get_ref().len()))
+        .ok_or_else(|| anyhow::anyhow!("Backup position {} exceeds buffer length {}", position, cursor.get_ref().len()))
 }
 
-fn bound_backup_allocation(declared_size: usize, remaining_bytes: usize, segment: &str) -> anyhow::Result<usize> {
+fn check_backup_segment_size(segment_size: usize, remaining_backup_bytes: usize, segment: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
-        declared_size <= remaining_bytes,
-        "{} declared {} bytes but only {} bytes remain in the backup payload",
+        segment_size <= remaining_backup_bytes,
+        "{} declared {} bytes but only {} bytes remain in the backup",
         segment,
-        declared_size,
-        remaining_bytes
+        segment_size,
+        remaining_backup_bytes
     );
-    Ok(declared_size)
+    Ok(())
 }
 
-fn bound_declared_qblob_allocation(declared_total_size: u64, remaining_payload_bytes: usize, segment: &str) -> anyhow::Result<usize> {
-    let declared_size = usize::try_from(declared_total_size)
-        .map_err(|_| anyhow::anyhow!("{} QBlob declared total_size {} exceeds usize range", segment, declared_total_size))?;
+fn check_qblob_size(declared_total_size: u64, remaining_payload_bytes: usize, segment: &str) -> anyhow::Result<usize> {
+    let qblob_size = usize::try_from(declared_total_size)
+        .map_err(|_| anyhow::anyhow!("{} QBlob size {} exceeds usize range", segment, declared_total_size))?;
     anyhow::ensure!(
-        declared_size >= QBLOB_TREE_NODE_BATCH_HEADER_SIZE,
-        "{} QBlob declared total_size {} smaller than header size {}",
+        qblob_size >= QBLOB_TREE_NODE_BATCH_HEADER_SIZE,
+        "{} QBlob size {} is smaller than header size {}",
         segment,
-        declared_size,
+        qblob_size,
         QBLOB_TREE_NODE_BATCH_HEADER_SIZE
     );
-    let remaining_total = remaining_payload_bytes
+    let remaining_qblob_bytes = remaining_payload_bytes
         .checked_add(QBLOB_TREE_NODE_BATCH_HEADER_SIZE)
-        .ok_or_else(|| anyhow::anyhow!("{} QBlob remaining-size overflow", segment))?;
-    bound_backup_allocation(declared_size, remaining_total, &format!("{} QBlob", segment))
+        .ok_or_else(|| anyhow::anyhow!("{} QBlob remaining byte count overflows", segment))?;
+    check_backup_segment_size(qblob_size, remaining_qblob_bytes, segment)?;
+    Ok(qblob_size)
 }
 
 
@@ -427,18 +453,12 @@ pub struct RealmGUTAEndCapGathererConfig<
     pub coordinator_guta_updates_circuit_whitelist: N::QHash,
     pub checkpoint_tree: Arc<PsyDashMemoryAppendOnlyMerkleStore<N::HasherBase, N::QHash>>,
     pub future_pending_end_cap_jobs: Arc<RwLock<Vec<PlannedFutureEndCapJob<N::F, N::QHash>>>>,
-    /// Process-lifetime fee-leaf slot: the single authority for the validator
-    /// leaf's balance/nonce across builder recreates. Fed by EndCaps, finalize
-    /// fee credits and follower FFS user-leaf preimages; never read back from
-    /// the DB gathering checkpoint.
-    pub current_fee_validator_leaf: Arc<RwLock<Option<PQEDUserLeaf<N::F, N::QHash>>>>,
-    /// Last fee leaf whose hash matched the tree at a commit point. FF uses
-    /// it to discard speculative slot overlays that a reverted recorder left
-    /// behind, restoring the committed preimage before FFS last-wins.
-    pub committed_fee_validator_leaf: Arc<RwLock<Option<PQEDUserLeaf<N::F, N::QHash>>>>,
+    /// Process-lifetime shared validator account leaf: the single authority
+    /// for the validator's balance/nonce across builder recreates. Fed by
+    /// EndCaps, finalize fee credits and follower FFS user-leaf preimages;
+    /// never read back from the DB gathering checkpoint.
+    pub current_validator_user_leaf: Arc<Mutex<PQEDUserLeaf<N::F, N::QHash>>>,
     pub tree_store: Arc<dyn PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync>,
-    pub validator: psy_data::genesis::genesis_block_setup::GenesisValidator,
-    pub checkpoints_per_epoch: u64,
     pub _phantom_n: std::marker::PhantomData<N>,
 
 
@@ -457,26 +477,60 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
             coordinator_guta_updates_circuit_whitelist: self.coordinator_guta_updates_circuit_whitelist,
             checkpoint_tree: self.checkpoint_tree.clone(),
             future_pending_end_cap_jobs: self.future_pending_end_cap_jobs.clone(),
-            current_fee_validator_leaf: self.current_fee_validator_leaf.clone(),
-            committed_fee_validator_leaf: self.committed_fee_validator_leaf.clone(),
+            current_validator_user_leaf: self.current_validator_user_leaf.clone(),
             tree_store: self.tree_store.clone(),
-            validator: self.validator,
-            checkpoints_per_epoch: self.checkpoints_per_epoch,
             _phantom_n: std::marker::PhantomData,
         }
     }
 }
 
+/// Checkpoint-bound validator: the authenticated validator-tree preimage, its
+/// membership proof, and the checkpoint state roots at the gathering checkpoint.
+pub(crate) async fn load_checkpoint_validator<N, S>(
+    tree_store: &S,
+    status: &RealmProcessorCoreState<N::QHash>,
+) -> anyhow::Result<(
+    psy_data::p2p::ValidatorLeafPreimage,
+    MerkleProofCore<N::QHash>,
+    psy_data::v1::qdata::checkpoint::PQEDCheckpointGlobalStateRoots<N::QHash>,
+)>
+where
+    N: QNetworkTypesConfig,
+    S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync + ?Sized,
+{
+    let checkpoint_id = status.gathering_checkpoint_id;
+    let realm_id = status.realm_identifier.realm_id as u32;
+    let realm_sub_id = status.realm_identifier.realm_sub_id;
+    let validator_index = psy_data::guta::realm_finalize::validator_tree_index(realm_id, realm_sub_id);
+    let preimage = tree_store.validator_tree_get_leaf_preimage(checkpoint_id, validator_index).await?
+        .ok_or_else(|| anyhow::anyhow!("no persisted validator-tree preimage at checkpoint {} index {}", checkpoint_id, validator_index))?;
+    anyhow::ensure!(preimage.chain_id == status.chain_id,
+        "Validator preimage chain {} does not match local chain {}",
+        preimage.chain_id, status.chain_id);
+    anyhow::ensure!(preimage.realm_id == realm_id && preimage.realm_sub_id == realm_sub_id,
+        "Validator preimage realm {} sub {} does not match local realm {} sub {}",
+        preimage.realm_id, preimage.realm_sub_id, realm_id, realm_sub_id);
+    let roots = tree_store.get_checkpoint_global_state_roots(checkpoint_id).await?;
+    let validator_tree_proof = tree_store.validator_tree_get_merkle_proof(checkpoint_id, validator_index).await?;
+    anyhow::ensure!(validator_tree_proof.root == roots.validator_tree_root
+        && validator_tree_proof.verify::<N::HasherBase>(),
+        "Validator-tree proof does not match the checkpoint validator-tree root");
+    psy_data::p2p::authenticate_validator_preimage(&preimage, &validator_tree_proof.value)?;
+    Ok((preimage, validator_tree_proof, roots))
+}
+
+
 impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>, FileSystem: TokioLikeFileSystem>
     RealmGUTAEndCapGathererConfig<N, TempDatabase, FileSystem>
 {
-    pub(crate) async fn finalizer_identity(&self, status: &RealmProcessorCoreState<N::QHash>) -> anyhow::Result<RealmFinalizeGUTAIdentity<N::F, N::QHash>> {
-        anyhow::ensure!(self.checkpoints_per_epoch > 0, "Realm finalization requires rotation");
+    pub(crate) async fn load_realm_guta_validator_proofs(&self, status: &RealmProcessorCoreState<N::QHash>) -> anyhow::Result<RealmGUTAValidatorProofs<N::F, N::QHash>> {
+        anyhow::ensure!(psy_config::CHECKPOINTS_PER_EPOCH > 0, "Realm finalization requires rotation");
         let checkpoint_id = status.gathering_checkpoint_id;
         let target = checkpoint_id.checked_add(1).ok_or_else(|| anyhow::anyhow!("Checkpoint overflow"))?;
-        let epoch = parth_common::realm_rotation::epoch(target, self.checkpoints_per_epoch);
-        let anchor_id = parth_common::realm_rotation::anchor_checkpoint_id(epoch, self.checkpoints_per_epoch);
-        let user_id = self.validator.validator_user_id;
+        let epoch = parth_common::realm_rotation::epoch(target, psy_config::CHECKPOINTS_PER_EPOCH);
+        let anchor_id = parth_common::realm_rotation::anchor_checkpoint_id(epoch, psy_config::CHECKPOINTS_PER_EPOCH);
+        let (preimage, validator_tree_proof, roots) = load_checkpoint_validator::<N, _>(self.tree_store.as_ref(), status).await?;
+        let user_id = preimage.validator_user_id;
         let min_user_id = self.realm_id_u64 << N::REALM_GLOBAL_USER_TREE_HEIGHT;
         let max_user_id = (self.realm_id_u64 + 1) << N::REALM_GLOBAL_USER_TREE_HEIGHT;
         anyhow::ensure!(user_id >= min_user_id && user_id < max_user_id, "Validator user is outside its realm");
@@ -484,51 +538,35 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
         // No wallet key material: BLS authorization stays with the processor's
         // own P2P key; the identity is public validator-tree/leaf evidence only.
         let checkpoint_leaf = self.tree_store.get_checkpoint_leaf_data(checkpoint_id).await?;
-        let roots = self.tree_store.get_checkpoint_global_state_roots(checkpoint_id).await?;
         let checkpoint_tree_proof = self.tree_store.checkpoint_tree_get_merkle_proof(checkpoint_id, checkpoint_id).await?;
         let anchor_checkpoint_leaf = self.tree_store.get_checkpoint_leaf_data(anchor_id).await?;
         let anchor_checkpoint_tree_proof = self.tree_store.checkpoint_tree_get_merkle_proof(checkpoint_id, anchor_id).await?;
-        let (validator_user_tree_proof, old_realm_root_proof) = finalizer_user_tree_proofs::<N, _>(
+        let (validator_user_tree_proof, old_realm_root_proof) = validator_user_tree_proofs::<N, _>(
             self.tree_store.as_ref(), checkpoint_id, user_id, self.realm_id_u64).await?;
-        let validator_index = psy_data::guta::realm_finalize::validator_tree_index(self.realm_id_u64 as u32, self.realm_sub_id_u64 as u16);
-        let validator_tree_proof = self.tree_store.validator_tree_get_merkle_proof(checkpoint_id, validator_index).await?;
-        let node_limbs = psy_data::p2p::digest_to_field_limbs(&psy_data::p2p::sha256(&self.validator.node_id))?;
-        let bls_limbs = psy_data::p2p::digest_to_field_limbs(&psy_data::p2p::sha256(&self.validator.bls_public_key))?;
         anyhow::ensure!(checkpoint_tree_proof.root == status.gathering_checkpoint_root
             && checkpoint_tree_proof.value == checkpoint_leaf.qfhash::<N::HasherBase>()
             && checkpoint_tree_proof.verify::<N::HasherBase>()
             && anchor_checkpoint_tree_proof.root == status.gathering_checkpoint_root
             && anchor_checkpoint_tree_proof.value == anchor_checkpoint_leaf.qfhash::<N::HasherBase>()
-            && anchor_checkpoint_tree_proof.verify::<N::HasherBase>(), "Finalizer checkpoint proofs do not match gathering snapshot");
+            && anchor_checkpoint_tree_proof.verify::<N::HasherBase>(), "Checkpoint proofs do not match gathering state");
         anyhow::ensure!(validator_user_tree_proof.root == roots.user_tree_root,
-            "Finalizer user proof root {:?} does not match stored user tree root {:?}",
+            "Validator user proof root {:?} does not match stored user tree root {:?}",
             validator_user_tree_proof.root, roots.user_tree_root);
         anyhow::ensure!(validator_user_tree_proof.value == leaf.qfhash::<N::HasherBase>(),
-            "Finalizer user proof value {:?} does not match validator leaf hash",
+            "Validator user proof value {:?} does not match validator leaf hash",
             validator_user_tree_proof.value);
         anyhow::ensure!(validator_user_tree_proof.verify::<N::HasherBase>(),
-            "Finalizer user proof fails verification");
+            "Validator user proof fails verification");
         anyhow::ensure!(old_realm_root_proof.root == roots.user_tree_root,
-            "Finalizer old realm root proof root {:?} does not match stored user tree root {:?}",
+            "Realm root proof root {:?} does not match stored user tree root {:?}",
             old_realm_root_proof.root, roots.user_tree_root);
         anyhow::ensure!(old_realm_root_proof.value == status.gathering_realm_start_root,
-            "Finalizer old realm root proof value {:?} does not match gathering_realm_start_root {:?}",
+            "Realm root proof value {:?} does not match gathering_realm_start_root {:?}",
             old_realm_root_proof.value, status.gathering_realm_start_root);
         anyhow::ensure!(old_realm_root_proof.verify::<N::HasherBase>(),
-            "Finalizer old realm root proof fails verification");
-        anyhow::ensure!(validator_tree_proof.root == roots.validator_tree_root
-            && validator_tree_proof.value == psy_data::guta::realm_finalize::realm_validator_leaf_hash::<N::F, N::QHash, N::HasherBase>(user_id, node_limbs, bls_limbs)
-            && validator_tree_proof.verify::<N::HasherBase>(), "Finalizer validator proof does not match gathering snapshot");
-        let mut current_validator_user_tree_proof = validator_user_tree_proof.clone();
-        current_validator_user_tree_proof.index = user_id - min_user_id;
-        current_validator_user_tree_proof.siblings.truncate(N::REALM_GLOBAL_USER_TREE_HEIGHT as usize);
-        current_validator_user_tree_proof.root = status.gathering_realm_start_root;
-        Ok(RealmFinalizeGUTAIdentity {
-            validator_user_id: user_id,
-            validator_node_id_hash_limbs: node_limbs,
-            validator_bls_hash_limbs: bls_limbs,
-            current_validator_user_leaf: leaf.clone(),
-            current_validator_user_tree_proof,
+            "Realm root proof fails verification");
+        Ok(RealmGUTAValidatorProofs {
+            validator: preimage,
             validator_user_leaf: leaf,
             anchor_checkpoint_leaf,
             anchor_checkpoint_tree_proof,
@@ -543,7 +581,7 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
     }
 }
 
-pub(crate) async fn finalizer_user_tree_proofs<N, S>(
+pub(crate) async fn validator_user_tree_proofs<N, S>(
     store: &S,
     checkpoint_id: u64,
     user_id: u64,
@@ -562,7 +600,7 @@ where
         && top.siblings.len() == N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT as usize
         && top.index == realm_id
         && user_id.checked_shr(N::REALM_GLOBAL_USER_TREE_HEIGHT as u32) == Some(realm_id),
-        "Finalizer user proof has an invalid realm boundary at checkpoint {}", checkpoint_id);
+        "Validator user proof has an invalid realm boundary at checkpoint {}", checkpoint_id);
     let mut bottom = store.global_user_tree_get_merkle_proof_sub_tree(
         checkpoint_id, N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT, N::GLOBAL_USER_TREE_HEIGHT, user_id).await?;
     anyhow::ensure!(bottom.siblings.len() == N::REALM_GLOBAL_USER_TREE_HEIGHT as usize
@@ -701,13 +739,31 @@ pub struct RealmGUTAEndCapGatherer<
     pub config: RealmGUTAEndCapGathererConfig<N, TempDatabase, FileSystem>,
     pub last_committed_checkpoint_root: N::QHash,
     pub guta_planner: RealmGUTAPlanner<N::F, N::QHash>,
-    committed_validator_user_leaf: PQEDUserLeaf<N::F, N::QHash>,
     pub status: RealmProcessorCoreState<N::QHash>,
     pub start_global_user_tree_root: N::QHash,
     pub total_users_updated: u64,
     pub new_realm_end_cap_gatherer_file: FileSystem::File,
     pub pending_file_path: String,
-
+    gathering_start_validator_user_leaf: PQEDUserLeaf<N::F, N::QHash>,
+}
+impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>, FileSystem: TokioLikeFileSystem>
+    Drop for RealmGUTAEndCapGatherer<N, TempDatabase, FileSystem>
+{
+    /// Return checkpoint-ahead EndCaps to the shared list whenever a builder is dropped.
+    fn drop(&mut self) {
+        let pending = std::mem::take(&mut self.guta_planner.future_pending_end_cap_jobs);
+        if pending.is_empty() {
+            return;
+        }
+        match self.config.future_pending_end_cap_jobs.write() {
+            Ok(mut slot) => slot.extend(pending),
+            Err(_) => tracing::error!(
+                "Failed to restore {} future pending end cap jobs on gatherer drop for pending id {}",
+                pending.len(),
+                self.status.gathering_unique_pending_id
+            ),
+        }
+    }
 }
 
 fn publish_gathering_snapshot_if_current<Hash: PartialEq + Copy + std::fmt::Debug>(
@@ -829,28 +885,23 @@ impl<
         }
         let status = config.status.read()
             .map_err(|_| anyhow::anyhow!("error reading gathering snapshot"))?.clone();
-        let user_id = config.validator.validator_user_id;
+        // The validator is checkpoint-bound: authenticated from the persisted
+        // validator tree at the gathering checkpoint, never from Genesis.
+        let (validator_preimage, _, _) = load_checkpoint_validator::<N, _>(config.tree_store.as_ref(), &status).await?;
+        let user_id = validator_preimage.validator_user_id;
         let min_user_id = config.realm_id_u64 << N::REALM_GLOBAL_USER_TREE_HEIGHT;
         anyhow::ensure!(user_id >= min_user_id && user_id - min_user_id < (1u64 << N::REALM_GLOBAL_USER_TREE_HEIGHT),
-            "bootstrap validator is outside realm");
-        // The process-lifetime fee-leaf slot is the balance/nonce authority:
-        // seed the planner from it and never read the fee preimage back from
-        // the DB gathering checkpoint while the slot is populated.
-        let in_memory_leaf = config.current_fee_validator_leaf.read()
-            .map_err(|_| anyhow::anyhow!("error reading fee leaf slot"))?.clone();
-        let identity = if in_memory_leaf.is_none() { Some(config.finalizer_identity(&status).await?) } else { None };
-        let current_leaf = match in_memory_leaf
-            .or_else(|| identity.as_ref().map(|identity| identity.current_validator_user_leaf.clone())) {
-            Some(leaf) => leaf,
-            None => anyhow::bail!("no in-memory fee leaf and no persisted identity"),
-        };
-        anyhow::ensure!(current_leaf.user_id.to_u64_value() == user_id, "fee leaf belongs to another user");
+            "validator user is outside realm");
+        // The shared validator account leaf must hash to the current tree leaf.
+        let current_leaf = config.current_validator_user_leaf.lock()
+            .map_err(|_| anyhow::anyhow!("error reading current validator leaf"))?.clone();
+        anyhow::ensure!(current_leaf.user_id.to_u64_value() == user_id, "current validator leaf belongs to another user");
         anyhow::ensure!(tree.get_leaf(user_id - min_user_id).value == current_leaf.qfhash::<N::HasherBase>(),
-            "fee leaf preimage does not match live tree");
-        let live_root = tree.get_root();
-        anyhow::ensure!(live_root == status.gathering_realm_start_root || live_root == status.processing_realm_end_root,
-            "live recorder root {:?} matches neither gathering_realm_start_root {:?} nor processing_realm_end_root {:?}",
-            live_root, status.gathering_realm_start_root, status.processing_realm_end_root);
+            "current validator leaf preimage does not match current tree");
+        let current_tree_root = tree.get_root();
+        anyhow::ensure!(current_tree_root == status.gathering_realm_start_root || current_tree_root == status.processing_realm_end_root,
+            "current tree root {:?} matches neither gathering_realm_start_root {:?} nor processing_realm_end_root {:?}",
+            current_tree_root, status.gathering_realm_start_root, status.processing_realm_end_root);
         let new_realm_end_cap_gatherer_file_path = get_new_realm_end_cap_gatherer_backup_file_path(
             &config.backup_file_directory, config.realm_id_u64, config.realm_sub_id_u64,
             status.gathering_unique_pending_id);
@@ -860,8 +911,8 @@ impl<
         let mut new_realm_end_cap_gatherer_file = config.file_system.file_like_fs_create(&backup_path).await?;
         new_realm_end_cap_gatherer_file.file_like_set_len(0).await?;
         new_realm_end_cap_gatherer_file.write_u32_le(REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32).await?;
-        new_realm_end_cap_gatherer_file.write_all(&live_root.into_owned_32bytes()).await?;
-        new_realm_end_cap_gatherer_file.write_all(&live_root.into_owned_32bytes()).await?;
+        new_realm_end_cap_gatherer_file.write_all(&current_tree_root.into_owned_32bytes()).await?;
+        new_realm_end_cap_gatherer_file.write_all(&current_tree_root.into_owned_32bytes()).await?;
         new_realm_end_cap_gatherer_file.write_u64_le(0).await?;
         config
             .file_system
@@ -873,50 +924,54 @@ impl<
             status.gathering_checkpoint_root,
             status.gathering_checkpoint_id,
             status.gathering_unique_pending_id,
-            live_root,
+            current_tree_root,
             N::REALM_GLOBAL_USER_TREE_HEIGHT,
             N::GLOBAL_USER_TREE_HEIGHT,
             config.coordinator_guta_updates_circuit_whitelist,
         );
-        guta_planner.realm_finalize_validator_user_id = Some(user_id);
-        guta_planner.realm_finalize_current_validator_user_leaf = Some(current_leaf);
-        if let Some(identity) = identity { guta_planner.refresh_realm_finalize_identity(identity); }
+        guta_planner.current_validator_user_leaf = Some(current_leaf);
         let future_end_cap_jobs: Vec<PlannedFutureEndCapJob<N::F, N::QHash>> = {
             std::mem::take(&mut *config.future_pending_end_cap_jobs.write()
                 .map_err(|_| anyhow::anyhow!("error writing to future pending end cap jobs"))?)
         };
-        let committed_validator_user_leaf = guta_planner.realm_finalize_current_validator_user_leaf.clone()
-            .context("missing initial validator leaf")?;
         let restore_future_jobs = future_end_cap_jobs.clone();
-        let end_cap_jobs_added = match guta_planner
-            .add_future_end_cap_jobs(&config.checkpoint_tree, tree, &mut new_realm_end_cap_gatherer_file,
-                config.temp_db.clone(), future_end_cap_jobs)
-            .await
+        // Return checkpoint-ahead EndCaps if construction fails after taking the shared list.
+        let (end_cap_jobs_added, gathering_start_validator_user_leaf) = match async {
+            let gathering_start_validator_user_leaf = guta_planner.current_validator_user_leaf.clone()
+                .context("missing current validator leaf")?;
+            let end_cap_jobs_added = guta_planner
+                .add_future_end_cap_jobs(&config.checkpoint_tree, tree, &mut new_realm_end_cap_gatherer_file,
+                    config.temp_db.clone(), future_end_cap_jobs)
+                .await?;
+            config
+                .file_system
+                .file_like_fs_flush_file_with_path(&backup_path, &mut new_realm_end_cap_gatherer_file)
+                .await?;
+            anyhow::Ok((end_cap_jobs_added, gathering_start_validator_user_leaf))
+        }
+        .await
         {
-            Ok(count) => count,
+            Ok(result) => result,
             Err(error) => {
-                if let Ok(mut pending) = config.future_pending_end_cap_jobs.write() {
-                    pending.extend(restore_future_jobs);
-                } else {
-                    tracing::error!("Failed to restore future pending end cap jobs after failed gatherer construction");
+                match config.future_pending_end_cap_jobs.write() {
+                    Ok(mut pending) => pending.extend(restore_future_jobs),
+                    Err(_) => {
+                        return Err(anyhow::anyhow!("{error:#}; also failed to restore {} future pending end cap jobs after failed gatherer construction", restore_future_jobs.len()))
+                    }
                 }
                 return Err(error);
             }
         };
-        config
-            .file_system
-            .file_like_fs_flush_file_with_path(&backup_path, &mut new_realm_end_cap_gatherer_file)
-            .await?;
         let last_committed_checkpoint_root = config.checkpoint_tree.get_root();
         Ok(Self {
             config,
             status,
-            committed_validator_user_leaf,
+            gathering_start_validator_user_leaf,
             guta_planner,
             last_committed_checkpoint_root,
             total_users_updated: end_cap_jobs_added as u64,
             new_realm_end_cap_gatherer_file,
-            start_global_user_tree_root: live_root,
+            start_global_user_tree_root: current_tree_root,
             pending_file_path: backup_path,
         })
     }
@@ -957,15 +1012,12 @@ impl<
         // EndCap overlay: the slot is only advanced when the tree leaf moved
         // in the same operation. A lone (straggler) EndCap stages the planner
         // leaf without touching the tree, so publishing it here would break
-        let tree_leaf_value = self.guta_planner.realm_finalize_validator_user_id
-            .map(|user_id| tree.get_leaf(user_id - self.guta_planner.realm_user_min_id).value);
-        let matches_tree = match (&tree_leaf_value, self.guta_planner.realm_finalize_current_validator_user_leaf.as_ref()) {
-            (Some(tree_value), Some(leaf)) => leaf.qfhash::<N::HasherBase>() == *tree_value,
-            _ => false,
-        };
-        if matches_tree {
-            if let Ok(mut slot) = self.config.current_fee_validator_leaf.write() {
-                *slot = self.guta_planner.realm_finalize_current_validator_user_leaf.clone();
+        let tree_leaf_value = self.guta_planner.current_validator_user_leaf.as_ref()
+            .map(|leaf| tree.get_leaf(leaf.user_id.to_u64_value() - self.guta_planner.realm_user_min_id).value);
+        if let (Some(tree_value), Some(leaf)) = (&tree_leaf_value, self.guta_planner.current_validator_user_leaf.as_ref()) {
+            if leaf.qfhash::<N::HasherBase>() == *tree_value {
+                *self.config.current_validator_user_leaf.lock()
+                    .map_err(|_| anyhow::anyhow!("error writing current validator leaf"))? = leaf.clone();
             }
         }
         Ok(())
@@ -1002,10 +1054,10 @@ impl<
                 tree.get_root()
             );
             tree.revert_changes();
-            self.guta_planner.realm_finalize_current_validator_user_leaf = Some(self.committed_validator_user_leaf.clone());
-            if let Ok(mut slot) = self.config.current_fee_validator_leaf.write() {
-                *slot = self.guta_planner.realm_finalize_current_validator_user_leaf.clone();
-            }
+            self.guta_planner.current_validator_user_leaf = Some(self.gathering_start_validator_user_leaf.clone());
+            *self.config.current_validator_user_leaf.lock()
+                .map_err(|_| anyhow::anyhow!("error writing current validator leaf"))? =
+                self.gathering_start_validator_user_leaf.clone();
             {
                 let mut shared = self
                     .config
@@ -1041,14 +1093,14 @@ impl<
                 self.start_global_user_tree_root
             );
         }
-        // Formal identity is loaded here, at the official finalize, only.
-        let identity = self.config.finalizer_identity(&authenticated).await?;
+        // Validator proofs are loaded at finalize.
+        let proofs = self.config.load_realm_guta_validator_proofs(&authenticated).await?;
         if authenticated.gathering_checkpoint_id != self.guta_planner.current_checkpoint_id
             || authenticated.gathering_checkpoint_root != self.guta_planner.current_checkpoint_root {
             // Checkpoint-advance rebase: rebuild the planner bound to the
             // authentic checkpoint, replay the owned inputs, and truncate-
-            // replace the pending backup in place. Identity is bound and the
-            // fee leaf is preserved; no .replay staging exists.
+            // replace the pending backup in place. Witness is bound and the
+            // account leaf is preserved; no .replay staging exists.
             let accepted = self.guta_planner.accepted_end_cap_jobs.clone();
             let pending = self.guta_planner.future_pending_end_cap_jobs.clone();
             let mut rebuilt_tree = tree.clone();
@@ -1061,9 +1113,9 @@ impl<
                 self.status.gathering_unique_pending_id, self.start_global_user_tree_root,
                 N::REALM_GLOBAL_USER_TREE_HEIGHT, N::GLOBAL_USER_TREE_HEIGHT,
                 self.config.coordinator_guta_updates_circuit_whitelist);
-            // Leaf preservation: the retained fee leaf seeds the rebuilt planner.
-            rebuilt.realm_finalize_current_validator_user_leaf = Some(self.committed_validator_user_leaf.clone());
-            rebuilt.refresh_realm_finalize_identity(identity);
+            // Leaf preservation: the retained account leaf seeds the rebuilt planner.
+            rebuilt.current_validator_user_leaf = Some(self.gathering_start_validator_user_leaf.clone());
+            rebuilt.set_validator_proofs(proofs)?;
             self.new_realm_end_cap_gatherer_file.seek(tokio::io::SeekFrom::Start(4 + 32 + 32 + 8)).await?;
             rebuilt.add_future_end_cap_jobs(&self.config.checkpoint_tree, &mut rebuilt_tree,
                 &mut self.new_realm_end_cap_gatherer_file, self.config.temp_db.clone(), accepted).await?;
@@ -1082,7 +1134,7 @@ impl<
             *tree = rebuilt_tree;
             self.guta_planner = rebuilt;
         } else {
-            self.guta_planner.refresh_realm_finalize_identity(identity);
+            self.guta_planner.set_validator_proofs(proofs)?;
         }
         tracing::info!(
             "Committing GUTA updates gatherer changes for pending id {}, finalizing root {:?}",
@@ -1126,14 +1178,12 @@ impl<
             );
             tree.commit_changes();
             // Publish the committed root so the immediate recreate bootstrap
-            // accepts the finalize-committed live root (recreate race fix).
+            // accepts the finalize-committed current tree root (recreate race fix).
             publish_gathering_snapshot_if_current(&self.config.status, &self.status, tree.get_root());
-            if let Ok(mut slot) = self.config.current_fee_validator_leaf.write() {
-                *slot = self.guta_planner.realm_finalize_current_validator_user_leaf.clone();
-            }
-            if let Ok(mut committed) = self.config.committed_fee_validator_leaf.write() {
-                *committed = self.guta_planner.realm_finalize_current_validator_user_leaf.clone();
-            }
+            *self.config.current_validator_user_leaf.lock()
+                .map_err(|_| anyhow::anyhow!("error writing current validator leaf"))? =
+                self.guta_planner.current_validator_user_leaf.clone()
+                    .ok_or_else(|| anyhow::anyhow!("missing current validator leaf after finalize"))?;
             return Ok(result);
         }
 
@@ -1174,14 +1224,12 @@ impl<
             .file_like_fs_sync_file_with_path(&self.pending_file_path, &mut self.new_realm_end_cap_gatherer_file)
             .await?;
         // Publish even for a no-op finalize so the recreate bootstrap accepts
-        // the current live root.
+        // the current tree root.
         publish_gathering_snapshot_if_current(&self.config.status, &self.status, tree.get_root());
-        if let Ok(mut slot) = self.config.current_fee_validator_leaf.write() {
-            *slot = self.guta_planner.realm_finalize_current_validator_user_leaf.clone();
-        }
-        if let Ok(mut committed) = self.config.committed_fee_validator_leaf.write() {
-            *committed = self.guta_planner.realm_finalize_current_validator_user_leaf.clone();
-        }
+        *self.config.current_validator_user_leaf.lock()
+            .map_err(|_| anyhow::anyhow!("error writing current validator leaf"))? =
+            self.guta_planner.current_validator_user_leaf.clone()
+                .ok_or_else(|| anyhow::anyhow!("missing current validator leaf after finalize"))?;
         Ok(RealmGUTAEndCapGathererOutput {
             db_output: RealmGUTAEndCapGathererOutputDatabase::<N::F, N::QHash>::get_empty(tree.get_root()),
             job_ids: vec![],
@@ -1198,27 +1246,10 @@ impl<
             "FFS belongs to another realm");
         anyhow::ensure!(updates.update_user_leaves_ffs.len() % PSY_OBJECT_FFS_SIZE_USER_LEAF == 0,
             "invalid FFS user leaf length");
-        let user_id = config.validator.validator_user_id;
-        let min_user_id = config.realm_id_u64 << N::REALM_GLOBAL_USER_TREE_HEIGHT;
-        // Trust the speculative slot only while its hash still matches the
-        // committed preimage; a reverted recorder otherwise invalidated it.
-        // The committed preimage is the FF base, then FFS last-wins overlays.
-        let committed_leaf = config.committed_fee_validator_leaf.read()
-            .map_err(|_| anyhow::anyhow!("error reading committed fee leaf slot"))?.clone();
-        let speculative_leaf = config.current_fee_validator_leaf.read()
-            .map_err(|_| anyhow::anyhow!("error reading fee leaf slot"))?.clone();
-        let mut current_leaf = match (&speculative_leaf, &committed_leaf) {
-            (Some(speculative), Some(committed)) if speculative.qfhash::<N::HasherBase>() == committed.qfhash::<N::HasherBase>() => Some(speculative.clone()),
-            (Some(speculative), None) => Some(speculative.clone()),
-            (_, Some(committed)) => Some(committed.clone()),
-            (None, None) => None,
-        };
-        for bytes in updates.update_user_leaves_ffs.chunks_exact(PSY_OBJECT_FFS_SIZE_USER_LEAF) {
-            let leaf = PQEDUserLeaf::<N::F, N::QHash>::psy_ser_from_slice(bytes)?;
-            if leaf.user_id.to_u64_value() == user_id {
-                current_leaf = Some(leaf);
-            }
-        }
+        let status = config.status.read()
+            .map_err(|_| anyhow::anyhow!("error reading gathering snapshot"))?.clone();
+        let (preimage, _, _) = load_checkpoint_validator::<N, _>(config.tree_store.as_ref(), &status).await?;
+        let user_id = preimage.validator_user_id;
         apply_state_updates_to_tree(
             tree,
             updates.old_realm_root,
@@ -1227,13 +1258,27 @@ impl<
             N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
             config.realm_id_u64,
         )?;
-        if let Some(leaf) = current_leaf {
-            anyhow::ensure!(leaf.user_id.to_u64_value() == user_id, "FFS validator leaf belongs to another user");
+        let min_user_id = config.realm_id_u64 << N::REALM_GLOBAL_USER_TREE_HEIGHT;
+        // FFS validator leaves are last-wins. Without one, the retained account leaf
+        // must still hash to the updated tree leaf.
+        let mut ffs_validator_leaf: Option<PQEDUserLeaf<N::F, N::QHash>> = None;
+        for bytes in updates.update_user_leaves_ffs.chunks_exact(PSY_OBJECT_FFS_SIZE_USER_LEAF) {
+            let leaf = PQEDUserLeaf::<N::F, N::QHash>::psy_ser_from_slice(bytes)?;
+            if leaf.user_id.to_u64_value() == user_id {
+                ffs_validator_leaf = Some(leaf);
+            }
+        }
+        if let Some(leaf) = ffs_validator_leaf {
             anyhow::ensure!(tree.get_leaf(user_id - min_user_id).value == leaf.qfhash::<N::HasherBase>(),
                 "FFS validator preimage does not match updated tree");
-            if let Ok(mut slot) = config.current_fee_validator_leaf.write() {
-                *slot = Some(leaf);
-            }
+            *config.current_validator_user_leaf.lock()
+                .map_err(|_| anyhow::anyhow!("error writing current validator leaf"))? = leaf;
+        } else {
+            let current_leaf = config.current_validator_user_leaf.lock()
+                .map_err(|_| anyhow::anyhow!("error reading current validator leaf"))?.clone();
+            anyhow::ensure!(current_leaf.user_id.to_u64_value() == user_id, "FFS validator leaf belongs to another user");
+            anyhow::ensure!(tree.get_leaf(user_id - min_user_id).value == current_leaf.qfhash::<N::HasherBase>(),
+                "FFS validator preimage does not match updated tree");
         }
         tracing::info!(
             "Applied Realm gatherer FastForward old_root={:?} new_root={:?}",
@@ -1463,13 +1508,21 @@ mod backup_file_tests {
         const READER_COORDINATOR_GLOBAL_USER_TREE_HEIGHT: u8 = 32;
 
         async fn read_backup_with_records(records: &[Vec<u8>]) -> anyhow::Result<RealmGUTAEndCapGathererOutputDatabase<ReaderF, ReaderHash>> {
+            read_backup_with_declared_start_root(records, None).await
+        }
+
+        async fn read_backup_with_declared_start_root(
+            records: &[Vec<u8>],
+            declared_start_root_override: Option<ReaderHash>,
+        ) -> anyhow::Result<RealmGUTAEndCapGathererOutputDatabase<ReaderF, ReaderHash>> {
             let file_system = SimpleMockMemoryFileSystem::new();
             let path = "realm_end_cap_reader_test.backup";
             let mut tree = SimpleMemoryMerkleRecorderStore::<ReaderHasher, ReaderHash>::new(READER_REALM_GLOBAL_USER_TREE_HEIGHT);
             let start_root = tree.get_root();
+            let declared_start_root = declared_start_root_override.unwrap_or(start_root);
             let mut data = Vec::new();
             data.extend_from_slice(&REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32.to_le_bytes());
-            data.extend_from_slice(&start_root.into_owned_32bytes());
+            data.extend_from_slice(&declared_start_root.into_owned_32bytes());
             data.extend_from_slice(&start_root.into_owned_32bytes());
             data.extend_from_slice(&(records.len() as u64).to_le_bytes());
             for record in records {
@@ -1612,6 +1665,55 @@ mod backup_file_tests {
             assert!(
                 message.contains("declared 1000000 bytes") && message.contains("bytes remain"),
                 "Allocation bound error not surfaced, got: {message}"
+            );
+            Ok(())
+        }
+
+
+        #[tokio::test]
+        async fn start_root_mismatch_is_typed_and_leaves_tree_unmutated() -> anyhow::Result<()> {
+            use super::super::RealmBackupStartRootMismatch;
+
+            let forged_start_root = ReaderHash::from_owned_32bytes([0x5Au8; 32]);
+            let error = match read_backup_with_declared_start_root(&[end_cap_record(Some(empty_imt_blob()?))?], Some(forged_start_root)).await {
+                Ok(_) => anyhow::bail!("a backup whose declared start root differs from the current tree root must be rejected"),
+                Err(error) => error,
+            };
+            let mismatch = error
+                .downcast_ref::<RealmBackupStartRootMismatch<ReaderHash>>()
+                .expect("start-root rejection must be the typed error so recovery can extract the declared start root");
+            assert_eq!(mismatch.backup_start_root, forged_start_root);
+            assert_ne!(mismatch.tree_root, forged_start_root);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn start_root_mismatch_check_fires_before_any_tree_mutation() -> anyhow::Result<()> {
+            let mut tree = SimpleMemoryMerkleRecorderStore::<ReaderHasher, ReaderHash>::new(READER_REALM_GLOBAL_USER_TREE_HEIGHT);
+            let forged_start_root = ReaderHash::from_owned_32bytes([0xA5u8; 32]);
+            let mut data = Vec::new();
+            data.extend_from_slice(&REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32.to_le_bytes());
+            data.extend_from_slice(&forged_start_root.into_owned_32bytes());
+            data.extend_from_slice(&tree.get_root().into_owned_32bytes());
+            data.extend_from_slice(&1u64.to_le_bytes());
+            data.extend_from_slice(&end_cap_record(Some(empty_imt_blob()?))?);
+            let file_system = SimpleMockMemoryFileSystem::new();
+            file_system.files.insert("realm_end_cap_mutation_test.backup".to_string(), data);
+
+            assert!(read_realm_end_cap_gatherer_backup_file::<ReaderHasher, ReaderHash, ReaderF, SimpleMockMemoryFileSystem>(
+                &file_system,
+                "realm_end_cap_mutation_test.backup",
+                &mut tree,
+                0,
+                READER_REALM_GLOBAL_USER_TREE_HEIGHT,
+                READER_COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+                false,
+            )
+            .await
+            .is_err());
+            assert!(
+                tree.get_changes().is_empty(),
+                "the start-root check must fire before the backup mutates the journal, or a failed candidate poisons the next one"
             );
             Ok(())
         }

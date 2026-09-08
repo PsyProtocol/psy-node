@@ -101,10 +101,13 @@ where
         self.shared_state.update_from_core_state(&self.state).await?;
 
         self.temp_db
-            .set_gathering_unique_pending_ids(
+            .set_gathering_generation(
                 &self.state.realm_identifier,
-                self.state.gathering_unique_pending_id,
-                self.state.gathering_proc_checkpoint_unique_id,
+                psy_node_core::psy_temp_db::GatheringGeneration {
+                    checkpoint_id: self.state.gathering_checkpoint_id,
+                    unique_pending_id: self.state.gathering_unique_pending_id,
+                    proc_checkpoint_unique_id: self.state.gathering_proc_checkpoint_unique_id,
+                },
             )
             .await?;
         self.temp_db
@@ -171,21 +174,14 @@ where
         self.db
             .set_checkpoint_global_state_roots(checkpoint_sync_info.checkpoint_id, &checkpoint_sync_info.state_roots)
             .await?;
-        if checkpoint_sync_info.checkpoint_id == 0 {
-            // Genesis validator-tree nodes and preimages are written once at checkpoint 0.
-        }
         self.db
             .set_checkpoint_leaf_data(checkpoint_sync_info.checkpoint_id, &checkpoint_sync_info.checkpoint_leaf)
             .await?;
 
         println!("committing checkpoint proof: {:?}", &previous.to_append_proof::<N::HasherBase>());
-        // --- START FIX ---
-        // Instead of just setting the leaf hash, ingest the full proof from the correct in-memory tree.
-        // This ensures the database's internal tree structure is updated correctly.
         self.db
             .checkpoint_tree_injest_merkle_proof(checkpoint_sync_info.checkpoint_id, &previous.to_append_proof::<N::HasherBase>())
             .await?;
-        // --- END FIX ---
 
         self.db
             .set_checkpoint_root_hash_to_id_mapping(checkpoint_sync_info.checkpoint_tree_root, checkpoint_sync_info.checkpoint_id)

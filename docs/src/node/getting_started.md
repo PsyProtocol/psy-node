@@ -1,6 +1,6 @@
 # Getting Started
 
-> For supervised start/stop/restart/rollback, follow the internal guides `docs/src/dev/devnet_lifecycle.md` and `docs/src/dev/devnet-launcher-reference.md` (not published in SUMMARY). Prefer `make run-all` / `make shutdown` over manual per-service starts.
+> For supervised start/stop/restart/rollback, follow the internal guides `docs/src/../dev/devnet_lifecycle.md` and `docs/src/../dev/devnet-launcher-reference.md` (not published in SUMMARY). Prefer `make run-all` / `make shutdown` over manual per-service starts.
 
 
 > Updated: 2026-09-03.
@@ -9,7 +9,7 @@
 
 This guide starts a complete Psy network for local development. Use the automated lifecycle for normal operation; the manual commands describe the node components and their required runtime flags.
 
-Before running any startup, shutdown, restart, or rollback command, read [Devnet Startup, Shutdown, Restart, and Rollback](dev/devnet_lifecycle.md) and [Devnet Launcher Reference](dev/devnet-launcher-reference.md).
+Before running any startup, shutdown, restart, or rollback command, read [Devnet Startup, Shutdown, Restart, and Rollback](../dev/devnet_lifecycle.md) and [Devnet Launcher Reference](../dev/devnet-launcher-reference.md).
 
 ## Table of Contents
 
@@ -116,7 +116,7 @@ RUST_LOG=info psy_node_cli start-realm-processor \
   --p2p-identity-key ./local_checkpoints/realm_p2p/realm_0_sub_1_processor_identity.key \
   --p2p-bls-key ./local_checkpoints/realm_p2p/realm_0_sub_1_bls.key \
   --p2p-listen /ip4/0.0.0.0/tcp/41001 \
-  --coordinator-api-urls http://127.0.0.1:1337
+  --coordinator-api-url http://127.0.0.1:1337
 
 RUST_LOG=info psy_node_cli start-realm-edge \
   --scylla-db-url 127.0.0.1:9042 \
@@ -142,7 +142,7 @@ RUST_LOG=info psy_node_cli start-realm-processor \
   --p2p-identity-key ./local_checkpoints/realm_p2p/realm_1_sub_1_processor_identity.key \
   --p2p-bls-key ./local_checkpoints/realm_p2p/realm_1_sub_1_bls.key \
   --p2p-listen /ip4/0.0.0.0/tcp/41021 \
-  --coordinator-api-urls http://127.0.0.1:1337
+  --coordinator-api-url http://127.0.0.1:1337
 
 RUST_LOG=info psy_node_cli start-realm-edge \
   --scylla-db-url 127.0.0.1:9042 \
@@ -166,8 +166,8 @@ Prefer the supervised stack (`make run-all`), which starts realm workers and pro
 RUST_LOG=info psy_worker_cli worker \
   --user 0 \
   --private-key <local-devnet-miner-key> \
-  --realm-api-urls http://127.0.0.1:13380 \
-  --coordinator-api-urls http://127.0.0.1:1337
+  --realm-api-url http://127.0.0.1:13380 \
+  --coordinator-api-url http://127.0.0.1:1337
 
 RUST_LOG=info psy_user_cli prove-proxy
 ```
@@ -257,7 +257,7 @@ The shutdown target invokes the launcher teardown path (`Makefile:102-103`). Do 
 - Realm proposal voting and certification are implemented; see [Realm Peer-to-Peer Validators](../dev/realm-p2p-validators.md).
 - Cross-chain bridge processing is implemented by the relayer and bridge components.
 - Runtime node storage uses ScyllaDB with Redis and NATS JetStream; the accepted flags are `--scylla-db-url`, `--redis-url`, and `--nats-jetstream-url` (`psy_cli/psy_node_cli/src/subcommand.rs:24-34,95-105,163-173,201-211`).
-- Devnet lifecycle procedures are internal: `docs/src/dev/devnet_lifecycle.md` and `docs/src/dev/devnet-launcher-reference.md` (not published in SUMMARY).
+- Devnet lifecycle procedures are internal: `docs/src/../dev/devnet_lifecycle.md` and `docs/src/../dev/devnet-launcher-reference.md` (not published in SUMMARY).
 
 ## 10. Operating Tasks
 
@@ -270,7 +270,7 @@ The shutdown target invokes the launcher teardown path (`Makefile:102-103`). Do 
 ## 11. Failure Handling
 
 - **A service does not start:** confirm the selected ports are free and inspect the supervised service log.
-- **A realm processor rejects startup:** provide at least one `--coordinator-api-urls` value.
+- **A realm processor rejects startup:** provide at least one `--coordinator-api-url` value.
 - **A worker receives no jobs:** confirm its keystore, user identifier, and configured coordinator and realm endpoints.
 - **A database connection fails:** confirm the infrastructure script is still running and ports 6379, 4222, and 9042 are reachable.
 - **A restart or rollback is required:** stop and resume only through the lifecycle procedures.

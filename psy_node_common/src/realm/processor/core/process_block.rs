@@ -8,6 +8,7 @@ use parth_core::{
 
 
 
+use psy_config::CHECKPOINTS_PER_EPOCH;
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
     guta::{
@@ -19,8 +20,8 @@ use psy_data::{
     },
     node::node_proving_state::PsyNodeProvingState,
     p2p::{
-        encode_proposal_body, proposal_from_parts, sha256, vote_message, Certificate, Proposal,
-        ProtocolEncode, RealmFinalizeSubmitCode,
+        encode_proposal_body, proposal_from_parts, replication_threshold, sha256, vote_message,
+        Certificate, Proposal, ProtocolEncode,
     },
     prepared_block::realm::PsyPreparedRealmBlockStateUpdates,
     worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId,
@@ -39,10 +40,9 @@ use psy_node_core::{
 };
 
 use crate::{
-    p2p::guta_submit::GutaSubmitError,
     realm::{
         processor::{
-            consensus::{certificate_includes_proposer, form_certificate, require_nonzero_validator_tree_root, sign_vote, validate_certificate, votes_meet_wait},
+            consensus::{form_certificate, require_nonzero_validator_tree_root, sign_vote, validate_certificate, votes_meet_wait},
             core::PsyRealmProcessor,
             gatherers::realm_end_cap_gatherer::RealmGUTAEndCapGathererOutput,
         },
@@ -535,40 +535,7 @@ where
                 .await?;
         }
 
-        // Submit-gate BLS verification: mirror the Coordinator admission gate
-        // locally before the HTTP submit. The certificate must verify over the
-        // proposal identity D with checkpoint-authenticated keys, meet the
-        // replication wait, and include the scheduled proposer's vote.
         if let Some((proposal, certificate, output_bytes, worker_tag)) = p2p_submission.as_ref() {
-            let base_checkpoint_id = proposal.base_checkpoint_id;
-            let tree_rotation = self.rotation_from_validator_tree(base_checkpoint_id).await?;
-            let validator_sub_ids = tree_rotation.validator_sub_ids.as_slice();
-            let bls_public_keys = self.p2p_bls_public_keys.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "realm P2P enabled for realm {} but no BLS public keys were wired via set_realm_p2p",
-                    self.db.state.realm_id_u64
-                )
-            })?;
-            let leaf_bls_keys = validator_sub_ids
-                .iter()
-                .map(|sub_id| {
-                    bls_public_keys
-                        .get(sub_id)
-                        .copied()
-                        .map(|key| (*sub_id, key))
-                        .ok_or_else(|| anyhow::anyhow!("missing BLS key for validator Realm sub_id {sub_id}"))
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            validate_certificate(proposal, certificate, validator_sub_ids, &leaf_bls_keys)
-                .map_err(|error| anyhow::anyhow!("submit gate rejected certificate: {error}"))?;
-            anyhow::ensure!(
-                votes_meet_wait(validator_sub_ids.len(), proposal.proposer_sub_id, &certificate.signer_sub_ids()),
-                "submit gate rejected certificate: below replication wait"
-            );
-            anyhow::ensure!(
-                certificate_includes_proposer(certificate, proposal.proposer_sub_id),
-                "submit gate rejected certificate: missing scheduled proposer vote"
-            );
             let finalize_binding = RealmFinalizeBinding {
                 output: *output_bytes,
                 finalizer_worker_reward_tag: *worker_tag,
@@ -663,10 +630,11 @@ where
     /// Publish the Realm P2P Proposal + own Vote, block on votes, and form a
     /// Certificate (without submitting it to the coordinator).
     ///
-    /// This runs the Slice C sequence: epoch-of-target scheduled-proposer
-    /// check, in-band FFS encode, 410-byte actual finalizer-output encode,
-    /// proposal publish, own-vote sign + publish, blocking `wait_votes` until
-    /// `ceil(n/2)` replication, and `form_certificate`.
+    /// This runs the full P2P proposer sequence: epoch-of-target
+    /// scheduled-proposer check, in-band FFS encode, 410-byte actual
+    /// finalizer-output encode, proposal publish, own-vote sign + publish,
+    /// blocking `wait_votes` until `ceil(n/2)` replication, and
+    /// `form_certificate`.
     async fn publish_realm_p2p_proposal(
         &mut self,
         root_job_id: &QProvingJobDataID,
@@ -674,35 +642,37 @@ where
         rewards_root: N::QHash,
         state_updates: &PsyPreparedRealmBlockStateUpdates<N::QHash>,
     ) -> anyhow::Result<Option<(Proposal, Certificate, [u8; 410], [u8; 32])>> {
-        let (cmds, rotation) = (
-            self.p2p.as_ref().expect("p2p handle checked by caller"),
-            self.rotation.as_ref().expect("rotation checked by caller"),
-        );
+        let cmds = self.p2p.as_ref().expect("p2p handle checked by caller");
         let bls_secret = self.bls_secret.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "realm P2P enabled for realm {} but no BLS secret key was wired via set_realm_p2p",
                 self.db.state.realm_id_u64
             )
         })?;
-        let (output_bytes, base_checkpoint_id, validator_tree_root, worker_tag) = self
+        let (output_bytes, base_checkpoint_id, validator_tree_root, worker_tag, output_validator_user_id) = self
             .build_p2p_finalize_output(root_job_id, rewards_root)
             .await?;
         let target = base_checkpoint_id
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("GUTA Proposal proof-base checkpoint overflow"))?;
-        if !self.is_scheduled_proposer_for_base(base_checkpoint_id).await? {
-            return Err(GutaSubmitError::retryable(
-                RealmFinalizeSubmitCode::NotScheduledProposer,
-                format!(
-                    "local realm_sub_id {} is not the scheduled proposer for T={} (base={})",
-                    self.db.state.realm_sub_id_u64,
-                    target,
-                    base_checkpoint_id
-                ),
-            ).into());
-        }
+
         let local_sub_id = self.db.state.realm_sub_id_u64 as u16;
-        let epoch = parth_common::realm_rotation::epoch(target, rotation.checkpoints_per_epoch);
+        let (validator_sub_ids, leaf_bls_keys, validator_user_ids) =
+            self.load_base_checkpoint_validators(base_checkpoint_id).await?;
+        let proposer_user_id = validator_user_ids
+            .iter()
+            .find(|(sub_id, _)| *sub_id == local_sub_id)
+            .map(|(_, user_id)| *user_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "missing tree-authenticated validator user id for scheduled proposer sub_id {local_sub_id}"
+                )
+            })?;
+        anyhow::ensure!(
+            output_validator_user_id == proposer_user_id,
+            "finalize output validator_user_id {output_validator_user_id} does not match tree-authenticated proposer user {proposer_user_id} at base checkpoint {base_checkpoint_id}"
+        );
+        let epoch = parth_common::realm_rotation::epoch(target, CHECKPOINTS_PER_EPOCH);
         tracing::info!(
             "realm P2P scheduled proposer realm={} sub_id={} epoch={} target={} base={}",
             self.db.state.realm_id_u64,
@@ -737,7 +707,12 @@ where
             &proposal.proposal_id,
         );
         let own_vote = sign_vote(bls_secret, local_sub_id, &proposal);
-        cmds.publish_proposal(proposal.clone(), body).await?;
+        let remote_bls_keys = leaf_bls_keys
+            .iter()
+            .copied()
+            .filter(|(sub_id, _)| *sub_id != local_sub_id)
+            .collect();
+        cmds.publish_proposal(proposal.clone(), body, remote_bls_keys).await?;
         cmds.publish_vote(own_vote.clone()).await?;
         tracing::info!(
             "realm P2P proposal published proposal={} realm={} sub_id={} epoch={} target={} base={} validator_tree_root={}",
@@ -749,8 +724,7 @@ where
             base_checkpoint_id,
             hex::encode(proposal.validator_tree_root)
         );
-        let tree_rotation = self.rotation_from_validator_tree(base_checkpoint_id).await?;
-        let n = tree_rotation.validator_sub_ids.len();
+        let n = validator_sub_ids.len();
         let mut all_votes = vec![(own_vote.signer_sub_id, own_vote.signature)];
         let mut seen = std::collections::HashSet::from([local_sub_id]);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
@@ -761,18 +735,26 @@ where
         ) {
             let remaining_time = deadline.saturating_duration_since(tokio::time::Instant::now());
             anyhow::ensure!(!remaining_time.is_zero(), "timed out waiting for valid Realm votes");
+            let remaining = replication_threshold(n).saturating_sub(seen.len()).max(1);
             let received = cmds
-                .wait_votes(proposal.proposal_id, 1, remaining_time)
+                .wait_votes(proposal.proposal_id, remaining, remaining_time)
                 .await?;
             for vote in received {
                 if seen.contains(&vote.signer_sub_id) {
                     continue;
                 }
-                let public_key = self
-                    .p2p_bls_public_keys
-                    .as_ref()
-                    .and_then(|keys| keys.get(&vote.signer_sub_id))
-                    .ok_or_else(|| anyhow::anyhow!("missing BLS key for Realm vote signer {}", vote.signer_sub_id))?;
+                let Some(public_key) = leaf_bls_keys
+                    .iter()
+                    .find(|(sub_id, _)| *sub_id == vote.signer_sub_id)
+                    .map(|(_, key)| key)
+                else {
+                    tracing::warn!(
+                        "dropped Realm vote from non-validator proposal={} signer_sub_id={}",
+                        hex::encode(proposal.proposal_id),
+                        vote.signer_sub_id
+                    );
+                    continue;
+                };
                 if let Err(error) = vote.signature.verify_vote(&message, public_key) {
                     tracing::warn!(
                         "dropped invalid Realm vote proposal={} signer_sub_id={} error={}",
@@ -795,24 +777,7 @@ where
             }
         }
         let certificate = form_certificate(&proposal, &all_votes)?;
-        let validator_sub_ids = tree_rotation.validator_sub_ids.as_slice();
-        let bls_public_keys = self.p2p_bls_public_keys.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "realm P2P enabled for realm {} but no BLS public keys were wired via set_realm_p2p",
-                self.db.state.realm_id_u64
-            )
-        })?;
-        let leaf_bls_keys = validator_sub_ids
-            .iter()
-            .map(|sub_id| {
-                bls_public_keys
-                    .get(sub_id)
-                    .copied()
-                    .map(|key| (*sub_id, key))
-                    .ok_or_else(|| anyhow::anyhow!("missing BLS key for validator Realm sub_id {sub_id}"))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        validate_certificate(&proposal, &certificate, validator_sub_ids, &leaf_bls_keys)?;
+        validate_certificate(&proposal, &certificate, &validator_sub_ids, &leaf_bls_keys)?;
         let signer_ids = all_votes.iter().map(|(sub_id, _)| *sub_id).collect::<Vec<_>>();
         tracing::info!(
             "realm P2P certificate formed proposal={} realm={} target={} epoch={} signers={:?} verified_votes={}",
@@ -826,31 +791,26 @@ where
         Ok(Some((proposal, certificate, output_bytes, worker_tag)))
     }
 
-    async fn rotation_from_validator_tree(
+    async fn load_base_checkpoint_validators(
         &self,
         checkpoint_id: u64,
-    ) -> anyhow::Result<parth_common::realm_rotation::RealmRotationConfig>
+    ) -> anyhow::Result<(
+        Vec<u16>,
+        Vec<(u16, psy_data::p2p::BlsPublicKey)>,
+        Vec<(u16, u64)>,
+    )>
     where
         N::HasherBase: MerkleZeroHasher<N::QHash>,
     {
-        let period = self
-            .rotation
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("rotation config missing while loading validator tree"))?
-            .checkpoints_per_epoch;
         let roots = self.db.db.get_checkpoint_global_state_roots(checkpoint_id).await?;
-        let (validator_sub_ids, _, _) = load_realm_validators_from_tree::<N::HasherBase, N::QHash, _>(
+        load_realm_validators_from_tree::<N::HasherBase, N::QHash, _>(
             &*self.db.db,
             self.db.state.chain_id,
             checkpoint_id,
             self.db.state.realm_id_u64 as u32,
             &roots.validator_tree_root,
         )
-        .await?;
-        Ok(parth_common::realm_rotation::RealmRotationConfig {
-            checkpoints_per_epoch: period,
-            validator_sub_ids,
-        })
+        .await
     }
 
     async fn is_scheduled_proposer_for_base(&self, base_checkpoint_id: u64) -> anyhow::Result<bool> {
@@ -863,9 +823,13 @@ where
         let target = base_checkpoint_id
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("GUTA Proposal proof-base checkpoint overflow"))?;
-        let tree_rotation = self.rotation_from_validator_tree(base_checkpoint_id).await?;
-        let epoch = parth_common::realm_rotation::epoch(target, tree_rotation.checkpoints_per_epoch);
-        let anchor_id = parth_common::realm_rotation::anchor_checkpoint_id(epoch, tree_rotation.checkpoints_per_epoch);
+        let (validator_sub_ids, _, _) = self.load_base_checkpoint_validators(base_checkpoint_id).await?;
+        let tree_rotation = parth_common::realm_rotation::RealmRotationConfig {
+            checkpoints_per_epoch: CHECKPOINTS_PER_EPOCH,
+            validator_sub_ids,
+        };
+        let epoch = parth_common::realm_rotation::epoch(target, CHECKPOINTS_PER_EPOCH);
+        let anchor_id = parth_common::realm_rotation::anchor_checkpoint_id(epoch, CHECKPOINTS_PER_EPOCH);
         let anchor_leaf = self.db.db.get_checkpoint_leaf_data(anchor_id).await?;
         let seed_felts = anchor_leaf.stats.random_seed.to_4_felts();
         let anchor_seed = [
@@ -894,7 +858,7 @@ where
         &self,
         root_job_id: &QProvingJobDataID,
         rewards_root: N::QHash,
-    ) -> anyhow::Result<([u8; 410], u64, [u8; 32], [u8; 32])> {
+    ) -> anyhow::Result<([u8; 410], u64, [u8; 32], [u8; 32], u64)> {
         let unique_pending_id = self.db.state.processing_unique_pending_id;
         let metadata = self
             .db
@@ -954,6 +918,7 @@ where
             base_checkpoint_id,
             validator_tree_root,
             worker_tag.into_owned_32bytes(),
+            output.validator_user_id.to_u64_value(),
         ))
     }
 }

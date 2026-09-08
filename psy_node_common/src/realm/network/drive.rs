@@ -16,8 +16,8 @@ use libp2p::request_response::{
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId};
 use psy_data::p2p::{
-    DirectBodyRequest, DirectBodyResponse, EndCapForwardResponse, NodeId, Proposal, ProposalPart,
-    ProtocolEncode, Vote,
+    vote_message, BlsPublicKey, DirectBodyRequest, DirectBodyResponse, EndCapForwardResponse,
+    EndCapRejectReason, NodeId, Proposal, ProposalPart, ProtocolEncode, Vote,
     DIRECT_REQUEST_MAX_BYTES, MAINTENANCE_TICK_SECS, MAX_PROPOSAL_CHUNK_BYTES,
     RANGE_REQUEST_RETRY_INTERVAL_SECS,
 };
@@ -34,6 +34,11 @@ struct VoteWaiter {
     response: oneshot::Sender<Result<Vec<Vote>, NetworkError>>,
 }
 
+struct ProposalVoteAuth {
+    vote_message: Vec<u8>,
+    leaf_bls_keys: Vec<(u16, BlsPublicKey)>,
+}
+
 struct DriveState {
     published_bodies: HashMap<[u8; 32], (Proposal, Vec<u8>)>,
     proposal_source: HashMap<[u8; 32], PeerId>,
@@ -43,6 +48,7 @@ struct DriveState {
     >,
     inbound_body: HashMap<InboundRequestId, ResponseChannel<DirectBodyResponse>>,
     pending_direct: HashMap<OutboundRequestId, [u8; 32]>,
+    vote_auth: HashMap<[u8; 32], ProposalVoteAuth>,
     vote_backlog: HashMap<[u8; 32], Vec<Vote>>,
     vote_waiters: Vec<VoteWaiter>,
     end_cap_replies: FuturesUnordered<
@@ -58,6 +64,7 @@ impl DriveState {
             pending_end_cap: HashMap::new(),
             inbound_body: HashMap::new(),
             pending_direct: HashMap::new(),
+            vote_auth: HashMap::new(),
             vote_backlog: HashMap::new(),
             vote_waiters: Vec::new(),
             end_cap_replies: FuturesUnordered::new(),
@@ -100,7 +107,8 @@ impl RealmNetwork {
                     self.handle_swarm_event(event, &mut state);
                 }
                 Some((channel, reply)) = state.end_cap_replies.next() => {
-                    let response = reply.unwrap_or_else(|| EndCapForwardResponse::new(false));
+                    let response =
+                        reply.unwrap_or_else(|| EndCapForwardResponse::rejected(EndCapRejectReason::Busy));
                     if self
                         .swarm
                         .behaviour_mut()
@@ -147,8 +155,10 @@ impl RealmNetwork {
             RealmNetworkCommand::PublishProposal {
                 proposal,
                 body,
+                leaf_bls_keys,
                 response,
             } => {
+                register_proposal_vote_auth(state, &proposal, leaf_bls_keys);
                 let result = publish_proposal_parts(
                     &mut self.swarm,
                     self.realm_id,
@@ -159,6 +169,9 @@ impl RealmNetwork {
                     state
                         .published_bodies
                         .insert(proposal.proposal_id, (proposal, body));
+                } else {
+                    state.vote_auth.remove(&proposal.proposal_id);
+                    state.vote_backlog.remove(&proposal.proposal_id);
                 }
                 let _ = response.send(result);
             }
@@ -208,9 +221,16 @@ impl RealmNetwork {
                     let _ = response.send(Err(error));
                     return;
                 }
+                if !state.vote_auth.contains_key(&proposal_id) {
+                    let _ = response.send(Err(NetworkError::Rejected(
+                        "wait_votes has no registered vote verification context".into(),
+                    )));
+                    return;
+                }
                 let votes = state.vote_backlog.remove(&proposal_id).unwrap_or_default();
                 if votes.len() >= threshold {
                     let _ = response.send(Ok(votes));
+                    clear_vote_auth_if_idle(state, proposal_id);
                     return;
                 }
                 let seen = votes.iter().map(|vote| vote.signer_sub_id).collect();
@@ -249,6 +269,15 @@ impl RealmNetwork {
                 } else if message.topic == vote_hash {
                     match Vote::decode_exact(&message.data) {
                         Ok(vote) => {
+                            if !feed_vote_waiters(state, &vote) {
+                                tracing::debug!(
+                                    realm_id = self.realm_id,
+                                    proposal = %hex::encode(vote.proposal_id),
+                                    signer_sub_id = vote.signer_sub_id,
+                                    "dropped unauthenticated Realm vote"
+                                );
+                                return;
+                            }
                             tracing::info!(
                                 "realm P2P vote received proposal={} signer_sub_id={} realm={} source={:?}",
                                 hex::encode(vote.proposal_id),
@@ -256,7 +285,6 @@ impl RealmNetwork {
                                 self.realm_id,
                                 source
                             );
-                            feed_vote_waiters(state, &vote);
                             let _ = self.event_tx.try_send(RealmNetworkEvent::VoteReceived {
                                 source,
                                 vote,
@@ -372,7 +400,7 @@ impl RealmNetwork {
                     let Ok(source) = NodeId::from_peer_id(&peer) else {
                         let _ = self.swarm.behaviour_mut().end_cap_forward.send_response(
                             channel,
-                            EndCapForwardResponse::new(false),
+                            EndCapForwardResponse::rejected(EndCapRejectReason::Invalid),
                         );
                         return;
                     };
@@ -390,7 +418,10 @@ impl RealmNetwork {
                             .swarm
                             .behaviour_mut()
                             .end_cap_forward
-                            .send_response(channel, EndCapForwardResponse::new(false));
+                            .send_response(
+                                channel,
+                                EndCapForwardResponse::rejected(EndCapRejectReason::Busy),
+                            );
                         return;
                     }
                     state.end_cap_replies.push(async move {
@@ -526,17 +557,18 @@ impl RealmNetwork {
         let mut expired = Vec::new();
         state.vote_waiters.retain_mut(|waiter| {
             if now >= waiter.deadline {
-                expired.push(std::mem::replace(
-                    &mut waiter.response,
-                    oneshot::channel().0,
+                expired.push((
+                    waiter.proposal_id,
+                    std::mem::replace(&mut waiter.response, oneshot::channel().0),
                 ));
                 false
             } else {
                 true
             }
         });
-        for response in expired {
+        for (proposal_id, response) in expired {
             let _ = response.send(Err(NetworkError::Timeout("wait_votes".into())));
+            clear_vote_auth_if_idle(state, proposal_id);
         }
 
         let retry = Duration::from_secs(RANGE_REQUEST_RETRY_INTERVAL_SECS);
@@ -646,7 +678,56 @@ fn sha_body_hash(body: &[u8]) -> [u8; 32] {
     psy_data::p2p::sha256(body)
 }
 
-fn feed_vote_waiters(state: &mut DriveState, vote: &Vote) {
+fn register_proposal_vote_auth(
+    state: &mut DriveState,
+    proposal: &Proposal,
+    leaf_bls_keys: Vec<(u16, BlsPublicKey)>,
+) {
+    let leaf_bls_keys = leaf_bls_keys
+        .into_iter()
+        .filter(|(sub_id, _)| *sub_id != proposal.proposer_sub_id)
+        .collect();
+    state.vote_auth.insert(
+        proposal.proposal_id,
+        ProposalVoteAuth {
+            vote_message: vote_message(
+                proposal.chain_id,
+                proposal.realm_id,
+                &proposal.validator_tree_root,
+                &proposal.proposal_id,
+            ),
+            leaf_bls_keys,
+        },
+    );
+}
+
+fn vote_is_authenticated(state: &DriveState, vote: &Vote) -> bool {
+    let Some(auth) = state.vote_auth.get(&vote.proposal_id) else {
+        return false;
+    };
+    let Some(public_key) = auth
+        .leaf_bls_keys
+        .iter()
+        .find(|(sub_id, _)| *sub_id == vote.signer_sub_id)
+        .map(|(_, key)| key)
+    else {
+        return false;
+    };
+    vote.signature.verify_vote(&auth.vote_message, public_key).is_ok()
+}
+
+fn clear_vote_auth_if_idle(state: &mut DriveState, proposal_id: [u8; 32]) {
+    if state.vote_waiters.iter().any(|waiter| waiter.proposal_id == proposal_id) {
+        return;
+    }
+    state.vote_auth.remove(&proposal_id);
+    state.vote_backlog.remove(&proposal_id);
+}
+
+fn feed_vote_waiters(state: &mut DriveState, vote: &Vote) -> bool {
+    if !vote_is_authenticated(state, vote) {
+        return false;
+    }
     let mut delivered = false;
     let mut completed = Vec::new();
     for (index, waiter) in state.vote_waiters.iter_mut().enumerate() {
@@ -665,10 +746,16 @@ fn feed_vote_waiters(state: &mut DriveState, vote: &Vote) {
             votes.push(vote.clone());
         }
     }
+    let mut completed_ids = Vec::new();
     for index in completed.into_iter().rev() {
         let waiter = state.vote_waiters.remove(index);
+        completed_ids.push(waiter.proposal_id);
         let _ = waiter.response.send(Ok(waiter.votes));
     }
+    for proposal_id in completed_ids {
+        clear_vote_auth_if_idle(state, proposal_id);
+    }
+    true
 }
 
 
@@ -702,14 +789,15 @@ fn resolve_proposal_ready_source(source_peer: Option<&PeerId>) -> Option<NodeId>
 /// so nothing is sent here.
 #[allow(dead_code)]
 fn end_cap_reject_response(delivered: Result<(), ()>) -> Option<EndCapForwardResponse> {
-    delivered.err().map(|()| EndCapForwardResponse::new(false))
+    delivered
+        .err()
+        .map(|()| EndCapForwardResponse::rejected(EndCapRejectReason::Busy))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use libp2p_identity::Keypair;
-
     #[test]
     fn resolve_proposal_ready_source_returns_recorded_source() {
         let keypair = Keypair::generate_ed25519();
@@ -745,6 +833,7 @@ mod tests {
         assert_eq!(end_cap_reject_response(Ok(())), None);
         let rejected = end_cap_reject_response(Err(())).expect("failure yields a response");
         assert!(!rejected.is_accepted());
+        assert_eq!(rejected.reject_reason(), EndCapRejectReason::Busy);
     }
 
     #[test]
@@ -752,5 +841,154 @@ mod tests {
         assert!(validate_wait_votes_threshold(0).is_err());
         assert!(validate_wait_votes_threshold(1).is_ok());
         assert!(validate_wait_votes_threshold(7).is_ok());
+    }
+
+    fn bls_secret(seed: u8) -> psy_data::p2p::BlsSecretKey {
+        psy_data::p2p::BlsSecretKey::key_gen(&[seed; 32]).expect("bls ikm")
+    }
+
+    fn test_proposal(proposal_id: [u8; 32]) -> Proposal {
+        Proposal {
+            chain_id: 1,
+            realm_id: 7,
+            base_checkpoint_id: 10,
+            proposer_sub_id: 1,
+            validator_tree_root: [9u8; 32],
+            proposal_id,
+            public_output_hash: [0u8; 32],
+            finalizer_proof_hash: [0u8; 32],
+            backup_hash: [0u8; 32],
+            body_hash: [0u8; 32],
+        }
+    }
+
+    fn signed_vote(
+        secret: &psy_data::p2p::BlsSecretKey,
+        proposal: &Proposal,
+        signer_sub_id: u16,
+        message: &[u8],
+    ) -> Vote {
+        Vote {
+            proposal_id: proposal.proposal_id,
+            signer_sub_id,
+            signature: secret.sign_vote(message),
+        }
+    }
+
+    #[test]
+    fn invalid_signature_with_real_sub_id_cannot_suppress_later_valid_vote() {
+        let mut state = DriveState::new();
+        let proposal = test_proposal([0x11; 32]);
+        let secret = bls_secret(1);
+        let remote_sub_id = 2;
+        let leaf_bls_keys = vec![(remote_sub_id, secret.public_key())];
+        let canonical = vote_message(
+            proposal.chain_id,
+            proposal.realm_id,
+            &proposal.validator_tree_root,
+            &proposal.proposal_id,
+        );
+        let garbage = signed_vote(&secret, &proposal, remote_sub_id, b"not-the-vote-message");
+        let valid = signed_vote(&secret, &proposal, remote_sub_id, &canonical);
+
+        assert!(!feed_vote_waiters(&mut state, &garbage));
+        assert!(state.vote_backlog.is_empty());
+
+        register_proposal_vote_auth(&mut state, &proposal, leaf_bls_keys);
+        let (response, mut result) = oneshot::channel();
+        state.vote_waiters.push(VoteWaiter {
+            proposal_id: proposal.proposal_id,
+            threshold: 1,
+            deadline: Instant::now() + Duration::from_secs(60),
+            votes: Vec::new(),
+            seen: HashSet::new(),
+            response,
+        });
+        assert!(!feed_vote_waiters(&mut state, &garbage));
+        assert!(state.vote_waiters[0].seen.is_empty());
+        assert!(state.vote_backlog.is_empty());
+        assert!(feed_vote_waiters(&mut state, &valid));
+        let votes = result.try_recv().expect("waiter completed").expect("votes");
+        assert_eq!(votes, vec![valid]);
+        assert!(state.vote_waiters.is_empty());
+        assert!(state.vote_auth.get(&proposal.proposal_id).is_none());
+    }
+
+    #[test]
+    fn proposer_or_unknown_sub_id_cannot_complete_waiter() {
+        let mut state = DriveState::new();
+        let proposal = test_proposal([0x22; 32]);
+        let proposer = bls_secret(2);
+        let remote = bls_secret(3);
+        register_proposal_vote_auth(
+            &mut state,
+            &proposal,
+            vec![
+                (proposal.proposer_sub_id, proposer.public_key()),
+                (2, remote.public_key()),
+            ],
+        );
+        let canonical = vote_message(
+            proposal.chain_id,
+            proposal.realm_id,
+            &proposal.validator_tree_root,
+            &proposal.proposal_id,
+        );
+        let (response, mut result) = oneshot::channel();
+        state.vote_waiters.push(VoteWaiter {
+            proposal_id: proposal.proposal_id,
+            threshold: 1,
+            deadline: Instant::now() + Duration::from_secs(60),
+            votes: Vec::new(),
+            seen: HashSet::new(),
+            response,
+        });
+        assert!(!feed_vote_waiters(
+            &mut state,
+            &signed_vote(&proposer, &proposal, proposal.proposer_sub_id, &canonical)
+        ));
+        assert!(!feed_vote_waiters(
+            &mut state,
+            &signed_vote(&bls_secret(4), &proposal, 99, &canonical)
+        ));
+        assert!(state.vote_waiters[0].seen.is_empty());
+        assert!(state.vote_backlog.is_empty());
+        assert!(result.try_recv().is_err());
+        assert!(state.vote_auth.contains_key(&proposal.proposal_id));
+        let remote_vote = signed_vote(&remote, &proposal, 2, &canonical);
+        assert!(feed_vote_waiters(&mut state, &remote_vote));
+        let votes = result.try_recv().expect("waiter completed").expect("votes");
+        assert_eq!(votes, vec![remote_vote]);
+    }
+
+    #[test]
+    fn valid_vote_reaches_waiter_threshold() {
+        let mut state = DriveState::new();
+        let proposal = test_proposal([0x33; 32]);
+        let secret = bls_secret(4);
+        let remote_sub_id = 2;
+        register_proposal_vote_auth(&mut state, &proposal, vec![(remote_sub_id, secret.public_key())]);
+        let canonical = vote_message(
+            proposal.chain_id,
+            proposal.realm_id,
+            &proposal.validator_tree_root,
+            &proposal.proposal_id,
+        );
+        let valid = signed_vote(&secret, &proposal, remote_sub_id, &canonical);
+        let (response, mut result) = oneshot::channel();
+        state.vote_waiters.push(VoteWaiter {
+            proposal_id: proposal.proposal_id,
+            threshold: 1,
+            deadline: Instant::now() + Duration::from_secs(60),
+            votes: Vec::new(),
+            seen: HashSet::new(),
+            response,
+        });
+        assert!(feed_vote_waiters(&mut state, &valid));
+        let votes = result.try_recv().expect("waiter completed").expect("votes");
+        assert_eq!(votes, vec![valid]);
+        assert!(state.vote_waiters.is_empty());
+        assert!(state.vote_auth.get(&proposal.proposal_id).is_none());
+        assert!(state.vote_backlog.get(&proposal.proposal_id).is_none());
     }
 }

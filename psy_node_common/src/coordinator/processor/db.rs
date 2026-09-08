@@ -391,7 +391,11 @@ impl<
         tracing::info!("[COORD_INIT] temp db unique ids set");
 
         temp_db
-            .set_gathering_unique_pending_ids(&realm_identifier, current_unique_pending_id, current_core_proc_unique_pending_id)
+            .set_gathering_generation(&realm_identifier, psy_node_core::psy_temp_db::GatheringGeneration {
+                checkpoint_id: ids.checkpoint_id,
+                unique_pending_id: ids.gathering_unique_pending_id,
+                proc_checkpoint_unique_id: ids.gathering_proc_checkpoint_unique_id,
+            })
             .await?;
         tracing::info!("[COORD_INIT] temp db gathering unique ids set");
         let last_committed_l2_state = shared_status.block_state.clone();
@@ -750,7 +754,11 @@ checkpoint_backup_copy_status={}
             .set_unique_pending_ids(&self.ids.realm_identifier, unique_pending_id, proc_checkpoint_unique_id)
             .await?;
         self.temp_db
-            .set_gathering_unique_pending_ids(&self.ids.realm_identifier, unique_pending_id, proc_checkpoint_unique_id)
+            .set_gathering_generation(&self.ids.realm_identifier, psy_node_core::psy_temp_db::GatheringGeneration {
+                checkpoint_id: self.ids.checkpoint_id,
+                unique_pending_id: self.ids.gathering_unique_pending_id,
+                proc_checkpoint_unique_id: self.ids.gathering_proc_checkpoint_unique_id,
+            })
             .await?;
         self.shared_status
             .update_status(unique_pending_id, checkpoint_id, checkpoint_leaf, checkpoint_state_roots, l2_state, true)?;
@@ -852,7 +860,11 @@ checkpoint_backup_copy_status={}
         self.ids.gathering_proc_checkpoint_unique_id = new_core_proc_unique_pending_id;
 
         // 5. Update temp_db
-        self.temp_db.set_gathering_unique_pending_ids(&self.ids.realm_identifier, self.ids.gathering_unique_pending_id, self.ids.gathering_proc_checkpoint_unique_id).await?;
+        self.temp_db.set_gathering_generation(&self.ids.realm_identifier, psy_node_core::psy_temp_db::GatheringGeneration {
+            checkpoint_id: self.ids.next_checkpoint_id,
+            unique_pending_id: self.ids.gathering_unique_pending_id,
+            proc_checkpoint_unique_id: self.ids.gathering_proc_checkpoint_unique_id,
+        }).await?;
         self.temp_db.set_unique_pending_ids(&self.ids.realm_identifier, self.ids.unique_pending_id, self.ids.proc_checkpoint_unique_id).await?;
 
 

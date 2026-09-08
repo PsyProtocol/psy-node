@@ -4,30 +4,22 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 
-use parth_common::realm_rotation::RealmRotationConfig;
 use parth_core::{
-    crypto::hash::traits::QFieldHashable,
-    protocol::core_types::{QNetworkTypesConfig, QZKProofVerifier},
+    crypto::hash::traits::MerkleZeroHasher,
+    protocol::core_types::{Q256BitHash, QNetworkTypesConfig},
 };
 use psy_config::CHECKPOINTS_PER_EPOCH;
-use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
+use psy_core::job::job_id::QProvingJobDataID;
 use psy_core::constants::chain_id::PsyChainNetworkType;
 use psy_data::{
-    genesis::genesis_block_setup::{GenesisValidator, PsyGenesisBlockSetupData},
-    guta::{
-        header_extended::{
-            GlobalUserTreeAggregatorHeaderWithTagValue,
-            GlobalUserTreeAggregatorHeaderWithTagValueAndJobType,
-        },
-        realm_finalize::protocol_decode_finalize_output,
-    },
+    genesis::genesis_block_setup::PsyGenesisBlockSetupData,
     p2p::{
-        BlsPublicKey, EndCapForwardHeader, EndCapForwardResponse, NodeId,
+        BlsPublicKey, EndCapForwardHeader, EndCapForwardResponse, EndCapRejectReason, NodeId,
         MAX_VALIDATORS_PER_REALM, MIN_VALIDATORS_PER_REALM,
     },
 };
 use psy_node_common::{
-    coordinator::genesis_validators::{index_from_genesis, GenesisValidatorIndex},
+    coordinator::genesis_validators::index_from_genesis,
     realm::{
         network::{
             build_optional_realm_network, load_bls_secret_key, load_ed25519_identity_key,
@@ -36,7 +28,11 @@ use psy_node_common::{
         processor::consensus::{sign_vote, verify_proposal_submission},
     },
 };
-use psy_node_core::config::node_start_config::{RealmEdgeStartConfig, RealmProcessorStartConfig};
+use psy_node_core::{
+    config::node_start_config::{RealmEdgeStartConfig, RealmProcessorStartConfig},
+    p2p::validator_lookup::load_realm_validators_from_tree,
+    psy_core_db::traits::full::PsyRealmProcessorStore,
+};
 use serde::Deserialize;
 
 #[derive(Clone, Deserialize)]
@@ -295,58 +291,8 @@ fn bootnodes_without_local_peer(
 }
 
 
-/// Build the coordinator-facing genesis validator index from public network values.
-pub fn genesis_validator_index_from_network_config(
-    network_type: PsyChainNetworkType,
-) -> anyhow::Result<(GenesisValidatorIndex, u64)> {
-    let network = load_selected_network(network_type)?;
-    let mut index = GenesisValidatorIndex::new();
-    let mut user_ids = HashSet::new();
-    let mut node_ids = HashSet::new();
-    let mut bls_keys = HashSet::new();
-
-    for realm in &network.realm_configs {
-        if realm.validators.is_empty() {
-            continue;
-        }
-        validate_realm_validator_count(realm.id, realm.validators.len())?;
-        for (position, validator) in realm.validators.iter().enumerate() {
-            let sub_id = validator_sub_id(position)?;
-            let description = format!("Realm {} validator sub {sub_id}", realm.id);
-            let node_id = parse_node_id(&validator.processor_node_id, &description)?;
-            let bls_public_key = parse_bls_key(&validator.bls_public_key, &description)?;
-            anyhow::ensure!(
-                user_ids.insert(validator.validator_user_id),
-                "duplicate validator_user_id {}",
-                validator.validator_user_id
-            );
-            anyhow::ensure!(node_ids.insert(*node_id.as_raw()), "duplicate public NodeId");
-            anyhow::ensure!(
-                bls_keys.insert(bls_public_key.to_bytes()),
-                "duplicate validator BLS public key"
-            );
-            for edge in &validator.edge_nodes {
-                let edge_id = parse_node_id(&edge.node_id, &format!("{description} edge"))?;
-                anyhow::ensure!(node_ids.insert(*edge_id.as_raw()), "duplicate public NodeId");
-            }
-            let genesis_validator = GenesisValidator {
-                realm_id: realm.id,
-                validator_user_id: validator.validator_user_id,
-                node_id: *node_id.as_raw(),
-                bls_public_key: bls_public_key.to_bytes(),
-            };
-            anyhow::ensure!(
-                index.insert((realm.id, sub_id), genesis_validator).is_none(),
-                "duplicate validator slot for Realm {} sub {sub_id}",
-                realm.id
-            );
-        }
-    }
-    Ok((index, CHECKPOINTS_PER_EPOCH))
-}
-
 /// Construct a processor Realm network from local keys/listen and public membership.
-pub fn maybe_build_processor_network(
+pub fn build_processor_network(
     config: &RealmProcessorStartConfig,
     chain_id: u64,
 ) -> anyhow::Result<OptionalRealmNetwork> {
@@ -378,7 +324,7 @@ pub fn maybe_build_processor_network(
 pub fn maybe_build_edge_network(
     config: &RealmEdgeStartConfig,
     chain_id: u64,
-) -> anyhow::Result<(OptionalRealmNetwork, HashMap<u16, NodeId>, HashSet<NodeId>, RealmRotationConfig)> {
+) -> anyhow::Result<(OptionalRealmNetwork, HashMap<u16, NodeId>, HashSet<NodeId>)> {
     let identity = config
         .p2p_identity_key_path
         .as_deref()
@@ -401,8 +347,7 @@ pub fn maybe_build_edge_network(
         &public.validator_sub_ids,
         CHECKPOINTS_PER_EPOCH,
     )?;
-    let rotation = built.rotation.clone();
-    Ok((built, public.proposer_edge_node_ids, public.realm_edge_node_ids, rotation))
+    Ok((built, public.proposer_edge_node_ids, public.realm_edge_node_ids))
 }
 
 /// Resolve the processor's one-based validator position from its local Ed25519 identity.
@@ -459,10 +404,10 @@ pub fn resolve_edge_sub_id(config: &RealmEdgeStartConfig) -> anyhow::Result<u16>
 }
 
 /// Validate the local processor identity and BLS key against public config and Genesis.
-pub fn processor_validator_data<F, Hash>(
+pub fn validate_processor_identity<F, Hash>(
     config: &RealmProcessorStartConfig,
     genesis: &PsyGenesisBlockSetupData<F, Hash>,
-) -> anyhow::Result<(u16, u64, HashMap<u16, BlsPublicKey>)> {
+) -> anyhow::Result<u16> {
     let derived_sub_id = resolve_processor_sub_id(config)?;
     let identity_path = config
         .p2p_identity_key_path
@@ -543,22 +488,21 @@ pub fn processor_validator_data<F, Hash>(
         "local BLS secret public key does not match public config and Genesis for sub {derived_sub_id}"
     );
 
-    Ok((
-        derived_sub_id,
-        genesis_validator.validator_user_id,
-        public.bls_public_keys,
-    ))
+    Ok(derived_sub_id)
 }
 
 /// Drive loop plus processor event consumer. Non-proposers validate and vote.
-pub fn spawn_processor_realm_network<N>(
+pub fn spawn_processor_realm_network<N, S>(
     built: OptionalRealmNetwork,
     config: &RealmProcessorStartConfig,
     local_sub_id: u16,
+    validator_store: Arc<S>,
     proof_verifier: N::ZKVerifier,
     verified_state_updates: tokio::sync::mpsc::Sender<Vec<u8>>,
 ) where
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
+    S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync + 'static,
+    N::HasherBase: MerkleZeroHasher<N::QHash>,
     N::ZKVerifier: 'static,
 {
     let OptionalRealmNetwork {
@@ -571,8 +515,6 @@ pub fn spawn_processor_realm_network<N>(
     let chain_id = config.network.get_chain_id();
     let public = realm_public_data(config.network, realm_id)
         .expect("processor Realm P2P public config was validated at startup");
-    let (validator_index, _) = genesis_validator_index_from_network_config(config.network)
-        .expect("network validator config was validated at startup");
     let proof_verifier = Arc::new(proof_verifier);
     let commands = handle.commands();
     let mut events = handle.into_parts().1;
@@ -599,22 +541,32 @@ pub fn spawn_processor_realm_network<N>(
                             public.validator_processor_node_ids.get(&proposal.proposer_sub_id) == Some(&source),
                             "Proposal source NodeId does not match configured proposer"
                         );
-                        let decoded = psy_node_common::realm::processor::consensus::decode_proposal_body(
-                            &proposal,
-                            body.as_bytes(),
-                        ).map_err(|error| anyhow::anyhow!("invalid Proposal body: {error}"))?;
-                        let output = protocol_decode_finalize_output::<N::F, N::QHash>(&decoded.output)
-                            .map_err(|error| anyhow::anyhow!("invalid Realm finalize output: {error}"))?;
-                        let proposer = validator_index
-                            .get(&(proposal.realm_id, proposal.proposer_sub_id))
+                        let roots = validator_store
+                            .get_checkpoint_global_state_roots(proposal.base_checkpoint_id)
+                            .await?;
+                        let (_, _, user_ids) = load_realm_validators_from_tree::<N::HasherBase, N::QHash, _>(
+                            validator_store.as_ref(),
+                            chain_id,
+                            proposal.base_checkpoint_id,
+                            realm_id,
+                            &roots.validator_tree_root,
+                        )
+                        .await?;
+                        anyhow::ensure!(
+                            proposal.validator_tree_root == roots.validator_tree_root.into_owned_32bytes(),
+                            "Proposal validator_tree_root does not match proof-base checkpoint"
+                        );
+                        let proposer_user_id = user_ids
+                            .iter()
+                            .find_map(|&(sub_id, user_id)| (sub_id == proposal.proposer_sub_id).then_some(user_id))
                             .ok_or_else(|| anyhow::anyhow!(
-                                "GUTA proposer sub_id {} has no genesis validator",
+                                "GUTA proposer sub_id {} has no checkpoint validator",
                                 proposal.proposer_sub_id
                             ))?;
                         let decoded = verify_proposal_submission::<N>(
                             &proposal,
                             body.as_bytes(),
-                            proposer.validator_user_id,
+                            proposer_user_id,
                             proof_verifier.as_ref(),
                         )?;
                         verified_state_updates
@@ -649,53 +601,12 @@ pub fn spawn_processor_realm_network<N>(
                     );
                 }
                 RealmNetworkEvent::EndCapReceived { reply, .. } => {
-                    let _ = reply.send(EndCapForwardResponse::new(false));
+                    let _ = reply.send(EndCapForwardResponse::rejected(EndCapRejectReason::Invalid));
                 }
                 RealmNetworkEvent::VoteReceived { .. } => {}
             }
         }
     });
-}
-
-fn infer_root_job_type<N>(
-    proof_verifier: &N::ZKVerifier,
-    submission: &GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
-    proof: &[u8],
-) -> anyhow::Result<u32>
-where
-    N: QNetworkTypesConfig,
-{
-    let expected = submission.header.qfhash::<N::HasherBase>();
-    for circuit_type in [
-        // The injected verifier resolves the finalizer and its recursive signature
-        // child from the same registered circuit library used by the coordinator.
-        ProvingJobCircuitType::RealmFinalizeGUTA,
-        ProvingJobCircuitType::GUTASingleEndCap,
-        ProvingJobCircuitType::GUTATwoEndCap,
-        ProvingJobCircuitType::GUTATwoGUTA,
-        ProvingJobCircuitType::GUTALeftEndCapRightGUTA,
-        ProvingJobCircuitType::GUTALeftGUTARightEndCap,
-        ProvingJobCircuitType::GUTAVerifyToCap,
-        ProvingJobCircuitType::GUTANoChange,
-        ProvingJobCircuitType::GUTATwoGUTAWithCheckpointUpgrade,
-        ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade,
-        ProvingJobCircuitType::GUTATwoGUTALinear,
-        ProvingJobCircuitType::GUTATwoGUTALinearUpgradeCheckpoint,
-        ProvingJobCircuitType::GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint,
-        ProvingJobCircuitType::GUTAVerifyLeftLeafRightLinearUpgradeCheckpoint,
-    ] {
-        if proof_verifier
-            .verify_zk_proof_from_slice_check_public_inputs_hash(
-                circuit_type as u32,
-                proof,
-                expected,
-            )
-            .is_ok()
-        {
-            return Ok(circuit_type as u32);
-        }
-    }
-    anyhow::bail!("Proposal proof is not a valid registered GUTA root proof (ordinary or RealmFinalizeGUTA)")
 }
 
 /// Drive loop plus edge event consumer. Inbound EndCaps are accepted locally.
@@ -800,99 +711,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn root_job_inference_verifies_registered_finalizer_and_fails_closed() {
-        use parth_core::{pgoldilocks::{PoseidonHasher, QHashOut}, protocol::core_types::QNetworkTypesConfigHelper};
-        use plonky2::{
-            field::{goldilocks_field::GoldilocksField, types::Field},
-            iop::witness::PartialWitness,
-            plonk::{circuit_builder::CircuitBuilder, circuit_data::CircuitConfig, config::PoseidonGoldilocksConfig},
-        };
-        use psy_core::network_config::PsyNetworkLocalDevnetConstants;
-        use psy_data::guta::{header::GlobalUserTreeAggregatorHeader, stats::GUTAStats, sub_tree_transition::SubTreeNodeStateTransition};
-        use psy_plonky2_circuits::{protocol_types::ZKTypesPlonky2GoldilocksPoseidon, zk_verifier::PsyPlonky2ZKVerifier};
-
-        type F = GoldilocksField;
-        type C = PoseidonGoldilocksConfig;
-        type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
-        let zero = QHashOut::from_values(0, 0, 0, 0);
-        let mut submission = GlobalUserTreeAggregatorHeaderWithTagValueAndJobType {
-            header: GlobalUserTreeAggregatorHeaderWithTagValue {
-                header: GlobalUserTreeAggregatorHeader {
-                    guta_circuit_whitelist: zero,
-                    checkpoint_tree_root: zero,
-                    state_transition: SubTreeNodeStateTransition {
-                        old_node_value: zero, new_node_value: zero,
-                        node_index: F::ZERO, node_level: F::ZERO,
-                    },
-                    stats: GUTAStats::get_zero_value(),
-                    total_aggregation_proofs_generated: F::ZERO,
-                },
-                new_tag_tree_node_value: zero,
-            },
-            job_type_u32: ProvingJobCircuitType::RealmFinalizeGUTA as u32,
-        };
-        let expected = submission.header.qfhash::<PoseidonHasher>();
-        // Small real Plonky2 circuits exercise typed registry dispatch without
-        // substituting a permissive verifier or rebuilding the recursive prover.
-        let build = |mismatch: bool| {
-            let mut builder = CircuitBuilder::<F, 2>::new(CircuitConfig::standard_recursion_config());
-            for mut value in expected.0.elements {
-                if mismatch { value += F::ONE; }
-                let target = builder.constant(value);
-                builder.register_public_input(target);
-            }
-            builder.build::<C>()
-        };
-        let matching = build(false);
-        let mismatching = build(true);
-        let proof = matching.prove(PartialWitness::new()).unwrap();
-        let bytes = bincode::serialize(&proof).unwrap();
-        let mut verifier = PsyPlonky2ZKVerifier::<C, 2>::from_cached();
-        for (circuit_type, info) in &mut verifier.gcv.library.info_map {
-            let data = if *circuit_type == ProvingJobCircuitType::RealmFinalizeGUTA {
-                &matching
-            } else {
-                &mismatching
-            };
-            info.verifier_data = (&data.verifier_only).into();
-            info.fingerprint = psy_plonky2_circuits::proof_minifier::pm_core::get_circuit_fingerprint_generic_q::<2, F, C>(&data.verifier_only);
-            verifier.gcv.common.insert_common_data(*circuit_type, data.common.clone());
-        }
-        assert_eq!(infer_root_job_type::<N>(&verifier, &submission, &bytes).unwrap(), 63);
-        for circuit_type in [
-            ProvingJobCircuitType::GUTASingleEndCap,
-            ProvingJobCircuitType::GUTATwoEndCap,
-            ProvingJobCircuitType::GUTATwoGUTA,
-            ProvingJobCircuitType::GUTALeftEndCapRightGUTA,
-            ProvingJobCircuitType::GUTALeftGUTARightEndCap,
-            ProvingJobCircuitType::GUTAVerifyToCap,
-            ProvingJobCircuitType::GUTANoChange,
-            ProvingJobCircuitType::GUTATwoGUTAWithCheckpointUpgrade,
-            ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade,
-            ProvingJobCircuitType::GUTATwoGUTALinear,
-            ProvingJobCircuitType::GUTATwoGUTALinearUpgradeCheckpoint,
-            ProvingJobCircuitType::GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint,
-            ProvingJobCircuitType::GUTAVerifyLeftLeafRightLinearUpgradeCheckpoint,
-        ] {
-            assert!(verifier.verify_zk_proof_from_slice_check_public_inputs_hash(circuit_type as u32, &bytes, expected).is_err());
-        }
-        submission.header.new_tag_tree_node_value = QHashOut::from_values(1, 0, 0, 0);
-        assert!(infer_root_job_type::<N>(&verifier, &submission, &bytes).is_err());
-        submission.header.new_tag_tree_node_value = zero;
-        let mut corrupted = proof;
-        corrupted.public_inputs[0] += F::ONE;
-        assert!(infer_root_job_type::<N>(&verifier, &submission, &bincode::serialize(&corrupted).unwrap()).is_err());
-        assert!(verifier.verify_zk_proof_from_slice_check_public_inputs_hash(u32::MAX, &bytes, expected).is_err());
-        let mut finalizer_info = verifier.gcv.library.info_map.remove(&ProvingJobCircuitType::RealmFinalizeGUTA).unwrap();
-        finalizer_info.circuit_type = ProvingJobCircuitType::WrappedSignatureProof;
-        verifier.gcv.library.info_map.insert(ProvingJobCircuitType::WrappedSignatureProof, finalizer_info);
-        verifier.gcv.common.insert_common_data(ProvingJobCircuitType::WrappedSignatureProof, matching.common);
-        assert!(verifier.verify_zk_proof_from_slice_check_public_inputs_hash(ProvingJobCircuitType::WrappedSignatureProof as u32, &bytes, expected).is_ok());
-        let error = infer_root_job_type::<N>(&verifier, &submission, &bytes).unwrap_err();
-        assert!(error.to_string().contains("not a valid registered GUTA root proof"));
-    }
 
     fn node_id(seed: u8) -> NodeId {
         let mut raw = [0u8; 38];

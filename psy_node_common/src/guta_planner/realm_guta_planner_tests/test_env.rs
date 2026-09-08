@@ -9,7 +9,8 @@ use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use parth_core::crypto::hash::traits::FieldQHasher;
 use psy_data::guta::realm_finalize::{realm_validator_leaf_hash, RealmFinalizeGUTAInput, VALIDATOR_TREE_HEIGHT};
 use psy_data::v1::qdata::checkpoint::{PQEDCheckpointLeaf, PQEDCheckpointLeafStats, PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeafCompactWithStateRoots};
-use crate::guta_planner::realm_guta_planner::RealmFinalizeGUTAIdentity;
+use crate::guta_planner::realm_guta_planner::RealmGUTAValidatorProofs;
+use psy_data::p2p::{digest_to_field_limbs, sha256, BlsPublicKey, BlsSecretKey, NodeId, ValidatorLeafPreimage};
 use psy_data::{
     guta::{header::GlobalUserTreeAggregatorHeader, stats::GUTAStats},
     proof_input::guta::{
@@ -55,6 +56,28 @@ use crate::{
 
 type N = PsyRGPNetworkConfig;
 
+/// Generates a deterministic valid Ed25519 NodeId and BLS public key from
+/// fixed seeds, advancing the seeds only until the SHA-256 digests reduce
+/// to canonical Goldilocks limbs (as realm_validator_leaf_hash requires).
+fn validator_key_fixture(node_seed: u64, bls_seed: u64) -> (NodeId, [u64; 4], BlsPublicKey, [u64; 4]) {
+    use libp2p_identity::Keypair;
+    for attempt in 0..10_000u64 {
+        let mut ed_seed = [0u8; 32];
+        ed_seed[..8].copy_from_slice(&node_seed.wrapping_add(attempt).to_le_bytes());
+        let Ok(keypair) = Keypair::ed25519_from_bytes(&mut ed_seed) else { continue };
+        let Ok(node_id) = NodeId::from_keypair(&keypair) else { continue };
+        let mut bls_ikm = [0u8; 32];
+        bls_ikm[..8].copy_from_slice(&bls_seed.wrapping_add(attempt).to_le_bytes());
+        let Ok(bls_secret) = BlsSecretKey::from_bytes(&bls_ikm) else { continue };
+        let bls_public_key = bls_secret.public_key();
+        let (Ok(node_limbs), Ok(bls_limbs)) = (
+            digest_to_field_limbs(&sha256(node_id.as_raw())),
+            digest_to_field_limbs(&sha256(bls_public_key.as_bytes())),
+        ) else { continue };
+        return (node_id, node_limbs, bls_public_key, bls_limbs);
+    }
+    panic!("no canonical limb seeds found");
+}
 #[derive(Clone)]
 pub struct RGPContractUpdate {
     pub contract_id: u32,
@@ -184,6 +207,9 @@ pub struct RGPTestChainState {
     pub guta_circuit_whitelist: Hash,
     pub first_realm_global_user_tree: RecTree,
     pub finalizer_user: RGPUser,
+    pub validator_preimage: ValidatorLeafPreimage,
+    pub validator_node_limbs: [u64; 4],
+    pub validator_bls_limbs: [u64; 4],
     pub finalizer_checkpoint_leaf: PQEDCheckpointLeaf<F, Hash>,
     pub finalizer_state_roots: PQEDCheckpointGlobalStateRoots<Hash>,
     pub finalizer_checkpoint_leaves: Vec<PQEDCheckpointLeaf<F, Hash>>,
@@ -203,6 +229,14 @@ impl RGPTestChainState {
         // Public-key field is unconstrained now; keep a stable nonzero value.
         let finalizer_user = RGPUser::new(((realm_id_u64 + 1) << N::REALM_GLOBAL_USER_TREE_HEIGHT) - 1,
             Hash::from_u64x4([101, 102, 103, 104]));
+        let (validator_node_id, validator_node_limbs, validator_bls_public_key, validator_bls_limbs) =
+            validator_key_fixture(7, 11);
+        let validator_preimage = ValidatorLeafPreimage {
+            chain_id: psy_core::constants::chain_id::PSY_CHAIN_ID_LOCAL_DEVNET,
+            realm_id: realm_id_u64 as u32, realm_sub_id: realm_sub_id_u64 as u16,
+            validator_user_id: finalizer_user.user_id,
+            node_id: *validator_node_id.as_raw(), bls_public_key: validator_bls_public_key.to_bytes(),
+        };
         let mut state = Self {
             db,
             chain_id: psy_core::constants::chain_id::PSY_CHAIN_ID_LOCAL_DEVNET,
@@ -225,6 +259,9 @@ impl RGPTestChainState {
             next_contract_id: 0,
             next_user_registration_id: 0,
             finalizer_user,
+            validator_preimage,
+            validator_node_limbs,
+            validator_bls_limbs,
             finalizer_checkpoint_leaves: Vec::new(),
             checkpoints_per_epoch: 10,
             finalizer_checkpoint_leaf: PQEDCheckpointLeaf { global_chain_root: Hash::get_zero_value(), stats: PQEDCheckpointLeafStats::get_empty_stats() },
@@ -241,7 +278,7 @@ impl RGPTestChainState {
     fn validator_tree(&self) -> RecTree {
         let mut tree = RecTree::new(VALIDATOR_TREE_HEIGHT as u8);
         tree.set_leaf((self.realm_id_u64 << 8) | self.realm_sub_id_u64, realm_validator_leaf_hash::<F, Hash, Hasher>(
-            self.finalizer_user.user_id, [21, 22, 23, 24], [31, 32, 33, 34]));
+            self.finalizer_user.user_id, self.validator_node_limbs, self.validator_bls_limbs));
         tree
     }
 
@@ -258,7 +295,7 @@ impl RGPTestChainState {
         Ok(())
     }
 
-    pub fn configure_finalizer_identity(&self, planner: RealmGUTAPlanner<F, Hash>) -> RealmGUTAPlanner<F, Hash> {
+    pub fn configure_validator_proofs(&self, mut planner: RealmGUTAPlanner<F, Hash>) -> anyhow::Result<RealmGUTAPlanner<F, Hash>> {
         let old_realm_root_proof = self.coordinator_global_user_tree.get_e_leaf(self.realm_id_u64);
         let mut validator_user_tree_proof = self.first_realm_global_user_tree.get_leaf(N::MAX_USERS_PER_REALM as u64 - 1);
         validator_user_tree_proof.index = self.finalizer_user.user_id;
@@ -267,12 +304,10 @@ impl RGPTestChainState {
         let checkpoint_tree_proof = self.checkpoint_tree.get_leaf(self.checkpoint_id);
         let epoch = (self.checkpoint_id + 1) / self.checkpoints_per_epoch;
         let anchor_id = (epoch * self.checkpoints_per_epoch).saturating_sub(1);
-        planner.with_realm_finalize_identity(RealmFinalizeGUTAIdentity {
-            validator_user_id: self.finalizer_user.user_id,
-            validator_node_id_hash_limbs: [21, 22, 23, 24], validator_bls_hash_limbs: [31, 32, 33, 34],
+        planner.current_validator_user_leaf = Some(self.finalizer_user.user_leaf.clone());
+        planner.set_validator_proofs(RealmGUTAValidatorProofs {
+            validator: self.validator_preimage.clone(),
             validator_user_leaf: self.finalizer_user.user_leaf.clone(),
-            current_validator_user_leaf: self.finalizer_user.user_leaf.clone(),
-            current_validator_user_tree_proof: self.first_realm_global_user_tree.get_leaf(N::MAX_USERS_PER_REALM as u64 - 1),
             anchor_checkpoint_leaf: self.finalizer_checkpoint_leaves[anchor_id as usize],
             anchor_checkpoint_tree_proof: self.checkpoint_tree.get_leaf(anchor_id),
             checkpoint_leaf: PQEDCheckpointLeafCompactWithStateRoots {
@@ -280,7 +315,8 @@ impl RGPTestChainState {
             },
             checkpoint_tree_proof, old_realm_root_proof,
             validator_tree_proof: self.validator_tree().get_leaf((self.realm_id_u64 << 8) | self.realm_sub_id_u64), validator_user_tree_proof,
-        })
+        })?;
+        Ok(planner)
     }
     pub fn gen_rand_contract_updates_for_ups(&self, max_num_txs: usize, max_leaves_per_tx: usize) -> anyhow::Result<Vec<RGPContractUpdate>> {
         if max_leaves_per_tx == 0 || max_num_txs == 0 {
@@ -508,7 +544,7 @@ impl RGPTestChainState {
             N::GLOBAL_USER_TREE_HEIGHT,
             self.guta_circuit_whitelist,
         );
-        realm_planner = self.configure_finalizer_identity(realm_planner);
+        realm_planner = self.configure_validator_proofs(realm_planner)?;
 
         for (user_id, ups) in user_ups_list.iter() {
             let queue_item = self.run_ups_for_user(*user_id, ups).await?;
@@ -1249,73 +1285,28 @@ async fn test_finalizer_single_endcap_dispatch_and_fee_credit() -> anyhow::Resul
 }
 
 #[tokio::test]
-async fn test_finalizer_missing_identity_fails_closed() -> anyhow::Result<()> {
+async fn test_finalizer_missing_validator_proofs_fails_closed() -> anyhow::Result<()> {
     let mut state = RGPTestChainState::create_for_tests().await?;
     let mut planner = RealmGUTAPlanner::new(state.chain_id, state.realm_identifier, state.checkpoint_tree_root,
         state.checkpoint_id, state.unique_pending_id, state.first_realm_global_user_tree.get_root(),
         N::REALM_GLOBAL_USER_TREE_HEIGHT, N::GLOBAL_USER_TREE_HEIGHT, state.guta_circuit_whitelist);
     let error = match planner.finalize_with_reward_ids(&state.checkpoint_tree, &mut state.first_realm_global_user_tree, state.temp_db.clone(), 0, 0).await {
         Err(error) => error,
-        Ok(_) => panic!("finalization without identity must fail even for an empty batch"),
+        Ok(_) => panic!("finalization without witness must fail even for an empty batch"),
     };
-    assert!(error.to_string().contains("requires complete checkpoint-bound validator identity"), "{error}");
+    assert!(error.to_string().contains("requires complete checkpoint-bound validator proofs"), "{error}");
     Ok(())
 }
 
-#[tokio::test]
-async fn retained_fee_leaf_survives_same_checkpoint_planner_reset() -> anyhow::Result<()> {
-    use psy_data::guta::{header_extended::GlobalUserTreeAggregatorHeaderWithJobId, sub_tree_transition::SubTreeNodeStateTransition};
-    let mut state = RGPTestChainState::create_for_tests().await?;
-    let mut planner = state.configure_finalizer_identity(RealmGUTAPlanner::new(
-        state.chain_id, state.realm_identifier, state.checkpoint_tree_root, state.checkpoint_id,
-        state.unique_pending_id, state.first_realm_global_user_tree.get_root(),
-        N::REALM_GLOBAL_USER_TREE_HEIGHT, N::GLOBAL_USER_TREE_HEIGHT, state.guta_circuit_whitelist));
-    let historical = planner.realm_finalize_validator_user_leaf.clone();
-    let initial_balance = planner.realm_finalize_current_validator_user_leaf.as_ref().unwrap().balance.to_u64_value();
-    for fee in [7, 11] {
-        let root = state.first_realm_global_user_tree.get_root();
-        let mut stats = GUTAStats::<F>::get_zero_value();
-        stats.da_fees_collected = F::from_u64_value(fee);
-        let header = GlobalUserTreeAggregatorHeaderWithJobId {
-            job_id: QProvingJobDataID::guta_single_end_cap_witness(planner.unique_pending_id, 0, 0, 0),
-            header: GlobalUserTreeAggregatorHeader {
-                guta_circuit_whitelist: state.guta_circuit_whitelist,
-                checkpoint_tree_root: state.checkpoint_tree_root,
-                state_transition: SubTreeNodeStateTransition { old_node_value: root, new_node_value: root,
-                    node_index: F::from_u64_value(state.realm_id_u64), node_level: F::ZERO_VALUE },
-                stats, total_aggregation_proofs_generated: F::ZERO_VALUE,
-            },
-        };
-        let retained = planner.realm_finalize_current_validator_user_leaf.clone();
-        for wrong_user in [false, true] {
-            let leaf = planner.realm_finalize_current_validator_user_leaf.as_mut().unwrap();
-            if wrong_user { leaf.user_id += F::from_u64_value(1); }
-            else { leaf.balance += F::from_u64_value(1); }
-            let error = planner.append_realm_finalize_guta::<Hasher, TempStore>(
-                &mut state.first_realm_global_user_tree, state.temp_db.clone(), header.clone()).await.unwrap_err();
-            assert!(error.to_string().contains(if wrong_user { "another user" } else { "does not match tree leaf" }));
-            assert_eq!(state.first_realm_global_user_tree.get_root(), root);
-            planner.realm_finalize_current_validator_user_leaf = retained.clone();
-        }
-        planner.append_realm_finalize_guta::<Hasher, TempStore>(&mut state.first_realm_global_user_tree,
-            state.temp_db.clone(), header).await?;
-        let current = planner.realm_finalize_current_validator_user_leaf.as_ref().unwrap();
-        assert_eq!(state.first_realm_global_user_tree.get_leaf(N::MAX_USERS_PER_REALM as u64 - 1).value, current.qfhash::<Hasher>());
-        planner.restart_cycle(planner.unique_pending_id + 1, state.first_realm_global_user_tree.get_root());
-        assert_eq!(planner.realm_finalize_validator_user_leaf, historical);
-    }
-    assert_eq!(planner.realm_finalize_current_validator_user_leaf.as_ref().unwrap().balance.to_u64_value(), initial_balance + 18);
-    Ok(())
-}
 
 #[tokio::test]
 async fn deferred_endcap_conflict_preserves_authoritative_leaf() -> anyhow::Result<()> {
     use crate::guta_planner::realm_guta_planner::PlannedFutureEndCapJob;
     let mut state = RGPTestChainState::create_for_tests().await?;
-    let mut planner = state.configure_finalizer_identity(RealmGUTAPlanner::new(
+    let mut planner = state.configure_validator_proofs(RealmGUTAPlanner::new(
         state.chain_id, state.realm_identifier, state.checkpoint_tree_root, state.checkpoint_id,
         state.unique_pending_id, state.first_realm_global_user_tree.get_root(),
-        N::REALM_GLOBAL_USER_TREE_HEIGHT, N::GLOBAL_USER_TREE_HEIGHT, state.guta_circuit_whitelist));
+        N::REALM_GLOBAL_USER_TREE_HEIGHT, N::GLOBAL_USER_TREE_HEIGHT, state.guta_circuit_whitelist))?;
     let mut leaf = state.finalizer_user.user_leaf.clone();
     leaf.balance += F::from_u64_value(9);
     let item = PsyRealmUserUpdateQueueItem {
@@ -1338,6 +1329,7 @@ async fn deferred_endcap_conflict_preserves_authoritative_leaf() -> anyhow::Resu
     Ok(())
 }
 
+
 #[cfg(test)]
 mod realm_gatherer_fixture_tests {
     use super::*;
@@ -1350,16 +1342,15 @@ mod realm_gatherer_fixture_tests {
         QNetworkHashTypes, QNetworkTypesConfig, QNetworkTypesConfigHelper, QNetworkZKTypes,
         QZKProofPublicInputsHasherReader, QZKProofVerifier,
     };
-    use psy_data::genesis::genesis_block_setup::GenesisValidator;
     use psy_data::node::realm_processor::RealmProcessorCoreState;
-    use psy_data::p2p::{digest_to_field_limbs, sha256};
+    use psy_data::p2p::{digest_to_field_limbs, sha256, BlsPublicKey, BlsSecretKey, NodeId, ValidatorLeafPreimage};
     use psy_data::prepared_block::realm::PsyPreparedRealmBlockStateUpdates;
     use psy_node_core::psy_core_db::traits::full::{
         PsyNodeCheckpointObjectDatabaseWriter, PsyNodeCheckpointTreeDatabaseWriter, PsyNodeGlobalUserTreeDatabaseWriter,
         PsyNodeValidatorTreeDatabaseWriter, PsyRealmProcessorStore,
     };
     use tokio::io::AsyncWriteExt;
-    use std::sync::RwLock;
+    use std::sync::{Mutex, RwLock};
 
     type GathererN = QNetworkTypesConfigHelper<QProvingJobDataID, RGPZKTypes, PsyRGPNetworkConfig>;
     type FixtureGatherer = RealmGUTAEndCapGatherer<GathererN, TempStore, SimpleMockMemoryFileSystem>;
@@ -1395,30 +1386,17 @@ mod realm_gatherer_fixture_tests {
         type ZKVerifier = RGPTestZKVerifier;
     }
 
-    /// Searches deterministic byte arrays whose SHA-256 digest reduces to
-    /// canonical Goldilocks limbs, as the real finalizer_identity requires.
-    fn search_limb_bytes<const LEN: usize>(seed: u64) -> ([u8; LEN], [u64; 4]) {
-        for attempt in 0..10_000u64 {
-            let mut bytes = [0u8; LEN];
-            bytes[LEN - 8..].copy_from_slice(&attempt.wrapping_add(seed).to_le_bytes());
-            if let Ok(limbs) = digest_to_field_limbs(&sha256(&bytes)) {
-                return (bytes, limbs);
-            }
-        }
-        panic!("no valid goldilocks limb bytes found");
-    }
 
-    /// Persists checkpoint 0 exactly as finalizer_identity reads it: global
-    /// user leaf + checkpointed top spine, validator tree leaf, checkpoint
-    /// leaf/state-roots and the DB checkpoint tree mirrored by the in-memory
-    /// append-only checkpoint tree.
+    /// Persists checkpoint 0 exactly as load_checkpoint_validator reads it:
+    /// global user leaf + checkpointed top spine, validator tree leaf,
+    /// checkpoint leaf/state-roots and the DB checkpoint tree mirrored by the
+    /// in-memory append-only checkpoint tree.
     async fn build_real_gatherer_fixture(skip_global_state_roots: bool) -> anyhow::Result<(FixtureConfig, RecTree, Arc<RwLock<RealmProcessorCoreState<Hash>>>, SimpleMockMemoryFileSystem)> {
         let db = Arc::new(create_rgp_test_db().await?);
         let user_id = (1u64 << N::REALM_GLOBAL_USER_TREE_HEIGHT) - 1;
         let validator_user = RGPUser::new(user_id, Hash::from_u64x4([101, 102, 103, 104]));
         let leaf_hash = validator_user.user_leaf.qfhash::<Hasher>();
-        let (node_id, node_limbs) = search_limb_bytes::<38>(7);
-        let (bls_public_key, bls_limbs) = search_limb_bytes::<48>(11);
+        let (node_id, node_limbs, bls_public_key, bls_limbs) = validator_key_fixture(7, 11);
         let mut realm_tree = RecTree::new(N::REALM_GLOBAL_USER_TREE_HEIGHT);
         realm_tree.set_leaf(user_id, leaf_hash);
         let realm_root = realm_tree.get_root();
@@ -1434,8 +1412,13 @@ mod realm_gatherer_fixture_tests {
         let validator_leaf_hash = realm_validator_leaf_hash::<F, Hash, Hasher>(user_id, node_limbs, bls_limbs);
         let mut validator_tree = RecTree::new(VALIDATOR_TREE_HEIGHT as u8);
         validator_tree.set_leaf(validator_index, validator_leaf_hash);
-        let validator_root = validator_tree.get_root();
+        let validator_preimage = ValidatorLeafPreimage {
+            chain_id: psy_core::constants::chain_id::PSY_CHAIN_ID_LOCAL_DEVNET,
+            realm_id: 0, realm_sub_id: 0, validator_user_id: user_id, node_id: *node_id.as_raw(), bls_public_key: bls_public_key.to_bytes(),
+        };
         db.validator_tree_set_leaf_hash(0, validator_index, validator_leaf_hash).await?;
+        db.validator_tree_set_leaf_preimage(0, validator_index, &validator_preimage).await?;
+        let validator_root = validator_tree.get_root();
         let roots = PQEDCheckpointGlobalStateRoots {
             user_tree_root: canonical.get_root(),
             contract_tree_root: Hash::get_zero_value(), deposit_tree_root: Hash::get_zero_value(),
@@ -1460,9 +1443,6 @@ mod realm_gatherer_fixture_tests {
         );
         let status = Arc::new(RwLock::new(status));
         let file_system = Arc::new(SimpleMockMemoryFileSystem::new());
-        let validator = GenesisValidator {
-            realm_id: 0, validator_user_id: user_id, node_id, bls_public_key,
-        };
         let config = FixtureConfig {
             realm_id_u64: 0,
             realm_sub_id_u64: 0,
@@ -1473,11 +1453,8 @@ mod realm_gatherer_fixture_tests {
             coordinator_guta_updates_circuit_whitelist: Hash::from_u64x4([1337, 69, 420, 9696]),
             checkpoint_tree: Arc::new(mem_checkpoint_tree),
             future_pending_end_cap_jobs: Arc::new(RwLock::new(Vec::new())),
-            current_fee_validator_leaf: Arc::new(RwLock::new(None)),
-            committed_fee_validator_leaf: Arc::new(RwLock::new(None)),
+            current_validator_user_leaf: Arc::new(Mutex::new(validator_user.user_leaf.clone())),
             tree_store: db,
-            validator,
-            checkpoints_per_epoch: 10,
             _phantom_n: std::marker::PhantomData,
         };
         Ok((config, realm_tree, status, SimpleMockMemoryFileSystem::new()))
@@ -1505,8 +1482,7 @@ mod realm_gatherer_fixture_tests {
     ) -> anyhow::Result<(FixtureConfig, SimpleMockMemoryFileSystem)> {
         let db = Arc::new(create_rgp_test_db().await?);
         let validator_user = RGPUser::new((1u64 << N::REALM_GLOBAL_USER_TREE_HEIGHT) - 1, Hash::from_u64x4([101, 102, 103, 104]));
-        let (node_id, node_limbs) = search_limb_bytes::<38>(7);
-        let (bls_public_key, bls_limbs) = search_limb_bytes::<48>(11);
+        let (node_id, node_limbs, bls_public_key, bls_limbs) = validator_key_fixture(7, 11);
         let status = RealmProcessorCoreState::new_basic(
             psy_core::constants::chain_id::PSY_CHAIN_ID_LOCAL_DEVNET,
             QRealmIdentifier::new(0, 0), 0, 0, QCoreProcCheckpointUniqueId::from(0u128),
@@ -1514,10 +1490,25 @@ mod realm_gatherer_fixture_tests {
         );
         let status = Arc::new(RwLock::new(status));
         let file_system = Arc::new(SimpleMockMemoryFileSystem::new());
-        let validator = GenesisValidator {
-            realm_id: 0, validator_user_id: validator_user.user_id, node_id,
-            bls_public_key,
+        // Persist the checkpoint-bound validator-tree fixture the gatherer's
+        // checkpoint validator loader reads: leaf hash, preimage, and state
+        // roots at checkpoint 0 (realm 0/sub 0).
+        let validator_index = 0u64; // (realm_id << 8) | realm_sub_id with realm 0/sub 0
+        let validator_leaf_hash = realm_validator_leaf_hash::<F, Hash, Hasher>(validator_user.user_id, node_limbs, bls_limbs);
+        let mut validator_tree = RecTree::new(VALIDATOR_TREE_HEIGHT as u8);
+        validator_tree.set_leaf(validator_index, validator_leaf_hash);
+        let validator_preimage = ValidatorLeafPreimage {
+            chain_id: psy_core::constants::chain_id::PSY_CHAIN_ID_LOCAL_DEVNET,
+            realm_id: 0, realm_sub_id: 0, validator_user_id: validator_user.user_id, node_id: *node_id.as_raw(), bls_public_key: bls_public_key.to_bytes(),
         };
+        db.validator_tree_set_leaf_hash(0, validator_index, validator_leaf_hash).await?;
+        db.validator_tree_set_leaf_preimage(0, validator_index, &validator_preimage).await?;
+        db.set_checkpoint_global_state_roots(0, &PQEDCheckpointGlobalStateRoots {
+            user_tree_root: Hash::get_zero_value(),
+            contract_tree_root: Hash::get_zero_value(), deposit_tree_root: Hash::get_zero_value(),
+            withdrawal_tree_root: Hash::get_zero_value(), user_registration_tree_root: Hash::get_zero_value(),
+            validator_tree_root: validator_tree.get_root(),
+        }).await?;
         let config = FixtureConfig {
             realm_id_u64: 0, realm_sub_id_u64: 0, status,
             temp_db: Arc::new(TempStore::new("rgp_ffs_test".to_string(), 0, 0)),
@@ -1526,14 +1517,10 @@ mod realm_gatherer_fixture_tests {
             coordinator_guta_updates_circuit_whitelist: Hash::from_u64x4([1337, 69, 420, 9696]),
             checkpoint_tree: Arc::new(PsyDashMemoryAppendOnlyMerkleStore::new(N::CHECKPOINT_TREE_HEIGHT)),
             future_pending_end_cap_jobs: Arc::new(RwLock::new(Vec::new())),
-            current_fee_validator_leaf: Arc::new(RwLock::new(None)),
-            committed_fee_validator_leaf: Arc::new(RwLock::new(None)),
+            current_validator_user_leaf: Arc::new(Mutex::new(validator_user.user_leaf.clone())),
             tree_store: db,
-            validator,
-            checkpoints_per_epoch: 10,
             _phantom_n: std::marker::PhantomData,
         };
-        let _ = (node_limbs, bls_limbs);
         Ok((config, SimpleMockMemoryFileSystem::new()))
     }
 
@@ -1556,15 +1543,17 @@ mod realm_gatherer_fixture_tests {
         let mut gatherer = <FixtureGatherer as QueueGathererItemBuilderWithTree<FixtureConfig, RecTree>>::create_new_with_tree(
             &mut tree, QCoreProcCheckpointUniqueId::from(0u128), config).await?;
         let planner = &gatherer.guta_planner;
-        assert_eq!(planner.realm_finalize_validator_user_id, Some((1u64 << N::REALM_GLOBAL_USER_TREE_HEIGHT) - 1));
-        let identity_leaf_proof = planner.realm_finalize_validator_user_tree_proof.as_ref().unwrap();
-        assert!(identity_leaf_proof.verify::<Hasher>());
-        assert!(planner.realm_finalize_validator_tree_proof.as_ref().unwrap().verify::<Hasher>());
+        let user_id = (1u64 << N::REALM_GLOBAL_USER_TREE_HEIGHT) - 1;
+        assert_eq!(planner.current_validator_user_leaf.as_ref().unwrap().user_id.to_u64_value(), user_id);
+        let current_leaf = planner.current_validator_user_leaf.as_ref().unwrap();
+        assert_eq!(tree.get_leaf(user_id).value,
+            current_leaf.qfhash::<Hasher>(), "retained account leaf must match the current tree leaf");
+        assert!(planner.validator_proofs.is_none(), "bootstrap must not load the full proofs");
         Ok(())
     }
 
     #[tokio::test]
-    async fn finalizer_identity_fails_closed_without_persisted_roots() -> anyhow::Result<()> {
+    async fn load_checkpoint_validator_fails_closed_without_persisted_roots() -> anyhow::Result<()> {
         let (config, mut tree, _status, _fs) = build_real_gatherer_fixture(true).await?;
         let result = <FixtureGatherer as QueueGathererItemBuilderWithTree<FixtureConfig, RecTree>>::create_new_with_tree(
             &mut tree, QCoreProcCheckpointUniqueId::from(0u128), config).await;
@@ -1572,4 +1561,148 @@ mod realm_gatherer_fixture_tests {
         Ok(())
     }
 
+
+    #[tokio::test]
+    async fn ff_fails_closed_when_retained_leaf_stale_without_ffs_leaf() -> anyhow::Result<()> {
+        let mut tree = RecTree::new(N::REALM_GLOBAL_USER_TREE_HEIGHT);
+        let (config, _fs) = create_minimal_ffs_gatherer(&mut tree).await?;
+        let validator_user = RGPUser::new((1u64 << N::REALM_GLOBAL_USER_TREE_HEIGHT) - 1, Hash::from_u64x4([101, 102, 103, 104]));
+        // Retained slot whose preimage does not hash to the tree's actual
+        // leaf: with no FFS validator leaf there is no last-wins overlay, so
+        // the stale retained leaf must fail closed instead of being kept.
+        let mut stale = validator_user.user_leaf.clone();
+        stale.balance += F::from_u64_value(5);
+        *config.current_validator_user_leaf.lock().unwrap() = stale;
+        let updates = PsyPreparedRealmBlockStateUpdates::<Hash> {
+            unique_pending_id: 0,
+            proc_checkpoint_unique_id: QCoreProcCheckpointUniqueId::from(0u128),
+            realm_id: 0, realm_sub_id: 0,
+            old_realm_root: tree.get_root(), new_realm_root: tree.get_root(),
+            update_global_user_tree_nodes_ffs: vec![],
+            update_user_contract_tree_nodes_ffs: vec![],
+            update_contract_state_tree_nodes_ffs: vec![],
+            update_user_leaves_ffs: vec![],
+            update_contract_state_imt_leaves_ffs: vec![],
+        };
+        let error = <FixtureGatherer as QueueGathererItemBuilderWithTree<FixtureConfig, RecTree>>::apply_fast_forward_with_tree(
+            &mut tree, &config, updates.psy_ser_to_bytes_vec()?).await.unwrap_err();
+        assert!(error.to_string().contains("does not match updated tree"), "{error:#}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ff_ffs_validator_leaf_last_wins_updates_slot() -> anyhow::Result<()> {
+        use parth_common::memory_stores::traits::PsyMemoryMerkleStoreImm;
+        use psy_node_core::qblob::data_views::zero_merkle_node_batch::create_ffs_merkle_nodes_zero_id_from_hash_map_with_offset;
+        let mut tree = RecTree::new(N::REALM_GLOBAL_USER_TREE_HEIGHT);
+        let user_id = (1u64 << N::REALM_GLOBAL_USER_TREE_HEIGHT) - 1;
+        let validator_user = RGPUser::new(user_id, Hash::from_u64x4([101, 102, 103, 104]));
+        let leaf_a = validator_user.user_leaf.clone();
+        let mut leaf_b = leaf_a.clone();
+        leaf_b.balance += F::from_u64_value(3);
+        tree.set_leaf(user_id, leaf_a.qfhash::<Hasher>());
+        tree.commit_changes();
+        let old_root = tree.get_root();
+        let (config, _fs) = create_minimal_ffs_gatherer(&mut tree).await?;
+        *config.current_validator_user_leaf.lock().unwrap() = leaf_a;
+        let mut modified = tree.clone();
+        modified.set_leaf(user_id, leaf_b.qfhash::<Hasher>());
+        let new_root = modified.get_root();
+        let realm_root_key = parth_core::data::hash::merkle_node_key::SimpleMerkleNodeKey {
+            level: N::GLOBAL_USER_TREE_HEIGHT - N::REALM_GLOBAL_USER_TREE_HEIGHT,
+            index: 0,
+        };
+        let ffs_nodes = create_ffs_merkle_nodes_zero_id_from_hash_map_with_offset::<Hash>(&modified.get_changes(), realm_root_key);
+        let updates = PsyPreparedRealmBlockStateUpdates::<Hash> {
+            unique_pending_id: 0,
+            proc_checkpoint_unique_id: QCoreProcCheckpointUniqueId::from(0u128),
+            realm_id: 0, realm_sub_id: 0,
+            old_realm_root: old_root, new_realm_root: new_root,
+            update_global_user_tree_nodes_ffs: ffs_nodes,
+            update_user_contract_tree_nodes_ffs: vec![],
+            update_contract_state_tree_nodes_ffs: vec![],
+            update_user_leaves_ffs: leaf_b.psy_ser_to_bytes_vec()?,
+            update_contract_state_imt_leaves_ffs: vec![],
+        };
+        <FixtureGatherer as QueueGathererItemBuilderWithTree<FixtureConfig, RecTree>>::apply_fast_forward_with_tree(
+            &mut tree, &config, updates.psy_ser_to_bytes_vec()?).await?;
+        assert_eq!(tree.get_root(), new_root);
+        assert_eq!(*config.current_validator_user_leaf.lock().unwrap(), leaf_b, "FFS validator leaf must win and be written to the single slot");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_failure_restores_future_pending_jobs() -> anyhow::Result<()> {
+        use crate::guta_planner::realm_guta_planner::PlannedFutureEndCapJob;
+        let (config, mut tree, _status, _fs) = build_real_gatherer_fixture(false).await?;
+        let slot = config.future_pending_end_cap_jobs.clone();
+        let validator_user = RGPUser::new((1u64 << N::REALM_GLOBAL_USER_TREE_HEIGHT) - 1, Hash::from_u64x4([101, 102, 103, 104]));
+        let leaf_hash = validator_user.user_leaf.qfhash::<Hasher>();
+        // Passes the deferred preimage/staleness gates, then fails batch
+        // validation: the taken job must land back in the shared slot.
+        let job = PlannedFutureEndCapJob {
+            queue_item: PsyRealmUserUpdateQueueItem {
+                job_id: QProvingJobDataID::new_invalid_job_id(), expected_fake_checkpoint_id: 0,
+                old_user_leaf_hash: leaf_hash, new_user_leaf_hash: leaf_hash,
+                events: vec![], new_user_leaf: validator_user.user_leaf.clone(), stats: GUTAStats::get_zero_value(),
+            },
+            contract_updates: vec![7u8; 64],
+        };
+        slot.write().unwrap().push(job);
+        let result = <FixtureGatherer as QueueGathererItemBuilderWithTree<FixtureConfig, RecTree>>::create_new_with_tree(
+            &mut tree, QCoreProcCheckpointUniqueId::from(0u128), config).await;
+        assert!(result.is_err(), "corrupt contract updates must fail create");
+        assert_eq!(slot.read().unwrap().len(), 1, "failed create must restore the taken future pending jobs");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gatherer_drop_restores_future_pending_jobs() -> anyhow::Result<()> {
+        use crate::guta_planner::realm_guta_planner::PlannedFutureEndCapJob;
+        let (config, mut tree, _status, _fs) = build_real_gatherer_fixture(false).await?;
+        let slot = config.future_pending_end_cap_jobs.clone();
+        let mut gatherer = <FixtureGatherer as QueueGathererItemBuilderWithTree<FixtureConfig, RecTree>>::create_new_with_tree(
+            &mut tree, QCoreProcCheckpointUniqueId::from(0u128), config).await?;
+        let mut leaf = {
+            let planner_leaf = gatherer.guta_planner.current_validator_user_leaf.clone().unwrap();
+            planner_leaf
+        };
+        leaf.last_checkpoint_id = F::from_u64_value(5);
+        gatherer.guta_planner.future_pending_end_cap_jobs.push(PlannedFutureEndCapJob {
+            queue_item: PsyRealmUserUpdateQueueItem {
+                job_id: QProvingJobDataID::new_invalid_job_id(), expected_fake_checkpoint_id: 0,
+                old_user_leaf_hash: Hash::get_zero_value(), new_user_leaf_hash: leaf.qfhash::<Hasher>(),
+                events: vec![], new_user_leaf: leaf, stats: GUTAStats::get_zero_value(),
+            },
+            contract_updates: vec![],
+        });
+        drop(gatherer);
+        assert_eq!(slot.read().unwrap().len(), 1, "dropped builder must hand deferred jobs back to the shared slot");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finalize_revert_restores_future_pending_jobs() -> anyhow::Result<()> {
+        use crate::guta_planner::realm_guta_planner::PlannedFutureEndCapJob;
+        let (config, mut tree, status, _fs) = build_real_gatherer_fixture(false).await?;
+        let slot = config.future_pending_end_cap_jobs.clone();
+        let mut gatherer = <FixtureGatherer as QueueGathererItemBuilderWithTree<FixtureConfig, RecTree>>::create_new_with_tree(
+            &mut tree, QCoreProcCheckpointUniqueId::from(0u128), config).await?;
+        let mut leaf = gatherer.guta_planner.current_validator_user_leaf.clone().unwrap();
+        leaf.last_checkpoint_id = F::from_u64_value(5);
+        gatherer.guta_planner.future_pending_end_cap_jobs.push(PlannedFutureEndCapJob {
+            queue_item: PsyRealmUserUpdateQueueItem {
+                job_id: QProvingJobDataID::new_invalid_job_id(), expected_fake_checkpoint_id: 0,
+                old_user_leaf_hash: Hash::get_zero_value(), new_user_leaf_hash: leaf.qfhash::<Hasher>(),
+                events: vec![], new_user_leaf: leaf, stats: GUTAStats::get_zero_value(),
+            },
+            contract_updates: vec![],
+        });
+        status.write().unwrap().should_revert_processing_changes = true;
+        let output = <FixtureGatherer as QueueGathererItemBuilderWithTree<FixtureConfig, RecTree>>::finalize_with_tree(
+            gatherer, &mut tree).await?;
+        assert!(output.db_output.is_noop());
+        assert_eq!(slot.read().unwrap().len(), 1, "finalize revert lifecycle end must restore deferred jobs");
+        Ok(())
+    }
 }

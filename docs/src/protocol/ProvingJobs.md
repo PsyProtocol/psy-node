@@ -2,7 +2,7 @@
 
 This protocol reference covers realm and coordinator proving-job dependencies and public input layouts alongside the [circuit index](Circuits.md).
 
-> Updated: 2026-09-03.
+> Updated: 2026-09-08. PI layouts corrected to 4-felt rewards-tag model.
 
 ## Abstract
 
@@ -24,30 +24,40 @@ This document describes the proving jobs architecture for both Realm and Coordin
 
 ## 1. Public Input Layouts
 
-**IMPORTANT**: Different circuit types have different public inputs layouts!
+> **Currency (2026-09-08):** Live circuits register a **4-felt Poseidon hash**, not a flat 19- or 15-limb public vector. Older “19 / 15 input” tables below this note are **obsolete**; do not use them for audit or worker PI checks. Authoritative helpers: `psy_plonky2_circuits/src/agg/common.rs`, `guta/gadgets/guta_header.rs`, `docs/src/dev/reward-tree-circuits.md`.
 
-### Coordinator Main Circuits (19 inputs)
+### Coordinator trackable leaves / aggregates (4 felts)
 
-- **[0..4]**: commitment
-- **[4..8]**: worker_public_key
-- **[8..11]**: pm_jobs_completed_stats (deploy_contracts_completed, register_users_completed, gutas_completed)
-- **[11..15]**: circuit_whitelist_root
-- **[15..19]**: state_transition_hash
+```
+ST = H2(old_root, new_root)   // or equivalent state-transition hash
+PI = compute_agg_state_trackable_final_public_inputs_leaf(
+       whitelist_root, ST, worker_reward_tag)
+   // ≈ H2( H( H2(whitelist, ST) || proof_count ), rewards_tag_tree_value )
+```
 
-### GUTA Circuits (15 inputs)
+Worker identity and PM job counts are **inside the rewards tag tree / witness**, not separate public limbs.
 
-- **[0..4]**: commitment
-- **[4..8]**: worker_public_key
-- **[8..11]**: pm_jobs_completed_stats
-- **[11..15]**: guta_header_hash
+### GUTA circuits (4 felts)
 
-### Special: AggUserRegistrationDeployContractsGUTA (19 inputs)
+```
+PI = H2(guta_header_hash, rewards_tree_value)
+```
 
-- **[0..4]**: state_transition_hash (NOT commitment!)
-- **[4..8]**: hash(user_registration_commitment, user_registration_worker_pk)
-- **[8..12]**: hash(deploy_contracts_commitment, deploy_contracts_worker_pk)
-- **[12..16]**: hash(guta_commitment, guta_worker_pk)
-- **[16..19]**: additional data
+`rewards_tree_value` folds worker tag + child reward tags (see reward-tree layouts). Header carries whitelist, checkpoint, GUSR transition, and stats.
+
+### Part-1 `AggUserRegisterDeployContractsGUTA` (type 40, 4 felts)
+
+```
+header_hash = combined(URT_ST, GCON_ST, GUSR_header, …)
+tag = hash_tag_tree_node_four(guta_R, register_R, deploy_R, update_R, worker_tag)
+PI = H2(header_hash, tag)
+```
+
+**Four** child proofs: register-users ST, deploy ST, **update-contracts ST**, GUTA. Deploy end root must equal update start root on GCON.
+
+### Checkpoint state transition (type 32, 4 felts)
+
+Registers the CST public-inputs hash (chain / transition commitment) — not a flat 19-limb layout. See CST circuit + recursive previous-proof gadget.
 
 ## 2. Realm Proving Jobs
 
@@ -81,7 +91,7 @@ P2P Proposal / Votes / Certificate --> Coordinator psy_submit_guta(..., proposal
 
 Witness construction for finalization is `RealmGUTAPlanner::append_realm_finalize_guta` (`psy_node_common/src/guta_planner/realm_guta_planner.rs`). Circuit implementation: `psy_plonky2_circuits/src/guta_v2/circuits/realm_finalize_guta.rs`.
 
-Ordinary GUTA public-input layout (15 inputs) in §1 still applies to aggregation GUTA jobs. RealmFinalizeGUTA carries the finalized GUTA header hash as its expected public inputs commitment; do not use the obsolete ProcessUserOp table below historically.
+GUTA aggregation jobs use the **4-felt** `H2(header, rewards)` PI form in §1. RealmFinalizeGUTA likewise registers a 4-felt PI over the finalized header and rewards tag; do not use obsolete ProcessUserOp or flat 15-limb tables.
 
 ## 3. Coordinator Proving Jobs
 
@@ -127,6 +137,10 @@ graph TB
         RUN --> RU_AGG2
         RU_AGG1 --> RU_ROOT
         RU_AGG2 --> RU_ROOT
+    end
+
+    subgraph "Update Contracts Tree"
+        UC_NOTE[BatchUpdateContracts + Agg]
     end
 
     subgraph "Deploy Contracts Tree"
@@ -190,7 +204,7 @@ graph LR
 
 ### Additional GUTA Circuits
 
-**Other live GUTA circuits** (also 15 inputs / rewards-header PI form — see [GUTAV2Circuits.md](./GUTAV2Circuits.md)):
+**Other live GUTA circuits** (4-felt rewards-header PI form — see [GUTAV2Circuits.md](./GUTAV2Circuits.md)):
 - `GUTANoChange`: No state changes
 - `GUTATwoEndCap`: Aggregate two EndCap proofs
 - `GUTAVerifyToCap`: Verify GUTA to tree cap
@@ -203,45 +217,26 @@ All follow the same commitment / rewards-tag calculation rules based on their de
 
 ## 5. State Part 1
 
-This circuit aggregates the three main trees:
+This circuit aggregates **four** coordinator streams (register, deploy, update, GUTA):
 
 ### Inputs
 
-- Register Users proof (from aggregation root)
-- Deploy Contracts proof (from aggregation root)
-- GUTA proof (from aggregation root or GUTAVerifyToCap)
+- Register Users ST proof (aggregation root)
+- Deploy Contracts ST proof (aggregation root)
+- **Update Contracts** ST proof (aggregation root)
+- GUTA proof (aggregation root or GUTAVerifyToCap)
 
-### Public Inputs Layout (19 total) - SPECIAL LAYOUT!
+### Public Inputs
 
-**WARNING**: This circuit has a unique layout different from other circuits!
-- **[0..4]**: state_transition_hash (NOT commitment!)
-- **[4..8]**: hash(register_users_commitment, register_users_worker_pk)
-- **[8..12]**: hash(deploy_contracts_commitment, deploy_contracts_worker_pk)
-- **[12..16]**: hash(guta_commitment, guta_worker_pk)
-- **[16..19]**: additional data
+4 felts: `H2(combined_header_hash, four_child_rewards_tag)` — see §1. Do **not** use the obsolete flat 19-limb Part-1 table.
 
-### How Child Proofs Are Processed
+### Child proof processing
 
-```rust
-// Extract from each child proof:
-let user_registration_commitment = child_proof.public_inputs[0..4];
-let user_registration_worker_pk = child_proof.public_inputs[4..8];
-let user_registration_final = hash(commitment, worker_pk);
+Each child exposes a 4-felt PI hash. Part-1 verifies fingerprints/whitelists, binds deploy.end → update.start on GCON, and folds child reward tags with `hash_tag_tree_node_four`.
 
-// This final hash goes into parent's public_inputs[4..8]
-```
+### PM / rewards tag tree
 
-### PM Rewards Commitment
-
-The PM (Prover/Miner) Rewards Commitment is calculated from these three roots:
-
-```rust
-PMRewardCommitment {
-    register_users_root,
-    deploy_contracts_root,
-    gutas_root,
-}
-```
+Reward metadata for the four children is folded into the Part-1 tag tree (not three independent flat roots). See `docs/src/dev/reward-tree-circuits.md`.
 
 ## 6. Checkpoint State Transition
 
@@ -254,13 +249,10 @@ The final circuit that creates the checkpoint proof:
 - Checkpoint tree merkle proof
 - Various metadata (block time, random seed, etc.)
 
-### Public Inputs Layout (19 inputs total)
+### Public Inputs
 
-- **[0..4]**: commitment
-- **[4..8]**: worker_public_key
-- **[8..11]**: pm_jobs_completed_stats (from State Part 1 proof)
-- **[11..15]**: old_checkpoint_tree_root
-- **[15..19]**: new_checkpoint_tree_root
+4-felt CST public-inputs hash (see §1). Previous CST / genesis fingerprint checks are in-circuit via `VerifyRecursiveCheckpointStateTransitionProofGadget`.
+
 
 ## 7. Job Dependencies and Task Graph
 
@@ -280,11 +272,13 @@ graph LR
 
     RU --> SP1
     DC --> SP1
+    UC[Update Contracts Jobs] --> SP1
     GUTA --> SP1
     SP1 --> CST
     CST --> NOTIFY
 ```
 
+> **Currency:** Part-1 also depends on the **Update Contracts** aggregation root (four children). The Register / Deploy / GUTA parallel trees remain; update runs beside deploy on GCON.
 The dependency graph shows how PM stats flow through the system:
 1. **Parallel Trees**: Each tree type accumulates its specific job counts
 2. **State Part 1**: Combines PM stats from all three trees
@@ -298,15 +292,15 @@ The commitment calculation follows a consistent pattern across all circuits:
 ### 1. Leaf Circuits (No Dependencies)
 
 ```rust
-commitment = worker_public_key
+PI = agg_state_trackable_leaf(whitelist, ST, worker_tag)  // not raw worker_pk
 ```
 
-Examples: GUTANoChange, BatchDeployContracts, AppendUserRegistrationTree
+Examples: GUTANoChange, BatchDeployContracts, AppendUserRegistrationTree (PI via `compute_agg_state_trackable_final_public_inputs_leaf`, not raw worker_pk)
 
 ### 2. Single Dependency Circuits (One Child Proof)
 
 ```rust
-commitment = hash(child.commitment, worker_public_key)
+PI folds child PI hash + worker_tag into rewards tag tree (see reward-tree docs)
 ```
 
 Examples: GUTASingleEndCap, GUTAVerifyToCap, GUTAVerifyToCapWithCheckpointUpgrade
@@ -314,7 +308,7 @@ Examples: GUTASingleEndCap, GUTAVerifyToCap, GUTAVerifyToCapWithCheckpointUpgrad
 ### 3. Two Dependencies Circuits (Two Child Proofs)
 
 ```rust
-commitment = hash(hash(left.commitment, right.commitment), worker_public_key)
+PI = H2(header, hash_tag_tree(left_R, right_R, worker_tag))
 ```
 
 Examples: GUTATwoGUTA, GUTATwoGUTAWithCheckpointUpgrade, GUTATwoEndCap, GUTALeftGUTARightEndCap, AggStateTransition
@@ -337,7 +331,7 @@ Examples: GUTATwoGUTA, GUTATwoGUTAWithCheckpointUpgrade, GUTATwoEndCap, GUTALeft
 
 ## 9. Core Proving Circuits
 
-### Coordinator Main Circuits (19 inputs)
+### Coordinator Main Circuits (4-felt PI)
 
 | Circuit                             | Type        | Dependencies | Commitment Calculation                                                                |
 | ----------------------------------- | ----------- | ------------ | ------------------------------------------------------------------------------------- |
@@ -346,14 +340,9 @@ Examples: GUTATwoGUTA, GUTATwoGUTAWithCheckpointUpgrade, GUTATwoEndCap, GUTALeft
 | **AggStateTransition**              | Aggregation | 2 proofs     | `commitment = hash(hash(left.commit, left.worker), hash(right.commit, right.worker))` |
 | **DummyAggStateTransition**         | Dummy       | None         | `commitment = hash(0, 0)`                                                             |
 
-**Public Inputs Layout (19 total)**:
-- `[0..4]`: commitment
-- `[4..8]`: worker_public_key
-- `[8..11]`: pm_jobs_completed_stats
-- `[11..15]`: circuit_whitelist
-- `[15..19]`: state_transition_hash
+**Public Inputs:** 4 felts via `compute_agg_state_trackable_final_public_inputs_leaf` (§1).
 
-### GUTA Core Circuits (15 inputs)
+### GUTA Core Circuits (4-felt PI)
 
 Live rows only (enum leftovers 9/12/14 omitted — see §4 currency note).
 
@@ -365,18 +354,14 @@ Live rows only (enum leftovers 9/12/14 omitted — see §4 currency note).
 | **GUTATwoEndCap**           | Aggregation | 2 EndCap          | `commitment = hash(hash(left.commit, left.worker), hash(right.commit, right.worker))` |
 | **GUTALeftGUTARightEndCap** | Mixed       | 1 GUTA + 1 EndCap | `commitment = hash(hash(left.commit, left.worker), hash(right.commit, right.worker))` |
 
-**Public Inputs Layout (15 total)**:
-- `[0..4]`: commitment
-- `[4..8]`: worker_public_key
-- `[8..11]`: pm_jobs_completed_stats
-- `[11..15]`: guta_header_hash
+**Public Inputs:** 4 felts = `H2(header_hash, rewards_tree_value)` (§1).
 
 ### Final Aggregation Circuits
 
-| Circuit                                          | Dependencies                        | Special Notes                                                         |
-| ------------------------------------------------ | ----------------------------------- | --------------------------------------------------------------------- |
-| **VerifyAggUserRegistrationDeployContractsGUTA** | 3 proofs (user_reg + deploy + guta) | **UNIQUE LAYOUT**: `[0..4]` = state_transition_hash (NOT commitment!) |
-| **PsyCheckpointStateTransition**                 | 1 proof (state_part_1)              | Standard 19-input layout                                              |
+| Circuit                                          | Dependencies                                        | Special Notes                                      |
+| ------------------------------------------------ | --------------------------------------------------- | -------------------------------------------------- |
+| **VerifyAggUserRegistrationDeployContractsGUTA** | 4 proofs (user_reg + deploy + **update** + guta)    | 4-felt PI: `H2(header, four_child_rewards_tag)` (§1) |
+| **QEDCheckpointStateTransition**                 | 1 proof (state_part_1) + previous CST/genesis       | 4-felt CST PI hash (§1); not a flat 19-limb layout |
 
 ## 10. Proof Miner Job Statistics
 
@@ -438,7 +423,7 @@ This provides a complete count of all work performed in the current checkpoint.
 
 ## 11. Design Principles
 
-1. **Consistent Public Inputs**: All circuits follow the same [commitment, worker_public_key, pm_jobs_completed_stats, data_hash] layout
+1. **Consistent Public Inputs**: Trackable/GUTA circuits expose a **4-felt** Poseidon commitment; worker/PM metadata lives in the rewards tag tree / witness
 2. **Tree Aggregation**: Each category (GUTA, Register Users, Deploy Contracts) forms its own tree
 3. **Parallel Processing**: The three trees can be processed in parallel
 4. **Commitment Chain**: Commitments flow up from leaves to root, enabling reward distribution

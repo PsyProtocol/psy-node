@@ -1,0 +1,41 @@
+/* Softer inline-code styling: the mdBook default purple is jarring on
+   pages dense with short code spans (circuit refs like [R(N-1).5]). */
+@media (prefers-color-scheme: light) {
+    .content code {
+        color: #334155;
+        background: #f1f5f9;
+        padding: 0.1em 0.35em;
+        border-radius: 3px;
+    }
+    .content a code {
+        color: #1d4ed8;
+        background: #eff6ff;
+    }
+    .content blockquote {
+        border-left: 4px solid #93c5fd;
+        background: #f8fafc;
+        color: #334155;
+    }
+}
+/* Dark theme keeps mdBook defaults but tones the code red down */
+@media (prefers-color-scheme: dark) {
+    .content code {
+        color: #cbd5e1;
+        background: #1e293b;
+    }
+}
+
+/* Sidebar fold (mdBook 0.5 has no collapsible sidebar) */
+.sidebar .sidebar-fold-caret {
+    cursor: pointer;
+    user-select: none;
+    font-size: 0.85em;
+    margin-right: 0.3em;
+    opacity: 0.65;
+}
+.sidebar .sidebar-fold-caret:hover {
+    opacity: 1;
+}
+.sidebar ol.section.fold-hidden {
+    display: none;
+}

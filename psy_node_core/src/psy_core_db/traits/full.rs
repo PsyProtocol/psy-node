@@ -298,7 +298,13 @@ pub trait PsyNodeCheckpointObjectDatabaseReader<F, Hash> {
     /// Recovery callers may use this to skip abandoned counter values left by a crash between allocating
     /// a pending ID and persisting its processor ID mapping. Runtime callers should use the strict current getter.
     async fn get_latest_mapped_unique_pending_id(&self) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId)>;
-}
+    /// Returns the processor checkpoint unique ID durably recorded for a specific pending
+    /// generation, if any. `inc_unique_pending_id` writes this record before any backup file
+    /// or commit exists, so it is the only trusted identity source for a pending generation
+    /// that never reached a checkpoint mapping (the crash window recovery replays). Callers
+    /// must never borrow another generation's proc ID for it.
+    async fn get_proc_checkpoint_unique_id_for_pending_id(&self, unique_pending_id: u64) -> anyhow::Result<Option<QCoreProcCheckpointUniqueId>>;
+ }
 
 #[async_trait]
 #[auto_impl(&, Arc)]
@@ -468,6 +474,7 @@ pub trait PsyNodeCheckpointTransitionZKProofDatabaseWriter<F, Hash> {
 
 pub trait PsyRealmEdgeAPIStoreReader<F, Hash>:
     PsyNodeCheckpointTreeDatabaseReader<Hash>
+    + PsyNodeValidatorTreeDatabaseReader<Hash>
     + PsyNodeGlobalUserTreeDatabaseReader<Hash>
     + PsyNodeUserContractTreeDatabaseReader<Hash>
     + PsyNodeContractStateTreeTreeDatabaseReader<Hash>
@@ -483,6 +490,7 @@ pub trait PsyRealmEdgeAPIStoreReader<F, Hash>:
 impl<
         T: PsyNodeCheckpointTreeDatabaseReader<Hash>
             + PsyNodeGlobalUserTreeDatabaseReader<Hash>
+            + PsyNodeValidatorTreeDatabaseReader<Hash>
             + PsyNodeUserContractTreeDatabaseReader<Hash>
             + PsyNodeContractStateTreeTreeDatabaseReader<Hash>
             + PsyNodeCheckpointObjectDatabaseReader<F, Hash>

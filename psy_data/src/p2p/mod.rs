@@ -33,8 +33,8 @@ pub use limits::*;
 pub use messages::{
     bitmap_get, bitmap_set, compute_end_cap_id, compute_proposal_id, encode_proposal_body,
     proposal_from_parts, vote_message, Certificate, DirectBodyRequest, DirectBodyResponse,
-    EndCapForwardHeader, EndCapForwardResponse, Proposal, ProposalPart, RealmFinalizeOutputBytes,
-    RealmFinalizeSubmitCode, Vote,
+    EndCapForwardHeader, EndCapForwardResponse, EndCapRejectReason, Proposal, ProposalPart,
+    RealmFinalizeOutputBytes, RealmFinalizeSubmitCode, Vote,
 };
 pub use node_id::NodeId;
 pub use validator_leaf::ValidatorLeaf;

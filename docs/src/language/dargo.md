@@ -17,21 +17,27 @@ Creates a new Psy language project with a standard directory structure.
 dargo new my_project
 ```
 
-This creates:
+By default this creates a **binary** project (one entry file). Use `dargo new my_project --lib` for a library template.
+
 ```text
+# Binary (default): dargo new my_project
 my_project/
 ├── Dargo.toml          # Project configuration
-├── src/
-│   ├── main.psy        # Main source file
-│   └── lib.psy         # Library source file
-└── target/             # Build output directory
+└── src/
+    └── main.psy        # Entry point
+
+# Library: dargo new my_project --lib
+my_project/
+├── Dargo.toml
+└── src/
+    └── lib.psy         # Library entry
 ```
 
 **Project Structure:**
 - `Dargo.toml` - Project metadata and dependencies
-- `src/main.psy` - Entry point for binary projects
-- `src/lib.psy` - Library code (if applicable)
-- `target/` - Compiled artifacts and intermediate files
+- `src/main.psy` - Entry point for binary projects (`dargo new` / `dargo init` default)
+- `src/lib.psy` - Library entry when `--lib` is used (not created alongside `main.psy`)
+- `target/` - Created later by compilation (not by `new`/`init`)
 
 ### `dargo init`
 
@@ -122,14 +128,14 @@ Compiles and executes Psy programs with specified parameters.
 # Execute main function
 dargo execute
 
-# Execute with parameters
-dargo execute --parameters 100 200
+# Execute with parameters (comma-separated Felt list for one method)
+dargo execute --parameters 100,200
 
 # Execute contract method with parameters
-dargo execute --contract-name TokenContract --method-names mint --parameters 123 50
+dargo execute --contract-name TokenContract --method-names mint --parameters 123,50
 
-# Execute multiple methods
-dargo execute -c TokenContract -m transfer burn -p 123 456 100
+# Execute multiple methods (one --parameters value per method, in order)
+dargo execute -c TokenContract -m transfer burn -p 123,456,100 -p 50
 ```
 
 #### Execution Examples
@@ -147,7 +153,7 @@ fn main(x: Felt, y: Felt) -> Felt {
 
 ```bash
 # Execute with parameters x=10, y=20
-dargo execute --parameters 10 20
+dargo execute --parameters 10,20
 # Returns: 30
 ```
 
@@ -172,11 +178,11 @@ impl CalculatorRef {
 
 ```bash
 # Execute multiply method
-dargo execute -c Calculator -m multiply -p 6 7
+dargo execute -c Calculator -m multiply -p 6,7
 # Returns: 42
 
 # Execute divide method  
-dargo execute -c Calculator -m divide -p 15 3
+dargo execute -c Calculator -m divide -p 15,3
 # Returns: modular inverse result
 ```
 
@@ -354,11 +360,11 @@ The generated ABI is used by the TypeScript SDK to create typed contract interfa
 # 1. Generate ABI
 dargo generate-abi -c TokenContract -o ./target
 
-# 2. Copy to TypeScript SDK
-cp target/TokenContract.abi.json psy_sdk/psy-ts-sdk/packages/contract-sdk/abi/
+# 2. Copy to TypeScript SDK (sibling psy-sdk checkout)
+cp target/TokenContract.abi.json ../psy-sdk/psy-ts-sdk/packages/contract-sdk/abi/
 
 # 3. Generate TypeScript bindings
-cd psy_sdk/psy-ts-sdk/packages/contract-sdk
+cd ../psy-sdk/psy-ts-sdk/packages/contract-sdk
 pnpm generate
 ```
 
@@ -369,11 +375,8 @@ pnpm generate
 Formats Psy source code according to standard style guidelines.
 
 ```bash
-# Format specific file
+# Format a single file (fmt takes exactly one <FILE> argument)
 dargo fmt src/main.psy
-
-# Format all files in src directory
-dargo fmt src/*.psy
 ```
 
 **Before formatting:**
@@ -440,20 +443,20 @@ dargo compile -c TokenContract -m mint
 
 ### Parameter Types and Formats
 
-When using `--parameters`, different types are supported:
+Each `--parameters` / `-p` value is one comma-separated `Vec<u64>` for one compiled method (see `parse_vec_u64` in `psy-dargo-cli`). Space-separated tokens become separate method parameter lists, not one arity.
 
 ```bash
-# Felt parameters
-dargo execute -p 123 456 789
+# Felt parameters for one method
+dargo execute -p 123,456,789
 
 # Boolean parameters (represented as 0/1)
-dargo execute -p 1 0  # true false
+dargo execute -p 1,0  # true, false
 
-# Array parameters (space-separated elements)
-dargo execute -m process_array -p 1 2 3 4 5
+# Multiple Felts for one method
+dargo execute -m process_array -p 1,2,3,4,5
 
-# Mixed parameter types
-dargo execute -m complex_function -p 100 1 42
+# Mixed values for one method
+dargo execute -m complex_function -p 100,1,42
 ```
 
 ### Environment Variables
@@ -461,13 +464,9 @@ dargo execute -m complex_function -p 100 1 42
 Dargo respects certain environment variables:
 
 ```bash
-# Set default file for test command
+# Set default file for test command (--file is otherwise required)
 export FILE=tests/my_test.psy
 dargo test
-
-# Build optimization level
-export DARGO_OPTIMIZATION=release
-dargo compile
 ```
 
 ## 7. Project Configuration
@@ -524,7 +523,7 @@ dargo compile
 dargo compile -c Token -m transfer
 
 # Execute with parameters
-dargo execute -c Token -m transfer -p 123 50
+dargo execute -c Token -m transfer -p 123,50
 
 # Run tests
 dargo test -f src/main.psy
@@ -579,7 +578,7 @@ dargo compile -c Token -m transfer  # Check spelling
 ```bash
 # Check parameter count and types
 # Method expects: fn transfer(to: Felt, amount: Felt)
-dargo execute -c Token -m transfer -p 123 50  # Correct: 2 parameters
+dargo execute -c Token -m transfer -p 123,50  # Correct: 2 parameters
 ```
 
 **Compilation Errors:**

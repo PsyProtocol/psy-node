@@ -342,7 +342,7 @@ These circuit wrappers compose the gadgets above and register tree-aware public 
 -   **File:** `…/ups/circuits/end_cap.rs` (core ~238)
 -   **Gadgets:** `UPSEndCapFromProofTreeGadget` (previous step + ZK-sig + `UPSEndCapCoreGadget`)
 -   **Public Inputs:** `H2(state_transition_pi_hash, guta_stats_pi_hash)` (4 felts) — **not** tree-aware UPS form.
--   **Constraints:** See `AUDIT_SCOPE.md` §1.7 EndCap brief / gadget §11–8.
+-   **Constraints:** See `docs/src/audit/scope.md` §1.7 EndCap brief / gadget §11–8.
 -   **Role:** Session close → realm GUTA leaf (`UserEndCap`, type 6).
 
 *(Legacy wrappers `old_end_cap.rs` / `with_root_end_cap.rs` are out of audit narrative; prefer `end_cap.rs`.)*

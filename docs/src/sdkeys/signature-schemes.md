@@ -56,9 +56,8 @@ private_inputs = private_key
 
 **Key Features:**
 - **Custom Signature Logic**: Supports transaction introspection and custom constraints
-- **ECDSA Compatibility**: Can integrate with existing ECDSA infrastructure
-- **Well-Studied Curve**: secp256k1 semantics identical to Ethereum tooling
 - **Optimized Circuit**: Minimal constraint count for fast proving (~2-5 seconds)
+- **Native Psy Identity**: Does not use secp256k1 ECDSA; see §2 for the SECP256K1 compatibility path
 
 ## 2. SECP256K1 Signature
 
