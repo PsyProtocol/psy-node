@@ -42,6 +42,13 @@ enum Commands {
     Status(StatusArgs),
     /// Execute every mutating phase after explicit staging authorization.
     Run(RunArgs),
+    /// Recover a submitted deposit proof only; never sends L1 or L2 transactions.
+    RecoverDeposit {
+        #[command(flatten)]
+        args: RunArgs,
+        #[arg(long, default_value = "usdt", value_parser = ["usdt", "psy"])]
+        token: String,
+    },
 }
 
 #[derive(Args)]
@@ -195,6 +202,16 @@ fn main() -> Result<()> {
         Commands::Init(args) => init(args),
         Commands::Status(args) => status(args),
         Commands::Run(args) => run(args),
+        Commands::RecoverDeposit { args, token } => {
+            let runner = Runner::load(args)?;
+            runner.check_recovery_cli()?;
+            let phase = format!("deposit-{token}");
+            ensure!(runner.run_dir.join(format!("phases/{phase}.intent.json")).is_file(), "no retained deposit intent; refusing to create a deposit");
+            let registered: Value = serde_json::from_slice(&fs::read(runner.run_dir.join("phases/register-p1.ok.json"))?)?;
+            let user_id = registered["user_id"].as_u64().context("missing registered p1 user ID")?;
+            let selected = if token == "usdt" { &runner.usdt } else { &runner.psy };
+            runner.reconcile_submitted_deposit(&phase, &token, selected, user_id)
+        }
     }
 }
 
@@ -382,16 +399,24 @@ fn run(args: RunArgs) -> Result<()> {
         "pass --authorized-staging-transactions only after explicit authorization"
     );
     let runner = Runner::load(args)?;
+    runner.check_recovery_cli()?;
     runner.run_all()
 }
 
 impl Runner {
+    fn check_recovery_cli(&self) -> Result<()> {
+        let help = self.cli("deposit-capabilities", vec!["deposit".into(), "--help".into()], 30, &[])?;
+        validate_recovery_cli_help(&help.stdout)
+    }
+
     fn load(args: RunArgs) -> Result<Self> {
         let root = canonical_root(&args.root)?;
         let run_dir = args.run_dir.canonicalize().with_context(|| {
             format!("run directory does not exist: {}", args.run_dir.display())
         })?;
-        let cli = root.join("target/release/psy_user_cli");
+        let cli = std::env::var_os("PSY_E2E_USER_CLI")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.join("target/release/psy_user_cli"));
         ensure!(cli.is_file(), "missing release CLI: {}", cli.display());
         let rpc_config = run_dir.join("config.json");
         let config: Value = serde_json::from_slice(&fs::read(&rpc_config)?)?;
@@ -859,6 +884,7 @@ impl Runner {
             .context("faucet evidence missing operator")?;
         let claim_phase = format!("l2-faucet-claim-{label}");
         self.mutation(&claim_phase, || {
+            self.wait_for_onchain_claimable(&claim_phase, user_id, operator)?;
             let before = self.latest_checkpoint()?;
             self.cli(
                 &claim_phase,
@@ -1144,14 +1170,13 @@ impl Runner {
                 .join(format!("secrets/deposit-{slug}-nullifier-secret")),
         )?;
         let proof = self.run_dir.join(format!("deposit-{slug}-proof.json"));
+        let result_path = self.run_dir.join(format!("{phase}-recovery-result.json"));
         self.cli(
             &format!("{phase}-recover-proof"),
             vec![
                 "deposit".into(),
                 "--l1-rpc-url".into(),
                 self.l1_rpc_url.clone().into(),
-                "--private-key".into(),
-                self.e_key.clone().into(),
                 "--router-address".into(),
                 self.contracts.router.clone().into(),
                 "--token".into(),
@@ -1178,6 +1203,12 @@ impl Runner {
                 proof.clone().into_os_string(),
                 "--resume-deposit-index".into(),
                 deposit_index.to_string().into(),
+                "--resume-tx-hash".into(),
+                tx_hash.clone().into(),
+                "--resume-chain-id".into(),
+                self.expected_l1_chain_id.to_string().into(),
+                "--result-file".into(),
+                result_path.clone().into_os_string(),
             ],
             900,
             &[(
@@ -1185,6 +1216,8 @@ impl Runner {
                 self.run_dir.join("deployments").display().to_string(),
             )],
         )?;
+        let recovery: Value = serde_json::from_slice(&fs::read(&result_path)?)?;
+        validate_recovery_result(&recovery, self.expected_l1_chain_id)?;
         ensure!(
             proof.is_file() && fs::metadata(&proof)?.len() > 0,
             "recovered deposit proof is missing"
@@ -1205,6 +1238,7 @@ impl Runner {
             "proved_after": proved,
             "proof_file": proof.file_name().and_then(|name| name.to_str()),
             "reconciled_from_retained_intent": true,
+            "recovery_result": recovery,
             "duration_ms": epoch_seconds().saturating_sub(started_at).saturating_mul(1000),
             "completed_at_epoch": epoch_seconds()
         });
@@ -1329,6 +1363,7 @@ impl Runner {
         })?;
         let claim_phase = format!("public-claim-{direction}");
         self.mutation(&claim_phase, || {
+            self.wait_for_onchain_claimable(&claim_phase, receiver_id, sender_id)?;
             let before = self.latest_checkpoint()?;
             self.cli(
                 &claim_phase,
@@ -1654,6 +1689,48 @@ impl Runner {
         rpc_checkpoint(&self.http, &self.network.coordinator)
     }
 
+    fn wait_for_onchain_claimable(&self, phase: &str, user: u64, sender: u64) -> Result<()> {
+        let started = Instant::now();
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let checkpoint = self.latest_checkpoint()?;
+            let nodes = self.wait_for_nodes_at_least(checkpoint)?;
+            let name = format!("{phase}-claimable-{attempt}");
+            let path = self.run_dir.join("logs").join(format!("{name}.json"));
+            self.cli(
+                &name,
+                vec![
+                    "get-claim-amount".into(),
+                    "--rpc-config".into(),
+                    self.rpc_config.clone().into_os_string(),
+                    "--checkpoint-id".into(),
+                    checkpoint.to_string().into(),
+                    "--user-id".into(),
+                    user.to_string().into(),
+                    "--claim-user-id".into(),
+                    sender.to_string().into(),
+                    "--result-file".into(),
+                    path.clone().into_os_string(),
+                ],
+                60,
+                &[],
+            )?;
+            let result: Value = serde_json::from_slice(&fs::read(path)?)?;
+            let amount = result["claim_amount"].as_u64().context("missing chain claim_amount")?;
+            write_json_secure(
+                &self.run_dir.join("logs").join(format!("{name}-snapshot.json")),
+                &json!({"checkpoint": checkpoint, "user": user, "sender": sender,
+                    "claim_amount": amount, "nodes": nodes}),
+            )?;
+            if amount > 0 {
+                return Ok(());
+            }
+            ensure!(started.elapsed() < self.poll_timeout, "chain claimable remained zero for {phase}");
+            thread::sleep(Duration::from_secs(3));
+        }
+    }
+
     fn wait_for_nodes_at_least(&self, target: u64) -> Result<Value> {
         let started = Instant::now();
         let mut checkpoints = [0_u64; 3];
@@ -1927,6 +2004,20 @@ struct UserEvidence {
     user_id: u64,
     public_key_hash: String,
     realm: u64,
+}
+
+fn validate_recovery_cli_help(help: &str) -> Result<()> {
+    for flag in ["--resume-deposit-index", "--resume-tx-hash", "--resume-chain-id", "--result-file"] {
+        ensure!(help.contains(flag), "CLI lacks {flag}; build the deployment branch psy_user_cli and set PSY_E2E_USER_CLI. No transactions started.");
+    }
+    Ok(())
+}
+
+fn validate_recovery_result(result: &Value, expected_chain: u64) -> Result<()> {
+    ensure!(result["status"] == "proof_only", "deposit recovery did not return proof_only");
+    ensure!(result.get("transaction_hash") == Some(&Value::Null), "recovery must not submit a new transaction");
+    ensure!(result["chain_id"].as_u64() == Some(expected_chain), "recovery result chain ID mismatch");
+    Ok(())
 }
 
 fn canonical_root(path: &Path) -> Result<PathBuf> {
@@ -2308,6 +2399,28 @@ fn write_json_secure(path: &Path, value: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_cli_requires_all_safety_flags() {
+        let flags = ["--resume-deposit-index", "--resume-tx-hash", "--resume-chain-id", "--result-file"];
+        assert!(validate_recovery_cli_help(&flags.join("\n")).is_ok());
+        for missing in 0..flags.len() {
+            let help = flags.iter().enumerate().filter(|(i, _)| *i != missing).map(|(_, flag)| *flag).collect::<Vec<_>>().join("\n");
+            assert!(validate_recovery_cli_help(&help).is_err());
+        }
+    }
+
+    #[test]
+    fn recovery_result_must_be_read_only_and_same_chain() {
+        let good = json!({"status": "proof_only", "transaction_hash": null, "chain_id": 84532});
+        assert!(validate_recovery_result(&good, 84532).is_ok());
+        assert!(validate_recovery_result(&good, 97).is_err());
+        for (key, value) in [("status", json!("confirmed")), ("transaction_hash", json!("0x1234")), ("chain_id", Value::Null)] {
+            let mut bad = good.clone(); bad[key] = value;
+            assert!(validate_recovery_result(&bad, 84532).is_err());
+        }
+        assert!(validate_recovery_result(&json!({"status": "proof_only", "chain_id": 84532}), 84532).is_err());
+    }
 
     #[test]
     fn parses_registration_public_key() {

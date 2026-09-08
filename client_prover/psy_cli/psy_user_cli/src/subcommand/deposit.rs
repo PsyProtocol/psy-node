@@ -513,6 +513,26 @@ mod tests {
     }
 
     #[test]
+    fn recovery_uses_keccak_for_l1_not_poseidon() {
+        // Base Sepolia transaction 0x14a08ca1...394b413, deposit 0.
+        let mut deposit = DepositClaimProofDeposit {
+            shield_address: "0x5ca76dbcc717910939317a568e76822cc823b432fe6019f6619edc605bd8b437".into(),
+            token_address: "0x2c8cf094fe026e55ea363a0a4d8ad4fead0cfd04".into(),
+            l2_token_contract_id: "4".into(),
+            amount: "1000000".into(),
+            note_commitment: "0x735820b4f52767c468328498257a26ba6ace83bde49d4032b69d2878bf19db03".into(),
+            source_chain_id: 2,
+        };
+        let expected: B256 = "0x2c03076bef3c99d9e751ae720156258672e865a4b68dac807a644a3b80ea8ab5".parse().unwrap();
+        assert_eq!(l1_deposit_leaf(&deposit).unwrap(), expected);
+        deposit.source_chain_id = 0;
+        assert_ne!(l1_deposit_leaf(&deposit).unwrap(), expected);
+        deposit.source_chain_id = 2;
+        deposit.amount = "1000001".into();
+        assert_ne!(l1_deposit_leaf(&deposit).unwrap(), expected);
+    }
+
+    #[test]
     fn recovered_proof_is_private_and_atomic() {
         let dir = std::env::temp_dir().join(format!("deposit-recovery-test-{}", rand::random::<u64>()));
         let path = dir.join("proof.json");
@@ -1014,6 +1034,27 @@ async fn publish_deposit_backup(
     })
 }
 
+fn l1_deposit_leaf(deposit: &DepositClaimProofDeposit) -> anyhow::Result<B256> {
+    // Bridge._recordDeposit packs five bytes32 values and a uint32 chain index.
+    // Its Keccak leaf is distinct from the L2 Poseidon commitment.
+    let mut packed = Vec::with_capacity(164);
+    for words in [
+        parse_bytes32_to_u32x8(&deposit.shield_address)?,
+        parse_evm_addr_or_bytes32_to_u32x8(&deposit.token_address)?,
+        parse_evm_addr_or_bytes32_to_u32x8(&deposit.l2_token_contract_id)?,
+        parse_decimal_uint_to_u32x8(&deposit.amount)?,
+    ] {
+        for word in words {
+            packed.extend_from_slice(&word.to_be_bytes());
+        }
+    }
+    packed.extend_from_slice(&deposit.source_chain_id.to_be_bytes());
+    for word in parse_bytes32_to_u32x8(&deposit.note_commitment)? {
+        packed.extend_from_slice(&word.to_be_bytes());
+    }
+    Ok(alloy_primitives::keccak256(packed))
+}
+
 fn recovery_network(chain_id: u64, configured: &str) -> &str {
     match chain_id {
         11155111 => "sepolia",
@@ -1171,8 +1212,9 @@ async fn recover_deposit_proof(
     anyhow::ensure!(block["hash"] == receipt["blockHash"], "original deposit receipt is no longer canonical");
     let services_url = resolve_services_url(&config)?;
     let ready = wait_for_deposit_proof(args, &services_url, &bridge_address, deposit_index).await?;
+    anyhow::ensure!(ready.deposit_proof.index == deposit_index, "service proof deposit index mismatch");
     anyhow::ensure!(
-        B256::from(shield_address_to_bytes32(ready.deposit_proof.value)) == leaf,
+        l1_deposit_leaf(&ready.deposit)? == leaf,
         "service proof does not match original deposit leaf"
     );
     let payload = build_deposit_inclusion_proof_payload(args, backup, shield_address, note_commitment, ready)?;

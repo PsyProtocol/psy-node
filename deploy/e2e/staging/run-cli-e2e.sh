@@ -5,7 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 E2E_MANIFEST="$REPO_DIR/deploy/e2e/cli-full-e2e/Cargo.toml"
 E2E_BIN="$REPO_DIR/deploy/e2e/cli-full-e2e/target/release/psy-cli-full-e2e"
-USER_CLI="$REPO_DIR/target/release/psy_user_cli"
+USER_CLI="${PSY_E2E_USER_CLI:-$REPO_DIR/target/release/psy_user_cli}"
+export PSY_E2E_USER_CLI="$USER_CLI"
 BASE_CONFIG="$REPO_DIR/psy-genesis/config.json"
 STAGING_CHAIN="${STAGING_CHAIN:-${STAGING_NETWORK:-bsc}}"
 
@@ -14,6 +15,7 @@ usage() {
 Usage:
   STAGING_CHAIN=sepolia|bsc|base run-cli-e2e.sh init [RUN_DIR] [EVM_KEY_FILE]
   STAGING_CHAIN=sepolia|bsc|base run-cli-e2e.sh status RUN_DIR
+  STAGING_CHAIN=sepolia|bsc|base run-cli-e2e.sh recover-deposit RUN_DIR [--token usdt|psy]
   AUTHORIZED_STAGING_TRANSACTIONS=1 STAGING_CHAIN=sepolia|bsc|base \
     run-cli-e2e.sh run RUN_DIR [RUN_OPTIONS...]
 
@@ -74,10 +76,8 @@ select_profile() {
 }
 
 ensure_e2e_binary() {
-  if [ ! -x "$E2E_BIN" ]; then
-    echo "[staging-cli-e2e] building psy_cli_full_e2e"
-    cargo build --locked --release --manifest-path "$E2E_MANIFEST"
-  fi
+  echo "[staging-cli-e2e] checking incremental E2E build"
+  cargo build --locked --release --manifest-path "$E2E_MANIFEST"
   [ -x "$E2E_BIN" ] || fail "missing E2E executable: $E2E_BIN"
 }
 
@@ -164,6 +164,17 @@ case "$command_name" in
     [ -d "$run_dir" ] || fail "run directory not found: $run_dir"
     validate_run_profile "$run_dir"
     "$E2E_BIN" status --root "$REPO_DIR" --run-dir "$run_dir" "${rpc_args[@]}"
+    ;;
+
+  recover-deposit)
+    ensure_e2e_binary
+    ensure_user_cli
+    run_dir="${1:-}"
+    [ -n "$run_dir" ] || fail "recover-deposit requires RUN_DIR"
+    shift
+    validate_run_profile "$run_dir"
+    echo "[staging-cli-e2e] read-only deposit recovery; no claim or new deposit"
+    "$E2E_BIN" recover-deposit --root "$REPO_DIR" --run-dir "$run_dir" "${rpc_args[@]}" "$@"
     ;;
 
   run)
