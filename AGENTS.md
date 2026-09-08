@@ -67,14 +67,15 @@ Changes to `PrivateNoteInclusionCircuit` or `DepositInclusionCircuit` (protocol 
 3. Use a clean clone or dedicated clean worktree for coordinated releases. Never auto-stash a shared worktree.
 4. Stage only explicitly owned paths. Never use `git add .`, `git add -A`, `git commit -a`, or broad pathspecs.
 5. Push only when the user explicitly authorizes the exact repository, destination ref, and scope in the current task. Never force-push.
-6. npm publication, deployment, and Git push are separate authorizations. Authorization for one does not authorize either of the others.
-7. Every staged delivery set must be reviewed by a different model before commit or push. The reviewer must read every staged diff line. Any post-review edit requires another staged-diff review.
-8. Freeze and remotely publish an upstream commit before placing its SHA in a downstream manifest or gitlink.
-9. Use one immutable `psy-node` source revision for all downstream Cargo pins in one release. Do not pin downstream repositories to the later parent-integration commit when that commit changes only generated artifacts or gitlinks.
-10. Record the exact release SHAs and npm versions in the task output. Do not rely on branch names as provenance.
-11. Commit each independent task or verified dependency milestone immediately after its scoped tests and independent review pass, before starting the next dependent milestone. Never accumulate several successful milestones into one unreviewed working-tree bundle.
-12. Never run formatters or make style-only formatting changes unless the user explicitly requests formatting. Surgical edits must preserve surrounding formatting.
-13. Prefer surgical changes in existing files. A new module must own one named domain; `Defaults`, `Utils`, `Helpers`, and similar grab-bag modules are forbidden. TypeScript tests remain adjacent as `<name>.test.ts`.
+6. Batch commits before pushing: accumulate local commits across tasks and push once per work session instead of pushing after every commit. When a push would ship a run of same-topic commits (fixup/wip/repeated-retry chains), squash them first with an interactive rebase limited to the unpushed range so remote history stays reviewable; keep semantically distinct deliveries as separate commits. Squashing may never rewrite already-pushed history.
+7. npm publication, deployment, and Git push are separate authorizations. Authorization for one does not authorize either of the others.
+8. Every staged delivery set must be reviewed by a different model before commit or push. The reviewer must read every staged diff line. Any post-review edit requires another staged-diff review.
+9. Freeze and remotely publish an upstream commit before placing its SHA in a downstream manifest or gitlink.
+10. Use one immutable `psy-node` source revision for all downstream Cargo pins in one release. Do not pin downstream repositories to the later parent-integration commit when that commit changes only generated artifacts or gitlinks.
+11. Record the exact release SHAs and npm versions in the task output. Do not rely on branch names as provenance.
+12. Commit each independent task or verified dependency milestone immediately after its scoped tests and independent review pass, before starting the next dependent milestone. Never accumulate several successful milestones into one unreviewed working-tree bundle.
+13. Never run formatters or make style-only formatting changes unless the user explicitly requests formatting. Surgical edits must preserve surrounding formatting.
+14. Prefer surgical changes in existing files. A new module must own one named domain; `Defaults`, `Utils`, `Helpers`, and similar grab-bag modules are forbidden. TypeScript tests remain adjacent as `<name>.test.ts`.
 
 ## Repository Cohort
 
