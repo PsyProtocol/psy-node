@@ -1023,6 +1023,9 @@ struct ClaimDepositArgs {
     backup_path: Option<String>,
     #[serde(default)]
     deposit_index: Option<u64>,
+    /// Required with deposit_index when claiming from a non-default L1.
+    #[serde(default)]
+    source_chain_index: Option<u32>,
     #[serde(default)]
     services_url: Option<String>,
 }
@@ -1037,6 +1040,9 @@ struct RetryDepositDeliveryArgs {
     backup_path: Option<String>,
     #[serde(default)]
     deposit_index: Option<u64>,
+    /// Required with deposit_index when retrying a non-default L1 deposit.
+    #[serde(default)]
+    source_chain_index: Option<u32>,
     #[serde(default)]
     services_url: Option<String>,
 }
@@ -1075,6 +1081,11 @@ struct ClaimBatchArgs {
     /// Deposit indices saved by `deposit`.
     #[serde(default)]
     deposit_indices: Vec<u64>,
+    /// Chain-qualified deposits. Use this instead of deposit_indices for
+    /// non-default L1 chains or whenever the same local index exists on
+    /// multiple chains.
+    #[serde(default)]
+    deposit_refs: Vec<DepositRefSpec>,
     /// Alternative to `deposit_indices`: paths returned by `deposit`.
     #[serde(default)]
     backup_paths: Vec<String>,
@@ -1089,6 +1100,12 @@ struct ClaimBatchArgs {
     private_token: String,
     #[serde(default)]
     services_url: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct DepositRefSpec {
+    source_chain_index: u32,
+    deposit_index: u64,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -1124,17 +1141,17 @@ fn default_usdt() -> String {
     "USDT".to_string()
 }
 
-fn network_l1_rpc(wallet: &WalletManager, network: &NetworkId) -> Result<String, String> {
-    required_network_value(wallet.l1_rpc_url(network), network, "l1_rpc_urls")
+fn network_l1_rpc(wallet: &WalletManager, network: &NetworkId, chain_index: u32) -> Result<String, String> {
+    required_network_value(wallet.l1_rpc_url(network, chain_index), network, &format!("l1_chains[{chain_index}].rpc_url"))
 }
-fn network_router(wallet: &WalletManager, network: &NetworkId) -> Result<String, String> {
-    required_network_value(wallet.l1_router_address(network), network, "l1_router_address")
+fn network_router(wallet: &WalletManager, network: &NetworkId, chain_index: u32) -> Result<String, String> {
+    required_network_value(wallet.l1_router_address(network, chain_index), network, &format!("l1_chains[{chain_index}].contracts.Router"))
 }
-fn network_erc20_gateway(wallet: &WalletManager, network: &NetworkId) -> Result<String, String> {
-    required_network_value(wallet.l1_erc20_gateway_address(network), network, "l1_erc20_gateway_address")
+fn network_erc20_gateway(wallet: &WalletManager, network: &NetworkId, chain_index: u32) -> Result<String, String> {
+    required_network_value(wallet.l1_erc20_gateway_address(network, chain_index), network, &format!("l1_chains[{chain_index}].contracts.ERC20Gateway"))
 }
-fn network_bridge(wallet: &WalletManager, network: &NetworkId) -> Result<String, String> {
-    required_network_value(wallet.l1_bridge_address(network), network, "l1_bridge_address")
+fn network_bridge(wallet: &WalletManager, network: &NetworkId, chain_index: u32) -> Result<String, String> {
+    required_network_value(wallet.l1_bridge_address(network, chain_index), network, &format!("l1_chains[{chain_index}].contracts.Bridge"))
 }
 
 fn default_x402_network(psy_network: &NetworkId) -> String {
@@ -1302,13 +1319,24 @@ async fn load_claimable_deposit(
     network: &str,
     backup_path: Option<String>,
     deposit_index: Option<u64>,
+    source_chain_index: Option<u32>,
     services_url: Option<&str>,
 ) -> Result<DepositMaterial, (String, serde_json::Value)> {
     let dir = crate::keystore::keystore_dir();
     let path = match backup_path {
         Some(p) => std::path::PathBuf::from(p),
         None => match deposit_index {
-            Some(i) => crate::wallet::DepositNote::path_in(&dir, network, i).map_err(|e| (format!("{e:#}"), json!({ "gate": "network" })))?,
+            Some(i) => {
+                let chain_index = source_chain_index.unwrap_or(0);
+                let scoped = crate::wallet::DepositNote::path_in(&dir, network, chain_index, i)
+                    .map_err(|e| (format!("{e:#}"), json!({ "gate": "network" })))?;
+                if scoped.exists() || chain_index != 0 {
+                    scoped
+                } else {
+                    crate::wallet::DepositNote::legacy_path_in(&dir, network, i)
+                        .map_err(|e| (format!("{e:#}"), json!({ "gate": "network" })))?
+                }
+            }
             None => {
                 return Err((
                     "pass backup_path or deposit_index (both are in deposit's output)".to_string(),
@@ -1338,7 +1366,8 @@ async fn load_claimable_deposit(
     // HONESTLY. Inflating it past reality makes the service build a proof
     // over a tree the chain does not have yet — which then fails at the
     // claim itself with an opaque error instead of a retryable "not yet".
-    let bridge_value = network_bridge(wallet, &network_id).map_err(|e| (e, json!({ "gate": "config", "field": "l1_bridge_address" })))?;
+    let bridge_value = network_bridge(wallet, &network_id, note.source_chain_index)
+        .map_err(|e| (e, json!({ "gate": "config", "sourceChainIndex": note.source_chain_index })))?;
     let bridge: alloy_primitives::Address = bridge_value.parse().map_err(|e| {
         (
             format!("network `{network_id}` has an invalid `l1_bridge_address`: {e}"),
@@ -1348,7 +1377,8 @@ async fn load_claimable_deposit(
     // Read the proved count keylessly — this is a plain eth_call; it needs no
     // signer. The old from_env-or-0 here made every keyless claim read a fake 0
     // and report "relayer still working" long after the chain proved the deposit.
-    let l1_rpc = network_l1_rpc(wallet, &network_id).map_err(|e| (e, json!({ "gate": "config", "field": "l1_rpc_urls" })))?;
+    let l1_rpc = network_l1_rpc(wallet, &network_id, note.source_chain_index)
+        .map_err(|e| (e, json!({ "gate": "config", "sourceChainIndex": note.source_chain_index })))?;
     let proved = crate::l1::L1Client::read_only(l1_rpc)
         .call_u64(bridge, "provedDepositCount()")
         .await
@@ -1416,8 +1446,8 @@ struct WithdrawArgs {
     nonce: Option<u64>,
 }
 
-fn network_l1_token(wallet: &WalletManager, network: &NetworkId, token: &str) -> Option<String> {
-    wallet.l1_token_address(network, token)
+fn network_l1_token(wallet: &WalletManager, network: &NetworkId, chain_index: u32, token: &str) -> Option<String> {
+    wallet.l1_token_address(network, chain_index, token)
 }
 
 /// Slot holding the note-tree root in the token contract's state.

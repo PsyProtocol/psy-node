@@ -297,11 +297,18 @@ impl PsyWalletServer {
     }
 
     #[tool(
-        description = "Deposit tokens from Ethereum into this wallet's shielded address on Psy. Uses the owner-provisioned L1 key (PSY_MCP_L1_KEY env — the agent never sees it): saves the claim secrets to disk FIRST, then approves if needed and calls Router.deposit. After the bridge relayer proves it, publishes the wallet-compatible proof/secrets pair to the configured Nostr relay so psy-wallet can claim it. Policy-gated at the amount."
+        description = "Deposit tokens from a configured EVM chain into this wallet's shielded address on Psy. Select it with source_chain_index from wallet_status.l1Chains. Uses the owner-provisioned L1 key (PSY_MCP_L1_KEY env — the agent never sees it): saves the claim secrets to disk FIRST, then approves if needed and calls that chain's Router.deposit. After the bridge relayer proves it, publishes the wallet-compatible proof/secrets pair to the configured Nostr relay so psy-wallet can claim it. Policy-gated at the amount."
     )]
     async fn deposit(&self, Parameters(a): Parameters<DepositArgs>) -> Result<CallToolResult, McpError> {
         let state = &self.state;
         let network = wallet_network!(state.wallet, a.network.as_deref());
+        let (l1_chain_id, l1_chain_name) = match state.wallet.l1_chain_identity(&network, a.source_chain_index) {
+            Some(identity) => identity,
+            None => return err_json(
+                format!("unknown L1 source chain index {}", a.source_chain_index),
+                json!({ "gate": "config", "sourceChainIndex": a.source_chain_index }),
+            ),
+        };
         if let Some(user) = state.wallet.current_user(&network).await {
             self.policy.lock().unwrap().set_current_wallet(network.as_str(), user.user_id);
         }
@@ -335,7 +342,7 @@ impl PsyWalletServer {
                 return err_json($m, $x);
             }};
         }
-        let l1_rpc = match network_l1_rpc(&state.wallet, &network) {
+        let l1_rpc = match network_l1_rpc(&state.wallet, &network, a.source_chain_index) {
             Ok(url) => url,
             Err(e) => fail!(e, json!({ "gate": "config", "field": "l1_rpc_urls" })),
         };
@@ -343,7 +350,7 @@ impl PsyWalletServer {
             Ok(c) => c,
             Err(e) => fail!(format!("{e:#}"), json!({ "gate": "l1-key" })),
         };
-        let token_str = match network_l1_token(&state.wallet, &network, &a.token) {
+        let token_str = match network_l1_token(&state.wallet, &network, a.source_chain_index, &a.token) {
             Some(t) => t,
             None => fail!(format!("no L1 address known for {}", a.token), json!({ "gate": "config" })),
         };
@@ -351,7 +358,7 @@ impl PsyWalletServer {
             Ok(t) => t,
             Err(e) => fail!(format!("bad token address {token_str}: {e}"), json!({ "gate": "config" })),
         };
-        let router_value = match network_router(&state.wallet, &network) {
+        let router_value = match network_router(&state.wallet, &network, a.source_chain_index) {
             Ok(value) => value,
             Err(e) => fail!(e, json!({ "gate": "config", "field": "l1_router_address" })),
         };
@@ -359,7 +366,7 @@ impl PsyWalletServer {
             Ok(r) => r,
             Err(e) => fail!(format!("bad router address: {e}"), json!({ "gate": "config" })),
         };
-        let bridge_value = match network_bridge(&state.wallet, &network) {
+        let bridge_value = match network_bridge(&state.wallet, &network, a.source_chain_index) {
             Ok(value) => value,
             Err(e) => fail!(e, json!({ "gate": "config", "field": "l1_bridge_address" })),
         };
@@ -427,7 +434,7 @@ impl PsyWalletServer {
         // Router leaves allowance(gateway)=0 and the deposit reverts with
         // ERC20InsufficientAllowance. Mirrors the web wallet's
         // `spender = erc20GatewayAddress || routerAddress`.
-        let gateway_value = match network_erc20_gateway(&state.wallet, &network) {
+        let gateway_value = match network_erc20_gateway(&state.wallet, &network, a.source_chain_index) {
             Ok(value) => value,
             Err(e) => fail!(e, json!({ "gate": "config", "field": "l1_erc20_gateway_address" })),
         };
@@ -466,7 +473,7 @@ impl PsyWalletServer {
                 let _ = note.persist(&dir);
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
                 let service_proof = loop {
-                    match load_claimable_deposit(&state.wallet, network.as_str(), Some(backup.to_string_lossy().to_string()), None, None).await {
+                    match load_claimable_deposit(&state.wallet, network.as_str(), Some(backup.to_string_lossy().to_string()), None, None, None).await {
                         Ok(DepositMaterial::Ready { proof, .. }) => break proof,
                         Ok(DepositMaterial::AlreadyClaimed { .. }) => {
                             return err_json(
@@ -526,6 +533,8 @@ impl PsyWalletServer {
                         ok_json(json!({
                             "status": "ok", "submitted": true, "delivered": true, "l1TxHash": tx,
                             "amountBaseUnits": a.amount_base_units, "token": a.token,
+                            "sourceChainIndex": a.source_chain_index, "l1ChainId": l1_chain_id,
+                            "l1ChainName": l1_chain_name,
                             "expectedDepositIndex": expected_index, "nostrEventIds": event_ids,
                             "recipientNpub": identity.npub,
                             "next": "The deposit proof and secrets were delivered to psy-wallet. Claim it from the wallet claim list.",
@@ -566,8 +575,17 @@ impl PsyWalletServer {
         let path = match a.backup_path.as_deref() {
             Some(path) => std::path::PathBuf::from(path),
             None => match a.deposit_index {
-                Some(index) => match crate::wallet::DepositNote::path_in(&dir, network.as_str(), index) {
-                    Ok(path) => path,
+                Some(index) => match crate::wallet::DepositNote::path_in(
+                    &dir,
+                    network.as_str(),
+                    a.source_chain_index.unwrap_or(0),
+                    index,
+                ) {
+                    Ok(path) if path.exists() || a.source_chain_index.unwrap_or(0) != 0 => path,
+                    Ok(_) => match crate::wallet::DepositNote::legacy_path_in(&dir, network.as_str(), index) {
+                        Ok(path) => path,
+                        Err(e) => return err_json(format!("{e:#}"), json!({ "gate": "network" })),
+                    },
                     Err(e) => return err_json(format!("{e:#}"), json!({ "gate": "network" })),
                 },
                 None => {
@@ -607,6 +625,7 @@ impl PsyWalletServer {
                 &state.wallet,
                 network.as_str(),
                 Some(path.to_string_lossy().to_string()),
+                None,
                 None,
                 a.services_url.as_deref(),
             )
@@ -682,6 +701,7 @@ impl PsyWalletServer {
             network.as_str(),
             a.backup_path.clone(),
             a.deposit_index,
+            a.source_chain_index,
             a.services_url.as_deref(),
         )
         .await
@@ -811,7 +831,7 @@ impl PsyWalletServer {
             self.policy.lock().unwrap().set_current_wallet(network.as_str(), user.user_id);
         }
         let wants_public = !a.public_claims.is_empty();
-        let wants_deposit = !a.deposit_indices.is_empty() || !a.backup_paths.is_empty();
+        let wants_deposit = !a.deposit_indices.is_empty() || !a.deposit_refs.is_empty() || !a.backup_paths.is_empty();
         let wants_private = !a.private_notes.is_empty() || a.drain_private;
         let wants_transfer = !a.transfers.is_empty();
         let wants_withdraw = !a.withdraws.is_empty();
@@ -934,7 +954,10 @@ impl PsyWalletServer {
             };
             let token_addr = match spec.l1_token_address.clone() {
                 Some(t) => t,
-                None => match network_l1_token(&state.wallet, &network, &spec.token) {
+                None => match u32::try_from(spec.dest_chain_index)
+                    .ok()
+                    .and_then(|chain_index| network_l1_token(&state.wallet, &network, chain_index, &spec.token))
+                {
                     Some(t) => t,
                     None => {
                         refund_all(&mut spent_auths);
@@ -967,10 +990,21 @@ impl PsyWalletServer {
         let mut deposit_notes: Vec<crate::wallet::DepositNote> = Vec::new();
         let mut deposit_proofs: Vec<serde_json::Value> = Vec::new();
         let mut skipped_claimed: Vec<u64> = Vec::new();
-        let mut deposit_lookups: Vec<(Option<String>, Option<u64>)> = a.backup_paths.iter().map(|p| (Some(p.clone()), None)).collect();
-        deposit_lookups.extend(a.deposit_indices.iter().copied().map(|i| (None, Some(i))));
-        for (backup_path, deposit_index) in deposit_lookups {
-            match load_claimable_deposit(&state.wallet, network.as_str(), backup_path, deposit_index, a.services_url.as_deref()).await {
+        let mut deposit_lookups: Vec<(Option<String>, Option<u64>, Option<u32>)> =
+            a.backup_paths.iter().map(|p| (Some(p.clone()), None, None)).collect();
+        deposit_lookups.extend(a.deposit_indices.iter().copied().map(|i| (None, Some(i), Some(0))));
+        deposit_lookups.extend(a.deposit_refs.iter().map(|item| (None, Some(item.deposit_index), Some(item.source_chain_index))));
+        for (backup_path, deposit_index, source_chain_index) in deposit_lookups {
+            match load_claimable_deposit(
+                &state.wallet,
+                network.as_str(),
+                backup_path,
+                deposit_index,
+                source_chain_index,
+                a.services_url.as_deref(),
+            )
+            .await
+            {
                 Ok(DepositMaterial::Ready { note, proof }) => {
                     deposit_notes.push(note);
                     deposit_proofs.push(proof);
@@ -1132,7 +1166,7 @@ impl PsyWalletServer {
     }
 
     #[tool(
-        description = "Withdraw to an Ethereum address: burns the amount on Psy and the bridge relayer settles the L1 leg, so the agent needs no Ethereum gas. Policy-gated at the amount like any other spend."
+        description = "Withdraw to an address on a configured EVM chain: select it with dest_chain_index from wallet_status.l1Chains. Burns the amount on Psy and the bridge relayer settles the destination-chain leg, so the agent needs no EVM gas. Policy-gated at the amount like any other spend."
     )]
     async fn withdraw(&self, Parameters(a): Parameters<WithdrawArgs>) -> Result<CallToolResult, McpError> {
         // ZERO RECIPIENT = burned money. The L1 leg is settled by the relayer
@@ -1152,6 +1186,17 @@ impl PsyWalletServer {
         }
         let state = &self.state;
         let network = wallet_network!(state.wallet, a.network.as_deref());
+        let destination_chain_index = match u32::try_from(a.dest_chain_index) {
+            Ok(value) => value,
+            Err(_) => return err_json("destination chain index exceeds u32".to_string(), json!({ "gate": "args" })),
+        };
+        let (l1_chain_id, l1_chain_name) = match state.wallet.l1_chain_identity(&network, destination_chain_index) {
+            Some(identity) => identity,
+            None => return err_json(
+                format!("unknown L1 destination chain index {}", a.dest_chain_index),
+                json!({ "gate": "config", "destinationChainIndex": a.dest_chain_index }),
+            ),
+        };
         if let Some(user) = state.wallet.current_user(&network).await {
             self.policy.lock().unwrap().set_current_wallet(network.as_str(), user.user_id);
         }
@@ -1171,7 +1216,10 @@ impl PsyWalletServer {
         };
         let token_addr = match a.l1_token_address.clone() {
             Some(t) => t,
-            None => match network_l1_token(&state.wallet, &network, &a.token) {
+            None => match u32::try_from(a.dest_chain_index)
+                .ok()
+                .and_then(|chain_index| network_l1_token(&state.wallet, &network, chain_index, &a.token))
+            {
                 Some(t) => t,
                 None => {
                     self.policy.lock().unwrap().refund(&auth, charge);
@@ -1224,6 +1272,8 @@ impl PsyWalletServer {
             Ok(leaf) => ok_json(json!({
                 "status": "ok", "submitted": true, "amount": a.amount_nano, "token": a.token,
                 "l1Recipient": a.l1_recipient, "l1TokenAddress": token_addr, "nonce": nonce,
+                "destinationChainIndex": a.dest_chain_index, "l1ChainId": l1_chain_id,
+                "l1ChainName": l1_chain_name,
                 "txHash": leaf,
                 "note": "Burned on Psy. The bridge relayer settles the Ethereum leg; watch the L1 recipient.",
             })),

@@ -397,6 +397,7 @@ impl PsyWalletServer {
         ok_json(json!({
             "network": network.as_str(),
             "defaultNetwork": state.wallet.default_network(),
+            "l1Chains": state.wallet.l1_chain_summaries(&network),
             "activeWallet": active,
             "walletCount": state.wallet.list_users(&network).await.map(|users| users.len()).unwrap_or(0),
             "endpoints": {
