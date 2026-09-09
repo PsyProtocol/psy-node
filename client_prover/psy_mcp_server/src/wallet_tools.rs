@@ -84,11 +84,16 @@ impl PsyWalletServer {
                 Ok(kp) => kp,
                 Err(e) => return err_json(e, json!({})),
             };
+            let sign_type = if a.fingerprint.is_some() {
+                "custom".to_string()
+            } else {
+                a.sign_type.as_deref().unwrap_or("zk").trim().to_ascii_lowercase()
+            };
             // Funds-safety invariant: the key is durably backed up BEFORE the
             // chain learns the identity. A crash after this write leaves a
             // harmless stray file; the reverse order could leave an on-chain
             // wallet whose key nobody has. See keystore.rs.
-            let backup_path = match keystore::persist_generated_key_named(&pk, &fp, network.as_str(), &a.name) {
+            let backup_path = match keystore::persist_generated_key_named_with_sign_type(&pk, &fp, network.as_str(), &a.name, &sign_type) {
                 Ok(p) => p,
                 Err(e) => {
                     return err_json(
@@ -97,7 +102,7 @@ impl PsyWalletServer {
                     )
                 }
             };
-            match state.wallet.register(&network, &pk, &fp, &a.name).await {
+            match state.wallet.register(&network, &pk, &fp, &a.name, &sign_type).await {
                 Ok(l) => (l, Some(backup_path)),
                 Err(e) => {
                     tracing::info!(
@@ -114,6 +119,9 @@ impl PsyWalletServer {
             }
         };
         if let Some(path) = key_backup_path.as_ref() {
+            if let Err(e) = keystore::persist_public_identity(path, &loaded.pk_hash.to_string(), loaded.user_id) {
+                tracing::warn!("could not add the public identity to {}: {e:#}", path.display());
+            }
             match state.wallet.receive_identity(&network).await {
                 Ok(identity) => {
                     if let Err(e) = keystore::persist_default_receive_address(path, &identity.shield_address_base58, &identity.npub) {
@@ -142,6 +150,7 @@ impl PsyWalletServer {
             "userId": loaded.user_id,
             "psyId": format!("Psy-{:08}", loaded.user_id),
             "fingerprint": loaded.fingerprint.to_string(),
+            "signType": loaded.sign_type,
             "policyId": policy_id,
             "allowedRecipientCount": recipient_count,
             "note": "Key registered with REAL on-chain proving via WalletSession. Issue a session with issue_session to let the agent spend.",
@@ -228,6 +237,10 @@ impl PsyWalletServer {
                 );
             }
         };
+
+        if let Err(e) = keystore::persist_public_identity(&backup_path, &loaded.pk_hash.to_string(), loaded.user_id) {
+            tracing::warn!("could not add the public identity to {}: {e:#}", backup_path.display());
+        }
 
         match state.wallet.receive_identity(&network).await {
             Ok(identity) => {
@@ -338,6 +351,7 @@ impl PsyWalletServer {
                     "userId": u.user_id,
                     "psyId": format!("Psy-{:08}", u.user_id),
                     "pkHash": u.pk_hash.to_string(),
+                    "signType": u.sign_type,
                     "active": active.as_deref() == Some(u.pk_hash.to_string().as_str()),
                     "softwareDefined": u.mandate.is_some(),
                 })
@@ -374,6 +388,7 @@ impl PsyWalletServer {
             "userId": selected.user_id,
             "psyId": format!("Psy-{:08}", selected.user_id),
             "pkHash": selected.pk_hash.to_string(),
+            "signType": selected.sign_type,
             "active": true,
         }))
     }
@@ -391,6 +406,7 @@ impl PsyWalletServer {
                 "userId": u.user_id,
                 "psyId": format!("Psy-{:08}", u.user_id),
                 "pkHash": u.pk_hash.to_string(),
+                "signType": u.sign_type,
                 "softwareDefined": u.mandate.is_some(),
             })
         });
@@ -404,7 +420,14 @@ impl PsyWalletServer {
                 "coordinator": endpoints.coordinator,
                 "realm": endpoints.realm,
                 "proveProxy": endpoints.prove_proxy,
+                "faucet": endpoints.faucet,
                 "apiServices": endpoints.api_services,
+                "indexerGraphql": endpoints.indexer_graphql,
+                "explorer": endpoints.explorer,
+                "nostrRelay": endpoints.nostr_relay,
+                "l1Rpc": endpoints.l1_rpc,
+                "bridge": endpoints.bridge,
+                "l1Config": endpoints.l1_config,
             },
         }))
     }

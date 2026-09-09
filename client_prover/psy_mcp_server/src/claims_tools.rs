@@ -1,16 +1,162 @@
 use super::*;
 use crate::wallet_network;
 
+async fn probe_endpoint(kind: &'static str, url: String) -> serde_json::Value {
+    let parsed = match reqwest::Url::parse(&url) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return json!({ "kind": kind, "url": url, "reachable": false, "httpStatus": null, "error": error.to_string() })
+        }
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return json!({
+            "kind": kind,
+            "url": url,
+            "reachable": null,
+            "httpStatus": null,
+            "error": format!("{} endpoint is configured but not HTTP-probed", parsed.scheme()),
+        });
+    }
+    let started = std::time::Instant::now();
+    match reqwest::Client::new()
+        .get(parsed)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(response) => json!({
+            "kind": kind,
+            "url": url,
+            "reachable": true,
+            "httpStatus": response.status().as_u16(),
+            "latencyMs": started.elapsed().as_millis() as u64,
+            "error": null,
+        }),
+        Err(error) => json!({
+            "kind": kind,
+            "url": url,
+            "reachable": false,
+            "httpStatus": null,
+            "latencyMs": started.elapsed().as_millis() as u64,
+            "error": error.to_string(),
+        }),
+    }
+}
+
+async fn probe_endpoints(summary: crate::wallet::EndpointSummary) -> Vec<serde_json::Value> {
+    let groups = [
+        ("coordinator", summary.coordinator),
+        ("realm", summary.realm),
+        ("proveProxy", summary.prove_proxy),
+        ("faucet", summary.faucet),
+        ("apiServices", summary.api_services),
+        ("indexerGraphql", summary.indexer_graphql),
+        ("explorer", summary.explorer),
+        ("nostrRelay", summary.nostr_relay),
+        ("l1Rpc", summary.l1_rpc),
+        ("bridge", summary.bridge),
+        ("l1Config", summary.l1_config),
+    ];
+    futures_util::future::join_all(
+        groups
+            .into_iter()
+            .flat_map(|(kind, urls)| urls.into_iter().map(move |url| probe_endpoint(kind, url))),
+    )
+    .await
+}
+
 #[tool_router(router = claims_tools_router, vis = "pub(crate)")]
 impl PsyWalletServer {
-    #[tool(description = "Live chain status: the latest coordinator checkpoint id.")]
+    #[tool(
+        description = "Health of every configured Psy network (or one selected network): complete latest coordinator block state, active wallet, and live reachability/latency for coordinator, realm, prove-proxy, faucet, services, indexer, explorer, Nostr, bridge and L1 endpoints. A broken network or endpoint is reported as data and does not fail the whole MCP call."
+    )]
     async fn get_chain_status(&self, Parameters(a): Parameters<NetworkArgs>) -> Result<CallToolResult, McpError> {
         let state = &self.state;
-        let network = wallet_network!(state.wallet, a.network.as_deref());
-        match state.wallet.latest_checkpoint(&network).await {
-            Ok(cp) => ok_json(json!({ "network": network.as_str(), "checkpointId": cp })),
-            Err(e) => err_json(format!("chain unreachable: {e:#}"), json!({})),
-        }
+        let networks = match a.network.as_deref() {
+            Some(requested) => match state.wallet.resolve_network(Some(requested)) {
+                Ok(network) => vec![network],
+                Err(error) => return err_json(error, json!({ "gate": "network" })),
+            },
+            None => state.wallet.configured_networks(),
+        };
+        // Probe in parallel so one dead network does not delay every healthy
+        // result. Bound each probe as well: health inspection itself must not
+        // become another apparent MCP startup/hang failure.
+        let statuses = futures_util::future::join_all(networks.into_iter().map(|network| async move {
+            let endpoints = match state.wallet.endpoint_summary(&network) {
+                Ok(summary) => probe_endpoints(summary).await,
+                Err(error) => vec![json!({ "kind": "config", "url": null, "reachable": false, "error": error.to_string() })],
+            };
+            let probe = async {
+                state.wallet.ensure_network(&network).await?;
+                let (checkpoint_id, latest_block_state) = state.wallet.latest_block_state_json(&network).await?;
+                let active = state.wallet.current_user(&network).await;
+                let wallet_count = state.wallet.list_users(&network).await.map(|users| users.len()).unwrap_or(0);
+                Ok::<_, anyhow::Error>((checkpoint_id, latest_block_state, active, wallet_count))
+            };
+            match tokio::time::timeout(std::time::Duration::from_secs(15), probe).await {
+                Ok(Ok((checkpoint_id, latest_block_state, active, wallet_count))) => {
+                    let active_wallet = active.as_ref().map(|user| {
+                        json!({
+                            "name": user.name,
+                            "userId": user.user_id,
+                            "psyId": format!("Psy-{:08}", user.user_id),
+                            "pkHash": user.pk_hash.to_string(),
+                            "fingerprint": user.fingerprint.to_string(),
+                            "signType": user.sign_type,
+                            "accountType": if user.mandate.is_some() { "softwareDefined" } else { "standard" },
+                            "softwareDefined": user.mandate.is_some(),
+                            "mandate": user.mandate,
+                        })
+                    });
+                    json!({
+                        "network": network.as_str(),
+                        "connected": true,
+                        "checkpointId": checkpoint_id,
+                        "latestBlockState": latest_block_state,
+                        // Keep the original flat fields for existing clients.
+                        "activeUserId": active.as_ref().map(|user| user.user_id),
+                        "activePublicKey": active.as_ref().map(|user| user.pk_hash.to_string()),
+                        "activeWallet": active_wallet,
+                        "walletCount": wallet_count,
+                        "endpoints": endpoints,
+                        "error": null,
+                    })
+                }
+                Ok(Err(error)) => json!({
+                    "network": network.as_str(),
+                    "connected": false,
+                    "checkpointId": null,
+                    "latestBlockState": null,
+                    "activeUserId": null,
+                    "activePublicKey": null,
+                    "activeWallet": null,
+                    "walletCount": null,
+                    "endpoints": endpoints,
+                    "error": format!("network probe failed: {error:#}"),
+                }),
+                Err(_) => json!({
+                    "network": network.as_str(),
+                    "connected": false,
+                    "checkpointId": null,
+                    "latestBlockState": null,
+                    "activeUserId": null,
+                    "activePublicKey": null,
+                    "activeWallet": null,
+                    "walletCount": null,
+                    "endpoints": endpoints,
+                    "error": "network probe timed out after 15 seconds",
+                }),
+            }
+        }))
+        .await;
+        let connected = statuses.iter().filter(|status| status["connected"] == true).count();
+        ok_json(json!({
+            "connected": connected,
+            "total": statuses.len(),
+            "allConnected": connected == statuses.len(),
+            "chains": statuses,
+        }))
     }
 
     #[tool(description = "Info about the loaded wallet: user id and Psy ID.")]

@@ -1792,7 +1792,11 @@ async fn main() -> anyhow::Result<()> {
     let wallet = WalletManager::from_config(&config_path, network.as_deref()).await?;
     tracing::info!("using default Psy network {}", wallet.default_network());
 
-    startup::restore_wallets(&wallet).await?;
+    match tokio::time::timeout(Duration::from_secs(30), startup::restore_wallets(&wallet)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!("wallet restoration failed; MCP will continue without the affected wallets: {error:#}"),
+        Err(_) => tracing::warn!("wallet restoration exceeded 30 seconds; MCP will continue in degraded mode"),
+    }
     if std::env::var("PSY_MCP_OWNER_TOKEN").map(|v| v.trim().is_empty()).unwrap_or(true) {
         tracing::warn!(
             "PSY_MCP_OWNER_TOKEN is not set: every execute_* transaction tool is DISABLED. \

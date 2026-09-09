@@ -324,6 +324,9 @@ pub struct LoadedUser {
     pub user_id: u64,
     /// Circuit fingerprint is part of the wallet identity and must survive reloads.
     pub fingerprint: QHashOut<F>,
+    /// Signing circuit name (`zk`, `secp256k1`, `eth-personal-secp256k1`,
+    /// `sd-key`, or `custom`).
+    pub sign_type: String,
     pub mandate: Option<Mandate>,
     /// Kept in memory (never serialized) so the wallet can re-derive its
     /// private receive identity — the shielded address' blinding factors
@@ -343,7 +346,14 @@ pub struct EndpointSummary {
     pub coordinator: Vec<String>,
     pub realm: Vec<String>,
     pub prove_proxy: Vec<String>,
+    pub faucet: Vec<String>,
     pub api_services: Vec<String>,
+    pub indexer_graphql: Vec<String>,
+    pub explorer: Vec<String>,
+    pub nostr_relay: Vec<String>,
+    pub l1_rpc: Vec<String>,
+    pub bridge: Vec<String>,
+    pub l1_config: Vec<String>,
 }
 
 struct NetworkWallet {
@@ -511,6 +521,10 @@ struct McpNetworkConfig {
     l1_rpc_urls: Vec<String>,
     #[serde(default)]
     bridge_url: Vec<String>,
+    #[serde(default)]
+    indexer_graphql_url: Vec<String>,
+    #[serde(default)]
+    explorer_url: Vec<String>,
     #[serde(default)]
     l1_config_url: Option<String>,
     #[serde(skip)]
@@ -1021,24 +1035,39 @@ impl WalletManager {
         let mcp_network = mcp_networks
             .get_mut(&network)
             .with_context(|| format!("network `{network}` is not present in Psy config"))?;
-        load_l1_config(&network, mcp_network).await?;
+        if let Err(error) = tokio::time::timeout(Duration::from_secs(15), load_l1_config(&network, mcp_network))
+            .await
+            .unwrap_or_else(|_| Err(anyhow!("L1 configuration probe timed out after 15 seconds")))
+        {
+            // L1 bridge metadata is optional for the core Psy wallet. A
+            // temporary config-host or EVM RPC outage must not take down the
+            // entire MCP server (including its health/status tools).
+            tracing::warn!("L1 configuration for network `{network}` is unavailable; bridge tools will remain unavailable until restart: {error:#}");
+        }
         let rpc_config = psy_config
             .get_network(network.as_str())
             .with_context(|| format!("network `{network}` is not present in Psy config"))?
             .clone();
-        let session = WalletSession::new(&rpc_config)
-            .await
-            .context("failed to init WalletSession (prove-proxy / coordinator unreachable?)")?;
         let default_network = network.clone();
         let mut networks = HashMap::new();
-        networks.insert(
-            network.clone(),
-            Arc::new(Mutex::new(NetworkWallet {
-                session,
-                users: HashMap::new(),
-                active_user: None,
-            })),
-        );
+        match tokio::time::timeout(Duration::from_secs(15), WalletSession::new(&rpc_config)).await {
+            Ok(Ok(session)) => {
+                networks.insert(
+                    network.clone(),
+                    Arc::new(Mutex::new(NetworkWallet {
+                        session,
+                        users: HashMap::new(),
+                        active_user: None,
+                    })),
+                );
+            }
+            Ok(Err(error)) => tracing::warn!(
+                "default network `{network}` is currently unreachable; MCP will start in degraded mode and retry when a tool probes the network: {error:#}"
+            ),
+            Err(_) => tracing::warn!(
+                "default network `{network}` initialization timed out after 15 seconds; MCP will start in degraded mode"
+            ),
+        }
         Ok(Self {
             config: psy_config,
             mcp_networks,
@@ -1049,6 +1078,12 @@ impl WalletManager {
 
     pub fn default_network(&self) -> &NetworkId {
         &self.default_network
+    }
+
+    pub fn configured_networks(&self) -> Vec<NetworkId> {
+        let mut networks = self.mcp_networks.keys().cloned().collect::<Vec<_>>();
+        networks.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        networks
     }
 
     /// The configured Nostr relay for private-note delivery on this network.
@@ -1062,13 +1097,25 @@ impl WalletManager {
             })
     }
 
-    pub fn endpoint_summary(&self, network: &NetworkId) -> Result<EndpointSummary> {
-        let network = self.config.get_network(network.as_str())?;
+    pub fn endpoint_summary(&self, network_id: &NetworkId) -> Result<EndpointSummary> {
+        let network = self.config.get_network(network_id.as_str())?;
         Ok(EndpointSummary {
             coordinator: network.coordinator_configs.iter().flat_map(|c| c.rpc_url.clone()).collect(),
             realm: network.realm_configs.iter().flat_map(|r| r.rpc_url.clone()).collect(),
             prove_proxy: network.prove_proxy_url.clone(),
+            faucet: network.faucet_rpc_url.clone(),
             api_services: network.api_services_url.clone().unwrap_or_default(),
+            indexer_graphql: self.mcp_networks.get(network_id).map(|config| config.indexer_graphql_url.clone()).unwrap_or_default(),
+            explorer: self.mcp_networks.get(network_id).map(|config| config.explorer_url.clone()).unwrap_or_default(),
+            nostr_relay: (!network.nostr_relay_url.trim().is_empty()).then(|| network.nostr_relay_url.clone()).into_iter().collect(),
+            l1_rpc: self.mcp_networks.get(network_id).map(|config| config.l1_rpc_urls.clone()).unwrap_or_default(),
+            bridge: self.mcp_networks.get(network_id).map(|config| config.bridge_url.clone()).unwrap_or_default(),
+            l1_config: self
+                .mcp_networks
+                .get(network_id)
+                .and_then(|config| config.l1_config_url.clone())
+                .into_iter()
+                .collect(),
         })
     }
 
@@ -1244,7 +1291,7 @@ impl WalletManager {
     /// devnet whose checkpoints are near-instant. We poll until the id
     /// exists, mirroring what the shipped web wallet's sign-in sequence
     /// does.
-    pub async fn register(&self, network: &NetworkId, private_key_hex: &str, fingerprint_hex: &str, name: &str) -> Result<LoadedUser> {
+    pub async fn register(&self, network: &NetworkId, private_key_hex: &str, fingerprint_hex: &str, name: &str, sign_type: &str) -> Result<LoadedUser> {
         let private_key = Self::parse_key(private_key_hex)?;
         let fingerprint = fingerprint_hex.trim().parse::<QHashOut<F>>().map_err(|_| anyhow!("invalid fingerprint (expected QHashOut hex)"))?;
         let pk_hash = self.state(network).await?.session.register_user(private_key, fingerprint).await?;
@@ -1254,6 +1301,7 @@ impl WalletManager {
             pk_hash,
             user_id,
             fingerprint,
+            sign_type: sign_type.to_string(),
             mandate: None,
             private_key,
         };
@@ -1363,6 +1411,7 @@ impl WalletManager {
             pk_hash,
             user_id,
             fingerprint,
+            sign_type: "sd-key".to_string(),
             mandate: Some(mandate),
             private_key,
         };
@@ -1427,9 +1476,24 @@ impl WalletManager {
             (pk_hash, fingerprint)
         };
         let user_id = self.resolve_user_id(network, pk_hash).await?;
-        let loaded = LoadedUser { name: name.to_string(), pk_hash, user_id, fingerprint, mandate: None, private_key };
+        let resolved_sign_type = if fingerprint_hex.is_some() {
+            "custom".to_string()
+        } else {
+            sign_type.unwrap_or("zk").trim().to_ascii_lowercase()
+        };
+        let loaded = LoadedUser { name: name.to_string(), pk_hash, user_id, fingerprint, sign_type: resolved_sign_type, mandate: None, private_key };
         self.activate_user(network, loaded.clone()).await?;
         Ok(loaded)
+    }
+
+    async fn infer_sign_type(&self, network: &NetworkId, private_key: QHashOut<F>, fingerprint: QHashOut<F>) -> Result<String> {
+        let mut state = self.state(network).await?;
+        for sign_type in ["zk", "secp256k1", "eth-personal-secp256k1"] {
+            if state.resolve_fingerprint(private_key, Some(sign_type), None).await? == fingerprint {
+                return Ok(sign_type.to_string());
+            }
+        }
+        Ok("custom".to_string())
     }
 
     /// Restore a wallet from a key backup, re-registering the agent's circuit
@@ -1450,9 +1514,14 @@ impl WalletManager {
             let private_key = Self::parse_key(&backup.private_key)?;
             let fingerprint = backup.fingerprint.trim().parse::<QHashOut<F>>()
                 .map_err(|_| anyhow!("key backup has an invalid fingerprint"))?;
+            let sign_type = match backup.sign_type.as_deref() {
+                Some(value) => value.to_string(),
+                None => self.infer_sign_type(network, private_key, fingerprint).await?,
+            };
             let pk_hash = self.state(network).await?.session.add_user(private_key, fingerprint).await?;
             let user_id = self.resolve_user_id(network, pk_hash).await?;
-            let loaded = LoadedUser { name: backup.name.clone(), pk_hash, user_id, fingerprint, mandate: None, private_key };
+            validate_cached_identity(backup, pk_hash, user_id)?;
+            let loaded = LoadedUser { name: backup.name.clone(), pk_hash, user_id, fingerprint, sign_type, mandate: None, private_key };
             self.activate_user(network, loaded.clone()).await?;
             return Ok(loaded);
         };
@@ -1477,11 +1546,13 @@ impl WalletManager {
         }
         let pk_hash = self.state(network).await?.session.add_user(private_key, fingerprint).await?;
         let user_id = self.resolve_user_id(network, pk_hash).await?;
+        validate_cached_identity(backup, pk_hash, user_id)?;
         let loaded = LoadedUser {
             name: backup.name.clone(),
             pk_hash,
             user_id,
             fingerprint,
+            sign_type: "sd-key".to_string(),
             mandate: Some(mandate),
             private_key,
         };
@@ -1514,6 +1585,12 @@ impl WalletManager {
 
     pub async fn latest_checkpoint(&self, network: &NetworkId) -> Result<u64> {
         self.state(network).await?.latest_checkpoint().await
+    }
+
+    pub async fn latest_block_state_json(&self, network: &NetworkId) -> Result<(u64, serde_json::Value)> {
+        let state = self.state(network).await?.session.st_provider.get_coordinator_latest_block_state().await?;
+        let checkpoint_id = state.checkpoint_id;
+        Ok((checkpoint_id, serde_json::to_value(state).context("serialize coordinator latest block state")?))
     }
 
     /// Public claimable owed to the loaded user by a specific sender.
@@ -1699,6 +1776,22 @@ impl WalletManager {
     pub async fn generate_keypair(&self, network: &NetworkId, sign_type: Option<&str>, fingerprint: Option<&str>) -> Result<(String, String)> {
         self.state(network).await?.generate_keypair(sign_type, fingerprint).await
     }
+}
+
+fn validate_cached_identity(backup: &crate::keystore::KeyBackup, pk_hash: QHashOut<F>, user_id: u64) -> Result<()> {
+    if let Some(cached) = backup.public_key.as_deref() {
+        anyhow::ensure!(
+            cached == pk_hash.to_string(),
+            "key backup public_key {cached} does not match the public key derived from its private key and fingerprint ({pk_hash})"
+        );
+    }
+    if let Some(cached) = backup.user_id {
+        anyhow::ensure!(
+            cached == user_id,
+            "key backup user_id {cached} does not match user_id {user_id} resolved on the selected network"
+        );
+    }
+    Ok(())
 }
 
 /// The note tree is 20 levels deep (2^20 notes per user/contract).
