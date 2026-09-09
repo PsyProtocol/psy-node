@@ -205,6 +205,12 @@ fn require_checkpoint_id(checkpoint_id: Option<u64>, source: &str) -> Result<u64
     checkpoint_id.with_context(|| format!("{} has no checkpoint id", source))
 }
 
+fn reward_path_info(level: u8, index: u64) -> Result<u64> {
+    const INDEX_MASK: u64 = 0x00ff_ffff_ffff_ffff;
+    anyhow::ensure!(index <= INDEX_MASK, "reward tree node index {} exceeds 56 bits", index);
+    Ok(((level as u64) << 56) | index)
+}
+
 pub async fn build_realm_proofs(
     provider: &RpcProvider,
     last_claimed_checkpoint_id: u64,
@@ -385,7 +391,7 @@ fn load_job_ids_from_file(path: &str) -> Result<ClaimRewardJobsWithRealm> {
             .with_context(|| format!("failed to parse jobs backup record at offset {}", offset))?;
         let job = QProvingJobDataIDWithRewardPreimage::new(
             metadata.job_id,
-            metadata.reward_tree_node_key.index,
+            reward_path_info(metadata.reward_tree_node_key.level, metadata.reward_tree_node_key.index)?,
             metadata.reward_tree_tag_preimage,
         );
         if metadata.node_type == 1 {
@@ -650,7 +656,7 @@ mod tests {
     }
 
     #[test]
-    fn backup_preserves_unique_pending_id() {
+    fn backup_preserves_unique_pending_id_and_reward_tree_node_key() {
         use psy_crypto::hash::merkle::utils::common::SimpleMerkleNodeKey;
 
         let metadata = PsyProvingJobClaimMetadata {
@@ -662,7 +668,7 @@ mod tests {
             unique_pending_id: 987,
             realm_id: 3,
             realm_sub_id: 0,
-            reward_tree_node_key: SimpleMerkleNodeKey { level: 1, index: 10 },
+            reward_tree_node_key: SimpleMerkleNodeKey { level: 3, index: 2 },
             reward_tree_hash_mode: 0,
             reward_tree_node_children: 0,
             node_type: 1,
@@ -673,6 +679,10 @@ mod tests {
         let loaded = load_job_ids_from_file(path.to_str().unwrap()).unwrap();
         assert_eq!(loaded.realm_jobs[0].0, 3);
         assert_eq!(loaded.realm_jobs[0].1, 987);
+        assert_eq!(
+            loaded.realm_jobs[0].2.inner.reward_path_info,
+            (3u64 << 56) | 2
+        );
         std::fs::remove_file(path).unwrap();
     }
 }
