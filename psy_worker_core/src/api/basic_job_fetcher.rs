@@ -105,13 +105,14 @@ impl<
         &self,
         api_url_hash: [u8; 32],
         claim_metadata: PsyProvingJobClaimMetadata<Hash, QProvingJobDataID>,
+        is_in_realm_mode: bool,
     ) -> anyhow::Result<()> {
         {
             let mut completed_jobs_guard = self.completed_jobs.write().await;
             completed_jobs_guard.push(claim_metadata);
         }
         {
-            if self.is_in_realm_mode.load(std::sync::atomic::Ordering::SeqCst) {
+            if is_in_realm_mode {
                 self.realm_api_url_manager.report_api_url_success(&api_url_hash);
                 self.realm_api_url_manager.report_seen_job_for_current_api_url().await;
             } else {
@@ -131,6 +132,10 @@ impl<
     }
     pub async fn report_fetch_job_failure(&self, api_url_hash: [u8; 32]) {
         let is_in_realm_mode = self.is_in_realm_mode.load(std::sync::atomic::Ordering::SeqCst);
+        self.report_api_url_failure_for_mode(api_url_hash, is_in_realm_mode);
+    }
+
+    fn report_api_url_failure_for_mode(&self, api_url_hash: [u8; 32], is_in_realm_mode: bool) {
         if is_in_realm_mode {
             self.realm_api_url_manager.report_api_url_failure(&api_url_hash);
             let total = self.realm_api_url_manager.get_total_api_urls();
@@ -149,29 +154,29 @@ impl<
     }
     pub async fn report_submit_proof_failure(&self, api_url_hash: [u8; 32]) {
         let is_in_realm_mode = self.is_in_realm_mode.load(std::sync::atomic::Ordering::SeqCst);
-        if is_in_realm_mode {
-            self.realm_api_url_manager.report_api_url_failure(&api_url_hash);
-            let total = self.realm_api_url_manager.get_total_api_urls();
-            let failed = self.realm_api_url_manager.api_url_failed_attempts.len();
-            if failed >= total && self.coordinator_api_url_manager.has_urls() {
-                self.is_in_realm_mode.store(false, std::sync::atomic::Ordering::SeqCst);
-            }
-        } else {
-            self.coordinator_api_url_manager.report_api_url_failure(&api_url_hash);
-            let total = self.coordinator_api_url_manager.get_total_api_urls();
-            let failed = self.coordinator_api_url_manager.api_url_failed_attempts.len();
-            if failed >= total && self.realm_api_url_manager.has_urls() {
-                self.is_in_realm_mode.store(true, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
+        self.report_api_url_failure_for_mode(api_url_hash, is_in_realm_mode);
     }
     pub async fn report_fetch_job_success(&self, api_url_hash: [u8; 32]) {
         let is_in_realm_mode = self.is_in_realm_mode.load(std::sync::atomic::Ordering::SeqCst);
+        self.report_api_url_success_for_mode(api_url_hash, is_in_realm_mode).await;
+    }
+
+    async fn report_api_url_success_for_mode(&self, api_url_hash: [u8; 32], is_in_realm_mode: bool) {
         if is_in_realm_mode {
             self.realm_api_url_manager.report_api_url_success(&api_url_hash)
         } else {
             self.coordinator_api_url_manager.report_api_url_success(&api_url_hash)
         }
+    }
+
+    fn api_client_for_hash(&self, api_url_hash: &[u8; 32]) -> Option<(jsonrpsee::http_client::HttpClient, bool)> {
+        if let Some(client) = self.realm_api_url_manager.api_url_hash_to_client.get(api_url_hash) {
+            return Some((client.value().clone(), true));
+        }
+        self.coordinator_api_url_manager
+            .api_url_hash_to_client
+            .get(api_url_hash)
+            .map(|client| (client.value().clone(), false))
     }
     pub async fn fetch_next_job(
         &self,
@@ -239,26 +244,25 @@ impl<
                 };
                 self.reward_preimage_map
                     .insert((api_url_hash, response.base.job.job_id.clone()), (claim_metadata, get_current_time_ms()));
-                self.report_fetch_job_success(api_url_hash).await;
+                self.report_api_url_success_for_mode(api_url_hash, is_in_realm_mode).await;
                 Ok(Some((api_url_hash, tag.clone(), response)))
             }
             Err(e) => {
-                self.report_fetch_job_failure(api_url_hash).await;
+                self.report_api_url_failure_for_mode(api_url_hash, is_in_realm_mode);
                 Err(anyhow::anyhow!("Failed to fetch job from API URL: {}", e))
             }
         }
     }
 
     pub async fn submit_proof_inner(&self, api_url_hash: [u8; 32], job_id: QProvingJobDataID, tag: Hash, proof: Vec<u8>) -> anyhow::Result<()> {
-        let is_in_realm_mode = self.is_in_realm_mode.load(std::sync::atomic::Ordering::SeqCst);
-        let api_client = if is_in_realm_mode {
-            self.realm_api_url_manager.api_url_hash_to_client.get(&api_url_hash)
-        } else {
-            self.coordinator_api_url_manager.api_url_hash_to_client.get(&api_url_hash)
-        };
-        if api_client.is_none() {
+        // The global mode may change while a proof is being generated. Resolve
+        // the endpoint from the hash itself, rather than from that mutable mode.
+        let (api_client, is_in_realm_mode) = match self.api_client_for_hash(&api_url_hash) {
+            Some(client) => client,
+            None => {
             anyhow::bail!("API client not found for URL hash");
-        }
+            }
+        };
 
         let current_time = get_current_time_ms();
         let (mut claim_metadata, tag_creation_time) = match self.reward_preimage_map.remove(&(api_url_hash, job_id.clone())) {
@@ -277,16 +281,16 @@ impl<
             API_REQUEST_SIGNATURE_VALID_DURATION_MS,
             tag.clone().into_owned_32bytes(),
         );
-        let submit_result: Result<(), _> = api_client.unwrap().submit_proof_raw(signature, request, job_id.clone(), tag, proof).await;
+        let submit_result: Result<(), _> = api_client.submit_proof_raw(signature, request, job_id.clone(), tag, proof).await;
         match submit_result {
             Ok(_) => {
                 println!("[worker/basic_fetcher] submit_proof_raw ok: {:?}", job_id);
-                self.notify_job_completed_with_claim_metadata(api_url_hash, claim_metadata).await?;
-                self.report_fetch_job_success(api_url_hash).await;
+                self.notify_job_completed_with_claim_metadata(api_url_hash, claim_metadata, is_in_realm_mode).await?;
+                self.report_api_url_success_for_mode(api_url_hash, is_in_realm_mode).await;
                 Ok(())
             }
             Err(e) => {
-                self.report_submit_proof_failure(api_url_hash).await;
+                self.report_api_url_failure_for_mode(api_url_hash, is_in_realm_mode);
                 println!("[worker/basic_fetcher] submit_proof_raw error: job={:?} err={}", job_id, e);
                 Err(anyhow::anyhow!("Failed to submit proof to API URL: {}", e))
             }
