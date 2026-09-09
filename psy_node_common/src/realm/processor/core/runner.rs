@@ -159,13 +159,47 @@ where
             Ok(())
         }
         result = async {
-            let (processor_result, gatherer_result) = tokio::try_join!(
-                tokio::spawn(run_realm_processor_loop(processor)),
-                guta_gatherer_join_handle,
-            )?;
-            processor_result?;
-            gatherer_result?;
-            Ok::<(), anyhow::Error>(())
+            let mut tasks: Vec<(&'static str, tokio::task::JoinHandle<Result<(), anyhow::Error>>)> = vec![
+                ("realm processor", tokio::spawn(run_realm_processor_loop(processor))),
+                ("GUTA gatherer", guta_gatherer_join_handle),
+            ];
+
+            // Observe tasks directly. The first failure marks the processor
+            // status Error, aborts and joins only the still-running tasks so
+            // no live mutation is left detached, and returns the original
+            // error. Completed entries are removed before cleanup so a
+            // finished handle is never awaited twice.
+            let outcome = loop {
+                if tasks.is_empty() {
+                    break Ok::<(), anyhow::Error>(());
+                }
+                let boxed: Vec<_> = tasks
+                    .iter_mut()
+                    .map(|(name, handle)| Box::pin(async move { (*name, handle.await) }))
+                    .collect();
+                let ((name, completion), index, rest) = futures::future::select_all(boxed).await;
+                drop(rest);
+                tasks.swap_remove(index);
+                let error = match completion {
+                    Ok(Ok(())) => continue,
+                    Ok(Err(error)) => error,
+                    Err(join_error) => anyhow::Error::new(join_error).context(format!("{name} task panicked")),
+                };
+                status.require_recovery(format!("{name} failed: {error:#}"));
+                for (name, handle) in tasks.iter_mut() {
+                    handle.abort();
+                    match handle.await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => tracing::error!("{} task failed during cleanup: {:#}", *name, error),
+                        Err(join_error) if !join_error.is_cancelled() => {
+                            tracing::error!("{} task join error during cleanup: {}", *name, join_error);
+                        }
+                        Err(_) => {}
+                    }
+                }
+                break Err(error);
+            };
+            outcome
         } => {
             result?;
             tracing::info!("All realm processor threads completed");

@@ -42,7 +42,7 @@ struct ProposalVoteAuth {
 struct DriveState {
     published_bodies: HashMap<[u8; 32], (Proposal, Vec<u8>)>,
     proposal_source: HashMap<[u8; 32], PeerId>,
-    pending_end_cap: HashMap<
+    end_cap_responses: HashMap<
         OutboundRequestId,
         oneshot::Sender<Result<EndCapForwardResponse, NetworkError>>,
     >,
@@ -61,7 +61,7 @@ impl DriveState {
         Self {
             published_bodies: HashMap::new(),
             proposal_source: HashMap::new(),
-            pending_end_cap: HashMap::new(),
+            end_cap_responses: HashMap::new(),
             inbound_body: HashMap::new(),
             pending_direct: HashMap::new(),
             vote_auth: HashMap::new(),
@@ -150,7 +150,7 @@ impl RealmNetwork {
                     .behaviour_mut()
                     .end_cap_forward
                     .send_request(&destination.to_peer_id(), request);
-                state.pending_end_cap.insert(request_id, response);
+                state.end_cap_responses.insert(request_id, response);
             }
             RealmNetworkCommand::PublishProposal {
                 proposal,
@@ -432,7 +432,7 @@ impl RealmNetwork {
                     request_id,
                     response,
                 } => {
-                    if let Some(tx) = state.pending_end_cap.remove(&request_id) {
+                    if let Some(tx) = state.end_cap_responses.remove(&request_id) {
                         let _ = tx.send(Ok(response));
                     }
                 }
@@ -440,7 +440,7 @@ impl RealmNetwork {
             request_response::Event::OutboundFailure {
                 request_id, error, ..
             } => {
-                if let Some(tx) = state.pending_end_cap.remove(&request_id) {
+                if let Some(tx) = state.end_cap_responses.remove(&request_id) {
                     let _ = tx.send(Err(NetworkError::DirectRequest(error.to_string())));
                 }
             }

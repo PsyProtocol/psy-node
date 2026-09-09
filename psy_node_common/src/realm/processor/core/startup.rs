@@ -109,8 +109,8 @@ where
                 p2p: None,
                 rotation: None,
                 bls_secret: None,
-                verified_state_updates: None,
-                held_state_updates: None,
+                proposal_rx: None,
+                proposals: std::collections::BTreeMap::new(),
             },
 
             guta_join_handle,

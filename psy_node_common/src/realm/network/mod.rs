@@ -35,7 +35,7 @@ pub use config::{
     BOOTNODE_MIN_CIRCUIT_DURATION_SECS, BOOTNODE_MIN_CIRCUITS,
 };
 pub use reassembly::{
-    validate_start, CompleteProposalBody, InsertOutcome, ProposalReassembly, ReassemblyBook,
+    validate_start, InsertOutcome, ProposalReassembly, ProposalWithBody, ReassemblyBook,
     StartOutcome, VerifiedProposalBody,
 };
 pub use drive::run_realm_network;

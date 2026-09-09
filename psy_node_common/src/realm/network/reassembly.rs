@@ -20,7 +20,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
-pub struct CompleteProposalBody {
+pub struct ProposalWithBody {
     pub proposal: Proposal,
     pub body: VerifiedProposalBody,
 }
@@ -348,7 +348,7 @@ impl ReassemblyBook {
     }
 
     /// Finalize and verify a complete reassembly, removing it from the book.
-    pub fn finalize(&mut self, proposal_id: &[u8; 32]) -> Result<CompleteProposalBody, NetworkError> {
+    pub fn finalize(&mut self, proposal_id: &[u8; 32]) -> Result<ProposalWithBody, NetworkError> {
         let reassembly = self
             .entries
             .remove(proposal_id)
@@ -356,7 +356,7 @@ impl ReassemblyBook {
         self.insertion_order.retain(|id| id != proposal_id);
         let proposal = reassembly.proposal.clone();
         let body = reassembly.into_verified_body()?;
-        Ok(CompleteProposalBody { proposal, body })
+        Ok(ProposalWithBody { proposal, body })
     }
 
     /// Drop an in-flight reassembly without verifying.

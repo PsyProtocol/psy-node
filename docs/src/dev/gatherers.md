@@ -67,7 +67,7 @@ Every gatherer follows the same cycle.
 
 **Finalize.** After the drain, the gatherer asks the planner for jobs, writes the backup footer, and returns FFS node updates plus the job tree.
 
-The runner polls `should_run()` at the top of each cycle, each inner gather loop, and after handing output back (`queue/gatherer.rs`). When the processor parks in `Error`, every bound gatherer exits.
+On a tree-gatherer failure, the runner replies to the active command when present and returns the original error. Realm and Coordinator supervisors observe inner task errors, mark recovery required, then cancel and join their remaining tasks. No failed gatherer stays alive to drain commands.
 
 ```mermaid
 flowchart LR
@@ -99,6 +99,8 @@ Current contract (`realm_end_cap_gatherer.rs`):
 
 FastForward remains the follower path for applying an included proposal; it is separate from generation discard.
 
+The tree runner does not retain raw cycle items for replay. FastForward applies the included updates before constructing a replacement builder; speculative inputs are not replayed. Items fetched from the retired queue after finalize are discarded with a warning. Future-checkpoint EndCaps remain owned by `future_pending_end_cap_jobs`; the lossy raw-input policy does not authorize dropping confirmed FFS.
+
 ## 4. Coordinator gatherers
 
 **Register user.** Deserialize 64 bytes (fingerprint + param), set the next leaf in `user_registration_tree`, append FFS public-key bytes, increment `next_user_id`.
@@ -113,14 +115,14 @@ Coordinator trees are owned by these **four** gatherers after startup hydrates t
 
 ## 5. Unique-id rotation
 
-`set_new_unique_ids` runs once per block **before** finalize (coordinator `coordinator/processor/db.rs:772`; realm `realm/processor/db/commit.rs:52`).
+`set_new_unique_ids` runs once per block **before** finalize (coordinator `coordinator/processor/db.rs:780`; realm `realm/processor/db/commit.rs:52`).
 
 ```text
 Before:  processing = P, gathering = G
 After:   processing = G, gathering = fresh
 ```
 
-Finalize then consumes exactly one gathering epoch. Items that arrive during finalize stay on the consumer and replay with `DeliverPolicy::All` when that checkpoint is processed again. That is replay, not a silent drop; durability still requires the processor to re-enter the checkpoint.
+Finalize consumes one gathering generation. The final post-finalize drain acknowledges and discards any fetched tail items; they are not replayed into the next builder. The runner does not guarantee recovery of later publications to the retired queue key.
 
 ```text
 GATHERING --> PROCESSING --> COMMITTED --> next GATHERING
@@ -135,7 +137,7 @@ Realm extra fields: `gathering_realm_start_root` (checkpoint-authenticated), `pr
 | `RealmGUTAPlanner` | Fixed-level arrays plus EndCap / job stragglers | 7 / 11 EndCap | 8 / 13 / 57 and checkpoint-upgrade twins; root 63 |
 | `CoordinatorGUTAPlanner` | MMR-style `waiting_nodes` with right-fold finalize | incoming realm GUTA | lift (mode 3) then binary fold |
 
-Realm two-EndCap jobs are mode 1 (`realm_guta_planner.rs:590`). The finalizer job is mode 0 with the root GUTA as its only dependency (`realm_guta_planner.rs:1136-1145`). Coordinator wrap-one-child jobs are mode 3 (`coordinator_guta_planner.rs:475-484`). Reward-node keys are assigned from the offsets in [Reward Tree Circuit Layouts](reward-tree-circuits.md#5-global-reward-tree-offsets).
+Realm two-EndCap jobs are mode 1 (`realm_guta_planner.rs:590`). The finalizer job is mode 0 with the root GUTA as its only dependency (`realm_guta_planner.rs:1028-1038`). Coordinator wrap-one-child jobs are mode 3 (`coordinator_guta_planner.rs:475-484`). Reward-node keys are assigned from the offsets in [Reward Tree Circuit Layouts](reward-tree-circuits.md#5-global-reward-tree-offsets).
 
 ## 7. Security Considerations
 

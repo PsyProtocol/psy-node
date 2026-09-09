@@ -387,15 +387,15 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
             let commands = built.handle.commands();
             let rotation = built.rotation.clone();
             processor.set_realm_p2p(commands, rotation, bls_secret);
-                let (state_updates_tx, state_updates_rx) = tokio::sync::mpsc::channel(4);
-                processor.verified_state_updates = Some(state_updates_rx);
+                let (proposal_tx, proposal_rx) = tokio::sync::mpsc::channel(4);
+                processor.proposal_rx = Some(proposal_rx);
                 crate::node::realm_p2p::spawn_processor_realm_network::<N, _>(
                     built,
                     config,
                     realm_sub_id,
                     validator_store,
                     verifier,
-                    state_updates_tx,
+                    proposal_tx,
                 );
 
 

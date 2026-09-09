@@ -212,122 +212,132 @@ where
     }
 
     pub async fn sync_and_verify(&mut self) -> anyhow::Result<()> {
-        self.db.sync_with_coordinator().await?;
-        if let Err(error) = self.db.ensure_db_matches_coordinator_head().await {
-            let message = error.to_string();
-            if !message.contains("Local database is stale") && !message.contains("Realm Root mismatch") {
-                return Err(error);
+        // Drain before any fallible sync/early return; never replace a distinct proposal.
+        if let Some(proposal_rx) = self.proposal_rx.as_mut() {
+            while let Ok(complete) = proposal_rx.try_recv() {
+                self.proposals.entry(complete.proposal.proposal_id).or_insert(complete);
             }
-            tracing::warn!("Coordinator is ahead of local DB ({}), attempting recovery sync...", message);
-            self.commit_included_proposal_ffs().await?;
-
-            self.db.ensure_db_matches_coordinator_head().await?;
-            tracing::info!("Coordinator recovery sync complete. Resuming block processing.");
         }
-        Ok(())
+        self.db.sync_with_coordinator().await?;
+        // This also retries gatherer fast-forward after a successful durable commit.
+        self.commit_included_proposal_ffs().await?;
+        self.db.ensure_db_matches_coordinator_head().await
     }
-    async fn ensure_uncommitted_processing_ids(&mut self) -> anyhow::Result<()> {
+
+    async fn ensure_uncommitted_processing_ids(&mut self, checkpoint_id: u64) -> anyhow::Result<()> {
         let pending_id = self.db.state.processing_unique_pending_id;
-        if pending_id != 0 && self.db.db.get_checkpoint_id_for_unique_pending_id(pending_id).await?.is_none() {
+        let mapped_checkpoint = self.db.db.get_checkpoint_id_for_unique_pending_id(pending_id).await?;
+        // commit_state writes this forward mapping first. Keep its IDs even if the
+        // reverse mapping or a later write failed; a retry must not allocate again.
+        if pending_id != 0 && mapped_checkpoint == Some(checkpoint_id) {
             return Ok(());
         }
-        let (pending_id, proc_checkpoint_unique_id) = self.db.db.inc_unique_pending_id(1).await?;
+        let (pending_id, proc_checkpoint_unique_id) =
+            if let Some(ids) = self.db.db.get_unique_pending_id_for_checkpoint_id(checkpoint_id).await? {
+                ids
+            } else if pending_id != 0 && mapped_checkpoint.is_none() {
+                return Ok(());
+            } else {
+                self.db.db.inc_unique_pending_id(1).await?
+            };
         self.db.state.processing_unique_pending_id = pending_id;
         self.db.state.processing_proc_checkpoint_unique_id = proc_checkpoint_unique_id;
-        self.db
-            .temp_db
-            .set_unique_pending_ids(&self.db.state.realm_identifier, pending_id, proc_checkpoint_unique_id)
-            .await?;
+        self.db.temp_db.set_unique_pending_ids(
+            &self.db.state.realm_identifier, pending_id, proc_checkpoint_unique_id,
+        ).await?;
         Ok(())
     }
 
 
     async fn commit_included_proposal_ffs(&mut self) -> anyhow::Result<()> {
-        let coordinator_latest_checkpoint_id = self.db.coordinator_client.rc_get_latest_checkpoint_id().await?;
-        let coordinator_realm_state = self
-            .db
-            .coordinator_client
-            .rc_get_realm_root_and_last_modified_checkpoint(coordinator_latest_checkpoint_id, self.db.state.realm_id_u64)
+        let latest_checkpoint_id = self.db.coordinator_client.rc_get_latest_checkpoint_id().await?;
+        let mapped_checkpoint = self.db.db.get_checkpoint_id_for_unique_pending_id(
+            self.db.state.processing_unique_pending_id,
+        ).await?;
+        // Resume a partially committed transition at its original checkpoint, even
+        // when the coordinator has already included a subsequent proposal.
+        let checkpoint_id = mapped_checkpoint
+            .filter(|id| *id > self.db.state.last_committed_checkpoint_id)
+            .unwrap_or(latest_checkpoint_id);
+        let mut coordinator_realm_state = self.db.coordinator_client
+            .rc_get_realm_root_and_last_modified_checkpoint(checkpoint_id, self.db.state.realm_id_u64)
             .await?;
-        let included_checkpoint_id = coordinator_realm_state.checkpoint_id;
-        let db_matches = coordinator_realm_state.value == self.db.state.last_committed_realm_end_root;
+        // Walk authenticated last-modified boundaries backwards to the first
+        // unapplied transition. Looking only at the tip can skip retained bodies
+        // (or hide a root that changed away and then returned to its old value).
+        while coordinator_realm_state.checkpoint_id > self.db.state.last_committed_checkpoint_id {
+            let previous = self.db.coordinator_client
+                .rc_get_realm_root_and_last_modified_checkpoint(
+                    coordinator_realm_state.checkpoint_id - 1, self.db.state.realm_id_u64,
+                ).await?;
+            if previous.checkpoint_id <= self.db.state.last_committed_checkpoint_id {
+                break;
+            }
+            anyhow::ensure!(previous.checkpoint_id < coordinator_realm_state.checkpoint_id,
+                "Coordinator realm last-modified checkpoint did not decrease during recovery");
+            coordinator_realm_state = previous;
+        }
 
-        if let Some(rx) = self.verified_state_updates.as_mut() {
-            while let Ok(updates_bytes) = rx.try_recv() {
-                self.held_state_updates = Some(updates_bytes);
+        let mut selected = None;
+        for (proposal_id, complete) in &self.proposals {
+            let decoded = crate::realm::processor::consensus::decode_proposal_body(
+                &complete.proposal, complete.body.as_bytes(),
+            ).map_err(|error| anyhow::anyhow!("Proposal {}: {error}", hex::encode(proposal_id)))?;
+            let updates = PsyPreparedRealmBlockStateUpdates::<N::QHash>::psy_ser_from_slice(&decoded.state_updates)?;
+            // An already committed object takes precedence: its gatherer may still
+            // need FF, and a newer transition cannot safely run ahead of that FF.
+            if updates.new_realm_root == self.db.state.last_committed_realm_end_root
+                && updates.old_realm_root == self.db.state.last_committed_realm_start_root
+            {
+                coordinator_realm_state = self.db.coordinator_client
+                    .rc_get_realm_root_and_last_modified_checkpoint(
+                        self.db.state.last_committed_checkpoint_id, self.db.state.realm_id_u64,
+                    ).await?;
+                anyhow::ensure!(coordinator_realm_state.value == updates.new_realm_root,
+                    "Committed proposal {} no longer matches authenticated realm root", hex::encode(proposal_id));
+                selected = Some((*proposal_id, updates, decoded.state_updates));
+                break;
+            }
+            if selected.is_none() && updates.new_realm_root == coordinator_realm_state.value
+                && updates.old_realm_root == self.db.state.last_committed_realm_end_root
+            {
+                selected = Some((*proposal_id, updates, decoded.state_updates));
             }
         }
-        let Some(updates_bytes) = self.held_state_updates.clone() else {
-            return self.db.sync_to_coordinator_set_checkpoint_id().await;
+        let Some((proposal_id, updates, updates_bytes)) = selected else {
+            anyhow::ensure!(coordinator_realm_state.value == self.db.state.last_committed_realm_end_root
+                && coordinator_realm_state.checkpoint_id <= self.db.state.last_committed_checkpoint_id,
+                "Checkpoint {}: no complete proposal body for included realm transition {:?} -> {:?}; retaining {} unresolved proposals without advancing committed state",
+                coordinator_realm_state.checkpoint_id, self.db.state.last_committed_realm_end_root,
+                coordinator_realm_state.value, self.proposals.len());
+            return self.db.sync_to_coordinator_checkpoint_id(checkpoint_id).await;
         };
-        let updates = PsyPreparedRealmBlockStateUpdates::<N::QHash>::psy_ser_from_slice(&updates_bytes)?;
-        if updates.new_realm_root != coordinator_realm_state.value {
-            anyhow::ensure!(
-                db_matches,
-                "Checkpoint {}: in-band new_realm_root {:?} does not match included root {:?}",
-                included_checkpoint_id,
-                updates.new_realm_root,
-                coordinator_realm_state.value
-            );
-            return self.db.sync_to_coordinator_set_checkpoint_id().await;
-        }
-
-        self.db.state.processing_realm_end_root = coordinator_realm_state.value;
-        self.db
-            .shared_state
-            .update_from_core_state(&self.db.state)
-            .await?;
-
-        if !db_matches {
-            anyhow::ensure!(
-                updates.old_realm_root == self.db.state.last_committed_realm_end_root,
-                "Checkpoint {}: in-band old_realm_root {:?} does not match last committed {:?}",
-                included_checkpoint_id,
-                updates.old_realm_root,
-                self.db.state.last_committed_realm_end_root
-            );
-            self.ensure_uncommitted_processing_ids().await?;
-            let coordinator_update = self
-                .db
-                .coordinator_client
+        let included_checkpoint_id = coordinator_realm_state.checkpoint_id;
+        if included_checkpoint_id > self.db.state.last_committed_checkpoint_id {
+            self.ensure_uncommitted_processing_ids(included_checkpoint_id).await?;
+            let coordinator_update = self.db.coordinator_client
                 .rc_get_realm_sync_info(included_checkpoint_id, self.db.state.realm_id_u64)
                 .await?;
             self.db.state.processing_checkpoint_id = included_checkpoint_id;
             self.db.state.processing_checkpoint_root = coordinator_update.checkpoint_sync_info.checkpoint_tree_root;
-            self.db.state.processing_realm_start_root = self.db.state.last_committed_realm_end_root;
-            self.db
-                .commit_state(
-                    &coordinator_update,
-                    &updates,
-                    ProvingJobCircuitType::GUTANoChange,
-                    vec![],
-                    true,
-                )
-                .await?;
-            tracing::info!(
-                "Committed Realm proposal FFS end_root={:?} checkpoint_id={}",
-                updates.new_realm_root,
-                included_checkpoint_id
-            );
+            self.db.state.processing_realm_start_root = updates.old_realm_root;
+            self.db.state.processing_realm_end_root = updates.new_realm_root;
+            self.db.commit_state(
+                &coordinator_update, &updates, ProvingJobCircuitType::GUTANoChange, vec![], true,
+            ).await?;
+            tracing::info!("Committed Realm proposal {} FFS checkpoint_id={}", hex::encode(proposal_id), included_checkpoint_id);
         }
 
-        self.db.state.gathering_realm_start_root = coordinator_realm_state.value;
-        self.db
-            .shared_state
-            .update_from_core_state(&self.db.state)
-            .await?;
-
+        self.db.state.gathering_realm_start_root = updates.new_realm_root;
+        self.db.shared_state.update_from_core_state(&self.db.state).await?;
+        // The author's gatherer already contains this transition.
         if updates.realm_sub_id != self.db.state.realm_sub_id_u64 {
             self.guta_queue_gatherer.fast_forward(updates_bytes).await?;
-            tracing::info!(
-                "Applied Realm proposal FFS end_root={:?} checkpoint_id={}",
-                updates.new_realm_root,
-                included_checkpoint_id
-            );
         }
-        self.held_state_updates = None;
-
-        self.db.sync_to_coordinator_set_checkpoint_id().await
+        self.proposals.remove(&proposal_id);
+        // Bound metadata advancement to the applied root's checkpoint. A newer
+        // transition is selected on the next sync rather than skipped as metadata.
+        self.db.sync_to_coordinator_checkpoint_id(self.db.state.last_committed_checkpoint_id).await
     }
 
 
@@ -359,7 +369,7 @@ where
         let root_job_id = self.get_root_job_id(&guta_jobs)?;
         if root_job_id.is_none() {
             tracing::info!("No GUTA jobs to process in this block, skipping.");
-            self.db.sync_to_coordinator_set_checkpoint_id().await?;
+            self.db.sync_to_coordinator_checkpoint_id(self.db.state.last_committed_checkpoint_id).await?;
             if let Err(err) = self
                 .db
                 .proof_work_queue
@@ -581,7 +591,7 @@ where
         self.db.print_coordinator_processor_state();
 
         // Final sync
-        self.db.sync_to_coordinator_set_checkpoint_id().await?;
+        self.db.sync_to_coordinator_checkpoint_id(self.db.state.last_committed_checkpoint_id).await?;
         //self.db.print_last_10_checkpoint_roots_and_leaves("process_block after
         // sync_to_coordinator_set_checkpoint_id").await?;
 

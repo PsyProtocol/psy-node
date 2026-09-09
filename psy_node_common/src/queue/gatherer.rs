@@ -402,26 +402,6 @@ pub async fn gatherer_runner<
     }
 }
 
-async fn hold_failed_tree_gatherer<Output>(
-    commands: &mut mpsc::Receiver<GathererTreeCommand<Output>>,
-    error: &anyhow::Error,
-) {
-    while let Some(command) = commands.recv().await {
-        let failure = anyhow::anyhow!("gatherer halted after mutation failure: {error:#}");
-        match command {
-            GathererTreeCommand::Stop { reply } => {
-                let _ = reply.send(Err(failure));
-                return;
-            }
-            GathererTreeCommand::Finalize { reply } => {
-                let _ = reply.send(Err(failure));
-            }
-            GathererTreeCommand::FastForward { reply, .. } => {
-                let _ = reply.send(Err(failure));
-            }
-        }
-    }
-}
 
 pub async fn gatherer_runner_for_tree<
     const QUEUE_TOPIC_ID: u32,
@@ -440,60 +420,59 @@ pub async fn gatherer_runner_for_tree<
     mut trigger_rx: mpsc::Receiver<GathererTreeCommand<Builder::Output>>,
 
 ) -> anyhow::Result<()> {
-    let mut pending_cycle_items: Vec<Vec<u8>> = Vec::new();
     loop {
-        let mut pending_handoff = None;
-        let mut pending_fast_forward = None;
-        while let Ok(command) = trigger_rx.try_recv() {
-            match command {
-                GathererTreeCommand::FastForward { state_updates, reply } => {
-                    if pending_fast_forward.is_some() {
-                        let _ = reply.send(Err(anyhow::anyhow!("initial FastForward already pending")));
-                        continue;
-                    }
-                    let result = Builder::apply_fast_forward_with_tree(
-                        &mut *tree.write().await, &create_builder_config, state_updates).await;
-                    if let Err(error) = result {
-                        let _ = reply.send(Err(anyhow::anyhow!("{error:#}")));
-                        hold_failed_tree_gatherer(&mut trigger_rx, &error).await;
-                        return Err(error);
-                    }
-                    pending_fast_forward = Some(reply);
-                }
-                handoff => { pending_handoff = Some(handoff); break; }
-            }
-        }
+        let mut command = trigger_rx.try_recv().ok();
         let bootstrap = async {
             let mut tree = tree.write().await;
-            let mut builder = Builder::create_new_with_tree(&mut *tree, queue_key.unique_id, create_builder_config.clone()).await?;
-            if !pending_cycle_items.is_empty() {
-                builder.update_from_many_queue_items_with_tree(&mut *tree, pending_cycle_items.clone()).await?;
+            if let Some(GathererTreeCommand::FastForward { state_updates, .. }) = command.as_mut() {
+                Builder::apply_fast_forward_with_tree(
+                    &mut *tree,
+                    &create_builder_config,
+                    std::mem::take(state_updates),
+                )
+                .await?;
             }
+            let mut builder = Builder::create_new_with_tree(
+                &mut *tree,
+                queue_key.unique_id,
+                create_builder_config.clone(),
+            )
+            .await?;
             anyhow::Ok(builder)
-        }.await;
+        }
+        .await;
         let mut builder = match bootstrap {
-            Ok(builder) => builder,
+            Ok(builder) => {
+                command = match command {
+                    Some(GathererTreeCommand::FastForward { reply, .. }) => {
+                        let _ = reply.send(Ok(()));
+                        None
+                    }
+                    command => command,
+                };
+                builder
+            }
             Err(error) => {
-                if let Some(reply) = pending_fast_forward { let _ = reply.send(Err(anyhow::anyhow!("{error:#}"))); }
-                if let Some(command) = pending_handoff {
+                if let Some(command) = command {
                     match command {
-                        GathererTreeCommand::Finalize { reply } | GathererTreeCommand::Stop { reply } => { let _ = reply.send(Err(anyhow::anyhow!("{error:#}"))); }
-                        GathererTreeCommand::FastForward { reply, .. } => { let _ = reply.send(Err(anyhow::anyhow!("{error:#}"))); }
+                        GathererTreeCommand::Finalize { reply } | GathererTreeCommand::Stop { reply } => {
+                            let _ = reply.send(Err(anyhow::anyhow!("{error:#}")));
+                        }
+                        GathererTreeCommand::FastForward { reply, .. } => {
+                            let _ = reply.send(Err(anyhow::anyhow!("{error:#}")));
+                        }
                     }
                 }
-                hold_failed_tree_gatherer(&mut trigger_rx, &error).await;
                 return Err(error);
             }
         };
-        if let Some(reply) = pending_fast_forward { let _ = reply.send(Ok(())); }
         if let Err(error) = stream.ensure_consumer(&queue_key, queue_key.realm_id, queue_key.realm_sub_id,
             queue_key.unique_id, queue_key.task_group as u32).await {
             tracing::warn!("GATHERER_{QUEUE_TOPIC_ID}: ensure_consumer failed: {error}");
         }
-        let mut cycle_items = std::mem::take(&mut pending_cycle_items);
         'gathering: loop {
 
-            let command = if let Some(command) = pending_handoff.take() {
+            let command = if let Some(command) = command.take() {
                 Some(command)
             } else {
                 tokio::select! {
@@ -506,11 +485,9 @@ pub async fn gatherer_runner_for_tree<
                                     tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Received {} items from queue.", d.len());
                                     let update_result = {
                                         let mut tree = tree.write().await;
-                                        builder.update_from_many_queue_items_with_tree(&mut *tree, d.clone()).await
+                                        builder.update_from_many_queue_items_with_tree(&mut *tree, d).await
                                     };
-                                    cycle_items.extend(d);
                                     if let Err(err) = update_result {
-                                        hold_failed_tree_gatherer(&mut trigger_rx, &err).await;
                                         return Err(err);
                                     }
                                 }
@@ -535,14 +512,12 @@ pub async fn gatherer_runner_for_tree<
                         let mut tree = tree.write().await;
                         Builder::apply_fast_forward_with_tree(&mut *tree, &create_builder_config, state_updates).await?;
                         let mut replacement = Builder::create_new_with_tree(&mut *tree, queue_key.unique_id, create_builder_config.clone()).await?;
-                        replacement.update_from_many_queue_items_with_tree(&mut *tree, cycle_items.clone()).await?;
                         anyhow::Ok(replacement)
                     }.await;
                     match replacement {
                         Ok(replacement) => { builder = replacement; let _ = reply.send(Ok(())); }
                         Err(error) => {
                             let _ = reply.send(Err(anyhow::anyhow!("{error:#}")));
-                            hold_failed_tree_gatherer(&mut trigger_rx, &error).await;
                             return Err(error);
                         }
                     }
@@ -561,8 +536,7 @@ pub async fn gatherer_runner_for_tree<
                             let items = stream.dump_entire_ephemeral_queue_bytes(&old_key, old_key.realm_id,
                                 old_key.realm_sub_id, old_key.unique_id, old_key.task_group as u32, usize::MAX).await?;
                             if !items.is_empty() {
-                                let update = builder.update_from_many_queue_items_with_tree(&mut *tree.write().await, items.clone()).await;
-                                cycle_items.extend(items);
+                                let update = builder.update_from_many_queue_items_with_tree(&mut *tree.write().await, items).await;
                                 update?;
                             }
                         }
@@ -570,17 +544,12 @@ pub async fn gatherer_runner_for_tree<
                     }.await;
                     match result {
                         Ok(output) => {
-                            if let Err(output) = responder.send(Ok(output)) {
-                                let error = anyhow::anyhow!("finalized output receiver dropped");
-                                hold_failed_tree_gatherer(&mut trigger_rx, &error).await;
-                                drop(output);
-                                return Err(error);
+                            if responder.send(Ok(output)).is_err() {
+                                return Err(anyhow::anyhow!("finalized output receiver dropped"));
                             }
-                            cycle_items.clear();
                         }
                         Err(error) => {
                             let _ = responder.send(Err(anyhow::anyhow!("{error:#}")));
-                            hold_failed_tree_gatherer(&mut trigger_rx, &error).await;
                             return Err(error);
                         }
                     }
@@ -592,10 +561,11 @@ pub async fn gatherer_runner_for_tree<
                                     old_key.realm_sub_id, old_key.unique_id, old_key.task_group as u32).await {
                                     tracing::warn!("GATHERER_{QUEUE_TOPIC_ID}: consumer delete failed: {error}");
                                 }
-                            } else { pending_cycle_items = items; }
+                            } else {
+                                tracing::warn!("GATHERER_{QUEUE_TOPIC_ID}: discarding {} late post-finalize items for unique_id {} under lossy intake contract", items.len(), old_key.unique_id);
+                            }
                         }
                         Err(error) => {
-                            hold_failed_tree_gatherer(&mut trigger_rx, &error).await;
                             return Err(error);
                         }
                     }
@@ -607,26 +577,3 @@ pub async fn gatherer_runner_for_tree<
         tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Handoff complete. Cycle restarting.");
     }
 }
-
-#[cfg(test)]
-mod halted_failure_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn halted_owner_reports_cause_and_releases_on_stop() {
-        let (tx, mut rx) = mpsc::channel::<GathererTreeCommand<()>>(3);
-        let (finalize, finalized) = oneshot::channel();
-        let (stop, stopped) = oneshot::channel();
-        tx.send(GathererTreeCommand::Finalize { reply: finalize }).await.unwrap();
-        tx.send(GathererTreeCommand::Stop { reply: stop }).await.unwrap();
-        let failure = anyhow::anyhow!("injected witness write failure").context("fee finalize");
-        hold_failed_tree_gatherer(&mut rx, &failure).await;
-        for result in [finalized.await.unwrap(), stopped.await.unwrap()] {
-            let message = format!("{:#}", result.unwrap_err());
-            assert!(message.contains("fee finalize"));
-            assert!(message.contains("injected witness write failure"));
-        }
-        assert!(!tx.is_closed());
-    }
-}
-

@@ -781,8 +781,6 @@ where
                 .await?;
         }
 
-        self.sync_to_coordinator_set_checkpoint_id().await?;
-
         let current_realm_root = self.db.global_user_tree_get_node(self.state.last_committed_checkpoint_id, self.realm_root_node).await?;
         
         self.state.last_committed_realm_end_root = current_realm_root;
@@ -790,6 +788,8 @@ where
         self.state.processing_realm_start_root = current_realm_root;
         self.state.processing_realm_end_root = current_realm_root;
         self.state.gathering_realm_start_root = current_realm_root;
+
+        self.sync_to_coordinator_set_checkpoint_id().await?;
 
         let head_checkpoint_id = self.checkpoint_tree_backup_manager.get_current_checkpoint_id_head();
         let head_checkpoint_root = self.checkpoint_tree_backup_manager.get_current_checkpoint_tree_root_head();

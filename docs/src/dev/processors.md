@@ -102,15 +102,15 @@ Part-1 and CST reward layouts are in [Reward Tree Circuit Layouts](reward-tree-c
 
 ## 4. Realm `process_block`
 
-Entry: `realm/processor/core/process_block.rs:338`.
+Entry: `realm/processor/core/process_block.rs:348`.
 
 1. Sanity check, then `get_results_from_gatherers` (`:169`): `set_new_unique_ids`, finalize the EndCap gatherer.
-2. If there is no root job, `sync_to_coordinator_set_checkpoint_id` and return without mutating `processing_realm_end_root`.
+2. If there is no root job, synchronize metadata only through `last_committed_checkpoint_id` and return without mutating `processing_realm_end_root`.
 3. If P2P rotation is enabled and the finalized proof base does not schedule this sub-ID for `T = base + 1`, fail closed without syncing after the gatherer tree commit.
 4. Record `processing_realm_end_root`, publish GUTA jobs, and retrieve the root proof.
 5. Submit circuit 63, the finalizer binding, Proposal, and Certificate through `rc_submit_guta_proof`.
 6. Wait until the Coordinator checkpoint carries the new Realm root, then commit the included state.
-7. Fast-forward any additional Coordinator checkpoints and delete the processing worker-queue consumer.
+7. Synchronize metadata through the applied checkpoint and delete the processing worker-queue consumer; later transitions are handled by the next `sync_and_verify` iteration.
 
 Candidate A proving, P2P consensus, and Coordinator inclusion overlap with builder B accepting EndCaps on A's end root. B keeps its planner checkpoint when that checkpoint authenticates its cycle start. Otherwise B reverts and discards that generation before tree commit; it does not rebase or replay accepted EndCaps.
 
@@ -118,7 +118,7 @@ Candidate A proving, P2P consensus, and Coordinator inclusion overlap with build
 
 ### Coordinator
 
-`coordinator/processor/db.rs:1045`.
+`coordinator/processor/db.rs:1041`.
 
 Pre-write: recompute the new leaf hash; require the old leaf hash to match `last_committed`; require `checkpoint_id == last + 1` with `checked_add`; read the old checkpoint-tree root by the **committed** id, not the incoming id.
 
@@ -153,9 +153,14 @@ Realm sync entry points (`realm/processor/db/sync.rs`):
 |---|---|---|
 | `sync_with_coordinator` | no (memory checkpoint tree only) | top of each `process_block` via `sync_and_verify` |
 | `commit_state` | yes, one checkpoint | after coordinator inclusion |
-| `sync_to_coordinator_set_checkpoint_id` | yes, `[latest+1, tip]` | init, no-jobs skip, post-commit fast-forward |
+| `sync_to_coordinator_checkpoint_id` | metadata through the supplied checkpoint | only when its Realm root is already locally applied; no newer-tip marker advance |
+| `sync_to_coordinator_set_checkpoint_id` | same guarded metadata path, bounded to a fetched tip | startup and retryable-rejection synchronization |
 
 The append-only checkpoint tree has two roots: the live root over all inserted leaves, and the historical append root over `0..=k` used as a transition's old/new checkpoint-tree root.
+
+The network passes `ProposalWithBody` through `proposal_tx`/`proposal_rx` after full validation. The processor owns distinct objects in `proposals`, keyed by proposal ID; later proposals do not overwrite earlier ones. Historical last-modified checkpoints select the next unapplied root transition. The processor derives FFS from the selected body, commits with stable retry IDs, awaits follower FastForward, and only then removes the object. No matching body means an error without marker-only catch-up.
+
+The proposal collection is process-local and has no eviction policy. Restart loses unresolved bodies; post-restart body retrieval is not implemented by this cutover. Existing DB and backup recovery does not make the in-memory proposal collection durable.
 
 Coordinator recovery is self-contained. Realm recovery walks coordinator checkpoints from `last_committed + 1`. Unchanged realm roots skip. Missing pending-id mappings scan backup files by `end_root`. No matching backup is data loss and fails closed.
 

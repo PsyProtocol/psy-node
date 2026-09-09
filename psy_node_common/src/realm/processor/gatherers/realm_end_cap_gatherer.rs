@@ -771,39 +771,6 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
     }
 }
 
-fn publish_gathering_snapshot_if_current<Hash: PartialEq + Copy + std::fmt::Debug>(
-    shared_status: &Arc<RwLock<RealmProcessorCoreState<Hash>>>,
-    snapshot: &RealmProcessorCoreState<Hash>,
-    tree_root: Hash,
-) {
-    if let Ok(mut shared) = shared_status.write() {
-        let processing_root = shared.processing_realm_end_root;
-        let gathering_start = shared.gathering_realm_start_root;
-        if snapshot.processing_realm_end_root == processing_root {
-            shared.gathering_realm_start_root = tree_root;
-            return;
-        }
-        if tree_root == processing_root || tree_root == gathering_start {
-            tracing::info!(
-                "Skipping displaced gatherer snapshot write pending={} tree_root={:?} processing_root={:?}",
-                snapshot.gathering_unique_pending_id,
-                tree_root,
-                processing_root
-            );
-            return;
-        }
-        if gathering_start == processing_root {
-            shared.gathering_realm_start_root = tree_root;
-            return;
-        }
-        tracing::info!(
-            "Skipping stale gatherer snapshot write pending={} snapshot_processing_root={:?} live_processing_root={:?}",
-            snapshot.gathering_unique_pending_id,
-            snapshot.processing_realm_end_root,
-            processing_root
-        );
-    }
-}
 
 #[derive(Clone)]
 pub struct RealmGUTAEndCapGathererOutputDatabase<F, Hash> {
@@ -1078,7 +1045,9 @@ impl<
                 self.status.gathering_unique_pending_id,
                 reverted_root
             );
-            publish_gathering_snapshot_if_current(&self.config.status, &self.status, reverted_root);
+            self.config.status.write()
+                .map_err(|_| anyhow::anyhow!("error writing gathering start root"))?
+                .gathering_realm_start_root = reverted_root;
             return Ok(RealmGUTAEndCapGathererOutput {
                 db_output: RealmGUTAEndCapGathererOutputDatabase::<N::F, N::QHash>::get_empty(reverted_root),
                 job_ids: vec![],
@@ -1119,7 +1088,9 @@ impl<
                 .map_err(|_| anyhow::anyhow!("error writing current validator leaf"))? =
                 self.gathering_start_validator_user_leaf.clone();
             let reverted_root = tree.get_root();
-            publish_gathering_snapshot_if_current(&self.config.status, &self.status, reverted_root);
+            self.config.status.write()
+                .map_err(|_| anyhow::anyhow!("error writing gathering start root"))?
+                .gathering_realm_start_root = reverted_root;
             return Ok(RealmGUTAEndCapGathererOutput {
                 db_output: RealmGUTAEndCapGathererOutputDatabase::<N::F, N::QHash>::get_empty(reverted_root),
                 job_ids: vec![],
@@ -1177,9 +1148,9 @@ impl<
                 self.status.gathering_unique_pending_id
             );
             tree.commit_changes();
-            // Publish the committed root so the immediate recreate bootstrap
-            // accepts the finalize-committed current tree root (recreate race fix).
-            publish_gathering_snapshot_if_current(&self.config.status, &self.status, tree.get_root());
+            self.config.status.write()
+                .map_err(|_| anyhow::anyhow!("error writing gathering start root"))?
+                .gathering_realm_start_root = tree.get_root();
             *self.config.current_validator_user_leaf.lock()
                 .map_err(|_| anyhow::anyhow!("error writing current validator leaf"))? =
                 self.guta_planner.current_validator_user_leaf.clone()
@@ -1223,9 +1194,9 @@ impl<
             .file_system
             .file_like_fs_sync_file_with_path(&self.pending_file_path, &mut self.new_realm_end_cap_gatherer_file)
             .await?;
-        // Publish even for a no-op finalize so the recreate bootstrap accepts
-        // the current tree root.
-        publish_gathering_snapshot_if_current(&self.config.status, &self.status, tree.get_root());
+        self.config.status.write()
+            .map_err(|_| anyhow::anyhow!("error writing gathering start root"))?
+            .gathering_realm_start_root = tree.get_root();
         *self.config.current_validator_user_leaf.lock()
             .map_err(|_| anyhow::anyhow!("error writing current validator leaf"))? =
             self.guta_planner.current_validator_user_leaf.clone()

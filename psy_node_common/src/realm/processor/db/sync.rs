@@ -30,14 +30,31 @@ where
     N::HasherBase: 'static + Send + Sync,
 {
     pub async fn sync_to_coordinator_set_checkpoint_id(&mut self) -> anyhow::Result<()> {
+        let checkpoint_id = self.coordinator_client.rc_get_latest_checkpoint_id().await?;
+        self.sync_to_coordinator_checkpoint_id(checkpoint_id).await
+    }
+
+    pub async fn sync_to_coordinator_checkpoint_id(&mut self, checkpoint_id: u64) -> anyhow::Result<()> {
+        anyhow::ensure!(checkpoint_id >= self.state.last_committed_checkpoint_id,
+            "metadata sync checkpoint {} precedes local committed checkpoint {}", checkpoint_id, self.state.last_committed_checkpoint_id);
+        let realm_root_state = self.coordinator_client
+            .rc_get_realm_root_and_last_modified_checkpoint(checkpoint_id, self.state.realm_id_u64)
+            .await?;
+        anyhow::ensure!(realm_root_state.value == self.state.last_committed_realm_end_root,
+            "checkpoint {} requires Realm state updates before metadata sync", checkpoint_id);
+        anyhow::ensure!(realm_root_state.checkpoint_id <= self.state.last_committed_checkpoint_id,
+            "checkpoint {} contains an unapplied Realm transition at checkpoint {}", checkpoint_id, realm_root_state.checkpoint_id);
         // 1. Sync Headers
         self.checkpoint_tree_backup_manager
             .sync_from_coordinator_client::<CoordinatorClient, N::F>(&self.coordinator_client, 2000)
             .await?;
 
         let mut latest_db_checkpoint_id = self.db.get_latest_checkpoint_id().await?;
-        let latest_synced_checkpoint_id = self.checkpoint_tree_backup_manager.get_current_checkpoint_id_head();
-        let latest_synced_checkpoint_root = self.checkpoint_tree_backup_manager.get_current_checkpoint_tree_root_head();
+        let latest_synced_checkpoint_id = checkpoint_id;
+        anyhow::ensure!(checkpoint_id <= self.checkpoint_tree_backup_manager.get_current_checkpoint_id_head(),
+            "checkpoint {} is not available in the synchronized checkpoint tree", checkpoint_id);
+        let latest_synced_checkpoint_root = self.checkpoint_tree_backup_manager.checkpoint_tree
+            .get_leaf(checkpoint_id).get_append_root::<N::HasherBase>();
 
         // Defensive: if a previous run (e.g. old fast-forward code) set latest_checkpoint_id
         // without writing the corresponding L2 block state, roll back to the last checkpoint
@@ -105,7 +122,7 @@ where
             .await?;
 
         // 5. CRITICAL: Update Internal Memory State to match the new HEAD
-        let latest_checkpoint_root = self.checkpoint_tree_backup_manager.get_current_checkpoint_tree_root_head();
+        let latest_checkpoint_root = latest_synced_checkpoint_root;
         
         self.state.coordinator_head_synced_checkpoint_id = latest_synced_checkpoint_id;
         self.state.coordinator_head_synced_checkpoint_root = latest_checkpoint_root;
@@ -115,9 +132,6 @@ where
         self.state.gathering_checkpoint_id = latest_synced_checkpoint_id;
 
         // Update the last committed markers so wait logic knows where to start looking next
-        let realm_root_state = self.coordinator_client
-            .rc_get_realm_root_and_last_modified_checkpoint(latest_synced_checkpoint_id, self.state.realm_id_u64)
-            .await?;
         
         self.state.last_committed_checkpoint_id = latest_synced_checkpoint_id;
         self.state.last_committed_realm_end_root = realm_root_state.value;

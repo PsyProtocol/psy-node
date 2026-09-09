@@ -23,7 +23,8 @@ use psy_node_common::{
     realm::{
         network::{
             build_optional_realm_network, load_bls_secret_key, load_ed25519_identity_key,
-            parse_bootnode, run_realm_network, OptionalRealmNetwork, RealmNetworkEvent,
+            parse_bootnode, run_realm_network, ProposalWithBody, OptionalRealmNetwork,
+            RealmNetworkEvent,
         },
         processor::consensus::{sign_vote, verify_proposal_submission},
     },
@@ -491,14 +492,15 @@ pub fn validate_processor_identity<F, Hash>(
     Ok(derived_sub_id)
 }
 
-/// Drive loop plus processor event consumer. Non-proposers validate and vote.
+/// Drive loop plus processor event consumer. Non-proposers validate, deliver the
+/// complete proposal, and vote.
 pub fn spawn_processor_realm_network<N, S>(
     built: OptionalRealmNetwork,
     config: &RealmProcessorStartConfig,
     local_sub_id: u16,
     validator_store: Arc<S>,
     proof_verifier: N::ZKVerifier,
-    verified_state_updates: tokio::sync::mpsc::Sender<Vec<u8>>,
+    proposal_tx: tokio::sync::mpsc::Sender<ProposalWithBody>,
 ) where
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
     S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync + 'static,
@@ -530,6 +532,7 @@ pub fn spawn_processor_realm_network<N, S>(
                     if proposal.proposer_sub_id == local_sub_id {
                         continue;
                     }
+                    let proposal_id = proposal.proposal_id;
                     let validation = async {
                         anyhow::ensure!(proposal.chain_id == chain_id, "Proposal chain_id mismatch");
                         anyhow::ensure!(proposal.realm_id == realm_id, "Proposal realm_id mismatch");
@@ -563,38 +566,42 @@ pub fn spawn_processor_realm_network<N, S>(
                                 "GUTA proposer sub_id {} has no checkpoint validator",
                                 proposal.proposer_sub_id
                             ))?;
-                        let decoded = verify_proposal_submission::<N>(
+                        verify_proposal_submission::<N>(
                             &proposal,
                             body.as_bytes(),
                             proposer_user_id,
                             proof_verifier.as_ref(),
                         )?;
-                        verified_state_updates
-                            .send(decoded.state_updates)
+                        let vote = sign_vote(&bls_secret, local_sub_id, &proposal);
+                        let complete = ProposalWithBody { proposal, body };
+                        proposal_tx
+                            .send(complete)
                             .await
-                            .map_err(|_| anyhow::anyhow!("verified state_updates receiver dropped"))?;
-                        Ok::<(), anyhow::Error>(())
+                            .map_err(|_| anyhow::anyhow!("verified proposals receiver dropped"))?;
+                        Ok::<_, anyhow::Error>(vote)
                     }.await;
-                    if let Err(error) = validation {
-                        tracing::warn!(
-                            "realm P2P non-proposer rejected Proposal proposal={} error={:#}",
-                            hex::encode(proposal.proposal_id),
-                            error
-                        );
-                        continue;
-                    }
-                    let vote = sign_vote(&bls_secret, local_sub_id, &proposal);
+                    let vote = match validation {
+                        Ok(vote) => vote,
+                        Err(error) => {
+                            tracing::warn!(
+                                "realm P2P non-proposer rejected Proposal proposal={} error={:#}",
+                                hex::encode(proposal_id),
+                                error
+                            );
+                            continue;
+                        }
+                    };
                     if let Err(error) = commands.publish_vote(vote).await {
                         tracing::warn!(
                             "realm P2P non-proposer vote publish failed proposal={} error={}",
-                            hex::encode(proposal.proposal_id),
+                            hex::encode(proposal_id),
                             error
                         );
                         continue;
                     }
                     tracing::info!(
                         "realm P2P non-proposer vote published proposal={} signer_sub_id={} realm={} source={:?}",
-                        hex::encode(proposal.proposal_id),
+                        hex::encode(proposal_id),
                         local_sub_id,
                         realm_id,
                         source
