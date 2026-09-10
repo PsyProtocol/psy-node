@@ -34,6 +34,9 @@ local_staging_source_env_defaults "$SCRIPT_DIR/local.env"
 : "${LOCAL_STAGING_REALM_EDGE_BASE_PORT:=13380}"
 : "${LOCAL_STAGING_REALM_EDGE_PORT_STRIDE:=10}"
 : "${LOCAL_STAGING_PROVE_PROXY_ADDR:=127.0.0.1:9999}"
+: "${LOCAL_STAGING_PROVE_PROXY_ROLE:=all}"
+: "${LOCAL_STAGING_START_SYSTEM_PROVE_PROXY:=0}"
+: "${LOCAL_STAGING_SYSTEM_PROVE_PROXY_ADDR:=127.0.0.1:9997}"
 : "${LOCAL_STAGING_FAUCET_ADDR:=127.0.0.1:9998}"
 : "${LOCAL_STAGING_PSY_SERVICES_ADDR:=127.0.0.1:3000}"
 : "${LOCAL_STAGING_APP_PORT:=8088}"
@@ -699,6 +702,7 @@ start_faucet_split_components() {
     local prove_proxy_env=(
       "PSY_USER_CLI_SHA256=$user_cli_sha256"
       "PROVE_PROXY_LISTEN_ADDR=$LOCAL_STAGING_PROVE_PROXY_ADDR"
+      "PROVE_PROXY_ROLE=$LOCAL_STAGING_PROVE_PROXY_ROLE"
       "RPC_CONFIG=$RPC_CONFIG"
     )
     if [ -n "${LOCAL_STAGING_PROVE_PROXY_HOME:-}" ]; then
@@ -709,6 +713,28 @@ start_faucet_split_components() {
     restart_process_if_env_changed "prove-proxy" "${prove_proxy_env[@]}"
     start_process "prove-proxy" "prove-proxy" "${prove_proxy_env[@]}"
     wait_process_tcp "prove-proxy" "${LOCAL_STAGING_PROVE_PROXY_ADDR%:*}" "${LOCAL_STAGING_PROVE_PROXY_ADDR##*:}" "prove-proxy" 240 2
+  fi
+
+  # Optional second pool: a role=system prove-proxy for the bridge relayer, so a
+  # local stack can exercise the user/system split. The relayer config written
+  # by cloudflare-tunnel/up.sh points system_prove_proxy_url here when enabled.
+  # Startup builds the coordinator circuit library and preloads the Groth16
+  # keystores (~3.5 min, ~22 GiB RSS), hence the longer wait.
+  if [ "$LOCAL_STAGING_START_SYSTEM_PROVE_PROXY" = "1" ]; then
+    local system_prove_proxy_env=(
+      "PSY_USER_CLI_SHA256=$user_cli_sha256"
+      "PROVE_PROXY_LISTEN_ADDR=$LOCAL_STAGING_SYSTEM_PROVE_PROXY_ADDR"
+      "PROVE_PROXY_ROLE=system"
+      "RPC_CONFIG=$RPC_CONFIG"
+    )
+    if [ -n "${LOCAL_STAGING_PROVE_PROXY_HOME:-}" ]; then
+      mkdir -p "$LOCAL_STAGING_PROVE_PROXY_HOME"
+      system_prove_proxy_env+=("HOME=$LOCAL_STAGING_PROVE_PROXY_HOME")
+    fi
+
+    restart_process_if_env_changed "system-prove-proxy" "${system_prove_proxy_env[@]}"
+    start_process "system-prove-proxy" "prove-proxy" "${system_prove_proxy_env[@]}"
+    wait_process_tcp "system-prove-proxy" "${LOCAL_STAGING_SYSTEM_PROVE_PROXY_ADDR%:*}" "${LOCAL_STAGING_SYSTEM_PROVE_PROXY_ADDR##*:}" "system-prove-proxy" 360 2
   fi
 
   if [ "$LOCAL_STAGING_ENABLE_PSY_FAUCET" != "1" ] || [ "$LOCAL_STAGING_START_FAUCET_SERVER" != "1" ]; then
@@ -781,7 +807,10 @@ main() {
     require_exec "$USER_CLI"
     start_faucet_split_components
     echo "[local-staging] faucet split ready"
-    echo "  prove-proxy: http://$LOCAL_STAGING_PROVE_PROXY_ADDR"
+    echo "  prove-proxy: http://$LOCAL_STAGING_PROVE_PROXY_ADDR (role=$LOCAL_STAGING_PROVE_PROXY_ROLE)"
+    if [ "$LOCAL_STAGING_START_SYSTEM_PROVE_PROXY" = "1" ]; then
+      echo "  system prove-proxy: http://$LOCAL_STAGING_SYSTEM_PROVE_PROXY_ADDR (role=system)"
+    fi
     echo "  faucet:      http://$LOCAL_STAGING_FAUCET_ADDR"
     return 0
   fi
@@ -947,7 +976,10 @@ main() {
   for realm_id in $LOCAL_STAGING_REALMS; do
     echo "  realm $realm_id:      $(realm_url "$realm_id")"
   done
-  echo "  prove-proxy:  http://$LOCAL_STAGING_PROVE_PROXY_ADDR"
+  echo "  prove-proxy:  http://$LOCAL_STAGING_PROVE_PROXY_ADDR (role=$LOCAL_STAGING_PROVE_PROXY_ROLE)"
+  if [ "$LOCAL_STAGING_START_SYSTEM_PROVE_PROXY" = "1" ]; then
+    echo "  system prove-proxy: http://$LOCAL_STAGING_SYSTEM_PROVE_PROXY_ADDR (role=system)"
+  fi
   if [ "$LOCAL_STAGING_ENABLE_PSY_FAUCET" = "1" ] && [ "$LOCAL_STAGING_START_FAUCET_SERVER" = "1" ]; then
     echo "  faucet:       http://$LOCAL_STAGING_FAUCET_ADDR"
   fi

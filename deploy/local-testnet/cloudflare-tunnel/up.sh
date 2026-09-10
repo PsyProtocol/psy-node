@@ -984,12 +984,23 @@ write_bridge_relayer_rpc_config() {
   local tmp_output="${output}.tmp.$$"
 
   mkdir -p "$(dirname "$output")" "$(dirname "$restart_marker")"
+
+  # The relayer refuses to start without system_prove_proxy_url and checks that
+  # the pool behind it serves the bridge methods. With the optional system pool
+  # enabled that is the role=system process; otherwise the single proxy must
+  # run role=all (the stack default).
+  local system_prove_url="http://${LOCAL_STAGING_PROVE_PROXY_ADDR}"
+  if [ "${LOCAL_STAGING_START_SYSTEM_PROVE_PROXY:-0}" = "1" ]; then
+    system_prove_url="http://${LOCAL_STAGING_SYSTEM_PROVE_PROXY_ADDR}"
+  fi
+
   jq \
     --arg network "$LOCAL_STAGING_CHAIN_CONFIG_NETWORK" \
     --arg coordinator "http://127.0.0.1:${LOCAL_STAGING_COORDINATOR_EDGE_PORT}" \
     --arg realm0 "http://127.0.0.1:$(local_cf_realm_port 0)" \
     --arg realm1 "http://127.0.0.1:$(local_cf_realm_port 1)" \
     --arg prove "http://${LOCAL_STAGING_PROVE_PROXY_ADDR}" \
+    --arg system_prove "$system_prove_url" \
     --arg faucet "http://${LOCAL_STAGING_FAUCET_ADDR}" \
     --arg services "http://${LOCAL_STAGING_PSY_SERVICES_ADDR}" \
     --arg indexer "http://127.0.0.1:${LOCAL_STAGING_INDEXER_PORT}/v1/graphql" \
@@ -1006,6 +1017,7 @@ write_bridge_relayer_rpc_config() {
           {id: 1, rpc_url: [$realm1]}
         ]
       | .networks[$network].prove_proxy_url = [$prove]
+      | .networks[$network].system_prove_proxy_url = [$system_prove]
       | .networks[$network].faucet_rpc_url = [$faucet]
       | .networks[$network].api_services_url = [$services]
       | .networks[$network].indexer_graphql_url = [$indexer]

@@ -88,6 +88,8 @@ localhost["realm_configs"] = [
     if url.strip()
 ]
 localhost["prove_proxy_url"] = [prove_proxy]
+# The relayer needs the system pool; the public prove host runs role=all.
+localhost["system_prove_proxy_url"] = [prove_proxy]
 localhost["api_services_url"] = [services]
 
 with open(target, "w", encoding="utf-8") as f:
