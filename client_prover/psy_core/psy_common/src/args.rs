@@ -192,12 +192,45 @@ pub struct ProverArgs {
     pub api_key: String,
 }
 
+/// Which proof families a prove-proxy instance serves.
+///
+/// `user`   — wallet proofs: UPS session chain, contract calls, signatures, minifiers.
+/// `system` — relayer proofs: the three bridge Groth16 methods.
+/// `all`    — both; intended for single-machine local testnets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ProveProxyRole {
+    User,
+    System,
+    All,
+}
+
+impl ProveProxyRole {
+    pub fn serves_user(&self) -> bool {
+        matches!(self, ProveProxyRole::User | ProveProxyRole::All)
+    }
+
+    pub fn serves_system(&self) -> bool {
+        matches!(self, ProveProxyRole::System | ProveProxyRole::All)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProveProxyRole::User => "user",
+            ProveProxyRole::System => "system",
+            ProveProxyRole::All => "all",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Parser)]
 pub struct ProveProxyArgs {
     #[clap(env = "PROVE_PROXY_LISTEN_ADDR", long, default_value = "0.0.0.0:9999")]
     pub listen_addr: String,
     #[clap(env, long, default_value = "config.json", env)]
     pub rpc_config: String,
+    /// Proof families this instance serves. Defaults to user proofs only.
+    #[clap(env = "PROVE_PROXY_ROLE", long, value_enum, default_value_t = ProveProxyRole::User, ignore_case = true)]
+    pub role: ProveProxyRole,
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -257,4 +290,40 @@ pub struct ExportKeyStoreArgs {
     pub keystore_path: String,
     #[clap(long, env = "WALLET_PASSWORD")]
     pub wallet_password: String,
+}
+
+#[cfg(test)]
+mod prove_proxy_role_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn role_defaults_to_user() {
+        let args = ProveProxyArgs::try_parse_from(["prove-proxy"]).unwrap();
+        assert_eq!(args.role, ProveProxyRole::User);
+        assert!(args.role.serves_user());
+        assert!(!args.role.serves_system());
+    }
+
+    #[test]
+    fn role_parses_case_insensitively() {
+        let args = ProveProxyArgs::try_parse_from(["prove-proxy", "--role", "SYSTEM"]).unwrap();
+        assert_eq!(args.role, ProveProxyRole::System);
+        assert!(!args.role.serves_user());
+        assert!(args.role.serves_system());
+    }
+
+    #[test]
+    fn role_all_serves_both() {
+        let args = ProveProxyArgs::try_parse_from(["prove-proxy", "--role", "all"]).unwrap();
+        assert_eq!(args.role, ProveProxyRole::All);
+        assert!(args.role.serves_user());
+        assert!(args.role.serves_system());
+        assert_eq!(args.role.as_str(), "all");
+    }
+
+    #[test]
+    fn role_rejects_unknown_value() {
+        assert!(ProveProxyArgs::try_parse_from(["prove-proxy", "--role", "bridge"]).is_err());
+    }
 }
