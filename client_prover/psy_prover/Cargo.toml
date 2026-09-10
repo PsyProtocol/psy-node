@@ -83,6 +83,8 @@ js-sys = { workspace = true }
 
 [dev-dependencies]
 flate2 = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
 
 [features]
 gnark-wrap = ["dep:gnark-plonky2-verifier-ffi", "psy_plonky2_circuits/gnark-wrap"]
