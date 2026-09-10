@@ -67,7 +67,7 @@ pub async fn run_prove_proxy_server(args: psy_client_common::args::ProveProxyArg
     use std::net::SocketAddr;
 
     use hyper::Method;
-    use jsonrpsee::server::{RpcModule, ServerBuilder, ServerConfig};
+    use jsonrpsee::server::{ServerBuilder, ServerConfig};
     use psy_client_common::health::HealthLayer;
     use tower_http::cors::{Any, CorsLayer};
 
@@ -76,15 +76,34 @@ pub async fn run_prove_proxy_server(args: psy_client_common::args::ProveProxyArg
     let psy_config = psy_config::PsyConfigGoldilocks::from_file(&args.rpc_config)?;
     let rpc_config = psy_config.get_current_network()?;
 
-    let mut module = RpcModule::new(());
-    let user = UserProveProvider::new_with_config(rpc_config.clone(), PSY_NETWORK_MAGIC).await?;
-    module.merge(user.into_rpc())?;
-    #[cfg(feature = "gnark-wrap")]
-    {
-        use crate::local::native::prove_proxy::system::{ProveProxySystemRpcServer, SystemProveProvider};
-        let system = SystemProveProvider::new()?;
-        module.merge(system.into_rpc())?;
-    }
+    use crate::local::native::prove_proxy::assemble_rpc_module;
+
+    let role = args.role;
+    tracing::info!(role = role.as_str(), "prove proxy role");
+
+    // User circuits are built before assembly because the constructor is
+    // async; assemble_rpc_module only decides whether to *use* it.
+    let user = if role.serves_user() {
+        Some(UserProveProvider::new_with_config(rpc_config.clone(), PSY_NETWORK_MAGIC).await?)
+    } else {
+        None
+    };
+
+    let module = assemble_rpc_module(
+        role,
+        move || Ok(user.expect("user provider built when role serves user").into_rpc().into()),
+        || {
+            #[cfg(feature = "gnark-wrap")]
+            {
+                use crate::local::native::prove_proxy::system::{ProveProxySystemRpcServer, SystemProveProvider};
+                Ok(SystemProveProvider::new()?.into_rpc().into())
+            }
+            #[cfg(not(feature = "gnark-wrap"))]
+            {
+                anyhow::bail!("role `{}` needs system proofs, but this binary was built without the `gnark-wrap` feature", role.as_str())
+            }
+        },
+    )?;
 
     let cors_opts = CorsLayer::new()
         .allow_methods([Method::POST, Method::OPTIONS])
@@ -105,7 +124,7 @@ pub async fn run_prove_proxy_server(args: psy_client_common::args::ProveProxyArg
         .await?;
 
     let handle = server.start(module);
-    println!("\n[CFLI:PSY_PROVE_PROXY_STARTED][{}]\n", server_addr);
+    println!("\n[CFLI:PSY_PROVE_PROXY_STARTED][{}][{}]\n", server_addr, role.as_str());
     handle.stopped().await;
     Ok(())
 }

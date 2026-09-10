@@ -1,7 +1,7 @@
 //! prove-proxy: wallet-facing (user) and relayer-facing (system) proving RPCs.
 //!
 //! `user` and `system` are separate `#[rpc]` traits so a process can register
-//! exactly one family; see `assemble_rpc_module` (Task 3).
+//! exactly one family; see `assemble_rpc_module`.
 
 pub mod user;
 
