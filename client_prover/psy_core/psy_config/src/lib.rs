@@ -55,6 +55,10 @@ pub struct NetworkConfig<F: RichField> {
     pub realm_configs: Vec<RealmConfig>,
     pub coordinator_configs: Vec<CoordinatorConfig>,
     pub prove_proxy_url: Vec<String>,
+    /// Prove-proxy pool that serves the bridge Groth16 (relayer) proofs.
+    /// The relayer refuses to start when this is empty for the current network.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system_prove_proxy_url: Vec<String>,
     pub faucet_rpc_url: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_services_url: Option<Vec<String>>,
@@ -803,6 +807,7 @@ mod tests {
                         "realm_configs": [{"id": 0, "rpc_url": ["http://127.0.0.1:8546"]}],
                         "coordinator_configs": [{"id": 0, "rpc_url": ["http://127.0.0.1:8545"]}],
                         "prove_proxy_url": ["http://127.0.0.1:9999"],
+                        "system_prove_proxy_url": ["http://127.0.0.1:9999"],
                         "native_currency": "PSY",
                         "native_currency_decimal": 9,
                         "native_currency_name": "PSY",
@@ -822,6 +827,7 @@ mod tests {
                         "realm_configs": [{"id": 0, "rpc_url": ["https://testnet.example.com"]}],
                         "coordinator_configs": [{"id": 0, "rpc_url": ["https://testnet-coord.example.com"]}],
                         "prove_proxy_url": ["https://testnet-prover.example.com"],
+                        "system_prove_proxy_url": ["https://testnet-prover.example.com"],
                         "native_currency": "tPSY",
                         "native_currency_decimal": 9,
                         "native_currency_name": "Test PSY",
@@ -847,6 +853,53 @@ mod tests {
     }
 
     #[test]
+    fn system_prove_proxy_url_defaults_to_empty_and_reads_when_present() {
+        // Template: the "localhost" network object's fields from test_network_switching
+        // above, plus `magic`, `faucet_rpc_url` and `nostr_relay_url` (required fields
+        // on NetworkConfig with no serde default) and without the extra "network"
+        // wrapper key that test_network_switching's literal uses. Config::networks is
+        // HashMap<String, NetworkConfig<F>>, i.e. flat — real config.json (see
+        // psy-genesis/config.json) has no "network" wrapper either. The
+        // test_network_switching-family tests are pre-existing failures for this
+        // structural reason; see task report.
+        // This base still does not contain system_prove_proxy_url.
+        let base = r#"{
+                        "magic": "0x1",
+                        "users_per_realm": 1048576,
+                        "global_user_tree_height": 24,
+                        "realm_user_tree_height": 20,
+                        "group_realm_height": 1,
+                        "realm_configs": [{"id": 0, "rpc_url": ["http://127.0.0.1:8546"]}],
+                        "coordinator_configs": [{"id": 0, "rpc_url": ["http://127.0.0.1:8545"]}],
+                        "prove_proxy_url": ["http://127.0.0.1:9999"],
+                        "faucet_rpc_url": ["http://127.0.0.1:8547"],
+                        "nostr_relay_url": "wss://relay.127.0.0.1.example",
+                        "native_currency": "PSY",
+                        "native_currency_decimal": 9,
+                        "native_currency_name": "PSY",
+                        "fees": {
+                            "register_user_fee": 0,
+                            "deploy_contract_fee": 0,
+                            "guta_fee": 5000000000,
+                            "da_fee": 0
+                        }
+                    }"#;
+        let without = format!(r#"{{"networks":{{"localhost":{base}}},"defaultNetwork":"localhost"}}"#);
+        let with = without.replacen(
+            r#""prove_proxy_url": ["http://127.0.0.1:9999"],"#,
+            r#""prove_proxy_url": ["http://127.0.0.1:9999"], "system_prove_proxy_url": ["http://127.0.0.1:9997"],"#,
+            1,
+        );
+        assert_ne!(with, without, "replacen must hit the prove_proxy_url line");
+
+        let cfg = PsyConfigGoldilocks::from_json(&without).unwrap();
+        assert!(cfg.get_current_network().unwrap().system_prove_proxy_url.is_empty());
+
+        let cfg = PsyConfigGoldilocks::from_json(&with).unwrap();
+        assert_eq!(cfg.get_current_network().unwrap().system_prove_proxy_url, vec!["http://127.0.0.1:9997"]);
+    }
+
+    #[test]
     fn test_flexible_config_creation() {
         let json = r#"{
             "networks": {
@@ -859,6 +912,7 @@ mod tests {
                         "realm_configs": [{"id": 0, "rpc_url": ["http://dev.local"]}],
                         "coordinator_configs": [{"id": 0, "rpc_url": ["http://coord.local"]}],
                         "prove_proxy_url": ["http://prover.local"],
+                        "system_prove_proxy_url": ["http://prover.local"],
                         "native_currency": "DEV",
                         "native_currency_decimal": 6,
                         "native_currency_name": "Development",
@@ -878,6 +932,7 @@ mod tests {
                         "realm_configs": [{"id": 0, "rpc_url": ["http://localhost:8546"]}],
                         "coordinator_configs": [{"id": 0, "rpc_url": ["http://localhost:8545"]}],
                         "prove_proxy_url": ["http://localhost:9999"],
+                        "system_prove_proxy_url": ["http://localhost:9999"],
                         "native_currency": "LOCAL",
                         "native_currency_decimal": 8,
                         "native_currency_name": "Local Token",
@@ -917,6 +972,7 @@ mod tests {
                         "realm_configs": [{"id": 0, "rpc_url": ["http://dev.local"]}],
                         "coordinator_configs": [{"id": 0, "rpc_url": ["http://coord.local"]}],
                         "prove_proxy_url": ["http://prover.local"],
+                        "system_prove_proxy_url": ["http://prover.local"],
                         "native_currency": "DEV",
                         "native_currency_decimal": 6,
                         "native_currency_name": "Development",
@@ -936,6 +992,7 @@ mod tests {
                         "realm_configs": [{"id": 0, "rpc_url": ["http://localhost:8546"]}],
                         "coordinator_configs": [{"id": 0, "rpc_url": ["http://localhost:8545"]}],
                         "prove_proxy_url": ["http://localhost:9999"],
+                        "system_prove_proxy_url": ["http://localhost:9999"],
                         "native_currency": "LOCAL",
                         "native_currency_decimal": 8,
                         "native_currency_name": "Local Token",
@@ -983,6 +1040,7 @@ mod tests {
                         "realm_configs": [{"id": 0, "rpc_url": ["http://test.local"]}],
                         "coordinator_configs": [{"id": 0, "rpc_url": ["http://coord.local"]}],
                         "prove_proxy_url": ["http://prover.local"],
+                        "system_prove_proxy_url": ["http://prover.local"],
                         "native_currency": "TEST",
                         "native_currency_decimal": 6,
                         "native_currency_name": "Test",
