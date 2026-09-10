@@ -10,7 +10,6 @@ pub mod contract_abi_upload;
 pub mod deploy_contract;
 pub mod faucet_server;
 pub mod local_prover;
-#[cfg(feature = "gnark-wrap")]
 pub mod prove_proxy;
 pub mod simulate;
 pub mod update_contract;
@@ -110,7 +109,6 @@ pub enum Commands {
 
     // local proving
     LocalProver(ProverArgs),
-    #[cfg(feature = "gnark-wrap")]
     ProveProxy(psy_client_common::args::ProveProxyArgs),
     FaucetServer(PsyFaucetServerArgs),
 
