@@ -4,13 +4,11 @@ pub mod signature;
 pub mod trace;
 pub mod wallet;
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "gnark-wrap"))]
+#[cfg(not(target_arch = "wasm32"))]
 use psy_config::PSY_NETWORK_MAGIC;
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::local::native::faucet::PsyFaucetServerProvider;
-#[cfg(all(not(target_arch = "wasm32"), feature = "gnark-wrap"))]
-use crate::local::native::prove_proxy::ProveProxyServerProvider;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn run_server(args: psy_client_common::args::ProverArgs) -> anyhow::Result<()> {
@@ -64,20 +62,30 @@ pub async fn run_server(args: psy_client_common::args::ProverArgs) -> anyhow::Re
     Ok(())
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "gnark-wrap"))]
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn run_prove_proxy_server(args: psy_client_common::args::ProveProxyArgs) -> anyhow::Result<()> {
     use std::net::SocketAddr;
 
     use hyper::Method;
-    use jsonrpsee::server::{ServerBuilder, ServerConfig};
+    use jsonrpsee::server::{RpcModule, ServerBuilder, ServerConfig};
     use psy_client_common::health::HealthLayer;
     use tower_http::cors::{Any, CorsLayer};
 
-    use crate::local::native::prove_proxy::ProveProxyRpcServer;
+    use crate::local::native::prove_proxy::user::{ProveProxyUserRpcServer, UserProveProvider};
 
     let psy_config = psy_config::PsyConfigGoldilocks::from_file(&args.rpc_config)?;
     let rpc_config = psy_config.get_current_network()?;
-    let prove_proxy = ProveProxyServerProvider::new_with_config(rpc_config.clone(), PSY_NETWORK_MAGIC).await?;
+
+    let mut module = RpcModule::new(());
+    let user = UserProveProvider::new_with_config(rpc_config.clone(), PSY_NETWORK_MAGIC).await?;
+    module.merge(user.into_rpc())?;
+    #[cfg(feature = "gnark-wrap")]
+    {
+        use crate::local::native::prove_proxy::system::{ProveProxySystemRpcServer, SystemProveProvider};
+        let system = SystemProveProvider::new()?;
+        module.merge(system.into_rpc())?;
+    }
+
     let cors_opts = CorsLayer::new()
         .allow_methods([Method::POST, Method::OPTIONS])
         .allow_origin(Any)
@@ -96,7 +104,7 @@ pub async fn run_prove_proxy_server(args: psy_client_common::args::ProveProxyArg
         .build(server_addr)
         .await?;
 
-    let handle = server.start(prove_proxy.into_rpc());
+    let handle = server.start(module);
     println!("\n[CFLI:PSY_PROVE_PROXY_STARTED][{}]\n", server_addr);
     handle.stopped().await;
     Ok(())
