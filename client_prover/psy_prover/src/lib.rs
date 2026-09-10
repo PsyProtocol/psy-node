@@ -71,12 +71,11 @@ pub async fn run_prove_proxy_server(args: psy_client_common::args::ProveProxyArg
     use psy_client_common::health::HealthLayer;
     use tower_http::cors::{Any, CorsLayer};
 
+    use crate::local::native::prove_proxy::assemble_rpc_module;
     use crate::local::native::prove_proxy::user::{ProveProxyUserRpcServer, UserProveProvider};
 
     let psy_config = psy_config::PsyConfigGoldilocks::from_file(&args.rpc_config)?;
     let rpc_config = psy_config.get_current_network()?;
-
-    use crate::local::native::prove_proxy::assemble_rpc_module;
 
     let role = args.role;
     tracing::info!(role = role.as_str(), "prove proxy role");

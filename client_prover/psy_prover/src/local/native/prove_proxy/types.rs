@@ -74,25 +74,6 @@ pub fn parse_hex_qhashout(hex: &str) -> anyhow::Result<ParthQHashOut<F>> {
     }))
 }
 
-pub fn parse_internal_u32x8_qhashout(hex: &str) -> anyhow::Result<ParthQHashOut<F>> {
-    let hex = hex.trim_start_matches("0x");
-    anyhow::ensure!(hex.len() == 64, "expected 64 hex chars, got {}", hex.len());
-    let bytes = hex::decode(hex)?;
-    let mut words = [0u32; 8];
-    for i in 0..8 {
-        words[i] = u32::from_be_bytes(bytes[i * 4..i * 4 + 4].try_into()?);
-    }
-    let elems = [
-        ((words[1] as u64) << 32) | words[0] as u64,
-        ((words[3] as u64) << 32) | words[2] as u64,
-        ((words[5] as u64) << 32) | words[4] as u64,
-        ((words[7] as u64) << 32) | words[6] as u64,
-    ];
-    Ok(ParthQHashOut(HashOut {
-        elements: elems.map(F::from_canonical_u64),
-    }))
-}
-
 // ── Bridge Aggregation Types ─────────────────────────────────────────────
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -208,12 +189,6 @@ pub fn g16_proof_to_solidity_words(groth16: &UncompressedGroth16ProofData) -> [S
 pub fn parse_hex_qhashout_to_qhash(h: &str) -> anyhow::Result<parth_core::pgoldilocks::QHashOut<F>> {
     let pq = parse_hex_qhashout(h)?;
     Ok(parth_core::pgoldilocks::QHashOut(pq.0))
-}
-
-pub fn qhashout_from_felts(elems: &[F]) -> parth_core::pgoldilocks::QHashOut<F> {
-    parth_core::pgoldilocks::QHashOut(HashOut {
-        elements: [elems[0], elems[1], elems[2], elems[3]],
-    })
 }
 
 pub fn felt4_to_bytes32_hex(felts: &[F]) -> String {
