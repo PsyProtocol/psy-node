@@ -1,3 +1,9 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
 use anyhow::{Context, Result};
 use hashbrown::HashMap;
 use plonky2::field::{goldilocks_field::GoldilocksField, types::PrimeField64};
@@ -9,22 +15,103 @@ use psy_client_common::{
 };
 use psy_client_data::{
     api::reward::{PsyProoffMinerRewardProof, PsyProoffMinerRewardProofWithRewardPreimage, PsyProvingJobClaimMetadata},
+    config::store_config::PsyHasher,
     traits::qdatastore::{qmetadata::QMetaDataStoreReaderSync, qtreedata::QTreeDataStoreReaderSync},
 };
 use psy_config::network_constants::{MINING_REWARDS_CONTRACT_ID, TOKEN_CONTRACT_ID, TOKEN_CONTRACT_STATE_TREE_HEIGHT};
-use psy_crypto::hash::merkle::tag_tree::TagTreeMerkleProofWithRewardPreimage;
+use psy_crypto::hash::{merkle::tag_tree::TagTreeMerkleProofWithRewardPreimage, traits::hasher::FieldQHasher};
 use psy_prover::session::{build_claim_calls_for_multi_checkpoints_v2, ProofWithCheckpointV2, LAST_CLAIMED_CHECKPOINT_SLOT};
 use psy_provider::provider::RpcProvider;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::{args::ClaimRewardsArgs, submit_end_cap_proof};
-use crate::result::{CommandResult, TransactionResult, TransactionStatus};
+use crate::result::{write_json_atomically, CommandResult, TransactionResult, TransactionStatus};
+
+type ClaimMetadata = PsyProvingJobClaimMetadata<QHashOut<GoldilocksField>, QProvingJobDataID>;
+
+#[derive(Debug)]
+struct LoadedClaimJobs {
+    records: Vec<ClaimMetadata>,
+    source_format: String,
+    source_record_size: Option<usize>,
+    source_sha256: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RewardSummary {
+    schema_version: u32,
+    network: String,
+    generated_at_ms: u64,
+    source: RewardSummarySource,
+    summary: RewardSummaryTotals,
+    checkpoints: Vec<RewardSummaryCheckpoint>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RewardSummarySource {
+    path: String,
+    format: String,
+    record_size: Option<usize>,
+    record_count: usize,
+    sha256: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RewardSummaryTotals {
+    checkpoint_count: usize,
+    job_count: usize,
+    estimated_total_reward: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RewardSummaryCheckpoint {
+    checkpoint_id: u64,
+    unique_pending_id: u64,
+    node_type: String,
+    realm_id: u64,
+    realm_sub_id: u64,
+    fees_collected: u64,
+    gutas_completed: u64,
+    reward_per_job: u64,
+    job_count: usize,
+    estimated_total_reward: u64,
+    jobs: Vec<RewardSummaryJob>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RewardSummaryJob {
+    #[serde(flatten)]
+    metadata: ClaimMetadata,
+    circuit_name: String,
+    reward_path_info: u64,
+    estimated_reward: u64,
+    validation: RewardSummaryValidation,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RewardSummaryValidation {
+    preimage_matches_backup_tag: bool,
+    proof_leaf_tag_matches_backup_tag: bool,
+}
 
 pub async fn run(args: ClaimRewardsArgs) -> Result<CommandResult> {
     let psy_config = psy_config::PsyConfigGoldilocks::from_file(&args.rpc_config)?;
     let rpc_config = psy_config.get_current_network()?.clone();
-    let info = load_wallet_key_info(&args.wallet, false)?;
-
     let provider = RpcProvider::new_with_config(&rpc_config)?;
+    let loaded = load_claim_jobs(&args.jobs_file)?;
+    tracing::info!("Loaded {} job records from {}", loaded.records.len(), args.jobs_file);
+
+    if let Some(summary_output) = &args.summary_output {
+        let summary = build_reward_summary(&provider, psy_config.current_network_name(), &args.jobs_file, &loaded).await?;
+        write_json_atomically(Path::new(summary_output), &summary)?;
+        tracing::info!("Wrote reusable reward summary to {}", summary_output);
+    }
+    if args.summary_only {
+        return Ok(CommandResult::generic("claim-rewards-summary"));
+    }
+
+    let info = load_wallet_key_info(&args.wallet, false)?;
     let user_id = provider
         .get_user_ids_for_public_key(info.public_key_hash)
         .await?
@@ -32,7 +119,7 @@ pub async fn run(args: ClaimRewardsArgs) -> Result<CommandResult> {
         .ok_or(anyhow::format_err!("no user id"))?
         .clone();
 
-    let job_ids = load_job_ids_from_file(&args.jobs_file)?;
+    let job_ids = claim_jobs_from_metadata(loaded.records)?;
     tracing::info!("Loaded {} job IDs from file", job_ids.jobs_len());
     let job_ids = validate_and_deduplicate_jobs(job_ids, user_id, &args.jobs_file)?;
     tracing::info!(
@@ -368,16 +455,60 @@ async fn get_last_claimed_checkpoint_id(provider: &RpcProvider, user_id: u64, la
     Ok(proof.value.0.elements[1].0)
 }
 
-fn load_job_ids_from_file(path: &str) -> Result<ClaimRewardJobsWithRealm> {
+fn load_claim_jobs(path: &str) -> Result<LoadedClaimJobs> {
     let buffer = std::fs::read(path)?;
-    let mut claim_jobs = ClaimRewardJobsWithRealm::new_empty();
+    let source_sha256 = format!("{:x}", Sha256::digest(&buffer));
 
     if buffer.is_empty() {
         tracing::info!("Backup file is empty");
-        return Ok(claim_jobs);
+        return Ok(LoadedClaimJobs {
+            records: Vec::new(),
+            source_format: "psy-worker-backup-v1".to_string(),
+            source_record_size: Some(ClaimMetadata::record_size()),
+            source_sha256,
+        });
     }
 
-    let record_size = PsyProvingJobClaimMetadata::<QHashOut<GoldilocksField>, QProvingJobDataID>::record_size();
+    if buffer.iter().find(|byte| !byte.is_ascii_whitespace()) == Some(&b'{') {
+        let summary: RewardSummary = serde_json::from_slice(&buffer).context("failed to parse reward summary JSON")?;
+        anyhow::ensure!(
+            summary.schema_version == 1,
+            "unsupported reward summary schema_version {}",
+            summary.schema_version
+        );
+        let expected_job_count = summary.summary.job_count;
+        let mut records = Vec::new();
+        for checkpoint in summary.checkpoints {
+            for job in checkpoint.jobs {
+                let computed_path = reward_path_info(job.metadata.reward_tree_node_key.level, job.metadata.reward_tree_node_key.index)?;
+                anyhow::ensure!(
+                    computed_path == job.reward_path_info,
+                    "{} has inconsistent reward_path_info for job {:?}: stored={}, computed={}",
+                    path,
+                    job.metadata.job_id,
+                    job.reward_path_info,
+                    computed_path,
+                );
+                records.push(job.metadata);
+            }
+        }
+        anyhow::ensure!(
+            records.len() == expected_job_count,
+            "{} summary job_count is {}, but contains {} jobs",
+            path,
+            expected_job_count,
+            records.len(),
+        );
+        let records = validate_and_deduplicate_metadata(records, path)?;
+        return Ok(LoadedClaimJobs {
+            records,
+            source_format: "psy-reward-summary-v1".to_string(),
+            source_record_size: None,
+            source_sha256,
+        });
+    }
+
+    let record_size = ClaimMetadata::record_size();
     anyhow::ensure!(
         buffer.len() % record_size == 0,
         "jobs backup length {} is not a multiple of record size {}",
@@ -385,10 +516,56 @@ fn load_job_ids_from_file(path: &str) -> Result<ClaimRewardJobsWithRealm> {
         record_size
     );
 
+    let mut records = Vec::with_capacity(buffer.len() / record_size);
     for (record_index, record_data) in buffer.chunks_exact(record_size).enumerate() {
         let offset = record_index * record_size;
-        let metadata = PsyProvingJobClaimMetadata::<QHashOut<GoldilocksField>, QProvingJobDataID>::psy_ser_from_slice(record_data)
-            .with_context(|| format!("failed to parse jobs backup record at offset {}", offset))?;
+        let metadata =
+            ClaimMetadata::psy_ser_from_slice(record_data).with_context(|| format!("failed to parse jobs backup record at offset {}", offset))?;
+        validate_claim_metadata(&metadata, path)?;
+        records.push(metadata);
+    }
+
+    Ok(LoadedClaimJobs {
+        records: validate_and_deduplicate_metadata(records, path)?,
+        source_format: "psy-worker-backup-v1".to_string(),
+        source_record_size: Some(record_size),
+        source_sha256,
+    })
+}
+
+fn validate_claim_metadata(metadata: &ClaimMetadata, source: &str) -> Result<()> {
+    let encoded = reward_path_info(metadata.reward_tree_node_key.level, metadata.reward_tree_node_key.index)?;
+    let expected_tag = PsyHasher::q_two_to_one(metadata.reward_tree_tag_preimage, metadata.reward_tree_tag_preimage);
+    anyhow::ensure!(
+        expected_tag == metadata.reward_tree_tag,
+        "{} contains a reward_tree_tag that does not match its preimage: job_id={:?}, reward_path_info={}",
+        source,
+        metadata.job_id,
+        encoded,
+    );
+    Ok(())
+}
+
+fn validate_and_deduplicate_metadata(records: Vec<ClaimMetadata>, source: &str) -> Result<Vec<ClaimMetadata>> {
+    let mut seen: HashMap<QProvingJobDataID, ClaimMetadata> = HashMap::new();
+    let mut result = Vec::with_capacity(records.len());
+    for metadata in records {
+        validate_claim_metadata(&metadata, source)?;
+        match seen.get(&metadata.job_id) {
+            Some(existing) if existing == &metadata => continue,
+            Some(_) => anyhow::bail!("{} contains conflicting duplicate job_id {:?}", source, metadata.job_id),
+            None => {
+                seen.insert(metadata.job_id, metadata.clone());
+                result.push(metadata);
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn claim_jobs_from_metadata(records: Vec<ClaimMetadata>) -> Result<ClaimRewardJobsWithRealm> {
+    let mut claim_jobs = ClaimRewardJobsWithRealm::new_empty();
+    for metadata in records {
         let job = QProvingJobDataIDWithRewardPreimage::new(
             metadata.job_id,
             reward_path_info(metadata.reward_tree_node_key.level, metadata.reward_tree_node_key.index)?,
@@ -402,6 +579,154 @@ fn load_job_ids_from_file(path: &str) -> Result<ClaimRewardJobsWithRealm> {
     }
 
     Ok(claim_jobs)
+}
+
+#[cfg(test)]
+fn load_job_ids_from_file(path: &str) -> Result<ClaimRewardJobsWithRealm> {
+    claim_jobs_from_metadata(load_claim_jobs(path)?.records)
+}
+
+async fn build_reward_summary(provider: &RpcProvider, network: &str, source_path: &str, loaded: &LoadedClaimJobs) -> Result<RewardSummary> {
+    let mut groups: BTreeMap<(u8, u64, u64, u64), Vec<&ClaimMetadata>> = BTreeMap::new();
+    for metadata in &loaded.records {
+        anyhow::ensure!(
+            matches!(metadata.node_type, 1 | 2),
+            "unsupported reward node_type {} for job {:?}",
+            metadata.node_type,
+            metadata.job_id,
+        );
+        groups
+            .entry((metadata.node_type, metadata.realm_id, metadata.realm_sub_id, metadata.unique_pending_id))
+            .or_default()
+            .push(metadata);
+    }
+
+    let mut checkpoint_stats = BTreeMap::<u64, (u64, u64, u64)>::new();
+    let mut checkpoints = Vec::with_capacity(groups.len());
+    let mut distinct_checkpoint_ids = BTreeSet::new();
+    let mut estimated_total_reward = 0u64;
+
+    for ((node_type, realm_id, realm_sub_id, unique_pending_id), records) in groups {
+        let request_jobs = records
+            .iter()
+            .map(|metadata| {
+                Ok(QProvingJobDataIDWithRewardPreimage::new(
+                    metadata.job_id,
+                    reward_path_info(metadata.reward_tree_node_key.level, metadata.reward_tree_node_key.index)?,
+                    metadata.reward_tree_tag_preimage,
+                )
+                .inner)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let (checkpoint_id, proofs) = if node_type == 1 {
+            let checkpoint_id = require_checkpoint_id(
+                provider
+                    .get_realm_checkpoint_id_for_unique_pending_id_by_realm_id(realm_id, unique_pending_id)
+                    .await?,
+                &format!("realm {} unique_pending_id {}", realm_id, unique_pending_id),
+            )?;
+            let proofs = provider
+                .generate_realm_batch_proof_miner_reward_proofs_by_realm_id(realm_id, unique_pending_id, request_jobs)
+                .await?;
+            (checkpoint_id, proofs)
+        } else {
+            let checkpoint_id = require_checkpoint_id(
+                provider.get_coordinator_checkpoint_id_for_unique_pending_id(unique_pending_id).await?,
+                &format!("coordinator unique_pending_id {}", unique_pending_id),
+            )?;
+            let proofs = provider
+                .generate_coordinator_batch_proof_miner_reward_proofs(unique_pending_id, request_jobs)
+                .await?;
+            (checkpoint_id, proofs)
+        };
+
+        let (fees_collected, gutas_completed, reward_per_job) = match checkpoint_stats.get(&checkpoint_id) {
+            Some(stats) => *stats,
+            None => {
+                let leaf = provider.get_checkpoint_leaf_data(checkpoint_id).await?;
+                let fees = leaf.stats.guta_fees_collected.to_canonical_u64();
+                let gutas = leaf.stats.pm_jobs_completed.gutas_completed.to_canonical_u64();
+                let reward = if gutas == 0 { 0 } else { fees / gutas };
+                checkpoint_stats.insert(checkpoint_id, (fees, gutas, reward));
+                (fees, gutas, reward)
+            }
+        };
+
+        let mut proofs_by_job = HashMap::new();
+        for proof in proofs {
+            anyhow::ensure!(
+                proofs_by_job.insert(proof.job_id, proof).is_none(),
+                "duplicate reward proof for unique_pending_id {}",
+                unique_pending_id,
+            );
+        }
+
+        let mut jobs = Vec::with_capacity(records.len());
+        for metadata in records {
+            let proof = proofs_by_job
+                .remove(&metadata.job_id)
+                .with_context(|| format!("missing reward proof for job {:?}", metadata.job_id))?;
+            anyhow::ensure!(
+                proof.tag_tree_proof.leaf.tag == metadata.reward_tree_tag,
+                "reward proof leaf tag does not match backup tag for job {:?}",
+                metadata.job_id,
+            );
+            jobs.push(RewardSummaryJob {
+                metadata: metadata.clone(),
+                circuit_name: format!("{:?}", metadata.job_id.circuit_type),
+                reward_path_info: reward_path_info(metadata.reward_tree_node_key.level, metadata.reward_tree_node_key.index)?,
+                estimated_reward: reward_per_job,
+                validation: RewardSummaryValidation {
+                    preimage_matches_backup_tag: true,
+                    proof_leaf_tag_matches_backup_tag: true,
+                },
+            });
+        }
+        anyhow::ensure!(
+            proofs_by_job.is_empty(),
+            "RPC returned unrequested reward proofs for unique_pending_id {}",
+            unique_pending_id
+        );
+
+        let group_total = reward_per_job.checked_mul(jobs.len() as u64).context("estimated group reward overflow")?;
+        estimated_total_reward = estimated_total_reward
+            .checked_add(group_total)
+            .context("estimated total reward overflow")?;
+        distinct_checkpoint_ids.insert(checkpoint_id);
+        checkpoints.push(RewardSummaryCheckpoint {
+            checkpoint_id,
+            unique_pending_id,
+            node_type: if node_type == 1 { "realm" } else { "coordinator" }.to_string(),
+            realm_id,
+            realm_sub_id,
+            fees_collected,
+            gutas_completed,
+            reward_per_job,
+            job_count: jobs.len(),
+            estimated_total_reward: group_total,
+            jobs,
+        });
+    }
+
+    Ok(RewardSummary {
+        schema_version: 1,
+        network: network.to_string(),
+        generated_at_ms: SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64,
+        source: RewardSummarySource {
+            path: source_path.to_string(),
+            format: loaded.source_format.clone(),
+            record_size: loaded.source_record_size,
+            record_count: loaded.records.len(),
+            sha256: loaded.source_sha256.clone(),
+        },
+        summary: RewardSummaryTotals {
+            checkpoint_count: distinct_checkpoint_ids.len(),
+            job_count: loaded.records.len(),
+            estimated_total_reward,
+        },
+        checkpoints,
+    })
 }
 
 pub async fn build_claim_calls_from_proofs(
@@ -659,10 +984,11 @@ mod tests {
     fn backup_preserves_unique_pending_id_and_reward_tree_node_key() {
         use psy_crypto::hash::merkle::utils::common::SimpleMerkleNodeKey;
 
+        let reward_tree_tag_preimage = QHashOut::from_values(7, 0, 10, 11);
         let metadata = PsyProvingJobClaimMetadata {
             job_id: job(1, 7, 10).inner.job_data_id,
-            reward_tree_tag: QHashOut::from_values(1, 2, 3, 4),
-            reward_tree_tag_preimage: QHashOut::from_values(7, 0, 10, 11),
+            reward_tree_tag: PsyHasher::q_two_to_one(reward_tree_tag_preimage, reward_tree_tag_preimage),
+            reward_tree_tag_preimage,
             proving_duration_ms: 1,
             job_submitted_at: 2,
             unique_pending_id: 987,
@@ -679,10 +1005,74 @@ mod tests {
         let loaded = load_job_ids_from_file(path.to_str().unwrap()).unwrap();
         assert_eq!(loaded.realm_jobs[0].0, 3);
         assert_eq!(loaded.realm_jobs[0].1, 987);
-        assert_eq!(
-            loaded.realm_jobs[0].2.inner.reward_path_info,
-            (3u64 << 56) | 2
-        );
+        assert_eq!(loaded.realm_jobs[0].2.inner.reward_path_info, (3u64 << 56) | 2);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reusable_json_recomputes_and_validates_reward_path() {
+        use psy_crypto::hash::merkle::utils::common::SimpleMerkleNodeKey;
+
+        let reward_tree_tag_preimage = QHashOut::from_values(7, 0, 10, 11);
+        let metadata = PsyProvingJobClaimMetadata {
+            job_id: job(1, 7, 10).inner.job_data_id,
+            reward_tree_tag: PsyHasher::q_two_to_one(reward_tree_tag_preimage, reward_tree_tag_preimage),
+            reward_tree_tag_preimage,
+            proving_duration_ms: 1,
+            job_submitted_at: 2,
+            unique_pending_id: 987,
+            realm_id: 3,
+            realm_sub_id: 4,
+            reward_tree_node_key: SimpleMerkleNodeKey { level: 3, index: 2 },
+            reward_tree_hash_mode: 0,
+            reward_tree_node_children: 0,
+            node_type: 1,
+            api_url_hash: [0; 32],
+        };
+        let summary = RewardSummary {
+            schema_version: 1,
+            network: "sepolia".to_string(),
+            generated_at_ms: 1,
+            source: RewardSummarySource {
+                path: "worker.backup".to_string(),
+                format: "psy-worker-backup-v1".to_string(),
+                record_size: Some(ClaimMetadata::record_size()),
+                record_count: 1,
+                sha256: "00".to_string(),
+            },
+            summary: RewardSummaryTotals {
+                checkpoint_count: 1,
+                job_count: 1,
+                estimated_total_reward: 42,
+            },
+            checkpoints: vec![RewardSummaryCheckpoint {
+                checkpoint_id: 999,
+                unique_pending_id: 987,
+                node_type: "realm".to_string(),
+                realm_id: 3,
+                realm_sub_id: 4,
+                fees_collected: 42,
+                gutas_completed: 1,
+                reward_per_job: 42,
+                job_count: 1,
+                estimated_total_reward: 42,
+                jobs: vec![RewardSummaryJob {
+                    metadata,
+                    circuit_name: "test".to_string(),
+                    reward_path_info: (3u64 << 56) | 2,
+                    estimated_reward: 42,
+                    validation: RewardSummaryValidation {
+                        preimage_matches_backup_tag: true,
+                        proof_leaf_tag_matches_backup_tag: true,
+                    },
+                }],
+            }],
+        };
+        let path = std::env::temp_dir().join(format!("claim-rewards-summary-{}.json", std::process::id()));
+        std::fs::write(&path, serde_json::to_vec_pretty(&summary).unwrap()).unwrap();
+        let loaded = load_claim_jobs(path.to_str().unwrap()).unwrap();
+        let jobs = claim_jobs_from_metadata(loaded.records).unwrap();
+        assert_eq!(jobs.realm_jobs[0].2.inner.reward_path_info, (3u64 << 56) | 2);
         std::fs::remove_file(path).unwrap();
     }
 }

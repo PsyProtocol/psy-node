@@ -542,6 +542,13 @@ pub struct ClaimRewardsArgs {
     /// Path to JSON file containing job IDs
     #[clap(long, default_value = "worker.backup")]
     pub jobs_file: String,
+    /// Write a versioned, reusable JSON reward summary to this path.
+    #[clap(long)]
+    pub summary_output: Option<String>,
+    /// Generate the reward summary without loading a wallet or submitting a
+    /// transaction.
+    #[clap(long, requires = "summary_output")]
+    pub summary_only: bool,
 }
 
 #[derive(Clone, Args, Serialize, Deserialize)]
