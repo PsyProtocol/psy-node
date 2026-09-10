@@ -9,7 +9,7 @@ use crate::bridge::{
     claim_withdrawals,
     constants::{DEFAULT_DEPLOYMENTS_NETWORK, DEFAULT_L1_RPC_URL},
     daemon::{
-        fetch_l1_last_finalized_checkpoint, resolve_bridge_address, resolve_prove_proxy_url,
+        fetch_l1_last_finalized_checkpoint, resolve_bridge_address, resolve_system_prove_proxy_url,
         run_l2_bridge_round_with_l1_provider, submit_deposit_batch_appends_with_l1_rpc,
         BridgeProposeDaemonConfig, DaemonState, DaemonFinalizeConfig, L2RoundResult,
     },
@@ -218,7 +218,7 @@ impl L1Client {
         config: &BridgeProposeDaemonConfig,
         target_deposit_count: u32,
     ) -> anyhow::Result<()> {
-        let prove_proxy_url = resolve_prove_proxy_url(config);
+        let prove_proxy_url = resolve_system_prove_proxy_url(config)?;
         self.with_retry("deposit_batch_appends", L1_RETRY_MAX_ATTEMPTS, |url| {
             let owned = url.to_string();
             let proxy = prove_proxy_url.clone();
@@ -227,7 +227,7 @@ impl L1Client {
                     config,
                     &owned,
                     target_deposit_count,
-                    proxy.as_deref(),
+                    Some(proxy.as_str()),
                 )
                 .await
             }
@@ -247,7 +247,7 @@ impl L1Client {
             to_checkpoint,
             "claiming current batch withdrawals on L1"
         );
-        let prove_proxy_url = resolve_prove_proxy_url(config);
+        let prove_proxy_url = resolve_system_prove_proxy_url(config)?;
         self.with_retry("claim_withdrawals", L1_RETRY_MAX_ATTEMPTS, |url| {
             let owned = url.to_string();
             let bridge_addr = bridge_addr.clone();
@@ -258,7 +258,7 @@ impl L1Client {
                     config,
                     &owned,
                     &bridge_addr,
-                    proxy.as_deref(),
+                    Some(proxy.as_str()),
                 )
                 .await?;
                 tracing::info!(

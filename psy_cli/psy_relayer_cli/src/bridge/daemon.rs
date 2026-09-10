@@ -857,8 +857,8 @@ async fn run_multichain(
     let max_batch = config.max_checkpoint_batch.unwrap_or(DEFAULT_MAX_CHECKPOINT_BATCH);
     validate_max_checkpoint_batch(max_batch)?;
     let state_path = proof_dir.join("daemon_state_multichain.toml");
-    let proxy = resolve_prove_proxy_url(&config);
-    if proxy.is_none() { warmup_bridge_resources()?; }
+    let proxy = resolve_system_prove_proxy_url(&config)?;
+    tracing::info!(prove_proxy = %proxy, "system prove proxy configured");
     tracing::info!(config=%config_path.display(), chain_count=chains.len(), %identity_namespace, "multichain bridge relayer started");
 
     loop {
@@ -948,7 +948,7 @@ async fn run_multichain(
         let needs_finalize = chains.iter().any(|chain| cursors[&chain.chain_index] < to_checkpoint);
         if needs_finalize && !shared_path.exists() {
             if let Err(error) = chains[0].l1.load_or_build_proof(
-                &chains[0].config, &shared_path, from_checkpoint, to_checkpoint, proxy.as_deref(),
+                &chains[0].config, &shared_path, from_checkpoint, to_checkpoint, Some(proxy.as_str()),
             ).await {
                 tracing::error!(%error, "shared bridge proof generation failed");
                 tokio::time::sleep(poll_interval).await; continue;
@@ -1028,12 +1028,8 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path)
     tracing::info!(config = %config_path.display(), proof_dir = %proof_dir.display(), "bridge relayer started");
 
     // Phase 4.4: skip local circuit/Groth16 warmup when remote prove proxy is configured
-    let proxy_url_at_startup = resolve_prove_proxy_url(&config);
-    if proxy_url_at_startup.is_some() {
-        tracing::info!("prove proxy configured; skipping local circuit/Groth16 warmup");
-    } else {
-        warmup_bridge_resources()?;
-    }
+    let proxy_url_at_startup = resolve_system_prove_proxy_url(&config)?;
+    tracing::info!(prove_proxy = %proxy_url_at_startup, "system prove proxy configured; local Groth16 warmup skipped");
 
     let provider = RpcProvider::new_with_config_path(&config.rpc_config)?;
     let l1 = L1Client::from_finalize_config(&config.finalize);
@@ -1321,7 +1317,7 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path)
         //  PHASE 3 ─ Proof Generation (bridge aggregation + Groth16 wrap)
         // ═══════════════════════════════════════════════════════════════════
 
-        let prove_proxy_url = resolve_prove_proxy_url(&config);
+        let prove_proxy_url = resolve_system_prove_proxy_url(&config)?;
         let prove_result = match dispatch_post_l2_phase(
             &post_l2_phase_permit,
             l1.load_or_build_proof(
@@ -1329,7 +1325,7 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path)
                 &proof_path,
                 from_checkpoint,
                 to_checkpoint,
-                prove_proxy_url.as_deref(),
+                Some(prove_proxy_url.as_str()),
             ),
         )
         .await
@@ -1651,6 +1647,7 @@ pub(crate) async fn submit_deposit_batch_appends_with_l1_rpc(
     Ok(())
 }
 
+#[allow(dead_code)] // kept for the local-proving CLI path
 fn warmup_bridge_resources() -> anyhow::Result<()> {
     tracing::info!("warming bridge relayer resources");
 
@@ -1682,14 +1679,29 @@ fn warmup_bridge_resources() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) fn resolve_prove_proxy_url(config: &BridgeProposeDaemonConfig) -> Option<String> {
-    let rpc_config = psy_config::PsyConfigGoldilocks::from_file(&config.rpc_config).ok()?;
-    let network = rpc_config.get_current_network().ok()?;
+/// The prove-proxy pool that serves bridge Groth16 proofs.
+///
+/// Reads `system_prove_proxy_url` for the current network. There is no
+/// fallback to `prove_proxy_url`: that pool runs the `user` role and does not
+/// register the bridge methods, so routing there would only fail later.
+pub(crate) fn resolve_system_prove_proxy_url(config: &BridgeProposeDaemonConfig) -> anyhow::Result<String> {
+    let rpc_config = psy_config::PsyConfigGoldilocks::from_file(&config.rpc_config)
+        .with_context(|| format!("failed to load rpc config {}", config.rpc_config))?;
+    let network_name = rpc_config.current_network_name().to_string();
+    let network = rpc_config.get_current_network()?;
     network
-        .prove_proxy_url
+        .system_prove_proxy_url
         .iter()
-        .find(|url| !url.trim().is_empty())
-        .cloned()
+        .map(|url| url.trim())
+        .find(|url| !url.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "network `{}` in {} has no `system_prove_proxy_url`; the relayer needs a prove-proxy running role=system or role=all",
+                network_name,
+                config.rpc_config
+            )
+        })
 }
 
 fn load_config(path: &Path) -> anyhow::Result<BridgeProposeDaemonConfig> {
@@ -6002,5 +6014,76 @@ deployments_network = "localhostBase"
         assert_eq!(config.chains.len(), 3);
         assert_eq!(config.chains.iter().map(|chain| chain.chain_index).collect::<Vec<_>>(), vec![0, 1, 2]);
         assert!(config.chains.iter().all(|chain| chain.family == "evm"));
+    }
+
+    fn write_temp_rpc_config(system_urls: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "relayer-proxy-test-{}-{}",
+            std::process::id(),
+            system_urls.len()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        // Template: the "localhost" NetworkConfig object, copied from
+        // psy_config::tests::system_prove_proxy_url_defaults_to_empty_and_reads_when_present
+        // (client_prover/psy_core/psy_config/src/lib.rs). That test's `base` is the
+        // correct, flat NetworkConfig shape (no "network" wrapper key) — unlike
+        // test_network_switching's literal, which is broken on this branch (extra
+        // "network" wrapper, missing required fields).
+        let json = r#"{"networks":{"localhost":{
+                "magic": "0x1",
+                "users_per_realm": 1048576,
+                "global_user_tree_height": 24,
+                "realm_user_tree_height": 20,
+                "group_realm_height": 1,
+                "realm_configs": [{"id": 0, "rpc_url": ["http://127.0.0.1:8546"]}],
+                "coordinator_configs": [{"id": 0, "rpc_url": ["http://127.0.0.1:8545"]}],
+                "prove_proxy_url": ["http://127.0.0.1:9999"],
+                "system_prove_proxy_url": __SYSTEM_URLS__,
+                "faucet_rpc_url": ["http://127.0.0.1:8547"],
+                "nostr_relay_url": "wss://relay.127.0.0.1.example",
+                "native_currency": "PSY",
+                "native_currency_decimal": 9,
+                "native_currency_name": "PSY",
+                "fees": {
+                    "register_user_fee": 0,
+                    "deploy_contract_fee": 0,
+                    "guta_fee": 5000000000,
+                    "da_fee": 0
+                }
+            }},"defaultNetwork":"localhost"}"#
+        .replace("__SYSTEM_URLS__", system_urls);
+        std::fs::write(&path, json).unwrap();
+        path
+    }
+
+    fn daemon_config_with_rpc(path: &std::path::Path) -> BridgeProposeDaemonConfig {
+        toml::from_str(&format!(
+            "rpc_config = {:?}\nservices_url = \"http://127.0.0.1:1\"\nwithdraw_method_id = 0\n",
+            path.display()
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn system_prove_proxy_url_is_required() {
+        let path = write_temp_rpc_config("[]");
+        let err = resolve_system_prove_proxy_url(&daemon_config_with_rpc(&path)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("system_prove_proxy_url"), "{msg}");
+        assert!(msg.contains("localhost"), "{msg}");
+    }
+
+    #[test]
+    fn system_prove_proxy_url_skips_blank_entries() {
+        let path = write_temp_rpc_config(r#"["  ", "http://127.0.0.1:9997"]"#);
+        let url = resolve_system_prove_proxy_url(&daemon_config_with_rpc(&path)).unwrap();
+        assert_eq!(url, "http://127.0.0.1:9997");
+    }
+
+    #[test]
+    fn user_pool_url_is_not_a_fallback() {
+        let path = write_temp_rpc_config(r#"[""]"#);
+        assert!(resolve_system_prove_proxy_url(&daemon_config_with_rpc(&path)).is_err());
     }
 }
