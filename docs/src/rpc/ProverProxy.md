@@ -778,7 +778,7 @@ psy_user_cli prove-proxy \
 The prover proxy initializes with:
 - Network magic number for proof validation
 - RPC provider for fetching contract code
-- Circuit manager for all proof types
+- Circuit manager for the proof families the configured role serves (see Roles)
 - Session circuit info store for fingerprint tracking
 
 ---
