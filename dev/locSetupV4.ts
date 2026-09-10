@@ -3806,6 +3806,8 @@ class DevNetProcessManager {
                         `0.0.0.0:${port}`,
                         '--rpc-config',
                         'psy-genesis/config.json',
+                        '--role',
+                        'all',
                     ],
                     proveProxyStartedDetector,
                     { cwd, ...getLogPaths(`prove_proxy_${i}`, false), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }

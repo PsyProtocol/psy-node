@@ -11,6 +11,7 @@ This document provides comprehensive documentation for the Psy Prover Proxy RPC 
 ## Table of Contents
 
 1. [Overview](#overview)
+   - [Roles](#roles)
 2. [UPS (Unified Proving System) Methods](#ups-unified-proving-system-methods)
 3. [Contract Management](#contract-management)
 4. [Signature Proving](#signature-proving)
@@ -34,6 +35,26 @@ The Prover Proxy is a local proving service that generates zero-knowledge proofs
 - **Software-Defined Signatures**: Custom circuit-based authentication schemes
 - **Contract Circuit Management**: Dynamic registration and execution of contract circuits
 - **Proof Tree Aggregation**: Hierarchical proof composition and verification
+
+### Roles
+
+Every instance runs exactly one role, chosen with `--role` (env `PROVE_PROXY_ROLE`, default `user`):
+
+| Role | Registers | Built at startup | Intended for |
+|---|---|---|---|
+| `user` | UPS session chain, proof-tree aggregation, contract circuits, signature and minifier proofs, circuit queries | UPS circuit manager | wallet-facing pool (CLI, web wallet, faucet-server, MCP) |
+| `system` | `psy_prove_withdrawal_batch_claim_groth16`, `psy_prove_deposit_batch_append_groth16`, `psy_prove_bridge_agg_groth16` | bridge wrap circuits, three Groth16 keystores | relayer pool |
+| `all` | both | both | single-machine local testnets |
+
+A method outside the instance's role is not registered; calling it returns JSON-RPC `-32601 Method not found`.
+
+Every role also registers `psy_get_prove_proxy_role`:
+
+```json
+{ "jsonrpc": "2.0", "id": 1, "result": { "role": "user", "user_methods": true, "system_methods": false } }
+```
+
+Clients pick the pool through `config.json`: wallets use `prove_proxy_url`; the relayer reads `system_prove_proxy_url` and refuses to start when it is missing for the current network. `psy_user_cli claim-withdrawal --prove-proxy-url` must point at a `system` or `all` instance.
 
 ---
 
@@ -738,6 +759,7 @@ The prover proxy is configured via `ProveProxyArgs`:
 pub struct ProveProxyArgs {
     pub listen_addr: String,        // Default: "0.0.0.0:9999"
     pub rpc_config: String,         // Path to network config file
+    pub role: ProveProxyRole,       // user | system | all, default user
 }
 ```
 
@@ -747,7 +769,8 @@ pub struct ProveProxyArgs {
 # Start prover proxy
 psy_user_cli prove-proxy \
   --listen-addr "127.0.0.1:9999" \
-  --rpc-config "config.json"
+  --rpc-config "config.json" \
+  --role user
 ```
 
 ### Circuit Initialization
