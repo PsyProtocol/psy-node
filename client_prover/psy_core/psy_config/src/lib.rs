@@ -784,7 +784,7 @@ mod tests {
 
     #[test]
     fn test_config_loading() {
-        let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config.json");
+        let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../psy-genesis/config.json");
         let config = PsyConfigGoldilocks::from_file(config_path.to_str().unwrap()).unwrap();
 
         assert_eq!(config.current_network_name(), "localhost");
@@ -799,7 +799,9 @@ mod tests {
         let json = r#"{
             "networks": {
                 "localhost": {
-                    "network": {
+                        "magic": "0x1",
+                        "faucet_rpc_url": [],
+                        "nostr_relay_url": "ws://127.0.0.1:8081",
                         "users_per_realm": 1048576,
                         "global_user_tree_height": 24,
                         "realm_user_tree_height": 20,
@@ -814,12 +816,14 @@ mod tests {
                         "fees": {
                             "register_user_fee": 0,
                             "deploy_contract_fee": 0,
-                            "guta_fee": 5000000000
+                            "guta_fee": 5000000000,
+                            "da_fee": 0
                         }
-                    }
                 },
                 "testnet": {
-                    "network": {
+                        "magic": "0x1",
+                        "faucet_rpc_url": [],
+                        "nostr_relay_url": "ws://127.0.0.1:8081",
                         "users_per_realm": 1048576,
                         "global_user_tree_height": 24,
                         "realm_user_tree_height": 20,
@@ -834,9 +838,9 @@ mod tests {
                         "fees": {
                             "register_user_fee": 1000,
                             "deploy_contract_fee": 5000,
-                            "guta_fee": 5000000000
+                            "guta_fee": 5000000000,
+                            "da_fee": 0
                         }
-                    }
                 }
             },
             "defaultNetwork": "localhost"
@@ -904,7 +908,9 @@ mod tests {
         let json = r#"{
             "networks": {
                 "dev": {
-                    "network": {
+                        "magic": "0x1",
+                        "faucet_rpc_url": [],
+                        "nostr_relay_url": "ws://127.0.0.1:8081",
                         "users_per_realm": 1024,
                         "global_user_tree_height": 20,
                         "realm_user_tree_height": 10,
@@ -919,12 +925,14 @@ mod tests {
                         "fees": {
                             "register_user_fee": 100,
                             "deploy_contract_fee": 500,
-                            "guta_fee": 1000000000
+                            "guta_fee": 1000000000,
+                            "da_fee": 0
                         }
-                    }
                 },
                 "localhost": {
-                    "network": {
+                        "magic": "0x1",
+                        "faucet_rpc_url": [],
+                        "nostr_relay_url": "ws://127.0.0.1:8081",
                         "users_per_realm": 1024,
                         "global_user_tree_height": 20,
                         "realm_user_tree_height": 10,
@@ -939,12 +947,12 @@ mod tests {
                         "fees": {
                             "register_user_fee": 50,
                             "deploy_contract_fee": 250,
-                            "guta_fee": 500000000
+                            "guta_fee": 500000000,
+                            "da_fee": 0
                         }
-                    }
                 }
             },
-            "defaultNetwork": "dev"
+            "defaultNetwork": "localhost"
         }"#;
 
         let config1 = PsyConfigGoldilocks::from_json(json).unwrap();
@@ -964,7 +972,9 @@ mod tests {
         let json = r#"{
             "networks": {
                 "dev": {
-                    "network": {
+                        "magic": "0x1",
+                        "faucet_rpc_url": [],
+                        "nostr_relay_url": "ws://127.0.0.1:8081",
                         "users_per_realm": 1024,
                         "global_user_tree_height": 20,
                         "realm_user_tree_height": 10,
@@ -979,12 +989,14 @@ mod tests {
                         "fees": {
                             "register_user_fee": 100,
                             "deploy_contract_fee": 500,
-                            "guta_fee": 1000000000
+                            "guta_fee": 1000000000,
+                            "da_fee": 0
                         }
-                    }
                 },
                 "localhost": {
-                    "network": {
+                        "magic": "0x1",
+                        "faucet_rpc_url": [],
+                        "nostr_relay_url": "ws://127.0.0.1:8081",
                         "users_per_realm": 512,
                         "global_user_tree_height": 18,
                         "realm_user_tree_height": 9,
@@ -999,9 +1011,9 @@ mod tests {
                         "fees": {
                             "register_user_fee": 50,
                             "deploy_contract_fee": 250,
-                            "guta_fee": 500000000
+                            "guta_fee": 500000000,
+                            "da_fee": 0
                         }
-                    }
                 }
             },
             "defaultNetwork": "localhost"
@@ -1032,7 +1044,9 @@ mod tests {
         let json = r#"{
             "networks": {
                 "only_network": {
-                    "network": {
+                        "magic": "0x1",
+                        "faucet_rpc_url": [],
+                        "nostr_relay_url": "ws://127.0.0.1:8081",
                         "users_per_realm": 1024,
                         "global_user_tree_height": 20,
                         "realm_user_tree_height": 10,
@@ -1047,12 +1061,12 @@ mod tests {
                         "fees": {
                             "register_user_fee": 0,
                             "deploy_contract_fee": 0,
-                            "guta_fee": 1000000000
+                            "guta_fee": 1000000000,
+                            "da_fee": 0
                         }
-                    }
                 }
             },
-            "defaultNetwork": "only_network"
+            "defaultNetwork": "missing_network"
         }"#;
 
         let result = PsyConfigGoldilocks::from_json(json);
