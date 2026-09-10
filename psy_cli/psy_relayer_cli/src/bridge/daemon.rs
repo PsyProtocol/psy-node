@@ -858,6 +858,7 @@ async fn run_multichain(
     validate_max_checkpoint_batch(max_batch)?;
     let state_path = proof_dir.join("daemon_state_multichain.toml");
     let proxy = resolve_system_prove_proxy_url(&config)?;
+    verify_system_prove_proxy(&proxy).await?;
     tracing::info!(prove_proxy = %proxy, "system prove proxy configured");
     tracing::info!(config=%config_path.display(), chain_count=chains.len(), %identity_namespace, "multichain bridge relayer started");
 
@@ -1029,6 +1030,7 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path)
 
     // Phase 4.4: skip local circuit/Groth16 warmup when remote prove proxy is configured
     let proxy_url_at_startup = resolve_system_prove_proxy_url(&config)?;
+    verify_system_prove_proxy(&proxy_url_at_startup).await?;
     tracing::info!(prove_proxy = %proxy_url_at_startup, "system prove proxy configured; local Groth16 warmup skipped");
 
     let provider = RpcProvider::new_with_config_path(&config.rpc_config)?;
@@ -1702,6 +1704,64 @@ pub(crate) fn resolve_system_prove_proxy_url(config: &BridgeProposeDaemonConfig)
                 config.rpc_config
             )
         })
+}
+
+/// Confirms the resolved prove-proxy registers the bridge (system) methods.
+/// A pool running role=user answers `psy_get_prove_proxy_role` with
+/// `system_methods: false`; treat that like a missing URL and refuse to start.
+pub(crate) async fn verify_system_prove_proxy(url: &str) -> anyhow::Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .context("failed to build reqwest client for prove-proxy role verification")?;
+
+    let response = client
+        .post(url)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "psy_get_prove_proxy_role",
+            "params": []
+        }))
+        .send()
+        .await
+        .with_context(|| format!("failed to reach prove proxy {url} for psy_get_prove_proxy_role"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        anyhow::bail!("prove proxy {url} returned HTTP {status} for psy_get_prove_proxy_role");
+    }
+
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .with_context(|| format!("failed to parse psy_get_prove_proxy_role response from {url}"))?;
+
+    let role = body
+        .get("result")
+        .and_then(|result| result.get("role"))
+        .and_then(|role| role.as_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!("prove proxy {url} psy_get_prove_proxy_role response missing result.role")
+        })?
+        .to_string();
+
+    let system_methods = body
+        .get("result")
+        .and_then(|result| result.get("system_methods"))
+        .and_then(|value| value.as_bool())
+        .ok_or_else(|| {
+            anyhow::anyhow!("prove proxy {url} psy_get_prove_proxy_role response missing result.system_methods")
+        })?;
+
+    if !system_methods {
+        anyhow::bail!(
+            "prove proxy {url} runs role `{role}` and does not serve system proofs; point system_prove_proxy_url at a role=system or role=all instance"
+        );
+    }
+
+    tracing::info!(prove_proxy = %url, role = %role, "system prove proxy verified");
+    Ok(())
 }
 
 fn load_config(path: &Path) -> anyhow::Result<BridgeProposeDaemonConfig> {
@@ -6085,5 +6145,60 @@ deployments_network = "localhostBase"
     fn user_pool_url_is_not_a_fallback() {
         let path = write_temp_rpc_config(r#"[""]"#);
         assert!(resolve_system_prove_proxy_url(&daemon_config_with_rpc(&path)).is_err());
+    }
+
+    /// Starts a minimal single-shot HTTP responder on `127.0.0.1:0` that reads
+    /// one request and replies with `body` as a JSON response, then returns
+    /// the URL to reach it.
+    fn spawn_json_responder(body: &'static str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn verify_system_prove_proxy_accepts_role_system() {
+        let url = spawn_json_responder(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"role":"system","user_methods":false,"system_methods":true}}"#,
+        );
+
+        verify_system_prove_proxy(&url).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn verify_system_prove_proxy_rejects_role_user() {
+        let url = spawn_json_responder(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"role":"user","user_methods":true,"system_methods":false}}"#,
+        );
+
+        let err = verify_system_prove_proxy(&url).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("role `user`"), "{msg}");
+        assert!(msg.contains("system_prove_proxy_url"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn verify_system_prove_proxy_errs_on_closed_port() {
+        // Bind to get a free port, then drop the listener so nothing answers.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let url = format!("http://{addr}");
+
+        assert!(verify_system_prove_proxy(&url).await.is_err());
     }
 }
