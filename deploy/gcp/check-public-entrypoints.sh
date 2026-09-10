@@ -189,6 +189,9 @@ main() {
     jsonrpc_expect_result "realm1 alias ${domain}" "https://${domain}/" "psy_get_latest_checkpoint_tree_root"
   done
   jsonrpc_expect_result "prove proxy" "https://${PUBLIC_PROVE_PROXY_DOMAIN}/" "psy_get_circuits_data"
+  # Every role answers this; the public host must be the wallet-facing pool
+  # (user or all), which psy_get_circuits_data above already proves.
+  jsonrpc_expect_result "prove proxy role" "https://${PUBLIC_PROVE_PROXY_DOMAIN}/" "psy_get_prove_proxy_role"
   jsonrpc_expect_result "Psy faucet" "https://${PUBLIC_FAUCET_DOMAIN}/" "psy_get_psy_faucet_config"
   for domain in ${PUBLIC_PROVE_PROXY_ALIAS_DOMAINS:-}; do
     jsonrpc_expect_result "prove proxy alias ${domain}" "https://${domain}/" "psy_get_circuits_data"

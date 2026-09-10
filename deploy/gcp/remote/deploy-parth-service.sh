@@ -213,6 +213,7 @@ case "$PARTH_SERVICE" in
       delete_env "$service_env" "$key"
     done
     upsert_if_set "$service_env" PROVE_PROXY_LISTEN_ADDR PROVE_PROXY_LISTEN_ADDR
+    upsert_if_set "$service_env" PROVE_PROXY_ROLE PROVE_PROXY_ROLE
     upsert_if_set "$service_env" PROVE_PROXY_DISPATCH_WORKERS PROVE_PROXY_DISPATCH_WORKERS
     upsert_if_set "$service_env" PROVE_PROXY_LOCAL_FALLBACK PROVE_PROXY_LOCAL_FALLBACK
     upsert_if_set "$service_env" PROVE_PROXY_JOB_TIMEOUT_SECS PROVE_PROXY_JOB_TIMEOUT_SECS
