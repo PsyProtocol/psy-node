@@ -1,6 +1,5 @@
 #[cfg(feature = "rand_gen")]
 use parth_core::utils::QPGenRandom;
-#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
 use parth_core::{felt::QFelt64, protocol::core_types::Q256BitHash};
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
@@ -98,5 +97,38 @@ pub struct PsyGathererPreparedResult<R, Hash, JobId> {
 impl<R, Hash, JobId> PsyGathererPreparedResult<R, Hash, JobId> {
     pub fn new(result: R, job_ids: Vec<PsyProvingJobMetadataWithJobId<Hash, JobId>>) -> Self {
         Self { result, job_ids }
+    }
+}
+
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+    use parth_core::{utils::QPGenRandom, PF, PHash};
+    use psy_core::job::job_id::QProvingJobDataID;
+
+    #[test]
+    fn gatherer_prepared_result_new_stores_fields() {
+        let job_ids = vec![
+            PsyProvingJobMetadataWithJobId::<PHash, QProvingJobDataID>::qp_rand_gen(),
+            PsyProvingJobMetadataWithJobId::<PHash, QProvingJobDataID>::qp_rand_gen(),
+        ];
+        let result = PsyGathererPreparedResult::new(42u32, job_ids.clone());
+
+        assert_eq!(result.result, 42);
+        assert_eq!(result.job_ids, job_ids);
+        assert_eq!(result.job_ids.len(), 2);
+
+        let empty = PsyGathererPreparedResult::<u32, PHash, QProvingJobDataID>::new(0, vec![]);
+        assert_eq!(empty.result, 0);
+        assert!(empty.job_ids.is_empty());
+    }
+
+    #[test]
+    fn pending_checkpoint_base_reports_declared_fixed_size() {
+        type PendingBase = PsyCoordinatorPendingCheckpointBase<PF, PHash>;
+
+        assert!(PendingBase::IS_FIXED_SIZE);
+        let value = PendingBase::qp_rand_gen();
+        assert_eq!(value.fallback_pio_serialized_size(), PendingBase::FIXED_SIZE);
     }
 }

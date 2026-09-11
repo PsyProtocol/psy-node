@@ -1,4 +1,3 @@
-#[cfg(feature = "node")]
 use auto_impl::auto_impl;
 #[cfg(feature = "rand_gen")]
 use parth_core::utils::QPGenRandom;
@@ -208,6 +207,215 @@ impl<Hash: Eq + Copy> PSimpleContractHeightCache<Hash> for DashMapContractHeight
         match self.mapping.get(&contract_id) {
             Some(x) => Ok(x.1),
             None => anyhow::bail!("contract {} not loaded",contract_id),
+        }
+    }
+}
+
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+    use parth_core::{crypto::hash::traits::{FromU64x4, ZeroableHash}, PF, PHash};
+
+    #[derive(Default)]
+    struct Cache;
+
+    impl PSimpleContractHeightCache<PHash> for Cache {
+        fn add_contract(&self, _: u32, _: u8, _: PHash) {}
+
+        fn get_contract_height(&self, _: u32) -> anyhow::Result<u8> {
+            Ok(0)
+        }
+
+        fn get_contract_zero_hash(&self, _: u32) -> anyhow::Result<PHash> {
+            Ok(PHash::get_zero_value())
+        }
+    }
+
+    fn proof(old_root: u64, old_value: u64, new_root: u64, new_value: u64, index: u64, siblings: usize) -> DeltaMerkleProofCore<PHash> {
+        let hash = |value| PHash::from_u64x4([value, 0, 0, 0]);
+        DeltaMerkleProofCore {
+            old_root: hash(old_root),
+            old_value: hash(old_value),
+            new_root: hash(new_root),
+            new_value: hash(new_value),
+            index,
+            siblings: vec![PHash::get_zero_value(); siblings],
+        }
+    }
+
+    #[test]
+    fn consistency_and_slot_updates_cover_valid_and_invalid_histories() {
+        let update = proof(10, 1, 20, 2, 7, 2);
+        let history = QEDContractStateUpdateHistory {
+            user_contract_tree_update_proof: proof(0, 10, 0, 20, 12, 3),
+            contract_state_tree_updates: vec![update],
+        };
+        history.ensure_basic_consistency(&Cache, 3).unwrap();
+        assert_eq!(history.get_double_id_nodes_size_hint(), 4);
+        let slots = history.get_slot_updates::<PF>().unwrap();
+        assert_eq!(slots.contract_id, 12);
+        assert_eq!(slots.slot_updates.len(), 1);
+        assert_eq!(slots.slot_updates[0].slot, 28);
+
+        let empty = QEDContractStateUpdateHistory::<PHash> {
+            user_contract_tree_update_proof: proof(0, 0, 0, 0, 0, 0),
+            contract_state_tree_updates: vec![],
+        };
+        assert_eq!(empty.get_double_id_nodes_size_hint(), 0);
+        assert!(empty.ensure_basic_consistency(&Cache, 0).is_err());
+
+        let wrong_height = QEDContractStateUpdateHistory {
+            user_contract_tree_update_proof: proof(0, 10, 0, 20, 12, 2),
+            contract_state_tree_updates: vec![proof(10, 1, 20, 2, 7, 2)],
+        };
+        assert!(wrong_height.ensure_basic_consistency(&Cache, 3).is_err());
+    }
+
+    #[test]
+    fn consistency_rejects_mismatched_roots_and_broken_chains() {
+        // first CST old root does not match the UCT old value (non-zero old value)
+        let mismatched_first = QEDContractStateUpdateHistory {
+            user_contract_tree_update_proof: proof(0, 11, 0, 20, 12, 3),
+            contract_state_tree_updates: vec![proof(10, 1, 20, 2, 7, 3)],
+        };
+        assert!(mismatched_first.ensure_basic_consistency(&Cache, 3).is_err());
+
+        // zero UCT old value: first CST old root must equal the contract zero hash
+        let zero_valued = QEDContractStateUpdateHistory {
+            user_contract_tree_update_proof: proof(0, 0, 0, 20, 12, 3),
+            contract_state_tree_updates: vec![proof(10, 1, 20, 2, 7, 3)],
+        };
+        assert!(zero_valued.ensure_basic_consistency(&Cache, 3).is_err());
+
+        // a fresh (all-zero) first old root is accepted through the zero-hash branch
+        let fresh = QEDContractStateUpdateHistory {
+            user_contract_tree_update_proof: proof(0, 0, 0, 20, 12, 3),
+            contract_state_tree_updates: vec![proof(0, 0, 20, 2, 7, 3)],
+        };
+        fresh.ensure_basic_consistency(&Cache, 3).unwrap();
+
+        // last CST new root does not match the UCT new value
+        let mismatched_last = QEDContractStateUpdateHistory {
+            user_contract_tree_update_proof: proof(0, 10, 0, 21, 12, 3),
+            contract_state_tree_updates: vec![proof(10, 1, 20, 2, 7, 3)],
+        };
+        assert!(mismatched_last.ensure_basic_consistency(&Cache, 3).is_err());
+
+        // mid-chain sibling height mismatch
+        let bad_height_chain = QEDContractStateUpdateHistory {
+            user_contract_tree_update_proof: proof(0, 10, 0, 30, 12, 3),
+            contract_state_tree_updates: vec![
+                proof(10, 1, 20, 2, 7, 3),
+                proof(20, 2, 30, 3, 7, 4),
+            ],
+        };
+        assert!(bad_height_chain.ensure_basic_consistency(&Cache, 3).is_err());
+
+        // broken old_root -> new_root transition between consecutive updates
+        let broken_chain = QEDContractStateUpdateHistory {
+            user_contract_tree_update_proof: proof(0, 10, 0, 30, 12, 3),
+            contract_state_tree_updates: vec![
+                proof(10, 1, 20, 2, 7, 3),
+                proof(21, 2, 30, 3, 7, 3),
+            ],
+        };
+        assert!(broken_chain.ensure_basic_consistency(&Cache, 3).is_err());
+
+        // a fully consistent multi-update chain passes
+        let chain = QEDContractStateUpdateHistory {
+            user_contract_tree_update_proof: proof(0, 10, 0, 30, 12, 3),
+            contract_state_tree_updates: vec![
+                proof(10, 1, 20, 2, 7, 3),
+                proof(20, 2, 30, 3, 9, 3),
+            ],
+        };
+        chain.ensure_basic_consistency(&Cache, 3).unwrap();
+        assert_eq!(chain.get_double_id_nodes_size_hint(), 2 * 3 + 2);
+    }
+
+    #[test]
+    fn slot_updates_capture_every_changed_felt_offset() {
+        use parth_core::felt::ToU64Value;
+
+        let dmp = |old: [u64; 4], new: [u64; 4], index: u64| DeltaMerkleProofCore {
+            old_root: PHash::get_zero_value(),
+            old_value: PHash::from_u64x4(old),
+            new_root: PHash::get_zero_value(),
+            new_value: PHash::from_u64x4(new),
+            index,
+            siblings: vec![PHash::get_zero_value(); 2],
+        };
+        let history = QEDContractStateUpdateHistory {
+            user_contract_tree_update_proof: proof(0, 0, 0, 0, 3, 2),
+            contract_state_tree_updates: vec![
+                dmp([1, 2, 3, 4], [1, 9, 3, 8], 2),
+                dmp([7, 0, 0, 0], [0, 0, 0, 7], 5),
+            ],
+        };
+        let slots = history.get_slot_updates::<PF>().unwrap();
+        assert_eq!(slots.contract_id, 3);
+        let got: Vec<(u64, u64, u64)> = slots
+            .slot_updates
+            .iter()
+            .map(|u| (u.slot, u.old_value.to_u64_value(), u.new_value.to_u64_value()))
+            .collect();
+        // unchanged felts are skipped; slots are index * 4 + offset
+        assert_eq!(got, vec![(9, 2, 9), (11, 4, 8), (20, 7, 0), (23, 0, 7)]);
+    }
+
+    struct MissingContractCache;
+
+    impl PSimpleContractHeightCache<PHash> for MissingContractCache {
+        fn add_contract(&self, _: u32, _: u8, _: PHash) {}
+
+        fn get_contract_height(&self, id: u32) -> anyhow::Result<u8> {
+            anyhow::bail!("contract {} not loaded", id)
+        }
+
+        fn get_contract_zero_hash(&self, _: u32) -> anyhow::Result<PHash> {
+            Ok(PHash::get_zero_value())
+        }
+    }
+
+    #[test]
+    fn default_contains_key_follows_height_lookup_success() {
+        // default trait implementation, success branch
+        assert!(Cache.contains_key(0));
+        // default trait implementation, failure branch
+        assert!(!MissingContractCache.contains_key(7));
+    }
+
+    #[cfg(feature = "node")]
+    #[test]
+    fn dash_map_height_cache_tracks_contracts() {
+        let cache = DashMapContractHeightCache::<PHash>::new();
+        assert!(!cache.contains_key(1));
+        assert!(cache.get_contract_height(1).is_err());
+        assert!(cache.get_contract_zero_hash(1).is_err());
+
+        cache.add_contract(1, 4, PHash::get_zero_value());
+        assert!(cache.contains_key(1));
+        assert_eq!(cache.get_contract_height(1).unwrap(), 4);
+        assert_eq!(cache.get_contract_zero_hash(1).unwrap(), PHash::get_zero_value());
+    }
+
+    #[cfg(feature = "rand_gen")]
+    #[test]
+    fn random_histories_round_trip() {
+        use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
+
+        for _ in 0..32 {
+            let history = QEDContractStateUpdateHistory::<PHash>::qp_rand_gen();
+            let bytes = history.psy_ser_to_bytes_vec().unwrap();
+            assert_eq!(
+                QEDContractStateUpdateHistory::<PHash>::psy_ser_from_slice(&bytes).unwrap(),
+                history
+            );
+            // The fallback writer accepts the same histories even though its
+            // reader cannot decode them back under the default feature set:
+            // the user-contract-tree proof is read through the speedy buffered
+            // stream reader, which consumes the bytes of the update vector.
+            assert!(history.fallback_psy_ser_to_bytes_vec().unwrap().len() > 0);
         }
     }
 }

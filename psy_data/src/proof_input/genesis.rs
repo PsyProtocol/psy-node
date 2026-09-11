@@ -82,3 +82,39 @@ pser::impl_psy_ser_basic_tests_fallback!(
     { parth_core::PHash },
     psy_checkpoint_state_transition_genesis_circuit_input_tests
 );
+
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+    use parth_core::{pgoldilocks::{PoseidonHasher, QHashOut}, utils::QPGenRandom, PF};
+
+    type Hash = QHashOut<PF>;
+
+    #[test]
+    fn public_inputs_hash_chains_root_leaf_then_fingerprint() {
+        let input = PsyCheckpointStateTransitionGenesisCircuitInput::<Hash>::qp_rand_gen();
+
+        let root_leaf = PoseidonHasher::two_to_one(&input.checkpoint_tree_root, &input.checkpoint_leaf_hash);
+        let expected = PoseidonHasher::two_to_one(&root_leaf, &input.genesis_fingerprint);
+
+        assert_eq!(input.get_public_inputs_hash_no_rewards_tag::<PoseidonHasher>(), expected);
+        assert_eq!(input.qfhash::<PoseidonHasher>(), expected);
+    }
+
+    #[test]
+    fn public_inputs_hash_is_sensitive_to_each_component() {
+        let mut input = PsyCheckpointStateTransitionGenesisCircuitInput::<Hash>::qp_rand_gen();
+        let baseline = input.get_public_inputs_hash_no_rewards_tag::<PoseidonHasher>();
+
+        input.checkpoint_tree_root = Hash::qp_rand_gen();
+        assert_ne!(input.get_public_inputs_hash_no_rewards_tag::<PoseidonHasher>(), baseline);
+
+        let with_new_root = input.get_public_inputs_hash_no_rewards_tag::<PoseidonHasher>();
+        input.checkpoint_leaf_hash = Hash::qp_rand_gen();
+        assert_ne!(input.get_public_inputs_hash_no_rewards_tag::<PoseidonHasher>(), with_new_root);
+
+        let with_new_leaf = input.get_public_inputs_hash_no_rewards_tag::<PoseidonHasher>();
+        input.genesis_fingerprint = Hash::qp_rand_gen();
+        assert_ne!(input.get_public_inputs_hash_no_rewards_tag::<PoseidonHasher>(), with_new_leaf);
+    }
+}

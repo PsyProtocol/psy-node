@@ -424,3 +424,109 @@ impl<F: QFelt64, Hash: PartialEq + Copy> VerifyLeftEndCapRightGUTAInput<F, Hash>
     }
 
 }
+
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+    use parth_common::memory_stores::mem_tree_v3::SimpleMemoryMerkleStoreV3;
+    use parth_core::{crypto::hash::traits::FromU64x4, pgoldilocks::{PoseidonHasher, QHashOut}, utils::QPGenRandom, PF};
+
+    type Hash = QHashOut<PF>;
+
+    fn make_nca_shallow(nca: &mut PartialUpdateNearestCommonAncestorProof<Hash>) {
+        nca.nearest_common_ancestor_level = 0;
+        nca.child_a.index = 0;
+        nca.child_a.siblings.clear();
+        nca.child_b.index = 1;
+        nca.child_b.siblings.clear();
+    }
+
+    /// Builds an end cap whose witness is genuinely consistent: the merkle proof
+    /// comes from a real in-memory tree, and the checkpoint root is the historical
+    /// root of that proof.
+    fn consistent_end_cap(height: u8, leaf_index: u64, salt: u64) -> VerifyEndCapSimpleStandardInput<PF, Hash> {
+        let mut tree = SimpleMemoryMerkleStoreV3::<PoseidonHasher, Hash>::new(height);
+        let leaf_value = Hash::from_u64x4([salt, salt + 1, salt + 2, salt + 3]);
+        let delta = tree.set_leaf(leaf_index, leaf_value);
+        let proof = MerkleProofCore {
+            root: delta.new_root,
+            value: leaf_value,
+            index: leaf_index,
+            siblings: delta.siblings.clone(),
+        };
+        let (historical_root, current_root) =
+            compute_historical_and_current_merkle_roots_core_gt::<Hash, PoseidonHasher>(&proof);
+        assert_eq!(current_root, proof.root);
+        VerifyEndCapSimpleStandardInput {
+            guta_stats: GUTAStats::qp_rand_gen(),
+            checkpoint_root: historical_root,
+            checkpoint_historical_merkle_proof: proof,
+        }
+    }
+
+    #[test]
+    fn left_guta_right_end_cap_simple_witness_accepts_consistent_checkpoint_root() {
+        let end_cap = consistent_end_cap(4, 2, 13);
+        let mut input = VerifyLeftGUTARightEndCapInputSimple::<PF, Hash>::qp_rand_gen();
+        input.b_end_cap = end_cap.clone();
+        let (_historical_root, current_root) =
+            compute_historical_and_current_merkle_roots_core_gt::<Hash, PoseidonHasher>(&end_cap.checkpoint_historical_merkle_proof);
+        input.checkpoint_tree_root = current_root;
+        assert!(input.check_witness::<PoseidonHasher>().is_ok());
+
+        input.checkpoint_tree_root = Hash::from_u64x4([9, 9, 9, 9]);
+        let err = input.check_witness::<PoseidonHasher>().unwrap_err();
+        assert!(err.to_string().contains("left guta right endcap checkpoint tree root not match"));
+    }
+
+    #[test]
+    fn left_end_cap_right_guta_simple_witness_accepts_consistent_checkpoint_root() {
+        let end_cap = consistent_end_cap(4, 5, 17);
+        let mut input = VerifyLeftEndCapRightGUTAInputSimple::<PF, Hash>::qp_rand_gen();
+        input.a_end_cap = end_cap.clone();
+        let (_historical_root, current_root) =
+            compute_historical_and_current_merkle_roots_core_gt::<Hash, PoseidonHasher>(&end_cap.checkpoint_historical_merkle_proof);
+        input.checkpoint_tree_root = current_root;
+        assert!(input.check_witness::<PoseidonHasher>().is_ok());
+
+        input.checkpoint_tree_root = Hash::from_u64x4([8, 8, 8, 8]);
+        let err = input.check_witness::<PoseidonHasher>().unwrap_err();
+        assert!(err.to_string().contains("left endcap right guta checkpoint tree root not match"));
+    }
+
+    #[test]
+    fn left_guta_right_end_cap_projects_header_and_end_result() {
+        let mut input = VerifyLeftGUTARightEndCapInput::<PF, Hash>::qp_rand_gen();
+        make_nca_shallow(&mut input.nca_proof);
+        let header = input.get_guta_header_a();
+        let result = input.get_end_result_b();
+        assert_eq!(header.guta_circuit_whitelist, input.guta_inclusion_proof_a.root);
+        assert_eq!(header.checkpoint_tree_root, input.checkpoint_tree_root);
+        assert_eq!(header.state_transition.old_node_value, input.nca_proof.child_a.old_value);
+        assert_eq!(result.start_user_leaf_hash, input.nca_proof.child_b.old_value);
+        assert_eq!(result.end_user_leaf_hash, input.nca_proof.child_b.new_value);
+        assert_eq!(result.checkpoint_tree_root_hash, input.b_end_cap.checkpoint_root);
+    }
+
+    #[test]
+    fn left_end_cap_right_guta_projects_header_and_end_result() {
+        let mut input = VerifyLeftEndCapRightGUTAInput::<PF, Hash>::qp_rand_gen();
+        make_nca_shallow(&mut input.nca_proof);
+        let header = input.get_guta_header_b();
+        let result = input.get_end_result_a();
+        assert_eq!(header.guta_circuit_whitelist, input.guta_inclusion_proof_b.root);
+        assert_eq!(header.checkpoint_tree_root, input.checkpoint_tree_root);
+        assert_eq!(header.state_transition.new_node_value, input.nca_proof.child_b.new_value);
+        assert_eq!(result.start_user_leaf_hash, input.nca_proof.child_a.old_value);
+        assert_eq!(result.end_user_leaf_hash, input.nca_proof.child_a.new_value);
+        assert_eq!(result.checkpoint_tree_root_hash, input.a_end_cap.checkpoint_root);
+    }
+
+    #[test]
+    fn simple_witnesses_reject_random_inconsistent_end_caps() {
+        let left = VerifyLeftGUTARightEndCapInputSimple::<PF, Hash>::qp_rand_gen();
+        let right = VerifyLeftEndCapRightGUTAInputSimple::<PF, Hash>::qp_rand_gen();
+        assert!(left.check_witness::<parth_core::pgoldilocks::PoseidonHasher>().is_err());
+        assert!(right.check_witness::<parth_core::pgoldilocks::PoseidonHasher>().is_err());
+    }
+}

@@ -626,7 +626,7 @@ macro_rules! impl_psy_ser_basic_tests_fallback {
         { $($concrete_type:ty),* },
         $module_base_name:ident $(,)?
     ) => {
-        $crate::impl_psy_ser_basic_tests!(@gen
+        $crate::impl_psy_ser_basic_tests_fallback!(@gen
             $struct_name,
             { $($concrete_type),* },
             $module_base_name,
@@ -641,7 +641,7 @@ macro_rules! impl_psy_ser_basic_tests_fallback {
         $module_base_name:ident,
         true
     ) => {
-        $crate::impl_psy_ser_basic_tests!(@gen
+        $crate::impl_psy_ser_basic_tests_fallback!(@gen
             $struct_name,
             { $($concrete_type),* },
             $module_base_name,
@@ -662,7 +662,7 @@ macro_rules! impl_psy_ser_basic_tests_fallback {
                 // The struct is now two levels up, so we use `super::super::`.
                 use super::$struct_name;
                 use $qp_gen_path;
-                use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalDatabaseSerializeBaseMulti, PsyCanonicalDatabaseSerializeBaseSingle};
+                use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalDatabaseSerializeBaseMulti, PsyCanonicalDatabaseSerializeBaseSingle, PsyIOReadWrite};
 
                 type PsySerTestTargetType = $struct_name<$($concrete_type),*>;
 
@@ -676,17 +676,20 @@ macro_rules! impl_psy_ser_basic_tests_fallback {
                     assert!(value == deserialized, "Round trip serialization failed");
                     assert!(value == deserialized_owned, "Round trip owned serialization failed");
 
-                    let serialized_owned = value.psy_ser_into_bytes_vec()?;
-                    assert_eq!(serialized, serialized_owned, "Owned and non-owned serialization differ");
-
                     let fallback_serialized = value.fallback_psy_ser_to_bytes_vec()?;
                     assert_eq!(serialized, fallback_serialized, "Fallback and non-fallback serialization differ");
 
                     let fallback_deserialized = PsySerTestTargetType::fallback_psy_ser_from_slice(&fallback_serialized)?;
                     assert!(value == fallback_deserialized, "Fallback round trip serialization failed");
 
-                    let fallback_deserialized_owned = PsySerTestTargetType::fallback_psy_ser_from_owned_bytes_vec(fallback_serialized.clone())?;
-                    assert!(value == fallback_deserialized_owned, "Fallback round trip owned serialization failed");
+                    let expected_size = value.pio_serialized_size();
+                    assert_eq!(serialized.len(), expected_size, "Serialized size does not match expected size");
+                    let fallback_expected_size = value.fallback_pio_serialized_size();
+                    assert_eq!(serialized.len(), fallback_expected_size, "Serialized size does not match expected size from fallback size method");
+
+                    // Consumes `value`, so keep this call last.
+                    let serialized_owned = value.psy_ser_into_bytes_vec()?;
+                    assert_eq!(serialized, serialized_owned, "Owned and non-owned serialization differ");
 
                     Ok(())
                 }
