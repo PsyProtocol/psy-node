@@ -1,8 +1,6 @@
 use parth_core::{crypto::hash::traits::{FieldQHasher, QFieldHashable, ZeroableHash}, data::serializable::QPDSerializable, felt::{QFelt, QFelt64, QFeltSized, ToQFelts, ZeroableFelt}, impl_qpd_serialize_params, protocol::core_types::{Q256BitHash, QFHashBase, QHashBase}, utils::QPGenRandom};
 use pser::{QBytesDeserialize, QBytesSerialize};
-use psy_serialize::{AutoDatabaseSerializationUseFastFixedSerialize, PsyCanonicalSerializeMetadata, PsySerializeCanonicalAsyncSafe};
-#[cfg(all(feature = "serialize_bytemuck", target_endian = "little"))]
-use psy_serialize::FastFixedSerializable;
+use psy_serialize::{AutoDatabaseSerializationUseFastFixedSerialize, FastFixedSerializable, PsyCanonicalSerializeMetadata, PsySerializeCanonicalAsyncSafe};
 
 use crate::v1::qdata::ffs_sizes::PSY_OBJECT_FFS_SIZE_USER_LEAF;
 
@@ -204,28 +202,21 @@ impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash> for PQEDUserLeaf<F
 
 
 #[cfg(not(all(target_endian = "little", feature = "serialize_bytemuck")))]
-impl FastFixedSerializable<104> for PQEDUserLeafSerialize256HashU64Felt {
+impl<F: QFelt64, Hash: Q256BitHash> FastFixedSerializable<104> for PQEDUserLeaf<F, Hash> {
     fn ffs_from_owned_bytes(data: [u8; 104]) -> Self {
-            let public_key = data[0..32].try_into().unwrap();
-            let user_state_tree_root = data[32..64].try_into().unwrap();
-            let balance = u64::from_le_bytes(data[64..72].try_into().unwrap());
-            let nonce = u64::from_le_bytes(data[72..80].try_into().unwrap());
-            let last_checkpoint_id = u64::from_le_bytes(data[80..88].try_into().unwrap());
-            let event_index = u64::from_le_bytes(data[88..96].try_into().unwrap());
-            let user_id = u64::from_le_bytes(data[96..104].try_into().unwrap());
-            return PQEDUserLeafSerialize256HashU64Felt {
-                public_key,
-                user_state_tree_root,
-                balance,
-                nonce,
-                last_checkpoint_id,
-                event_index,
-                user_id,
-            }
+        PQEDUserLeaf {
+            public_key: Hash::from_owned_32bytes(data[0..32].try_into().unwrap()),
+            user_state_tree_root: Hash::from_owned_32bytes(data[32..64].try_into().unwrap()),
+            balance: F::from_u64_value(u64::from_le_bytes(data[64..72].try_into().unwrap())),
+            nonce: F::from_u64_value(u64::from_le_bytes(data[72..80].try_into().unwrap())),
+            last_checkpoint_id: F::from_u64_value(u64::from_le_bytes(data[80..88].try_into().unwrap())),
+            event_index: F::from_u64_value(u64::from_le_bytes(data[88..96].try_into().unwrap())),
+            user_id: F::from_u64_value(u64::from_le_bytes(data[96..104].try_into().unwrap())),
+        }
     }
     fn ffs_from_slice_or_panic(data: &[u8]) -> Self {
         if data.len() != 104 {
-            panic!("Invalid number of bytes for ExampleUserSerialize");
+            panic!("Invalid number of bytes for PQEDUserLeaf");
         }
         let mut arr = [0u8; 104];
         arr.copy_from_slice(data);
@@ -234,7 +225,7 @@ impl FastFixedSerializable<104> for PQEDUserLeafSerialize256HashU64Felt {
 
     fn ffs_try_from_slice(data: &[u8]) -> anyhow::Result<Self> {
         if data.len() != 104 {
-            anyhow::bail!("Invalid number of bytes for ExampleUserSerialize");
+            anyhow::bail!("Invalid number of bytes for PQEDUserLeaf");
         }
         let mut arr = [0u8; 104];
         arr.copy_from_slice(data);
@@ -242,27 +233,27 @@ impl FastFixedSerializable<104> for PQEDUserLeafSerialize256HashU64Felt {
     }
 
     fn ffs_to_bytes(&self) -> [u8; 104] {
-            let mut bytes = [0u8; 104];
-            bytes[0..32].copy_from_slice(&self.public_key);
-            bytes[32..64].copy_from_slice(&self.user_state_tree_root);
-            bytes[64..72].copy_from_slice(&self.balance.to_le_bytes());
-            bytes[72..80].copy_from_slice(&self.nonce.to_le_bytes());
-            bytes[80..88].copy_from_slice(&self.last_checkpoint_id.to_le_bytes());
-            bytes[88..96].copy_from_slice(&self.event_index.to_le_bytes());
-            bytes[96..104].copy_from_slice(&self.user_id.to_le_bytes());
-            bytes
+        let mut bytes = [0u8; 104];
+        bytes[0..32].copy_from_slice(&self.public_key.into_owned_32bytes());
+        bytes[32..64].copy_from_slice(&self.user_state_tree_root.into_owned_32bytes());
+        bytes[64..72].copy_from_slice(&self.balance.to_u64_value().to_le_bytes());
+        bytes[72..80].copy_from_slice(&self.nonce.to_u64_value().to_le_bytes());
+        bytes[80..88].copy_from_slice(&self.last_checkpoint_id.to_u64_value().to_le_bytes());
+        bytes[88..96].copy_from_slice(&self.event_index.to_u64_value().to_le_bytes());
+        bytes[96..104].copy_from_slice(&self.user_id.to_u64_value().to_le_bytes());
+        bytes
     }
 
     fn ffs_into_bytes(self) -> [u8; 104] {
-            let mut bytes = [0u8; 104];
-            bytes[0..32].copy_from_slice(&self.public_key);
-            bytes[32..64].copy_from_slice(&self.user_state_tree_root);
-            bytes[64..72].copy_from_slice(&self.balance.to_le_bytes());
-            bytes[72..80].copy_from_slice(&self.nonce.to_le_bytes());
-            bytes[80..88].copy_from_slice(&self.last_checkpoint_id.to_le_bytes());
-            bytes[88..96].copy_from_slice(&self.event_index.to_le_bytes());
-            bytes[96..104].copy_from_slice(&self.user_id.to_le_bytes());
-            bytes
+        let mut bytes = [0u8; 104];
+        bytes[0..32].copy_from_slice(&self.public_key.into_owned_32bytes());
+        bytes[32..64].copy_from_slice(&self.user_state_tree_root.into_owned_32bytes());
+        bytes[64..72].copy_from_slice(&self.balance.to_u64_value().to_le_bytes());
+        bytes[72..80].copy_from_slice(&self.nonce.to_u64_value().to_le_bytes());
+        bytes[80..88].copy_from_slice(&self.last_checkpoint_id.to_u64_value().to_le_bytes());
+        bytes[88..96].copy_from_slice(&self.event_index.to_u64_value().to_le_bytes());
+        bytes[96..104].copy_from_slice(&self.user_id.to_u64_value().to_le_bytes());
+        bytes
     }
 }
 pub trait PQEDUserLeafAsyncStore: PsySerializeCanonicalAsyncSafe {
@@ -338,7 +329,7 @@ psy_serialize::impl_psy_canonical_serialize_for_fixed_type!(
 
 #[cfg(test)]
 mod user_leaf_tests {
-    use parth_core::{utils::QPGenRandom, PHash, PF};
+    use parth_core::{crypto::hash::traits::{FieldQHasher, FromU64x4, QFieldHashable, ZeroableHash}, felt::{FromPrimitiveValuesFelt, ToQFelts}, pgoldilocks::PoseidonHasher, utils::QPGenRandom, PHash, PF};
     use psy_serialize::PsyIOReadWrite;
 
     use crate::v1::qdata::user::PQEDUserLeaf;
@@ -353,5 +344,105 @@ mod user_leaf_tests {
 
         Ok(())
 
+    }
+
+    #[test]
+    fn defaults_state_detection_qfelts_and_hash_are_consistent() {
+        let public_key = PHash::from_u64x4([1, 0, 0, 0]);
+        let state_root = PHash::from_u64x4([2, 0, 0, 0]);
+        let leaf = PQEDUserLeaf::new_user_default(PF::from_u64_value(9), public_key, state_root);
+        assert!(!leaf.is_first_transaction_old_user_leaf());
+        assert!(leaf.is_first_transaction_old_user_leaf_with_state(state_root));
+
+        let first = PQEDUserLeaf::new_user_default(PF::from_u64_value(9), PHash::get_zero_value(), state_root);
+        assert!(first.is_first_transaction_old_user_leaf());
+        let felts = leaf.to_qfelts();
+        assert_eq!(felts.len(), 13);
+        assert_eq!(PQEDUserLeaf::<PF, PHash>::from_qfelts(&felts), leaf);
+        assert_eq!(leaf.qfhash::<PoseidonHasher>(), PoseidonHasher::q_hash_many(&felts));
+    }
+
+    #[test]
+    fn new_constructor_sets_every_field() {
+        let public_key = PHash::from_u64x4([1, 2, 3, 4]);
+        let state_root = PHash::from_u64x4([5, 6, 7, 8]);
+        let leaf = PQEDUserLeaf::new(
+            public_key,
+            state_root,
+            PF::from_u64_value(100),
+            PF::from_u64_value(200),
+            PF::from_u64_value(300),
+            PF::from_u64_value(400),
+            PF::from_u64_value(500),
+        );
+        assert_eq!(leaf.public_key, public_key);
+        assert_eq!(leaf.user_state_tree_root, state_root);
+        assert_eq!(leaf.balance, PF::from_u64_value(100));
+        assert_eq!(leaf.nonce, PF::from_u64_value(200));
+        assert_eq!(leaf.last_checkpoint_id, PF::from_u64_value(300));
+        assert_eq!(leaf.event_index, PF::from_u64_value(400));
+        assert_eq!(leaf.user_id, PF::from_u64_value(500));
+        assert!(!leaf.is_first_transaction_old_user_leaf());
+    }
+
+    #[test]
+    fn new_user_default_with_zero_matches_new_user_default() {
+        let public_key = PHash::from_u64x4([9, 9, 9, 9]);
+        let state_root = PHash::from_u64x4([1, 1, 1, 1]);
+        let with_zero = PQEDUserLeaf::new_user_default_with_zero(PF::from_u64_value(0), PF::from_u64_value(3), public_key, state_root);
+        assert_eq!(with_zero, PQEDUserLeaf::new_user_default(PF::from_u64_value(3), public_key, state_root));
+    }
+
+    #[test]
+    fn first_transaction_detection_rejects_active_leaves() {
+        let public_key = PHash::from_u64x4([1, 0, 0, 0]);
+        let state_root = PHash::from_u64x4([2, 0, 0, 0]);
+        // nonzero nonce disqualifies both checks, even against the default state root
+        let mut leaf = PQEDUserLeaf::new_user_default(PF::from_u64_value(4), public_key, state_root);
+        leaf.nonce = PF::from_u64_value(1);
+        assert!(!leaf.is_first_transaction_old_user_leaf());
+        assert!(!leaf.is_first_transaction_old_user_leaf_with_state(state_root));
+
+        // nonzero balance disqualifies the plain check, and a foreign state root the state-aware check
+        let mut leaf = PQEDUserLeaf::new_user_default(PF::from_u64_value(4), public_key, state_root);
+        leaf.balance = PF::from_u64_value(7);
+        assert!(!leaf.is_first_transaction_old_user_leaf());
+        assert!(!leaf.is_first_transaction_old_user_leaf_with_state(PHash::from_u64x4([3, 0, 0, 0])));
+
+        // zeroed leaf qualifies for both regardless of the provided default state root
+        let zeroed = PQEDUserLeaf::new_user_default(PF::from_u64_value(4), PHash::get_zero_value(), state_root);
+        assert!(zeroed.is_first_transaction_old_user_leaf());
+        assert!(zeroed.is_first_transaction_old_user_leaf_with_state(PHash::from_u64x4([3, 0, 0, 0])));
+    }
+
+    #[test]
+    #[cfg(all(feature = "serialize_bytemuck", target_endian = "little"))]
+    fn random_with_user_id_places_user_id_in_tail_bytes() {
+        use psy_serialize::FastFixedSerializable;
+
+        let leaf = PQEDUserLeaf::<PF, PHash>::random_with_user_id(42);
+        assert_eq!(leaf.user_id, PF::from_u64_value(42));
+        let bytes = leaf.ffs_to_bytes();
+        assert_eq!(bytes.len(), crate::v1::qdata::ffs_sizes::PSY_OBJECT_FFS_SIZE_USER_LEAF);
+        assert_eq!(u64::from_le_bytes(bytes[96..104].try_into().unwrap()), 42);
+    }
+
+    #[test]
+    fn read_user_id_from_fixed_bytes_and_bytes_ref() {
+        let mut data = [0u8; crate::v1::qdata::ffs_sizes::PSY_OBJECT_FFS_SIZE_USER_LEAF];
+        data[96..104].copy_from_slice(&777u64.to_le_bytes());
+        assert_eq!(PQEDUserLeaf::<PF, PHash>::read_user_id_from_fixed_bytes(&data), 777);
+        assert_eq!(PQEDUserLeaf::<PF, PHash>::read_user_id_from_bytes_ref(&data).unwrap(), 777);
+
+        // wrong-length input must be rejected
+        let too_short = &data[..crate::v1::qdata::ffs_sizes::PSY_OBJECT_FFS_SIZE_USER_LEAF - 1];
+        assert!(PQEDUserLeaf::<PF, PHash>::read_user_id_from_bytes_ref(too_short).is_err());
+        let too_long = [0u8; crate::v1::qdata::ffs_sizes::PSY_OBJECT_FFS_SIZE_USER_LEAF + 1];
+        assert!(PQEDUserLeaf::<PF, PHash>::read_user_id_from_bytes_ref(&too_long).is_err());
+
+        // boundary values survive the little-endian read
+        data[96..104].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(PQEDUserLeaf::<PF, PHash>::read_user_id_from_fixed_bytes(&data), u64::MAX);
+        assert_eq!(PQEDUserLeaf::<PF, PHash>::read_user_id_from_bytes_ref(&data).unwrap(), u64::MAX);
     }
 }

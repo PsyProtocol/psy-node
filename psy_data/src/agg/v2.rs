@@ -230,6 +230,80 @@ impl<Hash: Q256BitHash> FallbackPsySerializeCanonical for AggStateTransitionInpu
     }
 }
 
+#[cfg(test)]
+mod behavior_tests {
+    use parth_core::{
+        felt::ToU64Value,
+        pgoldilocks::{PoseidonHasher, QHashOut},
+        PF,
+    };
+
+    use super::*;
+
+    type Hash = QHashOut<PF>;
+
+    fn hash(value: u64) -> Hash {
+        Hash::from_values(value, 0, 0, 0)
+    }
+
+    #[test]
+    fn v2_transition_views_dummy_and_public_hash_are_consistent() {
+        let transition = AggStateTransitionWithStats {
+            state_transition_start: hash(1),
+            state_transition_end: hash(2),
+            total_proofs_generated: 7,
+        };
+        assert_eq!(
+            transition.get_agg_state_transition(),
+            AggStateTransition::new(hash(1), hash(2))
+        );
+        let (plain, count): (_, PF) = transition.get_agg_state_transition_and_f();
+        assert_eq!(plain, transition.get_agg_state_transition());
+        assert_eq!(count.to_u64_value(), 7);
+        assert_ne!(
+            transition.get_public_inputs_hash_no_tag_tree::<PoseidonHasher, PF>(hash(3)),
+            Hash::default()
+        );
+
+        let dummy = AggStateTransitionWithStats::get_dummy_value(hash(9));
+        assert_eq!(dummy.state_transition_start, hash(9));
+        assert_eq!(dummy.state_transition_end, hash(9));
+        assert_eq!(dummy.total_proofs_generated, 0);
+    }
+
+    #[test]
+    fn v2_input_condenses_converts_and_hashes() {
+        let input = AggStateTransitionInputV2 {
+            left_input: AggStateTransitionWithStats {
+                state_transition_start: hash(1),
+                state_transition_end: hash(2),
+                total_proofs_generated: 3,
+            },
+            right_input: AggStateTransitionWithStats {
+                state_transition_start: hash(2),
+                state_transition_end: hash(3),
+                total_proofs_generated: 5,
+            },
+            left_proof_is_leaf: true,
+            right_proof_is_leaf: false,
+        };
+        assert_eq!(input.condense().total_proofs_generated, 8);
+        assert_eq!(input.condense_add_one().total_proofs_generated, 9);
+        assert_eq!(input.get_state_transition(), AggStateTransition::new(hash(1), hash(3)));
+        let v1 = input.to_v1_input();
+        assert_eq!(v1.left_input, input.left_input.get_agg_state_transition());
+        assert_eq!(v1.right_input, input.right_input.get_agg_state_transition());
+        assert!(v1.left_proof_is_leaf && !v1.right_proof_is_leaf);
+        assert_ne!(
+            input.get_public_inputs_hash_no_tag_tree::<PoseidonHasher>(hash(4)),
+            Hash::default()
+        );
+
+        let dummy = AggStateTransitionInputV2::get_dummy_value(hash(8));
+        assert_eq!(dummy.condense().total_proofs_generated, 0);
+    }
+}
+
 #[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
 psy_serialize::impl_psy_canonical_serialize_for_speedy!(
     AggStateTransitionInputV2,

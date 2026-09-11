@@ -1,6 +1,5 @@
 #[cfg(feature = "rand_gen")]
 use parth_core::utils::QPGenRandom;
-#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
 use parth_core::{felt::QFelt64, protocol::core_types::Q256BitHash};
 use parth_core::{QCoreProcCheckpointUniqueId, crypto::hash::{merkle_proof::MerkleProofCore, tag_tree::TagTreeMerkleProof}};
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
@@ -294,3 +293,63 @@ pser::impl_psy_ser_basic_tests_fallback!(
     { parth_core::PF, parth_core::PHash },
     psy_realm_coordinator_update_tests
 );
+
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+    use parth_core::{utils::QPGenRandom, PF, PHash};
+    use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
+
+    #[test]
+    fn prepared_realm_payloads_round_trip_with_variable_length_sections() {
+        let updates = PsyPreparedRealmBlockStateUpdates::<PHash>::qp_rand_gen();
+        let encoded = updates.psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(encoded.len(), updates.pio_serialized_size());
+        let decoded = PsyPreparedRealmBlockStateUpdates::<PHash>::psy_ser_from_slice(&encoded).unwrap();
+        assert_eq!(decoded.realm_id, updates.realm_id);
+        assert_eq!(decoded.realm_sub_id, updates.realm_sub_id);
+        assert_eq!(decoded.unique_pending_id, updates.unique_pending_id);
+        assert_eq!(decoded.old_realm_root, updates.old_realm_root);
+        assert_eq!(decoded.new_realm_root, updates.new_realm_root);
+        assert_eq!(decoded.update_global_user_tree_nodes_ffs, updates.update_global_user_tree_nodes_ffs);
+        assert_eq!(decoded.update_contract_state_imt_leaves_ffs, updates.update_contract_state_imt_leaves_ffs);
+
+        let coordinated = PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate::<PF, PHash>::qp_rand_gen();
+        let bytes = coordinated.psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(bytes.len(), coordinated.pio_serialized_size());
+        let restored = PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate::<PF, PHash>::psy_ser_from_slice(&bytes).unwrap();
+        assert_eq!(restored.prepared_updates.realm_id, coordinated.prepared_updates.realm_id);
+        assert_eq!(restored.coordinator_update.checkpoint_sync_info, coordinated.coordinator_update.checkpoint_sync_info);
+    }
+
+    #[test]
+    fn realm_updates_with_empty_sections_round_trip() {
+        let mut updates = PsyPreparedRealmBlockStateUpdates::<PHash>::qp_rand_gen();
+        updates.update_global_user_tree_nodes_ffs = Vec::new();
+        updates.update_user_contract_tree_nodes_ffs = Vec::new();
+        updates.update_contract_state_tree_nodes_ffs = Vec::new();
+        updates.update_user_leaves_ffs = Vec::new();
+        updates.update_contract_state_imt_leaves_ffs = Vec::new();
+
+        let encoded = updates.psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(encoded.len(), updates.pio_serialized_size());
+        let decoded = PsyPreparedRealmBlockStateUpdates::<PHash>::psy_ser_from_slice(&encoded).unwrap();
+        assert_eq!(decoded, updates);
+    }
+
+    #[test]
+    fn realm_updates_reject_truncated_payloads() {
+        let updates = PsyPreparedRealmBlockStateUpdates::<PHash>::qp_rand_gen();
+        let encoded = updates.psy_ser_to_bytes_vec().unwrap();
+        assert!(PsyPreparedRealmBlockStateUpdates::<PHash>::psy_ser_from_slice(&encoded[..encoded.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn coordinator_update_round_trips_alone() {
+        let update = PsyRealmCoordinatorUpdate::<PF, PHash>::qp_rand_gen();
+        let encoded = update.psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(encoded.len(), update.pio_serialized_size());
+        let decoded = PsyRealmCoordinatorUpdate::<PF, PHash>::psy_ser_from_slice(&encoded).unwrap();
+        assert_eq!(decoded, update);
+    }
+}

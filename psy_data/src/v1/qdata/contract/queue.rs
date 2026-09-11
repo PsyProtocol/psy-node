@@ -312,7 +312,7 @@ impl<F: QFelt64, Hash: Q256BitHash + Default> PsyDeployContractQueueItem<F, Hash
 
 impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for PsyDeployContractQueueItem<F, Hash> {
     fn fallback_pio_serialized_size(&self) -> usize {
-        16 + PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF + self.function_leaves.len() * 32
+        16 + PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF + 4 + self.function_leaves.len() * 32
     }
     
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
@@ -741,5 +741,333 @@ mod deploy_v2_queue_tests {
     fn v2_queue_item_restorable_id_is_random_key() {
         let item = example_item();
         assert_eq!(item.get_restorable_job_id(), item.rand_key_id);
+    }
+
+    #[test]
+    fn v2_shape_validation_and_constructor_cover_limits() {
+        let item = example_item();
+        item.validate_shape().unwrap();
+        let mut invalid = item.clone();
+        invalid.layout_protocol_version = 0;
+        assert!(invalid.validate_shape().is_err());
+        invalid = item.clone();
+        invalid.function_leaves.clear();
+        assert!(invalid.validate_shape().is_err());
+        invalid = item.clone();
+        invalid.canonical_layout_proof.clear();
+        assert!(invalid.validate_shape().is_err());
+        invalid = item.clone();
+        invalid.contract_leaf.state_layout_field_count = PF::from_u64_value(5);
+        assert!(invalid.validate_shape().is_err());
+        invalid = item.clone();
+        invalid.contract_leaf.state_tree_height = PF::from_u64_value(64);
+        assert!(invalid.validate_shape().is_err());
+        invalid = item.clone();
+        invalid.contract_leaf.state_layout_slot_count = PF::from_u64_value(1025);
+        assert!(invalid.validate_shape().is_err());
+
+        let made = PsyDeployContractQueueItemV2::new_from_layout_endpoint::<parth_core::pgoldilocks::PoseidonHasher>(
+            QHashOut::default(), 4, vec![QHashOut::default()], QHashOut::default(), 1,
+            1, QHashOut::default(), 1, 1, QHashOut::default(), vec![1],
+        ).unwrap();
+        assert!(made.validate_shape().is_ok());
+        assert!(PsyDeployContractQueueItemV2::new_from_layout_endpoint::<parth_core::pgoldilocks::PoseidonHasher>(
+            QHashOut::default(), 4, vec![QHashOut::default(); 3], QHashOut::default(), 1,
+            1, QHashOut::default(), 1, 1, QHashOut::default(), vec![1],
+        ).is_err());
+    }
+
+    #[test]
+    fn update_queue_validates_and_exposes_queue_contract() {
+        let deploy = example_item();
+        let update = PsyUpdateContractQueueItem {
+            rand_key_id: deploy.rand_key_id,
+            contract_id: 1,
+            contract_leaf: deploy.contract_leaf,
+            function_leaves: deploy.function_leaves,
+            layout_protocol_version: deploy.layout_protocol_version,
+            canonical_layout_verifier_fingerprint: deploy.canonical_layout_verifier_fingerprint,
+            canonical_layout_proof: deploy.canonical_layout_proof,
+        };
+        update.validate_shape().unwrap();
+        let encoded = update.encode_queue_item_vec().unwrap();
+        assert!(PsyUpdateContractQueueItem::<PF, QHashOut<PF>>::is_queue_item(&encoded));
+        assert_eq!(PsyUpdateContractQueueItem::decode_queue_item_ref(&encoded).unwrap(), update);
+        assert_eq!(update.get_restorable_job_id(), update.rand_key_id);
+        assert_eq!(PsyUpdateContractQueueItem::<PF, QHashOut<PF>>::get_size_hint(), 0);
+        assert!(!PsyUpdateContractQueueItem::<PF, QHashOut<PF>>::has_fixed_size());
+
+        let mut invalid = update.clone();
+        invalid.contract_id = 0;
+        assert!(invalid.validate_shape().is_err());
+        invalid = update.clone();
+        invalid.layout_protocol_version = 0;
+        assert!(invalid.validate_shape().is_err());
+        invalid = update.clone();
+        invalid.function_leaves.clear();
+        assert!(invalid.validate_shape().is_err());
+        invalid = update.clone();
+        invalid.canonical_layout_proof.clear();
+        assert!(invalid.validate_shape().is_err());
+    }
+
+    #[test]
+    fn update_queue_shape_validation_covers_remaining_rules() {
+        let deploy = example_item();
+        let update = PsyUpdateContractQueueItem {
+            rand_key_id: deploy.rand_key_id,
+            contract_id: 1,
+            contract_leaf: deploy.contract_leaf,
+            function_leaves: deploy.function_leaves,
+            layout_protocol_version: deploy.layout_protocol_version,
+            canonical_layout_verifier_fingerprint: deploy.canonical_layout_verifier_fingerprint,
+            canonical_layout_proof: deploy.canonical_layout_proof,
+        };
+
+        let mut invalid = update.clone();
+        invalid.canonical_layout_proof = vec![0u8;
+            psy_core::constants::protocol::STATE_LAYOUT_MAX_PROOF_BYTES + 1];
+        assert!(invalid.validate_shape().is_err());
+
+        invalid = update.clone();
+        invalid.contract_leaf.state_tree_height = PF::from_u64_value(64);
+        assert!(invalid.validate_shape().is_err());
+    }
+
+    #[test]
+    fn update_queue_constructor_builds_valid_item_and_enforces_limits() {
+        use parth_core::crypto::hash::traits::FromU64x4;
+
+        let function_leaf = QHashOut::from_u64x4([1, 2, 3, 4]);
+        let made = PsyUpdateContractQueueItem::<PF, QHashOut<PF>>::
+            new_from_leaves_and_deployer::<parth_core::pgoldilocks::PoseidonHasher>(
+                7,
+                QHashOut::default(),
+                4,
+                QHashOut::default(),
+                2,
+                4,
+                1,
+                QHashOut::default(),
+                vec![1, 2],
+                vec![function_leaf],
+                QHashOut::default(),
+                1,
+            )
+            .unwrap();
+        assert_eq!(made.contract_id, 7);
+        assert_eq!(made.contract_leaf.state_tree_height, PF::from_u64_value(4));
+        assert_eq!(
+            made.contract_leaf.state_layout_slot_count,
+            PF::from_u64_value(4)
+        );
+        assert_eq!(made.function_leaves, vec![function_leaf]);
+        let mut tree = SimpleMemoryMerkleStore::<
+            parth_core::pgoldilocks::PoseidonHasher,
+            QHashOut<PF>,
+        >::new(1);
+        tree.set_leaf(0, function_leaf);
+        assert_eq!(made.contract_leaf.function_tree_root, tree.get_root());
+
+        // more function leaves than the contract function tree can support
+        assert!(PsyUpdateContractQueueItem::<PF, QHashOut<PF>>::
+            new_from_leaves_and_deployer::<parth_core::pgoldilocks::PoseidonHasher>(
+                7,
+                QHashOut::default(),
+                4,
+                QHashOut::default(),
+                2,
+                4,
+                1,
+                QHashOut::default(),
+                vec![1, 2],
+                vec![QHashOut::default(); 3],
+                QHashOut::default(),
+                1,
+            )
+            .is_err());
+
+        // zero contract id fails shape validation inside the constructor
+        assert!(PsyUpdateContractQueueItem::<PF, QHashOut<PF>>::
+            new_from_leaves_and_deployer::<parth_core::pgoldilocks::PoseidonHasher>(
+                0,
+                QHashOut::default(),
+                4,
+                QHashOut::default(),
+                2,
+                4,
+                1,
+                QHashOut::default(),
+                vec![1, 2],
+                vec![QHashOut::default()],
+                QHashOut::default(),
+                1,
+            )
+            .is_err());
+
+        // zero layout protocol version fails shape validation inside the constructor
+        assert!(PsyUpdateContractQueueItem::<PF, QHashOut<PF>>::
+            new_from_leaves_and_deployer::<parth_core::pgoldilocks::PoseidonHasher>(
+                7,
+                QHashOut::default(),
+                4,
+                QHashOut::default(),
+                2,
+                4,
+                0,
+                QHashOut::default(),
+                vec![1, 2],
+                vec![QHashOut::default()],
+                QHashOut::default(),
+                1,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn v2_queue_rejects_wrong_version() {
+        let mut bytes = example_item().psy_ser_to_bytes_vec().unwrap();
+        bytes[4] = 0xff;
+        bytes[5] = 0xff;
+        assert!(
+            PsyDeployContractQueueItemV2::<PF, QHashOut<PF>>::psy_ser_from_slice(&bytes).is_err()
+        );
+    }
+
+    #[test]
+    fn v2_queue_item_base_decodes_encodes_and_gates_on_length() {
+        let item = example_item();
+        let encoded = item.encode_queue_item_vec().unwrap();
+        assert_eq!(
+            PsyDeployContractQueueItemV2::decode_queue_item_ref(&encoded).unwrap(),
+            item
+        );
+        assert!(PsyDeployContractQueueItemV2::<PF, QHashOut<PF>>::is_queue_item(&encoded));
+        // magic prefix alone is shorter than the minimum record length
+        assert!(!PsyDeployContractQueueItemV2::<PF, QHashOut<PF>>::is_queue_item(
+            &DEPLOY_CONTRACT_QUEUE_MAGIC
+        ));
+        assert!(!PsyDeployContractQueueItemV2::<PF, QHashOut<PF>>::is_queue_item(b""));
+        assert_eq!(
+            PsyDeployContractQueueItemV2::<PF, QHashOut<PF>>::get_size_hint(),
+            0
+        );
+        assert!(!PsyDeployContractQueueItemV2::<PF, QHashOut<PF>>::has_fixed_size());
+    }
+
+    #[test]
+    fn v2_constructor_rejects_unsupported_state_trees() {
+        // state tree height >= 64 is rejected up front
+        assert!(PsyDeployContractQueueItemV2::new_from_layout_endpoint::<
+            parth_core::pgoldilocks::PoseidonHasher,
+        >(
+            QHashOut::default(),
+            64,
+            vec![QHashOut::default()],
+            QHashOut::default(),
+            1,
+            1,
+            QHashOut::default(),
+            1,
+            1,
+            QHashOut::default(),
+            vec![1],
+        )
+        .is_err());
+
+        // height 2 supports at most (1 << 2) * 4 = 16 layout slots
+        assert!(PsyDeployContractQueueItemV2::new_from_layout_endpoint::<
+            parth_core::pgoldilocks::PoseidonHasher,
+        >(
+            QHashOut::default(),
+            2,
+            vec![QHashOut::default()],
+            QHashOut::default(),
+            1,
+            1,
+            QHashOut::default(),
+            1,
+            17,
+            QHashOut::default(),
+            vec![1],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn v1_queue_item_constructor_matches_manual_tree_and_round_trips() {
+        use parth_core::crypto::hash::traits::FromU64x4;
+
+        let deployer = QHashOut::from_u64x4([1, 2, 3, 4]);
+        let code_root = QHashOut::from_u64x4([5, 6, 7, 8]);
+        let leaves = vec![
+            QHashOut::from_u64x4([9, 10, 11, 12]),
+            QHashOut::from_u64x4([13, 14, 15, 16]),
+        ];
+        let mut item = PsyDeployContractQueueItem::<PF, QHashOut<PF>>::
+            new_from_leaves_and_deployer::<parth_core::pgoldilocks::PoseidonHasher>(
+                deployer,
+                8,
+                leaves.clone(),
+                code_root,
+                2,
+            )
+            .unwrap();
+        // pin the random key so the discriminator check below is deterministic
+        item.rand_key_id = [7; 16];
+
+        assert_eq!(item.contract_leaf.deployer, deployer);
+        assert_eq!(item.contract_leaf.code_root, code_root);
+        assert_eq!(item.function_leaves, leaves);
+        assert_eq!(item.contract_leaf.state_tree_height, PF::from_u64_value(8));
+
+        let mut tree = SimpleMemoryMerkleStore::<
+            parth_core::pgoldilocks::PoseidonHasher,
+            QHashOut<PF>,
+        >::new(2);
+        tree.set_leaf(0, leaves[0]);
+        tree.set_leaf(1, leaves[1]);
+        assert_eq!(item.contract_leaf.function_tree_root, tree.get_root());
+
+        let encoded = item.encode_queue_item_vec().unwrap();
+        // NOTE: no exact size assertion against `fallback_pio_serialized_size`
+        // here — `encode_queue_item_vec` uses the canonical (speedy) encoding
+        // while the size hint describes the fallback layout.
+        assert!(PsyDeployContractQueueItem::<PF, QHashOut<PF>>::is_queue_item(&encoded));
+        assert_eq!(
+            PsyDeployContractQueueItem::decode_queue_item_ref(&encoded).unwrap(),
+            item
+        );
+        assert_eq!(item.get_restorable_job_id(), item.rand_key_id.to_vec());
+        assert_eq!(
+            PsyDeployContractQueueItem::<PF, QHashOut<PF>>::get_size_hint(),
+            0
+        );
+        assert!(!PsyDeployContractQueueItem::<PF, QHashOut<PF>>::has_fixed_size());
+    }
+
+    #[test]
+    fn v1_queue_item_constructor_rejects_oversized_function_sets() {
+        assert!(PsyDeployContractQueueItem::<PF, QHashOut<PF>>::
+            new_from_leaves_and_deployer::<parth_core::pgoldilocks::PoseidonHasher>(
+                QHashOut::default(),
+                8,
+                vec![QHashOut::default(); 5],
+                QHashOut::default(),
+                2,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn v1_queue_random_items_round_trip() {
+        for _ in 0..8 {
+            let item = PsyDeployContractQueueItem::<PF, QHashOut<PF>>::qp_rand_gen();
+            let bytes = item.psy_ser_to_bytes_vec().unwrap();
+            assert_eq!(
+                PsyDeployContractQueueItem::<PF, QHashOut<PF>>::psy_ser_from_slice(&bytes).unwrap(),
+                item
+            );
+        }
     }
 }

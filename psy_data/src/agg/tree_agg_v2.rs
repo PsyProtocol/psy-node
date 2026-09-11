@@ -292,3 +292,183 @@ pub fn plan_jobs_for_tree_agg_offset_root<
     Ok((layers, all_witnesses))
 }
 
+#[cfg(test)]
+mod tests {
+    use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
+    use parth_core::pgoldilocks::{PoseidonHasher, QHashOut};
+    use parth_core::PF;
+
+    use super::*;
+    use crate::agg::{AggStateTrackableInput, AggStateTransition, AggStateTransitionInput};
+
+    type Hash = QHashOut<PF>;
+    type Leaf = AggStateTransitionInput<Hash>;
+
+    struct Helper;
+
+    impl BasicTreePlannerHelper<QProvingJobDataID, Hash, Leaf, AggStateTransitionInputV2<Hash>, DummyAggStateTransition<Hash>> for Helper {
+        fn get_dummy_job_id(checkpoint: u64) -> QProvingJobDataID {
+            QProvingJobDataID::new_proof_job_id(checkpoint, 0, ProvingJobCircuitType::Unknown, 0, 0)
+        }
+
+        fn get_agg_job_id(checkpoint: u64, key: SimpleMerkleNodeKey) -> QProvingJobDataID {
+            QProvingJobDataID::new_proof_job_id(checkpoint, key.level as u32, ProvingJobCircuitType::Unknown, 1, key.index as u32)
+        }
+
+        fn get_leaf_job_id(checkpoint: u64, key: SimpleMerkleNodeKey) -> QProvingJobDataID {
+            QProvingJobDataID::new_proof_job_id(checkpoint, key.level as u32, ProvingJobCircuitType::Unknown, 2, key.index as u32)
+        }
+
+        fn create_dummy_witness(allowed: Hash, root: Hash) -> DummyAggStateTransition<Hash> {
+            DummyAggStateTransition {
+                unmodified_state_tree_root: root,
+                allowed_circuit_hashes_root: allowed,
+                is_deploy_contracts: false,
+                is_register_users: false,
+            }
+        }
+
+        fn create_agg_two_leaf_witness(left: &Leaf, right: &Leaf) -> AggStateTransitionInputV2<Hash> {
+            aggregate(left.get_state_transition(), right.get_state_transition(), true, true)
+        }
+
+        fn create_agg_left_leaf_right_agg_witness(left: &Leaf, right: &AggStateTransitionInputV2<Hash>) -> AggStateTransitionInputV2<Hash> {
+            aggregate(left.get_state_transition(), right.get_state_transition(), true, false)
+        }
+
+        fn create_agg_left_agg_right_leaf_witness(left: &AggStateTransitionInputV2<Hash>, right: &Leaf) -> AggStateTransitionInputV2<Hash> {
+            aggregate(left.get_state_transition(), right.get_state_transition(), false, true)
+        }
+
+        fn create_agg_to_agg_witness(left: &AggStateTransitionInputV2<Hash>, right: &AggStateTransitionInputV2<Hash>) -> AggStateTransitionInputV2<Hash> {
+            aggregate(left.get_state_transition(), right.get_state_transition(), false, false)
+        }
+    }
+
+    fn aggregate(left: AggStateTransition<Hash>, right: AggStateTransition<Hash>, left_leaf: bool, right_leaf: bool) -> AggStateTransitionInputV2<Hash> {
+        AggStateTransitionInputV2 {
+            left_input: crate::agg::AggStateTransitionWithStats {
+                state_transition_start: left.state_transition_start,
+                state_transition_end: left.state_transition_end,
+                total_proofs_generated: 1,
+            },
+            right_input: crate::agg::AggStateTransitionWithStats {
+                state_transition_start: right.state_transition_start,
+                state_transition_end: right.state_transition_end,
+                total_proofs_generated: 1,
+            },
+            left_proof_is_leaf: left_leaf,
+            right_proof_is_leaf: right_leaf,
+        }
+    }
+
+    fn leaf(index: u64) -> Leaf {
+        Leaf {
+            left_input: AggStateTransition::new(Hash::from_values(index, 0, 0, 0), Hash::from_values(index + 1, 0, 0, 0)),
+            right_input: AggStateTransition::new(Hash::from_values(index + 1, 0, 0, 0), Hash::from_values(index + 2, 0, 0, 0)),
+            left_proof_is_leaf: true,
+            right_proof_is_leaf: true,
+        }
+    }
+
+    #[test]
+    fn computes_expected_levels() {
+        assert_eq!(compute_max_level(0), 0);
+        assert_eq!(compute_max_level(1), 0);
+        assert_eq!(compute_max_level(2), 1);
+        assert_eq!(compute_max_level(3), 2);
+        assert_eq!(compute_max_level(5), 3);
+    }
+
+    #[test]
+    fn plans_dummy_single_and_mixed_subtrees() {
+        let root = Hash::from_values(10, 0, 0, 0);
+        let allowed = Hash::from_values(11, 0, 0, 0);
+        for count in 0..=5 {
+            let leaves = (0..count).map(|i| leaf(i as u64)).collect::<Vec<_>>();
+            let (layers, witnesses) = plan_jobs_for_tree_agg::<QProvingJobDataID, PF, Hash, PoseidonHasher, Leaf, Helper>(7, root, allowed, &leaves).unwrap();
+            let expected_jobs = if count == 0 { 1 } else { count * 2 - 1 };
+            assert_eq!(layers.iter().map(Vec::len).sum::<usize>(), expected_jobs);
+            assert_eq!(witnesses.len(), expected_jobs);
+            assert_eq!(layers.len(), compute_max_level(count) as usize + 1);
+            assert_eq!(layers.last().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn offset_planner_rebases_reward_tree_coordinates() {
+        let leaves = vec![leaf(0), leaf(1), leaf(2)];
+        let (layers, witnesses) = plan_jobs_for_tree_agg_offset_root::<QProvingJobDataID, PF, Hash, PoseidonHasher, Leaf, Helper>(
+            9,
+            Hash::default(),
+            Hash::from_values(12, 0, 0, 0),
+            &leaves,
+            6,
+            4,
+        ).unwrap();
+        assert_eq!(witnesses.len(), 5);
+        assert_eq!(layers.last().unwrap()[0].metadata.reward_tree_node_index, 6);
+        assert_eq!(layers.last().unwrap()[0].metadata.reward_tree_node_level, 4);
+        assert_eq!(layers[0][0].metadata.reward_tree_node_index, 24);
+        assert_eq!(layers[0][0].metadata.reward_tree_node_level, 6);
+        for layer in &layers {
+            for job in layer {
+                assert!(job.metadata.reward_tree_node_level >= 4);
+            }
+        }
+
+        let (dummy_layers, dummy_witnesses) = plan_jobs_for_tree_agg_offset_root::<QProvingJobDataID, PF, Hash, PoseidonHasher, Leaf, Helper>(
+            9, Hash::default(), Hash::default(), &[], 7, 5,
+        ).unwrap();
+        assert_eq!(dummy_layers[0][0].metadata.reward_tree_node_index, 7);
+        assert_eq!(dummy_layers[0][0].metadata.reward_tree_node_level, 5);
+        assert_eq!(dummy_witnesses.len(), 1);
+    }
+
+    #[test]
+    fn planned_layers_carry_leaf_and_aggregation_metadata() {
+        let leaves = vec![leaf(0), leaf(1), leaf(2), leaf(3), leaf(4)];
+        let (layers, witnesses) = plan_jobs_for_tree_agg::<QProvingJobDataID, PF, Hash, PoseidonHasher, Leaf, Helper>(
+            11,
+            Hash::default(),
+            Hash::from_values(12, 0, 0, 0),
+            &leaves,
+        )
+        .unwrap();
+
+        // The bottom layer holds leaf jobs: no children and no dependencies.
+        assert!(!layers[0].is_empty());
+        for job in &layers[0] {
+            assert_eq!(job.metadata.reward_tree_node_children, 0);
+            assert!(job.metadata.dependencies.is_empty());
+            assert_eq!(job.metadata.reward_tree_hash_mode, PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN);
+        }
+
+        // The top layer holds a single root aggregation job depending on both children.
+        let root = layers.last().unwrap();
+        assert_eq!(root.len(), 1);
+        assert_eq!(root[0].metadata.reward_tree_node_children, 2);
+        assert_eq!(root[0].metadata.dependencies.len(), 2);
+        assert_eq!(root[0].metadata.reward_tree_hash_mode, PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD);
+        assert_eq!(root[0].metadata.reward_tree_node_index, 0);
+        assert_eq!(root[0].metadata.reward_tree_node_level, 0);
+
+        // Intermediate layers mix leaf jobs (no children) with aggregation
+        // jobs (two dependencies each), depending on how the leaf count splits.
+        for layer in &layers[1..layers.len() - 1] {
+            for job in layer {
+                if job.metadata.reward_tree_node_children == 0 {
+                    assert!(job.metadata.dependencies.is_empty());
+                    assert_eq!(job.metadata.reward_tree_hash_mode, PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN);
+                } else {
+                    assert_eq!(job.metadata.reward_tree_node_children, 2);
+                    assert_eq!(job.metadata.dependencies.len(), 2);
+                    assert_eq!(job.metadata.reward_tree_hash_mode, PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD);
+                }
+            }
+        }
+
+        // Every planned job contributes exactly one witness.
+        assert_eq!(witnesses.len(), layers.iter().map(Vec::len).sum::<usize>());
+    }
+}

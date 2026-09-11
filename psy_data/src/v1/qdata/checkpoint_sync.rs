@@ -3,7 +3,6 @@ use std::hash::Hash;
 use parth_core::crypto::hash::merkle_proof::{DeltaMerkleProofCore, compute_root_merkle_proof_generic};
 use parth_core::crypto::hash::traits::{FieldQHasher, QFieldHashable};
 use parth_core::felt::QFelt64;
-#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
 use parth_core::protocol::core_types::Q256BitHash;
 use parth_core::protocol::core_types::QFHashBase;
 #[cfg(feature = "rand_gen")]
@@ -77,8 +76,8 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for PQEDCheckp
         let coordinator_unique_pending_id = reader.psy_read_u64()?;
         
         let block_state = QEDL2BlockState::pio_read_from_io(reader)?;
-        let checkpoint_leaf = PQEDCheckpointLeaf::<F, Hash>::pio_read_from_io(reader)?;
         let state_roots = PQEDCheckpointGlobalStateRoots::<Hash>::pio_read_from_io(reader)?;
+        let checkpoint_leaf = PQEDCheckpointLeaf::<F, Hash>::pio_read_from_io(reader)?;
         let checkpoint_leaf_hash = Hash::from_owned_32bytes(reader.psy_read_bytes_32()?);
         let checkpoint_tree_root = Hash::from_owned_32bytes(reader.psy_read_bytes_32()?);
         Ok(Self {
@@ -302,3 +301,112 @@ pser::impl_psy_ser_basic_tests_fallback!(
     { parth_core::PF, parth_core::PHash },
     pqed_checkpoint_sync_info_tests
 );
+
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+    use parth_core::{pgoldilocks::{PoseidonHasher, QHashOut}, utils::QPGenRandom, PF};
+
+    type Hash = QHashOut<PF>;
+
+    #[test]
+    fn compact_sync_validation_accepts_consistent_data_and_rejects_each_commitment() {
+        let state_roots = PQEDCheckpointGlobalStateRoots::<Hash>::qp_rand_gen();
+        let mut checkpoint_leaf = PQEDCheckpointLeaf::<PF, Hash>::qp_rand_gen();
+        checkpoint_leaf.global_chain_root = state_roots.qfhash::<PoseidonHasher>();
+        let checkpoint_leaf_hash = checkpoint_leaf.qfhash::<PoseidonHasher>();
+        let siblings = vec![Hash::qp_rand_gen(), Hash::qp_rand_gen()];
+        let checkpoint_id = 3;
+        let checkpoint_tree_root = compute_root_merkle_proof_generic::<Hash, PoseidonHasher>(checkpoint_leaf_hash, checkpoint_id, &siblings);
+        let value = PQEDCheckpointSyncInfoCompact {
+            checkpoint_id,
+            coordinator_id: 1,
+            coordinator_sub_id: 2,
+            coordinator_unique_pending_id: 3,
+            block_state: QEDL2BlockState::qp_rand_gen(),
+            state_roots,
+            checkpoint_leaf,
+            checkpoint_leaf_hash,
+            checkpoint_tree_root,
+        };
+        value.ensure_valid::<PoseidonHasher>(&siblings).unwrap();
+        let mut invalid = value.clone();
+        invalid.checkpoint_leaf.global_chain_root = Hash::qp_rand_gen();
+        assert!(invalid.ensure_valid::<PoseidonHasher>(&siblings).is_err());
+        invalid = value.clone();
+        invalid.checkpoint_leaf_hash = Hash::qp_rand_gen();
+        assert!(invalid.ensure_valid::<PoseidonHasher>(&siblings).is_err());
+        invalid = value.clone();
+        invalid.checkpoint_tree_root = Hash::qp_rand_gen();
+        assert!(invalid.ensure_valid::<PoseidonHasher>(&siblings).is_err());
+        invalid = value.clone();
+        // a sibling path that does not derive the recorded root must also fail
+        invalid.checkpoint_id += 1;
+        assert!(invalid.ensure_valid::<PoseidonHasher>(&siblings).is_err());
+    }
+
+    #[test]
+    fn ensure_valid_accepts_root_level_leaf_with_empty_sibling_path() {
+        let state_roots = PQEDCheckpointGlobalStateRoots::<Hash>::qp_rand_gen();
+        let mut checkpoint_leaf = PQEDCheckpointLeaf::<PF, Hash>::qp_rand_gen();
+        checkpoint_leaf.global_chain_root = state_roots.qfhash::<PoseidonHasher>();
+        let checkpoint_leaf_hash = checkpoint_leaf.qfhash::<PoseidonHasher>();
+        let value = PQEDCheckpointSyncInfoCompact {
+            checkpoint_id: 0,
+            coordinator_id: 0,
+            coordinator_sub_id: 0,
+            coordinator_unique_pending_id: 0,
+            block_state: QEDL2BlockState::get_genesis_value(),
+            state_roots,
+            checkpoint_leaf,
+            checkpoint_leaf_hash,
+            // with no siblings the tree root is the leaf hash itself
+            checkpoint_tree_root: checkpoint_leaf_hash,
+        };
+        value.ensure_valid::<PoseidonHasher>(&[]).unwrap();
+    }
+
+    #[test]
+    fn compact_core_and_full_sync_info_fallback_round_trips() {
+        use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
+
+        // Regression test: the fallback read paths of these sync info types used
+        // to be broken twice over — `fallback_pio_read_from_io` mixed manual
+        // psy_io reads with children whose `pio_read_from_io` resolved to the
+        // buffered speedy stream reader (which over-reads the shared cursor),
+        // and PQEDCheckpointSyncInfoCompact parsed state_roots and
+        // checkpoint_leaf in the opposite order to how they are written. Both
+        // are fixed, so full fallback round trips are asserted below.
+        let compact = PQEDCheckpointSyncInfoCompact::<PF, Hash>::qp_rand_gen();
+        let compact_bytes = compact.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(compact_bytes.len(), <PQEDCheckpointSyncInfoCompact<PF, Hash> as PsyCanonicalSerializeMetadata>::FIXED_SIZE);
+        assert_eq!(PQEDCheckpointSyncInfoCompact::<PF, Hash>::fallback_psy_ser_from_slice(&compact_bytes).unwrap(), compact);
+        assert!(PQEDCheckpointSyncInfoCompact::<PF, Hash>::fallback_psy_ser_from_slice(&compact_bytes[..16]).is_err());
+        let compact_canonical = compact.psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(PQEDCheckpointSyncInfoCompact::psy_ser_from_slice(&compact_canonical).unwrap(), compact);
+
+        let core = PQEDCheckpointCoreSyncInfo::<PF, Hash>::qp_rand_gen();
+        let core_bytes = core.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(core_bytes.len(), <PQEDCheckpointCoreSyncInfo<PF, Hash> as PsyCanonicalSerializeMetadata>::FIXED_SIZE);
+        assert_eq!(PQEDCheckpointCoreSyncInfo::<PF, Hash>::fallback_psy_ser_from_slice(&core_bytes).unwrap(), core);
+        assert!(PQEDCheckpointCoreSyncInfo::<PF, Hash>::fallback_psy_ser_from_slice(&core_bytes[..16]).is_err());
+        let core_canonical = core.psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(PQEDCheckpointCoreSyncInfo::psy_ser_from_slice(&core_canonical).unwrap(), core);
+
+        let full = PQEDCheckpointSyncInfo::<PF, Hash>::qp_rand_gen();
+        let full_bytes = full.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(full_bytes.len(), full.fallback_pio_serialized_size());
+        assert_eq!(PQEDCheckpointSyncInfo::<PF, Hash>::fallback_psy_ser_from_slice(&full_bytes).unwrap(), full);
+        assert!(PQEDCheckpointSyncInfo::<PF, Hash>::fallback_psy_ser_from_slice(&full_bytes[..16]).is_err());
+        let full_canonical = full.psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(PQEDCheckpointSyncInfo::psy_ser_from_slice(&full_canonical).unwrap(), full);
+    }
+
+    #[test]
+    fn sync_info_serde_round_trip() {
+        let value = PQEDCheckpointSyncInfo::<PF, Hash>::qp_rand_gen();
+        let json = serde_json::to_string(&value).unwrap();
+        let restored = serde_json::from_str::<PQEDCheckpointSyncInfo<PF, Hash>>(&json).unwrap();
+        assert_eq!(restored, value);
+    }
+}

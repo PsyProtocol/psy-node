@@ -255,7 +255,9 @@ impl ABISlotAnalyzer {
         match type_spec {
             TypeAbiSpec::Basic(inner_type) => self.calculate_struct_total_slots(inner_type),
             TypeAbiSpec::Array { inner_type, length, .. } => {
-                let elem_slot_count = self.calculate_struct_total_slots(inner_type)?;
+                // basic inner types (Felt/u32/bool) resolve to one slot per element here,
+                // struct inner types to their total slot count, unknown names still error
+                let elem_slot_count = self.calculate_type_slot_count(&TypeAbiSpec::Basic(inner_type.clone()))?;
                 Ok(elem_slot_count * (*length as u64))
             }
         }
@@ -434,6 +436,180 @@ mod tests {
         assert_eq!(analyzer.get_field_by_slot(6666)?, "PsyTokenContract.other_user_info[3331].amount_claimed");
         assert_eq!(analyzer.get_field_by_slot(6667)?, "PsyTokenContract.other_user_info[3332].amount_sent");
 
+        Ok(())
+    }
+
+    fn basic_array_abi() -> QContractABI {
+        QContractABI {
+            version: "1.0.0".to_string(),
+            structs: vec![StructAbiSpec {
+                name: "ArrContract".to_string(),
+                is_contract: true,
+                fields: vec![
+                    FieldAbiSpec {
+                        name: "owner".to_string(),
+                        field_type: TypeAbiSpec::Basic("Felt".to_string()),
+                    },
+                    FieldAbiSpec {
+                        name: "notes".to_string(),
+                        field_type: TypeAbiSpec::Array {
+                            type_name: "Array".to_string(),
+                            inner_type: "Felt".to_string(),
+                            length: 4,
+                        },
+                    },
+                ],
+                functions: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn contract_struct_lookup_distinguishes_zero_one_and_many() {
+        let missing = QContractABI { version: "1.0.0".to_string(), structs: vec![] };
+        let err = missing.get_contract_struct().unwrap_err();
+        assert!(err.to_string().contains("contract struct not found"));
+
+        let single = basic_array_abi();
+        assert_eq!(single.get_contract_struct().unwrap().name, "ArrContract");
+
+        let mut duplicate = basic_array_abi();
+        duplicate.structs.push(StructAbiSpec {
+            name: "OtherContract".to_string(),
+            is_contract: true,
+            fields: vec![],
+            functions: None,
+        });
+        let err = duplicate.get_contract_struct().unwrap_err();
+        assert!(err.to_string().contains("multiple contract structs found"));
+    }
+
+    fn nested_struct_abi() -> QContractABI {
+        QContractABI {
+            version: "1.0.0".to_string(),
+            structs: vec![
+                StructAbiSpec {
+                    name: "PairContract".to_string(),
+                    is_contract: true,
+                    fields: vec![
+                        FieldAbiSpec {
+                            name: "first".to_string(),
+                            field_type: TypeAbiSpec::Basic("u32".to_string()),
+                        },
+                        FieldAbiSpec {
+                            name: "entries".to_string(),
+                            field_type: TypeAbiSpec::Array {
+                                type_name: "Array".to_string(),
+                                inner_type: "Entry".to_string(),
+                                length: 3,
+                            },
+                        },
+                    ],
+                    functions: None,
+                },
+                StructAbiSpec {
+                    name: "Entry".to_string(),
+                    is_contract: false,
+                    fields: vec![
+                        FieldAbiSpec {
+                            name: "a".to_string(),
+                            field_type: TypeAbiSpec::Basic("bool".to_string()),
+                        },
+                        FieldAbiSpec {
+                            name: "b".to_string(),
+                            field_type: TypeAbiSpec::Basic("Felt".to_string()),
+                        },
+                    ],
+                    functions: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn basic_inner_array_paths_render_direct_element_indexing() -> anyhow::Result<()> {
+        // basic inner types resolve to one slot per element, so the ABI
+        // analyzes on its own and elements render as direct indexing
+        let analyzer = ABISlotAnalyzer::new_with_analyze(basic_array_abi())?;
+        assert_eq!(analyzer.calculate_struct_total_slots("ArrContract")?, 5);
+
+        assert_eq!(analyzer.get_field_by_slot(0)?, "ArrContract.owner");
+        assert_eq!(analyzer.get_field_by_slot(1)?, "ArrContract.notes[0]");
+        assert_eq!(analyzer.get_field_by_slot(4)?, "ArrContract.notes[3]");
+        assert!(analyzer.get_field_by_slot(5).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn analyzer_reports_errors_for_missing_contract_and_structs() -> anyhow::Result<()> {
+        let no_contract = QContractABI {
+            version: "1.0.0".to_string(),
+            structs: vec![StructAbiSpec {
+                name: "Plain".to_string(),
+                is_contract: false,
+                fields: vec![],
+                functions: None,
+            }],
+        };
+        assert!(ABISlotAnalyzer::new(no_contract).is_err());
+
+        // Array fields whose inner type is a missing struct still fail analysis
+        let missing_inner = QContractABI {
+            version: "1.0.0".to_string(),
+            structs: vec![StructAbiSpec {
+                name: "ArrContract".to_string(),
+                is_contract: true,
+                fields: vec![FieldAbiSpec {
+                    name: "notes".to_string(),
+                    field_type: TypeAbiSpec::Array {
+                        type_name: "Array".to_string(),
+                        inner_type: "Missing".to_string(),
+                        length: 4,
+                    },
+                }],
+                functions: None,
+            }],
+        };
+        let analyzer = ABISlotAnalyzer::new(missing_inner)?;
+        assert!(analyzer.calculate_all_structs_field_slots().is_err());
+
+        let analyzer = ABISlotAnalyzer::new_with_analyze(nested_struct_abi())?;
+        assert!(analyzer.get_struct_range("Missing").is_err());
+        assert!(analyzer.calculate_struct_total_slots("Missing").is_err());
+        assert_eq!(analyzer.calculate_struct_total_slots("Entry")?, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn analyzer_default_and_clone_rebuild_independent_caches() -> anyhow::Result<()> {
+        let analyzer = ABISlotAnalyzer::new_with_analyze(nested_struct_abi())?;
+        let cloned = analyzer.clone();
+        assert_eq!(cloned.get_field_by_slot(0)?, "PairContract.first");
+        assert_eq!(cloned.get_field_by_slot(4)?, "PairContract.entries[1].b");
+        assert!(cloned.get_field_by_slot(99).is_err());
+
+        let default = ABISlotAnalyzer::default();
+        assert!(default.get_field_by_slot(0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn struct_range_slot_lookup_and_type_helpers() -> anyhow::Result<()> {
+        let analyzer = ABISlotAnalyzer::new_with_analyze(nested_struct_abi())?;
+        let range = analyzer.get_struct_range("PairContract")?;
+        assert_eq!(range.get_field_by_slot(0)?.field_name, "first");
+        assert!(range.get_field_by_slot(99).is_err());
+
+        let array_type = TypeAbiSpec::Array {
+            type_name: "Array".to_string(),
+            inner_type: "Felt".to_string(),
+            length: 4,
+        };
+        assert!(array_type.is_array());
+        assert!(!TypeAbiSpec::Basic("Felt".to_string()).is_array());
+        assert_eq!(array_type.get_type_name(), "Array");
+        assert!(!array_type.is_basic_type());
+        assert!(TypeAbiSpec::Basic("Felt".to_string()).is_basic_type());
         Ok(())
     }
 }

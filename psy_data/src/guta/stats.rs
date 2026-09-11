@@ -120,3 +120,77 @@ pser::impl_psy_ser_basic_tests_fallback!(
     { parth_core::PF },
     guta_stats_tests
 );
+
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+    use parth_core::{felt::FromPrimitiveValuesFelt, pgoldilocks::{PoseidonHasher, QHashOut}, PF};
+
+    type Hash = QHashOut<PF>;
+
+    fn stats(base: u64) -> GUTAStats<PF> {
+        GUTAStats {
+            guta_fees_collected: PF::from_u64_value(base),
+            da_fees_collected: PF::from_u64_value(base + 1),
+            user_ops_processed: PF::from_u64_value(base + 2),
+            total_transactions: PF::from_u64_value(base + 3),
+            slots_modified: PF::from_u64_value(base + 4),
+        }
+    }
+
+    #[test]
+    fn zero_add_combine_and_hash_are_consistent() {
+        let zero = GUTAStats::<PF>::get_zero_value();
+        let left = stats(1);
+        let right = stats(10);
+        assert_eq!(zero.combine_with(&left), left);
+
+        let combined = left.combine_with(&right);
+        let mut accumulated = left;
+        accumulated.add_from_mut(&right);
+        assert_eq!(accumulated, combined);
+        assert_eq!(combined.guta_fees_collected, PF::from_u64_value(11));
+        assert_eq!(combined.da_fees_collected, PF::from_u64_value(13));
+        assert_eq!(combined.user_ops_processed, PF::from_u64_value(15));
+        assert_eq!(combined.total_transactions, PF::from_u64_value(17));
+        assert_eq!(combined.slots_modified, PF::from_u64_value(19));
+
+        let expected: Hash = PoseidonHasher::q_hash_many(&[
+            combined.guta_fees_collected,
+            combined.da_fees_collected,
+            combined.user_ops_processed,
+            combined.total_transactions,
+            combined.slots_modified,
+        ]);
+        let actual: Hash = <GUTAStats<PF> as QFieldHashable<PF, Hash>>::qfhash::<PoseidonHasher>(&combined);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn zero_value_is_additive_identity() {
+        let zero = GUTAStats::<PF>::get_zero_value();
+        let other = stats(7);
+
+        let mut accumulated = zero;
+        accumulated.add_from_mut(&other);
+        assert_eq!(accumulated, other);
+        assert_eq!(other.combine_with(&zero), other);
+
+        let expected: Hash = PoseidonHasher::q_hash_many(&[PF::ZERO_VALUE; 5]);
+        let actual: Hash = <GUTAStats<PF> as QFieldHashable<PF, Hash>>::qfhash::<PoseidonHasher>(&zero);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn combine_is_commutative_and_associative() {
+        let a = stats(1);
+        let b = stats(50);
+        let c = stats(1000);
+
+        assert_eq!(a.combine_with(&b), b.combine_with(&a));
+        assert_eq!(
+            a.combine_with(&b).combine_with(&c),
+            a.combine_with(&b.combine_with(&c))
+        );
+    }
+}

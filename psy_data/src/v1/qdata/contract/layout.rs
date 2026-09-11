@@ -2554,7 +2554,7 @@ mod tests {
                 1,
             )?;
         let huge =
-            fixed_array_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(u64_layout, 9)?;
+            fixed_array_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(u64_layout, 33)?;
         let error = contract_state_layout::<PoseidonHasher, PF, QHashOut<PF>>(
             &[huge],
             1,
@@ -2665,6 +2665,94 @@ mod tests {
     }
 
     #[test]
+    fn public_layout_transition_shape_rejects_each_invalid_endpoint() {
+        let root = QHashOut::<PF>::rand();
+        let valid = LayoutAppendPublicInputs {
+            contract_id: 1,
+            layout_version: STATE_LAYOUT_VERSION,
+            old_layout_root: root,
+            old_layout_field_count: 2,
+            old_layout_slot_count: 4,
+            new_layout_root: QHashOut::rand(),
+            new_layout_field_count: 3,
+            new_layout_slot_count: 5,
+            appended_field_count: 1,
+            appended_fields_commitment: QHashOut::rand(),
+        };
+        valid.validate_shape().unwrap();
+
+        let mut wrong_version = valid;
+        wrong_version.layout_version += 1;
+        assert!(wrong_version.validate_shape().is_err());
+        let mut wrong_fields = valid;
+        wrong_fields.new_layout_field_count += 1;
+        assert!(wrong_fields.validate_shape().is_err());
+        let mut decreasing_slots = valid;
+        decreasing_slots.new_layout_slot_count = 3;
+        assert!(decreasing_slots.validate_shape().is_err());
+        let mut identity_root = valid;
+        identity_root.appended_field_count = 0;
+        identity_root.new_layout_field_count = identity_root.old_layout_field_count;
+        assert!(identity_root.validate_shape().is_err());
+        identity_root.new_layout_root = identity_root.old_layout_root;
+        identity_root.new_layout_slot_count += 1;
+        assert!(identity_root.validate_shape().is_err());
+    }
+
+    #[test]
+    fn batch_commitment_checks_count_and_zero_hash_invariants() {
+        let hashes = vec![QHashOut::<PF>::rand(), QHashOut::ZERO];
+        assert!(compute_layout_batch_commitment::<PoseidonHasher, PF, _>(1, 0, 0, 3, &hashes).is_err());
+        assert!(compute_layout_batch_commitment::<PoseidonHasher, PF, _>(1, 0, 0, 2, &hashes).is_err());
+        let commitment = compute_layout_batch_commitment::<PoseidonHasher, PF, _>(1, 0, 0, 1, &hashes).unwrap();
+        assert_ne!(commitment, QHashOut::ZERO);
+    }
+
+    #[test]
+    fn aggregation_rejects_each_continuity_mismatch() {
+        let root0 = QHashOut::<PF>::rand();
+        let root1 = QHashOut::rand();
+        let root2 = QHashOut::rand();
+        let left = LayoutAppendPublicInputs {
+            contract_id: 1,
+            layout_version: STATE_LAYOUT_VERSION,
+            old_layout_root: root0,
+            old_layout_field_count: 0,
+            old_layout_slot_count: 0,
+            new_layout_root: root1,
+            new_layout_field_count: 1,
+            new_layout_slot_count: 1,
+            appended_field_count: 1,
+            appended_fields_commitment: QHashOut::rand(),
+        };
+        let right = LayoutAppendPublicInputs {
+            contract_id: 1,
+            layout_version: STATE_LAYOUT_VERSION,
+            old_layout_root: root1,
+            old_layout_field_count: 1,
+            old_layout_slot_count: 1,
+            new_layout_root: root2,
+            new_layout_field_count: 2,
+            new_layout_slot_count: 2,
+            appended_field_count: 1,
+            appended_fields_commitment: QHashOut::rand(),
+        };
+        let mut other_contract = right;
+        other_contract.contract_id = 2;
+        assert!(aggregate_layout_transitions::<PoseidonHasher, PF, _>(left, other_contract).is_err());
+        let mut other_root = right;
+        other_root.old_layout_root = QHashOut::rand();
+        assert!(aggregate_layout_transitions::<PoseidonHasher, PF, _>(left, other_root).is_err());
+        let mut other_fields = right;
+        other_fields.old_layout_field_count = 0;
+        other_fields.new_layout_field_count = 1;
+        assert!(aggregate_layout_transitions::<PoseidonHasher, PF, _>(left, other_fields).is_err());
+        let mut other_slots = right;
+        other_slots.old_layout_slot_count = 0;
+        assert!(aggregate_layout_transitions::<PoseidonHasher, PF, _>(left, other_slots).is_err());
+    }
+
+    #[test]
     fn binds_transition_to_v2_leaf_endpoints_and_capacity(
     ) -> anyhow::Result<()> {
         let deployer: QHashOut<PF> = QHashOut::rand();
@@ -2686,7 +2774,7 @@ mod tests {
             state_tree_height: PF::from_u64_value(3),
             state_layout_root: new_root,
             state_layout_field_count: PF::from_u64_value(2),
-            state_layout_slot_count: PF::from_u64_value(8),
+            state_layout_slot_count: PF::from_u64_value(32),
         };
         let transition = LayoutAppendPublicInputs {
             contract_id: 11,
@@ -2696,7 +2784,7 @@ mod tests {
             old_layout_slot_count: 2,
             new_layout_root: new_root,
             new_layout_field_count: 2,
-            new_layout_slot_count: 8,
+            new_layout_slot_count: 32,
             appended_field_count: 1,
             appended_fields_commitment: QHashOut::rand(),
         };
@@ -2707,9 +2795,9 @@ mod tests {
             &transition,
         )?;
 
-        new_leaf.state_layout_slot_count = PF::from_u64_value(9);
+        new_leaf.state_layout_slot_count = PF::from_u64_value(33);
         let mut oversized = transition;
-        oversized.new_layout_slot_count = 9;
+        oversized.new_layout_slot_count = 33;
         assert!(
             validate_contract_layout_transition(
                 11, &old_leaf, &new_leaf, &oversized,
@@ -2718,6 +2806,24 @@ mod tests {
             .to_string()
             .contains("capacity")
         );
+
+        new_leaf.state_layout_slot_count = PF::from_u64_value(32);
+        assert!(validate_contract_layout_transition(12, &old_leaf, &new_leaf, &transition).is_err());
+        let mut changed_deployer = new_leaf;
+        changed_deployer.deployer = QHashOut::rand();
+        assert!(validate_contract_layout_transition(11, &old_leaf, &changed_deployer, &transition).is_err());
+        let mut changed_height = new_leaf;
+        changed_height.state_tree_height = PF::from_u64_value(4);
+        assert!(validate_contract_layout_transition(11, &old_leaf, &changed_height, &transition).is_err());
+        let mut changed_root = new_leaf;
+        changed_root.state_layout_root = QHashOut::rand();
+        assert!(validate_contract_layout_transition(11, &old_leaf, &changed_root, &transition).is_err());
+        let mut changed_fields = new_leaf;
+        changed_fields.state_layout_field_count = PF::from_u64_value(3);
+        assert!(validate_contract_layout_transition(11, &old_leaf, &changed_fields, &transition).is_err());
+        let mut changed_slots = new_leaf;
+        changed_slots.state_layout_slot_count = PF::from_u64_value(31);
+        assert!(validate_contract_layout_transition(11, &old_leaf, &changed_slots, &transition).is_err());
         Ok(())
     }
 
@@ -2795,9 +2901,25 @@ mod tests {
         };
         witness.validate::<PoseidonHasher, PF>()?;
 
-        let mut forged = witness;
+        let mut forged = witness.clone();
         forged.appended_fields[0].start_slot = 7;
         assert!(forged.validate::<PoseidonHasher, PF>().is_err());
+        let mut wrong_count = witness.clone();
+        wrong_count.public_inputs.appended_field_count = 2;
+        wrong_count.public_inputs.new_layout_field_count = 4;
+        assert!(wrong_count.validate::<PoseidonHasher, PF>().is_err());
+        let mut missing_type = witness.clone();
+        missing_type.appended_type_layouts.clear();
+        assert!(missing_type.validate::<PoseidonHasher, PF>().is_err());
+        let mut missing_proof = witness.clone();
+        missing_proof.canonical_type_proofs[0].clear();
+        assert!(missing_proof.validate::<PoseidonHasher, PF>().is_err());
+        let mut wrong_field_id = witness.clone();
+        wrong_field_id.appended_fields[0].field_id = 99;
+        assert!(wrong_field_id.validate::<PoseidonHasher, PF>().is_err());
+        let mut wrong_commitment = witness;
+        wrong_commitment.public_inputs.appended_fields_commitment = QHashOut::rand();
+        assert!(wrong_commitment.validate::<PoseidonHasher, PF>().is_err());
         Ok(())
     }
 
@@ -3106,6 +3228,1738 @@ mod tests {
         >(&[array_layout, hash_layout], 1)?
         .summary;
         assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn v2_contract_leaf_default_metadata_size_and_domain_hash() {
+        let default_leaf = PQEDContractLeafV2::<PF, QHashOut<PF>>::default();
+        assert_eq!(default_leaf.deployer, QHashOut::default());
+        assert_eq!(default_leaf.state_tree_height, PF::default());
+        assert_eq!(
+            default_leaf.layout_metadata().protocol_version,
+            STATE_LAYOUT_VERSION
+        );
+
+        let leaf = PQEDContractLeafV2 {
+            deployer: QHashOut::rand(),
+            function_tree_root: QHashOut::rand(),
+            code_root: QHashOut::rand(),
+            state_tree_height: PF::from_u64_value(16),
+            state_layout_root: QHashOut::rand(),
+            state_layout_field_count: PF::from_u64_value(3),
+            state_layout_slot_count: PF::from_u64_value(22),
+        };
+        let metadata = leaf.layout_metadata();
+        assert_eq!(metadata.field_count, 3);
+        assert_eq!(metadata.slot_count, 22);
+        assert_eq!(metadata.state_tree_height, 16);
+        assert_eq!(metadata.state_layout_root, leaf.state_layout_root);
+
+        assert_eq!(
+            <PQEDContractLeafV2<PF, QHashOut<PF>> as QFeltSized>::q_felt_size(),
+            CONTRACT_LEAF_FELT_SIZE
+        );
+        assert_eq!(leaf.self_qsize(), CONTRACT_LEAF_FELT_SIZE);
+
+        let domain_hash = leaf.qfhash::<PoseidonHasher>();
+        assert_ne!(domain_hash, QHashOut::default());
+        assert_eq!(leaf.qfhash::<PoseidonHasher>(), domain_hash);
+    }
+
+    #[test]
+    fn canonical_primitive_slot_width_matches_encoding_table() {
+        assert_eq!(canonical_primitive_slot_width(StatePrimitiveTypeTag::Felt), 1);
+        assert_eq!(canonical_primitive_slot_width(StatePrimitiveTypeTag::Bool), 1);
+        assert_eq!(canonical_primitive_slot_width(StatePrimitiveTypeTag::U32), 1);
+        assert_eq!(canonical_primitive_slot_width(StatePrimitiveTypeTag::U64), 1);
+        assert_eq!(canonical_primitive_slot_width(StatePrimitiveTypeTag::U128), 2);
+        assert_eq!(canonical_primitive_slot_width(StatePrimitiveTypeTag::Hash), 4);
+        assert_eq!(
+            canonical_primitive_slot_width(StatePrimitiveTypeTag::Bytes32),
+            4
+        );
+    }
+
+    fn sample_contract_leaf() -> PQEDContractLeafV2<PF, QHashOut<PF>> {
+        PQEDContractLeafV2 {
+            deployer: QHashOut::from_values(1, 2, 3, 4),
+            function_tree_root: QHashOut::from_values(5, 6, 7, 8),
+            code_root: QHashOut::from_values(9, 10, 11, 12),
+            state_tree_height: PF::from_u64_value(16),
+            state_layout_root: QHashOut::from_values(13, 14, 15, 16),
+            state_layout_field_count: PF::from_u64_value(3),
+            state_layout_slot_count: PF::from_u64_value(22),
+        }
+    }
+
+    #[test]
+    fn v2_contract_leaf_serde_and_domain_separation() -> anyhow::Result<()> {
+        let leaf = sample_contract_leaf();
+        let leaf_json = serde_json::to_string(&leaf)?;
+        assert_eq!(
+            serde_json::from_str::<PQEDContractLeafV2<PF, QHashOut<PF>>>(
+                &leaf_json
+            )?,
+            leaf
+        );
+        let metadata = leaf.layout_metadata();
+        let metadata_json = serde_json::to_string(&metadata)?;
+        assert_eq!(
+            serde_json::from_str::<ContractLayoutMetadata<QHashOut<PF>>>(
+                &metadata_json
+            )?,
+            metadata
+        );
+
+        // The domain separator keeps the leaf hash off the bare felts hash.
+        assert_ne!(
+            leaf.qfhash::<PoseidonHasher>(),
+            PoseidonHasher::q_hash_many(
+                &<PQEDContractLeafV2<PF, QHashOut<PF>> as ToQFelts<PF>>::to_qfelts(
+                    &leaf
+                )
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid number of contract leaf felts")]
+    fn v2_contract_leaf_from_qfelts_rejects_wrong_length() {
+        let _ =
+            <PQEDContractLeafV2<PF, QHashOut<PF>> as ToQFelts<PF>>::from_qfelts(
+                &[PF::default(); 4],
+            );
+    }
+
+    #[test]
+    fn primitive_type_layout_rejects_non_canonical_width() -> anyhow::Result<()> {
+        let error =
+            primitive_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+                StatePrimitiveTypeTag::Felt,
+                2,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("occupies"));
+        let bytes32 =
+            primitive_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+                StatePrimitiveTypeTag::Bytes32,
+                4,
+            )?;
+        assert_eq!(bytes32.total_slot_count, 4);
+        let u128_layout =
+            primitive_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+                StatePrimitiveTypeTag::U128,
+                2,
+            )?;
+        assert_eq!(u128_layout.total_slot_count, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn fixed_array_type_layout_rejects_degenerate_arguments()
+    -> anyhow::Result<()> {
+        let element =
+            primitive_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+                StatePrimitiveTypeTag::Felt,
+                1,
+            )?;
+        assert!(
+            fixed_array_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+                element,
+                0
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("non-zero")
+        );
+        let empty_element = StateTypeLayoutSummary {
+            type_layout_hash: QHashOut::from_values(1, 2, 3, 4),
+            total_slot_count: 0,
+        };
+        assert!(
+            fixed_array_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+                empty_element,
+                3
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("occupy slots")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fixed_map_type_layout_separates_kinds_and_rejects_bad_arguments()
+    -> anyhow::Result<()> {
+        let key = primitive_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+            StatePrimitiveTypeTag::Hash,
+            4,
+        )?;
+        let value = primitive_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+            StatePrimitiveTypeTag::Felt,
+            1,
+        )?;
+        let build = |kind| {
+            fixed_map_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+                kind, key, value, 8, 4,
+            )
+        };
+        let contract_hash_map = build(StateMapKind::ContractHashMap)?;
+        let plain_map = build(StateMapKind::Map)?;
+        let namespaced_map = build(StateMapKind::NamespacedMap)?;
+        assert_eq!(plain_map.total_slot_count, 8);
+        assert_ne!(
+            contract_hash_map.type_layout_hash,
+            plain_map.type_layout_hash
+        );
+        assert_ne!(
+            namespaced_map.type_layout_hash,
+            plain_map.type_layout_hash
+        );
+        assert_ne!(
+            contract_hash_map.type_layout_hash,
+            namespaced_map.type_layout_hash
+        );
+
+        assert!(
+            fixed_map_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+                StateMapKind::Map,
+                key,
+                value,
+                0,
+                4
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("non-zero")
+        );
+        for alignment in [0u64, 3, 6] {
+            assert!(
+                fixed_map_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+                    StateMapKind::Map,
+                    key,
+                    value,
+                    8,
+                    alignment
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("power of two")
+            );
+        }
+        let overflowing = StateTypeLayoutSummary {
+            type_layout_hash: value.type_layout_hash,
+            total_slot_count: 4,
+        };
+        assert!(
+            fixed_map_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+                StateMapKind::Map,
+                key,
+                overflowing,
+                u64::MAX,
+                4
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("overflow")
+        );
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Struct member and state field layout leaves
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn struct_type_layout_rejects_empty_and_oversized_members()
+    -> anyhow::Result<()> {
+        let felt = primitive_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+            StatePrimitiveTypeTag::Felt,
+            1,
+        )?;
+        assert!(
+            struct_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(&[], 1)
+                .unwrap_err()
+                .to_string()
+                .contains("empty structs")
+        );
+        let five = [felt; 5];
+        assert!(
+            struct_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(&five, 2)
+                .unwrap_err()
+                .to_string()
+                .contains("members-tree capacity")
+        );
+        assert!(
+            struct_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(&[felt], 64)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds usize capacity")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn struct_member_layout_validates_ids_counts_and_version()
+    -> anyhow::Result<()> {
+        let felt = primitive_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+            StatePrimitiveTypeTag::Felt,
+            1,
+        )?;
+        let empty = StateTypeLayoutSummary {
+            type_layout_hash: QHashOut::from_values(1, 2, 3, 4),
+            total_slot_count: 0,
+        };
+        assert!(
+            StructMemberLayout::<QHashOut<PF>>::new(0, 0, empty)
+                .unwrap_err()
+                .to_string()
+                .contains("at least one slot")
+        );
+        let member = StructMemberLayout::<QHashOut<PF>>::new(3, 7, felt)?;
+        assert_eq!(member.member_id, 4);
+        assert_eq!(member.slot_offset, 7);
+        assert_eq!(member.slot_count, 1);
+        assert_eq!(member.encoding_version, STATE_LAYOUT_ENCODING_VERSION);
+        assert_eq!(
+            member.hash::<PoseidonHasher, PF>()?,
+            member.hash::<PoseidonHasher, PF>()?
+        );
+        assert_ne!(
+            member.hash::<PoseidonHasher, PF>()?,
+            QHashOut::<PF>::default()
+        );
+
+        let mut zero_id = member;
+        zero_id.member_id = 0;
+        assert!(zero_id.hash::<PoseidonHasher, PF>().is_err());
+        let mut zero_count = member;
+        zero_count.slot_count = 0;
+        assert!(zero_count.hash::<PoseidonHasher, PF>().is_err());
+        let mut bad_version = member;
+        bad_version.encoding_version = STATE_LAYOUT_ENCODING_VERSION + 1;
+        assert!(bad_version.hash::<PoseidonHasher, PF>().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn state_field_layout_validates_ids_offsets_counts_and_version()
+    -> anyhow::Result<()> {
+        let felt = primitive_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+            StatePrimitiveTypeTag::Felt,
+            1,
+        )?;
+        let empty = StateTypeLayoutSummary {
+            type_layout_hash: QHashOut::from_values(1, 2, 3, 4),
+            total_slot_count: 0,
+        };
+        assert!(
+            StateFieldLayoutLeaf::<QHashOut<PF>>::new(0, 0, empty)
+                .unwrap_err()
+                .to_string()
+                .contains("at least one slot")
+        );
+        let field = StateFieldLayoutLeaf::<QHashOut<PF>>::new(0, 5, felt)?;
+        assert_eq!(field.field_id, 1);
+        assert_eq!(field.start_slot, 5);
+        assert_eq!(field.payload_offset, 0);
+        assert_eq!(field.slot_count, 1);
+        let padded =
+            StateFieldLayoutLeaf::<QHashOut<PF>>::new_with_payload_offset(
+                1, 9, 2, felt,
+            )?;
+        assert_eq!(padded.field_id, 2);
+        assert_eq!(padded.payload_offset, 2);
+        assert_eq!(padded.slot_count, 3);
+        let huge = StateTypeLayoutSummary {
+            type_layout_hash: felt.type_layout_hash,
+            total_slot_count: u64::MAX,
+        };
+        assert!(
+            StateFieldLayoutLeaf::<QHashOut<PF>>::new_with_payload_offset(
+                0, 0, 1, huge
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("slot count overflow")
+        );
+
+        assert_eq!(
+            field.hash::<PoseidonHasher, PF>()?,
+            field.hash::<PoseidonHasher, PF>()?
+        );
+        assert_ne!(
+            field.hash::<PoseidonHasher, PF>()?,
+            QHashOut::<PF>::default()
+        );
+        let mut zero_id = field;
+        zero_id.field_id = 0;
+        assert!(zero_id.hash::<PoseidonHasher, PF>().is_err());
+        let mut zero_count = field;
+        zero_count.slot_count = 0;
+        assert!(zero_count.hash::<PoseidonHasher, PF>().is_err());
+        let mut offset_at_end = field;
+        offset_at_end.payload_offset = offset_at_end.slot_count;
+        assert!(offset_at_end.hash::<PoseidonHasher, PF>().is_err());
+        let mut bad_version = field;
+        bad_version.encoding_version = STATE_LAYOUT_ENCODING_VERSION + 1;
+        assert!(bad_version.hash::<PoseidonHasher, PF>().is_err());
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Canonical type-layout witnesses
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn type_layout_witness_summaries_match_native_layouts() -> anyhow::Result<()> {
+        let felt = primitive_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+            StatePrimitiveTypeTag::Felt,
+            1,
+        )?;
+        let primitive_witness =
+            StateTypeLayoutWitness::<QHashOut<PF>>::Primitive {
+                type_tag: StatePrimitiveTypeTag::Felt,
+            };
+        assert_eq!(
+            primitive_witness.summary::<PoseidonHasher, PF>()?,
+            felt
+        );
+
+        let array =
+            fixed_array_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+                felt,
+                5,
+            )?;
+        let array_witness = StateTypeLayoutWitness::FixedArray {
+            element_type_hash: felt.type_layout_hash,
+            element_slot_count: felt.total_slot_count,
+            array_length: 5,
+        };
+        assert_eq!(array_witness.summary::<PoseidonHasher, PF>()?, array);
+
+        let key = primitive_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+            StatePrimitiveTypeTag::Hash,
+            4,
+        )?;
+        let map = fixed_map_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+            StateMapKind::NamespacedMap,
+            key,
+            felt,
+            8,
+            2,
+        )?;
+        let map_witness = StateTypeLayoutWitness::FixedMap {
+            map_kind: StateMapKind::NamespacedMap,
+            key_type_hash: key.type_layout_hash,
+            key_slot_count: key.total_slot_count,
+            value_type_hash: felt.type_layout_hash,
+            value_slot_count: felt.total_slot_count,
+            capacity: 8,
+            alignment_slots: 2,
+        };
+        assert_eq!(map_witness.summary::<PoseidonHasher, PF>()?, map);
+
+        let struct_layout =
+            struct_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+                &[felt, key],
+                1,
+            )?;
+        let struct_witness = StateTypeLayoutWitness::Struct {
+            member_count: struct_layout.members.len() as u64,
+            total_slot_count: struct_layout.summary.total_slot_count,
+            members_root: struct_layout.members_root,
+        };
+        assert_eq!(
+            struct_witness.summary::<PoseidonHasher, PF>()?,
+            struct_layout.summary
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn struct_type_layout_witness_rejects_empty_members() -> anyhow::Result<()> {
+        let witness = |member_count: u64, total_slot_count: u64| {
+            StateTypeLayoutWitness::<QHashOut<PF>>::Struct {
+                member_count,
+                total_slot_count,
+                members_root: QHashOut::from_values(1, 2, 3, 4),
+            }
+        };
+        witness(2, 2).summary::<PoseidonHasher, PF>()?;
+        assert!(witness(0, 2).summary::<PoseidonHasher, PF>().is_err());
+        assert!(witness(2, 0).summary::<PoseidonHasher, PF>().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn type_layout_witness_validate_field_checks_hash_offset_and_count()
+    -> anyhow::Result<()> {
+        let felt = primitive_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+            StatePrimitiveTypeTag::Felt,
+            1,
+        )?;
+        let primitive_witness =
+            StateTypeLayoutWitness::<QHashOut<PF>>::Primitive {
+                type_tag: StatePrimitiveTypeTag::Felt,
+            };
+        let field = StateFieldLayoutLeaf {
+            field_id: 1,
+            start_slot: 0,
+            payload_offset: 0,
+            slot_count: felt.total_slot_count,
+            type_layout_hash: felt.type_layout_hash,
+            encoding_version: STATE_LAYOUT_ENCODING_VERSION,
+        };
+        primitive_witness.validate_field::<PoseidonHasher, PF>(&field)?;
+        let mut wrong_hash = field;
+        wrong_hash.type_layout_hash = QHashOut::from_values(9, 9, 9, 9);
+        assert!(
+            primitive_witness
+                .validate_field::<PoseidonHasher, PF>(&wrong_hash)
+                .unwrap_err()
+                .to_string()
+                .contains("canonical preimage")
+        );
+
+        let map_witness = StateTypeLayoutWitness::FixedMap {
+            map_kind: StateMapKind::Map,
+            key_type_hash: QHashOut::from_values(1, 2, 3, 4),
+            key_slot_count: 1,
+            value_type_hash: QHashOut::from_values(5, 6, 7, 8),
+            value_slot_count: 4,
+            capacity: 8,
+            alignment_slots: 4,
+        };
+        let map_summary = map_witness.summary::<PoseidonHasher, PF>()?;
+        assert_eq!(map_summary.total_slot_count, 32);
+        let mut map_field = StateFieldLayoutLeaf {
+            field_id: 2,
+            start_slot: 1,
+            payload_offset: 0,
+            slot_count: 32,
+            type_layout_hash: map_summary.type_layout_hash,
+            encoding_version: STATE_LAYOUT_ENCODING_VERSION,
+        };
+        // start_slot 1 with alignment 4 requires three padding slots first.
+        assert!(
+            map_witness
+                .validate_field::<PoseidonHasher, PF>(&map_field)
+                .unwrap_err()
+                .to_string()
+                .contains("payload offset is not canonical")
+        );
+        map_field.payload_offset = 3;
+        assert!(
+            map_witness
+                .validate_field::<PoseidonHasher, PF>(&map_field)
+                .unwrap_err()
+                .to_string()
+                .contains("owned slot count")
+        );
+        map_field.slot_count = 35;
+        map_witness.validate_field::<PoseidonHasher, PF>(&map_field)?;
+
+        let overflowing_witness = StateTypeLayoutWitness::FixedMap {
+            map_kind: StateMapKind::Map,
+            key_type_hash: QHashOut::from_values(1, 2, 3, 4),
+            key_slot_count: 1,
+            value_type_hash: QHashOut::from_values(5, 6, 7, 8),
+            value_slot_count: u64::MAX,
+            capacity: 1,
+            alignment_slots: 4,
+        };
+        let overflowing_field = StateFieldLayoutLeaf {
+            field_id: 3,
+            start_slot: 1,
+            payload_offset: 3,
+            slot_count: 100,
+            type_layout_hash: overflowing_witness
+                .summary::<PoseidonHasher, PF>()?
+                .type_layout_hash,
+            encoding_version: STATE_LAYOUT_ENCODING_VERSION,
+        };
+        assert!(
+            overflowing_witness
+                .validate_field::<PoseidonHasher, PF>(&overflowing_field)
+                .unwrap_err()
+                .to_string()
+                .contains("slot count overflow")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn type_layout_witness_and_dag_serde_round_trips() -> anyhow::Result<()> {
+        let key = primitive_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+            StatePrimitiveTypeTag::Hash,
+            4,
+        )?;
+        let value = primitive_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+            StatePrimitiveTypeTag::Felt,
+            1,
+        )?;
+        let witnesses = vec![
+            StateTypeLayoutWitness::<QHashOut<PF>>::Primitive {
+                type_tag: StatePrimitiveTypeTag::Felt,
+            },
+            StateTypeLayoutWitness::FixedArray {
+                element_type_hash: key.type_layout_hash,
+                element_slot_count: key.total_slot_count,
+                array_length: 3,
+            },
+            StateTypeLayoutWitness::Struct {
+                member_count: 1,
+                total_slot_count: 1,
+                members_root: QHashOut::from_values(1, 2, 3, 4),
+            },
+            StateTypeLayoutWitness::FixedMap {
+                map_kind: StateMapKind::ContractHashMap,
+                key_type_hash: key.type_layout_hash,
+                key_slot_count: 4,
+                value_type_hash: value.type_layout_hash,
+                value_slot_count: 1,
+                capacity: 8,
+                alignment_slots: 2,
+            },
+        ];
+        for witness in &witnesses {
+            let json = serde_json::to_string(witness)?;
+            assert_eq!(
+                serde_json::from_str::<StateTypeLayoutWitness<QHashOut<PF>>>(
+                    &json
+                )?,
+                *witness
+            );
+        }
+
+        let dag = CanonicalTypeLayoutDag {
+            nodes: vec![
+                CanonicalTypeLayoutNode::Primitive {
+                    type_tag: StatePrimitiveTypeTag::Hash,
+                },
+                CanonicalTypeLayoutNode::Primitive {
+                    type_tag: StatePrimitiveTypeTag::Felt,
+                },
+                CanonicalTypeLayoutNode::FixedMap {
+                    map_kind: StateMapKind::NamespacedMap,
+                    key: 0,
+                    value: 1,
+                    capacity: 8,
+                    alignment_slots: 2,
+                },
+            ],
+            root: 2,
+        };
+        let json = serde_json::to_string(&dag)?;
+        assert_eq!(
+            serde_json::from_str::<CanonicalTypeLayoutDag>(&json)?,
+            dag
+        );
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Canonical type-layout DAG shape validation
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn dag_shape_validation_rejects_each_structural_violation() {
+        let felt_node = |tag| CanonicalTypeLayoutNode::Primitive { type_tag: tag };
+        let array_node = |element: u16, length: u64| {
+            CanonicalTypeLayoutNode::FixedArray { element, length }
+        };
+        let map_node = |key: u16, value: u16, capacity: u64, alignment: u64| {
+            CanonicalTypeLayoutNode::FixedMap {
+                map_kind: StateMapKind::Map,
+                key,
+                value,
+                capacity,
+                alignment_slots: alignment,
+            }
+        };
+        let struct_node = |members: Vec<u16>, height: u8| {
+            CanonicalTypeLayoutNode::Struct {
+                members,
+                members_tree_height: height,
+            }
+        };
+        let make_dag = |nodes: Vec<CanonicalTypeLayoutNode>| {
+            CanonicalTypeLayoutDag {
+                root: (nodes.len() - 1) as u16,
+                nodes,
+            }
+        };
+        let expect_invalid = |dag: CanonicalTypeLayoutDag, expected: &str| {
+            let error = match dag.validate_shape() {
+                Ok(()) => panic!("expected invalid DAG containing {expected}, but validation succeeded"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains(expected), "unexpected error: {error}");
+        };
+
+        expect_invalid(
+            CanonicalTypeLayoutDag { nodes: vec![], root: 0 },
+            "DAG is empty",
+        );
+        expect_invalid(
+            make_dag(vec![
+                felt_node(StatePrimitiveTypeTag::Felt);
+                CANONICAL_TYPE_LAYOUT_MAX_NODES + 1
+            ]),
+            "maximum is",
+        );
+        expect_invalid(
+            CanonicalTypeLayoutDag {
+                nodes: vec![
+                    felt_node(StatePrimitiveTypeTag::Felt),
+                    felt_node(StatePrimitiveTypeTag::Felt),
+                ],
+                root: 0,
+            },
+            "final node",
+        );
+        expect_invalid(
+            CanonicalTypeLayoutDag {
+                nodes: vec![
+                    felt_node(StatePrimitiveTypeTag::Felt),
+                    array_node(1, 1),
+                ],
+                root: 1,
+            },
+            "non-topological",
+        );
+
+        // Fixed-array constraints.
+        expect_invalid(
+            make_dag(vec![
+                felt_node(StatePrimitiveTypeTag::Felt),
+                array_node(0, 0),
+            ]),
+            "fixed array length is zero",
+        );
+        expect_invalid(
+            make_dag(vec![
+                felt_node(StatePrimitiveTypeTag::Felt),
+                array_node(0, (1 << 32) + 1),
+            ]),
+            "array length exceeds",
+        );
+        expect_invalid(
+            make_dag(vec![
+                felt_node(StatePrimitiveTypeTag::Hash),
+                array_node(0, 1 << 32),
+                array_node(1, 2),
+            ]),
+            "array slot count exceeds",
+        );
+        expect_invalid(
+            make_dag(vec![
+                felt_node(StatePrimitiveTypeTag::Felt),
+                map_node(0, 0, 1, 1),
+                array_node(1, 1),
+            ]),
+            "cannot be nested in an array",
+        );
+
+        // Fixed-map constraints.
+        expect_invalid(
+            make_dag(vec![
+                felt_node(StatePrimitiveTypeTag::Felt),
+                felt_node(StatePrimitiveTypeTag::Felt),
+                map_node(0, 1, 0, 1),
+            ]),
+            "fixed map capacity is zero",
+        );
+        expect_invalid(
+            make_dag(vec![
+                felt_node(StatePrimitiveTypeTag::Felt),
+                felt_node(StatePrimitiveTypeTag::Felt),
+                map_node(0, 1, 1 << 31, 1),
+            ]),
+            "map capacity exceeds",
+        );
+        for alignment in [0u64, 3, (1 << 16) + 1] {
+            expect_invalid(
+                make_dag(vec![
+                    felt_node(StatePrimitiveTypeTag::Felt),
+                    felt_node(StatePrimitiveTypeTag::Felt),
+                    map_node(0, 1, 1, alignment),
+                ]),
+                "power of two",
+            );
+        }
+        // The maximum alignment of 65536 is still canonical.
+        make_dag(vec![
+            felt_node(StatePrimitiveTypeTag::Felt),
+            felt_node(StatePrimitiveTypeTag::Felt),
+            map_node(0, 1, 1, 1 << 16),
+        ])
+        .validate_shape()
+        .unwrap();
+        expect_invalid(
+            make_dag(vec![
+                felt_node(StatePrimitiveTypeTag::Felt),
+                felt_node(StatePrimitiveTypeTag::Felt),
+                map_node(0, 1, 1, 1),
+                map_node(0, 2, 1, 1),
+            ]),
+            "cannot contain another fixed map",
+        );
+        expect_invalid(
+            make_dag(vec![
+                felt_node(StatePrimitiveTypeTag::Hash),
+                felt_node(StatePrimitiveTypeTag::Felt),
+                array_node(0, 1 << 32),
+                map_node(1, 2, 2, 1),
+            ]),
+            "map slot count exceeds",
+        );
+
+        // Struct constraints.
+        expect_invalid(
+            make_dag(vec![struct_node(vec![], 1)]),
+            "empty structs",
+        );
+        expect_invalid(
+            make_dag(vec![
+                felt_node(StatePrimitiveTypeTag::Felt),
+                struct_node(
+                    vec![0; CANONICAL_TYPE_LAYOUT_MAX_STRUCT_MEMBERS + 1],
+                    CANONICAL_TYPE_LAYOUT_STRUCT_TREE_HEIGHT as u8,
+                ),
+            ]),
+            "maximum is",
+        );
+        expect_invalid(
+            make_dag(vec![
+                felt_node(StatePrimitiveTypeTag::Felt),
+                struct_node(vec![0, 0, 0], 1),
+            ]),
+            "members-tree capacity",
+        );
+        expect_invalid(
+            make_dag(vec![
+                felt_node(StatePrimitiveTypeTag::Felt),
+                map_node(0, 0, 1, 1),
+                struct_node(vec![0, 1], 1),
+            ]),
+            "nested in a struct",
+        );
+        expect_invalid(
+            make_dag(vec![
+                felt_node(StatePrimitiveTypeTag::Felt),
+                struct_node(vec![0], 255),
+            ]),
+            "exceeds usize capacity",
+        );
+
+        // 32 Hash members nested through seven structs overflow the slot
+        // range: 4 * 32^7 = 2^37 slots.
+        let mut nodes = vec![felt_node(StatePrimitiveTypeTag::Hash)];
+        for _ in 0..7 {
+            let previous = (nodes.len() - 1) as u16;
+            nodes.push(struct_node(
+                vec![previous; CANONICAL_TYPE_LAYOUT_MAX_STRUCT_MEMBERS],
+                CANONICAL_TYPE_LAYOUT_STRUCT_TREE_HEIGHT as u8,
+            ));
+        }
+        expect_invalid(
+            CanonicalTypeLayoutDag { nodes, root: 7 },
+            "struct slot count exceeds",
+        );
+    }
+
+    #[test]
+    fn dag_evaluate_matches_native_fixed_map_layout() -> anyhow::Result<()> {
+        let key = primitive_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+            StatePrimitiveTypeTag::Hash,
+            4,
+        )?;
+        let value = primitive_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+            StatePrimitiveTypeTag::Felt,
+            1,
+        )?;
+        let expected =
+            fixed_map_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+                StateMapKind::NamespacedMap,
+                key,
+                value,
+                8,
+                2,
+            )?;
+        let dag = CanonicalTypeLayoutDag {
+            nodes: vec![
+                CanonicalTypeLayoutNode::Primitive {
+                    type_tag: StatePrimitiveTypeTag::Hash,
+                },
+                CanonicalTypeLayoutNode::Primitive {
+                    type_tag: StatePrimitiveTypeTag::Felt,
+                },
+                CanonicalTypeLayoutNode::FixedMap {
+                    map_kind: StateMapKind::NamespacedMap,
+                    key: 0,
+                    value: 1,
+                    capacity: 8,
+                    alignment_slots: 2,
+                },
+            ],
+            root: 2,
+        };
+        assert_eq!(
+            dag.evaluate::<PoseidonHasher, PF, QHashOut<PF>>()?,
+            expected
+        );
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Public transition shapes and contract-level checks
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn public_layout_transition_rejects_field_count_overflow() {
+        let mut inputs = LayoutAppendPublicInputs {
+            contract_id: 1,
+            layout_version: STATE_LAYOUT_VERSION,
+            old_layout_root: QHashOut::<PF>::from_values(1, 1, 1, 1),
+            old_layout_field_count: u64::MAX,
+            old_layout_slot_count: 0,
+            new_layout_root: QHashOut::<PF>::from_values(2, 2, 2, 2),
+            new_layout_field_count: u64::MAX,
+            new_layout_slot_count: 0,
+            appended_field_count: 1,
+            appended_fields_commitment: QHashOut::<PF>::from_values(3, 3, 3, 3),
+        };
+        assert!(
+            inputs
+                .validate_shape()
+                .unwrap_err()
+                .to_string()
+                .contains("overflow")
+        );
+        inputs.appended_field_count = 0;
+        inputs.new_layout_root = inputs.old_layout_root;
+        inputs.validate_shape().unwrap();
+    }
+
+    #[test]
+    fn contract_transition_skips_capacity_check_for_huge_tree_heights()
+    -> anyhow::Result<()> {
+        let old_leaf = PQEDContractLeafV2::<PF, QHashOut<PF>> {
+            deployer: QHashOut::from_values(1, 2, 3, 4),
+            function_tree_root: QHashOut::from_values(5, 6, 7, 8),
+            code_root: QHashOut::from_values(9, 10, 11, 12),
+            state_tree_height: PF::from_u64_value(u64::from(u64::BITS)),
+            state_layout_root: QHashOut::from_values(13, 14, 15, 16),
+            state_layout_field_count: PF::from_u64_value(1),
+            state_layout_slot_count: PF::from_u64_value(1 << 63),
+        };
+        let new_leaf = PQEDContractLeafV2::<PF, QHashOut<PF>> {
+            deployer: old_leaf.deployer,
+            function_tree_root: QHashOut::from_values(25, 26, 27, 28),
+            code_root: QHashOut::from_values(29, 30, 31, 32),
+            state_tree_height: old_leaf.state_tree_height,
+            state_layout_root: QHashOut::from_values(33, 34, 35, 36),
+            state_layout_field_count: PF::from_u64_value(2),
+            state_layout_slot_count: PF::from_u64_value(1 << 63),
+        };
+        let transition = LayoutAppendPublicInputs {
+            contract_id: 5,
+            layout_version: STATE_LAYOUT_VERSION,
+            old_layout_root: old_leaf.state_layout_root,
+            old_layout_field_count: 1,
+            old_layout_slot_count: 1 << 63,
+            new_layout_root: new_leaf.state_layout_root,
+            new_layout_field_count: 2,
+            new_layout_slot_count: 1 << 63,
+            appended_field_count: 1,
+            appended_fields_commitment: QHashOut::from_values(41, 42, 43, 44),
+        };
+        // A tree height of at least 64 makes the felt capacity unrepresentable,
+        // so only endpoint matching is enforced.
+        validate_contract_layout_transition(5, &old_leaf, &new_leaf, &transition)
+    }
+
+    #[test]
+    fn contract_state_layout_rejects_offset_capacity_and_slot_errors()
+    -> anyhow::Result<()> {
+        let felt = primitive_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+            StatePrimitiveTypeTag::Felt,
+            1,
+        )?;
+        assert!(
+            contract_state_layout_with_payload_offsets::<
+                PoseidonHasher,
+                PF,
+                QHashOut<PF>,
+            >(&[felt], &[], 2, 4)
+            .unwrap_err()
+            .to_string()
+            .contains("length mismatch")
+        );
+        // Three field leaves cannot fit a two-leaf layout tree.
+        assert!(
+            contract_state_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+                &[felt, felt, felt],
+                1,
+                5
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("exceed tree capacity")
+        );
+        let huge = StateTypeLayoutSummary {
+            type_layout_hash: felt.type_layout_hash,
+            total_slot_count: u64::MAX,
+        };
+        assert!(
+            contract_state_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+                &[huge, huge],
+                1,
+                5
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("slot count overflow")
+        );
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Layout append batch witness endpoint checks
+    // ------------------------------------------------------------------
+
+    fn build_layout_append_batch_witness()
+    -> anyhow::Result<LayoutAppendBatchWitness<QHashOut<PF>>> {
+        let tree_height = 5;
+        let web_tree_height = 2;
+        let u64_layout =
+            primitive_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+                StatePrimitiveTypeTag::U64,
+                1,
+            )?;
+        let old_layout =
+            contract_state_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+                &[u64_layout, u64_layout],
+                tree_height,
+                tree_height,
+            )?;
+        let new_layout =
+            contract_state_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+                &[u64_layout, u64_layout, u64_layout],
+                tree_height,
+                tree_height,
+            )?;
+        let mut tree =
+            SimpleMerkleTree::<PoseidonHasher, QHashOut<PF>>::new(
+                tree_height as u8
+            );
+        for (index, field) in old_layout.fields.iter().enumerate() {
+            tree.set_leaf(
+                index as u64,
+                field.hash::<PoseidonHasher, PF>()?,
+            );
+        }
+        let appended_fields = new_layout.fields[2..].to_vec();
+        let proof = tree
+            .append_leaves_spider_man(
+                web_tree_height,
+                &[appended_fields[0].hash::<PoseidonHasher, PF>()?],
+            )?
+            .remove(0);
+        let mut committed_hashes =
+            vec![QHashOut::ZERO; proof.web_proof_new_leaves.len()];
+        committed_hashes[2] =
+            appended_fields[0].hash::<PoseidonHasher, PF>()?;
+        let commitment =
+            compute_layout_batch_commitment::<PoseidonHasher, PF, _>(
+                19,
+                old_layout.state_layout_field_count,
+                old_layout.state_layout_slot_count,
+                appended_fields.len(),
+                &committed_hashes,
+            )?;
+        Ok(LayoutAppendBatchWitness {
+            public_inputs: LayoutAppendPublicInputs {
+                contract_id: 19,
+                layout_version: STATE_LAYOUT_VERSION,
+                old_layout_root: old_layout.state_layout_root,
+                old_layout_field_count: 2,
+                old_layout_slot_count: 2,
+                new_layout_root: new_layout.state_layout_root,
+                new_layout_field_count: 3,
+                new_layout_slot_count: 3,
+                appended_field_count: 1,
+                appended_fields_commitment: commitment,
+            },
+            spiderman_update_proof: proof,
+            appended_fields,
+            appended_type_layouts: vec![StateTypeLayoutWitness::Primitive {
+                type_tag: StatePrimitiveTypeTag::U64,
+            }],
+            canonical_type_proofs: vec![vec![1]],
+        })
+    }
+
+    #[test]
+    fn batch_witness_rejects_root_and_slot_count_mismatches()
+    -> anyhow::Result<()> {
+        let witness = build_layout_append_batch_witness()?;
+        witness.validate::<PoseidonHasher, PF>()?;
+
+        let mut wrong_old_root = witness.clone();
+        wrong_old_root.public_inputs.old_layout_root =
+            QHashOut::from_values(7, 7, 7, 7);
+        assert!(
+            wrong_old_root
+                .validate::<PoseidonHasher, PF>()
+                .unwrap_err()
+                .to_string()
+                .contains("layout roots do not match")
+        );
+
+        let mut wrong_slot_count = witness;
+        wrong_slot_count.public_inputs.new_layout_slot_count = 4;
+        assert!(
+            wrong_slot_count
+                .validate::<PoseidonHasher, PF>()
+                .unwrap_err()
+                .to_string()
+                .contains("new layout slot count")
+        );
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Layouts derived from the existing contract ABI
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn abi_layout_resolves_lowercase_primitives_and_reuses_cached_structs()
+    -> anyhow::Result<()> {
+        let abi: QContractABI = serde_json::from_str(
+            r#"{
+                "version": "1.0.0",
+                "structs": [
+                    {
+                        "name": "Point",
+                        "is_contract": false,
+                        "fields": [
+                            {"name": "x", "type": "u32"},
+                            {"name": "y", "type": "bool"}
+                        ]
+                    },
+                    {
+                        "name": "Wallet",
+                        "is_contract": true,
+                        "fields": [
+                            {"name": "a", "type": "Point"},
+                            {"name": "b", "type": "Point"},
+                            {"name": "flag", "type": "bool"},
+                            {"name": "count", "type": "u32"}
+                        ]
+                    }
+                ]
+            }"#,
+        )?;
+        let result =
+            contract_state_layout_from_abi::<PoseidonHasher, PF, QHashOut<PF>>(
+                &abi, 3, 2, 5,
+            )?;
+        assert_eq!(result.contract_layout.state_layout_field_count, 4);
+        assert_eq!(result.contract_layout.state_layout_slot_count, 6);
+        assert_eq!(result.contract_layout.fields[0].start_slot, 0);
+        assert_eq!(result.contract_layout.fields[1].start_slot, 2);
+        assert_eq!(result.contract_layout.fields[2].start_slot, 4);
+        assert_eq!(result.contract_layout.fields[3].start_slot, 5);
+        // The second reference to Point is served from the layout cache and
+        // produces the same canonical witness as the first.
+        assert_eq!(result.field_type_layouts[0], result.field_type_layouts[1]);
+        assert!(matches!(
+            result.field_type_layouts[2],
+            StateTypeLayoutWitness::Primitive {
+                type_tag: StatePrimitiveTypeTag::Bool
+            }
+        ));
+        assert!(matches!(
+            result.field_type_layouts[3],
+            StateTypeLayoutWitness::Primitive {
+                type_tag: StatePrimitiveTypeTag::U32
+            }
+        ));
+        assert!(result.struct_layouts.contains_key("Point"));
+        assert!(result.struct_layouts.contains_key("Wallet"));
+        assert_eq!(result.struct_layouts.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn abi_layout_rejects_missing_struct_and_missing_contract()
+    -> anyhow::Result<()> {
+        let missing_field: QContractABI = serde_json::from_str(
+            r#"{
+                "version": "1.0.0",
+                "structs": [
+                    {
+                        "name": "Example",
+                        "is_contract": true,
+                        "fields": [{"name": "ghost", "type": "Missing"}]
+                    }
+                ]
+            }"#,
+        )?;
+        assert!(
+            contract_state_layout_from_abi::<PoseidonHasher, PF, QHashOut<PF>>(
+                &missing_field, 1, 1, 4
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("ABI struct 'Missing' not found")
+        );
+        let no_contract: QContractABI = serde_json::from_str(
+            r#"{
+                "version": "1.0.0",
+                "structs": [
+                    {"name": "Plain", "is_contract": false, "fields": []}
+                ]
+            }"#,
+        )?;
+        assert!(
+            contract_state_layout_from_abi::<PoseidonHasher, PF, QHashOut<PF>>(
+                &no_contract, 1, 1, 4
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Layouts derived from the compiler ABI manifest
+    // ------------------------------------------------------------------
+
+    fn base_compiler_abi_json() -> String {
+        r#"{
+            "contract": {
+                "state_tree_height": 4,
+                "state_layout": {
+                    "layout_version": 1,
+                    "encoding_version": 1,
+                    "field_count": 3,
+                    "slot_count": 7,
+                    "fields": [
+                        {
+                            "field_id": 1,
+                            "type": {"kind": "primitive", "name": "Felt"},
+                            "start_slot": 0,
+                            "slot_count": 1
+                        },
+                        {
+                            "field_id": 2,
+                            "type": {"kind": "struct", "name": "Account"},
+                            "start_slot": 1,
+                            "slot_count": 2
+                        },
+                        {
+                            "field_id": 3,
+                            "type": {
+                                "kind": "array",
+                                "item": {"kind": "primitive", "name": "Bool"},
+                                "length": 4,
+                                "item_felt_size": 1
+                            },
+                            "start_slot": 3,
+                            "slot_count": 4
+                        }
+                    ]
+                }
+            },
+            "types": [
+                {
+                    "name": "Account",
+                    "fields": [
+                        {
+                            "type": {"kind": "primitive", "name": "Felt"},
+                            "offset_within_parent": 0,
+                            "felt_size": 1
+                        },
+                        {
+                            "type": {"kind": "primitive", "name": "U32"},
+                            "offset_within_parent": 1,
+                            "felt_size": 1
+                        }
+                    ]
+                }
+            ]
+        }"#
+        .to_string()
+    }
+
+    fn base_map_compiler_abi_json() -> String {
+        r#"{
+            "contract": {
+                "state_tree_height": 6,
+                "state_layout": {
+                    "layout_version": 1,
+                    "encoding_version": 1,
+                    "field_count": 1,
+                    "slot_count": 8,
+                    "fields": [
+                        {
+                            "field_id": 1,
+                            "type": {
+                                "kind": "map",
+                                "map_kind": "map",
+                                "key": {"kind": "primitive", "name": "Hash"},
+                                "value": {"kind": "primitive", "name": "Hash"},
+                                "capacity": 2,
+                                "value_felt_size": 4,
+                                "alignment_felts": 1
+                            },
+                            "start_slot": 0,
+                            "payload_offset": 0,
+                            "slot_count": 8
+                        }
+                    ]
+                }
+            },
+            "types": []
+        }"#
+        .to_string()
+    }
+
+    #[test]
+    fn compiler_manifest_rejects_each_malformed_variant() -> anyhow::Result<()> {
+        let derive = |json: String| {
+            contract_state_layout_from_compiler_abi_json::<
+                PoseidonHasher,
+                PF,
+                QHashOut<PF>,
+            >(&json, 3, 2)
+        };
+        let expect_invalid = |json: String, expected: &str| {
+            let error = derive(json).unwrap_err().to_string();
+            assert!(error.contains(expected), "unexpected error: {error}");
+        };
+
+        assert!(derive("{ not json".to_string()).is_err());
+        expect_invalid(
+            base_compiler_abi_json().replace(
+                "\"layout_version\": 1",
+                "\"layout_version\": 2",
+            ),
+            "unsupported compiler state layout version",
+        );
+        expect_invalid(
+            base_compiler_abi_json().replace(
+                "\"encoding_version\": 1",
+                "\"encoding_version\": 2",
+            ),
+            "unsupported compiler state layout encoding",
+        );
+        expect_invalid(
+            base_compiler_abi_json()
+                .replace("\"field_count\": 3", "\"field_count\": 4"),
+            "field count mismatch",
+        );
+        expect_invalid(
+            base_compiler_abi_json()
+                .replace("\"slot_count\": 7", "\"slot_count\": 8"),
+            "total slot count mismatch",
+        );
+        expect_invalid(
+            base_compiler_abi_json()
+                .replace("\"field_id\": 2", "\"field_id\": 5"),
+            "field ids are not contiguous",
+        );
+        expect_invalid(
+            base_compiler_abi_json()
+                .replace("\"start_slot\": 1", "\"start_slot\": 2"),
+            "slot ranges are not contiguous",
+        );
+        expect_invalid(
+            base_compiler_abi_json().replace(
+                "\"offset_within_parent\": 1",
+                "\"offset_within_parent\": 3",
+            ),
+            "non-contiguous member offset",
+        );
+        expect_invalid(
+            base_compiler_abi_json()
+                .replace("\"felt_size\": 1", "\"felt_size\": 2"),
+            "member size does not match",
+        );
+        expect_invalid(
+            base_compiler_abi_json().replace(
+                "\"item_felt_size\": 1",
+                "\"item_felt_size\": 2",
+            ),
+            "array item size does not match",
+        );
+        expect_invalid(
+            base_compiler_abi_json().replace(
+                "\"types\": [",
+                "\"types\": [{\"name\": \"Account\", \"fields\": []},",
+            ),
+            "duplicate struct type names",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compiler_map_manifest_happy_path_and_rejections() -> anyhow::Result<()> {
+        let derive = |json: String| {
+            contract_state_layout_from_compiler_abi_json::<
+                PoseidonHasher,
+                PF,
+                QHashOut<PF>,
+            >(&json, 1, 1)
+        };
+        let result = derive(base_map_compiler_abi_json())?;
+        assert_eq!(result.contract_layout.state_layout_field_count, 1);
+        assert_eq!(result.contract_layout.state_layout_slot_count, 8);
+        assert!(matches!(
+            result.field_type_layouts[0],
+            StateTypeLayoutWitness::FixedMap {
+                map_kind: StateMapKind::Map,
+                capacity: 2,
+                alignment_slots: 1,
+                ..
+            }
+        ));
+
+        let expect_invalid = |json: String, expected: &str| {
+            let error = derive(json).unwrap_err().to_string();
+            assert!(error.contains(expected), "unexpected error: {error}");
+        };
+        expect_invalid(
+            base_map_compiler_abi_json().replace(
+                "\"value_felt_size\": 4",
+                "\"value_felt_size\": 5",
+            ),
+            "map value size does not match",
+        );
+        expect_invalid(
+            base_map_compiler_abi_json().replace(
+                "\"alignment_felts\": 1",
+                "\"alignment_felts\": 3",
+            ),
+            "alignment is invalid",
+        );
+        expect_invalid(
+            base_map_compiler_abi_json()
+                .replace("\"alignment_felts\": 1", "\"alignment_felts\": 4")
+                .replace("\"payload_offset\": 0", "\"payload_offset\": 1"),
+            "incorrect alignment padding",
+        );
+        // The map-containment scan short-circuits on a top-level map, so a
+        // dangling struct reference inside the value only surfaces in the
+        // layout builder.
+        expect_invalid(
+            base_map_compiler_abi_json().replace(
+                "\"value\": {\"kind\": \"primitive\", \"name\": \"Hash\"}",
+                "\"value\": {\"kind\": \"struct\", \"name\": \"Missing\"}",
+            ),
+            "compiler ABI struct 'Missing' not found",
+        );
+        let recursive_map_value = base_map_compiler_abi_json()
+            .replace(
+                "\"value\": {\"kind\": \"primitive\", \"name\": \"Hash\"}",
+                "\"value\": {\"kind\": \"struct\", \"name\": \"Loop\"}",
+            )
+            .replace(
+                "\"types\": []",
+                "\"types\": [{\"name\": \"Loop\", \"fields\": [{\"type\": {\"kind\": \"struct\", \"name\": \"Loop\"}, \"offset_within_parent\": 0, \"felt_size\": 1}]}]",
+            );
+        expect_invalid(
+            recursive_map_value,
+            "recursive compiler ABI struct",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compiler_manifest_forbids_maps_below_top_level_fields() -> anyhow::Result<()> {
+        let array_of_maps = r#"{
+            "contract": {
+                "state_tree_height": 4,
+                "state_layout": {
+                    "layout_version": 1,
+                    "encoding_version": 1,
+                    "field_count": 1,
+                    "slot_count": 8,
+                    "fields": [
+                        {
+                            "field_id": 1,
+                            "type": {
+                                "kind": "array",
+                                "item": {
+                                    "kind": "map",
+                                    "map_kind": "map",
+                                    "key": {"kind": "primitive", "name": "Felt"},
+                                    "value": {"kind": "primitive", "name": "Felt"},
+                                    "capacity": 4,
+                                    "value_felt_size": 1,
+                                    "alignment_felts": 1
+                                },
+                                "length": 2,
+                                "item_felt_size": 4
+                            },
+                            "start_slot": 0,
+                            "slot_count": 8
+                        }
+                    ]
+                }
+            },
+            "types": []
+        }"#;
+        assert!(
+            contract_state_layout_from_compiler_abi_json::<
+                PoseidonHasher,
+                PF,
+                QHashOut<PF>,
+            >(array_of_maps, 1, 1)
+            .unwrap_err()
+            .to_string()
+            .contains("aligned Map below a top-level field")
+        );
+
+        let struct_with_map = r#"{
+            "contract": {
+                "state_tree_height": 4,
+                "state_layout": {
+                    "layout_version": 1,
+                    "encoding_version": 1,
+                    "field_count": 1,
+                    "slot_count": 4,
+                    "fields": [
+                        {
+                            "field_id": 1,
+                            "type": {"kind": "struct", "name": "WithMap"},
+                            "start_slot": 0,
+                            "slot_count": 4
+                        }
+                    ]
+                }
+            },
+            "types": [
+                {
+                    "name": "WithMap",
+                    "fields": [
+                        {
+                            "type": {
+                                "kind": "map",
+                                "map_kind": "namespaced_map",
+                                "key": {"kind": "primitive", "name": "Felt"},
+                                "value": {"kind": "primitive", "name": "Felt"},
+                                "capacity": 4,
+                                "value_felt_size": 1,
+                                "alignment_felts": 1
+                            },
+                            "offset_within_parent": 0,
+                            "felt_size": 4
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        assert!(
+            contract_state_layout_from_compiler_abi_json::<
+                PoseidonHasher,
+                PF,
+                QHashOut<PF>,
+            >(struct_with_map, 1, 1)
+            .unwrap_err()
+            .to_string()
+            .contains("aligned Map below a top-level field")
+        );
+
+        // The containment scan also resolves every referenced struct.
+        let dangling_struct = base_compiler_abi_json().replace(
+            "\"type\": {\"kind\": \"struct\", \"name\": \"Account\"}",
+            "\"type\": {\"kind\": \"struct\", \"name\": \"Ghost\"}",
+        );
+        assert!(
+            contract_state_layout_from_compiler_abi_json::<
+                PoseidonHasher,
+                PF,
+                QHashOut<PF>,
+            >(&dangling_struct, 3, 2)
+            .unwrap_err()
+            .to_string()
+            .contains("compiler ABI struct 'Ghost' not found")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compiler_dags_cover_maps_and_reject_duplicates_and_recursion()
+    -> anyhow::Result<()> {
+        let dags = canonical_type_layout_dags_from_compiler_abi_json(
+            &base_map_compiler_abi_json(),
+            2,
+        )?;
+        assert_eq!(dags.len(), 1);
+        let key = primitive_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+            StatePrimitiveTypeTag::Hash,
+            4,
+        )?;
+        let expected =
+            fixed_map_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(
+                StateMapKind::Map,
+                key,
+                key,
+                2,
+                1,
+            )?;
+        assert_eq!(
+            dags[0].evaluate::<PoseidonHasher, PF, QHashOut<PF>>()?,
+            expected
+        );
+
+        let duplicate = base_compiler_abi_json().replace(
+            "\"types\": [",
+            "\"types\": [{\"name\": \"Account\", \"fields\": []},",
+        );
+        assert!(
+            canonical_type_layout_dags_from_compiler_abi_json(&duplicate, 2)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate struct type names")
+        );
+
+        let recursive = r#"{
+            "contract": {
+                "state_tree_height": 4,
+                "state_layout": {
+                    "layout_version": 1,
+                    "encoding_version": 1,
+                    "field_count": 1,
+                    "slot_count": 1,
+                    "fields": [
+                        {
+                            "field_id": 1,
+                            "type": {"kind": "struct", "name": "Loop"},
+                            "start_slot": 0,
+                            "slot_count": 1
+                        }
+                    ]
+                }
+            },
+            "types": [
+                {
+                    "name": "Loop",
+                    "fields": [
+                        {
+                            "type": {"kind": "struct", "name": "Loop"},
+                            "offset_within_parent": 0,
+                            "felt_size": 1
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        assert!(
+            canonical_type_layout_dags_from_compiler_abi_json(recursive, 2)
+                .unwrap_err()
+                .to_string()
+                .contains("recursive compiler ABI struct")
+        );
+
+        let dangling = base_compiler_abi_json().replace(
+            "\"type\": {\"kind\": \"struct\", \"name\": \"Account\"}",
+            "\"type\": {\"kind\": \"struct\", \"name\": \"Ghost\"}",
+        );
+        assert!(
+            canonical_type_layout_dags_from_compiler_abi_json(&dangling, 2)
+                .unwrap_err()
+                .to_string()
+                .contains("compiler ABI struct 'Ghost' not found")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compiler_layout_update_accepts_only_append_only_transitions()
+    -> anyhow::Result<()> {
+        let old_json = r#"{
+            "contract": {
+                "state_tree_height": 4,
+                "state_layout": {
+                    "layout_version": 1,
+                    "encoding_version": 1,
+                    "field_count": 2,
+                    "slot_count": 2,
+                    "fields": [
+                        {"field_id": 1, "type": {"kind": "primitive", "name": "Felt"}, "start_slot": 0, "slot_count": 1},
+                        {"field_id": 2, "type": {"kind": "primitive", "name": "Felt"}, "start_slot": 1, "slot_count": 1}
+                    ]
+                }
+            },
+            "types": []
+        }"#;
+        let new_json = r#"{
+            "contract": {
+                "state_tree_height": 4,
+                "state_layout": {
+                    "layout_version": 1,
+                    "encoding_version": 1,
+                    "field_count": 3,
+                    "slot_count": 6,
+                    "fields": [
+                        {"field_id": 1, "type": {"kind": "primitive", "name": "Felt"}, "start_slot": 0, "slot_count": 1},
+                        {"field_id": 2, "type": {"kind": "primitive", "name": "Felt"}, "start_slot": 1, "slot_count": 1},
+                        {"field_id": 3, "type": {"kind": "primitive", "name": "Hash"}, "start_slot": 2, "slot_count": 4}
+                    ]
+                }
+            },
+            "types": []
+        }"#;
+        let update = |old_json: &str, new_json: &str| {
+            contract_state_layout_update_from_compiler_abi_json::<
+                PoseidonHasher,
+                PF,
+                QHashOut<PF>,
+            >(old_json, new_json, 2, 1)
+        };
+        let (old_layout, new_layout) = update(old_json, new_json)?;
+        assert_eq!(old_layout.contract_layout.state_layout_field_count, 2);
+        assert_eq!(new_layout.contract_layout.state_layout_slot_count, 6);
+        assert_eq!(
+            new_layout.contract_layout.fields
+                [..old_layout.contract_layout.fields.len()],
+            old_layout.contract_layout.fields[..]
+        );
+
+        let taller = new_json.replace(
+            "\"state_tree_height\": 4",
+            "\"state_tree_height\": 5",
+        );
+        assert!(
+            update(old_json, &taller)
+                .unwrap_err()
+                .to_string()
+                .contains("tree height cannot change")
+        );
+        assert!(
+            update(new_json, old_json)
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be removed")
+        );
+        let modified = new_json.replacen(
+            "{\"field_id\": 2, \"type\": {\"kind\": \"primitive\", \"name\": \"Felt\"}",
+            "{\"field_id\": 2, \"type\": {\"kind\": \"primitive\", \"name\": \"Bool\"}",
+            1,
+        );
+        assert!(
+            update(old_json, &modified)
+                .unwrap_err()
+                .to_string()
+                .contains("modified or reordered")
+        );
         Ok(())
     }
 }

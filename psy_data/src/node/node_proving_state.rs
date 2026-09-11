@@ -191,3 +191,70 @@ psy_serialize::impl_psy_canonical_serialize_for_speedy!(PsyNodeProvingState);
 impl psy_serialize::AutoImplementFallbackPsySerializeCanonical for PsyNodeProvingState {}
 
 pser::impl_psy_ser_basic_tests_fallback!(PsyNodeProvingState, {}, psy_node_proving_state_tests);
+
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+
+    #[test]
+    fn realm_state_tracks_levels_and_completion() {
+        let mut state = PsyNodeProvingState::new_standard_realm(1, 2, 3, 4, 5, 6);
+        assert_eq!(state.node_type, PROVING_NODE_TYPE_REALM);
+        assert_eq!(state.has_remaining_proving_jobs, 1);
+        state.inc_current_proving_level();
+        assert_eq!(state.current_proving_level, 1);
+        state.set_current_proving_level(255);
+        state.inc_current_proving_level();
+        assert_eq!(state.current_proving_level, 0);
+        state.finish();
+        assert_eq!(state.has_remaining_proving_jobs, 0);
+        assert_eq!(PsyNodeProvingState::new_standard_realm(1, 2, 3, 4, 0, 0).has_remaining_proving_jobs, 0);
+    }
+
+    #[test]
+    fn coordinator_remaining_flag_considers_each_work_category() {
+        let make = |guta, users, contracts| {
+            PsyNodeProvingState::new_standard_coordinator(1, 2, 3, 4, 5, guta, users, 7, contracts, 8)
+        };
+        assert_eq!(make(0, 0, 0).has_remaining_proving_jobs, 0);
+        assert_eq!(make(1, 0, 0).has_remaining_proving_jobs, 1);
+        assert_eq!(make(0, 1, 0).has_remaining_proving_jobs, 1);
+        assert_eq!(make(0, 0, 1).has_remaining_proving_jobs, 1);
+        assert_eq!(make(0, 0, 1).node_type, PROVING_NODE_TYPE_COORDINATOR);
+    }
+
+    #[test]
+    fn standard_realm_initializes_with_documented_defaults() {
+        let state = PsyNodeProvingState::new_standard_realm(9, 8, 7, 6, 5, 4);
+        assert_eq!(state.realm_id, 9);
+        assert_eq!(state.realm_sub_id, 8);
+        assert_eq!(state.unique_pending_id, 7);
+        assert_eq!(state.last_committed_checkpoint_id, 6);
+        assert_eq!(state.guta_input_proofs, 5);
+        assert_eq!(state.total_guta_jobs, 4);
+        assert_eq!(state.node_type, PROVING_NODE_TYPE_REALM);
+        assert_eq!(state.plan_variant, PLAN_VARIANT_REALM_STANDARD);
+        assert_eq!(state.current_proving_level, 0);
+        assert_eq!(state.new_user_registrations, 0);
+        assert_eq!(state.total_user_registration_jobs, 0);
+        assert_eq!(state.new_contracts_deployed, 0);
+        assert_eq!(state.total_deploy_contract_jobs, 0);
+    }
+
+    #[test]
+    fn standard_coordinator_records_counters_verbatim() {
+        let state = PsyNodeProvingState::new_standard_coordinator(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+        assert_eq!(state.realm_id, 1);
+        assert_eq!(state.realm_sub_id, 2);
+        assert_eq!(state.unique_pending_id, 3);
+        assert_eq!(state.last_committed_checkpoint_id, 4);
+        assert_eq!(state.guta_input_proofs, 5);
+        assert_eq!(state.total_guta_jobs, 6);
+        assert_eq!(state.new_user_registrations, 7);
+        assert_eq!(state.total_user_registration_jobs, 8);
+        assert_eq!(state.new_contracts_deployed, 9);
+        assert_eq!(state.total_deploy_contract_jobs, 10);
+        assert_eq!(state.plan_variant, PLAN_VARIANT_COORDINATOR_STANDARD);
+        assert_eq!(state.current_proving_level, 0);
+    }
+}

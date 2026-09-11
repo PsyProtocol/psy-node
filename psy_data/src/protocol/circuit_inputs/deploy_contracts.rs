@@ -324,3 +324,337 @@ impl<F: QFelt64, Hash: Q256BitHash>
     for QCBatchDeployContractsCircuitInput<F, Hash>
 {
 }
+
+#[cfg(test)]
+mod tests {
+    use parth_core::{
+        crypto::hash::{
+            merkle_proof::DeltaMerkleProofCore, spiderman::SpidermanUpdateProof,
+            traits::{FromU64x4, MerkleLeafHasher, QFieldHashable},
+        },
+        felt::FromPrimitiveValuesFelt,
+        pgoldilocks::{PoseidonHasher, QHashOut},
+        utils::QPGenRandom,
+        PF,
+    };
+    use psy_core::constants::protocol::{
+        STATE_LAYOUT_MAX_BATCH_ITEMS, STATE_LAYOUT_MAX_PROOF_BYTES,
+    };
+    use psy_serialize::FallbackPsySerializeCanonical;
+
+    use super::*;
+
+    type Hash = QHashOut<PF>;
+
+    fn valid_input() -> QCBatchDeployContractsCircuitInput<PF, Hash> {
+        QCBatchDeployContractsCircuitInput {
+            deploy_contract_circuit_whitelist: Hash::default(),
+            spiderman_append_proof: SpidermanUpdateProof::qp_rand_gen(),
+            contract_ids: vec![1],
+            contract_leaves: vec![PQEDContractLeafV2::default()],
+            initial_layout_proofs: vec![vec![1]],
+        }
+    }
+
+    #[test]
+    fn validates_deploy_batch_shape_and_rejects_each_invalid_form() {
+        let valid = valid_input();
+        assert!(valid.validate_shape().is_ok());
+
+        let mut mismatched = valid.clone();
+        mismatched.initial_layout_proofs.clear();
+        assert!(mismatched.validate_shape().unwrap_err().to_string().contains("equal length"));
+
+        let mut too_many = valid.clone();
+        too_many.contract_ids = vec![1, 2, 3];
+        too_many.contract_leaves = vec![PQEDContractLeafV2::default(); 3];
+        too_many.initial_layout_proofs = vec![vec![1]; 3];
+        assert!(too_many.validate_shape().unwrap_err().to_string().contains("capacity"));
+
+        let mut empty_proof = valid.clone();
+        empty_proof.initial_layout_proofs[0].clear();
+        assert!(empty_proof.validate_shape().unwrap_err().to_string().contains("cannot be empty"));
+
+        let mut unordered = valid.clone();
+        unordered.contract_ids = vec![2, 1];
+        unordered.contract_leaves = vec![PQEDContractLeafV2::default(); 2];
+        unordered.initial_layout_proofs = vec![vec![1]; 2];
+        assert!(unordered.validate_shape().unwrap_err().to_string().contains("strictly increasing"));
+    }
+
+    #[test]
+    fn deploy_batch_fallback_serialization_round_trips() {
+        let value = valid_input();
+        let bytes = value.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(bytes.len(), value.fallback_pio_serialized_size());
+        assert_eq!(
+            QCBatchDeployContractsCircuitInput::<PF, Hash>::fallback_psy_ser_from_slice(&bytes).unwrap(),
+            value
+        );
+    }
+
+    fn hash(seed: u64) -> Hash {
+        Hash::from_u64x4([
+            seed,
+            seed.wrapping_mul(31),
+            seed.wrapping_mul(7),
+            seed.wrapping_mul(13),
+        ])
+    }
+
+    fn contract_leaf(seed: u64) -> PQEDContractLeafV2<PF, Hash> {
+        PQEDContractLeafV2 {
+            deployer: hash(seed),
+            function_tree_root: hash(seed + 1),
+            code_root: hash(seed + 2),
+            state_tree_height: PF::from_u64_value(seed % 32),
+            state_layout_root: hash(seed + 3),
+            state_layout_field_count: PF::from_u64_value(seed + 4),
+            state_layout_slot_count: PF::from_u64_value(seed + 5),
+        }
+    }
+
+    fn spiderman_proof(
+        top_index: u64,
+        old_leaves: Vec<Hash>,
+        new_leaves: Vec<Hash>,
+        siblings: Vec<Hash>,
+    ) -> SpidermanUpdateProof<Hash> {
+        let old_web_root = PoseidonHasher::compute_root_from_leaves(&old_leaves).unwrap();
+        let new_web_root = PoseidonHasher::compute_root_from_leaves(&new_leaves).unwrap();
+        SpidermanUpdateProof {
+            top_line_proof: DeltaMerkleProofCore::from_params::<PoseidonHasher>(
+                top_index,
+                old_web_root,
+                new_web_root,
+                siblings,
+            ),
+            web_proof_old_leaves: old_leaves,
+            web_proof_new_leaves: new_leaves,
+        }
+    }
+
+    fn deploy_input(
+        proof: SpidermanUpdateProof<Hash>,
+        contract_ids: Vec<u64>,
+        contract_leaves: Vec<PQEDContractLeafV2<PF, Hash>>,
+        initial_layout_proofs: Vec<Vec<u8>>,
+    ) -> QCBatchDeployContractsCircuitInput<PF, Hash> {
+        QCBatchDeployContractsCircuitInput {
+            deploy_contract_circuit_whitelist: hash(1),
+            spiderman_append_proof: proof,
+            contract_ids,
+            contract_leaves,
+            initial_layout_proofs,
+        }
+    }
+
+    fn valid_deploy_input() -> QCBatchDeployContractsCircuitInput<PF, Hash> {
+        let leaves = vec![contract_leaf(20), contract_leaf(30)];
+        let new_hashes = leaves
+            .iter()
+            .map(|leaf| leaf.qfhash::<PoseidonHasher>())
+            .collect::<Vec<_>>();
+        let proof = spiderman_proof(
+            5,
+            vec![Hash::default(), Hash::default()],
+            new_hashes,
+            vec![hash(91), hash(92)],
+        );
+        // window_start = top_index * web_window = 5 * 2
+        deploy_input(proof, vec![10, 11], leaves, vec![vec![0xAA], vec![0xBB]])
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_append_batch() {
+        assert!(valid_deploy_input().validate::<PoseidonHasher>().is_ok());
+
+        // An empty batch over an unchanged (all-default) window is also valid.
+        let unchanged = spiderman_proof(
+            0,
+            vec![Hash::default(), Hash::default()],
+            vec![Hash::default(), Hash::default()],
+            vec![hash(51)],
+        );
+        let empty = deploy_input(unchanged, vec![], vec![], vec![]);
+        assert!(empty.validate::<PoseidonHasher>().is_ok());
+        assert!(empty.validate_shape().is_ok());
+        let bytes = empty.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert!(
+            QCBatchDeployContractsCircuitInput::<PF, Hash>::fallback_psy_ser_from_slice(&bytes).unwrap() == empty
+        );
+    }
+
+    #[test]
+    fn validate_rejects_proof_and_vector_mismatches() {
+        // Corrupted top-line root: the Spiderman proof no longer verifies.
+        let mut corrupted = valid_deploy_input();
+        corrupted.spiderman_append_proof.top_line_proof.new_root = hash(123);
+        assert!(corrupted
+            .validate::<PoseidonHasher>()
+            .unwrap_err()
+            .to_string()
+            .contains("invalid contract-tree Spiderman deploy proof"));
+
+        // Overwriting an existing (non-default) leaf is rejected.
+        let leaves = vec![contract_leaf(20), contract_leaf(30)];
+        let occupied = spiderman_proof(
+            5,
+            vec![hash(55), Hash::default()],
+            vec![leaves[0].qfhash::<PoseidonHasher>(), Hash::default()],
+            vec![hash(91), hash(92)],
+        );
+        let overwrite = deploy_input(
+            occupied,
+            vec![10, 11],
+            leaves,
+            vec![vec![0xAA], vec![0xBB]],
+        );
+        assert!(overwrite
+            .validate::<PoseidonHasher>()
+            .unwrap_err()
+            .to_string()
+            .contains("attempts to overwrite a leaf"));
+
+        // Deployed id does not line up with the proof window position.
+        let mut wrong_ids = valid_deploy_input();
+        wrong_ids.contract_ids = vec![10, 999];
+        assert!(wrong_ids
+            .validate::<PoseidonHasher>()
+            .unwrap_err()
+            .to_string()
+            .contains("deployed contract id does not match proof position"));
+
+        // Serialized leaf does not hash to the web-proof leaf.
+        let mut wrong_leaf = valid_deploy_input();
+        wrong_leaf.contract_leaves[0] = contract_leaf(21);
+        assert!(wrong_leaf
+            .validate::<PoseidonHasher>()
+            .unwrap_err()
+            .to_string()
+            .contains("deployed contract leaf does not match proof"));
+
+        // Fewer id/leaf/proof vectors than appended proof leaves: the id check
+        // fires first because the proof keeps appending past the short vector.
+        let leaves = vec![contract_leaf(20), contract_leaf(30)];
+        let new_hashes = leaves
+            .iter()
+            .map(|leaf| leaf.qfhash::<PoseidonHasher>())
+            .collect::<Vec<_>>();
+        let short_proof = spiderman_proof(
+            5,
+            vec![Hash::default(), Hash::default()],
+            new_hashes.clone(),
+            vec![hash(91), hash(92)],
+        );
+        let short = deploy_input(short_proof, vec![10], vec![leaves[0]], vec![vec![0xAA]]);
+        assert!(short
+            .validate::<PoseidonHasher>()
+            .unwrap_err()
+            .to_string()
+            .contains("deployed contract id does not match proof position"));
+
+        // An unchanged window with a leftover leaf reaches the final tally check:
+        // every position is old == new, so nothing is appended, yet a leaf remains.
+        let unchanged_proof = spiderman_proof(
+            5,
+            vec![Hash::default(), Hash::default()],
+            vec![Hash::default(), Hash::default()],
+            vec![hash(91), hash(92)],
+        );
+        let unchanged = deploy_input(
+            unchanged_proof,
+            vec![10],
+            vec![contract_leaf(20)],
+            vec![vec![0xAA]],
+        );
+        assert!(unchanged
+            .validate::<PoseidonHasher>()
+            .unwrap_err()
+            .to_string()
+            .contains("deploy vectors do not match added proof leaves"));
+
+        // window_start = index * window_size overflows u64.
+        let overflow_proof = spiderman_proof(
+            u64::MAX,
+            vec![Hash::default(), Hash::default()],
+            new_hashes,
+            vec![hash(91), hash(92)],
+        );
+        let overflow = deploy_input(overflow_proof, vec![0, 1], leaves, vec![vec![0xAA], vec![0xBB]]);
+        assert!(overflow
+            .validate::<PoseidonHasher>()
+            .unwrap_err()
+            .to_string()
+            .contains("contract deploy window index overflow"));
+    }
+
+    #[test]
+    fn validate_shape_rejects_oversized_layout_proof_bytes() {
+        let mut oversized = valid_input();
+        oversized.initial_layout_proofs[0] = vec![0u8; STATE_LAYOUT_MAX_PROOF_BYTES + 1];
+        assert!(oversized
+            .validate_shape()
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds maximum size"));
+    }
+
+    #[test]
+    fn state_transition_and_expected_hash_follow_append_proof() {
+        let input = valid_deploy_input();
+        assert_eq!(
+            input.get_state_transition().state_transition_start,
+            input.spiderman_append_proof.top_line_proof.old_root
+        );
+        assert_eq!(
+            input.get_state_transition().state_transition_end,
+            input.spiderman_append_proof.top_line_proof.new_root
+        );
+        let expected = compute_agg_state_trackable_final_public_inputs_no_rewards_tag_leaf::<PoseidonHasher, PF, Hash>(
+            input.deploy_contract_circuit_whitelist,
+            input.get_state_transition().get_combined_hash::<PoseidonHasher>(),
+        );
+        assert!(input.get_expected_public_inputs_hash::<PoseidonHasher>() == expected);
+    }
+
+    #[test]
+    fn deserializer_rejects_forged_batch_counts() {
+        let input = valid_input();
+        let bytes = input.fallback_psy_ser_to_bytes_vec().unwrap();
+
+        // Measure the exact subfield byte lengths so the count fields can be patched.
+        let mut proof_bytes = Vec::new();
+        input.spiderman_append_proof.fallback_pio_write_to_io(&mut proof_bytes).unwrap();
+        let mut leaf_bytes = Vec::new();
+        input.contract_leaves[0].pio_write_to_io(&mut leaf_bytes).unwrap();
+
+        let ids_len_offset = 32 + proof_bytes.len();
+        let leaves_len_offset = ids_len_offset + 4 + input.contract_ids.len() * 8;
+        let layout_proofs_len_offset = leaves_len_offset + 4 + leaf_bytes.len();
+
+        let over_limit = u32::try_from(STATE_LAYOUT_MAX_BATCH_ITEMS + 1).unwrap();
+
+        let mut forged = bytes.clone();
+        forged[ids_len_offset..ids_len_offset + 4].copy_from_slice(&over_limit.to_le_bytes());
+        assert!(QCBatchDeployContractsCircuitInput::<PF, Hash>::fallback_psy_ser_from_slice(&forged)
+            .unwrap_err()
+            .to_string()
+            .contains("deploy contract id count exceeds batch capacity"));
+
+        let mut forged = bytes.clone();
+        forged[leaves_len_offset..leaves_len_offset + 4].copy_from_slice(&over_limit.to_le_bytes());
+        assert!(QCBatchDeployContractsCircuitInput::<PF, Hash>::fallback_psy_ser_from_slice(&forged)
+            .unwrap_err()
+            .to_string()
+            .contains("deploy contract leaf count exceeds batch capacity"));
+
+        let mut forged = bytes;
+        forged[layout_proofs_len_offset..layout_proofs_len_offset + 4]
+            .copy_from_slice(&over_limit.to_le_bytes());
+        assert!(QCBatchDeployContractsCircuitInput::<PF, Hash>::fallback_psy_ser_from_slice(&forged)
+            .unwrap_err()
+            .to_string()
+            .contains("deploy layout proof count exceeds batch capacity"));
+    }
+}

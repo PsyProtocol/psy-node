@@ -379,3 +379,90 @@ pser::impl_psy_ser_basic_tests_fallback!(
     { parth_core::PF, parth_core::PHash },
     guta_verify_two_guta_left_linear_right_child_right_upgrade_tests
 );
+
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+    use parth_core::{crypto::hash::traits::QFieldHashable, felt::FromPrimitiveValuesFelt, pgoldilocks::{PoseidonHasher, QHashOut}, utils::QPGenRandom, PF};
+    use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
+
+    type Hash = QHashOut<PF>;
+
+    #[test]
+    fn linear_aggregation_preserves_endpoints_and_combines_stats() {
+        let input = GUTAVerifyTwoGUTALinearCircuitInput::<PF, Hash>::qp_rand_gen();
+        assert_eq!(input.get_guta_header_a(), input.left_header);
+        assert_eq!(input.get_guta_header_b(), input.right_header);
+        let combined = input.get_new_guta_header();
+        assert_eq!(combined.state_transition.old_node_value, input.left_header.state_transition.old_node_value);
+        assert_eq!(combined.state_transition.new_node_value, input.right_header.state_transition.new_node_value);
+        assert_eq!(combined.stats, input.left_header.stats.combine_with(&input.right_header.stats));
+        assert_eq!(input.get_public_inputs_hash_no_rewards_tag::<PoseidonHasher>(), combined.qfhash::<PoseidonHasher>());
+        let left = QProvingJobDataID::qp_rand_gen();
+        let right = QProvingJobDataID::qp_rand_gen();
+        let (metadata, header) = input.get_job_witness_and_new_guta::<PoseidonHasher>(4, 2, 8, left, right);
+        assert_eq!(metadata.job_id, header.job_id);
+        assert_eq!(metadata.metadata.dependencies, vec![left, right]);
+        assert_eq!(metadata.metadata.expected_public_inputs_hash, header.header.qfhash::<PoseidonHasher>());
+    }
+
+    #[test]
+    fn checkpoint_upgrade_variants_select_their_documented_roots() {
+        let input = GUTAVerifyTwoGUTALinearUpgradeCheckpointCircuitInput::<PF, Hash>::qp_rand_gen();
+        let combined = input.get_new_guta_header();
+        assert_eq!(combined.checkpoint_tree_root, input.left_historical_checkpoint_proof.root);
+        assert_eq!(input.get_public_inputs_hash_no_rewards_tag::<PoseidonHasher>(), combined.qfhash::<PoseidonHasher>());
+
+        let leaf = GUTAVerifyLeftLinearRightLeafUpgradeCheckpointCircuitInput::<PF, Hash>::qp_rand_gen();
+        let combined_leaf = leaf.get_new_guta_header();
+        assert_eq!(combined_leaf.checkpoint_tree_root, leaf.left_header.checkpoint_tree_root);
+        assert_eq!(combined_leaf.state_transition.new_node_value, leaf.right_global_user_tree_delta_merkle_proof.new_root);
+        assert_eq!(leaf.get_public_inputs_hash_no_rewards_tag::<PoseidonHasher>(), combined_leaf.qfhash::<PoseidonHasher>());
+    }
+
+    #[test]
+    fn linear_new_header_keeps_left_checkpoint_whitelist_and_position() {
+        let input = GUTAVerifyTwoGUTALinearCircuitInput::<PF, Hash>::qp_rand_gen();
+        let combined = input.get_new_guta_header();
+        assert_eq!(combined.checkpoint_tree_root, input.left_header.checkpoint_tree_root);
+        assert_eq!(combined.guta_circuit_whitelist, input.left_header.guta_circuit_whitelist);
+        assert_eq!(combined.state_transition.node_index, input.left_header.state_transition.node_index);
+        assert_eq!(combined.state_transition.node_level, input.left_header.state_transition.node_level);
+        assert_eq!(
+            combined.total_aggregation_proofs_generated,
+            input.left_header.total_aggregation_proofs_generated
+                + input.right_header.total_aggregation_proofs_generated
+                + PF::from_u8_value(1)
+        );
+    }
+
+    // The fallback writer must emit exactly the canonical (speedy) encoding, and
+    // that payload must round-trip through the canonical reader. The fallback
+    // reader itself cannot be exercised here: chained nested speedy stream reads
+    // desynchronize the shared cursor (reported production bug).
+    #[test]
+    fn linear_inputs_fallback_write_matches_canonical_encoding() {
+        let linear = GUTAVerifyTwoGUTALinearCircuitInput::<PF, Hash>::qp_rand_gen();
+        assert!(GUTAVerifyTwoGUTALinearCircuitInput::<PF, Hash>::IS_FIXED_SIZE);
+        assert_eq!(
+            linear.fallback_pio_serialized_size(),
+            GUTAVerifyTwoGUTALinearCircuitInput::<PF, Hash>::FIXED_SIZE
+        );
+        let bytes = linear.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(bytes.len(), 2 * GlobalUserTreeAggregatorHeader::<PF, Hash>::FIXED_SIZE);
+        assert_eq!(bytes, linear.psy_ser_to_bytes_vec().unwrap());
+        assert_eq!(GUTAVerifyTwoGUTALinearCircuitInput::<PF, Hash>::psy_ser_from_slice(&bytes).unwrap(), linear);
+
+        let upgrade = GUTAVerifyTwoGUTALinearUpgradeCheckpointCircuitInput::<PF, Hash>::qp_rand_gen();
+        let bytes = upgrade.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(bytes.len(), upgrade.fallback_pio_serialized_size());
+        assert_eq!(bytes, upgrade.psy_ser_to_bytes_vec().unwrap());
+        assert_eq!(GUTAVerifyTwoGUTALinearUpgradeCheckpointCircuitInput::<PF, Hash>::psy_ser_from_slice(&bytes).unwrap(), upgrade);
+
+        let leaf = GUTAVerifyLeftLinearRightLeafUpgradeCheckpointCircuitInput::<PF, Hash>::qp_rand_gen();
+        let bytes = leaf.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(bytes.len(), leaf.fallback_pio_serialized_size());
+        assert_eq!(bytes, leaf.psy_ser_to_bytes_vec().unwrap());
+        assert_eq!(GUTAVerifyLeftLinearRightLeafUpgradeCheckpointCircuitInput::<PF, Hash>::psy_ser_from_slice(&bytes).unwrap(), leaf);
+    }
+}

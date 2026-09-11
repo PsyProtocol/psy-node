@@ -111,4 +111,61 @@ impl<Hash: Q256BitHash, JobId: QJobIdBase> PCoreQueueItemBase for PsyProvingJobM
     }
 }
 
+#[cfg(test)]
+mod behavior_tests {
+    use parth_core::PHash;
+    use psy_core::job::job_id::ProvingJobCircuitType;
+
+    use super::*;
+    use crate::worker::metadata::PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD;
+
+    fn sample() -> PsyProvingJobMetadataWithJobId<PHash, QProvingJobDataID> {
+        PsyProvingJobMetadataWithJobId {
+            job_id: QProvingJobDataID::new_proof_job_id(7, 1, ProvingJobCircuitType::UserEndCap, 0, 3),
+            metadata: PsyProvingJobMetadata {
+                expected_public_inputs_hash: PHash::from_values(11, 0, 0, 0),
+                reward_tree_node_index: 5,
+                reward_tree_node_level: 2,
+                reward_tree_hash_mode: PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD,
+                reward_tree_node_children: 2,
+                dependencies: vec![
+                    QProvingJobDataID::new_proof_job_id(7, 1, ProvingJobCircuitType::UserEndCap, 0, 4),
+                    QProvingJobDataID::new_proof_job_id(7, 1, ProvingJobCircuitType::GUTATwoGUTA, 0, 5),
+                ],
+            },
+        }
+    }
+
+    #[test]
+    fn reward_tree_node_key_helpers_update_level_and_index() {
+        let mut item = sample();
+        assert_eq!(item.get_reward_tree_node_key(), SimpleMerkleNodeKey { level: 2, index: 5 });
+
+        let dependencies = item.update_level_and_index(4, 9);
+        assert_eq!(dependencies.len(), 2);
+        let restored = dependencies.to_vec();
+        assert_eq!(item.metadata.reward_tree_node_level, 4);
+        assert_eq!(item.metadata.reward_tree_node_index, 9);
+        assert_eq!(item.get_reward_tree_node_key(), SimpleMerkleNodeKey { level: 4, index: 9 });
+        assert_eq!(restored, item.metadata.dependencies);
+    }
+
+    #[test]
+    fn queue_item_base_round_trips_and_enforces_min_prefix() {
+        let item = sample();
+        let encoded = item.encode_queue_item_vec().unwrap();
+        let min_size = 32 + 8 + (1 + 1 + 2) + 4 + QJOB_ID_SERIALIZED_SIZE;
+
+        assert!(PsyProvingJobMetadataWithJobId::<PHash, QProvingJobDataID>::is_queue_item(&encoded));
+        assert!(!PsyProvingJobMetadataWithJobId::<PHash, QProvingJobDataID>::is_queue_item(&encoded[..min_size - 1]));
+        assert!(!PsyProvingJobMetadataWithJobId::<PHash, QProvingJobDataID>::has_fixed_size());
+        assert!(PsyProvingJobMetadataWithJobId::<PHash, QProvingJobDataID>::get_size_hint() >= min_size);
+        assert_eq!(item.get_restorable_job_id(), item.job_id.to_bytes_fixed().to_vec());
+
+        let decoded = PsyProvingJobMetadataWithJobId::<PHash, QProvingJobDataID>::decode_queue_item_ref(&encoded).unwrap();
+        assert_eq!(decoded, item);
+        assert_eq!(decoded.get_restorable_job_id(), item.job_id.to_bytes_fixed().to_vec());
+    }
+}
+
 

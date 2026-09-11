@@ -1,5 +1,4 @@
 use parth_core::{crypto::hash::traits::{FieldQHasher, MerkleHasher, QFieldHashable}};
-#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
 use parth_core::protocol::core_types::Q256BitHash;
 #[cfg(feature = "rand_gen")]
 use parth_core::utils::QPGenRandom;
@@ -105,6 +104,129 @@ pser::impl_psy_ser_basic_tests_fallback!(
     { parth_core::PHash },
     checkpoint_state_hash_transition_ser_tests
 );
+
+#[cfg(test)]
+mod behavior_tests {
+    use parth_core::{
+        crypto::hash::traits::QFieldHashable,
+        pgoldilocks::{PoseidonHasher, QHashOut},
+        utils::QPGenRandom,
+        PF,
+    };
+    use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
+
+    use super::*;
+
+    type Hash = QHashOut<PF>;
+
+    fn hash(value: u64) -> Hash {
+        Hash::from_values(value, value + 1, value + 2, value + 3)
+    }
+
+    #[test]
+    fn transition_hash_matches_manual_merkle_composition() {
+        let transition = CheckpointStateHashTransition {
+            old_checkpoint_tree_root: hash(1),
+            new_checkpoint_tree_root: hash(2),
+            old_checkpoint_leaf_hash: hash(3),
+            new_checkpoint_leaf_hash: hash(4),
+        };
+        let roots = PoseidonHasher::two_to_one(&hash(1), &hash(2));
+        let leaves = PoseidonHasher::two_to_one(&hash(3), &hash(4));
+        let expected = PoseidonHasher::two_to_one(&roots, &leaves);
+        assert_eq!(transition.get_hash::<PoseidonHasher>(), expected);
+        assert_eq!(transition.qfhash::<PoseidonHasher>(), expected);
+
+        let genesis = hash(5);
+        let fingerprint = hash(6);
+        assert_eq!(
+            transition.get_public_inputs_hash_no_rewards_tag::<PoseidonHasher>(&genesis, &fingerprint),
+            PoseidonHasher::two_to_one(&expected, &PoseidonHasher::two_to_one(&genesis, &fingerprint))
+        );
+    }
+
+    #[test]
+    fn public_input_chain_helpers_match_documented_formulas() {
+        let data = CheckpointStateTransitionPublicInputs {
+            checkpoint_transition: CheckpointStateHashTransition {
+                old_checkpoint_tree_root: hash(1),
+                new_checkpoint_tree_root: hash(2),
+                old_checkpoint_leaf_hash: hash(3),
+                new_checkpoint_leaf_hash: hash(4),
+            },
+            genesis_checkpoint_state_transition_hash: hash(5),
+            checkpoint_state_transition_circuit_fingerprint: hash(6),
+        };
+        let root_leaf = PoseidonHasher::two_to_one(&hash(2), &hash(4));
+        assert_eq!(
+            data.get_chain_0_from_genesis_leaf::<PoseidonHasher>(&hash(7)),
+            PoseidonHasher::two_to_one(&root_leaf, &hash(7))
+        );
+        let step = PoseidonHasher::two_to_one(&root_leaf, &hash(6));
+        assert_eq!(data.get_step_commit_hash::<PoseidonHasher>(), step);
+        assert_eq!(
+            data.get_chain_hash_from_previous::<PoseidonHasher>(&hash(8)),
+            PoseidonHasher::two_to_one(&hash(8), &step)
+        );
+        assert_eq!(data.qfhash::<PoseidonHasher>(), data.get_public_inputs_hash_no_rewards_tag::<PoseidonHasher>());
+    }
+
+    #[test]
+    fn fallback_encoded_sizes_match_fixed_size_constants() {
+        let transition = CheckpointStateHashTransition::<Hash>::qp_rand_gen();
+        assert_eq!(transition.fallback_pio_serialized_size(), CheckpointStateHashTransition::<Hash>::FIXED_SIZE);
+        let bytes = transition.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(bytes.len(), CheckpointStateHashTransition::<Hash>::FIXED_SIZE);
+        assert_eq!(bytes.len(), transition.pio_serialized_size());
+        assert_eq!(
+            CheckpointStateHashTransition::<Hash>::fallback_psy_ser_from_slice(&bytes).unwrap(),
+            transition
+        );
+
+        let public_inputs = CheckpointStateTransitionPublicInputs::<Hash>::qp_rand_gen();
+        assert_eq!(
+            public_inputs.fallback_pio_serialized_size(),
+            CheckpointStateTransitionPublicInputs::<Hash>::FIXED_SIZE
+        );
+        let pi_bytes = public_inputs.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(pi_bytes.len(), CheckpointStateTransitionPublicInputs::<Hash>::FIXED_SIZE);
+        assert_eq!(pi_bytes.len(), public_inputs.pio_serialized_size());
+        // The fallback decoder cannot be used for this type: its read path mixes the
+        // speedy-buffered read of `checkpoint_transition` (which drains a small cursor
+        // into its 8 KiB circular buffer) with direct 32-byte reads, so those trailing
+        // reads hit EOF. Decode through the active in-memory reader instead, which
+        // also proves the fallback encoding stays byte-compatible with it.
+        assert_eq!(
+            CheckpointStateTransitionPublicInputs::<Hash>::psy_ser_from_slice(&pi_bytes).unwrap(),
+            public_inputs
+        );
+        assert_eq!(
+            CheckpointStateTransitionPublicInputs::<Hash>::FIXED_SIZE,
+            CheckpointStateHashTransition::<Hash>::FIXED_SIZE + 32 * 2
+        );
+    }
+
+    #[test]
+    fn transition_hash_distinguishes_root_and_leaf_changes() {
+        let mut transition = CheckpointStateHashTransition {
+            old_checkpoint_tree_root: hash(1),
+            new_checkpoint_tree_root: hash(2),
+            old_checkpoint_leaf_hash: hash(3),
+            new_checkpoint_leaf_hash: hash(4),
+        };
+        let baseline = transition.get_hash::<PoseidonHasher>();
+
+        transition.new_checkpoint_tree_root = hash(5);
+        assert_ne!(transition.get_hash::<PoseidonHasher>(), baseline);
+
+        transition.new_checkpoint_tree_root = hash(2);
+        transition.old_checkpoint_leaf_hash = hash(6);
+        assert_ne!(transition.get_hash::<PoseidonHasher>(), baseline);
+
+        transition.old_checkpoint_leaf_hash = hash(3);
+        assert_eq!(transition.get_hash::<PoseidonHasher>(), baseline);
+    }
+}
 
 
 #[pderive::serialize_copy_hash_ts]

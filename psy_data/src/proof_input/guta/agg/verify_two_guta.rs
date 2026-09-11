@@ -405,3 +405,189 @@ impl<F: QFelt64, Hash: Copy> VerifyTwoGUTAProofUpgradeCheckpointStandardInput<F,
         }
     }
 }
+
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+    use parth_core::{crypto::hash::traits::MerkleHasher, felt::FromPrimitiveValuesFelt, pgoldilocks::{PoseidonHasher, QHashOut}, utils::QPGenRandom, PF};
+    use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
+
+    type Hash = QHashOut<PF>;
+
+    /// Builds a `MerkleProofCore` whose `root` matches the current root that
+    /// `compute_historical_and_current_merkle_roots_core_gt` derives from it.
+    fn consistent_checkpoint_proof(index: u64, siblings: Vec<Hash>, value: Hash) -> MerkleProofCore<Hash> {
+        let mut current = value;
+        for (i, sibling) in siblings.iter().enumerate() {
+            if index & (1 << i) == 0 {
+                current = PoseidonHasher::two_to_one(&current, sibling);
+            } else {
+                current = PoseidonHasher::two_to_one(sibling, &current);
+            }
+        }
+        MerkleProofCore { root: current, value, index, siblings }
+    }
+
+    fn upgrade_simple_with_proofs(
+        proof_a: MerkleProofCore<Hash>,
+        proof_b: MerkleProofCore<Hash>,
+    ) -> VerifyTwoGUTAProofUpgradeCheckpointStandardInputSimple<PF, Hash> {
+        VerifyTwoGUTAProofUpgradeCheckpointStandardInputSimple {
+            historical_checkpoint_proof_a: proof_a,
+            historical_checkpoint_proof_b: proof_b,
+            stats_a: GUTAStats::qp_rand_gen(),
+            stats_b: GUTAStats::qp_rand_gen(),
+            nca_proof: PartialUpdateNearestCommonAncestorProof::qp_rand_gen(),
+            total_aggregation_proofs_generated_a: PF::qp_rand_gen(),
+            total_aggregation_proofs_generated_b: PF::qp_rand_gen(),
+        }
+    }
+
+    #[test]
+    fn simple_inputs_combine_stats_and_accept_their_placeholder_witness() {
+        let input = VerifyTwoGUTAProofGadgetStandardInputSimple::<PF, Hash>::qp_rand_gen();
+        assert_eq!(input.get_combined_stats(), input.stats_a.combine_with(&input.stats_b));
+        input.check_witness().unwrap();
+
+        let upgrade = VerifyTwoGUTAProofUpgradeCheckpointStandardInputSimple::<PF, Hash>::qp_rand_gen();
+        assert_eq!(upgrade.get_combined_stats(), upgrade.stats_a.combine_with(&upgrade.stats_b));
+        assert!(upgrade.check_witness::<PoseidonHasher>().is_err());
+    }
+
+    #[test]
+    fn standard_inputs_project_nca_and_inclusion_data_into_headers() {
+        let mut input = VerifyTwoGUTAProofGadgetStandardInput::<PF, Hash>::qp_rand_gen();
+        // Random NCA proofs may combine a u8 level with up to 63 random siblings,
+        // overflowing the public level accessor in debug builds. This test only
+        // needs a valid, shallow NCA shape to exercise header projection.
+        input.nca_proof.nearest_common_ancestor_level = 0;
+        input.nca_proof.child_a.index = 0;
+        input.nca_proof.child_a.siblings.clear();
+        input.nca_proof.child_b.index = 1;
+        input.nca_proof.child_b.siblings.clear();
+        let a = input.get_guta_header_a();
+        let b = input.get_guta_header_b();
+        assert_eq!(a.guta_circuit_whitelist, input.guta_inclusion_proof_a.root);
+        assert_eq!(b.guta_circuit_whitelist, input.guta_inclusion_proof_b.root);
+        assert_eq!(a.state_transition.old_node_value, input.nca_proof.child_a.old_value);
+        assert_eq!(b.state_transition.new_node_value, input.nca_proof.child_b.new_value);
+    }
+
+    #[test]
+    fn upgraded_inputs_project_historical_roots_and_nca_headers() {
+        let simple = VerifyTwoGUTAProofUpgradeCheckpointStandardInputSimple::<PF, Hash>::qp_rand_gen();
+        assert!(simple.check_witness::<PoseidonHasher>().is_err());
+        let mut input = VerifyTwoGUTAProofUpgradeCheckpointStandardInput {
+            historical_checkpoint_proof_a: simple.historical_checkpoint_proof_a,
+            historical_checkpoint_proof_b: simple.historical_checkpoint_proof_b,
+            stats_a: simple.stats_a,
+            stats_b: simple.stats_b,
+            nca_proof: simple.nca_proof,
+            guta_inclusion_proof_a: MerkleProofCore::qp_rand_gen(),
+            guta_inclusion_proof_b: MerkleProofCore::qp_rand_gen(),
+            total_aggregation_proofs_generated_a: simple.total_aggregation_proofs_generated_a,
+            total_aggregation_proofs_generated_b: simple.total_aggregation_proofs_generated_b,
+        };
+        input.nca_proof.nearest_common_ancestor_level = 0;
+        input.nca_proof.child_a.index = 0;
+        input.nca_proof.child_a.siblings.clear();
+        input.nca_proof.child_b.index = 1;
+        input.nca_proof.child_b.siblings.clear();
+        let a = input.get_guta_header_a::<PoseidonHasher>();
+        let b = input.get_guta_header_b::<PoseidonHasher>();
+        assert_eq!(a.guta_circuit_whitelist, input.guta_inclusion_proof_a.root);
+        assert_eq!(b.guta_circuit_whitelist, input.guta_inclusion_proof_b.root);
+        assert_eq!(a.state_transition.old_node_value, input.nca_proof.child_a.old_value);
+        assert_eq!(b.state_transition.new_node_value, input.nca_proof.child_b.new_value);
+    }
+
+    #[test]
+    fn upgrade_check_witness_accepts_proofs_sharing_the_current_root() {
+        let proof = consistent_checkpoint_proof(
+            0b101,
+            vec![Hash::qp_rand_gen(), Hash::qp_rand_gen(), Hash::qp_rand_gen()],
+            Hash::qp_rand_gen(),
+        );
+        let input = upgrade_simple_with_proofs(proof.clone(), proof);
+        input.check_witness::<PoseidonHasher>().unwrap();
+    }
+
+    #[test]
+    fn upgrade_check_witness_reports_each_root_mismatch_separately() {
+        let proof = consistent_checkpoint_proof(
+            0b01,
+            vec![Hash::qp_rand_gen(), Hash::qp_rand_gen()],
+            Hash::qp_rand_gen(),
+        );
+
+        // Left proof root does not match its recomputed current root.
+        let mut a_bad = proof.clone();
+        a_bad.root = PoseidonHasher::two_to_one(&proof.root, &proof.value);
+        let err = upgrade_simple_with_proofs(a_bad, proof.clone()).check_witness::<PoseidonHasher>().unwrap_err();
+        assert!(err.to_string().contains("historical_checkpoint_proof_a not match"), "unexpected error: {err}");
+
+        // Right proof root does not match its recomputed current root.
+        let mut b_bad = proof.clone();
+        b_bad.root = PoseidonHasher::two_to_one(&proof.root, &proof.value);
+        let err = upgrade_simple_with_proofs(proof.clone(), b_bad).check_witness::<PoseidonHasher>().unwrap_err();
+        assert!(err.to_string().contains("historical_checkpoint_proof_b not match"), "unexpected error: {err}");
+
+        // Both proofs are individually consistent but live at different current roots.
+        let other = consistent_checkpoint_proof(
+            0b10,
+            vec![Hash::qp_rand_gen(), Hash::qp_rand_gen()],
+            Hash::qp_rand_gen(),
+        );
+        let err = upgrade_simple_with_proofs(proof, other).check_witness::<PoseidonHasher>().unwrap_err();
+        assert!(err.to_string().contains("current checkpoint root not match"), "unexpected error: {err}");
+    }
+
+    // The fallback writer must emit exactly the canonical (speedy) encoding, and
+    // that payload must round-trip through the canonical reader. The fallback
+    // reader itself cannot be exercised here: chained nested speedy stream reads
+    // desynchronize the shared cursor (reported production bug).
+    #[test]
+    fn two_guta_inputs_fallback_write_matches_canonical_encoding() {
+        let simple = VerifyTwoGUTAProofGadgetStandardInputSimple::<PF, Hash>::qp_rand_gen();
+        let bytes = simple.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(bytes.len(), simple.fallback_pio_serialized_size());
+        assert_eq!(bytes, simple.psy_ser_to_bytes_vec().unwrap());
+        assert_eq!(VerifyTwoGUTAProofGadgetStandardInputSimple::<PF, Hash>::psy_ser_from_slice(&bytes).unwrap(), simple);
+
+        let standard = VerifyTwoGUTAProofGadgetStandardInput::<PF, Hash>::qp_rand_gen();
+        let bytes = standard.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(bytes.len(), standard.fallback_pio_serialized_size());
+        assert_eq!(bytes, standard.psy_ser_to_bytes_vec().unwrap());
+        assert_eq!(VerifyTwoGUTAProofGadgetStandardInput::<PF, Hash>::psy_ser_from_slice(&bytes).unwrap(), standard);
+
+        let upgrade_simple = VerifyTwoGUTAProofUpgradeCheckpointStandardInputSimple::<PF, Hash>::qp_rand_gen();
+        let bytes = upgrade_simple.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(bytes.len(), upgrade_simple.fallback_pio_serialized_size());
+        assert_eq!(bytes, upgrade_simple.psy_ser_to_bytes_vec().unwrap());
+        assert_eq!(VerifyTwoGUTAProofUpgradeCheckpointStandardInputSimple::<PF, Hash>::psy_ser_from_slice(&bytes).unwrap(), upgrade_simple);
+    }
+
+    #[test]
+    fn standard_headers_project_nca_positions_and_totals() {
+        let mut input = VerifyTwoGUTAProofGadgetStandardInput::<PF, Hash>::qp_rand_gen();
+        // Keep the NCA shape shallow so the public level accessors stay within u8 range.
+        input.nca_proof.nearest_common_ancestor_level = 2;
+        input.nca_proof.child_a.index = 11;
+        input.nca_proof.child_a.siblings.truncate(3);
+        input.nca_proof.child_b.index = 13;
+        input.nca_proof.child_b.siblings.truncate(4);
+
+        let a = input.get_guta_header_a();
+        let b = input.get_guta_header_b();
+        assert_eq!(a.checkpoint_tree_root, input.checkpoint_tree_root);
+        assert_eq!(b.checkpoint_tree_root, input.b_checkpoint_tree_root);
+        assert_eq!(a.state_transition.node_index, PF::from_u64_value(input.nca_proof.get_a_node_key().index));
+        assert_eq!(a.state_transition.node_level, PF::from_u8_value(input.nca_proof.get_level_a()));
+        assert_eq!(b.state_transition.node_index, PF::from_u64_value(input.nca_proof.get_b_node_key().index));
+        assert_eq!(b.state_transition.node_level, PF::from_u8_value(input.nca_proof.get_level_b()));
+        assert_eq!(a.stats, input.stats_a);
+        assert_eq!(b.stats, input.stats_b);
+        assert_eq!(a.total_aggregation_proofs_generated, input.total_aggregation_proofs_generated_a);
+        assert_eq!(b.total_aggregation_proofs_generated, input.total_aggregation_proofs_generated_b);
+    }
+}

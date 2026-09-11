@@ -175,6 +175,178 @@ impl<Hash: ZeroableHash + Copy + PartialEq, JobId> PsyProvingJobMetadata<Hash, J
         Ok(updates)
     }
 }
+
+#[cfg(test)]
+mod reward_behavior_tests {
+    use parth_core::pgoldilocks::{PoseidonHasher, QHashOut};
+    use parth_core::PF;
+
+    use super::*;
+
+    type Hash = QHashOut<PF>;
+
+    fn hash(value: u64) -> Hash {
+        Hash::from_values(value, 0, 0, 0)
+    }
+
+    fn metadata(mode: u8, dependencies: usize) -> PsyProvingJobMetadata<Hash, u8> {
+        PsyProvingJobMetadata {
+            expected_public_inputs_hash: hash(50),
+            reward_tree_node_index: 3,
+            reward_tree_node_level: 2,
+            reward_tree_hash_mode: mode,
+            reward_tree_node_children: dependencies as u16,
+            dependencies: (0..dependencies as u8).collect(),
+        }
+    }
+
+    #[test]
+    fn reward_modes_accept_expected_children_and_reject_wrong_shapes() {
+        let tag = hash(9);
+        let cases = [
+            (PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN, vec![]),
+            (PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD, vec![hash(1), hash(2)]),
+            (PROOF_REWARD_TREE_HASH_MODE_3_CHILDREN_DOUBLE_REWARD, vec![hash(1), hash(2), hash(3)]),
+            (PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD, vec![hash(1)]),
+            (PROOF_REWARD_TREE_HASH_MODE_4_CHILDREN, vec![hash(1), hash(2), hash(3), hash(4)]),
+        ];
+        for (mode, children) in cases {
+            let value = metadata(mode, children.len());
+            let reward = value.get_new_rewards_tag_tree_value::<PoseidonHasher>(tag, &children).unwrap();
+            assert_ne!(reward, Hash::default());
+            assert_ne!(value.compute_reward_tagged_expected_public_inputs::<PoseidonHasher>(tag, &children).unwrap(), reward);
+            assert!(!value.get_new_rewards_tag_tree_updates::<PoseidonHasher>(tag, &children, reward).unwrap().is_empty());
+        }
+
+        assert!(metadata(PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD, 0)
+            .get_new_rewards_tag_tree_value::<PoseidonHasher>(tag, &[]).is_err());
+        assert!(metadata(PROOF_REWARD_TREE_HASH_MODE_3_CHILDREN_DOUBLE_REWARD, 2)
+            .get_new_rewards_tag_tree_value::<PoseidonHasher>(tag, &[hash(1), hash(2)]).is_err());
+        assert!(metadata(PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD, 0)
+            .get_new_rewards_tag_tree_value::<PoseidonHasher>(tag, &[]).is_err());
+        assert!(metadata(PROOF_REWARD_TREE_HASH_MODE_4_CHILDREN, 3)
+            .get_new_rewards_tag_tree_value::<PoseidonHasher>(tag, &[hash(1), hash(2), hash(3)]).is_err());
+        assert!(metadata(255, 0).get_new_rewards_tag_tree_value::<PoseidonHasher>(tag, &[]).is_err());
+    }
+
+    #[test]
+    fn reward_updates_validate_dependency_counts_and_expected_value() {
+        let tag = hash(9);
+        let children3 = [hash(1), hash(2), hash(3)];
+        let mode3 = metadata(PROOF_REWARD_TREE_HASH_MODE_3_CHILDREN_DOUBLE_REWARD, 3);
+        let reward3 = mode3.get_new_rewards_tag_tree_value::<PoseidonHasher>(tag, &children3).unwrap();
+        let updates3 = mode3.get_new_rewards_tag_tree_updates::<PoseidonHasher>(tag, &children3, reward3).unwrap();
+        assert_eq!(updates3.len(), 2);
+        assert_eq!(updates3[0].0, mode3.get_reward_tree_node_key());
+        assert!(mode3.get_new_rewards_tag_tree_updates::<PoseidonHasher>(tag, &children3[..2], reward3).is_err());
+        assert!(mode3.get_new_rewards_tag_tree_updates::<PoseidonHasher>(tag, &children3, hash(99)).is_err());
+
+        let children4 = [hash(1), hash(2), hash(3), hash(4)];
+        let mode4 = metadata(PROOF_REWARD_TREE_HASH_MODE_4_CHILDREN, 4);
+        let reward4 = mode4.get_new_rewards_tag_tree_value::<PoseidonHasher>(tag, &children4).unwrap();
+        assert_eq!(mode4.get_new_rewards_tag_tree_updates::<PoseidonHasher>(tag, &children4, reward4).unwrap().len(), 3);
+        assert!(mode4.get_new_rewards_tag_tree_updates::<PoseidonHasher>(tag, &children4[..3], reward4).is_err());
+        assert!(mode4.get_new_rewards_tag_tree_updates::<PoseidonHasher>(tag, &children4, hash(99)).is_err());
+
+        let standard = metadata(PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD, 2);
+        let children2 = [hash(1), hash(2)];
+        let reward2 = standard.get_new_rewards_tag_tree_value::<PoseidonHasher>(tag, &children2).unwrap();
+        assert!(standard.get_new_rewards_tag_tree_updates::<PoseidonHasher>(tag, &children2, hash(99)).is_err());
+        assert_eq!(standard.get_new_rewards_tag_tree_updates::<PoseidonHasher>(tag, &children2, reward2).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn default_metadata_is_a_no_hash_children_leaf() {
+        let value = PsyProvingJobMetadata::<Hash, u8>::default();
+        assert_eq!(value.expected_public_inputs_hash, Hash::default());
+        assert_eq!(value.reward_tree_node_index, 0);
+        assert_eq!(value.reward_tree_node_level, 0);
+        assert_eq!(value.reward_tree_hash_mode, PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN);
+        assert_eq!(value.reward_tree_node_children, 0);
+        assert!(value.dependencies.is_empty());
+        assert_eq!(value.get_reward_tree_node_key(), SimpleMerkleNodeKey { level: 0, index: 0 });
+    }
+
+    #[test]
+    fn constructors_install_reward_key_and_hash_mode() {
+        let key = SimpleMerkleNodeKey { level: 3, index: 12 };
+        let pi_hash = hash(77);
+
+        let leaf = PsyProvingJobMetadata::<Hash, u8>::new_leaf(pi_hash, key, vec![1, 2]);
+        assert_eq!(leaf.expected_public_inputs_hash, pi_hash);
+        assert_eq!(leaf.reward_tree_hash_mode, PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN);
+        assert_eq!(leaf.reward_tree_node_children, 0);
+        assert_eq!(leaf.get_reward_tree_node_key(), key);
+        assert_eq!(leaf.dependencies, vec![1u8, 2u8]);
+
+        let inner = PsyProvingJobMetadata::<Hash, u8>::new_inner_standard(pi_hash, key, vec![1, 2]);
+        assert_eq!(inner.reward_tree_hash_mode, PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD);
+        assert_eq!(inner.reward_tree_node_children, 2);
+        assert_eq!(inner.get_reward_tree_node_key(), key);
+        assert_eq!(inner.dependencies, vec![1u8, 2u8]);
+
+        let double = PsyProvingJobMetadata::<Hash, u8>::new_3_to_1_double_reward(pi_hash, key, vec![1, 2, 3]);
+        assert_eq!(double.reward_tree_hash_mode, PROOF_REWARD_TREE_HASH_MODE_3_CHILDREN_DOUBLE_REWARD);
+        assert_eq!(double.reward_tree_node_children, 3);
+        assert_eq!(double.get_reward_tree_node_key(), key);
+        assert_eq!(double.dependencies, vec![1u8, 2u8, 3u8]);
+
+        let custom = PsyProvingJobMetadata::<Hash, u8>::new(pi_hash, 21, 9, PROOF_REWARD_TREE_HASH_MODE_4_CHILDREN, 4, vec![]);
+        assert_eq!(custom.expected_public_inputs_hash, pi_hash);
+        assert_eq!(custom.reward_tree_node_index, 21);
+        assert_eq!(custom.reward_tree_node_level, 9);
+        assert_eq!(custom.reward_tree_hash_mode, PROOF_REWARD_TREE_HASH_MODE_4_CHILDREN);
+        assert_eq!(custom.reward_tree_node_children, 4);
+        assert!(custom.dependencies.is_empty());
+    }
+
+    #[test]
+    fn compute_reward_tagged_expected_public_inputs_hashes_inputs_with_reward() {
+        let tag = hash(9);
+        let value = metadata(PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD, 2);
+        let children = [hash(1), hash(2)];
+        let reward = value.get_new_rewards_tag_tree_value::<PoseidonHasher>(tag, &children).unwrap();
+
+        assert_eq!(
+            value.compute_reward_tagged_expected_public_inputs::<PoseidonHasher>(tag, &children).unwrap(),
+            PoseidonHasher::two_to_one(&value.expected_public_inputs_hash, &reward)
+        );
+        // A wrong child count must propagate the mode error instead of hashing.
+        assert!(value.compute_reward_tagged_expected_public_inputs::<PoseidonHasher>(tag, &[]).is_err());
+    }
+
+    #[test]
+    fn lift_child_updates_store_a_single_node_and_validate_the_value() {
+        let tag = hash(9);
+        let value = metadata(PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD, 1);
+        let children = [hash(1)];
+        let reward = value.get_new_rewards_tag_tree_value::<PoseidonHasher>(tag, &children).unwrap();
+
+        let updates = value.get_new_rewards_tag_tree_updates::<PoseidonHasher>(tag, &children, reward).unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].0, value.get_reward_tree_node_key());
+        assert_eq!(updates[0].1.tag, tag);
+        assert_eq!(updates[0].1.value, reward);
+
+        assert!(value.get_new_rewards_tag_tree_updates::<PoseidonHasher>(tag, &[], reward).is_err());
+        assert!(value.get_new_rewards_tag_tree_updates::<PoseidonHasher>(tag, &children, hash(99)).is_err());
+    }
+
+    #[test]
+    fn no_hash_children_updates_store_a_single_node() {
+        let tag = hash(9);
+        let value = metadata(PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN, 0);
+        let reward = value.get_new_rewards_tag_tree_value::<PoseidonHasher>(tag, &[]).unwrap();
+
+        let updates = value.get_new_rewards_tag_tree_updates::<PoseidonHasher>(tag, &[], reward).unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].0, value.get_reward_tree_node_key());
+        assert_eq!(updates[0].1.tag, tag);
+        assert_eq!(updates[0].1.value, reward);
+
+        assert!(value.get_new_rewards_tag_tree_updates::<PoseidonHasher>(tag, &[], hash(99)).is_err());
+    }
+}
 impl<Hash: QPGenRandom, JobId: QPGenRandom> QPGenRandom for PsyProvingJobMetadata<Hash, JobId> {
     fn qp_rand_gen() -> Self
     where

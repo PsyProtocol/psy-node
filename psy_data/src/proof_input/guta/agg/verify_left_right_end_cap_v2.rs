@@ -1,4 +1,3 @@
-#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
 use parth_core::protocol::core_types::Q256BitHash;
 #[cfg(feature = "rand_gen")]
 use parth_core::utils::QPGenRandom;
@@ -79,7 +78,6 @@ impl<F: QFelt, Hash: Copy> GUTAVerifyLeftGUTARightEndCapCircuitInputV2<F, Hash> 
 impl<F: QFelt64, Hash: QFHashBase<F>> GUTAVerifyLeftGUTARightEndCapCircuitInputV2<F, Hash> {
     pub fn get_public_inputs_hash_no_rewards_tag<Hasher: FieldQHasher<F, Hash>>(&self) -> Hash {
         let new_guta_header = self.get_new_guta_header();
-        println!("GUTAVerifyLeftGUTARightEndCapCircuitInputV2 new_guta_header: {:?}", new_guta_header);
         new_guta_header.qfhash::<Hasher>()
     }
 
@@ -226,14 +224,23 @@ impl<F: QFelt, Hash: Copy> GUTAVerifyTwoEndCapCircuitInputV2<F, Hash> {
         }
     }
     pub fn get_new_guta_header(&self, global_user_tree_height: usize, guta_circuit_whitelist: Hash) -> GlobalUserTreeAggregatorHeader<F, Hash> {
+        let siblings_len = self.right_global_user_tree_delta_merkle_proof.siblings.len();
+        assert!(
+            siblings_len <= global_user_tree_height,
+            "global user tree proof cannot be taller than the tree"
+        );
+        assert!(
+            siblings_len < u64::BITS as usize,
+            "global user tree proof height cannot be represented by its u64 index"
+        );
         GlobalUserTreeAggregatorHeader {
             checkpoint_tree_root: self.right_end_cap.checkpoint_historical_merkle_proof.root,
             guta_circuit_whitelist,
             state_transition: SubTreeNodeStateTransition {
                 old_node_value: self.left_global_user_tree_delta_merkle_proof.old_root,
                 new_node_value: self.right_global_user_tree_delta_merkle_proof.new_root,
-                node_index: F::from_u64_value(self.right_global_user_tree_delta_merkle_proof.index >> self.right_global_user_tree_delta_merkle_proof.siblings.len()),
-                node_level: F::from_u64_value((global_user_tree_height - self.right_global_user_tree_delta_merkle_proof.siblings.len()) as u64),
+                node_index: F::from_u64_value(self.right_global_user_tree_delta_merkle_proof.index >> siblings_len),
+                node_level: F::from_u64_value((global_user_tree_height - siblings_len) as u64),
             },
             stats: self.left_end_cap.guta_stats.combine_with(&self.right_end_cap.guta_stats),
             total_aggregation_proofs_generated: F::from_u8_value(1),
@@ -464,3 +471,125 @@ pser::impl_psy_ser_basic_tests_fallback!(
     guta_verify_two_end_cap_circuit_input_v2_tests
 );
 // END SERIALIZATION HELPERS
+
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+    use parth_core::{crypto::hash::traits::QFieldHashable, felt::{FromPrimitiveValuesFelt, ToU64Value}, pgoldilocks::{PoseidonHasher, QHashOut}, PF, utils::QPGenRandom};
+
+    type Hash = QHashOut<PF>;
+
+    #[test]
+    fn left_guta_right_end_cap_job_metadata_pins_reward_tree_fields() {
+        let input = GUTAVerifyLeftGUTARightEndCapCircuitInputV2::<PF, Hash>::qp_rand_gen();
+        let left_id = QProvingJobDataID::qp_rand_gen();
+        let right_id = QProvingJobDataID::qp_rand_gen();
+        let (metadata, with_id) = input.get_job_witness_and_new_guta::<PoseidonHasher>(7, 3, 2, left_id, right_id);
+        assert_eq!(metadata.job_id, QProvingJobDataID::guta_left_linear_right_end_cap_proof(7, 3, 2));
+        assert_eq!(metadata.job_id, with_id.job_id);
+        assert_eq!(metadata.metadata.reward_tree_node_index, 2);
+        assert_eq!(metadata.metadata.reward_tree_node_level, 0);
+        assert_eq!(metadata.metadata.reward_tree_node_children, 1);
+        assert_eq!(metadata.metadata.reward_tree_hash_mode, PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD);
+        assert_eq!(with_id.header, input.get_new_guta_header());
+    }
+
+    #[test]
+    fn left_guta_right_end_cap_new_header_combines_stats_and_bumps_proof_count() {
+        let mut input = GUTAVerifyLeftGUTARightEndCapCircuitInputV2::<PF, Hash>::qp_rand_gen();
+        input.left_header.total_aggregation_proofs_generated = PF::from_u64_value(4);
+        let expected_stats = input.left_header.stats.combine_with(&input.right_end_cap.guta_stats);
+
+        let header = input.get_new_guta_header();
+        assert_eq!(header.stats, expected_stats);
+        assert_eq!(header.total_aggregation_proofs_generated, PF::from_u64_value(5));
+        assert_eq!(header.checkpoint_tree_root, input.left_header.checkpoint_tree_root);
+        assert_eq!(header.guta_circuit_whitelist, input.left_header.guta_circuit_whitelist);
+        assert_eq!(header.state_transition.node_index, input.left_header.state_transition.node_index);
+        assert_eq!(header.state_transition.node_level, input.left_header.state_transition.node_level);
+    }
+
+    #[test]
+    fn right_guta_left_end_cap_new_header_combines_stats_and_bumps_proof_count() {
+        let mut input = GUTAVerifyRightGUTALeftEndCapCircuitInputV2::<PF, Hash>::qp_rand_gen();
+        input.right_header.total_aggregation_proofs_generated = PF::from_u64_value(9);
+        let expected_stats = input.left_end_cap.guta_stats.combine_with(&input.right_header.stats);
+
+        let header = input.get_new_guta_header();
+        assert_eq!(header.stats, expected_stats);
+        assert_eq!(header.total_aggregation_proofs_generated, PF::from_u64_value(10));
+        assert_eq!(header.state_transition.old_node_value, input.left_global_user_tree_delta_merkle_proof.old_root);
+        assert_eq!(header.state_transition.new_node_value, input.right_header.state_transition.new_node_value);
+        assert_eq!(header.state_transition.node_index, input.right_header.state_transition.node_index);
+        assert_eq!(header.state_transition.node_level, input.right_header.state_transition.node_level);
+        assert_eq!(header.checkpoint_tree_root, input.right_header.checkpoint_tree_root);
+        assert_eq!(header.guta_circuit_whitelist, input.right_header.guta_circuit_whitelist);
+    }
+
+    #[test]
+    fn two_end_caps_new_header_shifts_index_by_sibling_count() {
+        let mut input = GUTAVerifyTwoEndCapCircuitInputV2::<PF, Hash>::qp_rand_gen();
+        input.right_global_user_tree_delta_merkle_proof.index = 0b10100;
+        input.right_global_user_tree_delta_merkle_proof.siblings = vec![Hash::qp_rand_gen(); 3];
+        let whitelist = Hash::qp_rand_gen();
+
+        let header = input.get_new_guta_header(5, whitelist);
+        assert_eq!(header.state_transition.node_index, PF::from_u64_value(0b10100 >> 3));
+        assert_eq!(header.state_transition.node_level, PF::from_u64_value(5 - 3));
+        assert_eq!(header.guta_circuit_whitelist, whitelist);
+        assert_eq!(header.checkpoint_tree_root, input.right_end_cap.checkpoint_historical_merkle_proof.root);
+        let expected_stats = input.left_end_cap.guta_stats.combine_with(&input.right_end_cap.guta_stats);
+        assert_eq!(header.stats, expected_stats);
+        assert_eq!(header.total_aggregation_proofs_generated, PF::from_u64_value(1));
+    }
+
+    #[test]
+    fn left_guta_right_end_cap_builds_results_headers_and_job_metadata() {
+        let input = GUTAVerifyLeftGUTARightEndCapCircuitInputV2::<PF, Hash>::qp_rand_gen();
+        let result = input.get_end_cap_result_b();
+        assert_eq!(result.user_id.to_u64_value(), input.right_global_user_tree_delta_merkle_proof.index);
+        assert_eq!(input.get_guta_header_a(), input.left_header);
+        let child = input.get_guta_header_b(12);
+        assert_eq!(child.state_transition.new_node_value, input.right_global_user_tree_delta_merkle_proof.new_value);
+        let new_header = input.get_new_guta_header();
+        assert_eq!(new_header.state_transition.new_node_value, input.right_global_user_tree_delta_merkle_proof.new_root);
+        assert_eq!(input.get_public_inputs_hash_no_rewards_tag::<PoseidonHasher>(), new_header.qfhash::<PoseidonHasher>());
+
+        let left_id = QProvingJobDataID::qp_rand_gen();
+        let right_id = QProvingJobDataID::qp_rand_gen();
+        let (metadata, with_id) = input.get_job_witness_and_new_guta::<PoseidonHasher>(7, 3, 2, left_id, right_id);
+        assert_eq!(metadata.job_id, with_id.job_id);
+        assert_eq!(metadata.metadata.dependencies, vec![left_id, right_id]);
+        assert_eq!(metadata.metadata.expected_public_inputs_hash, with_id.header.qfhash::<PoseidonHasher>());
+    }
+
+    #[test]
+    fn right_guta_left_end_cap_builds_both_headers() {
+        let input = GUTAVerifyRightGUTALeftEndCapCircuitInputV2::<PF, Hash>::qp_rand_gen();
+        assert_eq!(input.get_guta_header_b(), input.right_header);
+        let result = input.get_end_cap_result_a();
+        assert_eq!(result.user_id.to_u64_value(), input.left_global_user_tree_delta_merkle_proof.index);
+        let child = input.get_guta_header_a(10);
+        assert_eq!(child.state_transition.old_node_value, input.left_global_user_tree_delta_merkle_proof.old_value);
+        let new_header = input.get_new_guta_header();
+        assert_eq!(new_header.state_transition.new_node_value, input.right_header.state_transition.new_node_value);
+        assert_eq!(input.get_public_inputs_hash_no_rewards_tag::<PoseidonHasher>(), new_header.qfhash::<PoseidonHasher>());
+    }
+
+    #[test]
+    fn two_end_caps_build_results_child_headers_and_combined_header() {
+        let input = GUTAVerifyTwoEndCapCircuitInputV2::<PF, Hash>::qp_rand_gen();
+        let whitelist = Hash::qp_rand_gen();
+        let height = input.right_global_user_tree_delta_merkle_proof.siblings.len() + 2;
+        let a = input.get_end_cap_result_a();
+        let b = input.get_end_cap_result_b();
+        assert_eq!(a.user_id.to_u64_value(), input.left_global_user_tree_delta_merkle_proof.index);
+        assert_eq!(b.user_id.to_u64_value(), input.right_global_user_tree_delta_merkle_proof.index);
+        assert_eq!(input.get_guta_header_a(height, whitelist).guta_circuit_whitelist, whitelist);
+        assert_eq!(input.get_guta_header_b(height, whitelist).guta_circuit_whitelist, whitelist);
+        let combined = input.get_new_guta_header(height, whitelist);
+        assert_eq!(combined.state_transition.old_node_value, input.left_global_user_tree_delta_merkle_proof.old_root);
+        assert_eq!(combined.state_transition.new_node_value, input.right_global_user_tree_delta_merkle_proof.new_root);
+        assert_eq!(input.get_public_inputs_hash_no_rewards_tag::<PoseidonHasher>(height, whitelist), combined.qfhash::<PoseidonHasher>());
+    }
+}

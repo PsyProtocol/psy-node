@@ -251,3 +251,88 @@ impl<F: QFelt64, Hash: PartialEq + Copy> VerifyGUTAToCapUpgradeCheckpointCircuit
     }
 }
 
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+    use parth_core::{crypto::hash::traits::ZeroableHash, felt::FromPrimitiveValuesFelt, pgoldilocks::{PoseidonHasher, QHashOut}, utils::QPGenRandom, PF};
+    use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
+
+    type Hash = QHashOut<PF>;
+
+    #[test]
+    fn cap_inputs_cover_identity_and_merkle_lift_transitions() {
+        let mut input = VerifyGUTAToCapCircuitInputSimple::<PF, Hash>::qp_rand_gen();
+        input.top_line_siblings.clear();
+        let identity = input.get_new_state_transition::<PoseidonHasher>();
+        assert_eq!(identity, input.guta_proof_header.state_transition);
+
+        input.guta_proof_header.state_transition.node_index = PF::from_u64_value(6);
+        input.guta_proof_header.state_transition.node_level = PF::from_u64_value(3);
+        input.top_line_siblings = vec![Hash::get_zero_value()];
+        let lifted = input.get_new_state_transition::<PoseidonHasher>();
+        assert_eq!(lifted.node_index, PF::from_u64_value(3));
+        assert_eq!(lifted.node_level, PF::from_u64_value(2));
+        let header = input.get_new_guta_header::<PoseidonHasher>();
+        assert_eq!(header.total_aggregation_proofs_generated, input.guta_proof_header.total_aggregation_proofs_generated + PF::from_u64_value(1));
+        assert_eq!(input.get_public_inputs_hash_no_rewards_tag::<PoseidonHasher>(), header.qfhash::<PoseidonHasher>());
+    }
+
+    #[test]
+    fn checkpoint_upgrade_uses_the_new_checkpoint_root() {
+        let mut input = VerifyGUTAToCapUpgradeCheckpointCircuitInputSimple::<PF, Hash>::qp_rand_gen();
+        input.top_line_siblings.clear();
+        let header = input.get_new_guta_header::<PoseidonHasher>();
+        assert_eq!(header.checkpoint_tree_root, input.historical_checkpoint_proof.root);
+        assert_eq!(header.state_transition, input.guta_proof_header.state_transition);
+        assert_eq!(input.get_public_inputs_hash_no_rewards_tag::<PoseidonHasher>(), header.qfhash::<PoseidonHasher>());
+    }
+
+    #[test]
+    fn checkpoint_upgrade_lifts_transition_above_top_line_siblings() {
+        let mut input = VerifyGUTAToCapUpgradeCheckpointCircuitInputSimple::<PF, Hash>::qp_rand_gen();
+        input.guta_proof_header.state_transition.node_index = PF::from_u64_value(12);
+        input.guta_proof_header.state_transition.node_level = PF::from_u64_value(5);
+        input.top_line_siblings = vec![Hash::get_zero_value(); 2];
+
+        let lifted = input.get_new_state_transition::<PoseidonHasher>();
+        assert_eq!(lifted.node_index, PF::from_u64_value(3));
+        assert_eq!(lifted.node_level, PF::from_u64_value(3));
+        assert_ne!(lifted.old_node_value, input.guta_proof_header.state_transition.old_node_value);
+
+        let header = input.get_new_guta_header::<PoseidonHasher>();
+        assert_eq!(header.checkpoint_tree_root, input.historical_checkpoint_proof.root);
+        assert_eq!(header.state_transition, lifted);
+        assert_eq!(header.stats, input.guta_proof_header.stats);
+        assert_eq!(
+            header.total_aggregation_proofs_generated,
+            input.total_aggregation_proofs_generated + PF::from_u64_value(1)
+        );
+        assert_eq!(input.get_public_inputs_hash_no_rewards_tag::<PoseidonHasher>(), header.qfhash::<PoseidonHasher>());
+    }
+
+    // The fallback writer must emit exactly the canonical (speedy) encoding, and
+    // that payload must round-trip through the canonical reader. The fallback
+    // reader itself cannot be exercised here: chained nested speedy stream reads
+    // desynchronize the shared cursor (reported production bug).
+    #[test]
+    fn cap_inputs_fallback_write_matches_canonical_encoding() {
+        let mut input = VerifyGUTAToCapCircuitInputSimple::<PF, Hash>::qp_rand_gen();
+        let bytes = input.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(bytes.len(), input.fallback_pio_serialized_size());
+        assert_eq!(bytes, input.psy_ser_to_bytes_vec().unwrap());
+        assert_eq!(VerifyGUTAToCapCircuitInputSimple::<PF, Hash>::psy_ser_from_slice(&bytes).unwrap(), input);
+
+        // Empty top line siblings exercise the zero-length vector path.
+        input.top_line_siblings.clear();
+        let bytes = input.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(bytes.len(), GlobalUserTreeAggregatorHeader::<PF, Hash>::FIXED_SIZE + 4);
+        assert_eq!(bytes, input.psy_ser_to_bytes_vec().unwrap());
+        assert_eq!(VerifyGUTAToCapCircuitInputSimple::<PF, Hash>::psy_ser_from_slice(&bytes).unwrap(), input);
+
+        let upgrade = VerifyGUTAToCapUpgradeCheckpointCircuitInputSimple::<PF, Hash>::qp_rand_gen();
+        let bytes = upgrade.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(bytes.len(), upgrade.fallback_pio_serialized_size());
+        assert_eq!(bytes, upgrade.psy_ser_to_bytes_vec().unwrap());
+        assert_eq!(VerifyGUTAToCapUpgradeCheckpointCircuitInputSimple::<PF, Hash>::psy_ser_from_slice(&bytes).unwrap(), upgrade);
+    }
+}

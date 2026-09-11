@@ -209,3 +209,115 @@ pub fn generate_tree_inputs_from_leaves<LA: TPLeafAggregator<IL, IO>, IL: Clone,
 
     output
 }
+
+#[cfg(test)]
+mod tests {
+    use parth_core::pgoldilocks::{PoseidonHasher, QHashOut};
+    use parth_core::PF;
+
+    use super::*;
+    use crate::agg::AggStateTransition;
+
+    struct CollectLeaves;
+
+    impl TPLeafAggregator<u64, Vec<u64>> for CollectLeaves {
+        fn get_output_from_inputs(left: &Vec<u64>, right: &Vec<u64>) -> Vec<u64> {
+            left.iter().chain(right).copied().collect()
+        }
+
+        fn get_output_from_left_leaf(left: &u64, right: &Vec<u64>) -> Vec<u64> {
+            core::iter::once(*left).chain(right.iter().copied()).collect()
+        }
+
+        fn get_output_from_right_leaf(left: &Vec<u64>, right: &u64) -> Vec<u64> {
+            left.iter().copied().chain(core::iter::once(*right)).collect()
+        }
+
+        fn get_output_from_leaves(left: &u64, right: &u64) -> Vec<u64> {
+            vec![*left, *right]
+        }
+    }
+
+    #[test]
+    fn planners_aggregate_even_and_odd_leaf_sets() {
+        assert!(generate_tree_inputs_from_leaves::<CollectLeaves, _, _>(&[]).is_empty());
+        assert!(generate_tree_inputs_with_position::<CollectLeaves, _, _>(&[1]).is_empty());
+
+        for leaves in [vec![1, 2], vec![1, 2, 3], vec![1, 2, 3, 4], vec![1, 2, 3, 4, 5]] {
+            let values = generate_tree_inputs_from_leaves::<CollectLeaves, _, _>(&leaves);
+            assert_eq!(values.last().unwrap()[0], leaves);
+
+            let jobs = generate_tree_inputs_with_position::<CollectLeaves, _, _>(&leaves);
+            assert_eq!(jobs.last().unwrap()[0].input, leaves);
+            assert_eq!(jobs.last().unwrap()[0].tree_position.position.index, 0);
+        }
+    }
+
+    #[test]
+    fn aggregator_helpers_and_fingerprint_configs_preserve_inputs() {
+        type Hash = QHashOut<PF>;
+        type Leaf = AggStateTransition<Hash>;
+        type Input = AggStateTransitionInput<Hash>;
+        let leaf = AggStateTransition::new(
+            QHashOut::<PF>::from_values(1, 0, 0, 0),
+            QHashOut::<PF>::from_values(2, 0, 0, 0),
+        );
+        let right = AggStateTransition::new(
+            QHashOut::<PF>::from_values(2, 0, 0, 0),
+            QHashOut::<PF>::from_values(3, 0, 0, 0),
+        );
+        let leaves = <AggWTLeafAggregator as TPLeafAggregator<Leaf, Input>>::get_output_from_leaves(&leaf, &right);
+        assert!(leaves.left_proof_is_leaf && leaves.right_proof_is_leaf);
+        let input_pair = <AggWTLeafAggregator as TPLeafAggregator<Leaf, Input>>::get_output_from_inputs(&leaves, &leaves);
+        assert!(!input_pair.left_proof_is_leaf && !input_pair.right_proof_is_leaf);
+        assert!(<AggWTLeafAggregator as TPLeafAggregator<Leaf, Input>>::get_output_from_left_leaf(&leaf, &leaves).left_proof_is_leaf);
+        assert!(<AggWTLeafAggregator as TPLeafAggregator<Leaf, Input>>::get_output_from_right_leaf(&leaves, &right).right_proof_is_leaf);
+
+        let leaf_fingerprint = QHashOut::<PF>::default();
+        let aggregator_fingerprint = QHashOut::<PF>::default();
+        let dummy_fingerprint = QHashOut::<PF>::default();
+        let config = TPCircuitFingerprintConfig::from_leaf_and_agg_fingerprints::<PoseidonHasher>(
+            leaf_fingerprint,
+            aggregator_fingerprint,
+            dummy_fingerprint,
+        );
+        assert_eq!(config.leaf_circuit_type, 255);
+        assert_eq!(config.aggregator_circuit_type, 255);
+        let typed = TPCircuitFingerprintConfig::from_leaf_and_agg_fingerprints_with_type::<PoseidonHasher>(
+            leaf_fingerprint,
+            aggregator_fingerprint,
+            dummy_fingerprint,
+            4,
+            9,
+        );
+        assert_eq!(typed.leaf_circuit_type, 4);
+        assert_eq!(typed.aggregator_circuit_type, 9);
+
+        let position = BinaryTreePlanner::new(2).levels[0][0];
+        let job = TreeAggJob::new(vec![1, 2], position);
+        assert_eq!(job.input, vec![1, 2]);
+        assert_eq!(job.tree_position, position);
+    }
+
+    #[test]
+    fn alt_fingerprint_config_preserves_fields() {
+        type Hash = QHashOut<PF>;
+        let config = TPAltCircuitFingerprintConfig {
+            leaf_fingerprint: QHashOut::<PF>::from_values(1, 0, 0, 0),
+            aggregator_fingerprint: QHashOut::<PF>::from_values(2, 0, 0, 0),
+            dummy_fingerprint: QHashOut::<PF>::from_values(3, 0, 0, 0),
+            verifier_data_cap_height: 30,
+        };
+        // The config is plain copy data: copying keeps every field intact.
+        let copy = config;
+        assert_eq!(copy.leaf_fingerprint, config.leaf_fingerprint);
+        assert_eq!(copy.aggregator_fingerprint, config.aggregator_fingerprint);
+        assert_eq!(copy.dummy_fingerprint, config.dummy_fingerprint);
+        assert_eq!(copy.verifier_data_cap_height, 30);
+
+        let mut set = std::collections::HashSet::new();
+        assert!(set.insert(config));
+        assert!(!set.insert(copy));
+        assert_eq!(set.len(), 1);
+    }
+}

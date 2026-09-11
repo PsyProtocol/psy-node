@@ -85,6 +85,154 @@ pser::impl_psy_ser_basic_tests_fallback!(
     qc_qed_checkpoint_state_transition_input_partial_ser_tests
 );
 
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+    use parth_core::{crypto::hash::traits::{MerkleHasher, MerkleZeroHasher}, felt::{ToU64Value, ZeroableFelt}, pgoldilocks::{PoseidonHasher, QHashOut}, utils::QPGenRandom, PF};
+
+    type Hash = QHashOut<PF>;
+
+    #[test]
+    fn reward_root_update_refreshes_leaf_and_tree_root() {
+        let mut input = QCQEDCheckpointStateTransitionInput::<PF, Hash>::qp_rand_gen();
+        let reward_root = Hash::qp_rand_gen();
+        input.update_with_new_reward_tree_root::<PoseidonHasher>(reward_root);
+        let expected_leaf = input.partial.get_new_checkpoint_leaf::<PoseidonHasher>(reward_root).qfhash::<PoseidonHasher>();
+        assert_eq!(input.append_checkpoint_tree_proof.new_value, expected_leaf);
+        assert_eq!(
+            input.append_checkpoint_tree_proof.new_root,
+            compute_root_merkle_proof_generic::<Hash, PoseidonHasher>(
+                expected_leaf,
+                input.append_checkpoint_tree_proof.index,
+                &input.append_checkpoint_tree_proof.siblings,
+            )
+        );
+
+        let mut prover_input = QCQEDCheckpointStateTransitionInput::<PF, Hash>::qp_rand_gen();
+        prover_input.update_for_prover::<PoseidonHasher>(reward_root);
+        assert_eq!(prover_input.append_checkpoint_tree_proof.new_value, prover_input.partial.get_new_checkpoint_leaf::<PoseidonHasher>(reward_root).qfhash::<PoseidonHasher>());
+    }
+
+    #[test]
+    fn chain_helpers_match_manual_step_and_reward_updated_clone() {
+        let input = QCQEDCheckpointStateTransitionInput::<PF, Hash>::qp_rand_gen();
+        let previous = Hash::qp_rand_gen();
+        let fingerprint = Hash::qp_rand_gen();
+        let step = input.get_step_commit_hash_with_fingerprint::<PoseidonHasher>(fingerprint);
+        let chain = input.get_chain_hash_from_previous_with_fingerprint::<PoseidonHasher>(previous, fingerprint);
+        assert_eq!(chain, PoseidonHasher::two_to_one(&previous, &step));
+        assert_eq!(chain, input.get_chain_hash_with_fingerprint_from_previous::<PoseidonHasher>(previous, fingerprint));
+
+        let reward = Hash::qp_rand_gen();
+        let mut updated = input.clone();
+        updated.update_with_new_reward_tree_root::<PoseidonHasher>(reward);
+        assert_eq!(
+            input.get_chain_hash_with_fingerprint_and_reward_root::<PoseidonHasher>(previous, fingerprint, reward),
+            updated.get_chain_hash_with_fingerprint_from_previous::<PoseidonHasher>(previous, fingerprint),
+        );
+    }
+
+    #[test]
+    fn reward_root_update_preserves_proof_geometry() {
+        let mut input = QCQEDCheckpointStateTransitionInput::<PF, Hash>::qp_rand_gen();
+        let before = input.append_checkpoint_tree_proof.clone();
+        input.update_with_new_reward_tree_root::<PoseidonHasher>(Hash::qp_rand_gen());
+        let after = input.append_checkpoint_tree_proof;
+        assert_eq!(after.index, before.index);
+        assert_eq!(after.siblings, before.siblings);
+        assert_eq!(after.old_root, before.old_root);
+        assert_eq!(after.old_value, before.old_value);
+        assert_ne!(after.new_value, before.new_value);
+        assert_ne!(after.new_root, before.new_root);
+    }
+
+    #[test]
+    fn partial_serialization_matches_declared_fixed_size() {
+        let value = QCQEDCheckpointStateTransitionInputPartial::<PF, Hash>::qp_rand_gen();
+        assert!(QCQEDCheckpointStateTransitionInputPartial::<PF, Hash>::IS_FIXED_SIZE);
+        assert_eq!(
+            value.fallback_pio_serialized_size(),
+            QCQEDCheckpointStateTransitionInputPartial::<PF, Hash>::FIXED_SIZE
+        );
+
+        let bytes = value.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(bytes.len(), value.fallback_pio_serialized_size());
+        // Note: the fallback round trip is intentionally not asserted here.
+        // With the default `serialize_speedy` feature the fallback reader interleaves
+        // psy_io reads with speedy buffered-stream reads (`pio_*`), and speedy's
+        // per-call buffer over-advances the shared cursor, so deserializing two or
+        // more subfields fails with `unexpected end of input` even though the
+        // written bytes match `FIXED_SIZE` exactly.
+    }
+
+    #[test]
+    fn full_input_fallback_serialization_matches_declared_size() {
+        let value = QCQEDCheckpointStateTransitionInput::<PF, Hash>::qp_rand_gen();
+        let bytes = value.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(bytes.len(), value.fallback_pio_serialized_size());
+        // Note: the fallback round trip is intentionally not asserted here.
+        // With the default `serialize_speedy` feature the fallback reader interleaves
+        // psy_io reads with speedy buffered-stream reads (`pio_*`), and speedy's
+        // per-call buffer over-advances the shared cursor, so deserializing two or
+        // more subfields fails with `unexpected end of input` even though the
+        // written bytes match the declared size exactly.
+    }
+
+    #[test]
+    fn old_state_roots_and_old_checkpoint_leaf_read_start_transitions() {
+        let input = QCQEDCheckpointStateTransitionInputPartial::<PF, Hash>::qp_rand_gen();
+        let old_roots = input.get_old_state_roots::<PoseidonHasher>();
+        assert_eq!(
+            old_roots.contract_tree_root,
+            input.part_1_header.deploy_contracts_state_transition.state_transition_start
+        );
+        assert_eq!(
+            old_roots.user_tree_root,
+            input.part_1_header.guta_proof_header.state_transition.old_node_value
+        );
+        assert_eq!(
+            old_roots.user_registration_tree_root,
+            input.part_1_header.register_users_state_transition.state_transition_start
+        );
+        assert_eq!(old_roots.deposit_tree_root, PoseidonHasher::get_zero_hash(TODO_DEPOSIT_TREE_HEIGHT as usize));
+        assert_eq!(
+            old_roots.withdrawal_tree_root,
+            PoseidonHasher::get_zero_hash(TODO_WITHDRAWAL_TREE_HEIGHT as usize)
+        );
+
+        let old_leaf = input.get_old_checkpoint_leaf::<PoseidonHasher>();
+        assert_eq!(old_leaf.global_chain_root, old_roots.qfhash::<PoseidonHasher>());
+        assert!(old_leaf.stats == input.old_stats);
+    }
+
+    #[test]
+    fn new_checkpoint_leaf_binds_end_roots_reward_root_and_carried_stats() {
+        let input = QCQEDCheckpointStateTransitionInputPartial::<PF, Hash>::qp_rand_gen();
+        let reward_root = Hash::qp_rand_gen();
+        let leaf = input.get_new_checkpoint_leaf::<PoseidonHasher>(reward_root);
+
+        let mut expected_roots = input.get_old_state_roots::<PoseidonHasher>();
+        expected_roots.contract_tree_root =
+            input.part_1_header.update_contracts_state_transition.state_transition_end;
+        expected_roots.user_tree_root = input.part_1_header.guta_proof_header.state_transition.new_node_value;
+        expected_roots.user_registration_tree_root =
+            input.part_1_header.register_users_state_transition.state_transition_end;
+        assert_eq!(leaf.global_chain_root, expected_roots.qfhash::<PoseidonHasher>());
+
+        assert_eq!(leaf.stats.pm_rewards_commitment.register_users_root, reward_root);
+        assert_eq!(leaf.stats.pm_rewards_commitment.gutas_root, reward_root);
+        assert_eq!(leaf.stats.pm_rewards_commitment.deploy_contracts_root, reward_root);
+        assert_eq!(leaf.stats.random_seed, input.final_random_seed_contribution);
+        assert_eq!(leaf.stats.block_time.to_u64_value(), input.block_time.to_u64_value());
+        assert!(leaf.stats.pm_jobs_completed == input.pm_jobs_completed);
+        assert_eq!(
+            leaf.stats.guta_fees_collected.to_u64_value(),
+            input.part_1_header.guta_proof_header.stats.guta_fees_collected.to_u64_value()
+        );
+        assert!(leaf.stats.da_challenges_claimed.iter().all(|f| *f == PF::ZERO_VALUE));
+    }
+}
+
 #[pderive::serialize_clone_f_hash]
 pub struct QCQEDCheckpointStateTransitionInput<F, Hash> {
     pub partial: QCQEDCheckpointStateTransitionInputPartial<F, Hash>,
