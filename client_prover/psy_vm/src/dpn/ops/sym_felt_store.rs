@@ -57,3 +57,47 @@ impl SymFeltStore {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dpn::ops::op_types::DPNOpType;
+
+    #[test]
+    fn stores_derived_references_and_rebuilds_their_definition_tree() {
+        let mut store = SymFeltStore::new();
+        let left = SymFeltRef::new_constant(2);
+        let right = SymFeltRef::new_constant(3);
+        let add = store.insert(SymFeltRefValue {
+            op_type: DPNOpType::Add,
+            const_param: 0,
+            inputs: vec![left, right],
+        });
+
+        assert!(store.contains(add));
+        assert_eq!(store.get_opt(add).unwrap().inputs, vec![left, right]);
+        assert_eq!(store.get_direct_children(add), vec![left, right]);
+        assert_eq!(store.get_def(add), SymFeltDef {
+            op_type: DPNOpType::Add,
+            const_param: 0,
+            inputs: vec![left.get_inline_def(), right.get_inline_def()],
+        });
+    }
+
+    #[test]
+    fn inline_references_do_not_consume_store_entries() {
+        let mut store = SymFeltStore::new();
+        let constant = SymFeltRef::new_constant(7);
+        let key = store.insert(SymFeltRefValue {
+            op_type: DPNOpType::Constant,
+            const_param: 7,
+            inputs: vec![],
+        });
+
+        assert_eq!(key, constant);
+        assert!(!store.contains(key));
+        assert!(store.get_opt(key).is_none());
+        assert!(store.get_direct_children(key).is_empty());
+        assert_eq!(store.get_def(key), constant.get_inline_def());
+    }
+}

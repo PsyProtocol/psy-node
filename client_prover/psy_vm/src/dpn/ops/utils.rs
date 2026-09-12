@@ -123,3 +123,40 @@ impl<T: FeltSized, const N: usize> IndexMut<SymFeltRef> for SparseArray<T, N> {
 pub trait QStatefulContract<T> {
     fn get_contract_state_for_user(&self, user_id: SymFeltRef, contract_id: SymFeltRef) -> T;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dpn::ops::exec_context::QExecContext;
+    use crate::dpn::ops::op_types::DPNOpType;
+
+    #[test]
+    fn u252_converts_to_felts_and_exercises_comparison_placeholder_contract() {
+        let low = U252([SymFeltRef::new_constant(1); 4]);
+        let high = U252([SymFeltRef::new_constant(2); 4]);
+        assert_eq!(low.to_felts(), low.0.to_vec());
+        assert_eq!(U252::from_felts(&high.to_felts()), high);
+        assert_eq!(low.gt(high).get_constant_value(), 1);
+        assert_eq!(low.gte(high).get_constant_value(), 1);
+        assert_eq!(high.gt(low).get_constant_value(), 0);
+        assert_eq!(low.add(high).to_felts(), vec![SymFeltRef::new_constant(1); 4]);
+        assert_eq!(low.sub(high).to_felts(), vec![SymFeltRef::new_constant(1); 4]);
+    }
+
+    #[test]
+    fn sparse_array_get_set_uses_element_size_and_preserves_state_metadata() {
+        let array = SparseArray::<SymFeltRef, 4>::create_stateful_at(
+            &mut QExecContext::new(),
+            SymFeltRef::new_constant(10),
+            16,
+            SymFeltRef::new_constant(2),
+            SymFeltRef::new_constant(3),
+        );
+        let mut context = QExecContext::new();
+        let value = array.get(&mut context, SymFeltRef::new_constant(2));
+        assert_eq!(value.get_op_type(), DPNOpType::GetStateCommandResultSingle);
+        array.q_get(&mut context, SymFeltRef::new_constant(0));
+        array.set(&mut context, SymFeltRef::new_constant(1), SymFeltRef::new_constant(99));
+        assert_eq!(context.events.len(), 0);
+    }
+}

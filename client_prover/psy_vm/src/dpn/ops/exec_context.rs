@@ -31,6 +31,340 @@ pub struct EventRecord<F: ContextFelt> {
     pub data: Vec<F>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use plonky2::field::types::Field64;
+
+    #[test]
+    fn builds_scalar_expression_graphs_and_constant_folds_all_basic_operator_families() {
+        let mut ctx = QExecContext::new();
+        let target = ctx.add_input();
+        let u32_value = ctx.add_u32_input();
+        let boolean = ctx.add_bool_input();
+        let one = ctx.op_const(1);
+        let two = ctx.op_const(2);
+        let u32_one = ctx.op_const_u32(1);
+        let u32_two = ctx.op_const_u32(2);
+
+        assert_eq!(ctx.op_add(one, two).get_constant_value(), 3);
+        assert_eq!(ctx.op_sub(two, one).get_constant_value(), 1);
+        assert_eq!(ctx.op_mul(two, two).get_constant_value(), 4);
+        assert_eq!(ctx.op_div(two, two).get_constant_value(), 1);
+        assert_eq!(ctx.op_mod(two, two).get_constant_value(), 0);
+        assert_eq!(ctx.op_exp(two, u32_two).get_op_type(), DPNOpType::ExpConstantPower);
+        assert_eq!(ctx.op_bool_not(SymFeltRef::constant_false()).get_constant_value(), 1);
+        assert_eq!(ctx.op_bool_and(SymFeltRef::constant_true(), SymFeltRef::constant_true()).get_constant_value(), 1);
+        assert_eq!(ctx.op_bool_or(SymFeltRef::constant_false(), SymFeltRef::constant_true()).get_constant_value(), 1);
+        assert_eq!(ctx.op_bool_xor(one, two).get_constant_value(), 3);
+        assert_eq!(ctx.op_eq(one, one).get_constant_value(), 1);
+        assert_eq!(ctx.op_neq(one, two).get_constant_value(), 1);
+        assert_eq!(ctx.op_lt(one, two).get_constant_value(), 1);
+        assert_eq!(ctx.op_lte(one, two).get_constant_value(), 1);
+        assert_eq!(ctx.op_gt(two, one).get_constant_value(), 1);
+        assert_eq!(ctx.op_gte(two, one).get_constant_value(), 1);
+        assert_eq!(ctx.op_u32_add(u32_one, u32_two).get_constant_value(), 3);
+        assert_eq!(ctx.op_u32_sub(u32_two, u32_one).get_constant_value(), 1);
+        assert_eq!(ctx.op_u32_mul(u32_two, u32_two).get_constant_value(), 4);
+        assert_eq!(ctx.op_u32_div(u32_two, u32_two).get_constant_value(), 1);
+        assert_eq!(ctx.op_u32_mod(u32_two, u32_two).get_constant_value(), 0);
+        assert_eq!(ctx.op_u32_exp(u32_two, u32_two).get_constant_value(), 4);
+        assert_eq!(ctx.op_u32_and(u32_one, u32_two).get_constant_value(), 0);
+        assert_eq!(ctx.op_u32_or(u32_one, u32_two).get_constant_value(), 3);
+        assert_eq!(ctx.op_u32_xor(u32_one, u32_two).get_constant_value(), 3);
+        assert_eq!(ctx.op_u32_shl(u32_one, u32_one).get_constant_value(), 2);
+        assert_eq!(ctx.op_u32_shr(u32_two, u32_one).get_constant_value(), 1);
+        assert_eq!(ctx.op_select(SymFeltRef::constant_true(), one, two), one);
+        assert_eq!(ctx.op_select(SymFeltRef::constant_false(), one, two), two);
+        assert_eq!(ctx.op_cast_u32(one).get_op_type(), DPNOpType::ConstantU32);
+        assert_eq!(ctx.op_cast_felt(u32_one).get_op_type(), DPNOpType::Constant);
+        assert_eq!(ctx.op_cast_bool(one).get_op_type(), DPNOpType::ConstantTrue);
+        assert_eq!(ctx.op_bool_or_many(&[boolean, SymFeltRef::constant_false()]).get_op_type(), DPNOpType::BoolOr);
+        assert_eq!(ctx.op_bool_and_many(&[boolean, SymFeltRef::constant_true()]).get_op_type(), DPNOpType::BoolAnd);
+        assert_eq!(ctx.op_add(target, one).get_op_type(), DPNOpType::Add);
+        assert_eq!(ctx.op_u32_add(u32_value, u32_one).get_op_type(), DPNOpType::U32Add);
+        assert_eq!(ctx.input_count, 3);
+    }
+
+    #[test]
+    fn builds_state_control_flow_hash_checkpoint_and_imt_graphs() {
+        let mut ctx = QExecContext::new_with_contract_state_tree_height(8);
+        let zero = ctx.op_const(0);
+        let one = ctx.op_const(1);
+        let two = ctx.op_const(2);
+        let key = [one, two, zero, one];
+        let value = [two, one, two, one];
+
+        let true_value = ctx.op_true();
+        ctx.assert_true(true_value, "true assertion");
+        let first_condition = ctx.op_eq(one, one);
+        ctx.start_if_block(first_condition);
+        ctx.cset_state_at(zero, two);
+        ctx.emit_event(vec![one, two]);
+        let second_condition = ctx.op_eq(one, two);
+        ctx.start_else_if_block(second_condition);
+        ctx.cset_state_range_at(one, &[one, two]);
+        ctx.start_else_block();
+        ctx.cset_state_hash_at(one, value);
+        ctx.end_if_block();
+        assert_eq!(ctx.get_current_condition(), SymFeltRef::constant_true());
+
+        let current_hash = ctx.get_state_hash_at(zero);
+        assert_eq!(current_hash.len(), 4);
+        assert_eq!(ctx.get_state_range_at(one, two).len(), 2);
+        assert_eq!(ctx.get_other_contract_state_hash_at(two, two, zero).len(), 4);
+        assert_eq!(ctx.get_other_user_contract_state_hash_at(two, one, two, zero).len(), 4);
+        assert_eq!(ctx.get_other_user_contract_state_range_at(two, one, two, zero, two).len(), 2);
+
+        assert_eq!(ctx.hash(&[one, two]).len(), 4);
+        assert_eq!(ctx.hash_two_to_one(&key, &value).len(), 4);
+        assert_eq!(ctx.keccak256(&[one, two]).len(), 8);
+        let bits = ctx.split_bits(one, 4);
+        assert_eq!(bits.len(), 4);
+        assert_eq!(ctx.sum_bits(&bits).get_op_type(), DPNOpType::SumBits);
+
+        assert_eq!(ctx.get_contract_deployer(one).len(), 4);
+        ctx.get_contract_state_tree_height(one);
+        ctx.get_user_public_key_hash();
+        ctx.get_session_proof_tree_root();
+        ctx.get_checkpoint_stats(one);
+        ctx.get_register_users_root(one);
+        ctx.get_gutas_root(one);
+        ctx.get_deploy_contracts_root(one);
+        ctx.get_guta_fees_collected(one);
+        ctx.get_da_fees_collected(one);
+        ctx.get_user_ops_processed(one);
+        ctx.get_total_transactions(one);
+        ctx.get_slots_modified(one);
+        ctx.get_register_users_completed(one);
+        ctx.get_gutas_completed(one);
+        ctx.get_deploy_contracts_completed(one);
+        ctx.get_global_state_roots(one);
+        ctx.get_checkpoint_user_tree_root(one);
+        ctx.get_checkpoint_contract_tree_root(one);
+        ctx.get_checkpoint_deposit_tree_root(one);
+        ctx.get_checkpoint_withdrawal_tree_root(one);
+        ctx.get_checkpoint_user_registration_tree_root(one);
+
+        assert_eq!(ctx.imt_get_value(key, zero, two).len(), 4);
+        assert_eq!(ctx.imt_get_other_user_value(two, one, two, key, zero, two).len(), 4);
+        ctx.imt_contains_other_user(two, one, two, key, zero, two);
+        assert_eq!(ctx.imt_insert(key, value, zero, two).len(), 4);
+        assert_eq!(ctx.imt_update(key, value, zero, two).len(), 4);
+        ctx.imt_contains(key, zero, two);
+        ctx.clear_entire_tree();
+        ctx.cinvoke_external_contract_function_sync(two, one, vec![one, two], 2);
+        ctx.cinvoke_external_contract_function_deferred(two, one, vec![one, two]);
+
+        assert!(!ctx.state_cmd_store.commands.is_empty());
+        assert!(!ctx.events.is_empty());
+    }
+
+    #[test]
+    fn simplification_cast_shift_and_conditional_boundaries_cover_nonconstant_paths() {
+        let mut ctx = QExecContext::new();
+        ctx.finalize();
+        let target = ctx.add_input();
+        let other = ctx.add_input();
+        let u32_input = ctx.add_u32_input();
+        let bool_input = ctx.add_bool_input();
+        assert_eq!(ctx.add_inputs(0), Vec::<SymFeltRef>::new());
+        assert_eq!(ctx.add_inputs(2).len(), 2);
+        let seven = ctx.op_const(7);
+        assert_eq!(ctx.get_constant_value(seven), 7);
+        assert_eq!(ctx.get_op_type(target), DPNOpType::InputTarget);
+
+        let zero = ctx.op_const(0);
+        let one = ctx.op_const(1);
+        let two = ctx.op_const(2);
+        let above_u32 = ctx.op_const(u32::MAX as u64 + 1);
+        let u32_one = ctx.op_const_u32(1);
+        assert_eq!(ctx.op_add(target, zero), target);
+        assert_eq!(ctx.op_sub(target, zero), target);
+        assert_eq!(ctx.op_mul(target, zero), target);
+        assert_eq!(ctx.op_select(bool_input, target, target), target);
+        assert_eq!(ctx.op_select(zero, target, other), other);
+        assert_eq!(ctx.op_select(two, target, other), target);
+        assert_eq!(ctx.op_cast_u32(u32_input), u32_input);
+        assert_eq!(ctx.op_cast_felt(target), target);
+        assert_eq!(ctx.op_cast_bool(bool_input), bool_input);
+        assert_eq!(ctx.op_cast_bool(zero), SymFeltRef::constant_false());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.op_cast_bool(two))).is_err());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.op_cast_u32(above_u32))).is_err());
+
+        assert_eq!(ctx.op_bool_and(u32_one, u32_one).get_constant_value(), 1);
+        assert_eq!(ctx.op_bool_or(u32_one, u32_one).get_constant_value(), 1);
+        assert_eq!(ctx.op_bool_xor(u32_one, u32_one).get_constant_value(), 0);
+        assert_eq!(ctx.op_add(u32_one, u32_one).get_constant_value(), 2);
+        assert_eq!(ctx.op_sub(u32_one, u32_one).get_constant_value(), 0);
+        assert_eq!(ctx.op_mul(u32_one, u32_one).get_constant_value(), 1);
+        assert_eq!(ctx.op_div(u32_one, u32_one).get_constant_value(), 1);
+        assert_eq!(ctx.op_eq(u32_one, u32_one).get_constant_value(), 1);
+        assert_eq!(ctx.op_neq(u32_one, u32_one).get_constant_value(), 0);
+        assert_eq!(ctx.op_lt(u32_one, u32_one).get_constant_value(), 0);
+        assert_eq!(ctx.op_lte(u32_one, u32_one).get_constant_value(), 1);
+        assert_eq!(ctx.op_gt(u32_one, u32_one).get_constant_value(), 0);
+        assert_eq!(ctx.op_gte(u32_one, u32_one).get_constant_value(), 1);
+        assert_eq!(ctx.op_neg(one).get_constant_value(), GoldilocksField::ORDER - 1);
+
+        assert_eq!(ctx.op_exp(u32_one, target).get_op_type(), DPNOpType::ExpConstantBase);
+        assert_eq!(ctx.op_exp(target, u32_one).get_op_type(), DPNOpType::ExpConstantPower);
+        assert_eq!(ctx.op_u32_shl(u32_one, u32_input).get_op_type(), DPNOpType::U32ShiftLeftConstantValue);
+        assert_eq!(ctx.op_u32_shl(u32_input, u32_one).get_op_type(), DPNOpType::U32ShiftLeftConstantBitDistance);
+        assert_eq!(ctx.op_u32_shl(u32_input, target).get_op_type(), DPNOpType::U32ShiftLeft);
+        assert_eq!(ctx.op_u32_shr(u32_one, u32_input).get_op_type(), DPNOpType::U32ShiftRightConstantValue);
+        assert_eq!(ctx.op_u32_shr(u32_input, u32_one).get_op_type(), DPNOpType::U32ShiftRightConstantBitDistance);
+        assert_eq!(ctx.op_u32_shr(u32_input, target).get_op_type(), DPNOpType::U32ShiftRight);
+
+        let before = ctx.assertions.len();
+        ctx.start_if_block(SymFeltRef::constant_false());
+        ctx.assert_eq(target, other, "skipped");
+        assert_eq!(ctx.cset(target, other), target);
+        ctx.end_if_block();
+        assert_eq!(ctx.assertions.len(), before);
+        ctx.start_if_block(bool_input);
+        ctx.assert_eq(target, other, "conditional");
+        assert_eq!(ctx.cset(target, other).get_op_type(), DPNOpType::Select);
+        ctx.end_if_block();
+        assert_eq!(ctx.assertions.len(), before + 1);
+    }
+
+    #[test]
+    fn state_reference_error_and_side_effect_boundaries_are_explicit() {
+        let mut ctx = QExecContext::new();
+        let zero = ctx.op_const(0);
+        let one = ctx.op_const(1);
+        let current_contract = ctx.get_contract_id();
+        let current_user = ctx.get_user_id();
+        assert_eq!(ctx.create_contract_state_ref(32, current_contract, current_user, SymFeltRef::constant_true(), zero, vec![one]).get_op_type(), DPNOpType::GetStateCommandResultArray);
+        assert_eq!(ctx.create_contract_state_ref(32, current_contract, current_user, SymFeltRef::constant_true(), zero, vec![one, zero]).get_op_type(), DPNOpType::GetStateCommandResultArray);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ctx.create_contract_state_ref(32, one, current_user, SymFeltRef::constant_true(), zero, vec![one])
+        }))
+        .is_err());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ctx.create_contract_state_ref(32, current_contract, one, SymFeltRef::constant_true(), zero, vec![one])
+        }))
+        .is_err());
+        let before = ctx.state_cmd_store.commands.len();
+        ctx.resolve_state_cmd_side_effect(DPNStateCmd::ClearEntireTree(DPNStateCmdClearEntireTree { condition: SymFeltRef::constant_true() }));
+        assert_eq!(ctx.state_cmd_store.commands.len(), before + 1);
+    }
+
+    #[test]
+    fn state_get_reference_covers_every_owner_scope_and_length_boundary() {
+        let mut ctx = QExecContext::new();
+        let height = ctx.op_const(32);
+        let slot = ctx.op_const(9);
+        let current_contract = ctx.get_contract_id();
+        let current_user = ctx.get_user_id();
+        let external_contract = ctx.op_const(17);
+        let other_user = ctx.op_const(23);
+
+        let cases = [
+            (current_contract, current_user, 1, DPNOpType::GetStateCommandResultSingle),
+            (current_contract, current_user, 0, DPNOpType::GetStateCommandResultArray),
+            (external_contract, current_user, 1, DPNOpType::GetStateCommandResultSingle),
+            (external_contract, current_user, 2, DPNOpType::GetStateCommandResultArray),
+            (current_contract, other_user, 1, DPNOpType::GetStateCommandResultSingle),
+            (external_contract, other_user, u32::MAX, DPNOpType::GetStateCommandResultArray),
+        ];
+        for (contract, user, length, expected) in cases {
+            assert_eq!(ctx.create_contract_state_get_ref(height, contract, user, slot, length).get_op_type(), expected);
+        }
+        assert_eq!(ctx.state_cmd_store.commands.len(), cases.len());
+    }
+
+    #[test]
+    fn add_simplification_handles_nested_constants_on_both_sides() {
+        let mut ctx = QExecContext::new();
+        let input = ctx.add_input();
+        let zero = ctx.op_const(0);
+        let two = ctx.op_const(2);
+        let three = ctx.op_const(3);
+
+        assert_eq!(ctx.simplify_add(zero, input), input);
+        assert_eq!(ctx.simplify_add(input, zero), input);
+
+        let constant_first = ctx.op_add(two, input);
+        let folded_first = ctx.simplify_add(three, constant_first);
+        assert_eq!(folded_first.get_op_type(), DPNOpType::Add);
+        assert_eq!(ctx.store.get_direct_children(folded_first)[0].get_constant_value(), 5);
+
+        let constant_second = ctx.op_add(input, two);
+        let folded_second = ctx.simplify_add(three, constant_second);
+        assert_eq!(ctx.store.get_direct_children(folded_second)[0].get_constant_value(), 5);
+
+        let reversed = ctx.simplify_add(constant_second, three);
+        assert_eq!(ctx.store.get_direct_children(reversed)[0].get_constant_value(), 5);
+        let other_input = ctx.add_input();
+        assert_eq!(ctx.simplify_add(input, other_input).get_op_type(), DPNOpType::Add);
+    }
+
+    #[test]
+    fn control_flow_cast_identity_and_protocol_value_boundaries_are_explicit() {
+        let mut ctx = QExecContext::new_with_contract_state_tree_height(19);
+        let target = ctx.add_input();
+        let u32_input = ctx.add_u32_input();
+        let bool_input = ctx.add_bool_input();
+        let zero = ctx.op_const(0);
+        let one = ctx.op_const(1);
+
+        assert_eq!(ctx.op_cast_u32(target).get_op_type(), DPNOpType::CastU32);
+        assert_eq!(ctx.op_cast_felt(u32_input).get_op_type(), DPNOpType::CastFelt);
+        assert_eq!(ctx.op_cast_bool(target).get_op_type(), DPNOpType::CastBool);
+        assert_eq!(ctx.op_neg(target).get_op_type(), DPNOpType::UnaryNegative);
+        assert_eq!(ctx.op_exp(target, target).get_op_type(), DPNOpType::Exp);
+        assert_eq!(ctx.op_false(), SymFeltRef::constant_false());
+        assert_eq!(ctx.cset(zero, one), one);
+
+        assert_eq!(ctx.get_caller_contract_id().get_op_type(), DPNOpType::GetCallerContractId);
+        assert_eq!(ctx.get_checkpoint_id().get_op_type(), DPNOpType::GetCheckpointId);
+        assert_eq!(ctx.get_last_nonce().get_op_type(), DPNOpType::GetNonce);
+        assert_eq!(ctx.op_secp256k1_verify([target; 16], [one; 4], [zero; 16]).get_op_type(), DPNOpType::Secp256k1Verify);
+
+        for action in [0, 1, 2] {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match action {
+                0 => ctx.start_else_if_block(bool_input),
+                1 => ctx.start_else_block(),
+                _ => ctx.end_if_block(),
+            }));
+            assert!(result.is_err());
+        }
+
+        ctx.start_if_block(SymFeltRef::constant_true());
+        assert_eq!(ctx.get_current_condition(), SymFeltRef::constant_true());
+        let assertions = ctx.assertions.len();
+        ctx.assert_eq(zero, one, "true branch");
+        assert_eq!(ctx.assertions.len(), assertions + 1);
+        assert_eq!(ctx.cset(zero, one), one);
+        ctx.end_if_block();
+
+        ctx.start_if_block(SymFeltRef::constant_false());
+        assert_eq!(ctx.get_current_condition(), SymFeltRef::constant_false());
+        let events = ctx.events.len();
+        ctx.emit_event(vec![one]);
+        assert_eq!(ctx.events.len(), events);
+        ctx.end_if_block();
+
+        let current_contract = ctx.get_contract_id();
+        let other_user = ctx.op_const(41);
+        let key = [zero, one, zero, one];
+        assert_eq!(ctx.get_other_contract_state_hash_at(one, current_contract, zero).len(), 4);
+        assert_eq!(ctx.get_other_user_contract_state_hash_at(one, other_user, current_contract, zero).len(), 4);
+        assert_eq!(ctx.get_other_user_contract_state_range_at(one, other_user, current_contract, zero, zero), Vec::<SymFeltRef>::new());
+        assert_eq!(ctx.imt_get_other_user_value(one, other_user, current_contract, key, zero, one).len(), 4);
+        assert_eq!(ctx.imt_contains_other_user(one, other_user, current_contract, key, zero, one).get_op_type(), DPNOpType::TargetAt);
+
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.get_state_range_at(zero, target))).is_err());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ctx.get_other_user_contract_state_range_at(one, other_user, current_contract, zero, target)
+        }))
+        .is_err());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.cset_state(target, one))).is_err());
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct IfConditionStack {
     pub conditions: Vec<SymFeltRef>,

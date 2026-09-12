@@ -87,3 +87,46 @@ impl StatePhaseBuilder {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dpn::ops::sym_felt::SymFeltRefValue;
+
+    #[test]
+    fn derives_phase_from_state_result_and_propagates_it_to_parents() {
+        let mut store = SymFeltStore::new();
+        let query = store.insert(SymFeltRefValue {
+            op_type: DPNOpType::GetStateQueryResultSingle,
+            const_param: (3u64 << 32) | 7,
+            inputs: vec![],
+        });
+        let parent = store.insert(SymFeltRefValue {
+            op_type: DPNOpType::Add,
+            const_param: 0,
+            inputs: vec![query, SymFeltRef::new_constant(1)],
+        });
+        let mut builder = StatePhaseBuilder::new();
+
+        let query_phase = builder.compute_phase(&store, query);
+        assert_eq!(query_phase, StatePhaseKey { before_set_state_index: 7, before_external_call_index: 3 });
+        assert_eq!(builder.compute_phase(&store, parent), query_phase);
+        assert_eq!(builder.state_phases.get(&query_phase), Some(&vec![query]));
+        assert_eq!(builder.compute_phase(&store, parent), query_phase);
+        assert_eq!(builder.state_phase_cache.get(&parent), Some(&query_phase));
+    }
+
+    #[test]
+    fn inline_and_childless_values_have_the_initial_phase() {
+        let mut store = SymFeltStore::new();
+        let childless = store.insert(SymFeltRefValue {
+            op_type: DPNOpType::Add,
+            const_param: 0,
+            inputs: vec![],
+        });
+        let mut builder = StatePhaseBuilder::new();
+        let initial = StatePhaseKey { before_set_state_index: 0, before_external_call_index: 0 };
+        assert_eq!(builder.compute_phase(&store, SymFeltRef::new_constant(1)), initial);
+        assert_eq!(builder.compute_phase(&store, childless), initial);
+    }
+}

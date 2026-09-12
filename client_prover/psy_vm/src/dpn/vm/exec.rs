@@ -300,7 +300,7 @@ impl<F: RichField> SimpleDPNExecutor<F> {
         let (t, index) = decode_indexed_op_id(id);
         match t {
             DPNBuiltInDataType::HashOut160 => {
-                assert!(index < self.hashes.len(), "Invalid hash160 index");
+                assert!(index < self.hash160s.len(), "Invalid hash160 index");
                 self.hash160s[index]
             }
             _ => panic!("Invalid data type for hash160"),
@@ -1464,5 +1464,380 @@ mod tests {
         let expected_bytes4_le = keccak_digest_bytes_to_u32x8(&packed_bytes4_le);
 
         assert_ne!(got, expected_bytes4_le);
+    }
+
+    #[test]
+    fn process_var_def_covers_scalar_boolean_hash_and_u32_operations() {
+        let mut exec = mk_exec(vec![7, 3, 1]);
+        let target = |i| encode_indexed_op_id(DPNBuiltInDataType::Target, i);
+        let boolean = |i| encode_indexed_op_id(DPNBuiltInDataType::Bool, i);
+        let u32v = |i| encode_indexed_op_id(DPNBuiltInDataType::U32Target, i);
+
+        let mut add = |data_type, index, op_type, inputs: Vec<u64>| {
+            exec.process_var_def(&DPNIndexedVarDef { data_type, index, op_type, inputs });
+        };
+        add(DPNBuiltInDataType::Target, 0, DPNOpType::InputTarget, vec![0]);
+        add(DPNBuiltInDataType::Target, 1, DPNOpType::InputTarget, vec![1]);
+        add(DPNBuiltInDataType::Target, 2, DPNOpType::Add, vec![target(0), target(1)]);
+        add(DPNBuiltInDataType::Target, 3, DPNOpType::Sub, vec![target(0), target(1)]);
+        add(DPNBuiltInDataType::Target, 4, DPNOpType::Mul, vec![target(0), target(1)]);
+        add(DPNBuiltInDataType::Target, 5, DPNOpType::Div, vec![target(0), target(1)]);
+        add(DPNBuiltInDataType::Target, 6, DPNOpType::Mod, vec![target(0), target(1)]);
+        add(DPNBuiltInDataType::Target, 7, DPNOpType::Exp, vec![target(1), target(1)]);
+        add(DPNBuiltInDataType::Target, 8, DPNOpType::UnaryNegative, vec![target(1)]);
+        add(DPNBuiltInDataType::Target, 9, DPNOpType::UnaryInverse, vec![target(1)]);
+
+        add(DPNBuiltInDataType::Bool, 0, DPNOpType::ConstantTrue, vec![]);
+        add(DPNBuiltInDataType::Bool, 1, DPNOpType::ConstantFalse, vec![]);
+        add(DPNBuiltInDataType::Bool, 2, DPNOpType::BoolAnd, vec![boolean(0), boolean(1)]);
+        add(DPNBuiltInDataType::Bool, 3, DPNOpType::BoolOr, vec![boolean(0), boolean(1)]);
+        add(DPNBuiltInDataType::Bool, 4, DPNOpType::Xor, vec![boolean(0), boolean(1)]);
+        add(DPNBuiltInDataType::Bool, 5, DPNOpType::Nor, vec![boolean(0), boolean(1)]);
+        add(DPNBuiltInDataType::Bool, 6, DPNOpType::BoolNot, vec![boolean(1)]);
+        add(DPNBuiltInDataType::Bool, 7, DPNOpType::Eq, vec![target(0), target(1)]);
+        add(DPNBuiltInDataType::Bool, 8, DPNOpType::Lt, vec![target(1), target(0)]);
+        add(DPNBuiltInDataType::Bool, 9, DPNOpType::Gte, vec![target(0), target(1)]);
+
+        add(DPNBuiltInDataType::HashOut, 0, DPNOpType::HashNoPad, vec![target(0), target(1)]);
+        add(DPNBuiltInDataType::HashOut, 1, DPNOpType::HashTwoToOne, vec![target(0); 8]);
+        add(DPNBuiltInDataType::U32TargetArray, 0, DPNOpType::Keccak256, vec![target(0), target(1)]);
+        add(DPNBuiltInDataType::BoolArray, 0, DPNOpType::SplitBits, vec![4, target(0)]);
+        add(DPNBuiltInDataType::Target, 10, DPNOpType::SumBits, vec![boolean(0), boolean(1)]);
+        add(DPNBuiltInDataType::Target, 11, DPNOpType::Select, vec![target(0), target(0), target(1)]);
+        add(DPNBuiltInDataType::TargetArray, 0, DPNOpType::DivRem4, vec![target(0)]);
+        add(DPNBuiltInDataType::Target, 12, DPNOpType::Constant, vec![1]);
+        add(DPNBuiltInDataType::Target, 13, DPNOpType::TargetAt, vec![encode_indexed_op_id(DPNBuiltInDataType::TargetArray, 0), target(12)]);
+
+        add(DPNBuiltInDataType::U32Target, 0, DPNOpType::ConstantU32, vec![9]);
+        add(DPNBuiltInDataType::U32Target, 1, DPNOpType::U32Add, vec![u32v(0), u32v(0)]);
+        add(DPNBuiltInDataType::U32Target, 2, DPNOpType::U32Sub, vec![u32v(1), u32v(0)]);
+        add(DPNBuiltInDataType::U32Target, 3, DPNOpType::U32Mul, vec![u32v(0), u32v(0)]);
+        add(DPNBuiltInDataType::U32Target, 4, DPNOpType::U32Div, vec![u32v(1), u32v(0)]);
+        add(DPNBuiltInDataType::U32Target, 5, DPNOpType::U32Mod, vec![u32v(1), u32v(0)]);
+        add(DPNBuiltInDataType::U32Target, 6, DPNOpType::U32Xor, vec![u32v(0), u32v(1)]);
+        add(DPNBuiltInDataType::U32Target, 7, DPNOpType::U32Or, vec![u32v(0), u32v(1)]);
+        add(DPNBuiltInDataType::U32Target, 8, DPNOpType::U32And, vec![u32v(0), u32v(1)]);
+        add(DPNBuiltInDataType::U32Target, 9, DPNOpType::U32ShiftLeft, vec![u32v(0), u32v(0)]);
+        add(DPNBuiltInDataType::U32Target, 10, DPNOpType::U32ShiftRight, vec![u32v(1), u32v(0)]);
+        add(DPNBuiltInDataType::Target, 14, DPNOpType::ExpConstantPower, vec![target(1), target(2)]);
+        add(DPNBuiltInDataType::Target, 15, DPNOpType::ExpConstantBase, vec![target(2), target(1)]);
+        add(DPNBuiltInDataType::Target, 16, DPNOpType::ModConstantDividend, vec![target(2), target(1)]);
+        add(DPNBuiltInDataType::Target, 17, DPNOpType::ModConstantDivisor, vec![target(0), target(1)]);
+        add(DPNBuiltInDataType::U32Target, 11, DPNOpType::U32AndConstant, vec![u32v(0), u32v(1)]);
+        add(DPNBuiltInDataType::U32Target, 12, DPNOpType::U32OrConstant, vec![u32v(0), u32v(1)]);
+        add(DPNBuiltInDataType::U32Target, 13, DPNOpType::U32XorConstant, vec![u32v(0), u32v(1)]);
+        add(DPNBuiltInDataType::U32Target, 14, DPNOpType::U32ShiftLeftConstantBitDistance, vec![u32v(0), u32v(1)]);
+        add(DPNBuiltInDataType::U32Target, 15, DPNOpType::U32ShiftRightConstantValue, vec![u32v(0), u32v(1)]);
+        add(DPNBuiltInDataType::U32Target, 16, DPNOpType::CastU32, vec![target(0)]);
+        add(DPNBuiltInDataType::Target, 18, DPNOpType::CastFelt, vec![u32v(0)]);
+        add(DPNBuiltInDataType::Bool, 10, DPNOpType::CastBool, vec![target(12)]);
+        add(DPNBuiltInDataType::U32Target, 17, DPNOpType::U32InputTarget, vec![0]);
+        add(DPNBuiltInDataType::Bool, 11, DPNOpType::BoolInputTarget, vec![2]);
+        add(DPNBuiltInDataType::Bool, 12, DPNOpType::Lte, vec![target(1), target(0)]);
+        add(DPNBuiltInDataType::Bool, 13, DPNOpType::Gt, vec![target(0), target(1)]);
+        add(DPNBuiltInDataType::U32Target, 18, DPNOpType::U32Exp, vec![target(1), target(1)]);
+        add(DPNBuiltInDataType::U32Target, 19, DPNOpType::ConstantU32, vec![32]);
+        add(DPNBuiltInDataType::U32Target, 20, DPNOpType::U32ShiftLeft, vec![u32v(0), u32v(19)]);
+        add(DPNBuiltInDataType::U32Target, 21, DPNOpType::U32ShiftRight, vec![u32v(0), u32v(19)]);
+        add(DPNBuiltInDataType::U32Target, 22, DPNOpType::U32ShiftLeftConstantBitDistance, vec![u32v(0), u32v(19)]);
+        add(DPNBuiltInDataType::U32Target, 23, DPNOpType::U32ShiftRightConstantBitDistance, vec![u32v(0), u32v(19)]);
+        add(DPNBuiltInDataType::U32Target, 24, DPNOpType::U32ShiftLeftConstantValue, vec![u32v(0), u32v(19)]);
+        add(DPNBuiltInDataType::U32Target, 25, DPNOpType::U32ShiftRightConstantValue, vec![u32v(0), u32v(19)]);
+        add(DPNBuiltInDataType::Target, 19, DPNOpType::GetUserId, vec![]);
+        add(DPNBuiltInDataType::Target, 20, DPNOpType::GetContractId, vec![]);
+        add(DPNBuiltInDataType::Target, 21, DPNOpType::GetCallerContractId, vec![]);
+        add(DPNBuiltInDataType::Target, 22, DPNOpType::GetCheckpointId, vec![]);
+        add(DPNBuiltInDataType::Target, 23, DPNOpType::GetNonce, vec![]);
+        add(DPNBuiltInDataType::HashOut, 2, DPNOpType::GetUserPublicKeyHash, vec![]);
+        add(DPNBuiltInDataType::HashOut, 3, DPNOpType::GetSessionProofTreeRoot, vec![]);
+
+        assert_eq!(exec.resolve_target(target(2)).to_canonical_u64(), 10);
+        assert_eq!(exec.resolve_u32(u32v(1)), 18);
+        assert_eq!(exec.resolve_target_array(encode_indexed_op_id(DPNBuiltInDataType::TargetArray, 0)).len(), 2);
+        assert_eq!(
+            exec.resolve_target_array_ref(encode_indexed_op_id(DPNBuiltInDataType::BoolArray, 0), target(1)),
+            GoldilocksField::ZERO
+        );
+        assert_eq!(exec.resolve_hash(encode_indexed_op_id(DPNBuiltInDataType::HashOut, 0)).len(), 4);
+        assert_eq!(exec.resolve_target_array(encode_indexed_op_id(DPNBuiltInDataType::U32TargetArray, 0)).len(), 8);
+    }
+
+    #[test]
+    fn resolves_all_array_kinds_and_hash160_storage_without_cross_pool_bounds() {
+        let mut exec = mk_exec(vec![1]);
+        exec.set_target_at(0, GoldilocksField::ZERO, "test_index");
+        exec.set_hash_at(0, [GoldilocksField::from_canonical_u64(1); 4], "test_hash");
+        exec.set_hash160_at(0, [1, 2, 3, 4, 5], "test_hash160");
+        exec.set_target_array_at(0, vec![GoldilocksField::from_canonical_u64(7)], "test_targets");
+        exec.set_bool_array_at(0, vec![true, false], "test_bools");
+        exec.set_u32_array_at(0, vec![8, 9], "test_u32s");
+
+        assert_eq!(exec.resolve_hash160(encode_indexed_op_id(DPNBuiltInDataType::HashOut160, 0)), [1, 2, 3, 4, 5]);
+        assert_eq!(exec.resolve_bool_array(encode_indexed_op_id(DPNBuiltInDataType::BoolArray, 0)), vec![true, false]);
+        assert_eq!(exec.resolve_u32_array(encode_indexed_op_id(DPNBuiltInDataType::U32TargetArray, 0)), vec![8, 9]);
+        assert_eq!(exec.resolve_target_array_ref(encode_indexed_op_id(DPNBuiltInDataType::HashOut, 0), encode_indexed_op_id(DPNBuiltInDataType::Target, 0)), GoldilocksField::ONE);
+        assert_eq!(exec.resolve_target_array_ref(encode_indexed_op_id(DPNBuiltInDataType::HashOut160, 0), encode_indexed_op_id(DPNBuiltInDataType::Target, 0)), GoldilocksField::from_canonical_u64(1));
+        assert_eq!(exec.resolve_target_array_ref(encode_indexed_op_id(DPNBuiltInDataType::U32TargetArray, 0), encode_indexed_op_id(DPNBuiltInDataType::Target, 0)), GoldilocksField::from_canonical_u64(8));
+    }
+
+    #[test]
+    fn resolver_boundaries_cover_scalar_conversions_and_invalid_type_rejection() {
+        let mut exec = mk_exec(vec![7, 0]);
+        exec.set_target_at(0, GoldilocksField::from_canonical_u64(7), "boundary");
+        exec.set_target_at(1, GoldilocksField::ZERO, "boundary");
+        exec.set_target_at(2, GoldilocksField::ZERO, "boundary");
+        exec.set_bool_at(0, true, "boundary");
+        exec.set_bool_at(1, false, "boundary");
+        exec.set_u32_at(0, u32::MAX, "boundary");
+        exec.set_u32_at(1, 0, "boundary");
+        exec.set_target_array_at(0, vec![GoldilocksField::from_canonical_u64(9)], "boundary");
+        exec.set_bool_array_at(0, vec![true, false], "boundary");
+        exec.set_u32_array_at(0, vec![u32::MAX], "boundary");
+
+        assert!(exec.resolve_bool(encode_indexed_op_id(DPNBuiltInDataType::Bool, 0)));
+        assert!(!exec.resolve_bool(encode_indexed_op_id(DPNBuiltInDataType::Bool, 1)));
+        assert!(!exec.resolve_bool(encode_indexed_op_id(DPNBuiltInDataType::Target, 1)));
+        assert!(!exec.resolve_bool(encode_indexed_op_id(DPNBuiltInDataType::U32Target, 1)));
+        let invalid_bool_value = std::panic::catch_unwind(|| exec.resolve_bool(encode_indexed_op_id(DPNBuiltInDataType::Target, 0)));
+        assert!(invalid_bool_value.is_err());
+        assert_eq!(exec.resolve_u32(encode_indexed_op_id(DPNBuiltInDataType::U32Target, 0)), u32::MAX);
+        assert_eq!(exec.resolve_u32(encode_indexed_op_id(DPNBuiltInDataType::Bool, 0)), 1);
+        assert_eq!(exec.resolve_u32(encode_indexed_op_id(DPNBuiltInDataType::Bool, 1)), 0);
+        assert_eq!(exec.resolve_u32(encode_indexed_op_id(DPNBuiltInDataType::Target, 0)), 7);
+        assert_eq!(exec.resolve_target(encode_indexed_op_id(DPNBuiltInDataType::Bool, 0)), GoldilocksField::ONE);
+        assert_eq!(exec.resolve_target(encode_indexed_op_id(DPNBuiltInDataType::Bool, 1)), GoldilocksField::ZERO);
+        assert_eq!(exec.resolve_target(encode_indexed_op_id(DPNBuiltInDataType::U32Target, 0)), GoldilocksField::from_canonical_u64(u32::MAX as u64));
+        assert_eq!(exec.resolve_target_array(encode_indexed_op_id(DPNBuiltInDataType::BoolArray, 0)).len(), 2);
+        assert_eq!(exec.resolve_target_array(encode_indexed_op_id(DPNBuiltInDataType::U32TargetArray, 0))[0], GoldilocksField::from_canonical_u64(u32::MAX as u64));
+        assert_eq!(exec.resolve_targets(&[encode_indexed_op_id(DPNBuiltInDataType::Target, 0)]).len(), 1);
+        let zero_index = encode_indexed_op_id(DPNBuiltInDataType::Target, 2);
+        assert_eq!(exec.resolve_target_array_ref(encode_indexed_op_id(DPNBuiltInDataType::TargetArray, 0), zero_index), GoldilocksField::from_canonical_u64(9));
+        assert_eq!(exec.resolve_target_array_ref(encode_indexed_op_id(DPNBuiltInDataType::BoolArray, 0), zero_index), GoldilocksField::ONE);
+        assert_eq!(exec.resolve_target_array_ref(encode_indexed_op_id(DPNBuiltInDataType::Target, 0), zero_index), GoldilocksField::from_canonical_u64(7));
+        assert_eq!(exec.resolve_target_array_ref(encode_indexed_op_id(DPNBuiltInDataType::Bool, 1), zero_index), GoldilocksField::ZERO);
+        assert_eq!(exec.resolve_target_array_ref(encode_indexed_op_id(DPNBuiltInDataType::U32Target, 0), zero_index), GoldilocksField::from_canonical_u64(u32::MAX as u64));
+
+        let invalid_bool = std::panic::catch_unwind(|| exec.resolve_bool(encode_indexed_op_id(DPNBuiltInDataType::HashOut, 0)));
+        assert!(invalid_bool.is_err());
+        let invalid_target = std::panic::catch_unwind(|| exec.resolve_target(encode_indexed_op_id(DPNBuiltInDataType::HashOut, 0)));
+        assert!(invalid_target.is_err());
+        let invalid_array = std::panic::catch_unwind(|| exec.resolve_target_array(encode_indexed_op_id(DPNBuiltInDataType::HashOut, 0)));
+        assert!(invalid_array.is_err());
+        assert!(std::panic::catch_unwind(|| exec.resolve_hash(encode_indexed_op_id(DPNBuiltInDataType::Target, 0))).is_err());
+        assert!(std::panic::catch_unwind(|| exec.resolve_hash160(encode_indexed_op_id(DPNBuiltInDataType::Target, 0))).is_err());
+        assert!(std::panic::catch_unwind(|| exec.resolve_bool_array(encode_indexed_op_id(DPNBuiltInDataType::TargetArray, 0))).is_err());
+        assert!(std::panic::catch_unwind(|| exec.resolve_u32_array(encode_indexed_op_id(DPNBuiltInDataType::TargetArray, 0))).is_err());
+        assert!(std::panic::catch_unwind(|| exec.resolve_u32(encode_indexed_op_id(DPNBuiltInDataType::HashOut, 0))).is_err());
+    }
+
+    #[test]
+    fn resolver_out_of_range_boundaries_are_rejected_for_every_storage_family() {
+        let mut exec = mk_exec(vec![]);
+        exec.set_target_at(0, GoldilocksField::ZERO, "boundary");
+        exec.set_bool_at(0, false, "boundary");
+        exec.set_u32_at(0, 0, "boundary");
+        exec.set_hash_at(0, [GoldilocksField::ZERO; 4], "boundary");
+        exec.set_hash160_at(0, [0; 5], "boundary");
+        exec.set_target_array_at(0, vec![GoldilocksField::ZERO], "boundary");
+        exec.set_bool_array_at(0, vec![false], "boundary");
+        exec.set_u32_array_at(0, vec![0], "boundary");
+
+        let invalid_ids = [
+            (DPNBuiltInDataType::Bool, 1),
+            (DPNBuiltInDataType::Target, 1),
+            (DPNBuiltInDataType::U32Target, 1),
+        ];
+        for (data_type, index) in invalid_ids {
+            let id = encode_indexed_op_id(data_type, index);
+            assert!(std::panic::catch_unwind(|| exec.resolve_bool(id)).is_err(), "resolve_bool {data_type}");
+            assert!(std::panic::catch_unwind(|| exec.resolve_target(id)).is_err(), "resolve_target {data_type}");
+            assert!(std::panic::catch_unwind(|| exec.resolve_u32(id)).is_err(), "resolve_u32 {data_type}");
+        }
+        assert!(std::panic::catch_unwind(|| exec.resolve_hash(encode_indexed_op_id(DPNBuiltInDataType::HashOut, 1))).is_err());
+        assert!(std::panic::catch_unwind(|| exec.resolve_hash160(encode_indexed_op_id(DPNBuiltInDataType::HashOut160, 1))).is_err());
+        assert!(std::panic::catch_unwind(|| exec.resolve_target_array(encode_indexed_op_id(DPNBuiltInDataType::TargetArray, 1))).is_err());
+        assert!(std::panic::catch_unwind(|| exec.resolve_target_array(encode_indexed_op_id(DPNBuiltInDataType::BoolArray, 1))).is_err());
+        assert!(std::panic::catch_unwind(|| exec.resolve_target_array(encode_indexed_op_id(DPNBuiltInDataType::U32TargetArray, 1))).is_err());
+        assert!(std::panic::catch_unwind(|| exec.resolve_bool_array(encode_indexed_op_id(DPNBuiltInDataType::BoolArray, 1))).is_err());
+        assert!(std::panic::catch_unwind(|| exec.resolve_u32_array(encode_indexed_op_id(DPNBuiltInDataType::U32TargetArray, 1))).is_err());
+
+        exec.set_target_at(1, GoldilocksField::ONE, "index one");
+        let one = encode_indexed_op_id(DPNBuiltInDataType::Target, 1);
+        for scalar_type in [DPNBuiltInDataType::Target, DPNBuiltInDataType::Bool, DPNBuiltInDataType::U32Target] {
+            assert!(std::panic::catch_unwind(|| exec.resolve_target_array_ref(encode_indexed_op_id(scalar_type, 0), one)).is_err(), "{scalar_type}");
+        }
+        assert!(std::panic::catch_unwind(|| exec.resolve_target_array_ref(encode_indexed_op_id(DPNBuiltInDataType::HashOut, 0), encode_indexed_op_id(DPNBuiltInDataType::Target, 2))).is_err());
+        exec.set_target_at(2, GoldilocksField::from_canonical_u64(4), "hash bound");
+        assert!(std::panic::catch_unwind(|| exec.resolve_target_array_ref(encode_indexed_op_id(DPNBuiltInDataType::HashOut, 0), encode_indexed_op_id(DPNBuiltInDataType::Target, 2))).is_err());
+        exec.set_target_at(3, GoldilocksField::from_canonical_u64(5), "hash160 bound");
+        assert!(std::panic::catch_unwind(|| exec.resolve_target_array_ref(encode_indexed_op_id(DPNBuiltInDataType::HashOut160, 0), encode_indexed_op_id(DPNBuiltInDataType::Target, 3))).is_err());
+    }
+
+    #[test]
+    fn debug_operation_printer_accepts_every_builtin_storage_type() {
+        let exec = mk_exec(vec![]);
+        for (index, data_type) in [
+            DPNBuiltInDataType::Target,
+            DPNBuiltInDataType::Bool,
+            DPNBuiltInDataType::U32Target,
+            DPNBuiltInDataType::HashOut,
+            DPNBuiltInDataType::HashOut160,
+            DPNBuiltInDataType::TargetArray,
+            DPNBuiltInDataType::BoolArray,
+            DPNBuiltInDataType::U32TargetArray,
+            DPNBuiltInDataType::Unknown,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            exec.print_current_op(&DPNIndexedVarDef { data_type, index, op_type: DPNOpType::Constant, inputs: vec![0] });
+        }
+    }
+
+    #[test]
+    fn process_var_def_covers_constant_math_casts_and_context_hashes() {
+        let target = |index| encode_indexed_op_id(DPNBuiltInDataType::Target, index);
+        let u32v = |index| encode_indexed_op_id(DPNBuiltInDataType::U32Target, index);
+        let mut exec = mk_exec(vec![3, 2, 1]);
+        exec.set_target_at(0, GoldilocksField::from_canonical_u64(3), "seed");
+        exec.set_target_at(1, GoldilocksField::from_canonical_u64(2), "seed");
+        exec.set_target_at(2, GoldilocksField::from_canonical_u64(5), "seed");
+        exec.set_u32_at(0, 3, "seed");
+        exec.set_u32_at(1, 1, "seed");
+        exec.set_bool_at(0, true, "seed");
+
+        let mut run = |data_type, index, op_type, inputs| exec.process_var_def(&DPNIndexedVarDef { data_type, index, op_type, inputs });
+        run(DPNBuiltInDataType::Target, 3, DPNOpType::ExpConstantPower, vec![target(0), target(2)]);
+        run(DPNBuiltInDataType::Target, 4, DPNOpType::ExpConstantBase, vec![target(2), target(1)]);
+        run(DPNBuiltInDataType::Target, 5, DPNOpType::ModConstantDividend, vec![target(2), target(1)]);
+        run(DPNBuiltInDataType::Target, 6, DPNOpType::ModConstantDivisor, vec![target(2), target(1)]);
+        run(DPNBuiltInDataType::TargetArray, 0, DPNOpType::DivRem4, vec![target(2)]);
+        run(DPNBuiltInDataType::U32Target, 2, DPNOpType::CastU32, vec![target(0)]);
+        run(DPNBuiltInDataType::Target, 7, DPNOpType::CastFelt, vec![u32v(0)]);
+        run(DPNBuiltInDataType::Bool, 1, DPNOpType::CastBool, vec![u32v(1)]);
+        run(DPNBuiltInDataType::U32Target, 3, DPNOpType::U32AndConstant, vec![u32v(0), target(1)]);
+        run(DPNBuiltInDataType::U32Target, 4, DPNOpType::U32OrConstant, vec![u32v(0), target(1)]);
+        run(DPNBuiltInDataType::U32Target, 5, DPNOpType::U32XorConstant, vec![u32v(0), target(1)]);
+        run(DPNBuiltInDataType::U32Target, 6, DPNOpType::U32InputTarget, vec![1]);
+        run(DPNBuiltInDataType::U32Target, 7, DPNOpType::ConstantU32, vec![u32::MAX as u64]);
+        run(DPNBuiltInDataType::Bool, 2, DPNOpType::BoolInputTarget, vec![2]);
+        run(DPNBuiltInDataType::HashOut, 0, DPNOpType::GetUserPublicKeyHash, vec![]);
+        run(DPNBuiltInDataType::HashOut, 1, DPNOpType::GetSessionProofTreeRoot, vec![]);
+
+        assert_eq!(exec.resolve_target_array(encode_indexed_op_id(DPNBuiltInDataType::TargetArray, 0)).len(), 2);
+        assert_eq!(exec.resolve_u32(u32v(7)), u32::MAX);
+        assert_eq!(exec.resolve_bool(encode_indexed_op_id(DPNBuiltInDataType::Bool, 2)), true);
+        assert_eq!(exec.resolve_hash(encode_indexed_op_id(DPNBuiltInDataType::HashOut, 0)), [GoldilocksField::ZERO; 4]);
+    }
+
+    #[test]
+    fn process_var_def_rejects_unsupported_and_invalid_boundary_operations() {
+        let mut exec = mk_exec(vec![1]);
+        let unsupported = [
+            DPNOpType::HashPad,
+            DPNOpType::CalculateMerkleRoot,
+            DPNOpType::GetStateQueryResult,
+            DPNOpType::GetStateQueryResultSingle,
+            DPNOpType::GetStateCommandResultHash,
+            DPNOpType::GetStateCommandResultSingle,
+            DPNOpType::GetStateCommandResultArray,
+        ];
+        for (index, op_type) in unsupported.into_iter().enumerate() {
+            let op = DPNIndexedVarDef { data_type: DPNBuiltInDataType::Target, index, op_type, inputs: vec![] };
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| exec.process_var_def(&op))).is_err(), "{op_type}");
+        }
+
+        let too_wide = DPNIndexedVarDef {
+            data_type: DPNBuiltInDataType::BoolArray,
+            index: 0,
+            op_type: DPNOpType::SplitBits,
+            inputs: vec![65, encode_indexed_op_id(DPNBuiltInDataType::Target, 0)],
+        };
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| exec.process_var_def(&too_wide))).is_err());
+    }
+
+    #[test]
+    fn process_var_def_rejects_each_numeric_failure_boundary() {
+        let target = |index| encode_indexed_op_id(DPNBuiltInDataType::Target, index);
+        let u32v = |index| encode_indexed_op_id(DPNBuiltInDataType::U32Target, index);
+        let cases = [
+            (DPNBuiltInDataType::Target, DPNOpType::Div, vec![target(1), target(0)]),
+            (DPNBuiltInDataType::Target, DPNOpType::Mod, vec![target(1), target(0)]),
+            (DPNBuiltInDataType::Target, DPNOpType::ModConstantDividend, vec![target(1), target(0)]),
+            (DPNBuiltInDataType::Target, DPNOpType::ModConstantDivisor, vec![target(1), target(0)]),
+            (DPNBuiltInDataType::Target, DPNOpType::UnaryInverse, vec![target(0)]),
+            (DPNBuiltInDataType::U32Target, DPNOpType::U32Add, vec![u32v(0), u32v(1)]),
+            (DPNBuiltInDataType::U32Target, DPNOpType::U32Sub, vec![u32v(1), u32v(1)]),
+            (DPNBuiltInDataType::U32Target, DPNOpType::U32Mul, vec![u32v(0), u32v(0)]),
+            (DPNBuiltInDataType::U32Target, DPNOpType::U32Div, vec![u32v(1), u32v(2)]),
+            (DPNBuiltInDataType::U32Target, DPNOpType::U32Mod, vec![u32v(1), u32v(2)]),
+        ];
+        for (index, (data_type, op_type, inputs)) in cases.into_iter().enumerate() {
+            let mut exec = mk_exec(vec![]);
+            exec.set_target_at(0, GoldilocksField::ZERO, "zero");
+            exec.set_target_at(1, GoldilocksField::ONE, "one");
+            exec.set_u32_at(0, u32::MAX, "max");
+            exec.set_u32_at(1, 1, "one");
+            exec.set_u32_at(2, 0, "zero");
+            let op = DPNIndexedVarDef { data_type, index: index + 10, op_type, inputs };
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| exec.process_var_def(&op))).is_err(), "{op_type}");
+        }
+
+        for (op_type, inputs) in [
+            (DPNOpType::InputTarget, vec![0]),
+            (DPNOpType::U32InputTarget, vec![0]),
+            (DPNOpType::BoolInputTarget, vec![0]),
+            (DPNOpType::ConstantU32, vec![u32::MAX as u64 + 1]),
+        ] {
+            let mut exec = mk_exec(vec![]);
+            let op = DPNIndexedVarDef { data_type: op_type.get_data_type(), index: 0, op_type, inputs };
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| exec.process_var_def(&op))).is_err(), "{op_type}");
+        }
+    }
+
+    #[test]
+    fn indexed_setters_accept_idempotent_writes_and_reject_sparse_or_conflicting_boundaries() {
+        type F = GoldilocksField;
+        let mut executor = SimpleDPNExecutor::<F>::new();
+        let felt = F::from_canonical_u64(1);
+        executor.set_target_at(0, felt, "test");
+        executor.set_target_at(0, felt, "test");
+        executor.set_target_array_at(0, vec![felt], "test");
+        executor.set_target_array_at(0, vec![felt], "test");
+        executor.set_hash_at(0, [felt; 4], "test");
+        executor.set_hash_at(0, [felt; 4], "test");
+        executor.set_hash160_at(0, [1; 5], "test");
+        executor.set_hash160_at(0, [1; 5], "test");
+        executor.set_bool_at(0, true, "test");
+        executor.set_bool_at(0, true, "test");
+        executor.set_bool_array_at(0, vec![true], "test");
+        executor.set_bool_array_at(0, vec![true], "test");
+        executor.set_u32_at(0, 1, "test");
+        executor.set_u32_at(0, 1, "test");
+        executor.set_u32_array_at(0, vec![1], "test");
+        executor.set_u32_array_at(0, vec![1], "test");
+
+        assert_eq!(SimpleDPNExecutor::<F>::fmt_hash_elements(&[F::ZERO, F::ONE, F::from_canonical_u64(2), F::from_canonical_u64(3)]),
+            "0000000000000003000000000000000200000000000000010000000000000000");
+
+        let panics = [
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.set_target_at(2, felt, "sparse"))),
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.set_target_array_at(2, vec![felt], "sparse"))),
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.set_hash_at(2, [felt; 4], "sparse"))),
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.set_hash160_at(2, [1; 5], "sparse"))),
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.set_bool_at(2, true, "sparse"))),
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.set_bool_array_at(2, vec![true], "sparse"))),
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.set_u32_at(2, 1, "sparse"))),
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.set_u32_array_at(2, vec![1], "sparse"))),
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.set_target_at(0, F::from_canonical_u64(2), "conflict"))),
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.set_target_array_at(0, vec![F::from_canonical_u64(2)], "conflict"))),
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.set_hash_at(0, [F::from_canonical_u64(2); 4], "conflict"))),
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.set_hash160_at(0, [2; 5], "conflict"))),
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.set_bool_at(0, false, "conflict"))),
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.set_bool_array_at(0, vec![false], "conflict"))),
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.set_u32_at(0, 2, "conflict"))),
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.set_u32_array_at(0, vec![2], "conflict"))),
+        ];
+        assert!(panics.into_iter().all(|result| result.is_err()));
     }
 }

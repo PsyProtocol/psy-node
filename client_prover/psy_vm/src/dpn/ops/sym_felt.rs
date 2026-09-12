@@ -748,3 +748,213 @@ impl<T: QStateInitializable, const N: usize> QStateInitializable for [T; N] {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn value(reference: SymFeltRef) -> u64 {
+        reference.get_constant_value()
+    }
+
+    #[test]
+    fn constant_and_input_references_keep_their_kind_and_payload() {
+        let input = SymFeltRef::new_input(12, DPNBuiltInDataType::Target);
+        let boolean = SymFeltRef::new_input(3, DPNBuiltInDataType::Bool);
+        let constant = SymFeltRef::new_constant(99);
+
+        assert_eq!(input.get_op_type(), DPNOpType::InputTarget);
+        assert_eq!(input.get_input_index(), 12);
+        assert_eq!(boolean.get_op_type(), DPNOpType::BoolInputTarget);
+        assert_eq!(constant.get_constant_value_multi(), 99);
+        assert!(constant.is_constant_type());
+        assert_eq!(format!("{input}"), "Input(12)");
+        assert_eq!(format!("{}", SymFeltRef::constant_true()), "true");
+        assert_eq!(format!("{}", SymFeltRef::constant_false()), "false");
+        assert!(!input.needs_store());
+        assert!(!constant.needs_store());
+    }
+
+    #[test]
+    fn arithmetic_bitwise_and_assignment_operators_preserve_constant_semantics() {
+        let a = SymFeltRef::new_constant(12);
+        let b = SymFeltRef::new_constant(3);
+
+        assert_eq!(value(a + b), 15);
+        assert_eq!(value(a - b), 9);
+        assert_eq!(value(a * b), 36);
+        assert_eq!(value(a / b), 4);
+        assert_eq!(value(a % b), 0);
+        assert_eq!(value(a & b), 0);
+        assert_eq!(value(a | b), 15);
+        assert_eq!(value(a ^ b), 15);
+        assert_eq!(value(a << b), 96);
+        assert_eq!(value(a >> b), 1);
+        assert_eq!(value(!SymFeltRef::new_constant(0)), 1);
+        assert_eq!(value(!SymFeltRef::new_constant(1)), 0);
+
+        let mut assigned = a;
+        assigned += b;
+        assigned -= 2;
+        assigned *= 2;
+        assigned /= 13;
+        assigned %= 2;
+        assigned |= 8;
+        assigned ^= 1;
+        assigned &= 15;
+        assigned <<= 1;
+        assigned >>= 1;
+        assert_eq!(value(assigned), 9);
+    }
+
+    #[test]
+    fn primitive_interoperability_and_definition_rendering_are_stable() {
+        let reference = SymFeltRef::from(4u64);
+        assert_eq!(value(reference + 5), 9);
+        assert_eq!(value(20u64 - reference), 16);
+        assert_eq!(value(3u64 * reference), 12);
+        assert_eq!(value(20u64 / reference), 5);
+        assert_eq!(value(21u64 % reference), 1);
+        assert_eq!(value(8u64 | reference), 12);
+
+        let mut number = 20u64;
+        number -= reference;
+        number *= reference;
+        number /= reference;
+        number %= reference;
+        number |= reference;
+        number ^= reference;
+        number &= reference;
+        number <<= reference;
+        number >>= reference;
+        assert_eq!(number, 0);
+
+        let def = SymFeltDef {
+            op_type: DPNOpType::Add,
+            const_param: 0,
+            inputs: vec![
+                SymFeltDef { op_type: DPNOpType::InputTarget, const_param: 1, inputs: vec![] },
+                SymFeltDef { op_type: DPNOpType::Constant, const_param: 2, inputs: vec![] },
+            ],
+        };
+        assert_eq!(def.to_code_string(), "DPNOpType::Add(input1, 2)");
+        assert_eq!(SymFeltRefValue { op_type: DPNOpType::Constant, const_param: 7, inputs: vec![] }.get_ref_key(), SymFeltRef::new_constant(7));
+    }
+
+    #[test]
+    fn constant_helpers_cover_boolean_and_u128_reduction_boundaries() {
+        assert_eq!(SymFeltRef::constant_bool(true), SymFeltRef::constant_true());
+        assert_eq!(SymFeltRef::constant_bool(false), SymFeltRef::constant_false());
+        assert_eq!(SymFeltRef::new_constant_u32(u32::MAX).get_constant_value(), u32::MAX as u64);
+        assert_eq!(SymFeltRef::new_constant_reduce(u128::MAX).get_constant_value(), (u128::MAX % GoldilocksField::ORDER as u128) as u64);
+        assert_eq!(SymFeltRef::constant_true().get_constant_bool_value_multi(), true);
+        assert_eq!(SymFeltRef::constant_false().get_constant_bool_value_multi(), false);
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot get inline ref")]
+    fn inline_definition_rejects_stored_operation_references() {
+        let stored = SymFeltRef((DPNOpType::Add as u128) << 112);
+        let _ = stored.get_inline_def();
+    }
+
+    #[test]
+    #[should_panic]
+    fn new_input_rejects_array_data_types() {
+        let _ = SymFeltRef::new_input(0, DPNBuiltInDataType::TargetArray);
+    }
+
+    #[test]
+    fn reference_rhs_assignments_and_reverse_integer_operators_are_exercised() {
+        let a = SymFeltRef::new_constant(20);
+        let b = SymFeltRef::new_constant(4);
+        let _ = -a;
+        let mut assigned = a;
+        assigned += b;
+        assigned -= b;
+        assigned *= b;
+        assigned /= b;
+        assigned %= b;
+        assigned &= b;
+        assigned |= b;
+        assigned ^= b;
+        assigned <<= b;
+        assigned >>= b;
+        assert_eq!(assigned.get_constant_value(), 0);
+
+        assert_eq!(value(20u64 + b), 24);
+        assert_eq!(value(20u64 - b), 16);
+        assert_eq!(value(20u64 * b), 80);
+        assert_eq!(value(20u64 / b), 5);
+        assert_eq!(value(20u64 % b), 0);
+        assert_eq!(value(20u64 & b), 4);
+        assert_eq!(value(20u64 | b), 20);
+        assert_eq!(value(20u64 ^ b), 16);
+        assert_eq!(value(20u64 << b), 320);
+        assert_eq!(value(20u64 >> b), 1);
+    }
+
+    #[test]
+    fn primitive_operator_conversion_and_rendering_boundaries_are_exercised() {
+        let base = SymFeltRef::new_constant(20);
+        assert_eq!(value(base + 4u64), 24);
+        assert_eq!(value(base - 4u64), 16);
+        assert_eq!(value(base * 4u64), 80);
+        assert_eq!(value(base / 4u64), 5);
+        assert_eq!(value(base % 6u64), 2);
+        assert_eq!(value(base & 6u64), 4);
+        assert_eq!(value(base | 3u64), 23);
+        assert_eq!(value(base ^ 4u64), 16);
+        assert_eq!(value(base << 2u64), 80);
+        assert_eq!(value(base >> 2u64), 5);
+
+        let mut assigned = base;
+        assigned += 4u64;
+        assert_eq!(assigned, 24u64);
+        assigned -= 4u64;
+        assigned *= 2u64;
+        assigned /= 4u64;
+        assigned %= 7u64;
+        assigned &= 6u64;
+        assigned |= 8u64;
+        assigned ^= 2u64;
+        assigned <<= 1u64;
+        assigned >>= 2u64;
+        assert_eq!(assigned.get_constant_value(), 4);
+        assert!(assigned < 5u64);
+
+        assert_eq!(SymFeltRef::from(u8::MAX).get_constant_value(), u8::MAX as u64);
+        assert_eq!(SymFeltRef::from(u16::MAX).get_constant_value(), u16::MAX as u64);
+        assert_eq!(SymFeltRef::from(u32::MAX).get_constant_value(), u32::MAX as u64);
+        assert_eq!(SymFeltRef::from(7i32).get_constant_value(), 7);
+        assert_eq!(SymFeltRef::from(8i64).get_constant_value(), 8);
+        assert_eq!(SymFeltRef::from(true), SymFeltRef::constant_true());
+        assert_eq!(SymFeltRef::from(false), SymFeltRef::constant_false());
+        assert!(std::panic::catch_unwind(|| SymFeltRef::from(-1i32)).is_err());
+        assert!(std::panic::catch_unwind(|| SymFeltRef::from(-1i64)).is_err());
+
+        assert_eq!(SymFeltRef::new_constant(17).get_constant_value_multi_u128(), 17u128);
+        assert_eq!(SymFeltRef::new_valueless(DPNOpType::Add).get_target_hash_value(), 0);
+        assert_eq!(format!("{:?}", SymFeltRef::new_input(2, DPNBuiltInDataType::Bool)), "BoolInput(2)");
+        assert_eq!(format!("{:?}", SymFeltRef::new_input(3, DPNBuiltInDataType::U32Target)), "3");
+        assert_eq!(format!("{:?}", SymFeltRef::new_constant_u32(4)), "4u32");
+        assert!(format!("{:?}", SymFeltRef::new_valueless(DPNOpType::Add)).contains("Add"));
+        assert_eq!(<SymFeltRef as ContextFelt>::cns(9).get_constant_value(), 9);
+        assert_eq!(
+            <SymFeltRef as ContextFelt>::cns_inverse(2).get_constant_value(),
+            GoldilocksField::from_canonical_u64(2).inverse().to_canonical_u64()
+        );
+
+        let set = SetSymFeltRef::new(5, SymFeltRef::new_constant(6), SymFeltRef::new_constant(7));
+        assert_eq!(set.before_external_function_call, 5);
+        assert_eq!(set.index.get_constant_value(), 6);
+        assert_eq!(set.value.get_constant_value(), 7);
+        assert_eq!(SymFeltRef::size(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Not a constant type")]
+    fn multi_constant_accessor_rejects_input_references() {
+        let _ = SymFeltRef::new_input(0, DPNBuiltInDataType::Target).get_constant_value_multi();
+    }
+}

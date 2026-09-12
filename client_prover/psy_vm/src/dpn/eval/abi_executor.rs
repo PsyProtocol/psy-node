@@ -230,6 +230,78 @@ fn format_felt_vec(values: &[u64]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dpn::eval::executor::InMemoryStateBackend;
+    use psy_client_data::abi::{AbiContract, AbiParam, AbiStateField, PrimitiveTypeName, StateMutability};
+
+    fn felt_type() -> TypeRef {
+        TypeRef::Primitive {
+            name: PrimitiveTypeName::Felt,
+        }
+    }
+
+    fn abi() -> Abi {
+        Abi {
+            schema_version: "1".to_string(),
+            contract: AbiContract {
+                name: "Token".to_string(),
+                state_tree_height: 4,
+                state: vec![
+                    AbiStateField {
+                        name: "balance".to_string(),
+                        ty: felt_type(),
+                        offset: 0,
+                        felt_size: 1,
+                    },
+                    AbiStateField {
+                        name: "owners".to_string(),
+                        ty: TypeRef::Array {
+                            item: Box::new(felt_type()),
+                            length: 3,
+                            item_felt_size: 2,
+                        },
+                        offset: 4,
+                        felt_size: 6,
+                    },
+                ],
+                methods: vec![AbiMethod {
+                    name: "transfer".to_string(),
+                    method_id: 7,
+                    state_mutability: StateMutability::External,
+                    inputs: vec![
+                        AbiParam {
+                            name: "to".to_string(),
+                            ty: felt_type(),
+                            felt_size: 1,
+                        },
+                        AbiParam {
+                            name: "amount".to_string(),
+                            ty: felt_type(),
+                            felt_size: 1,
+                        },
+                    ],
+                    outputs: Vec::new(),
+                    input_felt_count: 2,
+                    output_felt_count: 0,
+                    vm_type: None,
+                }],
+            },
+            types: Vec::new(),
+        }
+    }
+
+    fn circuit() -> DPNFunctionCircuitDefinition {
+        DPNFunctionCircuitDefinition {
+            name: "transfer".to_string(),
+            method_id: 7,
+            circuit_inputs: vec![0, 1],
+            circuit_outputs: Vec::new(),
+            state_commands: Vec::new(),
+            state_command_resolution_indices: Vec::new(),
+            assertions: Vec::new(),
+            definitions: Vec::new(),
+            events: Vec::new(),
+        }
+    }
 
     #[test]
     fn test_param_value_to_felts() {
@@ -257,5 +329,82 @@ mod tests {
         assert_eq!(format_felt_vec(&[42]), "42");
         assert_eq!(format_felt_vec(&[1, 2, 3]), "[1, 2, 3]");
         assert_eq!(format_felt_vec(&[]), "[]");
+    }
+
+    #[test]
+    fn abi_executor_resolves_methods_parameters_slots_and_deltas() {
+        let executor = AbiExecutor::new(InMemoryStateBackend::new(), abi(), vec![circuit()]);
+        assert_eq!(executor.abi().contract.name, "Token");
+        assert_eq!(executor.method_names(), vec!["transfer"]);
+
+        let method = &executor.abi().contract.methods[0];
+        assert_eq!(
+            executor
+                .flatten_params(method, &[("amount", ParamValue::Felt(9)), ("to", ParamValue::Felt(8))])
+                .unwrap(),
+            vec![8, 9]
+        );
+        assert!(executor.flatten_params(method, &[("to", ParamValue::Felt(8))]).is_err());
+        assert!(
+            executor
+                .flatten_params(method, &[("to", ParamValue::Hash([1, 2, 3, 4])), ("amount", ParamValue::Felt(9))])
+                .is_err()
+        );
+
+        assert_eq!(executor.resolve_slot_to_field(0), "balance");
+        assert_eq!(executor.resolve_slot_to_field(4), "owners[0]");
+        assert_eq!(executor.resolve_slot_to_field(5), "owners[0]+1");
+        assert_eq!(executor.resolve_slot_to_field(10), "slot_10");
+
+        let formatted = executor.format_state_delta(&ExecutionResult {
+            success: true,
+            failure: None,
+            state_reads: Vec::new(),
+            state_writes: Vec::new(),
+            state_delta: vec![
+                super::super::executor::StateDelta {
+                    user_id: 1,
+                    contract_id: 2,
+                    slot_index: 0,
+                    old_value: vec![3],
+                    new_value: vec![4],
+                },
+                super::super::executor::StateDelta {
+                    user_id: 1,
+                    contract_id: 2,
+                    slot_index: 5,
+                    old_value: vec![1, 2],
+                    new_value: vec![3, 4],
+                },
+            ],
+            events: Vec::new(),
+            op_counts: Default::default(),
+            outputs: Vec::new(),
+        });
+        assert_eq!(formatted.contract_name, "Token");
+        assert_eq!(formatted.field_changes[0].field_path, "balance");
+        assert_eq!(formatted.field_changes[1].field_path, "owners[0]+1");
+        assert_eq!(formatted.field_changes[1].new_value, "[3, 4]");
+    }
+
+    #[test]
+    fn abi_executor_calls_named_and_raw_methods_and_reports_missing_names() {
+        let mut executor = AbiExecutor::new(InMemoryStateBackend::new(), abi(), vec![circuit()]);
+        let context = ExecutionContext {
+            user_id: 1,
+            contract_id: 2,
+            caller_contract_id: 3,
+            checkpoint_id: 4,
+            nonce: 5,
+            user_public_key_hash: [0; 4],
+        };
+
+        assert!(executor
+            .call("transfer", &[("to", ParamValue::Felt(8)), ("amount", ParamValue::Felt(9))], &context)
+            .unwrap()
+            .success);
+        assert!(executor.call_raw("transfer", &[8, 9], &context).unwrap().success);
+        assert!(executor.call("missing", &[], &context).is_err());
+        assert!(executor.call_raw("missing", &[], &context).is_err());
     }
 }

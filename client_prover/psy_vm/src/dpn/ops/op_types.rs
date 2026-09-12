@@ -687,6 +687,311 @@ mod event_record_tests {
     }
 }
 
+#[cfg(test)]
+mod op_type_contract_tests {
+    use super::*;
+    use crate::dpn::ops::sym_felt::SymFeltRef;
+    use std::collections::HashSet;
+
+    const ALL: &[DPNOpType] = &[
+        DPNOpType::InputTarget, DPNOpType::Constant, DPNOpType::ConstantTrue, DPNOpType::ConstantFalse,
+        DPNOpType::Add, DPNOpType::Sub, DPNOpType::Mul, DPNOpType::Div, DPNOpType::BoolNot, DPNOpType::BoolAnd,
+        DPNOpType::BoolOr, DPNOpType::Xor, DPNOpType::Nor, DPNOpType::Eq, DPNOpType::Lte, DPNOpType::Gte,
+        DPNOpType::Gt, DPNOpType::Lt, DPNOpType::SplitBits, DPNOpType::SumBits, DPNOpType::TargetAt,
+        DPNOpType::HashNoPad, DPNOpType::HashPad, DPNOpType::Select, DPNOpType::Exp, DPNOpType::ExpConstantPower,
+        DPNOpType::ExpConstantBase, DPNOpType::Mod, DPNOpType::ModConstantDividend, DPNOpType::ModConstantDivisor,
+        DPNOpType::DivRem4, DPNOpType::CastU32, DPNOpType::U32And, DPNOpType::U32AndConstant, DPNOpType::U32Or,
+        DPNOpType::U32OrConstant, DPNOpType::U32Xor, DPNOpType::U32XorConstant, DPNOpType::U32ShiftLeft,
+        DPNOpType::U32ShiftLeftConstantBitDistance, DPNOpType::U32ShiftLeftConstantValue, DPNOpType::U32ShiftRight,
+        DPNOpType::U32ShiftRightConstantBitDistance, DPNOpType::U32ShiftRightConstantValue, DPNOpType::CalculateMerkleRoot,
+        DPNOpType::GetUserId, DPNOpType::GetContractId, DPNOpType::GetCheckpointId, DPNOpType::GetNonce,
+        DPNOpType::GetUserPublicKeyHash, DPNOpType::GetStateQueryResult, DPNOpType::GetStateQueryResultSingle,
+        DPNOpType::GetStateCommandResultHash, DPNOpType::GetStateCommandResultSingle, DPNOpType::GetStateCommandResultArray,
+        DPNOpType::UnaryInverse, DPNOpType::UnaryNegative, DPNOpType::U32InputTarget, DPNOpType::ConstantU32,
+        DPNOpType::U32Add, DPNOpType::U32Sub, DPNOpType::U32Mul, DPNOpType::U32Div, DPNOpType::CastFelt,
+        DPNOpType::CastBool, DPNOpType::BoolInputTarget, DPNOpType::U32Mod, DPNOpType::U32Exp, DPNOpType::Secp256k1Verify,
+        DPNOpType::HashTwoToOne, DPNOpType::GetCallerContractId, DPNOpType::GetSessionProofTreeRoot, DPNOpType::Keccak256,
+    ];
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum OpcodeBoundaryKind {
+        InputOrConstant,
+        Unary,
+        Binary,
+        VariableArity,
+        Indexed,
+        Cast,
+        Context,
+        StateResult,
+        Cryptographic,
+        ExplicitlyUnsupported,
+    }
+
+    fn boundary_kind(op: DPNOpType) -> OpcodeBoundaryKind {
+        match op {
+            DPNOpType::InputTarget | DPNOpType::U32InputTarget | DPNOpType::BoolInputTarget | DPNOpType::Constant
+            | DPNOpType::ConstantU32 | DPNOpType::ConstantTrue | DPNOpType::ConstantFalse => OpcodeBoundaryKind::InputOrConstant,
+            DPNOpType::BoolNot | DPNOpType::UnaryInverse | DPNOpType::UnaryNegative => OpcodeBoundaryKind::Unary,
+            DPNOpType::Add | DPNOpType::Sub | DPNOpType::Mul | DPNOpType::Div | DPNOpType::BoolAnd | DPNOpType::BoolOr
+            | DPNOpType::Xor | DPNOpType::Nor | DPNOpType::Eq | DPNOpType::Lte | DPNOpType::Gte | DPNOpType::Gt
+            | DPNOpType::Lt | DPNOpType::Select | DPNOpType::Exp | DPNOpType::ExpConstantPower | DPNOpType::ExpConstantBase
+            | DPNOpType::Mod | DPNOpType::ModConstantDividend | DPNOpType::ModConstantDivisor | DPNOpType::U32And
+            | DPNOpType::U32AndConstant | DPNOpType::U32Or | DPNOpType::U32OrConstant | DPNOpType::U32Xor
+            | DPNOpType::U32XorConstant | DPNOpType::U32ShiftLeft | DPNOpType::U32ShiftLeftConstantBitDistance
+            | DPNOpType::U32ShiftLeftConstantValue | DPNOpType::U32ShiftRight | DPNOpType::U32ShiftRightConstantBitDistance
+            | DPNOpType::U32ShiftRightConstantValue | DPNOpType::U32Add | DPNOpType::U32Sub | DPNOpType::U32Mul
+            | DPNOpType::U32Div | DPNOpType::U32Mod | DPNOpType::U32Exp => OpcodeBoundaryKind::Binary,
+            DPNOpType::SplitBits | DPNOpType::SumBits | DPNOpType::DivRem4 => OpcodeBoundaryKind::VariableArity,
+            DPNOpType::TargetAt => OpcodeBoundaryKind::Indexed,
+            DPNOpType::CastU32 | DPNOpType::CastFelt | DPNOpType::CastBool => OpcodeBoundaryKind::Cast,
+            DPNOpType::GetUserId | DPNOpType::GetContractId | DPNOpType::GetCheckpointId | DPNOpType::GetNonce
+            | DPNOpType::GetUserPublicKeyHash | DPNOpType::GetCallerContractId | DPNOpType::GetSessionProofTreeRoot => OpcodeBoundaryKind::Context,
+            DPNOpType::GetStateQueryResult | DPNOpType::GetStateQueryResultSingle | DPNOpType::GetStateCommandResultHash
+            | DPNOpType::GetStateCommandResultSingle | DPNOpType::GetStateCommandResultArray => OpcodeBoundaryKind::StateResult,
+            DPNOpType::HashNoPad | DPNOpType::HashTwoToOne | DPNOpType::Keccak256 | DPNOpType::Secp256k1Verify => OpcodeBoundaryKind::Cryptographic,
+            DPNOpType::HashPad | DPNOpType::CalculateMerkleRoot => OpcodeBoundaryKind::ExplicitlyUnsupported,
+        }
+    }
+
+    #[test]
+    fn every_opcode_has_an_explicit_boundary_test_classification() {
+        let mut encodings = HashSet::new();
+        for &op in ALL {
+            assert!(encodings.insert(op.get_enc_value()), "duplicate opcode encoding for {op}");
+            let expected_type = op.get_data_type();
+            assert_ne!(expected_type, DPNBuiltInDataType::Unknown, "{op}");
+            match boundary_kind(op) {
+                OpcodeBoundaryKind::InputOrConstant => assert!(matches!(op, DPNOpType::InputTarget | DPNOpType::U32InputTarget | DPNOpType::BoolInputTarget | DPNOpType::Constant | DPNOpType::ConstantU32 | DPNOpType::ConstantTrue | DPNOpType::ConstantFalse)),
+                OpcodeBoundaryKind::Unary => assert!(matches!(op, DPNOpType::BoolNot | DPNOpType::UnaryInverse | DPNOpType::UnaryNegative)),
+                OpcodeBoundaryKind::Binary => assert!(!op.is_inputless(), "{op}"),
+                OpcodeBoundaryKind::VariableArity => assert!(!op.is_inputless(), "{op}"),
+                OpcodeBoundaryKind::Indexed => assert_eq!(op, DPNOpType::TargetAt),
+                OpcodeBoundaryKind::Cast => assert!(matches!(op, DPNOpType::CastU32 | DPNOpType::CastFelt | DPNOpType::CastBool)),
+                OpcodeBoundaryKind::Context => assert!(op.is_inputless(), "{op}"),
+                OpcodeBoundaryKind::StateResult => assert!(matches!(expected_type, DPNBuiltInDataType::Target | DPNBuiltInDataType::HashOut | DPNBuiltInDataType::TargetArray), "{op}"),
+                OpcodeBoundaryKind::Cryptographic => assert!(!op.is_inputless(), "{op}"),
+                OpcodeBoundaryKind::ExplicitlyUnsupported => assert!(matches!(op, DPNOpType::HashPad | DPNOpType::CalculateMerkleRoot)),
+            }
+        }
+        assert_eq!(encodings.len(), ALL.len());
+    }
+
+    #[test]
+    fn reserved_and_out_of_range_wire_opcodes_are_all_rejected() {
+        let valid = ALL.iter().map(DPNOpType::get_enc_value).collect::<HashSet<_>>();
+        for encoded in 0..=81 {
+            if !valid.contains(&encoded) {
+                assert!(std::panic::catch_unwind(|| DPNOpType::from(encoded)).is_err(), "reserved opcode {encoded}");
+            }
+        }
+        for encoded in [82, 255, 256, u16::MAX] {
+            assert!(std::panic::catch_unwind(|| DPNOpType::from(encoded)).is_err(), "out-of-range opcode {encoded}");
+        }
+    }
+
+    #[test]
+    fn constant_opcode_evaluators_cover_zero_maximum_and_failure_boundaries() {
+        let max = GoldilocksField::ORDER - 1;
+        assert_eq!(DPNOpType::Add.eval_binary_constant(max, 1), 0);
+        assert_eq!(DPNOpType::Sub.eval_binary_constant(0, 1), max);
+        assert_eq!(DPNOpType::Mul.eval_binary_constant(max, 0), 0);
+        assert_eq!(DPNOpType::Div.eval_binary_constant(max, 1), max);
+        assert_eq!(DPNOpType::Xor.eval_binary_constant(max, max), 0);
+        for op in [DPNOpType::Eq, DPNOpType::Lte, DPNOpType::Gte, DPNOpType::Gt, DPNOpType::Lt] {
+            let result = op.eval_binary_constant(max, 0);
+            assert!(result <= 1, "{op}");
+        }
+        for op in [DPNOpType::Exp, DPNOpType::ExpConstantPower, DPNOpType::ExpConstantBase, DPNOpType::U32Exp] {
+            assert_eq!(op.eval_binary_constant(0, 0), 1, "{op}");
+        }
+        for op in [DPNOpType::U32And, DPNOpType::U32Or, DPNOpType::U32Xor] {
+            assert!(op.eval_binary_constant(u32::MAX as u64, 0) <= u32::MAX as u64, "{op}");
+        }
+        for op in [DPNOpType::U32ShiftLeft, DPNOpType::U32ShiftLeftConstantBitDistance, DPNOpType::U32ShiftLeftConstantValue,
+            DPNOpType::U32ShiftRight, DPNOpType::U32ShiftRightConstantBitDistance, DPNOpType::U32ShiftRightConstantValue] {
+            assert_eq!(op.eval_binary_constant(u32::MAX as u64, 0), u32::MAX as u64, "{op}");
+        }
+        for op in [DPNOpType::Div, DPNOpType::Mod, DPNOpType::U32Div, DPNOpType::U32Mod] {
+            assert!(std::panic::catch_unwind(|| op.eval_binary_constant(1, 0)).is_err(), "{op}");
+        }
+        assert!(std::panic::catch_unwind(|| DPNOpType::UnaryInverse.eval_unary_constant(0)).is_err());
+        assert_eq!(DPNOpType::UnaryNegative.eval_unary_constant(max), 1);
+    }
+
+    #[test]
+    fn every_opcode_has_an_executed_constant_evaluator_boundary_contract() {
+        for &op in ALL {
+            match op {
+                DPNOpType::Add | DPNOpType::Sub | DPNOpType::Mul | DPNOpType::Div | DPNOpType::Xor
+                | DPNOpType::Eq | DPNOpType::Lte | DPNOpType::Gte | DPNOpType::Gt | DPNOpType::Lt
+                | DPNOpType::Exp | DPNOpType::ExpConstantPower | DPNOpType::ExpConstantBase | DPNOpType::Mod
+                | DPNOpType::U32And | DPNOpType::U32Or | DPNOpType::U32Xor | DPNOpType::BoolAnd | DPNOpType::BoolOr
+                | DPNOpType::U32Add | DPNOpType::U32Sub | DPNOpType::U32Mul | DPNOpType::U32Div | DPNOpType::U32Mod
+                | DPNOpType::U32Exp | DPNOpType::U32ShiftLeft | DPNOpType::U32ShiftLeftConstantBitDistance
+                | DPNOpType::U32ShiftLeftConstantValue | DPNOpType::U32ShiftRight | DPNOpType::U32ShiftRightConstantBitDistance
+                | DPNOpType::U32ShiftRightConstantValue => {
+                    let (a, b) = if matches!(op, DPNOpType::Div | DPNOpType::Mod | DPNOpType::U32Div | DPNOpType::U32Mod) { (1, 1) } else { (0, 0) };
+                    let _ = op.eval_binary_constant(a, b);
+                    assert!(std::panic::catch_unwind(|| op.eval_unary_constant(0)).is_err(), "binary opcode accepted unary evaluation: {op}");
+                }
+                DPNOpType::BoolNot | DPNOpType::UnaryInverse | DPNOpType::UnaryNegative => {
+                    let input = if op == DPNOpType::UnaryInverse { 1 } else { 0 };
+                    let _ = op.eval_unary_constant(input);
+                    assert!(std::panic::catch_unwind(|| op.eval_binary_constant(0, 0)).is_err(), "unary opcode accepted binary evaluation: {op}");
+                }
+                DPNOpType::InputTarget | DPNOpType::Constant | DPNOpType::ConstantTrue | DPNOpType::ConstantFalse
+                | DPNOpType::Nor | DPNOpType::SplitBits | DPNOpType::SumBits | DPNOpType::TargetAt | DPNOpType::HashNoPad
+                | DPNOpType::HashPad | DPNOpType::Select | DPNOpType::ModConstantDividend | DPNOpType::ModConstantDivisor
+                | DPNOpType::DivRem4 | DPNOpType::CastU32 | DPNOpType::U32AndConstant | DPNOpType::U32OrConstant
+                | DPNOpType::U32XorConstant | DPNOpType::CalculateMerkleRoot | DPNOpType::GetUserId | DPNOpType::GetContractId
+                | DPNOpType::GetCheckpointId | DPNOpType::GetNonce | DPNOpType::GetUserPublicKeyHash | DPNOpType::GetStateQueryResult
+                | DPNOpType::GetStateQueryResultSingle | DPNOpType::GetStateCommandResultHash | DPNOpType::GetStateCommandResultSingle
+                | DPNOpType::GetStateCommandResultArray | DPNOpType::U32InputTarget | DPNOpType::ConstantU32 | DPNOpType::CastFelt
+                | DPNOpType::CastBool | DPNOpType::BoolInputTarget | DPNOpType::Secp256k1Verify | DPNOpType::HashTwoToOne
+                | DPNOpType::GetCallerContractId | DPNOpType::GetSessionProofTreeRoot | DPNOpType::Keccak256 => {
+                    assert!(std::panic::catch_unwind(|| op.eval_binary_constant(0, 0)).is_err(), "runtime-only opcode accepted binary evaluation: {op}");
+                    assert!(std::panic::catch_unwind(|| op.eval_unary_constant(0)).is_err(), "runtime-only opcode accepted unary evaluation: {op}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_wire_opcode_round_trips_and_has_a_runtime_type_and_name() {
+        for op in ALL {
+            assert_eq!(DPNOpType::from(op.get_enc_value()), *op);
+            assert!(!op.to_string().is_empty());
+            let _ = op.get_data_type();
+            let _ = op.is_inputless();
+            let _ = op.needs_store();
+            let _ = op.has_constant_param();
+        }
+    }
+
+    #[test]
+    fn indexed_ids_and_all_builtin_types_round_trip() {
+        let types = [
+            DPNBuiltInDataType::Target, DPNBuiltInDataType::Bool, DPNBuiltInDataType::U32Target,
+            DPNBuiltInDataType::HashOut, DPNBuiltInDataType::HashOut160, DPNBuiltInDataType::TargetArray,
+            DPNBuiltInDataType::BoolArray, DPNBuiltInDataType::U32TargetArray,
+        ];
+        for ty in types {
+            let encoded = encode_indexed_op_id(ty, 123);
+            assert_eq!(decode_indexed_op_id(encoded), (ty, 123));
+            assert_eq!(DPNBuiltInDataType::from(ty as u8), ty);
+            assert!(!ty.to_string().is_empty());
+        }
+        assert_eq!(DPNBuiltInDataType::from(99u64), DPNBuiltInDataType::Unknown);
+        let max_index = u32::MAX as usize;
+        assert_eq!(decode_indexed_op_id(encode_indexed_op_id(DPNBuiltInDataType::Target, max_index)), (DPNBuiltInDataType::Target, max_index));
+    }
+
+    #[test]
+    #[should_panic(expected = "Unknown DPNOpType")]
+    fn unknown_wire_opcode_is_rejected() {
+        let _ = DPNOpType::from(u16::MAX);
+    }
+
+    #[test]
+    fn constant_evaluation_covers_arithmetic_boolean_and_u32_families() {
+        let cases = [
+            (DPNOpType::Add, 2, 3, 5), (DPNOpType::Sub, 5, 3, 2), (DPNOpType::Mul, 2, 3, 6),
+            (DPNOpType::Div, 6, 3, 2), (DPNOpType::Xor, 6, 3, 5), (DPNOpType::Eq, 3, 3, 1),
+            (DPNOpType::Lte, 3, 4, 1), (DPNOpType::Gte, 4, 3, 1), (DPNOpType::Gt, 4, 3, 1),
+            (DPNOpType::Lt, 3, 4, 1), (DPNOpType::Exp, 2, 3, 8), (DPNOpType::ExpConstantPower, 2, 3, 8),
+            (DPNOpType::ExpConstantBase, 2, 3, 8), (DPNOpType::Mod, 7, 3, 1), (DPNOpType::U32And, 6, 3, 2),
+            (DPNOpType::U32Or, 6, 3, 7), (DPNOpType::U32Xor, 6, 3, 5), (DPNOpType::BoolAnd, 1, 1, 1),
+            (DPNOpType::BoolOr, 0, 1, 1), (DPNOpType::U32Add, 2, 3, 5), (DPNOpType::U32Sub, 5, 3, 2),
+            (DPNOpType::U32Mul, 2, 3, 6), (DPNOpType::U32Div, 6, 3, 2), (DPNOpType::U32Mod, 7, 3, 1),
+            (DPNOpType::U32Exp, 2, 3, 8), (DPNOpType::U32ShiftLeft, 3, 2, 12),
+            (DPNOpType::U32ShiftLeftConstantBitDistance, 3, 2, 12), (DPNOpType::U32ShiftLeftConstantValue, 3, 2, 12),
+            (DPNOpType::U32ShiftRight, 12, 2, 3), (DPNOpType::U32ShiftRightConstantBitDistance, 12, 2, 3),
+            (DPNOpType::U32ShiftRightConstantValue, 12, 2, 3),
+        ];
+        for (op, a, b, expected) in cases { assert_eq!(op.eval_binary_constant(a, b), expected, "{op}"); }
+        assert_eq!(DPNOpType::BoolNot.eval_unary_constant(0), 1);
+        assert_eq!(DPNOpType::BoolNot.eval_unary_constant(1), 0);
+        assert_eq!(DPNOpType::UnaryInverse.eval_unary_constant(1), 1);
+        assert_eq!(DPNOpType::UnaryNegative.eval_unary_constant(0), 0);
+    }
+
+    #[test]
+    fn built_in_type_conversions_and_wire_payloads_cover_boundaries() {
+        let expected = [
+            DPNBuiltInDataType::Target,
+            DPNBuiltInDataType::Bool,
+            DPNBuiltInDataType::U32Target,
+            DPNBuiltInDataType::HashOut,
+            DPNBuiltInDataType::HashOut160,
+            DPNBuiltInDataType::TargetArray,
+            DPNBuiltInDataType::BoolArray,
+            DPNBuiltInDataType::U32TargetArray,
+        ];
+        for (value, data_type) in expected.into_iter().enumerate() {
+            assert_eq!(DPNBuiltInDataType::from(value as u64), data_type);
+            assert_eq!(DPNBuiltInDataType::from(value as u32), data_type);
+            assert_eq!(DPNBuiltInDataType::from(value as u16), data_type);
+            assert_eq!(DPNBuiltInDataType::from(value as u8), data_type);
+            assert!(data_type.to_string().starts_with("DPNBuiltInDataType::"));
+        }
+        assert_eq!(DPNBuiltInDataType::from(8u64), DPNBuiltInDataType::Unknown);
+        assert_eq!(DPNBuiltInDataType::from(u64::MAX), DPNBuiltInDataType::Unknown);
+        assert_eq!(DPNBuiltInDataType::Unknown.to_string(), "DPNBuiltInDataType::Unknown");
+
+        let definition = DPNIndexedVarDef {
+            data_type: DPNBuiltInDataType::TargetArray,
+            index: u16::MAX as usize,
+            op_type: DPNOpType::HashPad,
+            inputs: vec![0, 1, GoldilocksField::ORDER - 1],
+        };
+        assert_eq!(definition.get_combined_data_type_index(), encode_indexed_op_id(definition.data_type, definition.index));
+        let felts: Vec<SymFeltRef> = definition.to_felts();
+        assert_eq!(<DPNIndexedVarDef as ToFelts<SymFeltRef>>::from_felts(&felts), definition);
+
+        let assertion = DPNAssertEqInfoIndexed { left: 1, right: 2, message: "边界".to_owned() };
+        let felts: Vec<SymFeltRef> = assertion.to_felts();
+        assert_eq!(<DPNAssertEqInfoIndexed as ToFelts<SymFeltRef>>::from_felts(&felts), assertion);
+
+        let event = DPNEventRecord { condition: 1, checkpoint_id: 2, user_id: 3, contract_id: 4, data: vec![0, GoldilocksField::ORDER - 1] };
+        let felts: Vec<SymFeltRef> = event.to_felts();
+        assert_eq!(<DPNEventRecord as ToFelts<SymFeltRef>>::from_felts(&felts), event);
+    }
+
+    #[test]
+    fn malformed_wire_payloads_are_rejected_at_each_length_boundary() {
+        let c = SymFeltRef::new_constant;
+        assert!(std::panic::catch_unwind(|| <DPNIndexedVarDef as ToFelts<SymFeltRef>>::from_felts(&[c(0), c(0), c(0)])).is_err());
+        assert!(std::panic::catch_unwind(|| {
+            <DPNIndexedVarDef as ToFelts<SymFeltRef>>::from_felts(&[c(0), c(0), c(DPNOpType::Add as u64), c(2), c(9)])
+        })
+        .is_err());
+        assert!(std::panic::catch_unwind(|| <DPNAssertEqInfoIndexed as ToFelts<SymFeltRef>>::from_felts(&[c(1), c(2)])).is_err());
+        assert!(std::panic::catch_unwind(|| {
+            <DPNAssertEqInfoIndexed as ToFelts<SymFeltRef>>::from_felts(&[c(1), c(2), c(2), c(b'x' as u64)])
+        })
+        .is_err());
+        assert!(std::panic::catch_unwind(|| {
+            <DPNAssertEqInfoIndexed as ToFelts<SymFeltRef>>::from_felts(&[c(1), c(2), c(1), c(0xff)])
+        })
+        .is_err());
+        assert!(std::panic::catch_unwind(|| <DPNEventRecord as ToFelts<SymFeltRef>>::from_felts(&[c(1), c(2), c(3)])).is_err());
+    }
+
+    #[test]
+    fn constant_evaluation_rejects_non_field_values_and_unsupported_operators() {
+        assert!(std::panic::catch_unwind(|| DPNOpType::Add.eval_binary_constant(GoldilocksField::ORDER, 0)).is_err());
+        assert!(std::panic::catch_unwind(|| DPNOpType::Add.eval_binary_constant(0, GoldilocksField::ORDER)).is_err());
+        assert!(std::panic::catch_unwind(|| DPNOpType::Constant.eval_binary_constant(0, 0)).is_err());
+        assert!(std::panic::catch_unwind(|| DPNOpType::BoolNot.eval_unary_constant(GoldilocksField::ORDER)).is_err());
+        assert!(std::panic::catch_unwind(|| DPNOpType::Add.eval_unary_constant(0)).is_err());
+        assert_eq!(DPNOpType::Eq.eval_binary_constant(1, 2), 0);
+        assert_eq!(DPNOpType::Lte.eval_binary_constant(2, 1), 0);
+        assert_eq!(DPNOpType::Gte.eval_binary_constant(1, 2), 0);
+        assert_eq!(DPNOpType::Gt.eval_binary_constant(1, 2), 0);
+        assert_eq!(DPNOpType::Lt.eval_binary_constant(2, 1), 0);
+    }
+}
+
 impl<F: ContextFelt> ToFelts<F> for DPNEventRecord {
     fn to_felts(&self) -> Vec<F> {
         let mut out = Vec::with_capacity(5 + self.data.len());

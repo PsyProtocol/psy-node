@@ -420,3 +420,101 @@ pub trait DPNContext<F: ContextFelt>: Debug + Clone {
     // event operations
     fn emit_event(&mut self, event_data: Vec<F>);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dpn::ops::exec_context::QExecContext;
+
+    fn c(value: u64) -> SymFeltRef {
+        SymFeltRef::new_constant(value)
+    }
+
+    #[test]
+    fn felt_sizes_scalar_round_trip_and_constant_array_indexing_cover_boundaries() {
+        assert_eq!(SymFeltRef::size(), 1);
+        assert_eq!(c(9).self_size(), 1);
+        assert_eq!(<[SymFeltRef; 0] as FeltSized>::size(), 0);
+        assert_eq!(<[SymFeltRef; 3] as FeltSized>::size(), 3);
+        assert_eq!(c(7).to_felts(), vec![c(7)]);
+        assert_eq!(<SymFeltRef as ToFelts<SymFeltRef>>::from_felts(&[c(8)]), c(8));
+
+        let values = [c(10), c(20), c(30)];
+        let mut context = QExecContext::new();
+        assert_eq!(QContextArray::q_size(&values), 3);
+        assert_eq!(QContextArray::q_get(&values, &mut context, c(0)), c(10));
+        assert_eq!(QContextArray::q_get(&values, &mut context, c(2)), c(30));
+        assert_eq!(values[c(1)], c(20));
+        assert!(std::panic::catch_unwind(|| values[SymFeltRef::new_input(0, super::super::op_types::DPNBuiltInDataType::Target)]).is_err());
+    }
+
+    #[test]
+    fn sized_array_and_vector_direct_accessors_cover_first_and_last_elements() {
+        let mut array = [c(1), c(2), c(3)];
+        assert_eq!(<[SymFeltRef; 3] as QContextArraySized<SymFeltRef>>::q_sized_size(&array), 3);
+        assert_eq!(<[SymFeltRef; 3] as QContextArraySized<SymFeltRef>>::q_get_direct(&array, 2), c(3));
+        assert_eq!(*<[SymFeltRef; 3] as QContextArraySized<SymFeltRef>>::q_get_direct_ref(&array, 0), c(1));
+        *<[SymFeltRef; 3] as QContextArraySized<SymFeltRef>>::q_get_direct_mut(&mut array, 0) = c(4);
+        <[SymFeltRef; 3] as QContextArraySized<SymFeltRef>>::q_put_direct(&mut array, 2, c(5));
+        assert_eq!(array, [c(4), c(2), c(5)]);
+
+        let mut values = vec![c(6), c(7)];
+        assert_eq!(<Vec<SymFeltRef> as DPNContextArraySized<SymFeltRef, SymFeltRef>>::q_sized_size(&values), 2);
+        assert_eq!(<Vec<SymFeltRef> as DPNContextArraySized<SymFeltRef, SymFeltRef>>::q_get_direct(&values, 1), c(7));
+        assert_eq!(*<Vec<SymFeltRef> as DPNContextArraySized<SymFeltRef, SymFeltRef>>::q_get_direct_ref(&values, 0), c(6));
+        *<Vec<SymFeltRef> as DPNContextArraySized<SymFeltRef, SymFeltRef>>::q_get_direct_mut(&mut values, 0) = c(8);
+        <Vec<SymFeltRef> as DPNContextArraySized<SymFeltRef, SymFeltRef>>::q_put_direct(&mut values, 1, c(9));
+        assert_eq!(values, vec![c(8), c(9)]);
+    }
+
+    #[test]
+    fn symbolic_array_selection_and_unimplemented_reference_accessors_are_explicit() {
+        let values = [c(10), c(20), c(30)];
+        let mut context = QExecContext::new();
+        let index = context.add_input();
+        let selected = QContextArray::q_get(&values, &mut context, index);
+        assert!(selected.needs_store());
+
+        let mut values = values;
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = QContextArray::q_get_ref(&values, &mut context, c(0));
+        }))
+        .is_err());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = QContextArray::q_get_mut(&mut values, &mut context, c(0));
+        }))
+        .is_err());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = QContextArray::q_set_at_index(&mut values, &mut context, c(0));
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn generic_dpn_array_access_covers_constant_symbolic_and_todo_paths() {
+        type Values = [SymFeltRef; 3];
+        let mut values = [c(11), c(22), c(33)];
+        let mut context = QExecContext::new();
+        assert_eq!(<Values as DPNContextArray<SymFeltRef, SymFeltRef, QExecContext>>::q_size(&values), 3);
+        assert_eq!(
+            <Values as DPNContextArray<SymFeltRef, SymFeltRef, QExecContext>>::q_get(&values, &mut context, c(2)),
+            c(33)
+        );
+        let index = context.add_input();
+        let selected = <Values as DPNContextArray<SymFeltRef, SymFeltRef, QExecContext>>::q_get(&values, &mut context, index);
+        assert!(selected.needs_store());
+
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = <Values as DPNContextArray<SymFeltRef, SymFeltRef, QExecContext>>::q_get_ref(&values, &mut context, c(0));
+        }))
+        .is_err());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = <Values as DPNContextArray<SymFeltRef, SymFeltRef, QExecContext>>::q_get_mut(&mut values, &mut context, c(0));
+        }))
+        .is_err());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = <Values as DPNContextArray<SymFeltRef, SymFeltRef, QExecContext>>::q_set_at_index(&mut values, &mut context, c(0));
+        }))
+        .is_err());
+    }
+}

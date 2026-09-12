@@ -63,3 +63,32 @@ impl DPNStateCommandStore {
         self.commands
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deduplicates_read_commands_but_keeps_writes_and_resets_sensitive_caches() {
+        let mut store = DPNStateCommandStore::new();
+        let slot = SymFeltRef::new_constant(2);
+        let read = DPNStateCmd::get_other_user_contract_state_slot_single(
+            SymFeltRef::new_constant(1), SymFeltRef::new_constant(2), SymFeltRef::new_constant(4), slot,
+        );
+        assert_eq!(store.injest_command(read.clone()), 0);
+        assert_eq!(store.injest_command(read), 0);
+
+        let sensitive = DPNStateCmd::get_self_user_current_contract_state_slot_single(slot);
+        assert_eq!(store.injest_command(sensitive.clone()), 1);
+        assert_eq!(store.injest_command(sensitive), 1);
+
+        let write = DPNStateCmd::set_contract_state_slot_single(
+            SymFeltRef::constant_true(), slot, SymFeltRef::new_constant(9),
+        );
+        assert_eq!(store.injest_command(write.clone()), 2);
+        assert_eq!(store.injest_command(write), 3);
+        assert_eq!(store.commands.len(), 4);
+        assert!(store.external_and_state_sensitive_cmd_map.is_empty());
+        assert_eq!(store.finalize().len(), 4);
+    }
+}

@@ -162,6 +162,298 @@ fn imt_leaf_matches_key<F: RichField>(leaf: &psy_client_data::qdata::imt_contrac
     leaf.key == *key
 }
 
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use kvq::memory::simple::KVQSimpleMemoryBackingStore;
+    use plonky2::field::goldilocks_field::GoldilocksField;
+    use plonky2::field::types::Field;
+    use plonky2::hash::poseidon::PoseidonHash;
+    use psy_client_data::dpn::proving_session::DPNProvingSessionSimpleMethodCall;
+    use psy_client_data::qstore::controllers::proving_session::PsyLocalProvingSessionStore;
+    use crate::dpn::ops::op_types::encode_indexed_op_id;
+
+    #[tokio::test]
+    async fn process_state_cmd_resolves_a_zero_default_slot_and_records_witness() {
+        let target = encode_indexed_op_id(DPNBuiltInDataType::Target, 0);
+        let mut session: PsyLocalProvingSessionStore<GoldilocksField, KVQSimpleMemoryBackingStore, PoseidonHash> = PsyLocalProvingSessionStore::new_at(
+            KVQSimpleMemoryBackingStore::new(),
+            GoldilocksField::ZERO,
+            GoldilocksField::from_canonical_u64(7),
+            GoldilocksField::ZERO,
+            GoldilocksField::ZERO,
+            4,
+        );
+        session
+            .init_transaction(DPNProvingSessionSimpleMethodCall::new(
+                GoldilocksField::from_canonical_u64(8),
+                GoldilocksField::ONE,
+                vec![GoldilocksField::from_canonical_u64(3)],
+            ))
+            .await
+            .unwrap();
+
+        let mut executor = SimpleDPNExecutor::new_with_contract_ctx(
+            vec![GoldilocksField::from_canonical_u64(3)],
+            GoldilocksField::from_canonical_u64(7),
+            GoldilocksField::from_canonical_u64(8),
+            GoldilocksField::ZERO,
+            GoldilocksField::ZERO,
+            GoldilocksField::ZERO,
+            [GoldilocksField::ZERO; 4],
+            [GoldilocksField::ZERO; 4],
+        );
+        executor.process_var_def(&crate::dpn::ops::op_types::DPNIndexedVarDef {
+            data_type: DPNBuiltInDataType::Target,
+            index: 0,
+            op_type: DPNOpType::Constant,
+            inputs: vec![1],
+        });
+        let command = DPNStateCmd::get_self_user_current_contract_state_slot_single(target);
+        let mut result = PsyEvalSessionResult::new();
+        let error = result.process_state_cmd(&mut executor, &mut session, &command).await.unwrap_err();
+        assert!(error.to_string().contains("Contract not found"));
+        assert!(result.cmd_witnesses.is_empty());
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "state cmd input expects scalar")]
+    async fn process_state_cmd_rejects_array_inputs_before_resolving() {
+        let mut session: PsyLocalProvingSessionStore<GoldilocksField, KVQSimpleMemoryBackingStore, PoseidonHash> = PsyLocalProvingSessionStore::new_at(
+            KVQSimpleMemoryBackingStore::new(),
+            GoldilocksField::ZERO,
+            GoldilocksField::from_canonical_u64(7),
+            GoldilocksField::ZERO,
+            GoldilocksField::ZERO,
+            4,
+        );
+        session
+            .init_transaction(DPNProvingSessionSimpleMethodCall::new(
+                GoldilocksField::from_canonical_u64(8),
+                GoldilocksField::ONE,
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let mut executor = SimpleDPNExecutor::new_with_contract_ctx(
+            vec![GoldilocksField::from_canonical_u64(3)],
+            GoldilocksField::from_canonical_u64(7),
+            GoldilocksField::from_canonical_u64(8),
+            GoldilocksField::ZERO,
+            GoldilocksField::ZERO,
+            GoldilocksField::ZERO,
+            [GoldilocksField::ZERO; 4],
+            [GoldilocksField::ZERO; 4],
+        );
+        executor.push_external_target_array(0, vec![GoldilocksField::ONE]);
+        let command = DPNStateCmd::get_self_user_current_contract_state_slot_single(encode_indexed_op_id(DPNBuiltInDataType::TargetArray, 0));
+        let mut result = PsyEvalSessionResult::new();
+        let _ = result.process_state_cmd(&mut executor, &mut session, &command).await;
+    }
+
+    #[tokio::test]
+    async fn process_state_cmd_resolves_bool_and_u32_scalar_boundaries_without_recording_failed_witnesses() {
+        let mut session: PsyLocalProvingSessionStore<GoldilocksField, KVQSimpleMemoryBackingStore, PoseidonHash> = PsyLocalProvingSessionStore::new_at(
+            KVQSimpleMemoryBackingStore::new(),
+            GoldilocksField::ZERO,
+            GoldilocksField::from_canonical_u64(7),
+            GoldilocksField::ZERO,
+            GoldilocksField::ZERO,
+            4,
+        );
+        session
+            .init_transaction(DPNProvingSessionSimpleMethodCall::new(
+                GoldilocksField::from_canonical_u64(8),
+                GoldilocksField::ONE,
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let mut executor = SimpleDPNExecutor::new_with_contract_ctx(
+            vec![],
+            GoldilocksField::from_canonical_u64(7),
+            GoldilocksField::from_canonical_u64(8),
+            GoldilocksField::ZERO,
+            GoldilocksField::ZERO,
+            GoldilocksField::ZERO,
+            [GoldilocksField::ZERO; 4],
+            [GoldilocksField::ZERO; 4],
+        );
+        executor.process_var_def(&crate::dpn::ops::op_types::DPNIndexedVarDef {
+            data_type: DPNBuiltInDataType::Bool,
+            index: 0,
+            op_type: DPNOpType::ConstantTrue,
+            inputs: vec![],
+        });
+        executor.process_var_def(&crate::dpn::ops::op_types::DPNIndexedVarDef {
+            data_type: DPNBuiltInDataType::Bool,
+            index: 1,
+            op_type: DPNOpType::ConstantFalse,
+            inputs: vec![],
+        });
+        executor.process_var_def(&crate::dpn::ops::op_types::DPNIndexedVarDef {
+            data_type: DPNBuiltInDataType::U32Target,
+            index: 0,
+            op_type: DPNOpType::ConstantU32,
+            inputs: vec![u32::MAX as u64],
+        });
+
+        for scalar in [
+            encode_indexed_op_id(DPNBuiltInDataType::Bool, 0),
+            encode_indexed_op_id(DPNBuiltInDataType::Bool, 1),
+            encode_indexed_op_id(DPNBuiltInDataType::U32Target, 0),
+        ] {
+            let command = DPNStateCmd::get_self_user_current_contract_state_slot_single(scalar);
+            let mut result = PsyEvalSessionResult::new();
+            let error = result.process_state_cmd(&mut executor, &mut session, &command).await.unwrap_err();
+            assert!(error.to_string().contains("Contract not found"));
+            assert!(result.cmd_witnesses.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "state cmd input contains Unknown typed op id")]
+    async fn process_state_cmd_rejects_unknown_scalar_before_resolving() {
+        let mut session: PsyLocalProvingSessionStore<GoldilocksField, KVQSimpleMemoryBackingStore, PoseidonHash> = PsyLocalProvingSessionStore::new_at(
+            KVQSimpleMemoryBackingStore::new(),
+            GoldilocksField::ZERO,
+            GoldilocksField::from_canonical_u64(7),
+            GoldilocksField::ZERO,
+            GoldilocksField::ZERO,
+            4,
+        );
+        let mut executor = SimpleDPNExecutor::new();
+        let unknown = encode_indexed_op_id(DPNBuiltInDataType::Unknown, 0);
+        let command = DPNStateCmd::get_self_user_current_contract_state_slot_single(unknown);
+        let mut result = PsyEvalSessionResult::new();
+        let _ = result.process_state_cmd(&mut executor, &mut session, &command).await;
+    }
+
+    #[tokio::test]
+    async fn process_state_cmd_rejects_every_non_scalar_input_family() {
+        for data_type in [
+            DPNBuiltInDataType::HashOut,
+            DPNBuiltInDataType::HashOut160,
+            DPNBuiltInDataType::TargetArray,
+            DPNBuiltInDataType::BoolArray,
+            DPNBuiltInDataType::U32TargetArray,
+        ] {
+            let task = tokio::spawn(async move {
+                let mut session: PsyLocalProvingSessionStore<GoldilocksField, KVQSimpleMemoryBackingStore, PoseidonHash> = PsyLocalProvingSessionStore::new_at(
+                    KVQSimpleMemoryBackingStore::new(),
+                    GoldilocksField::ZERO,
+                    GoldilocksField::from_canonical_u64(7),
+                    GoldilocksField::ZERO,
+                    GoldilocksField::ZERO,
+                    4,
+                );
+                let mut executor = SimpleDPNExecutor::new();
+                let input = encode_indexed_op_id(data_type, 0);
+                let command = DPNStateCmd::get_self_user_current_contract_state_slot_single(input);
+                let mut result = PsyEvalSessionResult::new();
+                let _ = result.process_state_cmd(&mut executor, &mut session, &command).await;
+            });
+            let error = task.await.unwrap_err();
+            assert!(error.is_panic(), "{data_type}");
+        }
+    }
+
+    #[tokio::test]
+    async fn contract_call_entrypoints_reject_wrong_input_lengths_without_touching_session() {
+        let mut session: PsyLocalProvingSessionStore<GoldilocksField, KVQSimpleMemoryBackingStore, PoseidonHash> = PsyLocalProvingSessionStore::new_at(
+            KVQSimpleMemoryBackingStore::new(),
+            GoldilocksField::ZERO,
+            GoldilocksField::from_canonical_u64(7),
+            GoldilocksField::ZERO,
+            GoldilocksField::ZERO,
+            4,
+        );
+        let fn_def = DPNFunctionCircuitDefinition {
+            name: "arity".into(),
+            method_id: 3,
+            circuit_inputs: vec![encode_indexed_op_id(DPNBuiltInDataType::Target, 0)],
+            circuit_outputs: vec![],
+            state_commands: vec![],
+            state_command_resolution_indices: vec![],
+            assertions: vec![],
+            definitions: vec![],
+            events: vec![],
+        };
+        let result = PsyEvalSessionResult::new()
+            .exec_deferred_contract_call_local(&mut session, GoldilocksField::from_canonical_u64(8), &fn_def, vec![])
+            .await;
+        assert!(result.unwrap_err().to_string().contains("expect 1 number of inputs"));
+        let result = PsyEvalSessionResult::new()
+            .exec_contract_call(&mut session, GoldilocksField::from_canonical_u64(8), &fn_def, vec![])
+            .await;
+        assert!(result.unwrap_err().to_string().contains("expect 1 number of inputs"));
+        let result = PsyEvalSessionResult::new()
+            .exec_deferred_contract_call(
+                &mut session,
+                GoldilocksField::from_canonical_u64(8),
+                GoldilocksField::from_canonical_u64(9),
+                &fn_def,
+                vec![],
+            )
+            .await;
+        assert!(result.unwrap_err().to_string().contains("expect 1 number of inputs"));
+    }
+
+    #[tokio::test]
+    async fn resolve_vec_dispatches_every_state_command_family_on_empty_backend() {
+        let mut session: PsyLocalProvingSessionStore<GoldilocksField, KVQSimpleMemoryBackingStore, PoseidonHash> = PsyLocalProvingSessionStore::new_at(
+            KVQSimpleMemoryBackingStore::new(),
+            GoldilocksField::ZERO,
+            GoldilocksField::from_canonical_u64(7),
+            GoldilocksField::ZERO,
+            GoldilocksField::ZERO,
+            4,
+        );
+        session
+            .init_transaction(DPNProvingSessionSimpleMethodCall::new(
+                GoldilocksField::from_canonical_u64(8),
+                GoldilocksField::ONE,
+                vec![],
+            ))
+            .await
+            .unwrap();
+
+        let key = [1, 2, 3, 4];
+        let value = [5, 6, 7, 8];
+        let commands = vec![
+            DPNStateCmd::set_contract_state_slot_hash(0, 1, value),
+            DPNStateCmd::set_contract_state_slot_hash(1, 1, value),
+            DPNStateCmd::set_contract_state_slot_single(0, 1, 9),
+            DPNStateCmd::set_contract_state_slot_single(1, 1, 9),
+            DPNStateCmd::set_contract_state_slot_range(0, 1, vec![9, 10]),
+            DPNStateCmd::set_contract_state_slot_range(1, 1, vec![9, 10]),
+            DPNStateCmd::set_imt_contract_state_value(0, 1, 2, key, value),
+            DPNStateCmd::set_imt_contract_state_value(1, 1, 2, key, value),
+            DPNStateCmd::get_self_user_current_contract_state_slot_single(1),
+            DPNStateCmd::get_self_user_current_contract_state_slot_hash(1),
+            DPNStateCmd::get_self_user_current_contract_state_slot_range(1, 2),
+            DPNStateCmd::get_self_user_external_contract_state_slot_single(8, 2, 1),
+            DPNStateCmd::get_self_user_external_contract_state_slot_hash(8, 2, 1),
+            DPNStateCmd::get_self_user_external_contract_state_slot_range(8, 2, 1, 2),
+            DPNStateCmd::get_other_user_contract_state_slot_single(7, 8, 2, 1),
+            DPNStateCmd::get_other_user_contract_state_slot_hash(7, 8, 2, 1),
+            DPNStateCmd::get_other_user_contract_state_slot_range(7, 8, 2, 1, 2),
+            DPNStateCmd::invoke_external_contract_function_deferred(1, 8, 3, vec![4]),
+            DPNStateCmd::get_checkpoint_leaf_stats(1),
+            DPNStateCmd::get_global_state_roots(1),
+            DPNStateCmd::get_contract_leaf(8),
+            DPNStateCmd::get_self_user_current_imt_contract_state_value(1, 2, key),
+            DPNStateCmd::get_self_user_external_imt_contract_state_value(8, 2, 1, 2, key),
+            DPNStateCmd::get_other_user_imt_contract_state_value(7, 8, 2, 1, 2, key),
+            DPNStateCmd::contains_self_user_current_imt_contract_state_value(1, 2, key),
+            DPNStateCmd::contains_other_user_imt_contract_state_value(7, 8, 2, 1, 2, key),
+        ];
+        for command in commands {
+            let _ = session.resolve_vec(&command).await;
+        }
+    }
+}
+
 #[cfg_attr(not(target_arch = "wasm32"), maybe_async::maybe_async)]
 #[cfg_attr(target_arch = "wasm32", maybe_async::maybe_async(?Send))]
 pub trait PsyCmdInputWitnessResolver<F: RichField + PrimeField64, H: MerkleZeroHasherWithMarkedLeaf<QHashOut<F>> + FieldQHasher<F> + Send> {
@@ -2069,7 +2361,9 @@ impl<F: RichField> PsyEvalSessionResult<F> {
 
 #[cfg(test)]
 mod tests {
-    use super::imt_slot_base_from_subslot_base;
+    use super::*;
+    use plonky2::field::{goldilocks_field::GoldilocksField, types::Field};
+    use psy_client_data::qdata::imt_contract_state::IMTContractStateLeaf;
 
     #[test]
     fn test_imt_slot_base_from_subslot_base_rounds_up_to_slot_boundary() {
@@ -2080,6 +2374,100 @@ mod tests {
         assert_eq!(imt_slot_base_from_subslot_base(4), 1);
         assert_eq!(imt_slot_base_from_subslot_base(5), 2);
         assert_eq!(imt_slot_base_from_subslot_base(130), 33);
+    }
+
+    #[test]
+    fn imt_indices_enforce_absolute_capacity_bounds_and_sentinel_rule() {
+        assert_eq!(validate_imt_leaf_index(11, 10, 3).unwrap(), 11);
+        assert_eq!(validate_imt_leaf_index(13, 10, 3).unwrap(), 13);
+        assert!(validate_imt_leaf_index(10, 10, 3).is_err());
+        assert!(validate_imt_leaf_index(14, 10, 3).is_err());
+        assert_eq!(validate_imt_predecessor_leaf_index(10, 10, 3).unwrap(), 10);
+        assert!(validate_imt_predecessor_leaf_index(14, 10, 3).is_err());
+        assert_eq!(validate_imt_next_append_index(0, 10, 3).unwrap(), 11);
+        assert_eq!(validate_imt_next_append_index(12, 10, 3).unwrap(), 12);
+        assert!(validate_imt_next_append_index(14, 10, 3).is_err());
+        assert_eq!(validate_imt_slot_index(11, 10, 3).unwrap(), 11);
+        assert!(validate_imt_slot_index(10, 10, 3).is_err());
+    }
+
+    #[test]
+    fn imt_validation_handles_overflow_and_next_pointer_bounds() {
+        assert!(validate_imt_leaf_index(1, u64::MAX, 1).is_err());
+        assert!(validate_imt_leaf_index(1, u64::MAX - 1, 2).is_err());
+        assert!(validate_imt_next_append_index(0, u64::MAX, 1).is_err());
+        assert!(validate_imt_slot_index(1, u64::MAX, 1).is_err());
+        assert!(validate_imt_slot_index(1, u64::MAX - 1, 2).is_err());
+
+        let valid = IMTContractStateLeaf::<GoldilocksField> {
+            next_index: GoldilocksField::from_canonical_u64(12),
+            ..Default::default()
+        };
+        assert_eq!(validate_imt_preimage(valid, 10, 3).unwrap(), valid);
+        let terminal = IMTContractStateLeaf::<GoldilocksField> {
+            next_index: GoldilocksField::ZERO,
+            ..Default::default()
+        };
+        assert_eq!(validate_imt_preimage(terminal, u64::MAX, 0).unwrap(), terminal);
+        let invalid = IMTContractStateLeaf::<GoldilocksField> {
+            next_index: GoldilocksField::from_canonical_u64(14),
+            ..Default::default()
+        };
+        assert!(validate_imt_preimage(invalid, 10, 3).is_err());
+    }
+
+    #[test]
+    fn validation_helpers_recognize_supported_heights_and_known_error_text() {
+        assert_eq!(validate_contract_state_tree_height(1).unwrap(), 1);
+        assert_eq!(validate_contract_state_tree_height(32).unwrap(), 32);
+        assert!(validate_contract_state_tree_height(0).is_err());
+        assert!(validate_contract_state_tree_height(33).is_err());
+
+        assert!(is_imt_key_not_found_error(&anyhow::anyhow!("Key not found in IMT")));
+        assert!(is_imt_key_not_found_error(&anyhow::anyhow!("key not found in IMT")));
+        assert!(!is_imt_key_not_found_error(&anyhow::anyhow!("other error")));
+        assert!(is_imt_predecessor_not_found_error(&anyhow::anyhow!("No predecessor found")));
+        assert!(!is_imt_predecessor_not_found_error(&anyhow::anyhow!("missing")));
+    }
+
+    #[test]
+    fn non_membership_checks_key_order_and_successor_boundary() {
+        let key = QHashOut::from_values(5, 0, 0, 0);
+        let valid = IMTContractStateLeaf::<GoldilocksField>::new(
+            QHashOut::from_values(3, 0, 0, 0),
+            QHashOut::ZERO,
+            QHashOut::from_values(8, 0, 0, 0),
+            GoldilocksField::ONE,
+        );
+        assert!(is_valid_imt_non_membership_predecessor(&valid, &key));
+        assert!(!is_valid_imt_non_membership_predecessor(&valid, &QHashOut::from_values(3, 0, 0, 0)));
+        assert!(!is_valid_imt_non_membership_predecessor(&valid, &QHashOut::from_values(8, 0, 0, 0)));
+        assert!(imt_leaf_matches_key(&valid, &QHashOut::from_values(3, 0, 0, 0)));
+        assert!(!imt_leaf_matches_key(&valid, &key));
+    }
+
+    #[test]
+    fn empty_eval_result_starts_without_witnesses() {
+        let result = PsyEvalSessionResult::<GoldilocksField>::new();
+        assert!(result.cmd_witnesses.is_empty());
+    }
+
+    #[test]
+    fn merkle_proof_conversion_preserves_the_read_as_an_unchanged_delta() {
+        let proof = MerkleProofCore {
+            root: 10u64,
+            value: 3u64,
+            index: 4,
+            siblings: vec![1, 2],
+        };
+
+        let delta = mp_to_dmp(proof);
+        assert_eq!(delta.old_root, 10);
+        assert_eq!(delta.new_root, 10);
+        assert_eq!(delta.old_value, 3);
+        assert_eq!(delta.new_value, 3);
+        assert_eq!(delta.index, 4);
+        assert_eq!(delta.siblings, vec![1, 2]);
     }
 }
 

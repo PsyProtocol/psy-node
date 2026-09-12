@@ -1652,3 +1652,377 @@ impl Registers {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dpn::ops::{op_types::encode_indexed_op_id, state_cmd::data::DPNStateCmd};
+
+    fn context() -> ExecutionContext {
+        ExecutionContext {
+            user_id: 7,
+            contract_id: 8,
+            caller_contract_id: 9,
+            checkpoint_id: 10,
+            nonce: 11,
+            user_public_key_hash: [1, 2, 3, 4],
+        }
+    }
+
+    #[test]
+    fn in_memory_backend_preserves_all_supported_state_shapes() {
+        let mut backend = InMemoryStateBackend::new();
+        backend.set_slot(1, 2, 3, 4);
+        backend.set_hash(1, 2, 2, [5, 6, 7, 8]);
+        backend.set_deployer(2, [9, 10, 11, 12]);
+        backend.set_checkpoint_stats(3, vec![13, 14]);
+        backend.set_contract_leaf(2, vec![15; 13]);
+        backend.set_checkpoint_global_state_roots(3, vec![16; 20]);
+        backend.set_imt(1, 2, [1; 4], [17; 4]);
+
+        assert_eq!(backend.get_contract_slot(1, 2, 3).unwrap(), 4);
+        assert_eq!(backend.get_contract_hash(1, 2, 2).unwrap(), [5, 6, 7, 8]);
+        assert_eq!(backend.get_contract_range(1, 2, 7, 3).unwrap(), vec![0, 5, 6]);
+        assert_eq!(backend.get_contract_deployer(2).unwrap(), [9, 10, 11, 12]);
+        assert_eq!(backend.get_checkpoint_stats(3).unwrap(), vec![13, 14]);
+        assert_eq!(backend.get_contract_leaf(2).unwrap(), vec![15; 13]);
+        assert_eq!(backend.get_checkpoint_global_state_roots(3).unwrap(), vec![16; 20]);
+        assert_eq!(backend.get_imt_value(1, 2, &[1; 4]), [17; 4]);
+        backend.set_imt_value(1, 2, &[2; 4], &[18; 4]);
+        assert_eq!(backend.imt_entries_for(1, 2).count(), 2);
+        assert_eq!(backend.get_contract_leaf(999).unwrap(), vec![0; 13]);
+        assert_eq!(backend.get_contract_hash(1, 2, 999).unwrap(), [0; 4]);
+        assert_eq!(backend.get_contract_range(1, 2, 999, 0).unwrap(), Vec::<u64>::new());
+        assert_eq!(backend.get_contract_deployer(999).unwrap(), [0; 4]);
+        assert!(backend.get_checkpoint_stats(999).unwrap().is_empty());
+        assert_eq!(backend.get_checkpoint_global_state_roots(999).unwrap(), vec![0; 20]);
+        assert_eq!(backend.get_imt_value(1, 2, &[99; 4]), [0; 4]);
+    }
+
+    #[test]
+    fn executor_records_overlay_write_read_delta_and_conditional_skip() {
+        let target = |index| encode_indexed_op_id(DPNBuiltInDataType::Target, index);
+        let circuit = DPNFunctionCircuitDefinition {
+            name: "write".into(),
+            method_id: 1,
+            circuit_inputs: vec![target(0), target(1), target(2)],
+            circuit_outputs: vec![target(1)],
+            state_commands: vec![
+                DPNStateCmd::set_contract_state_slot_single(target(0), target(1), target(2)),
+                DPNStateCmd::set_contract_state_slot_single(target(3), target(1), target(2)),
+            ],
+            state_command_resolution_indices: vec![0, 0],
+            assertions: vec![],
+            definitions: vec![],
+            events: vec![],
+        };
+        let mut executor = VmExecutor::new(InMemoryStateBackend::new());
+        let result = executor.execute(&circuit, &context(), &[1, 5, 42]).unwrap();
+
+        assert!(result.success);
+        assert_eq!(result.outputs, vec![5]);
+        assert_eq!(result.state_writes.len(), 2);
+        assert!(result.state_writes[0].condition);
+        assert!(!result.state_writes[1].condition);
+        assert_eq!(result.state_writes[0].new_value, vec![42]);
+        assert_eq!(result.state_delta.len(), 1);
+        assert_eq!(result.state_delta[0].new_value, vec![42]);
+        assert_eq!(executor.write_overlay().get(&(7, 8, 5)), Some(&42));
+    }
+
+    #[test]
+    fn definition_evaluator_covers_scalar_opcode_families_and_failures() {
+        use crate::dpn::ops::op_types::DPNIndexedVarDef;
+        let target = |index| encode_indexed_op_id(DPNBuiltInDataType::Target, index);
+        let mut registers = Registers::new();
+        registers.set(DPNBuiltInDataType::Target, 0, 12);
+        registers.set(DPNBuiltInDataType::Target, 1, 3);
+        let executor = VmExecutor::new(InMemoryStateBackend::new());
+        let results = HashMap::new();
+        let mut counts = OpCounts::default();
+        let definition = |op_type, inputs| DPNIndexedVarDef {
+            data_type: DPNBuiltInDataType::Target,
+            index: 10,
+            op_type,
+            inputs,
+        };
+        let cases = [
+            (DPNOpType::Add, 15), (DPNOpType::Sub, 9), (DPNOpType::Mul, 36), (DPNOpType::Div, 4),
+            (DPNOpType::Mod, 0), (DPNOpType::Exp, 1728), (DPNOpType::BoolAnd, 1), (DPNOpType::BoolOr, 1),
+            (DPNOpType::Xor, 15), (DPNOpType::Nor, 4_294_967_280), (DPNOpType::Eq, 0), (DPNOpType::Lt, 0),
+            (DPNOpType::Lte, 0), (DPNOpType::Gt, 1), (DPNOpType::Gte, 1), (DPNOpType::U32Add, 15),
+            (DPNOpType::U32Sub, 9), (DPNOpType::U32Mul, 36), (DPNOpType::U32Div, 4), (DPNOpType::U32Mod, 0),
+            (DPNOpType::U32Exp, 1728), (DPNOpType::U32And, 0), (DPNOpType::U32Or, 15), (DPNOpType::U32Xor, 15),
+            (DPNOpType::U32ShiftLeft, 96), (DPNOpType::U32ShiftRight, 1),
+        ];
+        for (op, expected) in cases {
+            assert_eq!(executor.eval_definition_with_state(&definition(op, vec![target(0), target(1)]), &context(), &registers, &mut counts, &results).unwrap(), expected, "{op}");
+        }
+        assert_eq!(executor.eval_definition_with_state(&definition(DPNOpType::Select, vec![target(0), target(0), target(1)]), &context(), &registers, &mut counts, &results).unwrap(), 12);
+        assert_eq!(executor.eval_definition_with_state(&definition(DPNOpType::GetUserId, vec![]), &context(), &registers, &mut counts, &results).unwrap(), 7);
+        assert_eq!(executor.eval_definition_with_state(&definition(DPNOpType::GetContractId, vec![]), &context(), &registers, &mut counts, &results).unwrap(), 8);
+        assert_eq!(executor.eval_definition_with_state(&definition(DPNOpType::GetCallerContractId, vec![]), &context(), &registers, &mut counts, &results).unwrap(), 9);
+        assert_eq!(executor.eval_definition_with_state(&definition(DPNOpType::GetCheckpointId, vec![]), &context(), &registers, &mut counts, &results).unwrap(), 10);
+        assert_eq!(executor.eval_definition_with_state(&definition(DPNOpType::GetNonce, vec![]), &context(), &registers, &mut counts, &results).unwrap(), 11);
+        registers.set(DPNBuiltInDataType::Target, 1, 0);
+        assert!(executor.eval_definition_with_state(&definition(DPNOpType::Mod, vec![target(0), target(1)]), &context(), &registers, &mut counts, &results).is_err());
+        assert!(counts.total_operations == 0 && counts.arithmetic_ops > 0 && counts.boolean_ops > 0 && counts.comparison_ops > 0);
+    }
+
+    #[test]
+    fn state_command_processor_handles_hash_range_and_imt_overlays() {
+        let target = |index| encode_indexed_op_id(DPNBuiltInDataType::Target, index);
+        let mut backend = InMemoryStateBackend::new();
+        backend.set_hash(7, 8, 2, [1, 2, 3, 4]);
+        backend.set_imt(7, 8, [21, 22, 23, 24], [31, 32, 33, 34]);
+        let mut executor = VmExecutor::new(backend);
+        let mut registers = Registers::new();
+        for (index, value) in [1, 2, 10, 11, 12, 13, 21, 22, 23, 24, 41, 42, 43, 44].into_iter().enumerate() {
+            registers.set(DPNBuiltInDataType::Target, index, value);
+        }
+        let key = [target(6), target(7), target(8), target(9)];
+        let value = [target(10), target(11), target(12), target(13)];
+        let commands = vec![
+            DPNStateCmd::set_contract_state_slot_hash(target(0), target(1), [target(2), target(3), target(4), target(5)]),
+            DPNStateCmd::get_self_user_current_contract_state_slot_hash(target(1)),
+            DPNStateCmd::set_contract_state_slot_range(target(0), target(1), vec![target(2), target(3)]),
+            DPNStateCmd::get_self_user_current_contract_state_slot_range(target(1), 2),
+            DPNStateCmd::set_imt_contract_state_value(target(0), target(1), target(1), key, value),
+            DPNStateCmd::get_self_user_current_imt_contract_state_value(target(1), target(1), key),
+            DPNStateCmd::contains_self_user_current_imt_contract_state_value(target(1), target(1), key),
+            DPNStateCmd::get_self_user_current_contract_state_slot_single(target(1)),
+            DPNStateCmd::get_self_user_external_contract_state_slot_single(target(0), target(1), target(2)),
+            DPNStateCmd::get_self_user_external_contract_state_slot_hash(target(0), target(1), target(1)),
+            DPNStateCmd::get_self_user_external_contract_state_slot_range(target(0), target(1), target(1), 2),
+            DPNStateCmd::get_other_user_contract_state_slot_single(target(0), target(1), target(2), target(1)),
+            DPNStateCmd::get_other_user_contract_state_slot_hash(target(0), target(1), target(2), target(1)),
+            DPNStateCmd::get_other_user_contract_state_slot_range(target(0), target(1), target(2), target(1), 2),
+            DPNStateCmd::get_checkpoint_leaf_stats(target(0)),
+            DPNStateCmd::get_global_state_roots(target(0)),
+            DPNStateCmd::get_contract_leaf(target(1)),
+            DPNStateCmd::get_self_user_external_imt_contract_state_value(target(0), target(1), target(1), target(1), key),
+            DPNStateCmd::get_other_user_imt_contract_state_value(target(0), target(1), target(1), target(1), target(1), key),
+            DPNStateCmd::contains_other_user_imt_contract_state_value(target(0), target(1), target(1), target(1), target(1), key),
+            DPNStateCmd::invoke_external_contract_function(target(0), target(1), target(2), vec![target(3)], 1),
+            DPNStateCmd::invoke_external_contract_function_deferred(target(0), target(1), target(2), vec![target(3)]),
+        ];
+        let mut reads = Vec::new();
+        let mut writes = Vec::new();
+        let mut counts = OpCounts::default();
+        let mut results = Vec::new();
+        for (index, command) in commands.iter().enumerate() {
+            results.push(executor.process_state_command(command, index, &context(), &registers, &mut reads, &mut writes, &mut counts).unwrap().unwrap());
+        }
+        assert_eq!(results[0], vec![1, 2, 3, 4, 10, 11, 12, 13]);
+        assert_eq!(results[1], vec![10, 11, 12, 13]);
+        assert_eq!(results[3], vec![10, 11]);
+        assert_eq!(results[4], vec![31, 32, 33, 34, 41, 42, 43, 44]);
+        assert_eq!(results[5], vec![41, 42, 43, 44]);
+        assert_eq!(results[6], vec![1]);
+        assert!(reads.len() >= 4);
+        assert_eq!(writes.len(), 3);
+        assert!(counts.state_read_ops >= 4);
+        assert_eq!(counts.state_write_ops, 3);
+    }
+
+    #[test]
+    fn executor_definition_matrix_covers_hash_keccak_split_context_and_events() {
+        use crate::dpn::ops::op_types::{DPNAssertEqInfoIndexed, DPNEventRecord, DPNIndexedVarDef};
+
+        let target = |index| encode_indexed_op_id(DPNBuiltInDataType::Target, index);
+        let words = |index| encode_indexed_op_id(DPNBuiltInDataType::U32TargetArray, index);
+        let mut definitions = Vec::new();
+        definitions.push(DPNIndexedVarDef {
+            data_type: DPNBuiltInDataType::HashOut,
+            index: 0,
+            op_type: DPNOpType::HashNoPad,
+            inputs: vec![target(0), target(1)],
+        });
+        definitions.push(DPNIndexedVarDef {
+            data_type: DPNBuiltInDataType::HashOut,
+            index: 1,
+            op_type: DPNOpType::HashTwoToOne,
+            inputs: (0..8).map(target).collect(),
+        });
+        definitions.push(DPNIndexedVarDef {
+            data_type: DPNBuiltInDataType::U32TargetArray,
+            index: 2,
+            op_type: DPNOpType::Keccak256,
+            inputs: vec![target(0), target(1)],
+        });
+        definitions.push(DPNIndexedVarDef {
+            data_type: DPNBuiltInDataType::BoolArray,
+            index: 3,
+            op_type: DPNOpType::SplitBits,
+            inputs: vec![4, target(0)],
+        });
+        definitions.push(DPNIndexedVarDef {
+            data_type: DPNBuiltInDataType::Target,
+            index: 4,
+            op_type: DPNOpType::GetUserPublicKeyHash,
+            inputs: vec![],
+        });
+        definitions.push(DPNIndexedVarDef {
+            data_type: DPNBuiltInDataType::Target,
+            index: 5,
+            op_type: DPNOpType::TargetAt,
+            inputs: vec![words(2), target(1)],
+        });
+        definitions.push(DPNIndexedVarDef {
+            data_type: DPNBuiltInDataType::Target,
+            index: 6,
+            op_type: DPNOpType::GetStateCommandResultSingle,
+            inputs: vec![],
+        });
+
+        let circuit = DPNFunctionCircuitDefinition {
+            name: "definition-matrix".into(),
+            method_id: 7,
+            circuit_inputs: (0..8).map(target).collect(),
+            circuit_outputs: vec![target(4), target(5), target(6)],
+            state_commands: vec![],
+            state_command_resolution_indices: vec![],
+            assertions: vec![DPNAssertEqInfoIndexed { left: target(4), right: target(4), message: "context".into() }],
+            definitions,
+            events: vec![DPNEventRecord {
+                condition: target(4),
+                checkpoint_id: target(0),
+                user_id: target(1),
+                contract_id: target(2),
+                data: vec![target(3)],
+            }],
+        };
+
+        let mut executor = VmExecutor::new(InMemoryStateBackend::new());
+        let result = executor.execute(&circuit, &context(), &[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        assert!(result.success);
+        assert_eq!(result.outputs[0], 1);
+        assert_ne!(result.outputs[1], 0);
+        assert_eq!(result.outputs[2], 0);
+        assert_eq!(result.events.len(), 1);
+        assert_eq!(result.events[0].data, vec![4]);
+        assert!(result.op_counts.hash_ops >= 3);
+    }
+
+    #[test]
+    fn executor_boundary_cases_report_assertion_failure_and_default_missing_inputs() {
+        let target = |index| encode_indexed_op_id(DPNBuiltInDataType::Target, index);
+        let failing = DPNFunctionCircuitDefinition {
+            name: "failure".into(),
+            method_id: 1,
+            circuit_inputs: vec![target(0), target(1)],
+            circuit_outputs: vec![target(1)],
+            state_commands: vec![],
+            state_command_resolution_indices: vec![],
+            assertions: vec![crate::dpn::ops::op_types::DPNAssertEqInfoIndexed {
+                left: target(0),
+                right: target(1),
+                message: "values differ".into(),
+            }],
+            definitions: vec![],
+            events: vec![],
+        };
+        let mut executor = VmExecutor::new(InMemoryStateBackend::new());
+        let result = executor.execute(&failing, &context(), &[7]).unwrap();
+        assert!(!result.success);
+        let failure = result.failure.unwrap();
+        assert_eq!(failure.assertion_index, 0);
+        assert_eq!((failure.left_value, failure.right_value), (7, 0));
+        assert_eq!(result.outputs, vec![0]);
+
+        let oob = DPNFunctionCircuitDefinition {
+            name: "oob".into(),
+            method_id: 2,
+            circuit_inputs: vec![target(0)],
+            circuit_outputs: vec![],
+            state_commands: vec![],
+            state_command_resolution_indices: vec![],
+            assertions: vec![],
+            definitions: vec![crate::dpn::ops::op_types::DPNIndexedVarDef {
+                data_type: DPNBuiltInDataType::Target,
+                index: 1,
+                op_type: DPNOpType::TargetAt,
+                inputs: vec![encode_indexed_op_id(DPNBuiltInDataType::TargetArray, 0), target(0)],
+            }],
+            events: vec![],
+        };
+        assert!(executor.execute(&oob, &context(), &[9]).is_err());
+    }
+
+    #[test]
+    fn clear_entire_tree_only_removes_matching_overlay_entries() {
+        use crate::dpn::ops::state_cmd::data::DPNStateCmdClearEntireTree;
+
+        let target = |index| encode_indexed_op_id(DPNBuiltInDataType::Target, index);
+        let mut executor = VmExecutor::new(InMemoryStateBackend::new());
+        executor.write_overlay.insert((7, 8, 1), 11);
+        executor.write_overlay.insert((7, 9, 1), 22);
+        let mut registers = Registers::new();
+        registers.set(DPNBuiltInDataType::Target, 0, 1);
+        let command = DPNStateCmd::ClearEntireTree(DPNStateCmdClearEntireTree { condition: target(0) });
+        let mut reads = Vec::new();
+        let mut writes = Vec::new();
+        let mut counts = OpCounts::default();
+        executor.process_state_command(&command, 0, &context(), &registers, &mut reads, &mut writes, &mut counts).unwrap();
+        assert!(!executor.write_overlay.contains_key(&(7, 8, 1)));
+        assert_eq!(executor.write_overlay.get(&(7, 9, 1)), Some(&22));
+        assert_eq!(writes[0].condition, true);
+    }
+
+    #[test]
+    fn register_storage_covers_scalar_array_growth_empty_and_unknown_boundaries() {
+        let mut registers = Registers::new();
+        let scalar_types = [
+            DPNBuiltInDataType::Target,
+            DPNBuiltInDataType::Bool,
+            DPNBuiltInDataType::U32Target,
+            DPNBuiltInDataType::HashOut,
+            DPNBuiltInDataType::HashOut160,
+        ];
+        for (offset, data_type) in scalar_types.into_iter().enumerate() {
+            let index = 5000 + offset;
+            registers.set(data_type, index, 100 + offset as u64);
+            assert_eq!(registers.get(data_type, index), 100 + offset as u64);
+            assert_eq!(registers.get(data_type, index + 1), 0);
+        }
+        registers.set(DPNBuiltInDataType::Unknown, usize::MAX, 99);
+        assert_eq!(registers.get(DPNBuiltInDataType::Unknown, usize::MAX), 0);
+
+        for (data_type, index) in [
+            (DPNBuiltInDataType::TargetArray, 300usize),
+            (DPNBuiltInDataType::BoolArray, 100usize),
+            (DPNBuiltInDataType::U32TargetArray, 100usize),
+        ] {
+            registers.set(data_type, index, 7);
+            assert_eq!(registers.get(data_type, index), 7);
+            registers.set_array(data_type, index, vec![8, 9]);
+            assert_eq!(registers.get_array_by_encoded_id(encode_indexed_op_id(data_type, index)), vec![8, 9]);
+            assert!(registers.get_array_by_encoded_id(encode_indexed_op_id(data_type, index + 1)).is_empty());
+        }
+
+        registers.set_array(DPNBuiltInDataType::HashOut, 7, Vec::new());
+        assert_eq!(registers.get_array_by_encoded_id(encode_indexed_op_id(DPNBuiltInDataType::HashOut, 7)), vec![0]);
+        registers.set_array(DPNBuiltInDataType::HashOut, 7, vec![1, 2, 3, 4]);
+        assert_eq!(registers.get_array_by_encoded_id(encode_indexed_op_id(DPNBuiltInDataType::HashOut, 7)), vec![1, 2, 3, 4]);
+        registers.set_array(DPNBuiltInDataType::Bool, 8, Vec::new());
+        assert_eq!(registers.get(DPNBuiltInDataType::Bool, 8), 0);
+        registers.set_array(DPNBuiltInDataType::Bool, 8, vec![1, 2]);
+        assert_eq!(registers.get_array_by_encoded_id(encode_indexed_op_id(DPNBuiltInDataType::Bool, 8)), vec![1]);
+    }
+
+    #[test]
+    fn backend_overlay_application_and_executor_consumption_preserve_boundary_entries() {
+        let mut backend = InMemoryStateBackend::new();
+        backend.apply_overlay(&HashMap::from([((1, 2, 0), 3), ((1, 2, u64::MAX), 4)]));
+        backend.apply_imt_overlay(&HashMap::from([((1, 2, [0; 4]), [5; 4]), ((1, 2, [u64::MAX; 4]), [6; 4])]));
+        assert_eq!(backend.get_contract_slot(1, 2, 0).unwrap(), 3);
+        assert_eq!(backend.get_contract_slot(1, 2, u64::MAX).unwrap(), 4);
+        assert_eq!(backend.get_imt_value(1, 2, &[0; 4]), [5; 4]);
+        assert_eq!(backend.get_imt_value(1, 2, &[u64::MAX; 4]), [6; 4]);
+
+        let executor = VmExecutor::new(backend);
+        assert!(executor.imt_write_overlay().is_empty());
+        let backend = executor.into_inner();
+        assert_eq!(backend.imt_entries_for(1, 2).count(), 2);
+    }
+}

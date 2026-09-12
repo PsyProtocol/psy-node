@@ -183,6 +183,7 @@ where
 
 #[cfg_attr(not(target_arch = "wasm32"), maybe_async)]
 #[cfg_attr(target_arch = "wasm32", maybe_async(?Send))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 impl<C: GenericConfig<D>, const D: usize, T> UPSCircuitManager<C, D> for &T
 where
     T: UPSCircuitManager<C, D> + Sync,
@@ -430,6 +431,7 @@ where
 
 #[cfg_attr(not(target_arch = "wasm32"), maybe_async)]
 #[cfg_attr(target_arch = "wasm32", maybe_async(?Send))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 impl<C: GenericConfig<D>, const D: usize> UPSCircuitManager<C, D> for Box<dyn UPSCircuitManager<C, D>>
 where
     C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasherWithMarkedLeaf<HashOut<C::F>> + MerkleZeroHasherWithMarkedLeaf<QHashOut<C::F>>,
@@ -763,6 +765,7 @@ where
 // Blanket implementations for &T and Box<dyn UPSCircuitManager>
 #[cfg_attr(not(target_arch = "wasm32"), maybe_async::maybe_async)]
 #[cfg_attr(target_arch = "wasm32", maybe_async::maybe_async(?Send))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 impl<T, C: GenericConfig<D>, const D: usize> PortableQTreeRecursionCircuitsData<C, D> for &T
 where
     T: PortableQTreeRecursionCircuitsData<C, D> + Sync,
@@ -802,6 +805,7 @@ where
 
 #[cfg_attr(not(target_arch = "wasm32"), maybe_async::maybe_async)]
 #[cfg_attr(target_arch = "wasm32", maybe_async::maybe_async(?Send))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 impl<T, C: GenericConfig<D>, const D: usize> PortableQTreeRecursionCircuitsProve<C, D> for &T
 where
     T: PortableQTreeRecursionCircuitsProve<C, D> + Sync,
@@ -915,6 +919,7 @@ where
 
 #[cfg_attr(not(target_arch = "wasm32"), maybe_async::maybe_async)]
 #[cfg_attr(target_arch = "wasm32", maybe_async::maybe_async(?Send))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 impl<T, C: GenericConfig<D>, const D: usize> PortableQTreeRecursion<C, D> for &T
 where
     T: PortableQTreeRecursion<C, D> + Sync,
@@ -928,6 +933,7 @@ where
 // Blanket implementations for Box<dyn UPSCircuitManager>
 #[cfg_attr(not(target_arch = "wasm32"), maybe_async::maybe_async)]
 #[cfg_attr(target_arch = "wasm32", maybe_async::maybe_async(?Send))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 impl<C: GenericConfig<D>, const D: usize> PortableQTreeRecursion<C, D> for Box<dyn UPSCircuitManager<C, D>>
 where
     C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasherWithMarkedLeaf<HashOut<C::F>> + MerkleZeroHasherWithMarkedLeaf<QHashOut<C::F>>,
@@ -939,6 +945,7 @@ where
 
 #[cfg_attr(not(target_arch = "wasm32"), maybe_async::maybe_async)]
 #[cfg_attr(target_arch = "wasm32", maybe_async::maybe_async(?Send))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 impl<C: GenericConfig<D>, const D: usize> PortableQTreeRecursionCircuitsData<C, D> for Box<dyn UPSCircuitManager<C, D>>
 where
     C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasherWithMarkedLeaf<HashOut<C::F>> + MerkleZeroHasherWithMarkedLeaf<QHashOut<C::F>>,
@@ -977,6 +984,7 @@ where
 
 #[cfg_attr(not(target_arch = "wasm32"), maybe_async::maybe_async)]
 #[cfg_attr(target_arch = "wasm32", maybe_async::maybe_async(?Send))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 impl<C: GenericConfig<D>, const D: usize> PortableQTreeRecursionCircuitsProve<C, D> for Box<dyn UPSCircuitManager<C, D>>
 where
     C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasherWithMarkedLeaf<HashOut<C::F>> + MerkleZeroHasherWithMarkedLeaf<QHashOut<C::F>>,

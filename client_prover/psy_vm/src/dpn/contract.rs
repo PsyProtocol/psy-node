@@ -231,3 +231,102 @@ pub fn cfc_code_definition_to_dapen_fc(cfc_def: &ContractFunctionCodeDefinition)
         Err(e) => anyhow::bail!("error deserializing dapen function definition {:?}", e),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use plonky2::field::goldilocks_field::GoldilocksField;
+
+    fn definition(method_id: u32) -> DPNFunctionCircuitDefinition {
+        DPNFunctionCircuitDefinition {
+            name: "transfer".into(),
+            method_id,
+            circuit_inputs: vec![1, 2],
+            circuit_outputs: vec![3],
+            state_commands: vec![],
+            state_command_resolution_indices: vec![],
+            assertions: vec![],
+            definitions: vec![],
+            events: vec![],
+        }
+    }
+
+    #[test]
+    fn function_code_conversion_round_trips_and_keeps_wire_metadata() {
+        let definition = definition(17);
+        let code = dapen_fc_to_cfc_code_definition(&definition);
+
+        assert_eq!(code.method_id, 17);
+        assert_eq!(code.num_inputs, 2);
+        assert_eq!(code.num_outputs, 1);
+        assert_eq!(code.vm_type, VM_TYPE_STANRDARD_DAPEN_V1);
+        assert_eq!(cfc_code_definition_to_dapen_fc(&code).unwrap(), definition);
+    }
+
+    #[test]
+    fn invalid_function_code_is_rejected_and_hash_tracks_definition_contents() {
+        let invalid = ContractFunctionCodeDefinition {
+            method_id: 0,
+            num_inputs: 0,
+            num_outputs: 0,
+            vm_type: VM_TYPE_STANRDARD_DAPEN_V1,
+            code: vec![0xff],
+        };
+        assert!(cfc_code_definition_to_dapen_fc(&invalid).is_err());
+
+        let first = definition(1);
+        let second = definition(2);
+        assert_ne!(hash_dpn_function::<GoldilocksField>(&first), hash_dpn_function::<GoldilocksField>(&second));
+        assert_eq!(hash_dpn_function::<GoldilocksField>(&first), hash_dpn_function::<GoldilocksField>(&first));
+    }
+
+    #[test]
+    fn function_hash_encodes_every_state_command_variant() {
+        use crate::dpn::ops::state_cmd::data::DPNStateCmdClearEntireTree;
+
+        let commands = vec![
+            DPNStateCmd::set_contract_state_slot_hash(1, 2, [3, 4, 5, 6]),
+            DPNStateCmd::set_contract_state_slot_single(1, 2, 3),
+            DPNStateCmd::set_contract_state_slot_range(1, 2, vec![3, 4]),
+            DPNStateCmd::ClearEntireTree(DPNStateCmdClearEntireTree { condition: 1 }),
+            DPNStateCmd::invoke_external_contract_function(1, 2, 3, vec![4, 5], 2),
+            DPNStateCmd::invoke_external_contract_function_deferred(1, 2, 3, vec![4, 5]),
+            DPNStateCmd::get_self_user_current_contract_state_slot_hash(2),
+            DPNStateCmd::get_self_user_current_contract_state_slot_single(2),
+            DPNStateCmd::get_self_user_current_contract_state_slot_range(2, 2),
+            DPNStateCmd::get_self_user_external_contract_state_slot_hash(2, 4, 3),
+            DPNStateCmd::get_self_user_external_contract_state_slot_single(2, 4, 3),
+            DPNStateCmd::get_self_user_external_contract_state_slot_range(2, 4, 3, 2),
+            DPNStateCmd::get_other_user_contract_state_slot_hash(1, 2, 4, 3),
+            DPNStateCmd::get_other_user_contract_state_slot_single(1, 2, 4, 3),
+            DPNStateCmd::get_other_user_contract_state_slot_range(1, 2, 4, 3, 2),
+            DPNStateCmd::get_checkpoint_leaf_stats(1),
+            DPNStateCmd::get_contract_leaf(2),
+            DPNStateCmd::get_global_state_roots(1),
+            DPNStateCmd::set_imt_contract_state_value(1, 2, 4, [5, 6, 7, 8], [9, 10, 11, 12]),
+            DPNStateCmd::get_self_user_current_imt_contract_state_value(2, 4, [5, 6, 7, 8]),
+            DPNStateCmd::get_self_user_external_imt_contract_state_value(2, 4, 2, 4, [5, 6, 7, 8]),
+            DPNStateCmd::get_other_user_imt_contract_state_value(1, 2, 4, 2, 4, [5, 6, 7, 8]),
+            DPNStateCmd::contains_self_user_current_imt_contract_state_value(2, 4, [5, 6, 7, 8]),
+            DPNStateCmd::contains_other_user_imt_contract_state_value(1, 2, 4, 2, 4, [5, 6, 7, 8]),
+        ];
+        let mut rich_definition = definition(1);
+        rich_definition.state_commands = commands;
+        rich_definition.state_command_resolution_indices = (0..rich_definition.state_commands.len()).collect();
+        rich_definition.assertions.push(DPNAssertEqInfoIndexed {
+            left: 9,
+            right: 10,
+            message: "ignored in hash".to_string(),
+        });
+        rich_definition.events.push(DPNEventRecord {
+            condition: 1,
+            checkpoint_id: 2,
+            user_id: 3,
+            contract_id: 4,
+            data: vec![5, 6],
+        });
+
+        assert_eq!(rich_definition.state_commands.len(), 24);
+        assert_ne!(hash_dpn_function::<GoldilocksField>(&rich_definition), hash_dpn_function::<GoldilocksField>(&definition(1)));
+    }
+}
