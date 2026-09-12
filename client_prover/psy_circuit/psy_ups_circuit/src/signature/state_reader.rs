@@ -91,66 +91,20 @@ impl<F: RichField + Extendable<D>, const D: usize> StateReaderGadget<F, D> {
         length: u32,
     ) -> anyhow::Result<Vec<Target>> {
         let sub_slot_index = sub_slot_index.to_noncanonical_u64();
-        let slot_index = F::from_canonical_u64(sub_slot_index / 4u64);
-        let n = (sub_slot_index & 0b11) as usize;
-        if length == 1 {
-            // one merkle proof
-            let cur = self.get_self_user_current_contract_state_slot_hash(builder, slot_index)?;
-            Ok(vec![cur.elements[n]])
-        } else if length < 6 {
-            // two merkle proofs
-            let value_0 = self.get_self_user_current_contract_state_slot_hash(builder, slot_index)?;
-            let value_1 = self.get_self_user_current_contract_state_slot_hash(builder, slot_index + F::ONE)?;
-
-            let elements = [value_0.elements, value_1.elements].concat();
-
-            Ok(elements[n..(n + length as usize)].to_vec())
-        } else {
-            let n_proofs = ((length + 6) / 4) as u64;
-            let sub_slot_index_mod_4 = sub_slot_index % 4;
-            let start_slot = sub_slot_index / 4;
-            let mut result = Vec::<Target>::with_capacity(length as usize);
-
-            let len_minus_2_mod_4 = (length - 2) % 4;
-
-            for i in 0..n_proofs {
-                let mp_value = self.get_self_user_current_contract_state_slot_hash(builder, F::from_canonical_u64(start_slot + i))?;
-                if i == 0 {
-                    if sub_slot_index_mod_4 == 0 {
-                        result.push(mp_value.elements[0]);
-                        result.push(mp_value.elements[1]);
-                        result.push(mp_value.elements[2]);
-                        result.push(mp_value.elements[3]);
-                    } else if sub_slot_index_mod_4 == 1 {
-                        result.push(mp_value.elements[1]);
-                        result.push(mp_value.elements[2]);
-                        result.push(mp_value.elements[3]);
-                    } else if sub_slot_index_mod_4 == 2 {
-                        result.push(mp_value.elements[2]);
-                        result.push(mp_value.elements[3]);
-                    } else if sub_slot_index_mod_4 == 3 {
-                        result.push(mp_value.elements[3]);
-                    }
-                } else if i == (n_proofs - 1) {
-                    let slot_mask_type = (len_minus_2_mod_4 as usize) + sub_slot_index_mod_4 as usize;
-                    if slot_mask_type >= 3 {
-                        result.push(mp_value.elements[0]);
-                    }
-                    if slot_mask_type >= 4 {
-                        result.push(mp_value.elements[1]);
-                    }
-                    if slot_mask_type >= 5 {
-                        result.push(mp_value.elements[2]);
-                    }
-                    if slot_mask_type >= 6 {
-                        result.push(mp_value.elements[3]);
-                    }
-                } else {
-                    result.extend_from_slice(&mp_value.elements);
-                }
-            }
-            Ok(result)
+        if length == 0 {
+            return Ok(Vec::new());
         }
+        let n = (sub_slot_index & 0b11) as usize;
+        let start_slot = sub_slot_index / 4;
+        let n_proofs = (n + length as usize).div_ceil(4) as u64;
+        let mut result = Vec::<Target>::with_capacity(length as usize);
+        for i in 0..n_proofs {
+            let value = self.get_self_user_current_contract_state_slot_hash(builder, F::from_canonical_u64(start_slot + i))?;
+            let offset = if i == 0 { n } else { 0 };
+            let count = (length as usize - result.len()).min(4 - offset);
+            result.extend_from_slice(&value.elements[offset..offset + count]);
+        }
+        Ok(result)
     }
 
     pub fn get_self_user_external_contract_state_slot_hash(
@@ -205,72 +159,25 @@ impl<F: RichField + Extendable<D>, const D: usize> StateReaderGadget<F, D> {
         contract_state_tree_height: u8,
     ) -> anyhow::Result<Vec<Target>> {
         let sub_slot_index = sub_slot_index.to_noncanonical_u64();
-        let slot_index = F::from_canonical_u64(sub_slot_index / 4u64);
-        let n = (sub_slot_index & 0b11) as usize;
-        if length == 1 {
-            // one merkle proof
-            let cur = self.get_self_user_external_contract_state_slot_hash(builder, contract_id, slot_index, contract_state_tree_height)?;
-            Ok(vec![cur.elements[n]])
-        } else if length < 6 {
-            // two merkle proofs
-            let value_0 = self.get_self_user_external_contract_state_slot_hash(builder, contract_id, slot_index, contract_state_tree_height)?;
-            let value_1 =
-                self.get_self_user_external_contract_state_slot_hash(builder, contract_id, slot_index + F::ONE, contract_state_tree_height)?;
-
-            let elements = [value_0.elements, value_1.elements].concat();
-
-            Ok(elements[n..(n + length as usize)].to_vec())
-        } else {
-            let n_proofs = ((length + 6) / 4) as u64;
-            let sub_slot_index_mod_4 = sub_slot_index % 4;
-            let start_slot = sub_slot_index / 4;
-            let mut result = Vec::<Target>::with_capacity(length as usize);
-
-            let len_minus_2_mod_4 = (length - 2) % 4;
-
-            for i in 0..n_proofs {
-                let mp_value = self.get_self_user_external_contract_state_slot_hash(
-                    builder,
-                    contract_id,
-                    F::from_canonical_u64(start_slot + i),
-                    contract_state_tree_height,
-                )?;
-                if i == 0 {
-                    if sub_slot_index_mod_4 == 0 {
-                        result.push(mp_value.elements[0]);
-                        result.push(mp_value.elements[1]);
-                        result.push(mp_value.elements[2]);
-                        result.push(mp_value.elements[3]);
-                    } else if sub_slot_index_mod_4 == 1 {
-                        result.push(mp_value.elements[1]);
-                        result.push(mp_value.elements[2]);
-                        result.push(mp_value.elements[3]);
-                    } else if sub_slot_index_mod_4 == 2 {
-                        result.push(mp_value.elements[2]);
-                        result.push(mp_value.elements[3]);
-                    } else if sub_slot_index_mod_4 == 3 {
-                        result.push(mp_value.elements[3]);
-                    }
-                } else if i == (n_proofs - 1) {
-                    let slot_mask_type = (len_minus_2_mod_4 as usize) + sub_slot_index_mod_4 as usize;
-                    if slot_mask_type >= 3 {
-                        result.push(mp_value.elements[0]);
-                    }
-                    if slot_mask_type >= 4 {
-                        result.push(mp_value.elements[1]);
-                    }
-                    if slot_mask_type >= 5 {
-                        result.push(mp_value.elements[2]);
-                    }
-                    if slot_mask_type >= 6 {
-                        result.push(mp_value.elements[3]);
-                    }
-                } else {
-                    result.extend_from_slice(&mp_value.elements);
-                }
-            }
-            Ok(result)
+        if length == 0 {
+            return Ok(Vec::new());
         }
+        let n = (sub_slot_index & 0b11) as usize;
+        let start_slot = sub_slot_index / 4;
+        let n_proofs = (n + length as usize).div_ceil(4) as u64;
+        let mut result = Vec::<Target>::with_capacity(length as usize);
+        for i in 0..n_proofs {
+            let value = self.get_self_user_external_contract_state_slot_hash(
+                builder,
+                contract_id,
+                F::from_canonical_u64(start_slot + i),
+                contract_state_tree_height,
+            )?;
+            let offset = if i == 0 { n } else { 0 };
+            let count = (length as usize - result.len()).min(4 - offset);
+            result.extend_from_slice(&value.elements[offset..offset + count]);
+        }
+        Ok(result)
     }
 
     pub fn get_other_user_contract_state_slot_hash(
@@ -327,72 +234,25 @@ impl<F: RichField + Extendable<D>, const D: usize> StateReaderGadget<F, D> {
         contract_state_tree_height: u8,
     ) -> anyhow::Result<Vec<Target>> {
         let sub_slot_index = sub_slot_index.to_noncanonical_u64();
-        let slot_index = F::from_canonical_u64(sub_slot_index / 4u64);
-        let n = (sub_slot_index & 0b11) as usize;
-        if length == 1 {
-            // one merkle proof
-            let cur = self.get_other_user_contract_state_slot_hash(builder, user_id, contract_id, slot_index, contract_state_tree_height)?;
-            Ok(vec![cur.elements[n]])
-        } else if length < 6 {
-            // two merkle proofs
-            let value_0 = self.get_other_user_contract_state_slot_hash(builder, user_id, contract_id, slot_index, contract_state_tree_height)?;
-            let value_1 =
-                self.get_other_user_contract_state_slot_hash(builder, user_id, contract_id, slot_index + F::ONE, contract_state_tree_height)?;
-
-            let elements = [value_0.elements, value_1.elements].concat();
-
-            Ok(elements[n..(n + length as usize)].to_vec())
-        } else {
-            let n_proofs = ((length + 6) / 4) as u64;
-            let sub_slot_index_mod_4 = sub_slot_index % 4;
-            let start_slot = sub_slot_index / 4;
-            let mut result = Vec::<Target>::with_capacity(length as usize);
-
-            let len_minus_2_mod_4 = (length - 2) % 4;
-
-            for i in 0..n_proofs {
-                let mp_value = self.get_other_user_contract_state_slot_hash(
-                    builder,
-                    user_id,
-                    contract_id,
-                    F::from_canonical_u64(start_slot + i),
-                    contract_state_tree_height,
-                )?;
-                if i == 0 {
-                    if sub_slot_index_mod_4 == 0 {
-                        result.push(mp_value.elements[0]);
-                        result.push(mp_value.elements[1]);
-                        result.push(mp_value.elements[2]);
-                        result.push(mp_value.elements[3]);
-                    } else if sub_slot_index_mod_4 == 1 {
-                        result.push(mp_value.elements[1]);
-                        result.push(mp_value.elements[2]);
-                        result.push(mp_value.elements[3]);
-                    } else if sub_slot_index_mod_4 == 2 {
-                        result.push(mp_value.elements[2]);
-                        result.push(mp_value.elements[3]);
-                    } else if sub_slot_index_mod_4 == 3 {
-                        result.push(mp_value.elements[3]);
-                    }
-                } else if i == (n_proofs - 1) {
-                    let slot_mask_type = (len_minus_2_mod_4 as usize) + sub_slot_index_mod_4 as usize;
-                    if slot_mask_type >= 3 {
-                        result.push(mp_value.elements[0]);
-                    }
-                    if slot_mask_type >= 4 {
-                        result.push(mp_value.elements[1]);
-                    }
-                    if slot_mask_type >= 5 {
-                        result.push(mp_value.elements[2]);
-                    }
-                    if slot_mask_type >= 6 {
-                        result.push(mp_value.elements[3]);
-                    }
-                } else {
-                    result.extend_from_slice(&mp_value.elements);
-                }
-            }
-            Ok(result)
+        if length == 0 {
+            return Ok(Vec::new());
         }
+        let n = (sub_slot_index & 0b11) as usize;
+        let start_slot = sub_slot_index / 4;
+        let n_proofs = (n + length as usize).div_ceil(4) as u64;
+        let mut result = Vec::<Target>::with_capacity(length as usize);
+        for i in 0..n_proofs {
+            let value = self.get_other_user_contract_state_slot_hash(
+                builder,
+                user_id,
+                contract_id,
+                F::from_canonical_u64(start_slot + i),
+                contract_state_tree_height,
+            )?;
+            let offset = if i == 0 { n } else { 0 };
+            let count = (length as usize - result.len()).min(4 - offset);
+            result.extend_from_slice(&value.elements[offset..offset + count]);
+        }
+        Ok(result)
     }
 }

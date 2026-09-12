@@ -23,22 +23,13 @@ pub struct DPNStateCmdSetContractStateSlotHash<T> {
 
 #[cfg(test)]
 mod dynamic_state_tree_height_tests {
-    use super::{
-        DPNStateCmd,
-        DPNStateCmdGetSelfUserExternalContractStateSlotHash,
-        DPNStateCmdGetSelfUserExternalIMTContractStateValue,
-    };
-    use crate::dpn::ops::{
-        context_trait::ToFelts,
-        state_cmd::types::DPNStateCmdCore,
-        sym_felt::SymFeltRef,
-    };
+    use super::{DPNStateCmd, DPNStateCmdGetSelfUserExternalContractStateSlotHash, DPNStateCmdGetSelfUserExternalIMTContractStateValue};
+    use crate::dpn::ops::{context_trait::ToFelts, state_cmd::types::DPNStateCmdCore, sym_felt::SymFeltRef};
 
     #[test]
     fn external_state_command_resolves_height_as_runtime_input() {
-        let command = DPNStateCmd::GetSelfUserExternalContractStateSlotHash(
-            DPNStateCmdGetSelfUserExternalContractStateSlotHash::new(101u64, 202u64, 303u64),
-        );
+        let command =
+            DPNStateCmd::GetSelfUserExternalContractStateSlotHash(DPNStateCmdGetSelfUserExternalContractStateSlotHash::new(101u64, 202u64, 303u64));
 
         assert_eq!(command.get_inputs(), vec![101, 202, 303]);
 
@@ -53,9 +44,8 @@ mod dynamic_state_tree_height_tests {
 
     #[test]
     fn external_state_command_round_trip_preserves_large_height_wire_id() {
-        let command = DPNStateCmd::GetSelfUserExternalContractStateSlotHash(
-            DPNStateCmdGetSelfUserExternalContractStateSlotHash::new(101u64, 300u64, 303u64),
-        );
+        let command =
+            DPNStateCmd::GetSelfUserExternalContractStateSlotHash(DPNStateCmdGetSelfUserExternalContractStateSlotHash::new(101u64, 300u64, 303u64));
         let felts: Vec<SymFeltRef> = command.to_felts();
         let decoded = <DPNStateCmd<u64> as ToFelts<SymFeltRef>>::from_felts(&felts);
 
@@ -67,15 +57,13 @@ mod dynamic_state_tree_height_tests {
 
     #[test]
     fn external_imt_command_resolves_and_preserves_dynamic_height() {
-        let command = DPNStateCmd::GetSelfUserExternalIMTContractStateValue(
-            DPNStateCmdGetSelfUserExternalIMTContractStateValue::new(
-                101u64,
-                300u64,
-                400u64,
-                500u64,
-                [601u64, 602u64, 603u64, 604u64],
-            ),
-        );
+        let command = DPNStateCmd::GetSelfUserExternalIMTContractStateValue(DPNStateCmdGetSelfUserExternalIMTContractStateValue::new(
+            101u64,
+            300u64,
+            400u64,
+            500u64,
+            [601u64, 602u64, 603u64, 604u64],
+        ));
         assert_eq!(command.get_inputs(), vec![101, 300, 400, 500, 601, 602, 603, 604]);
 
         let resolved = command.convert_to_u64(&[7, 24, 8, 9, 10, 11, 12, 13]);
@@ -90,6 +78,94 @@ mod dynamic_state_tree_height_tests {
             panic!("unexpected state command variant");
         };
         assert_eq!(decoded.contract_state_tree_height, 300);
+    }
+}
+
+#[cfg(test)]
+mod command_matrix_tests {
+    use super::*;
+    use crate::dpn::ops::{context_trait::ToFelts, sym_felt::SymFeltRef};
+
+    #[test]
+    fn every_state_command_variant_exposes_inputs_and_round_trips_wire_shape() {
+        let commands: Vec<DPNStateCmd<u64>> = vec![
+            DPNStateCmd::set_contract_state_slot_hash(1, 2, [3, 4, 5, 6]),
+            DPNStateCmd::set_contract_state_slot_single(1, 2, 3),
+            DPNStateCmd::set_contract_state_slot_range(1, 2, vec![3, 4]),
+            DPNStateCmd::ClearEntireTree(DPNStateCmdClearEntireTree { condition: 1 }),
+            DPNStateCmd::invoke_external_contract_function(1, 2, 3, vec![4, 5], 2),
+            DPNStateCmd::invoke_external_contract_function_deferred(1, 2, 3, vec![4, 5]),
+            DPNStateCmd::get_self_user_current_contract_state_slot_hash(2),
+            DPNStateCmd::get_self_user_current_contract_state_slot_single(2),
+            DPNStateCmd::get_self_user_current_contract_state_slot_range(2, 2),
+            DPNStateCmd::get_self_user_external_contract_state_slot_hash(2, 4, 3),
+            DPNStateCmd::get_self_user_external_contract_state_slot_single(2, 4, 3),
+            DPNStateCmd::get_self_user_external_contract_state_slot_range(2, 4, 3, 2),
+            DPNStateCmd::get_other_user_contract_state_slot_hash(1, 2, 4, 3),
+            DPNStateCmd::get_other_user_contract_state_slot_single(1, 2, 4, 3),
+            DPNStateCmd::get_other_user_contract_state_slot_range(1, 2, 4, 3, 2),
+            DPNStateCmd::get_checkpoint_leaf_stats(1),
+            DPNStateCmd::get_contract_leaf(2),
+            DPNStateCmd::get_global_state_roots(1),
+            DPNStateCmd::set_imt_contract_state_value(1, 2, 4, [5, 6, 7, 8], [9, 10, 11, 12]),
+            DPNStateCmd::get_self_user_current_imt_contract_state_value(2, 4, [5, 6, 7, 8]),
+            DPNStateCmd::get_self_user_external_imt_contract_state_value(2, 4, 2, 4, [5, 6, 7, 8]),
+            DPNStateCmd::get_other_user_imt_contract_state_value(1, 2, 4, 2, 4, [5, 6, 7, 8]),
+            DPNStateCmd::contains_self_user_current_imt_contract_state_value(2, 4, [5, 6, 7, 8]),
+            DPNStateCmd::contains_other_user_imt_contract_state_value(1, 2, 4, 2, 4, [5, 6, 7, 8]),
+        ];
+        assert_eq!(commands.len(), 24);
+        for command in commands {
+            assert!(!command.get_inputs().is_empty());
+            let type_id = command.get_state_command_type();
+            let _output_size = command.get_output_felt_size();
+            let felts: Vec<SymFeltRef> = command.to_felts();
+            let decoded = <DPNStateCmd<u64> as ToFelts<SymFeltRef>>::from_felts(&felts);
+            assert_eq!(decoded.get_state_command_type(), type_id);
+            assert_eq!(decoded.get_inputs(), command.get_inputs());
+            assert_eq!(command.convert_to_u64(&command.get_inputs()).get_state_command_type(), type_id);
+        }
+    }
+
+    #[test]
+    fn malformed_state_command_wire_payloads_fail_at_length_boundaries() {
+        let c = SymFeltRef::new_constant;
+        let decode = |felts: &[SymFeltRef]| <DPNStateCmd<u64> as ToFelts<SymFeltRef>>::from_felts(felts);
+        assert!(std::panic::catch_unwind(|| decode(&[])).is_err());
+        assert!(std::panic::catch_unwind(|| decode(&[c(DPNStateCommandType::SetContractStateSlotHash.get_enc_value() as u64)])).is_err());
+        assert!(std::panic::catch_unwind(|| {
+            decode(&[
+                c(DPNStateCommandType::SetContractStateSlotRange.get_enc_value() as u64),
+                c(1),
+                c(2),
+                c(2),
+                c(3),
+            ])
+        })
+        .is_err());
+        assert!(std::panic::catch_unwind(|| {
+            decode(&[
+                c(DPNStateCommandType::InvokeExternalContractFunctionSync.get_enc_value() as u64),
+                c(1),
+                c(2),
+                c(3),
+                c(2),
+                c(4),
+            ])
+        })
+        .is_err());
+        assert!(std::panic::catch_unwind(|| {
+            decode(&[
+                c(DPNStateCommandType::InvokeExternalContractFunctionDeferred.get_enc_value() as u64),
+                c(1),
+                c(2),
+                c(3),
+                c(2),
+                c(4),
+            ])
+        })
+        .is_err());
+        assert!(std::panic::catch_unwind(|| decode(&[c(u8::MAX as u64)])).is_err());
     }
 }
 
@@ -1641,30 +1717,15 @@ impl<T: Copy + Clone + Hash + Ord> DPNStateCmd<T> {
             DPNStateCmd::GetSelfUserExternalContractStateSlotSingle(_c) => DPNStateCmd::GetSelfUserExternalContractStateSlotSingle(
                 DPNStateCmdGetSelfUserExternalContractStateSlotSingle::<u64>::new(inputs_as_u64[0], inputs_as_u64[1], inputs_as_u64[2]),
             ),
-            DPNStateCmd::GetSelfUserExternalContractStateSlotRange(c) => {
-                DPNStateCmd::GetSelfUserExternalContractStateSlotRange(DPNStateCmdGetSelfUserExternalContractStateSlotRange::<u64>::new(
-                    inputs_as_u64[0],
-                    inputs_as_u64[1],
-                    inputs_as_u64[2],
-                    c.length,
-                ))
-            }
-            DPNStateCmd::GetOtherUserContractStateSlotHash(_c) => {
-                DPNStateCmd::GetOtherUserContractStateSlotHash(DPNStateCmdGetOtherUserContractStateSlotHash::<u64>::new(
-                    inputs_as_u64[0],
-                    inputs_as_u64[1],
-                    inputs_as_u64[2],
-                    inputs_as_u64[3],
-                ))
-            }
-            DPNStateCmd::GetOtherUserContractStateSlotSingle(_c) => {
-                DPNStateCmd::GetOtherUserContractStateSlotSingle(DPNStateCmdGetOtherUserContractStateSlotSingle::<u64>::new(
-                    inputs_as_u64[0],
-                    inputs_as_u64[1],
-                    inputs_as_u64[2],
-                    inputs_as_u64[3],
-                ))
-            }
+            DPNStateCmd::GetSelfUserExternalContractStateSlotRange(c) => DPNStateCmd::GetSelfUserExternalContractStateSlotRange(
+                DPNStateCmdGetSelfUserExternalContractStateSlotRange::<u64>::new(inputs_as_u64[0], inputs_as_u64[1], inputs_as_u64[2], c.length),
+            ),
+            DPNStateCmd::GetOtherUserContractStateSlotHash(_c) => DPNStateCmd::GetOtherUserContractStateSlotHash(
+                DPNStateCmdGetOtherUserContractStateSlotHash::<u64>::new(inputs_as_u64[0], inputs_as_u64[1], inputs_as_u64[2], inputs_as_u64[3]),
+            ),
+            DPNStateCmd::GetOtherUserContractStateSlotSingle(_c) => DPNStateCmd::GetOtherUserContractStateSlotSingle(
+                DPNStateCmdGetOtherUserContractStateSlotSingle::<u64>::new(inputs_as_u64[0], inputs_as_u64[1], inputs_as_u64[2], inputs_as_u64[3]),
+            ),
             DPNStateCmd::GetOtherUserContractStateSlotRange(c) => {
                 DPNStateCmd::GetOtherUserContractStateSlotRange(DPNStateCmdGetOtherUserContractStateSlotRange::<u64>::new(
                     inputs_as_u64[0],

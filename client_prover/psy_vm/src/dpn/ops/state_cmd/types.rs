@@ -235,6 +235,40 @@ impl DPNStateCommandType {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_command_type_round_trips_and_exposes_classification_metadata() {
+        let types = [
+            DPNStateCommandType::SetContractStateSlotHash, DPNStateCommandType::SetContractStateSlotSingle,
+            DPNStateCommandType::SetContractStateSlotRange, DPNStateCommandType::ClearEntireTree,
+            DPNStateCommandType::InvokeExternalContractFunctionSync, DPNStateCommandType::InvokeExternalContractFunctionDeferred,
+            DPNStateCommandType::GetSelfUserCurrentContractStateSlotHash, DPNStateCommandType::GetSelfUserCurrentContractStateSlotSingle,
+            DPNStateCommandType::GetSelfUserCurrentContractStateSlotRange, DPNStateCommandType::GetSelfUserExternalContractStateSlotHash,
+            DPNStateCommandType::GetSelfUserExternalContractStateSlotSingle, DPNStateCommandType::GetSelfUserExternalContractStateSlotRange,
+            DPNStateCommandType::GetOtherUserContractStateSlotHash, DPNStateCommandType::GetOtherUserContractStateSlotSingle,
+            DPNStateCommandType::GetOtherUserContractStateSlotRange, DPNStateCommandType::GetCheckpointLeafStats,
+            DPNStateCommandType::GetContractLeaf, DPNStateCommandType::GetGlobalStateRoots, DPNStateCommandType::SetIMTContractStateValue,
+            DPNStateCommandType::GetSelfUserCurrentIMTContractStateValue, DPNStateCommandType::GetSelfUserExternalIMTContractStateValue,
+            DPNStateCommandType::GetOtherUserIMTContractStateValue, DPNStateCommandType::ContainsSelfUserCurrentIMTContractStateValue,
+            DPNStateCommandType::ContainsOtherUserIMTContractStateValue,
+        ];
+        for command_type in types {
+            assert_eq!(DPNStateCommandType::from(command_type.get_enc_value()), command_type);
+            let _ = command_type.get_data_type();
+            assert_eq!(command_type.updates_state(), !command_type.is_read_only());
+            let _ = command_type.is_external_call_order_sensitive();
+            let _ = command_type.is_set_state_order_sensitive();
+            let _ = command_type.is_inline_external_call_cmd();
+            let _ = command_type.is_set_state_cmd();
+            let _ = command_type.is_imt_set_state_cmd();
+            assert!(!command_type.to_string().is_empty());
+        }
+    }
+}
+
 impl std::fmt::Display for DPNStateCommandType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let r = match &self {

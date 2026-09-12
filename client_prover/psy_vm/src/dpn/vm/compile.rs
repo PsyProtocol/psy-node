@@ -223,3 +223,79 @@ impl PsyCompileResult {
 /*
 
 QExecContext*/
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dpn::ops::context_trait::DPNContext;
+    use crate::dpn::ops::op_types::DPNOpType;
+    use crate::dpn::ops::sym_felt::SymFeltRefValue;
+
+    #[test]
+    fn compiles_inputs_outputs_assertions_state_commands_and_events() {
+        let mut ctx = QExecContext::new();
+        let input = ctx.add_input();
+        let one = ctx.op_const(1);
+        let output = ctx.op_add(input, one);
+        ctx.assert_eq(output, output, "output is stable");
+
+        let slot = ctx.op_const(3);
+        ctx.op_set_state_felt(slot, output);
+        ctx.emit_event(vec![output]);
+
+        let definition = PsyCompileResult::compile_exec("increment".to_string(), 9, &ctx.store, &ctx, &[output]);
+
+        assert_eq!(definition.name, "increment");
+        assert_eq!(definition.method_id, 9);
+        assert_eq!(definition.circuit_inputs.len(), 1);
+        assert_eq!(definition.circuit_outputs.len(), 1);
+        assert_eq!(definition.assertions.len(), 1);
+        assert_eq!(definition.assertions[0].message, "output is stable");
+        // A state write also materializes the read of its previous value.
+        assert_eq!(definition.state_commands.len(), 2);
+        assert_eq!(definition.state_command_resolution_indices.len(), 2);
+        assert_eq!(definition.events.len(), 1);
+        assert_eq!(definition.events[0].data.len(), 1);
+        assert!(!definition.definitions.is_empty());
+        assert!(!definition.is_view_function());
+    }
+
+    #[test]
+    #[should_panic(expected = "too many events")]
+    fn rejects_more_events_than_circuit_limit() {
+        let mut ctx = QExecContext::new();
+        let data = ctx.op_const(1);
+        for _ in 0..=MAX_EVENT_RECORDS_PER_CALL {
+            ctx.emit_event(vec![data]);
+        }
+
+        PsyCompileResult::compile_exec("events".to_string(), 1, &ctx.store, &ctx, &[]);
+    }
+
+    #[test]
+    fn ingestion_allocates_each_representable_register_family_and_reuses_duplicates() {
+        let mut store = SymFeltStore::new();
+        let constant = SymFeltRef::new_constant(3);
+        let values = [
+            SymFeltRef::new_input(0, DPNBuiltInDataType::Target),
+            SymFeltRef::new_input(1, DPNBuiltInDataType::Bool),
+            SymFeltRef::new_input(2, DPNBuiltInDataType::U32Target),
+            store.insert(SymFeltRefValue { op_type: DPNOpType::HashNoPad, const_param: 0, inputs: vec![constant] }),
+            store.insert(SymFeltRefValue { op_type: DPNOpType::GetStateCommandResultArray, const_param: 7, inputs: vec![] }),
+            store.insert(SymFeltRefValue { op_type: DPNOpType::SplitBits, const_param: 4, inputs: vec![constant] }),
+            store.insert(SymFeltRefValue { op_type: DPNOpType::Keccak256, const_param: 0, inputs: vec![constant] }),
+        ];
+        let mut result = PsyCompileResult::new();
+        let encoded = values.map(|value| result.injest_sfr(&store, value));
+        assert_eq!(result.injest_sfr(&store, values[0]), encoded[0]);
+        assert_eq!(result.total_targets, 2);
+        assert_eq!(result.total_bools, 1);
+        assert_eq!(result.total_u32s, 1);
+        assert_eq!(result.total_hashes, 1);
+        assert_eq!(result.total_target_arrays, 1);
+        assert_eq!(result.total_bool_arrays, 1);
+        assert_eq!(result.total_u32_arrays, 1);
+        assert_eq!(result.total_hash160s, 0);
+        assert_eq!(result.definitions.len(), 8);
+    }
+}
