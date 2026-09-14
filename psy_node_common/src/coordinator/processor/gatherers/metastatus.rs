@@ -66,3 +66,49 @@ impl GathererMetadata {
         id_lock.clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::GathererMetadata;
+
+    #[test]
+    fn new_initializes_every_field() {
+        let metadata = GathererMetadata::new(3, 5, 100, 200, 300, 400, 500);
+        assert_eq!(metadata.realm_id_u64, 3);
+        assert_eq!(metadata.realm_sub_id_u64, 5);
+        assert_eq!(metadata.get_pending_unique_id(), 100);
+        assert_eq!(metadata.get_pending_core_proc_id(), 200);
+        assert_eq!(metadata.get_last_checkpoint_id(), 300);
+        assert_eq!(metadata.get_next_user_id(), 400);
+        assert_eq!(metadata.get_next_contract_id(), 500);
+    }
+
+    #[test]
+    fn setters_update_the_shared_atomics() {
+        let metadata = GathererMetadata::new(0, 0, 0, 0, 0, 0, 0);
+        metadata.set_pending_unique_id(11);
+        metadata.set_pending_core_proc_id(22);
+        metadata.set_last_checkpoint_id(33);
+        metadata.set_next_user_id(44);
+        metadata.set_next_contract_id(55);
+
+        assert_eq!(metadata.get_pending_unique_id(), 11);
+        assert_eq!(metadata.get_pending_core_proc_id(), 22);
+        assert_eq!(metadata.get_last_checkpoint_id(), 33);
+        assert_eq!(metadata.get_next_user_id(), 44);
+        assert_eq!(metadata.get_next_contract_id(), 55);
+    }
+
+    #[test]
+    fn clones_share_the_same_underlying_state() {
+        let metadata = GathererMetadata::new(0, 0, 0, 0, 0, 0, 0);
+        let clone = metadata.clone();
+        clone.set_next_user_id(7);
+        clone.set_pending_core_proc_id(8);
+
+        // the Arc-backed fields are shared, so writes through one handle are
+        // observed through the other — this is what the gatherers rely on
+        assert_eq!(metadata.get_next_user_id(), 7);
+        assert_eq!(metadata.get_pending_core_proc_id(), 8);
+    }
+}

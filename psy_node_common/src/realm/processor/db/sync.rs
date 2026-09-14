@@ -376,8 +376,32 @@ where
                 )
                 .await?;
 
+            let realm_root_proof = &sync_info.merkle_proof_to_realm_root;
+            anyhow::ensure!(
+                realm_root_proof.index == self.state.realm_id_u64,
+                "Realm-root proof index {} does not match realm id {} at checkpoint {}",
+                realm_root_proof.index,
+                self.state.realm_id_u64,
+                checkpoint_id
+            );
+            anyhow::ensure!(
+                realm_root_proof.siblings.len() == N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT as usize,
+                "Realm-root proof height {} does not match coordinator global-user-tree height {} at checkpoint {}",
+                realm_root_proof.siblings.len(),
+                N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+                checkpoint_id
+            );
+            anyhow::ensure!(
+                realm_root_proof.root == sync_info.checkpoint_sync_info.state_roots.user_tree_root,
+                "Realm-root proof root does not match checkpoint user-tree root at checkpoint {}",
+                checkpoint_id
+            );
+            let realm_root_nodes = realm_root_proof.get_all_merkle_nodes_and_verify::<N::HasherBase>()?;
             self.db
-                .global_user_tree_set_top_tree_merkle_proof(checkpoint_id, &sync_info.merkle_proof_to_realm_root)
+                .global_user_tree_set_nodes(checkpoint_id, &realm_root_nodes)
+                .await?;
+            self.db
+                .global_user_tree_set_top_tree_merkle_proof(checkpoint_id, realm_root_proof)
                 .await?;
 
             // Sentinel write — must remain the final persisted metadata for this checkpoint (see note above).
@@ -451,6 +475,201 @@ where
         }
         let mapping: Vec<(u64, u8)> = ids.into_iter().zip(heights.into_iter()).collect();
         self.db.set_contract_tree_heights(checkpoint_id, &mapping).await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use psy_node_core::psy_core_db::traits::full::{
+        PsyNodeCheckpointObjectDatabaseReader, PsyNodeCheckpointTreeDatabaseReader,
+        PsyNodeCoreDatabaseBasicContractInfoStoreReader,
+    };
+
+    use crate::realm::processor::db::realm_db_test_env::*;
+
+    #[tokio::test]
+    async fn sync_to_coordinator_bails_on_fresh_database_without_metadata() -> anyhow::Result<()> {
+        let mut env = RealmDbTestEnv::create().await?;
+
+        let err = match env.processor.sync_to_coordinator_set_checkpoint_id().await {
+            Err(err) => err,
+            Ok(_) => panic!("syncing a database without any checkpoint metadata must fail"),
+        };
+        assert!(err.to_string().contains("No complete checkpoint metadata"), "unexpected error: {err}");
+        assert_eq!(env.db.get_latest_checkpoint_id().await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_to_coordinator_at_genesis_head_keeps_state_consistent() -> anyhow::Result<()> {
+        let mut env = RealmDbTestEnv::create().await?;
+        env.commit_genesis().await?;
+        env.seed_consistent_coordinator_head().await?;
+
+        env.processor.sync_to_coordinator_set_checkpoint_id().await?;
+
+        // the coordinator sits at the same checkpoint 0 as the db
+        assert_eq!(env.db.get_latest_checkpoint_id().await?, 0);
+        let state = &env.processor.state;
+        assert_eq!(state.coordinator_head_synced_checkpoint_id, 0);
+        assert_eq!(state.last_committed_checkpoint_id, 0);
+        assert_eq!(state.processing_checkpoint_id, 0);
+        assert_eq!(state.gathering_checkpoint_id, 0);
+        assert_eq!(state.last_committed_checkpoint_root, state.processing_checkpoint_root);
+        // realm root pointers stay aligned regardless of the early-return path
+        assert_eq!(state.last_committed_realm_end_root, state.processing_realm_end_root);
+        assert_eq!(state.last_committed_realm_end_root, state.gathering_realm_start_root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_to_coordinator_fetches_checkpoint_one_metadata() -> anyhow::Result<()> {
+        let mut env = RealmDbTestEnv::create().await?;
+        env.commit_genesis().await?;
+        env.processor.set_new_unique_ids(None).await?;
+        env.seed_consistent_coordinator_head().await?;
+
+        let update = env.make_checkpoint_one_update();
+        let root_at_one = zh(71);
+        env.seed_checkpoint_one(update.clone(), root_at_one);
+        assert_eq!(env.db.get_latest_checkpoint_id().await?, 0);
+
+        env.processor.sync_to_coordinator_set_checkpoint_id().await?;
+
+        // db advanced to checkpoint 1 with all per-checkpoint metadata
+        assert_eq!(env.db.get_latest_checkpoint_id().await?, 1);
+        assert_eq!(env.db.get_l2_block_state(1).await?, update.checkpoint_sync_info.block_state);
+        assert_eq!(env.db.get_latest_l2_block_state().await?, update.checkpoint_sync_info.block_state);
+        assert_eq!(env.db.get_checkpoint_global_state_roots(1).await?, update.checkpoint_sync_info.state_roots);
+        assert_eq!(
+            env.db.get_checkpoint_id_for_checkpoint_root_hash(update.checkpoint_sync_info.checkpoint_tree_root).await?,
+            Some(1)
+        );
+        assert_eq!(
+            env.db.checkpoint_tree_get_root_hash(1).await?,
+            update.checkpoint_sync_info.checkpoint_tree_root
+        );
+
+        // the new contract introduced at checkpoint 1 got its tree height fetched
+        assert_eq!(env.db.get_contract_tree_heights(1, &[1]).await?, vec![8u8]);
+
+        // in-memory state moved to the new head
+        let state = &env.processor.state;
+        assert_eq!(state.coordinator_head_synced_checkpoint_id, 1);
+        assert_eq!(state.last_committed_checkpoint_id, 1);
+        assert_eq!(state.processing_checkpoint_id, 1);
+        assert_eq!(state.gathering_checkpoint_id, 1);
+        assert_eq!(state.last_committed_realm_end_root, root_at_one);
+        assert_eq!(state.processing_realm_start_root, root_at_one);
+        assert_eq!(state.gathering_realm_start_root, root_at_one);
+        assert_eq!(state.processing_checkpoint_root, state.coordinator_head_synced_checkpoint_root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_with_coordinator_updates_heads_and_bails_when_local_ahead() -> anyhow::Result<()> {
+        let mut env = RealmDbTestEnv::create().await?;
+        env.commit_genesis().await?;
+        env.processor.set_new_unique_ids(None).await?;
+        env.seed_consistent_coordinator_head().await?;
+
+        // coordinator one checkpoint ahead: heads move to 1
+        let update = env.make_checkpoint_one_update();
+        env.seed_checkpoint_one(update, zh(72));
+        env.processor.sync_with_coordinator().await?;
+        let state = &env.processor.state;
+        assert_eq!(state.coordinator_head_synced_checkpoint_id, 1);
+        assert_eq!(state.processing_checkpoint_id, 1);
+        assert_eq!(state.gathering_checkpoint_id, 1);
+        assert_eq!(state.processing_checkpoint_root, state.coordinator_head_synced_checkpoint_root);
+        assert_eq!(state.gathering_checkpoint_root, state.coordinator_head_synced_checkpoint_root);
+
+        // coordinator falling behind the local backup head is an inconsistency
+        env.coordinator.set_latest_checkpoint_id(0);
+        let err = match env.processor.sync_with_coordinator().await {
+            Err(err) => err,
+            Ok(_) => panic!("coordinator behind the local head must fail"),
+        };
+        assert!(err.to_string().contains("ahead of coordinator"), "unexpected error: {err}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wait_for_realm_update_waits_then_confirms() -> anyhow::Result<()> {
+        let mut env = RealmDbTestEnv::create().await?;
+        env.commit_genesis().await?;
+        env.processor.set_new_unique_ids(None).await?;
+        let old_root = env.processor.state.last_committed_realm_end_root;
+        env.coordinator.seed_realm_root(0, old_root);
+
+        // the next coordinator checkpoint carries the new realm root; it only
+        // becomes visible after the realm waits for it
+        let new_root = zh(73);
+        let update = env.make_checkpoint_one_update();
+        env.coordinator.stage_checkpoint(update.checkpoint_sync_info.checkpoint_leaf_hash, update.clone());
+        env.coordinator.seed_realm_root(1, new_root);
+        // latest stays 0 so the first loop iteration sees the old root
+
+        let sync_info = env.processor.wait_for_realm_update_sync_with_coordinator(new_root).await?;
+
+        // exactly one wait was needed before the update showed up
+        assert_eq!(env.coordinator.wait_call_count(), 1);
+        assert_eq!(sync_info.checkpoint_sync_info.checkpoint_id, 1);
+        assert_eq!(sync_info.checkpoint_sync_info.checkpoint_tree_root, update.checkpoint_sync_info.checkpoint_tree_root);
+
+        // metadata for checkpoint 1 was persisted...
+        assert_eq!(env.db.get_l2_block_state(1).await?, update.checkpoint_sync_info.block_state);
+        // ...but the checkpoint marker stays: the caller commits after the wait
+        assert_eq!(env.db.get_latest_checkpoint_id().await?, 0);
+
+        let state = &env.processor.state;
+        assert_eq!(state.last_committed_checkpoint_id, 1);
+        assert_eq!(state.last_committed_realm_end_root, new_root);
+        assert_eq!(state.last_committed_unique_pending_id, state.processing_unique_pending_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wait_for_realm_update_bails_on_divergent_root() -> anyhow::Result<()> {
+        let mut env = RealmDbTestEnv::create().await?;
+        env.commit_genesis().await?;
+        env.processor.set_new_unique_ids(None).await?;
+        let old_root = env.processor.state.last_committed_realm_end_root;
+        env.coordinator.seed_realm_root(0, old_root);
+
+        // the coordinator reports a root that is neither the old nor the
+        // expected new one: someone else updated the realm
+        env.coordinator.clear_realm_roots();
+        env.coordinator.seed_realm_root(0, zh(88));
+
+        let err = match env.processor.wait_for_realm_update_sync_with_coordinator(zh(89)).await {
+            Err(err) => err,
+            Ok(_) => panic!("a divergent realm root must abort the wait"),
+        };
+        assert!(err.to_string().contains("Realm state diverged"), "unexpected error: {err}");
+        assert_eq!(env.coordinator.wait_call_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wait_for_realm_update_confirms_immediately_when_already_included() -> anyhow::Result<()> {
+        let mut env = RealmDbTestEnv::create().await?;
+        env.commit_genesis().await?;
+        env.processor.set_new_unique_ids(None).await?;
+        let old_root = env.processor.state.last_committed_realm_end_root;
+        env.coordinator.seed_realm_root(0, old_root);
+
+        // checkpoint 1 (with the new root) is already published
+        let new_root = zh(74);
+        let update = env.make_checkpoint_one_update();
+        env.seed_checkpoint_one(update.clone(), new_root);
+
+        let sync_info = env.processor.wait_for_realm_update_sync_with_coordinator(new_root).await?;
+
+        assert_eq!(env.coordinator.wait_call_count(), 0);
+        assert_eq!(sync_info.checkpoint_sync_info.checkpoint_id, 1);
+        assert_eq!(env.processor.state.last_committed_realm_end_root, new_root);
         Ok(())
     }
 }

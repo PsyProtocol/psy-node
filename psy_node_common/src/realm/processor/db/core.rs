@@ -222,3 +222,114 @@ where
     }
 
 }
+
+#[cfg(test)]
+mod core_tests {
+    use parth_core::{
+        crypto::hash::traits::ZeroableHash,
+        protocol::core_types::QNetworkTreeConstants,
+        data::hash::merkle_node_key::SimpleMerkleNodeKey,
+        felt::FromPrimitiveValuesFelt,
+        utils::QPGenRandom,
+        PHash, PF,
+    };
+    use psy_core::job::job_id::QProvingJobDataID;
+    use psy_node_core::psy_core_db::traits::full::{
+        PsyNodeCoreDatabaseUserStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyNodeGlobalUserTreeDatabaseReader,
+    };
+    use psy_node_core::psy_temp_db::QTempDBRewardsTreeWriter;
+
+    use crate::realm::processor::db::realm_db_test_env::*;
+
+    #[tokio::test]
+    async fn get_next_checkpoint_id_and_proof_queue_key_track_state() -> anyhow::Result<()> {
+        let env = RealmDbTestEnv::create().await?;
+
+        // fresh database: next checkpoint after genesis marker 0 is 1
+        assert_eq!(env.processor.get_next_checkpoint_id().await?, 1);
+
+        let proof_key = env.processor.get_proof_worker_queue_key();
+        assert_eq!(proof_key.realm_id, TEST_REALM_ID);
+        assert_eq!(proof_key.realm_sub_id, TEST_REALM_SUB_ID);
+        assert_eq!(proof_key.unique_id, 0);
+        assert_eq!(proof_key.task_group, 0);
+        assert_eq!(proof_key.unique_id, env.processor.state.processing_proc_checkpoint_unique_id);
+
+        env.processor.print_coordinator_processor_state();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_realm_root_from_db_reads_realm_subtree_root() -> anyhow::Result<()> {
+        let mut env = RealmDbTestEnv::create().await?;
+        env.commit_genesis().await?;
+
+        let realm_root = env.processor.get_realm_root_from_db().await?;
+        // matches the direct db read of the (coordinator height, realm id) node
+        let direct = env
+            .db
+            .global_user_tree_get_node(
+                0,
+                SimpleMerkleNodeKey { level: N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT, index: TEST_REALM_ID },
+            )
+            .await?;
+        assert_eq!(realm_root, direct);
+        // genesis users make the realm root a non-zero root
+        assert_ne!(realm_root, PHash::default());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn print_last_checkpoint_roots_and_leaves_covers_genesis() -> anyhow::Result<()> {
+        let mut env = RealmDbTestEnv::create().await?;
+        env.commit_genesis().await?;
+        env.processor.print_last_10_checkpoint_roots_and_leaves("core_tests").await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reward_tree_root_reads_temp_store_then_tag_tree() -> anyhow::Result<()> {
+        let env = RealmDbTestEnv::create().await?;
+        let rid = test_realm_identifier();
+        let job_id = QProvingJobDataID::qp_rand_gen();
+
+        // pending id with no data anywhere: the tag-tree store errors, so the
+        // strict getter fails
+        assert!(env.processor.get_reward_tree_root(0, 5, job_id).await.is_err());
+
+        // seed the permanent tag tree at pending id 0: root comes from there
+        let root_key = SimpleMerkleNodeKey::new_root();
+        let tag_value = zh(41);
+        env.db.rewards_tag_tree_set_node_tag(0, root_key, zh(40), tag_value).await?;
+        assert_eq!(env.processor.get_reward_tree_root(0, 0, job_id).await?, tag_value);
+
+        // temp store wins when it has a non-zero value for the pending id
+        let temp_value = zh(42);
+        env.temp_db.set_proof_miner_rewards_tree_value(&rid, 7, job_id, temp_value).await?;
+        assert_eq!(env.processor.get_reward_tree_root(0, 7, job_id).await?, temp_value);
+
+        // a zero temp value at a non-zero pending id falls back to the tag
+        // tree, which is zero there => None
+        env.db.rewards_tag_tree_set_node_tag(9, root_key, zh(43), PHash::get_zero_value()).await?;
+        env.temp_db.set_proof_miner_rewards_tree_value(&rid, 9, job_id, PHash::get_zero_value()).await?;
+        assert_eq!(env.processor.get_reward_tree_root_or_none(0, 9, job_id).await?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn committed_genesis_writes_in_realm_user_leaves() -> anyhow::Result<()> {
+        let mut env = RealmDbTestEnv::create().await?;
+        env.commit_genesis().await?;
+
+        // genesis has four users, two of which (registration ids 1 and 3) are
+        // placed inside realm 1 via the user-id bit strategy
+        let user_one = env.db.get_user_leaf(0, 1 << N::REALM_GLOBAL_USER_TREE_HEIGHT).await?;
+        assert_eq!(user_one.balance, PF::from_u64_value(2_000));
+        let user_three = env
+            .db
+            .get_user_leaf(0, (1 << N::REALM_GLOBAL_USER_TREE_HEIGHT) | (1 << (N::REALM_GLOBAL_USER_TREE_HEIGHT - 1)))
+            .await?;
+        assert_eq!(user_three.balance, PF::from_u64_value(4_000));
+        Ok(())
+    }
+}

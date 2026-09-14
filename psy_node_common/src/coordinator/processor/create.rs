@@ -235,3 +235,78 @@ where
 
     Ok(())
 }
+
+#[cfg(test)]
+mod create_and_run_tests {
+    use std::{sync::Arc, time::{Duration, Instant}};
+
+    use parth_core::node::realm_identifier::QRealmIdentifier;
+
+    use crate::{
+        coordinator::processor::{
+            core::startup::startup_tests::{fingerprint_config, genesis_setup_data, N},
+            create::create_coordinator_processor_and_run,
+        },
+        test_common::{create_test_unified_db, FakeEphemeralQueueSubscriber, FakeWorkerQueue},
+    };
+    use psy_node_core::{
+        file::memory_fs::SimpleMockMemoryFileSystem,
+        psy_core_db::traits::full::PsyNodeCheckpointObjectDatabaseReader,
+    };
+    use psy_node_store_memory::temp_store::InMemoryTempStore;
+
+    #[tokio::test]
+    async fn create_coordinator_processor_and_run_builds_processor_and_keeps_loop_alive() -> anyhow::Result<()> {
+        let db = Arc::new(create_test_unified_db().await?);
+        let tag_tree = Arc::clone(&db);
+        let temp_db = Arc::new(InMemoryTempStore::new("coord_create_test".to_string(), 1, 2));
+        let proof_store = Arc::clone(&temp_db);
+        let guta_queue = Arc::new(FakeEphemeralQueueSubscriber::new());
+        let register_queue = Arc::new(FakeEphemeralQueueSubscriber::new());
+        let deploy_queue = Arc::new(FakeEphemeralQueueSubscriber::new());
+        let proof_work_queue = Arc::new(FakeWorkerQueue::new());
+        let file_system = Arc::new(SimpleMockMemoryFileSystem::new());
+
+        let genesis_data = Arc::new(genesis_setup_data());
+        let task_genesis_data = Arc::clone(&genesis_data);
+        let observe_db = Arc::clone(&db);
+        let observe_guta_queue = Arc::clone(&guta_queue);
+        let task = tokio::spawn(async move {
+            create_coordinator_processor_and_run::<N, _, _, _, _, _, _, _, _, _>(
+                &task_genesis_data,
+                fingerprint_config(),
+                Arc::clone(&file_system),
+                "coord_create_deploy_backups".to_string(),
+                "coord_create_update_backups".to_string(),
+                "coord_create_register_backups".to_string(),
+                "coord_create_guta_backups".to_string(),
+                "coord_create_checkpoint_tree_backup.bin".to_string(),
+                Arc::clone(&db),
+                tag_tree,
+                Arc::clone(&temp_db),
+                Arc::clone(&proof_store),
+                Arc::clone(&guta_queue),
+                Arc::clone(&register_queue),
+                Arc::clone(&deploy_queue),
+                Arc::clone(&proof_work_queue),
+                QRealmIdentifier::new(1, 2),
+            )
+            .await
+        });
+
+        // construction ensures queue consumers; poll for that side effect
+        // instead of assuming a fixed startup duration
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while observe_guta_queue.ensured_consumers.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "and_run never built the processor");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(observe_db.get_latest_checkpoint_id().await?, 0);
+
+        // the run loop is now driving the processor; the task must not have
+        // exited (it only returns on shutdown or a fatal join error)
+        assert!(!task.is_finished());
+        task.abort();
+        Ok(())
+    }
+}
