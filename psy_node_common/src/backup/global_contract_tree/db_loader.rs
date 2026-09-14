@@ -114,7 +114,7 @@ pub async fn load_global_contract_tree_append_only_pivot_from_db<
     }
     // SANITY CHECK: ensure the leaf node is not zero hash, as we already checked to
     // ensure the root is not a zero hash
-    if current_value == Hasher::get_zero_hash(tree_height as usize) {
+    if current_value == Hasher::get_zero_hash(0) {
         // Tree is empty
         anyhow::bail!("Failed to load Global Contract Tree from DB: reached leaf node with zero hash, but root is not zero hash");
     }
@@ -153,7 +153,7 @@ pub async fn load_global_contract_tree_append_only_pivot_from_db<
         let value = contract_db_reader
             .global_contract_tree_get_node(checkpoint_id, SimpleMerkleNodeKey::new(tree_height, start_required_contract_id))
             .await?;
-        if value == Hasher::get_zero_hash(tree_height as usize) {
+        if value == Hasher::get_zero_hash(0) {
             anyhow::bail!(
                 "Failed to load Global Contract Tree from DB: leaf node for contract id {} is zero hash, but tree root is not zero hash",
                 start_required_contract_id
@@ -204,4 +204,158 @@ pub async fn load_global_contract_tree_append_only_pivot_from_db<
         tree.get_root()
     );
     Ok((next_contract_id, tree))
+}
+
+#[cfg(test)]
+mod tests {
+    use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
+    use parth_core::{pgoldilocks::PoseidonHasher, protocol::core_types::QNetworkTreeConstants, PHash};
+    use psy_node_core::psy_core_db::traits::full::{
+        PsyNodeGlobalContractTreeDatabaseReader,
+        PsyNodeGlobalContractTreeDatabaseWriter,
+    };
+
+    use crate::test_common::{create_test_unified_db, TestNetworkConfig, TestUnifiedDatabaseStore};
+
+    use super::*;
+
+    type Hasher = PoseidonHasher;
+    type Hash = PHash;
+
+    const HEIGHT: u8 = TestNetworkConfig::GLOBAL_CONTRACT_TREE_HEIGHT;
+    const CP: u64 = 3;
+
+    fn zh(level: usize) -> Hash {
+        PoseidonHasher::get_zero_hash(level)
+    }
+
+    fn leaf(i: u64) -> Hash {
+        PHash::from_values(i * 16 + 5, 0x3DDD_4CCC_5BBB_6AAA, i + 23, 0x9AAA_8BBB_7CCC_6DDD)
+    }
+
+    async fn seed_leaves(db: &TestUnifiedDatabaseStore, checkpoint_id: u64, count: u64) -> anyhow::Result<()> {
+        for i in 0..count {
+            db.global_contract_tree_set_leaf_hash(checkpoint_id, i, leaf(i)).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_only_load_populates_leaves_across_complete_batches_and_remainder() -> anyhow::Result<()> {
+        let db = create_test_unified_db().await?;
+        seed_leaves(&db, CP, 13).await?;
+
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(HEIGHT);
+        load_append_only_global_contract_tree_into_memory(&db, &mut tree, CP, 0, 12, 5).await?;
+
+        for i in 0..=12u64 {
+            assert_eq!(tree.get_leaf_value(i), leaf(i), "leaf {i} must match the db value");
+        }
+        assert_eq!(tree.get_root(), db.global_contract_tree_get_root_hash(CP).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_only_load_with_exact_batch_multiple_skips_remainder() -> anyhow::Result<()> {
+        let db = create_test_unified_db().await?;
+        seed_leaves(&db, CP, 11).await?;
+
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(HEIGHT);
+        load_append_only_global_contract_tree_into_memory(&db, &mut tree, CP, 0, 10, 5).await?;
+
+        for i in 0..=10u64 {
+            assert_eq!(tree.get_leaf_value(i), leaf(i));
+        }
+        assert_eq!(tree.get_root(), db.global_contract_tree_get_root_hash(CP).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_only_load_from_non_zero_start_index() -> anyhow::Result<()> {
+        let db = create_test_unified_db().await?;
+        seed_leaves(&db, CP, 9).await?;
+
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(HEIGHT);
+        load_append_only_global_contract_tree_into_memory(&db, &mut tree, CP, 4, 8, 3).await?;
+
+        for i in 4..=8u64 {
+            assert_eq!(tree.get_leaf_value(i), leaf(i));
+        }
+        assert_eq!(tree.get_root(), db.global_contract_tree_get_root_hash(CP).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pivot_load_on_empty_tree_returns_zero_next_id_and_empty_root() -> anyhow::Result<()> {
+        let db = create_test_unified_db().await?;
+        let (next_contract_id, tree) =
+            load_global_contract_tree_append_only_pivot_from_db::<Hasher, TestUnifiedDatabaseStore, Hash>(&db, HEIGHT, 0, 4).await?;
+
+        assert_eq!(next_contract_id, 0);
+        assert_eq!(tree.get_root(), zh(HEIGHT as usize));
+        assert_eq!(tree.get_leaf_value(0), zh(0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pivot_load_returns_next_contract_id_with_matching_root_and_last_leaf() -> anyhow::Result<()> {
+        let db = create_test_unified_db().await?;
+        seed_leaves(&db, CP, 5).await?;
+
+        let (next_contract_id, tree) =
+            load_global_contract_tree_append_only_pivot_from_db::<Hasher, TestUnifiedDatabaseStore, Hash>(&db, HEIGHT, CP, 2).await?;
+
+        assert_eq!(next_contract_id, 5);
+        assert_eq!(tree.get_root(), db.global_contract_tree_get_root_hash(CP).await?);
+        assert_eq!(tree.get_leaf_value(4), leaf(4));
+        assert_eq!(tree.get_leaf_value(2), leaf(2));
+        assert_eq!(tree.get_leaf_value(5), zh(0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pivot_load_rejects_gap_in_append_only_contract_tree() -> anyhow::Result<()> {
+        let db = create_test_unified_db().await?;
+        // An append-only tree cannot have an empty history followed by an occupied
+        // leaf. With the pivot at 4 and a two-leaf history window, leaf 2 is the
+        // integrity-check target and must be rejected as an empty leaf.
+        db.global_contract_tree_set_leaf_hash(CP, 4, leaf(4)).await?;
+
+        let result = load_global_contract_tree_append_only_pivot_from_db::<Hasher, TestUnifiedDatabaseStore, Hash>(
+            &db, HEIGHT, CP, 2,
+        )
+        .await;
+
+        assert!(result.is_err(), "sparse append-only contract tree must be rejected");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pivot_load_clamps_required_previous_leaves_to_available_history() -> anyhow::Result<()> {
+        let db = create_test_unified_db().await?;
+        seed_leaves(&db, CP, 5).await?;
+
+        let (next_contract_id, tree) =
+            load_global_contract_tree_append_only_pivot_from_db::<Hasher, TestUnifiedDatabaseStore, Hash>(&db, HEIGHT, CP, 100).await?;
+
+        assert_eq!(next_contract_id, 5);
+        assert_eq!(tree.get_root(), db.global_contract_tree_get_root_hash(CP).await?);
+        assert_eq!(tree.get_leaf_value(0), leaf(0));
+        assert_eq!(tree.get_leaf_value(4), leaf(4));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pivot_load_with_zero_required_previous_leaves_skips_bulk_fetch() -> anyhow::Result<()> {
+        let db = create_test_unified_db().await?;
+        seed_leaves(&db, CP, 5).await?;
+
+        let (next_contract_id, tree) =
+            load_global_contract_tree_append_only_pivot_from_db::<Hasher, TestUnifiedDatabaseStore, Hash>(&db, HEIGHT, CP, 0).await?;
+
+        assert_eq!(next_contract_id, 5);
+        assert_eq!(tree.get_root(), db.global_contract_tree_get_root_hash(CP).await?);
+        assert_eq!(tree.get_leaf_value(4), leaf(4));
+        Ok(())
+    }
 }

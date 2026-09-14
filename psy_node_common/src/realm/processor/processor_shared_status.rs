@@ -69,3 +69,67 @@ impl<F: QFelt, Hash: QHashBase> PsyRealmProcessorSharedStatusWrapper<F, Hash> {
         Ok(())
     }
 }
+#[cfg(test)]
+mod shared_status_tests {
+    use crate::realm::processor::db::realm_db_test_env::RealmDbTestEnv;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn shared_status_wrapper_publishes_and_reverts_fields() -> anyhow::Result<()> {
+        let env = RealmDbTestEnv::create().await?;
+        let sync_info = &env.genesis.coordinator_update.checkpoint_sync_info;
+        let leaf = sync_info.checkpoint_leaf.clone();
+        let roots = sync_info.state_roots.clone();
+        let block_state = sync_info.block_state.clone();
+
+        let initial = PsyRealmProcessorSharedStatus {
+            last_committed_checkpoint_id: 0,
+            unique_pending_id: 0,
+            last_committed_checkpoint_leaf: leaf.clone(),
+            last_committed_checkpoint_state_roots: roots.clone(),
+            should_revert_last_changes: false,
+            block_state: block_state.clone(),
+        };
+        let wrapper = PsyRealmProcessorSharedStatusWrapper::new(initial);
+
+        // a full status update replaces every published field
+        wrapper.update_status(5, 9, leaf.clone(), roots.clone(), block_state.clone(), false)?;
+        {
+            let status = wrapper.inner.read().map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            assert_eq!(status.unique_pending_id, 5);
+            assert_eq!(status.last_committed_checkpoint_id, 9);
+            assert_eq!(status.last_committed_checkpoint_leaf, leaf);
+            assert_eq!(status.last_committed_checkpoint_state_roots, roots);
+            assert_eq!(status.block_state, block_state);
+            assert!(!status.should_revert_last_changes);
+        }
+
+        // a revert only flags the revert and moves the pending id
+        wrapper.revert_last_changes(7)?;
+        {
+            let status = wrapper.inner.read().map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            assert!(status.should_revert_last_changes);
+            assert_eq!(status.unique_pending_id, 7);
+            assert_eq!(status.last_committed_checkpoint_id, 9);
+        }
+
+        // bulk copy from another shared status replaces everything again
+        let replacement = PsyRealmProcessorSharedStatus {
+            last_committed_checkpoint_id: 12,
+            unique_pending_id: 8,
+            last_committed_checkpoint_leaf: leaf.clone(),
+            last_committed_checkpoint_state_roots: roots.clone(),
+            should_revert_last_changes: false,
+            block_state: block_state.clone(),
+        };
+        wrapper.update_status_from_shared_status(replacement)?;
+        {
+            let status = wrapper.inner.read().map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            assert_eq!(status.unique_pending_id, 8);
+            assert_eq!(status.last_committed_checkpoint_id, 12);
+            assert!(!status.should_revert_last_changes);
+        }
+        Ok(())
+    }
+}

@@ -7,6 +7,12 @@ use psy_data::{node::node_proving_state::PsyNodeProvingState, worker::api_respon
 
 #[rpc(server, client, namespace = "psy_worker")]
 pub trait NodeEdgeWorkerRpc<Hash, JobId> {
+    /// Legacy compatibility endpoint. The in-tree worker does not use this
+    /// method; it uses `get_proving_work_with_child_proofs` instead.
+    ///
+    /// Unlike the child-proofs endpoint, the current server implementation
+    /// does not persist the metadata and claim records required by
+    /// `submit_proof_raw`. New clients must not use this method.
     #[method(name = "get_proving_work")]
     async fn get_proving_work(&self, signature:  QEDCompressedSecp256K1Signature, request: SimpleTimedRequest) -> RpcResult<PsyWorkerGetProvingWorkAPIResponse<Hash, JobId>>;
     #[method(name = "get_proving_work_with_child_proofs")]
@@ -23,4 +29,3 @@ pub trait NodeEdgeWorkerRpc<Hash, JobId> {
     #[method(name = "get_worker_reputation")]
     async fn get_worker_reputation(&self, public_key: Vec<u8>) -> RpcResult<u64>;
 }
-

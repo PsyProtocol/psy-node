@@ -125,6 +125,11 @@ pub async fn read_update_contract_gatherer_backup_file_path<
     max_contract_function_tree_leaves: usize,
     tree: &mut SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
 ) -> anyhow::Result<UpdateContractGathererOutputDatabase<Hash>> {
+    anyhow::ensure!(
+        max_contract_function_tree_leaves.is_power_of_two(),
+        "maximum contract function tree leaves must be a power of two"
+    );
+    let contract_function_tree_height = max_contract_function_tree_leaves.trailing_zeros() as u8;
     let mut file: FileSystem::File = file_system.file_like_fs_open(file_path).await?;
     let metadata = file.file_like_metadata().await?;
     let file_len = metadata.len();
@@ -190,15 +195,11 @@ pub async fn read_update_contract_gatherer_backup_file_path<
         file.read_exact(&mut contract_leaf_bytes[..]).await?;
         let new_leaf: PQEDContractLeafV2<F, Hash> = PQEDContractLeafV2::<F, Hash>::pio_read_from_io(&mut &contract_leaf_bytes[..])?;
         if pivot_proof.is_none() {
-            let pivot = tree.get_historical_pivot_leaf(contract_id);
-            if pivot.root != start_root_hash {
-                return Err(anyhow::anyhow!(
-                    "Backup file start root hash {:?} does not match tree computed root hash {:?}",
-                    start_root_hash,
-                    pivot.root
-                ));
-            }
-            pivot_proof = Some(pivot);
+            // A historical pivot clears the selected leaf, so its root differs
+            // from the real start root whenever the old leaf is non-zero. The
+            // update circuit needs only its siblings; the header root and old
+            // leaf have already been validated against the current tree.
+            pivot_proof = Some(tree.get_historical_pivot_leaf(contract_id));
         }
         let new_leaf_hash = validate_contract_update::<Hasher, F, Hash>(tree, contract_id, &old_leaf, &new_leaf)?;
         tree.set_leaf(contract_id, new_leaf_hash);
@@ -229,7 +230,11 @@ pub async fn read_update_contract_gatherer_backup_file_path<
         }
 
         let (computed_contract_function_tree_root, contract_function_tree_ffs) =
-            generate_single_merkle_node_blob_from_leaves::<Hash, Hasher>(contract_id, &function_leaves);
+            generate_single_merkle_node_blob_from_leaves_with_tree_height::<Hash, Hasher>(
+                contract_id,
+                &function_leaves,
+                contract_function_tree_height,
+            );
         if computed_contract_function_tree_root != new_leaf.function_tree_root {
             return Err(anyhow::anyhow!(
                 "Backup file contract {} function tree root {:?} does not match computed root {:?}",
@@ -725,6 +730,11 @@ impl<
         )?;
         let total_jobs = jobs_for_queue.iter().map(|v| v.len()).sum::<usize>() as u64;
         self.updates_file.write_u64_le(total_jobs).await?;
+        // The update phase starts after deploy finalization. Both gatherers
+        // are created before either phase finalizes, so replace the root that
+        // was written at creation with the actual post-deploy start root.
+        self.updates_file.seek(SeekFrom::Start(4)).await?;
+        self.updates_file.write_all(&start_state_root.into_owned_32bytes()).await?;
         self.updates_file.seek(SeekFrom::Start(4 + 32)).await?;
         // UCB1 encodes integer fields in little-endian. Using `write_u32`
         // here writes big-endian and makes one update look like 16,777,216
@@ -1065,6 +1075,615 @@ mod tests {
         assert_eq!(tree.get_root(), committed_root);
         assert_eq!(tree.get_leaf_value(2), old_leaf_a.qfhash::<Hasher>());
         assert_eq!(tree.get_leaf_value(9), old_leaf_b.qfhash::<Hasher>());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod output_database_tests {
+    use parth_core::{utils::QPGenRandom, PHash};
+
+    use super::UpdateContractGathererOutputDatabase;
+
+    #[test]
+    fn empty_output_has_no_updates_and_matching_roots() {
+        let contract_tree_root = PHash::qp_rand_gen();
+        let output = UpdateContractGathererOutputDatabase::empty(contract_tree_root);
+        assert!(!output.has_updates());
+        assert_eq!(output.start_global_contract_tree_root, contract_tree_root);
+        assert_eq!(output.end_global_contract_tree_root, contract_tree_root);
+        assert!(output.updated_contract_ids.is_empty());
+        assert!(output.updated_contract_leaves_ffs.is_empty());
+        assert!(output.update_contract_function_tree_nodes_ffs.is_empty());
+        assert!(output.updated_contract_code_definitions.is_empty());
+        assert!(output.global_contract_tree_update_pivot_siblings.is_empty());
+        assert!(output.update_global_contract_tree_nodes_ffs.is_empty());
+        assert_eq!(output.total_jobs, 0);
+    }
+
+    #[test]
+    fn has_updates_tracks_updated_contract_ids() {
+        let mut output = UpdateContractGathererOutputDatabase::empty(PHash::qp_rand_gen());
+        assert!(!output.has_updates());
+
+        output.updated_contract_ids.push(1);
+        assert!(output.has_updates());
+
+        output.updated_contract_ids.clear();
+        assert!(!output.has_updates());
+    }
+}
+
+/// Tests for the backup-file reader/writer paths and the full
+/// `QueueGathererItemBuilderWithTree` implementation, running fully offline
+/// against the in-memory db stack, temp store and mock file system from
+/// `crate::test_common` / `psy_node_core` / `psy_node_store_memory`.
+#[cfg(test)]
+mod gatherer_builder_tests {
+    use std::sync::{Arc, RwLock};
+
+    use parth_core::{
+        crypto::hash::merkle_proof::compute_root_merkle_proof_generic,
+        felt::FromPrimitiveValuesFelt,
+        pgoldilocks::PoseidonHasher,
+        protocol::core_types::{QNetworkTreeCircuitSpecificConstants, QNetworkTreeConstants},
+        utils::QPGenRandom,
+        PHash, PF,
+    };
+    use psy_data::v1::qdata::{
+        checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
+        contract::ContractCodeDefinition,
+    };
+    use psy_node_core::{
+        file::memory_fs::SimpleMockMemoryFileSystem,
+        psy_core_db::traits::full::PsyNodeCoreDatabaseContractObjectStoreWriter,
+        psy_temp_db::QTempDBDeployContractDataWriter,
+    };
+    use psy_node_store_memory::temp_store::InMemoryTempStore;
+
+    use crate::test_common::{create_test_unified_db, TestNetworkConfig, TestUnifiedDatabaseStore};
+
+    use super::*;
+
+    type N = TestNetworkConfig;
+    type Hash = PHash;
+    type F = PF;
+    type Hasher = PoseidonHasher;
+    type Db = TestUnifiedDatabaseStore;
+    type TempDb = InMemoryTempStore;
+    type Fs = SimpleMockMemoryFileSystem;
+
+    const REALM_ID: u64 = 1;
+    const REALM_SUB_ID: u64 = 2;
+    const CONTRACT_ID: u64 = 5;
+    const UNIQUE_PENDING_ID: u64 = 900;
+
+    fn zh(level: usize) -> Hash {
+        PoseidonHasher::get_zero_hash(level)
+    }
+
+    fn rand_contract_leaf(deployer: Hash, state_tree_height: u16) -> PQEDContractLeafV2<F, Hash> {
+        PQEDContractLeafV2 {
+            deployer,
+            function_tree_root: Hash::qp_rand_gen(),
+            code_root: Hash::qp_rand_gen(),
+            state_tree_height: F::from_u16_value(state_tree_height),
+            state_layout_root: Hash::default(),
+            state_layout_field_count: F::default(),
+            state_layout_slot_count: F::default(),
+        }
+    }
+
+    fn function_leaves() -> Vec<Hash> {
+        vec![Hash::qp_rand_gen(), Hash::qp_rand_gen()]
+    }
+
+    /// Root exactly the way the gatherer WRITER computes it (full height 16).
+    fn fn_tree_root_full_height(contract_id: u64, leaves: &[Hash]) -> Hash {
+        generate_single_merkle_node_blob_from_leaves_with_tree_height::<Hash, Hasher>(
+            contract_id,
+            leaves,
+            N::CONTRACT_FUNCTION_TREE_HEIGHT,
+        )
+        .0
+    }
+
+    fn realm_identifier() -> QRealmIdentifier {
+        QRealmIdentifier {
+            realm_id: REALM_ID as u32,
+            realm_sub_id: REALM_SUB_ID as u16,
+        }
+    }
+
+    fn block_state() -> QEDL2BlockState {
+        QEDL2BlockState {
+            checkpoint_id: 0,
+            next_add_withdrawal_id: 0,
+            next_process_withdrawal_id: 0,
+            next_deposit_id: 0,
+            total_deposits_claimed_epoch: 0,
+            next_user_id: 0,
+            end_balance: 0,
+            next_contract_id: CONTRACT_ID as u32 + 1,
+        }
+    }
+
+    fn shared_status(contract_tree_root: Hash, should_revert: bool) -> Arc<RwLock<PsyCoordinatorProcessorSharedStatus<F, Hash>>> {
+        Arc::new(RwLock::new(PsyCoordinatorProcessorSharedStatus {
+            last_committed_checkpoint_id: 0,
+            unique_pending_id: UNIQUE_PENDING_ID,
+            last_committed_checkpoint_leaf: PQEDCheckpointLeaf::qp_rand_gen(),
+            last_committed_checkpoint_state_roots: PQEDCheckpointGlobalStateRoots {
+                contract_tree_root,
+                deposit_tree_root: zh(2),
+                user_tree_root: zh(3),
+                withdrawal_tree_root: zh(2),
+                user_registration_tree_root: zh(3),
+            },
+            should_revert_last_changes: should_revert,
+            block_state: block_state(),
+        }))
+    }
+
+    fn test_config(
+        status: Arc<RwLock<PsyCoordinatorProcessorSharedStatus<F, Hash>>>,
+        db: Arc<Db>,
+        temp_db: Arc<TempDb>,
+        fs: Arc<Fs>,
+    ) -> UpdateContractGathererConfig<N, Db, TempDb, Fs> {
+        UpdateContractGathererConfig {
+            realm_id_u64: REALM_ID,
+            realm_sub_id_u64: REALM_SUB_ID,
+            shared_status: status,
+            temp_db,
+            contract_leaf_reader: db,
+            backup_file_directory: "gatherer_backups".to_string(),
+            update_contract_circuit_whitelist: zh(24),
+            file_system: fs,
+            _phantom_n: std::marker::PhantomData,
+        }
+    }
+
+    async fn seed_dbs(
+        db: &Db,
+        temp_db: &TempDb,
+        old_leaf: &PQEDContractLeafV2<F, Hash>,
+        rand_key_id: &[u8; 16],
+    ) -> anyhow::Result<()> {
+        db.set_contract_leaf(block_state().checkpoint_id, CONTRACT_ID, old_leaf).await?;
+        temp_db
+            .set_deploy_contract_code_definition_raw(
+                &realm_identifier(),
+                UNIQUE_PENDING_ID,
+                rand_key_id,
+                ContractCodeDefinition { state_tree_height: 10, functions: vec![] }.psy_ser_to_bytes_vec()?,
+            )
+            .await?;
+        Ok(())
+    }
+
+    fn queue_item_bytes(
+        contract_id: u64,
+        contract_leaf: PQEDContractLeafV2<F, Hash>,
+        leaves: Vec<Hash>,
+        rand_key_id: [u8; 16],
+    ) -> anyhow::Result<Vec<u8>> {
+        let item = PsyUpdateContractQueueItem::<F, Hash> {
+            rand_key_id,
+            contract_id,
+            contract_leaf,
+            function_leaves: leaves,
+            layout_protocol_version: 1,
+            canonical_layout_verifier_fingerprint: Hash::default(),
+            canonical_layout_proof: vec![1, 2, 3, 4],
+        };
+        item.psy_ser_to_bytes_vec()
+    }
+
+    /// Deploys `old_leaf` at CONTRACT_ID and commits, returning the committed
+    /// root.
+    fn deploy_old_leaf(tree: &mut SimpleMemoryMerkleRecorderStore<Hasher, Hash>, old_leaf: &PQEDContractLeafV2<F, Hash>) -> Hash {
+        tree.set_leaf(CONTRACT_ID, old_leaf.qfhash::<Hasher>());
+        tree.commit_changes();
+        tree.get_root()
+    }
+
+    #[test]
+    fn historical_pivot_siblings_do_not_reconstruct_a_middle_update_start_root() {
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(24);
+        let old_leaf = rand_contract_leaf(Hash::qp_rand_gen(), 10);
+        let right_leaf = rand_contract_leaf(Hash::qp_rand_gen(), 10);
+        tree.set_leaf(1, old_leaf.qfhash::<Hasher>());
+        tree.set_leaf(2, right_leaf.qfhash::<Hasher>());
+        tree.commit_changes();
+
+        let start_root = tree.get_root();
+        let normal = tree.get_leaf(1);
+        let pivot = tree.get_historical_pivot_leaf(1);
+        let reconstructed_from_pivot = compute_root_merkle_proof_generic::<Hash, Hasher>(
+            old_leaf.qfhash::<Hasher>(),
+            1,
+            &pivot.siblings,
+        );
+
+        assert_eq!(normal.root, start_root);
+        assert_eq!(
+            compute_root_merkle_proof_generic::<Hash, Hasher>(old_leaf.qfhash::<Hasher>(), 1, &normal.siblings),
+            start_root,
+        );
+        assert_ne!(pivot.siblings, normal.siblings);
+        assert_ne!(reconstructed_from_pivot, start_root);
+    }
+
+    #[test]
+    fn backup_file_path_contains_realm_and_pending_ids() {
+        let path = get_new_update_contract_gatherer_backup_file_path("/tmp/backups", 7, 9, 1234);
+        assert!(path.starts_with("/tmp/backups"));
+        assert!(path.ends_with("update_contract_gatherer_realm_7_sub_9_pending_1234.backup"));
+    }
+
+    #[tokio::test]
+    async fn read_backup_rejects_header_level_errors() -> anyhow::Result<()> {
+        let fs = SimpleMockMemoryFileSystem::new();
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(24);
+
+        // below the minimum header size of 4 + 32 + 4 + 8 bytes
+        fs.files.insert("too_small".to_string(), vec![0u8; 47]);
+        let err = read_update_contract_gatherer_backup_file_path(&fs, "too_small", 4, &mut tree).await.unwrap_err();
+        assert!(err.to_string().contains("too small to be valid"), "got: {err}");
+
+        // wrong magic ('XCB1' instead of 'UCB1')
+        let mut bad_magic = Vec::new();
+        bad_magic.extend_from_slice(&0x31424358u32.to_le_bytes());
+        bad_magic.extend_from_slice(&[0u8; 44]);
+        fs.files.insert("bad_magic".to_string(), bad_magic);
+        let err = read_update_contract_gatherer_backup_file_path(&fs, "bad_magic", 4, &mut tree).await.unwrap_err();
+        assert!(err.to_string().contains("magic number mismatch"), "got: {err}");
+
+        // update count above the per-block maximum
+        let mut too_many = Vec::new();
+        too_many.extend_from_slice(&UPDATE_CONTRACT_GATHERER_BACKUP_V1_MAGIC_U32.to_le_bytes());
+        too_many.extend_from_slice(&tree.get_root().into_owned_32bytes());
+        too_many.extend_from_slice(&((MAX_UPDATE_CONTRACTS_GATHERER_PER_BLOCK + 1) as u32).to_le_bytes());
+        too_many.extend_from_slice(&[0u8; 8]);
+        fs.files.insert("too_many".to_string(), too_many);
+        let err = read_update_contract_gatherer_backup_file_path(&fs, "too_many", 4, &mut tree).await.unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum"), "got: {err}");
+
+        // start root that does not match the tree root with a non-zero count
+        let mut wrong_root = Vec::new();
+        wrong_root.extend_from_slice(&UPDATE_CONTRACT_GATHERER_BACKUP_V1_MAGIC_U32.to_le_bytes());
+        wrong_root.extend_from_slice(&Hash::qp_rand_gen().into_owned_32bytes());
+        wrong_root.extend_from_slice(&1u32.to_le_bytes());
+        wrong_root.extend_from_slice(&[0u8; 8]);
+        fs.files.insert("wrong_root".to_string(), wrong_root);
+        let err = read_update_contract_gatherer_backup_file_path(&fs, "wrong_root", 4, &mut tree).await.unwrap_err();
+        assert!(err.to_string().contains("does not match tree root hash"), "got: {err}");
+        Ok(())
+    }
+
+    /// Builds a complete single-update backup file body (after magic + start
+    /// root + count) for the given old/new leaves. The function tree root in
+    /// `new_leaf` must already be set the way the READER computes it.
+    fn backup_update_body(
+        old_leaf: &PQEDContractLeafV2<F, Hash>,
+        new_leaf: &PQEDContractLeafV2<F, Hash>,
+        function_leaves: &[Hash],
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&CONTRACT_ID.to_le_bytes());
+        bytes.extend_from_slice(&old_leaf.psy_ser_to_bytes_vec()?);
+        bytes.extend_from_slice(&new_leaf.psy_ser_to_bytes_vec()?);
+        bytes.extend_from_slice(&(function_leaves.len() as u32).to_le_bytes());
+        for leaf in function_leaves {
+            bytes.extend_from_slice(&leaf.into_owned_32bytes());
+        }
+        let code_with_id = ContractCodeDefinitionWithContractId {
+            contract_id: CONTRACT_ID,
+            code_definition: ContractCodeDefinition { state_tree_height: 10, functions: vec![] },
+        };
+        let code_bytes = code_with_id.psy_ser_to_bytes_vec()?;
+        bytes.extend_from_slice(&(code_bytes.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&code_bytes);
+        bytes.extend_from_slice(&3u64.to_le_bytes()); // total jobs
+        Ok(bytes)
+    }
+
+    fn backup_with_body(start_root: Hash, body: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&UPDATE_CONTRACT_GATHERER_BACKUP_V1_MAGIC_U32.to_le_bytes());
+        bytes.extend_from_slice(&start_root.into_owned_32bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
+    #[tokio::test]
+    async fn read_backup_restores_valid_updates_and_rejects_stale_ones() -> anyhow::Result<()> {
+        let fs = SimpleMockMemoryFileSystem::new();
+        let old_leaf = rand_contract_leaf(Hash::qp_rand_gen(), 10);
+
+        let leaves = function_leaves();
+        let mut new_leaf = old_leaf;
+        new_leaf.code_root = Hash::qp_rand_gen();
+        new_leaf.function_tree_root = fn_tree_root_full_height(CONTRACT_ID, &leaves);
+        let good_body = backup_update_body(&old_leaf, &new_leaf, &leaves)?;
+
+        // stale old leaf: same body against a fresh (empty) tree
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(24);
+        let start_root = tree.get_root();
+        fs.files.insert("stale".to_string(), backup_with_body(start_root, &good_body));
+        let err = read_update_contract_gatherer_backup_file_path(&fs, "stale", 1 << N::CONTRACT_FUNCTION_TREE_HEIGHT, &mut tree).await.unwrap_err();
+        assert!(err.to_string().contains("old leaf for contract id"), "got: {err}");
+
+        // A complete update against the committed old leaf must restore.
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(24);
+        let committed_root = deploy_old_leaf(&mut tree, &old_leaf);
+        fs.files.insert("valid_body".to_string(), backup_with_body(committed_root, &good_body));
+        let output = read_update_contract_gatherer_backup_file_path(
+            &fs,
+            "valid_body",
+            1 << N::CONTRACT_FUNCTION_TREE_HEIGHT,
+            &mut tree,
+        )
+        .await?;
+        assert!(output.has_updates());
+        assert_eq!(output.start_global_contract_tree_root, committed_root);
+        assert_eq!(output.end_global_contract_tree_root, tree.get_root());
+        assert_eq!(tree.get_leaf_value(CONTRACT_ID), new_leaf.qfhash::<Hasher>());
+        assert_eq!(output.updated_contract_ids, vec![CONTRACT_ID]);
+        assert_eq!(output.updated_contract_code_definitions.len(), 1);
+        assert_eq!(output.total_jobs, 3);
+        assert_eq!(output.global_contract_tree_update_pivot_siblings.len(), 24);
+        assert!(!output.update_global_contract_tree_nodes_ffs.is_empty());
+
+        // empty backup (count 0) succeeds with matching start root and no updates
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(24);
+        let committed_root = deploy_old_leaf(&mut tree, &old_leaf);
+        let mut empty = Vec::new();
+        empty.extend_from_slice(&UPDATE_CONTRACT_GATHERER_BACKUP_V1_MAGIC_U32.to_le_bytes());
+        empty.extend_from_slice(&committed_root.into_owned_32bytes());
+        empty.extend_from_slice(&0u32.to_le_bytes());
+        empty.extend_from_slice(&7u64.to_le_bytes());
+        fs.files.insert("empty".to_string(), empty);
+        let output = read_update_contract_gatherer_backup_file_path(&fs, "empty", 4, &mut tree).await?;
+        assert!(!output.has_updates());
+        assert_eq!(output.total_jobs, 7);
+        assert_eq!(output.start_global_contract_tree_root, committed_root);
+        assert_eq!(output.end_global_contract_tree_root, committed_root);
+        assert!(output.global_contract_tree_update_pivot_siblings.is_empty());
+        assert!(output.update_global_contract_tree_nodes_ffs.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn builder_accepts_update_and_finalizes() -> anyhow::Result<()> {
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(24);
+        let old_leaf = rand_contract_leaf(Hash::qp_rand_gen(), 10);
+        let committed_root = deploy_old_leaf(&mut tree, &old_leaf);
+
+        let db = Arc::new(create_test_unified_db().await?);
+        let temp_db = Arc::new(InMemoryTempStore::new("update_gatherer_test".to_string(), 1, 2));
+        let fs = Arc::new(SimpleMockMemoryFileSystem::new());
+        let rand_key_id = [7u8; 16];
+        seed_dbs(&db, &temp_db, &old_leaf, &rand_key_id).await?;
+
+        let config = test_config(
+            shared_status(committed_root, false),
+            Arc::clone(&db),
+            Arc::clone(&temp_db),
+            Arc::clone(&fs),
+        );
+        assert_eq!(config.get_realm_identifier(), realm_identifier());
+
+        let mut gatherer = UpdateContractGatherer::create_new_with_tree(&mut tree, 77, config).await?;
+        assert_eq!(gatherer.unique_pending_id, UNIQUE_PENDING_ID);
+        assert_eq!(
+            gatherer.pending_file_path,
+            get_new_update_contract_gatherer_backup_file_path("gatherer_backups", 1, 2, 900)
+        );
+
+        let leaves = function_leaves();
+        let mut new_leaf = old_leaf;
+        new_leaf.code_root = Hash::qp_rand_gen();
+        // the writer path validates with the full-height (16) computation
+        new_leaf.function_tree_root = fn_tree_root_full_height(CONTRACT_ID, &leaves);
+        let item = queue_item_bytes(CONTRACT_ID, new_leaf.clone(), leaves, rand_key_id)?;
+
+        gatherer.update_from_many_queue_items_with_tree(&mut tree, vec![item]).await?;
+        assert_eq!(gatherer.updated_contract_ids, vec![CONTRACT_ID]);
+        assert_eq!(gatherer.updated_contract_leaves.len(), 1);
+        assert_eq!(gatherer.updated_contract_leaves[0].0, old_leaf);
+        // the tree is only mutated at finalize so spiderman proofs see old leaves
+        assert_eq!(tree.get_leaf_value(CONTRACT_ID), old_leaf.qfhash::<Hasher>());
+
+        let output = UpdateContractGatherer::finalize_with_tree(gatherer, &mut tree).await?;
+        assert_eq!(output.db_output.updated_contract_ids, vec![CONTRACT_ID]);
+        assert_eq!(output.db_output.start_global_contract_tree_root, committed_root);
+        assert_ne!(output.db_output.end_global_contract_tree_root, committed_root);
+        assert_eq!(tree.get_leaf_value(CONTRACT_ID), new_leaf.qfhash::<Hasher>());
+        assert!(output.db_output.has_updates());
+        assert!(output.db_output.total_jobs >= 1);
+        assert!(!output.job_ids.is_empty());
+        assert!(!output.db_output.updated_contract_code_definitions.is_empty());
+
+        // the backup file is flushed with the real update count patched at the
+        // seek-fixed offset (little-endian, see the UCB1 note above)
+        let backup_path = get_new_update_contract_gatherer_backup_file_path("gatherer_backups", 1, 2, 900);
+        let bytes = fs.files.get(&backup_path).unwrap().value().clone();
+        assert_eq!(&bytes[0..4], &UPDATE_CONTRACT_GATHERER_BACKUP_V1_MAGIC_U32.to_le_bytes()[..]);
+        assert_eq!(u32::from_le_bytes(bytes[36..40].try_into()?), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn builder_rejects_invalid_queue_items() -> anyhow::Result<()> {
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(24);
+        let old_leaf = rand_contract_leaf(Hash::qp_rand_gen(), 10);
+        let committed_root = deploy_old_leaf(&mut tree, &old_leaf);
+
+        let db = Arc::new(create_test_unified_db().await?);
+        let temp_db = Arc::new(InMemoryTempStore::new("update_gatherer_test".to_string(), 1, 2));
+        let fs = Arc::new(SimpleMockMemoryFileSystem::new());
+        let rand_key_id = [7u8; 16];
+        seed_dbs(&db, &temp_db, &old_leaf, &rand_key_id).await?;
+
+        let config = test_config(shared_status(committed_root, false), Arc::clone(&db), Arc::clone(&temp_db), Arc::clone(&fs));
+        let mut gatherer = UpdateContractGatherer::create_new_with_tree(&mut tree, 77, config).await?;
+
+        // undersized item
+        let err = gatherer.update_from_queue_item_with_tree(&mut tree, vec![0u8; 16]).await.unwrap_err();
+        assert!(err.to_string().contains("Invalid queue item size"), "got: {err}");
+
+        // function tree root that does not match the serialized leaves
+        let leaves = function_leaves();
+        let mut bad_fn_leaf = old_leaf;
+        bad_fn_leaf.code_root = Hash::qp_rand_gen();
+        bad_fn_leaf.function_tree_root = Hash::qp_rand_gen();
+        let item = queue_item_bytes(CONTRACT_ID, bad_fn_leaf, leaves, rand_key_id)?;
+        let err = gatherer.update_from_queue_item_with_tree(&mut tree, item).await.unwrap_err();
+        assert!(err.to_string().contains("function tree root mismatch"), "got: {err}");
+
+        // unknown contract id (no leaf in the core db)
+        let leaves = function_leaves();
+        let mut unknown_leaf = old_leaf;
+        unknown_leaf.code_root = Hash::qp_rand_gen();
+        unknown_leaf.function_tree_root = fn_tree_root_full_height(999, &leaves);
+        let item = queue_item_bytes(999, unknown_leaf, leaves, rand_key_id)?;
+        let err = gatherer.update_from_queue_item_with_tree(&mut tree, item).await.unwrap_err();
+        assert!(err.to_string().contains("could not find existing contract leaf"), "got: {err}");
+
+        // missing code definition in the temp db: the memory temp store errors
+        // on the missing key before the gatherer's own not-found branch
+        let leaves = function_leaves();
+        let mut no_code_leaf = old_leaf;
+        no_code_leaf.code_root = Hash::qp_rand_gen();
+        no_code_leaf.function_tree_root = fn_tree_root_full_height(CONTRACT_ID, &leaves);
+        let item = queue_item_bytes(CONTRACT_ID, no_code_leaf, leaves, [9u8; 16])?;
+        let err = gatherer.update_from_queue_item_with_tree(&mut tree, item).await.unwrap_err();
+        assert!(err.to_string().contains("deploy contract code definition not found"), "got: {err}");
+        assert!(gatherer.updated_contract_ids.is_empty());
+        assert!(gatherer.updated_contract_leaves_ffs.is_empty());
+
+        // duplicate update of the same contract id within one block
+        let leaves = function_leaves();
+        let mut new_leaf = old_leaf;
+        new_leaf.code_root = Hash::qp_rand_gen();
+        new_leaf.function_tree_root = fn_tree_root_full_height(CONTRACT_ID, &leaves);
+        let item = queue_item_bytes(CONTRACT_ID, new_leaf, leaves, rand_key_id)?;
+        gatherer.update_from_queue_item_with_tree(&mut tree, item.clone()).await?;
+        let err = gatherer.update_from_queue_item_with_tree(&mut tree, item).await.unwrap_err();
+        assert!(err.to_string().contains("already being updated in this block"), "got: {err}");
+        assert_eq!(gatherer.updated_contract_ids, vec![CONTRACT_ID]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finalize_without_updates_writes_empty_backup() -> anyhow::Result<()> {
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(24);
+        let old_leaf = rand_contract_leaf(Hash::qp_rand_gen(), 10);
+        let committed_root = deploy_old_leaf(&mut tree, &old_leaf);
+
+        let db = Arc::new(create_test_unified_db().await?);
+        let temp_db = Arc::new(InMemoryTempStore::new("update_gatherer_test".to_string(), 1, 2));
+        let fs = Arc::new(SimpleMockMemoryFileSystem::new());
+        let config = test_config(shared_status(committed_root, false), db, temp_db, Arc::clone(&fs));
+
+        let gatherer = UpdateContractGatherer::create_new_with_tree(&mut tree, 77, config).await?;
+        let output = UpdateContractGatherer::finalize_with_tree(gatherer, &mut tree).await?;
+        assert!(!output.db_output.has_updates());
+        // even with no updates the planner emits the root promotion job
+        let planned_jobs = output.job_ids.iter().map(|v| v.len()).sum::<usize>() as u64;
+        assert!(planned_jobs >= 1);
+        assert_eq!(output.db_output.total_jobs, planned_jobs);
+        assert_eq!(output.db_output.start_global_contract_tree_root, committed_root);
+        assert_eq!(output.db_output.end_global_contract_tree_root, committed_root);
+        // with no updates the pivot falls back to index 0 and still reports
+        // the full sibling path of the empty tree
+        assert_eq!(output.db_output.global_contract_tree_update_pivot_siblings.len(), 24);
+
+        let backup_path = get_new_update_contract_gatherer_backup_file_path("gatherer_backups", 1, 2, 900);
+        let bytes = fs.files.get(&backup_path).unwrap().value().clone();
+        assert_eq!(u32::from_le_bytes(bytes[36..40].try_into()?), 0);
+        assert_eq!(u64::from_le_bytes(bytes[40..48].try_into()?), planned_jobs);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finalize_revert_restores_committed_root_and_empties_output() -> anyhow::Result<()> {
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(24);
+        let old_leaf = rand_contract_leaf(Hash::qp_rand_gen(), 10);
+        let committed_root = deploy_old_leaf(&mut tree, &old_leaf);
+
+        let db = Arc::new(create_test_unified_db().await?);
+        let temp_db = Arc::new(InMemoryTempStore::new("update_gatherer_test".to_string(), 1, 2));
+        let fs = Arc::new(SimpleMockMemoryFileSystem::new());
+        let rand_key_id = [7u8; 16];
+        seed_dbs(&db, &temp_db, &old_leaf, &rand_key_id).await?;
+
+        let config = test_config(
+            shared_status(committed_root, true),
+            Arc::clone(&db),
+            Arc::clone(&temp_db),
+            Arc::clone(&fs),
+        );
+        let mut gatherer = UpdateContractGatherer::create_new_with_tree(&mut tree, 77, config).await?;
+
+        let leaves = function_leaves();
+        let mut new_leaf = old_leaf;
+        new_leaf.code_root = Hash::qp_rand_gen();
+        new_leaf.function_tree_root = fn_tree_root_full_height(CONTRACT_ID, &leaves);
+        let item = queue_item_bytes(CONTRACT_ID, new_leaf, leaves, rand_key_id)?;
+        gatherer.update_from_queue_item_with_tree(&mut tree, item).await?;
+        assert_eq!(gatherer.updated_contract_ids.len(), 1);
+
+        // simulate this block's update being committed into the tree mid-block
+        let new_hash = gatherer.updated_contract_leaves[0].1.qfhash::<Hasher>();
+        tree.set_leaf(CONTRACT_ID, new_hash);
+        tree.commit_changes();
+        assert_ne!(tree.get_root(), committed_root);
+
+        let output = UpdateContractGatherer::finalize_with_tree(gatherer, &mut tree).await?;
+        // the revert branch wipes the gathered state and restores the tree
+        assert!(!output.db_output.has_updates());
+        assert_eq!(output.db_output.end_global_contract_tree_root, committed_root);
+        assert_eq!(tree.get_root(), committed_root);
+        assert_eq!(tree.get_leaf_value(CONTRACT_ID), old_leaf.qfhash::<Hasher>());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finalize_revert_with_wrong_committed_root_fails() -> anyhow::Result<()> {
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(24);
+        let old_leaf = rand_contract_leaf(Hash::qp_rand_gen(), 10);
+        let committed_root = deploy_old_leaf(&mut tree, &old_leaf);
+
+        let db = Arc::new(create_test_unified_db().await?);
+        let temp_db = Arc::new(InMemoryTempStore::new("update_gatherer_test".to_string(), 1, 2));
+        let fs = Arc::new(SimpleMockMemoryFileSystem::new());
+        let rand_key_id = [7u8; 16];
+        seed_dbs(&db, &temp_db, &old_leaf, &rand_key_id).await?;
+
+        // the shared status claims a different last committed contract root,
+        // so the restored tree cannot match it
+        let config = test_config(
+            shared_status(Hash::qp_rand_gen(), true),
+            Arc::clone(&db),
+            Arc::clone(&temp_db),
+            Arc::clone(&fs),
+        );
+        let mut gatherer = UpdateContractGatherer::create_new_with_tree(&mut tree, 77, config).await?;
+        let leaves = function_leaves();
+        let mut new_leaf = old_leaf;
+        new_leaf.code_root = Hash::qp_rand_gen();
+        new_leaf.function_tree_root = fn_tree_root_full_height(CONTRACT_ID, &leaves);
+        let item = queue_item_bytes(CONTRACT_ID, new_leaf, leaves, rand_key_id)?;
+        gatherer.update_from_queue_item_with_tree(&mut tree, item).await?;
+
+        let err = UpdateContractGatherer::finalize_with_tree(gatherer, &mut tree).await.unwrap_err();
+        assert!(err.to_string().contains("tree root mismatch"), "got: {err}");
+        // the tree itself is still restored to the pre-update state
+        assert_eq!(tree.get_root(), committed_root);
         Ok(())
     }
 }

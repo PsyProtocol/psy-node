@@ -935,3 +935,350 @@ mod backup_file_tests {
         Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
     }
 }
+
+#[cfg(test)]
+mod guta_header_backup_tests {
+    use parth_core::{utils::QPGenRandom, PHash, PF};
+    use psy_data::guta::header_extended::GlobalUserTreeAggregatorHeaderWithJobId;
+    use psy_serialize::PsyCanonicalSerializeMetadata;
+
+    use super::{
+        read_guta_header_with_job_id_from_backup_bytes, write_guta_header_with_job_id_backup_bytes,
+        RealmGUTAEndCapGathererOutputDatabase,
+    };
+
+    #[test]
+    fn guta_header_backup_bytes_roundtrip() -> anyhow::Result<()> {
+        let header = GlobalUserTreeAggregatorHeaderWithJobId::<PF, PHash>::qp_rand_gen();
+        let bytes = write_guta_header_with_job_id_backup_bytes(&header)?;
+        assert_eq!(bytes.len(), GlobalUserTreeAggregatorHeaderWithJobId::<PF, PHash>::FIXED_SIZE);
+
+        let restored = read_guta_header_with_job_id_from_backup_bytes::<PF, PHash>(&bytes)?;
+        // no PartialEq on the header: re-serializing the restored value must
+        // reproduce the exact backup bytes
+        let bytes_again = write_guta_header_with_job_id_backup_bytes(&restored)?;
+        assert_eq!(bytes, bytes_again);
+        Ok(())
+    }
+
+    #[test]
+    fn guta_header_backup_rejects_wrong_length() {
+        let too_short = vec![0u8; 10];
+        assert!(read_guta_header_with_job_id_from_backup_bytes::<PF, PHash>(&too_short).is_err());
+        let too_long = vec![0u8; GlobalUserTreeAggregatorHeaderWithJobId::<PF, PHash>::FIXED_SIZE + 1];
+        assert!(read_guta_header_with_job_id_from_backup_bytes::<PF, PHash>(&too_long).is_err());
+    }
+
+    #[test]
+    fn empty_end_cap_output_is_a_noop() {
+        let realm_root = PHash::qp_rand_gen();
+        let output = RealmGUTAEndCapGathererOutputDatabase::<PF, PHash>::get_empty(realm_root);
+        assert!(output.is_noop());
+        assert_eq!(output.old_realm_root, realm_root);
+        assert_eq!(output.new_realm_root, realm_root);
+        assert_eq!(output.total_users_updated, 0);
+        assert_eq!(output.total_proofs_generated, 0);
+        assert!(output.update_global_user_tree_nodes_ffs.is_empty());
+        assert!(output.update_user_contract_tree_nodes_ffs.is_empty());
+        assert!(output.update_contract_state_tree_nodes_ffs.is_empty());
+        assert!(output.update_user_leaves_ffs.is_empty());
+        assert!(output.update_contract_state_imt_leaves_ffs.is_empty());
+
+        // any root change means the output is no longer a noop
+        let mut changed = RealmGUTAEndCapGathererOutputDatabase::<PF, PHash>::get_empty(realm_root);
+        changed.new_realm_root = PHash::qp_rand_gen();
+        assert!(!changed.is_noop());
+    }
+}
+
+#[cfg(test)]
+mod gatherer_builder_tests {
+    use std::sync::{Arc, RwLock};
+
+    use parth_common::memory_stores::{
+        mem_tree_recorder::SimpleMemoryMerkleRecorderStore, traits::PsyMemoryMerkleStoreImm,
+    };
+    use parth_core::{
+        felt::FromPrimitiveValuesFelt,
+        pgoldilocks::PoseidonHasher,
+        protocol::core_types::QNetworkTreeConstants,
+        utils::QPGenRandom,
+        PHash, PF,
+    };
+    use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
+    use psy_data::{guta::header_extended::GlobalUserTreeAggregatorHeaderWithJobId, node::realm_processor::RealmProcessorCoreState};
+    use psy_io::tokio::TokioLikeFileSystem;
+    use psy_node_core::file::memory_fs::SimpleMockMemoryFileSystem;
+    use psy_node_store_memory::temp_store::InMemoryTempStore;
+    use psy_serialize::{PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSerializeMetadata};
+
+    use crate::guta_planner::realm_guta_planner_tests::test_env::{RGPContractUpdate, RGPTestChainState};
+    use crate::queue::gatherer_builder::QueueGathererItemBuilderWithTree;
+    use crate::test_common::TestNetworkConfig;
+
+    use super::{
+        get_new_realm_end_cap_gatherer_backup_file_path, read_realm_backup_end_root, read_realm_end_cap_gatherer_backup_file,
+        RealmGUTAEndCapGatherer, RealmGUTAEndCapGathererConfig,
+    };
+
+    type N = TestNetworkConfig;
+    type Hash = PHash;
+    type RecTree = SimpleMemoryMerkleRecorderStore<PoseidonHasher, PHash>;
+
+    struct GatherFixture {
+        file_system: Arc<SimpleMockMemoryFileSystem>,
+        backup_path: String,
+        realm_id_u64: u64,
+        user_a: u64,
+        user_b: u64,
+        old_hash_a: Hash,
+        old_hash_b: Hash,
+        root_job_id: QProvingJobDataID,
+        old_realm_root: Hash,
+        new_realm_root: Hash,
+    }
+
+    /// Runs the full RealmGUTAEndCapGatherer lifecycle (create -> two queue
+    /// items -> finalize) over the in-memory realm planner test env and returns
+    /// everything needed to inspect the committed backup file.
+    async fn gather_two_user_backup() -> anyhow::Result<GatherFixture> {
+        let mut chain_state = RGPTestChainState::create_for_tests().await?;
+        let user_a = chain_state.register_new_random_user().await?;
+        let user_b = chain_state.register_new_random_user().await?;
+        chain_state.add_new_contract(12).await?;
+        chain_state.unique_pending_id += 1;
+        let updates = || {
+            vec![RGPContractUpdate {
+                contract_id: 0,
+                leaves: vec![(0, Hash::qp_rand_gen()), (1, Hash::qp_rand_gen())],
+            }]
+        };
+        let item_a = chain_state.run_ups_for_user(user_a, &updates()).await?;
+        let item_b = chain_state.run_ups_for_user(user_b, &updates()).await?;
+
+        let mut realm_tree = RecTree::new(N::REALM_GLOBAL_USER_TREE_HEIGHT);
+        let file_system = Arc::new(SimpleMockMemoryFileSystem::new());
+        let status = Arc::new(RwLock::new(RealmProcessorCoreState::new_basic(
+            chain_state.chain_id,
+            chain_state.realm_identifier,
+            chain_state.checkpoint_id,
+            chain_state.unique_pending_id,
+            chain_state.unique_cord_proc_id,
+            chain_state.checkpoint_tree_root,
+            realm_tree.get_root(),
+        )));
+        let config = RealmGUTAEndCapGathererConfig::<N, InMemoryTempStore, SimpleMockMemoryFileSystem> {
+            realm_id_u64: chain_state.realm_id_u64,
+            realm_sub_id_u64: chain_state.realm_sub_id_u64,
+            status,
+            temp_db: chain_state.temp_db.clone(),
+            file_system: file_system.clone(),
+            backup_file_directory: "backups".to_string(),
+            coordinator_guta_updates_circuit_whitelist: chain_state.guta_circuit_whitelist,
+            checkpoint_tree: Arc::new(chain_state.checkpoint_tree.clone()),
+            future_pending_end_cap_jobs: Arc::new(RwLock::new(Vec::new())),
+            _phantom_n: std::marker::PhantomData,
+        };
+
+        let mut gatherer =
+            RealmGUTAEndCapGatherer::<N, InMemoryTempStore, SimpleMockMemoryFileSystem>::create_new_with_tree(
+                &mut realm_tree,
+                chain_state.unique_cord_proc_id,
+                config,
+            )
+            .await?;
+        gatherer
+            .update_from_many_queue_items_with_tree(
+                &mut realm_tree,
+                vec![item_a.psy_ser_to_bytes_vec()?, item_b.psy_ser_to_bytes_vec()?],
+            )
+            .await?;
+        let output = gatherer.finalize_with_tree(&mut realm_tree).await?;
+
+        // both users were paired into a single GUTATwoEndCap root job
+        assert_eq!(output.job_ids.len(), 1);
+        assert_eq!(output.job_ids[0].len(), 1);
+        assert_eq!(output.job_ids[0][0].job_id.circuit_type, ProvingJobCircuitType::GUTATwoEndCap);
+        assert_eq!(output.db_output.total_users_updated, 2);
+        assert_eq!(output.db_output.total_proofs_generated, 1);
+        assert!(!output.db_output.is_noop());
+
+        let backup_path = get_new_realm_end_cap_gatherer_backup_file_path(
+            "backups",
+            chain_state.realm_id_u64,
+            chain_state.realm_sub_id_u64,
+            chain_state.unique_pending_id,
+        )
+        .to_string_lossy()
+        .to_string();
+        assert!(file_system.file_like_exists(&backup_path).await?);
+
+        Ok(GatherFixture {
+            file_system,
+            backup_path,
+            realm_id_u64: chain_state.realm_id_u64,
+            user_a,
+            user_b,
+            old_hash_a: item_a.old_user_leaf_hash,
+            old_hash_b: item_b.old_user_leaf_hash,
+            root_job_id: output.job_ids[0][0].job_id.clone(),
+            old_realm_root: output.db_output.old_realm_root,
+            new_realm_root: output.db_output.new_realm_root,
+        })
+    }
+
+    #[tokio::test]
+    async fn end_cap_gatherer_round_trips_through_backup_file() -> anyhow::Result<()> {
+        let fixture = gather_two_user_backup().await?;
+
+        // the lightweight probe reads the end root committed by finalize
+        let end_root =
+            read_realm_backup_end_root::<SimpleMockMemoryFileSystem, Hash>(fixture.file_system.as_ref(), &fixture.backup_path).await?;
+        assert_eq!(end_root, fixture.new_realm_root);
+
+        // a full restore with new leaves reproduces the gatherer output
+        let mut restored_tree = RecTree::new(N::REALM_GLOBAL_USER_TREE_HEIGHT);
+        let restored = read_realm_end_cap_gatherer_backup_file::<PoseidonHasher, Hash, PF, _>(
+            fixture.file_system.as_ref(),
+            &fixture.backup_path,
+            &mut restored_tree,
+            fixture.realm_id_u64,
+            N::REALM_GLOBAL_USER_TREE_HEIGHT,
+            N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+            false,
+        )
+        .await?;
+        assert_eq!(restored.total_users_updated, 2);
+        assert_eq!(restored.total_proofs_generated, 0);
+        assert_eq!(restored.old_realm_root, fixture.old_realm_root);
+        assert_eq!(restored.new_realm_root, fixture.new_realm_root);
+        assert_eq!(restored_tree.get_root(), fixture.new_realm_root);
+        assert_eq!(restored.guta_header.job_id, fixture.root_job_id);
+        assert!(!restored.update_user_leaves_ffs.is_empty());
+        assert!(!restored.update_user_contract_tree_nodes_ffs.is_empty());
+        assert!(!restored.update_contract_state_tree_nodes_ffs.is_empty());
+        assert!(!restored.update_global_user_tree_nodes_ffs.is_empty());
+
+        // restoring with insert_old_leaves rebuilds the pre-update tree state
+        let mut old_tree = RecTree::new(N::REALM_GLOBAL_USER_TREE_HEIGHT);
+        read_realm_end_cap_gatherer_backup_file::<PoseidonHasher, Hash, PF, _>(
+            fixture.file_system.as_ref(),
+            &fixture.backup_path,
+            &mut old_tree,
+            fixture.realm_id_u64,
+            N::REALM_GLOBAL_USER_TREE_HEIGHT,
+            N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+            true,
+        )
+        .await?;
+        let min_user_id = fixture.realm_id_u64 << (N::REALM_GLOBAL_USER_TREE_HEIGHT as u64);
+        assert_eq!(old_tree.get_leaf_value(fixture.user_a - min_user_id), fixture.old_hash_a);
+        assert_eq!(old_tree.get_leaf_value(fixture.user_b - min_user_id), fixture.old_hash_b);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn backup_readers_reject_corrupted_files() -> anyhow::Result<()> {
+        let fixture = gather_two_user_backup().await?;
+        let raw = fixture.file_system.files.get(&fixture.backup_path).unwrap().value().clone();
+        assert!(raw.len() > 4 + 32 + 32 + 8);
+
+        // wrong magic is rejected by both readers
+        let bad_magic_path = "backups/bad_magic.backup".to_string();
+        let mut bad_magic = raw.clone();
+        bad_magic[0] ^= 0xff;
+        fixture.file_system.files.insert(bad_magic_path.clone(), bad_magic);
+        let err = match read_realm_backup_end_root::<SimpleMockMemoryFileSystem, Hash>(fixture.file_system.as_ref(), &bad_magic_path).await {
+            Err(e) => e,
+            Ok(_) => anyhow::bail!("bad magic must fail the end root reader"),
+        };
+        assert!(err.to_string().contains("magic number mismatch"), "unexpected error: {err}");
+        let mut tree = RecTree::new(N::REALM_GLOBAL_USER_TREE_HEIGHT);
+        let err = match read_realm_end_cap_gatherer_backup_file::<PoseidonHasher, Hash, PF, _>(
+            fixture.file_system.as_ref(),
+            &bad_magic_path,
+            &mut tree,
+            fixture.realm_id_u64,
+            N::REALM_GLOBAL_USER_TREE_HEIGHT,
+            N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+            false,
+        )
+        .await
+        {
+            Err(e) => e,
+            Ok(_) => anyhow::bail!("bad magic must fail the full reader"),
+        };
+        assert!(err.to_string().contains("magic number mismatch"), "unexpected error: {err}");
+
+        // a file shorter than the fixed header is rejected
+        let too_small_path = "backups/too_small.backup".to_string();
+        fixture.file_system.files.insert(too_small_path.clone(), vec![0u8; 16]);
+        let mut tree = RecTree::new(N::REALM_GLOBAL_USER_TREE_HEIGHT);
+        let err = match read_realm_end_cap_gatherer_backup_file::<PoseidonHasher, Hash, PF, _>(
+            fixture.file_system.as_ref(),
+            &too_small_path,
+            &mut tree,
+            fixture.realm_id_u64,
+            N::REALM_GLOBAL_USER_TREE_HEIGHT,
+            N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+            false,
+        )
+        .await
+        {
+            Err(e) => e,
+            Ok(_) => anyhow::bail!("short file must fail"),
+        };
+        assert!(err.to_string().contains("too small"), "unexpected error: {err}");
+
+        // a start root that disagrees with the in-memory tree is rejected
+        let mut wrong_tree = RecTree::new(N::REALM_GLOBAL_USER_TREE_HEIGHT);
+        wrong_tree.set_leaf(9, Hash::from_values(1, 2, 3, 4));
+        let err = match read_realm_end_cap_gatherer_backup_file::<PoseidonHasher, Hash, PF, _>(
+            fixture.file_system.as_ref(),
+            &fixture.backup_path,
+            &mut wrong_tree,
+            fixture.realm_id_u64,
+            N::REALM_GLOBAL_USER_TREE_HEIGHT,
+            N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+            false,
+        )
+        .await
+        {
+            Err(e) => e,
+            Ok(_) => anyhow::bail!("start root mismatch must fail"),
+        };
+        assert!(err.to_string().contains("does not match tree root"), "unexpected error: {err}");
+
+        // cutting the footer off the end of a valid backup is detected
+        let footer_size = GlobalUserTreeAggregatorHeaderWithJobId::<PF, Hash>::FIXED_SIZE;
+        let truncated_path = "backups/truncated.backup".to_string();
+        fixture
+            .file_system
+            .files
+            .insert(truncated_path.clone(), raw[..raw.len() - footer_size].to_vec());
+        let mut tree = RecTree::new(N::REALM_GLOBAL_USER_TREE_HEIGHT);
+        let err = match read_realm_end_cap_gatherer_backup_file::<PoseidonHasher, Hash, PF, _>(
+            fixture.file_system.as_ref(),
+            &truncated_path,
+            &mut tree,
+            fixture.realm_id_u64,
+            N::REALM_GLOBAL_USER_TREE_HEIGHT,
+            N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+            false,
+        )
+        .await
+        {
+            Err(e) => e,
+            Ok(_) => anyhow::bail!("truncated footer must fail"),
+        };
+        assert!(err.to_string().contains("missing GUTA footer"), "unexpected error: {err}");
+
+        // a path that was never written simply fails to open
+        assert!(
+            read_realm_backup_end_root::<SimpleMockMemoryFileSystem, Hash>(fixture.file_system.as_ref(), "backups/never_written.backup")
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
+}

@@ -375,4 +375,108 @@ mod tests {
 
         assert_eq!(tree.get_root(), expected_root);
     }
+
+    /// load_ variant: an empty sub-root returns a fresh recorder of the
+    /// sub-tree height whose root is that height's zero hash.
+    #[tokio::test(flavor = "current_thread")]
+    async fn load_with_sub_root_on_empty_realm_returns_empty_sub_tree() {
+        let tree_height: u8 = 16;
+        let sub_root = SimpleMerkleNodeKey { level: 12, index: 1 };
+
+        let reader = MockUserTreeReader::new(tree_height);
+        let tree = super::load_global_user_tree_from_db_with_sub_root::<CoreSha256Hasher, _, Hash256>(
+            &reader,
+            tree_height,
+            sub_root,
+            5,
+            4,
+        )
+        .await
+        .expect("loader should succeed on an empty sub-tree");
+
+        assert_eq!(tree.get_height(), tree_height - sub_root.level);
+        assert_eq!(
+            tree.get_root(),
+            <CoreSha256Hasher as MerkleZeroHasher<Hash256>>::get_zero_hash((tree_height - sub_root.level) as usize)
+        );
+    }
+
+    /// load_ variant: a populated realm descends from the sub-root to the
+    /// rightmost leaf, bulk-fetches the range and reproduces the DB sub-root.
+    #[tokio::test(flavor = "current_thread")]
+    async fn load_with_sub_root_on_populated_realm_matches_db_sub_root() {
+        let tree_height: u8 = 16;
+        let sub_root_level: u8 = 12;
+        let sub_root_index: u64 = 1;
+        let sub_tree_height = tree_height - sub_root_level; // 4
+        let leaves_in_realm: u64 = 1u64 << sub_tree_height; // 16
+        let leaf_min_index: u64 = sub_root_index << sub_tree_height;
+
+        let reader = MockUserTreeReader::new(tree_height);
+        for i in 0..leaves_in_realm {
+            reader.set_leaf(leaf_min_index + i, Hash256::from_u64_le_values(i + 1, 7, 9, 13));
+        }
+
+        let sub_root_key = SimpleMerkleNodeKey { level: sub_root_level, index: sub_root_index };
+        let expected_root = reader.node(sub_root_key);
+
+        let tree = super::load_global_user_tree_from_db_with_sub_root::<CoreSha256Hasher, _, Hash256>(
+            &reader,
+            tree_height,
+            sub_root_key,
+            42,
+            3,
+        )
+        .await
+        .expect("loader should succeed");
+
+        assert_eq!(tree.get_root(), expected_root);
+        // leaves are re-indexed relative to the sub-root
+        assert_eq!(tree.get_leaf_value(0), Hash256::from_u64_le_values(1, 7, 9, 13));
+        assert_eq!(tree.get_leaf_value(leaves_in_realm - 1), Hash256::from_u64_le_values(leaves_in_realm, 7, 9, 13));
+    }
+
+    /// fetch_ variant: a requested range sticking out of the sub-root's span is
+    /// rejected up front.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_with_sub_root_rejects_range_outside_sub_root_span() {
+        let tree_height: u8 = 16;
+        let sub_root_level: u8 = 12;
+        let sub_root_index: u64 = 1;
+        let sub_tree_height = tree_height - sub_root_level; // 4
+        let leaf_min_index: u64 = sub_root_index << sub_tree_height; // 16
+
+        let reader = MockUserTreeReader::new(tree_height);
+        let sub_root_key = SimpleMerkleNodeKey { level: sub_root_level, index: sub_root_index };
+
+        // one below the covered span [16, 32)
+        let err = fetch_global_user_tree_from_db_with_sub_root::<CoreSha256Hasher, _, Hash256>(
+            &reader,
+            tree_height,
+            sub_root_key,
+            1,
+            leaf_min_index - 1,
+            leaf_min_index + (1u64 << sub_tree_height),
+            4,
+        )
+        .await
+        .err()
+        .expect("range below the sub-root span must fail");
+        assert!(err.to_string().contains("does not cover the requested user ID range"), "unexpected error: {err}");
+
+        // one above the covered span
+        let err = fetch_global_user_tree_from_db_with_sub_root::<CoreSha256Hasher, _, Hash256>(
+            &reader,
+            tree_height,
+            sub_root_key,
+            1,
+            leaf_min_index,
+            leaf_min_index + (1u64 << sub_tree_height) + 1,
+            4,
+        )
+        .await
+        .err()
+        .expect("range above the sub-root span must fail");
+        assert!(err.to_string().contains("does not cover the requested user ID range"), "unexpected error: {err}");
+    }
 }

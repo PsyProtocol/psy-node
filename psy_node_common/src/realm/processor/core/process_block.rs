@@ -436,3 +436,290 @@ where
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod process_block_tests {
+    use parth_core::{
+        crypto::hash::{merkle_proof::compute_root_merkle_proof_generic, traits::QFieldHashable},
+        pgoldilocks::PoseidonHasher,
+        protocol::core_types::QNetworkTreeConstants,
+    };
+    use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
+    use psy_data::worker::{
+        metadata::{PsyProvingJobMetadata, PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN},
+        metadata_with_job_id::PsyProvingJobMetadataWithJobId,
+    };
+    use psy_node_core::psy_temp_db::QTempDBNodeProvingStateReader;
+
+    use crate::realm::processor::{
+        core::startup::startup_tests::RealmProcessorTestEnv,
+        db::realm_db_test_env::{zh, N},
+    };
+
+    type TestJobs = Vec<Vec<PsyProvingJobMetadataWithJobId<parth_core::PHash, QProvingJobDataID>>>;
+
+    fn job(
+        circuit: ProvingJobCircuitType,
+        salt: u64,
+    ) -> PsyProvingJobMetadataWithJobId<parth_core::PHash, QProvingJobDataID> {
+        PsyProvingJobMetadataWithJobId {
+            job_id: QProvingJobDataID::new_proof_job_id(salt, 0, circuit, 0, 0),
+            metadata: PsyProvingJobMetadata {
+                expected_public_inputs_hash: zh(7),
+                reward_tree_node_index: 0,
+                reward_tree_node_level: 0,
+                reward_tree_hash_mode: PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN,
+                reward_tree_node_children: 0,
+                dependencies: vec![],
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn get_root_job_id_returns_last_level_first_job_or_none() -> anyhow::Result<()> {
+        let env = RealmProcessorTestEnv::create().await?;
+
+        // no levels at all, or only empty levels: no root job
+        assert!(env.processor.get_root_job_id(&vec![])?.is_none());
+        assert!(env.processor.get_root_job_id(&vec![vec![]])?.is_none());
+
+        // a single level reports its first job
+        let only = job(ProvingJobCircuitType::GUTATwoEndCap, 1);
+        let root = env
+            .processor
+            .get_root_job_id(&vec![vec![only.clone()]])?
+            .expect("a single job must be the root");
+        assert_eq!(root, only.job_id);
+
+        // multi-level job lists report the first job of the LAST level
+        let lower = job(ProvingJobCircuitType::UserEndCap, 2);
+        let upper_a = job(ProvingJobCircuitType::GUTATwoEndCap, 3);
+        let upper_b = job(ProvingJobCircuitType::GUTATwoEndCap, 4);
+        let root = env
+            .processor
+            .get_root_job_id(&vec![vec![lower], vec![upper_a.clone(), upper_b]])?
+            .expect("the last level must provide the root");
+        assert_eq!(root, upper_a.job_id);
+        env.abort_gatherers();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publish_all_worker_jobs_persists_proving_state_per_level() -> anyhow::Result<()> {
+        let env = RealmProcessorTestEnv::create().await?;
+        let queue_key = env.processor.db.get_proof_worker_queue_key();
+
+        let level_zero = job(ProvingJobCircuitType::UserEndCap, 11);
+        let level_one = job(ProvingJobCircuitType::GUTATwoEndCap, 12);
+        let jobs: TestJobs = vec![vec![level_zero], vec![level_one]];
+        let proving_state = psy_data::node::node_proving_state::PsyNodeProvingState::new_standard_realm(
+            1,
+            2,
+            0,
+            0,
+            0,
+            2,
+        );
+
+        env.processor.publish_all_worker_jobs(proving_state, &queue_key, &jobs).await?;
+
+        // both non-empty levels were published to the worker queue
+        assert_eq!(*env.db_env.proof_queue.published_count.lock().unwrap(), 2);
+
+        // the persisted proving state names the last published level and is
+        // marked finished
+        let persisted = env
+            .db_env
+            .temp_db
+            .get_psy_node_proving_state(&env.processor.db.state.realm_identifier)
+            .await?;
+        assert_eq!(persisted.current_proving_level, 1);
+        assert_eq!(persisted.has_remaining_proving_jobs, 0);
+        env.abort_gatherers();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publish_all_worker_jobs_counts_only_non_empty_levels() -> anyhow::Result<()> {
+        let env = RealmProcessorTestEnv::create().await?;
+        let queue_key = env.processor.db.get_proof_worker_queue_key();
+
+        // an empty level does not advance the compacted level numbering: the
+        // single job at raw level 1 becomes compacted level 0
+        let only = job(ProvingJobCircuitType::GUTATwoEndCap, 21);
+        let jobs: TestJobs = vec![vec![], vec![only]];
+        let proving_state = psy_data::node::node_proving_state::PsyNodeProvingState::new_standard_realm(
+            1,
+            2,
+            0,
+            0,
+            0,
+            1,
+        );
+
+        env.processor.publish_all_worker_jobs(proving_state, &queue_key, &jobs).await?;
+
+        assert_eq!(*env.db_env.proof_queue.published_count.lock().unwrap(), 1);
+        let persisted = env
+            .db_env
+            .temp_db
+            .get_psy_node_proving_state(&env.processor.db.state.realm_identifier)
+            .await?;
+        assert_eq!(persisted.current_proving_level, 0);
+        env.abort_gatherers();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_results_from_gatherers_bails_when_ids_undifferentiated() -> anyhow::Result<()> {
+        let mut env = RealmProcessorTestEnv::create().await?;
+        // model a processor past genesis whose ids were never rotated
+        env.processor.db.state.last_committed_checkpoint_id = 1;
+        env.processor.db.state.processing_proc_checkpoint_unique_id =
+            env.processor.db.state.gathering_proc_checkpoint_unique_id;
+        env.processor.db.state.processing_unique_pending_id = env.processor.db.state.gathering_unique_pending_id;
+
+        let error = match env.processor.get_results_from_gatherers().await {
+            Err(e) => e.to_string(),
+            Ok(_) => anyhow::bail!("undifferentiated ids past genesis must bail"),
+        };
+        assert!(
+            error.contains("Unique IDs not differentiated outside of genesis"),
+            "unexpected error: {error}"
+        );
+        env.abort_gatherers();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_results_from_gatherers_rotates_ids_once_and_returns_empty_output() -> anyhow::Result<()> {
+        let mut env = RealmProcessorTestEnv::create().await?;
+        let gathering_before = env.processor.db.state.gathering_unique_pending_id;
+        let processing_before = env.processor.db.state.processing_unique_pending_id;
+
+        let output = env.processor.get_results_from_gatherers().await?;
+
+        // one rotation: the old gathering pair graduated to processing and
+        // gathering advanced to the next pending id
+        let state = &env.processor.db.state;
+        assert_eq!(state.processing_unique_pending_id, gathering_before);
+        assert_eq!(state.gathering_unique_pending_id, gathering_before + 1);
+        assert_ne!(state.processing_unique_pending_id, processing_before);
+
+        // with no queue items the gatherer finalizes to an empty no-op output
+        assert!(output.job_ids.is_empty());
+        assert!(output.db_output.is_noop());
+        assert_eq!(output.db_output.total_users_updated, 0);
+        env.abort_gatherers();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_and_verify_fast_forwards_when_coordinator_is_ahead() -> anyhow::Result<()> {
+        let mut env = RealmProcessorTestEnv::create().await?;
+        assert_eq!(env.db_env.db.get_latest_checkpoint_id().await?, 0);
+
+        // the coordinator advances one checkpoint past the local head; the
+        // realm itself was not modified in that checkpoint, so the coordinator
+        // still reports the exact realm-root node value the store holds
+        let mut update = env.db_env.make_checkpoint_one_update();
+        let realm_root_unchanged = env.db_env.local_realm_root().await?;
+        update.merkle_proof_to_realm_root.value = realm_root_unchanged;
+        update.merkle_proof_to_realm_root.root =
+            update.merkle_proof_to_realm_root.compute_root_with_value::<PoseidonHasher>(realm_root_unchanged);
+        update.checkpoint_sync_info.state_roots.user_tree_root = update.merkle_proof_to_realm_root.root;
+        update.checkpoint_sync_info.checkpoint_leaf.global_chain_root =
+            update.checkpoint_sync_info.state_roots.qfhash::<PoseidonHasher>();
+        update.checkpoint_sync_info.checkpoint_leaf_hash =
+            update.checkpoint_sync_info.checkpoint_leaf.qfhash::<PoseidonHasher>();
+        let mut checkpoint_siblings = Vec::with_capacity(N::CHECKPOINT_TREE_HEIGHT_USIZE);
+        checkpoint_siblings.push(env.db_env.genesis_leaf_hash());
+        for level in 1..N::CHECKPOINT_TREE_HEIGHT_USIZE {
+            checkpoint_siblings.push(zh(level));
+        }
+        update.checkpoint_sync_info.checkpoint_tree_root = compute_root_merkle_proof_generic::<_, PoseidonHasher>(
+            update.checkpoint_sync_info.checkpoint_leaf_hash,
+            1,
+            &checkpoint_siblings,
+        );
+        env.db_env.seed_checkpoint_one(update, realm_root_unchanged);
+
+        // the stale check must be recognized, fast-forwarded and re-verified
+        env.processor.sync_and_verify().await?;
+
+        assert_eq!(env.db_env.db.get_latest_checkpoint_id().await?, 1);
+        assert_eq!(env.processor.db.state.last_committed_checkpoint_id, 1);
+        assert_eq!(env.processor.db.state.processing_checkpoint_id, 1);
+        assert_eq!(env.processor.db.state.last_committed_realm_end_root, realm_root_unchanged);
+        env.abort_gatherers();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_and_verify_fast_forwards_changed_realm_root() -> anyhow::Result<()> {
+        let mut env = RealmProcessorTestEnv::create().await?;
+        let old_realm_root = env.db_env.local_realm_root().await?;
+
+        // This checkpoint comes from a separately built, internally consistent
+        // genesis state, so its realm root and top-tree proof belong together.
+        let update = env.db_env.make_checkpoint_one_update();
+        let new_realm_root = update.merkle_proof_to_realm_root.value;
+        assert_ne!(new_realm_root, old_realm_root);
+        assert_eq!(
+            update.merkle_proof_to_realm_root.root,
+            update.checkpoint_sync_info.state_roots.user_tree_root
+        );
+        env.db_env.seed_checkpoint_one(update, new_realm_root);
+
+        // Fast-forward must persist the changed realm node before the second
+        // consistency check reads it back from the global-user-tree store.
+        env.processor.sync_and_verify().await?;
+
+        assert_eq!(env.db_env.db.get_latest_checkpoint_id().await?, 1);
+        assert_eq!(env.processor.db.state.last_committed_realm_end_root, new_realm_root);
+        assert_eq!(env.processor.db.get_realm_root_from_db().await?, new_realm_root);
+        env.abort_gatherers();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_and_verify_propagates_unrecoverable_realm_root_mismatch() -> anyhow::Result<()> {
+        let mut env = RealmProcessorTestEnv::create().await?;
+
+        // the coordinator reports a realm root at the same checkpoint that
+        // disagrees with the committed local root: the fast-forward path
+        // cannot fix this, so the error must propagate
+        env.db_env.coordinator.clear_realm_roots();
+        env.db_env.coordinator.seed_realm_root(0, zh(99));
+
+        let error = match env.processor.sync_and_verify().await {
+            Err(e) => e.to_string(),
+            Ok(_) => anyhow::bail!("a realm root mismatch at the same checkpoint must fail"),
+        };
+        assert!(
+            error.contains("Realm Root mismatch"),
+            "unexpected error: {error}"
+        );
+        env.abort_gatherers();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn process_block_without_jobs_syncs_and_cleans_up_consumer() -> anyhow::Result<()> {
+        let mut env = RealmProcessorTestEnv::create().await?;
+
+        // an empty gatherer result takes the no-jobs early return
+        env.processor.process_block().await?;
+
+        // the ids still rotated once for the attempt, but no checkpoint was
+        // committed
+        assert_eq!(env.processor.db.state.processing_unique_pending_id, 1);
+        assert_eq!(env.processor.db.state.last_committed_checkpoint_id, 0);
+        assert_eq!(env.db_env.db.get_latest_checkpoint_id().await?, 0);
+
+        // the worker-queue consumer for the finished attempt was cleaned up
+        assert!(!env.db_env.proof_queue.deleted_consumers.lock().unwrap().is_empty());
+        env.abort_gatherers();
+        Ok(())
+    }
+}

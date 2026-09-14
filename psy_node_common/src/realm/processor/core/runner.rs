@@ -153,3 +153,131 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod runner_tests {
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    use crate::{
+        realm::processor::core::{
+            runner::{run_realm_processor, run_realm_processor_loop},
+            startup::startup_tests::RealmProcessorTestEnv,
+        },
+        utils::processor_status::ProcessorState,
+    };
+
+    /// Polls `check` every 10ms until it returns true or the deadline passes,
+    /// returning the final answer. Never asserts on a wall-clock sleep.
+    async fn poll_until(timeout_ms: u64, mut check: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        loop {
+            if check() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The loop processes a block only inside the 100ms window whose slot is a
+    /// multiple of 30 (every 3s). Waiting for a slot safely inside [3, 25]
+    /// keeps shutdown-oriented tests clear of that window, so they never race
+    /// a block attempt.
+    async fn wait_for_slot_away_from_processing_window() {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let slot = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() / 100;
+            if slot % 30 >= 3 && slot % 30 <= 25 {
+                return;
+            }
+            assert!(Instant::now() < deadline, "wall clock never left the processing window");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_marks_running_and_shuts_down_gracefully() -> anyhow::Result<()> {
+        let env = RealmProcessorTestEnv::create().await?;
+        let status = env.processor.db.status.clone();
+        wait_for_slot_away_from_processing_window().await;
+
+        let handle = tokio::spawn(run_realm_processor_loop(env.processor));
+        assert!(
+            poll_until(5_000, || status.state() == ProcessorState::Running).await,
+            "loop must mark itself running at startup"
+        );
+
+        status.begin_shutdown();
+        let result = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("loop must exit promptly after begin_shutdown")?;
+        result?;
+        assert_eq!(status.state(), ProcessorState::Stopped);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn loop_parks_in_error_state_when_process_block_fails() -> anyhow::Result<()> {
+        let mut env = RealmProcessorTestEnv::create().await?;
+        // make every block attempt bail immediately: past genesis the unique
+        // ids must be differentiated, and equal ids mark corrupt state. The
+        // sync path itself stays healthy (it consults the store and the
+        // backup manager, not these in-memory ids), so the failure is
+        // attributable to process_block alone.
+        env.processor.db.state.last_committed_checkpoint_id = 1;
+        env.processor.db.state.processing_proc_checkpoint_unique_id =
+            env.processor.db.state.gathering_proc_checkpoint_unique_id;
+        env.processor.db.state.processing_unique_pending_id = env.processor.db.state.gathering_unique_pending_id;
+        let status = env.processor.db.status.clone();
+
+        let handle = tokio::spawn(run_realm_processor_loop(env.processor));
+        assert!(poll_until(5_000, || status.state() == ProcessorState::Running).await);
+
+        // a processing slot arrives at most 3s apart; the block attempt fails
+        // and the loop must park in Error until manually restarted
+        assert!(
+            poll_until(20_000, || status.state() == ProcessorState::Error).await,
+            "a failed process_block must park the loop in the Error state"
+        );
+        let error = status.error().unwrap_or_default().to_string();
+        assert!(
+            error.contains("realm process_block failed at slot"),
+            "unexpected recorded error: {error}"
+        );
+
+        // the parked loop stays alive: begin_shutdown cannot clear Error, so
+        // it must still be running
+        status.begin_shutdown();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!handle.is_finished(), "an errored loop must keep running until aborted");
+        assert_eq!(status.state(), ProcessorState::Error);
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_realm_processor_propagates_gatherer_join_errors() -> anyhow::Result<()> {
+        let env = RealmProcessorTestEnv::create().await?;
+        let status = env.processor.db.status.clone();
+
+        // a crashed gatherer surfaces as an error from the joined runner
+        env.guta_gatherer_handle.abort();
+
+        let RealmProcessorTestEnv { processor, guta_gatherer_handle, .. } = env;
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_realm_processor(processor, guta_gatherer_handle),
+        )
+        .await
+        .expect("runner must return once the gatherer join fails");
+
+        assert!(result.is_err(), "an aborted gatherer must fail the runner");
+        // the inner loop task was spawned and marked itself running before the
+        // join error tore everything down; tell it to stop before dropping the
+        // runtime
+        status.begin_shutdown();
+        Ok(())
+    }
+}

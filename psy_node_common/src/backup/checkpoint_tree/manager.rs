@@ -532,3 +532,633 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use parth_common::memory_stores::{dash_tree_append_only::PsyDashMemoryAppendOnlyMerkleStore, traits::PsyMemoryMerkleStoreImm};
+    use parth_core::{crypto::hash::merkle_proof::MerkleProofCore, pgoldilocks::PoseidonHasher, protocol::core_types::QNetworkTreeConstants, PHash};
+    use psy_node_core::{
+        file::memory_fs::SimpleMockMemoryFileSystem,
+        psy_core_db::traits::full::{PsyNodeCheckpointTreeDatabaseReader, PsyNodeCheckpointTreeDatabaseWriter},
+    };
+
+    use crate::realm::processor::db::realm_db_test_env::FakeRealmCoordinatorClient;
+    use crate::test_common::{create_test_unified_db, TestNetworkConfig, TestUnifiedDatabaseStore};
+
+    use super::*;
+
+    type Hasher = PoseidonHasher;
+    type Hash = PHash;
+    type Fs = SimpleMockMemoryFileSystem;
+    type Manager = CheckpointTreeBackupManager<Hasher, Hash, Fs>;
+
+    const HEIGHT: u8 = TestNetworkConfig::CHECKPOINT_TREE_HEIGHT;
+    const PATH: &str = "checkpoint_tree_backup.bin";
+
+    fn zh(level: usize) -> Hash {
+        PoseidonHasher::get_zero_hash(level)
+    }
+
+    /// Deterministic, pairwise-distinct, non-zero leaf values.
+    fn leaf(i: u64) -> Hash {
+        PHash::from_values(i * 16 + 1, 0x1111_2222_3333_4444, i + 7, 0x5555_6666_7777_8888)
+    }
+
+    fn leaves(n: u64) -> Vec<Hash> {
+        (0..n).map(leaf).collect()
+    }
+
+    /// Serializes backup file bytes: magic + entries of (id, hash).
+    fn file_bytes(entries: &[(u64, Hash)]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(CHECKPOINT_BACKUP_MAGIC_LEN + entries.len() * CHECKPOINT_BACKUP_ITEM_SIZE);
+        bytes.extend_from_slice(&CHECKPOINT_BACKUP_MAGIC_BYTES);
+        for (id, hash) in entries {
+            bytes.extend_from_slice(&id.to_le_bytes());
+            bytes.extend_from_slice(&hash.into_owned_32bytes());
+        }
+        bytes
+    }
+
+    async fn seed_db_leaves(db: &TestUnifiedDatabaseStore, values: &[Hash]) -> anyhow::Result<()> {
+        for (i, value) in values.iter().enumerate() {
+            db.checkpoint_tree_set_leaf_hash(i as u64, *value).await?;
+        }
+        Ok(())
+    }
+
+    /// Reference append-only tree built the plain way (append_leaf per index).
+    fn reference_tree(values: &[Hash]) -> PsyDashMemoryAppendOnlyMerkleStore<Hasher, Hash> {
+        let tree = PsyDashMemoryAppendOnlyMerkleStore::<Hasher, Hash>::new(HEIGHT);
+        for (i, value) in values.iter().enumerate() {
+            tree.append_leaf(i as u64, *value).expect("reference append must succeed");
+        }
+        tree
+    }
+
+    async fn new_manager(fs: &Arc<Fs>, db: &TestUnifiedDatabaseStore, path: &str, max_keep: u64) -> anyhow::Result<Manager> {
+        CheckpointTreeBackupManager::<Hasher, Hash, Fs>::new_from_file_path(
+            Arc::clone(fs),
+            max_keep,
+            HEIGHT,
+            db,
+            path,
+            true,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn new_from_file_path_creates_file_and_starts_empty() -> anyhow::Result<()> {
+        let fs = Arc::new(Fs::new());
+        let db = create_test_unified_db().await?;
+        let manager = new_manager(&fs, &db, PATH, 10).await?;
+
+        assert_eq!(manager.get_current_checkpoint_id_head(), 0);
+        assert_eq!(manager.get_current_checkpoint_tree_root_head(), zh(HEIGHT as usize));
+        assert_eq!(manager.min_backed_up_checkpoint_id, 0);
+        assert_eq!(manager.next_backup_checkpoint_id, 0);
+
+        // the file was created containing only the magic header
+        let bytes = fs.files.get(PATH).expect("backup file must exist").value().clone();
+        assert_eq!(bytes, CHECKPOINT_BACKUP_MAGIC_BYTES.to_vec());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn new_from_file_path_rejects_missing_file_without_create() -> anyhow::Result<()> {
+        let fs = Arc::new(Fs::new());
+        let db = create_test_unified_db().await?;
+        let err = CheckpointTreeBackupManager::<Hasher, Hash, Fs>::new_from_file_path(
+            Arc::clone(&fs),
+            10,
+            HEIGHT,
+            &db,
+            "missing.bin",
+            false,
+        )
+        .await
+        .err()
+        .expect("opening a missing file without create must fail");
+        assert!(err.to_string().contains("not found"), "unexpected error: {err}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn new_from_file_path_rejects_empty_file_without_create() -> anyhow::Result<()> {
+        let fs = Arc::new(Fs::new());
+        let db = create_test_unified_db().await?;
+        fs.files.insert(PATH.to_string(), Vec::new());
+        let err = CheckpointTreeBackupManager::<Hasher, Hash, Fs>::new_from_file_path(
+            Arc::clone(&fs),
+            10,
+            HEIGHT,
+            &db,
+            PATH,
+            false,
+        )
+        .await
+        .err()
+        .expect("an empty file without create must fail");
+        assert!(err.to_string().contains("empty and creation not allowed"), "unexpected error: {err}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn new_from_file_path_rejects_truncated_header_and_bad_magic() -> anyhow::Result<()> {
+        let fs = Arc::new(Fs::new());
+        let db = create_test_unified_db().await?;
+
+        fs.files.insert("short.bin".to_string(), vec![1, 2, 3, 4]);
+        let err = CheckpointTreeBackupManager::<Hasher, Hash, Fs>::new_from_file_path(
+            Arc::clone(&fs),
+            10,
+            HEIGHT,
+            &db,
+            "short.bin",
+            true,
+        )
+        .await
+        .err()
+        .expect("a file below the magic length must fail");
+        assert!(err.to_string().contains("too small"), "unexpected error: {err}");
+
+        fs.files.insert("badmagic.bin".to_string(), vec![0xABu8; CHECKPOINT_BACKUP_MAGIC_LEN]);
+        let err = CheckpointTreeBackupManager::<Hasher, Hash, Fs>::new_from_file_path(
+            Arc::clone(&fs),
+            10,
+            HEIGHT,
+            &db,
+            "badmagic.bin",
+            true,
+        )
+        .await
+        .err()
+        .expect("a wrong magic must fail");
+        assert!(err.to_string().contains("Invalid magic bytes"), "unexpected error: {err}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_sequential_checkpoints_updates_heads_root_and_file() -> anyhow::Result<()> {
+        let fs = Arc::new(Fs::new());
+        let db = create_test_unified_db().await?;
+        let mut manager = new_manager(&fs, &db, PATH, 10).await?;
+
+        let values = leaves(3);
+        for (i, value) in values.iter().enumerate() {
+            let proof = manager.append_checkpoint_leaf_hash(i as u64, *value).await?;
+            assert_eq!(proof.index, i as u64);
+            assert_eq!(proof.new_value, *value);
+        }
+
+        assert_eq!(manager.next_backup_checkpoint_id, 3);
+        assert_eq!(manager.min_backed_up_checkpoint_id, 0);
+        assert_eq!(manager.get_current_checkpoint_id_head(), 2);
+        assert_eq!(
+            manager.get_current_checkpoint_tree_root_head(),
+            reference_tree(&values).get_root()
+        );
+
+        // every append-only prefix root is indexed by its checkpoint id
+        let reference = PsyDashMemoryAppendOnlyMerkleStore::<Hasher, Hash>::new(HEIGHT);
+        for (i, value) in values.iter().enumerate() {
+            reference.append_leaf(i as u64, *value)?;
+            assert_eq!(manager.checkpoint_tree.get_leaf_index_for_root(reference.get_root()), Some(i as u64));
+        }
+
+        // the file contains magic + one item per checkpoint in slot order
+        let bytes = fs.files.get(PATH).expect("backup file must exist").value().clone();
+        assert_eq!(bytes.len(), CHECKPOINT_BACKUP_MAGIC_LEN + 3 * CHECKPOINT_BACKUP_ITEM_SIZE);
+        assert_eq!(
+            bytes,
+            file_bytes(&[(0, values[0]), (1, values[1]), (2, values[2])])
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_retry_of_last_checkpoint_is_idempotent() -> anyhow::Result<()> {
+        let fs = Arc::new(Fs::new());
+        let db = create_test_unified_db().await?;
+        let mut manager = new_manager(&fs, &db, PATH, 10).await?;
+        let values = leaves(3);
+        for (i, value) in values.iter().enumerate() {
+            manager.append_checkpoint_leaf_hash(i as u64, *value).await?;
+        }
+        let root_before = manager.get_current_checkpoint_tree_root_head();
+
+        // replaying the last append with the same hash must not advance the head
+        manager.append_checkpoint_leaf_hash(2, values[2]).await?;
+        assert_eq!(manager.next_backup_checkpoint_id, 3);
+        assert_eq!(manager.get_current_checkpoint_id_head(), 2);
+        assert_eq!(manager.get_current_checkpoint_tree_root_head(), root_before);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_rejects_out_of_order_checkpoint_ids() -> anyhow::Result<()> {
+        let fs = Arc::new(Fs::new());
+        let db = create_test_unified_db().await?;
+        let mut manager = new_manager(&fs, &db, PATH, 10).await?;
+        let values = leaves(3);
+        for (i, value) in values.iter().enumerate() {
+            manager.append_checkpoint_leaf_hash(i as u64, *value).await?;
+        }
+
+        let err = manager
+            .append_checkpoint_leaf_hash(5, leaf(5))
+            .await
+            .expect_err("skipping checkpoint ids must fail");
+        assert!(err.to_string().contains("Sequential append required"), "unexpected error: {err}");
+        assert_eq!(manager.next_backup_checkpoint_id, 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reload_from_file_rebuilds_identical_state() -> anyhow::Result<()> {
+        let fs = Arc::new(Fs::new());
+        let db = create_test_unified_db().await?;
+        seed_db_leaves(&db, &leaves(4)).await?;
+
+        let mut manager = new_manager(&fs, &db, PATH, 10).await?;
+        for (i, value) in leaves(4).iter().enumerate() {
+            manager.append_checkpoint_leaf_hash(i as u64, *value).await?;
+        }
+        let expected_root = manager.get_current_checkpoint_tree_root_head();
+        drop(manager);
+
+        // a second manager over the same file rebuilds the same window
+        let reloaded = CheckpointTreeBackupManager::<Hasher, Hash, Fs>::new_from_file_path(
+            Arc::clone(&fs),
+            10,
+            HEIGHT,
+            &db,
+            PATH,
+            false,
+        )
+        .await?;
+        assert_eq!(reloaded.min_backed_up_checkpoint_id, 0);
+        assert_eq!(reloaded.next_backup_checkpoint_id, 4);
+        assert_eq!(reloaded.get_current_checkpoint_id_head(), 3);
+        assert_eq!(reloaded.get_current_checkpoint_tree_root_head(), expected_root);
+        assert_eq!(reloaded.checkpoint_tree.get_leaf_value(2), leaf(2));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reload_from_file_handles_ring_buffer_wraparound() -> anyhow::Result<()> {
+        let fs = Arc::new(Fs::new());
+        let db = create_test_unified_db().await?;
+        let values = leaves(7);
+        seed_db_leaves(&db, &values).await?;
+
+        let mut manager = new_manager(&fs, &db, PATH, 4).await?;
+        for (i, value) in values.iter().enumerate() {
+            manager.append_checkpoint_leaf_hash(i as u64, *value).await?;
+        }
+        // the window advanced past the overwritten slots
+        assert_eq!(manager.min_backed_up_checkpoint_id, 3);
+        assert_eq!(manager.next_backup_checkpoint_id, 7);
+
+        // on disk the ring buffer holds [4, 5, 6, 3] in slot order (id % 4)
+        let bytes = fs.files.get(PATH).expect("backup file must exist").value().clone();
+        assert_eq!(
+            bytes,
+            file_bytes(&[(4, values[4]), (5, values[5]), (6, values[6]), (3, values[3])])
+        );
+
+        let expected_root = manager.get_current_checkpoint_tree_root_head();
+        drop(manager);
+
+        let reloaded = CheckpointTreeBackupManager::<Hasher, Hash, Fs>::new_from_file_path(
+            Arc::clone(&fs),
+            4,
+            HEIGHT,
+            &db,
+            PATH,
+            false,
+        )
+        .await?;
+        // the longest contiguous chain [3, 6] is recovered
+        assert_eq!(reloaded.min_backed_up_checkpoint_id, 3);
+        assert_eq!(reloaded.next_backup_checkpoint_id, 7);
+        assert_eq!(reloaded.get_current_checkpoint_id_head(), 6);
+        assert_eq!(reloaded.get_current_checkpoint_tree_root_head(), expected_root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reload_from_file_ignores_duplicate_entries() -> anyhow::Result<()> {
+        let fs = Arc::new(Fs::new());
+        let db = create_test_unified_db().await?;
+        let values = leaves(3);
+        seed_db_leaves(&db, &values).await?;
+
+        // a duplicated entry for id 1 must be ignored, not break the chain
+        fs.files.insert(
+            PATH.to_string(),
+            file_bytes(&[(0, values[0]), (1, values[1]), (1, values[1]), (2, values[2])]),
+        );
+        let manager = CheckpointTreeBackupManager::<Hasher, Hash, Fs>::new_from_file_path(
+            Arc::clone(&fs),
+            10,
+            HEIGHT,
+            &db,
+            PATH,
+            false,
+        )
+        .await?;
+        assert_eq!(manager.min_backed_up_checkpoint_id, 0);
+        assert_eq!(manager.next_backup_checkpoint_id, 3);
+        assert_eq!(manager.get_current_checkpoint_tree_root_head(), reference_tree(&values).get_root());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn has_appropriate_checkpoint_history_flag_bounds() -> anyhow::Result<()> {
+        let fs = Arc::new(Fs::new());
+        let db = create_test_unified_db().await?;
+        let values = leaves(7);
+        seed_db_leaves(&db, &values).await?;
+        let mut manager = new_manager(&fs, &db, PATH, 4).await?;
+        for (i, value) in values.iter().enumerate() {
+            manager.append_checkpoint_leaf_hash(i as u64, *value).await?;
+        }
+        // window is [3, 7)
+        assert_eq!(manager.min_backed_up_checkpoint_id, 3);
+        assert_eq!(manager.next_backup_checkpoint_id, 7);
+
+        // head covers current=6 and the window reaches exactly the required min
+        assert!(manager.has_appropriate_checkpoint_history_for_stale_proofs(3, 6));
+        // required min (6 - 3 = 3 == min) is the boundary; one more stale slot breaks it
+        assert!(!manager.has_appropriate_checkpoint_history_for_stale_proofs(4, 6));
+        // history does not reach far enough back
+        assert!(!manager.has_appropriate_checkpoint_history_for_stale_proofs(100, 6));
+        // current checkpoint beyond the local head
+        assert!(!manager.has_appropriate_checkpoint_history_for_stale_proofs(3, 7));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hard_reset_truncates_file_and_restarts_at_given_id() -> anyhow::Result<()> {
+        let fs = Arc::new(Fs::new());
+        let db = create_test_unified_db().await?;
+        let mut manager = new_manager(&fs, &db, PATH, 10).await?;
+        for (i, value) in leaves(3).iter().enumerate() {
+            manager.append_checkpoint_leaf_hash(i as u64, *value).await?;
+        }
+
+        manager.hard_reset_and_truncate(5).await?;
+        assert_eq!(manager.min_backed_up_checkpoint_id, 5);
+        assert_eq!(manager.next_backup_checkpoint_id, 5);
+        assert_eq!(manager.get_current_checkpoint_id_head(), 4);
+        assert_eq!(manager.get_current_checkpoint_tree_root_head(), zh(HEIGHT as usize));
+        // the file was truncated back to just the magic header
+        let bytes = fs.files.get(PATH).expect("backup file must exist").value().clone();
+        assert_eq!(bytes, CHECKPOINT_BACKUP_MAGIC_BYTES.to_vec());
+
+        // appending continues from the reset id
+        manager.append_checkpoint_leaf_hash(5, leaf(5)).await?;
+        assert_eq!(manager.next_backup_checkpoint_id, 6);
+        assert_eq!(manager.get_current_checkpoint_id_head(), 5);
+        assert_eq!(manager.checkpoint_tree.get_leaf_value(5), leaf(5));
+        Ok(())
+    }
+
+    fn fake_with_leaves(values: &[Hash], latest: u64) -> Arc<FakeRealmCoordinatorClient> {
+        let client = FakeRealmCoordinatorClient::new();
+        for value in values {
+            client.push_checkpoint_leaf(*value);
+        }
+        client.set_latest_checkpoint_id(latest);
+        Arc::new(client)
+    }
+
+    #[tokio::test]
+    async fn sync_from_coordinator_client_bootstraps_empty_manager() -> anyhow::Result<()> {
+        let fs = Arc::new(Fs::new());
+        let db = create_test_unified_db().await?;
+        let values = leaves(5);
+        let client = fake_with_leaves(&values, 4);
+
+        let mut manager = new_manager(&fs, &db, PATH, 10).await?;
+        manager.sync_from_coordinator_client(client.as_ref(), 2).await?;
+
+        assert_eq!(manager.min_backed_up_checkpoint_id, 0);
+        assert_eq!(manager.next_backup_checkpoint_id, 5);
+        assert_eq!(manager.get_current_checkpoint_id_head(), 4);
+        assert_eq!(manager.get_current_checkpoint_tree_root_head(), reference_tree(&values).get_root());
+        assert_eq!(manager.checkpoint_tree.get_leaf_value(3), values[3]);
+        // the synced leaves were persisted to the backup file
+        let bytes = fs.files.get(PATH).expect("backup file must exist").value().clone();
+        assert_eq!(
+            bytes,
+            file_bytes(&[(0, values[0]), (1, values[1]), (2, values[2]), (3, values[3]), (4, values[4])])
+        );
+
+        // a second sync is a no-op when already at the coordinator head
+        manager.sync_from_coordinator_client(client.as_ref(), 2).await?;
+        assert_eq!(manager.next_backup_checkpoint_id, 5);
+        assert_eq!(manager.get_current_checkpoint_tree_root_head(), reference_tree(&values).get_root());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_from_coordinator_client_recovers_from_fork() -> anyhow::Result<()> {
+        let fs = Arc::new(Fs::new());
+        let db = create_test_unified_db().await?;
+        let mut manager = new_manager(&fs, &db, PATH, 10).await?;
+        // local chain: [leaf(0), leaf(1)]
+        manager.append_checkpoint_leaf_hash(0, leaf(0)).await?;
+        manager.append_checkpoint_leaf_hash(1, leaf(1)).await?;
+
+        // coordinator chain forks at checkpoint 1
+        let forked = vec![leaf(0), PHash::from_values(999, 1, 2, 3)];
+        let client = fake_with_leaves(&forked, 1);
+
+        manager.sync_from_coordinator_client(client.as_ref(), 8).await?;
+        // after the fork the local state was rebuilt from the coordinator's chain
+        assert_eq!(manager.next_backup_checkpoint_id, 2);
+        assert_eq!(manager.get_current_checkpoint_id_head(), 1);
+        assert_eq!(manager.get_current_checkpoint_tree_root_head(), reference_tree(&forked).get_root());
+        assert_eq!(manager.checkpoint_tree.get_leaf_value(1), forked[1]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_from_coordinator_client_resets_when_local_is_ahead() -> anyhow::Result<()> {
+        let fs = Arc::new(Fs::new());
+        let db = create_test_unified_db().await?;
+        let mut manager = new_manager(&fs, &db, PATH, 10).await?;
+        for (i, value) in leaves(5).iter().enumerate() {
+            manager.append_checkpoint_leaf_hash(i as u64, *value).await?;
+        }
+        assert_eq!(manager.next_backup_checkpoint_id, 5);
+
+        // the coordinator only knows checkpoints 0 and 1 with different hashes
+        let remote = leaves_with_offset(100, 2);
+        let client = fake_with_leaves(&remote, 1);
+
+        manager.sync_from_coordinator_client(client.as_ref(), 8).await?;
+        // the local fork was discarded and re-synced to the remote chain
+        assert_eq!(manager.next_backup_checkpoint_id, 2);
+        assert_eq!(manager.get_current_checkpoint_id_head(), 1);
+        assert_eq!(manager.get_current_checkpoint_tree_root_head(), reference_tree(&remote).get_root());
+        Ok(())
+    }
+
+    fn leaves_with_offset(offset: u64, n: u64) -> Vec<Hash> {
+        (0..n).map(|i| PHash::from_values(offset + i * 16 + 1, 0x1111_2222_3333_4444, i + 7, 0x5555_6666_7777_8888)).collect()
+    }
+
+    #[tokio::test]
+    async fn sync_from_coordinator_client_bails_on_insufficient_batch() -> anyhow::Result<()> {
+        let fs = Arc::new(Fs::new());
+        let db = create_test_unified_db().await?;
+        // latest=3 promises four checkpoints but only two leaves are available
+        let client = fake_with_leaves(&leaves(2), 3);
+
+        let mut manager = new_manager(&fs, &db, PATH, 10).await?;
+        let err = manager
+            .sync_from_coordinator_client(client.as_ref(), 2)
+            .await
+            .expect_err("a short batch must fail the sync");
+        assert!(err.to_string().contains("insufficient leaves for batch starting at 2"), "unexpected error: {err}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_from_database_replays_committed_checkpoints() -> anyhow::Result<()> {
+        let fs = Arc::new(Fs::new());
+        let db = create_test_unified_db().await?;
+        let values = leaves(6);
+        seed_db_leaves(&db, &values).await?;
+
+        let mut manager = new_manager(&fs, &db, PATH, 100).await?;
+        manager.sync_from_database(&db, 3, 5).await?;
+
+        assert_eq!(manager.min_backed_up_checkpoint_id, 0);
+        assert_eq!(manager.next_backup_checkpoint_id, 6);
+        assert_eq!(manager.get_current_checkpoint_id_head(), 5);
+        assert_eq!(manager.get_current_checkpoint_tree_root_head(), db.checkpoint_tree_get_root_hash(5).await?);
+        assert_eq!(manager.get_current_checkpoint_tree_root_head(), reference_tree(&values).get_root());
+        assert_eq!(manager.checkpoint_tree.get_leaf_value(4), values[4]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_from_database_on_genesis_only_database_stays_empty() -> anyhow::Result<()> {
+        let fs = Arc::new(Fs::new());
+        let db = create_test_unified_db().await?;
+        // no checkpoint leaves committed: last_committed = 0 with a zero leaf at
+        // index 0 is the genesis initialization case
+        let mut manager = new_manager(&fs, &db, PATH, 100).await?;
+        manager.sync_from_database(&db, 4, 0).await?;
+
+        assert_eq!(manager.min_backed_up_checkpoint_id, 0);
+        assert_eq!(manager.next_backup_checkpoint_id, 0);
+        assert_eq!(manager.get_current_checkpoint_tree_root_head(), zh(HEIGHT as usize));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_from_database_resyncs_when_history_falls_out_of_window() -> anyhow::Result<()> {
+        let fs = Arc::new(Fs::new());
+        let db = create_test_unified_db().await?;
+        let values = leaves(6);
+        seed_db_leaves(&db, &values).await?;
+
+        // a manager holding only the last two checkpoints must hard-reset and
+        // rebuild from the required history start
+        fs.files.insert(
+            PATH.to_string(),
+            file_bytes(&[(4, values[4]), (5, values[5])]),
+        );
+        let mut manager = CheckpointTreeBackupManager::<Hasher, Hash, Fs>::new_from_file_path(
+            Arc::clone(&fs),
+            100,
+            HEIGHT,
+            &db,
+            PATH,
+            false,
+        )
+        .await?;
+        assert_eq!(manager.min_backed_up_checkpoint_id, 4);
+
+        manager.sync_from_database(&db, 10, 5).await?;
+        assert_eq!(manager.min_backed_up_checkpoint_id, 0);
+        assert_eq!(manager.next_backup_checkpoint_id, 6);
+        assert_eq!(manager.get_current_checkpoint_tree_root_head(), db.checkpoint_tree_get_root_hash(5).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_from_database_bails_when_a_committed_leaf_is_zero() -> anyhow::Result<()> {
+        let fs = Arc::new(Fs::new());
+        let db = create_test_unified_db().await?;
+        // checkpoint 3 was committed with a zero leaf: an integrity violation
+        let values = [leaf(0), leaf(1), leaf(2), zh(0), leaf(4), leaf(5)];
+        for (i, value) in values.iter().enumerate() {
+            db.checkpoint_tree_set_leaf_hash(i as u64, *value).await?;
+        }
+
+        let mut manager = new_manager(&fs, &db, PATH, 100).await?;
+        let err = manager
+            .sync_from_database(&db, 5, 5)
+            .await
+            .err()
+            .expect("a zero leaf inside the committed history must fail the sync");
+        assert!(err.to_string().contains("DB sync integrity error at checkpoint 3"), "unexpected error: {err}");
+        // the sync stopped before the corrupt checkpoint was appended
+        assert_eq!(manager.get_current_checkpoint_id_head(), 2);
+        assert_eq!(manager.next_backup_checkpoint_id, 3);
+        Ok(())
+    }
+
+    /// Reader wrapper that drops the last entry of every bulk `get_nodes`
+    /// response, simulating a truncated DB batch.
+    struct ShortBatchReader<'a> {
+        db: &'a TestUnifiedDatabaseStore,
+    }
+
+    #[async_trait]
+    impl PsyNodeCheckpointTreeDatabaseReader<Hash> for ShortBatchReader<'_> {
+        async fn checkpoint_tree_get_leaf_hash(&self, checkpoint_id: u64, leaf_index: u64) -> anyhow::Result<Hash> {
+            self.db.checkpoint_tree_get_leaf_hash(checkpoint_id, leaf_index).await
+        }
+
+        async fn checkpoint_tree_get_root_hash(&self, checkpoint_id: u64) -> anyhow::Result<Hash> {
+            self.db.checkpoint_tree_get_root_hash(checkpoint_id).await
+        }
+
+        async fn checkpoint_tree_get_merkle_proof(&self, checkpoint_id: u64, leaf_index: u64) -> anyhow::Result<MerkleProofCore<Hash>> {
+            self.db.checkpoint_tree_get_merkle_proof(checkpoint_id, leaf_index).await
+        }
+
+        async fn checkpoint_tree_get_nodes(&self, checkpoint_id: u64, keys: &[SimpleMerkleNodeKey]) -> anyhow::Result<Vec<Hash>> {
+            let mut hashes = self.db.checkpoint_tree_get_nodes(checkpoint_id, keys).await?;
+            hashes.pop();
+            Ok(hashes)
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_from_database_bails_when_db_returns_a_short_batch() -> anyhow::Result<()> {
+        let fs = Arc::new(Fs::new());
+        let db = create_test_unified_db().await?;
+        seed_db_leaves(&db, &leaves(6)).await?;
+
+        let reader = ShortBatchReader { db: &db };
+        let mut manager = new_manager(&fs, &db, PATH, 100).await?;
+        let err = manager
+            .sync_from_database(&reader, 5, 5)
+            .await
+            .err()
+            .expect("a truncated bulk response must fail the sync");
+        assert!(err.to_string().contains("DB sync mismatch"), "unexpected error: {err}");
+        Ok(())
+    }
+}

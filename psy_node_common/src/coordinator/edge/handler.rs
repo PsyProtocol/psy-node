@@ -668,7 +668,7 @@ impl<
         }
 
         let realm_level = realm_level_u64 as u8;
-        if realm_id_u64 > (1u64 << realm_level) || realm_id_u64 > u32::MAX as u64 {
+        if realm_id_u64 >= (1u64 << realm_level) || realm_id_u64 > u32::MAX as u64 {
             anyhow::bail!("invalid realm id {}", realm_id_u64);
         }
 
@@ -777,6 +777,633 @@ impl<
             );
         }
 
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::coordinator::processor::db::PsyCoordinatorDatabaseProcessor;
+    use crate::test_common::{
+        create_test_unified_db, FakeEphemeralQueuePublisher, FakeEphemeralQueueSubscriber,
+        FakeWorkerQueuePublisher, FakeWorkerQueueSubscriber, TestNetworkConfig,
+        TestUnifiedDatabaseStore,
+    };
+    use parth_core::{
+        crypto::hash::traits::MerkleZeroHasher,
+        felt::{FromPrimitiveValuesFelt, ToU64Value},
+        node::realm_identifier::QRealmIdentifier,
+        protocol::core_types::QNetworkTreeConstants,
+        utils::QPGenRandom,
+        PHash, PF,
+    };
+    use psy_core::job::job_id::QProvingJobDataID;
+    use psy_data::{
+        config::network_config::PsyNodeCircuitFingerprintConfig,
+        genesis::genesis_block_setup::PsyGenesisBlockSetupData,
+        v1::qdata::{
+            checkpoint::PQEDCheckpointLeafStats,
+            contract::{
+                ContractCodeDefinition, ContractFunctionCodeDefinition, PQBCDeployContract,
+                PQEDContractLeafV2,
+            },
+        },
+    };
+    use psy_node_core::{
+        file::memory_fs::SimpleMockMemoryFileSystem,
+        genesis::genesis_db_data_builder::GenesisDatabaseDataBuilder,
+        psy_core_db::traits::full::{
+            PsyNodeCheckpointObjectDatabaseReader, PsyNodeCoreDatabaseContractObjectStoreReader,
+            PsyNodeCoreDatabaseContractObjectStoreWriter, PsyNodeCoreRewardsTagTreeStoreWriter,
+            PsyNodeGlobalUserTreeDatabaseReader, PsyNodeGlobalUserTreeDatabaseWriter,
+        },
+        psy_temp_db::{
+            QTempDBPendingIdWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter,
+        },
+        store::traits::proof_store::QParthProofStoreReader,
+    };
+    use psy_node_store_memory::temp_store::InMemoryTempStore;
+
+    type N = TestNetworkConfig;
+
+    type TestHandler = CoordinatorEdgeHandler<
+        N,
+        TestUnifiedDatabaseStore,
+        TestUnifiedDatabaseStore,
+        FakeEphemeralQueuePublisher,
+        FakeEphemeralQueuePublisher,
+        FakeEphemeralQueuePublisher,
+        FakeWorkerQueueSubscriber,
+        InMemoryTempStore,
+        InMemoryTempStore,
+    >;
+
+    type TestProcessor = PsyCoordinatorDatabaseProcessor<
+        N,
+        TestUnifiedDatabaseStore,
+        TestUnifiedDatabaseStore,
+        FakeEphemeralQueueSubscriber,
+        FakeEphemeralQueueSubscriber,
+        FakeEphemeralQueueSubscriber,
+        FakeWorkerQueuePublisher,
+        InMemoryTempStore,
+        InMemoryTempStore,
+        SimpleMockMemoryFileSystem,
+    >;
+
+    fn zh(level: usize) -> PHash {
+        parth_core::pgoldilocks::PoseidonHasher::get_zero_hash(level)
+    }
+
+    fn fingerprint_config() -> PsyNodeCircuitFingerprintConfig<PHash> {
+        PsyNodeCircuitFingerprintConfig {
+            guta_circuit_whitelist_root: zh(21),
+            register_users_circuit_whitelist_root: zh(22),
+            deploy_contracts_circuit_whitelist_root: zh(23),
+            update_contracts_circuit_whitelist_root: zh(24),
+            checkpoint_state_transition_circuit_fingerprint: zh(25),
+            genesis_checkpoint_state_transition_fingerprint: zh(26),
+        }
+    }
+
+    fn genesis_setup_data() -> PsyGenesisBlockSetupData<PF, PHash> {
+        let contract = PQBCDeployContract::new(
+            PHash::from_values(1, 0, 0, 0),
+            ContractCodeDefinition { state_tree_height: 8, functions: vec![] },
+            vec![PHash::from_values(2, 0, 0, 0)],
+            PHash::from_values(3, 0, 0, 0),
+        );
+        PsyGenesisBlockSetupData {
+            contracts: vec![contract],
+            users: vec![],
+            checkpoint_stats: PQEDCheckpointLeafStats::qp_rand_gen(),
+            deposit_tree_root: PHash::from_values(4, 0, 0, 0),
+            withdrawal_tree_root: PHash::from_values(5, 0, 0, 0),
+        }
+    }
+
+    /// Handler wired to a fresh in-memory database; `commit_genesis` optionally
+    /// drives the real genesis commit through the database processor so the
+    /// handler reads committed state.
+    pub(crate) struct EdgeTestEnv {
+        pub(crate) handler: TestHandler,
+        pub(crate) db: Arc<TestUnifiedDatabaseStore>,
+        pub(crate) guta_queue: Arc<FakeEphemeralQueuePublisher>,
+        pub(crate) register_queue: Arc<FakeEphemeralQueuePublisher>,
+        pub(crate) contract_queue: Arc<FakeEphemeralQueuePublisher>,
+        pub(crate) work_queue: Arc<FakeWorkerQueueSubscriber>,
+        pub(crate) temp_db: Arc<InMemoryTempStore>,
+    }
+
+    impl EdgeTestEnv {
+        pub(crate) async fn create() -> anyhow::Result<Self> {
+            let db = Arc::new(create_test_unified_db().await?);
+            let tag_tree = Arc::clone(&db);
+            let temp_db = Arc::new(InMemoryTempStore::new("coord_edge_test".to_string(), 1, 2));
+            let proof_store = Arc::clone(&temp_db);
+            let guta_queue = Arc::new(FakeEphemeralQueuePublisher::new());
+            let register_queue = Arc::new(FakeEphemeralQueuePublisher::new());
+            let contract_queue = Arc::new(FakeEphemeralQueuePublisher::new());
+            let work_queue = Arc::new(FakeWorkerQueueSubscriber::new());
+            let handler = CoordinatorEdgeHandler::new(
+                Arc::clone(&db),
+                tag_tree,
+                Arc::clone(&temp_db),
+                proof_store,
+                Arc::clone(&guta_queue),
+                Arc::clone(&register_queue),
+                Arc::clone(&contract_queue),
+                Arc::clone(&work_queue),
+                QRealmIdentifier::new(1, 2),
+                Arc::new(crate::test_common::TestZKVerifier {}),
+                zh(25),
+                PHash::from_values(7, 0, 0, 0),
+                Arc::new(|proof| {
+                    anyhow::ensure!(
+                        proof == [1, 2, 3, 4] || proof == [5, 6, 7, 8],
+                        "test canonical layout proof is invalid"
+                    );
+                    Ok(())
+                }),
+            );
+            // A fresh InMemoryTempStore errors on pending-id reads ("Unique
+            // pending ids not found") while the unified db answers (0, 0);
+            // seed both counters so handler reads behave like production.
+            let rid = QRealmIdentifier::new(1, 2);
+            temp_db.set_unique_pending_ids(&rid, 0, 0).await?;
+            temp_db.set_gathering_unique_pending_ids(&rid, 0, 0).await?;
+            Ok(Self { handler, db, guta_queue, register_queue, contract_queue, work_queue, temp_db })
+        }
+
+        /// Commits genesis through a real database processor sharing the same
+        /// underlying unified store, then returns the processor for inspection.
+        pub(crate) async fn commit_genesis(&self) -> anyhow::Result<TestProcessor> {
+            let guta_sub = Arc::new(FakeEphemeralQueueSubscriber::new());
+            let register_sub = Arc::new(FakeEphemeralQueueSubscriber::new());
+            let deploy_sub = Arc::new(FakeEphemeralQueueSubscriber::new());
+            let proof_pub = Arc::new(FakeWorkerQueuePublisher::new());
+            let file_system = Arc::new(SimpleMockMemoryFileSystem::new());
+            let genesis_data = genesis_setup_data();
+            let fp_config = fingerprint_config();
+            let (genesis_transition, genesis_block_update) =
+                GenesisDatabaseDataBuilder::<PF, PHash>::setup_for_coordinator::<
+                    parth_core::pgoldilocks::PoseidonHasher,
+                    N,
+                >(&genesis_data, fp_config.checkpoint_state_transition_circuit_fingerprint)?;
+            let mut processor = TestProcessor::new_init(
+                Arc::clone(&self.db),
+                Arc::clone(&self.db),
+                Arc::new(InMemoryTempStore::new("coord_edge_genesis".to_string(), 1, 2)),
+                Arc::new(InMemoryTempStore::new("coord_edge_genesis".to_string(), 1, 2)),
+                guta_sub,
+                register_sub,
+                deploy_sub,
+                proof_pub,
+                QRealmIdentifier::new(1, 2),
+                fp_config,
+                genesis_transition,
+                file_system,
+                "checkpoint_tree_backup.bin".to_string(),
+            )
+            .await?;
+            processor
+                .commit_state(
+                    genesis_block_update,
+                    psy_core::job::job_id::ProvingJobCircuitType::GenesisBlockCheckpointStateTransition,
+                    vec![],
+                )
+                .await?;
+            Ok(processor)
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_key_helpers_reflect_gathering_ids_and_realm() -> anyhow::Result<()> {
+        let env = EdgeTestEnv::create().await?;
+        let handler = &env.handler;
+
+        let (pending, proc_id, register_key) = handler.get_register_user_queue_key().await?;
+        assert_eq!((pending, proc_id), (0, 0));
+        assert_eq!(register_key.realm_id, 1);
+        assert_eq!(register_key.realm_sub_id, 2);
+        assert_eq!(register_key.unique_id, proc_id);
+        assert_eq!(register_key.task_group, 0);
+
+        let (_, _, deploy_key) = handler.get_deploy_contract_queue_key().await?;
+        assert_eq!(deploy_key.realm_id, 1);
+        assert_eq!(deploy_key.realm_sub_id, 2);
+
+        let (_, _, update_key) = handler.get_update_contract_queue_key().await?;
+        assert_eq!(update_key.realm_id, 1);
+        assert_eq!(update_key.realm_sub_id, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn register_user_publishes_public_key_to_queue() -> anyhow::Result<()> {
+        let env = EdgeTestEnv::create().await?;
+        let public_key = PZKPublicKeyInfo::<PHash>::qp_rand_gen();
+
+        let result = env.handler.register_user_internal(public_key.clone()).await?;
+        assert_eq!(result, "ok");
+        assert_eq!(env.register_queue.published_count(), 1);
+        let published = env.register_queue.published_bytes_for(0);
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0], public_key.psy_ser_into_bytes_vec()?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn checkpoint_leaves_batch_raw_validates_count_and_serializes() -> anyhow::Result<()> {
+        let env = EdgeTestEnv::create().await?;
+
+        let err = env
+            .handler
+            .get_checkpoint_leaves_batch_raw_internal(0, 20001)
+            .await
+            .expect_err("count above the maximum must be rejected");
+        assert!(err.to_string().contains("exceeds maximum"), "unexpected error: {err}");
+
+        // on a fresh database the latest checkpoint is 0, so only the genesis
+        // leaf node comes back even when more are requested
+        let raw = env.handler.get_checkpoint_leaves_batch_raw_internal(0, 5).await?;
+        assert!(!raw.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn job_stats_require_pending_mapping_and_default_to_zero() -> anyhow::Result<()> {
+        let env = EdgeTestEnv::create().await?;
+
+        // no pending-id mapping exists on a fresh database
+        let err = env
+            .handler
+            .get_job_stats_internal(0)
+            .await
+            .expect_err("stats for a checkpoint without pending mapping must fail");
+        assert!(err.to_string().contains("no unique pending id"), "unexpected error: {err}");
+
+        env.commit_genesis().await?;
+        let stats = env.handler.get_job_stats_internal(0).await?;
+        assert_eq!(stats.unique_pending_id, 0);
+        assert_eq!(stats.total_completed, 0);
+        assert_eq!(stats.total_duration_ms, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_id_accessors_and_submit_guard() -> anyhow::Result<()> {
+        let env = EdgeTestEnv::create().await?;
+        let handler = &env.handler;
+
+        assert_eq!(handler.get_current_unique_pending_id_internal().await?, (0, 0));
+        assert_eq!(handler.get_current_gathering_unique_pending_id_internal().await?, (0, 0));
+        // no pending-id mapping exists on a fresh database
+        assert_eq!(handler.get_checkpoint_id_for_unique_pending_id_internal(0).await?, None);
+        // genesis commit records pending id 0 -> checkpoint 0
+        env.commit_genesis().await?;
+        assert_eq!(handler.get_checkpoint_id_for_unique_pending_id_internal(0).await?, Some(0));
+
+        // nothing submitted yet: guard passes, then fails once a status is set
+        handler.ensure_realm_has_not_submitted(0, 0).await?;
+        env.temp_db
+            .set_submitted_status_for_pending(&QRealmIdentifier::new(1, 2), 0, 0, 7)
+            .await?;
+        let err = handler
+            .ensure_realm_has_not_submitted(0, 0)
+            .await
+            .expect_err("a submitted realm must be rejected");
+        assert!(err.to_string().contains("already been submitted"), "unexpected error: {err}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn realm_sync_info_reads_committed_genesis_state() -> anyhow::Result<()> {
+        let env = EdgeTestEnv::create().await?;
+        let processor = env.commit_genesis().await?;
+
+        let update = env.handler.get_realm_sync_info_internal(0, 0).await?;
+        assert_eq!(update.checkpoint_sync_info.checkpoint_id, 0);
+        assert_eq!(update.checkpoint_sync_info.coordinator_id, 1);
+        assert_eq!(update.checkpoint_sync_info.coordinator_sub_id, 2);
+        assert_eq!(update.checkpoint_sync_info.coordinator_unique_pending_id, 0);
+        assert_eq!(update.checkpoint_sync_info.checkpoint_leaf, processor.last_committed.checkpoint_leaf);
+        assert_eq!(update.checkpoint_sync_info.state_roots, processor.last_committed.checkpoint_state_roots);
+        assert_eq!(update.checkpoint_sync_info.block_state, processor.last_committed.l2_state);
+        // no reward tree node key exists at genesis: the proof is the empty one
+        assert!(update.reward_tree_top_proof.is_empty());
+
+        // a checkpoint that was never committed must fail
+        assert!(env.handler.get_realm_sync_info_internal(0, 9).await.is_err());
+        Ok(())
+    }
+
+    fn valid_deploy_contract_v2() -> PQBCDeployContractV2<PHash> {
+        let deploy_contract = PQBCDeployContract::new(
+            PHash::from_values(9, 0, 0, 0),
+            ContractCodeDefinition {
+                state_tree_height: 8,
+                functions: vec![ContractFunctionCodeDefinition::qp_rand_gen()],
+            },
+            vec![PHash::from_values(2, 0, 0, 0)],
+            PHash::from_values(3, 0, 0, 0),
+        );
+        PQBCDeployContractV2 {
+            deploy_contract,
+            layout_protocol_version: 1,
+            state_layout_root: PHash::from_values(6, 0, 0, 0),
+            state_layout_field_count: 1,
+            state_layout_slot_count: 4,
+            canonical_layout_verifier_fingerprint: PHash::from_values(7, 0, 0, 0),
+            canonical_layout_proof: vec![1, 2, 3, 4],
+        }
+    }
+
+    #[tokio::test]
+    async fn deploy_contract_publishes_queue_item_and_content_hash() -> anyhow::Result<()> {
+        let env = EdgeTestEnv::create().await?;
+
+        let hex = env.handler.deploy_contract_internal(valid_deploy_contract_v2()).await?;
+        assert_eq!(hex.len(), 64, "content hash must be a 64-char hex string");
+        assert_eq!(env.contract_queue.published_count(), 1);
+
+        // shape validation: zero layout protocol version is rejected before publishing
+        let mut bad = valid_deploy_contract_v2();
+        bad.layout_protocol_version = 0;
+        let err = env.handler.deploy_contract_internal(bad).await.expect_err("invalid shape must fail");
+        assert!(err.to_string().contains("layout protocol version"), "unexpected error: {err}");
+        assert_eq!(env.contract_queue.published_count(), 1);
+
+        // The claimed verifier fingerprint must match the verifier configured
+        // by the node before the request can reach the queue.
+        let mut bad_fingerprint = valid_deploy_contract_v2();
+        bad_fingerprint.canonical_layout_verifier_fingerprint =
+            PHash::from_values(8, 0, 0, 0);
+        let err = env
+            .handler
+            .deploy_contract_internal(bad_fingerprint)
+            .await
+            .expect_err("wrong canonical layout verifier fingerprint must fail");
+        assert!(err.to_string().contains("fingerprint mismatch"), "unexpected error: {err}");
+        assert_eq!(env.contract_queue.published_count(), 1);
+
+        // Matching metadata is insufficient: the proof bytes themselves must
+        // verify against the node's canonical layout circuit.
+        let mut bad_proof = valid_deploy_contract_v2();
+        bad_proof.canonical_layout_proof = vec![4, 3, 2, 1];
+        let err = env
+            .handler
+            .deploy_contract_internal(bad_proof)
+            .await
+            .expect_err("invalid canonical layout proof must fail");
+        assert!(err.to_string().contains("proof verification failed"), "unexpected error: {err}");
+        assert_eq!(env.contract_queue.published_count(), 1);
+
+        // contracts without functions are rejected
+        let mut no_functions = valid_deploy_contract_v2();
+        no_functions.deploy_contract = PQBCDeployContract::new(
+            PHash::from_values(9, 0, 0, 0),
+            ContractCodeDefinition { state_tree_height: 8, functions: vec![] },
+            vec![PHash::from_values(2, 0, 0, 0)],
+            PHash::from_values(3, 0, 0, 0),
+        );
+        let err = env.handler.deploy_contract_internal(no_functions).await.expect_err("empty contract must fail");
+        assert!(err.to_string().contains("no functions"), "unexpected error: {err}");
+        assert_eq!(env.contract_queue.published_count(), 1);
+        Ok(())
+    }
+
+    async fn seed_contract(db: &TestUnifiedDatabaseStore) -> anyhow::Result<()> {
+        let leaf = PQEDContractLeafV2::<PF, PHash> {
+            deployer: PHash::from_values(11, 0, 0, 0),
+            function_tree_root: PHash::from_values(12, 0, 0, 0),
+            code_root: PHash::from_values(13, 0, 0, 0),
+            state_tree_height: PF::from_u64_value(8),
+            state_layout_root: PHash::from_values(14, 0, 0, 0),
+            state_layout_field_count: PF::from_u64_value(1),
+            state_layout_slot_count: PF::from_u64_value(4),
+        };
+        db.set_contract_leaf(0, 1, &leaf).await?;
+        Ok(())
+    }
+
+    fn valid_update_contract() -> PQBCUpdateContract<PHash> {
+        PQBCUpdateContract {
+            contract_id: 1,
+            deployer: PHash::from_values(11, 0, 0, 0),
+            code_definition: ContractCodeDefinition {
+                state_tree_height: 8,
+                functions: vec![ContractFunctionCodeDefinition::qp_rand_gen()],
+            },
+            function_whitelist: vec![PHash::from_values(15, 0, 0, 0)],
+            code_root: PHash::from_values(16, 0, 0, 0),
+            layout_protocol_version: 1,
+            state_layout_root: PHash::from_values(17, 0, 0, 0),
+            state_layout_field_count: 1,
+            state_layout_slot_count: 4,
+            canonical_layout_verifier_fingerprint: PHash::from_values(7, 0, 0, 0),
+            canonical_layout_proof: vec![5, 6, 7, 8],
+        }
+    }
+
+    #[tokio::test]
+    async fn update_contract_validates_against_committed_state() -> anyhow::Result<()> {
+        let env = EdgeTestEnv::create().await?;
+        seed_contract(&env.db).await?;
+        let handler = &env.handler;
+
+        // happy path: original deployer, immutable height kept as committed
+        let hex = handler.update_contract_internal(valid_update_contract()).await?;
+        assert_eq!(hex.len(), 64);
+        assert_eq!(env.contract_queue.published_count(), 1);
+
+        let mut bad_fingerprint = valid_update_contract();
+        bad_fingerprint.canonical_layout_verifier_fingerprint =
+            PHash::from_values(18, 0, 0, 0);
+        let err = handler
+            .update_contract_internal(bad_fingerprint)
+            .await
+            .expect_err("wrong canonical layout verifier fingerprint must fail");
+        assert!(err.to_string().contains("fingerprint mismatch"), "unexpected error: {err}");
+        assert_eq!(env.contract_queue.published_count(), 1);
+
+        let mut bad_proof = valid_update_contract();
+        bad_proof.canonical_layout_proof = vec![8, 7, 6, 5];
+        let err = handler
+            .update_contract_internal(bad_proof)
+            .await
+            .expect_err("invalid canonical layout proof must fail");
+        assert!(err.to_string().contains("proof verification failed"), "unexpected error: {err}");
+        assert_eq!(env.contract_queue.published_count(), 1);
+
+        // reserved contract id 0
+        let mut bad = valid_update_contract();
+        bad.contract_id = 0;
+        let err = handler.update_contract_internal(bad).await.expect_err("contract id 0 must be rejected");
+        assert!(err.to_string().contains("non-zero"), "unexpected error: {err}");
+
+        // unknown contract id
+        let mut unknown = valid_update_contract();
+        unknown.contract_id = 9;
+        let err = handler.update_contract_internal(unknown).await.expect_err("unknown contract must be rejected");
+        assert!(err.to_string().contains("does not exist"), "unexpected error: {err}");
+
+        // wrong deployer
+        let mut other_deployer = valid_update_contract();
+        other_deployer.deployer = PHash::from_values(99, 0, 0, 0);
+        let err = handler.update_contract_internal(other_deployer).await.expect_err("wrong deployer must be rejected");
+        assert!(err.to_string().contains("only the original deployer"), "unexpected error: {err}");
+
+        // state tree height is immutable
+        let mut other_height = valid_update_contract();
+        other_height.code_definition = ContractCodeDefinition {
+            state_tree_height: 9,
+            functions: vec![ContractFunctionCodeDefinition::qp_rand_gen()],
+        };
+        let err = handler.update_contract_internal(other_height).await.expect_err("height change must be rejected");
+        assert!(err.to_string().contains("immutable"), "unexpected error: {err}");
+
+        // no functions
+        let mut no_functions = valid_update_contract();
+        no_functions.code_definition.functions = vec![];
+        let err = handler.update_contract_internal(no_functions).await.expect_err("empty contract must be rejected");
+        assert!(err.to_string().contains("no functions"), "unexpected error: {err}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batch_reward_proofs_empty_and_seeded() -> anyhow::Result<()> {
+        let env = EdgeTestEnv::create().await?;
+
+        // no jobs requested: no proofs
+        let empty = env.handler.generate_batch_proof_miner_reward_proofs_internal(0, vec![]).await?;
+        assert!(empty.is_empty());
+
+        // seed one node in the rewards tag tree and request its proof
+        let root_key = parth_core::data::hash::merkle_node_key::SimpleMerkleNodeKey::new_root();
+        env.db
+            .rewards_tag_tree_set_node_tag(0, root_key, zh(40), zh(41))
+            .await?;
+        let job_id = QProvingJobDataIDWithRewardPath::new(
+            QProvingJobDataID::qp_rand_gen(),
+            root_key.to_reward_path_info(),
+        );
+        let proofs = env
+            .handler
+            .generate_batch_proof_miner_reward_proofs_internal(0, vec![job_id])
+            .await?;
+        assert_eq!(proofs.len(), 1);
+        Ok(())
+    }
+
+    fn guta_input() -> GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<PF, PHash> {
+        let mut input = GlobalUserTreeAggregatorHeaderWithTagValueAndJobType::<PF, PHash>::qp_rand_gen();
+        input.header.header.state_transition.node_level = PF::from_u64_value(
+            N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT as u64,
+        );
+        input.header.header.state_transition.node_index = PF::from_u64_value(0);
+        input.job_type_u32 = psy_core::job::job_id::ProvingJobCircuitType::GUTANoChange as u32;
+        input
+    }
+
+    #[tokio::test]
+    async fn submit_guta_rejects_invalid_headers() -> anyhow::Result<()> {
+        let env = EdgeTestEnv::create().await?;
+        let handler = &env.handler;
+
+        // wrong node level
+        let mut bad_level = guta_input();
+        bad_level.header.header.state_transition.node_level = PF::from_u64_value(5);
+        let err = handler.submit_guta_internal(bad_level, vec![]).await.expect_err("wrong level must fail");
+        assert!(err.to_string().contains("invalid realm level"), "unexpected error: {err}");
+
+        // realm id beyond the coordinator tree capacity
+        let mut bad_realm = guta_input();
+        bad_realm.header.header.state_transition.node_index =
+            PF::from_u64_value((1u64 << N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT) + 1);
+        let err = handler.submit_guta_internal(bad_realm, vec![]).await.expect_err("invalid realm id must fail");
+        assert!(err.to_string().contains("invalid realm id"), "unexpected error: {err}");
+
+        // unknown circuit type
+        let mut bad_type = guta_input();
+        bad_type.job_type_u32 = 999_999;
+        assert!(handler.submit_guta_internal(bad_type, vec![]).await.is_err());
+
+        // stale realm root
+        let mut stale = guta_input();
+        stale.header.header.state_transition.old_node_value = PHash::from_values(123, 0, 0, 0);
+        let err = handler.submit_guta_internal(stale, vec![]).await.expect_err("stale root must fail");
+        assert!(err.to_string().contains("stale GUTA update rejected"), "unexpected error: {err}");
+
+        // double submission for the same realm + pending id
+        let mut input = guta_input();
+        let realm_key = parth_core::data::hash::merkle_node_key::SimpleMerkleNodeKey {
+            level: N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+            index: 0,
+        };
+        let current_root = env
+            .db
+            .global_user_tree_get_node_and_checkpoint_id_max_checkpoint(0, &realm_key)
+            .await?;
+        input.header.header.state_transition.old_node_value = current_root.value;
+        env.temp_db
+            .set_submitted_status_for_pending(&QRealmIdentifier::new(1, 2), 0, 0, 1)
+            .await?;
+        let err = handler.submit_guta_internal(input, vec![]).await.expect_err("double submit must fail");
+        assert!(err.to_string().contains("already been submitted"), "unexpected error: {err}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn submit_guta_rejects_realm_id_at_tree_capacity() -> anyhow::Result<()> {
+        let env = EdgeTestEnv::create().await?;
+        let handler = &env.handler;
+        let mut input = guta_input();
+        input.header.header.state_transition.node_index =
+            PF::from_u64_value(1u64 << N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT);
+
+        let err = handler
+            .submit_guta_internal(input, vec![])
+            .await
+            .expect_err("realm id equal to tree capacity must fail");
+        assert!(err.to_string().contains("invalid realm id"), "unexpected error: {err}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn submit_guta_happy_path_stores_proof_and_publishes() -> anyhow::Result<()> {
+        let env = EdgeTestEnv::create().await?;
+        let handler = &env.handler;
+
+        let mut input = guta_input();
+        let realm_key = parth_core::data::hash::merkle_node_key::SimpleMerkleNodeKey {
+            level: N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+            index: 0,
+        };
+        let current_root = env
+            .db
+            .global_user_tree_get_node_and_checkpoint_id_max_checkpoint(0, &realm_key)
+            .await?;
+        input.header.header.state_transition.old_node_value = current_root.value;
+
+        handler.submit_guta_internal(input, vec![]).await?;
+
+        // the queue item was published and the proof stored for the derived job id
+        assert_eq!(env.guta_queue.published_count(), 1);
+        let job_id = QProvingJobDataID::try_get_coordinator_edge_proof_store_output_proof_id_for_realm_submit(
+            0,
+            N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+            0,
+            psy_core::job::job_id::ProvingJobCircuitType::GUTANoChange,
+        )?;
+        assert!(env.temp_db.contains_proof_for_job_id(job_id, 0).await?);
+
+        // a second submission for the same realm is rejected by the status guard
+        let mut second = guta_input();
+        second.header.header.state_transition.old_node_value = current_root.value;
+        let err = handler.submit_guta_internal(second, vec![]).await.expect_err("double submit must fail");
+        assert!(err.to_string().contains("already been submitted"), "unexpected error: {err}");
         Ok(())
     }
 }

@@ -1867,3 +1867,381 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("checkpoint ID 367"));
     }
 }
+
+/// Integration tests for `PsyCoordinatorDatabaseProcessor` running against the
+/// real in-memory database stack (`InMemoryCoreStore` +
+/// `PsyUnifiedCoreDatabaseStore` + `InMemoryTempStore`), the mock memory file
+/// system, and fake queues from `crate::test_common` — fully offline.
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use crate::test_common::{
+        create_test_unified_db, FakeEphemeralQueueSubscriber, FakeWorkerQueuePublisher, TestNetworkConfig,
+        TestUnifiedDatabaseStore,
+    };
+    use parth_core::{node::realm_identifier::QRealmIdentifier, protocol::core_types::QNetworkTreeConstants, utils::QPGenRandom, PHash, PF};
+    use psy_node_core::psy_core_db::traits::full::{
+        PsyNodeCheckpointObjectDatabaseReader, PsyNodeCheckpointTransitionZKProofDatabaseReader,
+        PsyNodeContractFunctionTreeDatabaseReader, PsyNodeCoreDatabaseBasicContractInfoStoreReader,
+        PsyNodeCoreDatabaseContractObjectStoreReader, PsyNodeGlobalContractTreeDatabaseReader,
+    };
+    use psy_data::{
+        config::network_config::PsyNodeCircuitFingerprintConfig,
+        genesis::genesis_block_setup::PsyGenesisBlockSetupData,
+        v1::qdata::{
+            checkpoint::PQEDCheckpointLeafStats,
+            contract::{ContractCodeDefinition, PQBCDeployContract},
+        },
+    };
+    use psy_node_core::{file::memory_fs::SimpleMockMemoryFileSystem, genesis::genesis_db_data_builder::GenesisDatabaseDataBuilder};
+    use psy_node_store_memory::temp_store::InMemoryTempStore;
+
+    type N = TestNetworkConfig;
+
+    type TestProcessor = PsyCoordinatorDatabaseProcessor<
+        N,
+        TestUnifiedDatabaseStore,
+        TestUnifiedDatabaseStore,
+        FakeEphemeralQueueSubscriber,
+        FakeEphemeralQueueSubscriber,
+        FakeEphemeralQueueSubscriber,
+        FakeWorkerQueuePublisher,
+        InMemoryTempStore,
+        InMemoryTempStore,
+        SimpleMockMemoryFileSystem,
+    >;
+
+    fn zh(level: usize) -> PHash {
+        parth_core::pgoldilocks::PoseidonHasher::get_zero_hash(level)
+    }
+
+    fn fingerprint_config() -> PsyNodeCircuitFingerprintConfig<PHash> {
+        PsyNodeCircuitFingerprintConfig {
+            guta_circuit_whitelist_root: zh(21),
+            register_users_circuit_whitelist_root: zh(22),
+            deploy_contracts_circuit_whitelist_root: zh(23),
+            update_contracts_circuit_whitelist_root: zh(24),
+            checkpoint_state_transition_circuit_fingerprint: zh(25),
+            genesis_checkpoint_state_transition_fingerprint: zh(26),
+        }
+    }
+
+    fn genesis_setup_data() -> PsyGenesisBlockSetupData<PF, PHash> {
+        let contract = PQBCDeployContract::new(
+            PHash::from_values(1, 0, 0, 0),
+            ContractCodeDefinition { state_tree_height: 8, functions: vec![] },
+            vec![PHash::from_values(2, 0, 0, 0)],
+            PHash::from_values(3, 0, 0, 0),
+        );
+        PsyGenesisBlockSetupData {
+            contracts: vec![contract],
+            users: vec![],
+            checkpoint_stats: PQEDCheckpointLeafStats::qp_rand_gen(),
+            deposit_tree_root: PHash::from_values(4, 0, 0, 0),
+            withdrawal_tree_root: PHash::from_values(5, 0, 0, 0),
+        }
+    }
+
+    struct CoordinatorDbTestEnv {
+        processor: TestProcessor,
+        db: Arc<TestUnifiedDatabaseStore>,
+        guta_queue: Arc<FakeEphemeralQueueSubscriber>,
+        register_queue: Arc<FakeEphemeralQueueSubscriber>,
+        deploy_queue: Arc<FakeEphemeralQueueSubscriber>,
+        proof_queue: Arc<FakeWorkerQueuePublisher>,
+        file_system: Arc<SimpleMockMemoryFileSystem>,
+        genesis_transition: PsyVerifiableCheckpointTransition<PF, PHash>,
+        genesis_data: PsyGenesisBlockSetupData<PF, PHash>,
+    }
+
+    impl CoordinatorDbTestEnv {
+        async fn create() -> anyhow::Result<Self> {
+            let db = Arc::new(create_test_unified_db().await?);
+            let tag_tree_rewards_store = Arc::clone(&db);
+            let temp_db = Arc::new(InMemoryTempStore::new("coord_test".to_string(), 1, 2));
+            let proof_store = Arc::clone(&temp_db);
+            let guta_queue = Arc::new(FakeEphemeralQueueSubscriber::new());
+            let register_queue = Arc::new(FakeEphemeralQueueSubscriber::new());
+            let deploy_queue = Arc::new(FakeEphemeralQueueSubscriber::new());
+            let proof_queue = Arc::new(FakeWorkerQueuePublisher::new());
+            let file_system = Arc::new(SimpleMockMemoryFileSystem::new());
+            let genesis_data = genesis_setup_data();
+            let fp_config = fingerprint_config();
+            let (genesis_transition, _genesis_block_update) = GenesisDatabaseDataBuilder::<PF, PHash>::setup_for_coordinator::<
+                parth_core::pgoldilocks::PoseidonHasher,
+                N,
+            >(&genesis_data, fp_config.checkpoint_state_transition_circuit_fingerprint)?;
+
+            let processor = TestProcessor::new_init(
+                Arc::clone(&db),
+                tag_tree_rewards_store,
+                temp_db,
+                proof_store,
+                Arc::clone(&guta_queue),
+                Arc::clone(&register_queue),
+                Arc::clone(&deploy_queue),
+                Arc::clone(&proof_queue),
+                QRealmIdentifier::new(1, 2),
+                fp_config,
+                genesis_transition.clone(),
+                Arc::clone(&file_system),
+                "checkpoint_tree_backup.bin".to_string(),
+            )
+            .await?;
+
+            Ok(Self {
+                processor,
+                db,
+                guta_queue,
+                register_queue,
+                deploy_queue,
+                proof_queue,
+                file_system,
+                genesis_transition,
+                genesis_data,
+            })
+        }
+
+        async fn create_with_genesis_committed() -> anyhow::Result<Self> {
+            let mut env = Self::create().await?;
+            env.processor.ensure_genesis_applied_from_setup_data(&env.genesis_data).await?;
+            Ok(env)
+        }
+    }
+
+    #[tokio::test]
+    async fn new_init_on_fresh_database_reports_needs_genesis() -> anyhow::Result<()> {
+        let env = CoordinatorDbTestEnv::create().await?;
+        let processor = &env.processor;
+
+        assert_eq!(processor.get_database_check_state().await?, DatabaseCheckState::NeedsGenesis);
+        assert_eq!(processor.get_next_checkpoint_id().await?, 1);
+        assert_eq!(processor.get_latest_checkpoint_id_internal().await?, 0);
+        // no pending-id mapping exists yet on a fresh database: (pending_id, unique_id) = (0, 0)
+        assert_eq!(processor.get_current_unique_pending_id_internal().await?, (0, 0));
+
+        assert_eq!(processor.ids.checkpoint_id, 0);
+        assert_eq!(processor.ids.next_checkpoint_id, 1);
+        assert_eq!(processor.ids.unique_pending_id, 0);
+        assert_eq!(processor.ids.gathering_unique_pending_id, 0);
+        assert!(!processor.needs_revert);
+
+        // the genesis hash is taken straight from the provided verifiable transition
+        assert_eq!(
+            processor.genesis_checkpoint_state_transition_hash,
+            env.genesis_transition.state_transition.genesis_checkpoint_state_transition_hash,
+        );
+        // fresh checkpoint tree: root at checkpoint 0 is the zero root
+        assert_eq!(processor.last_committed.checkpoint_root, zh(N::CHECKPOINT_TREE_HEIGHT_USIZE));
+
+        // queue key managers start parked on the initial unique id
+        assert_eq!(processor.guta_queue_key_status_manager.get_queue_key()?.unique_id, 0);
+        assert_eq!(processor.register_user_queue_key_status_manager.get_queue_key()?.unique_id, 0);
+        assert_eq!(processor.deploy_contract_queue_key_status_manager.get_queue_key()?.unique_id, 0);
+        assert_eq!(processor.update_contract_queue_key_status_manager.get_queue_key()?.unique_id, 0);
+
+        // worker queue key mirrors the processing ids
+        let proof_key = processor.get_proof_worker_queue_key();
+        assert_eq!(proof_key.realm_id, 1);
+        assert_eq!(proof_key.realm_sub_id, 2);
+        assert_eq!(proof_key.unique_id, 0);
+
+        processor.print_coordinator_processor_state();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn genesis_commit_flips_state_to_ready_and_persists_everything() -> anyhow::Result<()> {
+        let mut env = CoordinatorDbTestEnv::create().await?;
+        env.processor.ensure_genesis_applied_from_setup_data(&env.genesis_data).await?;
+
+        let processor = &env.processor;
+        assert_eq!(processor.get_database_check_state().await?, DatabaseCheckState::Ready);
+        // genesis commits checkpoint 0, so the next checkpoint is 1
+        assert_eq!(processor.get_latest_checkpoint_id_internal().await?, 0);
+        assert_eq!(processor.get_next_checkpoint_id().await?, 1);
+        assert_eq!(processor.get_current_unique_pending_id_internal().await?, (0, 0u128));
+        assert_eq!(processor.ids.checkpoint_id, 0);
+        assert!(!processor.needs_revert);
+
+        let genesis_leaf_hash = processor.last_committed.checkpoint_leaf_hash;
+        assert_ne!(genesis_leaf_hash, zh(N::CHECKPOINT_TREE_HEIGHT_USIZE));
+
+        // the checkpoint tree now carries the genesis leaf at index 0 and the
+        // root-hash -> checkpoint-id mapping is recorded
+        let new_root = env.db.checkpoint_tree_get_root_hash(0).await?;
+        assert_eq!(new_root, processor.checkpoint_tree_backup_manager.checkpoint_tree.get_root());
+        assert_eq!(env.db.checkpoint_tree_get_leaf_hash(0, 0).await?, genesis_leaf_hash);
+        assert_eq!(env.db.get_checkpoint_id_for_checkpoint_root_hash(new_root).await?, Some(0));
+
+        // l2 block state + checkpoint leaf + state roots are persisted
+        assert_eq!(env.db.get_l2_block_state(0).await?, processor.last_committed.l2_state);
+        assert_eq!(env.db.get_checkpoint_leaf_data(0).await?, processor.last_committed.checkpoint_leaf);
+        assert_eq!(
+            env.db.get_checkpoint_global_state_roots(0).await?,
+            processor.last_committed.checkpoint_state_roots,
+        );
+
+        // the genesis contract from the setup data is persisted with its code definition
+        let contract_leaf = env.db.get_contract_leaf(0, 0).await?;
+        let code_definition = env.db.get_contract_code_definition(0, 0).await?;
+        assert_eq!(code_definition.state_tree_height, 8);
+        assert_eq!(env.db.get_contract_tree_heights(0, &[0]).await?, vec![8]);
+        assert_eq!(
+            env.db.contract_function_tree_get_root_hash(0, 0).await?,
+            contract_leaf.function_tree_root,
+        );
+        let contract_tree_proof = env.db.global_contract_tree_get_merkle_proof(0, 0).await?;
+        assert!(contract_tree_proof.verify::<parth_core::pgoldilocks::PoseidonHasher>());
+        assert_eq!(contract_tree_proof.value, contract_leaf.qfhash::<parth_core::pgoldilocks::PoseidonHasher>());
+
+        // the verifiable transition with proof is stored and retrievable
+        let stored = env.db.get_verifiable_checkpoint_state_transition_and_zkp(0).await?;
+        assert_eq!(stored.circuit_type, ProvingJobCircuitType::GenesisBlockCheckpointStateTransition as u32);
+        assert!(stored.zk_proof.is_empty());
+
+        // processor state agrees with the canonical genesis transition
+        processor.ensure_db_matches_verifiable_transition(&env.genesis_transition).await?;
+
+        // a second ensure call must be a no-op (state is already Ready)
+        env.processor.ensure_genesis_applied_from_setup_data(&env.genesis_data).await?;
+        assert_eq!(env.processor.get_latest_checkpoint_id_internal().await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn commit_state_rejects_inconsistent_updates() -> anyhow::Result<()> {
+        let mut env = CoordinatorDbTestEnv::create().await?;
+        let (_, genesis_block_update) = GenesisDatabaseDataBuilder::<PF, PHash>::setup_for_coordinator::<parth_core::pgoldilocks::PoseidonHasher, N>(
+            &env.genesis_data,
+            env.processor.circuit_fingerprint_config.checkpoint_state_transition_circuit_fingerprint,
+        )?;
+
+        // tampered new leaf hash
+        let mut tampered = genesis_block_update.clone();
+        tampered.new_base.checkpoint_leaf_hash = zh(99);
+        let err = match env.processor
+            .commit_state(tampered, ProvingJobCircuitType::GenesisBlockCheckpointStateTransition, vec![])
+            .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("commit with a tampered checkpoint leaf hash must fail"),
+        };
+        assert!(err.to_string().contains("Checkpoint leaf hash mismatch"), "unexpected error: {err}");
+
+        // tampered old leaf hash (must match the processor's last committed leaf)
+        let mut tampered = genesis_block_update.clone();
+        tampered.old_base.checkpoint_leaf_hash = zh(98);
+        let err = match env.processor
+            .commit_state(tampered, ProvingJobCircuitType::GenesisBlockCheckpointStateTransition, vec![])
+            .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("commit with a tampered old checkpoint leaf hash must fail"),
+        };
+        assert!(err.to_string().contains("Old checkpoint leaf hash mismatch"), "unexpected error: {err}");
+
+        // nothing was committed by the failed attempts
+        assert_eq!(env.processor.get_latest_checkpoint_id_internal().await?, 0);
+        assert_eq!(env.processor.get_database_check_state().await?, DatabaseCheckState::NeedsGenesis);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_new_unique_ids_rotates_ids_and_ensures_all_consumers() -> anyhow::Result<()> {
+        let mut env = CoordinatorDbTestEnv::create_with_genesis_committed().await?;
+
+        // gathering proc id is 0 on a freshly-initialized coordinator, so the
+        // genesis consumer pass also runs: every queue gets consumers for both
+        // the new unique id and the gathering (0) one; the deploy queue also
+        // serves the update-contract key, so it doubles up.
+        env.processor.set_new_unique_ids().await?;
+
+        assert_eq!(env.processor.ids.unique_pending_id, 0);
+        assert_eq!(env.processor.ids.gathering_unique_pending_id, 1);
+        assert_ne!(env.processor.ids.gathering_proc_checkpoint_unique_id, 0);
+        assert_eq!(env.guta_queue.ensured_consumer_count(), 2);
+        assert_eq!(env.register_queue.ensured_consumer_count(), 2);
+        assert_eq!(env.deploy_queue.ensured_consumer_count(), 4);
+        assert_eq!(env.proof_queue.ensured_consumer_count(), 2);
+
+        // a second rotation moves the previous gathering id into the processing slot
+        env.processor.set_new_unique_ids().await?;
+        assert_eq!(env.processor.ids.unique_pending_id, 1);
+        assert_eq!(env.processor.ids.gathering_unique_pending_id, 2);
+        // gathering proc id is no longer zero, so only one consumer pass runs now
+        assert_eq!(env.guta_queue.ensured_consumer_count(), 3);
+        assert_eq!(env.deploy_queue.ensured_consumer_count(), 6);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reset_to_checkpoint_zero_rebuilds_state_and_keeps_backup() -> anyhow::Result<()> {
+        let mut env = CoordinatorDbTestEnv::create_with_genesis_committed().await?;
+        let genesis_leaf_hash = env.processor.last_committed.checkpoint_leaf_hash;
+        let checkpoint_root = env.processor.last_committed.checkpoint_root;
+        let genesis_fp = env.processor.circuit_fingerprint_config.genesis_checkpoint_state_transition_fingerprint;
+
+        // refusing to reset to a checkpoint that does not exist yet
+        let err = match env.processor.reset_to_checkpoint(1).await {
+            Err(err) => err,
+            Ok(_) => panic!("reset to a future checkpoint must fail"),
+        };
+        assert!(err.to_string().contains("Cannot reset coordinator to checkpoint 1"), "unexpected error: {err}");
+
+        env.processor.reset_to_checkpoint(0).await?;
+
+        let processor = &env.processor;
+        assert!(processor.needs_revert);
+        assert_eq!(processor.ids.checkpoint_id, 0);
+        assert_eq!(processor.ids.next_checkpoint_id, 1);
+        assert_eq!(processor.ids.unique_pending_id, 0);
+        assert_eq!(processor.ids.gathering_unique_pending_id, 0);
+        assert_eq!(processor.last_committed.checkpoint_leaf_hash, genesis_leaf_hash);
+        assert_eq!(processor.last_committed.checkpoint_root, checkpoint_root);
+
+        // chain hash for genesis: H(H(root, leaf), genesis_fingerprint)
+        let root_leaf = parth_core::pgoldilocks::PoseidonHasher::q_two_to_one(checkpoint_root, genesis_leaf_hash);
+        let expected_chain_hash = parth_core::pgoldilocks::PoseidonHasher::q_two_to_one(root_leaf, genesis_fp);
+        assert_eq!(processor.last_committed.last_chain_hash, expected_chain_hash);
+
+        // reset wrote the pre-reset backup artifacts next to the checkpoint backup
+        // (the manifest write runs inside reset; assert the reset-backup directory
+        // exists by opening the checkpoint backup file again, which still must work)
+        let mut backup_file = env
+            .file_system
+            .file_like_fs_open("checkpoint_tree_backup.bin")
+            .await?;
+        let mut bytes = Vec::new();
+        use tokio::io::AsyncReadExt;
+        backup_file.read_to_end(&mut bytes).await?;
+        assert!(!bytes.is_empty(), "checkpoint backup file must survive the reset");
+
+        // database stayed consistent for the genesis checkpoint
+        assert_eq!(processor.get_database_check_state().await?, DatabaseCheckState::Ready);
+        assert_eq!(env.db.get_latest_checkpoint_id().await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_reward_tree_root_reads_tag_tree_and_rejects_missing_roots() -> anyhow::Result<()> {
+        let mut env = CoordinatorDbTestEnv::create_with_genesis_committed().await?;
+
+        // seed one node into the rewards tag tree for unique_pending_id 0 so a
+        // real root exists, then read it back through the processor
+        use parth_core::data::hash::merkle_node_key::SimpleMerkleNodeKey;
+        let root_key = SimpleMerkleNodeKey::new_root();
+        let tag = zh(40);
+        let value = zh(41);
+        env.db.rewards_tag_tree_set_node_tag(0, root_key, tag, value).await?;
+
+        let root = env.processor.get_reward_tree_root(0, 0).await?;
+        assert_ne!(root, PHash::default());
+
+        // a pending id with no tag tree data at all must fail (missing root), and
+        // a tag tree that resolves to the zero value for a nonzero pending id
+        // is treated as an inconsistency
+        assert!(env.processor.get_reward_tree_root(5, 7).await.is_err());
+        Ok(())
+    }
+}

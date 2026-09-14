@@ -383,3 +383,185 @@ impl<
         res(self.get_worker_reputation_internal(&key).await)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coordinator::edge::handler::tests::EdgeTestEnv;
+    use crate::test_common::TestNetworkConfig;
+    use parth_core::{crypto::secp256k1::get_current_time_ms, utils::QPGenRandom, PHash};
+    use psy_api_core::{
+        coordinator::standard_edge_rpc::CoordinatorEdgeRpcServer,
+        worker::standard_worker_rpc::NodeEdgeWorkerRpcServer, CheckpointJobStats,
+    };
+    use psy_data::v1::qdata::{
+        contract::{
+            ContractCodeDefinition, ContractFunctionCodeDefinition, PQBCUpdateContract,
+            PQEDContractLeafV2,
+        },
+        public_key::PZKPublicKeyInfo,
+    };
+    use parth_core::{felt::FromPrimitiveValuesFelt, PF};
+    use psy_node_core::psy_core_db::traits::full::PsyNodeCoreDatabaseContractObjectStoreWriter;
+
+    type N = TestNetworkConfig;
+
+    /// Exercises every RPC reader wrapper against a database with genesis
+    /// committed: each wrapper must route to the underlying store and map the
+    /// result into an RPC response without panicking.
+    #[tokio::test]
+    async fn rpc_reader_wrappers_serve_committed_genesis_state() -> anyhow::Result<()> {
+        let env = EdgeTestEnv::create().await?;
+        env.commit_genesis().await?;
+        let handler = &env.handler;
+
+        assert_eq!(handler.get_latest_checkpoint_id().await?, 0);
+        assert_eq!(handler.get_checkpoint_id_for_unique_pending_id(0).await?, Some(0));
+        assert_eq!(handler.get_unique_pending_id_for_checkpoint_id(0).await?, Some((0, 0)));
+
+        let stats: CheckpointJobStats = handler.get_job_stats(0).await?;
+        assert_eq!(stats.unique_pending_id, 0);
+
+        let leaf = handler.get_checkpoint_leaf_data(0).await?;
+        assert_eq!(leaf, env.db.get_checkpoint_leaf_data(0).await?);
+        handler.get_latest_l2_block_state().await?;
+        handler.get_l2_block_state(0).await?;
+        handler.get_latest_checkpoint_tree_root().await?;
+        handler.get_checkpoint_tree_root(0).await?;
+        let _ = handler.get_checkpoint_tree_leaf_hash(0, 0).await;
+        let _ = handler.get_checkpoint_tree_merkle_proof(0, 0).await;
+        handler.get_checkpoint_global_state_roots(0).await?;
+        handler.get_withdrawal_tree_root(0).await?;
+        let _ = handler.get_checkpoint_state_transition_proof(0).await;
+
+        handler.get_user_tree_root(0).await?;
+        let _ = handler.get_user_leaf_data(0, 0).await;
+        // sub-tree proofs run from a leaf level UP to a smaller root level
+        // (levels count down from the tree root at 0), mirroring the
+        // coordinator realm-sync call shape
+        let _ = handler.get_user_sub_tree_merkle_proof(0, 0, 8, 0).await;
+        let _ = handler.get_user_tree_merkle_proof(0, 0).await;
+        handler.get_user_top_tree_cap_root(0, 0, 0).await?;
+        handler.get_user_latest_top_tree_cap_root(0, 0).await?;
+        let _ = handler.get_user_top_tree_merkle_proof(0, 8, 0).await;
+
+        handler.get_user_registration_tree_root(0).await?;
+        let _ = handler.get_user_registration_tree_leaf_hash(0, 0).await;
+        handler.get_user_registration_tree_leaf_hashes(0, vec![0]).await?;
+        let _ = handler.get_user_registration_tree_merkle_proof(0, 0).await;
+
+        handler.get_contract_tree_root(0).await?;
+        let _ = handler.get_contract_tree_leaf_hash(0, 0).await;
+        let _ = handler.get_contract_tree_merkle_proof(0, 0).await;
+        handler.get_contract_tree_heights(0, vec![1]).await?;
+        handler.get_contract_tree_state_heights(0, vec![1]).await?;
+        let _ = handler.get_contract_function_tree_root(0, 0).await;
+        let _ = handler.get_contract_function_tree_leaf_hash(0, 0, 0).await;
+        let _ = handler.get_contract_function_tree_merkle_proof(0, 0, 0).await;
+        // genesis commits the contract leaf but not its code definition; seed
+        // one so the reader wrapper serves the Ok branch
+        env.db
+            .set_contract_code_definition(
+                0,
+                1,
+                &ContractCodeDefinition {
+                    state_tree_height: 8,
+                    functions: vec![ContractFunctionCodeDefinition::qp_rand_gen()],
+                },
+            )
+            .await?;
+        handler.get_contract_code_definition(1).await?;
+
+        handler.get_realm_sync_info(0, 0).await?;
+        assert!(!handler.get_checkpoint_leaves_batch_raw(0, 5).await?.is_empty());
+        handler.get_realm_root_and_last_modified_checkpoint(0, 0).await?;
+        assert!(handler.generate_batch_proof_miner_reward_proofs(0, vec![]).await?.is_empty());
+
+        // write-side wrappers: registration publishes, contract update validates
+        let public_key = PZKPublicKeyInfo::<PHash>::qp_rand_gen();
+        assert_eq!(handler.register_user(public_key.clone()).await?, "ok");
+        assert!(handler.get_user_ids_for_public_key(public_key.fingerprint, 0, 10).await?.is_empty());
+        let _ = handler.get_public_key_for_user_id(0).await;
+
+        // genesis commits the tree roots but not the contract leaf itself;
+        // seed contract id 1 (deployer/height aligned with the update below)
+        env.db
+            .set_contract_leaf(
+                0,
+                1,
+                &PQEDContractLeafV2::<PF, PHash> {
+                    deployer: PHash::from_values(1, 0, 0, 0),
+                    function_tree_root: PHash::from_values(12, 0, 0, 0),
+                    code_root: PHash::from_values(13, 0, 0, 0),
+                    state_tree_height: PF::from_u64_value(8),
+                    state_layout_root: PHash::from_values(14, 0, 0, 0),
+                    state_layout_field_count: PF::from_u64_value(1),
+                    state_layout_slot_count: PF::from_u64_value(4),
+                },
+            )
+            .await?;
+        let update = PQBCUpdateContract::<PHash> {
+            contract_id: 1,
+            deployer: PHash::from_values(1, 0, 0, 0),
+            code_definition: ContractCodeDefinition {
+                state_tree_height: 8,
+                functions: vec![ContractFunctionCodeDefinition::qp_rand_gen()],
+            },
+            function_whitelist: vec![PHash::from_values(15, 0, 0, 0)],
+            code_root: PHash::from_values(16, 0, 0, 0),
+            layout_protocol_version: 1,
+            state_layout_root: PHash::from_values(17, 0, 0, 0),
+            state_layout_field_count: 1,
+            state_layout_slot_count: 4,
+            canonical_layout_verifier_fingerprint: PHash::from_values(7, 0, 0, 0),
+            canonical_layout_proof: vec![5, 6, 7, 8],
+        };
+        assert_eq!(handler.update_contract(update).await?.len(), 64);
+        Ok(())
+    }
+
+    /// Worker-facing wrappers: input validation and signature-gated endpoints
+    /// must surface RPC errors instead of panicking.
+    #[tokio::test]
+    async fn worker_rpc_wrappers_validate_input_and_gate_on_signature() -> anyhow::Result<()> {
+        let env = EdgeTestEnv::create().await?;
+        let handler = &env.handler;
+
+        assert_eq!(
+            handler.get_realm_identifier_worker_api().await?,
+            parth_core::node::realm_identifier::QRealmIdentifier::new(1, 2)
+        );
+        handler.get_node_proving_state().await?;
+
+        // wrong-length public key hits the 33-byte input validation branch
+        let err = handler.get_worker_reputation(vec![1, 2, 3]).await;
+        assert!(err.is_err(), "short public key must be rejected");
+        // unknown wallets read back the INITIAL_WORKER_REPUTATION default of 5
+        assert_eq!(handler.get_worker_reputation(vec![0u8; 33]).await?, 5);
+
+        // signature-gated endpoints reject garbage signatures
+        let signature = QEDCompressedSecp256K1Signature::qp_rand_gen();
+        let request = SimpleTimedRequest {
+            for_target: 0,
+            request_type: 1,
+            valid_until: get_current_time_ms() + 60_000,
+            nonce: 1,
+            tag: [0u8; 32],
+        };
+        assert!(handler.get_proving_work(signature, request.clone()).await.is_err());
+        assert!(handler.get_proving_work_with_child_proofs(signature, request.clone()).await.is_err());
+        assert!(
+            handler
+                .submit_proof_raw(
+                    signature,
+                    request,
+                    psy_core::job::job_id::QProvingJobDataID::qp_rand_gen(),
+                    PHash::from_values(1, 0, 0, 0),
+                    vec![],
+                )
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
+}

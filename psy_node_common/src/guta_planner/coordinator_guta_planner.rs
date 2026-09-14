@@ -425,6 +425,13 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
             &node.header,
             &[],
         )?;
+        anyhow::ensure!(
+            node.header.state_transition.node_level.to_u64_value()
+                >= global_user_tree.get_effective_height() as u64,
+            "GUTA promotion siblings height {} exceeds input node level {}",
+            global_user_tree.get_effective_height(),
+            node.header.state_transition.node_level.to_u64_value(),
+        );
         let dmp =
             Self::apply_input_leaf_update_to_global_tree::<Hasher>(global_user_tree, &node.header);
 
@@ -453,7 +460,6 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
                     historical_checkpoint_proof: checkpoint_tree.get_historical_index_append_only_merkle_proof_for_root(node.header.checkpoint_tree_root, current_checkpoint_index)?,
                     total_aggregation_proofs_generated: node.header.total_aggregation_proofs_generated,
                 };
-
                 (
                     input.psy_ser_to_bytes_vec()?,
                     input.get_new_guta_header::<Hasher>(),
@@ -705,7 +711,7 @@ mod tests {
     };
     use parth_core::{
         crypto::hash::traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable},
-        felt::{FromPrimitiveValuesFelt, ZeroableFelt},
+        felt::{FromPrimitiveValuesFelt, ToU64Value, ZeroableFelt},
         node::realm_identifier::QRealmIdentifier,
         pgoldilocks::PoseidonHasher,
         utils::{QPGenRandom, math::log2_ceil},
@@ -719,13 +725,13 @@ mod tests {
             header_extended::{GlobalUserTreeAggregatorHeaderWithJobId, GlobalUserTreeAggregatorHeaderWithTagValue, GlobalUserTreeAggregatorHeaderWithTagValueAndJobID},
             stats::GUTAStats,
             sub_tree_transition::SubTreeNodeStateTransition,
-        }, proof_input::guta::{GUTANoChangeFullInput, GUTAVerifyLeftLinearRightLeafUpgradeCheckpointCircuitInput, GUTAVerifyTwoGUTACircuitInputV2, GUTAVerifyTwoGUTALinearCircuitInput, GUTAVerifyTwoGUTAUpgradeCheckpointCircuitInputV2, VerifyGUTAToCapUpgradeCheckpointCircuitInputSimple}, v1::qdata::{
-            checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, PQEDCheckpointLeafCompact, PQEDCheckpointLeafStats},
+        }, proof_input::guta::{GUTANoChangeFullInput, GUTAVerifyLeftLinearRightLeafUpgradeCheckpointCircuitInput, GUTAVerifyTwoGUTACircuitInputV2, GUTAVerifyTwoGUTALinearCircuitInput, GUTAVerifyTwoGUTAUpgradeCheckpointCircuitInputV2, VerifyGUTAToCapCircuitInputSimple, VerifyGUTAToCapUpgradeCheckpointCircuitInputSimple}, v1::qdata::{
+            checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, PQEDCheckpointLeafCompact, PQEDCheckpointLeafCompactWithStateRoots, PQEDCheckpointLeafStats},
             pm_jobs_completed_stats::PPMJobsCompletedStats,
             pm_rewards_commitment::PPMRewardCommitment,
-        }, worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId
+        }, worker::{metadata::PsyProvingJobMetadata, metadata_with_job_id::PsyProvingJobMetadataWithJobId}
     };
-    use psy_node_core::psy_temp_db::StandardProcessorTempDBStoreBase;
+    use psy_node_core::psy_temp_db::{QTempDBProofWitnessReader, QTempDBProofWitnessWriter, StandardProcessorTempDBStoreBase};
     use psy_node_store_memory::temp_store::InMemoryTempStore;
     use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
     use rand::Rng;
@@ -800,6 +806,24 @@ mod tests {
                     },
                     ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade => {
                         let witness = VerifyGUTAToCapUpgradeCheckpointCircuitInputSimple::<F, Hash>::psy_ser_from_slice(&data)?;
+                        anyhow::ensure!(
+                            witness.guta_proof_header.state_transition.node_level.to_u64_value()
+                                >= witness.top_line_siblings.len() as u64,
+                            "GUTA promotion witness siblings height {} exceeds input node level {}",
+                            witness.top_line_siblings.len(),
+                            witness.guta_proof_header.state_transition.node_level.to_u64_value(),
+                        );
+                        (witness.get_new_guta_header::<Hasher>().state_transition, witness.get_public_inputs_hash_no_rewards_tag::<Hasher>())
+                    },
+                    ProvingJobCircuitType::GUTAVerifyToCap => {
+                        let witness = VerifyGUTAToCapCircuitInputSimple::<F, Hash>::psy_ser_from_slice(&data)?;
+                        anyhow::ensure!(
+                            witness.guta_proof_header.state_transition.node_level.to_u64_value()
+                                >= witness.top_line_siblings.len() as u64,
+                            "GUTA promotion witness siblings height {} exceeds input node level {}",
+                            witness.top_line_siblings.len(),
+                            witness.guta_proof_header.state_transition.node_level.to_u64_value(),
+                        );
                         (witness.get_new_guta_header::<Hasher>().state_transition, witness.get_public_inputs_hash_no_rewards_tag::<Hasher>())
                     },
                     ProvingJobCircuitType::GUTATwoGUTALinear => {
@@ -1528,9 +1552,744 @@ mod tests {
                 has_error = true;
                 println!("Test failed: {:?}", result.err());
             }
-        
+
         if has_error {
             panic!("Some tests failed, see output above.");
         }
+    }
+
+    fn planner_test_fixture() -> (
+        QRealmIdentifier,
+        Arc<InMemoryTempStore>,
+        PsyDashMemoryAppendOnlyMerkleStore<Hasher, Hash>,
+        SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
+        Hash,
+        Hash,
+        PQEDCheckpointGlobalStateRoots<Hash>,
+        Hash,
+    ) {
+        let realm_identifier = QRealmIdentifier {
+            realm_id: 1,
+            realm_sub_id: 0,
+        };
+        let temp_store = Arc::new(InMemoryTempStore::new("coordinator-guta-planner-test".to_string(), 1, 0));
+        let checkpoint_tree = PsyDashMemoryAppendOnlyMerkleStore::<Hasher, Hash>::new(32);
+        let global_user_tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(REALM_LEVEL_U8);
+        let (checkpoint_0_leaf_hash, _, _, _, _) = gen_random_checkpoint();
+        checkpoint_tree.append_leaf(0, checkpoint_0_leaf_hash).unwrap();
+        let checkpoint_0_root = checkpoint_tree.get_root();
+        let (checkpoint_1_leaf_hash, _, stats_1, global_state_roots_1, _) = gen_random_checkpoint();
+        checkpoint_tree.append_leaf(1, checkpoint_1_leaf_hash).unwrap();
+        let checkpoint_1_root = checkpoint_tree.get_root();
+        let stats_hash_1 = stats_1.qfhash::<Hasher>();
+        (
+            realm_identifier,
+            temp_store,
+            checkpoint_tree,
+            global_user_tree,
+            checkpoint_0_root,
+            checkpoint_1_root,
+            global_state_roots_1,
+            stats_hash_1,
+        )
+    }
+
+    #[tokio::test]
+    async fn single_input_job_with_old_checkpoint_promotes_via_checkpoint_upgrade() -> anyhow::Result<()> {
+        let (realm_identifier, temp_store, checkpoint_tree, mut global_user_tree, checkpoint_0_root, checkpoint_1_root, state_roots, stats_hash) =
+            planner_test_fixture();
+        let unique_pending_id = 0u64;
+        let guta_circuit_whitelist = Hash::from_values(1, 2, 3, 4);
+
+        let job = gen_job_for_index_checkpoint(0, 7, checkpoint_0_root);
+        let mut planner = CoordinatorGUTAPlanner::<F, Hash>::new(checkpoint_1_root);
+        planner
+            .add_realm_job::<Hasher, InMemoryTempStore>(
+                unique_pending_id,
+                &checkpoint_1_root,
+                &checkpoint_tree,
+                &mut global_user_tree,
+                temp_store.clone(),
+                job.clone(),
+            )
+            .await?;
+        // same root as the synced root and nothing committed yet: the job is queued
+        assert!(!planner.has_committed_updates);
+        assert_eq!(planner.queued_updates.len(), 1);
+        assert!(planner.job_levels.is_empty());
+
+        let reward_tree_root_level = 2u8;
+        let reward_tree_root_index = 0u64;
+        let (result, reward_keys, root_header) = planner
+            .finalize_with_reward_ids(
+                &realm_identifier,
+                unique_pending_id,
+                &checkpoint_1_root,
+                &checkpoint_tree,
+                &mut global_user_tree,
+                temp_store.clone(),
+                reward_tree_root_level,
+                reward_tree_root_index,
+                state_roots,
+                stats_hash,
+                guta_circuit_whitelist,
+            )
+            .await?;
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 1);
+        let root_job = result[0][0].clone();
+        assert_eq!(root_job.job_id.circuit_type, ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade);
+        assert_eq!(root_job.metadata.dependencies, vec![job.job_id.clone()]);
+        assert_eq!(root_job.metadata.reward_tree_node_level, reward_tree_root_level);
+        assert_eq!(root_job.metadata.reward_tree_node_index, reward_tree_root_index);
+        // the promoted root header upgrades the checkpoint root to the current one
+        // and lifts the single leaf transition to the global user tree root
+        assert_eq!(root_header.checkpoint_tree_root, checkpoint_1_root);
+        assert_eq!(root_header.state_transition.new_node_value, global_user_tree.get_root());
+        assert_eq!(root_header.state_transition.node_level.to_u64_value(), 0);
+        assert_eq!(
+            root_header.total_aggregation_proofs_generated.to_u64_value(),
+            job.header.header.total_aggregation_proofs_generated.to_u64_value() + 1
+        );
+        // the input realm gets a reward key one level below the root
+        assert_eq!(reward_keys.len(), 1);
+        let reward_key = reward_keys.get(&7).expect("realm 7 reward key");
+        assert_eq!(reward_key.level, reward_tree_root_level + 1);
+        assert_eq!(reward_key.index, 0);
+
+        let input_jobs_metadata = get_job_metadata_for_input_jobs(&[job.clone()]);
+        let checker = JobCorrectnessChecker::new(input_jobs_metadata, result);
+        checker.check_jobs_correctness::<Hasher>()?;
+        checker
+            .process_job_witness::<InMemoryTempStore>(&realm_identifier, unique_pending_id, temp_store.clone(), root_job.job_id.clone(), guta_circuit_whitelist)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn single_input_job_at_current_checkpoint_promotes_with_verify_to_cap() -> anyhow::Result<()> {
+        let (realm_identifier, temp_store, checkpoint_tree, mut global_user_tree, _checkpoint_0_root, checkpoint_1_root, state_roots, stats_hash) =
+            planner_test_fixture();
+        let unique_pending_id = 0u64;
+        let guta_circuit_whitelist = Hash::from_values(1, 2, 3, 4);
+
+        let job = gen_job_for_index_checkpoint(1, 9, checkpoint_1_root);
+        let mut planner = CoordinatorGUTAPlanner::<F, Hash>::new(checkpoint_1_root);
+        planner
+            .add_realm_job::<Hasher, InMemoryTempStore>(
+                unique_pending_id,
+                &checkpoint_1_root,
+                &checkpoint_tree,
+                &mut global_user_tree,
+                temp_store.clone(),
+                job.clone(),
+            )
+            .await?;
+
+        let (result, _reward_keys, root_header) = planner
+            .finalize_with_reward_ids(
+                &realm_identifier,
+                unique_pending_id,
+                &checkpoint_1_root,
+                &checkpoint_tree,
+                &mut global_user_tree,
+                temp_store.clone(),
+                0,
+                0,
+                state_roots,
+                stats_hash,
+                guta_circuit_whitelist,
+            )
+            .await?;
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 1);
+        let root_job = &result[0][0];
+        assert_eq!(root_job.job_id.circuit_type, ProvingJobCircuitType::GUTAVerifyToCap);
+        assert_eq!(root_job.metadata.dependencies, vec![job.job_id.clone()]);
+        // the cap transition keeps the checkpoint root and ends at the global user tree root
+        assert_eq!(root_header.checkpoint_tree_root, checkpoint_1_root);
+        assert_eq!(root_header.state_transition.new_node_value, global_user_tree.get_root());
+        assert_eq!(root_header.state_transition.node_level.to_u64_value(), 0);
+
+        // the witness is stored under the emitted job id and round trips
+        let witness_bytes = temp_store
+            .get_tdb_proof_witness_bytes(&realm_identifier, unique_pending_id, root_job.job_id.clone())
+            .await?;
+        let witness = VerifyGUTAToCapCircuitInputSimple::<F, Hash>::psy_ser_from_slice(&witness_bytes)?;
+        assert_eq!(witness.guta_proof_header.state_transition.new_node_value, job.header.header.state_transition.new_node_value);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn no_input_jobs_finalizes_to_no_change_proof() -> anyhow::Result<()> {
+        let (realm_identifier, temp_store, checkpoint_tree, mut global_user_tree, _checkpoint_0_root, checkpoint_1_root, state_roots, stats_hash) =
+            planner_test_fixture();
+        let unique_pending_id = 0u64;
+        let guta_circuit_whitelist = Hash::from_values(1, 2, 3, 4);
+        let reward_tree_root_level = 3u8;
+        let reward_tree_root_index = 5u64;
+
+        let planner = CoordinatorGUTAPlanner::<F, Hash>::new(checkpoint_1_root);
+        let (result, reward_keys, root_header) = planner
+            .finalize_with_reward_ids(
+                &realm_identifier,
+                unique_pending_id,
+                &checkpoint_1_root,
+                &checkpoint_tree,
+                &mut global_user_tree,
+                temp_store.clone(),
+                reward_tree_root_level,
+                reward_tree_root_index,
+                state_roots,
+                stats_hash,
+                guta_circuit_whitelist,
+            )
+            .await?;
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 1);
+        let no_change_job = result[0][0].clone();
+        assert_eq!(no_change_job.job_id.circuit_type, ProvingJobCircuitType::GUTANoChange);
+        assert!(no_change_job.metadata.dependencies.is_empty());
+        assert_eq!(no_change_job.metadata.reward_tree_node_level, reward_tree_root_level);
+        assert_eq!(no_change_job.metadata.reward_tree_node_index, reward_tree_root_index);
+        assert!(reward_keys.is_empty());
+
+        // the returned header is the trivial identity transition on the checkpointed user tree root
+        assert_eq!(root_header.state_transition.old_node_value, state_roots.user_tree_root);
+        assert_eq!(root_header.state_transition.new_node_value, state_roots.user_tree_root);
+        assert_eq!(root_header.checkpoint_tree_root, checkpoint_1_root);
+        assert_eq!(root_header.total_aggregation_proofs_generated.to_u64_value(), 1);
+
+        // metadata hash equals a freshly computed no-change public inputs hash
+        let current_checkpoint_index = checkpoint_tree
+            .get_leaf_index_for_root(checkpoint_1_root)
+            .ok_or_else(|| anyhow::anyhow!("checkpoint root missing"))?;
+        let no_change_input = GUTANoChangeFullInput {
+            checkpoint_tree_proof: checkpoint_tree
+                .get_historical_index_append_only_merkle_proof_for_root(checkpoint_1_root, current_checkpoint_index)?,
+            checkpoint_leaf: PQEDCheckpointLeafCompactWithStateRoots {
+                checkpoint_leaf: PQEDCheckpointLeafCompact {
+                    global_chain_root: state_roots.qfhash::<Hasher>(),
+                    stats_hash,
+                },
+                global_state_roots: state_roots,
+            },
+        };
+        assert_eq!(
+            no_change_job.metadata.expected_public_inputs_hash,
+            no_change_input.get_public_inputs_hash_no_rewards_tag::<F, Hasher>(guta_circuit_whitelist)
+        );
+
+        let checker = JobCorrectnessChecker::new(vec![], result);
+        checker.check_jobs_correctness::<Hasher>()?;
+        checker
+            .process_job_witness::<InMemoryTempStore>(&realm_identifier, unique_pending_id, temp_store.clone(), no_change_job.job_id.clone(), guta_circuit_whitelist)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn checkpoint_root_change_commits_queued_updates_then_adds_directly() -> anyhow::Result<()> {
+        let (realm_identifier, temp_store, checkpoint_tree, mut global_user_tree, checkpoint_0_root, checkpoint_1_root, state_roots, stats_hash) =
+            planner_test_fixture();
+        let unique_pending_id = 0u64;
+        let guta_circuit_whitelist = Hash::from_values(1, 2, 3, 4);
+
+        let mut planner = CoordinatorGUTAPlanner::<F, Hash>::new(checkpoint_0_root);
+        // three realm jobs arriving while the checkpoint root is still the synced root: queued
+        let queued_jobs: Vec<_> = [11u64, 12, 13]
+            .iter()
+            .map(|&index| gen_job_for_index_checkpoint(0, index, checkpoint_0_root))
+            .collect();
+        for job in &queued_jobs {
+            planner
+                .add_realm_job::<Hasher, InMemoryTempStore>(
+                    unique_pending_id,
+                    &checkpoint_0_root,
+                    &checkpoint_tree,
+                    &mut global_user_tree,
+                    temp_store.clone(),
+                    job.clone(),
+                )
+                .await?;
+        }
+        assert!(!planner.has_committed_updates);
+        assert_eq!(planner.queued_updates.len(), 3);
+        assert!(planner.job_levels.is_empty());
+
+        // a job arriving with a NEW checkpoint root commits the queued updates first
+        let late_job = gen_job_for_index_checkpoint(1, 14, checkpoint_1_root);
+        planner
+            .add_realm_job::<Hasher, InMemoryTempStore>(
+                unique_pending_id,
+                &checkpoint_1_root,
+                &checkpoint_tree,
+                &mut global_user_tree,
+                temp_store.clone(),
+                late_job.clone(),
+            )
+            .await?;
+        assert!(planner.has_committed_updates);
+        assert!(planner.queued_updates.is_empty());
+        assert!(!planner.job_levels.is_empty());
+
+        // after the commit every further job is added directly without queueing
+        let direct_job = gen_job_for_index_checkpoint(1, 15, checkpoint_1_root);
+        planner
+            .add_realm_job::<Hasher, InMemoryTempStore>(
+                unique_pending_id,
+                &checkpoint_1_root,
+                &checkpoint_tree,
+                &mut global_user_tree,
+                temp_store.clone(),
+                direct_job.clone(),
+            )
+            .await?;
+        assert!(planner.has_committed_updates);
+        assert!(planner.queued_updates.is_empty());
+
+        let mut all_input_jobs = queued_jobs;
+        all_input_jobs.push(late_job);
+        all_input_jobs.push(direct_job);
+        let (result, _reward_keys, _root_header) = planner
+            .finalize_with_reward_ids(
+                &realm_identifier,
+                unique_pending_id,
+                &checkpoint_1_root,
+                &checkpoint_tree,
+                &mut global_user_tree,
+                temp_store.clone(),
+                2,
+                0,
+                state_roots,
+                stats_hash,
+                guta_circuit_whitelist,
+            )
+            .await?;
+        assert!(!result.is_empty());
+
+        let input_jobs_metadata = get_job_metadata_for_input_jobs(&all_input_jobs);
+        let checker = JobCorrectnessChecker::new(input_jobs_metadata, result.clone());
+        println!("graph viz:\n{}", checker.generate_graph_viz_simple()?);
+        checker.check_jobs_correctness::<Hasher>()?;
+        let root_job_id = result
+            .last()
+            .and_then(|level| level.first())
+            .map(|job_metadata| job_metadata.job_id.clone())
+            .ok_or_else(|| anyhow::anyhow!("No root job generated"))?;
+        checker
+            .process_job_witness::<InMemoryTempStore>(&realm_identifier, unique_pending_id, temp_store.clone(), root_job_id, guta_circuit_whitelist)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finalize_errors_when_current_checkpoint_root_is_missing_from_tree() -> anyhow::Result<()> {
+        let (realm_identifier, temp_store, checkpoint_tree, mut global_user_tree, checkpoint_0_root, _checkpoint_1_root, state_roots, stats_hash) =
+            planner_test_fixture();
+        let unique_pending_id = 0u64;
+        let unknown_root = Hash::rand();
+
+        let mut planner = CoordinatorGUTAPlanner::<F, Hash>::new(unknown_root);
+        for index in [3u64, 4] {
+            let job = gen_job_for_index_checkpoint(0, index, checkpoint_0_root);
+            planner
+                .add_realm_job::<Hasher, InMemoryTempStore>(
+                    unique_pending_id,
+                    &unknown_root,
+                    &checkpoint_tree,
+                    &mut global_user_tree,
+                    temp_store.clone(),
+                    job,
+                )
+                .await?;
+        }
+        let err = planner
+            .finalize_with_reward_ids(
+                &realm_identifier,
+                unique_pending_id,
+                &unknown_root,
+                &checkpoint_tree,
+                &mut global_user_tree,
+                temp_store.clone(),
+                0,
+                0,
+                state_roots,
+                stats_hash,
+                Hash::from_values(1, 2, 3, 4),
+            )
+            .await
+            .expect_err("finalizing against an unknown checkpoint root must fail");
+        assert!(
+            err.to_string().contains("not found in checkpoint tree"),
+            "unexpected error: {err}"
+        );
+        Ok(())
+    }
+
+    fn hand_made_metadata(
+        job_id: QProvingJobDataID,
+        dependencies: Vec<QProvingJobDataID>,
+        reward_level: u8,
+        reward_index: u64,
+    ) -> PsyProvingJobMetadataWithJobId<Hash, QProvingJobDataID> {
+        PsyProvingJobMetadataWithJobId {
+            job_id,
+            metadata: PsyProvingJobMetadata {
+                expected_public_inputs_hash: Hash::from_values(0, 0, 0, 0),
+                reward_tree_node_index: reward_index,
+                reward_tree_node_level: reward_level,
+                reward_tree_hash_mode: 0,
+                reward_tree_node_children: dependencies.len() as u16,
+                dependencies,
+            },
+        }
+    }
+
+    fn hand_made_agg_job_id(circuit_type: ProvingJobCircuitType, task_index: u32) -> QProvingJobDataID {
+        QProvingJobDataID::new_proof_job_id(1, 0, circuit_type, 0, task_index)
+    }
+
+    fn hand_made_input_job_id(goal_id: u64, task_index: u32) -> QProvingJobDataID {
+        QProvingJobDataID::new_proof_job_id(goal_id, 0, ProvingJobCircuitType::GUTATwoEndCap, 0, task_index)
+    }
+
+    fn expect_check_error(
+        input_jobs: Vec<PsyProvingJobMetadataWithJobId<Hash, QProvingJobDataID>>,
+        result_jobs: Vec<Vec<PsyProvingJobMetadataWithJobId<Hash, QProvingJobDataID>>>,
+        expected_fragment: &str,
+    ) {
+        let checker = JobCorrectnessChecker::new(input_jobs, result_jobs);
+        let err = checker
+            .check_jobs_correctness::<Hasher>()
+            .expect_err("checker must reject this job graph");
+        assert!(
+            err.to_string().contains(expected_fragment),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn checker_reports_jobs_missing_from_the_planner() {
+        let unknown = hand_made_agg_job_id(ProvingJobCircuitType::GUTATwoGUTALinear, 99);
+        let checker = JobCorrectnessChecker::new(vec![], vec![vec![]]);
+        let err = checker.get_job_level_index_by_id(&unknown).expect_err("unknown job id must fail");
+        assert!(
+            err.to_string().contains("not found in planner"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn checker_rejects_dependencies_not_below_their_parent() {
+        let sibling = hand_made_metadata(hand_made_agg_job_id(ProvingJobCircuitType::GUTANoChange, 1), vec![], 0, 0);
+        let parent = hand_made_metadata(
+            hand_made_agg_job_id(ProvingJobCircuitType::GUTATwoGUTALinear, 2),
+            vec![sibling.job_id.clone()],
+            0,
+            0,
+        );
+        // both jobs live at the same (result) level: the dependency is not lower
+        expect_check_error(vec![], vec![vec![sibling, parent]], "which is not lower");
+    }
+
+    #[test]
+    fn checker_rejects_incorrect_child_reward_tree_positions() {
+        let child = hand_made_metadata(hand_made_agg_job_id(ProvingJobCircuitType::GUTATwoGUTALinear, 1), vec![], 5, 9);
+        let parent = hand_made_metadata(
+            hand_made_agg_job_id(ProvingJobCircuitType::GUTATwoGUTALinear, 2),
+            vec![child.job_id.clone()],
+            0,
+            0,
+        );
+        // level should be parent level + 1
+        expect_check_error(vec![child.clone()], vec![vec![parent.clone()]], "incorrect reward tree node level");
+
+        // index should be (parent index << 1) | position
+        let mut child = child;
+        child.metadata.reward_tree_node_level = 1;
+        child.metadata.reward_tree_node_index = 1;
+        let mut parent = parent;
+        parent.metadata.dependencies = vec![child.job_id.clone()];
+        expect_check_error(vec![child], vec![vec![parent]], "incorrect reward tree node index");
+    }
+
+    #[test]
+    fn checker_accepts_a_small_valid_linear_graph() -> anyhow::Result<()> {
+        let left = hand_made_metadata(hand_made_agg_job_id(ProvingJobCircuitType::GUTATwoGUTALinear, 1), vec![], 1, 0);
+        let right = hand_made_metadata(hand_made_agg_job_id(ProvingJobCircuitType::GUTATwoGUTALinear, 2), vec![], 1, 1);
+        let parent = hand_made_metadata(
+            hand_made_agg_job_id(ProvingJobCircuitType::GUTATwoGUTALinear, 3),
+            vec![left.job_id.clone(), right.job_id.clone()],
+            0,
+            0,
+        );
+        let checker = JobCorrectnessChecker::new(vec![left, right], vec![vec![parent]]);
+        checker.check_jobs_correctness::<Hasher>()?;
+        Ok(())
+    }
+
+    #[test]
+    fn checker_rejects_wrong_parent_circuits_for_two_input_children() {
+        // parent GUTATwoGUTA but an input child needs a checkpoint upgrade (goal id 0)
+        let input_a = hand_made_metadata(hand_made_input_job_id(0, 1), vec![], 0, 0);
+        let input_b = hand_made_metadata(hand_made_input_job_id(0, 2), vec![], 0, 0);
+        let parent = hand_made_metadata(
+            hand_made_agg_job_id(ProvingJobCircuitType::GUTATwoGUTA, 3),
+            vec![input_a.job_id.clone(), input_b.job_id.clone()],
+            0,
+            0,
+        );
+        expect_check_error(
+            vec![input_a.clone(), input_b.clone()],
+            vec![vec![parent]],
+            "is GUTATwoGUTA but one of its input proofs needs checkpoint upgrade",
+        );
+
+        // parent GUTATwoGUTAWithCheckpointUpgrade but neither input child needs one
+        let input_a = hand_made_metadata(hand_made_input_job_id(4, 1), vec![], 0, 0);
+        let input_b = hand_made_metadata(hand_made_input_job_id(4, 2), vec![], 0, 0);
+        let parent = hand_made_metadata(
+            hand_made_agg_job_id(ProvingJobCircuitType::GUTATwoGUTAWithCheckpointUpgrade, 3),
+            vec![input_a.job_id.clone(), input_b.job_id.clone()],
+            0,
+            0,
+        );
+        expect_check_error(
+            vec![input_a, input_b],
+            vec![vec![parent]],
+            "is GUTATwoGUTAWithCheckpointUpgrade but none of its input proofs needs checkpoint upgrade",
+        );
+
+        // a linear circuit type cannot aggregate two input proofs
+        let input_a = hand_made_metadata(hand_made_input_job_id(4, 1), vec![], 0, 0);
+        let input_b = hand_made_metadata(hand_made_input_job_id(4, 2), vec![], 0, 0);
+        let parent = hand_made_metadata(
+            hand_made_agg_job_id(ProvingJobCircuitType::GUTATwoGUTALinear, 3),
+            vec![input_a.job_id.clone(), input_b.job_id.clone()],
+            0,
+            0,
+        );
+        expect_check_error(vec![input_a, input_b], vec![vec![parent]], "unexpected circuit type GUTATwoGUTALinear for two input proofs");
+    }
+
+    #[test]
+    fn checker_rejects_mixed_and_wrongly_typed_pairs() {
+        // left is an input proof but right is not
+        let input_a = hand_made_metadata(hand_made_input_job_id(4, 1), vec![], 0, 0);
+        let linear_b = hand_made_metadata(hand_made_agg_job_id(ProvingJobCircuitType::GUTATwoGUTALinear, 2), vec![], 1, 1);
+        let parent = hand_made_metadata(
+            hand_made_agg_job_id(ProvingJobCircuitType::GUTATwoGUTA, 3),
+            vec![input_a.job_id.clone(), linear_b.job_id.clone()],
+            0,
+            0,
+        );
+        expect_check_error(
+            vec![input_a.clone(), linear_b.clone()],
+            vec![vec![parent]],
+            "left input proof as input proof but right is not",
+        );
+
+        // left linear + right input proof requires the LeftLinearRightLeaf circuit;
+        // the linear child's reward position must match its dep slot so the checker
+        // reaches the circuit type validation
+        let linear_b_left = hand_made_metadata(hand_made_agg_job_id(ProvingJobCircuitType::GUTATwoGUTALinear, 2), vec![], 1, 0);
+        let parent = hand_made_metadata(
+            hand_made_agg_job_id(ProvingJobCircuitType::GUTATwoGUTALinear, 3),
+            vec![linear_b_left.job_id.clone(), input_a.job_id.clone()],
+            0,
+            0,
+        );
+        expect_check_error(
+            vec![input_a, linear_b_left],
+            vec![vec![parent]],
+            "expected circuit type GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint but got",
+        );
+
+        // two non-input children must use the linear circuit
+        let linear_a = hand_made_metadata(hand_made_agg_job_id(ProvingJobCircuitType::GUTATwoGUTALinear, 1), vec![], 1, 0);
+        let linear_b = hand_made_metadata(hand_made_agg_job_id(ProvingJobCircuitType::GUTATwoGUTALinear, 2), vec![], 1, 1);
+        let parent = hand_made_metadata(
+            hand_made_agg_job_id(ProvingJobCircuitType::GUTATwoGUTA, 3),
+            vec![linear_a.job_id.clone(), linear_b.job_id.clone()],
+            0,
+            0,
+        );
+        expect_check_error(vec![linear_a, linear_b], vec![vec![parent]], "two non-input proofs but unexpected circuit type");
+    }
+
+    #[test]
+    fn checker_rejects_invalid_single_dependency_and_dependency_counts() {
+        // single input dependency must use the cap-with-upgrade circuit
+        let input_a = hand_made_metadata(hand_made_input_job_id(4, 1), vec![], 0, 0);
+        let parent = hand_made_metadata(
+            hand_made_agg_job_id(ProvingJobCircuitType::GUTATwoGUTALinear, 3),
+            vec![input_a.job_id.clone()],
+            0,
+            0,
+        );
+        expect_check_error(vec![input_a.clone()], vec![vec![parent]], "unexpected circuit type GUTATwoGUTALinear for single input proof");
+
+        // a single non-input dependency is never expected (its reward position must
+        // match the dep slot so the checker reaches the circuit type validation)
+        let linear_a = hand_made_metadata(hand_made_agg_job_id(ProvingJobCircuitType::GUTATwoGUTALinear, 1), vec![], 1, 0);
+        let parent = hand_made_metadata(
+            hand_made_agg_job_id(ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade, 3),
+            vec![linear_a.job_id.clone()],
+            0,
+            0,
+        );
+        expect_check_error(vec![linear_a], vec![vec![parent]], "non-input proof as single dependency");
+
+        // three dependencies are never valid
+        let input_a = hand_made_metadata(hand_made_input_job_id(4, 1), vec![], 0, 0);
+        let input_b = hand_made_metadata(hand_made_input_job_id(4, 2), vec![], 0, 0);
+        let input_c = hand_made_metadata(hand_made_input_job_id(4, 3), vec![], 0, 0);
+        let parent = hand_made_metadata(
+            hand_made_agg_job_id(ProvingJobCircuitType::GUTATwoGUTALinear, 3),
+            vec![input_a.job_id.clone(), input_b.job_id.clone(), input_c.job_id.clone()],
+            0,
+            0,
+        );
+        expect_check_error(
+            vec![input_a.clone(), input_b.clone(), input_c.clone()],
+            vec![vec![parent.clone()]],
+            "expected 1 or 2 or 0 for no change proof",
+        );
+
+        // a no-change job must not carry dependencies
+        let mut parent = parent;
+        parent.job_id = hand_made_agg_job_id(ProvingJobCircuitType::GUTANoChange, 3);
+        expect_check_error(vec![input_a, input_b, input_c], vec![vec![parent]], "is GUTANoChange but has 3 dependencies");
+    }
+
+    #[test]
+    fn checker_treats_only_two_end_cap_jobs_as_input_proofs() -> anyhow::Result<()> {
+        let checker = JobCorrectnessChecker::new(vec![], vec![vec![]]);
+        assert!(checker.is_job_input_proof(&hand_made_input_job_id(4, 1))?);
+        assert!(!checker.is_job_input_proof(&hand_made_agg_job_id(ProvingJobCircuitType::GUTATwoGUTALinear, 1))?);
+        assert!(!checker.is_job_input_proof(&hand_made_agg_job_id(ProvingJobCircuitType::GUTANoChange, 1))?);
+        Ok(())
+    }
+
+    #[test]
+    fn graph_viz_simple_renders_levels_and_flags_missing_dependencies() -> anyhow::Result<()> {
+        let input_end_cap = hand_made_metadata(hand_made_input_job_id(5, 0), vec![], 0, 0);
+        let level_0_linear = hand_made_metadata(
+            hand_made_agg_job_id(ProvingJobCircuitType::GUTATwoGUTALinear, 0),
+            vec![input_end_cap.job_id.clone()],
+            1,
+            0,
+        );
+        let missing_dep = hand_made_agg_job_id(ProvingJobCircuitType::GUTATwoGUTALinear, 42);
+        let root = hand_made_metadata(
+            hand_made_agg_job_id(ProvingJobCircuitType::GUTATwoGUTALinear, 1),
+            vec![level_0_linear.job_id.clone(), missing_dep],
+            0,
+            0,
+        );
+        let checker = JobCorrectnessChecker::new(vec![input_end_cap], vec![vec![level_0_linear], vec![root]]);
+        let dot = checker.generate_graph_viz_simple()?;
+        assert!(dot.starts_with("digraph G {"), "unexpected dot header: {dot}");
+        assert!(dot.contains("rank=same;"));
+        // input level labels carry the checkpoint goal id
+        assert!(dot.contains("Input Proof 1\\nCheckpoint 5") || dot.contains("Input Proof 1\nCheckpoint 5"));
+        // aggregation nodes carry the circuit type and reward position
+        assert!(dot.contains("GUTATwoGUTALinear"));
+        assert!(dot.contains("RewardLevel=1"));
+        // real dependency edges plus the ghost node for the missing dependency
+        assert!(dot.contains("job_0_0 -> job_1_0;"));
+        assert!(dot.contains("job_1_0 -> job_2_0;"));
+        assert!(dot.contains("missing_2_0 [label=\"Missing\" style=dotted];"));
+        assert!(dot.contains("missing_2_0 -> job_2_0 [style=dotted];"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn process_job_witness_validates_hashes_and_rejects_unknown_jobs() -> anyhow::Result<()> {
+        let realm_identifier = QRealmIdentifier {
+            realm_id: 1,
+            realm_sub_id: 0,
+        };
+        let temp_store = Arc::new(InMemoryTempStore::new("coordinator-guta-planner-test".to_string(), 1, 0));
+        let unique_pending_id = 0u64;
+        let guta_circuit_whitelist = Hash::from_values(1, 2, 3, 4);
+
+        let left = fixed_header(3, Hasher::get_zero_hash(0), Hash::from_values(20, 21, 22, 23));
+        let right = fixed_header(3, Hash::from_values(20, 21, 22, 23), Hash::from_values(30, 31, 32, 33));
+        let witness = GUTAVerifyTwoGUTALinearCircuitInput::<F, Hash> {
+            left_header: left,
+            right_header: right,
+        };
+        let expected_hash = witness.get_public_inputs_hash_no_rewards_tag::<Hasher>();
+        let stored_job_id = hand_made_agg_job_id(ProvingJobCircuitType::GUTATwoGUTALinear, 0);
+        temp_store
+            .set_tdb_proof_witnesses_tuple_owned_raw(&realm_identifier, unique_pending_id, vec![(stored_job_id.clone(), witness.psy_ser_to_bytes_vec()?)])
+            .await?;
+
+        // a mismatching expected public inputs hash is rejected
+        let mut bad_metadata = hand_made_metadata(stored_job_id.clone(), vec![], 0, 0);
+        bad_metadata.metadata.expected_public_inputs_hash = Hash::from_values(9, 9, 9, 9);
+        let checker = JobCorrectnessChecker::new(vec![], vec![vec![bad_metadata]]);
+        let err = checker
+            .process_job_witness::<InMemoryTempStore>(&realm_identifier, unique_pending_id, temp_store.clone(), stored_job_id.clone(), guta_circuit_whitelist)
+            .await
+            .expect_err("hash mismatch must fail");
+        assert!(
+            err.to_string().contains("public inputs hash mismatch"),
+            "unexpected error: {err}"
+        );
+
+        // a matching hash passes and echoes the witness state transition
+        let mut good_metadata = hand_made_metadata(stored_job_id.clone(), vec![], 0, 0);
+        good_metadata.metadata.expected_public_inputs_hash = expected_hash;
+        let checker = JobCorrectnessChecker::new(vec![], vec![vec![good_metadata]]);
+        let state_transition = checker
+            .process_job_witness::<InMemoryTempStore>(&realm_identifier, unique_pending_id, temp_store.clone(), stored_job_id.clone(), guta_circuit_whitelist)
+            .await?;
+        assert_eq!(state_transition.old_node_value, Hasher::get_zero_hash(0));
+        assert_eq!(state_transition.new_node_value, Hash::from_values(30, 31, 32, 33));
+
+        // circuit types outside the GUTA aggregation family are rejected; the
+        // witness bytes are read first but never deserialized for this arm
+        let unsupported_id = hand_made_agg_job_id(ProvingJobCircuitType::GUTARegisterUsers, 0);
+        temp_store
+            .set_tdb_proof_witnesses_tuple_owned_raw(&realm_identifier, unique_pending_id, vec![(unsupported_id.clone(), witness.psy_ser_to_bytes_vec()?)])
+            .await?;
+        let err = checker
+            .process_job_witness::<InMemoryTempStore>(&realm_identifier, unique_pending_id, temp_store.clone(), unsupported_id, guta_circuit_whitelist)
+            .await
+            .expect_err("unsupported circuit type must fail");
+        assert!(
+            err.to_string().contains("Unsupported job circuit type"),
+            "unexpected error: {err}"
+        );
+
+        // a witness that was never stored fails on read
+        let unstored_id = hand_made_agg_job_id(ProvingJobCircuitType::GUTATwoGUTALinear, 7);
+        assert!(
+            checker
+                .process_job_witness::<InMemoryTempStore>(&realm_identifier, unique_pending_id, temp_store.clone(), unstored_id, guta_circuit_whitelist)
+                .await
+                .is_err()
+        );
+
+        // a stored witness whose job is missing from the checker fails on lookup
+        let orphan_id = hand_made_agg_job_id(ProvingJobCircuitType::GUTATwoGUTALinear, 8);
+        temp_store
+            .set_tdb_proof_witnesses_tuple_owned_raw(&realm_identifier, unique_pending_id, vec![(orphan_id.clone(), witness.psy_ser_to_bytes_vec()?)])
+            .await?;
+        let err = checker
+            .process_job_witness::<InMemoryTempStore>(&realm_identifier, unique_pending_id, temp_store.clone(), orphan_id, guta_circuit_whitelist)
+            .await
+            .expect_err("job missing from the checker must fail");
+        assert!(
+            err.to_string().contains("not found in planner"),
+            "unexpected error: {err}"
+        );
+        Ok(())
     }
 }

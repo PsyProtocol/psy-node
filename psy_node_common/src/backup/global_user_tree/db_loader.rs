@@ -203,3 +203,150 @@ pub async fn load_global_user_tree_from_db<
     }
     Ok(tree)
 }
+
+#[cfg(test)]
+mod tests {
+    use parth_core::{data::hash::merkle_node_key::SimpleMerkleNodeKey, pgoldilocks::PoseidonHasher, protocol::core_types::QNetworkTreeConstants, PHash};
+    use psy_node_core::psy_core_db::traits::full::{
+        PsyNodeGlobalUserTreeDatabaseReader,
+        PsyNodeGlobalUserTreeDatabaseWriter,
+    };
+
+    use crate::test_common::{create_test_unified_db, TestNetworkConfig, TestUnifiedDatabaseStore};
+
+    use super::*;
+
+    type Hasher = PoseidonHasher;
+    type Hash = PHash;
+
+    const TREE_HEIGHT: u8 = TestNetworkConfig::GLOBAL_USER_TREE_HEIGHT;
+    const EFFECTIVE_HEIGHT: u8 = TestNetworkConfig::COORDINATOR_GLOBAL_USER_TREE_HEIGHT;
+    /// leaves of the full tree covered by one effective-level node
+    const SUB_LEAVES: u64 = 1u64 << (TREE_HEIGHT - EFFECTIVE_HEIGHT);
+    const CP: u64 = 7;
+
+    fn zh(level: usize) -> Hash {
+        PoseidonHasher::get_zero_hash(level)
+    }
+
+    fn leaf(i: u64) -> Hash {
+        PHash::from_values(i * 16 + 3, 0x1F2E_3D4C_5B6A_7988, i + 29, 0x8879_6A5B_4C3D_2E1F)
+    }
+
+    /// Seeds leaves so exactly effective-level nodes 0 and 1 are non-zero.
+    async fn seed_two_effective_slots(db: &TestUnifiedDatabaseStore) -> anyhow::Result<()> {
+        db.global_user_tree_set_leaf_hash(CP, 0, leaf(0)).await?;
+        db.global_user_tree_set_leaf_hash(CP, SUB_LEAVES + 3, leaf(1)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetch_rebuilds_tree_root_from_effective_level_nodes() -> anyhow::Result<()> {
+        let db = create_test_unified_db().await?;
+        seed_two_effective_slots(&db).await?;
+
+        let tree = fetch_global_user_tree_from_db::<Hasher, TestUnifiedDatabaseStore, Hash>(
+            &db,
+            TREE_HEIGHT,
+            EFFECTIVE_HEIGHT,
+            CP,
+            0,
+            2,
+            2,
+        )
+        .await?;
+
+        assert_eq!(tree.get_height(), TREE_HEIGHT);
+        assert_eq!(tree.get_effective_height(), EFFECTIVE_HEIGHT);
+        assert_eq!(tree.get_root(), db.global_user_tree_get_root_hash(CP).await?);
+        assert_eq!(
+            tree.get_e_leaf_value(0),
+            db.global_user_tree_get_node(CP, SimpleMerkleNodeKey::new(EFFECTIVE_HEIGHT, 0)).await?
+        );
+        assert_eq!(
+            tree.get_e_leaf_value(1),
+            db.global_user_tree_get_node(CP, SimpleMerkleNodeKey::new(EFFECTIVE_HEIGHT, 1)).await?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetch_of_empty_range_yields_empty_root() -> anyhow::Result<()> {
+        let db = create_test_unified_db().await?;
+        // nothing seeded: every fetched node is the sub-tree zero hash and filtered out
+        let tree = fetch_global_user_tree_from_db::<Hasher, TestUnifiedDatabaseStore, Hash>(
+            &db,
+            TREE_HEIGHT,
+            EFFECTIVE_HEIGHT,
+            CP,
+            0,
+            4,
+            2,
+        )
+        .await?;
+
+        assert_eq!(tree.get_root(), zh(TREE_HEIGHT as usize));
+        assert_eq!(tree.get_root(), db.global_user_tree_get_root_hash(CP).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetch_handles_full_batches_plus_remainder() -> anyhow::Result<()> {
+        let db = create_test_unified_db().await?;
+        seed_two_effective_slots(&db).await?;
+
+        // range of 5 with batch 2: two complete batches + one remainder item;
+        // effective slots 2..=4 are empty and must be filtered as zeros
+        let tree = fetch_global_user_tree_from_db::<Hasher, TestUnifiedDatabaseStore, Hash>(
+            &db,
+            TREE_HEIGHT,
+            EFFECTIVE_HEIGHT,
+            CP,
+            0,
+            5,
+            2,
+        )
+        .await?;
+
+        assert_eq!(tree.get_root(), db.global_user_tree_get_root_hash(CP).await?);
+        assert_eq!(tree.get_e_leaf_value(2), zh((TREE_HEIGHT - EFFECTIVE_HEIGHT) as usize));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_on_empty_db_returns_empty_tree_with_effective_height_set() -> anyhow::Result<()> {
+        let db = create_test_unified_db().await?;
+        let tree = load_global_user_tree_from_db::<Hasher, TestUnifiedDatabaseStore, Hash>(&db, TREE_HEIGHT, EFFECTIVE_HEIGHT, 0, 100).await?;
+
+        assert_eq!(tree.get_root(), zh(TREE_HEIGHT as usize));
+        assert_eq!(tree.get_height(), TREE_HEIGHT);
+        assert_eq!(tree.get_effective_height(), EFFECTIVE_HEIGHT);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_descends_to_rightmost_effective_node_and_matches_db_root() -> anyhow::Result<()> {
+        let db = create_test_unified_db().await?;
+        seed_two_effective_slots(&db).await?;
+
+        let tree = load_global_user_tree_from_db::<Hasher, TestUnifiedDatabaseStore, Hash>(&db, TREE_HEIGHT, EFFECTIVE_HEIGHT, CP, 1000).await?;
+
+        assert_eq!(tree.get_root(), db.global_user_tree_get_root_hash(CP).await?);
+        assert_eq!(
+            tree.get_e_leaf_value(0),
+            db.global_user_tree_get_node(CP, SimpleMerkleNodeKey::new(EFFECTIVE_HEIGHT, 0)).await?
+        );
+        assert_eq!(
+            tree.get_e_leaf_value(1),
+            db.global_user_tree_get_node(CP, SimpleMerkleNodeKey::new(EFFECTIVE_HEIGHT, 1)).await?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "effective_tree_height must be less than or equal to tree_height")]
+    async fn load_rejects_effective_height_above_tree_height() {
+        let db = create_test_unified_db().await.expect("db");
+        let _ = load_global_user_tree_from_db::<Hasher, TestUnifiedDatabaseStore, Hash>(&db, TREE_HEIGHT, TREE_HEIGHT + 1, 0, 10).await;
+    }
+}

@@ -773,3 +773,753 @@ where
         Ok(())
     }
 }
+
+/// Shared fixtures for the realm database processor tests: an in-memory
+/// unified store, the real temp/proof store, fake queues and a controllable
+/// coordinator client. Lives here (`db::init`) and is re-exported for the
+/// sibling test modules via `db::mod`.
+#[cfg(test)]
+pub(crate) mod realm_db_test_env {
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use parth_core::{
+        crypto::hash::{
+            merkle_proof::{compute_root_merkle_proof_generic, MerkleProofCore},
+            traits::MerkleZeroHasher,
+        },
+        data::hash::{checkpointed_merkle_node::CheckpointedMerkleHash, merkle_node_key::SimpleMerkleNodeKey},
+        node::realm_identifier::QRealmIdentifier,
+        pgoldilocks::PoseidonHasher,
+        protocol::core_types::QNetworkTreeConstants,
+        utils::QPGenRandom,
+        PHash, PF,
+    };
+    use psy_data::{
+        config::network_config::PsyNodeCircuitFingerprintConfig,
+        genesis::genesis_block_setup::PsyGenesisBlockSetupData,
+        guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobType,
+        prepared_block::realm::{PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate, PsyRealmCoordinatorUpdate},
+        user::complete_user_record::PsyCompactUserDefinition,
+        v1::qdata::{
+            checkpoint::PQEDCheckpointLeafStats,
+            contract::{ContractCodeDefinition, PQBCDeployContract},
+            public_key::PZKPublicKeyInfo,
+        },
+    };
+    use psy_node_core::{
+        file::memory_fs::SimpleMockMemoryFileSystem,
+        genesis::genesis_db_data_builder::GenesisDatabaseDataBuilder,
+        p2p::traits::realm_coordinantor::RealmCoordinatorClient,
+        psy_core_db::traits::full::PsyNodeGlobalUserTreeDatabaseReader,
+    };
+    use psy_node_store_memory::temp_store::InMemoryTempStore;
+
+    use crate::test_common::{
+        create_test_unified_db, FakeEphemeralQueueSubscriber, FakeWorkerQueue, TestNetworkConfig,
+        TestUnifiedDatabaseStore,
+    };
+
+    use super::{DatabaseCheckState, PsyRealmDatabaseProcessor};
+
+    pub(crate) type N = TestNetworkConfig;
+
+    pub(crate) type TestRealmProcessor = PsyRealmDatabaseProcessor<
+        N,
+        TestUnifiedDatabaseStore,
+        TestUnifiedDatabaseStore,
+        FakeEphemeralQueueSubscriber,
+        FakeWorkerQueue,
+        InMemoryTempStore,
+        InMemoryTempStore,
+        SimpleMockMemoryFileSystem,
+        FakeRealmCoordinatorClient,
+    >;
+
+    pub(crate) const TEST_CHAIN_ID: u32 = 1;
+    pub(crate) const TEST_REALM_ID: u64 = 1;
+    pub(crate) const TEST_REALM_SUB_ID: u64 = 2;
+    pub(crate) const TEST_BACKUP_PATH: &str = "realm_checkpoint_tree_backup.bin";
+    pub(crate) const TEST_GUTA_BACKUP_DIR: &str = "realm_guta_backups";
+
+    pub(crate) fn zh(level: usize) -> PHash {
+        PoseidonHasher::get_zero_hash(level)
+    }
+
+    pub(crate) fn fingerprint_config() -> PsyNodeCircuitFingerprintConfig<PHash> {
+        PsyNodeCircuitFingerprintConfig {
+            guta_circuit_whitelist_root: zh(21),
+            register_users_circuit_whitelist_root: zh(22),
+            deploy_contracts_circuit_whitelist_root: zh(23),
+            update_contracts_circuit_whitelist_root: zh(24),
+            checkpoint_state_transition_circuit_fingerprint: zh(25),
+            genesis_checkpoint_state_transition_fingerprint: zh(26),
+        }
+    }
+
+    pub(crate) fn test_realm_identifier() -> QRealmIdentifier {
+        QRealmIdentifier::new(TEST_REALM_ID as u32, TEST_REALM_SUB_ID as u16)
+    }
+
+    fn genesis_user(balance: u64) -> PsyCompactUserDefinition<PHash> {
+        PsyCompactUserDefinition {
+            public_key_info: PZKPublicKeyInfo::qp_rand_gen(),
+            balance,
+            nonce: 0,
+            last_checkpoint_id: 0,
+            event_index: 0,
+            constract_state_tree_records: vec![],
+        }
+    }
+
+    /// Genesis setup data with `contract_count` contracts and `user_count`
+    /// users. With GROUP_REALM_HEIGHT = 1 and Strategy-5 user-id derivation,
+    /// odd registration ids land in realm `TEST_REALM_ID`, so an even user
+    /// count puts half of the users inside the realm under test.
+    pub(crate) fn genesis_setup_data(contract_count: usize, user_count: usize) -> PsyGenesisBlockSetupData<PF, PHash> {
+        let contracts = (0..contract_count)
+            .map(|i| {
+                PQBCDeployContract::new(
+                    PHash::from_values(i as u64 + 1, 0, 0, 0),
+                    ContractCodeDefinition { state_tree_height: 8, functions: vec![] },
+                    vec![PHash::from_values(100 + i as u64, 0, 0, 0)],
+                    PHash::from_values(200 + i as u64, 0, 0, 0),
+                )
+            })
+            .collect();
+        let users = (0..user_count).map(|i| genesis_user((i as u64 + 1) * 1_000)).collect();
+        PsyGenesisBlockSetupData {
+            contracts,
+            users,
+            checkpoint_stats: PQEDCheckpointLeafStats::qp_rand_gen(),
+            deposit_tree_root: PHash::from_values(4, 0, 0, 0),
+            withdrawal_tree_root: PHash::from_values(5, 0, 0, 0),
+        }
+    }
+
+    pub(crate) fn build_realm_genesis(
+        genesis_data: &PsyGenesisBlockSetupData<PF, PHash>,
+    ) -> anyhow::Result<PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate<PF, PHash>> {
+        GenesisDatabaseDataBuilder::<PF, PHash>::setup_for_realm::<PoseidonHasher, N>(
+            genesis_data,
+            TEST_REALM_ID,
+            TEST_REALM_SUB_ID,
+        )
+    }
+
+    /// In-memory fake of the coordinator client the realm processor talks to.
+    /// Default answers: latest checkpoint 0, realm root = default hash at
+    /// checkpoint 0; tests seed leaves / sync infos / realm roots explicitly.
+    #[derive(Default)]
+    pub(crate) struct FakeRealmCoordinatorClient {
+        pub latest_checkpoint_id: Mutex<u64>,
+        /// checkpoint leaf hashes by checkpoint id (index == checkpoint id)
+        pub checkpoint_leaves: Mutex<Vec<PHash>>,
+        pub realm_sync_infos: Mutex<HashMap<u64, PsyRealmCoordinatorUpdate<PF, PHash>>>,
+        /// realm-root states keyed by the checkpoint that last modified them;
+        /// a query at id resolves to the largest key <= id
+        pub realm_roots: Mutex<HashMap<u64, CheckpointedMerkleHash<PHash>>>,
+        pub submitted_gutas: Mutex<Vec<(u64, Vec<u8>)>>,
+        pub wait_calls: Mutex<u64>,
+        /// leaves + sync infos published by the coordinator only once a waiter
+        /// asks for the next checkpoint (drives the wait-loop deterministically)
+        pub staged_leaves: Mutex<VecDeque<PHash>>,
+        pub staged_sync_infos: Mutex<VecDeque<PsyRealmCoordinatorUpdate<PF, PHash>>>,
+    }
+
+    impl FakeRealmCoordinatorClient {
+        pub(crate) fn new() -> Self {
+            Self::default()
+        }
+        pub(crate) fn set_latest_checkpoint_id(&self, id: u64) {
+            *self.latest_checkpoint_id.lock().unwrap() = id;
+        }
+        pub(crate) fn push_checkpoint_leaf(&self, leaf: PHash) {
+            self.checkpoint_leaves.lock().unwrap().push(leaf);
+        }
+        pub(crate) fn seed_realm_sync_info(&self, update: PsyRealmCoordinatorUpdate<PF, PHash>) {
+            let id = update.checkpoint_sync_info.checkpoint_id;
+            self.realm_sync_infos.lock().unwrap().insert(id, update);
+        }
+        /// Stages a checkpoint to become visible on the next wait call.
+        pub(crate) fn stage_checkpoint(
+            &self,
+            leaf: PHash,
+            update: PsyRealmCoordinatorUpdate<PF, PHash>,
+        ) {
+            self.staged_leaves.lock().unwrap().push_back(leaf);
+            self.staged_sync_infos.lock().unwrap().push_back(update);
+        }
+        pub(crate) fn seed_realm_root(&self, checkpoint_id: u64, value: PHash) {
+            self.realm_roots
+                .lock()
+                .unwrap()
+                .insert(checkpoint_id, CheckpointedMerkleHash { checkpoint_id, value });
+        }
+        pub(crate) fn clear_realm_roots(&self) {
+            self.realm_roots.lock().unwrap().clear();
+        }
+        pub(crate) fn wait_call_count(&self) -> u64 {
+            *self.wait_calls.lock().unwrap()
+        }
+        fn realm_root_at(&self, checkpoint_id: u64) -> CheckpointedMerkleHash<PHash> {
+            let map = self.realm_roots.lock().unwrap();
+            map.iter()
+                .filter(|(id, _)| **id <= checkpoint_id)
+                .max_by_key(|(id, _)| **id)
+                .map(|(_, state)| *state)
+                .unwrap_or(CheckpointedMerkleHash { checkpoint_id: 0, value: PHash::default() })
+        }
+    }
+
+    #[async_trait]
+    impl RealmCoordinatorClient<PF, PHash> for FakeRealmCoordinatorClient {
+        async fn rc_get_latest_checkpoint_id(&self) -> anyhow::Result<u64> {
+            Ok(*self.latest_checkpoint_id.lock().unwrap())
+        }
+        async fn rc_wait_for_next_checkpoint(&self) -> anyhow::Result<u64> {
+            let mut latest = self.latest_checkpoint_id.lock().unwrap();
+            *latest += 1;
+            *self.wait_calls.lock().unwrap() += 1;
+            // release one staged checkpoint (leaf + sync info), if any
+            if let Some(leaf) = self.staged_leaves.lock().unwrap().pop_front() {
+                self.checkpoint_leaves.lock().unwrap().push(leaf);
+            }
+            if let Some(update) = self.staged_sync_infos.lock().unwrap().pop_front() {
+                self.seed_realm_sync_info(update);
+            }
+            Ok(*latest)
+        }
+        async fn rc_get_realm_sync_info(
+            &self,
+            checkpoint_id: u64,
+            _realm_id: u64,
+        ) -> anyhow::Result<PsyRealmCoordinatorUpdate<PF, PHash>> {
+            self.realm_sync_infos
+                .lock()
+                .unwrap()
+                .get(&checkpoint_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("realm sync info for checkpoint {} not seeded", checkpoint_id))
+        }
+        async fn rc_get_checkpoint_leaves_batch(&self, start_checkpoint_id: u64, count: u32) -> anyhow::Result<Vec<PHash>> {
+            let leaves = self.checkpoint_leaves.lock().unwrap();
+            let start = start_checkpoint_id as usize;
+            if start >= leaves.len() {
+                return Ok(vec![]);
+            }
+            let end = (start + count as usize).min(leaves.len());
+            Ok(leaves[start..end].to_vec())
+        }
+        async fn rc_get_checkpoint_tree_merkle_proof(&self, _checkpoint_id: u64) -> anyhow::Result<MerkleProofCore<PHash>> {
+            Ok(MerkleProofCore::default())
+        }
+        async fn rc_get_realm_root_and_last_modified_checkpoint(
+            &self,
+            checkpoint_id: u64,
+            _realm_id: u64,
+        ) -> anyhow::Result<CheckpointedMerkleHash<PHash>> {
+            Ok(self.realm_root_at(checkpoint_id))
+        }
+        async fn rc_submit_guta_proof(
+            &self,
+            _input: GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<PF, PHash>,
+            proof: Vec<u8>,
+            realm_id: u64,
+        ) -> anyhow::Result<()> {
+            self.submitted_gutas.lock().unwrap().push((realm_id, proof));
+            Ok(())
+        }
+        async fn rc_get_contract_tree_state_heights(&self, _checkpoint_id: u64, contract_ids: Vec<u64>) -> anyhow::Result<Vec<u8>> {
+            Ok(vec![8u8; contract_ids.len()])
+        }
+    }
+
+    pub(crate) struct RealmDbTestEnv {
+        pub processor: TestRealmProcessor,
+        pub db: Arc<TestUnifiedDatabaseStore>,
+        pub temp_db: Arc<InMemoryTempStore>,
+        pub guta_queue: Arc<FakeEphemeralQueueSubscriber>,
+        pub proof_queue: Arc<FakeWorkerQueue>,
+        pub file_system: Arc<SimpleMockMemoryFileSystem>,
+        pub coordinator: Arc<FakeRealmCoordinatorClient>,
+        pub genesis_data: PsyGenesisBlockSetupData<PF, PHash>,
+        pub genesis: PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate<PF, PHash>,
+    }
+
+    impl RealmDbTestEnv {
+        pub(crate) async fn create() -> anyhow::Result<Self> {
+            let db = Arc::new(create_test_unified_db().await?);
+            let tag_tree_rewards_store = Arc::clone(&db);
+            let temp_db = Arc::new(InMemoryTempStore::new("realm_proc_test".to_string(), 1, 2));
+            let proof_store = Arc::clone(&temp_db);
+            let guta_queue = Arc::new(FakeEphemeralQueueSubscriber::new());
+            let proof_queue = Arc::new(FakeWorkerQueue::new());
+            let file_system = Arc::new(SimpleMockMemoryFileSystem::new());
+            let genesis_data = genesis_setup_data(1, 4);
+            let genesis = build_realm_genesis(&genesis_data)?;
+
+            let coordinator = Arc::new(FakeRealmCoordinatorClient::new());
+            // the coordinator is sitting at genesis (checkpoint 0)
+            coordinator.push_checkpoint_leaf(genesis.coordinator_update.checkpoint_sync_info.checkpoint_leaf_hash);
+            coordinator.seed_realm_sync_info(genesis.coordinator_update.clone());
+
+            let processor = TestRealmProcessor::new_init(
+                Arc::clone(&db),
+                tag_tree_rewards_store,
+                Arc::clone(&temp_db),
+                proof_store,
+                Arc::clone(&guta_queue),
+                Arc::clone(&proof_queue),
+                Arc::clone(&coordinator),
+                TEST_CHAIN_ID,
+                test_realm_identifier(),
+                fingerprint_config(),
+                Arc::clone(&file_system),
+                TEST_BACKUP_PATH.to_string(),
+                genesis.prepared_updates.new_realm_root,
+                genesis.coordinator_update.checkpoint_sync_info.checkpoint_tree_root,
+            )
+            .await?;
+
+            Ok(Self {
+                processor,
+                db,
+                temp_db,
+                guta_queue,
+                proof_queue,
+                file_system,
+                coordinator,
+                genesis_data,
+                genesis,
+            })
+        }
+
+        /// Drives the real genesis commit through `ensure_genesis_applied`.
+        pub(crate) async fn commit_genesis(&mut self) -> anyhow::Result<()> {
+            self.processor.ensure_genesis_applied(self.genesis.clone()).await
+        }
+
+        pub(crate) fn genesis_leaf_hash(&self) -> PHash {
+            self.genesis.coordinator_update.checkpoint_sync_info.checkpoint_leaf_hash
+        }
+
+        /// The realm root the local database reports at checkpoint 0, i.e. the
+        /// node at (COORDINATOR_GLOBAL_USER_TREE_HEIGHT, realm_id).
+        pub(crate) async fn local_realm_root(&self) -> anyhow::Result<PHash> {
+            Ok(self
+                .db
+                .global_user_tree_get_node(
+                    0,
+                    SimpleMerkleNodeKey { level: N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT, index: TEST_REALM_ID },
+                )
+                .await?)
+        }
+
+        /// Seed the fake coordinator so the local post-genesis state at
+        /// checkpoint 0 looks fully consistent (root matches the db).
+        pub(crate) async fn seed_consistent_coordinator_head(&self) -> anyhow::Result<PHash> {
+            let realm_root = self.local_realm_root().await?;
+            self.coordinator.seed_realm_root(0, realm_root);
+            Ok(realm_root)
+        }
+
+        /// A distinct coordinator update for checkpoint 1, as a coordinator
+        /// that advanced one block past genesis would hand it out. The
+        /// checkpoint-tree root is recomputed for the genesis leaf sitting at
+        /// index 0, so the local checksum validation during sync accepts it.
+        pub(crate) fn make_checkpoint_one_update(&self) -> PsyRealmCoordinatorUpdate<PF, PHash> {
+            let second_data = genesis_setup_data(2, 4);
+            let second = build_realm_genesis(&second_data).expect("second genesis builds");
+            let mut update = second.coordinator_update;
+            update.checkpoint_sync_info.checkpoint_id = 1;
+            update.checkpoint_sync_info.block_state.checkpoint_id = 1;
+            // realm genesis block states carry next_contract_id = 0 (realms do
+            // not own contract registration), so set it explicitly to model a
+            // coordinator that registered two contracts by checkpoint 1
+            update.checkpoint_sync_info.block_state.next_contract_id = 2;
+            let mut siblings = Vec::with_capacity(N::CHECKPOINT_TREE_HEIGHT_USIZE);
+            siblings.push(self.genesis_leaf_hash());
+            for level in 1..N::CHECKPOINT_TREE_HEIGHT_USIZE {
+                siblings.push(zh(level));
+            }
+            update.checkpoint_sync_info.checkpoint_tree_root =
+                compute_root_merkle_proof_generic::<PHash, PoseidonHasher>(
+                    update.checkpoint_sync_info.checkpoint_leaf_hash,
+                    1,
+                    &siblings,
+                );
+            update
+        }
+
+        /// Seeds the fake coordinator to be one checkpoint ahead: leaf +
+        /// sync info for checkpoint 1 exist, latest = 1. Returns the seeded
+        /// update and the new realm root the coordinator reports at 1.
+        pub(crate) fn seed_checkpoint_one(&self, update: PsyRealmCoordinatorUpdate<PF, PHash>, realm_root_at_one: PHash) {
+            self.coordinator.push_checkpoint_leaf(update.checkpoint_sync_info.checkpoint_leaf_hash);
+            self.coordinator.seed_realm_sync_info(update.clone());
+            self.coordinator.seed_realm_root(1, realm_root_at_one);
+            self.coordinator.set_latest_checkpoint_id(1);
+        }
+
+        /// Convenience state reader mirroring `get_database_check_state`.
+        pub(crate) async fn check_state(&self) -> anyhow::Result<DatabaseCheckState> {
+            self.processor.get_database_check_state().await
+        }
+    }
+
+    /// Helper for tests that need a `SimpleMemoryMerkleRecorderStore` loaded
+    /// from the db (recovery / init paths).
+    pub(crate) async fn load_global_user_tree(env: &RealmDbTestEnv) -> anyhow::Result<
+        parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore<PoseidonHasher, PHash>,
+    > {
+        let trees = crate::backup::realm::load_realm_memory_trees_from_db::<N, _>(
+            &env.db,
+            env.processor.state.gathering_checkpoint_id,
+            TEST_REALM_ID,
+        )
+        .await?;
+        Ok(trees.into_tuple().0)
+    }
+}
+
+#[cfg(test)]
+mod init_tests {
+    use parth_core::{protocol::core_types::QNetworkTreeConstants, PHash};
+    use psy_node_core::psy_core_db::traits::full::{
+        PsyNodeCheckpointObjectDatabaseReader, PsyNodeCheckpointObjectDatabaseWriter,
+        PsyNodeCheckpointTreeDatabaseReader,
+    };
+
+    use super::*;
+    use super::realm_db_test_env::*;
+
+    #[tokio::test]
+    async fn new_init_on_fresh_database_reports_needs_genesis() -> anyhow::Result<()> {
+        let env = RealmDbTestEnv::create().await?;
+        let processor = &env.processor;
+
+        // fresh database: nothing committed, no pending-id mapping
+        assert_eq!(env.db.get_latest_checkpoint_id().await?, 0);
+        assert_eq!(processor.get_database_check_state().await?, DatabaseCheckState::NeedsGenesis);
+
+        // state recovered from the empty database defaults to genesis params
+        assert_eq!(processor.state.last_committed_checkpoint_id, 0);
+        assert_eq!(processor.state.last_committed_unique_pending_id, 0);
+        assert_eq!(processor.state.last_committed_proc_checkpoint_unique_id, 0u128);
+        // note: the db reports the zero-tree root for checkpoint 0 on a fresh
+        // database (Ok, not Err), so new_init's genesis-root fallback never
+        // fires and the state carries the db's zero root, not the update root
+        let fresh_db_root = env.db.checkpoint_tree_get_root_hash(0).await?;
+        assert_ne!(fresh_db_root, env.genesis.coordinator_update.checkpoint_sync_info.checkpoint_tree_root);
+        assert_eq!(processor.state.last_committed_checkpoint_root, fresh_db_root);
+        // nothing is mapped yet
+        assert_eq!(
+            env.db
+                .get_checkpoint_id_for_checkpoint_root_hash(env.genesis.coordinator_update.checkpoint_sync_info.checkpoint_tree_root)
+                .await?,
+            None
+        );
+        assert_eq!(
+            processor.state.last_committed_realm_end_root,
+            env.genesis.prepared_updates.new_realm_root
+        );
+        assert_eq!(processor.state.chain_id, TEST_CHAIN_ID);
+        assert_eq!(processor.state.realm_id_u64, TEST_REALM_ID);
+        assert_eq!(processor.state.realm_sub_id_u64, TEST_REALM_SUB_ID);
+        assert!(!processor.needs_revert);
+
+        // realm root node points at (coordinator height, realm id)
+        assert_eq!(processor.realm_root_node.level, N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT);
+        assert_eq!(processor.realm_root_node.index, TEST_REALM_ID);
+
+        // queue key manager starts parked on unique id 0
+        assert_eq!(processor.guta_queue_key_status_manager.get_queue_key()?.unique_id, 0);
+
+        // backup manager starts empty but initialized from the file
+        assert_eq!(processor.checkpoint_tree_backup_manager.get_current_checkpoint_id_head(), 0);
+
+        // the checkpoint tree backup file was created in the mock file system
+        let _backup_file = env.file_system.file_like_fs_open(TEST_BACKUP_PATH).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn new_init_rolls_back_marker_without_pending_id_mapping() -> anyhow::Result<()> {
+        let env = RealmDbTestEnv::create().await?;
+        // simulate a database where latest_checkpoint_id was fast-forwarded
+        // without writing the pending-id mapping for any checkpoint
+        env.db.set_latest_checkpoint_id(3).await?;
+        assert_eq!(env.db.get_latest_checkpoint_id().await?, 3);
+
+        // re-running new_init must roll the marker back to 0
+        let processor = TestRealmProcessor::new_init(
+            Arc::clone(&env.db),
+            Arc::clone(&env.db),
+            Arc::new(psy_node_store_memory::temp_store::InMemoryTempStore::new(
+                "realm_rollback".to_string(),
+                1,
+                2,
+            )),
+            Arc::new(psy_node_store_memory::temp_store::InMemoryTempStore::new(
+                "realm_rollback".to_string(),
+                1,
+                2,
+            )),
+            Arc::clone(&env.guta_queue),
+            Arc::clone(&env.proof_queue),
+            Arc::clone(&env.coordinator),
+            TEST_CHAIN_ID,
+            test_realm_identifier(),
+            fingerprint_config(),
+            Arc::clone(&env.file_system),
+            format!("rollback_{}", std::process::id()),
+            env.genesis.prepared_updates.new_realm_root,
+            env.genesis.coordinator_update.checkpoint_sync_info.checkpoint_tree_root,
+        )
+        .await?;
+
+        assert_eq!(processor.state.last_committed_checkpoint_id, 0);
+        assert_eq!(env.db.get_latest_checkpoint_id().await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_database_check_state_classifies_coordinator_divergence() -> anyhow::Result<()> {
+        let mut env = RealmDbTestEnv::create().await?;
+        env.commit_genesis().await?;
+        // genesis commits checkpoint 0 but the pending-id counter is still 0,
+        // so the state machine still classifies the db as needing genesis
+        assert_eq!(env.check_state().await?, DatabaseCheckState::NeedsGenesis);
+
+        // rotating unique ids advances the pending-id counter past 0 so the
+        // coordinator-consistency checks run
+        env.processor.set_new_unique_ids(None).await?;
+
+        // no realm root seeded at all: fake answers checkpoint 0 with the
+        // default hash, which cannot match the local realm root
+        assert_eq!(env.check_state().await?, DatabaseCheckState::NeedsRecovery);
+
+        // coordinator thinks the realm changed at a checkpoint we do not have
+        env.coordinator.clear_realm_roots();
+        env.coordinator.seed_realm_root(3, zh(42));
+        assert_eq!(env.check_state().await?, DatabaseCheckState::NeedsRecovery);
+
+        // coordinator at our checkpoint but with a different realm root
+        env.coordinator.clear_realm_roots();
+        env.coordinator.seed_realm_root(0, zh(43));
+        assert_eq!(env.check_state().await?, DatabaseCheckState::NeedsRecovery);
+
+        // consistent coordinator view: Ready
+        env.coordinator.clear_realm_roots();
+        let seeded = env.seed_consistent_coordinator_head().await?;
+        assert_ne!(seeded, PHash::default());
+        assert_eq!(env.check_state().await?, DatabaseCheckState::Ready);
+
+        // pending-id mapping pointing at a future checkpoint is an inconsistency
+        env.db.set_unique_pending_id_checkpoint_id_mapping(1, 5).await?;
+        assert_eq!(env.check_state().await?, DatabaseCheckState::NeedsRecovery);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ensure_genesis_applied_persists_records_and_is_idempotent() -> anyhow::Result<()> {
+        let mut env = RealmDbTestEnv::create().await?;
+        env.commit_genesis().await?;
+
+        let update = &env.genesis.coordinator_update;
+        assert_eq!(env.db.get_latest_checkpoint_id().await?, 0);
+        assert_eq!(env.db.get_l2_block_state(0).await?, update.checkpoint_sync_info.block_state);
+        assert_eq!(env.db.get_checkpoint_leaf_data(0).await?, update.checkpoint_sync_info.checkpoint_leaf);
+        assert_eq!(env.db.get_checkpoint_global_state_roots(0).await?, update.checkpoint_sync_info.state_roots);
+        assert_eq!(
+            env.db.checkpoint_tree_get_root_hash(0).await?,
+            update.checkpoint_sync_info.checkpoint_tree_root
+        );
+        assert_eq!(
+            env.db.get_checkpoint_id_for_checkpoint_root_hash(update.checkpoint_sync_info.checkpoint_tree_root).await?,
+            Some(0)
+        );
+        // genesis is committed under unique pending id 0
+        assert_eq!(env.db.get_checkpoint_id_for_unique_pending_id(0).await?, Some(0));
+        assert_eq!(env.db.get_unique_pending_id_for_checkpoint_id(0).await?, Some((0, 0u128)));
+
+        // once the pending-id counter advances, the state is no longer
+        // NeedsGenesis and a second ensure call must not re-apply genesis
+        env.processor.set_new_unique_ids(None).await?;
+        env.seed_consistent_coordinator_head().await?;
+        assert_eq!(env.check_state().await?, DatabaseCheckState::Ready);
+        env.processor.ensure_genesis_applied(env.genesis.clone()).await?;
+        assert_eq!(env.db.get_latest_checkpoint_id().await?, 0);
+        assert_eq!(env.check_state().await?, DatabaseCheckState::Ready);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ensure_genesis_applied_from_setup_data_matches_prepared_update() -> anyhow::Result<()> {
+        let mut env = RealmDbTestEnv::create().await?;
+        env.processor.ensure_genesis_applied_from_setup_data(&env.genesis_data).await?;
+
+        assert_eq!(env.db.get_latest_checkpoint_id().await?, 0);
+        let update = &env.genesis.coordinator_update;
+        assert_eq!(env.db.get_l2_block_state(0).await?, update.checkpoint_sync_info.block_state);
+        assert_eq!(env.db.get_checkpoint_leaf_data(0).await?, update.checkpoint_sync_info.checkpoint_leaf);
+        // the coordinator's root maps back to checkpoint 0 (the per-checkpoint
+        // tree root stored by the db is the zero-slot append root, not the
+        // coordinator's canonical root)
+        assert_eq!(
+            env.db.get_checkpoint_id_for_checkpoint_root_hash(update.checkpoint_sync_info.checkpoint_tree_root).await?,
+            Some(0)
+        );
+
+        // the setup-data variant is also a no-op once genesis is applied
+        env.processor.set_new_unique_ids(None).await?;
+        env.seed_consistent_coordinator_head().await?;
+        env.processor.ensure_genesis_applied_from_setup_data(&env.genesis_data).await?;
+        assert_eq!(env.db.get_latest_checkpoint_id().await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ensure_db_matches_coordinator_head_validates_all_inconsistencies() -> anyhow::Result<()> {
+        let mut env = RealmDbTestEnv::create().await?;
+        env.commit_genesis().await?;
+        let local_root = env.seed_consistent_coordinator_head().await?;
+        env.processor.ensure_db_matches_coordinator_head().await?;
+
+        // local checkpoint marker ahead of the coordinator
+        env.db.set_latest_checkpoint_id(2).await?;
+        let err = match env.processor.ensure_db_matches_coordinator_head().await {
+            Err(err) => err,
+            Ok(_) => panic!("local ahead of coordinator must fail"),
+        };
+        assert!(err.to_string().contains("ahead of coordinator"), "unexpected error: {err}");
+
+        // coordinator ahead of the local realm state
+        env.db.set_latest_checkpoint_id(0).await?;
+        env.coordinator.set_latest_checkpoint_id(2);
+        env.coordinator.clear_realm_roots();
+        env.coordinator.seed_realm_root(2, local_root);
+        let err = match env.processor.ensure_db_matches_coordinator_head().await {
+            Err(err) => err,
+            Ok(_) => panic!("stale local database must fail"),
+        };
+        assert!(err.to_string().contains("Local database is stale"), "unexpected error: {err}");
+
+        // realm root mismatch at the same checkpoint
+        env.coordinator.set_latest_checkpoint_id(0);
+        env.coordinator.clear_realm_roots();
+        env.coordinator.seed_realm_root(0, zh(44));
+        let err = match env.processor.ensure_db_matches_coordinator_head().await {
+            Err(err) => err,
+            Ok(_) => panic!("realm root mismatch must fail"),
+        };
+        assert!(err.to_string().contains("Realm Root mismatch"), "unexpected error: {err}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ensure_backup_restored_skips_checkpoints_with_unchanged_realm_root() -> anyhow::Result<()> {
+        let mut env = RealmDbTestEnv::create().await?;
+        env.commit_genesis().await?;
+        env.processor.set_new_unique_ids(None).await?;
+        let old_root = env.processor.state.last_committed_realm_end_root;
+
+        // coordinator advanced to checkpoint 1 but our realm root is unchanged
+        let update = env.make_checkpoint_one_update();
+        env.seed_checkpoint_one(update, old_root);
+        assert_eq!(env.check_state().await?, DatabaseCheckState::NeedsRecovery);
+
+        let mut tree = load_global_user_tree(&env).await?;
+        env.processor
+            .ensure_backup_restored_if_necessary(&env.file_system, TEST_GUTA_BACKUP_DIR, &mut tree)
+            .await?;
+
+        // the unchanged checkpoint was skipped: nothing was committed locally
+        assert_eq!(env.db.get_latest_checkpoint_id().await?, 0);
+        // but the checkpoint leaf for checkpoint 1 was synced into the backup manager
+        assert_eq!(env.processor.checkpoint_tree_backup_manager.get_current_checkpoint_id_head(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ensure_backup_restored_bails_on_changed_root_without_backup() -> anyhow::Result<()> {
+        let mut env = RealmDbTestEnv::create().await?;
+        env.commit_genesis().await?;
+        // advance the pending-id counter so the candidate scan branch runs
+        env.processor.set_new_unique_ids(None).await?;
+
+        let changed_root = zh(55);
+        let update = env.make_checkpoint_one_update();
+        env.seed_checkpoint_one(update, changed_root);
+        assert_eq!(env.check_state().await?, DatabaseCheckState::NeedsRecovery);
+
+        let mut tree = load_global_user_tree(&env).await?;
+        let err = match env
+            .processor
+            .ensure_backup_restored_if_necessary(&env.file_system, TEST_GUTA_BACKUP_DIR, &mut tree)
+            .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("recovery without a matching backup must fail"),
+        };
+        assert!(err.to_string().contains("no local backup found"), "unexpected error: {err}");
+
+        // nothing was committed by the failed recovery
+        assert_eq!(env.db.get_latest_checkpoint_id().await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn init_with_setup_and_genesis_rotates_ids_and_publishes_state() -> anyhow::Result<()> {
+        let mut env = RealmDbTestEnv::create().await?;
+        env.commit_genesis().await?;
+        // the pending-id counter must advance past 0 before the state machine
+        // leaves NeedsGenesis
+        env.processor.set_new_unique_ids(None).await?;
+        env.seed_consistent_coordinator_head().await?;
+        assert_eq!(env.check_state().await?, DatabaseCheckState::Ready);
+
+        let mut tree = load_global_user_tree(&env).await?;
+        env.processor
+            .init_with_setup_and_genesis(&env.file_system, TEST_GUTA_BACKUP_DIR, env.genesis.clone(), &mut tree)
+            .await?;
+
+        let state = &env.processor.state;
+        assert_eq!(state.last_committed_checkpoint_id, 0);
+        assert_eq!(state.coordinator_head_synced_checkpoint_id, 0);
+        // init refreshes the committed root from the genesis param at
+        // checkpoint 0 (unlike new_init, which falls back to the db's
+        // zero-slot root)
+        assert_eq!(
+            state.last_committed_checkpoint_root,
+            env.genesis.coordinator_update.checkpoint_sync_info.checkpoint_tree_root
+        );
+        // unique ids rotated twice: once before the Ready check and once
+        // inside init_with_setup_and_genesis, so gathering graduated to
+        // processing on the second rotation
+        assert_eq!(state.gathering_unique_pending_id, 2);
+        assert_ne!(state.gathering_proc_checkpoint_unique_id, 0u128);
+        assert_eq!(state.processing_unique_pending_id, 1);
+        // all realm-root pointers converge on the committed root
+        assert_eq!(state.last_committed_realm_end_root, state.processing_realm_end_root);
+        assert_eq!(state.last_committed_realm_end_root, state.gathering_realm_start_root);
+
+        // gatherer queue key was moved to the new gathering proc id
+        let queue_key = env.processor.guta_queue_key_status_manager.get_queue_key()?;
+        assert_eq!(queue_key.unique_id, state.gathering_proc_checkpoint_unique_id);
+        assert_eq!(queue_key.realm_id, TEST_REALM_ID);
+        assert_eq!(queue_key.realm_sub_id, TEST_REALM_SUB_ID);
+
+        // consumers were ensured for the new gathering id and the genesis (0) id
+        assert!(env.guta_queue.ensured_consumer_count() >= 2);
+        assert!(env.proof_queue.ensured_consumers.lock().unwrap().len() >= 2);
+
+        // shared state wrapper received the refreshed core state
+        let shared = env.processor.shared_state.load_core_state().await?;
+        assert_eq!(shared.gathering_unique_pending_id, 2);
+        assert_eq!(shared.coordinator_head_synced_checkpoint_id, 0);
+        Ok(())
+    }
+}
