@@ -11,5 +11,9 @@ esac
 (cd "$HERE/$dir" && sha256sum -c SHA256SUMS)
 ssh -F "$ssh_config" "$host" 'install -d -m 0700 ~/prove-proxy-role-3a81f59e'
 rsync -a -e "ssh -F $ssh_config" "$HERE/$dir" "$HERE/$script" "$host:prove-proxy-role-3a81f59e/"
+if [ "$kind" = proxy ]; then
+  rsync -a -e "ssh -F $ssh_config" "$HERE/remote-proxy-split.sh" "$HERE/run-role.sh" \
+    "$HERE/parth-prove-proxy@.service" "$host:prove-proxy-role-3a81f59e/"
+fi
 ssh -F "$ssh_config" "$host" "cd ~/prove-proxy-role-3a81f59e/$dir && sha256sum -c SHA256SUMS"
 echo "Staged only, no service changed: $host:~/prove-proxy-role-3a81f59e/$script"

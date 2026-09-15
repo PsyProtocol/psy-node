@@ -6,15 +6,15 @@ action=${1:-verify}
 unit=parth-relayer.service
 root=/opt/parth/role-rollouts/3a81f59e-relayer
 config=/opt/parth/current/client_prover/config.json
-url=http://10.148.0.32:19999
+url=http://10.148.0.32:19998
 role_ready() {
   curl -fsS --max-time 10 "$url" -H 'content-type: application/json' \
     --data '{"jsonrpc":"2.0","id":1,"method":"psy_get_prove_proxy_role","params":[]}' |
-    jq -e '.error == null and .result.role == "all" and .result.user_methods == true and .result.system_methods == true' >/dev/null
+    jq -e '.error == null and .result.role == "system" and .result.user_methods == false and .result.system_methods == true' >/dev/null
 }
 case "$action" in deploy|verify|rollback) ;; *) echo 'Usage: deploy|verify|rollback'; exit 2 ;; esac
 if [ "$action" != rollback ]; then
-  role_ready || { echo 'BLOCKED: proxy is not role=all; relayer was not modified.' >&2; exit 1; }
+  role_ready || { echo 'BLOCKED: dedicated system proxy is not ready; relayer was not modified.' >&2; exit 1; }
 fi
 if [ "$action" = verify ]; then
   systemctl show "$unit" -p ActiveState -p MainPID -p NRestarts
