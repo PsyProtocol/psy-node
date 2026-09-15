@@ -56,7 +56,9 @@ The mount dependencies and existing service user/sandbox settings are retained.
 
 Both remote installers support verify and rollback. Proxy rollback stops and
 disables both new units, restores the old enabled state, and starts the
-unmodified old service. Relayer rollback restores its paired binary/config.
+unmodified old service. Relayer rollback restores its paired binary/config/env.
+The relayer installer enables INFO only for its daemon module, retaining WARN
+elsewhere, so its required startup handshake is visible even on a warn-only host.
 If both upgrades were applied, roll back relayer and proxy in the same
 maintenance operation: the old relayer cannot bridge through user-only while
 the new relayer cannot use a stopped system port.
@@ -67,12 +69,40 @@ Run `bash rollout/test-split-role.sh` and ShellCheck before staging.
 Remote proxy verify checks both capabilities, different PIDs and disallowed
 method boundaries without generating proofs. Deployment checks preserved
 genesis/config/binary/env checksums. Relayer requires a handshake in the new
-systemd invocation, stable PID, and unchanged env/genesis/TOML.
+systemd invocation, stable PID, unchanged common env/genesis/TOML, and the
+expected relayer logging override. Its original environment is backed up.
 
 These checks do not replace user proof and three-chain bridge E2E tests.
-The 2026-09-15 Alchemy monthly quota errors are an independent blocker to
-bridge E2E, not something fixed by role splitting.
+The 2026-09-15 Alchemy monthly quota errors were resolved by an independent
+RPC subscription change. Role splitting itself does not resolve RPC quotas.
 
 The build enforces the runtime commit, genesis submodule commit and Cargo.lock;
 out/TOOLCHAIN.txt records the Bookworm compiler. out-arch is the supplied,
 checksum-verified Arch artifact. Binary directories are intentionally ignored.
+
+## Relayer batch size
+
+The GCP deployment default is 32 checkpoints per batch. Explicit environment
+overrides still take precedence. Local-testnet defaults are unchanged.
+For an existing host, upload `set-relayer-batch.py` and run it with sudo:
+
+```bash
+sudo python3 /tmp/set-relayer-batch.py 32
+# To return to smaller batches:
+sudo python3 /tmp/set-relayer-batch.py 8
+```
+
+This changes only the batch size in the existing TOML, makes a protected backup,
+and restarts only the relayer. It preserves RPC credentials, confirmation lag,
+polling interval, genesis and persisted pending batches. A pending range resumes
+with its original endpoints; the next new range uses the new batch size.
+Check proof completion, all three L1 cursors, and system-proxy memory before
+considering a larger batch validated. Process startup alone is not sufficient.
+
+Staging verification on 2026-09-15: both roles responded through the gateway,
+opposite-family methods returned -32601, and the relayer logged its system-role
+handshake. The first 32-checkpoint batch (58476-58507) completed on Sepolia, BSC
+Testnet and Base Sepolia. Proof request time was about 15.4 seconds. This was
+not a new user-transaction E2E run. A previously submitted Sepolia finalize
+transaction completed across the relayer restart; duplicate retries produced
+InvalidCheckpointContinuity before the next round reconciled the L1 cursor.

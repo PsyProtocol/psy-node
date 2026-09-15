@@ -6,6 +6,7 @@ action=${1:-verify}
 unit=parth-relayer.service
 root=/opt/parth/role-rollouts/3a81f59e-relayer
 config=/opt/parth/current/client_prover/config.json
+env_file=/etc/parth/relayer.env
 url=http://10.148.0.32:19998
 role_ready() {
   curl -fsS --max-time 10 "$url" -H 'content-type: application/json' \
@@ -38,6 +39,9 @@ restore() {
   systemctl stop "$unit"
   replace "$root/backup/psy_relayer_cli" "$release/target/release/psy_relayer_cli" 0755
   replace "$root/backup/config.json" "$config" "$(stat -c %a "$root/backup/config.json")"
+  if [ -f "$root/backup/relayer.env" ]; then
+    replace "$root/backup/relayer.env" "$env_file" "$(stat -c %a "$root/backup/relayer.env")"
+  fi
   systemctl start "$unit"
   printf 'rolled-back\n' > "$root/state"
   echo 'Old relayer restored; inspect progress separately from process state.'
@@ -65,6 +69,13 @@ if [ ! -f "$root/backup/READY" ]; then
   touch "$root/backup/READY"
 fi
 test "$(cat "$root/backup/release")" = "$release"
+sha256sum -c "$root/backup/preserved.sha256"
+if [ ! -f "$root/backup/relayer.env" ]; then
+  cp -p "$env_file" "$root/backup/relayer.env"
+fi
+# The startup handshake is INFO; a warn-only environment hides successful verification.
+cp -p "$env_file" "$root/relayer.env"
+printf '\nRUST_LOG=warn,psy_relayer_cli::bridge::daemon=info\n' >> "$root/relayer.env"
 jq --arg url "$url" '.networks[.defaultNetwork].system_prove_proxy_url = [$url]' "$config" > "$root/config.json"
 changed=0
 finish() {
@@ -78,6 +89,7 @@ changed=1
 systemctl stop "$unit"
 replace "$HERE/out/psy_relayer_cli" "$bin" 0755
 replace "$root/config.json" "$config" "$(stat -c %a "$config")"
+replace "$root/relayer.env" "$env_file" "$(stat -c %a "$env_file")"
 systemctl start "$unit"
 pid=$(systemctl show "$unit" -p MainPID --value)
 invocation=$(systemctl show "$unit" -p InvocationID --value)
@@ -92,7 +104,8 @@ test "$ready" = 1
 sleep 10
 systemctl is-active --quiet "$unit"
 test "$(systemctl show "$unit" -p MainPID --value)" = "$pid"
-sha256sum -c "$root/backup/preserved.sha256"
+grep -v ' /etc/parth/relayer.env$' "$root/backup/preserved.sha256" | sha256sum -c -
+cmp "$root/relayer.env" "$env_file"
 printf 'applied\n' > "$root/state"
 systemctl show "$unit" -p MainPID -p ActiveState -p NRestarts
 echo 'Relayer role handshake verified. L1 RPC quotas and bridge E2E require separate verification.'
