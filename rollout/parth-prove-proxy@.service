@@ -1,0 +1,31 @@
+[Unit]
+Description=Parth prove-proxy role %i
+Wants=network-online.target wg-quick@wg0.service
+After=network-online.target wg-quick@wg0.service opt-parth.mount var-lib-parth.mount
+RequiresMountsFor=/opt/parth /var/lib/parth
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=parth
+Group=parth
+UMask=0027
+Environment=HOME=/var/lib/parth
+EnvironmentFile=/etc/parth/offsite-prove-proxy.env
+EnvironmentFile=-/etc/parth/prove-proxy-%i.env
+WorkingDirectory=/opt/parth/current
+ExecStart=/opt/parth/prove-proxy-role-releases/3a81f59e/run-role.sh %i
+Restart=on-failure
+RestartSec=10
+KillSignal=SIGINT
+TimeoutStopSec=90
+LimitNOFILE=1048576
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/parth
+
+[Install]
+WantedBy=multi-user.target

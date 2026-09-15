@@ -223,6 +223,13 @@ case "$service" in
       --listen-addr "${PROVE_PROXY_LISTEN_ADDR:-0.0.0.0:9999}"
       --rpc-config "${RPC_CONFIG:-$PARTH_HOME/client_prover/config.json}"
     )
+    # user | system | all. The binary defaults to `user`; the wrapper defaults
+    # to `all` so an existing single-host proxy keeps serving the relayer until
+    # it is deliberately split into pools. Binaries built before the role
+    # switch reject the flag, so only pass it when `--help` advertises it.
+    if "$user_bin" prove-proxy --help 2>/dev/null | grep -q -- '--role'; then
+      args+=(--role "${PROVE_PROXY_ROLE:-all}")
+    fi
     exec "${args[@]}"
     ;;
 

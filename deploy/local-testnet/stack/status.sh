@@ -16,6 +16,9 @@ local_staging_source_env_defaults "$SCRIPT_DIR/local.env"
 : "${LOCAL_STAGING_REALM_EDGE_BASE_PORT:=13380}"
 : "${LOCAL_STAGING_REALM_EDGE_PORT_STRIDE:=10}"
 : "${LOCAL_STAGING_PROVE_PROXY_ADDR:=127.0.0.1:9999}"
+: "${LOCAL_STAGING_PROVE_PROXY_ROLE:=all}"
+: "${LOCAL_STAGING_START_SYSTEM_PROVE_PROXY:=0}"
+: "${LOCAL_STAGING_SYSTEM_PROVE_PROXY_ADDR:=127.0.0.1:9997}"
 : "${LOCAL_STAGING_FAUCET_ADDR:=127.0.0.1:9998}"
 : "${LOCAL_STAGING_PSY_SERVICES_ADDR:=127.0.0.1:3000}"
 : "${LOCAL_STAGING_APP_PORT:=8088}"
@@ -107,6 +110,25 @@ check_jsonrpc_missing() {
   fi
 }
 
+# A prove-proxy answers psy_get_prove_proxy_role on every role; the answer must
+# name the role this stack expects, otherwise the wrong pool is listening.
+check_prove_proxy_role() {
+  local label="$1"
+  local url="$2"
+  local expected="$3"
+
+  printf '%-18s %s ' "$label" "$url"
+  local role
+  role="$(local_staging_jsonrpc_result "$url" "psy_get_prove_proxy_role" 2>/dev/null | jq -r '.result.role // empty')"
+  if [ "$role" = "$expected" ]; then
+    echo "ok role=$role"
+  elif [ -n "$role" ]; then
+    echo "failed role=$role expected=$expected"
+  else
+    echo "failed"
+  fi
+}
+
 print_endpoint_status() {
   echo
   echo "== endpoints =="
@@ -115,8 +137,18 @@ print_endpoint_status() {
   for realm_id in $LOCAL_STAGING_REALMS; do
     check_jsonrpc "realm-$realm_id" "http://127.0.0.1:$(realm_port "$realm_id")"
   done
-  check_jsonrpc_ok "prove-proxy" "http://$LOCAL_STAGING_PROVE_PROXY_ADDR" "psy_get_circuits_data"
+  check_prove_proxy_role "prove-proxy" "http://$LOCAL_STAGING_PROVE_PROXY_ADDR" "$LOCAL_STAGING_PROVE_PROXY_ROLE"
+  if [ "$LOCAL_STAGING_PROVE_PROXY_ROLE" != "system" ]; then
+    check_jsonrpc_ok "prove-user" "http://$LOCAL_STAGING_PROVE_PROXY_ADDR" "psy_get_circuits_data"
+  fi
+  if [ "$LOCAL_STAGING_PROVE_PROXY_ROLE" = "user" ]; then
+    check_jsonrpc_missing "prove-no-system" "http://$LOCAL_STAGING_PROVE_PROXY_ADDR" "psy_prove_bridge_agg_groth16"
+  fi
   check_jsonrpc_missing "prove-boundary" "http://$LOCAL_STAGING_PROVE_PROXY_ADDR" "psy_get_psy_faucet_config"
+  if [ "$LOCAL_STAGING_START_SYSTEM_PROVE_PROXY" = "1" ]; then
+    check_prove_proxy_role "system-prove" "http://$LOCAL_STAGING_SYSTEM_PROVE_PROXY_ADDR" "system"
+    check_jsonrpc_missing "system-no-user" "http://$LOCAL_STAGING_SYSTEM_PROVE_PROXY_ADDR" "psy_get_circuits_data"
+  fi
   check_jsonrpc_ok "faucet-server" "http://$LOCAL_STAGING_FAUCET_ADDR" "psy_get_psy_faucet_config"
 
   printf '%-18s http://%s ' "psy-services" "$LOCAL_STAGING_PSY_SERVICES_ADDR"

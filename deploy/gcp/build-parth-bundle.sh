@@ -84,20 +84,37 @@ render_client_prover_config() {
     done
   fi
   prove_proxy_url="${CLIENT_PROVE_PROXY_URL:-http://${prove_proxy_host}:${prove_proxy_port}}"
+  # The relayer reads system_prove_proxy_url and refuses to start unless the
+  # pool behind it serves the bridge methods. With a dedicated role=system
+  # instance (DEPLOY_SYSTEM_PROVE_PROXY=1) point it there; otherwise the single
+  # instance must run role=all and the two URLs coincide.
+  local system_prove_proxy_url
+  if [ -n "${CLIENT_SYSTEM_PROVE_PROXY_URL:-}" ]; then
+    system_prove_proxy_url="$CLIENT_SYSTEM_PROVE_PROXY_URL"
+  elif [ "${DEPLOY_SYSTEM_PROVE_PROXY:-0}" = "1" ]; then
+    local system_prove_proxy_listen="${SYSTEM_PROVE_PROXY_LISTEN_ADDR:-0.0.0.0:9997}"
+    if [ -z "$prove_proxy_host" ]; then
+      prove_proxy_host="$(client_endpoint "${PROVE_PROXY_HOST:-}" "${PROVE_PROXY_VM_NAME:-}")"
+    fi
+    system_prove_proxy_url="http://${prove_proxy_host}:${system_prove_proxy_listen##*:}"
+  else
+    system_prove_proxy_url="$prove_proxy_url"
+  fi
   psy_services_url="${CLIENT_PSY_SERVICES_URL:-http://${psy_services_host}:${PSY_SERVICES_PORT:-3000}}"
 
   echo "rendering bundled client_prover/config.json:" >&2
   echo "  coordinator: ${coordinator_url}" >&2
   echo "  realms:      ${realm_urls}" >&2
   echo "  prove proxy: ${prove_proxy_url}" >&2
+  echo "  system prove proxy: ${system_prove_proxy_url}" >&2
   echo "  services:    ${psy_services_url}" >&2
 
   python3 - "$source_config" "$target_config" \
-    "$coordinator_url" "$realm_urls" "$prove_proxy_url" "$psy_services_url" <<'PY'
+    "$coordinator_url" "$realm_urls" "$prove_proxy_url" "$psy_services_url" "$system_prove_proxy_url" <<'PY'
 import json
 import sys
 
-source, target, coordinator, realms_csv, prove_proxy, services = sys.argv[1:]
+source, target, coordinator, realms_csv, prove_proxy, services, system_prove_proxy = sys.argv[1:]
 
 with open(source, "r", encoding="utf-8") as f:
     data = json.load(f)
@@ -107,6 +124,7 @@ localhost["coordinator_configs"] = [{"id": 0, "rpc_url": [coordinator]}]
 realms = [item.strip() for item in realms_csv.split(",") if item.strip()]
 localhost["realm_configs"] = [{"id": idx, "rpc_url": [url]} for idx, url in enumerate(realms)]
 localhost["prove_proxy_url"] = [prove_proxy]
+localhost["system_prove_proxy_url"] = [system_prove_proxy]
 localhost["api_services_url"] = [services]
 
 with open(target, "w", encoding="utf-8") as f:
